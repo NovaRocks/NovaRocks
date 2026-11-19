@@ -623,7 +623,7 @@ fn compile(package: FragmentPackage, pipeline_dop: usize, root_sink: bool) -> Ar
     Arc::new(
         compile_fragment(
             validated,
-            &crate::exec::expr::compiled_program::tests::rng_subset(),
+            &novarocks_functions::testkit::rng_subset(),
             LocalCompileOptions {
                 pipeline_dop: NonZeroUsize::new(pipeline_dop).unwrap(),
                 root_sink_dop: root_sink.then(|| NonZeroUsize::new(1).unwrap()),

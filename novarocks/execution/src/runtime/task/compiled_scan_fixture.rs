@@ -572,7 +572,7 @@ pub(crate) fn scan_program(dop: usize, residual: bool) -> Arc<LocalProgram> {
     .unwrap();
     let package = Arc::new(packages.remove(&FRAGMENT).unwrap());
     let validated = validate_fragment_providers(package, &providers(), &FixtureControl).unwrap();
-    let functions = crate::exec::expr::compiled_program::tests::rng_subset();
+    let functions = novarocks_functions::testkit::rng_subset();
     Arc::new(
         compile_fragment(validated, &functions, options(dop), &FixtureControl)
             .unwrap_or_else(|error| panic!("the scan fixture compiles: {error}")),

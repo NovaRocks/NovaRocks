@@ -211,7 +211,7 @@ fn read_unit_like(program: &LocalProgram, like: ProgramRootRef) -> AuthoredInput
     work.finish().unwrap();
     let pools = novarocks_physical_plan::ConstantPools::empty();
     let parameters = SemanticParameters::try_new([]).unwrap();
-    let functions = crate::exec::expr::compiled_program::tests::rng_subset();
+    let functions = novarocks_functions::testkit::rng_subset();
     let mut work = CompileCheckpoints::try_new(&NoControl, CompilePhase::LowerProgram).unwrap();
     let compiled = compile_expr_set_pure(
         &unit,
@@ -303,7 +303,7 @@ fn read_join_output_unit(
     .unwrap();
     let pools = novarocks_physical_plan::ConstantPools::empty();
     let parameters = SemanticParameters::try_new([]).unwrap();
-    let catalog = crate::exec::expr::compiled_program::tests::rng_subset();
+    let catalog = novarocks_functions::testkit::rng_subset();
     let compiled = compile_expr_set_pure(
         &unit,
         EvaluationEnvironment {
@@ -2234,116 +2234,6 @@ fn join_probe_owned_shared_processor_gate_starts_at_input_and_has_exact_observab
         NextStep::Finished
     ));
     assert_eq!(subscription.records(), vec!["published"]);
-}
-
-#[test]
-fn join_probe_owned_root_frame_every_actual_callback_keeps_seven_causes_and_latch() {
-    use crate::exec::expr::compiled_program::CompiledExpressionInstance;
-    use novarocks_functions::{
-        KernelDiagnostic, KernelEvaluationControl, KernelFailure, Selection,
-    };
-    struct Control {
-        calls: Mutex<Vec<u32>>,
-        refusal: Option<(usize, KernelFailure)>,
-    }
-    impl KernelEvaluationControl for Control {
-        fn checkpoint(&self, units: u32) -> Result<(), KernelFailure> {
-            let mut calls = self.calls.lock().unwrap();
-            let at = calls.len();
-            calls.push(units);
-            if let Some((stop, cause)) = &self.refusal
-                && at == *stop
-            {
-                return Err(cause.clone());
-            }
-            Ok(())
-        }
-        fn wait(&self, _: Duration) -> Result<(), KernelFailure> {
-            panic!("a key root never waits")
-        }
-    }
-    let program =
-        join_with_probe_consumers(&single_join(false), vec![blocking_consumer(7)]).unwrap();
-    let join = join_node(&program);
-    let ProgramNodeKind::Join {
-        runtime_filter_consumers,
-        ..
-    } = program.graph().nodes()[join.index()].kind()
-    else {
-        unreachable!()
-    };
-    let root = runtime_filter_consumers[0].expr_id;
-    let ProgramNodeKind::Join { left_layout, .. } = program.graph().nodes()[join.index()].kind()
-    else {
-        unreachable!()
-    };
-    let batch = arrow::record_batch::RecordBatch::try_new(
-        left_layout.schema().clone(),
-        vec![
-            Arc::new(arrow::array::Int64Array::from(vec![Some(1), None, Some(2)]))
-                as arrow::array::ArrayRef,
-            Arc::new(arrow::array::Int64Array::from(vec![
-                Some(10),
-                Some(40),
-                Some(20),
-            ])) as arrow::array::ArrayRef,
-        ],
-    )
-    .unwrap();
-    let make = || {
-        let construction = Control {
-            calls: Mutex::new(vec![]),
-            refusal: None,
-        };
-        CompiledExpressionInstance::try_new(
-            program.unit(root.unit).unwrap().clone(),
-            root.root,
-            &construction,
-        )
-        .unwrap()
-    };
-    let baseline = Control {
-        calls: Mutex::new(vec![]),
-        refusal: None,
-    };
-    let mut instance = make();
-    instance
-        .evaluate(&batch, Selection::all(3), &baseline)
-        .unwrap();
-    let trace = baseline.calls.lock().unwrap().clone();
-    assert!(!trace.is_empty());
-    for at in 0..trace.len() {
-        for cause in [
-            KernelFailure::Cancelled,
-            KernelFailure::DeadlineExceeded,
-            KernelFailure::ResourceExhausted,
-            KernelFailure::InvalidProgram(KernelDiagnostic::new("original")),
-            KernelFailure::Internal(KernelDiagnostic::new("original")),
-            KernelFailure::Operational(KernelDiagnostic::new("original")),
-            KernelFailure::InstanceFailed,
-        ] {
-            let control = Control {
-                calls: Mutex::new(vec![]),
-                refusal: Some((at, cause.clone())),
-            };
-            let mut instance = make();
-            assert_eq!(
-                instance
-                    .evaluate(&batch, Selection::all(3), &control)
-                    .unwrap_err(),
-                cause
-            );
-            assert_eq!(*control.calls.lock().unwrap(), trace[..=at]);
-            let before = control.calls.lock().unwrap().clone();
-            assert_eq!(
-                instance
-                    .evaluate(&batch, Selection::all(3), &control)
-                    .unwrap_err(),
-                KernelFailure::InstanceFailed
-            );
-            assert_eq!(*control.calls.lock().unwrap(), before);
-        }
-    }
 }
 
 #[test]

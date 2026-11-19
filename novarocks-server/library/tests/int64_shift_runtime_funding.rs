@@ -22,9 +22,10 @@ mod shift_helpers;
 mod shift_support;
 use arrow::array::{Array, Int64Array};
 use novarocks_execution::runtime::scalar_memory::{
-    RuntimeScalarEvaluationFailure, RuntimeScalarMemoryRefusal,
+    RuntimeScalarMemoryRefusal,
     test_support::{RuntimeScalarFrameForTest, RuntimeScalarWrapperForTest},
 };
+use novarocks_expression::ScalarCallFailure;
 use novarocks_functions::{EvaluatedArgument, Selection};
 use novarocks_memory::lane::global_store;
 use shift_helpers::*;
@@ -252,7 +253,7 @@ fn original_complete_wrapper_empty_small_and_missing_keep_existing_policy() {
         let (failure, refused) = missing.evaluate(Selection::all(rows), &arguments);
         assert_eq!(
             failure.unwrap_err(),
-            RuntimeScalarEvaluationFailure::Host(RuntimeScalarMemoryRefusal::MissingQueryMemory)
+            ScalarCallFailure::Host(RuntimeScalarMemoryRefusal::MissingQueryMemory)
         );
         assert!(refused.body.settlement.is_none());
         drop(wrapper);

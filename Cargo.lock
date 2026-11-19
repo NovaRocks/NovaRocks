@@ -4049,6 +4049,7 @@ dependencies = [
  "novarocks-connector-paimon",
  "novarocks-execution",
  "novarocks-execution-contract",
+ "novarocks-expression",
  "novarocks-expression-contract",
  "novarocks-failpoint",
  "novarocks-frontend-application",
@@ -4182,6 +4183,7 @@ name = "novarocks-sql-testkit"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "novarocks-expression-contract",
  "novarocks-functions",
  "novarocks-parser",
  "novarocks-physical-plan",
@@ -4401,6 +4403,7 @@ dependencies = [
  "novarocks-sql",
  "novarocks-sql-testkit",
  "novarocks-type-contract",
+ "novarocks-types",
  "prost 0.13.5",
 ]
 

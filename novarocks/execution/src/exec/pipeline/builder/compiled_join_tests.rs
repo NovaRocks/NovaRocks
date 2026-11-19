@@ -903,7 +903,7 @@ pub(super) fn compile(
     pipeline_dop: usize,
     result: bool,
 ) -> Arc<LocalProgram> {
-    let catalog = crate::exec::expr::compiled_program::tests::rng_subset();
+    let catalog = novarocks_functions::testkit::rng_subset();
     try_compile(package, &catalog, pipeline_dop, result)
         .unwrap_or_else(|error| panic!("join fragment compiles: {error}"))
 }
@@ -2975,7 +2975,6 @@ fn b3_input_and_finalize_operators_preserve_the_first_prepare_refusal() {
 #[test]
 fn b3_residual_gathers_only_original_referenced_columns_from_published_pages() {
     use crate::exec::{
-        expr::compiled_program::CompiledExpressionInstance,
         operators::{
             compiled_expression::{RuntimeKernelControl, evaluate_projected_chunk_all},
             hashjoin::{
@@ -2990,6 +2989,7 @@ fn b3_residual_gathers_only_original_referenced_columns_from_published_pages() {
     };
     use crate::runtime::mem_tracker::MemTracker;
     use arrow::array::{Array, ArrayRef, BooleanArray, Int64Array};
+    use novarocks_expression::CompiledExpressionInstance;
     let mut packages = packages(&single_plan_with_dop(
         Spec::hash(JoinKind::Inner, true),
         &LEFT_ROWS,

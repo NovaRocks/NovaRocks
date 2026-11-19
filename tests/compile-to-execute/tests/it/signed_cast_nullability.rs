@@ -20,8 +20,11 @@ use arrow::{
     datatypes::{DataType, Field},
     record_batch::RecordBatch,
 };
-use novarocks_execution::exec::expr::compiled_program::CompiledExpressionInstance;
+use novarocks_expression::CompiledExpressionInstance;
+use novarocks_expression::EvaluationInput;
+use novarocks_expression::testkit::PassThroughCallHost;
 use novarocks_expression_contract::ExprKind;
+use novarocks_functions::ScalarInvocationScope;
 use novarocks_functions::{
     KernelEvaluationControl, KernelFailure, ScalarInvocationActivation, Selection,
 };
@@ -288,11 +291,18 @@ fn check_array_source(
             )
             .unwrap();
             let output = frame
-                .evaluate_evaluation(
-                    &batch,
-                    Selection::try_sparse(expected_values.len(), rows).unwrap(),
+                .evaluate(
+                    EvaluationInput::Batch {
+                        batch: &batch,
+                        source: None,
+                    },
+                    {
+                        let selection = Selection::try_sparse(expected_values.len(), rows).unwrap();
+                        ScalarInvocationScope::new(selection, selection)
+                    },
                     ScalarInvocationActivation::Activated,
                     &Control,
+                    &mut PassThroughCallHost,
                 )
                 .unwrap();
             assert!(output.errors().is_empty());

@@ -483,7 +483,7 @@ pub(crate) fn try_compile(
     package: Arc<FragmentPackage>,
     dop: usize,
 ) -> Result<Arc<LocalProgram>, String> {
-    let functions = crate::exec::expr::compiled_program::tests::rng_subset();
+    let functions = novarocks_functions::testkit::rng_subset();
     let providers =
         PureProviderProgramCatalog::<std::io::Error>::try_new(&[], vec![], &FixtureControl)
             .unwrap();

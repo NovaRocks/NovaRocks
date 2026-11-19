@@ -76,7 +76,6 @@ use super::compiled_expression::{RuntimeKernelControl, evaluate_all, instances};
 use super::compiled_window_geometry::{admit_frame, frame_table, frame_table_tracked, peer_groups};
 use super::sort::creation::{CreatedSortConverter, CreatedSortRows, SortCreation};
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
-use crate::exec::expr::compiled_program::CompiledExpressionInstance;
 use crate::exec::pipeline::operator::{ConstructionFailure, InputConstructionOwner};
 use crate::exec::pipeline::operator::{InputEncodingPolicy, Operator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
@@ -88,6 +87,7 @@ use crate::exec::pipeline::{
 };
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
 use crate::runtime::task::{ExecutionFailure, ExecutionResult};
+use novarocks_expression::CompiledExpressionInstance;
 use novarocks_type_contract::ValueTypeStorageLifetime;
 
 #[derive(Clone, Copy, Debug)]

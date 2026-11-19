@@ -19,10 +19,13 @@
 use arrow::array::{Array, Decimal128Array, Int64Array};
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
-use novarocks_execution::exec::expr::compiled_program::CompiledExpressionInstance;
+use novarocks_expression::CompiledExpressionInstance;
+use novarocks_expression::EvaluationInput;
 use novarocks_expression::StaticExprKind;
+use novarocks_expression::testkit::PassThroughCallHost;
 use novarocks_expression_contract::{ExprKind, RootOrdinal};
 use novarocks_functions::{KernelEvaluationControl, KernelFailure, Selection};
+use novarocks_functions::{ScalarInvocationActivation, ScalarInvocationScope};
 use novarocks_sql_testkit::sql_source;
 use novarocks_test_compile_to_execute::programs::programs_with_catalogue;
 
@@ -107,7 +110,19 @@ fn integral_decimal128_actual_sql_required_i64_to_four_zero_bound_source_and_fra
     for rows in [vec![0, 1, 2], vec![0, 2], Vec::new()] {
         let mut frame = CompiledExpressionInstance::try_new(unit.clone(), root, &Control).unwrap();
         let output = frame
-            .evaluate(&data, Selection::try_sparse(3, &rows).unwrap(), &Control)
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &data,
+                    source: None,
+                },
+                {
+                    let selection = Selection::try_sparse(3, &rows).unwrap();
+                    ScalarInvocationScope::new(selection, selection)
+                },
+                ScalarInvocationActivation::Activated,
+                &Control,
+                &mut PassThroughCallHost,
+            )
             .unwrap();
         assert!(output.errors().is_empty());
         assert_eq!(output.values().data_type(), &target);

@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::compiled_program::tests::{SEED_42_FIRST, SeedMode, program};
+use crate::exec::expr::fixtures::{SEED_42_FIRST, SeedMode, program};
 use crate::exec::operators::{ResultSinkBuffer, ResultSinkFactory};
 use crate::exec::pipeline::executor::prepare_compiled_program_pipeline_execution;
 use crate::runtime::runtime_state::RuntimeState;

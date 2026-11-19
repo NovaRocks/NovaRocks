@@ -679,3 +679,34 @@ fn raw_plan_type_policy_retains_physical64_for_constant_or_source_subtrees() {
     );
     assert_eq!(over.errors[0].message(), "Arrow data type depth exceeds 64");
 }
+
+// Physical source admission precedes compilation for either float destination.
+fn assert_decimal_source_out_of_range_scale() {
+    for (source, max) in [
+        (DataType::Decimal128(1, -127), 38),
+        (DataType::Decimal256(1, -127), 76),
+    ] {
+        let out = raw(&source, std::mem::size_of::<ValueType>());
+        assert_eq!(out.errors.len(), 1);
+        assert_eq!(
+            out.errors[0].category(),
+            ValidationErrorCategory::StructuralInvariant
+        );
+        assert_eq!(
+            out.errors[0].message(),
+            format!(
+                "Arrow decimal precision/scale (1, -127) is outside 1..={max} and -{max}..={max}"
+            ),
+        );
+    }
+}
+
+#[test]
+fn decimal_float_actual_physical_source_rejects_out_of_range_scale_before_compile() {
+    assert_decimal_source_out_of_range_scale();
+}
+
+#[test]
+fn decimal_float32_actual_physical_source_rejects_out_of_range_scale_before_compile() {
+    assert_decimal_source_out_of_range_scale();
+}

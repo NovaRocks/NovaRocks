@@ -17,7 +17,7 @@ code-anchors:
   - "novarocks/sql/src/optimizer/derive/hash_join.rs (hash_join_only_broadcast)"
   - "novarocks/local-compiler/src/join.rs (LeftMark lowering)"
   - "novarocks/execution/src/exec/operators/hashjoin/compiled_hash_join/phased_probe.rs (ProbeMatch, advance_probe)"
-  - "novarocks/execution/src/exec/expr/compiled_program/utf8_inlist.rs (utf8_equality_observed)"
+  - "novarocks/expression/src/evaluator/utf8_inlist.rs (utf8_equality_observed)"
   - "novarocks/types/src/value/variant.rs (format_variant_timestamp)"
 ---
 

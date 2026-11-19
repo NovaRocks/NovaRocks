@@ -557,3 +557,66 @@ fn decimal_float32_preserves_original_expr_null_and_unsanitized_project_projecti
         CastRowResult::Float32(f32::INFINITY)
     );
 }
+
+#[test]
+fn decimal_float32_actual_constant_author_rejects_precision_one_raw_71() {
+    let policy = ConstantPolicy {
+        max_rows: 16,
+        max_array_nodes: 128,
+        max_logical_elements: 1024,
+        max_retained_buffer_bytes: 1 << 20,
+        max_type_depth: 64,
+        max_type_nodes: 4096,
+        max_dictionary_depth: 64,
+        max_metadata_bytes: 1 << 20,
+        max_library_validation_work: 1 << 20,
+        max_library_validation_bytes: 1 << 20,
+    };
+    for wide in [false, true] {
+        for scale in [-1, 0, 1] {
+            let source = if wide {
+                DataType::Decimal256(1, scale)
+            } else {
+                DataType::Decimal128(1, scale)
+            };
+            let ty = FunctionValueType::new(source, false);
+            let field = Arc::new(ty.try_to_field("actual-decimal-constant").unwrap());
+            // Precision one admits raw -9..=9. These fixed diagnostics use
+            // raw71's decimal spelling and the maximum raw9 at each scale;
+            // the expected error is not obtained from an Arrow validator.
+            let (value, maximum) = match scale {
+                -1 => ("710", "90"),
+                0 => ("71", "9"),
+                1 => ("7.1", "0.9"),
+                _ => unreachable!(),
+            };
+            let kind = if wide { "Decimal256" } else { "Decimal128" };
+            let expected = format!(
+                "Invalid argument error: {value} is too large to store in a {kind} of precision 1. Max is {maximum}"
+            );
+            let result = if wide {
+                ConstantValue::from_decimal256(
+                    field,
+                    ty,
+                    i256::from_i128(71),
+                    policy,
+                    CompilePhase::FunctionSpecialization,
+                    &Control::default(),
+                )
+            } else {
+                ConstantValue::from_decimal128(
+                    field,
+                    ty,
+                    71,
+                    policy,
+                    CompilePhase::FunctionSpecialization,
+                    &Control::default(),
+                )
+            };
+            let Err(error) = result else {
+                panic!("original real constant owner cannot admit raw 71 at precision one");
+            };
+            assert_eq!(error.to_string(), expected);
+        }
+    }
+}

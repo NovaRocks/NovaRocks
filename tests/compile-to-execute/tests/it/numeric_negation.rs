@@ -19,7 +19,9 @@ mod scalar {
         array::{Array, ArrayRef, Int8Array, Int16Array, Int32Array, Int64Array},
         datatypes::DataType,
     };
-    use novarocks_execution::exec::expr::compiled_program::CompiledExpressionInstance;
+    use novarocks_expression::CompiledExpressionInstance;
+    use novarocks_expression::testkit::PassThroughCallHost;
+    use novarocks_expression::{EvaluationInput, ExprEvaluationFailure};
     use novarocks_functions::*;
     use novarocks_sql_testkit::sql_source;
     use novarocks_test_compile_to_execute::programs::{batch, producer_root, programs};
@@ -86,7 +88,18 @@ mod scalar {
                 &Control,
             )
             .unwrap();
-            let selected = frame.evaluate(&data, Selection::all(2), &Control).unwrap();
+            let selected = frame
+                .evaluate(
+                    EvaluationInput::Batch {
+                        batch: &data,
+                        source: None,
+                    },
+                    ScalarInvocationScope::new(Selection::all(2), Selection::all(2)),
+                    ScalarInvocationActivation::Activated,
+                    &Control,
+                    &mut PassThroughCallHost,
+                )
+                .unwrap();
             assert_eq!(selected.errors().len(), 1);
             assert_eq!(selected.errors()[0].selected_ordinal(), 0);
             assert_eq!(
@@ -97,7 +110,19 @@ mod scalar {
             assert_eq!(selected.values().null_count(), 1);
             let rows = [1];
             let sparse = frame
-                .evaluate(&data, Selection::try_sparse(2, &rows).unwrap(), &Control)
+                .evaluate(
+                    EvaluationInput::Batch {
+                        batch: &data,
+                        source: None,
+                    },
+                    {
+                        let selection = Selection::try_sparse(2, &rows).unwrap();
+                        ScalarInvocationScope::new(selection, selection)
+                    },
+                    ScalarInvocationActivation::Activated,
+                    &Control,
+                    &mut PassThroughCallHost,
+                )
                 .unwrap();
             assert_eq!(sparse.values().null_count(), 0);
             assert_eq!(
@@ -106,7 +131,19 @@ mod scalar {
             );
             assert_eq!(
                 frame
-                    .evaluate(&data, Selection::try_sparse(2, &[]).unwrap(), &Control)
+                    .evaluate(
+                        EvaluationInput::Batch {
+                            batch: &data,
+                            source: None
+                        },
+                        {
+                            let selection = Selection::try_sparse(2, &[]).unwrap();
+                            ScalarInvocationScope::new(selection, selection)
+                        },
+                        ScalarInvocationActivation::Activated,
+                        &Control,
+                        &mut PassThroughCallHost
+                    )
                     .unwrap()
                     .values()
                     .len(),
@@ -132,7 +169,18 @@ mod scalar {
                 &Control,
             )
             .unwrap();
-            let out = frame.evaluate(&data, Selection::all(2), &Control).unwrap();
+            let out = frame
+                .evaluate(
+                    EvaluationInput::Batch {
+                        batch: &data,
+                        source: None,
+                    },
+                    ScalarInvocationScope::new(Selection::all(2), Selection::all(2)),
+                    ScalarInvocationActivation::Activated,
+                    &Control,
+                    &mut PassThroughCallHost,
+                )
+                .unwrap();
             if sql.contains("IF(") {
                 assert!(out.errors().is_empty(), "inactive MIN is not evaluated");
                 assert_eq!(out.values().null_count(), 0);
@@ -185,7 +233,16 @@ mod scalar {
         .unwrap();
         assert!(
             successful
-                .evaluate(&data, selection, &Control)
+                .evaluate(
+                    EvaluationInput::Batch {
+                        batch: &data,
+                        source: None
+                    },
+                    ScalarInvocationScope::new(selection, selection),
+                    ScalarInvocationActivation::Activated,
+                    &Control,
+                    &mut PassThroughCallHost
+                )
                 .unwrap()
                 .errors()
                 .is_empty()
@@ -220,7 +277,18 @@ mod scalar {
             &Control,
         )
         .unwrap();
-        frame.evaluate(&data, selection, &success).unwrap();
+        frame
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &data,
+                    source: None,
+                },
+                ScalarInvocationScope::new(selection, selection),
+                ScalarInvocationActivation::Activated,
+                &success,
+                &mut PassThroughCallHost,
+            )
+            .unwrap();
         let trace = success.events.into_inner().unwrap();
         for at in 0..trace.len() {
             for cause in [
@@ -243,13 +311,35 @@ mod scalar {
                 )
                 .unwrap();
                 assert_eq!(
-                    frame.evaluate(&data, selection, &control).unwrap_err(),
-                    cause
+                    frame
+                        .evaluate(
+                            EvaluationInput::Batch {
+                                batch: &data,
+                                source: None
+                            },
+                            ScalarInvocationScope::new(selection, selection),
+                            ScalarInvocationActivation::Activated,
+                            &control,
+                            &mut PassThroughCallHost
+                        )
+                        .unwrap_err(),
+                    ExprEvaluationFailure::Kernel(cause)
                 );
                 assert_eq!(*control.events.lock().unwrap(), trace[..=at]);
                 assert_eq!(
-                    frame.evaluate(&data, selection, &control).unwrap_err(),
-                    KernelFailure::InstanceFailed
+                    frame
+                        .evaluate(
+                            EvaluationInput::Batch {
+                                batch: &data,
+                                source: None
+                            },
+                            ScalarInvocationScope::new(selection, selection),
+                            ScalarInvocationActivation::Activated,
+                            &control,
+                            &mut PassThroughCallHost
+                        )
+                        .unwrap_err(),
+                    ExprEvaluationFailure::Kernel(KernelFailure::InstanceFailed)
                 );
                 assert_eq!(*control.events.lock().unwrap(), trace[..=at]);
             }

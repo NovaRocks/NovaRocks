@@ -171,6 +171,16 @@ impl ChunkBatchProjection {
     }
 }
 
+impl novarocks_expression::InputSourceStorage for Chunk {
+    fn storage_lifetime_observed(
+        &self,
+        base: ValueTypeStorageLifetime,
+        request: &mut dyn FnMut(Layout) -> Result<(), novarocks_expression::InputStorageFailure>,
+    ) -> Result<ValueTypeStorageLifetime, novarocks_expression::InputStorageFailure> {
+        self.source_storage_lifetime_observed(base, request)
+    }
+}
+
 impl Chunk {
     pub(crate) fn set_position_shard_source(&mut self, source: PositionShardChunkSource) {
         self.position_shard_source = Some(source);

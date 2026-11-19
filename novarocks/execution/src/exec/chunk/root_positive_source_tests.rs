@@ -44,7 +44,7 @@ impl novarocks_type_contract::PureCompileControl for MaterializedLayoutControl {
 
 #[test]
 fn root_positive_source_structural_local_compiler_unknown_owner_and_materialized_layout() {
-    use crate::exec::expr::compiled_program::tests::{SeedMode, program};
+    use crate::exec::expr::fixtures::{SeedMode, program};
     use novarocks_type_contract::owned_resources::metadata_materialization::{
         MaterializedFieldNamespace, TypedSchemaMaterializations, materialize_value_field,
     };

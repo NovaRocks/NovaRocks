@@ -20,7 +20,7 @@
 
 use crate::exec::arrow_work::{ArrowWorkBudget, ArrowWorkShape};
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::compiled_program::input_source::CompiledInputLoan;
+use crate::exec::operators::compiled_expression::chunk_evaluation_input;
 use crate::exec::operators::compiled_expression::{
     CompiledFilterBody, CompiledFilterProcessorFactory, RuntimeKernelControl,
 };
@@ -101,7 +101,8 @@ impl CompiledOrderedOutputEvaluator {
                 _stock: Option<OpaqueRetainedCharge>,
             }
             let mut mask = ResidualMask {
-                truth: residual.evaluate(CompiledInputLoan::from_chunk(&chunk), &self.control)?,
+                truth: residual
+                    .evaluate(chunk_evaluation_input(&chunk, &self.control), &self.control)?,
                 _stock: None,
             };
             let mut stock = OpaqueRetainedCharge::try_new(self.host.scalar_allocator())?;

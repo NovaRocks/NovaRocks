@@ -19,15 +19,13 @@
 //! The Frame entry and the complete-wrapper contract are distinct witnesses.
 
 use super::{RuntimeKernelControl, evaluate_all};
-use crate::exec::expr::compiled_program::CompiledExpressionInstance;
 use crate::runtime::{
     execution_runtime::ExecutionRuntime,
     kernel_memory::KernelMemoryJournal,
     query_memory::QueryMemoryBinding,
     runtime_state::RuntimeState,
     scalar_memory::{
-        RuntimeScalarEvaluationFailure, RuntimeScalarMemoryJournal, RuntimeScalarMemoryScope,
-        RuntimeScalarOperationScope,
+        RuntimeScalarMemoryJournal, RuntimeScalarMemoryRefusal, RuntimeScalarMemoryScope,
     },
     task::{
         ExecutionResult,
@@ -36,7 +34,10 @@ use crate::runtime::{
 };
 use arrow::{array::ArrayRef, record_batch::RecordBatch};
 use novarocks_execution_contract::TaskIdentity;
+use novarocks_expression::CompiledExpressionInstance;
+use novarocks_expression::ScalarCallFailure;
 use novarocks_expression::evaluator_view::{UnitStateTemplate, state_template};
+use novarocks_expression::testkit::{call_invocation, call_scalar};
 use novarocks_functions::{
     AggregateStateAllocator, EvaluatedArgument, InvocationScalarEvaluationInstance,
     ScalarEvaluationInstance, ScalarInvocationActivation, SelectedValues, Selection,
@@ -211,19 +212,19 @@ impl RuntimeInvocationWrapperForTest {
         arguments: &'a [EvaluatedArgument<'a>],
         activation: ScalarInvocationActivation,
     ) -> (
-        Result<SelectedValues<'a>, RuntimeScalarEvaluationFailure>,
+        Result<SelectedValues<'a>, ScalarCallFailure<RuntimeScalarMemoryRefusal>>,
         RuntimeInvocationWrapperReceiptForTest,
     ) {
         let mut journal = RuntimeScalarMemoryJournal::default();
-        let result = RuntimeScalarMemoryScope::new(&self.control, &mut journal)
-            .evaluate_invocation(
-                &mut self.instance,
-                selection,
-                arguments,
-                activation,
-                Some(&self.host),
-                &self.control,
-            );
+        let result = call_invocation(
+            &mut RuntimeScalarMemoryScope::new(&self.control, &mut journal),
+            &mut self.instance,
+            selection,
+            arguments,
+            activation,
+            Some(&self.host),
+            &self.control,
+        );
         (
             result,
             RuntimeInvocationWrapperReceiptForTest {
@@ -295,11 +296,12 @@ impl RuntimeScalarWrapperForTest {
         selection: Selection<'a>,
         arguments: &'a [EvaluatedArgument<'a>],
     ) -> (
-        Result<SelectedValues<'a>, RuntimeScalarEvaluationFailure>,
+        Result<SelectedValues<'a>, ScalarCallFailure<RuntimeScalarMemoryRefusal>>,
         RuntimeScalarWrapperReceiptForTest,
     ) {
         let mut journal = RuntimeScalarMemoryJournal::default();
-        let result = RuntimeScalarMemoryScope::new(&self.control, &mut journal).evaluate(
+        let result = call_scalar(
+            &mut RuntimeScalarMemoryScope::new(&self.control, &mut journal),
             &mut self.instance,
             selection,
             arguments,

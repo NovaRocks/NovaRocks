@@ -37,8 +37,6 @@ paths = [
     "novarocks/functions/src/float_date_cast.rs",
     "novarocks/functions/src/time*_cast.rs",
     "novarocks/functions/src/temporal_carrier.rs",
-    "novarocks/execution/src/exec/expr/compiled_program.rs",
-    "novarocks/execution/src/exec/expr/compiled_program/**",
     "novarocks/expression-contract/**",
     "novarocks/expression/**",
     "novarocks/execution/src/exec/operators/compiled_expression.rs",

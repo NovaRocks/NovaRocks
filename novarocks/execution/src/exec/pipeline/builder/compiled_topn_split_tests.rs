@@ -532,7 +532,7 @@ fn packages(plan: &PhysicalPlan) -> BTreeMap<FragmentId, FragmentPackage> {
 }
 
 fn compile(package: FragmentPackage, pipeline_dop: usize, result: bool) -> Arc<LocalProgram> {
-    let functions = crate::exec::expr::compiled_program::tests::rng_subset();
+    let functions = novarocks_functions::testkit::rng_subset();
     let providers =
         PureProviderProgramCatalog::<std::io::Error>::try_new(&[], vec![], &FixtureControl)
             .unwrap();

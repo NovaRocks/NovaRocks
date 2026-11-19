@@ -32,8 +32,6 @@ paths = ["novarocks/table-maintenance/**", "novarocks/frontend-application/src/q
     "novarocks/sql/src/analyzer/declaration_widening.rs",
     "novarocks/functions/src/evaluation.rs",
     "novarocks/functions/src/kernel_input.rs",
-    "novarocks/execution/src/exec/expr/compiled_program.rs",
-    "novarocks/execution/src/exec/expr/compiled_program/**",
     "novarocks/expression-contract/**",
     "novarocks/expression/**",
     "novarocks/functions/src/cast.rs",

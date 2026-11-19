@@ -938,19 +938,24 @@ fn newly_materialized_unsigned_negative_scale_and_nested_metadata_outputs_are_cv
     // the FE port materializes an exact CV through a valid Identity node.
     let target = FunctionValueType::new(DataType::UInt32, true);
     let source = i32(7);
-    let converted = novarocks_execution::exec::expr::compiled_program::constant_node::evaluate_constant_node(
-        novarocks_execution::exec::expr::compiled_program::constant_node::ConstantNode::Conversion(
-            novarocks_execution::exec::expr::compiled_program::constant_node::ConstantConversion::Carrier(
-                novarocks_execution::exec::expr::compiled_program::constant_node::ConstantCarrierStep {
+    let converted = novarocks_expression::constant_node::evaluate_constant_node(
+        novarocks_expression::constant_node::ConstantNode::Conversion(
+            novarocks_expression::constant_node::ConstantConversion::Carrier(
+                novarocks_expression::constant_node::ConstantCarrierStep {
                     target: &target,
                     decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
                     allow_throw_exception: false,
-                }
-            )
+                },
+            ),
         ),
-        &[source.value], &target, &TestControl, CompilePhase::FunctionSpecialization,
-    ).unwrap();
-    let novarocks_execution::exec::expr::compiled_program::constant_node::ConstantNodeOutcome::Value(converted) = converted else {
+        &[source.value],
+        &target,
+        &TestControl,
+        CompilePhase::FunctionSpecialization,
+    )
+    .unwrap();
+    let novarocks_expression::constant_node::ConstantNodeOutcome::Value(converted) = converted
+    else {
         panic!("the existing Int32-to-UInt32 cast must produce a value");
     };
     let output = evaluate(&identity(typed_arg(converted, target)));

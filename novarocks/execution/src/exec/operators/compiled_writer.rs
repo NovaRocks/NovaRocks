@@ -47,7 +47,6 @@ use novarocks_local_program::{LocalProgram, ProgramNodeId, ProgramNodeKind, Prog
 
 use super::compiled_writer_failure as failure;
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
-use crate::exec::expr::compiled_program::CompiledExpressionInstance;
 use crate::exec::node::table_finish::TableFinishRuntimeBinding;
 use crate::exec::node::table_write_relation::{
     RootWriteResultRelationTemplate, WriterMultiplexRelationTemplate,
@@ -64,6 +63,7 @@ use crate::exec::operators::{TableFinishOperatorFactory, TableWriterOperatorFact
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::runtime::runtime_state::RuntimeErrorState;
 use crate::runtime::task::ExecutionResult;
+use novarocks_expression::CompiledExpressionInstance;
 
 /// Build the compiled writer of local node `id` over the Task's exact write
 /// capability.
@@ -377,7 +377,7 @@ struct CompiledWriterProjector {
 #[cfg(test)]
 pub(crate) fn source_loan_test_projector(
     program: Arc<LocalProgram>,
-    observer: Option<Arc<crate::exec::expr::compiled_program::input_source::SlotSourceObserver>>,
+    observer: Option<Arc<crate::exec::operators::compiled_expression::InputAdapterObserver>>,
 ) -> Box<dyn WriterPageProjection> {
     // Reuse the original checked Slot fixture, through the actual projector's
     // project() method. This fixture tests input borrowing and handoff, not
@@ -412,7 +412,7 @@ pub(crate) fn source_loan_test_projector(
     let mut slots = None;
     instances(&mut slots, &program, &[site], &control).unwrap();
     if let Some(observer) = observer {
-        slots.as_mut().unwrap()[0].observe_slot_source(observer);
+        control.observe_input_adapter(observer);
     }
     let factory = crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
         crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),

@@ -18,7 +18,13 @@
 explicit_only = false
 
 [impact]
-paths = ["novarocks/trino-adapter/**", "novarocks/query-application/src/**"]
+paths = [
+    "novarocks/trino-adapter/**",
+    "novarocks/query-application/src/**",
+    "novarocks/frontend-application/src/query_execution/required_constant_eval.rs",
+    "novarocks/frontend-application/src/query_execution/required_constant_eval/**",
+    "novarocks/frontend-application/src/query/session_property_computation.rs",
+]
 
 [reuse]
 scope = "suite"

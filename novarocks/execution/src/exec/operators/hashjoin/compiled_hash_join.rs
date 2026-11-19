@@ -45,7 +45,6 @@ use super::native_runtime_filter::{
 };
 use super::typed_gather::JoinGatherError;
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
-use crate::exec::expr::compiled_program::CompiledExpressionInstance;
 use crate::exec::hash_table::partition_keys::source_key_owner;
 use crate::exec::hash_table::{allocation::AggregateAllocator, key_index::BulkWork};
 use crate::exec::node::join::JoinType;
@@ -66,6 +65,7 @@ use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
 use crate::runtime::task::{ExecutionFailure, ExecutionResult};
 use crate::runtime_filter::RuntimeFilterProducerFailure;
+use novarocks_expression::CompiledExpressionInstance;
 use novarocks_type_contract::{FunctionValueType, ValueTypeStorageLifetime};
 use novarocks_value_arrays::decode::ValueConversionContext;
 

@@ -21,12 +21,10 @@
 use super::kernel_memory::{self, KernelMemoryAdmission, KernelMemoryJournal};
 use super::query_memory::QueryMemoryBinding;
 use crate::exec::operators::compiled_expression::RuntimeKernelControl;
-use novarocks_functions::{
-    AggregateStateAllocator, EvaluatedArgument, InvocationPreparationFailure,
-    InvocationScalarEvaluationInstance, KernelEvaluationControl, KernelFailure,
-    ScalarEvaluationInstance, ScalarInvocationActivation, ScalarInvocationData,
-    ScalarInvocationFailure, ScalarResourceError, SelectedValues, Selection,
+use novarocks_expression::{
+    ScalarCallFailure, ScalarCallHost, ScalarCallPhase, ScalarCallRequestFacts,
 };
+use novarocks_functions::{AggregateStateAllocator, KernelEvaluationControl, ScalarResourceError};
 use novarocks_memory::attribution::scope::{AmbientEntryObservation, AmbientExitObservation};
 use novarocks_memory::{CapacityError, ShortageReceipt};
 use std::sync::Arc;
@@ -51,96 +49,7 @@ impl std::fmt::Display for RuntimeScalarMemoryRefusal {
 }
 impl std::error::Error for RuntimeScalarMemoryRefusal {}
 
-/// The original Frame transports each first cause nominally. Source/host
-/// refusal must bypass the old kernel footer and fail the original root.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum RuntimeScalarEvaluationFailure {
-    Kernel(KernelFailure),
-    Data(ScalarInvocationData),
-    Source(ScalarResourceError),
-    Host(RuntimeScalarMemoryRefusal),
-}
-impl From<KernelFailure> for RuntimeScalarEvaluationFailure {
-    fn from(cause: KernelFailure) -> Self {
-        Self::Kernel(cause)
-    }
-}
-impl From<ScalarInvocationFailure> for RuntimeScalarEvaluationFailure {
-    fn from(cause: ScalarInvocationFailure) -> Self {
-        match cause {
-            ScalarInvocationFailure::Kernel(cause) => Self::Kernel(cause),
-            ScalarInvocationFailure::Data(cause) => Self::Data(cause),
-        }
-    }
-}
-impl From<InvocationPreparationFailure> for RuntimeScalarEvaluationFailure {
-    fn from(cause: InvocationPreparationFailure) -> Self {
-        match cause {
-            InvocationPreparationFailure::Source(cause) => Self::Source(cause),
-            InvocationPreparationFailure::Kernel(cause) => Self::Kernel(cause),
-        }
-    }
-}
-impl std::fmt::Display for RuntimeScalarEvaluationFailure {
-    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Kernel(cause) => cause.fmt(out),
-            Self::Data(cause) => cause.fmt(out),
-            Self::Source(cause) => write!(out, "scalar runtime request: {cause}"),
-            Self::Host(cause) => cause.fmt(out),
-        }
-    }
-}
-impl std::error::Error for RuntimeScalarEvaluationFailure {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Kernel(cause) => Some(cause),
-            Self::Data(cause) => Some(cause),
-            Self::Source(cause) => Some(cause),
-            Self::Host(cause) => Some(cause),
-        }
-    }
-}
-
-/// Explicit synchronous loan from the real runtime caller to its one Frame.
-/// Lifetime-only generics keep this trusted Execution port dyn-compatible.
-/// The concrete host owns the static FnOnce and any account qualification.
-/// Its original observed controller must come from that same runtime caller;
-/// this interface does not prove arbitrary third-party trait implementations.
-pub trait RuntimeScalarOperationScope {
-    fn evaluate<'a>(
-        &mut self,
-        instance: &mut ScalarEvaluationInstance,
-        selection: Selection<'a>,
-        arguments: &'a [EvaluatedArgument<'a>],
-        control: &dyn KernelEvaluationControl,
-    ) -> Result<SelectedValues<'a>, RuntimeScalarEvaluationFailure>;
-    fn evaluate_invocation<'a>(
-        &mut self,
-        instance: &mut InvocationScalarEvaluationInstance,
-        selection: Selection<'a>,
-        arguments: &'a [EvaluatedArgument<'a>],
-        activation: ScalarInvocationActivation,
-        allocator: Option<&Arc<dyn AggregateStateAllocator>>,
-        control: &dyn KernelEvaluationControl,
-    ) -> Result<SelectedValues<'a>, RuntimeScalarEvaluationFailure>;
-    fn evaluate_scoped_invocation<'a>(
-        &mut self,
-        _instance: &mut InvocationScalarEvaluationInstance,
-        _scope: novarocks_functions::ScalarInvocationScope<'a>,
-        _sources: &'a [novarocks_functions::ScalarInvocationSource<'a>],
-        _activation: ScalarInvocationActivation,
-        _allocator: Option<&Arc<dyn AggregateStateAllocator>>,
-        _control: &dyn KernelEvaluationControl,
-    ) -> Result<SelectedValues<'a>, RuntimeScalarEvaluationFailure> {
-        Err(
-            KernelFailure::InvalidProgram(novarocks_functions::KernelDiagnostic::new(
-                "runtime scalar scope does not install explicit actual-domain invocation transport",
-            ))
-            .into(),
-        )
-    }
-}
+type ScalarMemoryCallFailure = ScalarCallFailure<RuntimeScalarMemoryRefusal>;
 
 /// Fixed secondary disposition for every completed leaf, retained even when
 /// the last-operation storage is reused. These facts never choose a cause.
@@ -214,18 +123,18 @@ impl<'a> RuntimeScalarMemoryScope<'a> {
     ) -> Self {
         Self { control, journal }
     }
-    fn capacity(&mut self, cause: CapacityError) -> RuntimeScalarEvaluationFailure {
+    fn capacity(&mut self, cause: CapacityError) -> ScalarMemoryCallFailure {
         // CapacityError has only fixed nominal fields. No message is formatted
         // or allocated here, including while preserving an original body Err.
         self.journal.capacity = Some(cause.clone());
-        RuntimeScalarEvaluationFailure::Host(RuntimeScalarMemoryRefusal::Capacity(cause))
+        ScalarCallFailure::Host(RuntimeScalarMemoryRefusal::Capacity(cause))
     }
     fn run<T, R>(
         &mut self,
         peak: usize,
-        body: impl FnOnce() -> Result<T, RuntimeScalarEvaluationFailure>,
+        body: impl FnOnce() -> Result<T, ScalarMemoryCallFailure>,
         mut request: R,
-    ) -> Result<T, RuntimeScalarEvaluationFailure>
+    ) -> Result<T, ScalarMemoryCallFailure>
     where
         R: FnMut(&QueryMemoryBinding, usize) -> KernelMemoryAdmission,
     {
@@ -271,13 +180,13 @@ impl<'a> RuntimeScalarMemoryScope<'a> {
                 }
                 KernelMemoryAdmission::SharedShortage(receipt) => {
                     self.journal.shortage = Some(receipt.clone());
-                    return Err(RuntimeScalarEvaluationFailure::Host(
+                    return Err(ScalarCallFailure::Host(
                         RuntimeScalarMemoryRefusal::SharedShortage(receipt),
                     ));
                 }
                 KernelMemoryAdmission::Refused(cause) => return Err(self.capacity(cause)),
                 KernelMemoryAdmission::MissingQueryMemory => {
-                    return Err(RuntimeScalarEvaluationFailure::Host(
+                    return Err(ScalarCallFailure::Host(
                         RuntimeScalarMemoryRefusal::MissingQueryMemory,
                     ));
                 }
@@ -285,160 +194,67 @@ impl<'a> RuntimeScalarMemoryScope<'a> {
         }
     }
 }
-impl RuntimeScalarOperationScope for RuntimeScalarMemoryScope<'_> {
-    fn evaluate_scoped_invocation<'a>(
-        &mut self,
-        instance: &mut InvocationScalarEvaluationInstance,
-        scope: novarocks_functions::ScalarInvocationScope<'a>,
-        sources: &'a [novarocks_functions::ScalarInvocationSource<'a>],
-        activation: ScalarInvocationActivation,
-        _allocator: Option<&Arc<dyn AggregateStateAllocator>>,
-        control: &dyn KernelEvaluationControl,
-    ) -> Result<SelectedValues<'a>, RuntimeScalarEvaluationFailure> {
+impl ScalarCallHost for RuntimeScalarMemoryScope<'_> {
+    type Refusal = RuntimeScalarMemoryRefusal;
+
+    fn begin_call(&mut self) {
         self.journal.begin();
-        // The actual installed original-domain owners declare no retired
-        // measurement profile. They still use this real synchronous scope.
-        if !instance.is_failed() && instance.invocation_resource_profile().is_some() {
-            return Err(
-                KernelFailure::InvalidProgram(novarocks_functions::KernelDiagnostic::new(
-                    "scoped invocation has no installed measurement source transport",
-                ))
-                .into(),
-            );
-        }
-        instance
-            .evaluate_scoped(scope, sources, activation, control)
-            .map_err(Into::into)
     }
 
-    fn evaluate_invocation<'a>(
+    fn run_admitted(
         &mut self,
-        instance: &mut InvocationScalarEvaluationInstance,
-        selection: Selection<'a>,
-        arguments: &'a [EvaluatedArgument<'a>],
-        activation: ScalarInvocationActivation,
-        allocator: Option<&Arc<dyn AggregateStateAllocator>>,
-        control: &dyn KernelEvaluationControl,
-    ) -> Result<SelectedValues<'a>, RuntimeScalarEvaluationFailure> {
-        self.journal.begin();
-        // The original failed-instance cause reads no account, model, host or
-        // argument. Funding refusals do not mutate an uncalled instance.
-        if instance.is_failed() {
-            return instance
-                .evaluate(selection, arguments, activation, control)
-                .map_err(Into::into);
+        phase: ScalarCallPhase,
+        facts: ScalarCallRequestFacts,
+        body: &mut dyn FnMut() -> Result<(), ScalarMemoryCallFailure>,
+    ) -> Result<(), ScalarMemoryCallFailure> {
+        let workset = complete_workset(facts.bytes(), facts.requests())?;
+        self.run(workset, body, |binding, peak| {
+            kernel_memory::request_complete_operation(Some(binding), peak)
+        })?;
+        if phase == ScalarCallPhase::Preparation {
+            // Preserve the original settled prefix before reusing the journal.
+            let preparation = std::mem::take(&mut self.journal.body);
+            self.journal.begin();
+            self.journal.preparation = Some(preparation);
+            self.journal.preparation_workset_bytes = Some(workset);
         }
-        let Some(profile) = instance.invocation_resource_profile() else {
-            return instance
-                .evaluate(selection, arguments, activation, control)
-                .map_err(Into::into);
-        };
-        let prefix = profile.preparation_prefix();
-        let prefix_workset = complete_workset(prefix.bytes(), prefix.requests())?;
-        let facts = self.run(
-            prefix_workset,
-            || {
-                profile
-                    .requests_for(instance, selection, arguments, activation, control)
-                    .map_err(Into::into)
-            },
-            |binding, peak| kernel_memory::request_complete_operation(Some(binding), peak),
-        )?;
-        // run has already disposed this prefix. Preserve its actual fixed
-        // receipt before reusing the original last-operation journal.
-        let preparation = std::mem::take(&mut self.journal.body);
-        self.journal.begin();
-        self.journal.preparation = Some(preparation);
-        self.journal.preparation_workset_bytes = Some(prefix_workset);
-        let (bytes, requests) = if facts.requires_host_callback() {
-            // Only the reachable body borrows host labels. Failed, wrong
-            // arity/arguments and ValidateOnly retain their original order.
-            let host = self
-                .control
-                .invocation_host(allocator)
-                .map_err(RuntimeScalarEvaluationFailure::Source)?;
-            let callback = host.limit_failure_request_facts().map_err(|cause| {
-                use novarocks_type_contract::{CompileControlError, ControlResourceError};
-                RuntimeScalarEvaluationFailure::Source(match cause {
-                    ControlResourceError::SourceModel(detail) => {
-                        ScalarResourceError::SourceModel(detail)
-                    }
-                    ControlResourceError::Control(CompileControlError::ResourceExhausted) => {
-                        ScalarResourceError::Arithmetic
-                    }
-                    ControlResourceError::Control(_) => ScalarResourceError::Invariant(
-                        "whole-invocation host numerical source returned a control refusal",
-                    ),
-                })
-            })?;
-            let bytes = facts.bytes().checked_add(callback.requested_bytes).ok_or(
-                RuntimeScalarEvaluationFailure::Source(ScalarResourceError::Arithmetic),
-            )?;
-            let requests = facts.requests().checked_add(callback.requests).ok_or(
-                RuntimeScalarEvaluationFailure::Source(ScalarResourceError::Arithmetic),
-            )?;
-            (bytes, requests)
-        } else {
-            (facts.bytes(), facts.requests())
-        };
-        let workset = complete_workset(bytes, requests)?;
-        self.run(
-            workset,
-            || {
-                instance
-                    .evaluate(selection, arguments, activation, control)
-                    .map_err(Into::into)
-            },
-            |binding, peak| kernel_memory::request_complete_operation(Some(binding), peak),
-        )
+        Ok(())
     }
-    fn evaluate<'a>(
+
+    fn callback_request_facts(
         &mut self,
-        instance: &mut ScalarEvaluationInstance,
-        selection: Selection<'a>,
-        arguments: &'a [EvaluatedArgument<'a>],
-        control: &dyn KernelEvaluationControl,
-    ) -> Result<SelectedValues<'a>, RuntimeScalarEvaluationFailure> {
-        self.journal.begin();
-        let Some(profile) = instance.invocation_resource_profile() else {
-            // Explicitly uncovered sources keep their original call. A positive
-            // source's model/host error never enters this branch.
-            return instance
-                .evaluate(selection, arguments, control)
-                .map_err(Into::into);
-        };
-        let facts = profile
-            .requests_for(selection, arguments)
-            .map_err(RuntimeScalarEvaluationFailure::Source)?;
-        let peak = facts
-            .requests()
-            .checked_mul(novarocks_memory::attribution::ATTRIBUTION_TOKEN_BYTES)
-            .and_then(|tokens| facts.bytes().checked_add(tokens))
-            .ok_or(RuntimeScalarEvaluationFailure::Source(
-                ScalarResourceError::Arithmetic,
-            ))?;
-        self.run(
-            peak,
-            || {
-                instance
-                    .evaluate(selection, arguments, control)
-                    .map_err(Into::into)
-            },
-            |binding, peak| kernel_memory::request_complete_operation(Some(binding), peak),
-        )
+        allocator: Option<&Arc<dyn AggregateStateAllocator>>,
+    ) -> Result<ScalarCallRequestFacts, ScalarMemoryCallFailure> {
+        use novarocks_type_contract::{CompileControlError, ControlResourceError};
+        let host = self
+            .control
+            .invocation_host(allocator)
+            .map_err(ScalarCallFailure::Source)?;
+        let facts = host.limit_failure_request_facts().map_err(|cause| {
+            ScalarCallFailure::Source(match cause {
+                ControlResourceError::SourceModel(detail) => {
+                    ScalarResourceError::SourceModel(detail)
+                }
+                ControlResourceError::Control(CompileControlError::ResourceExhausted) => {
+                    ScalarResourceError::Arithmetic
+                }
+                ControlResourceError::Control(_) => ScalarResourceError::Invariant(
+                    "whole-invocation host numerical source returned a control refusal",
+                ),
+            })
+        })?;
+        Ok(ScalarCallRequestFacts::new(
+            facts.requested_bytes,
+            facts.requests,
+        ))
     }
 }
 
-fn complete_workset(
-    bytes: usize,
-    requests: usize,
-) -> Result<usize, RuntimeScalarEvaluationFailure> {
+fn complete_workset(bytes: usize, requests: usize) -> Result<usize, ScalarMemoryCallFailure> {
     requests
         .checked_mul(novarocks_memory::attribution::ATTRIBUTION_TOKEN_BYTES)
         .and_then(|tokens| bytes.checked_add(tokens))
-        .ok_or(RuntimeScalarEvaluationFailure::Source(
-            ScalarResourceError::Arithmetic,
-        ))
+        .ok_or(ScalarCallFailure::Source(ScalarResourceError::Arithmetic))
 }
 impl Drop for RuntimeScalarMemoryScope<'_> {
     fn drop(&mut self) {
@@ -457,43 +273,55 @@ mod contract_tests;
 mod tests {
     use super::*;
 
+    use novarocks_expression::{
+        ScalarCallFailure, ScalarCallHost, ScalarCallPhase, ScalarCallRequestFacts,
+    };
+
     // Compile the actual dyn/lifetime contract before any production grant.
     fn borrow_scope(
-        scope: &mut impl RuntimeScalarOperationScope,
-    ) -> &mut dyn RuntimeScalarOperationScope {
+        scope: &mut impl ScalarCallHost<Refusal = RuntimeScalarMemoryRefusal>,
+    ) -> &mut dyn ScalarCallHost<Refusal = RuntimeScalarMemoryRefusal> {
         scope
     }
+
     struct Refuse;
-    impl RuntimeScalarOperationScope for Refuse {
-        fn evaluate_invocation<'a>(
+    impl ScalarCallHost for Refuse {
+        type Refusal = RuntimeScalarMemoryRefusal;
+
+        fn begin_call(&mut self) {}
+
+        fn run_admitted(
             &mut self,
-            _: &mut InvocationScalarEvaluationInstance,
-            _: Selection<'a>,
-            _: &'a [EvaluatedArgument<'a>],
-            _: ScalarInvocationActivation,
-            _: Option<&Arc<dyn AggregateStateAllocator>>,
-            _: &dyn KernelEvaluationControl,
-        ) -> Result<SelectedValues<'a>, RuntimeScalarEvaluationFailure> {
-            Err(RuntimeScalarEvaluationFailure::Host(
+            _: ScalarCallPhase,
+            _: ScalarCallRequestFacts,
+            _: &mut dyn FnMut() -> Result<(), ScalarCallFailure<Self::Refusal>>,
+        ) -> Result<(), ScalarCallFailure<Self::Refusal>> {
+            Err(ScalarCallFailure::Host(
                 RuntimeScalarMemoryRefusal::MissingQueryMemory,
             ))
         }
-        fn evaluate<'a>(
+
+        fn callback_request_facts(
             &mut self,
-            _: &mut ScalarEvaluationInstance,
-            _: Selection<'a>,
-            _: &'a [EvaluatedArgument<'a>],
-            _: &dyn KernelEvaluationControl,
-        ) -> Result<SelectedValues<'a>, RuntimeScalarEvaluationFailure> {
-            Err(RuntimeScalarEvaluationFailure::Host(
+            _: Option<&Arc<dyn AggregateStateAllocator>>,
+        ) -> Result<ScalarCallRequestFacts, ScalarCallFailure<Self::Refusal>> {
+            Err(ScalarCallFailure::Host(
                 RuntimeScalarMemoryRefusal::MissingQueryMemory,
             ))
         }
     }
+
     #[test]
     fn runtime_scalar_memory_scope_is_a_borrowed_dyn_compatible_port() {
-        let mut scope = Refuse;
-        let _: &mut dyn RuntimeScalarOperationScope = borrow_scope(&mut scope);
+        let mut refusal = Refuse;
+        let _: &mut dyn ScalarCallHost<Refusal = RuntimeScalarMemoryRefusal> =
+            borrow_scope(&mut refusal);
+
+        let control = RuntimeKernelControl::new(Arc::default());
+        let mut journal = RuntimeScalarMemoryJournal::default();
+        let mut scope = RuntimeScalarMemoryScope::new(&control, &mut journal);
+        let _: &mut dyn ScalarCallHost<Refusal = RuntimeScalarMemoryRefusal> =
+            borrow_scope(&mut scope);
     }
 }
 

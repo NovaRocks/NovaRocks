@@ -2729,10 +2729,9 @@ pub(crate) mod tests {
 
     fn compiled_writer_source_loan(provider: bool) {
         use crate::exec::chunk::{record_batch_additional_bytes, record_batch_shared_owner_bytes};
-        use crate::exec::expr::compiled_program::{
-            input_source::{BorrowedInputSource, SlotSourceObserver},
-            input_source_tests::input_chunk,
-            tests::{SeedMode, program},
+        use crate::exec::expr::fixtures::{SeedMode, input_chunk, program};
+        use crate::exec::operators::compiled_expression::{
+            InputAdapterObserver, assert_original_chunk_input,
         };
         use crate::exec::operators::compiled_writer::source_loan_test_projector;
         use crate::exec::pipeline::operator::ExitProgress;
@@ -2981,15 +2980,15 @@ pub(crate) mod tests {
         let expected_array = Arc::as_ptr(input.record_batch().column(1)) as *const () as usize;
         let seen = Arc::new(Mutex::new(None));
         let observed = seen.clone();
-        let observer: Arc<SlotSourceObserver> = Arc::new(move |column| {
-            let (array, source) = column.into_parts();
-            let BorrowedInputSource::Attached(source) = source else {
-                panic!("checked Slot must borrow its original attached source")
-            };
+        let observer: Arc<InputAdapterObserver> = Arc::new(move |chunk, input| {
+            assert_original_chunk_input(chunk, input);
+            let array = input.batch().column(1);
+            let source = chunk.source_authority();
+            assert!(source.is_attached());
             let mut seen = observed.lock().unwrap();
             assert!(
                 seen.is_none(),
-                "this fixture evaluates exactly one checked Slot"
+                "this fixture adapts exactly one checked root"
             );
             *seen = Some((
                 Arc::as_ptr(array) as *const () as usize,

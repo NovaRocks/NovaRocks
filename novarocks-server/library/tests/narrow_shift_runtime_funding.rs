@@ -27,9 +27,10 @@ use arrow::{
     datatypes::DataType,
 };
 use novarocks_execution::runtime::scalar_memory::{
-    RuntimeScalarEvaluationFailure, RuntimeScalarMemoryRefusal,
+    RuntimeScalarMemoryRefusal,
     test_support::{RuntimeScalarFrameForTest, RuntimeScalarWrapperForTest},
 };
+use novarocks_expression::ScalarCallFailure;
 use novarocks_functions::{EvaluatedArgument, Selection};
 use novarocks_memory::lane::global_store;
 use shift_helpers::*;
@@ -247,9 +248,7 @@ fn original_narrow_empty_small_and_rounding_bands_preserve_nominal_missing_polic
                 let (failure, refused) = missing.evaluate(Selection::all(rows), &arguments);
                 assert_eq!(
                     failure.unwrap_err(),
-                    RuntimeScalarEvaluationFailure::Host(
-                        RuntimeScalarMemoryRefusal::MissingQueryMemory
-                    )
+                    ScalarCallFailure::Host(RuntimeScalarMemoryRefusal::MissingQueryMemory)
                 );
                 assert!(refused.body.settlement.is_none());
                 drop(wrapper);

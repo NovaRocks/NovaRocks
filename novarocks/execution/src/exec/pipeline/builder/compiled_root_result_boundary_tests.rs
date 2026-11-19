@@ -354,10 +354,8 @@ fn compiled_project_schema_scope_keeps_original_early_factory_errors() {
         assert_eq!(failure.detail(), direct.detail());
         assert_eq!((host.calls, host.bodies), (0, 0));
     }
-    let program = crate::exec::expr::compiled_program::tests::program(
-        crate::exec::expr::compiled_program::tests::SeedMode::Input,
-        false,
-    );
+    let program =
+        crate::exec::expr::fixtures::program(crate::exec::expr::fixtures::SeedMode::Input, false);
     let mut host = schema_scope(&program, CompiledSchemaSite::FinalResult);
     let error = Arc::new(RuntimeErrorState::default());
     let direct = CompiledProjectProcessorFactory::try_new_final_result_boundary(

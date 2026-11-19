@@ -27,9 +27,10 @@ use arrow::{
     datatypes::DataType,
 };
 use novarocks_execution::runtime::scalar_memory::{
-    RuntimeScalarEvaluationFailure, RuntimeScalarMemoryRefusal,
+    RuntimeScalarMemoryRefusal,
     test_support::{RuntimeScalarFrameForTest, RuntimeScalarWrapperForTest},
 };
+use novarocks_expression::ScalarCallFailure;
 use novarocks_functions::{
     ConstantPolicy, ConstantPool, EvaluatedArgument, SelectedValues, Selection,
 };
@@ -359,9 +360,7 @@ fn original_bitwise_small_empty_and_rounding_wrappers_keep_missing_binding_nomin
                 let (result, refusal) = missing.evaluate(Selection::all(n), &args);
                 assert_eq!(
                     result.unwrap_err(),
-                    RuntimeScalarEvaluationFailure::Host(
-                        RuntimeScalarMemoryRefusal::MissingQueryMemory
-                    )
+                    ScalarCallFailure::Host(RuntimeScalarMemoryRefusal::MissingQueryMemory)
                 );
                 assert!(refusal.body.settlement.is_none());
                 eprintln!(

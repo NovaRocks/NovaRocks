@@ -597,7 +597,7 @@ fn compiled_generate_series_compile_three_causes_return_at_original_callback_pre
         }
     }
     let source = literal_source([Some(1), Some(7), Some(2)], true, false);
-    let functions = crate::exec::expr::compiled_program::tests::rng_subset();
+    let functions = novarocks_functions::testkit::rng_subset();
     let providers =
         PureProviderProgramCatalog::<std::io::Error>::try_new(&[], vec![], &FixtureControl)
             .unwrap();

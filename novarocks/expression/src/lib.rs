@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Pure compilation of self-contained scalar expression units.
+//! Pure compilation and evaluation of self-contained scalar expression units.
 
 mod definitions;
 pub use definitions::*;
@@ -38,3 +38,15 @@ mod failure;
 use compiled::CompiledParts;
 
 pub(crate) use creation::ProgramCreationFailure;
+
+mod evaluator;
+pub use evaluator::constant_node;
+pub use evaluator::{
+    CompiledExpressionInstance, CompiledFilterConjunctionInstance, EvaluationInput,
+    ExprEvaluationFailure, InputColumnProjection, InputSourceStorage, InputStorageFailure,
+    RequiredExpressionRowError, ScalarCallFailure, ScalarCallHost, ScalarCallPhase,
+    ScalarCallRequestFacts,
+};
+
+#[cfg(any(test, novarocks_dev_controls))]
+pub mod testkit;

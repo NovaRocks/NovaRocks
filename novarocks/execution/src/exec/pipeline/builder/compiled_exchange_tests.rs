@@ -382,7 +382,7 @@ fn options(root_sink_dop: Option<NonZeroUsize>) -> LocalCompileOptions {
 fn compile(package: FragmentPackage, root_sink_dop: Option<NonZeroUsize>) -> Arc<LocalProgram> {
     // Literal-only fragments bind no function; the catalog is the real
     // sealed RAND subset because an empty catalog is refused.
-    let functions = crate::exec::expr::compiled_program::tests::rng_subset();
+    let functions = novarocks_functions::testkit::rng_subset();
     let providers =
         PureProviderProgramCatalog::<std::io::Error>::try_new(&[], vec![], &FixtureControl)
             .unwrap();
@@ -1313,7 +1313,7 @@ fn unknown_exchange_source_does_not_gain_project_placement() {
     let (plan, receiver) = drop_distribution_key_project_plan(false, &ROWS);
     let mut checked = packages(&plan);
     let consumer = checked.remove(&FragmentId::new(2)).unwrap();
-    let functions = crate::exec::expr::compiled_program::tests::rng_subset();
+    let functions = novarocks_functions::testkit::rng_subset();
     let providers =
         PureProviderProgramCatalog::<std::io::Error>::try_new(&[], vec![], &FixtureControl)
             .unwrap();

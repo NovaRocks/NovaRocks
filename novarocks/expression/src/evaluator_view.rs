@@ -15,17 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Read-only views consumed by the evaluator during its staged migration.
+//! Read-only compiled unit views for relational operators and local programs.
 use super::*;
 pub use crate::{
     ComparisonSite, CompiledExprId, CompiledRoot, InputBinding, StaticExprKind, StaticExprNode,
 };
 use novarocks_functions::{PreparedPureKernel, PureCallSpecialization};
 use novarocks_type_contract::ExpressionUseId;
-pub fn call(unit: &CompiledExprSet, id: ExpressionUseId) -> Option<&PureCallSpecialization> {
+pub(crate) fn call(unit: &CompiledExprSet, id: ExpressionUseId) -> Option<&PureCallSpecialization> {
     unit.calls().get(&id)
 }
-pub fn prepared(unit: &CompiledExprSet, id: ExpressionUseId) -> Option<&PreparedPureKernel> {
+pub(crate) fn prepared(unit: &CompiledExprSet, id: ExpressionUseId) -> Option<&PreparedPureKernel> {
     call(unit, id).map(|c| c.prepared())
 }
 
@@ -115,9 +115,6 @@ impl CompiledExprSet {
     }
     pub fn effects(&self) -> &BTreeMap<ExpressionUseId, ScopedExpressionEffects> {
         &self.effects
-    }
-    pub fn storage_lifetime(&self) -> ValueTypeStorageLifetime {
-        self.storage.clone()
     }
 }
 impl UnitRecipes {

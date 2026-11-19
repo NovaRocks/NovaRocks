@@ -346,3 +346,52 @@ fn raw_time_text_keeps_distinct_carrier_whitespace_and_numeric_grammar() {
         );
     }
 }
+
+#[test]
+fn calendar_time_exact_successful_null_fact_retains_nonnullable_date_and_nano_domains() {
+    use novarocks_functions::CastPrepareError;
+    for dtype in [
+        DataType::Date32,
+        DataType::Timestamp(TimeUnit::Nanosecond, None),
+    ] {
+        assert!(!novarocks_functions::carrier_cast_can_produce_null(
+            &dtype,
+            &DataType::Time64(TimeUnit::Microsecond),
+            false
+        ));
+        assert!(
+            PreparedCastRecipe::try_new(
+                CastOperation::Carrier,
+                &FunctionValueType::new(dtype, false),
+                &FunctionValueType::new(DataType::Time64(TimeUnit::Microsecond), false),
+                DecimalOverflowPolicy::ReportError,
+                false,
+                &Control::default()
+            )
+            .is_ok()
+        );
+    }
+    for unit in [
+        TimeUnit::Second,
+        TimeUnit::Millisecond,
+        TimeUnit::Microsecond,
+    ] {
+        let dtype = DataType::Timestamp(unit, None);
+        assert!(novarocks_functions::carrier_cast_can_produce_null(
+            &dtype,
+            &DataType::Time64(TimeUnit::Microsecond),
+            false
+        ));
+        assert_eq!(
+            PreparedCastRecipe::try_new(
+                CastOperation::Carrier,
+                &FunctionValueType::new(dtype, false),
+                &FunctionValueType::new(DataType::Time64(TimeUnit::Microsecond), false),
+                DecimalOverflowPolicy::ReportError,
+                false,
+                &Control::default()
+            ),
+            Err(CastPrepareError::TypeMismatch)
+        );
+    }
+}

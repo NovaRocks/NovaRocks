@@ -1063,7 +1063,7 @@ mod tests {
             &mut work,
         )
         .unwrap();
-        let catalog = crate::exec::expr::compiled_program::tests::rng_subset();
+        let catalog = novarocks_functions::testkit::rng_subset();
         let key_unit = compile_expr_set_pure(
             &unit,
             EvaluationEnvironment {

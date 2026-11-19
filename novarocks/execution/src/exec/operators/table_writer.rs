@@ -2960,7 +2960,7 @@ pub(crate) mod tests {
         let program = Arc::new(
             novarocks_local_compiler::compile_fragment(
                 validated,
-                &crate::exec::expr::compiled_program::tests::rng_subset(),
+                &novarocks_functions::testkit::rng_subset(),
                 novarocks_local_compiler::LocalCompileOptions {
                     pipeline_dop: std::num::NonZeroUsize::MIN,
                     root_sink_dop: None,

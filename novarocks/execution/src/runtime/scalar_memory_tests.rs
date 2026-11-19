@@ -17,6 +17,12 @@
 
 use super::*;
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
+use novarocks_expression::testkit::{call_invocation, call_scalar};
+use novarocks_functions::{
+    AggregateStateAllocator, EvaluatedArgument, InvocationScalarEvaluationInstance,
+    KernelEvaluationControl, KernelFailure, ScalarEvaluationInstance, ScalarInvocationActivation,
+    ScalarResourceError, SelectedValues, Selection,
+};
 use novarocks_memory::{AccountKind, AuthorityConfig, ExternalRef, MemoryAuthority};
 use novarocks_types::{
     QueryId,
@@ -26,6 +32,8 @@ use std::{
     cell::{Cell, RefCell},
     sync::Arc,
 };
+
+type CallFailure = novarocks_expression::ScalarCallFailure<RuntimeScalarMemoryRefusal>;
 
 fn bound() -> QueryMemoryBinding {
     let mut cfg = AuthorityConfig::new(131072, 65536, 65536);
@@ -146,16 +154,16 @@ fn runtime_invocation_memory_real_pending_registers_and_releases_before_actual_j
             occupied.stop_producing().unwrap();
         });
         ready_rx.recv().unwrap();
-        let output = RuntimeScalarMemoryScope::new(&control, &mut journal)
-            .evaluate_invocation(
-                &mut instance,
-                Selection::all(1),
-                &arguments,
-                ScalarInvocationActivation::Activated,
-                Some(&host),
-                &control,
-            )
-            .unwrap();
+        let output = call_invocation(
+            &mut RuntimeScalarMemoryScope::new(&control, &mut journal),
+            &mut instance,
+            Selection::all(1),
+            &arguments,
+            ScalarInvocationActivation::Activated,
+            Some(&host),
+            &control,
+        )
+        .unwrap();
         assert_eq!(
             output
                 .values()
@@ -189,7 +197,8 @@ fn runtime_invocation_memory_activated_empty_requires_the_original_host_and_pres
     let missing = control(Some(&binding), Arc::default());
     let mut journal = RuntimeScalarMemoryJournal::default();
     assert!(matches!(
-        RuntimeScalarMemoryScope::new(&missing, &mut journal).evaluate_invocation(
+        call_invocation(
+            &mut RuntimeScalarMemoryScope::new(&missing, &mut journal),
             &mut instance,
             Selection::all(0),
             &arguments,
@@ -197,23 +206,21 @@ fn runtime_invocation_memory_activated_empty_requires_the_original_host_and_pres
             Some(&host),
             &missing
         ),
-        Err(RuntimeScalarEvaluationFailure::Source(
-            ScalarResourceError::Invariant(
-                "whole-invocation runtime has no concrete allocation host"
-            )
-        ))
+        Err(CallFailure::Source(ScalarResourceError::Invariant(
+            "whole-invocation runtime has no concrete allocation host"
+        )))
     ));
     assert!(!instance.is_failed());
-    let output = RuntimeScalarMemoryScope::new(&original, &mut journal)
-        .evaluate_invocation(
-            &mut instance,
-            Selection::all(0),
-            &arguments,
-            ScalarInvocationActivation::Activated,
-            Some(&host),
-            &original,
-        )
-        .unwrap();
+    let output = call_invocation(
+        &mut RuntimeScalarMemoryScope::new(&original, &mut journal),
+        &mut instance,
+        Selection::all(0),
+        &arguments,
+        ScalarInvocationActivation::Activated,
+        Some(&host),
+        &original,
+    )
+    .unwrap();
     assert_eq!(output.values().len(), 0);
     assert_completed_operation(journal.preparation.as_ref().unwrap());
     assert_completed_operation(&journal.body);
@@ -261,16 +268,16 @@ fn runtime_invocation_memory_actual_json_two_grants_use_same_account_and_origina
         .limit_failure_request_facts()
         .unwrap();
     let mut journal = RuntimeScalarMemoryJournal::default();
-    let output = RuntimeScalarMemoryScope::new(&control, &mut journal)
-        .evaluate_invocation(
-            &mut instance,
-            selection,
-            &arguments,
-            ScalarInvocationActivation::Activated,
-            Some(&host),
-            &control,
-        )
-        .unwrap();
+    let output = call_invocation(
+        &mut RuntimeScalarMemoryScope::new(&control, &mut journal),
+        &mut instance,
+        selection,
+        &arguments,
+        ScalarInvocationActivation::Activated,
+        Some(&host),
+        &control,
+    )
+    .unwrap();
     let strings = output
         .values()
         .as_any()
@@ -311,7 +318,8 @@ fn runtime_invocation_memory_missing_binding_and_policy_refuse_before_instance_c
         let key: ArrayRef = Arc::new(StringArray::from(vec!["key"]));
         let arguments = [EvaluatedArgument::Column(&key)];
         let mut journal = RuntimeScalarMemoryJournal::default();
-        let result = RuntimeScalarMemoryScope::new(&control, &mut journal).evaluate_invocation(
+        let result = call_invocation(
+            &mut RuntimeScalarMemoryScope::new(&control, &mut journal),
             &mut instance,
             Selection::all(1),
             &arguments,
@@ -322,15 +330,13 @@ fn runtime_invocation_memory_missing_binding_and_policy_refuse_before_instance_c
         assert!(
             matches!(
                 &result,
-                Err(RuntimeScalarEvaluationFailure::Host(
+                Err(CallFailure::Host(
                     RuntimeScalarMemoryRefusal::MissingQueryMemory
                 ))
             ) && !capacity
                 || matches!(
                     &result,
-                    Err(RuntimeScalarEvaluationFailure::Host(
-                        RuntimeScalarMemoryRefusal::Capacity(_)
-                    ))
+                    Err(CallFailure::Host(RuntimeScalarMemoryRefusal::Capacity(_)))
                 ) && capacity
         );
         assert!(!instance.is_failed());
@@ -356,7 +362,8 @@ fn runtime_invocation_memory_cached_birth_host_rebind_is_source_refusal_without_
     let key: ArrayRef = Arc::new(StringArray::from(vec!["key"]));
     let arguments = [EvaluatedArgument::Column(&key)];
     let mut journal = RuntimeScalarMemoryJournal::default();
-    let result = RuntimeScalarMemoryScope::new(&rebound, &mut journal).evaluate_invocation(
+    let result = call_invocation(
+        &mut RuntimeScalarMemoryScope::new(&rebound, &mut journal),
         &mut instance,
         Selection::all(1),
         &arguments,
@@ -366,25 +373,23 @@ fn runtime_invocation_memory_cached_birth_host_rebind_is_source_refusal_without_
     );
     assert!(matches!(
         result,
-        Err(RuntimeScalarEvaluationFailure::Source(
-            ScalarResourceError::Invariant(
-                "whole-invocation instance allocation host differs from its runtime owner"
-            )
-        ))
+        Err(CallFailure::Source(ScalarResourceError::Invariant(
+            "whole-invocation instance allocation host differs from its runtime owner"
+        )))
     ));
     assert!(!instance.is_failed());
     assert_completed_operation(journal.preparation.as_ref().unwrap());
     assert!(journal.body.settlement.is_none());
-    let output = RuntimeScalarMemoryScope::new(&original, &mut journal)
-        .evaluate_invocation(
-            &mut instance,
-            Selection::all(1),
-            &arguments,
-            ScalarInvocationActivation::Activated,
-            Some(&host),
-            &original,
-        )
-        .unwrap();
+    let output = call_invocation(
+        &mut RuntimeScalarMemoryScope::new(&original, &mut journal),
+        &mut instance,
+        Selection::all(1),
+        &arguments,
+        ScalarInvocationActivation::Activated,
+        Some(&host),
+        &original,
+    )
+    .unwrap();
     assert_eq!(
         output
             .values()
@@ -416,7 +421,8 @@ fn runtime_invocation_memory_original_early_and_validate_only_paths_do_not_quali
     ] {
         let mut instance = actual_json(&[DataType::Utf8], &host);
         let mut journal = RuntimeScalarMemoryJournal::default();
-        let result = RuntimeScalarMemoryScope::new(&caller, &mut journal).evaluate_invocation(
+        let result = call_invocation(
+            &mut RuntimeScalarMemoryScope::new(&caller, &mut journal),
             &mut instance,
             Selection::all(1),
             &[],
@@ -424,9 +430,7 @@ fn runtime_invocation_memory_original_early_and_validate_only_paths_do_not_quali
             None,
             &caller,
         );
-        let Err(RuntimeScalarEvaluationFailure::Kernel(KernelFailure::InvalidProgram(cause))) =
-            result
-        else {
+        let Err(CallFailure::Kernel(KernelFailure::InvalidProgram(cause))) = result else {
             panic!("original early contract refusal")
         };
         if activation == ScalarInvocationActivation::ValidateOnly {
@@ -448,16 +452,16 @@ fn runtime_invocation_memory_original_early_and_validate_only_paths_do_not_quali
     let empty: ArrayRef = Arc::new(StringArray::from(Vec::<&str>::new()));
     let arguments = [EvaluatedArgument::Column(&empty)];
     let mut journal = RuntimeScalarMemoryJournal::default();
-    let output = RuntimeScalarMemoryScope::new(&caller, &mut journal)
-        .evaluate_invocation(
-            &mut instance,
-            Selection::all(0),
-            &arguments,
-            ScalarInvocationActivation::ValidateOnly,
-            None,
-            &caller,
-        )
-        .unwrap();
+    let output = call_invocation(
+        &mut RuntimeScalarMemoryScope::new(&caller, &mut journal),
+        &mut instance,
+        Selection::all(0),
+        &arguments,
+        ScalarInvocationActivation::ValidateOnly,
+        None,
+        &caller,
+    )
+    .unwrap();
     assert_eq!(output.values().len(), 0);
     assert_completed_operation(journal.preparation.as_ref().unwrap());
     assert_completed_operation(&journal.body);
@@ -501,7 +505,8 @@ fn runtime_invocation_memory_shape_refusal_latches_and_failed_replay_reads_no_st
     let mut instance = actual_json(std::slice::from_ref(declared.data_type()), &host);
     let arguments = [EvaluatedArgument::Scalar(&unsupported)];
     let mut journal = RuntimeScalarMemoryJournal::default();
-    let result = RuntimeScalarMemoryScope::new(&control, &mut journal).evaluate_invocation(
+    let result = call_invocation(
+        &mut RuntimeScalarMemoryScope::new(&control, &mut journal),
         &mut instance,
         Selection::try_sparse(4, &[1, 3]).unwrap(),
         &arguments,
@@ -510,7 +515,7 @@ fn runtime_invocation_memory_shape_refusal_latches_and_failed_replay_reads_no_st
         &control,
     );
     let failure = match result {
-        Err(RuntimeScalarEvaluationFailure::Kernel(cause)) => cause,
+        Err(CallFailure::Kernel(cause)) => cause,
         Err(error) => panic!("the carrier must remain an outer contract refusal: {error:?}"),
         Ok(_) => panic!("the unsupported carrier must not produce an output"),
     };
@@ -533,7 +538,8 @@ fn runtime_invocation_memory_shape_refusal_latches_and_failed_replay_reads_no_st
         novarocks_functions::KernelDiagnostic::new("stopped"),
     ));
     let stopped = super::contract_tests::control(None, error);
-    let replay = RuntimeScalarMemoryScope::new(&stopped, &mut journal).evaluate_invocation(
+    let replay = call_invocation(
+        &mut RuntimeScalarMemoryScope::new(&stopped, &mut journal),
         &mut instance,
         Selection::all(usize::MAX),
         &[],
@@ -543,9 +549,7 @@ fn runtime_invocation_memory_shape_refusal_latches_and_failed_replay_reads_no_st
     );
     assert!(matches!(
         replay,
-        Err(RuntimeScalarEvaluationFailure::Kernel(
-            KernelFailure::InstanceFailed
-        ))
+        Err(CallFailure::Kernel(KernelFailure::InstanceFailed))
     ));
     assert!(
         journal.workset_bytes.is_none()
@@ -575,20 +579,20 @@ fn runtime_invocation_memory_real_date_data_keeps_selected_rows_and_failed_repla
         &host,
     );
     let mut journal = RuntimeScalarMemoryJournal::default();
-    let failure = RuntimeScalarMemoryScope::new(&control, &mut journal)
-        .evaluate_invocation(
-            &mut instance,
-            Selection::try_sparse(4, &[1, 3]).unwrap(),
-            &[
-                EvaluatedArgument::Column(&keys),
-                EvaluatedArgument::Column(&values),
-            ],
-            ScalarInvocationActivation::Activated,
-            Some(&host),
-            &control,
-        )
-        .unwrap_err();
-    let RuntimeScalarEvaluationFailure::Data(data) = failure else {
+    let failure = call_invocation(
+        &mut RuntimeScalarMemoryScope::new(&control, &mut journal),
+        &mut instance,
+        Selection::try_sparse(4, &[1, 3]).unwrap(),
+        &[
+            EvaluatedArgument::Column(&keys),
+            EvaluatedArgument::Column(&values),
+        ],
+        ScalarInvocationActivation::Activated,
+        Some(&host),
+        &control,
+    )
+    .unwrap_err();
+    let CallFailure::Data(data) = failure else {
         panic!("the actual Date32 value error must retain its Data channel");
     };
     assert_eq!(
@@ -606,7 +610,8 @@ fn runtime_invocation_memory_real_date_data_keeps_selected_rows_and_failed_repla
     ));
     let stopped = super::contract_tests::control(None, error);
     assert!(matches!(
-        RuntimeScalarMemoryScope::new(&stopped, &mut journal).evaluate_invocation(
+        call_invocation(
+            &mut RuntimeScalarMemoryScope::new(&stopped, &mut journal),
             &mut instance,
             Selection::all(usize::MAX),
             &[],
@@ -614,9 +619,7 @@ fn runtime_invocation_memory_real_date_data_keeps_selected_rows_and_failed_repla
             None,
             &stopped,
         ),
-        Err(RuntimeScalarEvaluationFailure::Kernel(
-            KernelFailure::InstanceFailed
-        ))
+        Err(CallFailure::Kernel(KernelFailure::InstanceFailed))
     ));
     assert!(
         journal.workset_bytes.is_none()
@@ -695,9 +698,7 @@ fn runtime_scalar_memory_missing_binding_and_stop_before_request_run_no_body() {
         if stopped {
             assert_eq!(
                 result,
-                Err::<(), _>(RuntimeScalarEvaluationFailure::Kernel(
-                    KernelFailure::Cancelled
-                ))
+                Err::<(), _>(CallFailure::Kernel(KernelFailure::Cancelled))
             );
             assert_eq!(
                 error.error().unwrap().detail(),
@@ -713,7 +714,7 @@ fn runtime_scalar_memory_missing_binding_and_stop_before_request_run_no_body() {
         } else {
             assert_eq!(
                 result,
-                Err::<(), _>(RuntimeScalarEvaluationFailure::Host(
+                Err::<(), _>(CallFailure::Host(
                     RuntimeScalarMemoryRefusal::MissingQueryMemory
                 ))
             );
@@ -745,9 +746,7 @@ fn runtime_scalar_memory_stop_after_actual_grant_returns_unused_rights() {
     );
     assert_eq!(
         result,
-        Err::<(), _>(RuntimeScalarEvaluationFailure::Kernel(
-            KernelFailure::Cancelled
-        ))
+        Err::<(), _>(CallFailure::Kernel(KernelFailure::Cancelled))
     );
     let domain = domain.into_inner().unwrap();
     assert!(domain.snapshot().sealed);
@@ -835,9 +834,7 @@ fn runtime_scalar_memory_pending_uses_original_registered_stop_notification() {
             );
             assert_eq!(
                 result,
-                Err::<(), _>(RuntimeScalarEvaluationFailure::Kernel(
-                    KernelFailure::Cancelled
-                ))
+                Err::<(), _>(CallFailure::Kernel(KernelFailure::Cancelled))
             );
             if let Some(notifier) = notifier {
                 notifier.join().unwrap();
@@ -881,14 +878,12 @@ fn runtime_scalar_memory_body_first_and_success_next_step_remain_nominal_and_dis
         if body_error {
             assert_eq!(
                 result,
-                Err(RuntimeScalarEvaluationFailure::Kernel(
-                    KernelFailure::InstanceFailed
-                ))
+                Err(CallFailure::Kernel(KernelFailure::InstanceFailed))
             );
             assert!(journal.capacity.is_none());
         } else {
             assert!(
-                matches!(result,Err(RuntimeScalarEvaluationFailure::Host(RuntimeScalarMemoryRefusal::Capacity(CapacityError::Closed{account}))) if account==binding.account().id())
+                matches!(result,Err(CallFailure::Host(RuntimeScalarMemoryRefusal::Capacity(CapacityError::Closed{account}))) if account==binding.account().id())
             );
         }
         assert_eq!(calls.get(), 1);
@@ -913,12 +908,10 @@ fn runtime_scalar_memory_real_account_policy_refusal_never_runs_body() {
     let mut journal = RuntimeScalarMemoryJournal::default();
     let result = RuntimeScalarMemoryScope::new(&control, &mut journal).run(
         608,
-        || -> Result<(), RuntimeScalarEvaluationFailure> {
-            panic!("policy refused body cannot run")
-        },
+        || -> Result<(), CallFailure> { panic!("policy refused body cannot run") },
         request,
     );
-    let Err(RuntimeScalarEvaluationFailure::Host(RuntimeScalarMemoryRefusal::Capacity(
+    let Err(CallFailure::Host(RuntimeScalarMemoryRefusal::Capacity(
         CapacityError::ImpossibleRequest(refusal),
     ))) = result
     else {
@@ -1054,9 +1047,14 @@ fn runtime_scalar_memory_actual_three_sources_use_same_wrapper_arguments_and_emp
                 .requests_for(selection, &arguments)
                 .unwrap();
             let mut journal = RuntimeScalarMemoryJournal::default();
-            let selected = RuntimeScalarMemoryScope::new(&control, &mut journal)
-                .evaluate(&mut instance, selection, &arguments, &control)
-                .unwrap();
+            let selected = call_scalar(
+                &mut RuntimeScalarMemoryScope::new(&control, &mut journal),
+                &mut instance,
+                selection,
+                &arguments,
+                &control,
+            )
+            .unwrap();
             assert_eq!(selected.values().len(), rows);
             assert_eq!(selected.values().data_type(), &DataType::Int64);
             assert_eq!(selected.values().null_count(), usize::from(rows != 0));
@@ -1088,7 +1086,8 @@ fn runtime_scalar_memory_positive_source_errors_never_become_uncovered_or_latch_
         EvaluatedArgument::Column(&counts),
     ];
     let mut journal = RuntimeScalarMemoryJournal::default();
-    let result = RuntimeScalarMemoryScope::new(&control, &mut journal).evaluate(
+    let result = call_scalar(
+        &mut RuntimeScalarMemoryScope::new(&control, &mut journal),
         &mut instance,
         Selection::all(1),
         &wrong,
@@ -1096,13 +1095,12 @@ fn runtime_scalar_memory_positive_source_errors_never_become_uncovered_or_latch_
     );
     assert!(matches!(
         result,
-        Err(RuntimeScalarEvaluationFailure::Source(
-            ScalarResourceError::Invariant(_)
-        ))
+        Err(CallFailure::Source(ScalarResourceError::Invariant(_)))
     ));
     assert!(journal.workset_bytes.is_none() && journal.body.settlement.is_none());
     assert_eq!(binding.account().snapshot().granted_bytes, 0);
-    let result = RuntimeScalarMemoryScope::new(&control, &mut journal).evaluate(
+    let result = call_scalar(
+        &mut RuntimeScalarMemoryScope::new(&control, &mut journal),
         &mut instance,
         Selection::all(usize::MAX),
         &[],
@@ -1110,9 +1108,7 @@ fn runtime_scalar_memory_positive_source_errors_never_become_uncovered_or_latch_
     );
     assert!(matches!(
         result,
-        Err(RuntimeScalarEvaluationFailure::Source(
-            ScalarResourceError::Arithmetic
-        ))
+        Err(CallFailure::Source(ScalarResourceError::Arithmetic))
     ));
     assert!(journal.workset_bytes.is_none() && journal.body.settlement.is_none());
     // Host pre-body refusal leaves the scalar instance uncalled. The enclosing
@@ -1122,9 +1118,14 @@ fn runtime_scalar_memory_positive_source_errors_never_become_uncovered_or_latch_
         EvaluatedArgument::Column(&values),
         EvaluatedArgument::Column(&counts),
     ];
-    RuntimeScalarMemoryScope::new(&control, &mut journal)
-        .evaluate(&mut instance, Selection::all(1), &correct, &control)
-        .unwrap();
+    call_scalar(
+        &mut RuntimeScalarMemoryScope::new(&control, &mut journal),
+        &mut instance,
+        Selection::all(1),
+        &correct,
+        &control,
+    )
+    .unwrap();
 }
 
 fn narrow_array(
@@ -1305,9 +1306,14 @@ fn runtime_scalar_memory_actual_bitwise_16_sources_keep_exact_arity_mapping_and_
                     }
                 );
                 let mut journal = RuntimeScalarMemoryJournal::default();
-                let selected = RuntimeScalarMemoryScope::new(&control, &mut journal)
-                    .evaluate(&mut instance, selection, arguments, &control)
-                    .unwrap();
+                let selected = call_scalar(
+                    &mut RuntimeScalarMemoryScope::new(&control, &mut journal),
+                    &mut instance,
+                    selection,
+                    arguments,
+                    &control,
+                )
+                .unwrap();
                 let expected = match (name, scalar) {
                     ("bitand", false) => vec![Some(3), None, None],
                     ("bitor", false) => vec![Some(7), None, None],
@@ -1375,12 +1381,15 @@ fn runtime_scalar_memory_actual_bitwise_refusals_preserve_uncalled_instance_and_
             let mut instance = actual_scalar(name, &types);
             let mut journal = RuntimeScalarMemoryJournal::default();
             assert_eq!(
-                RuntimeScalarMemoryScope::new(&missing, &mut journal)
-                    .evaluate(&mut instance, Selection::all(1), arguments, &missing)
-                    .unwrap_err(),
-                RuntimeScalarEvaluationFailure::Host(
-                    RuntimeScalarMemoryRefusal::MissingQueryMemory
+                call_scalar(
+                    &mut RuntimeScalarMemoryScope::new(&missing, &mut journal),
+                    &mut instance,
+                    Selection::all(1),
+                    arguments,
+                    &missing
                 )
+                .unwrap_err(),
+                CallFailure::Host(RuntimeScalarMemoryRefusal::MissingQueryMemory)
             );
             assert!(journal.body.settlement.is_none());
             let other_type = if ty == DataType::Int8 {
@@ -1392,28 +1401,37 @@ fn runtime_scalar_memory_actual_bitwise_refusals_preserve_uncalled_instance_and_
             let mut wrong = args;
             wrong[arity - 1] = EvaluatedArgument::Column(&other);
             assert!(matches!(
-                RuntimeScalarMemoryScope::new(&funded, &mut journal).evaluate(
+                call_scalar(
+                    &mut RuntimeScalarMemoryScope::new(&funded, &mut journal),
                     &mut instance,
                     Selection::all(1),
                     &wrong[..arity],
                     &funded
                 ),
-                Err(RuntimeScalarEvaluationFailure::Source(
-                    ScalarResourceError::Invariant(_)
-                ))
+                Err(CallFailure::Source(ScalarResourceError::Invariant(_)))
             ));
             assert!(journal.workset_bytes.is_none() && journal.body.settlement.is_none());
             assert_eq!(binding.account().snapshot().granted_bytes, 0);
             assert_eq!(
-                RuntimeScalarMemoryScope::new(&funded, &mut journal)
-                    .evaluate(&mut instance, Selection::all(usize::MAX), &[], &funded)
-                    .unwrap_err(),
-                RuntimeScalarEvaluationFailure::Source(ScalarResourceError::Arithmetic)
+                call_scalar(
+                    &mut RuntimeScalarMemoryScope::new(&funded, &mut journal),
+                    &mut instance,
+                    Selection::all(usize::MAX),
+                    &[],
+                    &funded
+                )
+                .unwrap_err(),
+                CallFailure::Source(ScalarResourceError::Arithmetic)
             );
             assert!(journal.workset_bytes.is_none() && journal.body.settlement.is_none());
-            RuntimeScalarMemoryScope::new(&funded, &mut journal)
-                .evaluate(&mut instance, Selection::all(1), arguments, &funded)
-                .unwrap();
+            call_scalar(
+                &mut RuntimeScalarMemoryScope::new(&funded, &mut journal),
+                &mut instance,
+                Selection::all(1),
+                arguments,
+                &funded,
+            )
+            .unwrap();
             for wrong_arity in [false, true] {
                 let unrelated = [EvaluatedArgument::Column(&other); 2];
                 let invalid = if wrong_arity {
@@ -1426,10 +1444,15 @@ fn runtime_scalar_memory_actual_bitwise_refusals_preserve_uncalled_instance_and_
                     .evaluate(selection, invalid, &funded)
                     .unwrap_err();
                 let mut malformed = actual_scalar(name, &types);
-                let actual = RuntimeScalarMemoryScope::new(&funded, &mut journal)
-                    .evaluate(&mut malformed, selection, invalid, &funded)
-                    .unwrap_err();
-                let RuntimeScalarEvaluationFailure::Kernel(actual) = actual else {
+                let actual = call_scalar(
+                    &mut RuntimeScalarMemoryScope::new(&funded, &mut journal),
+                    &mut malformed,
+                    selection,
+                    invalid,
+                    &funded,
+                )
+                .unwrap_err();
+                let CallFailure::Kernel(actual) = actual else {
                     panic!("the exact outer shape failure must survive the host");
                 };
                 assert_eq!(
@@ -1439,10 +1462,15 @@ fn runtime_scalar_memory_actual_bitwise_refusals_preserve_uncalled_instance_and_
                 assert_eq!(actual.to_string(), expected.to_string());
                 assert!(journal.body.settlement.is_some());
                 assert_eq!(
-                    RuntimeScalarMemoryScope::new(&funded, &mut journal)
-                        .evaluate(&mut malformed, Selection::all(1), arguments, &funded)
-                        .unwrap_err(),
-                    RuntimeScalarEvaluationFailure::Kernel(KernelFailure::InstanceFailed)
+                    call_scalar(
+                        &mut RuntimeScalarMemoryScope::new(&funded, &mut journal),
+                        &mut malformed,
+                        Selection::all(1),
+                        arguments,
+                        &funded
+                    )
+                    .unwrap_err(),
+                    CallFailure::Kernel(KernelFailure::InstanceFailed)
                 );
             }
         }
@@ -1496,9 +1524,14 @@ fn runtime_scalar_memory_actual_nine_narrow_sources_keep_original_mapping_and_su
                     .unwrap();
                 assert_eq!(facts.requests(), if rows == 0 { 6 } else { 12 });
                 let mut journal = RuntimeScalarMemoryJournal::default();
-                let selected = RuntimeScalarMemoryScope::new(&control, &mut journal)
-                    .evaluate(&mut instance, selection, &arguments, &control)
-                    .unwrap();
+                let selected = call_scalar(
+                    &mut RuntimeScalarMemoryScope::new(&control, &mut journal),
+                    &mut instance,
+                    selection,
+                    &arguments,
+                    &control,
+                )
+                .unwrap();
                 let expected = match (name, scalar) {
                     ("bit_shift_left", false) => vec![Some(14), None, Some(-2)],
                     ("bit_shift_right", false) => vec![Some(3), None, Some(-1)],
@@ -1557,40 +1590,52 @@ fn runtime_scalar_memory_actual_narrow_refusals_preserve_uncalled_instance_and_o
             let mut instance = actual_shift(name, ty.clone());
             let mut journal = RuntimeScalarMemoryJournal::default();
             assert_eq!(
-                RuntimeScalarMemoryScope::new(&missing, &mut journal)
-                    .evaluate(&mut instance, Selection::all(1), &arguments, &missing)
-                    .unwrap_err(),
-                RuntimeScalarEvaluationFailure::Host(
-                    RuntimeScalarMemoryRefusal::MissingQueryMemory
+                call_scalar(
+                    &mut RuntimeScalarMemoryScope::new(&missing, &mut journal),
+                    &mut instance,
+                    Selection::all(1),
+                    &arguments,
+                    &missing
                 )
+                .unwrap_err(),
+                CallFailure::Host(RuntimeScalarMemoryRefusal::MissingQueryMemory)
             );
             assert!(journal.body.settlement.is_none());
             let wrong = [EvaluatedArgument::Column(&counts), arguments[1]];
             assert!(matches!(
-                RuntimeScalarMemoryScope::new(&funded, &mut journal).evaluate(
+                call_scalar(
+                    &mut RuntimeScalarMemoryScope::new(&funded, &mut journal),
                     &mut instance,
                     Selection::all(1),
                     &wrong,
                     &funded
                 ),
-                Err(RuntimeScalarEvaluationFailure::Source(
-                    ScalarResourceError::Invariant(_)
-                ))
+                Err(CallFailure::Source(ScalarResourceError::Invariant(_)))
             ));
             assert!(journal.workset_bytes.is_none() && journal.body.settlement.is_none());
             assert_eq!(binding.account().snapshot().granted_bytes, 0);
-            RuntimeScalarMemoryScope::new(&funded, &mut journal)
-                .evaluate(&mut instance, Selection::all(1), &arguments, &funded)
-                .unwrap();
+            call_scalar(
+                &mut RuntimeScalarMemoryScope::new(&funded, &mut journal),
+                &mut instance,
+                Selection::all(1),
+                &arguments,
+                &funded,
+            )
+            .unwrap();
             let mut original = actual_shift(name, ty.clone());
             let expected = original
                 .evaluate(Selection::all(2), &arguments, &funded)
                 .unwrap_err();
             let mut malformed = actual_shift(name, ty.clone());
-            let actual = RuntimeScalarMemoryScope::new(&funded, &mut journal)
-                .evaluate(&mut malformed, Selection::all(2), &arguments, &funded)
-                .unwrap_err();
-            let RuntimeScalarEvaluationFailure::Kernel(actual) = actual else {
+            let actual = call_scalar(
+                &mut RuntimeScalarMemoryScope::new(&funded, &mut journal),
+                &mut malformed,
+                Selection::all(2),
+                &arguments,
+                &funded,
+            )
+            .unwrap_err();
+            let CallFailure::Kernel(actual) = actual else {
                 panic!("the original shape author must survive the host");
             };
             assert_eq!(
@@ -1600,10 +1645,15 @@ fn runtime_scalar_memory_actual_narrow_refusals_preserve_uncalled_instance_and_o
             assert_eq!(actual.to_string(), expected.to_string());
             assert!(journal.body.settlement.is_some());
             assert_eq!(
-                RuntimeScalarMemoryScope::new(&funded, &mut journal)
-                    .evaluate(&mut malformed, Selection::all(1), &arguments, &funded)
-                    .unwrap_err(),
-                RuntimeScalarEvaluationFailure::Kernel(KernelFailure::InstanceFailed)
+                call_scalar(
+                    &mut RuntimeScalarMemoryScope::new(&funded, &mut journal),
+                    &mut malformed,
+                    Selection::all(1),
+                    &arguments,
+                    &funded
+                )
+                .unwrap_err(),
+                CallFailure::Kernel(KernelFailure::InstanceFailed)
             );
         }
     }
@@ -1633,9 +1683,14 @@ fn runtime_scalar_memory_uncovered_original_source_has_no_host_substitution() {
         EvaluatedArgument::Column(&counts),
     ];
     let mut journal = RuntimeScalarMemoryJournal::default();
-    let selected = RuntimeScalarMemoryScope::new(&control, &mut journal)
-        .evaluate(&mut instance, Selection::all(1), &arguments, &control)
-        .unwrap();
+    let selected = call_scalar(
+        &mut RuntimeScalarMemoryScope::new(&control, &mut journal),
+        &mut instance,
+        Selection::all(1),
+        &arguments,
+        &control,
+    )
+    .unwrap();
     assert_eq!(
         selected
             .values()
@@ -1676,15 +1731,12 @@ fn runtime_scalar_memory_qualified_shortage_retains_actual_live_block_and_fresh_
     let mut journal = RuntimeScalarMemoryJournal::default();
     let result = RuntimeScalarMemoryScope::new(&control, &mut journal).run(
         40000,
-        || -> Result<(), RuntimeScalarEvaluationFailure> {
+        || -> Result<(), CallFailure> {
             panic!("qualified shortage cannot run body");
         },
         request,
     );
-    let Err(RuntimeScalarEvaluationFailure::Host(RuntimeScalarMemoryRefusal::SharedShortage(
-        receipt,
-    ))) = result
-    else {
+    let Err(CallFailure::Host(RuntimeScalarMemoryRefusal::SharedShortage(receipt))) = result else {
         panic!("real completed coverage must preserve shortage");
     };
     assert!(receipt.coverage.complete);
@@ -1728,17 +1780,13 @@ fn runtime_scalar_memory_real_debt_stays_secondary_to_original_body_error() {
             binding
                 .account()
                 .install_policy(0, novarocks_memory::LimitDimension::Work);
-            Err::<(), _>(RuntimeScalarEvaluationFailure::Kernel(
-                KernelFailure::InstanceFailed,
-            ))
+            Err::<(), _>(CallFailure::Kernel(KernelFailure::InstanceFailed))
         },
         request,
     );
     assert_eq!(
         result,
-        Err(RuntimeScalarEvaluationFailure::Kernel(
-            KernelFailure::InstanceFailed
-        ))
+        Err(CallFailure::Kernel(KernelFailure::InstanceFailed))
     );
     let receipt = journal.body.settlement.as_ref().unwrap();
     assert_eq!(receipt.accepted_live, 1208);
@@ -1762,7 +1810,7 @@ fn runtime_scalar_memory_presealed_ready_is_activation_refusal_not_entry_fault()
     let domain = RefCell::new(None);
     let result = RuntimeScalarMemoryScope::new(&control, &mut journal).run(
         608,
-        || -> Result<(), RuntimeScalarEvaluationFailure> {
+        || -> Result<(), CallFailure> {
             panic!("presealed domain cannot activate");
         },
         |binding, peak| {
@@ -1776,7 +1824,7 @@ fn runtime_scalar_memory_presealed_ready_is_activation_refusal_not_entry_fault()
         },
     );
     assert!(
-        matches!(result,Err(RuntimeScalarEvaluationFailure::Host(RuntimeScalarMemoryRefusal::Capacity(CapacityError::Closed{account}))) if account==binding.account().id())
+        matches!(result,Err(CallFailure::Host(RuntimeScalarMemoryRefusal::Capacity(CapacityError::Closed{account}))) if account==binding.account().id())
     );
     assert_eq!(
         journal.body.observation.entry(),
@@ -1798,7 +1846,7 @@ fn runtime_scalar_memory_original_unwind_settles_and_disposes_without_replacing_
     let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _ = RuntimeScalarMemoryScope::new(&control, &mut journal).run(
             608,
-            || -> Result<(), RuntimeScalarEvaluationFailure> {
+            || -> Result<(), CallFailure> {
                 calls.set(calls.get() + 1);
                 domain.borrow().as_ref().unwrap().seal();
                 panic!("original synchronous body panic");
@@ -1872,8 +1920,7 @@ fn runtime_scalar_memory_original_domain_error_and_late_cancel_keep_real_settlem
                     .install_policy(0, novarocks_memory::LimitDimension::Work);
                 let original: Result<(), KernelFailure> = Err(expected.clone());
                 stopped.set_error(late_cancel.clone());
-                work.finish_result(original)
-                    .map_err(RuntimeScalarEvaluationFailure::Kernel)
+                work.finish_result(original).map_err(CallFailure::Kernel)
             },
             |binding, peak| {
                 let admission = request(binding, peak);
@@ -1886,7 +1933,7 @@ fn runtime_scalar_memory_original_domain_error_and_late_cancel_keep_real_settlem
         )
         .unwrap_err();
     // Shared source equality denotes the actual occurrence, not equal facts.
-    assert_eq!(actual, RuntimeScalarEvaluationFailure::Kernel(expected));
+    assert_eq!(actual, CallFailure::Kernel(expected));
     assert!(stopped.error().unwrap().same_occurrence(&late_cancel));
     assert_eq!(
         KernelEvaluationControl::checkpoint(&control, 0),
@@ -1914,6 +1961,101 @@ fn runtime_scalar_memory_original_domain_error_and_late_cancel_keep_real_settlem
     assert!(!domain.snapshot().active);
     assert!(domain.snapshot().sealed);
     assert_eq!(domain.snapshot().live, 1208);
+    drop(release);
+    assert_eq!(domain.snapshot().live, 0);
+    assert!(!domain.snapshot().active);
+}
+
+#[path = "scalar_memory_tests/invocation_custody.rs"]
+mod invocation_custody;
+#[path = "scalar_memory_tests/scalar_custody.rs"]
+mod scalar_custody;
+
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied. See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+#[test]
+fn original_occurrence_survives_late_cancel_after_real_charged_resource_settlement() {
+    use crate::runtime::task::ExecutionFailure;
+    use novarocks_memory::attribution::AttributingAllocator;
+    use novarocks_type_contract::owned_resources::layout::LayoutResourceError;
+    use std::alloc::{GlobalAlloc, Layout, System};
+    struct Release<'a> {
+        pointer: &'a Cell<*mut u8>,
+        allocator: &'a AttributingAllocator<System>,
+        layout: Layout,
+    }
+    impl Drop for Release<'_> {
+        fn drop(&mut self) {
+            let pointer = self.pointer.replace(std::ptr::null_mut());
+            if !pointer.is_null() {
+                // SAFETY: the one actual block is released exactly once
+                // through its original allocator and original Layout.
+                unsafe {
+                    self.allocator.dealloc(pointer, self.layout);
+                }
+            }
+        }
+    }
+    let binding = bound();
+    let stopped = Arc::new(RuntimeErrorState::default());
+    let runtime = control(Some(&binding), stopped.clone());
+    let KernelMemoryAdmission::Granted(ready) = request(&binding, 608) else {
+        panic!("the exact original body requires a real grant");
+    };
+    let domain = ready.domain().clone();
+    let allocator = AttributingAllocator::new(System);
+    let layout = Layout::from_size_align(600, 8).unwrap();
+    let pointer = Cell::new(std::ptr::null_mut());
+    let release = Release {
+        pointer: &pointer,
+        allocator: &allocator,
+        layout,
+    };
+    let expected = KernelFailure::from_domain(LayoutResourceError::SourceModel);
+    let late_cancel: ExecutionFailure = KernelFailure::Cancelled.into();
+    let mut journal = KernelMemoryJournal::default();
+    let result = ready
+        .run(&mut journal, || {
+            // SAFETY: valid nonzero Layout; Release owns the matching free.
+            pointer.set(unsafe { allocator.alloc(layout) });
+            assert!(!pointer.get().is_null());
+            stopped.set_error(late_cancel.clone());
+            Err::<(), _>(expected.clone())
+        })
+        .unwrap();
+    // The actual writer has exited before the ordinary Frame footer.
+    assert_eq!(journal.observation.entry(), AmbientEntryObservation::Bound);
+    assert_eq!(journal.observation.exit(), AmbientExitObservation::Restored);
+    assert_eq!(journal.settlement.as_ref().unwrap().accepted_live, 608);
+    assert_eq!(journal.settlement.as_ref().unwrap().next_step, Ok(()));
+    assert_eq!(journal.stopped, Some(Ok(())));
+    assert!(!domain.snapshot().active);
+    assert!(domain.snapshot().sealed);
+    assert_eq!(domain.snapshot().live, 608);
+    assert_eq!(result.unwrap_err(), expected);
+    // Cancellation remains independently observable; it never rewrites
+    // the already originating occurrence or the completed settlement.
+    assert!(stopped.error().unwrap().same_occurrence(&late_cancel));
+    assert_eq!(
+        KernelEvaluationControl::checkpoint(&runtime, 0),
+        Err(KernelFailure::Cancelled)
+    );
+    drop(ready);
     drop(release);
     assert_eq!(domain.snapshot().live, 0);
     assert!(!domain.snapshot().active);

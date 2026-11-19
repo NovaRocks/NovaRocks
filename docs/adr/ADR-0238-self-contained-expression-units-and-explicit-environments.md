@@ -5,6 +5,7 @@ domain: [sql-compiler, crate-boundary, pipeline-execution]
 status: active
 supersedes: []
 superseded-by: null
+partially-superseded-by: [ADR-0239]
 date: 2026-11-17
 implementation-status: partial
 provenance:

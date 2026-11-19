@@ -72,8 +72,6 @@ use super::table_finish::{
 use crate::exec::chunk::{
     ArrayNormalizationStep, Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema,
 };
-use crate::exec::expr::compiled_program::CompiledExpressionInstance;
-use crate::exec::expr::compiled_program::input_source::InputColumnProjection;
 use crate::exec::pipeline::operator::{
     ConstructionFailure, InputConstructionFactory, InputConstructionOwner, InputEncodingPolicy,
     Operator,
@@ -88,6 +86,8 @@ use crate::exec::pipeline::{
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
 use crate::runtime::task::{ExecutionFailure, ExecutionResult};
+use novarocks_expression::CompiledExpressionInstance;
+use novarocks_expression::InputColumnProjection;
 use novarocks_type_contract::ValueTypeStorageLifetime;
 
 /// Target bytes of one state backing block of the finish's target groups.
