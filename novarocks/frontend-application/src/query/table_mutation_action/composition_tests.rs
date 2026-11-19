@@ -761,6 +761,93 @@ async fn real_hadoop_create_keeps_same_source_after_borrowed_wait_drop_and_relea
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mv_create_uses_the_staged_iceberg_format_version_default() {
+    use crate::mv::command::TrinoMvPropertyPreparation;
+    use novarocks_parser::{ast::TrinoStatement, parser::parse_statement};
+
+    let mut fixture = Fixture::new_with_control_role(true, |_, _| {});
+    {
+        let planning = fixture
+            .host
+            .acquire_current(&fixture.key.instance_id)
+            .unwrap();
+        let ordinary = planning.derive_mutation_lease().unwrap();
+        let declarations = ordinary.table_property_declarations().unwrap();
+        let format_version = declarations
+            .iter()
+            .find(|declaration| declaration.name() == "format_version")
+            .unwrap();
+        assert_eq!(
+            format_version.default_value(),
+            &DdlPropertyValue::Integer(2)
+        );
+        let context = PropertyCpuContext {
+            current_database: "atomic".into(),
+            sql_semantics: Default::default(),
+            interpreter: Arc::new(
+                crate::query_execution::required_constant_eval::test_required_constant_interpreter(
+                ),
+            ),
+            control: SqlCompileControl::new(
+                None,
+                Arc::new(CpuWitness {
+                    cancellation: fixture.query_cancellation.clone(),
+                    first_thread: Mutex::new(None),
+                }),
+            ),
+            scope: fixture.scope.clone(),
+            window: fixture.window.as_ref().unwrap().clone(),
+            catalog: Arc::new(RwLock::new(Default::default())),
+            functions: Arc::new(
+                novarocks_functions::builtin::catalogue::build_builtin_engine_function_catalog()
+                    .unwrap(),
+            ),
+            policy: crate::application::test_constant_policy(),
+        };
+        for (source, expected) in [
+            (
+                "CREATE MATERIALIZED VIEW ice.atomic.mv AS SELECT 1 AS id",
+                3,
+            ),
+            (
+                "CREATE MATERIALIZED VIEW ice.atomic.mv WITH (format_version = DEFAULT) AS SELECT 1 AS id",
+                3,
+            ),
+            (
+                "CREATE MATERIALIZED VIEW ice.atomic.mv WITH (format_version = 2) AS SELECT 1 AS id",
+                2,
+            ),
+        ] {
+            let TrinoStatement::CreateMaterializedView(statement) =
+                parse_statement(source).unwrap()
+            else {
+                panic!("expected CREATE MATERIALIZED VIEW");
+            };
+            let prepared = TrinoMvPropertyPreparation {
+                source,
+                current_catalog: Some("ice"),
+                current_database: "atomic",
+                planning: &planning,
+                port: &mut context.constant_port(),
+                control: &context.control,
+            }
+            .create(statement)
+            .unwrap();
+            assert_eq!(prepared.storage.binding, fixture.key);
+            let (_, actual) = prepared
+                .storage
+                .properties
+                .iter()
+                .find(|(name, _)| name.as_ref() == "format_version")
+                .unwrap();
+            assert_eq!(actual, &DdlPropertyValue::Integer(expected), "{source}");
+        }
+    }
+    fixture.retire_current();
+    fixture.close_retired_resources(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn guarded_set_properties_uses_the_original_retained_generation_and_metadata_cpu() {
     let mut fixture = Fixture::new_with_control_role(true, |setup, instance| {
         let outcome = setup

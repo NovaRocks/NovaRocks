@@ -146,11 +146,15 @@ impl TrinoMvPropertyPreparation<'_> {
             engine_property_declarations().map_err(|error| invariant(error.to_string()))?;
         let engine_count = engine.len();
         let mut declarations = engine;
-        declarations.extend(
-            mutation
-                .table_property_declarations()
-                .map_err(provider_error)?,
-        );
+        let storage = match mode {
+            DdlPropertyEvaluationMode::Create => self
+                .planning
+                .derive_staged_create_lease()
+                .and_then(|staged| staged.mv_storage_property_declarations()),
+            DdlPropertyEvaluationMode::Alter => mutation.table_property_declarations(),
+        }
+        .map_err(provider_error)?;
+        declarations.extend(storage);
         let assignments = properties
             .iter()
             .map(|property| DdlPropertyAssignment {

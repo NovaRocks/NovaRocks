@@ -197,6 +197,15 @@ fn staged_mv_storage_uses_v3_default_and_original_create_projection() {
     let ordinary = defaults(table_property_declarations().unwrap());
     let ordinary = prepare_create_table_properties(&ordinary, None, &Active).unwrap();
     assert_eq!(ordinary.format_version, FormatVersion::V2);
+    let refused = match prepare_mv_staged_storage(&properties(), &Active) {
+        Err(error) => error,
+        Ok(_) => panic!("document-managed Iceberg storage requires format version 3"),
+    };
+    assert_eq!(refused.kind(), ConnectorErrorKind::Unsupported);
+    assert_eq!(
+        refused.message(),
+        "Iceberg materialized-view storage requires format_version = 3"
+    );
 
     let mut managed = defaults(mv_storage_property_declarations().unwrap());
     managed.push((
