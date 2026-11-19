@@ -87,7 +87,7 @@ select c4 > c5 from array_data_type;
 
 -- query 13
 USE ${case_db};
-select * from (select array_map(x -> x*2 + x*2, [1,3]) col1) t1 join (select array_map(x -> x*2 + x*2, c3) col2 from  array_data_type) t2;
+select * from (select array_map(x -> x*2 + x*2, [1,3]) col1) t1 CROSS JOIN (select array_map(x -> x*2 + x*2, c3) col2 from  array_data_type) t2;
 
 -- name: testArrayVarchar
 -- query 14
