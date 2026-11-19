@@ -722,7 +722,9 @@ mod tests {
             "db",
             control.clone(),
         ) else {
-            panic!("an unqualified catalog observation leaves the ordinary name intact");
+            panic!(
+                "without an Iceberg observation, the complete name goes through ordinary resolution"
+            );
         };
         assert_eq!(message, "unsupported identifier `Orders$files`");
 
@@ -754,6 +756,10 @@ mod tests {
         else {
             panic!("qualified metadata must reject time travel at the original period");
         };
+        assert_eq!(
+            error.kind(),
+            novarocks_sql::analyze_error::AnalyzeErrorKind::UnsupportedQueryShape
+        );
         assert_eq!(
             error.message(),
             "time travel is not supported on metadata relations"

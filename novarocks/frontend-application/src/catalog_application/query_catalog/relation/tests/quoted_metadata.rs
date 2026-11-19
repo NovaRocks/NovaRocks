@@ -339,8 +339,7 @@ async fn installed_quoted_metadata_uses_one_exact_pin_and_a_separate_statement_m
             );
             assert!(controls.acquired.lock().unwrap().is_empty());
             let (fact, pin) =
-                drive_metadata_read(gate, context.clone(), &materializer, &controls, quoted_need)
-                    .await;
+                drive_metadata_read(gate, context, &materializer, &controls, quoted_need).await;
             let CatalogRelationOutcome::Resolved(table) = fact.outcome() else {
                 panic!("the provider alias returned a typed SQL table");
             };
