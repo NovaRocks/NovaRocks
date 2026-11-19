@@ -87,7 +87,7 @@ GROUP BY x HAVING [count()] IN (SELECT [2]) OR x = 3 ORDER BY x;
 
 -- query 15
 -- A collection attached after a scalar aggregate must preserve its empty-input row.
-SELECT [count(*)] IN (SELECT [0]) AS membership
+SELECT [count()] IN (SELECT [0]) AS membership
 FROM (SELECT 1 AS x WHERE FALSE) t;
 
 -- query 16
