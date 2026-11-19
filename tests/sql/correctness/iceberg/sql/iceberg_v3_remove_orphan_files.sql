@@ -152,7 +152,7 @@ ALTER TABLE ${case_db}.t4 REMOVE ORPHAN FILES;
 
 -- ---------------------------------------------------------------------------
 -- Case 5: Branch suffix -> reject
--- Verifies: parser rejects ALTER TABLE t.branch_dev REMOVE ORPHAN FILES.
+-- Verifies: ALTER TABLE EXECUTE does not admit a branch-qualified table.
 -- ---------------------------------------------------------------------------
 
 -- query 23
@@ -160,8 +160,8 @@ ALTER TABLE ${case_db}.t4 REMOVE ORPHAN FILES;
 CREATE TABLE ${case_db}.t5 (id INT, v VARCHAR(16)) WITH (format_version = 3);
 
 -- query 24
--- @expect_error=does not support branch
-ALTER TABLE ${case_db}.t5.branch_dev EXECUTE remove_orphan_files(older_than => '2020-01-01 00:00:00');
+-- @expect_trino_error=SYNTAX_ERROR,USER_ERROR
+ALTER TABLE ${case_db}.t5@dev EXECUTE remove_orphan_files(older_than => '2020-01-01 00:00:00');
 
 -- ---------------------------------------------------------------------------
 -- Case 6: V2 shares the safety refusal

@@ -192,7 +192,7 @@ SELECT id, _row_id FROM ${case_db}.t5 ORDER BY id;
 
 -- ---------------------------------------------------------------------------
 -- Case 6: Branch suffix → reject
--- Verifies: parser rejects `ALTER TABLE t.branch_dev REWRITE MANIFESTS`.
+-- Verifies: ALTER TABLE EXECUTE does not admit a branch-qualified table.
 -- ---------------------------------------------------------------------------
 
 -- query 32
@@ -200,8 +200,8 @@ SELECT id, _row_id FROM ${case_db}.t5 ORDER BY id;
 CREATE TABLE ${case_db}.t6 (id INT, v VARCHAR(16)) WITH (format_version = 3);
 
 -- query 33
--- @expect_error=does not support branch
-ALTER TABLE ${case_db}.t6.branch_dev EXECUTE optimize_manifests;
+-- @expect_trino_error=SYNTAX_ERROR,USER_ERROR
+ALTER TABLE ${case_db}.t6@dev EXECUTE optimize_manifests;
 
 -- ---------------------------------------------------------------------------
 -- Case 7: Trailing tokens → reject

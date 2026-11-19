@@ -201,12 +201,12 @@ ALTER TABLE ${case_db}.t5 EXPIRE SNAPSHOTS;
 CREATE TABLE ${case_db}.t6 (id INT, v VARCHAR(16)) WITH (format_version = 2);
 
 -- query 33
--- @expect_error=must be >= 1
+-- @expect_trino_error=INVALID_PROCEDURE_ARGUMENT,USER_ERROR
 ALTER TABLE ${case_db}.t6 EXECUTE expire_snapshots(retain_last => 0);
 
 -- ---------------------------------------------------------------------------
 -- Case 7: Branch suffix -> reject
--- Verifies: parser rejects ALTER TABLE t.branch_dev EXPIRE SNAPSHOTS.
+-- Verifies: ALTER TABLE EXECUTE does not admit a branch-qualified table.
 -- ---------------------------------------------------------------------------
 
 -- query 34
@@ -214,8 +214,8 @@ ALTER TABLE ${case_db}.t6 EXECUTE expire_snapshots(retain_last => 0);
 CREATE TABLE ${case_db}.t7 (id INT, v VARCHAR(16)) WITH (format_version = 3);
 
 -- query 35
--- @expect_error=does not support branch
-ALTER TABLE ${case_db}.t7.branch_dev EXECUTE expire_snapshots(retain_last => 5);
+-- @expect_trino_error=SYNTAX_ERROR,USER_ERROR
+ALTER TABLE ${case_db}.t7@dev EXECUTE expire_snapshots(retain_last => 5);
 
 -- ---------------------------------------------------------------------------
 -- Case 8: V2 table support
