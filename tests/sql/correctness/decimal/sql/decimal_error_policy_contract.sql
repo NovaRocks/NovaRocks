@@ -146,13 +146,11 @@ SELECT CAST(1 AS DECIMAL(38,0))+1 AS v UNION ALL SELECT /*+ SET_VAR(sql_mode='ER
 -- query 25
 -- @skip_result_check=true
 -- @expect_error=ERROR_IF_OVERFLOW is not captured
-SET SESSION sql_mode = 'ERROR_IF_OVERFLOW'
-;
-CREATE VIEW default_catalog.${case_db}.decimal_error_uncaptured_v AS SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ 1 AS v
-;
-RESET SESSION sql_mode;
+SET SESSION sql_mode = 'ERROR_IF_OVERFLOW';
+CREATE VIEW default_catalog.${case_db}.decimal_error_uncaptured_v AS SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ 1 AS v;
 
 -- query 26
+SET SESSION sql_mode = '32';
 SET SESSION decimal_overflow_to_double = true;
 WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ CAST(12345678901234567890.1234567890 AS DECIMAL(30,10))*CAST(123456789.123456789 AS DECIMAL(18,9)) AS promoted;
 

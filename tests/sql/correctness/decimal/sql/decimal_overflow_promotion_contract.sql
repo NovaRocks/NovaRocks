@@ -78,14 +78,12 @@ SET SESSION decimal_overflow_to_double = false;
 -- query 12
 -- @skip_result_check=true
 -- @expect_error=[sql.admit.persisted_definition_semantics_unsupported] unsupported semantic setting: decimal_overflow_to_double=true is not captured for persistent VIEW or MATERIALIZED VIEW definition replay at line 1 column 1
-SET SESSION decimal_overflow_to_double = true
-;
+SET SESSION decimal_overflow_to_double = true;
 CREATE VIEW default_catalog.${case_db}.decimal_promotion_hint_view AS
-SELECT /*+ SET_VAR(decimal_overflow_to_double=true) */ 1 AS v
-;
-RESET SESSION decimal_overflow_to_double;
+SELECT /*+ SET_VAR(decimal_overflow_to_double=true) */ 1 AS v;
 
 -- query 13
+SET SESSION decimal_overflow_to_double = false;
 WITH promoted AS (SELECT /*+ SET_VAR(decimal_overflow_to_double=true) */ CAST(12345678901234567890.1234567890 AS DECIMAL(30,10))*CAST(123456789.123456789 AS DECIMAL(18,9)) AS v),
 checked AS (SELECT CAST(12345678901234567890.1234567890 AS DECIMAL(30,10))*CAST(123456789.123456789 AS DECIMAL(18,9)) AS v)
 SELECT promoted.v AS promoted,checked.v AS checked,CAST(12345678901234567890.1234567890 AS DECIMAL(30,10))*CAST(123456789.123456789 AS DECIMAL(18,9)) AS outer_checked
@@ -118,21 +116,15 @@ ORDER BY branch;
 -- @skip_result_check=true
 -- @expect_error=[sql.admit.persisted_definition_semantics_unsupported] unsupported semantic setting: decimal_overflow_to_double=true is not captured for persistent VIEW or MATERIALIZED VIEW definition replay at line 1 column 1
 -- D32 target migration: reject an uncaptured root setting, retaining the derived query.
-SET SESSION decimal_overflow_to_double = true
-;
+SET SESSION decimal_overflow_to_double = true;
 CREATE VIEW default_catalog.${case_db}.decimal_promotion_nested_view AS
-SELECT /*+ SET_VAR(decimal_overflow_to_double=true) */ v FROM (SELECT 1 AS v) t
-;
-RESET SESSION decimal_overflow_to_double;
+SELECT /*+ SET_VAR(decimal_overflow_to_double=true) */ v FROM (SELECT 1 AS v) t;
 
 -- query 21
 -- @skip_result_check=true
 -- @expect_error=[sql.admit.persisted_definition_semantics_unsupported] unsupported semantic setting: decimal_overflow_to_double=true is not captured for persistent VIEW or MATERIALIZED VIEW definition replay at line 1 column 1
-SET SESSION decimal_overflow_to_double = true
-;
-CREATE MATERIALIZED VIEW ${case_db}.decimal_promotion_hint_mv AS SELECT /*+ SET_VAR(decimal_overflow_to_double=true) */ 1 AS v
-;
-RESET SESSION decimal_overflow_to_double;
+SET SESSION decimal_overflow_to_double = true;
+CREATE MATERIALIZED VIEW ${case_db}.decimal_promotion_hint_mv AS SELECT /*+ SET_VAR(decimal_overflow_to_double=true) */ 1 AS v;
 
 -- query 22
 -- @skip_result_check=true
@@ -141,6 +133,7 @@ RESET SESSION decimal_overflow_to_double;
 -- @expect_error_at=1:47
 -- @expect_error_tier=target
 -- D32 target migration: validate the same invalid value at the root query boundary.
+SET SESSION decimal_overflow_to_double = false;
 WITH SESSION decimal_overflow_to_double = 'invalid' SELECT /*+ SET_VAR(decimal_overflow_to_double='invalid') */ 1 FROM (SELECT 1 AS v) t;
 
 -- query 23

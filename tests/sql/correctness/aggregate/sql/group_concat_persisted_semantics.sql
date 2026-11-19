@@ -72,13 +72,11 @@ WITH SESSION sql_mode = 'GROUP_CONCAT_LEGACY' SELECT /*+ SET_VAR(sql_mode='GROUP
 -- @expect_sql_code=sql.admit.persisted_definition_semantics_unsupported
 -- @expect_sql_phase=Admit
 -- @expect_error=sql.admit.persisted_definition_semantics_unsupported
-SET SESSION sql_mode = 'GROUP_CONCAT_LEGACY'
-;
-CREATE OR REPLACE VIEW default_catalog.${case_db}.v_persisted_mode AS SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ 9 AS value
-;
-RESET SESSION sql_mode;
+SET SESSION sql_mode = 'GROUP_CONCAT_LEGACY';
+CREATE OR REPLACE VIEW default_catalog.${case_db}.v_persisted_mode AS SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ 9 AS value;
 
 -- query 13
+SET SESSION sql_mode = '32';
 SELECT value FROM default_catalog.${case_db}.v_persisted_mode;
 
 -- query 14
