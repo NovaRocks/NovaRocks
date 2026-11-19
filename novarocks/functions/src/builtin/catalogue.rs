@@ -1173,6 +1173,9 @@ fn scalar_result_nullable_from_types(
         },
         // Invalid JSON is a required Data failure, not a NULL result.
         "__json_canonical_key" => first_value.is_some_and(FunctionValueType::nullable),
+        crate::native_like::ESCAPE_FUNCTION_NAME => {
+            nullable_arguments(0..logical_argument_count, false, &value_nullable, work)?
+        }
         // FIELD returns zero for NULL or absence, and a non-NULL first-match index otherwise.
         "field" => false,
         // A NULL predicate fails the assertion; successful evaluations are true.
@@ -3323,6 +3326,9 @@ pub(super) fn scalar_definition_parts(
                     "bitmap_to_string" => Some(super::bitmap_to_string_owner::effects()),
                     "parse_json" => Some(super::parse_json_owner::effects()),
                     "__json_canonical_key" => Some(super::json_canonical_owner::effects()),
+                    crate::native_like::ESCAPE_FUNCTION_NAME => {
+                        Some(super::like_escape_owner::effects())
+                    }
                     "json_object" => Some(super::json_object_owner::effects()),
                     "array_sortby" => Some(super::array_sortby_owner::effects()),
                     "percentile_hash" => Some(super::percentile_hash_owner::effects()),
@@ -3333,8 +3339,9 @@ pub(super) fn scalar_definition_parts(
                     name if super::string_case_owner::operation(name).is_some() => {
                         Some(super::string_case_owner::effects())
                     }
-                    name if super::string_concat_owner::operation(name).is_some() => {
-                        Some(super::string_concat_owner::effects())
+                    name @ ("concat" | "array_concat") => {
+                        super::string_concat_owner::operation(name)
+                            .map(super::string_concat_owner::effects)
                     }
                     name if super::string_find_in_set_owner::operation(name).is_some() => {
                         Some(super::string_find_in_set_owner::effects())
@@ -3684,6 +3691,9 @@ pub fn contribute_builtin_functions(
             "parse_json" => super::parse_json_owner::definition(declaration, resolver)?,
             "__json_canonical_key" => {
                 super::json_canonical_owner::definition(declaration, resolver)?
+            }
+            crate::native_like::ESCAPE_FUNCTION_NAME => {
+                super::like_escape_owner::definition(declaration, resolver)?
             }
             "json_object" => super::json_object_owner::definition(declaration, resolver)?,
             "array_sortby" => super::array_sortby_owner::definition(declaration, resolver)?,

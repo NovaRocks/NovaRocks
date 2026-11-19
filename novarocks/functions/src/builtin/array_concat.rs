@@ -22,8 +22,8 @@ use super::{
     collection_selected::{copy_error, reserve},
 };
 use crate::{
-    FunctionArgumentType, KernelEvaluationControl, KernelFailure, ScalarCallContract,
-    ScalarCallInput, SelectedValues,
+    DataFailureReason, FunctionArgumentType, KernelEvaluationControl, KernelFailure, RowDataError,
+    ScalarCallContract, ScalarCallInput, SelectedValues,
     kernel_control::{internal, invalid},
     kernel_input::EvaluationCheckpoints,
     selected_copy::{ExtendSegment, preflight_extend_multi},
@@ -122,6 +122,8 @@ pub(super) fn evaluate<'a>(
         let mut segments = reserve::<ExtendSegment>(segment_count, &work)?;
         let mut input_rows = reserve::<usize>(arrays.len(), &work)?;
         let mut nulls = NullBufferBuilder::new(selection.len());
+        let unary = arguments.len() == 1;
+        let mut errors = reserve::<RowDataError>(if unary { selection.len() } else { 0 }, &work)?;
         let mut offset = 0;
         offsets.push(offset);
 
@@ -140,8 +142,18 @@ pub(super) fn evaluate<'a>(
                 input_rows.push(source_row);
                 valid &= array.is_valid(source_row);
             }
-            nulls.append(valid);
-            if valid {
+            if valid && unary {
+                work.borrow_mut().flush()?;
+                errors.push(RowDataError::with_reason(
+                    ordinal,
+                    DataFailureReason::Domain(
+                        novarocks_function_contract::kernel_failure::INVALID_FUNCTION_ARGUMENT,
+                    ),
+                    "There must be two or more arguments to concat",
+                ));
+            }
+            nulls.append(valid && !unary);
+            if valid && !unary {
                 for (source, (array, source_row)) in arrays.iter().zip(&input_rows).enumerate() {
                     work.borrow_mut().step()?;
                     let ranges = array.value_offsets();
@@ -198,8 +210,13 @@ pub(super) fn evaluate<'a>(
         )
         .map_err(|error| arrow_failure("array_concat", ArrowSite::Construct, error))?;
         work.borrow_mut().flush()?;
-        SelectedValues::try_new(selection, target, Arc::new(array), Box::default())
-            .map_err(|_| internal("array_concat compact output differs from its frozen result"))
+        SelectedValues::try_new(
+            selection,
+            target,
+            Arc::new(array),
+            errors.into_boxed_slice(),
+        )
+        .map_err(|_| internal("array_concat compact output differs from its frozen result"))
     })();
     work.into_inner().finish_result(result)
 }

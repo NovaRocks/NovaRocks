@@ -15,8 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Actual original LIKE source FVT and permanent Frame success oracles.
-//! Before preparation these are RED at UnsupportedExpression(Like).
+//! LIKE source FVT and permanent Frame success oracles.
 use super::compiled_program::CompiledExpressionInstance;
 use super::numeric_unary_owned_transaction_tests::programs_with_catalogue_and_original_inlist_source as original_source_programs;
 use super::sql_test_source::{
@@ -54,7 +53,20 @@ fn inspect(source: &SqlAuthoredPhysicalPlan) -> usize {
     let mut n = 0;
     for (&id, fragment) in source.plan().fragments() {
         for (definition, node) in fragment.expressions().iter() {
-            if let ExprKind::Like {
+            if let ExprKind::FunctionCall { function, args } = &node.kind
+                && function.function_id.as_str() == "builtin.scalar/__like_with_escape/v1"
+            {
+                n += 1;
+                assert_eq!(args.len(), 3);
+                let mut nullable = false;
+                for argument in args.iter() {
+                    let ty = &fragment.expressions().get(*argument).unwrap().ty;
+                    assert_eq!(ty.data_type(), &DataType::Utf8);
+                    nullable |= ty.nullable();
+                }
+                assert_eq!(node.ty.data_type(), &DataType::Boolean);
+                assert_eq!(node.ty.nullable(), nullable);
+            } else if let ExprKind::Like {
                 expr,
                 pattern,
                 negated,
@@ -299,9 +311,7 @@ fn like_actual_compiler_notlike_truthonly_original_required_prefix() {
 }
 
 #[test]
-fn like_actual_compiler_explicit_escape_keeps_original_ignored_escape_author() {
-    // Analyzer currently drops AST.escape; the original core still uses its
-    // backslash author. This is a recorded bug witness, not a correction.
+fn like_actual_compiler_explicit_escape_matches_literal_percent() {
     let input: ArrayRef = Arc::new(StringArray::from(vec![
         Some("a!x"),
         Some("a%"),
@@ -312,7 +322,24 @@ fn like_actual_compiler_explicit_escape_keeps_original_ignored_escape_author() {
         "SELECT name LIKE 'a!%' ESCAPE '!' FROM t_filter_in_between_like",
         Field::new("name", DataType::Utf8, true),
         input,
-        vec![Some(true), Some(false), None, Some(true)],
+        vec![Some(false), Some(true), None, Some(false)],
+        false,
+    );
+}
+
+#[test]
+fn like_actual_compiler_unescaped_backslash_is_literal() {
+    let input: ArrayRef = Arc::new(StringArray::from(vec![
+        Some("a_b"),
+        Some(r"a\xb"),
+        None,
+        Some(r"a\_b"),
+    ]));
+    evaluate(
+        r"SELECT name LIKE 'a\_b' FROM t_filter_in_between_like",
+        Field::new("name", DataType::Utf8, true),
+        input,
+        vec![Some(false), Some(true), None, Some(true)],
         false,
     );
 }

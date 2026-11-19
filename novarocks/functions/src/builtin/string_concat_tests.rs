@@ -16,7 +16,7 @@
 // under the License.
 
 use super::super::string_concat_owner::{
-    effects, operation, owner_for_test, prepared_for_test_with_control,
+    ConcatKind, effects, operation, owner_for_test, prepared_for_test_with_control,
     prepared_for_test_with_policy,
 };
 use super::*;
@@ -544,7 +544,7 @@ fn string_concat_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_stal
         );
         assert_eq!(
             owner.binding_declaration().overloads()[0].effects.as_ref(),
-            Some(&effects())
+            Some(&effects(ConcatKind::String))
         );
         let pattern_arguments = [];
         assert!(

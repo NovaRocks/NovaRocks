@@ -324,6 +324,23 @@ impl crate::compiler::SqlFunctionCatalog for EngineFunctionCatalog {
         )
     }
 
+    fn resolve_like_with_escape_binding(
+        &self,
+        arguments: &[FunctionArgument],
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
+        self.resolve_bound_trusted(
+            novarocks_functions::native_like::ESCAPE_FUNCTION_NAME,
+            FunctionKind::Scalar,
+            FunctionBindingRequest {
+                arguments,
+                logical_argument_count: arguments.len(),
+                expected_result_type: None,
+            },
+            control,
+        )
+    }
+
     fn resolve_json_canonical_key_binding(
         &self,
         argument: &FunctionArgument,

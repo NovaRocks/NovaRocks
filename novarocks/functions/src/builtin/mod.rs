@@ -140,6 +140,7 @@ mod json_canonical_owner;
 mod json_canonical_selected;
 mod json_object_owner;
 mod json_object_selected;
+mod like_escape_owner;
 mod makedate;
 mod makedate_owner;
 pub mod map_entries_core;

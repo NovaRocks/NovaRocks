@@ -51,12 +51,15 @@ pub(super) fn operation(name: &str) -> Option<ConcatKind> {
     }
 }
 
-/// Concatenation is strict and total within the representable result layout.
-/// The kernel has no mutable instance state, even across batches.
-pub(super) fn effects() -> FunctionEffectDeclaration {
+/// Concatenation is strict and stateless. Array calls with one non-null
+/// argument report a row error.
+pub(super) fn effects(kind: ConcatKind) -> FunctionEffectDeclaration {
     FunctionEffectDeclaration {
         value_stability: FunctionVolatility::Immutable,
-        own_row_error: FunctionIntrinsicRowError::NoRowError,
+        own_row_error: match kind {
+            ConcatKind::String => FunctionIntrinsicRowError::NoRowError,
+            ConcatKind::Array => FunctionIntrinsicRowError::MayRaise,
+        },
         failure_behavior: FunctionFailureBehavior::Propagate,
         null_behavior: FunctionNullBehavior::Strict,
         argument_control: ArgumentControl::Eager,
@@ -97,7 +100,7 @@ impl ConcatOwner {
             value: name.into(),
         })?;
         let function = format!("builtin.scalar/{name}/v1");
-        let expected = effects();
+        let expected = effects(kind);
         if declaration.function_id().as_str() != function
             || declaration.kind() != FunctionKind::Scalar
             || declaration.overloads().len() != 1
@@ -129,11 +132,16 @@ impl ConcatOwner {
         })
     }
 
-    fn call_effects(&self, scope: CallProofScope) -> CallEffects {
-        let base = effects();
+    fn call_effects(&self, scope: CallProofScope, arguments: usize) -> CallEffects {
+        let base = effects(self.kind);
+        let own_row_error = if arguments == 1 {
+            base.own_row_error
+        } else {
+            FunctionIntrinsicRowError::NoRowError
+        };
         CallEffects {
             value_stability: base.value_stability,
-            own_row_error: base.own_row_error,
+            own_row_error,
             failure_behavior: base.failure_behavior,
             null_behavior: base.null_behavior,
             argument_control: base.argument_control,
@@ -410,7 +418,7 @@ impl ConcatOwner {
                 FunctionBindingError::Control(error) => FunctionEffectOwnerError::Control(error),
                 other => FunctionEffectOwnerError::Owner(other),
             })?;
-            Ok(self.call_effects(input.proof_scope))
+            Ok(self.call_effects(input.proof_scope, input.selected.argument_types.len()))
         })();
         if matches!(&result, Err(FunctionEffectOwnerError::Control(_))) {
             return result;
@@ -435,7 +443,8 @@ impl ConcatOwner {
                 || !std::ptr::eq(contract.selected(), input.selected)
                 || contract.context() != input.context
                 || contract.decimal_overflow_policy() != input.decimal_overflow_policy
-                || contract.effects() != &self.call_effects(input.proof_scope)
+                || contract.effects()
+                    != &self.call_effects(input.proof_scope, input.selected.argument_types.len())
                 || !input.environment.is_empty()
             {
                 return Err(invalid(

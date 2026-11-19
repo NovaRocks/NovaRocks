@@ -174,3 +174,39 @@ result
 [1,null,2]
 NULL
 [4]
+
+-- query 37
+-- types	array(integer)
+_col0
+NULL
+
+-- query 39
+-- types	boolean
+_col0
+NULL
+
+-- query 40
+-- types	boolean
+_col0
+NULL
+true
+
+-- query 43
+-- types	boolean
+_col0
+true
+
+-- query 44
+-- types	boolean
+_col0
+NULL
+
+-- query 45
+-- types	boolean
+_col0
+NULL
+
+-- query 47
+-- types	boolean
+_col0
+false

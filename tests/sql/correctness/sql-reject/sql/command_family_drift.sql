@@ -144,11 +144,11 @@ ALTER TABLE reject_ice.reject_ns.t ALTER COLUMN id DROP DEFAULT;
 
 -- query 31
 -- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
-ALTER TABLE reject_ice.reject_ns.t ALTER COLUMN id SET DATA TYPE bigint;
+ALTER TABLE IF EXISTS reject_ice.reject_ns.t ALTER COLUMN id SET DATA TYPE bigint;
 
 -- query 32
 -- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
-ALTER TABLE reject_ice.reject_ns.t ALTER COLUMN id DROP NOT NULL;
+ALTER TABLE IF EXISTS reject_ice.reject_ns.t ALTER COLUMN id DROP NOT NULL;
 
 -- query 33
 -- @expect_trino_error=NOT_SUPPORTED,USER_ERROR

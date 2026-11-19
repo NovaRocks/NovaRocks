@@ -128,3 +128,61 @@ SELECT l || r AS result FROM (
         (CAST(2 AS integer), CAST(NULL AS ARRAY(integer)), ARRAY[CAST(3 AS integer)]),
         (CAST(3 AS integer), CAST(ARRAY[] AS ARRAY(integer)), ARRAY[CAST(4 AS integer)])
 ) AS t(id, l, r) ORDER BY id;
+
+-- query 36
+-- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR
+SELECT concat(ARRAY[CAST(1 AS integer)]);
+
+-- query 37
+SELECT concat(CAST(NULL AS ARRAY(integer)));
+
+-- query 38
+-- @expect_trino_error=TOO_MANY_ARGUMENTS,USER_ERROR
+SELECT concat(
+    ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)],
+    ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)],
+    ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)],
+    ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)],
+    ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)],
+    ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)],
+    ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)],
+    ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)],
+    ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)],
+    ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)],
+    ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)],
+    ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)],
+    ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)],
+    ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)],
+    ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)],
+    ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)], ARRAY[CAST(1 AS integer)]
+);
+
+-- query 39
+SELECT CAST(NULL AS varchar) LIKE CAST('x!' AS varchar) ESCAPE '!';
+
+-- query 40
+SELECT value LIKE pattern ESCAPE esc FROM (VALUES (CAST(NULL AS varchar), CAST('x!' AS varchar), CAST('!' AS varchar)), ('ok', 'ok', '!')) t(value,pattern,esc);
+
+-- query 41
+-- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR
+SELECT 'miss' LIKE 'x!q' ESCAPE '!';
+
+-- query 42
+-- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR
+SELECT 'miss' LIKE 'x%' ESCAPE '😀';
+
+-- query 43
+SELECT 'a%b' LIKE 'a界%b' ESCAPE '界';
+
+-- query 44
+SELECT 'x' LIKE 'x' ESCAPE CAST(NULL AS varchar);
+
+-- query 45
+SELECT 'x' LIKE CAST(NULL AS varchar) ESCAPE 'long';
+
+-- query 46
+-- @expect_trino_error=INVALID_FUNCTION_ARGUMENT,USER_ERROR
+SELECT 'a_b' LIKE 'a\_b' ESCAPE '';
+
+-- query 47
+SELECT 'a_b' NOT LIKE 'a!_b' ESCAPE '!';

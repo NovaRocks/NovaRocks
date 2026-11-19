@@ -1481,10 +1481,76 @@ impl<'a> super::AnalyzerContext<'a> {
         predicate: &ast::LikePredicate,
         scope: &AnalyzerScope,
     ) -> Result<TypedExpr, AnalyzeError> {
-        // Preserve the original ignored-ESCAPE behavior during the P04 AST migration.
-        // Trino LIKE escape semantics remain a separate cutover requirement (D12).
-        let expr_typed = self.analyze_expr(value, scope)?;
-        let pattern_typed = self.analyze_expr(&predicate.pattern, scope)?;
+        use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
+
+        let operand = |syntax: &ast::Expr| {
+            let expr = self.analyze_expr(syntax, scope)?;
+            if is_strict_null_value_type(&expr.value_type) {
+                self.cast_to_value_type(
+                    expr,
+                    FunctionValueType::new(DataType::Utf8, true),
+                    syntax.span(),
+                )
+            } else if expr.value_type.logical_type() == ValueLogicalType::Physical
+                && expr.value_type.data_type() == &DataType::Utf8
+            {
+                Ok(expr)
+            } else {
+                Err(AnalyzeError::type_mismatch(
+                    "LIKE operands must be character strings",
+                    syntax.span(),
+                ))
+            }
+        };
+        let expr_typed = operand(value)?;
+        let pattern_typed = operand(&predicate.pattern)?;
+        if let Some(escape) = &predicate.escape {
+            let args = vec![expr_typed, pattern_typed, operand(escape)?];
+            let arguments = args
+                .iter()
+                .map(|arg| {
+                    crate::analysis::function_argument(arg, self.constant_policy, self.control)
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| {
+                    AnalyzeError::function_binding(error).at_type_mismatch(predicate.span)
+                })?;
+            let binding = self
+                .function_catalog
+                .resolve_like_with_escape_binding(&arguments, self.control)
+                .map_err(|error| {
+                    AnalyzeError::function_binding(error).at_type_mismatch(predicate.span)
+                })?;
+            let novarocks_functions::FunctionResultType::Scalar(value_type) =
+                &binding.selected.result_type
+            else {
+                return Err(AnalyzeError::internal("LIKE selected a non-scalar result"));
+            };
+            let value_type = value_type.clone();
+            let mut result = TypedExpr {
+                kind: ExprKind::FunctionCall {
+                    volatility: binding.semantics.volatility,
+                    name: novarocks_functions::native_like::ESCAPE_FUNCTION_NAME.to_owned(),
+                    binding: crate::binding::SqlFunctionBinding::new(
+                        binding,
+                        self.sql_semantics.sql_mode().decimal_overflow_policy(),
+                    ),
+                    args: args.into(),
+                    distinct: false,
+                },
+                value_type: value_type.clone(),
+            };
+            if predicate.negated {
+                result = TypedExpr {
+                    kind: ExprKind::UnaryOp {
+                        op: UnOp::Not,
+                        expr: novarocks_parser::ast::AstBox::new(result),
+                    },
+                    value_type,
+                };
+            }
+            return Ok(result);
+        }
         let nullable = expr_typed.value_type.nullable() || pattern_typed.value_type.nullable();
         Ok(TypedExpr {
             kind: ExprKind::Like {
@@ -3021,6 +3087,15 @@ impl<'a> super::AnalyzerContext<'a> {
                 self.control,
             )
             .map_err(|error| error.at_type_mismatch(func.span))?;
+            // This overload is also exposed by Trino's named array concat call.
+            if bound.binding.function_id.as_str() == "builtin.scalar/array_concat/v1"
+                && bound.binding.logical_argument_count > 127
+            {
+                return Err(AnalyzeError::too_many_arguments(
+                    "Too many arguments for function call concat()",
+                    func.span,
+                ));
+            }
             arg_types = bound
                 .args
                 .iter()
