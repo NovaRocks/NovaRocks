@@ -335,7 +335,8 @@ impl StatementStageAdmission {
         drop(self.compute.take());
         drop(self.q_wait.take());
         if let Some(owner) = self.owner.take() {
-            owner.complete();
+            // No launcher remains to consume a Cancel for this stage.
+            owner.complete_after_terminal_cancel_settled();
         }
         drop(self.client_window.take());
     }
@@ -1223,6 +1224,75 @@ mod tests {
         root.business.release();
         root.owner.complete();
         drive(&mut driver);
+        control.close_admission();
+        assert!(control.shutdown().is_ok());
+    }
+
+    #[test]
+    fn retired_unlaunched_client_stage_settles_its_inherited_deadline_cancel() {
+        use crate::query_execution::native_execution_adapter::source_cohort::tests::{
+            drive, fixture,
+        };
+        use novarocks_workload_control::{CancellationReason, ControlIntent, ResultWindowClass};
+
+        let (control, mut driver, capacity) = fixture();
+        let root = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let window = capacity
+            .try_acquire(&root.owner.scope(), ResultWindowClass::Client)
+            .unwrap();
+        let io = MetadataIoAdmission::for_original_source(&root.owner, Vec::new()).unwrap();
+        let mut stage = StatementStageAdmission::new(root.owner.scope(), 0)
+            .with_client_window(&window.retain_alias())
+            .unwrap();
+        drop(window);
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        let mut admitted = false;
+        for _ in 0..10000 {
+            drive(&mut driver);
+            if io.poll_progress(&root.owner, &mut cx).unwrap()
+                && let Poll::Ready(result) = stage.poll_admit(&io, &root.owner, &mut cx)
+            {
+                result.unwrap();
+                admitted = true;
+                break;
+            }
+        }
+        assert!(admitted, "the original Client stage must actually admit");
+        assert_eq!(capacity.snapshot().held_positions, [1, 0, 0, 0]);
+        let stage_scope = stage.owner.as_ref().unwrap().scope();
+        let stage_id = stage_scope.id();
+
+        root.owner.cancel(CancellationReason::DeadlineExceeded);
+        // Run the actual expiry owner after downward cancellation. The same
+        // finite frontier publishes the inherited Cancel on the stage.
+        control.deadline_expiry_handle().expire_deadlines();
+        assert_eq!(
+            stage_scope.check(),
+            Err(WorkError::Cancelled(CancellationReason::DeadlineExceeded))
+        );
+        assert!(
+            control.snapshot().scopes.iter().any(|scope| {
+                scope.id == stage_id && scope.control_pending.contains(ControlIntent::Cancel)
+            }),
+            "expiry must enqueue the original stage's Cancel"
+        );
+        assert!(matches!(
+            io.poll_actual_quiescent_continuing(&mut cx),
+            Poll::Ready(Ok(_))
+        ));
+
+        stage.retire_unlaunched();
+        drop((stage, stage_scope, io));
+        root.business.release();
+        root.owner.complete_after_terminal_cancel_settled();
+        drive(&mut driver);
+
+        let snapshot = control.snapshot();
+        assert!(snapshot.scopes.is_empty(), "the stage and Root must retire");
+        assert_eq!(snapshot.control_ready, 0);
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
         control.close_admission();
         assert!(control.shutdown().is_ok());
     }
