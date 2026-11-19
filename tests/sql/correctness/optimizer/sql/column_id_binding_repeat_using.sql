@@ -54,9 +54,9 @@ ANALYZE TABLE ${case_db}.cid_repeat_using_r;
 
 -- query 7
 -- @order_sensitive=true
-SELECT grouping(a + 1) AS g, a + 1 AS k, count(*) AS cnt
-FROM ${case_db}.cid_repeat_using_l
-GROUP BY ROLLUP(a + 1)
+SELECT grouping(k) AS g, k AS k, count() AS cnt
+FROM (SELECT a + 1 AS k FROM ${case_db}.cid_repeat_using_l) AS rollup_input
+GROUP BY ROLLUP(k)
 ORDER BY g, k;
 
 -- query 8

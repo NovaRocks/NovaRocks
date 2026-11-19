@@ -1213,12 +1213,9 @@ fn p2_having_computed_group_key_does_not_append_leaf_group_by() {
 
 #[test]
 fn p2_repeat_grouping_aggregate_outputs_follow_group_by_order() {
-    // Computed GROUPING arguments remain the existing Nova grammar extension.
-    // Trino requires qualifiedName here; that grammar flip belongs to 5e.
-    // The public width still follows the approved INTEGER/BIGINT rule.
-    let plan = plan_test_query(
-        "SELECT grouping(a + 1) AS g, a + 1 AS k, count(*) AS cnt \
-             FROM t GROUP BY ROLLUP(a + 1)",
+    let plan = plan_with_computed_repeat_key(
+        "SELECT grouping(a) AS g, a + 1 AS k, count(*) AS cnt FROM t GROUP BY ROLLUP(a)",
+        1,
     );
     let (project, aggregate) = root_project_over_aggregate(&plan);
     assert_eq!(
@@ -2390,10 +2387,40 @@ fn sqlx2_delta_relation_projects_token_bound_sql_scan_source() {
     ));
 }
 
+fn plan_with_computed_repeat_key(sql: &str, key_index: usize) -> LogicalPlanNode {
+    let statement =
+        novarocks_parser::trino_parser::parse_statement(sql).expect("parse a Trino ROLLUP fixture");
+    let novarocks_parser::ast::TrinoStatement::Query(query) = statement else {
+        panic!("expected a query");
+    };
+    let (mut resolved, cte_registry, mut factory) =
+        crate::analyzer::analyze(&query, &TestCatalog, "default").expect("bind the ROLLUP fixture");
+    let QueryBody::Select(select) = &mut resolved.body else {
+        panic!("expected a SELECT");
+    };
+    let [key, _mask] = select.group_by.as_mut_slice() else {
+        panic!("expected a ROLLUP key and its GROUPING mask");
+    };
+    // Keep the analyzed levels and mask. Supply the bound projection expression
+    // as the key to exercise the planner's computed Repeat input directly.
+    let computed_key = select.projection[key_index].expr.clone();
+    assert!(matches!(
+        computed_key.kind,
+        ExprKind::BinaryOp { op: BinOp::Add, .. }
+    ));
+    *key = computed_key;
+    plan_query(
+        resolved,
+        cte_registry,
+        &mut factory,
+        &crate::compiler::SqlCompileControl::unbounded(),
+    )
+    .expect("plan the computed Repeat key")
+}
+
 #[test]
 fn p2_rollup_materialized_key_has_real_id() {
-    let plan = parse_analyze_and_plan("SELECT a + 1 AS k FROM t GROUP BY ROLLUP(a + 1)")
-        .expect("planner should succeed");
+    let plan = plan_with_computed_repeat_key("SELECT a + 1 AS k FROM t GROUP BY ROLLUP(a)", 0);
     let (_project, aggregate) = root_project_over_aggregate(&plan);
     let (repeat_plan, _repeat) = first_repeat_node(&plan);
     let LogicalPlanKind::Project(repeat_input_project) = &repeat_plan.unary_input().kind else {
@@ -2492,7 +2519,10 @@ fn grouping_input_sum_distinct_count_and_ordered_array_keep_original_rows() {
 
 #[test]
 fn grouping_input_computed_key_does_not_replace_aggregate_arithmetic() {
-    let plan = plan_test_query("SELECT a + 1 AS k, sum(a + 1) AS s FROM t GROUP BY ROLLUP(a + 1)");
+    let plan = plan_with_computed_repeat_key(
+        "SELECT a + 1 AS k, sum(a + 1) AS s FROM t GROUP BY ROLLUP(a)",
+        0,
+    );
     let (source_id, repeat_key_id) = grouping_input_source_and_repeat_key(&plan);
     let (project, aggregate) = root_project_over_aggregate(&plan);
     assert_eq!(column_ref_id(&project.items[0].expr), repeat_key_id);
