@@ -89,7 +89,6 @@ pub(super) fn request(
         },
         DEFAULT_COMPLETION_LIMITS,
     )
-    .with_legacy_fold_evaluator(crate::query_execution::constant_eval::constant_evaluator())
 }
 
 #[tokio::test]

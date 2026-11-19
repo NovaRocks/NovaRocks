@@ -92,7 +92,7 @@ const OPTIMIZE_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) struct OptimizerEnvironment<'a> {
     settings: &'a options::SessionOptimizerSettings,
     control: &'a dyn PureCompileControl,
-    constant_evaluator: Option<&'static dyn crate::compiler::SqlConstantEvaluator>,
+
     function_catalog: Arc<dyn crate::compiler::SqlFunctionCatalog>,
     sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
@@ -103,7 +103,7 @@ pub(crate) struct OptimizerEnvironment<'a> {
 impl<'a> OptimizerEnvironment<'a> {
     pub(crate) fn new(
         settings: &'a options::SessionOptimizerSettings,
-        constant_evaluator: Option<&'static dyn crate::compiler::SqlConstantEvaluator>,
+
         function_catalog: Arc<dyn crate::compiler::SqlFunctionCatalog>,
         sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
         decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
@@ -112,7 +112,7 @@ impl<'a> OptimizerEnvironment<'a> {
     ) -> Self {
         Self {
             settings,
-            constant_evaluator,
+
             function_catalog,
             sealed_functions,
             decimal_overflow_policy,
@@ -218,7 +218,6 @@ pub(crate) fn optimize_with_test_table_statistics(
         PhysicalPropertySet::gather(),
         OptimizerEnvironment::new(
             &settings,
-            None,
             crate::functions::test_function_catalog_snapshot(),
             novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
@@ -254,7 +253,6 @@ pub(crate) fn optimize_with_root_distribution_and_test_table_statistics(
         root_required,
         OptimizerEnvironment::new(
             &settings,
-            None,
             crate::functions::test_function_catalog_snapshot(),
             novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
@@ -276,7 +274,7 @@ fn optimize_with_root_property(
 ) -> Result<OptimizedOperatorNode, SqlCompileError> {
     let OptimizerEnvironment {
         settings: session_settings,
-        constant_evaluator,
+
         function_catalog,
         sealed_functions,
         decimal_overflow_policy,
@@ -312,9 +310,6 @@ fn optimize_with_root_property(
     rewrite_ctx.set_query_stats_input(stats_input.clone());
     rewrite_ctx.set_deadline(deadline);
     rewrite_ctx.set_column_ref_factory(Rc::clone(&factory));
-    if let Some(evaluator) = constant_evaluator {
-        rewrite_ctx.set_constant_evaluator(evaluator);
-    }
     rewrite_ctx.set_fold_dependency_observer(fold_dependency_observer);
     rewrite_ctx.set_function_catalog(Arc::clone(&function_catalog));
     rewrite_ctx.set_sealed_functions(Arc::clone(&sealed_functions));
@@ -1580,7 +1575,6 @@ mod is_known_rule_name_tests {
                 &without_constant_folding(
                     crate::optimizer::options::SessionOptimizerSettings::default(),
                 ),
-                None,
                 crate::functions::test_function_catalog_snapshot(),
                 novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
                 novarocks_type_contract::DecimalOverflowPolicy::OutputNull,

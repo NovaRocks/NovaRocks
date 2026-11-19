@@ -171,3 +171,45 @@ fn integral_decimal128_actual_compiler_i64_to_4_0_policy_selection_and_carrier()
 }
 
 mod after;
+
+#[test]
+fn decimal_to_tinyint_overflow_keeps_its_selected_row_error() {
+    use crate::zero_port;
+    use novarocks_expression_contract::ExprKind;
+    use novarocks_type_contract::{
+        SemanticParameterId, SemanticParameterKey, SemanticParameterRef, SemanticParameterValue,
+        SemanticParameters,
+    };
+
+    let input: ArrayRef = Arc::new(
+        Decimal128Array::from(vec![1000])
+            .with_precision_and_scale(4, 0)
+            .unwrap(),
+    );
+    let parameter = SemanticParameterId::new(0);
+    let parameters = SemanticParameters::try_new([(
+        parameter,
+        SemanticParameterValue::AllowThrowException(true),
+    )])
+    .unwrap();
+    let unit = zero_port::primitive(
+        [input],
+        FunctionValueType::new(DataType::Int8, true),
+        |children| ExprKind::Cast {
+            expr: children[0],
+            target: DataType::Int8,
+            decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
+            allow_throw_exception: SemanticParameterRef {
+                id: parameter,
+                expected_key: SemanticParameterKey::AllowThrowException,
+            },
+        },
+        &parameters,
+    )
+    .unwrap();
+    let output = zero_port::evaluate(unit);
+    assert!(output.values().is_null(0));
+    assert_eq!(output.errors().len(), 1);
+    assert_eq!(output.errors()[0].selected_ordinal(), 0);
+    assert_eq!(output.errors()[0].message(), OVERFLOW);
+}

@@ -339,7 +339,6 @@ fn tracked_request(sql: &str, catalog: &Arc<CountingCatalog>) -> SqlFinalPlanCom
         template.scan_read_budget,
         template.limits,
     )
-    .with_legacy_fold_evaluator(template.constant_evaluator)
 }
 
 #[test]

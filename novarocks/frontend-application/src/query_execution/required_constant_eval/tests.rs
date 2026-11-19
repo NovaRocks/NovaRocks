@@ -220,8 +220,8 @@ fn required_active_branch_error_preserves_original_data_and_ordinal() {
             .expect("original required row");
         assert_eq!(required.error().selected_ordinal(), 0);
         assert_eq!(required.batch_row(), 0);
-        // A producer with the same Data fact arriving through the external
-        // evaluator port remains Outer; classification alone cannot erase it.
+        // A producer with the same Data fact outside the selected row
+        // result remains Outer; classification alone cannot erase it.
         let outer = SqlConstantEvaluationError::outer_domain(cause.clone());
         assert!(matches!(&outer, SqlConstantEvaluationError::Outer(actual)
             if actual == &cause && actual.failure_fact().class() == FailureClass::Data));

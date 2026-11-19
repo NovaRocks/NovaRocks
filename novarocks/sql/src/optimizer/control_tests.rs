@@ -63,7 +63,6 @@ fn environment<'a>(
 ) -> OptimizerEnvironment<'a> {
     OptimizerEnvironment::new(
         settings,
-        None,
         crate::functions::test_function_catalog_snapshot(),
         novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
         novarocks_type_contract::DecimalOverflowPolicy::OutputNull,

@@ -45,7 +45,6 @@ use compiled::CompiledParts;
 pub(crate) use creation::ProgramCreationFailure;
 
 mod evaluator;
-pub use evaluator::constant_node;
 pub use evaluator::{
     CompiledExpressionInstance, CompiledFilterConjunctionInstance, EvaluationInput,
     ExprEvaluationFailure, InputColumnProjection, InputSourceStorage, InputStorageFailure,

@@ -81,10 +81,6 @@ pub(super) fn admit_scalar_unit_sources_observed<'source>(
 /// SQL still pairs each call with its source journal and statement policy.
 /// Ports are authored at their original point after definition controls; this
 /// closure supplies declarations only, never capacity or source credentials.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Call authorship borrows both the original SQL source and the sealed function and unit facts."
-)]
 pub(super) fn finish_scalar_unit_observed(
     site: ScalarSourceSite,
     mut draft: novarocks_expression_contract::BoundExprSetBuilder,
@@ -95,7 +91,6 @@ pub(super) fn finish_scalar_unit_observed(
     functions: &Arc<dyn crate::compiler::SqlFunctionCatalog>,
     sealed_functions: &novarocks_functions::PureEngineFunctionCatalog,
     policy: novarocks_constant_contract::ConstantPolicy,
-    control: &dyn PureCompileControl,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<AuthoredScalarUnit, ContractLoweringError> {
     {
@@ -138,36 +133,6 @@ pub(super) fn finish_scalar_unit_observed(
         decimal_overflow: &empty_decimal,
     };
     let controls = novarocks_expression::author_call_controls(&draft, &control_inputs, work);
-    // A refused checkpoint must not be followed by the legacy author. Prefix
-    // tests treat any later checkpoint as a callback after the original refusal.
-    #[cfg(debug_assertions)]
-    if !matches!(
-        controls,
-        Err(novarocks_expression::CallAuthorError::Control(_))
-    ) {
-        let source = SqlUnitSourceLoan {
-            site: site.clone(),
-            definitions: super::super::unit_source::UnitDefinitions::from_builder(
-                site.owner(),
-                &draft,
-            ),
-            constants,
-            parameters,
-            journal,
-            functions,
-        };
-        let previous = super::super::expression_occurrences::author_original_unit_controls_observed(
-            &source, work,
-        );
-        if let (
-            Ok(_),
-            Err(super::super::expression_occurrences::ExpressionOccurrenceError::Control(cause)),
-        ) = (&controls, &previous)
-        {
-            return Err(PackageSemanticsError::Control(cause.clone()).into());
-        }
-        author_parity::controls(&controls, &previous);
-    }
     for (definition, shape) in controls.map_err(package_author_error)? {
         draft.definition_control(definition, shape)?;
         work.step()?;
@@ -182,8 +147,6 @@ pub(super) fn finish_scalar_unit_observed(
         journal,
         functions,
     };
-    #[cfg(debug_assertions)]
-    let mut scopes = BTreeMap::new();
     let mut decimal = BTreeMap::new();
     for (&id, invocation) in sealed.uses() {
         let definition = sealed.definition(invocation.definition).ok_or(
@@ -213,20 +176,6 @@ pub(super) fn finish_scalar_unit_observed(
             invocation.definition,
             entry.captured().binding().decimal_overflow_policy(),
         );
-        #[cfg(debug_assertions)]
-        {
-            scopes.insert(
-                id,
-                super::super::physical_expression_effects::PhysicalCallSourceScope {
-                    source: definition,
-                    decimal_overflow_policy: entry.captured().binding().decimal_overflow_policy(),
-                    environment: &[],
-                    proof_scope: novarocks_type_contract::CallProofScope::Region(
-                        invocation.context.region,
-                    ),
-                },
-            );
-        }
         work.step()?;
     }
     let effect_inputs = novarocks_expression::CallAuthorInputs {
@@ -239,37 +188,6 @@ pub(super) fn finish_scalar_unit_observed(
         decimal_overflow: &decimal,
     };
     let authored = novarocks_expression::author_unit_calls(&sealed, &effect_inputs, work);
-    #[cfg(debug_assertions)]
-    if !matches!(
-        authored,
-        Err(novarocks_expression::CallAuthorError::Control(_))
-    ) {
-        let previous =
-            super::super::physical_expression_effects::author_sql_expression_effects_observed(
-                &source,
-                super::super::physical_expression_effects::PhysicalExpressionEffectsInput {
-                    owner: site.owner(),
-                    unit: &sealed,
-                    constants,
-                    parameters,
-                    literal_policy: policy,
-                    call_scopes: &scopes,
-                },
-                control,
-            );
-        if let (
-            Ok(_),
-            Err(
-                super::super::physical_expression_effects::PhysicalExpressionEffectsError::Control(
-                    cause,
-                ),
-            ),
-        ) = (&authored, &previous)
-        {
-            return Err(PackageSemanticsError::Control(cause.clone()).into());
-        }
-        author_parity::effects(&authored, &previous);
-    }
     let authored = authored.map_err(package_author_error)?;
     let unit = Arc::new(sealed.finish(authored.claims, work)?);
     Ok(AuthoredScalarUnit {
@@ -278,7 +196,9 @@ pub(super) fn finish_scalar_unit_observed(
     })
 }
 
-fn package_author_error(error: novarocks_expression::CallAuthorError) -> PackageSemanticsError {
+pub(in crate::planner::distributed::build) fn package_author_error(
+    error: novarocks_expression::CallAuthorError,
+) -> PackageSemanticsError {
     use novarocks_expression::{CallAuthorError, CapabilityRefusal, InvariantRefusal};
     match error {
         CallAuthorError::Control(cause) => PackageSemanticsError::Control(cause),
@@ -310,158 +230,6 @@ fn package_author_error(error: novarocks_expression::CallAuthorError) -> Package
         }
         CallAuthorError::Invariant(InvariantRefusal::Source(detail)) => {
             PackageSemanticsError::InvalidSource(detail)
-        }
-    }
-}
-
-#[cfg(debug_assertions)]
-mod author_parity {
-    use super::super::super::expression_occurrences::ExpressionOccurrenceError;
-    use super::super::super::package_semantics::expression_effects_parity;
-    use super::super::super::physical_expression_effects::{
-        AuthoredPhysicalExpressionEffects, PhysicalExpressionEffectsError,
-    };
-    use novarocks_expression::{
-        CallAuthorError, CapabilityRefusal, InvariantRefusal, UnitCallAuthorship,
-    };
-    use novarocks_expression_contract::{DefinitionControl, ExprId};
-    use std::sync::Once;
-
-    pub(super) fn controls(
-        authored: &Result<Vec<(ExprId, DefinitionControl)>, CallAuthorError>,
-        previous: &Result<Vec<(ExprId, DefinitionControl)>, ExpressionOccurrenceError>,
-    ) {
-        match (authored, previous) {
-            (Ok(authored), Ok(previous)) => compare(
-                "controls",
-                authored == previous,
-                &format!("{previous:?}"),
-                &format!("{authored:?}"),
-            ),
-            (Err(authored), Err(previous)) => {
-                let (old_category, old_text) = occurrence_parity(previous);
-                let (new_category, new_text) = author_parity(authored);
-                compare(
-                    "controls",
-                    old_category == new_category && old_text == new_text,
-                    &format!("{old_category}: {old_text}"),
-                    &format!("{new_category}: {new_text}"),
-                );
-            }
-            (Ok(authored), Err(previous)) => {
-                let (category, text) = occurrence_parity(previous);
-                compare(
-                    "controls",
-                    false,
-                    &format!("{category}: {text}"),
-                    &format!("{authored:?}"),
-                );
-            }
-            (Err(authored), Ok(previous)) => {
-                let (category, text) = author_parity(authored);
-                compare(
-                    "controls",
-                    false,
-                    &format!("{previous:?}"),
-                    &format!("{category}: {text}"),
-                );
-            }
-        }
-    }
-
-    pub(super) fn effects(
-        authored: &Result<UnitCallAuthorship, CallAuthorError>,
-        previous: &Result<AuthoredPhysicalExpressionEffects, PhysicalExpressionEffectsError>,
-    ) {
-        match (authored, previous) {
-            (Ok(authored), Ok(previous)) => {
-                compare(
-                    "claims",
-                    authored.claims == previous.calls,
-                    &format!("{:?}", previous.calls),
-                    &format!("{:?}", authored.claims),
-                );
-                compare(
-                    "summaries",
-                    authored.summaries == previous.summaries,
-                    &format!("{:?}", previous.summaries),
-                    &format!("{:?}", authored.summaries),
-                );
-            }
-            (Err(authored), Err(previous)) => {
-                let (old_category, old_text) = expression_effects_parity(previous);
-                let (new_category, new_text) = author_parity(authored);
-                compare(
-                    "effects",
-                    old_category == new_category && old_text == new_text,
-                    &format!("{old_category}: {old_text}"),
-                    &format!("{new_category}: {new_text}"),
-                );
-            }
-            (Ok(authored), Err(previous)) => {
-                let (category, text) = expression_effects_parity(previous);
-                compare(
-                    "effects",
-                    false,
-                    &format!("{category}: {text}"),
-                    &format!("{:?}", authored.claims),
-                );
-            }
-            (Err(authored), Ok(previous)) => {
-                let (category, text) = author_parity(authored);
-                compare(
-                    "effects",
-                    false,
-                    &format!("{:?}", previous.calls),
-                    &format!("{category}: {text}"),
-                );
-            }
-        }
-    }
-
-    fn occurrence_parity(error: &ExpressionOccurrenceError) -> (&'static str, String) {
-        match error {
-            ExpressionOccurrenceError::Control(cause) => ("control", cause.to_string()),
-            other => (
-                "occurrence",
-                format!("package expression occurrences: {other:?}"),
-            ),
-        }
-    }
-
-    fn author_parity(error: &CallAuthorError) -> (&'static str, String) {
-        let category = match error {
-            CallAuthorError::Control(_) => "control",
-            CallAuthorError::Capability(CapabilityRefusal::ConstantLimit(_)) => "constant",
-            CallAuthorError::Capability(CapabilityRefusal::Occurrence(_)) => "occurrence",
-            CallAuthorError::Capability(CapabilityRefusal::Effects(_)) => "effects",
-            CallAuthorError::Capability(CapabilityRefusal::Unsupported(_)) => "unsupported",
-            CallAuthorError::Capability(CapabilityRefusal::Primitive { .. }) => "primitive",
-            CallAuthorError::Invariant(
-                InvariantRefusal::ConstantPolicy | InvariantRefusal::MissingOverflow(_),
-            ) => "effects",
-            CallAuthorError::Invariant(InvariantRefusal::Source(_)) => "source",
-        };
-        (category, error.to_string())
-    }
-
-    fn compare(field: &str, same: bool, old: &str, new: &str) {
-        static ENABLED: Once = Once::new();
-        ENABLED.call_once(|| {
-            tracing::warn!(
-                "{} probe=author",
-                novarocks_failpoint::observation_marker::EXL03_AUTHOR_PARITY_ENABLED
-            );
-        });
-        if same {
-            return;
-        }
-        tracing::warn!(
-            "{} field={field} old={old} new={new}",
-            novarocks_failpoint::observation_marker::EXL03_AUTHOR_PARITY_MISMATCH
-        );
-        if std::env::var_os("NOVAROCKS_EXL03_PARITY_PANIC").is_some_and(|value| value == "1") {
-            panic!("EXL-03 author parity mismatch field={field} old={old} new={new}");
         }
     }
 }
@@ -634,7 +402,6 @@ impl ContractLoweringVisitor<'_> {
                 &self.functions,
                 self.sealed_functions.as_ref(),
                 self.constant_policy,
-                self.control,
                 &mut self.work,
             )?;
             let unit = authored.unit;

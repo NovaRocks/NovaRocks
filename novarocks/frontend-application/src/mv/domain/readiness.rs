@@ -1016,8 +1016,7 @@ mod original_request_tests {
                 max_batch_bytes: novarocks_physical_plan::MAX_SCAN_BATCH_BYTES,
             },
             DEFAULT_COMPLETION_LIMITS,
-        )
-        .with_legacy_fold_evaluator(crate::query_execution::constant_eval::constant_evaluator());
+        );
         let SqlCompileProgress::Incomplete(compilation) =
             SqlCompiler::start(request.try_into_completion().unwrap(), &control).unwrap()
         else {

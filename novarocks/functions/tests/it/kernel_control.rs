@@ -15,5 +15,22 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod failure;
-mod recipe_boundary;
+use novarocks_functions::{CompileKernelControl, KernelEvaluationControl, KernelFailure};
+use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
+use std::time::Duration;
+
+struct Control;
+impl PureCompileControl for Control {
+    fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
+        Ok(())
+    }
+}
+
+#[test]
+fn compile_control_adapter_never_allows_a_wait() {
+    let control = CompileKernelControl::new(&Control, CompilePhase::FunctionSpecialization);
+    assert!(matches!(
+        control.wait(Duration::ZERO),
+        Err(KernelFailure::InvalidProgram(_))
+    ));
+}

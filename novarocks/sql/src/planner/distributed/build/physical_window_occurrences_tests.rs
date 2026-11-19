@@ -16,9 +16,6 @@
 // under the License.
 
 use super::super::contract_lowering::{NodeExpressionEffects, node_effects_with_test_summaries};
-use super::super::physical_expression_effects::{
-    PhysicalExpressionEffectsInput, author_physical_expression_effects_observed,
-};
 use super::super::{
     expression_occurrences::author_physical_occurrences_observed,
     physical_window_requests::{
@@ -191,7 +188,6 @@ fn root(
 fn finish(mut builder: FragmentBuilder, root: NodeId, external: &ConstantPools) -> Fragment {
     let mut pools = external.clone();
     checked::merge(&mut pools, &builder.pools);
-    let catalog = build_builtin_engine_function_catalog().unwrap();
     let parameters = SemanticParameters::try_new([]).unwrap();
     let nodes = builder
         .construction_nodes()
@@ -207,20 +203,16 @@ fn finish(mut builder: FragmentBuilder, root: NodeId, external: &ConstantPools) 
         let control = Control::default();
         let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
         let sealed = draft.seal(ports, &mut work).unwrap();
-        let authored = author_physical_expression_effects_observed(
-            PhysicalExpressionEffectsInput {
-                owner: crate::planner::distributed::build::unit_source::ScalarUnitOwner::Node(node),
-                unit: &sealed,
-                constants: &pools,
-                parameters: &parameters,
-                literal_policy: policy(),
-                call_scopes: &BTreeMap::new(),
-            },
-            &catalog,
-            &Control::default(),
+        let authored = super::super::expression_component_test_fixture::author_component_calls(
+            &sealed,
+            &pools,
+            &parameters,
+            policy(),
+            DecimalOverflowPolicy::OutputNull,
+            &mut work,
         )
         .unwrap();
-        let unit = Arc::new(sealed.finish(authored.calls, &mut work).unwrap());
+        let unit = Arc::new(sealed.finish(authored.claims, &mut work).unwrap());
         work.finish().unwrap();
         effects.insert(
             node,
@@ -1115,6 +1107,94 @@ fn window_occurrences_frame_pool_offsets_are_ordered_children_not_function_chann
                 false,
             );
             request_prefixes(source, &fragment, &pools, true);
+        }
+    }
+}
+
+#[test]
+fn expression_effects_runtime_window_requires_explicit_scope_and_keeps_its_lifecycle() {
+    use super::super::physical_fragment_effects::{
+        PhysicalFragmentEffectsError, PhysicalFragmentEffectsInput,
+        PhysicalRelationalCallSourceScope, author_physical_fragment_effects_observed,
+    };
+
+    let catalog = build_builtin_engine_function_catalog().unwrap();
+    let (mut builder, leaf, owner) = empty();
+    let site = window(
+        &mut builder,
+        leaf,
+        owner,
+        window_binding(&catalog, "rank", &[]),
+        &[],
+        None,
+        false,
+        None,
+        false,
+    );
+    let pools = ConstantPools::empty();
+    let fragment = finish(builder, owner, &pools);
+    let occurrences = uses(&fragment, &catalog);
+    let (source, _) = window_source(&fragment, site);
+    assert!(source.expressions.is_none());
+    let [(actual_site, context)] = occurrences.relational_contexts.as_slice() else {
+        panic!("one relational Window occurrence");
+    };
+    assert_eq!(*actual_site, site);
+    let parameters = SemanticParameters::try_new([]).unwrap();
+    let run = |scopes: &BTreeMap<_, _>, control: &Control| {
+        author_physical_fragment_effects_observed(
+            PhysicalFragmentEffectsInput {
+                fragment: &fragment,
+                occurrences: &occurrences,
+                constants: &pools,
+                parameters: &parameters,
+                literal_policy: policy(),
+                node_effects: &fragment.effects,
+                relational_scopes: scopes,
+            },
+            &catalog,
+            control,
+        )
+    };
+    let missing = BTreeMap::new();
+    let present = BTreeMap::from([(
+        site,
+        PhysicalRelationalCallSourceScope {
+            source,
+            decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
+            environment: &[],
+            proof_scope: CallProofScope::Relation(context.identity),
+        },
+    )]);
+    let baseline = Control::default();
+    assert!(
+        matches!(run(&missing, &baseline), Err(PhysicalFragmentEffectsError::MissingScope(actual)) if actual == site)
+    );
+    let missing_trace = baseline.trace();
+    let baseline = Control::default();
+    let authored = run(&present, &baseline).unwrap();
+    assert_eq!(authored.calls.entries().len(), 1);
+    assert_eq!(
+        authored.calls.entries()[&site].effects.instance_state,
+        FunctionInstanceState::WindowPartition
+    );
+    authored
+        .calls
+        .validate_fragment(&fragment, &Control::default())
+        .unwrap();
+    for (scopes, expected) in [(&missing, missing_trace), (&present, baseline.trace())] {
+        assert_eq!(expected.first(), Some(&(PHASE, 0)));
+        for (at, _) in expected.iter().enumerate() {
+            for cause in CAUSES {
+                let control = Control {
+                    refusal: Some((at, cause.clone())),
+                    ..Control::default()
+                };
+                assert!(
+                    matches!(run(scopes, &control), Err(PhysicalFragmentEffectsError::Control(actual)) if actual == cause)
+                );
+                assert_eq!(control.trace(), expected[..=at]);
+            }
         }
     }
 }

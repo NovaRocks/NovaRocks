@@ -65,10 +65,7 @@ macro_rules! scalar_factory {
     };
 }
 scalar_factory!(i64, i64, from_i64);
-scalar_factory!(timestamp, i64, from_timestamp);
 scalar_factory!(boolean, bool, from_boolean);
-scalar_factory!(f64_bits, u64, from_f64_bits);
-scalar_factory!(decimal128, i128, from_decimal128);
 pub(crate) fn null() -> Source {
     Box::new(|ty| {
         ConstantValue::null(

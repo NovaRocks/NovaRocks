@@ -82,10 +82,6 @@ pub(crate) struct RewriteContext<'a> {
     scalar_arena: Option<Rc<RefCell<ScalarArena>>>,
     /// Indexed by the rebuilt scalar with all constant children.
     fold_cache: RefCell<HashMap<ScalarId, Option<ScalarId>>>,
-    /// Process-lifetime constant evaluator injected at the compiler boundary.
-    /// `None` means the compile path has no execution capability attached, and
-    /// constant folding degrades to a no-op.
-    constant_evaluator: Option<&'static dyn crate::compiler::SqlConstantEvaluator>,
     fold_dependency_observer: Option<Arc<dyn crate::compiler::SqlFoldDependencyObserver>>,
     function_catalog: Option<Arc<dyn crate::compiler::SqlFunctionCatalog>>,
     sealed_functions: Option<Arc<novarocks_functions::PureEngineFunctionCatalog>>,
@@ -113,7 +109,7 @@ impl<'a> RewriteContext<'a> {
             column_ref_factory: None,
             scalar_arena: None,
             fold_cache: RefCell::new(HashMap::new()),
-            constant_evaluator: None,
+
             fold_dependency_observer: None,
             function_catalog: None,
             sealed_functions: None,
@@ -260,19 +256,6 @@ impl<'a> RewriteContext<'a> {
         &self,
     ) -> Option<&Arc<novarocks_functions::PureEngineFunctionCatalog>> {
         self.sealed_functions.as_ref()
-    }
-
-    pub(crate) fn set_constant_evaluator(
-        &mut self,
-        evaluator: &'static dyn crate::compiler::SqlConstantEvaluator,
-    ) {
-        self.constant_evaluator = Some(evaluator);
-    }
-
-    pub(crate) fn constant_evaluator(
-        &self,
-    ) -> Option<&'static dyn crate::compiler::SqlConstantEvaluator> {
-        self.constant_evaluator
     }
 
     pub(crate) fn set_fold_dependency_observer(

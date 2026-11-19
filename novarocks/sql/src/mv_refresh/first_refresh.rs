@@ -297,7 +297,7 @@ pub struct SqlMvFirstRefreshAnalyzeContext<'a> {
     pub environment: crate::compiler::SqlPlanningEnvironment,
     pub catalog: &'a dyn crate::compiler::SqlCatalogSnapshot,
     pub functions: &'a dyn crate::compiler::SqlFunctionCatalog,
-    pub constant_evaluator: &'static dyn crate::compiler::SqlConstantEvaluator,
+
     pub sealed_functions: std::sync::Arc<novarocks_functions::PureEngineFunctionCatalog>,
     pub constant_policy: novarocks_functions::ConstantPolicy,
     pub control: crate::compiler::SqlCompileControl,
@@ -337,8 +337,7 @@ pub fn analyze_mv_first_refresh_connector_write(
         None,
         context.constant_policy,
         context.control,
-    )
-    .with_legacy_fold_evaluator(context.constant_evaluator);
+    );
     let analyzed = crate::compiler::SqlCompiler::analyze(request)?.into_pending()?;
     Ok(SqlMvFirstRefreshAnalyzed {
         analyzed,
@@ -404,7 +403,7 @@ pub struct SqlMvJoinFirstRefreshAnalyzeContext<'a> {
     pub environment: crate::compiler::SqlPlanningEnvironment,
     pub catalog: &'a dyn crate::compiler::SqlCatalogSnapshot,
     pub functions: &'a dyn crate::compiler::SqlFunctionCatalog,
-    pub constant_evaluator: &'static dyn crate::compiler::SqlConstantEvaluator,
+
     pub sealed_functions: std::sync::Arc<novarocks_functions::PureEngineFunctionCatalog>,
     pub constant_policy: novarocks_functions::ConstantPolicy,
     pub control: crate::compiler::SqlCompileControl,
@@ -457,7 +456,6 @@ pub fn analyze_join_first_refresh_connector_write(
         context.catalog,
         functions,
         Arc::clone(&context.sealed_functions),
-        context.constant_evaluator,
         sql_semantics.clone(),
         context.constant_policy,
         context.control.clone(),
@@ -499,7 +497,6 @@ pub fn analyze_join_first_refresh_connector_write(
         },
         context.environment,
         Arc::clone(&context.sealed_functions),
-        Some(context.constant_evaluator),
         context.constant_policy,
         context.control,
     )
@@ -609,7 +606,7 @@ pub struct SqlMvJoinIncrementalRefreshAnalyzeContext<'a> {
     pub environment: crate::compiler::SqlPlanningEnvironment,
     pub catalog: &'a dyn crate::compiler::SqlCatalogSnapshot,
     pub functions: &'a dyn crate::compiler::SqlFunctionCatalog,
-    pub constant_evaluator: &'static dyn crate::compiler::SqlConstantEvaluator,
+
     pub sealed_functions: std::sync::Arc<novarocks_functions::PureEngineFunctionCatalog>,
     pub constant_policy: novarocks_functions::ConstantPolicy,
     pub control: crate::compiler::SqlCompileControl,
@@ -660,7 +657,6 @@ pub fn analyze_join_incremental_refresh_change_stream(
         context.catalog,
         functions,
         Arc::clone(&context.sealed_functions),
-        context.constant_evaluator,
         sql_semantics.clone(),
         context.constant_policy,
         context.control.clone(),
@@ -707,7 +703,6 @@ pub fn analyze_join_incremental_refresh_change_stream(
         },
         crate::compiler::SqlPlanningEnvironment::NotApplicable,
         Arc::clone(&context.sealed_functions),
-        Some(context.constant_evaluator),
         context.constant_policy,
         context.control,
     )
@@ -846,7 +841,7 @@ pub struct SqlMvIncrementalRefreshAnalyzeContext<'a> {
     pub environment: crate::compiler::SqlPlanningEnvironment,
     pub catalog: &'a dyn crate::compiler::SqlCatalogSnapshot,
     pub functions: &'a dyn crate::compiler::SqlFunctionCatalog,
-    pub constant_evaluator: &'static dyn crate::compiler::SqlConstantEvaluator,
+
     pub sealed_functions: std::sync::Arc<novarocks_functions::PureEngineFunctionCatalog>,
     pub constant_policy: novarocks_functions::ConstantPolicy,
     pub control: crate::compiler::SqlCompileControl,
@@ -894,7 +889,6 @@ pub fn analyze_mv_incremental_refresh_change_stream(
         context.catalog,
         context.functions,
         Arc::clone(&context.sealed_functions),
-        context.constant_evaluator,
         context.constant_policy,
         context.control,
     );
@@ -1007,10 +1001,6 @@ pub fn begin_final_mv_incremental_refresh_change_stream(
     )
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "The dev fold probe borrows the reference evaluator alongside the exact production catalogue."
-)]
 fn canonical_incremental_change_stream_request<'a>(
     query: ast::Query,
     imv_rewrite: &'a crate::compiler::SqlImvPlanningInput,
@@ -1020,7 +1010,7 @@ fn canonical_incremental_change_stream_request<'a>(
     catalog: &'a dyn crate::compiler::SqlCatalogSnapshot,
     functions: &'a dyn crate::compiler::SqlFunctionCatalog,
     sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
-    constant_evaluator: &'static dyn crate::compiler::SqlConstantEvaluator,
+
     constant_policy: novarocks_functions::ConstantPolicy,
     control: crate::compiler::SqlCompileControl,
 ) -> crate::compiler::SqlAnalyzeRequest<'a> {
@@ -1041,7 +1031,6 @@ fn canonical_incremental_change_stream_request<'a>(
         constant_policy,
         control,
     )
-    .with_legacy_fold_evaluator(constant_evaluator)
     .with_imv_rewrite(imv_rewrite)
 }
 
@@ -1744,7 +1733,7 @@ fn plain_join_first_refresh_logical_request<'a>(
     catalog: &'a dyn crate::compiler::SqlCatalogSnapshot,
     functions: &'a dyn crate::compiler::SqlFunctionCatalog,
     sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
-    constant_evaluator: &'static dyn crate::compiler::SqlConstantEvaluator,
+
     sql_semantics: crate::sql_mode::SqlSemanticSettings,
     constant_policy: novarocks_functions::ConstantPolicy,
     control: crate::compiler::SqlCompileControl,
@@ -1766,7 +1755,6 @@ fn plain_join_first_refresh_logical_request<'a>(
         constant_policy,
         control,
     )
-    .with_legacy_fold_evaluator(constant_evaluator)
 }
 
 fn build_join_first_refresh_append_logical_plan(
@@ -3299,7 +3287,6 @@ mod tests {
             &catalog,
             &functions,
             novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-            crate::compiler::noop_constant_evaluator(),
             crate::sql_mode::SqlSemanticSettings::default(),
             crate::constant::test_constant_policy(),
             crate::compiler::SqlCompileControl::unbounded(),
@@ -3327,7 +3314,6 @@ mod tests {
             &catalog,
             &functions,
             novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-            crate::compiler::noop_constant_evaluator(),
             crate::sql_mode::SqlSemanticSettings::default(),
             crate::constant::test_constant_policy(),
             crate::compiler::SqlCompileControl::unbounded(),
@@ -3359,7 +3345,6 @@ mod tests {
             &catalog,
             &functions,
             novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-            crate::compiler::noop_constant_evaluator(),
             crate::constant::test_constant_policy(),
             crate::compiler::SqlCompileControl::unbounded(),
         );
@@ -3485,7 +3470,7 @@ mod tests {
                     environment: crate::compiler::SqlPlanningEnvironment::Distributed,
                     catalog: &catalog,
                     functions: crate::functions::builtin_sql_function_catalog(),
-                    constant_evaluator: crate::compiler::noop_constant_evaluator(),
+
                     sealed_functions:
                         novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
                     constant_policy: crate::constant::test_constant_policy(),
@@ -4506,7 +4491,6 @@ mod tests {
             &catalog,
             functions,
             novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-            crate::compiler::noop_constant_evaluator(),
             effective.clone(),
             constant_policy,
             control.clone(),
@@ -4530,7 +4514,6 @@ mod tests {
             },
             crate::compiler::SqlPlanningEnvironment::NotApplicable,
             novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-            Some(crate::compiler::noop_constant_evaluator()),
             constant_policy,
             control.clone(),
         )

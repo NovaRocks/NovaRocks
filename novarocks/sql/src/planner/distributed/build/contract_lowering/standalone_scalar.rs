@@ -243,7 +243,6 @@ pub(crate) fn lower_required_constant_unit(
             &source.functions,
             sealed_functions.as_ref(),
             policy,
-            control,
             &mut work,
         )?;
         Ok(StandaloneScalarEmission {

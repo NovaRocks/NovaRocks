@@ -19,8 +19,8 @@
 
 use super::{
     CatalogRelationFact, CatalogRelationNeed, ExplainLevel, SqlAnalyzeRequest, SqlCompileControl,
-    SqlCompileError, SqlCompileIntent, SqlCompiler, SqlConstantEvaluator, SqlFunctionCatalog,
-    SqlPlannerTableSnapshot, SqlPlanningEnvironment, SqlSessionContext, SqlStatementInput,
+    SqlCompileError, SqlCompileIntent, SqlCompiler, SqlFunctionCatalog, SqlPlannerTableSnapshot,
+    SqlPlanningEnvironment, SqlSessionContext, SqlStatementInput,
     completion_catalog::CatalogCompletionState,
 };
 
@@ -74,7 +74,6 @@ impl SqlLogicalExplainCatalog {
         facts: &[CatalogRelationFact],
         functions: &dyn SqlFunctionCatalog,
         sealed_functions: std::sync::Arc<novarocks_functions::PureEngineFunctionCatalog>,
-        evaluator: &'static dyn SqlConstantEvaluator,
         policy: novarocks_functions::ConstantPolicy,
         environment: SqlPlanningEnvironment,
         level: ExplainLevel,
@@ -93,8 +92,7 @@ impl SqlLogicalExplainCatalog {
             None,
             policy,
             self.control.clone(),
-        )
-        .with_legacy_fold_evaluator(evaluator);
+        );
         SqlCompiler::analyze(request)?
             .into_complete()?
             .into_explain_lines(level, true, &self.control)
@@ -134,7 +132,6 @@ mod tests {
                 &[],
                 functions,
                 novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-                super::super::noop_constant_evaluator(),
                 crate::constant::test_constant_policy(),
                 SqlPlanningEnvironment::Distributed,
                 ExplainLevel::Normal,
@@ -179,7 +176,6 @@ mod tests {
                     &[],
                     functions,
                     novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-                    super::super::noop_constant_evaluator(),
                     crate::constant::test_constant_policy(),
                     SqlPlanningEnvironment::Distributed,
                     ExplainLevel::Normal

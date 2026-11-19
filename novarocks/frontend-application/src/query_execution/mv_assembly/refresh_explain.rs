@@ -31,7 +31,6 @@ fn compile_captured_refresh_explain(
             catalog,
             functions: ports.function_catalog().as_ref(),
             sealed_functions: Arc::clone(ports.sealed_functions()),
-            constant_evaluator: crate::query_execution::constant_eval::constant_evaluator(),
             constant_policy: ports.constant_policy(),
             control: crate::query_execution::planning::sql_compile_control_from_connector_request(
                 connector_context,

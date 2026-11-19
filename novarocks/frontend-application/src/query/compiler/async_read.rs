@@ -186,9 +186,6 @@ impl FrontendQueryCompiler {
                     Self::pipeline_dop_domain(query_options.as_ref())?,
                     Self::scan_read_budget(query_options.as_ref()),
                     novarocks_sql::compiler::DEFAULT_COMPLETION_LIMITS,
-                )
-                .with_legacy_fold_evaluator(
-                    crate::query_execution::constant_eval::constant_evaluator(),
                 ),
                 version,
             ))

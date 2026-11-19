@@ -26,7 +26,6 @@ pub(crate) mod cohort_read;
 pub mod completion;
 pub(crate) mod completion_facts;
 pub(crate) mod connector_domain;
-pub mod constant_eval;
 pub mod contract;
 mod core_bindings;
 #[cfg(test)]

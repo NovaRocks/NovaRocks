@@ -50,8 +50,6 @@ use crate::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode, SortKey};
 
 mod admission;
 mod evaluation;
-#[cfg(debug_assertions)]
-mod legacy_parity;
 
 /// Functions that are classified `Immutable` by the SQL function catalog but
 /// whose execution kernel still reads the *host process* environment — the
@@ -797,8 +795,6 @@ fn try_fold_node_current(
 
     work.flush()?;
     let result = evaluate_fold_input(arena, id, ctx, work);
-    #[cfg(debug_assertions)]
-    legacy_parity::compare(arena, id, ctx, &result);
     let folded = result?
         .map(|value| {
             arena.intern_observed(

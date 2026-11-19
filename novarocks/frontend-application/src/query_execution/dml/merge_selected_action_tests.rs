@@ -74,8 +74,7 @@ fn compile_selected_action(
             max_batch_bytes: 1 << 20,
         },
         DEFAULT_COMPLETION_LIMITS,
-    )
-    .with_legacy_fold_evaluator(crate::query_execution::constant_eval::constant_evaluator());
+    );
     SqlCompiler::start(request.try_into_completion().unwrap(), &control)
         .unwrap_or_else(|error| panic!("MERGE match completion: {error:#?}\n{sql}"))
         .into_complete()

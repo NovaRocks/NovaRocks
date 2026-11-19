@@ -866,3 +866,7 @@ fn materialization_error(error: CallRequestMaterializationError) -> CallAuthorEr
         }
     }
 }
+
+#[cfg(test)]
+#[path = "effects/tests.rs"]
+mod tests;

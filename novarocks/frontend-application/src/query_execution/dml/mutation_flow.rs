@@ -1720,8 +1720,7 @@ mod tests {
             None,
             crate::application::test_constant_policy(),
             SqlCompileControl::unbounded(),
-        )
-        .with_legacy_fold_evaluator(crate::query_execution::constant_eval::constant_evaluator());
+        );
         let request = match assignment {
             Some((ordinal, span)) => {
                 let control = SqlCompileControl::unbounded();

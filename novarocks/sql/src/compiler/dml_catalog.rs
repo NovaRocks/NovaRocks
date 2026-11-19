@@ -20,8 +20,8 @@
 use super::{
     CatalogRelationFact, CatalogRelationNeed, ConstantPolicy, RootDistributionRequirement,
     SqlAnalyzeRequest, SqlAnalyzedQuery, SqlCompileControl, SqlCompileError, SqlCompileIntent,
-    SqlCompiler, SqlConstantEvaluator, SqlFunctionCatalog, SqlPlannerTableSnapshot,
-    SqlPlanningEnvironment, SqlSessionContext, SqlStatementInput, SqlStatementInputKind,
+    SqlCompiler, SqlFunctionCatalog, SqlPlannerTableSnapshot, SqlPlanningEnvironment,
+    SqlSessionContext, SqlStatementInput, SqlStatementInputKind,
     completion_catalog::CatalogCompletionState,
 };
 use std::sync::Arc;
@@ -135,7 +135,6 @@ impl SqlDmlCatalogPreparation {
         facts: &[CatalogRelationFact],
         functions: &dyn SqlFunctionCatalog,
         sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
-        evaluator: &'static dyn SqlConstantEvaluator,
         policy: ConstantPolicy,
     ) -> Result<SqlAnalyzedQuery, SqlCompileError> {
         self.control.check()?;
@@ -169,8 +168,7 @@ impl SqlDmlCatalogPreparation {
             None,
             policy,
             self.control,
-        )
-        .with_legacy_fold_evaluator(evaluator);
+        );
         let request = match self.write_assignments {
             Some(assignments) => request.with_write_assignments(assignments)?,
             None => request,
@@ -227,7 +225,6 @@ mod tests {
             facts,
             crate::functions::builtin_sql_function_catalog(),
             novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-            super::super::noop_constant_evaluator(),
             crate::constant::test_constant_policy(),
         )
     }

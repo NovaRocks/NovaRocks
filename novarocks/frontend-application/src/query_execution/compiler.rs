@@ -1099,7 +1099,6 @@ pub(crate) async fn prepare_query_as_iceberg_write_with_write_session_and_consta
             &[],
             DmlQueryExecutionKernel::function_catalog(state),
             Arc::clone(DmlQueryExecutionKernel::sealed_functions(state)),
-            crate::query_execution::constant_eval::constant_evaluator(),
             DmlQueryExecutionKernel::constant_policy(state),
         )
         .map_err(crate::dml::error::DmlExecutionError::from_compile)?;

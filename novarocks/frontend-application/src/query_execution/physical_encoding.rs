@@ -1201,7 +1201,6 @@ mod tests {
         DEFAULT_COMPLETION_LIMITS, SessionOptimizerSettings, SqlCompileControl, SqlCompileIntent,
         SqlFactBatch, SqlFinalPlanCompileRequest, SqlNeedBatch, SqlPlanningEnvironment,
         SqlSessionContext, SqlStatementInput, builtin_sql_function_catalog,
-        noop_constant_evaluator,
     };
     use novarocks_workload_control::{
         ResourceConfig, WorkClass, WorkRequest, WorkloadConfig, WorkloadControl,
@@ -1362,7 +1361,6 @@ mod tests {
             JOIN (VALUES (7), (19)) AS r(id) ON l.id = r.id";
         let request = request_with_settings(
             sql,
-            crate::query_execution::constant_eval::constant_evaluator(),
             SessionOptimizerSettings {
                 cbo_broadcast_node_mem_budget_bytes: Some(0.0),
                 ..SessionOptimizerSettings::default()
@@ -2009,8 +2007,7 @@ mod tests {
                 max_batch_bytes: MAX_SCAN_BATCH_BYTES,
             },
             DEFAULT_COMPLETION_LIMITS,
-        )
-        .with_legacy_fold_evaluator(crate::query_execution::constant_eval::constant_evaluator());
+        );
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -2242,8 +2239,7 @@ mod tests {
                 max_batch_bytes: MAX_SCAN_BATCH_BYTES,
             },
             DEFAULT_COMPLETION_LIMITS,
-        )
-        .with_legacy_fold_evaluator(crate::query_execution::constant_eval::constant_evaluator());
+        );
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -2349,8 +2345,7 @@ mod tests {
                 max_batch_bytes: MAX_SCAN_BATCH_BYTES,
             },
             DEFAULT_COMPLETION_LIMITS,
-        )
-        .with_legacy_fold_evaluator(crate::query_execution::constant_eval::constant_evaluator());
+        );
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -2537,34 +2532,28 @@ mod tests {
             .expect("real builtin SQL catalogue");
         let semantics = novarocks_sql::sql_mode::SqlSemanticSettings::default();
         let decimal = semantics.sql_mode().decimal_overflow_policy();
-        let analyzed =
-            SqlCompiler::analyze(
-                SqlAnalyzeRequest::new(
-                    SqlStatementInput::parsed_query(query_ast(&sql)),
-                    SqlCompileIntent::IcebergWrite {
-                        root_distribution: RootDistributionRequirement::Any,
-                    },
-                    SqlSessionContext {
-                        sql_semantics: semantics,
-                        current_catalog: Some("native_statistics".into()),
-                        current_database: "native_statistics_db".into(),
-                        optimizer_settings: settings.clone(),
-                    },
-                    SqlPlanningEnvironment::Distributed,
-                    &snapshot,
-                    &functions,
-                    novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-                    None,
-                    FROZEN_CONSTANT_POLICY,
-                    control.clone(),
-                )
-                .with_legacy_fold_evaluator(
-                    crate::query_execution::constant_eval::constant_evaluator(),
-                ),
-            )
-            .unwrap_or_else(|error| panic!("wide INSERT source analysis: {error:#?}"))
-            .into_pending()
-            .expect("pending DML source");
+        let analyzed = SqlCompiler::analyze(SqlAnalyzeRequest::new(
+            SqlStatementInput::parsed_query(query_ast(&sql)),
+            SqlCompileIntent::IcebergWrite {
+                root_distribution: RootDistributionRequirement::Any,
+            },
+            SqlSessionContext {
+                sql_semantics: semantics,
+                current_catalog: Some("native_statistics".into()),
+                current_database: "native_statistics_db".into(),
+                optimizer_settings: settings.clone(),
+            },
+            SqlPlanningEnvironment::Distributed,
+            &snapshot,
+            &functions,
+            novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
+            None,
+            FROZEN_CONSTANT_POLICY,
+            control.clone(),
+        ))
+        .unwrap_or_else(|error| panic!("wide INSERT source analysis: {error:#?}"))
+        .into_pending()
+        .expect("pending DML source");
         let columns = (0..1024)
             .map(|index| ColumnDef {
                 name: format!("v{index}"),
@@ -3172,28 +3161,21 @@ mod tests {
     }
 
     fn request() -> SqlFinalPlanCompileRequest {
-        request_with("SELECT 1", noop_constant_evaluator())
-    }
-
-    /// A request folding constants with the production Frontend evaluator,
-    /// so the frozen packages are the ones production would freeze.
-    fn request_for(sql: &str) -> SqlFinalPlanCompileRequest {
-        request_with(
-            sql,
-            crate::query_execution::constant_eval::constant_evaluator(),
+        request_with_settings(
+            "SELECT 1",
+            SessionOptimizerSettings {
+                disabled_rules: vec!["FoldConstant".into()],
+                ..Default::default()
+            },
         )
     }
 
-    fn request_with(
-        sql: &str,
-        constant_evaluator: &'static dyn novarocks_sql::compiler::SqlConstantEvaluator,
-    ) -> SqlFinalPlanCompileRequest {
-        request_with_settings(sql, constant_evaluator, SessionOptimizerSettings::default())
+    fn request_for(sql: &str) -> SqlFinalPlanCompileRequest {
+        request_with_settings(sql, SessionOptimizerSettings::default())
     }
 
     fn request_with_settings(
         sql: &str,
-        constant_evaluator: &'static dyn novarocks_sql::compiler::SqlConstantEvaluator,
         optimizer_settings: SessionOptimizerSettings,
     ) -> SqlFinalPlanCompileRequest {
         SqlFinalPlanCompileRequest::new(
@@ -3222,6 +3204,5 @@ mod tests {
             },
             DEFAULT_COMPLETION_LIMITS,
         )
-        .with_legacy_fold_evaluator(constant_evaluator)
     }
 }

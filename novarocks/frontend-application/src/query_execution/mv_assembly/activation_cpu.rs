@@ -139,8 +139,6 @@ impl MvWriteAnalysisInput {
                         catalog: &c.catalog,
                         functions: c.functions.as_ref(),
                         sealed_functions: Arc::clone(&c.sealed_functions),
-                        constant_evaluator:
-                            crate::query_execution::constant_eval::constant_evaluator(),
                         constant_policy: c.constant_policy,
                         control: c.control,
                         sink,
@@ -169,8 +167,6 @@ impl MvWriteAnalysisInput {
                         catalog: &c.catalog,
                         functions: c.functions.as_ref(),
                         sealed_functions: Arc::clone(&c.sealed_functions),
-                        constant_evaluator:
-                            crate::query_execution::constant_eval::constant_evaluator(),
                         constant_policy: c.constant_policy,
                         control: c.control,
                         sink,
@@ -198,8 +194,6 @@ impl MvWriteAnalysisInput {
                         catalog: &c.catalog,
                         functions: c.functions.as_ref(),
                         sealed_functions: Arc::clone(&c.sealed_functions),
-                        constant_evaluator:
-                            crate::query_execution::constant_eval::constant_evaluator(),
                         constant_policy: c.constant_policy,
                         control: c.control,
                     },
@@ -229,8 +223,6 @@ impl MvWriteAnalysisInput {
                         catalog: &c.catalog,
                         functions: c.functions.as_ref(),
                         sealed_functions: Arc::clone(&c.sealed_functions),
-                        constant_evaluator:
-                            crate::query_execution::constant_eval::constant_evaluator(),
                         constant_policy: c.constant_policy,
                         control: c.control,
                     },

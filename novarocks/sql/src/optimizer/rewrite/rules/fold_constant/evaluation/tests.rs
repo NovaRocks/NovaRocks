@@ -185,6 +185,55 @@ fn row_data_error_keeps_the_compiled_candidate() {
     assert!(matches!(evaluated.outcome, FoldNodeOutcome::Kept));
 }
 
+#[derive(Debug)]
+struct OuterFoldFailure(FailureClass);
+
+impl std::fmt::Display for OuterFoldFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("division by zero")
+    }
+}
+
+impl std::error::Error for OuterFoldFailure {}
+
+impl FailureProjection for OuterFoldFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        novarocks_failure_contract::FailureFact::new(
+            self.0,
+            novarocks_failure_contract::FailureReason::new(
+                novarocks_failure_contract::domain::SQL,
+                std::num::NonZeroU16::new(65000).unwrap(),
+            ),
+        )
+    }
+}
+
+impl novarocks_failure_contract::OuterFailureProjection for OuterFoldFailure {}
+
+#[test]
+fn outer_failures_keep_the_exact_kernel_cause_even_when_classified_as_data() {
+    // The same diagnostic can also appear in the row journal. Only that
+    // channel permits the candidate to stay unfolded and compilation to continue.
+    for class in [
+        FailureClass::Data,
+        FailureClass::Control,
+        FailureClass::Resource,
+        FailureClass::Invariant,
+        FailureClass::Dependency,
+        FailureClass::Representation,
+        FailureClass::Unexpected,
+    ] {
+        let cause = KernelFailure::from_domain(OuterFoldFailure(class));
+        let actual = evaluation_error(ExprEvaluationFailure::Kernel(cause.clone()));
+        let SqlCompileError::CompilationSource(source) = actual else {
+            panic!("outer evaluation failure lost its original cause: {actual:?}");
+        };
+        assert_eq!(source.downcast_ref::<KernelFailure>(), Some(&cause));
+        assert_eq!(source.failure_fact(), cause.failure_fact());
+        assert_eq!(source.failure_fact().class(), class);
+    }
+}
+
 #[test]
 fn malformed_literal_is_a_fatal_lowering_error() {
     let mut arena = ScalarArena::new();

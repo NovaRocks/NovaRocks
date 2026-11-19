@@ -197,7 +197,6 @@ fn evaluation_error(error: SqlConstantEvaluationError, name: &str) -> QueryServi
                 QueryServiceError::from_failure_cause(cause)
             }
         }
-        SqlConstantEvaluationError::Evaluation(message) => super::internal_error(message),
     }
 }
 

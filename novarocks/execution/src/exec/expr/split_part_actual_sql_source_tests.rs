@@ -14,7 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//! The actual SQL case with no-op folding retains the original emitted call and request authors.
+//! The actual SQL case with folding disabled retains the original emitted call and request authors.
 //! Prior native PASS alone does not establish that a call survived real constant folding.
 use super::sql_test_source::sql_source;
 use arrow::datatypes::DataType;
@@ -79,7 +79,7 @@ fn check() {
     }
     assert!(
         count == 4,
-        "actual corpus SQL keeps a real function call with no-op fold"
+        "actual corpus SQL keeps a real function call with folding disabled"
     );
     eprintln!("split_part actual retained call count mode=compiled count={count}");
 }

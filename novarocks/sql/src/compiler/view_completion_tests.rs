@@ -457,7 +457,6 @@ fn dml_and_logical_explain_analyze_the_same_closed_saved_view_facts() {
         &[],
         crate::functions::builtin_sql_function_catalog(),
         novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-        super::super::noop_constant_evaluator(),
         crate::constant::test_constant_policy(),
     )
     .unwrap();
@@ -467,7 +466,6 @@ fn dml_and_logical_explain_analyze_the_same_closed_saved_view_facts() {
                 &[],
                 crate::functions::builtin_sql_function_catalog(),
                 novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-                super::super::noop_constant_evaluator(),
                 crate::constant::test_constant_policy(),
                 super::super::SqlPlanningEnvironment::Distributed,
                 crate::explain::ExplainLevel::Normal,

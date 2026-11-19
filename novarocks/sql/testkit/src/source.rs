@@ -69,10 +69,23 @@ pub fn sql_source_with_folding(
     sql: &str,
     dtype: DataType,
 ) -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
+    sql_source_with_folding_and_semantics(
+        sql,
+        dtype,
+        novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+    )
+}
+
+/// Enable constant folding with the exact semantics used by the unfolded oracle.
+pub fn sql_source_with_folding_and_semantics(
+    sql: &str,
+    dtype: DataType,
+    sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings,
+) -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
     try_sql_source_with_explicit_fields(
         sql,
         &[Field::new("k", dtype, false)],
-        novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+        sql_semantics,
         None,
         true,
     )

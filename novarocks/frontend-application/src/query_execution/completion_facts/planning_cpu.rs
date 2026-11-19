@@ -35,7 +35,7 @@ use novarocks_query_application::{
 };
 use novarocks_sql::compiler::{
     CatalogRelationFact, ExplainLevel, ExplainRenderBudget, SqlCompilation, SqlCompileControl,
-    SqlCompileError, SqlCompileProgress, SqlCompletedPlan, SqlConstantEvaluator, SqlFactBatch,
+    SqlCompileError, SqlCompileProgress, SqlCompletedPlan, SqlFactBatch,
     SqlFinalPlanCompileRequest, SqlFunctionCatalog, SqlLogicalExplainCatalog,
     SqlPlanningEnvironment, SqlSessionContext,
 };
@@ -147,7 +147,6 @@ pub(crate) struct LogicalFinishInput {
     pub(crate) logical: SqlLogicalExplainCatalog,
     pub(crate) functions: Arc<dyn SqlFunctionCatalog>,
     pub(crate) sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
-    pub(crate) evaluator: &'static dyn SqlConstantEvaluator,
     pub(crate) policy: novarocks_functions::ConstantPolicy,
     pub(crate) environment: SqlPlanningEnvironment,
     pub(crate) level: ExplainLevel,
@@ -320,7 +319,6 @@ impl PlanningCpuOriginal {
                     &[],
                     input.functions.as_ref(),
                     input.sealed_functions,
-                    input.evaluator,
                     input.policy,
                     input.environment,
                     input.level,

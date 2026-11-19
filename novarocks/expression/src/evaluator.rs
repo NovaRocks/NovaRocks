@@ -1125,7 +1125,6 @@ pub use host::{ScalarCallHost, ScalarCallPhase, ScalarCallRequestFacts};
 pub use input::{EvaluationInput, InputColumnProjection, InputSourceStorage, InputStorageFailure};
 
 mod boolean_region;
-pub mod constant_node;
 mod constant_projection;
 mod filter_conjunction;
 mod guarded;

@@ -33,6 +33,8 @@ mod standalone_scalar;
 pub(crate) use standalone_scalar::{StandaloneScalarEmission, lower_required_constant_unit};
 mod scalar_nullability;
 mod unit_authorship;
+#[cfg(test)]
+pub(super) use unit_authorship::package_author_error;
 
 #[cfg(test)]
 pub(super) mod original_emission_test_observer;
@@ -14032,12 +14034,8 @@ mod tests {
             // Check the original error-carrier projection with the genuine
             // constructor refusal above. This component test does not claim
             // that checked-CV consumption invokes a constructor again.
-            let projected = super::super::package_semantics::PackageSemanticsError::from(
-                super::super::physical_fragment_effects::PhysicalFragmentEffectsError::Expressions(
-                    super::super::physical_expression_effects::PhysicalExpressionEffectsError::Argument(
-                        super::super::physical_call_arguments::PhysicalArgumentError::from(expected_source.clone())
-                    )
-                )
+            let projected = super::super::package_semantics::PackageSemanticsError::ConstantSource(
+                expected_source.clone(),
             );
             assert_eq!(projected.failure_fact(), expected);
             let trace = baseline.trace.lock().unwrap().clone();
@@ -20697,6 +20695,3 @@ pub(super) fn node_effects_with_test_summaries(
     // facts to the original relation consumer. This is not a production issuer.
     NodeExpressionEffects { unit, summaries }
 }
-
-#[cfg(test)]
-pub(in crate::planner::distributed::build) use standalone_scalar::tests::sealed_standalone_source_for_effects;

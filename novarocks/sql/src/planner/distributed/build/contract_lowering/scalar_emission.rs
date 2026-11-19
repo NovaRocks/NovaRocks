@@ -1300,7 +1300,6 @@ impl ScalarEmission<'_, '_> {
             &source,
             target,
             policy,
-            self.root_allow_throw_exception,
             self.control,
         )
         .map_err(|error| match error {

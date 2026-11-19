@@ -14,7 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//! Actual original corpus call subtree with original no-op fold author retained in both modes.
+//! Actual original corpus call subtree with folding disabled.
 //! The corpus outer Json -> Struct conversion already fails in Original and is a separate gate.
 use arrow::datatypes::DataType;
 use novarocks_expression_contract::ExprKind;
@@ -63,7 +63,7 @@ fn check() {
     }
     assert_eq!(
         count, 1,
-        "same original corpus call subtree survives no-op fold"
+        "same original corpus call subtree survives with folding disabled"
     );
 }
 

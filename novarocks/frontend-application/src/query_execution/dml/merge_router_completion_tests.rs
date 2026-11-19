@@ -78,8 +78,7 @@ fn mor_merge_completion_freezes_original_routes_and_exact_summary_sources() {
         None,
         crate::application::test_constant_policy(),
         control.clone(),
-    )
-    .with_legacy_fold_evaluator(crate::query_execution::constant_eval::constant_evaluator()))
+    ))
     .expect("real analysis of the production MERGE match query")
     .into_pending()
     .unwrap();
@@ -109,7 +108,7 @@ fn mor_merge_completion_freezes_original_routes_and_exact_summary_sources() {
             .iter()
             .enumerate()
             .map(|(index, column)| DmlWriteTargetField {
- storage_type: None,
+                storage_type: None,
                 token: ConnectorWriteFieldToken::from_bytes(
                     [1 + ordinal as u8 * 8 + index as u8; 32],
                 ),

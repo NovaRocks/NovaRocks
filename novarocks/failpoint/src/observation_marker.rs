@@ -166,10 +166,6 @@ marker_registry! {
     TASK_TERMINAL_RETAINED => ("NOVAROCKS_TASK_TERMINAL_RETAINED", Task, Observation(TaskProtocol), ["backend", "execution_id", "stage", "state", "task"]),
     TASK_UPDATE_TERMINAL_ACK_DROPPED => ("NOVAROCKS_TASK_UPDATE_TERMINAL_ACK_DROPPED", Task, FaultInjection, ["backend_index", "execution_id", "token"]),
     WRITER_DIAGNOSTIC => ("NOVAROCKS_WRITER_DIAGNOSTIC", Writer, Observation(ExchangeSnapshot), ["aborting", "block_epoch", "contributors", "core_next", "counts", "current_generation", "cursor", "dest_node", "driver_id", "emitted", "end_sent", "event", "exiting", "expected", "failed", "finish_counted", "finished", "finishing", "frozen_generation", "generation", "generations", "last_driver", "output_claimed", "pending_chunks", "pending_payloads", "reason", "receiver_occupied", "reduction", "remaining", "remaining_drivers", "sender_state", "service", "sink", "source", "summary_end", "summary_wait", "task", "task_key", "writer_end", "writer_pending"]),
-    EXL03_FOLD_PARITY_ENABLED => ("NOVAROCKS_EXL03_FOLD_PARITY_ENABLED", Frontend, Unconditional, ["probe"]),
-    EXL03_FOLD_PARITY_MISMATCH => ("NOVAROCKS_EXL03_FOLD_PARITY_MISMATCH", Frontend, Unconditional, ["field", "input", "new", "old"]),
-    EXL03_AUTHOR_PARITY_ENABLED => ("NOVAROCKS_EXL03_AUTHOR_PARITY_ENABLED", Frontend, Unconditional, ["probe"]),
-    EXL03_AUTHOR_PARITY_MISMATCH => ("NOVAROCKS_EXL03_AUTHOR_PARITY_MISMATCH", Frontend, Unconditional, ["field", "new", "old"]),
 }
 
 pub fn markers() -> &'static [ObservationMarker] {

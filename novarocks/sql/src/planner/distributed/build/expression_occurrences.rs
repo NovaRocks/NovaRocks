@@ -17,18 +17,14 @@
 
 //! Same-emission scalar control facts and actual relational call identities.
 //! Units own scalar flow derivation; relations never allocate scalar uses or regions.
-use super::contract_lowering::SqlUnitSourceLoan;
-use super::lowered_draft::SqlSourceJournalError;
-use super::physical_temporal_sources::SourceError;
 use crate::compiler::SqlFunctionCatalog;
-use novarocks_expression_contract::{DefinitionControl, ExprId, ExprKind};
-use novarocks_functions::{FunctionSpecializationFailure, PureKernelAbi};
+use novarocks_functions::FunctionSpecializationFailure;
 use novarocks_physical_plan::{
     Fragment, FrozenCallError, NodeKind, PhysicalCallBinding, PhysicalCallSite, ValueDef,
     visit_relational_calls_observed,
 };
 use novarocks_type_contract::{
-    ArgumentControl, CompileCheckpoints, CompileControlError, CompilePhase, ControlShape,
+    ArgumentControl, CompileCheckpoints, CompileControlError, CompilePhase,
     MAX_CONTROL_USE_REFERENCES, PureCompileControl, RelationCallId, RelationEffectContext,
 };
 
@@ -36,13 +32,9 @@ use novarocks_type_contract::{
 pub(crate) enum ExpressionOccurrenceError {
     Control(CompileControlError),
     Function(FunctionSpecializationFailure),
-    MissingDefinition(ExprId),
-    InvalidFunctionControl(ExprId),
     TooManyItems,
     Calls(FrozenCallError),
     InvalidRelationalControl(PhysicalCallSite),
-    TemporalSource(&'static str),
-    Journal(SqlSourceJournalError),
 }
 impl From<CompileControlError> for ExpressionOccurrenceError {
     fn from(cause: CompileControlError) -> Self {
@@ -54,22 +46,6 @@ impl From<FrozenCallError> for ExpressionOccurrenceError {
         match error {
             FrozenCallError::Control(cause) => Self::Control(cause),
             error => Self::Calls(error),
-        }
-    }
-}
-impl From<SqlSourceJournalError> for ExpressionOccurrenceError {
-    fn from(error: SqlSourceJournalError) -> Self {
-        match error {
-            SqlSourceJournalError::Control(cause) => Self::Control(cause),
-            error => Self::Journal(error),
-        }
-    }
-}
-impl From<SourceError> for ExpressionOccurrenceError {
-    fn from(error: SourceError) -> Self {
-        match error {
-            SourceError::Control(cause) => Self::Control(cause),
-            SourceError::Invalid(message) => Self::TemporalSource(message),
         }
     }
 }
@@ -95,101 +71,6 @@ impl ExpressionOccurrenceError {
             error => Self::Function(error),
         }
     }
-}
-
-/// Select original controls before sealing. These records are consumed by the
-/// unit builder, which alone expands roots into ordered uses and guards. The
-/// caller admits the actual temporary records; this loan grants no capacity.
-pub(crate) fn author_original_unit_controls_observed(
-    source: &SqlUnitSourceLoan<'_>,
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<Vec<(ExprId, DefinitionControl)>, ExpressionOccurrenceError> {
-    let definitions = source.definitions();
-    let functions = source.functions();
-    let mut controls = Vec::new();
-    for ordinal in 0..definitions.len() {
-        let id = ExprId::new(
-            u32::try_from(ordinal).map_err(|_| CompileControlError::ResourceExhausted)?,
-        );
-        let definition = definitions
-            .definition(id)
-            .ok_or(ExpressionOccurrenceError::MissingDefinition(id))?;
-        work.step()?;
-        let ExprKind::FunctionCall { function, args } = &definition.kind else {
-            continue;
-        };
-        let original = source.checked_expression_source_observed(definition, work)?;
-        work.flush()?;
-        let declaration = functions
-            .pure_overload_declaration_observed(
-                &function.function_id,
-                function.kind,
-                &function.overload,
-                work.control(),
-            )
-            .map_err(ExpressionOccurrenceError::function)?;
-        if function.function_id.as_str() == "builtin.scalar/regexp_count/v1" {
-            work.flush()?;
-            novarocks_expression_contract::regexp_count_pattern_source_from_lookup_observed(
-                |id| definitions.definition(id),
-                args,
-                work,
-            )?;
-        }
-        let selected_control =
-            if declaration.implementation().abi == PureKernelAbi::ScalarInvocationV1 {
-                let canonical = original.canonical_operational().ok_or(
-                    ExpressionOccurrenceError::TemporalSource(
-                        "selected invocation demand has no same-emission canonical request",
-                    ),
-                )?;
-                declaration
-                    .selected_argument_control_observed(
-                        &function.function_id,
-                        canonical.selected().as_ref(),
-                        canonical.request().logical_argument_count,
-                        work.control(),
-                    )
-                    .map_err(|error| ExpressionOccurrenceError::function(error.into()))?
-            } else {
-                declaration.effects().argument_control
-            };
-        let (shape, temporal_sources) =
-            if let ArgumentControl::TemporalSource(kind) = selected_control {
-                work.flush()?;
-                let temporal =
-                novarocks_expression_contract::temporal_source_definitions_from_lookup_observed(
-                    kind,
-                    |id| definitions.definition(id),
-                    args,
-                    work,
-                )?;
-                (
-                    ControlShape::TemporalSource(temporal.facts.shape()),
-                    Some(temporal),
-                )
-            } else {
-                (
-                    scalar_shape(selected_control, args.len())
-                        .ok_or(ExpressionOccurrenceError::InvalidFunctionControl(id))?,
-                    None,
-                )
-            };
-        work.step()?;
-        work.flush()?;
-        controls
-            .try_reserve(1)
-            .map_err(|_| CompileControlError::ResourceExhausted)?;
-        controls.push((
-            id,
-            DefinitionControl {
-                shape,
-                temporal_sources,
-            },
-        ));
-        work.step()?;
-    }
-    Ok(controls)
 }
 
 #[derive(Clone, Debug)]
@@ -350,7 +231,6 @@ impl WriterOccurrenceContexts<'_, '_> {
             .map(|entry| (entry.site, entry.value, entry.context))
     }
 }
-pub(super) use crate::compiler::selected_scalar_call::scalar_shape;
 
 #[cfg(test)]
 #[path = "relational_occurrences_tests.rs"]

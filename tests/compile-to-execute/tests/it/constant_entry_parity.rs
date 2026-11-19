@@ -15,26 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Real SQL constant roots and the single-node entry share exact values and
-//! row errors, with independent expected values for every case.
-//! SQL source helpers install noop_constant_evaluator: the tested node must
-//! survive SQL completion and LocalCompiler, over literal/constant leaves.
+//! Folded SQL constants and unfolded LocalCompiler roots are checked against
+//! independent expected values. Rule exclusions keep the same runtime result.
 
 use arrow::{
     array::{
-        Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, FixedSizeBinaryArray,
-        Float32Array, Float64Array, Int8Array, Int32Array, Int64Array, StringArray,
-        TimestampMicrosecondArray, new_null_array,
+        Array, ArrayRef, BooleanArray, Decimal128Array, Float32Array, Float64Array, Int8Array,
+        Int32Array, Int64Array, StringArray, TimestampMicrosecondArray, new_null_array,
     },
     datatypes::{DataType, Schema},
     record_batch::{RecordBatch, RecordBatchOptions},
 };
 use novarocks_expression::CompiledExpressionInstance;
 use novarocks_expression::EvaluationInput;
-use novarocks_expression::constant_node::{
-    ConstantCarrierStep, ConstantConversion, ConstantNode, ConstantNodeOutcome,
-    evaluate_constant_node,
-};
 use novarocks_expression::testkit::PassThroughCallHost;
 use novarocks_expression::{CompiledExprSet, StaticExprKind};
 use novarocks_expression_contract::RootOrdinal;
@@ -42,13 +35,13 @@ use novarocks_functions::testkit::{
     installed_builtin_owner_catalogue, shared_installed_builtin_owner_catalogue,
 };
 use novarocks_functions::{
-    CastOperation, ConstantPolicy, ConstantValue, FunctionArgumentType, FunctionValueType,
+    CastOperation, ConstantPolicy, FunctionArgumentType, FunctionValueType,
     KernelEvaluationControl, KernelFailure, PreparedPureKernel, PureEngineFunctionCatalog,
-    Selection,
+    SelectedValues, Selection,
 };
 use novarocks_functions::{ScalarInvocationActivation, ScalarInvocationScope};
 use novarocks_local_program::{LocalProgram, ProgramNodeKind, ProgramRootRef, ProgramUnitId};
-use novarocks_sql_testkit::sql_source_with_semantics;
+use novarocks_sql_testkit::{sql_source_with_folding_and_semantics, sql_source_with_semantics};
 use novarocks_test_compile_to_execute::programs::programs_with_catalogue;
 
 use novarocks_sql::sql_mode::{SqlMode, SqlSemanticSettings};
@@ -88,6 +81,7 @@ fn policy() -> ConstantPolicy {
 }
 #[derive(Clone, Copy, Debug)]
 enum Family {
+    Constant,
     Arithmetic,
     Comparison,
     NullSafe,
@@ -100,6 +94,7 @@ enum Family {
 impl Family {
     fn matches(self, kind: &StaticExprKind, function: Option<&str>) -> bool {
         match self {
+            Self::Constant => matches!(kind, StaticExprKind::Constant(_)),
             Self::Arithmetic => matches!(kind, StaticExprKind::PreparedArithmetic { .. }),
             Self::Comparison => kind.ordinary_comparison().is_some(),
             Self::NullSafe => matches!(kind, StaticExprKind::PreparedNullSafeComparison { .. }),
@@ -125,6 +120,8 @@ struct Fixture {
     root: ProgramRootRef,
     occurrence: ExpressionUseId,
     sql: String,
+    family: Family,
+    semantics: SqlSemanticSettings,
 }
 impl Fixture {
     fn compile(
@@ -134,13 +131,20 @@ impl Fixture {
         functions: &PureEngineFunctionCatalog,
     ) -> Self {
         let sql = format!("SELECT {expression} AS entry_parity");
-        let source = sql_source_with_semantics(
-            &sql,
-            DataType::Int64,
-            SqlSemanticSettings::default()
-                .with_sql_mode(SqlMode::from_assignment(mode))
-                .with_decimal_overflow_to_double(false),
-        );
+        let semantics = SqlSemanticSettings::default()
+            .with_sql_mode(SqlMode::from_assignment(mode))
+            .with_decimal_overflow_to_double(false);
+        let source = sql_source_with_semantics(&sql, DataType::Int64, semantics.clone());
+        Self::find_root(source, family, sql, semantics, functions)
+    }
+
+    fn find_root(
+        source: novarocks_sql::compiler::SqlAuthoredPhysicalPlan,
+        family: Family,
+        sql: String,
+        semantics: SqlSemanticSettings,
+        functions: &PureEngineFunctionCatalog,
+    ) -> Self {
         let declared = source.plan().result_port().unwrap().fields[0].ty.clone();
         assert_eq!(
             &declared,
@@ -181,10 +185,6 @@ impl Fixture {
                             panic!("the actual SQL root is a scalar value")
                         };
                         assert_eq!(actual, &declared, "SQL/program complete root type: {sql}");
-                        eprintln!(
-                            "CONSTANT_ENTRY_PARITY frozen root sql={sql:?} result={actual:?} nullable={}",
-                            actual.nullable()
-                        );
                         let schema = unit.scope(compiled_root.scope).unwrap().schema();
                         assert!(schema.fields().is_empty(), "empty original input: {sql}");
                         found.push(Self {
@@ -192,6 +192,8 @@ impl Fixture {
                             root,
                             occurrence,
                             sql: sql.clone(),
+                            family,
+                            semantics: semantics.clone(),
                         });
                     }
                 }
@@ -200,7 +202,7 @@ impl Fixture {
         assert_eq!(
             found.len(),
             1,
-            "one actual {family:?} constant root must survive noop folding: {sql}"
+            "one actual {family:?} root must occur in the SQL-authored program: {sql}"
         );
         found.pop().unwrap()
     }
@@ -224,147 +226,32 @@ impl Fixture {
     fn call(&self, at: ExpressionUseId) -> &PreparedPureKernel {
         self.unit().calls()[&at].prepared()
     }
-    fn constant(&self, at: ExpressionUseId, array: ArrayRef) -> ConstantValue {
-        let ty = self.ty(at);
-        assert_eq!(
-            ty.data_type(),
-            array.data_type(),
-            "independent input carrier: {}",
-            self.sql
-        );
-        ConstantValue::from_scalar_array(
-            Arc::new(ty.try_to_field("actual_frozen_source").unwrap()),
-            ty.clone(),
-            array.to_data(),
-            policy(),
-            CompilePhase::FunctionSpecialization,
-            &Control,
-        )
-        .unwrap()
-    }
-    fn entry_node(&self) -> ConstantNode<'_> {
-        match self.kind(self.occurrence) {
-            StaticExprKind::PreparedArithmetic {
-                operator,
-                decimal_overflow_policy,
-                allow_throw_exception,
-                ..
-            } => ConstantNode::Arithmetic {
-                operator: *operator,
-                decimal_overflow_policy: *decimal_overflow_policy,
-                allow_throw_exception: *allow_throw_exception,
-            },
-            kind if kind.ordinary_comparison().is_some() => ConstantNode::Comparison {
-                operator: kind.ordinary_comparison().unwrap().0,
-                left: ConstantConversion::Identity,
-                right: ConstantConversion::Identity,
-            },
-            StaticExprKind::PreparedNullSafeComparison { .. } => ConstantNode::NullSafeEquality {
-                left: ConstantConversion::Identity,
-                right: ConstantConversion::Identity,
-            },
-            StaticExprKind::NaryAnd { .. } => ConstantNode::Conjunction,
-            StaticExprKind::NaryOr { .. } => ConstantNode::Disjunction,
-            StaticExprKind::Not(_) => ConstantNode::Not,
-            StaticExprKind::PreparedCast {
-                operation: CastOperation::Carrier,
-                ..
-            } => {
-                ConstantNode::Conversion(ConstantConversion::Carrier(self.carrier(self.occurrence)))
-            }
-            StaticExprKind::BoundCall { .. } => ConstantNode::Call(self.call(self.occurrence)),
-            kind => panic!("unexpected original root: {kind:?}"),
-        }
-    }
-    fn carrier(&self, at: ExpressionUseId) -> ConstantCarrierStep<'_> {
-        let StaticExprKind::PreparedCast {
-            operation: CastOperation::Carrier,
-            decimal_overflow_policy,
-            allow_throw_exception,
-            ..
-        } = self.kind(at)
-        else {
-            panic!("real frozen carrier cast required")
-        };
-        ConstantCarrierStep {
-            target: self.ty(at),
-            decimal_overflow_policy: *decimal_overflow_policy,
-            allow_throw_exception: *allow_throw_exception,
-        }
-    }
-    // Stop at the independently declared ORIGINAL input type, so explicit SQL
-    // constructors (e.g. string -> DATE) are not mistaken for comparison coercions.
-    // Only the actual selected conversion and at most one carrier tail are admitted.
-    fn conversion_from(
+    fn source_before_coercion(
         &self,
-        at: ExpressionUseId,
+        mut at: ExpressionUseId,
         source: &DataType,
-    ) -> (ExpressionUseId, ConstantConversion<'_>) {
-        if self.ty(at).data_type() == source {
-            return (at, ConstantConversion::Identity);
-        }
-        match self.kind(at) {
-            StaticExprKind::PreparedCast {
-                operation: CastOperation::Carrier,
-                ..
-            } => {
-                let args = self.args(at);
-                let [child] = args.as_slice() else {
-                    panic!("unary carrier occurrence")
-                };
-                if self.ty(*child).data_type() == source {
-                    return (*child, ConstantConversion::Carrier(self.carrier(at)));
-                }
-                let (original, conversion) = self.conversion_from(*child, source);
-                let ConstantConversion::ValueConversion {
-                    call,
-                    call_result,
-                    tail: None,
-                } = conversion
-                else {
-                    panic!("one actual value conversion, then one carrier tail")
-                };
-                (
-                    original,
-                    ConstantConversion::ValueConversion {
-                        call,
-                        call_result,
-                        tail: Some(self.carrier(at)),
-                    },
-                )
+    ) -> ExpressionUseId {
+        while self.ty(at).data_type() != source {
+            match self.kind(at) {
+                StaticExprKind::PreparedCast {
+                    operation: CastOperation::Carrier,
+                    ..
+                } => {}
+                StaticExprKind::BoundCall { .. } => assert_eq!(
+                    self.call(at).call_contract().function_id().as_str(),
+                    "builtin.scalar/value_domain_conversion/v1",
+                ),
+                other => panic!("missing real conversion to {source:?} from {other:?}"),
             }
-            StaticExprKind::BoundCall { .. } => {
-                let call = self.call(at);
-                assert_eq!(
-                    call.call_contract().function_id().as_str(),
-                    "builtin.scalar/value_domain_conversion/v1"
-                );
-                let args = self.args(at);
-                let [original] = args.as_slice() else {
-                    panic!("unary value conversion")
-                };
-                assert_eq!(self.ty(*original).data_type(), source);
-                (
-                    *original,
-                    ConstantConversion::ValueConversion {
-                        call,
-                        call_result: self.ty(at),
-                        tail: None,
-                    },
-                )
-            }
-            kind => panic!(
-                "missing real conversion from {source:?} to {:?}: {kind:?}",
-                self.ty(at)
-            ),
+            let args = self.args(at);
+            let [child] = args.as_slice() else {
+                panic!("unary conversion")
+            };
+            at = *child;
         }
+        at
     }
-    fn assert_both(
-        &self,
-        node: ConstantNode<'_>,
-        children: Vec<ConstantValue>,
-        expected: Expected,
-    ) {
+    fn run(&self) -> SelectedValues<'static> {
         let compiled_root = self.unit().root(self.root.root).unwrap();
         let schema = self
             .unit()
@@ -385,7 +272,7 @@ impl Fixture {
             &Control,
         )
         .unwrap();
-        let compiled = instance
+        instance
             .evaluate(
                 EvaluationInput::Batch {
                     batch: &batch,
@@ -396,58 +283,74 @@ impl Fixture {
                 &Control,
                 &mut PassThroughCallHost,
             )
-            .unwrap();
-        let entry = evaluate_constant_node(
-            node,
-            &children,
+            .unwrap()
+    }
+
+    fn assert_both(
+        &self,
+        functions: &PureEngineFunctionCatalog,
+        outcome: FoldOutcome,
+        expected: Expected,
+    ) {
+        let enabled_source = sql_source_with_folding_and_semantics(
+            &self.sql,
+            DataType::Int64,
+            self.semantics.clone(),
+        );
+        let enabled = Self::find_root(
+            enabled_source,
+            match outcome {
+                FoldOutcome::Folded => Family::Constant,
+                FoldOutcome::Kept => self.family,
+            },
+            self.sql.clone(),
+            self.semantics.clone(),
+            functions,
+        );
+        assert_eq!(
             self.ty(self.occurrence),
-            &Control,
-            CompilePhase::FunctionSpecialization,
-        )
-        .unwrap();
+            enabled.ty(enabled.occurrence),
+            "folding keeps the original declared type: {}",
+            self.sql,
+        );
+        let disabled = self.run();
+        let enabled = enabled.run();
         match expected {
             Expected::Value(expected) => {
-                assert!(
-                    compiled.errors().is_empty(),
-                    "unexpected compiled row error: {}",
-                    self.sql
-                );
-                let ConstantNodeOutcome::Value(entry) = entry else {
-                    panic!("expected value: {entry:?}; {}", self.sql)
-                };
-                assert_array(compiled.values(), &expected);
-                assert_array(&entry, &expected);
-                assert_array(&entry, compiled.values());
+                for output in [&disabled, &enabled] {
+                    assert!(
+                        output.errors().is_empty(),
+                        "unexpected runtime row error: {}",
+                        self.sql,
+                    );
+                    assert_array(output.values(), &expected);
+                }
+                assert_array(disabled.values(), enabled.values());
             }
             Expected::RowError(message) => {
-                let ConstantNodeOutcome::RowError(entry) = entry else {
-                    panic!("row error classification: {entry:?}; {}", self.sql)
-                };
-                assert_eq!(compiled.errors().len(), 1, "{}", self.sql);
-                let actual = &compiled.errors()[0];
-                assert_eq!(actual.selected_ordinal(), 0);
-                assert_eq!(entry.selected_ordinal(), 0);
-                assert_eq!(actual.message(), message);
-                assert_eq!(entry.message(), message);
-                assert_eq!(&entry, actual);
-                assert!(
-                    compiled.values().is_null(0),
-                    "failed row has NULL placeholder"
-                );
+                for output in [&disabled, &enabled] {
+                    let [actual] = output.errors() else {
+                        panic!("expected one row error: {}", self.sql)
+                    };
+                    assert_eq!(actual.selected_ordinal(), 0);
+                    assert_eq!(actual.message(), message);
+                    assert!(
+                        output.values().is_null(0),
+                        "failed row has NULL placeholder"
+                    );
+                }
+                assert_eq!(disabled.errors(), enabled.errors());
             }
         }
     }
-    fn direct(&self, arrays: Vec<ArrayRef>, expected: Expected) {
-        let args = self.args(self.occurrence);
-        assert_eq!(args.len(), arrays.len());
-        let constants = args
-            .into_iter()
-            .zip(arrays)
-            .map(|(at, array)| self.constant(at, array))
-            .collect();
-        self.assert_both(self.entry_node(), constants, expected);
-    }
 }
+
+#[derive(Clone, Copy)]
+enum FoldOutcome {
+    Folded,
+    Kept,
+}
+
 enum Expected {
     Value(ArrayRef),
     RowError(&'static str),
@@ -500,96 +403,46 @@ fn decimal(value: Option<i128>, precision: u8, scale: i8) -> ArrayRef {
             .unwrap(),
     )
 }
-fn largeint(value: i128) -> ArrayRef {
-    let bytes = value.to_be_bytes();
-    Arc::new(FixedSizeBinaryArray::try_from_iter([bytes.as_slice()].into_iter()).unwrap())
-}
 
 #[test]
 fn constant_entry_every_family_matches_real_noop_sql_constant_root() {
     let functions = shared_installed_builtin_owner_catalogue();
     metadata_cv_source_cross_entry(&functions, false);
     metadata_cv_source_cross_entry(&functions, true);
-    let cases: Vec<(&str, Family, bool, Vec<ArrayRef>, ArrayRef)> = vec![
-        (
-            "20 + 22",
-            Family::Arithmetic,
-            true,
-            vec![int(Some(20)), int(Some(22))],
-            int(Some(42)),
-        ),
-        (
-            "1e0 * 1e0",
-            Family::Arithmetic,
-            true,
-            vec![float(1.0), float(1.0)],
-            float(1.0),
-        ),
-        (
-            "20 < 22",
-            Family::Comparison,
-            false,
-            vec![int(Some(20)), int(Some(22))],
-            boolean(Some(true)),
-        ),
-        (
-            "1 <=> 1",
-            Family::NullSafe,
-            false,
-            vec![int(Some(1)), int(Some(1))],
-            boolean(Some(true)),
-        ),
-        (
-            "FALSE AND TRUE",
-            Family::And,
-            false,
-            vec![boolean(Some(false)), boolean(Some(true))],
-            boolean(Some(false)),
-        ),
-        (
-            "TRUE OR FALSE",
-            Family::Or,
-            false,
-            vec![boolean(Some(true)), boolean(Some(false))],
-            boolean(Some(true)),
-        ),
-        (
-            "NOT TRUE",
-            Family::Not,
-            false,
-            vec![boolean(Some(true))],
-            boolean(Some(false)),
-        ),
+    let cases: Vec<(&str, Family, bool, ArrayRef)> = vec![
+        ("20 + 22", Family::Arithmetic, true, int(Some(42))),
+        ("1e0 * 1e0", Family::Arithmetic, true, float(1.0)),
+        ("20 < 22", Family::Comparison, false, boolean(Some(true))),
+        ("1 <=> 1", Family::NullSafe, false, boolean(Some(true))),
+        ("FALSE AND TRUE", Family::And, false, boolean(Some(false))),
+        ("TRUE OR FALSE", Family::Or, false, boolean(Some(true))),
+        ("NOT TRUE", Family::Not, false, boolean(Some(false))),
         (
             "CAST(42 AS TINYINT)",
             Family::Carrier,
             true,
-            vec![int(Some(42))],
             Arc::new(Int8Array::from(vec![42])),
         ),
         (
             "upper('AbC')",
             Family::Call("builtin.scalar/upper/v1"),
             false,
-            vec![text("AbC")],
             text("ABC"),
         ),
         (
             "if(FALSE, 11, 22)",
             Family::Call("builtin.scalar/if/v1"),
             false,
-            vec![boolean(Some(false)), int(Some(11)), int(Some(22))],
             int(Some(22)),
         ),
         (
             "coalesce(11, 22)",
             Family::Call("builtin.scalar/coalesce/v1"),
             false,
-            vec![int(Some(11)), int(Some(22))],
             int(Some(11)),
         ),
     ];
-    for (expression, family, nullable, children, expected) in cases {
+    for (expression, family, nullable, expected) in cases {
         let fixture = Fixture::compile(expression, family, "32", &functions);
         assert_eq!(
             fixture.ty(fixture.occurrence).nullable(),
@@ -602,59 +455,59 @@ fn constant_entry_every_family_matches_real_noop_sql_constant_root() {
                 "T1 uses one actual node over constant leaves: {expression}"
             );
         }
-        fixture.direct(children, Expected::Value(expected));
+        fixture.assert_both(&functions, FoldOutcome::Folded, Expected::Value(expected));
     }
     // Native unary minus is zero subtraction: +0 - +0 is +0. An explicit
     // text CAST authors the separate -0 bit pattern. Preserve both real child
     // subexpressions, plus typed NULL, without replacing the depth-one cases.
-    for (expression, family, nullable, children, expected) in [
+    for (expression, family, nullable, outcome, expected) in [
         (
             "-0e0 * 1e0",
             Family::Arithmetic,
             true,
-            vec![float(0.0), float(1.0)],
+            FoldOutcome::Kept,
             float(0.0),
         ),
         (
             "CAST('-0' AS DOUBLE) * 1e0",
             Family::Arithmetic,
             true,
-            vec![float(-0.0), float(1.0)],
+            FoldOutcome::Folded,
             float(-0.0),
         ),
         (
             "TRUE AND CAST(NULL AS BOOLEAN)",
             Family::And,
             true,
-            vec![boolean(Some(true)), boolean(None)],
+            FoldOutcome::Folded,
             boolean(None),
         ),
         (
             "if(FALSE, CAST(NULL AS BIGINT), 22)",
             Family::Call("builtin.scalar/if/v1"),
             true,
-            vec![boolean(Some(false)), bigint(None), bigint(Some(22))],
+            FoldOutcome::Folded,
             bigint(Some(22)),
         ),
         (
             "coalesce(CAST(NULL AS BIGINT), CAST(NULL AS BIGINT))",
             Family::Call("builtin.scalar/coalesce/v1"),
             true,
-            vec![bigint(None), bigint(None)],
+            FoldOutcome::Folded,
             bigint(None),
         ),
         (
             "CAST(NULL AS BIGINT) <=> CAST(NULL AS BIGINT)",
             Family::NullSafe,
             false,
-            vec![bigint(None), bigint(None)],
+            FoldOutcome::Folded,
             boolean(Some(true)),
         ),
         (
             "NOT CAST(NULL AS BOOLEAN)",
             Family::Not,
             true,
-            vec![boolean(None)],
+            FoldOutcome::Folded,
             boolean(None),
         ),
     ] {
@@ -664,78 +517,58 @@ fn constant_entry_every_family_matches_real_noop_sql_constant_root() {
             nullable,
             "frozen root: {expression}"
         );
-        fixture.direct(children, Expected::Value(expected));
+        fixture.assert_both(&functions, outcome, Expected::Value(expected));
     }
 }
 
 #[test]
 fn constant_entry_heterogeneous_comparisons_replay_actual_sql_conversion_order() {
     let functions = installed_builtin_owner_catalogue();
-    let cases: Vec<(&str, ArrayRef, ArrayRef)> = vec![
+    let cases = [
         (
             "CAST('1970-01-02' AS DATE) < CAST('1970-01-03 00:00:00' AS DATETIME)",
-            Arc::new(Date32Array::from(vec![1])),
-            Arc::new(TimestampMicrosecondArray::from(vec![172_800_000_000])),
+            DataType::Date32,
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+            // DATETIME is outside the rule's result-literal domain.
+            FoldOutcome::Kept,
         ),
         (
             "CAST('12.3' AS DECIMAL(4,1)) < CAST('12.34' AS DECIMAL(6,2))",
-            decimal(Some(123), 4, 1),
-            decimal(Some(1234), 6, 2),
+            DataType::Decimal128(4, 1),
+            DataType::Decimal128(6, 2),
+            FoldOutcome::Folded,
         ),
         (
             "12 < CAST('12.34' AS DECIMAL(6,2))",
-            int(Some(12)),
-            decimal(Some(1234), 6, 2),
+            DataType::Int32,
+            DataType::Decimal128(6, 2),
+            FoldOutcome::Folded,
         ),
     ];
-    for (expression, left_array, right_array) in cases {
+    for (expression, left_source, right_source, outcome) in cases {
         let fixture = Fixture::compile(expression, Family::Comparison, "32", &functions);
         let args = fixture.args(fixture.occurrence);
         let [left_at, right_at] = args.as_slice() else {
             panic!("binary comparison")
         };
-        assert_ne!(
-            left_array.data_type(),
-            right_array.data_type(),
-            "original heterogeneous inputs"
-        );
-        let (left_source, left) = fixture.conversion_from(*left_at, left_array.data_type());
-        let (right_source, right) = fixture.conversion_from(*right_at, right_array.data_type());
+        assert_ne!(left_source, right_source, "original heterogeneous inputs");
+        let original_left = fixture.source_before_coercion(*left_at, &left_source);
+        let original_right = fixture.source_before_coercion(*right_at, &right_source);
         assert!(
-            !matches!(
-                (&left, &right),
-                (ConstantConversion::Identity, ConstantConversion::Identity)
-            ),
+            original_left != *left_at || original_right != *right_at,
             "real lowering must retain at least one conversion: {expression}"
         );
         assert_eq!(
             fixture.ty(*left_at).data_type(),
             fixture.ty(*right_at).data_type(),
-            "conversion destinations, not guessed source carriers"
+            "conversion destinations keep the same exact carrier"
         );
         assert_eq!(
             fixture.ty(fixture.occurrence).nullable(),
             fixture.ty(*left_at).nullable() || fixture.ty(*right_at).nullable(),
             "comparison root uses both actual converted nullable facts"
         );
-        let operator = fixture
-            .kind(fixture.occurrence)
-            .ordinary_comparison()
-            .unwrap()
-            .0;
-        let children = vec![
-            fixture.constant(left_source, left_array),
-            fixture.constant(right_source, right_array),
-        ];
-        fixture.assert_both(
-            ConstantNode::Comparison {
-                operator,
-                left,
-                right,
-            },
-            children,
-            Expected::Value(boolean(Some(true))),
-        );
+        fixture.assert_both(&functions, outcome, Expected::Value(boolean(Some(true))));
     }
 }
 
@@ -748,57 +581,59 @@ fn constant_entry_actual_largeint_conversion_then_carrier_tail_preserves_value_a
     // Both operands exceed i64::MAX, so explicit text -> LARGEINT supplies
     // their original exact nominal domain. Their independently fixed difference
     // remains 20200102030405; no ordinary out-of-range literal is admitted.
-    for (expression, value, expected) in [
+    for (expression, expected) in [
         (
             "CAST(CAST('9223392236956806213' AS LARGEINT) - CAST('9223372036854775808' AS LARGEINT) AS DATETIME)".to_owned(),
-            20_200_102_030_405_i128,
             Some(1_577_934_245_000_000_i64),
         ),
-        (format!("CAST(CAST('{}' AS LARGEINT) AS DATETIME)", i128::MAX), i128::MAX, None),
+        (format!("CAST(CAST('{}' AS LARGEINT) AS DATETIME)", i128::MAX), None),
     ] {
         let fixture = Fixture::compile(&expression, Family::Carrier, "32", &functions);
-        let (source, conversion) =
-            fixture.conversion_from(fixture.occurrence, &DataType::FixedSizeBinary(16));
+        let tail = fixture.occurrence;
+        let StaticExprKind::PreparedCast {
+            operation: CastOperation::Carrier,
+            decimal_overflow_policy,
+            allow_throw_exception,
+            ..
+        } = fixture.kind(tail) else {
+            panic!("actual carrier tail required")
+        };
+        let args = fixture.args(tail);
+        let [conversion] = args.as_slice() else {
+            panic!("unary carrier tail")
+        };
+        let call = fixture.call(*conversion).call_contract();
+        assert_eq!(call.function_id().as_str(), "builtin.scalar/value_domain_conversion/v1");
+        assert!(call.selected().overload.as_str().ends_with("largeint_to_signed_null_overflow/v1"));
+        let args = fixture.args(*conversion);
+        let [source] = args.as_slice() else {
+            panic!("unary value conversion")
+        };
+        assert_eq!(fixture.ty(*source).data_type(), &DataType::FixedSizeBinary(16));
         assert_eq!(
-            fixture.ty(source).logical_type(),
+            fixture.ty(*source).logical_type(),
             ValueLogicalType::LargeInt,
             "fixed binary alone never grants LARGEINT identity"
         );
-        let ConstantConversion::ValueConversion {
-            call,
-            call_result,
-            tail: Some(tail),
-        } = &conversion
-        else {
-            panic!("actual selected value conversion plus carrier tail required")
+        assert_eq!(fixture.ty(*conversion).data_type(), &DataType::Int64);
+        assert!(fixture.ty(*conversion).nullable());
+        assert_eq!(
+            fixture.ty(tail).data_type(),
+            &DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+        );
+        assert!(fixture.ty(tail).nullable());
+        assert_eq!(*decimal_overflow_policy, DecimalOverflowPolicy::OutputNull);
+        assert!(!*allow_throw_exception);
+        // The overflowing LARGEINT conversion yields a typed NULL in the
+        // enabled plan. A representable input retains the DATETIME tail.
+        let outcome = if expected.is_none() {
+            FoldOutcome::Folded
+        } else {
+            FoldOutcome::Kept
         };
-        assert!(
-            call.call_contract()
-                .selected()
-                .overload
-                .as_str()
-                .ends_with("largeint_to_signed_null_overflow/v1")
-        );
-        assert_eq!(call_result.data_type(), &DataType::Int64);
-        assert!(call_result.nullable());
-        assert_eq!(
-            tail.target.data_type(),
-            &DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None)
-        );
-        assert!(tail.target.nullable());
-        assert_eq!(
-            tail.decimal_overflow_policy,
-            DecimalOverflowPolicy::OutputNull
-        );
-        assert!(!tail.allow_throw_exception);
-        assert!(
-            fixture.ty(fixture.occurrence).nullable(),
-            "even the successful calendar row retains nullable=true"
-        );
-        let children = vec![fixture.constant(source, largeint(value))];
         fixture.assert_both(
-            ConstantNode::Conversion(conversion),
-            children,
+            &functions,
+            outcome,
             Expected::Value(Arc::new(TimestampMicrosecondArray::from(vec![expected]))),
         );
     }
@@ -833,16 +668,17 @@ fn constant_entry_decimal_policy_cross_allow_matrix_matches_independent_row_erro
             let expression =
                 format!("CAST('{max}' AS DECIMAL(38,0)) {symbol} CAST({rhs} AS DECIMAL(2,0))");
             let fixture = Fixture::compile(&expression, Family::Arithmetic, mode, &functions);
-            let ConstantNode::Arithmetic {
+            let StaticExprKind::PreparedArithmetic {
                 operator: frozen_op,
                 decimal_overflow_policy: frozen_policy,
                 allow_throw_exception: frozen_allow,
-            } = fixture.entry_node()
+                ..
+            } = fixture.kind(fixture.occurrence)
             else {
                 unreachable!()
             };
             assert_eq!(
-                (frozen_op, frozen_policy, frozen_allow),
+                (*frozen_op, *frozen_policy, *frozen_allow),
                 (operator, policy, allow)
             );
             assert_eq!(
@@ -857,10 +693,12 @@ fn constant_entry_decimal_policy_cross_allow_matrix_matches_independent_row_erro
             } else {
                 Expected::Value(decimal(None, 38, 0))
             };
-            fixture.direct(
-                vec![decimal(Some(max), 38, 0), decimal(Some(rhs), 2, 0)],
-                expected,
-            );
+            let outcome = if allow || matches!(expected, Expected::RowError(_)) {
+                FoldOutcome::Kept
+            } else {
+                FoldOutcome::Folded
+            };
+            fixture.assert_both(&functions, outcome, expected);
         }
         let fixture = Fixture::compile(
             "CAST(CAST('999.99' AS DECIMAL(5,2)) AS DECIMAL(4,1))",
@@ -868,12 +706,23 @@ fn constant_entry_decimal_policy_cross_allow_matrix_matches_independent_row_erro
             mode,
             &functions,
         );
-        let step = fixture.carrier(fixture.occurrence);
+        let StaticExprKind::PreparedCast {
+            operation: CastOperation::Carrier,
+            decimal_overflow_policy,
+            allow_throw_exception,
+            ..
+        } = fixture.kind(fixture.occurrence)
+        else {
+            panic!("actual decimal carrier cast")
+        };
         assert_eq!(
-            (step.decimal_overflow_policy, step.allow_throw_exception),
+            (*decimal_overflow_policy, *allow_throw_exception),
             (policy, allow)
         );
-        assert_eq!(step.target.data_type(), &DataType::Decimal128(4, 1));
+        assert_eq!(
+            fixture.ty(fixture.occurrence).data_type(),
+            &DataType::Decimal128(4, 1)
+        );
         // Root nullability is authored by SQL and checked against the program
         // in Fixture::compile; unlike arithmetic, do not invent nullable=true
         // for checked modes whose source declaration may already be non-null.
@@ -884,7 +733,12 @@ fn constant_entry_decimal_policy_cross_allow_matrix_matches_independent_row_erro
         } else {
             Expected::Value(new_null_array(&DataType::Decimal128(4, 1), 1))
         };
-        fixture.direct(vec![decimal(Some(99_999), 5, 2)], expected);
+        let outcome = if matches!(expected, Expected::RowError(_)) {
+            FoldOutcome::Kept
+        } else {
+            FoldOutcome::Folded
+        };
+        fixture.assert_both(&functions, outcome, expected);
     }
 }
 
@@ -1035,6 +889,11 @@ fn metadata_cv_source_cross_entry(functions: &Arc<PureEngineFunctionCatalog>, sp
                         .unwrap();
                     assert!(compiled.errors().is_empty());
                     assert_eq!(compiled.values().data_type(), ty.data_type());
+                    let DataType::List(field) = compiled.values().data_type() else {
+                        panic!("canonical List")
+                    };
+                    assert_eq!(field.name(), "item");
+                    assert!(field.metadata().as_arc().is_none());
                     let list = compiled
                         .values()
                         .as_any()
@@ -1056,27 +915,6 @@ fn metadata_cv_source_cross_entry(functions: &Arc<PureEngineFunctionCatalog>, sp
         found > 0,
         "the actual original CV must reach a compiled constant root"
     );
-    let ConstantNodeOutcome::Value(single) = evaluate_constant_node(
-        ConstantNode::Conversion(ConstantConversion::Identity),
-        std::slice::from_ref(&original),
-        &ty,
-        &Control,
-        CompilePhase::FunctionSpecialization,
-    )
-    .unwrap() else {
-        panic!("identity value")
-    };
-    let list = single.as_any().downcast_ref::<ListArray>().unwrap();
-    assert_eq!(
-        list.values()
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap()
-            .iter()
-            .collect::<Vec<_>>(),
-        vec![Some(22), Some(33)]
-    );
-    assert_eq!(single.data_type(), ty.data_type());
     assert_eq!(original.ordinal(), 1);
     assert_eq!(original.pool().backing_identity(), source_identity);
     assert!(Arc::ptr_eq(pool.array(), original.pool().array()));
@@ -1090,11 +928,6 @@ fn metadata_cv_source_cross_entry(functions: &Arc<PureEngineFunctionCatalog>, sp
     } else {
         assert_eq!(field.metadata()["provider.fact"], "kept");
     }
-    let DataType::List(field) = single.data_type() else {
-        panic!("canonical List")
-    };
-    assert_eq!(field.name(), "item");
-    assert!(field.metadata().as_arc().is_none());
 }
 
 mod numeric_not;

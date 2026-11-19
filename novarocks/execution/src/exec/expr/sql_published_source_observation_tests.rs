@@ -14,9 +14,9 @@ use novarocks_sql::compiler::{
     DEFAULT_COMPLETION_LIMITS, RootDistributionRequirement, SessionOptimizerSettings,
     SqlAnalyzeRequest, SqlAuthoredPhysicalPlan, SqlCancellationObservation, SqlCompileControl,
     SqlCompileError, SqlCompileIntent, SqlCompileProgress, SqlCompileProgressError, SqlCompiler,
-    SqlFinalPlanCompileRequest, SqlFoldDependencyInput, SqlFoldDependencyObserver,
-    SqlFoldEvaluationOutcome, SqlOptimizeRequest, SqlPlannerTableSnapshot, SqlPlanningEnvironment,
-    SqlSessionContext, SqlStatementInput, builtin_sql_function_catalog,
+    SqlFinalPlanCompileRequest, SqlFoldDependencyObserver, SqlOptimizeRequest,
+    SqlPlannerTableSnapshot, SqlPlanningEnvironment, SqlSessionContext, SqlStatementInput,
+    builtin_sql_function_catalog,
 };
 use novarocks_sql::planning::catalog::PlannerMemoryCatalog;
 use novarocks_sql::planning::dml::{
@@ -47,19 +47,6 @@ impl Probe {
     }
 }
 impl SqlFoldDependencyObserver for Probe {
-    fn before_fold_dependency_observed(
-        &self,
-        _: SqlFoldDependencyInput<'_>,
-        _: &dyn PureCompileControl,
-    ) -> Result<(), CompileControlError> {
-        Ok(())
-    }
-    fn after_fold_dependency_observed(
-        &self,
-        _: SqlFoldDependencyInput<'_>,
-        _: SqlFoldEvaluationOutcome<'_>,
-    ) {
-    }
     fn observe_published_source_observed(
         &self,
         source: &SqlAuthoredPhysicalPlan,
@@ -78,21 +65,7 @@ impl SqlFoldDependencyObserver for Probe {
     }
 }
 struct DefaultObserver;
-impl SqlFoldDependencyObserver for DefaultObserver {
-    fn before_fold_dependency_observed(
-        &self,
-        _: SqlFoldDependencyInput<'_>,
-        _: &dyn PureCompileControl,
-    ) -> Result<(), CompileControlError> {
-        Ok(())
-    }
-    fn after_fold_dependency_observed(
-        &self,
-        _: SqlFoldDependencyInput<'_>,
-        _: SqlFoldEvaluationOutcome<'_>,
-    ) {
-    }
-}
+impl SqlFoldDependencyObserver for DefaultObserver {}
 struct CountCancellation(AtomicUsize);
 impl SqlCancellationObservation for CountCancellation {
     fn is_cancelled(&self) -> bool {

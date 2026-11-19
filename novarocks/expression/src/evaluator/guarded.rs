@@ -3078,8 +3078,6 @@ fn validate_membership_phase(
     Ok(())
 }
 
-pub(super) mod constant_evaluator;
-
 fn complete_constant_leaf(
     constant: &novarocks_functions::ConstantValue,
     result: &novarocks_functions::FunctionValueType,

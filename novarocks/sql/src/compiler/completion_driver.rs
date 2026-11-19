@@ -45,8 +45,8 @@ use super::completion_predicate::{ProviderPredicateColumn, lower_provider_predic
 use super::mv_rewrite::{MvRewriteDefinitionIndex, SqlMvRewriteDefinitionFacts};
 use super::{
     SqlAnalyzeOutput, SqlAnalyzeRequest, SqlAnalyzedQuery, SqlCompileControl, SqlCompileError,
-    SqlCompileIntent, SqlCompiler, SqlConstantEvaluator, SqlFunctionCatalog,
-    SqlPlannerTableSnapshot, SqlPlanningEnvironment, SqlSessionContext, SqlStatementInput,
+    SqlCompileIntent, SqlCompiler, SqlFunctionCatalog, SqlPlannerTableSnapshot,
+    SqlPlanningEnvironment, SqlSessionContext, SqlStatementInput,
 };
 use crate::binding::SqlTableBindingId;
 use crate::catalog::TableLookupMode;
@@ -67,7 +67,7 @@ pub struct SqlFinalPlanCompileRequest {
     session: SqlSessionContext,
     environment: SqlPlanningEnvironment,
     functions: Arc<dyn SqlFunctionCatalog>,
-    constant_evaluator: &'static dyn SqlConstantEvaluator,
+
     sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     constant_policy: novarocks_functions::ConstantPolicy,
     control: SqlCompileControl,
@@ -118,7 +118,7 @@ impl SqlFinalPlanCompileRequest {
             session,
             environment,
             functions: functions.snapshot(),
-            constant_evaluator: crate::compiler::noop_constant_evaluator(),
+
             sealed_functions,
             constant_policy,
             control,
@@ -126,15 +126,6 @@ impl SqlFinalPlanCompileRequest {
             scan_read_budget,
             limits,
         }
-    }
-
-    /// Temporary fold port until EXL-03 retires `SqlConstantEvaluator`.
-    pub fn with_legacy_fold_evaluator(
-        mut self,
-        evaluator: &'static dyn SqlConstantEvaluator,
-    ) -> Self {
-        self.constant_evaluator = evaluator;
-        self
     }
 
     /// Returns the immutable request control that must govern every fact round.
@@ -154,7 +145,7 @@ impl SqlFinalPlanCompileRequest {
             session,
             environment,
             functions,
-            constant_evaluator,
+
             sealed_functions,
             constant_policy,
             control,
@@ -188,7 +179,7 @@ impl SqlFinalPlanCompileRequest {
             session,
             environment,
             functions,
-            constant_evaluator,
+
             sealed_functions,
             constant_policy,
             dop_domain,
@@ -312,7 +303,7 @@ struct FinalPlanCommon {
     session: SqlSessionContext,
     environment: SqlPlanningEnvironment,
     functions: Arc<dyn SqlFunctionCatalog>,
-    constant_evaluator: &'static dyn SqlConstantEvaluator,
+
     sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     constant_policy: novarocks_functions::ConstantPolicy,
     dop_domain: PipelineDopDomain,
@@ -610,8 +601,7 @@ fn analyze_with_catalog(
         mv_definitions,
         common.constant_policy,
         control.clone(),
-    )
-    .with_legacy_fold_evaluator(common.constant_evaluator);
+    );
     match SqlCompiler::analyze(request)? {
         SqlAnalyzeOutput::Pending(analyzed) => Ok(analyzed),
         SqlAnalyzeOutput::Complete(_) => Err(SqlCompileError::InvalidRequest(
@@ -819,7 +809,7 @@ fn optimize_to_physical(
         change_stream: _,
         mv_rewrite,
         function_catalog,
-        constant_evaluator,
+
         sealed_functions,
         constant_policy,
     } = analyzed;
@@ -857,7 +847,6 @@ fn optimize_to_physical(
     };
     let environment = crate::optimizer::OptimizerEnvironment::new(
         &settings,
-        constant_evaluator,
         Arc::clone(&function_catalog),
         Arc::clone(&sealed_functions),
         decimal_overflow_policy,
@@ -1488,21 +1477,18 @@ mod tests {
                 .with_sql_mode(crate::sql_mode::SqlMode::from_assignment(session_mode));
             let catalog = crate::planning::catalog::PlannerMemoryCatalog::default();
             let snapshot = SqlPlannerTableSnapshot::new(&catalog);
-            let analyzed = SqlCompiler::analyze(
-                SqlAnalyzeRequest::new(
-                    input.statement,
-                    input.intent,
-                    input.session,
-                    input.environment,
-                    &snapshot,
-                    input.functions.as_ref(),
-                    novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-                    None,
-                    crate::constant::test_constant_policy(),
-                    input.control.clone(),
-                )
-                .with_legacy_fold_evaluator(input.constant_evaluator),
-            )
+            let analyzed = SqlCompiler::analyze(SqlAnalyzeRequest::new(
+                input.statement,
+                input.intent,
+                input.session,
+                input.environment,
+                &snapshot,
+                input.functions.as_ref(),
+                novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
+                None,
+                crate::constant::test_constant_policy(),
+                input.control.clone(),
+            ))
             .unwrap()
             .into_pending()
             .unwrap();

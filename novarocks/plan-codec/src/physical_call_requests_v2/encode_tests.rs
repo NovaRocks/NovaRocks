@@ -403,6 +403,11 @@ fn fixture_with_parameters(reference: p::ConstantReference, parameter_count: usi
     }
 }
 fn relation_fixture() -> p::Fragment {
+    relation_fixture_with_result_constraint(None)
+}
+fn relation_fixture_with_result_constraint(
+    expected_result_type: Option<FunctionValueType>,
+) -> p::Fragment {
     let control = Control::default();
     let mut builder = p::FragmentBuilder::new(p::FragmentId::new(0));
     let input = p::NodeId::new(99);
@@ -480,7 +485,7 @@ fn relation_fixture() -> p::Fragment {
                 PhysicalCallRequest {
                     arguments: Box::default(),
                     logical_argument_count: 0,
-                    expected_result_type: None,
+                    expected_result_type,
                     constant_policy: data_policy(),
                 },
             )],

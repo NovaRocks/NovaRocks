@@ -328,53 +328,32 @@ fn seal_function_node(
     builder: &mut FragmentBuilder,
     node: NodeId,
     pools: &novarocks_physical_plan::ConstantPools,
-    catalog: &EngineFunctionCatalog,
+    _catalog: &EngineFunctionCatalog,
 ) {
-    use super::super::{
-        expression_component_test_fixture::seal_node_observed,
-        physical_expression_effects::{
-            PhysicalCallSourceScope, PhysicalExpressionEffectsInput,
-            author_physical_expression_effects_observed,
-        },
-    };
     let control = Control::default();
     let mut work =
         CompileCheckpoints::try_new(&control, CompilePhase::FunctionSpecialization).unwrap();
-    let sealed =
-        seal_node_observed(builder, node, pools, catalog, checked::policy(), &mut work).unwrap();
-    let scopes = sealed
-        .uses()
-        .iter()
-        .filter_map(|(&id, item)| {
-            let source = sealed.definition(item.definition).unwrap();
-            matches!(source.kind, ExprKind::FunctionCall { .. }).then_some((
-                id,
-                PhysicalCallSourceScope {
-                    source,
-                    decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-                    environment: &[],
-                    proof_scope: CallProofScope::Region(item.context.region),
-                },
-            ))
-        })
-        .collect();
-    let parameters = novarocks_type_contract::SemanticParameters::try_new([]).unwrap();
-    work.flush().unwrap();
-    let authored = author_physical_expression_effects_observed(
-        PhysicalExpressionEffectsInput {
-            owner: crate::planner::distributed::build::unit_source::ScalarUnitOwner::Node(node),
-            unit: &sealed,
-            constants: pools,
-            parameters: &parameters,
-            literal_policy: checked::policy(),
-            call_scopes: &scopes,
-        },
-        catalog,
-        work.control(),
+    let sealed = super::super::expression_component_test_fixture::seal_node_observed(
+        builder,
+        node,
+        pools,
+        &novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
+        checked::policy(),
+        &mut work,
     )
     .unwrap();
-    drop(scopes);
-    let unit = sealed.finish(authored.calls, &mut work).unwrap();
+    let parameters = novarocks_type_contract::SemanticParameters::try_new([]).unwrap();
+    work.flush().unwrap();
+    let authored = super::super::expression_component_test_fixture::author_component_calls(
+        &sealed,
+        pools,
+        &parameters,
+        checked::policy(),
+        DecimalOverflowPolicy::ReportError,
+        &mut work,
+    )
+    .unwrap();
+    let unit = sealed.finish(authored.claims, &mut work).unwrap();
     work.finish().unwrap();
     builder.install_unit(node, Arc::new(unit)).unwrap();
 }

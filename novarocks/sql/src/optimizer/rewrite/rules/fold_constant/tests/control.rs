@@ -21,7 +21,9 @@ use novarocks_functions::ConstantValue;
 use novarocks_type_contract::{CompileControlError, PureCompileControl};
 
 use super::{fixtures::*, *};
+use crate::common::LiteralValue;
 use crate::compiler::SqlFoldDependencyObserver;
+use crate::optimizer::scalar::HashableLiteral;
 
 #[derive(Default)]
 struct TraceControl {
@@ -182,4 +184,199 @@ fn evaluator_receives_original_phase_control_and_control_errors_never_decline() 
             Err(SqlCompileError::ResourceExhausted)
         ));
     }
+}
+
+fn check_attempt_prefixes(
+    build: impl Fn() -> (Fixture, ScalarId),
+    expected: impl FnOnce(&Fixture, Result<RewriteResult, SqlCompileError>),
+    sample_wide: bool,
+) -> Vec<(CompilePhase, u32)> {
+    let (fixture, input) = build();
+    let observe = TraceControl::default();
+    expected(
+        &fixture,
+        apply_with_control(&fixture, project(input), &observe),
+    );
+    let trace = observe.steps.into_inner().unwrap();
+    assert_eq!(trace.first(), Some(&(CompilePhase::Validate, 0)));
+
+    let checkpoints = if sample_wide {
+        // A wide compiled unit observes additional layout work per edge.
+        // Sample the entry, work quantum, specialization tail and completion.
+        let max = novarocks_type_contract::MAX_UNOBSERVED_COMPILE_WORK;
+        let quantum = trace.iter().position(|&(_, units)| units == max).unwrap();
+        let tail = trace
+            .iter()
+            .rposition(|&(phase, units)| {
+                phase == CompilePhase::FunctionSpecialization && (1..max).contains(&units)
+            })
+            .unwrap();
+        vec![0, quantum, tail, trace.len() - 1]
+    } else {
+        (0..trace.len()).collect()
+    };
+
+    for cause in [
+        CompileControlError::Cancelled,
+        CompileControlError::DeadlineExceeded,
+        CompileControlError::ResourceExhausted,
+        CompileControlError::Source(novarocks_failure_contract::SharedFailureCause::new(
+            novarocks_functions::KernelFailure::ResourceExhausted,
+        )),
+    ] {
+        for index in &checkpoints {
+            let ordinal = index + 1;
+            let (fixture, input) = build();
+            let refuse = TraceControl {
+                reject: Some((ordinal, cause.clone())),
+                ..Default::default()
+            };
+            let result = apply_with_control(&fixture, project(input), &refuse);
+            assert!(
+                matches!(result, Err(error) if error == SqlCompileError::from(cause.clone())),
+                "lost {cause:?} at {ordinal}: {:?}",
+                trace[ordinal - 1],
+            );
+            assert_eq!(refuse.steps.into_inner().unwrap(), trace[..ordinal]);
+        }
+    }
+    trace
+}
+
+#[test]
+fn real_wide_prepared_call_keeps_entry_quantum_tail_and_all_three_original_causes() {
+    use novarocks_functions::{FunctionArgument, FunctionResultType};
+    use novarocks_type_contract::{DecimalOverflowPolicy, FunctionValueType};
+
+    let ty = FunctionValueType::new(DataType::Int64, false);
+    let count = 320;
+    let source = crate::functions::builtin_sql_function_catalog()
+        .resolve_scalar_binding(
+            "coalesce",
+            &vec![
+                FunctionArgument::Value {
+                    value_type: ty,
+                    constant: None
+                };
+                count
+            ],
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
+    let FunctionResultType::Scalar(result) = &source.selected.result_type else {
+        panic!("the actual COALESCE owner returns a scalar");
+    };
+    let result = result.clone();
+    let binding =
+        crate::binding::SqlFunctionBinding::new(source, DecimalOverflowPolicy::OutputNull);
+    let trace = check_attempt_prefixes(
+        || {
+            let fixture = Fixture::new();
+            let seven = fixture.int_literal(7);
+            let root = fixture.intern(
+                ScalarNode::FunctionCall {
+                    binding: binding.clone(),
+                    name: "coalesce".into(),
+                    args: vec![seven; count],
+                    distinct: false,
+                    volatility: FunctionVolatility::Immutable,
+                },
+                result.clone(),
+            );
+            (fixture, root)
+        },
+        |fixture, result| {
+            assert_int_literal(fixture, project_expr(&changed(result.unwrap())), 7);
+        },
+        true,
+    );
+    assert!(trace.iter().any(|&(_, work)| work == 256));
+    assert!(
+        trace.iter().any(
+            |&(phase, work)| phase == CompilePhase::FunctionSpecialization
+                && (1..256).contains(&work)
+        ),
+        "the actual call still observes its function-specialization tail"
+    );
+}
+
+#[test]
+fn actual_metadata_decline_and_successful_output_pool_keep_all_callback_prefixes() {
+    use arrow::datatypes::Field;
+    use novarocks_type_contract::{
+        FunctionValueType, ValueKind, ValueLayout, ValueLogicalType, ValueTypeRef,
+        ValueTypeStorageLifetime,
+    };
+    let storage = ValueTypeStorageLifetime::pure();
+    let json = ValueTypeRef::try_new(
+        ValueKind::Nominal(ValueLogicalType::Json),
+        true,
+        storage.clone(),
+    )
+    .unwrap();
+    let list = ValueTypeRef::try_new(ValueKind::List(json), true, storage.clone()).unwrap();
+    let field = Field::new("item", DataType::Utf8, true).with_metadata([
+        (novarocks_type_contract::NR_LOGICAL_TYPE_KEY, "json"),
+        ("provider.fact", "positive source metadata"),
+    ]);
+    let layout = ValueLayout::try_new(&DataType::List(Arc::new(field)), storage).unwrap();
+    let declaration = FunctionValueType::try_from_value(list, layout).unwrap();
+    check_attempt_prefixes(
+        || {
+            let fixture = Fixture::new();
+            let null = fixture.intern(
+                ScalarNode::Literal(HashableLiteral(LiteralValue::Null)),
+                declaration.clone(),
+            );
+            let root = fixture.binary_typed(BinOp::EqForNull, null, null, DataType::Boolean, false);
+            (fixture, root)
+        },
+        |_, result| assert!(matches!(result, Ok(RewriteResult::Unchanged))),
+        false,
+    );
+    check_attempt_prefixes(
+        || {
+            let fixture = Fixture::new();
+            let one = fixture.int_literal(1);
+            let root = fixture.binary(BinOp::Add, one, one);
+            (fixture, root)
+        },
+        |fixture, result| assert_int_literal(fixture, project_expr(&changed(result.unwrap())), 2),
+        false,
+    );
+}
+
+#[test]
+fn ordinary_row_error_and_invalid_arithmetic_observe_exact_original_completion() {
+    use novarocks_type_contract::FunctionValueType;
+    check_attempt_prefixes(
+        || {
+            let fixture = Fixture::new();
+            let one = fixture.int_literal(1);
+            let zero = fixture.int_literal(0);
+            let root = fixture.binary(BinOp::Div, one, zero);
+            (fixture, root)
+        },
+        |_, result| assert!(matches!(result, Ok(RewriteResult::Unchanged))),
+        false,
+    );
+    check_attempt_prefixes(
+        || {
+            let fixture = Fixture::new();
+            let malformed = fixture.intern(
+                ScalarNode::Literal(HashableLiteral(LiteralValue::Int(1))),
+                FunctionValueType::new(DataType::Boolean, false),
+            );
+            let one = fixture.int_literal(1);
+            let root = fixture.binary(BinOp::Add, malformed, one);
+            (fixture, root)
+        },
+        |_, result| {
+            assert!(
+                matches!(result, Err(SqlCompileError::Compilation(_))),
+                "{result:?}"
+            )
+        },
+        false,
+    );
 }

@@ -561,110 +561,8 @@ pub use materialized_values::{
     SqlExpressionConstant, SqlExpressionConstants,
 };
 mod fold_observation;
-pub(crate) use fold_observation::evaluate_fold_dependency_observed;
-pub use fold_observation::{
-    SqlFoldDependencyInput, SqlFoldDependencyObserver, SqlFoldDependencySource,
-    SqlFoldEvaluationOutcome,
-};
-
-mod fold_node;
-pub use fold_node::{
-    CarrierStep, ConversionPlan, FrozenFoldArgumentSource, FrozenFoldCall, FrozenFoldIntrinsic,
-    FrozenFoldNode,
-};
+pub use fold_observation::SqlFoldDependencyObserver;
 pub(crate) mod selected_scalar_call;
-
-/// One already-folded argument of a fold request.
-#[derive(Clone, Debug)]
-pub struct FoldArg {
-    pub value: novarocks_functions::ConstantValue,
-    /// The authored logical domain and exact Arrow field vocabulary travel
-    /// together; a carrier alone cannot authorize a logical reinterpretation.
-    pub value_type: novarocks_type_contract::FunctionValueType,
-}
-
-/// A single-node constant evaluation request.
-///
-/// Every argument is already a literal: recursion, volatility gating and the
-/// foldable-shape policy stay on the SQL side, so an evaluator is a pure
-/// per-node calculator with no traversal knowledge.
-#[derive(Clone, Debug)]
-pub struct FoldRequest {
-    /// Exact selected call or intrinsic facts authored by SQL lowering.
-    pub kind: FrozenFoldNode,
-    /// Original admitted sources for observation. A selected call separately
-    /// retains canonical runtime arguments through FrozenFoldCall::arguments.
-    pub args: Vec<FoldArg>,
-    /// Explicit host-admitted policy for the newly evaluated backing.
-    pub constant_policy: novarocks_functions::ConstantPolicy,
-    pub result_type: novarocks_type_contract::FunctionValueType,
-}
-
-/// Evaluates one constant scalar node on behalf of the optimizer.
-///
-/// The implementation must reuse the same kernels the runtime uses, so a
-/// folded literal is bit-identical to what execution would have produced.
-/// Implementations are process-lifetime, stateless singletons: the analyzed
-/// query carries the reference into the optimize phase, which outlives the
-/// analyze request.
-///
-/// Fail-open contract:
-/// - `Ok(Some(literal))` — folded; the literal has the complete type `request.result_type`.
-/// - `Ok(None)` — evaluator declines (unmapped node shape or literal type).
-/// - `Err(Evaluation(_))` — evaluation failed. Callers keep the original expression and
-///   must never surface this as a planning error, because the runtime is
-///   still allowed to produce a value or its own error for that expression.
-/// - `Err(Source(_))` — the producer owns its classification and source.
-///   Only Data may decline optional folding; every other class stops compilation.
-/// - `Err(Control(_))` — request cancellation, deadline or resource exhaustion;
-///   compilation stops with that exact category, never an optimization decline.
-// Design: ADR-0100 (docs/adr/ADR-0100-constant-folding-reuses-execution-kernels-through-an-injected-port.md)
-pub trait SqlConstantEvaluator: Send + Sync {
-    #[cfg(debug_assertions)]
-    fn is_legacy_fold_reference(&self) -> bool {
-        false
-    }
-
-    fn eval_scalar(
-        &self,
-        request: &FoldRequest,
-        control: &dyn novarocks_type_contract::PureCompileControl,
-    ) -> Result<Option<novarocks_functions::ConstantValue>, SqlConstantEvaluationError>;
-
-    /// Static selected-call admission at the original parent node, before any
-    /// child is folded. The request loan supplies the actual immutable catalog;
-    /// legacy calculators retain their original behavior by default.
-    fn admit_fold_parent_observed(
-        &self,
-        _binding: &crate::binding::SqlFunctionBinding,
-        _lifecycle: novarocks_functions::PureCallLifecycle,
-        _control: &dyn novarocks_type_contract::PureCompileControl,
-    ) -> Result<(), novarocks_functions::FunctionBindingError> {
-        Ok(())
-    }
-
-    /// Optional observation before the original evaluator performs any work.
-    /// An observer must admit and reserve its complete receipt storage here.
-    /// A refusal aborts compilation with this exact control cause, without eval.
-    /// Existing evaluators observe nothing and introduce no extra checkpoints.
-    fn before_fold_dependency_observed(
-        &self,
-        _input: SqlFoldDependencyInput<'_>,
-        _control: &dyn novarocks_type_contract::PureCompileControl,
-    ) -> Result<(), novarocks_type_contract::CompileControlError> {
-        Ok(())
-    }
-
-    /// Complete only the receipt admitted by the corresponding start callback.
-    /// No allocation/admission, failure, binding, evaluation, or retry is allowed.
-    /// Borrowed error text is complete; this hook cannot replace the primary cause.
-    fn after_fold_dependency_observed(
-        &self,
-        _input: SqlFoldDependencyInput<'_>,
-        _outcome: SqlFoldEvaluationOutcome<'_>,
-    ) {
-    }
-}
 
 /// Outer author failures stay distinct from a normal optional row-data result.
 /// Kernel strings are not interpreted to infer a control category.
@@ -675,7 +573,6 @@ pub enum SqlConstantEvaluationError {
     Source(novarocks_failure_contract::SharedFailureCause),
     /// An outer evaluator failure is fatal even when its producer fact is Data.
     Outer(novarocks_failure_contract::SharedFailureCause),
-    Evaluation(String),
 }
 
 impl SqlConstantEvaluationError {
@@ -723,25 +620,12 @@ impl From<novarocks_type_contract::ValueTypeError> for SqlConstantEvaluationErro
     }
 }
 
-impl From<novarocks_functions::KernelFailure> for SqlConstantEvaluationError {
-    fn from(error: novarocks_functions::KernelFailure) -> Self {
-        Self::outer_domain(error)
-    }
-}
-
-impl From<String> for SqlConstantEvaluationError {
-    fn from(error: String) -> Self {
-        Self::Evaluation(error)
-    }
-}
-
 impl fmt::Display for SqlConstantEvaluationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Control(error) => error.fmt(f),
             Self::Constant(error) => error.fmt(f),
             Self::Source(error) | Self::Outer(error) => error.fmt(f),
-            Self::Evaluation(error) => f.write_str(error),
         }
     }
 }
@@ -752,37 +636,8 @@ impl std::error::Error for SqlConstantEvaluationError {
             Self::Control(source) => Some(source),
             Self::Constant(source) => Some(source),
             Self::Source(source) | Self::Outer(source) => Some(source),
-            Self::Evaluation(_) => None,
         }
     }
-}
-
-/// A constant evaluator that never folds.
-///
-/// Used by compiler paths that have no execution capability attached; the
-/// folding rule degrades to a no-op rather than changing plan semantics.
-#[derive(Debug, Default)]
-struct NoopConstantEvaluator;
-
-impl SqlConstantEvaluator for NoopConstantEvaluator {
-    fn eval_scalar(
-        &self,
-        _request: &FoldRequest,
-        control: &dyn novarocks_type_contract::PureCompileControl,
-    ) -> Result<Option<novarocks_functions::ConstantValue>, SqlConstantEvaluationError> {
-        let work = novarocks_type_contract::CompileCheckpoints::try_new(
-            control,
-            novarocks_type_contract::CompilePhase::FunctionSpecialization,
-        )?;
-        work.finish()?;
-        Ok(None)
-    }
-}
-
-static NOOP_CONSTANT_EVALUATOR: NoopConstantEvaluator = NoopConstantEvaluator;
-
-pub fn noop_constant_evaluator() -> &'static dyn SqlConstantEvaluator {
-    &NOOP_CONSTANT_EVALUATOR
 }
 
 /// Statement material already owned by the SQL boundary.
@@ -1010,7 +865,7 @@ pub struct SqlAnalyzeRequest<'a> {
     pub(crate) catalog: Option<&'a dyn SqlCatalogSnapshot>,
     pub(crate) functions: Option<&'a dyn SqlFunctionCatalog>,
     pub(crate) owned_functions: Option<Arc<dyn SqlFunctionCatalog>>,
-    pub(crate) constant_evaluator: Option<&'static dyn SqlConstantEvaluator>,
+
     pub(crate) sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     pub(crate) constant_policy: novarocks_functions::ConstantPolicy,
     pub(crate) mv_rewrite: Option<&'a MvRewriteDefinitionIndex>,
@@ -1062,23 +917,13 @@ impl<'a> SqlAnalyzeRequest<'a> {
             catalog: Some(catalog),
             functions: Some(functions),
             owned_functions: None,
-            constant_evaluator: Some(noop_constant_evaluator()),
+
             sealed_functions,
             constant_policy,
             mv_rewrite,
             imv_rewrite: None,
             control,
         }
-    }
-
-    /// Temporary fold port until EXL-03 retires `SqlConstantEvaluator`.
-    /// Absent calls keep the no-op evaluator.
-    pub fn with_legacy_fold_evaluator(
-        mut self,
-        evaluator: &'static dyn SqlConstantEvaluator,
-    ) -> Self {
-        self.constant_evaluator = Some(evaluator);
-        self
     }
 
     /// Build a phase-one request for an already SQL-owned logical plan. It has
@@ -1096,7 +941,7 @@ impl<'a> SqlAnalyzeRequest<'a> {
         session: SqlSessionContext,
         environment: SqlPlanningEnvironment,
         sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
-        constant_evaluator: Option<&'static dyn SqlConstantEvaluator>,
+
         constant_policy: novarocks_functions::ConstantPolicy,
         control: SqlCompileControl,
     ) -> Self {
@@ -1109,7 +954,7 @@ impl<'a> SqlAnalyzeRequest<'a> {
             catalog: None,
             functions: None,
             owned_functions: None,
-            constant_evaluator,
+
             sealed_functions,
             constant_policy,
             mv_rewrite: None,
@@ -1169,7 +1014,6 @@ pub struct SqlAnalyzedQuery {
     function_catalog: Arc<dyn SqlFunctionCatalog>,
     /// Carried from the analyze request because folding runs in the optimize
     /// phase, which outlives the analyze request borrow.
-    constant_evaluator: Option<&'static dyn SqlConstantEvaluator>,
     sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     constant_policy: novarocks_functions::ConstantPolicy,
 }
@@ -1318,7 +1162,7 @@ pub struct SqlImvRefreshExplainContext<'a> {
     pub environment: SqlPlanningEnvironment,
     pub catalog: &'a dyn SqlCatalogSnapshot,
     pub functions: &'a dyn SqlFunctionCatalog,
-    pub constant_evaluator: &'static dyn SqlConstantEvaluator,
+
     pub sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     pub constant_policy: novarocks_functions::ConstantPolicy,
     pub control: SqlCompileControl,
@@ -1393,7 +1237,7 @@ pub fn compile_imv_refresh_explain_lines(
         environment,
         catalog,
         functions,
-        constant_evaluator,
+
         sealed_functions,
         constant_policy,
         control,
@@ -1410,7 +1254,6 @@ pub fn compile_imv_refresh_explain_lines(
         catalog,
         functions,
         sealed_functions,
-        constant_evaluator,
         constant_policy,
         control,
     );
@@ -1433,7 +1276,7 @@ fn imv_refresh_explain_request<'a>(
     catalog: &'a dyn SqlCatalogSnapshot,
     functions: &'a dyn SqlFunctionCatalog,
     sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
-    constant_evaluator: &'static dyn SqlConstantEvaluator,
+
     constant_policy: novarocks_functions::ConstantPolicy,
     control: SqlCompileControl,
 ) -> SqlAnalyzeRequest<'a> {
@@ -1454,7 +1297,6 @@ fn imv_refresh_explain_request<'a>(
         constant_policy,
         control,
     )
-    .with_legacy_fold_evaluator(constant_evaluator)
     .with_imv_rewrite(imv_rewrite)
 }
 
@@ -1662,21 +1504,6 @@ impl std::error::Error for SqlCompileError {
             Self::Analyze(error) => Some(error),
             _ => None,
         }
-    }
-}
-
-/// Keep legacy runtime ALLOW_THROW semantics out of stateless numeric folding.
-/// The no-op port still permits structural reductions such as Nested(literal).
-/// This choice only controls optimization; it neither changes nor transports the
-/// separately frozen legacy runtime option.
-pub(crate) fn constant_evaluator_for_legacy_mode(
-    evaluator: Option<&'static dyn SqlConstantEvaluator>,
-    allow_throw_exception: bool,
-) -> Option<&'static dyn SqlConstantEvaluator> {
-    if allow_throw_exception {
-        evaluator.map(|_| noop_constant_evaluator())
-    } else {
-        evaluator
     }
 }
 
@@ -1976,10 +1803,6 @@ impl SqlCompiler {
             function_catalog,
             constant_policy: request.constant_policy,
             sealed_functions: request.sealed_functions,
-            constant_evaluator: constant_evaluator_for_legacy_mode(
-                request.constant_evaluator,
-                legacy_allow_throw_exception,
-            ),
         }))
     }
 
@@ -1995,7 +1818,7 @@ impl SqlCompiler {
             change_stream,
             mv_rewrite,
             function_catalog,
-            constant_evaluator,
+
             sealed_functions,
             constant_policy,
         } = request.analyzed;
@@ -2042,7 +1865,6 @@ impl SqlCompiler {
                 root_distribution,
                 crate::optimizer::OptimizerEnvironment::new(
                     &settings,
-                    constant_evaluator,
                     Arc::clone(&function_catalog),
                     Arc::clone(&sealed_functions),
                     decimal_overflow_policy,
@@ -2059,7 +1881,6 @@ impl SqlCompiler {
                 mv_candidates,
                 crate::optimizer::OptimizerEnvironment::new(
                     &settings,
-                    constant_evaluator,
                     Arc::clone(&function_catalog),
                     Arc::clone(&sealed_functions),
                     decimal_overflow_policy,
@@ -2918,7 +2739,6 @@ mod tests {
             &CATALOG,
             &FUNCTIONS,
             novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
-            noop_constant_evaluator(),
             crate::constant::test_constant_policy(),
             control(None, &cancellation),
         );
@@ -3649,68 +3469,6 @@ mod tests {
             assert_eq!(result.fields.len(), 1);
             assert_eq!(result.fields[0].ty.data_type().clone(), expected);
             assert!(result.fields[0].ty.nullable());
-        }
-    }
-
-    #[test]
-    fn noop_constant_evaluator_observes_request_entry_and_decline_completion() {
-        use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
-        struct Owner {
-            checks: std::sync::Mutex<Vec<u32>>,
-            failure: Option<(usize, CompileControlError)>,
-        }
-        impl PureCompileControl for Owner {
-            fn checkpoint(
-                &self,
-                phase: CompilePhase,
-                units: u32,
-            ) -> Result<(), CompileControlError> {
-                assert_eq!(phase, CompilePhase::FunctionSpecialization);
-                let mut checks = self.checks.lock().unwrap();
-                checks.push(units);
-                if let Some((at, error)) = self.failure.clone()
-                    && checks.len() == at
-                {
-                    return Err(error);
-                }
-                Ok(())
-            }
-        }
-        let request = FoldRequest {
-            constant_policy: crate::constant::test_constant_policy(),
-            kind: FrozenFoldNode::Intrinsic(FrozenFoldIntrinsic::Not),
-            args: Vec::new(),
-            result_type: novarocks_type_contract::FunctionValueType::new(
-                arrow::datatypes::DataType::Int64,
-                true,
-            ),
-        };
-        let owner = Owner {
-            checks: Default::default(),
-            failure: None,
-        };
-        assert!(
-            noop_constant_evaluator()
-                .eval_scalar(&request, &owner)
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(*owner.checks.lock().unwrap(), [0, 0]);
-        for error in [
-            CompileControlError::Cancelled,
-            CompileControlError::DeadlineExceeded,
-            CompileControlError::ResourceExhausted,
-        ] {
-            for at in [1, 2] {
-                let owner = Owner {
-                    checks: Default::default(),
-                    failure: Some((at, error.clone())),
-                };
-                assert!(
-                    matches!(noop_constant_evaluator().eval_scalar(&request, &owner), Err(SqlConstantEvaluationError::Control(actual)) if actual == error)
-                );
-                assert_eq!(owner.checks.lock().unwrap().len(), at);
-            }
         }
     }
 

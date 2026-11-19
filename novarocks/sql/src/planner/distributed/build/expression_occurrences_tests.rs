@@ -21,10 +21,12 @@ use super::super::expression_component_test_fixture::{
 use super::*;
 use crate::test_constants as checked;
 use arrow::datatypes::DataType;
-use novarocks_expression_contract::{BoundFunction, RootOrdinal, UnaryOperator, UnitError};
+use novarocks_expression_contract::{
+    BoundFunction, ExprId, ExprKind, RootOrdinal, UnaryOperator, UnitError,
+};
 use novarocks_functions::{
     EngineFunctionCatalog, FunctionArgument, FunctionBindingError, FunctionKind,
-    FunctionResolutionError, FunctionResultType, FunctionValueType, ResolvedAggregateSignature,
+    FunctionResultType, FunctionValueType,
     builtin::catalogue::build_builtin_engine_function_catalog,
 };
 use novarocks_physical_plan::{
@@ -33,10 +35,10 @@ use novarocks_physical_plan::{
     WindowSpec,
 };
 use novarocks_type_contract::{
-    EvaluationDemand, ExpressionControlFlowError, ExpressionInvocation, ExpressionUseId,
-    FunctionArgumentEvaluation, GuardKind, RegionGuard,
+    ControlShape, EvaluationDemand, ExpressionControlFlowError, ExpressionInvocation,
+    ExpressionUseId, FunctionArgumentEvaluation, GuardKind, RegionGuard,
 };
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 const CAUSES: [CompileControlError; 3] = [
     CompileControlError::Cancelled,
     CompileControlError::DeadlineExceeded,
@@ -68,21 +70,21 @@ impl PureCompileControl for Control {
 }
 fn run(
     builder: FixtureBuilder,
-    catalog: &dyn SqlFunctionCatalog,
+    functions: &novarocks_functions::PureEngineFunctionCatalog,
     control: &Control,
 ) -> Result<UnitFixture, ComponentSealError> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
-    let result = builder.seal_observed(catalog, checked::policy(), &mut work);
+    let result = builder.seal_observed(functions, checked::policy(), &mut work);
     work.finish_result(result, ComponentSealError::Control)
 }
 fn prefixes(
     mut source: impl FnMut() -> FixtureBuilder,
-    catalog: &dyn SqlFunctionCatalog,
+    functions: &novarocks_functions::PureEngineFunctionCatalog,
     success: bool,
     wide: bool,
 ) -> Vec<(CompilePhase, u32)> {
     let baseline = Control::default();
-    assert_eq!(run(source(), catalog, &baseline).is_ok(), success);
+    assert_eq!(run(source(), functions, &baseline).is_ok(), success);
     let trace = baseline.trace.lock().unwrap().clone();
     assert_eq!(trace.first(), Some(&(CompilePhase::Validate, 0)));
     assert!(
@@ -99,7 +101,7 @@ fn prefixes(
                 refusal: Some((at, cause.clone())),
             };
             assert!(
-                matches!(run(source(), catalog, &control), Err(ComponentSealError::Control(actual)) if actual==cause),
+                matches!(run(source(), functions, &control), Err(ComponentSealError::Control(actual)) if actual==cause),
                 "at {at}: {cause:?}"
             );
             assert_eq!(*control.trace.lock().unwrap(), trace[..=at]);
@@ -320,7 +322,12 @@ fn occurrence_shared_sparse_if_definition_keeps_value_truth_domains_and_ignores_
         (builder, root, predicate, assignment)
     };
     let (builder, root, predicate, assignment) = source();
-    let uses = run(builder, &catalog, &Control::default()).unwrap();
+    let uses = run(
+        builder,
+        &novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
+        &Control::default(),
+    )
+    .unwrap();
     assert_eq!(uses.sealed.roots().len(), 2);
     let predicate = uses.root_use(predicate);
     let value_use = uses.root_use(assignment);
@@ -349,7 +356,12 @@ fn occurrence_shared_sparse_if_definition_keeps_value_truth_domains_and_ignores_
         invocation(&uses, predicate).context.region,
         invocation(&uses, value_use).context.region
     );
-    prefixes(|| source().0, &catalog, true, false);
+    prefixes(
+        || source().0,
+        &novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
+        true,
+        false,
+    );
 }
 #[test]
 fn occurrence_installed_coalesce_and_lower_have_exact_guarded_and_eager_edges() {
@@ -389,7 +401,12 @@ fn occurrence_installed_coalesce_and_lower_have_exact_guarded_and_eager_edges() 
         (b, ordinal)
     };
     let (builder, ordinal) = source();
-    let uses = run(builder, &catalog, &Control::default()).unwrap();
+    let uses = run(
+        builder,
+        &novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
+        &Control::default(),
+    )
+    .unwrap();
     let root = uses.root_use(ordinal);
     assert_eq!(invocation(&uses, root).control, ControlShape::Coalesce);
     assert_eq!(
@@ -409,7 +426,12 @@ fn occurrence_installed_coalesce_and_lower_have_exact_guarded_and_eager_edges() 
         child(&uses, lower.context.use_id, 0).context.region,
         lower.context.region
     );
-    let trace = prefixes(|| source().0, &catalog, true, false);
+    let trace = prefixes(
+        || source().0,
+        &novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
+        true,
+        false,
+    );
     assert!(
         trace
             .iter()
@@ -418,7 +440,6 @@ fn occurrence_installed_coalesce_and_lower_have_exact_guarded_and_eager_edges() 
 }
 #[test]
 fn occurrence_intrinsic_boolean_and_both_case_shapes_preserve_order_and_hand_guards() {
-    let catalog = build_builtin_engine_function_catalog().unwrap();
     let source = || {
         let mut b = FixtureBuilder::new();
         let a = boolean(&mut b, true);
@@ -457,7 +478,12 @@ fn occurrence_intrinsic_boolean_and_both_case_shapes_preserve_order_and_hand_gua
         (b, and, roots)
     };
     let (builder, and, roots) = source();
-    let uses = run(builder, &catalog, &Control::default()).unwrap();
+    let uses = run(
+        builder,
+        &novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
+        &Control::default(),
+    )
+    .unwrap();
     for (position, ordinal) in roots.into_iter().enumerate() {
         let id = uses.root_use(ordinal);
         let simple = position == 1;
@@ -515,7 +541,12 @@ fn occurrence_intrinsic_boolean_and_both_case_shapes_preserve_order_and_hand_gua
             conjunction.context.region
         );
     }
-    prefixes(|| source().0, &catalog, true, false);
+    prefixes(
+        || source().0,
+        &novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
+        true,
+        false,
+    );
 }
 #[test]
 fn occurrence_window_optional_frame_offsets_are_eager_topology_not_scalar_lifecycle() {
@@ -691,24 +722,6 @@ fn occurrence_typeof_missing_owner_is_not_an_installed_type_only_capability() {
             assert_eq!(*control.trace.lock().unwrap(), trace[..=at]);
         }
     }
-    // These assert closed protocol projection only, not an installed owner.
-    assert_eq!(
-        scalar_shape(ArgumentControl::TypeOnly, 2),
-        Some(ControlShape::TypeOnly)
-    );
-    assert_eq!(
-        scalar_shape(
-            ArgumentControl::HigherOrder {
-                body_ordinal: 1,
-                body_demand: EvaluationDemand::TruthOnly
-            },
-            2
-        ),
-        Some(ControlShape::HigherOrder {
-            body_ordinal: 1,
-            body_demand: EvaluationDemand::TruthOnly
-        })
-    );
     assert_eq!(
         ExprKind::Lambda {
             parameter_types: Box::default(),
@@ -718,44 +731,6 @@ fn occurrence_typeof_missing_owner_is_not_an_installed_type_only_capability() {
         .unwrap(),
         Some(ControlShape::LambdaBody)
     );
-}
-
-#[derive(Clone, Debug)]
-struct MetadataOnly;
-impl SqlFunctionCatalog for MetadataOnly {
-    fn snapshot(&self) -> Arc<dyn SqlFunctionCatalog> {
-        Arc::new(self.clone())
-    }
-    fn resolve_scalar_signature(
-        &self,
-        _: &str,
-        _: &[DataType],
-        _: &dyn PureCompileControl,
-    ) -> Result<crate::functions::ResolvedScalarFunction, crate::functions::ResolveError> {
-        panic!("no name re-resolution")
-    }
-    fn resolve_aggregate_signature(
-        &self,
-        _: &str,
-        _: &[DataType],
-        _: &dyn PureCompileControl,
-    ) -> Result<ResolvedAggregateSignature, FunctionResolutionError> {
-        panic!("no aggregate re-resolution")
-    }
-    fn resolve_aggregate_trusted(
-        &self,
-        _: &str,
-        _: &[DataType],
-        _: &dyn PureCompileControl,
-    ) -> Result<ResolvedAggregateSignature, FunctionResolutionError> {
-        panic!("no trusted re-resolution")
-    }
-    fn contains_aggregate(&self, _: &str) -> bool {
-        panic!("no name discovery")
-    }
-    fn volatility(&self, _: &str) -> novarocks_functions::FunctionVolatility {
-        panic!("no legacy effect inference")
-    }
 }
 
 #[test]
@@ -780,15 +755,14 @@ fn occurrence_metadata_only_refusal_and_nested_typed_controls_never_fallback_or_
         project(&mut b, &[root]);
         b
     };
+    let subset = novarocks_functions::testkit::rng_subset();
     assert!(matches!(
-        run(source(), &MetadataOnly, &Control::default()),
-        Err(ComponentSealError::Occurrence(
-            ExpressionOccurrenceError::Function(FunctionSpecializationFailure::InvalidInput(
-                "SQL function snapshot has no installed pure overload declaration owner"
-            ))
+        run(source(), &subset, &Control::default()),
+        Err(ComponentSealError::Author(
+            novarocks_expression::CallAuthorError::Capability(_)
         ))
     ));
-    prefixes(source, &MetadataOnly, false, false);
+    prefixes(source, &subset, false, false);
     for cause in CAUSES {
         assert!(
             matches!(ExpressionOccurrenceError::function(FunctionSpecializationFailure::Binding(FunctionBindingError::Control(cause.clone()))),ExpressionOccurrenceError::Control(actual) if actual==cause)
@@ -801,7 +775,6 @@ fn occurrence_metadata_only_refusal_and_nested_typed_controls_never_fallback_or_
 }
 #[test]
 fn occurrence_real_320_values_rows_expand_shared_definition_and_observe_actual_quantums() {
-    let catalog = build_builtin_engine_function_catalog().unwrap();
     let source = || {
         let mut b = FixtureBuilder::new();
         let root = boolean(&mut b, true);
@@ -838,7 +811,12 @@ fn occurrence_real_320_values_rows_expand_shared_definition_and_observe_actual_q
         (b, root)
     };
     let (builder, root) = source();
-    let uses = run(builder, &catalog, &Control::default()).unwrap();
+    let uses = run(
+        builder,
+        &novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
+        &Control::default(),
+    )
+    .unwrap();
     assert_eq!(uses.sealed.roots().len(), 320);
     assert_eq!(uses.flow().uses().len(), 320);
     assert_eq!(uses.flow().regions().len(), 320);
@@ -852,11 +830,15 @@ fn occurrence_real_320_values_rows_expand_shared_definition_and_observe_actual_q
         assert_eq!(use_.context.demand, EvaluationDemand::Value);
         assert!(uses.flow().regions()[&use_.context.region].parent.is_none());
     }
-    prefixes(|| source().0, &catalog, true, true);
+    prefixes(
+        || source().0,
+        &novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
+        true,
+        true,
+    );
 }
 #[test]
 fn occurrence_shared_and_dag_reference_limit_counts_expanded_uses_before_publication() {
-    let catalog = build_builtin_engine_function_catalog().unwrap();
     fn source(levels: usize) -> FixtureBuilder {
         let mut b = FixtureBuilder::new();
         let mut root = boolean(&mut b, true);
@@ -875,7 +857,12 @@ fn occurrence_shared_and_dag_reference_limit_counts_expanded_uses_before_publica
     let near = source(14);
     assert_eq!(near.definitions().len(), 15);
     let near_control = Control::default();
-    let near_uses = run(near, &catalog, &near_control).unwrap();
+    let near_uses = run(
+        near,
+        &novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
+        &near_control,
+    )
+    .unwrap();
     assert_eq!(near_uses.sealed.roots().len(), 1);
     assert_eq!(near_uses.flow().uses().len(), 32_767);
     assert_eq!(near_uses.flow().regions().len(), 1);
@@ -910,7 +897,7 @@ fn occurrence_shared_and_dag_reference_limit_counts_expanded_uses_before_publica
                 refusal: Some((at, cause.clone())),
             };
             assert!(
-                matches!(run(source(14), &catalog, &control), Err(ComponentSealError::Control(actual)) if actual == cause)
+                matches!(run(source(14), &novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(), &control), Err(ComponentSealError::Control(actual)) if actual == cause)
             );
             assert_eq!(*control.trace.lock().unwrap(), near_trace[..=at]);
         }
@@ -919,7 +906,11 @@ fn occurrence_shared_and_dag_reference_limit_counts_expanded_uses_before_publica
     assert_eq!(over.definitions().len(), 16);
     let control = Control::default();
     assert!(matches!(
-        run(over, &catalog, &control),
+        run(
+            over,
+            &novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
+            &control
+        ),
         Err(ComponentSealError::Unit(UnitError::Flow(
             ExpressionControlFlowError::TooManyItems
         )))

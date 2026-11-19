@@ -15,4 +15,3 @@
 // specific language governing permissions and limitations
 // under the License.
 //! Loan the sole actual emitted-Physical source projection.
-pub(super) use novarocks_expression_contract::TemporalSourceProjectionError as SourceError;
