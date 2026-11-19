@@ -90,13 +90,13 @@ ORDER BY t.pk;
 -- query 11
 -- map<int, string> self join (WHERE syntax)
 SELECT t.map0, s.map0
-FROM ${case_db}.map_test t JOIN ${case_db}.map_test s WHERE s.map0 = t.map0
+FROM ${case_db}.map_test t CROSS JOIN ${case_db}.map_test s WHERE s.map0 = t.map0
 ORDER BY t.pk;
 
 -- query 12
 -- map<decimal, varchar> self join (WHERE syntax)
 SELECT t.map1, s.map1
-FROM ${case_db}.map_test t JOIN ${case_db}.map_test s WHERE s.map1 = t.map1
+FROM ${case_db}.map_test t CROSS JOIN ${case_db}.map_test s WHERE s.map1 = t.map1
 ORDER BY t.pk;
 
 -- ========== MAP<INT, JSON> same-type equi-join ==========
@@ -117,7 +117,7 @@ ORDER BY t.pk;
 -- query 14
 -- @expect_error=does not support binary predicate operation
 SELECT t.map0, s.map5
-FROM ${case_db}.map_test t JOIN ${case_db}.map_test s WHERE s.map0 = t.map5
+FROM ${case_db}.map_test t CROSS JOIN ${case_db}.map_test s WHERE s.map0 = t.map5
 ORDER BY t.pk;
 
 -- ========== FE error: non-equality comparison on MAP ==========

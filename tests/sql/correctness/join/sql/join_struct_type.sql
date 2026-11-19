@@ -111,26 +111,26 @@ ORDER BY t.pk;
 -- query 13
 -- @order_sensitive=true
 SELECT t.s0, s.s0
-FROM ${case_db}.struct_test t JOIN ${case_db}.struct_test s WHERE s.s0 = t.s0
+FROM ${case_db}.struct_test t CROSS JOIN ${case_db}.struct_test s WHERE s.s0 = t.s0
 ORDER BY t.pk;
 
 -- query 14
 -- @order_sensitive=true
 SELECT t.s1, s.s1
-FROM ${case_db}.struct_test t JOIN ${case_db}.struct_test s WHERE s.s1 = t.s1
+FROM ${case_db}.struct_test t CROSS JOIN ${case_db}.struct_test s WHERE s.s1 = t.s1
 ORDER BY t.pk;
 
 -- query 15
 -- @order_sensitive=true
 SELECT t.s2, s.s2
-FROM ${case_db}.struct_test t JOIN ${case_db}.struct_test s WHERE s.s2 = t.s2
+FROM ${case_db}.struct_test t CROSS JOIN ${case_db}.struct_test s WHERE s.s2 = t.s2
 ORDER BY t.pk;
 
 -- query 16
 -- @order_sensitive=true
 -- struct<string, map<int, varchar>> self join WHERE
 SELECT t.s3, s.s3
-FROM ${case_db}.struct_test t JOIN ${case_db}.struct_test s WHERE s.s3 = t.s3
+FROM ${case_db}.struct_test t CROSS JOIN ${case_db}.struct_test s WHERE s.s3 = t.s3
 ORDER BY t.pk;
 
 -- ========== FE error: cross-type struct comparison ==========
@@ -138,7 +138,7 @@ ORDER BY t.pk;
 -- query 17
 -- @expect_error=does not support binary predicate operation
 SELECT t.s2, s.s3
-FROM ${case_db}.struct_test t JOIN ${case_db}.struct_test s WHERE s.s2 = t.s3
+FROM ${case_db}.struct_test t CROSS JOIN ${case_db}.struct_test s WHERE s.s2 = t.s3
 ORDER BY t.pk;
 
 -- ========== NULL-safe equal (<=>) ON syntax ==========
@@ -166,25 +166,25 @@ ORDER BY t.pk;
 -- query 21
 -- @order_sensitive=true
 SELECT t.s0, s.s0
-FROM ${case_db}.struct_test t JOIN ${case_db}.struct_test s WHERE s.s0 <=> t.s0
+FROM ${case_db}.struct_test t CROSS JOIN ${case_db}.struct_test s WHERE s.s0 <=> t.s0
 ORDER BY t.pk;
 
 -- query 22
 -- @order_sensitive=true
 SELECT t.s1, s.s1
-FROM ${case_db}.struct_test t JOIN ${case_db}.struct_test s WHERE s.s1 <=> t.s1
+FROM ${case_db}.struct_test t CROSS JOIN ${case_db}.struct_test s WHERE s.s1 <=> t.s1
 ORDER BY t.pk;
 
 -- query 23
 -- @order_sensitive=true
 SELECT t.s2, s.s2
-FROM ${case_db}.struct_test t JOIN ${case_db}.struct_test s WHERE s.s2 <=> t.s2
+FROM ${case_db}.struct_test t CROSS JOIN ${case_db}.struct_test s WHERE s.s2 <=> t.s2
 ORDER BY t.pk;
 
 -- query 24
 -- @order_sensitive=true
 SELECT t.s3, s.s3
-FROM ${case_db}.struct_test t JOIN ${case_db}.struct_test s WHERE s.s3 <=> t.s3
+FROM ${case_db}.struct_test t CROSS JOIN ${case_db}.struct_test s WHERE s.s3 <=> t.s3
 ORDER BY t.pk;
 
 -- ========== FE error: <=> cross-type struct comparison ==========
@@ -192,7 +192,7 @@ ORDER BY t.pk;
 -- query 25
 -- @expect_error=does not support binary predicate operation
 SELECT t.s4, s.s5
-FROM ${case_db}.struct_test t JOIN ${case_db}.struct_test s WHERE s.s4 <=> t.s5
+FROM ${case_db}.struct_test t CROSS JOIN ${case_db}.struct_test s WHERE s.s4 <=> t.s5
 ORDER BY t.pk;
 
 -- ========== FE error: non-equality comparison on struct ==========
