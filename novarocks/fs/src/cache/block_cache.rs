@@ -905,8 +905,8 @@ fn crc_hash64_sse42(data: &[u8], seed: u64) -> u64 {
         }
     }
 
-    h1 = (h1 << 16) | (h1 >> 16);
-    h2 = (h2 << 16) | (h2 >> 16);
+    h1 = h1.rotate_right(16);
+    h2 = h2.rotate_right(16);
     ((h2 as u64) << 32) | (h1 as u64)
 }
 
