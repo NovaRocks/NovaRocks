@@ -45,11 +45,12 @@ fn analyze(sql: &str) -> Result<(), SqlCompileError> {
         SqlPlanningEnvironment::Distributed,
         &catalog,
         builtin_sql_function_catalog(),
-        &EVALUATOR,
+        novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
         None,
         super::test_support::constant_policy(),
         SqlCompileControl::unbounded(),
-    );
+    )
+    .with_legacy_fold_evaluator(&EVALUATOR);
     SqlCompiler::analyze(request)?.into_pending()?;
     Ok(())
 }
@@ -226,7 +227,7 @@ fn sql_presence_candidate_completion_uses_actual_request_mode_before_fold_or_pub
         session(),
         SqlPlanningEnvironment::Distributed,
         builtin_sql_function_catalog().snapshot(),
-        &EVALUATOR,
+        novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
         super::test_support::constant_policy(),
         SqlCompileControl::unbounded(),
         PipelineDopDomain {
@@ -239,7 +240,8 @@ fn sql_presence_candidate_completion_uses_actual_request_mode_before_fold_or_pub
             max_batch_bytes: 1 << 20,
         },
         DEFAULT_COMPLETION_LIMITS,
-    );
+    )
+    .with_legacy_fold_evaluator(&EVALUATOR);
     unavailable(
         request
             .try_into_completion()

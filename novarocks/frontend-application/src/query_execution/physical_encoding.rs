@@ -1996,7 +1996,7 @@ mod tests {
             },
             SqlPlanningEnvironment::Distributed,
             builtin_sql_function_catalog().snapshot(),
-            crate::query_execution::constant_eval::constant_evaluator(),
+            novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
             FROZEN_CONSTANT_POLICY,
             control.clone(),
             PipelineDopDomain {
@@ -2009,7 +2009,8 @@ mod tests {
                 max_batch_bytes: MAX_SCAN_BATCH_BYTES,
             },
             DEFAULT_COMPLETION_LIMITS,
-        );
+        )
+        .with_legacy_fold_evaluator(crate::query_execution::constant_eval::constant_evaluator());
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -2228,7 +2229,7 @@ mod tests {
             },
             SqlPlanningEnvironment::Distributed,
             builtin_sql_function_catalog().snapshot(),
-            crate::query_execution::constant_eval::constant_evaluator(),
+            novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
             FROZEN_CONSTANT_POLICY,
             control.clone(),
             PipelineDopDomain {
@@ -2241,7 +2242,8 @@ mod tests {
                 max_batch_bytes: MAX_SCAN_BATCH_BYTES,
             },
             DEFAULT_COMPLETION_LIMITS,
-        );
+        )
+        .with_legacy_fold_evaluator(crate::query_execution::constant_eval::constant_evaluator());
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -2334,7 +2336,7 @@ mod tests {
             },
             SqlPlanningEnvironment::Distributed,
             builtin_sql_function_catalog().snapshot(),
-            crate::query_execution::constant_eval::constant_evaluator(),
+            novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
             FROZEN_CONSTANT_POLICY,
             control.clone(),
             PipelineDopDomain {
@@ -2347,7 +2349,8 @@ mod tests {
                 max_batch_bytes: MAX_SCAN_BATCH_BYTES,
             },
             DEFAULT_COMPLETION_LIMITS,
-        );
+        )
+        .with_legacy_fold_evaluator(crate::query_execution::constant_eval::constant_evaluator());
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -2534,28 +2537,34 @@ mod tests {
             .expect("real builtin SQL catalogue");
         let semantics = novarocks_sql::sql_mode::SqlSemanticSettings::default();
         let decimal = semantics.sql_mode().decimal_overflow_policy();
-        let analyzed = SqlCompiler::analyze(SqlAnalyzeRequest::new(
-            SqlStatementInput::parsed_query(query_ast(&sql)),
-            SqlCompileIntent::IcebergWrite {
-                root_distribution: RootDistributionRequirement::Any,
-            },
-            SqlSessionContext {
-                sql_semantics: semantics,
-                current_catalog: Some("native_statistics".into()),
-                current_database: "native_statistics_db".into(),
-                optimizer_settings: settings.clone(),
-            },
-            SqlPlanningEnvironment::Distributed,
-            &snapshot,
-            &functions,
-            crate::query_execution::constant_eval::constant_evaluator(),
-            None,
-            FROZEN_CONSTANT_POLICY,
-            control.clone(),
-        ))
-        .unwrap_or_else(|error| panic!("wide INSERT source analysis: {error:#?}"))
-        .into_pending()
-        .expect("pending DML source");
+        let analyzed =
+            SqlCompiler::analyze(
+                SqlAnalyzeRequest::new(
+                    SqlStatementInput::parsed_query(query_ast(&sql)),
+                    SqlCompileIntent::IcebergWrite {
+                        root_distribution: RootDistributionRequirement::Any,
+                    },
+                    SqlSessionContext {
+                        sql_semantics: semantics,
+                        current_catalog: Some("native_statistics".into()),
+                        current_database: "native_statistics_db".into(),
+                        optimizer_settings: settings.clone(),
+                    },
+                    SqlPlanningEnvironment::Distributed,
+                    &snapshot,
+                    &functions,
+                    novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
+                    None,
+                    FROZEN_CONSTANT_POLICY,
+                    control.clone(),
+                )
+                .with_legacy_fold_evaluator(
+                    crate::query_execution::constant_eval::constant_evaluator(),
+                ),
+            )
+            .unwrap_or_else(|error| panic!("wide INSERT source analysis: {error:#?}"))
+            .into_pending()
+            .expect("pending DML source");
         let columns = (0..1024)
             .map(|index| ColumnDef {
                 name: format!("v{index}"),
@@ -3199,7 +3208,7 @@ mod tests {
             },
             SqlPlanningEnvironment::Distributed,
             builtin_sql_function_catalog().snapshot(),
-            constant_evaluator,
+            novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
             crate::application::test_constant_policy(),
             SqlCompileControl::unbounded(),
             PipelineDopDomain {
@@ -3213,5 +3222,6 @@ mod tests {
             },
             DEFAULT_COMPLETION_LIMITS,
         )
+        .with_legacy_fold_evaluator(constant_evaluator)
     }
 }

@@ -24,6 +24,7 @@ use super::{
     SqlPlanningEnvironment, SqlSessionContext, SqlStatementInput, SqlStatementInputKind,
     completion_catalog::CatalogCompletionState,
 };
+use std::sync::Arc;
 
 /// Owns the original prepared syntax while the application observes the exact
 /// catalog facts. No application catalog or provider callback crosses this boundary.
@@ -133,6 +134,7 @@ impl SqlDmlCatalogPreparation {
         self,
         facts: &[CatalogRelationFact],
         functions: &dyn SqlFunctionCatalog,
+        sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
         evaluator: &'static dyn SqlConstantEvaluator,
         policy: ConstantPolicy,
     ) -> Result<SqlAnalyzedQuery, SqlCompileError> {
@@ -163,11 +165,12 @@ impl SqlDmlCatalogPreparation {
             SqlPlanningEnvironment::Distributed,
             &snapshot,
             functions,
-            evaluator,
+            sealed_functions,
             None,
             policy,
             self.control,
-        );
+        )
+        .with_legacy_fold_evaluator(evaluator);
         let request = match self.write_assignments {
             Some(assignments) => request.with_write_assignments(assignments)?,
             None => request,
@@ -223,6 +226,7 @@ mod tests {
         source.analyze(
             facts,
             crate::functions::builtin_sql_function_catalog(),
+            novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
             super::super::noop_constant_evaluator(),
             crate::constant::test_constant_policy(),
         )

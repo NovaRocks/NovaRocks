@@ -123,7 +123,14 @@ fn compile_unit<const N: usize>(
     let parameters = SemanticParameters::try_new([]).unwrap();
     let mut work = CompileCheckpoints::try_new(&HarnessControl, CompilePhase::Validate).unwrap();
     register_call_requests(&mut draft, &authors, &mut constants);
-    declare_call_controls(&mut draft, &functions, &constants, &parameters, POLICY, &mut work);
+    declare_call_controls(
+        &mut draft,
+        &functions,
+        &constants,
+        &parameters,
+        POLICY,
+        &mut work,
+    );
     let sealed = draft.seal(vec![port], &mut work).unwrap();
     let unit = finish_unit(
         &functions,

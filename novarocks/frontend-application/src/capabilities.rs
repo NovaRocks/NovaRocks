@@ -56,6 +56,7 @@ use crate::query::compiler::FrontendQueryCompiler;
 #[derive(Clone)]
 pub(crate) struct QueryCompilerPorts {
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
+    sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     constant_policy: novarocks_functions::ConstantPolicy,
     static_plan_carrier: CompiledPackageCarrier,
     catalog_service: Arc<QueryCatalogService>,
@@ -95,9 +96,11 @@ impl QueryCompilerPorts {
         connector_blocking_io: crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor,
         constant_policy: novarocks_functions::ConstantPolicy,
         static_plan_carrier: CompiledPackageCarrier,
+        sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     ) -> Self {
         Self {
             functions,
+            sealed_functions,
             constant_policy,
             static_plan_carrier,
             catalog_service,
@@ -130,6 +133,7 @@ pub(crate) fn query_compiler(ports: QueryCompilerPorts) -> FrontendQueryCompiler
         ports.exchange_port,
         ports.constant_policy,
         ports.static_plan_carrier,
+        Arc::clone(&ports.sealed_functions),
     );
     let view = domain::ViewExecutionKernel::new(
         Arc::clone(&ports.functions),
@@ -151,6 +155,7 @@ pub(crate) fn query_compiler(ports: QueryCompilerPorts) -> FrontendQueryCompiler
         ports.mv_storage_observation,
         ports.connector_blocking_io,
         ports.constant_policy,
+        ports.sealed_functions,
     )
 }
 
@@ -158,6 +163,7 @@ pub(crate) fn query_compiler(ports: QueryCompilerPorts) -> FrontendQueryCompiler
 #[derive(Clone)]
 pub struct DmlEnginePorts {
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
+    sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     constant_policy: novarocks_functions::ConstantPolicy,
     static_plan_carrier: CompiledPackageCarrier,
     catalog_service: Arc<QueryCatalogService>,
@@ -199,11 +205,13 @@ impl DmlEnginePorts {
         static_plan_carrier: CompiledPackageCarrier,
         view_service: Arc<dyn ViewService>,
         system_relations: Arc<SystemTableRegistry>,
+        sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     ) -> Self {
         Self {
             view_service,
             system_relations,
             functions,
+            sealed_functions,
             constant_policy,
             static_plan_carrier,
             catalog_service,
@@ -246,6 +254,7 @@ impl DmlEnginePorts {
                 self.static_plan_carrier.clone(),
                 Arc::clone(&self.view_service),
                 self.system_relations.clone(),
+                Arc::clone(&self.sealed_functions),
             ),
             self.catalog_application.clone(),
             Arc::clone(&self.connector_control),
@@ -378,6 +387,7 @@ pub struct MaintenanceCommandPorts {
     rewrite_runtime: Option<domain::MaintenanceRewriteRuntime>,
     constant_policy: novarocks_functions::ConstantPolicy,
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
+    sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     static_plan_carrier: CompiledPackageCarrier,
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
@@ -406,12 +416,14 @@ impl MaintenanceCommandPorts {
         runtime: Handle,
         constant_policy: novarocks_functions::ConstantPolicy,
         static_plan_carrier: CompiledPackageCarrier,
+        sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     ) -> Self {
         Self {
             state_store: None,
             rewrite_runtime: None,
             constant_policy,
             functions,
+            sealed_functions,
             static_plan_carrier,
             catalog_service,
             catalog_application,
@@ -452,6 +464,7 @@ impl MaintenanceCommandPorts {
             Arc::clone(&self.service),
             self.constant_policy,
             self.static_plan_carrier.clone(),
+            Arc::clone(&self.sealed_functions),
         )
         .with_state_store_original(self.state_store.clone());
         match self.rewrite_runtime.as_ref() {
@@ -473,6 +486,7 @@ pub struct MvCommandPorts {
     view_service: Arc<dyn ViewService>,
     system_relations: Arc<SystemTableRegistry>,
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
+    sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     constant_policy: novarocks_functions::ConstantPolicy,
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
@@ -510,11 +524,13 @@ impl MvCommandPorts {
         constant_policy: novarocks_functions::ConstantPolicy,
         view_service: Arc<dyn ViewService>,
         system_relations: Arc<SystemTableRegistry>,
+        sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     ) -> Self {
         Self {
             view_service,
             system_relations,
             functions,
+            sealed_functions,
             constant_policy,
             catalog_service,
             catalog_application,
@@ -544,6 +560,7 @@ pub fn mv_command_executor(ports: MvCommandPorts) -> mv_command::MvCommandExecut
             ports.constant_policy,
             ports.view_service,
             ports.system_relations.clone(),
+            Arc::clone(&ports.sealed_functions),
         );
     mv_command::MvCommandExecutor::new(
         iceberg_ports,
@@ -672,6 +689,7 @@ pub(crate) struct MvRefreshProviderActivationPorts {
     view_service: Arc<dyn ViewService>,
     system_relations: Arc<SystemTableRegistry>,
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
+    sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     constant_policy: novarocks_functions::ConstantPolicy,
     static_plan_carrier: CompiledPackageCarrier,
     catalog_service: Arc<QueryCatalogService>,
@@ -711,11 +729,13 @@ impl MvRefreshProviderActivationPorts {
         static_plan_carrier: CompiledPackageCarrier,
         view_service: Arc<dyn ViewService>,
         system_relations: Arc<SystemTableRegistry>,
+        sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     ) -> Self {
         Self {
             view_service,
             system_relations,
             functions,
+            sealed_functions,
             constant_policy,
             static_plan_carrier,
             catalog_service,
@@ -749,6 +769,7 @@ pub(crate) fn mv_refresh_provider_activation(
         ports.exchange_port,
         ports.constant_policy,
         ports.static_plan_carrier,
+        Arc::clone(&ports.sealed_functions),
     );
     let mv_ports =
         crate::mv::domain::iceberg_refresh::IcebergMvCorePorts::new_with_management_entrance(
@@ -763,6 +784,7 @@ pub(crate) fn mv_refresh_provider_activation(
             ports.constant_policy,
             ports.view_service,
             ports.system_relations.clone(),
+            ports.sealed_functions,
         );
     Arc::new(
         crate::query_execution::mv_assembly::iceberg_activation::IcebergMvRefreshProviderActivation::new(
@@ -789,6 +811,7 @@ pub(crate) struct MvBackgroundPorts {
     view_service: Arc<dyn ViewService>,
     system_relations: Arc<SystemTableRegistry>,
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
+    sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     constant_policy: novarocks_functions::ConstantPolicy,
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
@@ -810,11 +833,13 @@ impl MvBackgroundPorts {
         constant_policy: novarocks_functions::ConstantPolicy,
         view_service: Arc<dyn ViewService>,
         system_relations: Arc<SystemTableRegistry>,
+        sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     ) -> Self {
         Self {
             view_service,
             system_relations,
             functions,
+            sealed_functions,
             constant_policy,
             catalog_service,
             catalog_application,
@@ -846,6 +871,7 @@ impl MvBackgroundPorts {
             self.constant_policy,
             self.view_service,
             self.system_relations.clone(),
+            self.sealed_functions,
         )
     }
 }

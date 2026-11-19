@@ -808,6 +808,7 @@ mod tests {
                 None,
                 semantics,
                 crate::functions::test_function_catalog_snapshot(),
+                novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
                 false,
                 crate::constant::test_constant_policy(),
                 &crate::compiler::SqlCompileControl::unbounded(),

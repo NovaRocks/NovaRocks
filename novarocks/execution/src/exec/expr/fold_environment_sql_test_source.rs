@@ -29,18 +29,21 @@ pub(super) fn optimize(sql: &str, max_len: Option<i64>) -> Result<(), SqlCompile
         source_session.sql_semantics = source_session.sql_semantics.with_group_concat_max_len(raw);
     }
     let control = SqlCompileControl::unbounded();
-    let analyzed = SqlCompiler::analyze(SqlAnalyzeRequest::new(
-        SqlStatementInput::parsed_query(crate::exec::expr::test_support::parse_query(sql)),
-        SqlCompileIntent::Query,
-        source_session,
-        SqlPlanningEnvironment::Distributed,
-        &tables,
-        builtin_sql_function_catalog(),
-        &EVALUATOR,
-        None,
-        super::test_support::constant_policy(),
-        control.clone(),
-    ))?
+    let analyzed = SqlCompiler::analyze(
+        SqlAnalyzeRequest::new(
+            SqlStatementInput::parsed_query(crate::exec::expr::test_support::parse_query(sql)),
+            SqlCompileIntent::Query,
+            source_session,
+            SqlPlanningEnvironment::Distributed,
+            &tables,
+            builtin_sql_function_catalog(),
+            novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
+            None,
+            super::test_support::constant_policy(),
+            control.clone(),
+        )
+        .with_legacy_fold_evaluator(&EVALUATOR),
+    )?
     .into_pending()?;
     let statistics = novarocks_sql::planning::dml::DmlStatisticsSnapshot::empty();
     SqlCompiler::optimize(SqlOptimizeRequest::new(analyzed, &statistics, control))?;

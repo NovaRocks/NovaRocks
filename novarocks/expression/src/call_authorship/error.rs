@@ -18,13 +18,13 @@
 //! Display text matches the SQL package-semantics strings this author replaces.
 //! SQL maps each variant back to that category and embeds this text.
 
+use arrow::datatypes::DataType;
 use novarocks_constant_contract::ConstantError;
 use novarocks_failure_contract::SharedFailureCause;
 use novarocks_functions::{
     ArithmeticPrepareError, CastPrepareError, ComparisonPrepareError, FunctionBindingError,
     FunctionSpecializationFailure, KernelFailure,
 };
-use arrow::datatypes::DataType;
 use novarocks_type_contract::{CompileControlError, ValueTypeError};
 use std::fmt;
 
@@ -100,9 +100,7 @@ fn control_specialization(
     match error {
         FunctionSpecializationFailure::Control(error)
         | FunctionSpecializationFailure::Binding(FunctionBindingError::Control(error))
-        | FunctionSpecializationFailure::Kernel(KernelFailure::CompileControl(error)) => {
-            Ok(error)
-        }
+        | FunctionSpecializationFailure::Kernel(KernelFailure::CompileControl(error)) => Ok(error),
         FunctionSpecializationFailure::Kernel(KernelFailure::Cancelled) => {
             Ok(CompileControlError::Cancelled)
         }
@@ -146,15 +144,14 @@ pub(crate) fn cast_author_error(
         | CastPrepareError::Kernel(KernelFailure::CompileControl(cause)) => {
             CallAuthorError::Control(cause)
         }
-        CastPrepareError::Unsupported => primitive(SharedFailureCause::new(error), Some((from, to))),
+        CastPrepareError::Unsupported => {
+            primitive(SharedFailureCause::new(error), Some((from, to)))
+        }
         other => primitive(SharedFailureCause::new(other), None),
     }
 }
 
-fn primitive(
-    source: SharedFailureCause,
-    cast: Option<(DataType, DataType)>,
-) -> CallAuthorError {
+fn primitive(source: SharedFailureCause, cast: Option<(DataType, DataType)>) -> CallAuthorError {
     CallAuthorError::Capability(CapabilityRefusal::Primitive { source, cast })
 }
 

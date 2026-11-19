@@ -25,7 +25,8 @@ mod compiler;
 pub use compiler::{ExprCompileError, ExprCompileFailure};
 mod call_authorship;
 pub use call_authorship::{
-    CallAuthorError, CallAuthorInputs, UnitCallAuthorship, author_call_controls, author_unit_calls,
+    CallAuthorError, CallAuthorInputs, CapabilityRefusal, InvariantRefusal, UnitCallAuthorship,
+    author_call_controls, author_unit_calls,
 };
 mod original_requests;
 mod primitives;

@@ -120,6 +120,7 @@ fn finish(expression: TypedExpr) -> SqlAuthoredPhysicalPlan {
         version(),
         dop(),
         crate::functions::builtin_sql_function_catalog().snapshot(),
+        novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
         false,
         policy(),
         &control,
@@ -357,6 +358,7 @@ fn conversion_journal_identity_and_null_fastpaths_have_no_phantom_source() {
         dop(),
         None,
         crate::functions::builtin_sql_function_catalog().snapshot(),
+        novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
         false,
         policy(),
         &control,
@@ -409,6 +411,7 @@ fn conversion_journal_lambda_scope_matches_the_actual_intermediate_emission() {
         dop(),
         None,
         crate::functions::builtin_sql_function_catalog().snapshot(),
+        novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
         false,
         policy(),
         &control,
@@ -524,6 +527,7 @@ fn conversion_emission_capture_and_record_stop_at_every_actual_control_refusal()
             version(),
             dop(),
             functions.clone(),
+            novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
             false,
             policy(),
             &control
@@ -542,7 +546,7 @@ fn conversion_emission_capture_and_record_stop_at_every_actual_control_refusal()
                 ..Control::default()
             };
             assert!(
-                matches!(lower_final_physical_plan(&source,version(),dop(),functions.clone(),false,policy(),&control),
+                matches!(lower_final_physical_plan(&source,version(),dop(),functions.clone(),novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(), false,policy(),&control),
             Err(ContractLoweringError::Control(actual)) if actual==cause)
             );
             assert_eq!(control.trace(), trace[..=stop]);

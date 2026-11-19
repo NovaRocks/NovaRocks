@@ -105,7 +105,6 @@ async fn original_literal_completed_plan(
         DEFAULT_COMPLETION_LIMITS, SessionOptimizerSettings, SqlCompileControl, SqlCompileIntent,
         SqlFactBatch, SqlFinalPlanCompileRequest, SqlNeedBatch, SqlPlanningEnvironment,
         SqlSessionContext, SqlStatementInput, builtin_sql_function_catalog,
-        noop_constant_evaluator,
     };
     struct LiteralSqlComponentFacts;
     #[async_trait::async_trait]
@@ -137,7 +136,7 @@ async fn original_literal_completed_plan(
         },
         SqlPlanningEnvironment::Distributed,
         builtin_sql_function_catalog().snapshot(),
-        noop_constant_evaluator(),
+        novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
         crate::application::test_constant_policy(),
         SqlCompileControl::unbounded(),
         PipelineDopDomain {

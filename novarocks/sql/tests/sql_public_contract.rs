@@ -123,7 +123,7 @@ fn external_sql_contract_analyzes_and_optimizes_query() {
             SqlPlanningEnvironment::Distributed,
             &catalog,
             functions,
-            novarocks_sql::compiler::noop_constant_evaluator(),
+            novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
             None,
             novarocks_constant_contract::ConstantPolicy {
                 max_rows: 4096,

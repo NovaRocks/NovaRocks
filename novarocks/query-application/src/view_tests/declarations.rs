@@ -291,7 +291,6 @@ pub(super) fn analyze_snapshot_query(
     use novarocks_sql::compiler::{
         SessionOptimizerSettings, SqlAnalyzeRequest, SqlCompileIntent, SqlCompiler,
         SqlPlanningEnvironment, SqlSessionContext, SqlStatementInput, builtin_sql_function_catalog,
-        noop_constant_evaluator,
     };
     let (catalog, _) = capture_snapshot_query(snapshot, sql, database)?;
     SqlCompiler::analyze(SqlAnalyzeRequest::new(
@@ -306,7 +305,7 @@ pub(super) fn analyze_snapshot_query(
         SqlPlanningEnvironment::Distributed,
         &catalog,
         builtin_sql_function_catalog(),
-        noop_constant_evaluator(),
+        novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
         None,
         crate::completed_plan_fixture::test_constant_policy(),
         SqlCompileControl::unbounded(),

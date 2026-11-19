@@ -300,7 +300,14 @@ pub fn fixture(shape: FilterShape) -> Fixture {
     .unwrap();
     register_call_requests(&mut draft, &authors, &mut constants);
     let mut work = CompileCheckpoints::try_new(&HarnessControl, CompilePhase::Validate).unwrap();
-    declare_call_controls(&mut draft, &catalog, &constants, &parameters, POLICY, &mut work);
+    declare_call_controls(
+        &mut draft,
+        &catalog,
+        &constants,
+        &parameters,
+        POLICY,
+        &mut work,
+    );
     let sealed = draft.seal(vec![port], &mut work).unwrap();
     let unit = finish_unit(
         &catalog,

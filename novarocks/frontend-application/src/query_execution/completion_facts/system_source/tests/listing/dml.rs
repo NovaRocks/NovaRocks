@@ -168,6 +168,7 @@ async fn original_insert_and_ctas_completion_install_system_snapshots_before_wri
             .analyze(
                 &[],
                 &functions,
+                novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
                 crate::query_execution::constant_eval::constant_evaluator(),
                 policy,
             )

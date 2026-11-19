@@ -4015,7 +4015,7 @@ mod tests {
         ProviderReadProperties, ProviderReadRequestBinding, SessionOptimizerSettings,
         SqlCompilation, SqlCompileControl, SqlCompileIntent, SqlCompileProgress, SqlCompiler,
         SqlFactBatch, SqlFinalPlanCompileRequest, SqlPlanningEnvironment, SqlSessionContext,
-        SqlStatementInput, StatisticsFact, builtin_sql_function_catalog, noop_constant_evaluator,
+        SqlStatementInput, StatisticsFact, builtin_sql_function_catalog,
     };
     use crate::planner::table::{
         ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity, SqlTableVersionSelector, TableDef,
@@ -4042,7 +4042,7 @@ mod tests {
             },
             SqlPlanningEnvironment::Distributed,
             builtin_sql_function_catalog().snapshot(),
-            noop_constant_evaluator(),
+            novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
             crate::constant::test_constant_policy(),
             SqlCompileControl::unbounded(),
             PipelineDopDomain {

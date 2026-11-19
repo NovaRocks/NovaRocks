@@ -89,7 +89,7 @@ fn compile(score_type: DataType, predicate: &str) -> SqlOptimizedOutput {
         SqlPlanningEnvironment::Distributed,
         &snapshot,
         crate::functions::builtin_sql_function_catalog(),
-        noop_constant_evaluator(),
+        novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
         None,
         crate::constant::test_constant_policy(),
         control.clone(),

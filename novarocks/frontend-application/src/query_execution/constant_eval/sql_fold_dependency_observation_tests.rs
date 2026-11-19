@@ -332,7 +332,7 @@ pub(super) fn compile_with_observer(
         },
         SqlPlanningEnvironment::Distributed,
         builtin_sql_function_catalog().snapshot(),
-        evaluator,
+        novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
         policy(),
         control.clone(),
         PipelineDopDomain {
@@ -345,7 +345,8 @@ pub(super) fn compile_with_observer(
             max_batch_bytes: 1 << 20,
         },
         DEFAULT_COMPLETION_LIMITS,
-    );
+    )
+    .with_legacy_fold_evaluator(evaluator);
     match SqlCompiler::start(request.try_into_completion()?, &control)? {
         SqlCompileProgress::Complete(completed) => Ok(completed.into_plan()),
         SqlCompileProgress::Incomplete(need) => Err(

@@ -28,18 +28,21 @@ pub(super) fn logical(sql: &str, raw_limit: Option<i64>) -> Result<(), SqlCompil
     if let Some(raw) = raw_limit {
         source_session.sql_semantics = source_session.sql_semantics.with_group_concat_max_len(raw);
     }
-    SqlCompiler::analyze(SqlAnalyzeRequest::new(
-        SqlStatementInput::parsed_query(crate::exec::expr::test_support::parse_query(sql)),
-        SqlCompileIntent::LogicalOnly,
-        source_session,
-        SqlPlanningEnvironment::Distributed,
-        &tables,
-        builtin_sql_function_catalog(),
-        &EVALUATOR,
-        None,
-        super::test_support::constant_policy(),
-        SqlCompileControl::unbounded(),
-    ))?
+    SqlCompiler::analyze(
+        SqlAnalyzeRequest::new(
+            SqlStatementInput::parsed_query(crate::exec::expr::test_support::parse_query(sql)),
+            SqlCompileIntent::LogicalOnly,
+            source_session,
+            SqlPlanningEnvironment::Distributed,
+            &tables,
+            builtin_sql_function_catalog(),
+            novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
+            None,
+            super::test_support::constant_policy(),
+            SqlCompileControl::unbounded(),
+        )
+        .with_legacy_fold_evaluator(&EVALUATOR),
+    )?
     .into_complete()?;
     Ok(())
 }

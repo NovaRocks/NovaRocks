@@ -94,6 +94,7 @@ pub(crate) struct OptimizerEnvironment<'a> {
     control: &'a dyn PureCompileControl,
     constant_evaluator: Option<&'static dyn crate::compiler::SqlConstantEvaluator>,
     function_catalog: Arc<dyn crate::compiler::SqlFunctionCatalog>,
+    sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
     root_allow_throw_exception: bool,
     fold_dependency_observer: Option<Arc<dyn crate::compiler::SqlFoldDependencyObserver>>,
@@ -104,6 +105,7 @@ impl<'a> OptimizerEnvironment<'a> {
         settings: &'a options::SessionOptimizerSettings,
         constant_evaluator: Option<&'static dyn crate::compiler::SqlConstantEvaluator>,
         function_catalog: Arc<dyn crate::compiler::SqlFunctionCatalog>,
+        sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
         decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
         root_allow_throw_exception: bool,
         control: &'a dyn PureCompileControl,
@@ -112,6 +114,7 @@ impl<'a> OptimizerEnvironment<'a> {
             settings,
             constant_evaluator,
             function_catalog,
+            sealed_functions,
             decimal_overflow_policy,
             root_allow_throw_exception,
             control,
@@ -207,6 +210,7 @@ pub(crate) fn optimize_with_test_table_statistics(
             settings,
             None,
             crate::functions::test_function_catalog_snapshot(),
+            novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             false,
             test_optimizer_control(),
@@ -241,6 +245,7 @@ pub(crate) fn optimize_with_root_distribution_and_test_table_statistics(
             settings,
             None,
             crate::functions::test_function_catalog_snapshot(),
+            novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             false,
             test_optimizer_control(),
@@ -262,6 +267,7 @@ fn optimize_with_root_property(
         settings: session_settings,
         constant_evaluator,
         function_catalog,
+        sealed_functions,
         decimal_overflow_policy,
         root_allow_throw_exception,
         control,
@@ -300,6 +306,7 @@ fn optimize_with_root_property(
     }
     rewrite_ctx.set_fold_dependency_observer(fold_dependency_observer);
     rewrite_ctx.set_function_catalog(Arc::clone(&function_catalog));
+    rewrite_ctx.set_sealed_functions(Arc::clone(&sealed_functions));
     let arena = Rc::new(RefCell::new(scalar_arena));
     rewrite_ctx.set_scalar_arena(Rc::clone(&arena));
     let rewritten_expr =
@@ -1562,6 +1569,7 @@ mod is_known_rule_name_tests {
                 &crate::optimizer::options::SessionOptimizerSettings::default(),
                 None,
                 crate::functions::test_function_catalog_snapshot(),
+                novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
                 novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 false,
                 test_optimizer_control(),

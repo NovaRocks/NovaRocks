@@ -38,7 +38,9 @@ use novarocks_expression::constant_node::{
 use novarocks_expression::testkit::PassThroughCallHost;
 use novarocks_expression::{CompiledExprSet, StaticExprKind};
 use novarocks_expression_contract::RootOrdinal;
-use novarocks_functions::testkit::installed_builtin_owner_catalogue;
+use novarocks_functions::testkit::{
+    installed_builtin_owner_catalogue, shared_installed_builtin_owner_catalogue,
+};
 use novarocks_functions::{
     CastOperation, ConstantPolicy, ConstantValue, FunctionArgumentType, FunctionValueType,
     KernelEvaluationControl, KernelFailure, PreparedPureKernel, PureEngineFunctionCatalog,
@@ -505,7 +507,7 @@ fn largeint(value: i128) -> ArrayRef {
 
 #[test]
 fn constant_entry_every_family_matches_real_noop_sql_constant_root() {
-    let functions = installed_builtin_owner_catalogue();
+    let functions = shared_installed_builtin_owner_catalogue();
     metadata_cv_source_cross_entry(&functions, false);
     metadata_cv_source_cross_entry(&functions, true);
     let cases: Vec<(&str, Family, bool, Vec<ArrayRef>, ArrayRef)> = vec![
@@ -888,7 +890,7 @@ fn constant_entry_decimal_policy_cross_allow_matrix_matches_independent_row_erro
 
 // The source is a REAL checked CV and enters the actual SQL compiler before
 // package/LocalCompiler/Frame. No frozen call, program, output, or capability is forged.
-fn metadata_cv_source_cross_entry(functions: &PureEngineFunctionCatalog, spare_empty: bool) {
+fn metadata_cv_source_cross_entry(functions: &Arc<PureEngineFunctionCatalog>, spare_empty: bool) {
     use arrow::array::{Int32Array, ListArray};
     use arrow::buffer::{OffsetBuffer, ScalarBuffer};
     use arrow::datatypes::Field;
@@ -896,7 +898,7 @@ fn metadata_cv_source_cross_entry(functions: &PureEngineFunctionCatalog, spare_e
         DEFAULT_COMPLETION_LIMITS, SessionOptimizerSettings, SqlCompileControl, SqlCompileIntent,
         SqlCompileProgress, SqlCompiler, SqlConstantExpressionSite, SqlExpressionConstant,
         SqlFinalPlanCompileRequest, SqlPlanningEnvironment, SqlSessionContext, SqlStatementInput,
-        builtin_sql_function_catalog, noop_constant_evaluator,
+        builtin_sql_function_catalog,
     };
     let metadata = if spare_empty {
         let mut staging = std::collections::HashMap::<String, String>::with_capacity(16);
@@ -962,7 +964,7 @@ fn metadata_cv_source_cross_entry(functions: &PureEngineFunctionCatalog, spare_e
         },
         SqlPlanningEnvironment::Distributed,
         builtin_sql_function_catalog().snapshot(),
-        noop_constant_evaluator(),
+        Arc::clone(functions),
         policy(),
         control.clone(),
         novarocks_physical_plan::PipelineDopDomain {

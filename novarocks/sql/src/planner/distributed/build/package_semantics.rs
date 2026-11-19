@@ -192,6 +192,57 @@ fn constant_limit_from_effects(
     }
 }
 
+/// Category and display of one expression-effects failure, matching `From`.
+/// The author-parity probe borrows the original error instead of consuming it.
+pub(super) fn expression_effects_parity(
+    error: &super::physical_expression_effects::PhysicalExpressionEffectsError,
+) -> (&'static str, String) {
+    use super::physical_call_arguments::PhysicalArgumentError;
+    use super::physical_expression_effects::PhysicalExpressionEffectsError as E;
+    use super::physical_scalar_requests::PhysicalScalarRequestError as S;
+    use novarocks_functions::{
+        ArithmeticPrepareError as A, CastPrepareError as C, ComparisonPrepareError as B,
+        ConstantError, KernelFailure,
+    };
+    use novarocks_physical_plan::ConstantReferenceError;
+    fn limit_text(argument: &PhysicalArgumentError) -> Option<String> {
+        let cause = match argument {
+            PhysicalArgumentError::Constant(cause @ ConstantError::Limit(_))
+            | PhysicalArgumentError::Reference(ConstantReferenceError::Constant(
+                cause @ ConstantError::Limit(_),
+            )) => cause,
+            _ => return None,
+        };
+        Some(format!("constant admission limit: {cause}"))
+    }
+    if let Some(text) = match error {
+        E::Argument(argument) => limit_text(argument),
+        E::Request(S::Argument(argument)) => limit_text(argument),
+        _ => None,
+    } {
+        return ("constant", text);
+    }
+    match error {
+        E::Control(cause)
+        | E::Cast(C::Control(cause) | C::Kernel(KernelFailure::CompileControl(cause)))
+        | E::Arithmetic(A::Control(cause) | A::Kernel(KernelFailure::CompileControl(cause)))
+        | E::Comparison(B::Control(cause) | B::Kernel(KernelFailure::CompileControl(cause))) => {
+            ("control", cause.to_string())
+        }
+        E::UnsupportedCast { source, from, to } => (
+            "primitive",
+            format!("package cast {from:?} to {to:?}: {source}"),
+        ),
+        E::Cast(source) => ("primitive", source.to_string()),
+        E::Arithmetic(source) => ("primitive", source.to_string()),
+        E::Comparison(source) => ("primitive", source.to_string()),
+        other => (
+            "effects",
+            format!("package call effects: Expressions({other:?})"),
+        ),
+    }
+}
+
 impl From<super::physical_expression_effects::PhysicalExpressionEffectsError>
     for PackageSemanticsError
 {

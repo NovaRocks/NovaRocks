@@ -302,11 +302,12 @@ fn optimize(catalog: &TableParentCatalog) -> Result<(), SqlCompileError> {
         SqlPlanningEnvironment::Distributed,
         &tables,
         catalog,
-        &EVALUATOR,
+        novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
         None,
         super::test_support::constant_policy(),
         control.clone(),
-    ))?
+    )
+    .with_legacy_fold_evaluator(&EVALUATOR))?
     .into_pending()?;
     SqlCompiler::optimize(SqlOptimizeRequest::new(
         analyzed,

@@ -30,9 +30,7 @@ use novarocks_physical_plan::{
     FragmentBuilder, FragmentCuts, FragmentPackage, FragmentPackageInput, FragmentSink,
     FrozenFragmentPruning, NodeId, PipelineDopDomain, PlanVersionId, RequiredContracts, ResultPort,
 };
-use novarocks_type_contract::{
-    CompileCheckpoints, CompilePhase, ControlShape, SemanticParameters,
-};
+use novarocks_type_contract::{CompileCheckpoints, CompilePhase, ControlShape, SemanticParameters};
 use std::{collections::BTreeMap, sync::Arc};
 
 pub(crate) fn author(

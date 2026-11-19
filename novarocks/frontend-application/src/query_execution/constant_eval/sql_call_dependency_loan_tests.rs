@@ -43,7 +43,7 @@ fn exact(sql: &str) -> SqlAuthoredPhysicalPlan {
         },
         SqlPlanningEnvironment::Distributed,
         builtin_sql_function_catalog().snapshot(),
-        &DECLINE,
+        novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
         policy(),
         control.clone(),
         PipelineDopDomain {
@@ -56,7 +56,8 @@ fn exact(sql: &str) -> SqlAuthoredPhysicalPlan {
             max_batch_bytes: 1 << 20,
         },
         DEFAULT_COMPLETION_LIMITS,
-    );
+    )
+    .with_legacy_fold_evaluator(&DECLINE);
     match SqlCompiler::start(request.try_into_completion().unwrap(), &control).unwrap() {
         SqlCompileProgress::Complete(completed) => completed.into_plan(),
         SqlCompileProgress::Incomplete(_) => panic!("table-free actual source must complete"),

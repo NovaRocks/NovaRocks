@@ -1716,11 +1716,12 @@ mod tests {
             SqlPlanningEnvironment::Distributed,
             &snapshot,
             &functions,
-            crate::query_execution::constant_eval::constant_evaluator(),
+            novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
             None,
             crate::application::test_constant_policy(),
             SqlCompileControl::unbounded(),
-        );
+        )
+        .with_legacy_fold_evaluator(crate::query_execution::constant_eval::constant_evaluator());
         let request = match assignment {
             Some((ordinal, span)) => {
                 let control = SqlCompileControl::unbounded();

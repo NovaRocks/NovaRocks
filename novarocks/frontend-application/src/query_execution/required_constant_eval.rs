@@ -68,6 +68,11 @@ impl RequiredConstantInterpreter {
         Self { functions, policy }
     }
 
+    /// The same sealed catalogue this interpreter evaluates with.
+    pub fn sealed_functions(&self) -> Arc<PureEngineFunctionCatalog> {
+        Arc::clone(&self.functions)
+    }
+
     pub fn evaluate(
         &self,
         prepared: PreparedRequiredConstant,

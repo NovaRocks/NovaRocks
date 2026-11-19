@@ -58,6 +58,7 @@ pub(crate) trait DmlQueryExecutionKernel:
     + crate::query_execution::planning::statistics::QueryStatisticsResolver
 {
     fn function_catalog(&self) -> &novarocks_functions::EngineFunctionCatalog;
+    fn sealed_functions(&self) -> &std::sync::Arc<novarocks_functions::PureEngineFunctionCatalog>;
     fn constant_policy(&self) -> novarocks_functions::ConstantPolicy;
     /// The static carrier the kernel's composition chose for every plan.
     fn static_plan_carrier(
@@ -68,6 +69,10 @@ pub(crate) trait DmlQueryExecutionKernel:
 impl DmlQueryExecutionKernel for domain::DmlExecutionKernel {
     fn function_catalog(&self) -> &novarocks_functions::EngineFunctionCatalog {
         self.function_catalog().as_ref()
+    }
+
+    fn sealed_functions(&self) -> &std::sync::Arc<novarocks_functions::PureEngineFunctionCatalog> {
+        self.sealed_functions()
     }
 
     fn constant_policy(&self) -> novarocks_functions::ConstantPolicy {
@@ -85,6 +90,10 @@ impl DmlQueryExecutionKernel for domain::DmlExecutionKernel {
 impl DmlQueryExecutionKernel for domain::QueryPreparationKernel {
     fn function_catalog(&self) -> &novarocks_functions::EngineFunctionCatalog {
         self.function_catalog().as_ref()
+    }
+
+    fn sealed_functions(&self) -> &std::sync::Arc<novarocks_functions::PureEngineFunctionCatalog> {
+        self.sealed_functions()
     }
 
     fn constant_policy(&self) -> novarocks_functions::ConstantPolicy {
@@ -1089,6 +1098,7 @@ pub(crate) async fn prepare_query_as_iceberg_write_with_write_session_and_consta
         .analyze(
             &[],
             DmlQueryExecutionKernel::function_catalog(state),
+            Arc::clone(DmlQueryExecutionKernel::sealed_functions(state)),
             crate::query_execution::constant_eval::constant_evaluator(),
             DmlQueryExecutionKernel::constant_policy(state),
         )

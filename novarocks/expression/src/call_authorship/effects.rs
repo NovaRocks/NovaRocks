@@ -26,8 +26,8 @@ use super::error::{
 use super::{CallAuthorInputs, UnitCallAuthorship, scalar_binding_selection};
 use novarocks_constant_contract::{ConstantError, ConstantTableError};
 use novarocks_expression_contract::{
-    BinaryOperator, CallRequestMaterializationError, ExprId, ExprKind, ExprNode, ExpressionCallClaim,
-    SealedUnit, TemporalSourceProjectionError, UnaryOperator,
+    BinaryOperator, CallRequestMaterializationError, ExprId, ExprKind, ExprNode,
+    ExpressionCallClaim, SealedUnit, TemporalSourceProjectionError, UnaryOperator,
 };
 use novarocks_functions::{
     CallArgumentUses, CallEffectInput, PreparedArithmeticRecipe, PreparedCastRecipe,
@@ -104,9 +104,11 @@ fn compose(
                 work.step()?;
                 continue;
             }
-            let source = unit.definition(invocation.definition).ok_or(
-                CallAuthorError::effects_invalid("missing actual definition"),
-            )?;
+            let source =
+                unit.definition(invocation.definition)
+                    .ok_or(CallAuthorError::effects_invalid(
+                        "missing actual definition",
+                    ))?;
             work.step()?;
             let summary = if requests.contains_key(&source.id) {
                 author_call(
@@ -240,8 +242,10 @@ fn materialize_requests<'a>(
     unit: &'a SealedUnit,
     inputs: &CallAuthorInputs<'_>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<BTreeMap<ExprId, novarocks_expression_contract::MaterializedCallRequest<'a>>, CallAuthorError>
-{
+) -> Result<
+    BTreeMap<ExprId, novarocks_expression_contract::MaterializedCallRequest<'a>>,
+    CallAuthorError,
+> {
     let mut requests = BTreeMap::new();
     for source in unit.definitions() {
         if !matches!(source.kind, ExprKind::FunctionCall { .. }) {
@@ -306,9 +310,13 @@ fn author_call(
     let abi = declaration.implementation().abi;
     if !matches!(
         abi,
-        PureKernelAbi::ScalarV1 | PureKernelAbi::ScalarInvocationV1 | PureKernelAbi::ControlIntrinsicV1
+        PureKernelAbi::ScalarV1
+            | PureKernelAbi::ScalarInvocationV1
+            | PureKernelAbi::ControlIntrinsicV1
     ) {
-        return Err(CallAuthorError::effects(format!("Scalar(UnsupportedAbi({abi:?}))")));
+        return Err(CallAuthorError::effects(format!(
+            "Scalar(UnsupportedAbi({abi:?}))"
+        )));
     }
     let selection = scalar_binding_selection(function);
     let selected_control = if abi == PureKernelAbi::ScalarInvocationV1 {
@@ -383,9 +391,9 @@ fn author_call(
     let decimal = *inputs
         .decimal_overflow
         .get(&source.id)
-        .ok_or(CallAuthorError::Invariant(InvariantRefusal::MissingOverflow(
-            source.id,
-        )))?;
+        .ok_or(CallAuthorError::Invariant(
+            InvariantRefusal::MissingOverflow(source.id),
+        ))?;
     let mut argument_uses = Vec::new();
     let mut source_channels = Vec::new();
     let mut children = ScopedExpressionEffects::pure_value(invocation.context);
@@ -410,9 +418,12 @@ fn author_call(
                     "ordered scalar argument use has a different source definition",
                 ));
             }
-            let effects = summaries.get(&child_id).copied().ok_or(
-                CallAuthorError::effects(format!("Scalar(MissingChildEffects({child_id:?}))")),
-            )?;
+            let effects = summaries
+                .get(&child_id)
+                .copied()
+                .ok_or(CallAuthorError::effects(format!(
+                    "Scalar(MissingChildEffects({child_id:?}))"
+                )))?;
             children = children
                 .join_control_argument(effects, flow, ordinal)
                 .map_err(|error| CallAuthorError::effects(format!("Effects({error:?})")))?;
@@ -504,7 +515,10 @@ fn author_call(
             "scalar invocation has repeated call claims",
         ));
     }
-    Ok(ScopedExpressionEffects::primitive(invocation.context, effects))
+    Ok(ScopedExpressionEffects::primitive(
+        invocation.context,
+        effects,
+    ))
 }
 
 fn source_facts(
@@ -527,7 +541,9 @@ fn source_facts(
             work,
         ) {
             Ok(source) => Ok((Some(source), None)),
-            Err(TemporalSourceProjectionError::Control(cause)) => Err(CallAuthorError::Control(cause)),
+            Err(TemporalSourceProjectionError::Control(cause)) => {
+                Err(CallAuthorError::Control(cause))
+            }
             Err(TemporalSourceProjectionError::Invalid(message)) => {
                 Err(CallAuthorError::scalar_invalid(message))
             }
@@ -540,7 +556,9 @@ fn source_facts(
             work,
         ) {
             Ok(source) => Ok((None, Some(source))),
-            Err(TemporalSourceProjectionError::Control(cause)) => Err(CallAuthorError::Control(cause)),
+            Err(TemporalSourceProjectionError::Control(cause)) => {
+                Err(CallAuthorError::Control(cause))
+            }
             Err(TemporalSourceProjectionError::Invalid(message)) => {
                 Err(CallAuthorError::scalar_invalid(message))
             }
@@ -561,18 +579,26 @@ fn author_primitive(
     let flow = unit.control_flow();
     let mut next = 0;
     source.kind.invocation_references_observed(|definition| {
-        let child = invocation.arguments.get(next).copied().ok_or(
-            CallAuthorError::effects_invalid("source argument has no actual invocation edge"),
-        )?;
+        let child =
+            invocation
+                .arguments
+                .get(next)
+                .copied()
+                .ok_or(CallAuthorError::effects_invalid(
+                    "source argument has no actual invocation edge",
+                ))?;
         let child_use = flow.uses().get(&child);
         if child_use.is_none_or(|use_| use_.definition != definition) {
             return Err(CallAuthorError::effects_invalid(
                 "source and actual argument order differ",
             ));
         }
-        let effects = summaries.get(&child).copied().ok_or(CallAuthorError::effects_invalid(
-            "actual child effects were not authored",
-        ))?;
+        let effects = summaries
+            .get(&child)
+            .copied()
+            .ok_or(CallAuthorError::effects_invalid(
+                "actual child effects were not authored",
+            ))?;
         summary = summary
             .join_control_argument(effects, flow, next)
             .map_err(|error| CallAuthorError::effects(format!("Effects({error:?})")))?;
@@ -595,16 +621,14 @@ fn own_effects(
     context: ExpressionEffectContext,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<ScopedExpressionEffects, CallAuthorError> {
-    let allow = |reference, parameters: &SemanticParameters| {
-        match parameters
-            .require(reference)
-            .map_err(|error| CallAuthorError::effects(format!("Parameter({error:?})")))?
-        {
-            SemanticParameterValue::AllowThrowException(value) => Ok(*value),
-            _ => Err(CallAuthorError::effects_invalid(
-                "primitive parameter is not ALLOW_THROW_EXCEPTION",
-            )),
-        }
+    let allow = |reference, parameters: &SemanticParameters| match parameters
+        .require(reference)
+        .map_err(|error| CallAuthorError::effects(format!("Parameter({error:?})")))?
+    {
+        SemanticParameterValue::AllowThrowException(value) => Ok(*value),
+        _ => Err(CallAuthorError::effects_invalid(
+            "primitive parameter is not ALLOW_THROW_EXCEPTION",
+        )),
     };
     work.step()?;
     Ok(match &source.kind {
@@ -762,12 +786,18 @@ fn own_effects(
                 .map_err(arithmetic_author_error)?;
                 recipe.own_effects(context)
             } else if let Some(operator) = op.comparison_operator() {
-                let recipe = PreparedComparisonRecipe::try_new(operator, &left.ty, &right.ty, work.control())
-                    .map_err(comparison_author_error)?;
+                let recipe = PreparedComparisonRecipe::try_new(
+                    operator,
+                    &left.ty,
+                    &right.ty,
+                    work.control(),
+                )
+                .map_err(comparison_author_error)?;
                 recipe.own_effects(context)
             } else if *op == BinaryOperator::EqForNull {
-                let recipe = PreparedNullSafeComparisonRecipe::try_new(&left.ty, &right.ty, work.control())
-                    .map_err(comparison_author_error)?;
+                let recipe =
+                    PreparedNullSafeComparisonRecipe::try_new(&left.ty, &right.ty, work.control())
+                        .map_err(comparison_author_error)?;
                 recipe.own_effects(context)
             } else {
                 return Err(CallAuthorError::effects(format!(
@@ -797,14 +827,17 @@ fn expression_kind_label(kind: &ExprKind) -> String {
 }
 
 fn definition<'a>(unit: &'a SealedUnit, id: ExprId) -> Result<&'a ExprNode, CallAuthorError> {
-    unit.definition(id)
-        .ok_or(CallAuthorError::effects_invalid("missing primitive operand"))
+    unit.definition(id).ok_or(CallAuthorError::effects_invalid(
+        "missing primitive operand",
+    ))
 }
 
 fn table_error(error: ConstantTableError) -> CallAuthorError {
     match error {
         ConstantTableError::Control(cause)
-        | ConstantTableError::Constant(ConstantError::Control(cause)) => CallAuthorError::Control(cause),
+        | ConstantTableError::Constant(ConstantError::Control(cause)) => {
+            CallAuthorError::Control(cause)
+        }
         ConstantTableError::Constant(limit @ ConstantError::Limit(_)) => {
             CallAuthorError::Capability(super::error::CapabilityRefusal::ConstantLimit(limit))
         }

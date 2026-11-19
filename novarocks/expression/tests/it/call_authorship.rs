@@ -61,9 +61,7 @@ fn upper_call_is_eager_and_carries_no_source_fact() {
     });
     let input = ValueId::new(1);
     let ty = utf8();
-    let argument = draft
-        .add(None, ty.clone(), ExprKind::Value(input))
-        .unwrap();
+    let argument = draft.add(None, ty.clone(), ExprKind::Value(input)).unwrap();
     let owner = ClaimAuthor::with_exact_eager_binding(
         &functions,
         "upper",
@@ -110,7 +108,10 @@ fn upper_call_is_eager_and_carries_no_source_fact() {
     let authored = author_unit_calls(&sealed, &inputs, &mut work).unwrap();
     assert_eq!(authored.claims.len(), 1);
     let claim = authored.claims.values().next().unwrap();
-    assert_eq!(claim.decimal_overflow_policy, DecimalOverflowPolicy::ReportError);
+    assert_eq!(
+        claim.decimal_overflow_policy,
+        DecimalOverflowPolicy::ReportError
+    );
     assert!(claim.regexp_count_pattern_source.is_none());
     assert!(claim.to_base64_byte_source.is_none());
     assert!(claim.temporal_source.is_none());

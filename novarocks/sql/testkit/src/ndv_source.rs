@@ -46,7 +46,7 @@ use novarocks_physical_plan::{PipelineDopDomain, PlanVersionId, ScanReadBudget};
 use novarocks_sql::compiler::{
     DEFAULT_COMPLETION_LIMITS, SessionOptimizerSettings, SqlCompileControl, SqlCompileIntent,
     SqlCompileProgress, SqlCompiler, SqlFinalPlanCompileRequest, SqlPlanningEnvironment,
-    SqlSessionContext, SqlStatementInput, builtin_sql_function_catalog, noop_constant_evaluator,
+    SqlSessionContext, SqlStatementInput, builtin_sql_function_catalog,
 };
 
 pub fn ndv_sql_source(sql: &str) -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
@@ -100,7 +100,7 @@ fn sql_source_with_columns_and_semantics(
         },
         SqlPlanningEnvironment::Distributed,
         builtin_sql_function_catalog().snapshot(),
-        noop_constant_evaluator(),
+        novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
         // Explicit fixture admission; neither capacity grant nor defaults.
         ConstantPolicy {
             max_rows: 64,

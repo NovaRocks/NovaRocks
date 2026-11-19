@@ -8829,7 +8829,6 @@ pub(crate) mod tests {
             DEFAULT_COMPLETION_LIMITS, SessionOptimizerSettings, SqlCompileControl,
             SqlCompileIntent, SqlCompiler, SqlFinalPlanCompileRequest, SqlPlanningEnvironment,
             SqlSessionContext, SqlStatementInput, builtin_sql_function_catalog,
-            noop_constant_evaluator,
         };
         use novarocks_task_codec::creation::decode_task_assignment;
         use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
@@ -9456,7 +9455,7 @@ pub(crate) mod tests {
                 },
                 SqlPlanningEnvironment::Distributed,
                 builtin_sql_function_catalog().snapshot(),
-                noop_constant_evaluator(),
+                novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
                 constants(),
                 SqlCompileControl::unbounded(),
                 PipelineDopDomain {

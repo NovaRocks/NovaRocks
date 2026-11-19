@@ -165,6 +165,7 @@ impl FrontendQueryCompiler {
                 .logical_finish(LogicalFinishInput {
                     logical,
                     functions,
+                    sealed_functions: self.sealed_functions(),
                     evaluator: crate::query_execution::constant_eval::constant_evaluator(),
                     policy: self.constant_policy(),
                     environment: SqlPlanningEnvironment::Distributed,
@@ -212,13 +213,14 @@ impl FrontendQueryCompiler {
         let request: Result<
             novarocks_sql::compiler::SqlFinalPlanCompileRequest,
             FrontendQueryCompilerError,
-        > = (|| {
-            let connector_context = connector_planning_context.request();
-            let bindings = Arc::new(
-                crate::catalog_application::query_bindings::QueryTableBindingStore::try_new()
-                    .expect("query table binding scope allocation must not fail"),
-            );
-            crate::query_execution::completion_facts::install_frontend_fact_source(
+        > =
+            (|| {
+                let connector_context = connector_planning_context.request();
+                let bindings = Arc::new(
+                    crate::catalog_application::query_bindings::QueryTableBindingStore::try_new()
+                        .expect("query table binding scope allocation must not fail"),
+                );
+                crate::query_execution::completion_facts::install_frontend_fact_source(
                 provider_source,
                 self.completion_fact_owners(),
                 crate::query_execution::completion_facts::StatementFactScope::governed_read_io_in(
@@ -244,29 +246,32 @@ impl FrontendQueryCompiler {
                     .map_err(FrontendQueryCompilerError::Engine)?,
             )
             .map_err(FrontendQueryCompilerError::Engine)?;
-            Ok(novarocks_sql::compiler::SqlFinalPlanCompileRequest::new(
-                crate::query_execution::physical_encoding::mint_plan_version(),
-                SqlStatementInput::parsed_query(Box::new(query.clone())),
-                SqlCompileIntent::Explain {
-                    level,
-                    analyze: false,
-                },
-                SqlSessionContext {
-                    sql_semantics: execution.sql_semantics().clone(),
-                    current_catalog: current_catalog.map(str::to_string),
-                    current_database: current_database.to_string(),
-                    optimizer_settings: execution.optimizer_settings().clone(),
-                },
-                SqlPlanningEnvironment::Distributed,
-                novarocks_sql::compiler::SqlFunctionCatalog::snapshot(self.functions.as_ref()),
-                crate::query_execution::constant_eval::constant_evaluator(),
-                self.constant_policy(),
-                sql_compile_control_from_execution(execution),
-                Self::pipeline_dop_domain(query_options.as_ref())?,
-                Self::scan_read_budget(query_options.as_ref()),
-                novarocks_sql::compiler::DEFAULT_COMPLETION_LIMITS,
-            ))
-        })();
+                Ok(novarocks_sql::compiler::SqlFinalPlanCompileRequest::new(
+                    crate::query_execution::physical_encoding::mint_plan_version(),
+                    SqlStatementInput::parsed_query(Box::new(query.clone())),
+                    SqlCompileIntent::Explain {
+                        level,
+                        analyze: false,
+                    },
+                    SqlSessionContext {
+                        sql_semantics: execution.sql_semantics().clone(),
+                        current_catalog: current_catalog.map(str::to_string),
+                        current_database: current_database.to_string(),
+                        optimizer_settings: execution.optimizer_settings().clone(),
+                    },
+                    SqlPlanningEnvironment::Distributed,
+                    novarocks_sql::compiler::SqlFunctionCatalog::snapshot(self.functions.as_ref()),
+                    self.sealed_functions(),
+                    self.constant_policy(),
+                    sql_compile_control_from_execution(execution),
+                    Self::pipeline_dop_domain(query_options.as_ref())?,
+                    Self::scan_read_budget(query_options.as_ref()),
+                    novarocks_sql::compiler::DEFAULT_COMPLETION_LIMITS,
+                )
+                .with_legacy_fold_evaluator(
+                    crate::query_execution::constant_eval::constant_evaluator(),
+                ))
+            })();
         let request = match request {
             Ok(request) => request,
             Err(error) => return Ok(Err(error)),
@@ -371,12 +376,15 @@ impl FrontendQueryCompiler {
                     },
                     SqlPlanningEnvironment::Distributed,
                     novarocks_sql::compiler::SqlFunctionCatalog::snapshot(self.functions.as_ref()),
-                    crate::query_execution::constant_eval::constant_evaluator(),
+                    self.sealed_functions(),
                     self.constant_policy(),
                     sql_compile_control_from_execution(execution),
                     Self::pipeline_dop_domain(query_options.as_ref())?,
                     Self::scan_read_budget(query_options.as_ref()),
                     novarocks_sql::compiler::DEFAULT_COMPLETION_LIMITS,
+                )
+                .with_legacy_fold_evaluator(
+                    crate::query_execution::constant_eval::constant_evaluator(),
                 ),
                 version,
             ))

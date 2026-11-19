@@ -298,6 +298,7 @@ pub struct SqlMvFirstRefreshAnalyzeContext<'a> {
     pub catalog: &'a dyn crate::compiler::SqlCatalogSnapshot,
     pub functions: &'a dyn crate::compiler::SqlFunctionCatalog,
     pub constant_evaluator: &'static dyn crate::compiler::SqlConstantEvaluator,
+    pub sealed_functions: std::sync::Arc<novarocks_functions::PureEngineFunctionCatalog>,
     pub constant_policy: novarocks_functions::ConstantPolicy,
     pub control: crate::compiler::SqlCompileControl,
     pub sink: crate::planning::dml::DmlWritePlanInput,
@@ -332,11 +333,12 @@ pub fn analyze_mv_first_refresh_connector_write(
         context.environment,
         context.catalog,
         context.functions,
-        context.constant_evaluator,
+        Arc::clone(&context.sealed_functions),
         None,
         context.constant_policy,
         context.control,
-    );
+    )
+    .with_legacy_fold_evaluator(context.constant_evaluator);
     let analyzed = crate::compiler::SqlCompiler::analyze(request)?.into_pending()?;
     Ok(SqlMvFirstRefreshAnalyzed {
         analyzed,
@@ -403,6 +405,7 @@ pub struct SqlMvJoinFirstRefreshAnalyzeContext<'a> {
     pub catalog: &'a dyn crate::compiler::SqlCatalogSnapshot,
     pub functions: &'a dyn crate::compiler::SqlFunctionCatalog,
     pub constant_evaluator: &'static dyn crate::compiler::SqlConstantEvaluator,
+    pub sealed_functions: std::sync::Arc<novarocks_functions::PureEngineFunctionCatalog>,
     pub constant_policy: novarocks_functions::ConstantPolicy,
     pub control: crate::compiler::SqlCompileControl,
     pub sink: crate::planning::dml::DmlWritePlanInput,
@@ -453,6 +456,7 @@ pub fn analyze_join_first_refresh_connector_write(
         context.environment,
         context.catalog,
         functions,
+        Arc::clone(&context.sealed_functions),
         context.constant_evaluator,
         sql_semantics.clone(),
         context.constant_policy,
@@ -494,6 +498,7 @@ pub fn analyze_join_first_refresh_connector_write(
             optimizer_settings: context.optimizer_settings,
         },
         context.environment,
+        Arc::clone(&context.sealed_functions),
         Some(context.constant_evaluator),
         context.constant_policy,
         context.control,
@@ -605,6 +610,7 @@ pub struct SqlMvJoinIncrementalRefreshAnalyzeContext<'a> {
     pub catalog: &'a dyn crate::compiler::SqlCatalogSnapshot,
     pub functions: &'a dyn crate::compiler::SqlFunctionCatalog,
     pub constant_evaluator: &'static dyn crate::compiler::SqlConstantEvaluator,
+    pub sealed_functions: std::sync::Arc<novarocks_functions::PureEngineFunctionCatalog>,
     pub constant_policy: novarocks_functions::ConstantPolicy,
     pub control: crate::compiler::SqlCompileControl,
 }
@@ -653,6 +659,7 @@ pub fn analyze_join_incremental_refresh_change_stream(
         context.environment,
         context.catalog,
         functions,
+        Arc::clone(&context.sealed_functions),
         context.constant_evaluator,
         sql_semantics.clone(),
         context.constant_policy,
@@ -699,6 +706,7 @@ pub fn analyze_join_incremental_refresh_change_stream(
             optimizer_settings: crate::planning::dml::dml_change_stream_optimizer_settings(),
         },
         crate::compiler::SqlPlanningEnvironment::NotApplicable,
+        Arc::clone(&context.sealed_functions),
         Some(context.constant_evaluator),
         context.constant_policy,
         context.control,
@@ -755,6 +763,7 @@ pub fn compile_final_join_incremental_refresh_change_stream(
         statistics_targets,
         effect_output_ordinal,
         function_catalog,
+        compiled.sealed_functions,
         crate::planning::dml::DmlFinalChangeStreamSealContext {
             pre_expand_keyed_assert: None,
             shape,
@@ -813,6 +822,7 @@ pub fn begin_final_join_incremental_refresh_change_stream(
         statistics_targets,
         effect_output_ordinal,
         compiled.function_catalog,
+        compiled.sealed_functions,
         None,
         shape,
         decimal_overflow_policy,
@@ -837,6 +847,7 @@ pub struct SqlMvIncrementalRefreshAnalyzeContext<'a> {
     pub catalog: &'a dyn crate::compiler::SqlCatalogSnapshot,
     pub functions: &'a dyn crate::compiler::SqlFunctionCatalog,
     pub constant_evaluator: &'static dyn crate::compiler::SqlConstantEvaluator,
+    pub sealed_functions: std::sync::Arc<novarocks_functions::PureEngineFunctionCatalog>,
     pub constant_policy: novarocks_functions::ConstantPolicy,
     pub control: crate::compiler::SqlCompileControl,
 }
@@ -882,6 +893,7 @@ pub fn analyze_mv_incremental_refresh_change_stream(
         context.environment,
         context.catalog,
         context.functions,
+        Arc::clone(&context.sealed_functions),
         context.constant_evaluator,
         context.constant_policy,
         context.control,
@@ -931,6 +943,7 @@ pub fn compile_final_mv_incremental_refresh_change_stream(
         statistics_targets,
         effect_output_ordinal,
         function_catalog,
+        compiled.sealed_functions,
         crate::planning::dml::DmlFinalChangeStreamSealContext {
             pre_expand_keyed_assert: None,
             shape,
@@ -984,6 +997,7 @@ pub fn begin_final_mv_incremental_refresh_change_stream(
         statistics_targets,
         effect_output_ordinal,
         compiled.function_catalog,
+        compiled.sealed_functions,
         None,
         shape,
         decimal_overflow_policy,
@@ -1001,6 +1015,7 @@ fn canonical_incremental_change_stream_request<'a>(
     environment: crate::compiler::SqlPlanningEnvironment,
     catalog: &'a dyn crate::compiler::SqlCatalogSnapshot,
     functions: &'a dyn crate::compiler::SqlFunctionCatalog,
+    sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     constant_evaluator: &'static dyn crate::compiler::SqlConstantEvaluator,
     constant_policy: novarocks_functions::ConstantPolicy,
     control: crate::compiler::SqlCompileControl,
@@ -1017,11 +1032,12 @@ fn canonical_incremental_change_stream_request<'a>(
         environment,
         catalog,
         functions,
-        constant_evaluator,
+        sealed_functions,
         None,
         constant_policy,
         control,
     )
+    .with_legacy_fold_evaluator(constant_evaluator)
     .with_imv_rewrite(imv_rewrite)
 }
 
@@ -1723,6 +1739,7 @@ fn plain_join_first_refresh_logical_request<'a>(
     environment: crate::compiler::SqlPlanningEnvironment,
     catalog: &'a dyn crate::compiler::SqlCatalogSnapshot,
     functions: &'a dyn crate::compiler::SqlFunctionCatalog,
+    sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     constant_evaluator: &'static dyn crate::compiler::SqlConstantEvaluator,
     sql_semantics: crate::sql_mode::SqlSemanticSettings,
     constant_policy: novarocks_functions::ConstantPolicy,
@@ -1740,11 +1757,12 @@ fn plain_join_first_refresh_logical_request<'a>(
         environment,
         catalog,
         functions,
-        constant_evaluator,
+        sealed_functions,
         None,
         constant_policy,
         control,
     )
+    .with_legacy_fold_evaluator(constant_evaluator)
 }
 
 fn build_join_first_refresh_append_logical_plan(
@@ -3276,6 +3294,7 @@ mod tests {
             crate::compiler::SqlPlanningEnvironment::Distributed,
             &catalog,
             &functions,
+            novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
             crate::compiler::noop_constant_evaluator(),
             crate::sql_mode::SqlSemanticSettings::default(),
             crate::constant::test_constant_policy(),
@@ -3303,6 +3322,7 @@ mod tests {
             crate::compiler::SqlPlanningEnvironment::Distributed,
             &catalog,
             &functions,
+            novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
             crate::compiler::noop_constant_evaluator(),
             crate::sql_mode::SqlSemanticSettings::default(),
             crate::constant::test_constant_policy(),
@@ -3334,6 +3354,7 @@ mod tests {
             crate::compiler::SqlPlanningEnvironment::Distributed,
             &catalog,
             &functions,
+            novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
             crate::compiler::noop_constant_evaluator(),
             crate::constant::test_constant_policy(),
             crate::compiler::SqlCompileControl::unbounded(),
@@ -3461,6 +3482,8 @@ mod tests {
                     catalog: &catalog,
                     functions: crate::functions::builtin_sql_function_catalog(),
                     constant_evaluator: crate::compiler::noop_constant_evaluator(),
+                    sealed_functions:
+                        novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
                     constant_policy: crate::constant::test_constant_policy(),
                     control: SqlCompileControl::unbounded(),
                 },
@@ -4478,6 +4501,7 @@ mod tests {
             crate::compiler::SqlPlanningEnvironment::Distributed,
             &catalog,
             functions,
+            novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
             crate::compiler::noop_constant_evaluator(),
             effective.clone(),
             constant_policy,
@@ -4501,6 +4525,7 @@ mod tests {
                 optimizer_settings: crate::planning::dml::dml_change_stream_optimizer_settings(),
             },
             crate::compiler::SqlPlanningEnvironment::NotApplicable,
+            novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
             Some(crate::compiler::noop_constant_evaluator()),
             constant_policy,
             control.clone(),

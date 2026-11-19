@@ -83,23 +83,26 @@ fn analyze(
         )?,
         None => SqlStatementInput::parsed_query(Box::new(query)),
     };
-    SqlCompiler::analyze(SqlAnalyzeRequest::new(
-        statement,
-        SqlCompileIntent::Query,
-        SqlSessionContext {
-            current_catalog: None,
-            current_database: "db".into(),
-            optimizer_settings: SessionOptimizerSettings::default(),
-            sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings::default(),
-        },
-        SqlPlanningEnvironment::Distributed,
-        &snapshot,
-        &functions,
-        crate::query_execution::constant_eval::constant_evaluator(),
-        None,
-        crate::application::test_constant_policy(),
-        control,
-    ))?
+    SqlCompiler::analyze(
+        SqlAnalyzeRequest::new(
+            statement,
+            SqlCompileIntent::Query,
+            SqlSessionContext {
+                current_catalog: None,
+                current_database: "db".into(),
+                optimizer_settings: SessionOptimizerSettings::default(),
+                sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+            },
+            SqlPlanningEnvironment::Distributed,
+            &snapshot,
+            &functions,
+            novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
+            None,
+            crate::application::test_constant_policy(),
+            control,
+        )
+        .with_legacy_fold_evaluator(crate::query_execution::constant_eval::constant_evaluator()),
+    )?
     .into_pending()
     .map(|_| ())
 }

@@ -27,16 +27,16 @@ mod tests;
 
 pub use controls::author_call_controls;
 pub use effects::author_unit_calls;
-pub use error::CallAuthorError;
+pub use error::{CallAuthorError, CapabilityRefusal, InvariantRefusal};
 
 use crate::EvaluationEnvironment;
 use novarocks_constant_contract::ConstantPolicy;
 use novarocks_expression_contract::{BoundFunction, ExprId, ExpressionCallClaim};
-use novarocks_type_contract::{DecimalOverflowPolicy, ExpressionUseId};
 use novarocks_functions::{
     FunctionBindingSelection, FunctionResultType, PureEngineFunctionCatalog,
     ScopedExpressionEffects,
 };
+use novarocks_type_contract::{DecimalOverflowPolicy, ExpressionUseId};
 use std::{collections::BTreeMap, sync::Arc};
 
 /// Neutral inputs shared by both authorship steps. The decimal map is read only

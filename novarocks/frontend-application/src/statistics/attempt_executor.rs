@@ -52,6 +52,7 @@ pub struct StatisticsAttemptExecutorPorts {
         crate::native::data_runtime::FrontendDataRuntime,
     ),
     function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
+    sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     runtime: tokio::runtime::Handle,
 }
 
@@ -67,6 +68,7 @@ impl StatisticsAttemptExecutorPorts {
         runtime: tokio::runtime::Handle,
         constant_policy: novarocks_functions::ConstantPolicy,
         static_plan_carrier: crate::query_execution::package_freeze::CompiledPackageCarrier,
+        sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     ) -> Self {
         Self {
             constant_policy,
@@ -75,6 +77,7 @@ impl StatisticsAttemptExecutorPorts {
             completion,
             execution_runtime,
             function_catalog,
+            sealed_functions,
             runtime,
         }
     }
@@ -851,6 +854,7 @@ async fn prepare_plan(
             completion: ports.completion,
             blocking: &ports.execution_runtime.0,
             functions: ports.function_catalog,
+            sealed_functions: ports.sealed_functions,
             constant_policy: ports.constant_policy,
             static_plan_carrier: ports.static_plan_carrier,
             wake,

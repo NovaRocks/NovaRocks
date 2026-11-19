@@ -25,7 +25,7 @@ use novarocks_query_application::preparation::{
 use novarocks_sql::compiler::{
     DEFAULT_COMPLETION_LIMITS, SessionOptimizerSettings, SqlCompileControl, SqlCompileIntent,
     SqlCompileProgress, SqlCompiler, SqlFinalPlanCompileRequest, SqlPlanningEnvironment,
-    SqlSessionContext, SqlStatementInput, builtin_sql_function_catalog, noop_constant_evaluator,
+    SqlSessionContext, SqlStatementInput, builtin_sql_function_catalog,
 };
 pub(super) fn table_free_sql(sql: &str) -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
     let control = SqlCompileControl::unbounded();
@@ -45,7 +45,7 @@ pub(super) fn table_free_sql(sql: &str) -> novarocks_sql::compiler::SqlAuthoredP
         },
         SqlPlanningEnvironment::Distributed,
         builtin_sql_function_catalog().snapshot(),
-        noop_constant_evaluator(),
+        novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
         // Explicit fixture admission; neither capacity grant nor defaults.
         ConstantPolicy {
             max_rows: 64,

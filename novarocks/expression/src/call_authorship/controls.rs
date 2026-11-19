@@ -74,30 +74,30 @@ pub fn author_call_controls(
                 }
             }
         }
-        let selected_control = if declaration.implementation().abi == PureKernelAbi::ScalarInvocationV1
-        {
-            let request = draft.requests().get(&id).ok_or(CallAuthorError::Invariant(
-                super::error::InvariantRefusal::Source(
-                    "selected invocation demand has no original request",
-                ),
-            ))?;
-            let selection = scalar_binding_selection(function);
-            declaration
-                .selected_argument_control_observed(
-                    &function.function_id,
-                    selection.as_ref(),
-                    request.logical_argument_count,
-                    work.control(),
-                )
-                .map_err(|error| {
-                    CallAuthorError::specialization(
-                        novarocks_functions::FunctionSpecializationFailure::Binding(error),
-                        false,
+        let selected_control =
+            if declaration.implementation().abi == PureKernelAbi::ScalarInvocationV1 {
+                let request = draft.requests().get(&id).ok_or(CallAuthorError::Invariant(
+                    super::error::InvariantRefusal::Source(
+                        "selected invocation demand has no original request",
+                    ),
+                ))?;
+                let selection = scalar_binding_selection(function);
+                declaration
+                    .selected_argument_control_observed(
+                        &function.function_id,
+                        selection.as_ref(),
+                        request.logical_argument_count,
+                        work.control(),
                     )
-                })?
-        } else {
-            declaration.effects().argument_control
-        };
+                    .map_err(|error| {
+                        CallAuthorError::specialization(
+                            novarocks_functions::FunctionSpecializationFailure::Binding(error),
+                            false,
+                        )
+                    })?
+            } else {
+                declaration.effects().argument_control
+            };
         let (shape, temporal_sources) = if let ArgumentControl::TemporalSource(kind) =
             selected_control
         {
@@ -149,7 +149,10 @@ pub fn author_call_controls(
 
 /// Map an installed argument control onto the scalar control shape.
 /// Relational controls are not scalar shapes.
-pub fn installed_scalar_control_shape(control: ArgumentControl, count: usize) -> Option<ControlShape> {
+pub fn installed_scalar_control_shape(
+    control: ArgumentControl,
+    count: usize,
+) -> Option<ControlShape> {
     Some(match control {
         ArgumentControl::Eager => ControlShape::Eager,
         ArgumentControl::TypeOnly => ControlShape::TypeOnly,

@@ -66,7 +66,7 @@ fn public_sql_map_subscript_preserves_largeint_key_identity() {
             },
             SqlPlanningEnvironment::Distributed,
             builtin_sql_function_catalog().snapshot(),
-            noop_constant_evaluator(),
+            novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
             crate::constant::test_constant_policy(),
             SqlCompileControl::unbounded(),
             PipelineDopDomain {
@@ -146,7 +146,7 @@ fn public_sql_empty_map_lookup_keeps_uninhabited_key_and_actual_probe() {
             },
             SqlPlanningEnvironment::Distributed,
             builtin_sql_function_catalog().snapshot(),
-            noop_constant_evaluator(),
+            novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
             crate::constant::test_constant_policy(),
             SqlCompileControl::unbounded(),
             PipelineDopDomain {
@@ -253,7 +253,7 @@ fn public_sql_map_float_probe_keeps_nullable_cast_before_optional_folding() {
             },
             SqlPlanningEnvironment::Distributed,
             builtin_sql_function_catalog().snapshot(),
-            &PROBE,
+            novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
             crate::constant::test_constant_policy(),
             SqlCompileControl::unbounded(),
             PipelineDopDomain {
@@ -266,7 +266,8 @@ fn public_sql_map_float_probe_keeps_nullable_cast_before_optional_folding() {
                 max_batch_bytes: MAX_SCAN_BATCH_BYTES,
             },
             DEFAULT_COMPLETION_LIMITS,
-        );
+        )
+        .with_legacy_fold_evaluator(&PROBE);
         let SqlCompileProgress::Complete(completed) = SqlCompiler::start(
             request.try_into_completion().unwrap(),
             &SqlCompileControl::unbounded(),

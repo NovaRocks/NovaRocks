@@ -151,7 +151,10 @@ impl FrontendRoleProducts {
     /// Starts the two product-owned background domains only after the complete
     /// immutable role graph exists. SQL/session assembly never starts either
     /// worker as a side effect.
-    fn start_background_workers(&self) -> Result<(), FrontendApplicationError> {
+    fn start_background_workers(
+        &self,
+        sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
+    ) -> Result<(), FrontendApplicationError> {
         self.mv_service
             .start_background_workers(core_capabilities::mv_background_bindings(
                 core_capabilities::MvBackgroundPorts::new(
@@ -167,6 +170,7 @@ impl FrontendRoleProducts {
                     self.constant_policy,
                     Arc::clone(&self.view_service),
                     self.system_relations.clone(),
+                    sealed_functions,
                 ),
                 self.mv_execution_services.clone(),
             ))
@@ -393,6 +397,7 @@ async fn build_frontend_role_products(
             host.static_plan_carrier(),
             Arc::clone(&view_service),
             system_relations.clone(),
+            host.required_constant_interpreter().sealed_functions(),
         ),
     );
     let mv_service = Arc::new(
@@ -448,6 +453,7 @@ async fn build_frontend_role_products(
         Handle::current(),
         host.constant_policy(),
         host.static_plan_carrier(),
+        host.required_constant_interpreter().sealed_functions(),
     )
     .with_state_store_original(host.state_store_original_binding())
     .with_rewrite_runtime(crate::query_execution::kernels::MaintenanceRewriteRuntime {
@@ -495,6 +501,7 @@ async fn build_frontend_role_products(
             Handle::current(),
             host.constant_policy(),
             host.static_plan_carrier(),
+            host.required_constant_interpreter().sealed_functions(),
         ),
     );
     let statistics_target_resolver = Arc::new(
@@ -613,6 +620,7 @@ fn build_frontend_query_session_factory_from_role_products(
             host.connector_blocking_io_supervisor(),
             host.constant_policy(),
             host.static_plan_carrier(),
+            host.required_constant_interpreter().sealed_functions(),
         ));
     let session_catalog_resolver =
         core_capabilities::session_catalog_resolver(core_capabilities::SessionCatalogPorts::new(
@@ -667,6 +675,7 @@ fn build_frontend_query_session_factory_from_role_products(
             host.constant_policy(),
             Arc::clone(&view_service),
             products.system_relations.clone(),
+            host.required_constant_interpreter().sealed_functions(),
         ))
         .with_execution_services(products.mv_execution_services.clone());
     let mv_command_consumer: Arc<
@@ -705,6 +714,7 @@ fn build_frontend_query_session_factory_from_role_products(
             host.static_plan_carrier(),
             view_service.clone(),
             products.system_relations.clone(),
+            host.required_constant_interpreter().sealed_functions(),
         )
         .with_state_store_original(host.state_store_original_binding())
         .with_write_runtime(
@@ -766,7 +776,7 @@ async fn build_frontend_query_session_factory(
     let products =
         build_frontend_role_products(host, exchange_port, mv_storage_observation, system_catalog)
             .await?;
-    products.start_background_workers()?;
+    products.start_background_workers(host.required_constant_interpreter().sealed_functions())?;
     let session_factory = build_frontend_query_session_factory_from_role_products(host, &products)?;
     Ok((session_factory, products))
 }
@@ -994,7 +1004,9 @@ where
             return combine_server_and_shutdown(Err(error), stop_result);
         }
     };
-    if let Err(error) = products.start_background_workers() {
+    if let Err(error) =
+        products.start_background_workers(host.required_constant_interpreter().sealed_functions())
+    {
         let product_shutdown = shutdown_frontend_role_products_to_convergence(
             &mut products,
             config.frontend_cleanup_timeout,

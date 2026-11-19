@@ -17,8 +17,7 @@
 
 use super::{
     ClaimAuthor, HarnessControl, add_call, checked_constants, declare_call_controls, finish_unit,
-    try_finish_unit,
-    fixture_scope, register_call_requests, register_constant,
+    fixture_scope, register_call_requests, register_constant, try_finish_unit,
 };
 use crate::{
     CompiledExprSet, EvaluationEnvironment, ExprCompileError, ScopeLayout, ScopeLayouts,
@@ -982,7 +981,8 @@ pub fn build_program(
         constants: source_pools,
         allow,
     }
-    .prepare().unwrap()
+    .prepare()
+    .unwrap()
     .compile(&HarnessControl)
     .unwrap()
 }
@@ -1157,7 +1157,8 @@ pub fn typed_program(
         constants: source_pools,
         allow,
     }
-    .prepare().unwrap()
+    .prepare()
+    .unwrap()
     .compile(&HarnessControl)
     .unwrap()
 }
@@ -1261,7 +1262,8 @@ pub fn inherited_round_fixture_with_target(allow: bool, target: DataType) -> Com
         constants: source_pools,
         allow,
     }
-    .prepare().unwrap()
+    .prepare()
+    .unwrap()
     .compile(&HarnessControl)
     .unwrap()
 }
@@ -1315,7 +1317,8 @@ pub fn narrow_unsigned_constant(narrow: DataType) -> CompiledFixture {
         constants,
         allow: false,
     }
-    .prepare().unwrap()
+    .prepare()
+    .unwrap()
     .compile(&HarnessControl)
     .unwrap()
 }

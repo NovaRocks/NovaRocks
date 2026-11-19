@@ -50,23 +50,26 @@ fn analyze_shaped_query(query: ast::Query) -> Result<(), novarocks_sql::compiler
     let catalog = novarocks_sql::planning::catalog::PlannerMemoryCatalog::default();
     let snapshot = SqlPlannerTableSnapshot::new(&catalog);
     let functions = novarocks_sql::compiler::build_builtin_engine_function_catalog().unwrap();
-    SqlCompiler::analyze(SqlAnalyzeRequest::new(
-        SqlStatementInput::parsed_query(Box::new(query)),
-        SqlCompileIntent::Query,
-        SqlSessionContext {
-            current_catalog: None,
-            current_database: "db".into(),
-            optimizer_settings: SessionOptimizerSettings::default(),
-            sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings::default(),
-        },
-        SqlPlanningEnvironment::Distributed,
-        &snapshot,
-        &functions,
-        crate::query_execution::constant_eval::constant_evaluator(),
-        None,
-        crate::application::test_constant_policy(),
-        SqlCompileControl::unbounded(),
-    ))?
+    SqlCompiler::analyze(
+        SqlAnalyzeRequest::new(
+            SqlStatementInput::parsed_query(Box::new(query)),
+            SqlCompileIntent::Query,
+            SqlSessionContext {
+                current_catalog: None,
+                current_database: "db".into(),
+                optimizer_settings: SessionOptimizerSettings::default(),
+                sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+            },
+            SqlPlanningEnvironment::Distributed,
+            &snapshot,
+            &functions,
+            novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
+            None,
+            crate::application::test_constant_policy(),
+            SqlCompileControl::unbounded(),
+        )
+        .with_legacy_fold_evaluator(crate::query_execution::constant_eval::constant_evaluator()),
+    )?
     .into_pending()
     .map(|_| ())
 }

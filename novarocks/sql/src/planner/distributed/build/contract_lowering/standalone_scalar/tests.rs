@@ -63,7 +63,14 @@ fn emit(
     expression: &TypedExpr,
     control: &dyn PureCompileControl,
 ) -> Result<StandaloneScalarEmission, ContractLoweringError> {
-    lower_required_constant_unit(expression, functions(), false, policy(), control)
+    lower_required_constant_unit(
+        expression,
+        functions(),
+        novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
+        false,
+        policy(),
+        control,
+    )
 }
 fn root(source: &StandaloneScalarEmission) -> &novarocks_expression_contract::ExprNode {
     source
@@ -269,8 +276,14 @@ fn standalone_selected_cv_and_nullability_keep_actual_sources_and_every_control_
     small.max_retained_buffer_bytes = 1;
     let expression = text("an actual over-limit source literal");
     let baseline_control = Control::default();
-    let result =
-        lower_required_constant_unit(&expression, functions(), false, small, &baseline_control);
+    let result = lower_required_constant_unit(
+        &expression,
+        functions(),
+        novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
+        false,
+        small,
+        &baseline_control,
+    );
     let (expected_debug, expected_fact) = match result {
         Err(ContractLoweringError::ConstantSource(source @ ConstantError::Limit(_))) => {
             (format!("{source:?}"), source.failure_fact())
@@ -283,7 +296,14 @@ fn standalone_selected_cv_and_nullability_keep_actual_sources_and_every_control_
             trace: Mutex::new(Vec::new()),
             refusal: Some((baseline.len(), cause.clone())),
         };
-        match lower_required_constant_unit(&expression, functions(), false, small, &control) {
+        match lower_required_constant_unit(
+            &expression,
+            functions(),
+            novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
+            false,
+            small,
+            &control,
+        ) {
             Err(ContractLoweringError::ConstantSource(source @ ConstantError::Limit(_))) => {
                 assert_eq!(format!("{source:?}"), expected_debug);
                 assert_eq!(source.failure_fact(), expected_fact);

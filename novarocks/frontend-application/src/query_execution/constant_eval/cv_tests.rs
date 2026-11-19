@@ -258,7 +258,7 @@ fn capture(
         },
         SqlPlanningEnvironment::Distributed,
         catalog.snapshot(),
-        &RECORDER,
+        novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
         policy(),
         control.clone(),
         PipelineDopDomain {
@@ -272,6 +272,7 @@ fn capture(
         },
         DEFAULT_COMPLETION_LIMITS,
     )
+    .with_legacy_fold_evaluator(&RECORDER)
     .try_into_completion()
     .map_err(SqlCompileProgressError::Compile)
     .and_then(|request| SqlCompiler::start(request, &control))
@@ -654,7 +655,7 @@ fn declines_unmapped_unary_shapes_without_a_fake_kernel() {
         },
         SqlPlanningEnvironment::Distributed,
         catalog.snapshot(),
-        constant_evaluator(),
+        novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
         policy(),
         control.clone(),
         novarocks_physical_plan::PipelineDopDomain {
@@ -668,6 +669,7 @@ fn declines_unmapped_unary_shapes_without_a_fake_kernel() {
         },
         DEFAULT_COMPLETION_LIMITS,
     )
+    .with_legacy_fold_evaluator(constant_evaluator())
     .try_into_completion()
     .map_err(SqlCompileProgressError::Compile)
     .and_then(|request| SqlCompiler::start(request, &control))
@@ -1414,7 +1416,7 @@ fn regexp_count_real_sql_fold_author_attaches_existing_emitted_source_before_err
         },
         SqlPlanningEnvironment::Distributed,
         catalog.snapshot(),
-        &RECORDER,
+        novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
         policy(),
         control.clone(),
         PipelineDopDomain {
@@ -1428,6 +1430,7 @@ fn regexp_count_real_sql_fold_author_attaches_existing_emitted_source_before_err
         },
         DEFAULT_COMPLETION_LIMITS,
     )
+    .with_legacy_fold_evaluator(&RECORDER)
     .try_into_completion()
     .unwrap();
     let owner = SqlCompiler::start(request, &control)

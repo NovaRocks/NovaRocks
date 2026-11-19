@@ -132,6 +132,7 @@ pub struct IcebergMvCorePorts {
     view_service: Arc<dyn novarocks_query_application::view::ViewService>,
     system_relations: Arc<novarocks_query_application::system_tables::SystemTableRegistry>,
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
+    sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     constant_policy: novarocks_functions::ConstantPolicy,
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
@@ -165,11 +166,13 @@ impl IcebergMvCorePorts {
         constant_policy: novarocks_functions::ConstantPolicy,
         view_service: Arc<dyn novarocks_query_application::view::ViewService>,
         system_relations: Arc<novarocks_query_application::system_tables::SystemTableRegistry>,
+        sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     ) -> Self {
         Self {
             view_service,
             system_relations,
             functions,
+            sealed_functions,
             constant_policy,
             catalog_service,
             catalog_application,
@@ -211,6 +214,10 @@ impl IcebergMvCorePorts {
 
     pub(crate) fn function_catalog(&self) -> &Arc<novarocks_functions::EngineFunctionCatalog> {
         &self.functions
+    }
+
+    pub(crate) fn sealed_functions(&self) -> &Arc<novarocks_functions::PureEngineFunctionCatalog> {
+        &self.sealed_functions
     }
 
     pub(crate) fn readiness(&self) -> &Arc<MvReadinessPort> {

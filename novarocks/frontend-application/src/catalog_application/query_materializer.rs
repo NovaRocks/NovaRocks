@@ -1435,7 +1435,7 @@ mod tests {
             SessionOptimizerSettings, SqlCompileControl, SqlCompileIntent, SqlCompileProgress,
             SqlCompiler, SqlFactBatch, SqlFinalPlanCompileRequest, SqlNeedBatch,
             SqlPlanningEnvironment, SqlSessionContext, SqlStatementInput, StatisticsFact,
-            builtin_sql_function_catalog, noop_constant_evaluator,
+            builtin_sql_function_catalog,
         };
         use novarocks_sql::planning::catalog::MetadataTableKind;
         struct FilesLoader {
@@ -1552,7 +1552,7 @@ mod tests {
                     },
                     SqlPlanningEnvironment::Distributed,
                     builtin_sql_function_catalog().snapshot(),
-                    noop_constant_evaluator(),
+                    novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
                     crate::application::test_constant_policy(),
                     control.clone(),
                     novarocks_physical_plan::PipelineDopDomain {

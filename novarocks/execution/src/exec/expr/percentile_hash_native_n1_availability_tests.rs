@@ -115,7 +115,7 @@ fn hash_native_n1_exact_admission_preserves_original_variadic_binding_and_refuse
             session(),
             SqlPlanningEnvironment::Distributed,
             builtin_sql_function_catalog().snapshot(),
-            &EVALUATOR,
+            novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
             super::test_support::constant_policy(),
             SqlCompileControl::unbounded(),
             PipelineDopDomain {
@@ -128,7 +128,8 @@ fn hash_native_n1_exact_admission_preserves_original_variadic_binding_and_refuse
                 max_batch_bytes: 1 << 20,
             },
             DEFAULT_COMPLETION_LIMITS,
-        );
+        )
+        .with_legacy_fold_evaluator(&EVALUATOR);
         let SqlCompileError::Analyze(error) = request
             .try_into_completion()
             .err()

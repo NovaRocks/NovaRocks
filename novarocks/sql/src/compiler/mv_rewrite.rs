@@ -4063,11 +4063,12 @@ mod tests {
                     SqlPlanningEnvironment::Distributed,
                     &snapshot,
                     crate::functions::builtin_sql_function_catalog(),
-                    evaluator,
+                    novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
                     Some(&definitions),
                     crate::constant::test_constant_policy(),
                     control.clone(),
-                );
+                )
+                .with_legacy_fold_evaluator(evaluator);
                 if port_absent {
                     request.constant_evaluator = None;
                 }

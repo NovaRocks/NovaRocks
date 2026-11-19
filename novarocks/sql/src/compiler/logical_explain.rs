@@ -73,6 +73,7 @@ impl SqlLogicalExplainCatalog {
         self,
         facts: &[CatalogRelationFact],
         functions: &dyn SqlFunctionCatalog,
+        sealed_functions: std::sync::Arc<novarocks_functions::PureEngineFunctionCatalog>,
         evaluator: &'static dyn SqlConstantEvaluator,
         policy: novarocks_functions::ConstantPolicy,
         environment: SqlPlanningEnvironment,
@@ -88,11 +89,12 @@ impl SqlLogicalExplainCatalog {
             environment,
             &snapshot,
             functions,
-            evaluator,
+            sealed_functions,
             None,
             policy,
             self.control.clone(),
-        );
+        )
+        .with_legacy_fold_evaluator(evaluator);
         SqlCompiler::analyze(request)?
             .into_complete()?
             .into_explain_lines(level, true, &self.control)
@@ -131,6 +133,7 @@ mod tests {
             .finish(
                 &[],
                 functions,
+                novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
                 super::super::noop_constant_evaluator(),
                 crate::constant::test_constant_policy(),
                 SqlPlanningEnvironment::Distributed,
@@ -146,7 +149,7 @@ mod tests {
             SqlPlanningEnvironment::Distributed,
             &snapshot,
             functions,
-            super::super::noop_constant_evaluator(),
+            novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
             None,
             crate::constant::test_constant_policy(),
             control.clone(),
@@ -175,6 +178,7 @@ mod tests {
                 .finish(
                     &[],
                     functions,
+                    novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
                     super::super::noop_constant_evaluator(),
                     crate::constant::test_constant_policy(),
                     SqlPlanningEnvironment::Distributed,

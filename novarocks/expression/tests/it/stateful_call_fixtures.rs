@@ -183,7 +183,14 @@ fn checked_fixture(
     register_call_requests(&mut draft, authors, &mut constants);
     let parameters = SemanticParameters::try_new([]).unwrap();
     let mut work = CompileCheckpoints::try_new(&HarnessControl, CompilePhase::Validate).unwrap();
-    declare_call_controls(&mut draft, catalogue, &constants, &parameters, POLICY, &mut work);
+    declare_call_controls(
+        &mut draft,
+        catalogue,
+        &constants,
+        &parameters,
+        POLICY,
+        &mut work,
+    );
 
     // The original physical input was the first Project after zero-column
     // Values. Those non-result columns were named local_1_{ordinal}.

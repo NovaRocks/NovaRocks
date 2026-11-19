@@ -629,6 +629,8 @@ pub(super) fn run_with_denied_loan(
             environment: SqlPlanningEnvironment::Distributed,
             catalog: &tables,
             functions: &functions,
+            sealed_functions:
+                novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
             constant_evaluator: noop_constant_evaluator(),
             constant_policy: super::test_support::constant_policy(),
             control: SqlCompileControl::unbounded(),
@@ -645,6 +647,8 @@ pub(super) fn run_with_denied_loan(
             environment: SqlPlanningEnvironment::Distributed,
             catalog: &tables,
             functions: &functions,
+            sealed_functions:
+                novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
             constant_evaluator: noop_constant_evaluator(),
             constant_policy: super::test_support::constant_policy(),
             control: SqlCompileControl::unbounded(),

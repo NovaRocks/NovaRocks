@@ -86,6 +86,7 @@ pub(crate) struct RewriteContext<'a> {
     constant_evaluator: Option<&'static dyn crate::compiler::SqlConstantEvaluator>,
     fold_dependency_observer: Option<Arc<dyn crate::compiler::SqlFoldDependencyObserver>>,
     function_catalog: Option<Arc<dyn crate::compiler::SqlFunctionCatalog>>,
+    sealed_functions: Option<Arc<novarocks_functions::PureEngineFunctionCatalog>>,
 }
 
 impl<'a> RewriteContext<'a> {
@@ -112,6 +113,7 @@ impl<'a> RewriteContext<'a> {
             constant_evaluator: None,
             fold_dependency_observer: None,
             function_catalog: None,
+            sealed_functions: None,
         }
     }
 
@@ -242,6 +244,19 @@ impl<'a> RewriteContext<'a> {
 
     pub(crate) fn column_ref_factory(&self) -> Option<&Rc<RefCell<ColumnRefFactory>>> {
         self.column_ref_factory.as_ref()
+    }
+
+    pub(crate) fn set_sealed_functions(
+        &mut self,
+        functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
+    ) {
+        self.sealed_functions = Some(functions);
+    }
+
+    pub(crate) fn sealed_functions(
+        &self,
+    ) -> Option<&Arc<novarocks_functions::PureEngineFunctionCatalog>> {
+        self.sealed_functions.as_ref()
     }
 
     pub(crate) fn set_constant_evaluator(

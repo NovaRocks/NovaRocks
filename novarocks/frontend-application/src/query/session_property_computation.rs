@@ -106,6 +106,7 @@ impl SessionPropertyCpuInput {
                     catalog: &SqlPlannerTableSnapshot::new(&*catalog),
                     current_database: self.staged.current_database(),
                     functions: self.functions.clone(),
+                    sealed_functions: self.interpreter.sealed_functions(),
                     sql_semantics: self.staged.sql_semantics(),
                     constant_policy: self.policy,
                     control: &self.control,

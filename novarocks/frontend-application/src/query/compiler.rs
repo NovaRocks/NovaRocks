@@ -138,6 +138,7 @@ impl From<String> for FrontendQueryCompilerError {
 #[derive(Clone)]
 pub(crate) struct FrontendQueryCompiler {
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
+    sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     constant_policy: novarocks_functions::ConstantPolicy,
     query: QueryPreparationKernel,
     view: ViewExecutionKernel,
@@ -176,9 +177,11 @@ impl FrontendQueryCompiler {
         mv_storage_observation: Arc<dyn MvStorageObservationPort>,
         connector_blocking_io: crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor,
         constant_policy: novarocks_functions::ConstantPolicy,
+        sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     ) -> Self {
         Self {
             functions,
+            sealed_functions,
             constant_policy,
             query,
             view,
@@ -192,6 +195,10 @@ impl FrontendQueryCompiler {
 
     pub(crate) const fn constant_policy(&self) -> novarocks_functions::ConstantPolicy {
         self.constant_policy
+    }
+
+    pub(crate) fn sealed_functions(&self) -> Arc<novarocks_functions::PureEngineFunctionCatalog> {
+        Arc::clone(&self.sealed_functions)
     }
 
     pub(crate) fn session_property_input(
