@@ -1960,8 +1960,7 @@ mod tests {
 
     #[test]
     fn deferred_no_deadline_is_final_and_a_stopped_fixed_root_cannot_be_armed() {
-        let (control, _joint, _driver) =
-            fixed_control_storage_tests::prototype_profile(4, 1, 1, 1);
+        let (control, _joint, _driver) = fixed_control_storage_tests::prototype_profile(4, 1, 1, 1);
         let admission = control.root_admission();
         let completed = admission
             .begin_query_root_with_deferred_deadline()
