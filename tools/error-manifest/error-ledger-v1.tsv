@@ -35,14 +35,14 @@ sql.admit.invalid_table_procedure_argument	Admit	Active
 sql.admit.invalid_table_procedure_arguments	Admit	Active
 sql.admit.invalid_table_property	Admit	Active
 sql.admit.kill_connection_unsupported	Admit	Deprecated
-sql.admit.kill_denied	Admit	Active
+sql.admit.kill_denied	Admit	Deprecated
 sql.admit.merge_unsupported_form	Admit	Active
 sql.admit.not_in_transaction	Admit	Active
 sql.admit.persisted_definition_semantics_unsupported	Admit	Active
 sql.admit.schema_already_exists	Admit	Active
 sql.admit.session_catalog_not_found	Admit	Active
-sql.admit.session_global_scope_unsupported	Admit	Active
-sql.admit.session_transaction_unsupported	Admit	Active
+sql.admit.session_global_scope_unsupported	Admit	Deprecated
+sql.admit.session_transaction_unsupported	Admit	Deprecated
 sql.admit.table_already_exists	Admit	Active
 sql.admit.table_procedure_not_found	Admit	Active
 sql.admit.unsupported_statement	Admit	Active
@@ -73,7 +73,7 @@ sql.lex.unterminated_comment	Lex	Active
 sql.lex.unterminated_quoted_identifier	Lex	Active
 sql.lex.unterminated_string	Lex	Active
 sql.parse.unexpected_token	Parse	Active
-sql.parse.unsupported_statement	Parse	Active
+sql.parse.unsupported_statement	Parse	Deprecated
 sql.validate.duplicate_cte_name	Validate	Active
 sql.validate.duplicate_window_name	Validate	Active
 sql.validate.invalid_structure	Validate	Active
