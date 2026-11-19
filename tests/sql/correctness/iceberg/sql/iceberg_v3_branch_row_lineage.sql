@@ -75,7 +75,7 @@ SELECT count() AS n_main_rows, count(DISTINCT _row_id) AS n_main_unique
 -- query 5
 -- main is identical to the snap0 tag (no diff in row-lineage triples).
 -- @db=br_rl_${uuid0}.ns_${uuid0}
-SELECT count(*) AS n_main_diverged
+SELECT count() AS n_main_diverged
   FROM (
     SELECT id, _row_id, _last_updated_sequence_number FROM brlineage
     EXCEPT
