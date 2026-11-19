@@ -24,7 +24,8 @@ use crate::scenario::{Scenario, ScenarioContext};
 use anyhow::{Context, Result, ensure};
 use novarocks_cluster_harness::TestClusterOwner;
 
-const TWO_ROW_QUERY: &str = "SELECT v FROM (SELECT 1 AS v UNION ALL SELECT 2) t ORDER BY v";
+const TWO_ROW_QUERY: &str =
+    "SELECT v FROM (SELECT CAST(1 AS BIGINT) AS v UNION ALL SELECT CAST(2 AS BIGINT)) t ORDER BY v";
 
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![Box::new(TypedLayout), Box::new(SingleStatementEffects)]

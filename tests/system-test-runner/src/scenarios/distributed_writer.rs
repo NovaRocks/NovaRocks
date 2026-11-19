@@ -720,7 +720,7 @@ fn writer_partition_values(result: &StatementResult) -> Result<Vec<(String, serd
     let fields = &result.columns[1].type_signature.arguments;
     anyhow::ensure!(
         fields.len() == 2,
-        "evolved partition ROW requires its original p and p_bucket_8 fields"
+        "evolved partition ROW requires its original p and p_bucket fields"
     );
     let names = fields
         .iter()
@@ -736,7 +736,7 @@ fn writer_partition_values(result: &StatementResult) -> Result<Vec<(String, serd
                 .as_str();
             let expected = match name {
                 "p" => "bigint",
-                "p_bucket_8" => "integer",
+                "p_bucket" => "integer",
                 _ => bail!("unexpected evolved partition field {name}"),
             };
             anyhow::ensure!(
@@ -748,7 +748,7 @@ fn writer_partition_values(result: &StatementResult) -> Result<Vec<(String, serd
         })
         .collect::<Result<Vec<_>>>()?;
     anyhow::ensure!(
-        names.contains(&"p") && names.contains(&"p_bucket_8"),
+        names.contains(&"p") && names.contains(&"p_bucket"),
         "evolved partition ROW duplicated a field"
     );
     result.rows.iter().map(|row| match row.as_slice() {
