@@ -48,7 +48,7 @@ cross_sales as
      ,d1.d_year as syear
      ,d2.d_year as fsyear
      ,d3.d_year s2year
-     ,count(*) cnt
+     ,count() cnt
      ,sum(ss_wholesale_cost) s1
      ,sum(ss_list_price) s2
      ,sum(ss_coupon_amt) s3
