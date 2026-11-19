@@ -34,6 +34,8 @@ pub(crate) fn runtime_with_transport_timeout(timeout: Duration) -> Arc<Execution
                 limits.floating_slots(),
                 limits.stream_window(),
                 timeout,
+                std::num::NonZeroUsize::new(limits.max_unit_payload_bytes())
+                    .expect("copied unit bound"),
             )
             .unwrap(),
         )

@@ -50,6 +50,7 @@ pub fn test_backend_data_runtime() -> BackendDataRuntime {
         TEST_RUNTIME.handle().clone(),
         test_backend_native_trust(),
         BackendNativeTransport::Plaintext,
+        crate::TransportMessageLimits::DEFAULT,
     )
 }
 
@@ -169,12 +170,14 @@ mod tests {
             runtime.handle().clone(),
             test_backend_native_trust(),
             BackendNativeTransport::Plaintext,
+            crate::TransportMessageLimits::DEFAULT,
         );
         let clone = first.clone();
         let second = BackendDataRuntime::new(
             runtime.handle().clone(),
             test_backend_native_trust(),
             BackendNativeTransport::Plaintext,
+            crate::TransportMessageLimits::DEFAULT,
         );
 
         assert!(first.channels().same_cache(clone.channels()));
@@ -192,6 +195,7 @@ mod tests {
             runtime.handle().clone(),
             test_backend_native_trust(),
             BackendNativeTransport::Plaintext,
+            crate::TransportMessageLimits::DEFAULT,
         );
 
         assert_eq!(adapter.block_on(async { 7_u8 }), 7);

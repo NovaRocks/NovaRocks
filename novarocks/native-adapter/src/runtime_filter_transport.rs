@@ -70,6 +70,7 @@ fn test_backend_data_runtime() -> BackendDataRuntime {
                 runtime.handle().clone(),
                 trust,
                 crate::BackendNativeTransport::Plaintext,
+                crate::TransportMessageLimits::DEFAULT,
             );
             (runtime, adapter)
         });

@@ -1,4 +1,5 @@
 use std::fmt;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -68,6 +69,8 @@ impl ExecutionRuntimeConfig {
 ///
 /// Slots count units, not bytes of resident memory. Each installed instance has
 /// its own progress floor; registration does not consume a second process quota.
+/// `max_unit_payload_bytes` is the wire upper bound on one unit payload. It is
+/// not a memory budget.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ExchangeFlowLimits {
     instance_floor_slots: usize,
@@ -75,6 +78,7 @@ pub struct ExchangeFlowLimits {
     floating_slots: usize,
     stream_window: usize,
     transport_timeout: Duration,
+    max_unit_payload_bytes: NonZeroUsize,
 }
 
 impl ExchangeFlowLimits {
@@ -84,6 +88,7 @@ impl ExchangeFlowLimits {
         floating_slots: usize,
         stream_window: usize,
         transport_timeout: Duration,
+        max_unit_payload_bytes: NonZeroUsize,
     ) -> Result<Self, ExecutionRuntimeConfigError> {
         for (field, value) in [
             ("exchange_instance_floor_slots", instance_floor_slots),
@@ -110,6 +115,7 @@ impl ExchangeFlowLimits {
             floating_slots,
             stream_window,
             transport_timeout,
+            max_unit_payload_bytes,
         })
     }
 
@@ -132,13 +138,28 @@ impl ExchangeFlowLimits {
     pub const fn transport_timeout(self) -> Duration {
         self.transport_timeout
     }
+
+    /// Wire upper bound on one exchange unit payload. This is not a memory budget.
+    pub const fn max_unit_payload_bytes(self) -> usize {
+        self.max_unit_payload_bytes.get()
+    }
 }
 
 impl Default for ExchangeFlowLimits {
     fn default() -> Self {
         // Candidate defaults are calibrated before the production cutover.
-        Self::try_new(1, 32, 8192, 2, Duration::from_secs(30))
-            .expect("candidate exchange flow defaults must be valid")
+        Self::try_new(
+            1,
+            32,
+            8192,
+            2,
+            Duration::from_secs(30),
+            NonZeroUsize::new(
+                novarocks_execution_contract::native_result_support::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES,
+            )
+            .expect("the default exchange unit payload bound is nonzero"),
+        )
+        .expect("candidate exchange flow defaults must be valid")
     }
 }
 
@@ -218,7 +239,7 @@ impl ExecutionRuntime {
         let exchange_unit_scheduler = ExchangeUnitSendScheduler::try_new(
             config.exchange_io_max_inflight_bytes,
             peer_calls,
-            novarocks_execution_contract::native_result_support::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES,
+            exchange_flow_limits.max_unit_payload_bytes(),
         )
         .map_err(|error| ExecutionRuntimeConfigError::runtime(error.to_string()))?;
         Ok(Self {
@@ -378,12 +399,20 @@ impl std::error::Error for ExecutionRuntimeConfigError {}
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroUsize;
     use std::thread;
     use std::time::{Duration, Instant};
 
     use super::{
         ExchangeFlowLimits, ExecutionRuntime, ExecutionRuntimeConfig, test_execution_function_set,
     };
+
+    fn unit_bound() -> NonZeroUsize {
+        NonZeroUsize::new(
+            novarocks_execution_contract::native_result_support::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES,
+        )
+        .expect("default unit bound")
+    }
 
     fn wait_until(timeout: Duration, predicate: impl Fn() -> bool) -> bool {
         let deadline = Instant::now() + timeout;
@@ -413,8 +442,9 @@ mod tests {
 
     #[test]
     fn exchange_flow_limits_accept_zero_floating_and_preserve_explicit_values() {
-        let limits = ExchangeFlowLimits::try_new(2, 5, 0, 3, Duration::from_millis(71))
-            .expect("instance progress does not require floating slots");
+        let limits =
+            ExchangeFlowLimits::try_new(2, 5, 0, 3, Duration::from_millis(71), unit_bound())
+                .expect("instance progress does not require floating slots");
         assert_eq!(limits.instance_floor_slots(), 2);
         assert_eq!(limits.instance_max_slots(), 5);
         assert_eq!(limits.floating_slots(), 0);
@@ -429,6 +459,10 @@ mod tests {
         )
         .expect("explicit exchange limits construct a runtime");
         assert_eq!(runtime.exchange_flow_limits(), limits);
+        assert_eq!(
+            runtime.exchange_unit_scheduler().max_unit_bytes(),
+            limits.max_unit_payload_bytes()
+        );
     }
 
     #[test]
@@ -445,6 +479,7 @@ mod tests {
                 0,
                 window,
                 Duration::from_millis(timeout_ms),
+                unit_bound(),
             )
             .expect_err("an impossible progress resource must be refused");
             assert!(error.to_string().contains(field), "{error}");
