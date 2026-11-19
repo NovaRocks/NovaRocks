@@ -553,6 +553,21 @@ impl MetadataIoAdmission {
         )
     }
 
+    pub(crate) fn for_profiled_probe(
+        owner: &WorkOwner,
+        profile: ConnectorMetadataMaintenanceIoProfile,
+        mut read_dependencies: Vec<SharedDependency>,
+    ) -> Result<Arc<Self>, WorkError> {
+        read_dependencies.push(SharedDependency::LocalHost);
+        extend_original_dependencies(&mut read_dependencies, profile.initial_dependencies());
+        Self::from_original_facts(
+            owner.scope(),
+            read_dependencies,
+            profile.geometry().metadata_bytes().get(),
+            profile.initial_owned_bytes(),
+        )
+    }
+
     /// Borrow the original Root owner and the selected Provider's actual
     /// dependencies. SDK geometry and future commit concurrency are not an
     /// authority for this metadata Source's preparation or I/O.

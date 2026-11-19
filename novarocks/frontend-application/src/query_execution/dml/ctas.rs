@@ -95,6 +95,20 @@ pub(crate) struct CtasTargetBinding {
 }
 
 impl CtasTargetBinding {
+    pub(crate) fn governed_io_profile(
+        &self,
+        kernel: &DmlExecutionKernel,
+    ) -> Result<novarocks_spi::connector::ConnectorMetadataMaintenanceIoProfile, CtasFailure> {
+        let stack = crate::connector::write_target::derive_write_stack_lease(
+            kernel.typed_connector_control(),
+            &self.planning,
+        )
+        .map_err(internal_failure)?;
+        kernel
+            .snapshot_io_profile(stack.session().io_profile().map_err(connector_failure)?)
+            .map_err(connector_failure)
+    }
+
     pub(crate) fn qualified_name(&self) -> String {
         format!(
             "{}.{}.{}",
@@ -2488,20 +2502,6 @@ impl GovernedCtasControlReceiving {
 }
 
 impl PreparedCtasTargetPreflight {
-    pub(crate) fn governed_io_profile(
-        &self,
-        kernel: &DmlExecutionKernel,
-    ) -> Result<novarocks_spi::connector::ConnectorMetadataMaintenanceIoProfile, CtasFailure> {
-        let preflight = downcast_standard_preflight(self.handle.as_ref())?;
-        let stack = crate::connector::write_target::derive_write_stack_lease(
-            kernel.typed_connector_control(),
-            &preflight.planning_pin,
-        )
-        .map_err(internal_failure)?;
-        kernel
-            .snapshot_io_profile(stack.session().io_profile().map_err(connector_failure)?)
-            .map_err(connector_failure)
-    }
     pub(crate) fn validate_source(
         &self,
         source: &PreparedCtasSource,

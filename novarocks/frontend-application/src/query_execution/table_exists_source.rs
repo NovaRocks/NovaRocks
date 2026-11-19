@@ -29,7 +29,10 @@ use novarocks_query_application::{
     session_error::QueryServiceError,
     session_outcome::{cancellation_error, governed_cancellation_error},
 };
-use novarocks_spi::connector::{ConnectorError, ConnectorTableRequest, ConnectorTableResolution};
+use novarocks_spi::connector::{
+    ConnectorError, ConnectorMetadataMaintenanceIoProfile, ConnectorTableRequest,
+    ConnectorTableResolution,
+};
 use novarocks_workload_control::WorkError;
 use std::{
     future::Future,
@@ -46,7 +49,9 @@ pub(crate) struct TableExistsSource {
     binding: CatalogTableReadBinding,
     command: CommandContext,
     cancellation: QueryCancellationView,
+    profile: Option<ConnectorMetadataMaintenanceIoProfile>,
     io: Option<Arc<MetadataIoAdmission>>,
+    completed_io: Option<Arc<MetadataIoAdmission>>,
     bootstrapped: bool,
     call: Option<Call>,
     outcome: Option<Result<bool, QueryServiceError>>,
@@ -74,7 +79,9 @@ impl TableExistsSource {
             binding,
             command,
             cancellation,
+            profile: None,
             io: None,
+            completed_io: None,
             bootstrapped: false,
             call: None,
             outcome: None,
@@ -83,6 +90,14 @@ impl TableExistsSource {
             in_foreign: false,
             health: None,
         })
+    }
+
+    pub(crate) fn with_io_profile(
+        mut self,
+        profile: ConnectorMetadataMaintenanceIoProfile,
+    ) -> Self {
+        self.profile = Some(profile);
+        self
     }
 
     pub(crate) fn local_health_failure(&self) -> Option<StatementNativeHealthFailure> {
@@ -130,8 +145,15 @@ impl TableExistsSource {
             .metadata()
             .read_planning_initial_dependencies()
             .map_err(connector)?;
-        self.io =
-            Some(MetadataIoAdmission::for_original_source(original, dependencies).map_err(work)?);
+        self.io = Some(
+            match self.profile.take() {
+                Some(profile) => {
+                    MetadataIoAdmission::for_profiled_probe(original, profile, dependencies)
+                }
+                None => MetadataIoAdmission::for_original_source(original, dependencies),
+            }
+            .map_err(work)?,
+        );
         Ok(())
     }
 
@@ -166,10 +188,11 @@ impl TableExistsSource {
         if self.local_health_failure().is_some() {
             return Poll::Pending;
         }
-        if self.io.is_none() && self.outcome.is_none() {
-            if let Err(error) = self.setup(owner) {
-                self.outcome = Some(Err(error));
-            }
+        if self.io.is_none()
+            && self.outcome.is_none()
+            && let Err(error) = self.setup(owner)
+        {
+            self.outcome = Some(Err(error));
         }
         if self.outcome.is_none() {
             let io = self.io.as_ref().expect("original table existence I/O");
@@ -256,12 +279,24 @@ impl TableExistsSource {
         {
             self.outcome = Some(Err(work(error)));
         }
+        let outcome = self
+            .outcome
+            .take()
+            .expect("original table existence outcome");
+        if outcome.is_ok() {
+            self.completed_io = Some(
+                self.io
+                    .take()
+                    .expect("same positive table existence source"),
+            );
+        }
         self.delivered = true;
-        Poll::Ready(
-            self.outcome
-                .take()
-                .expect("original table existence outcome"),
-        )
+        Poll::Ready(outcome)
+    }
+
+    /// Transfer the positive Root source once after every probe request exits.
+    pub(crate) fn take_completed_io(&mut self) -> Option<Arc<MetadataIoAdmission>> {
+        self.completed_io.take()
     }
 }
 

@@ -104,6 +104,7 @@ fn original_read(fixture: &Fixture) -> LikeSourceRead {
     LikeSourceRead::try_new(
         binding,
         fixture.command.as_ref().unwrap().clone(),
+        None,
         fixture.creator.runtime(),
         fixture.query_cancellation.clone(),
         tokio::runtime::Handle::current(),

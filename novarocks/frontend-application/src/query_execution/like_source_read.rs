@@ -117,6 +117,7 @@ impl LikeSourceRead {
     pub(crate) fn try_new(
         binding: CatalogTableReadBinding,
         command: CommandContext,
+        continued_io: Option<Arc<MetadataIoAdmission>>,
         cpu: InternalResultCpu,
         cancellation: QueryCancellationView,
         runtime: tokio::runtime::Handle,
@@ -147,7 +148,7 @@ impl LikeSourceRead {
                 "LIKE source metadata CPU exit is unproven",
             ),
             call: Call::default(),
-            io: None,
+            io: continued_io,
             completed_io: None,
             port: None,
             setup_attempted: false,
@@ -201,13 +202,6 @@ impl LikeSourceRead {
         }
         self.setup_attempted = true;
         let result = (|| {
-            let dependencies = self
-                .binding
-                .planning()
-                .binding()
-                .metadata()
-                .read_planning_initial_dependencies()
-                .map_err(connector)?;
             let original = owner
                 .execution_owner_slot()
                 .as_ref()
@@ -215,9 +209,22 @@ impl LikeSourceRead {
             if !original.is_for_scope(self.command.scope()) {
                 return Err(work(WorkError::Conflict));
             }
-            self.io = Some(
-                MetadataIoAdmission::for_original_source(original, dependencies).map_err(work)?,
-            );
+            if let Some(io) = &self.io {
+                io.check_original_positive_owner(original).map_err(work)?;
+                self.bootstrap_ready = true;
+            } else {
+                let dependencies = self
+                    .binding
+                    .planning()
+                    .binding()
+                    .metadata()
+                    .read_planning_initial_dependencies()
+                    .map_err(connector)?;
+                self.io = Some(
+                    MetadataIoAdmission::for_original_source(original, dependencies)
+                        .map_err(work)?,
+                );
+            }
             Ok(())
         })();
         if let Err(error) = result {
@@ -337,10 +344,10 @@ impl LikeSourceRead {
         if !self.call.started && self.business_failure.is_none() {
             return Poll::Pending;
         }
-        if let Some(Err(error)) = self.call.result.as_ref() {
-            if self.business_failure.is_none() {
-                self.fail(connector(error.clone()));
-            }
+        if let Some(Err(error)) = self.call.result.as_ref()
+            && self.business_failure.is_none()
+        {
+            self.fail(connector(error.clone()));
         }
         std::task::ready!(self.poll_close(cx));
         self.delivered = true;

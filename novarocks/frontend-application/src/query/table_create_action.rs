@@ -15,8 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Original-parser CREATE preparation under the admitted statement. LIKE keeps
-//! its original source-first ordering until the Trino entry replaces it.
+//! Typed CREATE TABLE and SET PROPERTIES preparation under the admitted statement.
 
 use super::{
     FrontendQuerySession, QueryCancellationView, QueryServiceError, StatementResult,
@@ -30,8 +29,9 @@ use super::{
 };
 use crate::query_execution::{
     completion_facts::FrontendPlanningCpuSource, internal_result_cpu::InternalResultCpu,
-    like_source_read::LikeSourceRead, planning::sql_cancellation_observation,
-    required_constant_eval::RequiredConstantInterpreter, table_exists_source::TableExistsSource,
+    like_source_read::LikeSourceRead, maintenance::io_admission::MetadataIoAdmission,
+    planning::sql_cancellation_observation, required_constant_eval::RequiredConstantInterpreter,
+    table_exists_source::TableExistsSource,
 };
 use novarocks_parser::ast::{
     AstVec, ObjectName as ParsedObjectName, StatementProperty, StatementSaveMode, TrinoCreateTable,
@@ -180,6 +180,7 @@ struct Action {
     pending: Option<TablePropertyInput>,
     target: Option<CatalogTableReadBinding>,
     exists: Option<TableExistsSource>,
+    continued_io: Option<Arc<MetadataIoAdmission>>,
     trino_like: Option<Box<PreparedTrinoTableLike>>,
     compiler: FrontendQueryCompiler,
     interpreter: Arc<RequiredConstantInterpreter>,
@@ -253,6 +254,7 @@ impl Action {
                 .as_ref()
                 .expect("original table command")
                 .clone(),
+            self.continued_io.take(),
             self.cpu.clone(),
             self.cancellation.clone(),
             self.compiler.connector_runtime().clone(),
@@ -288,15 +290,17 @@ impl Action {
         owner: &mut GovernedActionContext<'_>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<bool, QueryServiceError>> {
-        let result = self
-            .exists
-            .as_mut()
-            .expect("original target probe")
-            .poll_result(owner, cx);
-        if result.is_ready() {
-            self.exists.take();
+        let probe = self.exists.as_mut().expect("original target probe");
+        let result = std::task::ready!(probe.poll_result(owner, cx));
+        if matches!(result, Ok(false)) {
+            self.continued_io = Some(
+                probe
+                    .take_completed_io()
+                    .expect("successful target probe source"),
+            );
         }
-        result
+        self.exists.take();
+        Poll::Ready(result)
     }
 
     fn advance(
@@ -418,15 +422,12 @@ impl Action {
                     let Prepared::Table(prepared) = prepared else {
                         unreachable!("same finite table CPU case")
                     };
-                    let continued_io = tail
-                        .read
-                        .as_mut()
-                        .map(|read| {
-                            read.take_completed_io().ok_or_else(|| {
-                                internal_error("LIKE read lost its original I/O continuation")
-                            })
-                        })
-                        .transpose()?;
+                    let continued_io = match tail.read.as_mut() {
+                        Some(read) => Some(read.take_completed_io().ok_or_else(|| {
+                            internal_error("LIKE read lost its original I/O continuation")
+                        })?),
+                        None => self.continued_io.take(),
+                    };
                     let inner = table_mutation_action::prepare(
                         prepared,
                         continued_io,
@@ -573,6 +574,7 @@ impl FrontendQuerySession {
             pending: Some(pending),
             target: None,
             exists: None,
+            continued_io: None,
             trino_like: None,
             compiler: self.service.query_compiler.clone(),
             interpreter: self.service.required_constant_interpreter.clone(),

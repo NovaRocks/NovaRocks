@@ -268,6 +268,7 @@ fn prepare_from_preflight(
     input: CtasExecutionInput,
     preflight: PreparedCtasTargetPreflight,
     root: WorkScope,
+    io: Arc<MetadataIoAdmission>,
 ) -> Result<Box<dyn GovernedStatementAction>, DmlError> {
     let current_catalog = input
         .context
@@ -280,12 +281,6 @@ fn prepare_from_preflight(
     } else {
         CreatePolicy::FailIfExists
     };
-    let profile = preflight
-        .governed_io_profile(&kernel)
-        .map_err(|error| error.into_governed_dml_error(&input.sql))?;
-    let source_bytes = profile.geometry().metadata_bytes().get();
-    let io = MetadataIoAdmission::new(root.clone(), profile, source_bytes)
-        .map_err(|error| DmlError::executor(error.to_string()))?;
     let initial = InitialComputationReservation::new(
         input
             .launcher

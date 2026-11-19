@@ -27,10 +27,11 @@ use crate::{
     query_execution::{
         completion_facts::FrontendPlanningCpuSource,
         dml::ctas::{
-            CtasCommand, CtasTargetBinding, CtasTargetPreflightOutcome,
+            CtasCommand, CtasFailure, CtasTargetBinding, CtasTargetPreflightOutcome,
             PreparedCtasTargetPreflight, TrinoCtasInput,
         },
         kernels::DmlExecutionKernel,
+        maintenance::io_admission::MetadataIoAdmission,
         planning::sql_cancellation_observation,
         required_constant_eval::RequiredConstantInterpreter,
         table_exists_source::TableExistsSource,
@@ -158,12 +159,20 @@ pub(crate) fn prepare(
         input.command.clone(),
         input.cancellation.clone(),
     )?;
+    // The exact retained generation's write profile is a pure quote. An
+    // unavailable quote still permits the read-only target disposition.
+    let (read, io_profile_refusal) = match binding.governed_io_profile(&kernel) {
+        Ok(profile) => (read.with_io_profile(profile), None),
+        Err(refusal) => (read, Some(refusal)),
+    };
     Ok(Box::new(Action {
         kernel,
         compiler: input.compiler,
         interpreter: input.interpreter,
         root,
         read: Some(read),
+        io: None,
+        io_profile_refusal,
         binding: Some(binding),
         statement: Some(input.statement),
         execution: Some(input.execution),
@@ -186,6 +195,8 @@ struct Action {
     interpreter: Arc<RequiredConstantInterpreter>,
     root: WorkScope,
     read: Option<TableExistsSource>,
+    io: Option<Arc<MetadataIoAdmission>>,
+    io_profile_refusal: Option<CtasFailure>,
     binding: Option<CtasTargetBinding>,
     statement: Option<TrinoCreateTableAsSelect>,
     execution: Option<CtasExecutionInput>,
@@ -329,9 +340,14 @@ impl GovernedStatementAction for Action {
         }
         if let Some(read) = self.read.as_mut() {
             let exists = ready!(read.poll_result(owner, cx))?;
-            drop(self.read.take());
+            let mut read = self.read.take().expect("original CTAS target probe");
             if let Some(no_op) = self.admit_target(exists)? {
                 return Poll::Ready(Ok(no_op));
+            }
+            if self.io_profile_refusal.is_none() {
+                self.io = Some(read.take_completed_io().ok_or_else(|| {
+                    internal_error("CTAS target probe lost its original I/O continuation")
+                })?);
             }
         }
         if let Some(cpu) = self.cpu.as_ref() {
@@ -357,15 +373,24 @@ impl GovernedStatementAction for Action {
             if let Some(reason) = self.cancellation.reason() {
                 return Poll::Ready(Err(cancellation_error(reason)));
             }
+            let execution = self.execution.take().expect("original CTAS execution");
+            if let Some(refusal) = self.io_profile_refusal.take() {
+                return Poll::Ready(Err(service(
+                    refusal.into_governed_dml_error(&execution.sql),
+                )));
+            }
             self.inner = Some(
                 prepare_from_preflight(
                     self.kernel.clone(),
                     command,
-                    self.execution.take().expect("original CTAS execution"),
+                    execution,
                     self.preflight
                         .take()
                         .expect("original staged CTAS preflight"),
                     self.root.clone(),
+                    self.io
+                        .take()
+                        .expect("original profiled CTAS I/O continuation"),
                 )
                 .map_err(service)?,
             );
