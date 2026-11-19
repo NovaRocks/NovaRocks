@@ -1689,6 +1689,19 @@ async fn actor_send_delivers_native_receipt_and_waits_for_its_final_alias() {
 }
 
 #[tokio::test]
+async fn actor_identity_mismatch_retires_only_the_replying_channel_generation() {
+    for replace_pending_channel in [false, true] {
+        run_actor_send(
+            ActorSendMode::IdentityMismatch {
+                replace_pending_channel,
+            },
+            None,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
 async fn actor_send_failure_tracks_live_native_row_until_original_exit() {
     run_actor_send(
         ActorSendMode::Send,
@@ -1739,6 +1752,7 @@ async fn late_terminal_abort_withdraws_the_original_paid_native_replay() {
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum ActorSendMode {
     Send,
+    IdentityMismatch { replace_pending_channel: bool },
     Replay,
     CreateReplay,
     LateOwnerFailed,
@@ -1821,7 +1835,18 @@ async fn run_actor_send(
     let history = replay.then(|| novarocks_control_runtime::history::HistoryCapture::new(4096));
     let roles = Roles::with_history(history.clone());
     let fail_core = failure_verdict.is_some();
-    let sends = mode == ActorSendMode::Send || replay;
+    let identity_mismatch = match mode {
+        ActorSendMode::IdentityMismatch {
+            replace_pending_channel,
+        } => Some(replace_pending_channel),
+        _ => None,
+    };
+    let expected_receipt = if identity_mismatch.is_some() {
+        OperationOutcome::IdentityMismatch
+    } else {
+        OperationOutcome::Accepted
+    };
+    let sends = mode == ActorSendMode::Send || replay || identity_mismatch.is_some();
     let withdraw = mode == ActorSendMode::Withdraw;
     let release = mode == ActorSendMode::Release;
     let mut peer = if sends {
@@ -1849,6 +1874,25 @@ async fn run_actor_send(
     let mut wc = Governed::for_native_origin(peer_endpoint.as_ref());
     let handle = Handle::current();
     let mut runtime = FrontendDataRuntime::new(handle.clone());
+    let held_mismatch = if let Some(replace_pending_channel) = identity_mismatch {
+        let method = NativeRpcMethod::ApplyTaskControlOperations;
+        let client = Client::for_endpoint(
+            peer_endpoint.as_ref().unwrap().native_endpoint().clone(),
+            method.contract().endpoint,
+            backend,
+            runtime.clone(),
+        );
+        // The lifecycle lane has one slot, so the original actor send must
+        // borrow this exact warm generation.
+        let (_, original) = client.grpc_with_channel_identity(method).await.unwrap();
+        let release = Arc::new(tokio::sync::Notify::new());
+        peer.as_ref()
+            .unwrap()
+            .reject_identity_mismatch_after(release.clone());
+        Some((replace_pending_channel, client, method, original, release))
+    } else {
+        None
+    };
     let (parent, payer) = roles
         .scope
         .reserve_next(
@@ -1881,7 +1925,7 @@ async fn run_actor_send(
         }
         if let Some(seed) = creation_seed.as_ref() {
             peer.accept_create(seed.identity());
-        } else if !withdraw_replay {
+        } else if !withdraw_replay && identity_mismatch.is_none() {
             peer.accept_abort(participation);
         }
         match failure_verdict {
@@ -2854,7 +2898,7 @@ async fn run_actor_send(
                                 assert_eq!(observed.reply.dispatch_result(),
                                     novarocks_attempt_protocol::operation::OperationDispatchResult::TransportUnknown);
                             } else {
-                                assert_eq!(observed.reply.worker_outcome(), Some(OperationOutcome::Accepted));
+                                assert_eq!(observed.reply.worker_outcome(), Some(expected_receipt));
                             }
                             original_report = Some(fact);
                             break;
@@ -2965,7 +3009,34 @@ async fn run_actor_send(
                 .0,
             reservation.unwrap()
         );
-        observe_send(
+        let mismatch_channels =
+            if let Some((replace_pending_channel, client, method, original, release)) =
+                held_mismatch
+            {
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    while peer.as_ref().unwrap().applied_requests().is_empty() {
+                        drive(&mut wc.driver);
+                        advance_host();
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("the original actor started the RPC on the warm generation");
+                assert!(!original.is_retired());
+                let replacement = if replace_pending_channel {
+                    assert!(client.invalidate_channel_if_current(method, &original));
+                    let (_, replacement) = client.grpc_with_channel_identity(method).await.unwrap();
+                    assert_eq!(original.slot(), replacement.slot());
+                    Some(replacement)
+                } else {
+                    None
+                };
+                release.notify_one();
+                Some((original, replacement))
+            } else {
+                None
+            };
+        let reports = observe_send(
             &mut wc,
             send_id,
             send_input,
@@ -2973,7 +3044,20 @@ async fn run_actor_send(
             replay,
             withdraw,
         )
-        .await
+        .await;
+        if let Some((original, replacement)) = mismatch_channels {
+            assert!(original.is_retired());
+            let current = runtime.cached_channel(original.slot());
+            if let Some(replacement) = replacement {
+                assert!(
+                    current.unwrap().same_generation_for_test(&replacement),
+                    "the original response leaves the replacement generation cached"
+                );
+            } else {
+                assert!(current.is_none(), "the replying generation is evicted");
+            }
+        }
+        reports
     };
     // Create reports its exact Task send through the Native receipt path.
     assert_eq!(starts.was_started(participation), sends && !create_replay);
@@ -3349,10 +3433,7 @@ async fn run_actor_send(
             "the original Native row still has a reply alias"
         );
         let original = receipt.lock().unwrap().take().unwrap();
-        assert_eq!(
-            original.worker_outcome(),
-            Some(novarocks_execution_contract::OperationOutcome::Accepted)
-        );
+        assert_eq!(original.worker_outcome(), Some(expected_receipt));
         drop(original);
     }
     if fail_core {

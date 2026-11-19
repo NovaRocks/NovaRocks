@@ -322,11 +322,11 @@ async fn encode_and_send(
                 .response_max_bytes(control),
         )
         .expect("the same original reply layout was registered before admission");
-    let response = super::execute::send_operations_in(
+    let result = super::execute::send_operations_in(
         &captures.client,
         request.request,
         expires,
-        &receipts,
+        &mut receipts,
         captures.clock.as_ref(),
         captures.lifecycle.as_ref(),
         &mut ready.call,
@@ -334,9 +334,8 @@ async fn encode_and_send(
         reply_plan,
     )
     .await;
-    match response {
-        Ok(response) => receipts.response(response),
-        Err(dispatch) => receipts.uniform(dispatch),
+    if let Err(dispatch) = result {
+        receipts.uniform(dispatch);
     }
     BodyOutcome::ReceiptsRecorded
 }

@@ -32,7 +32,6 @@ use crate::task_execution::{
 };
 use novarocks_coordination_contract::MonotonicClock;
 use novarocks_proto_codec::native_rpc::NativeRpcMethod;
-use novarocks_proto_models::novarocks as proto;
 use std::{future::Future, task::Poll};
 pub(super) fn classify_channel_error(error: &ChannelAcquisitionError) -> OperationDispatchResult {
     wire::classify_channel_failure(match error {
@@ -72,13 +71,13 @@ pub(crate) async fn send_operations_in(
     client: &Client,
     request: EncodedMethodRequest,
     expires_at: tokio::time::Instant,
-    receipts: &AcceptedReceipts,
+    receipts: &mut AcceptedReceipts,
     clock: &dyn MonotonicClock,
     lifecycle: Option<&LifecycleStarts>,
     selected: &mut Option<NativeCallSource>,
     action_tail: &mut Option<novarocks_resource_contract::ExistingOwnerRetentionPin>,
     reply_plan: novarocks_task_codec::resource_preflight::OperationReplyDecodePlan,
-) -> Result<proto::ApplyTaskOperationsResponse, OperationDispatchResult> {
+) -> Result<(), OperationDispatchResult> {
     let method = match &request {
         EncodedMethodRequest::Ordinary(_) => NativeRpcMethod::ApplyTaskOperations,
         EncodedMethodRequest::Control(_) => NativeRpcMethod::ApplyTaskControlOperations,
@@ -181,11 +180,22 @@ pub(crate) async fn send_operations_in(
         }),
         Err(_) => Err(OperationDispatchResult::TransportUnknown),
     };
-    if matches!(outcome, Err(OperationDispatchResult::TransportUnknown)) {
-        // An unknown outcome may have poisoned this stream. An old request
-        // cannot evict a replacement channel already installed by another
-        // attempt or by membership reconciliation.
-        client.invalidate_channel_if_current(method, &acquired);
+    match outcome {
+        Ok(response) => {
+            receipts.response(response, || {
+                // A stale target can already have occupied a lane on the
+                // replacement listener. Retire this cache generation while
+                // the exact Worker verdict continues to its original owner.
+                client.invalidate_channel_if_current(method, &acquired);
+            });
+            Ok(())
+        }
+        Err(dispatch) => {
+            if dispatch == OperationDispatchResult::TransportUnknown {
+                // An old response cannot evict an already-replaced channel.
+                client.invalidate_channel_if_current(method, &acquired);
+            }
+            Err(dispatch)
+        }
     }
-    outcome
 }
