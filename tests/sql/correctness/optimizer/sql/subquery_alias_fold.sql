@@ -44,6 +44,6 @@ ORDER BY renamed_k;
 EXPLAIN VERBOSE WITH w AS (
     SELECT k, v FROM ${case_db}.oq6_alias_base WHERE k < 3
 )
-SELECT count(*)
+SELECT count()
 FROM ${case_db}.oq6_alias_base b
 JOIN w w_alias ON b.k = w_alias.k;

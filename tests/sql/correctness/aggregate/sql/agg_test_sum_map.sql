@@ -390,7 +390,7 @@ INSERT INTO t8 values
 
 -- query 67
 USE ${case_db};
-select category, sum_map(metrics)["clicks"], sum_map(metrics)["views"], sum_map(metrics)["impressions"], count(*) from t8 group by category order by category;
+select category, sum_map(metrics)["clicks"], sum_map(metrics)["views"], sum_map(metrics)["impressions"], count() from t8 group by category order by category;
 
 -- query 68
 USE ${case_db};

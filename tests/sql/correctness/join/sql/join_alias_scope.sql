@@ -66,13 +66,13 @@ WHERE renamed.c1 = 1;
 
 -- query 7
 -- @expect_trino_error=COLUMN_NOT_FOUND,USER_ERROR
-SELECT CAST(count(*) AS integer)
+SELECT CAST(count() AS integer)
 FROM ${case_db}.alias_scope_rows renamed
 WHERE alias_scope_rows.c1 = 1;
 
 -- query 8
 -- @expect_trino_error=COLUMN_NOT_FOUND,USER_ERROR
-SELECT CAST(count(*) AS integer)
+SELECT CAST(count() AS integer)
 FROM ${case_db}.alias_scope_rows renamed
 WHERE ${case_db}.alias_scope_rows.c1 = 1;
 

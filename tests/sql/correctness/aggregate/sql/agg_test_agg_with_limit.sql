@@ -318,8 +318,8 @@ insert into tarray SELECT generate_series, [generate_series], generate_series FR
 
 -- query 57
 USE ${case_db};
-select count(*) from (select sum(c3) from tarray group by c1, c3 limit 10) t;
+select count() from (select sum(c3) from tarray group by c1, c3 limit 10) t;
 
 -- query 58
 USE ${case_db};
-select count(*) from (select sum(c3) from tarray group by c1 limit 10) t;
+select count() from (select sum(c3) from tarray group by c1 limit 10) t;

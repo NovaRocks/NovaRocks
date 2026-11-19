@@ -92,4 +92,4 @@ WHERE sleep(probe.delay_s);
 -- query 6
 -- Health query after FE restart and BE retained-record reclamation.
 -- @result_contains=3
-SELECT COUNT(*) FROM ${case_db}.fe_terminal_retained;
+SELECT COUNT() FROM ${case_db}.fe_terminal_retained;

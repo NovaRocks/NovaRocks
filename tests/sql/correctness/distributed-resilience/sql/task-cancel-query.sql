@@ -52,13 +52,13 @@ INSERT INTO ${case_db}.kill_query VALUES (3, 10);
 -- @cancel_query_after_be_log_contains=NOVAROCKS_TASK_CREATE_APPLIED
 -- @expect_error=USER_CANCELED
 -- @be_log_be_count_at_least=NOVAROCKS_PARTICIPATION_ABORT_APPLIED,3
-SELECT COUNT(*)
+SELECT COUNT()
 FROM ${case_db}.kill_query
 WHERE sleep(delay_s);
 
 -- query 6
 -- @result_contains=3
-SELECT COUNT(*) FROM ${case_db}.kill_query;
+SELECT COUNT() FROM ${case_db}.kill_query;
 
 -- query 7
 -- SPI-5B: metadata aliases use the generic ConnectorReadSource path.  Abort
@@ -76,4 +76,4 @@ WHERE sleep(data.delay_s);
 
 -- query 8
 -- @result_contains=3
-SELECT COUNT(*) FROM ${case_db}.kill_query;
+SELECT COUNT() FROM ${case_db}.kill_query;

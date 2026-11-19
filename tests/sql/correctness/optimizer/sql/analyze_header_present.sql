@@ -30,4 +30,4 @@ ANALYZE TABLE ${case_db}.t_analyze_header;
 -- @result_contains=PLAN FRAGMENT 0
 -- @result_contains=HASH AGGREGATE
 EXPLAIN ANALYZE
-SELECT COUNT(*) FROM ${case_db}.t_analyze_header;
+SELECT COUNT() FROM ${case_db}.t_analyze_header;

@@ -37,7 +37,7 @@ ANALYZE TABLE ${case_db}.rf_remap_c;
 -- @explain_contains=HASH JOIN (BROADCAST, LEFT SEMI
 -- @explain_contains=producer binding
 -- @explain_contains=consumer binding
-SELECT count(*)
+SELECT count()
 FROM (
     SELECT k AS ak, v
     FROM ${case_db}.rf_remap_a
@@ -46,7 +46,7 @@ WHERE EXISTS (SELECT 1 FROM ${case_db}.rf_remap_b b WHERE pa.ak = b.k);
 
 -- @explain_contains=UNION ALL
 -- @explain_contains=producer binding
-SELECT count(*)
+SELECT count()
 FROM (
     SELECT k
     FROM ${case_db}.rf_remap_a

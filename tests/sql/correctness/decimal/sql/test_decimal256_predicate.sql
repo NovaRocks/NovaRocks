@@ -460,7 +460,7 @@ SELECT * FROM ${case_db}.decimal_test WHERE
 -- query 79
 SELECT * FROM ${case_db}.decimal_test WHERE
     ((big_decimal >= 500000000000.000000000000000 OR big_decimal <= 100000000000.000000000000000) AND
-     (huge_decimal >= 5000000000.00000000000000000000)) OR
+     huge_decimal >= 5000000000.00000000000000000000) OR
     max_decimal = 0 ORDER BY id;
 
 -- query 80
@@ -604,7 +604,7 @@ SELECT * FROM ${case_db}.decimal_test WHERE
 -- query 117
 SELECT * FROM ${case_db}.decimal_test WHERE
     (huge_decimal IS NULL OR max_decimal IS NULL) AND
-    (big_decimal IS NOT NULL) ORDER BY id;
+    big_decimal IS NOT NULL ORDER BY id;
 
 -- query 118
 SELECT * FROM ${case_db}.decimal_test WHERE

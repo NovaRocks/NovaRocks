@@ -48,4 +48,4 @@ select c1 from t0 where c1 is null group by c1;
 
 -- query 6
 USE ${case_db};
-select c1, count(*) from t0 where c1 is null group by c1;
+select c1, count() from t0 where c1 is null group by c1;

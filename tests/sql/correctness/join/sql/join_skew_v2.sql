@@ -572,7 +572,7 @@ ANALYZE TABLE ${case_db}.t_mcv_r;
 SELECT count() FROM ${case_db}.t_mcv_l JOIN ${case_db}.t_mcv_r ON ${case_db}.t_mcv_l.k = ${case_db}.t_mcv_r.k;
 
 -- query 116
-WITH l AS (SELECT (cast(k AS bigint) + 10) AS k2, v FROM ${case_db}.t_mcv_l), r AS (SELECT (cast(k AS bigint) + 10) AS k2, v FROM ${case_db}.t_mcv_r) SELECT count(*) FROM l JOIN r ON l.k2 = r.k2;
+WITH l AS (SELECT cast(k AS bigint) + 10 AS k2, v FROM ${case_db}.t_mcv_l), r AS (SELECT cast(k AS bigint) + 10 AS k2, v FROM ${case_db}.t_mcv_r) SELECT count() FROM l JOIN r ON l.k2 = r.k2;
 
 -- ============================================================
 -- MCV thresholds: high skew threshold

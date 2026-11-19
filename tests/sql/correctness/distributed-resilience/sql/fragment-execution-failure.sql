@@ -87,11 +87,11 @@ INSERT INTO ${case_db}.fragment_execution_failure VALUES (3, 5);
 -- nothing. ABORT_APPLIED therefore fires on the participants minus that one,
 -- which is why this is one fewer than the count above rather than equal to it.
 -- @be_log_be_count_at_least=NOVAROCKS_PARTICIPATION_ABORT_APPLIED,1
-SELECT COUNT(*)
+SELECT COUNT()
 FROM ${case_db}.fragment_execution_failure
 WHERE sleep(delay_s);
 
 -- query 6
 -- A destructive local executor failure must leave the following query healthy.
 -- @result_contains=3
-SELECT COUNT(*) FROM ${case_db}.fragment_execution_failure;
+SELECT COUNT() FROM ${case_db}.fragment_execution_failure;

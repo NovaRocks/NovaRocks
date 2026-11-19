@@ -29,6 +29,6 @@ INSERT INTO ${case_db}.t_agg_pd_neg_b VALUES (1);
 ANALYZE TABLE ${case_db}.t_agg_pd_neg_a;
 ANALYZE TABLE ${case_db}.t_agg_pd_neg_b;
 EXPLAIN VERBOSE
-SELECT COUNT(*)
+SELECT COUNT()
 FROM ${case_db}.t_agg_pd_neg_a a
 INNER JOIN ${case_db}.t_agg_pd_neg_b b ON a.k = b.k;

@@ -87,7 +87,7 @@ WHERE _rowid <= 2 ORDER BY c4, c6;
 SELECT 1
 FROM (
     SELECT
-        COUNT(*) OVER (PARTITION BY c1) AS _count,
+        COUNT() OVER (PARTITION BY c1) AS _count,
         ROW_NUMBER() OVER (PARTITION BY c1 ORDER BY RAND()) AS rn
     FROM ${case_db}.t1
 ) AS x

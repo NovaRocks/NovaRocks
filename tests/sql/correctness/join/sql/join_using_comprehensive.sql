@@ -794,7 +794,7 @@ WITH base_data AS (
 )
 SELECT id,
        v1, v2, v3, v4, v5,
-       COUNT(*) OVER (PARTITION BY
+       COUNT() OVER (PARTITION BY
            CASE WHEN id <= 3 THEN 'LOW' WHEN id <= 6 THEN 'MID' ELSE 'HIGH' END
        ) AS range_count,
        ROW_NUMBER() OVER (

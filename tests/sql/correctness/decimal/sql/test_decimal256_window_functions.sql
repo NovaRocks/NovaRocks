@@ -91,7 +91,7 @@ SELECT
     d50_15,
     SUM(d50_15) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) as moving_sum,
     AVG(d50_15) OVER (PARTITION BY category ORDER BY id) as running_avg_by_cat,
-    COUNT(*) OVER (PARTITION BY category) as count_by_cat,
+    COUNT() OVER (PARTITION BY category) as count_by_cat,
     MAX(d76_0) OVER (PARTITION BY category ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) as running_max
 FROM ${case_db}.decimal_window_test
 ORDER BY id;

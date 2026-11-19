@@ -87,17 +87,17 @@ select count(1) from ${case_db}.t1 where
 
 -- query 6
 -- CastArrayExpr: IN with array literal, NOT IN with array literal
-select count(1) from ${case_db}.t1 where (
+select count(1) from ${case_db}.t1 where
     c_array_int in ([10, 11, 12, 13])
     OR c_array_int not in ([11, 12, 12, 14])
-);
+;
 
 -- query 7
 -- CastArrayExpr: mixed string/int cast for IN
-select count(1) from ${case_db}.t1 where (
+select count(1) from ${case_db}.t1 where
     c_array_int in (cast(['1', 11, 12, 13] as array<int>))
     OR c_array_int not in ([11, 12, 12, 14])
-);
+;
 
 -- query 8
 -- CastArrayExpr element access
@@ -107,10 +107,10 @@ select count(1) from ${case_db}.t1 where
 
 -- query 9
 -- CastMapExpr: IN/NOT IN with map literals
-select count(1) from ${case_db}.t1 where (
+select count(1) from ${case_db}.t1 where
     c_map in (map{0: 10, 1: 10 + 1, 2: 10 + 2}, map{0: 1000, 1: 1000 + 1, 2: 1000 + 2}, map{0: 10000, 1: 10000 + 1, 2: 10000 + 2})
     OR c_map not in (map{0: 10, 1: 10 + 1, 2: 10 + 2}, map{0: 1000, 1: 1000 + 1, 2: 1000 + 2}, map{0: 10000, 1: 10000 + 1, 2: 10000 + 2})
-);
+;
 
 -- query 10
 -- CastMapExpr: cast from string key map

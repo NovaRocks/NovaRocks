@@ -61,7 +61,7 @@ WHERE user_id IN (1, 2, 3, 4);
 -- @result_contains=predicates: user_id IN (1, 2, 3, 4, 5, 6, 7, 16, 32)
 USE iceberg_ddl_cat_${suite_uuid0}.iceberg_part_db_${uuid0};
 EXPLAIN VERBOSE
-SELECT COUNT(*), SUM(score)
+SELECT COUNT(), SUM(score)
 FROM test_users_bucketed
 WHERE user_id IN (1, 2, 3, 4, 5, 6, 7, 16, 32);
 
@@ -70,7 +70,7 @@ WHERE user_id IN (1, 2, 3, 4, 5, 6, 7, 16, 32);
 -- @result_contains=predicates: user_id IN (1, 2, 3, 4)
 USE iceberg_ddl_cat_${suite_uuid0}.iceberg_part_db_${uuid0};
 EXPLAIN VERBOSE
-SELECT COUNT(*), SUM(score)
+SELECT COUNT(), SUM(score)
 FROM test_users_bucketed
 WHERE user_id IN (1, 2, 3, 4);
 DROP TABLE iceberg_ddl_cat_${suite_uuid0}.iceberg_part_db_${uuid0}.test_users_bucketed FORCE;

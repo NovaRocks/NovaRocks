@@ -30,7 +30,7 @@ USE ${case_db};
 -- query 3
 USE ${case_db};
 with input as (SELECT array_map(x -> CAST(x AS STRING), array_generate(1, 2000000, 1)) AS a UNION ALL SELECT ["A", "B", "C"] AS a)
-SELECT count(*) from (select a from input group by 1) AS t;
+SELECT count() from (select a from input group by 1) AS t;
 
 -- query 4
 -- @skip_result_check=true

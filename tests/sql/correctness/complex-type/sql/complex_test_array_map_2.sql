@@ -40,11 +40,11 @@ insert into array_map_test values (1, array_repeat("abcdefghasdasdasirnqwrq", 20
 
 -- query 4
 USE ${case_db};
-select count() from array_map_test where array_length(array_map((x,y)->(id+length(x)+y), arr_str, arr_largeint)) > 10 ;
+select count() from array_map_test where array_length(array_map((x,y)->id+length(x)+y, arr_str, arr_largeint)) > 10 ;
 
 -- query 5
 USE ${case_db};
-select count(array_length(array_map((x,y)->(id+length(x)+y), arr_str, arr_largeint))) from array_map_test;
+select count(array_length(array_map((x,y)->id+length(x)+y, arr_str, arr_largeint))) from array_map_test;
 
 -- query 6
 USE ${case_db};
@@ -64,7 +64,7 @@ USE ${case_db};
 
 -- query 10
 USE ${case_db};
-select array_length(array_map((x,y)->x > y, (array_repeat("12345",1000000)),(array_repeat("12345",1000000)))) from table(generate_series(1,10,1));
+select array_length(array_map((x,y)->x > y, array_repeat("12345",1000000),array_repeat("12345",1000000))) from table(generate_series(1,10,1));
 
 -- query 11
 USE ${case_db};
@@ -196,7 +196,7 @@ USE ${case_db};
 
 -- query 40
 USE ${case_db};
-select /*+ SET_VAR(query_mem_limit=104857600)*/array_sum(array_map(x->array_contains((array_generate(1,10000)),x), array_generate(1,100000)));
+select /*+ SET_VAR(query_mem_limit=104857600)*/array_sum(array_map(x->array_contains(array_generate(1,10000),x), array_generate(1,100000)));
 
 -- query 41
 -- @skip_result_check=true
@@ -215,7 +215,7 @@ insert into array_map_x values (1, array_repeat("abcdefghasdasdasirnqwrq", 2), a
 
 -- query 43
 USE ${case_db};
-select cast(if (1 > rand(), "[]", "") as array<string>) l , array_map((x)-> (concat(x,l)), arr_str) from array_map_x;
+select cast(if (1 > rand(), "[]", "") as array<string>) l , array_map((x)-> concat(x,l), arr_str) from array_map_x;
 
 -- query 44
 -- @skip_result_check=true

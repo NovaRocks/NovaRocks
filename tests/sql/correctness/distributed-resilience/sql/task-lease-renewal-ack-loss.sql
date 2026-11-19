@@ -61,10 +61,10 @@ INSERT INTO ${case_db}.lease_renewal VALUES (1, 15);
 -- @query_lifecycle_fault=lease-renewal-ack-drop,0
 -- @skip_result_check=true
 -- @be_log_count_at_least=NOVAROCKS_PARTICIPATION_LEASE_RENEWED,1
-SELECT COUNT(*)
+SELECT COUNT()
 FROM ${case_db}.lease_renewal
 WHERE sleep(delay_s);
 
 -- query 4
 -- @result_contains=1
-SELECT COUNT(*) FROM ${case_db}.lease_renewal;
+SELECT COUNT() FROM ${case_db}.lease_renewal;

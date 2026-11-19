@@ -62,32 +62,32 @@ insert into test_all_null select t.* from (select 1 as d) x left join test_all_n
 
 -- query 3
 USE ${case_db};
-select (round(id_double)) <=> (round(NULL)) from test_all_null;
+select round(id_double) <=> round(NULL) from test_all_null;
 
 -- query 4
 USE ${case_db};
-select (dround(id_double)) <=> (dround(NULL)) from test_all_null;
+select dround(id_double) <=> dround(NULL) from test_all_null;
 
 -- query 5
 USE ${case_db};
-select (round(id_double, id_int)) <=> (round(NULL, NULL)) from test_all_null;
+select round(id_double, id_int) <=> round(NULL, NULL) from test_all_null;
 
 -- query 6
 USE ${case_db};
-select (round(id_double, id_int)) <=> (round(id_double, NULL)) from test_all_null;
+select round(id_double, id_int) <=> round(id_double, NULL) from test_all_null;
 
 -- query 7
 USE ${case_db};
-select (round(id_double, id_int)) <=> (round(NULL, id_int)) from test_all_null;
+select round(id_double, id_int) <=> round(NULL, id_int) from test_all_null;
 
 -- query 8
 USE ${case_db};
-select (dround(id_double, id_int)) <=> (dround(NULL, NULL)) from test_all_null;
+select dround(id_double, id_int) <=> dround(NULL, NULL) from test_all_null;
 
 -- query 9
 USE ${case_db};
-select (dround(id_double, id_int)) <=> (dround(id_double, NULL)) from test_all_null;
+select dround(id_double, id_int) <=> dround(id_double, NULL) from test_all_null;
 
 -- query 10
 USE ${case_db};
-select (dround(id_double, id_int)) <=> (dround(NULL, id_int)) from test_all_null;
+select dround(id_double, id_int) <=> dround(NULL, id_int) from test_all_null;

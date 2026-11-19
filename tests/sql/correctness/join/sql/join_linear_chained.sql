@@ -157,7 +157,7 @@ WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 tt2 WHERE tt1.c_int=tt2.c_int and tt1.
 -- left semi join on c_int with expression key and filter
 -- query 27
 select count(tt1.k1) from ${case_db}.t1 tt1
-WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 tt2 WHERE tt1.c_int=tt2.c_int and tt1.c_int+1=tt2.c_int+1) AND (tt1.k1 % 2 = 0);
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 tt2 WHERE tt1.c_int=tt2.c_int and tt1.c_int+1=tt2.c_int+1) AND tt1.k1 % 2 = 0;
 
 -- left semi join on c_int + c_bigint
 -- query 28
@@ -172,12 +172,12 @@ WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 tt2 WHERE tt1.c_int = tt2.c_int);
 -- left semi join using(c_int) with filter % 2
 -- query 30
 select count(tt1.k1) from ${case_db}.t1 tt1
-WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 tt2 WHERE tt1.c_int = tt2.c_int) AND (tt1.k1 % 2 = 0);
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 tt2 WHERE tt1.c_int = tt2.c_int) AND tt1.k1 % 2 = 0;
 
 -- left semi join using(c_int) with filter % 100
 -- query 31
 select count(tt1.k1) from ${case_db}.t1 tt1
-WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 tt2 WHERE tt1.c_int = tt2.c_int) AND (tt1.k1 % 100 = 0);
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 tt2 WHERE tt1.c_int = tt2.c_int) AND tt1.k1 % 100 = 0;
 
 -- left semi join using(c_bigint)
 -- query 32
@@ -187,12 +187,12 @@ WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 tt2 WHERE tt1.c_bigint = tt2.c_bigint)
 -- left semi join using(c_bigint) with filter % 2
 -- query 33
 select count(tt1.k1) from ${case_db}.t1 tt1
-WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 tt2 WHERE tt1.c_bigint = tt2.c_bigint) AND (tt1.k1 % 2 = 0);
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 tt2 WHERE tt1.c_bigint = tt2.c_bigint) AND tt1.k1 % 2 = 0;
 
 -- left semi join using(c_bigint) with filter % 100
 -- query 34
 select count(tt1.k1) from ${case_db}.t1 tt1
-WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 tt2 WHERE tt1.c_bigint = tt2.c_bigint) AND (tt1.k1 % 100 = 0);
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 tt2 WHERE tt1.c_bigint = tt2.c_bigint) AND tt1.k1 % 100 = 0;
 
 -- left semi join using(c_string)
 -- query 35
@@ -202,12 +202,12 @@ WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 tt2 WHERE tt1.c_string = tt2.c_string)
 -- left semi join using(c_string) with filter % 2
 -- query 36
 select count(tt1.c_string) from ${case_db}.t1 tt1
-WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 tt2 WHERE tt1.c_string = tt2.c_string) AND (tt1.k1 % 2 = 0);
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 tt2 WHERE tt1.c_string = tt2.c_string) AND tt1.k1 % 2 = 0;
 
 -- left semi join using(c_string) with filter % 100
 -- query 37
 select count(tt1.c_string) from ${case_db}.t1 tt1
-WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 tt2 WHERE tt1.c_string = tt2.c_string) AND (tt1.k1 % 100 = 0);
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 tt2 WHERE tt1.c_string = tt2.c_string) AND tt1.k1 % 100 = 0;
 
 -- left semi join on all three keys
 -- query 38

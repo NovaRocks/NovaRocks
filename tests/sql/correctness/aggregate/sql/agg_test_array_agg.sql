@@ -116,7 +116,7 @@ select max(id), array_agg(distinct name) from ss where id < 2  order by 1;
 
 -- query 19
 USE ${case_db};
-select max(id), array_agg(distinct name), array_agg(distinct (score > 0)) from ss where id < 2 order by 1;
+select max(id), array_agg(distinct name), array_agg(distinct score > 0) from ss where id < 2 order by 1;
 
 -- query 20
 USE ${case_db};
@@ -137,7 +137,7 @@ select max(id),array_agg(name), array_agg(distinct name) from ss where id < 2 or
 
 -- query 24
 USE ${case_db};
-select max(id),array_agg(distinct name), array_agg(distinct (score > 0)) from ss where id < 2 order by 1;
+select max(id),array_agg(distinct name), array_agg(distinct score > 0) from ss where id < 2 order by 1;
 
 -- query 25
 USE ${case_db};
@@ -158,7 +158,7 @@ select id, array_agg(name), array_agg(distinct name) from ss where id < 2 group 
 
 -- query 29
 USE ${case_db};
-select id, array_agg(distinct name), array_agg(distinct (score > 1)) from ss where id < 2 group by id order by 1;
+select id, array_agg(distinct name), array_agg(distinct score > 1) from ss where id < 2 group by id order by 1;
 
 -- query 30
 USE ${case_db};
@@ -179,7 +179,7 @@ select score, array_agg(name), array_agg(distinct name) from ss where id < 2 gro
 
 -- query 34
 USE ${case_db};
-select score, array_agg(distinct name), array_agg(distinct (score > 1)) from ss where id < 2 group by score order by 1;
+select score, array_agg(distinct name), array_agg(distinct score > 1) from ss where id < 2 group by score order by 1;
 
 -- query 35
 USE ${case_db};

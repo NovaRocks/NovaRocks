@@ -83,27 +83,27 @@ USE ${case_db};
 
 -- query 14
 USE ${case_db};
-select sum(array_contains((array_generate(1000)), pk)) from t;
+select sum(array_contains(array_generate(1000), pk)) from t;
 
 -- query 15
 USE ${case_db};
-select sum(array_contains((array_generate(1000)), 100)) from t;
+select sum(array_contains(array_generate(1000), 100)) from t;
 
 -- query 16
 USE ${case_db};
-select sum(array_position((array_generate(1000)), pk)) from t;
+select sum(array_position(array_generate(1000), pk)) from t;
 
 -- query 17
 USE ${case_db};
-select sum(array_position((array_generate(1000)), 100)) from t;
+select sum(array_position(array_generate(1000), 100)) from t;
 
 -- query 18
 USE ${case_db};
-select sum(array_contains(array_append((array_generate(1000)), null), pk)) from t;
+select sum(array_contains(array_append(array_generate(1000), null), pk)) from t;
 
 -- query 19
 USE ${case_db};
-select sum(array_contains(array_append((array_generate(1000)), null), null)) from t;
+select sum(array_contains(array_append(array_generate(1000), null), null)) from t;
 
 -- query 20
 USE ${case_db};
@@ -143,11 +143,11 @@ USE ${case_db};
 
 -- query 29
 USE ${case_db};
-select sum(array_contains((array_repeat("abcdefg", 10000)), "abcdefg")) from t;
+select sum(array_contains(array_repeat("abcdefg", 10000), "abcdefg")) from t;
 
 -- query 30
 USE ${case_db};
-select sum(array_contains((array_repeat("abcdefg", 10000)), str)) from t;
+select sum(array_contains(array_repeat("abcdefg", 10000), str)) from t;
 
 -- name: test_array_contains_with_decimal
 -- query 31
@@ -296,7 +296,7 @@ USE ${case_db};
 
 -- query 60
 USE ${case_db};
-select array_contains_all((array_repeat("abcdefg", 1000)), (array_repeat("abcdef", 2000)));
+select array_contains_all(array_repeat("abcdefg", 1000), array_repeat("abcdef", 2000));
 
 -- query 61
 -- @skip_result_check=true
@@ -308,11 +308,11 @@ USE ${case_db};
 
 -- query 63
 USE ${case_db};
-select array_contains_all((array_generate(1000)), (array_generate(2000)));
+select array_contains_all(array_generate(1000), array_generate(2000));
 
 -- query 64
 USE ${case_db};
-select array_contains_all((array_generate(2000)), (array_generate(1000)));
+select array_contains_all(array_generate(2000), array_generate(1000));
 
 -- query 65
 USE ${case_db};
@@ -416,7 +416,7 @@ USE ${case_db};
 
 -- query 90
 USE ${case_db};
-select array_contains_seq((array_append(array_repeat(1, 1000), 2)), (array_append(array_repeat(1, 500), 2)));
+select array_contains_seq(array_append(array_repeat(1, 1000), 2), array_append(array_repeat(1, 500), 2));
 
 -- query 91
 -- @expect_error=2-th input of array_contains_seq should be an array, rather than varchar

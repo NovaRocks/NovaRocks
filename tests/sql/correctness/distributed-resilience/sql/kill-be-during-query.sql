@@ -62,7 +62,7 @@ VALUES (3, 1);
 -- The completed result after one participant disappears proves the successor
 -- was activated without requiring the unreachable Worker to report a stop.
 -- @be_log_be_count_at_least=NOVAROCKS_TASK_CREATE_APPLIED,2
-SELECT COUNT(*)
+SELECT COUNT()
 FROM ${case_db}.resilience_series
 WHERE sleep(delay_s);
 

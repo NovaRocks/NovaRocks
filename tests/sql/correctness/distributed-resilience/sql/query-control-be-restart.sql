@@ -62,7 +62,7 @@ INSERT INTO ${case_db}.be_restart VALUES (3, 3);
 -- reuse the first attempt's already-consumed binding grant.
 -- @be_log_count_at_least=NOVAROCKS_PARTICIPATION_ESTABLISH_OBSERVED,1
 -- @be_log_be_count_at_least=NOVAROCKS_PARTICIPATION_ESTABLISH_APPLIED,3
-SELECT COUNT(*)
+SELECT COUNT()
 FROM ${case_db}.be_restart
 WHERE sleep(delay_s);
 
@@ -70,4 +70,4 @@ WHERE sleep(delay_s);
 -- @retry_count=5
 -- @retry_interval_ms=1000
 -- @result_contains=3
-SELECT COUNT(*) FROM ${case_db}.be_restart;
+SELECT COUNT() FROM ${case_db}.be_restart;

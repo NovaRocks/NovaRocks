@@ -60,14 +60,14 @@ INSERT INTO ${case_db}.t_agg_count_supplier VALUES
 
 SELECT table_name, row_count
 FROM (
-    SELECT 'customer' AS table_name, COUNT(*) AS row_count FROM ${case_db}.t_agg_count_customer
+    SELECT 'customer' AS table_name, COUNT() AS row_count FROM ${case_db}.t_agg_count_customer
     UNION ALL
-    SELECT 'dates', COUNT(*) FROM ${case_db}.t_agg_count_dates
+    SELECT 'dates', COUNT() FROM ${case_db}.t_agg_count_dates
     UNION ALL
-    SELECT 'lineorder', COUNT(*) FROM ${case_db}.t_agg_count_lineorder
+    SELECT 'lineorder', COUNT() FROM ${case_db}.t_agg_count_lineorder
     UNION ALL
-    SELECT 'part', COUNT(*) FROM ${case_db}.t_agg_count_part
+    SELECT 'part', COUNT() FROM ${case_db}.t_agg_count_part
     UNION ALL
-    SELECT 'supplier', COUNT(*) FROM ${case_db}.t_agg_count_supplier
+    SELECT 'supplier', COUNT() FROM ${case_db}.t_agg_count_supplier
 ) t
 ORDER BY table_name;

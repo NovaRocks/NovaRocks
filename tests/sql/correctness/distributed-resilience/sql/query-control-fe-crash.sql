@@ -90,10 +90,10 @@ INSERT INTO ${case_db}.fe_crash VALUES (3, 15);
 -- asserted on every context; this asserts that termination really followed on
 -- more than one backend rather than pinning a count a sleep can delay.
 -- @be_log_be_count_at_least=NOVAROCKS_PARTICIPATION_TERMINATION_COMPLETED,2
-SELECT COUNT(*)
+SELECT COUNT()
 FROM ${case_db}.fe_crash
 WHERE sleep(delay_s);
 
 -- query 6
 -- @result_contains=3
-SELECT COUNT(*) FROM ${case_db}.fe_crash;
+SELECT COUNT() FROM ${case_db}.fe_crash;

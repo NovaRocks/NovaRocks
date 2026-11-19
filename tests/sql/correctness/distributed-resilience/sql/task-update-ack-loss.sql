@@ -85,4 +85,4 @@ SELECT SUM(id) AS total FROM ${case_db}.task_update_ack_loss;
 -- query 13
 -- The one-shot fault must not poison later TaskUpdate delivery.
 -- @result_contains=9
-SELECT COUNT(*) FROM ${case_db}.task_update_ack_loss;
+SELECT COUNT() FROM ${case_db}.task_update_ack_loss;

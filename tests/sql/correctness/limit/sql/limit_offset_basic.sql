@@ -158,7 +158,7 @@ SELECT count() FROM (SELECT * FROM L UNION ALL SELECT * FROM R) AS U;
 EXPLAIN VERBOSE WITH C AS (SELECT region, sum(income) AS total FROM ${case_db}.t0 GROUP BY 1),
      L AS (SELECT total FROM C LIMIT 3),
      R AS (SELECT total FROM C LIMIT 4)
-SELECT  count(*) FROM (SELECT * FROM L UNION ALL SELECT * FROM R) AS U;
+SELECT  count() FROM (SELECT * FROM L UNION ALL SELECT * FROM R) AS U;
 
 -- query 23
 -- @skip_result_check=true
@@ -177,7 +177,7 @@ SELECT count() FROM (SELECT * FROM L UNION ALL SELECT * FROM R) AS U;
 EXPLAIN VERBOSE WITH C AS (SELECT region, sum(income) AS total FROM ${case_db}.t0 GROUP BY 1),
      L AS (SELECT total FROM C LIMIT 3),
      R AS (SELECT total FROM C LIMIT 4)
-SELECT  count(*) FROM (SELECT * FROM L UNION ALL SELECT * FROM R) AS U;
+SELECT  count() FROM (SELECT * FROM L UNION ALL SELECT * FROM R) AS U;
 
 -- query 26
 -- @skip_result_check=true

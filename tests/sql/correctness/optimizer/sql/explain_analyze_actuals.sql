@@ -32,6 +32,6 @@ INSERT INTO ${case_db}.explain_analyze_actuals_r VALUES (1, 100), (2, 200), (4, 
 -- @result_contains=HASH JOIN (BROADCAST, INNER
 -- @result_contains=act={rows=
 EXPLAIN ANALYZE
-SELECT COUNT(*)
+SELECT COUNT()
 FROM ${case_db}.explain_analyze_actuals_l l
 INNER JOIN ${case_db}.explain_analyze_actuals_r r ON l.k = r.k;

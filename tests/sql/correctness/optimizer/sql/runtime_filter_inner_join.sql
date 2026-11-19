@@ -32,6 +32,6 @@ ANALYZE TABLE ${case_db}.rf_probe;
 -- @explain_contains=expr = (b.k)
 -- @explain_contains=consumer binding
 -- @explain_contains=expr = (p.k)
-SELECT count(*)
+SELECT count()
 FROM ${case_db}.rf_probe p
 JOIN ${case_db}.customer_demographics b ON p.k = b.k;

@@ -38,20 +38,20 @@ INSERT INTO iceberg_cat_${suite_uuid0}.iv38f_db_${uuid0}.t_${uuid0} VALUES (2, '
 
 -- query 5
 -- two appends -> two data files, all content=0
-SELECT count(*) AS n_data_files
-  FROM iceberg_cat_${suite_uuid0}.iv38f_db_${uuid0}.t_${uuid0}$files
+SELECT count() AS n_data_files
+  FROM iceberg_cat_${suite_uuid0}.iv38f_db_${uuid0}."t_${uuid0}$files"
   WHERE content = 0;
 
 -- query 6
 -- total record_count across data files == 2 rows inserted
 SELECT sum(record_count) AS total_records
-  FROM iceberg_cat_${suite_uuid0}.iv38f_db_${uuid0}.t_${uuid0}$files
+  FROM iceberg_cat_${suite_uuid0}.iv38f_db_${uuid0}."t_${uuid0}$files"
   WHERE content = 0;
 
 -- query 7
 -- partition is a typed struct derived from the table partition spec.
 SELECT f.`partition`.region AS part_region, sum(record_count) AS records
-  FROM iceberg_cat_${suite_uuid0}.iv38f_db_${uuid0}.t_${uuid0}$files AS f
+  FROM iceberg_cat_${suite_uuid0}.iv38f_db_${uuid0}."t_${uuid0}$files" AS f
   WHERE content = 0
   GROUP BY f.`partition`.region
   ORDER BY part_region;

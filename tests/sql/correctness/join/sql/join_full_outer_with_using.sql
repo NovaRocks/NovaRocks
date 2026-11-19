@@ -509,7 +509,7 @@ SELECT k1, k2, v1, v2,
                   END,
                   COALESCE(v1, v2)
        ) as rn,
-       COUNT(*) OVER (PARTITION BY k1) as cnt_per_k1
+       COUNT() OVER (PARTITION BY k1) as cnt_per_k1
 FROM ${case_db}.t1 FULL OUTER JOIN ${case_db}.t2 USING(k1, k2)
 ORDER BY k1, k2,
          CASE

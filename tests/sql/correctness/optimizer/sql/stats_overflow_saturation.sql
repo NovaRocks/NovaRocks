@@ -34,6 +34,6 @@ ANALYZE TABLE ${case_db}.oq12_stats_big_b;
 -- @explain_contains=oq12_stats_big_b
 -- @explain_not_contains=rows=>=
 -- @explain_not_contains=9223372036854775807
-EXPLAIN VERBOSE SELECT COUNT(*)
+EXPLAIN VERBOSE SELECT COUNT()
 FROM ${case_db}.oq12_stats_big_a a
 CROSS JOIN ${case_db}.oq12_stats_big_b b;

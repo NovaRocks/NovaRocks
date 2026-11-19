@@ -272,11 +272,11 @@ select cast(percentile_approx_weighted(c13.b, 1, 0.5) as int) from t1;
 
 -- query 56
 USE ${case_db};
-with tt as (select (0.5) as v1, c1, c2 from t1) select  cast(percentile_approx_weighted(c2, c1, v1) as int) from tt;
+with tt as (select 0.5 as v1, c1, c2 from t1) select  cast(percentile_approx_weighted(c2, c1, v1) as int) from tt;
 
 -- query 57
 USE ${case_db};
-with tt as (select (0.5) as v1, (4096) as v2, c1, c2 from t1) select  cast(percentile_approx_weighted(c2, c1, v1, v2 + 1) as int) from tt;
+with tt as (select 0.5 as v1, 4096 as v2, c1, c2 from t1) select  cast(percentile_approx_weighted(c2, c1, v1, v2 + 1) as int) from tt;
 
 -- query 58
 -- @skip_result_check=true
@@ -461,11 +461,11 @@ select cast(percentile_approx_weighted(c13.b, 1, 0.5) as int) from t1;
 
 -- query 102
 USE ${case_db};
-with tt as (select (0.5) as v1, c1, c2 from t1) select  cast(percentile_approx_weighted(c2, c1, v1) as int) from tt;
+with tt as (select 0.5 as v1, c1, c2 from t1) select  cast(percentile_approx_weighted(c2, c1, v1) as int) from tt;
 
 -- query 103
 USE ${case_db};
-with tt as (select (0.5) as v1, (4096) as v2, c1, c2 from t1) select  cast(percentile_approx_weighted(c2, c1, v1, v2 + 1) as int) from tt;
+with tt as (select 0.5 as v1, 4096 as v2, c1, c2 from t1) select  cast(percentile_approx_weighted(c2, c1, v1, v2 + 1) as int) from tt;
 
 -- query 104
 -- @skip_result_check=true

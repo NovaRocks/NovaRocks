@@ -49,7 +49,7 @@ INSERT INTO ${case_db}.sqlx2_profile_timeout_cleanup VALUES (3, 3);
 -- @be_log_be_count_at_least=NOVAROCKS_PARTICIPATION_ABORT_APPLIED,3
 SET query_timeout = 1;
 EXPLAIN ANALYZE
-SELECT COUNT(*)
+SELECT COUNT()
 FROM ${case_db}.sqlx2_profile_timeout_cleanup
 WHERE sleep(delay_s);
 
@@ -61,8 +61,8 @@ SET query_timeout = 0;
 -- @skip_result_check=true
 -- @result_contains=Planning:
 -- @result_contains=Profile: tasks=
-EXPLAIN ANALYZE SELECT COUNT(*) FROM ${case_db}.sqlx2_profile_timeout_cleanup;
+EXPLAIN ANALYZE SELECT COUNT() FROM ${case_db}.sqlx2_profile_timeout_cleanup;
 
 -- query 6
 -- @result_contains=3
-SELECT COUNT(*) FROM ${case_db}.sqlx2_profile_timeout_cleanup;
+SELECT COUNT() FROM ${case_db}.sqlx2_profile_timeout_cleanup;

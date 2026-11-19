@@ -250,7 +250,7 @@ SELECT id, char_col FROM ${case_db}.t_string WHERE char_col IN ('fruit', 'animal
 -- ============================================================
 -- query 26
 -- @order_sensitive=true
-SELECT id, int_col FROM ${case_db}.t_int WHERE (int_col + 1000) IN (2000, 3000, 4000, 5000) ORDER BY id;
+SELECT id, int_col FROM ${case_db}.t_int WHERE int_col + 1000 IN (2000, 3000, 4000, 5000) ORDER BY id;
 
 -- query 27
 -- @order_sensitive=true
