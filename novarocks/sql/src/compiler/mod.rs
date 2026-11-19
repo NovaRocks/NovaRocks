@@ -1713,7 +1713,9 @@ pub use crate::explain::completed::{
     render_completed_plan,
 };
 pub use crate::explain::completed_tree::render_completed_plan_tree;
-pub use catalog_qualification::{CatalogQualification, CatalogQualifications};
+pub use catalog_qualification::{
+    CatalogQualification, CatalogQualifications, quoted_metadata_catalog_candidate,
+};
 #[cfg(test)]
 pub(crate) use catalog_qualification::{
     iceberg_metadata_qualifications_for_test, resolve_quoted_iceberg_metadata_for_test,

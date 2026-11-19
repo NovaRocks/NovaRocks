@@ -829,7 +829,7 @@ impl<'a> CatalogNeedCollector<'a> {
             }
         }
         if let Some(catalogs) = &mut self.qualification_requests {
-            if let Some(instance) = super::catalog_qualification::candidate_catalog(
+            if let Some(instance) = super::quoted_metadata_catalog_candidate(
                 name,
                 self.current_catalog,
                 self.current_database,

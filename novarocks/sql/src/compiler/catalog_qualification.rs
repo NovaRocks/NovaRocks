@@ -126,7 +126,9 @@ pub(super) struct QualifiedMetadata<'a, 'q> {
     pub(super) binding: &'q ConnectorProviderBindingKey,
 }
 
-pub(super) fn candidate_catalog(
+/// Find the catalog whose observation could qualify this authored table name.
+/// This does not classify the relation or bypass the query's CTE scope.
+pub fn quoted_metadata_catalog_candidate(
     name: &ObjectName,
     catalog: Option<&str>,
     database: &str,

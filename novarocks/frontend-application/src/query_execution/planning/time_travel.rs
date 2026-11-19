@@ -410,6 +410,17 @@ fn rewrite_time_travel_in_relation_async<'a>(
                             .into(),
                     );
                 }
+                // The SQL collector qualifies the complete name against the same
+                // statement's catalog observation and owns the period refusal.
+                if novarocks_sql::compiler::quoted_metadata_catalog_candidate(
+                    &table.name,
+                    current_catalog,
+                    current_database,
+                )
+                .is_some()
+                {
+                    return Ok(());
+                }
                 let version_clause = table.query_period.take().expect("checked is_some above");
                 let (parts, metadata_suffix) = time_travel_table_lookup(table);
                 let name = &mut table.name;
@@ -685,17 +696,44 @@ mod tests {
         }
     }
 
-    #[test]
-    fn time_travel_lookup_preserves_ordinary_identity_and_qualified_metadata_refuses_period() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn time_travel_lookup_preserves_ordinary_identity_and_qualified_metadata_refuses_period()
+    {
         use novarocks_parser::ast::{Relation, SetExpr};
         use novarocks_spi::connector::{ConnectorProviderBinding, ConnectorProviderId};
         use novarocks_sql::compiler::{
-            CatalogQualification, CatalogQualifications, SqlCapturedCatalogPreparation,
-            SqlCompileControl, SqlCompileError,
+            CatalogQualification, CatalogQualifications, RootDistributionRequirement,
+            SqlCompileControl, SqlCompileError, SqlCompileIntent, SqlDmlCatalogPreparation,
+            SqlSessionContext, SqlStatementInput,
         };
 
+        struct NoOrdinaryLookup;
+        impl super::CatalogAdmission for NoOrdinaryLookup {
+            fn catalog_application(
+                &self,
+            ) -> Option<&dyn novarocks_catalog_application::CatalogApplicationPort> {
+                panic!("the ordinary time-travel rewrite must leave the catalog candidate to SQL")
+            }
+        }
+        impl super::TimeTravelResolver for NoOrdinaryLookup {
+            fn connector_control(&self) -> &dyn novarocks_spi::connector::ConnectorControlResolver {
+                panic!("the original metadata period must reach the collector before provider I/O")
+            }
+        }
+
         let sql = r#"SELECT * FROM ice.db."Orders$files" FOR VERSION AS OF 42"#;
-        let query = novarocks_parser::parser::parse_query(sql).unwrap();
+        let mut query = novarocks_parser::parser::parse_query(sql).unwrap();
+        let original = query.clone();
+        super::rewrite_time_travel_refs_async(
+            &NoOrdinaryLookup,
+            Some("ice"),
+            "db",
+            &mut query,
+            &crate::connector::test_request_context(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(query, original);
         let SetExpr::Select(select) = query.body.as_ref() else {
             panic!("SELECT");
         };
@@ -716,12 +754,27 @@ mod tests {
         let period_span = table.query_period.as_ref().unwrap().span;
 
         let control = SqlCompileControl::unbounded();
-        let Err(SqlCompileError::Compilation(message)) = SqlCapturedCatalogPreparation::try_new(
-            query.clone(),
-            Some("ice"),
-            "db",
-            control.clone(),
-        ) else {
+        let session = SqlSessionContext {
+            sql_semantics: Default::default(),
+            current_catalog: Some("ice".into()),
+            current_database: "db".into(),
+            optimizer_settings: Default::default(),
+        };
+        let prepare = |intent, qualifications| {
+            SqlDmlCatalogPreparation::try_new_for_intent_with_qualifications(
+                SqlStatementInput::parsed_query(Box::new(query.clone())),
+                session.clone(),
+                control.clone(),
+                intent,
+                qualifications,
+            )
+        };
+        let write = SqlCompileIntent::IcebergWrite {
+            root_distribution: RootDistributionRequirement::Any,
+        };
+        let Err(SqlCompileError::Compilation(message)) =
+            prepare(write.clone(), CatalogQualifications::default())
+        else {
             panic!(
                 "without an Iceberg observation, the complete name goes through ordinary resolution"
             );
@@ -745,26 +798,21 @@ mod tests {
                 CatalogQualification::Ready { provider, binding },
             )
             .unwrap();
-        let Err(SqlCompileError::Analyze(error)) =
-            SqlCapturedCatalogPreparation::try_new_with_qualifications(
-                query,
-                Some("ice"),
-                "db",
-                control,
-                qualifications,
-            )
-        else {
-            panic!("qualified metadata must reject time travel at the original period");
-        };
-        assert_eq!(
-            error.kind(),
-            novarocks_sql::analyze_error::AnalyzeErrorKind::UnsupportedQueryShape
-        );
-        assert_eq!(
-            error.message(),
-            "time travel is not supported on metadata relations"
-        );
-        assert_eq!(error.span(), Some(period_span));
+        for intent in [write, SqlCompileIntent::ChangeStreamWrite] {
+            let Err(SqlCompileError::Analyze(error)) = prepare(intent, qualifications.clone())
+            else {
+                panic!("qualified metadata must reject time travel at the original period");
+            };
+            assert_eq!(
+                error.kind(),
+                novarocks_sql::analyze_error::AnalyzeErrorKind::UnsupportedQueryShape
+            );
+            assert_eq!(
+                error.message(),
+                "time travel is not supported on metadata relations"
+            );
+            assert_eq!(error.span(), Some(period_span));
+        }
     }
 
     #[test]
