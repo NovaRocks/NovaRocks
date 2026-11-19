@@ -68,8 +68,8 @@ VALUES (2, 'bb'), (3, 'c');
 
 -- query 8
 -- Capture the snapshot count after UPDATE and immediately before MERGE.
-SELECT count(*) AS snaps_before_merge
-  FROM iceberg_rest_${suite_uuid0}.iceberg_rest_update_merge_db_${uuid0}.t_update_merge_${uuid0}$snapshots;
+SELECT count() AS snaps_before_merge
+  FROM iceberg_rest_${suite_uuid0}.iceberg_rest_update_merge_db_${uuid0}."t_update_merge_${uuid0}$snapshots";
 
 -- query 9
 -- @skip_result_check=true
@@ -82,8 +82,8 @@ WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v);
 -- query 10
 -- MATCHED UPDATE plus NOT MATCHED INSERT are one aggregate commit, so this
 -- count must be exactly one greater than snaps_before_merge.
-SELECT count(*) AS snaps_after_merge
-  FROM iceberg_rest_${suite_uuid0}.iceberg_rest_update_merge_db_${uuid0}.t_update_merge_${uuid0}$snapshots;
+SELECT count() AS snaps_after_merge
+  FROM iceberg_rest_${suite_uuid0}.iceberg_rest_update_merge_db_${uuid0}."t_update_merge_${uuid0}$snapshots";
 
 -- query 11
 SELECT id, v

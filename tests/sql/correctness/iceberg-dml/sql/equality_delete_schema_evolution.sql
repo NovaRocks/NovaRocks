@@ -34,15 +34,15 @@ INSERT INTO orders_eq_evo VALUES
   (3, 30.75);
 
 -- query 2
-SELECT count(*) AS snapshot_count_before_equality_delete
-  FROM iceberg_dml_cat_${suite_uuid0}.eq_delete_schema_evolution_${uuid0}.orders_eq_evo$snapshots;
+SELECT count() AS snapshot_count_before_equality_delete
+  FROM iceberg_dml_cat_${suite_uuid0}.eq_delete_schema_evolution_${uuid0}."orders_eq_evo$snapshots";
 
 -- query 3
 ALTER TABLE orders_eq_evo ADD EQUALITY DELETE (amount) VALUES (20.25);
 
 -- query 4
-SELECT count(*) AS snapshot_count_after_equality_delete
-  FROM iceberg_dml_cat_${suite_uuid0}.eq_delete_schema_evolution_${uuid0}.orders_eq_evo$snapshots;
+SELECT count() AS snapshot_count_after_equality_delete
+  FROM iceberg_dml_cat_${suite_uuid0}.eq_delete_schema_evolution_${uuid0}."orders_eq_evo$snapshots";
 
 -- query 5
 ALTER TABLE orders_eq_evo RENAME COLUMN amount TO total_amount;

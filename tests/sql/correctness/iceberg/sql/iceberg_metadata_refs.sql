@@ -43,7 +43,7 @@ ALTER TABLE iceberg_cat_${suite_uuid0}.iceberg_meta_db_${uuid0}.metaref_${uuid0}
 -- query 6
 -- 3 refs total: dev (BRANCH), main (BRANCH), v1 (TAG). Names are tab-stable.
 SELECT name, type
-  FROM iceberg_cat_${suite_uuid0}.iceberg_meta_db_${uuid0}.metaref_${uuid0}$refs
+  FROM iceberg_cat_${suite_uuid0}.iceberg_meta_db_${uuid0}."metaref_${uuid0}$refs"
   ORDER BY name;
 
 -- query 7

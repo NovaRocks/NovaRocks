@@ -52,7 +52,7 @@ FROM (
     summary['total-records'] = '3'           AS total_records_is_3,
     summary['total-files-size'] IS NOT NULL  AS has_total_files_size,
     summary['engine-name'] IS NOT NULL       AS has_engine_name
-  FROM iceberg_cat_${suite_uuid0}.iv32_db_${uuid0}.t_${uuid0}$snapshots
+  FROM iceberg_cat_${suite_uuid0}.iv32_db_${uuid0}."t_${uuid0}$snapshots"
   ORDER BY committed_at DESC
   LIMIT 1
 ) t;
@@ -70,7 +70,7 @@ FROM (
     committed_at,
     summary['total-records'] = '3'          AS total_records_is_3,
     summary['engine-name'] IS NOT NULL      AS has_engine_name
-  FROM iceberg_cat_${suite_uuid0}.iv32_db_${uuid0}.t_${uuid0}$snapshots
+  FROM iceberg_cat_${suite_uuid0}.iv32_db_${uuid0}."t_${uuid0}$snapshots"
   ORDER BY committed_at DESC
   LIMIT 1
 ) t;

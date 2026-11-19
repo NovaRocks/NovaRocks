@@ -50,8 +50,8 @@ JOIN (SELECT id, _row_id AS rid FROM ${case_db}.t_update_ref_sequence
 
 -- query 7
 -- The legacy copy-on-write property is ignored: UPDATE published a delete artifact.
-SELECT count(*) > 0 AS has_delete_artifacts
-FROM ${case_db}.t_update_ref_sequence$files WHERE content=1;
+SELECT count() > 0 AS has_delete_artifacts
+FROM ${case_db}."t_update_ref_sequence$files" WHERE content=1;
 
 -- query 8
 -- @skip_result_check=true

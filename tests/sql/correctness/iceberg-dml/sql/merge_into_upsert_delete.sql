@@ -44,8 +44,8 @@ INSERT INTO ${case_db}.t_merge_source VALUES
 
 -- query 2
 -- Atomicity proof: capture the snapshot count immediately before the MERGE.
-SELECT count(*) AS snaps_before_merge
-FROM ${case_db}.t_merge_target$snapshots;
+SELECT count() AS snaps_before_merge
+FROM ${case_db}."t_merge_target$snapshots";
 
 -- query 3
 -- @skip_result_check=true
@@ -58,8 +58,8 @@ MERGE INTO ${case_db}.t_merge_target AS t
 -- query 4
 -- Atomicity proof: the MATCHED UPDATE and NOT-MATCHED INSERT fold into a
 -- single Iceberg snapshot, so snaps_after_merge - snaps_before_merge MUST be 1.
-SELECT count(*) AS snaps_after_merge
-FROM ${case_db}.t_merge_target$snapshots;
+SELECT count() AS snaps_after_merge
+FROM ${case_db}."t_merge_target$snapshots";
 
 -- query 5
 SELECT city_id, population, city
@@ -74,8 +74,8 @@ WHERE city_id = 1;
 -- query 7
 -- The follow-up standalone DELETE is its own snapshot, so this count is
 -- snaps_after_merge + 1.
-SELECT count(*) AS snaps_after_delete
-FROM ${case_db}.t_merge_target$snapshots;
+SELECT count() AS snaps_after_delete
+FROM ${case_db}."t_merge_target$snapshots";
 
 -- query 8
 SELECT city_id, population, city

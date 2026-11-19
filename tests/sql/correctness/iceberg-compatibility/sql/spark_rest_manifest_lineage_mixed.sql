@@ -40,7 +40,7 @@ WHERE id > 0 GROUP BY value ORDER BY value;
 
 -- query 4
 SELECT status, record_count, first_row_id, sequence_number, file_sequence_number
-FROM iceberg_compat_${suite_uuid0}.${case_db}.rwm14_${uuid0}_manifest_mixed$entries
+FROM iceberg_compat_${suite_uuid0}.${case_db}."rwm14_${uuid0}_manifest_mixed$entries"
 WHERE record_count IN (10, 25, 50) ORDER BY record_count;
 
 -- Reclaim directly after successful verification. Early failures leave the

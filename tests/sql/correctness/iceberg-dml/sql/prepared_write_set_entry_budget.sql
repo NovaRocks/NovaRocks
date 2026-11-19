@@ -55,8 +55,8 @@ INSERT INTO ${case_db}.t_write_set_entry_budget VALUES (-1, 1);
 
 -- query 2
 -- The committed state the refused write must not disturb.
-SELECT count(*) AS snaps_before
-FROM ${case_db}.t_write_set_entry_budget$snapshots;
+SELECT count() AS snaps_before
+FROM ${case_db}."t_write_set_entry_budget$snapshots";
 
 -- query 3
 -- 32 * 32 * 16 distinct partition values, plus one more: 16385 commit
@@ -83,8 +83,8 @@ ORDER BY p;
 -- query 5
 -- Stronger than a row check: the refused write produced no snapshot at all,
 -- so the external commit never ran.
-SELECT count(*) AS snaps_after
-FROM ${case_db}.t_write_set_entry_budget$snapshots;
+SELECT count() AS snaps_after
+FROM ${case_db}."t_write_set_entry_budget$snapshots";
 
 -- query 6
 -- @skip_result_check=true

@@ -38,13 +38,13 @@ INSERT INTO iceberg_cat_${suite_uuid0}.iceberg_meta_db_${uuid0}.metahist_${uuid0
 
 -- query 5
 -- 2 history rows, one per snapshot.
-SELECT count(*) AS n_history
-  FROM iceberg_cat_${suite_uuid0}.iceberg_meta_db_${uuid0}.metahist_${uuid0}$history;
+SELECT count() AS n_history
+  FROM iceberg_cat_${suite_uuid0}.iceberg_meta_db_${uuid0}."metahist_${uuid0}$history";
 
 -- query 6
 -- All history rows are ancestors of current after 2 sequential appends on main.
-SELECT count(*) AS n_ancestors
-  FROM iceberg_cat_${suite_uuid0}.iceberg_meta_db_${uuid0}.metahist_${uuid0}$history
+SELECT count() AS n_ancestors
+  FROM iceberg_cat_${suite_uuid0}.iceberg_meta_db_${uuid0}."metahist_${uuid0}$history"
   WHERE is_current_ancestor = TRUE;
 
 -- query 7

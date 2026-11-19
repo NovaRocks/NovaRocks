@@ -44,32 +44,32 @@ INSERT INTO iceberg_cat_${suite_uuid0}.iceberg_meta_db_${uuid0}.metasnap_${uuid0
 
 -- query 6
 -- 3 snapshots committed.
-SELECT count(*) AS n_snapshots
-  FROM iceberg_cat_${suite_uuid0}.iceberg_meta_db_${uuid0}.metasnap_${uuid0}$snapshots;
+SELECT count() AS n_snapshots
+  FROM iceberg_cat_${suite_uuid0}.iceberg_meta_db_${uuid0}."metasnap_${uuid0}$snapshots";
 
 -- query 7
 -- All 3 snapshot operations are 'append'.
-SELECT operation, count(*) AS n
-  FROM iceberg_cat_${suite_uuid0}.iceberg_meta_db_${uuid0}.metasnap_${uuid0}$snapshots
+SELECT operation, count() AS n
+  FROM iceberg_cat_${suite_uuid0}.iceberg_meta_db_${uuid0}."metasnap_${uuid0}$snapshots"
   GROUP BY operation
   ORDER BY operation;
 
 -- query 8
 -- Exactly one snapshot has parent_id NULL (the first one).
-SELECT count(*) AS n_root
-  FROM iceberg_cat_${suite_uuid0}.iceberg_meta_db_${uuid0}.metasnap_${uuid0}$snapshots
+SELECT count() AS n_root
+  FROM iceberg_cat_${suite_uuid0}.iceberg_meta_db_${uuid0}."metasnap_${uuid0}$snapshots"
   WHERE parent_id IS NULL;
 
 -- query 9
 -- All 3 snapshots have non-null snapshot_id.
-SELECT count(*) AS n_with_id
-  FROM iceberg_cat_${suite_uuid0}.iceberg_meta_db_${uuid0}.metasnap_${uuid0}$snapshots
+SELECT count() AS n_with_id
+  FROM iceberg_cat_${suite_uuid0}.iceberg_meta_db_${uuid0}."metasnap_${uuid0}$snapshots"
   WHERE snapshot_id IS NOT NULL;
 
 -- query 10
 -- Alias works.
-SELECT count(*) AS n_root_aliased
-  FROM iceberg_cat_${suite_uuid0}.iceberg_meta_db_${uuid0}.metasnap_${uuid0}$snapshots AS s
+SELECT count() AS n_root_aliased
+  FROM iceberg_cat_${suite_uuid0}.iceberg_meta_db_${uuid0}."metasnap_${uuid0}$snapshots" AS s
   WHERE s.parent_id IS NULL;
 
 -- query 11

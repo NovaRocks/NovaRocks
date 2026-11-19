@@ -63,8 +63,8 @@ ORDER BY id;
 
 -- query 3
 -- Atomicity proof: capture the snapshot count immediately before the MERGE.
-SELECT count(*) AS snaps_before
-FROM ${case_db}.t_v3_merge_mor$snapshots;
+SELECT count() AS snaps_before
+FROM ${case_db}."t_v3_merge_mor$snapshots";
 
 -- query 4
 -- @skip_result_check=true
@@ -77,8 +77,8 @@ WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v);
 -- query 5
 -- Atomicity proof: the MATCHED UPDATE (DV) and NOT-MATCHED INSERT fold into a
 -- single Iceberg snapshot, so snaps_after - snaps_before MUST be exactly 1.
-SELECT count(*) AS snaps_after
-FROM ${case_db}.t_v3_merge_mor$snapshots;
+SELECT count() AS snaps_after
+FROM ${case_db}."t_v3_merge_mor$snapshots";
 
 -- query 6
 SELECT id, v

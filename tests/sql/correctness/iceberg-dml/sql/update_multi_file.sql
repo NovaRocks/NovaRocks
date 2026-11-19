@@ -35,8 +35,8 @@ INSERT INTO ${case_db}.t_v3_update_multi_file VALUES (1, 'a');
 INSERT INTO ${case_db}.t_v3_update_multi_file VALUES (2, 'b');
 
 -- query 2
-SELECT count(*) AS snaps_before
-FROM ${case_db}.t_v3_update_multi_file$snapshots;
+SELECT count() AS snaps_before
+FROM ${case_db}."t_v3_update_multi_file$snapshots";
 
 -- query 3
 -- @skip_result_check=true
@@ -45,8 +45,8 @@ SET v = CONCAT(v, '_updated')
 WHERE id IN (1, 2);
 
 -- query 4
-SELECT count(*) AS snaps_after
-FROM ${case_db}.t_v3_update_multi_file$snapshots;
+SELECT count() AS snaps_after
+FROM ${case_db}."t_v3_update_multi_file$snapshots";
 
 -- query 5
 SELECT id, v

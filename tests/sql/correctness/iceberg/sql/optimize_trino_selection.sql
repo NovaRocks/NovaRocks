@@ -58,9 +58,9 @@ ALTER TABLE iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.tiny_rows OPTIMIZE;
 
 -- query 7
 -- A no-op retains the exact saved snapshot; this does not assume a history count.
-SELECT count(*) AS main_matches_before_noop
-FROM iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.tiny_rows$refs AS current_ref
-JOIN iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.tiny_rows$refs AS before_ref
+SELECT count() AS main_matches_before_noop
+FROM iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}."tiny_rows$refs" AS current_ref
+JOIN iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}."tiny_rows$refs" AS before_ref
   ON current_ref.snapshot_id = before_ref.snapshot_id
 WHERE current_ref.name = 'main' AND before_ref.name = 'before_noop';
 
@@ -77,7 +77,7 @@ ALTER TABLE iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.partition_rows OPTIMIZE;
 -- query 10
 -- Return the original partition ROW without requiring struct-field expressions.
 SELECT `partition`, record_count AS physical_rows
-FROM iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.partition_rows$files
+FROM iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}."partition_rows$files"
 WHERE content = 0 ORDER BY record_count DESC;
 
 -- query 11
