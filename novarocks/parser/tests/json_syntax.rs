@@ -17,7 +17,8 @@
 
 //! Public typed syntax dispatch; target-parser roundtrips belong to P05.
 use novarocks_parser::{
-    SYNTHETIC, Span, StructuralViolation, ValidateError, ast::*, build, printer,
+    SYNTHETIC, Span, StructuralViolation, ValidateError, ast::*, build, parse, printer,
+    trino_parser, trino_printer,
 };
 
 fn invocation() -> JsonPathInvocation {
@@ -45,6 +46,64 @@ fn table_query(table: JsonTable) -> Statement {
             build::select(vec![build::wildcard()], Some(from), None, None).unwrap(),
         ),
     )))
+}
+
+#[test]
+fn complete_legacy_json_object_pairs_share_standard_member_syntax() {
+    for (legacy_sql, trino_sql) in [
+        (
+            "SELECT json_object('2:3', NULL)",
+            "SELECT JSON_OBJECT('2:3': NULL)",
+        ),
+        (
+            "SELECT json_object('k', json_object('n', 1))",
+            "SELECT JSON_OBJECT('k': JSON_OBJECT('n': 1))",
+        ),
+        (
+            "SELECT array_agg(DISTINCT [json_object('2:3', NULL)]) FROM ss",
+            "SELECT array_agg(DISTINCT ARRAY[JSON_OBJECT('2:3': NULL)]) FROM ss",
+        ),
+    ] {
+        let statement = parse(legacy_sql).unwrap().pop().unwrap();
+        let Statement::Query(legacy) = &statement else {
+            panic!("expected an ordinary query");
+        };
+        let standard = trino_parser::parse_query(trino_sql).unwrap();
+        assert!(legacy.syntax_eq(&standard), "{legacy_sql}");
+        assert_eq!(printer::print_statement(&statement), legacy_sql);
+        let printed = trino_printer::print_query(&standard).unwrap();
+        assert!(standard.syntax_eq(&trino_parser::parse_query(&printed).unwrap()));
+    }
+}
+
+#[test]
+fn other_legacy_json_object_calls_keep_their_original_function_shape() {
+    for source in [
+        "json_object('k')",
+        "json_object()",
+        "json_object(DISTINCT 'k', 1)",
+        "json_object('k', 1 ORDER BY k)",
+        "json_object('k', 1) FILTER (WHERE true)",
+        "json_object('k', 1) OVER ()",
+        "`json_object`('k', 1)",
+        "s.json_object('k', 1)",
+        "JSON_OBJECT('k', 1)",
+    ] {
+        let statement = parse(&format!("SELECT {source}")).unwrap().pop().unwrap();
+        let Statement::Query(query) = statement else {
+            panic!("expected an ordinary query");
+        };
+        let SetExpr::Select(select) = &*query.body else {
+            panic!("expected SELECT");
+        };
+        let SelectItem::SingleColumn(column) = &select.projection[0] else {
+            panic!("expected a scalar projection");
+        };
+        assert!(
+            matches!(&column.expression, Expr::FunctionCall(_)),
+            "{source}"
+        );
+    }
 }
 
 #[test]

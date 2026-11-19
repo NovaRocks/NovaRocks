@@ -2395,6 +2395,25 @@ impl Printer {
     }
 
     fn write_json_object(&mut self, node: &JsonObject) {
+        if !node.members.is_empty()
+            && node.null_on_null
+            && !node.unique_keys
+            && node.returned_type.is_none()
+            && node.output_format.is_none()
+            && node.members.iter().all(|member| member.format.is_none())
+        {
+            self.output.push_str("json_object(");
+            for (index, member) in node.members.iter().enumerate() {
+                if index != 0 {
+                    self.output.push_str(", ");
+                }
+                self.write_expr(&member.key);
+                self.output.push_str(", ");
+                self.write_expr(&member.value);
+            }
+            self.output.push(')');
+            return;
+        }
         // The grammar allows NULL/UNIQUE clauses only after a nonempty member
         // list. An empty list can only carry AstBuilder's true/false defaults.
         assert!(

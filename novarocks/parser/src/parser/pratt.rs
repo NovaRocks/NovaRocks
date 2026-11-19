@@ -2126,6 +2126,47 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                 call_span,
             ));
         }
+        // A plain positional JSON_OBJECT with complete pairs has the same
+        // member facts as the standard constructor. Keep incomplete calls
+        // and calls with modifiers in the legacy function binding path.
+        if matches!(name.parts.as_slice(), [part] if !part.quoted && part.value == "json_object")
+            && !has_quantifier
+            && order_by.is_none()
+            && separator.is_none()
+            && filter.is_none()
+            && null_treatment.is_none()
+            && window.is_none()
+            && !arguments.is_empty()
+            && arguments.len().is_multiple_of(2)
+            && !arguments.iter().any(|argument| {
+                matches!(&argument.expression, Expr::Binary(binary)
+                    if binary.operator == BinaryOperator::Legacy(crate::ast::legacy::BinaryOperator::NamedArgument))
+            })
+        {
+            let mut members = Vec::with_capacity(arguments.len() / 2);
+            let mut arguments = arguments.into_iter();
+            while let Some(key) = arguments.next() {
+                let value = arguments.next().expect("checked complete JSON_OBJECT pairs");
+                members.push(crate::ast::JsonObjectMember {
+                    span: Span::new(key.syntax_span.start(), value.syntax_span.end()),
+                    key: key.expression,
+                    value: value.expression,
+                    format: None,
+                });
+            }
+            return Ok(ParsedExpression::authored(
+                Expr::JsonObject(AstBox::new(crate::ast::JsonObject {
+                    members,
+                    null_on_null: true,
+                    unique_keys: false,
+                    returned_type: None,
+                    output_format: None,
+                    span: call_span,
+                })),
+                self.syntax_extent(begin),
+                call_span,
+            ));
+        }
         // Erase the legacy clause only after its complete source shape is
         // admitted. Ordinary calls remain raw for SQL policy preparation.
         let name = if let Some(separator) = separator {
