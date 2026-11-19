@@ -48,7 +48,7 @@ fn compile_selected_action(
         matched_action,
         insert,
     );
-    let sql = novarocks_parser::printer::print_query(&query);
+    let sql = novarocks_parser::printer::print_query(&query).unwrap();
     let control = SqlCompileControl::unbounded();
     let request = SqlFinalPlanCompileRequest::new(
         PlanVersionId::try_new([61; 16]).unwrap(),

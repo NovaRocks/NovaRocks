@@ -45,21 +45,6 @@ pub struct TruncateCommand {
     pub target_ref: String,
 }
 
-/// Lowers the parser-owned TRUNCATE syntax into the mutation lifecycle input.
-pub fn command_from_typed_statement(
-    statement: &novarocks_parser::ast::TruncateTable,
-) -> TruncateCommand {
-    TruncateCommand {
-        target_parts: statement
-            .name
-            .parts
-            .iter()
-            .map(|part| part.value.clone())
-            .collect(),
-        target_ref: statement.target_ref.clone(),
-    }
-}
-
 pub struct PlanTruncateRequest {
     pub command: TruncateCommand,
     pub current_catalog: Option<String>,

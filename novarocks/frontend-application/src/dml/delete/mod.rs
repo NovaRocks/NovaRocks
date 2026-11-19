@@ -18,26 +18,9 @@
 //! Frontend-owned DELETE statement recognition and application routing.
 
 use crate::dml::error::DmlError;
-use crate::dml::service::DmlService;
-use crate::query_execution::dml::delete::{
-    DeleteStatement, OwnedDeleteStatement, PreparedPredicateDelete,
-};
+use crate::query_execution::dml::delete::{OwnedDeleteStatement, PreparedPredicateDelete};
 use crate::query_execution::dml::mutation::RowMutationTarget;
 use novarocks_query_application::sql::dml_admission::DmlAdmissionError;
-
-impl DmlService {
-    /// Validate the parser-owned shape before forming a governed write action.
-    pub(crate) fn admit_delete_shape(
-        &self,
-        statement: DeleteStatement<'_>,
-        source: &str,
-    ) -> Result<(), DmlError> {
-        match statement {
-            DeleteStatement::Predicate(delete) => admit_predicate_delete(delete, source),
-            DeleteStatement::Equality => Ok(()),
-        }
-    }
-}
 
 pub(crate) fn prepare_trino_delete_shape(
     statement: novarocks_parser::ast::TrinoDelete,
@@ -104,12 +87,12 @@ mod execution_error_tests {
 #[cfg(test)]
 mod trino_tests {
     use super::*;
-    use novarocks_parser::{ast::TrinoStatement, trino_parser};
+    use novarocks_parser::{ast::TrinoStatement, parser};
 
     #[test]
     fn trino_delete_keeps_its_predicate_span_and_existing_where_admission() {
         let sql = "DELETE FROM c.s.branch_named@dev WHERE id = 9";
-        let TrinoStatement::Delete(delete) = trino_parser::parse_statement(sql).unwrap() else {
+        let TrinoStatement::Delete(delete) = parser::parse_statement(sql).unwrap() else {
             panic!("expected DELETE");
         };
         let OwnedDeleteStatement::Predicate(delete) =
@@ -124,7 +107,7 @@ mod trino_tests {
         assert_eq!(&sql[span.start()..span.end()], "id = 9");
 
         let sql = "DELETE FROM c.s.branch_named@dev";
-        let TrinoStatement::Delete(delete) = trino_parser::parse_statement(sql).unwrap() else {
+        let TrinoStatement::Delete(delete) = parser::parse_statement(sql).unwrap() else {
             panic!("expected DELETE");
         };
         let error = prepare_trino_delete_shape(delete, sql).unwrap_err();

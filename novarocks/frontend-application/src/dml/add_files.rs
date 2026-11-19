@@ -49,8 +49,8 @@ pub(crate) struct PreparedAddFilesAttempt {
 }
 
 impl DmlService {
-    /// Plans an admitted ADD FILES statement without beginning dispatch.
-    pub(crate) fn prepare_add_files(
+    #[cfg(test)]
+    fn prepare_add_files(
         &self,
         engine: &dyn AddFilesEngine,
         command: AddFilesCommand,
@@ -102,13 +102,10 @@ impl DmlService {
             ));
         }
         let publication_id = LakePublicationId::new_v7();
-        let session = context.session();
         let prepared = engine
             .plan_add_files(PlanAddFilesRequest {
                 command,
                 retained,
-                current_catalog: session.current_catalog().map(ToOwned::to_owned),
-                current_database: session.current_database().to_string(),
                 mutation_operation_id: publication_id.to_bytes(),
                 query_options: query_options.cloned(),
                 execution: context.execution().clone(),
@@ -280,7 +277,6 @@ fn finalization_error(
 
 fn plan_error(error: AddFilesPlanError) -> DmlError {
     match error {
-        AddFilesPlanError::ProcedureArgument(error) => DmlError::from_application(*error),
         AddFilesPlanError::KnownUncommitted(failure)
         | AddFilesPlanError::ContractFailure { failure, .. } => {
             DmlError::executor(&failure.message)

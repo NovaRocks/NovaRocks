@@ -18,10 +18,7 @@
 //! Frontend-owned UPDATE and MERGE application use cases.
 
 use crate::dml::error::DmlError;
-use crate::dml::service::DmlService;
-use crate::query_execution::dml::mutation::{
-    MutationStatementKind, OwnedMutationStatement, RowMutationTarget,
-};
+use crate::query_execution::dml::mutation::{OwnedMutationStatement, RowMutationTarget};
 use crate::query_execution::dml::mutation_flow::{
     PreparedMergeClause, PreparedMergeMatchedAction, PreparedMergeNotMatchedAction,
     PreparedMergeStatement, PreparedMutationAssignment, PreparedMutationSource,
@@ -29,125 +26,13 @@ use crate::query_execution::dml::mutation_flow::{
 };
 use novarocks_parser::{
     Span,
-    ast::{
-        self, DmlStatement, MergeClause, MutationSource, TrinoMerge, TrinoMergeCase, TrinoUpdate,
-    },
+    ast::{self, TrinoMerge, TrinoMergeCase, TrinoUpdate},
 };
 use novarocks_query_application::sql::dml_admission::DmlAdmissionError;
-
-impl DmlService {
-    /// Apply the original typed statement admission before any asynchronous
-    /// source or Provider action is created. Lowering reads only admitted spans.
-    pub(crate) fn prepare_mutation_shape(
-        &self,
-        statement: &DmlStatement,
-        source: &str,
-    ) -> Result<crate::query_execution::dml::mutation::OwnedMutationStatement, DmlError> {
-        admit_mutation(statement, source)?;
-        crate::query_execution::dml::mutation::lower_statement(statement, source)
-            .map_err(DmlError::executor)
-    }
-}
-
-fn admit_mutation(
-    statement: &DmlStatement,
-    source: &str,
-) -> Result<(MutationStatementKind, &'static str), DmlError> {
-    match statement {
-        DmlStatement::Update(statement) => {
-            if statement
-                .alias
-                .as_ref()
-                .is_some_and(|alias| !alias.columns.is_empty())
-                || statement
-                    .assignments
-                    .iter()
-                    .any(|assignment| assignment.target.parts.len() != 1)
-                || matches!(
-                    &statement.source,
-                    Some(MutationSource::Query { lateral: true, .. })
-                )
-                || matches!(
-                    &statement.source,
-                    Some(MutationSource::Query { alias: None, .. })
-                )
-            {
-                return Err(DmlError::admit(
-                    DmlAdmissionError::UpdateUnsupportedForm.to_user_error(
-                        source,
-                        statement.span,
-                        "UPDATE form is not supported by the current frontend capability",
-                    ),
-                ));
-            }
-            Ok((MutationStatementKind::Update, "UPDATE"))
-        }
-        DmlStatement::Merge(statement) => {
-            if statement
-                .target_alias
-                .as_ref()
-                .is_some_and(|alias| !alias.columns.is_empty())
-                || matches!(
-                    &statement.source,
-                    MutationSource::Query { lateral: true, .. }
-                        | MutationSource::Query { alias: None, .. }
-                )
-            {
-                return Err(DmlError::admit(
-                    DmlAdmissionError::MergeUnsupportedForm.to_user_error(
-                        source,
-                        statement.span,
-                        "MERGE form is not supported by the current frontend capability",
-                    ),
-                ));
-            }
-            admit_merge_cases(
-                statement.clauses.iter().map(legacy_merge_case_shape),
-                source,
-                statement.span,
-            )?;
-            Ok((MutationStatementKind::Merge, "MERGE"))
-        }
-        other => Err(DmlError::admit(
-            DmlAdmissionError::UpdateUnsupportedForm.to_user_error(
-                source,
-                other.span(),
-                "typed mutation entry requires UPDATE or MERGE",
-            ),
-        )),
-    }
-}
 
 enum MergeCaseShape {
     Matched { supported: bool },
     NotMatched { columns: usize, values: usize },
-    NotMatchedBySource,
-}
-
-fn legacy_merge_case_shape(clause: &MergeClause) -> (Span, MergeCaseShape) {
-    match clause {
-        MergeClause::Matched { action, span, .. } => {
-            let qualified_assignment = matches!(
-                action,
-                ast::MergeMatchedAction::Update { assignments, .. }
-                    if assignments.iter().any(|assignment| assignment.target.parts.len() != 1)
-            );
-            (
-                *span,
-                MergeCaseShape::Matched {
-                    supported: !qualified_assignment,
-                },
-            )
-        }
-        MergeClause::NotMatched { action, span, .. } => (
-            *span,
-            MergeCaseShape::NotMatched {
-                columns: action.columns.len(),
-                values: action.values.len(),
-            },
-        ),
-        MergeClause::NotMatchedBySource { span, .. } => (*span, MergeCaseShape::NotMatchedBySource),
-    }
 }
 
 fn trino_merge_case_shape(clause: &TrinoMergeCase) -> (Span, MergeCaseShape) {
@@ -197,13 +82,6 @@ fn admit_merge_cases(
                     ));
                 }
                 not_matched = true;
-            }
-            MergeCaseShape::NotMatchedBySource => {
-                return Err(merge_admit_error(
-                    source,
-                    span,
-                    "MERGE WHEN NOT MATCHED BY SOURCE is not supported",
-                ));
             }
         }
     }
@@ -382,12 +260,12 @@ fn merge_relation_base(relation: ast::Relation) -> Option<(ast::Relation, Option
 #[cfg(test)]
 mod trino_tests {
     use super::*;
-    use novarocks_parser::{ast::TrinoStatement, trino_parser};
+    use novarocks_parser::{ast::TrinoStatement, parser};
 
     #[test]
     fn trino_update_keeps_authored_assignment_order_and_explicit_branch() {
         let sql = r#"UPDATE c.s.tag_named@"dev branch" SET "other" = 4, id = 7 WHERE id = 9"#;
-        let TrinoStatement::Update(update) = trino_parser::parse_statement(sql).unwrap() else {
+        let TrinoStatement::Update(update) = parser::parse_statement(sql).unwrap() else {
             panic!("expected UPDATE");
         };
         let OwnedMutationStatement::Update(update) =
@@ -416,7 +294,7 @@ mod trino_tests {
         let sql = "MERGE INTO c.s.dst@audit AS d USING (SELECT 1 AS id) AS s ON d.id = s.id \
                    WHEN MATCHED AND s.id = 1 THEN UPDATE SET id = 7 \
                    WHEN NOT MATCHED THEN INSERT (id) VALUES (s.id)";
-        let TrinoStatement::Merge(merge) = trino_parser::parse_statement(sql).unwrap() else {
+        let TrinoStatement::Merge(merge) = parser::parse_statement(sql).unwrap() else {
             panic!("expected MERGE");
         };
         let OwnedMutationStatement::Merge(merge) = prepare_trino_merge_shape(merge, sql).unwrap()
@@ -469,7 +347,7 @@ mod trino_tests {
                 "MERGE form is not supported by the current frontend capability",
             ),
         ] {
-            let TrinoStatement::Merge(merge) = trino_parser::parse_statement(sql).unwrap() else {
+            let TrinoStatement::Merge(merge) = parser::parse_statement(sql).unwrap() else {
                 panic!("expected MERGE");
             };
             let error = prepare_trino_merge_shape(merge, sql).unwrap_err();

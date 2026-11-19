@@ -456,7 +456,6 @@ fn validate_where_predicate(
                 Err(format!("phase 1 DELETE WHERE does not support predicate `{other:?}`").into())
             }
         },
-        Expr::LegacyParenthesized(nested) => validate_where_predicate(&nested.expression, columns),
         other => Err(format!(
             "phase 1 DELETE WHERE supports comparison / IN / IS NULL / AND / OR \
              over primitive columns; rewrite this clause and retry. Unsupported: {other:?}"
@@ -623,7 +622,6 @@ fn is_literal_expr(expr: &Expr) -> bool {
         Expr::Unary(unary) if unary.operator == UnaryOperator::Minus => {
             matches!(unary.expression.as_ref(), Expr::Literal(_))
         }
-        Expr::LegacyParenthesized(nested) => is_literal_expr(&nested.expression),
         _ => false,
     }
 }
@@ -757,7 +755,6 @@ fn extract_string_literal(expr: &Expr) -> Option<&str> {
             LiteralKind::String(value) => Some(value.as_str()),
             _ => None,
         },
-        Expr::LegacyParenthesized(nested) => extract_string_literal(&nested.expression),
         _ => None,
     }
 }
@@ -766,7 +763,7 @@ fn extract_string_literal(expr: &Expr) -> Option<&str> {
 mod tests {
     use arrow::datatypes::DataType;
     use novarocks_parser::Span;
-    use novarocks_parser::ast::{DmlStatement, Expr, Literal, LiteralKind, Statement};
+    use novarocks_parser::ast::{Expr, Literal, LiteralKind};
 
     fn column(name: &str, data_type: DataType) -> novarocks_types::schema::ColumnDef {
         novarocks_types::schema::ColumnDef {
@@ -779,12 +776,13 @@ mod tests {
     }
 
     fn where_expr(sql: &str) -> Expr {
-        let statements = novarocks_parser::parse(&format!("DELETE FROM orders WHERE {sql}"))
-            .expect("parse DELETE");
-        let Statement::Dml(DmlStatement::Delete(delete)) = &statements[0] else {
+        let source = format!("DELETE FROM orders WHERE {sql}");
+        let novarocks_parser::ast::TrinoStatement::Delete(delete) =
+            novarocks_parser::parser::parse_statement(&source).unwrap()
+        else {
             panic!("expected DELETE");
         };
-        delete.selection.clone().expect("where clause")
+        delete.predicate.expect("WHERE clause")
     }
 
     /// Variant columns reach row DML as LargeBinary, which is what keeps them

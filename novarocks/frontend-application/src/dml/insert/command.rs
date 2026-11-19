@@ -16,10 +16,7 @@
 // under the License.
 
 use crate::query_execution::dml::insert::{InsertOverwriteMode, InsertTargetName};
-use novarocks_parser::{
-    ast::{self, Insert},
-    printer,
-};
+use novarocks_parser::{ast, printer};
 
 /// Frontend command retaining the parser's complete source and numeric text.
 #[derive(Clone, Debug, PartialEq)]
@@ -30,46 +27,6 @@ pub struct InsertCommand {
     pub overwrite_mode: InsertOverwriteMode,
 }
 
-/// Convert the typed INSERT statement into the frontend-owned execution command.
-pub fn convert_insert_command(insert: &Insert) -> Result<InsertCommand, String> {
-    let target_parts = insert
-        .target
-        .parts
-        .iter()
-        .map(|part| part.value.clone())
-        .collect::<Vec<_>>();
-
-    let overwrite_mode = if insert
-        .partitions
-        .as_ref()
-        .is_some_and(|partitions| partitions.dynamic)
-    {
-        if !insert.overwrite {
-            return Err("dynamic INSERT partitions require INSERT OVERWRITE".to_string());
-        }
-        InsertOverwriteMode::DynamicPartitions
-    } else if insert.overwrite {
-        InsertOverwriteMode::FullTable
-    } else {
-        InsertOverwriteMode::Append
-    };
-    validate_insert_source(&target_parts, &insert.source)?;
-    let source = Box::new(insert.source.clone());
-
-    Ok(InsertCommand {
-        target: InsertTargetName {
-            parts: target_parts,
-        },
-        columns: insert
-            .columns
-            .iter()
-            .map(|column| column.value.clone())
-            .collect(),
-        source,
-        overwrite_mode,
-    })
-}
-
 pub(super) fn validate_insert_source(
     target_parts: &[String],
     source: &ast::Query,
@@ -77,7 +34,7 @@ pub(super) fn validate_insert_source(
     if target_parts.is_empty() {
         return Err("INSERT target is empty after overwrite normalization".to_string());
     }
-    if legacy_literal_query(source) {
+    if admission_literal_query(source) {
         validate_literal_set_operations(&source.body)?;
     }
     Ok(())
@@ -87,7 +44,6 @@ pub(super) fn validate_insert_source(
 pub(crate) fn is_literal_expr(expr: &ast::Expr) -> bool {
     match expr {
         ast::Expr::Literal(_) => true,
-        ast::Expr::LegacyParenthesized(nested) => is_literal_expr(&nested.expression),
         ast::Expr::Unary(unary) => {
             matches!(unary.operator, ast::UnaryOperator::Minus)
                 && is_literal_expr(&unary.expression)
@@ -184,7 +140,7 @@ enum LiteralShape {
     Other,
 }
 
-fn legacy_literal_shape(expr: &ast::Expr) -> Option<LiteralShape> {
+fn admission_literal_shape(expr: &ast::Expr) -> Option<LiteralShape> {
     use LiteralShape::{Float, Integer, Other, String};
     match expr {
         ast::Expr::Literal(literal) => Some(match &literal.kind {
@@ -196,7 +152,6 @@ fn legacy_literal_shape(expr: &ast::Expr) -> Option<LiteralShape> {
             _ => Other,
         }),
         ast::Expr::Identifier(_) => Some(String),
-        ast::Expr::LegacyParenthesized(nested) => legacy_literal_shape(&nested.expression),
         ast::Expr::Cast(cast) => {
             if matches!(
                 match &cast.data_type.kind {
@@ -208,17 +163,17 @@ fn legacy_literal_shape(expr: &ast::Expr) -> Option<LiteralShape> {
             ) {
                 None
             } else {
-                legacy_literal_shape(&cast.expression)
+                admission_literal_shape(&cast.expression)
             }
         }
         ast::Expr::Unary(unary) if matches!(unary.operator, ast::UnaryOperator::Minus) => {
-            legacy_literal_shape(&unary.expression)
+            admission_literal_shape(&unary.expression)
                 .filter(|kind| matches!(kind, Integer | Float | String))
         }
         ast::Expr::Binary(binary) => match (
-            legacy_literal_shape(&binary.left)?,
+            admission_literal_shape(&binary.left)?,
             binary.operator,
-            legacy_literal_shape(&binary.right)?,
+            admission_literal_shape(&binary.right)?,
         ) {
             (
                 Integer,
@@ -233,18 +188,18 @@ fn legacy_literal_shape(expr: &ast::Expr) -> Option<LiteralShape> {
         ast::Expr::Array(array) => array
             .values
             .iter()
-            .all(|value| legacy_literal_shape(value).is_some())
+            .all(|value| admission_literal_shape(value).is_some())
             .then_some(Other),
         ast::Expr::Row(structure) => structure
             .fields
             .iter()
-            .all(|field| legacy_literal_shape(&field.expression).is_some())
+            .all(|field| admission_literal_shape(&field.expression).is_some())
             .then_some(Other),
         ast::Expr::FunctionCall(function) if plain_function(function) => {
             let name = printer::print_object_name(&function.name).to_ascii_lowercase();
             if name == "parse_json" {
                 return (function.arguments.len() == 1
-                    && legacy_literal_shape(&function.arguments[0].value) == Some(String))
+                    && admission_literal_shape(&function.arguments[0].value) == Some(String))
                 .then_some(String);
             }
             if !matches!(name.as_str(), "array" | "row" | "map" | "named_struct")
@@ -256,14 +211,14 @@ fn legacy_literal_shape(expr: &ast::Expr) -> Option<LiteralShape> {
             function
                 .arguments
                 .iter()
-                .all(|argument| legacy_literal_shape(&argument.value).is_some())
+                .all(|argument| admission_literal_shape(&argument.value).is_some())
                 .then_some(Other)
         }
         _ => None,
     }
 }
 
-fn legacy_literal_query(query: &ast::Query) -> bool {
+fn admission_literal_query(query: &ast::Query) -> bool {
     if !query.functions.is_empty()
         || query.with.is_some()
         || query.modifiers.order_by.is_some()
@@ -280,7 +235,7 @@ fn legacy_literal_query(query: &ast::Query) -> bool {
                     && select.from.is_none()
                     && select.projection.iter().all(|item| match item {
                         ast::SelectItem::SingleColumn(column) => {
-                            legacy_literal_shape(&column.expression).is_some()
+                            admission_literal_shape(&column.expression).is_some()
                         }
                         _ => false,
                     })
@@ -293,12 +248,12 @@ fn legacy_literal_query(query: &ast::Query) -> bool {
                             && !cells.has_named_fields()
                             && cells
                                 .iter()
-                                .all(|value| legacy_literal_shape(value).is_some())
+                                .all(|value| admission_literal_shape(value).is_some())
                     })
             }
             ast::SetExpr::Query(subquery) => {
                 let query = &subquery.query;
-                legacy_literal_query(query)
+                admission_literal_query(query)
             }
             ast::SetExpr::SetOperation(operation) => operation.inputs.iter().all(body_is_literal),
         }
@@ -342,11 +297,14 @@ mod tests {
     use super::*;
 
     fn convert(sql: &str) -> Result<InsertCommand, String> {
-        let statements = novarocks_parser::parse(sql).expect("parse INSERT");
-        let [ast::Statement::Dml(ast::DmlStatement::Insert(insert))] = statements.as_slice() else {
+        let ast::TrinoStatement::Insert(insert) =
+            novarocks_parser::parser::parse_statement(sql).expect("parse INSERT")
+        else {
             panic!("expected INSERT");
         };
-        convert_insert_command(insert)
+        super::super::prepare_trino_insert_shape(insert, sql)
+            .map(|(command, _)| command)
+            .map_err(|error| error.to_string())
     }
 
     #[test]
@@ -382,15 +340,12 @@ mod tests {
             "INSERT INTO t SELECT id FROM src ORDER BY id LIMIT 3",
             "INSERT INTO t VALUES (to_bitmap(11), hll_hash(5))",
         ] {
-            let statements = novarocks_parser::parse(sql).unwrap();
-            let [ast::Statement::Dml(ast::DmlStatement::Insert(insert))] = statements.as_slice()
+            let ast::TrinoStatement::Insert(insert) =
+                novarocks_parser::parser::parse_statement(sql).unwrap()
             else {
                 panic!("INSERT");
             };
-            assert_eq!(
-                *convert_insert_command(insert).unwrap().source,
-                insert.source
-            );
+            assert_eq!(*convert(sql).unwrap().source, *insert.query.as_ref());
         }
     }
 
@@ -401,13 +356,9 @@ mod tests {
                 .unwrap_err()
                 .contains("requires UNION ALL")
         );
-        let statements =
-            novarocks_parser::parse("INSERT INTO t SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3")
-                .unwrap();
-        let [ast::Statement::Dml(ast::DmlStatement::Insert(insert))] = statements.as_slice() else {
-            panic!("INSERT");
-        };
-        let mut source = insert.source.clone();
+        let mut source = convert("INSERT INTO t SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3")
+            .unwrap()
+            .source;
         let ast::SetExpr::SetOperation(operation) = source.body.as_mut() else {
             panic!("set operation");
         };

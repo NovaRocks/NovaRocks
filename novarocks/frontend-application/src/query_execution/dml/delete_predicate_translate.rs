@@ -131,7 +131,6 @@ fn flatten_and(expr: &Expr) -> Result<Vec<&Expr>, String> {
                  use only AND of comparisons / IN / IS NULL"
                     .to_string())
             }
-            Expr::LegacyParenthesized(expression) => walk(&expression.expression, out),
             _ => {
                 out.push(e);
                 Ok(())
@@ -215,9 +214,6 @@ fn translate_atom(
                 "DELETE WHERE supports comparison / IN / IS NULL only; got {other:?}"
             )),
         },
-        Expr::LegacyParenthesized(expression) => {
-            translate_atom(&expression.expression, schema, keys, keys_type, out)
-        }
         other => Err(format!(
             "DELETE WHERE atom must be col-op-lit / IN / IS NULL; got {other:?}"
         )),
@@ -460,7 +456,6 @@ fn split_datetime_fraction(raw: &str, column_name: &str) -> Result<(String, Stri
 mod tests {
     use super::*;
     use arrow::datatypes::DataType;
-    use novarocks_parser::ast::{DmlStatement, Statement};
 
     fn dup_schema_int_str() -> Vec<ColumnDef> {
         vec![
@@ -482,12 +477,13 @@ mod tests {
     }
 
     fn parse_where(sql: &str) -> Expr {
-        let statements =
-            novarocks_parser::parse(&format!("DELETE FROM t WHERE {sql}")).expect("parse");
-        let Statement::Dml(DmlStatement::Delete(delete)) = &statements[0] else {
+        let source = format!("DELETE FROM t WHERE {sql}");
+        let novarocks_parser::ast::TrinoStatement::Delete(delete) =
+            novarocks_parser::parser::parse_statement(&source).unwrap()
+        else {
             panic!("expected DELETE");
         };
-        delete.selection.clone().expect("WHERE clause")
+        delete.predicate.expect("WHERE clause")
     }
 
     #[test]

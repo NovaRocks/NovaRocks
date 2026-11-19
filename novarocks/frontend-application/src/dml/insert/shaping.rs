@@ -326,8 +326,7 @@ fn shape_body(
                     else {
                         return Err("INSERT literal source lost its original projection".into());
                     };
-                    let Some(expression_path) = explicit_variant_source_path(&column.expression)
-                    else {
+                    if !is_explicit_variant_cast(&column.expression) {
                         continue;
                     };
                     // This original source cast and the outer target are two
@@ -339,16 +338,15 @@ fn shape_body(
                             relation_path: relation_path.clone(),
                         },
                     );
-                    constants.constants.push(
-                        novarocks_sql::compiler::SqlExpressionConstant::new(
+                    constants
+                        .constants
+                        .push(novarocks_sql::compiler::SqlExpressionConstant::new(
                             path,
                             novarocks_sql::compiler::SqlConstantExpressionSite::SelectProjection {
                                 column: source_column,
                             },
                             value.clone(),
-                        )
-                        .with_expression_path(expression_path),
-                    );
+                        ));
                 }
             }
             constants.publish(authored, |column| {
@@ -507,15 +505,8 @@ pub(crate) fn omitted_insert_expr(column: &ColumnDef) -> Result<ast::Expr, Strin
 fn is_variant_cast(cast: &ast::CastExpr) -> bool {
     matches!(&cast.data_type.kind, ast::TypeKind::Generic(generic) if generic.name.value.eq_ignore_ascii_case("variant"))
 }
-fn explicit_variant_source_path(
-    mut expr: &ast::Expr,
-) -> Option<Vec<novarocks_sql::compiler::SqlConstantExpressionStep>> {
-    let mut path = Vec::new();
-    while let ast::Expr::LegacyParenthesized(nested) = expr {
-        path.push(novarocks_sql::compiler::SqlConstantExpressionStep::Nested);
-        expr = &nested.expression;
-    }
-    matches!(expr, ast::Expr::Cast(cast) if is_variant_cast(cast)).then_some(path)
+fn is_explicit_variant_cast(expr: &ast::Expr) -> bool {
+    matches!(expr, ast::Expr::Cast(cast) if is_variant_cast(cast))
 }
 
 fn constrain_literal(expr: ast::Expr, target: &FunctionValueType) -> Result<ast::Expr, String> {
@@ -535,10 +526,6 @@ fn constrain_literal_in(
             {
                 cast.expression = syntax;
             }
-        }
-        ast::Expr::LegacyParenthesized(nested) => {
-            *nested.expression =
-                constrain_literal_in((*nested.expression).clone(), target, encoded.as_deref_mut())?;
         }
         ast::Expr::Literal(value) => {
             if matches!(target.data_type(), DataType::Binary | DataType::LargeBinary)
@@ -659,9 +646,6 @@ fn variant_bytes_expr(bytes: &[u8], span: Span) -> ast::Expr {
     })
 }
 fn constant_variant_bytes(expr: &ast::Expr) -> Result<Option<Vec<u8>>, String> {
-    if let ast::Expr::LegacyParenthesized(nested) = expr {
-        return constant_variant_bytes(&nested.expression);
-    }
     let ast::Expr::FunctionCall(function) = expr else {
         return Ok(None);
     };
@@ -677,7 +661,6 @@ fn constant_variant_bytes(expr: &ast::Expr) -> Result<Option<Vec<u8>>, String> {
                 kind: ast::LiteralKind::String(text),
                 ..
             }) => Some(text),
-            ast::Expr::LegacyParenthesized(nested) => string_literal(&nested.expression),
             ast::Expr::Cast(cast)
                 if matches!(
                     match &cast.data_type.kind {
@@ -917,10 +900,6 @@ fn typed_write_literal_source(
     encoded: Option<&mut Option<Vec<u8>>>,
 ) -> Result<ast::Expr, String> {
     match &mut expression {
-        ast::Expr::LegacyParenthesized(nested) => {
-            *nested.expression =
-                typed_write_literal_source((*nested.expression).clone(), target, encoded)?;
-        }
         ast::Expr::Cast(cast)
             if is_variant_cast(cast)
                 && target.logical_type() == novarocks_type_contract::ValueLogicalType::Variant =>
@@ -1118,7 +1097,6 @@ fn source_assignment_before_common_type(query: &ast::Query) -> bool {
                     && select.selection.is_none()
                     && select.group_by.is_none()
                     && select.having.is_none()
-                    && select.legacy.qualify.is_none()
                     && select.windows.is_empty()
                     && select.projection.iter().all(|item| match item {
                         ast::SelectItem::SingleColumn(column) => {
@@ -1319,7 +1297,7 @@ fn capture_typed_write_body(
                 .declared_value_type()
                 .map_err(|error| error.to_string())?;
             if target.logical_type() != novarocks_type_contract::ValueLogicalType::Variant
-                || explicit_variant_source_path(expression).is_none()
+                || !is_explicit_variant_cast(expression)
             {
                 return Ok(());
             }
@@ -1404,10 +1382,7 @@ fn capture_typed_write_body(
 mod typed_write_source_tests {
     use super::*;
     fn query(sql: &str) -> ast::Query {
-        let statements = novarocks_parser::parse(sql).unwrap();
-        let [ast::Statement::Query(query)] = statements.as_slice() else {
-            panic!("query");
-        };
+        let query = novarocks_parser::parser::parse_query(sql).unwrap();
         query.clone()
     }
     fn column(name: &str, ty: DataType) -> ColumnDef {

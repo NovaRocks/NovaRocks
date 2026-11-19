@@ -938,17 +938,19 @@ mod tests {
                 .expect("checked columns")
             );
             assert_eq!(
-                printer::print_type_name(
+                printer::print_type(
                     &novarocks_sql::sql_type_syntax(&declared.declared_value_type().unwrap())
                         .expect("declared type")
-                ),
+                )
+                .unwrap(),
                 spelling
             );
             assert_eq!(
-                printer::print_type_name(
+                printer::print_type(
                     &novarocks_sql::sql_type_syntax(&plain.declared_value_type().unwrap())
                         .expect("plain type")
-                ),
+                )
+                .unwrap(),
                 "VARBINARY"
             );
         }
@@ -972,10 +974,7 @@ mod tests {
     }
 
     pub(super) fn parse_query(sql: &str) -> Query {
-        let statements = novarocks_parser::parse(sql).expect("parse query");
-        let [ast::Statement::Query(query)] = statements.as_slice() else {
-            panic!("expected exactly one query statement");
-        };
+        let query = novarocks_parser::parser::parse_query(sql).expect("parse query");
         query.clone()
     }
 
@@ -1045,13 +1044,13 @@ mod tests {
         let ast::SetExpr::Values(values) = query.body.as_ref() else {
             panic!(
                 "expected VALUES query, got: {}",
-                printer::print_query(&query)
+                printer::print_query(&query).unwrap()
             );
         };
         let row = values.rows.first().expect("one row");
         let rendered: Vec<String> = ast::ValuesRowCells::new(row)
             .iter()
-            .map(printer::print_expr)
+            .map(|expr| printer::print_expression(expr).unwrap())
             .collect();
         assert_eq!(rendered, vec!["10", "5", "30"]);
     }
@@ -1083,16 +1082,16 @@ mod tests {
         let ast::SetExpr::Values(values) = query.body.as_ref() else {
             panic!(
                 "expected VALUES query, got: {}",
-                printer::print_query(&query)
+                printer::print_query(&query).unwrap()
             );
         };
         let first_row: Vec<String> = ast::ValuesRowCells::new(&values.rows[0])
             .iter()
-            .map(printer::print_expr)
+            .map(|expr| printer::print_expression(expr).unwrap())
             .collect();
         let second_row: Vec<String> = ast::ValuesRowCells::new(&values.rows[1])
             .iter()
-            .map(printer::print_expr)
+            .map(|expr| printer::print_expression(expr).unwrap())
             .collect();
         assert_eq!(first_row, vec!["1", "'us'", "10.5"]);
         assert_eq!(second_row, vec!["2", "'eu'", "20"]);
@@ -1120,12 +1119,12 @@ mod tests {
         let ast::SetExpr::Values(values) = query.body.as_ref() else {
             panic!(
                 "expected VALUES query, got: {}",
-                printer::print_query(&query)
+                printer::print_query(&query).unwrap()
             );
         };
         let row: Vec<String> = ast::ValuesRowCells::new(&values.rows[0])
             .iter()
-            .map(printer::print_expr)
+            .map(|expr| printer::print_expression(expr).unwrap())
             .collect();
         assert_eq!(row, vec!["1", "NULL", "10"]);
     }
@@ -1165,7 +1164,7 @@ mod tests {
         let ast::SetExpr::Values(values) = query.body.as_ref() else {
             panic!(
                 "expected VALUES query, got: {}",
-                printer::print_query(&query)
+                printer::print_query(&query).unwrap()
             );
         };
         let ast::Expr::Literal(value) = ast::ValuesRowCells::new(&values.rows[0]).get(0).unwrap()
@@ -1192,7 +1191,7 @@ mod tests {
         let ast::SetExpr::Values(values) = query.body.as_ref() else {
             panic!(
                 "expected VALUES query, got: {}",
-                printer::print_query(&query)
+                printer::print_query(&query).unwrap()
             );
         };
         let ast::Expr::Literal(value) = ast::ValuesRowCells::new(&values.rows[0]).get(0).unwrap()
@@ -1251,7 +1250,7 @@ mod tests {
 
         use ast::SyntaxEq;
         let expected = parse_query(
-            "SELECT `__nr_insert_src`.`a` AS `a`, 7 AS `b`, `__nr_insert_src`.`c` AS `c` FROM (SELECT x, y FROM src) AS `__nr_insert_src`(`c`, `a`)",
+            "SELECT \"__nr_insert_src\".\"a\" AS \"a\", 7 AS \"b\", \"__nr_insert_src\".\"c\" AS \"c\" FROM (SELECT x, y FROM src) AS \"__nr_insert_src\"(\"c\", \"a\")",
         );
         assert!(
             query.syntax_eq(&expected),

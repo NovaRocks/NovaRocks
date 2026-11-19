@@ -17,6 +17,7 @@
 
 //! Typed DELETE input and preparation for the supervised write action.
 
+#[cfg(any(test, novarocks_dev_controls))]
 pub(crate) mod equality;
 pub(crate) mod standard;
 
@@ -26,16 +27,6 @@ use crate::query_execution::kernels::DmlExecutionKernel;
 use novarocks_proto_codec::lifecycle::QueryOptions;
 use novarocks_query_application::admitted_query_context::QueryExecutionContext;
 
-/// One DELETE variant admitted by the typed statement router.
-///
-/// The source is retained separately in [`DeleteStatementInput`] and may only
-/// be sliced through the authored statement's [`novarocks_parser::Span`].
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum DeleteStatement<'a> {
-    Predicate(&'a PreparedPredicateDelete),
-    Equality,
-}
-
 /// The authored WHERE and target facts retained by the original DELETE action.
 #[derive(Clone, Debug)]
 pub(crate) struct PreparedPredicateDelete {
@@ -44,22 +35,11 @@ pub(crate) struct PreparedPredicateDelete {
     pub(crate) span: novarocks_parser::Span,
 }
 
-impl PreparedPredicateDelete {
-    pub(crate) fn from_legacy(statement: novarocks_parser::ast::Delete) -> Self {
-        Self {
-            target: super::mutation::RowMutationTarget::from_legacy(&statement.target),
-            selection: statement.selection,
-            span: statement.span,
-        }
-    }
-}
-
 /// The admitted statement retained by the supervised write action.
 /// Source text is never reparsed to rediscover the statement or its target.
 #[derive(Clone, Debug)]
 pub(crate) enum OwnedDeleteStatement {
     Predicate(PreparedPredicateDelete),
-    Equality(novarocks_parser::ast::AddEqualityDelete),
     #[cfg(novarocks_dev_controls)]
     TrinoEquality {
         statement: equality::PreparedEqualityDelete,
@@ -97,9 +77,6 @@ pub(crate) fn resolve_target(
     match statement {
         OwnedDeleteStatement::Predicate(statement) => {
             standard::resolve_target(state, statement, current_catalog, current_database)
-        }
-        OwnedDeleteStatement::Equality(statement) => {
-            equality::resolve_target(state, statement, current_catalog, current_database)
         }
         #[cfg(novarocks_dev_controls)]
         OwnedDeleteStatement::TrinoEquality { .. } => Err(
@@ -232,24 +209,11 @@ pub(crate) async fn prepare_delete_write_async(
             )
             .await
         }
-        OwnedDeleteStatement::Equality(statement) => {
-            equality::prepare_equality_delete_statement_async(
-                state,
-                equality::EqualityDeleteStatement::Legacy(statement),
-                target,
-                target_ref,
-                planning_pin,
-                execution,
-                connector_context,
-                begin_receiving,
-            )
-            .await
-        }
         #[cfg(novarocks_dev_controls)]
         OwnedDeleteStatement::TrinoEquality { statement, .. } => {
             equality::prepare_equality_delete_statement_async(
                 state,
-                equality::EqualityDeleteStatement::Trino(statement),
+                statement,
                 target,
                 target_ref,
                 planning_pin,
@@ -311,24 +275,6 @@ async fn begin_delete_write_session_async(
     .map_err(|error| format!("begin connector write session: {error}"))
 }
 
-/// DELETE statements recognized by the frontend command router.
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DeleteStatementKind {
-    Predicate,
-    Equality,
-}
-
-impl DeleteStatement<'_> {
-    #[cfg(test)]
-    pub const fn kind(self) -> DeleteStatementKind {
-        match self {
-            Self::Predicate(_) => DeleteStatementKind::Predicate,
-            Self::Equality => DeleteStatementKind::Equality,
-        }
-    }
-}
-
 /// Complete original DELETE input retained by its governed statement source.
 pub struct DeleteStatementInput {
     pub(crate) statement: OwnedDeleteStatement,
@@ -362,26 +308,5 @@ impl DeleteEngine for DmlExecutionKernel {
         crate::catalog_application::resolver::TargetResolutionError,
     > {
         crate::query::delete_action::prepare(self.clone(), input)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use novarocks_parser::ast::{DmlStatement, Statement};
-
-    #[test]
-    fn typed_variant_determines_delete_kind() {
-        let statements =
-            novarocks_parser::parse("DELETE FROM t WHERE id = 1").expect("parse DELETE");
-        let Statement::Dml(DmlStatement::Delete(delete)) = statements.into_iter().next().unwrap()
-        else {
-            panic!("expected DELETE");
-        };
-
-        assert_eq!(
-            DeleteStatement::Predicate(&PreparedPredicateDelete::from_legacy(delete)).kind(),
-            DeleteStatementKind::Predicate
-        );
     }
 }

@@ -865,7 +865,7 @@ fn update_assignment_projection(
                 })?;
             Ok((
                 build::ident_at(&column.name, false, assignment.column_span),
-                build::legacy_nested(assignment.value.clone()),
+                assignment.value.clone(),
             ))
         })
         .collect()
@@ -999,7 +999,7 @@ fn build_merge_match_query(
         action_cases.push((
             build::and_all(vec![
                 build::is_null(qualify("_file"), true),
-                build::legacy_nested(matched_predicate.unwrap_or_else(|| build::boolean(true))),
+                matched_predicate.unwrap_or_else(|| build::boolean(true)),
             ])
             .expect("MERGE matched action has two predicates"),
             build::integer(i64::from(action)),
@@ -1009,7 +1009,7 @@ fn build_merge_match_query(
         action_cases.push((
             build::and_all(vec![
                 build::is_null(qualify("_file"), false),
-                build::legacy_nested(not_matched_predicate.unwrap_or_else(|| build::boolean(true))),
+                not_matched_predicate.unwrap_or_else(|| build::boolean(true)),
             ])
             .expect("MERGE not-matched action has two predicates"),
             build::integer(i64::from(MERGE_ACTION_NOT_MATCHED_INSERT)),
@@ -1039,7 +1039,7 @@ fn build_merge_match_query(
         ));
     }
     projection.push(build::item(
-        build::legacy_nested(action),
+        action,
         Some(build::ident("__nr_merge_action", false)),
     ));
     for column in target_columns {
@@ -1054,7 +1054,7 @@ fn build_merge_match_query(
     ] {
         projection.extend(values.into_iter().map(|(column, expr)| {
             build::item(
-                build::legacy_nested(expr),
+                expr,
                 Some(build::ident_at(
                     format!("{prefix}{}", column.value),
                     false,
@@ -1122,7 +1122,7 @@ fn build_merge_mor_producer(
                     })?;
                 Ok((
                     build::ident_at(&column.name, false, assignment.column_span),
-                    build::legacy_nested(assignment.value.clone()),
+                    assignment.value.clone(),
                 ))
             })
             .collect::<Result<Vec<_>, String>>()?,
@@ -1133,10 +1133,7 @@ fn build_merge_mor_producer(
         for column in columns {
             if let Some(index) = column.value_index {
                 let expr = clause.action.values[index].clone();
-                insert_values.push((
-                    build::ident(&column.name, false),
-                    build::legacy_nested(expr),
-                ));
+                insert_values.push((build::ident(&column.name, false), expr));
             }
         }
     }
@@ -1343,12 +1340,7 @@ mod tests {
     use novarocks_types::schema::ColumnDef;
 
     fn test_query(source: &str) -> ast::Query {
-        let [ast::Statement::Query(query)]: [ast::Statement; 1] =
-            novarocks_parser::parse(source).unwrap().try_into().unwrap()
-        else {
-            panic!("query fixture");
-        };
-        query
+        novarocks_parser::parser::parse_query(source).unwrap()
     }
     fn test_expr(source: &str) -> ast::Expr {
         let query = test_query(&format!("SELECT {source}"));
@@ -1362,26 +1354,26 @@ mod tests {
         column.into_inner().expression
     }
     fn prepared_update(source: &str) -> PreparedUpdateStatement {
-        let [ast::Statement::Dml(statement)]: [ast::Statement; 1] =
-            novarocks_parser::parse(source).unwrap().try_into().unwrap()
+        let ast::TrinoStatement::Update(statement) =
+            novarocks_parser::parser::parse_statement(source).unwrap()
         else {
             panic!("update fixture");
         };
         let super::super::mutation::OwnedMutationStatement::Update(prepared) =
-            super::super::mutation::lower_statement(&statement, source).unwrap()
+            crate::dml::mutation::prepare_trino_update_shape(statement, source).unwrap()
         else {
             panic!("update fixture");
         };
         *prepared
     }
     fn prepared_merge(source: &str) -> PreparedMergeStatement {
-        let [ast::Statement::Dml(statement)]: [ast::Statement; 1] =
-            novarocks_parser::parse(source).unwrap().try_into().unwrap()
+        let ast::TrinoStatement::Merge(statement) =
+            novarocks_parser::parser::parse_statement(source).unwrap()
         else {
             panic!("merge fixture");
         };
         let super::super::mutation::OwnedMutationStatement::Merge(prepared) =
-            super::super::mutation::lower_statement(&statement, source).unwrap()
+            crate::dml::mutation::prepare_trino_merge_shape(statement, source).unwrap()
         else {
             panic!("merge fixture");
         };
@@ -1505,15 +1497,11 @@ mod tests {
 
     #[test]
     fn mor_source_table_and_internal_names_keep_admitted_identity() {
-        let prepared = prepared_update(
-            "UPDATE ice.db1.t AS t SET `odd name` = 7 FROM other.db2.source AS s WHERE t.id = s.id",
+        let merge = prepared_merge(
+            "MERGE INTO ice.db1.t AS t\nUSING other.db2.source AS s\nON t.id = s.id\nWHEN MATCHED THEN UPDATE SET \"odd name\" = 7",
         );
-        let source = mutation_source_relation(
-            prepared.source.as_ref().unwrap(),
-            Some("ice"),
-            &iceberg_target(),
-        )
-        .unwrap();
+        let source =
+            mutation_source_relation(&merge.source, Some("ice"), &iceberg_target()).unwrap();
         let ast::Relation::Aliased(source) = source else {
             panic!("source alias");
         };
@@ -1529,6 +1517,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["other", "db2", "source"]
         );
+        let prepared = prepared_update("UPDATE ice.db1.t SET \"odd name\" = 7 WHERE id = 1");
         let columns = [col("id"), col("odd name")];
         let query = build_update_match_query(
             mutation_target_relation(&iceberg_target(), build::ident("t", false), "main").unwrap(),
@@ -1575,12 +1564,9 @@ mod tests {
         let columns = [col("id"), col("v")];
         let source = "UPDATE ice.db1.t SET v = 99 WHERE id = 1";
         let original = prepared_update(source);
-        let [ast::Statement::Dml(mut statement)]: [ast::Statement; 1] =
-            novarocks_parser::parse(source).unwrap().try_into().unwrap()
+        let ast::TrinoStatement::Update(mut update) =
+            novarocks_parser::parser::parse_statement(source).unwrap()
         else {
-            panic!("UPDATE");
-        };
-        let ast::DmlStatement::Update(update) = &mut statement else {
             panic!("UPDATE");
         };
         let ast::Expr::Literal(value) = &mut update.assignments[0].value else {
@@ -1588,7 +1574,7 @@ mod tests {
         };
         value.span = novarocks_parser::Span::new(source.len() + 1, source.len() + 2);
         let super::super::mutation::OwnedMutationStatement::Update(lowered) =
-            super::super::mutation::lower_statement(&statement, source).unwrap()
+            crate::dml::mutation::prepare_trino_update_shape(update, source).unwrap()
         else {
             panic!("UPDATE");
         };
@@ -1602,19 +1588,12 @@ mod tests {
 
         let source = "MERGE INTO ice.db1.t t USING (SELECT 1 AS id, 3 AS v) s ON t.id = s.id WHEN MATCHED THEN UPDATE SET v = 99";
         let original = prepared_merge(source);
-        let [ast::Statement::Dml(mut statement)]: [ast::Statement; 1] =
-            novarocks_parser::parse(source).unwrap().try_into().unwrap()
+        let ast::TrinoStatement::Merge(mut merge) =
+            novarocks_parser::parser::parse_statement(source).unwrap()
         else {
             panic!("MERGE");
         };
-        let ast::DmlStatement::Merge(merge) = &mut statement else {
-            panic!("MERGE");
-        };
-        let ast::MergeClause::Matched {
-            action: ast::MergeMatchedAction::Update { assignments, .. },
-            ..
-        } = &mut merge.clauses[0]
-        else {
+        let ast::TrinoMergeCase::Update { assignments, .. } = &mut merge.cases[0] else {
             panic!("UPDATE clause");
         };
         let ast::Expr::Literal(value) = &mut assignments[0].value else {
@@ -1622,7 +1601,7 @@ mod tests {
         };
         value.span = novarocks_parser::Span::new(source.len() + 1, source.len() + 2);
         let super::super::mutation::OwnedMutationStatement::Merge(lowered) =
-            super::super::mutation::lower_statement(&statement, source).unwrap()
+            crate::dml::mutation::prepare_trino_merge_shape(merge, source).unwrap()
         else {
             panic!("MERGE");
         };
@@ -1747,7 +1726,7 @@ mod tests {
                 panic!("MERGE join");
             };
             *join.right = test_relation(
-                "(SELECT 1 AS id, 2 AS v, 'f' AS _file, CAST(0 AS BIGINT) AS _pos, CAST(1 AS BIGINT) AS _row_id, CAST(1 AS BIGINT) AS _last_updated_sequence_number, CAST(0 AS INT) AS _spec_id, CAST(NULL AS STRUCT<bucket INT>) AS _partition) AS t",
+                "(SELECT 1 AS id, 2 AS v, 'f' AS _file, CAST(0 AS BIGINT) AS _pos, CAST(1 AS BIGINT) AS _row_id, CAST(1 AS BIGINT) AS _last_updated_sequence_number, CAST(0 AS INTEGER) AS _spec_id, CAST(NULL AS ROW(bucket INTEGER)) AS _partition) AS t",
             );
             let error = analyze_mutation_query(query).unwrap_err();
             let error = crate::dml::error::DmlExecutionError::from_compile(error)
@@ -1825,7 +1804,7 @@ mod tests {
         let target =
             mutation_target_relation(&iceberg_target(), build::ident("t", false), "dev").unwrap();
         assert!(target.syntax_eq(&test_relation(
-            "`ice`.`db1`.`t` FOR VERSION AS OF 'dev' AS t"
+            r#""ice"."db1"."t" FOR VERSION AS OF 'dev' AS t"#
         )));
     }
 
@@ -1864,7 +1843,7 @@ mod tests {
             Some(test_expr("t.id = s.id")),
         )
         .unwrap();
-        assert!(query.syntax_eq(&test_query("SELECT t._file AS __nr_file, t._pos AS __nr_pos, t._row_id AS __nr_row_id, t._last_updated_sequence_number AS __nr_last_updated_sequence_number, t._spec_id AS __nr_spec_id, t._partition AS __nr_partition, t.*, (src_v) AS __nr_new_v FROM `ice`.`db1`.`t` AS t CROSS JOIN staging.s AS s WHERE t.id = s.id")));
+        assert!(query.syntax_eq(&test_query("SELECT t._file AS __nr_file, t._pos AS __nr_pos, t._row_id AS __nr_row_id, t._last_updated_sequence_number AS __nr_last_updated_sequence_number, t._spec_id AS __nr_spec_id, t._partition AS __nr_partition, t.*, (src_v) AS __nr_new_v FROM \"ice\".\"db1\".\"t\" AS t CROSS JOIN staging.s AS s WHERE t.id = s.id")));
     }
 
     fn typed_col(name: &str, data_type: DataType) -> ColumnDef {
@@ -1913,10 +1892,7 @@ mod tests {
                 _ => None,
             })
             .unwrap();
-        let ast::Expr::LegacyParenthesized(action) = action else {
-            panic!("action expression boundary");
-        };
-        let ast::Expr::SearchedCase(case) = action.expression.as_ref() else {
+        let ast::Expr::SearchedCase(case) = action else {
             panic!("ordered action CASE");
         };
         assert_eq!(case.when_clauses.len(), 2);
@@ -1960,11 +1936,8 @@ mod tests {
                 .unwrap_or_else(|never| match never {})
                 .is_some_and(|chain| chain.last().value == "_file")
             );
-            let ast::Expr::LegacyParenthesized(clause) = &condition.terms[1] else {
-                panic!("original clause boundary");
-            };
-            assert_eq!(clause.expression.as_ref(), original);
-            assert_eq!(clause.expression.span(), original.span());
+            assert_eq!(&condition.terms[1], original);
+            assert_eq!(condition.terms[1].span(), original.span());
             assert!(
                 matches!(&branch.result, ast::Expr::Literal(ast::Literal { kind: ast::LiteralKind::Long { parsed_value, .. }, .. }) if *parsed_value == i64::from(result))
             );
@@ -1999,11 +1972,11 @@ mod tests {
         for (alias, expected) in [
             (
                 "id",
-                "CASE WHEN t.`_file` IS NOT NULL THEN t.`id` ELSE NULL END",
+                r#"CASE WHEN t."_file" IS NOT NULL THEN t."id" ELSE NULL END"#,
             ),
             (
                 "__nr_row_id",
-                "CASE WHEN t.`_file` IS NOT NULL THEN t.`_row_id` ELSE NULL END",
+                r#"CASE WHEN t."_file" IS NOT NULL THEN t."_row_id" ELSE NULL END"#,
             ),
             ("__nr_new_v", "(s.v)"),
             ("__nr_ins_id", "(s.id)"),

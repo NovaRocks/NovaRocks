@@ -34,10 +34,7 @@ fn column(name: &str, data_type: DataType) -> ColumnDef {
 }
 
 fn parse_query(sql: &str) -> ast::Query {
-    let statements = novarocks_parser::parse(sql).expect("test query should parse");
-    let [ast::Statement::Query(query)] = statements.as_slice() else {
-        panic!("expected one query");
-    };
+    let query = novarocks_parser::parser::parse_query(sql).expect("test query should parse");
     query.clone()
 }
 
@@ -180,7 +177,7 @@ fn cast_input<'a>(expr: &'a ast::Expr, target: &str) -> &'a ast::Expr {
     let ast::Expr::Cast(cast) = expr else {
         panic!("expected target CAST, got {expr:?}");
     };
-    assert_eq!(printer::print_type_name(&cast.data_type), target);
+    assert_eq!(printer::print_type(&cast.data_type).unwrap(), target);
     &cast.expression
 }
 
@@ -334,7 +331,7 @@ fn explicit_casts_keep_their_original_expression_and_declared_type() {
             "ARRAY<DECIMAL(18, 9)>",
         ),
         (
-            "VALUES (ARRAY<DOUBLE>[123456789.123456789, 1.25e2])",
+            "VALUES (CAST([123456789.123456789, 1.25e2] AS ARRAY<DOUBLE>))",
             array_type(decimal_type()),
             "ARRAY<DECIMAL(18, 9)>",
         ),
@@ -779,7 +776,7 @@ fn column_mapping_reorders_and_fills_only_omitted_columns() {
     .unwrap();
     let rendered: Vec<_> = rows(&query)[0]
         .iter()
-        .map(|expr| printer::print_expr(expr))
+        .map(|expr| printer::print_expression(expr).unwrap())
         .collect();
     assert_eq!(
         rendered,
@@ -802,7 +799,7 @@ fn column_mapping_reorders_and_fills_only_omitted_columns() {
     assert_eq!(
         rows(&query)[0]
             .iter()
-            .map(|expr| printer::print_expr(expr))
+            .map(|expr| printer::print_expression(expr).unwrap())
             .collect::<Vec<_>>(),
         rendered
     );
@@ -901,12 +898,11 @@ fn literal_target_casts_keep_original_bitmap_and_hll_declarations() {
             FunctionValueType::try_with_logical_type(DataType::Binary, true, domain).unwrap();
         let target = ColumnDef::from_value_type("v".into(), declared, None).unwrap();
         let query = shape(&format!("VALUES (({source}))"), &[target]);
-        let ast::Expr::LegacyParenthesized(nested) = cast_input(rows(&query)[0][0], target_name)
-        else {
-            panic!("source parentheses must stay on the original path");
-        };
-        let original_call = cast_input(&nested.expression, target_name);
-        assert_eq!(printer::print_expr(original_call), source);
+        let original_call = cast_input(rows(&query)[0][0], target_name);
+        assert!(ast::SyntaxEq::syntax_eq(
+            original_call,
+            &novarocks_parser::parser::parse_expression(source).unwrap(),
+        ));
         analyze_shaped_query(query)
             .expect("the actual compiler must accept the original complete opaque cast");
         let error =

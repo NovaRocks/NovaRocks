@@ -27,10 +27,7 @@ use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
 use novarocks_types::schema::ColumnDef;
 
 fn parse_query(sql: &str) -> ast::Query {
-    let statements = novarocks_parser::parse(sql).unwrap();
-    let [ast::Statement::Query(query)] = statements.as_slice() else {
-        panic!("query")
-    };
+    let query = novarocks_parser::parser::parse_query(sql).unwrap();
     query.clone()
 }
 fn columns() -> Vec<ColumnDef> {

@@ -442,35 +442,38 @@ mod tests {
 
     #[test]
     fn parse_create_table_if_not_exists_sets_flag() {
-        use novarocks_parser::ast::{DmlStatement, Statement, TableStatement};
+        use novarocks_parser::ast::{StatementSaveMode, TrinoStatement};
 
-        let parsed = novarocks_parser::parse("CREATE TABLE IF NOT EXISTS t AS SELECT 1 AS x")
-            .expect("parse");
-        let [Statement::Dml(DmlStatement::CreateTableAsSelect(stmt))] = parsed.as_slice() else {
+        let parsed = novarocks_parser::parser::parse_statement(
+            "CREATE TABLE IF NOT EXISTS t AS SELECT 1 AS x",
+        )
+        .expect("parse");
+        let TrinoStatement::CreateTableAsSelect(stmt) = parsed else {
             panic!("expected CTAS");
         };
-        let TableStatement::Create(table) = &stmt.table;
-        assert!(
-            table.if_not_exists,
+        assert_eq!(
+            stmt.save_mode,
+            StatementSaveMode::Ignore,
             "IF NOT EXISTS must set the if_not_exists field to true"
         );
         assert_eq!(
-            novarocks_parser::printer::print_query(&stmt.query),
+            novarocks_parser::printer::print_query(&stmt.query).unwrap(),
             "SELECT 1 AS x"
         );
     }
 
     #[test]
     fn parse_create_table_without_if_not_exists_flag_is_false() {
-        use novarocks_parser::ast::{DmlStatement, Statement, TableStatement};
+        use novarocks_parser::ast::{StatementSaveMode, TrinoStatement};
 
-        let parsed = novarocks_parser::parse("CREATE TABLE t AS SELECT 1 AS x").expect("parse");
-        let [Statement::Dml(DmlStatement::CreateTableAsSelect(stmt))] = parsed.as_slice() else {
+        let parsed = novarocks_parser::parser::parse_statement("CREATE TABLE t AS SELECT 1 AS x")
+            .expect("parse");
+        let TrinoStatement::CreateTableAsSelect(stmt) = parsed else {
             panic!("expected CTAS");
         };
-        let TableStatement::Create(table) = &stmt.table;
-        assert!(
-            !table.if_not_exists,
+        assert_eq!(
+            stmt.save_mode,
+            StatementSaveMode::Fail,
             "without IF NOT EXISTS the flag should be false"
         );
     }
