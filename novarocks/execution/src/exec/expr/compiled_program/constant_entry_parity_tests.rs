@@ -576,7 +576,7 @@ fn constant_entry_every_family_matches_real_noop_sql_constant_root() {
             boolean(Some(true)),
         ),
         (
-            "1 <=> 1",
+            "1 IS NOT DISTINCT FROM 1",
             Family::NullSafe,
             false,
             vec![int(Some(1)), int(Some(1))],
@@ -690,7 +690,7 @@ fn constant_entry_every_family_matches_real_noop_sql_constant_root() {
             bigint(None),
         ),
         (
-            "CAST(NULL AS BIGINT) <=> CAST(NULL AS BIGINT)",
+            "CAST(NULL AS BIGINT) IS NOT DISTINCT FROM CAST(NULL AS BIGINT)",
             Family::NullSafe,
             false,
             vec![bigint(None), bigint(None)],

@@ -16,9 +16,19 @@
 // under the License.
 use novarocks_functions::ConstantPolicy;
 
-/// Parse one owned query before handing test syntax to the compiler.
+/// Parse one owned query from a statement fixture before compiling it.
 pub fn parse_query(sql: &str) -> Box<novarocks_parser::ast::Query> {
-    Box::new(novarocks_parser::parser::parse_query(sql).expect("parse test query"))
+    use novarocks_parser::parser::{frame_statements, parse_query};
+
+    let frames = frame_statements(sql).expect("frame test query");
+    let [frame] = frames.as_slice() else {
+        panic!(
+            "expected one test query, found {} statement frames",
+            frames.len()
+        );
+    };
+    let query = &sql[frame.source.start()..frame.source.end()];
+    Box::new(parse_query(query).expect("parse test query"))
 }
 
 /// Constant admission shared by the SQL source fixtures.
