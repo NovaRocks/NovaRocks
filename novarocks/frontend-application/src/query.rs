@@ -72,7 +72,9 @@ use novarocks_query_application::session::{
 };
 use novarocks_query_application::session_control::{
     GovernedQueryStatementBeginError, GovernedQueryStatementOwner, GovernedStatementAction,
-    QueryControlService, QuerySessionLease, SessionIdentity, SessionToken, StatementToken,
+    QueryControlService, QuerySessionLease, SessionIdentity, SessionToken, StatementActionReady,
+    StatementActionValue, StatementCommandCompletion, StatementCompletionProjection,
+    StatementToken,
 };
 use novarocks_query_application::session_effects::SessionEffects;
 use novarocks_query_application::session_error::{QueryServiceError, QueryServiceErrorKind};
@@ -899,6 +901,14 @@ where
         })
         .await
 }
+
+type TypedCommandWorker = Pin<
+    Box<
+        dyn Future<
+                Output = Result<(Result<StatementResult, RoutedExecutionError>, WorkOwner), String>,
+            > + Send,
+    >,
+>;
 
 /// Runs a DML plan and its external-effect dispatch as distinct governed
 /// blocking edges. A successful plan is still pre-dispatch state, so the
@@ -2330,19 +2340,28 @@ impl FrontendQuerySession {
 
     async fn finish_command_worker(
         &self,
+        statement: novarocks_query_application::session_control::GovernedQueryStatementOwner,
+        cancellation: QueryCancellationView,
+        timeout_duration: Option<Duration>,
+        worker: &mut TypedCommandWorker,
+    ) -> Result<StatementResult, QueryServiceError> {
+        self.finish_command_worker_with_unknown_count(
+            statement,
+            cancellation,
+            timeout_duration,
+            worker,
+            None,
+        )
+        .await
+    }
+
+    async fn finish_command_worker_with_unknown_count(
+        &self,
         mut statement: novarocks_query_application::session_control::GovernedQueryStatementOwner,
         cancellation: QueryCancellationView,
         timeout_duration: Option<Duration>,
-        mut worker: &mut Pin<
-            Box<
-                dyn Future<
-                        Output = Result<
-                            (Result<StatementResult, RoutedExecutionError>, WorkOwner),
-                            String,
-                        >,
-                    > + Send,
-            >,
-        >,
+        mut worker: &mut TypedCommandWorker,
+        count_projection: Option<StatementCompletionProjection>,
     ) -> Result<StatementResult, QueryServiceError> {
         let (result, execution_owner) = if let Some(timeout_duration) = timeout_duration {
             match tokio::time::timeout(timeout_duration, &mut worker).await {
@@ -2411,6 +2430,23 @@ impl FrontendQuerySession {
         }
         match result {
             Ok(StatementResult::Query(result)) => Ok(self.governed_local_result(result, statement)),
+            Ok(StatementResult::Ok) if count_projection.is_some() => {
+                let projection = count_projection.expect("guard selected command count projection");
+                // The branch TRUNCATE publication reports a planning summary,
+                // not the count of visible rows removed by this DELETE.
+                let mut ready = StatementActionReady::new(
+                    Ok(StatementActionValue::Ok(
+                        StatementCommandCompletion::no_count(),
+                    )),
+                    statement,
+                );
+                ready.prepare_completion(projection.shape(), projection.family());
+                let mut ready = Some(ready);
+                let mut output = None;
+                StatementActionReady::transfer_protocol_in(&mut ready, &mut output)
+                    .map_err(internal_error)?;
+                Ok(output.expect("command completion installed"))
+            }
             Ok(StatementResult::Ok) => Ok(StatementResult::GovernedCompletion(
                 GovernedCompletionStatementResult::new(
                     novarocks_query_application::session_control::StatementCommandCompletion::empty(

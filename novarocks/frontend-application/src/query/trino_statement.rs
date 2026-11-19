@@ -3,10 +3,11 @@
 //! Temporary typed statement entrance for Trino compatibility tests.
 
 use super::*;
+use crate::query_execution::dml::truncate::TruncateCommand;
 use novarocks_query_application::{
     admitted_query_context::QueryResultCapacityBinding,
     session::{QuerySessionStatement, StatementAdmission, StatementOutputShape},
-    session_control::GovernedQueryStatementOwner,
+    session_control::{GovernedQueryStatementOwner, StatementCompletionProjection},
     sql::trino_admission::{
         TrinoQueryAction, TrinoStatementAction, TrinoStatementPreparation, admit_trino_statement,
     },
@@ -370,6 +371,9 @@ fn preparation_plan(
         Prep::FastForwardBranch(_) | Prep::ShowBranches(_) => management(Call),
         Prep::Insert(_) => CommandPlan::write(Insert, true),
         Prep::Delete(_) => CommandPlan::write(Delete, true),
+        Prep::DeleteEntireBranch { .. } => {
+            CommandPlan::management(Delete, StatementOutputShape::Rows, true)
+        }
         Prep::Update(_) => CommandPlan::write(Update, true),
         Prep::Merge(_) => CommandPlan::write(Merge, true),
         Prep::Call(node) => {
@@ -477,43 +481,14 @@ impl FrontendQuerySession {
                     return self.run_trino_action(statement, action).await;
                 }
                 CatalogSqlCommand::TruncateTable { table, target_ref } => {
-                    let execution_owner = statement
-                        .take_execution_owner()
-                        .expect("SQL command has one execution owner");
-                    let dml = Arc::clone(&self.service.dml);
-                    let engine = Arc::clone(&self.service.truncate_engine);
-                    let prepare_dml = Arc::clone(&dml);
-                    let prepare_engine = Arc::clone(&engine);
-                    let mut worker = Box::pin(execute_prepared_dml_statement(
-                        self.service.query_blocking_executor.clone(),
-                        input.cancellation.clone(),
-                        execution_owner,
-                        input.command.result_window_alias(),
-                        move || {
-                            prepare_dml
-                                .prepare_truncate(
-                                    prepare_engine.as_ref(),
-                                    crate::query_execution::dml::truncate::TruncateCommand {
-                                        target_parts: table.parts,
-                                        target_ref,
-                                    },
-                                    &input.request,
-                                    Some(&input.options),
-                                )
-                                .map_err(|error| RoutedExecutionError::Engine(error.to_string()))
-                        },
-                        move |prepared| {
-                            dml.execute_prepared_truncate(engine.as_ref(), prepared)
-                                .map(|()| StatementResult::Ok)
-                                .map_err(|error| RoutedExecutionError::Engine(error.to_string()))
-                        },
-                    )) as TypedCommandWorker;
                     return self
-                        .finish_command_worker(
-                            statement,
-                            input.cancellation,
-                            input.timeout_duration,
-                            &mut worker,
+                        .execute_trino_truncate(
+                            TruncateCommand {
+                                target_parts: table.parts,
+                                target_ref,
+                            },
+                            None,
+                            CommandEntry { statement, input },
                         )
                         .await;
                 }
@@ -574,13 +549,55 @@ impl FrontendQuerySession {
     }
 }
 
-type TypedCommandWorker = Pin<
-    Box<
-        dyn Future<
-                Output = Result<(Result<StatementResult, RoutedExecutionError>, WorkOwner), String>,
-            > + Send,
-    >,
->;
+impl FrontendQuerySession {
+    async fn execute_trino_truncate(
+        &self,
+        command: TruncateCommand,
+        count_projection: Option<StatementCompletionProjection>,
+        entry: CommandEntry,
+    ) -> Result<StatementResult, QueryServiceError> {
+        let CommandEntry {
+            mut statement,
+            input,
+        } = entry;
+        let execution_owner = statement
+            .take_execution_owner()
+            .expect("SQL command has one execution owner");
+        let dml = Arc::clone(&self.service.dml);
+        let engine = Arc::clone(&self.service.truncate_engine);
+        let prepare_dml = Arc::clone(&dml);
+        let prepare_engine = Arc::clone(&engine);
+        let mut worker = Box::pin(execute_prepared_dml_statement(
+            self.service.query_blocking_executor.clone(),
+            input.cancellation.clone(),
+            execution_owner,
+            input.command.result_window_alias(),
+            move || {
+                prepare_dml
+                    .prepare_truncate(
+                        prepare_engine.as_ref(),
+                        command,
+                        &input.request,
+                        Some(&input.options),
+                    )
+                    .map_err(|error| RoutedExecutionError::Engine(error.to_string()))
+            },
+            move |prepared| {
+                dml.execute_prepared_truncate(engine.as_ref(), prepared)
+                    .map(|()| StatementResult::Ok)
+                    .map_err(|error| RoutedExecutionError::Engine(error.to_string()))
+            },
+        )) as TypedCommandWorker;
+        self.finish_command_worker_with_unknown_count(
+            statement,
+            input.cancellation,
+            input.timeout_duration,
+            &mut worker,
+            count_projection,
+        )
+        .await
+    }
+}
 
 impl FrontendQuerySession {
     async fn execute_trino_preparation(
@@ -746,6 +763,33 @@ impl FrontendQuerySession {
                     .execute_trino_write(
                         source,
                         TrinoWrite::Insert(node),
+                        CommandEntry { statement, input },
+                    )
+                    .await;
+            }
+            Prep::DeleteEntireBranch { table, branch } => {
+                let projection = self
+                    .state
+                    .lock()
+                    .map_err(poisoned_state)?
+                    .presentation()
+                    .copied()
+                    .map(|family| {
+                        StatementCompletionProjection::new(StatementOutputShape::Rows, family)
+                    });
+                let Some(projection) = projection else {
+                    return Ok(self.governed_typed_error(
+                        internal_error("client statement requires an explicit presentation"),
+                        statement,
+                    ));
+                };
+                return self
+                    .execute_trino_truncate(
+                        TruncateCommand {
+                            target_parts: table.parts,
+                            target_ref: branch,
+                        },
+                        Some(projection),
                         CommandEntry { statement, input },
                     )
                     .await;
@@ -1365,5 +1409,46 @@ impl FrontendQuerySession {
             &mut worker,
         )
         .await
+    }
+}
+
+#[cfg(test)]
+mod branch_delete_tests {
+    use super::*;
+
+    #[test]
+    fn whole_branch_delete_uses_the_same_target_with_delete_completion() {
+        let sql = "DELETE FROM lake.db.t @dev";
+        let parsed = novarocks_parser::trino_parser::parse_statement(sql).unwrap();
+        let TrinoStatementAction::Prepare(preparation) =
+            admit_trino_statement(sql, parsed).unwrap()
+        else {
+            panic!("expected whole-branch preparation");
+        };
+        let plan = preparation_plan(&preparation).unwrap();
+        assert_eq!(plan.admission.kind, StatementKind::Delete);
+        assert_eq!(plan.admission.shape, StatementOutputShape::Rows);
+        assert_eq!(plan.work_class, WorkClass::Management);
+        assert_eq!(plan.window_class, ResultWindowClass::Local);
+        assert!(!plan.waits_for_topology);
+        assert!(plan.publication_deadline);
+
+        let TrinoStatementPreparation::DeleteEntireBranch { table, branch } = preparation else {
+            panic!("expected whole-branch delete preparation");
+        };
+        let legacy = novarocks_query_application::sql::parse_single_statement(
+            "TRUNCATE TABLE lake.db.t.branch_dev",
+        )
+        .unwrap();
+        let ast::Statement::Catalog(ast::CatalogStatement::TruncateTable(legacy)) = legacy else {
+            panic!("expected legacy branch TRUNCATE");
+        };
+        assert_eq!(
+            TruncateCommand {
+                target_parts: table.parts,
+                target_ref: branch,
+            },
+            crate::query_execution::dml::truncate::command_from_typed_statement(&legacy)
+        );
     }
 }

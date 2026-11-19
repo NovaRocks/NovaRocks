@@ -7,7 +7,7 @@ use novarocks_user_error::{
     ErrorCodeDescriptor, ErrorCodeId, ErrorCodeStatus, ErrorPhase, RetryClass, UserError,
 };
 
-use novarocks_sql::semantic::{CatalogSqlCommand, StatisticsSqlCommand};
+use novarocks_sql::semantic::{CatalogSqlCommand, ObjectName, StatisticsSqlCommand};
 
 use super::{
     ProductSqlCommand, lower_object_name, property_evaluation::validate_create_authorization,
@@ -111,6 +111,10 @@ pub enum TrinoStatementPreparation {
     ShowBranches(ast::TrinoShowBranches),
     Insert(ast::TrinoInsert),
     Delete(ast::TrinoDelete),
+    DeleteEntireBranch {
+        table: ObjectName,
+        branch: String,
+    },
     Update(ast::TrinoUpdate),
     Merge(ast::TrinoMerge),
     Call(ast::TrinoCall),
@@ -266,7 +270,19 @@ pub fn admit_trino_statement(
         Statement::FastForwardBranch(node) => Prepare(Preparation::FastForwardBranch(node)),
         Statement::ShowBranches(node) => Prepare(Preparation::ShowBranches(node)),
         Statement::Insert(node) => Prepare(Preparation::Insert(node)),
-        Statement::Delete(node) => Prepare(Preparation::Delete(node)),
+        Statement::Delete(node) => {
+            if node.predicate.is_none()
+                && node.table.query_period.is_none()
+                && let Some(branch) = &node.table.branch
+            {
+                Prepare(Preparation::DeleteEntireBranch {
+                    table: lower_object_name(&node.table.name),
+                    branch: branch.value.clone(),
+                })
+            } else {
+                Prepare(Preparation::Delete(node))
+            }
+        }
         Statement::Update(node) => Prepare(Preparation::Update(node)),
         Statement::Merge(node) => Prepare(Preparation::Merge(node)),
         Statement::Call(node) => Prepare(Preparation::Call(node)),
@@ -434,6 +450,46 @@ mod tests {
     fn admit(source: &str) -> Result<TrinoStatementAction, QueryServiceError> {
         let statement = parse_statement(source).unwrap_or_else(|error| panic!("{source}: {error}"));
         admit_trino_statement(source, statement)
+    }
+
+    #[test]
+    fn only_the_unfiltered_explicit_branch_selects_whole_branch_delete() {
+        let TrinoStatementAction::Prepare(TrinoStatementPreparation::DeleteEntireBranch {
+            table,
+            branch,
+        }) = admit(r#"DELETE FROM lake."schema.with.dot".t @"Audit-Ref""#).unwrap()
+        else {
+            panic!("expected whole-branch delete");
+        };
+        assert_eq!(table.parts, ["lake", "schema.with.dot", "t"]);
+        assert_eq!(branch, "Audit-Ref");
+
+        for sql in [
+            "DELETE FROM lake.db.t",
+            "DELETE FROM lake.db.t @dev WHERE id = 2",
+        ] {
+            assert!(matches!(
+                admit(sql).unwrap(),
+                TrinoStatementAction::Prepare(TrinoStatementPreparation::Delete(_))
+            ));
+        }
+
+        let sql = "DELETE FROM lake.db.t @dev";
+        let ast::TrinoStatement::Delete(mut node) = parse_statement(sql).unwrap() else {
+            panic!("expected DELETE grammar");
+        };
+        // The grammar cannot produce a historical write target. Keep the
+        // existing predicate DELETE guard for constructed ASTs as well.
+        node.table.query_period = Some(ast::QueryPeriod {
+            start: None,
+            end: None,
+            range_type: ast::QueryPeriodRangeType::Version,
+            span: node.table.span,
+        });
+        assert!(matches!(
+            admit_trino_statement(sql, ast::TrinoStatement::Delete(node)).unwrap(),
+            TrinoStatementAction::Prepare(TrinoStatementPreparation::Delete(_))
+        ));
     }
 
     #[test]
