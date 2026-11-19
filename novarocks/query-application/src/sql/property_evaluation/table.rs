@@ -2,7 +2,7 @@
 
 //! Property and column preparation for the typed table statements.
 
-use std::sync::Arc;
+use std::{collections::BTreeSet, sync::Arc};
 
 use novarocks_failure_contract::SharedFailureCause;
 use novarocks_parser::{
@@ -17,7 +17,10 @@ use novarocks_spi::connector::{
     ConnectorCatalogMutationOperation, ConnectorCatalogMutationSession, ConnectorError,
     DdlPropertyDeclaration, DdlPropertyValue,
 };
-use novarocks_sql::semantic::command::{CreateTableSqlCommand, TableColumnSqlCommand};
+use novarocks_sql::{
+    analyze_error::AnalyzeError,
+    semantic::command::{CreateTableSqlCommand, TableColumnSqlCommand},
+};
 use novarocks_type_contract::PureCompileControl;
 
 use super::{
@@ -163,6 +166,7 @@ fn check_column_shape(
 fn lower_table_column(
     source: &str,
     column: &TrinoColumnDefinition,
+    names: &mut BTreeSet<String>,
     control: &dyn PureCompileControl,
 ) -> Result<TableColumnSqlCommand, QueryServiceError> {
     let [name] = column.name.parts.as_slice() else {
@@ -172,6 +176,21 @@ fn lower_table_column(
     };
     let data_type = lower_sql_type(&column.data_type)
         .map_err(|message| unsupported(source, column.data_type.span, message))?;
+    observe_bytes(&name.value, control)?;
+    if !names.insert(name.value.to_lowercase()) {
+        let written_name = if name.quoted {
+            format!("\"{}\"", name.value.replace('"', "\"\""))
+        } else {
+            name.value.clone()
+        };
+        let error = AnalyzeError::duplicate_column_name(
+            format!("Column name '{written_name}' specified more than once"),
+            column.span,
+        );
+        return Err(QueryServiceError::from_user_error(
+            error.to_user_error(Some(source)),
+        ));
+    }
     let default = match &column.default_value {
         None => None,
         Some(Expr::Literal(literal)) => Some(
@@ -201,10 +220,11 @@ fn lower_create_table(
     control: &dyn PureCompileControl,
 ) -> Result<CreateTableSqlCommand, QueryServiceError> {
     let mut columns = Vec::with_capacity(statement.elements.len());
+    let mut names = BTreeSet::new();
     for element in &statement.elements {
         checkpoint(control, 1)?;
         if let TrinoTableElement::Column(column) = element {
-            columns.push(lower_table_column(source, column, control)?);
+            columns.push(lower_table_column(source, column, &mut names, control)?);
         }
     }
     let comment = statement
@@ -522,6 +542,40 @@ mod tests {
             command.properties,
             vec![("format_version".into(), DdlPropertyValue::Integer(2))]
         );
+    }
+
+    #[test]
+    fn ordinary_create_reports_the_second_case_insensitive_column_definition() {
+        for (source, duplicate, value) in [
+            (
+                "CREATE TABLE sqlp5_duplicate_column (id INT, id BIGINT)",
+                "id BIGINT",
+                "id",
+            ),
+            (
+                r#"CREATE TABLE lake.ns.t ("Id" INT, "iD" BIGINT)"#,
+                r#""iD" BIGINT"#,
+                r#""iD""#,
+            ),
+        ] {
+            let TrinoStatement::CreateTable(statement) = parse_statement(source).unwrap() else {
+                panic!("real ordinary CREATE");
+            };
+            let control = SqlCompileControl::unbounded();
+            let like = table_like(source, &statement, &control).unwrap();
+            let error = lower_create_table(source, &statement, like, Vec::new(), &control)
+                .expect_err("duplicate explicit column name must fail before connector creation");
+            let error = error.user_error().unwrap();
+            assert_eq!(error.code().as_str(), "sql.analyze.duplicate_column_name");
+            assert_eq!(
+                error.location().unwrap().column(),
+                source.find(duplicate).unwrap() as u32 + 1
+            );
+            assert_eq!(
+                error.message(),
+                format!("Column name '{value}' specified more than once")
+            );
+        }
     }
 
     #[test]
