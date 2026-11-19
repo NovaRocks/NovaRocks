@@ -19,7 +19,7 @@ use novarocks_spi::connector::{
 };
 use novarocks_sql::{
     analyze_error::AnalyzeError,
-    semantic::command::{CreateTableSqlCommand, TableColumnSqlCommand},
+    semantic::command::{CommandLiteral, CreateTableSqlCommand, TableColumnSqlCommand},
 };
 use novarocks_type_contract::PureCompileControl;
 
@@ -153,13 +153,6 @@ fn check_column_shape(
             "CREATE TABLE column properties are not supported",
         ));
     }
-    if column.comment.is_some() {
-        return Err(unsupported(
-            source,
-            column.span,
-            "CREATE TABLE column comments are not supported",
-        ));
-    }
     Ok(())
 }
 
@@ -208,7 +201,11 @@ fn lower_table_column(
         data_type,
         nullable: Some(column.nullable),
         default,
-        comment: None,
+        comment: column
+            .comment
+            .as_deref()
+            .map(|value| copy_string(value, control).map(CommandLiteral::String))
+            .transpose()?,
     })
 }
 
