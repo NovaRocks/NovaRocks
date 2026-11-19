@@ -406,6 +406,12 @@ impl AttemptTransportSource {
                 .is_none_or(AttemptPumpSource::local_exited)
     }
 
+    fn native_admissions_quiescent(&self) -> bool {
+        // A retired admission result can leave its original queued input here
+        // until the Core dispatches it or asks this Source to release it.
+        self.admission.is_quiescent() && self.admission.grants().is_empty()
+    }
+
     fn transport_drained(&self) -> bool {
         self.native_originals.is_none()
             && self.ports.as_ref().is_none_or(OriginalPortJobs::is_empty)
@@ -1379,6 +1385,7 @@ impl EffectSource for AttemptTransportSource {
     fn local_convergence_exited(&self) -> bool {
         self.local_pumps_closing
             && self.native_jobs_quiescent()
+            && self.native_admissions_quiescent()
             && self.native_originals.is_none()
             && self
                 .releases
@@ -1674,6 +1681,7 @@ impl EffectSource for AttemptTransportSource {
         let originals_runnable = self.native_originals.is_some()
             && (failed || closing || self.local_pumps_closing)
             && self.native_jobs_quiescent()
+            && (failed || closing || self.native_admissions_quiescent())
             && (!failed || self.supervisor.is_none() && self.residual_retired())
             && self
                 .releases
