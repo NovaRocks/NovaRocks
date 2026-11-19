@@ -4,7 +4,7 @@ title: "Advisory discovery is independent of admission"
 domain: [crate-boundary, test-capabilities]
 status: superseded
 supersedes: []
-superseded-by: ADR-0239
+superseded-by: ADR-0240
 date: 2026-10-28
 provenance:
   - "discussion: 2026-10-28, accepted separation of advisory discovery from admission"

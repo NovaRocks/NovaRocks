@@ -16,7 +16,7 @@
 # specific language governing permissions and limitations
 # under the License.
 """Local advisory check: refresh the index, then summarize cargo-deny."""
-# Design: ADR-0239 (docs/adr/ADR-0239-advisory-discovery-is-a-manual-local-check.md)
+# Design: ADR-0240 (docs/adr/ADR-0240-advisory-discovery-is-a-manual-local-check.md)
 import argparse
 from datetime import datetime, timezone
 import hashlib

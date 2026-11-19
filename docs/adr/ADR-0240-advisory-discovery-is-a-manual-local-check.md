@@ -1,5 +1,5 @@
 ---
-id: ADR-0239
+id: ADR-0240
 title: "Advisory discovery is a manual local check"
 domain: [crate-boundary, test-capabilities]
 status: active

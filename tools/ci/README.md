@@ -375,7 +375,7 @@ its coverage need review and behavioral evidence.
 Advisory discovery is a manual local check. A maintainer runs it on a regular
 cadence. It is not a PR check, not an admission stage, not a dev-verify
 selection, and not part of any verification layer. See
-[ADR-0239](../../docs/adr/ADR-0239-advisory-discovery-is-a-manual-local-check.md).
+[ADR-0240](../../docs/adr/ADR-0240-advisory-discovery-is-a-manual-local-check.md).
 
 ```bash
 python3 tools/ci/dependency-advisories.py [--output DIR] [--repo DIR]

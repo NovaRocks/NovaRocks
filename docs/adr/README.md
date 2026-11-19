@@ -584,7 +584,7 @@ handles，不以 service locator、core callback、metadata fallback 或公共 S
 
 领域哲学：crate 结构表达依赖事实，编译器拒绝未声明的 crate 使用；哪些边可以新增、optional/feature/target 与传递能力是否符合 owner 边界，由 review 判断。CI 保留供应链与通用 lint，不增加依赖边界、源码形状或产品前提检查。迁移期临时检查随迁移完成一并删除。
 
-- [ADR-0239](ADR-0239-advisory-discovery-is-a-manual-local-check.md) — 公告发现为何只由维护者在本地检查、不进入 PR、准入或任何验证层（active）
+- [ADR-0240](ADR-0240-advisory-discovery-is-a-manual-local-check.md) — 公告发现为何只由维护者在本地检查、不进入 PR、准入或任何验证层（active）
 - [ADR-0204](ADR-0204-upstream-iceberg-backports-and-provider-suspension.md) — Iceberg 为何仅允许有界的原样上游依赖移植，实验性 Provider 为何保留注册并明确暂停能力（active；部分替代 ADR-0138/0139/0170/0174，授权读取、唯一 manifest、禁止计量 fork 与同源基线责任保留）
 - [ADR-0190](ADR-0190-dependency-direction-by-structure-and-review.md) — 依赖方向为何由 crate 结构与 review 维持、CI 为何保留通用检查，第三方资源预留为何按准入估计理解（active；部分替代 ADR-0140/0150/0168/0179 的具名检查与验收门规则；全局 Clippy warning-only 现状由 ADR-0194 替代，依赖治理与资源估计仍有效）
 - [ADR-0194](ADR-0194-strict-clippy-ci-baseline.md) — Clippy 为何只在 CI 阶段严格阻止警告、哪些放宽项与局部例外构成最小基线（active；仅替代 ADR-0190 的全局 Clippy warning-only 现状）
@@ -611,7 +611,7 @@ handles，不以 service locator、core callback、metadata fallback 或公共 S
 
 #### 历史
 
-- [ADR-0200](ADR-0200-advisory-discovery-is-independent-of-admission.md) — 公告发现为何独立于准入、保留真实失败与动态输入追溯，并报告传递 unsound（superseded → ADR-0239）
+- [ADR-0200](ADR-0200-advisory-discovery-is-independent-of-admission.md) — 公告发现为何独立于准入、保留真实失败与动态输入追溯，并报告传递 unsound（superseded → ADR-0240）
 - ADR-0134 — 概率结构为何精确依赖 registry DataSketches 预发布包、由上游唯一拥有标准格式与集合运算（superseded → ADR-0150）
 - ADR-0098 — native DTO 的字段路径与验证错误为何由 Protocol 独占、而不保留 Core family 门面（superseded → ADR-0106）
 - ADR-0099 — 聚合 Core 退场后为何按真实 owner 物理切断依赖（superseded → ADR-0108）
