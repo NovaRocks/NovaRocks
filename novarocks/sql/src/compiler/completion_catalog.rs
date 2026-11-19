@@ -864,7 +864,7 @@ impl<'a> CatalogNeedCollector<'a> {
             return self.add_need_qualified(
                 qualified.relation,
                 CatalogLookupTarget::IcebergMetadata {
-                    kind: qualified.kind,
+                    kind: qualified.kind.provider_kind(),
                 },
                 false,
                 None,
@@ -902,10 +902,7 @@ impl<'a> CatalogNeedCollector<'a> {
                 // The analyzer expands the partitions view over this exact
                 // Files fact; it must not request a provider Partitions read.
                 CatalogLookupTarget::IcebergMetadata {
-                    kind: match kind {
-                        SqlMetadataTableKind::Partitions => SqlMetadataTableKind::Files,
-                        kind => kind,
-                    },
+                    kind: kind.provider_kind(),
                 }
             }
             None if system_table => CatalogLookupTarget::SystemTable,
@@ -1714,7 +1711,9 @@ impl PlannerTableProvider for FactBackedCatalog {
         )?;
         let mut key = CatalogFactKey::new(
             found.relation.clone(),
-            CatalogLookupTarget::IcebergMetadata { kind: found.kind },
+            CatalogLookupTarget::IcebergMetadata {
+                kind: found.kind.provider_kind(),
+            },
         );
         key.quoted_metadata_binding = Some(found.binding.clone());
         let resolved = match self.entries.get(&key) {

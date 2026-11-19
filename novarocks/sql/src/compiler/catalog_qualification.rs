@@ -105,13 +105,11 @@ impl CatalogQualifications {
             return None;
         }
         let (base, suffix) = authored.value.split_once('$')?;
-        let kind = match suffix.to_ascii_lowercase().as_str() {
-            "files" => MetadataTableKind::Files,
-            "refs" => MetadataTableKind::Refs,
-            "snapshots" => MetadataTableKind::Snapshots,
-            _ => return None,
-        };
+        let kind = MetadataTableKind::parse(suffix).ok()?;
         let table = normalize_identifier(base).ok()?;
+        if !table.eq_ignore_ascii_case(base) {
+            return None;
+        }
         Some(QualifiedMetadata {
             relation: TableIdentity::new(&namespace.catalog, &namespace.namespace, &table),
             kind,
@@ -158,6 +156,18 @@ fn quoted_catalog<'a>(
     };
     let namespace =
         resolve_catalog_namespace_name(&scope, Some(catalog.unwrap_or(DEFAULT_CATALOG))).ok()?;
+    // These components are already decoded. Do not reinterpret whitespace or
+    // an embedded pair of backticks as a different catalog or namespace.
+    let authored_catalog = if let [catalog, _] = scope.as_slice() {
+        catalog.as_str()
+    } else {
+        catalog.unwrap_or(DEFAULT_CATALOG)
+    };
+    if !namespace.catalog.eq_ignore_ascii_case(authored_catalog)
+        || !namespace.namespace.eq_ignore_ascii_case(scope.last()?)
+    {
+        return None;
+    }
     if namespace.catalog == DEFAULT_CATALOG
         || crate::system_table::is_system_table_name(&namespace.catalog, &namespace.namespace)
     {

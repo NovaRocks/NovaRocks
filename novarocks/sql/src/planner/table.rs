@@ -60,6 +60,15 @@ pub enum SqlMetadataTableKind {
 }
 
 impl SqlMetadataTableKind {
+    /// The physical metadata source read for this SQL relation.
+    /// Partitions is computed from the same pinned Files source.
+    pub(crate) const fn provider_kind(self) -> Self {
+        match self {
+            Self::Partitions => Self::Files,
+            kind => kind,
+        }
+    }
+
     /// Resolve a `<table>$<suffix>` suffix. An unrecognized suffix is refused
     /// here — there is deliberately no catch-all relation to fall back to.
     pub(crate) fn parse(value: &str) -> Result<Self, String> {

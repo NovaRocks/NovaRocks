@@ -490,6 +490,39 @@ impl<'a> super::AnalyzerContext<'a> {
         self.analyze_table_relation(table, None)
     }
 
+    fn analyze_iceberg_partitions(
+        &self,
+        name: &ast::ObjectName,
+        files: &TableDef,
+        alias: Option<RelationAlias<'_>>,
+        qualifier: String,
+        qualified: Option<&novarocks_types::naming::TableIdentity>,
+    ) -> Result<(Relation, AnalyzerScope), AnalyzeError> {
+        let partitioned = files
+            .columns
+            .iter()
+            .any(|column| column.name.eq_ignore_ascii_case("partition"));
+        let source = super::iceberg_partitions::partitions_query(name, partitioned, qualified);
+        let query = self.analyze_query(&source)?;
+        let output_columns = derived_table_output_columns(&query.output_columns, alias)?;
+        let alias_name = alias
+            .map(|alias| alias.name.value.clone())
+            .unwrap_or(qualifier);
+        let mut scope = self.new_scope();
+        for column in &output_columns {
+            self.check_control()?;
+            scope.add_field(Some(&alias_name), column);
+        }
+        Ok((
+            Relation::Subquery {
+                query: novarocks_parser::ast::AstBox::new(query),
+                alias: alias_name,
+                output_columns,
+            },
+            scope,
+        ))
+    }
+
     fn analyze_table_relation(
         &self,
         node: &ast::Table,
@@ -575,39 +608,18 @@ impl<'a> super::AnalyzerContext<'a> {
                     catalog_override.as_deref(),
                     &db_lower,
                     &tbl_lower,
-                    if metadata_ty == crate::planner::table::SqlMetadataTableKind::Partitions {
-                        crate::planner::table::SqlMetadataTableKind::Files
-                    } else {
-                        metadata_ty
-                    },
+                    metadata_ty.provider_kind(),
                 )
                 .map_err(|error| AnalyzeError::unknown_table(error, name_span))?
                 .planner;
-            if metadata_ty == crate::planner::table::SqlMetadataTableKind::Partitions {
-                let partitioned = table_def
-                    .columns
-                    .iter()
-                    .any(|column| column.name.eq_ignore_ascii_case("partition"));
-                let view = super::iceberg_partitions::partitions_query(name, partitioned);
-                let query = self.analyze_query(&view)?;
-                let output_columns = derived_table_output_columns(&query.output_columns, alias)?;
-                let alias_name = alias
-                    .as_ref()
-                    .map(|alias| alias.name.value.clone())
-                    .unwrap_or_else(|| format!("{tbl_lower}$partitions"));
-                let mut scope = self.new_scope();
-                for column in &output_columns {
-                    self.check_control()?;
-                    scope.add_field(Some(&alias_name), column);
-                }
-                return Ok((
-                    Relation::Subquery {
-                        query: novarocks_parser::ast::AstBox::new(query),
-                        alias: alias_name,
-                        output_columns,
-                    },
-                    scope,
-                ));
+            if metadata_ty == MetadataTableKind::Partitions {
+                return self.analyze_iceberg_partitions(
+                    name,
+                    &table_def,
+                    alias,
+                    format!("{tbl_lower}$partitions"),
+                    None,
+                );
             }
             return self.analyze_iceberg_metadata_scan(
                 db_lower,
@@ -739,6 +751,15 @@ impl<'a> super::AnalyzerContext<'a> {
                 .resolved
                 .map_err(|error| AnalyzeError::unknown_table(error, name_span))?
                 .planner;
+            if metadata.kind == MetadataTableKind::Partitions {
+                return self.analyze_iceberg_partitions(
+                    name,
+                    &table,
+                    alias,
+                    tbl,
+                    Some(&metadata.relation),
+                );
+            }
             let qualifier = alias.map(|a| a.name.value.clone()).unwrap_or(tbl);
             return self.analyze_iceberg_metadata_scan(
                 metadata.relation.namespace,

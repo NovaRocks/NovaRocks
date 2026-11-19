@@ -129,6 +129,34 @@ fn quoted_metadata_requests_the_exact_base_kind_and_admitted_binding() {
             "events",
             SqlMetadataTableKind::Snapshots,
         ),
+        (
+            r#"SELECT 1 FROM "Orders$Entries""#,
+            "caller",
+            "caller_db",
+            "orders",
+            SqlMetadataTableKind::Entries,
+        ),
+        (
+            r#"SELECT 1 FROM Sales."Orders$History""#,
+            "caller",
+            "sales",
+            "orders",
+            SqlMetadataTableKind::History,
+        ),
+        (
+            r#"SELECT 1 FROM Ice.Sales."Events$Manifests""#,
+            "ice",
+            "sales",
+            "events",
+            SqlMetadataTableKind::Manifests,
+        ),
+        (
+            r#"SELECT 1 FROM "Ice"."Sales"."Events$Partitions""#,
+            "ice",
+            "sales",
+            "events",
+            SqlMetadataTableKind::Files,
+        ),
     ] {
         let observed = ready("iceberg", catalog, 2);
         let CatalogQualification::Ready { binding, .. } = &observed else {
@@ -216,22 +244,51 @@ fn quoted_metadata_does_not_share_the_unquoted_need_or_accept_its_fact() {
 #[test]
 fn observed_initial_absence_and_other_providers_keep_the_original_name_error() {
     let control = SqlCompileControl::unbounded();
-    let query = legacy_query(r#"SELECT 1 FROM ice.sales."orders$files""#);
-    assert_eq!(
-        quoted_metadata_catalogs(&query, Some("caller"), "caller_db", &control).unwrap(),
-        [instance("ice")],
-    );
-    for qualifications in [
-        CatalogQualifications::default(),
-        observations("ice", CatalogQualification::Absent),
-        observations("ice", CatalogQualification::Unavailable),
-        observations("ice", ready("paimon", "ice", 2)),
+    for suffix in ["files", "entries", "history", "manifests", "partitions"] {
+        let source = format!(r#"SELECT 1 FROM ice.sales."orders${suffix}""#);
+        let query = novarocks_parser::trino_parser::parse_query(&source).unwrap();
+        assert_eq!(
+            quoted_metadata_catalogs(&query, Some("caller"), "caller_db", &control).unwrap(),
+            [instance("ice")],
+        );
+        for qualifications in [
+            CatalogQualifications::default(),
+            observations("ice", CatalogQualification::Absent),
+            observations("ice", CatalogQualification::Unavailable),
+            observations("ice", ready("paimon", "ice", 2)),
+        ] {
+            let Err(SqlCompileError::Compilation(message)) = state(query.clone(), qualifications)
+            else {
+                panic!("expected the original compiler-owned identifier error");
+            };
+            assert_eq!(message, format!("unsupported identifier `orders${suffix}`"));
+        }
+    }
+}
+
+#[test]
+fn quoted_metadata_requires_exact_simple_components_and_a_recognized_suffix() {
+    for (name, invalid) in [
+        (r#"ice.sales."ordinary-name""#, "ordinary-name"),
+        (r#"ice.sales."orders$unknown""#, "orders$unknown"),
+        (
+            r#"ice.sales."orders$files$history""#,
+            "orders$files$history",
+        ),
+        (r#"ice.sales."order-items$entries""#, "order-items$entries"),
+        (r#"ice.sales."orders $history""#, "orders $history"),
+        (r#"ice.sales."`orders`$entries""#, "`orders`$entries"),
+        (r#""ice ".sales."orders$manifests""#, "orders$manifests"),
+        (r#"ice." sales"."orders$partitions""#, "orders$partitions"),
     ] {
-        let Err(SqlCompileError::Compilation(message)) = state(query.clone(), qualifications)
+        let source = format!("SELECT 1 FROM {name}");
+        let query = novarocks_parser::trino_parser::parse_query(&source).unwrap();
+        let Err(SqlCompileError::Compilation(message)) =
+            state(query, observations("ice", ready("iceberg", "ice", 2)))
         else {
-            panic!("expected the original compiler-owned identifier error");
+            panic!("expected original identifier refusal for {source}");
         };
-        assert_eq!(message, "unsupported identifier `orders$files`");
+        assert_eq!(message, format!("unsupported identifier `{invalid}`"));
     }
 }
 
@@ -250,6 +307,123 @@ fn a_complete_quoted_cte_name_uses_no_catalog_qualification_or_relation_need() {
         );
         let state = state(query, observations("caller", ready("iceberg", "caller", 2))).unwrap();
         assert!(state.needs().is_empty());
+    }
+}
+
+#[test]
+fn quoted_partitions_analyze_a_files_view_with_the_exact_catalog_binding() {
+    use crate::analysis::{QueryBody, Relation};
+    use crate::analyzer::iceberg_metadata::{
+        IcebergMetadataDerivedTypes, metadata_table_schema_with,
+    };
+
+    for partitioned in [false, true] {
+        for name in [
+            r#""ORDERS$partitions""#,
+            r#"caller_db."orders$partitions""#,
+            r#"caller.caller_db."orders$partitions""#,
+        ] {
+            let source = format!(
+                r#"WITH "orders$files" AS (SELECT 'not a file' AS content) SELECT p.* FROM {name} p"#
+            );
+            let query = novarocks_parser::trino_parser::parse_query(&source).unwrap();
+            let qualified = ready("iceberg", "caller", 2);
+            let CatalogQualification::Ready { binding, .. } = &qualified else {
+                unreachable!();
+            };
+            let mut state = state(query, observations("caller", qualified.clone())).unwrap();
+            let need = only_need(&state);
+            let identity = TableIdentity::new("caller", "caller_db", "orders");
+            assert_metadata_need(need, identity.clone(), SqlMetadataTableKind::Files, binding);
+
+            let partition_type = partitioned.then(|| {
+                DataType::Struct(
+                    vec![arrow::datatypes::Field::new(
+                        "region",
+                        DataType::Int32,
+                        true,
+                    )]
+                    .into(),
+                )
+            });
+            let derivatives = IcebergMetadataDerivedTypes::try_new(partition_type, None).unwrap();
+            let columns = metadata_table_schema_with(SqlMetadataTableKind::Files, &derivatives)
+                .into_iter()
+                .map(|column| ColumnDef {
+                    name: column.name,
+                    data_type: column.data_type,
+                    nullable: column.nullable,
+                    write_default: None,
+                    logical_type: column.logical_type,
+                })
+                .collect();
+            let slot = crate::binding::SqlTableBindingId::new_for_test(73);
+            let table = ResolvedAnalyzerTable::from_planner(
+                Some(&identity.catalog),
+                &identity.namespace,
+                TableDef {
+                    name: identity.table.clone(),
+                    columns,
+                    iceberg_row_lineage_metadata_columns: vec![],
+                    source: ScanSource::Sql(SqlScanSource::new(
+                        slot,
+                        SqlTableIdentity::try_new(
+                            identity.catalog.clone(),
+                            identity.namespace.clone(),
+                            identity.table.clone(),
+                        )
+                        .unwrap(),
+                        SqlScanKind::Metadata {
+                            kind: SqlMetadataTableKind::Files,
+                            version: SqlTableVersionSelector::Current,
+                        },
+                    )),
+                },
+            );
+            let fact = CatalogRelationFact::resolved(need, table).unwrap();
+            state
+                .accept_facts(vec![fact].into(), &SqlCompileControl::unbounded())
+                .unwrap();
+            assert!(state.needs().is_empty());
+            let catalog = state.completed_catalog().unwrap();
+            let (resolved, _, _) =
+                crate::analyzer::analyze(state.query(), &catalog, "caller_db").unwrap();
+            let expected =
+                metadata_table_schema_with(SqlMetadataTableKind::Partitions, &derivatives);
+            assert_eq!(resolved.output_columns.len(), expected.len());
+            for (column, shape) in resolved.output_columns.iter().zip(expected) {
+                assert_eq!(column.name, shape.name, "{source}");
+                assert_eq!(column.value_type.data_type(), &shape.data_type, "{source}");
+                assert_eq!(column.value_type.nullable(), shape.nullable, "{source}");
+            }
+
+            let QueryBody::Select(outer) = &resolved.body else {
+                panic!("expected select");
+            };
+            let Relation::Subquery {
+                query: partitions,
+                alias,
+                ..
+            } = outer.from.as_ref().unwrap()
+            else {
+                panic!("partitions must keep SQL-owned aggregation");
+            };
+            assert_eq!(alias, "p");
+            let QueryBody::Select(inner) = &partitions.body else {
+                panic!("expected partitions query");
+            };
+            assert!(inner.filter.is_some());
+            assert_eq!(inner.group_by.len(), usize::from(partitioned));
+            assert_eq!(inner.having.is_some(), !partitioned);
+            let Relation::IcebergMetadataScan(scan) = inner.from.as_ref().unwrap() else {
+                panic!(
+                    "partition aggregation must scan the exact Files fact despite the same-name CTE"
+                );
+            };
+            assert_eq!(scan.metadata_table_type, SqlMetadataTableKind::Files);
+            let ScanSource::Sql(source) = &scan.table.source;
+            assert_eq!(source.binding, slot);
+        }
     }
 }
 

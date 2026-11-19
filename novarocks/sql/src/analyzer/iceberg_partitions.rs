@@ -18,6 +18,7 @@
 //! SQL-owned partition aggregation over the same frozen Files binding.
 
 use novarocks_parser::{Span, ast};
+use novarocks_types::naming::TableIdentity;
 
 fn ident(value: &str, span: Span) -> ast::Ident {
     ast::Ident {
@@ -79,21 +80,43 @@ fn comparison(
 
 /// Preserve metadata syntax separately from the ordinary relation name, so
 /// an equal table or CTE name cannot shadow the frozen metadata relation.
-pub(super) fn partitions_query(name: &ast::ObjectName, partitioned: bool) -> ast::Query {
+pub(super) fn partitions_query(
+    name: &ast::ObjectName,
+    partitioned: bool,
+    qualified: Option<&TableIdentity>,
+) -> ast::Query {
     let span = name.span;
-    let mut source = name.clone();
-    for part in &mut source.parts {
-        part.value = part.value.to_lowercase();
-    }
-    if let Some(last) = source.parts.last_mut() {
-        let base = super::TableNameView::new(name)
-            .parts()
-            .last()
-            .expect("the last identifier requires a nonempty table name")
-            .to_lowercase();
-        last.value = format!("{base}$files");
-        last.quoted = false;
-    }
+    let source = if let Some(base) = qualified {
+        // Keep the generated reference on the exact qualified Files fact.
+        // Its full name also prevents an outer CTE from shadowing this read.
+        ast::ObjectName {
+            parts: vec![
+                ident(&base.catalog, span),
+                ident(&base.namespace, span),
+                ast::Ident {
+                    value: format!("{}$files", base.table),
+                    quoted: true,
+                    span,
+                },
+            ],
+            span,
+        }
+    } else {
+        let mut source = name.clone();
+        for part in &mut source.parts {
+            part.value = part.value.to_lowercase();
+        }
+        if let Some(last) = source.parts.last_mut() {
+            let base = super::TableNameView::new(name)
+                .parts()
+                .last()
+                .expect("the last identifier requires a nonempty table name")
+                .to_lowercase();
+            last.value = format!("{base}$files");
+            last.quoted = false;
+        }
+        source
+    };
     let mut projection = Vec::new();
     if partitioned {
         projection.push(novarocks_parser::build::item(
@@ -167,7 +190,7 @@ mod tests {
                 span,
             };
             for partitioned in [true, false] {
-                let query = partitions_query(&name, partitioned);
+                let query = partitions_query(&name, partitioned, None);
                 let ast::SetExpr::Select(select) = query.body.as_ref() else {
                     panic!("select")
                 };
