@@ -28,6 +28,7 @@ import shlex
 import shutil
 import socket
 import sys
+import tempfile
 import time
 import uuid
 from xml.sax.saxutils import escape
@@ -36,6 +37,8 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "iceberg-rest"))
 import fixture_runtime as runtime
 import machine_runtime as machine
+
+SQL_PRESENTATION = "sql-trino-v1"
 
 
 class HiveOwner:
@@ -88,7 +91,7 @@ class HiveOwner:
             'images': {'hms': {'image_id': None, 'tag': image}},
             'service_ports': {'hms': {'9083/tcp': port}},
             'hms': {'uri': f'thrift://127.0.0.1:{port}', 'port': port, 'warehouse': warehouse,
-                    'catalog_sql': str(directory / 'ice-hms-catalog.sql'),
+                    'catalog_sql': str(directory / SQL_PRESENTATION / 'ice-hms-catalog.sql'),
                     'spark_defaults': str(directory / 'spark-hms-defaults.conf'), 'image': image},
             'minio': manifest['minio'],
         }
@@ -126,32 +129,59 @@ class HiveOwner:
         self.write_definition(directory / "core-site.xml", core.encode())
         # This read-only bind mount must be readable by the image's hive UID.
         (directory / "core-site.xml").chmod(0o644)
-        props = {"type": "iceberg", "iceberg.catalog.type": "hive",
-                 "iceberg.catalog.hive.metastore.uris": record["hms"]["uri"],
-                 "iceberg.catalog.warehouse": record["hms"]["warehouse"],
-                 "aws.s3.endpoint": credentials["endpoint"],
-                 "aws.s3.region": "us-east-1", "aws.s3.enable_path_style_access": "true"}
-        for purpose, role in (("metadata", "frontend"), ("data", "backend")):
-            prefix = f"credential.object-store-{purpose}."
-            props.update({prefix + "consumer-role": role, prefix + "mode": "static",
-                          prefix + "name": "iceberg-test-data", prefix + "generation": "v1"})
-        sql = "CREATE EXTERNAL CATALOG ice_hms\nPROPERTIES (\n" + ",\n".join(f"  {json.dumps(key)} = {json.dumps(value)}" for key, value in props.items()) + "\n);\n"
-        self.write_definition(directory / "ice-hms-catalog.sql", sql.encode())
         props = {"": "org.apache.iceberg.spark.SparkCatalog", ".type": "hive", ".uri": "thrift://hms:9083",
                  ".warehouse": record["hms"]["warehouse"], ".io-impl": "org.apache.iceberg.aws.s3.S3FileIO",
                  ".s3.endpoint": "http://minio:9000", ".s3.path-style-access": "true",
                  ".s3.access-key-id": user, ".s3.secret-access-key": secret, ".s3.region": "us-east-1"}
         self.write_definition(directory / "spark-hms-defaults.conf", "".join(f"spark.sql.catalog.hms_catalog{key} {value}\n" for key, value in props.items()).encode())
+
+    def publish_presentation(self, record):
+        """Publish an immutable SQL/env pair under the existing HMS owner lock."""
+        directory = self.directory(record["machine_id"])
+        publication = directory / SQL_PRESENTATION
+        catalog_sql = publication / "ice-hms-catalog.sql"
+        env_file = publication / "env.sh"
+        props = {"iceberg.catalog.type": "hive",
+                 "iceberg.catalog.hive.metastore.uris": record["hms"]["uri"],
+                 "iceberg.catalog.warehouse": record["hms"]["warehouse"],
+                 "aws.s3.endpoint": record["minio"]["endpoint"],
+                 "aws.s3.region": "us-east-1", "aws.s3.enable_path_style_access": "true"}
+        for purpose, role in (("metadata", "frontend"), ("data", "backend")):
+            prefix = f"credential.object-store-{purpose}."
+            props.update({prefix + "consumer-role": role, prefix + "mode": "static",
+                          prefix + "name": "iceberg-test-data", prefix + "generation": "v1"})
+        properties = []
+        for key, value in props.items():
+            prop = '"' + key.replace('"', '""') + '"'
+            literal = "'" + str(value).replace("'", "''") + "'"
+            properties.append(f"  {prop} = {literal}")
+        sql = "CREATE CATALOG ice_hms USING iceberg WITH (\n" + ",\n".join(properties) + "\n);\n"
         exports = {"NOVA_ENV_HIVE_RUNTIME_DIR": str(directory), "NOVA_ENV_HIVE_MANIFEST": str(directory / "manifest.json"),
                    "NOVA_ENV_HIVE_CATALOG_ID": record["machine_id"], "NOVA_ENV_HIVE_COMPOSE_PROJECT": record["project"],
                    "NOVA_ENV_HIVE_COMPOSE_FILE": record["compose_file"], "NOVA_ENV_HIVE_COMPOSE_ENV": record["compose_env"],
                    "NOVA_ENV_HMS_PORT": record["ports"]["hms"], "NOVA_ENV_REST_NETWORK": record["rest_network"],
                    "NOVA_ENV_SHARED_HMS_WAREHOUSE_URI": record["hms"]["warehouse"],
                    "NOVAROCKS_ICEBERG_HMS_URI": record["hms"]["uri"], "NOVAROCKS_ICEBERG_HMS_WAREHOUSE": record["hms"]["warehouse"],
-                   "NOVAROCKS_ICE_HMS_CATALOG_SQL": record["hms"]["catalog_sql"],
+                   "NOVAROCKS_ICE_HMS_CATALOG_SQL": str(catalog_sql),
                    "NOVAROCKS_SPARK_HMS_DEFAULTS": record["hms"]["spark_defaults"],
                    "NOVAROCKS_SPARK_EXTRA_DEFAULTS": record["hms"]["spark_defaults"]}
-        self.write_definition(directory / "env.sh", "".join(f"export {key}={shlex.quote(str(value))}\n" for key, value in exports.items()).encode())
+        env = "".join(f"export {key}={shlex.quote(str(value))}\n" for key, value in exports.items())
+        definitions = {catalog_sql.name: sql.encode(), env_file.name: env.encode()}
+        if publication.exists():
+            for name, content in definitions.items():
+                path = publication / name
+                if not path.is_file() or path.read_bytes() != content:
+                    raise runtime.RuntimeFailure("RuntimeIdentityMismatch", "saved HMS publication changed: " + name)
+        else:
+            with tempfile.TemporaryDirectory(prefix=f".{SQL_PRESENTATION}-", dir=directory) as temporary:
+                staged = Path(temporary) / SQL_PRESENTATION
+                staged.mkdir(mode=0o700)
+                for name, content in definitions.items():
+                    runtime.atomic_bytes(staged / name, content)
+                os.rename(staged, publication)
+                runtime.fsync_directory(directory)
+        return {**record, "env_file": str(env_file),
+                "hms": {**record["hms"], "catalog_sql": str(catalog_sql)}}
 
     def up(self, manifest, image=None, prepare_only=False):
         identity = manifest["runtime"]["machine"]["id"]
@@ -160,11 +190,11 @@ class HiveOwner:
             if record["state"] == "deleting":
                 raise runtime.RuntimeFailure("RuntimeDeleting", identity)
             if prepare_only:
-                return record
+                return self.publish_presentation(record)
             snapshot = manifest['runtime']['machine']
             with self.owner.operation_snapshot(expected_generation=snapshot['generation']):
                 if record['state'] == 'ready':
-                    return record
+                    return self.publish_presentation(record)
                 if record['state'] != 'prepared':
                     raise runtime.RuntimeFailure('MachineUnavailable', 'unfinished HMS creation requires manual maintenance')
                 saved = record['images']['hms']['image_id']
@@ -205,7 +235,7 @@ class HiveOwner:
                 raise
             record["state"] = "ready"
             self.save(record)
-            return record
+            return self.publish_presentation(record)
 
     def wait_ready(self, record, timeout=60):
         # Docker Desktop's published port proxy can accept connections before
