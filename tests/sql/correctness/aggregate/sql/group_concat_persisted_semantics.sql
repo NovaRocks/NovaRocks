@@ -35,7 +35,7 @@ CREATE VIEW default_catalog.${case_db}.v_forbidden_mode AS SELECT 1;
 SELECT * FROM default_catalog.${case_db}.v_persisted_mode;
 
 -- query 4
-SELECT /*+ SET_VAR(sql_mode=32) */ value FROM default_catalog.${case_db}.v_persisted_mode;
+SELECT /*+ SET_VAR(sql_mode='32') */ value FROM default_catalog.${case_db}.v_persisted_mode;
 
 -- query 5
 -- @expect_error=GROUP_CONCAT_LEGACY is not captured

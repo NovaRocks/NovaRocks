@@ -1236,12 +1236,12 @@ select /*+ set_var(sql_mode = 'GROUP_CONCAT_LEGACY') */ id, group_concat( value 
 
 -- query 280
 USE ${case_db};
-select /*+ set_var(sql_mode = 68719476736) */ group_concat( value, '-' ) from t1;
+select /*+ set_var(sql_mode = '68719476736') */ group_concat( value, '-' ) from t1;
 
 -- query 281
 USE ${case_db};
-select /*+ set_var(sql_mode = 'GROUP_CONCAT_LEGACY') */ /*+ set_var(sql_mode = 'ONLY_FULL_GROUP_BY') */ id, group_concat( value, '-' ) from t1 group by id order by id;
+select /*+ set_var(sql_mode = 'ONLY_FULL_GROUP_BY') */ id, group_concat( value, '-' ) from t1 group by id order by id;
 
 -- query 282
 USE ${case_db};
-select /*+ set_var(sql_mode = 68719476736) */ /*+ set_var(sql_mode = 32) */ group_concat( value ) from t1;
+select /*+ set_var(sql_mode = '32') */ group_concat( value ) from t1;

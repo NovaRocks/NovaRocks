@@ -91,7 +91,7 @@ SET sql_mode='ERROR_IF_OVERFLOW';
 SELECT a/b AS div_zero,a%b AS mod_zero FROM ${case_db}.decimal_error_policy WHERE k=4;
 
 -- query 14
-SELECT /*+ SET_VAR(sql_mode=32) */ a+1 AS v FROM ${case_db}.decimal_error_policy WHERE k=2;
+SELECT /*+ SET_VAR(sql_mode='32') */ a+1 AS v FROM ${case_db}.decimal_error_policy WHERE k=2;
 
 -- query 15
 -- @skip_result_check=true
@@ -114,7 +114,7 @@ SELECT CAST(1000000000 AS DECIMAL(9,0)) AS narrowed;
 -- @expect_sql_code=query.execution.numeric_out_of_range
 -- @expect_sql_phase=Execution
 -- @expect_error=[query.execution.numeric_out_of_range]
-SELECT /*+ SET_VAR(sql_mode=34359738368) */ CAST(1000000000 AS DECIMAL(9,0)) AS narrowed;
+SELECT /*+ SET_VAR(sql_mode='34359738368') */ CAST(1000000000 AS DECIMAL(9,0)) AS narrowed;
 
 -- query 19
 SELECT CAST(CAST(999.995 AS DECIMAL(6,3)) AS DECIMAL(5,2)) AS carry;
