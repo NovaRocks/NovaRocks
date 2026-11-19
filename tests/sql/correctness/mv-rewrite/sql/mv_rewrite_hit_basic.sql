@@ -99,10 +99,10 @@ REFRESH MATERIALIZED VIEW agg_mv WITH SYNC MODE;
 -- group-by subset rollup hits the MV
 -- @skip_result_check=true
 -- @explain_contains=rewritten with mv: agg_mv
-SELECT region, SUM(amount), COUNT(*) FROM orders GROUP BY region;
+SELECT region, SUM(amount), COUNT() FROM orders GROUP BY region;
 
 -- query 10
-SELECT region, SUM(amount) AS s, COUNT(*) AS c FROM orders GROUP BY region ORDER BY region;
+SELECT region, SUM(amount) AS s, COUNT() AS c FROM orders GROUP BY region ORDER BY region;
 
 -- query 11
 -- group-by equal + compensation predicate on a group key
@@ -117,10 +117,10 @@ SELECT region, day, SUM(amount) AS s FROM orders WHERE region = 'east' GROUP BY 
 -- scalar COUNT rollup with empty matching groups must return 0
 -- @skip_result_check=true
 -- @explain_contains=rewritten with mv: agg_mv
-SELECT COUNT(*) FROM orders WHERE region = 'nosuch';
+SELECT COUNT() FROM orders WHERE region = 'nosuch';
 
 -- query 14
-SELECT COUNT(*) AS c FROM orders WHERE region = 'nosuch';
+SELECT COUNT() AS c FROM orders WHERE region = 'nosuch';
 
 -- query 15
 -- @cleanup=true
