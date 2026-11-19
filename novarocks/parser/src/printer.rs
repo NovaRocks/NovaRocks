@@ -1258,6 +1258,14 @@ impl Printer {
     #[recursive::recursive]
     fn write_type_name(&mut self, node: &TypeName) {
         match &node.kind {
+            TypeKind::Generic(value)
+                if !value.name.quoted
+                    && value.arguments.is_empty()
+                    && value.name.value.eq_ignore_ascii_case("DATETIME") =>
+            {
+                // Preserve the canonical spelling used by existing expression names and keys.
+                self.output.push_str("TIMESTAMP");
+            }
             TypeKind::Generic(value) => {
                 self.write_ident(&value.name);
                 if !value.arguments.is_empty() {

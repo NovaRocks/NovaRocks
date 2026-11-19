@@ -488,10 +488,10 @@ pub(crate) fn finish_type_name(
             fields: fields.into(),
         })
     } else if !name.quoted
-        && matches!(
-            name.value.to_ascii_uppercase().as_str(),
-            "TIME" | "TIMESTAMP" | "DATETIME"
-        )
+        && (name.value.eq_ignore_ascii_case("TIME")
+            || name.value.eq_ignore_ascii_case("TIMESTAMP")
+            // Only parameterized DATETIME uses the retiring precision grammar.
+            || (!arguments.is_empty() && name.value.eq_ignore_ascii_case("DATETIME")))
     {
         if arguments.len() > 1 {
             return Err(ParseError::UnexpectedToken {
