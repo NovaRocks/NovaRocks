@@ -74,21 +74,46 @@ pub(crate) fn sql_source(source: &str) -> String {
         let Ok((meta, sql)) = crate::parser::extract_meta_and_sql(&lines, &META) else {
             continue;
         };
-        let syntax_negative = meta.expect_trino_error.as_ref().is_some_and(|expected| {
+        let Some(expected) = meta.expect_trino_error.as_ref().filter(|expected| {
             expected.name == "SYNTAX_ERROR" && expected.error_type == "USER_ERROR"
-        });
-        if syntax_negative
-            && crate::parser::validate_trino_error_expectation(&meta, Some(&sql)).is_ok()
-            && novarocks_parser::parse(&sql).is_err()
-        {
-            // Only the analysis copy is masked. The original rejected SQL is
-            // still submitted unchanged, and cannot declare an owned catalog.
-            let blank = source[range.clone()]
-                .bytes()
-                .map(|byte| if byte == b'\n' { b'\n' } else { b' ' })
-                .collect::<Vec<_>>();
-            masked.replace_range(range, std::str::from_utf8(&blank).unwrap());
+        }) else {
+            continue;
+        };
+        if crate::parser::validate_trino_error_expectation(&meta, Some(&sql)).is_err() {
+            continue;
         }
+        let rejected = if expected.statement_ordinal.is_some() {
+            let Ok(statements) =
+                novarocks_parser::trino_parser::frame_statements(&source[range.clone()])
+            else {
+                continue;
+            };
+            if expected.validate_statement_count(statements.len()).is_err() {
+                continue;
+            }
+            let frame = statements.last().expect("validated positive ordinal");
+            let selected = range.start + frame.source.start()..range.start + frame.source.end();
+            let payload = &source[selected.clone()];
+            if novarocks_parser::parse(payload).is_ok()
+                || (frame.lexical_failure.is_none()
+                    && novarocks_parser::trino_parser::parse_statement(payload).is_ok())
+            {
+                continue;
+            }
+            selected
+        } else {
+            if novarocks_parser::parse(&sql).is_ok() {
+                continue;
+            }
+            range
+        };
+        // Only the analysis copy is masked. Valid statements retain their
+        // spans and the rejected statement is submitted unchanged.
+        let blank = source[rejected.clone()]
+            .bytes()
+            .map(|byte| if byte == b'\n' { b'\n' } else { b' ' })
+            .collect::<Vec<_>>();
+        masked.replace_range(rejected, std::str::from_utf8(&blank).unwrap());
     }
     masked
 }
@@ -1439,6 +1464,29 @@ mod tests {
         assert!(sealed.lookup(&invalid).is_none());
         assert!(sealed.lookup(&valid).is_some());
         assert_eq!(sealed.0.len(), 1);
+    }
+
+    #[test]
+    fn indexed_syntax_negative_masks_only_the_terminal_statement_in_catalog_analysis() {
+        let symbols = symbols();
+        let source = "-- query 1\r\n-- @expect_trino_error=SYNTAX_ERROR,USER_ERROR,2\r\nUSE owned.ns;\r\nSELECT id FROM t ORDER BY idSELECT id;\r\n-- query 2\r\nSELECT 1;";
+        let malformed = "SELECT id FROM t ORDER BY idSELECT id;";
+        let masked = sql_source(source);
+        assert_eq!(masked.len(), source.len());
+        assert!(masked.contains("USE owned.ns;"));
+        assert!(!masked.contains(malformed));
+        assert!(masked.ends_with("-- query 2\r\nSELECT 1;"));
+        let rewritten = symbols.rewrite_source(source).unwrap();
+        assert_eq!(
+            rewritten,
+            source.replacen(
+                "USE owned.ns;",
+                &format!("USE {}.ns;", symbols.lookup("owned").unwrap()),
+                1
+            )
+        );
+        let valid = source.replace(malformed, "SELECT 2;");
+        assert_eq!(sql_source(&valid), valid);
     }
 
     #[test]

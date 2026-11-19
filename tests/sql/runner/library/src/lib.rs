@@ -234,10 +234,11 @@ fn expected_error_location_result(
 fn expected_error_expectation_label(meta: &QueryMeta) -> String {
     let mut labels = Vec::new();
     if let Some(expected) = &meta.expect_trino_error {
-        labels.push(format!(
-            "trino_error={},{}",
-            expected.name, expected.error_type
-        ));
+        let mut label = format!("trino_error={},{}", expected.name, expected.error_type);
+        if let Some(ordinal) = expected.statement_ordinal {
+            label.push_str(&format!(",{ordinal}"));
+        }
+        labels.push(label);
     }
     if let Some(code) = meta.expect_error_code.as_deref() {
         labels.push(format!("engine_error_code={code}"));
@@ -266,19 +267,31 @@ fn evaluate_expected_error_outcome(
     outcome: Option<&SqlExecutionOutcome>,
 ) -> Option<Result<(), String>> {
     if let Some(expected) = &meta.expect_trino_error {
+        let count = expected.statement_count();
         let actual = outcome.and_then(|outcome| {
             if ok || outcome.0 || outcome.3.len() != 1 {
                 return None;
             }
             let attempt = &outcome.3[0];
-            if attempt.statement_count != 1
-                || attempt.statements.len() != 1
+            if attempt.statement_count != count
+                || attempt.statements.len() != count
                 || !attempt.local_failures.is_empty()
             {
                 return None;
             }
-            let statement = &attempt.statements[0];
-            if statement.ordinal != 0 || !statement.submission_started || !statement.completed {
+            let (statement, prior) = attempt.statements.split_last()?;
+            if prior.iter().enumerate().any(|(index, statement)| {
+                statement.ordinal != index
+                    || !statement.submission_started
+                    || !statement.completed
+                    || !statement.failures.is_empty()
+            }) {
+                return None;
+            }
+            if statement.ordinal != prior.len()
+                || !statement.submission_started
+                || !statement.completed
+            {
                 return None;
             }
             match statement.failures.as_slice() {
@@ -297,11 +310,11 @@ fn evaluate_expected_error_outcome(
                 Ok(())
             }
             Some(error) => Err(format!(
-                "expected Trino error {},{}, got {},{}: {}",
+                "expected Trino error {},{} at statement {count}, got {},{}: {}",
                 expected.name, expected.error_type, error.error_name, error.error_type, err_msg
             )),
             None => Err(format!(
-                "expected one actual Trino statement error {},{}, got success, multiple outcomes, or an infrastructure/local failure: {}",
+                "expected Trino error {},{} at statement {count} after successful preceding statements: {}",
                 expected.name, expected.error_type, err_msg
             )),
         });

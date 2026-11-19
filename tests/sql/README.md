@@ -70,7 +70,7 @@ LNP-3A/LNP-3D 与 `mv-storage-contract` 保留原 SQL、`.result` 和独立文�
 CREATE TABLE ${case_db}.missing_name AS SELECT CAST(1 AS integer);
 ```
 
-两项必填，去掉参数周围空白后，分别精确比较本次实际 Trino 错误的 `errorName` 与 `errorType`。每步只能有一条可执行 SQL；注释和引号内分号沿原词法 splitter 处理，负例 SQL 不在 runner 内做语义解析。空步骤、多语句、shell 和同一步其他报错指令均拒绝。该断言不进行外层重试或 transient commit 重试；成功、HTTP／transport／本地控制失败、额外错误和任一字段不符都失败，消息文本不能替代结构化错误。
+两项必填，去掉参数周围空白后，分别精确比较本次实际 Trino 错误的 `errorName` 与 `errorType`。默认步骤包含一条可执行 SQL。多语句步骤必须给出第三个字段，形如 `@expect_trino_error=SYNTAX_ERROR,USER_ERROR,2`。一基序号须指向步骤末条可执行 SQL，前面的语句均须按序提交并成功完成。注释和引号内分号沿原词法 splitter 处理。空步骤、shell、同一步其他报错指令和未显式指定序号的多语句步骤均拒绝。该断言不进行外层重试或 transient commit 重试；成功、HTTP／transport／本地控制失败、额外错误和任一字段不符都失败，消息文本不能替代结构化错误。
 
 verify、record 与 conversion 共用同一判定和 `expected_error` oracle。执行调用返回本次所有 attempt／statement 的实际提交、完成、typed result 与失败；后续查询不改写前次事实。普通多语句 conversion 仍保留成功 suffix 与全部失败，基础设施失败停止普通后继；多个错误不能被首个匹配错误变成通过。解析与 HTTP 边界回归属于原 runner 常规 Rust 测试，复用其本地独占 peer 与退出 owner，不需额外 fixture。
 

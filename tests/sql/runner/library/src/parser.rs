@@ -522,16 +522,25 @@ fn parse_meta_with_name_binding(
                 meta.db = Some(raw_value);
             }
             "expect_trino_error" => {
-                let parts = raw_value.split(',').map(str::trim).collect::<Vec<_>>();
-                let [name, error_type] = parts.as_slice() else {
-                    bail!("@expect_trino_error requires exactly <errorName>,<errorType>");
-                };
+                let mut parts = raw_value.split(',').map(str::trim);
+                let name = parts.next().unwrap_or_default();
+                let error_type = parts.next().unwrap_or_default();
                 if name.is_empty() || error_type.is_empty() {
                     bail!("@expect_trino_error requires nonempty errorName and errorType");
                 }
+                let statement_ordinal = parts
+                    .next()
+                    .map(str::parse)
+                    .transpose()
+                    .context("@expect_trino_error expects a positive statement ordinal")?;
+                ensure!(
+                    parts.next().is_none(),
+                    "@expect_trino_error requires <errorName>,<errorType>[,<statementOrdinal>]"
+                );
                 meta.expect_trino_error = Some(TrinoErrorExpectation {
-                    name: (*name).to_string(),
-                    error_type: (*error_type).to_string(),
+                    name: name.to_string(),
+                    error_type: error_type.to_string(),
+                    statement_ordinal,
                 });
             }
             "expect_error" => {
@@ -988,9 +997,9 @@ fn validate_result_rows_assertion(meta: &QueryMeta) -> Result<()> {
 }
 
 pub(crate) fn validate_trino_error_expectation(meta: &QueryMeta, sql: Option<&str>) -> Result<()> {
-    if meta.expect_trino_error.is_none() {
+    let Some(expected) = &meta.expect_trino_error else {
         return Ok(());
-    }
+    };
     ensure!(
         meta.expect_error.is_none()
             && meta.expect_error_code.is_none()
@@ -1001,12 +1010,9 @@ pub(crate) fn validate_trino_error_expectation(meta: &QueryMeta, sql: Option<&st
     if let Some(sql) = sql {
         ensure!(
             !crate::shell::is_shell_step(sql),
-            "@expect_trino_error requires one SQL statement, not shell"
+            "@expect_trino_error requires SQL statements, not shell"
         );
-        ensure!(
-            crate::session::split_sql_statements(sql)?.len() == 1,
-            "@expect_trino_error requires exactly one executable SQL statement"
-        );
+        expected.validate_statement_count(crate::session::split_sql_statements(sql)?.len())?;
     }
     Ok(())
 }
@@ -1983,7 +1989,7 @@ mod opt5_directive_tests {
     // Runner correctness belongs at the parser/returned HTTP outcome boundary;
     // these pure tests need no native cluster and run with the regular owner.
     #[test]
-    fn trino_error_expectation_requires_two_exact_fields_and_rejects_conflicts() {
+    fn trino_error_expectation_checks_protocol_fields_and_optional_ordinal() {
         let re = meta_re();
         let meta = parse_meta(
             &["-- @expect_trino_error= MISSING_COLUMN_NAME , USER_ERROR ".into()],
@@ -1995,6 +2001,7 @@ mod opt5_directive_tests {
             Some(TrinoErrorExpectation {
                 name: "MISSING_COLUMN_NAME".into(),
                 error_type: "USER_ERROR".into(),
+                statement_ordinal: None,
             })
         );
         for value in [
@@ -2003,6 +2010,8 @@ mod opt5_directive_tests {
             ",USER_ERROR",
             "MISSING_COLUMN_NAME,",
             "A,B,C",
+            "A,B,0",
+            "A,B,2,3",
         ] {
             assert!(
                 parse_meta(&[format!("-- @expect_trino_error={value}")], &re).is_err(),
@@ -2038,6 +2047,18 @@ mod opt5_directive_tests {
             );
         }
         assert!(meta.has_error_expectation());
+
+        let indexed = parse_meta(
+            &["-- @expect_trino_error=SYNTAX_ERROR,USER_ERROR,2".into()],
+            &re,
+        )
+        .unwrap();
+        validate_trino_error_expectation(&indexed, Some("USE fixture; SELECT idSELECT id"))
+            .unwrap();
+        for sql in ["SELECT 1", "USE fixture; SELECT idSELECT id; SELECT 3"] {
+            assert!(validate_trino_error_expectation(&indexed, Some(sql)).is_err());
+        }
+        assert!(validate_trino_error_expectation(&merge_meta(&legacy, &indexed), None).is_err());
     }
 
     #[test]

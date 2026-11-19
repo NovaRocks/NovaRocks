@@ -204,7 +204,11 @@ impl<'a> Observer<'a> {
             "prepared_sql_sha256": digest(sql.as_bytes()), "prepared_sql_len": sql.len(),
             "oracle": {"required": required, "expected_error": meta.has_error_expectation(),
                        "expect_trino_error": meta.expect_trino_error.as_ref().map(|error| {
-                           json!({"name": error.name, "type": error.error_type})
+                           let mut value = json!({"name": error.name, "type": error.error_type});
+                           if let Some(ordinal) = error.statement_ordinal {
+                               value["statement_ordinal"] = json!(ordinal);
+                           }
+                           value
                        }),
                        "skip_result_check": meta.skip_result_check,
                        "order_sensitive": meta.order_sensitive, "float_epsilon": meta.float_epsilon,

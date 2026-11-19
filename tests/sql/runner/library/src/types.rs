@@ -19,6 +19,7 @@ use crate::sql_error_codes::SqlErrorPhase;
 use crate::suite_manifest::SuiteManifest;
 pub use novarocks_failpoint::QueryLifecycleFaultKind;
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -237,6 +238,29 @@ pub struct ImvStatelessDirective {
 pub struct TrinoErrorExpectation {
     pub name: String,
     pub error_type: String,
+    /// One-based terminal statement ordinal. Omitted for a single statement.
+    pub statement_ordinal: Option<NonZeroUsize>,
+}
+
+impl TrinoErrorExpectation {
+    pub(crate) fn statement_count(&self) -> usize {
+        self.statement_ordinal.unwrap_or(NonZeroUsize::MIN).get()
+    }
+
+    pub(crate) fn validate_statement_count(&self, count: usize) -> anyhow::Result<()> {
+        if let Some(ordinal) = self.statement_ordinal {
+            anyhow::ensure!(
+                count == ordinal.get(),
+                "@expect_trino_error ordinal {ordinal} must identify the last executable SQL statement (found {count})"
+            );
+        } else {
+            anyhow::ensure!(
+                count == 1,
+                "@expect_trino_error requires exactly one executable SQL statement"
+            );
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Default, Clone)]

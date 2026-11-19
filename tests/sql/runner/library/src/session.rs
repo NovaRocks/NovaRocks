@@ -477,28 +477,27 @@ pub fn split_trino_sql_statements(sql: &str) -> Result<Vec<String>> {
 }
 
 /// Prepares exactly the same bytes for validation, control hashes, and POST.
-/// A declared syntax-error probe may submit one completely framed rejected
-/// token. The FE must produce its own typed error from the unmodified bytes.
+/// A declared syntax-error probe may submit the selected completely framed
+/// rejected statement. The FE produces its own error from the original bytes.
 pub(crate) fn split_trino_step_sql(
     sql: &str,
     expected_error: Option<&TrinoErrorExpectation>,
 ) -> Result<Vec<String>> {
     let frames =
         novarocks_parser::trino_parser::frame_statements(sql).context("framing Trino SQL batch")?;
-    if expected_error.is_some() {
-        ensure!(
-            frames.len() == 1,
-            "@expect_trino_error requires exactly one executable SQL statement"
-        );
+    if let Some(error) = expected_error {
+        error.validate_statement_count(frames.len())?;
     }
-    let allow_lexical_refusal = expected_error
-        .is_some_and(|error| error.name == "SYNTAX_ERROR" && error.error_type == "USER_ERROR");
+    let lexical_refusal_index = expected_error
+        .filter(|error| error.name == "SYNTAX_ERROR" && error.error_type == "USER_ERROR")
+        .map(|error| error.statement_count() - 1);
     frames
         .into_iter()
-        .map(|frame| {
+        .enumerate()
+        .map(|(index, frame)| {
             let raw = &sql[frame.source.start()..frame.source.end()];
             if let Some(error) = frame.lexical_failure {
-                if allow_lexical_refusal {
+                if lexical_refusal_index == Some(index) {
                     return Ok(raw.to_owned());
                 }
                 return Err(anyhow::Error::new(error).context("tokenizing Trino SQL batch"));
@@ -798,6 +797,24 @@ mod splitter_tests {
         statement_sha256,
     };
     use std::time::Duration;
+
+    #[test]
+    fn indexed_trino_error_expectation_allows_a_lexical_refusal_only_at_its_ordinal() {
+        let expectation = super::TrinoErrorExpectation {
+            name: "SYNTAX_ERROR".into(),
+            error_type: "USER_ERROR".into(),
+            statement_ordinal: std::num::NonZeroUsize::new(2),
+        };
+        assert_eq!(
+            super::split_trino_step_sql("USE fixture;SELECT #;", Some(&expectation)).unwrap(),
+            ["USE fixture", "SELECT #"]
+        );
+        assert!(super::split_trino_step_sql("SELECT #;SELECT 1;", Some(&expectation)).is_err());
+        assert!(
+            super::split_trino_step_sql("USE fixture;SELECT #;SELECT 3;", Some(&expectation))
+                .is_err()
+        );
+    }
 
     // The runner owns source framing. Expected fragments are hand-written
     // source slices; lexical rules come from the production parser dependency.
@@ -1697,6 +1714,7 @@ mod session_tests {
             expect_trino_error: Some(TrinoErrorExpectation {
                 name: "GENERIC_USER_ERROR".into(),
                 error_type: "USER_ERROR".into(),
+                statement_ordinal: None,
             }),
             ..Default::default()
         }
@@ -1735,6 +1753,61 @@ mod session_tests {
                 .is_err()
         );
         assert_eq!(peer.finish().len(), 4);
+    }
+
+    #[test]
+    fn indexed_trino_error_expectation_requires_the_prefix_use_to_succeed() {
+        for use_succeeds in [true, false] {
+            let mut replies = if use_succeeds {
+                vec![
+                    Reply::queued("/v1/statement", "/use"),
+                    Reply::json("GET", "/use", r#"{"id":"q","updateType":"USE"}"#)
+                        .header("X-Trino-Set-Schema", "fixture"),
+                ]
+            } else {
+                Vec::new()
+            };
+            replies.extend([
+                Reply::queued("/v1/statement", "/bad"),
+                Reply::json("GET", "/bad", &trino_error("same typed error")),
+            ]);
+            let mut meta = generic_user_expectation();
+            meta.expect_trino_error.as_mut().unwrap().statement_ordinal =
+                std::num::NonZeroUsize::new(2);
+            let peer = Peer::start(replies);
+            let temp = tempfile::TempDir::new().unwrap();
+            let (case, evidence, _) = run_boundary_steps(
+                &peer,
+                &temp,
+                crate::Mode::Verify,
+                false,
+                vec![boundary_step(1, "USE fixture; SELECT malformed", meta)],
+                None,
+                Box::new(BoundaryServer),
+            );
+            assert_eq!(
+                matches!(case.status, crate::CaseStatus::Pass),
+                use_succeeds,
+                "{}",
+                case.log
+            );
+            assert!(oracle_recorded(
+                &evidence,
+                1,
+                "expected_error",
+                if use_succeeds { "pass" } else { "fail" }
+            ));
+            let requests = peer.finish();
+            if use_succeeds {
+                assert_eq!(
+                    posted_requests(&requests),
+                    ["USE fixture", "SELECT malformed"]
+                );
+                assert_eq!(requests[2].headers["x-trino-schema"], "fixture");
+            } else {
+                assert_eq!(posted_requests(&requests), ["USE fixture"]);
+            }
+        }
     }
 
     #[test]
