@@ -6686,6 +6686,33 @@ pub(crate) mod tests {
             })
         };
         let payload = nonempty_data.then(|| receiver_data_payload(&port));
+        let held_delivery = if matches!(stop, ReceiverStop::Abort) && payload.is_some() {
+            let (entered, claimed) = std::sync::mpsc::sync_channel(1);
+            let (resume, wait_for_retirement) = std::sync::mpsc::sync_channel(1);
+            let execution_control = host.controls.lock().unwrap()[&descriptor.identity()]
+                .in_phase(novarocks_execution_contract::TaskFailurePhase::Execution);
+            let capabilities = host.inner.capabilities.clone();
+            let delivery = std::thread::spawn(move || {
+                capabilities.with_claimed_stream(stream, |_| {
+                    entered.send(()).unwrap();
+                    wait_for_retirement.recv().unwrap();
+                    let saw_original_stop =
+                        execution_control.is_stopped() && execution_control.accepted().is_some();
+                    if saw_original_stop {
+                        execution_control.report_failure(ExecutionFailure::from_domain(
+                            ReceiverConstructionAborted(AbortCause::QueryFailed),
+                        ));
+                    }
+                    Ok::<_, ()>(saw_original_stop)
+                })
+            });
+            claimed
+                .recv_timeout(until.saturating_duration_since(std::time::Instant::now()))
+                .expect("the original delivery claimed the receiver before abort");
+            Some((resume, delivery))
+        } else {
+            None
+        };
         let control = node.control.clone();
         let deadline = node.deadline();
         let (control_started, control_polled) = std::sync::mpsc::sync_channel(1);
@@ -6777,6 +6804,12 @@ pub(crate) mod tests {
                 "DemandDriven normal withdrawal preserves the actual authorized DATA path until physical retirement: {delivered:?}"
             );
         }
+        let delivery_observation = held_delivery.map(|(resume, delivery)| {
+            // The checked retirement callback has started. The admitted
+            // delivery still holds its original receiver read gate here.
+            resume.send(()).unwrap();
+            delivery.join().unwrap()
+        });
         drop(retirement_pause);
         if let Some(reply) = control_reply {
             drop(
@@ -6869,6 +6902,18 @@ pub(crate) mod tests {
             1,
             "one original registration exits exactly once"
         );
+        if let Some(delivered) = delivery_observation {
+            assert!(
+                matches!(delivered, Ok(Ok(true))),
+                "an already-claimed delivery must still see the original stop during retirement"
+            );
+            let health = host.inner.execution_runtime.execution_health();
+            assert!(
+                health.is_healthy(),
+                "the admitted delivery's stop report must preserve health: {:?}",
+                health.failure()
+            );
+        }
         drop(runtime_alias);
         drop(node);
         host.inner.root_producer_pool.shutdown().unwrap();
