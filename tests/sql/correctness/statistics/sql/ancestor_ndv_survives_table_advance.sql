@@ -65,7 +65,7 @@ SHOW STATS FOR statistics_hadoop_${suite_uuid0}.nr_ancestor_${suite_uuid0}.advan
 -- snapshot's own manifest, so it reports six rows rather than the four the
 -- sketch was measured over.
 -- @result_contains=6
-SELECT COUNT(*) FROM statistics_hadoop_${suite_uuid0}.nr_ancestor_${suite_uuid0}.advance_${uuid0};
+SELECT COUNT() FROM statistics_hadoop_${suite_uuid0}.nr_ancestor_${suite_uuid0}.advance_${uuid0};
 
 -- query 9
 -- @skip_result_check=true

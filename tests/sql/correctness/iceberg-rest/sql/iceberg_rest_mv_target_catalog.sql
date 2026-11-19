@@ -88,7 +88,7 @@ DROP MATERIALIZED VIEW analytics_${uuid0}.mv_orders_${uuid0};
 
 -- query 11
 -- @expect_error=unknown table
-SELECT COUNT(*) FROM analytics_${uuid0}.mv_orders_${uuid0};
+SELECT COUNT() FROM analytics_${uuid0}.mv_orders_${uuid0};
 
 -- query 12
 -- @cleanup=true

@@ -33,11 +33,11 @@ TBLPROPERTIES ('format-version'='3');
 INSERT INTO ${case_db}.lineage_source_${uuid0} VALUES (2,'bb'),(3,'c');
 
 -- query 2
-SELECT 'absent' AS property_value, COUNT(*) AS total_rows, COUNT(_row_id) AS assigned_ids,
+SELECT 'absent' AS property_value, COUNT() AS total_rows, COUNT(_row_id) AS assigned_ids,
        COUNT(_last_updated_sequence_number) AS assigned_sequences
 FROM ${case_db}.lineage_absent_${uuid0}
 UNION ALL
-SELECT 'false', COUNT(*), COUNT(_row_id), COUNT(_last_updated_sequence_number)
+SELECT 'false', COUNT(), COUNT(_row_id), COUNT(_last_updated_sequence_number)
 FROM ${case_db}.lineage_false_${uuid0}
 ORDER BY property_value;
 
@@ -61,11 +61,11 @@ SELECT 'false', id, v FROM ${case_db}.lineage_false_${uuid0}
 ORDER BY property_value,id;
 
 -- query 5
-SELECT 'absent' AS property_value, COUNT(*) AS total_rows, COUNT(_row_id) AS assigned_ids,
+SELECT 'absent' AS property_value, COUNT() AS total_rows, COUNT(_row_id) AS assigned_ids,
        COUNT(DISTINCT _row_id) AS unique_ids, COUNT(_last_updated_sequence_number) AS assigned_sequences
 FROM ${case_db}.lineage_absent_${uuid0}
 UNION ALL
-SELECT 'false', COUNT(*), COUNT(_row_id), COUNT(DISTINCT _row_id), COUNT(_last_updated_sequence_number)
+SELECT 'false', COUNT(), COUNT(_row_id), COUNT(DISTINCT _row_id), COUNT(_last_updated_sequence_number)
 FROM ${case_db}.lineage_false_${uuid0}
 ORDER BY property_value;
 

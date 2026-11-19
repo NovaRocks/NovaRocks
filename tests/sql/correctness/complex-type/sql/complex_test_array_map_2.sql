@@ -68,7 +68,7 @@ select array_length(array_map((x,y)->x > y, array_repeat("12345",1000000),array_
 
 -- query 11
 USE ${case_db};
-select count(*) from array_map_test where array_map((a1) -> concat(split(id, 'd'), split(id, 'd')), arr_str) is not null;
+select count() from array_map_test where array_map((a1) -> concat(split(id, 'd'), split(id, 'd')), arr_str) is not null;
 
 -- name: test_array_map_3
 -- query 12

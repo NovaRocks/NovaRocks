@@ -146,7 +146,7 @@ REFRESH MATERIALIZED VIEW xns_mv WITH SYNC MODE;
 -- serves it
 -- @skip_result_check=true
 -- @explain_contains=rewritten with mv: xns_mv
-SELECT category_l1, COUNT(*), SUM(sales_amount) FROM mvrw_${uuid0}.ns_${uuid0}.sales_data GROUP BY category_l1;
+SELECT category_l1, COUNT(), SUM(sales_amount) FROM mvrw_${uuid0}.ns_${uuid0}.sales_data GROUP BY category_l1;
 
 -- query 17
 SELECT category_l1, COUNT() AS c, SUM(sales_amount) AS s
