@@ -139,7 +139,7 @@ WHERE t3.v <= 150;
 -- bilateral probe placement. Do not golden query-local allocator identities.
 -- @skip_result_check=true
 EXPLAIN VERBOSE
-SELECT 'bilateral_probe' AS scenario, COUNT(*) AS row_count,
+SELECT 'bilateral_probe' AS scenario, COUNT() AS row_count,
        COALESCE(SUM(t1.v), 0) AS t1_sum, COALESCE(SUM(t2.v), 0) AS t2_sum
 FROM ${case_db}.rf_dist_bi_t1 t1
 JOIN ${case_db}.rf_dist_bi_t2 t2 ON t1.k = t2.k

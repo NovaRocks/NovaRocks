@@ -48,7 +48,7 @@ FROM (
 -- @skip_result_check=true
 -- @explain_contains=HASH AGGREGATE
 -- @explain_contains=count
-EXPLAIN VERBOSE SELECT count(*) AS c
+EXPLAIN VERBOSE SELECT count() AS c
 FROM ${case_db}.oq1a_t;
 
 SELECT count() AS c

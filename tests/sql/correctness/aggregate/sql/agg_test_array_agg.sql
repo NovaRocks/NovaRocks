@@ -1180,17 +1180,17 @@ select array_agg([1,2]) from ss;
 
 -- query 281
 USE ${case_db};
-select array_agg(json_object("2:3")) from ss;
+select array_agg(json_object('2:3', NULL)) from ss;
 
 -- query 282
 -- @expect_error=array_agg(DISTINCT json_object('2:3')) can't rewrite distinct to group by on (json).
 USE ${case_db};
-select array_agg(distinct json_object("2:3")) from ss;
+select array_agg(distinct json_object('2:3', NULL)) from ss;
 
 -- query 283
 -- @expect_error=array_agg(DISTINCT [json_object('2:3')]) can't rewrite distinct to group by on (array<json>).
 USE ${case_db};
-select array_agg(distinct [json_object("2:3")]) from ss;
+select array_agg(distinct [json_object('2:3', NULL)]) from ss;
 
 -- query 284
 USE ${case_db};

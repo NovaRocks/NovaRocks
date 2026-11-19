@@ -46,7 +46,7 @@ SET disable_optimizer_rules = 'JoinCommutativity';
 -- @explain_contains=k2
 -- @explain_contains=oq12_stats_mj_l
 -- @explain_contains=oq12_stats_mj_r
-EXPLAIN VERBOSE SELECT l.k1, l.k2, COUNT(*) AS match_count
+EXPLAIN VERBOSE SELECT l.k1, l.k2, COUNT() AS match_count
 FROM ${case_db}.oq12_stats_mj_l l
 INNER JOIN ${case_db}.oq12_stats_mj_r r
     ON l.k1 = r.k1 AND l.k2 = r.k2

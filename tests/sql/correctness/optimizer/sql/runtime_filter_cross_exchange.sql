@@ -37,7 +37,7 @@ SET global_runtime_filter_build_max_size = 10737418240;
 SET global_runtime_filter_probe_min_selectivity = 0.0;
 
 EXPLAIN VERBOSE
-SELECT count(*) AS cnt
+SELECT count() AS cnt
 FROM (
     SELECT a.v AS av
     FROM ${case_db}.ra a
@@ -51,6 +51,6 @@ JOIN (
 ON t1.av = t2.cv;
 
 EXPLAIN VERBOSE
-SELECT count(*) AS cnt
+SELECT count() AS cnt
 FROM ${case_db}.rf_x_probe p
 JOIN ${case_db}.rf_x_build b ON p.k = b.k;

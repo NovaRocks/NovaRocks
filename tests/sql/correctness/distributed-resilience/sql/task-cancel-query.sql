@@ -69,8 +69,8 @@ SELECT COUNT(*) FROM ${case_db}.kill_query;
 -- @be_log_count_at_least=NOVAROCKS_CONNECTOR_UNIT_READER_OPEN,1
 -- @be_log_count_at_least=NOVAROCKS_CONNECTOR_UNIT_READER_CLOSE,1
 -- @be_log_be_count_at_least=NOVAROCKS_PARTICIPATION_ABORT_APPLIED,3
-SELECT COUNT(*)
-FROM ${case_db}.kill_query$files AS metadata
+SELECT COUNT()
+FROM ${case_db}."kill_query$files" AS metadata
 JOIN ${case_db}.kill_query AS data ON TRUE
 WHERE sleep(data.delay_s);
 

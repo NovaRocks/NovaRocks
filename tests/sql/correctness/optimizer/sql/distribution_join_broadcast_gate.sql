@@ -41,7 +41,7 @@ INNER JOIN ${case_db}.oq8_build_big b ON p.k = b.k;
 -- Verbose EXPLAIN golden.
 -- @skip_result_check=true
 EXPLAIN VERBOSE
-SELECT COUNT(*) AS cnt
+SELECT COUNT() AS cnt
 FROM ${case_db}.oq8_probe_big p
 INNER JOIN ${case_db}.oq8_build_big b ON p.k = b.k;
 
@@ -54,6 +54,6 @@ INNER JOIN ${case_db}.oq8_build_big b ON p.k = b.k;
 
 -- @skip_result_check=true
 EXPLAIN VERBOSE
-SELECT COUNT(*) AS cnt
+SELECT COUNT() AS cnt
 FROM ${case_db}.oq8_probe_big p
 INNER JOIN ${case_db}.oq8_build_big b ON p.k = b.k;

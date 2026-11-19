@@ -127,7 +127,7 @@ WHERE b.flag = 'Y';
 -- Do not golden unstable query-local runtime-filter channel/binding ids.
 -- @skip_result_check=true
 EXPLAIN VERBOSE
-SELECT 'partitioned_probe' AS scenario, COUNT(*) AS row_count, COALESCE(SUM(p.id), 0) AS id_sum
+SELECT 'partitioned_probe' AS scenario, COUNT() AS row_count, COALESCE(SUM(p.id), 0) AS id_sum
 FROM ${case_db}.rf_dist_part_probe p
 JOIN ${case_db}.rf_dist_part_build b ON p.k = b.k
 WHERE b.flag = 'Y';

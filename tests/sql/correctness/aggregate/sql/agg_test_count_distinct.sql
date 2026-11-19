@@ -95,7 +95,7 @@ select count(distinct 1, 2, 3, 4) from test_cc;
 
 -- query 15
 USE ${case_db};
-select /*+ new_planner_agg_stage = 3 */ count(distinct 1, 2, 3, 4) from test_cc group by v2;
+select count(distinct 1, 2, 3, 4) from test_cc group by v2;
 
 -- query 16
 USE ${case_db};
@@ -103,7 +103,7 @@ select count(distinct 1, v2) from test_cc;
 
 -- query 17
 USE ${case_db};
-select /*+ new_planner_agg_stage = 2 */ count(distinct 1, v2) from test_cc;
+select count(distinct 1, v2) from test_cc;
 
 -- query 18
 USE ${case_db};

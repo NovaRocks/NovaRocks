@@ -1085,7 +1085,7 @@ select group_concat([1,2]) from ss;
 
 -- query 249
 USE ${case_db};
-select group_concat(json_object("2:3")) from ss;
+select group_concat(json_object('2:3', NULL)) from ss;
 
 -- query 250
 -- @expect_error=No matching function with signature: group_concat(map<int(11),int(11)>, varchar).

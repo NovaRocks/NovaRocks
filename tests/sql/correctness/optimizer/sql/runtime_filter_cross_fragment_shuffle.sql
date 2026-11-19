@@ -46,6 +46,6 @@ FROM ${case_db}.rf_shuffle_probe p
 JOIN ${case_db}.rf_shuffle_build b ON p.k = b.k;
 
 EXPLAIN VERBOSE
-SELECT count(*) AS cnt
+SELECT count() AS cnt
 FROM ${case_db}.rf_shuffle_probe p
 JOIN ${case_db}.rf_shuffle_build b ON p.k = b.k;

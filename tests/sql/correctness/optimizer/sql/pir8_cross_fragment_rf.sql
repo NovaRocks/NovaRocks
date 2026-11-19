@@ -57,6 +57,6 @@ FROM ${case_db}.pir8_rf_probe p
 JOIN ${case_db}.pir8_rf_build b ON p.k = b.k;
 
 EXPLAIN VERBOSE
-SELECT count(*) AS cnt
+SELECT count() AS cnt
 FROM ${case_db}.pir8_rf_probe p
 JOIN ${case_db}.pir8_rf_build b ON p.k = b.k;

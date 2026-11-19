@@ -79,6 +79,6 @@ SELECT col_int, map_entries(col_map) FROM ${case_db}.test_map ORDER BY col_int;
 
 -- query 10
 -- unnest(map_entries(...)) on a table column; entries emitted in insertion order
-SELECT col_int, map_entries(col_map), unnest
-FROM ${case_db}.test_map, unnest(map_entries(col_map)) AS unnest(unnest)
+SELECT col_int, map_entries(col_map), `unnest`
+FROM ${case_db}.test_map, unnest(map_entries(col_map)) AS `unnest`(`unnest`)
 ORDER BY col_int;
