@@ -32,9 +32,11 @@ CREATE TABLE ${case_db}.src (
 CREATE TABLE ${case_db}.dst (LIKE ${case_db}.src);
 
 -- query 2
--- @result_contains=`id`
--- @result_contains=`name`
--- @result_contains=`v`
+-- @result_contains=id integer
+-- @result_contains=name varchar
+-- @result_contains=v bigint
+-- @result_contains=format = 'PARQUET'
+-- @result_contains=format_version = 2
 SHOW CREATE TABLE ${case_db}.dst;
 
 -- query 3

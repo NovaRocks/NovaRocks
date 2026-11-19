@@ -6,8 +6,22 @@ use crate::ast::{
     TrinoCreateTable, TrinoDropTable, TrinoTableElement,
 };
 
+pub fn print_create_table_definition(node: &TrinoCreateTable) -> Result<String, super::PrintError> {
+    let mut writer = Writer::default();
+    writer.create_table_with_layout(node, true)?;
+    writer.finish(0)
+}
+
 impl Writer {
     pub(super) fn create_table(&mut self, node: &TrinoCreateTable) -> PrintResult {
+        self.create_table_with_layout(node, false)
+    }
+
+    fn create_table_with_layout(
+        &mut self,
+        node: &TrinoCreateTable,
+        definition: bool,
+    ) -> PrintResult {
         if node.elements.is_empty() {
             return Err(unsupported("CREATE TABLE without elements"));
         }
@@ -17,7 +31,10 @@ impl Writer {
         self.text(" (");
         for (index, element) in node.elements.iter().enumerate() {
             if index != 0 {
-                self.text(", ");
+                self.text(if definition { "," } else { ", " });
+            }
+            if definition {
+                self.text("\n   ");
             }
             match element {
                 TrinoTableElement::Column(column) => self.trino_column_definition(column)?,
@@ -32,13 +49,24 @@ impl Writer {
                 }
             }
         }
+        if definition {
+            self.character('\n');
+        }
         self.character(')');
         let elements_end = self.parameter_events.len();
         if let Some(comment) = &node.comment {
-            self.text(" COMMENT ");
+            self.text(if definition {
+                "\nCOMMENT "
+            } else {
+                " COMMENT "
+            });
             self.string(comment);
         }
-        self.optional_statement_properties(&node.properties)?;
+        if definition {
+            self.definition_properties(&node.properties)?;
+        } else {
+            self.optional_statement_properties(&node.properties)?;
+        }
         let end = self.parameter_events.len();
         self.reorder_parameter_events(
             parameter_start,

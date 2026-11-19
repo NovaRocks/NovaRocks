@@ -60,6 +60,43 @@ pub fn engine_property_declarations()
     .collect()
 }
 
+/// Project the declared SQL properties backed by the durable configuration.
+pub fn definition_properties(
+    configuration: &crate::persistence::codec::ConfigurationDocument,
+) -> Vec<(String, DdlPropertyValue)> {
+    use crate::persistence::codec::RefreshPolicy;
+
+    let policy = match configuration.refresh_policy {
+        RefreshPolicy::Manual => MvDesiredRefreshPolicy::Manual,
+        RefreshPolicy::AsyncOnChange => MvDesiredRefreshPolicy::AsyncOnChange,
+        RefreshPolicy::AsyncInterval => MvDesiredRefreshPolicy::AsyncInterval,
+    };
+    let mut properties = vec![
+        (
+            REFRESH_POLICY.to_owned(),
+            DdlPropertyValue::Varchar(refresh_policy_property_value(&policy).into()),
+        ),
+        (
+            REFRESH_PAUSED.to_owned(),
+            DdlPropertyValue::Boolean(configuration.paused),
+        ),
+    ];
+    if let Some(ms) = configuration.refresh_interval_ms {
+        let seconds = ms / SECOND_MS;
+        let remainder = ms % SECOND_MS;
+        let interval = if remainder == 0 {
+            format!("{seconds}s")
+        } else {
+            format!("{seconds}.{remainder:03}s")
+        };
+        properties.push((
+            REFRESH_INTERVAL.to_owned(),
+            DdlPropertyValue::Varchar(interval),
+        ));
+    }
+    properties
+}
+
 /// These are SQL property values. The durable policy names remain unchanged.
 pub const fn refresh_policy_property_value(policy: &MvDesiredRefreshPolicy) -> &'static str {
     match policy {

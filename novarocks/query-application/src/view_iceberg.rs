@@ -20,7 +20,11 @@ use crate::view::{
     CreateExternalViewRequest, CreateViewCommand, ViewEngine, ViewRequestContext,
     ViewStatementResult, ViewTarget,
 };
-use novarocks_parser::ast::ObjectName;
+use novarocks_parser::{
+    ast::ObjectName,
+    build::{ident_from_catalog, object_name},
+    printer::print_create_view_definition,
+};
 use novarocks_spi::connector::DropPolicy;
 use novarocks_types::naming::normalize_identifier;
 
@@ -169,14 +173,19 @@ pub(crate) fn show_create_view(
                 target.catalog, target.database, target.view
             )
         })?;
-    let mut ddl = format!(
-        "CREATE VIEW `{}`.`{}`.`{}`",
-        target.catalog, target.database, target.view
-    );
-    if let Some(comment) = &view.comment {
-        ddl.push_str(&format!("\nCOMMENT \"{}\"", comment.replace('"', "\\\"")));
-    }
-    ddl.push_str(&format!("\nAS {};", view.definition.raw_query_source));
+    let name = object_name(
+        [&target.catalog, &target.database, &target.view]
+            .into_iter()
+            .map(|part| ident_from_catalog(part.as_str()))
+            .collect(),
+    )
+    .map_err(|error| error.to_string())?;
+    let ddl = print_create_view_definition(
+        &name,
+        view.comment.as_deref(),
+        &view.definition.raw_query_source,
+    )
+    .map_err(|error| error.to_string())?;
     Ok(ViewStatementResult::Query(build_query_result(vec![
         ("View".to_string(), vec![target.view]),
         ("Create View".to_string(), vec![ddl]),

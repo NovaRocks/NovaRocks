@@ -99,6 +99,20 @@ pub fn ident(value: impl Into<String>, quoted: bool) -> Ident {
     ident_at(value, quoted, SYNTHETIC)
 }
 
+/// Builds an identifier from a stored catalog name, retaining its exact spelling.
+pub fn ident_from_catalog(value: impl Into<String>) -> Ident {
+    use crate::keyword::{KeywordClass, class, lookup};
+
+    let value = value.into();
+    let mut bytes = value.bytes();
+    let bare = bytes
+        .next()
+        .is_some_and(|first| first.is_ascii_lowercase() || first == b'_')
+        && bytes.all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        && !lookup(&value).is_some_and(|keyword| class(keyword) == KeywordClass::Reserved);
+    ident(value, !bare)
+}
+
 /// Builds an identifier derived from a particular user name.
 pub fn ident_at(value: impl Into<String>, quoted: bool, span: Span) -> Ident {
     Ident {

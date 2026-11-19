@@ -352,6 +352,36 @@ impl IcebergMetadata {
 }
 
 impl ConnectorMetadata for IcebergMetadata {
+    fn table_definition_properties(
+        &self,
+        table: &ConnectorTableMetadata,
+        context: &novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<Vec<(String, novarocks_spi::connector::DdlPropertyValue)>, ConnectorError> {
+        use crate::catalog_control::statistics::scoped_cpu::scoped_prepared_source::IcebergObservedSourceReadFacts;
+
+        self.ensure_owner(&table.identity.instance_id)?;
+        self.validate_context(context)?;
+        let marker = table.source_read_facts().ok_or_else(|| {
+            corrupt("Iceberg table definition is missing its original observation")
+        })?;
+        marker.validate_owner(&ConnectorProviderBindingKey {
+            instance_id: self.descriptor.instance_id.clone(),
+            incarnation: self.incarnation,
+        })?;
+        let observed =
+            marker.value::<IcebergObservedSourceReadFacts>(self.descriptor.instance_id.as_str())?;
+        let identifier = observed.access.identifier();
+        if !matches!(observed.projection, TableMetadataProjection::Current)
+            || identifier.name() != table.identity.table.as_ref()
+            || identifier.namespace().to_string() != table.identity.namespace.as_ref()
+        {
+            return Err(corrupt(
+                "Iceberg table definition does not match its original current table observation",
+            ));
+        }
+        crate::table_properties::table_definition_properties(observed.access.metadata(), context)
+    }
+
     fn read_planning_initial_dependencies(
         &self,
     ) -> Result<Vec<novarocks_spi::connector::SharedDependency>, ConnectorError> {

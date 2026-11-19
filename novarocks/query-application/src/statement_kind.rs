@@ -76,6 +76,7 @@ pub enum StatementKind {
     CreateView,
     DropView,
     ShowCreateView,
+    ShowCreateMaterializedView,
     Insert,
     Delete,
     Update,
@@ -107,7 +108,8 @@ impl StatementKind {
             | Self::ShowStats
             | Self::ShowCreateTable
             | Self::ExplainMaterializedViewRefresh
-            | Self::ShowCreateView => true,
+            | Self::ShowCreateView
+            | Self::ShowCreateMaterializedView => true,
             Self::Empty
             | Self::Analyze
             | Self::CreateCatalog

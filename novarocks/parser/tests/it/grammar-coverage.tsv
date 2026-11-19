@@ -164,7 +164,7 @@ alternative	statement	58	explainAnalyze	0	EXPLAIN ANALYZE SELECT 1 AS answer	sup
 alternative	statement	59	showCreateTable	0	SHOW CREATE TABLE lake.ns.t	supported	accept	reviewed-grammar-path	none
 alternative	statement	60	showCreateSchema	0	SHOW CREATE SCHEMA lake.ns	parsed-not-supported	accept	reviewed-grammar-path	none
 alternative	statement	61	showCreateView	0	SHOW CREATE VIEW lake.ns.v	supported	accept	reviewed-grammar-path	none
-alternative	statement	62	showCreateMaterializedView	0	SHOW CREATE MATERIALIZED VIEW lake.ns.mv	parsed-not-supported	accept	reviewed-grammar-path	none
+alternative	statement	62	showCreateMaterializedView	0	SHOW CREATE MATERIALIZED VIEW lake.ns.mv	supported	accept	reviewed-grammar-path	none
 alternative	statement	63	showCreateFunction	0	SHOW CREATE FUNCTION lake.ns.fn1	parsed-not-supported	accept	reviewed-grammar-path	none
 optional	statement	64		1	SHOW TABLES FROM lake.s LIKE '%x' ESCAPE '!'	parsed-not-supported	accept	reviewed-grammar-path	none
 optional	statement	64		2	SHOW TABLES FROM lake.s LIKE '%x' ESCAPE '!'	parsed-not-supported	accept	reviewed-grammar-path	none

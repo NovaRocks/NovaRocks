@@ -42,6 +42,7 @@ pub mod refresh_pin_adapter;
 pub mod rewrite;
 pub mod rewrite_prep;
 pub(crate) mod schema_validation;
+pub(crate) mod show_create;
 pub(crate) mod staged_create;
 pub(crate) mod startup_continuation;
 pub mod startup_restore;

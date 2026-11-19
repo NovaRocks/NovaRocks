@@ -574,6 +574,33 @@ impl ConnectorDocumentStorage {
         view.validate_for(&request)?;
         Ok(view)
     }
+    pub async fn observe_keyed_document_definition(
+        &self,
+        target: ConnectorTableIdentity,
+        context: ConnectorRequestContext,
+    ) -> Result<super::KeyedDocumentDefinition, super::KeyedDocumentReadError> {
+        let request = super::KeyedDocumentDefinitionRequest {
+            owner: self.owner().clone(),
+            catalog_handle: self.catalog_handle().clone(),
+            target,
+            context,
+        };
+        request.validate()?;
+        let definition = self
+            .observation()?
+            .observe_keyed_document_definition(&request)
+            .await?;
+        definition
+            .view
+            .validate_for(&super::KeyedDocumentObservationRequest {
+                owner: request.owner,
+                catalog_handle: request.catalog_handle,
+                target: request.target,
+                object_id: definition.view.object_id.clone(),
+                context: request.context,
+            })?;
+        Ok(definition)
+    }
     pub fn observe_full_keyed_documents(
         &self,
         request: super::KeyedDocumentObservationRequest,

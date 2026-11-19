@@ -2,6 +2,40 @@
 
 use super::*;
 
+/// Prints the saved view header followed by the original query source.
+pub fn print_create_view_definition(
+    name: &ObjectName,
+    comment: Option<&str>,
+    source: &str,
+) -> Result<String, PrintError> {
+    print_saved_definition("VIEW ", name, comment, &[], source)
+}
+
+/// Prints the saved materialized view header followed by the original query source.
+pub fn print_create_materialized_view_definition(
+    name: &ObjectName,
+    properties: &[StatementProperty],
+    source: &str,
+) -> Result<String, PrintError> {
+    print_saved_definition("MATERIALIZED VIEW ", name, None, properties, source)
+}
+
+fn print_saved_definition(
+    kind: &str,
+    name: &ObjectName,
+    comment: Option<&str>,
+    properties: &[StatementProperty],
+    source: &str,
+) -> Result<String, PrintError> {
+    let mut writer = Writer::default();
+    writer.create_view_head(kind, false, false, name);
+    writer.view_comment(comment);
+    writer.definition_properties(properties)?;
+    writer.text(" AS\n");
+    writer.text(source);
+    writer.finish(0)
+}
+
 impl Writer {
     pub(super) fn create_view(&mut self, node: &TrinoCreateView) -> PrintResult {
         if node.replace && node.not_exists {

@@ -646,16 +646,44 @@ pub struct KeyedDocumentObservationRequest {
 }
 impl KeyedDocumentObservationRequest {
     pub fn validate(&self) -> Result<(), ConnectorError> {
-        super::observation::validate_table(&self.target)?;
-        if self.owner.instance_id != self.target.instance_id
-            || self.catalog_handle.catalog_name() != &self.owner.instance_id
-        {
-            return Err(invalid(
-                "keyed observation does not match its catalog owner",
-            ));
-        }
-        Ok(())
+        validate_keyed_observation(&self.owner, &self.catalog_handle, &self.target)
     }
+}
+
+/// Observe the current named object's documents and declared table properties
+/// from one metadata version. This request carries no management authority.
+pub struct KeyedDocumentDefinitionRequest {
+    pub owner: ConnectorProviderBindingKey,
+    pub catalog_handle: crate::connector::CatalogHandle,
+    pub target: ConnectorTableIdentity,
+    pub context: crate::connector::ConnectorRequestContext,
+}
+
+impl KeyedDocumentDefinitionRequest {
+    pub fn validate(&self) -> Result<(), ConnectorError> {
+        validate_keyed_observation(&self.owner, &self.catalog_handle, &self.target)
+    }
+}
+
+pub struct KeyedDocumentDefinition {
+    pub view: KeyedDocumentView,
+    pub properties: Vec<(String, crate::connector::DdlPropertyValue)>,
+}
+
+fn validate_keyed_observation(
+    owner: &ConnectorProviderBindingKey,
+    catalog_handle: &crate::connector::CatalogHandle,
+    target: &ConnectorTableIdentity,
+) -> Result<(), ConnectorError> {
+    super::observation::validate_table(target)?;
+    if owner.instance_id != target.instance_id
+        || catalog_handle.catalog_name() != &owner.instance_id
+    {
+        return Err(invalid(
+            "keyed observation does not match its catalog owner",
+        ));
+    }
+    Ok(())
 }
 
 /// A legacy table is distinguishable from damaged data and may still be dropped.

@@ -1018,9 +1018,12 @@ pub enum ConnectorTableDefinitionType {
     },
     Date,
     Time,
-    DateTime,
-    DateTimeNs,
+    Timestamp {
+        precision: u32,
+        with_time_zone: bool,
+    },
     String,
+    Uuid,
     Binary {
         fixed_length: Option<u64>,
     },
@@ -1692,6 +1695,19 @@ pub type ConnectorTableObjectSnapshotFuture<'a> = std::pin::Pin<
 >;
 
 pub trait ConnectorMetadata: Send + Sync {
+    /// Project visible DDL properties from the same table observation as its schema.
+    /// No second table lookup or access to the raw property map is implied.
+    fn table_definition_properties(
+        &self,
+        _table: &ConnectorTableMetadata,
+        _context: &ConnectorRequestContext,
+    ) -> Result<Vec<(String, super::DdlPropertyValue)>, ConnectorError> {
+        Err(ConnectorError::new(
+            super::ConnectorErrorKind::Unsupported,
+            "connector does not expose table definition properties",
+        ))
+    }
+
     /// Pure initial read routes from this exact retained metadata generation.
     /// These facts grant no I/O, mutation, or publication authority.
     fn read_planning_initial_dependencies(

@@ -388,6 +388,9 @@ fn preparation_plan(
         Prep::CreateView(_) => management(CreateView),
         Prep::DropView(_) => management(DropView),
         Prep::ShowCreateView(_) => CommandPlan::management(ShowCreateView, ResultSet, false),
+        Prep::ShowCreateMaterializedView(_) => {
+            CommandPlan::management(ShowCreateMaterializedView, ResultSet, false)
+        }
         Prep::CreateMaterializedView(_) => management(CreateMaterializedView),
         Prep::DropMaterializedView(_) => management(DropMaterializedView),
         Prep::RefreshMaterializedView(_) => CommandPlan {
@@ -859,6 +862,11 @@ impl FrontendQuerySession {
                     )
                     .await;
             }
+            Prep::ShowCreateMaterializedView(node) => {
+                return self
+                    .execute_trino_show_create_mv(source, node, CommandEntry { statement, input })
+                    .await;
+            }
             Prep::CreateMaterializedView(node) => {
                 return self
                     .execute_observed_trino_mv_properties(
@@ -1015,6 +1023,50 @@ impl FrontendQuerySession {
 }
 
 impl FrontendQuerySession {
+    async fn execute_trino_show_create_mv(
+        &self,
+        source: Arc<str>,
+        node: ast::TrinoShowCreate,
+        entry: CommandEntry,
+    ) -> Result<StatementResult, QueryServiceError> {
+        let CommandEntry {
+            mut statement,
+            input,
+        } = entry;
+        let name = novarocks_query_application::sql::lower_object_name(&node.name);
+        let binding = match self
+            .service
+            .product_command_router
+            .acquire_table_read_binding(&name, &input.request)
+        {
+            Ok(binding) => binding,
+            Err(error) => {
+                return Ok(
+                    self.governed_typed_error(product_command_service_error(error), statement)
+                );
+            }
+        };
+        let execution_owner = statement
+            .take_execution_owner()
+            .expect("one original materialized view definition owner");
+        let context = input.command.connector_context().clone();
+        let mut worker = Box::pin(async move {
+            let result =
+                crate::mv::domain::show_create::execute(binding, context, &source, node.span)
+                    .await
+                    .map(StatementResult::Query)
+                    .map_err(RoutedExecutionError::Application);
+            Ok((result, execution_owner))
+        }) as TypedCommandWorker;
+        self.finish_command_worker(
+            statement,
+            input.cancellation,
+            input.timeout_duration,
+            &mut worker,
+        )
+        .await
+    }
+
     async fn execute_trino_view(
         &self,
         source: Arc<str>,

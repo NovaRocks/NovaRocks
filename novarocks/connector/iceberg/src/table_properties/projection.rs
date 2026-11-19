@@ -137,7 +137,7 @@ fn project_raw_table_property_inner(
     Ok(changes)
 }
 
-fn raw_key(name: &str) -> Option<&'static str> {
+pub(super) fn raw_key(name: &str) -> Option<&'static str> {
     Some(match name {
         "format" => TableProperties::PROPERTY_DEFAULT_FILE_FORMAT,
         "max_commit_retry" => TableProperties::PROPERTY_COMMIT_NUM_RETRIES,

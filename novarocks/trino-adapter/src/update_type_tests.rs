@@ -29,6 +29,7 @@ fn row_statements_and_empty_input_do_not_publish_an_update_type() {
         ShowCreateTable,
         ExplainMaterializedViewRefresh,
         ShowCreateView,
+        ShowCreateMaterializedView,
     ] {
         assert_eq!(update_type(kind), None, "{kind:?}");
     }

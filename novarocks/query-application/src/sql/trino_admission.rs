@@ -127,6 +127,7 @@ pub enum TrinoStatementPreparation {
     CreateView(ast::TrinoCreateView),
     DropView(ast::TrinoDropView),
     ShowCreateView(ast::TrinoShowCreate),
+    ShowCreateMaterializedView(ast::TrinoShowCreate),
     CreateMaterializedView(ast::TrinoCreateMaterializedView),
     DropMaterializedView(ast::TrinoDropMaterializedView),
     RefreshMaterializedView(ast::TrinoRefreshMaterializedView),
@@ -386,7 +387,7 @@ pub fn admit_trino_statement(
             }),
             ast::ShowCreateKind::View => Prepare(Preparation::ShowCreateView(node)),
             ast::ShowCreateKind::MaterializedView => {
-                return unsupported("SHOW CREATE MATERIALIZED VIEW");
+                Prepare(Preparation::ShowCreateMaterializedView(node))
             }
             ast::ShowCreateKind::Schema => return unsupported("SHOW CREATE SCHEMA"),
             ast::ShowCreateKind::Function => return unsupported("SHOW CREATE FUNCTION"),
@@ -756,6 +757,14 @@ mod tests {
     }
 
     #[test]
+    fn show_create_materialized_view_is_a_read_preparation() {
+        assert!(matches!(
+            admit("SHOW CREATE MATERIALIZED VIEW db.v").unwrap(),
+            TrinoStatementAction::Prepare(TrinoStatementPreparation::ShowCreateMaterializedView(_))
+        ));
+    }
+
+    #[test]
     fn parsed_only_statements_and_transactions_return_distinct_typed_errors() {
         for (sql, subject) in [
             ("SHOW TABLES", "SHOW TABLES"),
@@ -771,10 +780,6 @@ mod tests {
             ("SET TIME ZONE LOCAL", "SET TIME ZONE"),
             ("SET PATH a.b", "SET PATH"),
             ("START TRANSACTION READ ONLY", "START TRANSACTION"),
-            (
-                "SHOW CREATE MATERIALIZED VIEW db.v",
-                "SHOW CREATE MATERIALIZED VIEW",
-            ),
             ("SHOW STATS FOR (SELECT 1)", "SHOW STATS FOR a query"),
         ] {
             let error = admit(sql).unwrap_err();

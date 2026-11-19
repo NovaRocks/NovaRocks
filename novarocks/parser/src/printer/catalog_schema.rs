@@ -114,17 +114,40 @@ impl Writer {
             if index != 0 {
                 self.text(", ");
             }
-            self.identifier(&property.name);
-            self.text(" = ");
-            match &property.value {
-                None => self.text("DEFAULT"),
-                Some(value @ Expr::Identifier(name))
-                    if !name.quoted && name.value.eq_ignore_ascii_case("DEFAULT") =>
-                {
-                    self.parenthesized_expression(value)?;
+            self.statement_property(property)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn definition_properties(
+        &mut self,
+        properties: &[StatementProperty],
+    ) -> PrintResult {
+        if !properties.is_empty() {
+            self.text("\nWITH (");
+            for (index, property) in properties.iter().enumerate() {
+                if index != 0 {
+                    self.character(',');
                 }
-                Some(value) => self.expression(value)?,
+                self.text("\n   ");
+                self.statement_property(property)?;
             }
+            self.text("\n)");
+        }
+        Ok(())
+    }
+
+    fn statement_property(&mut self, property: &StatementProperty) -> PrintResult {
+        self.identifier(&property.name);
+        self.text(" = ");
+        match &property.value {
+            None => self.text("DEFAULT"),
+            Some(value @ Expr::Identifier(name))
+                if !name.quoted && name.value.eq_ignore_ascii_case("DEFAULT") =>
+            {
+                self.parenthesized_expression(value)?;
+            }
+            Some(value) => self.expression(value)?,
         }
         Ok(())
     }

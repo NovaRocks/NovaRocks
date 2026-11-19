@@ -695,9 +695,15 @@ fn execute_show_create_table(
         namespace: Arc::from(target.namespace.as_str()),
         table: Arc::from(target.table.as_str()),
     };
-    let loaded = lease
-        .binding()
-        .metadata()
+    let connector_context =
+        crate::connector::context_for_planning_pin_typed(&lease, connector_context.clone())
+            .map_err(|error| {
+                CommandError::from_failure_cause(
+                    novarocks_failure_contract::SharedFailureCause::new(error),
+                )
+            })?;
+    let metadata = lease.binding().metadata();
+    let loaded = metadata
         .load_frontend_table(novarocks_spi::connector::ConnectorTableRequest {
             table: identity.clone(),
             resolution: novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
@@ -711,8 +717,20 @@ fn execute_show_create_table(
             .into(),
         );
     }
-    let ddl =
-        build_iceberg_create_table_ddl(&target.catalog, &target.namespace, &target.table, &loaded)?;
+    let properties = metadata
+        .table_definition_properties(&loaded, &connector_context)
+        .map_err(|error| {
+            CommandError::from_failure_cause(novarocks_failure_contract::SharedFailureCause::new(
+                error,
+            ))
+        })?;
+    let ddl = build_iceberg_create_table_ddl(
+        &target.catalog,
+        &target.namespace,
+        &target.table,
+        &loaded,
+        properties,
+    )?;
     build_utf8_query_result(
         &["Table", "Create Table"],
         vec![vec![target.table.clone(), ddl]],

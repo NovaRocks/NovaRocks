@@ -84,6 +84,9 @@ pub fn print_statement(statement: &TrinoStatement) -> Result<String, PrintError>
     writer.finish(count)
 }
 
+pub use table_statement::print_create_table_definition;
+pub use view_statement::{print_create_materialized_view_definition, print_create_view_definition};
+
 pub fn print_path_specification(path: &TrinoPathSpecification) -> Result<String, PrintError> {
     let mut writer = Writer::default();
     writer.path_specification(path)?;

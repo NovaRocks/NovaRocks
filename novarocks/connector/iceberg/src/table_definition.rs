@@ -96,14 +96,27 @@ fn definition_type(data_type: &Type) -> ConnectorTableDefinitionType {
         }
         Type::Primitive(PrimitiveType::Date) => ConnectorTableDefinitionType::Date,
         Type::Primitive(PrimitiveType::Time) => ConnectorTableDefinitionType::Time,
-        Type::Primitive(PrimitiveType::Timestamp) | Type::Primitive(PrimitiveType::Timestamptz) => {
-            ConnectorTableDefinitionType::DateTime
-        }
-        Type::Primitive(PrimitiveType::TimestampNs)
-        | Type::Primitive(PrimitiveType::TimestamptzNs) => ConnectorTableDefinitionType::DateTimeNs,
-        Type::Primitive(PrimitiveType::String) | Type::Primitive(PrimitiveType::Uuid) => {
-            ConnectorTableDefinitionType::String
-        }
+        Type::Primitive(
+            value @ (PrimitiveType::Timestamp
+            | PrimitiveType::Timestamptz
+            | PrimitiveType::TimestampNs
+            | PrimitiveType::TimestamptzNs),
+        ) => ConnectorTableDefinitionType::Timestamp {
+            precision: if matches!(
+                value,
+                PrimitiveType::TimestampNs | PrimitiveType::TimestamptzNs
+            ) {
+                9
+            } else {
+                6
+            },
+            with_time_zone: matches!(
+                value,
+                PrimitiveType::Timestamptz | PrimitiveType::TimestamptzNs
+            ),
+        },
+        Type::Primitive(PrimitiveType::String) => ConnectorTableDefinitionType::String,
+        Type::Primitive(PrimitiveType::Uuid) => ConnectorTableDefinitionType::Uuid,
         Type::Primitive(PrimitiveType::Fixed(length)) => ConnectorTableDefinitionType::Binary {
             fixed_length: Some(*length),
         },
@@ -197,11 +210,14 @@ mod tests {
                 ),
                 ConnectorTableDefinitionStructField::new(
                     "uuid_value",
-                    ConnectorTableDefinitionType::String,
+                    ConnectorTableDefinitionType::Uuid,
                 ),
                 ConnectorTableDefinitionStructField::new(
                     "timestamp_value",
-                    ConnectorTableDefinitionType::DateTimeNs,
+                    ConnectorTableDefinitionType::Timestamp {
+                        precision: 9,
+                        with_time_zone: true,
+                    },
                 ),
                 ConnectorTableDefinitionStructField::new(
                     "decimal_value",

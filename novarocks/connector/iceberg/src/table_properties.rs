@@ -26,7 +26,9 @@ pub(crate) use create::{
     prepare_mv_staged_storage, typed_format_version,
 };
 
+mod display;
 mod projection;
+pub(crate) use display::table_definition_properties;
 pub use projection::project_partial_raw_table_property;
 pub(crate) use projection::project_raw_table_property_set;
 

@@ -618,17 +618,13 @@ fn iceberg_show_create_escapes_comment_and_preserves_original_body() {
     assert_eq!(query_rows_at(&show_create, 0), vec!["v"]);
     assert_eq!(
         query_rows_at(&show_create, 1),
-        vec![
-            "CREATE VIEW `ice`.`db`.`v`\nCOMMENT \"say \\\"hello\\\"\"\nAS SELECT /* raw body */\n 1 AS a;"
-        ]
+        vec!["CREATE VIEW ice.db.v COMMENT 'say \"hello\"' AS\nSELECT /* raw body */\n 1 AS a"]
     );
 
-    // P13 owns the display header. The saved query body already uses Trino.
     let displayed = query_rows_at(&show_create, 1);
-    let (_, body) = displayed[0].split_once("\nAS ").unwrap();
-    let body = body.strip_suffix(';').unwrap();
+    let (_, body) = displayed[0].split_once(" AS\n").unwrap();
     assert_eq!(body, "SELECT /* raw body */\n 1 AS a");
-    novarocks_parser::parser::parse_query(body).unwrap();
+    novarocks_parser::parser::parse_statement(&displayed[0]).unwrap();
 }
 
 #[test]
