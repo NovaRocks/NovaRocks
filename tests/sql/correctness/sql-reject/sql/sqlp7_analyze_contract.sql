@@ -153,7 +153,7 @@ SELECT * FROM TABLE (p14_other_function(DESCRIPTOR(id bigint)));
 
 -- query 37
 -- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
-SELECT * FROM TABLE (p14_other_function(TABLE(t), TABLE(u) COPARTITION (t, u)));
+SELECT * FROM TABLE (p14_other_function(1 COPARTITION (t, u)));
 
 -- query 38
 -- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
