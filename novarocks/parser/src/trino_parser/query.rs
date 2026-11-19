@@ -523,7 +523,11 @@ impl Parser<'_> {
     }
 
     fn parse_grouping_set(&mut self) -> Result<Vec<Expr>, ParserError> {
-        if self.grouping_parentheses_are_list() {
+        if !self.grouping_parentheses_are_list() {
+            return Ok(vec![self.parse_expression()?]);
+        }
+        let checkpoint = self.checkpoint();
+        let list = (|| {
             self.expect_symbol(Symbol::LParen)?;
             let mut columns = Vec::new();
             if !self.at_symbol(Symbol::RParen) {
@@ -534,8 +538,17 @@ impl Parser<'_> {
             }
             self.expect_symbol(Symbol::RParen)?;
             Ok(columns)
-        } else {
-            Ok(vec![self.parse_expression()?])
+        })();
+        let Err(list_error @ ParserError::Syntax(_)) = list else {
+            return list;
+        };
+
+        // A scalar subquery can use these parentheses as part of the
+        // expression alternative rather than as the grouping-list delimiter.
+        self.restore(checkpoint);
+        match self.parse_expression() {
+            Err(ParserError::Syntax(_)) => Err(list_error),
+            expression => expression.map(|value| vec![value]),
         }
     }
 

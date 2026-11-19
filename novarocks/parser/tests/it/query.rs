@@ -596,3 +596,30 @@ fn select_and_group_all_retries_restore_real_parameter_events_and_keep_construct
         assert_eq!(found, "IF");
     }
 }
+
+#[test]
+fn grouping_scalar_subquery_uses_its_expression_parentheses() {
+    let source = "SELECT k1 FROM t1 GROUP BY ((SELECT max(k2) FROM t2))";
+    let canonical = "SELECT k1 FROM t1 GROUP BY (SELECT max(k2) FROM t2)";
+    let source = query(source);
+    let canonical = query(canonical);
+    assert!(syntax_eq_query(&source, &canonical));
+    let printed = trino_printer::print_query(&canonical).unwrap();
+    assert!(syntax_eq_query(&canonical, &query(&printed)));
+
+    let query = query("SELECT ? GROUP BY (SELECT ?), ?");
+    let GroupingElement::Simple(first) = &select(&query).group_by.as_ref().unwrap().elements[0]
+    else {
+        panic!("simple grouping expression");
+    };
+    assert!(matches!(first.columns.as_slice(), [Expr::Subquery(_)]));
+    struct Parameters(Vec<usize>);
+    impl Visit for Parameters {
+        fn visit_parameter(&mut self, parameter: &Parameter) {
+            self.0.push(parameter.position);
+        }
+    }
+    let mut parameters = Parameters(Vec::new());
+    parameters.visit_query(&query);
+    assert_eq!(parameters.0, [0, 1, 2]);
+}
