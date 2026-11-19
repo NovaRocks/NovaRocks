@@ -51,7 +51,7 @@ const PARSE_UNEXPECTED_TOKEN: ErrorCodeDescriptor = ErrorCodeDescriptor {
 const PARSE_UNSUPPORTED_STATEMENT: ErrorCodeDescriptor = ErrorCodeDescriptor {
     code: ErrorCodeId::new("sql.parse.unsupported_statement"),
     phase: ErrorPhase::Parse,
-    status: ErrorCodeStatus::Active,
+    status: ErrorCodeStatus::Deprecated,
 };
 const VALIDATE_INVALID_STRUCTURE: ErrorCodeDescriptor = ErrorCodeDescriptor {
     code: ErrorCodeId::new("sql.validate.invalid_structure"),
@@ -106,10 +106,6 @@ pub enum ParseError {
         found: String,
         span: Span,
     },
-    UnsupportedStatement {
-        statement: String,
-        span: Span,
-    },
 }
 
 /// A construction-only invariant which has no independently addressable SQL
@@ -150,7 +146,6 @@ pub enum StructuralViolation {
     EmptyCaseBranches,
     TooFewCoalesceOperands,
     TooFewFormatArguments,
-    DuplicateTableColumnName,
 }
 
 /// A source-independent structural AST validation failure.
@@ -241,11 +236,6 @@ impl ParserError {
                 messages::unexpected_token(expected, found),
                 *span,
             ),
-            Self::Parse(ParseError::UnsupportedStatement { statement, span }) => (
-                PARSE_UNSUPPORTED_STATEMENT,
-                messages::unsupported_statement(statement),
-                *span,
-            ),
             Self::Validate(ValidateError::InvalidStructure { violation, span }) => (
                 VALIDATE_INVALID_STRUCTURE,
                 messages::invalid_structure(*violation),
@@ -312,9 +302,6 @@ impl fmt::Display for ParserError {
             Self::Parse(ParseError::UnexpectedToken {
                 expected, found, ..
             }) => messages::unexpected_token(expected, found),
-            Self::Parse(ParseError::UnsupportedStatement { statement, .. }) => {
-                messages::unsupported_statement(statement)
-            }
             Self::Validate(ValidateError::InvalidStructure { violation, .. }) => {
                 messages::invalid_structure(*violation)
             }

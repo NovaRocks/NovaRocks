@@ -465,7 +465,7 @@ fn actual_type_owning_cycle_supports_deep_clone_visit_fold_compare_print_and_dro
     assert_eq!(count.0, 20_001);
     let folded = Identity.fold_type_name(copy);
     assert!(node.syntax_eq(&folded));
-    let rendered = crate::printer::print_type_name(&folded);
+    let rendered = crate::printer::print_type(&folded).unwrap();
     assert_eq!(rendered.len(), 20_000 * 7 + 4);
     drop(node);
     drop(folded);

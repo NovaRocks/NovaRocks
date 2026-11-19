@@ -3,11 +3,11 @@
 use novarocks_parser::ast::{
     self, Expr, Relation, SyntaxEq, TrinoMergeCase, TrinoStatement, Visit,
 };
-use novarocks_parser::{trino_parser, trino_printer};
+use novarocks_parser::{parser, printer};
 
 fn round_trip(sql: &str, statement: &TrinoStatement) -> String {
-    let rendered = trino_printer::print_statement(statement).unwrap();
-    let reparsed = trino_parser::parse_statement(&rendered).unwrap();
+    let rendered = printer::print_statement(statement).unwrap();
+    let reparsed = parser::parse_statement(&rendered).unwrap();
     assert!(statement.syntax_eq(&reparsed), "{sql} became {rendered}");
     rendered
 }
@@ -19,7 +19,7 @@ USING (SELECT ? AS id) AS src ON "target".id = ?
 WHEN MATCHED AND ? THEN UPDATE SET id = ?, "value" = ?
 WHEN MATCHED AND ? THEN DELETE
 WHEN NOT MATCHED AND ? THEN INSERT (id, "value") VALUES (?, ?)"#;
-    let statement = trino_parser::parse_statement(sql).unwrap();
+    let statement = parser::parse_statement(sql).unwrap();
     let TrinoStatement::Merge(node) = &statement else {
         panic!("expected MERGE");
     };
@@ -86,7 +86,7 @@ WHEN NOT MATCHED AND ? THEN INSERT (id, "value") VALUES (?, ?)"#;
 fn merge_leaves_conditions_and_column_arity_to_the_original_syntax() {
     let sql = "MERGE INTO dst d USING s ON CASE WHEN s.id IS NULL THEN FALSE ELSE TRUE END \
                WHEN MATCHED THEN DELETE WHEN NOT MATCHED THEN INSERT VALUES (1)";
-    let statement = trino_parser::parse_statement(sql).unwrap();
+    let statement = parser::parse_statement(sql).unwrap();
     let TrinoStatement::Merge(node) = &statement else {
         panic!("expected MERGE");
     };
@@ -100,7 +100,7 @@ fn merge_leaves_conditions_and_column_arity_to_the_original_syntax() {
     round_trip(sql, &statement);
 
     let sql = "MERGE INTO dst USING src ON TRUE WHEN NOT MATCHED THEN INSERT (x, y) VALUES (1)";
-    let statement = trino_parser::parse_statement(sql).unwrap();
+    let statement = parser::parse_statement(sql).unwrap();
     let TrinoStatement::Merge(node) = &statement else {
         panic!("expected MERGE");
     };
@@ -115,7 +115,7 @@ fn merge_leaves_conditions_and_column_arity_to_the_original_syntax() {
 #[test]
 fn call_keeps_named_positional_and_empty_arguments_with_exact_ordinals() {
     let sql = r#"CALL c.system."proc"("where" => (WITH q AS (SELECT ?) SELECT ?), ?, x => 1)"#;
-    let statement = trino_parser::parse_statement(sql).unwrap();
+    let statement = parser::parse_statement(sql).unwrap();
     let TrinoStatement::Call(call) = &statement else {
         panic!("expected CALL");
     };
@@ -133,7 +133,7 @@ fn call_keeps_named_positional_and_empty_arguments_with_exact_ordinals() {
     round_trip(sql, &statement);
 
     let sql = "CALL c.system.proc()";
-    let statement = trino_parser::parse_statement(sql).unwrap();
+    let statement = parser::parse_statement(sql).unwrap();
     let TrinoStatement::Call(call) = &statement else {
         panic!("expected CALL");
     };
@@ -156,7 +156,7 @@ fn merge_and_call_reject_forms_absent_from_the_reference_grammar() {
         "CALL p(x =>)",
         "CALL p(?,)",
     ] {
-        assert!(trino_parser::parse_statement(sql).is_err(), "{sql}");
+        assert!(parser::parse_statement(sql).is_err(), "{sql}");
     }
 }
 

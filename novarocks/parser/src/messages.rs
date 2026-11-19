@@ -27,10 +27,6 @@ pub(crate) fn unexpected_token(expected: &str, found: &str) -> String {
     format!("expected {expected}, found {found}")
 }
 
-pub(crate) fn unsupported_statement(statement: &str) -> String {
-    format!("recognized but unsupported statement {statement}")
-}
-
 use crate::StructuralViolation;
 
 pub(crate) fn invalid_structure(violation: StructuralViolation) -> String {
@@ -128,9 +124,6 @@ pub(crate) fn invalid_structure(violation: StructuralViolation) -> String {
         }
         StructuralViolation::EmptyCaseBranches => {
             "invalid SQL structure: empty CASE branch list".to_owned()
-        }
-        StructuralViolation::DuplicateTableColumnName => {
-            "invalid SQL structure: duplicate CREATE TABLE column name".to_owned()
         }
     }
 }

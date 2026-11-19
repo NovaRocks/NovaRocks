@@ -3,13 +3,12 @@
 use novarocks_parser::ast::{
     StatementPrincipalKind, SyntaxEq, TrinoGrantor, TrinoRoleSelection, TrinoStatement,
 };
-use novarocks_parser::{ParseError, ParserError, trino_parser, trino_printer};
+use novarocks_parser::{ParseError, ParserError, parser, printer};
 
 fn round_trip(sql: &str) -> TrinoStatement {
-    let statement =
-        trino_parser::parse_statement(sql).unwrap_or_else(|error| panic!("{sql}: {error}"));
-    let printed = trino_printer::print_statement(&statement).unwrap();
-    let reparse = trino_parser::parse_statement(&printed).unwrap();
+    let statement = parser::parse_statement(sql).unwrap_or_else(|error| panic!("{sql}: {error}"));
+    let printed = printer::print_statement(&statement).unwrap();
+    let reparse = parser::parse_statement(&printed).unwrap();
     assert!(statement.syntax_eq(&reparse), "{sql} became {printed}");
     statement
 }
@@ -178,10 +177,10 @@ fn permission_grammar_rejects_wrong_family_options_and_reserved_role_atoms() {
         "DENY SELECT ON TABLE TO u",
         "ALTER TABLE t SET AUTHORIZATION",
     ] {
-        assert!(trino_parser::parse_statement(sql).is_err(), "{sql}");
+        assert!(parser::parse_statement(sql).is_err(), "{sql}");
     }
     let sql = "GRANT CREATE BRANCH TO USER u";
-    let error = trino_parser::parse_statement(sql).unwrap_err();
+    let error = parser::parse_statement(sql).unwrap_err();
     let ParserError::Parse(ParseError::UnexpectedToken { span, .. }) = error else {
         panic!("expected a construction parse error")
     };

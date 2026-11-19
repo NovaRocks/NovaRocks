@@ -17,105 +17,12 @@
 
 use novarocks_parser::{Span, StructuralViolation, ValidateError, ast::*, build, printer};
 
-fn query(source: &str) -> Query {
-    let mut statements = novarocks_parser::parse(source).unwrap();
-    let Statement::Query(query) = statements.remove(0) else {
-        panic!("query");
-    };
-    query
-}
-fn select(query: &Query) -> &Select {
-    let SetExpr::Select(select) = query.body.as_ref() else {
-        panic!("specification");
-    };
-    select
-}
-fn clause(source: &str) -> GroupBy {
-    select(&query(source)).group_by.clone().unwrap()
-}
-fn statement(group_by: GroupBy) -> Statement {
-    Statement::Query(build::query(SetExpr::Select(
+fn statement(group_by: GroupBy) -> TrinoStatement {
+    TrinoStatement::Query(build::query(SetExpr::Select(
         novarocks_parser::ast::AstBox::new(
             build::select(vec![build::wildcard()], None, None, Some(group_by)).unwrap(),
         ),
     )))
-}
-
-#[test]
-fn old_group_by_producers_preserve_ordered_expression_sources_and_actual_set_boundaries() {
-    assert!(select(&query("SELECT 1")).group_by.is_none());
-    let source = "SELECT 1 GROUP BY a, `b`, f(c)";
-    let group = clause(source);
-    assert!(!group.distinct);
-    assert_eq!(
-        group.span,
-        Span::new(source.find("a,").unwrap(), source.len())
-    );
-    assert_eq!(group.elements.len(), 3);
-    for (element, expected) in group.elements.iter().zip(["a", "`b`", "f(c)"]) {
-        let GroupingElement::Simple(simple) = element else {
-            panic!("one real Simple per item");
-        };
-        assert_eq!(simple.columns.len(), 1);
-        assert_eq!(simple.span, simple.columns[0].span());
-        assert_eq!(&source[simple.span.start()..simple.span.end()], expected);
-    }
-    for (source, kind) in [
-        ("SELECT 1 GROUP BY ROLLUP(a,b)", GroupingSetsKind::Rollup),
-        ("SELECT 1 GROUP BY CUBE(a,b)", GroupingSetsKind::Cube),
-    ] {
-        let parsed = query(source);
-        let group = select(&parsed).group_by.as_ref().unwrap();
-        let GroupingElement::Sets(sets) = &group.elements[0] else {
-            panic!("sets");
-        };
-        assert_eq!(sets.kind, kind);
-        assert_eq!(sets.sets.len(), 2);
-        for (set, name) in sets.sets.iter().zip(["a", "b"]) {
-            assert_eq!(set.len(), 1);
-            assert!(matches!(&set[0], Expr::Identifier(id) if id.value == name));
-            assert_eq!(&source[set[0].span().start()..set[0].span().end()], name);
-        }
-        assert!(parsed.syntax_eq(&query(&printer::print_query(&parsed))));
-    }
-    for source in ["SELECT 1 GROUP BY ROLLUP()", "SELECT 1 GROUP BY CUBE()"] {
-        let parsed = query(source);
-        let group = select(&parsed).group_by.as_ref().unwrap();
-        let [GroupingElement::Sets(sets)] = group.elements.as_slice() else {
-            panic!("one real canonical empty grouping set");
-        };
-        assert_eq!(sets.kind, GroupingSetsKind::Explicit);
-        assert_eq!(sets.sets.len(), 1);
-        assert!(sets.sets[0].is_empty());
-        assert_eq!(
-            &source[sets.span.start()..sets.span.end()],
-            source.split("GROUP BY ").nth(1).unwrap()
-        );
-        assert!(parsed.syntax_eq(&query("SELECT 1 GROUP BY GROUPING SETS (())")));
-        assert!(parsed.syntax_eq(&query(&printer::print_query(&parsed))));
-    }
-    let source = "SELECT 1 GROUP BY GROUPING SETS ((a,b),(),(c))";
-    let group = clause(source);
-    let GroupingElement::Sets(sets) = &group.elements[0] else {
-        panic!("explicit sets");
-    };
-    assert_eq!(sets.kind, GroupingSetsKind::Explicit);
-    assert_eq!(
-        sets.sets.iter().map(|set| set.len()).collect::<Vec<_>>(),
-        [2, 0, 1]
-    );
-    assert_eq!(
-        &source[sets.span.start()..sets.span.end()],
-        "GROUPING SETS ((a,b),(),(c))"
-    );
-    // A parenthesized old expression remains its actual Row subtree. P05's
-    // groupingSet grammar must not be inferred from an already parsed Row.
-    let group = clause("SELECT 1 GROUP BY (a,b)");
-    let GroupingElement::Simple(simple) = &group.elements[0] else {
-        panic!("simple");
-    };
-    assert_eq!(simple.columns.len(), 1);
-    assert!(matches!(&simple.columns[0], Expr::Row(row) if row.fields.len() == 2));
 }
 
 #[test]
@@ -256,8 +163,8 @@ fn mixed_typed_grouping_facts_keep_quotes_nested_set_order_distinct_hooks_and_sp
     let statement = statement(group);
     validate_statement(&statement).unwrap();
     assert_eq!(
-        printer::print_statement(&statement),
-        "SELECT * GROUP BY DISTINCT (`quoted`, 1), ROLLUP ((2, 3), ()), CUBE (4), GROUPING SETS ((), (5)), AUTO"
+        printer::print_statement(&statement).unwrap(),
+        "SELECT * GROUP BY DISTINCT (\"quoted\", 1), ROLLUP ((2, 3), ()), CUBE ((4)), GROUPING SETS ((), (5)), AUTO"
     );
 }
 

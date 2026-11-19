@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use novarocks_parser::ast::{Expr, SyntaxEq, TrinoStatement};
-use novarocks_parser::{SYNTHETIC, trino_parser, trino_printer};
+use novarocks_parser::{SYNTHETIC, parser, printer};
 
 #[test]
 fn views_and_managed_storage_roundtrip_without_semantic_admission() {
@@ -22,12 +22,11 @@ fn views_and_managed_storage_roundtrip_without_semantic_admission() {
         "REFRESH MATERIALIZED VIEW cat.s.v",
         "EXPLAIN REFRESH MATERIALIZED VIEW v",
     ] {
-        let ast =
-            trino_parser::parse_statement(sql).unwrap_or_else(|error| panic!("{sql}: {error}"));
+        let ast = parser::parse_statement(sql).unwrap_or_else(|error| panic!("{sql}: {error}"));
         assert_eq!(ast.span().end(), sql.len());
-        let rendered = trino_printer::print_statement(&ast).unwrap();
+        let rendered = printer::print_statement(&ast).unwrap();
         assert!(
-            ast.syntax_eq(&trino_parser::parse_statement(&rendered).unwrap()),
+            ast.syntax_eq(&parser::parse_statement(&rendered).unwrap()),
             "{sql}: {rendered}"
         );
     }
@@ -36,7 +35,7 @@ fn views_and_managed_storage_roundtrip_without_semantic_admission() {
 #[test]
 fn view_query_span_retains_actual_definition_and_properties_use_real_parameters() {
     let sql = "CREATE MATERIALIZED VIEW a WITH (x = ?) AS /* outside */ WITH t AS (VALUES 1) SELECT /* inside */ ? FROM t /* outside */";
-    let ast = trino_parser::parse_statement(sql).unwrap();
+    let ast = parser::parse_statement(sql).unwrap();
     let TrinoStatement::CreateMaterializedView(view) = ast else {
         panic!("materialized view")
     };
@@ -48,7 +47,7 @@ fn view_query_span_retains_actual_definition_and_properties_use_real_parameters(
         panic!("property parameter")
     };
     assert_eq!(property.position, 0);
-    let ast = trino_parser::parse_statement("REFRESH MATERIALIZED VIEW cat.s.v").unwrap();
+    let ast = parser::parse_statement("REFRESH MATERIALIZED VIEW cat.s.v").unwrap();
     let TrinoStatement::RefreshMaterializedView(refresh) = ast else {
         panic!("materialized view refresh")
     };
@@ -70,6 +69,6 @@ fn legacy_view_syntax_and_invalid_clause_order_are_refused() {
         "REFRESH MATERIALIZED VIEW v FULL",
         "DROP MATERIALIZED VIEW v FORCE",
     ] {
-        assert!(trino_parser::parse_statement(sql).is_err(), "{sql}");
+        assert!(parser::parse_statement(sql).is_err(), "{sql}");
     }
 }

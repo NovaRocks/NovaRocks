@@ -24,7 +24,7 @@
 
 use std::{error::Error, fmt};
 
-use crate::{ParseError, ParserError, SYNTHETIC, Span, ast::*, parser};
+use crate::{ParserError, SYNTHETIC, Span, ast::*, parser::numeric_literal_kind, token::TokenKind};
 
 /// A construction defect in an application-authored syntax tree.
 ///
@@ -88,9 +88,9 @@ impl Error for BuildError {
     }
 }
 
-impl From<ParseError> for BuildError {
-    fn from(error: ParseError) -> Self {
-        Self::Number(ParserError::Parse(error))
+impl From<ParserError> for BuildError {
+    fn from(error: ParserError) -> Self {
+        Self::Number(error)
     }
 }
 
@@ -131,33 +131,30 @@ pub fn column(qualifier: Ident, name: Ident) -> Expr {
 
 /// Builds an admitted or program-authored numeric spelling without reparsing SQL.
 ///
-/// The caller owns the spelling's lexical validity. Integer-width validation is
-/// shared with the parser. Only a negative integer is folded into its literal;
-/// signed fractional/exponent spellings retain the parser's unary syntax.
+/// The caller owns the spelling's lexical validity. The parser and this builder
+/// share numeric decoding. A leading minus belongs to the literal spelling.
 pub fn number(text: impl Into<String>) -> Result<Expr, BuildError> {
     let text = text.into();
-    if let Some(magnitude) = text.strip_prefix('-') {
-        if parser::is_integer_number(magnitude) {
-            return Ok(literal(parser::number_literal_kind(text, SYNTHETIC)?));
-        }
-        return unary(
-            UnaryOperator::Minus,
-            literal(parser::number_literal_kind(
-                magnitude.to_owned(),
-                SYNTHETIC,
-            )?),
-        );
-    }
+    let unsigned = text.trim_start_matches(['-', '+']);
+    let kind = if ["0x", "0X", "0o", "0O", "0b", "0B"]
+        .into_iter()
+        .any(|prefix| unsigned.starts_with(prefix))
+    {
+        TokenKind::Integer
+    } else if unsigned.contains(['e', 'E']) {
+        TokenKind::Double
+    } else if unsigned.contains('.') {
+        TokenKind::Decimal
+    } else {
+        TokenKind::Integer
+    };
     if let Some(magnitude) = text.strip_prefix('+') {
         return unary(
             UnaryOperator::Plus,
-            literal(parser::number_literal_kind(
-                magnitude.to_owned(),
-                SYNTHETIC,
-            )?),
+            literal(numeric_literal_kind(kind, magnitude.to_owned(), SYNTHETIC)?),
         );
     }
-    Ok(literal(parser::number_literal_kind(text, SYNTHETIC)?))
+    Ok(literal(numeric_literal_kind(kind, text, SYNTHETIC)?))
 }
 
 /// Builds an exactly representable integer without a fallible text conversion.
@@ -258,15 +255,6 @@ pub fn cast(expr: Expr, data_type: TypeName) -> Expr {
     }))
 }
 
-/// Preserve the old parser's parenthesis barrier until cutover.
-pub fn legacy_nested(expr: Expr) -> Expr {
-    let span = expr.span();
-    Expr::LegacyParenthesized(LegacyParenthesizedExpr {
-        expression: crate::ast::AstBox::new(expr),
-        span: span,
-    })
-}
-
 pub fn unary(operator: UnaryOperator, expr: Expr) -> Result<Expr, BuildError> {
     let span = expr.span();
     if operator == UnaryOperator::Minus
@@ -277,17 +265,16 @@ pub fn unary(operator: UnaryOperator, expr: Expr) -> Result<Expr, BuildError> {
             ..
         }) = &expr
         && !value.starts_with(['-', '+'])
-        && parser::is_integer_number(value)
     {
         return Ok(Expr::Literal(Literal {
-            kind: parser::number_literal_kind(format!("-{value}"), span)?,
+            kind: numeric_literal_kind(TokenKind::Integer, format!("-{value}"), span)?,
             span,
         }));
     }
     Ok(Expr::Unary(UnaryExpr {
-        operator: operator,
+        operator,
         expression: crate::ast::AstBox::new(expr),
-        span: span,
+        span,
     }))
 }
 
@@ -296,7 +283,7 @@ pub fn not(expr: Expr) -> Expr {
     Expr::Unary(UnaryExpr {
         operator: UnaryOperator::Not,
         expression: crate::ast::AstBox::new(expr),
-        span: span,
+        span,
     })
 }
 
@@ -305,7 +292,7 @@ fn binary_node(left: Expr, operator: BinaryOperator, right: Expr) -> Expr {
         left_operand_span: left.span(),
         span: left.span().cover(right.span()),
         left: crate::ast::AstBox::new(left),
-        operator: operator,
+        operator,
         right: crate::ast::AstBox::new(right),
     })
 }
@@ -444,7 +431,7 @@ pub fn count_star() -> Expr {
             parts: vec![ident("COUNT", false)],
             span: SYNTHETIC,
         },
-        vec![identifier(ident("*", false))],
+        Vec::new(),
     )
 }
 
@@ -573,11 +560,10 @@ pub fn select(
     Ok(Select {
         distinct: false,
         projection: projection.into(),
-        from: from,
-        selection: selection,
-        group_by: group_by,
+        from,
+        selection,
+        group_by,
         having: None,
-        legacy: Default::default(),
         windows: AstVec::new(),
         modifiers: Default::default(),
         span: SYNTHETIC,
@@ -686,15 +672,6 @@ pub fn array(values: Vec<Expr>) -> Expr {
         values: values.into(),
         span: SYNTHETIC,
     })
-}
-
-/// Temporarily preserve the old singleton parenthesis barrier; multiple values form a ROW.
-pub fn tuple(mut expressions: Vec<Expr>) -> Result<Expr, BuildError> {
-    match expressions.len() {
-        0 => Err(BuildError::EmptyTuple),
-        1 => Ok(legacy_nested(expressions.pop().expect("one expression"))),
-        _ => tuple_value(expressions),
-    }
 }
 
 /// Preserve a positional value tuple whose arity is owned by a typed caller.

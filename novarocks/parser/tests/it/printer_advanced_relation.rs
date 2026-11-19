@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 use novarocks_parser::ast::*;
-use novarocks_parser::{ParseError, ParserError, Span, trino_parser, trino_printer};
+use novarocks_parser::{ParseError, ParserError, Span, parser, printer};
 
 fn roundtrip(source: &str) -> Query {
-    let original = trino_parser::parse_query(source)
+    let original = parser::parse_query(source)
         .unwrap_or_else(|error| panic!("source: {source}\nerror: {error:?}"));
-    let printed = trino_printer::print_query(&original).unwrap();
-    let reparsed = trino_parser::parse_query(&printed)
+    let printed = printer::print_query(&original).unwrap();
+    let reparsed = parser::parse_query(&printed)
         .unwrap_or_else(|error| panic!("source: {source}\nprinted: {printed}\nerror: {error:?}"));
     assert!(
         original.syntax_eq(&reparsed),
@@ -288,7 +288,7 @@ fn copartition_coverage_witnesses_reach_real_clause_fields_and_keep_alias_diagno
     }
     assert_eq!(checked, 3);
     let source = "SELECT * FROM TABLE(f(TABLE(t) copartition(a,b)))";
-    let error = trino_parser::parse_query(source).unwrap_err();
+    let error = parser::parse_query(source).unwrap_err();
     let ParserError::Parse(ParseError::UnexpectedToken { span, found, .. }) = error else {
         panic!("not the original typed diagnostic")
     };

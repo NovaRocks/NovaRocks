@@ -27,35 +27,6 @@ mod predicate;
 pub use control_expr::*;
 mod query;
 pub use predicate::*;
-pub mod legacy;
-pub use legacy::{
-    AddEqualityDelete, AddFiles, AlterIcebergTable, AlterMaterializedView, AnalyzeTable,
-    Assignment, CallStatement, CatalogProperty, CatalogStatement, ColumnDefinition, ColumnPath,
-    ColumnPosition, CreateCatalog, CreateDatabase, CreateMaterializedView, CreateTable,
-    CreateTableAsSelect, CreateView, Delete, DmlStatement, DropCatalog, DropDatabase,
-    DropMaterializedView, DropTable, DropView, ExpireSnapshots, ExpireSnapshotsOption,
-    ExplainFormat, ExplainQuery, ExplainRefreshMaterializedView, IcebergColumnAction,
-    IcebergPartitionChange, IcebergPartitionField, IcebergPropertiesAction, IcebergReferenceAction,
-    IcebergReferenceKind, IcebergSchemaChange, IcebergStatement, IcebergTableAction, Insert,
-    InsertPartitionEntry, InsertPartitions, KillKind, KillStatement, LegacyRangePartition,
-    LegacyRangePartitionDefinition, MaintenanceStatement, MaintenanceValue,
-    MaterializedViewAlterAction, MaterializedViewDistribution, MaterializedViewExplainLevel,
-    MaterializedViewPartitionArgument, MaterializedViewPartitionField, MaterializedViewProperty,
-    MaterializedViewRefreshMode, MaterializedViewRefreshPolicy, MaterializedViewStatement, Merge,
-    MergeClause, MergeMatchedAction, MergeNotMatchedAction, MutationSource, OptimizeTable,
-    PartitionTransform, ProcedureArgument, ProcedureArgumentMode, ProcedureMap, ProcedureMapEntry,
-    Property, PropertyKeyValue, RawReferenceOptions, ReferenceAnchor, RefreshMaterializedView,
-    RemoveOrphanFiles, RewriteManifests, SessionStatement, SetAssignment, SetScope, SetStatement,
-    ShowCreateTable, ShowCreateView, ShowProcessList, ShowStats, Statement, StatisticsStatement,
-    TableDistribution, TableKey, TableKeyKind, TablePartition, TablePartitionTransform,
-    TableProperty, TableStatement, TransactionControlKind, TransactionControlStatement,
-    TruncateTable, Update, UseStatement, ViewStatement,
-};
-pub use legacy::{
-    BinaryOperator as LegacyBinaryOperator, IntervalExpr as LegacyIntervalExpr,
-    IntervalField as LegacyIntervalField, ParenthesizedExpr as LegacyParenthesizedExpr,
-    SelectExtensions as LegacySelectExtensions, UnaryOperator as LegacyUnaryOperator,
-};
 mod relation;
 mod routine;
 
@@ -101,9 +72,7 @@ mod visit;
 mod window;
 pub use storage::{AstBox, AstVec};
 
-pub use visit::{fold_legacy_interval_expr, walk_legacy_interval_expr};
-
-pub use equivalence::{SyntaxEq, syntax_eq_explain_query, syntax_eq_expr, syntax_eq_query};
+pub use equivalence::{SyntaxEq, syntax_eq_expr, syntax_eq_query};
 pub use expr::{
     AllRows, ArrayExpr, ArrayWildcardSubscriptExpr, BinaryExpr, BinaryOperator, CallArgument,
     DereferenceExpr, Expr, FunctionCall, IntervalField, LogicalExpr, LogicalOperator,
@@ -123,19 +92,17 @@ pub use row_pattern::{
     PatternSearchModeKind, RowPattern, SkipTo, SubsetDefinition, VariableDefinition,
 };
 
-pub use validate::{validate_statement, validate_statements};
+pub use validate::validate_statement;
 
 pub use visit::{
     Fold, Visit, fold_all_columns, fold_auto_group_by, fold_binary_expr, fold_cte, fold_expr,
     fold_function_call, fold_group_by, fold_grouping_element, fold_grouping_sets, fold_ident,
-    fold_legacy_parenthesized_expr, fold_logical_expr, fold_object_name, fold_query, fold_select,
-    fold_select_item, fold_set_expr, fold_simple_group_by, fold_single_column, fold_statement,
-    fold_unary_expr, fold_values, fold_view_statement, fold_with, walk_all_columns,
-    walk_auto_group_by, walk_binary_expr, walk_cte, walk_expr, walk_function_call, walk_group_by,
-    walk_grouping_element, walk_grouping_sets, walk_ident, walk_legacy_parenthesized_expr,
+    fold_logical_expr, fold_object_name, fold_query, fold_select, fold_select_item, fold_set_expr,
+    fold_simple_group_by, fold_single_column, fold_unary_expr, fold_values, fold_with,
+    walk_all_columns, walk_auto_group_by, walk_binary_expr, walk_cte, walk_expr,
+    walk_function_call, walk_group_by, walk_grouping_element, walk_grouping_sets, walk_ident,
     walk_logical_expr, walk_object_name, walk_query, walk_select, walk_select_item,
-    walk_simple_group_by, walk_single_column, walk_statement, walk_unary_expr, walk_values,
-    walk_view_statement, walk_with,
+    walk_simple_group_by, walk_single_column, walk_unary_expr, walk_values, walk_with,
 };
 pub use window::{
     Window, WindowDefinition, WindowFrame, WindowFrameBound, WindowFrameExclusion,
@@ -193,10 +160,7 @@ mod tests {
             span: span(8, 10),
         };
         let expression = Expr::Literal(literal.clone());
-        let statement = Statement::ShowProcessList(ShowProcessList {
-            full: false,
-            span: span(11, 24),
-        });
+        let statement = TrinoStatement::Commit(span(11, 24));
 
         assert_eq!(name.span, span(0, 7));
         assert_eq!(type_name.span, span(0, 7));
@@ -275,7 +239,8 @@ mod tests {
             }
         }
 
-        let expression = Expr::LegacyParenthesized(LegacyParenthesizedExpr {
+        let expression = Expr::Unary(UnaryExpr {
+            operator: UnaryOperator::Not,
             expression: crate::ast::AstBox::new(Expr::Identifier(Ident {
                 value: "old".to_owned(),
                 quoted: false,
@@ -287,7 +252,8 @@ mod tests {
         let expression = Rename.fold_expr(expression);
         assert_eq!(
             expression,
-            Expr::LegacyParenthesized(LegacyParenthesizedExpr {
+            Expr::Unary(UnaryExpr {
+                operator: UnaryOperator::Not,
                 expression: crate::ast::AstBox::new(Expr::Identifier(Ident {
                     value: "new".to_owned(),
                     quoted: false,

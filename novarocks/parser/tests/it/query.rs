@@ -16,10 +16,10 @@
 // under the License.
 
 use novarocks_parser::ast::*;
-use novarocks_parser::{trino_parser, trino_printer};
+use novarocks_parser::{parser, printer};
 
 fn query(sql: &str) -> Query {
-    trino_parser::parse_query(sql).expect(sql)
+    parser::parse_query(sql).expect(sql)
 }
 
 fn select(query: &Query) -> &Select {
@@ -65,7 +65,7 @@ fn match_can_name_a_projection_or_start_a_predicate() {
         };
         assert!(matches!(value.predicate, Predicate::Match(_)));
     }
-    assert!(trino_parser::parse_query("SELECT 1 MATCH UNIQUE").is_err());
+    assert!(parser::parse_query("SELECT 1 MATCH UNIQUE").is_err());
 }
 
 #[test]
@@ -84,7 +84,7 @@ fn at_can_name_a_projection_or_start_a_time_zone_expression() {
         expression(&select(&at_zone).projection[0]),
         Expr::AtTimeZone(_)
     ));
-    assert!(trino_parser::parse_query("SELECT 1 AT TIME").is_err());
+    assert!(parser::parse_query("SELECT 1 AT TIME").is_err());
 }
 
 #[test]
@@ -244,8 +244,8 @@ fn trino_query_projection_uses_true_primary_context_and_alias_facts() {
         ["x", "y"]
     );
     assert!(specification.modifiers.limit.is_some());
-    assert!(trino_parser::parse_query("SELECT a + b.* FROM t").is_err());
-    assert!(trino_parser::parse_query("SELECT * AS (x) FROM t").is_err());
+    assert!(parser::parse_query("SELECT a + b.* FROM t").is_err());
+    assert!(parser::parse_query("SELECT * AS (x) FROM t").is_err());
     let parsed = query("SELECT a limit FROM t offset");
     let SelectItem::SingleColumn(item) = &select(&parsed).projection[0] else {
         panic!()
@@ -288,7 +288,7 @@ fn trino_query_grouping_sets_preserve_real_grouping_lists() {
     assert_eq!((rollup.sets[0].len(), rollup.sets[1].len()), (2, 1));
     // The actual pinned GroupingSets constructor rejects an empty outer list.
     for sql in ["SELECT 1 GROUP BY ROLLUP()", "SELECT 1 GROUP BY CUBE()"] {
-        assert!(trino_parser::parse_query(sql).is_err(), "{sql}");
+        assert!(parser::parse_query(sql).is_err(), "{sql}");
     }
     let parsed = query("SELECT 1 GROUP BY GROUPING SETS (())");
     let GroupingElement::Sets(one_empty) = &select(&parsed).group_by.as_ref().unwrap().elements[0]
@@ -341,7 +341,7 @@ fn trino_query_relations_keep_period_alias_and_subquery_owners() {
     assert_eq!(period.range_type, QueryPeriodRangeType::Version);
     assert!(period.start.is_none());
     assert_eq!(parameter(period.end.as_ref().unwrap()), 0);
-    assert!(trino_parser::parse_query("SELECT * FROM t@branch").is_err());
+    assert!(parser::parse_query("SELECT * FROM t@branch").is_err());
     let parsed = query("SELECT * FROM ((SELECT 1) ORDER BY 1 LIMIT 2) AS q(x)");
     let Relation::Aliased(alias) = select(&parsed).from.as_ref().unwrap() else {
         panic!()
@@ -432,7 +432,7 @@ fn trino_query_keeps_root_prefixes_out_of_nested_query_grammar() {
         "(WITH c AS (SELECT 1) SELECT 1)",
         "SELECT * FROM (WITH SESSION x = 1 SELECT 1) q",
     ] {
-        assert!(trino_parser::parse_query(sql).is_err(), "{sql}");
+        assert!(parser::parse_query(sql).is_err(), "{sql}");
     }
 }
 
@@ -453,7 +453,7 @@ fn trino_query_first_slice_roundtrips_preserve_all_syntax_facts() {
         "SELECT \"MiXeD\" AS \"out\" FROM \"T\"",
     ] {
         let first = query(sql);
-        let rendered = trino_printer::print_query(&first).unwrap();
+        let rendered = printer::print_query(&first).unwrap();
         let second = query(&rendered);
         assert!(syntax_eq_query(&first, &second), "{sql}\n{rendered}");
     }
@@ -480,7 +480,7 @@ fn relation_parentheses_distinguish_query_wrappers_from_an_inner_alias() {
         matches!(&select.from, Some(Relation::TableSubquery(value)) if matches!(value.query.body.as_ref(), SetExpr::Query(_)))
     );
     for original in [aliased, nested] {
-        let printed = trino_printer::print_query(&original).unwrap();
+        let printed = printer::print_query(&original).unwrap();
         assert!(syntax_eq_query(&original, &query(&printed)), "{printed}");
     }
 }
@@ -587,7 +587,7 @@ fn select_and_group_all_retries_restore_real_parameter_events_and_keep_construct
         assert_eq!(parameter(call.filter.as_ref().unwrap()), 0);
     }
     for source in ["SELECT ALL IF()", "SELECT 1 FROM t GROUP BY ALL IF()"] {
-        let error = trino_parser::parse_query(source).unwrap_err();
+        let error = parser::parse_query(source).unwrap_err();
         let ParserError::Parse(ParseError::UnexpectedToken { span, found, .. }) = error else {
             panic!("not construction diagnostic")
         };
@@ -604,7 +604,7 @@ fn grouping_scalar_subquery_uses_its_expression_parentheses() {
     let source = query(source);
     let canonical = query(canonical);
     assert!(syntax_eq_query(&source, &canonical));
-    let printed = trino_printer::print_query(&canonical).unwrap();
+    let printed = printer::print_query(&canonical).unwrap();
     assert!(syntax_eq_query(&canonical, &query(&printed)));
 
     let query = query("SELECT ? GROUP BY (SELECT ?), ?");

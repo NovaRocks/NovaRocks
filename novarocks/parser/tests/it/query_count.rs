@@ -18,89 +18,18 @@
 
 use novarocks_parser::{Span, StructuralViolation, ValidateError, ast::*, build, printer};
 fn query(source: &str) -> Query {
-    let mut parsed = novarocks_parser::parse(source).unwrap();
-    let Statement::Query(query) = parsed.remove(0) else {
-        panic!("query");
-    };
-    query
+    novarocks_parser::parser::parse_query(source).unwrap()
 }
-fn modifiers(query: &Query) -> &QueryModifiers {
-    match query.body.as_ref() {
-        SetExpr::Select(select) => &select.modifiers,
-        _ => &query.modifiers,
-    }
-}
-fn statement(modifiers: QueryModifiers) -> Statement {
+fn statement(modifiers: QueryModifiers) -> TrinoStatement {
     let mut query = query("SELECT 1");
     let SetExpr::Select(select) = query.body.as_mut() else {
         unreachable!()
     };
     select.modifiers = modifiers;
-    Statement::Query(query)
+    TrinoStatement::Query(query)
 }
 fn count(value: i64) -> Expr {
     build::integer(value)
-}
-
-#[test]
-fn old_count_producers_move_real_comma_counts_and_keep_suffix_owners_and_keyword_spans() {
-    let source = "SELECT 11 ORDER BY 1 LIMIT 2, 5";
-    let parsed = query(source);
-    assert!(parsed.modifiers.is_empty());
-    let suffix = modifiers(&parsed);
-    let offset = suffix.offset.as_ref().unwrap();
-    let Some(QueryLimit::Limit(limit)) = &suffix.limit else {
-        panic!("LIMIT");
-    };
-    assert_eq!(
-        &source[offset.row_count.span().start()..offset.row_count.span().end()],
-        "2"
-    );
-    assert_eq!(
-        &source[limit.row_count.span().start()..limit.row_count.span().end()],
-        "5"
-    );
-    assert_eq!(&source[limit.span.start()..limit.span.end()], "LIMIT 2, 5");
-    assert_eq!(offset.span, offset.row_count.span());
-    assert_eq!(
-        printer::print_query(&parsed),
-        "SELECT 11 ORDER BY 1 ASC OFFSET 2 ROWS LIMIT 5"
-    );
-    assert!(parsed.syntax_eq(&query(&printer::print_query(&parsed))));
-    let source = "(SELECT 1 LIMIT 3) OFFSET 2 ROWS FETCH FIRST ROW ONLY";
-    let parsed = query(source);
-    let SetExpr::Query(inner) = parsed.body.as_ref() else {
-        panic!("original parentheses");
-    };
-    assert!(matches!(
-        &modifiers(&inner.query).limit,
-        Some(QueryLimit::Limit(_))
-    ));
-    let offset = parsed.modifiers.offset.as_ref().unwrap();
-    assert_eq!(
-        &source[offset.span.start()..offset.span.end()],
-        "OFFSET 2 ROWS"
-    );
-    let Some(QueryLimit::FetchFirst(fetch)) = &parsed.modifiers.limit else {
-        panic!("FETCH");
-    };
-    assert!(fetch.row_count.is_none());
-    assert!(!fetch.with_ties);
-    assert_eq!(
-        &source[fetch.span.start()..fetch.span.end()],
-        "FETCH FIRST ROW ONLY"
-    );
-    assert!(parsed.syntax_eq(&query(&printer::print_query(&parsed))));
-    let source = "SELECT 1 LIMIT ALL";
-    let parsed = query(source);
-    let Some(QueryLimit::Limit(limit)) = &modifiers(&parsed).limit else {
-        unreachable!()
-    };
-    let Expr::AllRows(all) = &limit.row_count else {
-        panic!("explicit unbounded count");
-    };
-    assert_eq!(&source[all.span.start()..all.span.end()], "ALL");
-    assert_ne!(modifiers(&parsed), modifiers(&query("SELECT 1")));
 }
 
 #[test]
@@ -116,7 +45,7 @@ fn count_constructor_constraints_refuse_real_wrong_shapes_and_do_not_erase_old_i
     ] {
         assert!(
             matches!(
-                novarocks_parser::parse(source),
+                novarocks_parser::parser::parse_statement(source),
                 Err(novarocks_parser::ParserError::Parse(_))
             ),
             "Parse refusal: {source}"
@@ -188,7 +117,10 @@ fn parameter_and_all_rows_keep_leaf_identity_and_fetch_none_stays_distinct_from_
         position: 8,
         span: Span::new(3, 4)
     })));
-    assert_eq!(printer::print_expr(&parameter), "?");
+    assert!(matches!(
+        printer::print_expression(&parameter),
+        Err(printer::PrintError::ParameterPosition { actual: 7, .. })
+    ));
     assert!(
         Expr::AllRows(AllRows {
             span: Span::new(3, 6)
@@ -225,7 +157,7 @@ fn parameter_and_all_rows_keep_leaf_identity_and_fetch_none_stays_distinct_from_
         }
     }
     let mut seen = Parameters(Vec::new());
-    seen.visit_statement(&stmt);
+    seen.visit_trino_statement(&stmt);
     assert_eq!(seen.0, [7]);
     struct Shift;
     impl Fold for Shift {
@@ -234,11 +166,14 @@ fn parameter_and_all_rows_keep_leaf_identity_and_fetch_none_stays_distinct_from_
             node
         }
     }
-    stmt = Shift.fold_statement(stmt);
+    stmt = Shift.fold_trino_statement(stmt);
     let mut seen = Parameters(Vec::new());
-    seen.visit_statement(&stmt);
+    seen.visit_trino_statement(&stmt);
     assert_eq!(seen.0, [9]);
-    assert!(printer::print_statement(&stmt).contains("OFFSET ? ROWS FETCH FIRST ROWS WITH TIES"));
+    assert!(matches!(
+        printer::print_statement(&stmt),
+        Err(printer::PrintError::ParameterPosition { actual: 9, .. })
+    ));
     all.limit = Some(QueryLimit::Limit(Limit {
         row_count: Expr::AllRows(AllRows {
             span: Span::new(9, 12),
@@ -295,7 +230,7 @@ fn set_arity_distinct_corresponding_and_union_all_flattening_are_independent_rea
             span,
         });
         let result =
-            novarocks_parser::ast::validate_statement(&Statement::Query(build::query(body)));
+            novarocks_parser::ast::validate_statement(&TrinoStatement::Query(build::query(body)));
         if valid {
             result.unwrap();
         } else {
@@ -359,8 +294,8 @@ fn formerly_combined_fixture_counts_have_independent_complete_limit_and_fetch_co
             limit: Some(node),
         });
         novarocks_parser::ast::validate_statement(&stmt).unwrap();
-        assert_eq!(printer::print_statement(&stmt), expected);
-        let Statement::Query(typed) = stmt else {
+        assert_eq!(printer::print_statement(&stmt).unwrap(), expected);
+        let TrinoStatement::Query(typed) = stmt else {
             unreachable!()
         };
         assert!(typed.syntax_eq(&query(expected)));

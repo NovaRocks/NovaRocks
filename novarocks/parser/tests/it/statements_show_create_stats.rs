@@ -3,13 +3,13 @@
 use novarocks_parser::ast::{
     Ident, Parameter, Relation, SetExpr, ShowCreateKind, SyntaxEq, TrinoStatement, Visit,
 };
-use novarocks_parser::{ParserError, SYNTHETIC, Span, trino_parser, trino_printer};
+use novarocks_parser::{ParserError, SYNTHETIC, Span, parser, printer};
 
 fn roundtrip(source: &str) -> TrinoStatement {
     let original =
-        trino_parser::parse_statement(source).unwrap_or_else(|error| panic!("{source}: {error}"));
-    let output = trino_printer::print_statement(&original).unwrap();
-    let reparsed = trino_parser::parse_statement(&output).unwrap();
+        parser::parse_statement(source).unwrap_or_else(|error| panic!("{source}: {error}"));
+    let output = printer::print_statement(&original).unwrap();
+    let reparsed = parser::parse_statement(&output).unwrap();
     assert!(original.syntax_eq(&reparsed), "{source}\n{output}");
     original
 }
@@ -117,15 +117,12 @@ fn show_shape_boundaries_refuse_syntax_and_unrepresentable_typed_targets() {
         "SHOW STATS FOR (SELECT 1);",
     ] {
         assert!(
-            matches!(
-                trino_parser::parse_statement(source),
-                Err(ParserError::Parse(_))
-            ),
+            matches!(parser::parse_statement(source), Err(ParserError::Parse(_))),
             "{source}",
         );
     }
 
-    let mut statement = trino_parser::parse_statement("SHOW STATS FOR t").unwrap();
+    let mut statement = parser::parse_statement("SHOW STATS FOR t").unwrap();
     let TrinoStatement::ShowStats(show) = &mut statement else {
         panic!("expected SHOW STATS");
     };
@@ -138,8 +135,8 @@ fn show_shape_boundaries_refuse_syntax_and_unrepresentable_typed_targets() {
         span: SYNTHETIC,
     });
     assert!(matches!(
-        trino_printer::print_statement(&statement),
-        Err(trino_printer::PrintError::Unrepresentable {
+        printer::print_statement(&statement),
+        Err(printer::PrintError::Unrepresentable {
             fact: "a versioned SHOW STATS target",
         }),
     ));

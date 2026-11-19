@@ -18,8 +18,7 @@
 use novarocks_parser::{Span, StructuralViolation, ValidateError, ast::*, build, printer};
 
 fn expression(source: &str) -> Expr {
-    let tokens = novarocks_parser::lex(source).unwrap();
-    novarocks_parser::parser::parse_expression(source, &tokens).unwrap()
+    novarocks_parser::parser::parse_expression(source).unwrap()
 }
 fn id(value: &str) -> Ident {
     build::ident_at(value, false, Span::new(3, 7))
@@ -99,8 +98,8 @@ fn operation(frame: WindowFrame) -> Expr {
         span: Span::new(0, 100),
     }))
 }
-fn statement(expr: Expr) -> Statement {
-    Statement::Query(build::query(SetExpr::Select(
+fn statement(expr: Expr) -> TrinoStatement {
+    TrinoStatement::Query(build::query(SetExpr::Select(
         novarocks_parser::ast::AstBox::new(
             build::select(vec![build::item(expr, None)], None, None, None).unwrap(),
         ),
@@ -110,8 +109,8 @@ fn statement(expr: Expr) -> Statement {
 #[test]
 fn original_over_branches_preserve_reference_vs_specification_and_quoted_spans() {
     for (source, reference, printed) in [
-        ("f(v) OVER `w`", true, "f(v) OVER `w`"),
-        ("f(v) OVER (`w`)", false, "f(v) OVER (`w`)"),
+        ("f(v) OVER \"w\"", true, "f(v) OVER \"w\""),
+        ("f(v) OVER (\"w\")", false, "f(v) OVER (\"w\")"),
     ] {
         let expr = expression(source);
         let Expr::FunctionCall(call) = &expr else {
@@ -122,18 +121,21 @@ fn original_over_branches_preserve_reference_vs_specification_and_quoted_spans()
                 assert!(reference);
                 assert!(node.name.quoted);
                 assert_eq!(node.name.value, "w");
-                assert_eq!(&source[node.name.span.start()..node.name.span.end()], "`w`");
-                assert_eq!(&source[node.span.start()..node.span.end()], "OVER `w`");
+                assert_eq!(
+                    &source[node.name.span.start()..node.name.span.end()],
+                    "\"w\""
+                );
+                assert_eq!(&source[node.span.start()..node.span.end()], "\"w\"");
             }
             Window::Specification(node) => {
                 assert!(!reference);
                 let name = node.existing_window_name.as_ref().unwrap();
                 assert!(name.quoted);
                 assert_eq!(name.value, "w");
-                assert_eq!(&source[node.span.start()..node.span.end()], "(`w`)");
+                assert_eq!(&source[node.span.start()..node.span.end()], "\"w\"");
             }
         }
-        assert_eq!(printer::print_expr(&expr), printed);
+        assert_eq!(printer::print_expression(&expr).unwrap(), printed);
         assert!(expr.syntax_eq(&expression(printed)));
     }
     assert!(!expression("f(v) OVER w").syntax_eq(&expression("f(v) OVER (w)")));
@@ -252,8 +254,8 @@ fn complete_frame_children_modes_quantifiers_order_and_spans_survive_shared_trai
         span: Span::new(1, 3)
     }));
     assert_eq!(
-        printer::print_expr(&operation(original.clone())),
-        "result OVER (MEASURES input AS measure ROWS CURRENT ROW AFTER MATCH SKIP TO FIRST A SEEK PATTERN((A{2,4}?)) SUBSET U = (A, B) DEFINE A AS predicate)"
+        printer::print_expression(&operation(original.clone())).unwrap(),
+        "result OVER (MEASURES input AS measure ROWS CURRENT ROW AFTER MATCH SKIP TO FIRST A SEEK PATTERN ((A){2,4}?) SUBSET U = (A, B) DEFINE A AS predicate)"
     );
     validate_statement(&statement(operation(original))).unwrap();
 }
@@ -292,7 +294,7 @@ fn inherited_window_name_allows_trivia_before_specification_clauses() {
         ("f(v) OVER (w ORDER BY k)", 0, 1, false),
         ("f(v) OVER (w ROWS CURRENT ROW)", 0, 0, true),
         (
-            "f(v) OVER (`w` /* boundary */ PARTITION BY k ORDER BY v ROWS CURRENT ROW)",
+            "f(v) OVER (\"w\" /* boundary */ PARTITION BY k ORDER BY v ROWS CURRENT ROW)",
             1,
             1,
             true,
@@ -307,14 +309,18 @@ fn inherited_window_name_allows_trivia_before_specification_clauses() {
         };
         let name = spec.existing_window_name.as_ref().unwrap();
         assert_eq!(name.value, "w");
-        assert_eq!(name.quoted, source.contains('`'));
+        assert_eq!(name.quoted, source.contains('"'));
         assert_eq!(
             &source[name.span.start()..name.span.end()],
-            if name.quoted { "`w`" } else { "w" }
+            if name.quoted { "\"w\"" } else { "w" }
         );
         assert_eq!(
             &source[spec.span.start()..spec.span.end()],
-            source.split_once("OVER ").unwrap().1
+            source
+                .split_once("OVER ")
+                .unwrap()
+                .1
+                .trim_matches(['(', ')'])
         );
         assert_eq!(spec.partition_by.len(), partition_count);
         assert_eq!(
@@ -327,7 +333,7 @@ fn inherited_window_name_allows_trivia_before_specification_clauses() {
             assert!(matches!(frame.start_bound, WindowFrameBound::CurrentRow(_)));
             assert!(frame.end_bound.is_none());
         }
-        let printed = printer::print_expr(&expr);
+        let printed = printer::print_expression(&expr).unwrap();
         assert!(
             expr.syntax_eq(&expression(&printed)),
             "{source} -> {printed}"

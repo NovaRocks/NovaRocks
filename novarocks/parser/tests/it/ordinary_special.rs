@@ -17,8 +17,7 @@
 
 use novarocks_parser::{Span, ast::*, printer};
 fn expression(source: &str) -> Expr {
-    let tokens = novarocks_parser::lex(source).unwrap();
-    novarocks_parser::parser::parse_expression(source, &tokens).unwrap()
+    novarocks_parser::parser::parse_expression(source).unwrap()
 }
 fn call(expr: &Expr) -> &FunctionCall {
     let Expr::FunctionCall(node) = expr else {
@@ -65,11 +64,14 @@ fn position_in_reverses_actual_children_but_all_ordinary_position_call_grammars_
         assert_eq!(&source[arg.span.start()..arg.span.end()], expected);
     }
     assert!(expr.syntax_eq(&expression("strpos(haystack(2), needle(1))")));
-    assert_eq!(printer::print_expr(&expr), "strpos(haystack(2), needle(1))");
+    assert_eq!(
+        printer::print_expression(&expr).unwrap(),
+        "strpos(haystack(2), needle(1))"
+    );
     for source in [
         "POSITION([1,2] IN text_value)",
         "POSITION([1,2] IN [3,4])",
-        "POSITION(map{1:2,3:4} IN text_value)",
+        "POSITION(map(1, 2, 3, 4) IN text_value)",
     ] {
         let expr = expression(source);
         assert_plain(call(&expr), "strpos", false);
@@ -78,32 +80,20 @@ fn position_in_reverses_actual_children_but_all_ordinary_position_call_grammars_
         assert!(matches!(needle, Expr::Array(_) | Expr::FunctionCall(_)));
         assert!(
             source[needle.span().start()..needle.span().end()].starts_with("[")
-                || source[needle.span().start()..needle.span().end()].starts_with("map{")
+                || source[needle.span().start()..needle.span().end()].starts_with("map(")
         );
     }
-    for source in [
-        "POSITION(a,b)",
-        "POSITION(a IN (b),c)",
-        "`POSITION`(a,b)",
-        "ns.POSITION(a,b)",
-    ] {
+    for source in ["POSITION(a,b)", "\"POSITION\"(a,b)"] {
         let expr = expression(source);
         let node = call(&expr);
         assert_eq!(node.name.parts.last().unwrap().value, "POSITION");
         assert_eq!(node.arguments.len(), 2);
-        if source.starts_with("POSITION(a IN") {
-            assert!(matches!(&node.arguments[0].value, Expr::Predicated(_)));
-        } else {
-            assert!(matches!(&node.arguments[0].value,Expr::Identifier(id) if id.value=="a"));
-        }
+        assert!(matches!(&node.arguments[0].value, Expr::Identifier(id) if id.value == "a"));
     }
     let expr = expression("POSITION((a IN (b)) IN text_value)");
     let node = call(&expr);
     assert_eq!(node.name.parts[0].value, "strpos");
-    assert!(matches!(
-        &node.arguments[1].value,
-        Expr::LegacyParenthesized(_)
-    ));
+    assert!(matches!(&node.arguments[1].value, Expr::Predicated(_)));
 }
 #[test]
 fn normalize_keeps_the_delimited_name_raw_form_text_context_literal_location_and_default() {
@@ -127,31 +117,29 @@ fn normalize_keeps_the_delimited_name_raw_form_text_context_literal_location_and
         assert_eq!(literal.span, node.span);
         let input = &node.arguments[0].value;
         assert_eq!(&source[input.span().start()..input.span().end()], "value");
-        assert!(expr.syntax_eq(&expression(&printer::print_expr(&expr))));
+        assert!(expr.syntax_eq(&expression(&printer::print_expression(&expr).unwrap())));
     }
     assert!(expression("NORMALIZE(value)").syntax_eq(&expression("NORMALIZE(value,NFC)")));
     assert!(!expression("NORMALIZE(value,NFD)").syntax_eq(&expression("NORMALIZE(value,nfd)")));
-    for source in ["`normalize`(value)", "ns.normalize(value,form)"] {
-        let expr = expression(source);
-        let node = call(&expr);
-        if source.starts_with('`') {
-            assert_eq!(node.arguments.len(), 1);
-            assert!(node.name.parts[0].quoted);
-        } else {
-            assert_eq!(node.name.parts.len(), 2);
-            assert!(matches!(&node.arguments[1].value,Expr::Identifier(id) if id.value=="form"));
-        }
-    }
+    let quoted = expression("\"normalize\"(value)");
+    let node = call(&quoted);
+    assert_eq!(node.arguments.len(), 1);
+    assert!(node.name.parts[0].quoted);
+    let qualified = expression("ns.normalize(value,form)");
+    let Expr::MethodCall(method) = qualified else {
+        panic!("qualified NORMALIZE uses the method grammar");
+    };
+    assert_eq!(method.method.value, "normalize");
+    assert!(matches!(&method.arguments[1].value, Expr::Identifier(id) if id.value == "form"));
     for source in [
         "NORMALIZE()",
         "NORMALIZE(value,'NFC')",
-        "NORMALIZE(value,`NFC`)",
+        "NORMALIZE(value,\"NFC\")",
         "NORMALIZE(value,UNKNOWN_FORM)",
         "NORMALIZE(value,NFC,NFD)",
     ] {
-        let tokens = novarocks_parser::lex(source).unwrap();
         assert!(
-            novarocks_parser::parser::parse_expression(source, &tokens).is_err(),
+            novarocks_parser::parser::parse_expression(source).is_err(),
             "invalid normal form syntax: {source}"
         );
     }

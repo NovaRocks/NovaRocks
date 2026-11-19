@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 use novarocks_parser::ast::*;
-use novarocks_parser::trino_parser::{parse_expression, parse_query};
-use novarocks_parser::trino_printer::{print_expression, print_query};
+use novarocks_parser::parser::{parse_expression, parse_query};
+use novarocks_parser::printer::{print_expression, print_query};
 
 fn expression_roundtrip(source: &str) -> Expr {
     let original = parse_expression(source).unwrap();
@@ -283,7 +283,7 @@ fn empty_json_constructors_refuse_unrepresentable_member_list_policies() {
     value.unique_keys = true;
     assert!(matches!(
         print_expression(&object),
-        Err(novarocks_parser::trino_printer::PrintError::Unrepresentable { .. })
+        Err(novarocks_parser::printer::PrintError::Unrepresentable { .. })
     ));
     let Expr::JsonObject(value) = &mut object else {
         unreachable!()
@@ -292,7 +292,7 @@ fn empty_json_constructors_refuse_unrepresentable_member_list_policies() {
     value.null_on_null = false;
     assert!(matches!(
         print_expression(&object),
-        Err(novarocks_parser::trino_printer::PrintError::Unrepresentable { .. })
+        Err(novarocks_parser::printer::PrintError::Unrepresentable { .. })
     ));
     let mut array = parse_expression("JSON_ARRAY()").unwrap();
     let Expr::JsonArray(value) = &mut array else {
@@ -301,6 +301,6 @@ fn empty_json_constructors_refuse_unrepresentable_member_list_policies() {
     value.null_on_null = true;
     assert!(matches!(
         print_expression(&array),
-        Err(novarocks_parser::trino_printer::PrintError::Unrepresentable { .. })
+        Err(novarocks_parser::printer::PrintError::Unrepresentable { .. })
     ));
 }

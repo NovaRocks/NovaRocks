@@ -4,10 +4,7 @@ use super::*;
 use crate::{SYNTHETIC, Span, build};
 
 fn query_with(expression: Expr) -> Query {
-    let mut statements = crate::parse("SELECT TRUE").unwrap();
-    let Statement::Query(mut query) = statements.pop().unwrap() else {
-        unreachable!()
-    };
+    let mut query = crate::parser::parse_query("SELECT TRUE").unwrap();
     let SetExpr::Select(select) = query.body.as_mut() else {
         unreachable!()
     };
@@ -138,17 +135,14 @@ fn control_children_keep_declared_order_and_partial_predicate_identity() {
     node.default_value = Some(build::null());
     assert!(!no_default.syntax_eq(&null_default));
     assert_eq!(
-        crate::printer::print_expr(&original),
+        crate::printer::print_expression(&original).unwrap(),
         "CASE operand WHEN label THEN result WHEN NOT BETWEEN SYMMETRIC minimum AND maximum THEN partial_result ELSE default END"
     );
     let Expr::SimpleCase(node) = &mut reordered else {
         unreachable!()
     };
     node.when_clauses.clear();
-    assert!(matches!(
-        validate_statement(&Statement::Query(query_with(reordered))),
-        Err(_)
-    ));
+    assert!(validate_statement(&TrinoStatement::Query(query_with(reordered))).is_err());
 }
 #[test]
 fn cast_lambda_and_subquery_wrappers_visit_all_stored_facts() {
@@ -249,8 +243,8 @@ fn actual_control_owning_cycles_and_synchronous_walks_grow_the_stack() {
     count.visit_expr(&node);
     assert_eq!(count.0, 35_001);
     let query = query_with(node);
-    validate_statement(&Statement::Query(query.clone())).unwrap();
-    let rendered = crate::printer::print_statement(&Statement::Query(query));
+    validate_statement(&TrinoStatement::Query(query.clone())).unwrap();
+    let rendered = crate::printer::print_statement(&TrinoStatement::Query(query)).unwrap();
     assert!(!rendered.is_empty());
     drop(folded);
 }

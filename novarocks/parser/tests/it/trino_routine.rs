@@ -16,7 +16,7 @@
 // under the License.
 
 use novarocks_parser::ast::*;
-use novarocks_parser::trino_parser::{
+use novarocks_parser::parser::{
     parse_function_specification as parse_standalone_function, parse_query,
 };
 use novarocks_parser::{ParseError, ParserError, Span};

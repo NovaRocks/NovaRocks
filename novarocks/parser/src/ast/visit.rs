@@ -408,9 +408,6 @@ pub trait Visit {
     fn visit_pattern_recognition_relation(&mut self, node: &PatternRecognitionRelation) {
         super::relation::walk_pattern_recognition_relation(self, node);
     }
-    fn visit_legacy_table_function(&mut self, node: &super::legacy::TableFunction) {
-        super::relation::walk_legacy_table_function(self, node);
-    }
     fn visit_group_by(&mut self, node: &GroupBy) {
         walk_group_by(self, node);
     }
@@ -825,50 +822,6 @@ pub trait Visit {
         super::routine::walk_control_statement(self, node);
     }
 
-    fn visit_statement(&mut self, statement: &Statement) {
-        walk_statement(self, statement);
-    }
-
-    fn visit_show_process_list(&mut self, statement: &ShowProcessList) {
-        walk_show_process_list(self, statement);
-    }
-
-    fn visit_statistics_statement(&mut self, statement: &StatisticsStatement) {
-        walk_statistics_statement(self, statement);
-    }
-
-    fn visit_catalog_statement(&mut self, statement: &CatalogStatement) {
-        walk_catalog_statement(self, statement);
-    }
-
-    fn visit_iceberg_statement(&mut self, statement: &IcebergStatement) {
-        walk_iceberg_statement(self, statement);
-    }
-
-    fn visit_maintenance_statement(&mut self, statement: &MaintenanceStatement) {
-        walk_maintenance_statement(self, statement);
-    }
-
-    fn visit_materialized_view_statement(&mut self, statement: &MaterializedViewStatement) {
-        walk_materialized_view_statement(self, statement);
-    }
-
-    fn visit_view_statement(&mut self, statement: &ViewStatement) {
-        walk_view_statement(self, statement);
-    }
-
-    fn visit_table_statement(&mut self, statement: &TableStatement) {
-        walk_table_statement(self, statement);
-    }
-
-    fn visit_dml_statement(&mut self, statement: &DmlStatement) {
-        walk_dml_statement(self, statement);
-    }
-
-    fn visit_session_statement(&mut self, statement: &SessionStatement) {
-        walk_session_statement(self, statement);
-    }
-
     fn visit_query(&mut self, query: &Query) {
         walk_query(self, query);
     }
@@ -880,10 +833,6 @@ pub trait Visit {
     fn visit_session_property(&mut self, property: &SessionProperty) {
         self.visit_object_name(&property.name);
         self.visit_expr(&property.value);
-    }
-
-    fn visit_explain_query(&mut self, query: &ExplainQuery) {
-        walk_explain_query(self, query);
     }
 
     fn visit_ident(&mut self, ident: &Ident) {
@@ -913,76 +862,6 @@ pub trait Visit {
     fn visit_binary_expr(&mut self, expression: &BinaryExpr) {
         walk_binary_expr(self, expression);
     }
-
-    fn visit_legacy_interval_expr(&mut self, expression: &LegacyIntervalExpr) {
-        walk_legacy_interval_expr(self, expression);
-    }
-
-    fn visit_legacy_parenthesized_expr(&mut self, expression: &LegacyParenthesizedExpr) {
-        walk_legacy_parenthesized_expr(self, expression);
-    }
-}
-
-pub fn walk_statement<V: Visit + ?Sized>(visitor: &mut V, statement: &Statement) {
-    match statement {
-        Statement::ShowProcessList(statement) => visitor.visit_show_process_list(statement),
-        Statement::Statistics(statement) => visitor.visit_statistics_statement(statement),
-        Statement::Catalog(statement) => visitor.visit_catalog_statement(statement),
-        Statement::Iceberg(statement) => visitor.visit_iceberg_statement(statement),
-        Statement::Maintenance(statement) => visitor.visit_maintenance_statement(statement),
-        Statement::MaterializedView(statement) => {
-            visitor.visit_materialized_view_statement(statement)
-        }
-        Statement::View(statement) => visitor.visit_view_statement(statement),
-        Statement::Table(statement) => visitor.visit_table_statement(statement),
-        Statement::Dml(statement) => visitor.visit_dml_statement(statement),
-        Statement::Session(statement) => visitor.visit_session_statement(statement),
-        Statement::Query(query) => visitor.visit_query(query),
-        Statement::ExplainQuery(query) => visitor.visit_explain_query(query),
-    }
-}
-
-pub fn walk_show_process_list<V: Visit + ?Sized>(_: &mut V, _: &ShowProcessList) {}
-
-pub fn walk_statistics_statement<V: Visit + ?Sized>(
-    visitor: &mut V,
-    statement: &StatisticsStatement,
-) {
-    super::legacy::statistics::walk(visitor, statement);
-}
-
-pub fn walk_catalog_statement<V: Visit + ?Sized>(visitor: &mut V, statement: &CatalogStatement) {
-    super::legacy::catalog::walk(visitor, statement);
-}
-
-pub fn walk_iceberg_statement<V: Visit + ?Sized>(visitor: &mut V, statement: &IcebergStatement) {
-    super::legacy::iceberg::walk(visitor, statement);
-}
-
-pub fn walk_maintenance_statement<V: Visit + ?Sized>(
-    visitor: &mut V,
-    statement: &MaintenanceStatement,
-) {
-    super::legacy::maintenance::walk(visitor, statement);
-}
-
-pub fn walk_materialized_view_statement<V: Visit + ?Sized>(
-    visitor: &mut V,
-    statement: &MaterializedViewStatement,
-) {
-    super::legacy::materialized_view::walk(visitor, statement);
-}
-
-pub fn walk_view_statement<V: Visit + ?Sized>(visitor: &mut V, statement: &ViewStatement) {
-    super::legacy::view::walk(visitor, statement);
-}
-
-pub fn walk_table_statement<V: Visit + ?Sized>(visitor: &mut V, statement: &TableStatement) {
-    super::legacy::table::walk(visitor, statement);
-}
-
-pub fn walk_dml_statement<V: Visit + ?Sized>(visitor: &mut V, statement: &DmlStatement) {
-    super::legacy::dml::walk(visitor, statement);
 }
 
 pub fn walk_ident<V: Visit + ?Sized>(_: &mut V, _: &Ident) {}
@@ -991,10 +870,6 @@ pub fn walk_object_name<V: Visit + ?Sized>(visitor: &mut V, name: &ObjectName) {
     for part in &name.parts {
         visitor.visit_ident(part);
     }
-}
-
-pub fn walk_explain_query<V: Visit + ?Sized>(visitor: &mut V, query: &ExplainQuery) {
-    visitor.visit_query(&query.query);
 }
 
 #[recursive::recursive]
@@ -1055,9 +930,6 @@ pub fn walk_select<V: Visit + ?Sized>(visitor: &mut V, select: &Select) {
     }
     if let Some(having) = &select.having {
         visitor.visit_expr(having);
-    }
-    if let Some(qualify) = &select.legacy.qualify {
-        visitor.visit_expr(qualify);
     }
     for window in &select.windows {
         visitor.visit_window_definition(window);
@@ -1187,11 +1059,7 @@ pub fn walk_expr<V: Visit + ?Sized>(visitor: &mut V, expression: &Expr) {
         Expr::SimpleCase(node) => visitor.visit_simple_case_expr(node),
         Expr::Predicated(node) => visitor.visit_predicated_expr(node),
         Expr::InList(node) => visitor.visit_in_list_expr(node),
-        Expr::LegacyParenthesized(expression) => {
-            visitor.visit_legacy_parenthesized_expr(expression)
-        }
 
-        Expr::LegacyInterval(expression) => visitor.visit_legacy_interval_expr(expression),
         Expr::Subquery(expression) => visitor.visit_query(&expression.query),
         Expr::Row(expression) => visitor.visit_row_expr(expression),
         Expr::Array(expression) => walk_array_expr(visitor, expression),
@@ -1229,27 +1097,6 @@ pub fn walk_unary_expr<V: Visit + ?Sized>(visitor: &mut V, expression: &UnaryExp
 pub fn walk_binary_expr<V: Visit + ?Sized>(visitor: &mut V, expression: &BinaryExpr) {
     visitor.visit_expr(&expression.left);
     visitor.visit_expr(&expression.right);
-}
-
-#[recursive::recursive]
-pub fn walk_legacy_interval_expr<V: Visit + ?Sized>(
-    visitor: &mut V,
-    expression: &LegacyIntervalExpr,
-) {
-    visitor.visit_expr(&expression.value);
-    if let Some(precision) = &expression.leading_precision {
-        visitor.visit_expr(precision);
-    }
-    if let Some(precision) = &expression.fractional_seconds_precision {
-        visitor.visit_expr(precision);
-    }
-}
-
-pub fn walk_legacy_parenthesized_expr<V: Visit + ?Sized>(
-    visitor: &mut V,
-    expression: &LegacyParenthesizedExpr,
-) {
-    visitor.visit_expr(&expression.expression);
 }
 
 /// Rebuilds AST nodes by value, recursively folding all children by default.
@@ -1708,12 +1555,6 @@ pub trait Fold {
         node: PatternRecognitionRelation,
     ) -> PatternRecognitionRelation {
         super::relation::fold_pattern_recognition_relation(self, node)
-    }
-    fn fold_legacy_table_function(
-        &mut self,
-        node: super::legacy::TableFunction,
-    ) -> super::legacy::TableFunction {
-        super::relation::fold_legacy_table_function(self, node)
     }
     fn fold_group_by(&mut self, node: GroupBy) -> GroupBy {
         fold_group_by(self, node)
@@ -2182,56 +2023,6 @@ pub trait Fold {
         super::routine::fold_control_statement(self, node)
     }
 
-    fn fold_statement(&mut self, statement: Statement) -> Statement {
-        fold_statement(self, statement)
-    }
-
-    fn fold_show_process_list(&mut self, statement: ShowProcessList) -> ShowProcessList {
-        fold_show_process_list(self, statement)
-    }
-
-    fn fold_statistics_statement(&mut self, statement: StatisticsStatement) -> StatisticsStatement {
-        fold_statistics_statement(self, statement)
-    }
-
-    fn fold_catalog_statement(&mut self, statement: CatalogStatement) -> CatalogStatement {
-        fold_catalog_statement(self, statement)
-    }
-
-    fn fold_iceberg_statement(&mut self, statement: IcebergStatement) -> IcebergStatement {
-        fold_iceberg_statement(self, statement)
-    }
-
-    fn fold_maintenance_statement(
-        &mut self,
-        statement: MaintenanceStatement,
-    ) -> MaintenanceStatement {
-        fold_maintenance_statement(self, statement)
-    }
-
-    fn fold_materialized_view_statement(
-        &mut self,
-        statement: MaterializedViewStatement,
-    ) -> MaterializedViewStatement {
-        fold_materialized_view_statement(self, statement)
-    }
-
-    fn fold_view_statement(&mut self, statement: ViewStatement) -> ViewStatement {
-        fold_view_statement(self, statement)
-    }
-
-    fn fold_table_statement(&mut self, statement: TableStatement) -> TableStatement {
-        fold_table_statement(self, statement)
-    }
-
-    fn fold_dml_statement(&mut self, statement: DmlStatement) -> DmlStatement {
-        fold_dml_statement(self, statement)
-    }
-
-    fn fold_session_statement(&mut self, statement: SessionStatement) -> SessionStatement {
-        fold_session_statement(self, statement)
-    }
-
     #[recursive::recursive]
 
     fn fold_query(&mut self, query: Query) -> Query {
@@ -2246,10 +2037,6 @@ pub trait Fold {
 
     fn fold_select(&mut self, select: Select) -> Select {
         fold_select(self, select)
-    }
-
-    fn fold_explain_query(&mut self, query: ExplainQuery) -> ExplainQuery {
-        fold_explain_query(self, query)
     }
 
     fn fold_ident(&mut self, ident: Ident) -> Ident {
@@ -2279,151 +2066,6 @@ pub trait Fold {
     fn fold_binary_expr(&mut self, expression: BinaryExpr) -> BinaryExpr {
         fold_binary_expr(self, expression)
     }
-
-    fn fold_legacy_interval_expr(&mut self, expression: LegacyIntervalExpr) -> LegacyIntervalExpr {
-        fold_legacy_interval_expr(self, expression)
-    }
-
-    fn fold_legacy_parenthesized_expr(
-        &mut self,
-        expression: LegacyParenthesizedExpr,
-    ) -> LegacyParenthesizedExpr {
-        fold_legacy_parenthesized_expr(self, expression)
-    }
-}
-
-pub fn fold_statement<F: Fold + ?Sized>(folder: &mut F, statement: Statement) -> Statement {
-    match statement {
-        Statement::ShowProcessList(statement) => {
-            Statement::ShowProcessList(folder.fold_show_process_list(statement))
-        }
-        Statement::Statistics(statement) => {
-            Statement::Statistics(folder.fold_statistics_statement(statement))
-        }
-        Statement::Catalog(statement) => {
-            Statement::Catalog(folder.fold_catalog_statement(statement))
-        }
-        Statement::Iceberg(statement) => {
-            Statement::Iceberg(folder.fold_iceberg_statement(statement))
-        }
-        Statement::Maintenance(statement) => {
-            Statement::Maintenance(folder.fold_maintenance_statement(statement))
-        }
-        Statement::MaterializedView(statement) => {
-            Statement::MaterializedView(folder.fold_materialized_view_statement(statement))
-        }
-        Statement::View(statement) => Statement::View(folder.fold_view_statement(statement)),
-        Statement::Table(statement) => Statement::Table(folder.fold_table_statement(statement)),
-        Statement::Dml(statement) => Statement::Dml(folder.fold_dml_statement(statement)),
-        Statement::Session(statement) => {
-            Statement::Session(folder.fold_session_statement(statement))
-        }
-        Statement::Query(query) => Statement::Query(folder.fold_query(query)),
-        Statement::ExplainQuery(query) => Statement::ExplainQuery(folder.fold_explain_query(query)),
-    }
-}
-
-pub fn fold_show_process_list<F: Fold + ?Sized>(
-    _: &mut F,
-    statement: ShowProcessList,
-) -> ShowProcessList {
-    statement
-}
-
-pub fn fold_statistics_statement<F: Fold + ?Sized>(
-    folder: &mut F,
-    statement: StatisticsStatement,
-) -> StatisticsStatement {
-    super::legacy::statistics::fold(folder, statement)
-}
-
-pub fn fold_catalog_statement<F: Fold + ?Sized>(
-    folder: &mut F,
-    statement: CatalogStatement,
-) -> CatalogStatement {
-    super::legacy::catalog::fold(folder, statement)
-}
-
-pub fn fold_iceberg_statement<F: Fold + ?Sized>(
-    folder: &mut F,
-    statement: IcebergStatement,
-) -> IcebergStatement {
-    super::legacy::iceberg::fold(folder, statement)
-}
-
-pub fn fold_maintenance_statement<F: Fold + ?Sized>(
-    folder: &mut F,
-    statement: MaintenanceStatement,
-) -> MaintenanceStatement {
-    super::legacy::maintenance::fold(folder, statement)
-}
-
-pub fn fold_materialized_view_statement<F: Fold + ?Sized>(
-    folder: &mut F,
-    statement: MaterializedViewStatement,
-) -> MaterializedViewStatement {
-    super::legacy::materialized_view::fold(folder, statement)
-}
-
-pub fn fold_view_statement<F: Fold + ?Sized>(
-    folder: &mut F,
-    statement: ViewStatement,
-) -> ViewStatement {
-    super::legacy::view::fold(folder, statement)
-}
-
-pub fn fold_table_statement<F: Fold + ?Sized>(
-    folder: &mut F,
-    statement: TableStatement,
-) -> TableStatement {
-    super::legacy::table::fold(folder, statement)
-}
-
-pub fn fold_dml_statement<F: Fold + ?Sized>(
-    folder: &mut F,
-    statement: DmlStatement,
-) -> DmlStatement {
-    super::legacy::dml::fold(folder, statement)
-}
-
-pub fn walk_session_statement<V: Visit + ?Sized>(visitor: &mut V, statement: &SessionStatement) {
-    match statement {
-        SessionStatement::Set(statement) => {
-            for assignment in &statement.assignments {
-                visitor.visit_ident(&assignment.name);
-                visitor.visit_expr(&assignment.value);
-            }
-        }
-        SessionStatement::Use(statement) => visitor.visit_ident(&statement.database),
-        SessionStatement::Kill(statement) => visitor.visit_literal(&statement.connection_id),
-        SessionStatement::TransactionControl(_) => {}
-    }
-}
-
-pub fn fold_session_statement<F: Fold + ?Sized>(
-    folder: &mut F,
-    statement: SessionStatement,
-) -> SessionStatement {
-    match statement {
-        SessionStatement::Set(mut statement) => {
-            for assignment in &mut statement.assignments {
-                assignment.name = folder.fold_ident(assignment.name.clone());
-                assignment.value = folder.fold_expr(assignment.value.clone());
-            }
-            SessionStatement::Set(statement)
-        }
-        SessionStatement::Use(mut statement) => {
-            statement.database = folder.fold_ident(statement.database);
-            SessionStatement::Use(statement)
-        }
-        SessionStatement::Kill(mut statement) => {
-            statement.connection_id = folder.fold_literal(statement.connection_id);
-            SessionStatement::Kill(statement)
-        }
-        SessionStatement::TransactionControl(statement) => {
-            SessionStatement::TransactionControl(statement)
-        }
-    }
 }
 
 pub fn fold_ident<F: Fold + ?Sized>(_: &mut F, ident: Ident) -> Ident {
@@ -2437,14 +2079,6 @@ pub fn fold_object_name<F: Fold + ?Sized>(folder: &mut F, mut name: ObjectName) 
         .map(|part| folder.fold_ident(part))
         .collect();
     name
-}
-
-pub fn fold_explain_query<F: Fold + ?Sized>(
-    folder: &mut F,
-    mut query: ExplainQuery,
-) -> ExplainQuery {
-    query.query = Box::new(folder.fold_query(*query.query));
-    query
 }
 
 #[recursive::recursive]
@@ -2514,7 +2148,6 @@ pub fn fold_select<F: Fold + ?Sized>(folder: &mut F, mut select: Select) -> Sele
     select.selection = select.selection.map(|expr| folder.fold_expr(expr));
     select.group_by = select.group_by.map(|node| folder.fold_group_by(node));
     select.having = select.having.map(|expr| folder.fold_expr(expr));
-    select.legacy.qualify = select.legacy.qualify.map(|expr| folder.fold_expr(expr));
     select.windows = select
         .windows
         .into_iter()
@@ -2723,13 +2356,7 @@ pub fn fold_expr<F: Fold + ?Sized>(folder: &mut F, expression: Expr) -> Expr {
         Expr::InList(node) => {
             Expr::InList(AstBox::new(folder.fold_in_list_expr(node.into_inner())))
         }
-        Expr::LegacyParenthesized(expression) => {
-            Expr::LegacyParenthesized(folder.fold_legacy_parenthesized_expr(expression))
-        }
 
-        Expr::LegacyInterval(expression) => {
-            Expr::LegacyInterval(folder.fold_legacy_interval_expr(expression))
-        }
         Expr::Subquery(mut expression) => {
             expression.query = AstBox::new(folder.fold_query(expression.query.into_inner()));
             Expr::Subquery(expression)
@@ -2780,29 +2407,6 @@ pub fn fold_binary_expr<F: Fold + ?Sized>(
 ) -> BinaryExpr {
     expression.left = AstBox::new(folder.fold_expr(expression.left.into_inner()));
     expression.right = AstBox::new(folder.fold_expr(expression.right.into_inner()));
-    expression
-}
-
-#[recursive::recursive]
-pub fn fold_legacy_interval_expr<F: Fold + ?Sized>(
-    folder: &mut F,
-    mut expression: LegacyIntervalExpr,
-) -> LegacyIntervalExpr {
-    expression.value = AstBox::new(folder.fold_expr(expression.value.into_inner()));
-    expression.leading_precision = expression
-        .leading_precision
-        .map(|precision| AstBox::new(folder.fold_expr(precision.into_inner())));
-    expression.fractional_seconds_precision = expression
-        .fractional_seconds_precision
-        .map(|precision| AstBox::new(folder.fold_expr(precision.into_inner())));
-    expression
-}
-
-pub fn fold_legacy_parenthesized_expr<F: Fold + ?Sized>(
-    folder: &mut F,
-    mut expression: LegacyParenthesizedExpr,
-) -> LegacyParenthesizedExpr {
-    expression.expression = AstBox::new(folder.fold_expr(expression.expression.into_inner()));
     expression
 }
 

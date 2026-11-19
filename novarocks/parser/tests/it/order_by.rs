@@ -18,16 +18,11 @@
 use novarocks_parser::{SYNTHETIC, Span, StructuralViolation, ValidateError, ast::*, build};
 
 fn expression(source: &str) -> Expr {
-    let tokens = novarocks_parser::lex(source).unwrap();
-    novarocks_parser::parser::parse_expression(source, &tokens).unwrap()
+    novarocks_parser::parser::parse_expression(source).unwrap()
 }
 
 fn query(source: &str) -> Query {
-    let mut statements = novarocks_parser::parse(source).unwrap();
-    let Statement::Query(query) = statements.remove(0) else {
-        panic!("query");
-    };
-    query
+    novarocks_parser::parser::parse_query(source).unwrap()
 }
 
 fn select(query: &Query) -> &Select {
@@ -39,13 +34,13 @@ fn select(query: &Query) -> &Select {
 
 #[test]
 fn all_three_order_owners_capture_their_real_keyword_and_original_keys() {
-    let source = "SELECT x FROM t ORDER /* clause */ BY x, `Last` DESC NULLS LAST LIMIT 2";
+    let source = "SELECT x FROM t ORDER /* clause */ BY x, \"Last\" DESC NULLS LAST LIMIT 2";
     let query = query(source);
     assert!(query.modifiers.order_by.is_none());
     let order = select(&query).modifiers.order_by.as_ref().unwrap();
     assert_eq!(
         &source[order.span.start()..order.span.end()],
-        "ORDER /* clause */ BY x, `Last` DESC NULLS LAST"
+        "ORDER /* clause */ BY x, \"Last\" DESC NULLS LAST"
     );
     assert_eq!(order.items.len(), 2);
     let (first, last) = (&order.items[0], &order.items[1]);
@@ -61,10 +56,10 @@ fn all_three_order_owners_capture_their_real_keyword_and_original_keys() {
         panic!("original quoted key");
     };
     assert_eq!((name.value.as_str(), name.quoted), ("Last", true));
-    assert_eq!(&source[name.span.start()..name.span.end()], "`Last`");
+    assert_eq!(&source[name.span.start()..name.span.end()], "\"Last\"");
     assert_eq!(
         &source[last.span.start()..last.span.end()],
-        "`Last` DESC NULLS LAST"
+        "\"Last\" DESC NULLS LAST"
     );
 
     for (source, expected, window) in [
@@ -222,7 +217,7 @@ fn checked_build_and_public_validation_reject_each_empty_order_owner() {
             }
         }
         assert_eq!(
-            validate_statement(&Statement::Query(query)),
+            validate_statement(&TrinoStatement::Query(query)),
             Err(ValidateError::InvalidStructure {
                 violation: StructuralViolation::EmptyOrderBy,
                 span: Span::new(41, 49)

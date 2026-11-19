@@ -38,11 +38,6 @@ pub fn syntax_eq_expr(left: &Expr, right: &Expr) -> bool {
     left.syntax_eq(right)
 }
 
-/// Compares two typed query EXPLAIN wrappers without comparing source spans.
-pub fn syntax_eq_explain_query(left: &ExplainQuery, right: &ExplainQuery) -> bool {
-    left.syntax_eq(right)
-}
-
 impl SyntaxEq for Ident {
     fn syntax_eq(&self, other: &Self) -> bool {
         self.value == other.value && self.quoted == other.quoted
@@ -52,14 +47,6 @@ impl SyntaxEq for Ident {
 impl SyntaxEq for ObjectName {
     fn syntax_eq(&self, other: &Self) -> bool {
         syntax_eq_slice(&self.parts, &other.parts)
-    }
-}
-
-impl SyntaxEq for ExplainQuery {
-    fn syntax_eq(&self, other: &Self) -> bool {
-        self.format == other.format
-            && self.logical == other.logical
-            && self.query.syntax_eq(&other.query)
     }
 }
 
@@ -153,7 +140,6 @@ impl SyntaxEq for Select {
             && syntax_eq_option(&self.selection, &other.selection)
             && syntax_eq_option(&self.group_by, &other.group_by)
             && syntax_eq_option(&self.having, &other.having)
-            && self.legacy.syntax_eq(&other.legacy)
             && syntax_eq_slice(&self.windows, &other.windows)
             && self.modifiers.syntax_eq(&other.modifiers)
     }
@@ -374,10 +360,6 @@ impl SyntaxEq for Expr {
             (Self::SimpleCase(left), Self::SimpleCase(right)) => left.syntax_eq(right),
             (Self::Predicated(left), Self::Predicated(right)) => left.syntax_eq(right),
             (Self::InList(left), Self::InList(right)) => left.syntax_eq(right),
-            (Self::LegacyParenthesized(left), Self::LegacyParenthesized(right)) => {
-                left.syntax_eq(right)
-            }
-            (Self::LegacyInterval(left), Self::LegacyInterval(right)) => left.syntax_eq(right),
             (Self::Subquery(left), Self::Subquery(right)) => left.syntax_eq(right),
             (Self::Row(left), Self::Row(right)) => left.syntax_eq(right),
             (Self::Array(left), Self::Array(right)) => left.syntax_eq(right),
@@ -423,31 +405,6 @@ impl SyntaxEq for BinaryExpr {
         self.left.syntax_eq(&other.left)
             && self.operator == other.operator
             && self.right.syntax_eq(&other.right)
-    }
-}
-
-impl SyntaxEq for LegacySelectExtensions {
-    fn syntax_eq(&self, other: &Self) -> bool {
-        syntax_eq_option(&self.qualify, &other.qualify)
-    }
-}
-
-impl SyntaxEq for LegacyParenthesizedExpr {
-    fn syntax_eq(&self, other: &Self) -> bool {
-        self.expression.syntax_eq(&other.expression)
-    }
-}
-
-impl SyntaxEq for LegacyIntervalExpr {
-    fn syntax_eq(&self, other: &Self) -> bool {
-        self.value.syntax_eq(&other.value)
-            && self.leading_field == other.leading_field
-            && syntax_eq_option(&self.leading_precision, &other.leading_precision)
-            && self.last_field == other.last_field
-            && syntax_eq_option(
-                &self.fractional_seconds_precision,
-                &other.fractional_seconds_precision,
-            )
     }
 }
 
@@ -524,6 +481,40 @@ fn syntax_eq_slice<T: SyntaxEq>(left: &[T], right: &[T]) -> bool {
             .iter()
             .zip(right)
             .all(|(left, right)| left.syntax_eq(right))
+}
+
+impl SyntaxEq for Window {
+    #[recursive::recursive]
+    fn syntax_eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Reference(a), Self::Reference(b)) => a.syntax_eq(b),
+            (Self::Specification(a), Self::Specification(b)) => a.syntax_eq(b),
+            _ => false,
+        }
+    }
+}
+impl SyntaxEq for WindowReference {
+    fn syntax_eq(&self, other: &Self) -> bool {
+        self.name.syntax_eq(&other.name)
+    }
+}
+impl SyntaxEq for WindowOperation {
+    #[recursive::recursive]
+    fn syntax_eq(&self, other: &Self) -> bool {
+        self.name.syntax_eq(&other.name) && self.window.syntax_eq(&other.window)
+    }
+}
+
+impl SyntaxEq for CallArgument {
+    #[recursive::recursive]
+    fn syntax_eq(&self, other: &Self) -> bool {
+        syntax_eq_option(&self.name, &other.name) && self.value.syntax_eq(&other.value)
+    }
+}
+impl SyntaxEq for ProcessingMode {
+    fn syntax_eq(&self, other: &Self) -> bool {
+        self.mode == other.mode
+    }
 }
 
 #[cfg(test)]
@@ -709,7 +700,6 @@ mod tests {
                     span: span(start + 13),
                 }),
                 having: None,
-                legacy: Default::default(),
                 windows: AstVec::new(),
                 modifiers: QueryModifiers {
                     order_by: Some(OrderBy {
@@ -775,39 +765,5 @@ mod tests {
         call.null_treatment = Some(NullTreatment::RespectNulls);
 
         assert!(!syntax_eq_expr(&left, &right));
-    }
-}
-
-impl SyntaxEq for Window {
-    #[recursive::recursive]
-    fn syntax_eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Reference(a), Self::Reference(b)) => a.syntax_eq(b),
-            (Self::Specification(a), Self::Specification(b)) => a.syntax_eq(b),
-            _ => false,
-        }
-    }
-}
-impl SyntaxEq for WindowReference {
-    fn syntax_eq(&self, other: &Self) -> bool {
-        self.name.syntax_eq(&other.name)
-    }
-}
-impl SyntaxEq for WindowOperation {
-    #[recursive::recursive]
-    fn syntax_eq(&self, other: &Self) -> bool {
-        self.name.syntax_eq(&other.name) && self.window.syntax_eq(&other.window)
-    }
-}
-
-impl SyntaxEq for CallArgument {
-    #[recursive::recursive]
-    fn syntax_eq(&self, other: &Self) -> bool {
-        syntax_eq_option(&self.name, &other.name) && self.value.syntax_eq(&other.value)
-    }
-}
-impl SyntaxEq for ProcessingMode {
-    fn syntax_eq(&self, other: &Self) -> bool {
-        self.mode == other.mode
     }
 }

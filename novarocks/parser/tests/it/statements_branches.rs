@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use novarocks_parser::ast::{Expr, StatementSaveMode, SyntaxEq, TrinoStatement};
-use novarocks_parser::{ParseError, ParserError, trino_parser, trino_printer};
+use novarocks_parser::{ParseError, ParserError, parser, printer};
 
 fn roundtrip(source: &str) -> TrinoStatement {
     let original =
-        trino_parser::parse_statement(source).unwrap_or_else(|error| panic!("{source}: {error}"));
-    let output = trino_printer::print_statement(&original).unwrap();
-    let reparsed = trino_parser::parse_statement(&output).unwrap();
+        parser::parse_statement(source).unwrap_or_else(|error| panic!("{source}: {error}"));
+    let output = printer::print_statement(&original).unwrap();
+    let reparsed = parser::parse_statement(&output).unwrap();
     assert!(original.syntax_eq(&reparsed), "{source}\n{output}");
     original
 }
@@ -76,7 +76,7 @@ fn branch_drop_fast_forward_and_show_keep_their_distinct_facts() {
 #[test]
 fn branch_mode_collision_precedes_property_construction_and_old_forms_are_syntax_errors() {
     let source = "  CREATE OR REPLACE BRANCH IF NOT EXISTS b WITH (snapshot_id = 9223372036854775808) IN TABLE t";
-    let error = trino_parser::parse_statement(source).unwrap_err();
+    let error = parser::parse_statement(source).unwrap_err();
     let ParserError::Parse(ParseError::UnexpectedToken { span, found, .. }) = error else {
         panic!("expected save-mode syntax error");
     };
@@ -96,10 +96,7 @@ fn branch_mode_collision_precedes_property_construction_and_old_forms_are_syntax
         "SHOW BRANCHES IN TABLE t;",
     ] {
         assert!(
-            matches!(
-                trino_parser::parse_statement(source),
-                Err(ParserError::Parse(_))
-            ),
+            matches!(parser::parse_statement(source), Err(ParserError::Parse(_))),
             "{source}",
         );
     }

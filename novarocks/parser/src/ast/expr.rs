@@ -64,7 +64,6 @@ pub enum Expr {
     Unary(UnaryExpr),
     Binary(BinaryExpr),
     Logical(LogicalExpr),
-    LegacyParenthesized(super::LegacyParenthesizedExpr),
     Predicated(AstBox<super::PredicatedExpr>),
     InList(AstBox<super::InListExpr>),
     Exists(AstBox<super::ExistsExpr>),
@@ -72,7 +71,6 @@ pub enum Expr {
     SimpleCase(AstBox<super::SimpleCaseExpr>),
     Unique(AstBox<super::UniqueExpr>),
     Cast(AstBox<super::CastExpr>),
-    LegacyInterval(super::LegacyIntervalExpr),
     Subquery(SubqueryExpr),
     Row(RowExpr),
     Array(ArrayExpr),
@@ -126,7 +124,6 @@ impl Expr {
             Self::Unary(expression) => expression.span,
             Self::Binary(expression) => expression.span,
             Self::Logical(expression) => expression.span,
-            Self::LegacyParenthesized(expression) => expression.span,
             Self::InList(expression) => expression.span,
             Self::Predicated(expression) => expression.span,
             Self::Exists(expression) => expression.span,
@@ -134,7 +131,6 @@ impl Expr {
             Self::SimpleCase(node) => node.span,
             Self::Unique(node) => node.span,
             Self::Cast(expression) => expression.span,
-            Self::LegacyInterval(expression) => expression.span,
             Self::Subquery(expression) => expression.span,
             Self::Row(expression) => expression.span,
             Self::Array(expression) => expression.span,
@@ -193,7 +189,6 @@ pub enum IntervalField {
     Hour,
     Minute,
     Second,
-    Legacy(super::legacy::IntervalField),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -261,7 +256,6 @@ pub enum UnaryOperator {
     Not,
     Plus,
     Minus,
-    Legacy(super::legacy::UnaryOperator),
 }
 
 /// Infix operators initially recognized by the Pratt parser.
@@ -272,7 +266,6 @@ pub enum BinaryOperator {
     Multiply,
     Divide,
     Modulo,
-    Legacy(super::legacy::BinaryOperator),
 }
 
 /// One positional or named function argument with its original expression.

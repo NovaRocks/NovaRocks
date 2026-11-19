@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Source-sized syntax uses the ordinary test thread through the whole lifecycle.
 use novarocks_parser::ast::*;
-use novarocks_parser::{Span, trino_parser, trino_printer};
+use novarocks_parser::{Span, parser, printer};
 
 #[derive(Default)]
 struct Count {
@@ -20,8 +20,8 @@ impl Visit for Count {
 }
 
 fn expression_lifecycle(original: Expr, expected: usize) {
-    let printed = trino_printer::print_expression(&original).unwrap();
-    let reparsed = trino_parser::parse_expression(&printed).unwrap();
+    let printed = printer::print_expression(&original).unwrap();
+    let reparsed = parser::parse_expression(&printed).unwrap();
     let cloned = reparsed.clone();
     assert!(original.syntax_eq(&reparsed));
     assert!(reparsed.syntax_eq(&cloned));
@@ -37,7 +37,7 @@ fn expression_lifecycle(original: Expr, expected: usize) {
 fn parentheses_and_function_calls_complete_the_full_lifecycle_on_the_default_thread() {
     for depth in [1_000, 10_000] {
         let source = format!("{}1{}", "(".repeat(depth), ")".repeat(depth));
-        let parsed = trino_parser::parse_expression(&source).unwrap();
+        let parsed = parser::parse_expression(&source).unwrap();
         assert!(
             matches!(&parsed, Expr::Literal(value) if value.span == Span::new(depth, depth + 1))
         );
@@ -45,7 +45,7 @@ fn parentheses_and_function_calls_complete_the_full_lifecycle_on_the_default_thr
     }
     let depth = 5_000;
     let source = format!("{}1{}", "f(".repeat(depth), ")".repeat(depth));
-    let parsed = trino_parser::parse_expression(&source).unwrap();
+    let parsed = parser::parse_expression(&source).unwrap();
     let mut cursor = &parsed;
     for index in 0..depth {
         let Expr::FunctionCall(call) = cursor else {
@@ -73,9 +73,9 @@ fn parentheses_and_function_calls_complete_the_full_lifecycle_on_the_default_thr
 fn nested_subqueries_keep_every_real_query_through_print_walk_clone_and_drop() {
     let depth = 200;
     let source = format!("{}SELECT 1{}", "SELECT (".repeat(depth), ")".repeat(depth));
-    let original = trino_parser::parse_query(&source).unwrap();
-    let printed = trino_printer::print_query(&original).unwrap();
-    let reparsed = trino_parser::parse_query(&printed).unwrap();
+    let original = parser::parse_query(&source).unwrap();
+    let printed = printer::print_query(&original).unwrap();
+    let reparsed = parser::parse_query(&printed).unwrap();
     let cloned = reparsed.clone();
     assert!(syntax_eq_query(&original, &reparsed));
     assert!(syntax_eq_query(&reparsed, &cloned));
@@ -94,7 +94,7 @@ fn long_or_source_remains_one_ordered_multi_term_node_through_the_full_lifecycle
     let source = std::iter::repeat_n("x", terms)
         .collect::<Vec<_>>()
         .join(" OR ");
-    let original = trino_parser::parse_expression(&source).unwrap();
+    let original = parser::parse_expression(&source).unwrap();
     let Expr::Logical(logical) = &original else {
         panic!()
     };
@@ -110,7 +110,7 @@ fn long_union_all_source_remains_flat_and_ordered_through_the_full_lifecycle() {
         .map(|index| format!("SELECT {index}"))
         .collect::<Vec<_>>()
         .join(" UNION ALL ");
-    let original = trino_parser::parse_query(&source).unwrap();
+    let original = parser::parse_query(&source).unwrap();
     let SetExpr::SetOperation(union) = original.body.as_ref() else {
         panic!()
     };
@@ -128,8 +128,8 @@ fn long_union_all_source_remains_flat_and_ordered_through_the_full_lifecycle() {
             matches!(&column.expression, Expr::Literal(Literal { kind: LiteralKind::Long { parsed_value, .. }, .. }) if *parsed_value == index as i64)
         );
     }
-    let printed = trino_printer::print_query(&original).unwrap();
-    let reparsed = trino_parser::parse_query(&printed).unwrap();
+    let printed = printer::print_query(&original).unwrap();
+    let reparsed = parser::parse_query(&printed).unwrap();
     let cloned = reparsed.clone();
     assert!(syntax_eq_query(&original, &reparsed));
     assert!(syntax_eq_query(&reparsed, &cloned));

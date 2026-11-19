@@ -16,10 +16,10 @@
 // under the License.
 
 use novarocks_parser::ast::*;
-use novarocks_parser::{Span, trino_parser, trino_printer};
+use novarocks_parser::{Span, parser, printer};
 
 fn query(source: &str) -> Query {
-    trino_parser::parse_query(source).expect(source)
+    parser::parse_query(source).expect(source)
 }
 
 fn select(query: &Query) -> &Select {
@@ -105,12 +105,12 @@ fn permute_without_a_top_level_comma_uses_the_nonreserved_variable() {
         ("PERMUTE(A{1,3})", "PERMUTE A{1,3}"),
         ("PERMUTE(PERMUTE(A,B))", "PERMUTE PERMUTE(A,B)"),
     ] {
-        let original = trino_parser::parse_row_pattern(source).unwrap();
-        let canonical = trino_parser::parse_row_pattern(canonical).unwrap();
+        let original = parser::parse_row_pattern(source).unwrap();
+        let canonical = parser::parse_row_pattern(canonical).unwrap();
         assert!(original.syntax_eq(&canonical), "{source}");
     }
     let source = "PERMUTE(A{1,3},B)";
-    let permutation = trino_parser::parse_row_pattern(source).unwrap();
+    let permutation = parser::parse_row_pattern(source).unwrap();
     assert!(
         matches!(&permutation, RowPattern::Permutation { patterns, .. } if patterns.len() == 2)
     );
@@ -403,14 +403,14 @@ fn trino_pattern_grammar_and_constructor_failures_remain_errors() {
     ] {
         let source =
             format!("SELECT * FROM t MATCH_RECOGNIZE (PATTERN ({pattern}) DEFINE A AS TRUE)");
-        assert!(trino_parser::parse_query(&source).is_err(), "{source}");
+        assert!(parser::parse_query(&source).is_err(), "{source}");
     }
     for source in [
         "SELECT * FROM t MATCH_RECOGNIZE (PATTERN(A))",
         "SELECT * FROM t MATCH_RECOGNIZE (PATTERN(A) DEFINE)",
         "SELECT * FROM t MATCH_RECOGNIZE (PATTERN(A) SUBSET S=() DEFINE A AS TRUE)",
     ] {
-        assert!(trino_parser::parse_query(source).is_err(), "{source}");
+        assert!(parser::parse_query(source).is_err(), "{source}");
     }
 }
 
@@ -447,7 +447,7 @@ fn trino_pattern_related_coverage_rows_use_the_actual_new_query_entry() {
             index + 1
         );
         assert!(
-            trino_parser::parse_query(&super::coverage::sample(columns[5])).is_ok(),
+            parser::parse_query(&super::coverage::sample(columns[5])).is_ok(),
             "coverage line {}: {}",
             index + 1,
             columns[5]
@@ -492,7 +492,7 @@ fn trino_pattern_new_printer_roundtrips_every_retained_fact() {
         "SELECT sum(?) OVER (MEASURES ? AS m ROWS BETWEEN ? PRECEDING AND CURRENT ROW EXCLUDE TIES AFTER MATCH SKIP PAST LAST ROW PATTERN(A??) DEFINE A AS ?)",
     ] {
         let parsed = query(source);
-        let rendered = trino_printer::print_query(&parsed).unwrap();
+        let rendered = printer::print_query(&parsed).unwrap();
         let reparsed = query(&rendered);
         assert!(syntax_eq_query(&parsed, &reparsed), "{source}\n{rendered}");
     }

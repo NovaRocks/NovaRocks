@@ -757,10 +757,7 @@ fn routine_external_definition_is_exact_opaque_content_and_not_expression_childr
 }
 
 fn query_with_functions(functions: Vec<FunctionSpecification>) -> crate::ast::Query {
-    let mut statements = crate::parse("SELECT 1").unwrap();
-    let crate::ast::Statement::Query(mut query) = statements.remove(0) else {
-        panic!("query");
-    };
+    let mut query = crate::parser::parse_query("SELECT 1").unwrap();
     query.functions = functions.into();
     query
 }
@@ -819,7 +816,7 @@ fn statement_validation_reaches_nested_routine_body_and_property_expressions() {
         span: Span::new(700, 711),
     };
     let valid = query_with_functions(vec![function(RoutineBody::Sql(ret("valid")))]);
-    crate::ast::validate_statement(&crate::ast::Statement::Query(valid)).unwrap();
+    crate::ast::validate_statement(&crate::ast::TrinoStatement::Query(valid)).unwrap();
     let body = RoutineBody::Sql(ControlStatement::Compound(CompoundStatement {
         variable_declarations: Vec::new(),
         statements: (vec![ControlStatement::While(WhileStatement {
@@ -837,7 +834,7 @@ fn statement_validation_reaches_nested_routine_body_and_property_expressions() {
     }));
     let query = query_with_functions(vec![function(body)]);
     assert_eq!(
-        crate::ast::validate_statement(&crate::ast::Statement::Query(query)).unwrap_err(),
+        crate::ast::validate_statement(&crate::ast::TrinoStatement::Query(query)).unwrap_err(),
         expected,
         "the validator must traverse Query.functions, compound, while, and RETURN"
     );
@@ -852,7 +849,7 @@ fn statement_validation_reaches_nested_routine_body_and_property_expressions() {
     }];
     let query = query_with_functions(vec![function]);
     assert_eq!(
-        crate::ast::validate_statement(&crate::ast::Statement::Query(query)).unwrap_err(),
+        crate::ast::validate_statement(&crate::ast::TrinoStatement::Query(query)).unwrap_err(),
         expected,
         "routine property expressions are not a validation blind spot"
     );

@@ -17,20 +17,10 @@
 
 use novarocks_parser::{Span, StructuralViolation, ValidateError, ast::*, build, printer};
 fn query(source: &str) -> Query {
-    let mut parsed = novarocks_parser::parse(source).unwrap();
-    let Statement::Query(query) = parsed.remove(0) else {
-        panic!("query")
-    };
-    query
+    novarocks_parser::parser::parse_query(source).unwrap()
 }
-fn from(query: &Query) -> &Relation {
-    let SetExpr::Select(select) = query.body.as_ref() else {
-        panic!("select")
-    };
-    select.from.as_ref().unwrap()
-}
-fn statement(relation: Relation) -> Statement {
-    Statement::Query(build::query(SetExpr::Select(AstBox::new(
+fn statement(relation: Relation) -> TrinoStatement {
+    TrinoStatement::Query(build::query(SetExpr::Select(AstBox::new(
         build::select(vec![build::wildcard()], Some(relation), None, None).unwrap(),
     ))))
 }
@@ -40,96 +30,6 @@ fn table(name: &str) -> Relation {
         None,
         None,
     )
-}
-
-#[test]
-fn old_relation_producers_keep_real_names_join_precedence_alias_scopes_and_legacy_call_facts() {
-    let parsed = query("SELECT * FROM a, b LEFT OUTER JOIN c ON b.k=c.k");
-    let Relation::Join(comma) = from(&parsed) else {
-        panic!("comma tree")
-    };
-    assert_eq!(comma.kind, JoinType::Implicit);
-    assert!(matches!(comma.left.as_ref(),Relation::Table(node)if node.name.parts[0].value=="a"));
-    let Relation::Join(left) = comma.right.as_ref() else {
-        panic!("explicit join binds before comma")
-    };
-    assert_eq!(left.kind, JoinType::Left);
-    assert!(matches!(left.criteria, Some(JoinCriteria::On(_))));
-    let source = "SELECT * FROM (SELECT 7) AS s(x)";
-    let parsed = query(source);
-    let Relation::Aliased(alias) = from(&parsed) else {
-        panic!("alias")
-    };
-    assert_eq!(alias.alias.value, "s");
-    assert_eq!(alias.column_names.as_ref().unwrap()[0].value, "x");
-    let Relation::TableSubquery(sub) = alias.relation.as_ref() else {
-        panic!("shared subquery payload")
-    };
-    assert_eq!(&source[sub.span.start()..sub.span.end()], "(SELECT 7)");
-    assert_eq!(
-        &source[sub.query.span.start()..sub.query.span.end()],
-        "SELECT 7"
-    );
-    for source in ["SELECT * FROM t$future", "SELECT * FROM `t$future`"] {
-        let parsed = query(source);
-        let Relation::Table(t) = from(&parsed) else {
-            panic!("whole table name")
-        };
-        assert_eq!(t.name.parts[0].value, "t$future");
-        assert_eq!(t.name.parts[0].quoted, source.contains('`'));
-    }
-    for (source, operator) in [
-        (
-            "SELECT * FROM a CROSS JOIN b ON hidden=1",
-            legacy::JoinOperator::Cross,
-        ),
-        (
-            "SELECT * FROM a INNER JOIN b",
-            legacy::JoinOperator::InnerExplicit,
-        ),
-        (
-            "SELECT * FROM a LEFT SEMI JOIN b ON a.k=b.k",
-            legacy::JoinOperator::LeftSemi,
-        ),
-    ] {
-        let parsed = query(source);
-        let Relation::Join(join) = from(&parsed) else {
-            panic!("join")
-        };
-        assert_eq!(join.kind, JoinType::Legacy(operator));
-        validate_statement(&Statement::Query(parsed)).unwrap();
-    }
-    let source = "SELECT * FROM TABLE(generate_series(end=>5,start=2)) AS g";
-    let parsed = query(source);
-    let Relation::Aliased(alias) = from(&parsed) else {
-        panic!("whole invocation alias")
-    };
-    let Relation::TableFunction(call) = alias.relation.as_ref() else {
-        panic!("typed invocation")
-    };
-    assert_eq!(call.arguments.len(), 2);
-    assert_eq!(call.arguments[0].name.as_ref().unwrap().value, "end");
-    assert!(call.arguments[1].name.is_none());
-    assert!(matches!(
-        &call.arguments[1].value,
-        TableFunctionArgumentValue::Expression(Expr::Predicated(_))
-    ));
-    assert_eq!(
-        &source[call.arguments[0].span.start()..call.arguments[0].span.end()],
-        "end=>5"
-    );
-    for source in [
-        "SELECT * FROM TABLE(f(DISTINCT 1))",
-        "SELECT * FROM TABLE(1)",
-    ] {
-        let parsed = query(source);
-        assert!(matches!(from(&parsed), Relation::LegacyTableFunction(_)));
-    }
-    let parsed = query("SELECT * FROM LATERAL (SELECT 7) AS s");
-    let Relation::Aliased(alias) = from(&parsed) else {
-        panic!("lateral alias")
-    };
-    assert!(matches!(alias.relation.as_ref(), Relation::Lateral(_)));
 }
 
 #[test]
@@ -262,11 +162,12 @@ fn complete_pattern_relation_reuses_ordering_and_pattern_authors_without_losing_
     assert_eq!(seen.mode, original.mode);
     let statement = statement(Relation::PatternRecognition(AstBox::new(node)));
     validate_statement(&statement).unwrap();
-    let printed = printer::print_statement(&statement);
-    assert!(printed.contains("TABLESAMPLE SYSTEM (10)"));
-    assert!(printed.contains("NULLS") == false);
-    assert!(printed.contains("SEEK PATTERN (`A`)"));
-    assert!(printed.contains("DEFINE `A` AS 90"));
+    assert!(matches!(
+        printer::print_statement(&statement),
+        Err(printer::PrintError::Unrepresentable {
+            fact: "computed PIVOT column outside qualifiedName grammar",
+        })
+    ));
 }
 
 #[test]
@@ -288,16 +189,6 @@ fn public_relation_invariants_and_optional_cte_columns_preserve_real_constructor
             ..
         })
     ));
-    let legacy = statement(build::join(
-        table("a"),
-        JoinType::Legacy(legacy::JoinOperator::Cross),
-        table("b"),
-        Some(JoinCriteria::On(JoinOn {
-            expression: build::boolean(true),
-            span,
-        })),
-    ));
-    validate_statement(&legacy).unwrap();
     let invalid = statement(Relation::Table(AstBox::new(Table {
         name: build::object_name(vec![build::ident("a", false)]).unwrap(),
         query_period: Some(QueryPeriod {
@@ -335,6 +226,6 @@ fn public_relation_invariants_and_optional_cte_columns_preserve_real_constructor
         span,
     };
     let query = build::query(SetExpr::Table(AstBox::new(table)));
-    validate_statement(&Statement::Query(query.clone())).unwrap();
-    assert_eq!(printer::print_query(&query), "TABLE actual");
+    validate_statement(&TrinoStatement::Query(query.clone())).unwrap();
+    assert_eq!(printer::print_query(&query).unwrap(), "TABLE actual");
 }

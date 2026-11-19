@@ -16,7 +16,7 @@
 // under the License.
 
 use novarocks_parser::ast::*;
-use novarocks_parser::trino_parser::{parse_expression, parse_query};
+use novarocks_parser::parser::{parse_expression, parse_query};
 use novarocks_parser::{ParseError, ParserError, Span};
 
 fn parameter(expression: &Expr) -> &Parameter {
@@ -663,7 +663,7 @@ fn every_existing_json_grammar_coverage_sample_reaches_the_new_query_parser() {
 #[test]
 fn json_constructor_and_nonreserved_function_alternatives_keep_their_own_facts() {
     use novarocks_parser::ast::*;
-    use novarocks_parser::trino_parser::parse_expression;
+    use novarocks_parser::parser::parse_expression;
     assert!(matches!(
         parse_expression("JSON(?)").unwrap(),
         Expr::JsonConstructor(_)
@@ -706,7 +706,7 @@ fn json_constructor_and_nonreserved_function_alternatives_keep_their_own_facts()
 #[test]
 fn json_constructor_trial_restores_events_before_a_complete_function_follow() {
     use novarocks_parser::ast::*;
-    use novarocks_parser::trino_parser::parse_expression;
+    use novarocks_parser::parser::parse_expression;
     let Expr::FunctionCall(filtered) = parse_expression("JSON(?) FILTER (WHERE ?)").unwrap() else {
         panic!("ordinary filtered call")
     };

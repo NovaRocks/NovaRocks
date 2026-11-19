@@ -593,17 +593,6 @@ impl GroupingOperation {
 mod tests;
 
 impl GroupingOperation {
-    /// The legacy parser can move an original leaf when the pinned name
-    /// construction would preserve its value and delimiter fact.
-    pub(crate) fn legacy_identifier_is_canonical(part: &Ident) -> bool {
-        let value = &part.value;
-        !value.is_empty()
-            && value
-                .bytes()
-                .all(|byte| (byte.is_ascii_graphic() || byte == b' ') && !byte.is_ascii_uppercase())
-            && part.quoted != grouping_identifier_is_unquoted(value)
-    }
-
     /// Apply this node's QualifiedName-to-expression canonical construction.
     /// This is not the general ObjectName parser or name-resolution policy.
     pub fn new(

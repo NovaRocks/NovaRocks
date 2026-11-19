@@ -19,13 +19,10 @@
 //! values preserve their original AST facts without source lexing.
 //! These pure tests need no fixture or process and run with the parser package.
 
-use novarocks_parser::{SYNTHETIC, Span, ast::*, build, parse, printer::print_query};
+use novarocks_parser::{SYNTHETIC, Span, ast::*, build, printer::print_query};
 
 fn query(source: &str) -> Query {
-    let Statement::Query(query) = parse(source).unwrap().remove(0) else {
-        panic!("query")
-    };
-    query
+    novarocks_parser::parser::parse_query(source).unwrap()
 }
 fn selected(query: &Query) -> &Select {
     let SetExpr::Select(select) = query.body.as_ref() else {
@@ -33,8 +30,8 @@ fn selected(query: &Query) -> &Select {
     };
     select
 }
-fn row_query(rows: Vec<Expr>) -> Statement {
-    Statement::Query(build::query(SetExpr::Values(Values {
+fn row_query(rows: Vec<Expr>) -> TrinoStatement {
+    TrinoStatement::Query(build::query(SetExpr::Values(Values {
         rows: rows.into(),
         span: Span::new(0, 1),
     })))
@@ -42,8 +39,8 @@ fn row_query(rows: Vec<Expr>) -> Statement {
 
 #[test]
 fn projection_producers_preserve_distinct_alias_names_targets_and_source_spans() {
-    let implicit = query("SELECT ALL 1 `label`, `catalog`.t.*, *");
-    let explicit = query("SELECT 1 AS `label`, `catalog`.t.*, *");
+    let implicit = query("SELECT ALL 1 \"label\", \"catalog\".t.*, *");
+    let explicit = query("SELECT 1 AS \"label\", \"catalog\".t.*, *");
     assert!(implicit.syntax_eq(&explicit));
     let select = selected(&implicit);
     assert!(!select.distinct);
@@ -77,8 +74,8 @@ fn projection_producers_preserve_distinct_alias_names_targets_and_source_spans()
     let distinct = query("SELECT DISTINCT 1 AS x");
     assert!(selected(&distinct).distinct);
     assert!(!implicit.syntax_eq(&distinct));
-    let rendered = print_query(&implicit);
-    assert_eq!(rendered, "SELECT 1 AS `label`, `catalog`.t.*, *");
+    let rendered = print_query(&implicit).unwrap();
+    assert_eq!(rendered, "SELECT 1 AS \"label\", \"catalog\".t.*, *");
     assert!(implicit.syntax_eq(&query(&rendered)));
     assert!(
         matches!(&selected(&query("SELECT 1")).projection[0],SelectItem::SingleColumn(column) if column.alias.is_none())
@@ -87,13 +84,13 @@ fn projection_producers_preserve_distinct_alias_names_targets_and_source_spans()
 
 #[test]
 fn values_rows_keep_outer_envelopes_inner_rows_and_original_borrowed_cells() {
-    let source = "VALUES (1), (ROW(2, 3))";
+    let source = "VALUES ROW(1), ROW(ROW(2, 3))";
     let parsed = query(source);
     let SetExpr::Values(values) = parsed.body.as_ref() else {
         panic!("VALUES")
     };
     assert_eq!(values.rows.len(), 2);
-    for (index, text) in ["(1)", "(ROW(2, 3))"].into_iter().enumerate() {
+    for (index, text) in ["ROW(1)", "ROW(ROW(2, 3))"].into_iter().enumerate() {
         let Expr::Row(row) = &values.rows[index] else {
             panic!("true outer row")
         };
@@ -158,8 +155,8 @@ fn values_rows_keep_outer_envelopes_inner_rows_and_original_borrowed_cells() {
         span: Span::new(0, 2),
     })]))
     .unwrap();
-    assert!(parse("VALUES ()").is_err());
-    assert!(parsed.syntax_eq(&query(&print_query(&parsed))));
+    assert!(novarocks_parser::parser::parse_query("VALUES ()").is_err());
+    assert!(parsed.syntax_eq(&query(&print_query(&parsed).unwrap())));
 }
 
 #[test]
@@ -231,13 +228,13 @@ fn projection_hooks_keep_real_children_and_strict_target_alias_facts() {
     node.aliases.swap(0, 1);
     assert!(!item.syntax_eq(&moved));
     let mut select = build::select(vec![item], None, None, None).unwrap();
-    validate_statement(&Statement::Query(build::query(SetExpr::Select(
+    validate_statement(&TrinoStatement::Query(build::query(SetExpr::Select(
         AstBox::new(select.clone()),
     ))))
     .unwrap();
     select.projection.clear();
     assert!(
-        validate_statement(&Statement::Query(build::query(SetExpr::Select(
+        validate_statement(&TrinoStatement::Query(build::query(SetExpr::Select(
             AstBox::new(select)
         ))))
         .is_err()

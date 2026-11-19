@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 use novarocks_parser::ast::SyntaxEq;
-use novarocks_parser::{trino_parser, trino_printer};
+use novarocks_parser::{parser, printer};
 
 #[test]
 fn trino_printer_literal_and_type_facts_survive_public_roundtrip() {
@@ -18,9 +18,9 @@ fn trino_printer_literal_and_type_facts_survive_public_roundtrip() {
         "\"decimal\" '1.25'",
         "INTERVAL - '2.3' SECOND(02,09)",
     ] {
-        let original = trino_parser::parse_expression(source).unwrap();
-        let printed = trino_printer::print_expression(&original).unwrap();
-        let reparsed = trino_parser::parse_expression(&printed).unwrap();
+        let original = parser::parse_expression(source).unwrap();
+        let printed = printer::print_expression(&original).unwrap();
+        let reparsed = parser::parse_expression(&printed).unwrap();
         assert!(original.syntax_eq(&reparsed), "{source:?} -> {printed:?}");
     }
     for source in [
@@ -32,9 +32,9 @@ fn trino_printer_literal_and_type_facts_survive_public_roundtrip() {
         "INTERVAL DAY(2) TO SECOND(9)",
         "INTEGER ARRAY[184467440737095516160] ARRAY",
     ] {
-        let original = trino_parser::parse_type(source).unwrap();
-        let printed = trino_printer::print_type(&original).unwrap();
-        let reparsed = trino_parser::parse_type(&printed).unwrap();
+        let original = parser::parse_type(source).unwrap();
+        let printed = printer::print_type(&original).unwrap();
+        let reparsed = parser::parse_type(&printed).unwrap();
         assert!(original.syntax_eq(&reparsed), "{source:?} -> {printed:?}");
     }
 }
@@ -64,9 +64,9 @@ fn trino_printer_expression_children_and_optional_facts_survive_public_roundtrip
         "\"if\"(x, y)",
         "RUNNING f(DISTINCT x, a => y ORDER BY z DESC NULLS FIRST) FILTER (WHERE TRUE) IGNORE NULLS OVER (PARTITION BY x ORDER BY y ROWS BETWEEN 2 PRECEDING AND CURRENT ROW)",
     ] {
-        let original = trino_parser::parse_expression(source).unwrap();
-        let printed = trino_printer::print_expression(&original).unwrap();
-        let reparsed = trino_parser::parse_expression(&printed).unwrap();
+        let original = parser::parse_expression(source).unwrap();
+        let printed = printer::print_expression(&original).unwrap();
+        let reparsed = parser::parse_expression(&printed).unwrap();
         assert!(original.syntax_eq(&reparsed), "{source:?} -> {printed:?}");
     }
 }
@@ -84,25 +84,25 @@ fn trino_printer_query_wrappers_counts_and_ordering_survive_public_roundtrip() {
         "SELECT sum(x) OVER win FROM t WINDOW win AS (ORDER BY y)",
         "SELECT sum(x) OVER (ORDER BY y ROWS CURRENT ROW) FROM t LIMIT ALL",
     ] {
-        let original = trino_parser::parse_query(source).unwrap();
-        let printed = trino_printer::print_query(&original).unwrap();
-        let reparsed = trino_parser::parse_query(&printed).unwrap();
+        let original = parser::parse_query(source).unwrap();
+        let printed = printer::print_query(&original).unwrap();
+        let reparsed = parser::parse_query(&printed).unwrap();
         assert!(original.syntax_eq(&reparsed), "{source:?} -> {printed:?}");
     }
-    let absent = trino_parser::parse_query("SELECT 1 FETCH FIRST ROWS ONLY").unwrap();
-    let one = trino_parser::parse_query("SELECT 1 FETCH FIRST 1 ROWS ONLY").unwrap();
+    let absent = parser::parse_query("SELECT 1 FETCH FIRST ROWS ONLY").unwrap();
+    let one = parser::parse_query("SELECT 1 FETCH FIRST 1 ROWS ONLY").unwrap();
     assert!(!absent.syntax_eq(&one));
     for value in [absent, one] {
-        let printed = trino_printer::print_query(&value).unwrap();
-        let reparsed = trino_parser::parse_query(&printed).unwrap();
+        let printed = printer::print_query(&value).unwrap();
+        let reparsed = parser::parse_query(&printed).unwrap();
         assert!(value.syntax_eq(&reparsed), "{printed}");
     }
 }
 
 fn parameter_query_roundtrip(source: &str) -> String {
-    let original = trino_parser::parse_query(source).unwrap();
-    let printed = trino_printer::print_query(&original).unwrap();
-    let reparsed = trino_parser::parse_query(&printed).unwrap();
+    let original = parser::parse_query(source).unwrap();
+    let printed = printer::print_query(&original).unwrap();
+    let reparsed = parser::parse_query(&printed).unwrap();
     assert!(
         original.syntax_eq(&reparsed),
         "{source} -> {printed}\n{original:?}\n{reparsed:?}"
@@ -133,14 +133,14 @@ fn parameter_positions_choose_inverse_position_without_reversing_ordinary_strpos
 fn parameter_gaps_duplicates_and_component_offsets_have_typed_source_errors() {
     use novarocks_parser::Span;
     use novarocks_parser::ast::*;
-    use novarocks_parser::trino_printer::PrintError;
+    use novarocks_parser::printer::PrintError;
     for source in [
         "SELECT IF(?, ? ORDER BY ?), ?",
         "SELECT COALESCE(?, ? ORDER BY ?), ?",
     ] {
-        let original = trino_parser::parse_query(source).unwrap();
+        let original = parser::parse_query(source).unwrap();
         let first = source.find('?').unwrap();
-        assert!(matches!(trino_printer::print_query(&original),
+        assert!(matches!(printer::print_query(&original),
             Err(PrintError::ParameterPosition { expected: 0, actual: 1, span })
                 if span == Span::new(first, first + 1)));
         let SetExpr::Select(select) = original.body.as_ref() else {
@@ -160,7 +160,7 @@ fn parameter_gaps_duplicates_and_component_offsets_have_typed_source_errors() {
         assert!(matches!(first, Expr::Parameter(value) if value.position == 1));
     }
     let source = "SELECT ?, ? + ?";
-    let query = trino_parser::parse_query(source).unwrap();
+    let query = parser::parse_query(source).unwrap();
     let SetExpr::Select(select) = query.body.as_ref() else {
         panic!()
     };
@@ -168,7 +168,7 @@ fn parameter_gaps_duplicates_and_component_offsets_have_typed_source_errors() {
         panic!()
     };
     assert!(matches!(
-        trino_printer::print_expression(&column.expression),
+        printer::print_expression(&column.expression),
         Err(PrintError::ParameterPosition {
             expected: 0,
             actual: 1,
@@ -177,7 +177,7 @@ fn parameter_gaps_duplicates_and_component_offsets_have_typed_source_errors() {
     ));
 
     let source = "SELECT ? + ?";
-    let mut query = trino_parser::parse_query(source).unwrap();
+    let mut query = parser::parse_query(source).unwrap();
     let SetExpr::Select(select) = query.body.as_mut() else {
         panic!()
     };
@@ -192,7 +192,7 @@ fn parameter_gaps_duplicates_and_component_offsets_have_typed_source_errors() {
     };
     right.position = 0;
     let last = source.rfind('?').unwrap();
-    assert!(matches!(trino_printer::print_query(&query),
+    assert!(matches!(printer::print_query(&query),
         Err(PrintError::ParameterPosition { expected: 1, actual: 0, span })
             if span == Span::new(last, last + 1)));
 
@@ -204,8 +204,8 @@ fn parameter_gaps_duplicates_and_component_offsets_have_typed_source_errors() {
 #[test]
 fn construction_ledger_rejects_permutations_that_a_global_set_cannot_detect() {
     use novarocks_parser::ast::*;
-    use novarocks_parser::trino_printer::PrintError;
-    let mut query = trino_parser::parse_query("SELECT ? + ?").unwrap();
+    use novarocks_parser::printer::PrintError;
+    let mut query = parser::parse_query("SELECT ? + ?").unwrap();
     let SetExpr::Select(select) = query.body.as_mut() else {
         panic!()
     };
@@ -224,7 +224,7 @@ fn construction_ledger_rejects_permutations_that_a_global_set_cannot_detect() {
     };
     right.position = 0;
     assert!(matches!(
-        trino_printer::print_query(&query),
+        printer::print_query(&query),
         Err(PrintError::ParameterPosition {
             expected: 0,
             actual: 1,
@@ -233,7 +233,7 @@ fn construction_ledger_rejects_permutations_that_a_global_set_cannot_detect() {
     ));
 
     let source = "SELECT strpos((? + ?), (? * ?))";
-    let mut interleaved = trino_parser::parse_query(source).unwrap();
+    let mut interleaved = parser::parse_query(source).unwrap();
     let SetExpr::Select(select) = interleaved.body.as_mut() else {
         panic!()
     };
@@ -258,11 +258,11 @@ fn construction_ledger_rejects_permutations_that_a_global_set_cannot_detect() {
     };
     value.position = 1;
     let start = source.find("? + ?").unwrap();
-    assert!(matches!(trino_printer::print_query(&interleaved),
+    assert!(matches!(printer::print_query(&interleaved),
         Err(PrintError::ParameterOrder { span })
             if span == novarocks_parser::Span::new(start, start + "? + ?".len())));
 
-    let mut query = trino_parser::parse_query("SELECT f(?) FILTER (WHERE ?)").unwrap();
+    let mut query = parser::parse_query("SELECT f(?) FILTER (WHERE ?)").unwrap();
     let SetExpr::Select(select) = query.body.as_mut() else {
         panic!()
     };
@@ -281,7 +281,7 @@ fn construction_ledger_rejects_permutations_that_a_global_set_cannot_detect() {
     };
     filter.position = 1;
     assert!(matches!(
-        trino_printer::print_query(&query),
+        printer::print_query(&query),
         Err(PrintError::ParameterPosition {
             expected: 0,
             actual: 1,
@@ -306,9 +306,9 @@ fn construction_ledger_preserves_real_nontext_builder_orders() {
 
 #[test]
 fn row_pattern_component_keeps_quantifier_questions_out_of_parameter_events() {
-    let original = trino_parser::parse_row_pattern("A?? B{01,2} | PERMUTE(C,D)").unwrap();
-    let printed = trino_printer::print_row_pattern(&original).unwrap();
-    let reparsed = trino_parser::parse_row_pattern(&printed).unwrap();
+    let original = parser::parse_row_pattern("A?? B{01,2} | PERMUTE(C,D)").unwrap();
+    let printed = printer::print_row_pattern(&original).unwrap();
+    let reparsed = parser::parse_row_pattern(&printed).unwrap();
     assert!(original.syntax_eq(&reparsed), "{printed}");
 }
 
@@ -316,10 +316,10 @@ fn row_pattern_component_keeps_quantifier_questions_out_of_parameter_events() {
 fn non_grammar_empty_and_all_rows_facts_return_typed_errors() {
     use novarocks_parser::SYNTHETIC;
     use novarocks_parser::ast::*;
-    use novarocks_parser::trino_printer::PrintError;
+    use novarocks_parser::printer::PrintError;
     let all = Expr::AllRows(AllRows { span: SYNTHETIC });
     assert!(matches!(
-        trino_printer::print_expression(&all),
+        printer::print_expression(&all),
         Err(PrintError::Unrepresentable { .. })
     ));
     let row = Expr::Row(RowExpr {
@@ -327,16 +327,16 @@ fn non_grammar_empty_and_all_rows_facts_return_typed_errors() {
         span: SYNTHETIC,
     });
     assert!(matches!(
-        trino_printer::print_expression(&row),
+        printer::print_expression(&row),
         Err(PrintError::Unrepresentable { .. })
     ));
-    let mut query = trino_parser::parse_query("VALUES 1").unwrap();
+    let mut query = parser::parse_query("VALUES 1").unwrap();
     let SetExpr::Values(values) = query.body.as_mut() else {
         panic!()
     };
     values.rows.clear();
     assert!(matches!(
-        trino_printer::print_query(&query),
+        printer::print_query(&query),
         Err(PrintError::Unrepresentable { .. })
     ));
     parameter_query_roundtrip("SELECT 1 LIMIT ALL");

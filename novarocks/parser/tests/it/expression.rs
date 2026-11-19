@@ -16,7 +16,7 @@
 // under the License.
 
 use novarocks_parser::ast::*;
-use novarocks_parser::{ParseError, ParserError, Span, trino_parser::parse_expression};
+use novarocks_parser::{ParseError, ParserError, Span, parser::parse_expression};
 
 #[test]
 fn arithmetic_and_concat_follow_the_value_grammar_and_keep_true_operand_extent() {
@@ -216,7 +216,7 @@ fn deeply_nested_parentheses_and_calls_use_the_default_test_thread_stack() {
     ));
     let calls = format!("{}1{}", "f(".repeat(5_000), ")".repeat(5_000));
     let parsed = parse_expression(&calls).unwrap();
-    let printed = novarocks_parser::trino_printer::print_expression(&parsed).unwrap();
+    let printed = novarocks_parser::printer::print_expression(&parsed).unwrap();
     let reparsed = parse_expression(&printed).unwrap();
     assert!(parsed.syntax_eq(&reparsed));
     drop(reparsed);
@@ -289,7 +289,7 @@ fn parenthesized_query_and_expression_alternatives_preserve_the_complete_context
                 "{source}"
             );
         }
-        let printed = novarocks_parser::trino_printer::print_expression(&expression).unwrap();
+        let printed = novarocks_parser::printer::print_expression(&expression).unwrap();
         assert!(
             expression.syntax_eq(&parse_expression(&printed).unwrap()),
             "{source} -> {printed}"
@@ -359,7 +359,7 @@ fn array_and_subscript_bind_as_distinct_primary_and_postfix_nodes() {
 
 #[test]
 fn parenthesized_values_accepts_a_bare_array_in_its_row() {
-    use novarocks_parser::trino_parser::parse_query;
+    use novarocks_parser::parser::parse_query;
     let actual = parse_query("SELECT x[1] FROM (VALUES ROW([11,12])) AS t(x)").unwrap();
     let explicit = parse_query("SELECT x[1] FROM (VALUES ROW(ARRAY[11,12])) AS t(x)").unwrap();
     assert!(syntax_eq_query(&actual, &explicit));

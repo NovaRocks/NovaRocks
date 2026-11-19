@@ -16,7 +16,7 @@
 // under the License.
 
 use novarocks_parser::ast::*;
-use novarocks_parser::trino_parser::parse_expression;
+use novarocks_parser::parser::parse_expression;
 use novarocks_parser::{ParseError, ParserError, SYNTHETIC, Span};
 
 fn call(expression: &Expr) -> &FunctionCall {

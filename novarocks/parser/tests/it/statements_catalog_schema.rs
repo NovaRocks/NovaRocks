@@ -3,15 +3,15 @@
 use novarocks_parser::ast::{
     Expr, Literal, LiteralKind, StatementPrincipalKind, SyntaxEq, TrinoStatement,
 };
-use novarocks_parser::{trino_parser, trino_printer};
+use novarocks_parser::{parser, printer};
 
 fn roundtrip(source: &str) -> TrinoStatement {
     let original =
-        trino_parser::parse_statement(source).unwrap_or_else(|error| panic!("{source}: {error}"));
-    let printed = trino_printer::print_statement(&original)
-        .unwrap_or_else(|error| panic!("{original:?}: {error}"));
-    let reparsed = trino_parser::parse_statement(&printed)
-        .unwrap_or_else(|error| panic!("{printed}: {error}"));
+        parser::parse_statement(source).unwrap_or_else(|error| panic!("{source}: {error}"));
+    let printed =
+        printer::print_statement(&original).unwrap_or_else(|error| panic!("{original:?}: {error}"));
+    let reparsed =
+        parser::parse_statement(&printed).unwrap_or_else(|error| panic!("{printed}: {error}"));
     assert!(original.syntax_eq(&reparsed), "{source}\n{printed}");
     original
 }
@@ -133,6 +133,6 @@ fn catalog_and_schema_reject_non_grammar_statement_suffixes() {
         "DROP CATALOG c; DROP CATALOG d",
         "CREATE SCHEMA s;",
     ] {
-        assert!(trino_parser::parse_statement(source).is_err(), "{source}");
+        assert!(parser::parse_statement(source).is_err(), "{source}");
     }
 }

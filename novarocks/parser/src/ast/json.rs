@@ -260,6 +260,10 @@ pub struct JsonTablePlanSiblings {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "JSON_TABLE columns are kept contiguous in AstVec with guarded recursive owners"
+)]
 pub enum JsonTableColumn {
     Ordinality(JsonTableOrdinalityColumn),
     Value(JsonTableValueColumn),

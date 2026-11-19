@@ -3,15 +3,15 @@
 use novarocks_parser::ast::{
     self, Expr, SetExpr, SyntaxEq, TrinoInsertMode, TrinoStatement, Visit,
 };
-use novarocks_parser::{Span, trino_parser, trino_printer};
+use novarocks_parser::{Span, parser, printer};
 
 fn source_text(sql: &str, span: Span) -> &str {
     &sql[span.start()..span.end()]
 }
 
 fn assert_round_trip(sql: &str, statement: &TrinoStatement) -> String {
-    let printed = trino_printer::print_statement(statement).unwrap();
-    let reparsed = trino_parser::parse_statement(&printed).unwrap();
+    let printed = printer::print_statement(statement).unwrap();
+    let reparsed = parser::parse_statement(&printed).unwrap();
     assert!(statement.syntax_eq(&reparsed), "{sql} became {printed}");
     printed
 }
@@ -21,7 +21,7 @@ fn insert_target_columns_and_query_use_their_own_source_ranges() {
     let sql = r#" /* preceding */ INSERT INTO ice.s.t@"audit-branch" ("ID", link)
         /* query starts after this comment */ WITH q AS (SELECT ?)
         SELECT ? FROM q /* following */ "#;
-    let statement = trino_parser::parse_statement(sql).unwrap();
+    let statement = parser::parse_statement(sql).unwrap();
     let TrinoStatement::Insert(node) = &statement else {
         panic!("expected INSERT");
     };
@@ -52,7 +52,7 @@ fn insert_target_columns_and_query_use_their_own_source_ranges() {
     assert!(printed.contains(r#"ice.s.t@"audit-branch" ("ID", link)"#));
 
     let sql = "INSERT INTO t (SELECT ?) UNION ALL SELECT ?";
-    let statement = trino_parser::parse_statement(sql).unwrap();
+    let statement = parser::parse_statement(sql).unwrap();
     let TrinoStatement::Insert(node) = &statement else {
         panic!("expected INSERT");
     };
@@ -105,7 +105,7 @@ fn overwrite_is_contextual_and_keeps_its_two_distinct_modes() {
             "overwrite",
         ),
     ] {
-        let statement = trino_parser::parse_statement(sql).unwrap();
+        let statement = parser::parse_statement(sql).unwrap();
         let TrinoStatement::Insert(node) = &statement else {
             panic!("expected INSERT");
         };
@@ -129,7 +129,7 @@ fn overwrite_is_contextual_and_keeps_its_two_distinct_modes() {
             false,
         ),
     ] {
-        let statement = trino_parser::parse_statement(sql).unwrap();
+        let statement = parser::parse_statement(sql).unwrap();
         let TrinoStatement::Insert(node) = &statement else {
             panic!("expected INSERT");
         };
@@ -143,16 +143,15 @@ fn overwrite_is_contextual_and_keeps_its_two_distinct_modes() {
         assert_round_trip(sql, &statement);
     }
 
-    let whole = trino_parser::parse_statement("INSERT OVERWRITE t SELECT 1").unwrap();
-    let partitions =
-        trino_parser::parse_statement("INSERT OVERWRITE PARTITIONS t SELECT 1").unwrap();
+    let whole = parser::parse_statement("INSERT OVERWRITE t SELECT 1").unwrap();
+    let partitions = parser::parse_statement("INSERT OVERWRITE PARTITIONS t SELECT 1").unwrap();
     assert!(!whole.syntax_eq(&partitions));
 }
 
 #[test]
 fn update_assignments_and_delete_keep_branch_and_parameter_facts() {
     let sql = r#"UPDATE c.s.t@"dev branch" SET "where" = ?, b = (WITH q AS (SELECT ?) SELECT ?) WHERE id = ?"#;
-    let statement = trino_parser::parse_statement(sql).unwrap();
+    let statement = parser::parse_statement(sql).unwrap();
     let TrinoStatement::Update(node) = &statement else {
         panic!("expected UPDATE");
     };
@@ -174,7 +173,7 @@ fn update_assignments_and_delete_keep_branch_and_parameter_facts() {
     assert!(printed.contains(r#"@"dev branch" SET "where" = ?"#));
 
     let sql = "DELETE FROM c.s.t@dev WHERE id IN (WITH q AS (SELECT ?) SELECT ?)";
-    let statement = trino_parser::parse_statement(sql).unwrap();
+    let statement = parser::parse_statement(sql).unwrap();
     let TrinoStatement::Delete(node) = &statement else {
         panic!("expected DELETE");
     };
@@ -185,7 +184,7 @@ fn update_assignments_and_delete_keep_branch_and_parameter_facts() {
     assert_round_trip(sql, &statement);
 
     for sql in ["DELETE FROM c.s.t", "UPDATE c.s.t SET id = 1"] {
-        let statement = trino_parser::parse_statement(sql).unwrap();
+        let statement = parser::parse_statement(sql).unwrap();
         match &statement {
             TrinoStatement::Delete(delete) => assert!(delete.predicate.is_none()),
             TrinoStatement::Update(update) => assert!(update.predicate.is_none()),
@@ -219,7 +218,7 @@ fn write_leaf_rejects_forms_outside_the_grammar_and_two_extensions() {
         "UPDATE t AS a SET id = 1",
         "UPDATE t SET id = 1 FROM s",
     ] {
-        assert!(trino_parser::parse_statement(sql).is_err(), "{sql}");
+        assert!(parser::parse_statement(sql).is_err(), "{sql}");
     }
 }
 

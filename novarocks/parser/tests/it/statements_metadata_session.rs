@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use novarocks_parser::ast::{Expr, Parameter, SyntaxEq, TrinoStatement, Visit};
-use novarocks_parser::{ParserError, trino_parser, trino_printer};
+use novarocks_parser::{ParserError, parser, printer};
 
 fn roundtrip(source: &str) -> TrinoStatement {
     let statement =
-        trino_parser::parse_statement(source).unwrap_or_else(|error| panic!("{source}: {error}"));
-    let rendered = trino_printer::print_statement(&statement).unwrap();
-    let reparsed = trino_parser::parse_statement(&rendered).unwrap();
+        parser::parse_statement(source).unwrap_or_else(|error| panic!("{source}: {error}"));
+    let rendered = printer::print_statement(&statement).unwrap();
+    let reparsed = parser::parse_statement(&rendered).unwrap();
     assert!(statement.syntax_eq(&reparsed), "{source}\n{rendered}");
     statement
 }
@@ -95,7 +95,7 @@ fn describe_synonyms_preserve_the_show_columns_shape_and_original_table_spans() 
         );
         assert_eq!(node.span.end(), source.len());
         assert_eq!(
-            trino_printer::print_statement(&statement).unwrap(),
+            printer::print_statement(&statement).unwrap(),
             r#"SHOW COLUMNS FROM lake."t.1""#
         );
     }
@@ -155,7 +155,7 @@ fn set_time_zone_keeps_the_local_choice_and_original_expression_parameters() {
     };
     assert!(matches!(&node.time_zone, Some(Expr::Identifier(ident)) if !ident.quoted));
     assert_eq!(
-        trino_printer::print_statement(&identifier).unwrap(),
+        printer::print_statement(&identifier).unwrap(),
         "SET TIME ZONE (LOCAL)"
     );
 
@@ -204,10 +204,7 @@ fn malformed_metadata_and_session_text_is_a_syntax_error() {
         "SHOW COLUMNS FROM t;",
     ] {
         assert!(
-            matches!(
-                trino_parser::parse_statement(source),
-                Err(ParserError::Parse(_))
-            ),
+            matches!(parser::parse_statement(source), Err(ParserError::Parse(_))),
             "{source}"
         );
     }

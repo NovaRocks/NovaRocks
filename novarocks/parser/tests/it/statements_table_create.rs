@@ -4,15 +4,15 @@ use novarocks_parser::ast::{
     Expr, LikePropertiesOption, Literal, LiteralKind, StatementSaveMode, SyntaxEq, TrinoStatement,
     TrinoTableElement,
 };
-use novarocks_parser::{ParseError, ParserError, trino_parser, trino_printer};
+use novarocks_parser::{ParseError, ParserError, parser, printer};
 
 fn roundtrip(source: &str) -> TrinoStatement {
     let original =
-        trino_parser::parse_statement(source).unwrap_or_else(|error| panic!("{source}: {error}"));
-    let printed = trino_printer::print_statement(&original)
-        .unwrap_or_else(|error| panic!("{original:?}: {error}"));
-    let reparsed = trino_parser::parse_statement(&printed)
-        .unwrap_or_else(|error| panic!("{printed}: {error}"));
+        parser::parse_statement(source).unwrap_or_else(|error| panic!("{source}: {error}"));
+    let printed =
+        printer::print_statement(&original).unwrap_or_else(|error| panic!("{original:?}: {error}"));
+    let reparsed =
+        parser::parse_statement(&printed).unwrap_or_else(|error| panic!("{printed}: {error}"));
     assert!(original.syntax_eq(&reparsed), "{source}\n{printed}");
     original
 }
@@ -95,7 +95,7 @@ fn table_statement_modes_and_like_options_remain_distinct() {
         TrinoStatement::CreateTable(node) if node.save_mode == StatementSaveMode::Replace
     ));
     let source = "  CREATE OR REPLACE TABLE IF NOT EXISTS t (id bigint)";
-    let error = trino_parser::parse_statement(source).unwrap_err();
+    let error = parser::parse_statement(source).unwrap_err();
     let ParserError::Parse(ParseError::UnexpectedToken { span, found, .. }) = error else {
         panic!("expected a save-mode syntax error");
     };
@@ -135,6 +135,6 @@ fn drop_and_analyze_preserve_original_shape_and_reject_legacy_suffixes() {
         "DROP TABLE t FORCE",
         "ANALYZE TABLE t (id)",
     ] {
-        assert!(trino_parser::parse_statement(source).is_err(), "{source}");
+        assert!(parser::parse_statement(source).is_err(), "{source}");
     }
 }

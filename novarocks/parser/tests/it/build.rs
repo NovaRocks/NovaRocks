@@ -26,19 +26,11 @@ use novarocks_parser::{
 };
 
 fn expression(source: &str) -> Expr {
-    let tokens = novarocks_parser::lex(source).expect("expression must lex");
-    novarocks_parser::parser::parse_expression(source, &tokens).expect("expression must parse")
+    novarocks_parser::parser::parse_expression(source).expect("expression must parse")
 }
 
 fn query(source: &str) -> ast::Query {
-    let mut statements = novarocks_parser::parse(source).expect("query must parse");
-    let [ast::Statement::Query(_)] = statements.as_slice() else {
-        panic!("expected exactly one query");
-    };
-    let ast::Statement::Query(query) = statements.pop().expect("one query") else {
-        unreachable!();
-    };
-    query
+    novarocks_parser::parser::parse_query(source).unwrap()
 }
 
 fn name(value: &str) -> ast::ObjectName {
@@ -73,8 +65,8 @@ fn select_body(value: i64) -> SetExpr {
 fn query_suffixes_keep_specification_and_parenthesized_owners_distinct() {
     use ast::{Literal, LiteralKind, Visit};
     for source in [
-        "SELECT 11 ORDER BY 1 LIMIT 5 OFFSET 2",
-        "WITH c AS (SELECT 11) SELECT 13 ORDER BY 1 LIMIT 5 OFFSET 2",
+        "SELECT 11 ORDER BY 1 OFFSET 2 LIMIT 5",
+        "WITH c AS (SELECT 11) SELECT 13 ORDER BY 1 OFFSET 2 LIMIT 5",
     ] {
         let parsed = query(source);
         assert!(parsed.modifiers.is_empty());
@@ -84,19 +76,23 @@ fn query_suffixes_keep_specification_and_parenthesized_owners_distinct() {
         assert_eq!(select.modifiers.order_by.as_ref().unwrap().items.len(), 1);
         assert!(select.modifiers.limit.is_some());
         assert!(select.modifiers.offset.is_some());
-        ast::validate_statement(&ast::Statement::Query(parsed.clone())).unwrap();
-        assert!(parsed.syntax_eq(&query(&novarocks_parser::printer::print_query(&parsed))));
+        ast::validate_statement(&ast::TrinoStatement::Query(parsed.clone())).unwrap();
+        assert!(parsed.syntax_eq(&query(
+            &novarocks_parser::printer::print_query(&parsed).unwrap()
+        )));
     }
     for source in [
-        "VALUES (11) ORDER BY 1 LIMIT 5 OFFSET 2",
-        "SELECT 11 UNION ALL SELECT 13 ORDER BY 1 LIMIT 5 OFFSET 2",
-        "(SELECT 11 ORDER BY 1 LIMIT 7 OFFSET 3) ORDER BY 1 LIMIT 5 OFFSET 2",
+        "VALUES (11) ORDER BY 1 OFFSET 2 LIMIT 5",
+        "SELECT 11 UNION ALL SELECT 13 ORDER BY 1 OFFSET 2 LIMIT 5",
+        "(SELECT 11 ORDER BY 1 OFFSET 3 LIMIT 7) ORDER BY 1 OFFSET 2 LIMIT 5",
     ] {
         let parsed = query(source);
         assert_eq!(parsed.modifiers.order_by.as_ref().unwrap().items.len(), 1);
         assert!(parsed.modifiers.limit.is_some());
         assert!(parsed.modifiers.offset.is_some());
-        assert!(parsed.syntax_eq(&query(&novarocks_parser::printer::print_query(&parsed))));
+        assert!(parsed.syntax_eq(&query(
+            &novarocks_parser::printer::print_query(&parsed).unwrap()
+        )));
     }
     #[derive(Default)]
     struct Numbers(Vec<String>);
@@ -110,7 +106,7 @@ fn query_suffixes_keep_specification_and_parenthesized_owners_distinct() {
             }
         }
     }
-    let mut parsed = query("(SELECT 11 ORDER BY 1 LIMIT 7 OFFSET 3) ORDER BY 1 LIMIT 5 OFFSET 2");
+    let mut parsed = query("(SELECT 11 ORDER BY 1 OFFSET 3 LIMIT 7) ORDER BY 1 OFFSET 2 LIMIT 5");
     let mut numbers = Numbers::default();
     numbers.visit_query(&parsed);
     assert_eq!(numbers.0, ["11", "1", "7", "3", "1", "5", "2"]);
@@ -121,7 +117,7 @@ fn query_suffixes_keep_specification_and_parenthesized_owners_distinct() {
         panic!("SELECT")
     };
     inner.query.modifiers = std::mem::take(&mut select.modifiers);
-    let error = ast::validate_statement(&ast::Statement::Query(parsed)).unwrap_err();
+    let error = ast::validate_statement(&ast::TrinoStatement::Query(parsed)).unwrap_err();
     assert!(matches!(
         error,
         novarocks_parser::ValidateError::InvalidStructure {
@@ -168,13 +164,13 @@ fn query_session_assignments_preserve_names_values_and_traversal() {
     assert_eq!(facts.names, ["iceberg", "property"]);
     assert_eq!(facts.numbers, ["5", "1"]);
     assert_eq!(
-        novarocks_parser::printer::print_query(&built),
+        novarocks_parser::printer::print_query(&built).unwrap(),
         "WITH SESSION iceberg.property = 5 SELECT 1"
     );
     let mut union = build::query(build::union_all(vec![select_body(1), select_body(2)]).unwrap());
     union.session_properties = built.session_properties.clone();
     assert_eq!(
-        novarocks_parser::printer::print_query(&union),
+        novarocks_parser::printer::print_query(&union).unwrap(),
         "WITH SESSION iceberg.property = 5 SELECT 1 UNION ALL SELECT 2"
     );
 
@@ -205,11 +201,11 @@ fn query_session_assignments_preserve_names_values_and_traversal() {
 #[test]
 fn identifiers_literals_and_unary_nodes_match_parser_shapes() {
     assert_expression(id("field"), "field");
-    assert_expression(build::identifier(build::ident("a b", true)), "`a b`");
-    assert_expression(build::identifier(build::ident("a`b", true)), "`a``b`");
+    assert_expression(build::identifier(build::ident("a b", true)), "\"a b\"");
+    assert_expression(build::identifier(build::ident("a`b", true)), "\"a`b\"");
     assert_expression(
         build::column(build::ident("a", false), build::ident("k1", true)),
-        "a.`k1`",
+        "a.\"k1\"",
     );
     for value in [
         "0",
@@ -227,12 +223,11 @@ fn identifiers_literals_and_unary_nodes_match_parser_shapes() {
     }
     assert_expression(build::integer(i64::MIN), "-9223372036854775808");
     assert_expression(build::integer(i64::MAX), "9223372036854775807");
-    assert_expression(build::string("a\\b'c"), "'a\\\\b''c'");
+    assert_expression(build::string("a\\b'c"), "'a\\b''c'");
     assert_expression(build::binary_literal(vec![0xAB, 1]), "X'AB01'");
     assert_expression(build::boolean(true), "TRUE");
     assert_expression(build::boolean(false), "FALSE");
     assert_expression(build::null(), "NULL");
-    assert_expression(build::legacy_nested(id("x")), "(x)");
     assert_expression(build::not(id("x")), "NOT x");
     assert_expression(
         build::unary(ast::UnaryOperator::Minus, build::integer(1)).expect("signed integer"),
@@ -242,14 +237,7 @@ fn identifiers_literals_and_unary_nodes_match_parser_shapes() {
         build::unary(ast::UnaryOperator::Minus, build::integer(-1)).expect("nested minus"),
         "- -1",
     );
-    assert_expression(
-        build::unary(
-            ast::UnaryOperator::Legacy(ast::legacy::UnaryOperator::BitwiseNot),
-            id("x"),
-        )
-        .expect("bitwise not"),
-        "~x",
-    );
+
     assert!(matches!(
         build::number("9223372036854775808"),
         Err(BuildError::Number(_))
@@ -286,12 +274,9 @@ fn one_field_value_tuples_remain_distinct_from_source_parentheses() {
     assert_eq!(row.fields[0].expression, field.clone());
     assert_eq!(row.fields[0].span, field.span());
     assert_eq!(row.span, SYNTHETIC);
-    let source_parentheses = build::tuple(vec![field.clone()]).expect("source parentheses");
-    let Expr::LegacyParenthesized(nested) = source_parentheses else {
-        panic!("source parentheses retain their Nested shape");
-    };
-    assert_eq!(*nested.expression, field);
-    assert_eq!(nested.span, SYNTHETIC);
+    let source_parentheses = expression("(7)");
+    assert!(source_parentheses.syntax_eq(&build::integer(7)));
+    assert!(!Expr::Row(row).syntax_eq(&source_parentheses));
 }
 
 #[test]
@@ -323,7 +308,7 @@ fn type_nodes_preserve_nested_arguments_without_comma_trivia() {
     );
     assert_expression(
         build::cast(build::null(), map),
-        "CAST(NULL AS MAP<STRING, ARRAY<STRUCT<`a b` INT>>>)",
+        "CAST(NULL AS MAP(STRING, ARRAY(ROW(\"a b\" INT))))",
     );
 }
 
@@ -357,12 +342,9 @@ fn expression_combinations_match_parser_without_reparsing_children() {
         "[1, NULL]",
     );
     assert_expression(build::array(Vec::new()), "[]");
+    assert_expression(build::integer(1), "(1)");
     assert_expression(
-        build::tuple(vec![build::integer(1)]).expect("single parentheses"),
-        "(1)",
-    );
-    assert_expression(
-        build::tuple(vec![build::integer(1), build::string("x")]).expect("tuple"),
+        build::tuple_value(vec![build::integer(1), build::string("x")]).expect("tuple"),
         "ROW(1, 'x')",
     );
     assert_expression(
@@ -455,8 +437,8 @@ fn select_relation_aliases_and_grouping_match_parser() {
     .expect("nonempty SELECT");
     let built = build::query(SetExpr::Select(novarocks_parser::ast::AstBox::new(select)));
     let parsed = query(
-        "SELECT s.k1 AS k, COUNT(*) n FROM `cat`.`db`.`source` FOR VERSION AS OF 'branch\\\\tail' AS s \
-         LEFT JOIN (VALUES (1)) v(k1) ON s.k1 = v.k1 WHERE s.k1 IS NOT NULL GROUP BY s.k1",
+        "SELECT s.k1 AS k, COUNT(*) n FROM \"cat\".\"db\".\"source\" FOR VERSION AS OF 'branch\\tail' AS s \
+         LEFT JOIN (VALUES ROW(1)) v(k1) ON s.k1 = v.k1 WHERE s.k1 IS NOT NULL GROUP BY s.k1",
     );
     assert!(
         built.syntax_eq(&parsed),
@@ -539,7 +521,9 @@ fn union_all_preserves_input_order_and_set_boundaries() {
             panic!("set operation")
         };
         assert_eq!(operation.inputs.len(), 2, "{source}");
-        assert!(parsed.syntax_eq(&query(&novarocks_parser::printer::print_query(&parsed))));
+        assert!(parsed.syntax_eq(&query(
+            &novarocks_parser::printer::print_query(&parsed).unwrap()
+        )));
     }
 }
 
@@ -549,7 +533,6 @@ fn derived_expressions_retain_source_locations_and_envelopes_are_synthetic() {
     let source = build::identifier(build::ident_at("user_value", false, source_span));
     let cast = build::cast(source.clone(), build::simple_type("INT"));
     assert_eq!(cast.span(), source_span);
-    assert_eq!(build::legacy_nested(cast.clone()).span(), source_span);
     assert_eq!(build::not(source.clone()).span(), source_span);
     assert_eq!(build::is_null(source.clone(), true).span(), source_span);
     assert_eq!(
@@ -604,7 +587,7 @@ fn builders_reject_missing_required_structure() {
         build::case_when(Vec::new(), None),
         Err(BuildError::EmptyCase)
     );
-    assert_eq!(build::tuple(Vec::new()), Err(BuildError::EmptyTuple));
+    assert_eq!(build::tuple_value(Vec::new()), Err(BuildError::EmptyTuple));
     assert_eq!(build::tuple_value(Vec::new()), Err(BuildError::EmptyTuple));
     assert_eq!(build::union_all(Vec::new()), Err(BuildError::EmptyUnion));
     assert_eq!(
@@ -645,7 +628,7 @@ fn public_literals_retain_categories_decoded_bytes_and_numeric_facts() {
     );
     assert!(matches!(kinds[5], ast::LiteralKind::Decimal(value) if value == "-123.45"));
     assert!(matches!(kinds[6], ast::LiteralKind::Double(value) if value.get() == f64::INFINITY));
-    let rendered = novarocks_parser::printer::print_query(&parsed);
+    let rendered = novarocks_parser::printer::print_query(&parsed).unwrap();
     assert!(rendered.contains("DECIMAL '12345678901234567890123456789012345678'"));
     assert!(parsed.syntax_eq(&query(&rendered)));
     let compact = query("SELECT CAST(NULL AS DECIMAL(12,2))");
@@ -659,7 +642,7 @@ fn decimal_constructor_text_is_not_reinterpreted_as_an_unrelated_number_expressi
     // later numeric analyzer will reject its value. Printing is syntax-only.
     for value in ["", ".", "1..2", "1-2.3", "1+2.3", "-0.0", "+2.3", "1e0"] {
         let built = build::literal(ast::LiteralKind::Decimal(value.into()));
-        let rendered = novarocks_parser::printer::print_expr(&built);
+        let rendered = novarocks_parser::printer::print_expression(&built).unwrap();
         assert_eq!(rendered, format!("DECIMAL '{value}'"));
         assert!(built.syntax_eq(&expression(&rendered)));
     }
@@ -693,7 +676,9 @@ fn logical_nodes_keep_source_order_grouping_and_every_visitor_child() {
     struct Identity;
     impl Fold for Identity {}
     assert_eq!(Identity.fold_expr(parsed.clone()), parsed);
-    assert!(parsed.syntax_eq(&expression(&novarocks_parser::printer::print_expr(&parsed))));
+    assert!(parsed.syntax_eq(&expression(
+        &novarocks_parser::printer::print_expression(&parsed).unwrap()
+    )));
     let mut changed = parsed.clone();
     let Expr::Logical(value) = &mut changed else {
         unreachable!()
@@ -743,8 +728,8 @@ fn public_wide_logical_chains_are_flat_without_changing_order_or_literal_facts()
         let mut values = Values::default();
         values.visit_expr(&folded);
         assert_eq!(values.0, (0..20_000).collect::<Vec<i64>>());
-        let rendered = novarocks_parser::printer::print_expr(&parsed);
-        assert_eq!(rendered, source);
+        let rendered = novarocks_parser::printer::print_expression(&parsed).unwrap();
+        assert_eq!(rendered, format!("({source})"));
         assert!(parsed.syntax_eq(&expression(&rendered)));
     }
 }
@@ -765,7 +750,7 @@ fn logical_minimum_arity_is_checked_without_catalog_or_analysis() {
             }),
             None,
         );
-        let error = ast::validate_statement(&ast::Statement::Query(parsed)).unwrap_err();
+        let error = ast::validate_statement(&ast::TrinoStatement::Query(parsed)).unwrap_err();
         assert!(
             matches!(error, novarocks_parser::ValidateError::InvalidStructure { violation: novarocks_parser::StructuralViolation::InvalidLogicalTermCount, span: actual } if actual == span)
         );
@@ -804,15 +789,15 @@ fn actual_recursive_logical_storage_guards_clone_walk_fold_compare_validation_pr
     let mut count = Count(0);
     count.visit_expr(&node);
     assert_eq!(count.0, 20_000);
-    let rendered = novarocks_parser::printer::print_expr(&node);
+    let rendered = novarocks_parser::printer::print_expression(&node).unwrap();
     assert!(rendered.starts_with('('));
-    assert!(rendered.ends_with("FALSE"));
+    assert!(rendered.trim_end_matches(')').ends_with("FALSE"));
     let mut parsed = query("SELECT TRUE");
     let SetExpr::Select(select) = parsed.body.as_mut() else {
         unreachable!()
     };
     select.projection[0] = novarocks_parser::build::item(folded, None);
-    ast::validate_statement(&ast::Statement::Query(parsed)).unwrap();
+    ast::validate_statement(&ast::TrinoStatement::Query(parsed)).unwrap();
     drop(node);
 }
 
@@ -825,7 +810,7 @@ fn public_predicate_producers_print_and_reparse_without_losing_their_fields() {
         "a <= b",
         "a > b",
         "a >= b",
-        "a <=> b",
+        "a IS NOT DISTINCT FROM b",
         "a IS NOT DISTINCT FROM b",
         "a IS DISTINCT FROM b",
         "a BETWEEN 1 AND 3",
@@ -842,13 +827,13 @@ fn public_predicate_producers_print_and_reparse_without_losing_their_fields() {
         "(a + 1) >= 2 AND (b IS NULL OR c NOT IN (3, 4))",
     ] {
         let parsed = expression(source);
-        let rendered = novarocks_parser::printer::print_expr(&parsed);
+        let rendered = novarocks_parser::printer::print_expression(&parsed).unwrap();
         assert!(
             parsed.syntax_eq(&expression(&rendered)),
             "{source} -> {rendered}"
         );
     }
-    let nullsafe = expression("a <=> b");
+    let nullsafe = expression("a IS NOT DISTINCT FROM b");
     assert!(nullsafe.syntax_eq(&expression("a IS NOT DISTINCT FROM b")));
     assert!(!nullsafe.syntax_eq(&expression("a IS DISTINCT FROM b")));
     let Expr::Predicated(in_node) = expression("a NOT IN (1, 2)") else {
@@ -866,7 +851,7 @@ fn public_predicate_producers_print_and_reparse_without_losing_their_fields() {
         build::in_list(id("a"), Vec::new(), false),
         Err(BuildError::EmptyInList)
     ));
-    assert!(novarocks_parser::parse("SELECT a IN ()").is_err());
+    assert!(novarocks_parser::parser::parse_statement("SELECT a IN ()").is_err());
 }
 
 #[test]
@@ -877,11 +862,11 @@ fn distinct_from_in_projection_keeps_the_later_relation_boundary() {
         "SELECT a IS /* boundary */ NOT DISTINCT /* value */ FROM b AS result FROM t",
         "SELECT a IS DISTINCT FROM b, c IS NOT DISTINCT FROM d FROM t WHERE a IS DISTINCT FROM b",
     ] {
-        let parsed = novarocks_parser::parse(source).unwrap();
-        let rendered = novarocks_parser::printer::print_statement(&parsed[0]);
-        let reparsed = novarocks_parser::parse(&rendered).unwrap();
-        let (ast::Statement::Query(left), ast::Statement::Query(right)) =
-            (&parsed[0], &reparsed[0])
+        let parsed = novarocks_parser::parser::parse_statement(source).unwrap();
+        let rendered = novarocks_parser::printer::print_statement(&parsed).unwrap();
+        let reparsed = novarocks_parser::parser::parse_statement(&rendered).unwrap();
+        let (ast::TrinoStatement::Query(left), ast::TrinoStatement::Query(right)) =
+            (&parsed, &reparsed)
         else {
             panic!("query")
         };
@@ -900,11 +885,11 @@ fn control_producers_keep_branch_wrappers_safe_flags_and_declaration_spans() {
         "SELECT array_map((x, y) -> x + y, [1], [2])",
         "SELECT EXISTS (SELECT 1), NOT EXISTS (SELECT 2)",
     ] {
-        let parsed = novarocks_parser::parse(source).unwrap();
-        let rendered = novarocks_parser::printer::print_statement(&parsed[0]);
-        let reparsed = novarocks_parser::parse(&rendered).unwrap();
-        let (ast::Statement::Query(left), ast::Statement::Query(right)) =
-            (&parsed[0], &reparsed[0])
+        let parsed = novarocks_parser::parser::parse_statement(source).unwrap();
+        let rendered = novarocks_parser::printer::print_statement(&parsed).unwrap();
+        let reparsed = novarocks_parser::parser::parse_statement(&rendered).unwrap();
+        let (ast::TrinoStatement::Query(left), ast::TrinoStatement::Query(right)) =
+            (&parsed, &reparsed)
         else {
             panic!("query")
         };
@@ -943,12 +928,12 @@ fn control_producers_keep_branch_wrappers_safe_flags_and_declaration_spans() {
 
 #[test]
 fn delimited_identifiers_keep_decoded_value_flag_and_position_through_printing() {
-    use novarocks_parser::printer::print_expr;
+    use novarocks_parser::printer::print_expression;
     for (value, expected) in [
-        ("select", "`select`"),
-        ("名", "`名`"),
-        ("a`b", "`a``b`"),
-        ("a\"b", "`a\"b`"),
+        ("select", "\"select\""),
+        ("名", "\"名\""),
+        ("a`b", "\"a`b\""),
+        ("a\"b", "\"a\"\"b\""),
     ] {
         let source_span = Span::new(11, 23);
         let name = build::ident_at(value, true, source_span);
@@ -956,7 +941,7 @@ fn delimited_identifiers_keep_decoded_value_flag_and_position_through_printing()
         assert!(name.quoted);
         assert_eq!(name.span, source_span);
         let authored = build::identifier(name);
-        let rendered = print_expr(&authored);
+        let rendered = print_expression(&authored).unwrap();
         assert_eq!(rendered, expected);
         assert!(authored.syntax_eq(&expression(&rendered)));
     }
@@ -971,30 +956,4 @@ fn delimited_identifiers_keep_decoded_value_flag_and_position_through_printing()
     assert!(!ordered.syntax_eq(&reversed));
     assert!(ordered.parts[0].quoted);
     assert!(!ordered.parts[1].quoted);
-}
-
-#[test]
-fn old_input_identifier_delimiters_share_facts_without_reclassifying_strings() {
-    use novarocks_parser::printer::print_statement;
-    let source = "SELECT 1 AS \"a\"\"b\"";
-    let quoted = query(source);
-    let backtick = query("SELECT 1 AS `a\"b`");
-    assert!(quoted.syntax_eq(&backtick));
-    let SetExpr::Select(select) = quoted.body.as_ref() else {
-        panic!("SELECT");
-    };
-    let ast::SelectItem::SingleColumn(column) = &select.projection[0] else {
-        panic!("explicit alias");
-    };
-    let alias = column.alias.as_ref().expect("original alias");
-    assert_eq!(alias.value, "a\"b");
-    assert!(alias.quoted);
-    assert_eq!(alias.span, Span::new(12, source.len()));
-    let rendered = print_statement(&ast::Statement::Query(quoted.clone()));
-    assert_eq!(rendered, "SELECT 1 AS `a\"b`");
-    assert!(quoted.syntax_eq(&query(&rendered)));
-    let Expr::Literal(literal) = expression("\"a\"\"b\"") else {
-        panic!("old expression syntax still produces a String literal");
-    };
-    assert!(matches!(literal.kind, ast::LiteralKind::String(ref value) if value == "a\"b"));
 }

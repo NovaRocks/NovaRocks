@@ -16,7 +16,7 @@
 use super::*;
 use crate::ast::{
     DataTypeParameter, IntervalQualifier, IntervalQualifierField, NumericParameter, SetExpr,
-    SimpleIntervalQualifier, Statement, validate_statement,
+    SimpleIntervalQualifier, TrinoStatement, validate_statement,
 };
 use crate::{SYNTHETIC, build, printer};
 fn span() -> Span {
@@ -45,8 +45,8 @@ fn interval_type() -> IntervalDataType {
         }),
     }
 }
-fn statement(value: Expr) -> Statement {
-    Statement::Query(build::query(SetExpr::Select(AstBox::new(
+fn statement(value: Expr) -> TrinoStatement {
+    TrinoStatement::Query(build::query(SetExpr::Select(AstBox::new(
         build::select(vec![build::item(value, None)], None, None, None).unwrap(),
     ))))
 }
@@ -113,14 +113,14 @@ fn recursive_fixtures() -> Vec<Expr> {
 #[test]
 fn typed_roots_print_real_fields_and_preserve_span_ignored_syntax_facts() {
     let expected = [
-        "1 AT LOCAL",
-        "1 AT TIME ZONE 'UTC'",
-        "GROUPING (a.b, c)",
-        "trim(LEADING 'x' FROM ' xy ')",
+        "((1) AT LOCAL)",
+        "((1) AT TIME ZONE 'UTC')",
+        "GROUPING(a.b, c)",
+        "TRIM(LEADING 'x' FROM ' xy ')",
         "OVERLAY('abc' PLACING 'x' FROM 2 FOR 1)",
-        "((1 - 2) DAY(17))",
-        "(1).`m`(arg => 2)",
-        "cat.`Type`::run()",
+        "(((1) - (2)) DAY(17))",
+        "(1).\"m\"(arg => 2)",
+        "cat.\"Type\"::run()",
     ];
     let fixtures = recursive_fixtures();
     struct Preserve;
@@ -130,7 +130,7 @@ fn typed_roots_print_real_fields_and_preserve_span_ignored_syntax_facts() {
     }
     for (node, expected) in fixtures.iter().zip(expected) {
         assert_eq!(node.span(), span());
-        assert_eq!(printer::print_expr(node), expected);
+        assert_eq!(printer::print_expression(node).unwrap(), expected);
         assert!(node.syntax_eq(&node.clone()));
         validate_statement(&statement(node.clone())).unwrap();
     }
@@ -141,7 +141,7 @@ fn typed_roots_print_real_fields_and_preserve_span_ignored_syntax_facts() {
         ),
         (
             Expr::CurrentDate(CurrentDate { span: span() }),
-            "current_date",
+            "CURRENT_DATE",
         ),
         (
             Expr::CurrentPath(CurrentPath { span: span() }),
@@ -160,31 +160,31 @@ fn typed_roots_print_real_fields_and_preserve_span_ignored_syntax_facts() {
                 precision: Some(3),
                 span: span(),
             }),
-            "current_time(3)",
+            "CURRENT_TIME(3)",
         ),
         (
             Expr::CurrentTimestamp(CurrentTimestamp {
                 precision: None,
                 span: span(),
             }),
-            "current_timestamp",
+            "CURRENT_TIMESTAMP",
         ),
         (
             Expr::LocalTime(LocalTime {
                 precision: Some(0),
                 span: span(),
             }),
-            "localtime(0)",
+            "LOCALTIME(0)",
         ),
         (
             Expr::LocalTimestamp(LocalTimestamp {
                 precision: Some(9),
                 span: span(),
             }),
-            "localtimestamp(9)",
+            "LOCALTIMESTAMP(9)",
         ),
     ] {
-        assert_eq!(printer::print_expr(&node), expected);
+        assert_eq!(printer::print_expression(&node).unwrap(), expected);
         assert_eq!(node.span(), span());
         validate_statement(&statement(node)).unwrap();
     }
@@ -227,11 +227,12 @@ fn typed_roots_print_real_fields_and_preserve_span_ignored_syntax_facts() {
         build::integer(2),
     );
     assert_eq!(
-        printer::print_expr(&Expr::AtLocal(AstBox::new(AtLocal {
+        printer::print_expression(&Expr::AtLocal(AstBox::new(AtLocal {
             value: sum,
             span: span()
-        }))),
-        "(1 + 2) AT LOCAL"
+        })))
+        .unwrap(),
+        "(((1 + 2)) AT LOCAL)"
     );
     let negated = build::unary(
         crate::ast::UnaryOperator::Minus,
@@ -239,10 +240,11 @@ fn typed_roots_print_real_fields_and_preserve_span_ignored_syntax_facts() {
     )
     .unwrap();
     assert_eq!(
-        printer::print_expr(&Expr::AtTimeZone(AstBox::new(
+        printer::print_expression(&Expr::AtTimeZone(AstBox::new(
             AtTimeZone::new(negated, build::string("UTC"), span()).unwrap()
-        ))),
-        "(-x) AT TIME ZONE 'UTC'"
+        )))
+        .unwrap(),
+        "(((- (x))) AT TIME ZONE 'UTC')"
     );
     let right = build::binary(
         build::integer(2),
@@ -250,21 +252,19 @@ fn typed_roots_print_real_fields_and_preserve_span_ignored_syntax_facts() {
         build::integer(3),
     );
     assert_eq!(
-        printer::print_expr(&Expr::IntervalValueExpression(AstBox::new(
+        printer::print_expression(&Expr::IntervalValueExpression(AstBox::new(
             IntervalValueExpression {
                 left: build::integer(1),
                 right,
                 data_type: interval_type(),
                 span: span()
             }
-        ))),
-        "((1 - (2 + 3)) DAY(17))"
+        )))
+        .unwrap(),
+        "(((1) - ((2 + 3))) DAY(17))"
     );
-    // Ordinary old grammar calls retain the original generic producer.
-    let mut parsed = crate::parse("SELECT old_schema.fn(1), trim('x')").unwrap();
-    let Statement::Query(query) = parsed.remove(0) else {
-        unreachable!()
-    };
+    // Ordinary calls retain the generic producer.
+    let query = crate::parser::parse_query(r#"SELECT old_schema.fn(1), "trim"('x')"#).unwrap();
     let SetExpr::Select(select) = query.body.as_ref() else {
         unreachable!()
     };
@@ -322,7 +322,7 @@ fn exact_constructor_constraints_and_name_projection_do_not_infer_global_policy(
     );
     for column in [
         build::integer(1),
-        build::legacy_nested(build::identifier(id("x", false))),
+        build::integer(1),
         Expr::Dereference(AstBox::new(crate::ast::DereferenceExpr {
             base: build::identifier(id("label", false)),
             field: None,
@@ -339,7 +339,7 @@ fn exact_constructor_constraints_and_name_projection_do_not_infer_global_policy(
     }
     for zone in [
         build::integer(1),
-        build::legacy_nested(build::string("UTC")),
+        build::identifier(id("UTC", false)),
         Expr::CurrentDate(CurrentDate { span: span() }),
     ] {
         assert_eq!(
@@ -391,7 +391,11 @@ fn exact_constructor_constraints_and_name_projection_do_not_infer_global_policy(
         ] {
             validate_statement(&statement(node.clone())).unwrap();
             if let Some(precision) = precision {
-                assert!(printer::print_expr(&node).ends_with(&format!("({precision})")));
+                assert!(
+                    printer::print_expression(&node)
+                        .unwrap()
+                        .ends_with(&format!("({precision})"))
+                );
             }
         }
     }

@@ -18,10 +18,11 @@
 use novarocks_parser::{
     ParserError, Span, ValidateError,
     ast::{
-        AstVec, Query, Select, SetExpr, Statement, WindowDefinition, WindowFrame, WindowFrameBound,
-        WindowFrameExclusion, WindowFrameUnits, WindowSpecification, validate_statement,
+        AstVec, Query, Select, SetExpr, TrinoStatement, WindowDefinition, WindowFrame,
+        WindowFrameBound, WindowFrameExclusion, WindowFrameUnits, WindowSpecification,
+        validate_statement,
     },
-    parse,
+    parser::parse_statement,
 };
 use novarocks_user_error::ErrorPhase;
 
@@ -30,7 +31,8 @@ const SPAN: Span = Span::new(0, 1);
 #[test]
 fn public_parse_runs_validation_after_syntax_build() {
     let source = "WITH c AS (SELECT 1), C AS (SELECT 2) SELECT * FROM c";
-    let error = parse(source).expect_err("duplicate CTE names are a Validate error");
+    let statement = parse_statement(source).unwrap();
+    let error = ParserError::from(validate_statement(&statement).unwrap_err());
     let ParserError::Validate(ValidateError::DuplicateCteName { name, span }) = error else {
         panic!("expected typed duplicate CTE validation error");
     };
@@ -48,7 +50,7 @@ fn public_parse_runs_validation_after_syntax_build() {
 
 #[test]
 fn parser_failures_remain_in_parse_phase_before_validation() {
-    let error = parse("SELECT FROM t").expect_err("missing projection is syntax-invalid");
+    let error = parse_statement("SELECT FROM t").expect_err("missing projection is syntax-invalid");
     let ParserError::Parse(_) = error else {
         panic!("expected Parse error, got {error:?}");
     };
@@ -90,7 +92,7 @@ fn quoted_window_names_keep_their_syntax_identity() {
 #[test]
 fn construction_only_empty_lists_retain_the_generic_structure_code() {
     let mut statement = select_statement(Vec::new());
-    let Statement::Query(query) = &mut statement else {
+    let TrinoStatement::Query(query) = &mut statement else {
         unreachable!()
     };
     let SetExpr::Select(select) = query.body.as_mut() else {
@@ -173,8 +175,8 @@ fn impossible_unbounded_window_frame_endpoints_are_rejected() {
     }
 }
 
-fn select_statement(windows: Vec<WindowDefinition>) -> Statement {
-    Statement::Query(Query {
+fn select_statement(windows: Vec<WindowDefinition>) -> TrinoStatement {
+    TrinoStatement::Query(Query {
         session_properties: novarocks_parser::ast::AstVec::new(),
         functions: novarocks_parser::ast::AstVec::new(),
         with: None,
@@ -185,7 +187,6 @@ fn select_statement(windows: Vec<WindowDefinition>) -> Statement {
                 selection: None,
                 group_by: None,
                 having: None,
-                legacy: Default::default(),
                 windows: windows.into(),
                 modifiers: Default::default(),
                 span: SPAN,

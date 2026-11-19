@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Every accepted grammar witness keeps its full typed AST.
 use novarocks_parser::ast::SyntaxEq;
-use novarocks_parser::{trino_parser, trino_printer};
+use novarocks_parser::{parser, printer};
 
 fn check(rule: &str, source: &str) -> Result<(), String> {
     macro_rules! roundtrip {
@@ -18,27 +18,18 @@ fn check(rule: &str, source: &str) -> Result<(), String> {
         }};
     }
     match rule {
-        "standaloneExpression" => roundtrip!(
-            trino_parser::parse_expression,
-            trino_printer::print_expression
-        ),
-        "standaloneType" => roundtrip!(trino_parser::parse_type, trino_printer::print_type),
-        "standaloneRowPattern" => roundtrip!(
-            trino_parser::parse_row_pattern,
-            trino_printer::print_row_pattern
-        ),
+        "standaloneExpression" => roundtrip!(parser::parse_expression, printer::print_expression),
+        "standaloneType" => roundtrip!(parser::parse_type, printer::print_type),
+        "standaloneRowPattern" => roundtrip!(parser::parse_row_pattern, printer::print_row_pattern),
         "standaloneFunctionSpecification" => roundtrip!(
-            trino_parser::parse_function_specification,
-            trino_printer::print_function_specification
+            parser::parse_function_specification,
+            printer::print_function_specification
         ),
         "standalonePathSpecification" => roundtrip!(
-            trino_parser::parse_path_specification,
-            trino_printer::print_path_specification
+            parser::parse_path_specification,
+            printer::print_path_specification
         ),
-        _ => roundtrip!(
-            trino_parser::parse_statement,
-            trino_printer::print_statement
-        ),
+        _ => roundtrip!(parser::parse_statement, printer::print_statement),
     }
 }
 

@@ -38,7 +38,6 @@ pub enum Relation {
     TableFunction(AstBox<TableFunctionInvocation>),
     JsonTable(AstBox<JsonTable>),
     PatternRecognition(AstBox<PatternRecognitionRelation>),
-    LegacyTableFunction(AstBox<super::legacy::TableFunction>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -63,8 +62,6 @@ pub enum JoinType {
     Right,
     Full,
     Implicit,
-    /// Temporary old-parser vocabulary, removed with legacy lowering at P12.
-    Legacy(super::legacy::JoinOperator),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -291,7 +288,6 @@ pub fn walk_relation<V: Visit + ?Sized>(visitor: &mut V, node: &Relation) {
         Relation::TableFunction(value) => visitor.visit_table_function_invocation(value),
         Relation::JsonTable(value) => visitor.visit_json_table(value),
         Relation::PatternRecognition(value) => visitor.visit_pattern_recognition_relation(value),
-        Relation::LegacyTableFunction(value) => visitor.visit_legacy_table_function(value),
     }
 }
 
@@ -551,9 +547,6 @@ pub fn fold_relation<F: Fold + ?Sized>(folder: &mut F, node: Relation) -> Relati
         Relation::JsonTable(value) => {
             Relation::JsonTable(AstBox::new(folder.fold_json_table(value.into_inner())))
         }
-        Relation::LegacyTableFunction(value) => Relation::LegacyTableFunction(AstBox::new(
-            folder.fold_legacy_table_function(value.into_inner()),
-        )),
         Relation::PatternRecognition(value) => Relation::PatternRecognition(AstBox::new(
             folder.fold_pattern_recognition_relation(value.into_inner()),
         )),
@@ -866,7 +859,6 @@ impl SyntaxEq for Relation {
             (Self::TableFunction(a), Self::TableFunction(b)) => a.syntax_eq(b),
             (Self::JsonTable(a), Self::JsonTable(b)) => a.syntax_eq(b),
             (Self::PatternRecognition(a), Self::PatternRecognition(b)) => a.syntax_eq(b),
-            (Self::LegacyTableFunction(a), Self::LegacyTableFunction(b)) => a.syntax_eq(b),
             _ => false,
         }
     }
@@ -917,10 +909,7 @@ impl SyntaxEq for AliasedRelation {
     fn syntax_eq(&self, other: &Self) -> bool {
         self.relation.syntax_eq(&other.relation)
             && self.alias.syntax_eq(&other.alias)
-            && eq_optional_slice(
-                self.column_names.as_ref().map(|v| v.as_slice()),
-                other.column_names.as_ref().map(|v| v.as_slice()),
-            )
+            && eq_optional_slice(self.column_names.as_deref(), other.column_names.as_deref())
     }
 }
 
@@ -1176,29 +1165,6 @@ impl SyntaxEq for PatternRecognitionRelation {
             && eq_slice(&self.variable_definitions, &other.variable_definitions)
     }
 }
-#[recursive::recursive]
-pub fn walk_legacy_table_function<V: Visit + ?Sized>(
-    visitor: &mut V,
-    node: &super::legacy::TableFunction,
-) {
-    visitor.visit_expr(&node.expr);
-}
-#[recursive::recursive]
-pub fn fold_legacy_table_function<F: Fold + ?Sized>(
-    folder: &mut F,
-    mut node: super::legacy::TableFunction,
-) -> super::legacy::TableFunction {
-    node.expr = folder.fold_expr(node.expr);
-    node
-}
-impl SyntaxEq for super::legacy::TableFunction {
-    #[recursive::recursive]
-    fn syntax_eq(&self, other: &Self) -> bool {
-        self.lateral == other.lateral
-            && self.syntax == other.syntax
-            && self.expr.syntax_eq(&other.expr)
-    }
-}
 impl Relation {
     pub fn span(&self) -> Span {
         match self {
@@ -1214,7 +1180,6 @@ impl Relation {
             Self::TableFunction(n) => n.span,
             Self::JsonTable(n) => n.span,
             Self::PatternRecognition(n) => n.span,
-            Self::LegacyTableFunction(n) => n.span,
         }
     }
 }

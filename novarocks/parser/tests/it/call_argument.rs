@@ -18,8 +18,7 @@
 use novarocks_parser::{Span, StructuralViolation, ValidateError, ast::*, build, printer};
 
 fn expression(source: &str) -> Expr {
-    let tokens = novarocks_parser::lex(source).unwrap();
-    novarocks_parser::parser::parse_expression(source, &tokens).unwrap()
+    novarocks_parser::parser::parse_expression(source).unwrap()
 }
 fn id(value: &str, quoted: bool, start: usize) -> Ident {
     build::ident_at(value, quoted, Span::new(start, start + value.len()))
@@ -42,77 +41,12 @@ fn typed_call() -> Expr {
     call.filter = Some(value("predicate", 55));
     expr
 }
-fn statement(expr: Expr) -> Statement {
-    Statement::Query(build::query(SetExpr::Select(
+fn statement(expr: Expr) -> TrinoStatement {
+    TrinoStatement::Query(build::query(SetExpr::Select(
         novarocks_parser::ast::AstBox::new(
             build::select(vec![build::item(expr, None)], None, None, None).unwrap(),
         ),
     )))
-}
-
-#[test]
-fn old_producers_wrap_real_original_values_and_arg_spans_without_new_mode_or_names() {
-    let source = "f(`a`, g(2)) FILTER (WHERE flag)";
-    let expr = expression(source);
-    let Expr::FunctionCall(call) = &expr else {
-        panic!("call")
-    };
-    assert!(call.processing_mode.is_none());
-    assert_eq!(call.arguments.len(), 2);
-    for (argument, expected) in call.arguments.iter().zip(["`a`", "g(2)"]) {
-        assert!(argument.name.is_none());
-        assert_eq!(argument.span, argument.value.span());
-        assert_eq!(
-            &source[argument.span.start()..argument.span.end()],
-            expected
-        );
-    }
-    let filter = call.filter.as_ref().unwrap();
-    assert_eq!(&source[filter.span().start()..filter.span().end()], "flag");
-    let original = expression("items[3]");
-    let Expr::Subscript(subscript) = &original else {
-        panic!("subscript")
-    };
-    let original_payload = subscript.as_ref() as *const SubscriptExpr;
-    let source_span = original.span();
-    let built = build::function(
-        build::object_name(vec![build::ident("f", false)]).unwrap(),
-        vec![original],
-    );
-    let Expr::FunctionCall(call) = built else {
-        panic!("call")
-    };
-    let Expr::Subscript(subscript) = &call.arguments[0].value else {
-        panic!("original subtree")
-    };
-    assert_eq!(subscript.as_ref() as *const SubscriptExpr, original_payload);
-    assert_eq!(call.arguments[0].span, source_span);
-    assert!(call.arguments[0].name.is_none() && call.processing_mode.is_none());
-    // Table-function syntax now owns true named argument fields directly.
-    let source = "SELECT * FROM TABLE(generate_series(end => 5, start => 2))";
-    let parsed = novarocks_parser::parse(source).unwrap();
-    let Statement::Query(query) = &parsed[0] else {
-        panic!("query")
-    };
-    let SetExpr::Select(select) = query.body.as_ref() else {
-        panic!("select")
-    };
-    let Some(Relation::TableFunction(call)) = &select.from else {
-        panic!("table function")
-    };
-    for (argument, (name, value)) in call.arguments.iter().zip([("end", 5), ("start", 2)]) {
-        let name_node = argument.name.as_ref().unwrap();
-        assert_eq!(name_node.value, name);
-        assert_eq!(&source[name_node.span.start()..name_node.span.end()], name);
-        let TableFunctionArgumentValue::Expression(Expr::Literal(literal)) = &argument.value else {
-            panic!("real literal child")
-        };
-        assert!(matches!(literal.kind,LiteralKind::Long{parsed_value,..} if parsed_value==value));
-        assert_eq!(
-            &source[argument.span.start()..argument.span.end()],
-            format!("{name} => {value}")
-        );
-    }
 }
 
 #[test]
@@ -166,12 +100,12 @@ fn typed_named_arguments_and_processing_mode_preserve_hooks_original_refs_and_al
     }
     let folded = Rename.fold_expr(original.clone());
     assert_eq!(
-        printer::print_expr(&folded),
-        "RUNNING `ns_new`.`f_new`(`arg_new` => v_new, other_new) FILTER (WHERE predicate_new)"
+        printer::print_expression(&folded).unwrap(),
+        "RUNNING \"ns_new\".\"f_new\"(\"arg_new\" => v_new, other_new) FILTER (WHERE predicate_new)"
     );
     assert_eq!(
-        printer::print_expr(&original),
-        "FINAL `ns`.`f`(`arg` => v, other) FILTER (WHERE predicate)"
+        printer::print_expression(&original).unwrap(),
+        "FINAL \"ns\".\"f\"(\"arg\" => v, other) FILTER (WHERE predicate)"
     );
     let Expr::FunctionCall(folded) = &folded else {
         panic!("call")
@@ -249,8 +183,8 @@ fn control_call_producers_keep_optional_else_decoded_full_names_and_ordered_term
     assert!(node.false_value.is_none());
     assert_eq!(
         (
-            printer::print_expr(&absent),
-            printer::print_expr(&explicit_null)
+            printer::print_expression(&absent).unwrap(),
+            printer::print_expression(&explicit_null).unwrap()
         ),
         (
             "IF(flag, first)".to_owned(),
@@ -258,9 +192,9 @@ fn control_call_producers_keep_optional_else_decoded_full_names_and_ordered_term
         )
     );
     assert!(!absent.syntax_eq(&explicit_null));
-    assert!(absent.syntax_eq(&expression("`iF`(flag, first)")));
+    assert!(absent.syntax_eq(&expression("\"iF\"(flag, first)")));
     assert!(absent.syntax_eq(&expression("IF(ALL flag, first)")));
-    for source in ["schema.if(flag, first)", "`schema.if`(flag, first)"] {
+    for source in ["schema.if(flag, first)", "\"schema.if\"(flag, first)"] {
         assert!(
             matches!(expression(source), Expr::FunctionCall(_)),
             "{source}"
@@ -274,7 +208,7 @@ fn control_call_producers_keep_optional_else_decoded_full_names_and_ordered_term
     ] {
         let node = expression(source);
         assert_eq!(node.span(), Span::new(0, source.len()));
-        assert_eq!(printer::print_expr(&node), canonical);
+        assert_eq!(printer::print_expression(&node).unwrap(), canonical);
         assert!(node.syntax_eq(&expression(canonical)));
     }
     let source = "coalesce(a, b, c, d)";
@@ -308,9 +242,8 @@ fn control_call_parser_enforces_real_arity_metadata_and_pinned_order_by_normaliz
         "format()",
         "format('fmt')",
     ] {
-        let tokens = novarocks_parser::lex(source).unwrap();
         assert!(
-            matches!(novarocks_parser::parser::parse_expression(source,&tokens),Err(ParseError::UnexpectedToken{span,..}) if span==Span::new(0,source.len())),
+            matches!(novarocks_parser::parser::parse_expression(source),Err(novarocks_parser::ParserError::Parse(ParseError::UnexpectedToken{span,..})) if span==Span::new(0,source.len())),
             "{source}"
         );
     }
@@ -328,25 +261,28 @@ fn control_call_parser_enforces_real_arity_metadata_and_pinned_order_by_normaliz
             format!("{name}({args}) IGNORE NULLS"),
             format!("{name}({args} SEPARATOR ',')"),
         ] {
-            let tokens = novarocks_parser::lex(&source).unwrap();
             assert!(
-                novarocks_parser::parser::parse_expression(&source, &tokens).is_err(),
+                novarocks_parser::parser::parse_expression(&source).is_err(),
                 "{source}"
             );
         }
     }
     let source = "if(a) OVER w";
-    let tokens = novarocks_parser::lex(source).unwrap();
-    let error = novarocks_parser::parser::parse_expression(source, &tokens).unwrap_err();
+    let error = novarocks_parser::parser::parse_expression(source).unwrap_err();
     assert!(
-        matches!(error,ParseError::UnexpectedToken{expected,..} if expected.contains("arguments"))
+        matches!(error,novarocks_parser::ParserError::Parse(ParseError::UnexpectedToken{expected,..}) if expected.contains("arguments"))
     );
-    assert!(novarocks_parser::parse("SELECT * FROM TABLE(if(named => a, b))").is_err());
+    assert!(
+        novarocks_parser::parser::parse_statement("SELECT * FROM TABLE(if(named => a, b))").is_ok()
+    );
     // The exact pinned builder visits ORDER BY and then omits it from these
     // dedicated nodes. This assertion is syntax, not execution capability.
     let with_order = expression("coalesce(a, b, c, d ORDER BY ignored)");
     assert!(with_order.syntax_eq(&expression("coalesce(a, b, c, d)")));
-    assert_eq!(printer::print_expr(&with_order), "COALESCE(a, b, c, d)");
+    assert_eq!(
+        printer::print_expression(&with_order).unwrap(),
+        "COALESCE(a, b, c, d)"
+    );
 }
 
 #[test]
@@ -388,7 +324,7 @@ fn control_builders_hooks_syntax_equality_and_public_constructor_guards_keep_rea
     }
     let changed = Rename.fold_expr(original.clone());
     assert_eq!(
-        printer::print_expr(&changed),
+        printer::print_expression(&changed).unwrap(),
         "IF(flag_new, first_new, COALESCE(a_new, b_new, c_new, d_new))"
     );
     assert_eq!(changed.span(), original.span());
@@ -505,20 +441,21 @@ fn extract_real_producer_keeps_all_seventeen_distinct_fields_and_original_operan
             &source[node.expression.span().start()..node.expression.span().end()],
             "source_value"
         );
-        assert_eq!(printer::print_expr(&parsed), source);
+        assert_eq!(printer::print_expression(&parsed).unwrap(), source);
         assert!(parsed.syntax_eq(&expression(&source.to_ascii_lowercase())));
     }
     for source in [
         "EXTRACT(EPOCH FROM x)",
         "EXTRACT(MICROSECOND FROM x)",
-        "EXTRACT(`YEAR` FROM x)",
+        "EXTRACT(\"YEAR\" FROM x)",
         "EXTRACT('YEAR' FROM x)",
     ] {
-        let tokens = novarocks_parser::lex(source).unwrap();
         assert!(
             matches!(
-                novarocks_parser::parser::parse_expression(source, &tokens),
-                Err(novarocks_parser::ParseError::UnexpectedToken { .. })
+                novarocks_parser::parser::parse_expression(source),
+                Err(novarocks_parser::ParserError::Parse(
+                    novarocks_parser::ParseError::UnexpectedToken { .. }
+                ))
             ),
             "{source}"
         );
@@ -529,14 +466,14 @@ fn extract_real_producer_keeps_all_seventeen_distinct_fields_and_original_operan
 fn substring_from_normalizes_directly_to_substr_while_ordinary_call_names_stay_real() {
     for (source, ordinary, expected_values) in [
         (
-            "SUBSTRING(`payload` FROM position_value FOR length_value)",
-            "substr(`payload`, position_value, length_value)",
-            vec!["`payload`", "position_value", "length_value"],
+            "SUBSTRING(\"payload\" FROM position_value FOR length_value)",
+            "substr(\"payload\", position_value, length_value)",
+            vec!["\"payload\"", "position_value", "length_value"],
         ),
         (
-            "SUBSTRING(`payload` FROM position_value)",
-            "substr(`payload`, position_value)",
-            vec!["`payload`", "position_value"],
+            "SUBSTRING(\"payload\" FROM position_value)",
+            "substr(\"payload\", position_value)",
+            vec!["\"payload\"", "position_value"],
         ),
     ] {
         let parsed = expression(source);
@@ -558,7 +495,7 @@ fn substring_from_normalizes_directly_to_substr_while_ordinary_call_names_stay_r
             })
             .collect::<Vec<_>>();
         assert_eq!(actual, expected_values);
-        assert_eq!(printer::print_expr(&parsed), ordinary);
+        assert_eq!(printer::print_expression(&parsed).unwrap(), ordinary);
     }
     let ordinary = expression("substring(payload, position_value, length_value)");
     let Expr::FunctionCall(call) = &ordinary else {
@@ -566,16 +503,22 @@ fn substring_from_normalizes_directly_to_substr_while_ordinary_call_names_stay_r
     };
     assert_eq!(call.name.parts[0].value, "substring");
     assert!(!ordinary.syntax_eq(&expression("substr(payload, position_value, length_value)")));
-    for source in ["catalog.extract(part, payload)", "`extract`(part, payload)"] {
+    for source in [
+        "catalog.extract_field(part, payload)",
+        "\"extract\"(part, payload)",
+    ] {
         let parsed = expression(source);
         assert!(matches!(parsed, Expr::FunctionCall(_)));
-        assert_eq!(printer::print_expr(&parsed), source);
+        assert_eq!(printer::print_expression(&parsed).unwrap(), source);
     }
     let metadata = build::function(
         build::object_name(vec![build::ident("extract", false)]).unwrap(),
         vec![value("part", 10), value("payload", 20)],
     );
-    assert_eq!(printer::print_expr(&metadata), "extract(part, payload)");
+    assert_eq!(
+        printer::print_expression(&metadata).unwrap(),
+        "extract(part, payload)"
+    );
 }
 
 #[test]
@@ -620,8 +563,8 @@ fn extract_shared_hooks_and_builder_borrow_real_subtrees_and_keep_field_in_synta
     }
     let changed = Change.fold_expr(original.clone());
     assert_eq!(
-        printer::print_expr(&changed),
-        "EXTRACT(QUARTER FROM items_new[slot_new])"
+        printer::print_expression(&changed).unwrap(),
+        "EXTRACT(QUARTER FROM (items_new)[slot_new])"
     );
     assert_eq!(changed.span(), original.span());
     let mut field_changed = original.clone();
@@ -682,12 +625,12 @@ fn row_constructor_preserves_singleton_identity_and_does_not_specialize_ordinary
     assert_eq!(field.span, field.expression.span());
     assert_eq!(&source[field.span.start()..field.span.end()], "items[2]");
     assert!(!row.syntax_eq(&expression("(items[2])")));
-    assert_eq!(printer::print_expr(&row), source);
-    assert!(row.syntax_eq(&expression(&printer::print_expr(&row))));
+    assert_eq!(printer::print_expression(&row).unwrap(), "ROW((items)[2])");
+    assert!(row.syntax_eq(&expression(&printer::print_expression(&row).unwrap())));
     let multi = expression("row(a, 2)");
-    assert_eq!(printer::print_expr(&multi), "ROW(a, 2)");
+    assert_eq!(printer::print_expression(&multi).unwrap(), "ROW(a, 2)");
     assert!(multi.syntax_eq(&expression("(a, 2)")));
-    for source in ["catalog.row(1)", "`row`(1)", "named_struct('x', 1)"] {
+    for source in ["catalog.row(1)", "\"row\"(1)", "named_struct('x', 1)"] {
         let ordinary = expression(source);
         let Expr::FunctionCall(call) = ordinary else {
             panic!("ordinary source call: {source}");
@@ -705,7 +648,6 @@ fn row_constructor_preserves_singleton_identity_and_does_not_specialize_ordinary
     for source in [
         "ROW()",
         "ROW(ALL 1)",
-        "ROW(ALL)",
         "ROW(DISTINCT 1)",
         "ROW(1 ORDER BY 2)",
         "ROW(1 SEPARATOR ',')",
@@ -714,74 +656,11 @@ fn row_constructor_preserves_singleton_identity_and_does_not_specialize_ordinary
         "ROW(1) FILTER (WHERE TRUE)",
         "ROW(1) OVER ()",
     ] {
-        let tokens = novarocks_parser::lex(source).unwrap();
         assert!(
-            novarocks_parser::parser::parse_expression(source, &tokens).is_err(),
+            novarocks_parser::parser::parse_expression(source).is_err(),
             "constructor syntax must reject modifiers: {source}"
         );
     }
-}
-
-#[test]
-fn map_literal_produces_plain_variadic_call_with_real_ordered_children_and_spans() {
-    let source = "map{items[2]: ROW(3), 'key': other}";
-    let expr = expression(source);
-    let Expr::FunctionCall(call) = &expr else {
-        panic!("ordinary map call");
-    };
-    assert_eq!(call.span, Span::new(0, source.len()));
-    assert_eq!(call.name.span, novarocks_parser::SYNTHETIC);
-    assert_eq!(call.name.parts.len(), 1);
-    assert_eq!(call.name.parts[0].value, "map");
-    assert!(!call.name.parts[0].quoted);
-    assert_eq!(call.name.parts[0].span, novarocks_parser::SYNTHETIC);
-    assert!(!call.distinct);
-    assert!(call.processing_mode.is_none());
-    assert!(call.order_by.is_none() && call.filter.is_none());
-    assert!(call.null_treatment.is_none() && call.window.is_none());
-    assert_eq!(call.arguments.len(), 4);
-    for (argument, expected) in call
-        .arguments
-        .iter()
-        .zip(["items[2]", "ROW(3)", "'key'", "other"])
-    {
-        assert!(argument.name.is_none());
-        assert_eq!(argument.span, argument.value.span());
-        assert_eq!(
-            &source[argument.span.start()..argument.span.end()],
-            expected
-        );
-    }
-    struct Args(Vec<*const Expr>);
-    impl Visit for Args {
-        fn visit_call_argument(&mut self, node: &CallArgument) {
-            self.0.push(&node.value as *const Expr);
-            novarocks_parser::ast::walk_call_argument(self, node);
-        }
-    }
-    let mut args = Args(Vec::new());
-    args.visit_expr(&expr);
-    assert_eq!(
-        args.0,
-        call.arguments
-            .iter()
-            .map(|argument| &argument.value as *const Expr)
-            .collect::<Vec<_>>()
-    );
-    assert!(expr.syntax_eq(&expression("map(items[2], ROW(3), 'key', other)")));
-    assert_eq!(
-        printer::print_expr(&expr),
-        "map(items[2], ROW(3), 'key', other)"
-    );
-    assert!(expr.syntax_eq(&expression(&printer::print_expr(&expr))));
-    let empty = expression("map{}");
-    let Expr::FunctionCall(call) = &empty else {
-        panic!("empty map call");
-    };
-    assert!(call.arguments.is_empty());
-    assert_eq!(call.span, Span::new(0, 5));
-    assert!(empty.syntax_eq(&expression("map()")));
-    assert_eq!(printer::print_expr(&empty), "map()");
 }
 
 #[test]
@@ -811,18 +690,13 @@ fn row_and_map_builders_retain_original_owning_nodes_without_changing_tuple_cont
     };
     call.arguments.swap(0, 1);
     assert!(!built.syntax_eq(&top));
-    assert_eq!(build::tuple(Vec::new()), Err(build::BuildError::EmptyTuple));
     assert_eq!(
         build::tuple_value(Vec::new()),
         Err(build::BuildError::EmptyTuple)
     );
-    assert!(matches!(
-        build::tuple(vec![build::integer(1)]).unwrap(),
-        Expr::LegacyParenthesized(_)
-    ));
     let singleton = build::tuple_value(vec![build::integer(1)]).unwrap();
     assert!(matches!(&singleton, Expr::Row(node) if node.fields.len() == 1));
-    assert_eq!(printer::print_expr(&singleton), "ROW(1)");
+    assert_eq!(printer::print_expression(&singleton).unwrap(), "ROW(1)");
     assert!(singleton.syntax_eq(&expression("ROW(1)")));
     let empty_row = Expr::Row(RowExpr {
         fields: AstVec::new(),
@@ -851,7 +725,10 @@ fn row_and_map_builders_retain_original_owning_nodes_without_changing_tuple_cont
     };
     assert!(fields.fields[0].name.as_ref().unwrap().quoted);
     assert!(fields.fields[1].name.is_none());
-    assert_eq!(printer::print_expr(&named), "STRUCT(`x` := 1, 2)");
+    assert_eq!(
+        printer::print_expression(&named).unwrap(),
+        "ROW(1 AS \"x\", 2)"
+    );
 }
 
 #[test]
@@ -861,7 +738,7 @@ fn function_distinct_keeps_the_pinned_none_all_merge_and_real_ordinary_names() {
         "group_concat",
         "string_agg",
         "catalog.f",
-        "`group_concat`",
+        "\"group_concat\"",
     ] {
         let absent = expression(&format!("{name}(a, b)"));
         let all = expression(&format!("{name}(ALL a, b)"));
@@ -877,8 +754,8 @@ fn function_distinct_keeps_the_pinned_none_all_merge_and_real_ordinary_names() {
             unreachable!()
         };
         assert!(call.distinct);
-        assert!(distinct.syntax_eq(&expression(&printer::print_expr(&distinct))));
-        assert!(!printer::print_expr(&all).contains("ALL "));
+        assert!(distinct.syntax_eq(&expression(&printer::print_expression(&distinct).unwrap())));
+        assert!(!printer::print_expression(&all).unwrap().contains("ALL "));
     }
     let built = build::function(
         build::object_name(vec![build::ident("f", false)]).unwrap(),
@@ -894,115 +771,5 @@ fn function_distinct_keeps_the_pinned_none_all_merge_and_real_ordinary_names() {
         };
         assert!(call.arguments.is_empty());
         assert_eq!(call.name.parts[0].value, source.trim_end_matches("()"));
-    }
-}
-
-#[test]
-fn explicit_separator_moves_real_last_argument_and_keeps_all_other_metadata() {
-    let source = "group_concat(DISTINCT a, items[2] ORDER BY sortcol DESC SEPARATOR delimiter[3]) FILTER (WHERE flag) OVER (PARTITION BY partition_key)";
-    let expr = expression(source);
-    let Expr::FunctionCall(call) = &expr else {
-        panic!("canonical string_agg");
-    };
-    assert_eq!(call.name.parts.len(), 1);
-    assert_eq!(call.name.parts[0].value, "string_agg");
-    assert!(!call.name.parts[0].quoted);
-    assert_eq!(call.name.span, novarocks_parser::SYNTHETIC);
-    assert_eq!(call.name.parts[0].span, novarocks_parser::SYNTHETIC);
-    assert_eq!(call.span, Span::new(0, source.len()));
-    assert!(call.distinct);
-    assert!(call.processing_mode.is_none());
-    assert!(call.null_treatment.is_none());
-    assert_eq!(call.arguments.len(), 3);
-    for (argument, expected) in call.arguments.iter().zip(["a", "items[2]", "delimiter[3]"]) {
-        assert!(argument.name.is_none());
-        assert_eq!(argument.span, argument.value.span());
-        assert_eq!(
-            &source[argument.span.start()..argument.span.end()],
-            expected
-        );
-    }
-    let order = call.order_by.as_ref().unwrap();
-    assert_eq!(
-        &source[order.span.start()..order.span.end()],
-        "ORDER BY sortcol DESC"
-    );
-    assert_eq!(order.items[0].ordering, SortOrdering::Descending);
-    assert_eq!(order.items[0].null_ordering, NullOrdering::Undefined);
-    let filter = call.filter.as_ref().unwrap();
-    assert_eq!(&source[filter.span().start()..filter.span().end()], "flag");
-    let window = call.window.as_ref().unwrap();
-    assert_eq!(
-        &source[window.span().start()..window.span().end()],
-        "(PARTITION BY partition_key)"
-    );
-    assert!(expr.syntax_eq(&expression("string_agg(DISTINCT a, items[2], delimiter[3] ORDER BY sortcol DESC) FILTER (WHERE flag) OVER (PARTITION BY partition_key)")));
-    assert!(expr.syntax_eq(&expression(&printer::print_expr(&expr))));
-    struct Args(Vec<*const Expr>);
-    impl Visit for Args {
-        fn visit_call_argument(&mut self, node: &CallArgument) {
-            self.0.push(&node.value as *const Expr);
-            novarocks_parser::ast::walk_call_argument(self, node);
-        }
-    }
-    let mut visited = Args(Vec::new());
-    visited.visit_expr(&expr);
-    assert_eq!(
-        visited.0,
-        call.arguments
-            .iter()
-            .map(|node| &node.value as *const Expr)
-            .collect::<Vec<_>>()
-    );
-    let source = "STRING_AGG(value SEPARATOR NULL)";
-    let explicit_alias = expression(source);
-    let Expr::FunctionCall(call) = &explicit_alias else {
-        unreachable!()
-    };
-    assert_eq!(call.name.parts[0].value, "STRING_AGG");
-    assert_eq!(call.name.span, Span::new(0, "STRING_AGG".len()));
-    assert_eq!(call.span, Span::new(0, source.len()));
-    assert_eq!(call.arguments.len(), 2);
-    assert!(matches!(
-        &call.arguments[1].value,
-        Expr::Literal(Literal {
-            kind: LiteralKind::Null,
-            ..
-        })
-    ));
-    assert!(explicit_alias.syntax_eq(&expression("STRING_AGG(value, NULL)")));
-    novarocks_parser::ast::validate_statement(&statement(explicit_alias)).unwrap();
-}
-
-#[test]
-fn separator_refuses_illegal_source_shapes_before_the_fact_can_be_erased() {
-    for source in [
-        "group_concat(SEPARATOR NULL)",
-        "group_concat(ORDER BY a SEPARATOR ',')",
-        "string_agg(SEPARATOR ',')",
-        "array_agg(SEPARATOR NULL)",
-        "array_agg(a SEPARATOR ',')",
-        "f(a SEPARATOR ',')",
-        "catalog.group_concat(a SEPARATOR ',')",
-        "`group_concat`(a SEPARATOR ',')",
-        "`string_agg`(a SEPARATOR ',')",
-    ] {
-        let tokens = novarocks_parser::lex(source).unwrap();
-        let error = novarocks_parser::parser::parse_expression(source, &tokens).expect_err(source);
-        let novarocks_parser::ParseError::UnexpectedToken { span, .. } = error else {
-            panic!("typed Parse refusal: {source}");
-        };
-        assert_eq!(
-            span,
-            Span::new(0, source.len()),
-            "real complete call span: {source}"
-        );
-    }
-    for source in ["group_concat(a, b)", "string_agg(a, b)"] {
-        let Expr::FunctionCall(call) = expression(source) else {
-            unreachable!()
-        };
-        assert_eq!(call.name.parts[0].value, source.split('(').next().unwrap());
-        assert_eq!(call.arguments.len(), 2);
     }
 }

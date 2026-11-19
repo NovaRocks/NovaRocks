@@ -16,11 +16,11 @@
 // under the License.
 
 use novarocks_parser::ast::*;
-use novarocks_parser::trino_parser::parse_query;
-use novarocks_parser::{trino_parser, trino_printer};
+use novarocks_parser::parser::parse_query;
+use novarocks_parser::{parser, printer};
 
 fn query(source: &str) -> Query {
-    trino_parser::parse_query(source).expect(source)
+    parser::parse_query(source).expect(source)
 }
 
 fn relation(query: &Query) -> &Relation {
@@ -210,9 +210,7 @@ fn trino_table_argument_copartition_alias_constraints() {
     ] {
         query(source);
     }
-    assert!(
-        trino_parser::parse_query("SELECT * FROM TABLE(f(TABLE(t) copartition(a,b)))").is_err()
-    );
+    assert!(parser::parse_query("SELECT * FROM TABLE(f(TABLE(t) copartition(a,b)))").is_err());
 }
 
 #[test]
@@ -333,7 +331,7 @@ fn trino_advanced_relation_rejects_grammar_failures_without_value_defaults() {
         "SELECT * FROM NEAREST(FROM t)",
         "SELECT * FROM NEAREST(FROM t WHERE TRUE)",
     ] {
-        assert!(trino_parser::parse_query(source).is_err(), "{source}");
+        assert!(parser::parse_query(source).is_err(), "{source}");
     }
 }
 
@@ -350,7 +348,7 @@ fn trino_advanced_relation_roundtrips_include_all_table_argument_list_shapes() {
         "SELECT * FROM NEAREST(FROM t WHERE a=b MATCH ts<=?)",
     ] {
         let parsed = query(source);
-        let printed = trino_printer::print_query(&parsed).unwrap();
+        let printed = printer::print_query(&parsed).unwrap();
         let reparsed = query(&printed);
         assert!(syntax_eq_query(&parsed, &reparsed), "{source}\n{printed}");
     }
@@ -414,7 +412,7 @@ fn descriptor_argument_selection_requires_the_complete_grammar_alternative() {
             ),
             "{source}"
         );
-        let printed = novarocks_parser::trino_printer::print_query(&parsed).unwrap();
+        let printed = novarocks_parser::printer::print_query(&parsed).unwrap();
         let reparsed = parse_query(&printed).unwrap();
         assert!(syntax_eq_query(&parsed, &reparsed), "{source} -> {printed}");
     }
@@ -452,6 +450,6 @@ fn pivot_aliased_expression_keeps_a_bare_interval_field_as_the_real_alias() {
     assert!(matches!(pivot.aggregations[0].expression, Expr::Binary(_)));
     assert_eq!(pivot.value_groups[0].alias.as_ref().unwrap().value, "DAY");
     assert!(matches!(pivot.value_groups[0].values[0], Expr::Binary(_)));
-    let printed = novarocks_parser::trino_printer::print_query(&parsed).unwrap();
+    let printed = novarocks_parser::printer::print_query(&parsed).unwrap();
     assert!(syntax_eq_query(&parsed, &parse_query(&printed).unwrap()));
 }

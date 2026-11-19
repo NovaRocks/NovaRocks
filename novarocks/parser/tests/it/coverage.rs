@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use novarocks_parser::trino_lexer::lex;
-use novarocks_parser::trino_token::TokenKind;
+use novarocks_parser::lexer::lex;
+use novarocks_parser::token::TokenKind;
 use std::borrow::Cow;
 
 /// Loads SQL bytes that cannot fit in one TSV cell, including dollar-body LF.
@@ -91,7 +91,7 @@ fn grammar_sample_tokens_reconstruct_the_complete_input() {
 
 #[test]
 fn grammar_samples_use_their_actual_entry() {
-    use novarocks_parser::trino_parser;
+    use novarocks_parser::parser;
     let mut failures = Vec::new();
     for line in include_str!("grammar-coverage.tsv")
         .lines()
@@ -112,16 +112,14 @@ fn grammar_samples_use_their_actual_entry() {
         );
         let source = sample(fields[5]);
         let result = match fields[1] {
-            "standaloneExpression" => trino_parser::parse_expression(&source).map(|_| ()),
-            "standaloneType" => trino_parser::parse_type(&source).map(|_| ()),
-            "standaloneRowPattern" => trino_parser::parse_row_pattern(&source).map(|_| ()),
+            "standaloneExpression" => parser::parse_expression(&source).map(|_| ()),
+            "standaloneType" => parser::parse_type(&source).map(|_| ()),
+            "standaloneRowPattern" => parser::parse_row_pattern(&source).map(|_| ()),
             "standaloneFunctionSpecification" => {
-                trino_parser::parse_function_specification(&source).map(|_| ())
+                parser::parse_function_specification(&source).map(|_| ())
             }
-            "standalonePathSpecification" => {
-                trino_parser::parse_path_specification(&source).map(|_| ())
-            }
-            _ => trino_parser::parse_statement(&source).map(|_| ()),
+            "standalonePathSpecification" => parser::parse_path_specification(&source).map(|_| ()),
+            _ => parser::parse_statement(&source).map(|_| ()),
         };
         match fields[7] {
             "accept" if result.is_err() => {
@@ -148,7 +146,7 @@ fn keyword_samples_obey_reserved_and_nonreserved_identifier_grammar() {
             continue;
         }
         let source = sample(fields[5]);
-        let result = novarocks_parser::trino_parser::parse_query(&source);
+        let result = novarocks_parser::parser::parse_query(&source);
         match fields[7] {
             "nonreserved" => assert!(result.is_ok(), "{line}\n{result:?}"),
             "reserved" => assert!(result.is_err(), "{line}"),

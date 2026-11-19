@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use novarocks_parser::trino_keyword::{KEYWORDS, class, lookup};
-use novarocks_parser::trino_lexer::lex;
-use novarocks_parser::trino_token::{Keyword, Symbol, TokenKind, TriviaKind};
+use novarocks_parser::keyword::{KEYWORDS, class, lookup};
+use novarocks_parser::lexer::lex;
+use novarocks_parser::token::{Keyword, Symbol, TokenKind, TriviaKind};
 use novarocks_parser::{KeywordClass, LexError, ParserError};
 
 fn kinds(sql: &str) -> Vec<TokenKind> {

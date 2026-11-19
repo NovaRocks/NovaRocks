@@ -10,10 +10,7 @@ fn id(name: &str) -> Expr {
     build::identifier(build::ident_at(name, false, span()))
 }
 fn subquery(name: &str) -> Expr {
-    let mut statements = crate::parse(&format!("SELECT {name}")).unwrap();
-    let crate::ast::Statement::Query(query) = statements.pop().unwrap() else {
-        unreachable!()
-    };
+    let query = crate::parser::parse_query(&format!("SELECT {name}")).unwrap();
     Expr::Subquery(crate::ast::SubqueryExpr {
         query: crate::ast::AstBox::new(query),
         span: span(),
@@ -271,17 +268,13 @@ fn predicate_owning_cycle_and_all_synchronous_traversals_grow_the_actual_stack()
     let mut count = Count(0);
     count.visit_expr(&node);
     assert_eq!(count.0, 20_000);
-    let rendered = crate::printer::print_expr(&node);
+    let rendered = crate::printer::print_expression(&node).unwrap();
     assert!(!rendered.is_empty());
-    let mut statements = crate::parse("SELECT TRUE").unwrap();
-    let crate::ast::Statement::Query(query) = &mut statements[0] else {
-        unreachable!()
-    };
+    let mut query = crate::parser::parse_query("SELECT TRUE").unwrap();
     let crate::ast::SetExpr::Select(select) = query.body.as_mut() else {
         unreachable!()
     };
     select.projection[0] = crate::build::item(folded, None);
-    crate::ast::validate_statement(&statements[0]).unwrap();
-    drop(statements);
+    crate::ast::validate_statement(&crate::ast::TrinoStatement::Query(query)).unwrap();
     drop(node);
 }

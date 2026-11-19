@@ -157,6 +157,10 @@ pub struct RepeatStatement {
 /// The external string is decoded content after AstBuilder's leading-newline
 /// removal. It is never a raw SQL representation of a control-statement tree.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the SQL body owns the original typed statement and its recursion guard"
+)]
 pub enum RoutineBody {
     Sql(ControlStatement),
     External { definition: String, span: Span },

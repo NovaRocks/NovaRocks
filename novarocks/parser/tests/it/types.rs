@@ -16,7 +16,7 @@
 // under the License.
 
 use novarocks_parser::ast::*;
-use novarocks_parser::trino_parser::{parse_expression, parse_type};
+use novarocks_parser::parser::{parse_expression, parse_type};
 use novarocks_parser::{ParseError, ParserError, Span};
 
 fn literal(source: &str) -> Literal {

@@ -166,7 +166,7 @@ fn table(prefix: &str, span: Span) -> JsonTable {
                     }),
                 ])
                 .into(),
-                span: span,
+                span,
             }),
         ],
         plan: Some(JsonTablePlan::Specific(JsonTableSpecificPlan::ParentChild(
@@ -184,10 +184,10 @@ fn table(prefix: &str, span: Span) -> JsonTable {
                             leaf(prefix, "plan_right", span),
                         ])
                         .into(),
-                        span: span,
+                        span,
                     },
                 )),
-                span: span,
+                span,
             },
         ))),
         error_behavior: Some(JsonTableErrorBehavior::Empty),
@@ -215,7 +215,7 @@ fn fixtures(prefix: &str, span: Span) -> Fixtures {
                 left: crate::ast::AstBox::new(expr(prefix, "ctor_left", span)),
                 operator: BinaryOperator::Add,
                 right: crate::ast::AstBox::new(expr(prefix, "ctor_right", span)),
-                span: span,
+                span,
             }),
             format: JsonFormat::Utf32,
             span,

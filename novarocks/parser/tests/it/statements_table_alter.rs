@@ -4,15 +4,15 @@ use novarocks_parser::ast::{
     CommentKind, Expr, Literal, LiteralKind, Parameter, SetPropertiesKind, SyntaxEq,
     TrinoColumnPosition, TrinoStatement, Visit,
 };
-use novarocks_parser::{ParserError, Span, trino_parser, trino_printer};
+use novarocks_parser::{ParserError, Span, parser, printer};
 
 fn roundtrip(source: &str) -> TrinoStatement {
     let original =
-        trino_parser::parse_statement(source).unwrap_or_else(|error| panic!("{source}: {error}"));
-    let printed = trino_printer::print_statement(&original)
-        .unwrap_or_else(|error| panic!("{original:?}: {error}"));
-    let reparsed = trino_parser::parse_statement(&printed)
-        .unwrap_or_else(|error| panic!("{printed}: {error}"));
+        parser::parse_statement(source).unwrap_or_else(|error| panic!("{source}: {error}"));
+    let printed =
+        printer::print_statement(&original).unwrap_or_else(|error| panic!("{original:?}: {error}"));
+    let reparsed =
+        parser::parse_statement(&printed).unwrap_or_else(|error| panic!("{printed}: {error}"));
     assert!(original.syntax_eq(&reparsed), "{source}\n{printed}");
     original
 }
@@ -91,7 +91,7 @@ fn alter_column_literal_set_drop_type_and_constraint_are_separate_nodes() {
         roundtrip("ALTER TABLE IF EXISTS t ALTER COLUMN a.b SET DATA TYPE decimal(10, 2)"),
         TrinoStatement::SetColumnType(node)
             if node.table_exists && node.column_name.parts.len() == 2
-                && node.data_type.syntax_eq(&trino_parser::parse_type("decimal(10, 2)").unwrap()),
+                && node.data_type.syntax_eq(&parser::parse_type("decimal(10, 2)").unwrap()),
     ));
     assert!(matches!(
         roundtrip("ALTER TABLE IF EXISTS t ALTER COLUMN \"a.b\" DROP NOT NULL"),
@@ -210,10 +210,7 @@ fn legacy_or_misshaped_alter_forms_are_rejected_as_syntax() {
         "TRUNCATE TABLE t;",
     ] {
         assert!(
-            matches!(
-                trino_parser::parse_statement(source),
-                Err(ParserError::Parse(_))
-            ),
+            matches!(parser::parse_statement(source), Err(ParserError::Parse(_))),
             "{source}",
         );
     }

@@ -26,47 +26,19 @@ use std::collections::HashSet;
 use crate::{StructuralViolation, ValidateError};
 
 use super::{
-    Cte, Expr, GroupBy, Query, Select, SelectItem, SetExpr, Statement, TableStatement, Values,
-    WindowFrame, WindowFrameBound, WindowSpecification,
+    Cte, Expr, GroupBy, Query, Select, SelectItem, SetExpr, TrinoStatement, Values, WindowFrame,
+    WindowFrameBound, WindowSpecification,
 };
 
-/// Validates every statement in a public parser result.
-pub fn validate_statements(statements: &[Statement]) -> Result<(), ValidateError> {
-    for statement in statements {
-        validate_statement(statement)?;
-    }
-    Ok(())
-}
-
-/// Validates one complete syntax tree without invoking semantic analysis.
-pub fn validate_statement(statement: &Statement) -> Result<(), ValidateError> {
+/// Validates known syntax-tree invariants without resolving names or types.
+#[recursive::recursive]
+pub fn validate_statement(statement: &TrinoStatement) -> Result<(), ValidateError> {
     match statement {
-        Statement::Query(query) => validate_query(query),
-        Statement::ExplainQuery(explain) => validate_query(&explain.query),
-        Statement::Table(TableStatement::Create(table)) => validate_create_table(table),
-        Statement::ShowProcessList(_)
-        | Statement::Statistics(_)
-        | Statement::Catalog(_)
-        | Statement::Iceberg(_)
-        | Statement::Maintenance(_)
-        | Statement::MaterializedView(_)
-        | Statement::View(_)
-        | Statement::Dml(_) => Ok(()),
-        Statement::Session(_) => Ok(()),
+        TrinoStatement::Query(query) => validate_query(query),
+        TrinoStatement::Explain(explain) => validate_statement(&explain.statement),
+        TrinoStatement::ExplainAnalyze(explain) => validate_statement(&explain.statement),
+        _ => Ok(()),
     }
-}
-
-fn validate_create_table(table: &super::CreateTable) -> Result<(), ValidateError> {
-    let mut names = HashSet::with_capacity(table.columns.len());
-    for column in &table.columns {
-        if !names.insert(identifier_key(&column.name.value, column.name.quoted)) {
-            return Err(ValidateError::invalid_structure(
-                StructuralViolation::DuplicateTableColumnName,
-                column.name.span,
-            ));
-        }
-    }
-    Ok(())
 }
 
 #[recursive::recursive]
@@ -214,9 +186,6 @@ fn validate_select(select: &Select) -> Result<(), ValidateError> {
     if let Some(having) = &select.having {
         validate_expr(having)?;
     }
-    if let Some(qualify) = &select.legacy.qualify {
-        validate_expr(qualify)?;
-    }
     if let Some(group_by) = &select.group_by {
         validate_group_by(group_by)?;
     }
@@ -281,7 +250,6 @@ fn validate_relation(relation: &super::Relation) -> Result<(), ValidateError> {
         Relation::Join(node) => {
             let valid = match node.kind {
                 JoinType::Cross | JoinType::Implicit => node.criteria.is_none(),
-                JoinType::Legacy(_) => true,
                 _ => node.criteria.is_some(),
             };
             if !valid {
@@ -295,10 +263,7 @@ fn validate_relation(relation: &super::Relation) -> Result<(), ValidateError> {
             if let Some(criteria) = &node.criteria {
                 match criteria {
                     JoinCriteria::On(node) => validate_expr(&node.expression)?,
-                    JoinCriteria::Using(node)
-                        if node.columns.is_empty()
-                            && !matches!(node_kind(relation), Some(JoinType::Legacy(_))) =>
-                    {
+                    JoinCriteria::Using(node) if node.columns.is_empty() => {
                         return Err(ValidateError::invalid_structure(
                             StructuralViolation::EmptyJoinUsingColumns,
                             node.span,
@@ -376,13 +341,13 @@ fn validate_relation(relation: &super::Relation) -> Result<(), ValidateError> {
                         }
                     }
                     TableFunctionArgumentValue::Descriptor(descriptor) => {
-                        if let Some(descriptor) = &descriptor.descriptor {
-                            if descriptor.fields.is_empty() {
-                                return Err(ValidateError::invalid_structure(
-                                    StructuralViolation::EmptyDescriptorFields,
-                                    descriptor.span,
-                                ));
-                            }
+                        if let Some(descriptor) = &descriptor.descriptor
+                            && descriptor.fields.is_empty()
+                        {
+                            return Err(ValidateError::invalid_structure(
+                                StructuralViolation::EmptyDescriptorFields,
+                                descriptor.span,
+                            ));
                         }
                     }
                 }
@@ -427,18 +392,9 @@ fn validate_relation(relation: &super::Relation) -> Result<(), ValidateError> {
                 validate_expr(&definition.expression)?;
             }
         }
-        Relation::LegacyTableFunction(node) => validate_expr(&node.expr)?,
     }
     Ok(())
 }
-fn node_kind(relation: &super::Relation) -> Option<super::JoinType> {
-    if let super::Relation::Join(node) = relation {
-        Some(node.kind)
-    } else {
-        None
-    }
-}
-
 #[recursive::recursive]
 fn validate_window_specification(specification: &WindowSpecification) -> Result<(), ValidateError> {
     for expression in &specification.partition_by {
@@ -717,7 +673,6 @@ fn validate_expr(expression: &Expr) -> Result<(), ValidateError> {
             validate_expr(&binary.left)?;
             validate_expr(&binary.right)?;
         }
-        Expr::LegacyParenthesized(nested) => validate_expr(&nested.expression)?,
 
         Expr::SearchedCase(case) => validate_case(
             None,
@@ -732,15 +687,6 @@ fn validate_expr(expression: &Expr) -> Result<(), ValidateError> {
             case.span,
         )?,
         Expr::Cast(cast) => validate_expr(&cast.expression)?,
-        Expr::LegacyInterval(interval) => {
-            validate_expr(&interval.value)?;
-            if let Some(precision) = &interval.leading_precision {
-                validate_expr(precision)?;
-            }
-            if let Some(precision) = &interval.fractional_seconds_precision {
-                validate_expr(precision)?;
-            }
-        }
         Expr::Row(row) => {
             for field in &row.fields {
                 validate_expr(&field.expression)?;

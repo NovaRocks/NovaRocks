@@ -3,15 +3,15 @@
 use novarocks_parser::ast::{
     Expr, Parameter, SetExpr, StatementSaveMode, SyntaxEq, TrinoStatement, Visit,
 };
-use novarocks_parser::{ParseError, ParserError, Span, trino_parser, trino_printer};
+use novarocks_parser::{ParseError, ParserError, Span, parser, printer};
 
 fn roundtrip(source: &str) -> TrinoStatement {
     let original =
-        trino_parser::parse_statement(source).unwrap_or_else(|error| panic!("{source}: {error}"));
-    let printed = trino_printer::print_statement(&original)
-        .unwrap_or_else(|error| panic!("{original:?}: {error}"));
-    let reparsed = trino_parser::parse_statement(&printed)
-        .unwrap_or_else(|error| panic!("{printed}: {error}"));
+        parser::parse_statement(source).unwrap_or_else(|error| panic!("{source}: {error}"));
+    let printed =
+        printer::print_statement(&original).unwrap_or_else(|error| panic!("{original:?}: {error}"));
+    let reparsed =
+        parser::parse_statement(&printed).unwrap_or_else(|error| panic!("{printed}: {error}"));
     assert!(original.syntax_eq(&reparsed), "{source}\n{printed}");
     original
 }
@@ -134,7 +134,7 @@ fn ctas_and_ordinary_table_own_distinct_complete_alternatives() {
     ));
 
     let source = "  CREATE OR REPLACE TABLE IF NOT EXISTS t AS SELECT 9223372036854775808";
-    let error = trino_parser::parse_statement(source).unwrap_err();
+    let error = parser::parse_statement(source).unwrap_err();
     let ParserError::Parse(ParseError::UnexpectedToken { span, found, .. }) = error else {
         panic!("expected the save-mode parse error");
     };
@@ -143,7 +143,7 @@ fn ctas_and_ordinary_table_own_distinct_complete_alternatives() {
 
     let source =
         "CREATE OR REPLACE TABLE IF NOT EXISTS t WITH (x = 9223372036854775808) AS SELECT 1";
-    let error = trino_parser::parse_statement(source).unwrap_err();
+    let error = parser::parse_statement(source).unwrap_err();
     let ParserError::Parse(ParseError::UnexpectedToken { span, .. }) = error else {
         panic!("expected the property literal parse error");
     };
@@ -160,33 +160,33 @@ fn ctas_and_ordinary_table_own_distinct_complete_alternatives() {
         "CREATE TABLE t AS SELECT 1 WITH DATA WITH NO DATA",
         "CREATE TABLE t AS SELECT 1;",
     ] {
-        assert!(trino_parser::parse_statement(source).is_err(), "{source}");
+        assert!(parser::parse_statement(source).is_err(), "{source}");
     }
 }
 
 #[test]
 fn ctas_printer_refuses_fields_outside_its_grammar() {
-    let mut alias_stmt = trino_parser::parse_statement("CREATE TABLE t AS SELECT 1").unwrap();
+    let mut alias_stmt = parser::parse_statement("CREATE TABLE t AS SELECT 1").unwrap();
     let TrinoStatement::CreateTableAsSelect(alias_node) = &mut alias_stmt else {
         panic!("expected CTAS");
     };
     alias_node.column_aliases = Some(Vec::new());
     assert!(matches!(
-        trino_printer::print_statement(&alias_stmt),
-        Err(trino_printer::PrintError::Unrepresentable {
+        printer::print_statement(&alias_stmt),
+        Err(printer::PrintError::Unrepresentable {
             fact: "an empty CTAS column alias list",
         })
     ));
 
-    let mut session_stmt = trino_parser::parse_statement("CREATE TABLE t AS SELECT 1").unwrap();
+    let mut session_stmt = parser::parse_statement("CREATE TABLE t AS SELECT 1").unwrap();
     let TrinoStatement::CreateTableAsSelect(session_node) = &mut session_stmt else {
         panic!("expected CTAS");
     };
-    let session_query = trino_parser::parse_query("WITH SESSION p = 1 SELECT 1").unwrap();
+    let session_query = parser::parse_query("WITH SESSION p = 1 SELECT 1").unwrap();
     session_node.query.session_properties = session_query.session_properties;
     assert!(matches!(
-        trino_printer::print_statement(&session_stmt),
-        Err(trino_printer::PrintError::Unrepresentable {
+        printer::print_statement(&session_stmt),
+        Err(printer::PrintError::Unrepresentable {
             fact: "WITH SESSION in a CTAS query",
         })
     ));
