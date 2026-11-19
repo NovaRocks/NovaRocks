@@ -94,7 +94,7 @@ REFRESH MATERIALIZED VIEW join_agg_mv_${uuid0};
 SELECT region, c, s FROM join_agg_mv_${uuid0} ORDER BY region;
 
 -- query 7
-SELECT d.area AS region, COUNT(*) AS c, SUM(f.amount) AS s
+SELECT d.area AS region, COUNT() AS c, SUM(f.amount) AS s
 FROM fact AS f
 JOIN dim AS d ON f.dim_id = d.id
 GROUP BY d.area

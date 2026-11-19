@@ -85,7 +85,7 @@ REFRESH MATERIALIZED VIEW agg_mv_${uuid0};
 SELECT region, c, s FROM agg_mv_${uuid0} ORDER BY region;
 
 -- query 7
-SELECT region, COUNT(*) AS c, SUM(amount) AS s
+SELECT region, COUNT() AS c, SUM(amount) AS s
 FROM orders
 GROUP BY region
 ORDER BY region;
