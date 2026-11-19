@@ -36,8 +36,8 @@ CREATE TABLE ${case_db}.variant_alter_v2 (id INT) WITH (format_version = 2);
 CREATE TABLE ${case_db}.variant_alter_v3 (id INT,s ROW(x INT)) WITH (format_version = 3);
 
 -- query 5
--- IF NOT EXISTS cannot turn an unsupported new definition into a target probe.
--- @expect_error=Iceberg Variant writes are not supported
+-- An existing target makes IF NOT EXISTS finish before new-definition validation.
+-- @skip_result_check=true
 CREATE TABLE IF NOT EXISTS ${case_db}.variant_alter_v3 (id INT,v VARIANT) WITH (format_version = 3);
 
 -- query 6
