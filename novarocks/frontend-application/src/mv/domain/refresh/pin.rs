@@ -650,14 +650,29 @@ mod tests {
     }
 
     #[test]
-    fn metadata_base_identity_reads_preserve_raw_names_and_quoted_ordinary_tables() {
+    fn base_identity_reads_keep_trino_quoted_dollar_names_raw() {
         use crate::mv::domain::{analysis, flow};
         use novarocks_parser::ast::{Relation, SetExpr};
-        for (sql, expected_table, quoted) in [
-            ("SELECT * FROM ice.db.\"orders$files\"", "orders", false),
+        for (sql, expected_table, spelling, quoted, raw_dollar_name) in [
             (
-                "SELECT * FROM ice.db.\"orders$files\"",
+                "SELECT * FROM ice.db.orders",
+                "orders",
+                "orders",
+                false,
+                false,
+            ),
+            (
+                r#"SELECT * FROM ice.db."orders""#,
+                "orders",
+                r#""orders""#,
+                true,
+                false,
+            ),
+            (
+                r#"SELECT * FROM ice.db."orders$files""#,
                 "orders$files",
+                r#""orders$files""#,
+                true,
                 true,
             ),
         ] {
@@ -670,16 +685,9 @@ mod tests {
                 panic!("original table");
             };
             let last = table.name.parts.last().unwrap();
-            assert_eq!(last.value, "orders$files");
+            assert_eq!(last.value, expected_table);
             assert_eq!(last.quoted, quoted);
-            assert_eq!(
-                &sql[last.span.start()..last.span.end()],
-                if quoted {
-                    "`orders$files`"
-                } else {
-                    "orders$files"
-                }
-            );
+            assert_eq!(&sql[last.span.start()..last.span.end()], spelling);
             let prepared =
                 analysis::prepare_mv_select_for_catalog_provider(&query, Some("ice"), "db")
                     .unwrap();
@@ -694,7 +702,7 @@ mod tests {
             assert_eq!(prepared.query_for_analysis(), &original);
             let base = make_ref("ice", "db", expected_table);
             let actual = flow::validate_incremental_mv_base_ref(&query, &base);
-            if quoted {
+            if raw_dollar_name {
                 assert_eq!(
                     actual.unwrap_err(),
                     "incremental MV refresh stored SQL has invalid table reference: unsupported identifier `orders$files`"

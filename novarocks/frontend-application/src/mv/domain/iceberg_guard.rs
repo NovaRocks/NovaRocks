@@ -610,7 +610,7 @@ mod context_tests;
 
 #[cfg(test)]
 #[test]
-fn metadata_from_qualifiers_do_not_strip_generic_delete_target_names() {
+fn base_wildcard_and_raw_metadata_names_keep_distinct_guards() {
     use novarocks_parser::{
         ast::{Relation, SetExpr, TrinoStatement},
         parser,
@@ -620,9 +620,11 @@ fn metadata_from_qualifiers_do_not_strip_generic_delete_target_names() {
         namespace: "sales".into(),
         table: "orders".into(),
     };
-    let source = "SELECT ice.sales.orders.* FROM ice.sales.\"orders$files\"";
-    let query = parser::parse_query(source).expect("SELECT");
+    let query = parser::parse_query("SELECT ice.sales.orders.* FROM ice.sales.orders").unwrap();
     assert!(query_projects_target_wildcard(&query, &target));
+    let source = r#"SELECT * FROM ice.sales."orders$files""#;
+    let raw_query = parser::parse_query(source).unwrap();
+    assert!(!query_projects_target_wildcard(&raw_query, &target));
     let SetExpr::Select(select) = query.body.as_ref() else {
         panic!("SELECT");
     };
@@ -634,7 +636,16 @@ fn metadata_from_qualifiers_do_not_strip_generic_delete_target_names() {
         name_parts_qualifier_keys(parts),
         ["ice.sales.orders", "orders", "sales.orders"]
     );
+    let SetExpr::Select(select) = raw_query.body.as_ref() else {
+        panic!("SELECT");
+    };
+    let Some(Relation::Table(table)) = &select.from else {
+        panic!("FROM table");
+    };
+    let parts = novarocks_sql::TableNameView::new(&table.name).parts();
+    assert_eq!(parts.collect::<Vec<_>>(), ["ice", "sales", "orders$files"]);
     let last = table.name.parts.last().unwrap();
+    assert!(last.quoted);
     assert_eq!(last.value, "orders$files");
     assert_eq!(
         &source[last.span.start()..last.span.end()],
@@ -652,6 +663,4 @@ fn metadata_from_qualifiers_do_not_strip_generic_delete_target_names() {
         &target
     ));
     assert!(name_parts_qualifier_keys(parts.iter().map(|part| part.value.as_str())).is_empty());
-    let query = parser::parse_query(r#"SELECT * FROM ice.sales."orders$files""#).unwrap();
-    assert!(!query_projects_target_wildcard(&query, &target));
 }

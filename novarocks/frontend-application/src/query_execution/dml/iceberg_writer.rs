@@ -1093,7 +1093,7 @@ mod tests {
             .iter()
             .map(|expr| printer::print_expression(expr).unwrap())
             .collect();
-        assert_eq!(first_row, vec!["1", "'us'", "10.5"]);
+        assert_eq!(first_row, vec!["1", "'us'", "DECIMAL '10.5'"]);
         assert_eq!(second_row, vec!["2", "'eu'", "20"]);
     }
 

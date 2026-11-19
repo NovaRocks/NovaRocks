@@ -797,7 +797,12 @@ mod tests {
     #[test]
     fn delete_predicates_keep_advanced_and_malformed_in_shapes_unsupported() {
         let columns = [column("n", DataType::Int32)];
-        for source in ["n <=> 1", "n BETWEEN 1 AND 2", "n IS TRUE", "n LIKE '1%'"] {
+        for source in [
+            "n IS NOT DISTINCT FROM 1",
+            "n BETWEEN 1 AND 2",
+            "n IS TRUE",
+            "n LIKE '1%'",
+        ] {
             let error = super::validate_where(&where_expr(source), &columns).unwrap_err();
             let crate::dml::error::DmlExecutionError::Engine(error) = error else {
                 panic!("unsupported predicate error");

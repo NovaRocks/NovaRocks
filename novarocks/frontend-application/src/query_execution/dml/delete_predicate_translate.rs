@@ -631,7 +631,7 @@ mod tests {
     #[test]
     fn advanced_predicates_do_not_expand_delete_translation() {
         for source in [
-            "id <=> 1",
+            "id IS NOT DISTINCT FROM 1",
             "id BETWEEN 1 AND 2",
             "id IS TRUE",
             "name LIKE 'a%'",

@@ -897,7 +897,7 @@ fn literal_target_casts_keep_original_bitmap_and_hll_declarations() {
         let declared =
             FunctionValueType::try_with_logical_type(DataType::Binary, true, domain).unwrap();
         let target = ColumnDef::from_value_type("v".into(), declared, None).unwrap();
-        let query = shape(&format!("VALUES (({source}))"), &[target]);
+        let query = shape(&format!("VALUES ROW({source})"), &[target]);
         let original_call = cast_input(rows(&query)[0][0], target_name);
         assert!(ast::SyntaxEq::syntax_eq(
             original_call,

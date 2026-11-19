@@ -160,10 +160,6 @@ impl SqlConstantEvaluator for Recorder {
                     FrozenFoldNode::Intrinsic(FrozenFoldIntrinsic::Negate)
                 )
                 | (
-                    FixtureNode::UnaryOp(UnOp::BitwiseNot),
-                    FrozenFoldNode::Intrinsic(FrozenFoldIntrinsic::BitNot)
-                )
-                | (
                     FixtureNode::BinaryOp(_, _),
                     FrozenFoldNode::Intrinsic(
                         FrozenFoldIntrinsic::Arithmetic { .. }
@@ -229,7 +225,16 @@ fn capture(
 ) -> FoldRequest {
     use novarocks_physical_plan::{PipelineDopDomain, PlanVersionId, ScanReadBudget};
     use novarocks_sql::compiler::*;
+    use novarocks_sql::sql_mode::{SqlMode, SqlSemanticSettings};
     let _serial = CAPTURE_SERIAL.lock().unwrap();
+    let mut semantics = SqlSemanticSettings::default();
+    if matches!(
+        &node,
+        FixtureNode::BinaryOp(_, DecimalOverflowPolicy::ReportError)
+            | FixtureNode::Cast(DecimalOverflowPolicy::ReportError)
+    ) {
+        semantics = semantics.with_sql_mode(SqlMode::from_assignment("ERROR_IF_OVERFLOW"));
+    }
     *CAPTURE_STATE.lock().unwrap() = Some(CaptureState {
         node,
         sources,
@@ -244,7 +249,7 @@ fn capture(
         statement,
         SqlCompileIntent::Query,
         SqlSessionContext {
-            sql_semantics: Default::default(),
+            sql_semantics: semantics,
             current_catalog: None,
             current_database: "fixture".into(),
             optimizer_settings: SessionOptimizerSettings {
@@ -325,7 +330,6 @@ fn capture(
 // Keeping Nested also exercises structural-site validation after normalization.
 fn statement_with_sources(
     expression: &str,
-    hint: &str,
     sources: &[ConstantValue],
 ) -> novarocks_sql::compiler::SqlStatementInput {
     use novarocks_sql::compiler::{
@@ -335,7 +339,7 @@ fn statement_with_sources(
         .map(|i| format!("(NULL) AS v{i}"))
         .collect::<Vec<_>>()
         .join(",");
-    let sql = format!("SELECT {hint}{projections}, {expression} AS result");
+    let sql = format!("SELECT {projections}, {expression} AS result");
     let query = novarocks_parser::parser::parse_query(&sql).unwrap();
     let constants = sources
         .iter()
@@ -350,7 +354,7 @@ fn statement_with_sources(
         .collect::<Vec<_>>()
         .into();
     SqlStatementInput::query_with_expression_constants(
-        Box::new(query.clone()),
+        Box::new(query),
         constants,
         &novarocks_sql::compiler::SqlCompileControl::unbounded(),
     )
@@ -362,7 +366,7 @@ fn identity(arg: FoldArg) -> FoldRequest {
     // comparison instead; unlike a Carrier/Call it has no hidden receipt.
     let sources = vec![i64(1).value, i64(2).value];
     let mut request = capture(
-        statement_with_sources("v0 = v1", "", &sources),
+        statement_with_sources("v0 = v1", &sources),
         FixtureNode::BinaryOp(BinOp::Eq, DecimalOverflowPolicy::OutputNull),
         Some(sources),
         DataType::Boolean,
@@ -426,7 +430,7 @@ fn request(kind: FixtureNode, args: Vec<FoldArg>, result: DataType) -> FoldReque
                 match op {
                     UnOp::Not => "NOT ",
                     UnOp::Negate => "-",
-                    UnOp::BitwiseNot => "~",
+                    UnOp::BitwiseNot => unreachable!("BitNot is a typed evaluator fixture"),
                 },
                 vars[0]
             )
@@ -456,17 +460,8 @@ fn request(kind: FixtureNode, args: Vec<FoldArg>, result: DataType) -> FoldReque
             )
         }
     };
-    let hint = if matches!(
-        kind,
-        FixtureNode::BinaryOp(_, DecimalOverflowPolicy::ReportError)
-            | FixtureNode::Cast(DecimalOverflowPolicy::ReportError)
-    ) {
-        "/*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ "
-    } else {
-        ""
-    };
     let sources = args.iter().map(|arg| arg.value.clone()).collect::<Vec<_>>();
-    let statement = statement_with_sources(&expression, hint, &sources);
+    let statement = statement_with_sources(&expression, &sources);
     let mut request = capture(
         statement,
         kind,
@@ -604,16 +599,20 @@ fn folds_decimal_multiplication_and_checked_rounding_cast_with_exact_coefficient
 }
 #[test]
 fn declines_unmapped_unary_shapes_without_a_fake_kernel() {
-    for kind in [
+    let mut unmapped = request(
         FixtureNode::UnaryOp(UnOp::Negate),
-        FixtureNode::UnaryOp(UnOp::BitwiseNot),
-    ] {
-        assert!(matches!(
-            constant_evaluator()
-                .eval_scalar(&request(kind, vec![i32(1)], DataType::Int32), &TestControl),
-            Ok(None)
-        ));
-    }
+        vec![i32(1)],
+        DataType::Int32,
+    );
+    assert!(matches!(
+        constant_evaluator().eval_scalar(&unmapped, &TestControl),
+        Ok(None)
+    ));
+    unmapped.kind = FrozenFoldNode::Intrinsic(FrozenFoldIntrinsic::BitNot);
+    assert!(matches!(
+        constant_evaluator().eval_scalar(&unmapped, &TestControl),
+        Ok(None)
+    ));
     let boolean = arg(
         Arc::new(arrow::array::BooleanArray::from(vec![true])),
         false,

@@ -691,7 +691,7 @@ mod tests {
             ("SET SESSION trc_unknown = 1", true),
             ("SET SESSION query_timeout = -1", true),
             ("SET SESSION pipeline_dop = 1.5", false),
-            ("SET SESSION pipeline_dop = NULL", false),
+            ("SET SESSION pipeline_dop = NULL", true),
             ("SET SESSION pipeline_dop = missing_column", false),
             ("SET SESSION pipeline_dop = (SELECT 1)", false),
             ("SET SESSION pipeline_dop = 1 / 0", false),

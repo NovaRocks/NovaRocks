@@ -209,12 +209,10 @@ async fn catalog_borrowed_wait_drop_preserves_actual_cpu_until_receive_and_close
         .unwrap();
     assert_eq!(command.name, "Warehouse");
     assert!(command.if_not_exists);
+    assert_eq!(command.connector_name.as_deref(), Some("iceberg"));
     assert_eq!(
         command.properties,
-        vec![
-            ("type".into(), "iceberg".into()),
-            ("MixedKey".into(), "selected中".into())
-        ]
+        vec![("MixedKey".into(), "selected中".into())]
     );
     assert!(tail.preparation.is_none());
     drop(command);

@@ -414,7 +414,7 @@ mod tests {
 
     #[test]
     fn preserves_dynamic_overwrite_target() {
-        let command = convert("INSERT OVERWRITE PARTITIONS TABLE db.t VALUES (1)").unwrap();
+        let command = convert("INSERT OVERWRITE PARTITIONS db.t VALUES (1)").unwrap();
         assert_eq!(command.target.parts, ["db", "t"]);
         assert_eq!(
             command.overwrite_mode,
