@@ -137,10 +137,10 @@ SELECT s.a FROM (SELECT CAST(ROW(1) AS STRUCT<a integer>) AS s) AS t;
 SELECT a2[1].a FROM (VALUES ([CAST(ROW(1) AS STRUCT<a integer>)])) AS t (a2);
 
 -- query 38
-SELECT (s).a FROM (SELECT CAST(ROW(1) AS STRUCT<a integer>) AS s) AS t;
+SELECT t.s.a FROM (SELECT CAST(ROW(1) AS STRUCT<a integer>) AS s) AS t;
 
 -- query 39
-SELECT (CAST(s AS STRUCT<a bigint>)).a FROM (SELECT CAST(ROW(1) AS STRUCT<a integer>) AS s) AS t;
+SELECT CAST(s AS STRUCT<a bigint>).a FROM (SELECT CAST(ROW(1) AS STRUCT<a integer>) AS s) AS t;
 
 -- query 40
 SELECT s.A FROM (SELECT CAST(ROW(1) AS STRUCT<a integer>) AS s) AS t;
