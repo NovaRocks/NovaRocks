@@ -128,10 +128,7 @@ CREATE MATERIALIZED VIEW ${case_db}.decimal_promotion_hint_mv AS SELECT /*+ SET_
 
 -- query 22
 -- @skip_result_check=true
--- @expect_error=invalid decimal_overflow_to_double value
--- @expect_sql_code=sql.analyze.invalid_argument
--- @expect_error_at=1:47
--- @expect_error_tier=target
+-- @expect_trino_error=INVALID_SESSION_PROPERTY,USER_ERROR,2
 -- D32 target migration: validate the same invalid value at the root query boundary.
 SET SESSION decimal_overflow_to_double = false;
 WITH SESSION decimal_overflow_to_double = 'invalid' SELECT /*+ SET_VAR(decimal_overflow_to_double='invalid') */ 1 FROM (SELECT 1 AS v) t;
