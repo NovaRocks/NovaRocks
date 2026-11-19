@@ -18,14 +18,18 @@
 #[path = "lowered_window_table_canonical_tests.rs"]
 mod lowered_window_table_canonical_tests;
 
+use super::original_emission_test_observer::{
+    OriginalEmissionObserver, OriginalEmissionView, OriginalWindowEmission,
+    lower_read_with_original_emission_observer,
+};
 use super::tests::{column, dop, stats, values, version};
 use super::*;
 use crate::analysis::{SortItem, WindowBound, WindowFrame, WindowFrameType};
 use crate::binding::SqlFunctionBinding;
 use crate::compiler::SqlAuthoredPhysicalPlan;
 use crate::planner::distributed::build::lowered_draft::{
-    CheckedExpressionLogicalSourceEntry, CheckedTableLogicalSourceEntry,
-    SqlOperationalProjectionError, SqlSourceJournalError,
+    CheckedTableLogicalSourceEntry, CheckedWindowLogicalSourceEntry, SqlOperationalProjectionError,
+    SqlSourceJournalError,
 };
 use crate::planner::payload::{PlanTableFunctionNode, PlanWindowNode, WindowExpr};
 use arrow::array::{Array, Int64Array, ListArray};
@@ -126,20 +130,101 @@ pub(in crate::planner::distributed::build) fn finish(
     .finish_observed(&control)
     .unwrap()
 }
+/// Run the real driver and inspect its original Window before mandatory
+/// implementation admission. The result is still the driver's final result.
+pub(in crate::planner::distributed::build) fn observe_window_emission<F>(
+    source: &PhysicalPlanNode,
+    control: &dyn PureCompileControl,
+    mut inspect: F,
+) -> Result<(), ContractLoweringError>
+where
+    F: FnMut(
+        OriginalWindowEmission<'_>,
+        &mut CompileCheckpoints<'_>,
+    ) -> Result<(), ContractLoweringError>,
+{
+    struct Observer<'inspect, F>(&'inspect mut F);
+    impl<F> OriginalEmissionObserver for Observer<'_, F>
+    where
+        F: FnMut(
+            OriginalWindowEmission<'_>,
+            &mut CompileCheckpoints<'_>,
+        ) -> Result<(), ContractLoweringError>,
+    {
+        fn observe(
+            &mut self,
+            view: OriginalEmissionView<'_>,
+            work: &mut CompileCheckpoints<'_>,
+        ) -> Result<(), ContractLoweringError> {
+            assert_eq!(view.journal().window_entries.len(), 1);
+            let (&(fragment, site), _) = view.journal().window_entries.first_key_value().unwrap();
+            (self.0)(view.window_source(fragment, site, work)?, work)
+        }
+    }
+    let mut observer = Observer(&mut inspect);
+    lower_read_with_original_emission_observer(
+        source,
+        version(),
+        dop(),
+        None,
+        crate::functions::builtin_sql_function_catalog().snapshot(),
+        false,
+        policy(),
+        control,
+        &mut observer,
+    )
+    .map(|_| ())
+}
+pub(in crate::planner::distributed::build) fn assert_window_unavailable(
+    result: Result<(), ContractLoweringError>,
+    original: &SqlFunctionBinding,
+) {
+    assert_eq!(original.resolved().kind, FunctionKind::Aggregate);
+    assert!(
+        matches!(result,
+            Err(ContractLoweringError::FunctionBinding(
+                novarocks_functions::FunctionBindingError::UnavailableImplementation(ref overload)
+            )) if overload == &original.resolved().selected.overload
+        ),
+        "the real AggregateWindow admission must retain its exact missing implementation: {result:?}"
+    );
+}
+
 pub(in crate::planner::distributed::build) fn window_source(
     owner: &SqlAuthoredPhysicalPlan,
-) -> (&Fragment, &novarocks_physical_plan::ExprNode) {
+) -> (
+    &Fragment,
+    &novarocks_physical_plan::PhysicalNode,
+    novarocks_physical_plan::PhysicalCallSite,
+    &novarocks_physical_plan::WindowCallSpec,
+) {
     owner
         .plan()
         .fragments()
         .values()
         .find_map(|fragment| {
-            fragment.expressions().iter().find_map(|(_, source)| {
-                matches!(source.kind, ContractExprKind::WindowCall { .. })
-                    .then_some((fragment, source))
+            fragment.nodes().values().find_map(|node| {
+                let NodeKind::Window(spec) = &node.kind else {
+                    return None;
+                };
+                spec.calls
+                    .iter()
+                    .enumerate()
+                    .next()
+                    .map(|(ordinal, source)| {
+                        (
+                            fragment,
+                            node,
+                            novarocks_physical_plan::PhysicalCallSite::Window {
+                                node: node.id,
+                                call: u32::try_from(ordinal).unwrap(),
+                            },
+                            source,
+                        )
+                    })
             })
         })
-        .expect("actual window emission")
+        .expect("actual relational window emission")
 }
 pub(in crate::planner::distributed::build) fn table_source(
     owner: &SqlAuthoredPhysicalPlan,
@@ -158,11 +243,14 @@ pub(in crate::planner::distributed::build) fn table_source(
 fn window_loan<'a>(
     owner: &'a SqlAuthoredPhysicalPlan,
     fragment: &'a Fragment,
-    source: &'a novarocks_physical_plan::ExprNode,
+    unit_node: &'a novarocks_physical_plan::PhysicalNode,
+    window_site: novarocks_physical_plan::PhysicalCallSite,
+    source: &'a novarocks_physical_plan::WindowCallSpec,
     control: &dyn PureCompileControl,
-) -> Result<CheckedExpressionLogicalSourceEntry<'a>, SqlSourceJournalError> {
+) -> Result<CheckedWindowLogicalSourceEntry<'a>, SqlSourceJournalError> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
-    let result = owner.checked_window_source_observed(fragment, source, &mut work);
+    let result =
+        owner.checked_window_source_observed(fragment, unit_node, window_site, source, &mut work);
     if matches!(&result, Err(SqlSourceJournalError::Control(_))) {
         return result;
     }
@@ -191,13 +279,24 @@ fn constant(source: &FunctionArgument) -> Option<&novarocks_functions::ConstantV
 }
 fn emitted(
     owner: &SqlAuthoredPhysicalPlan,
-    fragment: &Fragment,
+    unit_node: &novarocks_physical_plan::PhysicalNode,
     id: ExprId,
 ) -> novarocks_functions::ConstantValue {
-    let source = fragment.expressions().get(id).unwrap();
+    let source = unit_node
+        .expressions
+        .as_ref()
+        .unwrap()
+        .definition(id)
+        .unwrap();
     let ContractExprKind::Constant(reference) = source.kind else {
         panic!("actual selected constant")
     };
+    reference_constant(owner, reference)
+}
+fn reference_constant(
+    owner: &SqlAuthoredPhysicalPlan,
+    reference: novarocks_constant_contract::ConstantReference,
+) -> novarocks_functions::ConstantValue {
     let control = Control::default();
     let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
     let value = owner
@@ -207,6 +306,16 @@ fn emitted(
         .unwrap();
     work.finish().unwrap();
     value
+}
+fn root_definitions(
+    fragment: &Fragment,
+    node: NodeId,
+    roots: &[novarocks_expression_contract::RootOrdinal],
+) -> Vec<ExprId> {
+    roots
+        .iter()
+        .map(|root| fragment.root_expression(node, *root).unwrap().id)
+        .collect()
 }
 pub(in crate::planner::distributed::build) fn list_value(ordinal: u32) -> TypedExpr {
     let field = Arc::new(arrow::datatypes::Field::new("item", DataType::Int64, true));
@@ -362,9 +471,25 @@ fn window_journal_real_completion_keeps_row_number_and_min_requests() {
     ] {
         let owner = crate::compiler::compile_authored_aggregate_for_test(sql);
         let clone = owner.clone();
-        let (fragment, source) = window_source(&owner);
-        let original = window_loan(&owner, fragment, source, &Control::default()).unwrap();
-        let copied = window_loan(&clone, fragment, source, &Control::default()).unwrap();
+        let (fragment, unit_node, window_site, source) = window_source(&owner);
+        let original = window_loan(
+            &owner,
+            fragment,
+            unit_node,
+            window_site,
+            source,
+            &Control::default(),
+        )
+        .unwrap();
+        let copied = window_loan(
+            &clone,
+            fragment,
+            unit_node,
+            window_site,
+            source,
+            &Control::default(),
+        )
+        .unwrap();
         assert!(Arc::ptr_eq(owner.plan_arc(), clone.plan_arc()));
         assert!(std::ptr::eq(original.captured(), copied.captured()));
         assert!(std::ptr::eq(original.fragment(), fragment));
@@ -385,9 +510,15 @@ fn window_journal_real_completion_keeps_row_number_and_min_requests() {
         let control = Control::default();
         let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
         assert!(matches!(
-            owner.checked_scalar_source_observed(fragment, source, &mut work),
+            owner.checked_window_source_observed(
+                fragment,
+                unit_node,
+                novarocks_physical_plan::PhysicalCallSite::Table { node: unit_node.id },
+                source,
+                &mut work
+            ),
             Err(SqlSourceJournalError::InvalidSource(
-                "expression journal loan uses a different call lifecycle"
+                "window journal loans a different actual call slot"
             ))
         ));
         work.finish().unwrap();
@@ -404,6 +535,7 @@ fn table_journal_real_parser_completion_keeps_whole_relation_request() {
     );
     let clone = owner.clone();
     let (fragment, source) = table_source(&owner);
+    let unit_node = source;
     let receipt = table_loan(&owner, fragment, source, &Control::default()).unwrap();
     let other = table_loan(&clone, fragment, source, &Control::default()).unwrap();
     assert!(std::ptr::eq(receipt.captured(), other.captured()));
@@ -423,7 +555,10 @@ fn table_journal_real_parser_completion_keeps_whole_relation_request() {
         unreachable!()
     };
     assert_eq!(function.result_types.as_ref(), result.as_ref());
-    assert_eq!(receipt.arguments(), arguments.as_ref());
+    assert_eq!(
+        receipt.arguments(),
+        root_definitions(fragment, unit_node.id, arguments).as_slice()
+    );
     assert_eq!(result.len(), 1);
 }
 
@@ -451,68 +586,95 @@ fn window_journal_orders_only_logical_and_function_order_channels_with_original_
             nulls_first: true,
         }],
     );
-    let owner = finish(&source);
-    let (fragment, source) = window_source(&owner);
-    let receipt = window_loan(&owner, fragment, source, &Control::default()).unwrap();
-    assert!(std::ptr::eq(
-        receipt.captured().binding().resolved(),
-        binding.resolved()
-    ));
-    assert_eq!(
-        receipt.captured().binding().decimal_overflow_policy(),
-        DecimalOverflowPolicy::ReportError
-    );
-    let request = receipt.captured().request();
-    assert_eq!(request.logical_argument_count, 1);
-    assert_eq!(request.arguments.len(), 2);
-    let ContractExprKind::WindowCall {
-        args,
-        function_order_by,
-        frame,
-        ..
-    } = &source.kind
-    else {
-        unreachable!()
-    };
-    assert_eq!(receipt.arguments(), &[args[0], function_order_by[0].expr]);
-    assert_eq!(function_order_by[0].direction, SortDirection::Descending);
-    assert_eq!(function_order_by[0].null_ordering, NullOrdering::First);
-    let projected = project(&Control::default(), |work| {
-        receipt.operational_arguments_observed(owner.plan().constants(), work)
-    })
-    .unwrap();
-    assert_eq!(projected.len(), 2);
-    for (index, ordinal) in [1, 2].into_iter().enumerate() {
-        let captured = constant(&request.arguments[index]).unwrap();
-        let operational = constant(&projected[index]).unwrap();
-        assert_eq!(operational.ordinal(), ordinal);
-        assert_eq!(
-            operational.pool().backing_identity(),
-            captured.pool().backing_identity()
-        );
-        let actual = emitted(&owner, fragment, receipt.arguments()[index]);
-        assert_eq!(actual.ordinal(), ordinal);
-        assert!(Arc::ptr_eq(captured.pool().array(), pool.array()));
-        assert!(Arc::ptr_eq(actual.pool().array(), captured.pool().array()));
-        assert!(Arc::ptr_eq(
-            actual.pool().field_ref(),
-            captured.pool().field_ref()
+    let control = Control::default();
+    let mut seen = 0;
+    let result = observe_window_emission(&source, &control, |receipt, work| {
+        seen += 1;
+        let unit_node = receipt.node();
+        let source = receipt.source();
+        assert!(std::ptr::eq(
+            receipt.captured().binding().resolved(),
+            binding.resolved()
         ));
-    }
-    let Some(ContractWindowFrame {
-        start: ContractWindowBound::Preceding(offset),
-        ..
-    }) = frame
-    else {
-        panic!("frame offset")
-    };
-    assert!(!receipt.arguments().contains(offset));
-    let node = fragment.nodes().get(&source.owner).unwrap();
-    let NodeKind::Window(spec) = &node.kind else {
-        unreachable!()
-    };
-    assert!(!receipt.arguments().contains(&spec.partition_by[0].expr));
-    assert!(!receipt.arguments().contains(&spec.order_by[0].expr));
+        assert_eq!(
+            receipt.captured().binding().decimal_overflow_policy(),
+            DecimalOverflowPolicy::ReportError
+        );
+        let request = receipt.captured().request();
+        assert_eq!(request.logical_argument_count, 1);
+        assert_eq!(request.arguments.len(), 2);
+        let novarocks_physical_plan::WindowCallSpec {
+            arguments: args,
+            order_by: function_order_by,
+            frame,
+            ..
+        } = source;
+        assert_eq!(
+            receipt.arguments(),
+            &[
+                receipt.definitions().root_definition(args[0]).unwrap().id,
+                receipt
+                    .definitions()
+                    .root_definition(function_order_by[0].expr)
+                    .unwrap()
+                    .id
+            ]
+        );
+        assert_eq!(function_order_by[0].direction, SortDirection::Descending);
+        assert_eq!(function_order_by[0].null_ordering, NullOrdering::First);
+        let projected = receipt.operational_arguments(&control)?;
+        assert_eq!(projected.len(), 2);
+        for (index, ordinal) in [1, 2].into_iter().enumerate() {
+            let captured = constant(&request.arguments[index]).unwrap();
+            let operational = constant(&projected[index]).unwrap();
+            assert_eq!(operational.ordinal(), ordinal);
+            assert_eq!(
+                operational.pool().backing_identity(),
+                captured.pool().backing_identity()
+            );
+            let actual = receipt.emitted_constant(receipt.arguments()[index], work)?;
+            assert_eq!(actual.ordinal(), ordinal);
+            assert!(Arc::ptr_eq(captured.pool().array(), pool.array()));
+            assert!(Arc::ptr_eq(actual.pool().array(), captured.pool().array()));
+            assert!(Arc::ptr_eq(
+                actual.pool().field_ref(),
+                captured.pool().field_ref()
+            ));
+        }
+        let Some(ContractWindowFrame {
+            start: ContractWindowBound::Preceding(offset),
+            ..
+        }) = frame
+        else {
+            panic!("frame offset")
+        };
+        assert!(receipt.arguments().iter().all(|id| !matches!(receipt.definitions().definition(*id).unwrap().kind, ContractExprKind::Constant(reference) if reference == *offset)));
+        let node = unit_node;
+        let NodeKind::Window(spec) = &node.kind else {
+            unreachable!()
+        };
+        assert!(
+            !receipt.arguments().contains(
+                &receipt
+                    .definitions()
+                    .root_definition(spec.partition_by[0].expr)
+                    .unwrap()
+                    .id
+            )
+        );
+        assert!(
+            !receipt.arguments().contains(
+                &receipt
+                    .definitions()
+                    .root_definition(spec.order_by[0].expr)
+                    .unwrap()
+                    .id
+            )
+        );
+        Ok(())
+    });
+    assert_eq!(seen, 1);
+    assert_window_unavailable(result, &binding);
 }
 
 #[test]
@@ -521,6 +683,7 @@ fn table_journal_selected_list_ordinal_and_left_whole_relation_keep_full_source(
     let (source, binding) = table_fixture(args, true);
     let owner = finish(&source);
     let (fragment, node) = table_source(&owner);
+    let unit_node = node;
     let receipt = table_loan(&owner, fragment, node, &Control::default()).unwrap();
     assert!(std::ptr::eq(
         receipt.captured().binding().resolved(),
@@ -562,7 +725,7 @@ fn table_journal_selected_list_ordinal_and_left_whole_relation_keep_full_source(
             captured.pool().backing_identity()
         );
         assert_eq!(operational.value_type(), captured.value_type());
-        let actual = emitted(&owner, fragment, receipt.arguments()[index]);
+        let actual = emitted(&owner, unit_node, receipt.arguments()[index]);
         assert_eq!(actual.ordinal(), ordinal);
         assert!(Arc::ptr_eq(actual.pool().array(), captured.pool().array()));
         assert!(Arc::ptr_eq(
@@ -603,11 +766,19 @@ fn window_and_table_journals_keep_none_elision_and_typed_null_source_policy() {
     ] {
         let (source, _) = window_fixture(vec![input], vec![]);
         let owner = finish(&source);
-        let (fragment, source) = window_source(&owner);
-        let receipt = window_loan(&owner, fragment, source, &Control::default()).unwrap();
+        let (fragment, unit_node, window_site, source) = window_source(&owner);
+        let receipt = window_loan(
+            &owner,
+            fragment,
+            unit_node,
+            window_site,
+            source,
+            &Control::default(),
+        )
+        .unwrap();
         assert!(constant(&receipt.captured().request().arguments[0]).is_none());
         assert_eq!(
-            emitted(&owner, fragment, receipt.arguments()[0])
+            emitted(&owner, unit_node, receipt.arguments()[0])
                 .try_i64()
                 .unwrap(),
             Some(7)
@@ -624,11 +795,12 @@ fn window_and_table_journals_keep_none_elision_and_typed_null_source_policy() {
         let (source, _) = table_fixture(vec![input], false);
         let owner = finish(&source);
         let (fragment, node) = table_source(&owner);
+        let unit_node = node;
         let receipt = table_loan(&owner, fragment, node, &Control::default()).unwrap();
         let captured_request = receipt.captured().request();
         let captured = constant(&captured_request.arguments[0]);
         assert_eq!(captured.is_none(), is_nested);
-        let actual = emitted(&owner, fragment, receipt.arguments()[0]);
+        let actual = emitted(&owner, unit_node, receipt.arguments()[0]);
         assert_eq!(
             actual
                 .is_null_observed(CompilePhase::Validate, &Control::default())
@@ -645,27 +817,28 @@ fn window_and_table_journals_keep_none_elision_and_typed_null_source_policy() {
 fn window_and_table_journal_foreign_missing_and_all_small_control_prefixes_are_exact() {
     let (source, _) = window_fixture(vec![integer(7)], vec![]);
     let window_owner = finish(&source);
-    let (wf, ws) = window_source(&window_owner);
+    let (wf, wn, original_site, ws) = window_source(&window_owner);
     let foreign_window = ws.clone();
     let foreign_wf = wf.clone();
-    let missing_window = wf
-        .expressions()
-        .iter()
-        .find(|(_, source)| !matches!(source.kind, ContractExprKind::WindowCall { .. }))
-        .unwrap()
-        .1;
-    for (fragment, source) in [
-        (wf, ws),
-        (wf, &foreign_window),
-        (&foreign_wf, ws),
-        (wf, missing_window),
+    let NodeKind::Window(spec) = &wn.kind else {
+        unreachable!()
+    };
+    // There is no expression-shaped Window source in this API. The absent
+    // actual slot is the negative membership boundary for a relational call.
+    let missing_site = novarocks_physical_plan::PhysicalCallSite::Window {
+        node: wn.id,
+        call: u32::try_from(spec.calls.len()).unwrap(),
+    };
+    for (fragment, source, site) in [
+        (wf, ws, original_site),
+        (wf, &foreign_window, original_site),
+        (&foreign_wf, ws, original_site),
+        (wf, ws, missing_site),
     ] {
         let control = Control::default();
-        let result = window_loan(&window_owner, fragment, source, &control);
-        if std::ptr::eq(source, ws) && std::ptr::eq(fragment, wf) {
+        let result = window_loan(&window_owner, fragment, wn, site, source, &control);
+        if std::ptr::eq(source, ws) && std::ptr::eq(fragment, wf) && site == original_site {
             assert!(result.is_ok());
-        } else if std::ptr::eq(source, missing_window) {
-            assert!(matches!(result, Err(SqlSourceJournalError::MissingEntry)));
         } else {
             assert!(matches!(
                 result,
@@ -690,7 +863,7 @@ fn window_and_table_journal_foreign_missing_and_all_small_control_prefixes_are_e
                     ..Control::default()
                 };
                 assert!(
-                    matches!(window_loan(&window_owner,fragment,source,&control),Err(SqlSourceJournalError::Control(actual)) if actual==cause)
+                    matches!(window_loan(&window_owner,fragment,wn,site,source,&control),Err(SqlSourceJournalError::Control(actual)) if actual==cause)
                 );
                 assert_eq!(control.trace(), trace[..=stop]);
             }
@@ -752,7 +925,7 @@ fn window_and_table_journal_foreign_missing_and_all_small_control_prefixes_are_e
 
 #[test]
 fn window_and_table_actual_capture_recording_preserve_every_lowering_control_prefix() {
-    let (window, _) = window_fixture(
+    let (window, binding) = window_fixture(
         vec![integer(7)],
         vec![SortItem {
             expr: integer(41),
@@ -761,42 +934,78 @@ fn window_and_table_actual_capture_recording_preserve_every_lowering_control_pre
         }],
     );
     let (table, _) = table_fixture(vec![list_value(1), list_value(2)], true);
+    let invoke_window = |control: &Control, seen: &mut usize| {
+        observe_window_emission(&window, control, |emission, _| {
+            *seen += 1;
+            let projected = emission.operational_arguments(control)?;
+            assert_eq!(projected.len(), 2);
+            assert_eq!(emission.captured().request().logical_argument_count, 1);
+            assert!(emission.canonical().belongs_to(emission.captured()));
+            Ok(())
+        })
+    };
+    let control = Control::default();
+    let mut seen = 0;
+    assert_window_unavailable(invoke_window(&control, &mut seen), &binding);
+    assert_eq!(seen, 1);
+    let baseline = control.trace();
+    assert!(
+        baseline
+            .iter()
+            .any(|(phase, _)| *phase == CompilePhase::FunctionSpecialization)
+    );
+    for stop in 0..baseline.len() {
+        for cause in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let control = Control {
+                refusal: Some((stop, cause.clone())),
+                ..Control::default()
+            };
+            let mut seen = 0;
+            assert!(
+                matches!(invoke_window(&control, &mut seen), Err(ContractLoweringError::Control(actual)) if actual == cause)
+            );
+            assert_eq!(control.trace(), baseline[..=stop]);
+        }
+    }
+    // The supported table branch still completes the original driver.
     let functions = crate::functions::builtin_sql_function_catalog().snapshot();
-    for source in [window, table] {
-        let invoke = |control: &Control| {
-            lower_final_physical_plan(
-                &source,
-                version(),
-                dop(),
-                functions.clone(),
-                false,
-                policy(),
-                control,
-            )
-        };
-        let control = Control::default();
-        assert!(invoke(&control).is_ok());
-        let baseline = control.trace();
-        assert!(
-            baseline
-                .iter()
-                .any(|(phase, _)| *phase == CompilePhase::FunctionSpecialization)
-        );
-        for stop in 0..baseline.len() {
-            for cause in [
-                CompileControlError::Cancelled,
-                CompileControlError::DeadlineExceeded,
-                CompileControlError::ResourceExhausted,
-            ] {
-                let control = Control {
-                    refusal: Some((stop, cause.clone())),
-                    ..Control::default()
-                };
-                assert!(
-                    matches!(invoke(&control), Err(ContractLoweringError::Control(actual)) if actual == cause)
-                );
-                assert_eq!(control.trace(), baseline[..=stop]);
-            }
+    let invoke_table = |control: &Control| {
+        lower_final_physical_plan(
+            &table,
+            version(),
+            dop(),
+            functions.clone(),
+            false,
+            policy(),
+            control,
+        )
+    };
+    let control = Control::default();
+    assert!(invoke_table(&control).is_ok());
+    let baseline = control.trace();
+    assert!(
+        baseline
+            .iter()
+            .any(|(phase, _)| *phase == CompilePhase::FunctionSpecialization)
+    );
+    for stop in 0..baseline.len() {
+        for cause in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let control = Control {
+                refusal: Some((stop, cause.clone())),
+                ..Control::default()
+            };
+            assert!(
+                matches!(invoke_table(&control), Err(ContractLoweringError::Control(actual)) if actual == cause)
+            );
+            assert_eq!(control.trace(), baseline[..=stop]);
         }
     }
 }
@@ -845,10 +1054,11 @@ fn aggregate_window_argument_limit_refuses_before_any_channel_emission() {
         ))
     ));
     assert!(visitor.call_sources.expression_entries.is_empty());
+    assert!(visitor.call_sources.window_entries.is_empty());
     assert!(
         visitor.fragments[&ROOT_FRAGMENT_ID]
-            .expressions()
-            .is_empty()
+            .construction_unit(NodeId::new(99))
+            .is_none_or(|unit| unit.is_empty())
     );
     assert_eq!(
         control.trace().last(),

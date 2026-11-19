@@ -318,39 +318,60 @@ impl SnapshotBoundDormantAttemptInputs {
     ) -> Result<ManifestBoundNativeAttemptInputs, DistributedQueryError> {
         let manifest = TaskManifestBinding::bind(self.native, schedule, self.topology)?;
         Ok(ManifestBoundNativeAttemptInputs {
-            manifest,
-            access: self.access,
+            original: Some(ManifestBoundNativeAttemptOriginals {
+                manifest,
+                access: self.access,
+            }),
         })
     }
 }
 
 /// Exact activation inputs after the Query Application schedule has been
 /// joined to its originating topology and Native template.
-pub(crate) struct ManifestBoundNativeAttemptInputs {
+pub(crate) struct ManifestBoundNativeAttemptOriginals {
     manifest: TaskManifestBinding,
     access: PreparedDistributedAttemptAccessOwner,
+}
+
+/// The same dormant shell remains stable while its concrete original inputs
+/// transfer once to the installed AP Source. An empty shell grants no access.
+pub(crate) struct ManifestBoundNativeAttemptInputs {
+    original: Option<ManifestBoundNativeAttemptOriginals>,
 }
 
 impl std::fmt::Debug for ManifestBoundNativeAttemptInputs {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("ManifestBoundNativeAttemptInputs")
-            .field("manifest", &self.manifest)
+            .field(
+                "manifest",
+                &self.original.as_ref().map(|original| &original.manifest),
+            )
             .finish_non_exhaustive()
     }
 }
 
 impl ManifestBoundNativeAttemptInputs {
-    pub(crate) const fn manifest(&self) -> &TaskManifestBinding {
-        &self.manifest
+    pub(crate) fn manifest(&self) -> &TaskManifestBinding {
+        &self
+            .original
+            .as_ref()
+            .expect("original Native inputs have not transferred to their Source")
+            .manifest
+    }
+
+    pub(crate) fn take_for_source(&mut self) -> ManifestBoundNativeAttemptOriginals {
+        self.original
+            .take()
+            .expect("one original manifest and access transfer to its Source")
     }
 
     pub(crate) fn eligible_backends(&self) -> &[BackendProcessId] {
-        self.manifest.eligible_backends()
+        self.manifest().eligible_backends()
     }
 
-    pub(crate) const fn execution_id(&self) -> QueryExecutionId {
-        self.manifest.execution()
+    pub(crate) fn execution_id(&self) -> QueryExecutionId {
+        self.manifest().execution()
     }
 
     /// Starts a borrowed activation transaction.
@@ -362,7 +383,11 @@ impl ManifestBoundNativeAttemptInputs {
     pub(crate) fn begin_activation(
         &mut self,
     ) -> Result<ManifestBoundNativeAttemptActivation<'_>, DistributedQueryError> {
-        let prepared = self.access.instantiate(&self.manifest)?;
+        let original = self
+            .original
+            .as_mut()
+            .expect("activation retains original Native inputs");
+        let prepared = original.access.instantiate(&original.manifest)?;
         Ok(ManifestBoundNativeAttemptActivation {
             inputs: self,
             prepared: Some(prepared),
@@ -384,7 +409,7 @@ impl std::fmt::Debug for ManifestBoundNativeAttemptActivation<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("ManifestBoundNativeAttemptActivation")
-            .field("manifest", &self.inputs.manifest)
+            .field("manifest", self.inputs.manifest())
             .field("prepared_available", &self.prepared.is_some())
             .finish()
     }
@@ -398,7 +423,8 @@ impl<'a> ManifestBoundNativeAttemptActivation<'a> {
             .prepared
             .take()
             .expect("one manifest activation can project only once");
-        (prepared, &self.inputs.manifest)
+        let inputs = self.inputs;
+        (prepared, inputs.manifest())
     }
 }
 

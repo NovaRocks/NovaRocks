@@ -36,8 +36,7 @@ use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, BooleanArray};
 use novarocks_local_program::{
-    JoinDistributionMode, LocalProgram, ProgramExpressionRootSite, ProgramNodeExpressionRole,
-    ProgramNodeId, ProgramNodeKind,
+    JoinDistributionMode, LocalProgram, ProgramNodeId, ProgramNodeKind, ProgramRootRef,
 };
 
 use super::build_requirements::{BuildComponentRequirements, required_build_components};
@@ -46,7 +45,6 @@ use super::native_runtime_filter::{
 };
 use super::typed_gather::JoinGatherError;
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
-use crate::exec::expr::compiled_program::CompiledExpressionInstance;
 use crate::exec::hash_table::partition_keys::source_key_owner;
 use crate::exec::hash_table::{allocation::AggregateAllocator, key_index::BulkWork};
 use crate::exec::node::join::JoinType;
@@ -67,6 +65,7 @@ use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
 use crate::runtime::task::{ExecutionFailure, ExecutionResult};
 use crate::runtime_filter::RuntimeFilterProducerFailure;
+use novarocks_expression::CompiledExpressionInstance;
 use novarocks_type_contract::{FunctionValueType, ValueTypeStorageLifetime};
 use novarocks_value_arrays::decode::ValueConversionContext;
 
@@ -97,8 +96,8 @@ pub(crate) fn prepare_join_schemas(
 /// The frozen facts of one compiled Join node that both sides share.
 pub(crate) struct CompiledHashJoinPlan {
     node: ProgramNodeId,
-    probe_sites: Vec<ProgramExpressionRootSite>,
-    build_sites: Vec<ProgramExpressionRootSite>,
+    probe_sites: Vec<ProgramRootRef>,
+    build_sites: Vec<ProgramRootRef>,
     build_key_bindings: Vec<FunctionValueType>,
     probe_key_bindings: Vec<FunctionValueType>,
     eq_null_safe: Vec<bool>,
@@ -161,30 +160,8 @@ impl CompiledHashJoinPlan {
                 ),
             ));
         }
-        let site = |role| ProgramExpressionRootSite::Node { node, role };
-        let ordinal = |key: usize| {
-            u32::try_from(key).map_err(|_| {
-                program_binding_failure(
-                    PlanBindingKind::InvalidAssignment,
-                    "join key count exceeds u32",
-                )
-            })
-        };
-        let mut probe_sites = Vec::with_capacity(keys.len());
-        let mut build_sites = Vec::with_capacity(keys.len());
-        for key in 0..keys.len() {
-            let key = ordinal(key)?;
-            probe_sites.push(site(if condition.is_null_aware() {
-                ProgramNodeExpressionRole::NaaValueProbeKey { key }
-            } else {
-                ProgramNodeExpressionRole::JoinProbeKey { key }
-            }));
-            build_sites.push(site(if condition.is_null_aware() {
-                ProgramNodeExpressionRole::NaaValueBuildKey { key }
-            } else {
-                ProgramNodeExpressionRole::JoinBuildKey { key }
-            }));
-        }
+        let probe_sites = keys.iter().map(|key| key.probe).collect::<Vec<_>>();
+        let build_sites = keys.iter().map(|key| key.build).collect::<Vec<_>>();
         let build_key_bindings = build_sites
             .iter()
             .map(|site| root_value_type(program, *site).map_err(ExecutionFailure::from))
@@ -209,13 +186,7 @@ impl CompiledHashJoinPlan {
                 "mark join requires its frozen single NULL-aware Utf8 equality key",
             ));
         }
-        let residual = condition.residual_predicate().map(|_| {
-            site(if condition.is_null_aware() {
-                ProgramNodeExpressionRole::NaaEligibility
-            } else {
-                ProgramNodeExpressionRole::JoinResidual
-            })
-        });
+        let residual = condition.residual_predicate();
         let requirements = required_build_components(join_type, residual.is_some(), true, true);
         Ok(Self {
             node,
@@ -235,7 +206,7 @@ impl CompiledHashJoinPlan {
     }
 
     /// The build-key root of key `ordinal`.
-    pub(crate) fn build_site(&self, ordinal: usize) -> Option<ProgramExpressionRootSite> {
+    pub(crate) fn build_site(&self, ordinal: usize) -> Option<ProgramRootRef> {
         self.build_sites.get(ordinal).copied()
     }
 }

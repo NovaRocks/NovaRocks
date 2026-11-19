@@ -25,7 +25,7 @@ use arrow_array::{Array, ArrayRef, BooleanArray, Int32Array, Int64Array};
 use arrow_schema::DataType;
 use novarocks_type_contract::{ArgumentControl, EvaluationDemand, ExpressionUseId};
 use novarocks_type_contract::{
-    CallEffects, CallProofScope, CompileControlError, DecimalOverflowPolicy, EvaluationDomainId,
+    CallEffects, CallProofScope, CompileControlError, DecimalOverflowPolicy, EvaluationRegionId,
     ExpressionEffects, FunctionEffectDeclaration, FunctionFailureBehavior, FunctionInstanceState,
     FunctionIntrinsicRowError, FunctionNullBehavior, FunctionVolatility, ObservableEffects,
     SemanticParameters,
@@ -161,11 +161,12 @@ impl Owner {
     }
     fn input(&self) -> CallEffectInput<'_> {
         CallEffectInput {
-            context: ExpressionEffectContext {
+            context: (ExpressionEffectContext {
                 use_id: ExpressionUseId::new(0),
-                domain: EvaluationDomainId::new(7),
+                region: EvaluationRegionId::new(7),
                 demand: EvaluationDemand::Value,
-            },
+            })
+            .into(),
             argument_uses: crate::CallArgumentUses::SelectedChannels(&self.uses),
             function_id: &self.id,
             kind: FunctionKind::Scalar,
@@ -178,14 +179,14 @@ impl Owner {
             environment: &[],
             parameters: &self.parameters,
             decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-            proof_scope: CallProofScope::Domain(EvaluationDomainId::new(7)),
+            proof_scope: CallProofScope::Region(EvaluationRegionId::new(7)),
         }
     }
     fn options(&self) -> HigherOrderPreparationOptions {
-        let outer = self.input().context;
+        let outer = self.input().context.expression().unwrap();
         let inner = ExpressionEffectContext {
             use_id: ExpressionUseId::new(10),
-            domain: EvaluationDomainId::new(11),
+            region: EvaluationRegionId::new(11),
             demand: EvaluationDemand::Value,
         };
         HigherOrderPreparationOptions {
@@ -803,14 +804,14 @@ fn real_sparse_collection_expansion_preserves_ordinary_order_capture_samples_and
     assert!(
         specialization
             .effects()
-            .for_use(owner.input().context)
+            .for_use(owner.input().context.expression().unwrap())
             .unwrap()
             .may_raise_row_error
     );
     assert!(
         specialization
             .effects()
-            .for_use(owner.input().context)
+            .for_use(owner.input().context.expression().unwrap())
             .unwrap()
             .has_instance_state
     );
@@ -902,7 +903,10 @@ fn fresh_frozen_specialization_refines_once_joins_body_full_effects_and_owns_no_
     )
     .unwrap();
     assert_eq!(fresh.effects(), frozen.effects());
-    let effects = frozen.effects().for_use(owner.input().context).unwrap();
+    let effects = frozen
+        .effects()
+        .for_use(owner.input().context.expression().unwrap())
+        .unwrap();
     assert!(effects.may_raise_row_error);
     assert!(effects.has_instance_state);
     assert_eq!(effects.value_stability, FunctionVolatility::Stable);

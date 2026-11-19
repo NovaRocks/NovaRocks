@@ -17,7 +17,7 @@
 
 //! Publication evidence and bounded cleanup are separate results.
 
-use super::{ArtifactRecord, ObjectIdentity, OperationToken};
+use super::{ObjectIdentity, OperationToken};
 use novarocks_spi::connector::ConnectorMutationFailure;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -44,6 +44,10 @@ pub enum IcebergCleanupReport {
     },
     /// A possibly dispatched publication keeps every object until adjudication.
     NotAttempted,
+    /// An ambiguous stage ID observation permanently withholds deletion authority.
+    Withheld {
+        reason: String,
+    },
 }
 
 impl IcebergCleanupReport {
@@ -62,6 +66,12 @@ impl IcebergCleanupReport {
                     format!(
                         "Iceberg owned artifact cleanup incomplete: deleted={deleted}, remaining={remaining:?}"
                     ),
+                ))
+            }
+            Self::Withheld { reason } => {
+                ExternalMutationFinalization::Failed(ConnectorMutationFailure::new(
+                    ConnectorMutationFailureKind::Internal,
+                    format!("Iceberg owned artifact cleanup withheld: {reason}"),
                 ))
             }
             Self::NotAttempted => {
@@ -93,14 +103,6 @@ pub enum PublicationOutcome<Proof, Evidence> {
             )
         )]
         operation: OperationToken,
-        #[cfg_attr(
-            not(test),
-            expect(
-                dead_code,
-                reason = "Retains the complete owned-object ledger while publication remains unknown."
-            )
-        )]
-        artifacts: Vec<ArtifactRecord>,
     },
 }
 

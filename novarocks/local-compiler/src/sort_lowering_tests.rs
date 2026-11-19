@@ -20,13 +20,8 @@ use super::*;
 use crate::sort::lower_sort;
 use crate::{FragmentCompileError, compile_fragment};
 use arrow_array::StringArray;
-use novarocks_local_program::{
-    ProgramExprId, ProgramExpressionArena, ProgramExpressionRootSite, ProgramNodeExpressionRole,
-    ProgramNodeId, ProgramNodeKind,
-};
-use novarocks_physical_plan::{
-    ExprNode, NullOrdering, SortDirection, SortExpr, SortMode, TopNPhase,
-};
+use novarocks_local_program::{LocalSortMode, PartitionRank, ProgramNodeId, ProgramNodeKind};
+use novarocks_physical_plan::{NullOrdering, SortDirection, SortExpr, SortMode, TopNPhase};
 use novarocks_type_contract::ValueLogicalType;
 
 pub(super) fn package(
@@ -47,29 +42,24 @@ pub(super) fn package(
     for value in input.fragment.values().values() {
         builder.insert_value(value.clone()).unwrap();
     }
-    for (_, expr) in input.fragment.expressions().iter() {
-        builder.insert_expression(expr.clone()).unwrap();
-    }
     for node in input.fragment.nodes().values() {
         builder.insert_node_unchecked(node.clone()).unwrap();
     }
     let values = NodeId::new(u32::MAX);
     let column = input.fragment.nodes()[&values].output.columns[0];
     let sort = NodeId::new(0);
-    let key = ExprId::new(1000);
-    builder
-        .insert_expression(ExprNode {
-            id: key,
-            owner: sort,
-            lambda_scope: None,
-            ty: source.value_type().clone(),
-            kind: ExprKind::Value(column),
-        })
+    let definition = builder
+        .define(sort, source.value_type().clone(), ExprKind::Value(column))
         .unwrap();
     match &mut mode {
         SortMode::Analytic { partition_by } | SortMode::PartitionTopN { partition_by, .. } => {
             *partition_by = Box::from([SortExpr {
-                expr: key,
+                expr: builder.root_definition(
+                    sort,
+                    definition,
+                    RootScope::Port(0),
+                    EvaluationDemand::Value,
+                ),
                 direction: SortDirection::Ascending,
                 null_ordering: NullOrdering::Last,
             }]);
@@ -78,7 +68,12 @@ pub(super) fn package(
     }
     let order: Box<[_]> = (0..keys)
         .map(|i| SortExpr {
-            expr: key,
+            expr: builder.root_definition(
+                sort,
+                definition,
+                RootScope::Port(0),
+                EvaluationDemand::Value,
+            ),
             direction: if i % 2 == 0 {
                 SortDirection::Descending
             } else {
@@ -101,10 +96,17 @@ pub(super) fn package(
     let root = if tail {
         let filter = NodeId::new(7);
         let predicate = builder
-            .add_expression(
+            .add_root(
                 filter,
                 FunctionValueType::new(DataType::Boolean, false),
-                ExprKind::Literal(novarocks_physical_plan::LiteralValue::Boolean(true)),
+                crate::test_constants::boolean(
+                    &mut input.constants,
+                    &FunctionValueType::new(DataType::Boolean, false),
+                    true,
+                    compile_options().constants,
+                ),
+                RootScope::Port(0),
+                EvaluationDemand::TruthOnly,
             )
             .unwrap();
         builder
@@ -112,10 +114,12 @@ pub(super) fn package(
             .unwrap();
         let project = NodeId::new(8);
         let expr = builder
-            .add_expression(
+            .add_root(
                 project,
                 source.value_type().clone(),
                 ExprKind::Value(column),
+                RootScope::Port(0),
+                EvaluationDemand::Value,
             )
             .unwrap();
         // The original property author retains named ordering only for values
@@ -136,7 +140,7 @@ pub(super) fn package(
         sort
     };
     let fragment = builder
-        .finish_definition(
+        .finish_fixture(
             root,
             FragmentSink::Result,
             PipelineDopDomain {
@@ -146,48 +150,6 @@ pub(super) fn package(
             },
             novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
-        .unwrap();
-    let roots = PhysicalExpressionRoots::try_new(&fragment, &Control::good()).unwrap();
-    let domain = EvaluationDomainId::new(0);
-    let mut uses = Vec::new();
-    let bindings = roots
-        .sites()
-        .iter()
-        .enumerate()
-        .map(|(position, (&site, root))| {
-            let use_id = ExpressionUseId::new(match position {
-                0 => 0,
-                1 => u32::MAX,
-                n => n as u32 - 1,
-            });
-            uses.push(ExpressionInvocation {
-                context: ExpressionEffectContext {
-                    use_id,
-                    domain,
-                    demand: root.demand,
-                },
-                definition: root.expr,
-                control: ControlShape::Eager,
-                arguments: Box::default(),
-            });
-            (site, use_id)
-        })
-        .collect();
-    let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
-            id: domain,
-            parent: None,
-            guard: None,
-        }],
-        uses,
-        fragment.expressions(),
-        CompilePhase::Validate,
-        &Control::good(),
-    )
-    .unwrap();
-    let expression_uses =
-        PhysicalRootUses::try_new(&fragment, flow, bindings, &Control::good()).unwrap();
-    let calls = FrozenFragmentCalls::try_new(&fragment, &expression_uses, vec![], &Control::good())
         .unwrap();
     let output = fragment.nodes()[&root].output.clone();
     let fields = output
@@ -208,8 +170,6 @@ pub(super) fn package(
         fields,
     });
     input.fragment = fragment;
-    input.expression_uses = expression_uses;
-    input.calls = calls;
     Arc::new(FragmentPackage::try_new(input, package_admission(), &Control::good()).unwrap())
 }
 fn compile(
@@ -225,7 +185,21 @@ fn component(
 ) -> Result<(ProgramNodeKind, novarocks_local_program::StaticLayout), FragmentCompileError> {
     let good = compile(Arc::new(package.clone()), &Control::good()).unwrap();
     let layout = good.graph().nodes()[0].output_layout();
-    let mut ids = BTreeMap::from([(ExprId::new(1000), ProgramExprId::new(0))]);
+    let physical = &package.fragment().nodes()[&NodeId::new(0)];
+    let novarocks_physical_plan::NodeKind::Sort { order_by, .. } = &physical.kind else {
+        panic!("Sort")
+    };
+    let ProgramNodeKind::Sort {
+        order_by: local, ..
+    } = good.graph().nodes()[1].kind()
+    else {
+        panic!("compiled Sort")
+    };
+    let mut ids = order_by
+        .iter()
+        .zip(local)
+        .map(|(source, local)| (source.expr, local.expr))
+        .collect::<BTreeMap<_, _>>();
     if missing {
         ids.clear();
     }
@@ -247,31 +221,13 @@ fn global_sort_public_compile_preserves_keys_occurrences_channels_and_inactive_f
     let program = compile(package, &Control::good()).unwrap();
     let ProgramNodeKind::Sort {
         input,
-        use_top_n,
         order_by,
-        limit,
-        offset,
-        topn_type,
-        max_buffered_rows,
-        max_buffered_bytes,
-        partition_exprs,
-        partition_limit,
+        mode: LocalSortMode::Full,
     } = program.graph().nodes()[1].kind()
     else {
-        panic!("sort")
+        panic!("global sort")
     };
     assert_eq!(input.index(), 0);
-    assert!(!use_top_n);
-    assert_eq!(*limit, None);
-    assert_eq!(*offset, 0);
-    assert!(matches!(
-        topn_type,
-        novarocks_local_program::SortTopNType::RowNumber
-    ));
-    assert_eq!(*max_buffered_rows, None);
-    assert_eq!(*max_buffered_bytes, None);
-    assert!(partition_exprs.is_empty());
-    assert_eq!(*partition_limit, None);
     assert_eq!(
         order_by
             .iter()
@@ -279,31 +235,28 @@ fn global_sort_public_compile_preserves_keys_occurrences_channels_and_inactive_f
             .collect::<Vec<_>>(),
         [(false, true), (true, false), (false, true)]
     );
-    assert!(order_by.iter().all(|key| key.expr == order_by[0].expr));
+    assert!(
+        order_by
+            .iter()
+            .all(|key| root_definition(&program, key.expr)
+                == root_definition(&program, order_by[0].expr))
+    );
     assert_eq!(
         program.graph().nodes()[0].output_layout().slots(),
         program.graph().nodes()[1].output_layout().slots()
     );
-    let roots = program
-        .checked()
-        .channels()
-        .expressions()
-        .resolved_calls()
-        .snapshot();
-    let roles: Vec<_> = roots
-        .bindings()
-        .keys()
-        .filter_map(|site| match site {
-            ProgramExpressionRootSite::Node {
-                node,
-                role: ProgramNodeExpressionRole::SortOrder { key },
-            } if node.index() == 1 => Some(*key),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(roles, [0, 1, 2]);
-    assert_eq!(roots.bindings().len(), 3);
-    assert_eq!(program.checked().slots().len(), 3);
+    let refs = order_by.iter().map(|key| key.expr).collect::<Vec<_>>();
+    assert_eq!(
+        refs.iter().map(|r| r.root.get()).collect::<Vec<_>>(),
+        [0, 1, 2]
+    );
+    let unit = program.unit(refs[0].unit).unwrap();
+    assert_eq!(unit.roots().len(), 3);
+    assert_eq!(unit.control_flow().uses().len(), 3);
+    assert!(
+        refs.iter()
+            .all(|r| unit.input(root_use(&program, *r)).is_some())
+    );
 }
 #[test]
 fn global_sort_downstream_project_filter_limit_keep_original_ordered_source() {
@@ -344,32 +297,60 @@ fn global_sort_downstream_project_filter_limit_keep_original_ordered_source() {
             &DataType::Utf8
         );
     }
-    let ty = program
-        .checked()
-        .channels()
-        .expressions()
-        .types()
-        .get(&ProgramExpressionArena::Main)
-        .unwrap();
-    assert!(ty.iter().any(|ty| matches!(ty, novarocks_type_contract::FunctionArgumentType::Value(ty) if ty.logical_type()==ValueLogicalType::Json && ty.nullable())));
+    assert!(program.units().iter().flat_map(|unit|unit.types().iter()).any(|ty| matches!(ty,novarocks_type_contract::FunctionArgumentType::Value(ty) if ty.logical_type()==ValueLogicalType::Json && ty.nullable())));
 }
 #[test]
-fn partition_topn_sort_mode_stays_explicitly_unsupported() {
-    let source = integer_pool();
-    let package = package(
-        &source,
-        1,
-        false,
-        SortMode::PartitionTopN {
-            partition_by: Box::default(),
-            limit: 1,
-            kind: novarocks_physical_plan::PartitionTopNType::RowNumber,
-        },
-        false,
-    );
-    assert!(
-        matches!(compile(package,&Control::good()),Err(FragmentCompileError::Unsupported {node:Some(node),feature:"sort mode without a local owner"}) if node==NodeId::new(0))
-    );
+fn partition_topn_sort_preserves_keys_limit_ranking_and_root_bindings() {
+    use novarocks_physical_plan::PartitionTopNType;
+    for (kind, expected) in [
+        (PartitionTopNType::RowNumber, PartitionRank::RowNumber),
+        (PartitionTopNType::Rank, PartitionRank::Rank),
+        (PartitionTopNType::DenseRank, PartitionRank::DenseRank),
+    ] {
+        let source = integer_pool();
+        let package = package(
+            &source,
+            1,
+            false,
+            SortMode::PartitionTopN {
+                partition_by: Box::default(),
+                limit: 2,
+                kind,
+            },
+            false,
+        );
+        let program = compile(package, &Control::good()).unwrap();
+        let node = ProgramNodeId::new(1);
+        let ProgramNodeKind::Sort {
+            input,
+            order_by,
+            mode:
+                LocalSortMode::PartitionTopN {
+                    partition_by,
+                    limit,
+                    rank,
+                },
+        } = program.graph().nodes()[node.index()].kind()
+        else {
+            panic!("partition TopN")
+        };
+        assert_eq!(input.index(), 0);
+        assert_eq!(limit.get(), 2);
+        assert_eq!(*rank, expected);
+        assert_eq!((order_by.len(), partition_by.len()), (1, 1));
+        assert!(partition_by[0].asc && !partition_by[0].nulls_first);
+        assert!(!order_by[0].asc && order_by[0].nulls_first);
+        assert_eq!(partition_by[0].expr.unit, order_by[0].expr.unit);
+        assert_ne!(partition_by[0].expr.root, order_by[0].expr.root);
+        assert_eq!(
+            crate::test_units::input_ordinal(&program, partition_by[0].expr),
+            0
+        );
+        assert_eq!(
+            crate::test_units::input_ordinal(&program, order_by[0].expr),
+            0
+        );
+    }
 }
 #[test]
 fn analytic_sort_leads_with_its_partition_keys_and_binds_their_roots() {
@@ -387,9 +368,9 @@ fn analytic_sort_leads_with_its_partition_keys_and_binds_their_roots() {
     let sort = ProgramNodeId::new(1);
     let ProgramNodeKind::Sort {
         order_by,
-        partition_exprs,
-        partition_limit,
-        use_top_n,
+        mode: LocalSortMode::Partitioned {
+            partition_by: partition_exprs,
+        },
         ..
     } = program.graph().nodes()[sort.index()].kind()
     else {
@@ -399,19 +380,14 @@ fn analytic_sort_leads_with_its_partition_keys_and_binds_their_roots() {
     // Partition keys keep their own frozen direction and NULL placement.
     assert!(partition_exprs[0].asc && !partition_exprs[0].nulls_first);
     assert!(!order_by[0].asc && order_by[0].nulls_first);
-    assert!(partition_limit.is_none() && !use_top_n);
-    let bindings = program
-        .checked()
-        .channels()
-        .expressions()
-        .resolved_calls()
-        .snapshot()
-        .bindings();
-    for role in [
-        ProgramNodeExpressionRole::SortPartition { key: 0 },
-        ProgramNodeExpressionRole::SortOrder { key: 0 },
-    ] {
-        assert!(bindings.contains_key(&ProgramExpressionRootSite::Node { node: sort, role }));
+    for reference in partition_exprs
+        .iter()
+        .map(|key| key.expr)
+        .chain(order_by.iter().map(|key| key.expr))
+    {
+        let unit = program.unit(reference.unit).unwrap();
+        let root = unit.root(reference.root).unwrap();
+        assert!(unit.control_flow().root_use_ids().contains(&root.use_id));
     }
 }
 #[test]

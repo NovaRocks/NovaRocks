@@ -18,8 +18,7 @@
 //! Actual original corpus table facts; permanent complete lowering contract.
 use arrow::datatypes::DataType;
 use novarocks_physical_plan::{
-    FunctionArgumentType, NodeKind, PhysicalCallDefinition, PhysicalCallSite,
-    StaticFunctionArgument,
+    FunctionArgumentType, NodeKind, PhysicalCallSite, StaticFunctionArgument,
 };
 fn sources() -> Vec<novarocks_sql::compiler::SqlAuthoredPhysicalPlan> {
     vec![
@@ -55,11 +54,10 @@ fn hll_payload_aggregate_actual_original_required_sql_full_signature_source() {
                         "builtin.aggregate/hll_union_agg/v1" => DataType::Int64,
                         _ => continue,
                     };
-                    let definition =
-                        PhysicalCallDefinition::Relational(PhysicalCallSite::Aggregate {
-                            node: node.id,
-                            call: u32::try_from(ordinal).unwrap(),
-                        });
+                    let definition = PhysicalCallSite::Aggregate {
+                        node: node.id,
+                        call: u32::try_from(ordinal).unwrap(),
+                    };
                     let request = fragment.call_requests().get(definition).unwrap();
                     assert_eq!(request.logical_argument_count, 1);
                     assert_eq!(request.arguments.len(), 1);

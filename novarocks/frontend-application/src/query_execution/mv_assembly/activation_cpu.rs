@@ -239,6 +239,10 @@ impl MvWriteAnalysisInput {
     }
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "The original supervised planning state retains its SQL continuation inline."
+)]
 pub(crate) enum MvWriteContinuation {
     First(DmlWriteCompletion),
     Incremental(DmlChangeStreamCompletion),

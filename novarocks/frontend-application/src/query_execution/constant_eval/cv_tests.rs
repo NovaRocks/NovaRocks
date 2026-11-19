@@ -689,8 +689,8 @@ fn assert_invalid_arithmetic(result: &Result<Option<ConstantValue>, SqlConstantE
     );
     assert_eq!(source.failure_fact().class(), FailureClass::Invariant);
     assert!(matches!(
-        source.downcast_ref::<novarocks_local_program::ProgramPrimitiveError>(),
-        Some(novarocks_local_program::ProgramPrimitiveError::Arithmetic(
+        source.downcast_ref::<novarocks_expression::PrimitiveError>(),
+        Some(novarocks_expression::PrimitiveError::Arithmetic(
             novarocks_functions::ArithmeticPrepareError::TypeMismatch
         ))
     ));
@@ -928,20 +928,25 @@ fn newly_materialized_unsigned_negative_scale_and_nested_metadata_outputs_are_cv
     // the FE port materializes an exact CV through a valid Identity node.
     let target = FunctionValueType::new(DataType::UInt32, true);
     let source = i32(7);
-    let converted = novarocks_execution::exec::expr::compiled_program::constant_node::evaluate_constant_node(
-        novarocks_execution::exec::expr::compiled_program::constant_node::ConstantNode::Conversion(
-            novarocks_execution::exec::expr::compiled_program::constant_node::ConstantConversion::Carrier(
-                novarocks_execution::exec::expr::compiled_program::constant_node::ConstantCarrierStep {
+    let converted = novarocks_expression::constant_node::evaluate_constant_node(
+        novarocks_expression::constant_node::ConstantNode::Conversion(
+            novarocks_expression::constant_node::ConstantConversion::Carrier(
+                novarocks_expression::constant_node::ConstantCarrierStep {
                     target: &target,
                     decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
                     allow_throw_exception: false,
-            array_failure_mode: None,
-                }
-            )
+                    array_failure_mode: None,
+                },
+            ),
         ),
-        &[source.value], &target, &TestControl, CompilePhase::FunctionSpecialization,
-    ).unwrap();
-    let novarocks_execution::exec::expr::compiled_program::constant_node::ConstantNodeOutcome::Value(converted) = converted else {
+        &[source.value],
+        &target,
+        &TestControl,
+        CompilePhase::FunctionSpecialization,
+    )
+    .unwrap();
+    let novarocks_expression::constant_node::ConstantNodeOutcome::Value(converted) = converted
+    else {
         panic!("the existing Int32-to-UInt32 cast must produce a value");
     };
     let output = evaluate(&identity(typed_arg(converted, target)));
@@ -1431,7 +1436,16 @@ fn regexp_count_real_sql_fold_author_attaches_existing_emitted_source_before_err
             .all(|row| *row == (Some(Source::NativeV1Utf8LiteralWhenPresent), true)),
         "the fold author must preserve the exact emitted source and typed decline: {seen:?}"
     );
-    assert!(owner.plan().fragments().values().any(|fragment| fragment.expressions().iter().any(|(_,expression)| matches!(&expression.kind,novarocks_physical_plan::ExprKind::FunctionCall {function,..} if function.function_id.as_str()=="builtin.scalar/regexp_count/v1"))), "failed literal evaluation must retain the actual call, never fold to NULL");
+    assert!(
+        super::sql_fold_dependency_observation_tests::expression_sources(&owner).any(
+            |(_, _, expression)| matches!(
+                &expression.kind,
+                novarocks_expression_contract::ExprKind::FunctionCall { function, .. }
+                    if function.function_id.as_str() == "builtin.scalar/regexp_count/v1"
+            )
+        ),
+        "failed literal evaluation must retain the actual call, never fold to NULL"
+    );
 }
 
 #[test]

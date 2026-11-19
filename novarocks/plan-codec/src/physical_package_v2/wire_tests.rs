@@ -110,11 +110,17 @@ fn generated_dto_presence_survives_byte_admission_without_semantic_publication()
             ..Default::default()
         }),
         types: Some(Default::default()),
-        expression_control: Some(Default::default()),
+        source_constant_policy: Some(Default::default()),
         calls: Some(Default::default()),
         pruning: Some(Default::default()),
         parameters: Some(Default::default()),
         cuts: Some(Default::default()),
+        layouts: vec![wire::FrozenWriteLayoutRecipe {
+            node_id: Some(0),
+            provider_binding_id: Some(7),
+            recipe_payload_id: Some(u32::MAX),
+            input_field_tokens: [9_u8; 32].to_vec(),
+        }],
         result: Some(Default::default()),
         ..Default::default()
     };

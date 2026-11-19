@@ -27,7 +27,7 @@ use novarocks_type_contract::{CompileCheckpoints, CompileControlError};
 use std::alloc::Layout;
 
 struct Definition<'a> {
-    id: ExprId,
+    id: (crate::NodeId, ExprId),
     node: &'a ExprNode,
     queued: bool,
 }
@@ -74,7 +74,12 @@ pub(super) fn validate_guarantees_observed(
     }
     let mut edges = 0usize;
     if guarantees != 0 {
-        for (_, definition) in fragment.expressions().iter() {
+        for definition in fragment
+            .nodes()
+            .values()
+            .filter_map(|n| n.expressions.as_ref())
+            .flat_map(|u| u.definitions())
+        {
             definition.kind.expression_references_observed(|_| {
                 let next = edges.checked_add(1);
                 work.step()?;
@@ -87,7 +92,12 @@ pub(super) fn validate_guarantees_observed(
     let count = if guarantees == 0 {
         0
     } else {
-        fragment.expressions().len()
+        fragment
+            .nodes()
+            .values()
+            .filter_map(|n| n.expressions.as_ref())
+            .map(|u| u.definitions().len())
+            .sum::<usize>()
     };
     let index_bytes = Layout::array::<Definition<'_>>(count)
         .map_err(|_| resource(limits))?
@@ -138,13 +148,17 @@ pub(super) fn validate_guarantees_observed(
         return Err(CompileControlError::ResourceExhausted.into());
     }
     work.flush()?;
-    for (id, node) in fragment.expressions().iter() {
-        definitions.push(Definition {
-            id: *id,
-            node,
-            queued: false,
-        });
-        work.step()?;
+    for owner in fragment.nodes().values() {
+        if let Some(unit) = &owner.expressions {
+            for node in unit.definitions() {
+                definitions.push(Definition {
+                    id: (owner.id, node.id),
+                    node,
+                    queued: false,
+                });
+                work.step()?;
+            }
+        }
     }
     for node in fragment.nodes().values() {
         work.step()?;
@@ -155,7 +169,14 @@ pub(super) fn validate_guarantees_observed(
             enqueue(
                 &mut definitions,
                 &mut pending,
-                guarantee.predicate,
+                (
+                    node.id,
+                    fragment
+                        .unit(node.id)
+                        .and_then(|u| u.root(guarantee.predicate))
+                        .ok_or_else(|| resource(limits))?
+                        .definition,
+                ),
                 work,
                 limits,
             )?;
@@ -163,10 +184,7 @@ pub(super) fn validate_guarantees_observed(
             while let Some(ordinal) = pending.pop() {
                 work.step()?;
                 let definition = definitions[ordinal].node;
-                let needs_proof = matches!(
-                    definition.kind,
-                    ExprKind::FunctionCall { .. } | ExprKind::WindowCall { .. }
-                );
+                let needs_proof = matches!(definition.kind, ExprKind::FunctionCall { .. });
                 work.step()?;
                 if needs_proof {
                     let mut errors = ValidationContext::with_limits(limits);
@@ -179,7 +197,7 @@ pub(super) fn validate_guarantees_observed(
                     ));
                 }
                 definition.kind.expression_references_observed(|id| {
-                    enqueue(&mut definitions, &mut pending, id, work, limits)?;
+                    enqueue(&mut definitions, &mut pending, (node.id, id), work, limits)?;
                     work.step()?;
                     Ok::<_, FragmentPropertyError>(())
                 })?;
@@ -192,7 +210,7 @@ pub(super) fn validate_guarantees_observed(
 fn enqueue(
     definitions: &mut [Definition<'_>],
     pending: &mut Vec<usize>,
-    id: ExprId,
+    id: (crate::NodeId, ExprId),
     work: &mut CompileCheckpoints<'_>,
     limits: PlanLimits,
 ) -> Result<(), FragmentPropertyError> {

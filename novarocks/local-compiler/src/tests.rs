@@ -20,10 +20,7 @@ use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
 use novarocks_connector_contract::*;
 use novarocks_physical_plan::*;
-use novarocks_type_contract::{
-    EvaluationDomainId, ExpressionControlFlow, ExpressionEvaluationDomain, SemanticParameters,
-    ValueLogicalType,
-};
+use novarocks_type_contract::{SemanticParameters, ValueLogicalType};
 use std::{
     num::NonZeroU64,
     sync::{
@@ -360,6 +357,7 @@ fn add_writer(
                 source_multiplicity: RowMultiplicity::SingleCopy,
                 destination: Distribution::Unconstrained,
                 destination_multiplicity: RowMultiplicity::SingleCopy,
+                routing_only: Box::default(),
             },
             source_port: novarocks_physical_plan::FragmentOutputPort::Root,
             delivery: novarocks_physical_plan::DeliveryRequirement::MustDrain,
@@ -490,22 +488,6 @@ fn checked_package(
             novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap();
-    let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
-            id: EvaluationDomainId::new(0),
-            parent: None,
-            guard: None,
-        }],
-        vec![],
-        fragment.expressions(),
-        CompilePhase::Validate,
-        &FixtureControl,
-    )
-    .unwrap();
-    let expression_uses =
-        PhysicalRootUses::try_new(&fragment, flow, vec![], &FixtureControl).unwrap();
-    let calls =
-        FrozenFragmentCalls::try_new(&fragment, &expression_uses, vec![], &FixtureControl).unwrap();
     let pruning = FrozenFragmentPruning::try_new(fragment.id(), vec![], &FixtureControl).unwrap();
     Arc::new(
         FragmentPackage::try_new(
@@ -514,15 +496,15 @@ fn checked_package(
                 required: RequiredContracts::default(),
                 constants: novarocks_physical_plan::ConstantPools::empty(),
                 fragment,
-                expression_uses,
-                calls,
+                statement_constant_policy: crate::test_constants::policy(),
                 pruning,
                 cuts,
                 result: None,
-                parameters: SemanticParameters::default(),
+                parameters: SemanticParameters::try_new([]).unwrap(),
                 scans,
                 writes,
                 annotations: Box::default(),
+                layouts: Default::default(),
             },
             package_admission(),
             &FixtureControl,

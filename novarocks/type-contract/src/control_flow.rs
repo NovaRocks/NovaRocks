@@ -15,10 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Flat expression use/control domains. A shared definition is not a shared
-//! invocation: every use retains its own demand and strong branch domain.
+//! Flat expression use/control regions. A shared definition is not a shared
+//! invocation: every use retains its own demand and strong branch region.
 use crate::{
-    CompileCheckpoints, CompileControlError, CompilePhase, EvaluationDomainId,
+    CompileCheckpoints, CompileControlError, CompilePhase, EvaluationRegionId,
     ExpressionEffectContext, ExpressionUseId, PureCompileControl,
 };
 mod creation;
@@ -112,15 +112,15 @@ pub enum GuardKind {
     TemporalInvocationNull,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct DomainGuard {
+pub struct RegionGuard {
     pub owner: ExpressionUseId,
     pub kind: GuardKind,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ExpressionEvaluationDomain {
-    pub id: EvaluationDomainId,
-    pub parent: Option<EvaluationDomainId>,
-    pub guard: Option<DomainGuard>,
+pub struct ExpressionEvaluationRegion {
+    pub id: EvaluationRegionId,
+    pub parent: Option<EvaluationRegionId>,
+    pub guard: Option<RegionGuard>,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExpressionInvocation<D> {
@@ -131,7 +131,7 @@ pub struct ExpressionInvocation<D> {
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExpressionControlFlow<D> {
-    domains: Arc<ControlFlowOwned<BTreeMap<EvaluationDomainId, ExpressionEvaluationDomain>>>,
+    regions: Arc<ControlFlowOwned<BTreeMap<EvaluationRegionId, ExpressionEvaluationRegion>>>,
     uses: Arc<ControlFlowOwned<BTreeMap<ExpressionUseId, ExpressionInvocation<D>>>>,
     roots: Arc<ControlFlowOwned<Box<[ExpressionUseId]>>>,
     use_references: usize,
@@ -208,7 +208,7 @@ impl<D: Copy> ExpressionControlFlow<D> {
     /// The caller also checks the exact definition/control correspondence.
     /// No instance Selection or mutable state is stored here.
     pub fn try_new(
-        domains: Vec<ExpressionEvaluationDomain>,
+        regions: Vec<ExpressionEvaluationRegion>,
         uses: Vec<ExpressionInvocation<D>>,
         definitions: &impl ExpressionDefinitionMembership<D>,
         phase: CompilePhase,
@@ -216,7 +216,7 @@ impl<D: Copy> ExpressionControlFlow<D> {
     ) -> Result<Self, ExpressionControlFlowError> {
         let mut work = CompileCheckpoints::try_new(control, phase)?;
         let parts = Self::parts_in(
-            domains,
+            regions,
             uses,
             definitions,
             &mut |_| Ok(()),
@@ -227,9 +227,9 @@ impl<D: Copy> ExpressionControlFlow<D> {
             return Err(cause.clone().into());
         }
         work.finish()?;
-        let (domains, uses, roots, references) = parts?;
+        let (regions, uses, roots, references) = parts?;
         Ok(Self {
-            domains: Arc::new(ControlFlowOwned::pure(domains)),
+            regions: Arc::new(ControlFlowOwned::pure(regions)),
             uses: Arc::new(ControlFlowOwned::pure(uses)),
             roots: Arc::new(ControlFlowOwned::pure(roots.into_boxed_slice())),
             use_references: references,
@@ -240,16 +240,16 @@ impl<D: Copy> ExpressionControlFlow<D> {
     /// admission. Facts are cumulative for this call; no entry or footer is
     /// emitted here. Definition membership remains the original borrowed view.
     pub fn try_new_in(
-        domains: Vec<ExpressionEvaluationDomain>,
+        regions: Vec<ExpressionEvaluationRegion>,
         uses: Vec<ExpressionInvocation<D>>,
         definitions: &impl ExpressionDefinitionMembership<D>,
         admit: &mut impl FnMut(&ControlOwnedResourceFacts) -> Result<(), CompileControlError>,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<Self, ExpressionControlFlowError> {
-        let (domains, uses, roots, references) =
-            Self::parts_in(domains, uses, definitions, admit, true, work)?;
+        let (regions, uses, roots, references) =
+            Self::parts_in(regions, uses, definitions, admit, true, work)?;
         work.flush()?;
-        let domains = Arc::new(ControlFlowOwned::pure(domains));
+        let regions = Arc::new(ControlFlowOwned::pure(regions));
         work.step()?;
         work.flush()?;
         let uses = Arc::new(ControlFlowOwned::pure(uses));
@@ -259,7 +259,7 @@ impl<D: Copy> ExpressionControlFlow<D> {
         work.step()?;
         work.flush()?;
         Ok(Self {
-            domains,
+            regions,
             uses,
             roots,
             use_references: references,
@@ -268,16 +268,42 @@ impl<D: Copy> ExpressionControlFlow<D> {
     /// Actual creation of the same validated graph, with temporary validation
     /// structures and immutable output backing in independent caller scopes.
     pub fn try_new_with_creator_in<H>(
-        domains: Vec<ExpressionEvaluationDomain>,
+        regions: Vec<ExpressionEvaluationRegion>,
         uses: Vec<ExpressionInvocation<D>>,
         definitions: &impl ExpressionDefinitionMembership<D>,
         temporary: &mut dyn crate::ValueSchemaCreationScope<H>,
         retained: &mut dyn crate::ValueSchemaCreationScope<H>,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<Self, ExpressionControlCreationFailure<H>> {
+        let mut creation = creation::ControlCreationScopes::Separate {
+            temporary,
+            retained,
+        };
+        Self::try_new_created_in(regions, uses, definitions, &mut creation, work)
+    }
+    /// Construct the same graph using one existing caller scope. Every
+    /// independently cloneable output Arc retains that actual storage; this
+    /// creates no second scope, factory, grant or control entry.
+    pub fn try_new_with_single_creator_in<H>(
+        regions: Vec<ExpressionEvaluationRegion>,
+        uses: Vec<ExpressionInvocation<D>>,
+        definitions: &impl ExpressionDefinitionMembership<D>,
+        creation: &mut dyn crate::ValueSchemaCreationScope<H>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Self, ExpressionControlCreationFailure<H>> {
+        let mut creation = creation::ControlCreationScopes::Single(creation);
+        Self::try_new_created_in(regions, uses, definitions, &mut creation, work)
+    }
+    fn try_new_created_in<H>(
+        regions: Vec<ExpressionEvaluationRegion>,
+        uses: Vec<ExpressionInvocation<D>>,
+        definitions: &impl ExpressionDefinitionMembership<D>,
+        creation: &mut creation::ControlCreationScopes<'_, H>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Self, ExpressionControlCreationFailure<H>> {
         use ExpressionControlCreationFailure as Failure;
         // Preserve the existing first header law before any admission/traversal.
-        if domains.len() > MAX_CONTROL_DEFINITIONS
+        if regions.len() > MAX_CONTROL_DEFINITIONS
             || uses.len() > MAX_CONTROL_DEFINITIONS
             || definitions.definition_count() > MAX_CONTROL_DEFINITIONS
         {
@@ -285,14 +311,14 @@ impl<D: Copy> ExpressionControlFlow<D> {
         }
         // The sole constructor geometry visitor also supplies the existing
         // cumulative pure model. It quotes no input payload or source bytes.
-        creation::observe::<D, H>(domains.len(), uses.len(), temporary, retained, work)?;
-        let (domains, uses, roots, references) =
-            Self::parts_in(domains, uses, definitions, &mut |_| Ok(()), true, work)
+        creation::observe::<D, H>(regions.len(), uses.len(), creation, work)?;
+        let (regions, uses, roots, references) =
+            Self::parts_in(regions, uses, definitions, &mut |_| Ok(()), true, work)
                 .map_err(Failure::from)?;
         work.flush().map_err(Failure::Control)?;
-        let storage = retained.storage_lifetime();
-        let domains = Arc::new(ControlFlowOwned {
-            value: domains,
+        let storage = creation.retained_storage();
+        let regions = Arc::new(ControlFlowOwned {
+            value: regions,
             _storage: storage.clone(),
         });
         work.step().map_err(Failure::Control)?;
@@ -304,8 +330,8 @@ impl<D: Copy> ExpressionControlFlow<D> {
         work.step().map_err(Failure::Control)?;
         work.flush().map_err(Failure::Control)?;
         if roots.capacity() != roots.len() && !roots.is_empty() {
-            retained
-                .request_layout(
+            creation
+                .request_retained_layout(
                     std::alloc::Layout::array::<ExpressionUseId>(roots.len()).map_err(|_| {
                         Failure::Resource(
                             crate::owned_resources::layout::LayoutResourceError::Arithmetic,
@@ -321,7 +347,7 @@ impl<D: Copy> ExpressionControlFlow<D> {
         work.step().map_err(Failure::Control)?;
         work.flush().map_err(Failure::Control)?;
         Ok(Self {
-            domains,
+            regions,
             uses,
             roots,
             use_references: references,
@@ -330,7 +356,7 @@ impl<D: Copy> ExpressionControlFlow<D> {
     // Keep the original facade's loop observations; the caller-owned port
     // additionally admits geometry and brackets completed opaque operations.
     fn parts_in(
-        domains: Vec<ExpressionEvaluationDomain>,
+        regions: Vec<ExpressionEvaluationRegion>,
         uses: Vec<ExpressionInvocation<D>>,
         definitions: &impl ExpressionDefinitionMembership<D>,
         admit: &mut impl FnMut(&ControlOwnedResourceFacts) -> Result<(), CompileControlError>,
@@ -339,22 +365,22 @@ impl<D: Copy> ExpressionControlFlow<D> {
     ) -> Result<FlowParts<D>, ExpressionControlFlowError> {
         let definition_count = definitions.definition_count();
         // Keep the original first header law ahead of source traversal.
-        if domains.len() > MAX_CONTROL_DEFINITIONS
+        if regions.len() > MAX_CONTROL_DEFINITIONS
             || uses.len() > MAX_CONTROL_DEFINITIONS
             || definition_count > MAX_CONTROL_DEFINITIONS
         {
             return Err(ExpressionControlFlowError::TooManyItems);
         }
         if observed {
-            preflight_flow(&domains, &uses, admit, work)?;
+            preflight_flow(&regions, &uses, admit, work)?;
         }
         (|| {
-            let mut domain_index = BTreeMap::new();
-            for domain in domains {
+            let mut region_index = BTreeMap::new();
+            for region in regions {
                 if observed {
                     work.flush()?;
                 }
-                let duplicate = domain_index.insert(domain.id, domain).is_some();
+                let duplicate = region_index.insert(region.id, region).is_some();
                 if observed {
                     work.step()?;
                     work.flush()?;
@@ -382,7 +408,7 @@ impl<D: Copy> ExpressionControlFlow<D> {
                     return Err(ExpressionControlFlowError::TooManyItems);
                 }
                 if !definitions.contains_definition(value.definition)
-                    || !domain_index.contains_key(&value.context.domain)
+                    || !region_index.contains_key(&value.context.region)
                 {
                     return Err(ExpressionControlFlowError::InvalidReference);
                 }
@@ -401,24 +427,24 @@ impl<D: Copy> ExpressionControlFlow<D> {
                     work.step()?;
                 }
             }
-            let mut children: BTreeMap<EvaluationDomainId, Vec<_>> = BTreeMap::new();
+            let mut children: BTreeMap<EvaluationRegionId, Vec<_>> = BTreeMap::new();
             let mut ready = VecDeque::new();
-            reserve_deque(&mut ready, domain_index.len(), observed, work)?;
+            reserve_deque(&mut ready, region_index.len(), observed, work)?;
             let mut depths = BTreeMap::new();
-            for domain in domain_index.values() {
+            for region in region_index.values() {
                 if observed {
                     work.flush()?;
                 }
-                match (domain.parent, domain.guard) {
+                match (region.parent, region.guard) {
                     (None, None) => {
-                        depths.insert(domain.id, 1usize);
-                        ready.push_back(domain.id);
+                        depths.insert(region.id, 1usize);
+                        ready.push_back(region.id);
                     }
                     (Some(parent), Some(guard)) => {
                         let owner = use_index
                             .get(&guard.owner)
                             .ok_or(ExpressionControlFlowError::InvalidReference)?;
-                        if parent != owner.context.domain || !domain_index.contains_key(&parent) {
+                        if parent != owner.context.region || !region_index.contains_key(&parent) {
                             return Err(ExpressionControlFlowError::InvalidGuard);
                         }
                         if observed {
@@ -428,7 +454,7 @@ impl<D: Copy> ExpressionControlFlow<D> {
                         children
                             .try_reserve(1)
                             .map_err(|_| CompileControlError::ResourceExhausted)?;
-                        children.push(domain.id);
+                        children.push(region.id);
                         if observed {
                             work.step()?;
                             work.flush()?;
@@ -473,7 +499,7 @@ impl<D: Copy> ExpressionControlFlow<D> {
                     work.flush()?;
                 }
             }
-            if visited != domain_index.len() {
+            if visited != region_index.len() {
                 return Err(ExpressionControlFlowError::Cycle);
             }
             let mut indegrees: BTreeMap<ExpressionUseId, usize> = BTreeMap::new();
@@ -511,18 +537,18 @@ impl<D: Copy> ExpressionControlFlow<D> {
                         return Err(ExpressionControlFlowError::InvalidDemand);
                     }
                     let expected = control_argument_guard(owner.control, ordinal);
-                    let domain = &domain_index[&child.context.domain];
+                    let region = &region_index[&child.context.region];
                     match expected {
-                        None if child.context.domain == owner.context.domain => {}
+                        None if child.context.region == owner.context.region => {}
                         Some(kind)
-                            if domain.parent == Some(owner.context.domain)
-                                && domain.guard
-                                    == Some(DomainGuard {
+                            if region.parent == Some(owner.context.region)
+                                && region.guard
+                                    == Some(RegionGuard {
                                         owner: owner.context.use_id,
                                         kind,
                                     }) =>
                         {
-                            used_guards.insert(domain.id, ());
+                            used_guards.insert(region.id, ());
                         }
                         _ => return Err(ExpressionControlFlowError::InvalidGuard),
                     }
@@ -541,11 +567,11 @@ impl<D: Copy> ExpressionControlFlow<D> {
                     work.flush()?;
                 }
             }
-            for domain in domain_index.values() {
+            for region in region_index.values() {
                 if observed {
                     work.flush()?;
                 }
-                if domain.guard.is_some() && !used_guards.contains_key(&domain.id) {
+                if region.guard.is_some() && !used_guards.contains_key(&region.id) {
                     return Err(ExpressionControlFlowError::InvalidGuard);
                 }
                 work.step()?;
@@ -611,7 +637,7 @@ impl<D: Copy> ExpressionControlFlow<D> {
             if visited != use_index.len() {
                 return Err(ExpressionControlFlowError::Cycle);
             }
-            Ok((domain_index, use_index, roots, references))
+            Ok((region_index, use_index, roots, references))
         })()
     }
     /// Every invocation with no parent argument edge, in stable ID order.
@@ -619,8 +645,8 @@ impl<D: Copy> ExpressionControlFlow<D> {
     pub fn root_use_ids(&self) -> &[ExpressionUseId] {
         &self.roots
     }
-    pub fn domains(&self) -> &BTreeMap<EvaluationDomainId, ExpressionEvaluationDomain> {
-        &self.domains
+    pub fn regions(&self) -> &BTreeMap<EvaluationRegionId, ExpressionEvaluationRegion> {
+        &self.regions
     }
     pub fn uses(&self) -> &BTreeMap<ExpressionUseId, ExpressionInvocation<D>> {
         &self.uses
@@ -632,7 +658,7 @@ impl<D: Copy> ExpressionControlFlow<D> {
     }
 }
 type FlowParts<D> = (
-    BTreeMap<EvaluationDomainId, ExpressionEvaluationDomain>,
+    BTreeMap<EvaluationRegionId, ExpressionEvaluationRegion>,
     BTreeMap<ExpressionUseId, ExpressionInvocation<D>>,
     Vec<ExpressionUseId>,
     usize,
@@ -717,12 +743,12 @@ pub fn expression_control_flow_edge_resource_facts(
     })
 }
 fn preflight_flow<D>(
-    domains: &[ExpressionEvaluationDomain],
+    regions: &[ExpressionEvaluationRegion],
     uses: &[ExpressionInvocation<D>],
     admit: &mut impl FnMut(&ControlOwnedResourceFacts) -> Result<(), CompileControlError>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<(), ExpressionControlFlowError> {
-    let n = domains.len();
+    let n = regions.len();
     let u = uses.len();
     let mut r = ControlResourceCounter::default();
     r.merge(expression_control_flow_header_resource_facts::<D>(n, u)?)?;
@@ -984,9 +1010,9 @@ mod tests {
             lookups: Cell::new(0),
         }
     }
-    fn root() -> ExpressionEvaluationDomain {
-        ExpressionEvaluationDomain {
-            id: EvaluationDomainId::new(u32::MAX),
+    fn root() -> ExpressionEvaluationRegion {
+        ExpressionEvaluationRegion {
+            id: EvaluationRegionId::new(u32::MAX),
             parent: None,
             guard: None,
         }
@@ -995,7 +1021,7 @@ mod tests {
         ExpressionInvocation {
             context: ExpressionEffectContext {
                 use_id: ExpressionUseId::new(id),
-                domain: root().id,
+                region: root().id,
                 demand: EvaluationDemand::Value,
             },
             definition,
@@ -1102,7 +1128,7 @@ mod tests {
         }
     }
     #[test]
-    fn unchecked_argument_shapes_and_ordinals_cannot_create_guard_domains() {
+    fn unchecked_argument_shapes_and_ordinals_cannot_create_guard_regions() {
         assert_eq!(
             control_argument_semantics(ControlShape::If, 3, 3, EvaluationDemand::Value),
             Err(ExpressionControlFlowError::InvalidReference)

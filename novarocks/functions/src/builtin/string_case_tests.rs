@@ -28,7 +28,7 @@ use crate::{
 };
 use novarocks_type_contract::{
     CallProofScope, CompileControlError, CompilePhase, DecimalOverflowPolicy, EvaluationDemand,
-    EvaluationDomainId, ExpressionEffectContext, ExpressionUseId, FunctionInstanceState,
+    EvaluationRegionId, ExpressionEffectContext, ExpressionUseId, FunctionInstanceState,
     FunctionNullBehavior, FunctionVolatility, PureCompileControl, SemanticParameters,
 };
 use std::{sync::Mutex, time::Duration};
@@ -469,13 +469,13 @@ fn string_case_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_stale_
         );
         let context = ExpressionEffectContext {
             use_id: ExpressionUseId::new(41),
-            domain: EvaluationDomainId::new(7),
+            region: EvaluationRegionId::new(7),
             demand: EvaluationDemand::Value,
         };
         let uses = [Some(ExpressionUseId::new(42))];
         let params = SemanticParameters::try_new([]).unwrap();
         let input = crate::CallEffectInput {
-            context,
+            context: context.into(),
             argument_uses: crate::CallArgumentUses::SelectedChannels(&uses),
             function_id: owner.binding_declaration().function_id(),
             kind: crate::FunctionKind::Scalar,
@@ -484,7 +484,7 @@ fn string_case_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_stale_
             environment: &[],
             parameters: &params,
             decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-            proof_scope: CallProofScope::Domain(context.domain),
+            proof_scope: CallProofScope::Region(context.region),
         };
         let fresh = specialize_scalar(
             &owner,
@@ -541,7 +541,11 @@ fn string_case_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_stale_
                 .is_err()
         );
         stale = input;
-        stale.context.use_id = ExpressionUseId::new(999);
+        stale.context = novarocks_type_contract::ExpressionEffectContext {
+            use_id: ExpressionUseId::new(999),
+            ..stale.context.expression().unwrap()
+        }
+        .into();
         assert!(
             owner
                 .prepare_scalar(stale, canonical, crate::binding_test_control())

@@ -63,11 +63,13 @@ fn required(id: Option<u32>, work: &mut CompileCheckpoints<'_>) -> Result<u32, E
     result
 }
 fn expression_encode(
-    id: p::ExprId,
+    id: novarocks_expression_contract::RootOrdinal,
     expressions: &EncodedExpressions<'_, '_, '_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), Error> {
-    let found = expressions.expression_observed(id.get(), work)?.is_some();
+    let found = expressions
+        .root_expression_observed(id.get(), work)?
+        .is_some();
     work.step()?;
     if found {
         Ok(())
@@ -82,7 +84,7 @@ fn expression_decode(
     expressions: &DecodedExpressions<'_, '_, '_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), Error> {
-    let found = expressions.definition_observed(id, work)?.is_some();
+    let found = expressions.root_definition_observed(id, work)?.is_some();
     work.step()?;
     if found {
         Ok(())
@@ -381,7 +383,7 @@ fn prepare_decode(
         )?;
         model.request::<p::ChangeAssignment>(event.assignments.len(), 2)?;
         if parent.is_some() {
-            occurrences = add(occurrences, usize::from(event.predicate_expr_id.is_some()))?;
+            occurrences = add(occurrences, usize::from(event.predicate_root.is_some()))?;
             model.delegated_work = add(
                 mul(occurrences, expressions.lookup_work_upper_bound()?)?,
                 type_work,
@@ -390,7 +392,7 @@ fn prepare_decode(
         gate(&model, known, &mut parent)?;
         count_prefix(model.inputs, model.items, source, known, l, w)?;
         if parent.is_none() {
-            occurrences = add(occurrences, usize::from(event.predicate_expr_id.is_some()))?;
+            occurrences = add(occurrences, usize::from(event.predicate_root.is_some()))?;
         }
         gate(&model, known, &mut parent)?;
         w.step()?;
@@ -430,7 +432,7 @@ fn prepare_decode(
                     type_work,
                 )?;
             }
-            occurrences = add(occurrences, usize::from(assignment.expr_id.is_some()))?;
+            occurrences = add(occurrences, usize::from(assignment.root_ordinal.is_some()))?;
             if parent.is_some() {
                 model.delegated_work = add(
                     mul(occurrences, expressions.lookup_work_upper_bound()?)?,
@@ -517,12 +519,12 @@ fn prepare_decode(
     reference(required(payload.effect_output_value_id, w)?, values, w)?;
     for event in &payload.events {
         decode_mutation_effect(event.effect, w)?;
-        if let Some(predicate) = event.predicate_expr_id {
+        if let Some(predicate) = event.predicate_root {
             expression_decode(predicate, expressions, w)?;
         }
         for assignment in &event.assignments {
             reference(required(assignment.value_id, w)?, values, w)?;
-            if let Some(expression) = assignment.expr_id {
+            if let Some(expression) = assignment.root_ordinal {
                 expression_decode(expression, expressions, w)?;
             }
             w.step()?;
@@ -600,20 +602,23 @@ fn emit_encode(
             let (value, expression) = (&assignment.output, &assignment.expression);
             assignments.push(wire::ChangeAssignment {
                 value_id: Some(value.get()),
-                expr_id: expression.map(p::ExprId::get),
+                root_ordinal: expression.map(novarocks_expression_contract::RootOrdinal::get),
                 write_input_value_type_id: types.map(|(input, _)| input),
                 storage_value_type_id: types.and_then(|(_, storage)| storage),
             });
             work.step()?;
         }
         emitted.push(wire::ChangeEvent {
-            predicate_expr_id: event.predicate.map(p::ExprId::get),
+            predicate_root: event
+                .predicate
+                .map(novarocks_expression_contract::RootOrdinal::get),
             effect: encode_mutation_effect(event.effect),
             assignments,
         });
         work.step()?;
     }
     let node = wire::PhysicalNode {
+        expressions: None,
         id: input.id.get(),
         input_node_ids: inputs,
         required_inputs,
@@ -668,19 +673,24 @@ fn emit_decode(
                 .transpose()?;
             assignments.push(p::ChangeAssignment {
                 output: p::ValueId::new(required(assignment.value_id, work)?),
-                expression: assignment.expr_id.map(p::ExprId::new),
+                expression: assignment
+                    .root_ordinal
+                    .map(novarocks_expression_contract::RootOrdinal::new),
                 write_input,
             });
             work.step()?;
         }
         emitted.push(p::ChangeEventSpec {
-            predicate: event.predicate_expr_id.map(p::ExprId::new),
+            predicate: event
+                .predicate_root
+                .map(novarocks_expression_contract::RootOrdinal::new),
             effect: decode_mutation_effect(event.effect, work)?,
             assignments: boxed(assignments, work)?,
         });
         work.step()?;
     }
     let node = p::PhysicalNode {
+        expressions: None,
         id: p::NodeId::new(input.id),
         inputs,
         required_inputs,

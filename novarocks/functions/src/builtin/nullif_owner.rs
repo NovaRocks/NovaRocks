@@ -272,10 +272,6 @@ impl ScalarKernelInstance for NullifInstance {
     }
 }
 
-#[cfg(test)]
-#[path = "nullif_owner_tests.rs"]
-mod tests;
-
 impl NullifOwner {
     fn refine_selected_core(
         &self,
@@ -294,7 +290,7 @@ impl NullifOwner {
             }
             if !input.environment.is_empty()
                 || !matches!(input.proof_scope, CallProofScope::Unconditional)
-                    && input.proof_scope != CallProofScope::Domain(input.context.domain)
+                    && input.proof_scope != input.context.proof_scope()
             {
                 return Err(FunctionBindingError::InvalidBinding(
                     "nullif has no environment dependencies and requires an exact proof scope"
@@ -331,7 +327,8 @@ impl NullifOwner {
                 || input.kind != FunctionKind::Scalar
                 || contract.function_id() != input.function_id
                 || !std::ptr::eq(contract.selected(), input.selected)
-                || contract.context() != input.context
+                || novarocks_type_contract::CallEffectContext::from(contract.context())
+                    != input.context
                 || contract.decimal_overflow_policy() != input.decimal_overflow_policy
                 || contract.effects() != &self.call_effects(input.proof_scope)
                 || !input.environment.is_empty()
@@ -358,3 +355,6 @@ impl NullifOwner {
         result
     }
 }
+
+#[cfg(test)]
+mod tests;

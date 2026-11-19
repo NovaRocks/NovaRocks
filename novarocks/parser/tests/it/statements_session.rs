@@ -10,6 +10,7 @@ fn session_explain_and_transaction_roundtrip() {
         "USE \"catalog\".s",
         "SET SESSION ice.incremental_refresh_enabled = NOT false",
         "RESET SESSION ice.incremental_refresh_enabled",
+        r#"SET SESSION "iceberg_prod".max_partitions_per_writer = 2"#,
         "SET SESSION authorization = 1",
         "RESET SESSION authorization.value",
         "SET SESSION AUTHORIZATION \"a user\"",

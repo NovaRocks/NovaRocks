@@ -1,0 +1,2959 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied. See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! Iterative actual-use continuations. Owned row domains never borrow a moving
+//! frame. Kernel calls temporarily borrow one stable domain, then erase that
+//! borrow into owned values before resuming the parent continuation.
+use super::boolean_region::BooleanRows;
+use super::node_recipes::{ComparisonPosition, NodeRecipes, UnitNodeRecipes};
+use super::*;
+use arrow::array::{Array, BooleanArray};
+use novarocks_type_contract::EvaluationDemand;
+
+pub(super) fn supports_result(ty: &DataType) -> bool {
+    novarocks_functions::control_values::supports_indexed_result(ty)
+}
+
+enum OwnedValue {
+    Constant(novarocks_functions::ConstantValue),
+    ConstantView(constant_projection::CanonicalConstant),
+    Column(ArrayRef),
+    Source(ArrayRef, Arc<input_source::ActualInvocationDomain>),
+    Selected(ArrayRef, Box<[RowDataError]>),
+    Continued(Box<Self>, input_source::ArrayContinuation),
+}
+impl OwnedValue {
+    fn uncontinued(&self) -> &Self {
+        match self {
+            Self::Continued(value, _) => value.uncontinued(),
+            _ => self,
+        }
+    }
+    fn continuation(&self) -> Option<input_source::ArrayContinuation> {
+        match self {
+            Self::Continued(_, owner) => Some(owner.clone()),
+            _ => None,
+        }
+    }
+    fn with_continuation(self, owner: Option<input_source::ArrayContinuation>) -> Self {
+        match owner {
+            Some(owner) => Self::Continued(Box::new(self), owner),
+            None => self,
+        }
+    }
+    fn into_value<'a>(
+        self,
+        selection: Selection<'a>,
+        work: &mut Work<'_, '_, impl Sized>,
+    ) -> Result<Value<'a>, KernelFailure> {
+        Ok(match self {
+            Self::Continued(value, owner) => value
+                .into_value(selection, work)?
+                .retaining_continuation(owner, work)?,
+            Self::Constant(value) => Value::Constant(value),
+            Self::ConstantView(value) => Value::ConstantView(value),
+            Self::Column(value) => Value::Column(value),
+            Self::Source(array, domain) => {
+                let actual = domain.selection(work.control)?;
+                if actual.is_all() {
+                    Value::Column(array)
+                } else if actual.same_rows_observed(selection, || work.step())? {
+                    let ty = array.data_type().clone();
+                    Value::Selected(SelectedValues::try_new_observed(
+                        selection,
+                        &ty,
+                        array,
+                        Box::default(),
+                        || work.step(),
+                    )?)
+                } else {
+                    let mut indices = Vec::with_capacity(selection.len());
+                    for row in selection.iter() {
+                        let ordinal = domain.physical_ordinal(row).ok_or_else(|| {
+                            invalid("demanded Slot row is outside its authored source domain")
+                        })?;
+                        indices.push(Some(
+                            u64::try_from(ordinal).map_err(|_| KernelFailure::ResourceExhausted)?,
+                        ));
+                        work.step()?;
+                    }
+                    let array = gather(&array, &indices, work)?;
+                    let ty = array.data_type().clone();
+                    Value::Selected(SelectedValues::try_new_observed(
+                        selection,
+                        &ty,
+                        array,
+                        Box::default(),
+                        || work.step(),
+                    )?)
+                }
+            }
+            Self::Selected(array, errors) => {
+                let ty = array.data_type().clone();
+                Value::Selected(SelectedValues::try_new_observed(
+                    selection,
+                    &ty,
+                    array,
+                    errors,
+                    || work.step(),
+                )?)
+            }
+        })
+    }
+    fn retaining_children(
+        self,
+        mut sources: Vec<input_source::ArrayContinuation>,
+        allocator: Option<&Arc<dyn novarocks_functions::AggregateStateAllocator>>,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<Self, KernelFailure> {
+        if sources.is_empty() {
+            return Ok(self);
+        }
+        let (value, previous) = match self {
+            Self::Continued(value, owner) => (*value, Some(owner)),
+            value => (value, None),
+        };
+        if let Some(previous) = previous {
+            sources.push(previous);
+        }
+        let owner = input_source::ArrayContinuation::combine(sources, allocator, control)?;
+        Ok(match (value, owner) {
+            (Self::Selected(array, errors), Some(owner)) => {
+                let array = owner.retain(array, control)?;
+                Self::Selected(array, errors).with_continuation(Some(owner))
+            }
+            (value, owner) => value.with_continuation(owner),
+        })
+    }
+    fn retaining_custody(
+        self,
+        custody: Option<&input_source::CapturedInputSource>,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<Self, KernelFailure> {
+        let Some(custody) = custody else {
+            return Ok(self);
+        };
+        let (value, _previous) = match self {
+            Self::Continued(value, owner) => (*value, Some(owner)),
+            value => (value, None),
+        };
+        Ok(match value {
+            Self::Selected(array, errors) => {
+                let array = custody.retain(array, control)?;
+                let owner = custody
+                    .continuation(&array, control)?
+                    .retaining_previous(_previous, control)?;
+                Self::Selected(array, errors).with_continuation(Some(owner))
+            }
+            value => value.with_continuation(_previous),
+        })
+    }
+    fn retaining_result_type(
+        self,
+        ty: &novarocks_functions::FunctionValueType,
+        allocator: Option<&Arc<dyn novarocks_functions::AggregateStateAllocator>>,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<Self, KernelFailure> {
+        let (value, previous) = match self {
+            Self::Continued(value, owner) => (*value, Some(owner)),
+            value => (value, None),
+        };
+        Ok(match value {
+            Self::Constant(value) => {
+                let owner = input_source::ArrayContinuation::from_constant(&value, allocator);
+                Self::Constant(value).with_continuation(owner.or(previous))
+            }
+            Self::ConstantView(value) => {
+                // The projection's new creator is independent of original CV
+                // purity. Its existing pin already contains that exact CV.
+                let owner = previous.or_else(|| {
+                    input_source::ArrayContinuation::from_constant(&value.original, allocator)
+                });
+                Self::ConstantView(value).with_continuation(owner)
+            }
+            Self::Selected(array, errors) => {
+                let (array, creator) =
+                    input_source::retain_result_type_with_creator(array, ty, allocator, control)?;
+                let owner = match creator {
+                    Some(creator) => Some(creator.retaining_previous(previous, control)?),
+                    None => previous,
+                };
+                Self::Selected(array, errors).with_continuation(owner)
+            }
+            Self::Source(array, domain) => {
+                let (array, owner) =
+                    Self::retain_arrow_creator(array, ty, allocator, previous, control)?;
+                Self::Source(array, domain).with_continuation(owner)
+            }
+            Self::Column(array) => {
+                let (array, owner) =
+                    Self::retain_arrow_creator(array, ty, allocator, previous, control)?;
+                Self::Column(array).with_continuation(owner)
+            }
+            value => value.with_continuation(previous),
+        })
+    }
+    fn retain_arrow_creator(
+        array: ArrayRef,
+        ty: &novarocks_functions::FunctionValueType,
+        allocator: Option<&Arc<dyn novarocks_functions::AggregateStateAllocator>>,
+        previous: Option<input_source::ArrayContinuation>,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<(ArrayRef, Option<input_source::ArrayContinuation>), KernelFailure> {
+        let layout = ty.typed_binding().layout();
+        if layout.storage_lifetime().is_pure() && layout.arrow_backing_storage_lifetime().is_pure()
+        {
+            return Ok((array, previous));
+        }
+        let array = input_source::retain_result_type(array, ty, allocator, control)?;
+        let owner = input_source::ArrayContinuation::capture(
+            &array,
+            allocator.ok_or_else(|| {
+                invalid("compiled result Arrow creator requires its actual allocation host")
+            })?,
+            control,
+        )?;
+        Ok((array, Some(owner)))
+    }
+    fn from_materialized(output: MaterializedValue<'_>) -> Self {
+        let MaterializedValue {
+            value,
+            continuation,
+        } = output;
+        Self::from_selected(value).with_continuation(continuation)
+    }
+    fn from_selected(output: SelectedValues<'_>) -> Self {
+        let (_, array, errors) = output.into_parts();
+        Self::Selected(array, errors)
+    }
+}
+struct Child {
+    // Compact parent positions, distinct from original batch rows.
+    ordinals: Vec<usize>,
+    value: OwnedValue,
+}
+pub(super) struct Frame<K = ExpressionUseId> {
+    occurrence: K,
+    activation: novarocks_functions::ScalarInvocationActivation,
+    rows: Vec<usize>,
+    output_rows: Vec<usize>,
+    domain: Arc<input_source::ActualInvocationDomain>,
+    parent_ordinals: Vec<usize>,
+    next: usize,
+    children: Vec<Child>,
+    routes: Vec<Option<bool>>,
+    remaining: Vec<usize>,
+    matched: Vec<usize>,
+    operand: Option<ArrayRef>,
+    choices: Vec<Option<(usize, usize)>>,
+    errors: BTreeMap<usize, RowDataError>,
+    boolean: Option<BooleanRows>,
+    temporal: Option<TemporalValues>,
+    membership: Option<novarocks_functions::native_inlist::InRows>,
+}
+impl<K> Frame<K> {
+    fn new(
+        occurrence: K,
+        shape: ControlShape,
+        result_type: &DataType,
+        mut rows: Vec<usize>,
+        domain: Arc<input_source::ActualInvocationDomain>,
+        needs_original_domain: bool,
+        activation: novarocks_functions::ScalarInvocationActivation,
+        parent_ordinals: Vec<usize>,
+        work: &mut Work<'_, '_, impl Sized>,
+    ) -> Result<Self, KernelFailure> {
+        let output_rows = rows.clone();
+        // IF's original author evaluates its condition on its actual parent
+        // Chunk, then filters mixed branches. Output projection is independent.
+        if shape == ControlShape::If
+            && needs_original_domain
+            && activation == novarocks_functions::ScalarInvocationActivation::Activated
+        {
+            rows = domain.rows().to_vec();
+        }
+        // A demand-zero invocation does not construct or interleave a result
+        // before its original arity Data. Retain the actual domain storage,
+        // but do not invent an output-copy admission for nonexistent values.
+        if shape != ControlShape::NoArguments && supports_result(result_type) {
+            novarocks_functions::selected_copy::guarded_result_extent(result_type, rows.len())
+                .map_err(|_| KernelFailure::ResourceExhausted)?;
+            work.step()?;
+        }
+        let tracks_remaining = matches!(
+            shape,
+            ControlShape::Coalesce
+                | ControlShape::Conjunction
+                | ControlShape::Disjunction
+                | ControlShape::Case { .. }
+        );
+        let tracks_choices = matches!(
+            shape,
+            ControlShape::If | ControlShape::Coalesce | ControlShape::Case { .. }
+        );
+        let mut remaining = Vec::new();
+        let mut choices = Vec::new();
+        if tracks_remaining {
+            remaining.reserve(rows.len());
+        }
+        if tracks_choices {
+            choices.reserve(rows.len());
+        }
+        if tracks_remaining || tracks_choices {
+            for ordinal in 0..rows.len() {
+                if tracks_remaining {
+                    remaining.push(ordinal);
+                }
+                if tracks_choices {
+                    choices.push(None);
+                }
+                work.step()?;
+            }
+        }
+        let temporal = if matches!(shape, ControlShape::TemporalSource(_)) {
+            Some(TemporalValues::new(rows.len(), work)?)
+        } else {
+            None
+        };
+        let boolean = if matches!(shape, ControlShape::Between { .. }) {
+            Some(BooleanRows::new(rows.len(), work)?)
+        } else {
+            None
+        };
+        Ok(Self {
+            occurrence,
+            activation,
+            rows,
+            output_rows,
+            domain,
+            parent_ordinals,
+            next: 0,
+            children: Vec::new(),
+            routes: Vec::new(),
+            remaining,
+            matched: Vec::new(),
+            operand: None,
+            choices,
+            errors: BTreeMap::new(),
+            boolean,
+            temporal,
+            membership: None,
+        })
+    }
+    fn next_ordinals(
+        &mut self,
+        shape: ControlShape,
+        arity: usize,
+        next_is_pure: bool,
+        batch_rows: usize,
+        work: &mut Work<'_, '_, impl Sized>,
+    ) -> Result<Option<Vec<usize>>, KernelFailure> {
+        if matches!(shape, ControlShape::Conjunction | ControlShape::Disjunction)
+            && self.boolean.is_none()
+        {
+            self.boolean = Some(BooleanRows::new(self.rows.len(), work)?);
+        }
+        if matches!(shape, ControlShape::Conjunction | ControlShape::Disjunction) && !next_is_pure {
+            self.boolean
+                .as_mut()
+                .ok_or_else(|| internal("missing Boolean continuation"))?
+                .boundary(&mut self.errors, &mut self.remaining, work)?;
+        }
+        if self.rows.is_empty()
+            && self.activation == novarocks_functions::ScalarInvocationActivation::Activated
+            && shape == ControlShape::If
+            && self.next == 1
+        {
+            self.next = 2;
+        }
+        if self.next >= arity
+            || (matches!(
+                shape,
+                ControlShape::Coalesce | ControlShape::Conjunction | ControlShape::Disjunction
+            ) && self.remaining.is_empty())
+        {
+            return Ok(None);
+        }
+        let mut ordinals = Vec::new();
+        match shape {
+            ControlShape::Membership { .. } => {
+                if self.next > 0 && self.rows.is_empty() {
+                    return Ok(None);
+                }
+                for ordinal in 0..self.rows.len() {
+                    if !self.errors.contains_key(&ordinal) {
+                        ordinals.push(ordinal);
+                    }
+                    work.step()?;
+                }
+                if !self.rows.is_empty() && ordinals.is_empty() {
+                    return Ok(None);
+                }
+            }
+            ControlShape::Between { .. } => {
+                // Original Value AND/OR demands the second comparison even
+                // after a deciding lower value. Only earlier data errors are
+                // terminal in this exact current invocation domain.
+                for ordinal in 0..self.rows.len() {
+                    if !self.errors.contains_key(&ordinal) {
+                        ordinals.push(ordinal);
+                    }
+                    work.step()?;
+                }
+                if !self.rows.is_empty() && ordinals.is_empty() {
+                    work.flush()?;
+                    self.children.clear();
+                    work.flush()?;
+                    return Ok(None);
+                }
+            }
+            ControlShape::TemporalSource(source_shape) => {
+                if source_shape == novarocks_type_contract::TemporalSourceShape::SecondsCastOther
+                    && self.next == 2
+                {
+                    let state = self
+                        .temporal
+                        .as_ref()
+                        .ok_or_else(|| internal("missing temporal source continuation"))?;
+                    let invocation_domain =
+                        Selection::try_sparse_observed(batch_rows, &self.rows, || work.step())?;
+                    if !state.needs_fallback(&self.errors, invocation_domain, work)? {
+                        return Ok(None);
+                    }
+                }
+                // Later source phases demand all successful invocation rows.
+                // A NULL predicate guards the invocation, never just its NULL rows.
+                for ordinal in 0..self.rows.len() {
+                    if !self.errors.contains_key(&ordinal) {
+                        ordinals.push(ordinal);
+                    }
+                    work.step()?;
+                }
+                if ordinals.is_empty() {
+                    return Ok(None);
+                }
+            }
+            ControlShape::Case { simple, arms, .. } => {
+                let offset = usize::from(simple);
+                let then = self.next >= offset
+                    && self.next < offset + arms as usize * 2
+                    && !(self.next - offset).is_multiple_of(2);
+                let domain = if then { &self.matched } else { &self.remaining };
+                if domain.is_empty() && self.remaining.is_empty() {
+                    return Ok(None);
+                }
+                for &ordinal in domain {
+                    ordinals.push(ordinal);
+                    work.step()?;
+                }
+            }
+            ControlShape::If if self.next != 0 => {
+                let desired = self.next == 1;
+                for (ordinal, &route) in self.routes.iter().enumerate() {
+                    if route == Some(desired) {
+                        ordinals.push(ordinal);
+                    }
+                    work.step()?;
+                }
+            }
+            ControlShape::Coalesce | ControlShape::Conjunction | ControlShape::Disjunction => {
+                for &ordinal in &self.remaining {
+                    ordinals.push(ordinal);
+                    work.step()?;
+                }
+            }
+            _ => {
+                for ordinal in 0..self.rows.len() {
+                    ordinals.push(ordinal);
+                    work.step()?;
+                }
+            }
+        }
+        Ok(Some(ordinals))
+    }
+    fn attach_temporal(
+        &mut self,
+        child: Child,
+        source_shape: novarocks_type_contract::TemporalSourceShape,
+        batch_rows: usize,
+        work: &mut Work<'_, '_, impl Sized>,
+    ) -> Result<(), KernelFailure> {
+        let mut rows = Vec::with_capacity(child.ordinals.len());
+        for &ordinal in &child.ordinals {
+            rows.push(self.rows[ordinal]);
+            work.step()?;
+        }
+        let selection = Selection::try_sparse_observed(batch_rows, &rows, || work.step())?;
+        let value = child.value.into_value(selection, work)?;
+        let ty = value.argument().array().data_type().clone();
+        let output = value.materialize(selection, &ty, work)?;
+        let mut good = Vec::with_capacity(child.ordinals.len());
+        let mut ordinals = Vec::with_capacity(child.ordinals.len());
+        let mut errors = output.errors().iter().peekable();
+        for (local, &parent) in child.ordinals.iter().enumerate() {
+            work.step()?;
+            if errors
+                .peek()
+                .is_some_and(|error| error.selected_ordinal() == local)
+            {
+                let error = errors
+                    .next()
+                    .ok_or_else(|| internal("missing temporal child error"))?;
+                self.errors
+                    .entry(parent)
+                    .or_insert_with(|| error.with_selected_ordinal(parent));
+            } else {
+                good.push(Some(local as u64));
+                ordinals.push(parent);
+            }
+        }
+        if !ordinals.is_empty() {
+            let array = if good.len() == output.values().len() {
+                Arc::clone(output.values())
+            } else {
+                gather_continued(output.values(), &good, output.continuation.as_ref(), work)?
+            };
+            let mut good_rows = Vec::with_capacity(ordinals.len());
+            for &ordinal in &ordinals {
+                good_rows.push(self.rows[ordinal]);
+                work.step()?;
+            }
+            let good_domain =
+                Selection::try_sparse_observed(batch_rows, &good_rows, || work.step())?;
+            let data_error = self
+                .temporal
+                .as_mut()
+                .ok_or_else(|| internal("missing temporal continuation"))?
+                .consume(
+                    source_shape,
+                    self.next - 1,
+                    good_domain,
+                    &ordinals,
+                    array,
+                    work,
+                )?;
+            if let Some(source) = data_error {
+                for &parent in &ordinals {
+                    work.step()?;
+                    self.errors
+                        .entry(parent)
+                        .or_insert_with(|| source.row_error(parent));
+                }
+            }
+        }
+        work.flush()?;
+        drop(output);
+        work.flush()?;
+        Ok(())
+    }
+    fn attach_between(
+        &mut self,
+        child: Child,
+        recipes: &dyn NodeRecipes,
+        negated: bool,
+        batch_rows: usize,
+        work: &mut Work<'_, '_, impl Sized>,
+    ) -> Result<(), KernelFailure> {
+        let ordinal = self
+            .next
+            .checked_sub(1)
+            .ok_or_else(|| internal("BETWEEN child completed before its continuation"))?;
+        if ordinal >= 4 {
+            return Err(invalid("BETWEEN has exactly four source uses"));
+        }
+        let mut child_rows = Vec::with_capacity(child.ordinals.len());
+        for &parent in &child.ordinals {
+            child_rows.push(self.rows[parent]);
+            work.step()?;
+        }
+        let selection = Selection::try_sparse_observed(batch_rows, &child_rows, || work.step())?;
+        let value = child.value.into_value(selection, work)?;
+        let ty = value.argument().array().data_type().clone();
+        let output = value.materialize(selection, &ty, work)?;
+        for error in output.errors() {
+            let parent = *child
+                .ordinals
+                .get(error.selected_ordinal())
+                .ok_or_else(|| invalid("BETWEEN child error has no source ordinal"))?;
+            self.errors
+                .entry(parent)
+                .or_insert_with(|| error.with_selected_ordinal(parent));
+            work.step()?;
+        }
+        self.children.push(Child {
+            ordinals: child.ordinals,
+            value: OwnedValue::from_materialized(output),
+        });
+        if ordinal.is_multiple_of(2) {
+            return Ok(());
+        }
+        if self.children.len() != 2 {
+            return Err(invalid(
+                "BETWEEN comparison requires its ordered operand and bound",
+            ));
+        }
+        // Finish the comparison before asking for the next use occurrence.
+        // Source addresses remain separate even when both definitions coincide.
+        let mut pair = std::mem::take(&mut self.children).into_iter();
+        let left = pair
+            .next()
+            .ok_or_else(|| internal("missing BETWEEN operand"))?;
+        let right = pair
+            .next()
+            .ok_or_else(|| internal("missing BETWEEN bound"))?;
+        let mut parent_ordinals = Vec::with_capacity(right.ordinals.len());
+        let mut rows = Vec::with_capacity(right.ordinals.len());
+        for &parent in &right.ordinals {
+            if !self.errors.contains_key(&parent) {
+                parent_ordinals.push(parent);
+                rows.push(self.rows[parent]);
+            }
+            work.step()?;
+        }
+        let selection = Selection::try_sparse_observed(batch_rows, &rows, || work.step())?;
+        let left = between_comparison_operand(
+            left,
+            &parent_ordinals,
+            &self.rows,
+            selection,
+            batch_rows,
+            work,
+        )?;
+        let right = between_comparison_operand(
+            right,
+            &parent_ordinals,
+            &self.rows,
+            selection,
+            batch_rows,
+            work,
+        )?;
+        let site = if ordinal == 1 {
+            ComparisonPosition::BetweenLower
+        } else {
+            ComparisonPosition::BetweenUpper
+        };
+        let recipe = recipes
+            .comparison_recipe(site)
+            .ok_or_else(|| invalid("missing exact BETWEEN bound comparison recipe"))?;
+        let output = evaluate_comparison(
+            ComparisonRecipe::Ordinary(recipe),
+            &left,
+            &right,
+            selection,
+            work,
+        )?;
+        let connective = novarocks_type_contract::NativeBetweenPlan::new(negated).connective();
+        let _ = self
+            .boolean
+            .as_mut()
+            .ok_or_else(|| internal("missing BETWEEN Boolean continuation"))?
+            .consume(
+                &output,
+                &parent_ordinals,
+                connective,
+                EvaluationDemand::Value,
+                true,
+                &mut self.errors,
+                work,
+            )?;
+        // The existing Boolean author owns 3VL. Its dominance result is not an
+        // authorization to suppress original upper/volatile source invocations.
+        work.flush()?;
+        drop(output);
+        drop(left);
+        drop(right);
+        work.flush()?;
+        Ok(())
+    }
+    fn attach_membership(
+        &mut self,
+        child: Child,
+        recipes: &dyn NodeRecipes,
+        batch_rows: usize,
+        work: &mut Work<'_, '_, impl Sized>,
+        allocator: Option<&Arc<dyn novarocks_functions::AggregateStateAllocator>>,
+    ) -> Result<(), KernelFailure> {
+        use novarocks_functions::native_inlist::{InRows, signed_equality_observed};
+        let ordinal = self
+            .next
+            .checked_sub(1)
+            .ok_or_else(|| internal("IN completed before its source phase"))?;
+        let recipe = recipes
+            .native_inlist_recipe()
+            .ok_or_else(|| invalid("missing exact IN recipe"))?;
+        let mut rows = Vec::with_capacity(child.ordinals.len());
+        for &parent in &child.ordinals {
+            rows.push(self.rows[parent]);
+            work.step()?;
+        }
+        let selection = Selection::try_sparse_observed(batch_rows, &rows, || work.step())?;
+        let value = child.value.into_value(selection, work)?;
+        let ty = value.argument().array().data_type().clone();
+        let output = value.materialize(selection, &ty, work)?;
+        let expected = if ordinal == 0 {
+            recipe.source_type()
+        } else {
+            recipe
+                .candidate_types()
+                .get(ordinal - 1)
+                .ok_or_else(|| invalid("IN candidate phase exceeds its recipe"))?
+        };
+        work.flush()?;
+        validate_membership_phase(&output, selection, expected, work)?;
+        for error in output.errors() {
+            let parent = *child
+                .ordinals
+                .get(error.selected_ordinal())
+                .ok_or_else(|| invalid("IN child error has no source ordinal"))?;
+            self.errors
+                .entry(parent)
+                .or_insert_with(|| error.with_selected_ordinal(parent));
+            work.step()?;
+        }
+        if ordinal == 0 {
+            self.membership = Some(in_observed(InRows::begin_observed(
+                output.values(),
+                &mut |event| in_event(event, work),
+            ))?);
+            self.children.push(Child {
+                ordinals: child.ordinals,
+                value: OwnedValue::from_materialized(output),
+            });
+            return Ok(());
+        }
+        if self.children.len() != 1 {
+            return Err(invalid("IN lost its original source phase"));
+        }
+        let right = Child {
+            ordinals: child.ordinals,
+            value: OwnedValue::from_materialized(output),
+        };
+        let mut parents = Vec::with_capacity(right.ordinals.len());
+        let mut rows = Vec::with_capacity(right.ordinals.len());
+        for &parent in &right.ordinals {
+            if !self.errors.contains_key(&parent) {
+                parents.push(parent);
+                rows.push(self.rows[parent]);
+            }
+            work.step()?;
+        }
+        let selection = Selection::try_sparse_observed(batch_rows, &rows, || work.step())?;
+        let left = duplicate_child(&self.children[0], work)?;
+        let left =
+            between_comparison_operand(left, &parents, &self.rows, selection, batch_rows, work)?;
+        let right =
+            between_comparison_operand(right, &parents, &self.rows, selection, batch_rows, work)?;
+        let left = left.materialize(selection, expected.data_type(), work)?;
+        let right = right.materialize(selection, expected.data_type(), work)?;
+        let state = self
+            .membership
+            .as_mut()
+            .ok_or_else(|| internal("missing IN continuation"))?;
+        in_observed(state.candidate_nulls_selected_observed(
+            right.values(),
+            &parents,
+            &mut |event| in_event(event, work),
+        ))?;
+        let equalities = if expected.data_type() == &DataType::Utf8 {
+            if work.scalar_host.is_some() && allocator.is_none() {
+                return Err(invalid(
+                    "Task IN comparison has no original allocation owner",
+                ));
+            }
+            work.flush()?;
+            let control = work.control;
+            in_observed(super::utf8_inlist::utf8_equality_observed(
+                left.values(),
+                right.values(),
+                recipe.source_type().logical_type()
+                    == novarocks_type_contract::ValueLogicalType::Json,
+                allocator.cloned(),
+                control,
+                &mut |event| in_event(event, work),
+            ))?
+        } else {
+            super::utf8_inlist::Utf8Equalities::without_reservation(
+                in_observed(signed_equality_observed(
+                    left.values(),
+                    right.values(),
+                    &mut |event| in_event(event, work),
+                ))?
+                .ok_or_else(|| invalid("checked signed IN comparison lost its domain"))?,
+            )
+        };
+        in_observed(state.equalities_selected_observed(
+            equalities.array(),
+            &parents,
+            &mut |event| in_event(event, work),
+        ))?;
+        // A match never suppresses the next original candidate invocation.
+        work.flush()?;
+        drop(equalities);
+        drop(left);
+        drop(right);
+        work.flush()?;
+        Ok(())
+    }
+    fn attach(
+        &mut self,
+        child: Child,
+        recipes: &dyn NodeRecipes,
+        shape: ControlShape,
+        demand: EvaluationDemand,
+        child_is_pure: bool,
+        batch_rows: usize,
+        work: &mut Work<'_, '_, impl Sized>,
+        allocator: Option<&Arc<dyn novarocks_functions::AggregateStateAllocator>>,
+    ) -> Result<(), KernelFailure> {
+        if let ControlShape::Membership { .. } = shape {
+            return self.attach_membership(child, recipes, batch_rows, work, allocator);
+        }
+        if let ControlShape::Between { negated } = shape {
+            return self.attach_between(child, recipes, negated, batch_rows, work);
+        }
+        if let ControlShape::TemporalSource(source_shape) = shape {
+            return self.attach_temporal(child, source_shape, batch_rows, work);
+        }
+        if !matches!(
+            shape,
+            ControlShape::If
+                | ControlShape::Coalesce
+                | ControlShape::Conjunction
+                | ControlShape::Disjunction
+                | ControlShape::Case { .. }
+        ) {
+            self.children.push(child);
+            return Ok(());
+        }
+        let child_index = self.children.len();
+        let mut rows = Vec::with_capacity(child.ordinals.len());
+        for &ordinal in &child.ordinals {
+            rows.push(self.rows[ordinal]);
+            work.step()?;
+        }
+        let selection = Selection::try_sparse_observed(batch_rows, &rows, || work.step())?;
+        let value = child.value.into_value(selection, work)?;
+        let ty = value.argument().array().data_type().clone();
+        let output = value.materialize(selection, &ty, work)?;
+        if let ControlShape::Case { simple, arms, .. } = shape {
+            let ordinal = self
+                .next
+                .checked_sub(1)
+                .ok_or_else(|| internal("CASE child completed before its continuation"))?;
+            let offset = usize::from(simple);
+            if simple && ordinal == 0 {
+                let mut errors = output.errors().iter().peekable();
+                let mut remaining = Vec::with_capacity(child.ordinals.len());
+                for (local, &parent) in child.ordinals.iter().enumerate() {
+                    if errors
+                        .peek()
+                        .is_some_and(|error| error.selected_ordinal() == local)
+                    {
+                        let error = errors
+                            .next()
+                            .ok_or_else(|| internal("missing CASE operand error"))?;
+                        self.errors
+                            .insert(parent, error.with_selected_ordinal(parent));
+                    } else {
+                        remaining.push(parent);
+                    }
+                    work.step()?;
+                }
+                self.remaining = remaining;
+                self.operand = Some(Arc::clone(output.values()));
+                // The compact operand is retained once. Its errors are now
+                // terminal parent evidence, excluded from all later labels.
+                work.flush()?;
+                drop(output);
+                work.flush()?;
+                return Ok(());
+            }
+            if ordinal >= offset
+                && ordinal < offset + arms as usize * 2
+                && (ordinal - offset).is_multiple_of(2)
+            {
+                let booleans = if simple {
+                    None
+                } else {
+                    Some(
+                        output
+                            .values()
+                            .as_any()
+                            .downcast_ref::<BooleanArray>()
+                            .ok_or_else(|| {
+                                invalid(
+                                    "searched CASE WHEN differs from its frozen Boolean carrier",
+                                )
+                            })?,
+                    )
+                };
+                let parent_selection =
+                    Selection::try_sparse_observed(batch_rows, &self.rows, || work.step())?;
+                let operand = if simple {
+                    let array = self
+                        .operand
+                        .as_ref()
+                        .ok_or_else(|| internal("missing once-evaluated simple CASE operand"))?;
+                    Some(SelectedValues::try_new_observed(
+                        parent_selection,
+                        array.data_type(),
+                        Arc::clone(array),
+                        Box::default(),
+                        || work.step(),
+                    )?)
+                } else {
+                    None
+                };
+                let recipe = if simple {
+                    Some(
+                        recipes
+                            .comparison_recipe(ComparisonPosition::CaseWhen(
+                                ((ordinal - offset) / 2) as u32,
+                            ))
+                            .ok_or_else(|| invalid("missing exact CASE WHEN comparison recipe"))?,
+                    )
+                } else {
+                    None
+                };
+                let mut errors = output.errors().iter().peekable();
+                let mut remaining = Vec::with_capacity(child.ordinals.len());
+                self.matched.clear();
+                for (local, &parent) in child.ordinals.iter().enumerate() {
+                    if errors
+                        .peek()
+                        .is_some_and(|error| error.selected_ordinal() == local)
+                    {
+                        let error = errors
+                            .next()
+                            .ok_or_else(|| internal("missing CASE WHEN error"))?;
+                        self.errors
+                            .insert(parent, error.with_selected_ordinal(parent));
+                    } else {
+                        let matches = if let (Some(recipe), Some(operand)) =
+                            (recipe, operand.as_ref())
+                        {
+                            work.flush()?;
+                            recipe.compare_rows(
+                                EvaluatedArgument::SelectedColumn(operand),
+                                parent,
+                                self.rows[parent],
+                                EvaluatedArgument::SelectedColumn(&output),
+                                local,
+                                self.rows[parent],
+                                work.control,
+                            )? == Some(true)
+                        } else {
+                            let booleans = booleans
+                                .ok_or_else(|| internal("missing searched CASE Boolean carrier"))?;
+                            !booleans.is_null(local) && booleans.value(local)
+                        };
+                        if matches {
+                            self.matched.push(parent);
+                        } else {
+                            remaining.push(parent);
+                        }
+                    }
+                    work.step()?;
+                }
+                self.remaining = remaining;
+                work.flush()?;
+                drop(output);
+                work.flush()?;
+                return Ok(());
+            }
+            let mut errors = output.errors().iter().peekable();
+            for (local, &parent) in child.ordinals.iter().enumerate() {
+                if errors
+                    .peek()
+                    .is_some_and(|error| error.selected_ordinal() == local)
+                {
+                    let error = errors
+                        .next()
+                        .ok_or_else(|| internal("missing CASE result error"))?;
+                    self.errors
+                        .insert(parent, error.with_selected_ordinal(parent));
+                } else {
+                    self.choices[parent] = Some((child_index, local));
+                }
+                work.step()?;
+            }
+            self.matched.clear();
+            if ordinal == offset + arms as usize * 2 {
+                self.remaining.clear();
+            }
+            self.children.push(Child {
+                ordinals: child.ordinals,
+                value: OwnedValue::from_materialized(output),
+            });
+            return Ok(());
+        }
+        if matches!(shape, ControlShape::Conjunction | ControlShape::Disjunction) {
+            self.remaining = self
+                .boolean
+                .as_mut()
+                .ok_or_else(|| internal("missing Boolean continuation"))?
+                .consume(
+                    &output,
+                    &child.ordinals,
+                    shape,
+                    demand,
+                    child_is_pure,
+                    &mut self.errors,
+                    work,
+                )?;
+            // A wide Boolean region retains only row state, not every operand's
+            // selected array. Drop the consumed backing at an opaque boundary.
+            work.flush()?;
+            drop(output);
+            work.flush()?;
+            return Ok(());
+        }
+        let mut child_errors = output.errors().iter().peekable();
+        let mut remaining = Vec::new();
+        if shape == ControlShape::If && child_index == 0 {
+            let booleans = output
+                .values()
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| invalid("actual IF condition is not its frozen Boolean carrier"))?;
+            self.routes.reserve(self.rows.len());
+            for (ordinal, _) in rows.iter().enumerate() {
+                let route = if child_errors
+                    .peek()
+                    .is_some_and(|error| error.selected_ordinal() == ordinal)
+                {
+                    let error = child_errors
+                        .next()
+                        .ok_or_else(|| internal("missing IF condition error"))?;
+                    self.errors
+                        .insert(ordinal, error.with_selected_ordinal(ordinal));
+                    None
+                } else {
+                    Some(!booleans.is_null(ordinal) && booleans.value(ordinal))
+                };
+                self.routes.push(route);
+                work.step()?;
+            }
+        } else {
+            work.flush()?;
+            visit_selected_nulls(
+                EvaluatedArgument::SelectedColumn(&output),
+                selection,
+                work.control,
+                |ordinal, _, is_null| {
+                    let parent = child.ordinals[ordinal];
+                    if child_errors
+                        .peek()
+                        .is_some_and(|error| error.selected_ordinal() == ordinal)
+                    {
+                        let error = child_errors
+                            .next()
+                            .ok_or_else(|| internal("missing guarded child error"))?;
+                        self.errors
+                            .insert(parent, error.with_selected_ordinal(parent));
+                    } else if shape == ControlShape::Coalesce && is_null {
+                        remaining.push(parent);
+                    } else {
+                        self.choices[parent] = Some((child_index, ordinal));
+                    }
+                    Ok(())
+                },
+            )?;
+        }
+        if shape == ControlShape::Coalesce {
+            self.remaining = remaining;
+        }
+        self.children.push(Child {
+            ordinals: child.ordinals,
+            value: OwnedValue::from_materialized(output),
+        });
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum CompletionKind {
+    Like {
+        negated: bool,
+    },
+    InList {
+        is_not_in: bool,
+    },
+    Between {
+        plan: novarocks_type_contract::NativeBetweenPlan,
+    },
+    Boolean,
+    Cast,
+    Negate,
+    BitNot,
+    Arithmetic,
+    Comparison {
+        null_safe: bool,
+    },
+    Case,
+    Unary(super::unary::UnaryIntrinsic),
+    Call,
+}
+impl CompletionKind {
+    fn from_static(kind: &StaticExprKind) -> Option<Self> {
+        Some(match kind {
+            StaticExprKind::PreparedLike { negated, .. } => Self::Like { negated: *negated },
+            StaticExprKind::PreparedInList { is_not_in, .. } => Self::InList {
+                is_not_in: *is_not_in,
+            },
+            StaticExprKind::PreparedBetween { plan, .. } => Self::Between { plan: *plan },
+            StaticExprKind::NaryAnd { .. } | StaticExprKind::NaryOr { .. } => Self::Boolean,
+            StaticExprKind::PreparedCast { .. } => Self::Cast,
+            StaticExprKind::PreparedNativeNegate(_) => Self::Negate,
+            StaticExprKind::PreparedNativeBitNot(_) => Self::BitNot,
+            StaticExprKind::PreparedArithmetic { .. } => Self::Arithmetic,
+            StaticExprKind::PreparedNullSafeComparison { .. } => {
+                Self::Comparison { null_safe: true }
+            }
+            kind if kind.ordinary_comparison().is_some() => Self::Comparison { null_safe: false },
+            StaticExprKind::Case { .. } => Self::Case,
+            StaticExprKind::Not(_) => Self::Unary(super::unary::UnaryIntrinsic::Not),
+            StaticExprKind::IsNull(_) => Self::Unary(super::unary::UnaryIntrinsic::IsNull),
+            StaticExprKind::IsNotNull(_) => Self::Unary(super::unary::UnaryIntrinsic::IsNotNull),
+            StaticExprKind::BoundCall { .. } => Self::Call,
+            _ => return None,
+        })
+    }
+}
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The node's recipes, row demand and evaluation owner remain explicit"
+)]
+fn complete_node<'a, R, K: Ord + Clone>(
+    kind: &CompletionKind,
+    frame: &mut Frame<K>,
+    recipes: &dyn NodeRecipes,
+    shape: ControlShape,
+    demand: EvaluationDemand,
+    result_type: &novarocks_functions::FunctionValueType,
+    local_selection: Selection<'a>,
+    original_domain: bool,
+    instances: &mut BTreeMap<K, scalar_invocation::CallInstance>,
+    allocator: Option<&Arc<dyn novarocks_functions::AggregateStateAllocator>>,
+    work: &mut Work<'_, '_, R>,
+) -> Result<OwnedValue, ExprEvaluationFailure<R>> {
+    Ok(match kind {
+        CompletionKind::Like { negated } => {
+            if frame.children.len() != 2 {
+                return Err(invalid("LIKE requires its original ordered operands").into());
+            }
+            let mut children = std::mem::take(&mut frame.children).into_iter();
+            let text = children
+                .next()
+                .ok_or_else(|| internal("missing original LIKE source"))?
+                .value
+                .into_value(local_selection, work)?;
+            let pattern = children
+                .next()
+                .ok_or_else(|| internal("missing original LIKE pattern"))?
+                .value
+                .into_value(local_selection, work)?;
+            let recipe = recipes
+                .native_like_recipe()
+                .ok_or_else(|| invalid("missing exact LIKE recipe"))?;
+            if recipe.negated() != *negated {
+                return Err(invalid("LIKE negative expansion differs from original source").into());
+            }
+            work.flush()?;
+            let output = recipe.evaluate_selected(
+                text.argument(),
+                pattern.argument(),
+                local_selection,
+                demand == EvaluationDemand::TruthOnly,
+                work.control,
+            )?;
+            work.flush()?;
+            OwnedValue::from_selected(output)
+        }
+        CompletionKind::InList { is_not_in } => {
+            let recipe = recipes
+                .native_inlist_recipe()
+                .ok_or_else(|| invalid("missing IN completion recipe"))?;
+            if recipe.negated() != *is_not_in || frame.children.len() != 1 {
+                return Err(invalid("IN completion differs from its ordered source").into());
+            }
+            let source = frame
+                .children
+                .pop()
+                .ok_or_else(|| internal("missing original IN source"))?;
+            let source = source.value.into_value(local_selection, work)?;
+            let output =
+                source.materialize(local_selection, recipe.source_type().data_type(), work)?;
+            let mut failed = Vec::with_capacity(frame.errors.len());
+            for &row in frame.errors.keys() {
+                failed.push(row);
+                work.step()?;
+            }
+            let state = frame
+                .membership
+                .take()
+                .ok_or_else(|| internal("missing IN state at completion"))?;
+            let result = in_observed(state.finish_selected_observed(
+                output.values(),
+                *is_not_in,
+                demand == EvaluationDemand::TruthOnly,
+                &failed,
+                &mut |event| in_event(event, work),
+            ))?;
+            let mut errors = Vec::with_capacity(frame.errors.len());
+            for (_, error) in std::mem::take(&mut frame.errors) {
+                errors.push(error);
+                work.step()?;
+            }
+            work.flush()?;
+            OwnedValue::from_selected(SelectedValues::try_new_observed(
+                local_selection,
+                result_type.data_type(),
+                Arc::new(result),
+                errors.into_boxed_slice(),
+                || work.step(),
+            )?)
+        }
+        CompletionKind::Between { plan } => {
+            if !frame.children.is_empty() {
+                return Err(invalid("BETWEEN comparison phase was not completed").into());
+            }
+            let state = frame
+                .boolean
+                .take()
+                .ok_or_else(|| internal("missing BETWEEN Boolean continuation"))?;
+            let (array, errors) = state.finish(
+                plan.connective(),
+                demand,
+                std::mem::take(&mut frame.errors),
+                work,
+            )?;
+            OwnedValue::from_selected(SelectedValues::try_new_observed(
+                local_selection,
+                result_type.data_type(),
+                array,
+                errors,
+                || work.step(),
+            )?)
+        }
+        CompletionKind::Boolean => {
+            let state = frame
+                .boolean
+                .take()
+                .ok_or_else(|| internal("missing Boolean continuation"))?;
+            let (array, errors) =
+                state.finish(shape, demand, std::mem::take(&mut frame.errors), work)?;
+            OwnedValue::from_selected(SelectedValues::try_new_observed(
+                local_selection,
+                result_type.data_type(),
+                array,
+                errors,
+                || work.step(),
+            )?)
+        }
+        CompletionKind::Cast => {
+            if frame.children.len() != 1 {
+                return Err(invalid("cast requires its exact operand").into());
+            }
+            let child = std::mem::take(&mut frame.children)
+                .into_iter()
+                .next()
+                .ok_or_else(|| internal("missing cast operand"))?
+                .value
+                .into_value(local_selection, work)?;
+            let recipe = recipes
+                .cast_recipe()
+                .ok_or_else(|| invalid("missing exact cast recipe"))?;
+            if recipe.is_identity() {
+                // The value passes unchanged, with its row errors;
+                // only the frozen nullability widens.
+                OwnedValue::from_materialized(child.materialize(
+                    local_selection,
+                    recipe.result_type().data_type(),
+                    work,
+                )?)
+            } else {
+                OwnedValue::from_selected(evaluate_cast(recipe, &child, local_selection, work)?)
+            }
+        }
+        CompletionKind::Negate => {
+            if frame.children.len() != 1 {
+                return Err(invalid("native negate requires its exact ordered operand").into());
+            }
+            let child = frame
+                .children
+                .pop()
+                .ok_or_else(|| internal("missing native negate operand"))?
+                .value
+                .into_value(local_selection, work)?;
+            let recipe = recipes
+                .native_negate_recipe()
+                .ok_or_else(|| invalid("missing exact native negate recipe"))?;
+            work.flush()?;
+            let output =
+                recipe.evaluate_selected(child.argument(), local_selection, work.control)?;
+            work.flush()?;
+            OwnedValue::from_selected(output)
+        }
+        CompletionKind::BitNot => {
+            if frame.children.len() != 1 {
+                return Err(invalid("native BitwiseNot requires its exact ordered operand").into());
+            }
+            let child = frame
+                .children
+                .pop()
+                .ok_or_else(|| internal("missing native BitwiseNot operand"))?
+                .value
+                .into_value(local_selection, work)?;
+            let recipe = recipes
+                .native_bitnot_recipe()
+                .ok_or_else(|| invalid("missing exact native BitwiseNot recipe"))?;
+            work.flush()?;
+            let output =
+                recipe.evaluate_selected(child.argument(), local_selection, work.control)?;
+            work.flush()?;
+            OwnedValue::from_selected(output)
+        }
+        CompletionKind::Arithmetic => {
+            if frame.children.len() != 2 {
+                return Err(invalid("arithmetic requires its exact ordered operands").into());
+            }
+            let mut children = std::mem::take(&mut frame.children).into_iter();
+            let left = children
+                .next()
+                .ok_or_else(|| internal("missing arithmetic left operand"))?
+                .value
+                .into_value(local_selection, work)?;
+            let right = children
+                .next()
+                .ok_or_else(|| internal("missing arithmetic right operand"))?
+                .value
+                .into_value(local_selection, work)?;
+            let recipe = recipes
+                .arithmetic_recipe()
+                .ok_or_else(|| invalid("missing exact arithmetic recipe"))?;
+            OwnedValue::from_selected(evaluate_arithmetic(
+                recipe,
+                &left,
+                &right,
+                local_selection,
+                work,
+            )?)
+        }
+        CompletionKind::Comparison { null_safe } => {
+            if frame.children.len() != 2 {
+                return Err(invalid("comparison requires its exact ordered operands").into());
+            }
+            let mut children = std::mem::take(&mut frame.children).into_iter();
+            let left = children
+                .next()
+                .ok_or_else(|| internal("missing comparison left operand"))?
+                .value
+                .into_value(local_selection, work)?;
+            let right = children
+                .next()
+                .ok_or_else(|| internal("missing comparison right operand"))?
+                .value
+                .into_value(local_selection, work)?;
+            let recipe = if *null_safe {
+                ComparisonRecipe::NullSafe(
+                    recipes
+                        .null_safe_comparison_recipe()
+                        .ok_or_else(|| invalid("missing exact null-safe comparison recipe"))?,
+                )
+            } else {
+                ComparisonRecipe::Ordinary(
+                    recipes
+                        .comparison_recipe(ComparisonPosition::Binary)
+                        .ok_or_else(|| invalid("missing exact comparison recipe"))?,
+                )
+            };
+            OwnedValue::from_selected(evaluate_comparison(
+                recipe,
+                &left,
+                &right,
+                local_selection,
+                work,
+            )?)
+        }
+        CompletionKind::Case => assemble(
+            &frame.children,
+            &frame.choices,
+            &mut frame.errors,
+            result_type.data_type(),
+            local_selection,
+            work,
+        )?,
+        CompletionKind::Unary(kind) => {
+            if frame.children.len() != 1 {
+                return Err(invalid("unary occurrence requires its exact operand").into());
+            }
+            let child = frame
+                .children
+                .pop()
+                .ok_or_else(|| internal("missing actual unary operand"))?;
+            let value = child.value.into_value(local_selection, work)?;
+            OwnedValue::from_selected(super::unary::evaluate(
+                *kind,
+                &value,
+                local_selection,
+                work,
+            )?)
+        }
+        CompletionKind::Call => {
+            let prepared_call = recipes
+                .prepared_call()
+                .ok_or_else(|| invalid("missing prepared node call"))?;
+            match prepared_call {
+                PreparedPureKernel::Scalar(_) | PreparedPureKernel::ScalarInvocation(_) => {
+                    let prepared = match prepared_call {
+                        PreparedPureKernel::Scalar(p) => scalar_invocation::PreparedCall::Kernel(p),
+                        PreparedPureKernel::ScalarInvocation(p) => {
+                            scalar_invocation::PreparedCall::Invocation(p)
+                        }
+                        _ => {
+                            return Err(ExprEvaluationFailure::Kernel(invalid(
+                                "ordinary call changed its prepared lifecycle",
+                            )));
+                        }
+                    };
+                    if original_domain {
+                        let result = evaluate_original_invocation::<R, K>(
+                            frame.occurrence.clone(),
+                            prepared,
+                            &frame.children,
+                            &frame.domain,
+                            local_selection,
+                            frame.activation,
+                            instances,
+                            allocator,
+                            work,
+                        )?;
+                        OwnedValue::from_selected(result)
+                    } else {
+                        let mut children = Vec::with_capacity(frame.children.len());
+                        for child in std::mem::take(&mut frame.children) {
+                            children.push(child.value.into_value(local_selection, work)?);
+                            work.step()?;
+                        }
+                        OwnedValue::from_selected(evaluate_scalar::<R, K>(
+                            frame.occurrence.clone(),
+                            prepared,
+                            &children,
+                            local_selection,
+                            frame.activation,
+                            instances,
+                            allocator,
+                            work,
+                        )?)
+                    }
+                }
+                PreparedPureKernel::ControlIntrinsic(_)
+                    if matches!(shape, ControlShape::TemporalSource(_)) =>
+                {
+                    let state = frame
+                        .temporal
+                        .take()
+                        .ok_or_else(|| internal("missing temporal continuation at completion"))?;
+                    state.finish(shape, &mut frame.errors, local_selection, work)?
+                }
+                PreparedPureKernel::ControlIntrinsic(_) => {
+                    if shape == ControlShape::If {
+                        finish_if(
+                            &frame.children,
+                            &frame.choices,
+                            &mut frame.errors,
+                            &frame.routes,
+                            local_selection.is_empty(),
+                            result_type.data_type(),
+                            local_selection,
+                            work,
+                        )?
+                    } else {
+                        assemble(
+                            &frame.children,
+                            &frame.choices,
+                            &mut frame.errors,
+                            result_type.data_type(),
+                            local_selection,
+                            work,
+                        )?
+                    }
+                }
+                _ => {
+                    return Err(invalid("compiled occurrence has a different lifecycle").into());
+                }
+            }
+        }
+    })
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Keep the checked root, exact input port, selected domain, use-owned state/effects and caller control explicit"
+)]
+pub(super) fn evaluate_tree<'a, R>(
+    program: &CompiledExprSet,
+    root: RootOrdinal,
+    input: FrameInput<'_>,
+    input_scope: RootScope,
+    actual_domain: Selection<'a>,
+    selection: Selection<'a>,
+    activation: novarocks_functions::ScalarInvocationActivation,
+    instances: &mut BTreeMap<ExpressionUseId, scalar_invocation::CallInstance>,
+    allocator: Option<&Arc<dyn novarocks_functions::AggregateStateAllocator>>,
+    effects: &BTreeMap<ExpressionUseId, ScopedExpressionEffects>,
+    work: &mut Work<'_, '_, R>,
+) -> Result<Value<'a>, ExprEvaluationFailure<R>> {
+    let flow = program.control_flow();
+    let definitions = program.definitions();
+    let root_use = program
+        .root(root)
+        .ok_or_else(|| invalid("missing actual compiled expression root"))?
+        .use_id;
+    // Admit the controller's per-row storage representation before its first
+    // allocation. This is an extent gate, not a host memory grant.
+    let element_width = std::mem::size_of::<RowDataError>()
+        .max(std::mem::size_of::<Option<(usize, usize)>>())
+        .max(std::mem::size_of::<usize>());
+    if selection
+        .len()
+        .checked_mul(element_width)
+        .is_none_or(|bytes| bytes > isize::MAX as usize)
+    {
+        return Err(KernelFailure::ResourceExhausted.into());
+    }
+    work.step()?;
+    let mut rows = Vec::with_capacity(selection.len());
+    for row in selection.iter() {
+        rows.push(row);
+        work.step()?;
+    }
+    let domain = Arc::new(input_source::ActualInvocationDomain::root(
+        input,
+        actual_domain,
+        work.control,
+    )?);
+    if selection.batch_rows() != actual_domain.batch_rows() {
+        return Err(invalid("outer root demand has a different logical batch extent").into());
+    }
+    for row in selection.iter() {
+        if domain.physical_ordinal(row).is_none() {
+            return Err(invalid(
+                "outer root demand is outside the explicitly authored actual domain",
+            )
+            .into());
+        }
+        work.step()?;
+    }
+    let root_invocation = &flow.uses()[&root_use];
+    let root_type = definitions
+        .node(root_invocation.definition)
+        .ok_or_else(|| invalid("missing actual root definition"))?
+        .data_type();
+    // Reverse propagation is solely from the actual immutable prepared owner
+    // policy over this checked use graph. Ordinary ScalarV1/selected owners do
+    // not acquire a whole-domain child policy by sharing a numeric ABI.
+    let mut needs_original = BTreeSet::new();
+    let mut finished = BTreeSet::new();
+    let mut pending = vec![(root_use, false)];
+    while let Some((use_id, expanded)) = pending.pop() {
+        if finished.contains(&use_id) {
+            continue;
+        }
+        let invocation = &flow.uses()[&use_id];
+        if expanded {
+            let occurrence = use_id;
+            let own = matches!(program.calls().get(&occurrence).map(|call|call.prepared()),
+                Some(PreparedPureKernel::ScalarInvocation(prepared)) if scalar_invocation::PreparedCall::Invocation(prepared).input_domain_policy() == novarocks_functions::InvocationInputDomainPolicy::OriginalActualDomain);
+            let mut required = own;
+            for child in &invocation.arguments {
+                required |= needs_original.contains(child);
+                work.step()?;
+            }
+            if required {
+                needs_original.insert(use_id);
+            }
+            finished.insert(use_id);
+        } else {
+            pending.push((use_id, true));
+            for child in invocation.arguments.iter().rev() {
+                pending.push((*child, false));
+                work.step()?;
+            }
+        }
+        work.step()?;
+    }
+    let mut source_captured = false;
+    let mut source_custody = None;
+    let mut frames = vec![Frame::new(
+        root_use,
+        root_invocation.control,
+        root_type,
+        rows,
+        domain,
+        needs_original.contains(&root_use),
+        activation,
+        Vec::new(),
+        work,
+    )?];
+    while let Some(mut frame) = frames.pop() {
+        work.step()?;
+        let invocation = &flow.uses()[&frame.occurrence];
+        let definition = definitions
+            .node(invocation.definition)
+            .ok_or_else(|| invalid("missing compiled definition"))?;
+        let FunctionArgumentType::Value(result_type) = program
+            .types()
+            .get(invocation.definition.index())
+            .ok_or_else(|| invalid("missing exact compiled definition type"))?
+        else {
+            return Err(invalid("ordinary root cannot materialize a lambda definition").into());
+        };
+        let original_domain = match definition.kind() {
+            StaticExprKind::BoundCall { .. } => {
+                matches!(program.calls()[&frame.occurrence].prepared(),
+                    PreparedPureKernel::ScalarInvocation(prepared) if scalar_invocation::PreparedCall::Invocation(prepared).input_domain_policy() == novarocks_functions::InvocationInputDomainPolicy::OriginalActualDomain)
+            }
+            _ => false,
+        };
+        // ValidateOnly with no demanded rows enters no children or leaf.
+        // Activated empty invocations retain their original arity behavior.
+        let next = if frame.rows.is_empty()
+            && frame.activation == novarocks_functions::ScalarInvocationActivation::ValidateOnly
+        {
+            None
+        } else {
+            let next_is_pure = invocation
+                .arguments
+                .get(frame.next)
+                .map(|child| {
+                    let occurrence = *child;
+                    effects
+                        .get(&occurrence)
+                        .ok_or_else(|| invalid("missing exact operand effects"))?
+                        .for_use(flow.uses()[child].context)
+                        .map_err(|_| invalid("operand effect context differs"))
+                        .map(|summary| summary.permits_boolean_reordering())
+                })
+                .transpose()?
+                .unwrap_or(true);
+            frame.next_ordinals(
+                invocation.control,
+                invocation.arguments.len(),
+                next_is_pure,
+                input.num_rows(),
+                work,
+            )?
+        };
+        if let Some(ordinals) = next {
+            let child_use = invocation.arguments[frame.next];
+            frame.next += 1;
+            let (rows, child_domain, child_activation) =
+                child_context(&frame, invocation.control, &ordinals, original_domain, work)?;
+            let child = Frame::new(
+                child_use,
+                flow.uses()[&child_use].control,
+                definitions
+                    .node(flow.uses()[&child_use].definition)
+                    .ok_or_else(|| invalid("missing actual child definition"))?
+                    .data_type(),
+                rows,
+                child_domain,
+                needs_original.contains(&child_use),
+                child_activation,
+                ordinals,
+                work,
+            )?;
+            frames.push(frame);
+            frames.push(child);
+            continue;
+        }
+        // Row domains are immutable once traversal finishes this frame. Move
+        // their existing vectors out so completion can mutate the other state
+        // without cloning rows or adding observation callbacks.
+        let completion_rows = std::mem::take(&mut frame.rows);
+        let completion_output_rows = std::mem::take(&mut frame.output_rows);
+        let local_selection =
+            Selection::try_sparse_observed(input.num_rows(), &completion_rows, || work.step())?;
+        let output_selection =
+            Selection::try_sparse_observed(input.num_rows(), &completion_output_rows, || {
+                work.step()
+            })?;
+        // Clone only explicit finite continuations of actually evaluated
+        // children. No host request occurs before the original leaf outcome.
+        let child_sources = frame
+            .children
+            .iter()
+            .filter_map(|child| child.value.continuation())
+            .collect();
+        let value = if completion_rows.is_empty()
+            && frame.activation == novarocks_functions::ScalarInvocationActivation::ValidateOnly
+        {
+            complete_undemanded_leaf(result_type.data_type(), work)?
+        } else {
+            match definition.kind() {
+                StaticExprKind::Constant(constant) => {
+                    complete_constant_leaf(constant, result_type, local_selection, allocator, work)?
+                }
+                StaticExprKind::Input => {
+                    let source = program
+                        .input(frame.occurrence)
+                        .ok_or_else(|| invalid("input requires its actual compiled source"))?;
+                    if source.scope != input_scope {
+                        return Err(invalid("input source differs from actual root scope").into());
+                    }
+                    let ordinal = source.ordinal as usize;
+                    let column = input
+                        .checked_column(ordinal)
+                        .ok_or_else(|| invalid("slot source ordinal is absent"))?;
+                    // Obtain the source at the original checked Slot. Current
+                    // kernels still consume only the evaluated array; this
+                    // synchronous borrow neither captures nor wraps its owner.
+                    let (_original, _source) = column.into_parts();
+                    let array = frame.domain.column(ordinal).ok_or_else(|| {
+                        invalid("actual source domain has no checked Slot ordinal")
+                    })?;
+                    if !source_captured {
+                        source_custody = input.capture_source(allocator, work.control)?;
+                        source_captured = true;
+                    }
+                    let array = match &source_custody {
+                        Some(custody) => custody.retain(Arc::clone(array), work.control)?,
+                        None => Arc::clone(array),
+                    };
+                    let owner = source_custody
+                        .as_ref()
+                        .map(|custody| custody.continuation(&array, work.control))
+                        .transpose()?;
+                    OwnedValue::Source(array, frame.domain.clone()).with_continuation(owner)
+                }
+                kind => {
+                    let recipes = UnitNodeRecipes {
+                        unit: program,
+                        occurrence: frame.occurrence,
+                    };
+                    complete_node::<R, _>(
+                        &CompletionKind::from_static(kind)
+                            .ok_or_else(|| invalid("unsupported compiled root definition"))?,
+                        &mut frame,
+                        &recipes,
+                        invocation.control,
+                        invocation.context.demand,
+                        result_type,
+                        local_selection,
+                        original_domain,
+                        instances,
+                        allocator,
+                        work,
+                    )?
+                }
+            }
+        };
+        let value = if completion_output_rows != completion_rows {
+            project_owned(
+                value,
+                &completion_rows,
+                &completion_output_rows,
+                input.num_rows(),
+                work,
+            )?
+        } else {
+            value
+        };
+        // Required children become fatal at their original return boundary,
+        // before any new custody/type-holder allocation can replace the cause.
+        if let Some(parent) = frames.last() {
+            let parent_requires_original = matches!(
+                program.calls().get(&parent.occurrence).map(|call|call.prepared()),
+                Some(PreparedPureKernel::ScalarInvocation(prepared)) if scalar_invocation::PreparedCall::Invocation(prepared).input_domain_policy() == novarocks_functions::InvocationInputDomainPolicy::OriginalActualDomain
+            );
+            if parent_requires_original
+                && let OwnedValue::Selected(_, errors) = value.uncontinued()
+                && let Some(error) = errors.first()
+            {
+                work.control
+                    .operation_aborted
+                    .store(true, Ordering::Relaxed);
+                return Err(RequiredExpressionRowError::try_new(
+                    root,
+                    output_selection,
+                    error.clone(),
+                )?
+                .into());
+            }
+        }
+        // Preserve the original leaf/required-child failure before any new
+        // custody request. Successful scalar aliases inherit their real inputs.
+        let value = value.retaining_children(child_sources, allocator, work.control)?;
+        let value = value.retaining_custody(source_custody.as_ref(), work.control)?;
+        let value = value.retaining_result_type(result_type, allocator, work.control)?;
+        if let Some(operand) = frame.operand.take() {
+            work.flush()?;
+            drop(operand);
+            work.flush()?;
+        }
+        if let Some(parent) = frames.last_mut() {
+            let parent_invocation = &flow.uses()[&parent.occurrence];
+            let shape = parent_invocation.control;
+
+            let child_is_pure = effects
+                .get(&frame.occurrence)
+                .ok_or_else(|| invalid("missing actual child effects"))?
+                .for_use(invocation.context)
+                .map_err(|_| invalid("child effects differ from actual occurrence"))?
+                .permits_boolean_reordering();
+            parent.attach(
+                Child {
+                    ordinals: frame.parent_ordinals,
+                    value,
+                },
+                &UnitNodeRecipes {
+                    unit: program,
+                    occurrence: parent.occurrence,
+                },
+                shape,
+                parent_invocation.context.demand,
+                child_is_pure,
+                input.num_rows(),
+                work,
+                allocator,
+            )?;
+        } else {
+            let value = value.into_value(selection, work)?;
+            if let Some(custody) = &source_custody {
+                let ty = value.argument().array().data_type().clone();
+                let value = value.materialize(selection, &ty, work)?;
+                let continuation = value.continuation.clone();
+                let (_, array, errors) = value.into_parts();
+                let array = custody.retain(array, work.control)?;
+                return SelectedValues::try_new_observed(selection, &ty, array, errors, || {
+                    work.step()
+                })
+                .map(Value::Selected)
+                .and_then(|value| match continuation {
+                    Some(owner) => value.retaining_continuation(owner, work),
+                    None => Ok(value),
+                })
+                .map_err(ExprEvaluationFailure::Kernel);
+            }
+            return Ok(value);
+        }
+    }
+    Err(internal("actual compiled root result is absent").into())
+}
+
+/// Only the typed owner policy enters this path. Sources are already evaluated
+/// in the exact actual domain; success projects output, never required errors.
+fn evaluate_original_invocation<'a, R, K: Ord + Clone>(
+    occurrence: K,
+    prepared: scalar_invocation::PreparedCall<'_>,
+    children: &[Child],
+    domain: &Arc<input_source::ActualInvocationDomain>,
+    demand: Selection<'a>,
+    activation: novarocks_functions::ScalarInvocationActivation,
+    instances: &mut BTreeMap<K, scalar_invocation::CallInstance>,
+    allocator: Option<&Arc<dyn novarocks_functions::AggregateStateAllocator>>,
+    work: &mut Work<'_, '_, R>,
+) -> Result<SelectedValues<'a>, ExprEvaluationFailure<R>> {
+    use novarocks_functions::{EvaluatedSourceLoan, ScalarInvocationScope, ScalarInvocationSource};
+    let actual = domain.selection(work.control)?;
+    let mut sources = Vec::with_capacity(children.len());
+    for child in children {
+        sources.push(match child.value.uncontinued() {
+            OwnedValue::Constant(value) => ScalarInvocationSource::Constant(value),
+            OwnedValue::ConstantView(value) => ScalarInvocationSource::ConstantView(value.view()),
+            OwnedValue::Source(array, source) => ScalarInvocationSource::Array(
+                EvaluatedSourceLoan::new(array, source.selection(work.control)?),
+            ),
+            OwnedValue::Continued(_, _) => unreachable!("continuation was unwrapped"),
+            OwnedValue::Column(array) | OwnedValue::Selected(array, _) => {
+                ScalarInvocationSource::Array(EvaluatedSourceLoan::new(array, actual))
+            }
+        });
+        work.step()?;
+    }
+    work.flush()?;
+    if let std::collections::btree_map::Entry::Vacant(entry) = instances.entry(occurrence.clone()) {
+        let instance = match prepared.instantiate(allocator.cloned()) {
+            Ok(instance) => instance,
+            Err(cause) => {
+                work.control
+                    .operation_aborted
+                    .store(true, Ordering::Relaxed);
+                return Err(cause.into());
+            }
+        };
+        work.control.checkpoint(0)?;
+        entry.insert(instance);
+    }
+    let result = scalar_invocation::invoke_scoped(
+        instances
+            .get_mut(&occurrence)
+            .ok_or_else(|| internal("scoped scalar instance was not installed"))?,
+        ScalarInvocationScope::new(actual, demand),
+        &sources,
+        activation,
+        work,
+    );
+    let output = match result {
+        Ok(output) => output,
+        Err(cause) => {
+            work.control
+                .operation_aborted
+                .store(true, Ordering::Relaxed);
+            return Err(cause);
+        }
+    };
+    // End the local source loans before returning the independent outer demand.
+    let (_, array, errors) = output.into_parts();
+    SelectedValues::try_new_observed(
+        demand,
+        prepared.contract().result_type().data_type(),
+        array,
+        errors,
+        || work.step(),
+    )
+    .map_err(ExprEvaluationFailure::Kernel)
+}
+
+fn project_owned(
+    value: OwnedValue,
+    actual_rows: &[usize],
+    demand_rows: &[usize],
+    batch_rows: usize,
+    work: &mut Work<'_, '_, impl Sized>,
+) -> Result<OwnedValue, KernelFailure> {
+    let actual = Selection::try_sparse_observed(batch_rows, actual_rows, || work.step())?;
+    let value = value.into_value(actual, work)?;
+    let ty = value.argument().array().data_type().clone();
+    let actual_value = value.materialize(actual, &ty, work)?;
+    let mut indices = Vec::with_capacity(demand_rows.len());
+    let mut errors = Vec::new();
+    for (ordinal, row) in demand_rows.iter().enumerate() {
+        let physical = actual_rows.binary_search(row).map_err(|_| {
+            invalid("successful outer demand is outside its actual invocation domain")
+        })?;
+        indices.push(Some(
+            u64::try_from(physical).map_err(|_| KernelFailure::ResourceExhausted)?,
+        ));
+        if let Ok(index) = actual_value
+            .errors()
+            .binary_search_by_key(&physical, RowDataError::selected_ordinal)
+        {
+            errors.push(actual_value.errors()[index].with_selected_ordinal(ordinal));
+        }
+        work.step()?;
+    }
+    let continuation = actual_value.continuation.clone();
+    let array = gather_continued(actual_value.values(), &indices, continuation.as_ref(), work)?;
+    Ok(OwnedValue::Selected(array, errors.into_boxed_slice()).with_continuation(continuation))
+}
+
+/// The original IF author preserves a same-type chosen carrier on its genuine
+/// all-true/all-false fast paths. Mixed routes retain the original assembly.
+fn finish_if(
+    children: &[Child],
+    choices: &[Option<(usize, usize)>],
+    row_errors: &mut BTreeMap<usize, RowDataError>,
+    routes: &[Option<bool>],
+    empty: bool,
+    ty: &DataType,
+    selection: Selection<'_>,
+    work: &mut Work<'_, '_, impl Sized>,
+) -> Result<OwnedValue, KernelFailure> {
+    if row_errors.is_empty() {
+        let mut all_true = true;
+        let mut all_false = true;
+        for route in routes {
+            all_true &= *route == Some(true);
+            all_false &= *route == Some(false);
+            work.step()?;
+        }
+        let selected = if empty {
+            children.len().checked_sub(1)
+        } else if all_true {
+            Some(1)
+        } else if all_false {
+            Some(2)
+        } else {
+            None
+        };
+        if let Some(selected) = selected {
+            let child = children
+                .get(selected)
+                .ok_or_else(|| internal("original IF fast path has no selected branch"))?;
+            if let OwnedValue::Selected(array, errors) = child.value.uncontinued() {
+                if array.data_type() == ty {
+                    return Ok(OwnedValue::Selected(array.clone(), errors.clone())
+                        .with_continuation(child.value.continuation()));
+                }
+                if matches!(array.data_type(), DataType::Null) {
+                    work.flush()?;
+                    let array = new_null_array(ty, selection.len());
+                    work.flush()?;
+                    return Ok(OwnedValue::Selected(array, errors.clone()));
+                }
+                // Legal non-Null coercions are explicit frozen child Casts.
+                // Do not invent a late untyped cast or broaden that contract.
+            }
+        }
+    }
+    assemble(children, choices, row_errors, ty, selection, work)
+}
+
+fn assemble(
+    children: &[Child],
+    choices: &[Option<(usize, usize)>],
+    row_errors: &mut BTreeMap<usize, RowDataError>,
+    ty: &DataType,
+    selection: Selection<'_>,
+    work: &mut Work<'_, '_, impl Sized>,
+) -> Result<OwnedValue, KernelFailure> {
+    // The shared pure assembly receives only already-evaluated compact values.
+    // Frame scheduling and its original lazy row demand remain in this host.
+    let mut sources = Vec::with_capacity(children.len());
+    for child in children {
+        sources.push(match child.value.uncontinued() {
+            OwnedValue::Selected(array, _) => Some(array),
+            _ => None,
+        });
+        work.step()?;
+    }
+    work.flush()?;
+    let array = novarocks_functions::control_values::assemble_values(
+        novarocks_functions::control_values::AssemblyPlan::Indexed {
+            result_type: ty,
+            sources: &sources,
+            choices,
+        },
+        work.control,
+    )
+    .map_err(novarocks_functions::control_values::AssemblyFailure::into_kernel)?;
+    work.flush()?;
+    let mut errors = Vec::with_capacity(row_errors.len());
+    for error in std::mem::take(row_errors).into_values() {
+        errors.push(error);
+        work.step()?;
+    }
+    Ok(OwnedValue::from_selected(SelectedValues::try_new_observed(
+        selection,
+        ty,
+        array,
+        errors.into_boxed_slice(),
+        || work.step(),
+    )?))
+}
+
+/// Re-address one retained phase result through the existing selected COPY
+/// author. Nothing reads an inactive original batch row or supplies a new FVT.
+fn between_comparison_operand<'a>(
+    child: Child,
+    parent_ordinals: &[usize],
+    parent_rows: &[usize],
+    selection: Selection<'a>,
+    batch_rows: usize,
+    work: &mut Work<'_, '_, impl Sized>,
+) -> Result<Value<'a>, KernelFailure> {
+    let mut rows = Vec::with_capacity(child.ordinals.len());
+    for &parent in &child.ordinals {
+        rows.push(parent_rows[parent]);
+        work.step()?;
+    }
+    let source_selection = Selection::try_sparse_observed(batch_rows, &rows, || work.step())?;
+    let value = child.value.into_value(source_selection, work)?;
+    let ty = value.argument().array().data_type().clone();
+    let output = value.materialize(source_selection, &ty, work)?;
+    let mut indices = Vec::with_capacity(parent_ordinals.len());
+    for &parent in parent_ordinals {
+        let index = child
+            .ordinals
+            .binary_search(&parent)
+            .map_err(|_| invalid("BETWEEN comparison row is absent from its source phase"))?;
+        indices.push(Some(
+            u64::try_from(index).map_err(|_| KernelFailure::ResourceExhausted)?,
+        ));
+        work.step()?;
+    }
+    let continuation = output.continuation.clone();
+    let array = gather_continued(output.values(), &indices, continuation.as_ref(), work)?;
+    work.flush()?;
+    drop(output);
+    work.flush()?;
+    let value = Value::Selected(SelectedValues::try_new_observed(
+        selection,
+        &ty,
+        array,
+        Box::default(),
+        || work.step(),
+    )?);
+    match continuation {
+        Some(owner) => value.retaining_continuation(owner, work),
+        None => Ok(value),
+    }
+}
+
+/// The shared Boolean journal/assembly is independent of the numeric algorithm.
+/// Null-safe comparison retains its own prepared recipe and scalar semantics.
+enum ComparisonRecipe<'a> {
+    Ordinary(&'a novarocks_functions::PreparedComparisonRecipe),
+    NullSafe(&'a novarocks_functions::PreparedNullSafeComparisonRecipe),
+}
+
+fn evaluate_comparison<'a>(
+    recipe: ComparisonRecipe<'_>,
+    left: &Value<'_>,
+    right: &Value<'_>,
+    selection: Selection<'a>,
+    work: &mut Work<'_, '_, impl Sized>,
+) -> Result<SelectedValues<'a>, KernelFailure> {
+    // Borrow the original callback; a nested comparison's footer cannot
+    // observe again after any of its seven originating refusal categories.
+    let observed = novarocks_functions::KernelControlObservation::new(work.control);
+    let mut left_errors = left.errors().iter().peekable();
+    let mut right_errors = right.errors().iter().peekable();
+    // Representation accounting precedes fallible reservations. It is not a
+    // formal host memory grant or an Arrow allocation-origin guarantee.
+    selection
+        .len()
+        .checked_mul(
+            std::mem::size_of::<Option<bool>>()
+                + std::mem::size_of::<RowDataError>()
+                + novarocks_functions::MAX_ROW_ERROR_MESSAGE_BYTES,
+        )
+        .and_then(|n| {
+            selection
+                .len()
+                .checked_add(7)
+                .and_then(|bits| n.checked_add(bits / 8))
+        })
+        .filter(|n| *n <= isize::MAX as usize)
+        .ok_or(KernelFailure::ResourceExhausted)?;
+    work.flush()?;
+    let mut errors = Vec::new();
+    let mut values = Vec::new();
+    errors
+        .try_reserve_exact(selection.len())
+        .map_err(|_| KernelFailure::ResourceExhausted)?;
+    values
+        .try_reserve_exact(selection.len())
+        .map_err(|_| KernelFailure::ResourceExhausted)?;
+    work.flush()?;
+    for (ordinal, row) in selection.iter().enumerate() {
+        let l = if left_errors
+            .peek()
+            .is_some_and(|error| error.selected_ordinal() == ordinal)
+        {
+            left_errors.next()
+        } else {
+            None
+        };
+        let r = if right_errors
+            .peek()
+            .is_some_and(|error| error.selected_ordinal() == ordinal)
+        {
+            right_errors.next()
+        } else {
+            None
+        };
+        if let Some(error) = l.or(r) {
+            errors.push(error.clone());
+            values.push(None);
+        } else {
+            work.flush()?;
+            let compared = match recipe {
+                ComparisonRecipe::Ordinary(recipe) => recipe.compare_rows(
+                    left.argument(),
+                    ordinal,
+                    row,
+                    right.argument(),
+                    ordinal,
+                    row,
+                    &observed,
+                )?,
+                ComparisonRecipe::NullSafe(recipe) => Some(recipe.compare_rows(
+                    left.argument(),
+                    ordinal,
+                    row,
+                    right.argument(),
+                    ordinal,
+                    row,
+                    &observed,
+                )?),
+            };
+            values.push(compared);
+        }
+        work.step()?;
+    }
+    work.flush()?;
+    let array = Arc::new(BooleanArray::from(values));
+    work.flush()?;
+    SelectedValues::try_new_observed(
+        selection,
+        &DataType::Boolean,
+        array,
+        errors.into_boxed_slice(),
+        || work.step(),
+    )
+}
+
+fn evaluate_arithmetic<'a>(
+    recipe: &novarocks_functions::PreparedArithmeticRecipe,
+    left: &Value<'_>,
+    right: &Value<'_>,
+    selection: Selection<'a>,
+    work: &mut Work<'_, '_, impl Sized>,
+) -> Result<SelectedValues<'a>, KernelFailure> {
+    use arrow::array::{
+        Decimal128Array, Decimal256Array, Float64Array, Int8Array, Int16Array, Int32Array,
+        Int64Array, builder::FixedSizeBinaryBuilder,
+    };
+    use arrow::datatypes::i256;
+    use novarocks_functions::ArithmeticRowResult as R;
+    let ty = &recipe.result_type().data_type();
+    // This is a checked representation bound and fallible capacity reservation,
+    // not a host Account grant or an Arrow allocation-origin receipt.
+    let bitmap = selection
+        .len()
+        .checked_add(7)
+        .map(|n| n / 8)
+        .and_then(|n| n.checked_add(63))
+        .map(|n| n / 64 * 64)
+        .ok_or(KernelFailure::ResourceExhausted)?;
+    selection
+        .len()
+        .checked_mul(
+            std::mem::size_of::<Option<i256>>()
+                + 32
+                + std::mem::size_of::<RowDataError>()
+                + novarocks_functions::MAX_ROW_ERROR_MESSAGE_BYTES,
+        )
+        .and_then(|n| n.checked_add(bitmap))
+        .filter(|bytes| *bytes <= isize::MAX as usize)
+        .ok_or(KernelFailure::ResourceExhausted)?;
+    work.flush()?;
+    enum Output {
+        I8(Vec<Option<i8>>),
+        I16(Vec<Option<i16>>),
+        I32(Vec<Option<i32>>),
+        I64(Vec<Option<i64>>),
+        Float(Vec<Option<f64>>),
+        Decimal128(Vec<Option<i128>>),
+        Decimal256(Vec<Option<i256>>),
+        LargeInt(FixedSizeBinaryBuilder),
+    }
+    let mut output = match ty {
+        DataType::Int8 => Output::I8(Vec::new()),
+        DataType::Int16 => Output::I16(Vec::new()),
+        DataType::Int32 => Output::I32(Vec::new()),
+        DataType::Int64 => Output::I64(Vec::new()),
+        DataType::Float64 => Output::Float(Vec::new()),
+        DataType::Decimal128(..) => Output::Decimal128(Vec::new()),
+        DataType::Decimal256(..) => Output::Decimal256(Vec::new()),
+        DataType::FixedSizeBinary(16)
+            if recipe.result_type().logical_type()
+                == novarocks_type_contract::ValueLogicalType::LargeInt =>
+        {
+            Output::LargeInt(FixedSizeBinaryBuilder::with_capacity(selection.len(), 16))
+        }
+        _ => {
+            return Err(internal(
+                "arithmetic recipe has an unsupported frozen result carrier",
+            ));
+        }
+    };
+    match &mut output {
+        Output::I8(values) => values.try_reserve_exact(selection.len()),
+        Output::I16(values) => values.try_reserve_exact(selection.len()),
+        Output::I32(values) => values.try_reserve_exact(selection.len()),
+        Output::I64(values) => values.try_reserve_exact(selection.len()),
+        Output::Float(values) => values.try_reserve_exact(selection.len()),
+        Output::Decimal128(values) => values.try_reserve_exact(selection.len()),
+        Output::Decimal256(values) => values.try_reserve_exact(selection.len()),
+        Output::LargeInt(_) => Ok(()),
+    }
+    .map_err(|_| KernelFailure::ResourceExhausted)?;
+    let mut errors = Vec::new();
+    errors
+        .try_reserve_exact(selection.len())
+        .map_err(|_| KernelFailure::ResourceExhausted)?;
+    work.flush()?;
+    let mut left_errors = left.errors().iter().peekable();
+    let mut right_errors = right.errors().iter().peekable();
+    for (ordinal, row) in selection.iter().enumerate() {
+        let l = if left_errors
+            .peek()
+            .is_some_and(|e| e.selected_ordinal() == ordinal)
+        {
+            left_errors.next()
+        } else {
+            None
+        };
+        let r = if right_errors
+            .peek()
+            .is_some_and(|e| e.selected_ordinal() == ordinal)
+        {
+            right_errors.next()
+        } else {
+            None
+        };
+        let result = if let Some(error) = l.or(r) {
+            R::RowError(error.clone())
+        } else {
+            work.flush()?;
+            recipe.evaluate_row(
+                left.argument(),
+                ordinal,
+                row,
+                right.argument(),
+                ordinal,
+                row,
+                work.control,
+            )?
+        };
+        let result = match result {
+            R::RowError(error) => {
+                errors.push(error.with_selected_ordinal(ordinal));
+                R::Null
+            }
+            result => result,
+        };
+        match (&mut output, result) {
+            (Output::I8(values), R::Signed(value)) => {
+                values.push(Some(i8::try_from(value).map_err(|_| {
+                    internal("checked signed arithmetic returned an out-of-range Int8")
+                })?))
+            }
+            (Output::I16(values), R::Signed(value)) => {
+                values.push(Some(i16::try_from(value).map_err(|_| {
+                    internal("checked signed arithmetic returned an out-of-range Int16")
+                })?))
+            }
+            (Output::I32(values), R::Signed(value)) => {
+                values.push(Some(i32::try_from(value).map_err(|_| {
+                    internal("checked signed arithmetic returned an out-of-range Int32")
+                })?))
+            }
+            (Output::I64(values), R::Signed(value)) => values.push(Some(value)),
+            (Output::Float(values), R::Float(value)) => values.push(Some(value)),
+            (Output::Decimal128(values), R::Decimal128(value)) => values.push(Some(value)),
+            (Output::Decimal256(values), R::Decimal256(value)) => values.push(Some(value)),
+            (Output::LargeInt(values), R::LargeInt(value)) => values
+                .append_value(value.to_be_bytes())
+                .map_err(|_| internal("LargeInt result differs from its fixed carrier width"))?,
+            (Output::I8(values), R::Null) => values.push(None),
+            (Output::I16(values), R::Null) => values.push(None),
+            (Output::I32(values), R::Null) => values.push(None),
+            (Output::I64(values), R::Null) => values.push(None),
+            (Output::Float(values), R::Null) => values.push(None),
+            (Output::Decimal128(values), R::Null) => values.push(None),
+            (Output::Decimal256(values), R::Null) => values.push(None),
+            (Output::LargeInt(values), R::Null) => values.append_null(),
+            _ => {
+                return Err(internal(
+                    "arithmetic body returned a foreign frozen result carrier",
+                ));
+            }
+        }
+        work.step()?;
+    }
+    work.flush()?;
+    let array: ArrayRef = match (ty, output) {
+        (DataType::Int8, Output::I8(values)) => Arc::new(Int8Array::from(values)),
+        (DataType::Int16, Output::I16(values)) => Arc::new(Int16Array::from(values)),
+        (DataType::Int32, Output::I32(values)) => Arc::new(Int32Array::from(values)),
+        (DataType::Int64, Output::I64(values)) => Arc::new(Int64Array::from(values)),
+        (DataType::Float64, Output::Float(values)) => Arc::new(Float64Array::from(values)),
+        (DataType::Decimal128(precision, scale), Output::Decimal128(values)) => Arc::new(
+            Decimal128Array::from(values)
+                .with_precision_and_scale(*precision, *scale)
+                .map_err(|_| {
+                    internal("Decimal128 result metadata differs from its prepared type")
+                })?,
+        ),
+        (DataType::Decimal256(precision, scale), Output::Decimal256(values)) => Arc::new(
+            Decimal256Array::from(values)
+                .with_precision_and_scale(*precision, *scale)
+                .map_err(|_| {
+                    internal("Decimal256 result metadata differs from its prepared type")
+                })?,
+        ),
+        (DataType::FixedSizeBinary(16), Output::LargeInt(mut values)) => Arc::new(values.finish()),
+        _ => {
+            return Err(internal(
+                "arithmetic recipe has an unsupported frozen result carrier",
+            ));
+        }
+    };
+    work.flush()?;
+    SelectedValues::try_new_observed(selection, ty, array, errors.into_boxed_slice(), || {
+        work.step()
+    })
+}
+
+fn evaluate_cast<'a>(
+    recipe: &novarocks_functions::PreparedCastRecipe,
+    child: &Value<'_>,
+    selection: Selection<'a>,
+    work: &mut Work<'_, '_, impl Sized>,
+) -> Result<SelectedValues<'a>, KernelFailure> {
+    work.flush()?;
+    recipe.evaluate_selected(child.argument(), selection, child.errors(), work.control)
+}
+
+// Pure values from ordered, separately evaluated source occurrences. Scheduling
+// stays in Frame/evaluate_tree; no source definition or arena enters the math.
+struct TemporalValues {
+    seconds: Vec<Option<i64>>,
+    normal: Option<(ArrayRef, Vec<usize>)>,
+    result: Option<(ArrayRef, Vec<usize>)>,
+}
+fn temporal_math<T>(
+    work: &mut Work<'_, '_, impl Sized>,
+    body: impl FnOnce(
+        &mut novarocks_functions::EvaluationCheckpoints<'_>,
+    ) -> Result<
+        T,
+        novarocks_functions::builtin::calendar_time_text_shared::TimeTextError,
+    >,
+) -> Result<T, KernelFailure> {
+    use novarocks_functions::builtin::calendar_time_text_shared::TimeTextError;
+    work.flush()?;
+    let mut scope = novarocks_functions::EvaluationCheckpoints::new(work.control);
+    let value = body(&mut scope);
+    let value = scope.finish_result(value.map_err(TimeTextError::into_kernel))?;
+    work.flush()?;
+    Ok(value)
+}
+impl TemporalValues {
+    fn new(rows: usize, work: &mut Work<'_, '_, impl Sized>) -> Result<Self, KernelFailure> {
+        work.flush()?;
+        let mut seconds = Vec::new();
+        seconds
+            .try_reserve_exact(rows)
+            .map_err(|_| KernelFailure::ResourceExhausted)?;
+        for _ in 0..rows {
+            seconds.push(None);
+            work.step()?;
+        }
+        Ok(Self {
+            seconds,
+            normal: None,
+            result: None,
+        })
+    }
+    fn set_seconds(
+        &mut self,
+        ordinals: &[usize],
+        values: &[Option<i64>],
+        fill_null: bool,
+        work: &mut Work<'_, '_, impl Sized>,
+    ) -> Result<(), KernelFailure> {
+        if ordinals.len() != values.len() {
+            return Err(invalid("temporal dense source length differs"));
+        }
+        // Routing projects dense current values; the ONE original merge core
+        // owns override/fill-NULL value decisions for both v1 and this host.
+        let mut current = Vec::with_capacity(ordinals.len());
+        for &parent in ordinals {
+            work.step()?;
+            current.push(
+                *self
+                    .seconds
+                    .get(parent)
+                    .ok_or_else(|| invalid("temporal source ordinal is outside its invocation"))?,
+            );
+        }
+        temporal_math(work, |scope| {
+            novarocks_functions::builtin::calendar_time_text_shared::merge_source(
+                &mut current,
+                values,
+                if fill_null {
+                    novarocks_functions::builtin::calendar_time_text_shared::MergeMode::FillNull
+                } else {
+                    novarocks_functions::builtin::calendar_time_text_shared::MergeMode::Override
+                },
+                scope,
+            )
+        })?;
+        for (&parent, value) in ordinals.iter().zip(current) {
+            self.seconds[parent] = value;
+            work.step()?;
+        }
+        Ok(())
+    }
+    fn consume(
+        &mut self,
+        shape: novarocks_type_contract::TemporalSourceShape,
+        stage: usize,
+        domain: Selection<'_>,
+        ordinals: &[usize],
+        array: ArrayRef,
+        work: &mut Work<'_, '_, impl Sized>,
+    ) -> Result<
+        Option<novarocks_functions::builtin::calendar_time_text_shared::TimeTextDataFailure>,
+        KernelFailure,
+    > {
+        use novarocks_functions::builtin::calendar_time_text_shared as math;
+        use novarocks_type_contract::{TemporalSourceRole as R, TemporalSourceShape as S};
+        if array.len() != domain.len() || domain.len() != ordinals.len() {
+            return Err(invalid(
+                "temporal source is not compact for its exact invocation",
+            ));
+        }
+        let role = shape
+            .roles()
+            .get(stage)
+            .copied()
+            .flatten()
+            .ok_or_else(|| invalid("unknown temporal source phase"))?;
+        match role {
+            R::RawOverride => {
+                let strings = array
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .ok_or_else(|| {
+                        invalid("raw temporal override differs from its frozen Utf8 carrier")
+                    })?;
+                let values = temporal_math(work, |scope| math::clock_strings(strings, scope))?;
+                self.set_seconds(ordinals, &values, false, work)?;
+            }
+            R::OriginalSeconds => {
+                let values = temporal_math(work, |scope| math::sec_to_time_source(&array, scope))?;
+                self.set_seconds(ordinals, &values, false, work)?;
+            }
+            R::Normal if shape.kind() == novarocks_type_contract::TemporalSourceKind::TimeToSec => {
+                let values = temporal_math(work, |scope| {
+                    if let Some(strings) =
+                        array.as_any().downcast_ref::<arrow::array::StringArray>()
+                    {
+                        math::duration_strings(strings, scope)
+                    } else {
+                        math::datetime_seconds(&array, scope)
+                    }
+                })?;
+                self.set_seconds(ordinals, &values, false, work)?;
+            }
+            R::Normal => {
+                if shape == S::FormatOrdinary {
+                    self.normal = Some((array, ordinals.to_vec()));
+                }
+                // The UTF8 override branch still evaluates normal, but its type
+                // and value do not enter the original formatter computation.
+            }
+            R::ImmediateCastSource => {
+                if shape == S::SecondsCastString {
+                    let strings = array
+                        .as_any()
+                        .downcast_ref::<arrow::array::StringArray>()
+                        .ok_or_else(|| {
+                            invalid(
+                                "immediate temporal source differs from its frozen Utf8 carrier",
+                            )
+                        })?;
+                    let values =
+                        temporal_math(work, |scope| math::duration_strings(strings, scope))?;
+                    self.set_seconds(ordinals, &values, false, work)?;
+                }
+            }
+            R::DeepestCastSource => {
+                work.flush()?;
+                let mut scope = novarocks_functions::EvaluationCheckpoints::new(work.control);
+                let result = math::duration_cast_source(&array, &mut scope);
+                let values = match result {
+                    Ok(values) => scope.finish_result(Ok(values))?,
+                    Err(math::DurationCastError::Outer(source)) => {
+                        return scope.finish_result(Err(source.into_kernel()));
+                    }
+                    Err(math::DurationCastError::Data(source)) => return Ok(Some(source)),
+                };
+                self.set_seconds(ordinals, &values, true, work)?;
+                work.flush()?;
+            }
+            R::Format => {
+                // Format admission precedes ordinary normal argument parsing,
+                // preserving the original error/panic and evaluation order.
+                let formats = array
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .ok_or_else(|| {
+                        invalid("temporal format differs from its frozen Utf8 carrier")
+                    })?;
+                let seconds = if shape == S::FormatOrdinary {
+                    let (normal, normal_ordinals) = self
+                        .normal
+                        .take()
+                        .ok_or_else(|| internal("missing evaluated temporal normal argument"))?;
+                    let mut indices = Vec::with_capacity(ordinals.len());
+                    for parent in ordinals {
+                        let index = normal_ordinals
+                            .binary_search(parent)
+                            .map_err(|_| invalid("format demanded an absent normal source row"))?;
+                        indices.push(Some(index as u64));
+                        work.step()?;
+                    }
+                    let normal = gather(&normal, &indices, work)?;
+                    temporal_math(work, |scope| math::format_argument(&normal, scope))?
+                } else {
+                    let mut seconds = Vec::with_capacity(ordinals.len());
+                    for &parent in ordinals {
+                        seconds.push(self.seconds[parent]);
+                        work.step()?;
+                    }
+                    seconds
+                };
+                let result = temporal_math(work, |scope| {
+                    math::format_output(&seconds, formats, ordinals.len(), scope)
+                })?;
+                self.result = Some((result, ordinals.to_vec()));
+            }
+        }
+        Ok(None)
+    }
+    fn needs_fallback(
+        &self,
+        errors: &BTreeMap<usize, RowDataError>,
+        domain: Selection<'_>,
+        work: &mut Work<'_, '_, impl Sized>,
+    ) -> Result<bool, KernelFailure> {
+        use novarocks_functions::builtin::calendar_time_text_shared as math;
+        if self.seconds.len() != domain.len() {
+            return Err(invalid(
+                "temporal guard differs from its current invocation domain",
+            ));
+        }
+        let mut seconds = Vec::with_capacity(self.seconds.len());
+        for (ordinal, value) in self.seconds.iter().enumerate() {
+            if !errors.contains_key(&ordinal) {
+                seconds.push(*value);
+            }
+            work.step()?;
+        }
+        temporal_math(work, |scope| math::any_null(&seconds, scope))
+    }
+    fn finish(
+        mut self,
+        shape: ControlShape,
+        errors: &mut BTreeMap<usize, RowDataError>,
+        domain: Selection<'_>,
+        work: &mut Work<'_, '_, impl Sized>,
+    ) -> Result<OwnedValue, KernelFailure> {
+        use novarocks_functions::builtin::calendar_time_text_shared as math;
+        let ControlShape::TemporalSource(shape) = shape else {
+            return Err(invalid("temporal continuation has an ordinary shape"));
+        };
+        let output =
+            if shape.kind() == novarocks_type_contract::TemporalSourceKind::TimeToSec {
+                for &ordinal in errors.keys() {
+                    self.seconds[ordinal] = None;
+                    work.step()?;
+                }
+                temporal_math(work, |scope| math::seconds_output(self.seconds, scope))?
+            } else if let Some((result, ordinals)) = self.result {
+                let mut indices = Vec::with_capacity(domain.len());
+                for parent in 0..domain.len() {
+                    let index =
+                        if errors.contains_key(&parent) {
+                            None
+                        } else {
+                            Some(ordinals.binary_search(&parent).map_err(|_| {
+                                internal("successful temporal format row has no result")
+                            })? as u64)
+                        };
+                    indices.push(index);
+                    work.step()?;
+                }
+                gather(&result, &indices, work)?
+            } else if errors.len() == domain.len() {
+                work.flush()?;
+                let output = arrow::array::new_null_array(&DataType::Utf8, domain.len());
+                work.flush()?;
+                output
+            } else {
+                return Err(internal(
+                    "temporal format completed without its demanded format source",
+                ));
+            };
+        let mut row_errors = Vec::with_capacity(errors.len());
+        for error in std::mem::take(errors).into_values() {
+            row_errors.push(error);
+            work.step()?;
+        }
+        Ok(OwnedValue::from_selected(SelectedValues::try_new_observed(
+            domain,
+            output.data_type(),
+            Arc::clone(&output),
+            row_errors.into_boxed_slice(),
+            || work.step(),
+        )?))
+    }
+}
+
+fn in_event(
+    event: novarocks_functions::native_inlist::InObservation,
+    work: &mut Work<'_, '_, impl Sized>,
+) -> Result<(), KernelFailure> {
+    match event {
+        novarocks_functions::native_inlist::InObservation::Step => work.step(),
+        novarocks_functions::native_inlist::InObservation::OpaqueBoundary => work.flush(),
+    }
+}
+fn in_observed<T>(
+    result: Result<T, novarocks_functions::native_inlist::InError<KernelFailure>>,
+) -> Result<T, KernelFailure> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(novarocks_functions::native_inlist::InError::Host(error)) => Err(error),
+        // Exact signed recipes and actual carrier validation establish matching
+        // concrete types/lengths before Arrow equality. An error here violates
+        // that checked invariant; it is not a maskable SQL row-data result.
+        Err(novarocks_functions::native_inlist::InError::Operation(cause)) => Err(cause),
+    }
+}
+fn duplicate_child(
+    child: &Child,
+    work: &mut Work<'_, '_, impl Sized>,
+) -> Result<Child, KernelFailure> {
+    let mut ordinals = Vec::with_capacity(child.ordinals.len());
+    for &ordinal in &child.ordinals {
+        ordinals.push(ordinal);
+        work.step()?;
+    }
+    work.flush()?;
+    let continuation = child.value.continuation();
+    let value = match child.value.uncontinued() {
+        OwnedValue::Continued(_, _) => unreachable!("continuation was unwrapped"),
+        OwnedValue::Constant(value) => OwnedValue::Constant(value.clone()),
+        OwnedValue::ConstantView(value) => OwnedValue::ConstantView(value.clone()),
+        OwnedValue::Column(value) => OwnedValue::Column(Arc::clone(value)),
+        OwnedValue::Source(value, domain) => OwnedValue::Source(Arc::clone(value), domain.clone()),
+        OwnedValue::Selected(value, source_errors) => {
+            let mut errors = Vec::with_capacity(source_errors.len());
+            for error in source_errors.iter() {
+                errors.push(error.clone());
+                work.step()?;
+            }
+            work.flush()?;
+            OwnedValue::Selected(Arc::clone(value), errors.into_boxed_slice())
+        }
+    }
+    .with_continuation(continuation);
+    work.step()?;
+    Ok(Child { ordinals, value })
+}
+
+/// RowDataError placeholders are results, not error-free kernel arguments.
+/// Validate every successful selected row through the original COPY and exact
+/// argument authors. The original error journal/phase value stays intact.
+fn validate_membership_phase(
+    output: &SelectedValues<'_>,
+    selection: Selection<'_>,
+    expected: &novarocks_type_contract::FunctionValueType,
+    work: &mut Work<'_, '_, impl Sized>,
+) -> Result<(), KernelFailure> {
+    if output.errors().is_empty() {
+        return novarocks_functions::validate_evaluated_argument_observed(
+            EvaluatedArgument::SelectedColumn(output),
+            selection,
+            expected,
+            work.control,
+        );
+    }
+    if !output
+        .selection()
+        .same_rows_observed(selection, || work.step())?
+    {
+        return Err(invalid("IN phase result has a foreign selected domain"));
+    }
+    let mut errors = output.errors().iter().peekable();
+    let mut rows = Vec::with_capacity(selection.len());
+    let mut indices = Vec::with_capacity(selection.len());
+    for (ordinal, row) in selection.iter().enumerate() {
+        work.step()?;
+        if errors
+            .peek()
+            .is_some_and(|error| error.selected_ordinal() == ordinal)
+        {
+            errors.next();
+        } else {
+            rows.push(row);
+            indices.push(Some(
+                u64::try_from(ordinal).map_err(|_| KernelFailure::ResourceExhausted)?,
+            ));
+        }
+    }
+    let selected = Selection::try_sparse_observed(selection.batch_rows(), &rows, || work.step())?;
+    let values = gather(output.values(), &indices, work)?;
+    let successful = SelectedValues::try_new_observed(
+        selected,
+        expected.data_type(),
+        values,
+        Box::default(),
+        || work.step(),
+    )?;
+    work.flush()?;
+    novarocks_functions::validate_evaluated_argument_observed(
+        EvaluatedArgument::SelectedColumn(&successful),
+        selected,
+        expected,
+        work.control,
+    )?;
+    work.flush()?;
+    drop(successful);
+    work.flush()?;
+    Ok(())
+}
+
+pub(super) mod constant_evaluator;
+
+fn complete_constant_leaf(
+    constant: &novarocks_functions::ConstantValue,
+    result: &novarocks_functions::FunctionValueType,
+    selection: Selection<'_>,
+    allocator: Option<&Arc<dyn novarocks_functions::AggregateStateAllocator>>,
+    work: &mut Work<'_, '_, impl Sized>,
+) -> Result<OwnedValue, KernelFailure> {
+    work.flush()?;
+    let exact = novarocks_type_contract::arrow_data_types_exact_observed::<KernelFailure>(
+        constant.pool().array().data_type(),
+        result.data_type(),
+        || work.step(),
+    )?;
+    // Only actual array DataType fields can require an execution wrapper.
+    // The original root source Field and its provider annotations are not
+    // array metadata. Composite exact equality ignores spare metadata capacity;
+    // let the existing normalizer prove its zero-construction fast path.
+    let composite = matches!(
+        constant.pool().array().data_type(),
+        DataType::List(_)
+            | DataType::LargeList(_)
+            | DataType::ListView(_)
+            | DataType::LargeListView(_)
+            | DataType::FixedSizeList(_, _)
+            | DataType::Struct(_)
+            | DataType::Map(_, _)
+            | DataType::Union(_, _)
+    );
+    if exact && !composite {
+        validate_evaluated_argument_observed(
+            EvaluatedArgument::Constant(constant),
+            selection,
+            result,
+            work.control,
+        )?;
+        return Ok(OwnedValue::Constant(constant.clone()));
+    }
+    // Original CV owns semantics and NULL rules; source annotations never
+    // rewrite it. The shared normalizer may change representation only.
+    if !constant
+        .value_type()
+        .fits_physical_binding_observed(result, || work.step())?
+    {
+        return Err(invalid(
+            "constant argument differs from its complete frozen declaration",
+        ));
+    }
+    match constant_projection::project(constant, result, allocator, work)? {
+        Some((projected, creator)) => {
+            validate_evaluated_argument_observed(
+                projected.argument(),
+                selection,
+                result,
+                work.control,
+            )?;
+            Ok(OwnedValue::ConstantView(projected).with_continuation(creator))
+        }
+        None => {
+            validate_evaluated_argument_observed(
+                EvaluatedArgument::Constant(constant),
+                selection,
+                result,
+                work.control,
+            )?;
+            Ok(OwnedValue::Constant(constant.clone()))
+        }
+    }
+}
+
+fn child_context<K>(
+    frame: &Frame<K>,
+    shape: ControlShape,
+    ordinals: &[usize],
+    original_domain: bool,
+    work: &mut Work<'_, '_, impl Sized>,
+) -> Result<
+    (
+        Vec<usize>,
+        Arc<input_source::ActualInvocationDomain>,
+        novarocks_functions::ScalarInvocationActivation,
+    ),
+    KernelFailure,
+> {
+    let mut rows = Vec::with_capacity(if original_domain {
+        frame.domain.rows().len()
+    } else {
+        ordinals.len()
+    });
+    if original_domain {
+        for &row in frame.domain.rows() {
+            rows.push(row);
+            work.step()?;
+        }
+    } else {
+        for &ordinal in ordinals {
+            rows.push(frame.rows[ordinal]);
+            work.step()?;
+        }
+    }
+    // A control author supplies its actual phase mask. Eager required
+    // children retain the parent source domain; no leaf guesses it.
+    let child_domain = if shape == ControlShape::If
+        && frame.next > 1
+        && (!rows.is_empty() || frame.rows.is_empty())
+    {
+        frame.domain.filtered(&rows, work.control)?
+    } else {
+        // Other control/selected owners keep their existing logical
+        // demand and inherit the actual carrier. Only their own typed
+        // policy may demand a full original-domain child invocation.
+        frame.domain.clone()
+    };
+
+    let activation = if original_domain && !frame.domain.rows().is_empty()
+        || !ordinals.is_empty()
+        || frame.activation == novarocks_functions::ScalarInvocationActivation::Activated
+            && frame.rows.is_empty()
+    {
+        novarocks_functions::ScalarInvocationActivation::Activated
+    } else {
+        novarocks_functions::ScalarInvocationActivation::ValidateOnly
+    };
+    Ok((rows, child_domain, activation))
+}
+
+fn complete_undemanded_leaf(
+    ty: &DataType,
+    work: &mut Work<'_, '_, impl Sized>,
+) -> Result<OwnedValue, KernelFailure> {
+    work.flush()?;
+    let array = new_empty_array(ty);
+    work.flush()?;
+    Ok(OwnedValue::Selected(array, Box::default()))
+}
+
+#[cfg(test)]
+mod tests;

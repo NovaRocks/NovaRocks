@@ -18,7 +18,7 @@
 use super::*;
 use crate::physical_package_v2::definition_sources::tests::{
     change_stream_packages, cv_package, repeated_change_stream_packages, rich_package,
-    writer_constant_package, writer_package,
+    writer_constant_package,
 };
 use crate::physical_package_v2::prepare_package_wire_in;
 use crate::physical_package_v2::provider_sources::tests::checked_read;
@@ -95,7 +95,7 @@ fn whole_sender_emits_every_component_of_actual_checked_packages() {
         assert_eq!(out.plan_version.len(), 16, "{name}");
         assert!(out.required.is_some(), "{name}");
         assert!(out.types.is_some(), "{name}");
-        assert!(out.expression_control.is_some(), "{name}");
+        assert!(out.source_constant_policy.is_some(), "{name}");
         assert!(out.calls.is_some(), "{name}");
         assert!(out.pruning.is_some(), "{name}");
         assert!(out.parameters.is_some(), "{name}");
@@ -108,11 +108,31 @@ fn whole_sender_emits_every_component_of_actual_checked_packages() {
         assert_eq!(fragment.id, original.id().get(), "{name}");
         assert_eq!(fragment.nodes.len(), original.nodes().len(), "{name}");
         assert_eq!(fragment.values.len(), original.values().len(), "{name}");
-        assert_eq!(
-            fragment.expressions.len(),
-            original.expressions().len(),
-            "{name}"
-        );
+        for node in &fragment.nodes {
+            match (
+                node.expressions.as_ref(),
+                original.unit(p::NodeId::new(node.id)),
+            ) {
+                (None, None) => {}
+                (Some(unit), Some(source)) => {
+                    assert_eq!(unit.definitions.len(), source.definitions().len(), "{name}");
+                    assert_eq!(unit.roots.len(), source.roots().len(), "{name}");
+                    assert_eq!(unit.ports.len(), source.ports().len(), "{name}");
+                    assert_eq!(unit.requests.len(), source.requests().len(), "{name}");
+                    assert_eq!(
+                        unit.control.as_ref().unwrap().uses.len(),
+                        source.control_flow().uses().len(),
+                        "{name}"
+                    );
+                    assert_eq!(
+                        unit.claims.as_ref().unwrap().entries.len(),
+                        source.claims().len(),
+                        "{name}"
+                    );
+                }
+                _ => panic!("{name}: node unit presence differs from its exact author"),
+            }
+        }
         assert_eq!(
             fragment.call_requests.as_ref().unwrap().entries.len(),
             original.call_requests().entries().len(),
@@ -181,46 +201,6 @@ fn whole_sender_preserves_component_limit_and_control() {
     }
 }
 
-// The checked writer fixture still carries a legacy Literal in its Values
-// row. The v2 sender refuses it as an ordinary expression error: literals
-// must be authored as constant pool references before publication.
-#[test]
-fn legacy_literal_package_is_an_ordinary_refusal_not_a_silent_conversion() {
-    let package = writer_package();
-    assert!(matches!(
-        encode_fragment_package(&package, &encode_limits(), &Control::default()),
-        Err(PackageEncodeError::Expression(_))
-    ));
-}
-
-#[test]
-fn original_sender_refusal_precedes_late_footer_control() {
-    use novarocks_failure_contract::FailureProjection;
-    let package = writer_package();
-    let original_control = Control::default();
-    let mut work = CompileCheckpoints::try_new(&original_control, CompilePhase::Encode).unwrap();
-    let original = encode_fragment_package_in(&package, &encode_limits(), &mut work).unwrap_err();
-    assert!(matches!(original, PackageEncodeError::Expression(_)));
-    let original_trace = original_control.trace.lock().unwrap().clone();
-    assert!(!original_trace.is_empty());
-    for cause in [
-        CompileControlError::Cancelled,
-        CompileControlError::DeadlineExceeded,
-        CompileControlError::ResourceExhausted,
-    ] {
-        let stop = Control {
-            stop: Some((original_trace.len(), cause)),
-            ..Default::default()
-        };
-        let refused = encode_fragment_package(&package, &encode_limits(), &stop).unwrap_err();
-        assert!(matches!(refused, PackageEncodeError::Expression(_)));
-        assert_eq!(refused.to_string(), original.to_string());
-        assert_eq!(refused.failure_fact(), original.failure_fact());
-        assert_eq!(*stop.trace.lock().unwrap(), original_trace);
-        assert!(std::error::Error::source(&refused).is_some());
-    }
-}
-
 #[test]
 fn whole_package_preserves_declared_keyed_assertion_violation() {
     use crate::physical_package_v2::{decode_fragment_package, test_support};
@@ -242,6 +222,7 @@ fn whole_package_preserves_declared_keyed_assertion_violation() {
             .clone();
         let id = u32::MAX - 1;
         assertion.id = id;
+        assertion.expressions = None;
         assertion.input_node_ids = vec![source];
         assertion.required_inputs = vec![assertion.output_properties.clone().unwrap()];
         assertion.output.as_mut().unwrap().node_id = Some(id);

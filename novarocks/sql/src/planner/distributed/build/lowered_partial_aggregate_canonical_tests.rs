@@ -182,7 +182,13 @@ fn verify_update_and_final(owner: &SqlAuthoredPhysicalPlan) {
     assert!(final_call.order_by.is_empty());
     assert_eq!(
         final_entry.runtime(),
-        AggregateRuntimeDemand::ExpressionState(final_call.arguments[0])
+        AggregateRuntimeDemand::ExpressionState(
+            final_entry
+                .fragment()
+                .root_expression(final_entry.node().id, final_call.arguments[0])
+                .unwrap()
+                .id
+        )
     );
     let control = Control::default();
     let mut work =
@@ -358,8 +364,7 @@ fn partial_avg_local_output_uses_intermediate_utf8_not_final_float64() {
     assert_eq!(
         final_entry
             .fragment()
-            .expressions()
-            .get(final_entry.source().arguments[0])
+            .root_expression(final_entry.node().id, final_entry.source().arguments[0])
             .unwrap()
             .ty,
         selected.aggregate.as_ref().unwrap().intermediate_type
@@ -406,6 +411,31 @@ fn partial_array_agg_cv_order_retains_original_ordinals_backing_and_final_logica
     verify_update_and_final(&owner);
     let partial = entry(&owner, true);
     let final_entry = entry(&owner, false);
+    let state_source = partial
+        .captured()
+        .binding()
+        .aggregate_state_source()
+        .expect("the original Partial lexical source");
+    assert!(!state_source.distinct);
+    assert_eq!(
+        state_source.order_keys.as_ref(),
+        &[novarocks_type_contract::AggregateStateOrderKey {
+            ascending: false,
+            nulls_first: true,
+        }]
+    );
+    assert_eq!(
+        partial.source().binding.state_interpretation.as_ref(),
+        Some(state_source)
+    );
+    assert_eq!(
+        final_entry.source().binding.state_interpretation.as_ref(),
+        Some(state_source)
+    );
+    assert_eq!(
+        final_entry.captured().binding().aggregate_state_source(),
+        Some(state_source)
+    );
     let canonical = partial.canonical().unwrap();
     assert_eq!(canonical.request().logical_argument_count, 1);
     assert_eq!(canonical.request().arguments.len(), 2);
@@ -435,8 +465,11 @@ fn partial_array_agg_cv_order_retains_original_ordinals_backing_and_final_logica
         } else {
             partial.source().order_by[0].expr
         };
-        let ContractExprKind::Constant(reference) =
-            partial.fragment().expressions().get(expr).unwrap().kind
+        let ContractExprKind::Constant(reference) = partial
+            .fragment()
+            .root_expression(partial.node().id, expr)
+            .unwrap()
+            .kind
         else {
             panic!("actual retained Partial CV address");
         };
@@ -498,8 +531,7 @@ fn partial_elided_cast_nested_constants_keep_none_in_operational_and_final_captu
         assert!(matches!(
             partial
                 .fragment()
-                .expressions()
-                .get(partial.source().arguments[0])
+                .root_expression(partial.node().id, partial.source().arguments[0])
                 .unwrap()
                 .kind,
             ContractExprKind::Constant(_)
@@ -507,8 +539,7 @@ fn partial_elided_cast_nested_constants_keep_none_in_operational_and_final_captu
         assert!(matches!(
             final_entry
                 .fragment()
-                .expressions()
-                .get(final_entry.source().arguments[0])
+                .root_expression(final_entry.node().id, final_entry.source().arguments[0])
                 .unwrap()
                 .kind,
             ContractExprKind::Value(_)

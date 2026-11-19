@@ -60,7 +60,7 @@ mod publication;
 pub(crate) mod scoped_cpu;
 
 const STATISTICS_OPERATION_KIND: &str = "statistics-publish";
-const STATISTICS_PUBLICATION_EVIDENCE_VERSION: u16 = 2;
+const STATISTICS_PUBLICATION_EVIDENCE_VERSION: u16 = 3;
 
 #[cfg(test)]
 static STATISTICS_TRANSACTION_ADMISSIONS: std::sync::atomic::AtomicU64 =

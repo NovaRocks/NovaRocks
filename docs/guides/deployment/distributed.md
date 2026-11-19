@@ -140,6 +140,10 @@ enable_path_style_access = true
 ```
 
 `[runtime.native_ingress]` 的 BE 容量按 listener 生效，不是 FE 整集群查询配额。
+调大 `ordinary_request_max_bytes` 以传输宽行时，应同时让 `exchange_io_max_inflight_bytes`
+不小于由此推导出的 exchange 单元载荷边界（请求上限减去 `DeliverExchangeUnit` 的非载荷上界）。
+否则一个超过在途字节预算的单元会独占该 BE 的 exchange 发送，直到它完成。这只影响效率，
+配置加载不因此拒绝。
 Data listener 使用 `worker_threads` 与 ordinary 运行/等待资格；Control listener 有自己的
 线程、Tokio runtime、`control_worker_threads` 与 control 运行/等待资格。后者的小请求界
 和控制执行器不会排进 Data listener 的运行队列。

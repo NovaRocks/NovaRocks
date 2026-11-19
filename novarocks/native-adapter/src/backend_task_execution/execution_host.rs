@@ -63,7 +63,7 @@ use novarocks_execution::runtime::profile::{Profiler, RuntimeProfileTree, fragme
 use novarocks_execution::runtime::task::ExecutionFailureCause;
 use novarocks_execution::runtime::task::io::{
     ExchangeDestinationKey, ExchangeEdgeGates, ExchangeFrameTransmitter, ExchangeReceiverPort,
-    TaskCommitPort, TaskEvent, TaskEventSink, TaskResultWriter,
+    TaskEvent, TaskEventSink, TaskResultWriter,
 };
 use novarocks_execution::runtime::task::scan::compiled_scan_nodes;
 use novarocks_execution::runtime::task::{
@@ -251,7 +251,6 @@ pub struct NativeTaskExecutionHost {
     result_retained_limits: novarocks_worker::WorkerResultRetainedLimits,
     root_producer_pool: Arc<RootProducerPool>,
     exchange_receiver_port: Arc<dyn ExchangeReceiverPort>,
-    commit_port: Arc<dyn TaskCommitPort>,
     execution_runtime: Arc<ExecutionRuntime>,
     scan_stream_host: novarocks_worker::ScanStreamHost,
     completion_supervisor: Arc<TaskCompletionSupervisor>,
@@ -677,7 +676,6 @@ impl NativeTaskExecutionHost {
         result_retained_limits: novarocks_worker::WorkerResultRetainedLimits,
         root_producer_pool: Arc<RootProducerPool>,
         exchange_receiver_port: Arc<dyn ExchangeReceiverPort>,
-        commit_port: Arc<dyn TaskCommitPort>,
         execution_runtime: Arc<ExecutionRuntime>,
         scan_stream_host: novarocks_worker::ScanStreamHost,
         completion_supervisor: Arc<TaskCompletionSupervisor>,
@@ -692,7 +690,6 @@ impl NativeTaskExecutionHost {
             result_retained_limits,
             root_producer_pool,
             exchange_receiver_port,
-            commit_port,
             execution_runtime,
             scan_stream_host,
             completion_supervisor,
@@ -1128,7 +1125,6 @@ impl NativeTaskExecutionHost {
                 task_control,
                 admitted_work,
             )
-            .with_task_commit_port(Arc::clone(&self.commit_port))
             .with_exchange_receiver_port(Arc::clone(&self.exchange_receiver_port))
             .with_registration_owned_exchange_receivers()
             .with_execution_runtime(Arc::clone(&self.execution_runtime))
@@ -1231,7 +1227,9 @@ impl NativeTaskExecutionHost {
                             Arc::clone(&kernel_control),
                         ),
                     ),
-                    novarocks_execution_contract::native_result_support::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES as u64,
+                    self.execution_runtime
+                        .exchange_flow_limits()
+                        .max_unit_payload_bytes() as u64,
                 )
                 .map_err(host_failure)?;
         }
@@ -3247,35 +3245,34 @@ pub(crate) mod tests {
     #[test]
     fn runtime_scalar_memory_nominal_categories_preserve_original_transport() {
         use novarocks_execution::runtime::{
-            scalar_memory::{RuntimeScalarEvaluationFailure, RuntimeScalarMemoryRefusal},
+            scalar_memory::RuntimeScalarMemoryRefusal,
             task::{ExecutionFailure, ExecutionFailureCause},
         };
+        use novarocks_expression::ExprEvaluationFailure;
         use novarocks_functions::{KernelFailure, ScalarResourceError};
         for (failure, expected) in [
             (
-                RuntimeScalarEvaluationFailure::Source(ScalarResourceError::Arithmetic),
+                ExprEvaluationFailure::<RuntimeScalarMemoryRefusal>::Source(
+                    ScalarResourceError::Arithmetic,
+                ),
                 TaskFailureCategory::ResourceExhausted,
             ),
             (
-                RuntimeScalarEvaluationFailure::Source(ScalarResourceError::SourceModel(
+                ExprEvaluationFailure::Source(ScalarResourceError::SourceModel(
                     "cancelled ResourceExhausted",
                 )),
                 TaskFailureCategory::Internal,
             ),
             (
-                RuntimeScalarEvaluationFailure::Source(ScalarResourceError::Invariant(
-                    "ResourceExhausted",
-                )),
+                ExprEvaluationFailure::Source(ScalarResourceError::Invariant("ResourceExhausted")),
                 TaskFailureCategory::Internal,
             ),
             (
-                RuntimeScalarEvaluationFailure::Host(
-                    RuntimeScalarMemoryRefusal::MissingQueryMemory,
-                ),
+                ExprEvaluationFailure::Host(RuntimeScalarMemoryRefusal::MissingQueryMemory),
                 TaskFailureCategory::Internal,
             ),
             (
-                RuntimeScalarEvaluationFailure::Host(RuntimeScalarMemoryRefusal::Capacity(
+                ExprEvaluationFailure::Host(RuntimeScalarMemoryRefusal::Capacity(
                     novarocks_memory::CapacityError::Invalid {
                         detail: "cancelled Internal",
                     },
@@ -3283,15 +3280,15 @@ pub(crate) mod tests {
                 TaskFailureCategory::Internal,
             ),
             (
-                RuntimeScalarEvaluationFailure::Kernel(KernelFailure::Cancelled),
+                ExprEvaluationFailure::Kernel(KernelFailure::Cancelled),
                 TaskFailureCategory::Execution,
             ),
             (
-                RuntimeScalarEvaluationFailure::Kernel(KernelFailure::ResourceExhausted),
+                ExprEvaluationFailure::Kernel(KernelFailure::ResourceExhausted),
                 TaskFailureCategory::ResourceExhausted,
             ),
             (
-                RuntimeScalarEvaluationFailure::Kernel(KernelFailure::InstanceFailed),
+                ExprEvaluationFailure::Kernel(KernelFailure::InstanceFailed),
                 TaskFailureCategory::Internal,
             ),
         ] {
@@ -3299,15 +3296,15 @@ pub(crate) mod tests {
             assert_eq!(super::failure_category(error.cause()), expected);
             match (failure, error.cause()) {
                 (
-                    RuntimeScalarEvaluationFailure::Source(original),
+                    ExprEvaluationFailure::Source(original),
                     ExecutionFailureCause::RuntimeScalarSource(actual),
                 ) => assert_eq!(&original, actual),
                 (
-                    RuntimeScalarEvaluationFailure::Host(original),
+                    ExprEvaluationFailure::Host(original),
                     ExecutionFailureCause::RuntimeScalarMemory(actual),
                 ) => assert_eq!(&original, actual),
                 (
-                    RuntimeScalarEvaluationFailure::Kernel(original),
+                    ExprEvaluationFailure::Kernel(original),
                     ExecutionFailureCause::Kernel(actual),
                 ) => assert_eq!(&original, actual),
                 _ => {
@@ -3983,7 +3980,6 @@ pub(crate) mod tests {
             limits,
             pool,
             Arc::new(UnavailableExchangeReceiverPort),
-            Arc::new(novarocks_worker::sink_commit::WorkerSinkCommitPort),
             runtime,
             novarocks_worker::ScanStreamHost::new(
                 novarocks_worker::ScanPreparationConfig::default(),
@@ -5818,21 +5814,17 @@ pub(crate) mod tests {
     fn typed_failure_native_preparation_preserves_required_row_address_in_final_detail() {
         use novarocks_execution::runtime::task::{
             LocalTaskLaunchError, LocalTaskLaunchErrorKind, LocalTaskLaunchStage,
-            RequiredExpressionRowError,
         };
+        use novarocks_expression::RequiredExpressionRowError;
+        use novarocks_expression_contract::RootOrdinal;
         use novarocks_functions::{RowDataError, Selection};
-        use novarocks_local_program::{
-            ProgramExpressionRootSite, ProgramNodeExpressionRole, ProgramNodeId,
-        };
         let required = RequiredExpressionRowError::try_new(
-            ProgramExpressionRootSite::Node {
-                node: ProgramNodeId::new(41),
-                role: ProgramNodeExpressionRole::ProjectOutput { expression: 0 },
-            },
+            RootOrdinal::new(0),
             Selection::try_sparse(101, &[0, 50, 100]).unwrap(),
             RowDataError::new(1, "required root cannot publish a placeholder NULL"),
         )
         .unwrap();
+        assert_eq!(required.root(), RootOrdinal::new(0));
         let error = LocalTaskLaunchError::from_failure(
             LocalTaskLaunchStage::BuildPipelines,
             LocalTaskLaunchErrorKind::PipelineBuild,
@@ -5956,25 +5948,17 @@ pub(crate) mod tests {
 
     #[test]
     fn typed_failure_native_required_root_reports_original_selected_and_batch_row() {
-        use novarocks_execution::runtime::task::RequiredExpressionRowError;
         use novarocks_execution_contract::task_execution::status::{
             TaskFailurePhase, TerminationDetail,
         };
+        use novarocks_expression::RequiredExpressionRowError;
+        use novarocks_expression_contract::RootOrdinal;
         use novarocks_functions::{RowDataError, Selection};
-        use novarocks_local_program::{
-            ProgramExpressionRootSite, ProgramNodeExpressionRole, ProgramNodeId,
-        };
         let selection = Selection::try_sparse(101, &[0, 50, 100]).unwrap();
         let original = RowDataError::new(1, "required root cannot publish a placeholder NULL");
-        let required = RequiredExpressionRowError::try_new(
-            ProgramExpressionRootSite::Node {
-                node: ProgramNodeId::new(41),
-                role: ProgramNodeExpressionRole::ProjectOutput { expression: 0 },
-            },
-            selection,
-            original,
-        )
-        .unwrap();
+        let required =
+            RequiredExpressionRowError::try_new(RootOrdinal::new(0), selection, original).unwrap();
+        assert_eq!(required.root(), RootOrdinal::new(0));
         let error = LocalTaskExecutionError::from_failure(
             LocalTaskExecutionErrorKind::Pipeline,
             required.into(),
@@ -8831,9 +8815,10 @@ pub(crate) mod tests {
             PureImplementationDeclaration, PureImplementationId, PureKernelAbi,
         };
         use novarocks_physical_plan::{
-            FragmentId, FragmentPackageAdmission, FragmentSink, MAX_SCAN_BATCH_BYTES,
-            MAX_SCAN_BATCH_ROWS, NodeKind, PipelineDopDomain, PlanLimits, PlanVersionId,
-            PropertyProofProjectionLimits, ScanReadBudget, extract_fragment_packages,
+            FragmentId, FragmentPackage, FragmentPackageAdmission, FragmentSink,
+            FrozenFragmentPruning, MAX_SCAN_BATCH_BYTES, MAX_SCAN_BATCH_ROWS, NodeKind,
+            PipelineDopDomain, PlanLimits, PlanVersionId, PropertyProofProjectionLimits,
+            ScanReadBudget, extract_fragment_packages,
         };
         use novarocks_plan_codec::physical_package_v2::encode_fragment_package;
         use novarocks_plan_codec::physical_package_v2::test_support::{
@@ -8843,8 +8828,8 @@ pub(crate) mod tests {
         use novarocks_sql::compiler::{
             DEFAULT_COMPLETION_LIMITS, SessionOptimizerSettings, SqlCompileControl,
             SqlCompileIntent, SqlCompiler, SqlFinalPlanCompileRequest, SqlPlanningEnvironment,
-            SqlSessionContext, SqlStatementInput, author_fragment_package_semantics,
-            builtin_sql_function_catalog, noop_constant_evaluator,
+            SqlSessionContext, SqlStatementInput, builtin_sql_function_catalog,
+            noop_constant_evaluator,
         };
         use novarocks_task_codec::creation::decode_task_assignment;
         use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
@@ -8857,7 +8842,7 @@ pub(crate) mod tests {
         }
 
         // Explicit fixture admission; these values are not production defaults.
-        fn constants() -> ConstantPolicy {
+        pub(crate) fn constants() -> ConstantPolicy {
             ConstantPolicy {
                 max_rows: 16,
                 max_array_nodes: 128,
@@ -8874,7 +8859,7 @@ pub(crate) mod tests {
 
         /// A real sealed RAND-only subset; `SELECT 1` binds no function, but
         /// the compiler refuses an empty pure catalog. Not the Server catalogue.
-        fn sealed_rand_subset() -> PureEngineFunctionCatalog {
+        pub(crate) fn sealed_rand_subset() -> PureEngineFunctionCatalog {
             let actual =
                 novarocks_functions::builtin::catalogue::build_builtin_engine_function_catalog()
                     .expect("builtin catalogue");
@@ -8912,6 +8897,12 @@ pub(crate) mod tests {
         }
 
         pub(crate) fn interpreter() -> CompiledPackageInterpreter<std::convert::Infallible> {
+            interpreter_with_functions(Arc::new(sealed_rand_subset()))
+        }
+
+        fn interpreter_with_functions(
+            functions: Arc<PureEngineFunctionCatalog>,
+        ) -> CompiledPackageInterpreter<std::convert::Infallible> {
             let providers = PureProviderProgramCatalog::<std::convert::Infallible>::try_new(
                 &[],
                 vec![],
@@ -8921,7 +8912,7 @@ pub(crate) mod tests {
             CompiledPackageInterpreter::new(
                 FragmentDecodeResourceModel::try_new(&Unbounded).expect("decode model"),
                 decode_limits(),
-                Arc::new(sealed_rand_subset()),
+                functions,
                 Arc::new(providers),
                 constants(),
             )
@@ -9248,13 +9239,11 @@ pub(crate) mod tests {
                 .unwrap();
             let late = compiled
                 .program()
-                .expressions()
-                .graph()
-                .expressions()
-                .nodes()
+                .units()
                 .iter()
+                .flat_map(|unit| unit.definitions().nodes())
                 .find_map(|node| match node.kind() {
-                    novarocks_local_program::StaticExprKind::Constant(value) => {
+                    novarocks_expression::StaticExprKind::Constant(value) => {
                         Some(value.pool().clone())
                     }
                     _ => None,
@@ -9435,6 +9424,17 @@ pub(crate) mod tests {
         }
 
         fn sql_fragment(sql: &str, window: bool, receive: bool) -> (Vec<u8>, u32) {
+            let (package, receiver) = sql_fragment_package(sql, window, receive);
+            (encode_sql_fixture_package(&package), receiver)
+        }
+
+        fn encode_sql_fixture_package(package: &FragmentPackage) -> Vec<u8> {
+            encode_fragment_package(package, &encode_limits(), &SqlCompileControl::unbounded())
+                .expect("v2 bytes")
+                .encode_to_vec()
+        }
+
+        fn sql_fragment_package(sql: &str, window: bool, receive: bool) -> (FragmentPackage, u32) {
             let control = SqlCompileControl::unbounded();
             let query = novarocks_parser::parser::parse_query(sql).expect("parse test query");
             let request = SqlFinalPlanCompileRequest::new(
@@ -9476,16 +9476,17 @@ pub(crate) mod tests {
                     novarocks_result_contract::FrozenRootOutput::CountOnly,
                 ))
                 .expect("the fixture declares its actual CountOnly RootV1 output");
-            let semantics = author_fragment_package_semantics(&owner, constants(), &control)
-                .expect("package semantics");
-            let mut uses = BTreeMap::new();
-            let mut calls = BTreeMap::new();
+            owner
+                .require_statement_constant_policy(constants())
+                .expect("the original statement constant policy");
+            let plan = owner.plan();
             let mut pruning = BTreeMap::new();
             let mut admissions = BTreeMap::new();
-            for (id, authored) in semantics {
-                uses.insert(id, authored.expression_uses);
-                calls.insert(id, authored.calls);
-                pruning.insert(id, authored.pruning);
+            for &id in plan.fragments().keys() {
+                pruning.insert(
+                    id,
+                    FrozenFragmentPruning::try_new(id, vec![], &control).unwrap(),
+                );
                 admissions.insert(
                     id,
                     FragmentPackageAdmission {
@@ -9499,13 +9500,10 @@ pub(crate) mod tests {
                     },
                 );
             }
-            let plan = owner.plan();
             let mut packages = extract_fragment_packages(
                 plan,
                 &BTreeMap::new(),
                 &BTreeMap::new(),
-                &uses,
-                &calls,
                 &pruning,
                 &admissions,
                 &control,
@@ -9538,13 +9536,9 @@ pub(crate) mod tests {
                 .find(|node| matches!(node.kind, NodeKind::ExchangeSource { .. }))
                 .map(|node| node.id.get())
                 .expect("a gather receiver");
-            let package: novarocks_physical_plan::FragmentPackage =
-                packages.remove(&producer).expect("producer package");
+            let package = packages.remove(&producer).expect("producer package");
             let _: FragmentId = producer;
-            let bytes = encode_fragment_package(&package, &encode_limits(), &control)
-                .expect("v2 bytes")
-                .encode_to_vec();
-            (bytes, receiver)
+            (package, receiver)
         }
 
         pub(crate) fn window_producer() -> Vec<u8> {
@@ -10568,7 +10562,6 @@ pub(crate) mod tests {
                 limits,
                 pool,
                 Arc::new(UnavailableExchangeReceiverPort),
-                Arc::new(novarocks_worker::sink_commit::WorkerSinkCommitPort),
                 runtime,
                 novarocks_worker::ScanStreamHost::new(
                     novarocks_worker::ScanPreparationConfig::default(),
@@ -11114,7 +11107,6 @@ pub(crate) mod tests {
                 limits,
                 pool,
                 Arc::new(UnavailableExchangeReceiverPort),
-                Arc::new(novarocks_worker::sink_commit::WorkerSinkCommitPort),
                 runtime,
                 novarocks_worker::ScanStreamHost::new(
                     novarocks_worker::ScanPreparationConfig::default(),

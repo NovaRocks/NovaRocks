@@ -271,6 +271,3 @@ impl PreparedNativeBitNotRecipe {
         work.finish_result(outcome)
     }
 }
-#[cfg(test)]
-#[path = "native_bitnot_tests.rs"]
-mod tests;

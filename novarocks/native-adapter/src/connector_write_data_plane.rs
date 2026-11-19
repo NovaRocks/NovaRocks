@@ -27,10 +27,10 @@ use novarocks_execution::exec::node::table_write_relation::{
 use novarocks_execution::exec::node::table_write_relation::{
     TableWriteAggregateBoundary, TableWriteAggregateFaultHook,
 };
+use novarocks_proto_codec::FieldPath;
 use novarocks_proto_codec::connector_write::{
     ConnectorWriteFragmentEncoder, ValidatedCommitFragment,
 };
-use novarocks_proto_codec::{FieldPath, ProtocolErrorKind};
 use novarocks_proto_models::connector_write as dto;
 use novarocks_spi::connector::ConnectorWriteFragmentWireEncoder;
 use novarocks_spi::connector::write_stack::{ConnectorCommitFragment, WriteTargetOrdinal};
@@ -278,22 +278,28 @@ impl ConnectorCommitFragmentEncoder for RoleBoundCommitFragmentEncoder {
         self.encoder
             .canonical_commit_fragment_bytes(fragment)
             .map_err(|error| {
-                ConnectorError::new(
-                    ConnectorErrorKind::Internal,
-                    format!(
-                        "encode connector commit fragment for write target {}: {error}",
-                        target.get()
-                    ),
-                )
+                use novarocks_execution_contract::failure::{FailureClass, FailureProjection};
+                let kind = match error.failure_fact().class() {
+                    FailureClass::Resource | FailureClass::Representation => {
+                        ConnectorErrorKind::ResourceExhausted
+                    }
+                    FailureClass::Unsupported => ConnectorErrorKind::Unsupported,
+                    FailureClass::Data => ConnectorErrorKind::CorruptData,
+                    FailureClass::Control => ConnectorErrorKind::Interrupted,
+                    FailureClass::Dependency => ConnectorErrorKind::Unavailable,
+                    FailureClass::Invariant | FailureClass::Unexpected => {
+                        ConnectorErrorKind::Internal
+                    }
+                };
+                ConnectorError::from_domain(kind, error)
             })
     }
 }
 
 /// Canonical commit-fragment ingress for the single root aggregation.
 ///
-/// It proves a carrier is a canonical, in-bounds commit fragment of a provider
-/// the closed carrier vocabulary names, and stops there. It never produces a
-/// provider value, and it holds no provider binding that could produce one.
+/// It validates the canonical envelope against the closed carrier vocabulary.
+/// Only the selected provider binding can decode the private artifact.
 // Design: ADR-0133 (docs/adr/ADR-0133-dataflow-connector-writer-and-frontend-commit.md)
 pub struct RootCommitFragmentCarrierValidator {
     #[cfg(novarocks_dev_controls)]
@@ -349,21 +355,6 @@ impl ConnectorCommitFragmentCarrierValidator for RootCommitFragmentCarrierValida
         })?;
         let validated = ValidatedCommitFragment::parse(raw, FieldPath::root("commit_fragment"))
             .map_err(|error| {
-                // A fragment that is merely too large is not corrupt, and the
-                // difference is what an operator acts on: one says the write
-                // outgrew a frozen budget, the other says something rewrote the
-                // bytes in flight. The size gate runs inside `parse`, before the
-                // ledger would have charged it, so the kind has to be recovered
-                // here or the budget's documented failure never appears.
-                if error.kind() == &ProtocolErrorKind::OutOfRange {
-                    return ConnectorError::new(
-                        ConnectorErrorKind::ResourceExhausted,
-                        format!(
-                            "connector commit fragment carrier for write target {}: {error}",
-                            target.get()
-                        ),
-                    );
-                }
                 carrier_error(target, format!("carrier failed validation: {error}"))
             })?;
         // Canonicality is a byte-exact property, not a length coincidence: the
@@ -548,9 +539,7 @@ mod tests {
     };
     use novarocks_proto_models::connector_write as dto;
     use novarocks_spi::connector::ConnectorWriteFragmentWireEncoder;
-    use novarocks_spi::connector::write_stack::{
-        MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES, ProviderWriteRuntime, WriteRuntimeAdapter,
-    };
+    use novarocks_spi::connector::write_stack::{ProviderWriteRuntime, WriteRuntimeAdapter};
     use novarocks_spi::connector::{
         CatalogVersion, ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorInstanceId,
         ConnectorProviderId,
@@ -1030,14 +1019,13 @@ mod tests {
     }
 
     #[test]
-    fn the_validator_reports_a_carrier_over_the_frozen_fragment_budget_as_exhausted() {
+    fn the_validator_accepts_a_canonical_fragment_larger_than_one_mib() {
         let validator = RootCommitFragmentCarrierValidator::new(execution_id(), 12);
-        let oversized = data_file_fragment(&"s".repeat(MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES + 1))
-            .encode_to_vec();
-        let error = validator
-            .validate(target(0), &oversized)
-            .expect_err("an oversized carrier is refused");
-        assert_eq!(error.kind(), ConnectorErrorKind::ResourceExhausted);
+        let encoded = data_file_fragment(&"s".repeat(1024 * 1024 + 1)).encode_to_vec();
+        validator
+            .validate(target(0), &encoded)
+            .expect("canonical large carrier");
+        assert_eq!(validator.accepted_counts(), (encoded.len() as u64, 1));
     }
 
     #[test]

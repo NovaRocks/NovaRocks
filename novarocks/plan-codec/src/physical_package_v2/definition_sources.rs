@@ -22,14 +22,14 @@
 use super::binding_sources::BindingSources;
 use super::type_sources::{
     BindingOccurrence, CutDirection, PackageTypeChannel as Channel, PackageTypeOccurrence,
-    PackageTypeOwner as Owner,
+    PackageTypeOwner as Owner, RequestAddress,
 };
 use super::type_views::{
     PackageTypeViews, SourceInputPrefix, SourceInputReserve, TypeViewBudget, TypeViewError,
     TypeViewFacts, capture_source_input_reserve,
 };
 use crate::physical_binding_v2::{ArgumentTypeIds, BindingSource};
-use crate::physical_call_requests_v2::CallRequestTypeIds;
+use crate::physical_call_requests_v2::{CallRequestTypeIds, UnitRequestTypeIds};
 use crate::physical_constant_v2::ConstantRecordTypeIds;
 use crate::physical_cuts_v2::CutsTypeIds;
 use crate::physical_expression_v2::ExpressionTypeIds;
@@ -66,11 +66,11 @@ pub struct DefinitionSourceLimits {
     pub max_writer_node_fields: usize,
 }
 struct ExpressionRow {
+    node: p::NodeId,
     expression: p::ExprId,
     value: u32,
     parameters: Range<usize>,
     function: Option<u32>,
-    aggregate: Option<u32>,
 }
 enum RequestArgumentRow {
     Value(u32),
@@ -80,7 +80,7 @@ enum RequestArgumentRow {
     },
 }
 struct RequestRow {
-    definition: p::PhysicalCallDefinition,
+    definition: RequestAddress,
     arguments: Range<usize>,
     expected: Option<u32>,
 }
@@ -218,15 +218,16 @@ trait Visitor<'source> {
     ) -> Result<(), Error>;
     fn expression(
         &mut self,
+        node: p::NodeId,
         id: p::ExprId,
-        expression: &'source p::ExprNode,
+        expression: &'source novarocks_expression_contract::ExprNode,
         budget: &mut TypeViewBudget<'source, '_, '_>,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<(), Error>;
     fn request(
         &mut self,
-        definition: p::PhysicalCallDefinition,
-        request: &'source p::PhysicalCallRequest,
+        definition: RequestAddress,
+        request: &'source novarocks_expression_contract::PhysicalCallRequest,
         budget: &mut TypeViewBudget<'source, '_, '_>,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<(), Error>;
@@ -255,13 +256,32 @@ enum Destination {
 use novarocks_physical_plan::visit_fragment_definitions_observed as visit_fragment_definitions;
 /// One original definition lent from an unsealed or packaged fragment.
 /// The expression loan retains its exact kind, full value type and original
-/// scalar/window binding. A request retains its own definition identity,
+/// scalar binding. Window bindings are owned by relation nodes. A request retains its own definition identity,
 /// logical argument count, constant references and optional result constraint.
 /// No installed owner, execution use, inferred source or copied type is needed.
 pub use novarocks_physical_plan::{FragmentDefinitionSource, visit_fragment_definitions_observed};
 
 /// Only source-order/header enumeration lives here. Original codecs retain
 /// expression, cut, request, Writer-schema and full-type validation grammars.
+fn visit_request<'source>(
+    visitor: &mut impl Visitor<'source>,
+    definition: RequestAddress,
+    request: &'source novarocks_expression_contract::PhysicalCallRequest,
+    budget: &mut TypeViewBudget<'source, '_, '_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), Error> {
+    visitor.header(
+        Counts {
+            arguments: request.arguments.len(),
+            ..Counts::default()
+        },
+        add(request.arguments.len(), 4)?,
+        budget,
+        work,
+    )?;
+    visitor.request(definition, request, budget, work)
+}
+
 fn visit<'source>(
     package: &'source p::FragmentPackage,
     budget: &mut TypeViewBudget<'source, '_, '_>,
@@ -274,9 +294,13 @@ fn visit<'source>(
     }
     visit_fragment_definitions(fragment, work, |source, work| match source {
         FragmentDefinitionSource::Value { id, value } => visitor.value(id, value, budget, work),
-        FragmentDefinitionSource::Expression { id, expression } => {
+        FragmentDefinitionSource::Expression {
+            node,
+            id,
+            expression,
+        } => {
             let parameters = match &expression.kind {
-                p::ExprKind::Lambda {
+                novarocks_expression_contract::ExprKind::Lambda {
                     parameter_types, ..
                 } => parameter_types.len(),
                 _ => 0,
@@ -290,24 +314,31 @@ fn visit<'source>(
                 budget,
                 work,
             )?;
-            visitor.expression(id, expression, budget, work)
+            visitor.expression(node, id, expression, budget, work)
         }
+        FragmentDefinitionSource::ExpressionRequest {
+            node,
+            definition,
+            request,
+        } => visit_request(
+            visitor,
+            RequestAddress::Unit { node, definition },
+            request,
+            budget,
+            work,
+        ),
         FragmentDefinitionSource::Request {
             definition,
             request,
-        } => {
-            visitor.header(
-                Counts {
-                    arguments: request.arguments.len(),
-                    ..Counts::default()
-                },
-                add(request.arguments.len(), 4)?,
-                budget,
-                work,
-            )?;
-            visitor.request(definition, request, budget, work)
-        }
+        } => visit_request(
+            visitor,
+            RequestAddress::Relation(definition),
+            request,
+            budget,
+            work,
+        ),
     })?;
+
     for (ordinal, cut) in package.cuts().inbound.iter().enumerate() {
         let fields = match &cut.payload {
             p::ExchangePayloadContract::WriterResults(r) => r.fields.len(),
@@ -543,12 +574,13 @@ impl<'source> Visitor<'source> for CountPass<'_, 'source, '_> {
     }
     fn expression(
         &mut self,
+        _: p::NodeId,
         _: p::ExprId,
-        e: &'source p::ExprNode,
+        e: &'source novarocks_expression_contract::ExprNode,
         budget: &mut TypeViewBudget<'source, '_, '_>,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<(), Error> {
-        if let p::ExprKind::Lambda {
+        if let novarocks_expression_contract::ExprKind::Lambda {
             parameter_types, ..
         } = &e.kind
         {
@@ -560,8 +592,8 @@ impl<'source> Visitor<'source> for CountPass<'_, 'source, '_> {
     }
     fn request(
         &mut self,
-        _: p::PhysicalCallDefinition,
-        r: &'source p::PhysicalCallRequest,
+        _: RequestAddress,
+        r: &'source novarocks_expression_contract::PhysicalCallRequest,
         budget: &mut TypeViewBudget<'source, '_, '_>,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<(), Error> {
@@ -653,7 +685,7 @@ impl<'source> FillPass<'_, '_, '_, 'source> {
     fn function(
         &self,
         occurrence: BindingOccurrence,
-        actual: &p::BoundFunction,
+        actual: &novarocks_expression_contract::BoundFunction,
         budget: &mut TypeViewBudget<'source, '_, '_>,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<u32, Error> {
@@ -673,31 +705,6 @@ impl<'source> FillPass<'_, '_, '_, 'source> {
             work.step()?;
         }
         found.ok_or_else(|| invalid("expression function source is absent"))
-    }
-    fn aggregate(
-        &self,
-        occurrence: BindingOccurrence,
-        actual: &p::AggregateBinding,
-        budget: &mut TypeViewBudget<'source, '_, '_>,
-        work: &mut CompileCheckpoints<'_>,
-    ) -> Result<u32, Error> {
-        budget.before_steps(add(twice(self.bindings.aggregates().len())?, 4)?)?;
-        let mut found = None;
-        for row in self.bindings.aggregates() {
-            let matches = row.occurrence == occurrence;
-            if matches {
-                if !std::ptr::eq(row.source, actual) {
-                    return Err(invalid(
-                        "expression binding uses another original aggregate",
-                    ));
-                }
-                if found.replace(row.id).is_some() {
-                    return Err(invalid("expression aggregate source is ambiguous"));
-                }
-            }
-            work.step()?;
-        }
-        found.ok_or_else(|| invalid("expression aggregate source is absent"))
     }
 }
 impl<'source> Visitor<'source> for FillPass<'_, '_, '_, 'source> {
@@ -756,40 +763,31 @@ impl<'source> Visitor<'source> for FillPass<'_, '_, '_, 'source> {
     }
     fn expression(
         &mut self,
+        node: p::NodeId,
         id: p::ExprId,
-        e: &'source p::ExprNode,
+        e: &'source novarocks_expression_contract::ExprNode,
         budget: &mut TypeViewBudget<'source, '_, '_>,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<(), Error> {
-        let owner = Owner::Expression(id);
+        let owner = Owner::Expression {
+            node,
+            definition: id,
+        };
         let value = self.root(owner, Channel::Value, &e.ty, budget, work)?;
         let start = self.sources.expression_parameters.len();
-        let (function, aggregate) = match &e.kind {
-            p::ExprKind::FunctionCall { function, .. } => (
-                Some(self.function(BindingOccurrence::Scalar(id), function, budget, work)?),
-                None,
-            ),
-            p::ExprKind::WindowCall {
-                function,
-                aggregate_binding,
-                ..
-            } => {
-                let function =
-                    Some(self.function(BindingOccurrence::Window(id), function, budget, work)?);
-                let aggregate = aggregate_binding
-                    .as_ref()
-                    .map(|binding| {
-                        self.aggregate(
-                            BindingOccurrence::WindowAggregate(id),
-                            binding,
-                            budget,
-                            work,
-                        )
-                    })
-                    .transpose()?;
-                (function, aggregate)
+        let function = match &e.kind {
+            novarocks_expression_contract::ExprKind::FunctionCall { function, .. } => {
+                Some(self.function(
+                    BindingOccurrence::Scalar {
+                        node,
+                        definition: id,
+                    },
+                    function,
+                    budget,
+                    work,
+                )?)
             }
-            p::ExprKind::Lambda {
+            novarocks_expression_contract::ExprKind::Lambda {
                 parameter_types, ..
             } => {
                 for (ordinal, ty) in parameter_types.iter().enumerate() {
@@ -803,24 +801,24 @@ impl<'source> Visitor<'source> for FillPass<'_, '_, '_, 'source> {
                     self.sources.expression_parameters.push(root);
                     work.step()?;
                 }
-                (None, None)
+                None
             }
-            _ => (None, None),
+            _ => None,
         };
         self.sources.expressions.push(ExpressionRow {
+            node,
             expression: id,
             value,
             parameters: start..self.sources.expression_parameters.len(),
             function,
-            aggregate,
         });
         work.step()?;
         Ok(())
     }
     fn request(
         &mut self,
-        definition: p::PhysicalCallDefinition,
-        r: &'source p::PhysicalCallRequest,
+        definition: RequestAddress,
+        r: &'source novarocks_expression_contract::PhysicalCallRequest,
         budget: &mut TypeViewBudget<'source, '_, '_>,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<(), Error> {
@@ -1007,11 +1005,21 @@ pub(crate) fn collect_definition_sources_in<'source>(
     // These complete root row buffers are already known from closed headers.
     // Admit them together with initial read/copy work before any parent hook
     // or completed observation; no empty prefix precedes this captured batch.
+    budget.before_steps(add(twice(package.fragment().nodes().len())?, 4)?)?;
+    let mut expression_count = 0usize;
+    let mut request_count = package.fragment().call_requests().entries().len();
+    for node in package.fragment().nodes().values() {
+        if let Some(unit) = &node.expressions {
+            expression_count = add(expression_count, unit.definitions().len())?;
+            request_count = add(request_count, unit.requests().len())?;
+        }
+        work.step()?;
+    }
     let initial = Counts {
         constants: package.constants().entries().len(),
         values: package.fragment().values().len(),
-        expressions: package.fragment().expressions().len(),
-        requests: package.fragment().call_requests().entries().len(),
+        expressions: expression_count,
+        requests: request_count,
         result: package.result().map_or(0, |r| r.fields.len()),
         ..Counts::default()
     };
@@ -1126,24 +1134,29 @@ impl<'source> DefinitionSources<'source> {
     }
     pub(crate) fn expressions_in<'rows>(
         &'rows self,
+        node: p::NodeId,
         budget: &mut TypeViewBudget<'source, '_, '_>,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<Vec<ExpressionTypeIds<'rows>>, Error> {
         self.check(budget, work)?;
+        let rows = source_node_range_in(
+            &self.expressions,
+            Some(node),
+            |row| Some(row.node),
+            budget,
+            work,
+        )?;
+        let count = rows.len();
         let mut inputs = Vec::new();
-        let mut requests = [capture_source_input_reserve(
-            &inputs,
-            self.expressions.len(),
-        )?];
-        budget.admit_input_reserves_in(&mut requests, add(twice(self.expressions.len())?, 4)?)?;
+        let mut requests = [capture_source_input_reserve(&inputs, count)?];
+        budget.admit_input_reserves_in(&mut requests, add(twice(count)?, 4)?)?;
         budget.reserve_input_in(&mut inputs, requests[0], work)?;
-        for row in &self.expressions {
+        for row in &self.expressions[rows] {
             inputs.push(ExpressionTypeIds {
                 expr: row.expression,
                 value_type_id: row.value,
                 lambda_parameter_type_ids: &self.expression_parameters[row.parameters.clone()],
                 function_binding_id: row.function,
-                aggregate_binding_id: row.aggregate,
             });
             work.step()?;
         }
@@ -1229,6 +1242,47 @@ fn check_floor(actual: TypeViewFacts, floor: TypeViewFacts) -> Result<(), Error>
     }
     Ok(())
 }
+/// Source-order rows are node-grouped by the physical definition visitor;
+/// relation requests follow all units. Borrow their ranges without another
+/// namespace or an O(nodes * definitions) projection scan.
+fn source_node_range_in<T>(
+    rows: &[T],
+    target: Option<p::NodeId>,
+    key: impl Fn(&T) -> Option<p::NodeId>,
+    budget: &mut TypeViewBudget<'_, '_, '_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Range<usize>, Error> {
+    let levels = (usize::BITS - rows.len().leading_zeros()) as usize;
+    budget.before_steps(add(
+        levels
+            .checked_mul(4)
+            .ok_or(CompileControlError::ResourceExhausted)?,
+        4,
+    )?)?;
+    let mut bound = |upper: bool| -> Result<usize, Error> {
+        let (mut low, mut high) = (0, rows.len());
+        while low < high {
+            let middle = low + (high - low) / 2;
+            let order = match (key(&rows[middle]), target) {
+                (Some(actual), Some(target)) => actual.cmp(&target),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            };
+            work.step()?;
+            if order.is_lt() || (upper && order.is_eq()) {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        Ok(low)
+    };
+    let start = bound(false)?;
+    let end = bound(true)?;
+    Ok(start..end)
+}
+
 /// Local second layer borrows the stable first layer. Its final request rows
 /// must remain local and cannot be stored back in either owning layer.
 pub(crate) struct PreparedRequestArguments<'rows, 'source> {
@@ -1244,20 +1298,69 @@ impl<'rows, 'source> PreparedRequestArguments<'rows, 'source> {
     ) -> Result<Vec<CallRequestTypeIds<'arguments>>, Error> {
         self.sources.check(budget, work)?;
         check_floor(budget.facts(), self.floor)?;
+        let rows = source_node_range_in(
+            &self.sources.requests,
+            None,
+            |row| match row.definition {
+                RequestAddress::Unit { node, .. } => Some(node),
+                RequestAddress::Relation(_) => None,
+            },
+            budget,
+            work,
+        )?;
+        let count = rows.len();
         let mut inputs = Vec::new();
-        let mut requests = [capture_source_input_reserve(
-            &inputs,
-            self.sources.requests.len(),
-        )?];
-        budget
-            .admit_input_reserves_in(&mut requests, add(twice(self.sources.requests.len())?, 4)?)?;
-        budget.reserve_input_in(&mut inputs, requests[0], work)?;
-        for row in &self.sources.requests {
-            inputs.push(CallRequestTypeIds {
-                definition: row.definition,
-                arguments: &self.arguments[row.arguments.clone()],
-                expected_result_type: row.expected,
-            });
+        let mut reserves = [capture_source_input_reserve(&inputs, count)?];
+        budget.admit_input_reserves_in(&mut reserves, add(twice(count)?, 4)?)?;
+        budget.reserve_input_in(&mut inputs, reserves[0], work)?;
+        for row in &self.sources.requests[rows] {
+            if let RequestAddress::Relation(definition) = row.definition {
+                inputs.push(CallRequestTypeIds {
+                    definition,
+                    arguments: &self.arguments[row.arguments.clone()],
+                    expected_result_type: row.expected,
+                });
+            }
+            work.step()?;
+        }
+        Ok(inputs)
+    }
+    pub(crate) fn unit_request_type_ids_in<'arguments>(
+        &'arguments self,
+        node: p::NodeId,
+        budget: &mut TypeViewBudget<'source, '_, '_>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Vec<UnitRequestTypeIds<'arguments>>, Error> {
+        self.sources.check(budget, work)?;
+        check_floor(budget.facts(), self.floor)?;
+        let rows = source_node_range_in(
+            &self.sources.requests,
+            Some(node),
+            |row| match row.definition {
+                RequestAddress::Unit { node, .. } => Some(node),
+                RequestAddress::Relation(_) => None,
+            },
+            budget,
+            work,
+        )?;
+        let count = rows.len();
+        let mut inputs = Vec::new();
+        let mut reserves = [capture_source_input_reserve(&inputs, count)?];
+        budget.admit_input_reserves_in(&mut reserves, add(twice(count)?, 4)?)?;
+        budget.reserve_input_in(&mut inputs, reserves[0], work)?;
+        for row in &self.sources.requests[rows] {
+            if let RequestAddress::Unit {
+                node: actual,
+                definition,
+            } = row.definition
+                && actual == node
+            {
+                inputs.push(UnitRequestTypeIds {
+                    definition,
+                    arguments: &self.arguments[row.arguments.clone()],
+                    expected_result_type: row.expected,
+                });
+            }
             work.step()?;
         }
         Ok(inputs)

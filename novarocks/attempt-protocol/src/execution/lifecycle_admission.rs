@@ -595,6 +595,14 @@ impl QueryTaskExecution {
             return;
         }
         let kind = reply.kind();
+        if kind == OperationKind::AcquireParticipationAdmissionTicket
+            && reply.local_workload_refusal().is_some()
+            && self.lifecycle_owner_tracks(target, kind, operation)
+        {
+            // The local refusal closes only this replay. Its earlier
+            // dispatched generation still owns an unresolved Worker result.
+            return;
+        }
         if applied
             && reply.dispatch_result() == OperationDispatchResult::TransportUnknown
             && self.lifecycle_owner_tracks(target, kind, operation)

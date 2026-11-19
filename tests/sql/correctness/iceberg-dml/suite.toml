@@ -32,8 +32,8 @@ paths = [
     "novarocks/sql/src/analyzer/declaration_widening.rs",
     "novarocks/functions/src/evaluation.rs",
     "novarocks/functions/src/kernel_input.rs",
-    "novarocks/execution/src/exec/expr/compiled_program.rs",
-    "novarocks/execution/src/exec/expr/compiled_program/**",
+    "novarocks/expression-contract/**",
+    "novarocks/expression/**",
     "novarocks/functions/src/cast.rs",
     "novarocks/frontend-application/src/query_execution/constant_eval.rs",
     "novarocks/frontend-application/src/query_execution/constant_eval/**",
@@ -63,9 +63,9 @@ paths = [
     "novarocks/sql/src/compiler/mod.rs",
     "novarocks/sql/src/compiler/completion_driver.rs",
     "novarocks/sql/src/compiler/materialized_values.rs",
-    "novarocks/frontend-application/src/coordinator/internal_result.rs",
-    "novarocks/frontend-application/src/coordinator/execution.rs",
-    "novarocks/frontend-application/src/coordinator/statement_native_attempt.rs",
+    "novarocks/frontend-application/src/query_execution/internal_consumer/write.rs",
+    "novarocks/frontend-application/src/query/statement_computation.rs",
+    "novarocks/query-application/src/coordination/executor/native.rs",
     "novarocks/frontend-application/src/query_execution/internal_result_cpu.rs",
     "novarocks/result-contract/**",
     "novarocks/execution/src/exec/operators/logical_change_summary.rs",
@@ -79,7 +79,7 @@ paths = [
     "novarocks/frontend-application/src/query_execution/write_result.rs",
     "novarocks/frontend-application/src/task_execution/completion.rs",
     "novarocks/frontend-application/src/task_execution/protocol_facts.rs",
-    "novarocks/frontend-application/src/task_execution/manifest_round.rs",
+    "novarocks/frontend-application/src/task_execution/manifest_projection.rs",
 ]
 
 [reuse]

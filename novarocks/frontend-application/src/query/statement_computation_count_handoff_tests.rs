@@ -31,8 +31,7 @@ mod count_handoff_tests {
             QueryExecutionRequest,
         },
         coordination::{
-            AbortParticipationEffectAdmission, AbortParticipationEffectPort,
-            AbortParticipationIssueIdentity, LogicalExecutionRowsConfig,
+            LogicalExecutionRowsConfig,
             LogicalExecutionSupervisorConfig,
         },
         execution_error::{ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason},
@@ -110,21 +109,9 @@ mod count_handoff_tests {
             })
         }
     }
-    // The held preparation never binds a backend or starts a context. Any
-    // Abort reservation would contradict this fixture's actual execution.
-    #[derive(Debug)]
-    struct NoParticipationAborts(tokio::sync::watch::Sender<u64>);
-    impl AbortParticipationEffectPort for NoParticipationAborts {
-        fn subscribe_capacity(&self) -> tokio::sync::watch::Receiver<u64> {
-            self.0.subscribe()
-        }
-        fn try_reserve(
-            &self,
-            _: AbortParticipationIssueIdentity,
-        ) -> AbortParticipationEffectAdmission {
-            panic!("unbound preparation cannot request a context Abort")
-        }
-    }
+    // The held original preparation cannot bind scheduling/owner operands.
+    // The current supervisor installs the LP/AP runtime only after this F
+    // returns Ok; its actual Err path therefore owns no remote Abort author.
     fn original_request(gate: Arc<PreparationGate>) -> QueryExecutionRequest {
         use novarocks_physical_plan::{
             FragmentBuilder, FragmentId, FragmentSink, PipelineDopDomain, PlanBuilder,
@@ -147,7 +134,10 @@ mod count_handoff_tests {
                 StagePlacementPolicy::Singleton,
             )
             .unwrap();
-        let mut plan = PlanBuilder::new(PlanVersionId::try_new([199; 16]).unwrap());
+        let mut plan = PlanBuilder::new(
+            PlanVersionId::try_new([199; 16]).unwrap(),
+            crate::application::test_constant_policy(),
+        );
         plan.add_fragment(fragment).unwrap();
         let candidate = CompletedPhysicalPlanCandidate::for_program(
             plan.finish().unwrap(),
@@ -166,10 +156,8 @@ mod count_handoff_tests {
             ExecutionResourceRequirements::unknown(FrozenEstimateUnknownReason::NotProjected),
         )
         .unwrap();
-        let (capacity, _) = tokio::sync::watch::channel(0);
         QueryExecutionRequest::bind_native(
             description,
-            Arc::new(NoParticipationAborts(capacity)),
             None,
             HeldOriginalPreparation(gate),
         )
@@ -217,7 +205,6 @@ mod count_handoff_tests {
             QueryProcessNamespace::new(0x9c3),
             FrontendProcessId::new_v7(),
             LogicalExecutionSupervisorConfig::new(
-                NonZeroUsize::new(8).unwrap(),
                 NonZeroUsize::MIN,
                 NonZeroUsize::MIN,
                 LogicalExecutionRowsConfig::new(

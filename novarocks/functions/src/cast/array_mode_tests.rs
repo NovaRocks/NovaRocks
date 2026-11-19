@@ -843,6 +843,33 @@ fn explicit_unknown_arrays_keep_json_nominal_and_text_converts_through_its_autho
         ValueLogicalType::Json
     );
     let source = ty(DataType::Null, true, true, "unknown-list-source");
+    for operation in [CastOperation::Time, CastOperation::TimeFromDatetime] {
+        for (mode, expected) in [
+            (None, CastPrepareError::Unsupported),
+            (
+                Some(ArrayCastFailureMode::ReportError),
+                CastPrepareError::TypeMismatch,
+            ),
+            (
+                Some(ArrayCastFailureMode::OutputNull),
+                CastPrepareError::TypeMismatch,
+            ),
+        ] {
+            assert_eq!(
+                PreparedCastRecipe::try_new(
+                    operation,
+                    &source,
+                    &target,
+                    DecimalOverflowPolicy::OutputNull,
+                    false,
+                    mode,
+                    crate::binding_test_control(),
+                ),
+                Err(expected),
+                "{operation:?} cannot prepare a NULL-list to JSON-list cast with {mode:?}"
+            );
+        }
+    }
     let input = list(
         &source,
         Arc::new(arrow_array::NullArray::new(1)),

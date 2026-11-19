@@ -30,14 +30,15 @@ use crate::{
         ConnectorPayloadProjectionLimits, decode_connector_payloads, encode_connector_payloads,
     },
     physical_expression_v2::{
-        ExpressionProjectionLimits, ExpressionTypeIds, decode_expression_definitions,
-        encode_expression_definitions,
+        ExpressionDefinitionSource, ExpressionProjectionLimits, ExpressionTypeIds,
+        decode_expression_definitions, encode_expression_definitions,
     },
     physical_type_v2::{TypeProjectionLimits, decode_type_table, encode_type_table_sources},
     physical_value_origin_v2::ValueOriginProjectionLimits,
     physical_value_v2::{ValueProjectionLimits, ValueSource, decode_values, encode_values},
 };
 use arrow::datatypes::{DataType, Field};
+use novarocks_expression_contract::{ExprId, RootOrdinal};
 use novarocks_proto_models::physical_control_v2::Empty;
 use novarocks_type_contract::{
     AggregateStateArgumentContract, AggregateStateFormatId, CompileControlError,
@@ -220,7 +221,7 @@ fn nominal() -> FunctionValueType {
 fn aggregate(phase: p::AggregatePhase) -> p::AggregateBinding {
     p::AggregateBinding {
         state_interpretation: None,
-        function: p::BoundFunction::from_exact_signature(
+        function: novarocks_expression_contract::BoundFunction::from_exact_signature(
             FunctionId::try_new("test/f").unwrap(),
             FunctionOverloadId::try_new("test/o").unwrap(),
             FunctionKind::Aggregate,
@@ -238,6 +239,7 @@ fn aggregate(phase: p::AggregatePhase) -> p::AggregateBinding {
 }
 fn node() -> p::PhysicalNode {
     p::PhysicalNode {
+        expressions: None,
         id: p::NodeId::new(u32::MAX),
         inputs: Box::from([p::NodeId::new(0)]),
         required_inputs: Box::from([p::PhysicalProperties {
@@ -255,9 +257,9 @@ fn node() -> p::PhysicalNode {
         },
         kind: p::NodeKind::Aggregate {
             group_by: Box::from([
-                (p::ExprId::new(u32::MAX), p::ValueId::new(0)),
-                (p::ExprId::new(0), p::ValueId::new(u32::MAX)),
-                (p::ExprId::new(u32::MAX), p::ValueId::new(0)),
+                (RootOrdinal::new(1), p::ValueId::new(0)),
+                (RootOrdinal::new(0), p::ValueId::new(u32::MAX)),
+                (RootOrdinal::new(1), p::ValueId::new(0)),
             ]),
             calls: Box::from([
                 p::AggregateCall {
@@ -266,19 +268,19 @@ fn node() -> p::PhysicalNode {
                         sequence: p::AggregateSequenceId::new(0),
                     }),
                     arguments: Box::from([
-                        p::ExprId::new(0),
-                        p::ExprId::new(u32::MAX),
-                        p::ExprId::new(0),
+                        RootOrdinal::new(0),
+                        RootOrdinal::new(1),
+                        RootOrdinal::new(0),
                     ]),
                     distinct: true,
                     order_by: Box::from([
                         p::SortExpr {
-                            expr: p::ExprId::new(u32::MAX),
+                            expr: RootOrdinal::new(1),
                             direction: p::SortDirection::Descending,
                             null_ordering: p::NullOrdering::First,
                         },
                         p::SortExpr {
-                            expr: p::ExprId::new(0),
+                            expr: RootOrdinal::new(0),
                             direction: p::SortDirection::Ascending,
                             null_ordering: p::NullOrdering::Last,
                         },
@@ -314,6 +316,7 @@ fn body(n: &mut wire::PhysicalNode) -> &mut wire::AggregateNode {
 }
 fn expected() -> wire::PhysicalNode {
     wire::PhysicalNode {
+        expressions: None,
         id: u32::MAX,
         input_node_ids: vec![0],
         required_inputs: vec![wp(true)],
@@ -325,15 +328,15 @@ fn expected() -> wire::PhysicalNode {
         kind: Some(wire::physical_node::Kind::Aggregate(wire::AggregateNode {
             group_by: vec![
                 wire::ExpressionOutput {
-                    expr_id: Some(u32::MAX),
+                    root_ordinal: Some(1),
                     value_id: Some(0),
                 },
                 wire::ExpressionOutput {
-                    expr_id: Some(0),
+                    root_ordinal: Some(0),
                     value_id: Some(u32::MAX),
                 },
                 wire::ExpressionOutput {
-                    expr_id: Some(u32::MAX),
+                    root_ordinal: Some(1),
                     value_id: Some(0),
                 },
             ],
@@ -341,16 +344,16 @@ fn expected() -> wire::PhysicalNode {
                 wire::AggregateCall {
                     id: 0,
                     aggregate_binding_id: Some(0),
-                    argument_expr_ids: vec![0, u32::MAX, 0],
+                    argument_roots: vec![0, 1, 0],
                     distinct: true,
                     order_by: vec![
                         wire::SortExpression {
-                            expr_id: Some(u32::MAX),
+                            root_ordinal: Some(1),
                             direction: wire::SortDirection::Descending as i32,
                             null_ordering: wire::NullOrdering::First as i32,
                         },
                         wire::SortExpression {
-                            expr_id: Some(0),
+                            root_ordinal: Some(0),
                             direction: wire::SortDirection::Ascending as i32,
                             null_ordering: wire::NullOrdering::Last as i32,
                         },
@@ -360,7 +363,7 @@ fn expected() -> wire::PhysicalNode {
                 wire::AggregateCall {
                     id: u32::MAX,
                     aggregate_binding_id: Some(u32::MAX),
-                    argument_expr_ids: vec![],
+                    argument_roots: vec![],
                     distinct: false,
                     order_by: vec![],
                     output_value_id: Some(0),
@@ -370,17 +373,54 @@ fn expected() -> wire::PhysicalNode {
         })),
     }
 }
+
+fn unit_from_sources(
+    nodes: impl IntoIterator<Item = novarocks_expression_contract::ExprNode>,
+    values: &[p::ValueDef],
+    control: &dyn PureCompileControl,
+) -> novarocks_expression_contract::BoundExprSet {
+    use novarocks_expression_contract::{BoundExprSetBuilder, ExprPort, RootScope, UnitLimits};
+    use novarocks_type_contract::{CompileCheckpoints, EvaluationDemand};
+    let mut builder = BoundExprSetBuilder::new(UnitLimits {
+        expression_semantic_depth: p::PlanLimits::FROZEN.expression_semantic_depth,
+    });
+    for node in nodes {
+        let demand = if *node.ty.data_type() == DataType::Boolean {
+            EvaluationDemand::TruthOnly
+        } else {
+            EvaluationDemand::Value
+        };
+        let id = builder.add(node.lambda_scope, node.ty, node.kind).unwrap();
+        assert_eq!(id, node.id);
+        builder.root(id, demand, RootScope::Port(0)).unwrap();
+    }
+    let ports = vec![ExprPort {
+        values: values
+            .iter()
+            .map(|value| (value.id, value.ty.clone()))
+            .collect(),
+    }];
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate).unwrap();
+    let unit = builder
+        .seal(ports, &mut work)
+        .unwrap()
+        .finish(std::collections::BTreeMap::new(), &mut work)
+        .unwrap();
+    work.finish().unwrap();
+    unit
+}
+
 struct Fixture {
     roots: Vec<(u32, FunctionValueType)>,
     values: Vec<p::ValueDef>,
-    arena: p::ExprArena,
+    unit: novarocks_expression_contract::BoundExprSet,
     parameters: SemanticParameters,
     pools: p::ConstantPools,
 }
 impl Fixture {
     fn new() -> Self {
         let ty = FunctionValueType::new(DataType::Int64, true);
-        let values = [0, u32::MAX]
+        let values: Vec<p::ValueDef> = [0, u32::MAX]
             .into_iter()
             .enumerate()
             .map(|(i, id)| p::ValueDef {
@@ -392,22 +432,22 @@ impl Fixture {
                 },
             })
             .collect();
-        let arena = p::ExprArena::try_from_definitions_observed(
-            [0, u32::MAX].into_iter().map(|id| p::ExprNode {
-                id: p::ExprId::new(id),
-                owner: p::NodeId::new(u32::MAX),
-                lambda_scope: None,
-                ty: ty.clone(),
-                kind: p::ExprKind::Value(p::ValueId::new(id)),
+        let unit = unit_from_sources(
+            [0, u32::MAX].into_iter().enumerate().map(|(ordinal, id)| {
+                novarocks_expression_contract::ExprNode {
+                    id: ExprId::new(ordinal as u32),
+                    lambda_scope: None,
+                    ty: ty.clone(),
+                    kind: novarocks_expression_contract::ExprKind::Value(p::ValueId::new(id)),
+                }
             }),
-            &p::PlanLimits::default(),
+            &values,
             &Control::default(),
-        )
-        .unwrap();
+        );
         Self {
             roots: vec![(0, ty), (1, dictionary()), (2, nested()), (3, nominal())],
             values,
-            arena,
+            unit,
             parameters: SemanticParameters::try_new([]).unwrap(),
             pools: p::ConstantPools::empty(),
         }
@@ -573,20 +613,20 @@ impl Fixture {
         )
         .unwrap();
         let einputs = self
-            .arena
+            .unit
+            .definitions()
             .iter()
-            .map(|(expr, _)| ExpressionTypeIds {
-                expr: *expr,
+            .map(|node| ExpressionTypeIds {
+                expr: node.id,
                 value_type_id: 0,
                 lambda_parameter_type_ids: &[],
                 function_binding_id: None,
-                aggregate_binding_id: None,
             })
             .collect::<Vec<_>>();
         let mut expression_limits = el();
         expression_limits.max_coexisting_source_and_request_bytes = 4 * SOURCE;
         let expressions = encode_expression_definitions(
-            &self.arena,
+            Some(ExpressionDefinitionSource::from_unit(&self.unit)),
             &einputs,
             &types,
             &functions,
@@ -598,8 +638,10 @@ impl Fixture {
             c,
         )
         .unwrap();
+        let wire_roots = crate::test_constants::wire_roots(&self.unit);
         let read = decode_expression_definitions(
             expressions.as_wire(),
+            &wire_roots,
             &read_values,
             &fh,
             &ah,
@@ -713,9 +755,9 @@ fn aggregate_allocations_have_independent_layout_and_inline_binding_oracle() {
             * (layout::<p::NodeId>(1)
                 + layout::<p::PhysicalProperties>(1)
                 + layout::<p::ValueId>(3)
-                + layout::<(p::ExprId, p::ValueId)>(3)
+                + layout::<(RootOrdinal, p::ValueId)>(3)
                 + layout::<p::AggregateCall>(2)
-                + layout::<p::ExprId>(3)
+                + layout::<RootOrdinal>(3)
                 + layout::<p::SortExpr>(2));
         // Each inline call shares its immutable signature and state identity.
         // The seven real output collections each have Vec/Box upper requests.
@@ -813,7 +855,7 @@ fn aggregate_shape_presence_enum_refs_and_received_capacities_are_not_defaults()
         body(&mut w).grouping = 999;
         cases.push(w);
         let mut w = expected();
-        body(&mut w).group_by[0].expr_id = None;
+        body(&mut w).group_by[0].root_ordinal = None;
         cases.push(w);
         let mut w = expected();
         body(&mut w).group_by[0].value_id = Some(17);
@@ -825,7 +867,7 @@ fn aggregate_shape_presence_enum_refs_and_received_capacities_are_not_defaults()
         body(&mut w).calls[0].aggregate_binding_id = Some(17);
         cases.push(w);
         let mut w = expected();
-        body(&mut w).calls[0].argument_expr_ids[0] = 17;
+        body(&mut w).calls[0].argument_roots[0] = 17;
         cases.push(w);
         let mut w = expected();
         body(&mut w).calls[0].output_value_id = None;
@@ -853,7 +895,7 @@ fn aggregate_shape_presence_enum_refs_and_received_capacities_are_not_defaults()
         assert!(groups.is_empty() && calls.is_empty());
         assert_eq!(grouping, p::AggregateGrouping::Partial);
         let mut over = expected();
-        body(&mut over).calls[0].argument_expr_ids.reserve(SOURCE);
+        body(&mut over).calls[0].argument_roots.reserve(SOURCE);
         assert!(matches!(
             decode_aggregate_node(&over, d, a, SOURCE, limits()),
             Err(Error::InvalidShape(_))
@@ -925,7 +967,7 @@ fn aggregate_each_actual_small_success_and_ordinary_tail_preserves_three_causes(
 #[test]
 fn aggregate_wide_actual_inner_lists_observe_quantum_and_numeric_first_refusal() {
     let mut n = node();
-    calls(&mut n)[0].arguments = vec![p::ExprId::new(0); 320].into_boxed_slice();
+    calls(&mut n)[0].arguments = vec![RootOrdinal::new(0); 320].into_boxed_slice();
     let c = Control::default();
     Fixture::new().with(&n,&c,|v,e,d,a|{
         c.arm(None);let (w,_)=encode_aggregate_node(&n,v,e,SOURCE,limits()).unwrap();let baseline=c.trace();
@@ -1044,7 +1086,7 @@ fn aggregate_known_root_collection_requests_precede_shared_signature_work() {
         let b = body(&mut wire);
         b.group_by.clear();
         for call in &mut b.calls {
-            call.argument_expr_ids.clear();
+            call.argument_roots.clear();
             call.order_by.clear();
         }
         c.arm(None);
@@ -1101,7 +1143,7 @@ fn aggregate_known_container_layouts_precede_nested_quantum_and_late_three_cause
                 binding: aggregate(p::AggregatePhase::Partial {
                     sequence: p::AggregateSequenceId::new(0),
                 }),
-                arguments: Box::from([p::ExprId::new(0)]),
+                arguments: Box::from([RootOrdinal::new(0)]),
                 distinct: false,
                 order_by: Box::default(),
                 output: p::ValueId::new(0),
@@ -1142,7 +1184,7 @@ fn aggregate_known_container_layouts_precede_nested_quantum_and_late_three_cause
                         + layout::<p::PhysicalProperties>(1)
                         + layout::<p::ValueId>(3)
                         + layout::<p::AggregateCall>(COUNT)),
-                    2 * layout::<p::ExprId>(1),
+                    2 * layout::<RootOrdinal>(1),
                 )
             } else {
                 (
@@ -1234,9 +1276,9 @@ fn aggregate_known_container_layouts_precede_nested_quantum_and_late_three_cause
 fn aggregate_collection_counts_preserve_parent_work_once_across_batches() {
     const PARENT_WORK: usize = 137;
     let mut n = node();
-    calls(&mut n)[1].arguments = Box::from([p::ExprId::new(u32::MAX)]);
+    calls(&mut n)[1].arguments = Box::from([RootOrdinal::new(1)]);
     let mut raw = expected();
-    body(&mut raw).calls[1].argument_expr_ids = vec![u32::MAX];
+    body(&mut raw).calls[1].argument_roots = vec![1];
     let c = Control::default();
     Fixture::new().with(&n, &c, |v, e, d, a| {
         let (groups, source_calls, _) = physical(&n).unwrap();
@@ -1275,7 +1317,7 @@ fn aggregate_collection_counts_preserve_parent_work_once_across_batches() {
                     2 * (layout::<p::NodeId>(1)
                         + layout::<p::PhysicalProperties>(1)
                         + layout::<p::ValueId>(3)
-                        + layout::<(p::ExprId, p::ValueId)>(3)
+                        + layout::<(RootOrdinal, p::ValueId)>(3)
                         + layout::<p::AggregateCall>(2))
                 } else {
                     layout::<u32>(1)
@@ -1285,7 +1327,7 @@ fn aggregate_collection_counts_preserve_parent_work_once_across_batches() {
                         + layout::<wire::AggregateCall>(2)
                 };
             let nested_bytes = if receiving {
-                2 * (layout::<p::ExprId>(3) + layout::<p::SortExpr>(2) + layout::<p::ExprId>(1))
+                2 * (layout::<RootOrdinal>(3) + layout::<p::SortExpr>(2) + layout::<RootOrdinal>(1))
             } else {
                 layout::<u32>(3) + layout::<wire::SortExpression>(2) + layout::<u32>(1)
             };
@@ -1303,7 +1345,7 @@ fn aggregate_collection_counts_preserve_parent_work_once_across_batches() {
                     + layout::<wire::AggregateCall>(2)
             } else {
                 physical_header_floor(&n).unwrap()
-                    + layout::<(p::ExprId, p::ValueId)>(3)
+                    + layout::<(RootOrdinal, p::ValueId)>(3)
                     + layout::<p::AggregateCall>(2)
             };
             let run = |split: bool| -> Result<Model, Error> {
@@ -1330,13 +1372,13 @@ fn aggregate_collection_counts_preserve_parent_work_once_across_batches() {
                             };
                             if receiving {
                                 parent.count_decode(&raw_calls[i..i + 1], d, &mut w)?;
-                                known += layout::<u32>(raw_calls[i].argument_expr_ids.capacity())
+                                known += layout::<u32>(raw_calls[i].argument_roots.capacity())
                                     + layout::<wire::SortExpression>(
                                         raw_calls[i].order_by.capacity(),
                                     );
                             } else {
                                 parent.count_encode(&source_calls[i..i + 1], e, &mut w)?;
-                                known += layout::<p::ExprId>(source_calls[i].arguments.len())
+                                known += layout::<RootOrdinal>(source_calls[i].arguments.len())
                                     + layout::<p::SortExpr>(source_calls[i].order_by.len());
                             }
                         }
@@ -1420,7 +1462,7 @@ fn aggregate_collection_parent_tighter_gates_preserve_work_and_nested_capacity_e
                     2 * (layout::<p::NodeId>(1)
                         + layout::<p::PhysicalProperties>(1)
                         + layout::<p::ValueId>(3)
-                        + layout::<(p::ExprId, p::ValueId)>(3)
+                        + layout::<(RootOrdinal, p::ValueId)>(3)
                         + layout::<p::AggregateCall>(2))
                 } else {
                     layout::<u32>(1)
@@ -1430,7 +1472,7 @@ fn aggregate_collection_parent_tighter_gates_preserve_work_and_nested_capacity_e
                         + layout::<wire::AggregateCall>(2)
                 };
             let first_bytes = if receiving {
-                2 * (layout::<p::ExprId>(3) + layout::<p::SortExpr>(2))
+                2 * (layout::<RootOrdinal>(3) + layout::<p::SortExpr>(2))
             } else {
                 layout::<u32>(3) + layout::<wire::SortExpression>(2)
             };
@@ -1448,7 +1490,7 @@ fn aggregate_collection_parent_tighter_gates_preserve_work_and_nested_capacity_e
                     + layout::<wire::AggregateCall>(2)
             } else {
                 physical_header_floor(&n).unwrap()
-                    + layout::<(p::ExprId, p::ValueId)>(3)
+                    + layout::<(RootOrdinal, p::ValueId)>(3)
                     + layout::<p::AggregateCall>(2)
             };
             let action = |l: NodeProjectionLimits| -> Result<(), Error> {
@@ -1521,11 +1563,11 @@ fn aggregate_collection_parent_tighter_gates_preserve_work_and_nested_capacity_e
         // Actual receiving Vec capacity belongs to the source invoice. Its
         // omission remains an ordinary floor error, not a numeric cap failure.
         let mut over = b.calls.clone();
-        over[0].argument_expr_ids.reserve(SOURCE);
+        over[0].argument_roots.reserve(SOURCE);
         let known = wire_header_floor(&raw, raw.output.as_ref().unwrap()).unwrap()
             + layout::<wire::ExpressionOutput>(b.group_by.capacity())
             + layout::<wire::AggregateCall>(over.capacity());
-        assert!(known + layout::<u32>(over[0].argument_expr_ids.capacity()) > SOURCE);
+        assert!(known + layout::<u32>(over[0].argument_roots.capacity()) > SOURCE);
         let omitted_capacity = || {
             let mut w = CompileCheckpoints::try_new(&c, CompilePhase::Decode)?;
             let mut model = Model {

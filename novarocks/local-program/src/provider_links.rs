@@ -31,8 +31,8 @@ use novarocks_type_contract::{
 };
 
 use crate::{
-    ProgramChannelLayoutRole, ProgramChannelSite, ProgramLexicalBindings, ProgramNodeId,
-    ProgramNodeKind, ProgramTypedChannels, StaticLayout,
+    ProgramChannelLayoutRole, ProgramChannelSite, ProgramNodeId, ProgramNodeKind,
+    ProgramTypedChannels, StaticLayout,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -85,12 +85,13 @@ impl std::error::Error for ProviderLinkError {
 /// checkpoints surround them but do not certify their internal work quantum
 /// or authorize allocations. No fields, recipes or capabilities are copied.
 pub(crate) fn validate_provider_links(
-    checked: &ProgramLexicalBindings,
+    graph: &crate::LocalProgramGraph,
+    channels: &crate::ProgramTypedChannels,
     writes: &BTreeMap<ProgramNodeId, ConnectorWriteRecipe>,
     control: &dyn PureCompileControl,
 ) -> Result<(), ProviderLinkError> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
-    let result = validate_core(checked, writes, &mut work);
+    let result = validate_core(graph, channels, writes, &mut work);
     // Preserve a first control refusal; ordinary errors and success must still
     // observe their completed tail before returning to the final program owner.
     if matches!(result, Err(ProviderLinkError::Control(_))) {
@@ -101,12 +102,11 @@ pub(crate) fn validate_provider_links(
 }
 
 fn validate_core(
-    checked: &ProgramLexicalBindings,
+    graph: &crate::LocalProgramGraph,
+    channels: &crate::ProgramTypedChannels,
     writes: &BTreeMap<ProgramNodeId, ConnectorWriteRecipe>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), ProviderLinkError> {
-    let channels = checked.channels();
-    let graph = channels.expressions().resolved_calls().snapshot().program();
     for (index, node) in graph.nodes().iter().enumerate() {
         let id = ProgramNodeId::new(index);
         let kind = node.kind();

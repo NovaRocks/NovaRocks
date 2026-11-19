@@ -79,11 +79,16 @@ impl FragmentBuilder {
     ) -> Result<Fragment, FragmentStructureError> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
         let result = (|| {
+            self.ensure_units_finished()?;
             let mut errors = ValidationContext::for_construction(limits);
             admit_structure_counts(
                 self.nodes.len(),
                 self.values.len(),
-                self.expressions.len(),
+                self.nodes
+                    .values()
+                    .filter_map(|n| n.expressions.as_ref())
+                    .map(|u| u.definitions().len())
+                    .sum(),
                 self.runtime_filters.len(),
                 limits,
                 &mut errors,

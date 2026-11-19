@@ -67,7 +67,7 @@ fn required(id: Option<u32>, w: &mut CompileCheckpoints<'_>) -> Result<u32, Erro
     )
 }
 type AggregateBody<'a> = (
-    &'a [(p::ExprId, p::ValueId)],
+    &'a [(novarocks_expression_contract::RootOrdinal, p::ValueId)],
     &'a [p::AggregateCall],
     p::AggregateGrouping,
 );
@@ -107,7 +107,7 @@ fn encoded_expr(
     e: &EncodedExpressions<'_, '_, '_>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<(), Error> {
-    let present = e.expression_observed(id, w)?.is_some();
+    let present = e.root_expression_observed(id, w)?.is_some();
     completed(
         if present {
             Ok(())
@@ -122,7 +122,7 @@ fn decoded_expr(
     e: &DecodedExpressions<'_, '_, '_>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<(), Error> {
-    let present = e.definition_observed(id, w)?.is_some();
+    let present = e.root_definition_observed(id, w)?.is_some();
     completed(
         if present {
             Ok(())
@@ -183,7 +183,7 @@ fn encode_root_model(
     let known = add(
         physical_header_floor(input)?,
         add(
-            bytes::<(p::ExprId, p::ValueId)>(groups.len())?,
+            bytes::<(novarocks_expression_contract::RootOrdinal, p::ValueId)>(groups.len())?,
             bytes::<p::AggregateCall>(calls.len())?,
         )?,
     )?;
@@ -346,7 +346,10 @@ fn decode_root_model(
     base.delegated_work = decode_collection_lookup_work(&body.group_by, &body.calls, e, a)?;
     if roots {
         decode_header_requests(input, port, &mut base)?;
-        base.request::<(p::ExprId, p::ValueId)>(body.group_by.len(), 2)?;
+        base.request::<(novarocks_expression_contract::RootOrdinal, p::ValueId)>(
+            body.group_by.len(),
+            2,
+        )?;
         base.request::<p::AggregateCall>(body.calls.len(), 2)?;
     }
     Ok((base, known))
@@ -372,13 +375,7 @@ fn prepare_decode_core<'parent>(
         };
     if admit.is_some() && same {
         e.values().retained_floor_header_admitted()?;
-        add(
-            e.retained_floor_header_in()?,
-            add(
-                a.functions().retained_output_floor()?,
-                a.retained_output_floor()?,
-            )?,
-        )?;
+        e.owned_binding_floor(a.functions(), Some(a))?;
     }
     let mut early = if admit.is_some() && same && raw(input).is_ok() && input.output.is_some() {
         // Only a successful original shape projection supplies known requests.
@@ -425,16 +422,15 @@ fn prepare_decode_core<'parent>(
     node_gate(&base, source, e.values().count(), l.node, &mut admit)?;
     count_prefix(base.inputs, base.items, source, known, l.node, w)?;
     node_facts(&base, source, e.values().count(), l.node, &mut admit, w)?;
-    let borrowed = e.retained_floor_observed(w)?;
-    let owned = add(
-        a.functions().retained_output_floor()?,
-        a.retained_output_floor()?,
-    )?;
-    let dependency = add(borrowed, owned)?;
+    e.retained_floor_observed(w)?;
+    let dependency = e.owned_binding_floor(a.functions(), Some(a))?;
     floor(source, dependency, w)?;
     if !roots_prepared {
         decode_header_requests(input, port, &mut base)?;
-        base.request::<(p::ExprId, p::ValueId)>(body.group_by.len(), 2)?;
+        base.request::<(novarocks_expression_contract::RootOrdinal, p::ValueId)>(
+            body.group_by.len(),
+            2,
+        )?;
         base.request::<p::AggregateCall>(body.calls.len(), 2)?;
     }
     node_gate(&base, source, e.values().count(), l.node, &mut admit)?;
@@ -519,6 +515,7 @@ fn emit_encode(
     let (groups, calls, grouping) = physical(input)?;
     let (group_by, emitted) = encode_collections(groups, calls, e, w)?;
     let output = wire::PhysicalNode {
+        expressions: None,
         id: input.id.get(),
         input_node_ids: inputs,
         required_inputs,
@@ -546,6 +543,7 @@ fn emit_decode(
     let body = raw(input)?;
     let (group_by, calls) = decode_collections(&body.group_by, &body.calls, a, w)?;
     let output = p::PhysicalNode {
+        expressions: None,
         id: p::NodeId::new(input.id),
         inputs,
         required_inputs,

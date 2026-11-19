@@ -22,11 +22,12 @@ use arrow::{
     buffer::{NullBuffer, OffsetBuffer, ScalarBuffer},
     datatypes::{DataType, Field, Schema},
 };
+use novarocks_expression_contract::{ExprKind, RootScope};
 use novarocks_physical_plan::{
-    ConstantPools, ExprKind, FragmentBuilder, FragmentId, NodeId, NullOrdering, SortDirection,
-    SortExpr, SortMode, SystemRelationData, ValueOrigin,
+    ConstantPools, FragmentId, NodeId, NullOrdering, SortDirection, SortExpr, SortMode,
+    SystemRelationData, ValueOrigin,
 };
-use novarocks_type_contract::{FunctionValueType, ValueTypeStorageLifetime};
+use novarocks_type_contract::{EvaluationDemand, FunctionValueType, ValueTypeStorageLifetime};
 use std::{error::Error, sync::Arc};
 
 fn cause_chain(error: &(dyn Error + 'static)) -> String {
@@ -46,6 +47,8 @@ fn list_program(
     nullable_row: bool,
     wire_roundtrip: bool,
 ) -> Arc<novarocks_local_program::LocalProgram> {
+    let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
+
     use crate::exec::operators::family_fixture::{compile, package};
     let item = Arc::new(Field::new("item", DataType::Utf8, false));
     let types = [
@@ -83,7 +86,11 @@ fn list_program(
     } else {
         vec![batch]
     };
-    let mut builder = FragmentBuilder::new(FragmentId::new(94));
+    let mut builder =
+        crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+            FragmentId::new(94),
+            &fixture_sources,
+        );
     let source = NodeId::new(0);
     let sort_node = NodeId::new(1);
     let mut values = types
@@ -117,11 +124,18 @@ fn list_program(
         let filter = NodeId::new(2);
         let project = NodeId::new(3);
         let predicate = builder
-            .add_expression(
-                filter,
+            .unit(filter)
+            .unwrap()
+            .add(
+                None,
                 FunctionValueType::new(DataType::Boolean, false),
                 ExprKind::Value(values[2]),
             )
+            .unwrap();
+        let predicate = builder
+            .unit(filter)
+            .unwrap()
+            .root(predicate, EvaluationDemand::TruthOnly, RootScope::Port(0))
             .unwrap();
         builder
             .add_filter(filter, source, Box::from([predicate]))
@@ -130,14 +144,21 @@ fn list_program(
         let mut outputs = Vec::new();
         for (source_value, ty) in values.iter().zip(&types).take(2) {
             let expression = builder
-                .add_expression(project, ty.clone(), ExprKind::Value(*source_value))
+                .unit(project)
+                .unwrap()
+                .add(None, ty.clone(), ExprKind::Value(*source_value))
+                .unwrap();
+            let expression = builder
+                .unit(project)
+                .unwrap()
+                .root(expression, EvaluationDemand::Value, RootScope::Port(0))
                 .unwrap();
             let output = builder
                 .add_value(
                     ty.clone(),
                     ValueOrigin::Expr {
                         node: project,
-                        expr: expression,
+                        root: expression,
                     },
                 )
                 .unwrap();
@@ -159,11 +180,18 @@ fn list_program(
     };
     let root = if sort {
         let key = builder
-            .add_expression(
-                sort_node,
+            .unit(sort_node)
+            .unwrap()
+            .add(
+                None,
                 FunctionValueType::new(DataType::Utf8, false),
                 ExprKind::Value(values[0]),
             )
+            .unwrap();
+        let key = builder
+            .unit(sort_node)
+            .unwrap()
+            .root(key, EvaluationDemand::Value, RootScope::Port(0))
             .unwrap();
         builder
             .add_sort(
@@ -750,4 +778,42 @@ fn sort_carrier_merge_keeps_map_union_and_dictionary_parameters() {
         occurrence(7, true)
     );
     assert!(merge(&occurrence(7, false), &occurrence(8, true)).is_err());
+}
+
+#[test]
+fn shared_sort_window_encoding_preserves_float_bits_and_null_peers() {
+    use crate::exec::operators::{aggregate_fixture, family_fixture};
+    use crate::runtime::{mem_tracker::MemTracker, runtime_state::RuntimeErrorState};
+    let chunks = family_fixture::run(&list_program(false, false, false, false, false));
+    let output = chunks[0].chunk_schema_ref();
+    let factory = aggregate_fixture::runtime_construction_factory(
+        MemTracker::new_root("shared normalized key encoder"),
+        Arc::new(RuntimeErrorState::default()),
+    );
+    let creation = SortCreation::new(factory.as_ref(), &output);
+    let nan = f64::from_bits(0x7ff8_0000_0000_0001);
+    let other_nan = f64::from_bits(0x7ff8_0000_0000_0002);
+    let keys: Vec<arrow::array::ArrayRef> = vec![Arc::new(arrow::array::Float64Array::from(vec![
+        Some(-0.0),
+        Some(0.0),
+        Some(nan),
+        Some(nan),
+        Some(other_nan),
+        None,
+        None,
+    ]))];
+    let mut converter = None;
+    let encoded = creation
+        .encode_keys(
+            &mut converter,
+            &keys,
+            ValueTypeStorageLifetime::pure(),
+            encoding_failure,
+        )
+        .unwrap();
+    assert_ne!(encoded.row(0), encoded.row(1));
+    assert_eq!(encoded.row(2), encoded.row(3));
+    assert_ne!(encoded.row(2), encoded.row(4));
+    assert_eq!(encoded.row(5), encoded.row(6));
+    assert_ne!(encoded.row(4), encoded.row(5));
 }

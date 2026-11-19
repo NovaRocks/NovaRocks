@@ -18,8 +18,7 @@
 //! Actual corpus nullable Int32 source and permanent complete-package contract.
 use arrow::datatypes::DataType;
 use novarocks_physical_plan::{
-    FunctionArgumentType, NodeKind, PhysicalCallDefinition, PhysicalCallSite,
-    StaticFunctionArgument,
+    FunctionArgumentType, NodeKind, PhysicalCallSite, StaticFunctionArgument,
 };
 fn source() -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
     super::bitmap_to_string_actual_sql_source_tests::bitmap_sql_source(
@@ -39,10 +38,10 @@ fn bitmap_agg_actual_original_required_sql_full_signature_source() {
                 if call.binding.function.function_id.as_str() != "builtin.aggregate/bitmap_agg/v1" {
                     continue;
                 }
-                let definition = PhysicalCallDefinition::Relational(PhysicalCallSite::Aggregate {
+                let definition = PhysicalCallSite::Aggregate {
                     node: node.id,
                     call: u32::try_from(ordinal).unwrap(),
-                });
+                };
                 let request = fragment.call_requests().get(definition).unwrap();
                 assert_eq!(request.logical_argument_count, 1);
                 assert_eq!(request.arguments.len(), 1);

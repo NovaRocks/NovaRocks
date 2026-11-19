@@ -19,7 +19,6 @@ from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import fixture_run
-import java_rest_inputs
 import fixture_runtime
 
 
@@ -61,114 +60,6 @@ class RunTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'mutually exclusive'):
                 fixture_run.communicate(command, timeout=5, capture=True, stdout=subprocess.PIPE)
             process.assert_not_called()
-
-    def java_publication(self):
-        repo = self.root.resolve() / 'repo'
-        publication = repo / 'docker/iceberg-rest/runtime/current/published'
-        publication.mkdir(parents=True)
-        bom = self.root / 'bom.json'
-        bom.write_text(json.dumps({'lock_sha256':'exact-lock'}))
-        manifest = dict(self.manifest, fixture_inputs={'verified':True, 'bom':str(bom),
-                                                     'lock_sha256':'exact-lock'})
-        (publication / 'manifest.json').write_text(json.dumps(manifest))
-        values = dict(NOVA_ENV_ID='worktree-id', NOVA_ENV_REST_ENV_FILE=str(publication/'env.sh'),
-            NOVA_ENV_MANIFEST=str(publication/'manifest.json'), NOVA_ENV_RUNTIME_DIR=str(self.root),
-            NOVAROCKS_ICEBERG_REST_URI='http://fixture.invalid',
-            NOVAROCKS_ICEBERG_REST_WAREHOUSE='s3://fixture/rest', AWS_S3_ENDPOINT='http://s3.invalid',
-            AWS_S3_ACCESS_KEY_ID='fixture-key', AWS_S3_SECRET_ACCESS_KEY='fixture-secret')
-        import shlex
-        (publication/'env.sh').write_text('unset AWS_SESSION_TOKEN\n' +
-            ''.join('export '+key+'='+shlex.quote(value)+'\n' for key,value in values.items()))
-        return repo, publication
-
-    def test_java_owner_inherits_same_budget_storage_without_cleanup_rights(self):
-        repo, publication = self.java_publication()
-        with patch.dict(os.environ, {}, clear=True):
-            original = fixture_run.admit(publication/'env.sh')[2].as_dict()
-            storage = json.loads(os.environ['NOVA_FIXTURE_RUN_STORAGE'])
-            inherited = dict(os.environ, AWS_SESSION_TOKEN='foreign')
-            root = self.root.resolve()/'inherited-artifacts'
-            def sweep(*args, **kwargs):
-                self.assertFalse(root.exists())
-                self.assertEqual(kwargs['budget'].as_dict(), original)
-            with patch.object(java_rest_inputs.subprocess, 'run', return_value=subprocess.CompletedProcess([],0)), \
-                    patch.object(fixture_run, 'startup_sweep', side_effect=sweep), \
-                    patch.object(fixture_run, 'cleanup_run') as cleanup:
-                with java_rest_inputs.own_inputs(repo, root, inherited) as owner:
-                    self.assertFalse(owner.owns_run)
-                    self.assertEqual(json.loads(owner.environment['NOVA_FIXTURE_RUN_CONTEXT']), original)
-                    self.assertEqual(json.loads(owner.environment['NOVA_FIXTURE_RUN_STORAGE']), storage)
-                    self.assertNotIn('AWS_SESSION_TOKEN', owner.environment)
-                    with patch.object(fixture_run, 'communicate', return_value=subprocess.CompletedProcess([],0)) as command:
-                        self.assertEqual(owner.run(['original-command']), 0)
-                    self.assertEqual(command.call_args.kwargs['cwd'], repo)
-                    self.assertEqual(command.call_args.kwargs['environment'], owner.environment)
-                cleanup.assert_not_called()
-            result = json.loads((root/'owner-result.json').read_text())
-            self.assertEqual(result['cleanup']['disposition'], 'inherited_owner')
-            self.assertFalse(result['cleanup']['cleanup_rights'])
-
-    def test_java_owner_cleans_only_owned_success_after_command_return_and_retains_failures(self):
-        repo, publication = self.java_publication()
-        for status in (0, 7):
-            with self.subTest(status=status), patch.dict(os.environ, {}, clear=True):
-                root = self.root.resolve()/('artifacts-'+str(status))
-                def cleanup(*args, **kwargs):
-                    observed = json.loads((root/'owner-result.json').read_text())
-                    self.assertTrue(observed['command_returned'])
-                    self.assertEqual(observed['exit_code'], 0)
-                    self.assertEqual(kwargs['budget'].as_dict(),
-                                     json.loads((root/'fixture.json').read_text())['run_context'])
-                    return {'complete':True}
-                with patch.object(java_rest_inputs.subprocess, 'run', return_value=subprocess.CompletedProcess([],0)), \
-                        patch.object(fixture_run, 'startup_sweep'), \
-                        patch.object(fixture_run, 'cleanup_run', side_effect=cleanup) as cleaned:
-                    with java_rest_inputs.own_inputs(repo, root, {}) as owner:
-                        with patch.object(fixture_run, 'communicate', return_value=subprocess.CompletedProcess([],status)):
-                            self.assertEqual(owner.run(['original-command']), status)
-                    self.assertEqual(cleaned.call_count, 1 if status == 0 else 0)
-                facts = json.loads((root/'fixture.json').read_text())
-                self.assertEqual(facts['publication'], str(publication))
-                self.assertEqual(json.loads((root/'owner-result.json').read_text())['exit_code'], status)
-                for family in ('IRU5','IRU13A','IRU13B'):
-                    self.assertTrue((root/family).is_dir())
-
-    def test_java_owner_cancel_and_incomplete_cleanup_keep_original_failure_facts(self):
-        repo, publication = self.java_publication()
-        for mode in ('cancel', 'cleanup', 'collection'):
-            with self.subTest(mode=mode), patch.dict(os.environ, {}, clear=True):
-                root=self.root.resolve()/('cancel-'+mode)
-                with patch.object(java_rest_inputs.subprocess, 'run', return_value=subprocess.CompletedProcess([],0)), \
-                        patch.object(fixture_run, 'startup_sweep'), \
-                        patch.object(fixture_run, 'cleanup_run', return_value={'complete':False,'errors':['original']}) as cleanup:
-                    if mode == 'cancel':
-                        with self.assertRaises(KeyboardInterrupt):
-                            with java_rest_inputs.own_inputs(repo, root, {}) as owner:
-                                with patch.object(fixture_run, 'communicate', side_effect=KeyboardInterrupt):
-                                    owner.run(['original-command'])
-                        cleanup.assert_not_called()
-                    elif mode == 'collection':
-                        with self.assertRaisesRegex(ValueError,'native results absent'):
-                            with java_rest_inputs.own_inputs(repo, root, {}) as owner:
-                                with patch.object(fixture_run, 'communicate', return_value=subprocess.CompletedProcess([],0)):
-                                    owner.run(['original-command'])
-                                raise ValueError('native results absent')
-                        cleanup.assert_not_called()
-                    else:
-                        with self.assertRaisesRegex(ValueError,'cleanup is incomplete'):
-                            with java_rest_inputs.own_inputs(repo, root, {}) as owner:
-                                with patch.object(fixture_run, 'communicate', return_value=subprocess.CompletedProcess([],0)):
-                                    owner.run(['original-command'])
-                facts=json.loads((root/'owner-result.json').read_text())
-                self.assertEqual(facts['command_returned'],mode != 'cancel')
-                self.assertEqual(facts['cleanup']['summary'],'violation' if mode == 'cleanup' else 'unknown')
-                if mode == 'cancel':
-                    self.assertEqual(facts['interrupted'],'KeyboardInterrupt')
-                elif mode == 'collection':
-                    self.assertEqual(facts['owner_scope_error'],'ValueError')
-                    self.assertEqual(facts['exit_code'],0)
-                else:
-                    self.assertEqual(facts['cleanup']['report']['errors'],['original'])
 
     def cloud_publication(self):
         cloud = dict(kind="aliyun-oss", region="cn-test", bucket="fixture-bucket",

@@ -38,7 +38,7 @@ impl PureCompileControl for Control {
         }
     }
 }
-fn plan(facts: F) -> TemporalSourcePlan<novarocks_physical_plan::ExprId> {
+fn plan(facts: F) -> TemporalSourcePlan<novarocks_expression_contract::ExprId> {
     let sources = facts
         .shape()
         .roles()
@@ -49,14 +49,14 @@ fn plan(facts: F) -> TemporalSourcePlan<novarocks_physical_plan::ExprId> {
             role,
             use_id: ExpressionUseId::new(ordinal as u32 + 1),
             // Repeated definitions are legal; repeated occurrences are not.
-            definition: novarocks_physical_plan::ExprId::new(97),
+            definition: novarocks_expression_contract::ExprId::new(97),
         })
         .collect::<Vec<_>>()
         .into_boxed_slice();
     TemporalSourcePlan { facts, sources }
 }
 fn encode(
-    plan: &TemporalSourcePlan<novarocks_physical_plan::ExprId>,
+    plan: &TemporalSourcePlan<novarocks_expression_contract::ExprId>,
     control: &Control,
 ) -> Result<wire::TemporalSourcePlan, E> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
@@ -67,7 +67,7 @@ fn encode(
 fn decode(
     plan: &wire::TemporalSourcePlan,
     control: &Control,
-) -> Result<TemporalSourcePlan<novarocks_physical_plan::ExprId>, E> {
+) -> Result<TemporalSourcePlan<novarocks_expression_contract::ExprId>, E> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Decode)?;
     let result = decode_temporal_source(plan, &mut Projection::plain(), &mut work)?;
     work.finish()?;

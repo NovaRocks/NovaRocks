@@ -28,10 +28,7 @@ use crate::{
     change_events::lower_change_events_with_creation,
     channels::{ChannelLoweringError, resolve_tree_channels_with_creation},
     exchange::lower_exchange_source_with_creation,
-    expressions::{
-        ExpressionLoweringError, lower_expressions_with_unions,
-        lower_expressions_with_unions_with_creator, prepare_calls_with_aggregates,
-    },
+    expressions::{ExpressionLoweringError, LoweredExpressions},
     repeat::{RepeatLoweringError, lower_repeat_with_creation},
     scan::{admit_scan, lower_scan_with_creation},
     sort::lower_sort,
@@ -41,13 +38,12 @@ use crate::{
     },
     topn::lower_topn,
     unpivot::{UnpivotLoweringError, UnpivotLoweringInput, lower_unpivot_with_creation},
-    values::{lower_values_with_creation, retired_values_uses},
+    values::lower_values_with_creation,
 };
 use novarocks_functions::{ConstantPolicy, PureEngineFunctionCatalog};
 use novarocks_local_program::*;
 use novarocks_physical_plan::{
-    Distribution, EdgeKind, ExpressionRootRole, FragmentSink, JoinSide, NodeId, NodeKind,
-    RowMultiplicity,
+    Distribution, EdgeKind, FragmentSink, JoinSide, NodeId, NodeKind, RowMultiplicity,
 };
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, FunctionValueType, PureCompileControl,
@@ -99,27 +95,9 @@ impl FragmentCompileError {
     pub fn is_unsupported(&self) -> bool {
         match self {
             Self::Unsupported { .. } => true,
-            Self::Owner { error, .. } => {
-                error
-                    .downcast_ref::<ExpressionLoweringError>()
-                    .is_some_and(ExpressionLoweringError::is_unsupported)
-                    || error
-                        .downcast_ref::<LocalProgramCompileError>()
-                        .is_some_and(|error| {
-                            matches!(
-                                error,
-                                LocalProgramCompileError::Primitive(
-                                    novarocks_local_program::ProgramPrimitiveError::Cast(
-                                        novarocks_functions::CastPrepareError::Unsupported
-                                    ) | novarocks_local_program::ProgramPrimitiveError::Arithmetic(
-                                        novarocks_functions::ArithmeticPrepareError::Unsupported
-                                    ) | novarocks_local_program::ProgramPrimitiveError::Comparison(
-                                        novarocks_functions::ComparisonPrepareError::Unsupported
-                                    )
-                                )
-                            )
-                        })
-            }
+            Self::Owner { error, .. } => error
+                .downcast_ref::<ExpressionLoweringError>()
+                .is_some_and(ExpressionLoweringError::is_unsupported),
             _ => false,
         }
     }
@@ -248,37 +226,9 @@ owner_error!(LayoutCompileError, "layout");
 owner_error!(ValuesCompileError, "values");
 owner_error!(BindingRequirementsCompileError, "requirements");
 owner_error!(ProgramCompileError, "graph");
-owner_error!(ProgramControlFlowError, "control flow");
-impl From<ProgramRootBindingError> for FragmentCompileError {
-    fn from(error: ProgramRootBindingError) -> Self {
-        match error {
-            ProgramRootBindingError::Control(cause)
-            | ProgramRootBindingError::Roots(ProgramExpressionRootError::Control(cause)) => {
-                Self::Control(cause)
-            }
-            error => Self::Owner {
-                phase: "root correspondence",
-                error: novarocks_failure_contract::SharedFailureCause::new(error),
-            },
-        }
-    }
-}
-impl From<RootAttachmentError> for FragmentCompileError {
-    fn from(error: RootAttachmentError) -> Self {
-        match error {
-            RootAttachmentError::Control(cause) => Self::Control(cause),
-            RootAttachmentError::Roots(error) => error.into(),
-            RootAttachmentError::Calls(error) => error.into(),
-            RootAttachmentError::Expressions(error) => error.into(),
-            RootAttachmentError::Channels(error) => error.into(),
-        }
-    }
-}
-owner_error!(ProgramResolvedCallsError, "resolved calls");
-owner_error!(ProgramExpressionTypeError, "definition types");
-owner_error!(ProgramChannelTypeError, "channel types");
-owner_error!(ProgramLexicalBindingError, "lexical bindings");
-owner_error!(LocalProgramCompileError, "final owner");
+owner_error!(ProgramResolvedCallsError, "relation calls");
+owner_error!(ProgramChannelTypeError, "typed channels");
+owner_error!(LocalProgramCompileError, "local program");
 
 /// This entry consumes the provider intermediate rather than retaining a
 /// second package beside the resulting graph. Unsupported families remain
@@ -352,7 +302,7 @@ fn lower_with_creation<
     metadata: &mut ProjectMetadataMode<'_, P>,
 ) -> Result<LocalProgram, crate::FragmentCreationError<H>> {
     // Each validated provider recipe moves into its one lowered owner.
-    let (package, mut reads, mut writes) = input.into_parts();
+    let (package, mut reads, mut writes, mut layouts) = input.into_parts();
     let package = &package;
     let physical = package.fragment();
     let dop = u32::try_from(options.pipeline_dop.get())
@@ -431,6 +381,7 @@ fn lower_with_creation<
             .into());
         }
     };
+    let mut routing_receivers = BTreeSet::new();
     for cut in package.cuts().inbound.iter() {
         work.step()?;
         if cut.kind != EdgeKind::Stream && cut.kind != EdgeKind::ChangeStreamRouter {
@@ -439,6 +390,9 @@ fn lower_with_creation<
                 feature: "inbound CTE edge",
             })
             .into());
+        }
+        if !cut.partitioning.routing_only.is_empty() {
+            routing_receivers.insert(cut.destination_node);
         }
     }
     // Provider reads and writes are admitted per scan and writer below; each
@@ -584,17 +538,26 @@ fn lower_with_creation<
     let derived_roots = derived_definitions
         .checked_add(runtime_filters.join_consumer_count()?)
         .ok_or(CompileControlError::ResourceExhausted)?;
-    let original_flow = package.expression_uses().flow();
-    let mut references = original_flow
-        .uses()
-        .len()
-        .checked_add(derived_roots)
-        .ok_or(CompileControlError::ResourceExhausted)?;
-    for invocation in original_flow.uses().values() {
-        references = references
-            .checked_add(invocation.arguments.len())
-            .ok_or(CompileControlError::ResourceExhausted)?;
+    let mut definition_count = 0usize;
+    let mut region_count = 0usize;
+    let mut use_count = 0usize;
+    let mut references = derived_roots;
+    for node in physical.nodes().values() {
         work.step()?;
+        if let Some(unit) = &node.expressions {
+            definition_count = definition_count
+                .checked_add(unit.definitions().len())
+                .ok_or(CompileControlError::ResourceExhausted)?;
+            region_count = region_count
+                .checked_add(unit.control_flow().regions().len())
+                .ok_or(CompileControlError::ResourceExhausted)?;
+            use_count = use_count
+                .checked_add(unit.control_flow().uses().len())
+                .ok_or(CompileControlError::ResourceExhausted)?;
+            references = references
+                .checked_add(unit.control_flow().use_reference_count())
+                .ok_or(CompileControlError::ResourceExhausted)?;
+        }
     }
     if channel_count > MAX_PROGRAM_TYPED_CHANNELS
         || expanded_nodes
@@ -602,19 +565,13 @@ fn lower_with_creation<
             .is_none_or(|n| n > MAX_PROFILE_REFERENCES)
         || expanded_nodes > MAX_PROGRAM_NODES
         || expanded_nodes > MAX_PROGRAM_EXPANDED_OCCURRENCES
-        || physical
-            .expressions()
-            .len()
+        || definition_count
             .checked_add(derived_definitions)
             .is_none_or(|n| n > novarocks_type_contract::MAX_CONTROL_DEFINITIONS)
-        || original_flow
-            .domains()
-            .len()
+        || region_count
             .checked_add(derived_roots)
             .is_none_or(|n| n > novarocks_type_contract::MAX_CONTROL_DEFINITIONS)
-        || original_flow
-            .uses()
-            .len()
+        || use_count
             .checked_add(derived_roots)
             .is_none_or(|n| n > novarocks_type_contract::MAX_CONTROL_DEFINITIONS)
         || references > novarocks_type_contract::MAX_CONTROL_USE_REFERENCES
@@ -712,30 +669,26 @@ fn lower_with_creation<
             | NodeKind::Unpivot { .. }
             | NodeKind::ChangeEventExpand { .. }
             | NodeKind::Aggregate { .. } => node.inputs.len() == 1,
+            NodeKind::WriteLayoutKey { .. } => node.id == physical.root() && node.inputs.len() == 1,
             NodeKind::PositionShard(spec) => {
                 node.id == physical.root()
                     && !spec.inputs.is_empty()
                     && node.inputs.len() == spec.inputs.len()
             }
             NodeKind::Filter { predicates } => !predicates.is_empty() && node.inputs.len() == 1,
-            // Every row-count TopN phase; a grouped-state reduction has no
-            // local owner.
-            NodeKind::Sort {
-                mode:
-                    novarocks_physical_plan::SortMode::Global
-                    | novarocks_physical_plan::SortMode::Analytic { .. },
-                ..
-            }
+            // Every frozen sort mode and row-count TopN phase has one local owner.
+            NodeKind::Sort { .. }
             | NodeKind::TopN {
                 reduction: novarocks_physical_plan::TopNReduction::Rows,
                 ..
             } => node.inputs.len() == 1,
             NodeKind::TopN {
                 reduction: novarocks_physical_plan::TopNReduction::GroupedStates { .. },
-                phase: novarocks_physical_plan::TopNPhase::Partial { .. },
-                offset: 0,
                 ..
-            } => node.inputs.len() == 1,
+            } => {
+                crate::topn::admit_grouped_topn_shape(node)?;
+                true
+            }
             // A window, under its own admission: one input and an installed
             // pure window kernel for each call shape.
             NodeKind::Window(_) => {
@@ -851,15 +804,15 @@ fn lower_with_creation<
         }
         let sorted = node.inputs.len() == 1 && properties.get(&node.inputs[0]).is_some_and(|p| p.1);
         let changes = matches!(node.kind, NodeKind::ChangeEventExpand { .. });
-        // A table function keeps each outer row on its driver and emits its
-        // rows in outer order; the property law keeps exactly the input
-        // ordering prefix its pass-through values carry.
+        // A table function and a write layout key keep each outer row on its
+        // driver and preserve the ordering of the pass-through occurrences.
         let transparent = matches!(
             node.kind,
             NodeKind::Project { .. }
                 | NodeKind::Filter { .. }
                 | NodeKind::Limit { .. }
                 | NodeKind::TableFunction { .. }
+                | NodeKind::WriteLayoutKey { .. }
         );
         let partial_rows = matches!(
             node.kind,
@@ -941,7 +894,12 @@ fn lower_with_creation<
         // placement. Keep that placement fact, not a guessed distribution.
         // Network join admissibility was checked by orient_join above.
         let join_placed = probe_input.is_some() && node.inputs.iter().all(checked_input_placement);
-        let scan_rooted = matches!(node.kind, NodeKind::Scan { .. })
+        // The exact inbound cut places each row even when the routing key
+        // was consumed at the exchange and the node has no visible hash key.
+        let routed_exchange =
+            matches!(node.kind, NodeKind::ExchangeSource { .. }) && routing_receivers.contains(&id);
+        let runtime_placed = matches!(node.kind, NodeKind::Scan { .. })
+            || routed_exchange
             || projected_placement
             || repeat_placed
             || join_placed
@@ -957,7 +915,7 @@ fn lower_with_creation<
         // descendant could consume.
         let writer_rooted = matches!(node.kind, NodeKind::TableWriter { .. });
         work.step()?;
-        if unknown && !expanded && !changes && !scan_rooted && !writer_rooted {
+        if unknown && !expanded && !changes && !runtime_placed && !writer_rooted {
             return Err((FragmentCompileError::Unsupported {
                 node: Some(id),
                 feature: "unconstrained distribution without a runtime-split scan placement",
@@ -967,13 +925,14 @@ fn lower_with_creation<
         // Every row-count TopN phase emits its instance's window as one
         // ordered stream on one driver, so its declared ordering holds for
         // the whole instance output, as the property law states it. An
-        // analytic Sort does the same over its partition keys and then its
-        // order keys.
+        // analytic Sort and partition TopN do the same over partition keys
+        // followed by order keys; pruning preserves that ordering.
         let global = matches!(
             node.kind,
             NodeKind::Sort {
                 mode: novarocks_physical_plan::SortMode::Global
-                    | novarocks_physical_plan::SortMode::Analytic { .. },
+                    | novarocks_physical_plan::SortMode::Analytic { .. }
+                    | novarocks_physical_plan::SortMode::PartitionTopN { .. },
                 ..
             } | NodeKind::TopN { .. }
         );
@@ -999,7 +958,7 @@ fn lower_with_creation<
             })
             .into());
         }
-        properties.insert(id, (expanded || changes, ordered, scan_rooted));
+        properties.insert(id, (expanded || changes, ordered, runtime_placed));
     }
     work.flush()?;
     let channels_plan =
@@ -1010,75 +969,40 @@ fn lower_with_creation<
         work,
     )?;
     work.flush()?;
-    let expressions = match factory {
-        Some(f) => {
-            let mut type_scope = f
-                .begin_scope()
-                .map_err(crate::FragmentCreationError::Creator)?;
-            lower_expressions_with_unions_with_creator(
-                package,
-                options.constants,
-                &channels_plan.inputs,
-                &channels_plan.unions,
-                &runtime_filter_keys,
-                &mut type_scope,
-                f,
-                work.control(),
-            )?
-        }
-        None => lower_expressions_with_unions(
-            package,
-            options.constants,
-            &channels_plan.inputs,
-            &channels_plan.unions,
-            &runtime_filter_keys,
-            work.control(),
-        )?,
-    };
-    work.flush()?;
-    let local_nodes = channels_plan
-        .nodes
-        .iter()
-        .map(|(source, planned)| (*source, planned.local))
-        .collect::<BTreeMap<_, _>>();
-    work.flush()?;
-    let tokens = match factory {
-        Some(factory) => crate::expressions::prepare_calls_with_aggregates_with_creator(
-            package,
-            &expressions,
-            functions,
-            &local_nodes,
-            &options.constants,
-            factory,
-            work.control(),
-        )?,
-        None => prepare_calls_with_aggregates(
-            package,
-            &expressions,
-            functions,
-            &local_nodes,
-            work.control(),
-        )?,
-    };
+    let mut expressions =
+        LoweredExpressions::new(package, crate::creation::borrow_scope(&mut temporary), work)?;
+    let mut local_nodes = BTreeMap::new();
+    let mut physical_nodes = BTreeMap::new();
+    for (source, planned) in &channels_plan.nodes {
+        crate::creation::before_tree_insert::<NodeId, ProgramNodeId, H>(
+            local_nodes.len(),
+            crate::creation::borrow_scope(&mut temporary),
+            work,
+        )?;
+        local_nodes.insert(*source, planned.local);
+        crate::creation::before_tree_insert::<ProgramNodeId, NodeId, H>(
+            physical_nodes.len(),
+            crate::creation::borrow_scope(&mut temporary),
+            work,
+        )?;
+        physical_nodes.insert(planned.local, *source);
+        work.step()?;
+    }
     let mut nodes: Vec<ProgramNode> = Vec::new();
     let mut local_ids = BTreeMap::new();
     let mut channels = Vec::new();
     let mut operators = Vec::new();
     let mut allowed = BTreeSet::new();
-    let mut union_roots = Vec::new();
-    let mut filter_roots = Vec::new();
     let mut source_requirements = Vec::new();
     let mut exchange_inputs = BTreeMap::new();
     let mut scan_inputs = BTreeMap::new();
     let mut aggregates = BTreeMap::new();
     let mut program_writes = BTreeMap::new();
-    let mut writer_flows = Vec::new();
     // Local nodes whose layout is a provider scan layout unchanged.
     let mut scan_layouts = BTreeSet::new();
     crate::assert_rows::reserve_vec(&mut nodes, expanded_nodes, work)?;
     crate::assert_rows::reserve_vec(&mut operators, expanded_nodes, work)?;
     crate::assert_rows::reserve_vec(&mut channels, channel_count, work)?;
-    crate::assert_rows::reserve_vec(&mut union_roots, derived_definitions, work)?;
     for &source in order.iter().rev() {
         work.step()?;
         let node = &physical.nodes()[&source];
@@ -1089,6 +1013,93 @@ fn lower_with_creation<
                 "missing planned node channels",
             ))?;
         let id = planned.local;
+        if !matches!(
+            node.kind,
+            NodeKind::Scan { .. } | NodeKind::HashJoin { .. } | NodeKind::NestLoopJoin { .. }
+        ) {
+            let mut inputs = Vec::new();
+            crate::creation::reserve_vec(
+                &mut inputs,
+                node.inputs.len(),
+                crate::creation::borrow_scope(&mut temporary),
+                work,
+            )?;
+            for source in &node.inputs {
+                let layout = local_ids
+                    .get(source)
+                    .and_then(|id: &ProgramNodeId| nodes.get(id.index()))
+                    .map(ProgramNode::output_layout)
+                    .ok_or(FragmentCompileError::Invalid(
+                        "expression input runtime layout is absent",
+                    ))?;
+                work.step()?;
+                inputs.push(layout);
+            }
+            crate::expressions::compile_node_unit(
+                package,
+                node,
+                &inputs,
+                None,
+                &mut expressions,
+                functions,
+                options.constants,
+                creation,
+                crate::creation::borrow_scope(&mut temporary),
+                factory,
+                work,
+            )?;
+        }
+        if !matches!(
+            node.kind,
+            NodeKind::HashJoin { .. } | NodeKind::NestLoopJoin { .. }
+        ) && let Some(branches) = channels_plan.unions.get(&source)
+        {
+            let mut roots = Vec::new();
+            crate::creation::reserve_vec(
+                &mut roots,
+                branches.len(),
+                crate::creation::borrow_scope(&mut temporary),
+                work,
+            )?;
+            for branch in branches {
+                if channels_plan
+                    .sink_projection
+                    .as_ref()
+                    .is_some_and(|projection| projection.node == branch.normalizer)
+                {
+                    continue;
+                }
+                let child =
+                    *physical_nodes
+                        .get(&branch.input)
+                        .ok_or(FragmentCompileError::Invalid(
+                            "synthesized read input node is absent",
+                        ))?;
+                roots.push(crate::union_flow::compile_branch_reads(
+                    package,
+                    &mut expressions,
+                    functions,
+                    options.constants,
+                    nodes[branch.input.index()].output_layout(),
+                    child,
+                    branch,
+                    creation,
+                    crate::creation::borrow_scope(&mut temporary),
+                    factory,
+                    work,
+                )?);
+            }
+            crate::creation::before_tree_insert::<
+                NodeId,
+                Vec<Vec<novarocks_local_program::ProgramRootRef>>,
+                H,
+            >(
+                expressions.union_ids.len(),
+                crate::creation::borrow_scope(&mut temporary),
+                work,
+            )?;
+            expressions.union_ids.insert(source, roots);
+        }
         // A join lowers to its join node and, when its physical output is not
         // canonical, one selection Project whose slot reads were authored
         // like a union normalizer's.
@@ -1100,14 +1111,13 @@ fn lower_with_creation<
                     .ok_or(FragmentCompileError::Invalid("missing lowered join input"))
             };
             let (probe, build) = (input(join.probe)?, input(join.build)?);
-            let selection = expressions
-                .union_ids
-                .get(&source)
-                .and_then(|rows| rows.first())
-                .map(Vec::as_slice);
-            let filters =
-                runtime_filters.take_join(source, package, join, &expressions.ids, work)?;
-            filter_roots.extend(filters.roots);
+            let filters = runtime_filters.take_join(
+                source,
+                package,
+                join,
+                expressions.roots(source)?,
+                work,
+            )?;
             source_requirements.extend(filters.requirements);
             work.flush()?;
             let lowered = crate::join::lower_join_with_creation(
@@ -1123,8 +1133,11 @@ fn lower_with_creation<
                     node: build,
                     layout: nodes[build.index()].output_layout(),
                 },
-                &expressions.ids,
-                selection,
+                &mut expressions,
+                functions,
+                options.constants,
+                crate::creation::borrow_scope(&mut temporary),
+                factory,
                 filters.producers,
                 filters.consumers,
                 work.control(),
@@ -1142,7 +1155,6 @@ fn lower_with_creation<
             }
             channels.extend(lowered.channels);
             operators.extend(lowered.operators);
-            union_roots.extend(lowered.selection_roots);
             allowed.insert(DiagnosticSourceNodeId::new(source.get()));
             local_ids.insert(source, id);
             continue;
@@ -1153,7 +1165,7 @@ fn lower_with_creation<
                 node,
                 series,
                 &planned.slots,
-                &expressions.ids,
+                expressions.roots(source)?,
                 work,
                 creation,
             )?;
@@ -1196,7 +1208,7 @@ fn lower_with_creation<
                 table,
                 &planned.slots,
                 child,
-                &expressions.ids,
+                expressions.roots(source)?,
                 reads,
                 work.control(),
                 creation,
@@ -1215,7 +1227,6 @@ fn lower_with_creation<
             }
             channels.extend(lowered.channels);
             operators.extend(lowered.operators);
-            union_roots.extend(lowered.pass_through_roots);
             allowed.insert(DiagnosticSourceNodeId::new(source.get()));
             local_ids.insert(source, id);
             continue;
@@ -1254,20 +1265,6 @@ fn lower_with_creation<
             let owner = LocalOperatorId::new(
                 u32::try_from(id.index()).map_err(|_| CompileControlError::ResourceExhausted)?,
             );
-            for (branch, definitions) in branches.iter().zip(definitions) {
-                for (ordinal, (input, &definition)) in
-                    branch.sources.iter().zip(definitions).enumerate()
-                {
-                    union_roots.push(crate::union_flow::UnionRoot {
-                        node: branch.normalizer,
-                        ordinal: u32::try_from(ordinal)
-                            .map_err(|_| CompileControlError::ResourceExhausted)?,
-                        definition,
-                        source: input.input.source,
-                    });
-                    work.step()?;
-                }
-            }
             let source_id = DiagnosticSourceNodeId::new(source.get());
             allowed.insert(source_id);
             local_ids.insert(source, id);
@@ -1362,6 +1359,85 @@ fn lower_with_creation<
                 let recipe = reads.remove(&source).ok_or(FragmentCompileError::Invalid(
                     "missing provider read recipe",
                 ))?;
+                let mut lowered = lower_scan_with_creation(
+                    node,
+                    id,
+                    recipe,
+                    ScanFilterConsumers::default(),
+                    &planned.slots,
+                    expressions.roots(source)?,
+                    work.control(),
+                    creation,
+                )?;
+                crate::expressions::compile_node_unit(
+                    package,
+                    node,
+                    &[&lowered.layout],
+                    None,
+                    &mut expressions,
+                    functions,
+                    options.constants,
+                    creation,
+                    crate::creation::borrow_scope(&mut temporary),
+                    factory,
+                    work,
+                )?;
+                if let Some(keys) = runtime_filter_keys.get(&source) {
+                    let mut columns = Vec::new();
+                    crate::creation::reserve_vec(
+                        &mut columns,
+                        node.output.columns.len(),
+                        crate::creation::borrow_scope(&mut temporary),
+                        work,
+                    )?;
+                    for value in &node.output.columns {
+                        work.step()?;
+                        columns.push((*value, physical.values()[value].ty.clone()));
+                    }
+                    let mut reads = Vec::new();
+                    crate::creation::reserve_vec(
+                        &mut reads,
+                        keys.len(),
+                        crate::creation::borrow_scope(&mut temporary),
+                        work,
+                    )?;
+                    for key in keys {
+                        let ProgramChannelSite::Layout { ordinal, .. } = key.input.source else {
+                            return Err(FragmentCompileError::Invalid(
+                                "scan filter reads a nonlayout channel",
+                            )
+                            .into());
+                        };
+                        work.step()?;
+                        reads.push((
+                            ordinal as usize,
+                            novarocks_type_contract::EvaluationDemand::Value,
+                        ));
+                    }
+                    let roots = crate::union_flow::compile_reads(
+                        package,
+                        &mut expressions,
+                        functions,
+                        options.constants,
+                        &lowered.layout,
+                        &columns,
+                        &reads,
+                        creation,
+                        crate::creation::borrow_scope(&mut temporary),
+                        factory,
+                        work,
+                    )?;
+                    crate::creation::before_tree_insert::<
+                        NodeId,
+                        Vec<novarocks_local_program::ProgramRootRef>,
+                        H,
+                    >(
+                        expressions.runtime_filter_key_ids.len(),
+                        crate::creation::borrow_scope(&mut temporary),
+                        work,
+                    )?;
+                    expressions.runtime_filter_key_ids.insert(source, roots);
+                }
                 let filters = runtime_filters.take_scan(
                     source,
                     id,
@@ -1370,17 +1446,12 @@ fn lower_with_creation<
                     crate::creation::borrow_scope(&mut temporary),
                     work,
                 )?;
-                work.flush()?;
-                let lowered = lower_scan_with_creation(
-                    node,
-                    id,
-                    recipe,
-                    filters.filters,
-                    &planned.slots,
-                    &expressions.ids,
-                    work.control(),
-                    creation,
-                )?;
+                if let ProgramNodeKind::Scan {
+                    runtime_filters, ..
+                } = &mut lowered.kind
+                {
+                    *runtime_filters = filters.filters;
+                }
                 if filters.ordered {
                     let count = filters
                         .requirements
@@ -1393,16 +1464,9 @@ fn lower_with_creation<
                         crate::creation::borrow_scope(&mut temporary),
                         work,
                     )?;
-                    crate::creation::reserve_vec(
-                        &mut filter_roots,
-                        filters.roots.len(),
-                        crate::creation::borrow_scope(&mut temporary),
-                        work,
-                    )?;
                 }
                 source_requirements.push(lowered.requirement);
                 source_requirements.extend(filters.requirements);
-                filter_roots.extend(filters.roots);
                 scan_inputs.insert(id, lowered.input);
                 scan_layouts.insert(id);
                 (lowered.kind, lowered.layout)
@@ -1416,7 +1480,7 @@ fn lower_with_creation<
                     node,
                     child,
                     nodes[child.index()].output_layout(),
-                    &expressions.ids,
+                    expressions.roots(source)?,
                     work.control(),
                 )?
             }
@@ -1433,7 +1497,7 @@ fn lower_with_creation<
                     node,
                     child,
                     nodes[child.index()].output_layout(),
-                    &expressions.ids,
+                    expressions.roots(source)?,
                     &planned.slots,
                     work.control(),
                     creation,
@@ -1449,7 +1513,7 @@ fn lower_with_creation<
                         ))?;
                 let filters = runtime_filters.take_aggregate(
                     source,
-                    &expressions.ids,
+                    expressions.roots(source)?,
                     factory,
                     crate::creation::borrow_scope(&mut temporary),
                     work,
@@ -1468,7 +1532,7 @@ fn lower_with_creation<
                     package,
                     node,
                     child,
-                    &expressions.ids,
+                    expressions.roots(source)?,
                     &planned.slots,
                     filters.filters,
                     work.control(),
@@ -1490,7 +1554,7 @@ fn lower_with_creation<
                         package,
                         node,
                         child,
-                        &expressions.ids,
+                        expressions.roots(source)?,
                         &planned.slots,
                         work.control(),
                         creation,
@@ -1499,7 +1563,7 @@ fn lower_with_creation<
                         node,
                         child,
                         nodes[child.index()].output_layout(),
-                        &expressions.ids,
+                        expressions.roots(source)?,
                         work.control(),
                     )?,
                 }
@@ -1510,9 +1574,7 @@ fn lower_with_creation<
                     .ok_or(FragmentCompileError::Invalid("missing lowered child"))?;
                 let mut local_predicates = Vec::with_capacity(predicates.len());
                 for predicate in predicates {
-                    local_predicates.push(*expressions.ids.get(predicate).ok_or(
-                        FragmentCompileError::Invalid("missing predicate definition"),
-                    )?);
+                    local_predicates.push(expressions.root(source, *predicate)?);
                     work.step()?;
                 }
                 work.flush()?;
@@ -1564,10 +1626,37 @@ fn lower_with_creation<
                         node: child,
                         layout: nodes[child.index()].output_layout(),
                         sources,
-                        expressions: &expressions.ids,
+                        expressions: expressions.roots(source)?,
                     },
                     &planned.slots,
                     work.control(),
+                    creation,
+                )?
+            }
+            NodeKind::WriteLayoutKey {
+                key_inputs,
+                output_key,
+            } => {
+                let child =
+                    *local_ids
+                        .get(&node.inputs[0])
+                        .ok_or(FragmentCompileError::Invalid(
+                            "missing lowered layout input",
+                        ))?;
+                let recipe = layouts
+                    .remove(&source)
+                    .ok_or(FragmentCompileError::Invalid(
+                        "missing sealed write layout recipe",
+                    ))?;
+                lower_write_layout_key(
+                    package,
+                    node,
+                    (key_inputs, *output_key),
+                    child,
+                    nodes[child.index()].output_layout(),
+                    &planned.slots,
+                    recipe,
+                    work,
                     creation,
                 )?
             }
@@ -1594,7 +1683,7 @@ fn lower_with_creation<
                     id,
                     child,
                     &planned.slots,
-                    &expressions.ids,
+                    expressions.roots(source)?,
                     work.control(),
                     creation,
                 )?
@@ -1695,9 +1784,8 @@ fn lower_with_creation<
                         let mut exprs = Vec::new();
                         for (ordinal, (expr, value)) in projected.iter().enumerate() {
                             work.step()?;
-                            let definition = physical.expressions().get(*expr).ok_or(
-                                FragmentCompileError::Invalid("missing projection definition"),
-                            )?;
+                            let definition =
+                                crate::expressions::bound_root(package, source, *expr)?;
                             let value_type = &physical
                                 .values()
                                 .get(value)
@@ -1741,9 +1829,7 @@ fn lower_with_creation<
                             slots.push(*planned.slots.get(ordinal).ok_or(
                                 FragmentCompileError::Invalid("missing planned output occurrence"),
                             )?);
-                            exprs.push(*expressions.ids.get(expr).ok_or(
-                                FragmentCompileError::Invalid("missing projection expression"),
-                            )?);
+                            exprs.push(expressions.root(source, *expr)?);
                         }
                         work.flush()?;
                         let layout = typed_layout.finish_with_creation(&slots, work, creation)?;
@@ -1803,6 +1889,9 @@ fn lower_with_creation<
                         output_slots: &planned.slots,
                         projection_slots,
                     },
+                    &mut expressions,
+                    functions,
+                    options.constants,
                     work.control(),
                     creation,
                     crate::creation::borrow_scope(&mut temporary),
@@ -1810,7 +1899,6 @@ fn lower_with_creation<
                 )?;
                 source_requirements.push(lowered.requirement);
                 channels.extend(lowered.channels);
-                writer_flows.push(lowered.flow);
                 program_writes.insert(id, recipe);
                 (lowered.kind, lowered.layout)
             }
@@ -1837,7 +1925,7 @@ fn lower_with_creation<
                         }),
                         slots: &planned.slots,
                         statistics_slots,
-                        expressions: &expressions.ids,
+                        expressions: expressions.roots(source)?,
                     },
                     work.control(),
                     creation,
@@ -1939,6 +2027,48 @@ fn lower_with_creation<
     runtime_filters.finish()?;
     let mut root = local_ids[&physical.root()];
     if let Some(projection) = &channels_plan.sink_projection {
+        let branches =
+            channels_plan
+                .unions
+                .get(&physical.root())
+                .ok_or(FragmentCompileError::Invalid(
+                    "router projection sources are absent",
+                ))?;
+        let branch = branches.last().ok_or(FragmentCompileError::Invalid(
+            "router projection source is absent",
+        ))?;
+        let roots = crate::union_flow::compile_branch_reads(
+            package,
+            &mut expressions,
+            functions,
+            options.constants,
+            nodes[root.index()].output_layout(),
+            physical.root(),
+            branch,
+            creation,
+            crate::creation::borrow_scope(&mut temporary),
+            factory,
+            work,
+        )?;
+        if !expressions.union_ids.contains_key(&physical.root()) {
+            crate::creation::before_tree_insert::<
+                NodeId,
+                Vec<Vec<novarocks_local_program::ProgramRootRef>>,
+                H,
+            >(
+                expressions.union_ids.len(),
+                crate::creation::borrow_scope(&mut temporary),
+                work,
+            )?;
+        }
+        let branches = expressions.union_ids.entry(physical.root()).or_default();
+        crate::creation::reserve_vec(
+            branches,
+            1,
+            crate::creation::borrow_scope(&mut temporary),
+            work,
+        )?;
+        branches.push(roots);
         let branch = channels_plan
             .unions
             .get(&physical.root())
@@ -1961,7 +2091,7 @@ fn lower_with_creation<
             work,
             creation,
         )?;
-        for (ordinal, (source, definition)) in branch.sources.iter().zip(definitions).enumerate() {
+        for (ordinal, source) in branch.sources.iter().enumerate() {
             let source_ordinal = match source.input.source {
                 ProgramChannelSite::Layout {
                     node,
@@ -1991,13 +2121,6 @@ fn lower_with_creation<
                 },
                 source.ty.clone_observed(|| work.step())?,
             ));
-            union_roots.push(crate::union_flow::UnionRoot {
-                node: projection.node,
-                ordinal: u32::try_from(ordinal)
-                    .map_err(|_| CompileControlError::ResourceExhausted)?,
-                definition: *definition,
-                source: source.input.source,
-            });
             work.step()?;
         }
         let layout = typed.finish_with_creation(&projection.slots, work, creation)?;
@@ -2047,7 +2170,7 @@ fn lower_with_creation<
         options.kernel_abi,
     );
     let mut requirement_entries = source_requirements;
-    let (sink, stream) = match stream_cut {
+    let (sink, _) = match stream_cut {
         Some(cut) => {
             work.flush()?;
             let lowered = lower_stream_sink_with_creation(
@@ -2055,13 +2178,16 @@ fn lower_with_creation<
                 cut,
                 root,
                 root_layout,
+                &mut expressions,
+                functions,
+                options.constants,
                 work.control(),
                 creation,
                 crate::creation::borrow_scope(&mut temporary),
                 factory,
             )?;
             requirement_entries.extend(lowered.requirements);
-            (lowered.sink, Some(lowered.flow))
+            (lowered.sink, ())
         }
         None if is_router => {
             let projection = channels_plan
@@ -2072,6 +2198,9 @@ fn lower_with_creation<
                 package,
                 root,
                 root_layout,
+                &mut expressions,
+                functions,
+                options.constants,
                 &projection.route_slots,
                 work.control(),
                 creation,
@@ -2079,7 +2208,7 @@ fn lower_with_creation<
                 factory,
             )?;
             requirement_entries.extend(lowered.requirements);
-            (lowered.sink, Some(lowered.flow))
+            (lowered.sink, ())
         }
         None => {
             // The published layout's names are the result's: the frontend
@@ -2142,7 +2271,7 @@ fn lower_with_creation<
                     .into());
                 }
             };
-            (sink, None)
+            (sink, ())
         }
     };
     work.flush()?;
@@ -2159,462 +2288,26 @@ fn lower_with_creation<
     let requirements =
         BindingRequirements::try_new_for_compile(requirement_entries, work.control())?;
     work.flush()?;
+    let tokens = crate::expressions::prepare_calls_with_aggregates(
+        package,
+        &expressions,
+        functions,
+        &local_nodes,
+        work,
+        factory.map(|factory| (factory, &options.constants)),
+        crate::creation::borrow_scope(&mut temporary),
+    )?;
+    let units = expressions.finish(crate::creation::borrow_scope(&mut temporary), work)?;
     let graph = LocalProgramGraph::try_new_with_outputs_for_compile(
         nodes,
         root,
-        expressions.arena.clone(),
+        &units,
         profile,
         requirements,
         Some(sink),
         summaries,
         work.control(),
     )?;
-    // A materialized constant Values cell is backing, not a runtime root.
-    // Retire only those constant-cell source occurrences; every dynamic cell
-    // keeps its root and argument uses as a ValuesCell root.
-    let mut retired = retired_values_uses(package, &expressions, work)?;
-    // A window call occurrence and its frame offsets leave the flow; its
-    // argument uses are re-rooted on the Analytic node.
-    let window_roots = crate::window::window_roots(package, &local_ids, work)?;
-    retired.extend(window_roots.retired.iter().copied());
-    // Argument backing and published maps belong to one actual Main flow
-    // lifetime, separate from package construction and validation scratch.
-    let mut main_flow_scope = match factory {
-        Some(f) => {
-            work.flush()?;
-            Some(
-                f.begin_scope()
-                    .map_err(crate::FragmentCreationError::Creator)?,
-            )
-        }
-        None => None,
-    };
-    let mut domains = Vec::new();
-    for domain in package.expression_uses().flow().domains().values() {
-        work.step()?;
-        crate::creation::before_vec_push(
-            &domains,
-            crate::creation::borrow_scope(&mut temporary),
-            work,
-        )?;
-        domains.push(*domain);
-    }
-    let mut uses = Vec::new();
-    for invocation in package.expression_uses().flow().uses().values() {
-        work.step()?;
-        if retired.contains(&invocation.context.use_id) {
-            continue;
-        }
-        let definition =
-            *expressions
-                .ids
-                .get(&invocation.definition)
-                .ok_or(FragmentCompileError::Invalid(
-                    "missing invocation definition",
-                ))?;
-        let mut arguments = Vec::new();
-        for argument in &invocation.arguments {
-            work.step()?;
-            if let Some(scope) = main_flow_scope.as_mut() {
-                crate::creation::before_vec_push(&arguments, Some(scope), work)?;
-            }
-            arguments.push(*argument);
-        }
-        crate::creation::before_vec_push(
-            &uses,
-            crate::creation::borrow_scope(&mut temporary),
-            work,
-        )?;
-        uses.push(ProgramExpressionUse {
-            context: invocation.context,
-            definition,
-            control: invocation.control,
-            arguments: {
-                if arguments.capacity()!=arguments.len() && !arguments.is_empty()
-                    && let Some(scope)=main_flow_scope.as_mut() {
-                        crate::creation::request(std::alloc::Layout::array::<novarocks_type_contract::ExpressionUseId>(arguments.len()).map_err(|_| novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic)?,scope,work)?;
-                    }
-                arguments.into_boxed_slice()
-            },
-        });
-    }
-    let mut roots = Vec::new();
-    let mut union_slot_bindings = Vec::new();
-    let minted = crate::union_flow::package_use_ids(package, work)?;
-    work.flush()?;
-    match factory {
-        Some(_) => {
-            crate::union_flow::append_union_roots_with_creator(
-                &union_roots,
-                &minted,
-                &mut domains,
-                &mut uses,
-                &mut roots,
-                &mut union_slot_bindings,
-                crate::creation::borrow_scope(&mut temporary)
-                    .expect("strong entry supplies temporary scope"),
-                work.control(),
-            )?;
-        }
-        None => {
-            crate::union_flow::append_union_roots(
-                &union_roots,
-                &minted,
-                &mut domains,
-                &mut uses,
-                &mut roots,
-                &mut union_slot_bindings,
-                work.control(),
-            )?;
-        }
-    }
-
-    work.flush()?;
-    match factory {
-        Some(_) => {
-            crate::union_flow::append_union_roots_with_creator(
-                &filter_roots,
-                &minted,
-                &mut domains,
-                &mut uses,
-                &mut roots,
-                &mut union_slot_bindings,
-                crate::creation::borrow_scope(&mut temporary)
-                    .expect("strong entry supplies temporary scope"),
-                work.control(),
-            )?;
-        }
-        None => {
-            crate::union_flow::append_union_roots(
-                &filter_roots,
-                &minted,
-                &mut domains,
-                &mut uses,
-                &mut roots,
-                &mut union_slot_bindings,
-                work.control(),
-            )?;
-        }
-    }
-
-    for (site, use_id) in package.expression_uses().bindings() {
-        work.step()?;
-        if retired.contains(use_id) {
-            continue;
-        }
-        // A join's roots belong to its join node, never to its selection,
-        // with each key oriented to its local probe or build side.
-        if let Some(join) = channels_plan.joins.get(&site.node) {
-            let (role, _) = crate::join::root_role(join, site.role)?;
-            crate::creation::before_vec_push(
-                &roots,
-                crate::creation::borrow_scope(&mut temporary),
-                work,
-            )?;
-            roots.push(ProgramRootUseBinding {
-                site: ProgramExpressionRootSite::Node {
-                    node: join.join,
-                    role,
-                },
-                use_id: *use_id,
-            });
-            continue;
-        }
-        if let Some(root) = crate::generate_series::argument_root(
-            &channels_plan.series,
-            site.node,
-            site.role,
-            *use_id,
-        )? {
-            crate::creation::before_vec_push(
-                &roots,
-                crate::creation::borrow_scope(&mut temporary),
-                work,
-            )?;
-            roots.push(root);
-            continue;
-        }
-        // A table function's argument roots belong to its argument Project.
-        if let ExpressionRootRole::TableFunctionArgument { argument } = site.role {
-            crate::creation::before_vec_push(
-                &roots,
-                crate::creation::borrow_scope(&mut temporary),
-                work,
-            )?;
-            roots.push(crate::table_function::argument_root(
-                &channels_plan.table_functions,
-                site.node,
-                argument,
-                *use_id,
-            )?);
-            continue;
-        }
-        let node = *local_ids
-            .get(&site.node)
-            .ok_or(FragmentCompileError::Invalid("missing root node"))?;
-        let role = match site.role {
-            ExpressionRootRole::ChangePredicate { event } => {
-                ProgramNodeExpressionRole::ChangePredicate { event }
-            }
-            ExpressionRootRole::ChangeAssignment { event, assignment } => {
-                ProgramNodeExpressionRole::ChangeAssignment { event, assignment }
-            }
-            ExpressionRootRole::UnpivotConstant { mapping, constant } => {
-                ProgramNodeExpressionRole::UnpivotConstant { mapping, constant }
-            }
-            // A grouped Unpivot keeps the frozen mapping order, so a mapping
-            // ordinal names the same mapping on both sides.
-            ExpressionRootRole::FinishUnpivotConstant { mapping, constant } => {
-                ProgramNodeExpressionRole::FinishUnpivotConstant { mapping, constant }
-            }
-            ExpressionRootRole::FilterPredicate { predicate } => {
-                ProgramNodeExpressionRole::FilterPredicate { predicate }
-            }
-            ExpressionRootRole::ScanResidual { predicate } => {
-                ProgramNodeExpressionRole::ScanResidual { predicate }
-            }
-            ExpressionRootRole::SortOrder { key } => ProgramNodeExpressionRole::SortOrder { key },
-            ExpressionRootRole::SortPartition { key } => {
-                ProgramNodeExpressionRole::SortPartition { key }
-            }
-            ExpressionRootRole::WindowPartition { key } => {
-                ProgramNodeExpressionRole::WindowPartition { key }
-            }
-            ExpressionRootRole::WindowOrder { key } => {
-                ProgramNodeExpressionRole::WindowOrder { key }
-            }
-            ExpressionRootRole::TopNOrder { key } => match &physical.nodes()[&site.node].kind {
-                NodeKind::TopN {
-                    reduction: novarocks_physical_plan::TopNReduction::GroupedStates { .. },
-                    ..
-                } => ProgramNodeExpressionRole::TopNOrder { key },
-                _ => ProgramNodeExpressionRole::SortOrder { key },
-            },
-            ExpressionRootRole::TopNGroup { group } => {
-                ProgramNodeExpressionRole::TopNGroup { group }
-            }
-            ExpressionRootRole::TopNStateArgument { call, argument } => {
-                ProgramNodeExpressionRole::TopNStateArgument { call, argument }
-            }
-            ExpressionRootRole::ProjectOutput { expression } => {
-                ProgramNodeExpressionRole::ProjectOutput { expression }
-            }
-            ExpressionRootRole::ValuesCell { row, column } => {
-                ProgramNodeExpressionRole::ValuesCell { row, column }
-            }
-            ExpressionRootRole::AggregateGroup { group } => {
-                ProgramNodeExpressionRole::AggregateGroup { group }
-            }
-            ExpressionRootRole::AggregateArgument { call, argument } => {
-                ProgramNodeExpressionRole::AggregateInput { call, argument }
-            }
-            // Function ORDER channels follow the call's logical arguments.
-            ExpressionRootRole::AggregateOrder { call, key } => {
-                let NodeKind::Aggregate { calls, .. } = &physical.nodes()[&site.node].kind else {
-                    return Err((FragmentCompileError::Invalid(
-                        "aggregate order root outside an Aggregate",
-                    ))
-                    .into());
-                };
-                let logical = calls
-                    .get(call as usize)
-                    .ok_or(FragmentCompileError::Invalid(
-                        "missing aggregate order call",
-                    ))?
-                    .arguments
-                    .len();
-                let argument = u32::try_from(logical)
-                    .ok()
-                    .and_then(|logical| logical.checked_add(key))
-                    .ok_or(FragmentCompileError::Invalid(
-                        "aggregate order channel exhausted",
-                    ))?;
-                ProgramNodeExpressionRole::AggregateInput { call, argument }
-            }
-            _ => {
-                return Err((FragmentCompileError::Unsupported {
-                    node: Some(site.node),
-                    feature: "expression root role",
-                })
-                .into());
-            }
-        };
-        crate::creation::before_vec_push(
-            &roots,
-            crate::creation::borrow_scope(&mut temporary),
-            work,
-        )?;
-        roots.push(ProgramRootUseBinding {
-            site: ProgramExpressionRootSite::Node { node, role },
-            use_id: *use_id,
-        });
-    }
-    crate::creation::reserve_vec(
-        &mut roots,
-        window_roots.inputs.len(),
-        crate::creation::borrow_scope(&mut temporary),
-        work,
-    )?;
-    roots.extend(window_roots.inputs);
-    work.flush()?;
-    let flow = match main_flow_scope.as_mut() {
-        Some(retained) => ProgramControlFlow::try_new_with_creator_in(
-            domains,
-            uses,
-            expressions.arena.nodes().len(),
-            crate::creation::borrow_scope(&mut temporary)
-                .expect("strong entry supplies temporary scope"),
-            retained,
-            work.control(),
-        )?,
-        None => ProgramControlFlow::try_new(
-            domains,
-            uses,
-            expressions.arena.nodes().len(),
-            work.control(),
-        )?,
-    };
-    crate::creation::before_tree_insert::<ProgramExpressionArena, ProgramControlFlow, H>(
-        0,
-        crate::creation::borrow_scope(&mut temporary),
-        work,
-    )?;
-    let mut flows = BTreeMap::from([(ProgramExpressionArena::Main, flow)]);
-    crate::creation::before_tree_insert::<
-        ProgramExpressionArena,
-        novarocks_type_contract::FunctionArgumentTypes,
-        H,
-    >(0, crate::creation::borrow_scope(&mut temporary), work)?;
-    let mut types = BTreeMap::from([(ProgramExpressionArena::Main, expressions.types)]);
-    let mut sink_slot_bindings = Vec::new();
-    // A stream sink always owns a Sink arena, so its flow and types are
-    // supplied even when the arena is empty (Gather and Broadcast).
-    if let Some(stream) = stream {
-        crate::creation::reserve_vec(
-            &mut roots,
-            stream.roots.len(),
-            crate::creation::borrow_scope(&mut temporary),
-            work,
-        )?;
-        roots.extend(stream.roots);
-        crate::creation::before_tree_insert::<ProgramExpressionArena, ProgramControlFlow, H>(
-            flows.len(),
-            crate::creation::borrow_scope(&mut temporary),
-            work,
-        )?;
-        flows.insert(ProgramExpressionArena::Sink, stream.flow);
-        crate::creation::before_tree_insert::<
-            ProgramExpressionArena,
-            novarocks_type_contract::FunctionArgumentTypes,
-            H,
-        >(
-            types.len(),
-            crate::creation::borrow_scope(&mut temporary),
-            work,
-        )?;
-        types.insert(ProgramExpressionArena::Sink, stream.types);
-        sink_slot_bindings = stream.slots;
-    }
-    // Each writer owns its WriterProjection arena with its own flow, types,
-    // roots and input occurrences.
-    for writer in writer_flows {
-        crate::creation::reserve_vec(
-            &mut roots,
-            writer.roots.len(),
-            crate::creation::borrow_scope(&mut temporary),
-            work,
-        )?;
-        roots.extend(writer.roots);
-        crate::assert_rows::reserve_vec(&mut sink_slot_bindings, writer.slots.len(), work)?;
-        sink_slot_bindings.extend(writer.slots);
-        crate::creation::before_tree_insert::<ProgramExpressionArena, ProgramControlFlow, H>(
-            flows.len(),
-            crate::creation::borrow_scope(&mut temporary),
-            work,
-        )?;
-        flows.insert(writer.arena, writer.flow);
-        crate::creation::before_tree_insert::<
-            ProgramExpressionArena,
-            novarocks_type_contract::FunctionArgumentTypes,
-            H,
-        >(
-            types.len(),
-            crate::creation::borrow_scope(&mut temporary),
-            work,
-        )?;
-        types.insert(writer.arena, writer.types);
-    }
-    let channels = match factory {
-        Some(f) => attach_typed_root_channels_with_factory_in(
-            graph,
-            flows,
-            roots,
-            tokens,
-            types,
-            channels,
-            crate::creation::borrow_scope(&mut temporary)
-                .expect("strong entry supplies temporary scope"),
-            f,
-            work,
-        )?,
-        None => attach_typed_root_channels_created_in(
-            graph, flows, roots, tokens, types, channels, work,
-        )
-        .map_err(FragmentCompileError::from)?,
-    };
-    work.flush()?;
-    let mut slot_bindings = union_slot_bindings;
-    if !sink_slot_bindings.is_empty() {
-        crate::assert_rows::reserve_vec(&mut slot_bindings, sink_slot_bindings.len(), work)?;
-        slot_bindings.extend(sink_slot_bindings);
-    }
-    // A join-owned read takes the layout its own root reads: a key root its
-    // side, a residual or nested-loop predicate the join scope.
-    work.flush()?;
-    let join_uses = crate::join::join_use_roles(package, &channels_plan.joins, work.control())?;
-    work.flush()?;
-    for invocation in package.expression_uses().flow().uses().values() {
-        work.step()?;
-        if let Some(input) = channels_plan.inputs.get(&invocation.definition) {
-            let source = match channels_plan.join_values.get(&invocation.definition) {
-                Some(value) => {
-                    let (join, role) = *join_uses.get(&invocation.context.use_id).ok_or(
-                        FragmentCompileError::Invalid("join value read outside its join's roots"),
-                    )?;
-                    value.for_root(join, role)?
-                }
-                None => input.source,
-            };
-            slot_bindings.push(ProgramSlotBinding {
-                occurrence: ProgramUseRef {
-                    arena: ProgramExpressionArena::Main,
-                    use_id: invocation.context.use_id,
-                },
-                source: ProgramLexicalSource::Input(source),
-            });
-        }
-    }
-    work.flush()?;
-    let lexical = match factory {
-        Some(factory) => {
-            let mut retained = factory
-                .begin_scope()
-                .map_err(crate::creation::FragmentCreationError::Creator)?;
-            ProgramLexicalBindings::try_new_with_creator_in(
-                channels,
-                vec![],
-                slot_bindings,
-                // This compiler authors no Lambda capture allocation.
-                novarocks_type_contract::ValueTypeStorageLifetime::pure(),
-                crate::creation::borrow_scope(&mut temporary)
-                    .expect("strong entry supplies the real temporary scope"),
-                &mut retained,
-                work.control(),
-            )?
-        }
-        None => ProgramLexicalBindings::try_new(channels, vec![], slot_bindings, work.control())?,
-    };
-    work.flush()?;
     let facts = CompiledProgramFacts {
         writes: program_writes,
         exchange_inputs,
@@ -2623,19 +2316,125 @@ fn lower_with_creation<
     };
     match factory {
         Some(factory) => LocalProgram::try_new_with_creator_in(
-            lexical,
+            graph,
+            units,
+            tokens,
+            channels,
             operators,
             &allowed,
             facts,
             crate::creation::borrow_scope(&mut temporary)
-                .expect("strong entry supplies the real temporary scope"),
+                .expect("strong entry supplies the original temporary scope"),
             factory,
             work.control(),
         )
         .map_err(Into::into),
-        None => LocalProgram::try_new(lexical, operators, &allowed, facts, work.control())
-            .map_err(Into::into),
+        None => LocalProgram::try_new(
+            graph,
+            units,
+            tokens,
+            channels,
+            operators,
+            &allowed,
+            facts,
+            work.control(),
+        )
+        .map_err(Into::into),
     }
+}
+
+fn lower_write_layout_key<H>(
+    package: &novarocks_physical_plan::FragmentPackage,
+    node: &novarocks_physical_plan::PhysicalNode,
+    (key_inputs, output_key): (
+        &[novarocks_physical_plan::ValueId],
+        novarocks_physical_plan::ValueId,
+    ),
+    input: ProgramNodeId,
+    input_layout: &novarocks_local_program::StaticLayout,
+    slots: &[novarocks_types::SlotId],
+    recipe: novarocks_connector_contract::ConnectorWriteLayoutRecipe,
+    work: &mut CompileCheckpoints<'_>,
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+) -> Result<(ProgramNodeKind, novarocks_local_program::StaticLayout), crate::FragmentCreationError<H>>
+{
+    use novarocks_physical_plan::ValueId;
+    let fragment = package.fragment();
+    let child = &fragment.nodes()[&node.inputs[0]];
+    let local_slot = |value: ValueId, work: &mut CompileCheckpoints<'_>| {
+        for (ordinal, candidate) in child.output.columns.iter().enumerate() {
+            work.step()?;
+            if *candidate == value {
+                return Ok(input_layout.slots()[ordinal]);
+            }
+        }
+        Err(FragmentCompileError::Invalid(
+            "layout key reads outside its input",
+        ))
+    };
+    let mut key_slots = Vec::new();
+    crate::assert_rows::reserve_vec(&mut key_slots, key_inputs.len(), work)?;
+    for value in key_inputs {
+        key_slots.push(local_slot(*value, work)?);
+    }
+    let cut = package.cuts().outbound.iter().find(|cut| {
+        matches!(cut.partitioning.routing_only.as_ref(), [(key, _)] if *key == output_key)
+    }).ok_or(FragmentCompileError::Invalid("layout key lacks its exact output edge"))?;
+    let (branch, effects) = match fragment.sink() {
+        FragmentSink::Stream { edge } if *edge == cut.edge => (0, None),
+        FragmentSink::Router { effect, routes } => {
+            let (branch, route) = routes
+                .iter()
+                .enumerate()
+                .find(|(_, route)| route.edge == cut.edge)
+                .ok_or(FragmentCompileError::Invalid(
+                    "layout key lacks the router branch",
+                ))?;
+            // The original ChangeEventExpand produces one effect per page.
+            if !matches!(child.kind, NodeKind::ChangeEventExpand { effect_output: value, .. } if value == *effect)
+            {
+                return Err(FragmentCompileError::Unsupported {
+                    node: Some(node.id),
+                    feature: "write layout router input other than its original change-event expansion",
+                }.into());
+            }
+            (
+                branch,
+                Some(novarocks_local_program::ProgramWriteLayoutEffects {
+                    slot: local_slot(*effect, work)?,
+                    accepted: Arc::from(route.accepted_effects.clone()),
+                }),
+            )
+        }
+        _ => return Err(FragmentCompileError::Invalid("layout key has an invalid sink").into()),
+    };
+    let mut layout =
+        crate::typed_layout::TypedLayoutBuilder::new_with_creation(slots.len(), work, creation)?;
+    for (ordinal, value) in node.output.columns.iter().enumerate() {
+        let name = if ordinal < input_layout.slots().len() {
+            crate::typed_layout::copy_name_with_creation(
+                input_layout.schema().field(ordinal).name(),
+                work,
+                creation,
+            )?
+        } else {
+            crate::typed_layout::copy_name_with_creation("write_layout_key", work, creation)?
+        };
+        layout.push_with_creation(&fragment.values()[value].ty, name, work, creation)?;
+    }
+    Ok((
+        ProgramNodeKind::WriteLayoutKey {
+            input,
+            key_inputs: key_slots.into_boxed_slice(),
+            output_key: *slots
+                .last()
+                .ok_or(FragmentCompileError::Invalid("missing layout key slot"))?,
+            recipe,
+            branch,
+            effects,
+        },
+        layout.finish_with_creation(slots, work, creation)?,
+    ))
 }
 
 fn lower_position_shard<H>(
@@ -2722,8 +2521,8 @@ fn lower_position_shard<H>(
 fn unsupported_node_shape(kind: &NodeKind) -> &'static str {
     match kind {
         NodeKind::Filter { .. } => "filter with other than one predicate or input",
-        NodeKind::Sort { .. } => "sort mode without a local owner",
-        NodeKind::TopN { .. } => "grouped-state TopN reduction",
+        NodeKind::Sort { .. } => "sort with other than one input",
+        NodeKind::TopN { .. } => "TopN with other than one input",
         NodeKind::SetOp { .. } => "INTERSECT or EXCEPT set operation",
         NodeKind::GenerateSeries { .. } => "generate_series source",
         NodeKind::PositionShard(_) => "position shard aggregation",
@@ -2783,19 +2582,27 @@ pub fn compile_fragment_with_project_metadata_host<P: ProjectMetadataScope>(
     })
 }
 
+impl From<novarocks_constant_contract::ConstantTableError> for FragmentCompileError {
+    fn from(error: novarocks_constant_contract::ConstantTableError) -> Self {
+        Self::from(novarocks_physical_plan::ConstantReferenceError::from(error))
+    }
+}
+
 #[cfg(test)]
 mod capability_admission_tests {
     use super::*;
+    use novarocks_expression_contract::ExprId;
     use novarocks_functions::{
         FunctionBindingError, FunctionOverloadId, FunctionSpecializationFailure,
     };
-    use novarocks_physical_plan::ExprId;
 
     #[test]
     fn capability_identity_survives_private_expression_ownership() {
         let overload = FunctionOverloadId::try_new("fixture/missing/pure-v1").unwrap();
         for error in [
-            ExpressionLoweringError::UnsupportedExpression(ExprId::new(7)),
+            ExpressionLoweringError::from(
+                novarocks_expression::ExprCompileError::UnsupportedExpression(ExprId::new(7)),
+            ),
             ExpressionLoweringError::Binding(FunctionBindingError::UnavailableImplementation(
                 overload.clone(),
             )),

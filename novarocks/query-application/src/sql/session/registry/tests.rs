@@ -340,6 +340,9 @@ fn identity(catalog: &str, generation: u64) -> CatalogPropertyIdentity {
     let instance_id = ConnectorInstanceId::parse(catalog).unwrap();
     CatalogPropertyIdentity {
         attachment_id: uuid::Uuid::from_u128(u128::from(generation)),
+        control_runtime_id: novarocks_spi::connector::ConnectorControlRuntimeId::from_bytes(
+            u128::from(generation).to_be_bytes(),
+        ),
         binding_key: ConnectorProviderBindingKey {
             instance_id: instance_id.clone(),
             incarnation: ProviderBindingEpoch::from_bytes(u128::from(generation).to_be_bytes()),
@@ -448,6 +451,15 @@ fn same_provider_catalog_defaults_and_overrides_are_instance_bound() {
         )
         .unwrap();
     assert_eq!(inputs.read_catalog_override(&recreated, "limit"), None);
+    assert_eq!(
+        inputs.connector_catalog_overrides("first", first.identity().unwrap().control_runtime_id)["limit"],
+        novarocks_spi::connector::read_stack::SessionPropertyValue::Integer(7),
+    );
+    assert!(
+        inputs
+            .connector_catalog_overrides("first", recreated.identity().unwrap().control_runtime_id)
+            .is_empty()
+    );
     assert_eq!(inputs.raw_catalog_value("first", "limit"), Some("7"));
     let metadata = registry
         .visible_metadata(&inputs, &[Arc::new(recreated)])
@@ -758,6 +770,49 @@ fn checked_sql_constants_reject_actual_null_and_nominal_lookalikes() {
             &ConstantControl(None)
         ),
         Err(SessionPropertyError::InvalidValue { .. })
+    ));
+}
+
+#[test]
+fn catalog_sql_constant_keeps_the_bound_generation_and_qualified_errors() {
+    use arrow::{array::Int32Array, datatypes::DataType};
+    use novarocks_type_contract::FunctionValueType;
+
+    let registry = catalog_registry();
+    let catalog = registry
+        .bind_catalog(
+            "first",
+            identity("first", 1),
+            &[("default".into(), "4".into())],
+        )
+        .unwrap();
+    let pool = constant_pool(
+        Arc::new(Int32Array::from(vec![7, -1])),
+        FunctionValueType::new(DataType::Int32, false),
+    );
+    let property = catalog
+        .lookup_sql("LIMIT")
+        .unwrap()
+        .validate_value(&pool.value(0).unwrap(), &ConstantControl(None))
+        .unwrap();
+    assert_eq!(property.qualified_name(), "first.limit");
+    assert_eq!(
+        property.scope(),
+        &SessionPropertyScope::Catalog {
+            catalog: "first".into(),
+            identity: catalog.identity().cloned(),
+        }
+    );
+    assert_eq!(property.value(), &SessionPropertyValue::Integer(7));
+    assert!(property.constant_source().is_some());
+    let invalid = catalog
+        .lookup_sql("limit")
+        .unwrap()
+        .validate_value(&pool.value(1).unwrap(), &ConstantControl(None))
+        .unwrap_err();
+    assert!(matches!(
+        invalid,
+        SessionPropertyError::InvalidValue { name, .. } if name == "first.limit"
     ));
 }
 

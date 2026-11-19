@@ -40,7 +40,9 @@
 //!   branch when it repacks position deletes.
 
 use crate::commit::model::EntryIdentity;
+use novarocks_connector_contract::ConnectorWriteBinding;
 use novarocks_spi::connector::write_stack::ConnectorManagedPublicationShape;
+use novarocks_spi::connector::write_stack::ConnectorWriteLayoutPreference;
 use novarocks_spi::connector::write_stack::session::ConnectorWriteRouteFacts;
 use novarocks_spi::connector::{
     ConnectorDistributedRewriteShape, ConnectorError, ConnectorErrorKind,
@@ -82,6 +84,9 @@ fn unsupported(message: impl Into<String>) -> ConnectorError {
 pub(crate) struct IcebergSessionMaterial {
     /// The exact table generation the session is frozen against.
     pub table: IcebergWriteTableFacts,
+    pub write_binding: ConnectorWriteBinding,
+    /// The writer's spec may be newly prepared for a managed repartition.
+    pub write_partition_spec_id: i32,
     /// The provider-signed input shape the caller's fields were bound into.
     pub input: ConnectorWriteInputShape,
     /// The physical output every data branch writes.
@@ -114,6 +119,37 @@ impl IcebergSessionMaterial {
         })
     }
 
+    fn partition_layout(
+        &self,
+        consumed: &[&ConnectorWriteFieldBinding],
+    ) -> Result<Option<ConnectorWriteLayoutPreference>, ConnectorError> {
+        crate::commit::partition_key::partition_layout(
+            &self.write_binding,
+            self.write_partition_spec_id,
+            &self.data_recipe,
+            consumed,
+        )
+    }
+
+    fn plain_data_route(
+        &self,
+        flavor: IcebergWriteFlavor,
+    ) -> Result<Option<ConnectorWriteRouteFacts>, ConnectorError> {
+        let fields = self.input.fields();
+        let Some(layout) = self.partition_layout(&fields)? else {
+            return Ok(None);
+        };
+        let route = route_facts(
+            &self.table,
+            RouteKey::new(flavor, IcebergWriteBranch::Data, 0),
+            vec![ConnectorRowMutationEffect::Insert],
+            &InputOrdinals::of(&self.input),
+            fields.into_iter(),
+            layout,
+        )?;
+        Ok(Some(route))
+    }
+
     fn delete_plan(
         &self,
         branch: IcebergWriteBranch,
@@ -133,7 +169,9 @@ impl IcebergSessionMaterial {
             output: IcebergWriterOutput::try_new(
                 delete_branch_format(branch)?,
                 parquet::basic::Compression::SNAPPY,
-                None,
+                self.data_output.parquet_row_group_size_bytes(),
+                self.data_output.target_file_size_bytes(),
+                self.data_output.max_partitions_per_writer(),
             )?,
             position_rewrite,
             input,
@@ -169,7 +207,7 @@ pub(crate) struct IcebergSessionFlavorPlan {
     pub branches: Vec<IcebergWriteBranchPlan>,
 }
 
-/// Plan one unrouted data or equality-delete target.
+/// Plan one data or equality-delete target.
 pub(crate) fn plan_ordinary_branches(
     flavor: IcebergWriteFlavor,
     material: &IcebergSessionMaterial,
@@ -190,7 +228,7 @@ pub(crate) fn plan_ordinary_branches(
     }
     let branches = vec![IcebergWriteBranchPlan::Data {
         plan: material.data_plan(material.input.clone())?,
-        route: None,
+        route: material.plain_data_route(flavor)?,
     }];
     Ok(IcebergSessionFlavorPlan {
         flavor,
@@ -221,7 +259,9 @@ fn plan_equality_delete_branches(
                 output: IcebergWriterOutput::try_new(
                     IcebergFileFormat::Parquet,
                     parquet::basic::Compression::SNAPPY,
-                    None,
+                    material.data_output.parquet_row_group_size_bytes(),
+                    material.data_output.target_file_size_bytes(),
+                    material.data_output.max_partitions_per_writer(),
                 )?,
                 recipe,
                 input: material.input.clone(),
@@ -270,7 +310,7 @@ fn plan_publication_branch_list(
             }
             vec![IcebergWriteBranchPlan::Data {
                 plan: material.data_plan(material.input.clone())?,
-                route: None,
+                route: material.plain_data_route(IcebergWriteFlavor::ManagedPublication)?,
             }]
         }
         ConnectorManagedPublicationShape::InsertOnlyChangeStream => {
@@ -303,7 +343,9 @@ fn plan_publication_branch_list(
                 vec![ConnectorRowMutationEffect::Insert],
                 &ordinals,
                 data_fields.iter().copied(),
-                &[],
+                material
+                    .partition_layout(&data_fields)?
+                    .unwrap_or(ConnectorWriteLayoutPreference::None),
             )?;
             vec![IcebergWriteBranchPlan::Data {
                 plan: material.data_plan(material.input.clone())?,
@@ -533,9 +575,9 @@ pub(crate) fn plan_row_mutation_branches(
                     field.field().name()
                         == crate::typed_read::schema_binding::mutation_partition::SPEC_NAME
                 }) {
-                    &[]
+                    ConnectorWriteLayoutPreference::None
                 } else {
-                    partition_source_fields
+                    cluster_layout(partition_source_fields)
                 },
             )?;
             Ok(IcebergSessionFlavorPlan {
@@ -606,7 +648,9 @@ fn plan_merge_on_read_branches(
         ],
         ordinals,
         data_fields.iter(),
-        &[],
+        material
+            .partition_layout(&data_fields.iter().collect::<Vec<_>>())?
+            .unwrap_or(ConnectorWriteLayoutPreference::None),
     )?;
     // Every change event that touches one old data file has to reach one
     // physical delete writer: Iceberg permits a single deletion vector per data
@@ -641,7 +685,7 @@ fn plan_merge_on_read_branches(
         ],
         ordinals,
         row_identity_fields.iter(),
-        std::slice::from_ref(&file_identity),
+        cluster_layout(std::slice::from_ref(&file_identity)),
     )?;
     Ok(IcebergSessionFlavorPlan {
         flavor,
@@ -739,6 +783,19 @@ impl RouteKey {
     }
 }
 
+fn cluster_layout(fields: &[ConnectorWriteFieldBinding]) -> ConnectorWriteLayoutPreference {
+    if fields.is_empty() {
+        ConnectorWriteLayoutPreference::None
+    } else {
+        ConnectorWriteLayoutPreference::ClusterBy(
+            fields
+                .iter()
+                .map(ConnectorWriteFieldBinding::token)
+                .collect(),
+        )
+    }
+}
+
 /// Derive one branch's routing facts.
 fn route_facts<'a>(
     table: &IcebergWriteTableFacts,
@@ -746,7 +803,7 @@ fn route_facts<'a>(
     accepted_effects: Vec<ConnectorRowMutationEffect>,
     ordinals: &InputOrdinals,
     consumed: impl Iterator<Item = &'a ConnectorWriteFieldBinding>,
-    partition_source_fields: &[ConnectorWriteFieldBinding],
+    layout: ConnectorWriteLayoutPreference,
 ) -> Result<ConnectorWriteRouteFacts, ConnectorError> {
     let consumed = consumed.collect::<Vec<_>>();
     let input_ordinals = consumed
@@ -759,7 +816,7 @@ fn route_facts<'a>(
         })
         .collect::<Result<Vec<_>, _>>()?;
     use novarocks_spi::connector::write_stack::{
-        ConnectorWriteColocation, ConnectorWriteLayoutPreference, ConnectorWriteRouteRequirements,
+        ConnectorWriteColocation, ConnectorWriteRouteRequirements,
     };
     // Only deletion vectors require one final author per old data file.
     // Table partition values are a layout preference, not an ownership key.
@@ -780,15 +837,6 @@ fn route_facts<'a>(
         IcebergWriteBranch::Data
         | IcebergWriteBranch::PositionDelete
         | IcebergWriteBranch::EqualityDelete => ConnectorWriteColocation::None,
-    };
-    let layout_keys = partition_source_fields
-        .iter()
-        .map(ConnectorWriteFieldBinding::token)
-        .collect::<Vec<_>>();
-    let layout = if layout_keys.is_empty() {
-        ConnectorWriteLayoutPreference::None
-    } else {
-        ConnectorWriteLayoutPreference::ClusterBy(layout_keys)
     };
     ConnectorWriteRouteFacts::try_new(
         key.route_id(table),

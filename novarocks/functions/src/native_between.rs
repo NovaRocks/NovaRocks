@@ -78,7 +78,3 @@ impl PreparedNativeBetweenRecipe {
         ScopedExpressionEffects::pure_value(context)
     }
 }
-
-#[cfg(test)]
-#[path = "native_between_tests.rs"]
-mod tests;

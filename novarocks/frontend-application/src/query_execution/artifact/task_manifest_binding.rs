@@ -537,6 +537,36 @@ impl TaskManifestBinding {
         Self::bind(template, &scheduled, topology)
     }
 
+    /// Bind the finite protocol recipe to the SAME schedule issued by the
+    /// actual QA Native activation. This never invokes the fixture scheduler
+    /// or reconstructs task/participation identities from matching numbers.
+    #[cfg(test)]
+    pub(crate) fn protocol_fixture_with_schedule_for_test(
+        actual: &AttemptSchedule,
+        plan: novarocks_query_application::api::PlanSeal,
+        placements: &crate::query_execution::schedule::SchedulingPlan,
+        edges: &[crate::query_execution::attempt_plan_facts::AttemptEdgeFacts],
+        processes: &BTreeMap<usize, BackendProcessId>,
+        fragments: BTreeMap<
+            FragmentId,
+            std::sync::Arc<crate::native::fragment_encoder::frozen::FragmentArtifact>,
+        >,
+        descriptors: &BTreeMap<usize, novarocks_execution_contract::BackendProcessDescriptor>,
+    ) -> Result<Self, DistributedQueryError> {
+        let (template, topology) = protocol_fixture_material(
+            actual.execution(),
+            plan,
+            placements,
+            edges,
+            processes,
+            fragments,
+            Some(descriptors),
+        )?;
+        let original = Self::bind(template, actual, topology)?;
+        original.validate_schedule(actual)?;
+        Ok(original)
+    }
+
     /// Exercise the real bind rejection with one exact endpoint fact absent.
     #[cfg(test)]
     pub(crate) fn protocol_missing_backend_for_test(
@@ -859,6 +889,15 @@ impl TaskManifestBinding {
 
     pub(crate) const fn topology_revision(&self) -> u64 {
         self.topology_revision
+    }
+
+    pub(crate) fn write_root_targets(
+        &self,
+    ) -> Option<&[novarocks_spi::connector::write_stack::WriteTargetOrdinal]> {
+        self.native_template
+            .template
+            .plan_facts()
+            .write_root_targets()
     }
 
     /// Borrow the existing frozen occurrence list; no per-Task list is cloned.
@@ -1688,6 +1727,66 @@ fn protocol_fixture_inputs(
     ),
     DistributedQueryError,
 > {
+    let seal = novarocks_query_application::api::PlanSeal::Version(
+        novarocks_physical_plan::PlanVersionId::try_new([9; 16])
+            .expect("original protocol fixture version"),
+    );
+    let (template, topology) = protocol_fixture_material(
+        execution,
+        seal,
+        schedule,
+        edges,
+        processes,
+        fragments,
+        descriptors,
+    )?;
+    let explicit = schedule
+        .by_fragment
+        .iter()
+        .map(|(&fragment, placements)| {
+            let backends = placements
+                .iter()
+                .map(|placement| {
+                    processes
+                        .get(&placement.backend_idx)
+                        .copied()
+                        .ok_or_else(|| {
+                            contract_error(format!(
+                                "protocol fixture backend {} lacks its original process",
+                                placement.backend_idx
+                            ))
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok((fragment, backends))
+        })
+        .collect::<Result<BTreeMap<_, _>, DistributedQueryError>>()?;
+    let scheduled = novarocks_query_application::test_support::protocol_fixture_schedule(
+        execution,
+        frontend,
+        &template
+            .template
+            .attempt_scheduling_facts()
+            .map_err(contract_error)?,
+        &explicit,
+    )
+    .map_err(contract_error)?;
+    Ok((template, scheduled, topology))
+}
+
+#[cfg(test)]
+fn protocol_fixture_material(
+    execution: QueryExecutionId,
+    seal: novarocks_query_application::api::PlanSeal,
+    schedule: &crate::query_execution::schedule::SchedulingPlan,
+    edges: &[crate::query_execution::attempt_plan_facts::AttemptEdgeFacts],
+    processes: &BTreeMap<usize, BackendProcessId>,
+    fragments: BTreeMap<
+        FragmentId,
+        std::sync::Arc<crate::native::fragment_encoder::frozen::FragmentArtifact>,
+    >,
+    descriptors: Option<&BTreeMap<usize, novarocks_execution_contract::BackendProcessDescriptor>>,
+) -> Result<(RequestBoundNativeTemplate, FrozenAttemptTopology), DistributedQueryError> {
     use super::native_submission::{
         NativeSubmissionFragmentRole, SubmissionFragmentFacts, SubmissionPlanFacts,
     };
@@ -1735,10 +1834,6 @@ fn protocol_fixture_inputs(
             stream_kind: if edge.partition_kind == AttemptPartitionKind::Unpartitioned { SchedulingStreamKind::Gather } else { SchedulingStreamKind::Partitioned },
         }).collect(),
     };
-    let seal = novarocks_query_application::api::PlanSeal::Version(
-        novarocks_physical_plan::PlanVersionId::try_new([9; 16])
-            .expect("original protocol fixture version"),
-    );
     let native =
         crate::query_execution::native_fragment::NativeFragmentAttachment::for_completed_plan(
             fragments,
@@ -1779,37 +1874,6 @@ fn protocol_fixture_inputs(
         },
         affinity: Arc::new(super::PreparedDistributedAttemptAffinity),
     };
-    let explicit = schedule
-        .by_fragment
-        .iter()
-        .map(|(&fragment, placements)| {
-            let backends = placements
-                .iter()
-                .map(|placement| {
-                    processes
-                        .get(&placement.backend_idx)
-                        .copied()
-                        .ok_or_else(|| {
-                            contract_error(format!(
-                                "protocol fixture backend {} lacks its original process",
-                                placement.backend_idx
-                            ))
-                        })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok((fragment, backends))
-        })
-        .collect::<Result<BTreeMap<_, _>, DistributedQueryError>>()?;
-    let scheduled = novarocks_query_application::test_support::protocol_fixture_schedule(
-        execution,
-        frontend,
-        &template
-            .template
-            .attempt_scheduling_facts()
-            .map_err(contract_error)?,
-        &explicit,
-    )
-    .map_err(contract_error)?;
     let mut placed_endpoints = BTreeMap::new();
     for placement in schedule.by_fragment.values().flatten() {
         if let Some(previous) =
@@ -1876,7 +1940,7 @@ fn protocol_fixture_inputs(
         BackendTopologySnapshot::try_new(91, targets)
             .map_err(|error| contract_error(error.to_string()))?,
     )?;
-    Ok((template, scheduled, topology))
+    Ok((template, topology))
 }
 
 #[cfg(test)]

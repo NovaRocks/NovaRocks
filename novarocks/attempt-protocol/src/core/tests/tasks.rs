@@ -16,6 +16,9 @@
 // under the License.
 
 use super::*;
+mod covered_lifetime;
+mod original_properties;
+use crate::port_output::{AttemptAuthorization, AttemptToLogicalBody};
 use crate::{
     AttemptCore,
     capacity::ReservationToken,
@@ -31,10 +34,7 @@ use crate::{
     },
     split_delivery::{AcceptedPlanNode, SplitDeliverySettlement},
 };
-use novarocks_coordination_contract::{
-    AttemptAuthorization, AttemptAuthorizationDecision, AttemptAuthorizationRef,
-    AttemptToLogicalBody,
-};
+use novarocks_coordination_contract::{AttemptAuthorizationDecision, AttemptAuthorizationRef};
 use novarocks_execution_contract::{
     AdmissionTicketId, CancelReason, CreateTaskReceipt, DomainProgression,
     ExchangeDeliveryRequirement, ExchangeEdgeId, LeaseReceipt, LeaseSequence, LeaseValidFor,
@@ -495,7 +495,7 @@ fn closing_gate_settles_two_unused_establish_guards_on_separate_timer_inputs() {
             activation,
             body: LogicalToAttemptBody::Stop {
                 reason: AttemptStopReason::Client,
-                failure: AttemptFailure::TaskProtocol(Box::new(schedule("original client stop"))),
+                failure: crate::test_support::logical_failure("original client stop"),
             },
         }),
     );
@@ -560,10 +560,9 @@ fn closing_gate_settles_two_unused_establish_guards_on_separate_timer_inputs() {
 
 #[test]
 fn cleanup_settles_unused_establish_and_waits_for_emitted_establish_withdrawal() {
+    use crate::port_output::AttemptToLogical;
     use crate::{input::WithdrawalOutcome, terminal::GatePreparation};
-    use novarocks_coordination_contract::{
-        AttemptConvergenceMode, AttemptIssueSettlement, AttemptToLogical,
-    };
+    use novarocks_coordination_contract::{AttemptConvergenceMode, AttemptIssueSettlement};
 
     let start = start();
     let now = start.initial_now;

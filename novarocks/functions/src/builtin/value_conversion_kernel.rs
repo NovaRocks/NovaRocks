@@ -1036,7 +1036,6 @@ fn check_classes(
 }
 
 #[cfg(test)]
-#[path = "value_conversion_kernel/tests.rs"]
 mod tests;
 
 /// Preserve the actual preparation author's stable Unsupported/Invariant fact

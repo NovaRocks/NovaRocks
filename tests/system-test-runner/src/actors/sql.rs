@@ -83,6 +83,23 @@ impl SqlSession {
             .execute(&mut self.session, sql.as_ref(), self.deadline)
     }
 
+    /// Preserve the ordinary execution contract while exposing received facts.
+    pub(crate) fn execute_observed(
+        &mut self,
+        sql: impl AsRef<str>,
+        mut observe: impl FnMut(&'static str, novarocks_test_trino_client::StatementTrace<'_>),
+    ) -> Result<StatementResult, StatementFailure> {
+        let pending =
+            self.client
+                .submit_observed(&self.session, sql.as_ref(), self.deadline, |trace| {
+                    observe("submit", trace)
+                })?;
+        let (result, effects) =
+            pending.run_observed(self.deadline, |trace| observe("run", trace))?;
+        self.session.apply(&effects);
+        Ok(result)
+    }
+
     /// POST only; the caller can arm this exact query before the first GET.
     pub(crate) fn submit(
         &self,

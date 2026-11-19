@@ -15,10 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 //! Public SQL completion inputs for owner and compile-to-execute tests.
+#[cfg(novarocks_dev_controls)]
 mod catalogue;
 mod source;
 mod support;
 
+#[cfg(novarocks_dev_controls)]
 pub use catalogue::installed_builtin_owner_catalogue;
 pub use source::{
     sql_source, sql_source_with_declared_fields, sql_source_with_semantics,
@@ -26,3 +28,13 @@ pub use source::{
     try_sql_source_with_declared_fields,
 };
 pub use support::{parse_query, sql_fixture_constant_policy};
+
+mod approx_source;
+mod expression_sources;
+mod ndv_source;
+pub use approx_source::approx_sql_source;
+pub use expression_sources::{
+    inspect_inlist_source, inspect_like_source, inspect_ordered_scan_source, ordered_scan_source,
+    signed_inlist_source, unit_definitions,
+};
+pub use ndv_source::{ndv_sql_source, provider_contract, sql_source_with_columns};

@@ -130,6 +130,9 @@ use novarocks_native_trust::{
 };
 use novarocks_task_codec::TransportBudget;
 pub use novarocks_task_codec::TransportMessageLimits;
+pub use novarocks_task_codec::exchange_unit_codec::{
+    grantable_delivery_payload_bytes, max_delivery_non_payload_bytes,
+};
 use novarocks_types::NativeEndpoint;
 use tokio::runtime::Handle;
 
@@ -315,6 +318,7 @@ pub struct BackendDataRuntime {
     handle: Handle,
     native_trust: Arc<NativeTrust>,
     native_transport: BackendNativeTransport,
+    message_limits: TransportMessageLimits,
     channels: native_channel_cache::NativeChannelCache,
     transport_admission: Option<native_transport_admission::NativeTransportAdmission>,
 }
@@ -324,11 +328,13 @@ impl BackendDataRuntime {
         handle: Handle,
         native_trust: Arc<NativeTrust>,
         native_transport: BackendNativeTransport,
+        message_limits: TransportMessageLimits,
     ) -> Self {
         Self {
             handle,
             native_trust,
             native_transport,
+            message_limits,
             channels: native_channel_cache::NativeChannelCache::bounded()
                 .expect("frozen Native channel-cache geometry is finite"),
             transport_admission: None,
@@ -344,6 +350,7 @@ impl BackendDataRuntime {
             handle: self.handle.clone(),
             native_trust: Arc::clone(&self.native_trust),
             native_transport: self.native_transport.clone(),
+            message_limits: self.message_limits,
             channels: native_channel_cache::NativeChannelCache::bounded()?,
             transport_admission: Some(admission),
         })
@@ -397,6 +404,9 @@ impl BackendDataRuntime {
     }
     pub fn native_transport(&self) -> &BackendNativeTransport {
         &self.native_transport
+    }
+    pub fn message_limits(&self) -> TransportMessageLimits {
+        self.message_limits
     }
     pub(crate) fn channels(&self) -> &native_channel_cache::NativeChannelCache {
         &self.channels

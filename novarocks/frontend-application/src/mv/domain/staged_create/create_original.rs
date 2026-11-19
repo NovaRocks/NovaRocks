@@ -79,6 +79,8 @@ pub(crate) struct CreateOriginalInput {
     pub(crate) seed: Arc<MvCreateProjectionSeed>,
     pub(crate) ports: IcebergMvCorePorts,
     pub(crate) planning: ConnectorControlPlanningPin,
+    pub(crate) session_properties:
+        Arc<novarocks_query_application::sql::session::registry::SessionPropertyInputs>,
     pub(crate) operation_id: uuid::Uuid,
     pub(crate) context: ConnectorRequestContext,
     pub(crate) cancellation: QueryCancellationView,
@@ -317,6 +319,7 @@ impl CreateOriginal {
         }
         input.context = input.context.with_io_admission(input.io.clone());
         // All rejection above precedes installing any management or Provider work.
+        let empty = EmptyCreateWrite::new(Arc::clone(&input.session_properties));
         Ok(Arc::new(Self {
             state: Arc::new(State {
                 body: Mutex::new(Some(Box::new(Body {
@@ -335,7 +338,7 @@ impl CreateOriginal {
                     stage_result: None,
                     handle: None,
                     cpu_result: None,
-                    empty: EmptyCreateWrite::new(),
+                    empty,
                     keyed: None,
                     documents: None,
                     publication: None,
@@ -2148,6 +2151,7 @@ mod original_stage_tests {
                 seed,
                 ports,
                 planning,
+                session_properties: Arc::default(),
                 operation_id,
                 context,
                 cancellation,

@@ -17,6 +17,7 @@
 
 use super::*;
 use crate::physical_unpivot_v2::tests::{Control, Fixture, limits};
+use novarocks_expression_contract::RootOrdinal;
 use novarocks_type_contract::CompileControlError;
 use std::alloc::Layout;
 const SOURCE: usize = 1 << 20;
@@ -34,7 +35,7 @@ fn reference(pool: u32, ordinal: u32) -> p::ConstantReference {
 fn source() -> p::WriterGroupedUnpivotSpec {
     let constants = |id| {
         Box::from([
-            p::UnpivotConstant::Scalar(p::ExprId::new(id)),
+            p::UnpivotConstant::Scalar(RootOrdinal::new(id)),
             p::UnpivotConstant::Int32List(reference(0, 1)),
             p::UnpivotConstant::Utf8Map(reference(7, 1)),
         ])
@@ -65,7 +66,7 @@ fn source() -> p::WriterGroupedUnpivotSpec {
             p::WriterGroupedUnpivotMapping {
                 write_target_ordinal: p::WriteTargetOrdinal::try_new(0).unwrap(),
                 input: p::ValueId::new(7),
-                constants: constants(u32::MAX),
+                constants: constants(2),
             },
         ]),
         max_output_rows: u64::MAX,
@@ -76,7 +77,7 @@ fn expected() -> wire::WriterGroupedUnpivot {
     let constants = |id| {
         vec![
             wire::UnpivotConstant {
-                kind: Some(wire::unpivot_constant::Kind::ScalarExprId(id)),
+                kind: Some(wire::unpivot_constant::Kind::ScalarRoot(id)),
             },
             wire::UnpivotConstant {
                 kind: Some(wire::unpivot_constant::Kind::Int32List(
@@ -112,7 +113,7 @@ fn expected() -> wire::WriterGroupedUnpivot {
             wire::WriterGroupedUnpivotMapping {
                 write_target_ordinal: 0,
                 input_value_id: Some(7),
-                constants: constants(u32::MAX),
+                constants: constants(2),
             },
         ],
         max_output_rows: u64::MAX,
@@ -296,9 +297,9 @@ fn grouped_unpivot_closed_presence_and_selected_address_errors_remain_distinct()
                 Err(Error::InvalidShape(_))
             ));
         }
-        for id in [7, 99] {
+        for id in [1, 99] {
             let mut input = source();
-            input.mappings[0].constants[0] = p::UnpivotConstant::Scalar(p::ExprId::new(id));
+            input.mappings[0].constants[0] = p::UnpivotConstant::Scalar(RootOrdinal::new(id));
             c.arm(None);
             assert!(matches!(
                 encode_writer_grouped_unpivot(&input, values, expressions, SOURCE, limits()),
@@ -306,7 +307,7 @@ fn grouped_unpivot_closed_presence_and_selected_address_errors_remain_distinct()
             ));
             let mut raw = expected();
             raw.mappings[0].constants[0].kind =
-                Some(wire::unpivot_constant::Kind::ScalarExprId(id));
+                Some(wire::unpivot_constant::Kind::ScalarRoot(id));
             c.arm(None);
             assert!(matches!(
                 decode_writer_grouped_unpivot(&raw, read, SOURCE, limits()),
@@ -421,7 +422,7 @@ fn grouped_unpivot_six_resource_axes_and_actual_wire_capacities_precede_emission
         // obey the outer caller's source/list/work envelope.
         let mut wide = source();
         wide.mappings[0].constants =
-            vec![p::UnpivotConstant::Scalar(p::ExprId::new(0)); 320].into_boxed_slice();
+            vec![p::UnpivotConstant::Scalar(RootOrdinal::new(0)); 320].into_boxed_slice();
         let mut l = limits();
         l.max_list_items = 20;
         c.arm(None);
@@ -457,12 +458,12 @@ fn grouped_unpivot_every_small_callback_preserves_three_primary_causes_and_ordin
             prepare_writer_grouped_unpivot_decode(&raw, read, SOURCE, limits())
         });
         let mut bad = source();
-        bad.mappings[1].constants[2] = p::UnpivotConstant::Scalar(p::ExprId::new(7));
+        bad.mappings[1].constants[2] = p::UnpivotConstant::Scalar(RootOrdinal::new(1));
         assert_prefix(&c, || {
             encode_writer_grouped_unpivot(&bad, values, expressions, SOURCE, limits())
         });
         let mut bad = expected();
-        bad.mappings[1].constants[2].kind = Some(wire::unpivot_constant::Kind::ScalarExprId(7));
+        bad.mappings[1].constants[2].kind = Some(wire::unpivot_constant::Kind::ScalarRoot(1));
         assert_prefix(&c, || {
             decode_writer_grouped_unpivot(&bad, read, SOURCE, limits())
         });
@@ -515,11 +516,11 @@ fn grouped_unpivot_wide_inner_constants_observe_real_quantum_and_no_retry() {
     let c = Control::default();
     let mut input = source();
     input.mappings[0].constants =
-        vec![p::UnpivotConstant::Scalar(p::ExprId::new(0)); 320].into_boxed_slice();
+        vec![p::UnpivotConstant::Scalar(RootOrdinal::new(0)); 320].into_boxed_slice();
     let mut raw = expected();
     raw.mappings[0].constants = vec![
         wire::UnpivotConstant {
-            kind: Some(wire::unpivot_constant::Kind::ScalarExprId(0))
+            kind: Some(wire::unpivot_constant::Kind::ScalarRoot(0))
         };
         320
     ];
@@ -556,11 +557,11 @@ fn grouped_known_root_and_nested_requests_precede_the_next_real_wide_quantum() {
     let c = Control::default();
     let mut input = source();
     input.mappings[0].constants =
-        vec![p::UnpivotConstant::Scalar(p::ExprId::new(0)); 320].into_boxed_slice();
+        vec![p::UnpivotConstant::Scalar(RootOrdinal::new(0)); 320].into_boxed_slice();
     let mut raw = expected();
     raw.mappings[0].constants = vec![
         wire::UnpivotConstant {
-            kind: Some(wire::unpivot_constant::Kind::ScalarExprId(0)),
+            kind: Some(wire::unpivot_constant::Kind::ScalarRoot(0)),
         };
         320
     ];
@@ -719,6 +720,7 @@ fn grouped_nonempty_header_parent_merges_value_occurrences_and_source_invoice_on
     // TableFinish or a fabricated namespace. Its writer schemas stay outside
     // this narrow composition oracle.
     let node = p::PhysicalNode {
+        expressions: None,
         id: p::NodeId::new(u32::MAX),
         inputs: Box::from([p::NodeId::new(0)]),
         required_inputs: Box::from([props.clone()]),

@@ -41,15 +41,8 @@ pub(crate) fn fixture_before_ready() -> (
 ) {
     let count = 8;
     let storage = ControlStorageConfig::new(count, &[]).with_process_source_backing(
-        PollRoleSourceBacking::from_layouts(
-            &[std::alloc::Layout::from_size_align(
-                crate::native::NativeSubscriptionOwner::resident_storage_bytes(count).unwrap(),
-                8,
-            )
-            .unwrap()],
-            &[],
-        )
-        .unwrap(),
+        PollRoleSourceBacking::from_layouts(&process_source_backing_layouts().unwrap(), &[])
+            .unwrap(),
     );
     let control = WorkloadControl::try_new_counted(WorkloadConfig {
         root_limit: count,

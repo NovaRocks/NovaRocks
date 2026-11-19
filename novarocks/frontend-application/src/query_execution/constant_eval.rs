@@ -19,7 +19,7 @@
 //! SQL owns traversal and fold policy; Execution owns every calculated value.
 use arrow::array::{Array, ArrayRef, Decimal128Array, Decimal256Array};
 use arrow::datatypes::{DataType, Decimal128Type, Decimal256Type, DecimalType};
-use novarocks_execution::exec::expr::compiled_program::constant_node::{
+use novarocks_expression::constant_node::{
     ConstantCarrierStep, ConstantConversion, ConstantNode, ConstantNodeFailure,
     ConstantNodeOutcome, evaluate_constant_node,
 };

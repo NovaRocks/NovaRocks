@@ -29,10 +29,9 @@ use arrow_array::{Int32Array, Int64Array};
 use arrow_schema::DataType;
 use novarocks_type_contract::{
     ArgumentControl, CallEffects, CallProofScope, CompileCheckpoints, CompileControlError,
-    DecimalOverflowPolicy, EvaluationDemand, EvaluationDomainId, ExpressionEffectContext,
-    ExpressionUseId, FunctionEffectDeclaration, FunctionFailureBehavior, FunctionInstanceState,
-    FunctionIntrinsicRowError, FunctionNullBehavior, FunctionVolatility, ObservableEffects,
-    SemanticParameters,
+    DecimalOverflowPolicy, ExpressionUseId, FunctionEffectDeclaration, FunctionFailureBehavior,
+    FunctionInstanceState, FunctionIntrinsicRowError, FunctionNullBehavior, FunctionVolatility,
+    ObservableEffects, SemanticParameters,
 };
 use std::{
     sync::{
@@ -186,11 +185,10 @@ impl Fixture {
     }
     fn input(&self) -> CallEffectInput<'_> {
         CallEffectInput {
-            context: ExpressionEffectContext {
-                use_id: ExpressionUseId::new(0),
-                domain: EvaluationDomainId::new(7),
-                demand: EvaluationDemand::Value,
-            },
+            context: (novarocks_type_contract::RelationEffectContext::call(
+                novarocks_type_contract::RelationCallId::new(0),
+            ))
+            .into(),
             argument_uses: crate::CallArgumentUses::SelectedChannels(&self.uses),
             function_id: &self.id,
             kind: FunctionKind::Table,
@@ -302,7 +300,7 @@ impl Fixture {
             self,
             input,
             self.selected.clone(),
-            ScopedExpressionEffects::pure_value(input.context),
+            ScopedRelationalEffects::pure_value(input.context.relation().unwrap()),
             &CompileControl(None),
         )
         .unwrap()
@@ -1179,7 +1177,7 @@ fn fresh_frozen_owner_refines_prepares_once_without_cursor_and_rejects_forged_id
     for frozen in [false, true] {
         owner.counts.refine.store(0, Ordering::Relaxed);
         owner.counts.prepare.store(0, Ordering::Relaxed);
-        let arguments = ScopedExpressionEffects::pure_value(input.context);
+        let arguments = ScopedRelationalEffects::pure_value(input.context.relation().unwrap());
         let prepared = if frozen {
             specialize_frozen_table(
                 &owner,
@@ -1206,7 +1204,10 @@ fn fresh_frozen_owner_refines_prepares_once_without_cursor_and_rejects_forged_id
             prepared.prepared().contract().call().selected(),
             owner.selected.as_ref()
         ));
-        let effects = prepared.effects().for_use(input.context).unwrap();
+        let effects = prepared
+            .effects()
+            .for_use(input.context.relation().unwrap())
+            .unwrap();
         if let Some(previous) = previous {
             assert_eq!(previous, effects);
         }
@@ -1222,19 +1223,19 @@ fn fresh_frozen_owner_refines_prepares_once_without_cursor_and_rejects_forged_id
             input,
             owner.selected.clone(),
             &frozen,
-            ScopedExpressionEffects::pure_value(input.context),
+            ScopedRelationalEffects::pure_value(input.context.relation().unwrap()),
             &CompileControl(None)
         ),
         Err(FunctionSpecializationFailure::InvalidInput(_))
     ));
-    let mut context = input.context;
-    context.use_id = ExpressionUseId::new(99);
+    let mut context = input.context.relation().unwrap();
+    context.identity.call = novarocks_type_contract::RelationCallId::new(99);
     assert!(matches!(
         specialize_table(
             &owner,
             input,
             owner.selected.clone(),
-            ScopedExpressionEffects::pure_value(context),
+            ScopedRelationalEffects::pure_value(context),
             &CompileControl(None)
         ),
         Err(FunctionSpecializationFailure::Effects(_))
@@ -1248,7 +1249,7 @@ fn fresh_frozen_owner_refines_prepares_once_without_cursor_and_rejects_forged_id
             &owner,
             input,
             owner.selected.clone(),
-            ScopedExpressionEffects::pure_value(input.context),
+            ScopedRelationalEffects::pure_value(input.context.relation().unwrap()),
             &CompileControl(None)
         ),
         Err(FunctionSpecializationFailure::Kernel(
@@ -1268,7 +1269,7 @@ fn compile_entry_errors_remain_typed_before_owner_refinement_or_preparation() {
         let owner = fixture();
         let input = owner.input();
         for frozen in [false, true] {
-            let arguments = ScopedExpressionEffects::pure_value(input.context);
+            let arguments = ScopedRelationalEffects::pure_value(input.context.relation().unwrap());
             let result = if frozen {
                 specialize_frozen_table(
                     &owner,

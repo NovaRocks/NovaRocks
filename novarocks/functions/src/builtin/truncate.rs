@@ -233,5 +233,4 @@ fn arrow_layout(bytes: usize) -> Result<(), KernelFailure> {
 }
 
 #[cfg(test)]
-#[path = "truncate_tests.rs"]
 mod tests;

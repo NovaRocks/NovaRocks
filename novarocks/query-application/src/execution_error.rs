@@ -20,152 +20,38 @@
 //! instruction. Transport loss must be authored where it was actually observed;
 //! capacity, a local timeout and an answered remote refusal cannot manufacture it.
 
-use crate::api::{NativeAttemptTopologyRequirement, QueryExecutionErrorKind};
+use crate::api::NativeAttemptTopologyRequirement;
 use novarocks_coordination_contract::AttemptFailureClass;
 use novarocks_execution_contract::{
-    ParticipationRef, SafeDetail, TaskFailurePhase, TaskIdentity, TaskOperationId,
-    failure::{FailureClass, FailureFact, FailureProjection, FailureReason, domain},
-    operation::OperationKind,
+    TaskFailurePhase,
+    failure::{FailureClass, FailureProjection},
 };
-use novarocks_types::BackendProcessId;
+#[cfg(test)]
+use novarocks_execution_contract::{
+    TaskIdentity,
+    failure::{FailureFact, FailureReason, domain},
+};
 use novarocks_user_error::{
     ErrorCodeDescriptor, ErrorCodeId, ErrorCodeStatus, ErrorPhase, RetryClass, UserError,
 };
+#[cfg(test)]
 use std::num::NonZeroU16;
 
-/// Shared identity-refusal reason authored by the FE Task protocol projector.
-/// It describes identity-refusal semantics, not remote provenance, a specific
-/// identity field, pre-ready state, or independent process replacement.
-pub const TASK_PROTOCOL_IDENTITY_MISMATCH_REASON: FailureReason =
-    FailureReason::new(domain::QUERY, NonZeroU16::new(15).unwrap());
+pub use novarocks_coordination_contract::{
+    ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason,
+    TASK_PROTOCOL_IDENTITY_MISMATCH_REASON,
+};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ExecutionFailureSite {
-    Task {
-        identity: TaskIdentity,
-        phase: TaskFailurePhase,
-    },
-    /// A control termination reports no fabricated preparation/execution phase.
-    TaskControl {
-        identity: TaskIdentity,
-    },
-    Operation {
-        participation: ParticipationRef,
-        operation_id: TaskOperationId,
-        kind: OperationKind,
-    },
-    RootRead {
-        root: TaskIdentity,
-    },
-    Backend {
-        process: BackendProcessId,
-    },
-    /// A local coordinator failure with no Task/operation acceptance claim.
-    Coordinator,
+pub trait ExecutionFailurePresentation {
+    fn topology_requirement(&self) -> NativeAttemptTopologyRequirement;
+    fn descriptor(&self) -> SqlExecutionErrorDescriptor;
+    fn user_error(&self) -> UserError;
+    fn row_match_violation_message(&self) -> Option<&'static str>;
 }
 
-/// Facts and the bounded safe rendering cross the boundary together exactly
-/// once. No caller can replace only the class or reconstruct facts from text.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ExecutionFailureInput {
-    fact: FailureFact,
-    detail: SafeDetail,
-    site: ExecutionFailureSite,
-}
-impl ExecutionFailureInput {
-    pub const fn new(fact: FailureFact, detail: SafeDetail, site: ExecutionFailureSite) -> Self {
-        Self { fact, detail, site }
-    }
-    pub fn from_selected_task(
-        selected: &novarocks_coordination_contract::SelectedTaskTermination,
-    ) -> Option<Self> {
-        use novarocks_execution_contract::{AbortCause, TerminationDetail};
-        let identity = selected.identity();
-        let (fact, detail, site) = match selected.detail() {
-            TerminationDetail::Failed(failure) => (
-                failure.fact(),
-                failure.detail().clone(),
-                ExecutionFailureSite::Task {
-                    identity,
-                    phase: failure.phase(),
-                },
-            ),
-            TerminationDetail::Aborted(cause) => {
-                let reason = match cause {
-                    AbortCause::PeerTaskFailed => return None,
-                    AbortCause::LeaseExpired => QueryFailureReason::TaskLeaseExpired,
-                    AbortCause::QueryFailed => QueryFailureReason::TaskAborted,
-                };
-                (
-                    reason.failure_fact(),
-                    SafeDetail::truncating(cause.as_str()),
-                    ExecutionFailureSite::TaskControl { identity },
-                )
-            }
-            TerminationDetail::Canceled(reason) => (
-                QueryFailureReason::TaskCancelled.failure_fact(),
-                SafeDetail::truncating(reason.as_str()),
-                ExecutionFailureSite::TaskControl { identity },
-            ),
-        };
-        Some(Self::new(fact, detail, site))
-    }
-
-    pub const fn fact(&self) -> FailureFact {
-        self.fact
-    }
-    pub const fn detail(&self) -> &SafeDetail {
-        &self.detail
-    }
-    pub const fn site(&self) -> ExecutionFailureSite {
-        self.site
-    }
-    pub fn attempt_class(&self) -> AttemptFailureClass {
-        if self.fact.class() == FailureClass::Dependency
-            && self.fact.evidence()
-                == novarocks_execution_contract::failure::FailureEvidence::Originating
-            && self.fact.reason() == QueryFailureReason::BackendLost.failure_fact().reason()
-            && matches!(self.site, ExecutionFailureSite::Backend { .. })
-        {
-            return AttemptFailureClass::RecoverableInfrastructure;
-        }
-        if self.fact.evidence()
-            == novarocks_execution_contract::failure::FailureEvidence::Originating
-            && matches!(self.site, ExecutionFailureSite::Coordinator)
-            && self.fact.class() == QueryFailureReason::Cancelled.failure_fact().class()
-            && self.fact.reason() == QueryFailureReason::Cancelled.failure_fact().reason()
-        {
-            return AttemptFailureClass::Cancelled;
-        }
-        if self.fact.evidence()
-            == novarocks_execution_contract::failure::FailureEvidence::Originating
-            && matches!(self.site, ExecutionFailureSite::Coordinator)
-            && self.fact.class() == QueryFailureReason::DeadlineExceeded.failure_fact().class()
-            && self.fact.reason() == QueryFailureReason::DeadlineExceeded.failure_fact().reason()
-        {
-            return AttemptFailureClass::DeadlineExceeded;
-        }
-        if self.fact.evidence()
-            == novarocks_execution_contract::failure::FailureEvidence::Originating
-            && matches!(self.site, ExecutionFailureSite::Coordinator)
-            && self.fact.class() == QueryFailureReason::CommitUnknown.failure_fact().class()
-            && self.fact.reason() == QueryFailureReason::CommitUnknown.failure_fact().reason()
-        {
-            return AttemptFailureClass::CommitUnknown;
-        }
-        match self.fact.class() {
-            FailureClass::Unsupported => AttemptFailureClass::Unsupported,
-            FailureClass::Resource => AttemptFailureClass::ResourceGovernance,
-            FailureClass::Invariant => AttemptFailureClass::ContractViolation,
-            FailureClass::Unexpected
-            | FailureClass::Data
-            | FailureClass::Dependency
-            | FailureClass::Representation
-            | FailureClass::Control => AttemptFailureClass::ExecutionFailure,
-        }
-    }
-    pub fn topology_requirement(&self) -> NativeAttemptTopologyRequirement {
-        match (self.attempt_class(), self.site) {
+impl ExecutionFailurePresentation for ExecutionFailureInput {
+    fn topology_requirement(&self) -> NativeAttemptTopologyRequirement {
+        match (self.attempt_class(), self.site()) {
             (
                 AttemptFailureClass::RecoverableInfrastructure,
                 ExecutionFailureSite::Backend { process },
@@ -173,69 +59,61 @@ impl ExecutionFailureInput {
             _ => NativeAttemptTopologyRequirement::LiveSnapshot,
         }
     }
-    pub fn error_kind(&self) -> QueryExecutionErrorKind {
-        match self.attempt_class() {
-            AttemptFailureClass::Cancelled => QueryExecutionErrorKind::Cancelled,
-            AttemptFailureClass::DeadlineExceeded => QueryExecutionErrorKind::DeadlineExceeded,
-            AttemptFailureClass::ResourceGovernance => QueryExecutionErrorKind::Rejected,
-            _ => QueryExecutionErrorKind::Failed,
-        }
-    }
-    pub fn descriptor(&self) -> SqlExecutionErrorDescriptor {
+    fn descriptor(&self) -> SqlExecutionErrorDescriptor {
         use SqlExecutionErrorKind as K;
-        let kind = if self.fact.evidence()
+        let kind = if self.fact().evidence()
             == novarocks_execution_contract::failure::FailureEvidence::Originating
-            && matches!(self.site, ExecutionFailureSite::Coordinator)
-            && self.fact.class() == QueryFailureReason::Cancelled.failure_fact().class()
-            && self.fact.reason() == QueryFailureReason::Cancelled.failure_fact().reason()
+            && matches!(self.site(), ExecutionFailureSite::Coordinator)
+            && self.fact().class() == QueryFailureReason::Cancelled.failure_fact().class()
+            && self.fact().reason() == QueryFailureReason::Cancelled.failure_fact().reason()
         {
             K::Cancelled
-        } else if self.fact.evidence()
+        } else if self.fact().evidence()
             == novarocks_execution_contract::failure::FailureEvidence::Originating
-            && matches!(self.site, ExecutionFailureSite::Coordinator)
-            && self.fact.class() == QueryFailureReason::DeadlineExceeded.failure_fact().class()
-            && self.fact.reason() == QueryFailureReason::DeadlineExceeded.failure_fact().reason()
+            && matches!(self.site(), ExecutionFailureSite::Coordinator)
+            && self.fact().class() == QueryFailureReason::DeadlineExceeded.failure_fact().class()
+            && self.fact().reason() == QueryFailureReason::DeadlineExceeded.failure_fact().reason()
         {
             K::DeadlineExceeded
-        } else if self.fact.evidence()
+        } else if self.fact().evidence()
             == novarocks_execution_contract::failure::FailureEvidence::Originating
-            && matches!(self.site, ExecutionFailureSite::Coordinator)
-            && self.fact.class() == QueryFailureReason::CommitUnknown.failure_fact().class()
-            && self.fact.reason() == QueryFailureReason::CommitUnknown.failure_fact().reason()
+            && matches!(self.site(), ExecutionFailureSite::Coordinator)
+            && self.fact().class() == QueryFailureReason::CommitUnknown.failure_fact().class()
+            && self.fact().reason() == QueryFailureReason::CommitUnknown.failure_fact().reason()
         {
             K::CommitUnknown
-        } else if self.fact.class() == FailureClass::Data
-            && self.fact.reason()
+        } else if self.fact().class() == FailureClass::Data
+            && self.fact().reason()
                 == novarocks_failure_contract::sql_reason::MERGE_TARGET_ROW_MULTIPLE_MATCHES
         {
             K::MergeTargetRowMultipleMatches
-        } else if self.fact.class() == FailureClass::Data
-            && self.fact.reason()
+        } else if self.fact().class() == FailureClass::Data
+            && self.fact().reason()
                 == novarocks_failure_contract::sql_reason::UPDATE_TARGET_ROW_MULTIPLE_MATCHES
         {
             K::UpdateTargetRowMultipleMatches
-        } else if self.fact.class() == FailureClass::Data
-            && self.fact.reason()
+        } else if self.fact().class() == FailureClass::Data
+            && self.fact().reason()
                 == novarocks_function_contract::kernel_failure::NUMERIC_OUT_OF_RANGE
         {
             K::NumericOutOfRange
-        } else if self.fact.class() == FailureClass::Data
-            && self.fact.reason() == novarocks_function_contract::kernel_failure::DIVISION_BY_ZERO
+        } else if self.fact().class() == FailureClass::Data
+            && self.fact().reason() == novarocks_function_contract::kernel_failure::DIVISION_BY_ZERO
         {
             K::DivisionByZero
-        } else if self.fact.class() == FailureClass::Data
-            && self.fact.reason()
+        } else if self.fact().class() == FailureClass::Data
+            && self.fact().reason()
                 == novarocks_function_contract::kernel_failure::INVALID_CAST_ARGUMENT
         {
             K::InvalidCastArgument
-        } else if self.fact.class() == FailureClass::Data
-            && self.fact.reason()
+        } else if self.fact().class() == FailureClass::Data
+            && self.fact().reason()
                 == novarocks_function_contract::kernel_failure::INVALID_FUNCTION_ARGUMENT
         {
             K::InvalidFunctionArgument
         } else {
-            match self.fact.class() {
-                FailureClass::Unsupported if self.is_compiled_capability() => {
+            match self.fact().class() {
+                FailureClass::Unsupported if is_compiled_capability(self) => {
                     K::UnsupportedCompiledShape
                 }
                 FailureClass::Unsupported => K::Unsupported,
@@ -250,50 +128,11 @@ impl ExecutionFailureInput {
         };
         SqlExecutionErrorDescriptor::for_kind(kind)
     }
-    fn is_compiled_capability(&self) -> bool {
-        use novarocks_failure_contract::local_compiler_reason as compiler_failure;
-        use novarocks_function_contract::kernel_failure;
-        if self.fact.evidence()
-            != novarocks_execution_contract::failure::FailureEvidence::Originating
-        {
-            return false;
-        }
-        let reason = self.fact.reason();
-        // These exact reasons are emitted only by the compiled-plan authors.
-        if [
-            compiler_failure::UNSUPPORTED_FRAGMENT,
-            compiler_failure::UNSUPPORTED_EXPRESSION,
-            compiler_failure::UNSUPPORTED_CALL,
-            novarocks_failure_contract::plan_codec_reason::ENCODE_UNSUPPORTED,
-            novarocks_failure_contract::sql_reason::STRUCTURAL_WAIT_CYCLE,
-        ]
-        .contains(&reason)
-        {
-            return true;
-        }
-        // Function preparation is shared with non-compiler callers. Only the
-        // typed Task preparation path establishes compiled use here; every BE
-        // Task preparation consumes the original frozen compiled package.
-        matches!(
-            self.site,
-            ExecutionFailureSite::Task {
-                phase: TaskFailurePhase::Preparation,
-                ..
-            }
-        ) && [
-            kernel_failure::MISSING_PURE_IMPLEMENTATION,
-            kernel_failure::UNSUPPORTED_COMPARISON,
-            kernel_failure::UNSUPPORTED_ARITHMETIC,
-            kernel_failure::UNSUPPORTED_CAST,
-            novarocks_function_contract::UNAVAILABLE_IMPLEMENTATION,
-        ]
-        .contains(&reason)
-    }
-    pub fn user_error(&self) -> UserError {
+    fn user_error(&self) -> UserError {
         UserError::from_descriptor(
             self.descriptor().descriptor,
             self.row_match_violation_message()
-                .unwrap_or(self.detail.as_str()),
+                .unwrap_or(self.detail().as_str()),
             None,
             RetryClass::Never,
         )
@@ -301,11 +140,11 @@ impl ExecutionFailureInput {
 
     /// A planner-declared SQL identity controls the public message; the original
     /// execution fact, safe diagnostic and site remain available independently.
-    pub fn row_match_violation_message(&self) -> Option<&'static str> {
-        if self.fact.class() != FailureClass::Data {
+    fn row_match_violation_message(&self) -> Option<&'static str> {
+        if self.fact().class() != FailureClass::Data {
             return None;
         }
-        match self.fact.reason() {
+        match self.fact().reason() {
             reason if reason == novarocks_failure_contract::sql_reason::MERGE_TARGET_ROW_MULTIPLE_MATCHES => Some(MERGE_TARGET_ROW_MULTIPLE_MATCHES_MESSAGE),
             reason if reason == novarocks_failure_contract::sql_reason::UPDATE_TARGET_ROW_MULTIPLE_MATCHES => Some(UPDATE_TARGET_ROW_MULTIPLE_MATCHES_MESSAGE),
             _ => None,
@@ -313,80 +152,50 @@ impl ExecutionFailureInput {
     }
 }
 
+fn is_compiled_capability(input: &ExecutionFailureInput) -> bool {
+    use novarocks_failure_contract::local_compiler_reason as compiler_failure;
+    use novarocks_function_contract::kernel_failure;
+    if input.fact().evidence()
+        != novarocks_execution_contract::failure::FailureEvidence::Originating
+    {
+        return false;
+    }
+    let reason = input.fact().reason();
+    // These exact reasons are emitted only by the compiled-plan authors.
+    if [
+        compiler_failure::UNSUPPORTED_FRAGMENT,
+        compiler_failure::UNSUPPORTED_EXPRESSION,
+        compiler_failure::UNSUPPORTED_CALL,
+        novarocks_failure_contract::plan_codec_reason::ENCODE_UNSUPPORTED,
+        novarocks_failure_contract::sql_reason::STRUCTURAL_WAIT_CYCLE,
+    ]
+    .contains(&reason)
+    {
+        return true;
+    }
+    // Function preparation is shared with non-compiler callers. Only the
+    // typed Task preparation path establishes compiled use here; every BE
+    // Task preparation consumes the original frozen compiled package.
+    matches!(
+        input.site(),
+        ExecutionFailureSite::Task {
+            phase: TaskFailurePhase::Preparation,
+            ..
+        }
+    ) && [
+        kernel_failure::MISSING_PURE_IMPLEMENTATION,
+        kernel_failure::UNSUPPORTED_COMPARISON,
+        kernel_failure::UNSUPPORTED_ARITHMETIC,
+        kernel_failure::UNSUPPORTED_CAST,
+        novarocks_function_contract::UNAVAILABLE_IMPLEMENTATION,
+    ]
+    .contains(&reason)
+}
+
 pub const MERGE_TARGET_ROW_MULTIPLE_MATCHES_MESSAGE: &str =
     "One MERGE target table row matched more than one source row";
 pub const UPDATE_TARGET_ROW_MULTIPLE_MATCHES_MESSAGE: &str =
     "One UPDATE target table row matched more than one source row";
-
-/// Reasons produced by query coordination itself. Domain errors arriving from
-/// Task, operation or root owners retain their original fact without wrapping.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum QueryFailureReason {
-    Cancelled,
-    DeadlineExceeded,
-    /// An actual failed backend connection/process observation. Never a local
-    /// read deadline, observation budget, Preparing or plain remote Unavailable.
-    BackendLost,
-    TransportDeadline,
-    TransportRefused,
-    TransportCapacity,
-    ResultProtocol,
-    ActorProtocol,
-    ObservationLost,
-    PreparationProtocol,
-    CommitUnknown,
-    TaskAborted,
-    TaskLeaseExpired,
-    TaskCancelled,
-    NativeFuturePanicked,
-    InternalConsumerPanicked,
-    SplitAssignmentFailed,
-    PreparationFailed,
-    RecoveryPreparationBudgetExceeded,
-    LogicalFailureUnspecified,
-    LogicalOwnerStopped,
-    BlockingWorkerPanicked,
-    BlockingExecutorClosed,
-    BlockingSourceContract,
-    BlockingQueueFull,
-}
-impl FailureProjection for QueryFailureReason {
-    fn failure_fact(&self) -> FailureFact {
-        let (class, code) = match self {
-            Self::Cancelled => (FailureClass::Control, 1),
-            Self::DeadlineExceeded => (FailureClass::Control, 2),
-            Self::BackendLost => (FailureClass::Dependency, 3),
-            Self::TransportDeadline => (FailureClass::Dependency, 4),
-            Self::TransportRefused => (FailureClass::Dependency, 5),
-            Self::TransportCapacity => (FailureClass::Resource, 13),
-            Self::ResultProtocol => (FailureClass::Invariant, 6),
-            Self::ActorProtocol => (FailureClass::Invariant, 7),
-            Self::ObservationLost => (FailureClass::Dependency, 8),
-            Self::PreparationProtocol => (FailureClass::Invariant, 9),
-            Self::CommitUnknown => (FailureClass::Unexpected, 10),
-            Self::TaskAborted => (FailureClass::Control, 11),
-            Self::TaskLeaseExpired => (FailureClass::Control, 12),
-            Self::TaskCancelled => (FailureClass::Control, 27),
-            Self::NativeFuturePanicked => (FailureClass::Unexpected, 33),
-            Self::InternalConsumerPanicked => (FailureClass::Unexpected, 175),
-            Self::SplitAssignmentFailed => (FailureClass::Unexpected, 176),
-            Self::PreparationFailed => (FailureClass::Unexpected, 34),
-            Self::RecoveryPreparationBudgetExceeded => (FailureClass::Dependency, 151),
-            Self::LogicalFailureUnspecified => (FailureClass::Unexpected, 172),
-            Self::LogicalOwnerStopped => (FailureClass::Control, 174),
-            Self::BlockingWorkerPanicked => (FailureClass::Unexpected, 177),
-            Self::BlockingExecutorClosed => (FailureClass::Dependency, 178),
-            Self::BlockingSourceContract => (FailureClass::Invariant, 179),
-            Self::BlockingQueueFull => (FailureClass::Resource, 180),
-        };
-        let reason = FailureReason::new(domain::QUERY, NonZeroU16::new(code).unwrap());
-        if matches!(self, Self::LogicalOwnerStopped) {
-            FailureFact::stop_observation(reason)
-        } else {
-            FailureFact::new(class, reason)
-        }
-    }
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SqlExecutionErrorKind {

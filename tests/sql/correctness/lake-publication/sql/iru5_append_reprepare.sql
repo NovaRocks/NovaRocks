@@ -26,7 +26,7 @@
 CREATE SCHEMA lake_publication_${suite_uuid0}.ns_${uuid0};
 CREATE TABLE lake_publication_${suite_uuid0}.ns_${uuid0}.append_rows (
   id BIGINT, writer VARCHAR(16)
-) WITH (format_version = 3, max_commit_retry = 3, extra_properties = MAP(ARRAY['commit.retry.min-wait-ms', 'commit.retry.max-wait-ms', 'commit.retry.total-timeout-ms'], ARRAY['0', '0', '60000']));
+) WITH (partitioning = ARRAY['id'], format_version = 3, max_commit_retry = 3, extra_properties = MAP(ARRAY['commit.manifest.target-size-bytes', 'commit.retry.min-wait-ms', 'commit.retry.max-wait-ms', 'commit.retry.total-timeout-ms'], ARRAY['1024', '0', '0', '60000']));
 INSERT INTO lake_publication_${suite_uuid0}.ns_${uuid0}.append_rows VALUES ROW(1, 'seed');
 
 -- query 2
@@ -49,7 +49,11 @@ PYTHON
 -- @publication_catalog_fault=table-commit,before-requirement-check-hold-for-concurrent-shell
 -- @publication_catalog_concurrent_shell=set -eu; tmp_sql=$(mktemp "${TMPDIR:-/tmp}/iru5-append-companion-XXXXXX.sql"); trap 'rm -f "$tmp_sql"' EXIT; printf '%s\n' "INSERT INTO ice_rest.ns_${uuid0}.append_rows VALUES (2, 'spark');" > "$tmp_sql"; "${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-sql.sh" "$tmp_sql"
 -- @skip_result_check=true
-INSERT INTO lake_publication_${suite_uuid0}.ns_${uuid0}.append_rows VALUES (3, 'nova');
+INSERT INTO lake_publication_${suite_uuid0}.ns_${uuid0}.append_rows VALUES
+  ROW(3, 'nova'), ROW(4, 'nova'), ROW(5, 'nova'), ROW(6, 'nova'), ROW(7, 'nova'), ROW(8, 'nova'), ROW(9, 'nova'), ROW(10, 'nova'),
+  ROW(11, 'nova'), ROW(12, 'nova'), ROW(13, 'nova'), ROW(14, 'nova'), ROW(15, 'nova'), ROW(16, 'nova'), ROW(17, 'nova'), ROW(18, 'nova'),
+  ROW(19, 'nova'), ROW(20, 'nova'), ROW(21, 'nova'), ROW(22, 'nova'), ROW(23, 'nova'), ROW(24, 'nova'), ROW(25, 'nova'), ROW(26, 'nova'),
+  ROW(27, 'nova'), ROW(28, 'nova'), ROW(29, 'nova'), ROW(30, 'nova'), ROW(31, 'nova'), ROW(32, 'nova'), ROW(33, 'nova'), ROW(34, 'nova');
 
 -- query 4
 SELECT id, writer FROM lake_publication_${suite_uuid0}.ns_${uuid0}.append_rows ORDER BY id;
@@ -92,15 +96,19 @@ val parent = table.snapshot(current.parentId())
 require(parent.snapshotId() == snapshots(1).snapshotId(), "successful Nova snapshot has the wrong parent")
 require(current.sequenceNumber() == parent.sequenceNumber() + 1, "fresh append sequence is not actual Java successor")
 val rows = spark.sql(s"SELECT id, writer, _row_id, _last_updated_sequence_number FROM $name ORDER BY id").collect().toSeq
-require(rows.map(r => (r.getLong(0), r.getString(1))) == Seq((1L, "seed"), (2L, "spark"), (3L, "nova")), "lost or repeated append rows")
+val expected = Seq((1L, "seed"), (2L, "spark")) ++ (3L to 34L).map(id => (id, "nova"))
+require(rows.map(r => (r.getLong(0), r.getString(1))) == expected, "lost or repeated append rows")
+require(rows.size == 34 && rows.map(_.getLong(0)).sum == 595L, "the published rows do not satisfy the independent aggregate")
 require(rows.forall(r => !r.isNullAt(2) && !r.isNullAt(3)), "unassigned row lineage")
 require(rows.map(_.getLong(2)).distinct.size == rows.size, "conflicting attempts duplicated row IDs")
 require(rows(1).getLong(3) == parent.sequenceNumber(), "Spark row does not belong to actual parent")
-require(rows(2).getLong(3) == current.sequenceNumber(), "Nova row inherited a predicted or stale sequence")
+require(rows.drop(2).forall(_.getLong(3) == current.sequenceNumber()), "Nova rows inherited a predicted or stale sequence")
 val entries = spark.sql(s"SELECT sequence_number, file_sequence_number FROM $name.entries WHERE status = 1 AND snapshot_id = ${current.snapshotId()}").collect().toSeq
 entries.foreach(r => println(s"IRU5_APPEND_ENTRY data_sequence=${r.getLong(0)} file_sequence=${r.getLong(1)}"))
-require(entries.nonEmpty, "successful append has no actual added entries")
+require(entries.size == 32, "the successful Nova attempt must publish one file for each of its partitions")
 require(entries.forall(r => r.getLong(0) == current.sequenceNumber() && r.getLong(1) == current.sequenceNumber()), "added manifest entry sequence inheritance differs from actual publication")
+val newManifests = spark.sql(s"SELECT count(*) FROM $name.manifests WHERE added_snapshot_id = ${current.snapshotId()} AND content = 0").head().getLong(0)
+require(newManifests >= 2, "the successful attempt did not publish rolled data manifests")
 println("IRU5_APPEND_REPREPARE_OK")
 SPARK_SCALA
 spark_status=0

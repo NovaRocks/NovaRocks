@@ -21,7 +21,7 @@
 //! receiver capacity, authorize a caller, infer consumption or classify a failure.
 
 use std::collections::BTreeSet;
-use std::num::NonZeroU64;
+use std::num::{NonZeroU64, NonZeroUsize};
 
 use bytes::Bytes;
 use novarocks_execution_contract::exchange_flow::ExchangeStreamIdentity;
@@ -34,6 +34,7 @@ use novarocks_proto_codec::{FieldPath, ProtocolError};
 use novarocks_proto_models::novarocks as wire;
 use novarocks_types::UniqueId;
 use novarocks_types::identity::BackendProcessId;
+use prost::Message;
 
 use crate::exchange_flow_codec::{decode_stream, encode_stream};
 use crate::status::{decode_failure_fact, encode_failure_fact};
@@ -315,6 +316,101 @@ pub fn encode_delivery_request(
         }),
         next_demand: value.next_demand.map(encode_unit_demand),
     }
+}
+
+/// `BackendProcessId.value` is exactly 16 bytes. The size bound uses that
+/// fixed width; semantic UUID checks do not change the encoding.
+const BACKEND_PROCESS_ID_LEN: usize = 16;
+
+fn worst_case_backend_process_id() -> wire::BackendProcessId {
+    wire::BackendProcessId {
+        value: vec![0xff; BACKEND_PROCESS_ID_LEN],
+    }
+}
+
+fn worst_case_task_identity() -> wire::TaskIdentity {
+    wire::TaskIdentity {
+        query_execution_id: Some(wire::QueryExecutionId {
+            query_id: Some(wire::common::UniqueId { hi: -1, lo: -1 }),
+            attempt_id: u64::MAX,
+        }),
+        stage_id: u32::MAX,
+        task_id: u32::MAX,
+        backend_process_id: Some(worst_case_backend_process_id()),
+    }
+}
+
+fn worst_case_stream_identity() -> wire::ExchangeStreamIdentity {
+    wire::ExchangeStreamIdentity {
+        source_task: Some(worst_case_task_identity()),
+        source_task_key_hi: -1,
+        source_task_key_lo: -1,
+        sender_ordinal: u32::MAX,
+        destination_task: Some(worst_case_task_identity()),
+        destination_task_key_hi: -1,
+        destination_task_key_lo: -1,
+        destination_node_id: -1,
+    }
+}
+
+fn worst_case_delivery_request(
+    item: wire::deliver_exchange_unit_request::Item,
+) -> wire::DeliverExchangeUnitRequest {
+    wire::DeliverExchangeUnitRequest {
+        task_key_hi: -1,
+        task_key_lo: -1,
+        node_id: -1,
+        sender_id: -1,
+        be_number: -1,
+        source_task_key_hi: -1,
+        source_task_key_lo: -1,
+        sender_ordinal: u32::MAX,
+        sender_count: u32::MAX,
+        stream: Some(worst_case_stream_identity()),
+        item: Some(item),
+        next_demand: Some(wire::ExchangeUnitDemand {
+            sequence: u64::MAX,
+            wire_bytes: u64::MAX,
+        }),
+    }
+}
+
+fn worst_case_unit(payload: Bytes) -> wire::deliver_exchange_unit_request::Item {
+    wire::deliver_exchange_unit_request::Item::Unit(wire::ExchangeUnitData {
+        sequence: u64::MAX,
+        wire_bytes: u64::MAX,
+        payload,
+        end_after_unit: true,
+    })
+}
+
+/// Wire upper bound H on the non-payload bytes of one `DeliverExchangeUnitRequest`.
+///
+/// H is a wire upper bound on non-payload bytes, not a memory budget. The
+/// `+1+5+4+4` slack covers an omitted empty payload field and ancestor
+/// length-prefix growth. This bound is not a tight minimum.
+pub fn max_delivery_non_payload_bytes() -> usize {
+    // Field 3 is absent while payload is empty. A later payload can add its
+    // tag and length varint, and can widen the length prefixes of
+    // ExchangeUnitData and the parent oneof.
+    const OMITTED_PAYLOAD_TAG_BYTES: usize = 1;
+    const MAX_PAYLOAD_LENGTH_VARINT_BYTES: usize = 5;
+    const UNIT_LENGTH_PREFIX_GROWTH_BYTES: usize = 4;
+    const PARENT_ONEOF_LENGTH_PREFIX_GROWTH_BYTES: usize = 4;
+
+    let base = worst_case_delivery_request(worst_case_unit(Bytes::new())).encoded_len();
+    base + OMITTED_PAYLOAD_TAG_BYTES
+        + MAX_PAYLOAD_LENGTH_VARINT_BYTES
+        + UNIT_LENGTH_PREFIX_GROWTH_BYTES
+        + PARENT_ONEOF_LENGTH_PREFIX_GROWTH_BYTES
+}
+
+/// Payload bytes that still fit in `request_max_bytes` after H.
+///
+/// Returns `Some(request_max_bytes - H)` when that difference is positive.
+pub fn grantable_delivery_payload_bytes(request_max_bytes: usize) -> Option<NonZeroUsize> {
+    let remainder = request_max_bytes.checked_sub(max_delivery_non_payload_bytes())?;
+    NonZeroUsize::new(remainder)
 }
 
 pub fn decode_receiver_close(

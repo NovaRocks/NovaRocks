@@ -38,7 +38,8 @@ use novarocks_spi::connector::write_stack::{
 };
 use novarocks_spi::connector::{
     CatalogHandle, CatalogProperties, ConnectorError, ConnectorErrorKind,
-    ConnectorInstanceDescriptor, ConnectorRequestContext,
+    ConnectorExecutionResources, ConnectorInstanceDescriptor, ConnectorRequestContext,
+    ConnectorResourceClass, ConnectorResourceReservation,
 };
 
 use crate::access_binding::IcebergReadBinding;
@@ -251,6 +252,16 @@ fn managed_writer_io(
         let file_io =
             build_staged_file_io_with_creation(binding, location, handle, physical, &journal)?;
         Ok((file_io, journal))
+    } else if handle.branch() == IcebergWriteBranch::Data {
+        binding.resolve_access(location).map_err(|cause| {
+            error(
+                ConnectorErrorKind::InvalidRequest,
+                format!("resolve Iceberg staged output {location}: {cause}"),
+            )
+        })?;
+        let journal = StagedPathJournal::default();
+        let file_io = crate::fs_io::build_tracked_staged_file_io(binding.clone(), journal.clone());
+        Ok((file_io, journal))
     } else {
         let file_io = build_staged_file_io(binding, location)
             .map_err(|message| error(ConnectorErrorKind::InvalidRequest, message))?;
@@ -304,6 +315,8 @@ fn stage_position_error(cause: anyhow::Error) -> ConnectorError {
 struct IcebergDataStackWriter {
     adapter: IcebergWriteAdapter,
     writer: StreamingStagedDataFileWriter,
+    resources: ConnectorExecutionResources,
+    buffer_charge: Option<ConnectorResourceReservation>,
     request_context: ConnectorRequestContext,
     fragments: Vec<ConnectorCommitFragment>,
     staged_paths: StagedPathJournal,
@@ -344,7 +357,15 @@ impl IcebergDataStackWriter {
             transform_exprs: recipe.transform_exprs().to_vec(),
             target_schema_json,
             parquet_row_group_size_bytes: handle.output().parquet_row_group_size_bytes(),
+            target_file_size_bytes: handle.output().target_file_size_bytes(),
+            max_partitions_per_writer: handle.output().max_partitions_per_writer(),
         };
+        let resources = request.resources.ok_or_else(|| {
+            error(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg data writer requires its admitted Task resource ledger",
+            )
+        })?;
         let (file_io, staged_paths) = managed_writer_io(&binding, &handle, request.physical)?;
         let context = staged_write_context_with_file_io(&request.expected_schema, facts, file_io)
             .map_err(|message| error(ConnectorErrorKind::InvalidRequest, message))?;
@@ -357,12 +378,33 @@ impl IcebergDataStackWriter {
             adapter: execution.adapter.clone(),
             writer: StreamingStagedDataFileWriter::new(context, &staged_paths)
                 .map_err(stage_data_error)?,
+            resources,
+            buffer_charge: None,
             request_context: request.context,
             fragments: Vec::new(),
             staged_paths,
             cleanup,
             lifecycle: WriterLifecycle::Live,
         })
+    }
+
+    fn refresh_buffer_charge(&mut self) -> Result<(), ConnectorError> {
+        let bytes = self.writer.buffered_bytes();
+        if bytes == 0 {
+            drop(self.buffer_charge.take());
+        } else if let Some(charge) = &mut self.buffer_charge {
+            match bytes.checked_sub(charge.bytes()) {
+                Some(growth) => charge.try_grow(growth)?,
+                None => charge.shrink_to(bytes)?,
+            }
+        } else {
+            // The original Task ledger only opens nonempty reservations.
+            self.buffer_charge = Some(
+                self.resources
+                    .try_reserve(ConnectorResourceClass::WriterState, bytes)?,
+            );
+        }
+        Ok(())
     }
 
     fn record(&mut self, staged: Vec<StagedDataFile>) -> Result<(), ConnectorError> {
@@ -452,13 +494,18 @@ impl ConnectorBatchWriter for IcebergDataStackWriter {
         if batch.num_rows() == 0 {
             return Ok(());
         }
-        self.writer.append(batch).await.map_err(stage_data_error)
+        let write = self.writer.append(batch).await.map_err(stage_data_error);
+        let charge = self.refresh_buffer_charge();
+        write.and(charge)
     }
 
     async fn finish(&mut self) -> Result<Vec<ConnectorCommitFragment>, ConnectorError> {
         ensure_live(self.lifecycle, &self.request_context, "data")?;
         self.lifecycle = WriterLifecycle::Finishing;
-        let staged = self.writer.finish().await.map_err(stage_data_error)?;
+        let staged = self.writer.finish().await.map_err(stage_data_error);
+        let charge = self.refresh_buffer_charge();
+        let staged = staged?;
+        charge?;
         self.record(staged)?;
         self.lifecycle = WriterLifecycle::Sealed;
         Ok(std::mem::take(&mut self.fragments))
@@ -470,6 +517,7 @@ impl ConnectorBatchWriter for IcebergDataStackWriter {
         }
         self.lifecycle = WriterLifecycle::Aborting;
         self.writer.close_for_abort();
+        drop(self.buffer_charge.take());
         // The same unsealed journal activates the Provider's existing cleanup
         // phase once; Task stop still forbids append/finish work.
         self.cleanup.run(&self.staged_paths).await?;

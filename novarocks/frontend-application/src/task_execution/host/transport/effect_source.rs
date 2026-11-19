@@ -21,7 +21,8 @@ use super::{
     ActorSendReports, ActorTransportExecutor, AdmissionSource, AttemptCallSource,
     AttemptSubscriptions, BodyOutcome, FrozenSendRequests, NativeProgressInput, NativeReceiptInput,
     PreparedActorSend, SendContext, SendKey, SendMemberReport, SendReportRows,
-    call_source::{AttemptCallReply, TransportRelease},
+    call_source::TransportRelease,
+    port_jobs::{OriginalPortJobs, PortFactLoanObligation},
     releases::{ReleaseCapture, TransportReleases},
     send_binding::NativeSplitPayloadStore,
     send_reports::close_unlaunched,
@@ -35,18 +36,16 @@ use crate::{
         },
         transport_withdrawal::AttemptEffectEnvelope,
     },
-    task_execution::bridge::abort::{
-        AbortIngressRetirement, AbortIngressRetirementProgress, AbortInputRetirement,
-        AbortReceiptSlot, AbortSettlementOwner, DrainedAbortSubmissions,
-    },
     task_execution::host::RetirementScan,
     task_execution::host::custody::{ReturnedActorTransportResult, TransportSourceEvent},
     task_execution::host::failure_publication::FailureContext,
+    task_execution::host::failure_residual::FailureResidualReceiveObligation,
     task_execution::host::failure_supervisor::{
         FailureCleanupPort, FailureSupervisor, RunningFailureSupervisor,
     },
     task_execution::host::observations::host_turn::OrderedObservationHost,
-    task_execution::host::publication::{AttemptDiagnosticSources, OriginalHostFailure},
+    task_execution::host::port::abort::AbortReceiptSlot,
+    task_execution::host::publication::AttemptDiagnosticSources,
     task_execution::host::pumps::AttemptPumpSource,
 };
 use novarocks_attempt_protocol::{
@@ -75,10 +74,16 @@ use novarocks_execution_contract::TaskOperationId;
 use novarocks_types::BackendProcessId;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
+    mem::ManuallyDrop,
     num::NonZeroU64,
     sync::{Arc, Weak},
     task::{Poll, Waker},
 };
+
+const PORT_CALLS: usize = super::super::port::facts::FactRole::ALL.len();
+const CALL_SOURCES: usize = PORT_CALLS + 5;
+const PUBLICATION_CALL: usize = PORT_CALLS + 1;
+const RELEASE_CALL: usize = PORT_CALLS + 2;
 
 type Position = CausalInputObligation<FrontendActor>;
 
@@ -87,11 +92,17 @@ pub(crate) struct AttemptSendSource {
     pub(crate) contexts: Arc<BTreeMap<BackendProcessId, SendContext>>,
     pub(crate) report_author: ReportedWork,
     pub(crate) idle: [VecDeque<Position>; 2],
+    pub(crate) closed: super::super::port::abort::ClosedParticipations,
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the original prepaid fact loan stays inline and keeps its exact return obligation without another allocation"
+)]
 enum Prepaid {
     Admission,
     Call(usize),
+    Port(usize, PortFactLoanObligation),
     OpenSubscription,
     Send(usize, Box<PreparedActorSend>),
     Pump,
@@ -109,7 +120,6 @@ struct SendInFlight {
 pub(crate) struct AttemptFailureBinding {
     pub(crate) supervisor: FailureSupervisor,
     pub(crate) port: Box<dyn FailureCleanupPort>,
-    pub(crate) abort_drain: Option<tokio::sync::oneshot::Receiver<DrainedAbortSubmissions>>,
 }
 
 enum Supervisor {
@@ -133,7 +143,7 @@ pub(crate) struct AttemptTransportSource {
     native_source: ActorId,
     scope: ScopeHandle,
     admission: AdmissionSource,
-    calls: [Option<AttemptCallSource>; 6],
+    calls: [Option<AttemptCallSource>; CALL_SOURCES],
     subscriptions: Option<AttemptSubscriptions>,
     pumps: Option<AttemptPumpSource>,
     diagnostics: Option<Arc<AttemptDiagnosticSources>>,
@@ -142,22 +152,34 @@ pub(crate) struct AttemptTransportSource {
     local_pumps_closing: bool,
     requests: FrozenSendRequests,
     contexts: Arc<BTreeMap<BackendProcessId, SendContext>>,
+    closed: super::super::port::abort::ClosedParticipations,
     report_author: Option<ReportedWork>,
     send_idle: [VecDeque<Position>; 2],
     send_live: BTreeMap<AttemptActionId, SendInFlight>,
     abort_receipts: BTreeMap<(TaskOperationId, SendGeneration), Weak<AbortReceiptSlot>>,
+    abort_receipt_scan: RetirementScan,
+    abort_receipt_after: Option<(TaskOperationId, SendGeneration)>,
     failed_sends: BTreeMap<AttemptActionId, Vec<(TaskOperationId, SendGeneration)>>,
     send_ready: VecDeque<AttemptActionId>,
     send_scan: RetirementScan,
     admission_scan: RetirementScan,
     call_scan: usize,
     pending: Option<Prepaid>,
+    ports: Option<OriginalPortJobs>,
+    ordered_original_transferred: bool,
     failure: Option<FailureContext>,
     supervisor: Option<Supervisor>,
-    abort_drain: Option<tokio::sync::oneshot::Receiver<DrainedAbortSubmissions>>,
-    abort_inputs: VecDeque<AbortInputRetirement>,
-    abort_retirement: Option<AbortIngressRetirement>,
-    abort_scan: RetirementScan,
+    supervisor_completed: Option<bool>,
+    residual: Option<FailureResidualReceiveObligation>,
+    residual_refusal_reported: bool,
+    native_originals: Option<
+        ManuallyDrop<
+            Box<crate::query_execution::native_execution_adapter::AttemptSourceOriginalsObligation>,
+        >,
+    >,
+    native_observation:
+        Option<Arc<crate::query_execution::logical_binding::OriginalAttemptObservation>>,
+    lifecycle_detached: bool,
     in_flight: BTreeSet<AttemptActionId>,
     external_closed: bool,
     releases: Option<TransportReleases>,
@@ -171,10 +193,10 @@ impl AttemptTransportSource {
         native_source: ActorId,
         scope: ScopeHandle,
         admission: AdmissionSource,
-        calls: [Option<AttemptCallSource>; 6],
+        calls: [Option<AttemptCallSource>; CALL_SOURCES],
         subscriptions: Option<AttemptSubscriptions>,
         send: AttemptSendSource,
-        mut failure: (FailureContext, AttemptFailureBinding),
+        failure: (FailureContext, AttemptFailureBinding),
         other: Box<dyn EffectSource>,
     ) -> Self {
         assert!(registration.matches_scope(&scope) && admission.matches_scope(&scope));
@@ -201,22 +223,29 @@ impl AttemptTransportSource {
             local_pumps_closing: false,
             requests: send.requests,
             contexts: send.contexts,
+            closed: send.closed,
             report_author: Some(send.report_author),
             send_idle: send.idle,
             send_live: BTreeMap::new(),
             abort_receipts: BTreeMap::new(),
+            abort_receipt_scan: RetirementScan::default(),
+            abort_receipt_after: None,
             failed_sends: BTreeMap::new(),
             send_ready: VecDeque::with_capacity(capacity),
             send_scan: RetirementScan::default(),
             admission_scan: RetirementScan::default(),
             call_scan: 0,
             pending: None,
+            ports: None,
+            ordered_original_transferred: false,
             failure: Some(failure.0),
-            abort_drain: failure.1.abort_drain.take(),
-            abort_inputs: VecDeque::new(),
-            abort_retirement: None,
-            abort_scan: RetirementScan::default(),
             supervisor: Some(Supervisor::Armed(failure.1)),
+            supervisor_completed: None,
+            residual: None,
+            residual_refusal_reported: false,
+            native_originals: None,
+            native_observation: None,
+            lifecycle_detached: true,
             in_flight: BTreeSet::new(),
             external_closed: false,
             releases: None,
@@ -224,22 +253,96 @@ impl AttemptTransportSource {
         }
     }
 
-    pub(crate) fn with_releases(mut self, executor: tokio::runtime::Handle, wake: Waker) -> Self {
-        assert!(self.calls[3].is_some());
-        self.releases = Some(TransportReleases::new(executor, wake));
+    pub(crate) fn with_failure_residual(
+        mut self,
+        original: FailureResidualReceiveObligation,
+        activation: novarocks_coordination_contract::AttemptActivationIdentity,
+    ) -> Self {
+        assert!(original.matches(&self.registration, activation));
+        assert!(self.supervisor.is_some() && self.supervisor_completed.is_none());
+        assert!(self.residual.replace(original).is_none());
         self
     }
 
-    pub(crate) fn with_abort_retirement(
+    fn residual_retired(&self) -> bool {
+        self.residual
+            .as_ref()
+            .is_none_or(|original| self.supervisor_completed.is_some() && original.is_retired())
+    }
+
+    pub(crate) fn with_original_observation(
         mut self,
-        owner: &AbortSettlementOwner,
-        wake: Waker,
+        observation: Arc<crate::query_execution::logical_binding::OriginalAttemptObservation>,
     ) -> Self {
+        assert!(self.native_observation.is_none());
         assert!(
-            self.abort_retirement
-                .replace(owner.ingress_retirement(wake))
+            self.ports
+                .as_ref()
+                .is_some_and(|ports| ports.endpoints.activation() == observation.activation())
+        );
+        self.lifecycle_detached = !observation.observes_lifecycle();
+        self.native_observation = Some(observation);
+        self
+    }
+
+    pub(crate) fn with_native_originals(
+        mut self,
+        original: crate::query_execution::native_execution_adapter::AttemptSourceOriginalsObligation,
+    ) -> Self {
+        assert!(self.releases.is_some());
+        assert!(
+            self.native_observation
+                .as_ref()
+                .is_some_and(|observation| observation.activation() == original.activation())
+        );
+        assert!(
+            self.native_originals
+                .replace(ManuallyDrop::new(Box::new(original)))
                 .is_none()
         );
+        self
+    }
+
+    pub(crate) fn with_ports(
+        mut self,
+        endpoints: Arc<super::super::port::AttemptPortEndpoints>,
+        establish: Arc<super::AttemptEstablishMaterial>,
+        compatibility: novarocks_types::NativeCompatibilityId,
+        receipts: Arc<super::super::port::abort::AbortReceiptTable>,
+        reader: super::super::port::control::ControlReaderObligation,
+        logical: &crate::query_execution::logical_binding::BoundLogicalPorts,
+        link: &crate::control_runtime::logical::links::AttemptActivationLinkLoan,
+    ) -> Self {
+        assert!(endpoints.attempt().same_registration(&self.registration));
+        assert!(logical.runtime.same_runtime(&self.runtime));
+        assert!(self.closed.same_original(&logical.closed));
+        assert!(self.ports.is_none());
+        assert!(
+            self.residual.as_ref().is_some_and(
+                |original| original.matches(&self.registration, endpoints.activation())
+            )
+        );
+        assert!(self.calls[..PORT_CALLS].iter().all(Option::is_some));
+        self.failure
+            .as_ref()
+            .expect("same original failure context")
+            .publications
+            .bind_ports(endpoints.clone());
+        self.ports = Some(OriginalPortJobs::new(
+            endpoints,
+            establish,
+            compatibility,
+            receipts,
+            reader,
+            logical,
+            link,
+        ));
+        self
+    }
+
+    pub(crate) fn with_releases(mut self, executor: tokio::runtime::Handle, wake: Waker) -> Self {
+        assert!(self.calls[RELEASE_CALL].is_some());
+        self.releases = Some(TransportReleases::new(executor, wake));
         self
     }
 
@@ -260,7 +363,7 @@ impl AttemptTransportSource {
     fn take_unclaimed_release(&mut self) -> Option<TransportRelease> {
         if !self.send_live.is_empty()
             || !self.failed_sends.is_empty()
-            || !self.calls[3]
+            || !self.calls[RELEASE_CALL]
                 .as_ref()
                 .is_none_or(AttemptCallSource::is_quiescent)
         {
@@ -283,8 +386,29 @@ impl AttemptTransportSource {
         })
     }
 
+    fn native_jobs_quiescent(&self) -> bool {
+        self.in_flight.is_empty()
+            && self.send_live.is_empty()
+            && self.failed_sends.is_empty()
+            && self.admission.awaiting_result_retirement() == 0
+            && self
+                .calls
+                .iter()
+                .flatten()
+                .all(AttemptCallSource::is_quiescent)
+            && self
+                .subscriptions
+                .as_ref()
+                .is_none_or(AttemptSubscriptions::local_exited)
+            && self
+                .pumps
+                .as_ref()
+                .is_none_or(AttemptPumpSource::local_exited)
+    }
+
     fn transport_drained(&self) -> bool {
-        self.abort_retirement.is_none()
+        self.native_originals.is_none()
+            && self.ports.as_ref().is_none_or(OriginalPortJobs::is_empty)
             && self
                 .subscriptions
                 .as_ref()
@@ -298,6 +422,7 @@ impl AttemptTransportSource {
                 .iter()
                 .flatten()
                 .all(AttemptCallSource::is_drained)
+            && self.abort_receipts.is_empty()
             && self.report_author.is_none()
             && self.send_live.is_empty()
             && self.failed_sends.is_empty()
@@ -351,27 +476,16 @@ impl AttemptTransportSource {
             Some(Supervisor::Running(running)) => match running.progress() {
                 Poll::Pending => false,
                 Poll::Ready(Ok(())) => {
+                    // Running::progress has consumed the actual Join/report,
+                    // retired its original input and reaped the SAME header.
+                    let failed = self
+                        .runtime
+                        .snapshot(self.registration.actor())
+                        .expect("original completed supervisor registration")
+                        .failed;
+                    assert!(self.supervisor_completed.replace(failed).is_none());
                     self.supervisor.take();
-                    if let Some(mut handoff) = self.abort_drain.take() {
-                        let failed = self
-                            .runtime
-                            .snapshot(self.registration.actor())
-                            .expect("original attempt registration")
-                            .failed;
-                        match handoff.try_recv() {
-                            Ok(drained) => {
-                                assert!(failed && self.abort_inputs.is_empty());
-                                self.abort_inputs = drained.retirements;
-                                self.abort_scan.request();
-                                if !drained.errors.is_empty() {
-                                    self.other
-                                        .retain_transport_failure(Box::new(drained.errors));
-                                }
-                            }
-                            Err(tokio::sync::oneshot::error::TryRecvError::Closed) if !failed => {}
-                            Err(error) => std::panic::resume_unwind(Box::new(error)),
-                        }
-                    }
+
                     true
                 }
                 Poll::Ready(Err(error)) => {
@@ -465,7 +579,7 @@ impl AttemptTransportSource {
                     first_poll,
                 );
                 if let OperationIntent::AbortParticipation(request) = operation {
-                    member.retain_abort_receipt(request.participation());
+                    member.retain_abort_receipt(request.participation(), self.closed.clone());
                 }
                 if let Some(report) = diagnostic {
                     member.bind_release_diagnostic(report);
@@ -572,8 +686,8 @@ impl AttemptTransportSource {
             return false;
         }
         let row = self.send_live.remove(&effect).expect("same retired send");
-        for key in row.abort_keys {
-            self.abort_receipts.remove(&key);
+        if !row.abort_keys.is_empty() {
+            self.abort_receipt_scan.request();
         }
         let result = row.result.unwrap();
         self.send_idle[row.lane].push_back(result.original);
@@ -582,6 +696,17 @@ impl AttemptTransportSource {
 }
 
 impl EffectSource for AttemptTransportSource {
+    fn retain_transport_release(&mut self, original: Box<dyn std::any::Any + Send>) {
+        let releases = self
+            .releases
+            .as_mut()
+            .expect("same original disposal executor");
+        assert!(
+            releases.accepts_batch(),
+            "the original host obtains disposal credit before transfer"
+        );
+        releases.retain(ReleaseCapture::Original(original));
+    }
     fn prepay_result(&mut self, effect: &FrontendEffect) -> Option<Position> {
         assert!(self.pending.is_none());
         if let FrontendEffect::Attempt(original) = effect {
@@ -599,22 +724,70 @@ impl EffectSource for AttemptTransportSource {
             {
                 return None;
             }
-            let call_lane = match original {
-                original if original.is_qa_call() => Some(0),
-                original if original.is_process_call() => Some(1),
-                original if original.is_publication_call() => Some(2),
-                original if original.is_transport_release() => Some(3),
-                original if original.is_read_confirmation() => Some(4),
-                original if original.is_subscription_control() => Some(5),
-                _ => None,
-            };
+            let call_lane = self.calls.iter().position(|source| {
+                source
+                    .as_ref()
+                    .is_some_and(|source| source.handles(original))
+            });
+            if original.is_attempt_port()
+                || original.is_process_call()
+                || original.is_publication_call()
+                || original.is_transport_release()
+                || original.is_read_confirmation()
+                || original.is_subscription_control()
+            {
+                assert!(
+                    call_lane.is_some(),
+                    "the original closed call family is installed"
+                );
+            }
             if let Some(lane) = call_lane {
-                let result = self.calls[lane]
+                let port_loan = self.ports.as_ref().and_then(|ports| {
+                    let role = super::super::port::facts::FactRole::for_protocol_effect(&original.protocol.body)?;
+                    let request = matches!(&original.protocol.body,
+                        EffectBody::EstablishAuthorization { .. } | EffectBody::Port(novarocks_attempt_protocol::port_output::AttemptToLogical {
+                            body: novarocks_attempt_protocol::port_output::AttemptToLogicalBody::AuthorizationRequest { .. }
+                                | novarocks_attempt_protocol::port_output::AttemptToLogicalBody::PreReadyReplacementQuery { .. }
+                                | novarocks_attempt_protocol::port_output::AttemptToLogicalBody::EstablishSettlement { .. }, .. }));
+                    Some(ports.prepay(&self.runtime, role, request))
+                });
+                let port_loan = match port_loan {
+                    Some(None) => {
+                        tracing::debug!(
+                            target: "novarocks_original_wait",
+                            actor = ?self.registration.actor(),
+                            activation = ?self.ports.as_ref().map(|ports| ports.endpoints.activation()),
+                            action = ?original.protocol.id,
+                            call_lane = lane,
+                            role = ?super::super::port::facts::FactRole::for_protocol_effect(&original.protocol.body),
+                            "attempt original call prepay refused at port credit"
+                        );
+                        return None;
+                    }
+                    Some(Some(loan)) => Some(loan),
+                    None => None,
+                };
+                let Some(result) = self.calls[lane]
                     .as_mut()
                     .expect("original attempt call Source")
                     .prepay(original)
-                    .expect("original call prepayment")?;
-                self.pending = Some(Prepaid::Call(lane));
+                    .expect("original call prepayment")
+                else {
+                    tracing::debug!(
+                        target: "novarocks_original_wait",
+                        actor = ?self.registration.actor(),
+                        activation = ?self.ports.as_ref().map(|ports| ports.endpoints.activation()),
+                        action = ?original.protocol.id,
+                        call_lane = lane,
+                        role = ?super::super::port::facts::FactRole::for_protocol_effect(&original.protocol.body),
+                        "attempt original call prepay refused at call credit"
+                    );
+                    return None;
+                };
+                self.pending = Some(match port_loan {
+                    Some(loan) => Prepaid::Port(lane, loan),
+                    None => Prepaid::Call(lane),
+                });
                 return Some(result);
             }
             match original.protocol.body {
@@ -660,6 +833,57 @@ impl EffectSource for AttemptTransportSource {
             .unwrap_or_else(|refused| std::panic::resume_unwind(Box::new(refused)))
     }
 
+    fn try_bind_effect(
+        &mut self,
+        runtime: &ActorRuntime<FrontendActor>,
+        turn: &ActorHostTurn<FrontendActor>,
+        ticket: &EffectTicket<FrontendEffect>,
+        result: Position,
+    ) -> Result<crate::control_runtime::host::PreparedEffectBinding, EffectBindRefusal> {
+        if !matches!(self.pending, Some(Prepaid::Port(..))) {
+            return self
+                .try_bind_job(runtime, turn, ticket, result)
+                .map(crate::control_runtime::host::PreparedEffectBinding::Job);
+        }
+        let Prepaid::Port(lane, loan) = self.pending.take().unwrap() else {
+            unreachable!()
+        };
+        let FrontendEffect::Attempt(effect) = &ticket.effect else {
+            unreachable!("same original AP ticket")
+        };
+        let projected = self.ports.as_ref().unwrap().project(effect, |reference| {
+            self.admission
+                .project_failure(reference)
+                .or_else(|| self.subscriptions.as_ref()?.project_failure(reference))
+                .or_else(|| self.pumps.as_ref()?.project_failure(reference))
+                .or_else(|| {
+                    self.calls
+                        .iter()
+                        .flatten()
+                        .find_map(|source| source.project_failure(reference))
+                })
+        });
+        let message = match projected {
+            Ok(message) => message,
+            Err(original) => {
+                self.calls[lane].as_mut().unwrap().return_unclaimed(result);
+                return Err(EffectBindRefusal {
+                    error: ActorTurnError::PublicationTargetMismatch,
+                    original,
+                });
+            }
+        };
+        assert!(self.in_flight.insert(effect.protocol.id));
+        self.ports.as_mut().unwrap().bind(
+            runtime,
+            ticket,
+            result,
+            self.calls[lane].as_mut().unwrap(),
+            loan,
+            message,
+        )
+    }
+
     fn try_bind_job(
         &mut self,
         runtime: &ActorRuntime<FrontendActor>,
@@ -668,52 +892,11 @@ impl EffectSource for AttemptTransportSource {
         result: Position,
     ) -> Result<PreparedEffectJob, EffectBindRefusal> {
         match self.pending.take().expect("same original prepayment") {
+            Prepaid::Port(_, _) => unreachable!("passive port uses original retained binding"),
             Prepaid::Call(lane) => {
                 let FrontendEffect::Attempt(effect) = &ticket.effect else {
                     unreachable!()
                 };
-                if let EffectBody::Port(port) = &effect.protocol.body
-                    && crate::task_execution::bridge::root_control::reply_kind(&port.body).is_some()
-                {
-                    use novarocks_coordination_contract::AttemptToLogicalBody;
-                    let failure = match &port.body {
-                        AttemptToLogicalBody::SealResult {
-                            result: Err(failure),
-                            ..
-                        }
-                        | AttemptToLogicalBody::TerminalControlResult {
-                            result: Err(failure),
-                            ..
-                        } => {
-                            crate::task_execution::bridge::terminal::host_failure_reference(failure)
-                        }
-                        _ => None,
-                    };
-                    let projection = failure.and_then(|reference| {
-                        let input = self
-                            .admission
-                            .project_failure(reference)
-                            .or_else(|| self.subscriptions.as_ref()?.project_failure(reference))
-                            .or_else(|| self.pumps.as_ref()?.project_failure(reference))
-                            .or_else(|| {
-                                self.calls
-                                    .iter()
-                                    .flatten()
-                                    .find_map(|source| source.project_failure(reference))
-                            })?;
-                        Some((reference, input))
-                    });
-                    let source = self.calls[lane].as_mut().unwrap();
-                    if let Err((error, original)) =
-                        source.commit_root_reply(runtime, ticket, port, projection)
-                    {
-                        source.return_unclaimed(result);
-                        return Err(EffectBindRefusal {
-                            error,
-                            original: Box::new(original),
-                        });
-                    }
-                }
                 assert!(self.in_flight.insert(effect.protocol.id));
                 if effect.is_transport_release() {
                     let release = || match effect.protocol.body {
@@ -735,19 +918,7 @@ impl EffectSource for AttemptTransportSource {
                         .unwrap()
                         .bind_with_release(ticket, result, release));
                 }
-                let receipt = match &effect.protocol.body {
-                    EffectBody::Port(port) => match port.body {
-                        novarocks_coordination_contract::AttemptToLogicalBody::AbortSettlement {
-                            operation_id, receipt_generation: Some(generation), ..
-                        } => self.abort_receipts.get(&(operation_id, SendGeneration::new(generation))).and_then(Weak::upgrade),
-                        _ => None,
-                    },
-                    _ => None,
-                };
-                Ok(self.calls[lane]
-                    .as_mut()
-                    .unwrap()
-                    .bind_with_abort_receipt(ticket, result, receipt))
+                Ok(self.calls[lane].as_mut().unwrap().bind(ticket, result))
             }
             Prepaid::OpenSubscription => {
                 let FrontendEffect::Attempt(effect) = &ticket.effect else {
@@ -785,7 +956,15 @@ impl EffectSource for AttemptTransportSource {
                     .into_iter()
                     .map(|(key, receipt)| {
                         let address = (key.operation, key.generation);
+                        if let Some(ports) = &self.ports {
+                            ports.register_abort_receipt(
+                                &receipt
+                                    .upgrade()
+                                    .expect("same original unlaunched Abort report"),
+                            );
+                        }
                         assert!(self.abort_receipts.insert(address, receipt).is_none());
+                        self.abort_receipt_scan.request();
                         address
                     })
                     .collect();
@@ -810,7 +989,9 @@ impl EffectSource for AttemptTransportSource {
 
     fn return_unclaimed_result(&mut self, result: Position) {
         match self.pending.take().expect("same original prepayment") {
-            Prepaid::Call(lane) => self.calls[lane].as_mut().unwrap().return_unclaimed(result),
+            Prepaid::Call(lane) | Prepaid::Port(lane, _) => {
+                self.calls[lane].as_mut().unwrap().return_unclaimed(result)
+            }
             Prepaid::Admission => self.admission.return_unclaimed(result),
             Prepaid::Pump => self.pumps.as_mut().unwrap().return_unclaimed(result),
             Prepaid::OpenSubscription => self
@@ -827,6 +1008,9 @@ impl EffectSource for AttemptTransportSource {
     }
 
     fn core_consumed(&mut self, inputs: &[InputId]) {
+        if let Some(ports) = &mut self.ports {
+            ports.core_consumed(&self.runtime, inputs);
+        }
         if let Some(subscriptions) = self.subscriptions.as_mut() {
             subscriptions.core_consumed(inputs);
         }
@@ -878,27 +1062,33 @@ impl EffectSource for AttemptTransportSource {
             .position(|source| source.as_ref().is_some_and(|source| source.owns(effect)))
         {
             match event {
-                TransportSourceEvent::Result(mut original) => {
-                    if let Some(BodyOutcome::Call(AttemptCallReply::Terminal(publication))) =
-                        &mut original.outcome
-                        && let Some(reference) = publication.host_reference()
-                        && let Some(failure) = self
-                            .admission
-                            .take_failure(reference)
-                            .map(OriginalHostFailure::Task)
-                            .or_else(|| self.subscriptions.as_ref()?.take_failure(reference))
-                            .or_else(|| self.pumps.as_mut()?.take_failure(reference))
-                            .or_else(|| {
-                                self.calls
-                                    .iter_mut()
-                                    .flatten()
-                                    .find_map(|source| source.take_failure(reference))
-                            })
-                    {
-                        publication.attach_host_failure(reference, failure);
-                    }
+                TransportSourceEvent::Result(original) => {
                     let source = self.calls[lane].as_mut().unwrap();
+                    if let Ok(proof) = self.runtime.failure_proof_for(&self.registration) {
+                        match source.accept_after_owner_failure(original, &proof) {
+                            Ok(original) => retain_release(
+                                &mut self.releases,
+                                &mut self.other,
+                                ReleaseCapture::Original(original),
+                            ),
+                            Err(original) => {
+                                self.other.retain_transport_failure(Box::new(original))
+                            }
+                        }
+                        return;
+                    }
                     if let Err(refused) = source.accept(original) {
+                        #[cfg(test)]
+                        eprintln!(
+                            "original AP call result refused before infrastructure notification: effect={:?}, body={:?}, publication={:?}, predecessor_input={:?}",
+                            refused.original.effect.protocol.id,
+                            refused.original.effect.protocol.body,
+                            refused.publication.as_ref().map(|original| &original.error),
+                            refused
+                                .publication
+                                .as_ref()
+                                .and_then(|original| original.predecessor_input)
+                        );
                         self.other.retain_transport_failure(Box::new(refused));
                     }
                     if let Some(original) = source.take_refused_root_input() {
@@ -910,7 +1100,24 @@ impl EffectSource for AttemptTransportSource {
                     }
                 }
                 TransportSourceEvent::Retired => {
-                    assert!(self.in_flight.remove(&effect));
+                    if !self.in_flight.remove(&effect) {
+                        let proof = self.runtime.failure_proof_for(&self.registration).expect(
+                            "untracked call retirement requires the exact original actor failure",
+                        );
+                        let transferred = self.failure.is_none()
+                            && match &self.supervisor {
+                                Some(Supervisor::Running(original)) => {
+                                    original.holds_original_failure_ticket(&proof)
+                                }
+                                _ => self.supervisor_completed == Some(true),
+                            };
+                        assert!(
+                            transferred,
+                            "untracked call retirement precedes original failed-owner tracker transfer"
+                        );
+                    }
+                    // The SAME live call still enforces exact identity and
+                    // once-only actual retirement; result/header reaping is separate.
                     self.calls[lane].as_mut().unwrap().transport_retired(effect);
                 }
                 original => self.other.transport_event(effect, original),
@@ -944,6 +1151,79 @@ impl EffectSource for AttemptTransportSource {
                         self.send_ready.push_back(effect);
                         self.send_scan.request();
                     } else {
+                        // Borrow the SAME unresolved send before boxing its
+                        // original result/header. No payload/receipt is printed.
+                        #[cfg(test)]
+                        {
+                            let body_kind = match &result.effect.protocol.body {
+                                EffectBody::SendBatch { .. } => "SendBatch",
+                                _ => "UnexpectedNonSendBatch",
+                            };
+                            let outcome = match &result.outcome {
+                                None => "None",
+                                Some(BodyOutcome::InputAdmitted { .. }) => "InputAdmitted",
+                                Some(BodyOutcome::ReceiptsRecorded) => "ReceiptsRecorded",
+                                Some(BodyOutcome::Unused(_)) => "Unused",
+                                Some(BodyOutcome::LocalFailure(_)) => "LocalFailure",
+                                Some(BodyOutcome::CreationFailed(_)) => "CreationFailed",
+                                Some(BodyOutcome::Call(_)) => "Call",
+                                Some(BodyOutcome::CallNotStarted(_)) => "CallNotStarted",
+                                Some(BodyOutcome::Pump(_)) => "Pump",
+                                Some(BodyOutcome::RawFailure(_)) => "RawFailure",
+                            };
+                            let raw = match &result.outcome {
+                                Some(BodyOutcome::RawFailure(original)) => Some(original.as_ref()),
+                                _ => None,
+                            };
+                            let preparation = raw.and_then(|original| {
+                                original.downcast_ref::<super::PreparationFailure>()
+                            });
+                            let preparation_kind = preparation.map(|original| match original {
+                                super::PreparationFailure::Governance(_) => "Governance",
+                                super::PreparationFailure::Runtime(_) => "Runtime",
+                                super::PreparationFailure::Role(_) => "Role",
+                                super::PreparationFailure::Channel(_) => "Channel",
+                                super::PreparationFailure::LocalCall(_) => "LocalCall",
+                                super::PreparationFailure::GenerationRetired => "GenerationRetired",
+                                super::PreparationFailure::Layout(_) => "Layout",
+                            });
+                            eprintln!(
+                                "original AP unresolved send result: actor={:?}, event_effect={effect:?}, original_effect={:?}, body={body_kind}, outcome={outcome}, withdrawal={:?}, predecessor_input={:?}, raw_type={:?}, preparation={preparation_kind:?}",
+                                self.registration.actor(),
+                                result.effect.protocol.id,
+                                result.withdrawal.as_ref().map(|original| original
+                                    .as_ref()
+                                    .map(|input| *input)
+                                    .map_err(|refused| &refused.error)),
+                                result
+                                    .withdrawal
+                                    .as_ref()
+                                    .and_then(|original| original.as_ref().err())
+                                    .and_then(|refused| refused.predecessor_input),
+                                raw.map(|original| original.type_id())
+                            );
+                            match &result.outcome {
+                                Some(BodyOutcome::Unused(original)) => {
+                                    eprintln!("original AP unused send reason: {original:?}")
+                                }
+                                Some(BodyOutcome::LocalFailure(original)) => {
+                                    eprintln!("original AP local send refusal: {original:?}")
+                                }
+                                Some(BodyOutcome::CallNotStarted(original)) => {
+                                    eprintln!("original AP unstarted send call: {original:?}")
+                                }
+                                _ => {}
+                            }
+                            match preparation {
+                                Some(super::PreparationFailure::Governance(original)) => {
+                                    eprintln!("original AP send governance refusal: {original:?}")
+                                }
+                                Some(super::PreparationFailure::Runtime(original)) => {
+                                    eprintln!("original AP send runtime refusal: {original:?}")
+                                }
+                                _ => {}
+                            }
+                        }
                         let row = self.send_live.remove(&effect).unwrap();
                         assert!(row.result.is_none());
                         assert!(self.failed_sends.insert(effect, row.abort_keys).is_none());
@@ -966,8 +1246,8 @@ impl EffectSource for AttemptTransportSource {
                     row.retired = true;
                     self.send_scan.request();
                 } else if let Some(abort_keys) = self.failed_sends.remove(&effect) {
-                    for key in abort_keys {
-                        self.abort_receipts.remove(&key);
+                    if !abort_keys.is_empty() {
+                        self.abort_receipt_scan.request();
                     }
                     self.other
                         .transport_event(effect, TransportSourceEvent::Retired);
@@ -984,8 +1264,20 @@ impl EffectSource for AttemptTransportSource {
         &mut self,
         ticket: EffectTicket<FrontendEffect>,
         refused: EffectBindRefusal,
-    ) {
-        self.other.owner_failed_binding(ticket, refused);
+    ) -> Option<crate::control_runtime::host::OriginalUntrackedTransport> {
+        let transport = match &ticket.effect {
+            FrontendEffect::Attempt(effect) => self
+                .ports
+                .as_mut()
+                .and_then(|ports| ports.failed_binding(effect)),
+            _ => None,
+        };
+        let other = self.other.owner_failed_binding(ticket, refused);
+        assert!(
+            other.is_none() || transport.is_none(),
+            "one original binding destination"
+        );
+        transport.or(other)
     }
 
     fn owner_failed_pending(&mut self, pending: PendingHandoff) {
@@ -1042,9 +1334,6 @@ impl EffectSource for AttemptTransportSource {
 
     fn close_external(&mut self) {
         if !self.external_closed {
-            if let Some(qa) = &self.calls[0] {
-                qa.close_abort_ingress();
-            }
             self.other.close_external();
             self.external_closed = true;
         }
@@ -1084,31 +1373,13 @@ impl EffectSource for AttemptTransportSource {
     }
 
     fn begin_local_convergence(&mut self) {
-        if let Some(qa) = &self.calls[0] {
-            qa.close_abort_ingress();
-        }
         self.local_pumps_closing = true;
     }
 
     fn local_convergence_exited(&self) -> bool {
         self.local_pumps_closing
-            && self.in_flight.is_empty()
-            && self.send_live.is_empty()
-            && self.failed_sends.is_empty()
-            && self.admission.awaiting_result_retirement() == 0
-            && self
-                .calls
-                .iter()
-                .flatten()
-                .all(AttemptCallSource::is_quiescent)
-            && self
-                .subscriptions
-                .as_ref()
-                .is_none_or(AttemptSubscriptions::local_exited)
-            && self
-                .pumps
-                .as_ref()
-                .is_none_or(AttemptPumpSource::local_exited)
+            && self.native_jobs_quiescent()
+            && self.native_originals.is_none()
             && self
                 .releases
                 .as_ref()
@@ -1119,12 +1390,15 @@ impl EffectSource for AttemptTransportSource {
         self.result_admission_closed()
             && self.releases.is_some()
             && self.transport_drained()
+            && self.ports.as_ref().is_none_or(OriginalPortJobs::reader_closed)
             // The failed supervisor consumes the original failed tail. In
             // the normal path seal_drained first needs these roles returned.
             && (!failed || self.supervisor.is_none())
     }
 
     fn close_ordered_observations(&mut self, original: OrderedObservationHost) {
+        assert!(!self.ordered_original_transferred);
+        self.ordered_original_transferred = true;
         self.releases
             .as_mut()
             .expect("original observation close executor")
@@ -1145,7 +1419,11 @@ impl EffectSource for AttemptTransportSource {
             && let Some(releases) = self.releases.as_mut().filter(|source| source.has_work())
         {
             units += 1;
-            match releases.progress(self.calls[3].as_ref().expect("original release author")) {
+            match releases.progress(
+                self.calls[RELEASE_CALL]
+                    .as_ref()
+                    .expect("original release author"),
+            ) {
                 Ok(changed) => release_advanced = changed,
                 Err(error) => self.other.retain_transport_failure(Box::new(error)),
             }
@@ -1158,7 +1436,7 @@ impl EffectSource for AttemptTransportSource {
             .failed;
         if (failed || closing)
             && units < budget
-            && self.calls[2]
+            && self.calls[PUBLICATION_CALL]
                 .as_ref()
                 .is_none_or(AttemptCallSource::is_quiescent)
             && let Some(releases) = self
@@ -1173,6 +1451,30 @@ impl EffectSource for AttemptTransportSource {
             releases.retain(ReleaseCapture::Original(Box::new(original)));
             units += 1;
             progressed = true;
+        }
+        let mut port_more = false;
+        if let Some(ports) = &mut self.ports {
+            if turn.was_notified() {
+                ports.notify();
+            }
+            let control = ports.progress_control(runtime, failed, (budget - units).min(1));
+            units += control.units;
+            progressed |= control.progressed;
+            port_more |= control.more;
+            let progress = ports.progress(
+                runtime,
+                &ActorTransportExecutor(
+                    self.releases
+                        .as_ref()
+                        .expect("same original executor")
+                        .executor()
+                        .clone(),
+                ),
+                budget - units,
+            );
+            units += progress.units;
+            progressed |= progress.progressed;
+            port_more |= progress.more;
         }
         // A terminal already in flight can still claim an exact raw error
         // from any call Source. Dispose unselected rows only after all paid
@@ -1227,7 +1529,7 @@ impl EffectSource for AttemptTransportSource {
             .as_ref()
             .is_none_or(TransportReleases::accepts_batch);
         if turn.was_notified() || release_advanced {
-            self.abort_scan.request();
+            self.abort_receipt_scan.request();
             self.admission_scan.request();
             self.send_scan.request();
             if let Some(subscriptions) = &mut self.subscriptions {
@@ -1331,41 +1633,115 @@ impl EffectSource for AttemptTransportSource {
         } else {
             false
         };
-        if self
-            .abort_scan
-            .take_visits(self.abort_inputs.len(), (budget - units).min(1))
-            != 0
-        {
-            units += 1;
-            let mut original = self
-                .abort_inputs
-                .pop_front()
-                .expect("original drained Abort input");
-            if original
-                .retire_ready()
-                .expect("original Abort input retirement")
+        let mut residual_more = false;
+        if let Some(original) = &mut self.residual {
+            let was_retired = original.is_retired();
+            let progress = original.progress(budget - units, self.supervisor_completed);
+            units += progress.units;
+            residual_more |= progress.more;
+            progressed |= !was_retired && original.is_retired();
+            if let Some(error) = progress.error
+                && !self.residual_refusal_reported
             {
+                self.residual_refusal_reported = true;
+                self.other
+                    .retain_transport_failure(Box::new((error, original.record().cloned())));
                 progressed = true;
-            } else {
-                self.abort_inputs.push_back(original);
+            }
+            if original.needs_disposal()
+                && let Some(releases) = self
+                    .releases
+                    .as_mut()
+                    .filter(|source| source.accepts_batch())
+            {
+                if units < budget {
+                    let record = original
+                        .take_disposal()
+                        .expect("same unissued original residual disposal");
+                    releases.retain(ReleaseCapture::FailureResidual(record));
+                    units += 1;
+                    progressed = true;
+                } else {
+                    // Only this unvisited, runnable transfer owns another
+                    // turn. Issued disposal waits for its original Join wake.
+                    residual_more = true;
+                }
             }
         }
-        let mut abort_retirement_more = false;
-        if closing && let Some(retirement) = &mut self.abort_retirement {
-            if units == budget {
-                abort_retirement_more = true;
-            } else {
-                units += 1;
-                match retirement
-                    .progress()
-                    .expect("original Abort role retirement")
-                {
-                    AbortIngressRetirementProgress::Blocked => {}
-                    AbortIngressRetirementProgress::Advanced => abort_retirement_more = true,
-                    AbortIngressRetirementProgress::Complete => {
-                        self.abort_retirement = None;
-                        progressed = true;
+        // Normal local convergence must dispose these originals BEFORE AP
+        // closure/seal, which consumes LocalConvergenceExited. Failed cleanup
+        // additionally retains them until the original residual actually exits.
+        let originals_runnable = self.native_originals.is_some()
+            && (failed || closing || self.local_pumps_closing)
+            && self.native_jobs_quiescent()
+            && (!failed || self.supervisor.is_none() && self.residual_retired())
+            && self
+                .releases
+                .as_ref()
+                .is_some_and(TransportReleases::accepts_batch);
+        let originals_more = originals_runnable && units == budget;
+        if originals_runnable && units < budget {
+            let original = ManuallyDrop::into_inner(self.native_originals.take().unwrap());
+            self.releases
+                .as_mut()
+                .expect("same original disposal executor")
+                .retain(ReleaseCapture::NativeOriginals(original));
+            units += 1;
+            progressed = true;
+        }
+        // The final accepted selection is the same Arc carried by the
+        // committed AP fact. Detach only its value snapshot before this
+        // Source can exit; never reconstruct selection from profile rows.
+        let lifecycle_runnable = !self.lifecycle_detached
+            && closing
+            && self.native_jobs_quiescent()
+            && self.supervisor.is_none()
+            && self.residual_retired();
+        let lifecycle_more = lifecycle_runnable && units == budget;
+        if lifecycle_runnable && units < budget {
+            let observation = self
+                .native_observation
+                .as_ref()
+                .expect("same Native observation");
+            let selection = observation.lifecycle_selection();
+            let snapshot = self
+                .diagnostics
+                .as_ref()
+                .expect("same original diagnostics")
+                .take_lifecycle_rollup(selection.as_deref())
+                .expect("one original final lifecycle snapshot");
+            observation.detach_lifecycle(selection, snapshot);
+            self.lifecycle_detached = true;
+            units += 1;
+            progressed = true;
+        }
+        if self
+            .abort_receipt_scan
+            .take_visits(self.abort_receipts.len(), (budget - units).min(1))
+            != 0
+        {
+            use std::ops::Bound::{Excluded, Unbounded};
+            let next = self
+                .abort_receipt_after
+                .and_then(|after| {
+                    self.abort_receipts
+                        .range((Excluded(after), Unbounded))
+                        .next()
+                })
+                .or_else(|| self.abort_receipts.first_key_value())
+                .map(|(key, receipt)| (*key, receipt.strong_count() == 0));
+            units += 1;
+            if let Some((key, actually_dropped)) = next {
+                self.abort_receipt_after = Some(key);
+                if actually_dropped {
+                    if let Some(ports) = &self.ports {
+                        ports.retire_abort_receipt(SendKey {
+                            operation: key.0,
+                            generation: key.1,
+                        });
                     }
+                    self.abort_receipts.remove(&key);
+                    progressed = true;
                 }
             }
         }
@@ -1489,21 +1865,61 @@ impl EffectSource for AttemptTransportSource {
             }
         }
         if closing && self.transport_drained() {
+            if units < budget
+                && let Some(ports) = &mut self.ports
+            {
+                let (changed, more) = ports.close_recipient_inputs(runtime);
+                units += 1;
+                progressed |= changed;
+                port_more |= more;
+            }
+            if self.supervisor.is_none()
+                && self.residual_retired()
+                && let Some(ports) = &self.ports
+            {
+                progressed |= ports.producer_work_exited();
+            }
+            // Return protocol inputs before normal seal_drained. The Aux
+            // object/raw cell stays here until the final residual/Source gate.
             self.other.transport_roles_drained();
+        }
+        if units < budget
+            && let Some(releases) = self.releases.as_mut().filter(|r| r.accepts_batch())
+            && let Some(original) = self
+                .ports
+                .as_mut()
+                .and_then(OriginalPortJobs::take_establish_after_producer_exit)
+        {
+            releases.retain(ReleaseCapture::Original(Box::new(original)));
+            units += 1;
+            progressed = true;
+        }
+        if self.ordered_original_transferred
+            && units < budget
+            && let Some(releases) = self.releases.as_mut().filter(|r| r.is_empty())
+            && let Some(ports) = &mut self.ports
+            && let Some(original) = ports.take_input_author_return()
+        {
+            releases.retain(ReleaseCapture::InputAuthor(original));
+            units += 1;
+            progressed = true;
         }
         let mut progress = self
             .other
             .progress_retirement(runtime, turn, now, budget - units);
         progress.units += units;
         progress.progressed |= progressed || supervisor_advanced || release_advanced;
-        progress.more |= subscription_progress
-            .as_ref()
-            .is_some_and(|progress| release_accepting && progress.more)
+        progress.more |= lifecycle_more
+            || originals_more
+            || port_more
+            || residual_more
+            || subscription_progress
+                .as_ref()
+                .is_some_and(|progress| release_accepting && progress.more)
             || pump_more
             || split_changed
             || supervisor_advanced
-            || self.abort_scan.has_work(self.abort_inputs.len())
-            || abort_retirement_more
+            || self.abort_receipt_scan.has_work(self.abort_receipts.len())
             || self
                 .admission_scan
                 .has_work(self.admission.awaiting_result_retirement())
@@ -1515,8 +1931,14 @@ impl EffectSource for AttemptTransportSource {
                     .as_ref()
                     .is_some_and(TransportReleases::has_work)
             || progressed && self.result_admission_closed();
-        progress.retired &=
-            self.supervisor.is_none() && self.abort_inputs.is_empty() && self.transport_drained();
+        progress.retired &= self.supervisor.is_none()
+            && self.residual_retired()
+            && self.lifecycle_detached
+            && self.transport_drained()
+            && self
+                .ports
+                .as_ref()
+                .is_none_or(OriginalPortJobs::inputs_return_issued);
         progress
     }
 }

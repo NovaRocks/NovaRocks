@@ -45,6 +45,28 @@ tokio::task_local! {
     pub(crate) static HADOOP_TEST_LIST_CALLS: std::cell::Cell<usize>;
 }
 
+/// Unit-test observation of original storage requests; no product control route is installed.
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TestStorageRequest {
+    pub operation: &'static str,
+    pub path: String,
+}
+#[cfg(test)]
+tokio::task_local! {
+    pub(crate) static TEST_STORAGE_REQUESTS: std::sync::Arc<std::sync::Mutex<Vec<TestStorageRequest>>>;
+    pub(crate) static TEST_AVRO_WRITES_BEFORE_FAILURE: std::cell::Cell<usize>;
+}
+#[cfg(test)]
+pub(crate) fn note_test_storage_request(operation: &'static str, path: &str) {
+    let _ = TEST_STORAGE_REQUESTS.try_with(|requests| {
+        requests.lock().unwrap().push(TestStorageRequest {
+            operation,
+            path: path.to_owned(),
+        });
+    });
+}
+
 #[cfg(test)]
 fn note_hadoop_test_list() {
     let _ = HADOOP_TEST_LIST_CALLS.try_with(|calls| calls.set(calls.get() + 1));
@@ -216,6 +238,8 @@ pub struct IcebergFileSystemFactory {
     admission: Option<Arc<dyn IcebergWriteAdmission>>,
     #[serde(skip, default)]
     creation: Option<ManagedWriteObjects>,
+    #[serde(skip, default)]
+    staged_paths: Option<crate::commit::data_writer::StagedPathJournal>,
 }
 
 impl IcebergFileSystemFactory {
@@ -224,6 +248,7 @@ impl IcebergFileSystemFactory {
             binding: Some(binding),
             admission: None,
             creation: None,
+            staged_paths: None,
         }
     }
 }
@@ -242,6 +267,7 @@ impl StorageFactory for IcebergFileSystemFactory {
             listing: None,
             admission: self.admission.clone(),
             creation: self.creation.clone(),
+            staged_paths: self.staged_paths.clone(),
         }))
     }
 }
@@ -256,6 +282,8 @@ pub struct IcebergFsStorage {
     admission: Option<Arc<dyn IcebergWriteAdmission>>,
     #[serde(skip, default)]
     creation: Option<ManagedWriteObjects>,
+    #[serde(skip, default)]
+    staged_paths: Option<crate::commit::data_writer::StagedPathJournal>,
 }
 
 impl IcebergFsStorage {
@@ -265,6 +293,7 @@ impl IcebergFsStorage {
             listing: None,
             admission: None,
             creation: None,
+            staged_paths: None,
         }
     }
 
@@ -441,6 +470,8 @@ impl Storage for IcebergFsStorage {
     }
 
     async fn read(&self, path: &str) -> Result<Bytes> {
+        #[cfg(test)]
+        note_test_storage_request("read", path);
         self.check_read_active("read")?;
         let _io = optional_io_permit(self.admission.as_ref()).await?;
         let _phase = self.non_http_phase(path).await?;
@@ -456,6 +487,8 @@ impl Storage for IcebergFsStorage {
     }
 
     async fn reader(&self, path: &str) -> Result<Box<dyn FileRead>> {
+        #[cfg(test)]
+        note_test_storage_request("read", path);
         self.check_read_active("reader")?;
         let _io = optional_io_permit(self.admission.as_ref()).await?;
         let (access, relative_path) = self.resolve_path("reader", path).await?;
@@ -471,6 +504,8 @@ impl Storage for IcebergFsStorage {
     }
 
     async fn write(&self, path: &str, bs: Bytes) -> Result<()> {
+        #[cfg(test)]
+        note_test_storage_request("write", path);
         if self.creation.is_some() {
             let mut writer = self.writer(path).await?;
             writer.write(bs).await?;
@@ -507,6 +542,8 @@ impl Storage for IcebergFsStorage {
     }
 
     async fn writer(&self, path: &str) -> Result<Box<dyn FileWrite>> {
+        #[cfg(test)]
+        note_test_storage_request("write", path);
         if let Some(creation) = &self.creation {
             let binding = self.binding.as_ref().ok_or_else(|| {
                 Error::new(
@@ -516,6 +553,18 @@ impl Storage for IcebergFsStorage {
             })?;
             return creation.open(binding, path).await;
         }
+        let progress = self
+            .staged_paths
+            .as_ref()
+            .map(|journal| {
+                journal.write_progress(path).ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::Unexpected,
+                        "staged writer path was not registered",
+                    )
+                })
+            })
+            .transpose()?;
         let permit = match &self.admission {
             Some(admission) => Some(admission.clone().admit(path)?.acquire().await?),
             None => None,
@@ -551,6 +600,22 @@ impl Storage for IcebergFsStorage {
         Self::ensure_parent_dir(&op, &relative_path).await?;
         if let Some(permit) = &permit {
             permit.check_active()?;
+        }
+        #[cfg(test)]
+        if path.ends_with(".avro")
+            && TEST_AVRO_WRITES_BEFORE_FAILURE
+                .try_with(|remaining| {
+                    let before = remaining.get();
+                    remaining.set(before.saturating_sub(1));
+                    before == 0
+                })
+                .unwrap_or(false)
+        {
+            note_test_storage_request("write-refused", path);
+            return Err(Error::new(
+                ErrorKind::Unexpected,
+                "injected Avro store refusal",
+            ));
         }
         let stream = phase
             .as_ref()
@@ -592,10 +657,13 @@ impl Storage for IcebergFsStorage {
             stream,
             local_closed: false,
             accepted_bytes: 0,
+            progress,
         }))
     }
 
     async fn delete(&self, path: &str) -> Result<()> {
+        #[cfg(test)]
+        note_test_storage_request("delete", path);
         if let Some(creation) = &self.creation {
             creation
                 .journal
@@ -753,9 +821,17 @@ struct IcebergFsFileWrite {
     local_closed: bool,
     // Only writes returned successfully to the SDK contribute to stored size.
     accepted_bytes: u64,
+    progress: Option<crate::commit::data_writer::StagedWriteProgress>,
 }
 
 impl IcebergFsFileWrite {
+    fn record_accepted(&mut self, bytes: u64) {
+        self.accepted_bytes = bytes;
+        if let Some(progress) = &self.progress {
+            progress.record_accepted(bytes);
+        }
+    }
+
     fn closed_metadata(&self, metadata: crate::opendal::Metadata) -> Result<FileMetadata> {
         let reported = metadata.content_length();
         if reported != 0 && reported != self.accepted_bytes {
@@ -912,7 +988,7 @@ impl FileWrite for IcebergFsFileWrite {
                 .write(bs)
                 .await
                 .map_err(|e| Error::new(ErrorKind::Unexpected, format!("fs write: {e}")))?;
-            self.accepted_bytes = accepted_bytes;
+            self.record_accepted(accepted_bytes);
             return Ok(());
         }
         let mut writer = self
@@ -929,7 +1005,7 @@ impl FileWrite for IcebergFsFileWrite {
         .await;
         match result {
             Ok((accepted_bytes, None)) => {
-                self.accepted_bytes = accepted_bytes;
+                self.record_accepted(accepted_bytes);
                 self.writer = Some(writer);
                 Ok(())
             }
@@ -1011,6 +1087,7 @@ pub(crate) fn build_admitted_file_io_for_location(
         binding: Some(binding),
         admission: Some(admission),
         creation: None,
+        staged_paths: None,
     }))
     .build()
 }
@@ -1045,8 +1122,20 @@ pub(crate) fn build_managed_file_io(
             format,
             journal,
         }),
+        staged_paths: None,
     }))
     .build())
+}
+
+pub(crate) fn build_tracked_staged_file_io(
+    binding: IcebergReadBinding,
+    staged_paths: crate::commit::data_writer::StagedPathJournal,
+) -> FileIO {
+    FileIOBuilder::new(Arc::new(IcebergFileSystemFactory {
+        staged_paths: Some(staged_paths),
+        ..IcebergFileSystemFactory::new(binding)
+    }))
+    .build()
 }
 
 pub fn build_file_io_for_location(location: &str, binding: IcebergReadBinding) -> FileIO {
@@ -1111,6 +1200,7 @@ pub(crate) async fn list_directories(
         listing: Some(bound),
         admission: None,
         creation: None,
+        staged_paths: None,
     };
     storage.list_directories(location).await
 }
@@ -1566,6 +1656,7 @@ mod tests {
                 stream: None,
                 local_closed: false,
                 accepted_bytes: 0,
+                progress: None,
             },
             admission,
             events,
@@ -1957,6 +2048,7 @@ mod tests {
             listing: Some(novarocks_spi::connector::ConnectorListingPageSize::new(1).unwrap()),
             admission: None,
             creation: None,
+            staged_paths: None,
         };
         assert_eq!(
             complete.list_directories(&location).await.unwrap(),
@@ -2389,9 +2481,8 @@ pub(crate) mod manifest_stream_tests {
 
     use super::*;
     use crate::commit::model::{
-        AddedContent, ArtifactClass, ArtifactKind, ArtifactWriteState, ArtifactWriter,
-        AttemptArtifacts, AttemptToken, CleanupRemainingReason, CleanupScope, IcebergCleanupReport,
-        ObjectIdentity,
+        AddedContent, ArtifactKind, ArtifactWriteState, ArtifactWriter, AttemptToken,
+        CleanupRemainingReason, CleanupScope, IcebergCleanupReport, ObjectIdentity,
     };
     use crate::commit::operation::{
         CleanupBudget, IcebergCommitAttempt, IcebergCommitOperation, OperationLimits,
@@ -2487,6 +2578,7 @@ pub(crate) mod manifest_stream_tests {
                 stream: None,
                 local_closed: false,
                 accepted_bytes: 0,
+                progress: None,
             }))
         }
     }
@@ -2643,11 +2735,43 @@ pub(crate) mod manifest_stream_tests {
         fn check_active(&self) -> Result<()> {
             self.attempt.check_active()
         }
-        fn allocate(&self, class: ArtifactClass, kind: ArtifactKind) -> Result<ObjectIdentity> {
-            self.attempt.allocate(class, kind)
+        fn allocate(&self, kind: ArtifactKind) -> Result<ObjectIdentity> {
+            self.attempt.allocate(kind)
         }
-        fn snapshot_artifacts(&self, references: &[ObjectIdentity]) -> Result<AttemptArtifacts> {
-            self.attempt.snapshot_artifacts(references)
+        fn snapshot_artifacts(
+            &self,
+            lists: &[crate::commit::model::ObjectIdentity],
+            statistics: &[crate::commit::model::ObjectIdentity],
+        ) -> crate::iceberg::Result<crate::commit::model::AttemptArtifacts> {
+            self.attempt.snapshot_artifacts(lists, statistics)
+        }
+
+        fn record_manifest(
+            &self,
+            object: &crate::commit::model::ObjectIdentity,
+            added_paths: &[String],
+            existing_paths: &[String],
+            replaces: &[String],
+        ) -> crate::iceberg::Result<()> {
+            self.attempt
+                .record_manifest(object, added_paths, existing_paths, replaces)
+        }
+
+        fn record_manifest_list(
+            &self,
+            object: &crate::commit::model::ObjectIdentity,
+            snapshot_id: i64,
+            paths: &[String],
+        ) -> crate::iceberg::Result<()> {
+            self.attempt
+                .record_manifest_list(object, snapshot_id, paths)
+        }
+        fn stage_snapshot_id(
+            &self,
+            stage: usize,
+            metadata: &crate::iceberg::spec::TableMetadata,
+        ) -> crate::iceberg::Result<i64> {
+            self.attempt.stage_snapshot_id(stage, metadata)
         }
     }
 
@@ -2680,7 +2804,6 @@ pub(crate) mod manifest_stream_tests {
             io_requests: 1,
             cleanup: CleanupBudget {
                 time: Duration::from_millis(100),
-                objects: 1,
             },
         }
     }
@@ -2709,7 +2832,7 @@ pub(crate) mod manifest_stream_tests {
     }
 
     #[tokio::test]
-    async fn sdk_manifest_streams_register_before_admission_and_obey_cleanup_object_bound() {
+    async fn sdk_manifest_streams_register_before_admission_and_cleanup_completed_outputs() {
         let fixture = Fixture::new_with_limits(limits());
         let metadata = fixture.metadata(FormatVersion::V3);
         let (artifacts, probe) = probe_artifacts(&fixture, None);
@@ -2789,23 +2912,7 @@ pub(crate) mod manifest_stream_tests {
             .operation
             .cleanup(CleanupScope::EntireOperation)
             .await;
-        let IcebergCleanupReport::Partial {
-            deleted: 1,
-            remaining,
-        } = report
-        else {
-            panic!("cleanup must obey the one-object bound: {report:?}")
-        };
-        assert_eq!(remaining.len(), 1);
-        assert_eq!(remaining[0].reason, CleanupRemainingReason::BudgetExhausted);
-        assert_eq!(fixture.operation.artifacts().unwrap().len(), 1);
-        assert!(matches!(
-            fixture
-                .operation
-                .cleanup(CleanupScope::EntireOperation)
-                .await,
-            IcebergCleanupReport::Complete { deleted: 1 }
-        ));
+        assert_eq!(report, IcebergCleanupReport::Complete { deleted: 2 });
         assert!(fixture.operation.artifacts().unwrap().is_empty());
         for record in records {
             assert!(!Path::new(record.object.path().strip_prefix("file://").unwrap()).exists());
@@ -2865,7 +2972,9 @@ pub(crate) mod manifest_stream_tests {
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].object, records[0].object);
         assert_eq!(remaining[0].reason, CleanupRemainingReason::BudgetExhausted);
-        assert_eq!(fixture.operation.artifacts().unwrap(), records);
+        let mut retired = records.clone();
+        retired[0].retired = true;
+        assert_eq!(fixture.operation.artifacts().unwrap(), retired);
         assert!(!task.is_finished());
         assert!(!gate.write_exited.load(Ordering::SeqCst));
         gate.resume.notify_one();

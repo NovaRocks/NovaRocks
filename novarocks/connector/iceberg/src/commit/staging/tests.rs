@@ -104,11 +104,7 @@ impl ArtifactWriter for TestWriter {
     fn file_io(&self) -> &FileIO {
         &self.io
     }
-    fn allocate(
-        &self,
-        class: ArtifactClass,
-        kind: ArtifactKind,
-    ) -> crate::iceberg::Result<ObjectIdentity> {
+    fn allocate(&self, kind: ArtifactKind) -> crate::iceberg::Result<ObjectIdentity> {
         let mut ledger = self.ledger.lock().unwrap();
         let path = format!(
             "file://{}/object-{}.{}",
@@ -117,12 +113,11 @@ impl ArtifactWriter for TestWriter {
             kind.extension()
         );
         let object = ObjectIdentity::new(path)?;
-        ledger.register(ArtifactRecord {
-            object: object.clone(),
-            class,
-            attempt: (class == ArtifactClass::Attempt).then_some(self.attempt),
-            write_state: ArtifactWriteState::Allocated,
-        })?;
+        ledger.register(ArtifactRecord::produced(
+            object.clone(),
+            self.attempt_token(),
+            kind,
+        ))?;
         Ok(object)
     }
     fn attempt_token(&self) -> AttemptToken {
@@ -133,12 +128,50 @@ impl ArtifactWriter for TestWriter {
     }
     fn snapshot_artifacts(
         &self,
-        references: &[ObjectIdentity],
-    ) -> crate::iceberg::Result<AttemptArtifacts> {
+        lists: &[crate::commit::model::ObjectIdentity],
+        statistics: &[crate::commit::model::ObjectIdentity],
+    ) -> crate::iceberg::Result<crate::commit::model::AttemptArtifacts> {
         self.ledger
             .lock()
             .unwrap()
-            .snapshot_for_attempt(self.attempt, references.iter().cloned())
+            .snapshot_for_request(self.attempt_token(), lists, statistics)
+    }
+
+    fn record_manifest(
+        &self,
+        object: &crate::commit::model::ObjectIdentity,
+        added_paths: &[String],
+        existing_paths: &[String],
+        replaces: &[String],
+    ) -> crate::iceberg::Result<()> {
+        let mut ledger = self.ledger.lock().unwrap();
+        // This callback follows the successful FileIO write in the fixture.
+        let written = ledger.records().any(|record| {
+            record.object == *object
+                && record.write_state == crate::commit::model::ArtifactWriteState::Written
+        });
+        if !written {
+            ledger.confirm_written_for_test(object)?;
+        }
+        ledger.record_manifest(object, added_paths, existing_paths, replaces)
+    }
+
+    fn record_manifest_list(
+        &self,
+        object: &crate::commit::model::ObjectIdentity,
+        snapshot_id: i64,
+        paths: &[String],
+    ) -> crate::iceberg::Result<()> {
+        let mut ledger = self.ledger.lock().unwrap();
+        // This callback follows the successful FileIO write in the fixture.
+        let written = ledger.records().any(|record| {
+            record.object == *object
+                && record.write_state == crate::commit::model::ArtifactWriteState::Written
+        });
+        if !written {
+            ledger.confirm_written_for_test(object)?;
+        }
+        ledger.record_manifest_list(object, snapshot_id, paths)
     }
 }
 fn existing(metadata: TableMetadata) -> StagingBase {
@@ -304,7 +337,7 @@ async fn every_stage_equals_canonical_prefix_and_whole_request() {
         100
     );
     let staged = facts(engine.metadata());
-    let request = engine.freeze(&[]).unwrap();
+    let request = engine.freeze().unwrap();
     assert_eq!(
         staged,
         facts(&super::normalize::replay(&base, None, request.updates()).unwrap())
@@ -418,7 +451,7 @@ async fn later_preparer_observes_prior_snapshot_and_cas_is_single_base_assertion
         })
         .await
         .unwrap();
-    let request = engine.freeze(&[]).unwrap();
+    let request = engine.freeze().unwrap();
     assert_eq!(request.ref_snapshot_after("main"), Some(12));
     let cas: Vec<_> = request
         .requirements()
@@ -559,7 +592,7 @@ async fn requirements_from_staged_schema_are_folded_to_parent_schema() {
             ],
         })
         .unwrap();
-    let request = engine.freeze(&[]).unwrap();
+    let request = engine.freeze().unwrap();
     assert_eq!(
         request
             .requirements()
@@ -717,9 +750,7 @@ async fn manifest_roundtrip_preserves_d12_sequences_and_carried_row_ids() {
 async fn provider_manifest_read_inherits_sequences_without_assigning_v3_row_ids() {
     let metadata = fixture(FormatVersion::V3);
     let artifacts = TestWriter::new();
-    let object = artifacts
-        .allocate(ArtifactClass::Attempt, ArtifactKind::Manifest)
-        .unwrap();
+    let object = artifacts.allocate(ArtifactKind::Manifest).unwrap();
     let mut writer = ManifestWriterBuilder::new(
         artifacts.file_io().new_output(object.path()).unwrap(),
         None,
@@ -851,7 +882,7 @@ async fn create_initialization_is_complete_and_only_asserts_create() {
     engine
         .stage_change(change(append(engine.metadata(), 11)))
         .unwrap();
-    let request = engine.freeze(&[]).unwrap();
+    let request = engine.freeze().unwrap();
     assert_eq!(request.requirements(), &[TableRequirement::NotExist]);
     assert_eq!(request.ref_snapshot_after("main"), Some(11));
     assert_eq!(
@@ -931,7 +962,7 @@ async fn frozen_requests_match_stable_rest_goldens() {
                 .stage_change(change(append(engine.metadata(), 11)))
                 .unwrap();
         }
-        let request = engine.freeze(&[]).unwrap();
+        let request = engine.freeze().unwrap();
         let json = request.to_rest_json().unwrap();
         let (name, golden) = match shape {
             RequestShape::SnapshotProducing => ("snapshot", include_str!("golden/snapshot.json")),
@@ -1072,7 +1103,7 @@ async fn new_spec_binds_missing_field_ids_before_rest_freeze() {
             TableUpdate::SetDefaultSpec { spec_id: -1 },
         ]))
         .unwrap();
-    let request = engine.freeze(&[]).unwrap();
+    let request = engine.freeze().unwrap();
     let json = request.to_rest_json().unwrap();
     assert_eq!(
         json["updates"][0]["spec"]["fields"][0]["field-id"],
@@ -1109,7 +1140,7 @@ async fn ref_retention_staging_generates_set_ref_assertion_but_requires_explicit
             }],
         })
         .unwrap();
-    let request = engine.freeze(&[]).unwrap();
+    let request = engine.freeze().unwrap();
     assert_eq!(request.shape(), RequestShape::RefRetention);
     assert!(
         request
@@ -1168,9 +1199,7 @@ fn artifactless_existing_schema_stages_canonical_ids_and_parent_requirements_wit
     )
     .unwrap();
     assert_eq!(request.artifacts().attempt(), attempt);
-    assert!(request.artifacts().attempt_owned().is_empty());
-    assert!(request.artifacts().operation_references().is_empty());
-    assert!(request.artifacts().session_references().is_empty());
+    assert!(request.artifacts().references().is_empty());
     assert_eq!(
         request.requirements(),
         &[
@@ -1294,7 +1323,7 @@ fn artifactless_freeze_keeps_exactly_one_equal_caller_uuid() {
         request.requirements(),
         &[TableRequirement::UuidMatch { uuid: uuid() }]
     );
-    assert!(request.artifacts().attempt_owned().is_empty());
+    assert!(request.artifacts().references().is_empty());
 }
 
 #[test]
@@ -1355,7 +1384,7 @@ async fn document_expiry_asserts_all_observed_refs_and_matches_rest_golden() {
             },
         ]))
         .unwrap();
-    let request = engine.freeze(&[]).unwrap();
+    let request = engine.freeze().unwrap();
     let expected: serde_json::Value =
         serde_json::from_str(include_str!("golden/document-expiry.json")).unwrap();
     assert_eq!(request.to_rest_json().unwrap(), expected);
@@ -1365,7 +1394,7 @@ async fn document_expiry_asserts_all_observed_refs_and_matches_rest_golden() {
             snapshot_ids: vec![id],
         }]));
         assert!(
-            staged.is_err() || engine.freeze(&[]).is_err(),
+            staged.is_err() || engine.freeze().is_err(),
             "ref head must not be removed"
         );
     }
@@ -1374,7 +1403,7 @@ async fn document_expiry_asserts_all_observed_refs_and_matches_rest_golden() {
         removals: vec![key],
     }]))
     .unwrap();
-    assert_eq!(only.freeze(&[]).unwrap().updates().len(), 1);
+    assert_eq!(only.freeze().unwrap().updates().len(), 1);
 }
 
 #[tokio::test]
@@ -1399,4 +1428,77 @@ async fn document_expiry_rejects_every_effect_outside_its_channel() {
         let mut engine = StagingEngine::begin(existing(base.clone()), &expiry, &writer).unwrap();
         assert!(engine.stage_change(change(vec![update])).is_err());
     }
+}
+
+#[tokio::test]
+async fn manifest_list_rejects_replacement_together_with_its_source() {
+    check_manifest_list_rejects_replacement_together_with_its_source(false).await;
+}
+
+/// Exercises list construction after the compact stage has sealed its coverage.
+#[tokio::test]
+async fn compact_list_construction_rejects_replacement_together_with_its_source() {
+    check_manifest_list_rejects_replacement_together_with_its_source(true).await;
+}
+
+async fn check_manifest_list_rejects_replacement_together_with_its_source(compact: bool) {
+    let metadata = fixture(FormatVersion::V2);
+    let writer = TestWriter::new();
+    let mut manifests = Vec::new();
+    let source = "s3://bucket/source.parquet";
+    let replacement = if compact {
+        source
+    } else {
+        "s3://bucket/replacement.parquet"
+    };
+    if compact {
+        writer
+            .ledger
+            .lock()
+            .unwrap()
+            .register(ArtifactRecord::received(
+                ObjectIdentity::new(source).unwrap(),
+                ReceivedPublication::ViaManifest,
+            ))
+            .unwrap();
+    }
+    for path in [source, replacement] {
+        manifests.push(
+            write_manifest(
+                &writer,
+                FormatVersion::V2,
+                11,
+                metadata.current_schema().clone(),
+                metadata.default_partition_spec().as_ref().clone(),
+                ManifestContentType::Data,
+                [ManifestEntryWrite::Added(
+                    AddedContent::new_logical_data(data(path, 1, None), 0).unwrap(),
+                )],
+            )
+            .await
+            .unwrap(),
+        );
+    }
+    if compact {
+        writer
+            .ledger
+            .lock()
+            .unwrap()
+            .seal_compact_stage(11, &manifests[..1], 1)
+            .unwrap();
+    }
+    // Both descriptors come from completed writes. Only the replacement relation
+    // is injected here, to exercise the actual list writer's construction gate.
+    writer
+        .record_manifest(
+            &ObjectIdentity::new(&manifests[1].manifest_path).unwrap(),
+            &[replacement.to_owned()],
+            &[],
+            &[manifests[0].manifest_path.clone()],
+        )
+        .unwrap();
+    let Err(error) = write_manifest_list(&writer, &metadata, 11, None, manifests).await else {
+        panic!("replacement and source were accepted together")
+    };
+    assert!(error.to_string().contains("replac"), "{error}");
 }

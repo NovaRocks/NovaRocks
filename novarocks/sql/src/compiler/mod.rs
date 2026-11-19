@@ -37,7 +37,7 @@ pub use crate::optimizer::options::SessionOptimizerSettings;
 mod required_constant;
 pub use required_constant::{
     PreparedRequiredConstant, RequiredConstantInput, RequiredConstantRequest,
-    RequiredConstantTarget, prepare_required_constant,
+    RequiredConstantTarget, SqlAuthoredScalarUnit, prepare_required_constant,
 };
 
 mod captured_catalog;
@@ -53,8 +53,7 @@ pub use crate::planner::distributed::build::{
     SqlSourceJournalError,
 };
 pub use crate::planner::distributed::build::{
-    FragmentPackageSemantics, PackageSemanticsError, author_fragment_package_semantics,
-    check_pure_call_definitions_observed,
+    PackageSemanticsError, check_pure_call_definitions_observed,
 };
 pub use captured_catalog::{SqlCapturedCatalog, SqlCapturedCatalogPreparation};
 #[cfg(test)]
@@ -3134,9 +3133,15 @@ mod tests {
             // JSON objects cast to VARCHAR are admitted with the complete
             // target schema; actual object values must fail with Data9 at runtime.
             let mut array_cast_count = 0;
-            for fragment in plan.plan().fragments().values() {
-                for (_, expression) in fragment.expressions().iter() {
-                    if let novarocks_physical_plan::ExprKind::Cast {
+            for unit in plan
+                .plan()
+                .fragments()
+                .values()
+                .flat_map(|fragment| fragment.nodes().values())
+                .filter_map(|node| node.expressions.as_ref())
+            {
+                for expression in unit.definitions() {
+                    if let novarocks_expression_contract::ExprKind::Cast {
                         expr,
                         array_failure_mode: Some(mode),
                         target,
@@ -3149,10 +3154,7 @@ mod tests {
                             novarocks_type_contract::ArrayCastFailureMode::ReportError
                         );
                         assert_eq!(target, expression.ty.data_type());
-                        let source = fragment
-                            .expressions()
-                            .get(*expr)
-                            .expect("original CAST operand");
+                        let source = unit.definition(*expr).expect("original CAST operand");
                         assert_eq!(
                             source.ty.child_at(0).unwrap().logical_type(),
                             novarocks_type_contract::ValueLogicalType::Json

@@ -102,6 +102,25 @@ ALTER TABLE iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.vector_rows EXECUTE opti
 SELECT k FROM iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.vector_rows ORDER BY k;
 
 -- query 17
+-- Give each partition a second file so the same OPTIMIZE session runs both cohorts.
+-- @skip_result_check=true
+INSERT INTO iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.partition_rows VALUES ROW(4, 'a');
+INSERT INTO iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.partition_rows VALUES ROW(5, 'b');
+
+-- query 18
+ALTER TABLE iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.partition_rows EXECUTE optimize;
+
+-- query 19
+SELECT p, count(*) AS row_count, sum(k) AS key_sum
+FROM iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.partition_rows
+GROUP BY p ORDER BY p;
+
+-- query 20
+SELECT "partition", record_count AS physical_rows
+FROM iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}."partition_rows$files"
+WHERE content = 0 ORDER BY record_count DESC;
+
+-- query 21
 -- @cleanup=true
 -- @skip_result_check=true
 DROP TABLE IF EXISTS iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.empty_rows ;

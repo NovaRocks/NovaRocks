@@ -145,7 +145,7 @@ mod tests {
     use super::*;
     use crate::{
         FilterConsumerActivation, FilterLateApplyGranularity, FilterNullOrder, FilterOrderKey,
-        FilterOrderKeys, FilterProducerKind, FilterReduction, FilterSortDirection, ProgramExprId,
+        FilterOrderKeys, FilterProducerKind, FilterReduction, FilterSortDirection,
         StaticFilterConsumer, StaticFilterContract, StaticFilterProducer,
     };
     use novarocks_type_contract::{
@@ -268,7 +268,7 @@ mod tests {
 
     fn topn_site(exits: Arc<Mutex<Vec<&'static str>>>) -> AggregateTopNFilter {
         AggregateTopNFilter {
-            group_key_expr: ProgramExprId::new(4),
+            group_key_expr: crate::test_support::root(0, 4),
             group_key_ordinal: 0,
             limit: NonZeroU32::new(7).unwrap(),
             producer: StaticFilterProducer::try_new(
@@ -284,7 +284,7 @@ mod tests {
 
     fn scan_site(exits: Arc<Mutex<Vec<&'static str>>>) -> FilterConsumerAtExpr {
         FilterConsumerAtExpr {
-            expr_id: ProgramExprId::new(4),
+            expr_id: crate::test_support::root(0, 4),
             consumer: StaticFilterConsumer::try_new(
                 11,
                 12,

@@ -25,6 +25,7 @@ mod index;
 mod io_cuts;
 mod limits;
 mod node;
+mod node_units;
 mod package;
 mod properties;
 mod runtime_filter;
@@ -42,6 +43,7 @@ pub(crate) use index::*;
 pub use io_cuts::*;
 pub use limits::*;
 pub(crate) use node::*;
+use node_units::validate_node_unit_in;
 pub(crate) use package::*;
 pub(crate) use properties::*;
 pub use properties::{
@@ -61,7 +63,7 @@ use crate::resource::{
     validate_fragment_resources, validate_plan_resources,
 };
 use crate::{
-    AnnotationSubject, ExprId, Fragment, FragmentCuts, FragmentId, NodeId, NodeKind,
+    AnnotationSubject, Fragment, FragmentCuts, FragmentId, NodeId, NodeKind,
     PLAN_CONTRACT_REVISION, PhysicalPlan, RequiredContracts, ValueId,
 };
 
@@ -272,18 +274,39 @@ fn validate_plan_with_limits_core<V: PlanWaitValidation>(
         validate_fragment_into(fragment, &mut errors);
         // The complete-plan table is the sole intrinsic source. Fragment-only
         // validation checks reference shape; publication resolves exact values.
-        for (id, expression) in fragment.expressions().iter() {
-            for reference in expression.kind.intrinsic_parameter_references() {
-                if let Err(error) = plan.parameters().require(*reference) {
-                    errors.push(ValidationError::new(
-                        format!(
-                            "fragments[{}].expressions[{}].parameters",
-                            fragment.id().get(),
-                            id.get()
-                        ),
-                        error.to_string(),
-                    ));
+        for node in fragment.nodes().values() {
+            for expression in node.expressions.iter().flat_map(|u| u.definitions()) {
+                for reference in expression.kind.intrinsic_parameter_references() {
+                    if let Err(error) = plan.parameters().require(*reference) {
+                        errors.push(ValidationError::new(
+                            format!(
+                                "fragments[{}].nodes[{}].expressions[{}].parameters",
+                                fragment.id().get(),
+                                node.id.get(),
+                                expression.id.get()
+                            ),
+                            error.to_string(),
+                        ));
+                    }
                 }
+                if errors.is_saturated() {
+                    break;
+                }
+            }
+        }
+        for reference in fragment.calls().parameter_references().chain(
+            fragment
+                .nodes()
+                .values()
+                .filter_map(|n| n.expressions.as_ref())
+                .flat_map(|u| u.claims().values())
+                .flat_map(|call| call.effects.environment.iter().copied()),
+        ) {
+            if let Err(error) = plan.parameters().require(reference) {
+                errors.push(ValidationError::new(
+                    format!("fragments[{}].parameters", fragment.id().get()),
+                    error.to_string(),
+                ));
             }
             if errors.is_saturated() {
                 break;
@@ -314,6 +337,25 @@ fn validate_plan_with_limits_core<V: PlanWaitValidation>(
     run_validation_stage!(validate_fragment_graph(plan, &mut errors));
     run_validation_stage!(validate_sinks(plan, &mut errors));
     run_validation_stage!(validate_writer_flows(plan, &mut errors));
+    for fragment in plan.fragments().values() {
+        graph::validate_write_layout_recipes(
+            fragment,
+            plan.write_layouts()
+                .range((fragment.id(), NodeId::new(0))..=(fragment.id(), NodeId::new(u32::MAX)))
+                .map(|((_, node), recipe)| (*node, recipe)),
+            &mut errors,
+        );
+    }
+    if plan
+        .write_layouts()
+        .keys()
+        .any(|(id, _)| !plan.fragments().contains_key(id))
+    {
+        errors.push(ValidationError::new(
+            "layouts",
+            "write layout recipe has no fragment owner",
+        ));
+    }
     run_validation_stage!(validate_result(plan, &mut errors));
     run_validation_stage!(validate_runtime_filters(plan, &mut errors));
     if errors.is_empty() {
@@ -419,6 +461,20 @@ pub(crate) fn validate_fragment_into(fragment: &Fragment, errors: &mut Validatio
         return;
     }
     validate_fragment_structure_into(fragment, errors);
+    if errors.checks_output_and_effect_proofs()
+        && let Err(error) = fragment
+            .calls()
+            .validate_fragment(fragment, &PlainValidationControl)
+    {
+        let error = match error {
+            crate::FrozenCallError::TooManyItems
+            | crate::FrozenCallError::Control(
+                novarocks_type_contract::CompileControlError::ResourceExhausted,
+            ) => ValidationError::resource_limit("fragment.calls", error.to_string()),
+            _ => ValidationError::new("fragment.calls", error.to_string()),
+        };
+        errors.push(error);
+    }
 }
 
 // The original structure body chooses only owned scratch operations. All
@@ -426,6 +482,12 @@ pub(crate) fn validate_fragment_into(fragment: &Fragment, errors: &mut Validatio
 trait FragmentStructureScratch {
     type Error;
     fn indexes(&mut self, fragment: &Fragment) -> Result<FragmentValidationIndexes, Self::Error>;
+    fn unit(
+        &mut self,
+        fragment: &Fragment,
+        node: &crate::PhysicalNode,
+        errors: &mut ValidationContext,
+    ) -> Result<(), Self::Error>;
     fn node_graph(
         &mut self,
         fragment: &Fragment,
@@ -435,6 +497,26 @@ trait FragmentStructureScratch {
 struct PlainFragmentScratch;
 impl FragmentStructureScratch for PlainFragmentScratch {
     type Error = std::convert::Infallible;
+    fn unit(
+        &mut self,
+        fragment: &Fragment,
+        node: &crate::PhysicalNode,
+        errors: &mut ValidationContext,
+    ) -> Result<(), Self::Error> {
+        let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
+            &PlainValidationControl,
+            novarocks_type_contract::CompilePhase::Validate,
+        )
+        .expect("plain validation control is infallible");
+        if let Err(error) = validate_node_unit_in(fragment, node, errors, &mut work) {
+            errors.push(ValidationError::resource_limit(
+                "node.expressions",
+                error.to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     fn indexes(&mut self, fragment: &Fragment) -> Result<FragmentValidationIndexes, Self::Error> {
         Ok(FragmentValidationIndexes::new(fragment))
     }
@@ -456,6 +538,24 @@ struct CallerFragmentScratch<'a, 'control> {
 }
 impl FragmentStructureScratch for CallerFragmentScratch<'_, '_> {
     type Error = novarocks_type_contract::ControlResourceError;
+    fn unit(
+        &mut self,
+        fragment: &Fragment,
+        node: &crate::PhysicalNode,
+        errors: &mut ValidationContext,
+    ) -> Result<(), Self::Error> {
+        if let Some(unit) = &node.expressions {
+            self.resources
+                .tree::<crate::RootOrdinal, ()>(unit.roots().len())?;
+            for port in unit.ports() {
+                self.resources.tree::<ValueId, ()>(port.values.len())?;
+            }
+            (self.admit)(&self.resources.facts())?;
+        }
+        validate_node_unit_in(fragment, node, errors, self.work)?;
+        Ok(())
+    }
+
     fn indexes(&mut self, fragment: &Fragment) -> Result<FragmentValidationIndexes, Self::Error> {
         FragmentValidationIndexes::new_in(fragment, self.resources, self.admit, self.work)
     }
@@ -517,7 +617,12 @@ fn validate_fragment_structure_into_core<S: FragmentStructureScratch>(
     bounded_count(
         errors,
         &format!("{prefix}.expressions"),
-        fragment.expressions().len(),
+        fragment
+            .nodes()
+            .values()
+            .filter_map(|n| n.expressions.as_ref())
+            .map(|u| u.definitions().len())
+            .sum(),
         errors.limits().fragment_expressions,
     );
     if !fragment.nodes().contains_key(&fragment.root()) {
@@ -616,60 +721,8 @@ fn validate_fragment_structure_into_core<S: FragmentStructureScratch>(
             }
         }
     }
-    let window_roots = fragment
-        .nodes()
-        .values()
-        .filter_map(|node| match &node.kind {
-            NodeKind::Window(spec) => Some(spec.expressions.iter().map(|item| item.expression)),
-            _ => None,
-        })
-        .flatten()
-        .collect::<BTreeSet<_>>();
-    let operator_roots = fragment
-        .nodes()
-        .values()
-        .flat_map(|node| {
-            let mut roots = Vec::new();
-            node.kind.expression_references(&mut roots);
-            roots
-        })
-        .collect::<BTreeSet<_>>();
-    let mut expression_parents: BTreeMap<ExprId, Vec<ExpressionParentReference>> = BTreeMap::new();
-    for (_, parent) in fragment.expressions().iter() {
-        let mut references = Vec::new();
-        expression_parent_references(parent, &mut references);
-        for (child, role) in references {
-            expression_parents
-                .entry(child)
-                .or_default()
-                .push(ExpressionParentReference {
-                    parent: parent.id,
-                    role,
-                });
-        }
-    }
-    for (_, expression) in fragment.expressions().iter() {
-        validate_expression(
-            fragment,
-            expression,
-            &indexes.visible_inputs,
-            &window_roots,
-            &operator_roots,
-            expression_parents
-                .get(&expression.id)
-                .map(Vec::as_slice)
-                .unwrap_or_default(),
-            errors,
-        );
-        if errors.is_saturated() {
-            errors.mark_truncated();
-            return Ok(());
-        }
-    }
-    validate_expression_acyclic(fragment, errors);
-    validate_lambda_scope_acyclic(fragment, errors);
-    validate_expression_reachability(fragment, errors);
     for node in fragment.nodes().values() {
+        scratch.unit(fragment, node, errors)?;
         validate_node(fragment, node, &indexes, errors);
         if errors.is_saturated() {
             errors.mark_truncated();

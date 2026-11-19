@@ -236,15 +236,15 @@ fn fixture() -> (Vec<p::Relation>, Vec<(u32, FunctionValueType)>) {
     let guarantees = || {
         vec![
             p::PredicateGuarantee {
-                predicate: p::ExprId::new(u32::MAX),
+                predicate: novarocks_expression_contract::RootOrdinal::new(u32::MAX),
                 kind: p::PredicateGuaranteeKind::Exact,
             },
             p::PredicateGuarantee {
-                predicate: p::ExprId::new(0),
+                predicate: novarocks_expression_contract::RootOrdinal::new(0),
                 kind: p::PredicateGuaranteeKind::PruningOnly,
             },
             p::PredicateGuarantee {
-                predicate: p::ExprId::new(u32::MAX),
+                predicate: novarocks_expression_contract::RootOrdinal::new(u32::MAX),
                 kind: p::PredicateGuaranteeKind::Exact,
             },
         ]
@@ -301,15 +301,15 @@ fn expected(i: usize) -> wire::RelationDefinition {
         .collect();
     let guarantees = vec![
         wire::PredicateGuarantee {
-            predicate_expr_id: Some(u32::MAX),
+            predicate_root: Some(u32::MAX),
             kind: 1,
         },
         wire::PredicateGuarantee {
-            predicate_expr_id: Some(0),
+            predicate_root: Some(0),
             kind: 2,
         },
         wire::PredicateGuarantee {
-            predicate_expr_id: Some(u32::MAX),
+            predicate_root: Some(u32::MAX),
             kind: 1,
         },
     ];
@@ -362,7 +362,7 @@ fn with_source_mode(
         data.schema = Vec::new().into_boxed_slice();
         data.predicate_guarantees = (0..320)
             .map(|id| p::PredicateGuarantee {
-                predicate: p::ExprId::new(u32::MAX - id),
+                predicate: novarocks_expression_contract::RootOrdinal::new(u32::MAX - id),
                 kind: p::PredicateGuaranteeKind::Exact,
             })
             .collect::<Vec<_>>()
@@ -541,7 +541,7 @@ fn relation_namespace_source_association_full_fvt_and_presence_never_guess_or_re
                     4 => v.schema[0].column_payload_id = Some(999),
                     5 => v.schema[0].value_type_id = None,
                     6 => v.schema[0].value_type_id = Some(999),
-                    7 => v.predicate_guarantees[0].predicate_expr_id = None,
+                    7 => v.predicate_guarantees[0].predicate_root = None,
                     8 => v.provided_properties = None,
                     9 => v.selection_digest.pop().map(|_| ()).unwrap(),
                     _ => unreachable!(),
@@ -722,7 +722,7 @@ fn relation_namespace_real_occurrences_cross_quantum_preserve_sparse_layout_with
         for def in encoded.as_wire() {
             if let Some(wire::relation_definition::Kind::Data(data)) = &def.kind {
                 assert_eq!(data.predicate_guarantees.len(), 320);
-                assert_eq!(data.predicate_guarantees[319].predicate_expr_id, Some(u32::MAX-319));
+                assert_eq!(data.predicate_guarantees[319].predicate_root, Some(u32::MAX-319));
             } else { panic!("actual Data source changed"); }
         }
         let positive = trace(&c);
@@ -777,7 +777,7 @@ fn check_original_owned_backing_floor(dictionary: bool) {
             .into_boxed_slice(),
         predicate_guarantees: (0..16)
             .map(|n| p::PredicateGuarantee {
-                predicate: p::ExprId::new(n),
+                predicate: novarocks_expression_contract::RootOrdinal::new(n),
                 kind: p::PredicateGuaranteeKind::Exact,
             })
             .collect::<Vec<_>>()

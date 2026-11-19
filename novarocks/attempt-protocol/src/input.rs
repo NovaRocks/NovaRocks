@@ -458,13 +458,17 @@ pub struct AttemptInputClaim {
 }
 
 #[derive(Clone, Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the original prepaid input retains the complete bounded executor fact inline without another allocation"
+)]
 pub enum AttemptInput {
     /// The original paid first step installs the initial Native preference.
     Bootstrap,
     /// The original drive is bound and all permanent Sources are installed.
     StartProtocol,
     Executor(ExecutorFact),
-    Port(LogicalToAttempt<AttemptFailure>),
+    Port(LogicalToAttempt),
     Membership(MembershipView),
     CapacityReleased,
     Timer,
@@ -618,6 +622,17 @@ impl OperationReply {
         match &self.result {
             OperationReplyResult::Local { failure, .. } => failure.as_ref(),
             OperationReplyResult::Worker(_) => None,
+        }
+    }
+
+    pub(crate) fn local_workload_refusal(&self) -> Option<crate::failure::HostProjectedFailure> {
+        match &self.result {
+            OperationReplyResult::Local {
+                result: LocalDispatchResult::NonWorkerRejected,
+                failure: Some(failure),
+                ..
+            } if failure.kind == crate::failure::HostFailureKind::Workload => Some(*failure),
+            _ => None,
         }
     }
 }

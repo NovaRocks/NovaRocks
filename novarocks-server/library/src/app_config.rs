@@ -795,8 +795,6 @@ fn validate_state_store_configuration(config: &NovaRocksConfig) -> Result<()> {
 fn validate_application_configuration(config: &NovaRocksConfig) -> Result<()> {
     if config.cluster.role == ClusterRole::Fe {
         crate::composition::validate_frontend_joint_startup(&config.runtime)?;
-    } else {
-        crate::sdk_listing_profile::validate_current()?;
     }
     config.application.state_store_policy.resolve()?;
     Ok(())
@@ -1241,10 +1239,8 @@ pub struct FrontendWorkloadRuntimeConfig {
     pub obligation_records_limit: usize,
     pub control_inflight_limit: usize,
     pub control_ready_limit: usize,
-    pub logical_actor_mailbox_capacity: usize,
     pub logical_participation_admission_issue_capacity: usize,
     pub logical_participation_establish_capacity: usize,
-    pub logical_abort_effect_capacity: usize,
     pub logical_rows_delivery_capacity: usize,
     pub logical_replacement_reservation_ms: u64,
     pub logical_remote_cleanup_timeout_ms: u64,
@@ -1275,10 +1271,8 @@ impl Default for FrontendWorkloadRuntimeConfig {
             obligation_records_limit: 8192,
             control_inflight_limit: 16,
             control_ready_limit: 256,
-            logical_actor_mailbox_capacity: 64,
             logical_participation_admission_issue_capacity: 16,
             logical_participation_establish_capacity: 16,
-            logical_abort_effect_capacity: 16,
             logical_rows_delivery_capacity: 32,
             logical_replacement_reservation_ms: 30_000,
             logical_remote_cleanup_timeout_ms: 5_000,
@@ -1418,10 +1412,6 @@ pub struct RuntimeConfig {
     pub participation_lease_max_ms: u64,
     #[serde(default = "default_task_status_subscription_error_budget")]
     pub task_status_subscription_error_budget: u32,
-    #[serde(default = "default_write_commit_evidence_max_bytes")]
-    pub write_commit_evidence_max_bytes: usize,
-    #[serde(default = "default_write_commit_evidence_max_entries")]
-    pub write_commit_evidence_max_entries: usize,
     /// Joint Arrow-input plus encoded-output memory allowed per root stream.
     #[serde(default = "default_result_retained_bytes_per_root")]
     pub result_retained_bytes_per_root: usize,
@@ -2354,21 +2344,6 @@ fn validate_query_control_config(runtime: &RuntimeConfig) -> Result<()> {
             "runtime.query_control_task_update_retry_max_backoff_ms must not exceed runtime.query_control_task_update_retry_error_duration_ms"
         );
     }
-    let nonzero_limits = [
-        (
-            "runtime.write_commit_evidence_max_bytes",
-            runtime.write_commit_evidence_max_bytes,
-        ),
-        (
-            "runtime.write_commit_evidence_max_entries",
-            runtime.write_commit_evidence_max_entries,
-        ),
-    ];
-    for (field, value) in nonzero_limits {
-        if value == 0 {
-            bail!("{field} must be greater than 0");
-        }
-    }
     Ok(())
 }
 
@@ -2454,14 +2429,6 @@ fn default_olap_sink_write_buffer_size_bytes() -> usize {
 
 fn default_olap_sink_max_tablet_write_chunk_bytes() -> usize {
     512 * 1024 * 1024 // 512MB, aligned with StarRocks `max_tablet_write_chunk_bytes`
-}
-
-fn default_write_commit_evidence_max_bytes() -> usize {
-    novarocks_spi::connector::DEFAULT_WRITE_COMMIT_EVIDENCE_MAX_BYTES
-}
-
-fn default_write_commit_evidence_max_entries() -> usize {
-    novarocks_spi::connector::DEFAULT_WRITE_COMMIT_EVIDENCE_MAX_ENTRIES
 }
 
 fn default_result_retained_bytes_per_root() -> usize {
@@ -2695,8 +2662,6 @@ impl Default for RuntimeConfig {
             participation_lease_min_ms: default_participation_lease_min_ms(),
             participation_lease_max_ms: default_participation_lease_max_ms(),
             task_status_subscription_error_budget: default_task_status_subscription_error_budget(),
-            write_commit_evidence_max_bytes: default_write_commit_evidence_max_bytes(),
-            write_commit_evidence_max_entries: default_write_commit_evidence_max_entries(),
             result_retained_bytes_per_root: default_result_retained_bytes_per_root(),
             result_retained_bytes_per_process: default_result_retained_bytes_per_process(),
             lake_publication_max_attempt_duration_ms:
@@ -2839,12 +2804,22 @@ impl ExecutionServicesConfig {
 impl RuntimeConfig {
     /// Resolves the exchange structural limits without constructing a runtime.
     pub fn exchange_flow_limits(&self) -> Result<ExchangeFlowLimits> {
+        let unit = novarocks_native_adapter::grantable_delivery_payload_bytes(
+            self.native_ingress.ordinary_request_max_bytes,
+        )
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "runtime.native_ingress.ordinary_request_max_bytes must exceed the exchange delivery envelope of {} bytes",
+                novarocks_native_adapter::max_delivery_non_payload_bytes()
+            )
+        })?;
         ExchangeFlowLimits::try_new(
             self.exchange_instance_floor_slots,
             self.exchange_instance_max_slots,
             self.exchange_floating_slots,
             self.exchange_stream_window,
             Duration::from_millis(self.exchange_transport_timeout_ms),
+            unit,
         )
         .context("resolve runtime exchange flow limits")
     }
@@ -3203,24 +3178,54 @@ mod tests {
     #[test]
     fn exchange_flow_defaults_parse_and_resolve_to_the_execution_limits() {
         let absent = toml::from_str::<RuntimeConfig>("").expect("omitted settings use defaults");
-        let expected = super::ExchangeFlowLimits::default();
+        let resolved = absent.exchange_flow_limits().expect("valid defaults");
+        let explicit = RuntimeConfig::default()
+            .exchange_flow_limits()
+            .expect("valid explicit defaults");
+        assert_eq!(resolved, explicit);
+        let fallback = super::ExchangeFlowLimits::default();
         assert_eq!(
-            absent.exchange_flow_limits().expect("valid defaults"),
-            expected
+            resolved.instance_floor_slots(),
+            fallback.instance_floor_slots()
         );
+        assert_eq!(resolved.instance_max_slots(), fallback.instance_max_slots());
+        assert_eq!(resolved.floating_slots(), fallback.floating_slots());
+        assert_eq!(resolved.stream_window(), fallback.stream_window());
+        assert_eq!(resolved.transport_timeout(), fallback.transport_timeout());
+        let envelope = novarocks_native_adapter::max_delivery_non_payload_bytes();
         assert_eq!(
-            RuntimeConfig::default()
-                .exchange_flow_limits()
-                .expect("valid explicit defaults"),
-            expected
+            resolved.max_unit_payload_bytes(),
+            novarocks_execution_contract::native_result_support::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES
+                - envelope
         );
-        assert_eq!(expected.instance_floor_slots(), 1);
-        assert_eq!(expected.instance_max_slots(), 32);
-        assert_eq!(expected.floating_slots(), 8192);
-        assert_eq!(expected.stream_window(), 2);
+        assert_ne!(
+            resolved.max_unit_payload_bytes(),
+            fallback.max_unit_payload_bytes()
+        );
+        assert_eq!(resolved.instance_floor_slots(), 1);
+        assert_eq!(resolved.instance_max_slots(), 32);
+        assert_eq!(resolved.floating_slots(), 8192);
+        assert_eq!(resolved.stream_window(), 2);
         assert_eq!(
-            expected.transport_timeout(),
+            resolved.transport_timeout(),
             std::time::Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn exchange_unit_bound_refuses_a_request_limit_that_cannot_hold_the_envelope() {
+        let mut runtime = RuntimeConfig::default();
+        runtime.native_ingress.ordinary_request_max_bytes = 128;
+        runtime.native_ingress.ordinary_response_max_bytes = 128;
+        runtime.native_ingress.control_request_max_bytes = 128;
+        runtime.native_ingress.control_response_max_bytes = 128;
+        let error = runtime
+            .exchange_flow_limits()
+            .expect_err("the envelope must fit inside the request limit")
+            .to_string();
+        assert!(
+            error.contains("runtime.native_ingress.ordinary_request_max_bytes"),
+            "{error}"
         );
     }
 
@@ -5062,7 +5067,7 @@ mod joint_startup_load_tests {
         config.cluster.role = ClusterRole::Be;
         config.runtime.frontend_workload.concurrency_limit = 257;
         validate_application_configuration(&config)
-            .expect("BE keeps its original listing validation");
+            .expect("BE load does not apply the frontend workload policy");
     }
 }
 

@@ -1114,6 +1114,22 @@ FROM {catalog}.ns."orders$files";"#
     }
 
     #[test]
+    fn set_session_rewrites_only_the_catalog_qualifier() {
+        let symbols = symbols();
+        let catalog = symbols.lookup("owned").unwrap();
+        let source = r#"SET SESSION "owned".owned = 'owned';
+SET SESSION owned = 'owned';
+SET SESSION external.owned = 'owned';"#;
+        let expected = format!(
+            r#"SET SESSION "{catalog}".owned = 'owned';
+SET SESSION owned = 'owned';
+SET SESSION external.owned = 'owned';"#
+        );
+        assert_eq!(symbols.rewrite_source(source).unwrap(), expected);
+        assert_eq!(symbols.rewrite_source(&expected).unwrap(), expected);
+    }
+
+    #[test]
     fn optimize_and_metadata_bind_the_same_catalog_without_rewriting_data() {
         let symbols = symbols();
         let catalog = symbols.lookup("owned").unwrap();

@@ -30,14 +30,17 @@ const BROADCAST_FRAGMENT: u32 = 412;
 /// is produced and consumed at one broadcast join in fragment 412. Fragments
 /// 410 and 411 attach nothing.
 pub(super) fn numbered_plan() -> PhysicalPlan {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     let (partitioned, scan_fragment, join_fragment) =
-        super::contract_regressions::cross_fragment_scan_lineage_plan();
+        super::contract_regressions::cross_fragment_scan_lineage_plan(&mut fixture_constants);
     assert_eq!(
         (scan_fragment.get(), join_fragment.get()),
         (PARTITIONED_CONSUMER_FRAGMENT, PARTITIONED_PRODUCER_FRAGMENT)
     );
-    let broadcast = super::runtime_filter_wait_contract::acyclic_cross_fragment_fixture().plan;
-    let mut builder = PlanBuilder::new(version());
+    let broadcast =
+        super::runtime_filter_wait_contract::acyclic_cross_fragment_fixture(&mut fixture_constants)
+            .plan;
+    let mut builder = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
     for plan in [&partitioned, &broadcast] {
         for fragment in plan.fragments().values() {
             builder.add_fragment(fragment.clone()).unwrap();
@@ -49,7 +52,7 @@ pub(super) fn numbered_plan() -> PhysicalPlan {
             builder.add_runtime_filter(filter.clone()).unwrap();
         }
     }
-    builder.finish().unwrap()
+    crate::tests::constant_fixture::publish_plan(builder, &fixture_constants).unwrap()
 }
 
 /// The numbering the native v1 encoder minted before the physical plan
@@ -257,7 +260,7 @@ fn plan_numbering_follows_each_fragments_own_attachment_order_and_endpoint_index
             id: source.id(),
             root: source.root(),
             values: source.values().clone(),
-            expressions: source.expressions().clone(),
+
             nodes: source.nodes().clone(),
             sink: source.sink().clone(),
             dop_domain: source.dop_domain(),
@@ -267,6 +270,7 @@ fn plan_numbering_follows_each_fragments_own_attachment_order_and_endpoint_index
                 .map(RuntimeFilterId::new)
                 .collect::<Box<[_]>>(),
             call_requests: source.call_requests().clone(),
+            calls: source.calls().clone(),
         };
         fragments.insert(source.id(), Fragment::from(parts));
     }
@@ -278,6 +282,7 @@ fn plan_numbering_follows_each_fragments_own_attachment_order_and_endpoint_index
             PhysicalPlan::from(crate::PhysicalPlanParts {
                 constants: crate::ConstantPools::empty(),
                 parameters: novarocks_type_contract::SemanticParameters::default(),
+                statement_constant_policy: checked.statement_constant_policy(),
                 version: checked.version(),
                 fragments,
                 edges: checked.edges().clone(),
@@ -285,6 +290,7 @@ fn plan_numbering_follows_each_fragments_own_attachment_order_and_endpoint_index
                 result_port: checked.result_port().cloned(),
                 required: checked.required(),
                 annotations: Box::default(),
+                write_layouts: Default::default(),
             })
         };
     let plan = unchecked(fragments.clone(), runtime_filters.clone());
@@ -319,12 +325,13 @@ fn plan_numbering_follows_each_fragments_own_attachment_order_and_endpoint_index
             id: source.id(),
             root: source.root(),
             values: source.values().clone(),
-            expressions: source.expressions().clone(),
+
             nodes: source.nodes().clone(),
             sink: source.sink().clone(),
             dop_domain: source.dop_domain(),
             runtime_filters: Box::from([RuntimeFilterId::new(PARTITIONED_FILTER)]),
             call_requests: source.call_requests().clone(),
+            calls: source.calls().clone(),
         }),
     );
     let plan = unchecked(detached, runtime_filters.clone());

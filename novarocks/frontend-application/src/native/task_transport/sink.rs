@@ -158,7 +158,6 @@ pub(crate) enum NativeTaskTransportCreationError {
     NoBackends,
     DuplicateBackend { process: BackendProcessId },
     Registration(crate::native::transport_supervisor::NativeTransportRegistrationError),
-    ZeroStatusErrorBudget,
 }
 
 impl novarocks_execution_contract::failure::FailureProjection for NativeTaskTransportCreationError {
@@ -170,7 +169,6 @@ impl novarocks_execution_contract::failure::FailureProjection for NativeTaskTran
             Self::BudgetMismatch => 101,
             Self::NoBackends => 102,
             Self::DuplicateBackend { .. } => 103,
-            Self::ZeroStatusErrorBudget => 106,
             Self::Registration(error) => return error.failure_fact(),
         };
         FailureFact::new(
@@ -187,9 +185,6 @@ impl NativeTaskTransportCreationError {
             }
             Self::NoBackends => "native task transport requires at least one frozen backend",
             Self::DuplicateBackend { .. } => "native task transport repeats a backend process",
-            Self::ZeroStatusErrorBudget => {
-                "native status subscription error budget must be nonzero"
-            }
             Self::Registration(error) => return error.safe_detail(),
         };
         novarocks_execution_contract::SafeDetail::truncating(message)
@@ -630,15 +625,6 @@ pub(super) fn supervisor_lane(batch: &DispatchBatch) -> NativeTransportLane {
         .iter()
         .any(OperationIntent::requires_control_progress)
     {
-        NativeTransportLane::Control
-    } else {
-        NativeTransportLane::Ordinary
-    }
-}
-
-#[cfg(test)]
-pub(super) fn supervisor_lane_for_intent(intent: &OperationIntent) -> NativeTransportLane {
-    if intent.requires_control_progress() {
         NativeTransportLane::Control
     } else {
         NativeTransportLane::Ordinary

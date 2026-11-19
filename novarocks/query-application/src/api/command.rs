@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::execution_error::ExecutionFailurePresentation;
+
 use std::{error::Error, fmt, future::Future, pin::Pin, sync::Arc};
 
 use novarocks_spi::connector::{

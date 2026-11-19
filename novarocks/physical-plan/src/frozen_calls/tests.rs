@@ -24,12 +24,16 @@ mod property_formula_tests;
 mod property_proof_tests;
 use crate::*;
 use arrow_schema::DataType;
+use novarocks_expression_contract::RootOrdinal;
 use novarocks_type_contract::{
-    AggregateStateFormatId, ControlShape, DomainGuard, EvaluationDomainId, ExpressionControlFlow,
-    ExpressionEvaluationDomain, ExpressionInvocation, FunctionArgumentEvaluation,
-    FunctionFailureBehavior, FunctionId, FunctionInstanceState, FunctionIntrinsicRowError,
-    FunctionNullBehavior, FunctionOverloadId, FunctionVolatility, GuardKind, ObservableEffects,
-    SemanticParameterId, SemanticParameterKey,
+    AggregateStateFormatId, ArgumentControl, ControlShape, EvaluationRegionId,
+    ExpressionControlFlow, ExpressionEvaluationRegion, ExpressionInvocation,
+    FunctionArgumentEvaluation, FunctionFailureBehavior, FunctionId, FunctionInstanceState,
+    FunctionIntrinsicRowError, FunctionNullBehavior, FunctionOverloadId, FunctionVolatility,
+    GuardKind, ObservableEffects, RegionGuard, SemanticParameterId, SemanticParameterKey,
+};
+use novarocks_type_contract::{
+    CompileCheckpoints, EvaluationDemand, ExpressionEffectContext, ExpressionUseId,
 };
 use std::sync::Mutex;
 
@@ -94,7 +98,7 @@ fn function(kind: FunctionKind, result_type: ValueType) -> BoundFunction {
         }),
     }
 }
-fn effects(kind: FunctionKind, domain: EvaluationDomainId) -> CallEffects {
+fn declared_effects(kind: FunctionKind, scope: CallProofScope) -> CallEffects {
     CallEffects {
         value_stability: FunctionVolatility::Immutable,
         own_row_error: match kind {
@@ -119,19 +123,19 @@ fn effects(kind: FunctionKind, domain: EvaluationDomainId) -> CallEffects {
         },
         observable_effects: ObservableEffects::NONE,
         environment: Box::default(),
-        proof_scope: CallProofScope::Domain(domain),
+        proof_scope: scope,
     }
 }
 fn context(id: u32, domain: u32, demand: EvaluationDemand) -> ExpressionEffectContext {
     ExpressionEffectContext {
         use_id: ExpressionUseId::new(id),
-        domain: EvaluationDomainId::new(domain),
+        region: EvaluationRegionId::new(domain),
         demand,
     }
 }
-fn domain(id: u32) -> ExpressionEvaluationDomain {
-    ExpressionEvaluationDomain {
-        id: EvaluationDomainId::new(id),
+fn domain(id: u32) -> ExpressionEvaluationRegion {
+    ExpressionEvaluationRegion {
+        id: EvaluationRegionId::new(id),
         parent: None,
         guard: None,
     }
@@ -145,6 +149,7 @@ fn install_node(
 ) {
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: node,
             required_inputs: vec![properties(); inputs.len()].into_boxed_slice(),
             inputs: inputs.into_boxed_slice(),
@@ -178,23 +183,233 @@ fn zero_argument_request() -> PhysicalCallRequest {
         },
     }
 }
-fn add_values(builder: &mut FragmentBuilder, count: usize, scalar: bool) -> (NodeId, ExprId) {
+
+// Offline replacement foundation for frozen_calls/tests.rs. Not compiled.
+// Keep only Fragment as the fact authority. NodeId below identifies the fixed
+// fixture's scalar source, not another expression or invocation namespace.
+struct Fixture {
+    fragment: Fragment,
+    primary: NodeId,
+}
+impl Fixture {
+    fn unit(&self) -> &novarocks_expression_contract::BoundExprSet {
+        self.fragment.unit(self.primary).unwrap()
+    }
+    fn claims(
+        &self,
+    ) -> &BTreeMap<ExpressionUseId, novarocks_expression_contract::ExpressionCallClaim> {
+        self.unit().claims()
+    }
+    fn relations(&self) -> &BTreeMap<PhysicalCallSite, FrozenPhysicalCall> {
+        self.fragment.calls().entries()
+    }
+    fn checked(&self) -> Result<&FrozenFragmentCalls, FrozenCallError> {
+        self.fragment
+            .calls()
+            .validate_fragment(&self.fragment, &Control::default())?;
+        Ok(self.fragment.calls())
+    }
+    // Only these private fixtures create their unit with a pure construction
+    // lifetime. Recursive type/CV handles below retain their actual source.
+    // This is not a clone API for host-created production units.
+    fn candidate_unit(
+        &self,
+        edit: impl FnOnce(&mut novarocks_expression_contract::UnitParts),
+    ) -> Result<novarocks_expression_contract::BoundExprSet, novarocks_expression_contract::UnitError>
+    {
+        let source = self.unit();
+        let mut parts = novarocks_expression_contract::UnitParts::new(
+            source.ports().into(),
+            source.definitions().into(),
+            source.roots().into(),
+            source.root_use_ids().into(),
+            source.control_flow().clone(),
+            source.claims().clone(),
+            source.requests().clone(),
+        );
+        edit(&mut parts);
+        let control = Control::default();
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate)?;
+        let result = novarocks_expression_contract::BoundExprSet::try_from_parts_in(
+            parts,
+            unit_limits(),
+            &mut work,
+        );
+        if matches!(
+            result,
+            Err(novarocks_expression_contract::UnitError::Control(_))
+        ) {
+            return result;
+        }
+        work.finish()?;
+        result
+    }
+    fn edit_unit(&mut self, edit: impl FnOnce(&mut novarocks_expression_contract::UnitParts)) {
+        let unit = self
+            .candidate_unit(edit)
+            .expect("fixture's intended valid claim edit");
+        let mut parts = self.fragment.clone().into_parts();
+        parts.nodes.get_mut(&self.primary).unwrap().expressions = Some(std::sync::Arc::new(unit));
+        self.fragment = parts.into();
+    }
+    fn candidate_relations(
+        &self,
+        edit: impl FnOnce(&mut Vec<FrozenPhysicalCall>),
+    ) -> Result<Fragment, FrozenCallError> {
+        let mut calls = self.relations().values().cloned().collect();
+        edit(&mut calls);
+        self.fragment
+            .clone()
+            .with_calls_observed(calls, &Control::default())
+    }
+}
+fn unit_limits() -> novarocks_expression_contract::UnitLimits {
+    novarocks_expression_contract::UnitLimits {
+        expression_semantic_depth: PlanLimits::FROZEN.expression_semantic_depth,
+    }
+}
+// A borrowed membership view for already-authored dense local definitions.
+// It is not an arena, identity mint, source store or global adapter.
+struct FixtureDefinitions<'a>(&'a [novarocks_expression_contract::ExprNode]);
+impl novarocks_type_contract::ExpressionDefinitionMembership<ExprId> for FixtureDefinitions<'_> {
+    fn definition_count(&self) -> usize {
+        self.0.len()
+    }
+    fn contains_definition(&self, id: ExprId) -> bool {
+        self.0
+            .get(id.get() as usize)
+            .is_some_and(|node| node.id == id)
+    }
+}
+fn scalar_claim(
+    current: ExpressionEffectContext,
+) -> novarocks_expression_contract::ExpressionCallClaim {
+    novarocks_expression_contract::ExpressionCallClaim {
+        context: current,
+        effects: declared_effects(FunctionKind::Scalar, CallProofScope::Region(current.region)),
+        decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        temporal_source: None,
+        regexp_count_pattern_source: None,
+        to_base64_byte_source: None,
+    }
+}
+fn make_unit(
+    definitions: Vec<novarocks_expression_contract::ExprNode>,
+    roots: Vec<novarocks_expression_contract::ExprRoot>,
+    root_uses: Vec<ExpressionUseId>,
+    regions: Vec<ExpressionEvaluationRegion>,
+    invocations: Vec<ExpressionInvocation<ExprId>>,
+    claims: BTreeMap<ExpressionUseId, novarocks_expression_contract::ExpressionCallClaim>,
+    requests: BTreeMap<ExprId, novarocks_expression_contract::PhysicalCallRequest>,
+) -> novarocks_expression_contract::BoundExprSet {
+    let control = Control::default();
+    let flow = ExpressionControlFlow::try_new(
+        regions,
+        invocations,
+        &FixtureDefinitions(&definitions),
+        CompilePhase::Validate,
+        &control,
+    )
+    .unwrap();
+    let parts = novarocks_expression_contract::UnitParts::new(
+        Box::default(),
+        definitions.into_boxed_slice(),
+        roots.into_boxed_slice(),
+        root_uses.into_boxed_slice(),
+        flow,
+        claims,
+        requests,
+    );
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
+    let unit = novarocks_expression_contract::BoundExprSet::try_from_parts_in(
+        parts,
+        unit_limits(),
+        &mut work,
+    )
+    .unwrap();
+    work.finish().unwrap();
+    unit
+}
+fn leaf_unit(
+    count: usize,
+    scalar: bool,
+    fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
+) -> novarocks_expression_contract::BoundExprSet {
+    assert_ne!(count, 0, "zero rows use the genuinely empty source fixture");
+    let ty = if scalar { boolean() } else { integer() };
+    let definition = ExprId::new(0);
+    let definitions = vec![novarocks_expression_contract::ExprNode {
+        id: definition,
+        lambda_scope: None,
+        ty: ty.clone(),
+        kind: if scalar {
+            ExprKind::FunctionCall {
+                function: function(FunctionKind::Scalar, ty),
+                args: Box::default(),
+            }
+        } else {
+            fixture_constants.i64(17, &ty)
+        },
+    }];
+    let mut roots = Vec::new();
+    let mut root_uses = Vec::new();
+    let mut invocations = Vec::new();
+    let mut claims = BTreeMap::new();
+    for ordinal in 0..count {
+        let id = match ordinal {
+            0 => 0,
+            1 => u32::MAX,
+            other => u32::try_from(other - 1).unwrap(),
+        };
+        let current = context(
+            id,
+            if ordinal % 2 == 0 { 0 } else { u32::MAX },
+            EvaluationDemand::Value,
+        );
+        roots.push(novarocks_expression_contract::ExprRoot {
+            definition,
+            demand: EvaluationDemand::Value,
+            scope: novarocks_expression_contract::RootScope::AllPorts,
+        });
+        root_uses.push(current.use_id);
+        invocations.push(ExpressionInvocation {
+            context: current,
+            definition,
+            control: ControlShape::Eager,
+            arguments: Box::default(),
+        });
+        if scalar {
+            claims.insert(current.use_id, scalar_claim(current));
+        }
+    }
+    let regions = if count == 1 {
+        vec![domain(0)]
+    } else {
+        vec![domain(0), domain(u32::MAX)]
+    };
+    let requests = if scalar {
+        BTreeMap::from([(definition, zero_argument_request())])
+    } else {
+        BTreeMap::new()
+    };
+    make_unit(
+        definitions,
+        roots,
+        root_uses,
+        regions,
+        invocations,
+        claims,
+        requests,
+    )
+}
+fn add_values(
+    builder: &mut FragmentBuilder,
+    count: usize,
+    scalar: bool,
+    fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
+) -> NodeId {
     let node = builder.reserve_node_id().unwrap();
     let ty = if scalar { boolean() } else { integer() };
-    let expression = builder
-        .add_expression(
-            node,
-            ty.clone(),
-            if scalar {
-                ExprKind::FunctionCall {
-                    function: function(FunctionKind::Scalar, ty.clone()),
-                    args: Box::default(),
-                }
-            } else {
-                ExprKind::Literal(LiteralValue::Int64(17))
-            },
-        )
-        .unwrap();
     let value = builder
         .add_value(
             ty,
@@ -204,72 +419,23 @@ fn add_values(builder: &mut FragmentBuilder, count: usize, scalar: bool) -> (Nod
             },
         )
         .unwrap();
+    let unit = leaf_unit(count, scalar, fixture_constants);
     install_node(
         builder,
         node,
         vec![],
         vec![value],
         NodeKind::Values {
-            rows: vec![Box::from([expression]); count].into_boxed_slice(),
+            rows: (0..count)
+                .map(|ordinal| Box::from([RootOrdinal::new(u32::try_from(ordinal).unwrap())]))
+                .collect(),
         },
     );
-    (node, expression)
+    builder
+        .install_unit(node, std::sync::Arc::new(unit))
+        .unwrap();
+    node
 }
-fn leaf_roots(fragment: &Fragment) -> PhysicalRootUses {
-    let roots = PhysicalExpressionRoots::try_new(fragment, &Control::default()).unwrap();
-    let mut bindings = Vec::new();
-    let mut invocations = Vec::new();
-    for (ordinal, (site, root)) in roots.sites().iter().enumerate() {
-        // These fixtures explicitly use literals or zero-argument calls.
-        // This is not a production inference of function control semantics.
-        match &fragment.expressions().get(root.expr).unwrap().kind {
-            ExprKind::Literal(_) => {}
-            ExprKind::FunctionCall { args, .. } | ExprKind::WindowCall { args, .. } => {
-                assert!(args.is_empty());
-            }
-            _ => panic!("fixture root requires explicit invocation construction"),
-        }
-        let id = match ordinal {
-            0 => 0,
-            1 => u32::MAX,
-            other => other as u32 - 1,
-        };
-        let current = context(id, if ordinal % 2 == 0 { 0 } else { u32::MAX }, root.demand);
-        bindings.push((*site, current.use_id));
-        invocations.push(ExpressionInvocation {
-            context: current,
-            definition: root.expr,
-            control: ControlShape::Eager,
-            arguments: Box::default(),
-        });
-    }
-    let flow = ExpressionControlFlow::try_new(
-        vec![domain(0), domain(u32::MAX)],
-        invocations,
-        fragment.expressions(),
-        CompilePhase::Validate,
-        &Control::default(),
-    )
-    .unwrap();
-    PhysicalRootUses::try_new(fragment, flow, bindings, &Control::default()).unwrap()
-}
-struct Fixture {
-    fragment: Fragment,
-    uses: PhysicalRootUses,
-    calls: Vec<FrozenPhysicalCall>,
-}
-impl Fixture {
-    fn checked(&self) -> Result<FrozenFragmentCalls, FrozenCallError> {
-        FrozenFragmentCalls::try_new(
-            &self.fragment,
-            &self.uses,
-            self.calls.clone(),
-            &Control::default(),
-        )
-    }
-}
-// A genuine zero-row, zero-column source has no unreachable expression.
-// Empty call/request tables are explicit and checked by their original owners.
 fn empty_fixture() -> Fixture {
     let mut builder = FragmentBuilder::new(FragmentId::new(u32::MAX));
     let node = builder.reserve_node_id().unwrap();
@@ -287,237 +453,150 @@ fn empty_fixture() -> Fixture {
             node,
             FragmentSink::Noop,
             dop(),
-            crate::StagePlacementPolicy::Singleton,
+            StagePlacementPolicy::Singleton,
         )
         .unwrap()
         .with_call_requests_observed(vec![], &Control::default())
+        .unwrap()
+        .with_calls_observed(vec![], &Control::default())
         .unwrap();
-    let uses = leaf_roots(&fragment);
     Fixture {
         fragment,
-        uses,
-        calls: vec![],
+        primary: node,
     }
 }
-
-fn scalar_fixture(count: usize, fragment_id: u32) -> Fixture {
+fn scalar_fixture(
+    count: usize,
+    fragment_id: u32,
+    constants: &mut crate::tests::constant_fixture::ConstantFixture,
+) -> Fixture {
     let mut builder = FragmentBuilder::new(FragmentId::new(fragment_id));
-    let request = zero_argument_request();
-    let (node, expression) = add_values(&mut builder, count, true);
+    let node = add_values(&mut builder, count, true, constants);
     let fragment = builder
         .finish_definition(
             node,
             FragmentSink::Noop,
             dop(),
-            crate::StagePlacementPolicy::Singleton,
+            StagePlacementPolicy::Singleton,
         )
         .unwrap()
-        .with_call_requests_observed(
-            vec![(PhysicalCallDefinition::Expression(expression), request)],
-            &Control::default(),
-        )
+        .with_call_requests_observed(vec![], &Control::default())
+        .unwrap()
+        .with_calls_observed(vec![], &Control::default())
         .unwrap();
-    validate_fragment_definition(&fragment).unwrap();
-    let uses = leaf_roots(&fragment);
-    let calls = uses
-        .flow()
-        .uses()
-        .values()
-        .map(|invocation| FrozenPhysicalCall {
-            materialized_writer_input: None,
-            regexp_count_pattern_source: None,
-            to_base64_byte_source: None,
-            temporal_source: None,
-            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            site: PhysicalCallSite::Expression(invocation.context.use_id),
-            context: invocation.context,
-            effects: effects(FunctionKind::Scalar, invocation.context.domain),
-        })
-        .collect();
     Fixture {
         fragment,
-        uses,
-        calls,
+        primary: node,
     }
 }
 
-#[test]
-fn repeated_definition_preserves_complete_per_use_claims_and_exact_binding_borrow() {
-    let mut fixture = scalar_fixture(2, 0);
-    let reference = SemanticParameterRef {
-        id: SemanticParameterId::new(u32::MAX),
-        expected_key: SemanticParameterKey::TimeZone,
-    };
-    let rich = &mut fixture.calls[0].effects;
-    rich.value_stability = FunctionVolatility::Volatile;
-    rich.own_row_error = FunctionIntrinsicRowError::MayRaise;
-    rich.failure_behavior = FunctionFailureBehavior::ReturnsNull;
-    rich.null_behavior = FunctionNullBehavior::Strict;
-    rich.instance_state = FunctionInstanceState::ScalarInstance;
-    rich.observable_effects = ObservableEffects {
-        rng_sampling: true,
-        warnings: true,
-        controlled_wait: true,
-    };
-    rich.environment = Box::from([reference]);
-    fixture.calls[1].effects.proof_scope = CallProofScope::Unconditional;
-    let checked = fixture.checked().unwrap();
-    assert_eq!(checked.fragment(), FragmentId::new(0));
-    assert_eq!(checked.entries().len(), 2);
-    for call in &fixture.calls {
-        assert_eq!(&checked.entries()[&call.site], call);
-    }
-    assert_eq!(
-        checked.parameter_references().collect::<Vec<_>>(),
-        vec![reference]
-    );
-    let first = &fixture.uses.flow().uses()[&ExpressionUseId::new(0)];
-    let second = &fixture.uses.flow().uses()[&ExpressionUseId::new(u32::MAX)];
-    assert_eq!(first.definition, second.definition);
-    assert_ne!(first.context.domain, second.context.domain);
-    let ExprKind::FunctionCall { function, .. } = &fixture
-        .fragment
-        .expressions()
-        .get(first.definition)
-        .unwrap()
-        .kind
-    else {
-        panic!("expected actual function binding")
-    };
-    for call in &fixture.calls {
-        let Some(PhysicalCallBinding::Scalar(actual)) =
-            checked.binding(&fixture.fragment, &fixture.uses, call.site)
-        else {
-            panic!("missing exact binding")
-        };
-        assert!(std::ptr::eq(actual, function));
-    }
-    // Public shape claims intentionally do not authenticate an installed owner.
-    assert_ne!(
-        fixture.calls[0].effects.value_stability,
-        function.legacy_metadata.as_ref().unwrap().volatility
-    );
-}
-
-#[test]
-fn missing_extra_duplicate_foreign_fragment_context_scope_and_control_fail_closed() {
-    let fixture = scalar_fixture(2, 7);
-    let check = |calls| {
-        FrozenFragmentCalls::try_new(&fixture.fragment, &fixture.uses, calls, &Control::default())
-    };
-    assert_eq!(
-        check(vec![]),
-        Err(FrozenCallError::MissingSite(PhysicalCallSite::Expression(
-            ExpressionUseId::new(0)
-        )))
-    );
-    let mut calls = fixture.calls.clone();
-    calls.push(calls[0].clone());
-    assert_eq!(check(calls), Err(FrozenCallError::DuplicateSite));
-    let mut calls = fixture.calls.clone();
-    let mut extra = calls[0].clone();
-    extra.site = PhysicalCallSite::Expression(ExpressionUseId::new(123));
-    calls.push(extra);
-    assert_eq!(check(calls), Err(FrozenCallError::InvalidSite));
-    let mut calls = fixture.calls.clone();
-    calls[0].context.demand = EvaluationDemand::TruthOnly;
-    assert_eq!(check(calls), Err(FrozenCallError::WrongContext));
-    let mut calls = fixture.calls.clone();
-    calls[0].context.domain = EvaluationDomainId::new(123);
-    assert_eq!(check(calls), Err(FrozenCallError::WrongContext));
-    let mut calls = fixture.calls.clone();
-    calls[0].effects.proof_scope = CallProofScope::Domain(EvaluationDomainId::new(123));
-    assert_eq!(check(calls), Err(FrozenCallError::WrongProofScope));
-    let mut calls = fixture.calls.clone();
-    calls[0].effects.argument_control = ArgumentControl::TypeOnly;
-    assert_eq!(check(calls), Err(FrozenCallError::WrongControl));
-    let checked = fixture.checked().unwrap();
-    let foreign = scalar_fixture(2, 8);
-    assert_eq!(
-        checked.validate_fragment(&foreign.fragment, &foreign.uses, &Control::default()),
-        Err(FrozenCallError::WrongFragment)
-    );
-    assert!(
-        checked
-            .binding(&foreign.fragment, &foreign.uses, fixture.calls[0].site)
-            .is_none()
-    );
-}
-
-#[test]
-fn malformed_full_effect_shape_and_duplicate_environment_are_rejected() {
-    let fixture = scalar_fixture(1, 11);
-    let check = |effects| {
-        let mut calls = fixture.calls.clone();
-        calls[0].effects = effects;
-        FrozenFragmentCalls::try_new(&fixture.fragment, &fixture.uses, calls, &Control::default())
-    };
-    let mut invalid = fixture.calls[0].effects.clone();
-    invalid.instance_state = FunctionInstanceState::TableInstance;
-    assert_eq!(
-        check(invalid),
-        Err(FrozenCallError::InvalidEffects(
-            EffectContractError::KindMismatch
-        ))
-    );
-    let mut invalid = fixture.calls[0].effects.clone();
-    invalid.own_row_error = FunctionIntrinsicRowError::NotRowEvaluated;
-    assert_eq!(
-        check(invalid),
-        Err(FrozenCallError::InvalidEffects(
-            EffectContractError::KindMismatch
-        ))
-    );
-    let mut invalid = fixture.calls[0].effects.clone();
-    invalid.environment = Box::from([
-        SemanticParameterRef {
-            id: SemanticParameterId::new(0),
-            expected_key: SemanticParameterKey::TimeZone,
-        },
-        SemanticParameterRef {
-            id: SemanticParameterId::new(u32::MAX),
-            expected_key: SemanticParameterKey::TimeZone,
-        },
-    ]);
-    assert_eq!(
-        check(invalid),
-        Err(FrozenCallError::InvalidEffects(
-            EffectContractError::InvalidEnvironmentReference
-        ))
-    );
-}
-
-fn case_fixture() -> Fixture {
+fn case_fixture(constants: &mut crate::tests::constant_fixture::ConstantFixture) -> Fixture {
     let mut builder = FragmentBuilder::new(FragmentId::new(31));
     let node = builder.reserve_node_id().unwrap();
-    let function = builder
-        .add_expression(
-            node,
-            boolean(),
-            ExprKind::FunctionCall {
+    let definition = ExprId::new(0);
+    let otherwise = ExprId::new(1);
+    let case = ExprId::new(2);
+    let definitions = vec![
+        novarocks_expression_contract::ExprNode {
+            id: definition,
+            lambda_scope: None,
+            ty: boolean(),
+            kind: ExprKind::FunctionCall {
                 function: function(FunctionKind::Scalar, boolean()),
                 args: Box::default(),
             },
-        )
-        .unwrap();
-    let otherwise = builder
-        .add_expression(
-            node,
-            boolean(),
-            ExprKind::Literal(LiteralValue::Boolean(false)),
-        )
-        .unwrap();
-    let case = builder
-        .add_expression(
-            node,
-            boolean(),
-            ExprKind::Case {
+        },
+        novarocks_expression_contract::ExprNode {
+            id: otherwise,
+            lambda_scope: None,
+            ty: boolean(),
+            kind: constants.boolean(false, &boolean()),
+        },
+        novarocks_expression_contract::ExprNode {
+            id: case,
+            lambda_scope: None,
+            ty: boolean(),
+            kind: ExprKind::Case {
                 operand: None,
-                when_then: Box::from([(function, function)]),
+                when_then: Box::from([(definition, definition)]),
                 else_expr: Some(otherwise),
             },
-        )
-        .unwrap();
+        },
+    ];
+    let regions = vec![
+        domain(0),
+        ExpressionEvaluationRegion {
+            id: EvaluationRegionId::new(12),
+            parent: Some(EvaluationRegionId::new(0)),
+            guard: Some(RegionGuard {
+                owner: ExpressionUseId::new(9),
+                kind: GuardKind::CaseWhen { arm: 0 },
+            }),
+        },
+        ExpressionEvaluationRegion {
+            id: EvaluationRegionId::new(10),
+            parent: Some(EvaluationRegionId::new(0)),
+            guard: Some(RegionGuard {
+                owner: ExpressionUseId::new(9),
+                kind: GuardKind::CaseThen { arm: 0 },
+            }),
+        },
+        ExpressionEvaluationRegion {
+            id: EvaluationRegionId::new(11),
+            parent: Some(EvaluationRegionId::new(0)),
+            guard: Some(RegionGuard {
+                owner: ExpressionUseId::new(9),
+                kind: GuardKind::CaseElse,
+            }),
+        },
+    ];
+    let first = context(0, 12, EvaluationDemand::TruthOnly);
+    let then = context(u32::MAX, 10, EvaluationDemand::Value);
+    let unit = make_unit(
+        definitions,
+        vec![novarocks_expression_contract::ExprRoot {
+            definition: case,
+            demand: EvaluationDemand::Value,
+            scope: novarocks_expression_contract::RootScope::AllPorts,
+        }],
+        vec![ExpressionUseId::new(9)],
+        regions,
+        vec![
+            ExpressionInvocation {
+                context: context(9, 0, EvaluationDemand::Value),
+                definition: case,
+                control: ControlShape::Case {
+                    simple: false,
+                    arms: 1,
+                    has_else: true,
+                },
+                arguments: Box::from([first.use_id, then.use_id, ExpressionUseId::new(2)]),
+            },
+            ExpressionInvocation {
+                context: first,
+                definition,
+                control: ControlShape::Eager,
+                arguments: Box::default(),
+            },
+            ExpressionInvocation {
+                context: then,
+                definition,
+                control: ControlShape::Eager,
+                arguments: Box::default(),
+            },
+            ExpressionInvocation {
+                context: context(2, 11, EvaluationDemand::Value),
+                definition: otherwise,
+                control: ControlShape::Eager,
+                arguments: Box::default(),
+            },
+        ],
+        BTreeMap::from([
+            (first.use_id, scalar_claim(first)),
+            (then.use_id, scalar_claim(then)),
+        ]),
+        BTreeMap::from([(definition, zero_argument_request())]),
+    );
     let output = builder
         .add_value(
             boolean(),
@@ -533,158 +612,41 @@ fn case_fixture() -> Fixture {
         vec![],
         vec![output],
         NodeKind::Values {
-            rows: Box::from([Box::from([case])]),
+            rows: Box::from([Box::from([RootOrdinal::new(0)])]),
         },
     );
+    builder
+        .install_unit(node, std::sync::Arc::new(unit))
+        .unwrap();
     let fragment = builder
         .finish_definition(
             node,
             FragmentSink::Noop,
             dop(),
-            crate::StagePlacementPolicy::Singleton,
+            StagePlacementPolicy::Singleton,
         )
+        .unwrap()
+        .with_call_requests_observed(vec![], &Control::default())
+        .unwrap()
+        .with_calls_observed(vec![], &Control::default())
         .unwrap();
-    let domains = vec![
-        domain(0),
-        ExpressionEvaluationDomain {
-            id: EvaluationDomainId::new(12),
-            parent: Some(EvaluationDomainId::new(0)),
-            guard: Some(DomainGuard {
-                owner: ExpressionUseId::new(9),
-                kind: GuardKind::CaseWhen { arm: 0 },
-            }),
-        },
-        ExpressionEvaluationDomain {
-            id: EvaluationDomainId::new(10),
-            parent: Some(EvaluationDomainId::new(0)),
-            guard: Some(DomainGuard {
-                owner: ExpressionUseId::new(9),
-                kind: GuardKind::CaseThen { arm: 0 },
-            }),
-        },
-        ExpressionEvaluationDomain {
-            id: EvaluationDomainId::new(11),
-            parent: Some(EvaluationDomainId::new(0)),
-            guard: Some(DomainGuard {
-                owner: ExpressionUseId::new(9),
-                kind: GuardKind::CaseElse,
-            }),
-        },
-    ];
-    let invocations = vec![
-        ExpressionInvocation {
-            context: context(9, 0, EvaluationDemand::Value),
-            definition: case,
-            control: ControlShape::Case {
-                simple: false,
-                arms: 1,
-                has_else: true,
-            },
-            arguments: Box::from([
-                ExpressionUseId::new(0),
-                ExpressionUseId::new(u32::MAX),
-                ExpressionUseId::new(2),
-            ]),
-        },
-        ExpressionInvocation {
-            context: context(0, 12, EvaluationDemand::TruthOnly),
-            definition: function,
-            control: ControlShape::Eager,
-            arguments: Box::default(),
-        },
-        ExpressionInvocation {
-            context: context(u32::MAX, 10, EvaluationDemand::Value),
-            definition: function,
-            control: ControlShape::Eager,
-            arguments: Box::default(),
-        },
-        ExpressionInvocation {
-            context: context(2, 11, EvaluationDemand::Value),
-            definition: otherwise,
-            control: ControlShape::Eager,
-            arguments: Box::default(),
-        },
-    ];
-    let flow = ExpressionControlFlow::try_new(
-        domains,
-        invocations,
-        fragment.expressions(),
-        CompilePhase::Validate,
-        &Control::default(),
-    )
-    .unwrap();
-    let uses = PhysicalRootUses::try_new(
-        &fragment,
-        flow,
-        vec![(
-            ExpressionRootSite {
-                node,
-                role: ExpressionRootRole::ValuesCell { row: 0, column: 0 },
-            },
-            ExpressionUseId::new(9),
-        )],
-        &Control::default(),
-    )
-    .unwrap();
-    let calls = [0, u32::MAX]
-        .map(|id| {
-            let context = uses.flow().uses()[&ExpressionUseId::new(id)].context;
-            FrozenPhysicalCall {
-                materialized_writer_input: None,
-                regexp_count_pattern_source: None,
-                to_base64_byte_source: None,
-                temporal_source: None,
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-                site: PhysicalCallSite::Expression(context.use_id),
-                context,
-                effects: effects(FunctionKind::Scalar, context.domain),
-            }
-        })
-        .to_vec();
     Fixture {
         fragment,
-        uses,
-        calls,
+        primary: node,
     }
 }
 
-#[test]
-fn one_scalar_definition_has_independent_truth_and_guarded_value_occurrences() {
-    let mut fixture = case_fixture();
-    fixture.calls[1].effects.own_row_error = FunctionIntrinsicRowError::MayRaise;
-    let checked = fixture.checked().unwrap();
-    let first = &checked.entries()[&PhysicalCallSite::Expression(ExpressionUseId::new(0))];
-    let then = &checked.entries()[&PhysicalCallSite::Expression(ExpressionUseId::new(u32::MAX))];
-    assert_eq!(first.context.demand, EvaluationDemand::TruthOnly);
-    assert_eq!(then.context.demand, EvaluationDemand::Value);
-    assert_ne!(first.context.domain, then.context.domain);
-    assert_eq!(
-        then.effects.proof_scope,
-        CallProofScope::Domain(then.context.domain)
-    );
-    assert_eq!(
-        then.effects.own_row_error,
-        FunctionIntrinsicRowError::MayRaise
-    );
-    assert_eq!(
-        fixture.uses.flow().uses()[&first.context.use_id].definition,
-        fixture.uses.flow().uses()[&then.context.use_id].definition
-    );
-    let mut wrong = fixture.calls.clone();
-    wrong[1].effects.proof_scope = first.effects.proof_scope;
-    assert_eq!(
-        FrozenFragmentCalls::try_new(&fixture.fragment, &fixture.uses, wrong, &Control::default()),
-        Err(FrozenCallError::WrongProofScope)
-    );
+fn special_fixture(constants: &mut crate::tests::constant_fixture::ConstantFixture) -> Fixture {
+    special_fixture_with_rows(1, constants).unwrap()
 }
-
-fn special_fixture() -> Fixture {
-    special_fixture_with_rows(1)
-}
-
-fn special_fixture_with_rows(input_rows: usize) -> Fixture {
+// The rejection belongs at real relation installation. Return it instead of
+// storing a parallel invalid table in an otherwise published Fixture.
+fn special_fixture_with_rows(
+    input_rows: usize,
+    constants: &mut crate::tests::constant_fixture::ConstantFixture,
+) -> Result<Fixture, FrozenCallError> {
     let mut builder = FragmentBuilder::new(FragmentId::new(41));
-    let (input, _) = add_values(&mut builder, input_rows, false);
+    let input = add_values(&mut builder, input_rows, false, constants);
     let aggregate = builder.reserve_node_id().unwrap();
     let mut outputs = Vec::new();
     let mut aggregate_calls = Vec::new();
@@ -724,27 +686,12 @@ fn special_fixture_with_rows(input_rows: usize) -> Fixture {
         },
     );
     let window = builder.reserve_node_id().unwrap();
-    let expression = builder
-        .add_expression(
-            window,
-            integer(),
-            ExprKind::WindowCall {
-                function: function(FunctionKind::Window, integer()),
-                distinct: false,
-                args: Box::default(),
-                function_order_by: Box::default(),
-                frame: None,
-                ignore_nulls: false,
-                aggregate_binding: None,
-            },
-        )
-        .unwrap();
     let output = builder
         .add_value(
             integer(),
-            ValueOrigin::Expr {
+            ValueOrigin::NodeOutput {
                 node: window,
-                expr: expression,
+                output_ordinal: u32::try_from(outputs.len()).unwrap(),
             },
         )
         .unwrap();
@@ -757,7 +704,16 @@ fn special_fixture_with_rows(input_rows: usize) -> Fixture {
         NodeKind::Window(WindowSpec {
             partition_by: Box::default(),
             order_by: Box::default(),
-            expressions: Box::from([WindowExpression { expression, output }]),
+            calls: Box::from([WindowCallSpec {
+                binding: function(FunctionKind::Window, integer()),
+                distinct: false,
+                arguments: Box::default(),
+                order_by: Box::default(),
+                frame: None,
+                ignore_nulls: false,
+                aggregate_binding: None,
+                output,
+            }]),
         }),
     );
     let table = builder.reserve_node_id().unwrap();
@@ -770,7 +726,7 @@ fn special_fixture_with_rows(input_rows: usize) -> Fixture {
             },
         )
         .unwrap();
-    let scalar_fields = function(FunctionKind::Table, integer());
+    let fields = function(FunctionKind::Table, integer());
     install_node(
         &mut builder,
         table,
@@ -778,33 +734,13 @@ fn special_fixture_with_rows(input_rows: usize) -> Fixture {
         vec![output],
         NodeKind::TableFunction {
             function: BoundTableFunction {
-                function_id: scalar_fields.function_id,
-                overload: scalar_fields.overload,
-                argument_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(
-                    Box::default(),
-                ),
+                function_id: fields.function_id,
+                overload: fields.overload,
+                argument_types: fields.argument_types,
                 result_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::from(
                     [integer()],
                 )),
-                legacy_metadata: Some(crate::LegacyBindingMetadata {
-                    volatility: scalar_fields.legacy_metadata.as_ref().unwrap().volatility,
-                    argument_evaluation: scalar_fields
-                        .legacy_metadata
-                        .as_ref()
-                        .unwrap()
-                        .argument_evaluation,
-                    failure_behavior: scalar_fields
-                        .legacy_metadata
-                        .as_ref()
-                        .unwrap()
-                        .failure_behavior,
-                    intrinsic_row_error: scalar_fields
-                        .legacy_metadata
-                        .as_ref()
-                        .unwrap()
-                        .intrinsic_row_error,
-                    semantic_parameters: Box::default(),
-                }),
+                legacy_metadata: fields.legacy_metadata,
             },
             arguments: Box::default(),
             outputs: Box::from([TableFunctionOutput::FunctionResult {
@@ -814,248 +750,461 @@ fn special_fixture_with_rows(input_rows: usize) -> Fixture {
             left_outer: false,
         },
     );
+    // This is the original public construction layer for pending relational
+    // declarations; finish_definition retains its full local property gate.
     let fragment = builder
-        .finish_definition(
+        .finish_structure(
             table,
             FragmentSink::Noop,
             dop(),
-            crate::StagePlacementPolicy::Singleton,
+            PlanLimits::FROZEN,
+            &Control::default(),
+            StagePlacementPolicy::Singleton,
         )
         .unwrap();
-    validate_fragment_definition(&fragment).unwrap();
-    let uses = leaf_roots(&fragment);
-    let mut calls = vec![];
-    // Wide Values roots consume sequential low IDs plus MAX. Relational IDs
-    // are independent fresh occurrences, never reused graph roots.
-    let special_base = if input_rows == 1 {
-        1
-    } else {
-        u32::try_from(MAX_CONTROL_USE_REFERENCES).unwrap() - 2
-    };
-    for (call, use_id) in [(0, special_base), (1, special_base + 1)] {
-        let context = context(use_id, 0, EvaluationDemand::Value);
-        calls.push(FrozenPhysicalCall {
-            materialized_writer_input: None,
-            regexp_count_pattern_source: None,
-            to_base64_byte_source: None,
-            temporal_source: None,
-            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            site: PhysicalCallSite::Aggregate {
+    let sites = [
+        (
+            PhysicalCallSite::Aggregate {
                 node: aggregate,
-                call,
+                call: 0,
             },
+            FunctionKind::Aggregate,
+            0,
+        ),
+        (
+            PhysicalCallSite::Aggregate {
+                node: aggregate,
+                call: 1,
+            },
+            FunctionKind::Aggregate,
+            u32::MAX,
+        ),
+        (
+            PhysicalCallSite::Window {
+                node: window,
+                call: 0,
+            },
+            FunctionKind::Window,
+            71,
+        ),
+        (
+            PhysicalCallSite::Table { node: table },
+            FunctionKind::Table,
+            89,
+        ),
+    ];
+    let requests = sites
+        .iter()
+        .map(|(site, _, _)| (*site, zero_argument_request()))
+        .collect();
+    let fragment = fragment
+        .with_call_requests_observed(requests, &Control::default())
+        .unwrap();
+    let calls = sites
+        .into_iter()
+        .map(|(site, kind, id)| {
+            let current = novarocks_type_contract::RelationEffectContext::call(
+                novarocks_type_contract::RelationCallId::new(id),
+            );
+            FrozenPhysicalCall {
+                site,
+                context: current,
+                materialized_writer_input: None,
+                effects: declared_effects(kind, CallProofScope::Relation(current.identity)),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            }
+        })
+        .collect();
+    let fragment = fragment.with_calls_observed(calls, &Control::default())?;
+    Ok(Fixture {
+        fragment,
+        primary: input,
+    })
+}
+
+fn wide_relation_fixture(count: usize) -> Fixture {
+    let mut builder = FragmentBuilder::new(FragmentId::new(71));
+    let input = builder.reserve_node_id().unwrap();
+    install_node(
+        &mut builder,
+        input,
+        vec![],
+        vec![],
+        NodeKind::Values {
+            rows: Box::from([Box::default()]),
+        },
+    );
+    let aggregate = builder.reserve_node_id().unwrap();
+    let mut outputs = Vec::new();
+    let mut specifications = Vec::new();
+    let mut requests = Vec::new();
+    let mut calls = Vec::new();
+    for ordinal in 0..count {
+        let id = u32::try_from(ordinal).unwrap();
+        let call = AggregateCallId::new(id);
+        let output = builder
+            .add_value(integer(), ValueOrigin::AggregateResult { call })
+            .unwrap();
+        outputs.push(output);
+        specifications.push(AggregateCall {
+            id: call,
+            binding: AggregateBinding {
+                state_interpretation: None,
+                state_argument_contract:
+                    novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
+                function: function(FunctionKind::Aggregate, integer()),
+                phase: AggregatePhase::Single,
+                logical_argument_count: 0,
+                intermediate_type: ValueType::new(DataType::Binary, false),
+                state_format: AggregateStateFormatId::try_new("fixture/count/state-v1").unwrap(),
+            },
+            arguments: Box::default(),
+            distinct: false,
+            order_by: Box::default(),
+            output,
+        });
+        let site = PhysicalCallSite::Aggregate {
+            node: aggregate,
+            call: id,
+        };
+        requests.push((site, zero_argument_request()));
+        let context = novarocks_type_contract::RelationEffectContext::call(
+            novarocks_type_contract::RelationCallId::new(id),
+        );
+        calls.push(FrozenPhysicalCall {
+            site,
             context,
-            effects: effects(FunctionKind::Aggregate, context.domain),
+            materialized_writer_input: None,
+            effects: declared_effects(
+                FunctionKind::Aggregate,
+                CallProofScope::Relation(context.identity),
+            ),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         });
     }
-    let window_use = uses
-        .flow()
-        .uses()
-        .values()
-        .find(|invocation| invocation.definition == expression)
+    install_node(
+        &mut builder,
+        aggregate,
+        vec![input],
+        outputs,
+        NodeKind::Aggregate {
+            group_by: Box::default(),
+            calls: specifications.into_boxed_slice(),
+            grouping: AggregateGrouping::Complete,
+        },
+    );
+    let fragment = builder
+        .finish_structure(
+            aggregate,
+            FragmentSink::Noop,
+            dop(),
+            PlanLimits::FROZEN,
+            &Control::default(),
+            StagePlacementPolicy::Singleton,
+        )
         .unwrap()
-        .context;
-    calls.push(FrozenPhysicalCall {
-        materialized_writer_input: None,
-        regexp_count_pattern_source: None,
-        to_base64_byte_source: None,
-        temporal_source: None,
-        decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-        site: PhysicalCallSite::Expression(window_use.use_id),
-        context: window_use,
-        effects: effects(FunctionKind::Window, window_use.domain),
-    });
-    let context = context(special_base + 2, u32::MAX, EvaluationDemand::Value);
-    calls.push(FrozenPhysicalCall {
-        materialized_writer_input: None,
-        regexp_count_pattern_source: None,
-        to_base64_byte_source: None,
-        temporal_source: None,
-        decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-        site: PhysicalCallSite::Table { node: table },
-        context,
-        effects: effects(FunctionKind::Table, context.domain),
-    });
+        .with_call_requests_observed(requests, &Control::default())
+        .unwrap()
+        .with_calls_observed(calls, &Control::default())
+        .unwrap();
     Fixture {
         fragment,
-        uses,
-        calls,
+        primary: input,
     }
 }
 
 #[test]
+fn repeated_definition_preserves_complete_per_use_claims_and_exact_binding_borrow() {
+    let mut constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let mut fixture = scalar_fixture(2, 0, &mut constants);
+    let reference = SemanticParameterRef {
+        id: SemanticParameterId::new(u32::MAX),
+        expected_key: SemanticParameterKey::TimeZone,
+    };
+    fixture.edit_unit(|parts| {
+        let rich = &mut parts
+            .claims
+            .get_mut(&ExpressionUseId::new(0))
+            .unwrap()
+            .effects;
+        rich.value_stability = FunctionVolatility::Volatile;
+        rich.own_row_error = FunctionIntrinsicRowError::MayRaise;
+        rich.failure_behavior = FunctionFailureBehavior::ReturnsNull;
+        rich.null_behavior = FunctionNullBehavior::Strict;
+        rich.instance_state = FunctionInstanceState::ScalarInstance;
+        rich.observable_effects = ObservableEffects {
+            rng_sampling: true,
+            warnings: true,
+            controlled_wait: true,
+        };
+        rich.environment = Box::from([reference]);
+        parts
+            .claims
+            .get_mut(&ExpressionUseId::new(u32::MAX))
+            .unwrap()
+            .effects
+            .proof_scope = CallProofScope::Unconditional;
+    });
+    let checked = fixture.checked().unwrap();
+    assert_eq!(checked.fragment(), FragmentId::new(0));
+    assert!(
+        checked.entries().is_empty(),
+        "scalar claims belong only to the node unit"
+    );
+    assert_eq!(fixture.claims().len(), 2);
+    let actual_refs = fixture
+        .claims()
+        .values()
+        .flat_map(|call| call.effects.environment.iter().copied())
+        .collect::<Vec<_>>();
+    assert_eq!(actual_refs, vec![reference]);
+    let unit = fixture.unit();
+    let first = &unit.control_flow().uses()[&ExpressionUseId::new(0)];
+    let second = &unit.control_flow().uses()[&ExpressionUseId::new(u32::MAX)];
+    assert_eq!(first.definition, second.definition);
+    assert_ne!(first.context.region, second.context.region);
+    let ExprKind::FunctionCall { function, .. } = &unit.definition(first.definition).unwrap().kind
+    else {
+        panic!("actual scalar binding")
+    };
+    for call in unit.claims().values() {
+        let actual = &unit
+            .definition(unit.control_flow().uses()[&call.context.use_id].definition)
+            .unwrap()
+            .kind;
+        let ExprKind::FunctionCall {
+            function: actual, ..
+        } = actual
+        else {
+            panic!("exact definition")
+        };
+        assert!(std::ptr::eq(actual, function));
+        assert_eq!(
+            call.context,
+            unit.control_flow().uses()[&call.context.use_id].context
+        );
+    }
+    assert_ne!(
+        unit.claims()[&first.context.use_id].effects.value_stability,
+        function.legacy_metadata.as_ref().unwrap().volatility
+    );
+}
+
+// Pure unit rejection scenarios moved, without dropping their assertions, to
+// expression-contract-claims.candidate.rs in this offline proposal:
+// missing_extra_duplicate_foreign_fragment_context_scope_and_control_fail_closed
+// malformed_full_effect_shape_and_duplicate_environment_are_rejected
+// type_only_parent_retains_static_child_binding_without_runtime_child_claim
+// The fragment/snapshot part is also retained by property_proof_tests.
+
+#[test]
+fn one_scalar_definition_has_independent_truth_and_guarded_value_occurrences() {
+    let mut constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let mut fixture = case_fixture(&mut constants);
+    fixture.edit_unit(|parts| {
+        parts
+            .claims
+            .get_mut(&ExpressionUseId::new(u32::MAX))
+            .unwrap()
+            .effects
+            .own_row_error = FunctionIntrinsicRowError::MayRaise;
+    });
+    fixture.checked().unwrap();
+    let first = &fixture.claims()[&ExpressionUseId::new(0)];
+    let then = &fixture.claims()[&ExpressionUseId::new(u32::MAX)];
+    assert_eq!(first.context.demand, EvaluationDemand::TruthOnly);
+    assert_eq!(then.context.demand, EvaluationDemand::Value);
+    assert_ne!(first.context.region, then.context.region);
+    assert_eq!(
+        then.effects.proof_scope,
+        CallProofScope::Region(then.context.region)
+    );
+    assert_eq!(
+        then.effects.own_row_error,
+        FunctionIntrinsicRowError::MayRaise
+    );
+    assert_eq!(
+        fixture.unit().control_flow().uses()[&first.context.use_id].definition,
+        fixture.unit().control_flow().uses()[&then.context.use_id].definition
+    );
+    // Cross-region scalar proof refusal is tested at its real unit constructor
+    // in scalar_claim_cannot_borrow_another_guarded_occurrences_proof.
+}
+
+#[test]
 fn real_aggregate_window_table_positions_borrow_selected_bindings() {
-    let fixture = special_fixture();
+    let mut constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let fixture = special_fixture(&mut constants);
     let checked = fixture.checked().unwrap();
     assert_eq!(checked.entries().len(), 4);
-    for call in &fixture.calls {
-        let binding = checked
-            .binding(&fixture.fragment, &fixture.uses, call.site)
-            .unwrap();
-        match (call.site, binding) {
+    for call in fixture.relations().values() {
+        match (call.site, checked.binding(&fixture.fragment, call.site)) {
             (
-                PhysicalCallSite::Aggregate { node, call },
-                PhysicalCallBinding::Aggregate(actual),
+                PhysicalCallSite::Aggregate {
+                    node,
+                    call: ordinal,
+                },
+                Some(PhysicalCallBinding::Aggregate(actual)),
             ) => {
-                let NodeKind::Aggregate {
-                    calls, grouping, ..
-                } = &fixture.fragment.nodes()[&node].kind
+                let NodeKind::Aggregate { calls, .. } = &fixture.fragment.nodes()[&node].kind
                 else {
-                    panic!("actual aggregate")
+                    unreachable!()
                 };
-                assert_eq!(*grouping, AggregateGrouping::Complete);
-                assert!(std::ptr::eq(actual, &calls[call as usize].binding));
-                assert_eq!(actual.phase, AggregatePhase::Single);
-                assert_eq!(actual.logical_argument_count, 0);
+                let selected = &calls[ordinal as usize];
+                assert!(std::ptr::eq(actual, &selected.binding));
+                assert_eq!(
+                    selected.id,
+                    AggregateCallId::new(if ordinal == 0 { 0 } else { u32::MAX })
+                );
+                if ordinal != 0 {
+                    assert_ne!(selected.id.get(), ordinal);
+                }
             }
             (
-                PhysicalCallSite::Expression(id),
-                PhysicalCallBinding::Window {
+                PhysicalCallSite::Window {
+                    node,
+                    call: ordinal,
+                },
+                Some(PhysicalCallBinding::Window {
                     function: actual,
                     aggregate,
-                },
+                }),
             ) => {
-                let ExprKind::WindowCall { function, .. } = &fixture
-                    .fragment
-                    .expressions()
-                    .get(fixture.uses.flow().uses()[&id].definition)
-                    .unwrap()
-                    .kind
-                else {
-                    panic!("actual window")
+                let NodeKind::Window(spec) = &fixture.fragment.nodes()[&node].kind else {
+                    unreachable!()
                 };
-                assert!(std::ptr::eq(actual, function));
+                assert!(std::ptr::eq(actual, &spec.calls[ordinal as usize].binding));
                 assert!(aggregate.is_none());
             }
-            (PhysicalCallSite::Table { node }, PhysicalCallBinding::Table(actual)) => {
+            (PhysicalCallSite::Table { node }, Some(PhysicalCallBinding::Table(actual))) => {
                 let NodeKind::TableFunction { function, .. } =
                     &fixture.fragment.nodes()[&node].kind
                 else {
-                    panic!("actual table")
+                    unreachable!()
                 };
                 assert!(std::ptr::eq(actual, function));
-                assert_eq!(
-                    actual.result_types,
-                    novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::from(
-                        [integer()]
-                    ))
-                );
+                assert_eq!(actual.result_types.as_slice(), &[integer()]);
             }
-            _ => panic!("wrong binding family"),
+            _ => panic!("wrong actual binding family"),
         }
     }
 }
 
 #[test]
 fn relational_occurrences_require_fresh_ids_value_demand_actual_domain_and_kind() {
-    let fixture = special_fixture();
-    let check = |calls| {
-        FrozenFragmentCalls::try_new(&fixture.fragment, &fixture.uses, calls, &Control::default())
-    };
-    let mut wrong = fixture.calls.clone();
-    wrong[0].context.use_id = ExpressionUseId::new(0);
-    assert_eq!(check(wrong), Err(FrozenCallError::SharedUse));
-    let mut wrong = fixture.calls.clone();
-    wrong[1].context.use_id = wrong[0].context.use_id;
-    assert_eq!(check(wrong), Err(FrozenCallError::SharedUse));
-    let mut wrong = fixture.calls.clone();
-    wrong[0].context.demand = EvaluationDemand::TruthOnly;
-    assert_eq!(check(wrong), Err(FrozenCallError::WrongContext));
-    let mut wrong = fixture.calls.clone();
-    wrong[0].context.domain = EvaluationDomainId::new(123);
-    assert_eq!(check(wrong), Err(FrozenCallError::InvalidDomain));
-    let mut wrong = fixture.calls.clone();
-    wrong[0].effects.argument_control = ArgumentControl::Eager;
-    assert_eq!(
-        check(wrong),
-        Err(FrozenCallError::InvalidEffects(
-            EffectContractError::KindMismatch
-        ))
+    let mut constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let fixture = special_fixture(&mut constants);
+    let original = fixture.relations().values().cloned().collect::<Vec<_>>();
+    // Same integer in an unrelated expression namespace is valid. Real
+    // relation identities must instead be unique among actual relation sites.
+    assert_eq!(original[0].context.identity.call.get(), 0);
+    assert!(
+        fixture
+            .unit()
+            .control_flow()
+            .uses()
+            .contains_key(&ExpressionUseId::new(0))
     );
-    let mut wrong = fixture.calls.clone();
-    wrong.pop();
-    assert_eq!(
-        check(wrong),
-        Err(FrozenCallError::MissingSite(
-            fixture.calls.last().unwrap().site
-        ))
+    assert!(matches!(
+        fixture.candidate_relations(
+            |calls| calls[1].context.identity.call = calls[0].context.identity.call
+        ),
+        Err(FrozenCallError::DuplicateIdentity)
+    ));
+    assert!(matches!(
+        fixture.candidate_relations(|calls| calls[0].context.demand = EvaluationDemand::TruthOnly),
+        Err(FrozenCallError::WrongContext)
+    ));
+    assert!(matches!(
+        fixture.candidate_relations(|calls| calls[0].context.identity.role =
+            novarocks_type_contract::RelationEffectRole::MaterializedInput),
+        Err(FrozenCallError::WrongContext)
+    ));
+    assert!(matches!(
+        fixture.candidate_relations(|calls| {
+            calls[0].effects.proof_scope = CallProofScope::Relation(
+                novarocks_type_contract::RelationEffectContext::call(
+                    novarocks_type_contract::RelationCallId::new(123),
+                )
+                .identity,
+            );
+        }),
+        Err(FrozenCallError::WrongProofScope)
+    ));
+    assert!(matches!(
+            fixture.candidate_relations(
+                |calls| calls[0].effects.argument_control = ArgumentControl::Eager
+            ),
+            Err(FrozenCallError::InvalidEffects(
+                EffectContractError::KindMismatch
+            ))
+        ));
+    assert!(
+        matches!(fixture.candidate_relations(|calls| { calls.pop(); }), Err(FrozenCallError::MissingSite(site)) if site == original.last().unwrap().site)
     );
-    let mut wrong = fixture.calls.clone();
-    wrong[0].site = PhysicalCallSite::WriterPartial {
-        node: fixture.fragment.root(),
-        call: 0,
-    };
+    assert!(
+        matches!(fixture.candidate_relations(|calls| calls[0].site = PhysicalCallSite::WriterPartial { node: fixture.fragment.root(), call: 0 }), Err(FrozenCallError::MissingSite(site)) if site == original[0].site)
+    );
+    let foreign = wide_relation_fixture(2);
+    let checked = fixture.checked().unwrap();
     assert_eq!(
-        check(wrong),
-        Err(FrozenCallError::MissingSite(fixture.calls[0].site))
+        checked.validate_fragment(&foreign.fragment, &Control::default()),
+        Err(FrozenCallError::WrongFragment)
+    );
+    assert!(
+        checked
+            .binding(&foreign.fragment, original[0].site)
+            .is_none()
     );
 }
 
 #[test]
 fn combined_expression_and_relational_occurrences_share_one_near_over_budget() {
+    let mut constants = crate::tests::constant_fixture::ConstantFixture::new();
     for (rows, accepted) in [
         (MAX_CONTROL_USE_REFERENCES - 4, true),
         (MAX_CONTROL_USE_REFERENCES - 3, false),
     ] {
-        let fixture = special_fixture_with_rows(rows);
-        // Actual Values rows plus one Window call are expression uses; two
-        // Aggregate calls and one Table call add three distinct occurrences.
-        assert_eq!(fixture.uses.flow().use_reference_count(), rows + 1);
-        assert_eq!(fixture.calls.len(), 4);
-        let mut special_ids = BTreeSet::new();
-        for call in &fixture.calls {
-            if !matches!(call.site, PhysicalCallSite::Expression(_)) {
-                assert!(
-                    !fixture
-                        .uses
-                        .flow()
-                        .uses()
-                        .contains_key(&call.context.use_id)
-                );
-                assert!(special_ids.insert(call.context.use_id));
-            }
-        }
-        assert_eq!(special_ids.len(), 3);
+        let result = special_fixture_with_rows(rows, &mut constants);
         assert_eq!(
             rows + 4,
             MAX_CONTROL_USE_REFERENCES + usize::from(!accepted)
         );
-        let result = fixture.checked();
         if accepted {
-            let checked = result.expect("the combined exact boundary must be admitted");
-            assert_eq!(checked.entries().len(), 4);
-            checked
-                .validate_fragment(&fixture.fragment, &fixture.uses, &Control::default())
-                .unwrap();
+            let fixture = result.expect("exact original mixed boundary");
+            assert_eq!(fixture.unit().control_flow().use_reference_count(), rows);
+            assert_eq!(fixture.checked().unwrap().entries().len(), 4);
         } else {
-            assert_eq!(result, Err(FrozenCallError::TooManyItems));
+            assert!(matches!(result, Err(FrozenCallError::TooManyItems)));
         }
     }
 }
 
 #[test]
 fn entry_and_mid_quantum_compile_failures_keep_exact_outer_categories() {
-    let fixture = scalar_fixture(300, 71);
+    let fixture = wide_relation_fixture(300);
+    let calls = fixture.relations().values().cloned().collect::<Vec<_>>();
     let checked = fixture.checked().unwrap();
-    for error in [
+    let baseline = Control::default();
+    checked
+        .validate_fragment(&fixture.fragment, &baseline)
+        .unwrap();
+    let baseline = baseline.observations.lock().unwrap().clone();
+    assert!(baseline.iter().all(|(_, units)| *units <= 256));
+    let first_positive = baseline.iter().find(|(_, units)| *units > 0).unwrap().1;
+    for cause in [
         CompileControlError::Cancelled,
         CompileControlError::DeadlineExceeded,
         CompileControlError::ResourceExhausted,
     ] {
         for positive_only in [false, true] {
             let control = Control {
-                stop: Some(error.clone()),
+                stop: Some(cause.clone()),
                 positive_only,
                 observations: Mutex::default(),
             };
-            assert_eq!(
-                FrozenFragmentCalls::try_new(
-                    &fixture.fragment,
-                    &fixture.uses,
-                    fixture.calls.clone(),
-                    &control
-                ),
-                Err(FrozenCallError::Control(error.clone()))
+            assert!(
+                matches!(FrozenFragmentCalls::try_new(&fixture.fragment, calls.clone(), &control), Err(FrozenCallError::Control(actual)) if actual == cause)
             );
             let observations = control.observations.lock().unwrap();
             assert_eq!(observations[0], (CompilePhase::Validate, 0));
@@ -1064,31 +1213,37 @@ fn entry_and_mid_quantum_compile_failures_keep_exact_outer_categories() {
             }
             drop(observations);
             let control = Control {
-                stop: Some(error.clone()),
+                stop: Some(cause.clone()),
                 positive_only,
                 observations: Mutex::default(),
             };
             assert_eq!(
-                checked.validate_fragment(&fixture.fragment, &fixture.uses, &control),
-                Err(FrozenCallError::Control(error.clone()))
+                checked.validate_fragment(&fixture.fragment, &control),
+                Err(FrozenCallError::Control(cause.clone()))
             );
-            let observations = control.observations.lock().unwrap();
             if positive_only {
-                assert_eq!(observations.last(), Some(&(CompilePhase::Validate, 256)));
+                assert_eq!(
+                    control.observations.lock().unwrap().last(),
+                    Some(&(CompilePhase::Validate, first_positive))
+                );
             }
         }
     }
+    // Actual scalar source construction retains its own 300-use primary-cause
+    // test at the unit owner; an empty relation table cannot prove that work.
 }
 
 #[test]
 fn call_count_preflight_rejects_over_budget_without_visiting_entries() {
-    let fixture = scalar_fixture(1, 81);
-    let calls = vec![fixture.calls[0].clone(); MAX_CONTROL_USE_REFERENCES + 1];
+    let mut constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let fixture = special_fixture(&mut constants);
+    let calls =
+        vec![fixture.relations().values().next().unwrap().clone(); MAX_CONTROL_USE_REFERENCES + 1];
     let control = Control::default();
-    assert_eq!(
-        FrozenFragmentCalls::try_new(&fixture.fragment, &fixture.uses, calls, &control),
+    assert!(matches!(
+        FrozenFragmentCalls::try_new(&fixture.fragment, calls, &control),
         Err(FrozenCallError::TooManyItems)
-    );
+    ));
     assert_eq!(
         *control.observations.lock().unwrap(),
         vec![(CompilePhase::Validate, 0), (CompilePhase::Validate, 0)]
@@ -1096,248 +1251,111 @@ fn call_count_preflight_rejects_over_budget_without_visiting_entries() {
 }
 
 #[test]
-fn type_only_parent_retains_static_child_binding_without_runtime_child_claim() {
-    let mut builder = FragmentBuilder::new(FragmentId::new(91));
-    let node = builder.reserve_node_id().unwrap();
-    let child = builder
-        .add_expression(
-            node,
-            boolean(),
-            ExprKind::FunctionCall {
-                function: function(FunctionKind::Scalar, boolean()),
-                args: Box::default(),
-            },
-        )
-        .unwrap();
-    let mut selected_parent = function(FunctionKind::Scalar, boolean());
-    selected_parent.function_id = FunctionId::try_new("fixture/frozen-calls/inspect-type").unwrap();
-    selected_parent.argument_types =
-        novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::from([
-            FunctionArgumentType::Value(boolean()),
-        ]));
-    let parent = builder
-        .add_expression(
-            node,
-            boolean(),
-            ExprKind::FunctionCall {
-                function: selected_parent,
-                args: Box::from([child]),
-            },
-        )
-        .unwrap();
-    let output = builder
-        .add_value(
-            boolean(),
-            ValueOrigin::NodeOutput {
-                node,
-                output_ordinal: 0,
-            },
-        )
-        .unwrap();
-    install_node(
-        &mut builder,
-        node,
-        vec![],
-        vec![output],
-        NodeKind::Values {
-            rows: Box::from([Box::from([parent])]),
-        },
-    );
-    let fragment = builder
-        .finish_definition(
-            node,
-            FragmentSink::Noop,
-            dop(),
-            crate::StagePlacementPolicy::Singleton,
-        )
-        .unwrap();
-    let current = context(0, u32::MAX, EvaluationDemand::Value);
-    let flow = ExpressionControlFlow::try_new(
-        vec![domain(u32::MAX)],
-        vec![ExpressionInvocation {
-            context: current,
-            definition: parent,
-            control: ControlShape::TypeOnly,
-            arguments: Box::default(),
-        }],
-        fragment.expressions(),
-        CompilePhase::Validate,
-        &Control::default(),
-    )
-    .unwrap();
-    let uses = PhysicalRootUses::try_new(
-        &fragment,
-        flow,
-        vec![(
-            ExpressionRootSite {
-                node,
-                role: ExpressionRootRole::ValuesCell { row: 0, column: 0 },
-            },
-            current.use_id,
-        )],
-        &Control::default(),
-    )
-    .unwrap();
-    let mut claimed = effects(FunctionKind::Scalar, current.domain);
-    claimed.argument_control = ArgumentControl::TypeOnly;
-    let parent_call = FrozenPhysicalCall {
-        materialized_writer_input: None,
-        regexp_count_pattern_source: None,
-        to_base64_byte_source: None,
-        temporal_source: None,
-        decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-        site: PhysicalCallSite::Expression(current.use_id),
-        context: current,
-        effects: claimed,
-    };
-    let checked = FrozenFragmentCalls::try_new(
-        &fragment,
-        &uses,
-        vec![parent_call.clone()],
-        &Control::default(),
-    )
-    .unwrap();
-    assert_eq!(fragment.expressions().len(), 2);
-    assert_eq!(uses.flow().uses().len(), 1);
-    assert!(uses.flow().uses()[&current.use_id].arguments.is_empty());
-    assert_eq!(checked.entries().len(), 1);
-    let Some(PhysicalCallBinding::Scalar(actual)) =
-        checked.binding(&fragment, &uses, parent_call.site)
-    else {
-        panic!("type-only parent binding is required");
-    };
-    assert_eq!(
-        actual.argument_types,
-        novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::from([
-            FunctionArgumentType::Value(boolean())
-        ]))
-    );
-    let ExprKind::FunctionCall { args, .. } = &fragment.expressions().get(parent).unwrap().kind
-    else {
-        panic!("actual parent definition is required");
-    };
-    assert_eq!(args.as_ref(), &[child]);
-    let child_site = PhysicalCallSite::Expression(ExpressionUseId::new(u32::MAX));
-    assert!(checked.binding(&fragment, &uses, child_site).is_none());
-    let mut child_claim = parent_call.clone();
-    child_claim.site = child_site;
-    child_claim.context.use_id = ExpressionUseId::new(u32::MAX);
-    child_claim.effects.argument_control = ArgumentControl::Eager;
-    assert_eq!(
-        FrozenFragmentCalls::try_new(
-            &fragment,
-            &uses,
-            vec![parent_call, child_claim],
-            &Control::default(),
-        ),
-        Err(FrozenCallError::InvalidSite),
-    );
-}
-
-#[test]
 fn decimal_policy_is_independent_of_equal_effects_and_call_context() {
     use novarocks_type_contract::DecimalOverflowPolicy::{OutputNull, ReportError};
-
-    let mut fixture = scalar_fixture(1, 83);
-    let output_null = fixture.checked().unwrap();
-    let site = fixture.calls[0].site;
-    fixture.calls[0].decimal_overflow_policy = ReportError;
-    let report_error = fixture.checked().unwrap();
-    let before = &output_null.entries()[&site];
-    let after = &report_error.entries()[&site];
+    let mut constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let mut fixture = scalar_fixture(1, 83, &mut constants);
+    let before = fixture.claims()[&ExpressionUseId::new(0)].clone();
+    fixture.edit_unit(|parts| {
+        parts
+            .claims
+            .get_mut(&ExpressionUseId::new(0))
+            .unwrap()
+            .decimal_overflow_policy = ReportError
+    });
+    fixture.checked().unwrap();
+    let after = &fixture.claims()[&ExpressionUseId::new(0)];
     assert_eq!(before.context, after.context);
     assert_eq!(before.effects, after.effects);
     assert_eq!(before.decimal_overflow_policy, OutputNull);
     assert_eq!(after.decimal_overflow_policy, ReportError);
-    assert_ne!(before, after);
-    assert_ne!(output_null, report_error);
-    // Rechecking this exact snapshot validates shape, not an invented policy
-    // derived from the selected signature or its unchanged NoRowError claim.
-    report_error
-        .validate_fragment(&fixture.fragment, &fixture.uses, &Control::default())
-        .unwrap();
-    assert_eq!(report_error.entries()[&site], fixture.calls[0]);
+    assert_ne!(&before, after);
+    let repeated = fixture.candidate_unit(|_| {}).unwrap();
+    assert_eq!(&repeated, fixture.unit());
 }
 
 #[test]
 fn shared_definition_occurrences_keep_distinct_decimal_policies_in_one_table() {
     use novarocks_type_contract::DecimalOverflowPolicy::{OutputNull, ReportError};
-
-    let mut fixture = scalar_fixture(2, 84);
-    for call in &mut fixture.calls {
-        call.effects.proof_scope = CallProofScope::Unconditional;
-    }
-    fixture.calls[0].decimal_overflow_policy = ReportError;
-    fixture.calls[1].decimal_overflow_policy = OutputNull;
-    assert_eq!(fixture.calls[0].effects, fixture.calls[1].effects);
-    let checked = fixture.checked().unwrap();
-    let first = fixture.uses.flow().uses()[&fixture.calls[0].context.use_id].definition;
-    let second = fixture.uses.flow().uses()[&fixture.calls[1].context.use_id].definition;
-    assert_eq!(first, second);
-    let Some(PhysicalCallBinding::Scalar(first_binding)) =
-        checked.binding(&fixture.fragment, &fixture.uses, fixture.calls[0].site)
+    let mut constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let mut fixture = scalar_fixture(2, 84, &mut constants);
+    fixture.edit_unit(|parts| {
+        for call in parts.claims.values_mut() {
+            call.effects.proof_scope = CallProofScope::Unconditional;
+        }
+        parts
+            .claims
+            .get_mut(&ExpressionUseId::new(0))
+            .unwrap()
+            .decimal_overflow_policy = ReportError;
+        parts
+            .claims
+            .get_mut(&ExpressionUseId::new(u32::MAX))
+            .unwrap()
+            .decimal_overflow_policy = OutputNull;
+    });
+    fixture.checked().unwrap();
+    let first = &fixture.claims()[&ExpressionUseId::new(0)];
+    let second = &fixture.claims()[&ExpressionUseId::new(u32::MAX)];
+    assert_eq!(first.effects, second.effects);
+    let first_id = fixture.unit().control_flow().uses()[&first.context.use_id].definition;
+    let second_id = fixture.unit().control_flow().uses()[&second.context.use_id].definition;
+    assert_eq!(first_id, second_id);
+    let ExprKind::FunctionCall {
+        function: first_binding,
+        ..
+    } = &fixture.unit().definition(first_id).unwrap().kind
     else {
-        panic!("missing first exact scalar binding")
+        panic!("actual binding")
     };
-    let Some(PhysicalCallBinding::Scalar(second_binding)) =
-        checked.binding(&fixture.fragment, &fixture.uses, fixture.calls[1].site)
+    let ExprKind::FunctionCall {
+        function: second_binding,
+        ..
+    } = &fixture.unit().definition(second_id).unwrap().kind
     else {
-        panic!("missing second exact scalar binding")
+        panic!("actual binding")
     };
     assert!(std::ptr::eq(first_binding, second_binding));
-    for (call, policy) in fixture.calls.iter().zip([ReportError, OutputNull]) {
-        assert_eq!(
-            checked.entries()[&call.site].decimal_overflow_policy,
-            policy
-        );
-    }
-    checked
-        .validate_fragment(&fixture.fragment, &fixture.uses, &Control::default())
-        .unwrap();
-    assert_eq!(checked, fixture.checked().unwrap());
+    assert_eq!(first.decimal_overflow_policy, ReportError);
+    assert_eq!(second.decimal_overflow_policy, OutputNull);
 }
 
 #[test]
 fn relational_and_window_sites_preserve_their_own_explicit_decimal_policy() {
     use novarocks_type_contract::DecimalOverflowPolicy::{OutputNull, ReportError};
-
-    let mut fixture = special_fixture();
+    let mut constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let mut fixture = special_fixture(&mut constants);
     let policies = [ReportError, OutputNull, ReportError, OutputNull];
-    for (call, policy) in fixture.calls.iter_mut().zip(policies) {
-        call.decimal_overflow_policy = policy;
-    }
+    fixture.fragment = fixture
+        .candidate_relations(|calls| {
+            for (call, policy) in calls.iter_mut().zip(policies) {
+                call.decimal_overflow_policy = policy;
+            }
+        })
+        .unwrap();
     let checked = fixture.checked().unwrap();
+    let entries = checked.entries().values().collect::<Vec<_>>();
     assert!(matches!(
-        fixture.calls[0].site,
+        entries[0].site,
         PhysicalCallSite::Aggregate { call: 0, .. }
     ));
     assert!(matches!(
-        fixture.calls[1].site,
+        entries[1].site,
         PhysicalCallSite::Aggregate { call: 1, .. }
     ));
     assert!(matches!(
-        fixture.calls[2].site,
-        PhysicalCallSite::Expression(_)
+        entries[2].site,
+        PhysicalCallSite::Window { call: 0, .. }
     ));
-    assert!(matches!(
-        fixture.calls[3].site,
-        PhysicalCallSite::Table { .. }
-    ));
-    for (call, policy) in fixture.calls.iter().zip(policies) {
-        assert_eq!(
-            checked.entries()[&call.site].decimal_overflow_policy,
-            policy
-        );
-        assert!(
-            checked
-                .binding(&fixture.fragment, &fixture.uses, call.site)
-                .is_some()
-        );
+    assert!(matches!(entries[3].site, PhysicalCallSite::Table { .. }));
+    for (call, policy) in entries.into_iter().zip(policies) {
+        assert_eq!(call.decimal_overflow_policy, policy);
+        assert!(checked.binding(&fixture.fragment, call.site).is_some());
     }
     checked
-        .validate_fragment(&fixture.fragment, &fixture.uses, &Control::default())
+        .validate_fragment(&fixture.fragment, &Control::default())
         .unwrap();
-    assert_eq!(checked, fixture.checked().unwrap());
+    assert!(std::ptr::eq(checked, fixture.checked().unwrap()));
 }
 
 #[path = "visit_tests.rs"]

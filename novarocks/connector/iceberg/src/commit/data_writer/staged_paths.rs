@@ -17,6 +17,7 @@
 
 //! The original driver-local path inventory, shared only with its SDK path author.
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
@@ -54,11 +55,33 @@ struct StagedPath {
     claim: Option<CreateClaim>,
     owner: ObjectOwner,
     content: ObjectContent,
+    accepted_bytes: Arc<AtomicU64>,
+}
+
+/// The original SDK output publishes its cumulative success count on this path.
+#[derive(Clone, Debug)]
+pub(crate) struct StagedWriteProgress {
+    path_bytes: Arc<AtomicU64>,
+    total_bytes: Arc<AtomicU64>,
+}
+
+impl StagedWriteProgress {
+    pub(crate) fn record_accepted(&self, bytes: u64) {
+        let previous = self.path_bytes.swap(bytes, Ordering::Relaxed);
+        let delta = bytes - previous;
+        // Consumers take the wrapping difference between two append snapshots.
+        self.total_bytes.fetch_add(delta, Ordering::Relaxed);
+    }
+
+    pub(crate) fn accepted_bytes(&self) -> u64 {
+        self.path_bytes.load(Ordering::Relaxed)
+    }
 }
 
 #[derive(Clone, Default)]
 pub(crate) struct StagedPathJournal {
     paths: Arc<Mutex<Vec<StagedPath>>>,
+    total_accepted_bytes: Arc<AtomicU64>,
     managed: bool,
     cleanup: Arc<OnceLock<CleanupRequest>>,
     stream_cleanup: Arc<Mutex<Vec<ConnectorIoCleanupFuture>>>,
@@ -147,7 +170,25 @@ impl StagedPathJournal {
                     ObjectOwner::Ours
                 },
                 content: ObjectContent::Open,
+                accepted_bytes: Arc::default(),
             });
+    }
+
+    pub(crate) fn write_progress(&self, path: &str) -> Option<StagedWriteProgress> {
+        self.paths
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .iter()
+            .rev()
+            .find(|entry| entry.path == path)
+            .map(|entry| StagedWriteProgress {
+                path_bytes: Arc::clone(&entry.accepted_bytes),
+                total_bytes: Arc::clone(&self.total_accepted_bytes),
+            })
+    }
+
+    pub(crate) fn total_accepted_bytes(&self) -> u64 {
+        self.total_accepted_bytes.load(Ordering::Relaxed)
     }
 
     pub(crate) fn begin(&self, path: &str, identity: [u8; 32]) -> Result<CreateClaim, String> {

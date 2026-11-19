@@ -26,16 +26,12 @@ use super::{
 use super::{namespace::finish, receiving_grammar};
 use crate::{
     btree_resources_v2::{self, BTreeResourceError},
-    physical_aggregate_binding_v2::{
-        MaterializedAggregateBindings, copy_aggregate_binding_observed,
-        preflight_aggregate_binding_copy, preflight_aggregate_binding_copy_in,
-    },
+    physical_aggregate_binding_v2::MaterializedAggregateBindings,
     physical_binding_v2::{
         BindingProjectionLimits, MaterializationModel, MaterializedFunctionBinding,
         MaterializedFunctionBindings, add, boxed, cap, copy_scalar_signature_observed, mul,
         preflight_scalar_signature_copy, preflight_scalar_signature_copy_in, reserve,
     },
-    physical_properties_v2::{PhysicalPropertyCodecError, decode_direction, decode_nulls},
     physical_semantics_v2::{decode_decimal_policy, decode_reference},
     physical_type_v2::{DecodedTypeTable, clone_value_type_observed},
 };
@@ -53,12 +49,6 @@ fn tree_error(error: BTreeResourceError) -> Error {
     match error {
         BTreeResourceError::SourceModel(message) => shape(message),
         BTreeResourceError::Arithmetic(_) => CompileControlError::ResourceExhausted.into(),
-    }
-}
-fn property(error: PhysicalPropertyCodecError) -> Error {
-    match error {
-        PhysicalPropertyCodecError::Control(error) => error.into(),
-        PhysicalPropertyCodecError::InvalidShape(message) => shape(message),
     }
 }
 fn completed<T>(result: Result<T, Error>, w: &mut CompileCheckpoints<'_>) -> Result<T, Error> {
@@ -104,7 +94,7 @@ fn binding_facts(f: &crate::physical_binding_v2::BindingProjectionFacts, refs: u
 /// A real owned arena, retaining the original receiving namespace loans.
 /// Into-arena ends those loans without granting graph or installed capability.
 pub struct MaterializedExpressions<'loan, 'headers, 'wire, 'control> {
-    arena: p::ExprArena,
+    definitions: Box<[novarocks_expression_contract::ExprNode]>,
     expressions: &'loan DecodedExpressions<'headers, 'wire, 'control>,
     functions: &'loan MaterializedFunctionBindings<'headers, 'wire>,
     aggregates: &'loan MaterializedAggregateBindings<'loan, 'headers, 'wire>,
@@ -113,15 +103,15 @@ pub struct MaterializedExpressions<'loan, 'headers, 'wire, 'control> {
     retained_bytes: usize,
 }
 impl<'loan, 'headers, 'wire, 'control> MaterializedExpressions<'loan, 'headers, 'wire, 'control> {
-    pub fn arena(&self) -> &p::ExprArena {
+    pub fn definitions(&self) -> &[novarocks_expression_contract::ExprNode] {
         let _namespace_loans = (&self.functions, &self.aggregates);
-        &self.arena
+        &self.definitions
     }
     pub fn facts(&self) -> &Facts {
         &self.facts
     }
-    pub fn into_arena(self) -> p::ExprArena {
-        self.arena
+    pub fn into_definitions(self) -> Box<[novarocks_expression_contract::ExprNode]> {
+        self.definitions
     }
     #[cfg(test)]
     pub(crate) fn expressions(&self) -> &'loan DecodedExpressions<'headers, 'wire, 'control> {
@@ -141,14 +131,14 @@ impl<'loan, 'headers, 'wire, 'control> MaterializedExpressions<'loan, 'headers, 
         self.expressions.original_control()
     }
     pub fn lookup_work_upper_bound(&self) -> Result<usize, Error> {
-        btree_resources_v2::lookup_work_typed(self.arena.len()).map_err(tree_error)
+        btree_resources_v2::lookup_work_typed(self.definitions.len()).map_err(tree_error)
     }
     /// Caller admits this opaque lookup's work and owns entry/ordinary footer.
     pub fn definition_observed(
         &self,
         id: u32,
         w: &mut CompileCheckpoints<'_>,
-    ) -> Result<Option<&p::ExprNode>, Error> {
+    ) -> Result<Option<&novarocks_expression_contract::ExprNode>, Error> {
         let same = std::ptr::addr_eq(w.control(), self.original_control());
         w.step()?;
         if !same {
@@ -157,7 +147,10 @@ impl<'loan, 'headers, 'wire, 'control> MaterializedExpressions<'loan, 'headers, 
             ));
         }
         w.flush()?;
-        let found = self.arena.get(p::ExprId::new(id));
+        let found = self
+            .definitions
+            .get(id as usize)
+            .filter(|node| node.id.get() == id);
         w.step()?;
         w.flush()?;
         Ok(found)
@@ -167,7 +160,7 @@ impl<'loan, 'headers, 'wire, 'control> MaterializedExpressions<'loan, 'headers, 
         id: u32,
         admit: &mut Admit<'_>,
         work: &mut CompileCheckpoints<'_>,
-    ) -> Result<Option<&p::ExprNode>, Error> {
+    ) -> Result<Option<&novarocks_expression_contract::ExprNode>, Error> {
         same_control(self.original_control(), work)?;
         admit(&lookup_facts(
             self.lookup_work_upper_bound()?
@@ -189,7 +182,6 @@ pub struct PreparedExpressionMaterialization<'loan, 'headers, 'wire, 'control> {
     expressions: &'loan DecodedExpressions<'headers, 'wire, 'control>,
     functions: &'loan MaterializedFunctionBindings<'headers, 'wire>,
     aggregates: &'loan MaterializedAggregateBindings<'loan, 'headers, 'wire>,
-    plan_limits: &'loan p::PlanLimits,
     facts: Facts,
     limits: Limits,
     source_invoice: usize,
@@ -216,20 +208,11 @@ fn function<'a>(
     functions: &'a MaterializedFunctionBindings<'_, '_>,
     id: u32,
     w: &mut CompileCheckpoints<'_>,
-) -> Result<&'a p::BoundFunction, Error> {
+) -> Result<&'a novarocks_expression_contract::BoundFunction, Error> {
     match functions.definition_observed(id, w)? {
         Some(MaterializedFunctionBinding::Scalar(source)) => Ok(source),
         _ => Err(shape("owned expression scalar-result binding is absent")),
     }
-}
-fn aggregate<'a>(
-    aggregates: &'a MaterializedAggregateBindings<'_, '_, '_>,
-    id: u32,
-    w: &mut CompileCheckpoints<'_>,
-) -> Result<&'a p::AggregateBinding, Error> {
-    aggregates
-        .definition_observed(id, w)?
-        .ok_or_else(|| shape("owned expression aggregate binding is absent"))
 }
 fn list<T>(
     model: &mut MaterializationModel,
@@ -335,18 +318,10 @@ fn preflight(
     // These three floor authors contain only checked numerical operations.
     // The caller-owned path must lift their known overflow before any later
     // namespace observation; Plain keeps its original error and trace.
-    let expression_floor = if admission.observed() {
-        expressions.retained_floor_header_in()?
-    } else {
-        expressions.retained_floor_observed(w)?
-    };
-    let function_floor =
-        admission.numeric(functions.retained_output_floor().map_err(Error::from))?;
-    let aggregate_floor =
-        admission.numeric(aggregates.retained_output_floor().map_err(Error::from))?;
-    let output_floor =
-        admission.numeric(add(function_floor, aggregate_floor).map_err(Error::from))?;
-    let known = admission.numeric(add(expression_floor, output_floor).map_err(Error::from))?;
+    let known = admission.numeric(expressions.owned_binding_floor(functions, Some(aggregates)))?;
+    if !admission.observed() {
+        expressions.retained_floor_observed(w)?;
+    }
     let lookup = mul(
         2,
         btree_resources_v2::lookup_work_typed(expressions.types().value_types().len())
@@ -355,13 +330,9 @@ fn preflight(
     let mut model = MaterializationModel::for_composition(n, lookup, source, known);
     model.facts.type_reference_count = n;
     model.items = refs;
-    model.temporary_request::<p::ExprNode>(n, 1)?;
-    let map =
-        btree_resources_v2::insertion_only::<p::ExprId, p::ExprNode>(n).map_err(tree_error)?;
-    let layout =
-        btree_resources_v2::node_layout_typed::<p::ExprId, p::ExprNode>().map_err(tree_error)?;
-    model.request_layouts(layout, map.allocation_requests_upper_bound)?;
-    model.add_work(map.cumulative_work_upper_bound)?;
+    // The local dense declaration table is one owned Box slice. Reserve and
+    // possible Vec-to-Box shrink share this original request upper bound.
+    model.request::<novarocks_expression_contract::ExprNode>(n, 2)?;
     // At most one function plus one aggregate namespace lookup per definition
     // in each pass; full type lookup work is charged per actual clone root.
     model.add_work(mul(
@@ -416,15 +387,9 @@ fn preflight(
                 model.facts.type_reference_count = add(model.facts.type_reference_count, 1)?;
             }
             K::FunctionCall(v) => list::<p::ExprId>(&mut model, v.argument_expr_ids.len(), bl)?,
-            K::WindowCall(v) => {
-                list::<p::ExprId>(&mut model, v.argument_expr_ids.len(), bl)?;
-                list::<p::SortExpr>(&mut model, v.function_order_by.len(), bl)?;
-                if v.aggregate_binding_id.is_some() {
-                    model.request::<p::AggregateBinding>(1, 1)?;
-                }
-            }
+
             K::ValueId(_)
-            | K::Literal(_)
+            | K::Constant(_)
             | K::LambdaParameter(_)
             | K::Unary(_)
             | K::Binary(_)
@@ -506,65 +471,9 @@ fn preflight(
                     )?;
                 }
             }
-            K::WindowCall(v) => {
-                let id = required(v.function_binding_id, "owned window binding is absent", w)?;
-                if admission.observed() {
-                    let found = functions.definition_captured(
-                        id,
-                        &mut |binding, work| {
-                            if let MaterializedFunctionBinding::Scalar(source) = binding {
-                                preflight_scalar_signature_copy_in(
-                                    source,
-                                    &mut model,
-                                    bl,
-                                    &mut |prefix| parent_gate(admission, prefix, refs),
-                                    work,
-                                )?;
-                            }
-                            Ok(())
-                        },
-                        w,
-                    )?;
-                    if !matches!(found, Some(MaterializedFunctionBinding::Scalar(_))) {
-                        return Err(shape("owned expression scalar-result binding is absent"));
-                    }
-                } else {
-                    preflight_scalar_signature_copy(
-                        function(functions, id, w)?,
-                        &mut model,
-                        bl,
-                        w,
-                    )?;
-                }
-                if let Some(id) = v.aggregate_binding_id {
-                    if admission.observed() {
-                        let found = aggregates.definition_captured(
-                            id,
-                            &mut |source, work| {
-                                preflight_aggregate_binding_copy_in(
-                                    source,
-                                    &mut model,
-                                    bl,
-                                    &mut |prefix| parent_gate(admission, prefix, refs),
-                                    work,
-                                )
-                            },
-                            w,
-                        )?;
-                        found
-                            .ok_or_else(|| shape("owned expression aggregate binding is absent"))?;
-                    } else {
-                        preflight_aggregate_binding_copy(
-                            aggregate(aggregates, id, w)?,
-                            &mut model,
-                            bl,
-                            w,
-                        )?;
-                    }
-                }
-            }
+
             K::ValueId(_)
-            | K::Literal(_)
+            | K::Constant(_)
             | K::LambdaParameter(_)
             | K::Unary(_)
             | K::Binary(_)
@@ -580,12 +489,7 @@ fn preflight(
         check_model(&mut model, refs, bl, admission)?;
         w.step()?;
     }
-    // Occupied K/V bytes are a necessary floor, not the maximal private node
-    // layout upper bound or the temporary staging Vec's allocation.
-    let retained = add(
-        model.retained,
-        mul(n, add(size_of::<p::ExprId>(), size_of::<p::ExprNode>())?)?,
-    )?;
+    let retained = model.retained;
     Ok((facts(&model, refs), retained))
 }
 
@@ -661,7 +565,6 @@ fn prepare_core<'loan, 'headers, 'wire, 'control>(
             expressions,
             functions,
             aggregates,
-            plan_limits,
             facts,
             limits,
             source_invoice: source_retained_bytes,
@@ -711,9 +614,9 @@ fn owned_kind(
     ty: &FunctionValueType,
     expressions: &DecodedExpressions<'_, '_, '_>,
     functions: &MaterializedFunctionBindings<'_, '_>,
-    aggregates: &MaterializedAggregateBindings<'_, '_, '_>,
+    _aggregates: &MaterializedAggregateBindings<'_, '_, '_>,
     w: &mut CompileCheckpoints<'_>,
-) -> Result<p::ExprKind, Error> {
+) -> Result<novarocks_expression_contract::ExprKind, Error> {
     use wire::expression_definition::Kind as K;
     Ok(
         match completed(
@@ -722,20 +625,26 @@ fn owned_kind(
                 .ok_or_else(|| shape("owned expression kind is absent")),
             w,
         )? {
-            K::ValueId(id) => p::ExprKind::Value(p::ValueId::new(*id)),
-            K::Literal(v) => p::ExprKind::Constant(p::ConstantReference {
-                pool: p::ConstantPoolId::new(required(v.pool_id, "constant pool ID is absent", w)?),
-                ordinal: v.row_ordinal,
-            }),
-            K::LambdaParameter(v) => p::ExprKind::LambdaParameter {
+            K::ValueId(id) => novarocks_expression_contract::ExprKind::Value(p::ValueId::new(*id)),
+            K::Constant(v) => {
+                novarocks_expression_contract::ExprKind::Constant(p::ConstantReference {
+                    pool: p::ConstantPoolId::new(required(
+                        v.pool_id,
+                        "constant pool ID is absent",
+                        w,
+                    )?),
+                    ordinal: v.row_ordinal,
+                })
+            }
+            K::LambdaParameter(v) => novarocks_expression_contract::ExprKind::LambdaParameter {
                 lambda: expr(v.lambda_expr_id, "lambda parameter owner is absent", w)?,
                 ordinal: v.ordinal,
             },
-            K::Unary(v) => p::ExprKind::Unary {
+            K::Unary(v) => novarocks_expression_contract::ExprKind::Unary {
                 op: completed(receiving_grammar::decode_unary(v.op), w)?,
                 expr: expr(v.expr_id, "unary operand is absent", w)?,
             },
-            K::Binary(v) => p::ExprKind::Binary {
+            K::Binary(v) => novarocks_expression_contract::ExprKind::Binary {
                 left: expr(v.left_expr_id, "binary left operand is absent", w)?,
                 op: completed(receiving_grammar::decode_binary(v.op), w)?,
                 right: expr(v.right_expr_id, "binary right operand is absent", w)?,
@@ -749,15 +658,15 @@ fn owned_kind(
                     .map(|r| decode_reference(r, w).map_err(Error::from))
                     .transpose()?,
             },
-            K::Conjunction(v) => p::ExprKind::Conjunction {
+            K::Conjunction(v) => novarocks_expression_contract::ExprKind::Conjunction {
                 args: ids(&v.expr_ids, w)?,
             },
-            K::Disjunction(v) => p::ExprKind::Disjunction {
+            K::Disjunction(v) => novarocks_expression_contract::ExprKind::Disjunction {
                 args: ids(&v.expr_ids, w)?,
             },
             K::FunctionCall(v) => {
                 let id = required(v.function_binding_id, "owned call binding is absent", w)?;
-                p::ExprKind::FunctionCall {
+                novarocks_expression_contract::ExprKind::FunctionCall {
                     function: copy_scalar_signature_observed(function(functions, id, w)?, w)?,
                     args: ids(&v.argument_expr_ids, w)?,
                 }
@@ -768,12 +677,12 @@ fn owned_kind(
                     parameters.push(clone_type(type_root(expressions.types(), *id, w)?, w)?);
                     w.step()?;
                 }
-                p::ExprKind::Lambda {
+                novarocks_expression_contract::ExprKind::Lambda {
                     parameter_types: boxed(parameters, w)?,
                     body: expr(v.body_expr_id, "lambda body is absent", w)?,
                 }
             }
-            K::Cast(v) => p::ExprKind::Cast {
+            K::Cast(v) => novarocks_expression_contract::ExprKind::Cast {
                 expr: expr(v.expr_id, "cast operand is absent", w)?,
                 target: copy_value_projection(ty, w)?,
                 decimal_overflow_policy: completed(
@@ -791,22 +700,22 @@ fn owned_kind(
                     w,
                 )?,
             },
-            K::IsNull(v) => p::ExprKind::IsNull {
+            K::IsNull(v) => novarocks_expression_contract::ExprKind::IsNull {
                 expr: expr(v.expr_id, "null-test operand is absent", w)?,
                 negated: v.negated,
             },
-            K::InList(v) => p::ExprKind::InList {
+            K::InList(v) => novarocks_expression_contract::ExprKind::InList {
                 expr: expr(v.expr_id, "in-list operand is absent", w)?,
                 list: ids(&v.list_expr_ids, w)?,
                 negated: v.negated,
             },
-            K::Between(v) => p::ExprKind::Between {
+            K::Between(v) => novarocks_expression_contract::ExprKind::Between {
                 expr: expr(v.expr_id, "between operand is absent", w)?,
                 low: expr(v.low_expr_id, "between low operand is absent", w)?,
                 high: expr(v.high_expr_id, "between high operand is absent", w)?,
                 negated: v.negated,
             },
-            K::Like(v) => p::ExprKind::Like {
+            K::Like(v) => novarocks_expression_contract::ExprKind::Like {
                 expr: expr(v.expr_id, "like operand is absent", w)?,
                 pattern: expr(v.pattern_expr_id, "like pattern is absent", w)?,
                 negated: v.negated,
@@ -820,58 +729,17 @@ fn owned_kind(
                     ));
                     w.step()?;
                 }
-                p::ExprKind::Case {
+                novarocks_expression_contract::ExprKind::Case {
                     operand: v.operand_expr_id.map(p::ExprId::new),
                     when_then: boxed(arms, w)?,
                     else_expr: v.else_expr_id.map(p::ExprId::new),
                 }
             }
-            K::IsTruthValue(v) => p::ExprKind::IsTruthValue {
+            K::IsTruthValue(v) => novarocks_expression_contract::ExprKind::IsTruthValue {
                 expr: expr(v.expr_id, "truth-test operand is absent", w)?,
                 value: v.value,
                 negated: v.negated,
             },
-            K::WindowCall(v) => {
-                let id = required(v.function_binding_id, "owned window binding is absent", w)?;
-                let function = copy_scalar_signature_observed(function(functions, id, w)?, w)?;
-                let args = ids(&v.argument_expr_ids, w)?;
-                let mut order = reserve(v.function_order_by.len(), w)?;
-                for key in &v.function_order_by {
-                    order.push(p::SortExpr {
-                        expr: expr(key.expr_id, "window sort operand is absent", w)?,
-                        direction: completed(decode_direction(key.direction).map_err(property), w)?,
-                        null_ordering: completed(
-                            decode_nulls(key.null_ordering).map_err(property),
-                            w,
-                        )?,
-                    });
-                    w.step()?;
-                }
-                let frame = v
-                    .frame
-                    .as_ref()
-                    .map(|v| completed(receiving_grammar::decode_window_frame(v), w))
-                    .transpose()?;
-                let aggregate_binding = if let Some(id) = v.aggregate_binding_id {
-                    let copied = copy_aggregate_binding_observed(aggregate(aggregates, id, w)?, w)?;
-                    w.flush()?;
-                    let owned = Box::new(copied);
-                    w.step()?;
-                    w.flush()?;
-                    Some(owned)
-                } else {
-                    None
-                };
-                p::ExprKind::WindowCall {
-                    function,
-                    distinct: v.distinct,
-                    args,
-                    function_order_by: boxed(order, w)?,
-                    frame,
-                    ignore_nulls: v.ignore_nulls,
-                    aggregate_binding,
-                }
-            }
         },
     )
 }
@@ -920,23 +788,20 @@ fn materialize_core<'loan, 'headers, 'wire, 'control>(
                 token.aggregates,
                 w,
             )?;
-            definitions.push(p::ExprNode {
+            definitions.push(novarocks_expression_contract::ExprNode {
                 id: p::ExprId::new(raw.id),
-                owner: p::NodeId::new(required(
-                    raw.owner_node_id,
-                    "expression owner is absent",
-                    w,
-                )?),
                 lambda_scope: raw.lambda_scope_expr_id.map(p::ExprId::new),
                 ty,
                 kind,
             });
             w.step()?;
         }
-        let arena =
-            p::ExprArena::try_from_definitions_in(definitions.into_iter(), token.plan_limits, w)?;
+        w.flush()?;
+        let definitions = definitions.into_boxed_slice();
+        w.step()?;
+        w.flush()?;
         Ok(MaterializedExpressions {
-            arena,
+            definitions,
             expressions: token.expressions,
             functions: token.functions,
             aggregates: token.aggregates,

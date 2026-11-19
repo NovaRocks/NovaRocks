@@ -20,27 +20,25 @@
 //! LocalProgram owner. The provider compiler is a pure contract fixture that
 //! canonicalizes private bytes; it is not an installed Iceberg or Paimon port.
 
+use novarocks_expression::StaticExprKind;
+
 use super::*;
+use crate::test_units::{PureUnitFixture, compiled_root};
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
 use novarocks_connector_contract::*;
+use novarocks_expression_contract::{BinaryOperator, ExprKind, RootScope};
 use novarocks_functions::{
     ComparisonOperator, ConstantPolicy, EngineFunctionCatalogBuilder, FunctionId, FunctionKind,
     FunctionOverloadId, InstalledPureKernel, PureEngineFunctionCatalog,
     PureImplementationDeclaration, PureImplementationId, PureKernelAbi,
 };
 use novarocks_local_program::{
-    BindingRequirement, CompiledScanInput, KernelAbiVersion, LocalProgram,
-    ProgramChannelLayoutRole, ProgramChannelSite, ProgramComparisonSite, ProgramExpressionArena,
-    ProgramExpressionRootSite, ProgramLexicalSource, ProgramNodeExpressionRole, ProgramNodeId,
-    ProgramNodeKind, ProgramUseRef, ScanSourceKind, StaticExprKind, StaticSinkProgram,
+    BindingRequirement, CompiledScanInput, KernelAbiVersion, LocalProgram, ProgramNodeId,
+    ProgramNodeKind, ScanSourceKind, StaticSinkProgram,
 };
 use novarocks_physical_plan::*;
-use novarocks_type_contract::{
-    ControlShape, DecimalOverflowPolicy, EvaluationDemand, EvaluationDomainId,
-    ExpressionControlFlow, ExpressionEffectContext, ExpressionEvaluationDomain,
-    ExpressionInvocation, ExpressionUseId, control_argument_semantics,
-};
+use novarocks_type_contract::{DecimalOverflowPolicy, EvaluationDemand};
 use std::{
     collections::{BTreeSet, HashMap},
     num::{NonZeroU64, NonZeroUsize},
@@ -273,6 +271,7 @@ fn fixture(spec: Spec) -> Fixture {
     let columns = [b"c0" as &'static [u8], b"c1"].map(|bytes| ProviderColumnReference {
         column_payload: payload(&binding, ConnectorCodecCategory::ReadColumn, bytes),
     });
+    let mut constants = novarocks_physical_plan::ConstantPools::empty();
     let mut builder = FragmentBuilder::new(PRODUCER);
     let provider = columns
         .iter()
@@ -291,18 +290,23 @@ fn fixture(spec: Spec) -> Fixture {
     let mut residuals = Vec::new();
     for ordinal in 0..spec.residuals {
         let column = builder
-            .add_expression(SCAN, int64(), ExprKind::Value(provider[ordinal % 2]))
+            .fixture_definition(SCAN, int64(), ExprKind::Value(provider[ordinal % 2]))
             .unwrap();
         let literal = builder
-            .add_expression(
+            .fixture_definition(
                 SCAN,
                 int64(),
-                ExprKind::Literal(LiteralValue::Int64(7 + ordinal as i64)),
+                crate::test_constants::i64(
+                    &mut constants,
+                    &int64(),
+                    7 + ordinal as i64,
+                    options(None).constants,
+                ),
             )
             .unwrap();
         residuals.push(
             builder
-                .add_expression(
+                .fixture_definition(
                     SCAN,
                     boolean(),
                     ExprKind::Binary {
@@ -316,6 +320,19 @@ fn fixture(spec: Spec) -> Fixture {
                 .unwrap(),
         );
     }
+    let residuals: Vec<_> = residuals
+        .into_iter()
+        .map(|definition| {
+            builder
+                .fixture_occurrence(
+                    SCAN,
+                    definition,
+                    EvaluationDemand::TruthOnly,
+                    RootScope::Port(0),
+                )
+                .unwrap()
+        })
+        .collect();
     let predicate_guarantees: Box<[PredicateGuarantee]> = match spec.guarantee {
         Guarantee::None => Box::default(),
         Guarantee::PruningOnly | Guarantee::Exact => Box::from([PredicateGuarantee {
@@ -335,10 +352,23 @@ fn fixture(spec: Spec) -> Fixture {
     let mut derived_values = Vec::new();
     if spec.derived {
         let expr = builder
-            .add_expression(SCAN, int64(), ExprKind::Literal(LiteralValue::Int64(9)))
+            .fixture_definition(
+                SCAN,
+                int64(),
+                crate::test_constants::i64(&mut constants, &int64(), 9, options(None).constants),
+            )
+            .unwrap();
+        let expr = builder
+            .fixture_occurrence(SCAN, expr, EvaluationDemand::Value, RootScope::Port(0))
             .unwrap();
         let value = builder
-            .add_value(int64(), ValueOrigin::Expr { node: SCAN, expr })
+            .add_value(
+                int64(),
+                ValueOrigin::Expr {
+                    node: SCAN,
+                    root: expr,
+                },
+            )
             .unwrap();
         derived_values.push(value);
         output.push(value);
@@ -402,17 +432,24 @@ fn fixture(spec: Spec) -> Fixture {
             output.clone().into_boxed_slice(),
         )
         .unwrap();
+    if spec.residuals != 0 || spec.derived {
+        builder.finish_fixture_unit(SCAN, &FixtureControl).unwrap();
+    }
     let mut root = SCAN;
     if spec.filter {
         // A row-local filter over the unconstrained scan, reading `v1`.
         let column = builder
-            .add_expression(FILTER, int64(), ExprKind::Value(provider[1]))
+            .fixture_definition(FILTER, int64(), ExprKind::Value(provider[1]))
             .unwrap();
         let literal = builder
-            .add_expression(FILTER, int64(), ExprKind::Literal(LiteralValue::Int64(3)))
+            .fixture_definition(
+                FILTER,
+                int64(),
+                crate::test_constants::i64(&mut constants, &int64(), 3, options(None).constants),
+            )
             .unwrap();
         let predicate = builder
-            .add_expression(
+            .fixture_definition(
                 FILTER,
                 boolean(),
                 ExprKind::Binary {
@@ -424,8 +461,19 @@ fn fixture(spec: Spec) -> Fixture {
                 },
             )
             .unwrap();
+        let predicate = builder
+            .fixture_occurrence(
+                FILTER,
+                predicate,
+                EvaluationDemand::TruthOnly,
+                RootScope::Port(0),
+            )
+            .unwrap();
         builder
             .add_filter(FILTER, SCAN, Box::from([predicate]))
+            .unwrap();
+        builder
+            .finish_fixture_unit(FILTER, &FixtureControl)
             .unwrap();
         root = FILTER;
     }
@@ -449,11 +497,19 @@ fn fixture(spec: Spec) -> Fixture {
             )
             .unwrap();
         let cell = build
-            .add_expression(VALUES, int64(), ExprKind::Literal(LiteralValue::Int64(7)))
+            .fixture_definition(
+                VALUES,
+                int64(),
+                crate::test_constants::i64(&mut constants, &int64(), 7, options(None).constants),
+            )
+            .unwrap();
+        let cell = build
+            .fixture_occurrence(VALUES, cell, EvaluationDemand::Value, RootScope::AllPorts)
             .unwrap();
         build
             .add_values(VALUES, Box::from([Box::from([cell])]), Box::from([column]))
             .unwrap();
+        build.finish_fixture_unit(VALUES, &FixtureControl).unwrap();
         let fragment = build
             .finish_definition(
                 VALUES,
@@ -482,12 +538,32 @@ fn fixture(spec: Spec) -> Fixture {
             )
             .unwrap();
         let key = JoinKey {
-            left: builder
-                .add_expression(JOIN, int64(), ExprKind::Value(provider[0]))
-                .unwrap(),
-            right: builder
-                .add_expression(JOIN, int64(), ExprKind::Value(imported))
-                .unwrap(),
+            left: {
+                let definition = builder
+                    .fixture_definition(JOIN, int64(), ExprKind::Value(provider[0]))
+                    .unwrap();
+                builder
+                    .fixture_occurrence(
+                        JOIN,
+                        definition,
+                        EvaluationDemand::Value,
+                        RootScope::Port(0),
+                    )
+                    .unwrap()
+            },
+            right: {
+                let definition = builder
+                    .fixture_definition(JOIN, int64(), ExprKind::Value(imported))
+                    .unwrap();
+                builder
+                    .fixture_occurrence(
+                        JOIN,
+                        definition,
+                        EvaluationDemand::Value,
+                        RootScope::Port(1),
+                    )
+                    .unwrap()
+            },
             null_safe: false,
         };
         let probe = builder.node_output_properties(root).unwrap().clone();
@@ -514,6 +590,7 @@ fn fixture(spec: Spec) -> Fixture {
                 },
             )
             .unwrap();
+        builder.finish_fixture_unit(JOIN, &FixtureControl).unwrap();
         build_fragment = Some((fragment, column, imported));
         root = JOIN;
     }
@@ -620,7 +697,13 @@ fn fixture(spec: Spec) -> Fixture {
         )
         .unwrap();
 
-    let mut plan = PlanBuilder::new(PlanVersionId::try_new([7; 16]).unwrap());
+    let mut plan = PlanBuilder::new(
+        PlanVersionId::try_new([7; 16]).unwrap(),
+        options(None).constants,
+    );
+    for (&id, pool) in constants.entries() {
+        plan.insert_constant_pool(id, pool.clone()).unwrap();
+    }
     plan.add_fragment(producer).unwrap();
     if let Some((fragment, column, imported)) = build_fragment {
         plan.add_fragment(fragment).unwrap();
@@ -644,6 +727,7 @@ fn fixture(spec: Spec) -> Fixture {
                 source_multiplicity: RowMultiplicity::SingleCopy,
                 destination: Distribution::Broadcast,
                 destination_multiplicity: RowMultiplicity::Replicated,
+                routing_only: Box::default(),
             },
         })
         .unwrap();
@@ -712,6 +796,7 @@ fn fixture(spec: Spec) -> Fixture {
                     source_multiplicity: RowMultiplicity::SingleCopy,
                     destination: Distribution::Singleton,
                     destination_multiplicity: RowMultiplicity::SingleCopy,
+                    routing_only: Box::default(),
                 },
             })
             .unwrap();
@@ -760,7 +845,7 @@ fn fixture(spec: Spec) -> Fixture {
             .unwrap();
         }
     }
-    let plan = plan.finish().unwrap();
+    let plan = plan.finish_observed(&FixtureControl).unwrap();
 
     let draft = ConnectorReadRelationRecipeDraft::try_new(
         binding,
@@ -805,17 +890,9 @@ fn fixture(spec: Spec) -> Fixture {
         scans.insert(ProviderReadOccurrenceId::new(1), read);
     }
 
-    let mut uses = BTreeMap::new();
-    let mut calls = BTreeMap::new();
     let mut pruning = BTreeMap::new();
     let mut admissions = BTreeMap::new();
-    for (&id, fragment) in plan.fragments() {
-        let root_uses = root_uses(fragment);
-        calls.insert(
-            id,
-            FrozenFragmentCalls::try_new(fragment, &root_uses, vec![], &FixtureControl).unwrap(),
-        );
-        uses.insert(id, root_uses);
+    for &id in plan.fragments().keys() {
         pruning.insert(
             id,
             FrozenFragmentPruning::try_new(id, vec![], &FixtureControl).unwrap(),
@@ -826,8 +903,6 @@ fn fixture(spec: Spec) -> Fixture {
         &plan,
         &scans,
         &BTreeMap::new(),
-        &uses,
-        &calls,
         &pruning,
         &admissions,
         &FixtureControl,
@@ -836,76 +911,6 @@ fn fixture(spec: Spec) -> Fixture {
     Fixture {
         package: Arc::new(packages.remove(&PRODUCER).unwrap()),
     }
-}
-
-/// One complete eager use tree per physical root site in one root domain.
-pub(super) fn root_uses(fragment: &Fragment) -> PhysicalRootUses {
-    struct Author<'a> {
-        fragment: &'a Fragment,
-        next: u32,
-        uses: Vec<ExpressionInvocation<ExprId>>,
-    }
-    impl Author<'_> {
-        fn visit(&mut self, expr: ExprId, demand: EvaluationDemand) -> ExpressionUseId {
-            let id = ExpressionUseId::new(self.next);
-            self.next += 1;
-            let args = match &self.fragment.expressions().get(expr).unwrap().kind {
-                ExprKind::Binary { left, right, .. } => vec![*left, *right],
-                ExprKind::Literal(_) | ExprKind::Value(_) => vec![],
-                _ => panic!("the scan fixture has only comparisons, values and literals"),
-            };
-            let arguments = args
-                .iter()
-                .enumerate()
-                .map(|(ordinal, &child)| {
-                    let (child_demand, guard) = control_argument_semantics(
-                        ControlShape::Eager,
-                        args.len(),
-                        ordinal,
-                        demand,
-                    )
-                    .unwrap();
-                    assert!(guard.is_none());
-                    self.visit(child, child_demand)
-                })
-                .collect::<Box<[_]>>();
-            self.uses.push(ExpressionInvocation {
-                context: ExpressionEffectContext {
-                    use_id: id,
-                    domain: EvaluationDomainId::new(0),
-                    demand,
-                },
-                definition: expr,
-                control: ControlShape::Eager,
-                arguments,
-            });
-            id
-        }
-    }
-    let roots = PhysicalExpressionRoots::try_new(fragment, &FixtureControl).unwrap();
-    let mut author = Author {
-        fragment,
-        next: 0,
-        uses: vec![],
-    };
-    let bindings = roots
-        .sites()
-        .iter()
-        .map(|(&site, root)| (site, author.visit(root.expr, root.demand)))
-        .collect();
-    let flow = ExpressionControlFlow::<ExprId>::try_new(
-        vec![ExpressionEvaluationDomain {
-            id: EvaluationDomainId::new(0),
-            parent: None,
-            guard: None,
-        }],
-        author.uses,
-        fragment.expressions(),
-        CompilePhase::Validate,
-        &FixtureControl,
-    )
-    .unwrap();
-    PhysicalRootUses::try_new(fragment, flow, bindings, &FixtureControl).unwrap()
 }
 
 // Conservative retained-source invoice and independent projection ceilings for
@@ -1157,41 +1162,27 @@ fn residual_scan_compiles_to_the_provider_layout_seal_address_and_residual_root(
     // The one residual is the scan's own TruthOnly root over its output.
     assert_eq!(residuals.len(), 1);
     let predicate = residuals[0];
-    let checked = program.checked();
-    let snapshot = checked.channels().expressions().resolved_calls().snapshot();
-    let site = ProgramExpressionRootSite::Node {
-        node: ProgramNodeId::new(0),
-        role: ProgramNodeExpressionRole::ScanResidual { predicate: 0 },
-    };
-    let use_id = snapshot.bindings()[&site];
-    let root = &snapshot.flows()[&ProgramExpressionArena::Main].uses()[&use_id];
-    assert_eq!(root.definition, predicate);
-    assert_eq!(root.context.demand, EvaluationDemand::TruthOnly);
-    let arena = &snapshot.roots().arenas()[&ProgramExpressionArena::Main];
-    let StaticExprKind::Gt(column, _) = arena.node(predicate).unwrap().kind() else {
-        panic!("the ordered comparison survives lowering");
+    let (unit, root) = compiled_root(&program, predicate);
+    let invocation = &unit.control_flow().uses()[&root.use_id];
+    assert_eq!(invocation.definition, root.definition);
+    assert_eq!(invocation.context.demand, EvaluationDemand::TruthOnly);
+    let StaticExprKind::Gt(column, _) = unit.definitions().node(root.definition).unwrap().kind()
+    else {
+        panic!("ordered comparison survives lowering")
     };
     assert!(matches!(
-        arena.node(*column).unwrap().kind(),
-        StaticExprKind::SlotId(slot) if *slot == layout.slots()[0]
+        unit.definitions().node(*column).unwrap().kind(),
+        StaticExprKind::Input
     ));
-    // Its column reads the scan's own output occurrence, as root binding names.
-    assert_eq!(
-        checked.slots()[&ProgramUseRef {
-            arena: ProgramExpressionArena::Main,
-            use_id: root.arguments[0],
-        }],
-        ProgramLexicalSource::Input(ProgramChannelSite::Layout {
-            node: ProgramNodeId::new(0),
-            role: ProgramChannelLayoutRole::NodeOutput,
-            ordinal: 0,
-        })
-    );
-    let comparison = program
-        .comparison_recipe(ProgramComparisonSite::Binary(ProgramUseRef {
-            arena: ProgramExpressionArena::Main,
-            use_id,
-        }))
+    let input = unit.input(invocation.arguments[0]).unwrap();
+    assert_eq!(input.ordinal, 0);
+    assert!(Arc::ptr_eq(
+        unit.scope(input.scope).unwrap().schema(),
+        layout.schema()
+    ));
+    let comparison = unit
+        .recipes()
+        .comparison(novarocks_expression::ComparisonSite::Binary(root.use_id))
         .expect("mandatory comparison recipe");
     assert_eq!(comparison.operator(), ComparisonOperator::Gt);
 }
@@ -1208,13 +1199,7 @@ fn plain_scan_has_no_conjunct_and_no_root() {
         panic!("Scan");
     };
     assert!(residuals.is_empty());
-    let snapshot = program
-        .checked()
-        .channels()
-        .expressions()
-        .resolved_calls()
-        .snapshot();
-    assert!(snapshot.bindings().is_empty());
+    assert!(program.units().is_empty());
     assert_eq!(program.scan_inputs(), &scan_address());
 }
 
@@ -1232,25 +1217,17 @@ fn transparent_filter_over_the_unconstrained_scan_reads_the_scan_port() {
         ProgramNodeKind::Filter { input, .. } if *input == ProgramNodeId::new(0)
     ));
     assert_eq!(program.scan_inputs(), &scan_address());
-    let checked = program.checked();
-    let snapshot = checked.channels().expressions().resolved_calls().snapshot();
-    let filter = snapshot.bindings()[&ProgramExpressionRootSite::Node {
-        node: ProgramNodeId::new(1),
-        role: ProgramNodeExpressionRole::FilterPredicate { predicate: 0 },
-    }];
-    let root = &snapshot.flows()[&ProgramExpressionArena::Main].uses()[&filter];
-    // The Filter's `v1` reads its input, the scan's output ordinal 1.
-    assert_eq!(
-        checked.slots()[&ProgramUseRef {
-            arena: ProgramExpressionArena::Main,
-            use_id: root.arguments[0],
-        }],
-        ProgramLexicalSource::Input(ProgramChannelSite::Layout {
-            node: ProgramNodeId::new(0),
-            role: ProgramChannelLayoutRole::NodeOutput,
-            ordinal: 1,
-        })
-    );
+    let ProgramNodeKind::Filter { predicates, .. } = graph.nodes()[1].kind() else {
+        unreachable!()
+    };
+    let (unit, root) = compiled_root(&program, predicates[0]);
+    let invocation = &unit.control_flow().uses()[&root.use_id];
+    let input = unit.input(invocation.arguments[0]).unwrap();
+    assert_eq!(input.ordinal, 1);
+    assert!(Arc::ptr_eq(
+        unit.scope(input.scope).unwrap().schema(),
+        graph.nodes()[0].output_layout().schema()
+    ));
 }
 
 #[test]

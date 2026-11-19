@@ -19,8 +19,8 @@
 //!
 //! This module owns the transport-neutral vocabulary every provider write uses:
 //! a frontend-only commit session, immutable logical writer recipes, per-driver
-//! writer execution, independent commit fragments, and the bounded prepared
-//! write set the frontend commits.
+//! writer execution, independent commit fragments, and frontend receiving
+//! before publication.
 //!
 //! The production flow it describes has exactly one shape:
 //!
@@ -30,6 +30,7 @@
 //!   -> Exchange
 //!   -> one Root BE TableFinishOperator (bounded aggregation only)
 //!   -> RESULT_SINK / FetchResult
+//!   -> FE arrive_write_fragments / confirm_write_received
 //!   -> FE finish_write (the only external commit)
 //! ```
 //!
@@ -63,13 +64,12 @@ pub mod writer;
 pub use adapter::{ProviderWriteRuntime, WriteRuntimeAdapter};
 pub use budget::{UniqueWriterHandleLedger, validate_writer_handle_bytes};
 pub use limits::{
-    MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES, MAX_CONNECTOR_PREPARED_WRITE_SET_BYTES,
-    MAX_CONNECTOR_PREPARED_WRITE_SET_ENTRIES, MAX_CONNECTOR_UNIQUE_WRITER_HANDLE_BYTES,
-    MAX_CONNECTOR_WRITE_TARGETS, MAX_CONNECTOR_WRITER_HANDLE_BYTES,
+    MAX_CONNECTOR_UNIQUE_WRITER_HANDLE_BYTES, MAX_CONNECTOR_WRITE_TARGETS,
+    MAX_CONNECTOR_WRITER_HANDLE_BYTES,
 };
 pub use prepared::{
-    ConnectorPreparedWriteSet, ConnectorWriteProductionProof, ConnectorWriteRowChange,
-    PreparedWriteSetLedger, WriteRowCountAccumulator,
+    ConnectorWriteProductionProof, ConnectorWriteRowChange, WriteRowCountAccumulator,
+    validate_write_fragment_targets,
 };
 pub use relation::{
     MAX_WRITE_RELATION_DECODED_SCHEMA_BYTES, MAX_WRITE_RELATION_FIELD_NAME_BYTES,
@@ -111,9 +111,10 @@ pub use session::{
     ConnectorWriteFinishRequest, ConnectorWriteFinishRequestRef, ConnectorWriteLayoutPreference,
     ConnectorWriteNeededHandoffNotice, ConnectorWriteNeededReady,
     ConnectorWriteNeededReadyReceiving, ConnectorWritePublicationCompletion,
-    ConnectorWriteRouteFacts, ConnectorWriteRouteRequirements, ConnectorWriteSessionAbortRequest,
-    ConnectorWriteSessionFlavor, ConnectorWriteSessionPlan, ConnectorWriteSessionReconcileRequest,
-    ConnectorWriteTargetPlan, WriteStatisticsArtifact, WriteStatisticsContract,
+    ConnectorWriteQueryIdentity, ConnectorWriteRouteFacts, ConnectorWriteRouteRequirements,
+    ConnectorWriteSessionAbortRequest, ConnectorWriteSessionFlavor, ConnectorWriteSessionPlan,
+    ConnectorWriteSessionReconcileRequest, ConnectorWriteTargetPlan, WriteStatisticsArtifact,
+    WriteStatisticsContract,
 };
 pub use target::{
     WriteTargetOrdinal, validate_dense_target_ordinals, validate_query_target_ordinals,

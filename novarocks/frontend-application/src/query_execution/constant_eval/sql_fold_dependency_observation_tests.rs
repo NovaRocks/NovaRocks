@@ -16,11 +16,14 @@
 // under the License.
 //! Real SQL dependency observation through the production FE constant port.
 use arrow::array::{Array, StringArray};
+use novarocks_expression_contract::{ExprKind, ExprNode};
 use novarocks_functions::ConstantValue;
 use novarocks_functions::{
     ConstantError, FunctionArgumentType, FunctionResultType, ResolvedFunctionBinding,
 };
-use novarocks_physical_plan::{ExprKind, PipelineDopDomain, PlanVersionId, ScanReadBudget};
+use novarocks_physical_plan::{
+    Fragment, PhysicalNode, PipelineDopDomain, PlanVersionId, ScanReadBudget,
+};
 use novarocks_sql::compiler::{
     DEFAULT_COMPLETION_LIMITS, FoldArg, FoldRequest, FrozenFoldNode, SessionOptimizerSettings,
     SqlAuthoredPhysicalPlan, SqlCompileControl, SqlCompileIntent, SqlCompileProgress, SqlCompiler,
@@ -359,12 +362,21 @@ fn compile(
 fn probe() -> Arc<Probe> {
     Arc::new(Probe::new())
 }
+pub(super) fn expression_sources(
+    plan: &SqlAuthoredPhysicalPlan,
+) -> impl Iterator<Item = (&Fragment, &PhysicalNode, &ExprNode)> {
+    plan.plan().fragments().values().flat_map(|fragment| {
+        fragment.nodes().values().flat_map(move |node| {
+            node.expressions
+                .iter()
+                .flat_map(|unit| unit.definitions())
+                .map(move |source| (fragment, node, source))
+        })
+    })
+}
 fn calls(plan: &SqlAuthoredPhysicalPlan) -> usize {
-    plan.plan()
-        .fragments()
-        .values()
-        .flat_map(|f| f.expressions().iter())
-        .filter(|(_, e)| matches!(e.kind, ExprKind::FunctionCall { .. }))
+    expression_sources(plan)
+        .filter(|(_, _, e)| matches!(e.kind, ExprKind::FunctionCall { .. }))
         .count()
 }
 fn text(value: &ConstantValue) -> String {
@@ -729,13 +741,34 @@ fn native_decimal_array_and_temporal_literal_compile_sources_remain_valid() {
             novarocks_type_contract::ValueLogicalType::Physical,
             "{sql}",
         );
-        novarocks_sql::compiler::author_fragment_package_semantics(
-            &owner,
-            policy(),
-            &SqlCompileControl::unbounded(),
-        )
-        .unwrap_or_else(|error| panic!("real literal package semantics for {sql}: {error:#?}"));
+        assert_checked_packages_for_source(sql, owner);
     }
+}
+
+fn assert_checked_packages_for_source(sql: &str, owner: SqlAuthoredPhysicalPlan) {
+    let control = SqlCompileControl::unbounded();
+    let fragment_count = owner.plan().fragments().len();
+    let candidate =
+        novarocks_query_application::preparation::CompletedPhysicalPlanCandidate::for_sql_program(
+            owner, &control,
+        )
+        .unwrap_or_else(|error| panic!("real SQL plan candidate for {sql}: {error:#?}"));
+    let packages = crate::query_execution::package_freeze::extract_checked_packages(
+        &candidate,
+        &std::collections::BTreeMap::new(),
+        &std::collections::BTreeMap::new(),
+        policy(),
+        &novarocks_plan_codec::physical_package_v2::PackageDecodeLimits::FROZEN.admission,
+        &control,
+    )
+    .unwrap_or_else(|error| panic!("real package extraction for {sql}: {error:#?}"));
+    assert_eq!(packages.len(), fragment_count, "{sql}");
+    assert!(
+        packages
+            .values()
+            .all(|package| package.statement_constant_policy() == policy()),
+        "{sql}"
+    );
 }
 
 fn assert_real_null_list_cast(
@@ -808,36 +841,32 @@ fn assert_real_null_list_cast(
             expected_type.try_to_field(*name).unwrap(),
         );
         let mut actual_casts = 0;
-        for fragment in owner.plan().fragments().values() {
-            for (_, expression) in fragment.expressions().iter() {
-                let ExprKind::Cast { expr, target, .. } = &expression.kind else {
-                    continue;
-                };
-                if expression.ty != *expected_type {
-                    continue;
-                }
-                actual_casts += 1;
-                assert_eq!(target, expected_type.data_type());
-                let input = fragment
-                    .expressions()
-                    .get(*expr)
-                    .expect("actual CAST child");
+        for (_, node, expression) in expression_sources(&owner) {
+            let ExprKind::Cast { expr, target, .. } = &expression.kind else {
+                continue;
+            };
+            if expression.ty != *expected_type {
+                continue;
+            }
+            actual_casts += 1;
+            assert_eq!(target, expected_type.data_type());
+            let unit = node.expressions.as_ref().expect("actual expression unit");
+            let input = unit.definition(*expr).expect("actual CAST child");
+            assert_eq!(
+                input.ty, source_type,
+                "independent common NULL element type"
+            );
+            let ExprKind::FunctionCall { function, args } = &input.kind else {
+                panic!("the actual unfurled ARRAY source must remain: {input:#?}");
+            };
+            assert_eq!(function.result_type, source_type);
+            assert_eq!(args.len(), *expected_items);
+            for argument in args.iter() {
                 assert_eq!(
-                    input.ty, source_type,
-                    "independent common NULL element type"
+                    unit.definition(*argument).unwrap().ty,
+                    FunctionValueType::new(DataType::Null, true),
+                    "original NULL element declaration",
                 );
-                let ExprKind::FunctionCall { function, args } = &input.kind else {
-                    panic!("the actual unfurled ARRAY source must remain: {input:#?}");
-                };
-                assert_eq!(function.result_type, source_type);
-                assert_eq!(args.len(), *expected_items);
-                for argument in args.iter() {
-                    assert_eq!(
-                        fragment.expressions().get(*argument).unwrap().ty,
-                        FunctionValueType::new(DataType::Null, true),
-                        "original NULL element declaration",
-                    );
-                }
             }
         }
         assert_eq!(
@@ -845,14 +874,7 @@ fn assert_real_null_list_cast(
             "one exact runtime conversion for {name}: {sql}"
         );
     }
-    novarocks_sql::compiler::author_fragment_package_semantics(
-        &owner,
-        policy(),
-        &SqlCompileControl::unbounded(),
-    )
-    .unwrap_or_else(|error| {
-        panic!("complete real null-list package semantics for {sql}: {error:#?}")
-    });
+    assert_checked_packages_for_source(sql, owner);
 }
 
 #[test]

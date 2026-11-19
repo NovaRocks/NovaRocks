@@ -3238,7 +3238,6 @@ dependencies = [
  "novarocks-secret",
  "novarocks-task-codec",
  "novarocks-test-support",
- "novarocks-test-trino-client",
  "novarocks-types",
  "percent-encoding",
  "prost 0.13.5",
@@ -3281,7 +3280,6 @@ dependencies = [
  "iceberg",
  "iceberg-catalog-hms",
  "iceberg-catalog-rest",
- "novarocks-cluster-harness",
  "novarocks-connector-contract",
  "novarocks-connector-iceberg-functions",
  "novarocks-failpoint",
@@ -3313,7 +3311,6 @@ dependencies = [
  "typetag",
  "url",
  "uuid",
- "zstd 0.14.3",
 ]
 
 [[package]]
@@ -3431,8 +3428,9 @@ dependencies = [
  "novarocks-connector-iceberg-functions",
  "novarocks-control-runtime",
  "novarocks-control-runtime-core",
- "novarocks-coordination-contract",
  "novarocks-execution-contract",
+ "novarocks-expression",
+ "novarocks-expression-contract",
  "novarocks-failpoint",
  "novarocks-failure-contract",
  "novarocks-functions",
@@ -3481,6 +3479,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "novarocks-expression"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "novarocks-constant-contract",
+ "novarocks-expression-contract",
+ "novarocks-failure-contract",
+ "novarocks-function-contract",
+ "novarocks-functions",
+ "novarocks-type-contract",
+]
+
+[[package]]
+name = "novarocks-expression-contract"
+version = "0.1.0"
+dependencies = [
+ "arrow-array",
+ "arrow-schema",
+ "novarocks-constant-contract",
+ "novarocks-failure-contract",
+ "novarocks-function-contract",
+ "novarocks-type-contract",
+]
+
+[[package]]
 name = "novarocks-failpoint"
 version = "0.1.0"
 dependencies = [
@@ -3519,11 +3542,14 @@ dependencies = [
  "novarocks-coordination-contract",
  "novarocks-execution",
  "novarocks-execution-contract",
+ "novarocks-expression",
+ "novarocks-expression-contract",
  "novarocks-failpoint",
  "novarocks-failure-contract",
  "novarocks-functions",
  "novarocks-local-compiler",
  "novarocks-local-program",
+ "novarocks-logical-execution-protocol",
  "novarocks-memory",
  "novarocks-mv-application",
  "novarocks-native-adapter",
@@ -3671,6 +3697,9 @@ dependencies = [
  "bytes",
  "novarocks-connector-contract",
  "novarocks-connector-iceberg-functions",
+ "novarocks-constant-contract",
+ "novarocks-expression",
+ "novarocks-expression-contract",
  "novarocks-failure-contract",
  "novarocks-functions",
  "novarocks-local-program",
@@ -3684,18 +3713,32 @@ name = "novarocks-local-program"
 version = "0.1.0"
 dependencies = [
  "arrow-array",
- "arrow-buffer",
  "arrow-schema",
  "bytes",
  "novarocks-connector-contract",
+ "novarocks-constant-contract",
  "novarocks-execution-contract",
+ "novarocks-expression",
+ "novarocks-expression-contract",
  "novarocks-failure-contract",
+ "novarocks-function-contract",
  "novarocks-functions",
  "novarocks-result-contract",
  "novarocks-type-contract",
  "novarocks-types",
  "serde_json",
  "sha2 0.10.9",
+]
+
+[[package]]
+name = "novarocks-logical-execution-protocol"
+version = "0.1.0"
+dependencies = [
+ "novarocks-coordination-contract",
+ "novarocks-execution-contract",
+ "novarocks-failure-contract",
+ "novarocks-result-contract",
+ "novarocks-types",
 ]
 
 [[package]]
@@ -3768,6 +3811,8 @@ dependencies = [
  "novarocks-control-runtime",
  "novarocks-execution",
  "novarocks-execution-contract",
+ "novarocks-expression",
+ "novarocks-expression-contract",
  "novarocks-failpoint",
  "novarocks-functions",
  "novarocks-local-compiler",
@@ -3854,6 +3899,7 @@ dependencies = [
  "arrow-schema",
  "novarocks-connector-contract",
  "novarocks-constant-contract",
+ "novarocks-expression-contract",
  "novarocks-failure-contract",
  "novarocks-function-contract",
  "novarocks-result-contract",
@@ -3872,6 +3918,7 @@ dependencies = [
  "novarocks-arrow-ipc-frame",
  "novarocks-connector-contract",
  "novarocks-constant-contract",
+ "novarocks-expression-contract",
  "novarocks-failure-contract",
  "novarocks-functions",
  "novarocks-local-program",
@@ -3928,10 +3975,12 @@ dependencies = [
  "novarocks-constant-contract",
  "novarocks-coordination-contract",
  "novarocks-execution-contract",
+ "novarocks-expression-contract",
  "novarocks-failpoint",
  "novarocks-failure-contract",
  "novarocks-function-contract",
  "novarocks-functions",
+ "novarocks-logical-execution-protocol",
  "novarocks-parser",
  "novarocks-physical-plan",
  "novarocks-resource-contract",
@@ -4012,6 +4061,8 @@ dependencies = [
  "novarocks-connector-paimon",
  "novarocks-execution",
  "novarocks-execution-contract",
+ "novarocks-expression",
+ "novarocks-expression-contract",
  "novarocks-failpoint",
  "novarocks-frontend-application",
  "novarocks-fs",
@@ -4085,6 +4136,7 @@ dependencies = [
  "novarocks-connector-contract",
  "novarocks-connector-iceberg-functions",
  "novarocks-constant-contract",
+ "novarocks-expression-contract",
  "novarocks-failure-contract",
  "novarocks-functions",
  "novarocks-local-program",
@@ -4145,6 +4197,7 @@ name = "novarocks-sql-testkit"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "novarocks-expression-contract",
  "novarocks-functions",
  "novarocks-parser",
  "novarocks-physical-plan",
@@ -4281,6 +4334,7 @@ dependencies = [
  "novarocks-connector-iceberg",
  "novarocks-execution",
  "novarocks-execution-contract",
+ "novarocks-expression-contract",
  "novarocks-failpoint",
  "novarocks-fs",
  "novarocks-functions",
@@ -4353,6 +4407,8 @@ dependencies = [
  "arrow",
  "novarocks-connector-contract",
  "novarocks-execution",
+ "novarocks-expression",
+ "novarocks-expression-contract",
  "novarocks-functions",
  "novarocks-local-compiler",
  "novarocks-local-program",
@@ -4361,6 +4417,7 @@ dependencies = [
  "novarocks-sql",
  "novarocks-sql-testkit",
  "novarocks-type-contract",
+ "novarocks-types",
  "prost 0.13.5",
 ]
 
@@ -4507,7 +4564,6 @@ dependencies = [
  "novarocks-local-compiler",
  "novarocks-local-program",
  "novarocks-memory",
- "novarocks-memory-failure",
  "novarocks-physical-plan",
  "novarocks-result-contract",
  "novarocks-spi",

@@ -17,7 +17,7 @@
 
 //! Freeze one completed SQL plan into v2 FragmentPackage wire bytes.
 //!
-//! The SQL owner authors each fragment's uses, calls and pruning; each scan's
+//! SQL freezes expression units and relational calls before extraction. Each scan's
 //! frozen read is authored from the plan and the freeze that produced it; each
 //! written target's frozen recipe is authored from the write session that
 //! sealed it; the original extraction law publishes the checked packages; the
@@ -32,7 +32,7 @@ use std::sync::Arc;
 
 use novarocks_connector_contract::ConnectorWriteRecipeDraft;
 use novarocks_physical_plan::{
-    ConstantPolicy, FragmentId, FragmentPackage, FragmentPackageAdmission,
+    ConstantPolicy, FragmentId, FragmentPackage, FragmentPackageAdmission, FrozenFragmentPruning,
     ProviderReadOccurrenceId, WriteTargetOrdinal, extract_fragment_packages,
 };
 #[cfg(test)]
@@ -269,41 +269,35 @@ pub(crate) fn extract_checked_packages(
     control: &dyn PureCompileControl,
 ) -> Result<BTreeMap<FragmentId, FragmentPackage>, PackageFreezeError> {
     let plan = candidate.plan();
+    if plan.statement_constant_policy() != statement_constant_policy {
+        return Err(PackageFreezeError::Semantics(
+            novarocks_sql::compiler::PackageSemanticsError::StatementPolicyMismatch,
+        ));
+    }
     let scans = author_frozen_reads(plan, encodings, control)?;
-    let semantics = candidate
-        .author_package_semantics(statement_constant_policy, control)
-        .map_err(|error| match error {
-            novarocks_sql::compiler::PackageSemanticsError::Control(cause) => {
-                PackageFreezeError::Control(cause)
-            }
-            other => PackageFreezeError::Semantics(other),
-        })?;
-    let mut uses = BTreeMap::new();
-    let mut calls = BTreeMap::new();
     let mut pruning = BTreeMap::new();
     let mut admissions = BTreeMap::new();
-    for (id, authored) in semantics {
-        uses.insert(id, authored.expression_uses);
-        calls.insert(id, authored.calls);
-        pruning.insert(id, authored.pruning);
+    // This path has no pruning witness author. Empty tables grant no authority.
+    for &id in plan.fragments().keys() {
+        let table = FrozenFragmentPruning::try_new(id, vec![], control).map_err(|error| {
+            match novarocks_sql::compiler::PackageSemanticsError::from(error) {
+                novarocks_sql::compiler::PackageSemanticsError::Control(cause) => {
+                    PackageFreezeError::Control(cause)
+                }
+                other => PackageFreezeError::Semantics(other),
+            }
+        })?;
+        pruning.insert(id, table);
         admissions.insert(id, *admission);
     }
-    extract_fragment_packages(
-        plan,
-        &scans,
-        writes,
-        &uses,
-        &calls,
-        &pruning,
-        &admissions,
-        control,
+    extract_fragment_packages(plan, &scans, writes, &pruning, &admissions, control).map_err(
+        |error| match error {
+            novarocks_physical_plan::FragmentPackageExtractionError::Control(cause) => {
+                PackageFreezeError::Control(cause)
+            }
+            other => PackageFreezeError::Extraction(format!("{other:?}")),
+        },
     )
-    .map_err(|error| match error {
-        novarocks_physical_plan::FragmentPackageExtractionError::Control(cause) => {
-            PackageFreezeError::Control(cause)
-        }
-        other => PackageFreezeError::Extraction(format!("{other:?}")),
-    })
 }
 
 /// The exact wire bytes of one checked package.
@@ -366,6 +360,58 @@ mod error_projection_tests {
     use super::*;
     use novarocks_plan_codec::PhysicalEncodeError;
     use novarocks_sql::compiler::PackageSemanticsError;
+
+    #[test]
+    fn freeze_rejects_a_policy_different_from_the_authored_plan() {
+        use novarocks_physical_plan::{
+            FragmentBuilder, FragmentSink, PipelineDopDomain, PlanBuilder, PlanVersionId,
+            StagePlacementPolicy,
+        };
+        let control = novarocks_sql::compiler::SqlCompileControl::unbounded();
+        let policy = crate::application::test_constant_policy();
+        let mut different = policy;
+        different.max_rows = policy.max_rows.checked_add(1).unwrap();
+        let fragment_id = FragmentId::new(1);
+        let mut builder = FragmentBuilder::new(fragment_id);
+        let root = builder.reserve_node_id().unwrap();
+        builder
+            .add_values(root, Box::from([Box::default()]), Box::default())
+            .unwrap();
+        let fragment = builder
+            .finish_definition(
+                root,
+                FragmentSink::Noop,
+                PipelineDopDomain {
+                    min: 1,
+                    max: 1,
+                    requires_power_of_two: true,
+                },
+                StagePlacementPolicy::Singleton,
+            )
+            .unwrap();
+        let mut builder = PlanBuilder::new(PlanVersionId::try_new([157; 16]).unwrap(), policy);
+        builder.add_fragment(fragment).unwrap();
+        let candidate = CompletedPhysicalPlanCandidate::for_program(
+            builder.finish_observed(&control).unwrap(),
+            &control,
+        )
+        .unwrap();
+        let encodings = BTreeMap::new();
+        let writes = BTreeMap::new();
+        let admission = &PackageDecodeLimits::FROZEN.admission;
+        assert!(matches!(
+            extract_checked_packages(
+                &candidate, &encodings, &writes, different, admission, &control
+            ),
+            Err(PackageFreezeError::Semantics(
+                PackageSemanticsError::StatementPolicyMismatch
+            ))
+        ));
+        let packages =
+            extract_checked_packages(&candidate, &encodings, &writes, policy, admission, &control)
+                .unwrap();
+        assert_eq!(packages[&fragment_id].statement_constant_policy(), policy);
+    }
 
     #[test]
     fn receiver_refusals_keep_original_resource_data_and_schema_authors() {

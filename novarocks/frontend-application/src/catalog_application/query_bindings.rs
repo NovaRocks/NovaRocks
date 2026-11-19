@@ -392,6 +392,7 @@ pub struct QueryWriteTargetAdmission {
     /// target's input rows, as the write session sealed them for the handle
     /// the plan's writer carries.
     pub input: novarocks_spi::connector::ConnectorWriteInputShape,
+    pub layout: novarocks_spi::connector::write_stack::ConnectorWriteLayoutPreference,
 }
 
 /// Exact provider scan facts retained after admission.  The concrete Iceberg

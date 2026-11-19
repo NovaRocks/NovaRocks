@@ -1816,6 +1816,7 @@ fn query_options_from_session_settings(settings: &SessionExecutionSettings) -> Q
 #[cfg(test)]
 mod tests {
     use super::*;
+    use novarocks_query_application::api::ExecutionFailurePresentation;
 
     #[test]
     fn statement_origin_parser_errors_keep_the_original_source_prefix() {
@@ -2845,6 +2846,7 @@ mod maintenance_selected_failure_tests {
     use super::*;
     use novarocks_execution_contract::{SafeDetail, TaskFailurePhase, TaskIdentity};
     use novarocks_failure_contract::FailureProjection;
+    use novarocks_query_application::api::ExecutionFailurePresentation;
     use novarocks_query_application::execution_error::{
         ExecutionFailureInput, ExecutionFailureSite,
     };

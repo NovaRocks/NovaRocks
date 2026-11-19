@@ -42,4 +42,9 @@ pub use result::*;
 pub use root_delivery::*;
 pub use statement_native::*;
 
-pub use crate::execution_error::{ExecutionFailureInput, ExecutionFailureSite};
+pub use crate::execution_error::{
+    ExecutionFailureInput, ExecutionFailurePresentation, ExecutionFailureSite,
+};
+
+pub mod logical_runtime;
+pub use logical_runtime::*;

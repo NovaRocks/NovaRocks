@@ -3113,6 +3113,10 @@ mod diagnostic_release_tests {
 #[cfg(test)]
 mod bounded_drain_tests {
     use super::*;
+    mod nonempty_split;
+    mod original_create_release;
+    mod original_preparing_cancel;
+    mod original_properties;
     use crate::{
         capacity::{QueueStage, StepContext},
         config::DispatchLane,

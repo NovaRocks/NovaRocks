@@ -18,7 +18,9 @@
 
 mod contract_lowering;
 mod lowered_draft;
+mod unit_source;
 mod wait_graph;
+pub(crate) use contract_lowering::{StandaloneScalarEmission, lower_required_constant_unit};
 #[cfg(test)]
 pub(crate) use lowered_draft::CheckedAggregateLogicalSourceEntry;
 pub use lowered_draft::{
@@ -28,6 +30,7 @@ pub use lowered_draft::{
     SqlSourceJournalError,
 };
 pub(crate) use lowered_draft::{LoweredSqlPhysicalDraft, SqlPublicationError};
+
 mod expression_occurrences;
 mod source_support;
 pub use source_support::check_pure_call_definitions_observed;
@@ -47,9 +50,7 @@ mod physical_window_occurrences;
 mod physical_window_requests;
 mod physical_writer_occurrences;
 mod physical_writer_requests;
-pub use package_semantics::{
-    FragmentPackageSemantics, PackageSemanticsError, author_fragment_package_semantics,
-};
+pub use package_semantics::PackageSemanticsError;
 
 #[cfg(test)]
 pub(crate) use contract_lowering::lower_final_physical_plan;
@@ -69,3 +70,6 @@ pub mod state_source_fixture;
 pub mod state_author_fixture;
 #[cfg(novarocks_dev_controls)]
 pub mod writer_state_fixture;
+
+#[cfg(test)]
+mod expression_component_test_fixture;

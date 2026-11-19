@@ -34,8 +34,8 @@ use uuid::Uuid;
 use super::{
     CatalogProperties, ConnectorCommittedVersion, ConnectorControlRuntimeId, ConnectorError,
     ConnectorErrorKind, ConnectorExecutionDistribution, ConnectorMutationFailure,
-    ConnectorProviderBinding, ConnectorProviderBindingKey, ConnectorProviderId,
-    ConnectorRequestContext, ConnectorTableHandle, ExternalMutationEvidence,
+    ConnectorProcessLocalPayload, ConnectorProviderBinding, ConnectorProviderBindingKey,
+    ConnectorProviderId, ConnectorRequestContext, ConnectorTableHandle, ExternalMutationEvidence,
     ExternalMutationFinalization, LakePublicationFamily, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
     MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES, MvExactPartitionField, MvExactPartitionTransform,
 };
@@ -43,156 +43,12 @@ use super::{
 pub const MAX_CONNECTOR_WRITE_RECEIPT_BYTES: usize = MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES;
 pub const MAX_CONNECTOR_MANAGED_PARTITION_SPEC_FIELDS: usize = 4096;
 pub const MAX_CONNECTOR_MANAGED_PARTITION_FIELD_TEXT_BYTES: usize = 4096;
-pub const DEFAULT_WRITE_COMMIT_EVIDENCE_MAX_BYTES: usize = 64 * 1024 * 1024;
-pub const DEFAULT_WRITE_COMMIT_EVIDENCE_MAX_ENTRIES: usize = 16_384;
 
 const CONNECTOR_WRITE_COHORT_ID_DOMAIN: &[u8] = b"novarocks.connector-write-cohort.v1\0";
 const CONNECTOR_MANAGED_PARTITION_SPEC_OBSERVATION_DOMAIN: &[u8] =
     b"novarocks.connector-managed-partition-spec-observation.v1\0";
 const CONNECTOR_MANAGED_PARTITION_SPEC_REPLACEMENT_ID_DOMAIN: &[u8] =
     b"novarocks.connector-managed-partition-spec-replacement-id.v1\0";
-
-#[path = "write_evidence_failure.rs"]
-mod evidence_failure;
-use evidence_failure::WriteEvidenceFailure;
-
-/// Resolved per-fragment bounds for evidence returned by a distributed write.
-///
-/// This is intentionally an application input rather than a connector wire
-/// limit. Individual reports retain their independent SPI framing bounds; the
-/// ledger combines connector frames with tablet terminal facts for one
-/// fragment instance.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct WriteCommitEvidenceLimits {
-    max_bytes: usize,
-    max_entries: usize,
-}
-
-impl WriteCommitEvidenceLimits {
-    pub fn try_new(max_bytes: usize, max_entries: usize) -> Result<Self, ConnectorError> {
-        if max_bytes == 0 || max_entries == 0 {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "write commit evidence byte and entry limits must be greater than zero",
-            ));
-        }
-        Ok(Self {
-            max_bytes,
-            max_entries,
-        })
-    }
-
-    pub const fn max_bytes(self) -> usize {
-        self.max_bytes
-    }
-
-    pub const fn max_entries(self) -> usize {
-        self.max_entries
-    }
-}
-
-impl Default for WriteCommitEvidenceLimits {
-    fn default() -> Self {
-        Self {
-            max_bytes: DEFAULT_WRITE_COMMIT_EVIDENCE_MAX_BYTES,
-            max_entries: DEFAULT_WRITE_COMMIT_EVIDENCE_MAX_ENTRIES,
-        }
-    }
-}
-
-/// Fragment-local reserve-before-publish budget shared by all write evidence.
-#[derive(Clone, Debug)]
-pub struct WriteCommitEvidenceLedger {
-    limits: WriteCommitEvidenceLimits,
-    usage: Arc<Mutex<WriteCommitEvidenceUsage>>,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct WriteCommitEvidenceUsage {
-    bytes: usize,
-    entries: usize,
-}
-
-impl WriteCommitEvidenceUsage {
-    pub const fn bytes(self) -> usize {
-        self.bytes
-    }
-
-    pub const fn entries(self) -> usize {
-        self.entries
-    }
-}
-
-impl WriteCommitEvidenceLedger {
-    pub fn new(limits: WriteCommitEvidenceLimits) -> Self {
-        Self {
-            limits,
-            usage: Arc::new(Mutex::new(WriteCommitEvidenceUsage::default())),
-        }
-    }
-
-    /// Reserve before the caller makes evidence visible to a later terminal
-    /// report. A failed reservation leaves the ledger unchanged.
-    pub fn reserve(&self, bytes: usize, entries: usize) -> Result<(), ConnectorError> {
-        let mut usage = self
-            .usage
-            .lock()
-            .map_err(|_| WriteEvidenceFailure::Poisoned.into_connector())?;
-        let next_bytes = usage.bytes.checked_add(bytes).ok_or_else(|| {
-            WriteEvidenceFailure::Arithmetic {
-                dimension: novarocks_failure_contract::ResourceDimension::Bytes,
-                requested: bytes,
-                committed: usage.bytes,
-                limit: self.limits.max_bytes,
-            }
-            .into_connector()
-        })?;
-        let next_entries = usage.entries.checked_add(entries).ok_or_else(|| {
-            WriteEvidenceFailure::Arithmetic {
-                dimension: novarocks_failure_contract::ResourceDimension::Items,
-                requested: entries,
-                committed: usage.entries,
-                limit: self.limits.max_entries,
-            }
-            .into_connector()
-        })?;
-        if next_bytes > self.limits.max_bytes || next_entries > self.limits.max_entries {
-            return Err(WriteEvidenceFailure::Budget {
-                requested_bytes: bytes,
-                requested_entries: entries,
-                committed: *usage,
-                limits: self.limits,
-            }
-            .into_connector());
-        }
-        *usage = WriteCommitEvidenceUsage {
-            bytes: next_bytes,
-            entries: next_entries,
-        };
-        Ok(())
-    }
-
-    pub const fn limits(&self) -> WriteCommitEvidenceLimits {
-        self.limits
-    }
-
-    pub fn usage(&self) -> Result<WriteCommitEvidenceUsage, ConnectorError> {
-        self.usage
-            .lock()
-            .map(|usage| *usage)
-            .map_err(|_| WriteEvidenceFailure::Poisoned.into_connector())
-    }
-
-    pub fn same_instance(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.usage, &other.usage)
-    }
-}
-
-impl Default for WriteCommitEvidenceLedger {
-    fn default() -> Self {
-        Self::new(WriteCommitEvidenceLimits::default())
-    }
-}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ConnectorWriteOperationId(Uuid);
@@ -1512,14 +1368,26 @@ impl ConnectorPreReadyWritePlanningProof {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct ConnectorWriteReceipt {
     payload: Bytes,
     digest: [u8; 32],
     committed_version: Option<ConnectorCommittedVersion>,
     resulting_row_count: Option<u64>,
     committed_partitioning: Option<ConnectorCommittedPartitioning>,
+    process_local_payload: Option<Arc<ConnectorProcessLocalPayload>>,
 }
+
+impl PartialEq for ConnectorWriteReceipt {
+    fn eq(&self, other: &Self) -> bool {
+        self.payload == other.payload
+            && self.digest == other.digest
+            && self.committed_version == other.committed_version
+            && self.resulting_row_count == other.resulting_row_count
+            && self.committed_partitioning == other.committed_partitioning
+    }
+}
+impl Eq for ConnectorWriteReceipt {}
 
 impl ConnectorWriteReceipt {
     pub fn try_new(payload: Bytes) -> Result<Self, ConnectorError> {
@@ -1530,6 +1398,7 @@ impl ConnectorWriteReceipt {
             committed_version: None,
             resulting_row_count: None,
             committed_partitioning: None,
+            process_local_payload: None,
         })
     }
 
@@ -1605,8 +1474,39 @@ impl ConnectorWriteReceipt {
         self.committed_partitioning.as_ref()
     }
 
+    /// Attach immutable provider content after checking its complete generation.
+    /// The attachment changes neither receipt identity nor its wire representation.
+    pub fn with_process_local_payload(
+        mut self,
+        expected_owner: &ConnectorProviderBindingKey,
+        payload: ConnectorProcessLocalPayload,
+    ) -> Result<Self, ConnectorError> {
+        payload.validate_owner(expected_owner)?;
+        if self.process_local_payload.is_some() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "connector write receipt already retains a process-local payload",
+            ));
+        }
+        self.process_local_payload = Some(Arc::new(payload));
+        Ok(self)
+    }
+
+    /// Validate the generation before a provider opens its private content.
+    pub fn process_local_payload(
+        &self,
+        expected_owner: &ConnectorProviderBindingKey,
+    ) -> Result<Option<&ConnectorProcessLocalPayload>, ConnectorError> {
+        if let Some(payload) = &self.process_local_payload {
+            payload.validate_owner(expected_owner)?;
+        }
+        Ok(self.process_local_payload.as_deref())
+    }
+
     /// Stable durable form for application journals. The provider payload is
-    /// carried opaquely and never decoded outside the provider.
+    /// carried opaquely and never decoded outside the provider. Process-local
+    /// attachments are omitted; consumers that require them reject a receipt
+    /// restored from this wire form.
     pub fn try_to_wire_v1(&self) -> Result<Bytes, ConnectorError> {
         self.validate()?;
         const MAGIC: &[u8; 4] = b"CWR1";
@@ -2836,6 +2736,59 @@ mod tests {
                 .unwrap_err()
                 .kind(),
             ConnectorErrorKind::InvalidRequest
+        );
+    }
+
+    #[test]
+    fn receipt_attachment_preserves_identity_and_checks_generation() {
+        let owner = ConnectorProviderBinding::iceberg("catalog", [1; 16], "binding")
+            .unwrap()
+            .binding_key()
+            .clone();
+        let foreign = ConnectorProviderBinding::iceberg("catalog", [2; 16], "binding")
+            .unwrap()
+            .binding_key()
+            .clone();
+        let plain = ConnectorWriteReceipt::try_new(Bytes::from_static(b"bounded facts")).unwrap();
+        let content = Arc::new(vec![7u64]);
+        let attached = plain
+            .clone()
+            .with_process_local_payload(
+                &owner,
+                ConnectorProcessLocalPayload::new(owner.clone(), content.clone()),
+            )
+            .unwrap();
+        assert_eq!(plain, attached);
+        assert_eq!(plain.digest(), attached.digest());
+        assert!(Arc::ptr_eq(
+            attached
+                .process_local_payload(&owner)
+                .unwrap()
+                .unwrap()
+                .value::<Vec<u64>>(owner.instance_id())
+                .unwrap(),
+            &content,
+        ));
+        let decoded =
+            ConnectorWriteReceipt::try_from_wire_v1(&attached.try_to_wire_v1().unwrap()).unwrap();
+        assert_eq!(decoded, attached);
+        assert!(decoded.process_local_payload(&owner).unwrap().is_none());
+        assert!(attached.process_local_payload(&foreign).is_err());
+        assert!(
+            plain
+                .with_process_local_payload(
+                    &owner,
+                    ConnectorProcessLocalPayload::new(foreign, content),
+                )
+                .is_err()
+        );
+        assert!(
+            attached
+                .with_process_local_payload(
+                    &owner,
+                    ConnectorProcessLocalPayload::new(owner.clone(), Arc::new(())),
+                )
+                .is_err()
         );
     }
 

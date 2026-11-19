@@ -171,8 +171,8 @@ impl InternalDomainSlot {
             InternalDomainState::Statistics(decoder) => decoder
                 .apply_relay_body(body)
                 .map_err(InternalDomainFailure::from),
-            InternalDomainState::WriteComputation { decoder, .. } => decoder
-                .apply_relay_body(body)
+            InternalDomainState::WriteComputation { decoder, decode } => decode
+                .apply_body(decoder, body)
                 .map_err(InternalDomainFailure::from),
         };
         // Receipt contains no body alias. Relinquish this job's original reply
@@ -201,7 +201,7 @@ impl InternalDomainSlot {
             } => {
                 decoder.check_relay_end(end.output_rows)?;
                 decoder.observe_root_eof()?;
-                let prepared = decode.interpret(decoder.finish()?)?;
+                let prepared = decode.complete_root(decoder.finish()?)?;
                 InternalDomainCompletion::WriteDecoded(prepared)
             }
         };

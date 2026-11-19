@@ -45,6 +45,9 @@ pub use recursive_resources::{
     preflight_recursive_pool_resources_observed,
 };
 
+mod pool_table;
+pub use pool_table::{ConstantPoolId, ConstantPools, ConstantReference, ConstantTableError};
+
 mod semantic_key;
 pub use semantic_key::ConstantSemanticKey;
 mod collection_factory;

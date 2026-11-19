@@ -23,6 +23,10 @@ pub(super) use managed_repartition::slot_matches;
 mod materialized;
 #[cfg(test)]
 pub(crate) use materialized::observed_materialized_staging_fixture;
+#[cfg(test)]
+pub(in crate::commit::write_stack) use materialized::{
+    MaterializedDeleteStep, observation_target_bytes,
+};
 
 use super::*;
 #[cfg(test)]
@@ -37,12 +41,14 @@ use crate::commit::attempt::{self, RetryPolicy};
 use crate::commit::dependency::ValidationInputs;
 use crate::commit::model::EntryIdentity;
 use crate::commit::model::{
-    AddedContent, ArtifactClass, BaseIdentity, CleanupScope, FileChanges, FrozenRequest,
-    IsolationLevel, ObjectIdentity, OperationIntent, OperationIntentParts, OperationToken,
-    RequestShape, StartSnapshot, TableTarget,
+    AddedContent, BaseIdentity, CleanupScope, FileChanges, FrozenRequest, IsolationLevel,
+    ObjectIdentity, OperationIntent, OperationIntentParts, OperationToken, RequestShape,
+    StartSnapshot, TableTarget,
 };
 #[cfg(test)]
-use crate::commit::model::{ArtifactWriter, IcebergCleanupReport, PublicationOutcome};
+use crate::commit::model::{
+    ArtifactOrigin, ArtifactWriter, IcebergCleanupReport, PublicationOutcome, ReceivedPublication,
+};
 #[cfg(test)]
 use crate::commit::operation::IcebergCommitAttempt;
 use crate::commit::operation::{IcebergCommitOperation, OperationLimits};
@@ -58,9 +64,131 @@ fn format_error(error: ConnectorError) -> crate::iceberg::Error {
         .with_source(error)
 }
 
+/// Project exactly the admitted writer facts using the frozen write-time
+/// metadata. Compact and whole-set publication share this author.
+pub(in crate::commit) fn written_file_with_historical_partition(
+    fragment: &IcebergCommitFragment,
+    metadata: &TableMetadata,
+    historical_partition: Option<&crate::iceberg::spec::StructType>,
+) -> Result<WrittenFile, ConnectorError> {
+    let partition = fragment
+        .partition()
+        .ok_or_else(|| corrupt("Iceberg result has no written partition"))?;
+    let partition_values = match historical_partition {
+        Some(ty) => crate::write_descriptor::decode_partition_descriptor_with_type(
+            partition.descriptor(),
+            ty,
+        )
+        .map_err(|error| corrupt(error.detail_message()))?,
+        None => decode_partition_values(partition, metadata)?,
+    };
+    let metrics = fragment
+        .metrics()
+        .ok_or_else(|| corrupt("Iceberg result has no written metrics"))?;
+    let record_count = metrics.record_count();
+    let file_size_in_bytes = metrics.file_size_in_bytes();
+    let empty_stats = crate::commit::report::IcebergColumnStats::default();
+    let stats = metrics.column_stats().unwrap_or(&empty_stats);
+    let (
+        format,
+        content,
+        referenced_data_file,
+        first_row_id,
+        content_offset,
+        content_size,
+        cardinality,
+        equality_ids,
+    ) = match fragment.artifact() {
+        IcebergCommitArtifact::DataFile(file) => (
+            DataFileFormat::Parquet,
+            DataContentType::Data,
+            None,
+            file.first_row_id(),
+            None,
+            None,
+            None,
+            None,
+        ),
+        IcebergCommitArtifact::PositionDeleteFile(file) => (
+            DataFileFormat::Parquet,
+            DataContentType::PositionDeletes,
+            Some(file.referenced_data_file().to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ),
+        IcebergCommitArtifact::DeletionVector(file) => (
+            DataFileFormat::Puffin,
+            DataContentType::PositionDeletes,
+            Some(file.referenced_data_file().to_string()),
+            None,
+            Some(file.content_range().offset()),
+            Some(file.content_range().size_in_bytes()),
+            Some(file.cardinality()),
+            None,
+        ),
+        // An equality delete names no data file: Iceberg matches it against
+        // every row whose equality-column values agree, so the manifest carries
+        // the field ids instead of a referenced path.
+        IcebergCommitArtifact::EqualityDeleteFile(file) => (
+            DataFileFormat::Parquet,
+            DataContentType::EqualityDeletes,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(file.equality_field_ids().to_vec()),
+        ),
+        IcebergCommitArtifact::FinalDelete(effect) => {
+            let crate::commit::write_stack::domain::IcebergFinalDeleteKind::ReplacePositions(file) =
+                effect.kind()
+            else {
+                return Err(invalid("Iceberg pure removal has no written artifact"));
+            };
+            (
+                DataFileFormat::Puffin,
+                DataContentType::PositionDeletes,
+                Some(file.referenced_data_file().to_owned()),
+                None,
+                Some(file.content_range().offset()),
+                Some(file.content_range().size_in_bytes()),
+                Some(file.cardinality()),
+                None,
+            )
+        }
+    };
+    Ok(WrittenFile {
+        path: fragment.path().to_string(),
+        format,
+        content,
+        partition_values,
+        partition_spec_id: partition.partition_spec_id(),
+        record_count,
+        file_size_in_bytes,
+        split_offsets: metrics.split_offsets().to_vec(),
+        column_sizes: unsigned_counts(&stats.column_sizes)?,
+        value_counts: unsigned_counts(&stats.value_counts)?,
+        null_value_counts: unsigned_counts(&stats.null_value_counts)?,
+        nan_value_counts: unsigned_counts(&stats.nan_value_counts)?,
+        lower_bounds: decode_bounds(&stats.lower_bounds, metadata)?,
+        upper_bounds: decode_bounds(&stats.upper_bounds, metadata)?,
+        key_metadata: None,
+        referenced_data_file,
+        equality_ids,
+        first_row_id,
+        content_offset,
+        content_size_in_bytes: content_size,
+        cardinality,
+    })
+}
+
 struct WriteRecipe<'a> {
     source: Arc<TableMetadata>,
     files: Vec<WrittenFile>,
+    compact_stage: Option<usize>,
     materialized: Option<Arc<materialized::MaterializedDeleteStep>>,
     fixed_mutation: bool,
     selected: Option<crate::commit::selected_rewrite::SelectedRewriteFiles>,
@@ -232,6 +360,7 @@ impl<'a> WriteRecipe<'a> {
         Ok(Self {
             source,
             files,
+            compact_stage: None,
             materialized,
             fixed_mutation,
             selected,
@@ -372,22 +501,36 @@ impl<'a> WriteRecipe<'a> {
             summary: self.summary.clone(),
             token: operation.token(),
         })
-        .map(|intent| {
-            if self
-                .summary
-                .keys()
-                .any(|key| key.starts_with(crate::document_storage::keyed::keys::RECORD_PREFIX))
-            {
-                intent.with_snapshot_loading(crate::catalog::SnapshotLoading::Refs)
-            } else {
-                intent
-            }
+        .and_then(|intent| {
+            let intent = match self.compact_stage {
+                Some(stage) => intent.with_compact_stage(stage)?,
+                None => intent,
+            };
+            Ok(
+                if self
+                    .summary
+                    .keys()
+                    .any(|key| key.starts_with(crate::document_storage::keyed::keys::RECORD_PREFIX))
+                {
+                    intent.with_snapshot_loading(crate::catalog::SnapshotLoading::Refs)
+                } else {
+                    intent
+                },
+            )
         })
     }
 
-    fn preparer(&self) -> Result<Box<dyn Preparer>, ConnectorError> {
+    fn preparer(
+        &self,
+        operation: &IcebergCommitOperation,
+    ) -> Result<Box<dyn Preparer>, ConnectorError> {
         if let Some(step) = &self.materialized {
             return Ok(Box::new(Arc::clone(step)));
+        }
+        if self.compact_stage.is_some() {
+            return Ok(Box::new(
+                crate::commit::fast_append::CompactFastAppendPreparer(operation.clone()),
+            ));
         }
         // A managed publication admitted as CommitEmptyWrite still needs its
         // snapshot marker even when no row delta was materialized.
@@ -579,21 +722,104 @@ impl WritePublicationDispatch {
         }
     }
 }
+pub(super) struct ReceivedOperation<'a> {
+    operation: IcebergCommitOperation,
+    journal: PublicationJournal<ConnectorWriteReceipt>,
+    recipe: Result<WriteRecipe<'a>, ConnectorError>,
+}
+
 impl IcebergWriteSessionControl {
+    pub(super) fn prepare_received_operation<'a>(
+        &self,
+        handle: &'a IcebergWriteCommitSession,
+        validated: &[ValidatedFragment<'_>],
+        documents: Option<&novarocks_spi::connector::KeyedPublicationIntent>,
+        context: &ConnectorRequestContext,
+    ) -> Result<ReceivedOperation<'a>, ConnectorError> {
+        let (operation, journal) = self.adopt_received_operation(handle, validated, context)?;
+        let recipe = WriteRecipe::freeze(handle, validated, documents);
+        Ok(ReceivedOperation {
+            operation,
+            journal,
+            recipe,
+        })
+    }
+
+    pub(super) fn prepare_compact_operation<'a>(
+        &self,
+        handle: &'a IcebergWriteCommitSession,
+        received: &mut IcebergReceiving,
+        documents: Option<&novarocks_spi::connector::KeyedPublicationIntent>,
+        context: &ConnectorRequestContext,
+    ) -> Result<ReceivedOperation<'a>, ConnectorError> {
+        let compact = received
+            .compact_files()
+            .ok_or_else(|| internal("Expected compact write receiving"))?;
+        let (operation, journal) = self.adopt_compact_operation(handle, compact, context)?;
+        let files = received
+            .take_compact_files()
+            .expect("adopted compact files");
+        let recipe = WriteRecipe::freeze(handle, &[], documents).and_then(|mut recipe| {
+            let stage = usize::from(recipe.keyed_documents.is_some());
+            recipe.compact_stage = Some(stage);
+            recipe.output_facts.data_files = files.counts.data.files;
+            recipe.output_facts.data_rows = files.counts.data.rows;
+            if files.has_delete_effects() {
+                if !recipe.fixed_mutation {
+                    return Err(internal(
+                        "Iceberg compact delete lost its fixed write endpoint",
+                    ));
+                }
+                recipe.materialized =
+                    Some(Arc::new(materialized::MaterializedDeleteStep::compact(
+                        operation.clone(),
+                        stage,
+                        files.counts,
+                    )));
+                if recipe.source.format_version() == crate::iceberg::spec::FormatVersion::V2 {
+                    recipe.output_facts.position_delete_files = files.counts.position_deletes.files;
+                } else {
+                    recipe.output_facts.deletion_vectors = files.counts.position_deletes.files;
+                }
+            }
+            operation
+                .install_stage_new_files(
+                    stage,
+                    crate::commit::new_manifests::PendingNewFiles {
+                        received: files,
+                        source: Arc::clone(&recipe.source),
+                        codec: super::super::codec::CompactFragmentCodec::for_adapter(
+                            &self.adapter,
+                        ),
+                    },
+                )
+                .map_err(|error| internal(error.to_string()))?;
+            Ok(recipe)
+        });
+        Ok(ReceivedOperation {
+            operation,
+            journal,
+            recipe,
+        })
+    }
+
     pub(super) async fn dispatch_operation_async(
         &self,
         handle: &IcebergWriteCommitSession,
-        validated: &[ValidatedFragment<'_>],
+        prepared: ReceivedOperation<'_>,
         statistics: Vec<novarocks_spi::connector::StatisticsArtifactDraft>,
-        documents: Option<&novarocks_spi::connector::KeyedPublicationIntent>,
+        publishes_documents: bool,
         context: &ConnectorRequestContext,
-    ) -> Result<WritePublicationDispatch, ConnectorError> {
-        let (operation, journal) = self.adopt_received_operation(handle, validated, context)?;
-        let recipe = WriteRecipe::freeze(handle, validated, documents);
+    ) -> WritePublicationDispatch {
+        let ReceivedOperation {
+            operation,
+            journal,
+            recipe,
+        } = prepared;
         let recipe = match recipe {
             Ok(recipe) => recipe,
             Err(error) => {
-                let error = if documents.is_some() {
+                let error = if publishes_documents {
                     crate::document_storage::keyed::write::refusal_with_retained_bytes_async(
                         &self.runtime,
                         handle.table().namespace(),
@@ -605,35 +831,35 @@ impl IcebergWriteSessionControl {
                 } else {
                     error
                 };
-                return Ok(WritePublicationDispatch::settled(
+                return WritePublicationDispatch::settled(
                     self.reject_operation(handle, &operation, error).await,
-                ));
+                );
             }
         };
-        let data = match recipe.preparer() {
+        let data = match recipe.preparer(&operation) {
             Ok(data) => data,
             Err(error) => {
-                return Ok(WritePublicationDispatch::settled(
+                return WritePublicationDispatch::settled(
                     self.reject_operation(handle, &operation, error).await,
-                ));
+                );
             }
         };
         let policy = match RetryPolicy::from_properties(recipe.source.properties()) {
             Ok(policy) => policy,
             Err(error) => {
-                return Ok(WritePublicationDispatch::settled(
+                return WritePublicationDispatch::settled(
                     self.reject_operation(handle, &operation, format_error_to_connector(error))
                         .await,
-                ));
+                );
             }
         };
         let template =
             match RecoveryTemplate::from_handle(&self.descriptor, self.key.incarnation, handle) {
                 Ok(template) => template,
                 Err(error) => {
-                    return Ok(WritePublicationDispatch::settled(
+                    return WritePublicationDispatch::settled(
                         self.reject_operation(handle, &operation, error).await,
-                    ));
+                    );
                 }
             };
         let preflight_journal = journal.clone();
@@ -773,10 +999,10 @@ impl IcebergWriteSessionControl {
             mut finalization,
         } = outcome
         else {
-            return Ok(WritePublicationDispatch {
+            return WritePublicationDispatch {
                 outcome,
                 cleanup: None,
-            });
+            };
         };
         let snapshot_id =
             journal
@@ -832,7 +1058,7 @@ impl IcebergWriteSessionControl {
         if let Some(entry) = journal.current_entry() {
             journal.record_entry_finalization(entry, finalization.clone());
         }
-        Ok(WritePublicationDispatch {
+        WritePublicationDispatch {
             outcome: WritePublicationVerdict::KnownCommitted {
                 cleanup,
                 effect,
@@ -840,13 +1066,55 @@ impl IcebergWriteSessionControl {
                 finalization,
             },
             cleanup: Some((operation, journal)),
-        })
+        }
     }
 
     fn adopt_received_operation(
         &self,
         handle: &IcebergWriteCommitSession,
         validated: &[ValidatedFragment<'_>],
+        context: &ConnectorRequestContext,
+    ) -> Result<
+        (
+            IcebergCommitOperation,
+            PublicationJournal<ConnectorWriteReceipt>,
+        ),
+        ConnectorError,
+    > {
+        let objects = validated
+            .iter()
+            .filter_map(|entry| entry.fragment.new_object_path())
+            .map(ObjectIdentity::new)
+            .collect::<crate::iceberg::Result<BTreeSet<_>>>()
+            .map_err(|error| corrupt(error.to_string()))?;
+        self.adopt_operation_objects(handle, objects, context)
+    }
+
+    fn adopt_compact_operation(
+        &self,
+        handle: &IcebergWriteCommitSession,
+        compact: &super::super::receiving::ReceivedCompactFiles,
+        context: &ConnectorRequestContext,
+    ) -> Result<
+        (
+            IcebergCommitOperation,
+            PublicationJournal<ConnectorWriteReceipt>,
+        ),
+        ConnectorError,
+    > {
+        let objects = compact
+            .entries()
+            .filter_map(|entry| entry.addition.as_ref())
+            .map(|addition| ObjectIdentity::from_shared_path(Arc::clone(&addition.object_path)))
+            .collect::<crate::iceberg::Result<BTreeSet<_>>>()
+            .map_err(|error| corrupt(error.to_string()))?;
+        self.adopt_operation_objects(handle, objects, context)
+    }
+
+    fn adopt_operation_objects(
+        &self,
+        handle: &IcebergWriteCommitSession,
+        objects: BTreeSet<ObjectIdentity>,
         context: &ConnectorRequestContext,
     ) -> Result<
         (
@@ -868,24 +1136,21 @@ impl IcebergWriteSessionControl {
             operation.token(),
             self.runtime.resources().catalog_runtime(),
         );
-        handle.retain_publication(operation.clone(), journal.clone())?;
-        // Physical ownership deduplicates objects, while intent keeps full DV identities.
-        let objects: BTreeSet<_> = validated
-            .iter()
-            .filter_map(|entry| entry.fragment.new_object_path().map(str::to_owned))
-            .collect();
-        for path in objects {
+        for object in objects {
             operation
-                .adopt_session_data(ObjectIdentity::new(path).map_err(|e| corrupt(e.to_string()))?)
-                .map_err(|e| internal(e.to_string()))?;
+                .adopt_session_data(object)
+                .map_err(|error| internal(error.to_string()))?;
         }
+        // Publish the original owner only after adoption has completed, with
+        // no asynchronous boundary or created side effect in between.
+        handle.retain_publication(operation.clone(), journal.clone())?;
         Ok((operation, journal))
     }
 
     pub(super) async fn cleanup_received_set_async(
         &self,
         handle: &IcebergWriteCommitSession,
-        received: &ConnectorPreparedWriteSet,
+        received: IcebergReceiving,
         context: &ConnectorRequestContext,
     ) -> Result<ExternalMutationFinalization, ConnectorError> {
         if !matches!(
@@ -901,11 +1166,15 @@ impl IcebergWriteSessionControl {
                 "staged target publication retains its own sealed object cleanup authority",
             ));
         }
-        // The caller must have transferred the exact completed Session union;
-        // the same Provider additionally checks binding/targets/fragment facts.
-        // No ref/live-set scan and no old-reference path is adopted for deletion.
-        let validated = validate_prepared_set(handle, &self.adapter, received)?;
-        let (operation, _) = self.adopt_received_operation(handle, &validated, context)?;
+        // This is the original confirmed receiver won by the release or
+        // refused finish. No ref/live-set scan or old reference grants deletion.
+        let (operation, _) = if let Some(compact) = received.compact_files() {
+            self.adopt_compact_operation(handle, compact, context)?
+        } else {
+            let validated = validate_received_set(handle, &self.adapter, &received)?;
+            self.adopt_received_operation(handle, &validated, context)?
+        };
+        drop(received);
         let cleanup = {
             let mut original = std::pin::pin!(operation.cleanup(CleanupScope::EntireOperation));
             let report =
@@ -970,10 +1239,6 @@ pub(super) struct RecoveryPayload {
     parent_snapshot_id: Option<i64>,
     metadata_location: String,
     published_snapshot_id: Option<i64>,
-    artifacts: Vec<RecoveryObject>,
-    attempt_owned: Vec<u32>,
-    operation_references: Vec<u32>,
-    session_references: Vec<u32>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -990,29 +1255,6 @@ impl From<crate::commit::model::AttemptToken> for RecoveryAttempt {
         }
     }
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum OwnedClass {
-    SessionData,
-    Operation,
-    Attempt,
-}
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum WriteState {
-    Allocated,
-    Writing,
-    Written,
-}
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RecoveryObject {
-    path: String,
-    class: OwnedClass,
-    attempt: Option<RecoveryAttempt>,
-    state: WriteState,
-}
-
 struct RecoveryTemplate {
     descriptor: ConnectorInstanceDescriptor,
     incarnation: ProviderBindingEpoch,
@@ -1082,47 +1324,6 @@ impl RecoveryTemplate {
                 "Recovery envelope target differs from its frozen request",
             ));
         }
-        let records = operation.artifacts().map_err(|e| internal(e.to_string()))?;
-        let mut index = BTreeMap::new();
-        let mut artifacts = Vec::new();
-        for record in records {
-            index.insert(
-                record.object.clone(),
-                u32::try_from(artifacts.len())
-                    .map_err(|_| internal("Recovery object count overflow"))?,
-            );
-            let class = match record.class {
-                ArtifactClass::SessionData => OwnedClass::SessionData,
-                ArtifactClass::Operation => OwnedClass::Operation,
-                ArtifactClass::Attempt => OwnedClass::Attempt,
-                ArtifactClass::ExternalRegistered => {
-                    return Err(internal(
-                        "External registered object entered the owned ledger",
-                    ));
-                }
-            };
-            let state = match record.write_state {
-                crate::commit::model::ArtifactWriteState::Allocated => WriteState::Allocated,
-                crate::commit::model::ArtifactWriteState::Writing => WriteState::Writing,
-                crate::commit::model::ArtifactWriteState::Written => WriteState::Written,
-            };
-            artifacts.push(RecoveryObject {
-                path: record.object.path().to_string(),
-                class,
-                attempt: record.attempt.map(RecoveryAttempt::from),
-                state,
-            });
-        }
-        let indices = |paths: &[ObjectIdentity]| -> Result<Vec<u32>, ConnectorError> {
-            paths
-                .iter()
-                .map(|object| {
-                    index.get(object).copied().ok_or_else(|| {
-                        internal("Frozen request references an object absent from recovery ledger")
-                    })
-                })
-                .collect()
-        };
         let payload = RecoveryPayload {
             version: ICEBERG_WRITE_SESSION_EVIDENCE_VERSION,
             session_id: self.session_id.to_string(),
@@ -1139,13 +1340,9 @@ impl RecoveryTemplate {
             parent_snapshot_id: *parent,
             metadata_location: metadata_location.clone(),
             published_snapshot_id: request.ref_snapshot_after(&self.target_ref),
-            attempt_owned: indices(request.artifacts().attempt_owned())?,
-            operation_references: indices(request.artifacts().operation_references())?,
-            session_references: indices(request.artifacts().session_references())?,
-            artifacts,
         };
         payload.validate_facts(self)?;
-        let bytes = super::recovery_codec::encode(&payload)?;
+        let bytes = serde_json::to_vec(&payload).map_err(|error| internal(error.to_string()))?;
         ExternalMutationEvidence::try_new(
             ICEBERG_WRITE_SESSION_EVIDENCE_VERSION,
             self.descriptor.clone(),
@@ -1194,80 +1391,8 @@ impl RecoveryPayload {
                 "Iceberg recovery envelope disagrees with exact admitted session facts",
             ));
         }
-        let mut attempts = BTreeMap::from([(self.attempt.ordinal, self.attempt.nonce)]);
-        let valid_nonce = |nonce: &[u8; 16]| uuid::Uuid::from_bytes(*nonce).get_version_num() == 7;
-        if !valid_nonce(&self.attempt.nonce) {
+        if uuid::Uuid::from_bytes(self.attempt.nonce).get_version_num() != 7 {
             return Err(corrupt("Iceberg recovery attempt has no UUIDv7 nonce"));
-        }
-        let mut previous: Option<&str> = None;
-        for object in &self.artifacts {
-            crate::commit::write_stack::domain::validate_location("recovery object", &object.path)?;
-            if previous.is_some_and(|path| path >= object.path.as_str()) {
-                return Err(corrupt(
-                    "Iceberg recovery ledger is not strictly ordered by unique physical path",
-                ));
-            }
-            previous = Some(&object.path);
-            match (object.class, &object.attempt) {
-                (OwnedClass::Attempt, Some(attempt))
-                    if attempt.ordinal <= self.attempt.ordinal && valid_nonce(&attempt.nonce) =>
-                {
-                    if attempts
-                        .insert(attempt.ordinal, attempt.nonce)
-                        .is_some_and(|old| old != attempt.nonce)
-                    {
-                        return Err(corrupt(
-                            "Iceberg recovery attempt ordinal has conflicting nonces",
-                        ));
-                    }
-                }
-                (OwnedClass::SessionData, None) if object.state == WriteState::Written => {}
-                (OwnedClass::Operation, None) => {}
-                _ => {
-                    return Err(corrupt(
-                        "Iceberg recovery object class disagrees with its attempt/write state",
-                    ));
-                }
-            }
-        }
-        let mut referenced = BTreeSet::new();
-        for (references, class) in [
-            (&self.attempt_owned, OwnedClass::Attempt),
-            (&self.operation_references, OwnedClass::Operation),
-            (&self.session_references, OwnedClass::SessionData),
-        ] {
-            let mut previous = None;
-            for index in references {
-                let object = self
-                    .artifacts
-                    .get(*index as usize)
-                    .ok_or_else(|| corrupt("Recovery reference is outside the complete ledger"))?;
-                if previous.is_some_and(|prev| prev >= *index)
-                    || !referenced.insert(*index)
-                    || object.class != class
-                    || object.state != WriteState::Written
-                    || (class == OwnedClass::Attempt
-                        && object.attempt.as_ref() != Some(&self.attempt))
-                {
-                    return Err(corrupt(
-                        "Recovery reference is duplicate or disagrees with exact ownership",
-                    ));
-                }
-                previous = Some(*index);
-            }
-        }
-        let all_current: Vec<_> = self
-            .artifacts
-            .iter()
-            .enumerate()
-            .filter(|(_, object)| {
-                object.class == OwnedClass::Attempt
-                    && object.attempt.as_ref() == Some(&self.attempt)
-            })
-            .map(|(i, _)| i as u32)
-            .collect();
-        if self.attempt_owned != all_current {
-            return Err(corrupt("Recovery request omits current attempt objects"));
         }
         Ok(())
     }
@@ -1345,7 +1470,32 @@ mod recovery_tests {
             }
         }
         fn intent(&self) -> OperationIntent {
-            self.intent_with_files(Vec::new())
+            let added = self
+                .operation
+                .artifacts()
+                .unwrap()
+                .into_iter()
+                .filter_map(|record| {
+                    matches!(
+                        record.origin,
+                        ArtifactOrigin::Received {
+                            publishes: ReceivedPublication::ViaManifest
+                        }
+                    )
+                    .then(|| {
+                        AddedContent::new_logical_data(
+                            crate::commit::overwrite::preparer_tests::data(
+                                record.object.path(),
+                                1,
+                                crate::iceberg::spec::Struct::empty(),
+                            ),
+                            self.metadata.default_partition_spec_id(),
+                        )
+                        .unwrap()
+                    })
+                })
+                .collect();
+            self.intent_with_files(added)
         }
         fn intent_with_files(&self, added: Vec<AddedContent>) -> OperationIntent {
             OperationIntent::new(OperationIntentParts {
@@ -1372,7 +1522,7 @@ mod recovery_tests {
         }
         fn adopt_entropy(&self) -> ObjectIdentity {
             let mut path = self.directory.path().to_path_buf();
-            // Full independent path entropy remains material after compression.
+            // Independent path segments exercise long, unrelated owned object locations.
             for _ in 0..3 {
                 let segment: String = (0..3)
                     .map(|_| uuid::Uuid::new_v4().simple().to_string())
@@ -1412,6 +1562,7 @@ mod recovery_tests {
         fixture: &'a Fixture,
         dispatches: AtomicUsize,
         checked: Mutex<Option<ExternalMutationEvidence>>,
+        commit: bool,
     }
     #[async_trait]
     impl Publisher for TestPublisher<'_> {
@@ -1440,8 +1591,14 @@ mod recovery_tests {
             );
             Ok(())
         }
-        async fn dispatch_once(&self, _: FrozenRequest) -> CatalogOutcome<CommitProof> {
+        async fn dispatch_once(&self, request: FrozenRequest) -> CatalogOutcome<CommitProof> {
             self.dispatches.fetch_add(1, Ordering::SeqCst);
+            if self.commit {
+                return CatalogOutcome::committed(
+                    CommitProof::applied(request.ref_snapshot_after(request.target_ref())),
+                    ExternalMutationEffect::Applied,
+                );
+            }
             CatalogOutcome::unknown(
                 "transport lost after issue",
                 CatalogCommitEvidence::for_target("db.t"),
@@ -1453,14 +1610,16 @@ mod recovery_tests {
             fixture,
             dispatches: AtomicUsize::new(0),
             checked: Mutex::new(None),
+            commit: false,
         }
     }
 
     #[tokio::test]
-    async fn complete_owned_ledger_over_capacity_refuses_dispatch_and_cleans_actual_objects() {
+    async fn large_owned_ledger_publishes_with_bounded_evidence_and_keeps_received_objects() {
         let fixture = Fixture::new();
         let objects: Vec<_> = (0..800).map(|_| fixture.adopt_entropy()).collect();
-        let publisher = publisher(&fixture);
+        let mut publisher = publisher(&fixture);
+        publisher.commit = true;
         let report = attempt::run(
             &fixture.operation,
             &fixture.intent(),
@@ -1471,165 +1630,114 @@ mod recovery_tests {
         )
         .await;
         assert!(
-            matches!(report.publication, PublicationOutcome::KnownUncommitted(_)),
+            matches!(report.publication, PublicationOutcome::Committed(_)),
             "{report:?}"
         );
-        assert_eq!(publisher.dispatches.load(Ordering::SeqCst), 0);
-        assert!(publisher.checked.lock().unwrap().is_none());
+        assert_eq!(publisher.dispatches.load(Ordering::SeqCst), 1);
+        let checked = publisher.checked.lock().unwrap().clone().unwrap();
         assert!(
-            matches!(report.cleanup, IcebergCleanupReport::Complete { .. }),
-            "{:?}",
-            report.cleanup
+            checked.provider_payload().len()
+                <= novarocks_spi::connector::MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES
         );
+        let payload: RecoveryPayload = serde_json::from_slice(checked.provider_payload()).unwrap();
+        payload.validate_facts(&fixture.template).unwrap();
+        assert!(matches!(
+            report.cleanup,
+            IcebergCleanupReport::Complete { .. }
+        ));
         assert!(fixture.operation.artifacts().unwrap().is_empty());
-        assert!(
-            objects
-                .iter()
-                .all(|o| !std::path::Path::new(o.path().strip_prefix("file://").unwrap()).exists())
-        );
+        assert!(objects.iter().all(|object| {
+            std::path::Path::new(object.path().strip_prefix("file://").unwrap()).exists()
+        }));
     }
 
     #[tokio::test]
-    async fn large_complete_ledger_codec_preserves_all_classes_attempts_and_references() {
+    async fn recovery_evidence_size_is_independent_of_owned_object_count() {
         use crate::commit::staging::StagingEngine;
-        use crate::iceberg::spec::Struct;
-        let fixture = Fixture::new();
-        let sessions: Vec<_> = (0..1221).map(|_| fixture.adopt_random_file()).collect();
-        let old_attempt = fixture.operation.begin_attempt().unwrap();
-        let old_object = old_attempt
-            .allocate(ArtifactClass::Attempt, ArtifactKind::Statistics)
-            .unwrap();
-        let operation_object = old_attempt
-            .allocate(ArtifactClass::Operation, ArtifactKind::Metadata)
-            .unwrap();
-        let mut writer = old_attempt
-            .file_io()
-            .new_output(operation_object.path())
-            .unwrap()
-            .writer()
-            .await
-            .unwrap();
-        writer
-            .write(Bytes::from_static(b"operation-owned metadata"))
-            .await
-            .unwrap();
-        writer.close().await.unwrap();
-        let added = sessions
-            .iter()
-            .map(|object| {
-                AddedContent::new_logical_data(
-                    crate::commit::overwrite::preparer_tests::data(
-                        object.path(),
-                        1,
-                        Struct::empty(),
+        let mut normalized = None;
+        for count in [1, 1221] {
+            let fixture = Fixture::new();
+            let sessions: Vec<_> = (0..count).map(|_| fixture.adopt_random_file()).collect();
+            let old_attempt = fixture.operation.begin_attempt().unwrap();
+            let old_object = old_attempt.allocate(ArtifactKind::Statistics).unwrap();
+            let operation_path = fixture.directory.path().join("operation-metadata.json");
+            std::fs::write(&operation_path, b"operation metadata").unwrap();
+            let operation_object =
+                ObjectIdentity::new(format!("file://{}", operation_path.display())).unwrap();
+            fixture
+                .operation
+                .adopt_operation_reference(operation_object.clone())
+                .unwrap();
+            let intent = fixture.intent();
+            let current = fixture.operation.begin_attempt().unwrap();
+            let mut engine = StagingEngine::begin(
+                StagingBase::Existing {
+                    metadata: fixture.metadata.clone(),
+                    metadata_location: format!(
+                        "file://{}/base.metadata.json",
+                        fixture.directory.path().display()
                     ),
-                    fixture.metadata.default_partition_spec_id(),
-                )
-                .unwrap()
-            })
-            .collect();
-        let intent = fixture.intent_with_files(added);
-        let current = fixture.operation.begin_attempt().unwrap();
-        let mut engine = StagingEngine::begin(
-            StagingBase::Existing {
-                metadata: fixture.metadata.clone(),
-                metadata_location: format!(
-                    "file://{}/base.metadata.json",
-                    fixture.directory.path().display()
+                },
+                &intent,
+                &current,
+            )
+            .unwrap();
+            engine
+                .stage(&crate::commit::fast_append::FastAppendPreparer)
+                .await
+                .unwrap();
+            let request = engine.freeze().unwrap();
+            let evidence = fixture
+                .template
+                .encode(&request, &fixture.operation)
+                .unwrap();
+            let payload: RecoveryPayload =
+                serde_json::from_slice(evidence.provider_payload()).unwrap();
+            payload.validate_facts(&fixture.template).unwrap();
+            assert_eq!(
+                serde_json::to_vec(&payload).unwrap(),
+                evidence.provider_payload().as_ref()
+            );
+            assert!(
+                evidence.provider_payload().len()
+                    <= novarocks_spi::connector::MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES
+            );
+            let records = fixture.operation.artifacts().unwrap();
+            assert_eq!(records.len(), count + 4);
+            assert!(records.iter().any(|record| record.object == old_object
+                && record.write_state == crate::commit::model::ArtifactWriteState::Allocated));
+            assert!(
+                records
+                    .iter()
+                    .any(|record| record.object == operation_object)
+            );
+            let mut value = serde_json::to_value(&payload).unwrap();
+            for field in [
+                "artifacts",
+                "attempt_owned",
+                "operation_references",
+                "session_references",
+            ] {
+                assert!(value.get(field).is_none());
+            }
+            // These fields differ only because the two isolated owners have fresh identities.
+            value["table_uuid"] = serde_json::json!("table-identity");
+            value["staging_dir"] = serde_json::json!("staging-identity");
+            value["metadata_location"] = serde_json::json!("base-identity");
+            value["attempt"]["nonce"] = serde_json::to_value([0_u8; 16]).unwrap();
+            value["published_snapshot_id"] = serde_json::json!(1);
+            let bytes = serde_json::to_vec(&value).unwrap();
+            match &normalized {
+                None => normalized = Some(bytes),
+                Some(expected) => assert_eq!(
+                    &bytes, expected,
+                    "owned file count cannot enlarge recovery facts"
                 ),
-            },
-            &intent,
-            &current,
-        )
-        .unwrap();
-        engine
-            .stage(&crate::commit::fast_append::FastAppendPreparer)
-            .await
-            .unwrap();
-        let mut references = sessions.clone();
-        references.push(operation_object.clone());
-        let request = engine.freeze(&references).unwrap();
-        let evidence = fixture
-            .template
-            .encode(&request, &fixture.operation)
-            .unwrap();
-        let payload: RecoveryPayload =
-            super::super::recovery_codec::decode(evidence.provider_payload()).unwrap();
-        payload.validate_facts(&fixture.template).unwrap();
-        let records = fixture.operation.artifacts().unwrap();
-        assert_eq!(payload.artifacts.len(), records.len());
-        for (object, record) in payload.artifacts.iter().zip(records) {
-            assert_eq!(object.path, record.object.path());
-            assert_eq!(object.attempt, record.attempt.map(RecoveryAttempt::from));
-            let class = match record.class {
-                ArtifactClass::SessionData => OwnedClass::SessionData,
-                ArtifactClass::Operation => OwnedClass::Operation,
-                ArtifactClass::Attempt => OwnedClass::Attempt,
-                ArtifactClass::ExternalRegistered => {
-                    panic!("borrowed object entered actual owned test ledger")
-                }
-            };
-            let state = match record.write_state {
-                crate::commit::model::ArtifactWriteState::Allocated => WriteState::Allocated,
-                crate::commit::model::ArtifactWriteState::Writing => WriteState::Writing,
-                crate::commit::model::ArtifactWriteState::Written => WriteState::Written,
-            };
-            assert_eq!(object.class, class);
-            assert_eq!(object.state, state);
+            }
+            assert!(sessions.iter().all(|object| {
+                std::path::Path::new(object.path().strip_prefix("file://").unwrap()).exists()
+            }));
         }
-        let paths = |indices: &[u32]| -> Vec<ObjectIdentity> {
-            indices
-                .iter()
-                .map(|index| {
-                    ObjectIdentity::new(payload.artifacts[*index as usize].path.clone()).unwrap()
-                })
-                .collect()
-        };
-        assert_eq!(
-            paths(&payload.attempt_owned),
-            request.artifacts().attempt_owned()
-        );
-        assert_eq!(
-            paths(&payload.operation_references),
-            request.artifacts().operation_references()
-        );
-        assert_eq!(
-            paths(&payload.session_references),
-            request.artifacts().session_references()
-        );
-        assert_eq!(payload.session_references.len(), 1221);
-        assert_eq!(payload.operation_references.len(), 1);
-        assert!(!payload.attempt_owned.is_empty());
-        let old = payload
-            .artifacts
-            .iter()
-            .find(|object| object.path == old_object.path())
-            .unwrap();
-        assert_eq!(old.state, WriteState::Allocated);
-        assert_eq!(old.attempt, Some(old_attempt.attempt_token().into()));
-        let raw = serde_json::to_vec(&payload).unwrap();
-        assert!(raw.len() > novarocks_spi::connector::MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES);
-        assert!(
-            evidence.provider_payload().len()
-                <= novarocks_spi::connector::MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES
-        );
-        assert_eq!(
-            super::super::recovery_codec::encode(&payload).unwrap(),
-            evidence.provider_payload().as_ref()
-        );
-        println!(
-            "Recovery codec actual owned objects={} raw_json_bytes={} encoded_bytes={}",
-            payload.artifacts.len(),
-            raw.len(),
-            evidence.provider_payload().len()
-        );
-        assert_eq!(
-            fixture.operation.artifacts().unwrap().len(),
-            payload.artifacts.len()
-        );
-        assert!(sessions.iter().all(|object| {
-            std::path::Path::new(object.path().strip_prefix("file://").unwrap()).exists()
-        }));
     }
 
     #[tokio::test]
@@ -1637,26 +1745,15 @@ mod recovery_tests {
         let fixture = Fixture::new();
         let session_object = fixture.adopt(0);
         let old_attempt = fixture.operation.begin_attempt().unwrap();
-        let old_object = old_attempt
-            .allocate(ArtifactClass::Attempt, ArtifactKind::Statistics)
+        let old_object = old_attempt.allocate(ArtifactKind::Statistics).unwrap();
+        let operation_path = fixture.directory.path().join("operation-metadata.json");
+        std::fs::write(&operation_path, b"operation metadata").unwrap();
+        let operation_object =
+            ObjectIdentity::new(format!("file://{}", operation_path.display())).unwrap();
+        fixture
+            .operation
+            .adopt_operation_reference(operation_object.clone())
             .unwrap();
-        let operation_object = old_attempt
-            .allocate(ArtifactClass::Operation, ArtifactKind::Metadata)
-            .unwrap();
-        // Leave one old allocated output in the ledger: failed cleanup/recovery
-        // must retain its actual state, rather than claiming all objects written.
-        let mut writer = old_attempt
-            .file_io()
-            .new_output(operation_object.path())
-            .unwrap()
-            .writer()
-            .await
-            .unwrap();
-        writer
-            .write(Bytes::from_static(b"operation metadata"))
-            .await
-            .unwrap();
-        writer.close().await.unwrap();
         let publisher = publisher(&fixture);
         let report = attempt::run(
             &fixture.operation,
@@ -1674,32 +1771,37 @@ mod recovery_tests {
         assert_eq!(publisher.dispatches.load(Ordering::SeqCst), 1);
         assert!(matches!(report.cleanup, IcebergCleanupReport::NotAttempted));
         let evidence = publisher.checked.lock().unwrap().clone().unwrap();
-        let payload: RecoveryPayload =
-            super::super::recovery_codec::decode(evidence.provider_payload()).unwrap();
+        let payload: RecoveryPayload = serde_json::from_slice(evidence.provider_payload()).unwrap();
         payload.validate_facts(&fixture.template).unwrap();
         assert_eq!(payload.operation_id, fixture.operation.token().to_bytes());
         assert_eq!(
             payload.attempt.ordinal,
             old_attempt.attempt_token().ordinal() + 1
         );
-        assert_eq!(
-            payload.artifacts.len(),
-            fixture.operation.artifacts().unwrap().len()
-        );
-        let old = payload
-            .artifacts
+        let records = fixture.operation.artifacts().unwrap();
+        let old = records
             .iter()
-            .find(|a| a.path == old_object.path())
+            .find(|record| record.object == old_object)
             .unwrap();
-        assert_eq!(old.state, WriteState::Allocated);
-        assert_eq!(old.attempt, Some(old_attempt.attempt_token().into()));
+        assert_eq!(
+            old.write_state,
+            crate::commit::model::ArtifactWriteState::Allocated
+        );
         assert!(
-            payload
-                .artifacts
+            matches!(old.origin, ArtifactOrigin::Produced { attempt, .. }
+            if attempt == old_attempt.attempt_token())
+        );
+        assert!(
+            records
                 .iter()
-                .any(|a| a.path == operation_object.path()
-                    && a.class == OwnedClass::Operation
-                    && a.state == WriteState::Written)
+                .any(|record| record.object == operation_object
+                    && matches!(
+                        record.origin,
+                        ArtifactOrigin::Received {
+                            publishes: ReceivedPublication::WithRequest
+                        }
+                    )
+                    && record.write_state == crate::commit::model::ArtifactWriteState::Written)
         );
         assert!(
             std::path::Path::new(session_object.path().strip_prefix("file://").unwrap()).exists()
@@ -1711,15 +1813,17 @@ mod recovery_tests {
         tampered.attempt.nonce = [0; 16];
         assert!(tampered.validate_facts(&fixture.template).is_err());
         let mut tampered = payload.clone();
-        tampered.attempt_owned.clear();
+        tampered.document_record_digest = Some([1; 32]);
         assert!(tampered.validate_facts(&fixture.template).is_err());
+        let mut old_version = payload.clone();
+        old_version.version -= 1;
+        assert!(old_version.validate_facts(&fixture.template).is_err());
         let mut json = serde_json::to_value(&payload).unwrap();
         json["deleted_objects"] = serde_json::json!([]);
         assert!(serde_json::from_value::<RecoveryPayload>(json).is_err());
-        let mut nested = serde_json::to_value(&payload).unwrap();
-        nested["artifacts"][0]["unknown"] = serde_json::json!(true);
-        let nested = super::super::recovery_codec::encode(&nested).unwrap();
-        assert!(super::super::recovery_codec::decode::<RecoveryPayload>(&nested).is_err());
+        let mut old_envelope = serde_json::to_value(&payload).unwrap();
+        old_envelope["artifacts"] = serde_json::json!([]);
+        assert!(serde_json::from_value::<RecoveryPayload>(old_envelope).is_err());
     }
 }
 
@@ -1898,8 +2002,8 @@ mod keyed_preparation_tests {
                 .keys()
                 .any(|key| crate::document_storage::keyed::keys::is_legacy_key(key))
         );
-        let frozen = engine.freeze(&[]).unwrap();
-        assert_eq!(frozen.artifacts().attempt_owned().len(), 1);
+        let frozen = engine.freeze().unwrap();
+        assert_eq!(frozen.artifacts().references().len(), 1);
         let writes: Vec<_> = frozen
             .updates()
             .iter()

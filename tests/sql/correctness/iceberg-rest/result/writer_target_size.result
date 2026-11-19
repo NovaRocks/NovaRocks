@@ -1,0 +1,9 @@
+-- query 2
+-- types	boolean	bigint
+rolled	rows_in_files
+true	20000
+
+-- query 3
+-- types	bigint	bigint
+n	id_sum
+20000	200010000

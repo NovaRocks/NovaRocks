@@ -55,9 +55,12 @@ impl Expressions for EncodedExpressions<'_, '_, '_> {
         self.pools()
     }
     fn scalar(&self, id: u32, w: &mut CompileCheckpoints<'_>) -> Result<(), Error> {
-        let constant = self
-            .expression_observed(id, w)?
-            .is_some_and(|expr| matches!(expr.kind, p::ExprKind::Constant(_)));
+        let constant = self.root_expression_observed(id, w)?.is_some_and(|expr| {
+            matches!(
+                expr.kind,
+                novarocks_expression_contract::ExprKind::Constant(_)
+            )
+        });
         w.step()?;
         if constant {
             Ok(())
@@ -82,10 +85,10 @@ impl Expressions for DecodedExpressions<'_, '_, '_> {
         self.pools()
     }
     fn scalar(&self, id: u32, w: &mut CompileCheckpoints<'_>) -> Result<(), Error> {
-        let constant = self.definition_observed(id, w)?.is_some_and(|expr| {
+        let constant = self.root_definition_observed(id, w)?.is_some_and(|expr| {
             matches!(
                 expr.kind,
-                Some(wire::expression_definition::Kind::Literal(_))
+                Some(wire::expression_definition::Kind::Constant(_))
             )
         });
         w.step()?;
@@ -153,7 +156,7 @@ pub(crate) fn delegate_counts(
 /// the original enclosing loop.
 pub(crate) fn encode_constant(input: &p::UnpivotConstant) -> wire::UnpivotConstant {
     let kind = match input {
-        p::UnpivotConstant::Scalar(id) => wire::unpivot_constant::Kind::ScalarExprId(id.get()),
+        p::UnpivotConstant::Scalar(id) => wire::unpivot_constant::Kind::ScalarRoot(id.get()),
         p::UnpivotConstant::Int32List(reference) => {
             wire::unpivot_constant::Kind::Int32List(encode_address(*reference))
         }
@@ -170,8 +173,8 @@ pub(crate) fn decode_constant(input: &wire::UnpivotConstant) -> Result<p::Unpivo
             .as_ref()
             .ok_or_else(|| invalid("prepared Unpivot constant kind is absent"))?
         {
-            wire::unpivot_constant::Kind::ScalarExprId(id) => {
-                p::UnpivotConstant::Scalar(p::ExprId::new(*id))
+            wire::unpivot_constant::Kind::ScalarRoot(id) => {
+                p::UnpivotConstant::Scalar(novarocks_expression_contract::RootOrdinal::new(*id))
             }
             wire::unpivot_constant::Kind::Int32List(reference) => {
                 p::UnpivotConstant::Int32List(decode_address(reference)?)
@@ -470,7 +473,7 @@ fn prepare_decode(
                 .ok_or_else(|| invalid("Unpivot constant kind is absent"));
             if parent.is_some() {
                 match &kind {
-                    Ok(wire::unpivot_constant::Kind::ScalarExprId(_)) => {
+                    Ok(wire::unpivot_constant::Kind::ScalarRoot(_)) => {
                         delegate_counts(&mut model, 1, 0, expressions)?;
                     }
                     Ok(_) => {
@@ -482,7 +485,7 @@ fn prepare_decode(
             gate(&model, known, &mut parent)?;
             w.step()?;
             match kind? {
-                wire::unpivot_constant::Kind::ScalarExprId(_) => scalars = add(scalars, 1)?,
+                wire::unpivot_constant::Kind::ScalarRoot(_) => scalars = add(scalars, 1)?,
                 _ => pools = add(pools, 1)?,
             }
         }
@@ -568,7 +571,7 @@ fn prepare_decode(
                 .as_ref()
                 .ok_or_else(|| invalid("Unpivot constant kind is absent"))?
             {
-                wire::unpivot_constant::Kind::ScalarExprId(id) => expressions.scalar(*id, w)?,
+                wire::unpivot_constant::Kind::ScalarRoot(id) => expressions.scalar(*id, w)?,
                 wire::unpivot_constant::Kind::Int32List(reference)
                 | wire::unpivot_constant::Kind::Utf8Map(reference) => {
                     address(decode_address(reference)?, expressions, w)?
@@ -616,6 +619,7 @@ fn emit_encode(
         w.step()?;
     }
     let node = wire::PhysicalNode {
+        expressions: None,
         id: input.id.get(),
         input_node_ids: inputs,
         required_inputs,
@@ -676,6 +680,7 @@ fn emit_decode(
     }
     let mappings = boxed(mappings, w)?;
     let node = p::PhysicalNode {
+        expressions: None,
         id: p::NodeId::new(input.id),
         inputs,
         required_inputs,

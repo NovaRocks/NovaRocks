@@ -224,6 +224,17 @@ pub(crate) struct ReadyProfileComputation {
 }
 
 impl ReadyProfileComputation {
+    /// A passive alias of the SAME watch and snapshot budget owner. No Source,
+    /// publisher, credential table, grant or Ready author is cloned.
+    #[cfg(all(test, novarocks_dev_controls))]
+    pub(crate) fn original_observer_for_fixture(&self) -> ProfileDiagnosticObserver {
+        self.payload
+            .observer
+            .as_ref()
+            .expect("same original profile observer")
+            .clone_for_fixture()
+    }
+
     pub(crate) const fn ready_token(&self) -> ComputationReadyToken {
         self.ready
     }
@@ -306,6 +317,15 @@ pub(crate) fn profile_computation_consumer(
     ),
     QueryExecutionError,
 > {
+    validate_profile_contract(description, plan)?;
+    let (offers, handoffs) = attempt_handoff_mailbox();
+    Ok(bind_profile_consumer(plan, offers, handoffs))
+}
+
+fn validate_profile_contract(
+    description: &FrozenExecutionDescription,
+    plan: PlanSeal,
+) -> Result<(), QueryExecutionError> {
     if description.finish_boundary() != ExecutionFinishBoundary::ComputationReady
         || !description.matches_plan_seal(plan)
         || description.effect() != ExecutionEffect::None
@@ -323,14 +343,54 @@ pub(crate) fn profile_computation_consumer(
             "Profile computation requires its exact effect-free CountOnly finish contract",
         ));
     }
-    let (offers, handoffs) = attempt_handoff_mailbox();
+    Ok(())
+}
+
+fn bind_profile_consumer(
+    plan: PlanSeal,
+    offers: AttemptHandoffOfferPort,
+    handoffs: AttemptHandoffClaimPort,
+) -> (
+    Arc<dyn InternalComputationConsumer>,
+    AttemptHandoffOfferPort,
+    ProfileComputationOutput,
+) {
     let receiving = Arc::new(ProfileReceivingHolder::new());
     let consumer: Arc<dyn InternalComputationConsumer> = Arc::new(ProfileComputationConsumer {
         plan,
         handoffs,
         receiving: Arc::clone(&receiving),
     });
-    Ok((consumer, offers, ProfileComputationOutput { receiving }))
+    (consumer, offers, ProfileComputationOutput { receiving })
+}
+
+/// Reuse the SAME existing directory for the handoff mechanism component.
+/// Validation borrows before taking either endpoint; refusal preserves the
+/// complete original pair. This is no Source/Ready/Scope constructor.
+#[cfg(all(test, novarocks_dev_controls))]
+pub(crate) fn profile_computation_consumer_with_handoff_for_fixture(
+    description: &FrozenExecutionDescription,
+    plan: PlanSeal,
+    original: &mut Option<(AttemptHandoffOfferPort, AttemptHandoffClaimPort)>,
+) -> Result<
+    (
+        Arc<dyn InternalComputationConsumer>,
+        AttemptHandoffOfferPort,
+        ProfileComputationOutput,
+    ),
+    QueryExecutionError,
+> {
+    validate_profile_contract(description, plan)?;
+    let (offers, claims) = original
+        .as_ref()
+        .ok_or_else(|| profile_error("original handoff endpoint pair is absent"))?;
+    if !offers.shares_directory_for_fixture(claims) {
+        return Err(profile_error(
+            "handoff endpoints belong to different original directories",
+        ));
+    }
+    let (offers, claims) = original.take().expect("validated original endpoint pair");
+    Ok(bind_profile_consumer(plan, offers, claims))
 }
 
 /// Concrete preparation connects the fixed consumer, exact handoff offer and

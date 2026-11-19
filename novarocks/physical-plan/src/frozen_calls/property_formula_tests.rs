@@ -18,6 +18,51 @@
 use super::super::property_proof::PropertyProofProjectionLimits;
 use super::*;
 
+fn use_id(at: usize) -> ExpressionUseId {
+    ExpressionUseId::new(match at {
+        0 => 0,
+        1 => u32::MAX,
+        n => u32::try_from(n - 1).unwrap(),
+    })
+}
+fn claim(fixture: &Fixture, at: usize) -> &novarocks_expression_contract::ExpressionCallClaim {
+    &fixture.claims()[&use_id(at)]
+}
+fn edit_claim(
+    fixture: &mut Fixture,
+    at: usize,
+    edit: impl FnOnce(&mut novarocks_expression_contract::ExpressionCallClaim),
+) {
+    fixture.edit_unit(|parts| edit(parts.claims.get_mut(&use_id(at)).unwrap()));
+}
+fn expression_failure(fixture: &Fixture, at: usize) -> FrozenCallError {
+    FrozenCallError::ReplicaExpression {
+        node: fixture.primary,
+        invocation: use_id(at),
+    }
+}
+fn legacy_scalar_volatile(fixture: &mut Fixture) {
+    fixture.edit_unit(|parts| {
+        for definition in &mut parts.definitions {
+            if let ExprKind::FunctionCall { function, .. } = &mut definition.kind {
+                function.legacy_metadata.as_mut().unwrap().volatility =
+                    FunctionVolatility::Volatile;
+            }
+        }
+    });
+}
+fn edit_relation(
+    fixture: &mut Fixture,
+    site: PhysicalCallSite,
+    edit: impl FnOnce(&mut FrozenPhysicalCall),
+) {
+    fixture.fragment = fixture
+        .candidate_relations(|calls| {
+            edit(calls.iter_mut().find(|call| call.site == site).unwrap());
+        })
+        .unwrap();
+}
+
 const SOURCE: usize = 4 * 1024 * 1024;
 const PROJECTION: PropertyProofProjectionLimits = PropertyProofProjectionLimits {
     max_request_bytes: 1024 * 1024,
@@ -52,14 +97,11 @@ impl PureCompileControl for FormulaControl {
 }
 fn run(
     fixture: &Fixture,
-    calls: &FrozenFragmentCalls,
     source: usize,
     control: &FormulaControl,
 ) -> Result<PropertyProofProjectionFacts, FragmentPropertyError> {
     validate_fragment_output_properties_observed(
         &fixture.fragment,
-        &fixture.uses,
-        calls,
         PlanLimits::FROZEN,
         source,
         PROJECTION,
@@ -79,19 +121,8 @@ fn broadcast(fixture: &mut Fixture) {
     });
 }
 fn legacy_volatile(fixture: &mut Fixture) {
+    legacy_scalar_volatile(fixture);
     edit(fixture, |parts| {
-        let definitions = parts
-            .expressions
-            .iter()
-            .map(|(_, e)| e.clone())
-            .collect::<Vec<_>>();
-        for mut definition in definitions {
-            if let ExprKind::FunctionCall { function, .. } = &mut definition.kind {
-                function.legacy_metadata.as_mut().unwrap().volatility =
-                    FunctionVolatility::Volatile;
-            }
-            parts.expressions.insert(definition);
-        }
         for node in parts.nodes.values_mut() {
             if let NodeKind::TableFunction { function, .. } = &mut node.kind {
                 function.legacy_metadata.as_mut().unwrap().volatility =
@@ -128,31 +159,40 @@ fn prefixes(
 
 #[test]
 fn frozen_property_formulas_use_complete_occurrences_despite_legacy_volatile_and_keep_row_errors() {
-    let mut fixture = scalar_fixture(2, u32::MAX);
+    let mut constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let mut fixture = scalar_fixture(2, u32::MAX, &mut constants);
     broadcast(&mut fixture);
     legacy_volatile(&mut fixture);
-    assert!(validate_fragment_definition(&fixture.fragment).is_err());
-    assert_eq!(fixture.calls[0].context.use_id, ExpressionUseId::new(0));
-    assert_eq!(
-        fixture.calls[1].context.use_id,
-        ExpressionUseId::new(u32::MAX)
-    );
+    // The full local gate now consumes the installed claims as well.
+    validate_fragment_definition(&fixture.fragment).unwrap();
+    assert_eq!(claim(&fixture, 0).context.use_id, use_id(0));
+    assert_eq!(claim(&fixture, 1).context.use_id, use_id(1));
     assert_ne!(
-        fixture.calls[0].context.domain,
-        fixture.calls[1].context.domain
+        claim(&fixture, 0).context.region,
+        claim(&fixture, 1).context.region
     );
-    for call in &mut fixture.calls {
-        call.effects.own_row_error = FunctionIntrinsicRowError::MayRaise;
-        call.effects.failure_behavior = FunctionFailureBehavior::ReturnsNull;
-    }
-    let calls = fixture.checked().unwrap();
-    let facts = run(&fixture, &calls, SOURCE, &FormulaControl::default()).unwrap();
+    fixture.edit_unit(|parts| {
+        for call in parts.claims.values_mut() {
+            call.effects.own_row_error = FunctionIntrinsicRowError::MayRaise;
+            call.effects.failure_behavior = FunctionFailureBehavior::ReturnsNull;
+        }
+    });
+    let original = fixture.claims().clone();
+    let facts = run(&fixture, SOURCE, &FormulaControl::default()).unwrap();
     assert!(facts.request_bytes > 0);
-    for call in &fixture.calls {
-        assert_eq!(calls.entries()[&call.site].effects, call.effects);
+    assert_eq!(fixture.claims(), &original);
+    for call in fixture.claims().values() {
         assert_eq!(
             call.effects.proof_scope,
-            CallProofScope::Domain(call.context.domain)
+            CallProofScope::Region(call.context.region)
+        );
+        assert_eq!(
+            call.effects.own_row_error,
+            FunctionIntrinsicRowError::MayRaise
+        );
+        assert_eq!(
+            call.effects.failure_behavior,
+            FunctionFailureBehavior::ReturnsNull
         );
     }
     assert_eq!(
@@ -161,46 +201,46 @@ fn frozen_property_formulas_use_complete_occurrences_despite_legacy_volatile_and
             .distribution,
         Distribution::Broadcast
     );
-    // This is replication proof, not permission to erase or hoist row errors.
 }
 
 #[test]
 fn frozen_property_formulas_reject_each_sparse_unsafe_use_with_exact_global_replica_site() {
+    let mut constants = crate::tests::constant_fixture::ConstantFixture::new();
     for at in 0..2 {
         for mode in 0..4 {
-            let mut fixture = scalar_fixture(2, 23);
+            let mut fixture = scalar_fixture(2, 23, &mut constants);
             broadcast(&mut fixture);
-            match mode {
-                0 => {
-                    fixture.calls[at].effects.instance_state = FunctionInstanceState::ScalarInstance
-                }
-                1 => fixture.calls[at].effects.observable_effects.warnings = true,
-                2 => fixture.calls[at].effects.observable_effects.rng_sampling = true,
-                3 => fixture.calls[at].effects.value_stability = FunctionVolatility::Stable,
+            edit_claim(&mut fixture, at, |call| match mode {
+                0 => call.effects.instance_state = FunctionInstanceState::ScalarInstance,
+                1 => call.effects.observable_effects.warnings = true,
+                2 => call.effects.observable_effects.rng_sampling = true,
+                3 => call.effects.value_stability = FunctionVolatility::Stable,
                 _ => unreachable!(),
-            }
-            let calls = fixture.checked().unwrap();
-            assert!(matches!(
-                run(&fixture, &calls, SOURCE, &FormulaControl::default()),
-                Err(FragmentPropertyError::Calls(FrozenCallError::ReplicaEquivalence(site))) if site == fixture.calls[at].site
-            ));
+            });
+            assert!(
+                matches!(run(&fixture,SOURCE,&FormulaControl::default()),Err(FragmentPropertyError::Calls(actual)) if actual==expression_failure(&fixture,at))
+            );
         }
     }
 }
 
 #[test]
 fn frozen_property_formulas_single_copy_does_not_impose_replication_or_drop_effects() {
-    let mut fixture = scalar_fixture(2, 29);
-    fixture.calls[0].effects.instance_state = FunctionInstanceState::ScalarInstance;
-    fixture.calls[0].effects.observable_effects.rng_sampling = true;
-    fixture.calls[1].effects.value_stability = FunctionVolatility::Volatile;
-    fixture.calls[1].effects.own_row_error = FunctionIntrinsicRowError::MayRaise;
-    let calls = fixture.checked().unwrap();
-    run(&fixture, &calls, SOURCE, &FormulaControl::default()).unwrap();
+    let mut constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let mut fixture = scalar_fixture(2, 29, &mut constants);
+    edit_claim(&mut fixture, 0, |c| {
+        c.effects.instance_state = FunctionInstanceState::ScalarInstance;
+        c.effects.observable_effects.rng_sampling = true;
+    });
+    edit_claim(&mut fixture, 1, |c| {
+        c.effects.value_stability = FunctionVolatility::Volatile;
+        c.effects.own_row_error = FunctionIntrinsicRowError::MayRaise;
+    });
+    let original = fixture.claims().clone();
+    run(&fixture, SOURCE, &FormulaControl::default()).unwrap();
+    assert_eq!(fixture.claims(), &original);
     assert_eq!(
-        calls.entries()[&fixture.calls[0].site]
-            .effects
-            .instance_state,
+        claim(&fixture, 0).effects.instance_state,
         FunctionInstanceState::ScalarInstance
     );
     assert_eq!(
@@ -209,12 +249,18 @@ fn frozen_property_formulas_single_copy_does_not_impose_replication_or_drop_effe
     );
 }
 
-fn table_fixture() -> Fixture {
+fn table_source(
+    scalar_input: bool,
+    fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
+) -> Fixture {
+    use novarocks_expression_contract::{BoundExprSetBuilder, ExprPort, RootScope};
     let mut builder = FragmentBuilder::new(FragmentId::new(37));
-    let (input, _) = add_values(&mut builder, 1, false);
+    let input = add_values(&mut builder, 1, scalar_input, fixture_constants);
     let input_value = ValueId::new(0);
-    assert!(matches!(builder.value(input_value).unwrap().origin,
-        ValueOrigin::NodeOutput { node, output_ordinal: 0 } if node == input));
+    assert!(
+        matches!(builder.value(input_value).unwrap().origin,ValueOrigin::NodeOutput{node,output_ordinal:0} if node==input)
+    );
+    let input_type = if scalar_input { boolean() } else { integer() };
     let table = builder.reserve_node_id().unwrap();
     let output = builder
         .add_value(
@@ -226,6 +272,18 @@ fn table_fixture() -> Fixture {
         )
         .unwrap();
     let selected = function(FunctionKind::Table, integer());
+    let mut unit_builder = BoundExprSetBuilder::new(unit_limits());
+    let arguments = if scalar_input {
+        let def = unit_builder
+            .add(None, input_type.clone(), ExprKind::Value(input_value))
+            .unwrap();
+        // Value leaves use their intrinsic Eager flow; no function control record.
+        Box::from([unit_builder
+            .root(def, EvaluationDemand::Value, RootScope::Port(0))
+            .unwrap()])
+    } else {
+        Box::default()
+    };
     install_node(
         &mut builder,
         table,
@@ -236,28 +294,18 @@ fn table_fixture() -> Fixture {
                 function_id: selected.function_id,
                 overload: selected.overload,
                 argument_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(
-                    Box::default(),
+                    if scalar_input {
+                        Box::from([FunctionArgumentType::Value(input_type.clone())])
+                    } else {
+                        Box::default()
+                    },
                 ),
                 result_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::from(
                     [integer()],
                 )),
-                legacy_metadata: Some(crate::LegacyBindingMetadata {
-                    volatility: selected.legacy_metadata.as_ref().unwrap().volatility,
-                    argument_evaluation: selected
-                        .legacy_metadata
-                        .as_ref()
-                        .unwrap()
-                        .argument_evaluation,
-                    failure_behavior: selected.legacy_metadata.as_ref().unwrap().failure_behavior,
-                    intrinsic_row_error: selected
-                        .legacy_metadata
-                        .as_ref()
-                        .unwrap()
-                        .intrinsic_row_error,
-                    semantic_parameters: Box::default(),
-                }),
+                legacy_metadata: selected.legacy_metadata,
             },
-            arguments: Box::default(),
+            arguments,
             outputs: Box::from([
                 TableFunctionOutput::PassThrough(input_value),
                 TableFunctionOutput::FunctionResult {
@@ -268,81 +316,119 @@ fn table_fixture() -> Fixture {
             left_outer: false,
         },
     );
+    if scalar_input {
+        let control = Control::default();
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
+        let sealed = unit_builder
+            .seal(
+                vec![ExprPort {
+                    values: Box::from([(input_value, input_type.clone())]),
+                }],
+                &mut work,
+            )
+            .unwrap();
+        let unit = sealed.finish(BTreeMap::new(), &mut work).unwrap();
+        work.finish().unwrap();
+        builder.install_unit(table, Arc::new(unit)).unwrap();
+    }
     let fragment = builder
-        .finish_definition(
+        .finish_structure(
             table,
             FragmentSink::Noop,
             dop(),
-            crate::StagePlacementPolicy::Singleton,
+            PlanLimits::FROZEN,
+            &Control::default(),
+            StagePlacementPolicy::Singleton,
         )
         .unwrap();
-    let uses = leaf_roots(&fragment);
-    let current = context(1, 0, EvaluationDemand::Value);
-    let mut fixture = Fixture {
-        fragment,
-        uses,
-        calls: vec![FrozenPhysicalCall {
-            materialized_writer_input: None,
-            regexp_count_pattern_source: None,
-            to_base64_byte_source: None,
-            temporal_source: None,
-            site: PhysicalCallSite::Table { node: table },
-            context: current,
-            effects: effects(FunctionKind::Table, current.domain),
-            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-        }],
-    };
-    edit(&mut fixture, |parts| {
-        for node in parts.nodes.values_mut() {
-            node.output_properties.distribution = Distribution::Broadcast;
-            node.output_properties.row_multiplicity = RowMultiplicity::Replicated;
-            for required in &mut node.required_inputs {
-                required.distribution = Distribution::Broadcast;
-                required.row_multiplicity = RowMultiplicity::Replicated;
-            }
+    let site = PhysicalCallSite::Table { node: table };
+    let mut request = zero_argument_request();
+    if scalar_input {
+        request.logical_argument_count = 1;
+        request.arguments = Box::from([crate::StaticFunctionArgument::Value {
+            value_type: input_type.clone(),
+            constant: None,
+        }]);
+    }
+    let fragment = fragment
+        .with_call_requests_observed(vec![(site, request)], &Control::default())
+        .unwrap();
+    let context = novarocks_type_contract::RelationEffectContext::call(
+        novarocks_type_contract::RelationCallId::new(1),
+    );
+    let fragment = fragment
+        .with_calls_observed(
+            vec![FrozenPhysicalCall {
+                site,
+                context,
+                materialized_writer_input: None,
+                effects: declared_effects(
+                    FunctionKind::Table,
+                    CallProofScope::Relation(context.identity),
+                ),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            }],
+            &Control::default(),
+        )
+        .unwrap();
+    let mut parts = fragment.into_parts();
+    for node in parts.nodes.values_mut() {
+        node.output_properties.distribution = Distribution::Broadcast;
+        node.output_properties.row_multiplicity = RowMultiplicity::Replicated;
+        for required in &mut node.required_inputs {
+            required.distribution = Distribution::Broadcast;
+            required.row_multiplicity = RowMultiplicity::Replicated;
         }
-    });
-    fixture
+    }
+    Fixture {
+        fragment: parts.into(),
+        primary: input,
+    }
+}
+
+fn table_fixture(constants: &mut crate::tests::constant_fixture::ConstantFixture) -> Fixture {
+    table_source(false, constants)
 }
 
 #[test]
 fn frozen_property_formulas_canonical_relational_lifecycle_is_not_scalar_state() {
-    let mut fixture = table_fixture();
+    let mut constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let mut fixture = table_fixture(&mut constants);
     legacy_volatile(&mut fixture);
-    assert!(validate_fragment_definition(&fixture.fragment).is_err());
+    validate_fragment_definition(&fixture.fragment).unwrap();
+    let site = *fixture.relations().keys().next().unwrap();
     assert_eq!(
-        fixture.calls[0].effects.instance_state,
+        fixture.relations()[&site].effects.instance_state,
         FunctionInstanceState::TableInstance
     );
-    let calls = fixture.checked().unwrap();
-    run(&fixture, &calls, SOURCE, &FormulaControl::default()).unwrap();
-    fixture.calls[0].effects.observable_effects.warnings = true;
-    let calls = fixture.checked().unwrap();
+    run(&fixture, SOURCE, &FormulaControl::default()).unwrap();
+    edit_relation(&mut fixture, site, |c| {
+        c.effects.observable_effects.warnings = true
+    });
     assert!(
-        matches!(run(&fixture, &calls, SOURCE, &FormulaControl::default()),
-        Err(FragmentPropertyError::Calls(FrozenCallError::ReplicaEquivalence(site))) if site == fixture.calls[0].site)
+        matches!(run(&fixture,SOURCE,&FormulaControl::default()),Err(FragmentPropertyError::Calls(FrozenCallError::ReplicaEquivalence(actual))) if actual==site)
     );
-    let relational = special_fixture();
-    let calls = relational.checked().unwrap();
-    run(&relational, &calls, SOURCE, &FormulaControl::default()).unwrap();
+    let relational = special_fixture(&mut constants);
+    run(&relational, SOURCE, &FormulaControl::default()).unwrap();
     assert!(
         relational
-            .calls
-            .iter()
-            .any(|call| call.effects.instance_state == FunctionInstanceState::AggregateInstance)
+            .relations()
+            .values()
+            .any(|c| c.effects.instance_state == FunctionInstanceState::AggregateInstance)
     );
     assert!(
         relational
-            .calls
-            .iter()
-            .any(|call| call.effects.instance_state == FunctionInstanceState::WindowPartition)
+            .relations()
+            .values()
+            .any(|c| c.effects.instance_state == FunctionInstanceState::WindowPartition)
     );
 }
 
 #[test]
 fn frozen_property_formulas_keep_required_inputs_ordering_and_geometry_rejections() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     for bad in 0..3 {
-        let mut fixture = table_fixture();
+        let mut fixture = table_fixture(&mut fixture_constants);
         edit(&mut fixture, |parts| {
             let root = parts.nodes.get_mut(&parts.root).unwrap();
             match bad {
@@ -358,16 +444,15 @@ fn frozen_property_formulas_keep_required_inputs_ordering_and_geometry_rejection
                 _ => unreachable!(),
             }
         });
-        let calls = fixture.checked().unwrap();
         assert!(
             matches!(
-                run(&fixture, &calls, SOURCE, &FormulaControl::default()),
+                run(&fixture, SOURCE, &FormulaControl::default()),
                 Err(FragmentPropertyError::Structure(_))
             ),
             "malformed shape {bad}"
         );
     }
-    let mut fixture = scalar_fixture(1, 43);
+    let mut fixture = scalar_fixture(1, 43, &mut fixture_constants);
     broadcast(&mut fixture);
     edit(&mut fixture, |parts| {
         let value = parts.nodes[&parts.root].output.columns[0];
@@ -382,75 +467,128 @@ fn frozen_property_formulas_keep_required_inputs_ordering_and_geometry_rejection
             null_ordering: NullOrdering::First,
         }])
     });
-    let calls = fixture.checked().unwrap();
     assert!(matches!(
-        run(&fixture, &calls, SOURCE, &FormulaControl::default()),
+        run(&fixture, SOURCE, &FormulaControl::default()),
         Err(FragmentPropertyError::Structure(_))
     ));
 }
 
+fn broadcast_input_read_fixture(
+    constants: &mut crate::tests::constant_fixture::ConstantFixture,
+) -> Fixture {
+    use novarocks_expression_contract::{BoundExprSetBuilder, ExprPort, RootScope};
+    let mut builder = FragmentBuilder::new(FragmentId::new(47));
+    let input = add_values(&mut builder, 1, false, constants);
+    let value = ValueId::new(0);
+    let node = builder.reserve_node_id().unwrap();
+    let mut draft = BoundExprSetBuilder::new(unit_limits());
+    let def = draft.add(None, integer(), ExprKind::Value(value)).unwrap();
+    // Value leaves use their intrinsic Eager flow; no function control record.
+    let root = draft
+        .root(def, EvaluationDemand::Value, RootScope::Port(0))
+        .unwrap();
+    let output = builder
+        .add_value(integer(), ValueOrigin::Expr { node, root })
+        .unwrap();
+    let control = Control::default();
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
+    let sealed = draft
+        .seal(
+            vec![ExprPort {
+                values: Box::from([(value, integer())]),
+            }],
+            &mut work,
+        )
+        .unwrap();
+    let unit = sealed.finish(BTreeMap::new(), &mut work).unwrap();
+    work.finish().unwrap();
+    install_node(
+        &mut builder,
+        node,
+        vec![input],
+        vec![output],
+        NodeKind::Project {
+            expressions: Box::from([(root, output)]),
+        },
+    );
+    builder.install_unit(node, Arc::new(unit)).unwrap();
+    let fragment = builder
+        .finish_definition(
+            node,
+            FragmentSink::Noop,
+            dop(),
+            StagePlacementPolicy::Singleton,
+        )
+        .unwrap()
+        .with_call_requests_observed(vec![], &Control::default())
+        .unwrap()
+        .with_calls_observed(vec![], &Control::default())
+        .unwrap();
+    let mut fixture = Fixture {
+        fragment,
+        primary: input,
+    };
+    edit(&mut fixture, |parts| {
+        for node in parts.nodes.values_mut() {
+            node.output_properties.distribution = Distribution::Broadcast;
+            node.output_properties.row_multiplicity = RowMultiplicity::Replicated;
+            for required in &mut node.required_inputs {
+                required.distribution = Distribution::Broadcast;
+                required.row_multiplicity = RowMultiplicity::Replicated;
+            }
+        }
+    });
+    fixture
+}
+
 #[test]
 fn frozen_property_formulas_keep_closed_values_scope_separate_from_legacy_volatility() {
-    let mut fixture = scalar_fixture(1, 47);
+    let mut constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let mut fixture = scalar_fixture(1, 47, &mut constants);
     broadcast(&mut fixture);
     legacy_volatile(&mut fixture);
-    let root_expression = fixture.uses.flow().uses()[&ExpressionUseId::new(0)].definition;
     assert!(crate::expression::expressions_have_closed_value_scope(
-        fixture.fragment.expressions(),
-        [root_expression]
+        fixture.unit(),
+        [RootOrdinal::new(0)]
     ));
-    let calls = fixture.checked().unwrap();
-    run(&fixture, &calls, SOURCE, &FormulaControl::default()).unwrap();
-    edit(&mut fixture, |parts| {
-        let mut expression = parts.expressions.get(root_expression).unwrap().clone();
-        expression.kind = ExprKind::Value(parts.nodes[&parts.root].output.columns[0]);
-        parts.expressions.insert(expression);
-    });
-    let roots = PhysicalExpressionRoots::try_new(&fixture.fragment, &Control::default()).unwrap();
-    let current = context(0, 0, EvaluationDemand::Value);
-    let flow = ExpressionControlFlow::try_new(
-        vec![domain(0)],
-        vec![ExpressionInvocation {
-            context: current,
-            definition: root_expression,
-            control: ControlShape::Eager,
-            arguments: Box::default(),
-        }],
-        fixture.fragment.expressions(),
-        CompilePhase::Validate,
-        &Control::default(),
-    )
-    .unwrap();
-    fixture.uses = PhysicalRootUses::try_new(
-        &fixture.fragment,
-        flow,
-        roots
-            .sites()
-            .keys()
-            .map(|site| (*site, current.use_id))
-            .collect(),
-        &Control::default(),
-    )
-    .unwrap();
-    fixture.calls.clear();
+    run(&fixture, SOURCE, &FormulaControl::default()).unwrap();
+    // A checked Value definition requires an actual declared port; the old
+    // self-output Values injection belongs to the unit gate (see owner candidate).
+    let mut input_read = broadcast_input_read_fixture(&mut constants);
+    let unit = input_read
+        .fragment
+        .unit(input_read.fragment.root())
+        .unwrap();
     assert!(!crate::expression::expressions_have_closed_value_scope(
-        fixture.fragment.expressions(),
-        [root_expression]
+        unit,
+        [RootOrdinal::new(0)]
     ));
-    let calls = fixture.checked().unwrap();
+    run(&input_read, SOURCE, &FormulaControl::default()).unwrap();
+    // Reusing that valid input-reading unit on the zero-input Values source is
+    // independently rejected by the node-port correspondence author.
+    let borrowed = Arc::clone(
+        input_read.fragment.nodes()[&input_read.fragment.root()]
+            .expressions
+            .as_ref()
+            .unwrap(),
+    );
+    let source_node = input_read.primary;
+    edit(&mut input_read, |parts| {
+        parts.nodes.get_mut(&source_node).unwrap().expressions = Some(borrowed)
+    });
     assert!(matches!(
-        run(&fixture, &calls, SOURCE, &FormulaControl::default()),
+        run(&input_read, SOURCE, &FormulaControl::default()),
         Err(FragmentPropertyError::Structure(_))
     ));
 }
 
 #[test]
 fn frozen_property_formulas_success_ordinary_and_exact_call_error_observe_all_original_tails() {
-    let mut fixture = scalar_fixture(2, 53);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let mut fixture = scalar_fixture(2, 53, &mut fixture_constants);
     broadcast(&mut fixture);
-    let calls = fixture.checked().unwrap();
-    prefixes(|control| run(&fixture, &calls, SOURCE, control), true, true);
-    prefixes(|control| run(&fixture, &calls, 0, control), false, true);
+    prefixes(|control| run(&fixture, SOURCE, control), true, true);
+    prefixes(|control| run(&fixture, 0, control), false, true);
     let mut malformed = fixture;
     edit(&mut malformed, |parts| {
         let value = parts.nodes[&parts.root].output.columns[0];
@@ -465,31 +603,24 @@ fn frozen_property_formulas_success_ordinary_and_exact_call_error_observe_all_or
             null_ordering: NullOrdering::First,
         }])
     });
-    prefixes(
-        |control| run(&malformed, &calls, SOURCE, control),
-        false,
-        true,
-    );
-    let mut unsafe_fixture = scalar_fixture(2, 59);
+    prefixes(|control| run(&malformed, SOURCE, control), false, true);
+    let mut unsafe_fixture = scalar_fixture(2, 59, &mut fixture_constants);
     broadcast(&mut unsafe_fixture);
-    unsafe_fixture.calls[1].effects.observable_effects.warnings = true;
-    let unsafe_calls = unsafe_fixture.checked().unwrap();
-    prefixes(
-        |control| run(&unsafe_fixture, &unsafe_calls, SOURCE, control),
-        false,
-        true,
-    );
+    edit_claim(&mut unsafe_fixture, 1, |c| {
+        c.effects.observable_effects.warnings = true
+    });
+    prefixes(|control| run(&unsafe_fixture, SOURCE, control), false, true);
 }
 
 #[test]
 fn frozen_property_formulas_real_wide_occurrences_keep_actual_quantum_and_sampled_primary_prefixes()
 {
-    let mut fixture = scalar_fixture(320, 61);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let mut fixture = scalar_fixture(320, 61, &mut fixture_constants);
     broadcast(&mut fixture);
     legacy_volatile(&mut fixture);
-    let calls = fixture.checked().unwrap();
     let control = FormulaControl::default();
-    run(&fixture, &calls, SOURCE, &control).unwrap();
+    run(&fixture, SOURCE, &control).unwrap();
     assert!(
         control
             .trace
@@ -498,9 +629,5 @@ fn frozen_property_formulas_real_wide_occurrences_keep_actual_quantum_and_sample
             .iter()
             .any(|(_, units)| *units == 256)
     );
-    prefixes(
-        |control| run(&fixture, &calls, SOURCE, control),
-        true,
-        false,
-    );
+    prefixes(|control| run(&fixture, SOURCE, control), true, false);
 }

@@ -57,6 +57,9 @@ fn union_catalog() -> PureEngineFunctionCatalog {
     builder.seal_pure(installed).unwrap()
 }
 fn union_program(ty: DataType, two_phase: bool) -> Arc<LocalProgram> {
+    let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
+    let parameters = novarocks_type_contract::SemanticParameters::try_new([]).unwrap();
+
     let catalog = union_catalog();
     let bound = bind(
         &catalog,
@@ -64,7 +67,11 @@ fn union_program(ty: DataType, two_phase: bool) -> Arc<LocalProgram> {
         &[FunctionValueType::new(ty.clone(), true)],
     );
     let fragment = FragmentId::new(731);
-    let mut builder = FragmentBuilder::new(fragment);
+    let mut builder =
+        crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+            fragment,
+            &fixture_sources,
+        );
     let source = builder.reserve_node_id().unwrap();
     let input = values(
         &mut builder,
@@ -112,9 +119,20 @@ fn union_program(ty: DataType, two_phase: bool) -> Arc<LocalProgram> {
     } else {
         first
     };
-    let definition = finish(builder, root, FragmentSink::Result, 2);
+    let definition = finish(
+        builder,
+        root,
+        FragmentSink::Result,
+        2,
+        &catalog,
+        &parameters,
+    );
     let output = definition.nodes()[&root].output.clone();
-    let mut plan = PlanBuilder::new(PlanVersionId::try_new([73; 16]).unwrap());
+    let mut plan = crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
+        PlanVersionId::try_new([73; 16]).unwrap(),
+        &fixture_sources,
+    )
+    .with_semantic_parameters(parameters.clone());
     plan.add_fragment(definition).unwrap();
     plan.set_result_port(ResultPort {
         scalar_schema: None,
@@ -136,7 +154,7 @@ fn union_program(ty: DataType, two_phase: bool) -> Arc<LocalProgram> {
     .unwrap();
     let plan = plan.finish_observed(&FixtureControl).unwrap();
     compile(
-        packages(&plan, &catalog).remove(&fragment).unwrap(),
+        packages(&plan).remove(&fragment).unwrap(),
         &catalog,
         2,
         true,

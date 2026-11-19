@@ -17,8 +17,11 @@
 
 //! Actual SQL journal composition, distinct from structural physical fixtures.
 
+use super::super::contract_lowering::{NodeExpressionEffects, pure_node_effects_for_test};
 use super::super::expression_occurrences::author_physical_occurrences_observed;
 use super::*;
+use crate::compiler::SqlAuthoredPhysicalPlan;
+
 use novarocks_type_contract::FunctionInstanceState;
 use std::sync::Mutex;
 
@@ -80,7 +83,7 @@ fn source_scopes<'a>(
                     source: node,
                     decimal_overflow_policy: captured.binding().decimal_overflow_policy(),
                     environment: &[],
-                    proof_scope: CallProofScope::Domain(context.domain),
+                    proof_scope: CallProofScope::Relation(context.identity),
                 },
             )
         })
@@ -94,7 +97,7 @@ fn input<'a>(
     occurrences: &'a AuthoredPhysicalOccurrences<'a>,
     policy: ConstantPolicy,
     scopes: &'a BTreeMap<PhysicalCallSite, PhysicalRelationalCallSourceScope<'a>>,
-    expressions: &'a BTreeMap<ExpressionUseId, PhysicalCallSourceScope<'a>>,
+    expressions: &'a BTreeMap<novarocks_physical_plan::NodeId, NodeExpressionEffects>,
 ) -> PhysicalFragmentEffectsInput<'a> {
     PhysicalFragmentEffectsInput {
         fragment,
@@ -102,7 +105,7 @@ fn input<'a>(
         constants: owner.plan().constants(),
         parameters: owner.plan().parameters(),
         literal_policy: policy,
-        expression_scopes: expressions,
+        node_effects: expressions,
         relational_scopes: scopes,
     }
 }
@@ -206,9 +209,9 @@ fn genuine_sql_partial_final_composer_covers_every_actual_call_from_original_jou
         let occurrences =
             author_physical_occurrences_observed(fragment, catalog, &Control::default()).unwrap();
         let (policy, scopes) = source_scopes(&owner, fragment, &occurrences);
-        let expressions = BTreeMap::new();
+        let expressions = pure_node_effects_for_test(fragment);
         let result = author_sql_fragment_effects_observed(
-            &owner,
+            owner.relational_sources(),
             input(
                 &owner,
                 fragment,
@@ -247,7 +250,7 @@ fn genuine_sql_partial_final_composer_covers_every_actual_call_from_original_jou
         }
         result
             .calls
-            .validate_fragment(fragment, &occurrences.root_uses, &Control::default())
+            .validate_fragment(fragment, &Control::default())
             .unwrap();
     }
     assert!(
@@ -264,11 +267,11 @@ fn genuine_sql_composer_success_and_original_policy_refusal_observe_all_real_pre
         let occurrences =
             author_physical_occurrences_observed(fragment, catalog, &Control::default()).unwrap();
         let (policy, mut scopes) = source_scopes(&owner, fragment, &occurrences);
-        let expressions = BTreeMap::new();
+        let expressions = pure_node_effects_for_test(fragment);
         prefixes(
             |control| {
                 author_sql_fragment_effects_observed(
-                    &owner,
+                    owner.relational_sources(),
                     input(
                         &owner,
                         fragment,
@@ -289,7 +292,7 @@ fn genuine_sql_composer_success_and_original_policy_refusal_observe_all_real_pre
             };
         }
         let refusal = author_sql_fragment_effects_observed(
-            &owner,
+            owner.relational_sources(),
             input(
                 &owner,
                 fragment,
@@ -309,7 +312,7 @@ fn genuine_sql_composer_success_and_original_policy_refusal_observe_all_real_pre
         prefixes(
             |control| {
                 author_sql_fragment_effects_observed(
-                    &owner,
+                    owner.relational_sources(),
                     input(
                         &owner,
                         fragment,
@@ -337,10 +340,10 @@ fn genuine_sql_composer_refuses_foreign_equal_owner_pool_parameters_and_extra_mi
         let occurrences =
             author_physical_occurrences_observed(fragment, catalog, &Control::default()).unwrap();
         let (policy, mut scopes) = source_scopes(&owner, fragment, &occurrences);
-        let expressions = BTreeMap::new();
+        let expressions = pure_node_effects_for_test(fragment);
         assert!(
             author_sql_fragment_effects_observed(
-                &cloned,
+                cloned.relational_sources(),
                 input(
                     &owner,
                     fragment,
@@ -356,7 +359,7 @@ fn genuine_sql_composer_refuses_foreign_equal_owner_pool_parameters_and_extra_mi
         prefixes(
             |control| {
                 author_sql_fragment_effects_observed(
-                    &foreign,
+                    foreign.relational_sources(),
                     input(
                         &owner,
                         fragment,
@@ -386,19 +389,23 @@ fn genuine_sql_composer_refuses_foreign_equal_owner_pool_parameters_and_extra_mi
                     } else {
                         source.parameters = foreign.plan().parameters();
                     }
-                    author_sql_fragment_effects_observed(&owner, source, control)
+                    author_sql_fragment_effects_observed(
+                        owner.relational_sources(),
+                        source,
+                        control,
+                    )
                 },
                 false,
             );
         }
         let (site, scope) = scopes.pop_first().unwrap();
         assert!(
-            matches!(author_sql_fragment_effects_observed(&owner, input(&owner, fragment, &occurrences, policy, &scopes, &expressions), &Control::default()), Err(PhysicalFragmentEffectsError::MissingScope(actual)) if actual == site)
+            matches!(author_sql_fragment_effects_observed(owner.relational_sources(), input(&owner, fragment, &occurrences, policy, &scopes, &expressions), &Control::default()), Err(PhysicalFragmentEffectsError::MissingScope(actual)) if actual == site)
         );
         prefixes(
             |control| {
                 author_sql_fragment_effects_observed(
-                    &owner,
+                    owner.relational_sources(),
                     input(
                         &owner,
                         fragment,
@@ -433,7 +440,7 @@ fn genuine_sql_composer_refuses_foreign_equal_owner_pool_parameters_and_extra_mi
         prefixes(
             |control| {
                 author_sql_fragment_effects_observed(
-                    &owner,
+                    owner.relational_sources(),
                     input(
                         &owner,
                         fragment,
@@ -459,13 +466,13 @@ fn genuine_sql_composer_refuses_captured_constant_policy_change_and_direct_merge
         let occurrences =
             author_physical_occurrences_observed(fragment, catalog, &Control::default()).unwrap();
         let (policy, scopes) = source_scopes(&owner, fragment, &occurrences);
-        let expressions = BTreeMap::new();
+        let expressions = pure_node_effects_for_test(fragment);
         let mut changed = policy;
         changed.max_retained_buffer_bytes -= 1;
         prefixes(
             |control| {
                 author_sql_fragment_effects_observed(
-                    &owner,
+                    owner.relational_sources(),
                     input(
                         &owner,
                         fragment,

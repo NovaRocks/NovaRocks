@@ -25,6 +25,7 @@ use uuid::Uuid;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CatalogPropertyIdentity {
     pub attachment_id: Uuid,
+    pub control_runtime_id: novarocks_spi::connector::ConnectorControlRuntimeId,
     pub instance_id: ConnectorInstanceId,
     pub provider_id: ConnectorProviderId,
     pub generation: u64,
@@ -160,6 +161,29 @@ impl SessionPropertyRegistry {
             identity: Some(identity),
             declarations,
         })
+    }
+}
+
+pub fn admit_catalog_properties(
+    port: &dyn SessionCatalogPropertyPort,
+    catalog: &str,
+) -> Result<Arc<CatalogPropertyMetadata>, SessionPropertyError> {
+    match port
+        .session_property_catalog(catalog)
+        .map_err(SessionPropertyError::Source)?
+    {
+        SessionCatalogPropertyAdmission::Absent => Err(SessionPropertyError::CatalogNotFound {
+            catalog: catalog.to_owned(),
+        }),
+        SessionCatalogPropertyAdmission::Unavailable(error) => {
+            Err(SessionPropertyError::Source(error))
+        }
+        SessionCatalogPropertyAdmission::Ready(metadata) if metadata.catalog() == catalog => {
+            Ok(metadata)
+        }
+        SessionCatalogPropertyAdmission::Ready(_) => {
+            Err(SessionPropertyError::CatalogIdentityMismatch)
+        }
     }
 }
 

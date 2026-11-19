@@ -459,33 +459,11 @@ pub fn validate_scan_dynamic_filters(
 mod tests {
     use std::sync::Arc;
 
-    use arrow::datatypes::DataType;
-    use novarocks_local_program::{
-        FilterConsumerActivation, FilterNullSemantics, FilterReduction, ProgramExprId,
-        StaticFilterConsumer, StaticFilterContract,
-    };
+    use crate::compiled_scan_binding::tests::{ScanMembershipKey, layout};
 
     use super::*;
 
     const SCAN: u32 = 10;
-
-    fn consumer(binding_id: u32) -> FilterConsumerAtExpr {
-        FilterConsumerAtExpr {
-            expr_id: ProgramExprId::new(0),
-            consumer: StaticFilterConsumer::try_new(
-                binding_id,
-                7,
-                FilterConsumerActivation::BlockingSnapshot,
-                StaticFilterContract::membership(
-                    &novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
-                    FilterNullSemantics::NeverMatches,
-                )
-                .expect("membership contract"),
-                FilterReduction::SetUnion,
-            )
-            .expect("blocking membership consumer"),
-        }
-    }
 
     fn dynamic(filter_id: u32) -> StaticScanDynamicFilter {
         StaticScanDynamicFilter::new(filter_id, Arc::from("v0"))
@@ -512,17 +490,24 @@ mod tests {
 
     #[test]
     fn each_dynamic_filter_matches_exactly_one_scan_source_consumer_binding() {
+        let key = ScanMembershipKey::new(&layout());
         // Filter 7 is consumed at the scan source through binding 3; filter
         // 9 is consumed at the scan's output through binding 4 and carries no
         // dynamic filter.
         let table = endpoints(&[(3, 7, SCAN, SCAN_SOURCE), (4, 9, SCAN, NODE_OUTPUT)]);
-        validate_scan_dynamic_filters(SCAN, &[dynamic(7)], &[consumer(3), consumer(4)], &table)
-            .expect("filter 7 is binding 3's");
+        validate_scan_dynamic_filters(
+            SCAN,
+            &[dynamic(7)],
+            &[key.consumer(3), key.consumer(4)],
+            &table,
+        )
+        .expect("filter 7 is binding 3's");
         validate_scan_dynamic_filters(SCAN, &[], &[], &table).expect("an unfiltered scan");
     }
 
     #[test]
     fn a_dynamic_filter_without_its_consumer_binding_is_refused() {
+        let key = ScanMembershipKey::new(&layout());
         let table = endpoints(&[(3, 7, SCAN, SCAN_SOURCE)]);
         let missing = validate_scan_dynamic_filters(SCAN, &[dynamic(7)], &[], &table)
             .expect_err("no site consumes filter 7");
@@ -530,7 +515,7 @@ mod tests {
             missing,
             CompiledRuntimeFilterBindingError::MissingDynamicConsumer { filter: 7 }
         );
-        let other = validate_scan_dynamic_filters(SCAN, &[dynamic(8)], &[consumer(3)], &table)
+        let other = validate_scan_dynamic_filters(SCAN, &[dynamic(8)], &[key.consumer(3)], &table)
             .expect_err("filter 8 is nobody's");
         assert_eq!(
             other,
@@ -540,8 +525,9 @@ mod tests {
 
     #[test]
     fn a_scan_source_consumer_without_its_dynamic_filter_is_refused() {
+        let key = ScanMembershipKey::new(&layout());
         let table = endpoints(&[(3, 7, SCAN, SCAN_SOURCE)]);
-        let error = validate_scan_dynamic_filters(SCAN, &[], &[consumer(3)], &table)
+        let error = validate_scan_dynamic_filters(SCAN, &[], &[key.consumer(3)], &table)
             .expect_err("binding 3 applies at the source");
         assert_eq!(
             error,
@@ -551,10 +537,15 @@ mod tests {
 
     #[test]
     fn two_consumer_bindings_of_one_dynamic_filter_are_refused() {
+        let key = ScanMembershipKey::new(&layout());
         let table = endpoints(&[(3, 7, SCAN, SCAN_SOURCE), (5, 7, SCAN, SCAN_SOURCE)]);
-        let error =
-            validate_scan_dynamic_filters(SCAN, &[dynamic(7)], &[consumer(3), consumer(5)], &table)
-                .expect_err("one dynamic filter, two bindings");
+        let error = validate_scan_dynamic_filters(
+            SCAN,
+            &[dynamic(7)],
+            &[key.consumer(3), key.consumer(5)],
+            &table,
+        )
+        .expect_err("one dynamic filter, two bindings");
         assert_eq!(
             error,
             CompiledRuntimeFilterBindingError::MultipleDynamicConsumers {
@@ -565,7 +556,7 @@ mod tests {
         let twice = validate_scan_dynamic_filters(
             SCAN,
             &[dynamic(7), dynamic(7)],
-            &[consumer(3)],
+            &[key.consumer(3)],
             &endpoints(&[(3, 7, SCAN, SCAN_SOURCE)]),
         )
         .expect_err("a dynamic filter stated twice");
@@ -577,11 +568,12 @@ mod tests {
 
     #[test]
     fn a_site_binding_that_is_not_a_consumer_of_this_scan_is_refused() {
+        let key = ScanMembershipKey::new(&layout());
         let table = endpoints(&[
             (3, 7, SCAN + 1, SCAN_SOURCE),
             (4, 7, SCAN, CompiledRuntimeFilterRole::Producer),
         ]);
-        let elsewhere = validate_scan_dynamic_filters(SCAN, &[], &[consumer(3)], &table)
+        let elsewhere = validate_scan_dynamic_filters(SCAN, &[], &[key.consumer(3)], &table)
             .expect_err("binding 3 consumes at another node");
         assert_eq!(
             elsewhere,
@@ -591,13 +583,13 @@ mod tests {
                 expected: SCAN
             }
         );
-        let producer = validate_scan_dynamic_filters(SCAN, &[], &[consumer(4)], &table)
+        let producer = validate_scan_dynamic_filters(SCAN, &[], &[key.consumer(4)], &table)
             .expect_err("binding 4 is a producer");
         assert_eq!(
             producer,
             CompiledRuntimeFilterBindingError::ProducerAtScan { binding: 4 }
         );
-        let unnumbered = validate_scan_dynamic_filters(SCAN, &[], &[consumer(6)], &table)
+        let unnumbered = validate_scan_dynamic_filters(SCAN, &[], &[key.consumer(6)], &table)
             .expect_err("binding 6 is unnumbered");
         assert_eq!(
             unnumbered,

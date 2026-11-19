@@ -326,6 +326,7 @@ fn scan_core(
         system_relation: false,
     });
     let mut depth = 0_usize;
+    let mut contains_retired_field = false;
     let result = (|| -> Result<(), E> {
         loop {
             work.step()?;
@@ -352,6 +353,16 @@ fn scan_core(
                 .objects
                 .get(frame.object)
                 .ok_or(E::Schema("invalid active resource object"))?;
+            // Preserve the original scan/resource/format verdict. A lawful
+            // unknown field is unrelated to an exact retired message/tag.
+            if object
+                .layout
+                .reserved
+                .iter()
+                .any(|&(start, end)| tag >= start && tag < end)
+            {
+                contains_retired_field = true;
+            }
             let Some(field) = object.fields.get(&tag) else {
                 if parent {
                     Cursor::check_group_depth(wire, 0, limits.max_wire_depth - depth)?;
@@ -480,12 +491,14 @@ fn scan_core(
     match result {
         Ok(()) => Ok(DecodeResourceProjection {
             status: ResourceCursorStatus::Complete,
+            contains_retired_field,
             usage: accounting.usage,
         }),
         Err(E::Malformed) => {
             accounting.gate()?;
             Ok(DecodeResourceProjection {
                 status: ResourceCursorStatus::MalformedPrefix,
+                contains_retired_field,
                 usage: accounting.usage,
             })
         }

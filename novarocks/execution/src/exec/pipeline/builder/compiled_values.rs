@@ -39,16 +39,12 @@ use novarocks_functions::{
     KernelDiagnostic, KernelEvaluationControl, KernelFailure, MAX_UNOBSERVED_KERNEL_WORK,
     selected_copy::{self, CopyConstructionError},
 };
-use novarocks_local_program::{
-    LocalProgram, ProgramExpressionRootSite, ProgramNodeExpressionRole, ProgramNodeId,
-    ProgramNodeKind, StaticValuesBacking,
-};
+use novarocks_local_program::{LocalProgram, ProgramNodeId, ProgramNodeKind, StaticValuesBacking};
 use novarocks_type_contract::{
     ArrowTypeProfile, ValueSchemaCreation, arrow_data_types_exact_with_profile_observed,
 };
 
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
-use crate::exec::expr::compiled_program::CompiledExpressionInstance;
 use crate::exec::operators::compiled_expression::{RuntimeKernelControl, evaluate_all};
 use crate::exec::pipeline::operator::Operator;
 use crate::exec::pipeline::operator_factory::OperatorFactory;
@@ -56,6 +52,7 @@ use crate::exec::pipeline::shape::{Source, SourceKernel, SourceStart};
 use crate::exec::pipeline::step::{NextStep, StepResult};
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
 use crate::runtime::task::{ExecutionFailure, ExecutionResult};
+use novarocks_expression::CompiledExpressionInstance;
 
 fn invalid(message: &str) -> ExecutionFailure {
     KernelFailure::InvalidProgram(KernelDiagnostic::new(message)).into()
@@ -114,7 +111,8 @@ impl OperatorFactory for CompiledValuesSourceFactory {
             node: self.node,
             output: None,
             construction: None,
-            control: RuntimeKernelControl::new(Arc::clone(&self.error)),
+            control: RuntimeKernelControl::new(Arc::clone(&self.error))
+                .at_expression_node(self.node),
             driver_id,
         }))
     }
@@ -297,20 +295,18 @@ fn materialize(
     // Row-major: the first failing cell is the one v1 would have reported.
     let mut evaluated = reserve(dynamic.len(), owner.as_ref(), &mut work)?;
     for cell in dynamic {
-        let site = ProgramExpressionRootSite::Node {
-            node,
-            role: ProgramNodeExpressionRole::ValuesCell {
-                row: cell.row,
-                column: cell.column,
-            },
-        };
+        let site = cell.definition;
+        let unit = program
+            .unit(site.unit)
+            .ok_or_else(|| invalid("Values cell unit is absent"))?;
         let mut instance = CompiledExpressionInstance::try_new_with_allocator(
-            Arc::clone(program),
-            site,
+            Arc::clone(unit),
+            site.root,
             control,
             control.allocator(),
         )?;
-        let value = evaluate_all(&mut instance, site, &empty, control)?;
+        let value = evaluate_all(&mut instance, site, &empty, control)
+            .map_err(|cause| cause.at_expression_node(node))?;
         let field = schema
             .fields()
             .get(cell.column as usize)

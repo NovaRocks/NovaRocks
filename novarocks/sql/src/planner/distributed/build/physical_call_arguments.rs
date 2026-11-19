@@ -19,9 +19,12 @@
 //! This leaf does not resolve names, evaluate expressions or author effects.
 
 use novarocks_functions::{ConstantError, ConstantPolicy, FunctionArgument};
-use novarocks_physical_plan::{ConstantPools, ConstantReferenceError, ExprKind, ExprNode};
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, ValueTypeError,
+};
+use {
+    novarocks_expression_contract::{ExprKind, ExprNode},
+    novarocks_physical_plan::{ConstantPools, ConstantReferenceError},
 };
 
 #[derive(Debug)]
@@ -85,8 +88,7 @@ impl PhysicalArgumentError {
 /// Borrow the actual source type, preserving nullable covariance for the
 /// installed owner's selected-type validation. A checked pool value keeps its
 /// original Field, backing and ordinal; a typed NULL remains Some(value).
-/// Literal construction delegates to the sole original factory with explicit
-/// policy and phase. Computed values remain nonconstant, including casts.
+/// Computed values remain nonconstant, including casts.
 /// Lambda types come from the actual definition; body/lexical admission is
 /// the original structural owner's responsibility, not scalar evaluation.
 ///
@@ -97,8 +99,8 @@ impl PhysicalArgumentError {
 pub(crate) fn author_physical_argument_observed(
     source: &ExprNode,
     pools: &ConstantPools,
-    literal_policy: ConstantPolicy,
-    phase: CompilePhase,
+    _literal_policy: ConstantPolicy,
+    _phase: CompilePhase,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<FunctionArgument, PhysicalArgumentError> {
     work.step()?;
@@ -133,11 +135,6 @@ pub(crate) fn author_physical_argument_observed(
         ExprKind::Constant(reference) => {
             Some(pools.resolve_observed(*reference, &source.ty, work)?)
         }
-        ExprKind::Literal(literal) => Some(novarocks_physical_plan::literal_constant_observed::<
-            PhysicalArgumentError,
-        >(
-            literal, &source.ty, literal_policy, phase, work
-        )?),
         _ => None,
     };
     work.flush()?;
@@ -192,5 +189,11 @@ where
             left_result.exactly_equals_observed(right_result, || work.step().map_err(E::from))
         }
         _ => Ok(false),
+    }
+}
+
+impl From<novarocks_constant_contract::ConstantTableError> for PhysicalArgumentError {
+    fn from(error: novarocks_constant_contract::ConstantTableError) -> Self {
+        Self::from(ConstantReferenceError::from(error))
     }
 }

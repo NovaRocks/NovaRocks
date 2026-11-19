@@ -462,7 +462,7 @@ mod tests {
         assert_eq!(stored.value, desired);
         assert_eq!(stored.writer, Some(snapshot));
 
-        let request = engine.freeze(&[]).unwrap();
+        let request = engine.freeze().unwrap();
         overwrite.effect.verify_request(&request).unwrap();
         let mut wrong_prefix = overwrite.effect.clone();
         wrong_prefix.prefix_digest[0] ^= 1;

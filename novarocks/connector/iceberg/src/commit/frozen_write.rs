@@ -46,7 +46,9 @@ pub struct FrozenDataWriteFacts {
     pub partition_column_names: Vec<String>,
     pub transform_exprs: Vec<String>,
     pub target_schema_json: String,
-    pub parquet_row_group_size_bytes: Option<u64>,
+    pub parquet_row_group_size_bytes: u64,
+    pub target_file_size_bytes: u64,
+    pub max_partitions_per_writer: u32,
 }
 
 #[derive(Debug)]
@@ -260,6 +262,10 @@ pub(crate) fn staged_write_context_with_file_io(
         prepared.writer_schema,
         prepared.arrow_schema,
         facts.target_partition_spec_id,
+    )?
+    .with_frozen_file_shaping(
+        facts.target_file_size_bytes,
+        facts.max_partitions_per_writer,
     )
 }
 
@@ -386,13 +392,11 @@ fn build_target_table_metadata(
     let data_location = work.opaque(|| facts.data_location.clone())?;
     properties.insert("write.data.path".to_string(), data_location);
     work.step()?;
-    if let Some(value) = facts.parquet_row_group_size_bytes {
-        properties.insert(
-            PARQUET_ROW_GROUP_SIZE_BYTES_PROPERTY.to_string(),
-            value.to_string(),
-        );
-        work.step()?;
-    }
+    properties.insert(
+        PARQUET_ROW_GROUP_SIZE_BYTES_PROPERTY.to_string(),
+        facts.parquet_row_group_size_bytes.to_string(),
+    );
+    work.step()?;
     let metadata = work.opaque_source(|| {
         TableMetadataBuilder::new(
             writer_schema.clone(),
@@ -457,7 +461,7 @@ fn build_staged_partition_spec(
     work.opaque(|| builder.build())
 }
 
-fn parse_partition_transform(raw: &str) -> Result<Transform, String> {
+pub(super) fn parse_partition_transform(raw: &str) -> Result<Transform, String> {
     let normalized = raw.trim().to_ascii_lowercase();
     match normalized.as_str() {
         "identity" => Ok(Transform::Identity),
@@ -668,7 +672,9 @@ mod pure_schema_tests {
             transform_exprs: vec![],
             target_schema_json: serde_json::json!({"type":"struct","schema-id":42,"fields":fields})
                 .to_string(),
-            parquet_row_group_size_bytes: Some(1024),
+            parquet_row_group_size_bytes: 1024,
+            target_file_size_bytes: crate::catalog_config::DEFAULT_TARGET_FILE_SIZE_BYTES,
+            max_partitions_per_writer: crate::catalog_config::DEFAULT_MAX_PARTITIONS_PER_WRITER,
         }
     }
     fn field(id: i32, name: &str, ty: serde_json::Value, required: bool) -> serde_json::Value {

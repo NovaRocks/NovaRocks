@@ -214,6 +214,18 @@ impl InitialComputationReservation {
         (reserved, Arc::clone(&self.credentials))
     }
 
+    /// Test recipes move the SAME already issued QA token and its credential
+    /// author into the existing installation assembly, with no second reserve.
+    #[cfg(all(test, novarocks_dev_controls))]
+    pub(crate) fn into_start_parts_for_fixture(
+        self,
+    ) -> (
+        ReservedExecutionIdentity,
+        Arc<InitialComputationCredentials>,
+    ) {
+        self.into_start_parts()
+    }
+
     pub(crate) fn connector_request_context(
         &self,
         context: ConnectorRequestContext,
@@ -548,7 +560,6 @@ mod initial_reservation_tests {
             QueryProcessNamespace::new(0x9b1),
             FrontendProcessId::new_v7(),
             LogicalExecutionSupervisorConfig::new(
-                NonZeroUsize::new(8).unwrap(),
                 NonZeroUsize::MIN,
                 NonZeroUsize::MIN,
                 LogicalExecutionRowsConfig::new(

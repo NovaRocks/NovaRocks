@@ -113,6 +113,11 @@ impl GovernedWireRole {
             window,
         }
     }
+    /// The SAME already-funded physical window for protocol-only read RPCs.
+    pub(super) fn root_window_alias(&self) -> novarocks_workload_control::ResultWindowAlias {
+        self.window.retain_alias()
+    }
+
     pub(super) fn authority(&self) -> NativeAsyncActionAuthority {
         self.window
             .retain_alias()
@@ -238,13 +243,12 @@ async fn original_settlement_crosses_wire_after_last_result_window_alias_exits()
     })
     .await
     .unwrap();
-    let mut batch = DispatchBatch::with_queued_at(
+    let mut batch = DispatchBatch::with_queue_permits(
         backend,
         DispatchLane::Lifecycle,
         vec![intent.clone()],
         vec![permit],
         intent.queued_bytes(),
-        novarocks_coordination_contract::MonotonicInstant::ORIGIN,
     );
     tokio::time::timeout_at(deadline, async {
         loop {
@@ -269,10 +273,6 @@ async fn original_settlement_crosses_wire_after_last_result_window_alias_exits()
     assert_eq!(control.snapshot().result_windows.held_positions, [0; 4]);
     drop((received, preparation, intent, sink, acks));
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    runtime
-        .drain_original_subscriptions_until(deadline)
-        .await
-        .unwrap();
     runtime.drain_original_apply_until(deadline).await.unwrap();
     runtime.drain_native_outgoing_until(deadline).await.unwrap();
     assert!(peer.settle().await);
@@ -406,10 +406,6 @@ async fn unpublished_paid_input_withdrawal_recycles_queue_but_keeps_retained_pay
     drop(acks);
     drop(supervisor);
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
-    runtime
-        .drain_original_subscriptions_until(deadline)
-        .await
-        .unwrap();
     runtime.drain_original_apply_until(deadline).await.unwrap();
     runtime.drain_native_outgoing_until(deadline).await.unwrap();
     assert!(peer.settle().await);
@@ -475,13 +471,12 @@ async fn same_sink_pending_preparations_keep_original_requests_without_quota_wai
     // Installation retires the constructor independently of the original
     // retained input and its actual physical queue lifetime.
     governed.drive();
-    let action_input = DispatchBatch::with_queued_at(
+    let action_input = DispatchBatch::with_queue_permits(
         backend,
         DispatchLane::Lifecycle,
         vec![intents[0].clone()],
         vec![original_permit],
         intents[0].queued_bytes(),
-        novarocks_coordination_contract::MonotonicInstant::ORIGIN,
     );
     let action_quote = sink.quote_original_batch(&action_input).unwrap();
     let scope = governed._root.owner.scope();
@@ -574,7 +569,6 @@ async fn same_sink_pending_preparations_keep_original_requests_without_quota_wai
     drop(sink); // Original preparations retired before the registration lease.
     drop(acks);
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
-    let subscriptions = runtime.drain_original_subscriptions_until(deadline).await;
     let apply = runtime.drain_original_apply_until(deadline).await;
     let outgoing = runtime.drain_native_outgoing_until(deadline).await;
     let peer_exit = peer.settle().await;
@@ -595,13 +589,7 @@ async fn same_sink_pending_preparations_keep_original_requests_without_quota_wai
     let shutdown = control.shutdown();
     // Keep original cleanup results until the primary has a stable receiver.
     // The tuple has no diagnostic formatting of arbitrary original causes.
-    if body.is_err()
-        || subscriptions.is_err()
-        || apply.is_err()
-        || outgoing.is_err()
-        || !peer_exit
-        || shutdown.is_err()
-    {
-        std::panic::panic_any((body, subscriptions, apply, outgoing, peer_exit, shutdown));
+    if body.is_err() || apply.is_err() || outgoing.is_err() || !peer_exit || shutdown.is_err() {
+        std::panic::panic_any((body, apply, outgoing, peer_exit, shutdown));
     }
 }

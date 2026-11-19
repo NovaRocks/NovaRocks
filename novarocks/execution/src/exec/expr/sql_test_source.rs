@@ -21,3 +21,5 @@ pub(super) use novarocks_sql_testkit::{
     sql_source_with_single_field, sql_source_with_single_field_and_core_residuals,
     try_sql_source_with_declared_fields,
 };
+
+pub(super) use novarocks_sql_testkit::unit_definitions;

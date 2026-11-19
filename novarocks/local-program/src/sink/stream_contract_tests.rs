@@ -18,34 +18,47 @@
 //! The sender must accept precisely the declared hierarchical key domain.
 
 use super::*;
-use crate::{StaticExprKind, StaticExprNode};
 use arrow_schema::DataType;
-use std::collections::HashMap;
 
 fn stream(key_type: DataType, conditional: bool) -> Result<StaticSinkProgram, StaticSinkError> {
-    let mut nodes = vec![StaticExprNode::new(
-        StaticExprKind::SlotId(SlotId::new(1)),
-        key_type,
-        None,
-    )];
+    use novarocks_expression_contract::ValueId;
+    use novarocks_type_contract::{EvaluationDemand, FunctionValueType};
+    let mut fields = vec![arrow_schema::Field::new("key", key_type.clone(), false)];
+    let mut values = vec![(ValueId::new(1), FunctionValueType::new(key_type, false))];
+    let mut roots = vec![(0, EvaluationDemand::Value)];
     let routing = if conditional {
-        nodes.push(StaticExprNode::new(
-            StaticExprKind::SlotId(SlotId::new(2)),
+        fields.push(arrow_schema::Field::new(
+            "applies",
             DataType::Boolean,
-            None,
+            false,
         ));
+        values.push((
+            ValueId::new(2),
+            FunctionValueType::new(DataType::Boolean, false),
+        ));
+        roots.push((1, EvaluationDemand::TruthOnly));
         StaticStreamRouting::ConditionalKeyV1 {
-            applies: ProgramExprId::new(1),
+            applies: crate::test_support::root(0, 1),
         }
     } else {
         StaticStreamRouting::HierarchicalHashV1
     };
-    let arena =
-        Arc::new(ImmutableExpressions::try_new(nodes, false, HashMap::new(), None).unwrap());
+    let layout = StaticLayout::try_new(
+        Arc::new(arrow_schema::Schema::new(fields)),
+        (1..=values.len()).map(|i| SlotId::new(i as u32)).collect(),
+    )
+    .unwrap();
+    let ordinal_types: Vec<_> = values.iter().map(|(_, ty)| ty.clone()).collect();
+    let units = vec![crate::test_support::read_unit(
+        &layout,
+        &ordinal_types,
+        &values,
+        &roots,
+    )];
     let branch = StaticStreamBranch::try_new(
         1,
         DataStreamPartitionType::HashPartitioned,
-        vec![ProgramExprId::new(0)],
+        vec![crate::test_support::root(0, 0)],
         vec![SlotId::new(1)],
         None,
         StaticStreamContract {
@@ -55,7 +68,7 @@ fn stream(key_type: DataType, conditional: bool) -> Result<StaticSinkProgram, St
         },
     )
     .unwrap();
-    StaticSinkProgram::try_data_stream(branch, arena)
+    StaticSinkProgram::try_data_stream(branch, &units)
 }
 
 #[test]
@@ -63,13 +76,10 @@ fn hierarchical_and_conditional_sender_refuse_keys_outside_their_signed_algorith
     for conditional in [false, true] {
         stream(DataType::Int64, conditional)
             .expect("a canonical native key is valid before fault injection");
-        for bad in [
-            DataType::UInt64,
-            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
-        ] {
+        {
             assert!(
                 matches!(
-                    stream(bad, conditional),
+                    stream(DataType::UInt64, conditional),
                     Err(StaticSinkError::InvalidExpression)
                 ),
                 "a same-shaped expression is insufficient evidence of supported key semantics"

@@ -52,8 +52,8 @@ use crate::exec::pipeline::operator::OperatorLifecycle;
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef};
-use arrow::compute::{SortOptions, concat};
-use arrow::row::{OwnedRow, Rows};
+use arrow::compute::concat;
+use arrow::row::OwnedRow;
 use novarocks_functions::{
     AggregateStateAllocator, EvaluatedArgument, FullPartitionWindowInput, KernelEvaluationControl,
     KernelFailure, PreparedWindowKernel, Selection, WindowEvaluationPartition,
@@ -61,9 +61,8 @@ use novarocks_functions::{
     WindowRowRange,
 };
 use novarocks_local_program::{
-    AnalyticOutputColumn, LocalProgram, ProgramCallSite, ProgramExpressionRootSite,
-    ProgramNodeExpressionRole, ProgramNodeId, ProgramNodeKind, ProgramStateTemplate, WindowFrame,
-    WindowFunctionKind,
+    AnalyticOutputColumn, LocalProgram, ProgramCallSite, ProgramNodeId, ProgramNodeKind,
+    ProgramRootRef, ProgramStateTemplate, WindowFrame, WindowFunctionKind,
 };
 
 #[path = "compiled_window_invocation_input.rs"]
@@ -75,9 +74,8 @@ use super::analytic_shared::{
 };
 use super::compiled_expression::{RuntimeKernelControl, evaluate_all, instances};
 use super::compiled_window_geometry::{admit_frame, frame_table, frame_table_tracked, peer_groups};
-use super::sort::creation::{CreatedSortConverter, SortCreation};
+use super::sort::creation::{CreatedSortConverter, CreatedSortRows, SortCreation};
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
-use crate::exec::expr::compiled_program::CompiledExpressionInstance;
 use crate::exec::pipeline::operator::{ConstructionFailure, InputConstructionOwner};
 use crate::exec::pipeline::operator::{InputEncodingPolicy, Operator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
@@ -89,6 +87,7 @@ use crate::exec::pipeline::{
 };
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
 use crate::runtime::task::{ExecutionFailure, ExecutionResult};
+use novarocks_expression::CompiledExpressionInstance;
 use novarocks_type_contract::ValueTypeStorageLifetime;
 
 #[derive(Clone, Copy, Debug)]
@@ -153,7 +152,7 @@ enum OutputSource {
 pub struct CompiledWindowProcessorFactory {
     name: String,
     program: Arc<LocalProgram>,
-    sites: Vec<ProgramExpressionRootSite>,
+    sites: Vec<ProgramRootRef>,
     partition_keys: usize,
     order_keys: usize,
     calls: Vec<CallPlan>,
@@ -190,29 +189,8 @@ impl CompiledWindowProcessorFactory {
                 format!("compiled local node {at} is not an Analytic"),
             ));
         };
-        let key = |count: usize, role: fn(u32) -> ProgramNodeExpressionRole| {
-            (0..count)
-                .map(|key| {
-                    u32::try_from(key)
-                        .map(|key| ProgramExpressionRootSite::Node {
-                            node,
-                            role: role(key),
-                        })
-                        .map_err(|_| {
-                            program_binding_failure(
-                                PlanBindingKind::InvalidAssignment,
-                                format!("compiled Analytic at local node {at} has too many keys"),
-                            )
-                        })
-                })
-                .collect::<ExecutionResult<Vec<_>>>()
-        };
-        let mut sites = key(partition_exprs.len(), |key| {
-            ProgramNodeExpressionRole::WindowPartition { key }
-        })?;
-        sites.extend(key(order_by_exprs.len(), |key| {
-            ProgramNodeExpressionRole::WindowOrder { key }
-        })?);
+        let mut sites = partition_exprs.to_vec();
+        sites.extend_from_slice(order_by_exprs);
         let mut calls = Vec::with_capacity(functions.len());
         for (ordinal, function) in functions.iter().enumerate() {
             let call = novarocks_local_program::checked_program_ordinal(ordinal)
@@ -265,20 +243,7 @@ impl CompiledWindowProcessorFactory {
                 ));
             }
             let first_root = sites.len();
-            for argument in 0..roots {
-                let argument = u32::try_from(argument).map_err(|_| {
-                    program_binding_failure(
-                        PlanBindingKind::InvalidAssignment,
-                        format!(
-                            "compiled Analytic call {call} at local node {at} has too many inputs"
-                        ),
-                    )
-                })?;
-                sites.push(ProgramExpressionRootSite::Node {
-                    node,
-                    role: ProgramNodeExpressionRole::WindowInput { call, argument },
-                });
-            }
+            sites.extend_from_slice(&function.args);
             calls.push(CallPlan {
                 kernel,
                 frame,
@@ -371,7 +336,8 @@ impl CompiledWindowProcessorFactory {
             output_node: self.output_node,
             output: None,
             construction: None,
-            control: RuntimeKernelControl::new(Arc::clone(&self.error)),
+            control: RuntimeKernelControl::new(Arc::clone(&self.error))
+                .at_expression_node(self.output_node),
             instances: None,
             partition_key_types: None,
             order_key_types: None,
@@ -409,7 +375,7 @@ struct Piece {
 struct CompiledWindowProcessor {
     name: String,
     program: Arc<LocalProgram>,
-    sites: Vec<ProgramExpressionRootSite>,
+    sites: Vec<ProgramRootRef>,
     partition_keys: usize,
     order_keys: usize,
     calls: Vec<CallPlan>,
@@ -445,18 +411,6 @@ struct WindowOutputCursor {
     _length_storage: ValueTypeStorageLifetime,
 }
 
-/// The row encoding owns shared converter fields independently of the converter.
-/// Row bytes and offsets remain under the original window payload policy.
-struct CreatedWindowRows {
-    rows: Rows,
-    storage: ValueTypeStorageLifetime,
-}
-impl std::ops::Deref for CreatedWindowRows {
-    type Target = Rows;
-    fn deref(&self) -> &Rows {
-        &self.rows
-    }
-}
 struct CreatedPartitionKey {
     row: OwnedRow,
     _storage: ValueTypeStorageLifetime,
@@ -468,22 +422,9 @@ fn encode(
     keys: &[ArrayRef],
     type_storage: ValueTypeStorageLifetime,
     creation: &SortCreation<'_>,
-) -> ExecutionResult<CreatedWindowRows> {
-    if converter.is_none() {
-        *converter = Some(creation.row_converter(
-            keys,
-            type_storage,
-            std::iter::repeat_n(SortOptions::default(), keys.len()),
-        )?);
-    }
-    let converter = converter.as_ref().expect("converter was created");
-    let rows = converter
-        .converter()
-        .convert_columns(keys)
-        .map_err(|error| arrow_failure(WindowArrowOperation::EncodeKeys, error))?;
-    Ok(CreatedWindowRows {
-        rows,
-        storage: converter.storage_lifetime(),
+) -> ExecutionResult<CreatedSortRows> {
+    creation.encode_keys(converter, keys, type_storage, |error| {
+        arrow_failure(WindowArrowOperation::EncodeKeys, error)
     })
 }
 
@@ -1068,7 +1009,7 @@ impl CompiledWindowProcessor {
             }
             self.last_partition = Some(CreatedPartitionKey {
                 row: encoded.row(rows - 1).owned(),
-                _storage: encoded.storage.clone(),
+                _storage: encoded.storage_lifetime(),
             });
         }
         let mut closed = Vec::new();

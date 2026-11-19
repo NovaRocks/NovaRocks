@@ -1151,7 +1151,7 @@ fn encode_core<'loan, 'source, 'control, 'admit>(
         let mut guarantees = reserve(r.predicate_guarantees().len(), w)?;
         for g in r.predicate_guarantees() {
             guarantees.push(wire::PredicateGuarantee {
-                predicate_expr_id: Some(g.predicate.get()),
+                predicate_root: Some(g.predicate.get()),
                 kind: encode_guarantee(g.kind) as i32,
             });
             w.step()?;
@@ -1357,7 +1357,7 @@ fn preflight_decode_observed<'admit>(
             w.step()?;
         }
         for g in r.guarantees {
-            required(g.predicate_expr_id, w)?;
+            required(g.predicate_root, w)?;
             let kind = decode_guarantee(g.kind);
             w.step()?;
             kind?;
@@ -1420,7 +1420,10 @@ fn decode_core<'loan, 'wire, 'control, 'admit>(
         let mut guarantees = reserve(r.guarantees.len(), w)?;
         for g in r.guarantees {
             guarantees.push(p::PredicateGuarantee {
-                predicate: p::ExprId::new(required(g.predicate_expr_id, w)?),
+                predicate: novarocks_expression_contract::RootOrdinal::new(required(
+                    g.predicate_root,
+                    w,
+                )?),
                 kind: decode_guarantee(g.kind)?,
             });
             w.step()?;

@@ -278,7 +278,7 @@ fn original_missing_out_of_bounds_and_full_type_errors_never_become_nonconstant(
     let pools = pools(&pool);
     let missing = request(vec![value(integer(), Some(reference(0, 1)))]);
     assert!(
-        matches!(materialize(&missing, &pools, &Control::default()), Err(ExpressionLoweringError::Reference(ConstantReferenceError::MissingPool(id))) if id == ConstantPoolId::new(0))
+        matches!(materialize(&missing, &pools, &Control::default()), Err(ExpressionLoweringError::Reference(ConstantReferenceError::Table(novarocks_constant_contract::ConstantTableError::MissingPool(id)))) if id == ConstantPoolId::new(0))
     );
     let out_of_bounds = request(vec![value(integer(), Some(reference(u32::MAX, 3)))]);
     let error = materialize(&out_of_bounds, &pools, &Control::default()).unwrap_err();
@@ -288,7 +288,7 @@ fn original_missing_out_of_bounds_and_full_type_errors_never_become_nonconstant(
         Some(reference(u32::MAX, 1)),
     )]);
     assert!(
-        matches!(materialize(&mismatch, &pools, &Control::default()), Err(ExpressionLoweringError::Reference(ConstantReferenceError::SourceTypeMismatch(actual))) if actual == reference(u32::MAX, 1))
+        matches!(materialize(&mismatch, &pools, &Control::default()), Err(ExpressionLoweringError::Reference(ConstantReferenceError::Table(novarocks_constant_contract::ConstantTableError::SourceTypeMismatch(actual)))) if actual == reference(u32::MAX, 1))
     );
     prefixes(&missing, &pools, true);
     prefixes(&mismatch, &pools, true);

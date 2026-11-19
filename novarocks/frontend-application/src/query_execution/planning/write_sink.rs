@@ -30,7 +30,9 @@ use crate::catalog_application::query_bindings::{
     QueryTableBinding, QueryTableBindingAdmission, QueryTableBindingKey, QueryTableBindingStore,
     QueryWriteTargetAdmission,
 };
-use novarocks_spi::connector::write_stack::ConnectorWriteTargetPlan;
+use novarocks_spi::connector::write_stack::{
+    ConnectorWriteLayoutPreference, ConnectorWriteTargetPlan,
+};
 use novarocks_spi::connector::{ConnectorControlPlanningPin, ConnectorWriteInputShape};
 use novarocks_sql::binding::SqlTableBindingId;
 use novarocks_sql::planning::dml::{
@@ -84,6 +86,7 @@ pub(crate) fn dml_write_plan_input_for_admitted_target(
         admitted_write_input_columns(write_input)?,
         input,
     )
+    .map(|sink| sink.with_write_layout(admission.layout.clone()))
 }
 
 /// Reserve a SQL write token for one logical target of the query's write
@@ -125,6 +128,11 @@ pub(crate) fn admit_session_connector_write_target(
             mv_target_read: None,
             write_target_admission: Some(QueryWriteTargetAdmission {
                 input: input.clone(),
+                layout: target
+                    .route()
+                    .map_or(ConnectorWriteLayoutPreference::None, |route| {
+                        route.requirements().layout.clone()
+                    }),
             }),
             frozen_cohort_read: None,
             frozen_snapshot_materializations: std::collections::BTreeMap::new(),

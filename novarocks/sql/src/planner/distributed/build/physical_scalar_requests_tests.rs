@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::super::unit_source::UnitDefinitions;
 use super::*;
 use crate::{compiler::SqlFunctionCatalog, functions::build_builtin_engine_function_catalog};
 use arrow::{
@@ -27,10 +28,10 @@ use novarocks_functions::{
     PureKernelAbi, ScopedExpressionEffects,
 };
 use novarocks_physical_plan::{
-    ConstantPoolId, ConstantReference, LiteralValue, NodeId, PlanLimits, ValueId,
+    ConstantPoolId, ConstantReference, FragmentBuilder, FragmentId, NodeId, ValueId,
 };
 use novarocks_type_contract::{
-    CallProofScope, DecimalOverflowPolicy, EvaluationDemand, EvaluationDomainId,
+    CallProofScope, DecimalOverflowPolicy, EvaluationDemand, EvaluationRegionId,
     ExpressionEffectContext, ExpressionUseId, FunctionArgumentEvaluation, FunctionFailureBehavior,
     FunctionIntrinsicRowError, FunctionVolatility, PureCompileControl, SemanticParameterId,
     SemanticParameterKey, SemanticParameterRef, SemanticParameters, ValueLogicalType,
@@ -88,7 +89,6 @@ fn ty(carrier: DataType, nullable: bool) -> FunctionValueType {
 fn node(id: u32, ty: FunctionValueType, kind: ExprKind) -> ExprNode {
     ExprNode {
         id: ExprId::new(id),
-        owner: NodeId::new(7),
         lambda_scope: None,
         ty,
         kind,
@@ -97,13 +97,48 @@ fn node(id: u32, ty: FunctionValueType, kind: ExprKind) -> ExprNode {
 fn value(id: u32, ty: FunctionValueType) -> ExprNode {
     node(id, ty, ExprKind::Value(ValueId::new(id)))
 }
-fn arena(nodes: Vec<ExprNode>) -> ExprArena {
-    ExprArena::try_from_definitions_observed(
-        nodes.into_iter(),
-        &PlanLimits::FROZEN,
-        &Control::default(),
-    )
-    .unwrap()
+// These are direct-component fixtures, not SQL journal receipts or sealed
+// units. Each invocation still borrows its source and argument definitions
+// from the same real node-owned draft. Invalid signatures and missing children
+// deliberately remain unfinished so the original leaf can reject them.
+#[derive(Clone)]
+struct SourceDefinition {
+    ty: FunctionValueType,
+    kind: ExprKind,
+}
+struct RequestFixture {
+    fragment: FragmentBuilder,
+    source: ExprId,
+}
+impl RequestFixture {
+    fn new(arguments: &[ExprNode], source: SourceDefinition) -> Self {
+        let mut fragment = FragmentBuilder::new(FragmentId::new(71));
+        let draft = fragment.unit(NodeId::new(7)).unwrap();
+        for argument in arguments {
+            let actual = draft
+                .add(
+                    argument.lambda_scope,
+                    argument.ty.clone(),
+                    argument.kind.clone(),
+                )
+                .unwrap();
+            assert_eq!(
+                actual, argument.id,
+                "fixture IDs follow the actual dense author"
+            );
+        }
+        let source = draft.add(None, source.ty, source.kind).unwrap();
+        Self { fragment, source }
+    }
+    fn definitions(&self) -> UnitDefinitions<'_> {
+        UnitDefinitions::from_draft(&self.fragment, NodeId::new(7))
+    }
+    fn source(&self) -> &ExprNode {
+        self.definitions().definition(self.source).unwrap()
+    }
+    fn argument(&self, id: ExprId) -> &ExprNode {
+        self.definitions().definition(id).unwrap()
+    }
 }
 fn binding(
     catalog: &EngineFunctionCatalog,
@@ -129,7 +164,7 @@ fn binding(
         kind: resolved.kind,
         argument_types: resolved.selected.argument_types,
         result_type,
-        legacy_metadata: Some(novarocks_physical_plan::LegacyBindingMetadata {
+        legacy_metadata: Some(novarocks_expression_contract::LegacyBindingMetadata {
             volatility: resolved.semantics.volatility,
             argument_evaluation: resolved.semantics.argument_evaluation,
             failure_behavior: resolved.semantics.failure_behavior,
@@ -138,26 +173,28 @@ fn binding(
         }),
     }
 }
-fn call(function: BoundFunction, ids: &[u32]) -> ExprNode {
-    let result = function.result_type.clone();
-    node(
-        17,
-        result,
-        ExprKind::FunctionCall {
+fn call(function: BoundFunction, ids: &[u32]) -> SourceDefinition {
+    SourceDefinition {
+        ty: function.result_type.clone(),
+        kind: ExprKind::FunctionCall {
             function,
             args: ids.iter().copied().map(ExprId::new).collect(),
         },
-    )
+    }
 }
 fn invoke<'a>(
-    source: &'a ExprNode,
-    expressions: &ExprArena,
+    fixture: &'a RequestFixture,
     pools: &ConstantPools,
     control: &Control,
 ) -> Result<AuthoredPhysicalScalarRequest<'a>, PhysicalScalarRequestError> {
     let mut work = CompileCheckpoints::try_new(control, PHASE)?;
-    let result =
-        author_physical_scalar_request_observed(source, expressions, pools, policy(), &mut work);
+    let result = author_physical_scalar_request_observed(
+        fixture.source(),
+        fixture.definitions(),
+        pools,
+        policy(),
+        &mut work,
+    );
     if matches!(&result, Err(PhysicalScalarRequestError::Control(_))) {
         return result;
     }
@@ -167,7 +204,7 @@ fn invoke<'a>(
 fn context() -> ExpressionEffectContext {
     ExpressionEffectContext {
         use_id: ExpressionUseId::new(u32::MAX),
-        domain: EvaluationDomainId::new(9),
+        region: EvaluationRegionId::new(9),
         demand: EvaluationDemand::Value,
     }
 }
@@ -183,7 +220,7 @@ fn prepare(
         .map(|i| Some(ExpressionUseId::new(u32::try_from(i).unwrap())))
         .collect();
     let input = CallEffectInput {
-        context: context(),
+        context: novarocks_type_contract::CallEffectContext::Expression(context()),
         argument_uses: novarocks_functions::CallArgumentUses::SelectedChannels(&uses),
         function_id: &authored.function.function_id,
         kind: authored.function.kind,
@@ -192,7 +229,7 @@ fn prepare(
         environment: &[],
         parameters: &parameters,
         decimal_overflow_policy: policy,
-        proof_scope: CallProofScope::Domain(context().domain),
+        proof_scope: CallProofScope::Region(context().region),
     };
     let arguments = ScopedExpressionEffects::pure_value(context());
     let options = if control_intrinsic {
@@ -224,23 +261,24 @@ fn assert_owner_cause(error: &FunctionSpecializationFailure, cause: CompileContr
     }
 }
 fn prefixes(
-    source: &ExprNode,
-    expressions: &ExprArena,
+    fixture: &RequestFixture,
     pools: &ConstantPools,
     success: bool,
     sampled: bool,
 ) -> Vec<(CompilePhase, u32)> {
     let control = Control::default();
-    assert_eq!(
-        invoke(source, expressions, pools, &control).is_ok(),
-        success
-    );
+    assert_eq!(invoke(fixture, pools, &control).is_ok(), success);
     let trace = control.trace();
     assert_eq!(trace.first(), Some(&(PHASE, 0)));
     let direct = Control::default();
     let mut work = CompileCheckpoints::try_new(&direct, PHASE).unwrap();
-    let _ =
-        author_physical_scalar_request_observed(source, expressions, pools, policy(), &mut work);
+    let _ = author_physical_scalar_request_observed(
+        fixture.source(),
+        fixture.definitions(),
+        pools,
+        policy(),
+        &mut work,
+    );
     assert_eq!(&trace[..trace.len() - 1], direct.trace());
     assert_eq!(
         trace.len(),
@@ -258,7 +296,7 @@ fn prefixes(
                 refusal: Some((at, cause.clone())),
                 ..Control::default()
             };
-            assert!(matches!(invoke(source,expressions,pools,&refused),
+            assert!(matches!(invoke(fixture,pools,&refused),
                 Err(PhysicalScalarRequestError::Control(actual)) if actual==cause));
             assert_eq!(refused.trace(), trace[..=at]);
         }
@@ -272,29 +310,30 @@ fn scalar_requests_actual_lower_coalesce_if_preserve_order_repetition_sparse_ids
     let catalog = build_builtin_engine_function_catalog().unwrap();
     let text = ty(DataType::Utf8, true);
     let boolean = ty(DataType::Boolean, true);
-    let expressions = arena(vec![
+    // The accepted unit contract assigns dense ExprIds. Sparse external value
+    // identities remain distinct from those local definition addresses.
+    let expressions = vec![
         value(0, text.clone()),
-        value(u32::MAX, text.clone()),
-        value(7, boolean.clone()),
-    ]);
+        node(1, text.clone(), ExprKind::Value(ValueId::new(u32::MAX))),
+        node(2, boolean.clone(), ExprKind::Value(ValueId::new(7))),
+    ];
     for (name, types, ids, control_intrinsic) in [
-        ("lower", vec![text.clone()], vec![u32::MAX], false),
-        (
-            "coalesce",
-            vec![text.clone(); 3],
-            vec![u32::MAX, 0, u32::MAX],
-            true,
-        ),
+        ("lower", vec![text.clone()], vec![1], false),
+        ("coalesce", vec![text.clone(); 3], vec![1, 0, 1], true),
         (
             "if",
             vec![boolean, text.clone(), text.clone()],
-            vec![7, u32::MAX, 0],
+            vec![2, 1, 0],
             true,
         ),
     ] {
         let source = call(binding(&catalog, name, &types), &ids);
         let pools = ConstantPools::empty();
-        let authored = invoke(&source, &expressions, &pools, &Control::default()).unwrap();
+        let fixture = RequestFixture::new(&expressions, source);
+        let source = fixture.source();
+        assert!(matches!(fixture.argument(ExprId::new(1)).kind,
+            ExprKind::Value(id) if id == ValueId::new(u32::MAX)));
+        let authored = invoke(&fixture, &pools, &Control::default()).unwrap();
         let ExprKind::FunctionCall { function, .. } = &source.kind else {
             unreachable!()
         };
@@ -314,7 +353,7 @@ fn scalar_requests_actual_lower_coalesce_if_preserve_order_repetition_sparse_ids
             else {
                 panic!("value")
             };
-            assert_eq!(value_type, &expressions.get(ExprId::new(*id)).unwrap().ty);
+            assert_eq!(value_type, &fixture.argument(ExprId::new(*id)).ty);
             assert!(constant.is_none());
         }
         for policy in [
@@ -378,15 +417,16 @@ fn reference(ordinal: u32) -> ConstantReference {
 fn scalar_requests_checked_constants_keep_nonzero_ordinal_typed_null_original_field_and_backing() {
     let catalog = build_builtin_engine_function_catalog().unwrap();
     let (pools, pool, text) = string_pool();
-    let expressions = arena(vec![
+    let expressions = vec![
         node(0, text.clone(), ExprKind::Constant(reference(2))),
-        node(u32::MAX, text.clone(), ExprKind::Constant(reference(1))),
-    ]);
+        node(1, text.clone(), ExprKind::Constant(reference(1))),
+    ];
     let source = call(
         binding(&catalog, "coalesce", &[text.clone(), text.clone(), text]),
-        &[0, u32::MAX, 0],
+        &[0, 1, 0],
     );
-    let authored = invoke(&source, &expressions, &pools, &Control::default()).unwrap();
+    let fixture = RequestFixture::new(&expressions, source.clone());
+    let authored = invoke(&fixture, &pools, &Control::default()).unwrap();
     for (argument, ordinal) in authored.request().arguments.iter().zip([2, 1, 2]) {
         let FunctionArgument::Value {
             value_type,
@@ -416,19 +456,20 @@ fn scalar_requests_checked_constants_keep_nonzero_ordinal_typed_null_original_fi
         &Control::default(),
     )
     .unwrap();
-    prefixes(&source, &expressions, &pools, true, false);
-    let wrong = arena(vec![node(
+    prefixes(&fixture, &pools, true, false);
+    let wrong = vec![node(
         0,
         ty(DataType::Utf8, false),
         ExprKind::Constant(reference(2)),
-    )]);
+    )];
     let bad = call(
         binding(&catalog, "lower", &[ty(DataType::Utf8, false)]),
         &[0],
     );
-    assert!(matches!(invoke(&bad,&wrong,&pools,&Control::default()),
+    let wrong_fixture = RequestFixture::new(&wrong, bad);
+    assert!(matches!(invoke(&wrong_fixture,&pools,&Control::default()),
         Err(PhysicalScalarRequestError::Argument(PhysicalArgumentError::Reference(
-            novarocks_physical_plan::ConstantReferenceError::SourceTypeMismatch(actual)))) if actual==reference(2)));
+            novarocks_physical_plan::ConstantReferenceError::Table(novarocks_constant_contract::ConstantTableError::SourceTypeMismatch(actual))))) if actual==reference(2)));
 }
 
 #[test]
@@ -436,18 +477,17 @@ fn scalar_requests_keep_actual_nullable_covariance_separate_from_selected_owner_
     let catalog = build_builtin_engine_function_catalog().unwrap();
     let actual = ty(DataType::Utf8, false);
     let selected = ty(DataType::Utf8, true);
-    let expressions = arena(vec![value(u32::MAX, actual.clone())]);
+    let expressions = vec![node(
+        0,
+        actual.clone(),
+        ExprKind::Value(ValueId::new(u32::MAX)),
+    )];
     let source = call(
         binding(&catalog, "lower", std::slice::from_ref(&selected)),
-        &[u32::MAX],
+        &[0],
     );
-    let authored = invoke(
-        &source,
-        &expressions,
-        &ConstantPools::empty(),
-        &Control::default(),
-    )
-    .unwrap();
+    let fixture = RequestFixture::new(&expressions, source.clone());
+    let authored = invoke(&fixture, &ConstantPools::empty(), &Control::default()).unwrap();
     let FunctionArgument::Value {
         value_type,
         constant,
@@ -477,15 +517,10 @@ fn scalar_requests_keep_actual_nullable_covariance_separate_from_selected_owner_
     );
     let exact = call(
         binding(&catalog, "lower", std::slice::from_ref(&actual)),
-        &[u32::MAX],
+        &[0],
     );
-    let exact = invoke(
-        &exact,
-        &expressions,
-        &ConstantPools::empty(),
-        &Control::default(),
-    )
-    .unwrap();
+    let exact_fixture = RequestFixture::new(&expressions, exact);
+    let exact = invoke(&exact_fixture, &ConstantPools::empty(), &Control::default()).unwrap();
     catalog
         .validate_frozen_selection(
             &exact.function.function_id,
@@ -502,7 +537,7 @@ fn scalar_requests_legacy_effect_fields_do_not_author_effects_and_real_owner_rej
  {
     let catalog = build_builtin_engine_function_catalog().unwrap();
     let text = ty(DataType::Utf8, true);
-    let expressions = arena(vec![value(0, text.clone())]);
+    let expressions = vec![value(0, text.clone())];
     let mut source = call(
         binding(&catalog, "lower", std::slice::from_ref(&text)),
         &[0],
@@ -538,13 +573,8 @@ fn scalar_requests_legacy_effect_fields_do_not_author_effects_and_real_owner_rej
         id: SemanticParameterId::new(u32::MAX),
         expected_key: SemanticParameterKey::TimeZone,
     }]);
-    let authored = invoke(
-        &source,
-        &expressions,
-        &ConstantPools::empty(),
-        &Control::default(),
-    )
-    .unwrap();
+    let fixture = RequestFixture::new(&expressions, source.clone());
+    let authored = invoke(&fixture, &ConstantPools::empty(), &Control::default()).unwrap();
     let prepared = prepare(
         &catalog,
         &authored,
@@ -570,13 +600,8 @@ fn scalar_requests_legacy_effect_fields_do_not_author_effects_and_real_owner_rej
         novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::from([
             FunctionArgumentType::Value(ty(DataType::Int64, true)),
         ]));
-    let authored = invoke(
-        &wrong,
-        &expressions,
-        &ConstantPools::empty(),
-        &Control::default(),
-    )
-    .unwrap();
+    let wrong_fixture = RequestFixture::new(&expressions, wrong);
+    let authored = invoke(&wrong_fixture, &ConstantPools::empty(), &Control::default()).unwrap();
     assert!(
         catalog
             .validate_frozen_selection(
@@ -594,9 +619,9 @@ fn scalar_requests_legacy_effect_fields_do_not_author_effects_and_real_owner_rej
         unreachable!()
     };
     function.result_type = wrong_result.ty.clone();
+    let wrong_result_fixture = RequestFixture::new(&expressions, wrong_result);
     let authored = invoke(
-        &wrong_result,
-        &expressions,
+        &wrong_result_fixture,
         &ConstantPools::empty(),
         &Control::default(),
     )
@@ -621,12 +646,15 @@ fn scalar_requests_legacy_effect_fields_do_not_author_effects_and_real_owner_rej
 fn scalar_requests_reject_wrong_kind_shape_missing_argument_and_excess_before_expansion() {
     let catalog = build_builtin_engine_function_catalog().unwrap();
     let text = ty(DataType::Utf8, true);
-    let expressions = arena(vec![value(0, text.clone())]);
-    let ordinary = value(17, text.clone());
+    let expressions = vec![value(0, text.clone())];
+    let ordinary = SourceDefinition {
+        ty: text.clone(),
+        kind: ExprKind::Value(ValueId::new(17)),
+    };
+    let ordinary_fixture = RequestFixture::new(&expressions, ordinary.clone());
     assert!(matches!(
         invoke(
-            &ordinary,
-            &expressions,
+            &ordinary_fixture,
             &ConstantPools::empty(),
             &Control::default()
         ),
@@ -642,10 +670,10 @@ fn scalar_requests_reject_wrong_kind_shape_missing_argument_and_excess_before_ex
         unreachable!()
     };
     function.kind = FunctionKind::Window;
+    let non_scalar_fixture = RequestFixture::new(&expressions, non_scalar.clone());
     assert!(matches!(
         invoke(
-            &non_scalar,
-            &expressions,
+            &non_scalar_fixture,
             &ConstantPools::empty(),
             &Control::default()
         ),
@@ -657,10 +685,10 @@ fn scalar_requests_reject_wrong_kind_shape_missing_argument_and_excess_before_ex
         binding(&catalog, "lower", std::slice::from_ref(&text)),
         &[0, 0],
     );
+    let mismatch_fixture = RequestFixture::new(&expressions, mismatch.clone());
     assert!(matches!(
         invoke(
-            &mismatch,
-            &expressions,
+            &mismatch_fixture,
             &ConstantPools::empty(),
             &Control::default()
         ),
@@ -672,8 +700,9 @@ fn scalar_requests_reject_wrong_kind_shape_missing_argument_and_excess_before_ex
         binding(&catalog, "lower", std::slice::from_ref(&text)),
         &[u32::MAX],
     );
+    let missing_fixture = RequestFixture::new(&expressions, missing.clone());
     assert!(
-        matches!(invoke(&missing,&expressions,&ConstantPools::empty(),&Control::default()),
+        matches!(invoke(&missing_fixture,&ConstantPools::empty(),&Control::default()),
         Err(PhysicalScalarRequestError::MissingArgument(id)) if id==ExprId::new(u32::MAX))
     );
     let mut oversized = call(binding(&catalog, "lower", std::slice::from_ref(&text)), &[]);
@@ -682,13 +711,15 @@ fn scalar_requests_reject_wrong_kind_shape_missing_argument_and_excess_before_ex
     };
     *args = vec![ExprId::new(u32::MAX); MAX_CALL_EFFECT_ARGUMENTS + 1].into_boxed_slice();
     let control = Control::default();
+    let oversized_fixture = RequestFixture::new(&expressions, oversized.clone());
     assert!(matches!(
-        invoke(&oversized, &expressions, &ConstantPools::empty(), &control),
+        invoke(&oversized_fixture, &ConstantPools::empty(), &control),
         Err(PhysicalScalarRequestError::TooManyArguments)
     ));
     assert_eq!(control.trace(), vec![(PHASE, 0), (PHASE, 1)]);
     for source in [&ordinary, &non_scalar, &mismatch, &missing, &oversized] {
-        prefixes(source, &expressions, &ConstantPools::empty(), false, false);
+        let fixture = RequestFixture::new(&expressions, source.clone());
+        prefixes(&fixture, &ConstantPools::empty(), false, false);
     }
 }
 
@@ -736,14 +767,14 @@ fn scalar_requests_lambda_preserves_full_static_signature_and_observes_actual_pa
             ValueLogicalType::LargeInt,
         )
         .unwrap();
-        let expressions = arena(vec![node(
-            u32::MAX,
+        let expressions = vec![node(
+            0,
             result.clone(),
             ExprKind::Lambda {
                 parameter_types: parameters.clone().into_boxed_slice(),
                 body: ExprId::new(0),
             },
-        )]);
+        )];
         let mut function = binding(&catalog, "lower", &[ty(DataType::Utf8, true)]);
         function.argument_types =
             novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::from([
@@ -754,9 +785,10 @@ fn scalar_requests_lambda_preserves_full_static_signature_and_observes_actual_pa
                     result_type: result.clone(),
                 },
             ]));
-        let source = call(function, &[u32::MAX]);
+        let source = call(function, &[0]);
         let pools = ConstantPools::empty();
-        let authored = invoke(&source, &expressions, &pools, &Control::default()).unwrap();
+        let fixture = RequestFixture::new(&expressions, source.clone());
+        let authored = invoke(&fixture, &pools, &Control::default()).unwrap();
         let FunctionArgument::Lambda {
             parameter_types,
             result_type,
@@ -793,7 +825,7 @@ fn scalar_requests_lambda_preserves_full_static_signature_and_observes_actual_pa
                 )
                 .is_err()
         );
-        let trace = prefixes(&source, &expressions, &pools, true, count == 320);
+        let trace = prefixes(&fixture, &pools, true, count == 320);
         if count == 320 {
             assert!(trace.contains(&(PHASE, 256)));
             for (at, _) in trace
@@ -807,7 +839,7 @@ fn scalar_requests_lambda_preserves_full_static_signature_and_observes_actual_pa
                         ..Control::default()
                     };
                     assert!(
-                        matches!(invoke(&source,&expressions,&pools,&refused),Err(PhysicalScalarRequestError::Control(actual)) if actual==cause)
+                        matches!(invoke(&fixture,&pools,&refused),Err(PhysicalScalarRequestError::Control(actual)) if actual==cause)
                     );
                     assert_eq!(refused.trace(), trace[..=at]);
                 }
@@ -821,21 +853,23 @@ fn scalar_requests_every_small_source_and_installed_owner_callback_preserves_ori
 {
     let catalog = build_builtin_engine_function_catalog().unwrap();
     let text = ty(DataType::Utf8, true);
-    let expressions = arena(vec![value(0, text.clone())]);
+    let expressions = vec![value(0, text.clone())];
     let source = call(
         binding(&catalog, "lower", std::slice::from_ref(&text)),
         &[0],
     );
     let pools = ConstantPools::empty();
-    prefixes(&source, &expressions, &pools, true, false);
-    let authored = invoke(&source, &expressions, &pools, &Control::default()).unwrap();
+    let fixture = RequestFixture::new(&expressions, source.clone());
+    prefixes(&fixture, &pools, true, false);
+    let authored = invoke(&fixture, &pools, &Control::default()).unwrap();
     let mut wrong_result = source.clone();
     wrong_result.ty = ty(DataType::Int64, true);
     let ExprKind::FunctionCall { function, .. } = &mut wrong_result.kind else {
         unreachable!()
     };
     function.result_type = wrong_result.ty.clone();
-    let rejected = invoke(&wrong_result, &expressions, &pools, &Control::default()).unwrap();
+    let rejected_fixture = RequestFixture::new(&expressions, wrong_result);
+    let rejected = invoke(&rejected_fixture, &pools, &Control::default()).unwrap();
     // Original owner scopes, including its ordinary-error footer, are tested
     // independently from the static adapter's scope/profile above.
     for (request, success) in [(&authored, true), (&rejected, false)] {
@@ -874,13 +908,16 @@ fn scalar_requests_every_small_source_and_installed_owner_callback_preserves_ori
             }
         }
     }
-    let null = node(
-        0,
-        ty(DataType::Utf8, false),
-        ExprKind::Literal(LiteralValue::Null),
+    let mut nullable_sources = pools.clone();
+    let nullable = ty(DataType::Utf8, true);
+    let kind = crate::test_constants::insert(
+        &mut nullable_sources,
+        crate::test_constants::null()(&nullable),
     );
-    let bad_arena = arena(vec![null]);
-    prefixes(&source, &bad_arena, &pools, false, false);
+    let null = node(0, ty(DataType::Utf8, false), kind);
+    let bad_arguments = vec![null];
+    let bad_fixture = RequestFixture::new(&bad_arguments, source);
+    prefixes(&bad_fixture, &nullable_sources, false, false);
 }
 
 #[test]
@@ -890,15 +927,16 @@ fn scalar_requests_wide_actual_values_and_exact_4096_boundary_preserve_count_and
     let nodes: Vec<_> = (0..320)
         .map(|id| value(id, ty(DataType::Utf8, id % 2 == 0)))
         .collect();
-    let expressions = arena(nodes);
+    let expressions = nodes;
     let ids: Vec<u32> = (0..320).rev().collect();
     let types: Vec<_> = ids
         .iter()
-        .map(|id| expressions.get(ExprId::new(*id)).unwrap().ty.clone())
+        .map(|id| expressions[*id as usize].ty.clone())
         .collect();
     let source = call(binding(&catalog, "coalesce", &types), &ids);
     let pools = ConstantPools::empty();
-    let authored = invoke(&source, &expressions, &pools, &Control::default()).unwrap();
+    let fixture = RequestFixture::new(&expressions, source.clone());
+    let authored = invoke(&fixture, &pools, &Control::default()).unwrap();
     assert_eq!(authored.request().arguments.len(), 320);
     assert_eq!(authored.selected.argument_types.len(), 320);
     for (argument, id) in authored.request().arguments.iter().zip(&ids) {
@@ -909,7 +947,7 @@ fn scalar_requests_wide_actual_values_and_exact_4096_boundary_preserve_count_and
         else {
             unreachable!()
         };
-        assert_eq!(value_type, &expressions.get(ExprId::new(*id)).unwrap().ty);
+        assert_eq!(value_type, &fixture.argument(ExprId::new(*id)).ty);
         assert!(constant.is_none());
     }
     catalog
@@ -923,7 +961,7 @@ fn scalar_requests_wide_actual_values_and_exact_4096_boundary_preserve_count_and
         .unwrap();
     // Each actual Value leaf flushes. These sampled callbacks do not presume a
     // 256-unit callback; the lambda test isolates that real owned loop.
-    prefixes(&source, &expressions, &pools, true, true);
+    prefixes(&fixture, &pools, true, true);
     assert_eq!(MAX_CALL_EFFECT_ARGUMENTS, 4096);
     let mut boundary = source;
     let ExprKind::FunctionCall { function, args } = &mut boundary.kind else {
@@ -933,7 +971,8 @@ fn scalar_requests_wide_actual_values_and_exact_4096_boundary_preserve_count_and
         vec![FunctionArgumentType::Value(text); 4096].into_boxed_slice(),
     );
     *args = vec![ExprId::new(319); 4096].into_boxed_slice();
-    let authored = invoke(&boundary, &expressions, &pools, &Control::default()).unwrap();
+    let boundary_fixture = RequestFixture::new(&expressions, boundary);
+    let authored = invoke(&boundary_fixture, &pools, &Control::default()).unwrap();
     assert_eq!(authored.request().logical_argument_count, 4096);
     assert_eq!(authored.request().arguments.len(), 4096);
     // The boundary test is the static adapter's exact limit, not full owner

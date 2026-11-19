@@ -428,6 +428,9 @@ async fn scoped_set_and_reset_use_the_same_catalog_key_and_original_cpu() {
     };
     let identity = CatalogPropertyIdentity {
         attachment_id: uuid::Uuid::from_u128(1),
+        control_runtime_id: novarocks_spi::connector::ConnectorControlRuntimeId::from_bytes(
+            [1; 16],
+        ),
         instance_id,
         provider_id,
         generation: 1,

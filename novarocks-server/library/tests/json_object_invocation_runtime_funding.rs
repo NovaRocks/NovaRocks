@@ -32,14 +32,12 @@ use arrow::{
 use novarocks_execution::runtime::{
     kernel_memory::KernelMemoryJournal,
     query_memory::QueryMemoryBinding,
-    scalar_memory::{
-        RuntimeScalarEvaluationFailure,
-        test_support::{
-            RuntimeInvocationWrapperForTest, RuntimeInvocationWrapperReceiptForTest,
-            RuntimeScalarFrameForTest,
-        },
+    scalar_memory::test_support::{
+        RuntimeInvocationWrapperForTest, RuntimeInvocationWrapperReceiptForTest,
+        RuntimeScalarFrameForTest,
     },
 };
+use novarocks_expression::ScalarCallFailure;
 use novarocks_functions::{
     EvaluatedArgument, ScalarInvocationActivation as Activation, ScalarInvocationData, Selection,
 };
@@ -210,7 +208,7 @@ fn json_object_actual_runtime_buffer_aliases_keep_query_facts_until_cross_thread
         let (result, receipt) = wrapper.evaluate(selection, &args, Activation::Activated);
         wrapper_finished(&receipt);
         let alias = if data {
-            let Err(RuntimeScalarEvaluationFailure::Data(data)) = result else {
+            let Err(ScalarCallFailure::Data(data)) = result else {
                 panic!("original full Data")
             };
             assert_original_date32_data(&data, &rows);

@@ -2765,7 +2765,10 @@ mod sdk_nested_representation_tests {
             partition_column_names: vec![],
             transform_exprs: vec![],
             target_schema_json: serde_json::to_string(&table_schema).unwrap(),
-            parquet_row_group_size_bytes: None,
+            parquet_row_group_size_bytes:
+                crate::commit::data_writer::DEFAULT_PARQUET_ROW_GROUP_SIZE_BYTES,
+            target_file_size_bytes: crate::catalog_config::DEFAULT_TARGET_FILE_SIZE_BYTES,
+            max_partitions_per_writer: crate::catalog_config::DEFAULT_MAX_PARTITIONS_PER_WRITER,
         };
         let context =
             staged_write_context_from_frozen_facts(&binding, &input.schema(), facts).unwrap();
@@ -2934,7 +2937,10 @@ mod sdk_nested_representation_tests {
                 partition_column_names: vec![],
                 transform_exprs: vec![],
                 target_schema_json: serde_json::to_string(table_schema).unwrap(),
-                parquet_row_group_size_bytes: None,
+                parquet_row_group_size_bytes:
+                    crate::commit::data_writer::DEFAULT_PARQUET_ROW_GROUP_SIZE_BYTES,
+                target_file_size_bytes: crate::catalog_config::DEFAULT_TARGET_FILE_SIZE_BYTES,
+                max_partitions_per_writer: crate::catalog_config::DEFAULT_MAX_PARTITIONS_PER_WRITER,
             },
         )
         .unwrap();

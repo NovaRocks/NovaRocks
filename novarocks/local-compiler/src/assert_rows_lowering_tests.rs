@@ -15,7 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use novarocks_expression::StaticExprKind;
+use novarocks_expression_contract::ExprKind;
+
 use super::*;
+use crate::test_units::{PureUnitFixture, compiled_root, input_ordinal};
 use arrow_array::{Array, ListArray};
 use arrow_schema::{DataType, Field};
 use novarocks_connector_contract::PureProviderProgramCatalog;
@@ -26,21 +30,18 @@ use novarocks_functions::{
 };
 use novarocks_local_program::{
     AssertRowsMode, KernelAbiVersion, LocalOperatorId, LocalOperatorOrigin,
-    ProgramChannelLayoutRole, ProgramChannelSite, ProgramLexicalSource, ProgramNodeId,
-    ProgramNodeKind, RowAssertion, StaticExprKind, StaticSinkProgram,
+    ProgramChannelLayoutRole, ProgramChannelSite, ProgramNodeId, ProgramNodeKind, RowAssertion,
+    StaticSinkProgram,
 };
 use novarocks_physical_plan::{
-    ConstantPoolId, ConstantPools, ConstantReference, ExprKind, FragmentBuilder, FragmentCuts,
-    FragmentId, FragmentPackage, FragmentPackageAdmission, FragmentPackageInput, FragmentSink,
-    FrozenFragmentCalls, FrozenFragmentPruning, LiteralValue, NodeId, PhysicalExpressionRoots,
-    PhysicalRootUses, PipelineDopDomain, PlanLimits, PlanVersionId, PropertyProofProjectionLimits,
-    RequiredContracts, ResultField, ResultPort, RowCountAssertion, RowCountAssertionSpec, ValueId,
-    ValueOrigin,
+    ConstantPoolId, ConstantPools, ConstantReference, FragmentBuilder, FragmentCuts, FragmentId,
+    FragmentPackage, FragmentPackageAdmission, FragmentPackageInput, FragmentSink,
+    FrozenFragmentPruning, NodeId, PipelineDopDomain, PlanLimits, PlanVersionId,
+    PropertyProofProjectionLimits, RequiredContracts, ResultField, ResultPort, RowCountAssertion,
+    RowCountAssertionSpec, ValueId, ValueOrigin,
 };
 use novarocks_type_contract::{
-    CompileCheckpoints, CompileControlError, CompilePhase, ControlShape, EvaluationDomainId,
-    ExpressionControlFlow, ExpressionEffectContext, ExpressionEvaluationDomain,
-    ExpressionInvocation, ExpressionUseId, FunctionValueType, PureCompileControl,
+    CompileCheckpoints, CompileControlError, CompilePhase, FunctionValueType, PureCompileControl,
     SemanticParameters,
 };
 use novarocks_types::SlotId;
@@ -157,9 +158,9 @@ fn project(
     let mut definitions = Vec::new();
     let mut output = Vec::new();
     for (kind, ty) in items {
-        let expr = builder.add_expression(node, ty.clone(), kind).unwrap();
+        let expr = builder.fixture_value_root(node, ty.clone(), kind).unwrap();
         let value = builder
-            .add_value(ty, ValueOrigin::Expr { node, expr })
+            .add_value(ty, ValueOrigin::Expr { node, root: expr })
             .unwrap();
         definitions.push((expr, value));
         output.push(value);
@@ -172,6 +173,7 @@ fn project(
             output.clone().into_boxed_slice(),
         )
         .unwrap();
+    builder.finish_fixture_unit(node, &Control).unwrap();
     output
 }
 fn fixture(shape: Shape, downstream: bool) -> Result<Fixture, Box<dyn std::error::Error>> {
@@ -180,6 +182,7 @@ fn fixture(shape: Shape, downstream: bool) -> Result<Fixture, Box<dyn std::error
     let initial = NodeId::new(0);
     let duplicate = NodeId::new(43);
     let assertion = NodeId::new(901);
+    let mut constants = ConstantPools::empty();
     let mut builder = FragmentBuilder::new(fid);
     builder
         .add_values(empty, Box::from([Box::default()]), Box::default())
@@ -236,9 +239,15 @@ fn fixture(shape: Shape, downstream: bool) -> Result<Fixture, Box<dyn std::error
         initial,
         empty,
         vec![
-            (ExprKind::Literal(LiteralValue::Int64(11)), integer.clone()),
+            (
+                crate::test_constants::i64(&mut constants, &integer, 11, options().constants),
+                integer.clone(),
+            ),
             (ExprKind::Constant(selected), nested.clone()),
-            (ExprKind::Literal(LiteralValue::Null), text.clone()),
+            (
+                crate::test_constants::null(&mut constants, &text, options().constants),
+                text.clone(),
+            ),
         ],
     );
     let mut projected = Vec::new();
@@ -250,21 +259,22 @@ fn fixture(shape: Shape, downstream: bool) -> Result<Fixture, Box<dyn std::error
         .enumerate()
     {
         let expr = builder
-            .add_expression(duplicate, ty.clone(), ExprKind::Value(value))
+            .fixture_value_root(duplicate, ty.clone(), ExprKind::Value(value))
             .unwrap();
         let output = builder
             .add_value(
                 ty,
                 ValueOrigin::Expr {
                     node: duplicate,
-                    expr,
+                    root: expr,
                 },
             )
             .unwrap();
         projected.push((expr, output));
         child.push(output);
         if index == 0 {
-            projected.push((expr, output));
+            let duplicate_root = builder.fixture_repeated_root(duplicate, expr).unwrap();
+            projected.push((duplicate_root, output));
             child.push(output);
         }
     }
@@ -276,6 +286,7 @@ fn fixture(shape: Shape, downstream: bool) -> Result<Fixture, Box<dyn std::error
             child.clone().into_boxed_slice(),
         )
         .unwrap();
+    builder.finish_fixture_unit(duplicate, &Control)?;
     let spec = match shape {
         Shape::Global(comparison, desired_rows) => RowCountAssertionSpec::Global {
             subject: "actual scalar query\0λ".into(),
@@ -369,37 +380,6 @@ fn fixture(shape: Shape, downstream: bool) -> Result<Fixture, Box<dyn std::error
         &Control,
         novarocks_physical_plan::StagePlacementPolicy::Singleton,
     )?;
-    let roots = PhysicalExpressionRoots::try_new(&fragment, &Control)?;
-    let domain = EvaluationDomainId::new(u32::MAX);
-    let mut uses = Vec::new();
-    let mut bindings = Vec::new();
-    for (ordinal, (site, root)) in roots.sites().iter().enumerate() {
-        let id = ExpressionUseId::new(u32::MAX - ordinal as u32);
-        uses.push(ExpressionInvocation {
-            context: ExpressionEffectContext {
-                use_id: id,
-                domain,
-                demand: root.demand,
-            },
-            definition: root.expr,
-            control: ControlShape::Eager,
-            arguments: Box::default(),
-        });
-        bindings.push((*site, id));
-    }
-    let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
-            id: domain,
-            parent: None,
-            guard: None,
-        }],
-        uses,
-        fragment.expressions(),
-        CompilePhase::Validate,
-        &Control,
-    )?;
-    let uses = PhysicalRootUses::try_new(&fragment, flow, bindings, &Control)?;
-    let calls = FrozenFragmentCalls::try_new(&fragment, &uses, vec![], &Control)?;
     let result = ResultPort {
         scalar_schema: None,
         fragment: fid,
@@ -417,7 +397,6 @@ fn fixture(shape: Shape, downstream: bool) -> Result<Fixture, Box<dyn std::error
             .collect::<Vec<_>>()
             .into_boxed_slice(),
     };
-    let mut constants = ConstantPools::empty();
     constants.insert(pool_id, pool)?;
     let package = FragmentPackage::try_new(
         FragmentPackageInput {
@@ -425,8 +404,7 @@ fn fixture(shape: Shape, downstream: bool) -> Result<Fixture, Box<dyn std::error
             version: PlanVersionId::try_new([81; 16]).unwrap(),
             required: RequiredContracts::default(),
             fragment,
-            expression_uses: uses,
-            calls,
+            statement_constant_policy: options().constants,
             pruning: FrozenFragmentPruning::try_new(fid, vec![], &Control)?,
             cuts: FragmentCuts::default(),
             result: Some(result),
@@ -434,6 +412,7 @@ fn fixture(shape: Shape, downstream: bool) -> Result<Fixture, Box<dyn std::error
             scans: BTreeMap::new(),
             writes: BTreeMap::new(),
             annotations: Box::default(),
+            layouts: Default::default(),
         },
         admission(),
         &Control,
@@ -541,13 +520,7 @@ fn assert_rows_complete_keyed_preserves_order_duplicate_occurrences_full_source_
     };
     assert_eq!(field.name(), "item");
     assert!(field.metadata().is_empty());
-    let source_pool = source
-        .package
-        .constants()
-        .entries()
-        .values()
-        .next()
-        .unwrap();
+    let source_pool = &source.package.constants().entries()[&source.selected.pool];
     let DataType::List(source_field) = source_pool.field_ref().data_type() else {
         panic!("original source List");
     };
@@ -565,7 +538,6 @@ fn assert_rows_complete_keyed_preserves_order_duplicate_occurrences_full_source_
             .columns[ordinal as usize];
         assert!(
             program
-                .checked()
                 .channels()
                 .channel_type(site)
                 .unwrap()
@@ -578,10 +550,10 @@ fn assert_rows_complete_keyed_preserves_order_duplicate_occurrences_full_source_
                 .unwrap()
         );
     }
-    let value = graph
-        .expressions()
-        .nodes()
+    let value = program
+        .units()
         .iter()
+        .flat_map(|unit| unit.definitions().nodes())
         .find_map(|node| match node.kind() {
             StaticExprKind::Constant(value) if value.ordinal() == 1 => Some(value),
             _ => None,
@@ -630,16 +602,12 @@ fn assert_rows_downstream_value_uses_original_passthrough_occurrence_and_keeps_s
         child.output_layout().slots()
     );
     for (expression, ordinal) in exprs.iter().zip([0, 3]) {
-        assert!(
-            matches!(graph.expressions().node(*expression).unwrap().kind(), StaticExprKind::SlotId(slot)
-            if *slot == assertion.output_layout().slots()[ordinal])
-        );
-        assert!(program.checked().slots().values().any(|source| *source
-            == ProgramLexicalSource::Input(ProgramChannelSite::Layout {
-                node: ProgramNodeId::new(3),
-                role: ProgramChannelLayoutRole::NodeOutput,
-                ordinal: ordinal as u32
-            })));
+        assert_eq!(input_ordinal(&program, *expression), ordinal as u32);
+        let (unit, root) = compiled_root(&program, *expression);
+        assert!(Arc::ptr_eq(
+            unit.scope(root.scope).unwrap().schema(),
+            assertion.output_layout().schema()
+        ));
     }
 }
 

@@ -84,7 +84,8 @@ impl OperatorFactory for CompiledJoinProbeProcessorFactory {
             declaration: self.declaration.clone(),
             error: self.error.clone(),
             slot,
-            control: RuntimeKernelControl::new(self.error.clone()),
+            control: RuntimeKernelControl::new(self.error.clone())
+                .at_expression_node(self.declaration.node()),
             construction: None,
             tracker: None,
             frame: None,
@@ -107,9 +108,9 @@ struct ProbeDefinition {
     payload_only: bool,
     scope_keys: usize,
     key_count: usize,
-    sites: Vec<ProgramExpressionRootSite>,
+    sites: Vec<ProgramRootRef>,
     bindings: Vec<FunctionValueType>,
-    predicate: Option<ProgramExpressionRootSite>,
+    predicate: Option<ProgramRootRef>,
     _storage: ValueTypeStorageLifetime,
 }
 impl ProbeDefinition {
@@ -154,21 +155,11 @@ impl ProbeDefinition {
                     owner,
                     key_count + usize::from(condition.residual_predicate().is_some()),
                 )?;
-                let site = |role| ProgramExpressionRootSite::Node { node, role };
-                for key in 0..scope_keys {
-                    let key = u32::try_from(key).map_err(|_| {
-                        build_contract("join scope ordinal exceeds its frozen u32 representation")
-                    })?;
-                    sites.push(site(ProgramNodeExpressionRole::NaaScopeProbeKey { key }));
+                for key in condition.scope_keys() {
+                    sites.push(key.probe);
                 }
                 sites.extend(declaration.hash_plan()?.probe_sites.iter().copied());
-                predicate = condition.residual_predicate().map(|_| {
-                    site(if naa {
-                        ProgramNodeExpressionRole::NaaEligibility
-                    } else {
-                        ProgramNodeExpressionRole::JoinResidual
-                    })
-                });
+                predicate = condition.residual_predicate();
             }
             ProgramNodeKind::NestedLoopJoin {
                 join_type,
@@ -190,10 +181,7 @@ impl ProbeDefinition {
                 naa = false;
                 scope_keys = 0;
                 key_count = 0;
-                predicate = join_conjunct.map(|_| ProgramExpressionRootSite::Node {
-                    node,
-                    role: ProgramNodeExpressionRole::NestedLoopPredicate,
-                });
+                predicate = *join_conjunct;
                 sites = funded_vec(owner, usize::from(predicate.is_some()))?;
             }
             _ => {

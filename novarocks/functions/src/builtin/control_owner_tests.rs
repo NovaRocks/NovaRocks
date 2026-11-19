@@ -23,7 +23,7 @@ use crate::{
 };
 use arrow_schema::{DataType, Field};
 use novarocks_type_contract::{
-    CompilePhase, DecimalOverflowPolicy, EvaluationDemand, EvaluationDomainId,
+    CompilePhase, DecimalOverflowPolicy, EvaluationDemand, EvaluationRegionId,
     ExpressionEffectContext, ExpressionEffects, ExpressionUseId, SemanticParameterId,
     SemanticParameterKey, SemanticParameterRef, SemanticParameters, ValueLogicalType,
 };
@@ -87,7 +87,7 @@ fn record(name: &str, overload: &str) -> InstalledPureKernel {
 fn context() -> ExpressionEffectContext {
     ExpressionEffectContext {
         use_id: ExpressionUseId::new(17),
-        domain: EvaluationDomainId::new(5),
+        region: EvaluationRegionId::new(5),
         demand: EvaluationDemand::Value,
     }
 }
@@ -123,7 +123,7 @@ fn input<'a>(
     parameters: &'a SemanticParameters,
 ) -> CallEffectInput<'a> {
     CallEffectInput {
-        context: context(),
+        context: (context()).into(),
         argument_uses: crate::CallArgumentUses::SelectedChannels(uses),
         function_id: owner.declaration.function_id(),
         kind: FunctionKind::Scalar,
@@ -132,7 +132,7 @@ fn input<'a>(
         environment: &[],
         parameters,
         decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-        proof_scope: CallProofScope::Domain(context().domain),
+        proof_scope: CallProofScope::Region(context().region),
     }
 }
 fn uses(count: usize) -> Vec<Option<ExpressionUseId>> {
@@ -303,7 +303,7 @@ fn frozen_effect_tampering_never_falls_back_to_fresh_facts() {
         facts.observable_effects.rng_sampling = true;
         mutations.push(facts);
         let mut facts = correct.clone();
-        facts.proof_scope = CallProofScope::Domain(EvaluationDomainId::new(99));
+        facts.proof_scope = CallProofScope::Region(EvaluationRegionId::new(99));
         mutations.push(facts);
         let mut facts = correct.clone();
         facts.environment = vec![SemanticParameterRef {
@@ -354,7 +354,7 @@ fn wrong_occurrence_scope_and_scalar_preparation_are_refused() {
         Err(FunctionSpecializationFailure::Effects(_))
     ));
     let mut wrong_scope = exact;
-    wrong_scope.proof_scope = CallProofScope::Domain(EvaluationDomainId::new(88));
+    wrong_scope.proof_scope = CallProofScope::Region(EvaluationRegionId::new(88));
     assert!(
         catalog
             .prepare_fresh(
@@ -574,7 +574,7 @@ fn ordinary_owner_refusal_observes_completed_tail_and_preserves_control() {
     let parameters = SemanticParameters::try_new([]).unwrap();
     let uses = uses(3);
     let mut exact = input(&owner, &selected, &arguments, &uses, &parameters);
-    exact.proof_scope = CallProofScope::Domain(EvaluationDomainId::new(99));
+    exact.proof_scope = CallProofScope::Region(EvaluationRegionId::new(99));
     let successful = Trace {
         trace: Mutex::new(Vec::new()),
         fail_at: None,
@@ -616,9 +616,13 @@ fn actual_fresh_and_frozen_factories_keep_original_control_at_every_boundary() {
     let parameters = SemanticParameters::try_new([]).unwrap();
     let uses = uses(3);
     let mut exact = input(&owner, &selected, &arguments, &uses, &parameters);
-    exact.context.demand = EvaluationDemand::TruthOnly;
+    exact.context = ExpressionEffectContext {
+        demand: EvaluationDemand::TruthOnly,
+        ..exact.context.expression().unwrap()
+    }
+    .into();
     let options = || PureCallPreparation::ControlIntrinsic {
-        arguments: ScopedExpressionEffects::pure_value(exact.context),
+        arguments: ScopedExpressionEffects::pure_value(exact.context.expression().unwrap()),
     };
     let canonical = catalog
         .prepare_fresh(

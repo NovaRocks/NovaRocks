@@ -18,19 +18,22 @@
 //! Genuine SQL completion/journal merge requests; no manual journal constructor.
 
 use super::super::{
+    contract_lowering::{
+        NodeExpressionEffects, node_effects_with_test_summaries, pure_node_effects_for_test,
+    },
     expression_occurrences::author_physical_occurrences_observed,
     lowered_draft::CheckedAggregateLogicalSourceEntry,
     physical_aggregate_requests::{
         PhysicalAggregateRequestError, author_physical_aggregate_merge_request_observed,
     },
-    physical_expression_effects::{
-        PhysicalExpressionEffectsInput, author_physical_expression_effects_observed,
-    },
 };
 use super::*;
-use novarocks_functions::{AggregateKernelPhase, PreparedPureKernel};
+use novarocks_functions::{
+    AggregateKernelPhase, PreparedPureKernel, ScopedExpressionEffects, ScopedRelationalEffects,
+};
 use novarocks_physical_plan::{AggregatePhase, NodeKind};
 use novarocks_type_contract::{CompilePhase, EvaluationDemand, PureCompileControl};
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 #[derive(Default)]
@@ -93,34 +96,31 @@ fn loan<'a>(
 fn setup<'a>(
     entry: &CheckedAggregateLogicalSourceEntry<'a>,
     owner: &crate::compiler::SqlAuthoredPhysicalPlan,
-) -> (
-    AuthoredPhysicalOccurrences<'a>,
-    BTreeMap<ExpressionUseId, ScopedExpressionEffects>,
-) {
+) -> (AuthoredPhysicalOccurrences<'a>, NodeExpressionEffects) {
     let control = Control::default();
-    let catalog = crate::functions::builtin_sql_function_catalog();
-    let occurrences =
-        author_physical_occurrences_observed(entry.fragment(), catalog, &control).unwrap();
-    let expressions = author_physical_expression_effects_observed(
-        PhysicalExpressionEffectsInput {
-            temporal_sources: None,
-            fragment: entry.fragment(),
-            roots: &occurrences.root_uses,
-            constants: owner.plan().constants(),
-            parameters: owner.plan().parameters(),
-            literal_policy: entry.captured().constant_policy(),
-            call_scopes: &BTreeMap::new(),
-        },
-        catalog,
+    assert!(std::ptr::eq(
+        entry.fragment(),
+        owner
+            .plan()
+            .fragments()
+            .get(&entry.fragment().id())
+            .unwrap()
+    ));
+    let occurrences = author_physical_occurrences_observed(
+        entry.fragment(),
+        owner.function_catalog().as_ref(),
         &control,
     )
     .unwrap();
-    (occurrences, expressions.summaries)
+    let children = pure_node_effects_for_test(entry.fragment())
+        .remove(&entry.node().id)
+        .unwrap();
+    (occurrences, children)
 }
 fn run(
     entry: &CheckedAggregateLogicalSourceEntry<'_>,
     occurrences: &AuthoredPhysicalOccurrences,
-    children: &BTreeMap<ExpressionUseId, ScopedExpressionEffects>,
+    children: &NodeExpressionEffects,
     parameters: &SemanticParameters,
     policy: DecimalOverflowPolicy,
     control: &dyn PureCompileControl,
@@ -143,7 +143,7 @@ fn run(
                 source: entry.source(),
                 request: &request,
                 occurrences,
-                child_effects: children,
+                child_effects: Some(children),
                 parameters,
                 environment: &[],
                 decimal_overflow_policy: policy,
@@ -205,13 +205,22 @@ fn merge_genuine_count_star_keeps_logical_zero_and_physical_state_one() {
     assert_eq!(request.request().logical_argument_count, 0);
     assert!(request.request().arguments.is_empty());
     assert_eq!(entry.source().arguments.len(), 1);
-    assert_eq!(request.state_id(), entry.source().arguments[0]);
+    assert_eq!(
+        request.state_id(),
+        entry
+            .fragment()
+            .root_expression(entry.node().id, entry.source().arguments[0])
+            .unwrap()
+            .id
+    );
     assert!(std::ptr::eq(
         request.state(),
         entry
-            .fragment()
-            .expressions()
-            .get(request.state_id())
+            .node()
+            .expressions
+            .as_ref()
+            .unwrap()
+            .definition(request.state_id())
             .unwrap()
     ));
     assert_eq!(request.phase(), AggregateKernelPhase::Final);
@@ -283,8 +292,7 @@ fn merge_genuine_count_min_max_keep_original_complete_logical_signature() {
             Some(
                 &entry
                     .fragment()
-                    .expressions()
-                    .get(entry.source().arguments[0])
+                    .root_expression(entry.node().id, entry.source().arguments[0])
                     .unwrap()
                     .ty
             )
@@ -359,7 +367,10 @@ fn merge_missing_actual_state_effects_refuses_instead_of_using_pure_default() {
     let owner = crate::compiler::compile_authored_aggregate_for_test("SELECT COUNT(*) FROM orders");
     let entry = loan(&owner, &Control::default());
     let (occurrences, _) = setup(&entry, &owner);
-    let children = BTreeMap::new();
+    let children = node_effects_with_test_summaries(
+        entry.node().expressions.as_ref().unwrap().clone(),
+        BTreeMap::new(),
+    );
     assert!(matches!(
         run(
             &entry,
@@ -394,22 +405,15 @@ fn merge_state_summary_context_preserves_conservative_child_row_error() {
         crate::compiler::compile_authored_aggregate_for_test("SELECT MIN(order_key) FROM orders");
     let entry = loan(&owner, &Control::default());
     let (occurrences, mut children) = setup(&entry, &owner);
-    let site = ExpressionRootSite {
-        node: entry.node().id,
-        role: ExpressionRootRole::AggregateArgument {
-            call: match entry.site() {
-                PhysicalCallSite::Aggregate { call, .. } => call,
-                _ => unreachable!(),
-            },
-            argument: 0,
-        },
-    };
-    let id = occurrences.root_uses.bindings()[&site];
-    let context = occurrences.root_uses.flow().uses()[&id].context;
+    let unit = entry.node().expressions.as_ref().unwrap();
+    let id = unit.root_use(entry.source().arguments[0]).unwrap();
+    let context = unit.control_flow().uses()[&id].context;
     assert_eq!(context.demand, EvaluationDemand::Value);
     let mut effects = ExpressionEffects::PURE_VALUE;
     effects.may_raise_row_error = true;
-    children.insert(id, ScopedExpressionEffects::primitive(context, effects));
+    let mut summaries = children.summaries().clone();
+    summaries.insert(id, ScopedExpressionEffects::primitive(context, effects));
+    children = node_effects_with_test_summaries(unit.clone(), summaries);
     let result = run(
         &entry,
         &occurrences,
@@ -427,7 +431,10 @@ fn merge_state_summary_context_preserves_conservative_child_row_error() {
             .unwrap()
             .may_raise_row_error
     );
-    assert_ne!(result.frozen.context.domain, context.domain);
+    assert_ne!(
+        novarocks_type_contract::CallEffectContext::Relation(result.frozen.context),
+        novarocks_type_contract::CallEffectContext::Expression(context)
+    );
 }
 
 #[test]
@@ -473,26 +480,15 @@ fn merge_real_count_attachment_frozen_preparation_preserves_same_arc_and_state_d
         CompileCheckpoints::try_new(&control, CompilePhase::FunctionSpecialization).unwrap();
     let request = author_physical_aggregate_merge_request_observed(&entry, &mut work).unwrap();
     let context = relational_context_observed(&occurrences, entry.site(), &mut work).unwrap();
-    let PhysicalCallSite::Aggregate { node, call } = entry.site() else {
-        unreachable!()
-    };
-    let (id, effects) = relational_root_effects_observed(
-        &occurrences.root_uses,
-        ExpressionRootSite {
-            node,
-            role: ExpressionRootRole::AggregateArgument { call, argument: 0 },
-        },
-        request.state_id(),
-        &children,
-        &mut work,
-    )
-    .unwrap();
-    let state_context = occurrences.root_uses.flow().uses()[&id].context;
+    let unit = entry.node().expressions.as_ref().unwrap();
+    let (id, effects) =
+        relational_root_effects_observed(unit, request.state_root(), &children, &mut work).unwrap();
+    let state_context = unit.control_flow().uses()[&id].context;
     let input = CallEffectInput {
-        context,
+        context: context.into(),
         argument_uses: novarocks_functions::CallArgumentUses::AggregateMerge {
             phase: request.phase(),
-            state_context,
+            state_context: state_context.into(),
             state_input_type: &request.state().ty,
         },
         function_id: &request.function().function_id,
@@ -504,7 +500,7 @@ fn merge_real_count_attachment_frozen_preparation_preserves_same_arc_and_state_d
         decimal_overflow_policy: request.decimal_overflow_policy(),
         proof_scope: CallProofScope::Unconditional,
     };
-    let options = || request.preparation(ScopedExpressionEffects::primitive(context, effects));
+    let options = || request.preparation(ScopedRelationalEffects::primitive(context, effects));
     let fresh = catalog
         .prepare_fresh(input, Arc::clone(request.selected()), options(), &control)
         .unwrap();
@@ -565,7 +561,7 @@ fn merge_foreign_equal_sql_owner_cannot_replace_the_original_checked_journal_loa
                     source,
                     request: &request,
                     occurrences: &occurrences,
-                    child_effects: &children,
+                    child_effects: Some(&children),
                     parameters: owner.plan().parameters(),
                     environment: &[],
                     decimal_overflow_policy: request.decimal_overflow_policy(),

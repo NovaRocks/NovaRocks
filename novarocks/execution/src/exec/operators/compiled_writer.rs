@@ -43,14 +43,10 @@ use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef};
 use arrow::datatypes::SchemaRef;
-use novarocks_local_program::{
-    LocalProgram, ProgramChannelLayoutRole, ProgramExpressionRootSite, ProgramNodeId,
-    ProgramNodeKind, ProgramRootInput, root_input_layout,
-};
+use novarocks_local_program::{LocalProgram, ProgramNodeId, ProgramNodeKind, ProgramRootRef};
 
 use super::compiled_writer_failure as failure;
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
-use crate::exec::expr::compiled_program::CompiledExpressionInstance;
 use crate::exec::node::table_finish::TableFinishRuntimeBinding;
 use crate::exec::node::table_write_relation::{
     RootWriteResultRelationTemplate, WriterMultiplexRelationTemplate,
@@ -67,6 +63,7 @@ use crate::exec::operators::{TableFinishOperatorFactory, TableWriterOperatorFact
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::runtime::runtime_state::RuntimeErrorState;
 use crate::runtime::task::ExecutionResult;
+use novarocks_expression::CompiledExpressionInstance;
 
 /// Build the compiled writer of local node `id` over the Task's exact write
 /// capability.
@@ -243,8 +240,9 @@ fn compiled_finish_core(
 /// The compiled projection of one writer: one `WriterProjection` root per
 /// provider input field, read over the writer's input port.
 pub(crate) struct CompiledWriterProjection {
+    node: ProgramNodeId,
     program: Arc<LocalProgram>,
-    sites: Arc<[ProgramExpressionRootSite]>,
+    sites: Arc<[ProgramRootRef]>,
     value_types: Arc<[WriterProjectionValueTypes]>,
     /// The complete execution projection. Provider requiredness remains an
     /// independent per-row obligation below.
@@ -272,10 +270,7 @@ impl CompiledWriterProjection {
                 format!("missing compiled table writer node {}", id.index()),
             )
         })?;
-        let ProgramNodeKind::TableWriter {
-            input, projection, ..
-        } = node.kind()
-        else {
+        let ProgramNodeKind::TableWriter { projection, .. } = node.kind() else {
             return Err(program_binding_failure(
                 PlanBindingKind::InvalidAssignment,
                 format!("compiled node {} is not a TableWriter", id.index()),
@@ -312,38 +307,11 @@ impl CompiledWriterProjection {
         let mut sites = Vec::with_capacity(fields.len());
         let mut value_types = Vec::with_capacity(fields.len());
         for (ordinal, required) in recipe.draft().input().fields_iter().enumerate() {
-            let site = ProgramExpressionRootSite::WriterProjection {
-                node: id,
-                expression: novarocks_local_program::checked_program_ordinal(ordinal)
-                    .map_err(crate::runtime::task::ExecutionFailure::from_domain)?,
-            };
-            // Every projected value reads the writer's input port, the batch
-            // the writer is pushed.
-            match root_input_layout(program.graph(), site) {
-                Ok(ProgramRootInput::Layout {
-                    node,
-                    role: ProgramChannelLayoutRole::NodeOutput,
-                }) if node == *input => {}
-                other => {
-                    return Err(program_binding_failure(
-                        PlanBindingKind::InvalidAssignment,
-                        format!(
-                            "compiled writer projection {ordinal} at local node {} does not read its input port: {other:?}",
-                            id.index()
-                        ),
-                    ));
-                }
-            }
-            let Some(novarocks_functions::FunctionArgumentType::Value(source)) =
-                program.checked().channels().expressions().definition_type(
-                    novarocks_local_program::ProgramExpressionArena::WriterProjection(id),
-                    projection.expressions[ordinal],
-                )
-            else {
-                return Err(failure::contract(
-                    "writer projection lost its complete source declaration",
-                ));
-            };
+            let site = projection.expressions[ordinal];
+            let source = super::compiled_expression::root_value_type_ref(&program, site)
+                .ok_or_else(|| {
+                    failure::contract("writer projection lost its complete source declaration")
+                })?;
             let requirement = required.execution_type().ok_or_else(|| {
                 failure::contract("writer input lost its original target requirement")
             })?;
@@ -365,6 +333,7 @@ impl CompiledWriterProjection {
         let schema = Arc::new(arrow::datatypes::Schema::new(fields));
         let layout = projection.layout.clone();
         Ok(Self {
+            node: id,
             program,
             sites: Arc::from(sites),
             value_types: Arc::from(value_types),
@@ -385,7 +354,8 @@ impl WriterProjectionFactory for CompiledWriterProjection {
             layout: self.layout.clone(),
             chunk_schema: None,
             construction: None,
-            control: RuntimeKernelControl::new(Arc::clone(&self.error)),
+            control: RuntimeKernelControl::new(Arc::clone(&self.error))
+                .at_expression_node(self.node),
             instances: None,
         })
     }
@@ -394,7 +364,7 @@ impl WriterProjectionFactory for CompiledWriterProjection {
 /// One driver's projection: its own compiled instance per root.
 struct CompiledWriterProjector {
     program: Arc<LocalProgram>,
-    sites: Arc<[ProgramExpressionRootSite]>,
+    sites: Arc<[ProgramRootRef]>,
     value_types: Arc<[WriterProjectionValueTypes]>,
     schema: SchemaRef,
     layout: novarocks_local_program::StaticLayout,
@@ -407,16 +377,17 @@ struct CompiledWriterProjector {
 #[cfg(test)]
 pub(crate) fn source_loan_test_projector(
     program: Arc<LocalProgram>,
-    observer: Option<Arc<crate::exec::expr::compiled_program::input_source::SlotSourceObserver>>,
+    observer: Option<Arc<crate::exec::operators::compiled_expression::InputAdapterObserver>>,
 ) -> Box<dyn WriterPageProjection> {
-    use novarocks_local_program::ProgramNodeExpressionRole;
     // Reuse the original checked Slot fixture, through the actual projector's
     // project() method. This fixture tests input borrowing and handoff, not
     // provider recipe construction or WriterProjection root admission.
-    let site = ProgramExpressionRootSite::Node {
-        node: ProgramNodeId::new(3),
-        role: ProgramNodeExpressionRole::ProjectOutput { expression: 1 },
+    let node = ProgramNodeId::new(3);
+    let ProgramNodeKind::Project { exprs, .. } = program.graph().nodes()[node.index()].kind()
+    else {
+        panic!("the original source-loan fixture node is Project");
     };
+    let site = exprs[1];
     let input = program.graph().nodes()[2].output_layout();
     let field = Arc::clone(&input.schema().fields()[1]);
     let schema = Arc::new(arrow::datatypes::Schema::new(vec![field]));
@@ -435,12 +406,13 @@ pub(crate) fn source_loan_test_projector(
     let tracker =
         crate::runtime::mem_tracker::MemTracker::new_root("writer source-loan construction");
     tracker.install_limit_once(64 * 1024 * 1024).unwrap();
-    let mut control = RuntimeKernelControl::new(Arc::new(RuntimeErrorState::default()));
+    let mut control =
+        RuntimeKernelControl::new(Arc::new(RuntimeErrorState::default())).at_expression_node(node);
     control.bind_mem_tracker(tracker.clone());
     let mut slots = None;
     instances(&mut slots, &program, &[site], &control).unwrap();
     if let Some(observer) = observer {
-        slots.as_mut().unwrap()[0].observe_slot_source(observer);
+        control.observe_input_adapter(observer);
     }
     let factory = crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
         crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),

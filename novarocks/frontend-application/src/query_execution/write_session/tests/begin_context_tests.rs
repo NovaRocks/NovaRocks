@@ -1,0 +1,285 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use super::*;
+use novarocks_spi::connector as spi;
+use std::time::{Duration, Instant};
+
+struct BeginSink;
+impl spi::ConnectorVendedCredentialLeaseSink for BeginSink {
+    fn offer_vended_s3_credential_lease(
+        &self,
+        _: &spi::CatalogProperties,
+        _: spi::VendedS3CredentialLeaseContribution,
+    ) -> Result<(), ConnectorError> {
+        panic!("the scripted begin provider contributes no credential response")
+    }
+}
+
+fn nonempty_properties() -> spi::CatalogProperties {
+    spi::CatalogProperties::new(
+        catalog_handle(),
+        spi::ConnectorProviderId::parse("iceberg").unwrap(),
+        1,
+        vec![spi::CatalogProperty::new("uri", "http://127.0.0.1:12345").unwrap()],
+        vec![
+            spi::CatalogCredentialBinding::try_new(
+                spi::CatalogCredentialPurpose::ObjectStoreData,
+                spi::CredentialConsumerRole::Backend,
+                spi::CatalogCredentialMode::Vended,
+            )
+            .unwrap(),
+        ],
+    )
+    .unwrap()
+}
+
+fn attempt_context(
+    stop: &spi::ConnectorStopOwner,
+) -> (
+    ConnectorRequestContext,
+    Arc<dyn spi::ConnectorVendedCredentialLeaseSink>,
+) {
+    let sink: Arc<dyn spi::ConnectorVendedCredentialLeaseSink> = Arc::new(BeginSink);
+    let context = ConnectorRequestContext::try_new(
+        Instant::now() + Duration::from_secs(60),
+        stop.view(),
+        4096,
+        65536,
+    )
+    .unwrap()
+    .with_vended_credential_lease_sink(Arc::clone(&sink));
+    (context, sink)
+}
+
+fn unopened_begin() -> (ConnectorWriteStackPin, Arc<Mutex<Recorded>>) {
+    let (lease, recorded) = unopened_fixture(1, 16, commit_unknown());
+    recorded.lock().unwrap().capture_begin_context = true;
+    (lease, recorded)
+}
+
+struct BoundLegacyControl(spi::ConnectorProviderBindingKey);
+impl LegacyWriteControl for BoundLegacyControl {
+    fn binding_key(&self) -> &spi::ConnectorProviderBindingKey {
+        &self.0
+    }
+}
+
+fn exact_write_lease(
+    stack: &ConnectorWriteStackPin,
+    properties: spi::CatalogProperties,
+) -> spi::ConnectorWrite {
+    let key = stack.session().binding_key().clone();
+    spi::ConnectorWrite::new_with_control_runtime_id(
+        stack.control_runtime_id(),
+        key.clone(),
+        Arc::new(BoundLegacyControl(key)),
+        || {},
+    )
+    .unwrap()
+    .with_catalog_properties(properties)
+    .unwrap()
+}
+
+fn assert_attempt_at_provider(
+    captured: &ConnectorRequestContext,
+    original: &ConnectorRequestContext,
+    sink: &Arc<dyn spi::ConnectorVendedCredentialLeaseSink>,
+    properties: &spi::CatalogProperties,
+) {
+    assert_eq!(captured.deadline(), original.deadline());
+    assert!(!captured.is_cancelled());
+    assert!(Arc::ptr_eq(
+        captured.vended_credential_lease_sink().unwrap(),
+        sink
+    ));
+    assert_eq!(
+        captured
+            .vended_credential_lease_collection()
+            .expect("provider begin needs the exact attempt collection")
+            .catalog_properties(),
+        properties,
+    );
+}
+
+fn property_inputs(
+    runtime: spi::ConnectorControlRuntimeId,
+    binding: &spi::ConnectorProviderBindingKey,
+) -> Arc<novarocks_query_application::sql::session::registry::SessionPropertyInputs> {
+    use novarocks_query_application::sql::session::registry::*;
+    struct Factory(spi::ConnectorProviderId);
+    impl CatalogPropertyDeclarationFactory for Factory {
+        fn provider_id(&self) -> &spi::ConnectorProviderId {
+            &self.0
+        }
+        fn declarations(
+            &self,
+            _: &CatalogPropertyIdentity,
+            _: &[(String, String)],
+        ) -> Result<Vec<PropertyDeclaration>, SessionPropertyError> {
+            Ok(vec![PropertyDeclaration::catalog(
+                "max_partitions_per_writer",
+                SessionPropertyType::Integer,
+                Some(SessionPropertyValue::Integer(100)),
+                "Writer limit",
+                false,
+                |_| Ok(()),
+            )?])
+        }
+    }
+    let provider_id = spi::ConnectorProviderId::parse("iceberg").unwrap();
+    let instance_id = catalog_handle().catalog_name().clone();
+    let registry = SessionPropertyRegistry::with_catalog_factories(vec![Arc::new(Factory(
+        provider_id.clone(),
+    ))])
+    .unwrap();
+    let catalog = instance_id.as_str().to_owned();
+    let metadata = registry
+        .bind_catalog(
+            &catalog,
+            CatalogPropertyIdentity {
+                attachment_id: uuid::Uuid::nil(),
+                control_runtime_id: runtime,
+                binding_key: binding.clone(),
+                instance_id,
+                provider_id,
+                generation: 1,
+            },
+            &[],
+        )
+        .unwrap();
+    let mut properties = SessionPropertyInputs::default();
+    properties.insert(
+        metadata
+            .prepare_header(&catalog, "max_partitions_per_writer", "2")
+            .unwrap(),
+    );
+    Arc::new(properties)
+}
+
+#[test]
+fn ordinary_and_pending_begin_bind_exact_catalog_to_original_attempt() {
+    for pending in [false, true] {
+        let (lease, recorded) = unopened_begin();
+        let original_session = Arc::new(Mutex::new(None));
+        let receiving = WriteBeginReceiving::for_statement(
+            Arc::clone(&original_session),
+            property_inputs(lease.control_runtime_id(), lease.session().binding_key()),
+        );
+        let stop = spi::ConnectorStopOwner::new();
+        let (context, sink) = attempt_context(&stop);
+        let original = context.clone();
+        let properties = nonempty_properties();
+        let write_lease = exact_write_lease(&lease, properties.clone());
+        let session = if pending {
+            let (declaration, _) = application_document_publication();
+            let mut request = application_document_begin_request(declaration);
+            request.context = context;
+            futures::executor::block_on(
+                begin_connector_application_document_write_session_pending_async_in(
+                    lease,
+                    &write_lease,
+                    request,
+                    &receiving,
+                ),
+            )
+        } else {
+            let mut request = begin_request();
+            request.context = context;
+            futures::executor::block_on(ConnectorWriteSession::begin_async_in(
+                lease,
+                write_lease.catalog_properties().unwrap().clone(),
+                request,
+                &receiving,
+            ))
+        }
+        .unwrap();
+        drop(receiving);
+        drop(original_session);
+        let mut recorded = recorded.lock().unwrap();
+        assert_eq!(recorded.begin, 1);
+        assert_eq!(
+            recorded
+                .begin_catalog_session
+                .get("max_partitions_per_writer"),
+            Some(&spi::read_stack::SessionPropertyValue::Integer(2)),
+        );
+        let captured = recorded.begin_context.take().unwrap();
+        assert_attempt_at_provider(&captured, &original, &sink, &properties);
+        assert!(original.vended_credential_lease_collection().is_none());
+        stop.request_stop();
+        assert!(captured.is_cancelled());
+        // A terminal request consumes retained storage only. Begin decoration
+        // must not make a new response collector survive this boundary.
+        let terminal = session.terminal_context(captured).unwrap();
+        assert!(terminal.vended_credential_lease_sink().is_none());
+        assert!(terminal.vended_credential_lease_collection().is_none());
+        assert_eq!(terminal.deadline(), original.deadline());
+        assert!(terminal.is_cancelled());
+    }
+}
+
+#[test]
+fn control_only_ordinary_and_pending_begin_do_not_mint_a_collection() {
+    for kind in ["ordinary", "pending"] {
+        let (lease, recorded) = unopened_begin();
+        let original_session = Arc::new(Mutex::new(None));
+        let receiving = WriteBeginReceiving::new(Arc::clone(&original_session));
+        let properties = nonempty_properties();
+        let context = request_context();
+        let mut request = begin_request();
+        request.context = context.clone();
+        let write_lease = exact_write_lease(&lease, properties);
+        let session = match kind {
+            "ordinary" => futures::executor::block_on(ConnectorWriteSession::begin_async_in(
+                lease,
+                write_lease.catalog_properties().unwrap().clone(),
+                request,
+                &receiving,
+            ))
+            .unwrap(),
+            "pending" => {
+                let (declaration, _) = application_document_publication();
+                let mut request = application_document_begin_request(declaration);
+                request.context = context.clone();
+                futures::executor::block_on(
+                    begin_connector_application_document_write_session_pending_async_in(
+                        lease,
+                        &write_lease,
+                        request,
+                        &receiving,
+                    ),
+                )
+                .unwrap()
+            }
+            _ => unreachable!("finite ordinary and pending fixture"),
+        };
+        drop(receiving);
+        drop(original_session);
+        {
+            let recorded = recorded.lock().unwrap();
+            let captured = recorded.begin_context.as_ref().unwrap();
+            assert_eq!(captured.deadline(), context.deadline());
+            assert!(captured.vended_credential_lease_sink().is_none());
+            assert!(captured.vended_credential_lease_collection().is_none());
+        }
+        // The original lease's release callback records its actual exit under
+        // this same mutex, so retire the session outside the observation lock.
+        drop(session);
+        assert_eq!(recorded.lock().unwrap().source_drops, 1);
+    }
+}

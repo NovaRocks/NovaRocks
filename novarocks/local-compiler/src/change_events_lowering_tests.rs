@@ -15,27 +15,30 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use novarocks_expression_contract::ExprKind;
+
 use super::*;
+use crate::test_units::{PureUnitFixture, compiled_root, input_ordinal};
 use arrow_array::{Array, ListArray};
 use arrow_schema::{DataType, Field};
 use novarocks_connector_contract::PureProviderProgramCatalog;
+use novarocks_expression_contract::RootScope;
 use novarocks_functions::{
     ConstantPolicy, ConstantPool, EngineFunctionCatalogBuilder, FunctionId, FunctionKind,
     FunctionOverloadId, InstalledPureKernel, PureEngineFunctionCatalog,
     PureImplementationDeclaration, PureImplementationId, PureKernelAbi,
 };
-use novarocks_local_program::{KernelAbiVersion, ProgramNodeId, ProgramNodeKind, StaticExprKind};
+use novarocks_local_program::{KernelAbiVersion, ProgramNodeId, ProgramNodeKind};
 use novarocks_physical_plan::{
-    ConstantPoolId, ConstantPools, ConstantReference, ExprKind, FragmentBuilder, FragmentCuts,
-    FragmentId, FragmentPackage, FragmentPackageAdmission, FragmentPackageInput, FragmentSink,
-    FrozenFragmentCalls, FrozenFragmentPruning, LiteralValue, NodeId, PhysicalExpressionRoots,
-    PhysicalRootUses, PipelineDopDomain, PlanLimits, PlanVersionId, PropertyProofProjectionLimits,
-    RequiredContracts, ResultField, ResultPort, ValueId, ValueOrigin,
+    ConstantPoolId, ConstantPools, ConstantReference, FragmentBuilder, FragmentCuts, FragmentId,
+    FragmentPackage, FragmentPackageAdmission, FragmentPackageInput, FragmentSink,
+    FrozenFragmentPruning, NodeId, PipelineDopDomain, PlanLimits, PlanVersionId,
+    PropertyProofProjectionLimits, RequiredContracts, ResultField, ResultPort, ValueId,
+    ValueOrigin,
 };
+use novarocks_type_contract::EvaluationDemand;
 use novarocks_type_contract::{
-    CompileControlError, CompilePhase, ControlShape, EvaluationDomainId, ExpressionControlFlow,
-    ExpressionEffectContext, ExpressionEvaluationDomain, ExpressionInvocation, ExpressionUseId,
-    FunctionValueType, PureCompileControl, SemanticParameters,
+    CompileControlError, CompilePhase, FunctionValueType, PureCompileControl, SemanticParameters,
 };
 use std::{
     collections::BTreeMap,
@@ -131,9 +134,9 @@ fn project(
     let mut definitions = Vec::new();
     let mut output = Vec::new();
     for (kind, ty) in items {
-        let expr = builder.add_expression(node, ty.clone(), kind).unwrap();
+        let expr = builder.fixture_value_root(node, ty.clone(), kind).unwrap();
         let value = builder
-            .add_value(ty, ValueOrigin::Expr { node, expr })
+            .add_value(ty, ValueOrigin::Expr { node, root: expr })
             .unwrap();
         definitions.push((expr, value));
         output.push(value);
@@ -146,6 +149,7 @@ fn project(
             output.clone().into_boxed_slice(),
         )
         .unwrap();
+    builder.finish_fixture_unit(node, &Control).unwrap();
     output
 }
 struct Fixture {
@@ -160,6 +164,7 @@ fn try_fixture(
     let empty = NodeId::new(u32::MAX);
     let initial = NodeId::new(0);
     let event_node = NodeId::new(901);
+    let mut constants = ConstantPools::empty();
     let mut builder = FragmentBuilder::new(fid);
     builder
         .add_values(empty, Box::from([Box::default()]), Box::default())
@@ -210,31 +215,42 @@ fn try_fixture(
         initial,
         empty,
         vec![
-            (ExprKind::Literal(LiteralValue::Int64(11)), integer.clone()),
+            (
+                crate::test_constants::i64(&mut constants, &integer, 11, options().constants),
+                integer.clone(),
+            ),
             (ExprKind::Constant(selected), nested.clone()),
-            (ExprKind::Literal(LiteralValue::Null), text.clone()),
+            (
+                crate::test_constants::null(&mut constants, &text, options().constants),
+                text.clone(),
+            ),
         ],
     );
 
     let expr = builder
-        .add_expression(
+        .fixture_definition(
             event_node,
             integer.clone(),
             ExprKind::Value(initial_values[0]),
         )
         .unwrap();
     let nested_expr = builder
-        .add_expression(
+        .fixture_definition(
             event_node,
             nested.clone(),
             ExprKind::Value(initial_values[1]),
         )
         .unwrap();
     let predicate = builder
-        .add_expression(
+        .fixture_definition(
             event_node,
             FunctionValueType::new(DataType::Boolean, false),
-            ExprKind::Literal(LiteralValue::Boolean(true)),
+            crate::test_constants::boolean(
+                &mut constants,
+                &FunctionValueType::new(DataType::Boolean, false),
+                true,
+                options().constants,
+            ),
         )
         .unwrap();
     let value = builder
@@ -271,7 +287,20 @@ fn try_fixture(
     }
     let events = (0..count)
         .map(|index| novarocks_physical_plan::ChangeEventSpec {
-            predicate: (index % 2 == 0).then_some(predicate),
+            predicate: if index % 2 == 0 {
+                Some(
+                    builder
+                        .fixture_occurrence(
+                            event_node,
+                            predicate,
+                            EvaluationDemand::TruthOnly,
+                            RootScope::Port(0),
+                        )
+                        .unwrap(),
+                )
+            } else {
+                None
+            },
             effect: [
                 novarocks_connector_contract::ConnectorRowMutationEffect::Delete,
                 novarocks_connector_contract::ConnectorRowMutationEffect::Replace,
@@ -281,9 +310,30 @@ fn try_fixture(
                 Box::from([
                     novarocks_physical_plan::ChangeAssignment::exact(
                         nested_value,
-                        Some(nested_expr),
+                        Some(
+                            builder
+                                .fixture_occurrence(
+                                    event_node,
+                                    nested_expr,
+                                    EvaluationDemand::Value,
+                                    RootScope::Port(0),
+                                )
+                                .unwrap(),
+                        ),
                     ),
-                    novarocks_physical_plan::ChangeAssignment::exact(value, Some(expr)),
+                    novarocks_physical_plan::ChangeAssignment::exact(
+                        value,
+                        Some(
+                            builder
+                                .fixture_occurrence(
+                                    event_node,
+                                    expr,
+                                    EvaluationDemand::Value,
+                                    RootScope::Port(0),
+                                )
+                                .unwrap(),
+                        ),
+                    ),
                 ])
             } else {
                 Box::from([
@@ -309,14 +359,16 @@ fn try_fixture(
             },
             output: novarocks_physical_plan::OutputPort {
                 node: event_node,
-                columns: output.into_boxed_slice(),
+                columns: output.clone().into_boxed_slice(),
             },
+            expressions: None,
             kind: novarocks_physical_plan::NodeKind::ChangeEventExpand {
                 events,
                 effect_output: effect,
             },
         })
         .unwrap();
+    builder.finish_fixture_unit(event_node, &Control)?;
     let root = if downstream {
         let next = NodeId::new(7);
         project(
@@ -347,44 +399,13 @@ fn try_fixture(
         &Control,
         novarocks_physical_plan::StagePlacementPolicy::Singleton,
     )?;
-    let roots = PhysicalExpressionRoots::try_new(&fragment, &Control).unwrap();
-    let domain = EvaluationDomainId::new(u32::MAX);
-    let mut uses = Vec::new();
-    let mut bindings = Vec::new();
-    for (ordinal, (site, root)) in roots.sites().iter().enumerate() {
-        let id = ExpressionUseId::new(u32::MAX - ordinal as u32);
-        uses.push(ExpressionInvocation {
-            context: ExpressionEffectContext {
-                use_id: id,
-                domain,
-                demand: root.demand,
-            },
-            definition: root.expr,
-            control: ControlShape::Eager,
-            arguments: Box::default(),
-        });
-        bindings.push((*site, id));
-    }
-    let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
-            id: domain,
-            parent: None,
-            guard: None,
-        }],
-        uses,
-        fragment.expressions(),
-        CompilePhase::Validate,
-        &Control,
-    )
-    .unwrap();
-    let uses = PhysicalRootUses::try_new(&fragment, flow, bindings, &Control).unwrap();
-    let calls = FrozenFragmentCalls::try_new(&fragment, &uses, vec![], &Control).unwrap();
-    let output = fragment.nodes()[&root].output.columns.clone();
     let result = ResultPort {
         scalar_schema: None,
         fragment: fid,
         output: fragment.nodes()[&root].output.clone(),
-        fields: output
+        fields: fragment.nodes()[&root]
+            .output
+            .columns
             .iter()
             .enumerate()
             .map(|(ordinal, value)| ResultField {
@@ -397,7 +418,6 @@ fn try_fixture(
             .collect::<Vec<_>>()
             .into_boxed_slice(),
     };
-    let mut constants = ConstantPools::empty();
     constants.insert(pool_id, pool).unwrap();
     let package = FragmentPackage::try_new(
         FragmentPackageInput {
@@ -405,8 +425,7 @@ fn try_fixture(
             version: PlanVersionId::try_new([81; 16]).unwrap(),
             required: RequiredContracts::default(),
             fragment,
-            expression_uses: uses,
-            calls,
+            statement_constant_policy: options().constants,
             pruning: FrozenFragmentPruning::try_new(fid, vec![], &Control).unwrap(),
             cuts: FragmentCuts::default(),
             result: Some(result),
@@ -414,6 +433,7 @@ fn try_fixture(
             scans: BTreeMap::new(),
             writes: BTreeMap::new(),
             annotations: Box::default(),
+            layouts: Default::default(),
         },
         admission(),
         &Control,
@@ -533,10 +553,12 @@ fn downstream_reads_change_event_output_ordinal_not_original_input_slot() {
         panic!("project");
     };
     for (expr, ordinal) in exprs.iter().zip([2, 1]) {
-        let StaticExprKind::SlotId(slot) = graph.expressions().node(*expr).unwrap().kind() else {
-            panic!("actual slot");
-        };
-        assert_eq!(*slot, graph.nodes()[2].output_layout().slots()[ordinal]);
+        assert_eq!(input_ordinal(&program, *expr), ordinal as u32);
+        let (unit, root) = compiled_root(&program, *expr);
+        assert!(Arc::ptr_eq(
+            unit.scope(root.scope).unwrap().schema(),
+            graph.nodes()[2].output_layout().schema()
+        ));
     }
 }
 

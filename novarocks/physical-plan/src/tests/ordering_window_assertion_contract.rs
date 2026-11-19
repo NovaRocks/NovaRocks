@@ -16,6 +16,8 @@
 // under the License.
 
 use super::*;
+#[cfg(test)]
+use crate::tests::unit_fixture::DefinitionFixture;
 
 #[derive(Clone, Copy)]
 enum SourceDistribution {
@@ -39,7 +41,7 @@ fn ordering(value: ValueId, null_ordering: NullOrdering) -> OrderingKey {
     }
 }
 
-fn sort_expr(expression: ExprId, null_ordering: NullOrdering) -> SortExpr {
+fn sort_expr(expression: crate::RootOrdinal, null_ordering: NullOrdering) -> SortExpr {
     SortExpr {
         expr: expression,
         direction: SortDirection::Ascending,
@@ -105,6 +107,7 @@ fn append_exchange_source(
     };
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: node,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -131,15 +134,27 @@ fn finish_sort(
         append_exchange_source(&mut builder, 401, distribution_kind, false);
     let node = builder.reserve_node_id().unwrap();
     let order_expression = builder
-        .add_expression(node, ty(DataType::Int64, false), ExprKind::Value(order))
+        .define(node, ty(DataType::Int64, false), ExprKind::Value(order))
         .unwrap();
+    let order_expression = builder.root_definition(
+        node,
+        order_expression,
+        novarocks_type_contract::EvaluationDemand::Value,
+        crate::RootScope::Port(0),
+    );
     let order_by: Box<[SortExpr]> = Box::from([sort_expr(order_expression, NullOrdering::Last)]);
     let mode = match fixture_mode {
         SortFixtureMode::Global => SortMode::Global,
         SortFixtureMode::Analytic | SortFixtureMode::PartitionTopN(_) => {
             let partition_expression = builder
-                .add_expression(node, ty(DataType::Int64, false), ExprKind::Value(key))
+                .define(node, ty(DataType::Int64, false), ExprKind::Value(key))
                 .unwrap();
+            let partition_expression = builder.root_definition(
+                node,
+                partition_expression,
+                novarocks_type_contract::EvaluationDemand::Value,
+                crate::RootScope::Port(0),
+            );
             let partition_by = Box::from([sort_expr(partition_expression, NullOrdering::First)]);
             match fixture_mode {
                 SortFixtureMode::Analytic => SortMode::Analytic { partition_by },
@@ -161,6 +176,7 @@ fn finish_sort(
     };
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: node,
             inputs: Box::from([source]),
             required_inputs: Box::from([input_properties.clone()]),
@@ -176,7 +192,7 @@ fn finish_sort(
             kind: NodeKind::Sort { order_by, mode },
         })
         .unwrap();
-    builder.finish_definition(
+    builder.finish_fixture_definition(
         node,
         FragmentSink::Noop,
         dop(),
@@ -193,10 +209,17 @@ fn finish_topn(
         append_exchange_source(&mut builder, 402, distribution_kind, false);
     let node = builder.reserve_node_id().unwrap();
     let order_expression = builder
-        .add_expression(node, ty(DataType::Int64, false), ExprKind::Value(order))
+        .define(node, ty(DataType::Int64, false), ExprKind::Value(order))
         .unwrap();
+    let order_expression = builder.root_definition(
+        node,
+        order_expression,
+        novarocks_type_contract::EvaluationDemand::Value,
+        crate::RootScope::Port(0),
+    );
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: node,
             inputs: Box::from([source]),
             required_inputs: Box::from([input_properties.clone()]),
@@ -218,7 +241,7 @@ fn finish_topn(
             },
         })
         .unwrap();
-    builder.finish_definition(
+    builder.finish_fixture_definition(
         node,
         FragmentSink::Noop,
         dop(),
@@ -233,6 +256,7 @@ fn finish_topn_reduction(
     partial_offset: u64,
     final_limit: u64,
     final_offset: u64,
+    fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
 ) -> Result<PhysicalPlan, String> {
     let source_fragment = FragmentId::new(410);
     let partial_fragment = FragmentId::new(411);
@@ -243,6 +267,7 @@ fn finish_topn_reduction(
         source_fragment,
         FragmentSink::Stream { edge: partial_edge },
         false,
+        fixture_constants,
     );
 
     let mut partial_builder = FragmentBuilder::new(partial_fragment);
@@ -262,6 +287,7 @@ fn finish_topn_reduction(
     };
     partial_builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: partial_source,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -282,14 +308,21 @@ fn finish_topn_reduction(
         .unwrap();
     let partial_topn = partial_builder.reserve_node_id().unwrap();
     let partial_order = partial_builder
-        .add_expression(
+        .define(
             partial_topn,
             ty(DataType::Int64, false),
             ExprKind::Value(partial_value),
         )
         .unwrap();
+    let partial_order = partial_builder.root_definition(
+        partial_topn,
+        partial_order,
+        novarocks_type_contract::EvaluationDemand::Value,
+        crate::RootScope::Port(0),
+    );
     partial_builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: partial_topn,
             inputs: Box::from([partial_source]),
             required_inputs: Box::from([PhysicalProperties {
@@ -318,7 +351,7 @@ fn finish_topn_reduction(
         })
         .unwrap();
     let partial = partial_builder
-        .finish_definition(
+        .finish_fixture_definition(
             partial_topn,
             FragmentSink::Stream { edge: final_edge },
             dop(),
@@ -339,6 +372,7 @@ fn finish_topn_reduction(
         .unwrap();
     final_builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: final_source,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -359,14 +393,21 @@ fn finish_topn_reduction(
         .unwrap();
     let final_topn = final_builder.reserve_node_id().unwrap();
     let final_order = final_builder
-        .add_expression(
+        .define(
             final_topn,
             ty(DataType::Int64, false),
             ExprKind::Value(final_value),
         )
         .unwrap();
+    let final_order = final_builder.root_definition(
+        final_topn,
+        final_order,
+        novarocks_type_contract::EvaluationDemand::Value,
+        crate::RootScope::Port(0),
+    );
     final_builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: final_topn,
             inputs: Box::from([final_source]),
             required_inputs: Box::from([PhysicalProperties {
@@ -394,7 +435,7 @@ fn finish_topn_reduction(
         })
         .unwrap();
     let final_stage = final_builder
-        .finish_definition(
+        .finish_fixture_definition(
             final_topn,
             FragmentSink::Noop,
             dop(),
@@ -402,7 +443,7 @@ fn finish_topn_reduction(
         )
         .map_err(|error| error.to_string())?;
 
-    let mut plan = PlanBuilder::new(version());
+    let mut plan = PlanBuilder::new(version(), crate::tests::constant_fixture::policy());
     plan.add_fragment(source).unwrap();
     plan.add_fragment(partial).unwrap();
     plan.add_fragment(final_stage).unwrap();
@@ -429,6 +470,7 @@ fn finish_topn_reduction(
             source_multiplicity: RowMultiplicity::SingleCopy,
             destination: partial_distribution,
             destination_multiplicity: RowMultiplicity::SingleCopy,
+            routing_only: Box::default(),
         },
     })
     .unwrap();
@@ -452,10 +494,12 @@ fn finish_topn_reduction(
             source_multiplicity: RowMultiplicity::SingleCopy,
             destination: Distribution::Singleton,
             destination_multiplicity: RowMultiplicity::SingleCopy,
+            routing_only: Box::default(),
         },
     })
     .unwrap();
-    plan.finish().map_err(|error| error.to_string())
+    crate::tests::constant_fixture::publish_plan(plan, fixture_constants)
+        .map_err(|error| error.to_string())
 }
 
 fn window_function() -> BoundFunction {
@@ -483,87 +527,68 @@ enum WindowFixtureLayout {
     StrongerOrdering,
     HashKeySubset,
     Singleton,
-    ReusedCallAsChild,
 }
 
 fn finish_window(
-    build_frame: impl FnOnce(&mut FragmentBuilder, NodeId) -> WindowFrame,
+    build_frame: impl FnOnce(&mut crate::tests::constant_fixture::ConstantFixture) -> WindowFrame,
     layout: WindowFixtureLayout,
-) -> Result<Fragment, ValidationErrors> {
+) -> Result<(Fragment, ConstantPools), ValidationErrors> {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     let mut builder = FragmentBuilder::new(FragmentId::new(403));
     let distribution_kind = match layout {
         WindowFixtureLayout::Singleton => SourceDistribution::Singleton,
         WindowFixtureLayout::Exact
         | WindowFixtureLayout::MissingOrdering
         | WindowFixtureLayout::StrongerOrdering
-        | WindowFixtureLayout::HashKeySubset
-        | WindowFixtureLayout::ReusedCallAsChild => SourceDistribution::Hash(73),
+        | WindowFixtureLayout::HashKeySubset => SourceDistribution::Hash(73),
     };
-    let child_is_ordered = !matches!(layout, WindowFixtureLayout::MissingOrdering);
+    // Complete the real pending-call construction from a valid ordered
+    // source; inject only MissingOrdering's original fault at the full gate.
+    let child_is_ordered = true;
     let (source, key, order, _) =
         append_exchange_source(&mut builder, 403, distribution_kind, child_is_ordered);
     let node = builder.reserve_node_id().unwrap();
     let partition_expression = builder
-        .add_expression(node, ty(DataType::Int64, false), ExprKind::Value(key))
+        .define(node, ty(DataType::Int64, false), ExprKind::Value(key))
         .unwrap();
+    let partition_expression = builder.root_definition(
+        node,
+        partition_expression,
+        novarocks_type_contract::EvaluationDemand::Value,
+        crate::RootScope::Port(0),
+    );
     let order_expression = (!matches!(layout, WindowFixtureLayout::StrongerOrdering)).then(|| {
-        builder
-            .add_expression(node, ty(DataType::Int64, false), ExprKind::Value(order))
-            .unwrap()
-    });
-    let frame = build_frame(&mut builder, node);
-    let call = builder
-        .add_expression(
+        let definition = builder
+            .define(node, ty(DataType::Int64, false), ExprKind::Value(order))
+            .unwrap();
+        builder.root_definition(
             node,
-            ty(DataType::Int64, false),
-            ExprKind::WindowCall {
-                function: window_function(),
-                distinct: false,
-                args: Box::default(),
-                function_order_by: Box::default(),
-                frame: Some(frame),
-                ignore_nulls: false,
-                aggregate_binding: None,
-            },
+            definition,
+            novarocks_type_contract::EvaluationDemand::Value,
+            crate::RootScope::Port(0),
         )
-        .unwrap();
+    });
+    let frame = build_frame(&mut fixture_constants);
     let output = builder
         .add_value(
             ty(DataType::Int64, false),
-            ValueOrigin::Expr { node, expr: call },
+            ValueOrigin::NodeOutput {
+                node,
+                output_ordinal: 2,
+            },
         )
         .unwrap();
-    let mut output_columns = vec![key, order, output];
-    let mut window_expressions = vec![WindowExpression {
-        expression: call,
+    let output_columns = vec![key, order, output];
+    let calls = Box::from([crate::WindowCallSpec {
+        binding: window_function(),
+        distinct: false,
+        arguments: Box::default(),
+        order_by: Box::default(),
+        frame: Some(frame),
+        ignore_nulls: false,
+        aggregate_binding: None,
         output,
-    }];
-    if matches!(layout, WindowFixtureLayout::ReusedCallAsChild) {
-        let wrapper = builder
-            .add_expression(
-                node,
-                ty(DataType::Int64, false),
-                ExprKind::Unary {
-                    op: UnaryOperator::Plus,
-                    expr: call,
-                },
-            )
-            .unwrap();
-        let wrapper_output = builder
-            .add_value(
-                ty(DataType::Int64, false),
-                ValueOrigin::Expr {
-                    node,
-                    expr: wrapper,
-                },
-            )
-            .unwrap();
-        output_columns.push(wrapper_output);
-        window_expressions.push(WindowExpression {
-            expression: wrapper,
-            output: wrapper_output,
-        });
-    }
+    }]);
     let partition_by = if matches!(layout, WindowFixtureLayout::HashKeySubset) {
         Box::from([
             sort_expr(partition_expression, NullOrdering::First),
@@ -606,6 +631,7 @@ fn finish_window(
     };
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: node,
             inputs: Box::from([source]),
             required_inputs: Box::from([required_properties]),
@@ -617,16 +643,95 @@ fn finish_window(
             kind: NodeKind::Window(WindowSpec {
                 partition_by,
                 order_by,
-                expressions: window_expressions.into_boxed_slice(),
+                calls,
             }),
         })
         .unwrap();
-    builder.finish_definition(
-        node,
-        FragmentSink::Noop,
-        dop(),
-        crate::StagePlacementPolicy::Singleton,
-    )
+    crate::tests::unit_fixture::seal_pure_unit(&mut builder, node);
+    let fragment = builder
+        .finish_structure(
+            node,
+            FragmentSink::Noop,
+            dop(),
+            PlanLimits::FROZEN,
+            &WindowConstantControl,
+            crate::StagePlacementPolicy::Singleton,
+        )
+        .map_err(|error| match error {
+            crate::FragmentStructureError::Structure(errors) => errors,
+            other => panic!("fixed window structure fixture failed: {other}"),
+        })?;
+    let fragment = super::original_call_requests::with_original_relational_requests(
+        fragment,
+        &WindowConstantControl,
+    );
+    use novarocks_type_contract::{
+        ArgumentControl, CallEffects, CallProofScope, FunctionInstanceState, FunctionNullBehavior,
+        ObservableEffects, RelationCallId, RelationEffectContext,
+    };
+    let context = RelationEffectContext::call(RelationCallId::new(0));
+    let mut fragment = fragment
+        .with_calls_observed(
+            vec![crate::FrozenPhysicalCall {
+                site: crate::PhysicalCallSite::Window { node, call: 0 },
+                context,
+                materialized_writer_input: None,
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                effects: CallEffects {
+                    value_stability: FunctionVolatility::Immutable,
+                    own_row_error: FunctionIntrinsicRowError::NotRowEvaluated,
+                    failure_behavior: FunctionFailureBehavior::Propagate,
+                    null_behavior: FunctionNullBehavior::CalledOnNull,
+                    argument_control: ArgumentControl::Window,
+                    instance_state: FunctionInstanceState::WindowPartition,
+                    observable_effects: ObservableEffects::NONE,
+                    environment: Box::default(),
+                    proof_scope: CallProofScope::Relation(context.identity),
+                },
+            }],
+            &WindowConstantControl,
+        )
+        .expect("fixture authored its exact Window relation claim");
+    if matches!(layout, WindowFixtureLayout::MissingOrdering) {
+        let mut parts = fragment.into_parts();
+        parts
+            .nodes
+            .get_mut(&source)
+            .unwrap()
+            .output_properties
+            .ordering = Box::default();
+        parts
+            .nodes
+            .get_mut(&node)
+            .unwrap()
+            .output_properties
+            .ordering = Box::default();
+        fragment = parts.into();
+    }
+    crate::validate_fragment_definition(&fragment)?;
+    let pools = fixture_constants.into_pools();
+    if let Err(error) = crate::constants::validate_fragment_constants_observed(
+        &fragment,
+        &pools,
+        true,
+        PlanLimits::FROZEN,
+        &WindowConstantControl,
+    ) {
+        let mut errors = crate::validation::ValidationContext::new();
+        errors.push(ValidationError::new("window.constants", error.to_string()));
+        return Err(ValidationErrors::from_collector(errors));
+    }
+    Ok((fragment, pools))
+}
+struct WindowConstantControl;
+impl novarocks_type_contract::PureCompileControl for WindowConstantControl {
+    fn checkpoint(
+        &self,
+        _: novarocks_type_contract::CompilePhase,
+        _: u32,
+    ) -> Result<(), novarocks_type_contract::CompileControlError> {
+        Ok(())
+    }
 }
 
 fn finish_assertion(
@@ -639,6 +744,7 @@ fn finish_assertion(
     let node = builder.reserve_node_id().unwrap();
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: node,
             inputs: Box::from([source]),
             required_inputs: Box::from([properties.clone()]),
@@ -650,7 +756,7 @@ fn finish_assertion(
             kind: NodeKind::AssertOneRow(assertion(key, order)),
         })
         .unwrap();
-    builder.finish_definition(
+    builder.finish_fixture_definition(
         node,
         FragmentSink::Noop,
         dop(),
@@ -658,7 +764,7 @@ fn finish_assertion(
     )
 }
 
-fn contains_error(result: Result<Fragment, ValidationErrors>, expected: &str) -> bool {
+fn contains_error<T: std::fmt::Debug>(result: Result<T, ValidationErrors>, expected: &str) -> bool {
     result
         .expect_err("fixture must be rejected")
         .to_string()
@@ -689,9 +795,19 @@ fn sort_modes_close_global_analytic_and_partition_topn_contracts() {
 
 #[test]
 fn topn_phase_contract_separates_global_and_partial_completion() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     finish_topn(SourceDistribution::Singleton, TopNPhase::Single).unwrap();
     let sequence = TopNSequenceId::new(1);
-    finish_topn_reduction(sequence, Some(sequence), 15, 0, 10, 5).unwrap();
+    finish_topn_reduction(
+        sequence,
+        Some(sequence),
+        15,
+        0,
+        10,
+        5,
+        &mut fixture_constants,
+    )
+    .unwrap();
 
     assert!(contains_error(
         finish_topn(SourceDistribution::Hash(74), TopNPhase::Final { sequence }),
@@ -703,20 +819,46 @@ fn topn_phase_contract_separates_global_and_partial_completion() {
     )
     .unwrap();
 
-    let orphan = finish_topn_reduction(sequence, None, 10, 0, 10, 0).unwrap_err();
+    let orphan =
+        finish_topn_reduction(sequence, None, 10, 0, 10, 0, &mut fixture_constants).unwrap_err();
     assert!(orphan.contains("TopN sequence must have exactly one final node"));
 
-    let mismatch =
-        finish_topn_reduction(sequence, Some(TopNSequenceId::new(2)), 10, 0, 10, 0).unwrap_err();
+    let mismatch = finish_topn_reduction(
+        sequence,
+        Some(TopNSequenceId::new(2)),
+        10,
+        0,
+        10,
+        0,
+        &mut fixture_constants,
+    )
+    .unwrap_err();
     assert!(mismatch.contains("TopN sequence must have exactly one final node"));
 
-    let partial_offset = finish_topn_reduction(sequence, Some(sequence), 15, 1, 10, 5).unwrap_err();
+    let partial_offset = finish_topn_reduction(
+        sequence,
+        Some(sequence),
+        15,
+        1,
+        10,
+        5,
+        &mut fixture_constants,
+    )
+    .unwrap_err();
     assert!(
         partial_offset.contains("partial TopN cannot apply an offset before global completion")
     );
 
-    let undersized_partial =
-        finish_topn_reduction(sequence, Some(sequence), 10, 0, 10, 5).unwrap_err();
+    let undersized_partial = finish_topn_reduction(
+        sequence,
+        Some(sequence),
+        10,
+        0,
+        10,
+        5,
+        &mut fixture_constants,
+    )
+    .unwrap_err();
     assert!(
         undersized_partial
             .contains("TopN partial paths do not reduce exactly into their matching final")
@@ -731,25 +873,16 @@ fn window_owns_one_partition_order_and_preserves_frame_exclusion() {
         end: WindowBound::UnboundedFollowing,
         exclusion: WindowFrameExclusion::Ties,
     };
-    let fragment = finish_window(|_, _| frame, WindowFixtureLayout::Exact).unwrap();
+    let (fragment, _pools) = finish_window(|_| frame, WindowFixtureLayout::Exact).unwrap();
     let NodeKind::Window(spec) = &fragment.nodes()[&fragment.root()].kind else {
         panic!("expected window root");
     };
-    let ExprKind::WindowCall {
-        frame: Some(frame), ..
-    } = &fragment
-        .expressions()
-        .get(spec.expressions[0].expression)
-        .expect("window expression")
-        .kind
-    else {
-        panic!("expected window call");
-    };
+    let frame = spec.calls[0].frame.as_ref().expect("window frame");
     assert_eq!(frame.exclusion, WindowFrameExclusion::Ties);
 
     assert!(contains_error(
         finish_window(
-            |_, _| WindowFrame {
+            |_| WindowFrame {
                 units: WindowFrameUnits::Rows,
                 start: WindowBound::CurrentRow,
                 end: WindowBound::UnboundedFollowing,
@@ -761,7 +894,7 @@ fn window_owns_one_partition_order_and_preserves_frame_exclusion() {
     ));
     assert!(contains_error(
         finish_window(
-            |_, _| WindowFrame {
+            |_| WindowFrame {
                 units: WindowFrameUnits::Range,
                 start: WindowBound::UnboundedFollowing,
                 end: WindowBound::UnboundedFollowing,
@@ -774,21 +907,17 @@ fn window_owns_one_partition_order_and_preserves_frame_exclusion() {
 
     for (start_offset, end_offset, preceding) in [(5, 10, true), (10, 5, false)] {
         let result = finish_window(
-            |builder, owner| {
-                let start = builder
-                    .add_expression(
-                        owner,
-                        ty(DataType::UInt64, false),
-                        ExprKind::Literal(LiteralValue::UInt64(start_offset)),
-                    )
-                    .unwrap();
-                let end = builder
-                    .add_expression(
-                        owner,
-                        ty(DataType::UInt64, false),
-                        ExprKind::Literal(LiteralValue::UInt64(end_offset)),
-                    )
-                    .unwrap();
+            |fixture_constants| {
+                let ExprKind::Constant(start) =
+                    fixture_constants.u64(start_offset, &ty(DataType::UInt64, false))
+                else {
+                    unreachable!("checked constant fixture returns its exact reference")
+                };
+                let ExprKind::Constant(end) =
+                    fixture_constants.u64(end_offset, &ty(DataType::UInt64, false))
+                else {
+                    unreachable!("checked constant fixture returns its exact reference")
+                };
                 if preceding {
                     WindowFrame {
                         units: WindowFrameUnits::Rows,
@@ -809,20 +938,18 @@ fn window_owns_one_partition_order_and_preserves_frame_exclusion() {
         );
         assert!(contains_error(
             result,
-            "window frame start follows its end after comparing exact offsets"
+            "window frame start follows its end after comparing exact constant offsets"
         ));
     }
 
     assert!(contains_error(
         finish_window(
-            |builder, owner| {
-                let offset = builder
-                    .add_expression(
-                        owner,
-                        ty(DataType::Int64, false),
-                        ExprKind::Literal(LiteralValue::Int64(1)),
-                    )
-                    .unwrap();
+            |fixture_constants| {
+                let ExprKind::Constant(offset) =
+                    fixture_constants.i64(1, &ty(DataType::Int64, false))
+                else {
+                    unreachable!("checked constant fixture returns its exact reference")
+                };
                 WindowFrame {
                     units: WindowFrameUnits::Range,
                     start: WindowBound::Preceding(offset),
@@ -837,24 +964,8 @@ fn window_owns_one_partition_order_and_preserves_frame_exclusion() {
 }
 
 #[test]
-fn window_call_cannot_be_reused_as_an_expression_child() {
-    let error = finish_window(
-        |_, _| WindowFrame {
-            units: WindowFrameUnits::Rows,
-            start: WindowBound::UnboundedPreceding,
-            end: WindowBound::CurrentRow,
-            exclusion: WindowFrameExclusion::NoOthers,
-        },
-        WindowFixtureLayout::ReusedCallAsChild,
-    )
-    .unwrap_err()
-    .to_string();
-    assert!(error.contains("window call must be a top-level expression of its owning Window node"));
-}
-
-#[test]
 fn window_accepts_singleton_coarser_hash_and_stronger_ordering() {
-    let frame = |_: &mut FragmentBuilder, _: NodeId| WindowFrame {
+    let frame = |_: &mut crate::tests::constant_fixture::ConstantFixture| WindowFrame {
         units: WindowFrameUnits::Rows,
         start: WindowBound::UnboundedPreceding,
         end: WindowBound::CurrentRow,
@@ -1029,6 +1140,7 @@ fn finish_table_function_with_sink(
     };
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: node,
             inputs: Box::from([source]),
             required_inputs: Box::from([properties]),
@@ -1066,5 +1178,49 @@ fn finish_table_function_with_sink(
             },
         })
         .unwrap();
-    builder.finish_definition(node, sink, dop(), crate::StagePlacementPolicy::Singleton)
+    let fragment = builder.finish_fixture_structure(
+        node,
+        sink,
+        dop(),
+        crate::StagePlacementPolicy::Singleton,
+    )?;
+    let fragment = super::original_call_requests::with_original_relational_requests(
+        fragment,
+        &WindowConstantControl,
+    );
+    use novarocks_type_contract::{
+        ArgumentControl, CallEffects, CallProofScope, FunctionInstanceState, FunctionNullBehavior,
+        ObservableEffects, RelationCallId, RelationEffectContext,
+    };
+    let context = RelationEffectContext::call(RelationCallId::new(0));
+    // The fixed fixture's input, not binding metadata inspection, authors FX.
+    let effects = CallEffects {
+        value_stability: if volatile {
+            FunctionVolatility::Volatile
+        } else {
+            FunctionVolatility::Immutable
+        },
+        own_row_error: FunctionIntrinsicRowError::NoRowError,
+        failure_behavior: FunctionFailureBehavior::Propagate,
+        null_behavior: FunctionNullBehavior::CalledOnNull,
+        argument_control: ArgumentControl::Table,
+        instance_state: FunctionInstanceState::TableInstance,
+        observable_effects: ObservableEffects::NONE,
+        environment: Box::default(),
+        proof_scope: CallProofScope::Relation(context.identity),
+    };
+    let fragment = fragment
+        .with_calls_observed(
+            vec![crate::FrozenPhysicalCall {
+                site: crate::PhysicalCallSite::Table { node },
+                context,
+                materialized_writer_input: None,
+                effects,
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            }],
+            &WindowConstantControl,
+        )
+        .expect("fixture authored its exact Table relation claim");
+    crate::validate_fragment_definition(&fragment)?;
+    Ok(fragment)
 }

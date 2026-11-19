@@ -183,7 +183,7 @@ fn register(
         .unwrap();
     drive(driver);
     let mut ready = receive(&mut admission);
-    let mut bytes = Some(vec![19; 8].into_boxed_slice());
+    let mut bytes = Some(Arc::<[u8]>::from([19; 8]));
     let mut target = None;
     ready.register_in(&mut bytes, &mut target).unwrap().notify();
     assert!(bytes.is_none());
@@ -354,8 +354,9 @@ fn registration_refuses_frozen_local_s_against_canonical_control_without_taking_
         scope,
         origin: Arc::downgrade(&origin),
         quote: quote(),
+        registered: None,
     };
-    let mut bytes = Some(vec![7; 8].into_boxed_slice());
+    let mut bytes = Some(Arc::<[u8]>::from([7; 8]));
     let mut target = None;
     assert!(matches!(
         ready.register_in(&mut bytes, &mut target),

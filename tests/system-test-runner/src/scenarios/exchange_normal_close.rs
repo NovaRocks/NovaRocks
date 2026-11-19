@@ -887,7 +887,8 @@ mod observation_authorization_tests {
     #[test]
     fn normal_close_producer_keeps_original_bigint_source_and_exact_constant_references() {
         use arrow_schema::{DataType, Field};
-        use novarocks_physical_plan::{ConstantPoolId, ExprKind, FragmentId, NodeKind};
+        use novarocks_expression_contract::{ExprKind, RootScope};
+        use novarocks_physical_plan::{ConstantPoolId, FragmentId, NodeKind};
         use novarocks_plan_codec::{
             physical_package_v2::{PackageDecodeLimits, decode_fragment_package},
             resource_preflight_v2::FragmentDecodeResourceModel,
@@ -988,11 +989,13 @@ mod observation_authorization_tests {
             };
             assert_eq!(rows.len(), ROWS.len());
             for (ordinal, row) in rows.iter().enumerate() {
-                let [id] = row.as_ref() else {
+                let [ordinal_in_unit] = row.as_ref() else {
                     panic!("each original row has one BIGINT expression");
                 };
-                let value = fragment.expressions().get(*id).unwrap();
-                assert_eq!(value.owner, root);
+                let unit = fragment.unit(root).unwrap();
+                let declaration = unit.root(*ordinal_in_unit).unwrap();
+                assert_eq!(declaration.scope, RootScope::AllPorts);
+                let value = fragment.root_expression(root, *ordinal_in_unit).unwrap();
                 assert_eq!(value.ty, ty);
                 let ExprKind::Constant(reference) = &value.kind else {
                     panic!("the typed v2 decoder must keep the actual admitted constant reference");

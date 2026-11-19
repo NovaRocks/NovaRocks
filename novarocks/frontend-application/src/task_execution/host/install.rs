@@ -25,27 +25,24 @@ use super::{
     auxiliary::AttemptAuxiliaryExecutor,
     custody::TransportRetirements,
     failure_supervisor::FailureSupervisor,
-    funding::AttemptHostFunding,
     geometry::AttemptHostGeometry,
     publication::{AttemptDiagnosticSources, AttemptPublicationOwner, PublicationRecord},
     pumps::{DiagnosticRecords, DynamicFilterRecords, split::SplitPump},
-    transport::{ActorTransportExecutor, AttemptSendSource, StagedSubscriptionEndpoints},
+    transport::{
+        ActorTransportExecutor, AttemptSendSource, EstablishMaterialPreparation,
+        StagedSubscriptionEndpoints,
+    },
 };
 use crate::{
     control_runtime::{FrontendAttemptRuntime, host::EffectExecutor},
-    native::{data_runtime::FrontendDataRuntime, task_result_transport::NativeTaskResultTransport},
-    query_execution::{
-        native_execution_adapter::LogicalAbortRoute,
-        split_assignment_round::RoundSplitAssignmentPlan,
-    },
+    native::{data_runtime::FrontendDataRuntime, task_result_transport::TaskResultTransport},
+    query_execution::split_assignment_round::RoundSplitAssignmentPlan,
     task_execution::{
-        bridge::{root_control::RootControlRequests, terminal::RegisteredActiveAttempt},
         manifest_projection::{
             AttemptActivationInputs, AttemptManifestProjection, AttemptPlanPolicy,
-            PreparedManifestAttempt,
+            BoundAttemptManifestProjection, PreparedManifestAttempt,
         },
         profile_diagnostics::TaskFinalInfoCollector,
-        sources::AttemptEstablishFacts,
     },
     wake::StatusIntakeWake,
 };
@@ -68,13 +65,13 @@ use novarocks_coordination_contract::MonotonicClock;
 use novarocks_execution_contract::{SafeDetail, failure::FailureProjection};
 use novarocks_query_application::{
     api::{NativeAttemptPreparationFailure, StatementNativeHealthFailure},
-    coordination::{NativeAttemptDrive, ReplacementWorkerAdmissionEvidence},
+    coordination::ReplacementWorkerAdmissionEvidence,
     execution_error::{ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason},
 };
 use novarocks_workload_control::joint_admission::NativeAsyncActionAuthority;
 use std::{
     num::{NonZeroU64, NonZeroUsize},
-    sync::{Arc, OnceLock, Weak},
+    sync::{Arc, OnceLock},
     task::Waker,
 };
 
@@ -95,62 +92,46 @@ pub(crate) struct InstalledAttemptHost {
         novarocks_control_runtime_core::identity::ActorId,
         novarocks_control_runtime_core::identity::ActorId,
     ),
-    pub(crate) bridge: RegisteredActiveAttempt,
-    publication: Weak<AttemptPublicationOwner>,
-    registered_cut: Option<novarocks_query_application::api::ComputationReadyToken>,
-    lifecycle: Option<Arc<AttemptDiagnosticSources>>,
-}
-
-impl InstalledAttemptHost {
-    pub(crate) fn take_lifecycle_rollup(
-        &self,
-    ) -> Option<crate::query_execution::lifecycle_diagnostics::RuntimeFilterTerminalRollupSnapshot>
-    {
-        self.lifecycle
-            .as_ref()?
-            .take_lifecycle_rollup(self.bridge.lifecycle_runtime_filter_diagnostic())
-    }
-
-    pub(crate) async fn register_cut(
-        &mut self,
-        ready: novarocks_query_application::api::ComputationReadyToken,
-    ) -> Result<(), StatementNativeHealthFailure> {
-        if self.registered_cut == Some(ready) {
-            return Ok(());
-        }
-        if let Some(publication) = self.publication.upgrade() {
-            publication
-                .register_computation_cut(ready)
-                .await
-                .map_err(|error| {
-                    StatementNativeHealthFailure::actual_exit_unproven(
-                        "Native attempt lost its original diagnostic computation cut",
-                        Arc::new(error),
-                    )
-                })?;
-            self.registered_cut = Some(ready);
-        }
-        // If the publication Source has already exited, the bridge returns
-        // the original failure or convergence outcome.
-        Ok(())
-    }
+    #[cfg(test)]
+    pub(crate) fixture_exit: Arc<crate::control_runtime::host::HostExit>,
+    #[cfg(test)]
+    pub(crate) fixture_admission_failures: std::sync::Weak<
+        std::sync::Mutex<
+            std::collections::BTreeMap<
+                novarocks_attempt_protocol::failure::HostFailureRef,
+                crate::task_execution::error::TaskExecutionError,
+            >,
+        >,
+    >,
+    pub(crate) startup: super::startup::AttemptStartup,
 }
 
 pub(crate) struct InstallAttemptHost<'a> {
+    pub(crate) initial_now: novarocks_coordination_contract::MonotonicInstant,
+    #[cfg(test)]
+    pub(crate) fixture_observation_budget: Option<super::observations::ObservationBudget>,
+    #[cfg(all(test, novarocks_dev_controls))]
+    pub(crate) fixture_establish_handoff: Option<
+        &'a crate::query_execution::native_execution_adapter::original_install_fixture::OriginalInstallRow,
+    >,
     pub(crate) process: &'a FrontendAttemptRuntime,
     pub(crate) data: &'a FrontendDataRuntime,
     pub(crate) clock: Arc<dyn MonotonicClock>,
-    pub(crate) drive: &'a NativeAttemptDrive,
+    pub(crate) activation: novarocks_coordination_contract::AttemptActivationIdentity,
+    pub(crate) authorization_limits: novarocks_coordination_contract::AttemptAuthorizationLimits,
+    pub(crate) logical: &'a crate::query_execution::logical_binding::BoundLogicalPorts,
+    pub(crate) link: &'a crate::control_runtime::logical::links::AttemptActivationLinkLoan,
+    pub(crate) logical_inputs: &'a mut crate::control_runtime::logical::LogicalInputsLoan,
+    pub(crate) original_exit: &'a mut Option<crate::control_runtime::host::HostExit>,
     pub(crate) prepared: PreparedManifestAttempt,
-    pub(crate) establish: &'a AttemptEstablishFacts,
+    pub(crate) establish: &'a mut EstablishMaterialPreparation,
     pub(crate) replacements: Option<&'a [ReplacementWorkerAdmissionEvidence]>,
     pub(crate) subscriptions: StagedSubscriptionEndpoints,
     pub(crate) authority: NativeAsyncActionAuthority,
-    pub(crate) route: Arc<LogicalAbortRoute>,
-    pub(crate) results: Arc<NativeTaskResultTransport>,
+    pub(crate) results: Arc<dyn TaskResultTransport>,
     pub(crate) profile: Option<TaskFinalInfoCollector>,
     pub(crate) dynamic: Option<Arc<DynamicFilterRecords>>,
-    pub(crate) split: &'a mut Option<RoundSplitAssignmentPlan>,
+    pub(crate) originals: crate::query_execution::native_execution_adapter::AttemptSourceInputs<'a>,
     pub(crate) policy: AttemptPlanPolicy,
     pub(crate) ids: IdSeed,
     pub(crate) retain_diagnostics: bool,
@@ -161,22 +142,36 @@ pub(crate) struct InstallAttemptHost<'a> {
 }
 
 impl InstallAttemptHost<'_> {
-    pub(crate) fn install(self) -> Result<InstalledAttemptHost, NativeAttemptPreparationFailure> {
+    pub(crate) fn install(
+        self,
+    ) -> Result<
+        InstalledAttemptHost,
+        novarocks_query_application::api::NativeAttemptActivationFailure,
+    > {
         let Self {
+            initial_now,
+            #[cfg(test)]
+            fixture_observation_budget,
+            #[cfg(all(test, novarocks_dev_controls))]
+            fixture_establish_handoff,
             process,
             data,
             clock,
-            drive,
+            activation,
+            authorization_limits,
+            logical,
+            link,
+            logical_inputs,
+            original_exit,
             prepared,
             establish,
             replacements,
             subscriptions,
             authority,
-            route,
             results,
             profile,
             dynamic,
-            split,
+            mut originals,
             policy,
             ids,
             retain_diagnostics,
@@ -193,15 +188,24 @@ impl InstallAttemptHost<'_> {
         let layout = process.transport_capacity();
         let participants = NonZeroUsize::new(prepared.participants())
             .ok_or_else(|| preparation_failure("empty original Native roster"))?;
+        #[cfg(not(test))]
         let resources = AttemptActorRegistration::observation_resources(participants.get())
             .map_err(preparation_failure)?;
+        #[cfg(test)]
+        let budget = fixture_observation_budget
+            .unwrap_or_else(super::observations::ObservationBudget::for_task_attempt);
+        #[cfg(test)]
+        let resources =
+            AttemptActorRegistration::observation_resources_with_budget(budget, participants.get())
+                .map_err(preparation_failure)?;
         let mut next_payload = NonZeroU64::MIN;
         let mut pump_ref = || {
             let reference = PayloadRef(next_payload);
             next_payload = next_payload.checked_add(1).unwrap();
             reference
         };
-        let split_ref = split
+        let split_ref = originals
+            .split_plan_mut()
             .as_ref()
             .is_some_and(RoundSplitAssignmentPlan::has_sources)
             .then(&mut pump_ref);
@@ -213,29 +217,7 @@ impl InstallAttemptHost<'_> {
         .into_iter()
         .flatten()
         .collect::<Box<[_]>>();
-        let mut funding = AttemptHostFunding::reserve(ledger, None, GENERATION, resources)
-            .map_err(|error| {
-                let reason = if matches!(error, RuntimeError::CapacityDenied(_)) {
-                    QueryFailureReason::TransportCapacity
-                } else {
-                    QueryFailureReason::PreparationProtocol
-                };
-                preparation_failure_with(reason, &error)
-            })?;
-        let geometry = match AttemptHostGeometry::derive(
-            funding.scope().id(),
-            participants,
-            policy.coordination.dispatch,
-            layout,
-            &pumps,
-            retain_diagnostics,
-        ) {
-            Ok(geometry) => geometry,
-            Err(error) => {
-                funding.retire_unpublished(ledger);
-                return Err(preparation_failure(error));
-            }
-        };
+        let dispatch = policy.coordination.dispatch;
         let task_ids = split_ref.map(|_| {
             prepared
                 .graph()
@@ -247,11 +229,11 @@ impl InstallAttemptHost<'_> {
             prepared,
             establish,
             AttemptActivationInputs {
-                drive,
+                identity: activation,
+                authorization_limits,
                 replacement_admissions: replacements,
                 ids,
-                initial_now: clock.now(),
-                sources: geometry.sources,
+                initial_now,
                 retain_diagnostics,
                 observe_dev_root,
                 observe_lifecycle_diagnostics: observe_lifecycle,
@@ -260,27 +242,53 @@ impl InstallAttemptHost<'_> {
             pumps,
             &mut next_payload,
         );
-        let AttemptManifestProjection {
+        let projected = projected.map_err(|error| {
+            novarocks_query_application::api::NativeAttemptActivationFailure::new(
+                NativeAttemptPreparationFailure::from_input(error.preparation_input()),
+            )
+        })?;
+        let mut funding = link
+            .reserve_attempt(ledger, GENERATION, resources)
+            .map_err(|error| {
+                let reason = if matches!(error, RuntimeError::CapacityDenied(_)) {
+                    QueryFailureReason::TransportCapacity
+                } else {
+                    QueryFailureReason::PreparationProtocol
+                };
+                preparation_failure_with(reason, &error)
+            })?;
+        let mut geometry = match AttemptHostGeometry::derive(
+            funding.scope().id(),
+            participants,
+            dispatch,
+            layout,
+            projected.pumps(),
+            retain_diagnostics,
+        ) {
+            Ok(geometry) => geometry,
+            Err(error) => {
+                link.retire_unpublished_child(funding, ledger);
+                return Err(preparation_failure(error));
+            }
+        };
+        let logical_source = novarocks_attempt_protocol::input::AttemptSourceId(
+            NonZeroU64::new(logical.registration.actor().get()).unwrap(),
+        );
+        geometry.sources.owner = logical_source;
+        geometry.sources.qa = logical_source;
+        let BoundAttemptManifestProjection {
             start,
             members,
             publications,
             creations,
             requests,
-            qa,
+            establish,
             ..
-        } = match projected {
-            Ok(original) => original,
-            Err(error) => {
-                funding.retire_unpublished(ledger);
-                return Err(NativeAttemptPreparationFailure::from_input(
-                    error.preparation_input(),
-                ));
-            }
-        };
+        } = projected.bind_sources(geometry.sources);
         let config = match geometry.actor_config(&start) {
             Ok(config) => config,
             Err(error) => {
-                funding.retire_unpublished(ledger);
+                link.retire_unpublished_child(funding, ledger);
                 return Err(preparation_failure(error));
             }
         };
@@ -289,7 +297,7 @@ impl InstallAttemptHost<'_> {
         let (failure_work, report_author) = match reserve_authors(&scope, payer) {
             Ok(authors) => authors,
             Err(error) => {
-                funding.retire_unpublished(ledger);
+                link.retire_unpublished_child(funding, ledger);
                 return Err(preparation_failure(error));
             }
         };
@@ -297,7 +305,6 @@ impl InstallAttemptHost<'_> {
         // actor owns Core. The profile lookup is filled by the same split runner.
         let split_profile = split_ref.map(|reference| (reference, Arc::new(OnceLock::new())));
         let diagnostics = AttemptDiagnosticSources::new(&start, split_profile.clone());
-        let lifecycle = observe_lifecycle.then(|| diagnostics.clone());
         let mut registered = match AttemptActor::register(
             runtime,
             start,
@@ -311,10 +318,14 @@ impl InstallAttemptHost<'_> {
             Err(error) => {
                 retire_unpublished_author(&scope, failure_work);
                 retire_unpublished_author(&scope, report_author);
-                funding.retire_unpublished(ledger);
+                link.retire_unpublished_child(funding, ledger);
                 return Err(preparation_failure(error));
             }
         };
+        #[cfg(test)]
+        if fixture_observation_budget.is_some() {
+            registered.freeze_observation_budget_for_fixture(budget);
+        }
         // The remaining positions are derived from the same immutable
         // geometry and issued while the process registration gate is held.
         let executor = data.handle().clone();
@@ -328,8 +339,11 @@ impl InstallAttemptHost<'_> {
         let split_pump = split_profile.map(|(reference, profile)| {
             SplitPump::prepare(
                 reference,
-                drive.identity().execution(),
-                split.take().expect("original opened split plan"),
+                activation.execution(),
+                originals
+                    .split_plan_mut()
+                    .take()
+                    .expect("original opened split plan"),
                 task_ids.expect("original split targets"),
                 Arc::new(SourceWake(wake.clone())),
                 data.clone(),
@@ -337,9 +351,8 @@ impl InstallAttemptHost<'_> {
             )
             .expect("the original plan has opened split sources")
         });
-        let root = RootControlRequests::new(
+        let root = super::port::root_control::RootControlRequests::new(
             registered.root_control_binding().clone(),
-            registered.failure_publications().clone(),
         );
         let ingress = {
             let (observation, positions, root_work) = funding.observation_and_root_control();
@@ -357,10 +370,6 @@ impl InstallAttemptHost<'_> {
                 )
                 .expect("prepaid original observation Source")
         };
-        publications
-            .root_controls
-            .bind(registered.root_control_binding(), &root)
-            .expect("original root controls bind before publication");
         let (work, payer) = funding.parent();
         let capacity = registered
             .bind_source_parent(runtime, work, payer)
@@ -368,9 +377,70 @@ impl InstallAttemptHost<'_> {
         let membership = registered
             .bind_membership(runtime, work)
             .expect("prepaid original membership Source");
-        let (abort_ingress, abort) = route
-            .bind_attempt_ingress(&mut registered, runtime, work)
-            .expect("prepaid original Abort ingress");
+        let startup = registered
+            .prepare_startup(runtime, work)
+            .expect("prepaid original startup and local-exit roles");
+        let controls = registered
+            .prepare_port_controls(runtime, &logical.registration, work)
+            .expect("prepaid original logical control roles");
+        let abort = registered
+            .prepare_port_abort(runtime, &logical.registration, work)
+            .expect("prepaid original logical Abort roles");
+        let logical_wake = logical_inputs.host_waker();
+        let author = logical_inputs
+            .ap_author_from_link(link)
+            .expect("same issued original AP fact author");
+        let facts = super::port::facts::AttemptFactBank::reserve(
+            runtime,
+            &logical.registration,
+            &registered.original,
+            activation,
+            author,
+            retirement.host_waker(),
+            logical_wake,
+        )
+        .unwrap_or_else(|original| std::panic::resume_unwind(Box::new(original)));
+        let storage = link
+            .reserve_port_storage()
+            .expect("same original port reader funding");
+        let (control, reader) = super::port::control::SourcePublishedSlot::bind(
+            runtime,
+            super::port::control::ControlBinding {
+                lp: logical.registration.clone(),
+                ap: registered.original.clone(),
+                activation,
+                positions: controls,
+                storage,
+                observer: OBSERVER,
+                roots: root.clone(),
+            },
+        )
+        .unwrap_or_else(|original| std::panic::resume_unwind(Box::new(original)));
+        let requests_port = super::port::requests::AttemptRequests::new(
+            activation,
+            registered.original.clone(),
+            logical.registration.clone(),
+            NonZeroUsize::new(3).unwrap(),
+            retirement.host_waker(),
+        );
+        let receipts = Arc::new(super::port::abort::AbortReceiptTable::new(activation));
+        let endpoints = super::port::AttemptPortEndpoints::bind(
+            logical.registration.clone(),
+            registered.original.clone(),
+            activation,
+            startup.witness.clone(),
+            requests_port,
+            facts.clone(),
+            control,
+            abort,
+            root.clone(),
+        )
+        .unwrap_or_else(|original| std::panic::resume_unwind(Box::new(original)));
+        let observation = logical.bind_observation(link, activation, observe_lifecycle);
+        facts.bind_observation(observation.clone());
+        endpoints
+            .bind_observation(&observation)
+            .expect("same original control observation");
         let (auxiliary, infrastructure) = registered
             .prepare_auxiliary_source(runtime, work)
             .expect("prepaid original infrastructure failure position");
@@ -392,6 +462,7 @@ impl InstallAttemptHost<'_> {
             )
             .expect("prepaid original send routes");
         let send = AttemptSendSource {
+            closed: logical.closed.clone(),
             requests,
             contexts,
             report_author,
@@ -407,6 +478,8 @@ impl InstallAttemptHost<'_> {
                 geometry.admission_results,
             )
             .expect("prepaid original admission Source");
+        #[cfg(test)]
+        let fixture_admission_failures = admission.failure_records_for_fixture();
         for (reference, original) in creations {
             admission
                 .install_creation(reference, original)
@@ -415,8 +488,7 @@ impl InstallAttemptHost<'_> {
         let diagnostic_reads = retain_diagnostics.then(|| DiagnosticRecords::new(results));
         #[allow(unused_mut)]
         let mut publication = PublicationRecord::new(
-            drive.identity(),
-            publications.root_sender,
+            activation,
             publications.protocol,
             profile,
             diagnostic_reads.clone(),
@@ -425,18 +497,35 @@ impl InstallAttemptHost<'_> {
         if let Some(original) = root_observer {
             publication.register_root_observer(original);
         }
-        let publication =
-            AttemptPublicationOwner::new(publication, Some(diagnostics.clone()), Some(root));
+        let publication = AttemptPublicationOwner::new(publication, Some(diagnostics.clone()));
+        publication.bind_port_root(root);
+        publication.bind_observation(&observation);
+        let (residual, residual_sink) =
+            super::failure_residual::FailureResidualReceiveObligation::new(
+                registered.original.clone(),
+                activation,
+                members.clone(),
+                retirement.host_waker(),
+                auxiliary.raw_failure_publisher(),
+            );
         let transport = AttemptTransportBinding {
             retirement,
             admission,
-            abort,
+            port_binding: super::adapter::AttemptPortSourceBinding {
+                endpoints: endpoints.clone(),
+                establish,
+                receipts,
+                reader,
+                residual,
+                residual_sink,
+                observation: observation.clone(),
+            },
             send,
             next_payload,
             diagnostics,
-            qa: registered
-                .prepare_qa_source(runtime, work, payer, OBSERVER, qa)
-                .expect("prepaid original QA Source"),
+            ports: registered
+                .prepare_port_sources(runtime, &logical.registration, work, payer, OBSERVER)
+                .expect("prepaid original logical port Sources"),
             process: process
                 .prepare_attempt_process_source(&registered, work, payer, OBSERVER)
                 .expect("prepaid original process observation Source"),
@@ -477,32 +566,70 @@ impl InstallAttemptHost<'_> {
             registered.original.actor(),
             registered.subscription_source_for_test(),
         );
-        let mut prepared = registered
-            .prepare_host(
-                runtime,
-                work,
-                capacity,
-                membership,
-                Box::new(auxiliary),
-                &executor,
-                transport,
-            )
-            .unwrap_or_else(|original| std::panic::resume_unwind(Box::new(original)));
-        prepared.failure = prepared.failure.with_infrastructure_health(infrastructure);
-        let (startup, controls, terminal) = gate
-            .register_attempt(prepared, funding)
-            .unwrap_or_else(|original| std::panic::resume_unwind(Box::new(original)));
-        let bridge =
-            RegisteredActiveAttempt::new(startup, controls, terminal, clock, move |startup| {
-                route.publish_registered(startup, abort_ingress)
-            });
+        let prepared = match registered.prepare_host(
+            runtime,
+            work,
+            startup,
+            capacity,
+            membership,
+            Box::new(auxiliary),
+            &executor,
+            transport,
+            super::adapter::AttemptHostOriginals {
+                logical,
+                link,
+                inputs: originals,
+            },
+        ) {
+            Ok(prepared) => prepared,
+            Err(original) => return Err(retain_install_refusal((original, funding))),
+        };
+        #[cfg(all(test, novarocks_dev_controls))]
+        let prepared = if let Some(row) = fixture_establish_handoff {
+            let mut prepared = prepared;
+            let wake = prepared
+                .binding
+                .transport
+                .as_ref()
+                .expect("SAME original Host transport tracker")
+                .host_waker();
+            prepared.binding.executor =
+                row.decorate_original_executor(prepared.binding.executor.clone(), wake);
+            prepared
+        } else {
+            prepared
+        };
+        let mut funding = Some(funding);
+        let startup = match gate.register_attempt(prepared, &mut funding, original_exit) {
+            Ok(startup) => startup,
+            Err(original) => return Err(retain_install_refusal((original, funding))),
+        };
+        let exit = original_exit
+            .as_ref()
+            .expect("same stable received original HostExit");
+        link.bind_registered(&registered.original, exit);
+        link.bind_endpoints(endpoints);
+        let exit = Arc::new(original_exit.take().unwrap());
+        observation.bind_source(
+            link,
+            &registered.original,
+            exit.clone(),
+            startup.clone(),
+            &publication,
+            infrastructure,
+        );
+        startup
+            .release_initialization(runtime)
+            .expect("same original initialization release");
+
         Ok(InstalledAttemptHost {
             #[cfg(test)]
             fixture_sources,
-            bridge,
-            publication: Arc::downgrade(&publication),
-            registered_cut: None,
-            lifecycle,
+            #[cfg(test)]
+            fixture_exit: exit,
+            #[cfg(test)]
+            fixture_admission_failures,
+            startup,
         })
     }
 }
@@ -561,19 +688,52 @@ fn retire_unpublished_author(scope: &ScopeHandle, work: ReportedWork) {
     );
 }
 
-fn preparation_failure(error: impl std::fmt::Debug) -> NativeAttemptPreparationFailure {
+fn preparation_failure(
+    error: impl std::fmt::Debug,
+) -> novarocks_query_application::api::NativeAttemptActivationFailure {
     preparation_failure_with(QueryFailureReason::PreparationProtocol, &error)
 }
 
 fn preparation_failure_with(
     reason: QueryFailureReason,
     original: &impl std::fmt::Debug,
-) -> NativeAttemptPreparationFailure {
-    NativeAttemptPreparationFailure::from_input(ExecutionFailureInput::new(
-        reason.failure_fact(),
-        SafeDetail::truncating_display(format_args!(
-            "Native attempt installation refused: {original:?}"
+) -> novarocks_query_application::api::NativeAttemptActivationFailure {
+    novarocks_query_application::api::NativeAttemptActivationFailure::new(
+        NativeAttemptPreparationFailure::from_input(ExecutionFailureInput::new(
+            reason.failure_fact(),
+            SafeDetail::truncating_display(format_args!(
+                "Native attempt installation refused: {original:?}"
+            )),
+            ExecutionFailureSite::Coordinator,
         )),
-        ExecutionFailureSite::Coordinator,
-    ))
+    )
+}
+
+/// A whole typed constructor refusal retains its original Source/funding.
+/// Dropping an observer never destroys unresolved rich objects on a poller.
+struct UnprovenInstallObligation {
+    _original: std::sync::Mutex<std::mem::ManuallyDrop<Box<dyn std::any::Any + Send>>>,
+}
+impl std::fmt::Debug for UnprovenInstallObligation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("original Native installation custody retained")
+    }
+}
+impl std::fmt::Display for UnprovenInstallObligation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self, f)
+    }
+}
+impl std::error::Error for UnprovenInstallObligation {}
+fn retain_install_refusal(
+    original: impl Send + 'static,
+) -> novarocks_query_application::api::NativeAttemptActivationFailure {
+    novarocks_query_application::api::NativeAttemptActivationFailure::local_exit_unproven(
+        StatementNativeHealthFailure::actual_exit_unproven(
+            "original Native installation did not prove local exit",
+            Arc::new(UnprovenInstallObligation {
+                _original: std::sync::Mutex::new(std::mem::ManuallyDrop::new(Box::new(original))),
+            }),
+        ),
+    )
 }

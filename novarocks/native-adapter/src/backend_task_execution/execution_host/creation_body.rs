@@ -21,13 +21,13 @@
 use super::*;
 use arrow::array::{ArrayRef, Int64Array};
 use arrow::datatypes::{DataType, Field};
+use novarocks_expression_contract::{ExprKind, RootOrdinal, RootScope};
 use novarocks_functions::{ConstantPolicy, ConstantPool};
 use novarocks_physical_plan::*;
 use novarocks_proto_models::physical_package_v2 as wire;
 use novarocks_type_contract::{
-    CompileControlError, CompilePhase, ControlShape, EvaluationDomainId, ExpressionControlFlow,
-    ExpressionEffectContext, ExpressionEvaluationDomain, ExpressionInvocation, ExpressionUseId,
-    PureCompileControl, SemanticParameters,
+    CompileCheckpoints, CompileControlError, CompilePhase, EvaluationDemand, PureCompileControl,
+    SemanticParameters,
 };
 use std::collections::BTreeMap;
 
@@ -50,7 +50,7 @@ pub(crate) struct Body {
     pub(crate) assignment: proto::TaskAssignment,
 }
 
-fn constants() -> ConstantPolicy {
+fn constant_policy() -> ConstantPolicy {
     ConstantPolicy {
         max_rows: 65536,
         max_array_nodes: 64,
@@ -70,7 +70,7 @@ fn pool(array: ArrayRef, nullable: bool) -> ConstantPool {
         Arc::new(Field::new("fixture", array.data_type().clone(), nullable)),
         value,
         array.to_data(),
-        constants(),
+        constant_policy(),
         CompilePhase::Validate,
         &Control,
     )
@@ -110,17 +110,39 @@ fn edge_partition(
         source_multiplicity: RowMultiplicity::SingleCopy,
         destination: distribution_for(kind, destination),
         destination_multiplicity: RowMultiplicity::SingleCopy,
+        routing_only: Box::default(),
     }
 }
 
 fn finish(
-    builder: FragmentBuilder,
+    mut builder: FragmentBuilder,
     root: NodeId,
     sink: FragmentSink,
     dop: u32,
     constants: ConstantPools,
     cuts: FragmentCuts,
 ) -> Body {
+    let nodes: Vec<_> = builder
+        .construction_nodes()
+        .filter_map(|(&id, node)| {
+            let mut roots = Vec::new();
+            node.kind.root_references(&mut roots);
+            (!roots.is_empty()).then_some(id)
+        })
+        .collect();
+    let mut work = CompileCheckpoints::try_new(&Control, CompilePhase::Validate).unwrap();
+    for node in nodes {
+        let ports = builder.node_ports(node).unwrap();
+        let unit = builder
+            .take_unit_builder(node)
+            .unwrap()
+            .seal(ports, &mut work)
+            .unwrap()
+            .finish(BTreeMap::new(), &mut work)
+            .unwrap();
+        builder.install_unit(node, Arc::new(unit)).unwrap();
+    }
+    work.finish().unwrap();
     let fragment = builder
         .finish_definition(
             root,
@@ -133,38 +155,6 @@ fn finish(
             novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap();
-    let roots = PhysicalExpressionRoots::try_new(&fragment, &Control).unwrap();
-    let domain = EvaluationDomainId::new(0);
-    let mut invocations = Vec::new();
-    let mut bindings = Vec::new();
-    for (ordinal, (site, expression)) in roots.sites().iter().enumerate() {
-        let use_id = ExpressionUseId::new(ordinal as u32);
-        invocations.push(ExpressionInvocation {
-            context: ExpressionEffectContext {
-                use_id,
-                domain,
-                demand: expression.demand,
-            },
-            definition: expression.expr,
-            control: ControlShape::Eager,
-            arguments: Box::default(),
-        });
-        bindings.push((*site, use_id));
-    }
-    let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
-            id: domain,
-            parent: None,
-            guard: None,
-        }],
-        invocations,
-        fragment.expressions(),
-        CompilePhase::Validate,
-        &Control,
-    )
-    .unwrap();
-    let uses = PhysicalRootUses::try_new(&fragment, flow, bindings, &Control).unwrap();
-    let calls = FrozenFragmentCalls::try_new(&fragment, &uses, vec![], &Control).unwrap();
     let result = matches!(
         fragment.sink(),
         FragmentSink::Result | FragmentSink::RootResult(_)
@@ -221,14 +211,14 @@ fn finish(
             required: RequiredContracts::default(),
             pruning: FrozenFragmentPruning::try_new(fragment.id(), vec![], &Control).unwrap(),
             fragment,
-            expression_uses: uses,
-            calls,
+            statement_constant_policy: constant_policy(),
             cuts,
             result,
             parameters: SemanticParameters::try_new([]).unwrap(),
             scans: BTreeMap::new(),
             writes: BTreeMap::new(),
             annotations: Box::default(),
+            layouts: Default::default(),
         },
         FragmentPackageAdmission {
             plan_limits: PlanLimits::FROZEN,
@@ -333,11 +323,12 @@ impl Body {
             .unwrap();
         let source = pool(Arc::new(Int64Array::from(rows.to_vec())), false);
         let mut constants = ConstantPools::empty();
-        let mut cells: Vec<Box<[ExprId]>> = Vec::new();
+        let mut cells: Vec<Box<[RootOrdinal]>> = Vec::new();
         for ordinal in 0..rows.len() {
-            let expression = builder
-                .add_expression(
-                    root,
+            let unit = builder.unit(root).unwrap();
+            let expression = unit
+                .add(
+                    None,
                     source.value_type().clone(),
                     ExprKind::Constant(ConstantReference {
                         pool: ConstantPoolId::new(0),
@@ -345,7 +336,10 @@ impl Body {
                     }),
                 )
                 .unwrap();
-            cells.push(Box::from([expression]));
+            let cell = unit
+                .root(expression, EvaluationDemand::Value, RootScope::AllPorts)
+                .unwrap();
+            cells.push(Box::from([cell]));
         }
         if !rows.is_empty() {
             constants.insert(ConstantPoolId::new(0), source).unwrap();
@@ -452,9 +446,10 @@ impl Body {
                 },
             )
             .unwrap();
-        let input_expression = builder
-            .add_expression(
-                child,
+        let unit = builder.unit(child).unwrap();
+        let input_expression = unit
+            .add(
+                None,
                 binary.value_type().clone(),
                 ExprKind::Constant(ConstantReference {
                     pool: ConstantPoolId::new(0),
@@ -462,10 +457,17 @@ impl Body {
                 }),
             )
             .unwrap();
+        let input_root = unit
+            .root(
+                input_expression,
+                EvaluationDemand::Value,
+                RootScope::AllPorts,
+            )
+            .unwrap();
         builder
             .add_values(
                 child,
-                vec![vec![input_expression].into_boxed_slice()].into_boxed_slice(),
+                Box::from([Box::from([input_root])]),
                 Box::from([input]),
             )
             .unwrap();
@@ -491,14 +493,22 @@ impl Body {
                     .unwrap(),
             );
         }
-        let label_expression = builder
-            .add_expression(
-                root,
+        let unit = builder.unit(root).unwrap();
+        let label_expression = unit
+            .add(
+                None,
                 label.value_type().clone(),
                 ExprKind::Constant(ConstantReference {
                     pool: ConstantPoolId::new(1),
                     ordinal: 0,
                 }),
+            )
+            .unwrap();
+        let label_root = unit
+            .root(
+                label_expression,
+                EvaluationDemand::Value,
+                RootScope::Port(0),
             )
             .unwrap();
         builder
@@ -519,7 +529,7 @@ impl Body {
                                     pool: ConstantPoolId::new(2),
                                     ordinal: 0,
                                 }),
-                                UnpivotConstant::Scalar(label_expression),
+                                UnpivotConstant::Scalar(label_root),
                                 UnpivotConstant::Utf8Map(ConstantReference {
                                     pool: ConstantPoolId::new(3),
                                     ordinal: 0,

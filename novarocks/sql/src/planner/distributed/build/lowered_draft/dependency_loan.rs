@@ -27,7 +27,14 @@ use novarocks_functions::{
 pub enum SqlCallDependencySite<'a> {
     Expression {
         fragment: &'a Fragment,
-        source: &'a novarocks_physical_plan::ExprNode,
+        node: &'a PhysicalNode,
+        source: &'a novarocks_expression_contract::ExprNode,
+    },
+    Window {
+        fragment: &'a Fragment,
+        node: &'a PhysicalNode,
+        site: PhysicalCallSite,
+        source: &'a novarocks_physical_plan::WindowCallSpec,
     },
     Table {
         fragment: &'a Fragment,
@@ -48,7 +55,12 @@ pub enum SqlCallDependencySite<'a> {
 }
 
 enum AuthenticatedSource<'a> {
-    Expression(CheckedExpressionLogicalSourceEntry<'a>),
+    Expression {
+        entry: CheckedExpressionLogicalSourceEntry<'a>,
+        fragment: &'a Fragment,
+        node: &'a PhysicalNode,
+    },
+    Window(CheckedWindowLogicalSourceEntry<'a>),
     Table(CheckedTableLogicalSourceEntry<'a>),
     Aggregate(CheckedAggregateLogicalSourceEntry<'a>),
     WriterAggregate(CheckedWriterAggregateLogicalSourceEntry<'a>),
@@ -63,9 +75,16 @@ pub struct SqlCallDependencyLoan<'a> {
 pub enum SqlCallDependencyProvenance<'a> {
     Expression {
         fragment: &'a Fragment,
-        source: &'a novarocks_physical_plan::ExprNode,
+        node: &'a PhysicalNode,
+        source: &'a novarocks_expression_contract::ExprNode,
         kind: SqlExpressionCallKind,
         channels: &'a [ExprId],
+    },
+    Window {
+        fragment: &'a Fragment,
+        node: &'a PhysicalNode,
+        site: PhysicalCallSite,
+        source: &'a novarocks_physical_plan::WindowCallSpec,
     },
     Table {
         fragment: &'a Fragment,
@@ -123,7 +142,8 @@ impl<'a> SqlCanonicalDependencyLoan<'a> {
 impl<'a> SqlCallDependencyLoan<'a> {
     pub fn original_binding(&self) -> &'a SqlFunctionBinding {
         match &self.source {
-            AuthenticatedSource::Expression(source) => source.captured().binding(),
+            AuthenticatedSource::Expression { entry: source, .. } => source.captured().binding(),
+            AuthenticatedSource::Window(source) => source.captured().binding(),
             AuthenticatedSource::Table(source) => source.captured().binding(),
             AuthenticatedSource::Aggregate(source) => source.captured().binding(),
             AuthenticatedSource::WriterAggregate(source) => source.captured().binding(),
@@ -133,7 +153,10 @@ impl<'a> SqlCallDependencyLoan<'a> {
     /// constraint is intentionally not exposed as an original request constraint.
     pub fn original_arguments(&self) -> &'a [FunctionArgument] {
         match &self.source {
-            AuthenticatedSource::Expression(source) => source.captured().request().arguments,
+            AuthenticatedSource::Expression { entry: source, .. } => {
+                source.captured().request().arguments
+            }
+            AuthenticatedSource::Window(source) => source.captured().request().arguments,
             AuthenticatedSource::Table(source) => source.captured().request().arguments,
             AuthenticatedSource::Aggregate(source) => source.captured().request().arguments,
             AuthenticatedSource::WriterAggregate(source) => source.captured().request().arguments,
@@ -141,7 +164,10 @@ impl<'a> SqlCallDependencyLoan<'a> {
     }
     pub fn original_logical_argument_count(&self) -> usize {
         match &self.source {
-            AuthenticatedSource::Expression(source) => {
+            AuthenticatedSource::Expression { entry: source, .. } => {
+                source.captured().request().logical_argument_count
+            }
+            AuthenticatedSource::Window(source) => {
                 source.captured().request().logical_argument_count
             }
             AuthenticatedSource::Table(source) => {
@@ -157,7 +183,10 @@ impl<'a> SqlCallDependencyLoan<'a> {
     }
     pub fn original_constant_policy(&self) -> ConstantPolicy {
         match &self.source {
-            AuthenticatedSource::Expression(source) => source.captured().constant_policy(),
+            AuthenticatedSource::Expression { entry: source, .. } => {
+                source.captured().constant_policy()
+            }
+            AuthenticatedSource::Window(source) => source.captured().constant_policy(),
             AuthenticatedSource::Table(source) => source.captured().constant_policy(),
             AuthenticatedSource::Aggregate(source) => source.captured().constant_policy(),
             AuthenticatedSource::WriterAggregate(source) => source.captured().constant_policy(),
@@ -165,8 +194,11 @@ impl<'a> SqlCallDependencyLoan<'a> {
     }
     pub fn canonical(&self) -> Option<SqlCanonicalDependencyLoan<'a>> {
         let source = match &self.source {
-            AuthenticatedSource::Expression(source) => {
+            AuthenticatedSource::Expression { entry: source, .. } => {
                 CanonicalSource::Call(source.canonical_operational()?.as_ref())
+            }
+            AuthenticatedSource::Window(source) => {
+                CanonicalSource::Call(source.canonical_operational().as_ref())
             }
             AuthenticatedSource::Table(source) => {
                 CanonicalSource::Call(source.canonical_operational().as_ref())
@@ -182,11 +214,22 @@ impl<'a> SqlCallDependencyLoan<'a> {
     }
     pub fn provenance(&self) -> SqlCallDependencyProvenance<'a> {
         match &self.source {
-            AuthenticatedSource::Expression(source) => SqlCallDependencyProvenance::Expression {
-                fragment: source.fragment(),
+            AuthenticatedSource::Expression {
+                entry: source,
+                fragment,
+                node,
+            } => SqlCallDependencyProvenance::Expression {
+                fragment,
+                node,
                 source: source.source(),
                 kind: source.kind(),
                 channels: source.arguments(),
+            },
+            AuthenticatedSource::Window(source) => SqlCallDependencyProvenance::Window {
+                fragment: source.fragment(),
+                node: source.node(),
+                site: source.site(),
+                source: source.source(),
             },
             AuthenticatedSource::Table(source) => SqlCallDependencyProvenance::Table {
                 fragment: source.fragment(),
@@ -223,11 +266,24 @@ impl SqlAuthoredPhysicalPlan {
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<SqlCallDependencyLoan<'a>, SqlSourceJournalError> {
         let source = match site {
-            SqlCallDependencySite::Expression { fragment, source } => {
-                AuthenticatedSource::Expression(
-                    self.checked_expression_call_source_observed(fragment, source, work)?,
-                )
-            }
+            SqlCallDependencySite::Expression {
+                fragment,
+                node,
+                source,
+            } => AuthenticatedSource::Expression {
+                entry: self
+                    .checked_expression_call_source_observed(fragment, node, source, work)?,
+                fragment,
+                node,
+            },
+            SqlCallDependencySite::Window {
+                fragment,
+                node,
+                site,
+                source,
+            } => AuthenticatedSource::Window(
+                self.checked_window_source_observed(fragment, node, site, source, work)?,
+            ),
             SqlCallDependencySite::Table { fragment, source } => AuthenticatedSource::Table(
                 self.checked_table_source_observed(fragment, source, work)?,
             ),

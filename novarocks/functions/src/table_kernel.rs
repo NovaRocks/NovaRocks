@@ -22,7 +22,7 @@ use crate::kernel_input::EvaluationCheckpoints;
 use crate::{
     CallEffectInput, FunctionBindingError, FunctionBindingResolver, FunctionBindingSelection,
     FunctionCallContract, FunctionEffectOwner, FunctionSpecializationFailure,
-    KernelEvaluationControl, KernelFailure, RowDataError, ScopedExpressionEffects,
+    KernelEvaluationControl, KernelFailure, RowDataError, ScopedRelationalEffects,
     SelectedTableInput, TableCallContract, TableOutputPage, TablePageCapacity, TableParentErrors,
 };
 use arrow_array::{ArrayRef, new_empty_array};
@@ -126,13 +126,13 @@ pub trait PureTableImplementation:
 #[derive(Debug)]
 pub struct TableSpecialization {
     prepared: Arc<dyn PreparedTableKernel>,
-    effects: ScopedExpressionEffects,
+    effects: ScopedRelationalEffects,
 }
 impl TableSpecialization {
     pub fn prepared(&self) -> &Arc<dyn PreparedTableKernel> {
         &self.prepared
     }
-    pub const fn effects(&self) -> ScopedExpressionEffects {
+    pub const fn effects(&self) -> ScopedRelationalEffects {
         self.effects
     }
     pub fn into_prepared(self) -> Arc<dyn PreparedTableKernel> {
@@ -143,7 +143,7 @@ pub fn specialize_table<O: PureTableImplementation + ?Sized>(
     owner: &O,
     input: CallEffectInput<'_>,
     selected: Arc<FunctionBindingSelection>,
-    arguments: ScopedExpressionEffects,
+    arguments: ScopedRelationalEffects,
     control: &dyn PureCompileControl,
 ) -> Result<TableSpecialization, FunctionSpecializationFailure> {
     specialize_table_once(owner, input, selected, None, arguments, control)
@@ -153,7 +153,7 @@ pub fn specialize_frozen_table<O: PureTableImplementation + ?Sized>(
     input: CallEffectInput<'_>,
     selected: Arc<FunctionBindingSelection>,
     frozen: &CallEffects,
-    arguments: ScopedExpressionEffects,
+    arguments: ScopedRelationalEffects,
     control: &dyn PureCompileControl,
 ) -> Result<TableSpecialization, FunctionSpecializationFailure> {
     specialize_table_once(owner, input, selected, Some(frozen), arguments, control)
@@ -163,7 +163,7 @@ fn specialize_table_once<O: PureTableImplementation + ?Sized>(
     input: CallEffectInput<'_>,
     selected: Arc<FunctionBindingSelection>,
     frozen: Option<&CallEffects>,
-    arguments: ScopedExpressionEffects,
+    arguments: ScopedRelationalEffects,
     control: &dyn PureCompileControl,
 ) -> Result<TableSpecialization, FunctionSpecializationFailure> {
     specialize_table_once_core(
@@ -192,7 +192,7 @@ pub(crate) fn specialize_table_once_checked<O: PureTableImplementation + ?Sized>
     input: CallEffectInput<'_>,
     selected: Arc<FunctionBindingSelection>,
     frozen: Option<&CallEffects>,
-    arguments: ScopedExpressionEffects,
+    arguments: ScopedRelationalEffects,
     control: &dyn PureCompileControl,
 ) -> Result<TableSpecialization, crate::CheckedOwnerFailure<FunctionSpecializationFailure>> {
     specialize_table_once_core(
@@ -233,11 +233,11 @@ fn specialize_table_once_core<
     input: CallEffectInput<'a>,
     selected: Arc<FunctionBindingSelection>,
     _frozen: Option<&CallEffects>,
-    arguments: ScopedExpressionEffects,
+    arguments: ScopedRelationalEffects,
     control: &dyn PureCompileControl,
     refine: impl FnOnce(
-        ScopedExpressionEffects,
-    ) -> Result<(crate::RefinedCallEffects<'a>, ScopedExpressionEffects), E>,
+        ScopedRelationalEffects,
+    ) -> Result<(crate::RefinedCallEffects<'a>, ScopedRelationalEffects), E>,
     prepare: impl FnOnce(Arc<TableCallContract>) -> Result<Arc<dyn PreparedTableKernel>, E>,
 ) -> Result<TableSpecialization, E> {
     let (receipt, effects) = refine(arguments)?;

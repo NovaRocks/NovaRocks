@@ -16,6 +16,7 @@
 // under the License.
 
 use super::*;
+mod original_properties;
 use novarocks_types::identity::{AttemptId, QueryExecutionId, QueryId};
 
 fn owner() -> ParticipationOwner {

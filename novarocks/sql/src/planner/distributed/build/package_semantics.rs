@@ -15,53 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Production per-fragment package semantics of one completed SQL owner:
-//! expression root uses, the complete frozen call table, and the pruning
-//! table. Each call's source scope comes from the owner's original SQL
-//! journal entry; no policy is guessed from a first call or a package default.
-//!
-//! Scope facts and their sources:
-//! - decimal overflow policy: the call's captured SQL binding;
-//! - constant policy: the statement policy supplied by the caller, which
-//!   every captured call must equal exactly;
-//! - environment: SQL authors no lexical environment for ordinary calls yet
-//!   (the statement snapshot author is pending), so it is empty. An owner whose
-//!   call needs an environment refuses during refinement; nothing is invented;
-//! - proof scope: the call's actual evaluation domain, never Unconditional.
-//!
-//! Pruning: SQL authors no pruning witness, so each fragment publishes the
-//! empty table, which grants no pruning authority.
+//! Typed failures from the original SQL lowering and package admission.
+//! Error projection remains shared with that original author; this module
+//! never prepares effects, rebuilds control or reconstructs call requests.
 
-use std::collections::BTreeMap;
 use std::fmt;
 
-use novarocks_functions::ConstantPolicy;
-use novarocks_physical_plan::{
-    ExprKind, Fragment, FragmentId, FrozenFragmentCalls, FrozenFragmentPruning, FrozenPruningError,
-    PhysicalCallSite, PhysicalRootUses,
-};
-use novarocks_type_contract::{
-    CallProofScope, CompileCheckpoints, CompileControlError, CompilePhase, ExpressionUseId,
-    PureCompileControl,
-};
-
-use super::expression_occurrences::{
-    ExpressionOccurrenceError, author_physical_occurrences_from_journal_observed,
-};
-use super::lowered_draft::{SqlAuthoredPhysicalPlan, SqlSourceJournalError};
-use super::physical_expression_effects::{PhysicalCallSourceScope, PhysicalExpressionEffectsError};
-use super::physical_fragment_effects::{
-    PhysicalFragmentEffectsError, PhysicalFragmentEffectsInput, PhysicalRelationalCallSourceScope,
-    aggregate_source, author_sql_fragment_effects_observed, writer_source,
-};
-
-/// One fragment's package semantics, ready for package extraction.
-#[derive(Debug)]
-pub struct FragmentPackageSemantics {
-    pub expression_uses: PhysicalRootUses,
-    pub calls: FrozenFragmentCalls,
-    pub pruning: FrozenFragmentPruning,
-}
+use super::expression_occurrences::ExpressionOccurrenceError;
+use super::lowered_draft::SqlSourceJournalError;
+#[cfg(test)]
+use super::physical_expression_effects::PhysicalExpressionEffectsError;
+use super::physical_fragment_effects::PhysicalFragmentEffectsError;
+use novarocks_physical_plan::{FrozenPruningError, PhysicalCallSite};
+use novarocks_type_contract::CompileControlError;
+#[cfg(test)]
+use novarocks_type_contract::{CompilePhase, PureCompileControl};
 
 #[derive(Debug)]
 pub enum PackageSemanticsError {
@@ -81,6 +49,16 @@ pub enum PackageSemanticsError {
     Pruning(String),
     /// A captured call's constant policy differs from the statement policy.
     PolicyMismatch(PhysicalCallSite),
+    /// Package extraction must use the exact policy already frozen by SQL.
+    StatementPolicyMismatch,
+    ExpressionPolicyMismatch {
+        node: novarocks_physical_plan::NodeId,
+        invocation: novarocks_type_contract::ExpressionUseId,
+    },
+    /// The actual standalone source has no relational node identity.
+    StandaloneExpressionPolicyMismatch {
+        invocation: novarocks_type_contract::ExpressionUseId,
+    },
     InvalidSource(&'static str),
 }
 impl fmt::Display for PackageSemanticsError {
@@ -97,6 +75,20 @@ impl fmt::Display for PackageSemanticsError {
                 None => source.fmt(f),
             },
             Self::Pruning(detail) => write!(f, "package pruning: {detail}"),
+            Self::ExpressionPolicyMismatch { node, invocation } => write!(
+                f,
+                "captured constant policy differs from the statement policy at node {} invocation {}",
+                node.get(),
+                invocation.get()
+            ),
+            Self::StandaloneExpressionPolicyMismatch { invocation } => write!(
+                f,
+                "captured constant policy differs from the statement policy at standalone scalar unit invocation {}",
+                invocation.get()
+            ),
+            Self::StatementPolicyMismatch => {
+                f.write_str("statement constant policy differs from its authored SQL source")
+            }
             Self::PolicyMismatch(site) => write!(
                 f,
                 "captured constant policy differs from the statement policy at {site:?}"
@@ -127,7 +119,10 @@ impl novarocks_failure_contract::FailureProjection for PackageSemanticsError {
             Self::Effects(_) => (FailureClass::Invariant, 9),
             Self::UnsupportedCapability(_) => (FailureClass::Unsupported, 10),
             Self::Pruning(_) => (FailureClass::Invariant, 11),
-            Self::PolicyMismatch(_) => (FailureClass::Invariant, 12),
+            Self::PolicyMismatch(_)
+            | Self::StatementPolicyMismatch
+            | Self::ExpressionPolicyMismatch { .. }
+            | Self::StandaloneExpressionPolicyMismatch { .. } => (FailureClass::Invariant, 12),
             Self::InvalidSource(_) => (FailureClass::Invariant, 13),
         };
         FailureFact::new(
@@ -177,11 +172,9 @@ fn constant_limit_from_effects(
                 PhysicalFragmentEffectsError::Expressions(E::Request(S::Argument(argument)))
             })
         }
-        PhysicalFragmentEffectsError::Expressions(E::WindowRequest(W::Argument(argument))) => {
-            argument.into_constant_limit().map_err(|argument| {
-                PhysicalFragmentEffectsError::Expressions(E::WindowRequest(W::Argument(argument)))
-            })
-        }
+        PhysicalFragmentEffectsError::WindowRequest(W::Argument(argument)) => argument
+            .into_constant_limit()
+            .map_err(|argument| PhysicalFragmentEffectsError::WindowRequest(W::Argument(argument))),
         PhysicalFragmentEffectsError::AggregateRequest(A::Argument(argument)) => {
             argument.into_constant_limit().map_err(|argument| {
                 PhysicalFragmentEffectsError::AggregateRequest(A::Argument(argument))
@@ -199,9 +192,16 @@ fn constant_limit_from_effects(
     }
 }
 
+impl From<super::physical_expression_effects::PhysicalExpressionEffectsError>
+    for PackageSemanticsError
+{
+    fn from(error: super::physical_expression_effects::PhysicalExpressionEffectsError) -> Self {
+        Self::from(PhysicalFragmentEffectsError::Expressions(error))
+    }
+}
 impl From<PhysicalFragmentEffectsError> for PackageSemanticsError {
     fn from(error: PhysicalFragmentEffectsError) -> Self {
-        use PhysicalExpressionEffectsError as E;
+        use super::physical_expression_effects::PhysicalExpressionEffectsError as E;
         use novarocks_failure_contract::SharedFailureCause;
         use novarocks_functions::{
             ArithmeticPrepareError as A, CastPrepareError as C, ComparisonPrepareError as B,
@@ -245,6 +245,14 @@ impl From<PhysicalFragmentEffectsError> for PackageSemanticsError {
         }
     }
 }
+impl From<novarocks_physical_plan::FrozenCallError> for PackageSemanticsError {
+    fn from(error: novarocks_physical_plan::FrozenCallError) -> Self {
+        match error {
+            novarocks_physical_plan::FrozenCallError::Control(cause) => Self::Control(cause),
+            error => Self::from(PhysicalFragmentEffectsError::Calls(error)),
+        }
+    }
+}
 impl From<FrozenPruningError> for PackageSemanticsError {
     fn from(error: FrozenPruningError) -> Self {
         match error {
@@ -252,201 +260,6 @@ impl From<FrozenPruningError> for PackageSemanticsError {
             other => Self::Pruning(format!("{other:?}")),
         }
     }
-}
-
-/// Author every fragment's package semantics from the owner's journal.
-pub fn author_fragment_package_semantics(
-    owner: &SqlAuthoredPhysicalPlan,
-    statement_constant_policy: ConstantPolicy,
-    control: &dyn PureCompileControl,
-) -> Result<BTreeMap<FragmentId, FragmentPackageSemantics>, PackageSemanticsError> {
-    let mut output = BTreeMap::new();
-    for (id, fragment) in owner.plan().fragments() {
-        let semantics = author_one(owner, fragment, statement_constant_policy, control)?;
-        output.insert(*id, semantics);
-    }
-    Ok(output)
-}
-
-fn author_one(
-    owner: &SqlAuthoredPhysicalPlan,
-    fragment: &Fragment,
-    policy: ConstantPolicy,
-    control: &dyn PureCompileControl,
-) -> Result<FragmentPackageSemantics, PackageSemanticsError> {
-    let occurrences = author_physical_occurrences_from_journal_observed(owner, fragment, control)?;
-    let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
-    let environments = (|| {
-        let mut aggregate_environments = BTreeMap::new();
-        for &(site, _) in &occurrences.relational_contexts {
-            if let PhysicalCallSite::Aggregate { node, .. }
-            | PhysicalCallSite::TopNState { node, .. } = site
-            {
-                let node =
-                    fragment
-                        .nodes()
-                        .get(&node)
-                        .ok_or(PackageSemanticsError::InvalidSource(
-                            "aggregate node is absent",
-                        ))?;
-                let source = aggregate_source(node, site)?;
-                let entry = owner
-                    .checked_aggregate_source_observed(fragment, node, site, source, &mut work)?;
-                if let Some(facts) = entry.captured().binding().group_concat_source() {
-                    let refs = facts.environment();
-                    for reference in refs {
-                        owner.plan().parameters().require(reference).map_err(|_| {
-                            PackageSemanticsError::InvalidSource(
-                                "group_concat admitted parameter is absent",
-                            )
-                        })?;
-                        work.step()?;
-                    }
-                    aggregate_environments.insert(site, refs);
-                }
-            }
-        }
-        Ok(aggregate_environments)
-    })();
-    let aggregate_environments = match environments {
-        Ok(environments) => environments,
-        Err(error) => return work.finish_result(Err(error), PackageSemanticsError::from),
-    };
-    let scopes = (|| {
-        let mut expressions: BTreeMap<ExpressionUseId, PhysicalCallSourceScope<'_>> =
-            BTreeMap::new();
-        for (&id, invocation) in occurrences.root_uses.flow().uses() {
-            work.step()?;
-            let source = fragment.expressions().get(invocation.definition).ok_or(
-                PackageSemanticsError::InvalidSource(
-                    "root use names an absent expression definition",
-                ),
-            )?;
-            if !matches!(
-                source.kind,
-                ExprKind::FunctionCall { .. } | ExprKind::WindowCall { .. }
-            ) {
-                continue;
-            }
-            let entry =
-                owner.checked_expression_call_source_observed(fragment, source, &mut work)?;
-            let captured = entry.captured();
-            if captured.constant_policy() != policy {
-                return Err(PackageSemanticsError::PolicyMismatch(
-                    PhysicalCallSite::Expression(id),
-                ));
-            }
-            expressions.insert(
-                id,
-                PhysicalCallSourceScope {
-                    source,
-                    decimal_overflow_policy: captured.binding().decimal_overflow_policy(),
-                    environment: &[],
-                    proof_scope: CallProofScope::Domain(invocation.context.domain),
-                },
-            );
-        }
-        let mut relations: BTreeMap<PhysicalCallSite, PhysicalRelationalCallSourceScope<'_>> =
-            BTreeMap::new();
-        for &(site, context) in &occurrences.relational_contexts {
-            work.step()?;
-            let node_id = match site {
-                PhysicalCallSite::Table { node }
-                | PhysicalCallSite::Aggregate { node, .. }
-                | PhysicalCallSite::TopNState { node, .. }
-                | PhysicalCallSite::WriterPartial { node, .. }
-                | PhysicalCallSite::WriterFinal { node, .. } => node,
-                PhysicalCallSite::Expression(_) => {
-                    return Err(PackageSemanticsError::InvalidSource(
-                        "relational context names an expression call site",
-                    ));
-                }
-            };
-            let node =
-                fragment
-                    .nodes()
-                    .get(&node_id)
-                    .ok_or(PackageSemanticsError::InvalidSource(
-                        "relational call site names an absent node",
-                    ))?;
-            // (decimal overflow policy, captured constant policy)
-            let (decimal, constant) = match site {
-                PhysicalCallSite::Table { .. } => {
-                    let entry = owner.checked_table_source_observed(fragment, node, &mut work)?;
-                    let captured = entry.captured();
-                    (
-                        captured.binding().decimal_overflow_policy(),
-                        captured.constant_policy(),
-                    )
-                }
-                PhysicalCallSite::Aggregate { .. } | PhysicalCallSite::TopNState { .. } => {
-                    let source = aggregate_source(node, site)?;
-                    let entry = owner.checked_aggregate_source_observed(
-                        fragment, node, site, source, &mut work,
-                    )?;
-                    let captured = entry.captured();
-                    (
-                        captured.binding().decimal_overflow_policy(),
-                        captured.constant_policy(),
-                    )
-                }
-                PhysicalCallSite::WriterPartial { .. } | PhysicalCallSite::WriterFinal { .. } => {
-                    let source = writer_source(node, site)?;
-                    let entry = owner.checked_writer_aggregate_source_observed(
-                        fragment, node, site, source, &mut work,
-                    )?;
-                    let captured = entry.captured();
-                    (
-                        captured.binding().decimal_overflow_policy(),
-                        captured.constant_policy(),
-                    )
-                }
-                PhysicalCallSite::Expression(_) => unreachable!("refused above"),
-            };
-            if constant != policy {
-                return Err(PackageSemanticsError::PolicyMismatch(site));
-            }
-            relations.insert(
-                site,
-                PhysicalRelationalCallSourceScope {
-                    source: node,
-                    decimal_overflow_policy: decimal,
-                    environment: aggregate_environments
-                        .get(&site)
-                        .map_or(&[][..], |refs| refs.as_slice()),
-                    proof_scope: CallProofScope::Domain(context.domain),
-                },
-            );
-        }
-        Ok((expressions, relations))
-    })();
-    let (expressions, relations) = match scopes {
-        Ok(scopes) => scopes,
-        Err(error) => return work.finish_result(Err(error), PackageSemanticsError::from),
-    };
-    work.finish()?;
-    let effects = author_sql_fragment_effects_observed(
-        owner,
-        PhysicalFragmentEffectsInput {
-            fragment,
-            occurrences: &occurrences,
-            constants: owner.plan().constants(),
-            parameters: owner.plan().parameters(),
-            literal_policy: policy,
-            expression_scopes: &expressions,
-            relational_scopes: &relations,
-        },
-        control,
-    )?;
-    let calls = effects.calls;
-    drop(expressions);
-    drop(relations);
-    let pruning = FrozenFragmentPruning::try_new(fragment.id(), vec![], control)?;
-    Ok(FragmentPackageSemantics {
-        expression_uses: occurrences.root_uses,
-        calls,
-        pruning,
-    })
 }
 
 #[cfg(test)]
@@ -689,7 +502,7 @@ mod constant_limit_projection_tests {
 
     #[test]
     fn typed_limits_survive_all_physical_call_argument_wrappers() {
-        use PhysicalExpressionEffectsError as E;
+        use super::super::physical_expression_effects::PhysicalExpressionEffectsError as E;
         let expected = FailureFact::new(
             FailureClass::Resource,
             FailureReason::new(domain::CONSTANT, NonZeroU16::new(2).unwrap()),
@@ -700,9 +513,7 @@ mod constant_limit_projection_tests {
                 PhysicalFragmentEffectsError::Expressions(E::Request(S::Argument(argument(
                     reference,
                 )))),
-                PhysicalFragmentEffectsError::Expressions(E::WindowRequest(W::Argument(argument(
-                    reference,
-                )))),
+                PhysicalFragmentEffectsError::WindowRequest(W::Argument(argument(reference))),
                 PhysicalFragmentEffectsError::AggregateRequest(A::Argument(argument(reference))),
                 PhysicalFragmentEffectsError::TableRequest(T::Argument(argument(reference))),
                 PhysicalFragmentEffectsError::WriterRequest(R::Aggregate(A::Argument(argument(

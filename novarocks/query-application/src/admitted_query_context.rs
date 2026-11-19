@@ -168,7 +168,7 @@ impl StatementAdmissionContext {
     /// topology round.  Semantic session state, deadline, and cancellation
     /// identity remain those admitted for the original statement.
     pub fn for_topology(&self, topology: BackendTopologySnapshot) -> RequestContext {
-        let execution = QueryExecutionContext::new(
+        let mut execution = QueryExecutionContext::new(
             self.role,
             topology,
             self.deadline,
@@ -176,6 +176,7 @@ impl StatementAdmissionContext {
             self.session.optimizer_settings().clone(),
             self.session.sql_semantics().clone(),
         );
+        execution.session_properties = Arc::clone(self.session.property_inputs());
         let execution = match &self.fold_dependency_observer {
             Some(observer) => execution.with_fold_dependency_observer(Arc::clone(observer)),
             None => execution,
@@ -258,9 +259,6 @@ impl StreamedComputationProducer {
     }
 }
 impl StreamedComputationCutHandle {
-    pub(crate) fn is_for_scope(&self, scope: &WorkScope) -> bool {
-        self.scope.id() == scope.id()
-    }
     pub(crate) fn same_source(&self, other: &Self) -> bool {
         std::sync::Weak::ptr_eq(&self.activity, &other.activity)
     }
@@ -709,6 +707,7 @@ impl QueryResultCapacityBinding {
 /// receive it as a parameter. Those consumers leave with CLS-R3 and CLS-R5.
 #[derive(Clone)]
 pub struct QueryExecutionContext {
+    session_properties: Arc<crate::sql::session::registry::SessionPropertyInputs>,
     #[cfg(novarocks_dev_controls)]
     test_statement_nomination:
         Option<Arc<novarocks_failpoint::target_binding::StatementWorkNomination>>,
@@ -764,6 +763,7 @@ impl QueryExecutionContext {
             #[cfg(novarocks_dev_controls)]
             test_statement_nomination: None,
             result_capacity: None,
+            session_properties: Arc::default(),
             role,
             topology,
             deadline,
@@ -866,6 +866,12 @@ impl QueryExecutionContext {
         &self.cancellation
     }
 
+    pub fn session_property_inputs(
+        &self,
+    ) -> &Arc<crate::sql::session::registry::SessionPropertyInputs> {
+        &self.session_properties
+    }
+
     /// Settings frozen with the request so DML and coordinator-adjacent plan
     /// construction never consult process- or thread-local session state.
     pub fn sql_semantics(&self) -> &novarocks_sql::sql_mode::SqlSemanticSettings {
@@ -890,6 +896,15 @@ pub struct RequestContext {
     reason = "Retained for target-specific frontend integration and regression coverage."
 )]
 impl RequestContext {
+    /// Preserve admitted session overrides on the immutable statement context.
+    pub fn with_session_property_inputs(
+        mut self,
+        inputs: Arc<crate::sql::session::registry::SessionPropertyInputs>,
+    ) -> Self {
+        self.execution.session_properties = inputs;
+        self
+    }
+
     #[cfg(novarocks_dev_controls)]
     pub fn with_test_statement_nomination(
         mut self,
@@ -1009,6 +1024,36 @@ mod tests {
             .unwrap();
         control.mark_ready().unwrap();
         (control, capacity)
+    }
+
+    #[test]
+    fn request_admission_shares_validated_overrides_with_execution() {
+        use crate::sql::session::registry::SessionPropertyRegistry;
+
+        let registry = SessionPropertyRegistry::new().unwrap();
+        let mut inputs = SessionPropertyInputs::default();
+        inputs.insert(registry.prepare_system_header("pipeline_dop", "2").unwrap());
+        let context = RequestContext::admit(
+            RequestAdmission::new(
+                None,
+                "db1".to_owned(),
+                ClusterRole::Fe,
+                topology(7, 3),
+                None,
+                QueryCancellationSource::new().view(),
+                SessionOptimizerSettings::default(),
+                novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+                None,
+            )
+            .with_session_property_inputs(inputs),
+        );
+
+        let execution_inputs = context.execution().session_property_inputs();
+        assert!(Arc::ptr_eq(
+            context.session().property_inputs(),
+            execution_inputs
+        ));
+        assert_eq!(execution_inputs.raw_system_value("pipeline_dop"), Some("2"));
     }
 
     #[test]

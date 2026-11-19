@@ -81,6 +81,8 @@ pub mod decimal256_digits;
 pub mod decimal_text;
 mod effect_metadata;
 mod effect_refinement;
+mod scoped_relation_effects;
+pub use scoped_relation_effects::*;
 mod evaluation;
 mod evaluation_failure;
 #[cfg(test)]
@@ -2758,15 +2760,10 @@ pub use native_negate::*;
 
 pub mod binary_text;
 
-#[cfg(test)]
-mod native_negate_original_decimal_carrier_baseline_tests;
-
 pub mod decimal_float_cast;
 pub mod float_decimal128;
 
 pub mod time_text_cast;
-#[cfg(test)]
-mod time_text_cast_tests;
 
 pub mod time_calendar_cast;
 
@@ -2890,3 +2887,6 @@ mod f3_aggregate_independent_tests;
 
 #[cfg(test)]
 mod f3_recipe_independent_tests;
+
+#[cfg(any(test, novarocks_dev_controls))]
+pub mod testkit;

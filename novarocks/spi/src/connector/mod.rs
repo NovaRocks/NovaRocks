@@ -67,9 +67,10 @@ pub use binding::{
     ConnectorControlReadBinding, ConnectorControlRoleBinding, ConnectorControlWriteBinding,
     ConnectorExecutionReadBinding, ConnectorExecutionRoleBinding, ConnectorExecutionWriteBinding,
     ConnectorMaterializationError, ConnectorMaterializationErrorClass,
-    ConnectorMaterializationRetryDisposition, ConnectorReadAttemptAccess,
-    ConnectorReadAttemptCapabilities, ConnectorReadAttemptCapabilitiesFuture,
-    MaterializationContext, NormalizedCatalogProperties,
+    ConnectorMaterializationRetryDisposition, ConnectorPartitionKeyEvaluator,
+    ConnectorReadAttemptAccess, ConnectorReadAttemptCapabilities,
+    ConnectorReadAttemptCapabilitiesFuture, ConnectorWriteLayoutExecution, MaterializationContext,
+    NormalizedCatalogProperties,
 };
 pub use cancellation::{ConnectorStopOwner, ConnectorStopView};
 pub use catalog::{
@@ -342,10 +343,9 @@ pub use staged_create::{
 pub use statistics::{
     AsyncStatisticsCollectionSession, AsyncStatisticsCollectionStart, ConnectorStatistics,
     ConnectorStatisticsResolver, ConnectorStatisticsSession,
-    MAX_CONNECTOR_STATISTICS_ARTIFACT_BODY_BYTES, MAX_CONNECTOR_STATISTICS_ARTIFACTS,
-    MAX_CONNECTOR_STATISTICS_COLUMNS, MAX_CONNECTOR_STATISTICS_METRICS,
-    MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES, MAX_CONNECTOR_STATISTICS_RESULT_BATCH_BYTES,
-    MAX_CONNECTOR_STATISTICS_RESULT_BODY_BYTES, StatisticsArtifactDraft,
+    MAX_CONNECTOR_STATISTICS_ARTIFACT_BODY_BYTES, MAX_CONNECTOR_STATISTICS_COLUMNS,
+    MAX_CONNECTOR_STATISTICS_METRICS, MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES,
+    MAX_CONNECTOR_STATISTICS_RESULT_BATCH_BYTES, StatisticsArtifactDraft,
     StatisticsArtifactIdentity, StatisticsArtifactParts, StatisticsArtifactsCpuSource,
     StatisticsBasisRelation, StatisticsBindingCpuSource, StatisticsCollection,
     StatisticsCollectionSession, StatisticsCollectionStart, StatisticsCollectionStartRequest,
@@ -379,10 +379,9 @@ pub use write::{
     ConnectorWriteFieldRequest, ConnectorWriteFieldToken, ConnectorWriteInputRequest,
     ConnectorWriteInputShape, ConnectorWriteIntent, ConnectorWriteOperationId,
     ConnectorWritePreparation, ConnectorWritePreparationOutcome, ConnectorWritePreparationRequest,
-    ConnectorWriteReceipt, ConnectorWriteTargetRef, DEFAULT_WRITE_COMMIT_EVIDENCE_MAX_BYTES,
-    DEFAULT_WRITE_COMMIT_EVIDENCE_MAX_ENTRIES, MAX_CONNECTOR_MANAGED_PARTITION_FIELD_TEXT_BYTES,
-    MAX_CONNECTOR_MANAGED_PARTITION_SPEC_FIELDS, MAX_CONNECTOR_WRITE_RECEIPT_BYTES,
-    WriteCommitEvidenceLedger, WriteCommitEvidenceLimits, WriteCommitEvidenceUsage,
+    ConnectorWriteReceipt, ConnectorWriteTargetRef,
+    MAX_CONNECTOR_MANAGED_PARTITION_FIELD_TEXT_BYTES, MAX_CONNECTOR_MANAGED_PARTITION_SPEC_FIELDS,
+    MAX_CONNECTOR_WRITE_RECEIPT_BYTES,
 };
 
 pub use process_local::ConnectorProcessLocalPayload;

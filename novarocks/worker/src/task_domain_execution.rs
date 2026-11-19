@@ -40,6 +40,10 @@ pub struct DomainExecutionRejection {
     cause: DomainExecutionCause,
 }
 #[derive(Clone, Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Keep the original host rejection inline so reporting a capacity refusal requires no new allocation"
+)]
 enum DomainExecutionCause {
     Policy(DomainPolicyRejection),
     Host(HostRejection),

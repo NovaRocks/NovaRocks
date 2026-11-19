@@ -18,7 +18,7 @@
 use super::*;
 use crate::query_execution::connector_domain::PlanNodeAssignmentState;
 use crate::query_execution::split_assignment::TaskUpdateTransportErrorKind;
-use crate::task_execution::status_intake::CountingWake;
+use crate::wake::CountingWake;
 use novarocks_spi::connector::ConnectorReadWireEncoder;
 use novarocks_types::{AttemptId, BackendProcessId, QueryId, StageId, TaskId};
 

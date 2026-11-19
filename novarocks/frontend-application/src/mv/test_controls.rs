@@ -21,6 +21,7 @@ use novarocks_failpoint::scope::{ActionClaim, GrantHandle, ProcessBinding};
 use novarocks_failpoint::target_binding::{StatementInputNomination, StatementWorkNomination};
 use novarocks_mv_application::state_family::MV_ACCELERATOR_STATE_FAMILY;
 use novarocks_parser::ast::Query;
+use novarocks_query_application::api::ExecutionFailurePresentation;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -1301,6 +1302,7 @@ pub(crate) mod tests {
         use novarocks_mv_application::scheduler_runtime::{
             MvRefreshFailure, MvRefreshRuntimeDecision,
         };
+        use novarocks_query_application::api::ExecutionFailurePresentation;
         use novarocks_type_contract::CompileControlError;
         use prost::Message;
 

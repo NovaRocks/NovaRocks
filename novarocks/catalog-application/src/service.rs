@@ -424,8 +424,8 @@ impl CatalogApplicationService {
                 // This existing pure observation is outside the projection
                 // lock. A replacement in between cannot lend its new live
                 // binding to the old configuration snapshot.
-                match self.control.observe_current_binding(instance_id) {
-                    Ok(current) if current == binding_key => {
+                match self.control.observe_configuration_binding(instance_id) {
+                    Ok((current, control_runtime_id)) if current == binding_key => {
                         CatalogConfigurationAdmission::Ready(CatalogConfigurationObservation {
                             runtime: CatalogRuntimeObservation {
                                 attachment_id,
@@ -433,6 +433,7 @@ impl CatalogApplicationService {
                                 provider_id,
                                 generation,
                             },
+                            control_runtime_id,
                             configuration,
                             binding_key,
                         })

@@ -22,6 +22,7 @@
 
 use std::{fmt, num::NonZeroU16};
 
+pub mod connector_reason;
 pub mod execution_reason;
 /// LocalCompiler-owned IDs shared only for their existing public consumers.
 /// Their projection and meaning remain defined by the producing compiler.
@@ -153,6 +154,8 @@ pub mod domain {
     pub const VALUE_ARRAYS: NonZeroU16 = NonZeroU16::new(22).unwrap();
     pub const STORAGE_AUTHORITY: NonZeroU16 = NonZeroU16::new(23).unwrap();
     pub const STATE_STORE: NonZeroU16 = NonZeroU16::new(24).unwrap();
+    pub const EXPRESSION_CONTRACT: NonZeroU16 = NonZeroU16::new(25).unwrap();
+    pub const EXPRESSION: NonZeroU16 = NonZeroU16::new(26).unwrap();
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]

@@ -1,0 +1,9 @@
+-- query 6
+-- types	bigint
+snapshots_at_first_commit
+1
+
+-- query 8
+-- types	bigint
+snapshots_at_first_commit
+1

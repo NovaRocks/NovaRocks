@@ -17,9 +17,7 @@
 
 use super::*;
 use crate::physical_properties_v2::PhysicalPropertyProjectionLimits;
-use novarocks_type_contract::{
-    CompilePhase, ExpressionControlFlow, PureCompileControl, SemanticParameters,
-};
+use novarocks_type_contract::{CompilePhase, PureCompileControl, SemanticParameters};
 use std::{alloc::Layout, collections::BTreeMap, sync::Mutex};
 const SOURCE: usize = 1 << 20;
 const CAUSES: [CompileControlError; 3] = [
@@ -91,10 +89,10 @@ fn package(annotations: Vec<p::PlanAnnotation>) -> p::FragmentPackage {
             id: p::FragmentId::new(0),
             root: node,
             values: BTreeMap::new(),
-            expressions: p::ExprArena::default(),
             nodes: BTreeMap::from([(
                 node,
                 p::PhysicalNode {
+                    expressions: None,
                     id: node,
                     inputs: Box::default(),
                     required_inputs: Box::default(),
@@ -126,25 +124,14 @@ fn package(annotations: Vec<p::PlanAnnotation>) -> p::FragmentPackage {
     .unwrap()
     .with_call_requests_observed(vec![], &control)
     .unwrap();
-    let flow = ExpressionControlFlow::try_new(
-        vec![],
-        vec![],
-        fragment.expressions(),
-        CompilePhase::Validate,
-        &control,
-    )
-    .unwrap();
-    let uses = p::PhysicalRootUses::try_new(&fragment, flow, vec![], &control).unwrap();
-    let calls = p::FrozenFragmentCalls::try_new(&fragment, &uses, vec![], &control).unwrap();
     let pruning = p::FrozenFragmentPruning::try_new(fragment.id(), vec![], &control).unwrap();
     p::FragmentPackage::try_new(
         p::FragmentPackageInput {
+            statement_constant_policy: crate::test_constants::policy(),
             constants: p::ConstantPools::empty(),
             version: p::PlanVersionId::try_new([19; 16]).unwrap(),
             required: p::RequiredContracts::default(),
             fragment,
-            expression_uses: uses,
-            calls,
             pruning,
             cuts: p::FragmentCuts::default(),
             result: None,
@@ -152,6 +139,7 @@ fn package(annotations: Vec<p::PlanAnnotation>) -> p::FragmentPackage {
             scans: BTreeMap::new(),
             writes: BTreeMap::new(),
             annotations: annotations.into_boxed_slice(),
+            layouts: Default::default(),
         },
         admission(),
         &control,

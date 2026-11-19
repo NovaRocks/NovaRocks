@@ -37,15 +37,9 @@ use arrow::array::{Array, ArrayRef, BooleanArray};
 use arrow::compute::filter_record_batch;
 use arrow::record_batch::RecordBatch;
 use novarocks_functions::{KernelDiagnostic, KernelEvaluationControl, KernelFailure, Selection};
-use novarocks_local_program::{
-    LocalProgram, ProgramChannelLayoutRole, ProgramExpressionRootSite, ProgramNodeExpressionRole,
-    ProgramNodeId, ProgramNodeKind, ProgramRootInput, root_input_layout,
-};
+use novarocks_local_program::{LocalProgram, ProgramNodeId, ProgramNodeKind, ProgramRootRef};
 
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
-use crate::exec::expr::compiled_program::{
-    CompiledExpressionInstance, input_source::CompiledInputLoan,
-};
 use crate::exec::pipeline::operator::{InputEncodingPolicy, Operator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::{
@@ -53,7 +47,10 @@ use crate::exec::pipeline::{
     step::{NextStep, StepResult},
 };
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
-use crate::runtime::task::{ExecutionFailure, ExecutionResult, RequiredExpressionRowError};
+use crate::runtime::task::{ExecutionFailure, ExecutionResult};
+use novarocks_expression::CompiledExpressionInstance;
+use novarocks_expression::{EvaluationInput, InputColumnProjection, RequiredExpressionRowError};
+use novarocks_functions::ScalarInvocationScope;
 
 #[cfg(test)]
 pub(super) use crate::runtime::kernel_memory as runtime_kernel_memory;
@@ -71,19 +68,31 @@ pub(crate) mod runtime_scalar_memory_test_support;
 pub(crate) struct RuntimeKernelControl {
     error: Arc<RuntimeErrorState>,
     observed_stop: std::sync::OnceLock<ExecutionFailure>,
+    expression_node: Option<ProgramNodeId>,
     query_memory: Option<crate::runtime::query_memory::QueryMemoryBinding>,
     allocator: Option<Arc<crate::runtime::tracked_state_allocator::TrackedStateAllocator>>,
     construction: Option<Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>>,
+    #[cfg(test)]
+    input_adapter_observer: Option<Arc<InputAdapterObserver>>,
 }
 impl RuntimeKernelControl {
     pub(crate) fn new(error: Arc<RuntimeErrorState>) -> Self {
         Self {
             error,
             observed_stop: std::sync::OnceLock::new(),
+            expression_node: None,
             query_memory: None,
             allocator: None,
             construction: None,
+            #[cfg(test)]
+            input_adapter_observer: None,
         }
+    }
+    /// The actual operator supplies diagnostic context outside the evaluator.
+    /// This preserves the original failure occurrence and grants no resource.
+    pub(crate) fn at_expression_node(mut self, node: ProgramNodeId) -> Self {
+        self.expression_node = Some(node);
+        self
     }
     /// Bind a nested receiver to the same fragment services. Its allocator is
     /// installed separately on that receiver; this creates no memory authority.
@@ -91,9 +100,12 @@ impl RuntimeKernelControl {
         Self {
             error: Arc::clone(&self.error),
             observed_stop: std::sync::OnceLock::new(),
+            expression_node: self.expression_node,
             query_memory: self.query_memory.clone(),
             allocator: None,
             construction: self.construction.clone(),
+            #[cfg(test)]
+            input_adapter_observer: self.input_adapter_observer.clone(),
         }
     }
     /// Borrow the already-validated task capability at original operator binding.
@@ -186,7 +198,10 @@ impl RuntimeKernelControl {
         {
             return original.clone();
         }
-        failure
+        match self.expression_node {
+            Some(node) => failure.at_expression_node(node),
+            None => failure,
+        }
     }
     pub(crate) fn checkpoint_execution(&self) -> ExecutionResult<()> {
         match self.error.error() {
@@ -214,22 +229,105 @@ impl KernelEvaluationControl for RuntimeKernelControl {
     }
 }
 
-fn root(node: ProgramNodeId, role: ProgramNodeExpressionRole) -> ProgramExpressionRootSite {
-    ProgramExpressionRootSite::Node { node, role }
+#[cfg(test)]
+pub(crate) type InputAdapterObserver = dyn for<'a> Fn(&'a Chunk, EvaluationInput<'a>) + Send + Sync;
+
+#[cfg(test)]
+pub(crate) fn assert_original_chunk_input(chunk: &Chunk, input: EvaluationInput<'_>) {
+    assert!(std::ptr::eq(input.batch(), chunk.record_batch()));
+    let storage = input
+        .source_storage()
+        .expect("the adapter keeps the original Chunk source");
+    assert!(std::ptr::addr_eq(storage, chunk));
+}
+
+#[cfg(test)]
+impl RuntimeKernelControl {
+    pub(crate) fn observe_input_adapter(&mut self, observer: Arc<InputAdapterObserver>) {
+        self.input_adapter_observer = Some(observer);
+    }
+}
+
+pub(crate) fn chunk_evaluation_input<'a>(
+    chunk: &'a Chunk,
+    _control: &RuntimeKernelControl,
+) -> EvaluationInput<'a> {
+    let input = EvaluationInput::Batch {
+        batch: chunk.record_batch(),
+        source: Some(chunk),
+    };
+    #[cfg(test)]
+    if let Some(observer) = &_control.input_adapter_observer {
+        observer(chunk, input);
+    }
+    input
+}
+
+pub(crate) fn projected_chunk_evaluation_input<'a>(
+    chunk: &'a Chunk,
+    declared: &'a ChunkSchema,
+    projection: &'a Arc<InputColumnProjection>,
+    control: &dyn KernelEvaluationControl,
+) -> Result<EvaluationInput<'a>, KernelFailure> {
+    let compact = chunk.chunk_schema();
+    if !compact.is_typed() || !declared.is_typed() {
+        return Err(KernelFailure::InvalidProgram(KernelDiagnostic::new(
+            "projected input lacks its exact typed column map",
+        )));
+    }
+    EvaluationInput::try_projected_observed(
+        chunk.record_batch(),
+        declared.borrowed_arrow_schema_ref(),
+        projection,
+        Some(chunk),
+        control,
+        |physical, original| {
+            let actual_slot = &compact.slots()[physical];
+            let original_slot = &declared.slots()[original];
+            if actual_slot.slot_id() != original_slot.slot_id() {
+                return Ok(false);
+            }
+            actual_slot
+                .typed_binding()
+                .borrowed()
+                .same_physical_binding_ignoring_root_nullability_observed(
+                    original_slot.typed_binding().borrowed(),
+                    || control.checkpoint(1),
+                )
+        },
+    )
+}
+
+/// A compact Chunk retains the exact binding checked above.
+fn adapt_projected_chunk<'a>(
+    chunk: &'a Chunk,
+    declared: &'a ChunkSchema,
+    projection: &'a Arc<InputColumnProjection>,
+    control: &RuntimeKernelControl,
+) -> Result<EvaluationInput<'a>, KernelFailure> {
+    let input = projected_chunk_evaluation_input(chunk, declared, projection, control)?;
+    #[cfg(test)]
+    if let Some(observer) = &control.input_adapter_observer {
+        observer(chunk, input);
+    }
+    Ok(input)
 }
 
 /// Evaluate one root over every row of `input` and return the full column.
 /// A row data error of the root is a required error and is returned typed.
 pub(crate) fn evaluate_all(
     instance: &mut CompiledExpressionInstance,
-    site: ProgramExpressionRootSite,
+    site: ProgramRootRef,
     input: &RecordBatch,
     control: &RuntimeKernelControl,
 ) -> ExecutionResult<ArrayRef> {
     evaluate_selection(
         instance,
         site,
-        CompiledInputLoan::RecordBatch(input),
+        EvaluationInput::Batch {
+            batch: input,
+            source: None,
+        },
         Selection::all(input.num_rows()),
         if input.num_rows() == 0 {
             novarocks_functions::ScalarInvocationActivation::ValidateOnly
@@ -244,14 +342,14 @@ pub(crate) fn evaluate_all(
 /// authority is retained after this synchronous evaluation returns.
 pub(crate) fn evaluate_chunk_all(
     instance: &mut CompiledExpressionInstance,
-    site: ProgramExpressionRootSite,
+    site: ProgramRootRef,
     input: &Chunk,
     control: &RuntimeKernelControl,
 ) -> ExecutionResult<ArrayRef> {
     evaluate_selection(
         instance,
         site,
-        CompiledInputLoan::from_chunk(input),
+        chunk_evaluation_input(input, control),
         Selection::all(input.record_batch().num_rows()),
         if input.record_batch().num_rows() == 0 {
             novarocks_functions::ScalarInvocationActivation::ValidateOnly
@@ -267,13 +365,13 @@ pub(crate) fn evaluate_chunk_all(
 /// columns. No placeholder Array is constructed for an unreferenced channel.
 pub(crate) fn evaluate_projected_chunk_all(
     instance: &mut CompiledExpressionInstance,
-    site: ProgramExpressionRootSite,
+    site: ProgramRootRef,
     input: &Chunk,
     declared: &ChunkSchema,
-    projection: &Arc<crate::exec::expr::compiled_program::input_source::InputColumnProjection>,
+    projection: &Arc<InputColumnProjection>,
     control: &RuntimeKernelControl,
 ) -> ExecutionResult<ArrayRef> {
-    let loan = CompiledInputLoan::from_projected_chunk(input, declared, projection, control)?;
+    let loan = adapt_projected_chunk(input, declared, projection, control)?;
     evaluate_selection(
         instance,
         site,
@@ -294,10 +392,10 @@ pub(crate) fn evaluate_projected_chunk_all(
 /// a required error reported at its batch row.
 pub(crate) fn evaluate_projected_chunk_rows(
     instance: &mut CompiledExpressionInstance,
-    site: ProgramExpressionRootSite,
+    site: ProgramRootRef,
     input: &Chunk,
     declared: &ChunkSchema,
-    projection: &Arc<crate::exec::expr::compiled_program::input_source::InputColumnProjection>,
+    projection: &Arc<InputColumnProjection>,
     rows: &[usize],
     control: &RuntimeKernelControl,
 ) -> ExecutionResult<ArrayRef> {
@@ -306,7 +404,7 @@ pub(crate) fn evaluate_projected_chunk_rows(
             "compiled root selection is not ordered within its batch",
         )))
     })?;
-    let loan = CompiledInputLoan::from_projected_chunk(input, declared, projection, control)?;
+    let loan = adapt_projected_chunk(input, declared, projection, control)?;
     evaluate_selection(
         instance,
         site,
@@ -324,7 +422,7 @@ pub(crate) fn evaluate_projected_chunk_rows(
 /// The same original sparse selection author for a complete RecordBatch port.
 pub(crate) fn evaluate_selected(
     instance: &mut CompiledExpressionInstance,
-    site: ProgramExpressionRootSite,
+    site: ProgramRootRef,
     input: &RecordBatch,
     rows: &[usize],
     control: &RuntimeKernelControl,
@@ -342,7 +440,10 @@ pub(crate) fn evaluate_selected(
     evaluate_selection(
         instance,
         site,
-        CompiledInputLoan::RecordBatch(input),
+        EvaluationInput::Batch {
+            batch: input,
+            source: None,
+        },
         selection,
         activation,
         control,
@@ -351,8 +452,8 @@ pub(crate) fn evaluate_selected(
 
 fn evaluate_selection(
     instance: &mut CompiledExpressionInstance,
-    site: ProgramExpressionRootSite,
-    input: CompiledInputLoan<'_>,
+    site: ProgramRootRef,
+    input: EvaluationInput<'_>,
     selection: Selection<'_>,
     activation: novarocks_functions::ScalarInvocationActivation,
     control: &RuntimeKernelControl,
@@ -363,11 +464,20 @@ fn evaluate_selection(
     let mut scope =
         crate::runtime::scalar_memory::RuntimeScalarMemoryScope::new(control, &mut journal);
     let result = instance
-        .evaluate_input_runtime(input, selection, activation, control, &mut scope)
+        .evaluate(
+            input,
+            ScalarInvocationScope::new(selection, selection),
+            activation,
+            control,
+            &mut scope,
+        )
+        .map_err(ExecutionFailure::from)
         .map_err(|cause| control.project_required_failure(cause))?;
     let (selection, values, errors) = result.into_parts();
     if let Some(error) = errors.into_vec().into_iter().next() {
-        return Err(RequiredExpressionRowError::try_new(site, selection, error)?.into());
+        return Err(control.project_required_failure(
+            RequiredExpressionRowError::try_new(site.root, selection, error)?.into(),
+        ));
     }
     Ok(values)
 }
@@ -377,7 +487,7 @@ fn evaluate_selection(
 pub(crate) fn instances(
     slot: &mut Option<Vec<CompiledExpressionInstance>>,
     program: &Arc<LocalProgram>,
-    sites: &[ProgramExpressionRootSite],
+    sites: &[ProgramRootRef],
     control: &RuntimeKernelControl,
 ) -> ExecutionResult<()> {
     if slot.is_some() {
@@ -387,8 +497,12 @@ pub(crate) fn instances(
     for site in sites {
         created.push(
             CompiledExpressionInstance::try_new_with_allocator(
-                Arc::clone(program),
-                *site,
+                Arc::clone(program.unit(site.unit).ok_or_else(|| {
+                    KernelFailure::InvalidProgram(KernelDiagnostic::new(
+                        "compiled expression unit is absent",
+                    ))
+                })?),
+                site.root,
                 control,
                 control.allocator(),
             )
@@ -401,9 +515,21 @@ pub(crate) fn instances(
 
 /// The static value type the program's checked expressions give one root:
 /// the exact type of every array an instance of that root returns.
+pub(crate) fn root_value_type_ref(
+    program: &LocalProgram,
+    site: ProgramRootRef,
+) -> Option<&novarocks_type_contract::FunctionValueType> {
+    let unit = program.unit(site.unit)?;
+    let root = unit.root(site.root)?;
+    match unit.types().get(root.definition.index())? {
+        novarocks_type_contract::FunctionArgumentType::Value(value) => Some(value),
+        _ => None,
+    }
+}
+
 pub(crate) fn root_value_type(
     program: &LocalProgram,
-    site: ProgramExpressionRootSite,
+    site: ProgramRootRef,
 ) -> Result<
     novarocks_type_contract::FunctionValueType,
     crate::exec::fragment::error::FragmentBindingError,
@@ -411,21 +537,21 @@ pub(crate) fn root_value_type(
     use crate::exec::fragment::error::{
         FragmentBindingError, FragmentBindingErrorKind, FragmentBindingTarget,
     };
-    let expressions = program.checked().channels().expressions();
-    let root = expressions
-        .resolved_calls()
-        .snapshot()
-        .roots()
-        .sites()
-        .get(&site)
-        .ok_or_else(|| {
-            FragmentBindingError::new(
-                FragmentBindingTarget::Program,
-                FragmentBindingErrorKind::MissingAssignment,
-                format!("compiled program has no expression root {site:?}"),
-            )
-        })?;
-    match expressions.definition_type(site.arena(), root.definition) {
+    let unit = program.unit(site.unit).ok_or_else(|| {
+        FragmentBindingError::new(
+            FragmentBindingTarget::Program,
+            FragmentBindingErrorKind::MissingAssignment,
+            format!("compiled program has no expression unit {:?}", site.unit),
+        )
+    })?;
+    let root = unit.root(site.root).ok_or_else(|| {
+        FragmentBindingError::new(
+            FragmentBindingTarget::Program,
+            FragmentBindingErrorKind::MissingAssignment,
+            format!("compiled program has no expression root {site:?}"),
+        )
+    })?;
+    match unit.types().get(root.definition.index()) {
         Some(novarocks_type_contract::FunctionArgumentType::Value(value)) => Ok(value.clone()),
         Some(_) => Err(FragmentBindingError::new(
             FragmentBindingTarget::Program,
@@ -442,23 +568,19 @@ pub(crate) fn root_value_type(
 
 fn borrowed_project_root_value_type(
     program: &LocalProgram,
-    site: ProgramExpressionRootSite,
+    site: ProgramRootRef,
 ) -> Result<
     &novarocks_type_contract::FunctionValueType,
     crate::exec::pipeline::operator::ConstructionFailure,
 > {
     use crate::exec::pipeline::operator::ConstructionFailure;
-    let expressions = program.checked().channels().expressions();
-    let root = expressions
-        .resolved_calls()
-        .snapshot()
-        .roots()
-        .sites()
-        .get(&site)
-        .ok_or_else(|| {
-            ConstructionFailure::InvalidSource("compiled project root is absent".into())
-        })?;
-    match expressions.definition_type(site.arena(), root.definition) {
+    let unit = program.unit(site.unit).ok_or_else(|| {
+        ConstructionFailure::InvalidSource("compiled project unit is absent".into())
+    })?;
+    let root = unit.root(site.root).ok_or_else(|| {
+        ConstructionFailure::InvalidSource("compiled project root is absent".into())
+    })?;
+    match unit.types().get(root.definition.index()) {
         Some(novarocks_type_contract::FunctionArgumentType::Value(value)) => Ok(value),
         _ => Err(ConstructionFailure::InvalidSource(
             "compiled project root lacks a complete value declaration".into(),
@@ -470,7 +592,7 @@ fn borrowed_project_root_value_type(
 pub struct CompiledProjectProcessorFactory {
     name: String,
     program: Arc<LocalProgram>,
-    sites: Vec<ProgramExpressionRootSite>,
+    sites: Vec<ProgramRootRef>,
     final_identity_slots: Option<Vec<(novarocks_types::SlotId, novarocks_types::SlotId)>>,
     layout_node: ProgramNodeId,
     preparation_site: crate::runtime::preparation_metadata::CompiledSchemaSite,
@@ -535,6 +657,7 @@ impl CompiledProjectProcessorFactory {
             )
         })?;
         let ProgramNodeKind::Project {
+            input,
             exprs,
             expr_slot_ids,
             validate_final_result_input,
@@ -547,15 +670,7 @@ impl CompiledProjectProcessorFactory {
                 "compiled node is not a Project",
             ));
         };
-        let mut sites = Vec::with_capacity(exprs.len());
-        for ordinal in 0..exprs.len() {
-            let expression = novarocks_local_program::checked_program_ordinal(ordinal)
-                .map_err(crate::runtime::task::ExecutionFailure::from_domain)?;
-            sites.push(root(
-                node,
-                ProgramNodeExpressionRole::ProjectOutput { expression },
-            ));
-        }
+        let sites = exprs.to_vec();
         let final_identity_slots = if *validate_final_result_input {
             if output_indices.is_some() || exprs.len() != expr_slot_ids.len() {
                 return Err(program_binding_failure(
@@ -568,20 +683,33 @@ impl CompiledProjectProcessorFactory {
                     .iter()
                     .zip(expr_slot_ids)
                     .map(|(expr, output)| {
-                        match program
-                            .graph()
-                            .expressions()
-                            .node(*expr)
-                            .map(|node| node.kind())
-                        {
-                            Some(novarocks_local_program::StaticExprKind::SlotId(source)) => {
-                                Ok((*source, *output))
+                        let source = program.unit(expr.unit).and_then(|unit| {
+                            let root = unit.root(expr.root)?;
+                            if !matches!(
+                                unit.definitions().node(root.definition)?.kind(),
+                                novarocks_expression::StaticExprKind::Input
+                            ) {
+                                return None;
                             }
-                            _ => Err(program_binding_failure(
+                            let binding = unit.input(root.use_id)?;
+                            if binding.scope != root.scope {
+                                return None;
+                            }
+                            program
+                                .graph()
+                                .nodes()
+                                .get(input.index())?
+                                .output_layout()
+                                .slots()
+                                .get(binding.ordinal as usize)
+                                .copied()
+                        });
+                        source.map(|source| (source, *output)).ok_or_else(|| {
+                            program_binding_failure(
                                 PlanBindingKind::InvalidAssignment,
                                 "final result input validation requires identity expressions",
-                            )),
-                        }
+                            )
+                        })
                     })
                     .collect::<ExecutionResult<Vec<_>>>()?,
             )
@@ -621,7 +749,8 @@ impl OperatorFactory for CompiledProjectProcessorFactory {
             preparation_site: self.preparation_site,
             output: None,
             construction: None,
-            control: RuntimeKernelControl::new(Arc::clone(&self.error)),
+            control: RuntimeKernelControl::new(Arc::clone(&self.error))
+                .at_expression_node(self.layout_node),
             instances: None,
         }))
     }
@@ -629,7 +758,7 @@ impl OperatorFactory for CompiledProjectProcessorFactory {
 struct CompiledProjectProcessor {
     name: String,
     program: Arc<LocalProgram>,
-    sites: Vec<ProgramExpressionRootSite>,
+    sites: Vec<ProgramRootRef>,
     final_identity_slots: Option<Vec<(novarocks_types::SlotId, novarocks_types::SlotId)>>,
     layout_node: ProgramNodeId,
     preparation_site: crate::runtime::preparation_metadata::CompiledSchemaSite,
@@ -642,7 +771,7 @@ struct CompiledProjectProcessor {
 pub(crate) fn project_chunk_with_source_observer(
     program: Arc<LocalProgram>,
     chunk: Chunk,
-    observer: Arc<crate::exec::expr::compiled_program::input_source::SlotSourceObserver>,
+    observer: Arc<InputAdapterObserver>,
 ) -> ExecutionResult<Chunk> {
     let factory = CompiledProjectProcessorFactory::try_new(
         program,
@@ -677,9 +806,7 @@ pub(crate) fn project_chunk_with_source_observer(
         &processor.sites,
         &processor.control,
     )?;
-    for instance in processor.instances.as_mut().unwrap() {
-        instance.observe_slot_source(Arc::clone(&observer));
-    }
+    processor.control.observe_input_adapter(observer);
     let control = RuntimeErrorState::default();
     let mut turn = crate::exec::pipeline::driver_step::TurnWork::new(std::num::NonZeroU64::MIN, 64);
     let mut value_conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
@@ -877,69 +1004,55 @@ impl TransformKernel for CompiledProjectProcessor {
 #[derive(Clone)]
 pub struct CompiledFilterProcessorFactory {
     name: String,
-    program: Arc<LocalProgram>,
-    site: ProgramExpressionRootSite,
+    roots: Vec<(
+        Arc<novarocks_expression::CompiledExprSet>,
+        novarocks_expression_contract::RootOrdinal,
+    )>,
+    node: ProgramNodeId,
     error: Arc<RuntimeErrorState>,
 }
 impl CompiledFilterProcessorFactory {
-    /// `site` identifies the Filter owner through original predicate zero,
-    /// or original ScanResidual zero. All roots share the same
-    /// checked NodeOutput input port, which is also the filtered output.
     pub(crate) fn try_new(
         program: Arc<LocalProgram>,
-        site: ProgramExpressionRootSite,
+        node: ProgramNodeId,
         error: Arc<RuntimeErrorState>,
     ) -> ExecutionResult<Self> {
-        let ProgramExpressionRootSite::Node { node, role } = site else {
-            return Err(program_binding_failure(
-                PlanBindingKind::InvalidAssignment,
-                format!("compiled filter root {site:?} is not a node predicate"),
-            ));
-        };
         let graph_node = program.graph().nodes().get(node.index()).ok_or_else(|| {
             program_binding_failure(
                 PlanBindingKind::MissingAssignment,
-                format!("compiled filter node {} is absent", node.index()),
+                "compiled filter node is absent",
             )
         })?;
-        let label = match (graph_node.kind(), role) {
-            (
-                ProgramNodeKind::Filter { .. },
-                ProgramNodeExpressionRole::FilterPredicate { predicate: 0 },
-            ) => "COMPILED_FILTER",
-            (
-                ProgramNodeKind::Scan { .. },
-                ProgramNodeExpressionRole::ScanResidual { predicate: 0 },
-            ) => "COMPILED_SCAN_RESIDUAL",
+        let (predicates, label): (&[ProgramRootRef], _) = match graph_node.kind() {
+            ProgramNodeKind::Filter { predicates, .. } => (predicates, "COMPILED_FILTER"),
+            ProgramNodeKind::Scan { residuals, .. } => (residuals, "COMPILED_SCAN_RESIDUAL"),
             _ => {
                 return Err(program_binding_failure(
                     PlanBindingKind::InvalidAssignment,
-                    format!(
-                        "compiled filter root {role:?} at local node {} is neither a Filter predicate nor a Scan residual",
-                        node.index()
-                    ),
+                    "compiled filter requires its actual Filter or Scan node",
                 ));
             }
         };
-        match root_input_layout(program.graph(), site) {
-            Ok(ProgramRootInput::Layout {
-                role: ProgramChannelLayoutRole::NodeOutput,
-                ..
-            }) => {}
-            _ => {
-                return Err(program_binding_failure(
-                    PlanBindingKind::InvalidAssignment,
-                    format!(
-                        "compiled filter root {role:?} at local node {} has no single node-output input port",
-                        node.index()
-                    ),
-                ));
-            }
+        if predicates.is_empty() {
+            return Err(program_binding_failure(
+                PlanBindingKind::MissingAssignment,
+                "compiled filter has no actual predicate",
+            ));
+        }
+        let mut roots = Vec::with_capacity(predicates.len());
+        for predicate in predicates {
+            let unit = program.unit(predicate.unit).ok_or_else(|| {
+                program_binding_failure(
+                    PlanBindingKind::MissingAssignment,
+                    "compiled filter unit is absent",
+                )
+            })?;
+            roots.push((Arc::clone(unit), predicate.root));
         }
         Ok(Self {
             name: format!("{label} (node={})", node.index()),
-            program,
-            site,
+            roots,
+            node,
             error,
         })
     }
@@ -947,26 +1060,28 @@ impl CompiledFilterProcessorFactory {
 /// One synchronous predicate body. Pipeline buffering and source polling
 /// stay in their respective shells; both consume the same conjunction state.
 pub(crate) struct CompiledFilterBody {
-    program: Arc<LocalProgram>,
-    site: ProgramExpressionRootSite,
-    instance: Option<crate::exec::expr::compiled_program::CompiledFilterConjunctionInstance>,
+    roots: Vec<(
+        Arc<novarocks_expression::CompiledExprSet>,
+        novarocks_expression_contract::RootOrdinal,
+    )>,
+    node: ProgramNodeId,
+    instance: Option<novarocks_expression::CompiledFilterConjunctionInstance>,
 }
 impl CompiledFilterBody {
     pub(crate) fn evaluate(
         &mut self,
-        input: CompiledInputLoan<'_>,
+        input: EvaluationInput<'_>,
         control: &RuntimeKernelControl,
     ) -> ExecutionResult<BooleanArray> {
         if self.instance.is_none() {
-            let ProgramExpressionRootSite::Node { node, .. } = self.site else {
-                return Err(KernelFailure::InvalidProgram(KernelDiagnostic::new(
-                    "compiled Filter root is not a node",
-                ))
-                .into());
-            };
-            self.instance = Some(crate::exec::expr::compiled_program::CompiledFilterConjunctionInstance::try_new_with_allocator(
-                Arc::clone(&self.program), node, control, control.allocator(),
-            ).map_err(|cause| control.project_required_failure(cause.into()))?);
+            self.instance = Some(
+                novarocks_expression::CompiledFilterConjunctionInstance::try_new_with_allocator(
+                    &self.roots,
+                    control,
+                    control.allocator(),
+                )
+                .map_err(|cause| control.project_required_failure(cause.into()))?,
+            );
         }
         let mut journal = crate::runtime::scalar_memory::RuntimeScalarMemoryJournal::default();
         let mut scope =
@@ -975,13 +1090,16 @@ impl CompiledFilterBody {
             .instance
             .as_mut()
             .expect("instance was created")
-            .evaluate_required_input_runtime(
+            .evaluate(
                 input,
                 Selection::all(input.batch().num_rows()),
                 control,
                 &mut scope,
             )
-            .map_err(|cause| control.project_required_failure(cause))?;
+            .map_err(ExecutionFailure::from)
+            .map_err(|cause| {
+                control.project_required_failure(cause.at_expression_node(self.node))
+            })?;
         let truth = truth
             .as_any()
             .downcast_ref::<BooleanArray>()
@@ -996,8 +1114,8 @@ impl CompiledFilterBody {
 impl CompiledFilterProcessorFactory {
     pub(crate) fn create_body(&self) -> CompiledFilterBody {
         CompiledFilterBody {
-            program: Arc::clone(&self.program),
-            site: self.site,
+            roots: self.roots.clone(),
+            node: self.node,
             instance: None,
         }
     }
@@ -1010,7 +1128,8 @@ impl OperatorFactory for CompiledFilterProcessorFactory {
         Box::new(Transform::hydrating(CompiledFilterProcessor {
             name: self.name.clone(),
             body: self.create_body(),
-            control: RuntimeKernelControl::new(Arc::clone(&self.error)),
+            control: RuntimeKernelControl::new(Arc::clone(&self.error))
+                .at_expression_node(self.node),
         }))
     }
 }
@@ -1075,7 +1194,7 @@ impl crate::exec::pipeline::shape::TransformKernel for CompiledFilterProcessor {
         let rows = u64::try_from(chunk.len()).expect("supported row count fits u64");
         let truth = self
             .body
-            .evaluate(CompiledInputLoan::from_chunk(&chunk), &self.control)?;
+            .evaluate(chunk_evaluation_input(&chunk, &self.control), &self.control)?;
         let mask = crate::exec::chunk::normalize_filter_mask_observed(&truth, || Ok(()))?;
         let batch = filter_record_batch(chunk.record_batch(), &mask)
             .map_err(|error| ExecutionFailure::from_domain(CompiledFilterArrowFailure(error)))?;
@@ -1179,3 +1298,6 @@ mod runtime_stop_source_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

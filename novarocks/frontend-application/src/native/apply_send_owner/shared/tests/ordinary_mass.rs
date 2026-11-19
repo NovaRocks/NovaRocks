@@ -458,9 +458,10 @@ async fn native_apply_results_and_both_original_joins_retire_while_ordinary_stay
                 inbox.source(),
                 roles.scope.clone(),
                 admission,
-                [None, None, None, None, None, None],
+                std::array::from_fn(|_| None),
                 None,
                 transport::AttemptSendSource {
+                    closed: crate::task_execution::host::port::abort::ClosedParticipations::new(),
                     requests: transport::FrozenSendRequests::default(),
                     contexts: Arc::new(BTreeMap::from([(backend, context)])),
                     report_author,
@@ -478,7 +479,6 @@ async fn native_apply_results_and_both_original_joins_retire_while_ordinary_stay
                     transport::AttemptFailureBinding {
                         supervisor,
                         port: Box::new(NoFailure),
-                        abort_drain: None,
                     },
                 ),
                 Box::new(ScopeOwner {
@@ -499,7 +499,8 @@ async fn native_apply_results_and_both_original_joins_retire_while_ordinary_stay
             startup: None,
             capacity: None,
             membership: None,
-            owner_controls: None,
+
+            local_exit: None,
             ordered_observations: None,
         })
         .unwrap_or_else(|_| panic!("the original Native Host registration"));
@@ -747,9 +748,6 @@ async fn native_apply_results_and_both_original_joins_retire_while_ordinary_stay
     assert!(runtime.is_empty() && roles.ledger.is_empty());
     let deadline = Instant::now() + wait;
     data.drain_original_apply_until(deadline).await.unwrap();
-    data.drain_original_subscriptions_until(deadline)
-        .await
-        .unwrap();
     data.drain_native_outgoing_until(deadline).await.unwrap();
     assert!(peer.settle().await);
     assert!(wc.finish());

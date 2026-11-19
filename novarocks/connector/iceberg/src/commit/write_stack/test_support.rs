@@ -40,7 +40,9 @@ use crate::delete_file::IcebergFileFormat;
 use crate::write_descriptor::IcebergPartitionDescriptor;
 
 use novarocks_spi::connector::write_stack::{
-    ConnectorWriteProductionProof, ConnectorWriterPhysicalContext, WriteTargetOrdinal,
+    ConnectorCommitFragment, ConnectorWriteCommitSession, ConnectorWriteControl,
+    ConnectorWriteProductionProof, ConnectorWriteQueryIdentity, ConnectorWriterPhysicalContext,
+    WriteTargetOrdinal,
 };
 use std::sync::Arc;
 
@@ -62,6 +64,90 @@ pub(crate) fn received_write_proof(
         }
     }
     Arc::new(ExactWriter { target, physical })
+}
+
+pub(crate) fn write_query_identity() -> ConnectorWriteQueryIdentity {
+    ConnectorWriteQueryIdentity::try_new(*uuid::Uuid::now_v7().as_bytes(), 1, [2; 16]).unwrap()
+}
+
+// Exercise the actual wire decoder before any fixture enters compact receiving.
+pub(crate) fn paid_fragments(
+    adapter: &super::runtime::IcebergWriteAdapter,
+    fragments: Vec<ConnectorCommitFragment>,
+) -> (
+    Vec<ConnectorCommitFragment>,
+    novarocks_spi::connector::ConnectorPayloadRetentionGuard,
+) {
+    let (paid, author, _) = paid_fragments_counted(adapter, fragments);
+    (paid, author)
+}
+
+pub(crate) fn paid_fragments_counted(
+    adapter: &super::runtime::IcebergWriteAdapter,
+    fragments: Vec<ConnectorCommitFragment>,
+) -> (
+    Vec<ConnectorCommitFragment>,
+    novarocks_spi::connector::ConnectorPayloadRetentionGuard,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
+    use novarocks_spi::connector::{
+        ConnectorPayloadByteBudget, ConnectorPayloadRetentionGuard,
+        ConnectorWriteFragmentWireDecoder, ConnectorWriteFragmentWireEncoder,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct FixtureByteAuthor(Arc<AtomicUsize>);
+    struct FixtureByteReceipt(Arc<AtomicUsize>, usize);
+    impl Drop for FixtureByteReceipt {
+        fn drop(&mut self) {
+            self.0.fetch_sub(self.1, Ordering::SeqCst);
+        }
+    }
+    impl ConnectorPayloadByteBudget for FixtureByteAuthor {
+        fn reserve_bytes(
+            &self,
+            bytes: usize,
+        ) -> Result<ConnectorPayloadRetentionGuard, ConnectorError> {
+            self.0.fetch_add(bytes, Ordering::SeqCst);
+            Ok(ConnectorPayloadRetentionGuard::new(FixtureByteReceipt(
+                Arc::clone(&self.0),
+                bytes,
+            )))
+        }
+    }
+    let live = Arc::new(AtomicUsize::new(0));
+    let author = ConnectorPayloadRetentionGuard::from_byte_budget(Arc::new(FixtureByteAuthor(
+        Arc::clone(&live),
+    )));
+    let encoder = super::codec::IcebergWriteFragmentEncoder::new(adapter.clone());
+    let decoder = super::codec::IcebergWriteFragmentDecoder::new(adapter.clone());
+    let paid = fragments
+        .into_iter()
+        .map(|fragment| {
+            let encoded = encoder.encode_commit_fragment_payload(&fragment).unwrap();
+            decoder
+                .decode_commit_fragment_payload(&encoded, &author)
+                .unwrap()
+        })
+        .collect();
+    (paid, author, live)
+}
+
+pub(crate) fn receive_write_query(
+    control: &dyn ConnectorWriteControl,
+    commit: &ConnectorWriteCommitSession,
+    targets: &[WriteTargetOrdinal],
+    fragments: Vec<(WriteTargetOrdinal, ConnectorCommitFragment)>,
+) -> Result<(), ConnectorError> {
+    let query = write_query_identity();
+    control.begin_write_query(commit, &query, targets, None)?;
+    control.arrive_write_fragments(
+        commit,
+        &query,
+        fragments,
+        &novarocks_spi::connector::ConnectorPayloadRetentionGuard::new(()),
+    )?;
+    control.confirm_write_received(commit, &query)
 }
 
 pub(crate) fn writer_resources() -> ConnectorExecutionResources {
@@ -374,9 +460,25 @@ pub(crate) fn merge_on_read_input_shape() -> ConnectorWriteInputShape {
 /// perturbs only the input shape or the merge targets and asserts that the
 /// branch structure is what changes.
 pub(crate) fn session_material(input: ConnectorWriteInputShape) -> IcebergSessionMaterial {
+    use novarocks_connector_contract::ConnectorWriteBinding;
+    use novarocks_spi::connector::{
+        CatalogHandle, CatalogVersion, ConnectorInstanceDescriptor, ConnectorInstanceId,
+        ConnectorProviderId,
+    };
     let data = data_branch_plan();
+    let instance_id = ConnectorInstanceId::parse("unit").unwrap();
+    let write_binding = ConnectorWriteBinding::new(
+        ConnectorInstanceDescriptor {
+            provider_id: ConnectorProviderId::parse(crate::PROVIDER_ID).unwrap(),
+            instance_id: instance_id.clone(),
+        },
+        CatalogHandle::new(instance_id, CatalogVersion::from_bytes([1; 32])),
+    );
+    let table = table_facts();
     IcebergSessionMaterial {
-        table: table_facts(),
+        write_binding,
+        write_partition_spec_id: table.default_partition_spec_id(),
+        table,
         input,
         data_output: data.output,
         data_recipe: data.recipe,
@@ -430,12 +532,10 @@ pub(crate) fn equality_delete_recipe() -> IcebergEqualityDeleteRecipe {
 
 pub(crate) fn data_branch_plan() -> IcebergDataBranchPlan {
     IcebergDataBranchPlan {
-        output: IcebergWriterOutput::try_new(
+        output: IcebergWriterOutput::for_test(
             IcebergFileFormat::Parquet,
             parquet::basic::Compression::SNAPPY,
-            None,
-        )
-        .expect("output"),
+            ),
         recipe: IcebergDataBranchRecipe::try_new(Some(serde_json::json!({"type":"struct","schema-id":1,"fields":[{"id":1,"name":"k1","required":false,"type":"long"}]}).to_string()), Vec::new(), Vec::new(), Vec::new(), false)
             .expect("recipe"),
         input: data_input_shape(),
@@ -452,12 +552,7 @@ pub(crate) fn delete_branch_plan(
     };
     IcebergDeleteBranchPlan {
         branch,
-        output: IcebergWriterOutput::try_new(
-            file_format,
-            parquet::basic::Compression::SNAPPY,
-            None,
-        )
-        .expect("output"),
+        output: IcebergWriterOutput::for_test(file_format, parquet::basic::Compression::SNAPPY),
         position_rewrite,
         input: delete_input_shape(branch),
     }

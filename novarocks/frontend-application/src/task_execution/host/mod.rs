@@ -25,9 +25,9 @@ pub(crate) mod pumps;
 
 pub(crate) mod auxiliary;
 pub(crate) mod custody;
-pub(crate) mod failure_bridge;
 pub(crate) mod failure_lifecycle;
 pub(crate) mod failure_publication;
+pub(crate) mod failure_residual;
 pub(crate) mod failure_supervisor;
 pub(crate) mod funding;
 pub(crate) mod geometry;
@@ -126,3 +126,5 @@ mod tests {
 
 #[cfg(all(test, novarocks_dev_controls))]
 mod strict_tail_tests;
+
+pub(crate) mod port;

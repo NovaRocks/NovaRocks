@@ -30,8 +30,7 @@ use novarocks_execution::{
         },
     },
     runtime::{
-        exchange::{encode_chunks_bounded_with_creation, preflight_typed_root_result_decode},
-        mem_tracker::MemTracker,
+        exchange::encode_chunks_bounded_with_creation, mem_tracker::MemTracker,
         runtime_state::RuntimeErrorState,
     },
 };
@@ -119,35 +118,6 @@ fn packet_refusal_keeps_exact_facts_across_direct_and_arrow_writes() {
     )
     .unwrap();
     assert_eq!(exact.into_parts().0, reference);
-    // Decoder limits belong to the receiving format profile, not an
-    // allocation grant. The successful encoder is the independent wire oracle.
-    let limit = novarocks_execution_contract::ResultByteLimit::new(reference.len() as u64).unwrap();
-    let decoded = preflight_typed_root_result_decode(&reference, limit).unwrap();
-    assert!(decoded.retained_backing_upper_bound() > 0);
-    let small =
-        novarocks_execution_contract::ResultByteLimit::new(reference.len() as u64 - 1).unwrap();
-    let refusal = preflight_typed_root_result_decode(&reference, small).unwrap_err();
-    let fact = refusal.failure_fact();
-    assert_eq!(fact.class(), FailureClass::Representation);
-    let extent = fact.representation().unwrap();
-    assert_eq!(extent.required, Some(reference.len() as u64));
-    assert_eq!(extent.extent_limit, Some(reference.len() as u64 - 1));
-    assert_eq!(extent.representable_prefix, None);
-    assert!(fact.resource().is_none());
-    // The real fixed-prefix parser rejects this supported rejection case.
-    // Its original typed error must remain in the chain after projection.
-    let truncated = &reference[..12];
-    let refusal = preflight_typed_root_result_decode(truncated, limit).unwrap_err();
-    assert_eq!(refusal.failure_fact().class(), FailureClass::Data);
-    let mut cause: &(dyn std::error::Error + 'static) = &refusal;
-    loop {
-        if cause.is::<novarocks_arrow_ipc_frame::PrefixError>() {
-            break;
-        }
-        cause = cause
-            .source()
-            .expect("actual frame parser source is retained");
-    }
     drop(factory);
     assert_eq!(tracker.current(), 0);
 }

@@ -10,6 +10,7 @@ workspace = true
 [features]
 
 [dependencies]
+novarocks-logical-execution-protocol.workspace = true
 novarocks-failure-contract.workspace = true
 novarocks-coordination-contract.workspace = true
 novarocks-function-contract.workspace = true
@@ -38,6 +39,7 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+novarocks-expression-contract.workspace = true
 novarocks-sql-testkit.workspace = true
 novarocks-functions.workspace = true
 novarocks-resource-contract.workspace = true

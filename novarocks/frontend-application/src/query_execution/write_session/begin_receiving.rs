@@ -39,6 +39,8 @@ impl std::error::Error for BeginExitUnproven {}
 /// One fixed original Source. It adds no execution authority, future or task.
 /// The caller must retain this owner until the borrowed begin actually exits.
 pub(crate) struct WriteBeginReceiving {
+    session_properties:
+        Arc<novarocks_query_application::sql::session::registry::SessionPropertyInputs>,
     claimed: AtomicBool,
     in_poll_or_drop: AtomicBool,
     completed: AtomicBool,
@@ -49,8 +51,19 @@ pub(crate) struct WriteBeginReceiving {
     health: novarocks_query_application::api::StatementNativeHealthFailure,
 }
 impl WriteBeginReceiving {
+    #[cfg(test)]
     pub(crate) fn new(original: Arc<Mutex<Option<Arc<ConnectorWriteSession>>>>) -> Arc<Self> {
+        Self::for_statement(original, Arc::default())
+    }
+
+    pub(crate) fn for_statement(
+        original: Arc<Mutex<Option<Arc<ConnectorWriteSession>>>>,
+        session_properties: Arc<
+            novarocks_query_application::sql::session::registry::SessionPropertyInputs,
+        >,
+    ) -> Arc<Self> {
         Arc::new(Self {
+            session_properties,
             claimed: AtomicBool::new(false),
             in_poll_or_drop: AtomicBool::new(false),
             completed: AtomicBool::new(false),
@@ -65,6 +78,18 @@ impl WriteBeginReceiving {
                 ),
         })
     }
+    pub(super) fn bind_catalog_session(
+        &self,
+        request: &mut novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest,
+        write: &ConnectorWriteStackPin,
+        catalog: &novarocks_spi::connector::CatalogProperties,
+    ) {
+        request.catalog_session = self.session_properties.connector_catalog_overrides(
+            catalog.handle().catalog_name().as_str(),
+            write.control_runtime_id(),
+        );
+    }
+
     pub(super) fn claim(&self) -> Result<(), ConnectorError> {
         if self.claimed.swap(true, Ordering::AcqRel) {
             return Err(invalid("write begin receiving is already claimed"));

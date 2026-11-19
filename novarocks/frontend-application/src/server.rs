@@ -1377,6 +1377,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use novarocks_query_application::api::ExecutionFailurePresentation;
     use std::num::NonZeroUsize;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};

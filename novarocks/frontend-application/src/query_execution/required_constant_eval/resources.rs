@@ -17,15 +17,14 @@
 
 //! Actual construction and result custody from the statement's own window.
 
-use novarocks_execution::runtime::scalar_memory::{
-    RuntimeScalarEvaluationFailure, RuntimeScalarOperationScope,
+use novarocks_expression::{
+    ExprEvaluationFailure, ScalarCallFailure, ScalarCallHost, ScalarCallPhase,
+    ScalarCallRequestFacts,
 };
 use novarocks_failure_contract::{SharedFailureCause, SourceRetentionCapability};
 use novarocks_functions::opaque_memory::OpaqueAllocationHost;
 use novarocks_functions::{
-    AggregateStateAllocator, EvaluatedArgument, InvocationScalarEvaluationInstance,
-    KernelDiagnostic, KernelEvaluationControl, KernelFailure, ScalarEvaluationInstance,
-    ScalarInvocationActivation, ScalarResourceError, SelectedValues, Selection,
+    AggregateStateAllocator, KernelDiagnostic, KernelFailure, ScalarResourceError,
 };
 use novarocks_sql::compiler::SqlConstantEvaluationError;
 use novarocks_type_contract::owned_resources::layout::{LayoutResourceError, arc_layout};
@@ -37,6 +36,7 @@ use novarocks_type_contract::{
 use novarocks_workload_control::{ResultPayloadBytes, ResultWindowAlias, WorkError, WorkScope};
 use std::{
     alloc::Layout,
+    convert::Infallible,
     ptr::NonNull,
     sync::{Arc, Mutex},
 };
@@ -302,14 +302,13 @@ impl<'a> RootResources<'a> {
         match error {
             SqlConstantEvaluationError::Source(ref source)
             | SqlConstantEvaluationError::Outer(ref source) => {
-                // Forward custody through known owners to their canonical
-                // occurrence. Independently retained inner handles must keep
-                // the same receipt; unknown error trees are not traversed.
-                if let Some(execution) =
-                    source.downcast_ref::<novarocks_execution::runtime::task::ExecutionFailure>()
-                {
-                    execution.retain_source_lifetime(guard);
-                } else if let Some(kernel) = source.downcast_ref::<KernelFailure>() {
+                // Forward custody to a typed Kernel owner where it can keep
+                // the receipt. The shared source owns custody in all other cases.
+                let kernel = match source.downcast_ref::<ExprEvaluationFailure<Infallible>>() {
+                    Some(ExprEvaluationFailure::Kernel(kernel)) => Some(kernel),
+                    _ => source.downcast_ref::<KernelFailure>(),
+                };
+                if let Some(kernel) = kernel {
                     if let Err(custody) = kernel.try_retain_source_lifetime(guard) {
                         source.retain_source_lifetime(custody);
                     }
@@ -324,77 +323,33 @@ impl<'a> RootResources<'a> {
         }
         error
     }
-    fn operation(&self, bytes: usize) -> Result<(), RuntimeScalarEvaluationFailure> {
+    fn operation(&self, bytes: usize) -> Result<(), ScalarCallFailure<Infallible>> {
         self.operations
             .reserve(bytes)
             .map_err(|cause| KernelFailure::CompileControl(cause).into())
     }
 }
-impl RuntimeScalarOperationScope for RootResources<'_> {
-    fn evaluate<'a>(
+impl ScalarCallHost for RootResources<'_> {
+    type Refusal = Infallible;
+
+    fn begin_call(&mut self) {}
+
+    fn run_admitted(
         &mut self,
-        instance: &mut ScalarEvaluationInstance,
-        selection: Selection<'a>,
-        arguments: &'a [EvaluatedArgument<'a>],
-        control: &dyn KernelEvaluationControl,
-    ) -> Result<SelectedValues<'a>, RuntimeScalarEvaluationFailure> {
-        if let Some(profile) = instance.invocation_resource_profile() {
-            let facts = profile
-                .requests_for(selection, arguments)
-                .map_err(RuntimeScalarEvaluationFailure::Source)?;
-            self.operation(facts.bytes())?;
-        }
-        instance
-            .evaluate(selection, arguments, control)
-            .map_err(Into::into)
+        _phase: ScalarCallPhase,
+        facts: ScalarCallRequestFacts,
+        body: &mut dyn FnMut() -> Result<(), ScalarCallFailure<Self::Refusal>>,
+    ) -> Result<(), ScalarCallFailure<Self::Refusal>> {
+        self.operation(facts.bytes())?;
+        body()
     }
-    fn evaluate_invocation<'a>(
+
+    fn callback_request_facts(
         &mut self,
-        instance: &mut InvocationScalarEvaluationInstance,
-        selection: Selection<'a>,
-        arguments: &'a [EvaluatedArgument<'a>],
-        activation: ScalarInvocationActivation,
         _allocator: Option<&Arc<dyn AggregateStateAllocator>>,
-        control: &dyn KernelEvaluationControl,
-    ) -> Result<SelectedValues<'a>, RuntimeScalarEvaluationFailure> {
-        if !instance.is_failed()
-            && let Some(profile) = instance.invocation_resource_profile()
-        {
-            self.operation(profile.preparation_prefix().bytes())?;
-            let facts = profile
-                .requests_for(instance, selection, arguments, activation, control)
-                .map_err(RuntimeScalarEvaluationFailure::from)?;
-            if facts.requires_host_callback() {
-                return Err(RuntimeScalarEvaluationFailure::Source(
-                    ScalarResourceError::SourceModel(
-                        "required constant host has no original whole-invocation callback request source",
-                    ),
-                ));
-            }
-            self.operation(facts.bytes())?;
-        }
-        instance
-            .evaluate(selection, arguments, activation, control)
-            .map_err(Into::into)
-    }
-    fn evaluate_scoped_invocation<'a>(
-        &mut self,
-        instance: &mut InvocationScalarEvaluationInstance,
-        scope: novarocks_functions::ScalarInvocationScope<'a>,
-        sources: &'a [novarocks_functions::ScalarInvocationSource<'a>],
-        activation: ScalarInvocationActivation,
-        _allocator: Option<&Arc<dyn AggregateStateAllocator>>,
-        control: &dyn KernelEvaluationControl,
-    ) -> Result<SelectedValues<'a>, RuntimeScalarEvaluationFailure> {
-        if !instance.is_failed() && instance.invocation_resource_profile().is_some() {
-            return Err(RuntimeScalarEvaluationFailure::Source(
-                ScalarResourceError::SourceModel(
-                    "scoped invocation has no original measurement source transport",
-                ),
-            ));
-        }
-        instance
-            .evaluate_scoped(scope, sources, activation, control)
-            .map_err(Into::into)
+    ) -> Result<ScalarCallRequestFacts, ScalarCallFailure<Self::Refusal>> {
+        Err(ScalarCallFailure::Source(ScalarResourceError::SourceModel(
+            "required constant host has no original whole-invocation callback request source",
+        )))
     }
 }

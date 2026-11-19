@@ -54,25 +54,53 @@ message SemanticParameterRef {
   SemanticParameterKey expected_key = 2;
 }
 
+
+message ExpressionClaims { repeated ExpressionCallClaim entries = 1; }
+message ExpressionCallClaim {
+  optional uint32 use_id = 1;
+  ExpressionEffectContext context = 2;
+  CallEffects effects = 3;
+  optional DecimalOverflowPolicy decimal_overflow_policy = 4;
+  TemporalSourcePlan temporal_source = 5;
+  optional RegexpCountPatternSource regexp_count_pattern_source = 6;
+  optional ToBase64ByteSource to_base64_byte_source = 7;
+}
+message RelationEffectId {
+  optional uint32 call_id = 1;
+  RelationEffectRole role = 2;
+}
+enum RelationEffectRole {
+  RELATION_EFFECT_ROLE_UNSPECIFIED = 0;
+  RELATION_EFFECT_ROLE_CALL = 1;
+  RELATION_EFFECT_ROLE_MATERIALIZED_INPUT = 2;
+}
+message RelationEffectContext {
+  RelationEffectId identity = 1;
+  novarocks.physical_control_v2.EvaluationDemand demand = 2;
+}
+
 message FrozenCalls {
   repeated FrozenCall entries = 1;
 }
 message FrozenCall {
   CallSite site = 1;
-  EffectContext context = 2;
+  reserved 2, 5, 6, 7, 8;
+  reserved "context", "temporal_source", "regexp_count_pattern_source", "to_base64_byte_source", "materialized_writer_input";
+  RelationEffectContext relation_context = 9;
   CallEffects effects = 3;
   // Required for every real call. It belongs to the original SQL scope, not
   // to CallEffects, ALLOW_THROW_EXCEPTION or DecimalOverflowToDouble. Typed
   // decode rejects absence, UNSPECIFIED and unknown values without a default.
   optional DecimalOverflowPolicy decimal_overflow_policy = 4;
-  TemporalSourcePlan temporal_source = 5;
+
   // Explicit presence preserves proved dynamic versus missing source facts.
-  optional RegexpCountPatternSource regexp_count_pattern_source = 6;
+
   // Required positive source receipt only for exact TO_BASE64 calls.
-  optional ToBase64ByteSource to_base64_byte_source = 7;
+
   // Exact original writer Value scope. Required only for WriterPartial/Final;
   // its root domain is retained, while it is not an expression invocation.
-  EffectContext materialized_writer_input = 8;
+
+  RelationEffectContext materialized_input = 10;
 }
 
 // One shared semantic policy for actual function calls and Binary/Cast nodes.
@@ -89,8 +117,10 @@ message NodeCallSite {
   uint32 call = 2;
 }
 message CallSite {
+  reserved 1;
+  reserved "expression_use_id";
   oneof kind {
-    uint32 expression_use_id = 1;
+    NodeCallSite window = 7;
     NodeCallSite aggregate = 2;
     NodeCallSite top_n_state = 3;
     NodeCallSite writer_partial = 4;
@@ -98,9 +128,9 @@ message CallSite {
     uint32 table_node_id = 6;
   }
 }
-message EffectContext {
+message ExpressionEffectContext {
   optional uint32 use_id = 1;
-  optional uint32 domain_id = 2;
+  optional uint32 region_id = 2;
   novarocks.physical_control_v2.EvaluationDemand demand = 3;
 }
 
@@ -177,7 +207,8 @@ message ObservableEffects {
 message ProofScope {
   oneof kind {
     novarocks.physical_control_v2.Empty unconditional = 1;
-    uint32 domain_id = 2;
+    uint32 region_id = 2;
+    RelationEffectId relation = 3;
   }
 }
 
@@ -205,12 +236,15 @@ enum PruningDomainField {
 }
 message PredicateResponsibilityRef {
   optional uint32 fragment_id = 1;
-  novarocks.physical_control_v2.RootSite site = 2;
+  reserved 2;
+  reserved "site";
+  optional uint32 node_id = 4;
+  optional uint32 root_ordinal = 5;
   optional uint32 use_id = 3;
 }
 message PruningSourceWitness {
   PredicateResponsibilityRef responsibility = 1;
-  EffectContext context = 2;
+  ExpressionEffectContext context = 2;
   // Ordered child positions in the original positive conjunction occurrence.
   repeated uint32 conjunct_path = 3;
   repeated PruningInputEdge input_path = 4;

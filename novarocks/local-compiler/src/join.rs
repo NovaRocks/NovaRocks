@@ -49,24 +49,22 @@ use crate::{
     assert_rows::reserve_vec,
     channels::{ResolvedInput, UnionChannelBranch, UnionChannelSource},
     lowering::FragmentCompileError,
-    union_flow::UnionRoot,
 };
 
 use novarocks_local_program::{
     DiagnosticSourceNodeId, FilterConsumerAtJoinKey, FilterProducerAtExpr, JoinDistributionMode,
     JoinType, LocalOperatorId, LocalOperatorOrigin, LocalOperatorProvenance, MetricAggregation,
     NestedLoopJoinType, OperatorMetricAggregation, ProgramChannelLayoutRole, ProgramChannelSite,
-    ProgramExprId, ProgramJoinCondition, ProgramJoinKey, ProgramNode, ProgramNodeExpressionRole,
-    ProgramNodeId, ProgramNodeKind, StaticFilterProducer, StaticLayout,
+    ProgramJoinCondition, ProgramJoinKey, ProgramNode, ProgramNodeId, ProgramNodeKind,
+    ProgramRootRef, StaticFilterProducer, StaticLayout,
 };
 use novarocks_physical_plan::{
-    Distribution, ExprId, ExpressionRootRole, Fragment, FragmentPackage, JoinDistribution,
-    JoinKind, JoinSide, NestLoopJoinDistribution, NodeId, NodeKind, PhysicalNode, RowMultiplicity,
-    ValueId, ValueOrigin,
+    Distribution, Fragment, FragmentPackage, JoinDistribution, JoinKind, JoinSide,
+    NestLoopJoinDistribution, NodeId, NodeKind, PhysicalNode, RowMultiplicity, ValueId,
+    ValueOrigin,
 };
 use novarocks_type_contract::{
-    CompileCheckpoints, CompileControlError, CompilePhase, ExpressionUseId, FunctionValueType,
-    PureCompileControl,
+    CompileCheckpoints, CompileControlError, CompilePhase, FunctionValueType, PureCompileControl,
 };
 use novarocks_types::SlotId;
 use std::{
@@ -91,13 +89,6 @@ pub(crate) struct JoinOrientation {
 }
 
 impl JoinOrientation {
-    pub(crate) const fn probe_side(self) -> JoinSide {
-        if self.probe_input == 0 {
-            JoinSide::Left
-        } else {
-            JoinSide::Right
-        }
-    }
     /// The canonical output is the probe side alone.
     const fn probe_only(self) -> bool {
         matches!(
@@ -703,232 +694,11 @@ pub(crate) fn plan_join_channels(
     })
 }
 
-/// Where a join-owned value read lives: its side and ordinal there, and its
-/// ordinal in the join scope.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct JoinValueSource {
-    pub join: ProgramNodeId,
-    side: ProgramChannelLayoutRole,
-    side_ordinal: u32,
-    scope_ordinal: u32,
-}
-
-impl JoinValueSource {
-    /// The source of one use whose root reads `role` of `join`.
-    pub(crate) fn for_root(
-        self,
-        join: ProgramNodeId,
-        role: ProgramChannelLayoutRole,
-    ) -> Result<ProgramChannelSite, FragmentCompileError> {
-        if join != self.join {
-            return Err(FragmentCompileError::Invalid(
-                "join value is read by another node's root",
-            ));
-        }
-        let ordinal = if role == ProgramChannelLayoutRole::JoinScope {
-            self.scope_ordinal
-        } else if role == self.side {
-            self.side_ordinal
-        } else {
-            return Err(FragmentCompileError::Invalid(
-                "join key root reads the other side's value",
-            ));
-        };
-        Ok(ProgramChannelSite::Layout {
-            node: join,
-            role,
-            ordinal,
-        })
-    }
-}
-
-/// Resolve one join-owned value read. The value lies in exactly one side.
-pub(crate) fn resolve_join_value(
-    planned: &PlannedJoin,
-    value: ValueId,
-    ports: &BTreeMap<NodeId, BTreeMap<ValueId, usize>>,
-) -> Result<(ResolvedInput, JoinValueSource), FragmentCompileError> {
-    let probe = ports.get(&planned.probe).and_then(|port| port.get(&value));
-    let build = ports.get(&planned.build).and_then(|port| port.get(&value));
-    let (side, ordinal, slots, offset) = match (probe, build) {
-        (Some(&ordinal), None) => (
-            ProgramChannelLayoutRole::JoinLeft,
-            ordinal,
-            &planned.probe_slots,
-            0,
-        ),
-        (None, Some(&ordinal)) => (
-            ProgramChannelLayoutRole::JoinRight,
-            ordinal,
-            &planned.build_slots,
-            planned.probe_slots.len(),
-        ),
-        _ => {
-            return Err(FragmentCompileError::Invalid(
-                "join value is not on exactly one input side",
-            ));
-        }
-    };
-    let slot = *slots.get(ordinal).ok_or(FragmentCompileError::Invalid(
-        "join input occurrence has no slot",
-    ))?;
-    let side_ordinal =
-        u32::try_from(ordinal).map_err(|_| CompileControlError::ResourceExhausted)?;
-    let scope_ordinal = u32::try_from(
-        offset
-            .checked_add(ordinal)
-            .ok_or(CompileControlError::ResourceExhausted)?,
-    )
-    .map_err(|_| CompileControlError::ResourceExhausted)?;
-    Ok((
-        ResolvedInput {
-            slot,
-            source: ProgramChannelSite::Layout {
-                node: planned.join,
-                role: side,
-                ordinal: side_ordinal,
-            },
-        },
-        JoinValueSource {
-            join: planned.join,
-            side,
-            side_ordinal,
-            scope_ordinal,
-        },
-    ))
-}
-
-/// The local root role of one physical join root, and the layout its uses
-/// read.
-pub(crate) fn root_role(
-    planned: &PlannedJoin,
-    role: ExpressionRootRole,
-) -> Result<(ProgramNodeExpressionRole, ProgramChannelLayoutRole), FragmentCompileError> {
-    match (role, planned.orientation.kind) {
-        (ExpressionRootRole::JoinKey { key, side }, LocalJoinKind::Hash(kind))
-            if !matches!(kind, JoinType::NullAwareLeftAnti | JoinType::LeftMark) =>
-        {
-            Ok(if side == planned.orientation.probe_side() {
-                (
-                    ProgramNodeExpressionRole::JoinProbeKey { key },
-                    ProgramChannelLayoutRole::JoinLeft,
-                )
-            } else {
-                (
-                    ProgramNodeExpressionRole::JoinBuildKey { key },
-                    ProgramChannelLayoutRole::JoinRight,
-                )
-            })
-        }
-        (ExpressionRootRole::HashJoinResidual, LocalJoinKind::Hash(kind))
-            if !matches!(kind, JoinType::NullAwareLeftAnti | JoinType::LeftMark) =>
-        {
-            Ok((
-                ProgramNodeExpressionRole::JoinResidual,
-                ProgramChannelLayoutRole::JoinScope,
-            ))
-        }
-        (
-            ExpressionRootRole::NaaValueEqualKey { key, side },
-            LocalJoinKind::Hash(JoinType::NullAwareLeftAnti | JoinType::LeftMark),
-        ) => Ok(if side == planned.orientation.probe_side() {
-            (
-                ProgramNodeExpressionRole::NaaValueProbeKey { key },
-                ProgramChannelLayoutRole::JoinLeft,
-            )
-        } else {
-            (
-                ProgramNodeExpressionRole::NaaValueBuildKey { key },
-                ProgramChannelLayoutRole::JoinRight,
-            )
-        }),
-        (
-            ExpressionRootRole::NaaScopeKey { key, side },
-            LocalJoinKind::Hash(JoinType::NullAwareLeftAnti | JoinType::LeftMark),
-        ) => Ok(if side == planned.orientation.probe_side() {
-            (
-                ProgramNodeExpressionRole::NaaScopeProbeKey { key },
-                ProgramChannelLayoutRole::JoinLeft,
-            )
-        } else {
-            (
-                ProgramNodeExpressionRole::NaaScopeBuildKey { key },
-                ProgramChannelLayoutRole::JoinRight,
-            )
-        }),
-        (
-            ExpressionRootRole::NaaEligibility,
-            LocalJoinKind::Hash(JoinType::NullAwareLeftAnti | JoinType::LeftMark),
-        ) => Ok((
-            ProgramNodeExpressionRole::NaaEligibility,
-            ProgramChannelLayoutRole::JoinScope,
-        )),
-        (ExpressionRootRole::NestLoopPredicate, LocalJoinKind::NestLoop(_)) => Ok((
-            ProgramNodeExpressionRole::NestedLoopPredicate,
-            ProgramChannelLayoutRole::JoinScope,
-        )),
-        _ => Err(FragmentCompileError::Invalid(
-            "join root role differs from its join family",
-        )),
-    }
-}
-
-/// The join layout every use under a join root reads. Uses are per
-/// occurrence, so each use belongs to exactly one root.
-pub(crate) fn join_use_roles(
-    package: &FragmentPackage,
-    joins: &BTreeMap<NodeId, PlannedJoin>,
-    control: &dyn PureCompileControl,
-) -> Result<
-    BTreeMap<ExpressionUseId, (ProgramNodeId, ProgramChannelLayoutRole)>,
-    FragmentCompileError,
-> {
-    let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
-    let result = (|| {
-        let uses = package.expression_uses().flow().uses();
-        let mut roles = BTreeMap::new();
-        if joins.is_empty() {
-            return Ok(roles);
-        }
-        let mut stack = Vec::new();
-        for (site, &root) in package.expression_uses().bindings() {
-            work.step()?;
-            let Some(planned) = joins.get(&site.node) else {
-                continue;
-            };
-            let (_, layout) = root_role(planned, site.role)?;
-            stack.push(root);
-            while let Some(use_id) = stack.pop() {
-                work.step()?;
-                if roles.insert(use_id, (planned.join, layout)).is_some() {
-                    return Err(FragmentCompileError::Invalid(
-                        "join expression occurrence is shared by two roots",
-                    ));
-                }
-                let invocation = uses.get(&use_id).ok_or(FragmentCompileError::Invalid(
-                    "join root occurrence has no invocation",
-                ))?;
-                for &argument in invocation.arguments.iter() {
-                    stack.push(argument);
-                    work.step()?;
-                }
-            }
-        }
-        Ok(roles)
-    })();
-    if matches!(&result, Err(FragmentCompileError::Control(_))) {
-        return result;
-    }
-    work.finish()?;
-    result
-}
-
 /// The nodes, channels, provenance and selection roots of one lowered join.
 pub(crate) struct LoweredJoin {
     pub nodes: Vec<ProgramNode>,
     pub channels: Vec<(ProgramChannelSite, FunctionValueType)>,
     pub operators: Vec<LocalOperatorProvenance>,
-    pub selection_roots: Vec<UnionRoot>,
 }
 
 /// One lowered join input: its local node and published layout.
@@ -943,19 +713,25 @@ pub(crate) struct JoinInput<'a> {
     clippy::too_many_arguments,
     reason = "The planned join, its two lowered inputs, the derived selection reads and its runtime-filter producers are independent inputs"
 )]
-pub(crate) fn lower_join_with_creation<H>(
+pub(crate) fn lower_join_with_creation<
+    H,
+    F: novarocks_type_contract::ValueSchemaCreationFactory<H>,
+>(
     package: &FragmentPackage,
     node: &PhysicalNode,
     planned: &PlannedJoin,
     published: &[SlotId],
     probe: JoinInput<'_>,
     build: JoinInput<'_>,
-    expressions: &BTreeMap<ExprId, ProgramExprId>,
-    selection_definitions: Option<&[ProgramExprId]>,
+    expression_units: &mut crate::expressions::LoweredExpressions,
+    functions: &novarocks_functions::PureEngineFunctionCatalog,
+    policy: novarocks_functions::ConstantPolicy,
+    mut temporary: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
+    factory: Option<&F>,
     runtime_filters: Vec<(usize, StaticFilterProducer)>,
     runtime_filter_consumers: Vec<(
         usize,
-        ProgramExprId,
+        ProgramRootRef,
         novarocks_local_program::StaticFilterConsumer,
     )>,
     control: &dyn PureCompileControl,
@@ -969,8 +745,11 @@ pub(crate) fn lower_join_with_creation<H>(
         published,
         probe,
         build,
-        expressions,
-        selection_definitions,
+        expression_units,
+        functions,
+        policy,
+        crate::creation::borrow_scope(&mut temporary),
+        factory,
         runtime_filters,
         runtime_filter_consumers,
         &mut work,
@@ -1079,9 +858,9 @@ fn channel_types(
 }
 
 fn lowered(
-    expressions: &BTreeMap<ExprId, ProgramExprId>,
-    expression: ExprId,
-) -> Result<ProgramExprId, FragmentCompileError> {
+    expressions: &crate::expressions::RootMap,
+    expression: novarocks_expression_contract::RootOrdinal,
+) -> Result<ProgramRootRef, FragmentCompileError> {
     expressions
         .get(&expression)
         .copied()
@@ -1094,19 +873,22 @@ fn lowered(
     clippy::too_many_arguments,
     reason = "Mirrors lower_join with the caller's checkpoint scope"
 )]
-fn lower_core_with_creation<H>(
+fn lower_core_with_creation<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
     package: &FragmentPackage,
     node: &PhysicalNode,
     planned: &PlannedJoin,
     published: &[SlotId],
     probe: JoinInput<'_>,
     build: JoinInput<'_>,
-    expressions: &BTreeMap<ExprId, ProgramExprId>,
-    selection_definitions: Option<&[ProgramExprId]>,
+    expression_units: &mut crate::expressions::LoweredExpressions,
+    functions: &novarocks_functions::PureEngineFunctionCatalog,
+    policy: novarocks_functions::ConstantPolicy,
+    mut temporary: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
+    factory: Option<&F>,
     runtime_filters: Vec<(usize, StaticFilterProducer)>,
     runtime_filter_consumers: Vec<(
         usize,
-        ProgramExprId,
+        ProgramRootRef,
         novarocks_local_program::StaticFilterConsumer,
     )>,
     work: &mut CompileCheckpoints<'_>,
@@ -1173,6 +955,103 @@ fn lower_core_with_creation<H>(
         work,
         creation,
     )?;
+    let input_layouts = if planned.orientation.probe_input == 0 {
+        [probe.layout, build.layout]
+    } else {
+        [build.layout, probe.layout]
+    };
+    let probe_values = &fragment.nodes()[&planned.probe].output.columns;
+    let build_values = &fragment.nodes()[&planned.build].output.columns;
+    let mut scope_values = Vec::new();
+    crate::creation::reserve_vec(
+        &mut scope_values,
+        scope_slots.len(),
+        crate::creation::borrow_scope(&mut temporary),
+        work,
+    )?;
+    for value in probe_values.iter().chain(build_values.iter()) {
+        work.step()?;
+        scope_values.push(*value);
+    }
+    crate::expressions::compile_node_unit(
+        package,
+        node,
+        &input_layouts,
+        Some((&scope_values, &scope)),
+        expression_units,
+        functions,
+        policy,
+        creation,
+        crate::creation::borrow_scope(&mut temporary),
+        factory,
+        work,
+    )?;
+    let selection_definitions = if let Some(ordinals) = &planned.selection {
+        let canonical_values = if planned.orientation.probe_only() {
+            probe_values.as_ref()
+        } else if planned.orientation.build_only() {
+            build_values.as_ref()
+        } else {
+            scope_values.as_slice()
+        };
+        let mut columns = Vec::new();
+        crate::creation::reserve_vec(
+            &mut columns,
+            planned.canonical_types.len(),
+            crate::creation::borrow_scope(&mut temporary),
+            work,
+        )?;
+        for (value, ty) in canonical_values.iter().zip(planned.canonical_types.iter()) {
+            work.step()?;
+            columns.push((*value, ty.clone()));
+        }
+        if columns.len() != planned.canonical_types.len() {
+            let mark = node
+                .output
+                .columns
+                .iter()
+                .find(|value| {
+                    matches!(
+                        fragment.values()[value].origin,
+                        ValueOrigin::JoinMark { .. }
+                    )
+                })
+                .ok_or(FragmentCompileError::Invalid(
+                    "join mark canonical input is absent",
+                ))?;
+            columns.push((*mark, planned.canonical_types[columns.len()].clone()));
+        }
+        let mut reads = Vec::new();
+        crate::creation::reserve_vec(
+            &mut reads,
+            ordinals.len(),
+            crate::creation::borrow_scope(&mut temporary),
+            work,
+        )?;
+        for ordinal in ordinals {
+            work.step()?;
+            reads.push((
+                *ordinal as usize,
+                novarocks_type_contract::EvaluationDemand::Value,
+            ));
+        }
+        Some(crate::union_flow::compile_reads(
+            package,
+            expression_units,
+            functions,
+            policy,
+            &canonical,
+            &columns,
+            &reads,
+            creation,
+            crate::creation::borrow_scope(&mut temporary),
+            factory,
+            work,
+        )?)
+    } else {
+        None
+    };
+    let expressions = expression_units.roots(node.id)?;
     let kind = match (&node.kind, planned.orientation.kind) {
         (NodeKind::HashJoin { condition, .. }, LocalJoinKind::Hash(join_type)) => {
             let lower_keys = |source_keys: &[novarocks_physical_plan::JoinKey],
@@ -1186,16 +1065,10 @@ fn lower_core_with_creation<H>(
                     } else {
                         (key.right, key.left)
                     };
-                    let probe_type = &fragment
-                        .expressions()
-                        .get(probe_key)
-                        .ok_or(FragmentCompileError::Invalid("missing join key definition"))?
-                        .ty;
-                    let build_type = &fragment
-                        .expressions()
-                        .get(build_key)
-                        .ok_or(FragmentCompileError::Invalid("missing join key definition"))?
-                        .ty;
+                    let probe_type =
+                        &crate::expressions::bound_root(package, node.id, probe_key)?.ty;
+                    let build_type =
+                        &crate::expressions::bound_root(package, node.id, build_key)?.ty;
                     // The hash table compares exact carriers; a key pair whose
                     // carriers differ would need a BE cast, which is refused.
                     work.flush()?;
@@ -1363,7 +1236,6 @@ fn lower_core_with_creation<H>(
     reserve_vec(&mut nodes, pieces, work)?;
     let mut operators = Vec::new();
     reserve_vec(&mut operators, pieces, work)?;
-    let mut selection_roots = Vec::new();
     nodes.push(ProgramNode::new_local(join, vec![source], kind, canonical));
     operators.push(LocalOperatorProvenance {
         id: owner,
@@ -1378,9 +1250,11 @@ fn lower_core_with_creation<H>(
         metrics,
     });
     if let Some(sources) = &planned.selection {
-        let definitions = selection_definitions.ok_or(FragmentCompileError::Invalid(
-            "missing join selection definitions",
-        ))?;
+        let definitions = selection_definitions
+            .as_deref()
+            .ok_or(FragmentCompileError::Invalid(
+                "missing join selection definitions",
+            ))?;
         if definitions.len() != sources.len()
             || published.len() != sources.len()
             || node.output.columns.len() != sources.len()
@@ -1397,22 +1271,8 @@ fn lower_core_with_creation<H>(
         );
         let mut types = Vec::new();
         reserve_vec(&mut types, sources.len(), work)?;
-        reserve_vec(&mut selection_roots, sources.len(), work)?;
-        for (ordinal, (&canonical_ordinal, &definition)) in
-            sources.iter().zip(definitions).enumerate()
-        {
+        for &canonical_ordinal in sources {
             types.push(planned.canonical_types[canonical_ordinal as usize].clone());
-            selection_roots.push(UnionRoot {
-                node: local,
-                ordinal: u32::try_from(ordinal)
-                    .map_err(|_| CompileControlError::ResourceExhausted)?,
-                definition,
-                source: ProgramChannelSite::Layout {
-                    node: join,
-                    role: ProgramChannelLayoutRole::NodeOutput,
-                    ordinal: canonical_ordinal,
-                },
-            });
             work.step()?;
         }
         let layout = named_layout_with_creation(
@@ -1459,6 +1319,5 @@ fn lower_core_with_creation<H>(
         nodes,
         channels,
         operators,
-        selection_roots,
     })
 }

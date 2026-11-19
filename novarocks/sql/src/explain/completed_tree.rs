@@ -35,12 +35,13 @@ use super::completed::{ExplainRenderBudget, ExplainRenderOutput, RenderDiagnosti
 
 use arrow::datatypes::DataType;
 use novarocks_physical_plan::{
-    AnnotationSubject, Distribution, ExprId, ExprKind, Fragment, FragmentId, FragmentSink,
-    LiteralValue, NodeId, PhysicalNode, PhysicalPlan, PlanAnnotation, Relation, SortExpr, ValueId,
+    AnnotationSubject, Distribution, Fragment, FragmentId, FragmentSink, NodeId, PhysicalNode,
+    PhysicalPlan, PlanAnnotation, Relation, SortExpr, ValueId,
 };
 
 use crate::compiler::SqlCompileError;
 use crate::explain::ExplainLevel;
+use novarocks_expression_contract::{BoundExprSet, ExprId, ExprKind, RootOrdinal};
 
 /// One completed plan, printed as its operator tree.
 pub fn render_completed_plan_tree(
@@ -872,12 +873,13 @@ impl TreeContext<'_> {
 struct ExprText<'a> {
     context: &'a TreeContext<'a>,
     fragment: &'a Fragment,
-    expr: ExprId,
+    unit: Option<&'a BoundExprSet>,
+    expr: Option<ExprId>,
 }
 
 impl std::fmt::Display for ExprText<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.write(formatter, self.expr, 0)
+        self.write(formatter, self.expr.ok_or(fmt::Error)?, 0)
     }
 }
 
@@ -892,7 +894,8 @@ impl ExprText<'_> {
         Self {
             context: self.context,
             fragment: self.fragment,
-            expr,
+            unit: self.unit,
+            expr: Some(expr),
         }
     }
 
@@ -905,9 +908,10 @@ impl ExprText<'_> {
         if depth > Self::MAX_DEPTH {
             return Err(fmt::Error);
         }
-        let Some(node) = self.fragment.expressions().get(expr) else {
-            return write!(formatter, "e{}", expr.get());
-        };
+        let node = self
+            .unit
+            .and_then(|unit| unit.definition(expr))
+            .ok_or(fmt::Error)?;
         let inner = |expr: ExprId| ExprTextAt {
             text: self.nested(expr),
             depth: depth.saturating_add(1),
@@ -917,7 +921,6 @@ impl ExprText<'_> {
                 .context
                 .value_name(self.fragment.id(), *value)
                 .fmt(formatter),
-            ExprKind::Literal(value) => write!(formatter, "{}", literal_text(value)),
             ExprKind::Constant(reference) => match &self.context.diagnostic {
                 Some(diagnostic) => {
                     diagnostic.plan_constant(self.context.plan, *reference, &node.ty, formatter)
@@ -932,7 +935,7 @@ impl ExprText<'_> {
             ExprKind::LambdaParameter { ordinal, .. } => write!(formatter, "arg{ordinal}"),
             ExprKind::Lambda { body, .. } => write!(formatter, "-> {}", inner(*body)),
             ExprKind::Unary { op, expr } => {
-                use novarocks_physical_plan::UnaryOperator;
+                use novarocks_expression_contract::UnaryOperator;
                 match op {
                     UnaryOperator::Plus => write!(formatter, "+{}", inner(*expr)),
                     UnaryOperator::Minus => write!(formatter, "-{}", inner(*expr)),
@@ -1044,21 +1047,6 @@ impl ExprText<'_> {
                 write_joined(formatter, args, ", ", |arg| inner(*arg))?;
                 write!(formatter, ")")
             }
-            ExprKind::WindowCall {
-                function,
-                distinct,
-                args,
-                ..
-            } => {
-                write!(
-                    formatter,
-                    "{}({}",
-                    function_text(&function.function_id),
-                    if *distinct { "DISTINCT " } else { "" }
-                )?;
-                write_joined(formatter, args, ", ", |arg| inner(*arg))?;
-                write!(formatter, ")")
-            }
         }
     }
 }
@@ -1071,7 +1059,8 @@ struct ExprTextAt<'a> {
 
 impl std::fmt::Display for ExprTextAt<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.text.write(formatter, self.text.expr, self.depth)
+        self.text
+            .write(formatter, self.text.expr.ok_or(fmt::Error)?, self.depth)
     }
 }
 
@@ -1097,8 +1086,8 @@ fn function_text(function: &novarocks_physical_plan::FunctionId) -> &str {
     id.split('/').nth(1).unwrap_or(id)
 }
 
-fn binary_operator_text(op: novarocks_physical_plan::BinaryOperator) -> &'static str {
-    use novarocks_physical_plan::BinaryOperator;
+fn binary_operator_text(op: novarocks_expression_contract::BinaryOperator) -> &'static str {
+    use novarocks_expression_contract::BinaryOperator;
     match op {
         BinaryOperator::Eq => "=",
         BinaryOperator::EqForNull => "<=>",
@@ -1118,64 +1107,18 @@ fn binary_operator_text(op: novarocks_physical_plan::BinaryOperator) -> &'static
     }
 }
 
-struct LiteralText<'a>(&'a LiteralValue);
-
-fn literal_text(value: &LiteralValue) -> LiteralText<'_> {
-    LiteralText(value)
-}
-
-impl std::fmt::Display for LiteralText<'_> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.0 {
-            LiteralValue::Null => formatter.write_str("NULL"),
-            LiteralValue::Boolean(value) => write!(formatter, "{value}"),
-            LiteralValue::Int64(value) => write!(formatter, "{value}"),
-            LiteralValue::UInt64(value) => write!(formatter, "{value}"),
-            LiteralValue::Float64Bits(bits) => write!(formatter, "{}", f64::from_bits(*bits)),
-            LiteralValue::LargeInt(value) | LiteralValue::Decimal128(value) => {
-                write!(formatter, "{value}")
-            }
-            LiteralValue::Decimal256(bytes) => {
-                write!(
-                    formatter,
-                    "{}",
-                    arrow::datatypes::i256::from_be_bytes(*bytes)
-                )
-            }
-            LiteralValue::Utf8(value) => write!(formatter, "'{value}'"),
-            LiteralValue::Binary(value) => {
-                formatter.write_str("X'")?;
-                for byte in value.iter() {
-                    write!(formatter, "{byte:02x}")?;
-                }
-                formatter.write_str("'")
-            }
-            LiteralValue::Date32(value) => write!(formatter, "{value}"),
-            LiteralValue::Time64(value) | LiteralValue::Timestamp(value) => {
-                write!(formatter, "{value}")
-            }
-            LiteralValue::IntervalMonthDayNano {
-                months,
-                days,
-                nanoseconds,
-            } => write!(
-                formatter,
-                "interval(months={months}, days={days}, nanoseconds={nanoseconds})"
-            ),
-        }
-    }
-}
-
 fn sort_items_text<'a>(
     context: &'a TreeContext<'a>,
     fragment: &'a Fragment,
+    node: NodeId,
     items: &'a [SortExpr],
 ) -> impl Display + 'a {
-    sort_items_pair(context, fragment, items, &[])
+    sort_items_pair(context, fragment, node, items, &[])
 }
 fn sort_items_pair<'a>(
     context: &'a TreeContext<'a>,
     fragment: &'a Fragment,
+    node: NodeId,
     first: &'a [SortExpr],
     second: &'a [SortExpr],
 ) -> impl Display + 'a {
@@ -1187,7 +1130,7 @@ fn sort_items_pair<'a>(
             write!(
                 f,
                 "{} {} NULLS {}",
-                context.expr(fragment, item.expr),
+                context.expr(fragment, node, item.expr),
                 match item.direction {
                     novarocks_physical_plan::SortDirection::Ascending => "ASC",
                     novarocks_physical_plan::SortDirection::Descending => "DESC",
@@ -1203,22 +1146,27 @@ fn sort_items_pair<'a>(
 }
 
 impl TreeContext<'_> {
-    fn expr<'a>(&'a self, fragment: &'a Fragment, expr: ExprId) -> ExprText<'a> {
+    fn expr<'a>(&'a self, fragment: &'a Fragment, node: NodeId, root: RootOrdinal) -> ExprText<'a> {
+        let unit = fragment.unit(node);
         ExprText {
             context: self,
             fragment,
-            expr,
+            unit,
+            expr: unit
+                .and_then(|unit| unit.root(root))
+                .map(|root| root.definition),
         }
     }
 
     fn expressions<'a>(
         &'a self,
         fragment: &'a Fragment,
-        expressions: &'a [ExprId],
+        node: NodeId,
+        expressions: &'a [RootOrdinal],
         separator: &'static str,
     ) -> impl Display + 'a {
         joined(expressions, separator, move |expr, f| {
-            self.expr(fragment, *expr).fmt(f)
+            self.expr(fragment, node, *expr).fmt(f)
         })
     }
 
@@ -1270,10 +1218,12 @@ impl TreeContext<'_> {
                 if self.detailed() && !derived_values.is_empty() {
                     let derived = joined(derived_values, ", ", |value, f| {
                         self.value_name(fragment.id(), *value).fmt(f)?;
-                        if let Some(novarocks_physical_plan::ValueOrigin::Expr { expr, .. }) =
-                            fragment.values().get(value).map(|def| &def.origin)
+                        if let Some(novarocks_physical_plan::ValueOrigin::Expr {
+                            node: owner,
+                            root,
+                        }) = fragment.values().get(value).map(|def| &def.origin)
                         {
-                            write!(f, " := {}", self.expr(fragment, *expr))?;
+                            write!(f, " := {}", self.expr(fragment, *owner, *root))?;
                         }
                         Ok(())
                     });
@@ -1289,7 +1239,7 @@ impl TreeContext<'_> {
                 if !residuals.is_empty() {
                     out.push(format_args!(
                         "{pad}     predicates: {}",
-                        self.expressions(fragment, residuals, " AND ")
+                        self.expressions(fragment, node.id, residuals, " AND ")
                     ))?;
                 }
             }
@@ -1297,12 +1247,12 @@ impl TreeContext<'_> {
                 out.push(format_args!("{prefix}FILTER{stats}"))?;
                 out.push(format_args!(
                     "{pad}  predicate: {}",
-                    self.expressions(fragment, predicates, " AND ")
+                    self.expressions(fragment, node.id, predicates, " AND ")
                 ))?;
             }
             NodeKind::Project { expressions } => {
                 let items = joined(expressions, ", ", |(expression, value), f| {
-                    let expression = self.expr(fragment, *expression);
+                    let expression = self.expr(fragment, node.id, *expression);
                     let name = self.value_name(fragment.id(), *value);
                     ProjectExpressionDisplay { expression, name }.fmt(f)
                 });
@@ -1319,7 +1269,7 @@ impl TreeContext<'_> {
                             f,
                             ", group by: [{}]",
                             joined(group_by, ", ", |(expression, _), f| self
-                                .expr(fragment, *expression)
+                                .expr(fragment, node.id, *expression)
                                 .fmt(f))
                         )?;
                     }
@@ -1339,7 +1289,7 @@ impl TreeContext<'_> {
                             "{}({}{})",
                             function_text(&call.binding.function.function_id),
                             if call.distinct { "DISTINCT " } else { "" },
-                            self.expressions(fragment, &call.arguments, ", ")
+                            self.expressions(fragment, node.id, &call.arguments, ", ")
                         )
                     });
                     out.push(format_args!("{pad}  aggregations: {aggregates}"))?;
@@ -1357,9 +1307,9 @@ impl TreeContext<'_> {
                     write!(
                         f,
                         "{} {} {}",
-                        self.expr(fragment, key.left),
+                        self.expr(fragment, node.id, key.left),
                         if key.null_safe { "<=>" } else { "=" },
-                        self.expr(fragment, key.right)
+                        self.expr(fragment, node.id, key.right)
                     )
                 });
                 out.push(format_args!(
@@ -1372,7 +1322,7 @@ impl TreeContext<'_> {
                 if let Some(residual) = residual {
                     out.push(format_args!(
                         "{pad}  other: {}",
-                        self.expr(fragment, *residual)
+                        self.expr(fragment, node.id, *residual)
                     ))?;
                 }
                 if let Some(scope) = condition.scope_keys() {
@@ -1380,9 +1330,9 @@ impl TreeContext<'_> {
                         write!(
                             f,
                             "{} {} {}",
-                            self.expr(fragment, key.left),
+                            self.expr(fragment, node.id, key.left),
                             if key.null_safe { "<=>" } else { "=" },
-                            self.expr(fragment, key.right)
+                            self.expr(fragment, node.id, key.right)
                         )
                     });
                     out.push(format_args!("{pad}  scope: [{equalities}]"))?;
@@ -1398,7 +1348,7 @@ impl TreeContext<'_> {
                 if let Some(predicate) = predicate {
                     out.push(format_args!(
                         "{pad}  on: {}",
-                        self.expr(fragment, *predicate)
+                        self.expr(fragment, node.id, *predicate)
                     ))?;
                 }
             }
@@ -1425,7 +1375,7 @@ impl TreeContext<'_> {
                 });
                 out.push(format_args!(
                     "{prefix}SORT BY [{}]{suffix}{stats}",
-                    sort_items_pair(self, fragment, partitions, order_by)
+                    sort_items_pair(self, fragment, node.id, partitions, order_by)
                 ))?;
             }
             NodeKind::TopN {
@@ -1443,7 +1393,7 @@ impl TreeContext<'_> {
                 // rather than leaving a reader to infer it.
                 out.push(format_args!(
                     "{prefix}{label} (limit={limit}, offset={offset}) [{}]{stats}",
-                    sort_items_text(self, fragment, order_by)
+                    sort_items_text(self, fragment, node.id, order_by)
                 ))?;
             }
             NodeKind::Limit { limit, offset } => {
@@ -1462,20 +1412,34 @@ impl TreeContext<'_> {
                 out.push(format_args!("{prefix}LIMIT ({parts}){stats}"))?;
             }
             NodeKind::Window(spec) => {
-                let functions = joined(&spec.expressions, "; ", |expression, f| {
-                    self.expr(fragment, expression.expression).fmt(f)
+                let functions = joined(&spec.calls, "; ", |call, f| {
+                    write!(
+                        f,
+                        "{}({}",
+                        function_text(&call.binding.function_id),
+                        if call.distinct { "DISTINCT " } else { "" }
+                    )?;
+                    joined(&call.arguments, ", ", |root, f| {
+                        ExprTextAt {
+                            text: self.expr(fragment, node.id, *root),
+                            depth: 1,
+                        }
+                        .fmt(f)
+                    })
+                    .fmt(f)?;
+                    f.write_str(")")
                 });
                 out.push(format_args!("{prefix}WINDOW [{functions}]{stats}"))?;
                 if self.detailed() && !spec.partition_by.is_empty() {
                     out.push(format_args!(
                         "{pad}  partition by: [{}]",
-                        sort_items_text(self, fragment, &spec.partition_by)
+                        sort_items_text(self, fragment, node.id, &spec.partition_by)
                     ))?;
                 }
                 if self.detailed() && !spec.order_by.is_empty() {
                     out.push(format_args!(
                         "{pad}  order by: [{}]",
-                        sort_items_text(self, fragment, &spec.order_by)
+                        sort_items_text(self, fragment, node.id, &spec.order_by)
                     ))?;
                 }
             }
@@ -1531,12 +1495,12 @@ impl TreeContext<'_> {
             NodeKind::GenerateSeries { start, stop, step } => {
                 let step = text(|f| match step {
                     None => f.write_str("1"),
-                    Some(expression) => self.expr(fragment, *expression).fmt(f),
+                    Some(expression) => self.expr(fragment, node.id, *expression).fmt(f),
                 });
                 out.push(format_args!(
                     "{prefix}GENERATE_SERIES({}, {}, {step}){stats}",
-                    self.expr(fragment, *start),
-                    self.expr(fragment, *stop)
+                    self.expr(fragment, node.id, *start),
+                    self.expr(fragment, node.id, *stop)
                 ))?;
             }
             NodeKind::TableFunction {
@@ -1552,6 +1516,9 @@ impl TreeContext<'_> {
             }
             NodeKind::AssertOneRow(_) => {
                 out.push(format_args!("{prefix}ASSERT ONE ROW{stats}"))?;
+            }
+            NodeKind::WriteLayoutKey { .. } => {
+                out.push(format_args!("{prefix}WRITE_LAYOUT_KEY{stats}"))?;
             }
             NodeKind::PositionShard(spec) => {
                 out.push(format_args!(

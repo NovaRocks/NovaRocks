@@ -18,7 +18,7 @@
 //! Sole source-order borrowed definition visitor, shared with package encoding.
 //! It owns no decoder, binding resolver, runtime capability or capacity grant.
 use crate as p;
-use novarocks_type_contract::CompileCheckpoints;
+use novarocks_type_contract::{CompileCheckpoints, CompileControlError};
 
 #[derive(Clone, Copy, Debug)]
 pub enum FragmentDefinitionSource<'source> {
@@ -27,11 +27,17 @@ pub enum FragmentDefinitionSource<'source> {
         value: &'source p::ValueDef,
     },
     Expression {
+        node: p::NodeId,
         id: p::ExprId,
         expression: &'source p::ExprNode,
     },
+    ExpressionRequest {
+        node: p::NodeId,
+        definition: p::ExprId,
+        request: &'source p::PhysicalCallRequest,
+    },
     Request {
-        definition: p::PhysicalCallDefinition,
+        definition: p::PhysicalCallSite,
         request: &'source p::PhysicalCallRequest,
     },
 }
@@ -45,7 +51,7 @@ pub enum FragmentDefinitionSource<'source> {
 /// occurs here. The first callback/control error stops the original traversal.
 /// Constants/cuts and relational binding lifecycles remain their own authors;
 /// request rows preserve relational definition keys without rebuilding them.
-pub fn visit_fragment_definitions_observed<'source, E>(
+pub fn visit_fragment_definitions_observed<'source, E: From<CompileControlError>>(
     fragment: &'source p::Fragment,
     work: &mut CompileCheckpoints<'_>,
     capture: impl FnMut(FragmentDefinitionSource<'source>, &mut CompileCheckpoints<'_>) -> Result<(), E>,
@@ -56,7 +62,7 @@ pub fn visit_fragment_definitions_observed<'source, E>(
 /// Single source-order author. The package callbacks keep their original
 /// header admission, CountPass/FillPass operations and completed checkpoints.
 /// The public observation wrapper delegates without adding another step.
-fn visit_fragment_definitions<'source, E>(
+fn visit_fragment_definitions<'source, E: From<CompileControlError>>(
     fragment: &'source p::Fragment,
     work: &mut CompileCheckpoints<'_>,
     mut capture: impl FnMut(
@@ -67,14 +73,31 @@ fn visit_fragment_definitions<'source, E>(
     for (id, value) in fragment.values() {
         capture(FragmentDefinitionSource::Value { id: *id, value }, work)?;
     }
-    for (id, expression) in fragment.expressions().iter() {
-        capture(
-            FragmentDefinitionSource::Expression {
-                id: *id,
-                expression,
-            },
-            work,
-        )?;
+    for node in fragment.nodes().values() {
+        let unit = node.expressions.as_ref();
+        work.step().map_err(E::from)?;
+        if let Some(unit) = unit {
+            for expression in unit.definitions() {
+                capture(
+                    FragmentDefinitionSource::Expression {
+                        node: node.id,
+                        id: expression.id,
+                        expression,
+                    },
+                    work,
+                )?;
+            }
+            for (definition, request) in unit.requests() {
+                capture(
+                    FragmentDefinitionSource::ExpressionRequest {
+                        node: node.id,
+                        definition: *definition,
+                        request,
+                    },
+                    work,
+                )?;
+            }
+        }
     }
     for (definition, request) in fragment.call_requests().entries() {
         capture(

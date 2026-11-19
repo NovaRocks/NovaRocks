@@ -1240,6 +1240,7 @@ mod tests {
 mod original_gc_failure_tests {
     use super::*;
     use novarocks_failure_contract::FailureProjection;
+    use novarocks_query_application::api::ExecutionFailurePresentation;
     use novarocks_state_store_api::{StateStore, StateStoreError, StateStoreErrorKind};
     use novarocks_state_store_runtime::RunFailure;
     use novarocks_state_store_testkit::testing::InMemoryStateStore;

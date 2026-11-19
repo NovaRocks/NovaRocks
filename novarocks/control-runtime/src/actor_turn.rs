@@ -21,6 +21,7 @@ mod actor_failure_publication;
 mod execution_detach;
 mod failed_custodian_timer;
 mod poller_observation;
+mod receiver_failed;
 #[cfg(not(loom))]
 pub use poller_observation::{
     PollerObservation, PollerObservationSnapshot, PollerPhase, PollerTimerSnapshot,
@@ -469,6 +470,7 @@ struct Inbox<A: Actor> {
     mailbox: MailboxState,
     input_source: InputSourceMode,
     prefer_actor_source: bool,
+    owner_source_cursor: usize,
     inputs: BTreeMap<InputId, InputRecord>,
     standing_inputs: BTreeMap<StandingInputId, StandingInputRecord>,
     counts: [usize; 4],
@@ -498,8 +500,12 @@ impl<A: Actor> Inbox<A> {
     fn selected_source(&self) -> Option<ActorId> {
         match self.input_source {
             InputSourceMode::All => None,
-            InputSourceMode::Only(source) => Some(source),
-            InputSourceMode::Prefer(source) => self.mailbox.tail_from(source).map(|_| source),
+            InputSourceMode::Only(source) | InputSourceMode::OnlyWithOwner { source, .. } => {
+                Some(source)
+            }
+            InputSourceMode::Prefer(source) | InputSourceMode::PreferWithOwner { source, .. } => {
+                self.mailbox.tail_from(source).map(|_| source)
+            }
         }
     }
     fn ready_classes(&self, actor: ActorId) -> [bool; 4] {
@@ -511,6 +517,10 @@ impl<A: Actor> Inbox<A> {
                 |source| {
                     self.mailbox.has_ready_from(class, source)
                         || self.mailbox.has_ready_from(class, actor)
+                        || self
+                            .input_source
+                            .owner_source()
+                            .is_some_and(|owner| self.mailbox.has_ready_from(class, owner))
                 },
             )
         })
@@ -522,6 +532,22 @@ impl<A: Actor> Inbox<A> {
         let Some(source) = self.selected_source() else {
             return self.mailbox.pop(class);
         };
+        if let Some(owner) = self.input_source.owner_source()
+            && owner != actor
+            && owner != source
+        {
+            // Three original heads, constant work and bounded round-robin.
+            // The primary source/cut is unchanged even when owner ingress wins.
+            let sources = [source, actor, owner];
+            for offset in 0..sources.len() {
+                let index = (self.owner_source_cursor + offset) % sources.len();
+                if self.mailbox.has_ready_from(class, sources[index]) {
+                    self.owner_source_cursor = (index + 1) % sources.len();
+                    return self.mailbox.pop_from(class, sources[index]);
+                }
+            }
+            return None;
+        }
         let continuation = self.mailbox.has_ready_from(class, source);
         let own = self.mailbox.has_ready_from(class, actor);
         let chosen = match (continuation, own) {
@@ -2067,6 +2093,142 @@ impl<A: Actor> FailurePublicationSession<A> {
             withdrawn: false,
         })
     }
+    /// Publish a negative handoff to another owner's original prepaid control
+    /// or lifecycle role. The failure job, original source and destination
+    /// author are checked under the same inbox/ledger gates as the fill.
+    /// This grants neither business admission nor a new input position.
+    pub fn fill_standing(
+        &mut self,
+        target: &StandingInputObligation<A>,
+        author: Option<&InputAuthor>,
+        value: A::Input,
+    ) -> Result<InputId, (ActorTurnError, A::Input)> {
+        if !self.runtime.same_runtime(&target.runtime) || self.actor == target.actor {
+            return Err((ActorTurnError::PublicationTargetMismatch, value));
+        }
+        if !target.active {
+            return Err((ActorTurnError::UnknownStandingInput, value));
+        }
+        let source = match self.runtime.node(self.actor) {
+            Ok(node) => node,
+            Err(error) => return Err((error, value)),
+        };
+        let destination = match self.runtime.node(target.actor) {
+            Ok(node) => node,
+            Err(error) => return Err((error, value)),
+        };
+        if !Arc::ptr_eq(&destination.origin, &target.origin) {
+            return Err((ActorTurnError::EffectTicketOriginMismatch, value));
+        }
+        // Diagnostic clocks are foreign callbacks, just as on normal fills.
+        // Sample before taking either inbox or the ledger lock.
+        let observed = self.runtime.shared.observation.now();
+        // All two-inbox transactions use the same ActorId lock order.
+        let result = if self.actor < target.actor {
+            let mut source_inbox = source.inbox.lock().expect("source actor inbox lock");
+            let mut target_inbox = destination.inbox.lock().expect("target actor inbox lock");
+            self.fill_standing_locked(
+                (&source, &mut source_inbox),
+                (&destination, &mut target_inbox, target.standing_input_id),
+                author,
+                observed,
+                value,
+            )
+        } else {
+            let mut target_inbox = destination.inbox.lock().expect("target actor inbox lock");
+            let mut source_inbox = source.inbox.lock().expect("source actor inbox lock");
+            self.fill_standing_locked(
+                (&source, &mut source_inbox),
+                (&destination, &mut target_inbox, target.standing_input_id),
+                author,
+                observed,
+                value,
+            )
+        };
+        if result.is_ok() {
+            self.runtime
+                .shared
+                .state
+                .lock()
+                .expect("runtime scheduler lock")
+                .ready
+                .notify(target.actor)
+                .expect("live original role actor");
+            self.runtime.shared.changed.notify();
+        }
+        result
+    }
+
+    fn fill_standing_locked(
+        &self,
+        source: (&ActorCell<A>, &mut Inbox<A>),
+        target: (&ActorCell<A>, &mut Inbox<A>, StandingInputId),
+        author: Option<&InputAuthor>,
+        observed: Option<Tick>,
+        value: A::Input,
+    ) -> Result<InputId, (ActorTurnError, A::Input)> {
+        let target_scope = target.0.scope.current_scope();
+        let mut ledger = self
+            .scope
+            .runtime
+            .shared
+            .state
+            .lock()
+            .expect("runtime ledger lock");
+        let checked = (|| {
+            self.validate(source.0, source.1, &ledger, &target_scope)?;
+            let role = target
+                .1
+                .standing_inputs
+                .get(&target.2)
+                .ok_or(ActorTurnError::UnknownStandingInput)?;
+            if role.source != self.actor {
+                return Err(ActorTurnError::InputAuthorMismatch);
+            }
+            if !matches!(role.class, InputClass::Control | InputClass::Lifecycle) {
+                return Err(ActorTurnError::PublicationTargetMismatch);
+            }
+            if let Some(author) = author {
+                ActorRuntime::<A>::validate_input_author(
+                    target.0, target.1, &ledger, author, false, true,
+                )?;
+            }
+            let failed = ledger
+                .scopes
+                .get(&target_scope.id())
+                .ok_or(RuntimeError::UnknownScope)?
+                .failed();
+            Ok((Self::next_publication_action(source.1)?, failed))
+        })();
+        let (action, failed) = match checked {
+            Ok(checked) => checked,
+            Err(error) => return Err((error, value)),
+        };
+        let input =
+            target
+                .1
+                .fill_standing_input(target.2, failed, author, &mut ledger, observed, value)?;
+        source.1.failure_action_watermark = action.get();
+        self.runtime.shared.record(|| HistoryFact::FailurePublication {
+            target: source.0.history_target(),
+            actor_generation: self.generation,
+            financial_work: self.work,
+            financial_generation: match self.claim {
+                FailurePublicationOrigin::StartedCleanup { financial_generation, .. } => financial_generation,
+                FailurePublicationOrigin::SupervisorEffect { .. } => ledger.scopes
+                    .get(&self.work.scope).expect("validated original failure Work Scope").generation(),
+            },
+            action,
+            origin: match self.claim {
+                FailurePublicationOrigin::SupervisorEffect { input, action } =>
+                    novarocks_control_runtime_core::history::FailurePublicationHistoryOrigin::SupervisorEffect { input, action },
+                FailurePublicationOrigin::StartedCleanup { header, .. } =>
+                    novarocks_control_runtime_core::history::FailurePublicationHistoryOrigin::StartedCleanup { header },
+            },
+        });
+        Ok(input)
+    }
+
     pub fn commit_snapshot<T>(
         &mut self,
         target: &crate::publication::PublishedSnapshot<T>,
@@ -2647,6 +2809,7 @@ impl<A: Actor> ActorRuntime<A> {
                     mailbox: MailboxState::new(config.mailbox),
                     input_source: InputSourceMode::All,
                     prefer_actor_source: false,
+                    owner_source_cursor: 0,
                     inputs: BTreeMap::new(),
                     standing_inputs: BTreeMap::new(),
                     counts: [0; 4],
@@ -3444,6 +3607,7 @@ impl<A: Actor> ActorRuntime<A> {
                     {
                         if inbox.input_source.contending_source() != source.contending_source() {
                             inbox.prefer_actor_source = false;
+                            inbox.owner_source_cursor = 0;
                         }
                         inbox.input_source = source;
                     }

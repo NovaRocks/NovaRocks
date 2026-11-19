@@ -94,6 +94,17 @@ pub struct NativeIngressConfig {
     pub control_response_max_bytes: usize,
 }
 
+impl NativeIngressConfig {
+    pub fn message_limits(self) -> crate::TransportMessageLimits {
+        crate::TransportMessageLimits {
+            ordinary_request_max_bytes: self.ordinary_request_max_bytes,
+            ordinary_response_max_bytes: self.ordinary_response_max_bytes,
+            control_request_max_bytes: self.control_request_max_bytes,
+            control_response_max_bytes: self.control_response_max_bytes,
+        }
+    }
+}
+
 impl Default for NativeIngressConfig {
     fn default() -> Self {
         Self {

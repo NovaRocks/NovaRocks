@@ -15,7 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use novarocks_expression::StaticExprKind;
+use novarocks_expression_contract::{BinaryOperator, ExprId, ExprKind, RootScope};
+
 use super::*;
+use crate::test_units::PureUnitFixture;
 use arrow_schema::DataType;
 use novarocks_functions::{
     ArithmeticPrepareError, ConstantPolicy, EngineFunctionCatalogBuilder, FunctionId, FunctionKind,
@@ -23,23 +27,18 @@ use novarocks_functions::{
     PureImplementationDeclaration, PureImplementationId, PureKernelAbi,
 };
 use novarocks_local_program::{
-    KernelAbiVersion, ProgramChannelLayoutRole, ProgramChannelSite, ProgramExpressionArena,
-    ProgramExpressionRootSite, ProgramLexicalSource, ProgramNodeExpressionRole, ProgramNodeId,
-    ProgramUseRef, StaticExprKind,
+    KernelAbiVersion, ProgramChannelLayoutRole, ProgramChannelSite, ProgramNodeId,
 };
 use novarocks_physical_plan::{
-    BinaryOperator, ExprId, ExprKind, ExprNode, Fragment, FragmentBuilder, FragmentCuts,
-    FragmentId, FragmentPackageError, FragmentPackageInput, FragmentSink, FrozenFragmentCalls,
-    FrozenFragmentPruning, LiteralValue, NodeId, PhysicalExpressionRoots, PhysicalRootUses,
-    PipelineDopDomain, PlanVersionId, RequiredContracts, ResultField, ResultPort, ValueDef,
-    ValueId, ValueOrigin,
+    Fragment, FragmentBuilder, FragmentCuts, FragmentId, FragmentPackageError,
+    FragmentPackageInput, FragmentSink, FrozenFragmentPruning, NodeId, PipelineDopDomain,
+    PlanVersionId, RequiredContracts, ResultField, ResultPort, ValueDef, ValueId, ValueOrigin,
 };
 use novarocks_type_contract::{
-    ArithmeticOperator, ControlShape, DecimalOverflowPolicy, EvaluationDemand, EvaluationDomainId,
-    ExpressionControlFlow, ExpressionEffectContext, ExpressionEvaluationDomain,
-    ExpressionInvocation, ExpressionUseId, FunctionValueType, SemanticParameterError,
-    SemanticParameterId, SemanticParameterKey, SemanticParameterRef, SemanticParameterValue,
-    SemanticParameters, arithmetic_result_value_type_with_op,
+    ArithmeticOperator, ControlShape, DecimalOverflowPolicy, EvaluationDemand, ExpressionUseId,
+    FunctionValueType, SemanticParameterError, SemanticParameterId, SemanticParameterKey,
+    SemanticParameterRef, SemanticParameterValue, SemanticParameters,
+    arithmetic_result_value_type_with_op,
 };
 use std::num::NonZeroUsize;
 
@@ -121,6 +120,7 @@ fn reference(id: u32) -> SemanticParameterRef {
     }
 }
 struct Fixture {
+    constants: novarocks_physical_plan::ConstantPools,
     fragment: Fragment,
     root: ExprId,
     left: ExprId,
@@ -138,6 +138,7 @@ fn fixture(
     result_nullable: bool,
     nested_mod: bool,
 ) -> Fixture {
+    let mut constants = novarocks_physical_plan::ConstantPools::empty();
     let mut builder = FragmentBuilder::new(FragmentId::new(113));
     builder
         .add_values(
@@ -146,47 +147,34 @@ fn fixture(
             Box::default(),
         )
         .unwrap();
-    // Physical literals expose Int64, not narrower signed payload variants.
-    // Narrow inputs therefore use accurately declared nullable NULL sources.
-    // Nonmonotonic definition and node IDs cannot supply child order or local slots.
     let mut outputs = Vec::new();
     let mut projected = Vec::new();
-    for (expr, value, ty, number) in [
-        (
-            901,
-            100,
-            FunctionValueType::new(DataType::Int64, false),
-            999,
-        ),
-        (17, 103, left_type.clone(), 12),
-        (402, 109, right_type.clone(), 0),
+    // Sparse value identities and actual source positions are preserved. Definitions are node-local and dense.
+    for (value, ty, number) in [
+        (100, FunctionValueType::new(DataType::Int64, false), 999),
+        (103, left_type.clone(), 12),
+        (109, right_type.clone(), 0),
     ] {
-        let expr = ExprId::new(expr);
-        let value = ValueId::new(value);
-        builder
-            .insert_expression(ExprNode {
-                id: expr,
-                owner: NodeId::new(44),
-                lambda_scope: None,
-                ty: ty.clone(),
-                kind: ExprKind::Literal(if ty.nullable() {
-                    LiteralValue::Null
-                } else {
-                    LiteralValue::Int64(number)
-                }),
-            })
+        let kind = if ty.nullable() {
+            crate::test_constants::null(&mut constants, &ty, options().constants)
+        } else {
+            crate::test_constants::i64(&mut constants, &ty, number, options().constants)
+        };
+        let root = builder
+            .fixture_value_root(NodeId::new(44), ty.clone(), kind)
             .unwrap();
+        let value = ValueId::new(value);
         builder
             .insert_value(ValueDef {
                 id: value,
                 ty,
                 origin: ValueOrigin::Expr {
                     node: NodeId::new(44),
-                    expr,
+                    root,
                 },
             })
             .unwrap();
-        projected.push((expr, value));
+        projected.push((root, value));
         outputs.push(value);
     }
     builder
@@ -197,68 +185,70 @@ fn fixture(
             outputs.into_boxed_slice(),
         )
         .unwrap();
-    let left = ExprId::new(300);
-    let right = ExprId::new(31);
-    for (id, ty, value) in [
-        (left, left_type.clone(), ValueId::new(103)),
-        (right, right_type.clone(), ValueId::new(109)),
-    ] {
-        builder
-            .insert_expression(ExprNode {
-                id,
-                owner: NodeId::new(0),
-                lambda_scope: None,
-                ty,
-                kind: ExprKind::Value(value),
-            })
-            .unwrap();
-    }
+    let left = builder
+        .fixture_definition(
+            NodeId::new(0),
+            left_type.clone(),
+            ExprKind::Value(ValueId::new(103)),
+        )
+        .unwrap();
+    let right = builder
+        .fixture_definition(
+            NodeId::new(0),
+            right_type.clone(),
+            ExprKind::Value(ValueId::new(109)),
+        )
+        .unwrap();
     let (effective_left, effective_type, child) = if nested_mod {
-        let child = ExprId::new(932);
-        let mut ty = arithmetic_result_value_type_with_op(
+        let ty = arithmetic_result_value_type_with_op(
             &left_type,
             &right_type,
             ArithmeticOperator::Modulo,
         )
+        .unwrap()
+        .with_nullable(true)
         .unwrap();
-        ty = ty.with_nullable(true).unwrap();
-        builder
-            .insert_expression(ExprNode {
-                id: child,
-                owner: NodeId::new(0),
-                lambda_scope: None,
-                ty: ty.clone(),
-                kind: ExprKind::Binary {
+        let child = builder
+            .fixture_definition(
+                NodeId::new(0),
+                ty.clone(),
+                ExprKind::Binary {
                     left,
                     right,
                     op: BinaryOperator::Modulo,
                     decimal_overflow_policy: policy,
                     allow_throw_exception: Some(reference(0)),
                 },
-            })
+            )
             .unwrap();
         (child, ty, Some(child))
     } else {
         (left, left_type, None)
     };
-    let mut result =
-        arithmetic_result_value_type_with_op(&effective_type, &right_type, op).unwrap();
-    result = result.with_nullable(result_nullable).unwrap();
-    let root = ExprId::new(940);
-    builder
-        .insert_expression(ExprNode {
-            id: root,
-            owner: NodeId::new(0),
-            lambda_scope: None,
-            ty: result.clone(),
-            kind: ExprKind::Binary {
+    let result = arithmetic_result_value_type_with_op(&effective_type, &right_type, op)
+        .unwrap()
+        .with_nullable(result_nullable)
+        .unwrap();
+    let root = builder
+        .fixture_definition(
+            NodeId::new(0),
+            result.clone(),
+            ExprKind::Binary {
                 left: effective_left,
                 right,
                 op: physical_operator(op),
                 decimal_overflow_policy: policy,
                 allow_throw_exception: Some(reference(u32::MAX)),
             },
-        })
+        )
+        .unwrap();
+    let ordinal = builder
+        .fixture_occurrence(
+            NodeId::new(0),
+            root,
+            EvaluationDemand::Value,
+            RootScope::Port(0),
+        )
         .unwrap();
     let output = ValueId::new(117);
     builder
@@ -267,7 +257,7 @@ fn fixture(
             ty: result,
             origin: ValueOrigin::Expr {
                 node: NodeId::new(0),
-                expr: root,
+                root: ordinal,
             },
         })
         .unwrap();
@@ -275,10 +265,13 @@ fn fixture(
         .add_project(
             NodeId::new(0),
             NodeId::new(44),
-            Box::from([(root, output)]),
+            Box::from([(ordinal, output)]),
             Box::from([output]),
         )
         .unwrap();
+    for node in [NodeId::new(44), NodeId::new(0)] {
+        builder.finish_fixture_unit(node, &Control).unwrap();
+    }
     let fragment = builder
         .finish_definition(
             NodeId::new(0),
@@ -292,6 +285,7 @@ fn fixture(
         )
         .unwrap();
     Fixture {
+        constants,
         fragment,
         root,
         left,
@@ -301,86 +295,7 @@ fn fixture(
         policy,
     }
 }
-fn uses(fragment: &Fragment) -> PhysicalRootUses {
-    fn visit(
-        fragment: &Fragment,
-        definition: ExprId,
-        domain: EvaluationDomainId,
-        demand: EvaluationDemand,
-        next: &mut u32,
-        output: &mut Vec<ExpressionInvocation<ExprId>>,
-    ) -> ExpressionUseId {
-        let use_id = ExpressionUseId::new(*next);
-        *next += 19;
-        let children = match &fragment.expressions().get(definition).unwrap().kind {
-            ExprKind::Binary { left, right, .. } => vec![*left, *right],
-            ExprKind::Literal(_) | ExprKind::Value(_) => vec![],
-            _ => panic!("fixture declares only exact eager intrinsic definitions"),
-        };
-        let arguments = children
-            .into_iter()
-            .map(|child| {
-                visit(
-                    fragment,
-                    child,
-                    domain,
-                    EvaluationDemand::Value,
-                    next,
-                    output,
-                )
-            })
-            .collect::<Vec<_>>();
-        output.push(ExpressionInvocation {
-            context: ExpressionEffectContext {
-                use_id,
-                domain,
-                demand,
-            },
-            definition,
-            control: ControlShape::Eager,
-            arguments: arguments.into_boxed_slice(),
-        });
-        use_id
-    }
-    let domain = EvaluationDomainId::new(u32::MAX);
-    let mut next = 7;
-    let mut invocations = Vec::new();
-    let roots = PhysicalExpressionRoots::try_new(fragment, &Control).unwrap();
-    let bindings = roots
-        .sites()
-        .iter()
-        .map(|(&site, root)| {
-            (
-                site,
-                visit(
-                    fragment,
-                    root.expr,
-                    domain,
-                    root.demand,
-                    &mut next,
-                    &mut invocations,
-                ),
-            )
-        })
-        .collect();
-    let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
-            id: domain,
-            parent: None,
-            guard: None,
-        }],
-        invocations,
-        fragment.expressions(),
-        CompilePhase::Validate,
-        &Control,
-    )
-    .unwrap();
-    PhysicalRootUses::try_new(fragment, flow, bindings, &Control).unwrap()
-}
 fn package_input(fixture: &Fixture) -> FragmentPackageInput {
-    let expression_uses = uses(&fixture.fragment);
-    let calls = FrozenFragmentCalls::try_new(&fixture.fragment, &expression_uses, vec![], &Control)
-        .unwrap();
     let mut parameters = vec![(
         SemanticParameterId::new(u32::MAX),
         SemanticParameterValue::AllowThrowException(fixture.allow),
@@ -415,10 +330,9 @@ fn package_input(fixture: &Fixture) -> FragmentPackageInput {
     FragmentPackageInput {
         version: PlanVersionId::try_new([113; 16]).unwrap(),
         required: RequiredContracts::default(),
-        constants: novarocks_physical_plan::ConstantPools::empty(),
+        constants: fixture.constants.clone(),
         fragment: fixture.fragment.clone(),
-        expression_uses,
-        calls,
+        statement_constant_policy: options().constants,
         pruning: FrozenFragmentPruning::try_new(fixture.fragment.id(), vec![], &Control).unwrap(),
         cuts: FragmentCuts::default(),
         result: Some(result),
@@ -426,6 +340,7 @@ fn package_input(fixture: &Fixture) -> FragmentPackageInput {
         scans: BTreeMap::new(),
         writes: BTreeMap::new(),
         annotations: Box::default(),
+        layouts: Default::default(),
     }
 }
 fn package(fixture: &Fixture) -> Arc<FragmentPackage> {
@@ -447,23 +362,22 @@ fn compile(
         control,
     )
 }
-fn root() -> ProgramExpressionRootSite {
-    ProgramExpressionRootSite::Node {
-        node: ProgramNodeId::new(2),
-        role: ProgramNodeExpressionRole::ProjectOutput { expression: 0 },
-    }
+fn unit(program: &novarocks_local_program::LocalProgram) -> &novarocks_expression::CompiledExprSet {
+    let novarocks_local_program::ProgramNodeKind::Project { exprs, .. } =
+        program.graph().nodes()[program.graph().root().index()].kind()
+    else {
+        panic!("actual arithmetic Project")
+    };
+    program.unit(exprs[0].unit).unwrap()
 }
-fn occurrence(program: &novarocks_local_program::LocalProgram) -> ProgramUseRef {
-    ProgramUseRef {
-        arena: ProgramExpressionArena::Main,
-        use_id: program
-            .checked()
-            .channels()
-            .expressions()
-            .resolved_calls()
-            .snapshot()
-            .bindings()[&root()],
-    }
+fn occurrence(program: &novarocks_local_program::LocalProgram) -> ExpressionUseId {
+    unit(program).roots()[0].use_id
+}
+fn source_unit(source: &FragmentPackage) -> &novarocks_expression_contract::BoundExprSet {
+    source.fragment().nodes()[&NodeId::new(0)]
+        .expressions
+        .as_ref()
+        .unwrap()
 }
 #[test]
 fn signed_arithmetic_compiles_exact_ordered_types_policies_scopes_and_lexical_sources() {
@@ -509,20 +423,15 @@ fn signed_arithmetic_compiles_exact_ordered_types_policies_scopes_and_lexical_so
                 let source = package(&fixture);
                 let program = compile(source.clone(), &functions, &Control).unwrap();
                 let occurrence = occurrence(&program);
-                let snapshot = program
-                    .checked()
-                    .channels()
-                    .expressions()
-                    .resolved_calls()
-                    .snapshot();
-                let flow = &snapshot.flows()[&ProgramExpressionArena::Main];
-                let arena = &snapshot.roots().arenas()[&ProgramExpressionArena::Main];
-                let invocation = &flow.uses()[&occurrence.use_id];
+                let unit = unit(&program);
+                let flow = unit.control_flow();
+                let arena = unit.definitions();
+                let invocation = &flow.uses()[&occurrence];
                 assert_eq!(invocation.context.demand, EvaluationDemand::Value);
                 assert_eq!(invocation.control, ControlShape::Eager);
                 assert_eq!(invocation.arguments.len(), 2);
                 assert_eq!(
-                    source.expression_uses().flow().uses()[&occurrence.use_id].definition,
+                    source_unit(&source).control_flow().uses()[&occurrence].definition,
                     fixture.root
                 );
                 let StaticExprKind::PreparedArithmetic {
@@ -538,7 +447,7 @@ fn signed_arithmetic_compiles_exact_ordered_types_policies_scopes_and_lexical_so
                 assert_eq!(*operator, op);
                 assert_eq!(*decimal_overflow_policy, fixture.policy);
                 assert_eq!(*allow_throw_exception, fixture.allow);
-                let recipe = program.arithmetic_recipe(occurrence).unwrap();
+                let recipe = unit.recipes().arithmetic(occurrence).unwrap();
                 let mut expected =
                     arithmetic_result_value_type_with_op(&left_type, &right_type, op).unwrap();
                 expected = expected.with_nullable(true).unwrap();
@@ -560,10 +469,11 @@ fn signed_arithmetic_compiles_exact_ordered_types_policies_scopes_and_lexical_so
                 ] {
                     let child = &flow.uses()[&invocation.arguments[ordinal]];
                     assert_eq!(child.definition, local);
-                    assert_eq!(child.context.domain, invocation.context.domain);
+                    assert_eq!(child.context.region, invocation.context.region);
                     assert_eq!(child.context.demand, EvaluationDemand::Value);
                     assert_eq!(
-                        source.expression_uses().flow().uses()[&child.context.use_id].definition,
+                        source_unit(&source).control_flow().uses()[&child.context.use_id]
+                            .definition,
                         physical
                     );
                     let expected_source = ProgramChannelSite::Layout {
@@ -571,44 +481,30 @@ fn signed_arithmetic_compiles_exact_ordered_types_policies_scopes_and_lexical_so
                         role: ProgramChannelLayoutRole::NodeOutput,
                         ordinal: source_ordinal,
                     };
+                    let input = unit.input(child.context.use_id).unwrap();
+                    assert_eq!(input.ordinal, source_ordinal);
+                    assert!(matches!(
+                        arena.node(local).unwrap().kind(),
+                        StaticExprKind::Input
+                    ));
+                    let slot =
+                        program.graph().nodes()[1].output_layout().slots()[source_ordinal as usize];
                     assert_eq!(
-                        program.checked().slots().get(&ProgramUseRef {
-                            arena: ProgramExpressionArena::Main,
-                            use_id: child.context.use_id
-                        }),
-                        Some(&ProgramLexicalSource::Input(expected_source))
-                    );
-                    let StaticExprKind::SlotId(slot) = arena.node(local).unwrap().kind() else {
-                        panic!("the selected operand is a checked incoming slot")
-                    };
-                    assert_eq!(
-                        program.checked().channels().channel_slot(expected_source),
-                        Some(*slot)
+                        program
+                            .channels()
+                            .channel_slot(program.graph(), expected_source),
+                        Some(slot)
                     );
                     assert_ne!(slot.as_u32(), physical_value);
-                    assert!(
-                        program
-                            .arithmetic_recipe(ProgramUseRef {
-                                arena: ProgramExpressionArena::Main,
-                                use_id: child.context.use_id
-                            })
-                            .is_none()
-                    );
+                    assert!(unit.recipes().arithmetic(child.context.use_id).is_none());
                 }
-                assert!(snapshot.roots().sites().contains_key(&root()));
-                assert!(
-                    snapshot.flows()[&ProgramExpressionArena::Main].uses()[&occurrence.use_id]
-                        .arguments[0]
-                        != snapshot.flows()[&ProgramExpressionArena::Main].uses()
-                            [&occurrence.use_id]
-                            .arguments[1]
+                assert_eq!(unit.roots().len(), 1);
+                assert_ne!(
+                    flow.uses()[&occurrence].arguments[0],
+                    flow.uses()[&occurrence].arguments[1]
                 );
-                assert!(source.calls().entries().is_empty());
-                assert!(
-                    snapshot.roots().arenas()[&ProgramExpressionArena::Main]
-                        .node(invocation.definition)
-                        .is_some()
-                );
+                assert!(unit.calls().is_empty());
+                assert!(arena.node(invocation.definition).is_some());
             }
         }
     }
@@ -631,26 +527,16 @@ fn nested_signed_arithmetic_preserves_independent_scoped_switches_and_child_row_
         let source = package(&fixture);
         let program = compile(source.clone(), &functions, &Control).unwrap();
         let occurrence = occurrence(&program);
-        let snapshot = program
-            .checked()
-            .channels()
-            .expressions()
-            .resolved_calls()
-            .snapshot();
-        let flow = &snapshot.flows()[&ProgramExpressionArena::Main];
-        let invocation = &flow.uses()[&occurrence.use_id];
+        let unit = unit(&program);
+        let flow = unit.control_flow();
+        let invocation = &flow.uses()[&occurrence];
         let child = &flow.uses()[&invocation.arguments[0]];
         assert_eq!(
-            source.expression_uses().flow().uses()[&child.context.use_id].definition,
+            source_unit(&source).control_flow().uses()[&child.context.use_id].definition,
             fixture.child.unwrap()
         );
-        let outer = program.arithmetic_recipe(occurrence).unwrap();
-        let inner = program
-            .arithmetic_recipe(ProgramUseRef {
-                arena: ProgramExpressionArena::Main,
-                use_id: child.context.use_id,
-            })
-            .unwrap();
+        let outer = unit.recipes().arithmetic(occurrence).unwrap();
+        let inner = unit.recipes().arithmetic(child.context.use_id).unwrap();
         assert_eq!(outer.allow_throw_exception(), allow);
         assert_eq!(inner.allow_throw_exception(), !allow);
         assert_eq!(outer.left_type().data_type(), &DataType::Int8);
@@ -667,9 +553,7 @@ fn nested_signed_arithmetic_preserves_independent_scoped_switches_and_child_row_
         assert!(argument.for_use(child.context).unwrap().may_raise_row_error);
         // Use the actual checked occurrence edge. Both arithmetic operations
         // retain their own errors without fabricating a call token.
-        let composed = parent
-            .join_control_argument(argument, flow.shared_flow(), 0)
-            .unwrap();
+        let composed = parent.join_control_argument(argument, flow, 0).unwrap();
         assert!(
             composed
                 .for_use(invocation.context)
@@ -708,7 +592,7 @@ fn assert_arithmetic_failure(error: FragmentCompileError, expected: ArithmeticPr
         .downcast_ref::<crate::expressions::ExpressionLoweringError>()
         .unwrap();
     assert!(
-        matches!(error, crate::expressions::ExpressionLoweringError::Arithmetic(actual) if actual == &expected)
+        matches!(error, crate::expressions::ExpressionLoweringError::Unit(novarocks_expression::ExprCompileError::Arithmetic(actual)) if actual == &expected)
     );
 }
 #[test]
@@ -728,10 +612,8 @@ fn nullable_false_division_preserves_the_existing_arithmetic_result_contract() {
     // retains the existing nullable frozen binary arithmetic output contract.
     let source = package(&fixture);
     assert!(
-        !source
-            .fragment()
-            .expressions()
-            .get(fixture.root)
+        !source_unit(&source)
+            .definition(fixture.root)
             .unwrap()
             .ty
             .nullable()
@@ -763,7 +645,10 @@ fn floating_arithmetic_preserves_exact_prepared_types_and_policies() {
             layout.value_binding_at(0).unwrap().layout().data_type(),
             DataType::Float64
         ));
-        let recipe = program.arithmetic_recipe(occurrence(&program)).unwrap();
+        let recipe = unit(&program)
+            .recipes()
+            .arithmetic(occurrence(&program))
+            .unwrap();
         assert_eq!(recipe.operator(), ArithmeticOperator::Add);
         assert_eq!(recipe.left_type(), &ty);
         assert_eq!(recipe.right_type(), &ty);

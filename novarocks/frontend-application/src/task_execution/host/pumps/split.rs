@@ -327,6 +327,7 @@ impl SplitFailureRecord {
         Some(results.original_failure.as_ref()?.preparation_input())
     }
 
+    #[cfg(test)]
     pub(crate) fn take_failure(&self, reference: HostFailureRef) -> Option<TaskExecutionError> {
         let mut results = self.0.lock().expect("original split results");
         if results.selected_failure.as_ref()?.0 != reference {
@@ -930,10 +931,8 @@ fn split_payload_quote_includes_original_capacity_outside_wire_length() {
 async fn dormant_split_cleanup_keeps_the_original_provider_close_and_work_exit() {
     use crate::{
         query_execution::split_assignment_round::failure_observation_plan,
-        task_execution::{
-            blocking_io::tests::{OriginalExecutorsFixture, until},
-            status_intake::CountingWake,
-        },
+        task_execution::blocking_io::tests::{OriginalExecutorsFixture, until},
+        wake::CountingWake,
     };
     use novarocks_control_runtime::{
         completion::ReportSlot,

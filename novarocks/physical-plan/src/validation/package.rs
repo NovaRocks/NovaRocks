@@ -138,18 +138,20 @@ fn validate_package_core(
         }
         error => crate::FragmentPackageError::Constant(error),
     })?;
-    // Count the immutable control representation in the same package dynamic
-    // item bound. These counts are not a decoded-allocation or peak-byte model.
-    let control = &input.expression_uses;
-    usage.add_items(control.flow().domains().len());
-    usage.add_items(control.flow().use_reference_count());
-    usage.add_items(control.bindings().len());
-    usage.add_items(control.roots().sites().len());
+    // Unit-owned control representation is counted by add_fragment above.
     usage.add_items(semantic_items);
     usage.add_items(input.scans.len());
     for scan in input.scans.values() {
         usage.add_bytes(scan.retained_bytes());
         usage.add_items(scan.scan().assignments().len());
+    }
+    usage.add_items(input.layouts.len());
+    for layout in input.layouts.values() {
+        usage.add_items(layout.inputs().len());
+        usage.add_bytes(layout.inputs().len().saturating_mul(std::mem::size_of::<
+            novarocks_connector_contract::ConnectorWriteFieldToken,
+        >()));
+        usage.add_bytes(layout.payload().payload().len());
     }
     usage.add_items(input.writes.len());
     for write in input.writes.values() {
@@ -243,6 +245,11 @@ fn validate_package_core(
     );
     validate_package_scans(input, &mut errors);
     validate_package_writes(input, &mut errors);
+    super::graph::validate_write_layout_recipes(
+        &input.fragment,
+        input.layouts.iter().map(|(node, recipe)| (*node, recipe)),
+        &mut errors,
+    );
     if errors.is_empty() {
         Ok(())
     } else {

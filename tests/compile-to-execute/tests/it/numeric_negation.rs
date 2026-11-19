@@ -19,7 +19,9 @@ mod scalar {
         array::{Array, ArrayRef, Int8Array, Int16Array, Int32Array, Int64Array},
         datatypes::DataType,
     };
-    use novarocks_execution::exec::expr::compiled_program::CompiledExpressionInstance;
+    use novarocks_expression::CompiledExpressionInstance;
+    use novarocks_expression::testkit::PassThroughCallHost;
+    use novarocks_expression::{EvaluationInput, ExprEvaluationFailure};
     use novarocks_functions::*;
     use novarocks_sql_testkit::sql_source;
     use novarocks_test_compile_to_execute::programs::{batch, producer_root, programs};
@@ -80,9 +82,24 @@ mod scalar {
             let programs = programs(&source);
             let (program, root) = producer_root(&programs);
             let data = batch(&program, root, input.clone());
-            let mut frame =
-                CompiledExpressionInstance::try_new(program.clone(), root, &Control).unwrap();
-            let selected = frame.evaluate(&data, Selection::all(2), &Control).unwrap();
+            let mut frame = CompiledExpressionInstance::try_new(
+                program.unit(root.unit).unwrap().clone(),
+                root.root,
+                &Control,
+            )
+            .unwrap();
+            let selected = frame
+                .evaluate(
+                    EvaluationInput::Batch {
+                        batch: &data,
+                        source: None,
+                    },
+                    ScalarInvocationScope::new(Selection::all(2), Selection::all(2)),
+                    ScalarInvocationActivation::Activated,
+                    &Control,
+                    &mut PassThroughCallHost,
+                )
+                .unwrap();
             assert_eq!(selected.errors().len(), 1);
             assert_eq!(selected.errors()[0].selected_ordinal(), 0);
             assert_eq!(
@@ -93,7 +110,19 @@ mod scalar {
             assert_eq!(selected.values().null_count(), 1);
             let rows = [1];
             let sparse = frame
-                .evaluate(&data, Selection::try_sparse(2, &rows).unwrap(), &Control)
+                .evaluate(
+                    EvaluationInput::Batch {
+                        batch: &data,
+                        source: None,
+                    },
+                    {
+                        let selection = Selection::try_sparse(2, &rows).unwrap();
+                        ScalarInvocationScope::new(selection, selection)
+                    },
+                    ScalarInvocationActivation::Activated,
+                    &Control,
+                    &mut PassThroughCallHost,
+                )
                 .unwrap();
             assert_eq!(sparse.values().null_count(), 0);
             assert_eq!(
@@ -102,7 +131,19 @@ mod scalar {
             );
             assert_eq!(
                 frame
-                    .evaluate(&data, Selection::try_sparse(2, &[]).unwrap(), &Control)
+                    .evaluate(
+                        EvaluationInput::Batch {
+                            batch: &data,
+                            source: None
+                        },
+                        {
+                            let selection = Selection::try_sparse(2, &[]).unwrap();
+                            ScalarInvocationScope::new(selection, selection)
+                        },
+                        ScalarInvocationActivation::Activated,
+                        &Control,
+                        &mut PassThroughCallHost
+                    )
                     .unwrap()
                     .values()
                     .len(),
@@ -122,8 +163,24 @@ mod scalar {
             let programs = programs(&source);
             let (program, root) = producer_root(&programs);
             let data = batch(&program, root, Arc::new(Int8Array::from(vec![i8::MIN, 1])));
-            let mut frame = CompiledExpressionInstance::try_new(program, root, &Control).unwrap();
-            let out = frame.evaluate(&data, Selection::all(2), &Control).unwrap();
+            let mut frame = CompiledExpressionInstance::try_new(
+                program.unit(root.unit).unwrap().clone(),
+                root.root,
+                &Control,
+            )
+            .unwrap();
+            let out = frame
+                .evaluate(
+                    EvaluationInput::Batch {
+                        batch: &data,
+                        source: None,
+                    },
+                    ScalarInvocationScope::new(Selection::all(2), Selection::all(2)),
+                    ScalarInvocationActivation::Activated,
+                    &Control,
+                    &mut PassThroughCallHost,
+                )
+                .unwrap();
             if sql.contains("IF(") {
                 assert!(out.errors().is_empty(), "inactive MIN is not evaluated");
                 assert_eq!(out.values().null_count(), 0);
@@ -168,11 +225,24 @@ mod scalar {
         );
         let rows = [1];
         let selection = Selection::try_sparse(2, &rows).unwrap();
-        let mut successful =
-            CompiledExpressionInstance::try_new(program.clone(), root, &Control).unwrap();
+        let mut successful = CompiledExpressionInstance::try_new(
+            program.unit(root.unit).unwrap().clone(),
+            root.root,
+            &Control,
+        )
+        .unwrap();
         assert!(
             successful
-                .evaluate(&data, selection, &Control)
+                .evaluate(
+                    EvaluationInput::Batch {
+                        batch: &data,
+                        source: None
+                    },
+                    ScalarInvocationScope::new(selection, selection),
+                    ScalarInvocationActivation::Activated,
+                    &Control,
+                    &mut PassThroughCallHost
+                )
                 .unwrap()
                 .errors()
                 .is_empty()
@@ -201,9 +271,24 @@ mod scalar {
             }
         }
         let success = Trace::default();
-        let mut frame =
-            CompiledExpressionInstance::try_new(program.clone(), root, &Control).unwrap();
-        frame.evaluate(&data, selection, &success).unwrap();
+        let mut frame = CompiledExpressionInstance::try_new(
+            program.unit(root.unit).unwrap().clone(),
+            root.root,
+            &Control,
+        )
+        .unwrap();
+        frame
+            .evaluate(
+                EvaluationInput::Batch {
+                    batch: &data,
+                    source: None,
+                },
+                ScalarInvocationScope::new(selection, selection),
+                ScalarInvocationActivation::Activated,
+                &success,
+                &mut PassThroughCallHost,
+            )
+            .unwrap();
         let trace = success.events.into_inner().unwrap();
         for at in 0..trace.len() {
             for cause in [
@@ -219,16 +304,42 @@ mod scalar {
                     events: Mutex::new(Vec::new()),
                     refusal: Some((at, cause.clone())),
                 };
-                let mut frame =
-                    CompiledExpressionInstance::try_new(program.clone(), root, &Control).unwrap();
+                let mut frame = CompiledExpressionInstance::try_new(
+                    program.unit(root.unit).unwrap().clone(),
+                    root.root,
+                    &Control,
+                )
+                .unwrap();
                 assert_eq!(
-                    frame.evaluate(&data, selection, &control).unwrap_err(),
-                    cause
+                    frame
+                        .evaluate(
+                            EvaluationInput::Batch {
+                                batch: &data,
+                                source: None
+                            },
+                            ScalarInvocationScope::new(selection, selection),
+                            ScalarInvocationActivation::Activated,
+                            &control,
+                            &mut PassThroughCallHost
+                        )
+                        .unwrap_err(),
+                    ExprEvaluationFailure::Kernel(cause)
                 );
                 assert_eq!(*control.events.lock().unwrap(), trace[..=at]);
                 assert_eq!(
-                    frame.evaluate(&data, selection, &control).unwrap_err(),
-                    KernelFailure::InstanceFailed
+                    frame
+                        .evaluate(
+                            EvaluationInput::Batch {
+                                batch: &data,
+                                source: None
+                            },
+                            ScalarInvocationScope::new(selection, selection),
+                            ScalarInvocationActivation::Activated,
+                            &control,
+                            &mut PassThroughCallHost
+                        )
+                        .unwrap_err(),
+                    ExprEvaluationFailure::Kernel(KernelFailure::InstanceFailed)
                 );
                 assert_eq!(*control.events.lock().unwrap(), trace[..=at]);
             }
@@ -238,8 +349,7 @@ mod scalar {
 mod ordered {
     use arrow::datatypes::DataType;
     use novarocks_physical_plan::{
-        FunctionArgumentType, NodeKind, PhysicalCallDefinition, PhysicalCallSite,
-        StaticFunctionArgument,
+        FunctionArgumentType, NodeKind, PhysicalCallSite, StaticFunctionArgument,
     };
     use novarocks_sql_testkit::installed_builtin_owner_catalogue;
     use novarocks_sql_testkit::sql_source_with_semantics;
@@ -264,10 +374,7 @@ mod ordered {
                         node: node.id,
                         call: u32::try_from(ordinal).unwrap(),
                     };
-                    let request = fragment
-                        .call_requests()
-                        .get(PhysicalCallDefinition::Relational(site))
-                        .unwrap();
+                    let request = fragment.call_requests().get(site).unwrap();
                     let logical = request.logical_argument_count;
                     assert_eq!(
                         request.arguments.len() - logical,
@@ -299,8 +406,7 @@ mod ordered {
                         assert_eq!(call.order_by.len(), 1);
                         assert_eq!(
                             fragment
-                                .expressions()
-                                .get(call.order_by[0].expr)
+                                .root_expression(node.id, call.order_by[0].expr)
                                 .unwrap()
                                 .ty,
                             value_type.clone()

@@ -22,7 +22,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use crate::{
-    AggregatePhase, EdgeId, ExprId, Fragment, FragmentId, NodeId, NodeKind, PhysicalNode, ValueId,
+    AggregatePhase, EdgeId, Fragment, FragmentId, NodeId, NodeKind, PhysicalNode, RootOrdinal,
+    ValueId,
 };
 
 use novarocks_type_contract::{
@@ -708,7 +709,7 @@ impl SemanticTraceIndexes {
         fragment: &Fragment,
         node: &PhysicalNode,
         child: &PhysicalNode,
-        expressions: &[(ExprId, ValueId)],
+        expressions: &[(RootOrdinal, ValueId)],
         values: &[ValueId],
         budget: &mut SemanticTraceWorkBudget,
     ) -> Option<Vec<ValueId>> {
@@ -724,7 +725,7 @@ impl SemanticTraceIndexes {
             let mut index = ValueMappingIndex::default();
             for (expression, output) in expressions {
                 index.insert(
-                    crate::expression_value(fragment.expressions(), *expression),
+                    crate::expression_value(fragment, node.id, *expression),
                     *output,
                 );
             }

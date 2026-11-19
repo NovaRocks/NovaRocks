@@ -142,7 +142,7 @@ impl PreparedActorSend {
         &self,
     ) -> Vec<(
         SendKey,
-        std::sync::Weak<crate::task_execution::bridge::abort::AbortReceiptSlot>,
+        std::sync::Weak<crate::task_execution::host::port::abort::AbortReceiptSlot>,
     )> {
         self.reports.abort_receipts()
     }

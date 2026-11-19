@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#[cfg(test)]
+use crate::tests::unit_fixture::DefinitionFixture;
 use arrow_schema::{
     DECIMAL32_MAX_PRECISION, DECIMAL32_MAX_SCALE, DECIMAL64_MAX_PRECISION, DECIMAL64_MAX_SCALE,
     DECIMAL128_MAX_PRECISION, DECIMAL128_MAX_SCALE, DECIMAL256_MAX_PRECISION, DECIMAL256_MAX_SCALE,
@@ -452,6 +454,10 @@ fn fragment_cut_usage_core<P: TypeValidationPolicy>(
                 ]);
             }
         }
+        usage.add_items(cut.partitioning.routing_only.len());
+        usage.add_bytes(std::mem::size_of_val(
+            cut.partitioning.routing_only.as_ref(),
+        ));
         add_distribution_usage(&cut.partitioning.source, &mut usage);
         add_distribution_usage(&cut.partitioning.destination, &mut usage);
         for (ordinal, import) in cut.imports.iter().enumerate() {
@@ -500,6 +506,10 @@ fn fragment_cut_usage_core<P: TypeValidationPolicy>(
                 ]);
             }
         }
+        usage.add_items(cut.partitioning.routing_only.len());
+        usage.add_bytes(std::mem::size_of_val(
+            cut.partitioning.routing_only.as_ref(),
+        ));
         add_distribution_usage(&cut.partitioning.source, &mut usage);
         add_distribution_usage(&cut.partitioning.destination, &mut usage);
         for (ordinal, value) in cut.projection.iter().enumerate() {
@@ -747,7 +757,16 @@ fn plan_usage_core<P: TypeValidationPolicy>(
         plan.edges().len(),
         plan.runtime_filters().len(),
         plan.annotations().len(),
+        plan.write_layouts().len(),
     ]);
+    for recipe in plan.write_layouts().values() {
+        if usage.exhausted() {
+            break;
+        }
+        usage.add_items(recipe.inputs().len());
+        usage.add_bytes(std::mem::size_of_val(recipe.inputs()));
+        add_encoded_payload_usage(recipe.payload(), &mut usage);
+    }
     for fragment in plan.fragments().values() {
         if usage.exhausted() {
             break;
@@ -761,6 +780,7 @@ fn plan_usage_core<P: TypeValidationPolicy>(
         usage.add_item_counts([
             edge.source.projection.len(),
             edge.destination.receive_mapping.len(),
+            edge.partitioning.routing_only.len(),
             distribution_items(&edge.partitioning.source),
             distribution_items(&edge.partitioning.destination),
         ]);
@@ -888,7 +908,6 @@ fn fragment_usage_core<P: TypeValidationPolicy>(
     let mut usage = ResourceUsage::limited(MAX_FRAGMENT_DYNAMIC_ITEMS, MAX_FRAGMENT_DYNAMIC_BYTES);
     usage.add_item_counts([
         fragment.values().len(),
-        fragment.expressions().len(),
         fragment.nodes().len(),
         fragment.runtime_filters().len(),
     ]);
@@ -915,24 +934,72 @@ fn fragment_usage_core<P: TypeValidationPolicy>(
             policy,
         )?;
     }
-    for (id, expression) in fragment.expressions().iter() {
-        if usage.exhausted() {
-            return Ok(usage);
+    for node in fragment.nodes().values() {
+        let Some(unit) = &node.expressions else {
+            continue;
+        };
+        usage.add_item_counts([
+            unit.definitions().len(),
+            unit.ports().len(),
+            unit.roots().len(),
+            unit.root_use_ids().len(),
+            unit.control_flow().regions().len(),
+            unit.control_flow().use_reference_count(),
+            unit.claims().len(),
+            unit.requests().len(),
+        ]);
+        for port in unit.ports() {
+            usage.add_items(port.values.len());
+            for (value, ty) in &port.values {
+                if usage.exhausted() {
+                    return Ok(usage);
+                }
+                validate_value_type_core(
+                    ty,
+                    &format!(
+                        "{prefix}.nodes[{}].ports.value[{}]",
+                        node.id.get(),
+                        value.get()
+                    ),
+                    &mut usage,
+                    errors,
+                    policy,
+                )?;
+            }
         }
-        validate_value_type_core(
-            &expression.ty,
-            &format!("{prefix}.expressions[{}].type", id.get()),
-            &mut usage,
-            errors,
-            policy,
-        )?;
-        add_expression_usage_core(
-            &expression.kind,
-            &format!("{prefix}.expressions[{}]", id.get()),
-            &mut usage,
-            errors,
-            policy,
-        )?;
+        for expression in unit.definitions() {
+            if usage.exhausted() {
+                return Ok(usage);
+            }
+            let path = format!(
+                "{prefix}.nodes[{}].expressions[{}]",
+                node.id.get(),
+                expression.id.get()
+            );
+            validate_value_type_core(
+                &expression.ty,
+                &format!("{path}.type"),
+                &mut usage,
+                errors,
+                policy,
+            )?;
+            add_expression_usage_core(&expression.kind, &path, &mut usage, errors, policy)?;
+        }
+        for claim in unit.claims().values() {
+            usage.add_items(claim.effects.environment.len());
+        }
+        for request in unit.requests().values() {
+            if usage.exhausted() {
+                return Ok(usage);
+            }
+            let result = add_call_request_usage(request, &mut usage, errors, &mut |_| {
+                Ok::<(), std::convert::Infallible>(())
+            });
+            match result {
+                Ok(()) => {}
+                Err(never) => match never {},
+            }
+        }
     }
     for (id, node) in fragment.nodes() {
         if usage.exhausted() {
@@ -1017,25 +1084,6 @@ fn add_expression_usage_core<P: TypeValidationPolicy>(
         }
         ExprKind::InList { list, .. } => usage.add_items(list.len()),
         ExprKind::Case { when_then, .. } => usage.add_items(when_then.len().saturating_mul(2)),
-        ExprKind::WindowCall {
-            function,
-            args,
-            function_order_by,
-            aggregate_binding,
-            ..
-        } => {
-            usage.add_item_counts([args.len(), function_order_by.len()]);
-            add_function_usage_core(function, &format!("{path}.function"), usage, errors, policy)?;
-            if let Some(binding) = aggregate_binding {
-                add_aggregate_binding_usage_core(
-                    binding,
-                    &format!("{path}.aggregate_binding"),
-                    usage,
-                    errors,
-                    policy,
-                )?;
-            }
-        }
         _ => {}
     };
     Ok(())
@@ -1259,8 +1307,30 @@ fn add_node_usage_core<P: TypeValidationPolicy>(
             usage.add_item_counts([
                 spec.partition_by.len(),
                 spec.order_by.len(),
-                spec.expressions.len(),
+                spec.calls.len(),
             ]);
+            for (ordinal, call) in spec.calls.iter().enumerate() {
+                if usage.exhausted() {
+                    return Ok(());
+                }
+                usage.add_item_counts([call.arguments.len(), call.order_by.len()]);
+                add_function_usage_core(
+                    &call.binding,
+                    &format!("{path}.calls[{ordinal}].binding"),
+                    usage,
+                    errors,
+                    policy,
+                )?;
+                if let Some(binding) = &call.aggregate_binding {
+                    add_aggregate_binding_usage_core(
+                        binding,
+                        &format!("{path}.calls[{ordinal}].aggregate_binding"),
+                        usage,
+                        errors,
+                        policy,
+                    )?;
+                }
+            }
         }
         NodeKind::SetOp { input_mappings, .. } => {
             usage.add_items(input_mappings.len());
@@ -1387,6 +1457,9 @@ fn add_node_usage_core<P: TypeValidationPolicy>(
                     }
                 }
             }
+        }
+        NodeKind::WriteLayoutKey { key_inputs, .. } => {
+            usage.add_items(key_inputs.len().saturating_add(1));
         }
         NodeKind::PositionShard(spec) => {
             usage.add_items(spec.inputs.len());
@@ -3031,7 +3104,7 @@ fn add_call_request_table_usage_with<E>(
             .entries()
             .len()
             .saturating_mul(std::mem::size_of::<(
-                crate::PhysicalCallDefinition,
+                crate::PhysicalCallSite,
                 crate::PhysicalCallRequest,
             )>()),
     );
@@ -3045,7 +3118,7 @@ fn add_call_request_table_usage_with<E>(
     Ok(())
 }
 pub(crate) fn validate_call_request_source_observed(
-    requests: &[(crate::PhysicalCallDefinition, crate::PhysicalCallRequest)],
+    requests: &[(crate::PhysicalCallSite, crate::PhysicalCallRequest)],
     capacity: usize,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), crate::CallRequestError> {
@@ -3057,7 +3130,7 @@ pub(crate) fn validate_call_request_source_observed(
         capacity
             .saturating_add(requests.len())
             .saturating_mul(std::mem::size_of::<(
-                crate::PhysicalCallDefinition,
+                crate::PhysicalCallSite,
                 crate::PhysicalCallRequest,
             )>()),
     );
@@ -3137,7 +3210,7 @@ mod system_relation_resource_tests {
             },
         )
         .unwrap();
-        b.finish_definition(
+        b.finish_fixture_definition(
             node,
             FragmentSink::Noop,
             PipelineDopDomain {

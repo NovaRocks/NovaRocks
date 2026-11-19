@@ -18,7 +18,6 @@
 use super::filter_conjunction_actual_sql_compiler_tests::compiler_results_with_declared_read_fields;
 use super::sql_test_source::sql_source_with_declared_fields;
 use arrow::datatypes::{DataType, Field};
-use novarocks_physical_plan::ExprKind;
 use novarocks_sql::compiler::SqlAuthoredPhysicalPlan;
 fn fields(nullable: bool) -> Vec<Field> {
     vec![
@@ -40,16 +39,18 @@ fn running_fields() -> Vec<Field> {
 fn inspect(source: &SqlAuthoredPhysicalPlan) -> usize {
     let mut n = 0;
     for (fragment_id, fragment) in source.plan().fragments() {
-        for (definition, node) in fragment.expressions().iter() {
-            if let ExprKind::WindowCall {
-                function,
-                aggregate_binding: Some(binding),
-                function_order_by,
-                frame,
-                args,
-                ..
-            } = &node.kind
-            {
+        for node in fragment.nodes().values() {
+            let novarocks_physical_plan::NodeKind::Window(spec) = &node.kind else {
+                continue;
+            };
+            for source in &spec.calls {
+                let function = &source.binding;
+                let Some(binding) = &source.aggregate_binding else {
+                    continue;
+                };
+                let args = &source.arguments;
+                let frame = &source.frame;
+                let function_order_by = &source.order_by;
                 if !matches!(
                     function.function_id.as_str(),
                     "builtin.aggregate/max_by/v1" | "builtin.aggregate/min_by/v1"
@@ -58,8 +59,8 @@ fn inspect(source: &SqlAuthoredPhysicalPlan) -> usize {
                 }
                 n += 1;
                 println!(
-                    "actual BY window fragment={fragment_id:?} definition={definition:?} function={function:?} binding={binding:?} args={args:?} frame={frame:?} function_order={function_order_by:?} result={:?}",
-                    node.ty
+                    "actual BY window fragment={fragment_id:?} node={:?} function={function:?} binding={binding:?} args={args:?} frame={frame:?} function_order={function_order_by:?} result={:?}",
+                    node.id, function.result_type
                 );
                 assert_eq!(args.len(), 2);
                 assert_eq!(function.kind, novarocks_functions::FunctionKind::Aggregate);
@@ -68,7 +69,7 @@ fn inspect(source: &SqlAuthoredPhysicalPlan) -> usize {
                     novarocks_physical_plan::AggregatePhase::Single
                 );
                 assert!(function_order_by.is_empty());
-                assert!(node.ty.nullable());
+                assert!(function.result_type.nullable());
             }
         }
     }

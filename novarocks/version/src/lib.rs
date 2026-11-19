@@ -91,6 +91,9 @@ impl StaticPlanInterpreter {
 /// Planner-declared row assertion violations change the package descriptor and
 /// plan contract revision, so those exact inputs separate their compatibility
 /// islands without an additional execution-only epoch change.
+/// Node-owned expression units and relation Window calls change the package
+/// descriptor and plan contract revision 27. Those exact-island inputs already
+/// distinguish the interpretation; the execution-only epoch remains 15.
 ///
 /// Plan revision 26 admits explicit physical NULL-list lifting to declared
 /// nullable JSON and UTF8 list elements. Earlier peers lack these prepared
@@ -108,7 +111,7 @@ impl StaticPlanInterpreter {
 ///
 /// RWM-7 retires COW vocabulary and freezes explicit writer W/T declarations,
 /// projected writer values and selected-assignment construction in the package
-/// descriptor and plan revision 25. Iceberg revision 10 also freezes the private
+/// descriptor and current plan revision 27. Iceberg revision 10 also freezes the private
 /// DATA input seal and removes its retired read proof. These exact components
 /// already separate the new interpretation from prior peers; epoch 15 remains
 /// unchanged because no additional execution-only boundary is unrepresented.

@@ -178,12 +178,12 @@ fn nonprovider_cases() -> Vec<(physical::ValueOrigin, wire::ValueOrigin)> {
         (
             physical::ValueOrigin::Expr {
                 node: physical::NodeId::new(u32::MAX),
-                expr: physical::ExprId::new(0),
+                root: novarocks_expression_contract::RootOrdinal::new(0),
             },
             wrap(wire::value_origin::Kind::Expression(
                 wire::ExpressionOrigin {
                     node_id: Some(u32::MAX),
-                    expr_id: Some(0),
+                    root_ordinal: Some(0),
                 },
             )),
         ),
@@ -483,13 +483,13 @@ fn value_origin_every_required_reference_kind_phase_and_writer_enum_refuses_with
         wrap(wire::value_origin::Kind::Expression(
             wire::ExpressionOrigin {
                 node_id: None,
-                expr_id: Some(0),
+                root_ordinal: Some(0),
             },
         )),
         wrap(wire::value_origin::Kind::Expression(
             wire::ExpressionOrigin {
                 node_id: Some(0),
-                expr_id: None,
+                root_ordinal: None,
             },
         )),
         wrap(wire::value_origin::Kind::NullExtended(

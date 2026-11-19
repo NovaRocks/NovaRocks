@@ -305,7 +305,10 @@ fn prepare_from_preflight(
     let provider = FrontendCompletionCustody::new();
     let controls = GovernedCtasControlReceiving::new();
     let sessions = Arc::new(Mutex::new(None));
-    let begin = WriteBeginReceiving::new(sessions.clone());
+    let begin = WriteBeginReceiving::for_statement(
+        sessions.clone(),
+        Arc::clone(input.context.execution().session_property_inputs()),
+    );
     let publication_id = LakePublicationId::new_v7();
     let attempt = DmlPublicationAttempt::new(
         publication_id,
@@ -540,6 +543,13 @@ impl CtasSource {
             return Poll::Ready(());
         }
         if self.seal.is_none() {
+            if let Some(error) = self
+                .tail
+                .as_mut()
+                .and_then(|tail| tail.poll_supervision_failure(cx))
+            {
+                self.fail(governed_query_execution_error(error));
+            }
             let Some(session) = self.session() else {
                 self.seal_settled = true;
                 return Poll::Ready(());
@@ -952,6 +962,14 @@ impl CtasSource {
                     }
                 }
                 Phase::Bind => {
+                    if let Some(error) = self
+                        .tail
+                        .as_mut()
+                        .and_then(|tail| tail.poll_supervision_failure(cx))
+                    {
+                        self.fail(governed_query_execution_error(error));
+                        continue;
+                    }
                     // Only the lease-validated ACTUAL seal can authorize this
                     // pure bind and consume the retained terminal resolver.
                     if self.seal_needed.is_none()
@@ -1036,6 +1054,14 @@ impl CtasSource {
                 }
                 Phase::Publish => {
                     if !self.publish.started {
+                        if let Some(error) = self
+                            .tail
+                            .as_mut()
+                            .and_then(|tail| tail.poll_supervision_failure(cx))
+                        {
+                            self.fail(governed_query_execution_error(error));
+                            continue;
+                        }
                         if self.check_cancel(&cancellation) {
                             continue;
                         }

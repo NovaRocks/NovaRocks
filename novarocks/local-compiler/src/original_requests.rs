@@ -18,15 +18,16 @@
 //! The compiler delegates its original request materialization to the shared
 //! physical-plan author; only its nominal error projection belongs here.
 use crate::expressions::ExpressionLoweringError;
+use novarocks_expression_contract::PhysicalCallRequest;
 #[cfg(test)]
 use novarocks_functions::ConstantPolicy;
 #[cfg(test)]
 use novarocks_functions::FunctionArgument;
 use novarocks_functions::MAX_CALL_EFFECT_ARGUMENTS;
+use novarocks_physical_plan::ConstantPools;
 pub(crate) use novarocks_physical_plan::MaterializedCallRequest;
 #[cfg(test)]
 use novarocks_physical_plan::StaticFunctionArgument;
-use novarocks_physical_plan::{ConstantPools, PhysicalCallRequest};
 use novarocks_type_contract::CompileCheckpoints;
 #[cfg(test)]
 use novarocks_type_contract::{CompileControlError, FunctionValueType};

@@ -398,8 +398,13 @@ impl ConnectorExecutionRoleBindingFactory for IcebergExecutionRoleBindingFactory
             // frontend's: it decodes the handles it is given and encodes the
             // fragments it produces, and holds no commit authority at all.
             Arc::new(IcebergWriteHandleDecoder::new(adapter.clone())),
-            Arc::new(IcebergWriteFragmentEncoder::new(adapter)),
-        );
+            Arc::new(IcebergWriteFragmentEncoder::new(adapter.clone())),
+        )
+        .with_write_layout(Arc::new(
+            crate::commit::partition_key::IcebergWriteLayoutExecution::new(
+                adapter.binding().clone(),
+            ),
+        ));
         ConnectorExecutionRoleBinding::try_new(properties.clone(), Some(read), Some(write))
             .map_err(ConnectorMaterializationError::from)
     }
@@ -457,12 +462,10 @@ mod tests {
     fn writer_handle() -> IcebergWriterHandle {
         IcebergWriterHandle::try_new_data(
             table_facts(),
-            IcebergWriterOutput::try_new(
+            IcebergWriterOutput::for_test(
                 IcebergFileFormat::Parquet,
                 parquet::basic::Compression::SNAPPY,
-                None,
-            )
-            .expect("output"),
+            ),
             IcebergDataBranchRecipe::try_new(None, Vec::new(), Vec::new(), Vec::new(), false)
                 .expect("recipe")
                 .with_write_input_identity(
@@ -836,6 +839,7 @@ mod tests {
             .decode_commit_fragment(
                 &ValidatedCommitFragment::parse(raw, FieldPath::root("commit_fragment"))
                     .expect("canonical carrier"),
+                &crate::commit::write_stack::codec::test_fragment_decode_author(),
             )
             .expect("the frontend decodes the fragments it receives");
         assert_eq!(

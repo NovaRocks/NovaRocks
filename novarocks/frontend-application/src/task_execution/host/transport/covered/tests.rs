@@ -25,25 +25,22 @@ use crate::{
     },
     native::{data_runtime::FrontendDataRuntime, task_transport::tests::Loopback},
     query_execution::native_execution_adapter::source_cohort::tests as wc,
-    task_execution::{
-        bridge::root_control::RootControlRequests,
-        host::{
-            custody::{TransportRetirements, tests::WithdrawalInbox},
-            failure_publication::FailurePublications,
-            funding::AttemptHostFunding,
-            observations::{
-                ObservationBudget, OrderedObservationInput,
-                backing::{
-                    OBSERVATION_BACKING_BYTES, ObservationBackingQuote, PaidObservationMetadata,
-                },
-                credits::{OBSERVATION_WINDOW_BYTES, ObservationCredits},
-                host_turn::OrderedObservationHost,
-                read_progress::ReadProgressInput,
-                source::BoundObservationSource,
-                tests::ManualClock,
+    task_execution::host::{
+        custody::{TransportRetirements, tests::WithdrawalInbox},
+        funding::AttemptHostFunding,
+        observations::{
+            ObservationBudget, OrderedObservationInput,
+            backing::{
+                OBSERVATION_BACKING_BYTES, ObservationBackingQuote, PaidObservationMetadata,
             },
-            transport::ActorTransportExecutor,
+            credits::{OBSERVATION_WINDOW_BYTES, ObservationCredits},
+            host_turn::OrderedObservationHost,
+            read_progress::ReadProgressInput,
+            source::BoundObservationSource,
+            tests::ManualClock,
         },
+        port::root_control::RootControlRequests,
+        transport::ActorTransportExecutor,
     },
 };
 use novarocks_attempt_protocol::{
@@ -69,7 +66,10 @@ use novarocks_types::{
 use novarocks_workload_control::{CancellationReason, WorkClass, WorkError, WorkRequest};
 use std::{
     num::NonZeroU64,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -561,14 +561,7 @@ async fn run_installed_subscription(saturate_ordinary: bool) {
     let progress_id = progress_position.id();
     let progress = ReadProgressInput::new(registration, participation, progress_position)
         .with_backing(Some(metadata.pin()));
-    let requests = RootControlRequests::new(
-        root.clone(),
-        Arc::new(FailurePublications::new(
-            registration.clone(),
-            root.activation(),
-            &scope,
-        )),
-    );
+    let requests = RootControlRequests::new(root.clone());
     let source = BoundObservationSource::new(
         root.clone(),
         requests.clone(),
@@ -594,7 +587,7 @@ async fn run_installed_subscription(saturate_ordinary: bool) {
     )
     .unwrap();
     root.bind_reply_author(reply_author);
-    requests.bind_ingress(&ingress);
+    requests.bind_ingress(&ingress).unwrap();
     let weak_ingress = ingress.weak();
     assert!(matches!(
         refused.bind(
@@ -635,6 +628,13 @@ async fn run_installed_subscription(saturate_ordinary: bool) {
     );
     let membership_registry = Arc::new(MembershipRegistry::new());
     let queue_parent = payer.id();
+    let changed_role = sources.map(|sources| {
+        Mutex::new(standing(
+            source_id(sources.qa),
+            InputClass::Ordinary,
+            parent,
+        ))
+    });
     let ordinary = sources.map(|sources| {
         let (startup, witness) = AttemptStartupSource::new(
             registration.clone(),
@@ -659,6 +659,10 @@ async fn run_installed_subscription(saturate_ordinary: bool) {
             (progress_id, inbox.source()),
             (membership_id, source_id(sources.membership)),
             (capacity_id, source_id(sources.capacity)),
+            (
+                changed_role.as_ref().unwrap().lock().unwrap().id(),
+                source_id(sources.qa),
+            ),
         ];
         (
             (startup, capacity, membership),
@@ -705,7 +709,8 @@ async fn run_installed_subscription(saturate_ordinary: bool) {
                 startup,
                 capacity: capacity_source,
                 membership,
-                owner_controls: None,
+
+                local_exit: None,
                 ordered_observations: Some(
                     OrderedObservationHost::new(ingress.clone()).with_read_progress([progress]),
                 ),
@@ -721,6 +726,7 @@ async fn run_installed_subscription(saturate_ordinary: bool) {
         }
     };
     if let Some((witness, _, _, _)) = &ordinary {
+        witness.release_legacy_run(runtime);
         drive();
         for _ in 0..2 {
             assert!(runtime.poll_one(Tick(1)).unwrap());
@@ -745,7 +751,13 @@ async fn run_installed_subscription(saturate_ordinary: bool) {
     };
     let eof_observed = Cell::new(false);
     let next_fact = || {
-        while let Some((envelope, input)) = inbox.try_commit_envelope() {
+        while let Some((envelope, input)) = {
+            let original = inbox.try_commit_envelope();
+            if let Some(role) = &changed_role {
+                role.lock().unwrap().retire_ready_after_exit().unwrap();
+            }
+            original
+        } {
             let AttemptInput::Executor(fact) = input else {
                 panic!("expected an original subscription fact");
             };
@@ -817,7 +829,7 @@ async fn run_installed_subscription(saturate_ordinary: bool) {
     let filled_ordinary = || {
         let (_, _, _, roles) = ordinary.as_ref().unwrap();
         let rows = ordinary_inventory();
-        assert_eq!(rows.len(), 3);
+        assert_eq!(rows.len(), 4);
         assert_eq!(rows.len(), mailbox[InputClass::Ordinary.index()]);
         for &(id, source) in roles {
             let row = rows.iter().find(|row| row.standing_input_id == id).unwrap();
@@ -875,6 +887,14 @@ async fn run_installed_subscription(saturate_ordinary: bool) {
         wait_target = Some((registrant.id(), denial.wait_target()));
         drop(blocker);
         assert_eq!(ledger.capacity_waiter_count(), 0);
+        changed_role.as_ref().unwrap().lock().unwrap().fill(FrontendInput::Attempt(Box::new(AttemptInput::Port(
+            novarocks_coordination_contract::LogicalToAttempt {
+                activation: root.activation(),
+                body: novarocks_coordination_contract::LogicalToAttemptBody::PreReadyReplacementChanged {
+                    token: novarocks_coordination_contract::AttemptRequestToken::new(NonZeroU64::new(2).unwrap()),
+                },
+            },
+        )))).unwrap();
         // The actual stream takes its first original credit before the native
         // opening poll. Leave its genuine resume hint in the paid role.
         tokio::time::timeout(wait, async {
@@ -1074,6 +1094,11 @@ async fn run_installed_subscription(saturate_ordinary: bool) {
             .reap_observed_header(&command.retirement_observer())
             .unwrap()
     );
+    if let Some(role) = &changed_role {
+        let mut original = role.lock().unwrap();
+        assert!(original.retire_ready_after_exit().unwrap());
+        original.close_after_exit().unwrap();
+    }
     exit.request_close().unwrap();
     tokio::time::timeout(wait, async {
         while !sources_retired.load(Ordering::Acquire) {

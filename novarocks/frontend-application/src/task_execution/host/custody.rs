@@ -27,7 +27,7 @@ use crate::native::apply_send_owner::{
 use novarocks_control_runtime::{
     completion::ReportSlot,
     exit_custody::{ExitCustody, ExitCustodyError, ExitCustodyPhase, ExitObligation},
-    exit_work::{ExitWorkError, PanicSink, run_blocking},
+    exit_work::{ExitWorkError, PanicSink, run_blocking, run_future},
     obligation::{ReservationObligation, StepRegistration},
     reported_work::ReportedWork,
     transaction::{RuntimeError, ScopeHandle},
@@ -349,10 +349,12 @@ fn disposal_work(
 type HostDisposalCapture<T> = Arc<Mutex<Option<ManuallyDrop<T>>>>;
 type HostDisposalFactory<T, F> = fn(ExitObligation, HostDisposalCapture<T>, fn(T), PanicSink) -> F;
 
-/// Owns an original host capture until its credentialed blocking disposal
-/// returns. A rejected handoff or a work that never starts keeps the capture
-/// here, including when Tokio drops its unstarted closure.
-#[must_use = "observe the original blocking disposal and retire its Work"]
+/// Owns an original host capture until its credentialed disposal returns.
+/// Rich destructors use the blocking launch; first-party metadata returns may
+/// await the same original inventory through the asynchronous launch. A
+/// rejected handoff or never-started work keeps the capture here, including
+/// when Tokio drops its unstarted closure.
+#[must_use = "observe the original disposal and retire its Work"]
 pub(crate) struct HostDisposal<T> {
     role: Arc<OriginalRole<Result<(), ExitWorkError>>>,
     _capture: HostDisposalCapture<T>,
@@ -379,6 +381,24 @@ fn host_disposal_work<T>(
     move || work.run()
 }
 
+type HostFutureBodyFactory<T, F, B> = fn(HostDisposalCapture<T>, fn(T) -> F) -> B;
+
+async fn host_future_body<T, F>(body: HostDisposalCapture<T>, close: fn(T) -> F)
+where
+    T: Send + 'static,
+    F: Future<Output = ()> + Send + 'static,
+{
+    let original = {
+        body.lock()
+            .expect("original metadata return capture")
+            .take()
+    };
+    close(ManuallyDrop::into_inner(
+        original.expect("same original metadata return"),
+    ))
+    .await;
+}
+
 impl<T: Send + 'static> HostDisposal<T> {
     pub(crate) fn start(
         runtime: &Handle,
@@ -402,6 +422,64 @@ impl<T: Send + 'static> HostDisposal<T> {
             role,
             _capture: capture,
         })
+    }
+
+    /// Only first-party passive metadata returns use this mode. Rich Drop,
+    /// provider close and Native IO continue through the blocking launch.
+    pub(crate) fn start_future<F>(
+        runtime: &Handle,
+        original: ReportedWork,
+        observer: ConsumerId,
+        capture: T,
+        close: fn(T) -> F,
+    ) -> Result<Self, (CustodyRefusal, T)>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let panic = PanicSink::new();
+        let (role, exit) = match OriginalRole::new(original, observer, panic.clone()) {
+            Ok(original) => original,
+            Err(refused) => return Err((refused, capture)),
+        };
+        let capture = Arc::new(Mutex::new(Some(ManuallyDrop::new(capture))));
+        // Construct the obligated wrapper BEFORE carrier handoff. A dropped,
+        // never-polled task cannot consume the stable original capture or
+        // manufacture a successful callback/Join.
+        let body = host_future_body(Arc::clone(&capture), close);
+        let work = run_future(exit, body, panic);
+        match catch_unwind(AssertUnwindSafe(|| runtime.spawn(work))) {
+            Ok(join) => role.install_join(join),
+            Err(cause) => role.record_handoff_failure(cause),
+        }
+        Ok(Self {
+            role,
+            _capture: capture,
+        })
+    }
+
+    pub(crate) fn future_backing_layouts<F>(
+        _close: fn(T) -> F,
+    ) -> Result<
+        [std::alloc::Layout; 6],
+        novarocks_type_contract::owned_resources::layout::LayoutResourceError,
+    >
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        use std::alloc::Layout;
+        fn body_layouts<T, F, B>(_: HostFutureBodyFactory<T, F, B>) -> [Layout; 2]
+        where
+            F: Future<Output = ()>,
+            B: Future<Output = ()>,
+        {
+            [
+                Layout::new::<B>(),
+                Layout::new::<novarocks_control_runtime::exit_work::ObligatedFuture<B>>(),
+            ]
+        }
+        let [record, exit, panic, capture, _] = Self::backing_layouts()?;
+        let [body, carrier] = body_layouts(host_future_body::<T, F>);
+        Ok([record, exit, panic, capture, body, carrier])
     }
 
     pub(crate) fn poll_complete(&self, cx: &mut Context<'_>) -> Poll<Result<(), CustodyError>> {

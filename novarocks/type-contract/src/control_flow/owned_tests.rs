@@ -46,9 +46,9 @@ impl PureCompileControl for Control {
         }
     }
 }
-fn domain() -> ExpressionEvaluationDomain {
-    ExpressionEvaluationDomain {
-        id: EvaluationDomainId::new(u32::MAX),
+fn region() -> ExpressionEvaluationRegion {
+    ExpressionEvaluationRegion {
+        id: EvaluationRegionId::new(u32::MAX),
         parent: None,
         guard: None,
     }
@@ -57,7 +57,7 @@ fn invocation() -> ExpressionInvocation<u32> {
     ExpressionInvocation {
         context: ExpressionEffectContext {
             use_id: ExpressionUseId::new(0),
-            domain: domain().id,
+            region: region().id,
             demand: crate::EvaluationDemand::Value,
         },
         definition: 17,
@@ -79,9 +79,9 @@ fn run(
     let out = (|| {
         let mut w = CompileCheckpoints::try_new(&c, CompilePhase::Validate)?;
         let ds = if duplicate {
-            vec![domain(), domain()]
+            vec![region(), region()]
         } else {
-            vec![domain()]
+            vec![region()]
         };
         let out = ExpressionControlFlow::try_new_in(
             ds,
@@ -113,7 +113,7 @@ fn original_empty_arc_headers_and_actual_duplicate_insert_completion_are_indepen
             // Three original publication operations now construct guarded
             // immutable payloads; use their actual public Arc requests.
             arc_layout(Layout::new::<
-                ControlFlowOwned<BTreeMap<EvaluationDomainId, ExpressionEvaluationDomain>>,
+                ControlFlowOwned<BTreeMap<EvaluationRegionId, ExpressionEvaluationRegion>>,
             >())
             .unwrap()
             .size()
@@ -173,7 +173,7 @@ fn known_map_and_arc_admission_refuses_before_pending_control_or_source_operatio
             }
             let mut observed = None;
             let out = ExpressionControlFlow::try_new_in(
-                vec![domain()],
+                vec![region()],
                 vec![invocation()],
                 &Definitions(Box::from([17])),
                 &mut |facts| {

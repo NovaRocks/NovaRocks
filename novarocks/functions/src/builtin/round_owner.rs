@@ -342,7 +342,7 @@ impl RoundOwner {
         }
         if !input.environment.is_empty()
             || !matches!(input.proof_scope, CallProofScope::Unconditional)
-                && input.proof_scope != CallProofScope::Domain(input.context.domain)
+                && input.proof_scope != input.context.proof_scope()
         {
             return Err(FunctionBindingError::InvalidBinding(
                 "round has no environment dependencies and requires an exact proof scope".into(),
@@ -377,7 +377,7 @@ impl RoundOwner {
             || input.kind != FunctionKind::Scalar
             || contract.function_id() != input.function_id
             || !std::ptr::eq(contract.selected(), input.selected)
-            || contract.context() != input.context
+            || novarocks_type_contract::CallEffectContext::from(contract.context()) != input.context
             || contract.decimal_overflow_policy() != input.decimal_overflow_policy
             || !input.environment.is_empty()
         {
@@ -416,7 +416,7 @@ mod tests {
     };
     use arrow_schema::{DataType, Field};
     use novarocks_type_contract::{
-        CompileControlError, EvaluationDemand, EvaluationDomainId, ExpressionEffectContext,
+        CompileControlError, EvaluationDemand, EvaluationRegionId, ExpressionEffectContext,
         ExpressionUseId, SemanticParameterId, SemanticParameterKey, SemanticParameterRef,
         SemanticParameters, ValueLogicalType,
     };
@@ -429,7 +429,7 @@ mod tests {
     fn context() -> ExpressionEffectContext {
         ExpressionEffectContext {
             use_id: ExpressionUseId::new(41),
-            domain: EvaluationDomainId::new(7),
+            region: EvaluationRegionId::new(7),
             demand: EvaluationDemand::Value,
         }
     }
@@ -451,7 +451,7 @@ mod tests {
         policy: DecimalOverflowPolicy,
     ) -> CallEffectInput<'a> {
         CallEffectInput {
-            context: context(),
+            context: (context()).into(),
             argument_uses: crate::CallArgumentUses::SelectedChannels(uses),
             function_id: owner.declaration.function_id(),
             kind: FunctionKind::Scalar,
@@ -791,7 +791,7 @@ mod tests {
         .unwrap();
         let canonical = fresh.prepared().contract().clone();
         let mut wrong = exact;
-        wrong.proof_scope = CallProofScope::Domain(EvaluationDomainId::new(99));
+        wrong.proof_scope = CallProofScope::Region(EvaluationRegionId::new(99));
         assert!(
             owner
                 .validate_and_refine(wrong, crate::binding_test_control())
@@ -809,7 +809,11 @@ mod tests {
                 .is_err()
         );
         wrong = exact;
-        wrong.context.use_id = ExpressionUseId::new(99);
+        wrong.context = novarocks_type_contract::ExpressionEffectContext {
+            use_id: ExpressionUseId::new(99),
+            ..wrong.context.expression().unwrap()
+        }
+        .into();
         assert!(
             owner
                 .prepare_scalar(wrong, canonical.clone(), crate::binding_test_control())
@@ -831,7 +835,7 @@ mod tests {
                 .is_err()
         );
         let mut domain = exact;
-        domain.proof_scope = CallProofScope::Domain(context().domain);
+        domain.proof_scope = CallProofScope::Region(context().region);
         assert_eq!(
             owner
                 .validate_and_refine(domain, crate::binding_test_control())

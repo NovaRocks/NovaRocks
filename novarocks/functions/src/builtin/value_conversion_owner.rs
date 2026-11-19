@@ -351,10 +351,6 @@ pub(super) fn prepared_for_test_with_policy(
     tests::prepare(source, target, policy)
 }
 
-#[cfg(test)]
-#[path = "value_conversion_owner_tests.rs"]
-mod tests;
-
 impl ValueConversionOwner {
     fn refine_selected_core(
         &self,
@@ -372,7 +368,7 @@ impl ValueConversionOwner {
                 return Err(FunctionBindingError::UnknownFunction.into());
             }
             let scope = matches!(input.proof_scope, CallProofScope::Unconditional)
-                || input.proof_scope == CallProofScope::Domain(input.context.domain);
+                || input.proof_scope == input.context.proof_scope();
             let environment = input.environment.is_empty();
             work.step().map_err(FunctionEffectOwnerError::Control)?;
             if !scope || !environment {
@@ -404,7 +400,8 @@ impl ValueConversionOwner {
                 && input.kind == FunctionKind::Scalar
                 && contract.function_id() == input.function_id
                 && std::ptr::eq(contract.selected(), input.selected)
-                && contract.context() == input.context
+                && novarocks_type_contract::CallEffectContext::from(contract.context())
+                    == input.context
                 && contract.decimal_overflow_policy() == input.decimal_overflow_policy
                 && contract.effects() == &self.call_effects(input)
                 && input.environment.is_empty();
@@ -438,3 +435,6 @@ impl ValueConversionOwner {
 #[cfg(test)]
 #[path = "value_conversion_array_common_tests.rs"]
 mod array_common_tests;
+
+#[cfg(test)]
+mod tests;

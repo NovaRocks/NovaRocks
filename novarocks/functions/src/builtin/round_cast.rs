@@ -575,9 +575,4 @@ fn read_leaf(
 }
 
 #[cfg(test)]
-#[path = "round_cast_tests.rs"]
 mod tests;
-
-#[cfg(test)]
-#[path = "round_cast_arrow_tests.rs"]
-mod arrow_tests;

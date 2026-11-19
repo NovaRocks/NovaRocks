@@ -173,13 +173,9 @@ compiler_cause!(crate::channels::ChannelLoweringError);
 compiler_cause!(crate::expressions::ExpressionLoweringError);
 compiler_cause!(novarocks_local_program::ProgramCompileError);
 compiler_cause!(novarocks_local_program::BindingRequirementsCompileError);
-compiler_cause!(novarocks_local_program::ProgramControlFlowError);
-compiler_cause!(novarocks_local_program::ProgramRootBindingError);
 compiler_cause!(novarocks_local_program::ProgramResolvedCallsError);
-compiler_cause!(novarocks_local_program::ProgramExpressionTypeError);
 compiler_cause!(novarocks_local_program::ValuesCompileError);
 compiler_cause!(novarocks_local_program::ProgramChannelTypeError);
-compiler_cause!(novarocks_local_program::ProgramLexicalBindingError);
 compiler_cause!(novarocks_local_program::LocalProgramCompileError);
 
 impl FragmentCreationError<std::convert::Infallible> {
@@ -345,54 +341,6 @@ impl<H> novarocks_type_contract::ValueSchemaCreationFactory<H> for NoFactory {
     }
 }
 
-pub(crate) fn publish_argument_types<H>(
-    types: Vec<novarocks_type_contract::FunctionArgumentType>,
-    mut creation: Option<&mut dyn ValueSchemaCreationScope<H>>,
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<
-    novarocks_type_contract::FunctionArgumentTypes,
-    novarocks_local_program::ProgramCreationFailure<std::convert::Infallible, H>,
-> {
-    use novarocks_local_program::ProgramCreationFailure as Failure;
-    use novarocks_type_contract::{
-        FunctionArgumentType, FunctionArgumentTypes, ValueTypeStorageLifetime,
-    };
-    if let Some(c) = crate::creation::borrow_scope(&mut creation) {
-        if types.capacity() != types.len() && !types.is_empty() {
-            let layout = Layout::array::<FunctionArgumentType>(types.len())
-                .map_err(|_| Failure::Resource(LayoutResourceError::Arithmetic))?;
-            work.flush()?;
-            c.request_layout(layout).map_err(Failure::Creator)?;
-        }
-        if !types.is_empty() {
-            let layout =
-                FunctionArgumentTypes::storage_allocation_layout().map_err(Failure::Resource)?;
-            work.flush()?;
-            c.request_layout(layout).map_err(Failure::Creator)?;
-        }
-    }
-    let storage = creation
-        .as_ref()
-        .map_or_else(ValueTypeStorageLifetime::pure, |c| c.storage_lifetime());
-    Ok(FunctionArgumentTypes::from_boxed_in(
-        types.into_boxed_slice(),
-        storage,
-    ))
-}
-// Closed publisher failures have no semantic Owner case to erase or guess.
-pub(crate) fn argument_types_failure<H>(
-    e: novarocks_local_program::ProgramCreationFailure<std::convert::Infallible, H>,
-) -> FragmentCreationError<H> {
-    use novarocks_local_program::ProgramCreationFailure as Failure;
-    match e {
-        Failure::Control(c) => FragmentCreationError::Control(c),
-        Failure::Creator(c) => FragmentCreationError::Creator(c),
-        Failure::Resource(c) => FragmentCreationError::Resource(c),
-        Failure::Capacity(source) => program_publication_failure(source).into(),
-        Failure::Owner(never) => match never {},
-    }
-}
-
 /// Borrow the optional real scope for one synchronous operation. The caller's
 /// longer scope lifetime does not extend this mutable borrow across a loop.
 pub(crate) fn borrow_scope<'borrow, H>(
@@ -401,6 +349,40 @@ pub(crate) fn borrow_scope<'borrow, H>(
     match scope {
         Some(scope) => Some(&mut **scope),
         None => None,
+    }
+}
+
+impl<H> From<novarocks_constant_contract::ConstantTableError> for FragmentCreationError<H> {
+    fn from(error: novarocks_constant_contract::ConstantTableError) -> Self {
+        Self::from(novarocks_physical_plan::ConstantReferenceError::from(error))
+    }
+}
+
+impl<H> From<crate::expressions::ExpressionCreationFailure<H>> for FragmentCreationError<H> {
+    fn from(error: crate::expressions::ExpressionCreationFailure<H>) -> Self {
+        match error {
+            crate::expressions::ExpressionCreationFailure::Control(c) => Self::Control(c),
+            crate::expressions::ExpressionCreationFailure::Creator(c) => Self::Creator(c),
+            crate::expressions::ExpressionCreationFailure::Resource(c) => Self::Resource(c),
+            crate::expressions::ExpressionCreationFailure::Owner(c) => c.into(),
+        }
+    }
+}
+
+impl<H> From<novarocks_expression_contract::UnitConstructionFailure<H>>
+    for FragmentCreationError<H>
+{
+    fn from(error: novarocks_expression_contract::UnitConstructionFailure<H>) -> Self {
+        use novarocks_expression_contract::UnitConstructionFailure as F;
+        match error {
+            F::Control(c) => Self::Control(c),
+            F::Creator(c) | F::Observer(c) => Self::Creator(c),
+            F::Resource(c) => Self::Resource(c),
+            F::Owner(c) => Self::Compile(FragmentCompileError::Owner {
+                phase: "expression unit construction",
+                error: novarocks_failure_contract::SharedFailureCause::new(c),
+            }),
+        }
     }
 }
 
@@ -540,37 +522,5 @@ mod tests {
         ));
         assert!(types.is_empty());
         assert_eq!(types.capacity(), 0);
-    }
-    #[test]
-    fn independently_cloned_argument_types_keep_only_their_arena_creator() {
-        use novarocks_type_contract::{FunctionArgumentType, FunctionValueType};
-        let arena_drops = Arc::new(AtomicUsize::new(0));
-        let unrelated_drops = Arc::new(AtomicUsize::new(0));
-        let unrelated = ValueTypeStorageLifetime::held(Arc::new(Hold(unrelated_drops.clone())));
-        let control = Control(AtomicBool::new(false));
-        let mut request = |_: Layout| Ok::<(), std::convert::Infallible>(());
-        let mut opaque = |_: usize| Ok::<(), std::convert::Infallible>(());
-        let mut creation = ValueSchemaCreation::new(
-            ValueTypeStorageLifetime::held(Arc::new(Hold(arena_drops.clone()))),
-            &mut request,
-            &mut opaque,
-        );
-        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::LowerProgram).unwrap();
-        let mut types = Vec::new();
-        reserve_vec(&mut types, 1, Some(&mut creation), &mut work).unwrap();
-        types.push(FunctionArgumentType::Value(FunctionValueType::new(
-            arrow_schema::DataType::Int64,
-            false,
-        )));
-        let types = publish_argument_types(types, Some(&mut creation), &mut work).unwrap();
-        let last = types.clone();
-        drop(types);
-        drop(creation);
-        drop(unrelated);
-        assert_eq!(unrelated_drops.load(Ordering::SeqCst), 1);
-        assert_eq!(arena_drops.load(Ordering::SeqCst), 0);
-        assert_eq!(last.len(), 1);
-        drop(last);
-        assert_eq!(arena_drops.load(Ordering::SeqCst), 1);
     }
 }

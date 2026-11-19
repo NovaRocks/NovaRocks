@@ -16,7 +16,7 @@
 // under the License.
 //! Actual corpus SQL binding, complete call request and ordered argument source.
 use super::approx_percentile_actual_sql_source_tests::approx_sql_source;
-use novarocks_physical_plan::{ExprKind, PhysicalCallDefinition};
+use novarocks_expression_contract::ExprKind;
 
 const CORPUS: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -26,17 +26,14 @@ fn source(sql: &str, expected_arity: usize) {
     let owner = approx_sql_source(sql);
     let mut count = 0;
     for fragment in owner.plan().fragments().values() {
-        for (id, expr) in fragment.expressions().iter() {
+        for (_source_node, unit, id, expr) in super::sql_test_source::unit_definitions(fragment) {
             let ExprKind::FunctionCall { function, args } = &expr.kind else {
                 continue;
             };
             if function.function_id.as_str() != "builtin.scalar/percentile_hash/v1" {
                 continue;
             }
-            let request = fragment
-                .call_requests()
-                .get(PhysicalCallDefinition::Expression(*id))
-                .unwrap();
+            let request = unit.requests().get(id).unwrap();
             assert_eq!(request.logical_argument_count, expected_arity);
             assert_eq!(request.arguments.len(), expected_arity);
             assert_eq!(args.len(), expected_arity);

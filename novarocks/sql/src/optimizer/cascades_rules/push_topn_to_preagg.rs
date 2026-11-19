@@ -162,6 +162,19 @@ fn rewrite_topn_preagg(
     {
         return Ok(Vec::new());
     }
+    for aggregate in [global, local] {
+        let Some(keys) = group_key_outputs(aggregate) else {
+            return Ok(Vec::new());
+        };
+        if keys.iter().any(|key| {
+            !novarocks_physical_plan::grouped_state_topn_key_supported(
+                novarocks_type_contract::OrderedComparisonAlgorithm::NativeScalarOrderV1,
+                &key.value_type,
+            )
+        }) {
+            return Ok(Vec::new());
+        }
+    }
     if !order_by_covers_group_by(&topn.items, global, &memo.scalars) {
         return Ok(Vec::new());
     }
@@ -679,6 +692,21 @@ mod tests {
         };
         assert_eq!(*kind, OpKind::Aggregate);
         assert_eq!(local_children, &vec![Pattern::Leaf]);
+    }
+
+    #[test]
+    fn apply_rejects_float_grouping_keys_outside_installed_domain() {
+        let mut fixture = preagg_memo();
+        for group in [fixture.local_group, fixture.global_group] {
+            let Operator::LogicalAggregate(aggregate) =
+                &mut fixture.memo.groups[group].logical_exprs[0].op
+            else {
+                panic!("expected aggregate");
+            };
+            aggregate.output_layout.group_key_columns[0].value_type =
+                novarocks_type_contract::FunctionValueType::new(DataType::Float64, false);
+        }
+        assert_does_not_fire(&mut fixture);
     }
 
     #[test]

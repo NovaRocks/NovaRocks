@@ -276,14 +276,12 @@ pub(crate) fn writer_providers()
 /// relation to a finish fragment's receiver. Returns the bytes and that
 /// receiver node.
 pub(crate) fn writer_producer_package() -> (Vec<u8>, u32) {
+    use novarocks_expression_contract::{ExprKind, RootScope};
     use novarocks_physical_plan::*;
     use novarocks_plan_codec::physical_package_v2::encode_fragment_package;
     use novarocks_plan_codec::physical_package_v2::test_support::encode_limits;
     use novarocks_spi::connector::write_stack::{root_write_result_schema, writer_output_schema};
-    use novarocks_type_contract::{
-        ControlShape, EvaluationDomainId, ExpressionControlFlow, ExpressionEffectContext,
-        ExpressionEvaluationDomain, ExpressionInvocation, ExpressionUseId,
-    };
+    use novarocks_type_contract::{CompileCheckpoints, EvaluationDemand};
     use prost::Message;
     use std::collections::BTreeMap;
 
@@ -368,15 +366,20 @@ pub(crate) fn writer_producer_package() -> (Vec<u8>, u32) {
             },
         )
         .unwrap();
-    let cell = builder
-        .add_expression(
-            source,
+    let unit = builder.unit(source).unwrap();
+    let definition = unit
+        .add(
+            None,
             int64(),
             ExprKind::Constant(ConstantReference { pool, ordinal: 0 }),
         )
         .unwrap();
+    let cell = unit
+        .root(definition, EvaluationDemand::Value, RootScope::AllPorts)
+        .unwrap();
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: source,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -413,6 +416,7 @@ pub(crate) fn writer_producer_package() -> (Vec<u8>, u32) {
         }]);
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: writer,
             inputs: Box::from([source]),
             required_inputs: Box::from([property(Distribution::Singleton)]),
@@ -437,6 +441,17 @@ pub(crate) fn writer_producer_package() -> (Vec<u8>, u32) {
             },
         })
         .unwrap();
+    let ports = builder.node_ports(source).unwrap();
+    let mut work = CompileCheckpoints::try_new(&Unbounded, CompilePhase::Validate).unwrap();
+    let unit = builder
+        .take_unit_builder(source)
+        .unwrap()
+        .seal(ports, &mut work)
+        .unwrap()
+        .finish(BTreeMap::new(), &mut work)
+        .unwrap();
+    work.finish().unwrap();
+    builder.install_unit(source, Arc::new(unit)).unwrap();
     let producer = builder
         .finish_definition(
             writer,
@@ -475,6 +490,7 @@ pub(crate) fn writer_producer_package() -> (Vec<u8>, u32) {
         .collect::<Box<[_]>>();
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: exchange,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -493,6 +509,7 @@ pub(crate) fn writer_producer_package() -> (Vec<u8>, u32) {
     let outputs = relation(&mut builder, finish, true);
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: finish,
             inputs: Box::from([exchange]),
             required_inputs: Box::from([property(Distribution::Singleton)]),
@@ -531,7 +548,6 @@ pub(crate) fn writer_producer_package() -> (Vec<u8>, u32) {
         )
         .unwrap();
 
-    let mut plan = PlanBuilder::new(PlanVersionId::try_new([6; 16]).unwrap());
     // Explicit fixture admission; these values are not production defaults.
     let constants = novarocks_functions::ConstantPolicy {
         max_rows: 16,
@@ -545,6 +561,7 @@ pub(crate) fn writer_producer_package() -> (Vec<u8>, u32) {
         max_library_validation_work: 1 << 20,
         max_library_validation_bytes: 1 << 20,
     };
+    let mut plan = PlanBuilder::new(PlanVersionId::try_new([6; 16]).unwrap(), constants);
     plan.insert_constant_pool(
         pool,
         ConstantPool::try_new(
@@ -580,6 +597,7 @@ pub(crate) fn writer_producer_package() -> (Vec<u8>, u32) {
             source_multiplicity: RowMultiplicity::SingleCopy,
             destination: Distribution::Singleton,
             destination_multiplicity: RowMultiplicity::SingleCopy,
+            routing_only: Box::default(),
         },
     })
     .unwrap();
@@ -604,55 +622,9 @@ pub(crate) fn writer_producer_package() -> (Vec<u8>, u32) {
     .unwrap();
     let plan = plan.finish_observed(&Unbounded).unwrap();
 
-    let mut uses = BTreeMap::new();
-    let mut calls = BTreeMap::new();
     let mut pruning = BTreeMap::new();
     let mut admissions = BTreeMap::new();
-    for (&id, fragment) in plan.fragments() {
-        let roots = PhysicalExpressionRoots::try_new(fragment, &Unbounded).unwrap();
-        let mut invocations = Vec::new();
-        let bindings = roots
-            .sites()
-            .iter()
-            .enumerate()
-            .map(|(index, (&site, root))| {
-                let use_id = ExpressionUseId::new(index as u32);
-                invocations.push(ExpressionInvocation {
-                    context: ExpressionEffectContext {
-                        use_id,
-                        domain: EvaluationDomainId::new(0),
-                        demand: root.demand,
-                    },
-                    definition: root.expr,
-                    control: ControlShape::Eager,
-                    arguments: Box::default(),
-                });
-                (site, use_id)
-            })
-            .collect::<Vec<_>>();
-        let domains = if invocations.is_empty() {
-            vec![]
-        } else {
-            vec![ExpressionEvaluationDomain {
-                id: EvaluationDomainId::new(0),
-                parent: None,
-                guard: None,
-            }]
-        };
-        let flow = ExpressionControlFlow::try_new(
-            domains,
-            invocations,
-            fragment.expressions(),
-            CompilePhase::Validate,
-            &Unbounded,
-        )
-        .unwrap();
-        let root_uses = PhysicalRootUses::try_new(fragment, flow, bindings, &Unbounded).unwrap();
-        calls.insert(
-            id,
-            FrozenFragmentCalls::try_new(fragment, &root_uses, vec![], &Unbounded).unwrap(),
-        );
-        uses.insert(id, root_uses);
+    for &id in plan.fragments().keys() {
         pruning.insert(
             id,
             FrozenFragmentPruning::try_new(id, vec![], &Unbounded).unwrap(),
@@ -674,8 +646,6 @@ pub(crate) fn writer_producer_package() -> (Vec<u8>, u32) {
         &plan,
         &BTreeMap::new(),
         &BTreeMap::from([(ordinal, draft)]),
-        &uses,
-        &calls,
         &pruning,
         &admissions,
         &Unbounded,

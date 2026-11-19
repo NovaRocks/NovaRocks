@@ -78,13 +78,9 @@ fn zero_policy() -> wire::SourceConstantPolicy {
         max_library_validation_bytes: Some(0),
     }
 }
-fn request() -> wire::OriginalCallRequest {
-    wire::OriginalCallRequest {
-        definition: Some(wire::CallRequestDefinition {
-            kind: Some(wire::call_request_definition::Kind::ExpressionDefinitionId(
-                0,
-            )),
-        }),
+fn request() -> wire::UnitCallRequest {
+    wire::UnitCallRequest {
+        definition_id: Some(0),
         arguments: vec![
             wire::OriginalFunctionArgument {
                 kind: Some(wire::original_function_argument::Kind::Value(
@@ -119,14 +115,29 @@ fn request() -> wire::OriginalCallRequest {
         constant_policy: Some(zero_policy()),
     }
 }
-fn package(entries: Vec<wire::OriginalCallRequest>) -> wire::FragmentPackage {
+// Resource-only syntax fixture, not a semantically published unit. The real
+// unit author checks definitions, requests and claims after carrier admission.
+fn package(entries: Vec<wire::UnitCallRequest>) -> wire::FragmentPackage {
     wire::FragmentPackage {
         fragment: Some(wire::Fragment {
-            call_requests: Some(wire::FragmentCallRequests { entries }),
+            nodes: vec![wire::PhysicalNode {
+                expressions: Some(wire::ExpressionUnit {
+                    requests: entries,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
             ..Default::default()
         }),
         ..Default::default()
     }
+}
+fn decoded_requests(package: &wire::FragmentPackage) -> &Vec<wire::UnitCallRequest> {
+    &package.fragment.as_ref().unwrap().nodes[0]
+        .expressions
+        .as_ref()
+        .unwrap()
+        .requests
 }
 fn ld(tag: u32, payload: &[u8]) -> Vec<u8> {
     let mut result = Vec::new();
@@ -136,9 +147,9 @@ fn ld(tag: u32, payload: &[u8]) -> Vec<u8> {
     result
 }
 fn wrap_request(raw_request: &[u8]) -> Vec<u8> {
-    // Independent wire geometry: Package.fragment / Fragment.call_requests /
-    // FragmentCallRequests.entries. No descriptor/model traversal makes this.
-    ld(3, &ld(9, &ld(1, raw_request)))
+    // Independent wire geometry: Package.fragment / Fragment.nodes /
+    // PhysicalNode.expressions / ExpressionUnit.requests. No descriptor walk.
+    ld(3, &ld(5, &ld(30, &ld(6, raw_request))))
 }
 fn size<T: GeneratedResourceLayout>() -> usize {
     assert_eq!(T::RESOURCE_LAYOUT.size, size_of::<T>());
@@ -183,16 +194,16 @@ fn request_payload_presence_and_order_have_independent_wire_counts_and_storage_f
         .preflight(&raw, limits(), &Control::default())
         .unwrap();
     assert_eq!(projection.status, ResourceCursorStatus::Complete);
-    // Hand count: three outer messages, then request/definition, three argument
+    // Hand count: four outer messages, then one unit request, three argument
     // wrappers, two Value payloads, one reference, one Lambda and one policy.
     assert_eq!(projection.usage.message_occurrences, 13);
     assert_eq!(projection.usage.field_occurrences, 31);
     assert_eq!(projection.usage.scalar_elements, 21);
     let message_initialization_floor = size::<wire::FragmentPackage>()
         + size::<wire::Fragment>()
-        + size::<wire::FragmentCallRequests>()
-        + size::<wire::OriginalCallRequest>()
-        + size::<wire::CallRequestDefinition>()
+        + size::<wire::PhysicalNode>()
+        + size::<wire::ExpressionUnit>()
+        + size::<wire::UnitCallRequest>()
         + 3 * size::<wire::OriginalFunctionArgument>()
         + 2 * size::<wire::OriginalValueArgument>()
         + size::<wire::ConstantReference>()
@@ -201,9 +212,9 @@ fn request_payload_presence_and_order_have_independent_wire_counts_and_storage_f
     assert!(projection.usage.initialization_bytes_upper >= message_initialization_floor);
 
     let decoded = wire::FragmentPackage::decode(raw.as_slice()).unwrap();
-    let table = decoded.fragment.unwrap().call_requests.unwrap();
-    assert_eq!(table.entries, vec![original]);
-    let actual = &table.entries[0];
+    let entries = decoded_requests(&decoded);
+    assert_eq!(entries, &vec![original]);
+    let actual = &entries[0];
     let Some(wire::original_function_argument::Kind::Lambda(lambda)) =
         actual.arguments[2].kind.as_ref()
     else {
@@ -212,7 +223,8 @@ fn request_payload_presence_and_order_have_independent_wire_counts_and_storage_f
     assert_eq!(lambda.parameter_value_type_ids, [0, u32::MAX, 7]);
     assert_eq!(lambda.result_value_type_id, Some(0));
     assert_eq!(actual.constant_policy, Some(zero_policy()));
-    let live_vec_backing = table.entries.capacity() * size_of::<wire::OriginalCallRequest>()
+    let live_vec_backing = entries.capacity() * size_of::<wire::UnitCallRequest>()
+        + decoded.fragment.as_ref().unwrap().nodes.capacity() * size_of::<wire::PhysicalNode>()
         + actual.arguments.capacity() * size_of::<wire::OriginalFunctionArgument>()
         + lambda.parameter_value_type_ids.capacity() * size_of::<u32>();
     assert!(live_vec_backing > 0);
@@ -223,6 +235,62 @@ fn request_payload_presence_and_order_have_independent_wire_counts_and_storage_f
 }
 
 #[test]
+fn relation_request_carrier_keeps_the_real_site_and_original_argument_payload() {
+    use novarocks_proto_models::physical_semantics_v2 as semantics;
+    let scalar = request();
+    let relation = wire::OriginalCallRequest {
+        definition: Some(wire::CallRequestDefinition {
+            kind: Some(wire::call_request_definition::Kind::Relational(
+                semantics::CallSite {
+                    kind: Some(semantics::call_site::Kind::Window(
+                        semantics::NodeCallSite {
+                            node_id: Some(0),
+                            call: u32::MAX,
+                        },
+                    )),
+                },
+            )),
+        }),
+        arguments: scalar.arguments,
+        logical_argument_count: scalar.logical_argument_count,
+        expected_result_value_type_id: scalar.expected_result_value_type_id,
+        constant_policy: scalar.constant_policy,
+    };
+    let package = wire::FragmentPackage {
+        fragment: Some(wire::Fragment {
+            call_requests: Some(wire::FragmentCallRequests {
+                entries: vec![relation.clone()],
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let raw = package.encode_to_vec();
+    assert_eq!(raw, ld(3, &ld(9, &ld(1, &relation.encode_to_vec()))));
+    let projection = model()
+        .preflight(&raw, limits(), &Control::default())
+        .unwrap();
+    assert_eq!(projection.status, ResourceCursorStatus::Complete);
+    let decoded = wire::FragmentPackage::decode(raw.as_slice()).unwrap();
+    assert_eq!(
+        decoded
+            .fragment
+            .as_ref()
+            .unwrap()
+            .call_requests
+            .as_ref()
+            .unwrap()
+            .entries,
+        vec![relation]
+    );
+    let relation_floor = size::<wire::OriginalCallRequest>()
+        + size::<wire::CallRequestDefinition>()
+        + size::<semantics::CallSite>()
+        + size::<semantics::NodeCallSite>();
+    assert!(projection.usage.initialization_bytes_upper >= relation_floor);
+}
+
+#[test]
 fn request_each_receiving_limit_accepts_exact_boundary_and_refuses_one_under() {
     let model = model();
     let raw = package(vec![request()]).encode_to_vec();
@@ -230,7 +298,7 @@ fn request_each_receiving_limit_accepts_exact_boundary_and_refuses_one_under() {
         .preflight(&raw, limits(), &Control::default())
         .unwrap()
         .usage;
-    // Six descents reach the Value's ConstantReference; these source-policy
+    // Seven descents reach the Value's ConstantReference; these source-policy
     // zeros never replace any receiving limit.
     let exact = DecodeProjectionLimits {
         max_input_bytes: raw.len(),
@@ -240,7 +308,7 @@ fn request_each_receiving_limit_accepts_exact_boundary_and_refuses_one_under() {
         max_field_occurrences: 31,
         max_copied_bytes: usage.copied_bytes_upper,
         max_initialization_bytes: usage.initialization_bytes_upper,
-        max_wire_depth: 6,
+        max_wire_depth: 7,
     };
     assert_eq!(
         model
@@ -279,7 +347,7 @@ fn request_each_receiving_limit_accepts_exact_boundary_and_refuses_one_under() {
             ..exact
         },
         DecodeProjectionLimits {
-            max_wire_depth: 5,
+            max_wire_depth: 6,
             ..exact
         },
     ];
@@ -317,7 +385,7 @@ fn repeated_singular_request_policy_counts_both_occurrences_before_prost_merges(
     );
     let decoded = wire::FragmentPackage::decode(twice.as_slice()).unwrap();
     assert_eq!(
-        decoded.fragment.unwrap().call_requests.unwrap().entries[0].constant_policy,
+        decoded_requests(&decoded)[0].constant_policy,
         Some(zero_policy())
     );
     // Charging only the final logical object would incorrectly accept this.
@@ -437,19 +505,19 @@ fn wide_request_wire_is_refused_before_prost_and_observes_real_decode_quanta() {
     let control = Control::default();
     let projection = model.preflight(&raw, limits(), &control).unwrap();
     assert_eq!(projection.status, ResourceCursorStatus::Complete);
-    assert_eq!(projection.usage.message_occurrences, 3 + 10 * 320);
+    assert_eq!(projection.usage.message_occurrences, 4 + 9 * 320);
     assert_eq!(projection.usage.scalar_elements, 21 * 320);
-    assert_eq!(projection.usage.field_occurrences, 2 + 29 * 320);
+    assert_eq!(projection.usage.field_occurrences, 3 + 28 * 320);
     // Independent entry-count floor, even before argument/Lambda backing.
     assert!(
         projection.usage.cumulative_requested_heap_bytes_upper
-            >= 320 * size_of::<wire::OriginalCallRequest>()
+            >= 320 * size_of::<wire::UnitCallRequest>()
     );
     assert!(matches!(
         model.preflight(
             &raw,
             DecodeProjectionLimits {
-                max_message_occurrences: 3 + 10 * 320 - 1,
+                max_message_occurrences: 4 + 9 * 320 - 1,
                 ..limits()
             },
             &Control::default()

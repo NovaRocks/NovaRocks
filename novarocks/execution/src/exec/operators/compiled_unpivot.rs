@@ -48,8 +48,7 @@ use arrow::array::{Array, ArrayRef, Int32Array, ListArray, MapArray, StringArray
 use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::{DataType, FieldRef};
 use novarocks_local_program::{
-    LocalProgram, ProgramExpressionRootSite, ProgramNodeExpressionRole, ProgramNodeId,
-    ProgramNodeKind, StaticLayout, UnpivotConstant,
+    LocalProgram, ProgramNodeId, ProgramNodeKind, ProgramRootRef, StaticLayout, UnpivotConstant,
 };
 use novarocks_types::SlotId;
 
@@ -60,7 +59,6 @@ use super::unpivot_processor::{
 };
 use super::unpivot_processor::{unpivot_arrow, unpivot_contract};
 use crate::exec::chunk::{Chunk, ChunkBatchProjection, ChunkSchemaRef};
-use crate::exec::expr::compiled_program::CompiledExpressionInstance;
 use crate::exec::pipeline::operator::{
     ConstructionFailure, InputConstructionFactory, InputConstructionOwner, InputEncodingPolicy,
     Operator,
@@ -75,6 +73,7 @@ use crate::exec::pipeline::{
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
 use crate::runtime::task::{ExecutionFailure, ExecutionResult};
+use novarocks_expression::CompiledExpressionInstance;
 use novarocks_functions::array_projection::ArrayNormalizationStep;
 use novarocks_functions::{KernelEvaluationControl, KernelFailure};
 use novarocks_type_contract::{ValueSchemaCreation, ValueTypeStorageLifetime};
@@ -108,8 +107,9 @@ pub(crate) enum Producer {
 
 pub struct CompiledUnpivotProcessorFactory {
     name: String,
+    node: ProgramNodeId,
     program: Arc<LocalProgram>,
-    sites: Vec<ProgramExpressionRootSite>,
+    sites: Vec<ProgramRootRef>,
     producers: Arc<[Producer]>,
     mappings: usize,
     max_output_rows: usize,
@@ -268,16 +268,8 @@ impl CompiledUnpivotProcessorFactory {
                     invalid(format!("mapping {mapping_ordinal} lacks literal {literal}"))
                 })?;
                 let source = match constant {
-                    UnpivotConstant::Scalar { .. } => {
-                        sites.push(ProgramExpressionRootSite::Node {
-                            node,
-                            role: ProgramNodeExpressionRole::UnpivotConstant {
-                                mapping: u32::try_from(mapping_ordinal)
-                                    .map_err(|_| invalid("has too many mappings".to_string()))?,
-                                constant: u32::try_from(literal)
-                                    .map_err(|_| invalid("has too many literals".to_string()))?,
-                            },
-                        });
+                    UnpivotConstant::Scalar { expr_id, .. } => {
+                        sites.push(*expr_id);
                         let declared =
                             root_value_type(&program, *sites.last().expect("site was added"))?;
                         let target_binding = layout
@@ -352,6 +344,7 @@ impl CompiledUnpivotProcessorFactory {
         let (max_output_rows, max_output_bytes) = (*max_output_rows, *max_output_bytes);
         let mappings = value_mappings.len();
         Ok(Self {
+            node,
             name: format!("COMPILED_UNPIVOT (node={at})"),
             program,
             sites,
@@ -376,7 +369,8 @@ impl OperatorFactory for CompiledUnpivotProcessorFactory {
             name: self.name.clone(),
             program: Arc::clone(&self.program),
             sites: self.sites.clone(),
-            control: RuntimeKernelControl::new(Arc::clone(&self.error)),
+            control: RuntimeKernelControl::new(Arc::clone(&self.error))
+                .at_expression_node(self.node),
             instances: None,
             expansion: None,
             output_layout: self.output_layout.clone(),
@@ -534,7 +528,7 @@ impl UnpivotExpansion {
 struct CompiledUnpivotProcessor {
     name: String,
     program: Arc<LocalProgram>,
-    sites: Vec<ProgramExpressionRootSite>,
+    sites: Vec<ProgramRootRef>,
     control: RuntimeKernelControl,
     instances: Option<Vec<CompiledExpressionInstance>>,
     expansion: Option<UnpivotExpansion>,

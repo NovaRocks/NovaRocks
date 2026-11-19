@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use novarocks_expression_contract::ExprKind;
+
 use super::*;
 use crate::values::lower_values;
 use crate::{
@@ -23,10 +25,10 @@ use crate::{
 use arrow_array::{Float32Array, StringArray};
 use novarocks_connector_contract::PureProviderProgramCatalog;
 use novarocks_local_program::{
-    KernelAbiVersion, LocalProgram, ProgramChannelLayoutRole, ProgramChannelSite,
-    ProgramExpressionArena, ProgramNodeId, ProgramNodeKind,
+    KernelAbiVersion, LocalProgram, ProgramChannelLayoutRole, ProgramChannelSite, ProgramNodeId,
+    ProgramNodeKind,
 };
-use novarocks_physical_plan::{ExprKind, FragmentPackage};
+use novarocks_physical_plan::FragmentPackage;
 use novarocks_type_contract::{FunctionArgumentType, ValueLogicalType};
 use novarocks_types::SlotId;
 use std::num::NonZeroUsize;
@@ -134,13 +136,15 @@ pub(super) fn build_typed(
             };
             cells.push(
                 builder
-                    .add_expression(
+                    .add_root(
                         values_node,
                         pools[index].value_type().clone(),
                         ExprKind::Constant(ConstantReference {
                             pool: ConstantPoolId::new(pool_id),
                             ordinal,
                         }),
+                        RootScope::AllPorts,
+                        EvaluationDemand::Value,
                     )
                     .unwrap(),
             );
@@ -157,10 +161,17 @@ pub(super) fn build_typed(
     let root = if chain {
         let filter = NodeId::new(0);
         let predicate = builder
-            .add_expression(
+            .add_root(
                 filter,
                 FunctionValueType::new(DataType::Boolean, false),
-                ExprKind::Literal(novarocks_physical_plan::LiteralValue::Boolean(true)),
+                crate::test_constants::boolean(
+                    &mut constants,
+                    &FunctionValueType::new(DataType::Boolean, false),
+                    true,
+                    policy(),
+                ),
+                RootScope::Port(0),
+                EvaluationDemand::TruthOnly,
             )
             .unwrap();
         builder
@@ -172,14 +183,20 @@ pub(super) fn build_typed(
         for &input in &outputs {
             let ty = builder.value(input).unwrap().ty.clone();
             let expr = builder
-                .add_expression(project, ty.clone(), ExprKind::Value(input))
+                .add_root(
+                    project,
+                    ty.clone(),
+                    ExprKind::Value(input),
+                    RootScope::Port(0),
+                    EvaluationDemand::Value,
+                )
                 .unwrap();
             let output = builder
                 .add_value(
                     ty,
                     ValueOrigin::Expr {
                         node: project,
-                        expr,
+                        root: expr,
                     },
                 )
                 .unwrap();
@@ -199,7 +216,7 @@ pub(super) fn build_typed(
         values_node
     };
     let fragment = builder
-        .finish_definition(
+        .finish_fixture(
             root,
             FragmentSink::Result,
             PipelineDopDomain {
@@ -209,49 +226,6 @@ pub(super) fn build_typed(
             },
             novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
-        .unwrap();
-    let roots = PhysicalExpressionRoots::try_new(&fragment, &Control::good()).unwrap();
-    let domain = EvaluationDomainId::new(0);
-    let mut invocations = Vec::new();
-    let bindings = roots
-        .sites()
-        .iter()
-        .enumerate()
-        .map(|(position, (&site, root))| {
-            let id = match position {
-                0 => 0,
-                1 => u32::MAX,
-                n => n as u32 - 1,
-            };
-            let use_id = ExpressionUseId::new(id);
-            invocations.push(ExpressionInvocation {
-                context: ExpressionEffectContext {
-                    use_id,
-                    domain,
-                    demand: root.demand,
-                },
-                definition: root.expr,
-                control: ControlShape::Eager,
-                arguments: Box::default(),
-            });
-            (site, use_id)
-        })
-        .collect();
-    let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
-            id: domain,
-            parent: None,
-            guard: None,
-        }],
-        invocations,
-        fragment.expressions(),
-        CompilePhase::Validate,
-        &Control::good(),
-    )
-    .unwrap();
-    let expression_uses =
-        PhysicalRootUses::try_new(&fragment, flow, bindings, &Control::good()).unwrap();
-    let calls = FrozenFragmentCalls::try_new(&fragment, &expression_uses, vec![], &Control::good())
         .unwrap();
     let pruning = FrozenFragmentPruning::try_new(fragment.id(), vec![], &Control::good()).unwrap();
     let fields = fragment.nodes()[&root]
@@ -279,9 +253,8 @@ pub(super) fn build_typed(
                 version: PlanVersionId::try_new([171; 16]).unwrap(),
                 required: RequiredContracts::default(),
                 fragment,
-                expression_uses,
-                calls,
                 constants,
+                statement_constant_policy: policy(),
                 cuts: FragmentCuts::default(),
                 result: Some(result),
                 parameters: SemanticParameters::try_new([]).unwrap(),
@@ -289,6 +262,7 @@ pub(super) fn build_typed(
                 writes: BTreeMap::new(),
                 annotations: Box::default(),
                 pruning,
+                layouts: Default::default(),
             },
             package_admission(),
             &Control::good(),
@@ -301,6 +275,14 @@ fn compile(
     control: &dyn PureCompileControl,
 ) -> Result<LocalProgram, FragmentCompileError> {
     compile_fragment(providers(package), &functions(), compile_options(), control)
+}
+fn values_node_dynamic_refs(
+    program: &LocalProgram,
+) -> &[novarocks_local_program::StaticValuesCell] {
+    let ProgramNodeKind::Values { values } = program.graph().nodes()[0].kind() else {
+        panic!("Values")
+    };
+    values.dynamic_cells()
 }
 fn batch(program: &LocalProgram) -> &arrow_array::RecordBatch {
     let ProgramNodeKind::Values { values } = program.graph().nodes()[0].kind() else {
@@ -399,19 +381,14 @@ fn values_materialize_real_rows_columns_selected_ordinals_float_bits_and_json() 
         },
         ValueLogicalType::Json
     );
-    assert!(
-        program
-            .checked()
-            .channels()
-            .expressions()
-            .resolved_calls()
-            .snapshot()
-            .bindings()
-            .is_empty()
-    );
+    assert!(values_node_dynamic_refs(&program).is_empty());
     // Original CV sources remain in the expression owner; output copying never
     // reauthors a pool or changes the selected row/source-field identity.
-    for source in program.graph().expressions().nodes() {
+    for source in program
+        .units()
+        .iter()
+        .flat_map(|unit| unit.definitions().nodes())
+    {
         if let StaticExprKind::Constant(value) = source.kind() {
             assert!(
                 [
@@ -589,9 +566,18 @@ fn values_project_filter_keep_sparse_source_channels_and_remaining_runtime_roots
         program.graph().nodes()[2].kind(),
         ProgramNodeKind::Project { .. }
     ));
-    let resolved = program.checked().channels().expressions().resolved_calls();
-    assert_eq!(resolved.snapshot().bindings().len(), 2);
-    let channels = program.checked().channels();
+    let runtime_refs = program
+        .graph()
+        .nodes()
+        .iter()
+        .map(|node| match node.kind() {
+            ProgramNodeKind::Filter { predicates, .. } => predicates.len(),
+            ProgramNodeKind::Project { exprs, .. } => exprs.len(),
+            _ => 0,
+        })
+        .sum::<usize>();
+    assert_eq!(runtime_refs, 2);
+    let channels = program.channels();
     assert_eq!(
         channels.channel_type(ProgramChannelSite::Layout {
             node: ProgramNodeId::new(0),
@@ -600,10 +586,11 @@ fn values_project_filter_keep_sparse_source_channels_and_remaining_runtime_roots
         }),
         Some(source.value_type())
     );
-    let types = channels.expressions().types();
     assert!(
-        types[&ProgramExpressionArena::Main]
+        program
+            .units()
             .iter()
+            .flat_map(|unit| unit.types().iter())
             .all(|ty| matches!(ty, FunctionArgumentType::Value(_)))
     );
 }
@@ -619,7 +606,12 @@ fn values_original_control_every_materialization_callback_success_and_ordinary_t
     );
     let lowered = lower(&package, &Control::good()).unwrap();
     let mut wrong = lower(&package, &Control::good()).unwrap();
-    let first = *wrong.ids.values().next().unwrap();
+    let first = *wrong
+        .roots(NodeId::new(u32::MAX))
+        .unwrap()
+        .values()
+        .next()
+        .unwrap();
     let ty = FunctionValueType::new(DataType::Int64, true);
     replace_constant(
         &mut wrong,

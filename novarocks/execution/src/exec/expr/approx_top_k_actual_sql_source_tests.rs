@@ -16,7 +16,7 @@
 // under the License.
 //! Real original nullable corpus field source, ordered full requests and permanent complete compiler.
 use arrow::datatypes::{DataType, Field};
-use novarocks_physical_plan::{NodeKind, PhysicalCallDefinition, PhysicalCallSite};
+use novarocks_physical_plan::{NodeKind, PhysicalCallSite};
 
 fn source(full: bool) -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
     let fields = vec![
@@ -51,10 +51,10 @@ fn approx_top_k_actual_original_required_sql_ordered_full_binding_source() {
                     {
                         continue;
                     }
-                    let site = PhysicalCallDefinition::Relational(PhysicalCallSite::Aggregate {
+                    let site = PhysicalCallSite::Aggregate {
                         node: node.id,
                         call: u32::try_from(ordinal).unwrap(),
-                    });
+                    };
                     let req = fragment.call_requests().get(site).unwrap();
                     assert!((1..=3).contains(&req.logical_argument_count));
                     assert_eq!(

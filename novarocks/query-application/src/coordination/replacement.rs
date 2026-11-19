@@ -80,21 +80,22 @@ pub struct ReplacementQualificationRequest {
 }
 
 impl ReplacementQualificationRequest {
-    pub(crate) fn new(
+    /// Preserves the logical core's original operation and absolute deadline.
+    /// Construction neither mints an identity nor restarts a queued window.
+    pub(crate) fn from_logical(
+        operation_id: TaskOperationId,
         identity: ReplacementQualificationIdentity,
         failed_participations: Arc<[ParticipationRef]>,
         replacement_participations: Arc<[ParticipationRef]>,
         issued_at: MonotonicInstant,
         conservative_expiry: MonotonicInstant,
+        absolute_expiry: std::time::Instant,
         native_actions: Option<
             novarocks_workload_control::joint_admission::NativeAsyncActionAuthority,
         >,
     ) -> Self {
-        let absolute_expiry = std::time::Instant::now()
-            .checked_add(conservative_expiry.saturating_duration_since(issued_at))
-            .unwrap_or_else(std::time::Instant::now);
         Self {
-            operation_id: TaskOperationId::new_v7(),
+            operation_id,
             identity,
             failed_participations,
             replacement_participations,
@@ -280,9 +281,24 @@ pub trait ActiveAttemptIsolationOwner: fmt::Debug + Send {
 pub struct QualifiedReplacementReservation {
     identity: ReplacementQualificationIdentity,
     reservation: Option<Box<dyn AttemptIsolationReservation>>,
+    rejected_active: Option<ActivatedReplacementReservation>,
 }
 
 impl QualifiedReplacementReservation {
+    pub(crate) fn topology_revision(&self) -> u64 {
+        self.reservation
+            .as_deref()
+            .expect("qualified reservation still owns its original grants")
+            .topology_revision()
+    }
+
+    pub(crate) fn admissions(&self) -> &[QualifiedWorkerAdmission] {
+        self.reservation
+            .as_deref()
+            .expect("qualified reservation still owns its original grants")
+            .admissions()
+    }
+
     pub fn try_new(
         request: &ReplacementQualificationRequest,
         reservation: Box<dyn AttemptIsolationReservation>,
@@ -313,32 +329,12 @@ impl QualifiedReplacementReservation {
         Ok(Self {
             identity: request.identity,
             reservation: Some(reservation),
+            rejected_active: None,
         })
     }
 
     pub const fn identity(&self) -> ReplacementQualificationIdentity {
         self.identity
-    }
-
-    pub(crate) fn conservative_expiry(
-        &self,
-        dispatched_at: MonotonicInstant,
-        maximum_lifetime: std::time::Duration,
-    ) -> MonotonicInstant {
-        let effective = self
-            .reservation
-            .as_deref()
-            .and_then(|reservation| {
-                reservation
-                    .admissions()
-                    .iter()
-                    .map(|admission| admission.receipt().valid_for().get())
-                    .min()
-            })
-            .map_or(maximum_lifetime, |valid_for| {
-                valid_for.min(maximum_lifetime)
-            });
-        dispatched_at.saturating_add(effective)
     }
 
     fn reject_unpublished(mut self) {
@@ -347,9 +343,14 @@ impl QualifiedReplacementReservation {
         }
     }
 
-    pub(crate) fn activate(
-        mut self,
+    /// Failure retains the same returned reservation, or an invalid activated
+    /// owner, until the caller's explicit supervised abandonment path.
+    pub(crate) fn activate_retained(
+        &mut self,
     ) -> Result<ActivatedReplacementReservation, ReplacementQualificationFailure> {
+        if self.rejected_active.is_some() {
+            return Err(ReplacementQualificationFailure::InvalidReservation);
+        }
         let reservation = self
             .reservation
             .take()
@@ -364,19 +365,21 @@ impl QualifiedReplacementReservation {
             Ok(isolation) => isolation,
             Err(failure) => {
                 let (failure, reservation) = failure.into_parts();
-                reservation.abandon();
+                self.reservation = Some(reservation);
                 return Err(failure);
             }
         };
-        if isolation.execution() != self.identity.replacement() {
-            isolation.abandon();
-            return Err(ReplacementQualificationFailure::InvalidReservation);
-        }
-        Ok(ActivatedReplacementReservation {
-            execution: self.identity.replacement(),
+        let execution = isolation.execution();
+        let activated = ActivatedReplacementReservation {
+            execution,
             admissions: Some(admissions),
             isolation: Some(isolation),
-        })
+        };
+        if execution != self.identity.replacement() {
+            self.rejected_active = Some(activated);
+            return Err(ReplacementQualificationFailure::InvalidReservation);
+        }
+        Ok(activated)
     }
 }
 
@@ -388,6 +391,7 @@ impl Drop for QualifiedReplacementReservation {
     }
 }
 
+#[derive(Debug)]
 pub(crate) struct ActivatedReplacementReservation {
     execution: QueryExecutionId,
     admissions: Option<Box<[QualifiedWorkerAdmission]>>,
@@ -398,12 +402,6 @@ pub(crate) struct ActiveReplacementResources {
     execution: QueryExecutionId,
     admissions: Option<Box<[ReplacementWorkerAdmissionEvidence]>>,
     isolation: Option<Box<dyn ActiveAttemptIsolationOwner>>,
-}
-
-impl ActivatedReplacementReservation {
-    pub(crate) fn admissions(&self) -> &[QualifiedWorkerAdmission] {
-        self.admissions.as_deref().unwrap_or_default()
-    }
 }
 
 impl Drop for ActivatedReplacementReservation {
@@ -502,59 +500,7 @@ pub trait ReplacementQualificationEffectPort: fmt::Debug + Send + Sync {
     ) -> ReplacementQualificationEffectAdmission;
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ReplacementQualificationFailure {
-    Rejected,
-    InvalidReservation,
-    Expired,
-    OutcomeUnknown,
-    EffectOwnerClosed,
-    MismatchedReceipt,
-    DomainRefused(novarocks_execution_contract::failure::FailureFact),
-}
-
-impl novarocks_execution_contract::failure::FailureProjection for ReplacementQualificationFailure {
-    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
-        use novarocks_execution_contract::failure::{
-            FailureClass, FailureFact, FailureReason, domain,
-        };
-        let (class, code, observed_stop) = match self {
-            Self::Rejected => (FailureClass::Control, 94, false),
-            Self::InvalidReservation => (FailureClass::Invariant, 95, false),
-            Self::Expired => (FailureClass::Control, 96, false),
-            Self::OutcomeUnknown => (FailureClass::Dependency, 97, false),
-            Self::EffectOwnerClosed => (FailureClass::Control, 98, true),
-            Self::MismatchedReceipt => (FailureClass::Invariant, 100, false),
-            Self::DomainRefused(fact) => return *fact,
-        };
-        let reason = FailureReason::new(domain::QUERY, std::num::NonZeroU16::new(code).unwrap());
-        if observed_stop {
-            FailureFact::stop_observation(reason)
-        } else {
-            FailureFact::new(class, reason)
-        }
-    }
-}
-
-impl ReplacementQualificationFailure {
-    /// Bounded diagnostic authored here; no foreign Display becomes safe detail.
-    pub fn safe_detail(&self) -> novarocks_execution_contract::SafeDetail {
-        let message = match self {
-            Self::Rejected => "attempt replacement qualification was refused",
-            Self::InvalidReservation => {
-                "attempt replacement qualification returned an invalid reservation"
-            }
-            Self::Expired => "attempt replacement qualification expired",
-            Self::OutcomeUnknown => "attempt replacement qualification outcome is unknown",
-            Self::EffectOwnerClosed => "attempt replacement qualification effect owner is closed",
-            Self::MismatchedReceipt => {
-                "attempt replacement receipt does not match its exact operation and identity"
-            }
-            Self::DomainRefused(_) => "owning service refused replacement qualification",
-        };
-        novarocks_execution_contract::SafeDetail::truncating(message)
-    }
-}
+pub use novarocks_logical_execution_protocol::replacement::ReplacementQualificationFailure;
 
 #[derive(Debug)]
 pub(crate) enum ReplacementQualificationSettlement {
@@ -646,22 +592,6 @@ impl ReplacementQualificationEffectSubmission {
         self.settled = true;
     }
 
-    #[cfg(test)]
-    pub(crate) fn reject_with_header_for_test(
-        mut self,
-        operation_id: TaskOperationId,
-        identity: ReplacementQualificationIdentity,
-    ) {
-        let _ = self.receipts.send(ReplacementQualificationEffectReceipt {
-            operation_id,
-            identity,
-            settlement: ReplacementQualificationSettlement::Failed(
-                ReplacementQualificationFailure::Rejected,
-            ),
-        });
-        self.settled = true;
-    }
-
     fn publish(
         &self,
         settlement: ReplacementQualificationSettlement,
@@ -695,23 +625,18 @@ pub(crate) fn receipt_channel() -> (
 
 #[cfg(test)]
 mod failure_projection_tests {
+    use crate::execution_error::ExecutionFailurePresentation;
     #[test]
     fn qualification_outcome_cannot_claim_backend_loss_or_accepted_cancellation() {
         use super::ReplacementQualificationFailure;
         use crate::api::NativeAttemptTopologyRequirement;
-        use crate::coordination::LogicalExecutionActorError;
-        use crate::execution_error::{ExecutionFailureInput, ExecutionFailureSite};
         use novarocks_coordination_contract::AttemptFailureClass;
         use novarocks_execution_contract::failure::{
             FailureClass, FailureEvidence, FailureProjection,
         };
         let source = ReplacementQualificationFailure::OutcomeUnknown;
-        let actor = LogicalExecutionActorError::ReplacementQualificationFailed(source);
-        let input = ExecutionFailureInput::new(
-            actor.failure_fact(),
-            actor.safe_detail(),
-            ExecutionFailureSite::Coordinator,
-        );
+        let original = source.error();
+        let input = original.execution_failure().unwrap();
         assert_eq!(input.fact(), source.failure_fact());
         assert_eq!(input.detail(), &source.safe_detail());
         assert_eq!(input.fact().class(), FailureClass::Dependency);
@@ -721,12 +646,8 @@ mod failure_projection_tests {
             NativeAttemptTopologyRequirement::LiveSnapshot
         );
         let source = ReplacementQualificationFailure::EffectOwnerClosed;
-        let actor = LogicalExecutionActorError::ReplacementQualificationFailed(source);
-        let input = ExecutionFailureInput::new(
-            actor.failure_fact(),
-            actor.safe_detail(),
-            ExecutionFailureSite::Coordinator,
-        );
+        let original = source.error();
+        let input = original.execution_failure().unwrap();
         assert_eq!(input.fact().evidence(), FailureEvidence::StopObservation);
         assert_eq!(input.attempt_class(), AttemptFailureClass::ExecutionFailure);
     }

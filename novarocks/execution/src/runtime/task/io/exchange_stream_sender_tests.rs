@@ -283,6 +283,65 @@ fn sender_in_query(
 fn scheduler(bytes: usize) -> Arc<ExchangeUnitSendScheduler> {
     ExchangeUnitSendScheduler::try_new(bytes, 64, 1024).unwrap()
 }
+
+#[test]
+fn sender_accepts_a_payload_above_the_legacy_constant_inside_its_unit_bound() {
+    let wide = 96 * 1024 * 1024;
+    let transport = Arc::new(Scripted::default());
+    let scheduler = ExchangeUnitSendScheduler::try_new(wide, 4, wide).unwrap();
+    let sender = ExchangeStreamSender::try_new(
+        ExchangeStreamSenderConfig {
+            stream: stream_in_query(1, 1),
+            destination: RuntimeEndpoint::new("127.0.0.1", 9000).unwrap(),
+            sender_count: 16,
+            sender_id: 4,
+            backend_number: 5,
+            delivery: ExchangeDeliveryRequirement::DemandDriven,
+            retained_window: 64,
+            max_unit_bytes: wide,
+            retry_delay: Duration::from_millis(1),
+        },
+        transport,
+        scheduler,
+        Arc::new(Observable::new()),
+    )
+    .unwrap();
+    let payload = Bytes::from(vec![7u8; 65 * 1024 * 1024]);
+    let published = sender
+        .publish(&payload, false)
+        .expect("65 MiB fits in 96 MiB");
+    assert!(matches!(
+        published,
+        ExchangeUnitPublishOutcome::Published(range) if range.data_sequence == Some(1)
+    ));
+
+    let narrow = 64 * 1024 * 1024;
+    let transport = Arc::new(Scripted::default());
+    let scheduler = ExchangeUnitSendScheduler::try_new(narrow, 4, narrow).unwrap();
+    let sender = ExchangeStreamSender::try_new(
+        ExchangeStreamSenderConfig {
+            stream: stream_in_query(2, 1),
+            destination: RuntimeEndpoint::new("127.0.0.1", 9000).unwrap(),
+            sender_count: 16,
+            sender_id: 4,
+            backend_number: 5,
+            delivery: ExchangeDeliveryRequirement::DemandDriven,
+            retained_window: 64,
+            max_unit_bytes: narrow,
+            retry_delay: Duration::from_millis(1),
+        },
+        transport,
+        scheduler,
+        Arc::new(Observable::new()),
+    )
+    .unwrap();
+    let before = sender.snapshot();
+    assert_eq!(
+        sender.publish(&payload, false).unwrap_err(),
+        ExchangeUnitSenderError::UnitTooLarge
+    );
+    assert_eq!(sender.snapshot().retention, before.retention);
+}
 fn publish(
     sender: &Arc<ExchangeStreamSender>,
     bytes: &'static [u8],

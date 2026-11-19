@@ -95,6 +95,9 @@ pub enum AttemptFailure {
     /// The frontend attempt owner failed internally and cannot be recovered.
     OwnerFailed,
     Protocol(ProtocolFailure),
+    /// The logical owner already selected this complete passive failure.
+    /// Preserve its original fact, site, detail and replacement witness.
+    Logical(novarocks_coordination_contract::ExecutionFailure),
     TaskProtocol(Box<crate::error::TaskExecutionError>),
     Host(HostProjectedFailure),
     SelectedTask(novarocks_coordination_contract::SelectedTaskTermination),
@@ -102,7 +105,7 @@ pub enum AttemptFailure {
     /// history with QA's independent typed exhausted-budget reply. The original
     /// host error remains retained; kind/class/text cannot infer this fact.
     EstablishReplayExhausted {
-        original: HostProjectedFailure,
+        original: novarocks_coordination_contract::ExecutionFailure,
         participation: ParticipationRef,
         operation_id: TaskOperationId,
     },

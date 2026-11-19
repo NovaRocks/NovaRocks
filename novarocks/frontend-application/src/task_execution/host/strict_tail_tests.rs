@@ -15,18 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::{
-    adapter::tests::start, custody::tests::WithdrawalInbox, publication::PublicationRecord,
-};
+use super::{adapter::tests::start, publication::PublicationRecord};
 use crate::task_execution::{
-    bridge::{
-        control::AttemptOwnerControls,
-        terminal::{TerminalOutbox, TerminalPublication},
-    },
     completion::WriteVerdict,
+    graph_manifest_tests::delivery_chain_graph,
     intent::{AckPayload, OperationAcknowledgement},
     protocol_facts::{AttemptProtocolFactsPublisher, WriteProtocolTracker},
-    tests::delivery_chain_graph,
+};
+use novarocks_attempt_protocol::port_output::{
+    AbortIssueSettlement, AttemptTerminal, AttemptToLogical, AttemptToLogicalBody,
 };
 use novarocks_attempt_protocol::{
     AttemptCore, AttemptStep, Core, InputSelection,
@@ -42,18 +39,13 @@ use novarocks_attempt_protocol::{
     },
     start::{AttemptSources, FrozenEstablish, PayloadRef},
 };
-use novarocks_control_runtime::transaction::RuntimeLedger;
-use novarocks_control_runtime_core::{
-    capacity::{ReservationResources, ResourceVector},
-    identity::Generation,
-    mailbox::InputClass,
-    scope::{WorkAdmission, WorkKind},
+use novarocks_coordination_contract::logical_port::{
+    AttemptTerminal as PassiveTerminal, AttemptToLogical as PassivePort,
+    AttemptToLogicalBody as PassiveBody,
 };
 use novarocks_coordination_contract::{
-    AbortIssueSettlement, AttemptActionId, AttemptActivationIdentity, AttemptRequestToken,
-    AttemptStopReason, AttemptTerminal, AttemptToLogical, AttemptToLogicalBody, ExecutionEffect,
-    LogicalToAttempt, LogicalToAttemptBody, MonotonicInstant, ResultParticipationWithdrawal,
-    SelectedTaskTermination,
+    AttemptActionId, AttemptActivationIdentity, AttemptRequestToken, LogicalToAttempt,
+    LogicalToAttemptBody, MonotonicInstant, ResultParticipationWithdrawal, SelectedTaskTermination,
 };
 use novarocks_execution_contract::{
     AbortCause, AbortParticipation, AdmissionEpochCapability, ExchangeDeliveryRequirement,
@@ -61,44 +53,21 @@ use novarocks_execution_contract::{
     TaskIdentity, TaskOperationId, TaskOutputFacts, TaskState, TaskStatus, TaskStatusVersion,
     TerminationDetail, failure::FailureProjection,
 };
+use novarocks_logical_execution_protocol::cancel::{
+    LogicalCancellationReason, cancellation_decision,
+};
 use novarocks_physical_plan::PlanVersionId;
 use novarocks_query_application::{
-    api::{NativeAttemptTerminal, PlanSeal, QueryExecutionError},
-    coordination::{
-        AcceptedRootControlPort, AcceptedRootControlRequest, LogicalExecutionActorConfig,
-        accepted_root_status_projection_with_control_port,
-    },
+    api::{PlanSeal, QueryExecutionError},
     execution_error::{ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason},
-    session_outcome::governed_cancellation_failure_input,
-    test_support::LogicalExecutionTestHarness,
 };
 use novarocks_result_contract::{PerKind, SummaryKind};
 use novarocks_types::BackendProcessId;
 use novarocks_workload_control::{
-    CancellationReason, ResourceConfig, Stage, WorkCancellationRequestOutcome, WorkClass,
-    WorkRequest, WorkloadConfig, WorkloadControl,
+    CancellationReason, ResourceConfig, WorkCancellationRequestOutcome, WorkClass, WorkRequest,
+    WorkloadConfig, WorkloadControl,
 };
-use std::{
-    collections::BTreeSet,
-    num::{NonZeroU64, NonZeroUsize},
-    sync::{Arc, Mutex},
-    task::Poll,
-    time::{Duration, Instant},
-};
-
-#[derive(Debug, Default)]
-struct SealIngress(Mutex<Option<AcceptedRootControlRequest>>);
-
-impl AcceptedRootControlPort for SealIngress {
-    fn enqueue_root_control(
-        &self,
-        request: AcceptedRootControlRequest,
-    ) -> Result<(), AcceptedRootControlRequest> {
-        assert!(request.terminal_control_root().is_none());
-        assert!(self.0.lock().unwrap().replace(request).is_none());
-        Ok(())
-    }
-}
+use std::{collections::BTreeSet, num::NonZeroU64, sync::Arc, time::Duration};
 
 struct Units {
     remaining: usize,
@@ -142,6 +111,7 @@ struct PendingSealReply {
     action: AttemptActionId,
     token: AttemptRequestToken,
     withdrawals: Arc<[ResultParticipationWithdrawal]>,
+    original: AttemptToLogical<AttemptFailure>,
 }
 
 struct StrictTail {
@@ -149,7 +119,7 @@ struct StrictTail {
     sources: AttemptSources,
     input_id: u64,
     publication: PublicationRecord,
-    terminal: Arc<TerminalOutbox>,
+    terminals: Vec<AttemptToLogical<AttemptFailure>>,
     queue: Option<BackendProcessId>,
 }
 
@@ -202,28 +172,52 @@ impl StrictTail {
 
     // Keep the original Seal delivery at its AwaitSeal boundary.
     fn drive(&mut self, step: AttemptStep) -> Option<PendingSealReply> {
-        let terminal = self.terminal.clone();
+        let mut observed = Vec::new();
         let effect = self.advance(
             step,
             |round| assert_eq!(round, Ok(())),
-            |port| {
-                assert!(
-                    terminal
-                        .publish(Box::new(TerminalPublication::new(port)))
-                        .is_ok()
-                )
-            },
-        )?;
+            |port| observed.push(port),
+        );
+        for port in observed {
+            self.record_terminal(port);
+        }
+        let effect = effect?;
         let EffectBody::Port(port) = effect.body else {
             panic!("unexpected Native work in the strict-tail fixture: {effect:?}");
         };
-        let AttemptToLogicalBody::SealResult { token, result } = port.body else {
+        let AttemptToLogicalBody::SealResult { token, result } = &port.body else {
             panic!("expected the original Seal reply");
         };
         Some(PendingSealReply {
             action: effect.id,
-            token,
-            withdrawals: result.expect("the exact Root success is sealed"),
+            token: *token,
+            withdrawals: result
+                .as_ref()
+                .expect("the exact Root success is sealed")
+                .clone(),
+            original: port,
+        })
+    }
+
+    // Capture only outputs actually emitted by this same AP Core. This is a
+    // passive test log, not a second terminal owner, promise or async outbox.
+    fn record_terminal(&mut self, port: AttemptToLogical<AttemptFailure>) {
+        assert!(matches!(
+            port.body,
+            AttemptToLogicalBody::AttemptTerminal(_)
+        ));
+        assert!(
+            self.terminals.is_empty(),
+            "the AP emits the original terminal once"
+        );
+        self.terminals.push(port);
+    }
+    fn terminal(&self) -> Option<PassiveTerminal> {
+        self.terminals.first().map(|original| {
+            let PassiveBody::AttemptTerminal(terminal) = project_port(original).body else {
+                panic!("actual original terminal output");
+            };
+            terminal
         })
     }
 
@@ -246,6 +240,30 @@ impl StrictTail {
                         );
                         let applied = self.publication.publish(&publication, None).unwrap();
                         step = self.applied(effect.id, applied);
+                        continue;
+                    }
+                    EffectBody::Port(port)
+                        if matches!(&port.body, AttemptToLogicalBody::RootStatus(_)) =>
+                    {
+                        assert_eq!(
+                            step.selection,
+                            InputSelection::Only(self.sources.publication)
+                        );
+                        assert_eq!(port.action, effect.id);
+                        let AttemptToLogicalBody::RootStatus(original) = &port.body else {
+                            unreachable!()
+                        };
+                        assert_eq!(
+                            port.activation.execution(),
+                            original.status.identity().query_execution_id()
+                        );
+                        let PassiveBody::RootStatus(projected) = project_port(&port).body else {
+                            panic!("the same AP Root status crosses the passive projection");
+                        };
+                        assert_eq!(&projected, original);
+                        // Pure exact-action feedback, as for ProtocolBatch below.
+                        // The actual Host/current-ticket Root handoff is tested separately.
+                        step = self.applied(effect.id, PublicationApplied::RootStatus);
                         continue;
                     }
                     EffectBody::Port(port)
@@ -390,70 +408,45 @@ impl StrictTail {
     }
 }
 
+// Pure AP input feedback, not an actual current-ticket fill or Scope exit.
 fn apply_governed_stop(
     tail: &mut StrictTail,
     activation: AttemptActivationIdentity,
     reason: CancellationReason,
 ) -> AttemptStep {
-    let generation = Generation::new(1).unwrap();
-    let ledger = RuntimeLedger::new(ResourceVector::default());
-    let scope = ledger.open_scope_next(None, generation).unwrap();
-    let (mut work, mut payer) = scope
-        .reserve_next(
-            generation,
-            ReservationResources::work_only(),
-            WorkKind::Settlement,
-            WorkAdmission::External,
-        )
-        .unwrap()
-        .bind(WorkKind::Settlement)
-        .unwrap();
-    work.start().unwrap();
-    let inbox = WithdrawalInbox::new(&scope);
-    let standing = || {
-        inbox
-            .runtime()
-            .reserve_admitted_input_for(
-                inbox.registration(),
-                inbox.registration().actor(),
-                InputClass::Control,
-                &work,
-            )
-            .unwrap()
-            .into_standing_input()
-            .unwrap()
-    };
-    let mut controls = AttemptOwnerControls::new(activation, standing(), standing());
-    let input = controls
-        .stop_for_cancellation(reason.clone())
-        .unwrap()
-        .unwrap();
-    let (committed, stop) = inbox.try_commit_owner_control().unwrap();
-    assert_eq!(committed, input);
-    assert!(matches!(
-        &stop,
-        AttemptInput::Port(LogicalToAttempt {
-            activation: actual,
-            body: LogicalToAttemptBody::Stop {
-                reason: AttemptStopReason::Client,
-                ..
-            },
-        }) if *actual == activation
-    ));
-    let step = tail.input(tail.sources.actor, stop);
+    assert_eq!(
+        reason,
+        CancellationReason::Requested,
+        "this fixture observed the original Requested latch"
+    );
+    let decision = cancellation_decision(LogicalCancellationReason::Requested);
+    let stop = AttemptInput::Port(LogicalToAttempt {
+        activation,
+        body: LogicalToAttemptBody::Stop {
+            reason: decision.stop,
+            failure: novarocks_coordination_contract::ExecutionFailure::from_input(
+                decision.failure.execution_failure().unwrap().clone(),
+            ),
+        },
+    });
+    let step = tail.input(tail.sources.owner, stop);
     assert!(step.stop_producing);
-    assert_eq!(controls.stop_for_cancellation(reason).unwrap(), None);
-    assert!(inbox.try_commit_owner_control().is_none());
-    controls.close_after_exit().unwrap();
-    work.body_exited().unwrap();
-    work.captures_exited().unwrap();
-    payer.finish().unwrap();
-    scope.reap_ready(8).unwrap();
-    scope.close_external().unwrap();
-    inbox.finish();
-    ledger.remove_scope(scope.id()).unwrap();
-    assert!(ledger.is_empty());
     step
+}
+
+// This formal projection preserves the complete AP-authored typed payload.
+// It neither fills an LP position nor authorizes a publication ACK or exit.
+fn project_port(original: &AttemptToLogical<AttemptFailure>) -> PassivePort {
+    let projected = novarocks_attempt_protocol::port_projection::project_attempt_message(
+        original,
+        &mut |_| panic!("this fixture has no unresolved raw host reference"),
+        &mut |_, _| None,
+        &mut |_, _, _| None,
+    )
+    .unwrap();
+    assert_eq!(projected.activation, original.activation);
+    assert_eq!(projected.action, original.action);
+    projected
 }
 
 fn finished(task: TaskIdentity) -> TaskStatus {
@@ -473,6 +466,7 @@ enum TailCase {
     StrictSourceFailure,
     StrictCancellation,
     OrdinaryCompletion,
+    RunningRootBeforeSeal,
     SealVsNativeFailure { seal_first: bool },
 }
 
@@ -493,6 +487,11 @@ async fn demand_driven_tail_completes_at_original_seal_with_live_siblings() {
 }
 
 #[tokio::test]
+async fn same_root_seal_waits_for_running_flushing_and_exact_finished_with_live_siblings() {
+    run_tail_cases([TailCase::RunningRootBeforeSeal]).await;
+}
+
+#[tokio::test]
 async fn original_root_seal_reply_and_native_advance_failure_follow_their_cut_order() {
     run_tail_cases([true, false].map(|seal_first| TailCase::SealVsNativeFailure { seal_first }))
         .await;
@@ -502,7 +501,9 @@ async fn run_tail_cases(cases: impl IntoIterator<Item = TailCase>) {
     for case in cases {
         let strict = !matches!(
             case,
-            TailCase::OrdinaryCompletion | TailCase::SealVsNativeFailure { .. }
+            TailCase::OrdinaryCompletion
+                | TailCase::RunningRootBeforeSeal
+                | TailCase::SealVsNativeFailure { .. }
         );
         let graph = delivery_chain_graph(if strict {
             ExchangeDeliveryRequirement::MustDrain
@@ -547,32 +548,9 @@ async fn run_tail_cases(cases: impl IntoIterator<Item = TailCase>) {
         let scope = work.owner.scope();
         let requester = work.owner.cancellation_requester();
         let cancellation = scope.cancellation().unwrap();
-        let stage = scope.try_acquire(Stage::Execution).unwrap();
-        let config = LogicalExecutionActorConfig::single_attempt_completion(
-            execution,
-            ExecutionEffect::None,
-            NonZeroUsize::new(8).unwrap(),
-            Vec::new(),
-            NonZeroUsize::MIN,
-            NonZeroUsize::MIN,
-            work.owner,
-            stage,
-        )
-        .unwrap();
-        let mut logical = LogicalExecutionTestHarness::install(
-            tokio::runtime::Handle::current(),
-            config,
-            execution,
-            Vec::new(),
-        )
-        .unwrap();
-        logical.activate_initial().await.unwrap();
-        let drive = logical.native_attempt_drive();
-        let activation = drive.identity();
-        let control = Arc::new(SealIngress::default());
-        let (sender, statuses) =
-            accepted_root_status_projection_with_control_port(root, control.clone());
-        let terminal = TerminalOutbox::new(activation);
+        // Only a frozen identity for this pure AP fixture; no live LP or
+        // resource authority is reconstructed from it.
+        let activation = AttemptActivationIdentity::from_parts(92, execution, 1);
 
         let mut payload = NonZeroU64::MIN;
         let (graph, _creation_backing) = graph.into_attempt_graph(&mut payload).unwrap();
@@ -583,7 +561,7 @@ async fn run_tail_cases(cases: impl IntoIterator<Item = TailCase>) {
             .collect::<BTreeSet<_>>();
         let mut start = start();
         start.activation.identity = activation;
-        start.plan.authorization_limits = drive.authorization_limits();
+        start.plan.authorization_limits.activation = activation;
         start.plan.graph = graph;
         start.plan.writers = writers;
         start.plan.summary_sources = summaries;
@@ -667,14 +645,26 @@ async fn run_tail_cases(cases: impl IntoIterator<Item = TailCase>) {
             core,
             sources,
             input_id: 0,
-            terminal: terminal.clone(),
+            terminals: Vec::new(),
             queue: None,
-            publication: PublicationRecord::new(activation, sender, publisher, None, None),
+            publication: PublicationRecord::new(activation, publisher, None, None),
         };
         let started = tail.input(sources.actor, AttemptInput::Bootstrap);
         assert_eq!(started.selection, InputSelection::Prefer(sources.native));
+        let root_initial = if matches!(case, TailCase::RunningRootBeforeSeal) {
+            TaskStatus::try_new(
+                root,
+                TaskStatusVersion::new(2).unwrap(),
+                TaskState::Running,
+                None,
+                TaskOutputFacts::default(),
+            )
+            .unwrap()
+        } else {
+            finished(root)
+        };
         let initial = tail.observe(vec![
-            observation(finished(root)),
+            observation(root_initial),
             observation(TaskStatus::created(writer)),
             observation(TaskStatus::created(summary)),
         ]);
@@ -688,13 +678,12 @@ async fn run_tail_cases(cases: impl IntoIterator<Item = TailCase>) {
             }));
         }
 
-        let finish = async move |mut logical: LogicalExecutionTestHarness, drive| {
-            drop(drive);
+        let finish = async move {
+            // This is the SAME actual WC root created above, independent of
+            // the pure AP script. Completion is explicit, not inferred from
+            // any AP terminal, remote receipt or metadata projection.
+            work.owner.complete_after_terminal_cancel_settled();
             work.business.release();
-            logical
-                .finish_until(Instant::now() + Duration::from_secs(2))
-                .await
-                .unwrap();
             tokio::time::timeout(Duration::from_secs(2), scope.wait_released())
                 .await
                 .unwrap();
@@ -708,7 +697,6 @@ async fn run_tail_cases(cases: impl IntoIterator<Item = TailCase>) {
             .unwrap();
         let residual = matches!(case, TailCase::SealVsNativeFailure { .. })
             .then(|| tail.issue_residual_abort(activation, residual_participation));
-        let mut seal = statuses.begin_success_seal_request().unwrap();
         let token = AttemptRequestToken::new(id(1000));
         let seal_request = || {
             AttemptInput::Port(LogicalToAttempt {
@@ -720,6 +708,7 @@ async fn run_tail_cases(cases: impl IntoIterator<Item = TailCase>) {
             let (step, failure) =
                 tail.residual_abort_failure(residual_participation, residual.unwrap());
             let mut observed_round = None;
+            let mut observed_terminal = Vec::new();
             assert!(
                 tail.advance(
                     step,
@@ -734,20 +723,16 @@ async fn run_tail_cases(cases: impl IntoIterator<Item = TailCase>) {
                             AttemptToLogicalBody::AttemptTerminal(AttemptTerminal::Failed(actual))
                                 if actual == &failure
                         ));
-                        assert!(
-                            terminal
-                                .publish(Box::new(TerminalPublication::new(port)))
-                                .is_ok()
-                        );
+                        observed_terminal.push(port);
                     },
                 )
                 .is_none()
             );
             assert_eq!(observed_round, Some(failure));
-            let mut terminal_wait = Box::pin(terminal.terminal());
-            let Poll::Ready(Ok(NativeAttemptTerminal::Failed(native))) =
-                futures::poll!(terminal_wait.as_mut())
-            else {
+            for terminal in observed_terminal {
+                tail.record_terminal(terminal);
+            }
+            let Some(PassiveTerminal::Failed(native)) = tail.terminal() else {
                 panic!("the Native error preceded Seal acceptance");
             };
             assert_eq!(
@@ -758,10 +743,11 @@ async fn run_tail_cases(cases: impl IntoIterator<Item = TailCase>) {
                     kind: OperationKind::AbortParticipation,
                 }
             );
-            assert!(matches!(
-                seal.try_recv(),
-                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
-            ));
+            assert_eq!(
+                tail.terminals.len(),
+                1,
+                "only the preceding actual AP terminal exists"
+            );
             let requested = tail.input(sources.observation, seal_request());
             assert!(requested.root_control_processed.is_some());
             let reply = tail
@@ -785,27 +771,64 @@ async fn run_tail_cases(cases: impl IntoIterator<Item = TailCase>) {
                 crate::task_execution::error::TaskExecutionError::Schedule(refusal.into())
                     .preparation_input(),
             );
-            control
-                .0
-                .lock()
-                .unwrap()
-                .take()
-                .unwrap()
-                .reject(projected.clone());
+            let PassiveBody::SealResult {
+                token: actual_token,
+                result: Err(actual_failure),
+            } = project_port(&port).body
+            else {
+                panic!("the actual original refusal crosses the final passive reply contract");
+            };
+            assert_eq!(actual_failure.error(), &projected);
+            assert_eq!(actual_token, token);
+            // Feed the actual reply action's delivery result only as a pure
+            // Core input script. Real opaque fact-handoff/ACK is a separate test.
             let applied = tail.applied(reply.id, PublicationApplied::SealResult);
             assert!(tail.drive(applied).is_none());
-            assert_eq!(seal.await.unwrap(), Err(projected));
             if let Some(delta) = facts.take_changes(activation, root, plan).unwrap() {
                 assert!(!delta.root_success_sealed());
             }
-            finish(logical, drive).await;
+            finish.await;
             continue;
         }
         let step = tail.input(sources.observation, seal_request());
         assert!(step.root_control_processed.is_some());
-        let reply = tail
-            .drive(step)
-            .expect("the Root seal is independent of strict Task terminal facts");
+        let reply = if matches!(case, TailCase::RunningRootBeforeSeal) {
+            assert!(
+                tail.drive(step).is_none(),
+                "a running Root cannot seal success"
+            );
+            assert!(tail.terminal().is_none());
+            if let Some(delta) = facts.take_changes(activation, root, plan).unwrap() {
+                assert!(!delta.root_success_sealed());
+            }
+            let flushing = TaskStatus::try_new(
+                root,
+                TaskStatusVersion::new(3).unwrap(),
+                TaskState::Flushing,
+                None,
+                TaskOutputFacts::default(),
+            )
+            .unwrap();
+            let step = tail.observe(vec![observation(flushing)]);
+            assert!(
+                tail.drive(step).is_none(),
+                "Flushing preserves the SAME pending Seal"
+            );
+            let delta = facts.take_changes(activation, root, plan).unwrap().unwrap();
+            assert!(!delta.root_success_sealed());
+            assert!(delta.tasks().iter().any(|change| {
+                change.identity() == root
+                    && change
+                        .status()
+                        .is_some_and(|status| status.state() == TaskState::Flushing)
+            }));
+            let step = tail.observe(vec![observation(finished(root))]);
+            tail.drive(step)
+                .expect("only exact Root Finished settles the original Seal")
+        } else {
+            tail.drive(step)
+                .expect("the Root seal is independent of strict Task terminal facts")
+        };
         assert_eq!(reply.token, token);
         if strict {
             assert!(reply.withdrawals.is_empty());
@@ -824,7 +847,15 @@ async fn run_tail_cases(cases: impl IntoIterator<Item = TailCase>) {
                 )]
             );
         }
-        let mut terminal_wait = Box::pin(terminal.terminal());
+        let PassiveBody::SealResult {
+            token: projected_token,
+            result: Ok(projected_withdrawals),
+        } = project_port(&reply.original).body
+        else {
+            panic!("actual AP success Seal reply");
+        };
+        assert_eq!(projected_token, token);
+        assert!(Arc::ptr_eq(&projected_withdrawals, &reply.withdrawals));
         let paused = tail.input(sources.actor, AttemptInput::Timer);
         assert!(paused.effect.is_none() && paused.round_result.is_none());
         assert_eq!(paused.selection, InputSelection::Only(sources.publication));
@@ -834,24 +865,13 @@ async fn run_tail_cases(cases: impl IntoIterator<Item = TailCase>) {
         );
         assert!(foreign.effect.is_none() && foreign.round_result.is_none());
         assert_eq!(foreign.selection, InputSelection::Only(sources.publication));
-        assert!(futures::poll!(terminal_wait.as_mut()).is_pending());
-        assert!(matches!(
-            seal.try_recv(),
-            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
-        ));
+        assert!(
+            tail.terminal().is_none(),
+            "the AP parks AwaitSeal until feedback for its exact action"
+        );
 
-        let request = control
-            .0
-            .lock()
-            .unwrap()
-            .take()
-            .expect("the original QA request");
-        request
-            .accept(
-                tail.publication.take_root_for_seal().unwrap(),
-                reply.withdrawals.to_vec(),
-            )
-            .unwrap();
+        // The same actual Seal output/token/Arc was inspected above. This
+        // exact-action feedback tests AP AwaitSeal; it is not a Host receipt.
         let applied = tail.applied(reply.action, PublicationApplied::SealResult);
         if matches!(case, TailCase::SealVsNativeFailure { seal_first: true }) {
             let mut completed = None;
@@ -869,9 +889,10 @@ async fn run_tail_cases(cases: impl IntoIterator<Item = TailCase>) {
                 )
                 .is_none()
             );
-            // The real Core has selected the original terminal, but the Host
-            // has not delivered it and the QA caller has not consumed its Seal reply.
-            assert!(futures::poll!(terminal_wait.as_mut()).is_pending());
+            // The same actual AP output is still retained in `completed`,
+            // before it is moved into the passive log. No external promise
+            // or actual Host delivery is inferred from this local storage.
+            assert!(tail.terminal().is_none());
             let (step, failure) =
                 tail.residual_abort_failure(residual_participation, residual.unwrap());
             let mut observed_round = None;
@@ -888,24 +909,16 @@ async fn run_tail_cases(cases: impl IntoIterator<Item = TailCase>) {
                 .is_none()
             );
             assert_eq!(observed_round, Some(failure));
-            assert!(
-                terminal
-                    .publish(Box::new(TerminalPublication::new(completed.unwrap())))
-                    .is_ok()
-            );
-            assert!(matches!(
-                futures::poll!(terminal_wait.as_mut()),
-                Poll::Ready(Ok(NativeAttemptTerminal::Completed))
-            ));
+            tail.record_terminal(completed.unwrap());
+            assert!(matches!(tail.terminal(), Some(PassiveTerminal::Completed)));
         } else {
             assert!(tail.drive(applied).is_none());
         }
-        seal.await.unwrap().unwrap();
         let sealed = facts.take_changes(activation, root, plan).unwrap().unwrap();
         assert!(sealed.root_success_sealed());
         assert!(sealed.selected_failure().is_none());
         if strict {
-            assert!(futures::poll!(terminal_wait.as_mut()).is_pending());
+            assert!(tail.terminal().is_none());
         }
 
         match case {
@@ -931,20 +944,14 @@ async fn run_tail_cases(cases: impl IntoIterator<Item = TailCase>) {
                         summary_kind: remaining_kind,
                     }
                 );
-                assert!(futures::poll!(terminal_wait.as_mut()).is_pending());
+                assert!(tail.terminal().is_none());
 
                 let last = tail.observe(vec![observation(finished(last))]);
                 assert!(tail.drive(last).is_none());
                 let delta = facts.take_changes(activation, root, plan).unwrap().unwrap();
                 tracker.observe(&delta).unwrap();
                 assert_eq!(tracker.execution_verdict(), WriteVerdict::Complete);
-                assert!(matches!(
-                    tokio::time::timeout(Duration::from_secs(2), terminal_wait)
-                        .await
-                        .unwrap()
-                        .unwrap(),
-                    NativeAttemptTerminal::Completed
-                ));
+                assert!(matches!(tail.terminal(), Some(PassiveTerminal::Completed)));
             }
             TailCase::StrictSourceFailure => {
                 let termination = TerminationDetail::Failed(TaskFailure::new_in_phase(
@@ -976,9 +983,7 @@ async fn run_tail_cases(cases: impl IntoIterator<Item = TailCase>) {
                                 && status.installed()
                         })
                 }));
-                let Poll::Ready(Ok(NativeAttemptTerminal::Failed(failure))) =
-                    futures::poll!(terminal_wait.as_mut())
-                else {
+                let Some(PassiveTerminal::Failed(failure)) = tail.terminal() else {
                     panic!("strict source failure must settle before either sibling finishes");
                 };
                 assert_eq!(
@@ -1004,12 +1009,14 @@ async fn run_tail_cases(cases: impl IntoIterator<Item = TailCase>) {
                     .await
                     .unwrap();
                 assert_eq!(reason, CancellationReason::Requested);
-                let expected = governed_cancellation_failure_input(reason.clone());
+                let expected = cancellation_decision(LogicalCancellationReason::Requested)
+                    .failure
+                    .execution_failure()
+                    .unwrap()
+                    .clone();
                 let stop = apply_governed_stop(&mut tail, activation, reason);
                 assert!(tail.drive(stop).is_none());
-                let Poll::Ready(Ok(NativeAttemptTerminal::Failed(failure))) =
-                    futures::poll!(terminal_wait.as_mut())
-                else {
+                let Some(PassiveTerminal::Failed(failure)) = tail.terminal() else {
                     panic!("governed cancellation must settle before either sibling finishes");
                 };
                 assert_eq!(failure.input(), &expected);
@@ -1024,11 +1031,8 @@ async fn run_tail_cases(cases: impl IntoIterator<Item = TailCase>) {
                 }
             }
             TailCase::SealVsNativeFailure { .. } => {}
-            TailCase::OrdinaryCompletion => {
-                assert!(matches!(
-                    futures::poll!(terminal_wait.as_mut()),
-                    Poll::Ready(Ok(NativeAttemptTerminal::Completed))
-                ));
+            TailCase::OrdinaryCompletion | TailCase::RunningRootBeforeSeal => {
+                assert!(matches!(tail.terminal(), Some(PassiveTerminal::Completed)));
                 assert!(sealed.tasks().iter().all(|change| {
                     ![writer, summary].contains(&change.identity())
                         || change.status().is_some_and(|status| !status.is_terminal())
@@ -1036,6 +1040,6 @@ async fn run_tail_cases(cases: impl IntoIterator<Item = TailCase>) {
             }
         }
 
-        finish(logical, drive).await;
+        finish.await;
     }
 }

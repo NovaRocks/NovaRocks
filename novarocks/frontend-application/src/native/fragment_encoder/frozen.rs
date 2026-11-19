@@ -507,11 +507,10 @@ pub(crate) mod tests {
         )>,
         padding: usize,
     ) -> Arc<FragmentArtifact> {
+        use novarocks_expression_contract::{ExprKind, RootScope};
         use novarocks_physical_plan as p;
         use novarocks_type_contract::{
-            CompilePhase, ControlShape, EvaluationDomainId, ExpressionControlFlow,
-            ExpressionEffectContext, ExpressionEvaluationDomain, ExpressionInvocation,
-            ExpressionUseId, SemanticParameters,
+            CompileCheckpoints, CompilePhase, EvaluationDemand, SemanticParameters,
         };
         let control = novarocks_sql::compiler::SqlCompileControl::unbounded();
         let id = p::FragmentId::new(fragment_id);
@@ -554,17 +553,25 @@ pub(crate) mod tests {
                 )
                 .expect("output value");
             let expr = builder
-                .add_expression(
-                    node,
+                .unit(node)
+                .unwrap()
+                .add(
+                    None,
                     ty.clone(),
-                    p::ExprKind::Constant(p::ConstantReference {
+                    ExprKind::Constant(p::ConstantReference {
                         pool,
                         ordinal: literal.ordinal(),
                     }),
                 )
                 .expect("constant expression");
             values.push(value);
-            expressions.push(expr);
+            expressions.push(
+                builder
+                    .unit(node)
+                    .unwrap()
+                    .root(expr, EvaluationDemand::Value, RootScope::AllPorts)
+                    .unwrap(),
+            );
             remaining -= width;
             if remaining == 0 {
                 break;
@@ -583,6 +590,17 @@ pub(crate) mod tests {
         } else {
             p::FragmentSink::Result
         };
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
+        let ports = builder.node_ports(node).unwrap();
+        let unit = builder
+            .take_unit_builder(node)
+            .unwrap()
+            .seal(ports, &mut work)
+            .unwrap()
+            .finish(BTreeMap::new(), &mut work)
+            .unwrap();
+        builder.install_unit(node, Arc::new(unit)).unwrap();
+        work.finish().unwrap();
         let fragment = builder
             .finish_definition(
                 node,
@@ -591,44 +609,6 @@ pub(crate) mod tests {
                 novarocks_physical_plan::StagePlacementPolicy::Singleton,
             )
             .expect("checked fragment definition");
-        let roots = p::PhysicalExpressionRoots::try_new(&fragment, &control).expect("roots");
-        let bindings = roots
-            .sites()
-            .iter()
-            .enumerate()
-            .map(|(i, (site, _))| (*site, ExpressionUseId::new(i as u32)))
-            .collect();
-        let uses = roots
-            .sites()
-            .iter()
-            .enumerate()
-            .map(|(i, (_, root))| ExpressionInvocation {
-                context: ExpressionEffectContext {
-                    use_id: ExpressionUseId::new(i as u32),
-                    domain: EvaluationDomainId::new(0),
-                    demand: root.demand,
-                },
-                definition: root.expr,
-                control: ControlShape::Eager,
-                arguments: Box::default(),
-            })
-            .collect();
-        let flow = ExpressionControlFlow::try_new(
-            vec![ExpressionEvaluationDomain {
-                id: EvaluationDomainId::new(0),
-                parent: None,
-                guard: None,
-            }],
-            uses,
-            fragment.expressions(),
-            CompilePhase::Validate,
-            &control,
-        )
-        .expect("complete eager constant flow");
-        let expression_uses = p::PhysicalRootUses::try_new(&fragment, flow, bindings, &control)
-            .expect("exact root uses");
-        let calls = p::FrozenFragmentCalls::try_new(&fragment, &expression_uses, vec![], &control)
-            .expect("complete empty calls");
         let pruning =
             p::FrozenFragmentPruning::try_new(id, vec![], &control).expect("empty pruning");
         let mut edges = BTreeMap::new();
@@ -651,6 +631,7 @@ pub(crate) mod tests {
                     source_multiplicity: p::RowMultiplicity::SingleCopy,
                     destination: p::Distribution::Singleton,
                     destination_multiplicity: p::RowMultiplicity::SingleCopy,
+                    routing_only: Box::default(),
                 };
                 edges.insert(
                     edge_id,
@@ -725,8 +706,8 @@ pub(crate) mod tests {
                 version: p::PlanVersionId::try_new(version).expect("nonzero version"),
                 required: p::RequiredContracts::default(),
                 fragment,
-                expression_uses,
-                calls,
+                statement_constant_policy:
+                    novarocks_plan_codec::physical_package_v2::FROZEN_CONSTANT_POLICY,
                 pruning,
                 cuts,
                 result,
@@ -734,6 +715,7 @@ pub(crate) mod tests {
                 scans: BTreeMap::new(),
                 writes: BTreeMap::new(),
                 annotations: Box::default(),
+                layouts: Default::default(),
             },
             novarocks_plan_codec::physical_package_v2::FROZEN_PACKAGE_ADMISSION,
             &control,

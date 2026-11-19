@@ -380,6 +380,7 @@ async fn merge_preserves_current_status_and_old_identity_at_capacity_one() {
         &metadata,
         20,
         context(),
+        0,
         vec![
             MergeCandidate::pending(pending),
             MergeCandidate::committed(old, 10, "old-list"),
@@ -520,6 +521,7 @@ async fn merge_date_and_timestamp(
         &metadata,
         20,
         context(),
+        0,
         vec![
             MergeCandidate::pending(pending),
             MergeCandidate::committed(old, 10, "old-list"),
@@ -613,4 +615,189 @@ async fn merge_rejects_date_bounds_outside_the_promoted_range() {
                 .contains("DATE manifest bound 2147483647 days overflows")
         );
     }
+}
+
+#[tokio::test]
+async fn merge_reuses_exact_ordered_inputs_but_rewrites_changed_order_or_encoding() {
+    use crate::commit::model::ArtifactWriter;
+    use crate::commit::overwrite::preparer_tests::Fixture;
+    use crate::iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+    use std::collections::BTreeSet;
+    use std::sync::Mutex;
+    let fixture = Fixture::new();
+    let metadata = fixture.metadata(FormatVersion::V2);
+    let artifacts = fixture.operation.begin_attempt().unwrap();
+    let snapshot = artifacts.stage_snapshot_id(0, &metadata).unwrap();
+    let mut inputs = Vec::new();
+    for name in ["one", "two"] {
+        inputs.push(
+            write_manifest(
+                &artifacts,
+                metadata.format_version(),
+                snapshot,
+                metadata.current_schema().clone(),
+                metadata.default_partition_spec().as_ref().clone(),
+                ManifestContentType::Data,
+                [added(data(name, None), None)],
+            )
+            .await
+            .unwrap(),
+        );
+    }
+    fn candidates(inputs: &[ManifestFile]) -> Vec<MergeCandidate<'_>> {
+        inputs
+            .iter()
+            .cloned()
+            .map(MergeCandidate::pending)
+            .collect()
+    }
+    fn paths(events: &[crate::fs_io::TestStorageRequest], operation: &str) -> BTreeSet<String> {
+        events
+            .iter()
+            .filter(|event| event.operation == operation)
+            .map(|event| event.path.clone())
+            .collect()
+    }
+    fn check_entries(output: &ManifestFile, expected: &[&str]) {
+        let bytes = std::fs::read(output.manifest_path.trim_start_matches("file://")).unwrap();
+        let manifest = crate::iceberg::spec::Manifest::parse_avro(&bytes).unwrap();
+        let actual = manifest
+            .entries()
+            .iter()
+            .map(|entry| {
+                assert_eq!(entry.status, ManifestStatus::Added);
+                assert_eq!(entry.data_file().record_count(), 2);
+                entry.data_file().file_path()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+    }
+    async fn merge_observed(
+        artifacts: &dyn ArtifactWriter,
+        metadata: &TableMetadata,
+        snapshot: i64,
+        inputs: &[ManifestFile],
+    ) -> (ManifestFile, Vec<crate::fs_io::TestStorageRequest>) {
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let output = crate::fs_io::TEST_STORAGE_REQUESTS
+            .scope(
+                trace.clone(),
+                merge_manifests(
+                    artifacts,
+                    metadata,
+                    snapshot,
+                    context(),
+                    0,
+                    candidates(inputs),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            output.len(),
+            1,
+            "The real min-count=2 packer must merge these two inputs"
+        );
+        let events = trace.lock().unwrap().clone();
+        (output.into_iter().next().unwrap(), events)
+    }
+    let source_paths = inputs
+        .iter()
+        .map(|input| input.manifest_path.clone())
+        .collect::<BTreeSet<_>>();
+    let (first, first_events) = merge_observed(&artifacts, &metadata, snapshot, &inputs).await;
+    assert_eq!(paths(&first_events, "read"), source_paths);
+    assert_eq!(
+        paths(&first_events, "write"),
+        BTreeSet::from([first.manifest_path.clone()])
+    );
+    check_entries(
+        &first,
+        &["s3://bucket/one.parquet", "s3://bucket/two.parquet"],
+    );
+    let (same, same_events) = merge_observed(&artifacts, &metadata, snapshot, &inputs).await;
+    assert_eq!(same, first);
+    assert!(paths(&same_events, "read").is_empty());
+    assert!(paths(&same_events, "write").is_empty());
+    let reversed = inputs.iter().rev().cloned().collect::<Vec<_>>();
+    let (reordered, reordered_events) =
+        merge_observed(&artifacts, &metadata, snapshot, &reversed).await;
+    assert_ne!(reordered.manifest_path, first.manifest_path);
+    assert_eq!(paths(&reordered_events, "read"), source_paths);
+    assert_eq!(
+        paths(&reordered_events, "write"),
+        BTreeSet::from([reordered.manifest_path.clone()])
+    );
+    check_entries(
+        &reordered,
+        &["s3://bucket/two.parquet", "s3://bucket/one.parquet"],
+    );
+    let mut fields = metadata.current_schema().as_struct().fields().to_vec();
+    fields.push(Arc::new(NestedField::optional(
+        2,
+        "note",
+        Type::Primitive(PrimitiveType::String),
+    )));
+    let changed = metadata
+        .into_builder(None)
+        .add_current_schema(Schema::builder().with_fields(fields).build().unwrap())
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+    let (reencoded, reencoded_events) =
+        merge_observed(&artifacts, &changed, snapshot, &inputs).await;
+    assert_ne!(reencoded.manifest_path, first.manifest_path);
+    assert_eq!(paths(&reencoded_events, "read"), source_paths);
+    assert_eq!(
+        paths(&reencoded_events, "write"),
+        BTreeSet::from([reencoded.manifest_path.clone()])
+    );
+    check_entries(
+        &reencoded,
+        &["s3://bucket/one.parquet", "s3://bucket/two.parquet"],
+    );
+    for output in [first, reordered, reencoded] {
+        assert!(std::path::Path::new(output.manifest_path.trim_start_matches("file://")).exists());
+    }
+    // The test never dispatches a catalog request; its original owner can
+    // reclaim every actually written input/output after all I/O has exited.
+    assert_eq!(
+        fixture
+            .operation
+            .cleanup(crate::commit::model::CleanupScope::EntireOperation)
+            .await,
+        crate::commit::model::IcebergCleanupReport::Complete { deleted: 5 }
+    );
+}
+
+#[test]
+fn rolled_full_manifests_are_kept_alone_and_small_tail_uses_the_existing_merge_policy() {
+    let data = ManifestContentType::Data;
+    let pending = |name, bytes| MergeCandidate::pending(descriptor(name, bytes, 0, data));
+    let policy = ManifestMergePolicy {
+        enabled: true,
+        min_count: 3,
+        target_bytes: 100,
+    };
+    let retained = || candidate("retained", 25, 0, data);
+    let rolled = vec![
+        pending("first", 103),
+        pending("second", 101),
+        pending("tail", 70),
+        retained(),
+    ];
+    assert_eq!(
+        inspect(plan(rolled, policy).unwrap()),
+        [
+            (false, vec!["first".into()]),
+            (false, vec!["second".into()]),
+            (true, vec!["tail".into(), "retained".into()]),
+        ],
+    );
+    let first_short = vec![pending("tail", 70), retained()];
+    assert_eq!(
+        inspect(plan(first_short, policy).unwrap()),
+        [(false, vec!["tail".into(), "retained".into()])],
+    );
 }

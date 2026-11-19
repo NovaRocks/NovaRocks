@@ -2304,7 +2304,7 @@ mod tests {
 
     #[test]
     fn completed_arithmetic_and_cast_refs_freeze_the_exact_admitted_root_allow_value() {
-        use novarocks_physical_plan::{BinaryOperator, ExprKind};
+        use novarocks_expression_contract::{BinaryOperator, ExprKind};
         use novarocks_type_contract::{
             DecimalOverflowPolicy::{OutputNull, ReportError},
             SemanticParameterId, SemanticParameterKey, SemanticParameterValue,
@@ -2340,7 +2340,12 @@ mod tests {
             let mut arithmetic = 0;
             let mut casts = 0;
             for fragment in plan.fragments().values() {
-                for (_, expression) in fragment.expressions().iter() {
+                for expression in fragment
+                    .nodes()
+                    .values()
+                    .filter_map(|node| node.expressions.as_ref())
+                    .flat_map(|unit| unit.definitions())
+                {
                     let (reference, policy) = match &expression.kind {
                         ExprKind::Binary {
                             op: BinaryOperator::Add,
@@ -2380,7 +2385,7 @@ mod tests {
 
     #[test]
     fn completed_derived_query_inherits_root_allow_refs_and_decimal_policy() {
-        use novarocks_physical_plan::{BinaryOperator, ExprKind};
+        use novarocks_expression_contract::{BinaryOperator, ExprKind};
         use novarocks_type_contract::{DecimalOverflowPolicy::OutputNull, SemanticParameterValue};
         let completed = complete_root_intrinsic_fixture(
             "SELECT x + 1 AS a FROM (SELECT CAST(order_key AS DECIMAL(18,6)) AS x FROM orders) s",
@@ -2391,7 +2396,12 @@ mod tests {
         let mut saw_root_arithmetic = false;
         let mut saw_nested_cast = false;
         for fragment in plan.fragments().values() {
-            for (_, expression) in fragment.expressions().iter() {
+            for expression in fragment
+                .nodes()
+                .values()
+                .filter_map(|node| node.expressions.as_ref())
+                .flat_map(|unit| unit.definitions())
+            {
                 for reference in expression.kind.intrinsic_parameter_references() {
                     assert_eq!(
                         plan.parameters().require(*reference).unwrap(),
@@ -2425,13 +2435,18 @@ mod tests {
                 let plan = completed.plan();
                 assert!(plan.parameters().entries().is_empty());
                 assert!(plan.fragments().values().all(|fragment| {
-                    fragment.expressions().iter().all(|(_, expression)| {
-                        expression
-                            .kind
-                            .intrinsic_parameter_references()
-                            .next()
-                            .is_none()
-                    })
+                    fragment
+                        .nodes()
+                        .values()
+                        .filter_map(|node| node.expressions.as_ref())
+                        .flat_map(|unit| unit.definitions())
+                        .all(|expression| {
+                            expression
+                                .kind
+                                .intrinsic_parameter_references()
+                                .next()
+                                .is_none()
+                        })
                 }));
             }
         }
@@ -3596,7 +3611,10 @@ mod tests {
                     assert!(!calls.is_empty());
                     assert_eq!(group_by.len(), 1);
                     assert_eq!(
-                        fragment.expressions().get(group_by[0].0).unwrap().ty,
+                        fragment
+                            .root_expression(aggregate.id, group_by[0].0)
+                            .unwrap()
+                            .ty,
                         key.ty
                     );
                     let RuntimeFilterProducerTarget::AggregateTopNKey {
@@ -3699,11 +3717,13 @@ mod tests {
     }
 
     fn assert_grouped_state_topn_sources(owner: &super::super::SqlAuthoredPhysicalPlan) {
-        use novarocks_physical_plan::{
-            AggregateGrouping, AggregatePhase, ExprKind as PhysicalExprKind, PhysicalCallSite,
-            TopNReduction,
-        };
         use novarocks_type_contract::{CompileCheckpoints, CompilePhase};
+        use {
+            novarocks_expression_contract::ExprKind as PhysicalExprKind,
+            novarocks_physical_plan::{
+                AggregateGrouping, AggregatePhase, PhysicalCallSite, TopNReduction,
+            },
+        };
         let control = SqlCompileControl::unbounded();
         let mut work =
             CompileCheckpoints::try_new(&control, CompilePhase::FunctionSpecialization).unwrap();
@@ -3749,7 +3769,7 @@ mod tests {
                     binding.phase = call.binding.phase;
                     assert_eq!(call.binding, binding);
                     assert!(
-                        matches!(fragment.expressions().get(call.arguments[0]).unwrap().kind, PhysicalExprKind::Value(input) if input == original.output)
+                        matches!(fragment.root_expression(node.id, call.arguments[0]).unwrap().kind, PhysicalExprKind::Value(input) if input == original.output)
                     );
                     let ordinal = u32::try_from(ordinal).unwrap();
                     let consumer = owner

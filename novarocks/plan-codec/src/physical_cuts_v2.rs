@@ -317,12 +317,28 @@ fn count_partition(
     if let Some(p) = p {
         c.distribution(Some(&p.source), None, w)?;
         c.distribution(Some(&p.destination), None, w)?;
+        c.list::<(p::ValueId, p::ValueId), wire::RoutingOnlyValue>(p.routing_only.len(), 0, w)?;
+        for _ in &p.routing_only {
+            c.id(w)?;
+            c.id(w)?;
+        }
     } else {
         let p = req(raw)?;
         props::decode_multiplicity(p.source_multiplicity)?;
         props::decode_multiplicity(p.destination_multiplicity)?;
         c.distribution(None, p.source.as_ref(), w)?;
         c.distribution(None, p.destination.as_ref(), w)?;
+        c.list::<(p::ValueId, p::ValueId), wire::RoutingOnlyValue>(
+            p.routing_only.len(),
+            p.routing_only.capacity(),
+            w,
+        )?;
+        for value in &p.routing_only {
+            req(value.source_value_id)?;
+            req(value.destination_value_id)?;
+            c.id(w)?;
+            c.id(w)?;
+        }
     }
     Ok(())
 }
@@ -1237,6 +1253,12 @@ fn encode_partition(
         source_multiplicity: props::encode_multiplicity(p.source_multiplicity),
         destination: Some(props::emit_distribution_observed(&p.destination, w)?),
         destination_multiplicity: props::encode_multiplicity(p.destination_multiplicity),
+        routing_only: vec_map(&p.routing_only, w, |(source, destination), _| {
+            Ok(wire::RoutingOnlyValue {
+                source_value_id: Some(source.get()),
+                destination_value_id: Some(destination.get()),
+            })
+        })?,
     })
 }
 fn decode_partition(
@@ -1251,6 +1273,13 @@ fn decode_partition(
             w,
         )?,
         destination_multiplicity: props::decode_multiplicity(p.destination_multiplicity)?,
+        routing_only: vec_map(&p.routing_only, w, |value, _| {
+            Ok((
+                p::ValueId::new(req(value.source_value_id)?),
+                p::ValueId::new(req(value.destination_value_id)?),
+            ))
+        })?
+        .into_boxed_slice(),
     })
 }
 fn encode_value(p: &p::CutValue, e: &mut Encode<'_>) -> Result<wire::CutValue, E> {

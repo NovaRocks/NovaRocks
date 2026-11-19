@@ -319,3 +319,96 @@ fn actual_apply_failure_blocks_the_old_round_tail_and_cannot_be_overwritten_by_l
     assert!(!cursor.permits_protocol_turn());
     assert!(cursor.select(&mut execution, false).is_err());
 }
+
+#[test]
+fn task_status_replay_cannot_move_the_transport_cursor_backwards() {
+    let (mut execution, mut publication) = fixture();
+    finish_initial(&mut execution, &mut publication);
+    let current = status(&execution, 1, 2);
+    accept(&mut execution, &current);
+    publication.select(&mut execution, false).unwrap();
+    finish(&mut publication, &execution, 2);
+    let identity = current.identity();
+    let participation = execution
+        .task_by_identity_ref(identity)
+        .unwrap()
+        .participation();
+    let held = execution.status_cursors(participation);
+    assert_eq!(
+        held.iter()
+            .find(|cursor| cursor.identity() == identity)
+            .unwrap()
+            .current_version(),
+        Some(TaskStatusVersion::new(2).unwrap())
+    );
+    for observed in [status(&execution, 1, 1), current] {
+        let mut report = StatusReport::default();
+        execution.apply_published(&observed, &mut report).unwrap();
+        assert_eq!(report.accepted, 0);
+        assert_eq!(report.ignored, 1);
+        assert_eq!(execution.status_cursors(participation), held);
+        assert!(execution.accepted_protocol_task_changes().is_empty());
+        assert!(
+            !publication.select(&mut execution, false).unwrap(),
+            "an old or identical observation cannot republish a Task fact"
+        );
+    }
+}
+
+#[test]
+fn convergence_protocol_errors_leave_the_cursor_unchanged() {
+    use novarocks_execution_contract::{
+        ParticipationConvergenceReceipt, ParticipationConvergenceState,
+        ParticipationConvergenceVersion,
+    };
+    let (mut execution, _) = fixture();
+    let exact = *execution.graph().participations().next().unwrap();
+    let version = ParticipationConvergenceVersion::FIRST.next().unwrap();
+    let state = ParticipationConvergenceState::WorkerStoppedAndParticipationFenced;
+    let original = ParticipationConvergenceReceipt::new(exact, version, state);
+    let frame = |receipt| CoveredStatusStreamEvent {
+        source_revision: None,
+        fact: CoveredStatusStreamFact::ParticipationConvergence(receipt),
+    };
+    execution
+        .apply_covered_frame(exact, 1, frame(original), &mut StatusReport::default())
+        .unwrap();
+    let foreign_frontend = novarocks_types::FrontendProcessId::try_from_bytes(
+        crate::test_support::backend(701).to_bytes(),
+    )
+    .unwrap();
+    assert_ne!(foreign_frontend, exact.frontend_process_id());
+    let stranger = ParticipationRef::new(
+        exact.query_execution_id(),
+        foreign_frontend,
+        exact.backend_process_id(),
+    );
+    for rejected in [
+        ParticipationConvergenceReceipt::new(exact, ParticipationConvergenceVersion::FIRST, state),
+        ParticipationConvergenceReceipt::new(stranger, version, state),
+    ] {
+        assert!(matches!(
+            execution.apply_covered_frame(exact, 1, frame(rejected), &mut StatusReport::default()),
+            Err(TaskExecutionError::Schedule(_))
+        ));
+        assert_eq!(
+            execution.participation_convergence_receipt(exact),
+            Some(original)
+        );
+        let mut request = super::subscription_request::SubscriptionRequestBuild::new(
+            &execution,
+            exact,
+            NonZeroU64::new(2).unwrap(),
+        )
+        .unwrap();
+        let actual = request
+            .advance(&execution, &mut Units::new(100))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            actual.participation_cursor.unwrap().current_version(),
+            Some(version)
+        );
+        assert!(execution.accepted_protocol_task_changes().is_empty());
+    }
+}

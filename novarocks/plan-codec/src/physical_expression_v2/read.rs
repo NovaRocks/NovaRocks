@@ -51,6 +51,7 @@ pub type ExpressionNamespaceReadFacts = ExpressionNamespaceWriteFacts;
 /// invent provenance for their construction or replace Fragment validation.
 pub struct DecodedExpressions<'loan, 'wire, 'control> {
     definitions: &'wire [wire::ExpressionDefinition],
+    roots: &'wire [wire::ExpressionRoot],
     values: &'loan DecodedValues<'loan, 'wire, 'control>,
     functions: &'loan PreparedFunctionBindingHeaders<'wire>,
     aggregates: &'loan PreparedAggregateBindingHeaders<'loan, 'wire>,
@@ -94,6 +95,20 @@ impl<'loan, 'wire, 'control> DecodedExpressions<'loan, 'wire, 'control> {
     }
     pub fn lookup_work_upper_bound(&self) -> Result<usize, Error> {
         tree_lookup_work(self.definitions.len())
+    }
+    pub(crate) fn root_definition_observed(
+        &self,
+        ordinal: u32,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Option<&'wire wire::ExpressionDefinition>, Error> {
+        work.step()?;
+        match self.roots.get(ordinal as usize) {
+            Some(root) => self.definition_observed(
+                required(root.definition_id, "missing root definition")?,
+                work,
+            ),
+            None => Ok(None),
+        }
     }
     pub fn definition(&self, id: u32) -> Result<Option<&'wire wire::ExpressionDefinition>, Error> {
         let mut work = CompileCheckpoints::try_new(self.original_control(), CompilePhase::Decode)?;
@@ -146,6 +161,34 @@ impl<'loan, 'wire, 'control> DecodedExpressions<'loan, 'wire, 'control> {
         admit(&lookup_facts(1))?;
         work.step()?;
         Ok(floor)
+    }
+    /// This namespace's own disjoint header/index backing, excluding the
+    /// already invoiced union of borrowed source owners.
+    pub(crate) fn retained_output_floor(&self) -> Result<usize, Error> {
+        add(size_of::<Self>(), self.indices.backing_bytes()?)
+    }
+    /// Union of the actual borrowed/owned namespaces. Complete invoices may
+    /// already contain each other's outputs, so only disjoint output floors
+    /// are added. This numerical loan certifies no namespace association.
+    pub(crate) fn owned_binding_floor(
+        &self,
+        functions: &crate::physical_binding_v2::MaterializedFunctionBindings<'_, '_>,
+        aggregates: Option<
+            &crate::physical_aggregate_binding_v2::MaterializedAggregateBindings<'_, '_, '_>,
+        >,
+    ) -> Result<usize, Error> {
+        let mut owned = add(
+            self.retained_output_floor()?,
+            functions.retained_output_floor()?,
+        )?;
+        let mut invoice = self
+            .retained_floor_header_in()?
+            .max(functions.retained_invoice_floor()?);
+        if let Some(aggregates) = aggregates {
+            owned = add(owned, aggregates.retained_output_floor()?)?;
+            invoice = invoice.max(aggregates.retained_invoice_floor()?);
+        }
+        Ok(invoice.max(owned))
     }
     pub(crate) fn retained_floor_header_in(
         &self,
@@ -208,12 +251,29 @@ impl<'loan, 'wire, 'control> DecodedExpressions<'loan, 'wire, 'control> {
     }
 }
 
-/// Borrow all seventeen closed wire kinds. Types and control come from the
+/// Exact syntax slices from one receiving node namespace. This borrowed
+/// declaration supplies neither a published Unit nor SQL provenance.
+#[derive(Clone, Copy)]
+pub struct ExpressionDefinitionInput<'wire> {
+    definitions: &'wire [wire::ExpressionDefinition],
+    roots: &'wire [wire::ExpressionRoot],
+}
+impl<'wire> ExpressionDefinitionInput<'wire> {
+    pub fn new(
+        definitions: &'wire [wire::ExpressionDefinition],
+        roots: &'wire [wire::ExpressionRoot],
+    ) -> Self {
+        Self { definitions, roots }
+    }
+}
+
+/// Borrow all sixteen closed scalar wire kinds. Types and control come from the
 /// original value namespace; function and aggregate tokens must retain that
 /// same immutable correspondence. Source is a mandatory whole coexistence
 /// invoice, not encoded length, a guessed capacity or allocation authority.
 pub fn decode_expression_definitions<'loan, 'wire, 'control>(
     definitions: &'wire [wire::ExpressionDefinition],
+    roots: &'wire [wire::ExpressionRoot],
     values: &'loan DecodedValues<'loan, 'wire, 'control>,
     functions: &'loan PreparedFunctionBindingHeaders<'wire>,
     aggregates: &'loan PreparedAggregateBindingHeaders<'loan, 'wire>,
@@ -224,7 +284,7 @@ pub fn decode_expression_definitions<'loan, 'wire, 'control>(
 ) -> Result<DecodedExpressions<'loan, 'wire, 'control>, Error> {
     let mut work = CompileCheckpoints::try_new(values.original_control(), CompilePhase::Decode)?;
     let result = decode_core(
-        definitions,
+        ExpressionDefinitionInput::new(definitions, roots),
         values,
         functions,
         aggregates,
@@ -238,7 +298,7 @@ pub fn decode_expression_definitions<'loan, 'wire, 'control>(
     finish(work, result)
 }
 pub fn decode_expression_definitions_in<'loan, 'wire, 'control>(
-    definitions: &'wire [wire::ExpressionDefinition],
+    input: ExpressionDefinitionInput<'wire>,
     values: &'loan DecodedValues<'loan, 'wire, 'control>,
     functions: &'loan PreparedFunctionBindingHeaders<'wire>,
     aggregates: &'loan PreparedAggregateBindingHeaders<'loan, 'wire>,
@@ -251,7 +311,7 @@ pub fn decode_expression_definitions_in<'loan, 'wire, 'control>(
 ) -> Result<DecodedExpressions<'loan, 'wire, 'control>, Error> {
     same_control(values.original_control(), work)?;
     decode_core(
-        definitions,
+        input,
         values,
         functions,
         aggregates,
@@ -264,7 +324,7 @@ pub fn decode_expression_definitions_in<'loan, 'wire, 'control>(
     )
 }
 fn decode_core<'loan, 'wire, 'control>(
-    definitions: &'wire [wire::ExpressionDefinition],
+    input: ExpressionDefinitionInput<'wire>,
     values: &'loan DecodedValues<'loan, 'wire, 'control>,
     functions: &'loan PreparedFunctionBindingHeaders<'wire>,
     aggregates: &'loan PreparedAggregateBindingHeaders<'loan, 'wire>,
@@ -275,6 +335,7 @@ fn decode_core<'loan, 'wire, 'control>(
     parent: Option<&mut Admit<'_>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<DecodedExpressions<'loan, 'wire, 'control>, Error> {
+    let ExpressionDefinitionInput { definitions, roots } = input;
     let control = values.original_control();
     let mut admission = Admission {
         parent,
@@ -309,9 +370,17 @@ fn decode_core<'loan, 'wire, 'control>(
             &mut admission,
             work,
         )?;
+        for (ordinal, definition) in definitions.iter().enumerate() {
+            let dense = definition.id as usize == ordinal;
+            work.step()?;
+            if !dense {
+                return Err(shape("expression definition IDs are not dense"));
+            }
+        }
         let indices = BindingIndex::prepare(definitions.len(), |at| definitions[at].id, work)?;
         let mut output = DecodedExpressions {
             definitions,
+            roots,
             values,
             functions,
             aggregates,
@@ -323,6 +392,15 @@ fn decode_core<'loan, 'wire, 'control>(
             control,
         };
         output.validate(&mut admission, work)?;
+        let root_work = mul(roots.len(), add(tree_lookup_work(definitions.len())?, 2)?)?;
+        admission.charge(&mut output.facts, root_work, work)?;
+        for root in roots {
+            let id = required(root.definition_id, "unit root definition is absent")?;
+            if output.definition_observed(id, work)?.is_none() {
+                return Err(shape("root definition is absent from this node namespace"));
+            }
+            work.step()?;
+        }
         Ok(output)
     })()
 }
@@ -346,7 +424,7 @@ fn references(
         .as_ref()
         .ok_or_else(|| shape("expression kind is absent"))?
     {
-        K::ValueId(_) | K::Literal(_) => {}
+        K::ValueId(_) | K::Constant(_) => {}
         K::LambdaParameter(value) => visit(required(
             value.lambda_expr_id,
             "lambda parameter owner is absent",
@@ -409,28 +487,6 @@ fn references(
             }
         }
         K::IsTruthValue(value) => visit(required(value.expr_id, "truth-test operand is absent")?)?,
-        K::WindowCall(value) => {
-            for id in &value.argument_expr_ids {
-                visit(*id)?;
-            }
-            for key in &value.function_order_by {
-                visit(required(key.expr_id, "window sort operand is absent")?)?;
-            }
-            if let Some(frame) = &value.frame {
-                for bound in [&frame.start, &frame.end] {
-                    let bound = bound
-                        .as_ref()
-                        .ok_or_else(|| shape("window frame bound is absent"))?;
-                    match super::receiving_grammar::decode_window_bound(bound)? {
-                        novarocks_physical_plan::WindowBound::Preceding(id)
-                        | novarocks_physical_plan::WindowBound::Following(id) => visit(id.get())?,
-                        novarocks_physical_plan::WindowBound::UnboundedPreceding
-                        | novarocks_physical_plan::WindowBound::CurrentRow
-                        | novarocks_physical_plan::WindowBound::UnboundedFollowing => {}
-                    }
-                }
-            }
-        }
     }
     Ok(())
 }
@@ -490,10 +546,7 @@ fn preflight(
             K::Lambda(value) => numeric.bytes::<u32>(value.parameter_value_type_ids.capacity())?,
             K::InList(value) => numeric.bytes::<u32>(value.list_expr_ids.capacity())?,
             K::CaseExpression(value) => numeric.bytes::<wire::WhenThen>(value.arms.capacity())?,
-            K::WindowCall(value) => numeric.add(
-                numeric.bytes::<u32>(value.argument_expr_ids.capacity())?,
-                numeric.bytes::<wire::SortExpression>(value.function_order_by.capacity())?,
-            )?,
+
             _ => 0,
         };
         floor = numeric.add(floor, owned)?;
@@ -642,7 +695,6 @@ impl<'loan, 'wire, 'control> DecodedExpressions<'loan, 'wire, 'control> {
     ) -> Result<(), Error> {
         let definitions = self.definitions;
         for definition in definitions {
-            required(definition.owner_node_id, "expression owner node is absent")?;
             let type_id = required(definition.value_type_id, "expression value type is absent")?;
             self.type_root(type_id, admission, work)?;
             references(definition, |id| {
@@ -695,7 +747,7 @@ impl<'loan, 'wire, 'control> DecodedExpressions<'loan, 'wire, 'control> {
                     self.match_types(header, &value.ty, admission, work)?;
                 }
             }
-            K::Literal(reference) => {
+            K::Constant(reference) => {
                 let reference = ConstantReference {
                     pool: ConstantPoolId::new(required(
                         reference.pool_id,
@@ -742,12 +794,12 @@ impl<'loan, 'wire, 'control> DecodedExpressions<'loan, 'wire, 'control> {
                     compare_types(header, pool.value_type(), &mut self.facts, admission, work)?
                 };
                 if !verified.matches() {
-                    return Err(
-                        novarocks_physical_plan::ConstantReferenceError::SourceTypeMismatch(
+                    return Err(novarocks_physical_plan::ConstantReferenceError::Table(
+                        novarocks_constant_contract::ConstantTableError::SourceTypeMismatch(
                             reference,
-                        )
-                        .into(),
-                    );
+                        ),
+                    )
+                    .into());
                 }
                 work.flush()?;
                 let selected = self
@@ -903,7 +955,6 @@ impl<'loan, 'wire, 'control> DecodedExpressions<'loan, 'wire, 'control> {
             | K::Like(_)
             | K::CaseExpression(_)
             | K::IsTruthValue(_) => {}
-            K::WindowCall(value) => self.window(definition, value, admission, work)?,
         }
         work.step()?;
         Ok(())
@@ -1119,213 +1170,6 @@ impl<'loan, 'wire, 'control> DecodedExpressions<'loan, 'wire, 'control> {
         }
         self.call_result(definition, function, admission, work)?;
         self.arguments(&function.arguments, arguments, admission, work)
-    }
-    fn signatures(
-        &mut self,
-        left: &wire::FunctionBindingDefinition,
-        right: &wire::FunctionBindingDefinition,
-        admission: &mut Admission<'_, '_>,
-        work: &mut CompileCheckpoints<'_>,
-    ) -> Result<(), Error> {
-        let numeric = Arithmetic(admission.observed());
-        // Header identities have already passed the sole <=1024-byte grammar.
-        // Compare the actual strings at an honest opaque boundary; IDs in the
-        // sparse namespace may alias one exact selected signature.
-        self.charge(
-            numeric.add(
-                numeric.add(left.function_id.len(), right.function_id.len())?,
-                numeric.add(left.overload_id.len(), right.overload_id.len())?,
-            )?,
-            admission,
-            work,
-        )?;
-        work.flush()?;
-        let same = left.function_id == right.function_id
-            && left.overload_id == right.overload_id
-            && left.kind == right.kind
-            && left.arguments.len() == right.arguments.len();
-        work.step()?;
-        work.flush()?;
-        if !same {
-            return Err(shape("window aggregate and function signatures differ"));
-        }
-        let types = self.values.types();
-        self.charge(
-            numeric.mul(
-                numeric.add(left.arguments.len(), 1)?,
-                numeric.add(
-                    16,
-                    numeric.mul(2, tree_lookup_work(types.value_types().len())?)?,
-                )?,
-            )?,
-            admission,
-            work,
-        )?;
-        for (left, right) in left.arguments.iter().zip(&right.arguments) {
-            match (left.kind.as_ref(), right.kind.as_ref()) {
-                (
-                    Some(wire::function_argument_type::Kind::ValueTypeId(left)),
-                    Some(wire::function_argument_type::Kind::ValueTypeId(right)),
-                ) => self.signature_types(*left, *right, admission, work)?,
-                (
-                    Some(wire::function_argument_type::Kind::Lambda(left)),
-                    Some(wire::function_argument_type::Kind::Lambda(right)),
-                ) => {
-                    let same =
-                        left.parameter_value_type_ids.len() == right.parameter_value_type_ids.len();
-                    work.step()?;
-                    if !same {
-                        return Err(shape("aggregate lambda signature arity differs"));
-                    }
-                    self.charge(
-                        numeric.mul(
-                            left.parameter_value_type_ids.len(),
-                            numeric.mul(2, tree_lookup_work(types.value_types().len())?)?,
-                        )?,
-                        admission,
-                        work,
-                    )?;
-                    for (left, right) in left
-                        .parameter_value_type_ids
-                        .iter()
-                        .zip(&right.parameter_value_type_ids)
-                    {
-                        self.signature_types(*left, *right, admission, work)?;
-                    }
-                    self.signature_types(
-                        required(
-                            left.result_value_type_id,
-                            "aggregate lambda result is absent",
-                        )?,
-                        required(right.result_value_type_id, "window lambda result is absent")?,
-                        admission,
-                        work,
-                    )?;
-                }
-                _ => return Err(shape("window aggregate argument shapes differ")),
-            }
-            work.step()?;
-        }
-        match (left.result.as_ref(), right.result.as_ref()) {
-            (
-                Some(wire::function_binding_definition::Result::ScalarValueTypeId(left)),
-                Some(wire::function_binding_definition::Result::ScalarValueTypeId(right)),
-            ) => self.signature_types(*left, *right, admission, work)?,
-            _ => return Err(shape("window aggregate result is not scalar")),
-        }
-        Ok(())
-    }
-    fn signature_types(
-        &mut self,
-        left: u32,
-        right: u32,
-        admission: &mut Admission<'_, '_>,
-        work: &mut CompileCheckpoints<'_>,
-    ) -> Result<(), Error> {
-        let types = self.values.types();
-        work.flush()?;
-        let left = types.value_type(left);
-        let right = types.value_type(right);
-        self.match_captured_types(
-            (|| {
-                Ok((
-                    left.ok_or_else(|| shape("signature type is unknown"))?,
-                    right.ok_or_else(|| shape("signature type is unknown"))?,
-                ))
-            })(),
-            admission,
-            work,
-        )
-    }
-    fn window(
-        &mut self,
-        definition: &wire::ExpressionDefinition,
-        value: &wire::WindowCall,
-        admission: &mut Admission<'_, '_>,
-        work: &mut CompileCheckpoints<'_>,
-    ) -> Result<(), Error> {
-        let numeric = Arithmetic(admission.observed());
-        let id = required(
-            value.function_binding_id,
-            "window function binding ID is absent",
-        )?;
-        let function = self.function_header(id, admission, work)?;
-        self.call_result(definition, function, admission, work)?;
-        match wire::FunctionKind::try_from(function.kind) {
-            Ok(wire::FunctionKind::Window) => {
-                let ordinary = value.aggregate_binding_id.is_none()
-                    && !value.distinct
-                    && value.function_order_by.is_empty();
-                work.step()?;
-                if !ordinary {
-                    return Err(shape("window function carries aggregate-only fields"));
-                }
-                self.arguments(
-                    &function.arguments,
-                    &value.argument_expr_ids,
-                    admission,
-                    work,
-                )?;
-            }
-            Ok(wire::FunctionKind::Aggregate) => {
-                self.charge(
-                    tree_lookup_work(self.aggregates.as_wire().len())?,
-                    admission,
-                    work,
-                )?;
-                let aggregate = self
-                    .aggregates
-                    .definition_observed(
-                        required(
-                            value.aggregate_binding_id,
-                            "aggregate window binding is absent",
-                        )?,
-                        work,
-                    )?
-                    .ok_or_else(|| shape("aggregate window binding is unknown"))?;
-                let aggregate_function = self.function_header(
-                    required(
-                        aggregate.function_binding_id,
-                        "aggregate function ID is absent",
-                    )?,
-                    admission,
-                    work,
-                )?;
-                self.signatures(function, aggregate_function, admission, work)?;
-                // Phase/channel and logical arguments plus ORDER BY inputs
-                // are validated by the sole Fragment aggregate author. This
-                // borrowed component preserves them without a scalar zip.
-            }
-            _ => return Err(shape("window binding is neither Window nor Aggregate")),
-        }
-        self.charge(
-            numeric.mul(value.function_order_by.len(), 8)?,
-            admission,
-            work,
-        )?;
-        for sort in &value.function_order_by {
-            let closed = crate::physical_properties_v2::decode_direction(sort.direction).is_ok()
-                && crate::physical_properties_v2::decode_nulls(sort.null_ordering).is_ok();
-            work.step()?;
-            if !closed {
-                return Err(shape(
-                    "window sort direction or null order is unknown or unspecified",
-                ));
-            }
-        }
-        if let Some(frame) = &value.frame {
-            let closed = super::receiving_grammar::decode_window_units(frame.units).is_ok()
-                && super::receiving_grammar::decode_window_exclusion(frame.exclusion).is_ok();
-            work.step()?;
-            if !closed {
-                return Err(shape(
-                    "window frame unit or exclusion is unknown or unspecified",
-                ));
-            }
-            // Ordered bounds and their actual expression references were
-            // already visited. Absence of the optional whole frame is legal.
-        }
-        Ok(())
     }
 }
 

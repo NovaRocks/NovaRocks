@@ -19,3 +19,20 @@ mod fixtures;
 mod integral_decimal_cast;
 mod numeric_negation;
 mod signed_cast_nullability;
+#[cfg(debug_assertions)]
+mod write_layout;
+
+mod partition_topn;
+
+mod bitnot;
+mod constant_entry_parity;
+mod decimal_float_cast;
+mod filter_conjunction;
+mod inlist;
+mod json_object;
+mod like;
+mod percentile_hash;
+mod scan_residual_conjunction;
+
+mod fixed_binary_case;
+mod substring_index;

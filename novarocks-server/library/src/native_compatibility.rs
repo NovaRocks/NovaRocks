@@ -139,6 +139,75 @@ mod tests {
     }
 
     #[test]
+    fn peer_without_write_layout_keys_has_a_distinct_plan_contract() {
+        let manifest = server_manifest();
+        let current =
+            resolve_native_compatibility_material(manifest.contracts(), [0x31; 32], COMPILED)
+                .unwrap();
+        let prior = novarocks_version::derive_repository_native_compatibility_material(
+            native_carrier_declarations(manifest.contracts()).unwrap(),
+            [0x31; 32],
+            25,
+            COMPILED,
+        )
+        .unwrap();
+        assert_eq!(
+            current.plan_contract_revision(),
+            novarocks_physical_plan::PLAN_CONTRACT_REVISION
+        );
+        assert_ne!(current.plan_contract_digest(), prior.plan_contract_digest());
+        assert_ne!(current.id(), prior.id());
+        assert_eq!(current.descriptor_digest(), prior.descriptor_digest());
+    }
+
+    #[test]
+    fn peer_with_fragment_expression_arenas_has_a_distinct_compatibility_island() {
+        let manifest = server_manifest();
+        let current =
+            resolve_native_compatibility_material(manifest.contracts(), [0x31; 32], COMPILED)
+                .unwrap();
+        let prior = novarocks_version::derive_repository_native_compatibility_material(
+            native_carrier_declarations(manifest.contracts()).unwrap(),
+            [0x31; 32],
+            26,
+            COMPILED,
+        )
+        .unwrap();
+        assert_eq!(
+            current.plan_contract_revision(),
+            novarocks_physical_plan::PLAN_CONTRACT_REVISION
+        );
+        assert_eq!(prior.plan_contract_revision(), 26);
+        assert_ne!(current.plan_contract_digest(), prior.plan_contract_digest());
+        assert_ne!(current.id(), prior.id());
+        assert_eq!(current.descriptor_digest(), prior.descriptor_digest());
+    }
+
+    #[test]
+    fn peer_on_revision_27_has_a_distinct_compatibility_island() {
+        let manifest = server_manifest();
+        let current =
+            resolve_native_compatibility_material(manifest.contracts(), [0x31; 32], COMPILED)
+                .unwrap();
+        let prior = novarocks_version::derive_repository_native_compatibility_material(
+            native_carrier_declarations(manifest.contracts()).unwrap(),
+            [0x31; 32],
+            27,
+            COMPILED,
+        )
+        .unwrap();
+        assert_eq!(prior.plan_contract_revision(), 27);
+        assert_ne!(
+            current.plan_contract_revision(),
+            prior.plan_contract_revision()
+        );
+        assert_ne!(current.plan_contract_digest(), prior.plan_contract_digest());
+        assert_ne!(current.id(), prior.id());
+        assert_eq!(current.descriptor_digest(), prior.descriptor_digest());
+        assert_eq!(current.carriers(), prior.carriers());
+    }
+
+    #[test]
     fn peer_with_writer_count_and_token_quotas_has_a_distinct_plan_contract() {
         let manifest = server_manifest();
         let current =
@@ -180,7 +249,7 @@ mod tests {
                 .iter()
                 .map(|declaration| (declaration.provider_id(), declaration.contract_revision()))
                 .collect::<Vec<_>>(),
-            vec![("iceberg", 10), ("paimon", 1)]
+            vec![("iceberg", 11), ("paimon", 1)]
         );
         assert!(
             declarations

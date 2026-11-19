@@ -2219,6 +2219,41 @@ mod tests {
             unreachable!("scripted row-mutation fixture publishes no cleanup responsibility")
         }
 
+        fn begin_write_query(
+            &self,
+            _: &novarocks_spi::connector::write_stack::ConnectorWriteCommitSession,
+            _: &novarocks_spi::connector::write_stack::ConnectorWriteQueryIdentity,
+            _: &[novarocks_spi::connector::write_stack::WriteTargetOrdinal],
+            _: Option<
+                std::sync::Arc<
+                    dyn novarocks_spi::connector::write_stack::ConnectorWriteProductionProof,
+                >,
+            >,
+        ) -> Result<(), novarocks_spi::connector::ConnectorError> {
+            Ok(())
+        }
+
+        fn arrive_write_fragments(
+            &self,
+            _: &novarocks_spi::connector::write_stack::ConnectorWriteCommitSession,
+            _: &novarocks_spi::connector::write_stack::ConnectorWriteQueryIdentity,
+            _: Vec<(
+                novarocks_spi::connector::write_stack::WriteTargetOrdinal,
+                novarocks_spi::connector::write_stack::ConnectorCommitFragment,
+            )>,
+            _: &novarocks_spi::connector::ConnectorPayloadRetentionGuard,
+        ) -> Result<(), novarocks_spi::connector::ConnectorError> {
+            unreachable!("scripted row-mutation fixture receives no commit fragments")
+        }
+
+        fn confirm_write_received(
+            &self,
+            _: &novarocks_spi::connector::write_stack::ConnectorWriteCommitSession,
+            _: &novarocks_spi::connector::write_stack::ConnectorWriteQueryIdentity,
+        ) -> Result<(), novarocks_spi::connector::ConnectorError> {
+            Ok(())
+        }
+
         fn begin_write_async<'a>(
             &'a self,
             request: novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest,
@@ -2479,6 +2514,7 @@ mod tests {
         fn decode_commit_fragment_payload(
             &self,
             _fragment: &novarocks_spi::connector::ConnectorEncodedPayload,
+            _author: &novarocks_spi::connector::ConnectorPayloadRetentionGuard,
         ) -> Result<
             novarocks_spi::connector::write_stack::ConnectorCommitFragment,
             novarocks_spi::connector::ConnectorCodecError,
@@ -2531,6 +2567,7 @@ mod tests {
             lease,
             row_mutation_catalog_properties(),
             novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest {
+                catalog_session: Default::default(),
                 table: Arc::from("db1.t"),
                 target_ref: novarocks_spi::connector::ConnectorWriteTargetRef::main(),
                 intent: novarocks_spi::connector::ConnectorWriteIntent::RowDelta,

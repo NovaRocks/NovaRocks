@@ -251,6 +251,7 @@ pub struct StagingEngine<'a> {
     state: StagingState,
     intent: &'a OperationIntent,
     artifacts: &'a dyn ArtifactWriter,
+    stage: usize,
     context: PreparationContext,
     completed_list: Option<(String, ManifestList)>,
 }
@@ -297,30 +298,21 @@ impl<'a> StagingEngine<'a> {
                 io_window_width,
             },
             completed_list: None,
+            stage: 0,
         })
     }
+    #[cfg(test)]
     pub fn metadata(&self) -> &TableMetadata {
         &self.state.metadata
     }
-    pub(crate) async fn snapshot_sources<'s>(
-        &'s self,
-        snapshot: &'s crate::iceberg::spec::Snapshot,
-    ) -> Result<crate::commit::manifest_sources::SnapshotSources<'s>> {
-        super::view::load_snapshot_sources(
-            self.metadata(),
-            self.artifacts,
-            self.completed_list.as_ref(),
-            snapshot,
-        )
-        .await
-    }
-
+    #[cfg(test)]
     pub fn updates(&self) -> &[TableUpdate] {
         &self.state.updates
     }
     pub fn view(&self) -> StagedView<'_> {
         StagedView::new(
             &self.state.metadata,
+            self.stage,
             self.intent,
             self.artifacts,
             self.context,
@@ -344,6 +336,10 @@ impl<'a> StagingEngine<'a> {
             }
         }
         self.stage_change(prepared)?;
+        self.stage = self
+            .stage
+            .checked_add(1)
+            .ok_or_else(|| invalid("Iceberg stage ordinal exhausted"))?;
         if completed_list.is_some() {
             self.completed_list = completed_list;
         }
@@ -353,13 +349,27 @@ impl<'a> StagingEngine<'a> {
         self.artifacts.check_active()?;
         self.state.stage_change(self.intent, change)
     }
-    // Design: ADR-0171 (docs/adr/ADR-0171-commit-operation-model.md)
-    pub fn freeze(self, owned_references: &[ObjectIdentity]) -> Result<FrozenRequest> {
+    // Design: ADR-0234 (docs/adr/ADR-0234-operation-owned-artifacts-and-bounded-publication-facts.md)
+    pub fn freeze(self) -> Result<FrozenRequest> {
         self.artifacts.check_active()?;
-        self.state.freeze(
-            self.intent,
-            self.artifacts.snapshot_artifacts(owned_references)?,
-        )
+        let mut lists = Vec::new();
+        let mut statistics = Vec::new();
+        for update in &self.state.updates {
+            match update {
+                TableUpdate::AddSnapshot { snapshot } => {
+                    lists.push(ObjectIdentity::new(snapshot.manifest_list())?)
+                }
+                TableUpdate::SetStatistics { statistics: file } => {
+                    statistics.push(ObjectIdentity::new(file.statistics_path.clone())?)
+                }
+                TableUpdate::SetPartitionStatistics {
+                    partition_statistics: file,
+                } => statistics.push(ObjectIdentity::new(file.statistics_path.clone())?),
+                _ => {}
+            }
+        }
+        let artifacts = self.artifacts.snapshot_artifacts(&lists, &statistics)?;
+        self.state.freeze(self.intent, artifacts)
     }
 }
 

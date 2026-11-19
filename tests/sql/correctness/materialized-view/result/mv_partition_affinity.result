@@ -1,0 +1,16 @@
+-- query 2
+-- types	bigint	bigint	bigint
+p	n	id_sum
+1	3	12
+2	3	15
+3	3	18
+
+-- query 3
+-- types	bigint
+data_files
+3
+
+-- query 4
+-- types	bigint
+partitions
+3

@@ -91,7 +91,8 @@ fn assert_causes(run: impl Fn(&OwnerControl) -> Result<(), FrozenPruningError>) 
 
 #[test]
 fn pruning_borrowed_dynamic_count_retains_original_combined_limit_and_caller_scope() {
-    let (package, witness) = fixture(false, 1);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let (package, witness) = fixture(false, 1, &mut fixture_constants);
     let table = pruning_table(&package, vec![witness.clone()]);
     let old = Control::default();
     let expected = table.dynamic_items_observed(&old).unwrap();
@@ -140,7 +141,8 @@ fn pruning_borrowed_dynamic_count_retains_original_combined_limit_and_caller_sco
 
 #[test]
 fn pruning_borrowed_structure_consumes_original_predicate_and_one_index_without_private_scopes() {
-    let (package, enforced) = fixture(false, 2);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let (package, enforced) = fixture(false, 2, &mut fixture_constants);
     let mut unenforced = enforced.clone();
     unenforced.target.field = PruningDomainField::Unenforced;
     let tables = [
@@ -177,7 +179,8 @@ fn pruning_borrowed_structure_consumes_original_predicate_and_one_index_without_
 
 #[test]
 fn pruning_borrowed_original_witness_failures_keep_categories_and_all_control_prefixes() {
-    let (package, witness) = fixture(false, 2);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let (package, witness) = fixture(false, 2, &mut fixture_constants);
     for case in 0..6 {
         let mut bad = witness.clone();
         let expected = match case {
@@ -235,7 +238,8 @@ fn pruning_borrowed_original_witness_failures_keep_categories_and_all_control_pr
 
 #[test]
 fn pruning_borrowed_consumer_index_still_refuses_equal_foreign_snapshot() {
-    let (package, witness) = fixture(false, 1);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let (package, witness) = fixture(false, 1, &mut fixture_constants);
     let foreign = package.clone();
     let c = OwnerControl::default();
     let mut observed = CompileCheckpoints::try_new(&c, CompilePhase::Decode).unwrap();
@@ -253,7 +257,8 @@ fn pruning_borrowed_consumer_index_still_refuses_equal_foreign_snapshot() {
 
 #[test]
 fn predicate_borrowed_ports_preserve_actual_source_guards_and_all_callback_causes() {
-    let (package, witness) = fixture(false, 1);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let (package, witness) = fixture(false, 1, &mut fixture_constants);
     let site = witness.sources[0].responsibility.site;
     for bad in [false, true] {
         let run = |c: &OwnerControl| -> Result<(), FrozenPruningError> {
@@ -261,7 +266,6 @@ fn predicate_borrowed_ports_preserve_actual_source_guards_and_all_callback_cause
             let result = (|| {
                 let exact = ExactPredicateResponsibility::try_new_in(
                     package.fragment(),
-                    package.expression_uses(),
                     site,
                     &mut observed,
                 )
@@ -269,7 +273,6 @@ fn predicate_borrowed_ports_preserve_actual_source_guards_and_all_callback_cause
                 assert_eq!(exact.anchor(), witness.sources[0].responsibility);
                 let selected = PredicateConjunctSource::try_new_in(
                     package.fragment(),
-                    package.expression_uses(),
                     site,
                     if bad { vec![0] } else { vec![] },
                     &mut observed,

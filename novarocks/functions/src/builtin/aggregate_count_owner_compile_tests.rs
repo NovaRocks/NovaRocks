@@ -18,9 +18,8 @@
 //! Public trait calls on the original COUNT author, not a replacement refiner.
 use super::*;
 use novarocks_type_contract::{
-    CompileControlError, DecimalOverflowPolicy, EvaluationDemand, EvaluationDomainId,
-    ExpressionEffectContext, ExpressionUseId, SemanticParameterId, SemanticParameterKey,
-    SemanticParameterRef, SemanticParameters,
+    CompileControlError, DecimalOverflowPolicy, EvaluationRegionId, ExpressionUseId,
+    SemanticParameterId, SemanticParameterKey, SemanticParameterRef, SemanticParameters,
 };
 use std::sync::Mutex;
 
@@ -87,11 +86,9 @@ impl Fixture {
         }
     }
     fn input(&self) -> CallEffectInput<'_> {
-        let context = ExpressionEffectContext {
-            use_id: ExpressionUseId::new(0),
-            domain: EvaluationDomainId::new(7),
-            demand: EvaluationDemand::Value,
-        };
+        let context = novarocks_type_contract::RelationEffectContext::call(
+            novarocks_type_contract::RelationCallId::new(0),
+        );
         CallEffectInput {
             function_id: self.owner.binding_declaration().function_id(),
             kind: FunctionKind::Aggregate,
@@ -102,11 +99,11 @@ impl Fixture {
                 expected_result_type: None,
             },
             argument_uses: crate::CallArgumentUses::SelectedChannels(&self.uses),
-            context,
+            context: context.into(),
             parameters: &self.parameters,
             environment: &[],
             decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-            proof_scope: CallProofScope::Domain(context.domain),
+            proof_scope: CallProofScope::Relation(context.identity),
         }
     }
     fn canonical(&self) -> Arc<AggregateCallContract> {
@@ -115,7 +112,7 @@ impl Fixture {
             &self.owner,
             input,
             self.selected.clone(),
-            ScopedExpressionEffects::pure_value(input.context),
+            ScopedRelationalEffects::pure_value(input.context.relation().unwrap()),
             AggregatePreparationOptions {
                 state_interpretation: None,
                 phase: AggregateKernelPhase::Single,
@@ -191,7 +188,7 @@ fn count_public_refiner_preserves_authored_identity_scope_and_environment_errors
             let mut wrong = fixture.input();
             match field {
                 0 => wrong.function_id = &foreign,
-                1 => wrong.proof_scope = CallProofScope::Domain(EvaluationDomainId::new(99)),
+                1 => wrong.proof_scope = CallProofScope::Region(EvaluationRegionId::new(99)),
                 _ => wrong.environment = &environment,
             }
             let selected_arcs = Arc::strong_count(&fixture.selected);

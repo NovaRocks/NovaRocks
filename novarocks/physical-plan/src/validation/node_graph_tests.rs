@@ -16,10 +16,11 @@
 // under the License.
 
 use super::{NodeGraphEvent, validate_node_graph, visit_node_graph_child_first};
+#[cfg(test)]
+use crate::tests::unit_fixture::DefinitionFixture;
 use crate::*;
 use novarocks_type_contract::{
-    CompileCheckpoints, CompileControlError, CompilePhase, EvaluationDomainId,
-    ExpressionControlFlow, ExpressionEvaluationDomain, PureCompileControl, SemanticParameters,
+    CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl, SemanticParameters,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
@@ -90,7 +91,7 @@ fn diamond() -> Fragment {
         )
         .unwrap();
     builder
-        .finish_definition(
+        .finish_fixture_definition(
             NodeId::new(1),
             FragmentSink::Noop,
             dop(),
@@ -110,7 +111,7 @@ fn wide() -> Fragment {
         child = parent;
     }
     builder
-        .finish_definition(
+        .finish_fixture_definition(
             child,
             FragmentSink::Noop,
             dop(),
@@ -289,28 +290,13 @@ fn node_graph_wide_real_events_reach_quantum_and_keep_child_first_order() {
 
 fn package_input(fragment: Fragment) -> FragmentPackageInput {
     let setup = Control::default();
-    let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
-            id: EvaluationDomainId::new(0),
-            parent: None,
-            guard: None,
-        }],
-        vec![],
-        fragment.expressions(),
-        CompilePhase::Validate,
-        &setup,
-    )
-    .unwrap();
-    let uses = PhysicalRootUses::try_new(&fragment, flow, vec![], &setup).unwrap();
-    let calls = FrozenFragmentCalls::try_new(&fragment, &uses, vec![], &setup).unwrap();
     let pruning = FrozenFragmentPruning::try_new(fragment.id(), vec![], &setup).unwrap();
     FragmentPackageInput {
         constants: ConstantPools::empty(),
         version: PlanVersionId::try_new([9; 16]).unwrap(),
         required: RequiredContracts::default(),
         fragment,
-        expression_uses: uses,
-        calls,
+        statement_constant_policy: crate::tests::constant_fixture::policy(),
         pruning,
         cuts: FragmentCuts::default(),
         result: None,
@@ -318,13 +304,12 @@ fn package_input(fragment: Fragment) -> FragmentPackageInput {
         scans: BTreeMap::new(),
         writes: BTreeMap::new(),
         annotations: Box::default(),
+        layouts: Default::default(),
     }
 }
 fn property(input: &FragmentPackageInput, control: &Control) -> Result<bool, CompileControlError> {
     match validate_fragment_output_properties_observed(
         &input.fragment,
-        &input.expression_uses,
-        &input.calls,
         PlanLimits::FROZEN,
         SOURCE,
         PROJECTION,
@@ -356,8 +341,6 @@ fn node_graph_public_frozen_property_and_package_use_same_checked_snapshot() {
     assert!(
         validate_fragment_output_properties_observed(
             package.fragment(),
-            package.expression_uses(),
-            package.calls(),
             PlanLimits::FROZEN,
             SOURCE,
             PROJECTION,

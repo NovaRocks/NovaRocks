@@ -14,7 +14,10 @@
 // KIND, either express or implied. See the License for the
 // specific language governing permissions and limitations
 // under the License.
+
 use super::*;
+#[cfg(test)]
+use crate::tests::unit_fixture::DefinitionFixture;
 use crate::*;
 use arrow_schema::DataType;
 
@@ -54,16 +57,28 @@ fn mark_fragment(
     }
     output.push(mark);
     let kind = if hash {
-        let key_left = builder.add_expression(
+        let key_left = builder.define(
             join,
             ValueType::new(DataType::Utf8, true),
             ExprKind::Value(inputs[0]),
         )?;
-        let key_right = builder.add_expression(
+        let key_right = builder.define(
             join,
             ValueType::new(DataType::Utf8, true),
             ExprKind::Value(inputs[1]),
         )?;
+        let key_left = builder.root_definition(
+            join,
+            key_left,
+            novarocks_type_contract::EvaluationDemand::Value,
+            crate::RootScope::Port(0),
+        );
+        let key_right = builder.root_definition(
+            join,
+            key_right,
+            novarocks_type_contract::EvaluationDemand::Value,
+            crate::RootScope::Port(1),
+        );
         NodeKind::HashJoin {
             kind: JoinKind::LeftMark,
             distribution: JoinDistribution::Singleton,
@@ -80,11 +95,25 @@ fn mark_fragment(
             null_extended: Box::default(),
         }
     } else {
-        let predicate = builder.add_expression(
+        let input = builder.define(
+            join,
+            ValueType::new(DataType::Utf8, true),
+            ExprKind::Value(inputs[0]),
+        )?;
+        let predicate = builder.define(
             join,
             ValueType::new(DataType::Boolean, false),
-            ExprKind::Literal(LiteralValue::Boolean(true)),
+            ExprKind::IsNull {
+                expr: input,
+                negated: false,
+            },
         )?;
+        let predicate = builder.root_definition(
+            join,
+            predicate,
+            novarocks_type_contract::EvaluationDemand::Value,
+            crate::RootScope::AllPorts,
+        );
         NodeKind::NestLoopJoin {
             kind: JoinKind::LeftMark,
             distribution: NestLoopJoinDistribution::Singleton,
@@ -100,7 +129,7 @@ fn mark_fragment(
         Distribution::Singleton,
         kind,
     )?;
-    Ok(builder.finish_definition(
+    Ok(builder.finish_fixture_definition(
         join,
         FragmentSink::Noop,
         PipelineDopDomain {

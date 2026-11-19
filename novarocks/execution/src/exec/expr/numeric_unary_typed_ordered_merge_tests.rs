@@ -18,8 +18,7 @@
 //! Typed physical ordered merge support; explicitly not optimizer SQL plans.
 use arrow::datatypes::DataType;
 use novarocks_physical_plan::{
-    FunctionArgumentType, NodeKind, PhysicalCallDefinition, PhysicalCallSite,
-    StaticFunctionArgument,
+    FunctionArgumentType, NodeKind, PhysicalCallSite, StaticFunctionArgument,
 };
 use novarocks_sql::compiler::{
     SqlCompileControl, ordered_array_state_source_for_test, ordinary_state_observe_for_test,
@@ -49,12 +48,10 @@ fn check(intermediate: bool) {
             for (ordinal, call) in calls.iter().enumerate() {
                 let request = fragment
                     .call_requests()
-                    .get(PhysicalCallDefinition::Relational(
-                        PhysicalCallSite::Aggregate {
-                            node: node.id,
-                            call: u32::try_from(ordinal).unwrap(),
-                        },
-                    ))
+                    .get(PhysicalCallSite::Aggregate {
+                        node: node.id,
+                        call: u32::try_from(ordinal).unwrap(),
+                    })
                     .unwrap();
                 assert_eq!(request.logical_argument_count, 1);
                 assert_eq!(request.arguments.len(), 2);
@@ -79,11 +76,13 @@ fn check(intermediate: bool) {
                 if call.binding.phase.consumes_logical_arguments() {
                     assert_eq!(call.order_by.len(), 1);
                     assert_eq!(
-                        &fragment
-                            .expressions()
-                            .get(call.order_by[0].expr)
-                            .unwrap()
-                            .ty,
+                        {
+                            let unit = fragment.unit(node.id).unwrap();
+                            &unit
+                                .definition(unit.root(call.order_by[0].expr).unwrap().definition)
+                                .unwrap()
+                                .ty
+                        },
                         value_type,
                         "the request retains the completed ORDER expression's full FVT"
                     );

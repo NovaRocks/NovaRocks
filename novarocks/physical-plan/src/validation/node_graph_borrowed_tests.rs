@@ -16,6 +16,8 @@
 // under the License.
 
 use super::*;
+#[cfg(test)]
+use crate::tests::unit_fixture::DefinitionFixture;
 use crate::{FragmentBuilder, PipelineDopDomain, RequiredInputs, SetOperationKind};
 use novarocks_type_contract::{
     CompilePhase, PureCompileControl, owned_resources::copy::copy_string,
@@ -91,7 +93,7 @@ fn diamond() -> Fragment {
         )
         .unwrap();
     builder
-        .finish_definition(
+        .finish_fixture_definition(
             NodeId::new(1),
             FragmentSink::Noop,
             dop(),
@@ -111,7 +113,7 @@ fn wide() -> Fragment {
         child = parent;
     }
     builder
-        .finish_definition(
+        .finish_fixture_definition(
             child,
             FragmentSink::Noop,
             dop(),

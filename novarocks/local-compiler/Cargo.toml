@@ -11,6 +11,9 @@ workspace = true
 doctest = false
 
 [dependencies]
+novarocks-constant-contract.workspace = true
+novarocks-expression-contract.workspace = true
+novarocks-expression.workspace = true
 novarocks-failure-contract.workspace = true
 novarocks-connector-contract.workspace = true
 novarocks-physical-plan.workspace = true

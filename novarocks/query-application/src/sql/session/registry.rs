@@ -34,8 +34,9 @@ mod sql_entry;
 pub use catalog::{
     CatalogPropertyDeclarationFactory, CatalogPropertyIdentity, CatalogPropertyMetadata,
     EmptyCatalogPropertyDeclarationFactory, SessionCatalogPropertyAdmission,
-    SessionCatalogPropertyPort,
+    SessionCatalogPropertyPort, admit_catalog_properties,
 };
+pub use constant::SqlPropertyDeclaration;
 pub use inputs::{SessionPropertyInputs, SessionPropertyMetadata};
 pub use sql_entry::{ResolvedSqlSessionProperty, sql_session_property_error_at};
 
@@ -258,14 +259,13 @@ pub enum SessionPropertyScope {
     },
 }
 impl SessionPropertyScope {
-    fn qualify(&self, name: &str) -> String {
+    fn qualified_name(&self, name: &str) -> String {
         match self {
             Self::System => name.to_owned(),
             Self::Catalog { catalog, .. } => format!("{catalog}.{name}"),
         }
     }
 }
-
 #[derive(Clone, Debug)]
 pub struct ValidatedSessionProperty {
     declaration: Arc<PropertyDeclaration>,
@@ -279,7 +279,7 @@ impl ValidatedSessionProperty {
         self.declaration.name()
     }
     pub fn qualified_name(&self) -> String {
-        self.scope.qualify(self.name())
+        self.scope.qualified_name(self.name())
     }
     pub fn value(&self) -> &SessionPropertyValue {
         &self.value
@@ -443,20 +443,7 @@ impl SessionPropertyRegistry {
             let metadata = match bound_catalogs.get(catalog) {
                 Some(metadata) => metadata.clone(),
                 None => {
-                    let metadata = match catalogs
-                        .session_property_catalog(catalog)
-                        .map_err(SessionPropertyError::Source)?
-                    {
-                        SessionCatalogPropertyAdmission::Absent => {
-                            return Err(SessionPropertyError::CatalogNotFound {
-                                catalog: catalog.to_owned(),
-                            });
-                        }
-                        SessionCatalogPropertyAdmission::Unavailable(error) => {
-                            return Err(SessionPropertyError::Source(error));
-                        }
-                        SessionCatalogPropertyAdmission::Ready(metadata) => metadata,
-                    };
+                    let metadata = admit_catalog_properties(catalogs, catalog)?;
                     bound_catalogs.insert(catalog, metadata.clone());
                     metadata
                 }

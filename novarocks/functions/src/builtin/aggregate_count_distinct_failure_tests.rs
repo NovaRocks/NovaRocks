@@ -21,7 +21,7 @@ use arrow_array::{StringArray, StructArray};
 use arrow_schema::{Field, Fields};
 use novarocks_type_contract::{
     CallProofScope, CompileControlError, CompilePhase, DecimalOverflowPolicy, EvaluationDemand,
-    EvaluationDomainId, ExpressionEffectContext, ExpressionUseId, PureCompileControl,
+    EvaluationRegionId, ExpressionEffectContext, ExpressionUseId, PureCompileControl,
     SemanticParameters,
 };
 use std::{alloc::Layout, ptr::NonNull, sync::Mutex, time::Duration};
@@ -165,14 +165,12 @@ fn kernel(types: &[FunctionValueType], phase: AggregateKernelPhase) -> CountDist
         )
         .unwrap();
     let selected = Arc::new(bound.selected);
-    let context = ExpressionEffectContext {
-        use_id: ExpressionUseId::new(731),
-        domain: EvaluationDomainId::new(49),
-        demand: EvaluationDemand::Value,
-    };
+    let context = novarocks_type_contract::RelationEffectContext::call(
+        novarocks_type_contract::RelationCallId::new(731),
+    );
     let state_context = ExpressionEffectContext {
         use_id: ExpressionUseId::new(734),
-        domain: EvaluationDomainId::new(50),
+        region: EvaluationRegionId::new(50),
         demand: EvaluationDemand::Value,
     };
     let state_type = selected
@@ -189,7 +187,7 @@ fn kernel(types: &[FunctionValueType], phase: AggregateKernelPhase) -> CountDist
     } else {
         CallArgumentUses::AggregateMerge {
             phase,
-            state_context,
+            state_context: state_context.into(),
             state_input_type: &state_type,
         }
     };
@@ -202,15 +200,15 @@ fn kernel(types: &[FunctionValueType], phase: AggregateKernelPhase) -> CountDist
                 selected: &selected,
                 request,
                 argument_uses,
-                context,
+                context: context.into(),
                 parameters: &parameters,
                 environment: &[],
                 decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-                proof_scope: CallProofScope::Domain(context.domain),
+                proof_scope: CallProofScope::Relation(context.identity),
             },
             selected.clone(),
             PureCallPreparation::Aggregate {
-                arguments: ScopedExpressionEffects::pure_value(context),
+                arguments: ScopedRelationalEffects::pure_value(context),
                 options: AggregatePreparationOptions {
                     state_interpretation: None,
                     phase,

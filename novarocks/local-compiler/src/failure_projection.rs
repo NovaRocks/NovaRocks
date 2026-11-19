@@ -75,24 +75,18 @@ impl<E: Error + FailureProjection + 'static> FailureProjection for ProviderPrepa
 impl FailureProjection for crate::expressions::ExpressionLoweringError {
     fn failure_fact(&self) -> FailureFact {
         match self {
-            Self::Construction(source) => source.failure_fact(),
             Self::BTree(source) => source.failure_fact(),
-            Self::Publication(source) => source.failure_fact(),
             Self::Control(source) => source.failure_fact(),
             Self::Constant(source) => source.failure_fact(),
             Self::Reference(source) => source.failure_fact(),
             Self::Binding(source) => source.failure_fact(),
             Self::Type(source) => source.failure_fact(),
-            Self::Expressions(source) => source.failure_fact(),
+            Self::Unit(source) => source.failure_fact(),
             Self::Specialization(source) => source.failure_fact(),
             Self::Effects(source) => source.failure_fact(),
             Self::Arithmetic(source) => source.failure_fact(),
             Self::Cast(source) => source.failure_fact(),
             Self::Comparison(source) => source.failure_fact(),
-            Self::UnsupportedExpression(_) => FailureFact::new(
-                FailureClass::Unsupported,
-                novarocks_failure_contract::local_compiler_reason::UNSUPPORTED_EXPRESSION,
-            ),
             Self::UnsupportedCall(_) => FailureFact::new(
                 FailureClass::Unsupported,
                 novarocks_failure_contract::local_compiler_reason::UNSUPPORTED_CALL,
@@ -145,7 +139,7 @@ mod tests {
     #[test]
     fn explicit_capabilities_keep_their_compiler_reasons_through_private_ownership() {
         use crate::expressions::ExpressionLoweringError;
-        use novarocks_physical_plan::{ExprId, NodeId, PhysicalCallSite};
+        use novarocks_physical_plan::{NodeId, PhysicalCallSite};
         let errors = [
             (
                 FragmentCompileError::Unsupported {
@@ -155,10 +149,12 @@ mod tests {
                 1,
             ),
             (
-                FragmentCompileError::from(ExpressionLoweringError::UnsupportedExpression(
-                    ExprId::new(7),
+                FragmentCompileError::from(ExpressionLoweringError::from(
+                    novarocks_expression::ExprCompileError::UnsupportedExpression(
+                        novarocks_expression_contract::ExprId::new(7),
+                    ),
                 )),
-                10,
+                21,
             ),
             (
                 FragmentCompileError::from(ExpressionLoweringError::UnsupportedCall(
@@ -172,7 +168,14 @@ mod tests {
         for (error, reason) in errors {
             let fact = error.failure_fact();
             assert_eq!(fact.class(), FailureClass::Unsupported);
-            assert_eq!(fact.reason().domain(), domain::LOCAL_COMPILER.get());
+            assert_eq!(
+                fact.reason().domain(),
+                if reason == 21 {
+                    domain::EXPRESSION.get()
+                } else {
+                    domain::LOCAL_COMPILER.get()
+                }
+            );
             assert_eq!(fact.reason().code(), reason);
             if reason != 1 {
                 assert!(

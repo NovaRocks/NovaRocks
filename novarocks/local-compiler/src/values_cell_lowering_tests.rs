@@ -22,14 +22,10 @@
 
 use super::*;
 use arrow_array::{Int8Array, Int16Array};
-use novarocks_local_program::{
-    ProgramExpressionRootSite, ProgramNodeExpressionRole, ProgramRootInput, ProgramUseRef,
-    StaticValuesBacking, StaticValuesCell, root_input_layout,
-};
-use novarocks_physical_plan::ExprId;
+use novarocks_local_program::{StaticValuesBacking, StaticValuesCell};
 use novarocks_type_contract::{
-    ControlShape, DecimalOverflowPolicy, EvaluationDemand, ExpressionUseId, SemanticParameterId,
-    SemanticParameterKey, SemanticParameterRef, SemanticParameterValue,
+    DecimalOverflowPolicy, EvaluationDemand, SemanticParameterId, SemanticParameterKey,
+    SemanticParameterRef, SemanticParameterValue,
 };
 
 const ALLOW: SemanticParameterRef = SemanticParameterRef {
@@ -135,7 +131,7 @@ fn cast_package_with_cells(
                 Cell::Constant(pool, ordinal) | Cell::Cast(pool, ordinal) => (pool, ordinal),
             };
             let constant = builder
-                .add_expression(
+                .define(
                     values_node,
                     pools[pool as usize].1.value_type().clone(),
                     ExprKind::Constant(ConstantReference {
@@ -144,10 +140,10 @@ fn cast_package_with_cells(
                     }),
                 )
                 .unwrap();
-            exprs.push(match cell {
+            let definition = match cell {
                 Cell::Constant(..) => constant,
                 Cell::Cast(..) => builder
-                    .add_expression(
+                    .define(
                         values_node,
                         types[column].clone(),
                         ExprKind::Cast {
@@ -159,7 +155,13 @@ fn cast_package_with_cells(
                         },
                     )
                     .unwrap(),
-            });
+            };
+            exprs.push(builder.root_definition(
+                values_node,
+                definition,
+                RootScope::AllPorts,
+                EvaluationDemand::Value,
+            ));
         }
         cells.push(exprs.into_boxed_slice());
     }
@@ -177,14 +179,20 @@ fn cast_package_with_cells(
         for &input in &outputs {
             let ty = builder.value(input).unwrap().ty.clone();
             let expr = builder
-                .add_expression(project, ty.clone(), ExprKind::Value(input))
+                .add_root(
+                    project,
+                    ty.clone(),
+                    ExprKind::Value(input),
+                    RootScope::Port(0),
+                    EvaluationDemand::Value,
+                )
                 .unwrap();
             let output = builder
                 .add_value(
                     ty,
                     ValueOrigin::Expr {
                         node: project,
-                        expr,
+                        root: expr,
                     },
                 )
                 .unwrap();
@@ -204,7 +212,7 @@ fn cast_package_with_cells(
         values_node
     };
     let fragment = builder
-        .finish_definition(
+        .finish_fixture(
             root,
             FragmentSink::Result,
             PipelineDopDomain {
@@ -214,38 +222,6 @@ fn cast_package_with_cells(
             },
             novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
-        .unwrap();
-    let roots = PhysicalExpressionRoots::try_new(&fragment, &Control::good()).unwrap();
-    let domain = EvaluationDomainId::new(0);
-    let mut invocations = Vec::new();
-    let mut next = 3u32;
-    let mut bindings = Vec::new();
-    for (&site, root) in roots.sites() {
-        let use_id = visit(
-            &fragment,
-            root.expr,
-            domain,
-            root.demand,
-            &mut next,
-            &mut invocations,
-        );
-        bindings.push((site, use_id));
-    }
-    let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
-            id: domain,
-            parent: None,
-            guard: None,
-        }],
-        invocations,
-        fragment.expressions(),
-        CompilePhase::Validate,
-        &Control::good(),
-    )
-    .unwrap();
-    let expression_uses =
-        PhysicalRootUses::try_new(&fragment, flow, bindings, &Control::good()).unwrap();
-    let calls = FrozenFragmentCalls::try_new(&fragment, &expression_uses, vec![], &Control::good())
         .unwrap();
     let pruning = FrozenFragmentPruning::try_new(fragment.id(), vec![], &Control::good()).unwrap();
     let output = fragment.nodes()[&root].output.clone();
@@ -272,9 +248,8 @@ fn cast_package_with_cells(
                 version: PlanVersionId::try_new([172; 16]).unwrap(),
                 required: RequiredContracts::default(),
                 fragment,
-                expression_uses,
-                calls,
                 constants,
+                statement_constant_policy: policy(),
                 cuts: FragmentCuts::default(),
                 result: Some(result),
                 parameters: SemanticParameters::try_new([(
@@ -286,6 +261,7 @@ fn cast_package_with_cells(
                 writes: BTreeMap::new(),
                 annotations: Box::default(),
                 pruning,
+                layouts: Default::default(),
             },
             package_admission(),
             &Control::good(),
@@ -294,60 +270,11 @@ fn cast_package_with_cells(
     )
 }
 
-/// Author one eager use per actual occurrence; a cast reads its operand.
-fn visit(
-    fragment: &novarocks_physical_plan::Fragment,
-    definition: ExprId,
-    domain: EvaluationDomainId,
-    demand: EvaluationDemand,
-    next: &mut u32,
-    output: &mut Vec<ExpressionInvocation<ExprId>>,
-) -> ExpressionUseId {
-    let use_id = ExpressionUseId::new(*next);
-    *next += 11;
-    let children = match &fragment.expressions().get(definition).unwrap().kind {
-        ExprKind::Cast { expr, .. } => vec![*expr],
-        ExprKind::Constant(_) | ExprKind::Literal(_) | ExprKind::Value(_) => vec![],
-        other => panic!("fixture authors no control for {other:?}"),
-    };
-    let arguments = children
-        .into_iter()
-        .map(|child| {
-            visit(
-                fragment,
-                child,
-                domain,
-                EvaluationDemand::Value,
-                next,
-                output,
-            )
-        })
-        .collect::<Vec<_>>();
-    output.push(ExpressionInvocation {
-        context: ExpressionEffectContext {
-            use_id,
-            domain,
-            demand,
-        },
-        definition,
-        control: ControlShape::Eager,
-        arguments: arguments.into_boxed_slice(),
-    });
-    use_id
-}
-
 fn values_node(program: &LocalProgram) -> &novarocks_local_program::StaticValues {
     let ProgramNodeKind::Values { values } = program.graph().nodes()[0].kind() else {
         panic!("Values")
     };
     values
-}
-
-fn cell_site(row: u32, column: u32) -> ProgramExpressionRootSite {
-    ProgramExpressionRootSite::Node {
-        node: ProgramNodeId::new(0),
-        role: ProgramNodeExpressionRole::ValuesCell { row, column },
-    }
 }
 
 #[test]
@@ -384,84 +311,59 @@ fn values_cast_cells_compile_as_dynamic_roots_beside_constant_backing() {
         .collect::<Vec<_>>();
     assert_eq!(positions, vec![(0, 0), (1, 1), (2, 0)]);
 
-    let snapshot = program
-        .checked()
-        .channels()
-        .expressions()
-        .resolved_calls()
-        .snapshot();
-    // Only dynamic cells are roots; constant-cell root uses are retired.
     assert_eq!(
-        snapshot.bindings().keys().copied().collect::<Vec<_>>(),
-        vec![cell_site(0, 0), cell_site(1, 1), cell_site(2, 0)]
+        dynamic
+            .iter()
+            .map(|cell| (cell.row, cell.column))
+            .collect::<Vec<_>>(),
+        vec![(0, 0), (1, 1), (2, 0)]
     );
-    let flow = &snapshot.flows()[&novarocks_local_program::ProgramExpressionArena::Main];
-    assert_eq!(flow.uses().len(), 6, "three casts and their operands");
+    let mut dynamic_uses = 0;
     for cell in dynamic {
-        let site = cell_site(cell.row, cell.column);
-        assert_eq!(
-            root_input_layout(program.graph(), site).unwrap(),
-            ProgramRootInput::Empty
-        );
-        let use_id = snapshot.bindings()[&site];
-        let invocation = &flow.uses()[&use_id];
-        assert_eq!(invocation.definition, cell.definition);
+        let unit = program.unit(cell.definition.unit).unwrap();
+        let root = unit.root(cell.definition.root).unwrap();
+        let flow = unit.control_flow();
+        assert!(unit.scope(root.scope).unwrap().schema().fields().is_empty());
+        let invocation = &flow.uses()[&root.use_id];
+        assert_eq!(invocation.definition, root.definition);
         assert!(matches!(
-            program
-                .graph()
-                .expressions()
-                .node(cell.definition)
-                .unwrap()
-                .kind(),
+            unit.definitions().node(root.definition).unwrap().kind(),
             StaticExprKind::PreparedCast { .. }
         ));
-        // The cast is prepared exactly as a Project root's cast.
-        let recipe = program
-            .cast_recipe(ProgramUseRef {
-                arena: novarocks_local_program::ProgramExpressionArena::Main,
-                use_id,
-            })
+        let recipe = unit
+            .recipes()
+            .cast(root.use_id)
             .expect("prepared cast recipe");
         assert_eq!(recipe.result_type().data_type(), &DataType::Int64);
         assert_eq!(recipe.result_type().nullable(), cell.column == 0);
-        // The operand is the constant at its analyzed type.
         let operand = &flow.uses()[&invocation.arguments[0]];
         assert!(matches!(
-            program
-                .graph()
-                .expressions()
-                .node(operand.definition)
-                .unwrap()
-                .kind(),
+            unit.definitions().node(operand.definition).unwrap().kind(),
             StaticExprKind::Constant(_)
         ));
+        dynamic_uses += 1 + invocation.arguments.len();
     }
+    assert_eq!(dynamic_uses, 6, "three executed casts and their operands");
+    // The complete unit retains its source roots; Values only executes its dynamic cells.
+    let unit = program.unit(dynamic[0].definition.unit).unwrap();
+    assert_eq!(unit.roots().len(), 6);
 }
 
 #[test]
 fn values_cast_cells_feed_a_projection_through_ordinary_channels() {
     let program = compile(cast_package(true), &Control::good()).unwrap();
     assert_eq!(values_node(&program).dynamic_cells().len(), 3);
-    let snapshot = program
-        .checked()
-        .channels()
-        .expressions()
-        .resolved_calls()
-        .snapshot();
-    let project = |expression| ProgramExpressionRootSite::Node {
-        node: ProgramNodeId::new(1),
-        role: ProgramNodeExpressionRole::ProjectOutput { expression },
+    let ProgramNodeKind::Project { exprs, .. } = program.graph().nodes()[1].kind() else {
+        panic!("Project")
     };
-    assert_eq!(
-        snapshot.bindings().keys().copied().collect::<Vec<_>>(),
-        vec![
-            cell_site(0, 0),
-            cell_site(1, 1),
-            cell_site(2, 0),
-            project(0),
-            project(1),
-        ]
-    );
+    assert_eq!(exprs.len(), 2);
+    for (ordinal, reference) in exprs.iter().enumerate() {
+        let unit = program.unit(reference.unit).unwrap();
+        let root = unit.root(reference.root).unwrap();
+        assert_eq!(unit.input(root.use_id).unwrap().ordinal, ordinal as u32);
+        assert!(unit.control_flow().root_use_ids().contains(&root.use_id));
+    }
+    assert_eq!(values_node(&program).dynamic_cells().len() + exprs.len(), 5);
 }
 
 #[test]

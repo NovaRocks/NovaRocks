@@ -1047,6 +1047,45 @@ class MachineOperationTests(unittest.TestCase):
                 self.fail("liveness pipe descriptor leaked after monitor spawn failure")
 
 
+class OriginalProcessGroupSignalTests(unittest.TestCase):
+    def test_refused_signals_keep_the_original_group_until_observed_exit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            journal = Path(directory) / "operation.json"
+            runtime.atomic_json(journal, {"phase": "running"})
+            owner = operation.CommandOwner(
+                {"deadline_monotonic": 1.0, "environment": {}}, journal, -1, 1.0
+            )
+
+            def wait_original():
+                self.assertTrue(owner.fact["group_exit_confirmed"])
+                return 0
+
+            process = SimpleNamespace(pid=1234, wait=wait_original)
+            exited = SimpleNamespace(si_pid=process.pid)
+            refusal = PermissionError(errno.EPERM, "original signal refused")
+            with patch.object(owner, "alive", return_value=True), \
+                    patch.object(operation.subprocess, "Popen", return_value=process), \
+                    patch.object(operation.os, "waitid", side_effect=[None, None, exited]) as waitid, \
+                    patch.object(operation, "process_group_running", side_effect=[True, True, False]) as group, \
+                    patch.object(operation.os, "killpg", side_effect=refusal) as killpg, \
+                    patch.object(operation.time, "monotonic", side_effect=[0.0, 2.0, 4.0, 5.0, 5.0]), \
+                    patch.object(operation.time, "sleep"):
+                result = owner.command(["original"], journal.with_suffix(".stdout"), cleanup=False)
+
+            self.assertEqual(result, operation.CommandResult(0, True, True))
+            self.assertEqual([call.args for call in killpg.call_args_list],
+                             [(process.pid, signal.SIGTERM), (process.pid, signal.SIGKILL)])
+            self.assertEqual([call.args for call in group.call_args_list],
+                             [(process.pid,), (process.pid,), (process.pid,)])
+            self.assertEqual([call.args[1] for call in waitid.call_args_list], [process.pid] * 3)
+            fact = runtime.read_json(journal)
+            self.assertTrue(fact["leader_waited"])
+            self.assertEqual(fact["group_signal_refusals"], [
+                {"pid": process.pid, "signal": "SIGTERM", "errno": errno.EPERM},
+                {"pid": process.pid, "signal": "SIGKILL", "errno": errno.EPERM},
+            ])
+
+
 class MachineOperationDiagnosticTests(unittest.TestCase):
     def test_original_failure_keeps_private_callsite_and_typed_refusal(self):
         import errno

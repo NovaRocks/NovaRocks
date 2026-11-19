@@ -19,7 +19,7 @@
 
 use crate::validation::{ValidationContext, validate_fragment_construction_after_admission};
 use crate::{
-    ExprArena, Fragment, FragmentId, FragmentParts, FragmentSink, FragmentStructureError, NodeId,
+    Fragment, FragmentId, FragmentParts, FragmentSink, FragmentStructureError, NodeId,
     PhysicalNode, PipelineDopDomain, PlanLimits, RuntimeFilterId, ValidationError,
     ValidationErrors, ValueDef, ValueId,
 };
@@ -34,7 +34,6 @@ pub struct FragmentStructureInput {
     pub id: FragmentId,
     pub root: NodeId,
     pub values: BTreeMap<ValueId, ValueDef>,
-    pub expressions: ExprArena,
     pub nodes: BTreeMap<NodeId, PhysicalNode>,
     pub sink: FragmentSink,
     pub summaries: Box<[crate::SummaryOutput]>,
@@ -77,7 +76,12 @@ impl Fragment {
         crate::builder::admit_structure_counts(
             input.nodes.len(),
             input.values.len(),
-            input.expressions.len(),
+            input
+                .nodes
+                .values()
+                .filter_map(|n| n.expressions.as_ref())
+                .map(|u| u.definitions().len())
+                .sum(),
             input.runtime_filters.len(),
             limits,
             &mut errors,
@@ -126,7 +130,6 @@ impl Fragment {
             id: input.id,
             root: input.root,
             values: input.values,
-            expressions: input.expressions,
             nodes: input.nodes,
             sink: input.sink,
             summaries: input.summaries,
@@ -134,6 +137,7 @@ impl Fragment {
             stage_placement: input.stage_placement,
             runtime_filters: input.runtime_filters,
             call_requests: crate::FragmentCallRequests::unpublished_empty(input.id),
+            calls: crate::FrozenFragmentCalls::unpublished_empty(input.id),
         });
         work.flush()?;
         let mut usage = crate::resource::CutResourcePreflight::new();

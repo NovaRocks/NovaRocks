@@ -50,7 +50,7 @@ fn causes() -> [CompileControlError; 3] {
     ]
 }
 fn assert_prefixes(
-    fragment: &Fragment,
+    definitions: &Definitions,
     dto: &wire::ExpressionControl,
     trace: &[(CompilePhase, u32)],
 ) {
@@ -61,7 +61,7 @@ fn assert_prefixes(
                 ..Default::default()
             };
             assert_eq!(
-                decode_expression_control(fragment, dto, &control).unwrap_err(),
+                decode_expression_control(definitions, dto, &control).unwrap_err(),
                 ControlCodecError::Control(cause)
             );
             assert_eq!(*control.trace.lock().unwrap(), trace[..=at]);
@@ -71,8 +71,8 @@ fn assert_prefixes(
 
 #[test]
 fn decode_malformed_projection_observes_completed_tail_before_returning_format_error() {
-    let (fragment, roots) = binary_fixture();
-    let original = encode_expression_control(&roots, &Control::default()).unwrap();
+    let (definitions, flow) = binary_fixture();
+    let original = encode_expression_control(&flow, &Control::default()).unwrap();
     let mut malformed = Vec::new();
     let mut add = |change: fn(&mut wire::ExpressionControl)| {
         let mut dto = original.clone();
@@ -80,24 +80,24 @@ fn decode_malformed_projection_observes_completed_tail_before_returning_format_e
         malformed.push(dto);
     };
     add(|dto| {
-        dto.domains.push(wire::EvaluationDomain {
+        dto.regions.push(wire::EvaluationRegion {
             id: 11,
-            parent_domain_id: Some(u32::MAX),
-            guard: Some(wire::DomainGuard {
+            parent_region_id: Some(u32::MAX),
+            guard: Some(wire::RegionGuard {
                 owner_use_id: Some(0),
-                kind: Some(wire::domain_guard::Kind::Simple(i32::MAX)),
+                kind: Some(wire::region_guard::Kind::Simple(i32::MAX)),
             }),
         });
     });
     add(|dto| {
-        dto.domains[0].guard = Some(wire::DomainGuard {
+        dto.regions[0].guard = Some(wire::RegionGuard {
             owner_use_id: None,
-            kind: Some(wire::domain_guard::Kind::Simple(1)),
+            kind: Some(wire::region_guard::Kind::Simple(1)),
         });
     });
     add(|dto| dto.uses[0].demand = 0);
     add(|dto| dto.uses[0].demand = i32::MAX);
-    add(|dto| dto.uses[0].domain_id = None);
+    add(|dto| dto.uses[0].region_id = None);
     add(|dto| dto.uses[0].definition_id = None);
     add(|dto| dto.uses[0].control = None);
     add(|dto| dto.uses[0].control.as_mut().unwrap().kind = None);
@@ -105,14 +105,10 @@ fn decode_malformed_projection_observes_completed_tail_before_returning_format_e
         dto.uses[0].control.as_mut().unwrap().kind =
             Some(wire::control_shape::Kind::Simple(i32::MAX));
     });
-    add(|dto| dto.roots[0].site = None);
-    add(|dto| dto.roots[0].site.as_mut().unwrap().node_id = None);
-    add(|dto| dto.roots[0].site.as_mut().unwrap().role = None);
-    add(|dto| dto.roots[0].use_id = None);
     for dto in malformed {
         let recorder = PrefixControl::default();
         assert!(matches!(
-            decode_expression_control(&fragment, &dto, &recorder),
+            decode_expression_control(&definitions, &dto, &recorder),
             Err(ControlCodecError::InvalidShape(_))
         ));
         let trace = recorder.trace.lock().unwrap().clone();
@@ -122,22 +118,22 @@ fn decode_malformed_projection_observes_completed_tail_before_returning_format_e
         assert_eq!(trace[0], (CompilePhase::Decode, 0));
         assert_eq!(trace[1].0, CompilePhase::Decode);
         assert!(trace[1].1 > 0);
-        assert_prefixes(&fragment, &dto, &trace);
+        assert_prefixes(&definitions, &dto, &trace);
     }
 }
 
 #[test]
 fn decode_zero_work_error_still_observes_original_tail_and_keeps_refusal_primary() {
-    let (fragment, roots) = binary_fixture();
-    let mut dto = encode_expression_control(&roots, &Control::default()).unwrap();
+    let (definitions, flow) = binary_fixture();
+    let mut dto = encode_expression_control(&flow, &Control::default()).unwrap();
     dto.uses.clear();
-    dto.domains[0].guard = Some(wire::DomainGuard {
+    dto.regions[0].guard = Some(wire::RegionGuard {
         owner_use_id: Some(0),
         kind: None,
     });
     let recorder = PrefixControl::default();
     assert_eq!(
-        decode_expression_control(&fragment, &dto, &recorder).unwrap_err(),
+        decode_expression_control(&definitions, &dto, &recorder).unwrap_err(),
         ControlCodecError::InvalidShape("guard kind is missing")
     );
     let trace = recorder.trace.lock().unwrap().clone();
@@ -145,30 +141,30 @@ fn decode_zero_work_error_still_observes_original_tail_and_keeps_refusal_primary
         trace,
         [(CompilePhase::Decode, 0), (CompilePhase::Decode, 0)]
     );
-    assert_prefixes(&fragment, &dto, &trace);
+    assert_prefixes(&definitions, &dto, &trace);
 }
 
 #[test]
 fn decode_success_and_quantum_boundary_errors_keep_every_original_callback_prefix() {
     for count in [1, 255, 256, 257, 320] {
-        let (fragment, roots) = many_roots_fixture(count);
-        let original = encode_expression_control(&roots, &Control::default()).unwrap();
+        let (definitions, flow) = many_roots_fixture(count);
+        let original = encode_expression_control(&flow, &Control::default()).unwrap();
         let recorder = PrefixControl::default();
         assert_eq!(
-            decode_expression_control(&fragment, &original, &recorder).unwrap(),
-            roots
+            decode_expression_control(&definitions, &original, &recorder).unwrap(),
+            flow
         );
         let trace = recorder.trace.lock().unwrap().clone();
         assert_eq!(trace[0], (CompilePhase::Decode, 0));
         if count >= 255 {
             assert!(trace.contains(&(CompilePhase::Decode, 256)));
         }
-        assert_prefixes(&fragment, &original, &trace);
+        assert_prefixes(&definitions, &original, &trace);
         let mut malformed = original;
         malformed.uses.last_mut().unwrap().control = None;
         let recorder = PrefixControl::default();
         assert_eq!(
-            decode_expression_control(&fragment, &malformed, &recorder).unwrap_err(),
+            decode_expression_control(&definitions, &malformed, &recorder).unwrap_err(),
             ControlCodecError::InvalidShape("use control is missing")
         );
         let trace = recorder.trace.lock().unwrap().clone();
@@ -179,36 +175,30 @@ fn decode_success_and_quantum_boundary_errors_keep_every_original_callback_prefi
         );
         // A quantum can leave an exact zero-unit tail; it is still observed.
         assert!(trace.len() >= 2);
-        assert_prefixes(&fragment, &malformed, &trace);
+        assert_prefixes(&definitions, &malformed, &trace);
     }
 }
 
 #[test]
-fn root_error_projection_preserves_typed_control_causes_and_ordinary_root_category() {
+fn flow_error_projection_preserves_typed_control_causes_and_ordinary_flow_category() {
     for cause in causes() {
         assert_eq!(
-            ControlCodecError::from(RootUseBindingError::Control(cause.clone())),
-            ControlCodecError::Control(cause.clone())
-        );
-        assert_eq!(
-            ControlCodecError::from(RootUseBindingError::Roots(ExpressionRootError::Control(
-                cause.clone()
-            ))),
+            ControlCodecError::from(ExpressionControlFlowError::Control(cause.clone())),
             ControlCodecError::Control(cause)
         );
     }
-    let ordinary = RootUseBindingError::Roots(ExpressionRootError::InvalidExpressionOwner);
+    let ordinary = ExpressionControlFlowError::InvalidReference;
     assert_eq!(
         ControlCodecError::from(ordinary.clone()),
-        ControlCodecError::Roots(ordinary)
+        ControlCodecError::Flow(ordinary)
     );
-    let (fragment, roots) = binary_fixture();
-    let mut dto = encode_expression_control(&roots, &Control::default()).unwrap();
-    dto.roots[0].use_id = Some(12345);
+    let (definitions, flow) = binary_fixture();
+    let mut dto = encode_expression_control(&flow, &Control::default()).unwrap();
+    dto.uses[0].definition_id = Some(12345);
     let recorder = PrefixControl::default();
     assert_eq!(
-        decode_expression_control(&fragment, &dto, &recorder).unwrap_err(),
-        ControlCodecError::Roots(RootUseBindingError::InvalidUse)
+        decode_expression_control(&definitions, &dto, &recorder).unwrap_err(),
+        ControlCodecError::Flow(ExpressionControlFlowError::InvalidReference)
     );
-    assert_prefixes(&fragment, &dto, &recorder.trace.lock().unwrap().clone());
+    assert_prefixes(&definitions, &dto, &recorder.trace.lock().unwrap().clone());
 }

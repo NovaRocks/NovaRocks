@@ -287,12 +287,15 @@ fn public_sql_map_float_probe_keeps_nullable_cast_before_optional_folding() {
             ValueLogicalType::Physical
         );
         assert!(result.fields[0].ty.nullable());
-        author_fragment_package_semantics(
-            &owner,
-            crate::constant::test_constant_policy(),
-            &SqlCompileControl::unbounded(),
-        )
-        .unwrap_or_else(|error| panic!("real package source for {sql}: {error:#?}"));
+        owner
+            .require_statement_constant_policy(crate::constant::test_constant_policy())
+            .unwrap_or_else(|error| panic!("real package source for {sql}: {error:#?}"));
+        for fragment in owner.plan().fragments().values() {
+            fragment
+                .calls()
+                .validate_fragment(fragment, &SqlCompileControl::unbounded())
+                .unwrap();
+        }
         novarocks_physical_plan::validate_plan(owner.plan()).unwrap();
     }
 }

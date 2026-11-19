@@ -91,6 +91,26 @@ pub(crate) struct TargetFacts {
 }
 
 impl TargetFacts {
+    pub(crate) fn matches_data_locator(
+        &self,
+        completion: &RangeCompletion,
+        locator: &IcebergDeleteTargetLocator,
+    ) -> Result<bool> {
+        let descriptor = completion
+            .processed
+            .get(&self.data.source_index)
+            .ok_or_else(|| {
+                invalid("Target data entry source is absent from the completed range")
+            })?;
+        Ok(completion.manifest_list == locator.manifest_list()
+            && descriptor.manifest_path == locator.manifest_path()
+            && u64::try_from(self.data.source_index).ok() == Some(locator.manifest_ordinal())
+            && u64::try_from(self.data.ordinal).ok() == Some(locator.entry_ordinal())
+            && completion.domain.endpoint().snapshot_id() == locator.snapshot_id()
+            && self.data.frozen.identity().path() == locator.data_file_path()
+            && self.data.frozen.facts().record_count == locator.record_count())
+    }
+
     pub(crate) fn data_locator(
         &self,
         completion: &RangeCompletion,

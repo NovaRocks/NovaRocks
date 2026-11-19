@@ -22,9 +22,8 @@ use novarocks_functions::{
     PurePreparationSource, ScopedExpressionEffects,
 };
 use novarocks_type_contract::{
-    CallProofScope, CompileControlError, CompilePhase, DecimalOverflowPolicy, EvaluationDemand,
-    EvaluationDomainId, ExpressionEffectContext, ExpressionUseId, PureCompileControl,
-    SemanticParameters,
+    CompileControlError, CompilePhase, DecimalOverflowPolicy, EvaluationDemand, EvaluationRegionId,
+    ExpressionEffectContext, ExpressionUseId, PureCompileControl, SemanticParameters,
 };
 use std::sync::Mutex;
 
@@ -66,9 +65,14 @@ impl Control {
 fn context() -> ExpressionEffectContext {
     ExpressionEffectContext {
         use_id: ExpressionUseId::new(u32::MAX),
-        domain: EvaluationDomainId::new(7),
+        region: EvaluationRegionId::new(7),
         demand: EvaluationDemand::Value,
     }
+}
+fn relation_context() -> novarocks_type_contract::RelationEffectContext {
+    novarocks_type_contract::RelationEffectContext::call(
+        novarocks_type_contract::RelationCallId::new(7),
+    )
 }
 fn arguments() -> [FunctionArgument; 1] {
     [FunctionArgument::Value {
@@ -99,8 +103,14 @@ fn input<'a>(
     uses: &'a [Option<ExpressionUseId>],
     parameters: &'a SemanticParameters,
 ) -> CallEffectInput<'a> {
+    let context = match bound.kind {
+        FunctionKind::Scalar => novarocks_type_contract::CallEffectContext::Expression(context()),
+        FunctionKind::Aggregate | FunctionKind::Window | FunctionKind::Table => {
+            novarocks_type_contract::CallEffectContext::Relation(relation_context())
+        }
+    };
     CallEffectInput {
-        context: context(),
+        context,
         argument_uses: novarocks_functions::CallArgumentUses::SelectedChannels(uses),
         function_id: &bound.function_id,
         kind: bound.kind,
@@ -109,7 +119,7 @@ fn input<'a>(
         environment: &[],
         parameters,
         decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-        proof_scope: CallProofScope::Domain(context().domain),
+        proof_scope: context.proof_scope(),
     }
 }
 fn options() -> PureCallPreparation {
@@ -230,7 +240,9 @@ fn sql_selected_port_rejects_substituted_owner_full_type_and_prepares_table_life
             table_input,
             table_selected.clone(),
             PureCallPreparation::Table {
-                arguments: ScopedExpressionEffects::pure_value(context()),
+                arguments: novarocks_functions::ScopedRelationalEffects::pure_value(
+                    relation_context(),
+                ),
             },
             &control,
         )
@@ -329,7 +341,9 @@ fn sql_selected_port_checks_exact_result_environment_and_lifecycle_without_rebin
             call,
             selected.clone(),
             PureCallPreparation::Table {
-                arguments: ScopedExpressionEffects::pure_value(context())
+                arguments: novarocks_functions::ScopedRelationalEffects::pure_value(
+                    relation_context()
+                )
             },
             &control
         ),
@@ -569,7 +583,9 @@ fn sql_selected_snapshot_prepares_real_window_and_aggregate_owners_without_an_ad
             "count",
             FunctionKind::Aggregate,
             PureCallPreparation::Aggregate {
-                arguments: ScopedExpressionEffects::pure_value(context()),
+                arguments: novarocks_functions::ScopedRelationalEffects::pure_value(
+                    relation_context(),
+                ),
                 options: AggregatePreparationOptions {
                     state_interpretation: None,
                     phase: AggregateKernelPhase::Single,
@@ -584,7 +600,9 @@ fn sql_selected_snapshot_prepares_real_window_and_aggregate_owners_without_an_ad
             "count",
             FunctionKind::Aggregate,
             PureCallPreparation::AggregateWindow {
-                arguments: ScopedExpressionEffects::pure_value(context()),
+                arguments: novarocks_functions::ScopedRelationalEffects::pure_value(
+                    relation_context(),
+                ),
                 options: AggregateWindowPreparationOptions {
                     aggregate: AggregatePreparationOptions {
                         state_interpretation: None,
@@ -602,7 +620,9 @@ fn sql_selected_snapshot_prepares_real_window_and_aggregate_owners_without_an_ad
             "row_number",
             FunctionKind::Window,
             PureCallPreparation::Window {
-                arguments: ScopedExpressionEffects::pure_value(context()),
+                arguments: novarocks_functions::ScopedRelationalEffects::pure_value(
+                    relation_context(),
+                ),
                 options: WindowCallOptions::try_new(None, false, &control).unwrap(),
             },
             PureKernelAbi::WindowV1,

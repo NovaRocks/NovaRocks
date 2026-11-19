@@ -246,6 +246,64 @@ fn diagnostic_recursive_and_byte_work_preserve_entry_quantum_tail_refusals() {
         value_type: FunctionValueType::new(DataType::Int64, false),
     };
     assert_original_refusals(|control| format_expr(&case, control));
+    let interval_type = FunctionValueType::new(
+        DataType::Interval(arrow::datatypes::IntervalUnit::MonthDayNano),
+        false,
+    );
+    let interval = ConstantValue::from_interval_month_day_nano(
+        Arc::new(interval_type.try_to_field("original interval").unwrap()),
+        interval_type,
+        (-7, 23, i64::MIN),
+        policy(),
+        CompilePhase::Validate,
+        &Control::new(None),
+    )
+    .unwrap();
+    let expression = constant(interval.clone());
+    let expected = "INTERVAL(months=-7, days=23, nanoseconds=-9223372036854775808)";
+    assert_eq!(
+        format_expr(&expression, &Control::new(None)).unwrap(),
+        expected
+    );
+    assert_eq!(
+        crate::constant::format_constant_observed(&interval, &Control::new(None)).unwrap(),
+        expected
+    );
+    assert_original_refusals(|control| format_expr(&expression, control));
+    assert_original_refusals(|control| {
+        crate::constant::format_constant_observed(&interval, control)
+    });
+    struct RefusedOutput {
+        calls: usize,
+    }
+    impl std::fmt::Write for RefusedOutput {
+        fn write_str(&mut self, _: &str) -> std::fmt::Result {
+            self.calls += 1;
+            Err(std::fmt::Error)
+        }
+    }
+    let baseline = Control::new(None);
+    let mut refused = RefusedOutput { calls: 0 };
+    assert!(matches!(
+        crate::constant::write_constant_observed(&interval, &baseline, &mut refused),
+        Ok(Err(_))
+    ));
+    assert_eq!(refused.calls, 1);
+    let trace = baseline.trace();
+    for cause in [
+        CompileControlError::Cancelled,
+        CompileControlError::DeadlineExceeded,
+        CompileControlError::ResourceExhausted,
+    ] {
+        let late = Control::new(Some((trace.len() + 1, cause)));
+        let mut refused = RefusedOutput { calls: 0 };
+        assert!(matches!(
+            crate::constant::write_constant_observed(&interval, &late, &mut refused),
+            Ok(Err(_))
+        ));
+        assert_eq!(refused.calls, 1);
+        assert_eq!(late.trace(), trace);
+    }
 }
 
 #[test]

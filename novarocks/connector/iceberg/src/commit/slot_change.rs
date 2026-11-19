@@ -163,7 +163,7 @@ impl Preparer for SlotChangePreparer {
         } else {
             vec![]
         };
-        let snapshot_id = super::staging::new_snapshot_id(metadata);
+        let snapshot_id = view.stage_snapshot_id()?;
         let carry = carry_records_and_closure(metadata)?;
         let mut rewrites = carry.properties;
         for (name, value) in &self.change.slots {
@@ -457,9 +457,15 @@ mod tests {
         assert_eq!(current.parent_snapshot_id(), Some(parent.snapshot_id()));
         assert_eq!(current.row_range(), Some((base.next_row_id(), 0)));
         assert_ne!(current.manifest_list(), parent.manifest_list());
-        assert_eq!(request.artifacts().attempt_owned().len(), 1);
+        assert_eq!(request.artifacts().references().len(), 1);
         assert_eq!(
-            request.artifacts().attempt_owned()[0].path(),
+            request
+                .artifacts()
+                .references()
+                .iter()
+                .next()
+                .unwrap()
+                .path(),
             current.manifest_list()
         );
         assert!(

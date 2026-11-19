@@ -422,6 +422,7 @@ impl MvCreateStepOriginal {
                 seed: seed.clone(),
                 ports: self.input.ports.clone(),
                 planning,
+                session_properties: Arc::clone(self.input.execution.session_property_inputs()),
                 operation_id: self.operation,
                 context: self.context.clone(),
                 cancellation,

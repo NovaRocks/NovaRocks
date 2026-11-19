@@ -58,8 +58,11 @@ fn n_fixture(limit: usize) -> Fixture {
         .map(|(key, value)| {
             vec![
                 cell(*key),
-                value.map_or(LiteralValue::Null, LiteralValue::LargeInt),
-                LiteralValue::Int64(2),
+                value.map_or(
+                    crate::exec::operators::family_fixture::constant_sources::null(),
+                    crate::exec::operators::family_fixture::constant_sources::largeint,
+                ),
+                crate::exec::operators::family_fixture::constant_sources::i64(2),
             ]
         })
         .collect::<Vec<_>>();

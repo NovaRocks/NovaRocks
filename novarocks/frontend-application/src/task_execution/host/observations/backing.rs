@@ -100,6 +100,8 @@ impl ObservationBackingQuote {
                 participants,
             )?,
             crate::task_execution::host::transport::TransportReleases::backing_bytes()?,
+            crate::task_execution::host::failure_residual::FailureResidualReceiveObligation::backing_bytes()?,
+            crate::query_execution::native_execution_adapter::AttemptSourceOriginalsObligation::backing_bytes(),
             arc::<PaidObservationMetadata>()?.size(),
             arc::<BackingCharge>()?.size(),
             Layout::new::<ObservationBackingPin>().size(),

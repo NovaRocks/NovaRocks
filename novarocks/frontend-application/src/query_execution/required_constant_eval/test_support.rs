@@ -20,8 +20,6 @@ use super::*;
 use novarocks_functions::{
     EngineFunctionCatalog, EngineFunctionCatalogBuilder, FunctionKind, InstalledPureKernel,
 };
-use novarocks_plan_codec::physical_package_v2::{PackageDecodeLimits, PackageEncodeLimits};
-use novarocks_plan_codec::resource_preflight_v2::FragmentDecodeResourceModel;
 use novarocks_sql::compiler::SqlCompileControl;
 
 pub(crate) fn test_required_constant_interpreter() -> RequiredConstantInterpreter {
@@ -67,21 +65,7 @@ pub(super) fn test_product() -> (RequiredConstantInterpreter, Arc<EngineFunction
         }
     }
     let pure = Arc::new(builder.seal_pure(installed).unwrap());
-    let providers = Arc::new(
-        PureProviderProgramCatalog::<ConnectorCodecError>::try_new(&[], vec![], &compile).unwrap(),
-    );
-    let limits = PackageDecodeLimits::FROZEN;
-    let carrier = CompiledPackageCarrier::new(
-        limits.admission,
-        PackageEncodeLimits::FROZEN,
-        Arc::new(FragmentDecodeResourceModel::try_new(&compile).unwrap()),
-        limits.wire,
-    );
-    let interpreter = RequiredConstantInterpreter::new(
-        pure,
-        providers,
-        carrier,
-        crate::application::test_constant_policy(),
-    );
+    let interpreter =
+        RequiredConstantInterpreter::new(pure, crate::application::test_constant_policy());
     (interpreter, metadata)
 }

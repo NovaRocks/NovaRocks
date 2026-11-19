@@ -158,6 +158,7 @@ fn syntax_floating_sources_keep_bits_and_refuse_rounded_float32() {
         0x7ff0_0000_0000_0000,
         0xfff0_0000_0000_0000,
         0x7ff8_0000_0000_0042,
+        0xfff8_0000_0000_0043,
         0xfff8_0000_0000_0081,
     ] {
         assert_eq!(
@@ -167,6 +168,29 @@ fn syntax_floating_sources_keep_bits_and_refuse_rounded_float32() {
             Some(bits)
         );
     }
+    // The syntax author and the sole public factory preserve the same exact
+    // old NaN payload. Each constructs a fresh source, never re-admits a CV.
+    let bits = 0xfff8_0000_0000_0043;
+    let actual = admit(LiteralValue::Float(f64::from_bits(bits)), &double);
+    let field = std::sync::Arc::new(arrow::datatypes::Field::new(
+        "constant",
+        DataType::Float64,
+        false,
+    ));
+    let direct = ConstantValue::from_f64_bits(
+        field.clone(),
+        double.clone(),
+        bits,
+        policy(),
+        CompilePhase::FunctionSpecialization,
+        &Control::new(None),
+    )
+    .unwrap();
+    assert_eq!(actual.try_f64_bits().unwrap(), Some(bits));
+    assert_eq!(direct.try_f64_bits().unwrap(), Some(bits));
+    assert_eq!(direct.value_type(), &double);
+    assert_eq!(direct.field().name(), "constant");
+    assert!(std::sync::Arc::ptr_eq(direct.pool().field_ref(), &field));
     let single = ty(DataType::Float32, true);
     for bits in [0u32, 1 << 31, 1, 0x3fc0_0000, 0x7f80_0000, 0xff80_0000] {
         let input = f64::from(f32::from_bits(bits));
@@ -195,6 +219,28 @@ fn syntax_floating_sources_keep_bits_and_refuse_rounded_float32() {
 
 #[test]
 fn syntax_text_binary_nominal_and_typed_null_have_one_complete_source_type() {
+    let integer = ty(DataType::Int64, false);
+    assert!(matches!(
+        admit_syntax_constant(&LiteralValue::Null, &integer, policy(), &Control::new(None)),
+        Err(ConstantError::Invalid(
+            "NULL factory requires nullable exact type"
+        ))
+    ));
+    let nullable_integer = ty(DataType::Int64, true);
+    assert_eq!(
+        admit(LiteralValue::Null, &nullable_integer)
+            .try_i64()
+            .unwrap(),
+        None
+    );
+    assert!(matches!(
+        FunctionValueType::try_with_logical_type(
+            DataType::FixedSizeBinary(16),
+            false,
+            ValueLogicalType::Json
+        ),
+        Err(novarocks_type_contract::ValueTypeError::InvalidLogicalCarrier(ValueLogicalType::Json))
+    ));
     for carrier in [DataType::Utf8, DataType::LargeUtf8, DataType::Utf8View] {
         for nullable in [false, true] {
             let declared = ty(carrier.clone(), nullable);
@@ -478,6 +524,54 @@ fn syntax_constructor_policy_limits_are_exact_at_boundary_and_refuse_one_below()
                 Err(ConstantError::Limit(_))
             ));
             trace_case(&spelling, &declared, below, false, false);
+        }
+    }
+    // Preserve the original scalar one-row factory boundary and originating
+    // source fact at the current syntax owner, before any outer footer.
+    use novarocks_failure_contract::{FailureClass, FailureProjection, domain};
+    let declared = ty(DataType::Int64, false);
+    let syntax = LiteralValue::Int(7);
+    let exact = ConstantPolicy {
+        max_rows: 1,
+        ..policy()
+    };
+    assert_eq!(
+        admit_syntax_constant(&syntax, &declared, exact, &Control::new(None))
+            .unwrap()
+            .try_i64()
+            .unwrap(),
+        Some(7)
+    );
+    let low = ConstantPolicy {
+        max_rows: 0,
+        ..exact
+    };
+    let baseline = Control::new(None);
+    let source = admit_syntax_constant(&syntax, &declared, low, &baseline).unwrap_err();
+    assert!(matches!(source, ConstantError::Limit(_)));
+    let expected = source.failure_fact();
+    assert_eq!(expected.class(), FailureClass::Resource);
+    assert_eq!(expected.reason().domain(), domain::CONSTANT.get());
+    assert_eq!(expected.reason().code(), 2);
+    let trace = baseline.trace.into_inner().unwrap();
+    assert!(!trace.is_empty());
+    for cause in [
+        CompileControlError::Cancelled,
+        CompileControlError::DeadlineExceeded,
+        CompileControlError::ResourceExhausted,
+    ] {
+        let late = Control::new(Some((trace.len() + 1, cause.clone())));
+        let actual = admit_syntax_constant(&syntax, &declared, low, &late).unwrap_err();
+        assert_eq!(actual, source);
+        let compiled = crate::compiler::SqlCompileError::from(actual);
+        assert_eq!(compiled.source_failure().unwrap().failure_fact(), expected);
+        assert_eq!(*late.trace.lock().unwrap(), trace);
+        for at in 1..=trace.len() {
+            let earlier = Control::new(Some((at, cause.clone())));
+            assert!(
+                matches!(admit_syntax_constant(&syntax, &declared, low, &earlier), Err(ConstantError::Control(actual)) if actual == cause)
+            );
+            assert_eq!(*earlier.trace.lock().unwrap(), trace[..at]);
         }
     }
 }

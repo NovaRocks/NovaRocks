@@ -34,14 +34,18 @@
 
 use crate::commit::model::EntryIdentity;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use novarocks_connector_contract::ConnectorMutationContributionGroupId;
-use novarocks_spi::connector::write_stack::{ConnectorManagedPublicationShape, WriteTargetOrdinal};
+use novarocks_spi::connector::write_stack::{
+    ConnectorManagedPublicationShape, ConnectorWriteAbortProduction, ConnectorWriteCleanupState,
+    ConnectorWriteNeededReady, ConnectorWritePublicationCompletion, WriteTargetOrdinal,
+};
 use novarocks_spi::connector::{
     ConnectorDocumentPublicationDeclaration, ConnectorError, ConnectorErrorKind,
     ConnectorManagedPublicationEmptyInputDisposition, ConnectorManagedPublicationTechnique,
-    ConnectorWriteAdmissionPurpose, ConnectorWriteIntent,
+    ConnectorMutationFailure, ConnectorMutationFailureKind, ConnectorWriteAdmissionPurpose,
+    ConnectorWriteIntent, ExternalMutationFinalization,
 };
 use parquet::basic::Compression;
 
@@ -49,6 +53,8 @@ use crate::commit::CommitOpKind;
 use crate::commit::report::IcebergColumnStats;
 use crate::delete_file::IcebergFileFormat;
 use crate::write_descriptor::IcebergPartitionDescriptor;
+
+use super::receiving::IcebergReceiving;
 
 pub(crate) fn invalid(message: impl Into<String>) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::InvalidRequest, message.into())
@@ -782,32 +788,52 @@ impl IcebergMutationReadRecipe {
 pub struct IcebergWriterOutput {
     file_format: IcebergFileFormat,
     compression: Compression,
-    parquet_row_group_size_bytes: Option<u64>,
+    parquet_row_group_size_bytes: u64,
+    target_file_size_bytes: u64,
+    max_partitions_per_writer: u32,
 }
 
 impl IcebergWriterOutput {
     pub fn try_new(
         file_format: IcebergFileFormat,
         compression: Compression,
-        parquet_row_group_size_bytes: Option<u64>,
+        parquet_row_group_size_bytes: u64,
+        target_file_size_bytes: u64,
+        max_partitions_per_writer: u32,
     ) -> Result<Self, ConnectorError> {
         if file_format == IcebergFileFormat::Unknown {
             return Err(invalid(
                 "Iceberg writer output requires an exact file format",
             ));
         }
-        if let Some(size) = parquet_row_group_size_bytes
-            && (size == 0 || file_format != IcebergFileFormat::Parquet)
-        {
-            return Err(invalid(
-                "Iceberg Parquet row group size requires a positive value on a Parquet writer",
-            ));
+        if parquet_row_group_size_bytes == 0 {
+            return Err(invalid("Iceberg Parquet row group size must be positive"));
+        }
+        if target_file_size_bytes == 0 {
+            return Err(invalid("Iceberg target file size must be positive"));
+        }
+        if max_partitions_per_writer == 0 {
+            return Err(invalid("Iceberg maximum open partitions must be positive"));
         }
         Ok(Self {
             file_format,
             compression,
             parquet_row_group_size_bytes,
+            target_file_size_bytes,
+            max_partitions_per_writer,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(file_format: IcebergFileFormat, compression: Compression) -> Self {
+        Self::try_new(
+            file_format,
+            compression,
+            crate::commit::data_writer::DEFAULT_PARQUET_ROW_GROUP_SIZE_BYTES,
+            crate::catalog_config::DEFAULT_TARGET_FILE_SIZE_BYTES,
+            crate::catalog_config::DEFAULT_MAX_PARTITIONS_PER_WRITER,
+        )
+        .expect("positive test writer output settings")
     }
 
     pub const fn file_format(&self) -> IcebergFileFormat {
@@ -816,8 +842,14 @@ impl IcebergWriterOutput {
     pub const fn compression(&self) -> Compression {
         self.compression
     }
-    pub const fn parquet_row_group_size_bytes(&self) -> Option<u64> {
+    pub const fn parquet_row_group_size_bytes(&self) -> u64 {
         self.parquet_row_group_size_bytes
+    }
+    pub const fn target_file_size_bytes(&self) -> u64 {
+        self.target_file_size_bytes
+    }
+    pub const fn max_partitions_per_writer(&self) -> u32 {
+        self.max_partitions_per_writer
     }
 }
 
@@ -1273,10 +1305,10 @@ impl IcebergPositionRewriteTarget {
 /// A partition, as one staged artifact reports it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IcebergArtifactPartition {
-    partition_path: String,
-    null_fingerprint: String,
-    partition_spec_id: i32,
-    descriptor: IcebergPartitionDescriptor,
+    pub(super) partition_path: String,
+    pub(super) null_fingerprint: String,
+    pub(super) partition_spec_id: i32,
+    pub(super) descriptor: IcebergPartitionDescriptor,
 }
 
 impl IcebergArtifactPartition {
@@ -1336,10 +1368,10 @@ impl IcebergArtifactPartition {
 /// The physical metrics one staged artifact reports.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct IcebergArtifactMetrics {
-    record_count: u64,
-    file_size_in_bytes: u64,
-    split_offsets: Vec<i64>,
-    column_stats: Option<IcebergColumnStats>,
+    pub(super) record_count: u64,
+    pub(super) file_size_in_bytes: u64,
+    pub(super) split_offsets: Vec<i64>,
+    pub(super) column_stats: Option<IcebergColumnStats>,
 }
 
 impl IcebergArtifactMetrics {
@@ -1446,11 +1478,11 @@ impl IcebergContentRange {
 /// One written data file.
 #[derive(Clone, Debug)]
 pub struct IcebergDataFileArtifact {
-    path: String,
-    file_format: IcebergFileFormat,
-    partition: IcebergArtifactPartition,
-    metrics: IcebergArtifactMetrics,
-    first_row_id: Option<i64>,
+    pub(super) path: String,
+    pub(super) file_format: IcebergFileFormat,
+    pub(super) partition: IcebergArtifactPartition,
+    pub(super) metrics: IcebergArtifactMetrics,
+    pub(super) first_row_id: Option<i64>,
 }
 
 impl IcebergDataFileArtifact {
@@ -1501,11 +1533,11 @@ impl IcebergDataFileArtifact {
 /// One written Parquet position-delete file.
 #[derive(Clone, Debug)]
 pub struct IcebergPositionDeleteFileArtifact {
-    path: String,
-    partition: IcebergArtifactPartition,
-    metrics: IcebergArtifactMetrics,
-    referenced_data_file: String,
-    merged_old_references: Vec<EntryIdentity>,
+    pub(super) path: String,
+    pub(super) partition: IcebergArtifactPartition,
+    pub(super) metrics: IcebergArtifactMetrics,
+    pub(super) referenced_data_file: String,
+    pub(super) merged_old_references: Vec<EntryIdentity>,
 }
 
 impl IcebergPositionDeleteFileArtifact {
@@ -1697,13 +1729,13 @@ impl IcebergEqualityDeleteFileArtifact {
 /// One written Puffin deletion vector.
 #[derive(Clone, Debug)]
 pub struct IcebergDeletionVectorArtifact {
-    path: String,
-    partition: IcebergArtifactPartition,
-    metrics: IcebergArtifactMetrics,
-    referenced_data_file: String,
-    content_range: IcebergContentRange,
-    cardinality: u64,
-    merged_old_references: Vec<EntryIdentity>,
+    pub(super) path: String,
+    pub(super) partition: IcebergArtifactPartition,
+    pub(super) metrics: IcebergArtifactMetrics,
+    pub(super) referenced_data_file: String,
+    pub(super) content_range: IcebergContentRange,
+    pub(super) cardinality: u64,
+    pub(super) merged_old_references: Vec<EntryIdentity>,
 }
 
 impl IcebergDeletionVectorArtifact {
@@ -1795,12 +1827,12 @@ fn validate_merged_references(references: &[EntryIdentity]) -> Result<(), Connec
 /// A live data entry identified by its immutable list and physical ordinals.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IcebergDeleteTargetLocator {
-    manifest_list: String,
-    manifest_path: String,
+    pub(super) manifest_list: String,
+    pub(super) manifest_path: String,
     manifest_ordinal: u64,
     entry_ordinal: u64,
     snapshot_id: i64,
-    data_file_path: String,
+    pub(super) data_file_path: String,
     record_count: u64,
 }
 
@@ -1863,9 +1895,9 @@ impl IcebergDeleteTargetLocator {
 /// Original position effect. Only its artifact, when present, names a new object.
 #[derive(Clone, Debug)]
 pub struct IcebergFinalDeleteEffect {
-    target: IcebergDeleteTargetLocator,
-    newly_deleted_rows: std::num::NonZeroU64,
-    kind: IcebergFinalDeleteKind,
+    pub(super) target: IcebergDeleteTargetLocator,
+    pub(super) newly_deleted_rows: std::num::NonZeroU64,
+    pub(super) kind: IcebergFinalDeleteKind,
 }
 
 #[derive(Clone, Debug)]
@@ -2079,6 +2111,7 @@ pub enum IcebergCommitArtifact {
 pub struct IcebergCommitFragment {
     artifact: IcebergCommitArtifact,
     creation: Option<IcebergCreationReceipt>,
+    compact_payload_bytes: Option<usize>,
 }
 
 impl IcebergCommitFragment {
@@ -2086,7 +2119,21 @@ impl IcebergCommitFragment {
         Self {
             artifact,
             creation: None,
+            compact_payload_bytes: None,
         }
+    }
+
+    pub(super) fn with_compact_payload_bytes(mut self, bytes: Option<usize>) -> Self {
+        self.compact_payload_bytes = bytes;
+        self
+    }
+
+    pub(super) const fn compact_payload_bytes(&self) -> Option<usize> {
+        self.compact_payload_bytes
+    }
+
+    pub(super) fn into_artifact(self) -> IcebergCommitArtifact {
+        self.artifact
     }
 
     pub fn data_file(artifact: IcebergDataFileArtifact) -> Self {
@@ -2327,8 +2374,8 @@ impl std::fmt::Display for IcebergWriteSessionId {
 /// The frontend-only Iceberg write session.
 ///
 /// It is never `Clone`: exactly one owner may finish, abort, or reconcile it.
-/// Its terminal state lives behind a mutex because the neutral contract borrows
-/// the handle on every terminal call.
+/// Receiving and terminal claims share a mutex because the neutral contract
+/// borrows the handle on every call.
 #[derive(Debug)]
 pub struct IcebergWriteCommitSession {
     session_id: IcebergWriteSessionId,
@@ -2371,7 +2418,44 @@ pub struct IcebergWriteCommitSession {
     // their first poll. Neither a waiter nor an evidence projection owns exit.
     publication: std::sync::Mutex<Option<IcebergWritePublication>>,
     empty_cleanup_disposed: std::sync::atomic::AtomicBool,
-    state: std::sync::Mutex<IcebergWriteSessionState>,
+    progress: Mutex<IcebergWriteSessionProgress>,
+}
+
+#[derive(Debug)]
+struct IcebergWriteSessionProgress {
+    state: IcebergWriteSessionState,
+    receiving: IcebergReceiving,
+}
+
+pub(super) enum ClaimedWriteFinish {
+    EmptyNoOp(ConnectorWritePublicationCompletion),
+    Publish {
+        received: IcebergReceiving,
+        empty_preflight_error: Option<ConnectorError>,
+    },
+}
+
+impl IcebergWriteSessionProgress {
+    fn require_active(&self) -> Result<(), ConnectorError> {
+        match &self.state {
+            IcebergWriteSessionState::Active => Ok(()),
+            IcebergWriteSessionState::Committing => Err(invalid(
+                "Iceberg write session already has a commit in flight",
+            )),
+            IcebergWriteSessionState::KnownCommitted { .. } => {
+                Err(invalid("Iceberg write session is already known committed"))
+            }
+            IcebergWriteSessionState::Sealed => Err(invalid(
+                "Iceberg write session is already sealed for its publication",
+            )),
+            IcebergWriteSessionState::KnownUncommitted { .. } => Err(invalid(
+                "Iceberg write session is already known uncommitted",
+            )),
+            IcebergWriteSessionState::CommitUnknown { .. } => Err(invalid(
+                "Iceberg write session outcome is unknown and requires reconciliation",
+            )),
+        }
+    }
 }
 
 struct IcebergWritePublication {
@@ -2472,6 +2556,11 @@ pub enum IcebergWriteSessionState {
 impl IcebergWriteCommitSession {
     pub(crate) fn with_mutation_read(mut self, recipe: IcebergMutationReadRecipe) -> Self {
         self.mutation_read = Some(recipe);
+        self.progress
+            .get_mut()
+            .expect("new write session progress")
+            .receiving
+            .enable_fixed_mutation(self.flavor);
         self
     }
 
@@ -2638,6 +2727,15 @@ impl IcebergWriteCommitSession {
                 flavor.as_str()
             )));
         }
+        let compact_receiving = flavor == IcebergWriteFlavor::Append
+            || (repartition.is_none()
+                && document_publication.as_ref().is_some_and(|publication| {
+                    matches!(
+                        publication.technique(),
+                        ConnectorManagedPublicationTechnique::MetadataOnly
+                            | ConnectorManagedPublicationTechnique::Incremental
+                    )
+                }));
         Ok(Self {
             session_id,
             creation_scope: None,
@@ -2663,7 +2761,10 @@ impl IcebergWriteCommitSession {
             recovery_evidence: Arc::new(std::sync::Mutex::new(None)),
             publication: std::sync::Mutex::new(None),
             empty_cleanup_disposed: std::sync::atomic::AtomicBool::new(false),
-            state: std::sync::Mutex::new(IcebergWriteSessionState::Active),
+            progress: Mutex::new(IcebergWriteSessionProgress {
+                state: IcebergWriteSessionState::Active,
+                receiving: IcebergReceiving::with_compact_mode(compact_receiving),
+            }),
         })
     }
 
@@ -2928,11 +3029,23 @@ impl IcebergWriteCommitSession {
         )
     }
 
-    pub fn state(&self) -> Result<IcebergWriteSessionState, ConnectorError> {
-        self.state
+    fn progress(&self) -> Result<MutexGuard<'_, IcebergWriteSessionProgress>, ConnectorError> {
+        self.progress
             .lock()
-            .map(|state| state.clone())
             .map_err(|_| corrupt("Iceberg write session state lock is poisoned"))
+    }
+
+    pub fn state(&self) -> Result<IcebergWriteSessionState, ConnectorError> {
+        Ok(self.progress()?.state.clone())
+    }
+
+    pub(crate) fn with_active_receiving<T>(
+        &self,
+        access: impl FnOnce(&mut IcebergReceiving) -> Result<T, ConnectorError>,
+    ) -> Result<T, ConnectorError> {
+        let mut progress = self.progress()?;
+        progress.require_active()?;
+        access(&mut progress.receiving)
     }
 
     pub(crate) fn retain_publication(
@@ -3098,13 +3211,7 @@ impl IcebergWriteCommitSession {
             .store(true, std::sync::atomic::Ordering::Release);
     }
 
-    pub(crate) fn record_unstarted_cleanup_disposed(&self) -> Result<bool, ConnectorError> {
-        if !matches!(
-            self.state()?,
-            IcebergWriteSessionState::KnownUncommitted { .. }
-        ) {
-            return Ok(false);
-        }
+    fn record_unstarted_cleanup_disposed(&self) -> Result<bool, ConnectorError> {
         let original = self.publication.lock().map_err(|_| {
             ConnectorError::new(
                 ConnectorErrorKind::Internal,
@@ -3155,78 +3262,109 @@ impl IcebergWriteCommitSession {
         }
     }
 
-    /// Settle the same unstarted session without an external commit. This
-    /// Active claim shares the state mutex with commit and release claims.
-    pub(crate) fn settle_empty_noop(
+    /// Atomically close receiving and take its inventory for the sole finish.
+    /// An empty NoOp settles directly under this lock, as it has no external
+    /// work in flight for a competing abort to wait on.
+    pub(super) fn claim_finish(
         &self,
-        needed: Arc<novarocks_spi::connector::write_stack::ConnectorWriteNeededReady>,
-    ) -> Result<(), ConnectorError> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| corrupt("Iceberg write session state lock is poisoned"))?;
-        if !matches!(&*state, IcebergWriteSessionState::Active) {
-            return Err(invalid(
-                "Iceberg empty write requires its original active session",
+        prepare_empty: impl FnOnce() -> Result<Option<Arc<ConnectorWriteNeededReady>>, ConnectorError>,
+    ) -> Result<ClaimedWriteFinish, ConnectorError> {
+        let mut progress = self.progress()?;
+        progress.require_active()?;
+        progress.receiving.require_complete()?;
+        let empty = if progress.receiving.is_empty() {
+            prepare_empty()
+        } else {
+            Ok(None)
+        };
+        let received = std::mem::take(&mut progress.receiving);
+        if let Ok(Some(needed)) = empty {
+            self.record_empty_cleanup_disposed();
+            progress.state = IcebergWriteSessionState::KnownCommitted {
+                needed: Arc::clone(&needed),
+            };
+            drop(progress);
+            drop(received);
+            return Ok(ClaimedWriteFinish::EmptyNoOp(
+                ConnectorWritePublicationCompletion::KnownCommitted {
+                    needed,
+                    cleanup: ConnectorWriteCleanupState::Observed(
+                        ExternalMutationFinalization::Complete,
+                    ),
+                },
             ));
         }
-        // There is no fallible or asynchronous work after the original claim.
-        // A refused call above leaves all original cleanup and terminal facts.
-        self.record_empty_cleanup_disposed();
-        *state = IcebergWriteSessionState::KnownCommitted { needed };
+        progress.state = IcebergWriteSessionState::Committing;
+        Ok(ClaimedWriteFinish::Publish {
+            received,
+            empty_preflight_error: empty.err(),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn begin_commit(&self) -> Result<IcebergReceiving, ConnectorError> {
+        let ClaimedWriteFinish::Publish { received, .. } = self.claim_finish(|| Ok(None))? else {
+            unreachable!("this test claim does not propose an empty result");
+        };
+        Ok(received)
+    }
+
+    /// The abort that claims Active is the only owner of the received records.
+    /// Later callers can only project the original lifecycle and cleanup facts.
+    pub(crate) fn claim_release_state(
+        &self,
+        production: ConnectorWriteAbortProduction,
+    ) -> Result<(IcebergWriteSessionState, Option<IcebergReceiving>), ConnectorError> {
+        use ConnectorWriteAbortProduction as P;
+
+        let mut progress = self.progress()?;
+        let observed = progress.state.clone();
+        if !matches!(observed, IcebergWriteSessionState::Active) {
+            return Ok((observed, None));
+        }
+        if production == P::CompleteReceived {
+            progress.receiving.require_complete()?;
+        }
+        if production == P::NotStarted && !progress.receiving.is_unstarted() {
+            return Err(invalid(
+                "Iceberg write release names a session with registered production",
+            ));
+        }
+        if production != P::NotStarted || !self.record_unstarted_cleanup_disposed()? {
+            self.retain_unproven_write_release();
+        }
+        progress.state = IcebergWriteSessionState::KnownUncommitted {
+            message: "Iceberg write session was released before any external commit".to_string(),
+        };
+        Ok((observed, Some(std::mem::take(&mut progress.receiving))))
+    }
+
+    /// Refuse the claimed finish before an operation can dispatch. A competing
+    /// abort sees a retained inventory until the finish author settles cleanup.
+    pub(crate) fn reject_claimed_finish(
+        &self,
+        error: &ConnectorError,
+    ) -> Result<(), ConnectorError> {
+        let mut progress = self.progress()?;
+        if !matches!(progress.state, IcebergWriteSessionState::Committing) {
+            return Err(invalid(
+                "Iceberg commit refusal requires its original finish claim",
+            ));
+        }
+        self.retain_unproven_write_release();
+        progress.state = IcebergWriteSessionState::KnownUncommitted {
+            message: error.message().to_string(),
+        };
         Ok(())
     }
 
-    /// Observe the original release verdict while atomically claiming Active.
-    /// Returning Active proves this call changed it to KnownUncommitted under
-    /// the same lock; the caller must only project that already-chosen fact.
-    /// Every other state is borrowed unchanged, including the same needed Arc.
-    pub(crate) fn claim_release_state(&self) -> Result<IcebergWriteSessionState, ConnectorError> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| corrupt("Iceberg write session state lock is poisoned"))?;
-        let observed = state.clone();
-        if matches!(&*state, IcebergWriteSessionState::Active) {
-            *state = IcebergWriteSessionState::KnownUncommitted {
-                message: "Iceberg write session was released before any external commit"
-                    .to_string(),
-            };
-        }
-        Ok(observed)
-    }
-
-    /// Claim the single commit attempt this session allows.
-    ///
-    /// A second claim fails: exactly one external snapshot commit may be
-    /// attempted per session, and a caller that already saw a terminal verdict
-    /// must not silently start a second one.
-    pub fn begin_commit(&self) -> Result<(), ConnectorError> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| corrupt("Iceberg write session state lock is poisoned"))?;
-        match &*state {
-            IcebergWriteSessionState::Active => {
-                *state = IcebergWriteSessionState::Committing;
-                Ok(())
-            }
-            IcebergWriteSessionState::Committing => Err(invalid(
-                "Iceberg write session already has a commit in flight",
-            )),
-            IcebergWriteSessionState::KnownCommitted { .. } => {
-                Err(invalid("Iceberg write session is already known committed"))
-            }
-            IcebergWriteSessionState::Sealed => Err(invalid(
-                "Iceberg write session is already sealed for its publication",
-            )),
-            IcebergWriteSessionState::KnownUncommitted { .. } => Err(invalid(
-                "Iceberg write session is already known uncommitted",
-            )),
-            IcebergWriteSessionState::CommitUnknown { .. } => Err(invalid(
-                "Iceberg write session outcome is unknown and requires reconciliation",
-            )),
-        }
+    fn retain_unproven_write_release(&self) {
+        let cleanup = ExternalMutationFinalization::Failed(ConnectorMutationFailure::new(
+            ConnectorMutationFailureKind::Unavailable,
+            "write release retains an unproven object inventory",
+        ));
+        self.retain_cleanup(cleanup.clone());
+        self.retain_finalization(cleanup);
     }
 
     pub(crate) fn retain_finalization(
@@ -3317,11 +3455,7 @@ impl IcebergWriteCommitSession {
                 "Iceberg write session cannot settle into a non-terminal state",
             ));
         }
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| corrupt("Iceberg write session state lock is poisoned"))?;
-        *state = terminal;
+        self.progress()?.state = terminal;
         Ok(())
     }
 }

@@ -35,7 +35,7 @@ use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field};
 use novarocks_type_contract::{
     CallProofScope, CompileControlError, CompilePhase, DecimalOverflowPolicy, EvaluationDemand,
-    EvaluationDomainId, ExpressionEffectContext, ExpressionUseId, FunctionInstanceState,
+    EvaluationRegionId, ExpressionEffectContext, ExpressionUseId, FunctionInstanceState,
     FunctionNullBehavior, FunctionVolatility, PureCompileControl, SemanticParameters,
     ValueLogicalType,
 };
@@ -372,13 +372,13 @@ fn cardinality_two_actual_records_keep_selected_fresh_frozen_complete_sources_an
 
             let context = ExpressionEffectContext {
                 use_id: ExpressionUseId::new(41),
-                domain: EvaluationDomainId::new(7),
+                region: EvaluationRegionId::new(7),
                 demand: EvaluationDemand::Value,
             };
             let uses = [Some(ExpressionUseId::new(42))];
             let parameters = SemanticParameters::try_new([]).unwrap();
             let input = crate::CallEffectInput {
-                context,
+                context: context.into(),
                 argument_uses: crate::CallArgumentUses::SelectedChannels(&uses),
                 function_id: owner.binding_declaration().function_id(),
                 kind: crate::FunctionKind::Scalar,
@@ -387,7 +387,7 @@ fn cardinality_two_actual_records_keep_selected_fresh_frozen_complete_sources_an
                 environment: &[],
                 parameters: &parameters,
                 decimal_overflow_policy: decimal,
-                proof_scope: CallProofScope::Domain(context.domain),
+                proof_scope: CallProofScope::Region(context.region),
             };
             let fresh = specialize_scalar(
                 &owner,
@@ -469,7 +469,11 @@ fn cardinality_two_actual_records_keep_selected_fresh_frozen_complete_sources_an
                     .is_err()
             );
             let mut wrong_context = input;
-            wrong_context.context.domain = EvaluationDomainId::new(99);
+            wrong_context.context = ExpressionEffectContext {
+                region: EvaluationRegionId::new(99),
+                ..wrong_context.context.expression().unwrap()
+            }
+            .into();
             assert!(
                 owner
                     .prepare_scalar(
@@ -484,7 +488,7 @@ fn cardinality_two_actual_records_keep_selected_fresh_frozen_complete_sources_an
                 ..context
             };
             let child_effects = ScopedExpressionEffects::pure_value(context)
-                .join_same_domain(ScopedExpressionEffects::primitive(
+                .join_same_region(ScopedExpressionEffects::primitive(
                     child_context,
                     novarocks_type_contract::ExpressionEffects {
                         may_raise_row_error: true,

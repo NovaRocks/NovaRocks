@@ -328,7 +328,7 @@ pub(super) fn prepared_for_test(
         .map(|_| Some(novarocks_type_contract::ExpressionUseId::new(2)))
         .collect::<Vec<_>>();
     let input = CallEffectInput {
-        context,
+        context: context.into(),
         argument_uses: crate::CallArgumentUses::SelectedChannels(&uses),
         function_id: owner.declaration.function_id(),
         kind: FunctionKind::Scalar,
@@ -353,7 +353,7 @@ pub(super) fn prepared_for_test(
 fn test_context() -> novarocks_type_contract::ExpressionEffectContext {
     novarocks_type_contract::ExpressionEffectContext {
         use_id: novarocks_type_contract::ExpressionUseId::new(1),
-        domain: novarocks_type_contract::EvaluationDomainId::new(7),
+        region: novarocks_type_contract::EvaluationRegionId::new(7),
         demand: novarocks_type_contract::EvaluationDemand::Value,
     }
 }
@@ -374,7 +374,7 @@ impl RandOwner {
         }
         if !input.environment.is_empty()
             || !matches!(input.proof_scope, CallProofScope::Unconditional)
-                && input.proof_scope != CallProofScope::Domain(input.context.domain)
+                && input.proof_scope != input.context.proof_scope()
         {
             return Err(FunctionBindingError::InvalidBinding(
                 "RAND/RANDOM has no environment dependencies and requires an exact proof scope"
@@ -407,7 +407,7 @@ impl RandOwner {
             || input.kind != FunctionKind::Scalar
             || contract.function_id() != input.function_id
             || !std::ptr::eq(contract.selected(), input.selected)
-            || contract.context() != input.context
+            || novarocks_type_contract::CallEffectContext::from(contract.context()) != input.context
             || contract.decimal_overflow_policy() != input.decimal_overflow_policy
             || !input.environment.is_empty()
         {
@@ -449,7 +449,7 @@ mod tests {
         ScopedExpressionEffects, specialize_frozen_scalar, specialize_scalar,
     };
     use novarocks_type_contract::{
-        CompileControlError, DecimalOverflowPolicy, EvaluationDomainId, ExpressionUseId,
+        CompileControlError, DecimalOverflowPolicy, EvaluationRegionId, ExpressionUseId,
         SemanticParameterKey, SemanticParameterRef, SemanticParameters,
     };
 
@@ -474,7 +474,7 @@ mod tests {
         uses: &'a [Option<ExpressionUseId>],
     ) -> CallEffectInput<'a> {
         CallEffectInput {
-            context: test_context(),
+            context: (test_context()).into(),
             argument_uses: crate::CallArgumentUses::SelectedChannels(uses),
             function_id: owner.declaration.function_id(),
             kind: FunctionKind::Scalar,
@@ -798,7 +798,7 @@ mod tests {
         let uses = [Some(ExpressionUseId::new(2))];
         let input = input(&owner, &selected, &arguments, &parameters, &uses);
         let mut foreign = input;
-        foreign.proof_scope = CallProofScope::Domain(EvaluationDomainId::new(99));
+        foreign.proof_scope = CallProofScope::Region(EvaluationRegionId::new(99));
         assert!(matches!(
             owner.validate_and_refine(foreign, crate::binding_test_control()),
             Err(FunctionEffectOwnerError::Owner(

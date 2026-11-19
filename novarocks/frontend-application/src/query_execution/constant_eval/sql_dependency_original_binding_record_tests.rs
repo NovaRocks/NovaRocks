@@ -123,15 +123,12 @@ impl PureCompileControl for Control {
 }
 fn source<T>(f: impl FnOnce(&EncodedTypeTable<'_>, &[FunctionBindingInput<'_>]) -> T) -> T {
     let original = super::exact("SELECT upper('kept') AS original_call");
-    let binding = original
-        .plan()
-        .fragments()
-        .values()
-        .find_map(|v| {
-            v.expressions().iter().find_map(|(_, e)| match &e.kind {
-                novarocks_physical_plan::ExprKind::FunctionCall { function, .. } => Some(function),
-                _ => None,
-            })
+    let binding = super::super::expression_sources(&original)
+        .find_map(|(_, _, source)| match &source.kind {
+            novarocks_expression_contract::ExprKind::FunctionCall { function, .. } => {
+                Some(function)
+            }
+            _ => None,
         })
         .unwrap();
     let mut values = Vec::new();

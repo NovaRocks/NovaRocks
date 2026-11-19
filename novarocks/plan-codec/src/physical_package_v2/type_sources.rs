@@ -33,9 +33,18 @@ use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum BindingOccurrence {
-    Scalar(p::ExprId),
-    Window(p::ExprId),
-    WindowAggregate(p::ExprId),
+    Scalar {
+        node: p::NodeId,
+        definition: p::ExprId,
+    },
+    Window {
+        node: p::NodeId,
+        ordinal: usize,
+    },
+    WindowAggregate {
+        node: p::NodeId,
+        ordinal: usize,
+    },
     Aggregate {
         node: p::NodeId,
         ordinal: usize,
@@ -52,6 +61,16 @@ pub(crate) enum BindingOccurrence {
     },
 }
 
+/// A static source key keeps unit definitions separate from relation sites.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RequestAddress {
+    Unit {
+        node: p::NodeId,
+        definition: p::ExprId,
+    },
+    Relation(p::PhysicalCallSite),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CutDirection {
     Inbound,
@@ -62,7 +81,15 @@ pub(crate) enum CutDirection {
 pub(crate) enum PackageTypeOwner {
     Value(p::ValueId),
     SystemRelation(p::NodeId),
-    Expression(p::ExprId),
+    Expression {
+        node: p::NodeId,
+        definition: p::ExprId,
+    },
+    UnitPort {
+        node: p::NodeId,
+        port: usize,
+        ordinal: usize,
+    },
     Binding(BindingOccurrence),
     Relation(p::NodeId),
     WriterTarget(p::NodeId),
@@ -84,7 +111,7 @@ pub(crate) enum PackageTypeOwner {
         id: p::RuntimeFilterId,
     },
     Constant(p::ConstantPoolId),
-    Request(p::PhysicalCallDefinition),
+    Request(RequestAddress),
     Result,
     Scan(p::NodeId),
     Recipe(p::NodeId),
@@ -260,10 +287,46 @@ impl<'a, E: From<CompileControlError>> Walk<'a, '_, '_, '_, E> {
         }
         Ok(())
     }
+    fn request(
+        &mut self,
+        owner: PackageTypeOwner,
+        request: &'a novarocks_expression_contract::PhysicalCallRequest,
+    ) -> Result<(), E> {
+        for (argument, value) in request.arguments.iter().enumerate() {
+            match value {
+                p::StaticFunctionArgument::Value { value_type, .. } => {
+                    self.value(owner, PackageTypeChannel::Argument(argument), value_type)?
+                }
+                p::StaticFunctionArgument::Lambda {
+                    parameter_types,
+                    result_type,
+                } => {
+                    for (ordinal, ty) in parameter_types.iter().enumerate() {
+                        self.value(
+                            owner,
+                            PackageTypeChannel::LambdaParameter { argument, ordinal },
+                            ty,
+                        )?;
+                    }
+                    self.value(
+                        owner,
+                        PackageTypeChannel::LambdaResult(argument),
+                        result_type,
+                    )?;
+                }
+            }
+            self.completed()?;
+        }
+        if let Some(ty) = &request.expected_result_type {
+            self.value(owner, PackageTypeChannel::ExpectedResult, ty)?;
+        }
+        self.completed()?;
+        Ok(())
+    }
     fn function(
         &mut self,
         occurrence: BindingOccurrence,
-        function: &'a p::BoundFunction,
+        function: &'a novarocks_expression_contract::BoundFunction,
     ) -> Result<(), E> {
         let owner = PackageTypeOwner::Binding(occurrence);
         self.arguments(owner, &function.argument_types)?;
@@ -353,52 +416,79 @@ pub(crate) fn visit_package_type_sources_admitted_in<'source, E: From<CompileCon
         walk.value(O::Value(*id), C::Value, &value.ty)?;
         walk.completed()?;
     }
-    for (id, expression) in fragment.expressions().iter() {
-        walk.value(O::Expression(*id), C::Value, &expression.ty)?;
-        match &expression.kind {
-            p::ExprKind::FunctionCall { function, .. } => {
-                walk.function(BindingOccurrence::Scalar(*id), function)?
-            }
-            p::ExprKind::WindowCall {
-                function,
-                aggregate_binding,
-                ..
-            } => {
-                walk.function(BindingOccurrence::Window(*id), function)?;
-                if let Some(binding) = aggregate_binding {
-                    walk.aggregate(BindingOccurrence::WindowAggregate(*id), binding)?;
-                }
-            }
-            p::ExprKind::Lambda {
-                parameter_types, ..
-            } => {
-                for (ordinal, ty) in parameter_types.iter().enumerate() {
+    for (node_id, node) in fragment.nodes() {
+        if let Some(unit) = &node.expressions {
+            for (port, input) in unit.ports().iter().enumerate() {
+                for (ordinal, (_, ty)) in input.values.iter().enumerate() {
                     walk.value(
-                        O::Expression(*id),
-                        C::ExpressionLambdaParameter(ordinal),
+                        O::UnitPort {
+                            node: *node_id,
+                            port,
+                            ordinal,
+                        },
+                        C::Value,
                         ty,
                     )?;
                 }
+                walk.completed()?;
             }
-            p::ExprKind::Cast { .. } => walk.emit(
-                O::Expression(*id),
-                C::CastTarget,
-                PackageTypeSource::Carrier,
-            )?,
-            p::ExprKind::Value(_)
-            | p::ExprKind::LambdaParameter { .. }
-            | p::ExprKind::Literal(_)
-            | p::ExprKind::Constant(_)
-            | p::ExprKind::Unary { .. }
-            | p::ExprKind::Binary { .. }
-            | p::ExprKind::Conjunction { .. }
-            | p::ExprKind::Disjunction { .. }
-            | p::ExprKind::IsNull { .. }
-            | p::ExprKind::InList { .. }
-            | p::ExprKind::Between { .. }
-            | p::ExprKind::Like { .. }
-            | p::ExprKind::Case { .. }
-            | p::ExprKind::IsTruthValue { .. } => {}
+            for expression in unit.definitions() {
+                let id = expression.id;
+                walk.value(
+                    O::Expression {
+                        node: *node_id,
+                        definition: id,
+                    },
+                    C::Value,
+                    &expression.ty,
+                )?;
+                match &expression.kind {
+                    novarocks_expression_contract::ExprKind::FunctionCall { function, .. } => walk
+                        .function(
+                            BindingOccurrence::Scalar {
+                                node: *node_id,
+                                definition: id,
+                            },
+                            function,
+                        )?,
+                    novarocks_expression_contract::ExprKind::Lambda {
+                        parameter_types, ..
+                    } => {
+                        for (ordinal, ty) in parameter_types.iter().enumerate() {
+                            walk.value(
+                                O::Expression {
+                                    node: *node_id,
+                                    definition: id,
+                                },
+                                C::ExpressionLambdaParameter(ordinal),
+                                ty,
+                            )?;
+                        }
+                    }
+                    novarocks_expression_contract::ExprKind::Cast { .. } => walk.emit(
+                        O::Expression {
+                            node: *node_id,
+                            definition: id,
+                        },
+                        C::CastTarget,
+                        PackageTypeSource::Carrier,
+                    )?,
+                    novarocks_expression_contract::ExprKind::Value(_)
+                    | novarocks_expression_contract::ExprKind::LambdaParameter { .. }
+                    | novarocks_expression_contract::ExprKind::Constant(_)
+                    | novarocks_expression_contract::ExprKind::Unary { .. }
+                    | novarocks_expression_contract::ExprKind::Binary { .. }
+                    | novarocks_expression_contract::ExprKind::Conjunction { .. }
+                    | novarocks_expression_contract::ExprKind::Disjunction { .. }
+                    | novarocks_expression_contract::ExprKind::IsNull { .. }
+                    | novarocks_expression_contract::ExprKind::InList { .. }
+                    | novarocks_expression_contract::ExprKind::Between { .. }
+                    | novarocks_expression_contract::ExprKind::Like { .. }
+                    | novarocks_expression_contract::ExprKind::Case { .. }
+                    | novarocks_expression_contract::ExprKind::IsTruthValue { .. } => {}
+                }
+                walk.completed()?;
+            }
         }
         walk.completed()?;
     }
@@ -418,6 +508,21 @@ pub(crate) fn visit_package_type_sources_admitted_in<'source, E: From<CompileCon
             }
         }
         match &node.kind {
+            p::NodeKind::Window(spec) => {
+                for (ordinal, call) in spec.calls.iter().enumerate() {
+                    walk.function(
+                        BindingOccurrence::Window { node: *id, ordinal },
+                        &call.binding,
+                    )?;
+                    if let Some(binding) = &call.aggregate_binding {
+                        walk.aggregate(
+                            BindingOccurrence::WindowAggregate { node: *id, ordinal },
+                            binding,
+                        )?;
+                    }
+                    walk.completed()?;
+                }
+            }
             p::NodeKind::Scan { relation, .. } => {
                 for (ordinal, field) in relation.schema().iter().enumerate() {
                     walk.value(O::Relation(*id), C::Field(ordinal), &field.ty)?;
@@ -493,7 +598,6 @@ pub(crate) fn visit_package_type_sources_admitted_in<'source, E: From<CompileCon
             | p::NodeKind::NestLoopJoin { .. }
             | p::NodeKind::Sort { .. }
             | p::NodeKind::Limit { .. }
-            | p::NodeKind::Window(_)
             | p::NodeKind::SetOp { .. }
             | p::NodeKind::Values { .. }
             | p::NodeKind::Repeat { .. }
@@ -501,6 +605,7 @@ pub(crate) fn visit_package_type_sources_admitted_in<'source, E: From<CompileCon
             | p::NodeKind::GenerateSeries { .. }
             | p::NodeKind::AssertOneRow(_)
             | p::NodeKind::PositionShard(_)
+            | p::NodeKind::WriteLayoutKey { .. }
             | p::NodeKind::ExchangeSource { .. } => {}
         }
         walk.completed()?;
@@ -566,29 +671,22 @@ pub(crate) fn visit_package_type_sources_admitted_in<'source, E: From<CompileCon
         )?;
         walk.completed()?;
     }
-    for (definition, request) in fragment.call_requests().entries() {
-        let owner = O::Request(*definition);
-        for (argument, value) in request.arguments.iter().enumerate() {
-            match value {
-                p::StaticFunctionArgument::Value { value_type, .. } => {
-                    walk.value(owner, C::Argument(argument), value_type)?
-                }
-                p::StaticFunctionArgument::Lambda {
-                    parameter_types,
-                    result_type,
-                } => {
-                    for (ordinal, ty) in parameter_types.iter().enumerate() {
-                        walk.value(owner, C::LambdaParameter { argument, ordinal }, ty)?;
-                    }
-                    walk.value(owner, C::LambdaResult(argument), result_type)?;
-                }
+    for node in fragment.nodes().values() {
+        if let Some(unit) = &node.expressions {
+            for (definition, request) in unit.requests() {
+                walk.request(
+                    O::Request(RequestAddress::Unit {
+                        node: node.id,
+                        definition: *definition,
+                    }),
+                    request,
+                )?;
             }
-            walk.completed()?;
-        }
-        if let Some(ty) = &request.expected_result_type {
-            walk.value(owner, C::ExpectedResult, ty)?;
         }
         walk.completed()?;
+    }
+    for (definition, request) in fragment.call_requests().entries() {
+        walk.request(O::Request(RequestAddress::Relation(*definition)), request)?;
     }
     if let Some(result) = package.result() {
         for (ordinal, field) in result.fields.iter().enumerate() {
@@ -766,10 +864,31 @@ mod tests {
         )
         .unwrap();
         work.finish().unwrap();
-        // This actual fixture has six Values (including the private writer projection), one literal, one target field,
-        // four Writer output fields, three ordered four-field cut copies,
-        // and one independent original recipe Field.
-        assert_eq!(roots.len(), 25);
+        // Six Values (including the private writer projection), one constant
+        // expression, one target field, four Writer output fields, three
+        // ordered four-field cut copies, the constant pool's original value
+        // type and Field, and one independent original recipe Field.
+        assert_eq!(roots.len(), 27);
+        assert_eq!(package.constants().entries().len(), 1);
+        let (&pool_id, pool) = package.constants().entries().iter().next().unwrap();
+        let constant_roots: Vec<_> = roots
+            .iter()
+            .filter(|(occurrence, _)| occurrence.owner == PackageTypeOwner::Constant(pool_id))
+            .collect();
+        assert_eq!(constant_roots.len(), 2);
+        assert_eq!(constant_roots[0].0.channel, PackageTypeChannel::Value);
+        let PackageTypeSource::Value(actual_type) = constant_roots[0].1 else {
+            panic!("constant complete value type loan");
+        };
+        assert!(std::ptr::eq(actual_type, pool.value_type()));
+        assert_eq!(
+            constant_roots[1].0.channel,
+            PackageTypeChannel::ConstantField
+        );
+        let PackageTypeSource::SourceField(actual_field) = constant_roots[1].1 else {
+            panic!("constant original Field loan");
+        };
+        assert!(std::ptr::eq(actual_field, pool.field_ref()));
         for ((id, value), (occurrence, source)) in package.fragment().values().iter().zip(&roots) {
             assert_eq!(occurrence.owner, PackageTypeOwner::Value(*id));
             let PackageTypeSource::Value(actual) = source else {

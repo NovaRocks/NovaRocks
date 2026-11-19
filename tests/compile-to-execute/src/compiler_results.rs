@@ -23,7 +23,7 @@ use novarocks_local_compiler::{
 };
 use novarocks_local_program::{KernelAbiVersion, LocalProgram};
 use novarocks_physical_plan::*;
-use novarocks_sql::compiler::{SqlAuthoredPhysicalPlan, author_fragment_package_semantics};
+use novarocks_sql::compiler::SqlAuthoredPhysicalPlan;
 use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
 use std::{
     collections::BTreeMap,
@@ -129,9 +129,12 @@ fn frozen_reads_with_declared_fields(
                 // physical fragment. They are not provider recipe fields and
                 // this fixture must not clear them before package extraction.
                 for residual in residuals {
-                    let expression = fragment
-                        .expressions()
-                        .get(*residual)
+                    let unit = fragment.unit(node.id).expect("original Scan unit exists");
+                    let root = unit
+                        .root(*residual)
+                        .expect("original scan residual root exists");
+                    let expression = unit
+                        .definition(root.definition)
                         .expect("original scan residual definition exists");
                     assert_eq!(expression.ty.data_type().clone(), DataType::Boolean);
                 }
@@ -302,18 +305,17 @@ fn source_packages_with_reads(
     source: &SqlAuthoredPhysicalPlan,
     reads: BTreeMap<ProviderReadOccurrenceId, FrozenConnectorRead>,
 ) -> BTreeMap<FragmentId, Arc<FragmentPackage>> {
-    let semantics = author_fragment_package_semantics(source, policy(), &Control).unwrap();
-    let uses = semantics
-        .iter()
-        .map(|(&id, s)| (id, s.expression_uses.clone()))
-        .collect();
-    let calls = semantics
-        .iter()
-        .map(|(&id, s)| (id, s.calls.clone()))
-        .collect();
-    let pruning = semantics
-        .iter()
-        .map(|(&id, s)| (id, s.pruning.clone()))
+    source.require_statement_constant_policy(policy()).unwrap();
+    let pruning = source
+        .plan()
+        .fragments()
+        .keys()
+        .map(|&id| {
+            (
+                id,
+                FrozenFragmentPruning::try_new(id, Vec::new(), &Control).unwrap(),
+            )
+        })
         .collect();
     let admissions = source
         .plan()
@@ -338,8 +340,6 @@ fn source_packages_with_reads(
         source.plan(),
         &reads,
         &BTreeMap::new(),
-        &uses,
-        &calls,
         &pruning,
         &admissions,
         &Control,

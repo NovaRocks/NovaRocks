@@ -87,6 +87,15 @@ pub(in crate::planner::distributed::build) fn finish(
     plan: &PhysicalPlanNode,
 ) -> SqlAuthoredPhysicalPlan {
     let control = Control::default();
+    lower_draft_with_control(plan, &control)
+        .unwrap()
+        .finish_observed(&control)
+        .unwrap()
+}
+pub(in crate::planner::distributed::build) fn lower_draft_with_control(
+    plan: &PhysicalPlanNode,
+    control: &dyn PureCompileControl,
+) -> Result<LoweredSqlPhysicalDraft, ContractLoweringError> {
     lower_final_physical_plan(
         plan,
         version(),
@@ -94,43 +103,49 @@ pub(in crate::planner::distributed::build) fn finish(
         crate::functions::builtin_sql_function_catalog().snapshot(),
         false,
         policy(),
-        &control,
+        control,
     )
-    .unwrap()
-    .finish_observed(&control)
-    .unwrap()
 }
+
 fn source_named<'a>(
     owner: &'a SqlAuthoredPhysicalPlan,
     name: &str,
-) -> (&'a Fragment, &'a novarocks_physical_plan::ExprNode) {
+) -> (
+    &'a Fragment,
+    &'a novarocks_physical_plan::PhysicalNode,
+    &'a novarocks_expression_contract::ExprNode,
+) {
     let id = format!("builtin.scalar/{name}/v1");
     owner
         .plan()
         .fragments()
         .values()
         .find_map(|fragment| {
-            fragment
-                .expressions()
-                .iter()
-                .find_map(|(_, source)| match &source.kind {
-                    ContractExprKind::FunctionCall { function, .. }
-                        if function.function_id.as_str() == id =>
-                    {
-                        Some((fragment, source))
-                    }
-                    _ => None,
-                })
+            fragment.nodes().values().find_map(|node| {
+                node.expressions
+                    .as_ref()?
+                    .definitions()
+                    .iter()
+                    .find_map(|source| match &source.kind {
+                        ContractExprKind::FunctionCall { function, .. }
+                            if function.function_id.as_str() == id =>
+                        {
+                            Some((fragment, node, source))
+                        }
+                        _ => None,
+                    })
+            })
         })
         .expect("actual scalar source")
 }
 fn assert_canonical(
     owner: &SqlAuthoredPhysicalPlan,
     fragment: &Fragment,
-    source: &novarocks_physical_plan::ExprNode,
+    unit_node: &novarocks_physical_plan::PhysicalNode,
+    source: &novarocks_expression_contract::ExprNode,
     expected: &ValueType,
 ) {
-    let receipt = loan(owner, fragment, source, &Control::default()).unwrap();
+    let receipt = loan(owner, fragment, unit_node, source, &Control::default()).unwrap();
     let selected = receipt
         .canonical_selection()
         .expect("same-emission scalar canonical owner selection");
@@ -159,7 +174,7 @@ fn assert_canonical(
             .as_slice()
     );
     let clone = owner.clone();
-    let clone_receipt = loan(&clone, fragment, source, &Control::default()).unwrap();
+    let clone_receipt = loan(&clone, fragment, unit_node, source, &Control::default()).unwrap();
     assert!(Arc::ptr_eq(
         selected,
         clone_receipt.canonical_selection().unwrap()
@@ -169,7 +184,8 @@ fn assert_canonical(
 fn assert_result(
     owner: &SqlAuthoredPhysicalPlan,
     fragment: &Fragment,
-    source: &novarocks_physical_plan::ExprNode,
+    unit_node: &novarocks_physical_plan::PhysicalNode,
+    source: &novarocks_expression_contract::ExprNode,
     expected: &ValueType,
 ) {
     let result = owner.plan().result_port().unwrap();
@@ -201,7 +217,8 @@ fn assert_result(
     };
     assert_eq!(&source_value.ty, expected);
     assert!(
-        matches!(source_value.origin, ValueOrigin::Expr { node, expr } if node == source.owner && expr == source.id)
+        matches!(source_value.origin, ValueOrigin::Expr { node, root }
+            if node == unit_node.id && std::ptr::eq(fragment.root_expression(node, root).unwrap(), source))
     );
     assert_eq!(result.output.columns.as_ref(), &[field.value]);
 }
@@ -209,8 +226,8 @@ fn assert_result(
 #[test]
 fn canonical_scalar_repeat_child_nullable_is_authored_before_parent_and_result_publication() {
     let owner = finish(&repeat_plan(false));
-    let (fragment, source) = source_named(&owner, "lower");
-    let receipt = loan(&owner, fragment, source, &Control::default()).unwrap();
+    let (fragment, unit_node, source) = source_named(&owner, "lower");
+    let receipt = loan(&owner, fragment, unit_node, source, &Control::default()).unwrap();
     let old = receipt.captured().request();
     assert_eq!(
         old.expected_result_type,
@@ -219,7 +236,10 @@ fn canonical_scalar_repeat_child_nullable_is_authored_before_parent_and_result_p
     assert!(
         matches!(&old.arguments[0], FunctionArgument::Value { value_type, constant: None } if value_type == &ValueType::new(DataType::Utf8, false))
     );
-    let child = fragment.expressions().get(receipt.arguments()[0]).unwrap();
+    let child = receipt
+        .definitions()
+        .definition(receipt.arguments()[0])
+        .unwrap();
     assert_eq!(child.ty, ValueType::new(DataType::Utf8, true));
     let ContractExprKind::Value(value) = child.kind else {
         panic!("actual materialized Repeat value")
@@ -234,8 +254,8 @@ fn canonical_scalar_repeat_child_nullable_is_authored_before_parent_and_result_p
         NodeKind::Repeat { .. }
     ));
     let expected = ValueType::new(DataType::Utf8, true);
-    assert_canonical(&owner, fragment, source, &expected);
-    assert_result(&owner, fragment, source, &expected);
+    assert_canonical(&owner, fragment, unit_node, source, &expected);
+    assert_result(&owner, fragment, unit_node, source, &expected);
     assert_eq!(
         receipt.captured().binding().decimal_overflow_policy(),
         DecimalOverflowPolicy::ReportError
@@ -246,20 +266,21 @@ fn canonical_scalar_repeat_child_nullable_is_authored_before_parent_and_result_p
 #[test]
 fn canonical_scalar_nested_upper_consumes_lower_actual_nullable_result_once() {
     let owner = finish(&repeat_plan(true));
-    let (fragment, lower) = source_named(&owner, "lower");
-    let (upper_fragment, upper) = source_named(&owner, "upper");
+    let (fragment, unit_node, lower) = source_named(&owner, "lower");
+    let (upper_fragment, upper_node, upper) = source_named(&owner, "upper");
     assert!(std::ptr::eq(fragment, upper_fragment));
+    assert!(std::ptr::eq(unit_node, upper_node));
     let expected = ValueType::new(DataType::Utf8, true);
-    assert_canonical(&owner, fragment, lower, &expected);
-    assert_canonical(&owner, fragment, upper, &expected);
-    let receipt = loan(&owner, fragment, upper, &Control::default()).unwrap();
+    assert_canonical(&owner, fragment, unit_node, lower, &expected);
+    assert_canonical(&owner, fragment, unit_node, upper, &expected);
+    let receipt = loan(&owner, fragment, unit_node, upper, &Control::default()).unwrap();
     assert_eq!(receipt.arguments(), &[lower.id]);
     assert!(constant(&receipt.captured().request().arguments[0]).is_none());
     assert_eq!(
         receipt.captured().request().expected_result_type,
         Some(&ValueType::new(DataType::Utf8, false))
     );
-    assert_result(&owner, fragment, upper, &expected);
+    assert_result(&owner, fragment, unit_node, upper, &expected);
 }
 
 #[test]
@@ -280,20 +301,20 @@ fn canonical_scalar_original_none_survives_nested_and_identity_cast_constant_chi
         },
     ] {
         let owner = authored(lower_call(child, DecimalOverflowPolicy::ReportError));
-        let (fragment, source) = source_named(&owner, "lower");
-        let receipt = loan(&owner, fragment, source, &Control::default()).unwrap();
+        let (fragment, unit_node, source) = source_named(&owner, "lower");
+        let receipt = loan(&owner, fragment, unit_node, source, &Control::default()).unwrap();
         assert!(constant(&receipt.captured().request().arguments[0]).is_none());
         let projected = operational_arguments(&owner, &receipt, &Control::default()).unwrap();
         assert!(constant(&projected[0]).is_none());
         assert_eq!(
-            physical_constant(&owner, fragment, receipt.arguments()[0])
+            physical_constant(&owner, &receipt, receipt.arguments()[0])
                 .try_utf8()
                 .unwrap(),
             Some("ABC")
         );
         let expected = ValueType::new(DataType::Utf8, false);
-        assert_canonical(&owner, fragment, source, &expected);
-        assert_result(&owner, fragment, source, &expected);
+        assert_canonical(&owner, fragment, unit_node, source, &expected);
+        assert_result(&owner, fragment, unit_node, source, &expected);
     }
 }
 
@@ -325,8 +346,8 @@ fn canonical_scalar_cv_null_and_real_sql_keep_original_source_distinct_from_sele
         },
         DecimalOverflowPolicy::ReportError,
     ));
-    let (fragment, source) = source_named(&owner, "lower");
-    let receipt = loan(&owner, fragment, source, &Control::default()).unwrap();
+    let (fragment, unit_node, source) = source_named(&owner, "lower");
+    let receipt = loan(&owner, fragment, unit_node, source, &Control::default()).unwrap();
     let operational = operational_arguments(&owner, &receipt, &Control::default()).unwrap();
     let original_request = receipt.captured().request();
     for retained in [
@@ -340,16 +361,16 @@ fn canonical_scalar_cv_null_and_real_sql_keep_original_source_distinct_from_sele
         );
         assert!(Arc::ptr_eq(retained.pool().field_ref(), &field));
     }
-    assert_canonical(&owner, fragment, source, &ty);
-    assert_result(&owner, fragment, source, &ty);
+    assert_canonical(&owner, fragment, unit_node, source, &ty);
+    assert_result(&owner, fragment, unit_node, source, &ty);
 
     let null = TypedExpr {
         kind: ExprKind::Literal(LiteralValue::Null),
         value_type: ValueType::new(DataType::Null, true),
     };
     let owner = authored(lower_call(null, DecimalOverflowPolicy::ReportError));
-    let (fragment, source) = source_named(&owner, "lower");
-    let receipt = loan(&owner, fragment, source, &Control::default()).unwrap();
+    let (fragment, unit_node, source) = source_named(&owner, "lower");
+    let receipt = loan(&owner, fragment, unit_node, source, &Control::default()).unwrap();
     let original = receipt.captured().request();
     let original_cv = constant(&original.arguments[0]).unwrap();
     assert_eq!(original_cv.value_type().data_type().clone(), DataType::Null);
@@ -360,28 +381,28 @@ fn canonical_scalar_cv_null_and_real_sql_keep_original_source_distinct_from_sele
         typed_cv.pool().backing_identity(),
         original_cv.pool().backing_identity()
     );
-    let emitted = physical_constant(&owner, fragment, receipt.arguments()[0]);
+    let emitted = physical_constant(&owner, &receipt, receipt.arguments()[0]);
     assert_eq!(
         typed_cv.pool().backing_identity(),
         emitted.pool().backing_identity()
     );
-    assert_canonical(&owner, fragment, source, &ty);
-    assert_result(&owner, fragment, source, &ty);
+    assert_canonical(&owner, fragment, unit_node, source, &ty);
+    assert_result(&owner, fragment, unit_node, source, &ty);
 
     // Independent real analyzer/optimizer/provider completion, rather than a
     // claim that the typed Repeat fixture is a postjoin SQL optimizer route.
     let owner = crate::compiler::compile_authored_aggregate_for_test(
         "SELECT LOWER(CAST(order_key AS VARCHAR)) AS lower_key FROM orders",
     );
-    let (fragment, source) = source_named(&owner, "lower");
-    let receipt = loan(&owner, fragment, source, &Control::default()).unwrap();
+    let (fragment, unit_node, source) = source_named(&owner, "lower");
+    let receipt = loan(&owner, fragment, unit_node, source, &Control::default()).unwrap();
     assert!(constant(&receipt.captured().request().arguments[0]).is_none());
     let selected = receipt.canonical_selection().unwrap();
     let FunctionResultType::Scalar(result) = &selected.result_type else {
         panic!("scalar selection")
     };
-    assert_canonical(&owner, fragment, source, result);
-    assert_result(&owner, fragment, source, result);
+    assert_canonical(&owner, fragment, unit_node, source, result);
+    assert_result(&owner, fragment, unit_node, source, result);
 }
 
 #[test]
@@ -463,8 +484,8 @@ fn fold_and_real_lowering_share_operational_selection_and_prepared_effects() {
         let original = value.clone();
         let args = [FoldArg { value, value_type }];
         let owner = authored(expression);
-        let (fragment, source) = source_named(&owner, "lower");
-        let receipt = loan(&owner, fragment, source, &Control::default()).unwrap();
+        let (fragment, unit_node, source) = source_named(&owner, "lower");
+        let receipt = loan(&owner, fragment, unit_node, source, &Control::default()).unwrap();
         let call = freeze_fold_call(
             owner.function_catalog().as_ref(),
             &binding,
@@ -495,25 +516,15 @@ fn fold_and_real_lowering_share_operational_selection_and_prepared_effects() {
                 original.pool().backing_identity()
             );
         }
-        let semantics = crate::compiler::author_fragment_package_semantics(
-            &owner,
-            policy(),
-            &Control::default(),
-        )
-        .unwrap();
-        let semantics = &semantics[&fragment.id()];
-        let actual = semantics
-            .calls
-            .entries()
+        owner.require_statement_constant_policy(policy()).unwrap();
+        let unit = unit_node.expressions.as_ref().unwrap();
+        let actual = unit
+            .claims()
             .iter()
-            .find_map(|(site, frozen)| {
-                let novarocks_physical_plan::PhysicalCallSite::Expression(use_id) = site else {
-                    return None;
-                };
-                (semantics.expression_uses.flow().uses()[use_id].definition == source.id)
-                    .then_some(frozen)
+            .find_map(|(use_id, frozen)| {
+                (unit.control_flow().uses()[use_id].definition == source.id).then_some(frozen)
             })
-            .expect("actual same-source LOWER preparation");
+            .expect("actual same-node same-source LOWER preparation");
         assert_eq!(&actual.effects, call.prepared().call_contract().effects());
         assert_eq!(
             actual.decimal_overflow_policy,

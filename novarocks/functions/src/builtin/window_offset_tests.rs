@@ -25,9 +25,8 @@ use arrow_buffer::NullBuffer;
 use arrow_schema::{DataType, Field};
 use novarocks_type_contract::{
     ArgumentControl, CallProofScope, CompileControlError, CompilePhase, DecimalOverflowPolicy,
-    EvaluationDemand, EvaluationDomainId, ExpressionEffectContext, ExpressionUseId,
-    FunctionInstanceState, FunctionIntrinsicRowError, FunctionNullBehavior, PureCompileControl,
-    SemanticParameters,
+    ExpressionUseId, FunctionInstanceState, FunctionIntrinsicRowError, FunctionNullBehavior,
+    PureCompileControl, SemanticParameters,
 };
 use std::{
     sync::{Arc, Mutex},
@@ -94,12 +93,10 @@ fn causes() -> [KernelFailure; 7] {
         KernelFailure::InstanceFailed,
     ]
 }
-fn context() -> ExpressionEffectContext {
-    ExpressionEffectContext {
-        use_id: ExpressionUseId::new(41),
-        domain: EvaluationDomainId::new(7),
-        demand: EvaluationDemand::Value,
-    }
+fn context() -> novarocks_type_contract::RelationEffectContext {
+    novarocks_type_contract::RelationEffectContext::call(
+        novarocks_type_contract::RelationCallId::new(41),
+    )
 }
 struct Fixture {
     catalog: EngineFunctionCatalog,
@@ -170,7 +167,7 @@ impl Fixture {
     }
     fn input(&self) -> CallEffectInput<'_> {
         CallEffectInput {
-            context: context(),
+            context: (context()).into(),
             argument_uses: crate::CallArgumentUses::SelectedChannels(
                 &ARGUMENT_USES[..self.arguments.len()],
             ),
@@ -185,7 +182,7 @@ impl Fixture {
             environment: &[],
             parameters: &self.parameters,
             decimal_overflow_policy: self.policy,
-            proof_scope: CallProofScope::Domain(context().domain),
+            proof_scope: CallProofScope::Relation(context().identity),
         }
     }
     fn prepare(
@@ -197,7 +194,7 @@ impl Fixture {
             self.input(),
             self.selected.clone(),
             PureCallPreparation::Window {
-                arguments: ScopedExpressionEffects::pure_value(context()),
+                arguments: ScopedRelationalEffects::pure_value(context()),
                 options,
             },
             control,
@@ -656,7 +653,7 @@ fn exact_nested_source_fresh_and_frozen_keep_same_installed_attachment_and_metad
                 fixture.selected.clone(),
                 fresh.contract().call().effects(),
                 PureCallPreparation::Window {
-                    arguments: ScopedExpressionEffects::pure_value(context()),
+                    arguments: ScopedRelationalEffects::pure_value(context()),
                     options,
                 },
                 &CompileControl::default(),
@@ -715,7 +712,7 @@ fn exact_nested_source_fresh_and_frozen_keep_same_installed_attachment_and_metad
                     input,
                     fixture.selected.clone(),
                     PureCallPreparation::Window {
-                        arguments: ScopedExpressionEffects::pure_value(context()),
+                        arguments: ScopedRelationalEffects::pure_value(context()),
                         options
                     },
                     &CompileControl::default()

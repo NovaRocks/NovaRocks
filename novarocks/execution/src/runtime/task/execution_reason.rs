@@ -32,7 +32,7 @@ pub(crate) enum ExecutionReason {
     WriterPanicked = 11,
     WriterAbortTimeout = 12,
     WriterAcceptedRowsOverflow = 13,
-    WriterCommitFragmentLimit = 14,
+    // 14 was WriterCommitFragmentLimit.
     WriterInterrupted = 15,
     SourceInputEdge = 16,
     SourceInputEos = 17,
@@ -198,7 +198,15 @@ pub(crate) enum ExecutionReason {
     TableCursorInvalidBatchRows = 209,
     ChunkSplitExceedsCharge = 210,
     ChunkSplitExceedsReservation = 211,
+    #[expect(
+        dead_code,
+        reason = "Stable Execution failure reason retained after its producer retired; never renumber or reuse."
+    )]
     WriterInputBatchRows = 212,
+    #[expect(
+        dead_code,
+        reason = "Stable Execution failure reason retained after its producer retired; never renumber or reuse."
+    )]
     WriterInputBatchBytes = 213,
     WriterQueueCapacity = 214,
     WriterAdditionalBytes = 215,
@@ -527,7 +535,7 @@ pub(crate) enum ExecutionReason {
     DistinctSetGatherContract = 472,
     SinkMaterializationContract = 490,
     SinkRootIdentityExtent = 491,
-    SinkKeyIdentityExtent = 492,
+    // 492 is reserved: partition roots carry their checked ordinal directly.
     SortOperationArrow = 493,
     SortOperationAllocation = 494,
     #[cfg(test)]

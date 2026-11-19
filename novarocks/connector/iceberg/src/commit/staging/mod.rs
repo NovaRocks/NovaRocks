@@ -27,8 +27,9 @@ mod view;
 pub(crate) use engine::freeze_existing_change;
 pub use engine::{PreparedChange, Preparer, StagingBase, StagingEngine};
 pub use initialization::staged_create_updates;
+pub(crate) use manifests::write_manifest_with_sources;
+pub(crate) use manifests::write_sourced_manifest;
 pub use manifests::{ManifestEntryWrite, write_manifest, write_manifest_list};
-pub(crate) use manifests::{write_sourced_manifest, write_sourced_manifest_with_class};
 pub use snapshot_id::new_snapshot_id;
 pub use view::StagedView;
 

@@ -99,4 +99,7 @@ pub use query_execution::required_constant_eval::RequiredConstantInterpreter;
 
 pub(crate) mod control_runtime;
 
+#[cfg(test)]
+pub(crate) mod fixtures;
+
 pub mod task_wire;

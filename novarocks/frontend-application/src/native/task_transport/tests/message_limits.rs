@@ -69,8 +69,7 @@ fn system_fragment(
     };
     use novarocks_physical_plan as p;
     use novarocks_type_contract::{
-        CompilePhase, ExpressionControlFlow, FunctionValueType, SemanticParameters,
-        ValueTypeStorageLifetime,
+        FunctionValueType, SemanticParameters, ValueTypeStorageLifetime,
     };
     let control = novarocks_sql::compiler::SqlCompileControl::unbounded();
     let node = p::NodeId::new(0);
@@ -117,25 +116,14 @@ fn system_fragment(
             p::StagePlacementPolicy::Singleton,
         )
         .unwrap();
-    let flow = ExpressionControlFlow::try_new(
-        vec![],
-        vec![],
-        fragment.expressions(),
-        CompilePhase::Validate,
-        &control,
-    )
-    .unwrap();
-    let expression_uses = p::PhysicalRootUses::try_new(&fragment, flow, vec![], &control).unwrap();
-    let calls =
-        p::FrozenFragmentCalls::try_new(&fragment, &expression_uses, vec![], &control).unwrap();
     let pruning = p::FrozenFragmentPruning::try_new(fragment.id(), vec![], &control).unwrap();
     let package = p::FragmentPackage::try_new(
         p::FragmentPackageInput {
             version: p::PlanVersionId::try_new([0x72; 16]).unwrap(),
             required: p::RequiredContracts::default(),
             fragment,
-            expression_uses,
-            calls,
+            statement_constant_policy:
+                novarocks_plan_codec::physical_package_v2::FROZEN_CONSTANT_POLICY,
             pruning,
             constants: p::ConstantPools::empty(),
             cuts: p::FragmentCuts::default(),
@@ -144,6 +132,7 @@ fn system_fragment(
             scans: BTreeMap::new(),
             writes: BTreeMap::new(),
             annotations: Box::default(),
+            layouts: Default::default(),
         },
         novarocks_plan_codec::physical_package_v2::FROZEN_PACKAGE_ADMISSION,
         &control,
@@ -219,35 +208,6 @@ fn original_queue_bound_is_required_even_when_wire_length_alone_would_fit() {
     assert!(NativeRequestWindows::for_transport(understated).is_err());
 }
 
-#[test]
-fn small_operations_keep_grouping_at_the_target_without_losing_the_next_head() {
-    let backend = BackendProcessId::new_v7();
-    let intents: Vec<_> = (1..=3).map(|task| cancel_intent(task, backend)).collect();
-    let ids: Vec<_> = intents.iter().map(OperationIntent::operation_id).collect();
-    let transport = budget(
-        TransportMessageLimits::DEFAULT,
-        2 * intents[0].queued_bytes(),
-    );
-    let mut dispatcher = OperationDispatcher::new(DispatchBudget::DEFAULT, transport);
-    for intent in intents {
-        dispatcher
-            .enqueue(intent, MonotonicInstant::ORIGIN)
-            .unwrap();
-    }
-    let first = dispatcher.take_batch().unwrap();
-    assert_eq!(
-        first
-            .operations()
-            .iter()
-            .map(OperationIntent::operation_id)
-            .collect::<Vec<_>>(),
-        ids[..2]
-    );
-    let last = dispatcher.take_batch().unwrap();
-    assert_eq!(last.operations()[0].operation_id(), ids[2]);
-    assert!(dispatcher.take_batch().is_none());
-}
-
 pub(super) async fn close(fixture: SinkFixture) {
     let SinkFixture {
         mut loopback,
@@ -260,10 +220,6 @@ pub(super) async fn close(fixture: SinkFixture) {
     drop(acks);
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     runtime.drain_original_apply_until(deadline).await.unwrap();
-    runtime
-        .drain_original_subscriptions_until(deadline)
-        .await
-        .unwrap();
     runtime.drain_native_outgoing_until(deadline).await.unwrap();
     drop(runtime);
     assert!(loopback.settle().await);
@@ -305,11 +261,7 @@ async fn a_create_above_the_old_grouping_target_reaches_the_production_decoder()
                     .unwrap(),
                 )),
             )]));
-        let mut dispatcher = OperationDispatcher::new(DispatchBudget::DEFAULT, transport);
-        dispatcher
-            .enqueue(intent, MonotonicInstant::ORIGIN)
-            .unwrap();
-        let batch = dispatcher.take_batch().unwrap();
+        let batch = released_batch(backend, vec![intent]);
         assert_eq!(batch.operations().len(), 1);
         submit_batch(&fixture, batch);
         let acknowledgements = settled(&fixture.acks, 1).await;
@@ -365,11 +317,7 @@ async fn exact_message_limit_with_larger_queued_carrier_fits_minimum_windows() {
                 .unwrap(),
             )),
         )]));
-    let mut dispatcher = OperationDispatcher::new(DispatchBudget::DEFAULT, transport);
-    dispatcher
-        .enqueue(intent, MonotonicInstant::ORIGIN)
-        .unwrap();
-    submit_batch(&fixture, dispatcher.take_batch().unwrap());
+    submit_batch(&fixture, released_batch(backend, vec![intent]));
     let acknowledgements = settled(&fixture.acks, 1).await;
     assert_eq!(
         acknowledgements[0].worker_outcome(),

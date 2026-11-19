@@ -72,7 +72,8 @@ impl OperatorFactory for CompiledJoinTailSourceFactory {
             name: self.name.clone(),
             declaration: self.declaration.clone(),
             error: self.error.clone(),
-            control: RuntimeKernelControl::new(self.error.clone()),
+            control: RuntimeKernelControl::new(self.error.clone())
+                .at_expression_node(self.declaration.node()),
             construction: None,
             tracker: None,
             frame: None,

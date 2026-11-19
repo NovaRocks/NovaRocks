@@ -19,7 +19,6 @@ from dataclasses import asdict
 import copy
 import datetime
 import hashlib
-import importlib.util
 import json
 import os
 from pathlib import Path
@@ -130,30 +129,6 @@ def ignored_inventory(native, listing):
     return units
 
 
-def java_rest_owner(repo):
-    path = Path(repo) / 'docker/iceberg-rest/tests/java_rest_inputs.py'
-    spec = importlib.util.spec_from_file_location('_java_rest_inputs', path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def java_rest_group(repo, values, ignored, bindings, listing):
-    owned = [scope for scope in values if ignored.get(str(scope.units[0]), {}).get('input-owner') == 'iceberg-java-rest-interop']
-    if not owned:
-        return values
-    owned.sort(key=lambda scope: str(scope.units[0]))
-    owner = java_rest_owner(repo)
-    names = [_rust_binding(scope, bindings, listing)[1] for scope in owned]
-    owner.validate_group(names)
-    if any(scope.identity != owned[0].identity for scope in owned):
-        raise ValueError('Java REST owner members have different native artifact/input bindings')
-    group = Scope(owner.SCOPE, tuple(scope.units[0] for scope in owned), owned[0].identity,
-                  'isolated', all(scope.inputs_declared for scope in owned),
-                  any(scope.selected for scope in owned), 'heavy')
-    return [scope for scope in values if scope not in owned] + [group]
-
-
 def rust_environment(repo, native):
     return dict(os.environ, NOVAROCKS_BIN=native['receipt']['novarocks']['path'], NOVAROCKS_WORKSPACE_ROOT=str(Path(repo).resolve()))
 
@@ -199,7 +174,6 @@ def scopes(repo, native, chosen):
                                 'heavy' if case.get('ignored') else 'regular'))
     chosen['resolved_heavy_ignored'] = [dict(ignored[str(scope.units[0])], unit=str(scope.units[0]), selected=scope.selected)
                                       for scope in result if scope.tier == 'heavy']
-    result = java_rest_group(repo, result, ignored, bindings, listing)
     doc = identity_snapshot.rust_snapshot(repo, inputs, env, 'doctest')['workspace']
     result.append(Scope('rust-doctest:workspace',(UnitKey('rust-doctest','workspace'),),doc['inputs'],'isolated',doc['declared'],chosen['doctest']))
     selected_sql = {value['name'] for value in chosen['sql_suites']}
@@ -738,7 +712,6 @@ def requirement_checks(requirements, environment, native, run_command=subprocess
         'fixture:iceberg-rest':('NOVAROCKS_ICEBERG_REST_URI','NOVA_ENV_REST_ENV_FILE'),
         'fixture:minio':('AWS_S3_ENDPOINT','AWS_S3_ACCESS_KEY_ID','AWS_S3_SECRET_ACCESS_KEY'),
         'fixture:iceberg-rest-publication':('UEA7_TEST_CONTROL_URI',),
-        'fixture:aliyun-ecs-oss':('NOVA_OSS_TEST_CONFIG',),
         'dataset:iceberg-java-oracle':('NOVAROCKS_UEA4G_ORACLE_RECEIPT','NOVAROCKS_UEA4G_ORACLE_OUTPUT'),
     }
     for requirement in requirements:
@@ -755,10 +728,6 @@ def requirement_checks(requirements, environment, native, run_command=subprocess
             for name in names:
                 if name.endswith(('_ENV_FILE','_RECEIPT')) and environment.get(name) and not Path(environment[name]).is_file():
                     missing.append(name)
-                if name == 'NOVA_OSS_TEST_CONFIG' and environment.get(name):
-                    path=Path(environment[name])
-                    if not path.is_absolute() or not path.is_file():
-                        missing.append(name)
             check.update(ok=not missing,missing=sorted(set(missing)),basis='declared effective configuration; native owner validates runtime facts')
         else:
             check['reason']='no native availability contract for this requirement'
@@ -828,19 +797,15 @@ def _regular_expression(scopes, bindings, metadata, inputs, listing):
     return expression, sorted(actual)
 
 
-def _rust_batch(repo, attempt, output, expression, environment, ignored=False, input_owner=None):
+def _rust_batch(repo, attempt, output, expression, environment, ignored=False):
     argv=[sys.executable,str(repo/'tools/ci/test-run.py'),'batch','--output',str(output),'--','-E',expression]
     if ignored:argv+=['--run-ignored','only']
-    if input_owner is not None:argv+=['--test-threads','1']
     command=attempt/(output.name+'.command.json')
     write_record(command,{'argv':argv,'cwd':str(repo)})
     with (attempt/(output.name+'.log')).open('xb') as log:
         try:
-            if input_owner is None:
-                result=subprocess.run(argv,cwd=repo,env=environment,stdout=log,stderr=subprocess.STDOUT)
-                code=result.returncode
-            else:
-                code=input_owner.run(argv, stdout=log, stderr=subprocess.STDOUT)
+            result=subprocess.run(argv,cwd=repo,env=environment,stdout=log,stderr=subprocess.STDOUT)
+            code=result.returncode
         except OSError as error:
             code=None
             log.write(('executor did not start: '+str(error)+'\n').encode())
@@ -848,57 +813,17 @@ def _rust_batch(repo, attempt, output, expression, environment, ignored=False, i
     return code
 
 
-def _java_rest_batch(repo, root, attempt, native, scope, bindings, metadata, env):
-    owner_module = java_rest_owner(repo)
-    listing = native.get('regular_inventory')
-    names = [_rust_binding(Scope(str(unit), (unit,)), bindings, listing)[1] for unit in scope.units]
-    owner_module.validate_group(names)
-    expression = _rust_expression(scope, bindings, metadata, listing)
-    # Native nextest, rather than a Python selector parser, proves whole-group
-    # membership before admission starts the shared run's original deadline.
-    selected = native_list(native['inputs'], expression, 'only')
-    actual = {'rust-test:' + binary + '::' + name
-              for binary, suite in selected['rust-suites'].items()
-              for name, case in suite['testcases'].items()
-              if case.get('filter-match', {}).get('status') == 'matches'}
-    if actual != {str(unit) for unit in scope.units}:
-        raise ValueError('Java REST native selection differs from its complete owner group')
-    with owner_module.own_inputs(repo, attempt / 'java-rest-inputs', env) as owner:
-        declarations = [native['ignored_units'][str(unit)] for unit in scope.units]
-        requirements = declarations[0]['requires']
-        if any(value['requires'] != requirements or value.get('input-owner') != owner_module.OWNER
-               for value in declarations):
-            raise ValueError('Java REST owner group declarations differ')
-        checks = requirement_checks(requirements, owner.environment, native)
-        write_record(attempt / 'java-rest-prerequisites.json', dict(schema=1, checks=checks))
-        if not checks or not all(check['ok'] for check in checks):
-            raise ValueError('Java REST original owner prerequisites are unavailable')
-        snapshots = identity_snapshot.rust_snapshot(repo, native['identity_inputs'], owner.environment, 'nextest')
-        payloads = [snapshots[unit.id]['inputs'] for unit in scope.units]
-        if any(value != payloads[0] for value in payloads):
-            raise ValueError('Java REST owner inputs do not bind one complete native group')
-        declaration = dict(schema=1, phase='before-execution', scope=scope.key,
-                           units=[str(unit) for unit in scope.units],
-                           static_identity=owner_module.static_identity(payloads[0]), identity=payloads[0],
-                           owner_result=str(owner.root / 'owner-result.json'), files=owner.input_files)
-        path = attempt / 'java-rest-target.json'
-        write_record(path, declaration)
-        # A declared intended target, written before executing nextest. Compose
-        # never learns target identity from test outcomes or generated receipts.
-        identity_snapshot.atomic_json(root / 'java-rest-target.json',
-                                      dict(path=str(path), sha256=identity_snapshot.digest(path)))
-        scope.identity = payloads[0]
-        output = attempt / 'rust-heavy-java-rest'
-        code = _rust_batch(repo, attempt, output, expression,
-                           owner.environment, ignored=True, input_owner=owner)
-        if code == 0:
-            observations, errors = read_rust(output, attempt.name, (scope,))
-            if (errors or {item.unit for item in observations if item.unit.kind == 'rust-test'} != set(scope.units)
-                    or any(item.result != 'pass' or not item.record_complete or not item.terminated
-                           or not item.identity_confirmed or item.identity != scope.identity or item.cleanup != 'ok'
-                           for item in observations if item.unit.kind == 'rust-test')):
-                raise ValueError('Java REST complete native result/cleanup collection is missing')
-        return code
+# Owned environment keys in archived Java REST target receipts.
+JAVA_REST_OWNED_ENV = frozenset({
+    'NOVA_FIXTURE_RUN_CONTEXT', 'NOVA_FIXTURE_RUN_STORAGE', 'NOVA_ENV_MANIFEST',
+    'NOVA_ENV_REST_ENV_FILE', 'AWS_S3_ENDPOINT',
+    'AWS_S3_ACCESS_KEY_ID', 'AWS_S3_SECRET_ACCESS_KEY',
+    'NOVAROCKS_ICEBERG_REST_URI', 'NOVAROCKS_ICEBERG_REST_WAREHOUSE',
+    'NR_JAVA_REST_INTEROP_RUN_ROOT',
+    *('NR_' + family + '_INTEROP_' + suffix for family in ('IRU5', 'IRU13A', 'IRU13B')
+      for suffix in ('NAMESPACE', 'ARTIFACT_DIR')),
+})
+
 
 
 def _java_rest_target(root, scopes, target):
@@ -912,11 +837,14 @@ def _java_rest_target(root, scopes, target):
         raise ValueError('Java REST pre-execution target reference differs')
     saved = json.loads(path.read_text())
     scope = owned[0]
-    module = java_rest_owner(Path(__file__).resolve().parents[3])
     if (saved.get('schema') != 1 or saved.get('phase') != 'before-execution'
             or saved.get('scope') != scope.key or saved.get('units') != [str(unit) for unit in scope.units]):
         raise ValueError('Java REST target declaration differs from its complete group')
-    if scope.identity is None or saved['static_identity'] != module.static_identity(scope.identity):
+    if scope.identity is None:
+        return target
+    static_env = {key: item for key, item in scope.identity.get('env', {}).items()
+                  if key not in JAVA_REST_OWNED_ENV}
+    if saved['static_identity'] != dict(scope.identity, env=static_env):
         return target
     try:
         if any(identity_snapshot.digest(path) != digest for path, digest in saved['files'].items()):
@@ -1041,16 +969,6 @@ def execute(repo,root,native,chosen,scope_values,pending=None):
                 record_error('rust-batch','regular native tests',error=error)
         groups={}
         for scope in heavy:
-            if scope.key == 'rust-owner:iceberg-java-rest-interop':
-                try:
-                    code = _java_rest_batch(repo, root, attempt, native, scope, bindings, metadata, env)
-                    batch_attempted = True
-                    if code != 0:
-                        record_error('rust-heavy', scope.key, code=code)
-                except (OSError, ValueError, subprocess.SubprocessError,
-                        java_rest_owner(repo).fixture_run.runtime.RuntimeFailure) as error:
-                    record_error('rust-heavy', scope.key, error=error)
-                continue
             declaration=native.get('ignored_units',{}).get(str(scope.units[0]))
             if not declaration or declaration.get('class')!='heavy':
                 record_error('rust-heavy',str(scope.units[0]),error='native heavy declaration is unavailable')

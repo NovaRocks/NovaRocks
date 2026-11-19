@@ -18,9 +18,13 @@
 //! Single-fragment fixtures for compiled node families: a physical fragment
 //! authored with the real builder, published as a checked package, compiled by
 //! local-compiler and run through `prepare_compiled_program_pipeline_execution`.
-//! Every expression root in these fixtures is a leaf (literal or value read),
-//! so each root gets one eager use in one evaluation domain.
+//! No-call expression drafts retain explicit roots and input scopes. The unit
+//! SDK authors their actual occurrences and control regions before publication.
 
+#[path = "compiled_family_fixture/constant_sources.rs"]
+pub(crate) mod constant_sources;
+use constant_sources as cv;
+pub(crate) use constant_sources::FragmentBuilder;
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -29,22 +33,21 @@ use std::time::Duration;
 use arrow::array::{Array, Int64Array};
 use arrow::datatypes::DataType;
 use novarocks_connector_contract::PureProviderProgramCatalog;
+use novarocks_expression_contract::{ExprKind, RootScope};
 use novarocks_functions::ConstantPolicy;
 use novarocks_local_compiler::{
     LocalCompileOptions, compile_fragment, validate_fragment_providers,
 };
 use novarocks_local_program::{KernelAbiVersion, LocalProgram};
 use novarocks_physical_plan::{
-    ConstantPools, ExprKind, FragmentBuilder, FragmentCuts, FragmentId, FragmentPackage,
-    FragmentPackageAdmission, FragmentPackageInput, FragmentSink, FrozenFragmentCalls,
-    FrozenFragmentPruning, LiteralValue, NodeId, PhysicalExpressionRoots, PhysicalRootUses,
-    PipelineDopDomain, PlanLimits, PlanVersionId, PropertyProofProjectionLimits, RequiredContracts,
-    ResultField, ResultPort, ValueId, ValueOrigin,
+    ConstantPools, FragmentCuts, FragmentId, FragmentPackage, FragmentPackageAdmission,
+    FragmentPackageInput, FragmentSink, FrozenFragmentPruning, NodeId, PipelineDopDomain,
+    PlanLimits, PlanVersionId, PropertyProofProjectionLimits, RequiredContracts, ResultField,
+    ResultPort, ValueId, ValueOrigin,
 };
 use novarocks_type_contract::{
-    CompileControlError, CompilePhase, ControlShape, EvaluationDomainId, ExpressionControlFlow,
-    ExpressionEffectContext, ExpressionEvaluationDomain, ExpressionInvocation, ExpressionUseId,
-    FunctionValueType, PureCompileControl, SemanticParameters,
+    CompileCheckpoints, CompileControlError, CompilePhase, EvaluationDemand, FunctionValueType,
+    PureCompileControl, SemanticParameters,
 };
 
 use crate::exec::chunk::{Chunk, OutputColumnMetadata};
@@ -118,8 +121,8 @@ pub(crate) fn boolean(nullable: bool) -> FunctionValueType {
 }
 
 /// One nullable or non-null Int64 literal cell.
-pub(crate) fn cell(value: Option<i64>) -> LiteralValue {
-    value.map_or(LiteralValue::Null, LiteralValue::Int64)
+pub(crate) fn cell(value: Option<i64>) -> novarocks_functions::ConstantValue {
+    value.map_or_else(cv::null, cv::i64)
 }
 
 /// A Values leaf at `node` whose columns have the given complete types and
@@ -128,7 +131,7 @@ pub(crate) fn values(
     builder: &mut FragmentBuilder,
     node: NodeId,
     types: &[FunctionValueType],
-    rows: &[Vec<LiteralValue>],
+    rows: &[Vec<novarocks_functions::ConstantValue>],
 ) -> Vec<ValueId> {
     let columns = types
         .iter()
@@ -152,8 +155,11 @@ pub(crate) fn values(
             row.iter()
                 .zip(types)
                 .map(|(literal, ty)| {
+                    let definition = builder.constant(node, ty.clone(), literal.clone());
                     builder
-                        .add_expression(node, ty.clone(), ExprKind::Literal(literal.clone()))
+                        .unit(node)
+                        .unwrap()
+                        .root(definition, EvaluationDemand::Value, RootScope::AllPorts)
                         .unwrap()
                 })
                 .collect::<Vec<_>>()
@@ -183,8 +189,173 @@ fn admission() -> FragmentPackageAdmission {
     }
 }
 
-/// Publish the fragment rooted at `root` with a Result sink. Every root is a
-/// leaf and gets one eager use; there is no function call to freeze.
+/// Seal the original drafts of fixtures that contain no function calls. The SDK owns all
+/// occurrence identities and control regions; the empty claim map admits no call.
+pub(crate) fn seal_no_call_units(builder: &mut novarocks_physical_plan::FragmentBuilder) {
+    let nodes = builder
+        .construction_nodes()
+        .filter_map(|(&id, node)| {
+            let mut roots = Vec::new();
+            node.kind.root_references(&mut roots);
+            (node.expressions.is_none() && !roots.is_empty()).then_some(id)
+        })
+        .collect::<Vec<_>>();
+    let mut work = CompileCheckpoints::try_new(&FixtureControl, CompilePhase::Validate).unwrap();
+    for node in nodes {
+        let ports = builder.node_ports(node).unwrap();
+        let unit = builder
+            .take_unit_builder(node)
+            .unwrap()
+            .seal(ports, &mut work)
+            .unwrap()
+            .finish(BTreeMap::new(), &mut work)
+            .unwrap();
+        builder.install_unit(node, Arc::new(unit)).unwrap();
+    }
+    work.finish().unwrap();
+}
+
+/// Freeze calls over the actual writer/finish materialized channels. These
+/// inputs have already left scalar evaluation; no expression use is invented.
+pub(crate) fn freeze_materialized_writer_calls(
+    fragment: &novarocks_physical_plan::Fragment,
+    catalog: &novarocks_functions::PureEngineFunctionCatalog,
+    parameters: &SemanticParameters,
+    decimal_policy: novarocks_type_contract::DecimalOverflowPolicy,
+    control: &dyn PureCompileControl,
+) -> novarocks_physical_plan::FrozenFragmentCalls {
+    use novarocks_functions::{
+        AggregateBindingSelection, AggregateKernelPhase, AggregatePreparationOptions,
+        CallArgumentUses, CallEffectInput, FunctionArgument, FunctionBindingRequest,
+        FunctionBindingSelection, FunctionKind, FunctionResultType, PureCallPreparation,
+        ScopedRelationalEffects,
+    };
+    use novarocks_physical_plan::{
+        FrozenPhysicalCall, NodeKind, PhysicalCallSite, StaticFunctionArgument,
+    };
+    use novarocks_type_contract::{
+        CallProofScope, ExpressionEffects, RelationCallId, RelationEffectContext,
+    };
+    let mut frozen = Vec::new();
+    for node in fragment.nodes().values() {
+        let (calls, partial) = match &node.kind {
+            NodeKind::TableWriter { target } => (target.partial_aggregates.as_ref(), true),
+            NodeKind::TableFinish(spec) => (spec.final_aggregates.as_ref(), false),
+            _ => continue,
+        };
+        for (ordinal, item) in calls.iter().enumerate() {
+            let call = u32::try_from(ordinal).unwrap();
+            let site = if partial {
+                PhysicalCallSite::WriterPartial {
+                    node: node.id,
+                    call,
+                }
+            } else {
+                PhysicalCallSite::WriterFinal {
+                    node: node.id,
+                    call,
+                }
+            };
+            let relation = RelationCallId::new(u32::try_from(frozen.len()).unwrap());
+            let context = RelationEffectContext::call(relation);
+            let input = RelationEffectContext::materialized_input(relation);
+            let binding = &item.binding;
+            let selected = Arc::new(FunctionBindingSelection {
+                overload: binding.function.overload.clone(),
+                argument_types: binding.function.argument_types.clone(),
+                result_type: FunctionResultType::Scalar(binding.function.result_type.clone()),
+                aggregate: Some(AggregateBindingSelection {
+                    state_argument_contract: binding.state_argument_contract,
+                    intermediate_type: binding.intermediate_type.clone(),
+                    state_format: binding.state_format.clone(),
+                }),
+            });
+            let original = fragment
+                .call_requests()
+                .get(site)
+                .expect("original writer request");
+            let arguments = original
+                .arguments
+                .iter()
+                .map(|argument| match argument {
+                    StaticFunctionArgument::Value {
+                        value_type,
+                        constant: None,
+                    } => FunctionArgument::Value {
+                        value_type: value_type.clone(),
+                        constant: None,
+                    },
+                    _ => panic!("writer requests retain their original materialized value types"),
+                })
+                .collect::<Vec<_>>();
+            let input_type = &fragment.values()[&item.input].ty;
+            let phase = if partial {
+                AggregateKernelPhase::Partial
+            } else {
+                AggregateKernelPhase::Final
+            };
+            let token = catalog
+                .prepare_fresh(
+                    CallEffectInput {
+                        context: context.into(),
+                        argument_uses: if partial {
+                            CallArgumentUses::MaterializedInput {
+                                context: input,
+                                input_type,
+                            }
+                        } else {
+                            CallArgumentUses::AggregateMerge {
+                                phase,
+                                state_context: input.into(),
+                                state_input_type: input_type,
+                            }
+                        },
+                        function_id: &binding.function.function_id,
+                        kind: FunctionKind::Aggregate,
+                        selected: selected.as_ref(),
+                        request: FunctionBindingRequest {
+                            arguments: &arguments,
+                            logical_argument_count: original.logical_argument_count,
+                            expected_result_type: original.expected_result_type.as_ref(),
+                        },
+                        environment: &[],
+                        parameters,
+                        decimal_overflow_policy: decimal_policy,
+                        proof_scope: CallProofScope::Relation(context.identity),
+                    },
+                    selected.clone(),
+                    PureCallPreparation::Aggregate {
+                        arguments: ScopedRelationalEffects::primitive(
+                            context,
+                            ExpressionEffects::PURE_VALUE,
+                        ),
+                        options: AggregatePreparationOptions {
+                            state_interpretation: None,
+                            phase,
+                            distinct: false,
+                            order_keys: Arc::from([]),
+                            state_input_type: (!partial).then(|| input_type.clone()),
+                        },
+                    },
+                    control,
+                )
+                .unwrap_or_else(|error| {
+                    panic!("the original writer owner prepares {site:?}: {error}")
+                });
+            frozen.push(FrozenPhysicalCall {
+                site,
+                context,
+                materialized_writer_input: Some(input),
+                effects: token.call_contract().effects().clone(),
+                decimal_overflow_policy: decimal_policy,
+            });
+        }
+    }
+    novarocks_physical_plan::FrozenFragmentCalls::try_new(fragment, frozen, control).unwrap()
+}
+
+/// Publish the fragment rooted at `root` with a Result sink. Its original
+/// no-call expression drafts are sealed by the unit SDK before publication.
 pub(crate) fn package(
     builder: FragmentBuilder,
     root: NodeId,
@@ -205,13 +376,14 @@ pub(crate) fn package_with_sink(
 }
 
 pub(crate) fn package_with_sink_and_names(
-    builder: FragmentBuilder,
+    mut builder: FragmentBuilder,
     root: NodeId,
     constants: ConstantPools,
     max_dop: u32,
     sink: FragmentSink,
     names: Option<&[&str]>,
 ) -> Arc<FragmentPackage> {
+    seal_no_call_units(&mut builder);
     let fragment = builder
         .finish_definition(
             root,
@@ -224,38 +396,9 @@ pub(crate) fn package_with_sink_and_names(
             novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap();
-    let roots = PhysicalExpressionRoots::try_new(&fragment, &FixtureControl).unwrap();
-    let domain = EvaluationDomainId::new(0);
-    let mut uses = Vec::new();
-    let mut bindings = Vec::new();
-    for (ordinal, (site, root)) in roots.sites().iter().enumerate() {
-        let id = ExpressionUseId::new(u32::try_from(ordinal).unwrap());
-        uses.push(ExpressionInvocation {
-            context: ExpressionEffectContext {
-                use_id: id,
-                domain,
-                demand: root.demand,
-            },
-            definition: root.expr,
-            control: ControlShape::Eager,
-            arguments: Box::default(),
-        });
-        bindings.push((*site, id));
-    }
-    let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
-            id: domain,
-            parent: None,
-            guard: None,
-        }],
-        uses,
-        fragment.expressions(),
-        CompilePhase::Validate,
-        &FixtureControl,
-    )
-    .unwrap();
-    let uses = PhysicalRootUses::try_new(&fragment, flow, bindings, &FixtureControl).unwrap();
-    let calls = FrozenFragmentCalls::try_new(&fragment, &uses, vec![], &FixtureControl).unwrap();
+    let (fragment, sources) = fragment.into_parts();
+    let mut constants = constants;
+    cv::merge(&mut constants, &sources);
     let output = fragment.nodes()[&root].output.clone();
     if let Some(names) = names {
         assert_eq!(names.len(), output.columns.len());
@@ -291,8 +434,7 @@ pub(crate) fn package_with_sink_and_names(
                 version: PlanVersionId::try_new([91; 16]).unwrap(),
                 required: RequiredContracts::default(),
                 fragment,
-                expression_uses: uses,
-                calls,
+                statement_constant_policy: constant_policy(),
                 pruning: FrozenFragmentPruning::try_new(id, vec![], &FixtureControl).unwrap(),
                 cuts: FragmentCuts::default(),
                 result: Some(result),
@@ -300,6 +442,7 @@ pub(crate) fn package_with_sink_and_names(
                 scans: BTreeMap::new(),
                 writes: BTreeMap::new(),
                 annotations: Box::default(),
+                layouts: Default::default(),
             },
             admission(),
             &FixtureControl,
@@ -340,7 +483,7 @@ pub(crate) fn try_compile(
     package: Arc<FragmentPackage>,
     dop: usize,
 ) -> Result<Arc<LocalProgram>, String> {
-    let functions = crate::exec::expr::compiled_program::tests::rng_subset();
+    let functions = novarocks_functions::testkit::rng_subset();
     let providers =
         PureProviderProgramCatalog::<std::io::Error>::try_new(&[], vec![], &FixtureControl)
             .unwrap();
@@ -444,9 +587,11 @@ pub(crate) fn int64_rows(chunks: &[Chunk]) -> Vec<Vec<Option<i64>>> {
 /// Compile the fixture's complete declared columns as constant Values. This
 /// authors a checked package; lifecycle tests do not retain a decoder bridge.
 pub(crate) fn values_chunk_program(chunk: &Chunk, sink: FragmentSink) -> Arc<LocalProgram> {
+    let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
+
     use novarocks_functions::ConstantPool;
     use novarocks_physical_plan::{ConstantPoolId, ConstantReference};
-    let mut builder = FragmentBuilder::new(FragmentId::new(19));
+    let mut builder = FragmentBuilder::new(FragmentId::new(19), &fixture_sources);
     let node = novarocks_physical_plan::NodeId::new(19);
     let mut constants = ConstantPools::empty();
     let types = chunk
@@ -498,15 +643,22 @@ pub(crate) fn values_chunk_program(chunk: &Chunk, sink: FragmentSink) -> Arc<Loc
                 .iter()
                 .enumerate()
                 .map(|(ordinal, ty)| {
-                    builder
-                        .add_expression(
-                            node,
+                    let definition = builder
+                        .unit(node)
+                        .unwrap()
+                        .add(
+                            None,
                             ty.clone(),
                             ExprKind::Constant(ConstantReference {
                                 pool: ConstantPoolId::new(ordinal as u32),
                                 ordinal: row as u32,
                             }),
                         )
+                        .unwrap();
+                    builder
+                        .unit(node)
+                        .unwrap()
+                        .root(definition, EvaluationDemand::Value, RootScope::AllPorts)
                         .unwrap()
                 })
                 .collect::<Vec<_>>()

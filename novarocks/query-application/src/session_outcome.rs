@@ -17,6 +17,9 @@
 
 //! Session-local deadline and terminal-error interpretation.
 
+#[cfg(test)]
+use crate::execution_error::ExecutionFailurePresentation;
+
 use std::time::{Duration, Instant};
 
 use crate::api::{QueryExecutionError, QueryExecutionErrorKind};

@@ -27,6 +27,7 @@ use novarocks_type_contract::CompileControlError;
 use std::fmt;
 
 mod kind;
+pub(crate) use kind::window_frame as encode_window_frame;
 mod materialize;
 mod namespace;
 mod owner_admission;
@@ -37,17 +38,19 @@ pub use materialize::{
     materialize_expressions_in, prepare_expression_materialization,
     prepare_expression_materialization_in,
 };
+pub(crate) use receiving_grammar::decode_window_frame;
 
 pub use namespace::{
-    EncodedExpressions, ExpressionNamespaceWriteFacts, ExpressionProjectionLimits,
-    ExpressionTypeIds, PreparedExpressionNamespaceWrite, encode_expression_definitions,
-    prepare_expression_definitions, prepare_expression_definitions_in,
+    EncodedExpressions, ExpressionDefinitionSource, ExpressionNamespaceWriteFacts,
+    ExpressionProjectionLimits, ExpressionTypeIds, PreparedExpressionNamespaceWrite,
+    encode_expression_definitions, prepare_expression_definitions,
+    prepare_expression_definitions_in,
 };
 
 pub(crate) use namespace::tree_lookup_work as expression_tree_lookup_work;
 pub use read::{
-    DecodedExpressions, ExpressionNamespaceReadFacts, decode_expression_definitions,
-    decode_expression_definitions_in,
+    DecodedExpressions, ExpressionDefinitionInput, ExpressionNamespaceReadFacts,
+    decode_expression_definitions, decode_expression_definitions_in,
 };
 
 fn encode_array_cast_failure_mode(
@@ -85,7 +88,9 @@ pub enum ExpressionCodecError {
     Binding(BindingCodecError),
     Value(ValueCodecError),
     Constant(novarocks_physical_plan::ConstantReferenceError),
-    Arena(novarocks_physical_plan::ExprArenaConstructionError),
+    Unit(novarocks_expression_contract::UnitError),
+    ConstructedUnit(novarocks_expression_contract::ConstructedUnitError),
+    UnitResource(novarocks_type_contract::owned_resources::layout::LayoutResourceError),
 }
 impl fmt::Display for ExpressionCodecError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -97,7 +102,9 @@ impl fmt::Display for ExpressionCodecError {
             Self::Binding(error) => error.fmt(f),
             Self::Value(error) => error.fmt(f),
             Self::Constant(error) => error.fmt(f),
-            Self::Arena(error) => error.fmt(f),
+            Self::Unit(error) => error.fmt(f),
+            Self::ConstructedUnit(error) => error.fmt(f),
+            Self::UnitResource(error) => error.fmt(f),
         }
     }
 }
@@ -110,18 +117,18 @@ impl std::error::Error for ExpressionCodecError {
             Self::Binding(source) => Some(source),
             Self::Value(source) => Some(source),
             Self::Constant(source) => Some(source),
-            Self::Arena(source) => Some(source),
+            Self::Unit(source) => Some(source),
+            Self::ConstructedUnit(source) => Some(source),
+            Self::UnitResource(source) => Some(source),
             _ => None,
         }
     }
 }
-impl From<novarocks_physical_plan::ExprArenaConstructionError> for ExpressionCodecError {
-    fn from(value: novarocks_physical_plan::ExprArenaConstructionError) -> Self {
+impl From<novarocks_expression_contract::UnitError> for ExpressionCodecError {
+    fn from(value: novarocks_expression_contract::UnitError) -> Self {
         match value {
-            novarocks_physical_plan::ExprArenaConstructionError::Control(error) => {
-                Self::Control(error)
-            }
-            value => Self::Arena(value),
+            novarocks_expression_contract::UnitError::Control(error) => Self::Control(error),
+            value => Self::Unit(value),
         }
     }
 }
@@ -186,8 +193,13 @@ struct PreparedExpressionIds<'a> {
     root_carrier_type_id: Option<u32>,
     lambda_parameter_type_ids: &'a [u32],
     function_binding_id: Option<u32>,
-    aggregate_binding_id: Option<u32>,
 }
 
 #[cfg(test)]
 mod error_tests;
+
+impl From<novarocks_constant_contract::ConstantTableError> for ExpressionCodecError {
+    fn from(error: novarocks_constant_contract::ConstantTableError) -> Self {
+        Self::from(novarocks_physical_plan::ConstantReferenceError::from(error))
+    }
+}

@@ -132,6 +132,42 @@ impl SessionPropertyInputs {
         }
     }
 
+    /// Project only overrides admitted for this FE control runtime.
+    pub fn connector_catalog_overrides(
+        &self,
+        catalog: &str,
+        runtime: novarocks_spi::connector::ConnectorControlRuntimeId,
+    ) -> novarocks_spi::connector::read_stack::ConnectorCatalogSession {
+        use novarocks_spi::connector::read_stack::SessionPropertyValue as ConnectorValue;
+        self.catalogs
+            .get(catalog)
+            .into_iter()
+            .flat_map(|values| values.values())
+            .filter_map(|property| {
+                let SessionPropertyScope::Catalog {
+                    identity: Some(identity),
+                    ..
+                } = &property.scope
+                else {
+                    return None;
+                };
+                if identity.control_runtime_id != runtime {
+                    return None;
+                }
+                let value = match property.value() {
+                    SessionPropertyValue::Boolean(value) => ConnectorValue::Boolean(*value),
+                    SessionPropertyValue::Integer(value) => ConnectorValue::Integer(*value),
+                    SessionPropertyValue::Bigint(value) => ConnectorValue::BigInt(*value),
+                    SessionPropertyValue::Double(value) => ConnectorValue::Double(*value),
+                    SessionPropertyValue::Varchar(value) => {
+                        ConnectorValue::Varchar(Arc::from(value.as_str()))
+                    }
+                };
+                Some((Arc::from(property.name()), value))
+            })
+            .collect()
+    }
+
     pub fn system_overrides(&self) -> impl Iterator<Item = &ValidatedSessionProperty> {
         self.system.values()
     }

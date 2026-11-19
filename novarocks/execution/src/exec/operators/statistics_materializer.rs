@@ -35,9 +35,8 @@ use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 use novarocks_result_contract::RootProfileV1;
 use novarocks_spi::connector::{
-    MAX_CONNECTOR_STATISTICS_ARTIFACT_BODY_BYTES, MAX_CONNECTOR_STATISTICS_ARTIFACTS,
-    MAX_CONNECTOR_STATISTICS_COLUMNS, MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES,
-    MAX_CONNECTOR_STATISTICS_RESULT_BATCH_BYTES, MAX_CONNECTOR_STATISTICS_RESULT_BODY_BYTES,
+    MAX_CONNECTOR_STATISTICS_ARTIFACT_BODY_BYTES, MAX_CONNECTOR_STATISTICS_COLUMNS,
+    MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES, MAX_CONNECTOR_STATISTICS_RESULT_BATCH_BYTES,
 };
 use novarocks_types::SlotId;
 
@@ -69,28 +68,22 @@ const BATCH_ROWS: usize = 32;
 const BYTE_QUANTUM: usize = RootProfileV1::EMIT_BYTES_PER_TURN;
 const WORK_QUANTUM: usize = RootProfileV1::CELLS_PER_TURN;
 
-enum StatisticsLiteralSource {
-    #[cfg(test)]
-    Fixture(Arc<[novarocks_local_program::StaticLiteral]>),
+enum StatisticsConstantSource {
     Compiled(Arc<novarocks_local_program::LocalProgram>),
 }
-impl StatisticsLiteralSource {
-    fn blob(&self, expr: novarocks_local_program::ProgramExprId) -> Option<&str> {
+impl StatisticsConstantSource {
+    fn blob(&self, expr: novarocks_local_program::ProgramRootRef) -> Option<&str> {
         match self {
-            #[cfg(test)]
-            Self::Fixture(literals) => match literals.get(expr.index())? {
-                novarocks_local_program::StaticLiteral::Utf8(value) => Some(value),
-                _ => None,
-            },
-            Self::Compiled(program) => match program.graph().expressions().node(expr)?.kind() {
-                novarocks_local_program::StaticExprKind::Literal(
-                    novarocks_local_program::StaticLiteral::Utf8(value),
-                ) => Some(value),
-                novarocks_local_program::StaticExprKind::Constant(value) => {
-                    Self::constant_blob(value)
+            Self::Compiled(program) => {
+                let unit = program.unit(expr.unit)?;
+                let root = unit.root(expr.root)?;
+                match unit.definitions().node(root.definition)?.kind() {
+                    novarocks_expression::StaticExprKind::Constant(value) => {
+                        Self::constant_blob(value)
+                    }
+                    _ => None,
                 }
-                _ => None,
-            },
+            }
         }
     }
     fn constant_blob(value: &novarocks_functions::ConstantValue) -> Option<&str> {
@@ -140,7 +133,7 @@ impl StatisticsSchemaPreparation {
     }
 }
 struct Definition {
-    source: StatisticsLiteralSource,
+    source: StatisticsConstantSource,
     mappings: Vec<UnpivotValueMapping>,
     input_slots: Vec<SlotId>,
     input_ordinals: Vec<usize>,
@@ -152,7 +145,7 @@ pub(crate) struct StatisticsMaterializerFactory(Arc<Definition>);
 impl StatisticsMaterializerFactory {
     #[cfg(test)]
     fn from_test_facts(
-        literals: Arc<[novarocks_local_program::StaticLiteral]>,
+        program: Arc<novarocks_local_program::LocalProgram>,
         value_slot: SlotId,
         literal_slots: Vec<SlotId>,
         mappings: Vec<UnpivotValueMapping>,
@@ -163,7 +156,7 @@ impl StatisticsMaterializerFactory {
         max_bytes: usize,
     ) -> ExecutionResult<Self> {
         Self::try_new_from_source(
-            StatisticsLiteralSource::Fixture(literals),
+            StatisticsConstantSource::Compiled(program),
             value_slot,
             literal_slots,
             mappings,
@@ -189,7 +182,7 @@ impl StatisticsMaterializerFactory {
         max_bytes: usize,
     ) -> ExecutionResult<Self> {
         Self::try_new_from_source(
-            StatisticsLiteralSource::Compiled(program),
+            StatisticsConstantSource::Compiled(program),
             value_slot,
             literal_slots,
             mappings,
@@ -201,7 +194,7 @@ impl StatisticsMaterializerFactory {
         )
     }
     fn try_new_from_source(
-        source: StatisticsLiteralSource,
+        source: StatisticsConstantSource,
         value_slot: SlotId,
         literal_slots: Vec<SlotId>,
         mappings: Vec<UnpivotValueMapping>,
@@ -220,10 +213,8 @@ impl StatisticsMaterializerFactory {
             || value_slot != slots[2]
             || literal_slots.as_slice() != [slots[0], slots[1], slots[3]]
             || max_rows == 0
-            || max_rows > MAX_CONNECTOR_STATISTICS_ARTIFACTS
             || max_bytes != MAX_CONNECTOR_STATISTICS_RESULT_BATCH_BYTES
             || mappings.is_empty()
-            || mappings.len() > MAX_CONNECTOR_STATISTICS_ARTIFACTS
         {
             return Err(statistics_contract(
                 "statistics materializer roles or bounds differ from its frozen domain",
@@ -443,8 +434,6 @@ impl OperatorFactory for StatisticsMaterializerFactory {
             input: None,
             workspace: None,
             cursor: 0,
-            rows: 0,
-            body_bytes: 0,
             metadata_bytes: 0,
             finishing: false,
         })
@@ -461,8 +450,6 @@ struct StatisticsMaterializer {
     input: Option<Chunk>,
     workspace: Option<Workspace>,
     cursor: usize,
-    rows: usize,
-    body_bytes: usize,
     metadata_bytes: usize,
     finishing: bool,
 }
@@ -613,22 +600,10 @@ impl StatisticsMaterializer {
             if self.input.is_some() {
                 return Err(statistics_contract("statistics input position is full"));
             }
-            let expanded = chunk
+            chunk
                 .len()
                 .checked_mul(self.definition.mappings.len())
                 .ok_or_else(|| statistics_contract("statistics expanded row count overflow"))?;
-            if self
-                .rows
-                .checked_add(expanded)
-                .is_none_or(|n| n > MAX_CONNECTOR_STATISTICS_ARTIFACTS)
-            {
-                return Err(statistics_limit(
-                    "statistics expanded row count",
-                    novarocks_failure_contract::ResourceDimension::Items,
-                    self.rows as u128 + expanded as u128,
-                    MAX_CONNECTOR_STATISTICS_ARTIFACTS,
-                ));
-            }
             if chunk.chunk_schema_ref().slot_ids() != self.definition.input_slots {
                 return Err(statistics_contract(
                     "statistics input order differs from its frozen port",
@@ -668,18 +643,6 @@ impl StatisticsMaterializer {
                         ));
                     }
                     let next = sizes.add(ids.len(), blob.len(), body.len())?;
-                    if self
-                        .body_bytes
-                        .checked_add(next.body)
-                        .is_none_or(|n| n > MAX_CONNECTOR_STATISTICS_RESULT_BODY_BYTES)
-                    {
-                        return Err(statistics_limit(
-                            "statistics result body",
-                            novarocks_failure_contract::ResourceDimension::Bytes,
-                            self.body_bytes as u128 + next.body as u128,
-                            MAX_CONNECTOR_STATISTICS_RESULT_BODY_BYTES,
-                        ));
-                    }
                     if self
                         .metadata_bytes
                         .checked_add(next.metadata(rows + 1)?)
@@ -734,14 +697,11 @@ impl StatisticsMaterializer {
             }
             let workspace = self.workspace.take().unwrap();
             let rows = workspace.rows;
-            let body = workspace.sizes.body;
             let metadata = workspace.sizes.metadata(rows)?;
             let chunk = workspace.finish(self.output.as_ref().ok_or_else(|| {
                 statistics_contract("statistics output schema has not been prepared")
             })?)?;
             self.cursor += rows;
-            self.rows += rows;
-            self.body_bytes += body;
             self.metadata_bytes += metadata;
             if self.cursor == input.len() * self.definition.mappings.len() {
                 drop(self.input.take());
@@ -1367,8 +1327,56 @@ mod tests {
         max_rows: usize,
         mappings: usize,
     ) -> ExecutionResult<StatisticsMaterializerFactory> {
-        let expr_id = novarocks_local_program::ProgramExprId::new(0);
-        let literals = Arc::from([novarocks_local_program::StaticLiteral::Utf8(blob.into())]);
+        use crate::exec::operators::family_fixture::{self, constant_sources};
+        use novarocks_expression_contract::RootScope;
+        use novarocks_physical_plan::{ConstantPools, FragmentId, NodeId, ValueOrigin};
+        use novarocks_type_contract::{EvaluationDemand, FunctionValueType};
+
+        // This component still owns its original schema/funding fixture. Its
+        // scalar label now has a real program root, obtained from its author.
+        let sources = constant_sources::Sources::new();
+        let mut builder = constant_sources::FragmentBuilder::new(FragmentId::new(74), &sources);
+        let source = NodeId::new(0);
+        let project = NodeId::new(1);
+        let ty = FunctionValueType::new(DataType::Utf8, false);
+        family_fixture::values(&mut builder, source, &[], &[vec![]]);
+        let definition = builder.constant(
+            project,
+            ty.clone(),
+            constant_sources::utf8(blob.into_boxed_str()),
+        );
+        let root = builder
+            .unit(project)
+            .unwrap()
+            .root(definition, EvaluationDemand::Value, RootScope::Port(0))
+            .unwrap();
+        let output = builder
+            .add_value(
+                ty,
+                ValueOrigin::Expr {
+                    node: project,
+                    root,
+                },
+            )
+            .unwrap();
+        builder
+            .add_project(
+                project,
+                source,
+                Box::from([(root, output)]),
+                Box::from([output]),
+            )
+            .unwrap();
+        let program = family_fixture::compile(
+            family_fixture::package(builder, project, ConstantPools::empty(), 1),
+            1,
+        );
+        let novarocks_local_program::ProgramNodeKind::Project { exprs, .. } =
+            program.graph().nodes()[program.graph().root().index()].kind()
+        else {
+            panic!("the label author is Project");
+        };
+        let expr_id = exprs[0];
         let mapping = UnpivotValueMapping {
             input_value_slot_id: SlotId::new(99),
             constants: vec![
@@ -1381,7 +1389,7 @@ mod tests {
             ],
         };
         StatisticsMaterializerFactory::from_test_facts(
-            literals,
+            program,
             SlotId::new(3),
             vec![SlotId::new(1), SlotId::new(2), SlotId::new(4)],
             vec![mapping; mappings],
@@ -1408,8 +1416,6 @@ mod tests {
             input: None,
             workspace: None,
             cursor: 0,
-            rows: 0,
-            body_bytes: 0,
             metadata_bytes: 0,
             finishing: false,
         }
@@ -1743,6 +1749,9 @@ mod tests {
         protected: bool,
         state: &RuntimeState,
     ) -> crate::exec::pipeline::builder::PipelineGraph {
+        let fixture_sources =
+            crate::exec::operators::family_fixture::constant_sources::Sources::new();
+
         use crate::exec::pipeline::builder::{
             build_compiled_pipeline_graph, compile_family_fixture,
             family_package_with_sink_and_names, family_values,
@@ -1752,9 +1761,8 @@ mod tests {
             dependency::DependencyManager,
         };
         use novarocks_physical_plan::{
-            ConstantPoolId, ConstantPools, ConstantReference, ExprKind, FragmentBuilder,
-            FragmentId, FragmentSink, LiteralValue as PhysicalLiteral, NodeId, NodeKind,
-            UnpivotConstant as PhysicalConstant, UnpivotSpec,
+            ConstantPoolId, ConstantPools, ConstantReference, FragmentId, FragmentSink, NodeId,
+            NodeKind, UnpivotConstant as PhysicalConstant, UnpivotSpec,
             UnpivotValueMapping as PhysicalMapping, ValueOrigin,
         };
         use novarocks_type_contract::{
@@ -1840,7 +1848,11 @@ mod tests {
         let mut constants = ConstantPools::empty();
         constants.insert(ConstantPoolId::new(1), list_pool).unwrap();
         constants.insert(ConstantPoolId::new(2), map_pool).unwrap();
-        let mut builder = FragmentBuilder::new(FragmentId::new(73));
+        let mut builder =
+            crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+                FragmentId::new(73),
+                &fixture_sources,
+            );
         let source = NodeId::new(0);
         let target = NodeId::new(1);
         let body_type = FunctionValueType::new(DataType::Binary, false);
@@ -1848,16 +1860,25 @@ mod tests {
             &mut builder,
             source,
             std::slice::from_ref(&body_type),
-            &[vec![PhysicalLiteral::Binary(
-                b"actual decoded aggregate".to_vec().into_boxed_slice(),
-            )]],
+            &[vec![
+                crate::exec::operators::family_fixture::constant_sources::binary(
+                    b"actual decoded aggregate".to_vec().into_boxed_slice(),
+                ),
+            ]],
         );
         let label_type = FunctionValueType::new(DataType::Utf8, false);
+        let label = builder.constant(
+            target,
+            label_type.clone(),
+            crate::exec::operators::family_fixture::constant_sources::utf8("theta".into()),
+        );
         let label = builder
-            .add_expression(
-                target,
-                label_type.clone(),
-                ExprKind::Literal(PhysicalLiteral::Utf8("theta".into())),
+            .unit(target)
+            .unwrap()
+            .root(
+                label,
+                novarocks_type_contract::EvaluationDemand::Value,
+                novarocks_expression_contract::RootScope::Port(0),
             )
             .unwrap();
         let output = [list_binding, label_type, body_type, map_binding]

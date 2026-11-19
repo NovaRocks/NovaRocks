@@ -63,6 +63,8 @@ protoc-bin-vendored.workspace = true
 tonic-build.workspace = true
 
 [dev-dependencies]
+novarocks-expression.workspace = true
+novarocks-expression-contract.workspace = true
 novarocks-parser.workspace = true
 novarocks-test-support.workspace = true
 novarocks-worker-protocol.workspace = true

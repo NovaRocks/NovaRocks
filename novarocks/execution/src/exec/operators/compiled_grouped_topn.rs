@@ -42,8 +42,8 @@ use novarocks_functions::{
     OwnedAggregateState, PreparedAggregateHandle, SelectedAggregateMergeInput, Selection,
 };
 use novarocks_local_program::{
-    LocalProgram, ProgramAggregateCallScope, ProgramCallSite, ProgramExpressionRootSite,
-    ProgramNodeExpressionRole, ProgramNodeId, ProgramNodeKind, ProgramStateTemplate,
+    LocalProgram, ProgramAggregateCallScope, ProgramCallSite, ProgramNodeId, ProgramNodeKind,
+    ProgramRootRef, ProgramStateTemplate,
 };
 
 use super::compiled_expression::{
@@ -54,7 +54,6 @@ use super::compiled_grouped_topn_resources::{
 };
 use super::sort::creation::SortCreation;
 use crate::exec::chunk::{Chunk, ChunkSchemaRef, OutputColumnMetadata};
-use crate::exec::expr::compiled_program::CompiledExpressionInstance;
 use crate::exec::hash_table::allocation::{AggregateAllocator, AggregateVec};
 use crate::exec::pipeline::operator::{InputEncodingPolicy, Operator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
@@ -67,6 +66,7 @@ use crate::exec::pipeline::{
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
 use crate::runtime::task::{ExecutionFailure, ExecutionResult};
+use novarocks_expression::CompiledExpressionInstance;
 
 fn internal(detail: &str) -> ExecutionFailure {
     KernelFailure::Internal(KernelDiagnostic::new(detail)).into()
@@ -101,8 +101,9 @@ struct CallPlan {
 }
 #[derive(Clone)]
 struct Plan {
+    node: ProgramNodeId,
     program: Arc<LocalProgram>,
-    sites: Vec<ProgramExpressionRootSite>,
+    sites: Vec<ProgramRootRef>,
     groups: usize,
     permutation: Vec<usize>,
     rank_types: Vec<novarocks_type_contract::FunctionValueType>,
@@ -122,7 +123,8 @@ impl CompiledGroupedTopNProcessorFactory {
         Transform::hydrating(CompiledGroupedTopNProcessor {
             name: self.name.clone(),
             plan: self.plan.clone(),
-            control: RuntimeKernelControl::new(Arc::clone(&self.error)),
+            control: RuntimeKernelControl::new(Arc::clone(&self.error))
+                .at_expression_node(self.plan.node),
             tracker: None,
             construction: None,
             output: None,
@@ -165,26 +167,11 @@ impl CompiledGroupedTopNProcessorFactory {
             ));
         }
         let output_layout = graph_node.output_layout().clone();
-        let mut sites = Vec::new();
-        for group in 0..group_by.len() {
-            sites.push(ProgramExpressionRootSite::Node {
-                node,
-                role: ProgramNodeExpressionRole::TopNGroup {
-                    group: novarocks_local_program::checked_program_ordinal(group)
-                        .map_err(crate::runtime::task::ExecutionFailure::from_domain)?,
-                },
-            });
-        }
+        let mut sites = group_by.to_vec();
         let mut rank_types = Vec::new();
         let mut fields = Vec::new();
-        for (ordinal, key) in order_by.iter().enumerate() {
-            let site = ProgramExpressionRootSite::Node {
-                node,
-                role: ProgramNodeExpressionRole::TopNOrder {
-                    key: novarocks_local_program::checked_program_ordinal(ordinal)
-                        .map_err(crate::runtime::task::ExecutionFailure::from_domain)?,
-                },
-            };
+        for key in order_by {
+            let site = key.expr;
             let ty = root_value_type(&program, site)?;
             if !comparator.supports_value_type(&ty) {
                 return Err(program_binding_failure(
@@ -234,12 +221,10 @@ impl CompiledGroupedTopNProcessorFactory {
                 contract: Arc::clone(kernel.contract()),
                 root: sites.len(),
             });
-            sites.push(ProgramExpressionRootSite::Node {
-                node,
-                role: ProgramNodeExpressionRole::TopNStateArgument { call, argument: 0 },
-            });
+            sites.push(source.inputs[0]);
         }
         let plan = Plan {
+            node,
             groups: group_by.len(),
             permutation: rank_group_ordinals.clone(),
             rank_types,

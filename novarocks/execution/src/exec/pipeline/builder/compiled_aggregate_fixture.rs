@@ -21,13 +21,12 @@
 //! Each aggregate call site carries what the FE would freeze for it:
 //! - its original request: the logical argument types in every phase, never
 //!   a state type;
-//! - its own relational context, a use and an unguarded domain disjoint from
-//!   every expression occurrence;
+//! - its own actual relation-call context, independent of expression uses;
 //! - its frozen effects, obtained from a fresh preparation by the installed
 //!   owner with the same inputs the BE compiler later uses.
 //!
-//! Expression roots reuse the original Scan fixture's eager use-tree author,
-//! including binary residuals. Relational calls retain their separate domains.
+//! Scalar roots are sealed by the original SDK through each actual node draft.
+//! Fresh relation claims are installed before the complete plan is published.
 
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
@@ -35,12 +34,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use novarocks_connector_contract::PureProviderProgramCatalog;
+use novarocks_expression_contract::{BoundFunction, ExprKind, PhysicalCallRequest, RootScope};
 use novarocks_functions::{
     AggregateKernelPhase, AggregatePreparationOptions, AggregateStateFormatIdentity,
     CallEffectInput, EngineFunctionCatalogBuilder, FunctionArgument, FunctionBindingRequest,
     FunctionBindingSelection, FunctionId, FunctionKind, FunctionOverloadId, FunctionResultType,
     InstalledPureKernel, PureCallPreparation, PureEngineFunctionCatalog,
-    PureImplementationDeclaration, PureImplementationId, PureKernelAbi, ScopedExpressionEffects,
+    PureImplementationDeclaration, PureImplementationId, PureKernelAbi, ScopedRelationalEffects,
 };
 use novarocks_local_compiler::{
     LocalCompileOptions, compile_fragment, validate_fragment_providers,
@@ -48,21 +48,19 @@ use novarocks_local_compiler::{
 use novarocks_local_program::{KernelAbiVersion, LocalProgram};
 use novarocks_physical_plan::{
     AggregateBinding, AggregateCall, AggregateCallId, AggregateGrouping, AggregatePhase,
-    BoundFunction, Distribution, Edge, EdgeDestination, EdgeId, EdgeKind, EdgePartitioning,
-    EdgeSource, ExprKind, ExpressionRootRole, ExpressionRootSite, Fragment, FragmentBuilder,
+    Distribution, Edge, EdgeDestination, EdgeId, EdgeKind, EdgePartitioning, EdgeSource, Fragment,
     FragmentId, FragmentPackage, FragmentPackageAdmission, FragmentSink, FrozenCallError,
     FrozenFragmentCalls, FrozenFragmentPruning, FrozenPhysicalCall, FunctionArgumentType,
-    HashDefinition, HashPartitionScheme, LiteralValue, NodeId, NodeKind, OutputPort,
-    PartitionCountDomain, PartitionCountParameter, PartitionCountParameterId, PartitionSpaceId,
-    PhysicalCallBinding, PhysicalCallDefinition, PhysicalCallRequest, PhysicalCallSite,
-    PhysicalNode, PhysicalPlan, PhysicalProperties, PhysicalRootUses, PipelineDopDomain,
+    HashDefinition, HashPartitionScheme, NodeId, NodeKind, OutputPort, PartitionCountDomain,
+    PartitionCountParameter, PartitionCountParameterId, PartitionSpaceId, PhysicalCallBinding,
+    PhysicalCallSite, PhysicalNode, PhysicalPlan, PhysicalProperties, PipelineDopDomain,
     PlanLimits, PropertyProofProjectionLimits, RowMultiplicity, StaticFunctionArgument, ValueId,
     ValueOrigin, extract_fragment_packages,
 };
 use novarocks_type_contract::{
     CallProofScope, CompileCheckpoints, CompilePhase, DecimalOverflowPolicy, EvaluationDemand,
-    EvaluationDomainId, ExpressionControlFlow, ExpressionEffectContext, ExpressionEffects,
-    ExpressionEvaluationDomain, ExpressionUseId, FunctionValueType, SemanticParameters,
+    ExpressionEffects, FunctionValueType, RelationCallId, RelationEffectContext,
+    SemanticParameters,
 };
 use novarocks_types::UniqueId;
 
@@ -87,8 +85,6 @@ use crate::runtime::task::sink::materialize_compiled_sink;
 
 /// The frozen decimal policy every fixture call authors explicitly.
 pub(crate) const POLICY: DecimalOverflowPolicy = DecimalOverflowPolicy::ReportError;
-/// Relational use IDs start far above every expression use of a fixture.
-const RELATIONAL_USE_BASE: u32 = 1_000_000;
 
 /// Direct operator fixtures install the same original tracker/control host as
 /// pipeline preparation; the representation profile has one production owner.
@@ -208,7 +204,7 @@ impl Bound {
             self.selected.argument_types.clone(),
             self.result_type(),
         );
-        function.legacy_metadata = Some(novarocks_physical_plan::LegacyBindingMetadata {
+        function.legacy_metadata = Some(novarocks_expression_contract::LegacyBindingMetadata {
             volatility: self.semantics.volatility,
             argument_evaluation: self.semantics.argument_evaluation,
             failure_behavior: self.semantics.failure_behavior,
@@ -298,7 +294,7 @@ fn aggregate_distribution(input: &Distribution, output: &[ValueId]) -> Distribut
 /// Add an Aggregate over `input`: the group values pass through as outputs,
 /// followed by one output per call.
 pub(crate) fn add_aggregate(
-    builder: &mut FragmentBuilder,
+    builder: &mut crate::exec::operators::family_fixture::constant_sources::FragmentBuilder,
     input: NodeId,
     groups: &[ValueId],
     calls: &[CallSpec<'_>],
@@ -310,10 +306,17 @@ pub(crate) fn add_aggregate(
         .iter()
         .map(|value| {
             let ty = builder.value(*value).unwrap().ty.clone();
-            let expression = builder
-                .add_expression(node, ty, ExprKind::Value(*value))
+            let definition = builder
+                .unit(node)
+                .unwrap()
+                .add(None, ty, ExprKind::Value(*value))
                 .unwrap();
-            (expression, *value)
+            let root = builder
+                .unit(node)
+                .unwrap()
+                .root(definition, EvaluationDemand::Value, RootScope::Port(0))
+                .unwrap();
+            (root, *value)
         })
         .collect::<Vec<_>>();
     let mut columns = groups.to_vec();
@@ -324,8 +327,15 @@ pub(crate) fn add_aggregate(
             .iter()
             .map(|value| {
                 let ty = builder.value(*value).unwrap().ty.clone();
+                let definition = builder
+                    .unit(node)
+                    .unwrap()
+                    .add(None, ty, ExprKind::Value(*value))
+                    .unwrap();
                 builder
-                    .add_expression(node, ty, ExprKind::Value(*value))
+                    .unit(node)
+                    .unwrap()
+                    .root(definition, EvaluationDemand::Value, RootScope::Port(0))
                     .unwrap()
             })
             .collect::<Vec<_>>();
@@ -353,6 +363,7 @@ pub(crate) fn add_aggregate(
     let distribution = aggregate_distribution(&input_properties.distribution, &columns);
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: node,
             inputs: Box::from([input]),
             required_inputs: Box::from([input_properties]),
@@ -378,10 +389,10 @@ pub(crate) fn add_aggregate(
 /// A Values leaf whose columns have the given complete types and whose rows
 /// are literal cells of exactly those types.
 pub(crate) fn values(
-    builder: &mut FragmentBuilder,
+    builder: &mut crate::exec::operators::family_fixture::constant_sources::FragmentBuilder,
     node: NodeId,
     types: &[FunctionValueType],
-    rows: &[Vec<LiteralValue>],
+    rows: &[Vec<novarocks_functions::ConstantValue>],
 ) -> Vec<ValueId> {
     super::family_fixture::values(builder, node, types, rows)
 }
@@ -415,7 +426,7 @@ pub(crate) fn hash(keys: &[ValueId]) -> Distribution {
 
 /// Imports `sources` of `edge` as an ExchangeSource at `node`.
 pub(crate) fn receive(
-    builder: &mut FragmentBuilder,
+    builder: &mut crate::exec::operators::family_fixture::constant_sources::FragmentBuilder,
     node: NodeId,
     edge: EdgeId,
     sources: &[(ValueId, FunctionValueType)],
@@ -486,6 +497,7 @@ pub(crate) fn edge(
             source_multiplicity: RowMultiplicity::SingleCopy,
             destination,
             destination_multiplicity: RowMultiplicity::SingleCopy,
+            routing_only: Box::default(),
         },
     }
 }
@@ -493,19 +505,25 @@ pub(crate) fn edge(
 /// Finish a fragment and attach one original request per relational call:
 /// its logical argument types, in every phase.
 pub(crate) fn finish(
-    builder: FragmentBuilder,
+    mut builder: crate::exec::operators::family_fixture::constant_sources::FragmentBuilder,
     root: NodeId,
     sink: FragmentSink,
     max_dop: u32,
-) -> Fragment {
+    catalog: &PureEngineFunctionCatalog,
+    parameters: &SemanticParameters,
+) -> crate::exec::operators::family_fixture::constant_sources::Fragment {
+    super::family_fixture::seal_no_call_units(&mut builder);
     let fragment = builder
-        .finish_definition(
+        .finish_structure(
             root,
             sink,
             dop(max_dop),
+            PlanLimits::FROZEN,
+            &FixtureControl,
             novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap();
+    let (fragment, constants) = fragment.into_parts();
     let mut entries = fragment
         .call_requests()
         .entries()
@@ -533,7 +551,7 @@ pub(crate) fn finish(
                 })
                 .collect();
             entries.push((
-                PhysicalCallDefinition::Relational(site),
+                site,
                 PhysicalCallRequest {
                     arguments,
                     logical_argument_count: binding.logical_argument_count as usize,
@@ -546,36 +564,24 @@ pub(crate) fn finish(
     )
     .unwrap();
     work.finish().unwrap();
-    fragment
+    let fragment = fragment
         .with_call_requests_observed(entries, &FixtureControl)
-        .unwrap()
+        .unwrap();
+    let frozen = freeze(&fragment, catalog, parameters);
+    let fragment = fragment
+        .with_frozen_calls_observed(frozen, &FixtureControl)
+        .unwrap();
+    crate::exec::operators::family_fixture::constant_sources::Fragment::from_parts(
+        fragment, constants,
+    )
 }
 
-/// Root uses and frozen calls of one fragment. Expression roots share domain
-/// 0; aggregate call `k` owns domain `k + 1` and a relational use of its own.
+/// Prepare the actual relation table after the same fragment's scalar units are sealed.
 fn freeze(
     fragment: &Fragment,
     catalog: &PureEngineFunctionCatalog,
     parameters: &SemanticParameters,
-) -> (PhysicalRootUses, FrozenFragmentCalls) {
-    let expression_roots = crate::runtime::task::scan::compiled_fixture::root_uses(fragment);
-    let expression_domain = EvaluationDomainId::new(0);
-    let uses = expression_roots
-        .flow()
-        .uses()
-        .values()
-        .cloned()
-        .collect::<Vec<_>>();
-    let bindings = expression_roots
-        .bindings()
-        .iter()
-        .map(|(site, id)| (*site, *id))
-        .collect();
-    let mut domains = vec![ExpressionEvaluationDomain {
-        id: expression_domain,
-        parent: None,
-        guard: None,
-    }];
+) -> FrozenFragmentCalls {
     let mut sites = Vec::new();
     for node in fragment.nodes().values() {
         let (calls, topn) = match &node.kind {
@@ -588,16 +594,7 @@ fn freeze(
         };
         for ordinal in 0..calls.len() {
             let k = u32::try_from(sites.len()).unwrap();
-            let context = ExpressionEffectContext {
-                use_id: ExpressionUseId::new(RELATIONAL_USE_BASE + k),
-                domain: EvaluationDomainId::new(k + 1),
-                demand: EvaluationDemand::Value,
-            };
-            domains.push(ExpressionEvaluationDomain {
-                id: context.domain,
-                parent: None,
-                guard: None,
-            });
+            let context = RelationEffectContext::call(RelationCallId::new(k));
             let call = u32::try_from(ordinal).unwrap();
             let site = if topn {
                 PhysicalCallSite::TopNState {
@@ -613,15 +610,6 @@ fn freeze(
             sites.push((node.id, call, context, site));
         }
     }
-    let flow = ExpressionControlFlow::try_new(
-        domains,
-        uses,
-        fragment.expressions(),
-        CompilePhase::Validate,
-        &FixtureControl,
-    )
-    .unwrap();
-    let root_uses = PhysicalRootUses::try_new(fragment, flow, bindings, &FixtureControl).unwrap();
     let mut frozen = Vec::new();
     for (node, ordinal, context, call_site) in sites {
         let calls = match &fragment.nodes()[&node].kind {
@@ -656,23 +644,16 @@ fn freeze(
                 FunctionArgumentType::Lambda { .. } => panic!("aggregate value channel"),
             })
             .collect::<Vec<_>>();
-        let argument_uses = (0..call.arguments.len())
-            .map(|argument| {
-                let site = ExpressionRootSite {
-                    node,
-                    role: if matches!(call_site, PhysicalCallSite::TopNState { .. }) {
-                        ExpressionRootRole::TopNStateArgument {
-                            call: ordinal,
-                            argument: u32::try_from(argument).unwrap(),
-                        }
-                    } else {
-                        ExpressionRootRole::AggregateArgument {
-                            call: ordinal,
-                            argument: u32::try_from(argument).unwrap(),
-                        }
-                    },
-                };
-                Some(root_uses.bindings()[&site])
+        let unit = fragment.unit(node);
+        let argument_uses = call
+            .arguments
+            .iter()
+            .map(|root| {
+                Some(
+                    unit.expect("an actual aggregate input belongs to its node unit")
+                        .root_use(*root)
+                        .unwrap(),
+                )
             })
             .collect::<Vec<_>>();
         let phase = kernel_phase(binding.phase);
@@ -693,15 +674,16 @@ fn freeze(
         } else {
             let state_use = argument_uses[0].unwrap();
             state_type = fragment
-                .expressions()
-                .get(call.arguments[0])
+                .root_expression(node, call.arguments[0])
                 .unwrap()
                 .ty
                 .clone();
             (
                 novarocks_functions::CallArgumentUses::AggregateMerge {
                     phase,
-                    state_context: root_uses.flow().uses()[&state_use].context,
+                    state_context: unit.unwrap().control_flow().uses()[&state_use]
+                        .context
+                        .into(),
                     state_input_type: &state_type,
                 },
                 AggregatePreparationOptions {
@@ -716,7 +698,7 @@ fn freeze(
         let token = catalog
             .prepare_fresh(
                 CallEffectInput {
-                    context,
+                    context: context.into(),
                     argument_uses: uses,
                     function_id: &binding.function.function_id,
                     kind: FunctionKind::Aggregate,
@@ -729,11 +711,11 @@ fn freeze(
                     environment: &[],
                     parameters,
                     decimal_overflow_policy: POLICY,
-                    proof_scope: CallProofScope::Domain(context.domain),
+                    proof_scope: CallProofScope::Relation(context.identity),
                 },
                 Arc::clone(&selection),
                 PureCallPreparation::Aggregate {
-                    arguments: ScopedExpressionEffects::primitive(
+                    arguments: ScopedRelationalEffects::primitive(
                         context,
                         ExpressionEffects::PURE_VALUE,
                     ),
@@ -744,18 +726,14 @@ fn freeze(
             .unwrap_or_else(|error| panic!("fixture aggregate call prepares: {error}"));
         frozen.push(FrozenPhysicalCall {
             materialized_writer_input: None,
-            regexp_count_pattern_source: None,
-            to_base64_byte_source: None,
-            temporal_source: None,
             site: call_site,
             context,
             effects: token.call_contract().effects().clone(),
             decimal_overflow_policy: POLICY,
         });
     }
-    let calls = FrozenFragmentCalls::try_new(fragment, &root_uses, frozen, &FixtureControl)
-        .unwrap_or_else(|error| panic!("frozen aggregate calls validate: {error}"));
-    (root_uses, calls)
+    FrozenFragmentCalls::try_new(fragment, frozen, &FixtureControl)
+        .unwrap_or_else(|error| panic!("frozen aggregate calls validate: {error}"))
 }
 
 // Explicit small-fixture admission; these are test inputs, not defaults.
@@ -772,29 +750,18 @@ fn admission() -> FragmentPackageAdmission {
 }
 
 /// Every fragment of `plan` as a checked package with its frozen calls.
-pub(crate) fn packages(
-    plan: &PhysicalPlan,
-    catalog: &PureEngineFunctionCatalog,
-) -> BTreeMap<FragmentId, FragmentPackage> {
-    packages_with_reads(plan, catalog, &BTreeMap::new())
+pub(crate) fn packages(plan: &PhysicalPlan) -> BTreeMap<FragmentId, FragmentPackage> {
+    packages_with_reads(plan, &BTreeMap::new())
 }
 
 /// The same aggregate root/call author with explicitly frozen provider reads.
 pub(crate) fn packages_with_reads(
     plan: &PhysicalPlan,
-    catalog: &PureEngineFunctionCatalog,
     reads: &BTreeMap<
         novarocks_physical_plan::ProviderReadOccurrenceId,
         novarocks_connector_contract::FrozenConnectorRead,
     >,
 ) -> BTreeMap<FragmentId, FragmentPackage> {
-    let mut uses = BTreeMap::new();
-    let mut calls = BTreeMap::new();
-    for (id, fragment) in plan.fragments() {
-        let (root_uses, frozen) = freeze(fragment, catalog, plan.parameters());
-        uses.insert(*id, root_uses);
-        calls.insert(*id, frozen);
-    }
     let pruning = plan
         .fragments()
         .keys()
@@ -814,8 +781,6 @@ pub(crate) fn packages_with_reads(
         plan,
         reads,
         &BTreeMap::new(),
-        &uses,
-        &calls,
         &pruning,
         &admissions,
         &FixtureControl,

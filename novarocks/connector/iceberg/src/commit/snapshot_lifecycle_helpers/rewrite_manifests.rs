@@ -33,11 +33,15 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+#[cfg(test)]
 use std::sync::Mutex;
 
-use super::super::manifest_encoding::{ManifestWriteSource, SourcedManifestEntry};
-use super::super::model::{ArtifactClass, ArtifactWriter, FrozenEntry};
-use super::super::staging::{ManifestEntryWrite, write_sourced_manifest_with_class};
+use super::super::manifest_encoding::{
+    ManifestWriteSource, SourcedManifestEntry, descriptor_owned_bytes, encoding_basis,
+};
+use super::super::model::ManifestRewriteReuse;
+use super::super::model::{ArtifactWriter, FrozenEntry};
+use super::super::staging::{ManifestEntryWrite, write_sourced_manifest};
 use crate::iceberg::spec::{ManifestContentType, ManifestFile, Operation, Snapshot, Summary};
 use crate::iceberg::{TableRequirement, TableUpdate};
 #[cfg(test)]
@@ -193,14 +197,17 @@ async fn merge_manifest_group(
             }
         }
     }
-    write_sourced_manifest_with_class(
+    write_sourced_manifest(
         artifacts,
-        ArtifactClass::Operation,
         metadata,
         snapshot_id,
         spec,
         content,
         entries,
+        &group
+            .iter()
+            .map(|manifest| manifest.manifest_path.clone())
+            .collect::<Vec<_>>(),
     )
     .await
 }
@@ -227,51 +234,18 @@ fn carried_identity(
     Ok((snapshot, sequence, entry.file_sequence_number))
 }
 
-/// One operation owns reusable merged manifests; each staging attempt owns
-/// only its manifest-list. Reuse requires exact source descriptors in the
-/// latest target snapshot, including sequence/row-lineage facts.
-#[derive(Clone)]
-struct ReusableRewrite {
-    sources: Vec<ManifestFile>,
-    outputs: Vec<ManifestFile>,
-    encoding_basis: Vec<u8>,
-}
-
-fn encoding_basis(
-    metadata: &crate::iceberg::spec::TableMetadata,
-) -> crate::iceberg::Result<Vec<u8>> {
-    let mut schemas = metadata.schemas_iter().collect::<Vec<_>>();
-    schemas.sort_by_key(|schema| schema.schema_id());
-    let mut specs = metadata.partition_specs_iter().collect::<Vec<_>>();
-    specs.sort_by_key(|spec| spec.spec_id());
-    serde_json::to_vec(&(
-        metadata.format_version(),
-        metadata.current_schema_id(),
-        schemas,
-        specs,
-    ))
-    .map_err(|error| {
-        rewrite_error("Cannot encode manifest rewrite dependencies").with_source(error)
-    })
-}
-
 pub(crate) struct RewriteManifestsPreparer {
-    reusable: Mutex<Option<ReusableRewrite>>,
     request: Option<novarocks_spi::connector::ConnectorRequestContext>,
 }
 impl RewriteManifestsPreparer {
     pub(crate) fn for_request(request: novarocks_spi::connector::ConnectorRequestContext) -> Self {
         Self {
-            reusable: Mutex::new(None),
             request: Some(request),
         }
     }
     #[cfg(test)]
     pub(crate) fn new() -> Self {
-        Self {
-            reusable: Mutex::new(None),
-            request: None,
-        }
+        Self { request: None }
     }
 }
 
@@ -306,27 +280,9 @@ impl crate::commit::staging::Preparer for RewriteManifestsPreparer {
         if let Some(request) = &self.request {
             // These are actual borrowed descriptor facts, not compressed-file
             // bytes or an invented bound for the SDK's decoded DataFile graph.
-            let old = {
-                let cache = self
-                    .reusable
-                    .lock()
-                    .map_err(|_| rewrite_error("Manifest reuse state is poisoned"))?;
-                cache
-                    .as_ref()
-                    .map(|c| {
-                        descriptor_owned_bytes(&c.sources).and_then(|a| {
-                            descriptor_owned_bytes(&c.outputs).and_then(|b| {
-                                a.checked_add(b)
-                                    .and_then(|value| {
-                                        value.checked_add(c.encoding_basis.capacity() as u64)
-                                    })
-                                    .ok_or_else(|| rewrite_error("manifest backing overflow"))
-                            })
-                        })
-                    })
-                    .transpose()?
-                    .unwrap_or(0)
-            };
+            let old = view
+                .artifacts()
+                .rewrite_reuse_backing_bytes(view.stage_key())?;
             let required=descriptor_owned_bytes(latest)?.checked_add(old).and_then(|value| value.checked_add(encoding_basis.capacity() as u64)).and_then(|v|v.checked_mul(8)).and_then(|v|v.checked_add(2*(novarocks_spi::connector::MAX_CONNECTOR_METADATA_MAINTENANCE_PROVIDER_PAYLOAD_BYTES+novarocks_spi::connector::MAX_CONNECTOR_METADATA_MAINTENANCE_MARKER_BYTES) as u64)).and_then(std::num::NonZeroU64::new).ok_or_else(||rewrite_error("manifest backing overflow"))?;
             request
                 .reserve_owned_metadata(required)
@@ -335,24 +291,25 @@ impl crate::commit::staging::Preparer for RewriteManifestsPreparer {
                     rewrite_error("original manifest backing admission refused").with_source(e)
                 })?;
         }
-        let cached = self
-            .reusable
-            .lock()
-            .map_err(|_| rewrite_error("Manifest reuse state is poisoned"))?
-            .clone();
-        let reusable = match cached.filter(|cache| {
-            cache.encoding_basis == encoding_basis
-                && rewrite_sources_are_current(&cache.sources, latest)
-        }) {
+        let cached =
+            view.artifacts()
+                .find_reusable_rewrite(view.stage_key(), &encoding_basis, latest)?;
+        let groups = if cached.is_none() {
+            let groups = group_manifests_by_spec_and_content(latest);
+            if groups.values().all(|group| group.len() <= 1) {
+                return Ok(no_op());
+            }
+            Some(groups)
+        } else {
+            None
+        };
+        let snapshot_id = view.stage_snapshot_id()?;
+        let reusable = match cached {
             Some(cache) => cache,
             None => {
                 // This is a policy operation: invalidated selections are
                 // replanned, rather than treated as an explicit-input promise.
-                let groups = group_manifests_by_spec_and_content(latest);
-                if groups.values().all(|group| group.len() <= 1) {
-                    return Ok(no_op());
-                }
-                let snapshot_id = crate::commit::staging::new_snapshot_id(metadata);
+                let groups = groups.expect("invalidated rewrite selected nontrivial groups");
                 let mut sources = Vec::new();
                 let mut outputs = Vec::new();
                 for group in groups.values().filter(|group| group.len() > 1) {
@@ -368,20 +325,16 @@ impl crate::commit::staging::Preparer for RewriteManifestsPreparer {
                     sources.extend(group.iter().cloned());
                     outputs.push(output);
                 }
-                let cache = ReusableRewrite {
+                let cache = ManifestRewriteReuse {
                     sources,
                     outputs,
                     encoding_basis,
                 };
-                *self
-                    .reusable
-                    .lock()
-                    .map_err(|_| rewrite_error("Manifest reuse state is poisoned"))? =
-                    Some(cache.clone());
+                view.artifacts()
+                    .remember_reusable_rewrite(view.stage_key(), cache.clone())?;
                 cache
             }
         };
-        let snapshot_id = crate::commit::staging::new_snapshot_id(metadata);
         let mut manifests = latest
             .iter()
             .filter(|manifest| {
@@ -392,13 +345,7 @@ impl crate::commit::staging::Preparer for RewriteManifestsPreparer {
             })
             .cloned()
             .collect::<Vec<_>>();
-        for mut manifest in reusable.outputs.clone() {
-            // List-level introduction/sequence is attempt-local; immutable
-            // merged entries retain their exact original file/snapshot facts.
-            manifest.added_snapshot_id = snapshot_id;
-            manifest.sequence_number = -1;
-            manifests.push(manifest);
-        }
+        manifests.extend(reusable.outputs.iter().cloned());
         let properties = finalize_snapshot_summary(
             HashMap::from([
                 (
@@ -440,13 +387,6 @@ impl crate::commit::staging::Preparer for RewriteManifestsPreparer {
     }
 }
 
-/// Existence is insufficient: only exact membership of the latest list
-/// preserves a selected manifest's inherited sequence and row-ID meaning.
-fn rewrite_sources_are_current(sources: &[ManifestFile], latest: &[ManifestFile]) -> bool {
-    sources
-        .iter()
-        .all(|source| latest.iter().any(|current| current == source))
-}
 fn rewrite_error(message: &str) -> crate::iceberg::Error {
     crate::iceberg::Error::new(crate::iceberg::ErrorKind::DataInvalid, message)
 }
@@ -481,6 +421,8 @@ mod keyed_record_tests {
         token: crate::commit::model::OperationToken,
         attempt: Mutex<crate::commit::model::AttemptToken>,
         ledger: Mutex<crate::commit::model::ArtifactLedger>,
+        stage_ids: Mutex<BTreeMap<usize, i64>>,
+        reuse: Mutex<crate::commit::model::ManifestReuseIndex>,
     }
     impl RewriteArtifacts {
         fn new() -> Self {
@@ -492,16 +434,53 @@ mod keyed_record_tests {
                 token,
                 attempt: Mutex::new(crate::commit::model::AttemptToken::new(token, 0)),
                 ledger: Mutex::new(crate::commit::model::ArtifactLedger::new(token)),
+                stage_ids: Mutex::new(BTreeMap::new()),
+                reuse: Mutex::new(crate::commit::model::ManifestReuseIndex::default()),
             }
         }
     }
     impl crate::commit::model::ArtifactWriter for RewriteArtifacts {
+        fn rewrite_reuse_backing_bytes(&self, stage: usize) -> crate::iceberg::Result<u64> {
+            self.reuse.lock().unwrap().rewrite_backing_bytes(stage)
+        }
+        fn find_reusable_rewrite(
+            &self,
+            stage: usize,
+            encoding: &[u8],
+            latest: &[ManifestFile],
+        ) -> crate::iceberg::Result<Option<ManifestRewriteReuse>> {
+            self.reuse.lock().unwrap().find_rewrite(
+                &self.ledger.lock().unwrap(),
+                stage,
+                encoding,
+                latest,
+            )
+        }
+        fn remember_reusable_rewrite(
+            &self,
+            stage: usize,
+            result: ManifestRewriteReuse,
+        ) -> crate::iceberg::Result<()> {
+            self.reuse
+                .lock()
+                .unwrap()
+                .remember_rewrite(&self.ledger.lock().unwrap(), stage, result)
+        }
         fn file_io(&self) -> &FileIO {
             &self.io
         }
+        fn stage_snapshot_id(
+            &self,
+            stage: usize,
+            metadata: &crate::iceberg::spec::TableMetadata,
+        ) -> crate::iceberg::Result<i64> {
+            let mut ids = self.stage_ids.lock().unwrap();
+            Ok(*ids
+                .entry(stage)
+                .or_insert_with(|| crate::commit::staging::new_snapshot_id(metadata)))
+        }
         fn allocate(
             &self,
-            class: crate::commit::model::ArtifactClass,
             kind: crate::commit::model::ArtifactKind,
         ) -> crate::iceberg::Result<crate::commit::model::ObjectIdentity> {
             use crate::commit::model::*;
@@ -511,12 +490,11 @@ mod keyed_record_tests {
                 ledger.records().count(),
                 kind.extension()
             ))?;
-            ledger.register(ArtifactRecord {
-                object: object.clone(),
-                class,
-                attempt: (class == ArtifactClass::Attempt).then_some(self.attempt_token()),
-                write_state: ArtifactWriteState::Allocated,
-            })?;
+            ledger.register(ArtifactRecord::produced(
+                object.clone(),
+                self.attempt_token(),
+                kind,
+            ))?;
             Ok(object)
         }
         fn attempt_token(&self) -> crate::commit::model::AttemptToken {
@@ -527,12 +505,51 @@ mod keyed_record_tests {
         }
         fn snapshot_artifacts(
             &self,
-            references: &[crate::commit::model::ObjectIdentity],
+            lists: &[crate::commit::model::ObjectIdentity],
+            statistics: &[crate::commit::model::ObjectIdentity],
         ) -> crate::iceberg::Result<crate::commit::model::AttemptArtifacts> {
-            self.ledger
-                .lock()
-                .unwrap()
-                .snapshot_for_attempt(self.attempt_token(), references.iter().cloned())
+            self.ledger.lock().unwrap().snapshot_for_request(
+                self.attempt_token(),
+                lists,
+                statistics,
+            )
+        }
+
+        fn record_manifest(
+            &self,
+            object: &crate::commit::model::ObjectIdentity,
+            added_paths: &[String],
+            existing_paths: &[String],
+            replaces: &[String],
+        ) -> crate::iceberg::Result<()> {
+            let mut ledger = self.ledger.lock().unwrap();
+            // This callback follows the successful FileIO write in the fixture.
+            let written = ledger.records().any(|record| {
+                record.object == *object
+                    && record.write_state == crate::commit::model::ArtifactWriteState::Written
+            });
+            if !written {
+                ledger.confirm_written_for_test(object)?;
+            }
+            ledger.record_manifest(object, added_paths, existing_paths, replaces)
+        }
+
+        fn record_manifest_list(
+            &self,
+            object: &crate::commit::model::ObjectIdentity,
+            snapshot_id: i64,
+            paths: &[String],
+        ) -> crate::iceberg::Result<()> {
+            let mut ledger = self.ledger.lock().unwrap();
+            // This callback follows the successful FileIO write in the fixture.
+            let written = ledger.records().any(|record| {
+                record.object == *object
+                    && record.write_state == crate::commit::model::ArtifactWriteState::Written
+            });
+            if !written {
+                ledger.confirm_written_for_test(object)?;
+            }
+            ledger.record_manifest_list(object, snapshot_id, paths)
         }
     }
 
@@ -739,8 +756,20 @@ mod keyed_record_tests {
             paths.push(list.entries()[0].manifest_path.clone());
             lists.push(snapshot.manifest_list().to_string());
             let merged = ObjectIdentity::new(paths.last().unwrap().clone()).unwrap();
-            let request = engine.freeze(std::slice::from_ref(&merged)).unwrap();
-            assert_eq!(request.artifacts().operation_references(), &[merged]);
+            let request = engine.freeze().unwrap();
+            let expected = std::collections::BTreeSet::from([
+                merged,
+                ObjectIdentity::new(snapshot.manifest_list().to_owned()).unwrap(),
+            ]);
+            assert_eq!(
+                request
+                    .artifacts()
+                    .references()
+                    .iter()
+                    .cloned()
+                    .collect::<std::collections::BTreeSet<_>>(),
+                expected
+            );
             assert!(
                 request
                     .requirements()
@@ -769,7 +798,7 @@ mod keyed_record_tests {
         assert_eq!(
             ledger
                 .records()
-                .filter(|entry| entry.class == ArtifactClass::Operation)
+                .filter(|entry| entry.object.path() == paths[0])
                 .count(),
             1
         );
@@ -822,10 +851,7 @@ mod row_id_rewrite_tests {
         let artifacts = crate::commit::staging::TestWriter::new();
         let io = artifacts.file_io();
         let input = artifacts
-            .allocate(
-                ArtifactClass::Operation,
-                crate::commit::model::ArtifactKind::Manifest,
-            )
+            .allocate(crate::commit::model::ArtifactKind::Manifest)
             .unwrap();
         let schema = Schema::builder()
             .with_fields(vec![Arc::new(NestedField::required(
@@ -908,38 +934,4 @@ mod row_id_rewrite_tests {
         assert_eq!(actual["memory://rewrite/explicit.parquet"], Some(700));
         assert_eq!(actual["memory://rewrite/inherited.parquet"], Some(100));
     }
-}
-
-/// Exact public descriptor payloads used by first-party group/cache/list copies.
-/// The SDK DataFile clone's two owned-only getters are a separate qualification
-/// gap; this quote deliberately does not pretend to observe them without allocation.
-fn descriptor_owned_bytes(files: &[ManifestFile]) -> crate::iceberg::Result<u64> {
-    let mut bytes = files
-        .len()
-        .checked_mul(2 * std::mem::size_of::<ManifestFile>())
-        .ok_or_else(|| rewrite_error("manifest descriptor overflow"))?;
-    for file in files {
-        bytes = bytes
-            .checked_add(file.manifest_path.len())
-            .and_then(|v| v.checked_add(file.key_metadata.as_ref().map_or(0, Vec::len)))
-            .ok_or_else(|| rewrite_error("manifest descriptor overflow"))?;
-        if let Some(partitions) = &file.partitions {
-            bytes = bytes
-                .checked_add(
-                    partitions
-                        .len()
-                        .checked_mul(2 * std::mem::size_of::<crate::iceberg::spec::FieldSummary>())
-                        .ok_or_else(|| rewrite_error("manifest descriptor overflow"))?,
-                )
-                .ok_or_else(|| rewrite_error("manifest descriptor overflow"))?;
-            for p in partitions {
-                for bound in [&p.lower_bound, &p.upper_bound].into_iter().flatten() {
-                    bytes = bytes
-                        .checked_add(bound.len())
-                        .ok_or_else(|| rewrite_error("manifest descriptor overflow"))?;
-                }
-            }
-        }
-    }
-    u64::try_from(bytes).map_err(|_| rewrite_error("manifest descriptor overflow"))
 }

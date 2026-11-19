@@ -131,6 +131,7 @@ pub(crate) struct AttemptMembershipSource {
     open: bool,
     closing: bool,
     closed: bool,
+    original_errors: Option<std::mem::ManuallyDrop<MembershipErrors>>,
 }
 
 impl AttemptMembershipSource {
@@ -143,7 +144,30 @@ impl AttemptMembershipSource {
             open: false,
             closing: false,
             closed: false,
+            original_errors: None,
         }
+    }
+
+    /// The same observer error owner follows its installed membership Source
+    /// until the real standing input closes. Drop never disposes its raw errors.
+    pub(crate) fn with_original_errors(mut self, original: MembershipErrors) -> Self {
+        assert!(
+            self.target
+                .errors
+                .upgrade()
+                .is_some_and(|value| Arc::ptr_eq(&value, &original._original))
+        );
+        self.original_errors = Some(std::mem::ManuallyDrop::new(original));
+        self
+    }
+    pub(crate) fn has_original_errors(&self) -> bool {
+        self.original_errors.is_some()
+    }
+    pub(crate) fn take_original_errors_after_exit(&mut self) -> Option<MembershipErrors> {
+        assert!(self.closed);
+        self.original_errors
+            .take()
+            .map(std::mem::ManuallyDrop::into_inner)
     }
 
     pub(crate) fn matches(&self, registration: &ActorRegistration) -> bool {
@@ -155,7 +179,7 @@ impl AttemptMembershipSource {
     }
 
     pub(crate) fn index_committed(&mut self, inputs: &[InputId]) -> Result<bool, ActorTurnError> {
-        if inputs.is_empty() {
+        if self.closed || inputs.is_empty() {
             return Ok(false);
         }
         let Some(input) = self
@@ -171,6 +195,9 @@ impl AttemptMembershipSource {
     }
 
     pub(crate) fn needs_progress(&self, failed: bool, closing: bool) -> bool {
+        if self.closed {
+            return self.has_original_errors();
+        }
         self.indexed.is_some()
             || (self.startup_complete && !self.open && !self.closing)
             || self.closing
@@ -179,11 +206,19 @@ impl AttemptMembershipSource {
     }
 
     pub(crate) fn visit_units(&self) -> usize {
+        if self.closed {
+            // No roster or Kernel access remains. The host separately charges
+            // the one-unit transfer of the same retained error owner.
+            return 0;
+        }
         // Refilling, closing or disposing a view can visit its entire roster.
         self.target.members.len().saturating_add(1)
     }
 
     pub(crate) fn progress(&mut self, failed: bool, closing: bool) -> Result<bool, ActorTurnError> {
+        if self.closed {
+            return Ok(false);
+        }
         if !failed && !closing && self.startup_complete && !self.open && !self.closing {
             match self.registry.insert(self.target.clone()) {
                 Ok(()) => {
@@ -542,9 +577,9 @@ mod tests {
         ledger: RuntimeLedger,
         scope: novarocks_control_runtime::transaction::ScopeHandle,
         runtime: ActorRuntime<FrontendActor>,
-        registry: MembershipRegistry,
+        registry: Arc<MembershipRegistry>,
         target: Arc<MembershipTarget>,
-        _errors: MembershipErrors,
+        _errors: Option<MembershipErrors>,
         seen: Arc<Mutex<Vec<MembershipView>>>,
         port: ObservationPort,
         participation: ParticipationRef,
@@ -591,7 +626,7 @@ mod tests {
             }]),
             CoalescingInput::new(standing, membership_input),
         );
-        let registry = MembershipRegistry::new();
+        let registry = Arc::new(MembershipRegistry::new());
         assert!(registry.insert(target.clone()).is_ok());
         Fixture {
             ledger,
@@ -599,7 +634,7 @@ mod tests {
             runtime,
             registry,
             target,
-            _errors: errors,
+            _errors: Some(errors),
             seen,
             port: ObservationPort {
                 expected: backend,
@@ -677,5 +712,265 @@ mod tests {
         assert!(f.target.input.in_flight().unwrap().is_none());
         assert_eq!(f.seen.lock().unwrap().len(), 1);
         finish(f);
+    }
+
+    mod closed {
+        //! The same Source may outlive its retired role while the host owes one paid
+        //! error-owner handoff. These are component proofs, not a simulated HostExit.
+        use super::*;
+        use crate::task_execution::host::custody::{CustodyRefusal, HostDisposal};
+        use novarocks_control_runtime::{
+            completion::ReportSlot, obligation::WorkRetirementObserver, reported_work::ReportedWork,
+        };
+        use novarocks_control_runtime_core::{
+            capacity::ReservationResources,
+            completion::ConsumerKind,
+            identity::ConsumerId,
+            owned_storage::OwnedSlotNeed,
+            scope::{WorkAdmission, WorkKind},
+        };
+        use std::{
+            ops::{Deref, DerefMut},
+            sync::OnceLock,
+            time::Duration,
+        };
+
+        struct OriginalCase {
+            fixture: Fixture,
+            source: Option<AttemptMembershipSource>,
+            work: Option<ReportedWork>,
+            header: Option<WorkRetirementObserver>,
+            disposal: Option<HostDisposal<MembershipErrors>>,
+            transferred_errors: Option<MembershipErrors>,
+            refusal: Option<CustodyRefusal>,
+        }
+        struct RetainedCase(Option<Box<OriginalCase>>);
+        impl Deref for RetainedCase {
+            type Target = OriginalCase;
+            fn deref(&self) -> &OriginalCase {
+                self.0.as_deref().unwrap()
+            }
+        }
+        impl DerefMut for RetainedCase {
+            fn deref_mut(&mut self) -> &mut OriginalCase {
+                self.0.as_deref_mut().unwrap()
+            }
+        }
+        impl Drop for RetainedCase {
+            fn drop(&mut self) {
+                static ORIGINALS: OnceLock<Mutex<Vec<OriginalCase>>> = OnceLock::new();
+                if let Some(original) = self.0.take() {
+                    ORIGINALS
+                        .get_or_init(Mutex::default)
+                        .lock()
+                        .unwrap()
+                        .push(*original);
+                }
+            }
+        }
+        impl RetainedCase {
+            fn new() -> Self {
+                let mut case = Self(Some(Box::new(OriginalCase {
+                    fixture: fixture(),
+                    source: None,
+                    work: None,
+                    header: None,
+                    disposal: None,
+                    transferred_errors: None,
+                    refusal: None,
+                })));
+                let f = &mut case.fixture;
+                assert!(f.registry.remove(&f.target.registration).is_some());
+                let mut source = AttemptMembershipSource::new(f.registry.clone(), f.target.clone())
+                    .with_original_errors(f._errors.take().unwrap());
+                source.startup_complete();
+                assert!(!source.progress(false, false).unwrap());
+                case.source = Some(source);
+                let epoch = Generation::new(1).unwrap();
+                let (work, mut payer) = case
+                    .fixture
+                    .scope
+                    .reserve_next(
+                        epoch,
+                        ReservationResources::new(
+                            ResourceVector::default(),
+                            OwnedSlotNeed {
+                                work_headers: 1,
+                                completions: 1,
+                                captures: 1,
+                                ..Default::default()
+                            },
+                        ),
+                        WorkKind::Cleanup,
+                        WorkAdmission::External,
+                    )
+                    .unwrap()
+                    .bind(WorkKind::Cleanup)
+                    .unwrap();
+                case.header = Some(work.retirement_observer());
+                let report = ReportSlot::reserve_next(
+                    &mut payer,
+                    epoch,
+                    1,
+                    [(ConsumerId::new(1).unwrap(), ConsumerKind::Observer)],
+                )
+                .unwrap();
+                case.work = Some(ReportedWork::try_new(work, payer, report).unwrap());
+                case
+            }
+            async fn dispose_and_finish(mut self) {
+                self.transferred_errors = self
+                    .source
+                    .as_mut()
+                    .unwrap()
+                    .take_original_errors_after_exit();
+                assert!(self.transferred_errors.is_some());
+                assert!(!self.source.as_ref().unwrap().needs_progress(false, true));
+                assert!(!self.source.as_ref().unwrap().has_original_errors());
+                let work = self.work.take().unwrap();
+                let original = self.transferred_errors.take().unwrap();
+                match HostDisposal::start(
+                    &tokio::runtime::Handle::current(),
+                    work,
+                    ConsumerId::new(1).unwrap(),
+                    original,
+                    drop,
+                ) {
+                    Ok(disposal) => self.disposal = Some(disposal),
+                    Err((refusal, original)) => {
+                        self.transferred_errors = Some(original);
+                        self.refusal = Some(refusal);
+                        panic!("original membership disposal refused");
+                    }
+                }
+                tokio::time::timeout(
+                    Duration::from_secs(2),
+                    std::future::poll_fn(|cx| self.disposal.as_ref().unwrap().poll_complete(cx)),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert!(
+                    self.fixture
+                        .scope
+                        .reap_observed_header(self.header.as_ref().unwrap())
+                        .unwrap()
+                );
+                drop(self.disposal.take());
+                assert!(self.fixture.registry.is_empty());
+                assert_eq!(
+                    self.fixture
+                        .runtime
+                        .snapshot(self.fixture.target.registration.actor())
+                        .unwrap()
+                        .standing_inputs,
+                    0
+                );
+                self.fixture.scope.close_external().unwrap();
+                while let Some(turn) = self.fixture.runtime.claim_host_actor() {
+                    turn.release(false).unwrap();
+                }
+                self.fixture
+                    .runtime
+                    .remove_actor(self.fixture.target.registration.actor())
+                    .unwrap();
+                self.fixture
+                    .ledger
+                    .remove_scope(self.fixture.scope.id())
+                    .unwrap();
+                assert!(self.fixture.runtime.is_empty() && self.fixture.ledger.is_empty());
+                drop(self.0.take());
+            }
+        }
+
+        struct FailingObserver;
+        impl BackendProcessObservationPort for FailingObserver {
+            fn observe_process_at_endpoint(
+                &self,
+                _: BackendProcessId,
+                _: &RuntimeEndpoint,
+            ) -> Result<BackendProcessObservation, BackendTopologyError> {
+                Err(BackendTopologyError::Unavailable {
+                    message: "original membership observation refusal".to_owned(),
+                })
+            }
+        }
+
+        #[tokio::test]
+        async fn retired_membership_role_remains_closed_while_exact_turn_budget_defers_original_errors()
+         {
+            let mut case = RetainedCase::new();
+            case.fixture.registry.publish(1, &FailingObserver);
+            let input = case.fixture.target.input.in_flight().unwrap().unwrap();
+            assert!(case.fixture.runtime.poll_one(Tick(1)).unwrap());
+            assert!(
+                case.source
+                    .as_mut()
+                    .unwrap()
+                    .index_committed(&[input])
+                    .unwrap()
+            );
+            assert!(
+                !case
+                    .source
+                    .as_mut()
+                    .unwrap()
+                    .progress(false, false)
+                    .unwrap()
+            );
+            let errors = case.fixture.target.errors.clone();
+            let expected = BackendTopologyError::Unavailable {
+                message: "original membership observation refusal".to_owned(),
+            };
+            assert_eq!(
+                errors.upgrade().unwrap().lock().unwrap().as_slice(),
+                [(case.fixture.participation, expected)]
+            );
+            let mut budget = case.source.as_ref().unwrap().visit_units();
+            assert_eq!(budget, case.fixture.target.members.len() + 1);
+            budget -= case.source.as_ref().unwrap().visit_units();
+            assert!(!case.source.as_mut().unwrap().progress(false, true).unwrap());
+            assert_eq!(
+                budget, 0,
+                "this turn cannot pay the separate original-owner handoff"
+            );
+            assert!(case.source.as_ref().unwrap().is_closed());
+            assert!(case.source.as_ref().unwrap().has_original_errors());
+            assert!(case.source.as_ref().unwrap().needs_progress(false, true));
+            assert!(matches!(
+                case.fixture.target.input.in_flight(),
+                Err(ActorTurnError::UnknownStandingInput)
+            ));
+            assert!(!case.fixture.scope.snapshot().unwrap().join_ready);
+            for _ in 0..2 {
+                assert!(
+                    !case
+                        .source
+                        .as_mut()
+                        .unwrap()
+                        .index_committed(&[input])
+                        .unwrap()
+                );
+                assert!(!case.source.as_mut().unwrap().progress(false, true).unwrap());
+                assert_eq!(case.source.as_ref().unwrap().visit_units(), 0);
+                assert!(
+                    errors.upgrade().is_some(),
+                    "deferred handoff retains the same original error owner"
+                );
+            }
+            let source = case.source.as_ref().unwrap();
+            let retained = &source.original_errors.as_ref().unwrap()._original;
+            assert!(Arc::ptr_eq(retained, &errors.upgrade().unwrap()));
+            assert_eq!(
+                1 - source.visit_units(),
+                1,
+                "a one-unit next turn can pay the host's existing transfer"
+            );
+            case.dispose_and_finish().await;
+            assert!(
+                errors.upgrade().is_none(),
+                "only actual controlled disposal releases the original error container"
+            );
+        }
     }
 }

@@ -25,7 +25,7 @@ fn invoke(
     source: usize,
     caps: Limits,
     stop: Option<(usize, CompileControlError)>,
-) -> Result<(Facts, Facts, p::ExprArena), Error> {
+) -> Result<(Facts, Facts, Box<[novarocks_expression_contract::ExprNode]>), Error> {
     f.with_tokens(defs, c, |original, functions, aggregates| {
         c.arm(stop);
         let mut w = match CompileCheckpoints::try_new(c, CompilePhase::Decode) {
@@ -38,7 +38,7 @@ fn invoke(
         let result = (|| {
             let mut read_snapshot = Facts::default();
             let decoded = decode_expression_definitions_in(
-                defs,
+                crate::physical_expression_v2::ExpressionDefinitionInput::new(defs, &[]),
                 original.values(),
                 original.functions(),
                 original.aggregates(),
@@ -76,7 +76,7 @@ fn invoke(
                 },
                 &mut w,
             )?;
-            Ok((read_snapshot, snapshot, owned.into_arena()))
+            Ok((read_snapshot, snapshot, owned.into_definitions()))
         })();
         let result = finish(w, result);
         c.disarm();
@@ -91,14 +91,14 @@ fn caller_owned_receiving_and_materializing_preserve_original_complete_kinds_and
     let defs = f.all();
     let (_, _, actual) = invoke(&f, &defs, &c, SOURCE, limits(), None).unwrap();
     let expected = owned(&f, &defs);
-    assert_eq!(actual.len(), 19);
-    for (id, node) in expected.iter() {
-        assert_eq!(actual.get(*id), Some(node));
+    assert_eq!(actual.len(), 17);
+    for node in expected.iter() {
+        assert_eq!(actual.get(node.id.get() as usize), Some(node));
     }
     let (_, _, lambda) = invoke(&f, &golden(), &c, SOURCE, limits(), None).unwrap();
-    let p::ExprKind::Lambda {
+    let novarocks_expression_contract::ExprKind::Lambda {
         parameter_types, ..
-    } = &lambda.get(p::ExprId::new(13)).unwrap().kind
+    } = &lambda.get(3).unwrap().kind
     else {
         panic!("original lambda")
     };
@@ -184,7 +184,7 @@ fn caller_owned_expression_indexes_and_stage_requests_win_before_pending_quantum
             let mut l = limits();
             l.max_new_allocation_request_bytes = 0;
             let actual = decode_expression_definitions_in(
-                &defs,
+                crate::physical_expression_v2::ExpressionDefinitionInput::new(&defs, &[]),
                 e.values(),
                 e.functions(),
                 e.aggregates(),
@@ -231,7 +231,7 @@ fn caller_owned_wide_lists_and_clones_have_actual_quantum_and_original_source_lo
     let f = Fixture::new(&c);
     let mut defs = small();
     defs.push(definition(
-        8,
+        2,
         3,
         wire::expression_definition::Kind::InList(wire::InListExpression {
             expr_id: Some(0),
@@ -240,7 +240,9 @@ fn caller_owned_wide_lists_and_clones_have_actual_quantum_and_original_source_lo
         }),
     ));
     let (_, facts, arena) = invoke(&f, &defs, &c, SOURCE, limits(), None).unwrap();
-    let p::ExprKind::InList { list: args, .. } = &arena.get(p::ExprId::new(8)).unwrap().kind else {
+    let novarocks_expression_contract::ExprKind::InList { list: args, .. } =
+        &arena.get(2).unwrap().kind
+    else {
         panic!("original in-list")
     };
     assert_eq!(args.len(), 320);
@@ -292,7 +294,7 @@ fn caller_owned_captured_value_literal_and_signature_pairs_preserve_facts_and_pr
     let mut bad = good.clone();
     let literal = bad
         .iter_mut()
-        .find(|d| matches!(d.kind, Some(wire::expression_definition::Kind::Literal(_))))
+        .find(|d| matches!(d.kind, Some(wire::expression_definition::Kind::Constant(_))))
         .unwrap();
     literal.value_type_id = Some(0);
     for defs in [&good, &bad] {
@@ -307,7 +309,7 @@ fn caller_owned_captured_value_literal_and_signature_pairs_preserve_facts_and_pr
                     }
                 };
                 let result = decode_expression_definitions_in(
-                    defs,
+                    crate::physical_expression_v2::ExpressionDefinitionInput::new(defs, &[]),
                     original.values(),
                     original.functions(),
                     original.aggregates(),
@@ -333,9 +335,9 @@ fn caller_owned_captured_value_literal_and_signature_pairs_preserve_facts_and_pr
         } else {
             assert!(matches!(
                 baseline,
-                Err(Error::Constant(
-                    p::ConstantReferenceError::SourceTypeMismatch(_)
-                ))
+                Err(Error::Constant(p::ConstantReferenceError::Table(
+                    novarocks_constant_contract::ConstantTableError::SourceTypeMismatch(_)
+                )))
             ));
         }
         let trace = c.trace();
@@ -394,7 +396,7 @@ fn caller_owned_captured_value_literal_and_signature_pairs_preserve_facts_and_pr
 fn caller_owned_materialization_known_header_plus_owned_floor_overflow_is_primary() {
     let c = Control::default();
     let f = Fixture::new(&c);
-    f.with_tokens(&[], &c, |original, functions, aggregates| {
+    f.with_tokens(&small(), &c, |original, functions, aggregates| {
         let caps = Limits {
             max_definitions: usize::MAX,
             max_type_references: usize::MAX,
@@ -404,11 +406,12 @@ fn caller_owned_materialization_known_header_plus_owned_floor_overflow_is_primar
             max_coexisting_source_and_request_bytes: usize::MAX,
             max_cumulative_work: usize::MAX,
         };
-        // This is the actual original empty namespace, built through the old
-        // public decoder. Its inline header makes the exact floor MAX without
-        // fabricating a token or altering any original namespace loan.
-        let invoice = usize::MAX - std::mem::size_of_val(original);
+        // The actual nonempty namespace has an exact retained floor MAX.
+        // Its real dense output request must overflow coexistence before a
+        // pending checkpoint, without adding an already invoiced source twice.
+        let invoice = usize::MAX - original.retained_output_floor().unwrap();
         let huge = super::super::super::decode_expression_definitions(
+            original.as_wire(),
             &[],
             original.values(),
             original.functions(),
@@ -420,7 +423,7 @@ fn caller_owned_materialization_known_header_plus_owned_floor_overflow_is_primar
         )
         .unwrap();
         assert_eq!(huge.retained_floor_header_in().unwrap(), usize::MAX);
-        assert!(functions.retained_output_floor().unwrap() > 0);
+        assert!(huge.source_count() > 0);
         for cause in CAUSES {
             c.arm(Some((1, cause)));
             let mut w = CompileCheckpoints::try_new(&c, CompilePhase::Decode).unwrap();

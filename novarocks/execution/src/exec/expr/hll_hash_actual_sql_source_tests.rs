@@ -207,13 +207,14 @@ fn sources() -> Vec<novarocks_sql::compiler::SqlAuthoredPhysicalPlan> {
 }
 #[test]
 fn hll_hash_actual_original_required_sql_full_signature_source() {
-    use novarocks_physical_plan::{
-        ExprKind, FunctionArgumentType, PhysicalCallDefinition, StaticFunctionArgument,
-    };
+    use novarocks_expression_contract::ExprKind;
+    use novarocks_physical_plan::FunctionArgumentType;
+    use novarocks_physical_plan::StaticFunctionArgument;
     for source in sources() {
         let mut count = 0;
         for fragment in source.plan().fragments().values() {
-            for (id, node) in fragment.expressions().iter() {
+            for (_source_node, unit, id, node) in super::sql_test_source::unit_definitions(fragment)
+            {
                 let ExprKind::FunctionCall { function, args } = &node.kind else {
                     continue;
                 };
@@ -222,10 +223,7 @@ fn hll_hash_actual_original_required_sql_full_signature_source() {
                 }
                 assert_eq!(args.len(), 1);
                 assert_eq!(function.argument_types.len(), 1);
-                let request = fragment
-                    .call_requests()
-                    .get(PhysicalCallDefinition::Expression(*id))
-                    .unwrap();
+                let request = unit.requests().get(id).unwrap();
                 assert_eq!(request.logical_argument_count, 1);
                 assert_eq!(request.arguments.len(), 1);
                 let FunctionArgumentType::Value(selected) = &function.argument_types[0] else {
@@ -240,19 +238,13 @@ fn hll_hash_actual_original_required_sql_full_signature_source() {
                 assert_eq!(actual, selected);
                 // The original analyzer inserts this Cast before binding HLL_HASH.
                 assert_eq!(selected.data_type().clone(), DataType::Utf8);
-                let argument = fragment
-                    .expressions()
-                    .get(args[0])
-                    .expect("actual HLL argument");
+                let argument = unit.definition(args[0]).expect("actual HLL argument");
                 let ExprKind::Cast { expr, target, .. } = &argument.kind else {
                     panic!("original HLL analyzer-authored VARCHAR cast must remain present")
                 };
                 assert_eq!(target, &DataType::Utf8);
                 assert_eq!(argument.ty, *selected);
-                let input = fragment
-                    .expressions()
-                    .get(*expr)
-                    .expect("actual HLL cast source");
+                let input = unit.definition(*expr).expect("actual HLL cast source");
                 assert_eq!(input.ty.data_type().clone(), DataType::Int32);
                 assert!(selected.nullable());
                 assert_eq!(
@@ -263,7 +255,7 @@ fn hll_hash_actual_original_required_sql_full_signature_source() {
                 eprintln!(
                     "HLL_HASH actual original source fragment={:?} id={id:?} function={function:?} request={request:?} argument={:?} output={:?}",
                     fragment.id(),
-                    fragment.expressions().get(args[0]),
+                    unit.definition(args[0]),
                     node.ty
                 );
                 count += 1;

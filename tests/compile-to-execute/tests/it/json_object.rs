@@ -1,0 +1,409 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! Retained JSON_OBJECT SQL/package/Frame boundary properties for F3.
+//!
+//! SQL owns binding and type facts; LocalCompiler and Frame consume the actual
+//! frozen packages. Expected strings below follow the explicit input pairs:
+//! JSON text is parsed and its object keys are ordered, while ordinary text is
+//! quoted. No legacy evaluator or differential harness supplies expected values.
+
+use novarocks_expression::testkit::PassThroughCallHost;
+use novarocks_expression::{EvaluationInput, ExprEvaluationFailure, StaticExprKind};
+use std::sync::Arc;
+
+use arrow::array::{Array, ArrayRef, StringArray};
+use arrow::datatypes::{DataType, Field};
+use arrow::record_batch::RecordBatch;
+use novarocks_functions::{
+    KernelEvaluationControl, KernelFailure, ScalarInvocationActivation, ScalarInvocationScope,
+    Selection,
+};
+use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
+
+use novarocks_sql_testkit::sql_source_with_declared_fields;
+
+fn result() -> FunctionValueType {
+    FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json).unwrap()
+}
+
+#[derive(Default)]
+struct FrameControl;
+impl KernelEvaluationControl for FrameControl {
+    fn checkpoint(&self, units: u32) -> Result<(), KernelFailure> {
+        assert!(units <= 256);
+        Ok(())
+    }
+    fn wait(&self, _: std::time::Duration) -> Result<(), KernelFailure> {
+        panic!("JSON_OBJECT never waits")
+    }
+}
+
+#[test]
+fn c16_p1_json_object_real_sql_package_local_compiler_and_frame_keep_whole_call_data() {
+    use novarocks_expression::CompiledExpressionInstance;
+    use novarocks_expression_contract::ExprKind;
+    use novarocks_functions::testkit::installed_builtin_owner_catalogue;
+    use novarocks_local_program::ProgramNodeKind;
+    use novarocks_test_compile_to_execute::compiler_results::compiler_results;
+
+    {
+        for scenario in 0..5 {
+            let complex_key = matches!(scenario, 1..=3);
+            let mut fields = vec![
+                Field::new("k", DataType::Utf8, true),
+                Field::new("v", DataType::Utf8, true),
+                Field::new("n", DataType::Int64, true),
+            ];
+            if scenario >= 3 {
+                fields.push(Field::new("id", DataType::Int32, true));
+            }
+            let sql = match scenario {
+                0 => "SELECT json_object(k: v) AS j FROM t",
+                1 => "SELECT json_object([n]: v) AS j FROM t",
+                2 => "SELECT json_object(NULL: json_object([n]: v)) AS j FROM t",
+                3 | 4 => "SELECT json_object([[id, n]][IF(id = 2, NULL, 1)]: v) AS j FROM t",
+                _ => unreachable!(),
+            };
+            let source = sql_source_with_declared_fields(sql, &fields);
+            let mut authored = 0;
+            for fragment in source.plan().fragments().values() {
+                for (_source_node, unit, id, expression) in
+                    novarocks_sql_testkit::unit_definitions(fragment)
+                {
+                    let ExprKind::FunctionCall { function, args } = &expression.kind else {
+                        continue;
+                    };
+                    if function.function_id.as_str() != "builtin.scalar/json_object/v1" {
+                        continue;
+                    }
+                    assert_eq!(expression.ty, result());
+                    assert_eq!(function.result_type, expression.ty);
+                    assert_eq!(args.len(), 2);
+                    let request = unit.requests().get(id).unwrap();
+                    assert_eq!(request.logical_argument_count, 2);
+                    assert_eq!(request.arguments.len(), 2);
+                    authored += 1;
+                }
+            }
+            assert_eq!(authored, if scenario == 2 { 2 } else { 1 });
+
+            if scenario >= 3 {
+                if let Ok(directory) = std::env::var("C16_SQL_SOURCE_OUT") {
+                    std::fs::write(
+                        std::path::Path::new(&directory)
+                            .join(format!("nested-index-compiled-{scenario}.txt")),
+                        format!("{:#?}\n", source.plan()),
+                    )
+                    .unwrap();
+                }
+                let mut accesses = 0;
+                for fragment in source.plan().fragments().values() {
+                    for (_source_node, unit, _, expression) in
+                        novarocks_sql_testkit::unit_definitions(fragment)
+                    {
+                        let ExprKind::FunctionCall { function, args } = &expression.kind else {
+                            continue;
+                        };
+                        if function.function_id.as_str() != "builtin.scalar/__array_element_at/v1" {
+                            continue;
+                        }
+                        accesses += 1;
+                        assert_eq!(args.len(), 2);
+                        assert_eq!(
+                            expression.ty.data_type(),
+                            &DataType::List(Arc::new(Field::new("item", DataType::Int64, true)))
+                        );
+                        assert!(expression.ty.nullable());
+                        let index = unit.definition(args[1]).unwrap();
+                        assert_eq!(index.ty.data_type(), &DataType::Int32);
+                        assert!(index.ty.nullable());
+                        // The literal IF index now has its native INTEGER
+                        // type; no BIGINT-to-INTEGER cast is needed or forged.
+                        let conditional = index;
+                        assert_eq!(conditional.ty.data_type(), &DataType::Int32);
+                        assert!(conditional.ty.nullable());
+                        let ExprKind::FunctionCall { function, args } = &conditional.kind else {
+                            panic!("primitive SQL IF");
+                        };
+                        assert_eq!(function.function_id.as_str(), "builtin.scalar/if/v1");
+                        assert_eq!(args.len(), 3);
+                        for (arg, value) in args[1..].iter().zip([None, Some(1)]) {
+                            let branch = unit.definition(*arg).unwrap();
+                            assert_eq!(branch.ty.data_type(), &DataType::Int32);
+                            let actual = match &branch.kind {
+                                ExprKind::Constant(reference) => {
+                                    let pool =
+                                        &source.plan().constants().entries()[&reference.pool];
+                                    assert_eq!(pool.value_type(), &branch.ty);
+                                    let values = pool
+                                        .array()
+                                        .as_any()
+                                        .downcast_ref::<arrow::array::Int32Array>()
+                                        .unwrap();
+                                    let row = usize::try_from(reference.ordinal).unwrap();
+                                    assert_eq!(branch.ty.nullable(), value.is_none());
+                                    (!values.is_null(row)).then(|| i64::from(values.value(row)))
+                                }
+                                other => panic!("actual SQL integer source {other:?}"),
+                            };
+                            assert_eq!(actual, value);
+                        }
+                    }
+                }
+                assert_eq!(accesses, 1, "real nested List subscript is present");
+            }
+
+            let programs = compiler_results(&source, &installed_builtin_owner_catalogue());
+            let mut producer = None;
+            for program in programs.into_values() {
+                let program = Arc::new(program.expect("actual complete JSON SQL package compiles"));
+                for (site, unit, root) in
+                    novarocks_test_compile_to_execute::programs::compiled_roots(&program)
+                {
+                    let use_id = &root.use_id;
+                    let Some(call) = unit.calls().get(use_id) else {
+                        continue;
+                    };
+                    if call.call_contract().function_id().as_str()
+                        != "builtin.scalar/json_object/v1"
+                    {
+                        continue;
+                    }
+                    assert_eq!(call.call_contract().logical_argument_count(), 2);
+                    assert_eq!(
+                        call.call_contract().effects().argument_control,
+                        novarocks_type_contract::ArgumentControl::Eager
+                    );
+                    assert_eq!(
+                        call.call_contract().effects().null_behavior,
+                        novarocks_type_contract::FunctionNullBehavior::CalledOnNull
+                    );
+                    assert_eq!(unit.control_flow().uses()[use_id].arguments.len(), 2);
+                    let flow = unit.control_flow();
+                    let arena = unit.definitions();
+                    let StaticExprKind::BoundCall { args, .. } =
+                        arena.node(flow.uses()[use_id].definition).unwrap().kind()
+                    else {
+                        panic!("real JSON producer");
+                    };
+                    let key_slot = if complex_key || scenario == 4 {
+                        None
+                    } else {
+                        assert!(
+                            matches!(arena.node(args[0]).unwrap().kind(), StaticExprKind::Input),
+                            "real key Input"
+                        );
+                        Some(
+                            novarocks_test_compile_to_execute::programs::project_input_slot_for_use(
+                                &program,
+                                site,
+                                flow.uses()[use_id].arguments[0],
+                            ),
+                        )
+                    };
+                    let value_use = if scenario == 2 {
+                        let inner = flow.uses()[use_id].arguments[1];
+                        flow.uses()[&inner].arguments[1]
+                    } else {
+                        flow.uses()[use_id].arguments[1]
+                    };
+                    let value = if scenario == 2 {
+                        let StaticExprKind::BoundCall { args: inner, .. } =
+                            arena.node(args[1]).unwrap().kind()
+                        else {
+                            panic!("required original inner call");
+                        };
+                        inner[1]
+                    } else {
+                        args[1]
+                    };
+                    assert!(
+                        matches!(arena.node(value).unwrap().kind(), StaticExprKind::Input),
+                        "real value Input"
+                    );
+                    let value_slot =
+                        novarocks_test_compile_to_execute::programs::project_input_slot_for_use(
+                            &program, site, value_use,
+                        );
+                    assert!(
+                        producer
+                            .replace((program.clone(), site, key_slot, value_slot))
+                            .is_none()
+                    );
+                }
+            }
+            let (program, site, key_slot, value_slot) =
+                producer.expect("actual installed JSONObject producer root");
+            let input = program
+                .graph()
+                .nodes()
+                .iter()
+                .find_map(|node| match node.kind() {
+                    ProgramNodeKind::Project { input, exprs, .. } if exprs.contains(&site) => {
+                        Some(*input)
+                    }
+                    _ => None,
+                })
+                .expect("original project producer");
+            let schema = program.graph().nodes()[input.index()]
+                .output_layout()
+                .schema()
+                .clone();
+            let slots = program.graph().nodes()[input.index()]
+                .output_layout()
+                .slots();
+            let columns = schema
+                .fields()
+                .iter()
+                .zip(slots)
+                .map(|(field, slot)| match field.data_type() {
+                    DataType::Int32 => {
+                        Arc::new(arrow::array::Int32Array::from(vec![1, 2, 3])) as ArrayRef
+                    }
+                    DataType::Int64 => Arc::new(arrow::array::Int64Array::from(if scenario >= 3 {
+                        vec![Some(42), Some(-7), None]
+                    } else {
+                        vec![Some(1), None, Some(3)]
+                    })) as ArrayRef,
+                    DataType::Utf8 => Arc::new(StringArray::from(if key_slot == Some(*slot) {
+                        vec![Some("a"), None, Some("b")]
+                    } else {
+                        assert_eq!(*slot, value_slot, "the real ordered value channel");
+                        vec![Some("{\"z\":2,\"a\":1}"), None, Some("ordinary text")]
+                    })) as ArrayRef,
+                    other => panic!("exact authored input {other:?}"),
+                })
+                .collect();
+            let batch = RecordBatch::try_new(schema, columns).unwrap();
+            let tracker = Arc::new(novarocks_expression::testkit::CountingAllocator::new(
+                8 * 1024 * 1024,
+            ));
+            let mut frame = CompiledExpressionInstance::try_new_with_allocator(
+                program.unit(site.unit).unwrap().clone(),
+                site.root,
+                &FrameControl,
+                Some(tracker.clone()),
+            )
+            .unwrap();
+            let rows: &[usize] = if scenario == 4 { &[1] } else { &[0, 2] };
+            let selection = Selection::try_sparse(3, rows).unwrap();
+            let output = frame.evaluate(
+                EvaluationInput::Batch {
+                    batch: &batch,
+                    source: None,
+                },
+                ScalarInvocationScope::new(selection, selection),
+                ScalarInvocationActivation::Activated,
+                &FrameControl,
+                &mut PassThroughCallHost,
+            );
+            if complex_key {
+                let error = output.unwrap_err();
+                let ExprEvaluationFailure::Data(data) = &error else {
+                    panic!("whole-call complex-key Data: {error:?}")
+                };
+                let data = data.clone();
+                drop(error);
+                assert_eq!(
+                    data.message(),
+                    "json_object key does not support complex type"
+                );
+                assert_eq!(data.source_row(0), Some(0));
+                assert_eq!(data.source_row(1), Some(2));
+                assert!(matches!(
+                    frame.evaluate(
+                        EvaluationInput::Batch {
+                            batch: &batch,
+                            source: None
+                        },
+                        ScalarInvocationScope::new(selection, selection),
+                        ScalarInvocationActivation::Activated,
+                        &FrameControl,
+                        &mut PassThroughCallHost,
+                    ),
+                    Err(ExprEvaluationFailure::Kernel(KernelFailure::InstanceFailed))
+                ));
+                drop(frame);
+                assert!(
+                    tracker.outstanding() > 0,
+                    "Data retains actual host funding"
+                );
+                drop(data);
+            } else {
+                let output = output.unwrap();
+                assert!(output.errors().is_empty());
+                let text = output
+                    .values()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                if scenario == 4 {
+                    assert_eq!(text.len(), 1);
+                    assert!(
+                        text.is_null(0),
+                        "a NULL nested index yields a successful NULL key"
+                    );
+                } else {
+                    assert_eq!(text.value(0), "{\"a\": {\"a\": 1, \"z\": 2}}");
+                    assert_eq!(text.value(1), "{\"b\": \"ordinary text\"}");
+                }
+                let alias = output.values().slice(if scenario == 4 { 0 } else { 1 }, 1);
+                drop(output);
+                drop(frame);
+                assert!(
+                    tracker.outstanding() > 0,
+                    "independent Arrow alias retains actual host funding"
+                );
+                drop(alias);
+            }
+            assert_eq!(tracker.outstanding(), 0);
+            for activation in [
+                ScalarInvocationActivation::Activated,
+                ScalarInvocationActivation::ValidateOnly,
+            ] {
+                let mut empty = CompiledExpressionInstance::try_new_with_allocator(
+                    program.unit(site.unit).unwrap().clone(),
+                    site.root,
+                    &FrameControl,
+                    Some(tracker.clone()),
+                )
+                .unwrap();
+                let output = empty
+                    .evaluate(
+                        EvaluationInput::Batch {
+                            batch: &batch,
+                            source: None,
+                        },
+                        {
+                            let selection = Selection::try_sparse(3, &[]).unwrap();
+                            ScalarInvocationScope::new(selection, selection)
+                        },
+                        activation,
+                        &FrameControl,
+                        &mut PassThroughCallHost,
+                    )
+                    .unwrap();
+                assert!(output.values().is_empty());
+                assert!(output.errors().is_empty());
+                drop(output);
+                drop(empty);
+                assert_eq!(tracker.outstanding(), 0);
+            }
+        }
+    }
+}

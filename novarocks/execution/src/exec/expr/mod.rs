@@ -15,8 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Compiled expression runtime and independent boundary tests.
-pub mod compiled_program;
+//! Expression fixtures and independent boundary tests.
+#[cfg(test)]
+pub(crate) mod fixtures;
 
 #[cfg(test)]
 mod cast_decimal_text_oracle_tests;
@@ -56,9 +57,6 @@ mod cast_decimal_float32_oracle_tests;
 
 #[cfg(test)]
 mod numeric_unary_writer_dml_source_tests;
-
-#[cfg(test)]
-mod decimal_float32_sql_own_null_tests;
 
 #[cfg(test)]
 mod numeric_unary_state_union_sql_source_tests;
@@ -143,9 +141,6 @@ mod percentile_hash_corpus_sql_source_tests;
 
 #[cfg(test)]
 mod between_actual_sql_compiler_tests;
-
-#[cfg(test)]
-mod percentile_hash_native_n1_frame_tests;
 
 #[cfg(test)]
 mod percentile_hash_native_n1_availability_tests;

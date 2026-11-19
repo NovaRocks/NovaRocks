@@ -22,13 +22,9 @@ use std::sync::Arc;
 use arrow::datatypes::DataType;
 use novarocks_functions::{ConstantPolicy, ConstantValue};
 use novarocks_parser::{Span, ast};
-use novarocks_physical_plan::PlanVersionId;
 use novarocks_type_contract::FunctionValueType;
 
-use super::{
-    SqlAuthoredPhysicalPlan, SqlCatalogSnapshot, SqlCompileControl, SqlCompileError,
-    SqlFunctionCatalog,
-};
+use super::{SqlCatalogSnapshot, SqlCompileControl, SqlCompileError, SqlFunctionCatalog};
 
 /// The admitted SQL targets of a required constant computation.
 /// This vocabulary carries no application registry or setter authority.
@@ -73,13 +69,47 @@ pub struct RequiredConstantRequest<'a> {
     pub sql_semantics: &'a crate::sql_mode::SqlSemanticSettings,
     pub constant_policy: ConstantPolicy,
     pub control: &'a SqlCompileControl,
-    pub version: PlanVersionId,
+}
+
+/// The actual completed scalar unit and its original immutable SQL environment.
+/// The private producer retains its original source identity and journal.
+/// This source is not a plan, a fragment, or a resource grant.
+pub struct SqlAuthoredScalarUnit {
+    emission: crate::planner::distributed::build::StandaloneScalarEmission,
+}
+impl SqlAuthoredScalarUnit {
+    pub(crate) fn from_emission(
+        emission: crate::planner::distributed::build::StandaloneScalarEmission,
+    ) -> Self {
+        Self { emission }
+    }
+    pub fn unit(&self) -> &Arc<novarocks_expression_contract::BoundExprSet> {
+        self.emission.unit()
+    }
+    pub fn root(&self) -> novarocks_expression_contract::RootOrdinal {
+        self.emission.root()
+    }
+    pub fn constants(&self) -> &novarocks_physical_plan::ConstantPools {
+        self.emission.constants()
+    }
+    pub fn parameters(&self) -> &novarocks_type_contract::SemanticParameters {
+        self.emission.parameters()
+    }
+    pub fn function_catalog(&self) -> &Arc<dyn SqlFunctionCatalog> {
+        self.emission.function_catalog()
+    }
+    pub fn constant_policy(&self) -> ConstantPolicy {
+        self.emission.constant_policy()
+    }
+    pub fn value_type(&self) -> &FunctionValueType {
+        self.emission.value_type()
+    }
 }
 
 /// SQL's exact one-cell computation. The application cannot rewrite its tree,
 /// replace a selected binding, or reconstruct an expression from display text.
 pub struct PreparedRequiredConstant {
-    pub(crate) source: SqlAuthoredPhysicalPlan,
+    pub(crate) source: SqlAuthoredScalarUnit,
     pub(crate) value_type: FunctionValueType,
     pub(crate) span: Span,
     pub(crate) policy: ConstantPolicy,
@@ -95,7 +125,7 @@ impl std::fmt::Debug for PreparedRequiredConstant {
     }
 }
 impl PreparedRequiredConstant {
-    pub const fn source(&self) -> &SqlAuthoredPhysicalPlan {
+    pub const fn source(&self) -> &SqlAuthoredScalarUnit {
         &self.source
     }
     pub const fn value_type(&self) -> &FunctionValueType {

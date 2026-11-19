@@ -19,7 +19,6 @@ use novarocks_spi::connector::ConnectorExecutionRoleBindingFactory;
 #[cfg(test)]
 use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
 use novarocks_types::{AdvertiseEndpoint, BackendProcessId, NativeCompatibilityId, NativeEndpoint};
-use novarocks_worker::sink_commit::ConfiguredWorkerSinkCommitPort;
 use novarocks_worker::{
     CatalogManager, CatalogManagerConfig, ConnectorExecutionRoleBindingFactorySet,
     WorkerAdmissionEpochAuthority, WorkerDrainState, WorkerResultRetainedLimits,
@@ -61,7 +60,6 @@ use novarocks_execution_contract::task_execution::operation::{
 };
 #[cfg(test)]
 use novarocks_execution_contract::task_execution::status::TaskFailureCategory;
-use novarocks_spi::connector::WriteCommitEvidenceLimits;
 #[cfg(test)]
 use novarocks_worker::ParticipationHost;
 #[cfg(test)]
@@ -105,8 +103,6 @@ pub struct BackendServerConfig {
     pub announce_interval: Duration,
     pub announce_initial_backoff: Duration,
     pub announce_max_backoff: Duration,
-    /// Server-resolved per-fragment terminal write evidence budget.
-    pub write_commit_evidence_limits: WriteCommitEvidenceLimits,
     /// Server-validated hierarchy for retained native query results.
     pub result_retained_limits: WorkerResultRetainedLimits,
     /// Independent finite CPU/installation/stack resources for root encoding.
@@ -453,7 +449,6 @@ fn compose_backend_application_services(
     backend_process_id: BackendProcessId,
     execution: BackendExecutionRuntimeInput,
     native_compatibility_id: NativeCompatibilityId,
-    write_commit_evidence_limits: WriteCommitEvidenceLimits,
     result_retained_limits: WorkerResultRetainedLimits,
     result_retained_budget: Arc<novarocks_worker::result_buffer::ResultRetainedBudget>,
     root_producer_limits: RootProducerLimits,
@@ -597,9 +592,6 @@ fn compose_backend_application_services(
         result_retained_limits,
         Arc::clone(&root_producer_pool),
         Arc::clone(&exchange_receiver_port),
-        Arc::new(ConfiguredWorkerSinkCommitPort::new(
-            write_commit_evidence_limits,
-        )),
         Arc::clone(&execution_runtime),
         scan_stream_host,
         Arc::clone(&task_completion_supervisor),
@@ -911,7 +903,6 @@ impl BackendApplicationHost {
             announce_interval,
             announce_initial_backoff,
             announce_max_backoff,
-            write_commit_evidence_limits,
             result_retained_limits,
             root_producer_limits,
 
@@ -1069,7 +1060,6 @@ impl BackendApplicationHost {
             )
             .with_exchange_flow_limits(exchange_flow_limits),
             native_compatibility_id,
-            write_commit_evidence_limits,
             result_retained_limits,
             result_retained_budget,
             root_producer_limits,
@@ -1391,7 +1381,6 @@ mod tests {
     use novarocks_native_adapter::{BackendDataRuntime, BackendNativeTransport};
     use novarocks_proto_models::novarocks as protocol;
     use novarocks_proto_models::novarocks::{HeartbeatRequest, HeartbeatResponse};
-    use novarocks_spi::connector::WriteCommitEvidenceLimits;
     use novarocks_types::{AdvertiseEndpoint, BackendProcessId, NativeEndpoint};
     use novarocks_worker::{CatalogManagerConfig, WorkerResultRetainedLimits};
 
@@ -1555,7 +1544,6 @@ mod tests {
             announce_interval: Duration::from_secs(60),
             announce_initial_backoff: Duration::from_millis(100),
             announce_max_backoff: Duration::from_secs(2),
-            write_commit_evidence_limits: WriteCommitEvidenceLimits::default(),
             result_retained_limits: WorkerResultRetainedLimits::try_new(
                 16 * 1024 * 1024,
                 novarocks_execution_contract::native_result_support::NativeResultSupportGeometry::V1
@@ -1648,8 +1636,18 @@ mod tests {
         };
 
         let exchange_flow_limits =
-            super::ExchangeFlowLimits::try_new(2, 5, 0, 3, Duration::from_millis(71))
-                .expect("explicit exchange configuration is valid");
+            super::ExchangeFlowLimits::try_new(
+                2,
+                5,
+                0,
+                3,
+                Duration::from_millis(71),
+                std::num::NonZeroUsize::new(
+                    novarocks_execution_contract::native_result_support::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES,
+                )
+                .expect("unit bound"),
+            )
+            .expect("explicit exchange configuration is valid");
         let services = compose_backend_application_services(
             test_data_runtime(),
             BackendProcessId::new_v7(),
@@ -1660,7 +1658,6 @@ mod tests {
             )
             .with_exchange_flow_limits(exchange_flow_limits),
             novarocks_types::NativeCompatibilityId::new([0x71; 32]),
-            WriteCommitEvidenceLimits::default(),
             WorkerResultRetainedLimits::try_new(16 * 1024 * 1024, 32 * 1024 * 1024)
                 .expect("valid test result retained-byte limits"),
             novarocks_worker::result_buffer::ResultRetainedBudget::new(
@@ -2170,7 +2167,6 @@ mod tests {
                 novarocks_native_adapter::backend_test_support::test_memory_authority(),
             ),
             novarocks_types::NativeCompatibilityId::new([0x71; 32]),
-            WriteCommitEvidenceLimits::default(),
             WorkerResultRetainedLimits::try_new(16 * 1024 * 1024, 32 * 1024 * 1024)
                 .expect("valid test result retained-byte limits"),
             novarocks_worker::result_buffer::ResultRetainedBudget::new(

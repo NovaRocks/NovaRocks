@@ -22,14 +22,17 @@ use std::{alloc::Layout, sync::Arc};
 use novarocks_functions::{
     AggregateKernelPhase, AggregateOrderKey, AggregatePreparationOptions, ConstantPolicy,
     FunctionArgument, FunctionBindingRequest, FunctionBindingSelection, MAX_CALL_EFFECT_ARGUMENTS,
-    PureCallPreparation, ScopedExpressionEffects,
-};
-use novarocks_physical_plan::{
-    AggregateBinding, AggregateCall, AggregatePhase, BoundFunction, ConstantPools, ExprId,
-    Fragment, NodeKind, NullOrdering, PhysicalCallSite, PhysicalNode, SortDirection, TopNReduction,
+    PureCallPreparation, ScopedRelationalEffects,
 };
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, FunctionKind,
+};
+use {
+    novarocks_expression_contract::BoundFunction,
+    novarocks_physical_plan::{
+        AggregateBinding, AggregateCall, AggregatePhase, ConstantPools, ExprId, Fragment, NodeKind,
+        NullOrdering, PhysicalCallSite, PhysicalNode, SortDirection, TopNReduction,
+    },
 };
 
 use super::{
@@ -44,6 +47,7 @@ pub(crate) enum PhysicalAggregateRequestError {
     Argument(PhysicalArgumentError),
     InvalidSource(&'static str),
     MissingArgument(ExprId),
+    MissingRoot(novarocks_expression_contract::RootOrdinal),
     MissingLogicalSource(AggregatePhase),
 }
 impl From<CompileControlError> for PhysicalAggregateRequestError {
@@ -135,7 +139,7 @@ impl AuthoredPhysicalAggregateUpdateRequest<'_> {
             }
         }
     }
-    pub fn preparation(&self, arguments: ScopedExpressionEffects) -> PureCallPreparation {
+    pub fn preparation(&self, arguments: ScopedRelationalEffects) -> PureCallPreparation {
         PureCallPreparation::Aggregate {
             arguments,
             options: self.options.clone(),
@@ -248,9 +252,9 @@ pub(crate) fn author_physical_aggregate_update_request_observed<'a>(
         .copied()
         .chain(source.order_by.iter().map(|key| key.expr))
     {
-        let argument = fragment.expressions().get(id);
+        let argument = super::unit_source::UnitDefinitions::from_node(node).root_definition(id);
         work.step()?;
-        let argument = argument.ok_or(PhysicalAggregateRequestError::MissingArgument(id))?;
+        let argument = argument.ok_or(PhysicalAggregateRequestError::MissingRoot(id))?;
         arguments.push(author_physical_argument_observed(
             argument,
             pools,
@@ -441,7 +445,7 @@ pub(crate) struct AuthoredPhysicalAggregateMergeRequest<'entry, 'source> {
     entry: &'entry super::lowered_draft::CheckedAggregateLogicalSourceEntry<'source>,
     state_inputs: super::lowered_draft::CheckedAggregateStateInputs<'source>,
     state_id: ExprId,
-    state: &'source novarocks_physical_plan::ExprNode,
+    state: &'source novarocks_expression_contract::ExprNode,
     state_interpretation: Option<Arc<novarocks_type_contract::AggregateStateInterpretation>>,
     phase: AggregateKernelPhase,
     selected: Arc<FunctionBindingSelection>,
@@ -471,7 +475,10 @@ impl AuthoredPhysicalAggregateMergeRequest<'_, '_> {
     pub const fn state_id(&self) -> ExprId {
         self.state_id
     }
-    pub const fn state(&self) -> &novarocks_physical_plan::ExprNode {
+    pub fn state_root(&self) -> novarocks_expression_contract::RootOrdinal {
+        self.source().arguments[0]
+    }
+    pub const fn state(&self) -> &novarocks_expression_contract::ExprNode {
         self.state
     }
     pub const fn phase(&self) -> AggregateKernelPhase {
@@ -486,7 +493,7 @@ impl AuthoredPhysicalAggregateMergeRequest<'_, '_> {
     pub fn decimal_overflow_policy(&self) -> novarocks_type_contract::DecimalOverflowPolicy {
         self.entry.captured().binding().decimal_overflow_policy()
     }
-    pub fn preparation(&self, arguments: ScopedExpressionEffects) -> PureCallPreparation {
+    pub fn preparation(&self, arguments: ScopedRelationalEffects) -> PureCallPreparation {
         PureCallPreparation::Aggregate {
             arguments,
             options: AggregatePreparationOptions {
@@ -527,7 +534,11 @@ pub(crate) fn author_physical_aggregate_merge_request_observed<'entry, 'source>(
     let state_id = state_id.ok_or(PhysicalAggregateRequestError::InvalidSource(
         "merge request has no original expression state",
     ))?;
-    let channels = source.arguments.as_ref() == [state_id]
+    let definitions = super::unit_source::UnitDefinitions::from_node(entry.node());
+    let channels = source.arguments.len() == 1
+        && definitions
+            .root(source.arguments[0])
+            .is_some_and(|root| root.definition == state_id)
         && source.order_by.is_empty()
         && !source.distinct
         && source.binding.phase == entry.phase();
@@ -537,7 +548,7 @@ pub(crate) fn author_physical_aggregate_merge_request_observed<'entry, 'source>(
             "merge request differs from its original state channels",
         ));
     }
-    let state = entry.fragment().expressions().get(state_id);
+    let state = definitions.definition(state_id);
     work.step()?;
     let state = state.ok_or(PhysicalAggregateRequestError::MissingArgument(state_id))?;
     let selected = checked_merge_selected_observed(entry, work)?;

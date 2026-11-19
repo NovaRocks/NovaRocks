@@ -447,10 +447,10 @@ fn encode_core(
                 2,
             )
         }
-        physical::ValueOrigin::Expr { node, expr } => (
+        physical::ValueOrigin::Expr { node, root } => (
             wire::value_origin::Kind::Expression(wire::ExpressionOrigin {
                 node_id: Some(node.get()),
-                expr_id: Some(expr.get()),
+                root_ordinal: Some(root.get()),
             }),
             2,
         ),
@@ -637,7 +637,9 @@ fn decode_decision<'a>(
         wire::value_origin::Kind::Expression(value) => (
             physical::ValueOrigin::Expr {
                 node: physical::NodeId::new(required(value.node_id)?),
-                expr: physical::ExprId::new(required(value.expr_id)?),
+                root: novarocks_expression_contract::RootOrdinal::new(required(
+                    value.root_ordinal,
+                )?),
             },
             2,
         ),

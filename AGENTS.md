@@ -148,13 +148,14 @@ SQL client
   process allocator installation.
 
 - `novarocks/frontend-application/src/**`
-  FE application composition, SQL admission, catalog projection, native query
-  adapter, supervised statement orchestration and domain publication.
-  `novarocks/attempt-protocol/src/**` owns Native attempt protocol decisions.
-  `control_runtime/**` and `task_execution/host/**` bind the original I/O,
-  observations, reports and actual exit. The logical execution owner and
-  recovery policy remain in `novarocks/query-application/src/**`.
-  See [ADR-0230](docs/adr/ADR-0230-frontend-attempt-decisions-and-transport-custody.md).
+  FE application composition、SQL admission、catalog projection、Native adapter 与领域 publication。
+  `novarocks/logical-execution-protocol/src/**` 拥有纯逻辑执行政策：授权、恢复、可见性、
+  计算就绪与结论；`novarocks/attempt-protocol/src/**` 拥有纯 attempt 协议决定。
+  `novarocks/query-application/src/coordination/executor/**` 执行已决定的动作并回报原事实，
+  `runtime_registry.rs` 保原注册、health 与实际退出；supervisor 只在原准备后安装，不保留安装后驱动循环。
+  FA 的 `control_runtime/logical/**` 与 `task_execution/host/**` 保同原预付端口、I/O、回执、
+  工作报告与受控析构，不能代做恢复或领域完整性决定。两个核心按显式时间、种子和被动输入运行，
+  不持 Session 或资源 owner。见 [ADR-0237](docs/adr/ADR-0237-pure-logical-execution-and-original-host-custody.md)。
   Long-lived Catalog
   generation ownership remains in `novarocks/catalog-application/src/**`.
   `state_family/**` is the closed manifest of every frontend-local state
@@ -177,12 +178,13 @@ SQL client
   runtime that runs under them.
 
 - `novarocks/coordination-contract/src/**`
-  仅共享 FE owner 之间实际使用的身份、时间、消息与中立事实；无 Tokio、领域载荷、
-  session、closure、资源 owner 或恢复算法。Query Application 的 `coordination/supervisor.rs`
-  拥有唯一 query-id 来源、逻辑驱动和恢复政策，`runtime_registry.rs` 与
-  `runtime_registry/health.rs` 保管原任务、真实退出和原始 health；writer/统计完成证明属于
-  Frontend 领域。见 [ADR-0198](docs/adr/ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md)；
-  源码结构与局部测试不证明整族原生或最终全工作区验证完成。
+  仅共享 FE owner 之间的准确身份、时间、最终端口消息与被动失败事实；无 Tokio、领域载荷、
+  Session、closure、资源 owner 或恢复算法。唯一逻辑恢复政策在 `logical-execution-protocol`，
+  Query Application 负责原身份/准备与监督执行器，FA 的宿主持原载体和真实退出；writer/统计
+  完成证明仍属 Frontend 领域。共用 `control-runtime` 只核来源、原 Work/票据、失败保管与退休，
+  不识别 FE 负面业务内容；失败清理时刻由宿主一次冻结，已有远端期限只缩短。
+  见 [ADR-0198](docs/adr/ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md) 与
+  [ADR-0237](docs/adr/ADR-0237-pure-logical-execution-and-original-host-custody.md)；源码结构与局部测试不证明整族原生或最终全工作区验证完成。
 
 ### 4.2 SQL Frontend: Parse, Plan, Admit
 
@@ -230,6 +232,10 @@ SQL client
   `columns`、`data`、`updateType` 与 `updateCount`。普通/MOR 取同 Session 完整冻结的 Root
   计数，CTAS 等取最终 CREATE；无真实计数时为 NULL，不能填零。
   计数数据页之后仍须请求终页确认；完成数据不替代原 visibility、取消与实际退出。见 ADR-0217。
+  Iceberg 的根记录由 `novarocks/frontend-application/src/query_execution/write_result.rs` 组装，
+  `novarocks/frontend-application/src/query_execution/write_session/computation.rs` 在原 CPU 范围内逐记录
+  解码并交给 Provider。完整写集仍须通过根 EOF、参与方成功与取消/期限检查才交给原发布方。
+  Provider 的接收保管与滚动提交见 [ADR-0239](docs/adr/ADR-0239-iceberg-compact-receiving-and-rolling-manifests.md)。
 
 - `novarocks/frontend-application/src/statistics/{application,attempt_executor,service,read,publication}.rs`
   ANALYZE 在原语句的 Internal Root、冻结会话设置与 query permit 下完成 capture、计算与发布，
@@ -285,6 +291,12 @@ SQL client
   从完成的 planner physical IR 经 `encode_completed_packages` 冻结 package。
   SQL 的精确结果声明、类型与函数准入快照必须随原始输入保留，不能从展示信息猜测。
 
+- `novarocks/expression-contract/src/{unit,builder}.rs`
+  `BoundExprSet` 已冻结有序端口、局部定义、根、控制流、调用声明与静态请求；
+  codec 用受检的中立 parts 构造单元。修订号 27 的 package 在 PhysicalNode 信封承载单元，
+  类型、常量和函数绑定由 package 共享。节点字段的根与端口由 `physical-plan/src/node_roots.rs` 核对。
+  见 [ADR-0238](docs/adr/ADR-0238-self-contained-expression-units-and-explicit-environments.md)。
+
 - `novarocks/plan-codec/src/physical_package_v2/**`
   package 编解码与验证；`frozen_limits.rs` 拥有生产编码/解码上限和常量策略。
   `physical_type_v2.rs` 与 `physical_expression_v2.rs` 拥有对应 frozen vocabulary。
@@ -322,6 +334,13 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
   拥有独立系统关系的批序列、编解码、降级与 BE 游标源；每次消费批次，不整份拼接，
   不登记为 SQL 常量或借用 `StaticValues`。类型、几何和实际存储责任仍由原作者核对，见 ADR-0226/0227。
 
+- `novarocks/expression-contract/src/**` 与 `novarocks/expression/src/**`
+  前者拥有中立单元构造、封存和校验。后者从显式环境、完整输入布局和安装函数目录纯编译
+  `CompiledExprSet`，并在 `novarocks/expression/src/evaluator.rs` 及 `evaluator/**` 求值，
+  依赖闭包止于 Functions、中立契约和 Arrow。`evaluator_view.rs` 为关系算子与本地程序提供编译单元的只读视图。
+  求值器撰写叶子调用协议，宿主提供原控制、分配、准入和来源存储，见
+  [ADR-0239](docs/adr/ADR-0239-expression-evaluation-and-host-admission.md)。
+
 - `novarocks/local-compiler/src/**`
   只消费已冻结的 package、pure function/provider facts，产生纯 `LocalProgram`；
   不获取 Task、connector runtime 或 topology。能力拒绝必须与非法输入及控制失败保持 typed 区分。
@@ -334,17 +353,17 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
   compiled 复用的中立值描述、scan/writer 等运行能力；不构造旧执行树。
   不得按目录名删除共享值类型、typed failure 或实际 construction helper。
 
-- `novarocks/execution/src/exec/expr/**`
-  只有 compiled 求值器与保留的真实 SQL/独立预期测试；不保留旧 arena、名字分派或 legacy aggregate adapter。
+- `novarocks/execution/src/exec/operators/compiled_expression.rs` 与 `novarocks/execution/src/runtime/scalar_memory.rs`
+  Execution 在此绑定输入、控制、资源准入、结算与失败投影。`novarocks/execution/src/exec/expr/**` 承接存量测试与 fixture。
   折叠走 SQL `compiler/fold_node.rs` 的 FrozenFoldCall/Intrinsic 与共享 lowering 作者 → FE
-  `query_execution/constant_eval.rs` 端口 → Execution `compiled_program/constant_node.rs` 单节点入口，
+  `query_execution/constant_eval.rs` 端口 → `novarocks/expression/src/evaluator/constant_node.rs` 单节点入口，
   复用 `guarded::Frame` 和 Functions 的实际计算。原 admitted CV 与 canonical runtime 参数分开保留。
   同形常量规范化保留原 pool/ordinal 与实际 creator；source custody 按真实 Arrow 子树的
   geometry/validity 预检并续接。根无 Buffer 不代表后代无 Buffer；来源持有不授予容量。
   控制结果的 carrier 准入、精确宽度/NULL 与布局预检共用 Functions `control_values.rs` 和
   `selected_copy` 作者；`FixedSizeBinary` 保持原宽度字节，不重解释成整数或变长 Binary。
   有符号 IN helper/recipe 在 `novarocks/functions/src/native_inlist.rs`；UTF8 借用比较在
-  `compiled_program/utf8_inlist.rs`。不得恢复旧 evaluator 或用函数名重建调用。
+  `novarocks/expression/src/evaluator/utf8_inlist.rs`。不得恢复旧 evaluator 或用函数名重建调用。
 
 - Iceberg UPDATE 与所有 MERGE 形状在原 v3/类型/ref 准入后只走 MOR，legacy write-mode
   属性不选算法。Provider 同一作者签发规范输入 W 与可选完整存储 T；仅对应 T 的 plain
@@ -393,6 +412,13 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
   核心契约见 [ADR-0208](docs/adr/ADR-0208-logical-write-counts-and-strict-stream-delivery.md)，
   冻结放置与装配见 [ADR-0206](docs/adr/ADR-0206-frozen-write-placement-and-task-completion-assembly.md)，
   类型化种类、作者单位与逐种类完成见 [ADR-0222](docs/adr/ADR-0222-typed-task-summaries-and-per-kind-completion.md)。
+
+- `novarocks/execution/src/exec/operators/{write_layout_key,write_spread}.rs`
+  分区亲和边的发送算子向已绑定 Provider 求分区键，Execution 按目的 Task 与发送端实际 DOP 扩散热点。
+  `routing_only` 键穿过 `NativeHierarchicalV1` 的实例级及 driver 级 hash，接收端在本地交换后将它剥离。
+  `ByKey` 的输入和归属契约仍由原作者校验。writer 队列的空位准入、软占用阈值与真实 tracker
+  见 `exec/pipeline/async_writer.rs`，TableWriter multiplex 的单行分帧另行生效。
+  见 [ADR-0235](docs/adr/ADR-0235-iceberg-write-layout-and-data-plane-capacity.md)。
 
 - `novarocks/execution/src/exec/pipeline/driver.rs`
   Driver execution logic.
@@ -538,12 +564,27 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
   CREATE / ALTER ADD 在所有格式版本递归拒绝新 Variant 列；已有表的 DELETE、合法普通键 equality delete、
   TRUNCATE 与普通 metadata 修改保留原边界。schema ALTER 先在同一代 generation pin 做 Provider 纯准入，再执行原 MV / DROP 保护。
 
-  Iceberg 提交契约见 [ADR-0171](docs/adr/ADR-0171-commit-operation-model.md)。修改前先读：
-  - `novarocks/connector/iceberg/src/commit/model/**`：不可变意图、逻辑条目与物理对象身份、继承字段、冻结请求及发布/清理结果。
+  分区亲和配方与求值器在 `commit/partition_key.rs`，用同一写出适配和 SDK 分区变换。
+  `commit/write_stack/control.rs` 冻结成形设置，`commit/data_writer/streaming.rs` 与
+  `commit/data_writer/staged_paths.rs` 保管 rolling writer、闲置关闭与每文件成功写出字节。
+  `commit/write_stack/execution.rs` 向原 Task 账本预留尚未落盘的 Parquet 编码估计。
+  写集载体与解码对象沿 FE Internal 结果窗口计费。紧凑条目承接解码回执，
+  索引键、删除效果与转换并存峰沿同一作者申请。回执随实际保管退出。
+  根结果 32 MiB 分帧仍由原载体约束。文件政策与容量作者见
+  [ADR-0235](docs/adr/ADR-0235-iceberg-write-layout-and-data-plane-capacity.md)。
+
+  Iceberg 意图、依赖与字段契约见 [ADR-0171](docs/adr/ADR-0171-commit-operation-model.md)，产物责任、复用与有界发布事实见 [ADR-0234](docs/adr/ADR-0234-operation-owned-artifacts-and-bounded-publication-facts.md)。
+  紧凑接收、滚动写出与条目覆盖见 [ADR-0239](docs/adr/ADR-0239-iceberg-compact-receiving-and-rolling-manifests.md)。
+  - `novarocks/connector/iceberg/src/commit/write_stack/receiving.rs` 保管所有 flavor 的接收状态。
+    `novarocks/connector/iceberg/src/commit/write_stack/receiving/validation.rs` 核对片段的准确身份与归属。
+    紧凑模式逐记录核对索引和删除效果，完整接收前没有新增 manifest。
+  - `novarocks/connector/iceberg/src/commit/new_manifests.rs` 消费 operation 的紧凑 stage，
+    按 spec 和内容类型顺序滚动写出并释放已写条目。首次完整核对条目覆盖，各轮保留 manifest 级核对。
+  - `novarocks/connector/iceberg/src/commit/model/**`：不可变意图、逻辑/物理身份与继承字段；对象来源、写入与退休状态、覆盖记录及准确发布引用分别保留。
   - `novarocks/connector/iceberg/src/commit/dependency/**`：按类别惰性读取 metadata、目标 ref 存活集和连续历史窗口，验证操作依赖。
   - `novarocks/connector/iceberg/src/commit/staging/**`：updates 前缀事实、ID 规范化、requirements 折算及 manifest-list 的实际 row-ID 分配。
-  - `novarocks/connector/iceberg/src/commit/attempt.rs`：加载、验证、准备、冻结、单次派发和确定冲突的重试。
-  - `novarocks/connector/iceberg/src/commit/operation.rs`：操作内 I/O 并发、先登记后写入、实际退出监督和有界 owned-object 清理。
+  - `novarocks/connector/iceberg/src/commit/attempt.rs`：同一 operation 的单次提交循环；加载、依赖验证、稳定 stage ID 核对、准备与覆盖断言、单次派发及确定冲突重试，循环内不删除产物。
+  - `novarocks/connector/iceberg/src/commit/operation.rs`：同一账本保管接管/自建对象、stage ID、按依据复用与不可逆退休；先登记后写入并等真实退出，终态按准确引用结清和并发删除，Unknown 与 ID 命中保留全部对象。
   - `novarocks/connector/iceberg/src/commit/write_stack/execution/cleanup.rs`：原 unsealed writer actor 持有准确 staged journal，首次清理启用现有 Provider 独立时间预算，保留原 scope、凭据与 I/O 能力；只在实际 DELETE 成功后移除原路径。Work 停止不取消已存在的清理义务，sealed 产物与 Unknown 仍保留原所有权及真实退出要求。
 
 - `novarocks/connector/paimon/**`
@@ -598,10 +639,10 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
 
 ### 5.3 Native Distributed Task Execution Path
 
-1. Query Application 的 `coordination/supervisor.rs` 统一预留 query 与 attempt 身份；
-   `novarocks/frontend-application/src/query_execution/logical_execution.rs` 从同一 reservation
-   续接原凭据与 attempt 责任。`native_execution_adapter.rs` 从一个实际 backend snapshot 冻结
-   Task graph；`novarocks/frontend-application/src/task_execution/graph.rs` mints a `TaskIdentity`
+1. Query Application 的 `coordination/supervisor.rs` 保留原 query 身份来源与安装前准备；
+   `novarocks/logical-execution-protocol/src/core.rs` 决定 activation、授权与恢复，FA installer
+   从同一 reservation 续接原凭据。`query_execution/native_execution_adapter.rs` 从准确 backend
+   snapshot 冻结 Task graph；`novarocks/frontend-application/src/task_execution/graph.rs` mints a `TaskIdentity`
    ({QueryExecutionId, StageId, TaskId, BackendProcessId}) per placement and a
    `ParticipationRef` ({QueryExecutionId, FrontendProcessId, BackendProcessId})
    per participating backend. A participation exists only where the scheduler placed
@@ -611,12 +652,13 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
    独立决定 source、各 writer route 和 finish 的实例集合；driver DOP 使用同一 query options
    冻结的域。manifest 从同一准确 placement 分别冻结 writer 与按种类的 summary-source Task 集合；
    各集合均属于原 Task graph，同一 Task 可承担多个种类，完成义务不能互相替代或跨 attempt 拼接。
-2. Query Application 的统一逻辑执行 owner 管理各分布式意图的恢复、结果与计算就绪；
-   Frontend Action 编排 prepare、领域 publication 和必要 finalize，Task 驱动只提供协议事实。
-   稳定 Source 在启动前接收原输入、同 Root 责任与访问能力，跨取消和 panic 保管原件；
-   业务 Ready、原 Future 的 poll/Drop 退出和 Unknown 库存的处置分别取证。
-   结构退役不代表整族 Native 通过；实际验证范围、原始失败与验收资格须独立核对。
-   ADR-0198 将内部计算就绪、publication、诊断和收敛分开；就绪不等于语句成功。
+2. 纯逻辑核心决定恢复、结果可见性与计算就绪，纯 attempt 核心推进 Task/Participation 协议；
+   Query Application 的监督执行器和注册表保同原 Native/Relay/Consumer/Governance 与退出。
+   Frontend Action 仍编排 prepare、领域 publication 和必要 finalize，FA 宿主只绑定原端口、
+   工作、回执与实际析构。稳定 Source 在启动前接过同 Root 责任和访问能力，借用取消不丢原件；
+   Ready、正常启动观察返回、原 F/captures 退出、Unknown 处置分别取证，机械 Closed 不当失败。
+   Stop/Cleanup 经端口交给 attempt 由它自己停止 Scope；子 Scope 只表达所有权与退休顺序。
+   ADR-0198 的就绪/publication 分离继续适用，三层分工见 ADR-0237；局部验证不证明整族原生通过。
    `novarocks/attempt-protocol/src/core.rs` drives Establish and Task creation.
    The Frontend host dispatches the original effects through the shared runtime,
    pays each send generation, and retains the actual work and results through exit.
@@ -672,6 +714,15 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
 
 - `Chunk`: `novarocks/execution/src/exec/chunk/chunk_impl.rs`
   Arrow `RecordBatch` wrapper with `slot_id -> column_index` mapping and memory accounting.
+
+- `BoundExprSet` / `ExprPort` / `ExprRoot` / `RootOrdinal`：
+  `novarocks/expression-contract/src/unit.rs`；端口声明精确输入，根声明定义、需求与作用域，
+  定义身份局限于单元。常量池在 `novarocks/constant-contract/src/pool_table.rs`，参数与求值区域
+  在 type-contract；它们是显式环境与结构事实，不授予运行能力。
+
+- `CompiledExprSet`：`novarocks/expression/src/compiled.rs`。
+  输入绑定使用作用域内的实际物理序号，作用域携带所有物理位置的完整类型。
+  LocalProgram 持有编译单元表，节点和 sink 以 `ProgramRootRef` 引用（单元、根）。
 
 - `LocalProgram`: `novarocks/local-program/src/**`
   纯 compiled program；Task 的 exchange、scan、writer 与 sink 能力在 BE preparation 另行绑定。
@@ -735,6 +786,13 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
 
 - `[iceberg]`
   Embedded-JVM toggle for Iceberg metadata-table and remote metadata planning.
+
+- Iceberg catalog 写入属性
+  `iceberg.max-partitions-per-writer` 为正 SQL INTEGER，默认 100。
+  catalog session 属性 `max_partitions_per_writer` 可在 1 到该值间覆盖。
+  `iceberg.target-max-file-size` 接受正字节数或带单位的大小，默认 1 GiB，
+  表属性 `write.target-file-size-bytes` 优先。表属性 `write.parquet.row-group-size-bytes` 默认 128 MiB。
+  这些属性经 catalog properties 与 FE 写会话冻结。示例见 `novarocks-catalogs.toml.example`。
 
 - `[standalone_server]`
   `trino_port`（默认 `8080`，`0` 由 OS 分配）、`trino_client_timeout_ms`（默认 `300000`）、
@@ -1113,11 +1171,13 @@ unless you edited them.
 |---|---|
 | `novarocks/sql/**` (parser, analyzer, optimizer, planner, function registry) | `-p novarocks-sql` |
 | `novarocks/execution/**` (operators, expressions, pipeline, exchange, runtime filter) | `-p novarocks-execution` |
+| `novarocks/expression/**` (pure unit compilation) | `-p novarocks-expression`，并按实际调用接缝选择 LocalCompiler、Execution 或 FE 必需常量 owner |
+| `novarocks/logical-execution-protocol/**` | `-p novarocks-logical-execution-protocol`; port or host changes also cover their actual AP/QA/FA consumers |
 | `novarocks/frontend-application/**`, `novarocks/query-application/**`, `novarocks/catalog-application/**` | that crate, plus `-p novarocks-worker -p novarocks-native-adapter` when the change crosses the FE/BE boundary |
 | `novarocks/worker/**`, `novarocks/native-adapter/**` | `-p novarocks-worker -p novarocks-native-adapter` |
 | `novarocks/connector/<name>/**` | that connector crate, plus `-p novarocks-fs` when authorized object-store access changes |
 | `novarocks/state-store/**` | the touched backend crate plus `-p novarocks-state-store-api` |
-| `novarocks/types/**`, `novarocks/spi/**`, `novarocks/execution-contract/**`, `novarocks/coordination-contract/**`, `novarocks/*-codec/**`, `novarocks/proto-models/**` | the whole workspace: a shared vocabulary or wire format has no bounded blast radius |
+| `novarocks/types/**`, `novarocks/spi/**`, `novarocks/execution-contract/**`, `novarocks/coordination-contract/**`, `novarocks/expression-contract/**`, `novarocks/*-codec/**`, `novarocks/proto-models/**` | the whole workspace: a shared vocabulary or wire format has no bounded blast radius |
 
 **SQL: choose suites from native declarations** and their generated map in
 `tests/sql/correctness/README.md`. Direct `--only <case>` is useful for diagnosis;
@@ -1158,37 +1218,54 @@ suspected case against a clean server before attributing it to the change.
 Where a Rust test lives, what it may depend on and who supplies its input are
 decided by the [Rust test organization guide](docs/guides/development/rust-test-organization.md).
 Existing neighbours predate it and are not examples. Before writing a test,
-answer its [placement procedure](docs/guides/development/rust-test-organization.md#放置判定程序):
+choose its layer ([layer selection](docs/guides/development/rust-test-organization.md#选层)):
+an end-to-end statement result belongs to the SQL suites and a single
+function's values to Functions. Then answer the
+[placement procedure](docs/guides/development/rust-test-organization.md#放置判定程序):
 
 1. Whose property does the assertion protect? The crate that must change when
-   it fails owns the test.
-2. Are all needed crates inside the owner's production dependency closure, a
-   testkit of that closure, or mechanical test support? A composition across two
-   crates with no production edge goes to a seam test package.
-3. Does it need private items? Yes: a white-box test file under `src/`. No:
-   `<crate>/tests/it`. A test that needs the crate's own testkit must be in
-   `tests/it`.
+   it fails owns the test. Judge each test function by the production entries
+   it calls, not by its file, file name or imports.
+2. Are all needed crates allowed? The owner may depend on its production
+   dependency closure, domain testkits of that closure, mechanical test support,
+   and the input-contract producers the guide lists for it (today only
+   Execution, which may use local-compiler and physical-plan). Across a
+   composition with no production edge, a test whose expectation is stated
+   against upstream raw input, such as SQL text evaluated in Execution, and
+   whose property the layer table assigns to the seam goes to the seam test
+   package (`tests/compile-to-execute`).
+3. Can the assertion and its input be expressed through the public API? Then
+   it is a public-contract test in `<crate>/tests/it`, the first choice. Only a
+   test that must observe an internal property, or whose input can only be
+   built through private items, stays white-box under `src/`, and it states
+   what it observes. Do not widen production visibility or add `*_for_test`
+   entries for the crate's own `tests/it`; a test that needs the crate's own
+   testkit must be in `tests/it`.
 4. Does it need a target-level property (custom harness, global allocator,
-   `required-features`, Loom, Miri, a binary-scoped nextest group)? Only then a
-   standalone integration target; a test that also needs private items stays
-   under `src/`.
-5. Does an existing subject file, in any layout, already cover this behaviour
-   axis? Add the case there; create a new file only when none fits.
+   `required-features`, or a build-wide mode such as Loom)? Only then a
+   standalone integration target, one per identical reason per crate; a test
+   that also needs private items stays under `src/`. nextest groups, timeouts
+   and Miri are selected by test name and are not target-level reasons.
+5. Does an existing subject file at the canonical location already cover this
+   behaviour axis? Add the case there; do not add cases to legacy-layout files.
 6. Where does the input come from? Take the nearest sufficient rung of the
-   fixture ladder.
+   fixture ladder. Support used by other crates' tests is exposed by its nature:
+   a development-cfg thin entry, a gated testkit module, or a testkit crate.
 
-The guide is in a trial period. Its
-[trial rules](docs/guides/development/rust-test-organization.md#试行期规则) constrain new tests:
+New tests must not add flat `foo_tests.rs` siblings, new
+`#[cfg(test)] mod xxx_tests;` lines in a production `mod.rs`,
+one-binary-per-file integration targets, or dev-dependencies outside the
+allowed set above.
 
-- Do not add flat `foo_tests.rs` siblings or new `#[cfg(test)] mod xxx_tests;`
-  lines in a production `mod.rs`.
-- Do not add one-binary-per-file integration targets; new public-contract tests
-  go to `tests/it`.
-- Do not add dev-dependencies outside the owner's production dependency closure.
-
-Adding cases to an existing flat test file is allowed, and existing tests are
-not migrated opportunistically. The guide wins where this summary and the guide
-differ.
+Existing tests are not migrated in batches. A change that alters the behaviour a
+legacy test protects, retires what it tests, or replaces it with new tests
+migrates that test in the same change, following
+[migrating existing tests](docs/guides/development/rust-test-organization.md#存量测试的迁移):
+judge it per test function, rewrite it onto the public entry where possible,
+delete the replaced test, and record, in the plan and the PR description,
+which test now asserts each protected property or which retirement ends it.
+Untouched legacy tests stay as they are. The guide wins where this summary and
+the guide differ.
 
 ## 9. Suggested Starting Points for Typical Changes
 
@@ -1211,6 +1288,13 @@ differ.
   保留 facade，`contract_lowering.rs` 在冻结前解除可选 RF 等待或准确拒绝必需数据环。
   FrozenPlan 验证使用同一作者重新核对实际 activation，不静默解除等待；观察式入口的图阶段
   沿原调用者 checkpoint，不能回落到 plain 验证或宣称其他 legacy 验证遍历也已受控。
+- **表达式单元契约/编译**：先读
+  [ADR-0238](docs/adr/ADR-0238-self-contained-expression-units-and-explicit-environments.md)，
+  从 `novarocks/expression-contract/src/{unit,builder,claims,request}.rs` 开始，编译入口在
+  `novarocks/expression/src/compiled.rs`。节点端口、根及关系站点由 physical-plan 核对。
+  SQL 降级期撰写调用声明，package 冻结和 BE 解码阶段只校验该原始事实。
+  `novarocks/frontend-application/src/query_execution/required_constant_eval.rs` 直接编译必需常量的
+  零端口单根单元，在同一原语句工作范围内求值。
 - **Package decode / compiled preparation**：从 `novarocks/plan-codec/src/physical_package_v2/**`、
   `novarocks/native-adapter/src/backend_task_execution/{compiled_package.rs,execution_host.rs}`
   与 `novarocks/local-compiler/src/**` 开始；Task 能力投影见 `compiled_scan_binding.rs`、
@@ -1234,8 +1318,21 @@ differ.
   and Trino success/error projection; consult ADR-0198 and ADR-0217 before changing these boundaries.
   资源修改沿原 worker、Transport 与结果预算 owner；保留 typed Source、完整 D 和实际退出证据。
   局部组件通过不证明原生调用面或最终全工作区验证完成。
+- **Iceberg 数据文件成形与写集容量**见
+  [ADR-0235](docs/adr/ADR-0235-iceberg-write-layout-and-data-plane-capacity.md)。
+  路由从 Provider `commit/partition_key.rs` 到 SQL `planner/distributed/build/contract_lowering.rs`，
+  在 LocalCompiler `lowering.rs` 冻结局部布局，由 Native Adapter `compiled_writer_binding.rs` 绑定执行能力，
+  由 Execution 的 `write_layout_key.rs`、`write_spread.rs` 与原写入交换消费。
+  配置和 writer 生命周期见 Iceberg `catalog_config.rs`、`commit/write_stack/{control,execution}.rs`。
+  FE 回执见 `novarocks/frontend-application/src/query_execution/write_result.rs` 与
+  `novarocks/frontend-application/src/query_execution/write_session/computation.rs`。
+  写集回执、operation 账本及建表回执附件各自保留真实所有权和退出边界。
+
 - **Iceberg 提交、冲突与清理**：从 `novarocks/connector/iceberg/src/commit/{model,dependency,staging}/**`、
   `commit/attempt.rs`、`commit/operation.rs` 和 `commit/write_stack/control/publication.rs` 开始。
+  紧凑接收先读 [ADR-0239](docs/adr/ADR-0239-iceberg-compact-receiving-and-rolling-manifests.md)，
+  对照 `novarocks/connector/iceberg/src/commit/write_stack/receiving.rs` 的交接与
+  `novarocks/connector/iceberg/src/commit/new_manifests.rs` 的 stage 持有、滚动写出和沿用。
   单次派发结论由 `commit/attempt/observation.rs` 的 journal 拥有，prepared owner 在 `catalog/publication_dispatch.rs`；冻结恢复载荷与桥接证据在 `commit/recovery.rs`、
   `commit/attempt/observation.rs`；CTAS 完整 CREATE 请求在 `catalog_control/staged_create/publication.rs`。
   读 [ADR-0171](docs/adr/ADR-0171-commit-operation-model.md)、[ADR-0179](docs/adr/ADR-0179-iceberg-publication-lifecycle-and-evidence.md) 与 [ADR-0198](docs/adr/ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md) 后再改身份、字段继承、派发或清理授权。
@@ -1264,19 +1361,22 @@ differ.
   business-gate and async background custody. Provider publication, Current projection,
   cumulative effect, necessary finalization and physical retirement retain separate facts.
   MV query rewrite is an optimizer concern under `novarocks/sql/src/optimizer/**`.
-- **Native distributed task execution**: start with the common execution owner in
-  `novarocks/query-application/src/coordination/**` and the minimal boundary in
-  `novarocks/coordination-contract/**` (minimal neutral facts; ADR-0198), then inspect
-  `novarocks/frontend-application/src/query_execution/native_execution_adapter.rs`,
-  `novarocks/attempt-protocol/src/**`,
-  `novarocks/frontend-application/src/task_execution/{bridge,host}/**`,
-  `novarocks/worker-protocol/src/**`, `novarocks/worker/src/control_runtime/**`,
-  `novarocks/control-runtime{,-core}/src/**`,
-  `novarocks/native-adapter/src/{backend_application,task_protocol}.rs`, and
-  `novarocks/execution/src/task_execution/**`. Preserve the Installed/normal-close
-  gated edge-open barrier and the per-domain Apply / Idempotent / Older /
-  Conflict verdict; do not add a protocol shim, a standalone direct-call path,
-  or a no-runtime-filter retry inside an attempt. See ADR-0161.
+- **Native distributed task execution**: 先读
+  `novarocks/logical-execution-protocol/src/**` 的逻辑授权/恢复政策、
+  `novarocks/attempt-protocol/src/**` 的单次协议与 `novarocks/coordination-contract/src/**` 的被动消息；
+  QA 的 `novarocks/query-application/src/coordination/{supervisor,runtime_registry}.rs` 与
+  `coordination/executor/**` 只准备、安装、监督执行并保原注册/退出。FA 的
+  `novarocks/frontend-application/src/control_runtime/logical/**`、
+  `novarocks/frontend-application/src/task_execution/host/port/**` 和
+  `novarocks/frontend-application/src/query_execution/native_execution_adapter.rs` 持原链接、
+  端口与受控 I/O/析构。随后看 `novarocks/worker/src/control_runtime/**`、
+  `novarocks/control-runtime/src/**`、`novarocks/control-runtime-core/src/**`、
+  `novarocks/native-adapter/src/task_protocol.rs` 与 `novarocks/execution/src/runtime/task/**`。
+  保持 Installed/normal-close 的准确 edge-open 门与各域 Apply/Idempotent/Older/Conflict；
+  不能恢复桥、第二 owner 或 standalone direct-call。共享运行时不承载领域决定，宿主 failure cut
+  冻结一次且不续远端预算；见 ADR-0198、ADR-0230 与
+  [ADR-0237](docs/adr/ADR-0237-pure-logical-execution-and-original-host-custody.md)。
+
 - **Connector behavior**：读取 `novarocks/connector/**` 与 `novarocks/fs/**`。
   sealed manifest 注册 Iceberg 与 Paimon，Paimon 能力已暂停；
   恢复须待上游支持 Arrow 60 与 zstd 0.14，并满足 ADR-0138，见 ADR-0204。
@@ -1428,6 +1528,9 @@ Explicit required runs in the approved plan remain required.
 A plan task that adds Rust tests also states their placement: which existing
 subject file it extends, or why a new file is needed, following
 [test placement in plans](docs/guides/development/rust-test-organization.md#plan-中的测试落点).
+When the task changes legacy tests, the plan also lists which tests it migrates
+or deletes and, for each protected property, which test takes it over or which
+retirement ends it.
 
 Once execution starts, routine implementation difficulties are not reasons to
 stop; pause only for the major decision conditions defined by

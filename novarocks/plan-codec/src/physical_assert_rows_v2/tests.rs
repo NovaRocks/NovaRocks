@@ -247,6 +247,7 @@ fn assert_ordinary_prefix<T>(
 
 fn source(spec: p::RowCountAssertionSpec) -> p::PhysicalNode {
     p::PhysicalNode {
+        expressions: None,
         id: p::NodeId::new(u32::MAX),
         inputs: Box::from([p::NodeId::new(0)]),
         required_inputs: Box::from([required_property()]),
@@ -288,6 +289,7 @@ fn keyed() -> p::PhysicalNode {
 }
 fn expected(kind: wire::row_count_assertion_node::Kind) -> wire::PhysicalNode {
     wire::PhysicalNode {
+        expressions: None,
         id: u32::MAX,
         input_node_ids: vec![0],
         required_inputs: vec![expected_required_property()],
@@ -431,6 +433,7 @@ fn original_fragment_constructor_remains_the_semantic_owner_after_receiving() {
         };
     }
     let child = p::PhysicalNode {
+        expressions: None,
         id: p::NodeId::new(0),
         inputs: Box::default(),
         required_inputs: Box::default(),

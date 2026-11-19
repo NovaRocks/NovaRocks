@@ -54,6 +54,7 @@ fn make_test_operator(fixture: &Fixture) -> DataStreamSinkOperator {
         pending_bytes_per_dest: Vec::new(),
         pending_payloads_per_dest: Vec::new(),
         max_transmit_batched_bytes: 1,
+        max_unit_payload_bytes: novarocks_execution_contract::native_result_support::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES,
         finished: AtomicBool::new(false),
         aborting: AtomicBool::new(false),
         finishing: AtomicBool::new(false),
@@ -1350,6 +1351,110 @@ fn split_oversized_chunks_passes_small_chunks_through_unchanged() {
 }
 
 #[test]
+fn split_target_follows_a_unit_bound_below_the_memory_granularity() {
+    let fixture = Fixture::new();
+    let mut op = make_test_operator(&fixture);
+    op.input.destinations = vec![make_test_destination(&fixture)];
+    prepare_test_operator(&fixture, &mut op);
+    op.max_unit_payload_bytes = 1024;
+    op.buffer_chunk(typed_int64_chunk(10_000)).unwrap();
+    assert!(op.pending_chunk_count_total() > 1);
+    let rows: usize = op.pending_per_dest[0].iter().map(|chunk| chunk.len()).sum();
+    assert_eq!(rows, 10_000);
+}
+
+fn decoded_int64_rows(sink: &DataStreamSinkOperator, payload: &[u8]) -> Vec<i64> {
+    let sample = typed_int64_chunk(1);
+    let schema = std::sync::Arc::new(sample.chunk_schema().clone());
+    crate::runtime::exchange::online_unit::decode(
+        sink.recipe.as_deref().expect("prepared recipe"),
+        payload,
+        &schema,
+        sink.construction_factory.as_ref().unwrap().as_ref(),
+    )
+    .expect("encoded exchange payload")
+    .into_iter()
+    .flat_map(|chunk| {
+        chunk
+            .record_batch()
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .expect("int64 column")
+            .values()
+            .to_vec()
+    })
+    .collect()
+}
+
+fn prepared_destination(fixture: &Fixture) -> DataStreamSinkOperator {
+    let mut op = make_test_operator(fixture);
+    gate_destinations(&mut op, vec![make_test_destination(fixture)]);
+    prepare_test_operator(fixture, &mut op);
+    open_edges(&op, &[edge_id(1)]);
+    op
+}
+
+#[test]
+fn encoded_multirow_over_the_unit_bound_is_split_in_order_without_consuming_a_sequence() {
+    use novarocks_execution_contract::ordered_retained_stream::exchange::ExchangeUnitItem;
+    let one_row = {
+        let fixture = Fixture::new();
+        let mut probe = prepared_destination(&fixture);
+        probe.buffer_chunk(typed_int64_chunk(1)).unwrap();
+        probe.flush_pending(true).unwrap();
+        let frames = fixture.transport().frames();
+        assert_eq!(frames.len(), 1);
+        frames[0].receiver.payload.len()
+    };
+    let many_rows = {
+        let fixture = Fixture::new();
+        let mut wide = prepared_destination(&fixture);
+        wide.buffer_chunk(typed_int64_chunk(32)).unwrap();
+        wide.flush_pending(true).unwrap();
+        let frames = fixture.transport().frames();
+        assert_eq!(frames.len(), 1);
+        frames[0].receiver.payload.len()
+    };
+    assert!(many_rows > one_row);
+
+    let fixture = Fixture::new();
+    let mut sink = prepared_destination(&fixture);
+    sink.max_unit_payload_bytes = many_rows - 1;
+    sink.buffer_chunk(typed_int64_chunk(32)).unwrap();
+    sink.flush_pending(true).unwrap();
+    let frames = fixture.transport().frames();
+    assert!(
+        frames.len() > 1,
+        "encoded payload must be split across units"
+    );
+    let mut rows = Vec::new();
+    for (index, frame) in frames.iter().enumerate() {
+        match frame.receiver.item {
+            ExchangeUnitItem::Unit { demand, .. } => {
+                assert_eq!(demand.sequence.get(), (index + 1) as u64);
+                assert!(frame.receiver.payload.len() <= sink.max_unit_payload_bytes);
+                rows.extend(decoded_int64_rows(&sink, &frame.receiver.payload));
+            }
+            ExchangeUnitItem::End(_) => panic!("data flush must not emit End"),
+        }
+    }
+    assert_eq!(rows, (0..32).collect::<Vec<_>>());
+
+    let fixture = Fixture::new();
+    let mut sink = prepared_destination(&fixture);
+    sink.max_unit_payload_bytes = one_row - 1;
+    sink.buffer_chunk(typed_int64_chunk(1)).unwrap();
+    let error = sink.flush_pending(true).unwrap_err();
+    use novarocks_failure_contract::FailureProjection;
+    assert_eq!(
+        error.failure_fact().class(),
+        novarocks_failure_contract::FailureClass::Resource
+    );
+    assert!(fixture.transport().frames().is_empty());
+}
+
+#[test]
 fn split_oversized_chunks_slices_large_chunk_into_pieces_with_row_count_preserved() {
     // 10_000 int64 rows ≈ 80 KiB in-memory. Slice at a 8 KiB target. The
     // sliced chunks share the underlying Arrow buffers and therefore
@@ -1512,6 +1617,7 @@ mod typed_sender_header_tests {
         let out = split_oversized_chunks_with_creation(
             vec![source.clone()],
             1,
+            None,
             sink.construction_factory.as_ref().unwrap().as_ref(),
         )
         .unwrap();
@@ -1549,6 +1655,7 @@ mod typed_sender_header_tests {
         let out = split_oversized_chunks_with_creation(
             vec![source.clone()],
             1,
+            None,
             sink.construction_factory.as_ref().unwrap().as_ref(),
         )
         .unwrap();
@@ -1701,6 +1808,7 @@ mod typed_sender_header_tests {
         let refusal = split_oversized_chunks_with_creation(
             vec![source.clone()],
             1,
+            None,
             sink.construction_factory.as_ref().unwrap().as_ref(),
         )
         .err()
@@ -1767,6 +1875,7 @@ mod conditional_compiled_selection {
     use super::*;
     use arrow::{array::Int64Array, record_batch::RecordBatch};
     use novarocks_connector_contract::PureProviderProgramCatalog;
+    use novarocks_expression_contract::{BinaryOperator, ExprKind, RootScope};
     use novarocks_functions::{
         ConstantPolicy, EngineFunctionCatalogBuilder, FunctionKind, InstalledPureKernel,
         PureImplementationDeclaration, PureImplementationId, PureKernelAbi,
@@ -1774,21 +1883,17 @@ mod conditional_compiled_selection {
     use novarocks_local_compiler::{
         LocalCompileOptions, compile_fragment, validate_fragment_providers,
     };
-    use novarocks_local_program::{KernelAbiVersion, ProgramNodeExpressionRole, ProgramNodeId};
+    use novarocks_local_program::{KernelAbiVersion, ProgramNodeKind, ProgramRootRef};
     use novarocks_physical_plan::{
-        BinaryOperator, ConstantPools, ExprId, ExprKind, Fragment, FragmentBuilder, FragmentCuts,
-        FragmentId, FragmentPackage, FragmentPackageAdmission, FragmentPackageInput, FragmentSink,
-        FrozenFragmentCalls, FrozenFragmentPruning, LiteralValue, NodeId, PhysicalExpressionRoots,
-        PhysicalRootUses, PipelineDopDomain, PlanLimits, PlanVersionId,
+        FragmentCuts, FragmentId, FragmentPackage, FragmentPackageAdmission, FragmentPackageInput,
+        FragmentSink, FrozenFragmentPruning, NodeId, PipelineDopDomain, PlanLimits, PlanVersionId,
         PropertyProofProjectionLimits, RequiredContracts, ResultField, ResultPort,
         ResultValueDomain, StagePlacementPolicy, ValueId, ValueOrigin,
     };
     use novarocks_type_contract::{
-        CompileControlError, CompilePhase, ControlShape, DecimalOverflowPolicy, EvaluationDemand,
-        EvaluationDomainId, ExpressionControlFlow, ExpressionEffectContext,
-        ExpressionEvaluationDomain, ExpressionInvocation, ExpressionUseId, FunctionValueType,
-        PureCompileControl, SemanticParameterId, SemanticParameterKey, SemanticParameterRef,
-        SemanticParameterValue, SemanticParameters,
+        CompileControlError, CompilePhase, DecimalOverflowPolicy, EvaluationDemand,
+        FunctionValueType, PureCompileControl, SemanticParameterId, SemanticParameterKey,
+        SemanticParameterRef, SemanticParameterValue, SemanticParameters,
     };
     use std::{collections::BTreeMap, num::NonZeroUsize};
 
@@ -1799,61 +1904,49 @@ mod conditional_compiled_selection {
         }
     }
 
-    fn root(expression: u32) -> ProgramExpressionRootSite {
-        ProgramExpressionRootSite::Node {
-            node: ProgramNodeId::new(2),
-            role: ProgramNodeExpressionRole::ProjectOutput { expression },
-        }
-    }
-
-    fn visit(
-        fragment: &Fragment,
-        definition: ExprId,
-        demand: EvaluationDemand,
-        ordered: &mut Vec<ExpressionInvocation<ExprId>>,
-    ) -> ExpressionUseId {
-        let arguments = match &fragment.expressions().get(definition).unwrap().kind {
-            ExprKind::Binary { left, right, .. } => [*left, *right]
-                .into_iter()
-                .map(|child| visit(fragment, child, EvaluationDemand::Value, ordered))
-                .collect::<Vec<_>>(),
-            ExprKind::Value(_) | ExprKind::Literal(LiteralValue::Null) => Vec::new(),
-            other => panic!("unexpected conditional exchange fixture expression: {other:?}"),
+    fn root(program: &LocalProgram, expression: usize) -> ProgramRootRef {
+        let ProgramNodeKind::Project { exprs, .. } =
+            program.graph().nodes()[program.graph().root().index()].kind()
+        else {
+            panic!("actual conditional fixture output Project");
         };
-        let use_id = ExpressionUseId::new(u32::try_from(ordered.len()).unwrap());
-        ordered.push(ExpressionInvocation {
-            context: ExpressionEffectContext {
-                use_id,
-                domain: EvaluationDomainId::new(0),
-                demand,
-            },
-            definition,
-            control: ControlShape::Eager,
-            arguments: arguments.into_boxed_slice(),
-        });
-        use_id
+        exprs[expression]
     }
 
     fn program() -> Arc<LocalProgram> {
+        let fixture_sources =
+            crate::exec::operators::family_fixture::constant_sources::Sources::new();
+
         let fragment_id = FragmentId::new(219);
         let source = NodeId::new(10);
         let input = NodeId::new(20);
         let output = NodeId::new(30);
         let integer = FunctionValueType::new(DataType::Int64, true);
         let boolean = FunctionValueType::new(DataType::Boolean, true);
-        let mut builder = FragmentBuilder::new(fragment_id);
+        let mut builder =
+            crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+                fragment_id,
+                &fixture_sources,
+            );
         builder
             .add_values(source, Box::from([Box::default()]), Box::default())
             .unwrap();
         let mut inputs = Vec::new();
         for ty in [&integer, &integer, &boolean] {
-            let expr = builder
-                .add_expression(input, ty.clone(), ExprKind::Literal(LiteralValue::Null))
+            let expr = builder.constant(
+                input,
+                ty.clone(),
+                crate::exec::operators::family_fixture::constant_sources::null(),
+            );
+            let root = builder
+                .unit(input)
+                .unwrap()
+                .root(expr, EvaluationDemand::Value, RootScope::Port(0))
                 .unwrap();
             let value = builder
-                .add_value(ty.clone(), ValueOrigin::Expr { node: input, expr })
+                .add_value(ty.clone(), ValueOrigin::Expr { node: input, root })
                 .unwrap();
-            inputs.push((expr, value));
+            inputs.push((root, value));
         }
         let input_ids = inputs.iter().map(|(_, id)| *id).collect::<Vec<ValueId>>();
         builder
@@ -1865,18 +1958,24 @@ mod conditional_compiled_selection {
             )
             .unwrap();
         let left = builder
-            .add_expression(output, integer.clone(), ExprKind::Value(input_ids[0]))
+            .unit(output)
+            .unwrap()
+            .add(None, integer.clone(), ExprKind::Value(input_ids[0]))
             .unwrap();
         let right = builder
-            .add_expression(output, integer.clone(), ExprKind::Value(input_ids[1]))
+            .unit(output)
+            .unwrap()
+            .add(None, integer.clone(), ExprKind::Value(input_ids[1]))
             .unwrap();
         let parameter = SemanticParameterRef {
             id: SemanticParameterId::new(0),
             expected_key: SemanticParameterKey::AllowThrowException,
         };
         let key = builder
-            .add_expression(
-                output,
+            .unit(output)
+            .unwrap()
+            .add(
+                None,
                 integer.clone(),
                 ExprKind::Binary {
                     op: BinaryOperator::Add,
@@ -1888,15 +1987,22 @@ mod conditional_compiled_selection {
             )
             .unwrap();
         let applies = builder
-            .add_expression(output, boolean.clone(), ExprKind::Value(input_ids[2]))
+            .unit(output)
+            .unwrap()
+            .add(None, boolean.clone(), ExprKind::Value(input_ids[2]))
             .unwrap();
         let mut outputs = Vec::new();
         let mut fields = Vec::new();
         for (expr, ty, name) in [(key, integer, "key"), (applies, boolean, "applies")] {
-            let value = builder
-                .add_value(ty.clone(), ValueOrigin::Expr { node: output, expr })
+            let root = builder
+                .unit(output)
+                .unwrap()
+                .root(expr, EvaluationDemand::Value, RootScope::Port(0))
                 .unwrap();
-            outputs.push((expr, value));
+            let value = builder
+                .add_value(ty.clone(), ValueOrigin::Expr { node: output, root })
+                .unwrap();
+            outputs.push((root, value));
             fields.push(ResultField {
                 domain: ResultValueDomain::Plain,
                 name: name.into(),
@@ -1914,6 +2020,7 @@ mod conditional_compiled_selection {
                 output_ids.into_boxed_slice(),
             )
             .unwrap();
+        crate::exec::operators::family_fixture::seal_no_call_units(&mut builder);
         let fragment = builder
             .finish_definition(
                 output,
@@ -1926,33 +2033,7 @@ mod conditional_compiled_selection {
                 StagePlacementPolicy::Singleton,
             )
             .unwrap();
-        let roots = PhysicalExpressionRoots::try_new(&fragment, &FixtureControl).unwrap();
-        let mut ordered = Vec::new();
-        let bindings = roots
-            .sites()
-            .iter()
-            .map(|(site, expression)| {
-                (
-                    *site,
-                    visit(&fragment, expression.expr, expression.demand, &mut ordered),
-                )
-            })
-            .collect();
-        let flow = ExpressionControlFlow::try_new(
-            vec![ExpressionEvaluationDomain {
-                id: EvaluationDomainId::new(0),
-                parent: None,
-                guard: None,
-            }],
-            ordered,
-            fragment.expressions(),
-            CompilePhase::Validate,
-            &FixtureControl,
-        )
-        .unwrap();
-        let uses = PhysicalRootUses::try_new(&fragment, flow, bindings, &FixtureControl).unwrap();
-        let calls =
-            FrozenFragmentCalls::try_new(&fragment, &uses, vec![], &FixtureControl).unwrap();
+        let (fragment, constants) = fragment.into_parts();
         let result = ResultPort {
             scalar_schema: None,
             fragment: fragment_id,
@@ -1964,10 +2045,10 @@ mod conditional_compiled_selection {
                 FragmentPackageInput {
                     version: PlanVersionId::try_new([219; 16]).unwrap(),
                     required: RequiredContracts::default(),
-                    constants: ConstantPools::empty(),
+                    constants,
                     fragment,
-                    expression_uses: uses,
-                    calls,
+                    statement_constant_policy:
+                        crate::exec::operators::family_fixture::constant_policy(),
                     pruning: FrozenFragmentPruning::try_new(fragment_id, vec![], &FixtureControl)
                         .unwrap(),
                     cuts: FragmentCuts::default(),
@@ -1980,6 +2061,7 @@ mod conditional_compiled_selection {
                     scans: BTreeMap::new(),
                     writes: BTreeMap::new(),
                     annotations: Box::default(),
+                    layouts: Default::default(),
                 },
                 // Explicit bounded fixture invoices; no production defaults.
                 FragmentPackageAdmission {
@@ -2083,8 +2165,10 @@ mod conditional_compiled_selection {
 
     fn sink(fixture: &Fixture, program: Arc<LocalProgram>) -> DataStreamSinkOperator {
         let mut sink = make_test_operator(fixture);
+        let key = root(&program, 0);
+        let applies = root(&program, 1);
         sink.compiled_partition = Some(CompiledPartitionState {
-            keys: CompiledPartitionKeys::conditional(program, vec![root(0)], root(1)),
+            keys: CompiledPartitionKeys::conditional(program, vec![key], applies),
             instances: None,
             applicability_instances: None,
         });
@@ -2119,10 +2203,10 @@ mod conditional_compiled_selection {
         let mut full_sink = sink(&fixture, program.clone());
         let mut instances = None;
         let control = full_sink.compiled_control.as_ref().unwrap();
-        compiled_instances(&mut instances, &program, &[root(0)], control).unwrap();
+        compiled_instances(&mut instances, &program, &[root(&program, 0)], control).unwrap();
         let error = evaluate_all(
             &mut instances.as_mut().unwrap()[0],
-            root(0),
+            root(&program, 0),
             chunk.record_batch(),
             control,
         )

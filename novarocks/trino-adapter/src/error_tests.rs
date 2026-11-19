@@ -455,6 +455,41 @@ fn execution(reason: QueryFailureReason) -> QueryExecutionError {
     ))
 }
 #[test]
+fn open_iceberg_partition_limit_projects_the_typed_counts() {
+    use novarocks_failure_contract::{
+        FailureClass, FailureFact, ResourceDimension, ResourceFacts, ResourceScope,
+        connector_reason::ICEBERG_TOO_MANY_OPEN_PARTITIONS,
+    };
+    let fact = FailureFact::new(FailureClass::Resource, ICEBERG_TOO_MANY_OPEN_PARTITIONS)
+        .with_resource(ResourceFacts {
+            request_scope: Some(ResourceScope::Request),
+            constraint_scope: Some(ResourceScope::Operator),
+            dimension: ResourceDimension::Items,
+            requested: Some(4),
+            required_growth: Some(1),
+            limit: Some(3),
+            live: Some(3),
+            committed: None,
+        });
+    let error = QueryExecutionError::from_execution(ExecutionFailureInput::new(
+        fact,
+        SafeDetail::truncating("diagnostic detail irrelevant to Trino presentation"),
+        ExecutionFailureSite::Coordinator,
+    ));
+    let projected = query_error(TrinoErrorSource::Execution {
+        error: &error,
+        sql: "INSERT INTO t VALUES (1)",
+    });
+    assert_eq!(projected.error_code, 0x0504_0002);
+    assert_eq!(projected.error_name, "ICEBERG_TOO_MANY_OPEN_PARTITIONS");
+    assert_eq!(projected.error_type, "USER_ERROR");
+    assert_eq!(
+        projected.message,
+        "Exceeded limit of 3 open writers for partitions: 4"
+    );
+}
+
+#[test]
 fn execution_facts_retain_their_class_before_dependency_refinement() {
     for (reason, expected) in [
         (QueryFailureReason::BackendLost, "REMOTE_HOST_GONE"),

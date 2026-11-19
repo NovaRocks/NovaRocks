@@ -128,14 +128,20 @@ fn all_six_parameter_variants_preserve_raw_values_and_oneof_presence() {
 
 #[test]
 fn all_nine_effect_fields_higher_order_channels_and_both_proof_scopes_survive() {
-    let value = effects(v2::proof_scope::Kind::DomainId(0));
+    let value = effects(v2::proof_scope::Kind::RegionId(0));
     roundtrip(&value);
     let unconditional = effects(v2::proof_scope::Kind::Unconditional(control::Empty {}));
     roundtrip(&unconditional);
     assert_ne!(value.encode_to_vec(), unconditional.encode_to_vec());
-    let max_domain = effects(v2::proof_scope::Kind::DomainId(u32::MAX));
-    roundtrip(&max_domain);
-    assert_ne!(value.encode_to_vec(), max_domain.encode_to_vec());
+    let relation = effects(v2::proof_scope::Kind::Relation(v2::RelationEffectId {
+        call_id: Some(0),
+        role: v2::RelationEffectRole::Call as i32,
+    }));
+    roundtrip(&relation);
+    assert_ne!(value.encode_to_vec(), relation.encode_to_vec());
+    let max_region = effects(v2::proof_scope::Kind::RegionId(u32::MAX));
+    roundtrip(&max_region);
+    assert_ne!(value.encode_to_vec(), max_region.encode_to_vec());
     let descriptor = pool()
         .get_message_by_name("novarocks.physical_semantics_v2.CallEffects")
         .unwrap();
@@ -166,6 +172,7 @@ fn all_nine_effect_fields_higher_order_channels_and_both_proof_scopes_survive() 
         v2::SimpleArgumentControl::Aggregate,
         v2::SimpleArgumentControl::Window,
         v2::SimpleArgumentControl::Table,
+        v2::SimpleArgumentControl::NoArguments,
     ] {
         roundtrip(&v2::ArgumentControl {
             kind: Some(v2::argument_control::Kind::Simple(simple as i32)),
@@ -191,7 +198,7 @@ fn six_typed_sites_and_context_references_preserve_zero_max_and_absence() {
         call: u32::MAX,
     };
     let sites = [
-        Kind::ExpressionUseId(0),
+        Kind::Window(node),
         Kind::Aggregate(node),
         Kind::TopNState(node),
         Kind::WriterPartial(node),
@@ -202,29 +209,33 @@ fn six_typed_sites_and_context_references_preserve_zero_max_and_absence() {
         entries: sites
             .into_iter()
             .enumerate()
-            .map(|(ordinal, site)| v2::FrozenCall {
-                materialized_writer_input: None,
-                regexp_count_pattern_source: None,
-                to_base64_byte_source: None,
-                temporal_source: None,
-                site: Some(v2::CallSite { kind: Some(site) }),
-                context: Some(v2::EffectContext {
-                    use_id: Some(if ordinal == 0 { 0 } else { u32::MAX }),
-                    domain_id: Some(if ordinal == 0 { u32::MAX } else { 0 }),
-                    demand: if ordinal == 0 {
-                        control::EvaluationDemand::TruthOnly
+            .map(|(ordinal, site)| {
+                let identity = v2::RelationEffectId {
+                    call_id: Some(if ordinal == 0 { 0 } else { u32::MAX }),
+                    role: v2::RelationEffectRole::Call as i32,
+                };
+                v2::FrozenCall {
+                    site: Some(v2::CallSite { kind: Some(site) }),
+                    relation_context: Some(v2::RelationEffectContext {
+                        identity: Some(identity),
+                        demand: control::EvaluationDemand::Value as i32,
+                    }),
+                    materialized_input: matches!(ordinal, 3 | 4).then_some(
+                        v2::RelationEffectContext {
+                            identity: Some(v2::RelationEffectId {
+                                role: v2::RelationEffectRole::MaterializedInput as i32,
+                                ..identity
+                            }),
+                            demand: control::EvaluationDemand::Value as i32,
+                        },
+                    ),
+                    effects: Some(effects(v2::proof_scope::Kind::Relation(identity))),
+                    decimal_overflow_policy: Some(if ordinal % 2 == 0 {
+                        v2::DecimalOverflowPolicy::OutputNull
                     } else {
-                        control::EvaluationDemand::Value
-                    } as i32,
-                }),
-                effects: Some(effects(v2::proof_scope::Kind::Unconditional(
-                    control::Empty {},
-                ))),
-                decimal_overflow_policy: Some(if ordinal % 2 == 0 {
-                    v2::DecimalOverflowPolicy::OutputNull
-                } else {
-                    v2::DecimalOverflowPolicy::ReportError
-                } as i32),
+                        v2::DecimalOverflowPolicy::ReportError
+                    } as i32),
+                }
             })
             .collect(),
     };
@@ -241,6 +252,7 @@ fn six_typed_sites_and_context_references_preserve_zero_max_and_absence() {
             .count(),
         6
     );
+    assert!(descriptor.reserved_ranges().any(|range| range.contains(&1)));
     for id in [0, u32::MAX] {
         let reference = v2::SemanticParameterRef {
             id: Some(id),
@@ -255,28 +267,25 @@ fn six_typed_sites_and_context_references_preserve_zero_max_and_absence() {
             }
             .encode_to_vec()
         );
-        let context = v2::EffectContext {
+        let context = v2::ExpressionEffectContext {
             use_id: Some(id),
-            domain_id: Some(id),
+            region_id: Some(id),
             demand: control::EvaluationDemand::Value as i32,
         };
         roundtrip(&context);
-        assert_ne!(
-            context.encode_to_vec(),
-            v2::EffectContext {
+        for absent in [
+            v2::ExpressionEffectContext {
                 use_id: None,
                 ..context
-            }
-            .encode_to_vec()
-        );
-        assert_ne!(
-            context.encode_to_vec(),
-            v2::EffectContext {
-                domain_id: None,
+            },
+            v2::ExpressionEffectContext {
+                region_id: None,
                 ..context
-            }
-            .encode_to_vec()
-        );
+            },
+        ] {
+            roundtrip(&absent);
+            assert_ne!(context.encode_to_vec(), absent.encode_to_vec());
+        }
         let node = v2::NodeCallSite {
             node_id: Some(id),
             call: 0,
@@ -290,7 +299,7 @@ fn six_typed_sites_and_context_references_preserve_zero_max_and_absence() {
             }
             .encode_to_vec()
         );
-        for kind in [Kind::ExpressionUseId(id), Kind::TableNodeId(id)] {
+        for kind in [Kind::Window(node), Kind::TableNodeId(id)] {
             let site = v2::CallSite { kind: Some(kind) };
             roundtrip(&site);
             assert_ne!(
@@ -298,8 +307,31 @@ fn six_typed_sites_and_context_references_preserve_zero_max_and_absence() {
                 v2::CallSite::default().encode_to_vec()
             );
         }
+        for role in [
+            v2::RelationEffectRole::Call,
+            v2::RelationEffectRole::MaterializedInput,
+        ] {
+            let identity = v2::RelationEffectId {
+                call_id: Some(id),
+                role: role as i32,
+            };
+            roundtrip(&identity);
+            assert_ne!(
+                identity.encode_to_vec(),
+                v2::RelationEffectId {
+                    call_id: None,
+                    ..identity
+                }
+                .encode_to_vec()
+            );
+        }
     }
-    for name in ["SemanticParameterRef", "EffectContext", "NodeCallSite"] {
+    for name in [
+        "SemanticParameterRef",
+        "ExpressionEffectContext",
+        "NodeCallSite",
+        "RelationEffectId",
+    ] {
         let descriptor = pool()
             .get_message_by_name(&format!("novarocks.physical_semantics_v2.{name}"))
             .unwrap();
@@ -344,6 +376,14 @@ fn semantics_descriptor_is_nonrecursive_and_every_actual_layout_is_registered() 
     );
     assert_eq!(
         depth(
+            pool.get_message_by_name("novarocks.physical_semantics_v2.ExpressionClaims")
+                .unwrap(),
+            &mut BTreeSet::new()
+        ),
+        5
+    );
+    assert_eq!(
+        depth(
             pool.get_message_by_name("novarocks.physical_semantics_v2.SemanticParameters")
                 .unwrap(),
             &mut BTreeSet::new()
@@ -356,7 +396,7 @@ fn semantics_descriptor_is_nonrecursive_and_every_actual_layout_is_registered() 
                 .unwrap(),
             &mut BTreeSet::new()
         ),
-        6
+        4
     );
     let layouts = generated_resource_layouts()
         .filter(|layout| {
@@ -423,6 +463,11 @@ fn semantics_descriptor_is_nonrecursive_and_every_actual_layout_is_registered() 
     dimensions::<v2::semantic_parameter::Value>();
     dimensions::<v2::FrozenCalls>();
     dimensions::<v2::FrozenCall>();
+    dimensions::<v2::ExpressionClaims>();
+    dimensions::<v2::ExpressionCallClaim>();
+    dimensions::<v2::ExpressionEffectContext>();
+    dimensions::<v2::RelationEffectContext>();
+    dimensions::<v2::RelationEffectId>();
     dimensions::<v2::CallEffects>();
     dimensions::<v2::CallSite>();
     dimensions::<v2::call_site::Kind>();
@@ -452,15 +497,13 @@ fn pruning_witness(id: u32, field: v2::PruningDomainField) -> v2::PruningDomainW
         sources: vec![v2::PruningSourceWitness {
             responsibility: Some(v2::PredicateResponsibilityRef {
                 fragment_id: Some(id),
-                site: Some(control::RootSite {
-                    node_id: Some(id),
-                    role: Some(control::root_site::Role::FilterPredicate(0)),
-                }),
+                node_id: Some(id),
+                root_ordinal: Some(id),
                 use_id: Some(id),
             }),
-            context: Some(v2::EffectContext {
+            context: Some(v2::ExpressionEffectContext {
                 use_id: Some(id),
-                domain_id: Some(id),
+                region_id: Some(id),
                 demand: control::EvaluationDemand::TruthOnly as i32,
             }),
             conjunct_path: vec![0, 2, 0],
@@ -514,14 +557,7 @@ fn pruning_retains_complete_typed_roots_context_and_ordered_paths() {
     changed.columns[0].value_ids.pop();
     assert_ne!(source.encode_to_vec(), changed.encode_to_vec());
     let mut changed = source.clone();
-    changed
-        .responsibility
-        .as_mut()
-        .unwrap()
-        .site
-        .as_mut()
-        .unwrap()
-        .role = Some(control::root_site::Role::ScanResidual(0));
+    changed.responsibility.as_mut().unwrap().root_ordinal = Some(1);
     assert_ne!(source.encode_to_vec(), changed.encode_to_vec());
     let mut changed = source.clone();
     changed.context.as_mut().unwrap().demand = control::EvaluationDemand::Value as i32;
@@ -554,16 +590,6 @@ fn pruning_reference_presence_and_unspecified_defaults_cannot_be_confused() {
             assert_ne!(target.encode_to_vec(), absent.encode_to_vec());
         }
         let reference = witness.sources[0].responsibility.as_ref().unwrap();
-        let root = reference.site.unwrap();
-        roundtrip(&root);
-        assert_ne!(
-            root.encode_to_vec(),
-            control::RootSite {
-                node_id: None,
-                ..root
-            }
-            .encode_to_vec()
-        );
         for absent in [
             v2::PredicateResponsibilityRef {
                 fragment_id: None,
@@ -574,7 +600,11 @@ fn pruning_reference_presence_and_unspecified_defaults_cannot_be_confused() {
                 ..*reference
             },
             v2::PredicateResponsibilityRef {
-                site: None,
+                node_id: None,
+                ..*reference
+            },
+            v2::PredicateResponsibilityRef {
+                root_ordinal: None,
                 ..*reference
             },
         ] {
@@ -630,7 +660,7 @@ fn pruning_descriptor_exposes_only_exact_references_and_flat_path_fields() {
         ),
         (
             "PredicateResponsibilityRef",
-            &["fragment_id", "site", "use_id"][..],
+            &["fragment_id", "node_id", "root_ordinal", "use_id"][..],
         ),
         ("PruningSourceWitness", &["responsibility", "context"][..]),
         ("PruningInputEdge", &["consumer_id", "producer_id"][..]),
@@ -699,10 +729,10 @@ fn pruning_descriptor_exposes_only_exact_references_and_flat_path_fields() {
 
 #[test]
 fn call_policy_presence_preserves_absent_unspecified_and_unknown_for_typed_decode() {
-    // Independent canonical wire fixtures: FrozenCall field 4 is a varint.
+    // Independent canonical wire fixtures: both call owners use field 4 varints.
     // Prost intentionally retains all distinctions for the later typed codec.
     assert_eq!(
-        v2::FrozenCall::decode(&b""[..])
+        v2::ExpressionCallClaim::decode(&b""[..])
             .unwrap()
             .decimal_overflow_policy,
         None
@@ -713,9 +743,12 @@ fn call_policy_presence_preserves_absent_unspecified_and_unknown_for_typed_decod
         ([0x20, 0x02], 2),
         ([0x20, 0x63], 99),
     ] {
-        let decoded = v2::FrozenCall::decode(bytes.as_slice()).unwrap();
+        let decoded = v2::ExpressionCallClaim::decode(bytes.as_slice()).unwrap();
         assert_eq!(decoded.decimal_overflow_policy, Some(value));
         assert_eq!(decoded.encode_to_vec(), bytes);
+        let relation = v2::FrozenCall::decode(bytes.as_slice()).unwrap();
+        assert_eq!(relation.decimal_overflow_policy, Some(value));
+        assert_eq!(relation.encode_to_vec(), bytes);
     }
     assert_eq!(v2::DecimalOverflowPolicy::OutputNull as i32, 1);
     assert_eq!(v2::DecimalOverflowPolicy::ReportError as i32, 2);
@@ -729,6 +762,11 @@ fn calls_binary_and_cast_share_one_semantic_policy_with_unchanged_numeric_wire_v
     let pool = pool();
     for (message, tag, presence) in [
         ("novarocks.physical_semantics_v2.FrozenCall", 4, true),
+        (
+            "novarocks.physical_semantics_v2.ExpressionCallClaim",
+            4,
+            true,
+        ),
         ("novarocks.physical_package_v2.BinaryExpression", 4, false),
         ("novarocks.physical_package_v2.CastExpression", 3, false),
     ] {
@@ -766,13 +804,13 @@ fn calls_binary_and_cast_share_one_semantic_policy_with_unchanged_numeric_wire_v
 #[test]
 fn to_base64_field7_preserves_absent_positive_ordinary_latin1_and_unknown() {
     assert_eq!(
-        v2::FrozenCall::decode(&b""[..])
+        v2::ExpressionCallClaim::decode(&b""[..])
             .unwrap()
             .to_base64_byte_source,
         None
     );
     for (bytes, value) in [([0x38, 0x00], 0), ([0x38, 0x01], 1), ([0x38, 0x63], 99)] {
-        let decoded = v2::FrozenCall::decode(bytes.as_slice()).unwrap();
+        let decoded = v2::ExpressionCallClaim::decode(bytes.as_slice()).unwrap();
         assert_eq!(decoded.to_base64_byte_source, Some(value));
         assert_eq!(decoded.encode_to_vec(), bytes);
     }
@@ -784,7 +822,7 @@ fn to_base64_field7_preserves_absent_positive_ordinary_latin1_and_unknown() {
 fn to_base64_descriptor_field7_has_positive_zero_presence_and_closed_enum() {
     let pool = pool();
     let message = pool
-        .get_message_by_name("novarocks.physical_semantics_v2.FrozenCall")
+        .get_message_by_name("novarocks.physical_semantics_v2.ExpressionCallClaim")
         .unwrap();
     let field = message.get_field_by_name("to_base64_byte_source").unwrap();
     assert_eq!(field.number(), 7);

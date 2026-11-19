@@ -75,24 +75,13 @@ fn package_data(fields: Arc<[FieldRef]>, data: p::SystemRelationData) -> p::Frag
             p::StagePlacementPolicy::Singleton,
         )
         .unwrap();
-    let flow = novarocks_type_contract::ExpressionControlFlow::try_new(
-        vec![],
-        vec![],
-        fragment.expressions(),
-        CompilePhase::Validate,
-        &Control,
-    )
-    .unwrap();
-    let uses = p::PhysicalRootUses::try_new(&fragment, flow, vec![], &Control).unwrap();
-    let calls = p::FrozenFragmentCalls::try_new(&fragment, &uses, vec![], &Control).unwrap();
     let pruning = p::FrozenFragmentPruning::try_new(fragment.id(), vec![], &Control).unwrap();
     p::FragmentPackage::try_new(
         p::FragmentPackageInput {
+            statement_constant_policy: crate::test_constants::policy(),
             version: p::PlanVersionId::try_new([71; 16]).unwrap(),
             required: p::RequiredContracts::default(),
             fragment,
-            expression_uses: uses,
-            calls,
             pruning,
             constants: p::ConstantPools::empty(),
             cuts: p::FragmentCuts::default(),
@@ -101,6 +90,7 @@ fn package_data(fields: Arc<[FieldRef]>, data: p::SystemRelationData) -> p::Frag
             scans: BTreeMap::new(),
             writes: BTreeMap::new(),
             annotations: Box::default(),
+            layouts: Default::default(),
         },
         FROZEN_PACKAGE_ADMISSION,
         &Control,

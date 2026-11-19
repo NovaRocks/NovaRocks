@@ -4399,9 +4399,9 @@ mod tests {
     use arrow::datatypes::DataType;
     use bytes::Bytes;
     use novarocks_physical_plan::{
-        Distribution, ExactInputVersion, ExprKind, FragmentBuilder, FragmentId, FragmentSink,
-        LiteralValue, NodeKind, OutputPort, PhysicalNode, PhysicalProperties, PipelineDopDomain,
-        ResultField, ResultPort, RowMultiplicity, ValueOrigin,
+        Distribution, ExactInputVersion, FragmentBuilder, FragmentId, FragmentSink, NodeKind,
+        OutputPort, PhysicalNode, PhysicalProperties, PipelineDopDomain, ResultField, ResultPort,
+        RowMultiplicity, ValueOrigin,
     };
     use novarocks_spi::connector::read_stack::{
         ConnectorReadBinding, ConnectorValue, Domain, TupleDomain,
@@ -4424,8 +4424,22 @@ mod tests {
         let mut fragment = FragmentBuilder::new(FragmentId::new(1));
         let node = fragment.reserve_node_id().unwrap();
         let ty = ValueType::new(DataType::Int64, false);
+        let mut constants = novarocks_physical_plan::ConstantPools::empty();
+        let kind =
+            crate::test_constants::insert(&mut constants, crate::test_constants::i64(1)(&ty));
         let expression = fragment
-            .add_expression(node, ty.clone(), ExprKind::Literal(LiteralValue::Int64(1)))
+            .unit(node)
+            .unwrap()
+            .add(None, ty.clone(), kind)
+            .unwrap();
+        let expression = fragment
+            .unit(node)
+            .unwrap()
+            .root(
+                expression,
+                novarocks_type_contract::EvaluationDemand::Value,
+                novarocks_expression_contract::RootScope::AllPorts,
+            )
             .unwrap();
         let output = fragment
             .add_value(
@@ -4439,6 +4453,7 @@ mod tests {
         fragment
             .insert_node_unchecked(PhysicalNode {
                 id: node,
+                expressions: None,
                 inputs: Box::default(),
                 required_inputs: Box::default(),
                 output_properties: PhysicalProperties {
@@ -4455,6 +4470,21 @@ mod tests {
                 },
             })
             .unwrap();
+        let control = crate::compiler::SqlCompileControl::unbounded();
+        let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
+            &control,
+            novarocks_type_contract::CompilePhase::Validate,
+        )
+        .unwrap();
+        let unit = fragment
+            .take_unit_builder(node)
+            .unwrap()
+            .seal(vec![], &mut work)
+            .unwrap()
+            .finish(BTreeMap::new(), &mut work)
+            .unwrap();
+        work.finish().unwrap();
+        fragment.install_unit(node, Arc::new(unit)).unwrap();
         let fragment = fragment
             .finish_definition(
                 node,
@@ -4467,7 +4497,8 @@ mod tests {
                 novarocks_physical_plan::StagePlacementPolicy::Singleton,
             )
             .unwrap();
-        let mut plan = PlanBuilder::new(version);
+        let mut plan = PlanBuilder::new(version, crate::test_constants::policy())
+            .with_constant_pools(constants);
         plan.add_fragment(fragment).unwrap();
         plan.set_result_port(ResultPort {
             scalar_schema: None,

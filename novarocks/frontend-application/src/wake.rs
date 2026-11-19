@@ -36,13 +36,7 @@ pub struct TestIntakeWake {
 }
 
 #[cfg(test)]
-impl TestIntakeWake {
-    /// The same original wake also follows its owner into async residual
-    /// supervision. Register before inspecting state to retain a racing wake.
-    pub(crate) fn notified(&self) -> tokio::sync::futures::Notified<'_> {
-        self.async_signal.notified()
-    }
-}
+impl TestIntakeWake {}
 
 #[cfg(test)]
 impl StatusIntakeWake for TestIntakeWake {

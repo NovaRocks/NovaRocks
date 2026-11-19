@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Attempt-local internal consumption and actor-issued readiness receipts.
+//! Attempt-local internal consumption and runtime-issued readiness receipts.
 //!
 //! Design: ADR-0198 (docs/adr/ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md).
 
@@ -33,7 +33,7 @@ use super::{
     ResultDeliveryReceipt, ResultRowCarrier, RetainedRootReply, RootRelayResidentWindow,
     RootSegmentDelivery,
 };
-use crate::coordination::InternalReadyActorPort;
+use crate::coordination::executor::consumer::RuntimeReadyPort;
 
 /// This allocation is minted for one exact registered consumer. Correlation
 /// values alone cannot recreate its source capability or a decoded receipt.
@@ -86,21 +86,21 @@ pub struct ComputationReadyToken {
 }
 
 impl ComputationReadyToken {
-    pub(crate) fn accepted(
-        source: &InternalConsumerSeal,
-        cut: MonotonicInstant,
-        end: RootResultEnd,
-        budgets: ComputationObservationBudgets,
+    /// Projects the complete accepted protocol fact without issuing a Ready
+    /// promise, Work, publication right or lifetime guarantee.
+    pub const fn from_runtime_cut(
+        cut: novarocks_coordination_contract::AttemptComputationCut,
     ) -> Self {
         Self {
-            activation: source.activation,
-            root: source.root,
-            cut,
-            diagnostic_deadline: cut.saturating_add(budgets.diagnostics),
-            convergence_deadline: cut.saturating_add(budgets.convergence),
-            end,
+            activation: cut.activation,
+            root: cut.root,
+            cut: cut.cut,
+            diagnostic_deadline: cut.diagnostic_deadline,
+            convergence_deadline: cut.convergence_deadline,
+            end: cut.end,
         }
     }
+
     pub const fn activation(&self) -> AttemptActivationIdentity {
         self.activation
     }
@@ -151,12 +151,12 @@ impl DecodedInternalEndReceipt {
 /// That owner retains this inside its typed proof and calls accept only after
 /// its protocol rules and actual receiving-custody transfer have succeeded.
 pub struct ComputationReadySource {
-    port: InternalReadyActorPort,
+    port: RuntimeReadyPort,
     liveness: Option<oneshot::Sender<()>>,
 }
 
 impl ComputationReadySource {
-    pub(crate) fn issued(port: InternalReadyActorPort) -> (Self, oneshot::Receiver<()>) {
+    pub(crate) fn issued_runtime(port: RuntimeReadyPort) -> (Self, oneshot::Receiver<()>) {
         let (liveness, receiver) = oneshot::channel();
         (
             Self {
@@ -379,13 +379,12 @@ impl InternalResultStream {
 pub struct InternalConsumerActivation {
     pub(crate) stream: InternalResultStream,
     pub(crate) source: ComputationReadySource,
-    pub(crate) ready: watch::Receiver<Option<Result<ComputationReadyToken, QueryExecutionError>>>,
 }
 
 impl InternalConsumerActivation {
     pub(crate) async fn supervise_exit(
         &self,
-    ) -> Result<InternalConsumerExitReporter, crate::coordination::LogicalExecutionActorError> {
+    ) -> Result<InternalConsumerExitReporter, QueryExecutionError> {
         let (sender, receiver) = oneshot::channel();
         self.source.port.supervise_exit(receiver).await?;
         Ok(InternalConsumerExitReporter(sender))

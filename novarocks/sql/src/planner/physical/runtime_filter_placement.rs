@@ -307,6 +307,7 @@ fn expr_bound_child(node: &PhysicalPlanNode, expr: &TypedExpr) -> Option<usize> 
 
 fn rf_key_types_match(eq: &PhysicalHashJoinEqCondition) -> bool {
     eq.left.value_type.data_type() == eq.right.value_type.data_type()
+        && novarocks_local_program::is_filter_key_type(eq.left.value_type.data_type())
 }
 
 #[derive(Clone, Debug)]
@@ -1396,6 +1397,42 @@ mod tests {
             right: col_ref_with_type(2, "b", DataType::Utf8),
             null_safe: false,
         }));
+    }
+
+    #[test]
+    fn membership_placement_skips_keys_outside_the_canonical_schema() {
+        for (data_type, expected) in [
+            (DataType::Int64, 1),
+            (DataType::Binary, 0),
+            (DataType::Decimal256(40, 0), 0),
+        ] {
+            let left = col_ref_with_type(1, "a", data_type.clone());
+            let right = col_ref_with_type(2, "b", data_type.clone());
+            let mut left_output = out_col(1, "a");
+            left_output.value_type = left.value_type.clone();
+            let mut right_output = out_col(2, "b");
+            right_output.value_type = right.value_type.clone();
+            let mut join = hash_join_node(
+                JoinKind::Inner,
+                JoinDistribution::Broadcast,
+                Some(JoinExecutionMode::Broadcast),
+                vec![eq_cond(left, right, false)],
+                vec![leaf(vec![left_output]), leaf(vec![right_output])],
+                stats_with_columns(10.0, &[(1, 8.0), (2, 8.0)]),
+            );
+            let mut next_filter_id = 0;
+            place_node(&mut join, &permissive_config(1024), &mut next_filter_id);
+            assert_eq!(
+                expect_hash_join(&join).build_runtime_filters.len(),
+                expected,
+                "{data_type:?}"
+            );
+            assert_eq!(
+                join.children[0].probe_runtime_filters.len(),
+                expected,
+                "{data_type:?}"
+            );
+        }
     }
 
     #[test]

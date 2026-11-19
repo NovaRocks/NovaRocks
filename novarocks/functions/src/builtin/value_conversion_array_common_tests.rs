@@ -24,7 +24,7 @@ use crate::{
 use arrow_array::{Array, ArrayRef, Decimal128Array, Float64Array};
 use arrow_schema::DataType;
 use novarocks_type_contract::{
-    CompileControlError, EvaluationDemand, EvaluationDomainId, ExpressionUseId, SemanticParameters,
+    CompileControlError, EvaluationDemand, EvaluationRegionId, ExpressionUseId, SemanticParameters,
     ValueLogicalType,
 };
 use std::{sync::Mutex, time::Duration};
@@ -79,7 +79,7 @@ fn owner() -> ValueConversionOwner {
 fn context() -> novarocks_type_contract::ExpressionEffectContext {
     novarocks_type_contract::ExpressionEffectContext {
         use_id: ExpressionUseId::new(811),
-        domain: EvaluationDomainId::new(812),
+        region: EvaluationRegionId::new(812),
         demand: EvaluationDemand::Value,
     }
 }
@@ -115,7 +115,7 @@ fn prepare(
     let parameters = SemanticParameters::try_new([]).unwrap();
     let uses = [Some(ExpressionUseId::new(813))];
     let input = CallEffectInput {
-        context: context(),
+        context: context().into(),
         argument_uses: crate::CallArgumentUses::SelectedChannels(&uses),
         function_id: owner.declaration.function_id(),
         kind: FunctionKind::Scalar,
@@ -124,7 +124,7 @@ fn prepare(
         environment: &[],
         parameters: &parameters,
         decimal_overflow_policy: policy,
-        proof_scope: CallProofScope::Domain(context().domain),
+        proof_scope: CallProofScope::Region(context().region),
     };
     let fresh = specialize_scalar(
         &owner,

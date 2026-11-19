@@ -104,6 +104,17 @@ pub struct ConnectorControlRetirement {
     reason = "Retained for target-specific frontend integration and regression coverage."
 )]
 impl ConnectorControlHost {
+    pub(crate) fn observe_configuration_binding(
+        &self,
+        instance_id: &ConnectorInstanceId,
+    ) -> Result<(ConnectorProviderBindingKey, ConnectorControlRuntimeId), ConnectorError> {
+        let generation = self.current_generation(instance_id)?;
+        Ok((
+            generation.runtime().legacy_execution_key.clone(),
+            generation.runtime_id(),
+        ))
+    }
+
     pub fn new() -> Self {
         Self::from_factory_map(BTreeMap::new())
     }

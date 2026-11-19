@@ -155,10 +155,18 @@ fn completed_query_parts_move_original_plan_and_logical_journal_together() {
                         assert_eq!(call.arguments.len(), 1);
                         assert_eq!(
                             entry.runtime(),
-                            AggregateRuntimeDemand::ExpressionState(call.arguments[0])
+                            AggregateRuntimeDemand::ExpressionState(
+                                fragment
+                                    .root_expression(node.id, call.arguments[0])
+                                    .unwrap()
+                                    .id
+                            )
                         );
                         assert_eq!(
-                            fragment.expressions().get(call.arguments[0]).unwrap().ty,
+                            fragment
+                                .root_expression(node.id, call.arguments[0])
+                                .unwrap()
+                                .ty,
                             call.binding.intermediate_type
                         );
                     }

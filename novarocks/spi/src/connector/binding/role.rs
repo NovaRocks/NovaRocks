@@ -17,7 +17,12 @@
 
 use std::sync::Arc;
 
-use novarocks_connector_contract::ConnectorReadRelationRecipeCompiler;
+use arrow::array::Int64Array;
+use arrow::datatypes::Schema;
+use arrow::record_batch::RecordBatch;
+use novarocks_connector_contract::{
+    ConnectorReadRelationRecipeCompiler, ConnectorWriteLayoutRecipe,
+};
 
 use crate::connector::read_stack::{
     ConnectorAdmittedReadProviderFactory, ConnectorReadAttemptAccessSource,
@@ -412,6 +417,19 @@ impl ConnectorExecutionReadBinding {
     }
 }
 
+/// Synchronous, stateless evaluation of a Provider's partition facts.
+pub trait ConnectorPartitionKeyEvaluator: Send + Sync {
+    fn partition_keys(&self, input: &RecordBatch) -> Result<Int64Array, ConnectorError>;
+}
+
+pub trait ConnectorWriteLayoutExecution: Send + Sync {
+    fn open(
+        &self,
+        recipe: &ConnectorWriteLayoutRecipe,
+        input: &Schema,
+    ) -> Result<Arc<dyn ConnectorPartitionKeyEvaluator>, ConnectorError>;
+}
+
 /// The complete BE write group for one exact execution generation.
 ///
 /// Like its frontend counterpart every member is required, so a backend cannot
@@ -423,6 +441,7 @@ pub struct ConnectorExecutionWriteBinding {
     execution: Arc<dyn ConnectorWriteStackExecution>,
     handle_decoder: Arc<dyn ConnectorWriteHandleWireDecoder>,
     fragment_encoder: Arc<dyn ConnectorWriteFragmentWireEncoder>,
+    write_layout: Option<Arc<dyn ConnectorWriteLayoutExecution>>,
 }
 
 impl ConnectorExecutionWriteBinding {
@@ -435,7 +454,17 @@ impl ConnectorExecutionWriteBinding {
             execution,
             handle_decoder,
             fragment_encoder,
+            write_layout: None,
         }
+    }
+
+    pub fn with_write_layout(mut self, execution: Arc<dyn ConnectorWriteLayoutExecution>) -> Self {
+        self.write_layout = Some(execution);
+        self
+    }
+
+    pub fn write_layout(&self) -> Option<Arc<dyn ConnectorWriteLayoutExecution>> {
+        self.write_layout.clone()
     }
 
     /// Opens one writer per driver. It has no begin, finish, abort, or

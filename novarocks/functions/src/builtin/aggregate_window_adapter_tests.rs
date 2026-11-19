@@ -29,9 +29,8 @@ use arrow_array::{
 };
 use arrow_schema::DataType;
 use novarocks_type_contract::{
-    CallProofScope, CompileControlError, CompilePhase, DecimalOverflowPolicy, EvaluationDemand,
-    EvaluationDomainId, ExpressionEffectContext, ExpressionUseId, SemanticParameters,
-    ValueLogicalType, WindowBound, WindowFrame, WindowFrameUnits,
+    CallProofScope, CompileControlError, CompilePhase, DecimalOverflowPolicy, ExpressionUseId,
+    SemanticParameters, ValueLogicalType, WindowBound, WindowFrame, WindowFrameUnits,
 };
 use std::{num::NonZeroUsize, sync::Mutex, time::Duration};
 
@@ -91,12 +90,10 @@ fn causes() -> [KernelFailure; 7] {
     ]
 }
 
-fn context() -> ExpressionEffectContext {
-    ExpressionEffectContext {
-        use_id: ExpressionUseId::new(41),
-        domain: EvaluationDomainId::new(7),
-        demand: EvaluationDemand::Value,
-    }
+fn context() -> novarocks_type_contract::RelationEffectContext {
+    novarocks_type_contract::RelationEffectContext::call(
+        novarocks_type_contract::RelationCallId::new(41),
+    )
 }
 
 struct Fixture {
@@ -140,7 +137,7 @@ impl Fixture {
     }
     fn input(&self) -> CallEffectInput<'_> {
         CallEffectInput {
-            context: context(),
+            context: (context()).into(),
             argument_uses: crate::CallArgumentUses::SelectedChannels(&self.uses),
             function_id: &self.function,
             kind: FunctionKind::Aggregate,
@@ -153,7 +150,7 @@ impl Fixture {
             environment: &[],
             parameters: &self.parameters,
             decimal_overflow_policy: self.policy,
-            proof_scope: CallProofScope::Domain(context().domain),
+            proof_scope: CallProofScope::Relation(context().identity),
         }
     }
     fn aggregate_options(distinct: bool) -> AggregatePreparationOptions {
@@ -176,7 +173,7 @@ impl Fixture {
             self.input(),
             self.selected.clone(),
             PureCallPreparation::AggregateWindow {
-                arguments: ScopedExpressionEffects::pure_value(context()),
+                arguments: ScopedRelationalEffects::pure_value(context()),
                 options: AggregateWindowPreparationOptions {
                     aggregate: Self::aggregate_options(distinct),
                     window: WindowCallOptions::try_new(
@@ -209,7 +206,7 @@ impl Fixture {
                 self.input(),
                 self.selected.clone(),
                 PureCallPreparation::Aggregate {
-                    arguments: ScopedExpressionEffects::pure_value(context()),
+                    arguments: ScopedRelationalEffects::pure_value(context()),
                     options: Self::aggregate_options(false),
                 },
                 &CompileControl::default(),

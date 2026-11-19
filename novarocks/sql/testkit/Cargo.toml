@@ -15,6 +15,7 @@ arrow.workspace = true
 novarocks-sql.workspace = true
 novarocks-parser.workspace = true
 novarocks-physical-plan.workspace = true
+novarocks-expression-contract.workspace = true
 novarocks-spi.workspace = true
 novarocks-types.workspace = true
 novarocks-functions.workspace = true

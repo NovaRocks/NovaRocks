@@ -15,41 +15,26 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod actor;
-mod actor_state;
-mod delivery;
-mod establish;
+mod clock;
 mod native_active_custody;
 mod original_exit;
-mod plan_activation;
-mod recovery;
 mod replacement;
-mod result_pump;
 mod root_relay;
 mod runtime_registry;
 mod schedule;
-mod stand_down;
 mod supervisor;
 
-pub(crate) use actor::InternalReadyActorPort;
-pub use actor::*;
-pub use actor_state::*;
-pub use delivery::*;
-pub use establish::*;
+pub use clock::ProcessMonotonicClock;
 pub(crate) use native_active_custody::*;
 pub use original_exit::{
     LocalExecutionDisposition, LogicalActorExitPhase, LogicalExecutionExitGeometry,
     LogicalExecutionExitObserver, LogicalExecutionExitReceipt, LogicalExecutionExitView,
-    RemoteExecutionDisposition,
+    LogicalOwnerFailureObservation, RemoteExecutionDisposition,
 };
-pub(crate) use plan_activation::ActiveLogicalPlan;
-pub use recovery::*;
 pub use replacement::*;
-pub use result_pump::*;
 pub use root_relay::*;
 pub use runtime_registry::*;
 pub use schedule::*;
-pub use stand_down::*;
 pub use supervisor::*;
 
 /// Enforces a process owner's explicit-shutdown invariant from its `Drop`.
@@ -70,3 +55,5 @@ pub(crate) fn assert_shutdown_complete(shutdown_complete: bool, owner: &str) {
         "{owner} dropped without explicit shutdown"
     );
 }
+
+pub mod executor;

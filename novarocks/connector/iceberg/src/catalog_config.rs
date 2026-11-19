@@ -49,6 +49,115 @@ const REST_AUTH_TYPE_PROPERTY: &str = "rest.auth.type";
 const REST_AUTHENTICATION_SOURCE: &str = "REST catalog authentication is only possible through \
 the catalog's CatalogControl or DataCredentialVending credential binding";
 
+pub(crate) const MAX_PARTITIONS_PER_WRITER: &str = "iceberg.max-partitions-per-writer";
+pub const MAX_PARTITIONS_PER_WRITER_SESSION_PROPERTY: &str = "max_partitions_per_writer";
+const TARGET_MAX_FILE_SIZE: &str = "iceberg.target-max-file-size";
+pub(crate) const DEFAULT_MAX_PARTITIONS_PER_WRITER: u32 = 100;
+pub(crate) const DEFAULT_TARGET_FILE_SIZE_BYTES: u64 = 1 << 30;
+
+/// Catalog-local defaults for writer settings frozen when a write begins.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IcebergCatalogWriteConfig {
+    pub(crate) max_partitions_per_writer: u32,
+    pub(crate) target_file_size_bytes: u64,
+}
+
+impl Default for IcebergCatalogWriteConfig {
+    fn default() -> Self {
+        Self {
+            max_partitions_per_writer: DEFAULT_MAX_PARTITIONS_PER_WRITER,
+            target_file_size_bytes: DEFAULT_TARGET_FILE_SIZE_BYTES,
+        }
+    }
+}
+
+impl IcebergCatalogWriteConfig {
+    fn parse(properties: &HashMap<String, String>) -> Result<Self, String> {
+        let max_partitions_per_writer = parse_max_partitions_per_writer(
+            properties
+                .get(MAX_PARTITIONS_PER_WRITER)
+                .map(String::as_str),
+        )? as u32;
+        let target_file_size_bytes = match properties.get(TARGET_MAX_FILE_SIZE) {
+            Some(value) => parse_file_size(value).ok_or_else(|| {
+                format!(
+                    "Iceberg catalog property {TARGET_MAX_FILE_SIZE} requires a positive byte size"
+                )
+            })?,
+            None => DEFAULT_TARGET_FILE_SIZE_BYTES,
+        };
+        Ok(Self {
+            max_partitions_per_writer,
+            target_file_size_bytes,
+        })
+    }
+
+    /// The catalog session declaration uses the same positive SQL INTEGER
+    /// as provider materialization, without opening or authenticating a catalog.
+    pub fn max_partitions_from_properties(properties: &[(String, String)]) -> Result<i32, String> {
+        parse_max_partitions_per_writer(
+            properties.iter().rev().find_map(|(key, value)| {
+                (key == MAX_PARTITIONS_PER_WRITER).then_some(value.as_str())
+            }),
+        )
+    }
+
+    pub fn max_partitions_per_writer(self) -> u32 {
+        self.max_partitions_per_writer
+    }
+}
+
+fn parse_max_partitions_per_writer(value: Option<&str>) -> Result<i32, String> {
+    let Some(value) = value else {
+        return Ok(DEFAULT_MAX_PARTITIONS_PER_WRITER as i32);
+    };
+    value
+        .trim()
+        .parse::<i32>()
+        .ok()
+        .filter(|limit| *limit > 0)
+        .ok_or_else(|| {
+            format!("Iceberg catalog property {MAX_PARTITIONS_PER_WRITER} requires a positive SQL INTEGER")
+        })
+}
+
+fn parse_file_size(value: &str) -> Option<u64> {
+    let value = value.trim();
+    let unit_start = value
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(value.len());
+    let (number, unit) = value.split_at(unit_start);
+    if unit.is_empty() {
+        return number
+            .parse::<std::num::NonZeroU64>()
+            .ok()
+            .map(std::num::NonZeroU64::get);
+    }
+    let multiplier: u128 = match unit.trim().to_ascii_lowercase().as_str() {
+        "b" => 1,
+        "kb" | "kib" => 1 << 10,
+        "mb" | "mib" => 1 << 20,
+        "gb" | "gib" => 1 << 30,
+        "tb" | "tib" => 1 << 40,
+        "pb" | "pib" => 1 << 50,
+        _ => return None,
+    };
+    if number.ends_with('.') {
+        return None;
+    }
+    let (whole, fraction) = number.split_once('.').unwrap_or((number, ""));
+    let whole = whole.parse::<u64>().ok()?;
+    let fraction = fraction.trim_end_matches('0');
+    let fractional_bytes = if fraction.is_empty() {
+        0
+    } else {
+        let numerator = fraction.parse::<u128>().ok()?.checked_mul(multiplier)?;
+        numerator / 10u128.checked_pow(fraction.len().try_into().ok()?)?
+    };
+    let bytes = u64::try_from(u128::from(whole) * multiplier + fractional_bytes).ok()?;
+    (bytes != 0).then_some(bytes)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IcebergCatalogKind {
     Hadoop,
@@ -65,6 +174,7 @@ pub struct IcebergCatalogConfiguration {
     pub properties: Vec<(String, String)>,
     pub object_store_config: Option<ObjectStoreConfig>,
     pub warehouse_path: PathBuf,
+    pub write: IcebergCatalogWriteConfig,
 }
 
 impl IcebergCatalogConfiguration {
@@ -251,6 +361,7 @@ impl Debug for IcebergCatalogConfiguration {
             .field("property_count", &self.properties.len())
             .field("object_store_config", &self.object_store_config)
             .field("warehouse_path", &self.warehouse_path)
+            .field("write", &self.write)
             .finish()
     }
 }
@@ -347,6 +458,7 @@ fn parse_hadoop_configuration(
     injected_object_store_config: Option<&ObjectStoreConfig>,
     endpoint_binding: Option<&ObjectStoreEndpointConfig>,
 ) -> Result<IcebergCatalogConfiguration, String> {
+    let write = IcebergCatalogWriteConfig::parse(&properties)?;
     let raw_warehouse = properties
         .get("iceberg.catalog.warehouse")
         .or_else(|| properties.get("warehouse"))
@@ -400,6 +512,7 @@ fn parse_hadoop_configuration(
         warehouse_uri.clone(),
     );
     Ok(IcebergCatalogConfiguration {
+        write,
         kind: IcebergCatalogKind::Hadoop,
         warehouse_uri,
         rest_uri: None,
@@ -415,6 +528,7 @@ fn parse_rest_configuration(
     injected_object_store_config: Option<&ObjectStoreConfig>,
     endpoint_binding: Option<&ObjectStoreEndpointConfig>,
 ) -> Result<IcebergCatalogConfiguration, String> {
+    let write = IcebergCatalogWriteConfig::parse(&properties)?;
     // Every REST configuration passes here, so a definition that would let a
     // property override the role's authentication never yields a
     // configuration a generation could be built from.
@@ -450,6 +564,7 @@ fn parse_rest_configuration(
         );
     }
     Ok(IcebergCatalogConfiguration {
+        write,
         kind: IcebergCatalogKind::Rest,
         warehouse_uri,
         rest_uri: Some(uri),
@@ -465,6 +580,7 @@ fn parse_hive_configuration(
     injected_object_store_config: Option<&ObjectStoreConfig>,
     endpoint_binding: Option<&ObjectStoreEndpointConfig>,
 ) -> Result<IcebergCatalogConfiguration, String> {
+    let write = IcebergCatalogWriteConfig::parse(&properties)?;
     for key in properties.keys() {
         let normalized = key.to_ascii_lowercase();
         if normalized.contains("kerberos")
@@ -516,6 +632,7 @@ fn parse_hive_configuration(
         );
     }
     Ok(IcebergCatalogConfiguration {
+        write,
         kind: IcebergCatalogKind::Hive,
         warehouse_uri,
         rest_uri: None,
@@ -726,6 +843,99 @@ fn canonicalize_or_join(path: &Path) -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commit::data_writer::{
+        PARQUET_ROW_GROUP_SIZE_BYTES_PROPERTY, TARGET_FILE_SIZE_BYTES_PROPERTY,
+    };
+    use crate::commit::write_stack::control::freeze_writer_output;
+    use novarocks_spi::connector::ConnectorErrorKind;
+
+    #[test]
+    fn catalog_writer_defaults_and_byte_sizes_materialize() {
+        let base = [
+            ("iceberg.catalog.type".to_owned(), "rest".to_owned()),
+            ("uri".to_owned(), "http://rest:8181".to_owned()),
+        ];
+        let config = parse_catalog_configuration("writes", &base).unwrap();
+        assert_eq!(config.write.target_file_size_bytes, 1_073_741_824);
+        assert_eq!(config.write.max_partitions_per_writer(), 100);
+        assert_eq!(
+            IcebergCatalogWriteConfig::max_partitions_from_properties(&base).unwrap(),
+            100
+        );
+
+        for (size, expected) in [
+            ("4096", 4096),
+            ("32 MB", 33_554_432),
+            ("1.5GiB", 1_610_612_736),
+        ] {
+            let mut properties = base.to_vec();
+            properties.push((TARGET_MAX_FILE_SIZE.to_owned(), size.to_owned()));
+            properties.push((MAX_PARTITIONS_PER_WRITER.to_owned(), "17".to_owned()));
+            let config = parse_catalog_configuration("writes", &properties).unwrap();
+            assert_eq!(config.write.target_file_size_bytes, expected);
+            assert_eq!(config.write.max_partitions_per_writer(), 17);
+            assert_eq!(
+                IcebergCatalogWriteConfig::max_partitions_from_properties(&properties).unwrap(),
+                17
+            );
+        }
+        for (property, values) in [
+            (
+                TARGET_MAX_FILE_SIZE,
+                ["0", "-1GB", "0.5", "90000000000000000000GB"],
+            ),
+            (MAX_PARTITIONS_PER_WRITER, ["0", "-1", "1.5", "2147483648"]),
+        ] {
+            for value in values {
+                let mut properties = base.to_vec();
+                properties.push((property.to_owned(), value.to_owned()));
+                assert!(
+                    parse_catalog_configuration("writes", &properties)
+                        .unwrap_err()
+                        .contains(property)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn file_size_follows_table_override_then_catalog_and_validates_metadata() {
+        let config = IcebergCatalogWriteConfig {
+            max_partitions_per_writer: 17,
+            target_file_size_bytes: 8192,
+        };
+        let output = freeze_writer_output(&HashMap::new(), config).unwrap();
+        assert_eq!(output.target_file_size_bytes(), 8192);
+        assert_eq!(output.max_partitions_per_writer(), 17);
+        assert_eq!(output.parquet_row_group_size_bytes(), 134_217_728);
+
+        let overrides = HashMap::from([
+            (
+                TARGET_FILE_SIZE_BYTES_PROPERTY.to_owned(),
+                "1024".to_owned(),
+            ),
+            (
+                PARQUET_ROW_GROUP_SIZE_BYTES_PROPERTY.to_owned(),
+                "512".to_owned(),
+            ),
+        ]);
+        let output = freeze_writer_output(&overrides, config).unwrap();
+        assert_eq!(output.target_file_size_bytes(), 1024);
+        assert_eq!(output.max_partitions_per_writer(), 17);
+        assert_eq!(output.parquet_row_group_size_bytes(), 512);
+
+        for property in [
+            TARGET_FILE_SIZE_BYTES_PROPERTY,
+            PARQUET_ROW_GROUP_SIZE_BYTES_PROPERTY,
+        ] {
+            for value in ["0", "-1", "1MB", "18446744073709551616"] {
+                let malformed = HashMap::from([(property.to_owned(), value.to_owned())]);
+                let error = freeze_writer_output(&malformed, config).unwrap_err();
+                assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
+                assert!(error.to_string().contains(property));
+            }
+        }
+    }
 
     #[test]
     fn admitted_endpoint_parsing_does_not_require_or_fabricate_secret_material() {

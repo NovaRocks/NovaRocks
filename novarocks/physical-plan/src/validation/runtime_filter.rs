@@ -1068,7 +1068,8 @@ pub(crate) fn equality_key_value(
         .keys()
         .get(usize::try_from(witness.key_ordinal).ok()?)?;
     crate::expression_value(
-        fragment.expressions(),
+        fragment,
+        node.id,
         match side {
             crate::JoinSide::Left => key.left,
             crate::JoinSide::Right => key.right,
@@ -1104,8 +1105,12 @@ pub(crate) fn validate_runtime_filter_equality_witness(
             return false;
         };
         let domain_type = match witness.domain_side {
-            crate::JoinSide::Left => fragment.expressions().get(key.left).map(|expr| &expr.ty),
-            crate::JoinSide::Right => fragment.expressions().get(key.right).map(|expr| &expr.ty),
+            crate::JoinSide::Left => fragment
+                .root_expression(node.id, key.left)
+                .map(|expr| &expr.ty),
+            crate::JoinSide::Right => fragment
+                .root_expression(node.id, key.right)
+                .map(|expr| &expr.ty),
         };
         let domain_matches = match (domain, domain_type) {
             (crate::RuntimeFilterDomain::Membership { ty, null_semantics }, Some(actual)) => {
@@ -1261,14 +1266,14 @@ pub(crate) fn validate_runtime_filter_producer_target(
                     item.direction == direction
                         && item.null_ordering == null_ordering
                         && group_key.is_some_and(|(_, output)| {
-                            crate::expression_value(fragment.expressions(), item.expr)
+                            crate::expression_value(fragment, topn_node.id, item.expr)
                                 == Some(*output)
                         })
                 })
                 && ordered_domain_matches
                 && group_key
                     .and_then(|(expression, _)| {
-                        crate::expression_value(fragment.expressions(), *expression)
+                        crate::expression_value(fragment, aggregate.id, *expression)
                     })
                     .is_some_and(|value| producer.endpoint.values.as_ref() == [value])
         }
@@ -1782,7 +1787,7 @@ fn advance_runtime_filter_lineage_step<'a>(
                     mode: crate::SortMode::Global | crate::SortMode::Analytic { .. },
                 } if order_by
                     .iter()
-                    .all(|item| crate::expression_value(fragment.expressions(), item.expr).is_some())
+                    .all(|item| crate::expression_value(fragment,node.id, item.expr).is_some())
             );
             let child = node
                 .inputs
@@ -1831,7 +1836,7 @@ fn advance_runtime_filter_lineage_step<'a>(
             if output != position.2 {
                 return None;
             }
-            let source = crate::expression_value(fragment.expressions(), expression)?;
+            let source = crate::expression_value(fragment, node.id, expression)?;
             if !indexes.port_contains(fragment, child_node, source)
                 || !node_has_exact_parent(&mut indexes.parents, fragment, child, node.id)
             {
@@ -1863,11 +1868,9 @@ fn advance_runtime_filter_lineage_step<'a>(
                 return None;
             }
             let key_value = |side: crate::JoinSide| match side {
-                crate::JoinSide::Left => {
-                    crate::join_key_source_value(fragment.expressions(), key.left)
-                }
+                crate::JoinSide::Left => crate::join_key_source_value(fragment, node.id, key.left),
                 crate::JoinSide::Right => {
-                    crate::join_key_source_value(fragment.expressions(), key.right)
+                    crate::join_key_source_value(fragment, node.id, key.right)
                 }
             };
             if key_value(source_side) != Some(position.2)
@@ -1937,7 +1940,7 @@ fn advance_runtime_filter_lineage_step<'a>(
             let (expression, output) = group_by
                 .get(usize::try_from(group_key_ordinal).ok()?)
                 .copied()?;
-            let source = crate::expression_value(fragment.expressions(), expression)?;
+            let source = crate::expression_value(fragment, node.id, expression)?;
             let child = *node.inputs.first()?;
             let child_node = fragment.nodes().get(&child)?;
             if node.inputs.len() != 1

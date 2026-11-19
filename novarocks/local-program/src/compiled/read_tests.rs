@@ -25,8 +25,7 @@ use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
 use novarocks_connector_contract::*;
 use novarocks_type_contract::{
-    CompileCheckpoints, CompilePhase, EvaluationDomainId, FunctionArgumentType, FunctionValueType,
-    NR_LOGICAL_TYPE_KEY, ValueLogicalType,
+    CompileCheckpoints, CompilePhase, FunctionValueType, NR_LOGICAL_TYPE_KEY, ValueLogicalType,
 };
 use novarocks_types::SlotId;
 use std::{
@@ -228,7 +227,7 @@ pub(super) fn checked(
     source: ProgramScanSource,
     schema: Schema,
     logical: ValueLogicalType,
-) -> ProgramLexicalBindings {
+) -> super::tests::Fixture {
     checked_scans(vec![source], schema, logical)
 }
 /// Each local node keeps its own distinct diagnostic source; node 0 keeps the
@@ -242,8 +241,7 @@ fn checked_scans(
     sources: Vec<ProgramScanSource>,
     schema: Schema,
     logical: ValueLogicalType,
-) -> ProgramLexicalBindings {
-    let control = Control::default();
+) -> super::tests::Fixture {
     let ty = value_type(logical, schema.field(0));
     let layout = StaticLayout::try_new(Arc::new(schema), Arc::from([SlotId::new(1)])).unwrap();
     let mut nodes = Vec::new();
@@ -284,7 +282,7 @@ fn checked_scans(
     let graph = LocalProgramGraph::try_new_with_sink(
         nodes,
         ProgramNodeId::new(count - 1),
-        Arc::new(ImmutableExpressions::try_new(vec![], false, HashMap::new(), None).unwrap()),
+        &[],
         CompileProfile::new(
             NonZeroUsize::new(1).unwrap(),
             None,
@@ -295,52 +293,27 @@ fn checked_scans(
         Some(StaticSinkProgram::Result),
     )
     .unwrap();
-    let roots = ProgramExpressionRoots::collect(&graph, &control).unwrap();
-    assert!(roots.sites().is_empty());
-    let mut flows = BTreeMap::new();
-    let mut types = BTreeMap::new();
-    for (scope, arena) in roots.arenas() {
-        assert!(arena.nodes().is_empty());
-        flows.insert(
-            *scope,
-            ProgramControlFlow::try_new(
-                vec![ProgramEvaluationDomain {
-                    id: EvaluationDomainId::new(0),
-                    parent: None,
-                    guard: None,
-                }],
-                vec![],
-                0,
-                &control,
+    let channels = (0..count)
+        .map(|index| {
+            (
+                ProgramChannelSite::Layout {
+                    node: ProgramNodeId::new(index),
+                    role: ProgramChannelLayoutRole::NodeOutput,
+                    ordinal: 0,
+                },
+                ty.clone(),
             )
-            .unwrap(),
-        );
-        types.insert(*scope, Vec::<FunctionArgumentType>::new());
+        })
+        .collect();
+    super::tests::Fixture {
+        graph,
+        units: vec![],
+        calls: vec![],
+        channels,
     }
-    let snapshot = ProgramRootControlBindings::try_new(graph, flows, vec![], &control).unwrap();
-    let calls = ProgramResolvedCalls::try_new(snapshot, vec![], &control).unwrap();
-    let expressions = ProgramTypedExpressions::try_new(calls, types, &control).unwrap();
-    let channels = ProgramTypedChannels::try_new(
-        expressions,
-        (0..count)
-            .map(|index| {
-                (
-                    ProgramChannelSite::Layout {
-                        node: ProgramNodeId::new(index),
-                        role: ProgramChannelLayoutRole::NodeOutput,
-                        ordinal: 0,
-                    },
-                    ty.clone(),
-                )
-            })
-            .collect(),
-        &control,
-    )
-    .unwrap();
-    ProgramLexicalBindings::try_new(channels, vec![], vec![], &control).unwrap()
 }
 fn finish(
-    checked: ProgramLexicalBindings,
+    checked: super::tests::Fixture,
     control: &dyn PureCompileControl,
 ) -> Result<LocalProgram, LocalProgramCompileError> {
     finish_with(checked, scan_address(0, u32::MAX), control)
@@ -349,19 +322,12 @@ fn scan_address(node: usize, scan_node: u32) -> BTreeMap<ProgramNodeId, Compiled
     BTreeMap::from([(ProgramNodeId::new(node), CompiledScanInput { scan_node })])
 }
 fn finish_with(
-    checked: ProgramLexicalBindings,
+    checked: super::tests::Fixture,
     scan_inputs: BTreeMap<ProgramNodeId, CompiledScanInput>,
     control: &dyn PureCompileControl,
 ) -> Result<LocalProgram, LocalProgramCompileError> {
-    let count = checked
-        .channels()
-        .expressions()
-        .resolved_calls()
-        .snapshot()
-        .program()
-        .nodes()
-        .len();
-    LocalProgram::try_new(
+    let count = checked.graph.nodes().len();
+    super::tests::finish(
         checked,
         (0..count)
             .map(|index| LocalOperatorProvenance {
@@ -397,14 +363,7 @@ fn complete_read_seal_preserves_explicit_json_without_duplicating_root_field_tag
         panic!("complete seal");
     };
     let checked = checked(shared.clone(), schema(), ValueLogicalType::Json);
-    let graph_ptr = checked
-        .channels()
-        .expressions()
-        .resolved_calls()
-        .snapshot()
-        .program()
-        .nodes()
-        .as_ptr();
+    let graph_ptr = checked.graph.nodes().as_ptr();
     let program = finish(checked, &Control::default()).unwrap();
     assert_eq!(program.graph().nodes().as_ptr(), graph_ptr);
     let ProgramNodeKind::Scan { source, .. } = program.graph().nodes()[0].kind() else {

@@ -22,8 +22,7 @@ use std::sync::Arc;
 
 use novarocks_local_program::{AssertRowsMode, LocalProgram, ProgramNodeKind, RowAssertion};
 use novarocks_physical_plan::{
-    ConstantPools, FragmentBuilder, FragmentId, NodeId, RowCountAssertion, RowCountAssertionSpec,
-    ValueId,
+    ConstantPools, FragmentId, NodeId, RowCountAssertion, RowCountAssertionSpec, ValueId,
 };
 
 use super::family_fixture::{cell, compile, int64, int64_rows, package, run, try_run, values};
@@ -33,7 +32,13 @@ fn program(
     rows: &[(Option<i64>, i64)],
     spec: impl FnOnce(&[ValueId]) -> RowCountAssertionSpec,
 ) -> Arc<LocalProgram> {
-    let mut builder = FragmentBuilder::new(FragmentId::new(51));
+    let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
+
+    let mut builder =
+        crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+            FragmentId::new(51),
+            &fixture_sources,
+        );
     let source = NodeId::new(0);
     let assert = NodeId::new(1);
     let cells = rows
@@ -149,8 +154,14 @@ fn compiled_keyed_assertion_allows_distinct_keys_and_refuses_a_duplicate() {
 /// The applicability is an original materialized nullable Boolean column.
 /// Duplicate bypass keys deliberately remain in the result unchanged.
 fn conditional_program(rows: &[(Option<i64>, i64, Option<bool>)], dop: usize) -> Arc<LocalProgram> {
-    use novarocks_physical_plan::{AssertionApplicability, LiteralValue};
-    let mut builder = FragmentBuilder::new(FragmentId::new(52));
+    let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
+
+    use novarocks_physical_plan::AssertionApplicability;
+    let mut builder =
+        crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+            FragmentId::new(52),
+            &fixture_sources,
+        );
     let source = NodeId::new(0);
     let assertion = NodeId::new(1);
     let cells = rows
@@ -159,7 +170,10 @@ fn conditional_program(rows: &[(Option<i64>, i64, Option<bool>)], dop: usize) ->
             vec![
                 cell(*key),
                 cell(Some(*value)),
-                applies.map_or(LiteralValue::Null, LiteralValue::Boolean),
+                applies.map_or(
+                    crate::exec::operators::family_fixture::constant_sources::null(),
+                    crate::exec::operators::family_fixture::constant_sources::boolean,
+                ),
             ]
         })
         .collect::<Vec<_>>();

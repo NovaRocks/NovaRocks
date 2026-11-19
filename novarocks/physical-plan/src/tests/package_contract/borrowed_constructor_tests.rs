@@ -16,6 +16,8 @@
 // under the License.
 
 use super::*;
+#[cfg(test)]
+use crate::tests::unit_fixture::DefinitionFixture;
 use novarocks_type_contract::{
     CompileCheckpoints, ControlOwnedResourceFacts, ControlResourceCounter, SemanticParameterError,
 };
@@ -98,12 +100,18 @@ fn every_prefix(input: &FragmentPackageInput, expected: Result<(), FragmentPacka
         }
     }
 }
-fn parameter_input(occurrences: u32) -> FragmentPackageInput {
+fn parameter_input(
+    occurrences: u32,
+    fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
+) -> FragmentPackageInput {
     let reference = SemanticParameterRef {
         id: SemanticParameterId::new(u32::MAX),
         expected_key: SemanticParameterKey::TimeZone,
     };
-    let mut input = package_input(parameter_occurrences_fragment(reference, occurrences));
+    let mut input = package_input(
+        parameter_occurrences_fragment(reference, occurrences),
+        fixture_constants,
+    );
     input.parameters = SemanticParameters::try_new([(
         reference.id,
         SemanticParameterValue::TimeZone("Asia/Shanghai".into()),
@@ -135,7 +143,8 @@ fn snapshots(input: &FragmentPackageInput) -> SnapshotTrace {
 
 #[test]
 fn borrowed_complete_package_keeps_source_and_leaves_success_tail_to_decode_caller() {
-    let input = parameter_input(1);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let input = parameter_input(1, &mut fixture_constants);
     let c = BorrowedControl::new(None);
     let mut w = CompileCheckpoints::try_new(&c, CompilePhase::Decode).unwrap();
     let package =
@@ -149,6 +158,20 @@ fn borrowed_complete_package_keeps_source_and_leaves_success_tail_to_decode_call
         package.fragment().call_requests(),
         input.fragment.call_requests()
     );
+    assert_eq!(
+        parameter_unit(package.fragment()).requests(),
+        parameter_unit(&input.fragment).requests()
+    );
+    assert!(Arc::ptr_eq(
+        package.fragment().nodes()[&package.fragment().root()]
+            .expressions
+            .as_ref()
+            .unwrap(),
+        input.fragment.nodes()[&input.fragment.root()]
+            .expressions
+            .as_ref()
+            .unwrap(),
+    ));
     let before = c.trace();
     w.finish().unwrap();
     assert_eq!(&c.trace()[..before.len()], before);
@@ -162,7 +185,8 @@ fn borrowed_complete_package_keeps_source_and_leaves_success_tail_to_decode_call
 
 #[test]
 fn borrowed_complete_package_parameters_keep_missing_wrong_key_unused_and_sparse_intrinsics() {
-    let input = parameter_input(1);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let input = parameter_input(1, &mut fixture_constants);
     let r = SemanticParameterRef {
         id: SemanticParameterId::new(u32::MAX),
         expected_key: SemanticParameterKey::TimeZone,
@@ -198,7 +222,7 @@ fn borrowed_complete_package_parameters_keep_missing_wrong_key_unused_and_sparse
     ])
     .unwrap();
     every_prefix(&unused, Err(FragmentPackageError::UnusedParameters));
-    let intrinsic = intrinsic_package_fixture();
+    let intrinsic = intrinsic_package_fixture(&mut fixture_constants);
     every_prefix(&intrinsic, Ok(()));
     let p = construct(&intrinsic, &BorrowedControl::new(None)).unwrap();
     assert_eq!(
@@ -215,19 +239,20 @@ fn borrowed_complete_package_parameters_keep_missing_wrong_key_unused_and_sparse
 
 #[test]
 fn borrowed_package_keeps_original_requests_constants_and_pruning_error_order() {
-    let input = parameter_input(1);
-    let definition = *input
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let input = parameter_input(1, &mut fixture_constants);
+    let request_input = package_input(package_window_fragment(), &mut fixture_constants);
+    let definition = *request_input
         .fragment
         .call_requests()
         .entries()
         .keys()
         .next()
         .unwrap();
-    let mut parts = input.fragment.clone().into_parts();
+    let mut parts = request_input.fragment.into_parts();
     // A deliberate malformed source, never a substitute for mandatory facts.
     parts.call_requests = crate::FragmentCallRequests::unpublished_empty(parts.id);
-    let mut missing = package_input(Fragment::from(parts));
-    missing.parameters = input.parameters.clone();
+    let mut missing = package_input(Fragment::from(parts), &mut fixture_constants);
     every_prefix(
         &missing,
         Err(FragmentPackageError::Requests(
@@ -244,10 +269,8 @@ fn borrowed_package_keeps_original_requests_constants_and_pruning_error_order() 
         )),
     );
     let mut unused = input.clone();
-    let original_policy = input
-        .fragment
-        .call_requests()
-        .entries()
+    let original_policy = parameter_unit(&input.fragment)
+        .requests()
         .values()
         .next()
         .unwrap()
@@ -285,12 +308,15 @@ fn borrowed_package_keeps_original_requests_constants_and_pruning_error_order() 
 
 #[test]
 fn borrowed_package_parameter_projection_has_independent_vec_tree_and_unique_box_oracle() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     for repetitions in [1_u32, 3] {
-        let input = parameter_input(repetitions);
+        let input = parameter_input(repetitions, &mut fixture_constants);
         let (facts, _) = snapshots(&input);
         let count = repetitions as usize;
         // Original count walk, collection, then two real projection hooks per reference.
         let tail = &facts[facts.len() - (2 + 2 * count)..];
+        // One unit plus count scalar claims are the newly explicit observed
+        // prepass; the original definition/environment collection remains.
         let count_snapshot = tail[0].0;
         let collection = tail[1].0;
         let layout = Layout::array::<SemanticParameterRef>(count).unwrap();
@@ -306,7 +332,7 @@ fn borrowed_package_parameter_projection_has_independent_vec_tree_and_unique_box
         );
         assert_eq!(
             collection.cumulative_work_upper_bound - count_snapshot.cumulative_work_upper_bound,
-            2 * count + 2 + layout.size() + 32
+            3 * count + 5 + layout.size() + 32
         );
         let mut tree = ControlResourceCounter::default();
         tree.tree::<SemanticParameterId, SemanticParameterValue>(1)
@@ -348,7 +374,8 @@ fn borrowed_package_parameter_projection_has_independent_vec_tree_and_unique_box
 
 #[test]
 fn borrowed_package_known_parameter_allocations_refuse_before_actual_late_control_callback() {
-    let input = parameter_input(3);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let input = parameter_input(3, &mut fixture_constants);
     let (baseline, trace) = snapshots(&input);
     let tail = baseline.len() - 8;
     // Actual collection Vec gate and first unique value clone/tree gate.
@@ -400,12 +427,14 @@ use crate::{PlanLimits, UnpivotConstant};
 use arrow_array::ArrayRef;
 use arrow_array::builder::{Int32Builder, ListBuilder, MapBuilder, StringBuilder};
 use arrow_schema::Field;
-fn original_pool(array: ArrayRef) -> crate::ConstantPool {
+fn original_pool(
+    array: ArrayRef,
+    fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
+) -> crate::ConstantPool {
     let value_type = ty(array.data_type().clone(), false);
-    let original_policy = parameter_input(1)
-        .fragment
-        .call_requests()
-        .entries()
+    let input = parameter_input(1, fixture_constants);
+    let original_policy = parameter_unit(&input.fragment)
+        .requests()
         .values()
         .next()
         .unwrap()
@@ -423,28 +452,44 @@ fn original_pool(array: ArrayRef) -> crate::ConstantPool {
 fn collection_fragment(
     constants: &[UnpivotConstant],
     ty: &crate::FunctionValueType,
+    _fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
 ) -> (Fragment, ValueId) {
     let mut builder = crate::FragmentBuilder::new(crate::FragmentId::new(91));
     let empty = crate::NodeId::new(u32::MAX);
     let project = crate::NodeId::new(0);
     let unpivot = crate::NodeId::new(901);
-    builder
-        .add_values(empty, Box::from([Box::default()]), Box::default())
-        .unwrap();
     let integer = crate::FunctionValueType::new(DataType::Int64, false);
-    let expression = builder
-        .add_expression(
-            project,
+    let source_value = builder
+        .add_value(
             integer.clone(),
-            crate::ExprKind::Literal(crate::LiteralValue::Int64(7)),
+            crate::ValueOrigin::NodeOutput {
+                node: empty,
+                output_ordinal: 0,
+            },
         )
         .unwrap();
+    builder
+        .add_values(empty, Box::default(), Box::from([source_value]))
+        .unwrap();
+    let expression = builder
+        .define(
+            project,
+            integer.clone(),
+            crate::ExprKind::Value(source_value),
+        )
+        .unwrap();
+    let root = builder.root_definition(
+        project,
+        expression,
+        EvaluationDemand::Value,
+        crate::RootScope::Port(0),
+    );
     let input = builder
         .add_value(
             integer.clone(),
             crate::ValueOrigin::Expr {
                 node: project,
-                expr: expression,
+                root,
             },
         )
         .unwrap();
@@ -452,7 +497,7 @@ fn collection_fragment(
         .add_project(
             project,
             empty,
-            Box::from([(expression, input)]),
+            Box::from([(root, input)]),
             Box::from([input]),
         )
         .unwrap();
@@ -499,6 +544,7 @@ fn collection_fragment(
             },
         )
         .unwrap();
+    crate::tests::unit_fixture::seal_pure_unit(&mut builder, project);
     let fragment = builder
         .finish_structure(
             unpivot,
@@ -518,6 +564,7 @@ fn collection_fragment(
 
 #[test]
 fn borrowed_complete_list_and_map_packages_keep_resource_stage_on_original_decode_scope() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     let mut list = ListBuilder::new(Int32Builder::new()).with_field(Arc::new(Field::new(
         "item",
         DataType::Int32,
@@ -543,8 +590,16 @@ fn borrowed_complete_list_and_map_packages_keep_resource_stage_on_original_decod
         map.append(true).unwrap();
     }
     for (pool_id, backing, is_map) in [
-        (0, original_pool(Arc::new(list.finish())), false),
-        (u32::MAX, original_pool(Arc::new(map.finish())), true),
+        (
+            0,
+            original_pool(Arc::new(list.finish()), &mut fixture_constants),
+            false,
+        ),
+        (
+            u32::MAX,
+            original_pool(Arc::new(map.finish()), &mut fixture_constants),
+            true,
+        ),
     ] {
         let address = crate::ConstantReference {
             pool: crate::ConstantPoolId::new(pool_id),
@@ -555,9 +610,12 @@ fn borrowed_complete_list_and_map_packages_keep_resource_stage_on_original_decod
         } else {
             UnpivotConstant::Int32List(address)
         };
-        let (fragment, _) =
-            collection_fragment(std::slice::from_ref(&constant), backing.value_type());
-        let mut input = package_input(fragment);
+        let (fragment, _) = collection_fragment(
+            std::slice::from_ref(&constant),
+            backing.value_type(),
+            &mut fixture_constants,
+        );
+        let mut input = package_input(fragment, &mut fixture_constants);
         input
             .constants
             .insert(address.pool, backing.clone())
@@ -575,9 +633,11 @@ fn borrowed_complete_list_and_map_packages_keep_resource_stage_on_original_decod
 
 #[test]
 fn borrowed_result_package_counts_both_original_type_walks_in_existing_decode_scope() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     let id = FragmentId::new(981);
-    let (fragment, value) = literal_fragment(id, FragmentSink::Result, false);
-    let mut input = package_input(fragment.clone());
+    let (fragment, value) =
+        literal_fragment(id, FragmentSink::Result, false, &mut fixture_constants);
+    let mut input = package_input(fragment.clone(), &mut fixture_constants);
     input.result = Some(ResultPort {
         scalar_schema: None,
         fragment: id,
@@ -637,8 +697,14 @@ fn borrowed_result_package_counts_both_original_type_walks_in_existing_decode_sc
 
 #[test]
 fn borrowed_package_resource_stage_visits_original_fragment_types_on_decode_scope() {
-    let (fragment, _) = literal_fragment(FragmentId::new(982), FragmentSink::Noop, false);
-    let input = package_input(fragment);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let (fragment, _) = literal_fragment(
+        FragmentId::new(982),
+        FragmentSink::Noop,
+        false,
+        &mut fixture_constants,
+    );
+    let input = package_input(fragment, &mut fixture_constants);
     let control = BorrowedControl::new(None);
     let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
     let mut resources = ControlResourceCounter::default();
@@ -684,8 +750,14 @@ fn borrowed_package_resource_stage_visits_original_fragment_types_on_decode_scop
 
 #[test]
 fn borrowed_package_fragment_type_known_request_precedes_pending_control_refusal() {
-    let (fragment, _) = literal_fragment(FragmentId::new(983), FragmentSink::Noop, false);
-    let input = package_input(fragment);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let (fragment, _) = literal_fragment(
+        FragmentId::new(983),
+        FragmentSink::Noop,
+        false,
+        &mut fixture_constants,
+    );
+    let input = package_input(fragment, &mut fixture_constants);
     let spelling = "q".repeat(255);
     let baseline = BorrowedControl::new(None);
     let mut before = CompileCheckpoints::try_new(&baseline, CompilePhase::Decode).unwrap();

@@ -25,8 +25,8 @@ use crate::{
         ConnectorPayloadProjectionLimits, decode_connector_payloads, encode_connector_payloads,
     },
     physical_expression_v2::{
-        ExpressionProjectionLimits, ExpressionTypeIds, decode_expression_definitions,
-        encode_expression_definitions,
+        ExpressionDefinitionSource, ExpressionProjectionLimits, ExpressionTypeIds,
+        decode_expression_definitions, encode_expression_definitions,
     },
     physical_properties_v2::PhysicalPropertyProjectionLimits,
     physical_provider_binding_v2::{
@@ -47,6 +47,7 @@ use novarocks_connector_contract::{
     ConnectorInstanceId, ConnectorProviderId, ConnectorReadBinding, ConnectorReadInputVersion,
     ConnectorReadRelationKind, ConnectorReadRelationPayload,
 };
+use novarocks_expression_contract::{ExprId, RootOrdinal};
 use novarocks_proto_models::physical_control_v2::Empty;
 use novarocks_type_contract::{
     CompileControlError, FunctionValueType, PureCompileControl, SemanticParameters,
@@ -260,7 +261,7 @@ fn source() -> p::PhysicalNode {
             ty,
         }]),
         predicate_guarantees: Box::from([p::PredicateGuarantee {
-            predicate: p::ExprId::new(u32::MAX),
+            predicate: RootOrdinal::new(1),
             kind: p::PredicateGuaranteeKind::PruningOnly,
         }]),
         provided_properties: property(),
@@ -269,6 +270,7 @@ fn source() -> p::PhysicalNode {
     // author clones schema and provider output columns independently).
     let column = relation.schema()[0].column.clone();
     p::PhysicalNode {
+        expressions: None,
         id: p::NodeId::new(u32::MAX),
         inputs: Box::from([p::NodeId::new(0)]),
         required_inputs: Box::from([property()]),
@@ -286,9 +288,9 @@ fn source() -> p::PhysicalNode {
             },
             provider_outputs: Box::from([(column, p::ValueId::new(u32::MAX))]),
             residuals: Box::from([
-                p::ExprId::new(u32::MAX),
-                p::ExprId::new(0),
-                p::ExprId::new(u32::MAX),
+                RootOrdinal::new(1),
+                RootOrdinal::new(0),
+                RootOrdinal::new(1),
             ]),
             derived_values: Box::from([p::ValueId::new(0), p::ValueId::new(u32::MAX)]),
         },
@@ -305,6 +307,7 @@ fn wire_property() -> wire::PhysicalProperties {
 }
 fn expected() -> wire::PhysicalNode {
     wire::PhysicalNode {
+        expressions: None,
         id: u32::MAX,
         input_node_ids: vec![0],
         required_inputs: vec![wire_property()],
@@ -324,7 +327,7 @@ fn expected() -> wire::PhysicalNode {
                 column_payload_id: Some(u32::MAX),
                 value_id: Some(u32::MAX),
             }],
-            residual_expr_ids: vec![u32::MAX, 0, u32::MAX],
+            residual_roots: vec![1, 0, 1],
             derived_value_ids: vec![0, u32::MAX],
         })),
     }
@@ -335,6 +338,43 @@ fn wire_scan(n: &mut wire::PhysicalNode) -> &mut wire::ScanNode {
         _ => unreachable!(),
     }
 }
+
+fn unit_from_sources(
+    nodes: impl IntoIterator<Item = novarocks_expression_contract::ExprNode>,
+    values: &[p::ValueDef],
+    control: &dyn PureCompileControl,
+) -> novarocks_expression_contract::BoundExprSet {
+    use novarocks_expression_contract::{BoundExprSetBuilder, ExprPort, RootScope, UnitLimits};
+    use novarocks_type_contract::{CompileCheckpoints, EvaluationDemand};
+    let mut builder = BoundExprSetBuilder::new(UnitLimits {
+        expression_semantic_depth: p::PlanLimits::FROZEN.expression_semantic_depth,
+    });
+    for node in nodes {
+        let demand = if *node.ty.data_type() == DataType::Boolean {
+            EvaluationDemand::TruthOnly
+        } else {
+            EvaluationDemand::Value
+        };
+        let id = builder.add(node.lambda_scope, node.ty, node.kind).unwrap();
+        assert_eq!(id, node.id);
+        builder.root(id, demand, RootScope::Port(0)).unwrap();
+    }
+    let ports = vec![ExprPort {
+        values: values
+            .iter()
+            .map(|value| (value.id, value.ty.clone()))
+            .collect(),
+    }];
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate).unwrap();
+    let unit = builder
+        .seal(ports, &mut work)
+        .unwrap()
+        .finish(std::collections::BTreeMap::new(), &mut work)
+        .unwrap();
+    work.finish().unwrap();
+    unit
+}
+
 fn with_tokens<R>(
     node: &p::PhysicalNode,
     c: &Control,
@@ -464,33 +504,29 @@ fn with_token_payload_mode<R>(
         binding_limits(),
     )
     .unwrap();
-    let nodes = [0, u32::MAX].map(|id| p::ExprNode {
-        id: p::ExprId::new(id),
-        owner: p::NodeId::new(u32::MAX),
-        lambda_scope: None,
-        ty: ty.clone(),
-        kind: p::ExprKind::Value(p::ValueId::new(id)),
+    let nodes = [0, u32::MAX].into_iter().enumerate().map(|(ordinal, id)| {
+        novarocks_expression_contract::ExprNode {
+            id: ExprId::new(ordinal as u32),
+            lambda_scope: None,
+            ty: ty.clone(),
+            kind: novarocks_expression_contract::ExprKind::Value(p::ValueId::new(id)),
+        }
     });
-    let arena = p::ExprArena::try_from_definitions_observed(
-        nodes.into_iter(),
-        &p::PlanLimits::default(),
-        c,
-    )
-    .unwrap();
-    let expr_inputs = arena
+    let unit = unit_from_sources(nodes, &defs, c);
+    let expr_inputs = unit
+        .definitions()
         .iter()
-        .map(|(id, _)| ExpressionTypeIds {
-            expr: *id,
+        .map(|node| ExpressionTypeIds {
+            expr: node.id,
             value_type_id: 0,
             lambda_parameter_type_ids: &[],
             function_binding_id: None,
-            aggregate_binding_id: None,
         })
         .collect::<Vec<_>>();
     let parameters = SemanticParameters::try_new([]).unwrap();
     let pools = p::ConstantPools::empty();
     let expressions = encode_expression_definitions(
-        &arena,
+        Some(ExpressionDefinitionSource::from_unit(&unit)),
         &expr_inputs,
         &types,
         &functions,
@@ -502,8 +538,10 @@ fn with_token_payload_mode<R>(
         c,
     )
     .unwrap();
+    let wire_roots = crate::test_constants::wire_roots(&unit);
     let rdexpr = decode_expression_definitions(
         expressions.as_wire(),
+        &wire_roots,
         &rdvalues,
         &rdfns,
         &rdaggs,
@@ -785,7 +823,7 @@ fn scan_independent_layout_selected_child_and_all_seven_caps_in_both_directions(
                 2 * (std::mem::size_of::<p::NodeId>()
                     + std::mem::size_of::<p::PhysicalProperties>()
                     + 4 * std::mem::size_of::<p::ValueId>()
-                    + 3 * std::mem::size_of::<p::ExprId>()
+                    + 3 * std::mem::size_of::<RootOrdinal>()
                     + std::mem::size_of::<(p::ProviderColumnReference, p::ValueId)>())
                     + std::mem::size_of::<p::Relation>()
                     + shared
@@ -852,7 +890,7 @@ fn scan_required_presence_and_unknown_references_reject_before_emission() {
                 9 => wire_scan(&mut raw).provider_outputs[0].column_payload_id = Some(99),
                 10 => wire_scan(&mut raw).provider_outputs[0].value_id = None,
                 11 => wire_scan(&mut raw).provider_outputs[0].value_id = Some(99),
-                12 => wire_scan(&mut raw).residual_expr_ids[0] = 99,
+                12 => wire_scan(&mut raw).residual_roots[0] = 99,
                 _ => unreachable!(),
             }
             c.arm(None);
@@ -967,7 +1005,7 @@ fn scan_source_association_requires_original_relation_payload_and_type_namespace
 fn scan_namespace_counts_and_wire_capacity_are_gated_before_traversal() {
     let mut node = source();
     if let p::NodeKind::Scan { residuals, .. } = &mut node.kind {
-        *residuals = vec![p::ExprId::new(0); 320].into_boxed_slice();
+        *residuals = vec![RootOrdinal::new(0); 320].into_boxed_slice();
     }
     let c = Control::default();
     with_tokens(
@@ -988,7 +1026,7 @@ fn scan_namespace_counts_and_wire_capacity_are_gated_before_traversal() {
             ));
             assert!(!c.trace().iter().any(|(_, u)| *u == 256));
             let mut raw = expected();
-            wire_scan(&mut raw).residual_expr_ids = vec![0; 320];
+            wire_scan(&mut raw).residual_roots = vec![0; 320];
             c.arm(None);
             assert!(matches!(
                 prepare_scan_node_decode(&raw, rdrelations, rdexpr, SOURCE, low),
@@ -996,7 +1034,7 @@ fn scan_namespace_counts_and_wire_capacity_are_gated_before_traversal() {
             ));
             assert!(!c.trace().iter().any(|(_, u)| *u == 256));
             let mut raw = expected();
-            wire_scan(&mut raw).residual_expr_ids.reserve_exact(SOURCE);
+            wire_scan(&mut raw).residual_roots.reserve_exact(SOURCE);
             c.arm(None);
             assert!(matches!(
                 prepare_scan_node_decode(&raw, rdrelations, rdexpr, SOURCE, limits()),
@@ -1021,11 +1059,11 @@ fn scan_every_small_original_control_prefix_and_real_wide_quantum_are_primary() 
         for ordinary in [false, true] {
             let mut node = source();
             if ordinary && let p::NodeKind::Scan { residuals, .. } = &mut node.kind {
-                residuals[0] = p::ExprId::new(99);
+                residuals[0] = RootOrdinal::new(99);
             }
             let mut raw = expected();
             if ordinary {
-                wire_scan(&mut raw).residual_expr_ids[0] = 99;
+                wire_scan(&mut raw).residual_roots[0] = 99;
             }
             let c = Control::default();
             with_tokens(
@@ -1076,7 +1114,7 @@ fn scan_every_small_original_control_prefix_and_real_wide_quantum_are_primary() 
     }
     let mut node = source();
     if let p::NodeKind::Scan { residuals, .. } = &mut node.kind {
-        *residuals = vec![p::ExprId::new(0); 320].into_boxed_slice();
+        *residuals = vec![RootOrdinal::new(0); 320].into_boxed_slice();
     }
     let c = Control::default();
     with_tokens(
@@ -1315,7 +1353,7 @@ fn scan_parent_ordinary_tail_and_real_320_residual_occurrences() {
     let c = Control::default();
     let mut node = source();
     if let p::NodeKind::Scan { residuals, .. } = &mut node.kind {
-        *residuals = vec![p::ExprId::new(0); 320].into_boxed_slice();
+        *residuals = vec![RootOrdinal::new(0); 320].into_boxed_slice();
     }
     with_tokens(
         &node,
@@ -1341,7 +1379,7 @@ fn scan_parent_ordinary_tail_and_real_320_residual_occurrences() {
             finish(work, Ok(())).unwrap();
             assert_eq!(
                 match raw.kind.as_ref().unwrap() {
-                    wire::physical_node::Kind::Scan(scan) => scan.residual_expr_ids.len(),
+                    wire::physical_node::Kind::Scan(scan) => scan.residual_roots.len(),
                     _ => panic!("expected actual Scan"),
                 },
                 320
@@ -1366,7 +1404,7 @@ fn scan_parent_ordinary_tail_and_real_320_residual_occurrences() {
             assert!(c.trace().iter().any(|(_, units)| *units == 256));
             let mut invalid = expected();
             if let Some(wire::physical_node::Kind::Scan(scan)) = &mut invalid.kind {
-                scan.residual_expr_ids.push(123456);
+                scan.residual_roots.push(123456);
             }
             let run = || {
                 let mut work = CompileCheckpoints::try_new(

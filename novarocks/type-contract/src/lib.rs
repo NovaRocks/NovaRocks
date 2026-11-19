@@ -36,6 +36,7 @@ pub use array_common::{
     list_value_type_with_construction,
 };
 mod array_generate;
+mod call_context;
 mod carrier_parameters;
 mod coercion;
 mod comparison;
@@ -44,6 +45,7 @@ mod compile_control;
 mod control_flow;
 mod depth_profile;
 mod effects;
+pub use call_context::*;
 mod function;
 mod largeint;
 mod logical;

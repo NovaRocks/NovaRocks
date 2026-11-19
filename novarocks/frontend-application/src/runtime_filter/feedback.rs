@@ -603,6 +603,7 @@ fn connector_values(
 
 #[cfg(test)]
 mod tests {
+    mod original_feedback;
     use arrow::datatypes::DataType;
     use novarocks_execution::runtime_filter::contribution::ValueDomainDelta;
     use novarocks_proto_codec::lifecycle::AttemptId;

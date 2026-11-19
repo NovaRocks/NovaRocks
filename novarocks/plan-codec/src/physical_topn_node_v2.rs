@@ -85,7 +85,10 @@ fn raw(input: &wire::PhysicalNode) -> Result<&wire::TopNNode, Error> {
         _ => Err(invalid("node is not TopN")),
     }
 }
-type Collections<'a> = (&'a [(p::ExprId, p::ValueId)], &'a [p::AggregateCall]);
+type Collections<'a> = (
+    &'a [(novarocks_expression_contract::RootOrdinal, p::ValueId)],
+    &'a [p::AggregateCall],
+);
 fn physical_collections(reduction: &p::TopNReduction) -> Collections<'_> {
     match reduction {
         p::TopNReduction::Rows => (&[], &[]),
@@ -156,7 +159,7 @@ fn encoded_expr(
     e: &EncodedExpressions<'_, '_, '_>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<(), Error> {
-    let found = e.expression_observed(id, w)?.is_some();
+    let found = e.root_expression_observed(id, w)?.is_some();
     completed(
         if found {
             Ok(())
@@ -171,7 +174,7 @@ fn decoded_expr(
     e: &DecodedExpressions<'_, '_, '_>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<(), Error> {
-    let found = e.definition_observed(id, w)?.is_some();
+    let found = e.root_definition_observed(id, w)?.is_some();
     completed(
         if found {
             Ok(())
@@ -229,7 +232,7 @@ fn encode_root_model(
         add(
             bytes::<p::SortExpr>(keys.len())?,
             add(
-                bytes::<(p::ExprId, p::ValueId)>(groups.len())?,
+                bytes::<(novarocks_expression_contract::RootOrdinal, p::ValueId)>(groups.len())?,
                 bytes::<p::AggregateCall>(calls.len())?,
             )?,
         )?,
@@ -413,7 +416,8 @@ fn decode_root_model(
     if roots {
         decode_header_requests(input, port, &mut model)?;
         model.request::<p::SortExpr>(b.order_by.len(), 2)?;
-        model.request::<(p::ExprId, p::ValueId)>(groups.len(), 2)?;
+        model
+            .request::<(novarocks_expression_contract::RootOrdinal, p::ValueId)>(groups.len(), 2)?;
         model.request::<p::AggregateCall>(calls.len(), 2)?;
     }
     Ok((model, known))
@@ -439,13 +443,7 @@ fn prepare_decode_core<'parent>(
         };
     if admit.is_some() && same {
         e.values().retained_floor_header_admitted()?;
-        add(
-            e.retained_floor_header_in()?,
-            add(
-                a.functions().retained_output_floor()?,
-                a.retained_output_floor()?,
-            )?,
-        )?;
+        e.owned_binding_floor(a.functions(), Some(a))?;
     }
     let mut early = if admit.is_some()
         && same
@@ -498,17 +496,14 @@ fn prepare_decode_core<'parent>(
     node_gate(&model, source, e.values().count(), l.node, &mut admit)?;
     count_prefix(model.inputs, model.items, source, known, l.node, w)?;
     node_facts(&model, source, e.values().count(), l.node, &mut admit, w)?;
-    let borrowed = e.retained_floor_observed(w)?;
-    let owned = add(
-        a.functions().retained_output_floor()?,
-        a.retained_output_floor()?,
-    )?;
-    let dependency = add(borrowed, owned)?;
+    e.retained_floor_observed(w)?;
+    let dependency = e.owned_binding_floor(a.functions(), Some(a))?;
     floor(source, dependency, w)?;
     if !roots_prepared {
         decode_header_requests(input, port, &mut model)?;
         model.request::<p::SortExpr>(b.order_by.len(), 2)?;
-        model.request::<(p::ExprId, p::ValueId)>(groups.len(), 2)?;
+        model
+            .request::<(novarocks_expression_contract::RootOrdinal, p::ValueId)>(groups.len(), 2)?;
         model.request::<p::AggregateCall>(calls.len(), 2)?;
     }
     node_gate(&model, source, e.values().count(), l.node, &mut admit)?;
@@ -563,7 +558,7 @@ fn prepare_decode_core<'parent>(
         node_facts(&model, source, e.values().count(), l.node, &mut admit, w)?
     };
     for key in &b.order_by {
-        decoded_expr(required(key.expr_id, w)?, e, w)?;
+        decoded_expr(required(key.root_ordinal, w)?, e, w)?;
         completed(
             properties::decode_direction(key.direction).map_err(Error::from),
             w,
@@ -610,6 +605,7 @@ fn emit_encode(
         }
     };
     let output = wire::PhysicalNode {
+        expressions: None,
         id: input.id.get(),
         input_node_ids: inputs,
         required_inputs,
@@ -651,6 +647,7 @@ fn emit_decode(
         }
     };
     let output = p::PhysicalNode {
+        expressions: None,
         id: p::NodeId::new(input.id),
         inputs,
         required_inputs,

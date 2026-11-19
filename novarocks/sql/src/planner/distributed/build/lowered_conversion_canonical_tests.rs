@@ -21,7 +21,7 @@ use novarocks_type_contract::{NR_LOGICAL_TYPE_KEY, SemanticParameterKey, Semanti
 fn assert_selection(
     captured: &crate::binding::CapturedLogicalCallArguments,
     selected: &novarocks_functions::FunctionBindingSelection,
-    source: &novarocks_physical_plan::ExprNode,
+    source: &novarocks_expression_contract::ExprNode,
 ) {
     let binding = captured.binding();
     let target = binding
@@ -70,8 +70,8 @@ fn canonical_conversion_constant_none_intermediate_target_and_following_cast_are
         };
         let final_type = ValueType::new(final_type, false);
         let owner = finish(cast(input.clone(), final_type.clone(), decimal));
-        let (fragment, source) = conversion(&owner);
-        let receipt = loan(&owner, fragment, source, &Control::default()).unwrap();
+        let (fragment, unit_node, source) = conversion(&owner);
+        let receipt = loan(&owner, fragment, unit_node, source, &Control::default()).unwrap();
         let selected = receipt
             .canonical_selection()
             .expect("same-emission conversion selection");
@@ -81,7 +81,7 @@ fn canonical_conversion_constant_none_intermediate_target_and_following_cast_are
             decimal
         );
         assert_eq!(receipt.captured().constant_policy(), policy());
-        let actual = source_constant(&owner, fragment, receipt.arguments()[0]);
+        let actual = source_constant(&owner, unit_node, receipt.arguments()[0]);
         assert_eq!(actual.ordinal(), 1);
         assert_eq!(actual.try_utf8().unwrap(), Some("{\"kept\":7}"));
         assert_eq!(actual.value_type(), &json(false));
@@ -120,7 +120,7 @@ fn canonical_conversion_constant_none_intermediate_target_and_following_cast_are
                 .as_slice()
         );
         let clone = owner.clone();
-        let copied = loan(&clone, fragment, source, &Control::default()).unwrap();
+        let copied = loan(&clone, fragment, unit_node, source, &Control::default()).unwrap();
         assert!(Arc::ptr_eq(selected, copied.canonical_selection().unwrap()));
         assert!(std::ptr::eq(receipt.captured(), copied.captured()));
         assert!(std::ptr::eq(
@@ -140,9 +140,8 @@ fn canonical_conversion_constant_none_intermediate_target_and_following_cast_are
             final_type
         );
         if *final_type.data_type() == DataType::LargeUtf8 {
-            let wrapper = fragment.expressions().iter().find_map(|(_, expression)|
-                matches!(&expression.kind, ContractExprKind::Cast { expr, .. } if *expr == source.id)
-                    .then_some(expression)).expect("separate same-domain carrier CAST");
+            let wrapper = unit_node.expressions.as_ref().unwrap().definitions().iter().find(|expression|
+                matches!(&expression.kind, ContractExprKind::Cast { expr, .. } if *expr == source.id)).expect("separate same-domain carrier CAST");
             let ContractExprKind::Cast {
                 target,
                 decimal_overflow_policy,
@@ -167,11 +166,11 @@ fn canonical_conversion_constant_none_intermediate_target_and_following_cast_are
                 Some(&SemanticParameterValue::AllowThrowException(false))
             );
             assert!(matches!(
-                loan(&owner, fragment, wrapper, &Control::default()),
+                loan(&owner, fragment, unit_node, wrapper, &Control::default()),
                 Err(SqlSourceJournalError::MissingEntry)
             ));
         } else {
-            assert!(!fragment.expressions().iter().any(|(_, expression)|
+            assert!(!unit_node.expressions.as_ref().unwrap().definitions().iter().any(|expression|
                 matches!(&expression.kind, ContractExprKind::Cast { expr, .. } if *expr == source.id)));
         }
     }
@@ -218,29 +217,36 @@ fn canonical_conversion_raw_lambda_uses_original_lexical_scope_and_none_request(
         .lower_expression(NodeId::new(73), &expression, &BTreeMap::new())
         .unwrap();
     assert_eq!(visitor.call_sources.expression_entries.len(), 1);
-    let (_, entry) = visitor
+    let (key, entry) = visitor
         .call_sources
         .expression_entries
         .iter()
         .next()
         .unwrap();
+    let crate::planner::distributed::build::unit_source::ScalarSourceSite::Node {
+        fragment: _,
+        node: key_node,
+    } = key.site.clone()
+    else {
+        panic!("the original fixture owns a real node source")
+    };
     let fragment = &visitor.fragments[&ROOT_FRAGMENT_ID];
-    let source=fragment.expressions().iter().find_map(|(_,node)|
-        matches!(&node.kind,ContractExprKind::FunctionCall {function,..} if function.function_id.as_str()==CONVERSION)
-            .then_some(node)).unwrap();
+    let unit = fragment.construction_unit(key_node).unwrap();
+    let source=unit.definitions().find(|node|
+        matches!(&node.kind,ContractExprKind::FunctionCall {function,..} if function.function_id.as_str()==CONVERSION)).unwrap();
     let selected = entry
         .canonical_operational
         .as_ref()
         .expect("scoped conversion canonical receipt")
         .selected();
     assert_selection(entry.captured.captured(), selected, source);
-    assert_eq!(source.owner, NodeId::new(73));
+    assert_eq!(key_node, NodeId::new(73));
     assert_eq!(source.lambda_scope, Some(lambda));
     assert_eq!(entry.lambda_scope, Some(lambda));
     let ContractExprKind::Lambda {
         parameter_types,
         body,
-    } = &fragment.expressions().get(lambda).unwrap().kind
+    } = &unit.definition(lambda).unwrap().kind
     else {
         panic!("actual Lambda author");
     };
@@ -250,11 +256,17 @@ fn canonical_conversion_raw_lambda_uses_original_lexical_scope_and_none_request(
     };
     assert_eq!(entry.arguments.as_ref(), args.as_ref());
     assert_eq!(parameter_types.as_ref(), &[json(false)]);
-    let parameter = fragment.expressions().get(args[0]).unwrap();
+    let parameter = unit.definition(args[0]).unwrap();
     assert!(matches!(parameter.kind,
         ContractExprKind::LambdaParameter { lambda: scope, ordinal: 0 } if scope == lambda));
     assert_eq!(parameter.ty, json(false));
     assert_eq!(parameter.lambda_scope, Some(lambda));
-    validate_expression_source_entry_observed(entry, source, &mut visitor.work).unwrap();
+    validate_expression_source_entry_observed(
+        entry,
+        crate::planner::distributed::build::unit_source::ScalarUnitOwner::Node(key_node),
+        source,
+        &mut visitor.work,
+    )
+    .unwrap();
     visitor.work.finish().unwrap();
 }

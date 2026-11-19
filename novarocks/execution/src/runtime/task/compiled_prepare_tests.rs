@@ -24,7 +24,7 @@ use novarocks_types::{QueryId, UniqueId};
 
 use super::*;
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::compiled_program::tests::{SEED_42_FIRST, SeedMode, program};
+use crate::exec::expr::fixtures::{SEED_42_FIRST, SeedMode, program};
 use crate::exec::fragment::program::FragmentContractVersion;
 use crate::exec::fragment::program::FragmentNodeId;
 use crate::exec::node::scan::{BoundScanRanges, ScanSource};
@@ -136,8 +136,7 @@ pub(in crate::runtime::task) fn sql_gather_receiver_program() -> Arc<LocalProgra
     use novarocks_sql::compiler::{
         DEFAULT_COMPLETION_LIMITS, SessionOptimizerSettings, SqlCompileControl, SqlCompileIntent,
         SqlCompiler, SqlFinalPlanCompileRequest, SqlPlanningEnvironment, SqlSessionContext,
-        SqlStatementInput, author_fragment_package_semantics, builtin_sql_function_catalog,
-        noop_constant_evaluator,
+        SqlStatementInput, builtin_sql_function_catalog, noop_constant_evaluator,
     };
 
     // Explicit table-free fixture limits; no scan or runtime creator is mocked.
@@ -188,15 +187,14 @@ pub(in crate::runtime::task) fn sql_gather_receiver_program() -> Arc<LocalProgra
         .expect("SELECT 1 needs no provider observation")
         .into_parts()
         .0;
-    let semantics = author_fragment_package_semantics(&source, policy, &control).unwrap();
-    let mut uses = BTreeMap::new();
-    let mut calls = BTreeMap::new();
+    source.require_statement_constant_policy(policy).unwrap();
     let mut pruning = BTreeMap::new();
     let mut admissions = BTreeMap::new();
-    for (id, authored) in semantics {
-        uses.insert(id, authored.expression_uses);
-        calls.insert(id, authored.calls);
-        pruning.insert(id, authored.pruning);
+    for &id in source.plan().fragments().keys() {
+        pruning.insert(
+            id,
+            novarocks_physical_plan::FrozenFragmentPruning::try_new(id, vec![], &control).unwrap(),
+        );
         admissions.insert(
             id,
             FragmentPackageAdmission {
@@ -226,8 +224,6 @@ pub(in crate::runtime::task) fn sql_gather_receiver_program() -> Arc<LocalProgra
         source.plan(),
         &BTreeMap::new(),
         &BTreeMap::new(),
-        &uses,
-        &calls,
         &pruning,
         &admissions,
         &control,
@@ -244,7 +240,7 @@ pub(in crate::runtime::task) fn sql_gather_receiver_program() -> Arc<LocalProgra
     Arc::new(
         compile_fragment(
             validated,
-            &crate::exec::expr::compiled_program::tests::rng_subset(),
+            &novarocks_functions::testkit::rng_subset(),
             LocalCompileOptions {
                 pipeline_dop: NonZeroUsize::new(1).unwrap(),
                 root_sink_dop: Some(NonZeroUsize::new(1).unwrap()),
@@ -529,14 +525,17 @@ fn incomplete_or_foreign_task_capabilities_are_refused_before_host_acquisition()
     use crate::runtime::task_control::test_support::Owner;
     use novarocks_execution_contract::{TaskConclusionPort, TaskFailurePhase};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    struct FirstHostCall(AtomicUsize);
-    impl crate::runtime::task::io::TaskCommitPort for FirstHostCall {
-        fn acquire(
-            &self,
-            _: UniqueId,
-        ) -> ExecutionResult<Box<dyn crate::runtime::task::io::TaskCommitRegistration>> {
+    // Result-writer open is the first host acquisition. A submission-boundary
+    // refusal must not reach it.
+    struct FirstResultOpen(AtomicUsize);
+    impl TaskResultWriter for FirstResultOpen {
+        fn open(&self, _: ResultWriteSpec) -> Result<Arc<dyn TaskResultSession>, TaskIoError> {
             self.0.fetch_add(1, Ordering::SeqCst);
-            Err(novarocks_functions::KernelFailure::ResourceExhausted.into())
+            Err(TaskIoError::new(
+                crate::runtime::task::io::TaskIoOperation::ResultOpen,
+                crate::runtime::task::io::TaskIoErrorKind::Unavailable,
+                "result writer probe",
+            ))
         }
     }
     // No first-host-call refusal is allowed to hide a missing role/control
@@ -544,9 +543,12 @@ fn incomplete_or_foreign_task_capabilities_are_refused_before_host_acquisition()
     for scenario in 0..6 {
         let owner = Owner::new();
         let foreign = Owner::new();
-        let calls = Arc::new(FirstHostCall(AtomicUsize::new(0)));
+        let writer_calls = Arc::new(FirstResultOpen(AtomicUsize::new(0)));
         let control = Arc::new(owner.view(TaskFailurePhase::Execution));
-        let mut context = LocalTaskPrepareContext::default().with_task_commit_port(calls.clone());
+        let mut context = LocalTaskPrepareContext {
+            result_writer: writer_calls.clone(),
+            ..LocalTaskPrepareContext::default()
+        };
         context = match scenario {
             0 => context
                 .with_result_identity(owner.identity())
@@ -588,9 +590,9 @@ fn incomplete_or_foreign_task_capabilities_are_refused_before_host_acquisition()
             "scenario {scenario}"
         );
         assert_eq!(
-            calls.0.load(Ordering::SeqCst),
+            writer_calls.0.load(Ordering::SeqCst),
             0,
-            "scenario {scenario} reached host acquisition"
+            "scenario {scenario} reached result-writer acquisition"
         );
         assert!(error.cleanup_diagnostics().is_empty());
     }

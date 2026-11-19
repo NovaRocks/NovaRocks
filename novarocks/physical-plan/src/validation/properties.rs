@@ -22,8 +22,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::FrozenCallError;
 use crate::frozen_calls::OccurrencePropertyProof;
 use crate::{
-    Distribution, ExprId, Fragment, FragmentCuts, NodeId, NodeKind, PhysicalNode, PhysicalPlan,
-    RowMultiplicity, ValueId,
+    Distribution, Fragment, FragmentCuts, NodeId, NodeKind, PhysicalNode, PhysicalPlan,
+    RootOrdinal, RowMultiplicity, ValueId,
 };
 use novarocks_type_contract::CompileCheckpoints;
 
@@ -35,11 +35,10 @@ type PropertyResourceAdmission<'a> = dyn FnMut(
     ) -> Result<(), novarocks_type_contract::CompileControlError>
     + 'a;
 
-/// Only old standalone definition validation consults migration-era binding
-/// bits. The frozen package route supplies a checked proof of the same source
-/// and its original meter; it cannot fall back to legacy expression facts.
+/// Local definition validation consumes sealed occurrence claims. The package
+/// route supplies a checked proof of the same source and its original meter.
 pub(crate) enum PropertyEffectSource<'proof, 'work, 'control> {
-    Legacy,
+    Sealed,
     Frozen {
         proof: &'proof OccurrencePropertyProof<'proof>,
         work: &'work mut CompileCheckpoints<'control>,
@@ -50,14 +49,16 @@ impl PropertyEffectSource<'_, '_, '_> {
         &mut self,
         fragment: &Fragment,
         node: NodeId,
-        expressions: impl IntoIterator<Item = ExprId>,
+        expressions: impl IntoIterator<Item = RootOrdinal>,
         allow_values: bool,
     ) -> Result<bool, FrozenCallError> {
         match self {
-            Self::Legacy => {
-                fragment_expressions_are_replica_deterministic(fragment, expressions, allow_values)
-                    .map_err(FrozenCallError::MissingLegacyMetadata)
-            }
+            Self::Sealed => node_expressions_are_replica_deterministic(
+                fragment,
+                node,
+                expressions,
+                allow_values,
+            ),
             Self::Frozen { proof, work } => {
                 proof.require_fragment(fragment, work)?;
                 if !allow_values {
@@ -66,10 +67,15 @@ impl PropertyEffectSource<'_, '_, '_> {
                     // The original graph walker allocates opaque scratch;
                     // this boundary does not claim its internal cooperation.
                     work.flush()?;
-                    let closed = crate::expression::expressions_have_closed_value_scope(
-                        fragment.expressions(),
-                        expressions,
-                    );
+                    let mut expressions = expressions.into_iter().peekable();
+                    let closed = if expressions.peek().is_none() {
+                        true
+                    } else {
+                        crate::expression::expressions_have_closed_value_scope(
+                            fragment.unit(node).ok_or(FrozenCallError::InvalidSite)?,
+                            expressions,
+                        )
+                    };
                     work.step()?;
                     work.flush()?;
                     if !closed {
@@ -86,20 +92,18 @@ impl PropertyEffectSource<'_, '_, '_> {
         fragment: &Fragment,
         node: NodeId,
         function: &crate::BoundTableFunction,
-        arguments: &[ExprId],
+        arguments: &[RootOrdinal],
     ) -> Result<bool, FrozenCallError> {
         match self {
-            Self::Legacy => Ok(function
-                .require_legacy_metadata()
-                .map_err(FrozenCallError::MissingLegacyMetadata)?
-                .volatility
-                == crate::FunctionVolatility::Immutable
-                && fragment_expressions_are_replica_deterministic(
+            Self::Sealed => {
+                let _ = (function, arguments);
+                node_expressions_are_replica_deterministic(
                     fragment,
+                    node,
                     arguments.iter().copied(),
                     true,
                 )
-                .map_err(FrozenCallError::MissingLegacyMetadata)?),
+            }
             Self::Frozen { proof, work } => {
                 proof.require_fragment(fragment, work)?;
                 proof.replica_safe(node, work)
@@ -159,8 +163,6 @@ impl std::error::Error for FragmentPropertyError {}
 /// this API does not claim a complete first-allocation model or host MEM grant.
 pub fn validate_fragment_output_properties_observed(
     fragment: &Fragment,
-    uses: &crate::PhysicalRootUses,
-    calls: &crate::FrozenFragmentCalls,
     limits: PlanLimits,
     source_retained_bytes: usize,
     projection_limits: crate::PropertyProofProjectionLimits,
@@ -170,8 +172,6 @@ pub fn validate_fragment_output_properties_observed(
         CompileCheckpoints::try_new(control, novarocks_type_contract::CompilePhase::Validate)?;
     let result = validate_fragment_output_properties_core(
         fragment,
-        uses,
-        calls,
         limits,
         source_retained_bytes,
         projection_limits,
@@ -190,8 +190,6 @@ pub fn validate_fragment_output_properties_observed(
 /// still requires its original resource author; this is only a scope port.
 pub fn validate_fragment_output_properties_in(
     fragment: &Fragment,
-    uses: &crate::PhysicalRootUses,
-    calls: &crate::FrozenFragmentCalls,
     limits: PlanLimits,
     source_retained_bytes: usize,
     projection_limits: crate::PropertyProofProjectionLimits,
@@ -202,8 +200,6 @@ pub fn validate_fragment_output_properties_in(
 ) -> Result<crate::PropertyProofProjectionFacts, FragmentPropertyError> {
     validate_fragment_output_properties_core(
         fragment,
-        uses,
-        calls,
         limits,
         source_retained_bytes,
         projection_limits,
@@ -214,8 +210,6 @@ pub fn validate_fragment_output_properties_in(
 
 fn validate_fragment_output_properties_core(
     fragment: &Fragment,
-    uses: &crate::PhysicalRootUses,
-    calls: &crate::FrozenFragmentCalls,
     limits: PlanLimits,
     source_retained_bytes: usize,
     projection_limits: crate::PropertyProofProjectionLimits,
@@ -227,9 +221,8 @@ fn validate_fragment_output_properties_core(
         work.flush()?;
         let proof = if let Some(parent) = admit.as_deref_mut() {
             let mut contribution = novarocks_type_contract::ControlOwnedResourceFacts::default();
-            let proof = calls.property_proof_in(
+            let proof = fragment.calls().property_proof_in(
                 fragment,
-                uses,
                 &limits,
                 source_retained_bytes,
                 projection_limits,
@@ -242,9 +235,8 @@ fn validate_fragment_output_properties_core(
             resources.merge(contribution)?;
             proof
         } else {
-            calls.property_proof(
+            fragment.calls().property_proof(
                 fragment,
-                uses,
                 &limits,
                 source_retained_bytes,
                 projection_limits,
@@ -661,7 +653,7 @@ fn nest_loop_join_output_distribution(
     children: ChildProperties<'_>,
     kind: crate::JoinKind,
     distribution: crate::NestLoopJoinDistribution,
-    predicate: Option<ExprId>,
+    predicate: Option<RootOrdinal>,
     source: &mut PropertyEffectSource<'_, '_, '_>,
 ) -> Result<Option<Distribution>, FrozenCallError> {
     let Some(mut output) =
@@ -920,7 +912,7 @@ pub(crate) fn validate_node_output_properties(
         node,
         path,
         errors,
-        &mut PropertyEffectSource::Legacy,
+        &mut PropertyEffectSource::Sealed,
     ) {
         // Legacy mode has no compile owner and cannot produce Control; any
         // new invariant failure must still prevent standalone publication.
@@ -951,8 +943,6 @@ pub(crate) fn validate_node_output_properties(
 pub fn derive_fragment_output_properties_observed(
     fragment: &Fragment,
     cuts: &FragmentCuts,
-    uses: &crate::PhysicalRootUses,
-    calls: &crate::FrozenFragmentCalls,
     limits: PlanLimits,
     source_retained_bytes: usize,
     projection_limits: crate::PropertyProofProjectionLimits,
@@ -969,8 +959,6 @@ pub fn derive_fragment_output_properties_observed(
     let result = derive_fragment_output_properties_core(
         fragment,
         cuts,
-        uses,
-        calls,
         limits,
         source_retained_bytes,
         projection_limits,
@@ -990,8 +978,6 @@ pub fn derive_fragment_output_properties_observed(
 pub fn derive_fragment_output_properties_in(
     fragment: &Fragment,
     cuts: &FragmentCuts,
-    uses: &crate::PhysicalRootUses,
-    calls: &crate::FrozenFragmentCalls,
     limits: PlanLimits,
     source_retained_bytes: usize,
     projection_limits: crate::PropertyProofProjectionLimits,
@@ -1007,8 +993,6 @@ pub fn derive_fragment_output_properties_in(
     derive_fragment_output_properties_core(
         fragment,
         cuts,
-        uses,
-        calls,
         limits,
         source_retained_bytes,
         projection_limits,
@@ -1020,8 +1004,6 @@ pub fn derive_fragment_output_properties_in(
 fn derive_fragment_output_properties_core(
     fragment: &Fragment,
     cuts: &FragmentCuts,
-    uses: &crate::PhysicalRootUses,
-    calls: &crate::FrozenFragmentCalls,
     limits: PlanLimits,
     source_retained_bytes: usize,
     projection_limits: crate::PropertyProofProjectionLimits,
@@ -1039,9 +1021,8 @@ fn derive_fragment_output_properties_core(
         work.flush()?;
         let proof = if let Some(parent) = admit.as_deref_mut() {
             let mut contribution = novarocks_type_contract::ControlOwnedResourceFacts::default();
-            let proof = calls.property_proof_in(
+            let proof = fragment.calls().property_proof_in(
                 fragment,
-                uses,
                 &limits,
                 source_retained_bytes,
                 projection_limits,
@@ -1054,9 +1035,8 @@ fn derive_fragment_output_properties_core(
             resources.merge(contribution)?;
             proof
         } else {
-            calls.property_proof(
+            fragment.calls().property_proof(
                 fragment,
-                uses,
                 &limits,
                 source_retained_bytes,
                 projection_limits,
@@ -1212,8 +1192,6 @@ fn derive_fragment_output_properties_core(
 /// neither these ceilings nor the returned facts grant host memory.
 pub fn derive_replica_sensitive_output_properties_observed(
     fragment: &Fragment,
-    uses: &crate::PhysicalRootUses,
-    calls: &crate::FrozenFragmentCalls,
     node: NodeId,
     limits: PlanLimits,
     source_retained_bytes: usize,
@@ -1230,9 +1208,8 @@ pub fn derive_replica_sensitive_output_properties_observed(
         CompileCheckpoints::try_new(control, novarocks_type_contract::CompilePhase::Validate)?;
     let result = (|| {
         work.flush()?;
-        let proof = calls.property_proof(
+        let proof = fragment.calls().property_proof(
             fragment,
-            uses,
             &limits,
             source_retained_bytes,
             projection_limits,
@@ -1349,7 +1326,7 @@ fn filter_output_properties_from(
     fragment: &Fragment,
     node: &PhysicalNode,
     children: ChildProperties<'_>,
-    predicates: &[ExprId],
+    predicates: &[RootOrdinal],
     source: &mut PropertyEffectSource<'_, '_, '_>,
 ) -> Result<Option<crate::PhysicalProperties>, FrozenCallError> {
     let Some(input) = node
@@ -1369,7 +1346,7 @@ fn project_output_properties_from(
     fragment: &Fragment,
     node: &PhysicalNode,
     children: ChildProperties<'_>,
-    expressions: &[(ExprId, ValueId)],
+    expressions: &[(RootOrdinal, ValueId)],
     source: &mut PropertyEffectSource<'_, '_, '_>,
 ) -> Result<Option<crate::PhysicalProperties>, FrozenCallError> {
     let Some(input) = node
@@ -1503,8 +1480,8 @@ fn derive_node_output_properties_from(
                 crate::SortMode::Analytic { partition_by }
                 | crate::SortMode::PartitionTopN { partition_by, .. } => partition_by,
             };
-            let partition_values = direct_order_values(fragment, partition_by);
-            let expected_ordering = derive_ordering(fragment, partition_by, order_by);
+            let partition_values = direct_order_values(fragment, node.id, partition_by);
+            let expected_ordering = derive_ordering(fragment, node.id, partition_by, order_by);
             let expected = crate::PhysicalProperties {
                 distribution: if matches!(mode, crate::SortMode::Global) {
                     Distribution::Singleton
@@ -1579,7 +1556,7 @@ fn derive_node_output_properties_from(
                 return Ok(None);
             };
             let required = node.required_inputs.first();
-            let expected_ordering = derive_ordering(fragment, &[], order_by);
+            let expected_ordering = derive_ordering(fragment, node.id, &[], order_by);
             let expected = crate::PhysicalProperties {
                 distribution: if matches!(
                     phase,
@@ -1756,9 +1733,7 @@ fn derive_node_output_properties_from(
                 let required = node.required_inputs.first();
                 let grouping_values = group_by
                     .iter()
-                    .map(|(expression, _)| {
-                        crate::expression_value(fragment.expressions(), *expression)
-                    })
+                    .map(|(expression, _)| crate::expression_value(fragment, node.id, *expression))
                     .collect::<Option<Vec<_>>>();
                 let colocated = input.is_some_and(|input| {
                     required.is_some_and(|required| required.distribution == input.distribution)
@@ -1952,6 +1927,22 @@ fn derive_node_output_properties_from(
             }
             return Ok(Some(expected));
         }
+        NodeKind::WriteLayoutKey { .. } => {
+            let Some(child) = node
+                .inputs
+                .first()
+                .and_then(|id| children.get(fragment, id))
+            else {
+                return Ok(None);
+            };
+            if target.actual(node, child) != child {
+                errors.push(ValidationError::new(
+                    path,
+                    "write layout key must preserve child row properties",
+                ));
+            }
+            return Ok(Some(child.clone()));
+        }
         NodeKind::PositionShard(spec) => {
             let Some(first) = node
                 .inputs
@@ -2062,31 +2053,73 @@ fn derive_node_output_properties_from(
     Ok(expected)
 }
 
-/// Fragment-scoped wrapper over the arena-level check in `expression`.
-pub(crate) fn fragment_expressions_are_replica_deterministic(
+/// Exact sealed occurrence claims, never legacy provenance. Static closure
+/// remains an independent prerequisite for closed inline expressions.
+pub(crate) fn node_expressions_are_replica_deterministic(
     fragment: &Fragment,
-    expressions: impl IntoIterator<Item = ExprId>,
+    node: NodeId,
+    expressions: impl IntoIterator<Item = RootOrdinal>,
     allow_values: bool,
-) -> Result<bool, crate::MissingLegacyBindingMetadata> {
-    crate::expressions_are_replica_deterministic(fragment.expressions(), expressions, allow_values)
+) -> Result<bool, FrozenCallError> {
+    let Some(definition) = fragment.nodes().get(&node) else {
+        return Err(FrozenCallError::InvalidSite);
+    };
+    if !allow_values {
+        let mut expressions = expressions.into_iter().peekable();
+        if expressions.peek().is_some() {
+            let Some(unit) = &definition.expressions else {
+                return Ok(false);
+            };
+            if !crate::expression::expressions_have_closed_value_scope(unit, expressions) {
+                return Ok(false);
+            }
+        }
+    }
+    if let Some(unit) = &definition.expressions {
+        for claim in unit.claims().values() {
+            if !crate::frozen_calls::replica::call_is_replica_equivalent(
+                crate::FunctionKind::Scalar,
+                &claim.effects,
+            ) {
+                return Ok(false);
+            }
+        }
+    }
+    for (site, call) in fragment.calls().entries() {
+        if site.node() == node {
+            let binding = fragment
+                .calls()
+                .binding(fragment, *site)
+                .ok_or(FrozenCallError::InvalidSite)?;
+            if !crate::frozen_calls::replica::call_is_replica_equivalent(
+                binding.kind(),
+                &call.effects,
+            ) {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
 }
 
 pub(crate) fn direct_order_values(
     fragment: &Fragment,
+    node: NodeId,
     ordering: &[crate::SortExpr],
 ) -> Option<Vec<ValueId>> {
     ordering
         .iter()
-        .map(|item| crate::expression_value(fragment.expressions(), item.expr))
+        .map(|item| crate::expression_value(fragment, node, item.expr))
         .collect()
 }
 
 pub(crate) fn derive_ordering(
     fragment: &Fragment,
+    node: NodeId,
     partition_by: &[crate::SortExpr],
     order_by: &[crate::SortExpr],
 ) -> Option<Vec<crate::OrderingKey>> {
-    crate::ordering_keys(fragment.expressions(), partition_by, order_by)
+    crate::ordering_keys(fragment, node, partition_by, order_by)
 }
 
 pub(crate) fn distribution_colocates_by(distribution: &Distribution, keys: &[ValueId]) -> bool {
@@ -2122,8 +2155,8 @@ fn validate_window_properties_from(
         .first()
         .and_then(|input| children.get(fragment, input))?;
     let required = node.required_inputs.first()?;
-    let expected_ordering = derive_ordering(fragment, &spec.partition_by, &spec.order_by);
-    let partition_values = direct_order_values(fragment, &spec.partition_by);
+    let expected_ordering = derive_ordering(fragment, node.id, &spec.partition_by, &spec.order_by);
+    let partition_values = direct_order_values(fragment, node.id, &spec.partition_by);
     let expected = input.clone();
     let actual = target.actual(node, &expected);
     let distribution_valid = if spec.partition_by.is_empty() {
@@ -2247,7 +2280,7 @@ fn validate_table_function_properties_from(
     target: PropertyOutputTarget,
     table: (
         &crate::BoundTableFunction,
-        &[ExprId],
+        &[RootOrdinal],
         &[crate::TableFunctionOutput],
     ),
     path: &str,
@@ -2276,7 +2309,7 @@ fn table_function_output_properties_from(
     children: ChildProperties<'_>,
     table: (
         &crate::BoundTableFunction,
-        &[ExprId],
+        &[RootOrdinal],
         &[crate::TableFunctionOutput],
     ),
     source: &mut PropertyEffectSource<'_, '_, '_>,

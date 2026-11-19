@@ -113,9 +113,8 @@ use arrow::record_batch::RecordBatch;
 
 use novarocks_spi::connector::ConnectorRequestContext;
 use novarocks_spi::connector::write_stack::{
-    ConnectorOpenWriterRequest, ConnectorWriteExecution, ConnectorWriterHandle,
-    MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES, WriteTargetOrdinal, WriterRowKind, row_count_to_wire,
-    target_ordinal_to_wire,
+    ConnectorOpenWriterRequest, ConnectorWriteExecution, ConnectorWriterHandle, WriteTargetOrdinal,
+    WriterRowKind, row_count_to_wire, target_ordinal_to_wire,
 };
 
 use crate::exec::chunk::{Chunk, record_batch_additional_bytes, record_batch_bytes};
@@ -507,15 +506,6 @@ fn encode_writer_completion(
                 error,
             )
         })?;
-        if bytes.len() > MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES {
-            return Err(
-                crate::exec::pipeline::writer_failure::WriterFailure::CommitFragmentLimit {
-                    requested: bytes.len(),
-                    limit: MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES,
-                }
-                .into(),
-            );
-        }
         let accounting = tracker
             .as_ref()
             .map(|tracker| TrackedBytes::try_new(bytes.capacity(), Arc::clone(tracker)))
@@ -2627,12 +2617,9 @@ pub(crate) mod tests {
             PureProviderCompileError, PureProviderManifestEntry, PureProviderProgramCatalog,
             PureProviderProgramDefinition,
         };
+        use novarocks_expression_contract::{ExprKind, RootScope};
         use novarocks_physical_plan::*;
-        use novarocks_type_contract::{
-            ControlShape, EvaluationDomainId, ExpressionControlFlow, ExpressionEffectContext,
-            ExpressionEvaluationDomain, ExpressionInvocation, ExpressionUseId, FunctionValueType,
-            SemanticParameters,
-        };
+        use novarocks_type_contract::{EvaluationDemand, FunctionValueType, SemanticParameters};
         use std::collections::BTreeMap;
         let control = FixtureCompileControl;
         assert_eq!(provider_schema.fields().len(), 1);
@@ -2701,8 +2688,10 @@ pub(crate) mod tests {
         let mut constants = ConstantPools::empty();
         constants.insert(pool_id, pool).unwrap();
         let cell = builder
-            .add_expression(
-                source,
+            .unit(source)
+            .unwrap()
+            .add(
+                None,
                 ty.clone(),
                 ExprKind::Constant(ConstantReference {
                     pool: pool_id,
@@ -2710,18 +2699,30 @@ pub(crate) mod tests {
                 }),
             )
             .unwrap();
+        let cell = builder
+            .unit(source)
+            .unwrap()
+            .root(cell, EvaluationDemand::Value, RootScope::AllPorts)
+            .unwrap();
         builder
             .add_values(source, Box::from([Box::from([cell])]), Box::from([value]))
             .unwrap();
         let read = builder
-            .add_expression(input, ty.clone(), ExprKind::Value(value))
+            .unit(input)
+            .unwrap()
+            .add(None, ty.clone(), ExprKind::Value(value))
+            .unwrap();
+        let read = builder
+            .unit(input)
+            .unwrap()
+            .root(read, EvaluationDemand::Value, RootScope::Port(0))
             .unwrap();
         let projected = builder
             .add_value(
                 ty.clone(),
                 ValueOrigin::Expr {
                     node: input,
-                    expr: read,
+                    root: read,
                 },
             )
             .unwrap();
@@ -2800,6 +2801,7 @@ pub(crate) mod tests {
             }]);
         builder
             .insert_node_unchecked(PhysicalNode {
+                expressions: None,
                 id: writer,
                 inputs: Box::from([input]),
                 required_inputs: Box::from([property(Distribution::Singleton)]),
@@ -2825,6 +2827,7 @@ pub(crate) mod tests {
             })
             .unwrap();
         let edge = EdgeId::new(9);
+        crate::exec::operators::family_fixture::seal_no_call_units(&mut builder);
         let fragment = builder
             .finish_definition(
                 writer,
@@ -2837,38 +2840,6 @@ pub(crate) mod tests {
                 novarocks_physical_plan::StagePlacementPolicy::Singleton,
             )
             .unwrap();
-        let roots = PhysicalExpressionRoots::try_new(&fragment, &control).unwrap();
-        let domain = EvaluationDomainId::new(0);
-        let mut invocations = vec![];
-        let mut bindings = vec![];
-        for (index, (site, root)) in roots.sites().iter().enumerate() {
-            let use_id = ExpressionUseId::new(index as u32);
-            invocations.push(ExpressionInvocation {
-                context: ExpressionEffectContext {
-                    use_id,
-                    domain,
-                    demand: root.demand,
-                },
-                definition: root.expr,
-                control: ControlShape::Eager,
-                arguments: Box::default(),
-            });
-            bindings.push((*site, use_id));
-        }
-        let flow = ExpressionControlFlow::try_new(
-            vec![ExpressionEvaluationDomain {
-                id: domain,
-                parent: None,
-                guard: None,
-            }],
-            invocations,
-            fragment.expressions(),
-            novarocks_type_contract::CompilePhase::Validate,
-            &control,
-        )
-        .unwrap();
-        let uses = PhysicalRootUses::try_new(&fragment, flow, bindings, &control).unwrap();
-        let calls = FrozenFragmentCalls::try_new(&fragment, &uses, vec![], &control).unwrap();
         let cut = OutboundFragmentCut {
             edge,
             kind: EdgeKind::Stream,
@@ -2897,6 +2868,7 @@ pub(crate) mod tests {
                 source_multiplicity: RowMultiplicity::SingleCopy,
                 destination: Distribution::Singleton,
                 destination_multiplicity: RowMultiplicity::SingleCopy,
+                routing_only: Box::default(),
             },
             source_port: novarocks_physical_plan::FragmentOutputPort::Root,
             delivery: novarocks_physical_plan::DeliveryRequirement::MustDrain,
@@ -2923,8 +2895,7 @@ pub(crate) mod tests {
                 constants,
                 version: PlanVersionId::try_new([71; 16]).unwrap(),
                 required: RequiredContracts::default(),
-                expression_uses: uses,
-                calls,
+                statement_constant_policy: crate::exec::expr::test_support::constant_policy(),
                 pruning: FrozenFragmentPruning::try_new(fragment.id(), vec![], &control).unwrap(),
                 fragment,
                 cuts: FragmentCuts {
@@ -2936,6 +2907,7 @@ pub(crate) mod tests {
                 scans: BTreeMap::new(),
                 writes: BTreeMap::from([(writer, draft)]),
                 annotations: Box::default(),
+                layouts: Default::default(),
             },
             FragmentPackageAdmission {
                 plan_limits: PlanLimits::FROZEN,
@@ -2988,7 +2960,7 @@ pub(crate) mod tests {
         let program = Arc::new(
             novarocks_local_compiler::compile_fragment(
                 validated,
-                &crate::exec::expr::compiled_program::tests::rng_subset(),
+                &novarocks_functions::testkit::rng_subset(),
                 novarocks_local_compiler::LocalCompileOptions {
                     pipeline_dop: std::num::NonZeroUsize::MIN,
                     root_sink_dop: None,
@@ -3075,8 +3047,8 @@ pub(crate) mod tests {
     ) -> LocalPreparedWriterPartial {
         use novarocks_functions::*;
         use novarocks_type_contract::{
-            CallProofScope, DecimalOverflowPolicy, EvaluationDemand, EvaluationDomainId,
-            ExpressionEffectContext, ExpressionUseId, SemanticParameters,
+            CallProofScope, DecimalOverflowPolicy, ExpressionEffects, RelationCallId,
+            RelationEffectContext, SemanticParameters,
         };
         let original =
             novarocks_functions::builtin::catalogue::build_builtin_engine_function_catalog()
@@ -3143,17 +3115,17 @@ pub(crate) mod tests {
         let mut calls = Vec::with_capacity(count);
         let parameters = SemanticParameters::try_new([]).unwrap();
         for index in 0..count {
-            let context = ExpressionEffectContext {
-                use_id: ExpressionUseId::new(index as u32),
-                domain: EvaluationDomainId::new(index as u32),
-                demand: EvaluationDemand::Value,
-            };
-            let input_use = [Some(ExpressionUseId::new(count as u32 + index as u32))];
+            let call = RelationCallId::new(u32::try_from(index).unwrap());
+            let context = RelationEffectContext::call(call);
+            let input_context = RelationEffectContext::materialized_input(call);
             let token = catalog
                 .prepare_fresh(
                     CallEffectInput {
-                        context,
-                        argument_uses: CallArgumentUses::SelectedChannels(&input_use),
+                        context: context.into(),
+                        argument_uses: CallArgumentUses::MaterializedInput {
+                            context: input_context,
+                            input_type: &declared,
+                        },
                         function_id: &bound.function_id,
                         kind: FunctionKind::Aggregate,
                         selected: &selected,
@@ -3161,11 +3133,14 @@ pub(crate) mod tests {
                         environment: &[],
                         parameters: &parameters,
                         decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-                        proof_scope: CallProofScope::Domain(context.domain),
+                        proof_scope: CallProofScope::Relation(context.identity),
                     },
                     selected.clone(),
                     PureCallPreparation::Aggregate {
-                        arguments: ScopedExpressionEffects::pure_value(context),
+                        arguments: ScopedRelationalEffects::primitive(
+                            context,
+                            ExpressionEffects::PURE_VALUE,
+                        ),
                         options: AggregatePreparationOptions {
                             state_interpretation: None,
                             phase: AggregateKernelPhase::Partial,
@@ -4007,68 +3982,20 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn table_writer_rejects_a_fragment_over_the_frozen_single_fragment_budget() {
-        // Exactly at the limit is accepted.
+    fn table_writer_returns_a_fragment_larger_than_one_mib() {
+        let size = 1024 * 1024 + 1;
         let stats = Arc::new(WriteExecutionStats::default());
-        let execution = Arc::new(
-            TestWriteExecution::new(Arc::clone(&stats))
-                .with_fragments(1, MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES),
-        );
-        let state = test_runtime_state();
-        let factory = writer_factory(&writer_fixture(execution), &state);
-        let mut operator = factory.create(1, 0);
-
-        bind(&mut operator, &state);
-        operator
-            .finish_for_test(&state)
-            .expect("the exact single-fragment budget is legal");
-        wait_for_output(&mut operator, &state).expect("exact-budget output");
-
-        // One byte more is a typed rejection, and the writer is aborted.
-        let stats = Arc::new(WriteExecutionStats::default());
-        let execution = Arc::new(
-            TestWriteExecution::new(Arc::clone(&stats))
-                .with_fragments(1, MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES + 1),
-        );
+        let execution =
+            Arc::new(TestWriteExecution::new(Arc::clone(&stats)).with_fragments(1, size));
         let state = test_runtime_state();
         let factory = writer_factory(&writer_fixture(execution), &state);
         let mut operator = factory.create(1, 0);
         bind(&mut operator, &state);
-        operator
-            .finish_for_test(&state)
-            .expect("finish request is asynchronous");
-        let error =
-            wait_for_output(&mut operator, &state).expect_err("over the single-fragment budget");
-        let fact = novarocks_failure_contract::FailureProjection::failure_fact(&error);
-        assert_eq!(
-            fact.class(),
-            novarocks_failure_contract::FailureClass::Resource
-        );
-        let resource = fact
-            .resource()
-            .expect("the producing writer reports its exact bound");
-        assert_eq!(
-            resource.dimension,
-            novarocks_failure_contract::ResourceDimension::Bytes
-        );
-        assert_eq!(
-            resource.requested,
-            Some((MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES + 1) as u64)
-        );
-        assert_eq!(
-            resource.limit,
-            Some(MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES as u64)
-        );
-        assert!(
-            error
-                .detail()
-                .contains("exceeds the frozen single-fragment budget")
-        );
-        assert!(poll_until(
-            || stats.aborted.load(Ordering::Relaxed) == 1,
-            Duration::from_secs(5)
-        ));
-        assert_eq!(stats.aborted.load(Ordering::Relaxed), 1);
+        operator.finish_for_test(&state).expect("request finish");
+        let chunks = wait_for_output(&mut operator, &state).expect("writer output");
+        let columns = TableWriteRelationColumns::try_from_relation(&chunks[1]).expect("columns");
+        assert_eq!(columns.fragments.value(0).len(), size);
+        assert_eq!(stats.aborted.load(Ordering::Relaxed), 0);
     }
 
     #[test]

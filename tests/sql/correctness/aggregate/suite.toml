@@ -43,14 +43,17 @@ paths = [
     "novarocks/functions/src/lib.rs",
     "novarocks/functions/src/evaluation.rs",
     "novarocks/functions/src/kernel_input.rs",
-    "novarocks/execution/src/exec/expr/compiled_program.rs",
-    "novarocks/execution/src/exec/expr/compiled_program/**",
+    "novarocks/expression-contract/**",
+    "novarocks/expression/**",
     "novarocks/functions/src/array_projection.rs",
     "novarocks/functions/src/selected_copy.rs",
     "novarocks/functions/src/selected_copy/guarded_nested.rs",
     "novarocks/functions/src/arrow_result_custody.rs",
     "novarocks/functions/src/array_backing_geometry.rs",
     "novarocks/functions/src/source_custody_resources.rs",
+    "novarocks/sql/src/optimizer/cascades_rules/push_topn_to_preagg.rs",
+    "novarocks/sql/src/planner/distributed/build/contract_lowering/grouped_topn.rs",
+    "novarocks/local-compiler/src/topn.rs",
 ]
 
 [reuse]

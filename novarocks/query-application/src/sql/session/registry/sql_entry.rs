@@ -37,7 +37,7 @@ impl ResolvedSqlSessionProperty {
         self.declaration.name()
     }
     pub fn qualified_name(&self) -> String {
-        self.scope.qualify(self.name())
+        self.scope.qualified_name(self.name())
     }
     pub const fn scope(&self) -> &SessionPropertyScope {
         &self.scope

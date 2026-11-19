@@ -16,6 +16,8 @@
 // under the License.
 
 use super::*;
+#[cfg(test)]
+use crate::tests::unit_fixture::DefinitionFixture;
 use crate::*;
 use arrow_schema::DataType;
 use novarocks_connector_contract::{
@@ -25,10 +27,10 @@ use novarocks_connector_contract::{
     ConnectorReadRelationPayload, ConnectorReadRelationRecipeDraft, ConnectorValue,
     ConnectorValueType, Domain, FrozenConnectorScan, StaticScanAssignment,
 };
+use novarocks_expression_contract::{RootOrdinal, RootScope};
 use novarocks_type_contract::{
-    ControlShape, DecimalOverflowPolicy, EvaluationDemand, EvaluationDomainId,
-    ExpressionControlFlow, ExpressionEffectContext, ExpressionEvaluationDomain,
-    ExpressionInvocation, ExpressionUseId, SemanticParameters, control_argument_semantics,
+    DecimalOverflowPolicy, EvaluationDemand, EvaluationRegionId, ExpressionEffectContext,
+    SemanticParameters,
 };
 use std::{
     num::NonZeroU64,
@@ -86,7 +88,11 @@ fn encoded(
         vec![byte].into(),
     )
 }
-fn append_scan(builder: &mut FragmentBuilder, residual: bool) -> (NodeId, ValueId) {
+fn append_scan(
+    builder: &mut FragmentBuilder,
+    residual: bool,
+    fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
+) -> (NodeId, ValueId) {
     let instance = ConnectorInstanceId::parse("pruning-fixture").unwrap();
     let binding = ConnectorReadBinding::new(
         ConnectorInstanceDescriptor {
@@ -108,7 +114,15 @@ fn append_scan(builder: &mut FragmentBuilder, residual: bool) -> (NodeId, ValueI
             },
         )
         .unwrap();
-    let predicate = residual.then(|| predicate(builder, node, value));
+    let predicate = residual.then(|| {
+        let definition = predicate(builder, node, value, fixture_constants);
+        builder.root_definition(
+            node,
+            definition,
+            EvaluationDemand::TruthOnly,
+            RootScope::Port(0),
+        )
+    });
     let relation = Relation::Data(DataRelation {
         read: ProviderReadReference {
             binding: binding.clone(),
@@ -136,6 +150,7 @@ fn append_scan(builder: &mut FragmentBuilder, residual: bool) -> (NodeId, ValueI
     });
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: node,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -156,19 +171,24 @@ fn append_scan(builder: &mut FragmentBuilder, residual: bool) -> (NodeId, ValueI
         .unwrap();
     (node, value)
 }
-fn predicate(builder: &mut FragmentBuilder, node: NodeId, value: ValueId) -> ExprId {
+fn predicate(
+    builder: &mut FragmentBuilder,
+    node: NodeId,
+    value: ValueId,
+    fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
+) -> ExprId {
     let left = builder
-        .add_expression(node, ty(DataType::Int64), ExprKind::Value(value))
+        .define(node, ty(DataType::Int64), ExprKind::Value(value))
         .unwrap();
     let right = builder
-        .add_expression(
+        .define(
             node,
-            ty(DataType::Int64),
-            ExprKind::Literal(LiteralValue::Int64(0)),
+            (ty(DataType::Int64)).clone(),
+            fixture_constants.i64(0, &(ty(DataType::Int64))),
         )
         .unwrap();
     builder
-        .add_expression(
+        .define(
             node,
             ty(DataType::Boolean),
             ExprKind::Binary {
@@ -186,13 +206,23 @@ fn append_filter(
     child: NodeId,
     value: ValueId,
     count: usize,
+    fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
 ) -> NodeId {
     let node = builder.reserve_node_id().unwrap();
     let predicates = (0..count)
-        .map(|_| predicate(builder, node, value))
+        .map(|_| {
+            let definition = predicate(builder, node, value, fixture_constants);
+            builder.root_definition(
+                node,
+                definition,
+                EvaluationDemand::TruthOnly,
+                RootScope::Port(0),
+            )
+        })
         .collect();
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: node,
             inputs: Box::from([child]),
             required_inputs: Box::from([properties()]),
@@ -205,68 +235,6 @@ fn append_filter(
         })
         .unwrap();
     node
-}
-fn expression_uses(fragment: &Fragment) -> PhysicalRootUses {
-    fn add(
-        fragment: &Fragment,
-        definition: ExprId,
-        demand: EvaluationDemand,
-        uses: &mut Vec<ExpressionInvocation<ExprId>>,
-    ) -> ExpressionUseId {
-        let id = ExpressionUseId::new(uses.len() as u32);
-        let shape = match &fragment.expressions().get(definition).unwrap().kind {
-            ExprKind::Conjunction { .. } => ControlShape::Conjunction,
-            _ => ControlShape::Eager,
-        };
-        let children = match &fragment.expressions().get(definition).unwrap().kind {
-            ExprKind::Binary { left, right, .. } => vec![*left, *right],
-            ExprKind::Conjunction { args } => args.to_vec(),
-            ExprKind::Literal(_) | ExprKind::Value(_) => vec![],
-            other => panic!("fixture requires explicit control for {other:?}"),
-        };
-        uses.push(ExpressionInvocation {
-            context: ExpressionEffectContext {
-                use_id: id,
-                domain: EvaluationDomainId::new(0),
-                demand,
-            },
-            definition,
-            control: shape,
-            arguments: Box::default(),
-        });
-        let arguments = children
-            .iter()
-            .enumerate()
-            .map(|(ordinal, child)| {
-                let (child_demand, guard) =
-                    control_argument_semantics(shape, children.len(), ordinal, demand).unwrap();
-                assert_eq!(guard, None);
-                add(fragment, *child, child_demand, uses)
-            })
-            .collect();
-        uses[id.get() as usize].arguments = arguments;
-        id
-    }
-    let roots = PhysicalExpressionRoots::try_new(fragment, &Control::default()).unwrap();
-    let mut uses = Vec::new();
-    let bindings = roots
-        .sites()
-        .iter()
-        .map(|(site, root)| (*site, add(fragment, root.expr, root.demand, &mut uses)))
-        .collect();
-    let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
-            id: EvaluationDomainId::new(0),
-            parent: None,
-            guard: None,
-        }],
-        uses,
-        fragment.expressions(),
-        CompilePhase::Validate,
-        &Control::default(),
-    )
-    .unwrap();
-    PhysicalRootUses::try_new(fragment, flow, bindings, &Control::default()).unwrap()
 }
 fn public_read(
     fragment: &Fragment,
@@ -352,9 +320,14 @@ fn public_read(
     FrozenConnectorRead::try_new(scan, public)
 }
 
-fn package(builder: FragmentBuilder, root: NodeId, scan: NodeId) -> FragmentPackage {
+fn package(
+    builder: FragmentBuilder,
+    root: NodeId,
+    scan: NodeId,
+    fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
+) -> FragmentPackage {
     let fragment = builder
-        .finish_definition(
+        .finish_fixture_definition(
             root,
             FragmentSink::Noop,
             PipelineDopDomain {
@@ -365,7 +338,11 @@ fn package(builder: FragmentBuilder, root: NodeId, scan: NodeId) -> FragmentPack
             crate::StagePlacementPolicy::Singleton,
         )
         .unwrap();
-    let expression_uses = expression_uses(&fragment);
+    // There are no relational calls in these fixtures. Publish the real
+    // fragment table; scalar/intrinsic occurrences live in each sealed unit.
+    let fragment = fragment
+        .with_calls_observed(Vec::new(), &Control::default())
+        .unwrap();
     let NodeKind::Scan { relation, .. } = &fragment.nodes()[&scan].kind else {
         unreachable!()
     };
@@ -401,30 +378,27 @@ fn package(builder: FragmentBuilder, root: NodeId, scan: NodeId) -> FragmentPack
     let read = public_read(&fragment, scan, frozen).unwrap();
     let version = PlanVersionId::try_new([7; 16]).unwrap();
     // Derive cuts from a fully checked real plan, never bypass package checks.
-    let mut plan = PlanBuilder::new(version);
+    let mut plan = PlanBuilder::new(version, crate::tests::constant_fixture::policy());
     plan.add_fragment(fragment.clone()).unwrap();
-    let plan = plan.finish().unwrap();
+    let plan = crate::tests::constant_fixture::publish_plan(plan, fixture_constants).unwrap();
     let mut cuts = derive_fragment_cuts(&plan).unwrap();
-    let calls =
-        FrozenFragmentCalls::try_new(&fragment, &expression_uses, Vec::new(), &Control::default())
-            .unwrap();
     let pruning =
         FrozenFragmentPruning::try_new(fragment.id(), Vec::new(), &Control::default()).unwrap();
     FragmentPackage::try_new(
         FragmentPackageInput {
-            constants: crate::ConstantPools::empty(),
+            constants: fixture_constants.for_fragment(&fragment),
+            statement_constant_policy: crate::tests::constant_fixture::policy(),
             version,
             required: RequiredContracts::default(),
             cuts: cuts.remove(&fragment.id()).unwrap(),
             fragment,
-            expression_uses,
-            calls,
             pruning,
             result: None,
             parameters: SemanticParameters::default(),
             scans: BTreeMap::from([(scan, read)]),
             writes: BTreeMap::new(),
             annotations: Box::default(),
+            layouts: Default::default(),
         },
         package_admission(),
         &Control::default(),
@@ -433,12 +407,11 @@ fn package(builder: FragmentBuilder, root: NodeId, scan: NodeId) -> FragmentPack
 }
 fn source_claim(
     package: &FragmentPackage,
-    site: ExpressionRootSite,
+    site: PredicateSourceSite,
     path: &[u32],
 ) -> (PredicateResponsibilityRef, ExpressionEffectContext) {
     let source = PredicateConjunctSource::try_new(
         package.fragment(),
-        package.expression_uses(),
         site,
         path.to_vec(),
         &Control::default(),
@@ -446,15 +419,19 @@ fn source_claim(
     .unwrap();
     (source.responsibility().anchor(), source.context())
 }
-fn fixture(residual: bool, count: usize) -> (FragmentPackage, PruningDomainWitness) {
+fn fixture(
+    residual: bool,
+    count: usize,
+    fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
+) -> (FragmentPackage, PruningDomainWitness) {
     let mut builder = FragmentBuilder::new(FragmentId::new(930));
-    let (scan, value) = append_scan(&mut builder, residual);
+    let (scan, value) = append_scan(&mut builder, residual, fixture_constants);
     let node = if residual {
         scan
     } else {
-        append_filter(&mut builder, scan, value, count)
+        append_filter(&mut builder, scan, value, count, fixture_constants)
     };
-    let package = package(builder, node, scan);
+    let package = package(builder, node, scan, fixture_constants);
     let witness = PruningDomainWitness {
         target: PruningDomainSite {
             fragment: package.fragment().id(),
@@ -464,15 +441,9 @@ fn fixture(residual: bool, count: usize) -> (FragmentPackage, PruningDomainWitne
         },
         sources: (0..if residual { 1 } else { count })
             .map(|ordinal| {
-                let site = ExpressionRootSite {
+                let site = PredicateSourceSite {
                     node,
-                    role: if residual {
-                        ExpressionRootRole::ScanResidual { predicate: 0 }
-                    } else {
-                        ExpressionRootRole::FilterPredicate {
-                            predicate: ordinal as u32,
-                        }
-                    },
+                    root: RootOrdinal::new(ordinal as u32),
                 };
                 let (responsibility, context) = source_claim(&package, site, &[]);
                 PruningSourceWitness {
@@ -500,7 +471,8 @@ fn fixture(residual: bool, count: usize) -> (FragmentPackage, PruningDomainWitne
 }
 #[test]
 fn actual_enforced_and_unenforced_domain_fields_borrow_exact_read_and_keep_original_p() {
-    let (package, mut witness) = fixture(false, 1);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let (package, mut witness) = fixture(false, 1, &mut fixture_constants);
     for field in [PruningDomainField::Enforced, PruningDomainField::Unenforced] {
         witness.target.field = field;
         let checked =
@@ -519,7 +491,16 @@ fn actual_enforced_and_unenforced_domain_fields_borrow_exact_read_and_keep_origi
         else {
             unreachable!()
         };
-        assert_eq!(checked.sources()[0].definition(), predicates[0]);
+        assert_eq!(
+            checked.sources()[0].definition(),
+            package
+                .fragment()
+                .unit(witness.sources[0].responsibility.site.node)
+                .unwrap()
+                .root(predicates[0])
+                .unwrap()
+                .definition
+        );
         assert_eq!(
             checked.sources()[0].responsibility().anchor().site,
             witness.sources[0].responsibility.site
@@ -529,12 +510,14 @@ fn actual_enforced_and_unenforced_domain_fields_borrow_exact_read_and_keep_origi
 
 #[test]
 fn stronger_arbitrary_q_can_be_structurally_sound_without_implication_or_pruning_authorization() {
-    let (package, witness) = fixture(false, 1);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let (package, witness) = fixture(false, 1, &mut fixture_constants);
     let checked = PruningDomainStructure::try_new(&package, &witness, &Control::default()).unwrap();
     let expression = package
         .fragment()
-        .expressions()
-        .get(checked.sources()[0].definition())
+        .unit(witness.sources[0].responsibility.site.node)
+        .unwrap()
+        .definition(checked.sources()[0].definition())
         .unwrap();
     assert!(matches!(
         expression.kind,
@@ -560,7 +543,8 @@ fn stronger_arbitrary_q_can_be_structurally_sound_without_implication_or_pruning
 }
 #[test]
 fn scan_owned_residual_has_a_zero_edge_path_and_remains_an_exact_p_responsibility() {
-    let (package, witness) = fixture(true, 1);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let (package, witness) = fixture(true, 1, &mut fixture_constants);
     assert!(witness.sources[0].input_path.is_empty());
     assert_eq!(witness.sources[0].columns[0].values.len(), 1);
     let checked = PruningDomainStructure::try_new(&package, &witness, &Control::default()).unwrap();
@@ -574,31 +558,49 @@ fn scan_owned_residual_has_a_zero_edge_path_and_remains_an_exact_p_responsibilit
         unreachable!()
     };
     assert_eq!(*occurrence, witness.target.occurrence);
-    assert_eq!(checked.sources()[0].definition(), residuals[0]);
+    assert_eq!(
+        checked.sources()[0].definition(),
+        package
+            .fragment()
+            .unit(witness.target.scan)
+            .unwrap()
+            .root(residuals[0])
+            .unwrap()
+            .definition
+    );
     assert_eq!(relation.predicate_guarantees()[0].predicate, residuals[0]);
     assert_eq!(
         relation.predicate_guarantees()[0].kind,
         PredicateGuaranteeKind::PruningOnly
     );
 }
-fn project_fixture() -> (FragmentPackage, PruningDomainWitness) {
+fn project_fixture(
+    fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
+) -> (FragmentPackage, PruningDomainWitness) {
     let mut builder = FragmentBuilder::new(FragmentId::new(931));
-    let (scan, value) = append_scan(&mut builder, false);
+    let (scan, value) = append_scan(&mut builder, false, fixture_constants);
     let project = builder.reserve_node_id().unwrap();
     let expression = builder
-        .add_expression(project, ty(DataType::Int64), ExprKind::Value(value))
+        .define(project, ty(DataType::Int64), ExprKind::Value(value))
         .unwrap();
+    let expression = builder.root_definition(
+        project,
+        expression,
+        EvaluationDemand::Value,
+        RootScope::Port(0),
+    );
     let alias = builder
         .add_value(
             ty(DataType::Int64),
             ValueOrigin::Expr {
                 node: project,
-                expr: expression,
+                root: expression,
             },
         )
         .unwrap();
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: project,
             inputs: Box::from([scan]),
             required_inputs: Box::from([properties()]),
@@ -612,13 +614,13 @@ fn project_fixture() -> (FragmentPackage, PruningDomainWitness) {
             },
         })
         .unwrap();
-    let filter = append_filter(&mut builder, project, alias, 1);
-    let package = package(builder, filter, scan);
+    let filter = append_filter(&mut builder, project, alias, 1, fixture_constants);
+    let package = package(builder, filter, scan, fixture_constants);
     let (responsibility, context) = source_claim(
         &package,
-        ExpressionRootSite {
+        PredicateSourceSite {
             node: filter,
-            role: ExpressionRootRole::FilterPredicate { predicate: 0 },
+            root: RootOrdinal::new(0),
         },
         &[],
     );
@@ -655,7 +657,8 @@ fn project_fixture() -> (FragmentPackage, PruningDomainWitness) {
 }
 #[test]
 fn actual_project_alias_fields_transport_each_column_identity_on_adjacent_edges() {
-    let (package, witness) = project_fixture();
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let (package, witness) = project_fixture(&mut fixture_constants);
     PruningDomainStructure::try_new(&package, &witness, &Control::default()).unwrap();
     assert_ne!(
         witness.sources[0].columns[0].values[1],
@@ -680,7 +683,8 @@ fn actual_project_alias_fields_transport_each_column_identity_on_adjacent_edges(
 }
 #[test]
 fn fragment_occurrence_scan_and_exact_source_sites_are_checked_against_the_package() {
-    let (package, witness) = fixture(false, 1);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let (package, witness) = fixture(false, 1, &mut fixture_constants);
     let mut forged = witness.clone();
     forged.target.fragment = FragmentId::new(u32::MAX);
     assert_eq!(
@@ -705,8 +709,15 @@ fn fragment_occurrence_scan_and_exact_source_sites_are_checked_against_the_packa
         );
     }
     let mut forged = witness.clone();
-    forged.sources[0].responsibility.site.role =
-        ExpressionRootRole::FilterPredicate { predicate: 99 };
+    forged.sources[0].responsibility.site.root = RootOrdinal::new(99);
+    assert_eq!(
+        PruningDomainStructure::try_new(&package, &forged, &Control::default()).unwrap_err(),
+        PruningStructureError::Source(PredicateSourceError::NotSearchPredicate)
+    );
+    // Membership in an actual search field is checked before unit lookup.
+    // A genuinely absent source node retains the independent InvalidSite law.
+    let mut forged = witness.clone();
+    forged.sources[0].responsibility.site.node = NodeId::new(u32::MAX);
     assert_eq!(
         PruningDomainStructure::try_new(&package, &forged, &Control::default()).unwrap_err(),
         PruningStructureError::Source(PredicateSourceError::InvalidSite)
@@ -721,7 +732,8 @@ fn fragment_occurrence_scan_and_exact_source_sites_are_checked_against_the_packa
 
 #[test]
 fn exact_p_responsibility_rejects_wrong_fragment_and_another_actual_root_use() {
-    let (package, witness) = fixture(false, 2);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let (package, witness) = fixture(false, 2, &mut fixture_constants);
     let mut forged = witness.clone();
     forged.sources[0].responsibility.fragment = FragmentId::new(u32::MAX);
     assert_eq!(
@@ -744,7 +756,8 @@ fn exact_p_responsibility_rejects_wrong_fragment_and_another_actual_root_use() {
 
 #[test]
 fn selected_conjunct_context_rejects_wrong_use_domain_and_demand() {
-    let (package, witness) = fixture(false, 2);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let (package, witness) = fixture(false, 2, &mut fixture_constants);
     let context = witness.sources[0].context;
     let wrong = [
         ExpressionEffectContext {
@@ -752,7 +765,7 @@ fn selected_conjunct_context_rejects_wrong_use_domain_and_demand() {
             ..context
         },
         ExpressionEffectContext {
-            domain: EvaluationDomainId::new(u32::MAX),
+            region: EvaluationRegionId::new(u32::MAX),
             ..context
         },
         ExpressionEffectContext {
@@ -772,12 +785,13 @@ fn selected_conjunct_context_rejects_wrong_use_domain_and_demand() {
 
 #[test]
 fn shared_conjunct_definition_preserves_distinct_uses_and_cannot_swap_claimed_context() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     let mut builder = FragmentBuilder::new(FragmentId::new(933));
-    let (scan, value) = append_scan(&mut builder, false);
+    let (scan, value) = append_scan(&mut builder, false, &mut fixture_constants);
     let filter = builder.reserve_node_id().unwrap();
-    let shared = predicate(&mut builder, filter, value);
+    let shared = predicate(&mut builder, filter, value, &mut fixture_constants);
     let conjunction = builder
-        .add_expression(
+        .define(
             filter,
             ty(DataType::Boolean),
             ExprKind::Conjunction {
@@ -785,8 +799,15 @@ fn shared_conjunct_definition_preserves_distinct_uses_and_cannot_swap_claimed_co
             },
         )
         .unwrap();
+    let conjunction = builder.root_definition(
+        filter,
+        conjunction,
+        EvaluationDemand::TruthOnly,
+        RootScope::Port(0),
+    );
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: filter,
             inputs: Box::from([scan]),
             required_inputs: Box::from([properties()]),
@@ -800,10 +821,10 @@ fn shared_conjunct_definition_preserves_distinct_uses_and_cannot_swap_claimed_co
             },
         })
         .unwrap();
-    let package = package(builder, filter, scan);
-    let site = ExpressionRootSite {
+    let package = package(builder, filter, scan, &mut fixture_constants);
+    let site = PredicateSourceSite {
         node: filter,
-        role: ExpressionRootRole::FilterPredicate { predicate: 0 },
+        root: RootOrdinal::new(0),
     };
     let witness = PruningDomainWitness {
         target: PruningDomainSite {
@@ -871,7 +892,8 @@ fn shared_conjunct_definition_preserves_distinct_uses_and_cannot_swap_claimed_co
 
 #[test]
 fn input_occurrence_paths_and_column_traces_cannot_invent_local_transport() {
-    let (package, witness) = fixture(false, 1);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let (package, witness) = fixture(false, 1, &mut fixture_constants);
     for edge in [
         PruningInputEdge {
             consumer: witness.sources[0].responsibility.site.node,
@@ -943,7 +965,8 @@ fn input_occurrence_paths_and_column_traces_cannot_invent_local_transport() {
 }
 #[test]
 fn every_domain_column_requires_a_trace_and_source_occurrences_are_unique() {
-    let (package, witness) = fixture(false, 1);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let (package, witness) = fixture(false, 1, &mut fixture_constants);
     let mut forged = witness.clone();
     forged.sources[0].columns = Box::default();
     assert_eq!(
@@ -964,13 +987,16 @@ fn every_domain_column_requires_a_trace_and_source_occurrences_are_unique() {
     );
 }
 
-fn shared_scan_fixture(two_parents: bool) -> (FragmentPackage, PruningDomainWitness) {
+fn shared_scan_fixture(
+    two_parents: bool,
+    fixture_constants: &mut crate::tests::constant_fixture::ConstantFixture,
+) -> (FragmentPackage, PruningDomainWitness) {
     let mut builder = FragmentBuilder::new(FragmentId::new(932));
-    let (scan, value) = append_scan(&mut builder, false);
+    let (scan, value) = append_scan(&mut builder, false, fixture_constants);
     let (left, right) = if two_parents {
         (
-            append_filter(&mut builder, scan, value, 1),
-            append_filter(&mut builder, scan, value, 1),
+            append_filter(&mut builder, scan, value, 1, fixture_constants),
+            append_filter(&mut builder, scan, value, 1, fixture_constants),
         )
     } else {
         (scan, scan)
@@ -978,6 +1004,7 @@ fn shared_scan_fixture(two_parents: bool) -> (FragmentPackage, PruningDomainWitn
     let union = builder.reserve_node_id().unwrap();
     builder
         .insert_node_unchecked(PhysicalNode {
+            expressions: None,
             id: union,
             inputs: Box::from([left, right]),
             required_inputs: Box::from([properties(), properties()]),
@@ -997,10 +1024,10 @@ fn shared_scan_fixture(two_parents: bool) -> (FragmentPackage, PruningDomainWitn
     let source = if two_parents {
         left
     } else {
-        append_filter(&mut builder, union, value, 1)
+        append_filter(&mut builder, union, value, 1, fixture_constants)
     };
     let root = if two_parents { union } else { source };
-    let package = package(builder, root, scan);
+    let package = package(builder, root, scan, fixture_constants);
     let input_path: Box<[PruningInputEdge]> = if two_parents {
         Box::from([PruningInputEdge {
             consumer: left,
@@ -1024,9 +1051,9 @@ fn shared_scan_fixture(two_parents: bool) -> (FragmentPackage, PruningDomainWitn
     let values = vec![value; input_path.len() + 1].into_boxed_slice();
     let (responsibility, context) = source_claim(
         &package,
-        ExpressionRootSite {
+        PredicateSourceSite {
             node: source,
-            role: ExpressionRootRole::FilterPredicate { predicate: 0 },
+            root: RootOrdinal::new(0),
         },
         &[],
     );
@@ -1052,8 +1079,9 @@ fn shared_scan_fixture(two_parents: bool) -> (FragmentPackage, PruningDomainWitn
 }
 #[test]
 fn shared_scan_is_rejected_for_distinct_parents_and_for_two_input_occurrences_of_one_parent() {
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
     for two_parents in [true, false] {
-        let (package, witness) = shared_scan_fixture(two_parents);
+        let (package, witness) = shared_scan_fixture(two_parents, &mut fixture_constants);
         // Both fixtures have passed the same real plan/cut/package validators.
         assert_eq!(
             PruningDomainStructure::try_new(&package, &witness, &Control::default()).unwrap_err(),
@@ -1063,7 +1091,8 @@ fn shared_scan_is_rejected_for_distinct_parents_and_for_two_input_occurrences_of
 }
 #[test]
 fn entry_and_midwork_control_errors_remain_outer_and_typed() {
-    let (package, witness) = fixture(false, 300);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let (package, witness) = fixture(false, 300, &mut fixture_constants);
     PruningDomainStructure::try_new(&package, &witness, &Control::default()).unwrap();
     for failure in [
         CompileControlError::Cancelled,
@@ -1093,7 +1122,8 @@ fn entry_and_midwork_control_errors_remain_outer_and_typed() {
 }
 #[test]
 fn large_witness_preflight_precedes_projection_and_exact_bound_reaches_shape_validation() {
-    let (package, witness) = fixture(false, 1);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let (package, witness) = fixture(false, 1, &mut fixture_constants);
     let mut oversized = witness.clone();
     oversized.sources =
         vec![witness.sources[0].clone(); MAX_CONTROL_USE_REFERENCES + 1].into_boxed_slice();
@@ -1130,7 +1160,8 @@ fn pruning_table(
 
 #[test]
 fn mandatory_package_pruning_preserves_actual_witnesses_and_full_source_claims() {
-    let (package, witness) = fixture(false, 1);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let (package, witness) = fixture(false, 1, &mut fixture_constants);
     assert!(package.pruning().witnesses().is_empty());
     let expected = pruning_table(&package, vec![witness.clone()]);
     let mut input = package.into_input();
@@ -1158,7 +1189,8 @@ fn mandatory_package_pruning_preserves_actual_witnesses_and_full_source_claims()
 
 #[test]
 fn mandatory_package_pruning_rejects_invalid_target_paths_and_occurrence_claims() {
-    let (package, witness) = fixture(false, 2);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let (package, witness) = fixture(false, 2, &mut fixture_constants);
     let mut invalid_scan = witness.clone();
     invalid_scan.target.scan = NodeId::new(u32::MAX);
     let mut invalid_occurrence = witness.clone();
@@ -1202,7 +1234,8 @@ fn mandatory_package_pruning_rejects_invalid_target_paths_and_occurrence_claims(
 
 #[test]
 fn frozen_pruning_constructor_rejects_duplicate_target_foreign_fragment_and_empty_sources() {
-    let (package, witness) = fixture(false, 1);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let (package, witness) = fixture(false, 1, &mut fixture_constants);
     let mut foreign = witness.clone();
     foreign.target.fragment = FragmentId::new(999);
     let mut empty = witness.clone();
@@ -1225,7 +1258,8 @@ fn frozen_pruning_constructor_rejects_duplicate_target_foreign_fragment_and_empt
 
 #[test]
 fn frozen_pruning_reference_limit_is_combined_across_distinct_targets() {
-    let (package, witness) = fixture(false, 1);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let (package, witness) = fixture(false, 1, &mut fixture_constants);
     let mut enforced = witness.clone();
     let mut unenforced = witness;
     unenforced.target.field = PruningDomainField::Unenforced;
@@ -1269,7 +1303,8 @@ fn frozen_pruning_reference_limit_is_combined_across_distinct_targets() {
 
 #[test]
 fn frozen_pruning_and_mandatory_package_preserve_typed_entry_and_first_positive_work_failures() {
-    let (package, witness) = fixture(false, 300);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let (package, witness) = fixture(false, 300, &mut fixture_constants);
     let table = pruning_table(&package, vec![witness.clone()]);
     for failure in [
         CompileControlError::Cancelled,
@@ -1337,7 +1372,8 @@ fn frozen_pruning_and_mandatory_package_preserve_typed_entry_and_first_positive_
 
 #[test]
 fn two_real_domain_targets_share_one_actual_consumer_index() {
-    let (package, enforced) = fixture(false, 1);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let (package, enforced) = fixture(false, 1, &mut fixture_constants);
     let mut unenforced = enforced.clone();
     unenforced.target.field = PruningDomainField::Unenforced;
     let single = pruning_table(&package, vec![enforced.clone()]);
@@ -1369,7 +1405,8 @@ fn two_real_domain_targets_share_one_actual_consumer_index() {
 
 #[test]
 fn consumer_index_cannot_be_reused_for_a_different_package_with_the_same_fragment_id() {
-    let (package, witness) = fixture(false, 1);
+    let mut fixture_constants = crate::tests::constant_fixture::ConstantFixture::new();
+    let (package, witness) = fixture(false, 1, &mut fixture_constants);
     let other = package.clone();
     assert_eq!(package.fragment().id(), other.fragment().id());
     let control = Control::default();

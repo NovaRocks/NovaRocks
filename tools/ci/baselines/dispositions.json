@@ -142,16 +142,6 @@
       "expires": "2026-12-15"
     },
     {
-      "unit": "sql-case:analytic/analytic_filter_topn_with_window",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Missing local lowering: sort mode without a local owner; owner B5, I5; remove after capability repair and native verification",
-      "owner": "B5, I5",
-      "expires": "2026-12-15"
-    },
-    {
       "unit": "sql-case:analytic/analytic_lead_lag_array_type",
       "failure": {
         "class": "error_code",
@@ -222,16 +212,6 @@
       "expires": "2026-12-15"
     },
     {
-      "unit": "sql-case:analytic/analytic_test_window_function_streaming",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Missing local lowering: sort mode without a local owner; owner B5, I5; remove after capability repair and native verification",
-      "owner": "B5, I5",
-      "expires": "2026-12-15"
-    },
-    {
       "unit": "sql-case:analytic/analytic_test_window_functions_with_complex_types",
       "failure": {
         "class": "error_code",
@@ -255,20 +235,10 @@
       "unit": "sql-case:analytic/analytic_test_window_pre_agg_with_rank",
       "failure": {
         "class": "error_code",
-        "code": "UnsupportedCompiledShape"
+        "code": "sql.analyze.unavailable_implementation"
       },
-      "reason": "Missing local lowering: sort mode without a local owner; owner B5, I5; remove after capability repair and native verification",
-      "owner": "B5, I5",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:analytic/analytic_test_window_with_null_child",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Missing local lowering: sort mode without a local owner; owner B5, I5; remove after capability repair and native verification",
-      "owner": "B5, I5",
+      "reason": "Partition TopN now passes its original row oracle after strict R_old-equivalent format migration. The next original failure is statement 7: selected overload builtin.scalar/to_bitmap/(any<T>...)->binary;strict;legacy has no installed implementation (line 5 column 28), sql.analyze.unavailable_implementation. B7d owns bitmap scalar implementations under the accepted B5 handoff. Query 7 remains Legacy and its result oracle is unexecuted; preserve the raw failure and suffix gap. Confirmed by independent normal native 1FE+3BE verify; keep the original expiry and remove only after the complete case passes.",
+      "owner": "B7d",
       "expires": "2026-12-15"
     },
     {
@@ -908,16 +878,6 @@
         "code": "sql.analyze.unavailable_implementation"
       },
       "reason": "The unchanged complete native case refuses the exact selected overload `builtin.scalar/named_struct/dynamic-v1` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B7a, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 1; 2 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-shared-02/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
-      "owner": "UEA-5E B7a",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:iceberg-ddl/default_complex",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "The unchanged complete native case refuses the exact selected overload `builtin.scalar/map/dynamic-v1` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B7a, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 7; 1 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-shared-02/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
       "owner": "UEA-5E B7a",
       "expires": "2026-12-15"
     },
@@ -1592,16 +1552,6 @@
       "expires": "2026-12-15"
     },
     {
-      "unit": "sql-case:optimizer/ranking_window_topn",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Missing local lowering: sort mode without a local owner; owner B5; remove after capability repair and native verification",
-      "owner": "B5",
-      "expires": "2026-12-15"
-    },
-    {
       "unit": "sql-case:optimizer/variant_path_pushdown",
       "failure": {
         "class": "error_code",
@@ -1803,16 +1753,6 @@
     },
     {
       "unit": "sql-case:sort/ranking_window_topn_correctness",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Missing local lowering: sort mode without a local owner; owner B5, I5; remove after capability repair and native verification",
-      "owner": "B5, I5",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:sort/topn_rank_partition_filter_tie_expand",
       "failure": {
         "class": "error_code",
         "code": "UnsupportedCompiledShape"
@@ -2265,7 +2205,7 @@
       "exit_condition": "Owner B7 installs the corresponding declared pure implementation and this exact unchanged test passes with the original complete result/key/lambda assertions; then remove this quarantine."
     },
     {
-      "unit": "rust-test:novarocks-sql::planner::distributed::build::contract_lowering::lowered_scalar_source_tests::lowered_operational_lambda_tests::operational_lambda_real_sql_loans_original_parameters_and_actual_body_scope",
+      "unit": "rust-test:novarocks-sql::planner::distributed::build::contract_lowering::lowered_scalar_source_tests::lowered_operational_lambda_tests::operational_lambda_analyzed_source_loans_original_parameters_and_actual_body_scope",
       "owner": "B7",
       "review_by": "2026-12-15",
       "reason": "D0-5(a), K12: the first observed failure is the typed sql.analyze.unavailable_implementation refusal for builtin.scalar/array_map/dynamic-v1. This exact test protects an unavailable container/scalar/lambda declaration rather than an incidental fixture; preserve all its assertions.",

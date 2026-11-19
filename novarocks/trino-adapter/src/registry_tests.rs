@@ -113,6 +113,9 @@ impl FixtureCatalogs {
         let instance_id = ConnectorInstanceId::parse("input_lake").unwrap();
         let identity = CatalogPropertyIdentity {
             attachment_id: "00000000-0000-4000-8000-000000000001".parse().unwrap(),
+            control_runtime_id: novarocks_spi::connector::ConnectorControlRuntimeId::from_bytes(
+                [1; 16],
+            ),
             binding_key: ConnectorProviderBindingKey {
                 instance_id: instance_id.clone(),
                 incarnation: ProviderBindingEpoch::from_bytes([7; 16]),

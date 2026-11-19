@@ -40,16 +40,12 @@ use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, BooleanArray, Int8Array, new_null_array};
 use arrow::datatypes::DataType;
-use novarocks_local_program::{
-    LocalProgram, ProgramExpressionRootSite, ProgramNodeExpressionRole, ProgramNodeId,
-    ProgramNodeKind,
-};
+use novarocks_local_program::{LocalProgram, ProgramNodeId, ProgramNodeKind, ProgramRootRef};
 
 use super::compiled_expression::{
     RuntimeKernelControl, evaluate_all, evaluate_selected, instances,
 };
 use crate::exec::chunk::{Chunk, ChunkBatchProjection, ChunkSchemaRef};
-use crate::exec::expr::compiled_program::CompiledExpressionInstance;
 use crate::exec::pipeline::operator::{
     ConstructionFailure, InputConstructionFactory, InputEncodingPolicy, Operator,
 };
@@ -62,12 +58,13 @@ use crate::exec::pipeline::{
 };
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
 use crate::runtime::task::{ExecutionFailure, ExecutionResult};
+use novarocks_expression::CompiledExpressionInstance;
 
 /// One event's frozen facts, resolved to root indices and output ordinals.
 #[derive(Clone)]
 struct AssignedValue {
     root: usize,
-    expression: novarocks_local_program::ProgramExprId,
+    expression: ProgramRootRef,
     write_input: Option<novarocks_type_contract::WriteInputDeclaration>,
 }
 
@@ -83,8 +80,9 @@ struct EventPlan {
 
 pub struct CompiledChangeEventProcessorFactory {
     name: String,
+    node: ProgramNodeId,
     program: Arc<LocalProgram>,
-    sites: Vec<ProgramExpressionRootSite>,
+    sites: Vec<ProgramRootRef>,
     events: Arc<[EventPlan]>,
     effect_ordinal: usize,
     output_layout: novarocks_local_program::StaticLayout,
@@ -143,18 +141,13 @@ impl CompiledChangeEventProcessorFactory {
         let mut sites = Vec::new();
         let mut plans = Vec::with_capacity(events.len());
         for (event_ordinal, event) in events.iter().enumerate() {
-            let event_index = u32::try_from(event_ordinal)
-                .map_err(|_| invalid("has too many events".to_string()))?;
-            let predicate = event.predicate.map(|_| {
-                sites.push(ProgramExpressionRootSite::Node {
-                    node,
-                    role: ProgramNodeExpressionRole::ChangePredicate { event: event_index },
-                });
+            let predicate = event.predicate.map(|reference| {
+                sites.push(reference);
                 sites.len() - 1
             });
             let mut assigned = vec![None; layout.slots().len()];
             let mut covered = vec![false; layout.slots().len()];
-            for (assignment_ordinal, assignment) in event.assignments.iter().enumerate() {
+            for assignment in &event.assignments {
                 let ordinal = ordinal_of(assignment.output_slot_id).ok_or_else(|| {
                     invalid(format!(
                         "event {event_ordinal} assigns slot {} outside its output",
@@ -169,11 +162,8 @@ impl CompiledChangeEventProcessorFactory {
                 }
                 if let Some(expression) = assignment.expr {
                     if layout.is_typed() {
-                        let Some(novarocks_functions::FunctionArgumentType::Value(source)) =
-                            program.checked().channels().expressions().definition_type(
-                                novarocks_local_program::ProgramExpressionArena::Main,
-                                expression,
-                            )
+                        let Some(source) =
+                            super::compiled_expression::root_value_type_ref(&program, expression)
                         else {
                             return Err(invalid(
                                 "has an assignment without a complete value declaration".into(),
@@ -211,15 +201,7 @@ impl CompiledChangeEventProcessorFactory {
                             )));
                         }
                     }
-                    let assignment_index = u32::try_from(assignment_ordinal)
-                        .map_err(|_| invalid("has too many assignments".to_string()))?;
-                    sites.push(ProgramExpressionRootSite::Node {
-                        node,
-                        role: ProgramNodeExpressionRole::ChangeAssignment {
-                            event: event_index,
-                            assignment: assignment_index,
-                        },
-                    });
+                    sites.push(expression);
                     assigned[ordinal] = Some(AssignedValue {
                         root: sites.len() - 1,
                         expression,
@@ -235,6 +217,7 @@ impl CompiledChangeEventProcessorFactory {
         }
         let output_layout = layout.clone();
         Ok(Self {
+            node,
             name: format!("COMPILED_CHANGE_EVENT_EXPAND (node={at})"),
             program,
             sites,
@@ -261,7 +244,8 @@ impl OperatorFactory for CompiledChangeEventProcessorFactory {
             output_layout: self.output_layout.clone(),
             output: None,
             construction: None,
-            control: RuntimeKernelControl::new(Arc::clone(&self.error)),
+            control: RuntimeKernelControl::new(Arc::clone(&self.error))
+                .at_expression_node(self.node),
             instances: None,
             input: None,
             next_event: 0,
@@ -273,7 +257,7 @@ impl OperatorFactory for CompiledChangeEventProcessorFactory {
 struct CompiledChangeEventProcessor {
     name: String,
     program: Arc<LocalProgram>,
-    sites: Vec<ProgramExpressionRootSite>,
+    sites: Vec<ProgramRootRef>,
     events: Arc<[EventPlan]>,
     effect_ordinal: usize,
     output_layout: novarocks_local_program::StaticLayout,
@@ -409,16 +393,10 @@ impl CompiledChangeEventProcessor {
                     &rows,
                     &self.control,
                 )?;
-                let Some(novarocks_functions::FunctionArgumentType::Value(source_type)) = self
-                    .program
-                    .checked()
-                    .channels()
-                    .expressions()
-                    .definition_type(
-                        novarocks_local_program::ProgramExpressionArena::Main,
-                        assignment.expression,
-                    )
-                else {
+                let Some(source_type) = super::compiled_expression::root_value_type_ref(
+                    &self.program,
+                    assignment.expression,
+                ) else {
                     return Err(program_binding_failure(
                         PlanBindingKind::InvalidAssignment,
                         "compiled change-event assignment lost its original source binding",

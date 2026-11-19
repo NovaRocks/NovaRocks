@@ -102,6 +102,10 @@ pub(crate) struct PreparedDeleteWrite {
     write_session: Arc<crate::query_execution::write_session::ConnectorWriteSession>,
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "The statement preparation retains its admitted write input inline."
+)]
 enum DeleteWritePlan {
     Direct(novarocks_sql::planning::dml::DmlWritePlanInput),
     Materialized(novarocks_spi::connector::ConnectorControlPlanningPin),

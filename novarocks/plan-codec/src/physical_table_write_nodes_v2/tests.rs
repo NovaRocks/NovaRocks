@@ -240,7 +240,7 @@ fn nominal() -> FunctionValueType {
 fn aggregate(phase: p::AggregatePhase) -> p::AggregateBinding {
     p::AggregateBinding {
         state_interpretation: None,
-        function: p::BoundFunction::from_exact_signature(
+        function: novarocks_expression_contract::BoundFunction::from_exact_signature(
             FunctionId::try_new("test/f").unwrap(),
             FunctionOverloadId::try_new("test/o").unwrap(),
             FunctionKind::Aggregate,
@@ -360,6 +360,7 @@ fn writer_calls() -> Box<[p::WriterAggregateCall]> {
 }
 fn header(kind: p::NodeKind) -> p::PhysicalNode {
     p::PhysicalNode {
+        expressions: None,
         id: p::NodeId::new(u32::MAX),
         inputs: Box::from([p::NodeId::new(0)]),
         required_inputs: Box::from([p::PhysicalProperties {
@@ -430,7 +431,7 @@ fn group() -> p::WriterGroupedUnpivotSpec {
             write_target_ordinal: WriteTargetOrdinal::try_new(4095).unwrap(),
             input: p::ValueId::new(0),
             constants: Box::from([
-                p::UnpivotConstant::Scalar(p::ExprId::new(0)),
+                p::UnpivotConstant::Scalar(novarocks_expression_contract::RootOrdinal::new(0)),
                 p::UnpivotConstant::Int32List(reference(0, 1)),
                 p::UnpivotConstant::Utf8Map(reference(7, 1)),
             ]),
@@ -581,7 +582,7 @@ fn expected_group() -> wire::WriterGroupedUnpivot {
             input_value_id: Some(0),
             constants: vec![
                 wire::UnpivotConstant {
-                    kind: Some(wire::unpivot_constant::Kind::ScalarExprId(0)),
+                    kind: Some(wire::unpivot_constant::Kind::ScalarRoot(0)),
                 },
                 wire::UnpivotConstant {
                     kind: Some(wire::unpivot_constant::Kind::Int32List(
@@ -607,6 +608,7 @@ fn expected_group() -> wire::WriterGroupedUnpivot {
 }
 fn expected(writer: bool, grouped: bool) -> wire::PhysicalNode {
     wire::PhysicalNode {
+        expressions: None,
         id: u32::MAX,
         input_node_ids: vec![0],
         required_inputs: vec![wp(true)],
@@ -663,7 +665,8 @@ fn expected(writer: bool, grouped: bool) -> wire::PhysicalNode {
 struct Fixture {
     roots: Vec<(u32, FunctionValueType)>,
     values: Vec<p::ValueDef>,
-    arena: p::ExprArena,
+    expressions: Box<[novarocks_expression_contract::ExprNode]>,
+    expression_roots: Box<[novarocks_expression_contract::ExprRoot]>,
     parameters: SemanticParameters,
     pools: p::ConstantPools,
 }
@@ -722,24 +725,36 @@ impl Fixture {
         );
         pools.insert(p::ConstantPoolId::new(7), pool(&map)).unwrap();
         let nodes = [
-            (0, p::ExprKind::Constant(reference(u32::MAX, 1))),
-            (7, p::ExprKind::Value(p::ValueId::new(0))),
-            (u32::MAX, p::ExprKind::Constant(reference(u32::MAX, 2))),
+            (
+                0,
+                novarocks_expression_contract::ExprKind::Constant(reference(u32::MAX, 1)),
+            ),
+            (
+                1,
+                novarocks_expression_contract::ExprKind::Value(p::ValueId::new(0)),
+            ),
+            (
+                2,
+                novarocks_expression_contract::ExprKind::Constant(reference(u32::MAX, 2)),
+            ),
         ]
         .into_iter()
-        .map(|(id, kind)| p::ExprNode {
+        .map(|(id, kind)| novarocks_expression_contract::ExprNode {
             id: p::ExprId::new(id),
-            owner: p::NodeId::new(u32::MAX),
             lambda_scope: None,
             ty: ty.clone(),
             kind,
         });
-        let arena = p::ExprArena::try_from_definitions_observed(
-            nodes,
-            &p::PlanLimits::default(),
-            &Control::default(),
-        )
-        .unwrap();
+        let expressions = nodes.collect::<Vec<_>>().into_boxed_slice();
+        let expression_roots = expressions
+            .iter()
+            .map(|node| novarocks_expression_contract::ExprRoot {
+                definition: node.id,
+                demand: novarocks_type_contract::EvaluationDemand::Value,
+                scope: novarocks_expression_contract::RootScope::AllPorts,
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
         Self {
             roots: vec![
                 (0, ty),
@@ -749,7 +764,8 @@ impl Fixture {
                 (4, FunctionValueType::new(DataType::Int64, false)),
             ],
             values,
-            arena,
+            expressions,
+            expression_roots,
             parameters: SemanticParameters::try_new([]).unwrap(),
             pools,
         }
@@ -920,20 +936,24 @@ impl Fixture {
         )
         .unwrap();
         let einputs = self
-            .arena
+            .expressions
             .iter()
-            .map(|(expr, _)| ExpressionTypeIds {
-                expr: *expr,
+            .map(|node| ExpressionTypeIds {
+                expr: node.id,
                 value_type_id: 0,
                 lambda_parameter_type_ids: &[],
                 function_binding_id: None,
-                aggregate_binding_id: None,
             })
             .collect::<Vec<_>>();
         let mut expression_limits = el();
         expression_limits.max_coexisting_source_and_request_bytes = 4 * SOURCE;
         let expressions = encode_expression_definitions(
-            &self.arena,
+            Some(
+                crate::physical_expression_v2::ExpressionDefinitionSource::new(
+                    &self.expressions,
+                    &self.expression_roots,
+                ),
+            ),
             &einputs,
             &types,
             &functions,
@@ -945,8 +965,24 @@ impl Fixture {
             c,
         )
         .unwrap();
+        let root_wire = self
+            .expression_roots
+            .iter()
+            .enumerate()
+            .map(|(ordinal, root)| wire::ExpressionRoot {
+                definition_id: Some(root.definition.get()),
+                demand: crate::physical_control_v2::encode_demand(root.demand),
+                scope: Some(wire::RootScope {
+                    kind: Some(wire::root_scope::Kind::AllPorts(
+                        novarocks_proto_models::physical_control_v2::Empty {},
+                    )),
+                }),
+                use_id: Some(ordinal as u32),
+            })
+            .collect::<Vec<_>>();
         let read = decode_expression_definitions(
             expressions.as_wire(),
+            &root_wire,
             &read_values,
             &fh,
             &ah,
@@ -1700,7 +1736,7 @@ fn table_write_wide_real_fields_and_group_constants_sample_quantum_and_numeric_p
     let mut n = finisher(true);
     let g = finish_spec(&mut n).grouped_unpivot.as_mut().unwrap();
     g.mappings[0].constants = (0..320)
-        .map(|_| p::UnpivotConstant::Scalar(p::ExprId::new(0)))
+        .map(|_| p::UnpivotConstant::Scalar(novarocks_expression_contract::RootOrdinal::new(0)))
         .collect::<Vec<_>>()
         .into_boxed_slice();
     let ids = Ids::new(&n);

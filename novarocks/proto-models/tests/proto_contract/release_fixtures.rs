@@ -232,33 +232,6 @@ fn release_create_task_request() -> novarocks::CreateTaskRequest {
     }
 }
 
-fn release_fetch_result_response() -> novarocks::FetchResultResponse {
-    novarocks::FetchResultResponse {
-        status: novarocks::fetch_result_response::Status::Ready as i32,
-        message: "ready".to_string(),
-        result_arrow_ipc: b"NRX1-fixture".to_vec().into(),
-        packet_seq: 9,
-        eos: true,
-    }
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-fn print_fixture<M: Message>(name: &str, message: &M) {
-    println!("{name}={}", hex(&message.encode_to_vec()));
-}
-
-#[test]
-#[ignore = "manual release fixture recorder; paste output into checked-in constants"]
-fn print_release_fixture_hex() {
-    print_fixture("FROZEN_FRAGMENT", &release_frozen_fragment());
-    print_fixture("CREATION_METADATA", &release_creation_metadata());
-    print_fixture("CREATE_TASK_REQUEST", &release_create_task_request());
-    print_fixture("FETCH_RESULT_RESPONSE", &release_fetch_result_response());
-}
-
 #[test]
 fn release_create_task_carrier_fixtures_decode() {
     let request = release_create_task_request();

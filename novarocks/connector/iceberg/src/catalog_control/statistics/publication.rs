@@ -242,9 +242,7 @@ impl Projection {
                     "External mutation evidence payload exceeds its original limit",
                 )
             } else {
-                internal(format!(
-                    "Encode complete statistics recovery ledger: {error}"
-                ))
+                internal(format!("Encode statistics recovery facts: {error}"))
             }));
         }
         let bytes = encoded.bytes;
@@ -696,7 +694,7 @@ mod tests {
                     uuid: self.projection.uuid
                 }]
             );
-            assert_eq!(request.artifacts().attempt_owned().len(), 1);
+            assert_eq!(request.artifacts().references().len(), 1);
             if matches!(self.behavior, Behavior::RefuseCapacity) {
                 let mut projection = self.projection.clone();
                 projection.data_version =
@@ -1013,7 +1011,7 @@ mod tests {
     }
 
     #[test]
-    fn statistics_complete_recovery_capacity_refusal_is_undispatched_and_cleans() {
+    fn statistics_oversized_identity_refuses_dispatch_and_cleans() {
         let rig = Rig::new();
         let publisher = rig.publisher(rig.metadata.clone(), Behavior::RefuseCapacity);
         let outcome = rig.run(publisher.clone(), rig.preparer());
@@ -1022,6 +1020,32 @@ mod tests {
             "{outcome:?}"
         );
         assert_eq!(publisher.dispatches.load(Ordering::SeqCst), 0);
+        assert!(rig.operation.artifacts().unwrap().is_empty());
+    }
+
+    #[test]
+    fn statistics_large_owned_ledger_publishes_with_bounded_recovery() {
+        let rig = Rig::new();
+        let abandoned = rig.operation.begin_attempt().unwrap();
+        for _ in 0..1500 {
+            abandoned
+                .allocate(crate::commit::model::ArtifactKind::Statistics)
+                .unwrap();
+        }
+        let publisher = rig.publisher(rig.metadata.clone(), Behavior::Commit);
+        let outcome = rig.run(publisher.clone(), rig.preparer());
+        assert!(
+            matches!(
+                outcome,
+                ExternalMutationOutcome::KnownCommitted {
+                    finalization: ExternalMutationFinalization::Complete,
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(publisher.dispatches.load(Ordering::SeqCst), 1);
+        assert!(exists(&publisher.paths.lock().unwrap()[0]));
         assert!(rig.operation.artifacts().unwrap().is_empty());
     }
 
@@ -1290,10 +1314,9 @@ mod tests {
         }
         fn allocate(
             &self,
-            class: crate::commit::model::ArtifactClass,
             kind: crate::commit::model::ArtifactKind,
         ) -> crate::iceberg::Result<crate::commit::model::ObjectIdentity> {
-            let object = self.inner.allocate(class, kind)?;
+            let object = self.inner.allocate(kind)?;
             *self.path.lock().unwrap() = Some(object.path().into());
             Ok(object)
         }
@@ -1305,9 +1328,37 @@ mod tests {
         }
         fn snapshot_artifacts(
             &self,
-            references: &[crate::commit::model::ObjectIdentity],
+            lists: &[crate::commit::model::ObjectIdentity],
+            statistics: &[crate::commit::model::ObjectIdentity],
         ) -> crate::iceberg::Result<crate::commit::model::AttemptArtifacts> {
-            self.inner.snapshot_artifacts(references)
+            self.inner.snapshot_artifacts(lists, statistics)
+        }
+
+        fn record_manifest(
+            &self,
+            object: &crate::commit::model::ObjectIdentity,
+            added_paths: &[String],
+            existing_paths: &[String],
+            replaces: &[String],
+        ) -> crate::iceberg::Result<()> {
+            self.inner
+                .record_manifest(object, added_paths, existing_paths, replaces)
+        }
+
+        fn record_manifest_list(
+            &self,
+            object: &crate::commit::model::ObjectIdentity,
+            snapshot_id: i64,
+            paths: &[String],
+        ) -> crate::iceberg::Result<()> {
+            self.inner.record_manifest_list(object, snapshot_id, paths)
+        }
+        fn stage_snapshot_id(
+            &self,
+            stage: usize,
+            metadata: &crate::iceberg::spec::TableMetadata,
+        ) -> crate::iceberg::Result<i64> {
+            self.inner.stage_snapshot_id(stage, metadata)
         }
     }
 

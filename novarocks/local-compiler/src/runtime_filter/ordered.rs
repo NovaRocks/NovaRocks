@@ -33,7 +33,7 @@ use std::num::NonZeroU32;
 pub(super) struct PlannedAggregateProducer {
     requirement: i32,
     key_ordinal: usize,
-    key: novarocks_physical_plan::ExprId,
+    key: novarocks_expression_contract::RootOrdinal,
     limit: NonZeroU32,
     producer: StaticFilterProducer,
 }
@@ -51,12 +51,18 @@ fn contract<H, F: ValueSchemaCreationFactory<H>>(
 ) -> Result<StaticFilterContract, FragmentCreationError<H>> {
     let RuntimeFilterDomain::Ordered {
         key,
-        inclusive: true,
+        inclusive,
         comparator,
     } = &filter.domain
     else {
-        return Err(unsupported(node, "inclusive ordered runtime-filter domain").into());
+        return Err(FragmentCompileError::Invalid(
+            "Aggregate TopN runtime filter requires an ordered domain",
+        )
+        .into());
     };
+    if !inclusive {
+        return Err(unsupported(node, "inclusive ordered runtime-filter domain").into());
+    }
     if *comparator != OrderedComparisonAlgorithm::NativeScalarOrderV1
         || !is_aggregate_topn_key_type(&key.ty)
     {
@@ -65,7 +71,10 @@ fn contract<H, F: ValueSchemaCreationFactory<H>>(
     if filter.lifecycle != RuntimeFilterLifecycle::MonotonicUpdates
         || filter.reduction != RuntimeFilterReduction::TightenOrderedBound
     {
-        return Err(unsupported(node, "monotonic tightening ordered runtime filter").into());
+        return Err(FragmentCompileError::Invalid(
+            "Aggregate TopN runtime filter requires monotonic tightening",
+        )
+        .into());
     }
     let direction = match key.direction {
         SortDirection::Ascending => FilterSortDirection::Ascending,
@@ -164,9 +173,10 @@ fn route<H>(
         ..
     } = producer.target
     else {
-        return Err(
-            unsupported(node, "Aggregate TopN runtime-filter phase, limit or offset").into(),
-        );
+        return Err(FragmentCompileError::Invalid(
+            "Aggregate TopN runtime-filter phase, limit or offset differs",
+        )
+        .into());
     };
     work.step()?;
     let installed_parent = match (grouping, fragment.nodes().get(&topn).map(|node| &node.kind)) {
@@ -198,6 +208,11 @@ fn route<H>(
         )
         .into());
     }
+    if limit == 0 {
+        return Err(
+            FragmentCompileError::Invalid("Aggregate TopN runtime-filter limit is zero").into(),
+        );
+    }
     let limit = u32::try_from(limit)
         .ok()
         .and_then(NonZeroU32::new)
@@ -207,13 +222,7 @@ fn route<H>(
     let (key, _) = group_by.get(ordinal).ok_or(FragmentCompileError::Invalid(
         "missing Aggregate TopN group key",
     ))?;
-    let key_type = &fragment
-        .expressions()
-        .get(*key)
-        .ok_or(FragmentCompileError::Invalid(
-            "missing Aggregate TopN key definition",
-        ))?
-        .ty;
+    let key_type = &crate::expressions::bound_root(package, node, *key)?.ty;
     if !is_aggregate_topn_key_type(key_type) {
         return Err(unsupported(node, "Aggregate TopN runtime-filter order key type").into());
     }
@@ -257,7 +266,7 @@ pub(super) fn plan_producer<H, F: ValueSchemaCreationFactory<H>>(
     if !keys[0]
         .value_type
         .same_value_domain_observed::<FragmentCreationError<H>>(
-            &package.fragment().expressions().get(key).unwrap().ty,
+            &crate::expressions::bound_root(package, node, key)?.ty,
             || work.step().map_err(Into::into),
         )?
     {
@@ -349,17 +358,40 @@ pub(super) fn plan_consumer<H, F: ValueSchemaCreationFactory<H>>(
     if !matches!(scan.kind, NodeKind::Scan { .. })
         || !scan.inputs.is_empty()
         || consumer.apply_point != RuntimeFilterApplyPoint::ScanSource
-        || consumer.activation
-            != (RuntimeFilterConsumerActivation::NonBlockingLive {
-                late_apply: LateApplyGranularity::Batch,
-            })
-        || consumer.capabilities.as_ref() != [RuntimeFilterArtifactCapability::OrderedRange]
     {
-        return Err(unsupported(
-            node,
-            "Aggregate TopN runtime-filter live Batch scan consumer",
+        return Err(FragmentCompileError::Invalid(
+            "Aggregate TopN runtime-filter consumer requires a scan source",
         )
         .into());
+    }
+    if consumer.capabilities.as_ref() != [RuntimeFilterArtifactCapability::OrderedRange] {
+        return Err(FragmentCompileError::Invalid(
+            "Aggregate TopN runtime-filter consumer capabilities differ from its channel matrix",
+        )
+        .into());
+    }
+    match consumer.activation {
+        RuntimeFilterConsumerActivation::NonBlockingLive {
+            late_apply: LateApplyGranularity::Batch,
+        } => {}
+        RuntimeFilterConsumerActivation::NonBlockingLive {
+            late_apply:
+                LateApplyGranularity::RowGroup
+                | LateApplyGranularity::Split
+                | LateApplyGranularity::File,
+        } => {
+            return Err(unsupported(
+                node,
+                "Aggregate TopN runtime-filter live Batch scan consumer",
+            )
+            .into());
+        }
+        _ => {
+            return Err(FragmentCompileError::Invalid(
+                "Aggregate TopN runtime-filter consumer requires live scan activation",
+            )
+            .into());
+        }
     }
     for output in scan.output.columns.iter() {
         work.step()?;
@@ -434,7 +466,7 @@ impl PlannedRuntimeFilters {
     pub(crate) fn take_aggregate<H, F: ValueSchemaCreationFactory<H>>(
         &mut self,
         node: NodeId,
-        definitions: &BTreeMap<novarocks_physical_plan::ExprId, ProgramExprId>,
+        definitions: &crate::expressions::RootMap,
         factory: Option<&F>,
         mut temporary: Option<&mut dyn ValueSchemaCreationScope<H>>,
         work: &mut CompileCheckpoints<'_>,

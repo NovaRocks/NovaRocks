@@ -89,13 +89,14 @@ impl std::error::Error for FunctionSpecializationFailure {
 pub(crate) fn refine_once_for_specialization<
     'a,
     O: FunctionEffectOwner<Error = FunctionBindingError> + ?Sized,
+    S: ScopedArgumentEffects,
 >(
     owner: &O,
     input: CallEffectInput<'a>,
     frozen: Option<&CallEffects>,
-    arguments: ScopedExpressionEffects,
+    arguments: S,
     control: &dyn PureCompileControl,
-) -> Result<(RefinedCallEffects<'a>, ScopedExpressionEffects), FunctionSpecializationFailure> {
+) -> Result<(RefinedCallEffects<'a>, S), FunctionSpecializationFailure> {
     control
         .checkpoint(CompilePhase::FunctionSpecialization, 0)
         .map_err(FunctionSpecializationFailure::Control)?;
@@ -111,8 +112,8 @@ pub(crate) fn refine_once_for_specialization<
             FunctionSpecializationFailure::InvalidInput(error)
         }
     })?;
-    let effects = receipt
-        .compose_for_use(input, arguments)
+    let effects = arguments
+        .compose_for_call(&receipt, input)
         .map_err(FunctionSpecializationFailure::Effects)?;
     Ok((receipt, effects))
 }
@@ -202,17 +203,16 @@ pub(crate) fn checked_refinement_failure(
 pub(crate) fn refine_once_checked<
     'a,
     O: FunctionEffectOwner<Error = FunctionBindingError> + ?Sized,
+    S: ScopedArgumentEffects,
 >(
     owner: &O,
     checked: &crate::CheckedCallEffectInput<'_>,
     input: CallEffectInput<'a>,
     frozen: Option<&CallEffects>,
-    arguments: ScopedExpressionEffects,
+    arguments: S,
     control: &dyn PureCompileControl,
-) -> Result<
-    (RefinedCallEffects<'a>, ScopedExpressionEffects),
-    crate::CheckedOwnerFailure<FunctionSpecializationFailure>,
-> {
+) -> Result<(RefinedCallEffects<'a>, S), crate::CheckedOwnerFailure<FunctionSpecializationFailure>>
+{
     control
         .checkpoint(CompilePhase::FunctionSpecialization, 0)
         .map_err(FunctionSpecializationFailure::Control)?;
@@ -222,8 +222,35 @@ pub(crate) fn refine_once_checked<
         None => crate::refine_call_effects(&adapter, input, control),
     }
     .map_err(checked_refinement_failure)?;
-    let effects = receipt
-        .compose_for_use(input, arguments)
+    let effects = arguments
+        .compose_for_call(&receipt, input)
         .map_err(FunctionSpecializationFailure::Effects)?;
     Ok((receipt, effects))
+}
+
+/// Private static dispatch preserves each dedicated lifecycle's summary type.
+pub(crate) trait ScopedArgumentEffects: Copy {
+    fn compose_for_call(
+        self,
+        receipt: &RefinedCallEffects<'_>,
+        input: CallEffectInput<'_>,
+    ) -> Result<Self, novarocks_type_contract::EffectContractError>;
+}
+impl ScopedArgumentEffects for ScopedExpressionEffects {
+    fn compose_for_call(
+        self,
+        receipt: &RefinedCallEffects<'_>,
+        input: CallEffectInput<'_>,
+    ) -> Result<Self, novarocks_type_contract::EffectContractError> {
+        receipt.compose_for_use(input, self)
+    }
+}
+impl ScopedArgumentEffects for crate::ScopedRelationalEffects {
+    fn compose_for_call(
+        self,
+        receipt: &RefinedCallEffects<'_>,
+        input: CallEffectInput<'_>,
+    ) -> Result<Self, novarocks_type_contract::EffectContractError> {
+        receipt.compose_for_relation(input, self)
+    }
 }

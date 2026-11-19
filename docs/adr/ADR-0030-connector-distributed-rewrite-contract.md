@@ -5,6 +5,10 @@ domain: [provider-spi, table-maintenance]
 status: superseded
 supersedes: []
 superseded-by: ADR-0133
+partially-superseded-by:
+  - id: ADR-0235
+    scope: "The inherited fixed 16,384 writers and 64 MiB aggregate staging budgets. ADR-0133 remains the superseding contract"
+    link: "ADR-0235-iceberg-write-layout-and-data-plane-capacity.md"
 date: 2026-08-02
 provenance:
   - "discussion: 2026-08-02 connector distributed rewrite"

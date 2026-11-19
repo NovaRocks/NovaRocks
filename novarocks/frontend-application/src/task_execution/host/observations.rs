@@ -25,13 +25,10 @@ pub(crate) mod host_turn;
 pub(crate) mod read_progress;
 pub(crate) mod source;
 
-use novarocks_attempt_protocol::{
-    failure::AttemptFailure,
-    input::{
-        AttemptInput, ExecutorFact, ObservationBatch, ObservationEvent, ObservationFact,
-        ObservationFailure, ObservationOpening, ReadPauseCoverage, ReadProgressSnapshot,
-        ReadStateSnapshot, ReceivedObservation, ReceptionCoverage,
-    },
+use novarocks_attempt_protocol::input::{
+    AttemptInput, ExecutorFact, ObservationBatch, ObservationEvent, ObservationFact,
+    ObservationFailure, ObservationOpening, ReadPauseCoverage, ReadProgressSnapshot,
+    ReadStateSnapshot, ReceivedObservation, ReceptionCoverage,
 };
 #[cfg(test)]
 use novarocks_control_runtime::causal_input::{CausalFillFailure, CausalInputObligation};
@@ -125,9 +122,9 @@ impl RootControlBinding {
         }
     }
 }
-/// A compact, source-qualified correlation reference. The original rich QA
-/// request/oneshot remains in its canonical owner; neither it nor the complete
-/// LogicalToAttempt enum is copied into the ordered queue.
+/// A compact, source-qualified correlation reference. The original root command
+/// remains with its exact port owner; the complete LogicalToAttempt is not
+/// copied into the ordered queue.
 pub(crate) struct RootControlRef {
     token: AttemptRequestToken,
     origin: Arc<RootControlOrigin>,
@@ -179,7 +176,7 @@ impl ObservationMetadataLayout {
             root_reference: Layout::new::<RootControlRef>(),
             actor_input: Layout::new::<A::Input>(),
             ap_projection: Layout::new::<AttemptInput>(),
-            logical_projection: Layout::new::<LogicalToAttempt<AttemptFailure>>(),
+            logical_projection: Layout::new::<LogicalToAttempt>(),
             batch_item: Layout::new::<ReceivedObservation>(),
             in_flight: Layout::new::<InFlight>(),
             failed_fill: Layout::new::<FailedFill<A::Input>>(),
@@ -256,10 +253,7 @@ impl ObservationBudget {
         // This is ONLY the original canonical-request share. Its owner retains
         // that one share through real request/reply custody. Queue wrappers and
         // transient projections require the separate original metadata author.
-        let control_bytes = std::mem::size_of::<
-            novarocks_query_application::coordination::AcceptedRootControlRequest,
-        >()
-        .max(1);
+        let control_bytes = std::mem::size_of::<RootControlRef>().max(1);
         Self {
             queued_frames: 4096,
             total_positions: 4098,
@@ -443,7 +437,7 @@ pub(crate) trait ObservationSourcePool: Send + Sync + 'static {
     fn project_root_control(
         &self,
         reference: &RootControlRef,
-    ) -> Result<LogicalToAttempt<AttemptFailure>, ObservationError>;
+    ) -> Result<LogicalToAttempt, ObservationError>;
     fn poll_read(
         &self,
         stream: StreamKey,
@@ -891,6 +885,39 @@ impl<A: Actor> WeakOrderedObservationInput<A> {
         self.0
             .upgrade()
             .map(|inner| OrderedObservationInput(inner, self.1.clone()))
+    }
+}
+
+/// Read only the SAME Source inventory. This Weak carries no backing pin,
+/// Work, position, publication or actual-exit authority.
+#[cfg(test)]
+pub(crate) struct ObservationTestProbe<A: Actor>(Weak<Inner<A>>);
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ObservationTestState {
+    pub(crate) accepted_unretired: usize,
+    pub(crate) queued: usize,
+    pub(crate) in_flight: bool,
+    pub(crate) paused: bool,
+}
+#[cfg(test)]
+impl<A: Actor> ObservationTestProbe<A> {
+    pub(crate) fn stream(&self, key: StreamKey) -> Option<ObservationTestState> {
+        let original = self.0.upgrade()?;
+        let state = original.state.lock().ok()?;
+        let stream = state.streams.get(&key)?;
+        Some(ObservationTestState {
+            accepted_unretired: stream.accepted_unretired,
+            queued: state.queue.len(),
+            in_flight: state.in_flight.is_some(),
+            paused: stream.paused_from.is_some(),
+        })
+    }
+}
+#[cfg(test)]
+impl<A: Actor> OrderedObservationInput<A> {
+    pub(crate) fn test_probe(&self) -> ObservationTestProbe<A> {
+        ObservationTestProbe(Arc::downgrade(&self.0))
     }
 }
 

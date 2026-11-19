@@ -32,6 +32,7 @@ use novarocks_execution::runtime::{
     preparation_metadata::CompiledSchemaSite,
     query_memory::QueryMemoryBinding,
 };
+use novarocks_expression_contract::{ExprKind, RootScope};
 use novarocks_functions::{
     ConstantPolicy, EngineFunctionCatalogBuilder, FunctionId, FunctionKind, FunctionOverloadId,
     InstalledPureKernel, PureEngineFunctionCatalog, PureImplementationDeclaration,
@@ -166,14 +167,21 @@ fn source(ty: FunctionValueType, label_bytes: usize) -> Vec<u8> {
         .add_values(values, Box::default(), Box::from([input]))
         .unwrap();
     let expression = builder
-        .add_expression(project, ty.clone(), ExprKind::Value(input))
+        .unit(project)
+        .unwrap()
+        .add(None, ty.clone(), ExprKind::Value(input))
+        .unwrap();
+    let root = builder
+        .unit(project)
+        .unwrap()
+        .root(expression, EvaluationDemand::Value, RootScope::Port(0))
         .unwrap();
     let output = builder
         .add_value(
             ty.clone(),
             ValueOrigin::Expr {
                 node: project,
-                expr: expression,
+                root,
             },
         )
         .unwrap();
@@ -181,10 +189,21 @@ fn source(ty: FunctionValueType, label_bytes: usize) -> Vec<u8> {
         .add_project(
             project,
             values,
-            Box::from([(expression, output)]),
+            Box::from([(root, output)]),
             Box::from([output]),
         )
         .unwrap();
+    let ports = builder.node_ports(project).unwrap();
+    let mut work = CompileCheckpoints::try_new(&Control, CompilePhase::Validate).unwrap();
+    let unit = builder
+        .take_unit_builder(project)
+        .unwrap()
+        .seal(ports, &mut work)
+        .unwrap()
+        .finish(BTreeMap::new(), &mut work)
+        .unwrap();
+    work.finish().unwrap();
+    builder.install_unit(project, Arc::new(unit)).unwrap();
     let fragment = builder
         .finish_definition(
             project,
@@ -197,37 +216,6 @@ fn source(ty: FunctionValueType, label_bytes: usize) -> Vec<u8> {
             novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap();
-    let roots = PhysicalExpressionRoots::try_new(&fragment, &Control).unwrap();
-    let mut invocations = Vec::new();
-    let mut bindings = Vec::new();
-    for (ordinal, (site, root)) in roots.sites().iter().enumerate() {
-        let use_id = ExpressionUseId::new(u32::try_from(ordinal).unwrap());
-        invocations.push(ExpressionInvocation {
-            context: ExpressionEffectContext {
-                use_id,
-                domain: EvaluationDomainId::new(0),
-                demand: root.demand,
-            },
-            definition: root.expr,
-            control: ControlShape::Eager,
-            arguments: Box::default(),
-        });
-        bindings.push((*site, use_id));
-    }
-    let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
-            id: EvaluationDomainId::new(0),
-            parent: None,
-            guard: None,
-        }],
-        invocations,
-        fragment.expressions(),
-        CompilePhase::Validate,
-        &Control,
-    )
-    .unwrap();
-    let uses = PhysicalRootUses::try_new(&fragment, flow, bindings, &Control).unwrap();
-    let calls = FrozenFragmentCalls::try_new(&fragment, &uses, vec![], &Control).unwrap();
     let result = ResultPort {
         scalar_schema: None,
         fragment: fragment.id(),
@@ -251,8 +239,7 @@ fn source(ty: FunctionValueType, label_bytes: usize) -> Vec<u8> {
             required: RequiredContracts::default(),
             fragment,
             constants: ConstantPools::empty(),
-            expression_uses: uses,
-            calls,
+            statement_constant_policy: constants(),
             pruning: FrozenFragmentPruning::try_new(id, vec![], &Control).unwrap(),
             cuts: FragmentCuts::default(),
             result: Some(result),
@@ -260,6 +247,7 @@ fn source(ty: FunctionValueType, label_bytes: usize) -> Vec<u8> {
             scans: BTreeMap::new(),
             writes: BTreeMap::new(),
             annotations: Box::default(),
+            layouts: Default::default(),
         },
         FragmentPackageAdmission {
             plan_limits: PlanLimits::FROZEN,

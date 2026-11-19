@@ -20,7 +20,6 @@
 
 use super::{StagedPathJournal, error};
 use crate::access_binding::IcebergReadBinding;
-use crate::commit::operation::OperationLimits;
 use crate::iceberg::io::FileIO;
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorOperationControl, ConnectorRequestContext,
@@ -36,8 +35,6 @@ pub(super) struct UnsealedWriterCleanup {
 struct CleanupPhase {
     request: ConnectorRequestContext,
     file_io: FileIO,
-    objects_per_turn: usize,
-    completed_in_turn: usize,
 }
 impl UnsealedWriterCleanup {
     pub(super) fn new(
@@ -61,18 +58,12 @@ impl UnsealedWriterCleanup {
             // The original journal already owns this obligation. Activate the
             // existing Provider policy once, not a new Work deadline and not
             // the async actor's diagnostic watchdog.
-            let budget = OperationLimits::default().cleanup;
             let request = journal.cleanup_request(original);
             let file_io = crate::fs_io::build_file_io_for_location(
                 location,
                 binding.for_request(request.clone()),
             );
-            CleanupPhase {
-                request,
-                file_io,
-                objects_per_turn: budget.objects,
-                completed_in_turn: 0,
-            }
+            CleanupPhase { request, file_io }
         })
     }
     pub(super) async fn run(&mut self, journal: &StagedPathJournal) -> Result<(), ConnectorError> {
@@ -115,14 +106,8 @@ impl UnsealedWriterCleanup {
             journal
                 .confirm_deleted(&path)
                 .map_err(|message| error(ConnectorErrorKind::Internal, message))?;
-            phase.completed_in_turn += 1;
-            if phase.completed_in_turn == phase.objects_per_turn {
-                // The commit owner's object count bounds a cleanup ROUND,
-                // not this writer's legitimate total object inventory. Yield
-                // between rounds without resetting the one cleanup deadline.
-                phase.completed_in_turn = 0;
-                tokio::task::yield_now().await;
-            }
+            // Yield after the actual I/O completion without resetting the one cleanup deadline.
+            tokio::task::yield_now().await;
         }
         if let Some(error) = stream_error {
             return Err(error);

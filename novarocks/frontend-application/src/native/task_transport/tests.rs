@@ -183,27 +183,22 @@ fn original_dispatch_batch_drives_the_input_gate_before_dto_construction() {
 }
 
 use std::collections::VecDeque;
-use std::num::NonZeroUsize;
-use std::pin::Pin;
 
 use novarocks_execution::task_execution::{
     AbortCause, AbortParticipation, AdmissionTicketId, CancelReason, CancelTask, CreateTaskReceipt,
     CredentialDomainId, CredentialEpoch, CredentialUpdate, DomainVersion, EstablishParticipation,
-    FetchTaskDynamicFilters, LeaseSequence, LeaseValidFor, ParticipationConvergenceCursor,
-    ParticipationConvergenceReceipt, ParticipationConvergenceState,
-    ParticipationConvergenceVersion, ParticipationReceipt, ParticipationState,
-    QuiesceParticipationReceipt, RenewParticipationLease, TaskConvergenceCursor,
-    TaskConvergenceReceipt, TaskConvergenceVersion, TaskDomainUpdate, TaskOutputFacts, TaskState,
-    TaskStatus, TaskStatusVersion, UpdateTask,
+    FetchTaskDynamicFilters, LeaseSequence, LeaseValidFor, ParticipationConvergenceReceipt,
+    ParticipationConvergenceState, ParticipationConvergenceVersion, ParticipationReceipt,
+    ParticipationState, QuiesceParticipationReceipt, RenewParticipationLease,
+    TaskConvergenceCursor, TaskConvergenceReceipt, TaskConvergenceVersion, TaskDomainUpdate,
+    TaskOutputFacts, TaskState, TaskStatus, TaskStatusVersion, UpdateTask,
 };
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::{catalog, filter};
 use novarocks_task_codec::domain::{WireContent, WireCredential};
 use novarocks_task_codec::operation::{
-    CoveredCatchUpComplete, CoveredObservationBookmark, QuiesceObservationCursor,
-    decode_covered_subscribe_task_status, decode_participation_aware_subscribe_task_status,
-    decode_subscribe_task_status, encode_covered_status_event, encode_operation_outcome,
-    encode_participation_ack, encode_participation_convergence_event, encode_status_event,
+    CoveredCatchUpComplete, CoveredObservationBookmark, decode_covered_subscribe_task_status,
+    encode_covered_status_event, encode_operation_outcome, encode_participation_ack,
 };
 use novarocks_task_codec::operation::{
     ESTABLISH_CATALOG_DOMAIN_TAG, ESTABLISH_FILTER_DOMAIN_TAG, ESTABLISH_QUERY_OPTIONS_DOMAIN_TAG,
@@ -214,56 +209,26 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
 use crate::native::transport_supervisor::NativeTransportSupervisor;
-use crate::task_execution::dispatch::OperationDispatcher;
-use crate::task_execution::participation_convergence::ParticipationConvergenceIntake;
-use crate::task_execution::status_intake::{
-    CountingWake, ObservationIntake, ObservationIntakeEntry, StatusIntake,
-};
-use novarocks_attempt_protocol::config::DispatchBudget;
-use novarocks_coordination_contract::MonotonicInstant;
+use crate::wake::CountingWake;
 use novarocks_native_adapter::generated::nova_rocks_grpc_server::{
     NovaRocksGrpc, NovaRocksGrpcServer,
 };
 
 use super::*;
 
-#[test]
-fn covered_reconnect_backoff_is_exponential_bounded_and_jittered() {
-    let bases = [100_u64, 200, 400, 800, 1_000, 1_000];
-    for (index, base) in bases.into_iter().enumerate() {
-        let failure = index as u32 + 1;
-        assert_eq!(
-            covered_reconnect_backoff(failure, 0),
-            Duration::from_millis(base * 80 / 100)
-        );
-        assert_eq!(
-            covered_reconnect_backoff(failure, 20),
-            Duration::from_millis(base)
-        );
-        assert_eq!(
-            covered_reconnect_backoff(failure, 40),
-            Duration::from_millis(base * 120 / 100)
-        );
-    }
-    assert_eq!(
-        covered_reconnect_backoff(u32::MAX, 40),
-        Duration::from_millis(1_200)
-    );
-}
-
 // -----------------------------------------------------------------------
 // Fixtures
 // -----------------------------------------------------------------------
 
-/// The original test role and the SAME Workload authority supplied to its
-/// Covered subscriber. Cleanup joins original tasks before settling root.
-struct CoveredRoleFixture {
+/// The original Native test role and SAME Workload authority. Cleanup joins
+/// original Apply/outgoing tasks before settling its real Root.
+struct NativeRoleFixture {
     runtime: FrontendDataRuntime,
     workload: novarocks_workload_control::WorkloadControl,
     root: Option<novarocks_workload_control::RootWork>,
 }
 
-impl CoveredRoleFixture {
+impl NativeRoleFixture {
     fn new() -> Self {
         use novarocks_workload_control::{WorkClass, WorkRequest, WorkloadConfig, WorkloadControl};
         let config = WorkloadConfig::default();
@@ -280,16 +245,8 @@ impl CoveredRoleFixture {
         }
     }
 
-    fn scope(&self) -> novarocks_workload_control::WorkScope {
-        self.root.as_ref().unwrap().owner.scope().clone()
-    }
-
     async fn settle(mut self) {
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
-        self.runtime
-            .drain_original_subscriptions_until(deadline)
-            .await
-            .unwrap();
         self.runtime
             .drain_original_apply_until(deadline)
             .await
@@ -382,22 +339,22 @@ fn renew_intent(backend: BackendProcessId) -> OperationIntent {
     )))
 }
 
-/// Releases one batch through the real dispatcher, which is the only owner
-/// that may mint a [`DispatchBatch`].
+/// Assemble exact wire-test metadata. Actual submission replaces the placeholder
+/// permits with the original governed queue grants; this proves no dispatch policy.
 fn released_batch(backend: BackendProcessId, intents: Vec<OperationIntent>) -> DispatchBatch {
-    let mut dispatcher =
-        OperationDispatcher::new(DispatchBudget::DEFAULT, TransportBudget::DEFAULT);
-    dispatcher
-        .register_task(backend)
-        .expect("one task fits the per-backend bound");
-    for intent in intents {
-        dispatcher
-            .enqueue(intent, MonotonicInstant::ORIGIN)
-            .expect("the queue bounds admit a small batch");
-    }
-    dispatcher
-        .take_batch()
-        .expect("a queued lane releases a batch")
+    let lane = intents.first().expect("one original operation").lane();
+    assert!(
+        intents
+            .iter()
+            .all(|intent| intent.backend_process_id() == backend && intent.lane() == lane)
+    );
+    let queued_bytes = intents
+        .iter()
+        .try_fold(0usize, |bytes, intent| {
+            bytes.checked_add(intent.queued_bytes())
+        })
+        .expect("original batch bytes fit");
+    DispatchBatch::test_fixture(backend, lane, intents, queued_bytes)
 }
 
 /// A seam double for operations that need no retained typed content.
@@ -550,10 +507,40 @@ struct SingleRootIoGates {
     create: Arc<SingleRootIoGate>,
 }
 
+/// The default peer remains the original empty root. EncodedData is one
+/// caller-authored canonical segment; this peer never encodes domain values or
+/// derives a row count from an artifact, query, Task status or payload length.
+enum SingleRootResult {
+    EndOnly,
+    EncodedData {
+        data: novarocks_execution_contract::root_result::RootResultData,
+        output_rows: u64,
+    },
+}
+
+enum SingleRootTerminal {
+    Finished,
+    Failed(Box<novarocks_execution_contract::TaskFailure>),
+}
+struct SingleRootFinalInfo {
+    operators: Vec<novarocks_execution_contract::OperatorStatistics>,
+    truncated: bool,
+    requested: bool,
+}
+
 struct SingleRootLifecycle {
+    exchange_updates:
+        std::collections::BTreeMap<TaskIdentity, three_task_recipe::ScriptedExchangeUpdates>,
+    other_tasks: std::collections::BTreeMap<TaskIdentity, three_task_recipe::OtherTaskSlot>,
+    final_info: std::collections::BTreeMap<TaskIdentity, SingleRootFinalInfo>,
     io_gates: Option<SingleRootIoGates>,
+    root_data_gate: Option<Arc<SingleRootIoGate>>,
+    root_end_gate: Option<Arc<SingleRootIoGate>>,
     root: TaskIdentity,
     kind: novarocks_result_contract::RootOutputKind,
+    result: SingleRootResult,
+    terminal: Option<SingleRootTerminal>,
+    failing_revision: Option<u64>,
     participation: Option<ParticipationRef>,
     ticket_issued: bool,
     revision: u64,
@@ -563,12 +550,15 @@ struct SingleRootLifecycle {
     quiesce_revision: Option<u64>,
     participation_revision: Option<u64>,
     root_end_offered: bool,
+    root_offered_through: u64,
     root_consumed: u64,
     established: bool,
     created: bool,
     quiesce: Option<QuiesceParticipationReceipt>,
     released: bool,
     abort_cause: Option<AbortCause>,
+    close_finished_tasks_on_abort: bool,
+    defer_release_until_abort: bool,
 }
 
 impl SingleRootLifecycle {
@@ -590,7 +580,7 @@ impl SingleRootLifecycle {
         self.revision = self
             .revision
             .checked_add(1)
-            .expect("five fixed peer facts fit");
+            .expect("the declared finite peer facts fit");
         self.revision
     }
 
@@ -633,24 +623,70 @@ impl SingleRootLifecycle {
         .expect("the fixed peer finished its one installed root")
     }
 
-    fn completion_frames(&self) -> [proto::TaskStatusStreamEvent; 3] {
-        [
-            self.frame(
-                CoveredStatusStreamFact::Status(self.running_status()),
-                self.running_revision,
-            ),
-            self.frame(
-                CoveredStatusStreamFact::Status(self.finished_status()),
-                self.status_revision,
-            ),
-            self.frame(
-                CoveredStatusStreamFact::TaskConvergence(TaskConvergenceReceipt::actual_stopped(
-                    self.root,
-                    TaskConvergenceVersion::FIRST,
+    fn current_status(&self) -> TaskStatus {
+        match &self.terminal {
+            None => self.running_status(),
+            Some(SingleRootTerminal::Finished) => self.finished_status(),
+            Some(SingleRootTerminal::Failed(original)) => TaskStatus::try_new(
+                self.root,
+                TaskStatusVersion::new(4).unwrap(),
+                TaskState::Failed,
+                Some(novarocks_execution_contract::TerminationDetail::Failed(
+                    original.as_ref().clone(),
                 )),
-                self.task_revision,
-            ),
-        ]
+                TaskOutputFacts::default(),
+            )
+            .expect("the original fixed Task failure retains its exact phase and fact"),
+        }
+    }
+    fn assign_terminal_revisions(&mut self) {
+        if matches!(self.terminal, Some(SingleRootTerminal::Failed(_))) {
+            self.failing_revision = Some(self.next_revision());
+        }
+        self.status_revision = Some(self.next_revision());
+        self.task_revision = Some(self.next_revision());
+    }
+    fn terminal_frames(&self) -> Vec<proto::TaskStatusStreamEvent> {
+        let Some(terminal) = &self.terminal else {
+            return Vec::new();
+        };
+        let mut frames = Vec::new();
+        if let SingleRootTerminal::Failed(original) = terminal {
+            let failing = TaskStatus::try_new(
+                self.root,
+                TaskStatusVersion::new(3).unwrap(),
+                TaskState::Failing,
+                Some(novarocks_execution_contract::TerminationDetail::Failed(
+                    original.as_ref().clone(),
+                )),
+                TaskOutputFacts::default(),
+            )
+            .expect("the same original cause is present on the legal Failing prefix");
+            frames.push(self.frame(
+                CoveredStatusStreamFact::Status(failing),
+                self.failing_revision,
+            ));
+        }
+        frames.push(self.frame(
+            CoveredStatusStreamFact::Status(self.current_status()),
+            self.status_revision,
+        ));
+        frames.push(self.frame(
+            CoveredStatusStreamFact::TaskConvergence(TaskConvergenceReceipt::actual_stopped(
+                self.root,
+                TaskConvergenceVersion::FIRST,
+            )),
+            self.task_revision,
+        ));
+        frames
+    }
+    fn completion_frames(&self) -> Vec<proto::TaskStatusStreamEvent> {
+        let mut frames = vec![self.frame(
+            CoveredStatusStreamFact::Status(self.running_status()),
+            self.running_revision,
+        )];
+        frames.extend(self.terminal_frames());
+        frames
     }
 
     fn frame(
@@ -668,8 +704,11 @@ impl SingleRootLifecycle {
 
 #[derive(Default)]
 struct PeerState {
+    original_root_socket: Option<std::net::SocketAddr>,
     single_root: Option<SingleRootLifecycle>,
+    participation_only: Option<participation_recipe::ParticipationOnly>,
     applied: Vec<proto::ApplyTaskOperationsRequest>,
+    single_root_abort_refusals: Vec<(TaskOperationId, tonic::Code)>,
     control_requests: usize,
     heartbeat_descriptor: Option<BackendProcessDescriptor>,
     heartbeats: Vec<proto::HeartbeatRequest>,
@@ -700,6 +739,15 @@ impl TaskWirePeer {
         request: Request<proto::ApplyTaskOperationsRequest>,
     ) -> Result<Response<proto::ApplyTaskOperationsResponse>, Status> {
         let request = request.into_inner();
+        if self
+            .state
+            .lock()
+            .expect("peer state")
+            .participation_only
+            .is_some()
+        {
+            return self.apply_participation_only(request);
+        }
         let (scripted, create_gate) = {
             let state = self.state.lock().expect("peer state");
             let script = state.single_root.as_ref();
@@ -823,7 +871,10 @@ impl TaskWirePeer {
         let mut state = self.state.lock().expect("peer state");
         state.applied.push(request.clone());
         let PeerState {
-            single_root, held, ..
+            single_root,
+            held,
+            single_root_abort_refusals,
+            ..
         } = &mut *state;
         let script = single_root
             .as_mut()
@@ -911,7 +962,7 @@ impl TaskWirePeer {
                 }
                 D::CreateTask(create) => {
                     script.require_participation(create.request().participation())?;
-                    if create.request().identity() != script.root
+                    if !script.declares_task(create.request().identity())
                         || !script.established
                         || script.quiesce.is_some()
                         || script.released
@@ -921,22 +972,46 @@ impl TaskWirePeer {
                             "single-root Create is not admitted",
                         ));
                     }
-                    let status = if script.created {
-                        script.finished_status()
+                    let task = create.request().identity();
+                    script.bind_exchange_descriptor(create.request().descriptor())?;
+                    if task != script.root {
+                        let (status, frames) = script.create_other_task(task)?;
+                        for frame in frames {
+                            Self::queue_single_root_frame(held, frame)?;
+                        }
+                        Some(Self::create_ack(task, status))
                     } else {
-                        TaskStatus::created(script.root).with_installed()
-                    };
-                    finish = !script.created;
-                    if finish {
-                        // Each actual modeled publication owns its revision.
-                        // Running is published even when a later catch-up
-                        // retains only the latest Finished snapshot.
-                        script.running_revision = Some(script.next_revision());
-                        script.status_revision = Some(script.next_revision());
-                        script.task_revision = Some(script.next_revision());
+                        let status = if script.created {
+                            script.current_status()
+                        } else {
+                            TaskStatus::created(script.root).with_installed()
+                        };
+                        finish = !script.created;
+                        if finish {
+                            // Each actual modeled publication owns its revision.
+                            // Running is published even when a later catch-up
+                            // retains only the latest Finished snapshot.
+                            script.running_revision = Some(script.next_revision());
+                            if script.terminal.is_some() {
+                                script.assign_terminal_revisions();
+                            }
+                        }
+                        script.created = true;
+                        Some(Self::create_ack(script.root, status))
                     }
-                    script.created = true;
-                    Some(Self::create_ack(script.root, status))
+                }
+                D::UpdateTask(update) => {
+                    let (receipt, applied) = script.update_exchange_domains(update.request())?;
+                    outcome = if applied {
+                        OperationOutcome::Accepted
+                    } else {
+                        OperationOutcome::Idempotent
+                    };
+                    Some(proto::task_operation_verdict::Ack::UpdateTask(
+                        codec::encode_update_task_ack(&receipt).ok_or_else(|| {
+                            Status::internal("the original finite exchange receipt did not encode")
+                        })?,
+                    ))
                 }
                 D::QuiesceParticipation(quiesce) => {
                     script.require_participation(quiesce.participation())?;
@@ -948,11 +1023,7 @@ impl TaskWirePeer {
                         script.quiesce = Some(QuiesceParticipationReceipt::new(
                             quiesce.participation(),
                             1, // The production first immutable QuiesceDecision fence is 1.
-                            if script.created {
-                                vec![script.root]
-                            } else {
-                                Vec::new()
-                            },
+                            script.created_tasks(),
                             if script.abort_cause.is_some() {
                                 ParticipationState::Aborting
                             } else {
@@ -975,26 +1046,37 @@ impl TaskWirePeer {
                             "single-root release precedes its fence",
                         ));
                     }
-                    release = !script.released;
-                    script.released = true;
-                    if release {
-                        script.participation_revision = Some(script.next_revision());
+                    if script.defer_release_until_abort && script.abort_cause.is_none() {
+                        outcome = OperationOutcome::ReleaseNotReady;
+                        None
+                    } else {
+                        release = !script.released;
+                        script.released = true;
+                        if release {
+                            script.participation_revision = Some(script.next_revision());
+                        }
+                        let mut receipt = codec::encode_release_ack(
+                            original.participation(),
+                            ReleaseOutcome::Released,
+                            ParticipationState::TerminalRetained,
+                            None,
+                        )
+                        .expect("the original single-root release encodes");
+                        receipt.termination_cause =
+                            script.abort_cause.map(codec::encode_abort_cause_field);
+                        Some(proto::task_operation_verdict::Ack::ReleaseParticipation(
+                            receipt,
+                        ))
                     }
-                    let mut receipt = codec::encode_release_ack(
-                        original.participation(),
-                        ReleaseOutcome::Released,
-                        ParticipationState::TerminalRetained,
-                        None,
-                    )
-                    .expect("the original single-root release encodes");
-                    receipt.termination_cause =
-                        script.abort_cause.map(codec::encode_abort_cause_field);
-                    Some(proto::task_operation_verdict::Ack::ReleaseParticipation(
-                        receipt,
-                    ))
                 }
                 D::AbortParticipation(abort) => {
-                    script.require_participation(abort.participation())?;
+                    if let Err(error) = script.require_participation(abort.participation()) {
+                        // Preserve the actual refusal code of this same RPC;
+                        // this is not a Worker acknowledgement or close fact.
+                        single_root_abort_refusals
+                            .push((abort.envelope().operation_id(), error.code()));
+                        return Err(error);
+                    }
                     if !script.released {
                         script.abort_cause = Some(abort.cause());
                     } else {
@@ -1004,7 +1086,19 @@ impl TaskWirePeer {
                         encode_participation_ack(
                             &ParticipationReceipt::new(
                                 abort.participation(),
-                                if script.released {
+                                if script.released
+                                    || (script.close_finished_tasks_on_abort
+                                        && script.created
+                                        && script.created_tasks().len()
+                                            == script.other_tasks.len() + 1
+                                        && script
+                                            .created_tasks()
+                                            .into_iter()
+                                            .all(|task| script.static_stopped(task)))
+                                {
+                                    // This original Abort supplies the fence. The same peer
+                                    // already authored actual_stopped for EVERY declared Task.
+                                    // No FE local exit or Release is claimed by this receipt.
                                     ParticipationState::TerminalRetained
                                 } else {
                                     ParticipationState::Aborting
@@ -1016,15 +1110,26 @@ impl TaskWirePeer {
                     ))
                 }
                 D::CancelTask(cancel) => {
-                    if cancel.identity() != script.root {
+                    if !script.declares_task(cancel.identity()) {
                         return Err(Status::failed_precondition(
                             "single-root cancel identity mismatch",
                         ));
                     }
-                    // This peer's only created task is already terminal; never
-                    // replace Finished with a new cancellation status.
-                    outcome = if script.created {
+                    // Preserve the declared Task's original terminal status
+                    // when cancellation observes its completed script.
+                    outcome = if (cancel.identity() == script.root
+                        && script.created
+                        && script.terminal.is_some())
+                        || script.other_task_terminal(cancel.identity())
+                    {
                         OperationOutcome::Idempotent
+                    } else if script.other_task_created(cancel.identity()) {
+                        let frames =
+                            script.cancel_other_task(cancel.identity(), cancel.reason())?;
+                        for frame in frames {
+                            Self::queue_single_root_frame(held, frame)?;
+                        }
+                        OperationOutcome::Accepted
                     } else {
                         OperationOutcome::NotReady
                     };
@@ -1084,7 +1189,7 @@ impl TaskWirePeer {
         held: &[tokio::sync::mpsc::Sender<Result<proto::TaskStatusStreamEvent, Status>>],
         frame: proto::TaskStatusStreamEvent,
     ) -> Result<(), Status> {
-        // A fixed script has at most one open stream and at most seven frames.
+        // A fixed script has at most one open stream and at most eight declared frames.
         // Enqueue under the original PeerState gate so Create cannot overtake
         // its subscription's catch-up snapshot. No extra sender job exists.
         if let Some(sender) = held.last().filter(|sender| !sender.is_closed()) {
@@ -1100,6 +1205,16 @@ impl TaskWirePeer {
         request: proto::SubscribeTaskStatusRequest,
         close_after_initial: bool,
     ) -> Result<Response<StatusStream>, Status> {
+        let three_tasks = self
+            .state
+            .lock()
+            .expect("peer state")
+            .single_root
+            .as_ref()
+            .is_some_and(|script| !script.other_tasks.is_empty());
+        if three_tasks {
+            return self.subscribe_three_task_root(request, close_after_initial);
+        }
         let decoded = decode_covered_subscribe_task_status(
             &request,
             FieldPath::root("single_root_subscription"),
@@ -1144,9 +1259,11 @@ impl TaskWirePeer {
         let participation_version = decoded
             .participation_cursor
             .and_then(|cursor| cursor.current_version());
-        if status_version.is_some_and(|version| !script.created || version.get() > 3)
-            || task_version
-                .is_some_and(|version| !script.created || version > TaskConvergenceVersion::FIRST)
+        if status_version
+            .is_some_and(|version| !script.created || version > script.current_status().version())
+            || task_version.is_some_and(|version| {
+                script.task_revision.is_none() || version > TaskConvergenceVersion::FIRST
+            })
             || participation_version.is_some_and(|version| {
                 !script.released || version > ParticipationConvergenceVersion::FIRST
             })
@@ -1163,25 +1280,29 @@ impl TaskWirePeer {
         // Initial facts carry no live source revision. The exact original
         // catch-up cut below separates snapshot replay from later live frames.
         if script.created {
-            let status = if status_version == Some(TaskStatusVersion::new(3).unwrap()) {
+            let status = if status_version == Some(script.current_status().version()) {
                 CoveredStatusStreamFact::StatusUnchanged(script.root)
             } else {
-                CoveredStatusStreamFact::Status(script.finished_status())
+                CoveredStatusStreamFact::Status(script.current_status())
             };
             sender
                 .try_send(Ok(script.frame(status, None)))
                 .expect("fixed snapshot fits");
-            let task = if task_version == Some(TaskConvergenceVersion::FIRST) {
-                CoveredStatusStreamFact::TaskConvergenceUnchanged(script.root)
-            } else {
-                CoveredStatusStreamFact::TaskConvergence(TaskConvergenceReceipt::actual_stopped(
-                    script.root,
-                    TaskConvergenceVersion::FIRST,
-                ))
-            };
-            sender
-                .try_send(Ok(script.frame(task, None)))
-                .expect("fixed snapshot fits");
+            if script.task_revision.is_some() {
+                let task = if task_version == Some(TaskConvergenceVersion::FIRST) {
+                    CoveredStatusStreamFact::TaskConvergenceUnchanged(script.root)
+                } else {
+                    CoveredStatusStreamFact::TaskConvergence(
+                        TaskConvergenceReceipt::actual_stopped(
+                            script.root,
+                            TaskConvergenceVersion::FIRST,
+                        ),
+                    )
+                };
+                sender
+                    .try_send(Ok(script.frame(task, None)))
+                    .expect("fixed snapshot fits");
+            }
         } else if !decoded.required_identities.is_empty() || !decoded.status_cursors.is_empty() {
             sender
                 .try_send(Ok(
@@ -1425,6 +1546,15 @@ impl NovaRocksGrpc for TaskWirePeer {
         if !NativeRpcMethod::SubscribeTaskStatus.is_allowed_at(self.domain) {
             return Err(Self::rejected("wrong endpoint domain"));
         }
+        if self
+            .state
+            .lock()
+            .expect("peer state")
+            .participation_only
+            .is_some()
+        {
+            return self.subscribe_participation_only(request.into_inner());
+        }
         let (scripted, first_response) = {
             let mut state = self.state.lock().expect("peer state");
             let script = state.single_root.as_mut();
@@ -1484,9 +1614,54 @@ impl NovaRocksGrpc for TaskWirePeer {
 
     async fn get_final_task_info(
         &self,
-        _request: Request<proto::GetFinalTaskInfoRequest>,
+        request: Request<proto::GetFinalTaskInfoRequest>,
     ) -> Result<Response<proto::GetFinalTaskInfoResponse>, Status> {
-        Err(Self::rejected("GetFinalTaskInfo"))
+        let mut state = self.state.lock().expect("peer state");
+        if let Some(original) = state.participation_only.as_mut() {
+            return original.final_info(request.into_inner());
+        }
+        let Some(script) = state
+            .single_root
+            .as_mut()
+            .filter(|s| !s.final_info.is_empty())
+        else {
+            // Existing peers remain explicitly unsupported unless the caller
+            // supplied bounded original diagnostic payloads before Create.
+            return Err(Self::rejected("GetFinalTaskInfo"));
+        };
+        let request = novarocks_task_codec::operation::decode_get_final_task_info(
+            &request.into_inner(),
+            TaskOperationId::new_v7(),
+            FieldPath::root("get_final_task_info"),
+        )
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let task = request.identity();
+        // This is the SAME status already authored by this peer's original
+        // Create/covered subscription. Root End never manufactures Finished.
+        let status = script.static_status(task).ok_or_else(|| {
+            Status::failed_precondition("final info requires the original created Task")
+        })?;
+        let original = script.final_info.get_mut(&task).ok_or_else(|| {
+            Status::failed_precondition("final info payload is not declared for this Task")
+        })?;
+        if original.requested {
+            return Err(Status::failed_precondition(
+                "the original final-info read was already consumed",
+            ));
+        }
+        let info = novarocks_execution_contract::FinalTaskInfo::try_new(
+            task,
+            status,
+            original.operators.clone(),
+            original.truncated,
+        )
+        .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        original.requested = true;
+        Ok(Response::new(proto::GetFinalTaskInfoResponse {
+            result: Some(proto::get_final_task_info_response::Result::Info(
+                novarocks_task_codec::status::encode_final_task_info(&info),
+            )),
+        }))
     }
 
     async fn fetch_task_result(
@@ -1513,6 +1688,7 @@ impl NovaRocksGrpc for TaskWirePeer {
         if !NativeRpcMethod::FetchRootResult.is_allowed_at(self.domain) {
             return Err(Self::rejected("wrong root endpoint domain"));
         }
+        let original_root_socket = request.remote_addr();
         let wire = request.into_inner();
         if prost::Message::encoded_len(&wire)
             > novarocks_result_contract::RootProfileV1::ENVELOPE_BYTES
@@ -1526,6 +1702,46 @@ impl NovaRocksGrpc for TaskWirePeer {
             FieldPath::root("single_root_read"),
         )
         .map_err(|_| Status::invalid_argument("single-root read did not decode"))?;
+        let result_gate = {
+            let state = self.state.lock().expect("peer state");
+            let script = state
+                .single_root
+                .as_ref()
+                .ok_or_else(|| Self::rejected("root is not installed"))?;
+            if read.root_task() != script.root
+                || read.kind() != script.kind
+                || read.profile() != novarocks_result_contract::RootProfileId::V1
+            {
+                return Err(Status::failed_precondition(
+                    "root read differs from its explicit fixture declaration",
+                ));
+            }
+            if read.consumed() > script.root_offered_through {
+                return Err(Status::invalid_argument(
+                    "root ACK exceeds the actual offered sequence",
+                ));
+            }
+            match read.wanted().map(|value| value.get()) {
+                Some(1) if script.created && !script.released && script.root_consumed < 1 => {
+                    script.root_data_gate.clone()
+                }
+                Some(2) if script.created && !script.released && script.root_consumed < 2 => {
+                    script.root_end_gate.clone()
+                }
+                _ => None,
+            }
+        };
+        if let Some(gate) = result_gate {
+            {
+                let mut state = self.state.lock().expect("peer state");
+                if state.original_root_socket.is_none() {
+                    state.original_root_socket = original_root_socket;
+                }
+            }
+            // Hold this SAME real RPC future, outside the peer state lock.
+            // No DATA/End/ACK fact is offered by releasing the test gate.
+            gate.wait().await;
+        }
         let response = {
             let mut state = self.state.lock().expect("peer state");
             let script = state
@@ -1546,9 +1762,9 @@ impl NovaRocksGrpc for TaskWirePeer {
                     RootReadDeferral::Preparing,
                 ))
             } else {
-                if read.consumed() > u64::from(script.root_end_offered) {
+                if read.consumed() > script.root_offered_through {
                     return Err(Status::invalid_argument(
-                        "root ACK exceeds the offered End sequence",
+                        "root ACK exceeds the actual offered sequence",
                     ));
                 }
                 if !script.released {
@@ -1560,16 +1776,42 @@ impl NovaRocksGrpc for TaskWirePeer {
                     RootReadOutcome::AckOnly
                 } else if read.wanted().unwrap().get() <= script.root_consumed {
                     RootReadOutcome::Retired
-                } else if read.wanted().unwrap().get() == 1 {
-                    script.root_end_offered = true;
-                    RootReadOutcome::End(RootResultEnd {
-                        sequence: std::num::NonZeroU64::MIN,
-                        output_rows: 0,
-                    })
                 } else {
-                    return Err(Status::invalid_argument(
-                        "fixed empty root has no later sequence",
-                    ));
+                    let wanted = read.wanted().unwrap().get();
+                    match (&script.result, wanted) {
+                        (SingleRootResult::EndOnly, 1) => {
+                            script.root_offered_through = 1;
+                            script.root_end_offered = true;
+                            RootReadOutcome::End(RootResultEnd {
+                                sequence: std::num::NonZeroU64::MIN,
+                                output_rows: 0,
+                            })
+                        }
+                        (SingleRootResult::EncodedData { data, .. }, 1) => {
+                            script.root_offered_through = script.root_offered_through.max(1);
+                            RootReadOutcome::Data(data.clone())
+                        }
+                        (SingleRootResult::EncodedData { output_rows, .. }, 2)
+                            if script.root_offered_through >= 1 =>
+                        {
+                            script.root_offered_through = 2;
+                            script.root_end_offered = true;
+                            RootReadOutcome::End(RootResultEnd {
+                                sequence: std::num::NonZeroU64::new(2).unwrap(),
+                                output_rows: *output_rows,
+                            })
+                        }
+                        (SingleRootResult::EndOnly, _) => {
+                            return Err(Status::invalid_argument(
+                                "fixed empty root has no later sequence",
+                            ));
+                        }
+                        (SingleRootResult::EncodedData { .. }, _) => {
+                            return Err(Status::invalid_argument(
+                                "fixed encoded root read skips or exceeds its declared sequence",
+                            ));
+                        }
+                    }
                 };
                 RootReadResponse::Reply(RootResultReply {
                     root_task: script.root,
@@ -1685,6 +1927,7 @@ async fn generic_peer_rejects_root_before_parsing_an_unconfigured_request() {
 
 /// Two independent sockets for one shared process fixture.
 pub(crate) struct Loopback {
+    root_connections: Option<original_root_connection::OriginalRootConnections>,
     peer: TaskWirePeer,
     endpoint: RuntimeEndpoint,
     pub(in crate::native) control_endpoint: RuntimeEndpoint,
@@ -1692,6 +1935,11 @@ pub(crate) struct Loopback {
     served: [tokio::task::JoinHandle<()>; 2],
 }
 
+impl Loopback {
+    pub(crate) fn expect_covered_opening_blackhole(&self) {
+        self.peer.expect_subscribe(SubscribeAnswer::StallOpening);
+    }
+}
 impl Loopback {
     async fn serve(
         peer: TaskWirePeer,
@@ -1703,6 +1951,17 @@ impl Loopback {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind the loopback task peer");
+        Self::serve_listener(peer, listener).await
+    }
+
+    async fn serve_listener(
+        peer: TaskWirePeer,
+        listener: tokio::net::TcpListener,
+    ) -> (
+        RuntimeEndpoint,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
         let address = listener.local_addr().expect("loopback address");
         let incoming = futures::stream::unfold(listener, |listener| async {
             let item = listener.accept().await.map(|(stream, _)| stream);
@@ -1738,6 +1997,30 @@ impl Loopback {
         let (control_endpoint, control_shutdown, control_served) = Self::serve(control_peer).await;
         assert_ne!(endpoint, control_endpoint);
         Self {
+            root_connections: None,
+            peer,
+            endpoint,
+            control_endpoint,
+            shutdown: [Some(data_shutdown), Some(control_shutdown)],
+            served: [data_served, control_served],
+        }
+    }
+
+    /// Same first-party codec/service, with physical access to this peer's
+    /// accepted BackendData sockets, where FetchRootResult actually runs.
+    /// BackendControl stays separate; default start() stays unchanged.
+    pub(crate) async fn start_with_original_root_connection_control() -> Self {
+        let peer = TaskWirePeer::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let connections = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (endpoint, data_shutdown, data_served) =
+            original_root_connection::serve(peer.clone(), listener, connections.clone()).await;
+        let mut control_peer = peer.clone();
+        control_peer.domain = NativeEndpointDomain::BackendControl;
+        let (control_endpoint, control_shutdown, control_served) = Self::serve(control_peer).await;
+        assert_ne!(endpoint, control_endpoint);
+        Self {
+            root_connections: Some(connections),
             peer,
             endpoint,
             control_endpoint,
@@ -1752,9 +2035,44 @@ impl Loopback {
         root: TaskIdentity,
         kind: novarocks_result_contract::RootOutputKind,
     ) {
+        self.enable_single_root_result(root, kind, SingleRootResult::EndOnly);
+    }
+
+    /// Configure one original canonical DATA segment followed by End. The
+    /// caller supplies its frozen kind and exact Root output_rows; this peer
+    /// neither constructs a domain artifact nor interprets those bytes.
+    /// Invalid/oversized DATA refuses before mutating the original peer.
+    pub(crate) fn enable_single_root_encoded_result(
+        &self,
+        root: TaskIdentity,
+        kind: novarocks_result_contract::RootOutputKind,
+        canonical_body: bytes::Bytes,
+        output_rows: u64,
+    ) -> Result<(), novarocks_execution_contract::root_result::RootResultError> {
+        let data = novarocks_execution_contract::root_result::RootResultData::try_new(
+            kind,
+            std::num::NonZeroU64::MIN,
+            canonical_body,
+            None,
+        )?;
+        self.enable_single_root_result(
+            root,
+            kind,
+            SingleRootResult::EncodedData { data, output_rows },
+        );
+        Ok(())
+    }
+
+    fn enable_single_root_result(
+        &self,
+        root: TaskIdentity,
+        kind: novarocks_result_contract::RootOutputKind,
+        result: SingleRootResult,
+    ) {
         let mut state = self.peer.state.lock().expect("peer state");
         assert!(
             state.single_root.is_none()
+                && state.participation_only.is_none()
                 && state.applied.is_empty()
                 && state.subscribed.is_empty()
                 && state.apply_answers.is_empty()
@@ -1763,9 +2081,17 @@ impl Loopback {
             "configure the fixed peer before the original runtime starts"
         );
         state.single_root = Some(SingleRootLifecycle {
+            exchange_updates: std::collections::BTreeMap::new(),
+            other_tasks: std::collections::BTreeMap::new(),
+            final_info: std::collections::BTreeMap::new(),
+            root_data_gate: None,
+            root_end_gate: None,
             io_gates: None,
             root,
             kind,
+            result,
+            terminal: Some(SingleRootTerminal::Finished),
+            failing_revision: None,
             participation: None,
             ticket_issued: false,
             revision: 0,
@@ -1775,13 +2101,182 @@ impl Loopback {
             quiesce_revision: None,
             participation_revision: None,
             root_end_offered: false,
+            root_offered_through: 0,
             root_consumed: 0,
             established: false,
             created: false,
             quiesce: None,
             released: false,
             abort_cause: None,
+            close_finished_tasks_on_abort: false,
+            defer_release_until_abort: false,
         });
+    }
+
+    /// Supply only the bounded diagnostic payload. The terminal status comes
+    /// from this SAME peer's actual original Task lifecycle when the RPC runs.
+    /// Configuration refuses before moving a payload for a foreign/started Task.
+    pub(crate) fn enable_original_final_task_info(
+        &self,
+        task: TaskIdentity,
+        operators: Vec<novarocks_execution_contract::OperatorStatistics>,
+        truncated: bool,
+    ) -> Result<(), Status> {
+        if operators.len() > novarocks_execution_contract::status::FINAL_TASK_INFO_MAX_OPERATORS {
+            return Err(Status::resource_exhausted(
+                "original final-info payload exceeds its bound",
+            ));
+        }
+        let mut state = self.peer.state.lock().expect("peer state");
+        if let Some(original) = state.participation_only.as_mut() {
+            return original.declare_final_info(task, operators, truncated);
+        }
+        let script = state.single_root.as_mut().ok_or_else(|| {
+            Status::failed_precondition("declare the original root before its diagnostic payload")
+        })?;
+        if !script.declares_task(task)
+            || script.static_status(task).is_some()
+            || script.final_info.contains_key(&task)
+        {
+            return Err(Status::failed_precondition(
+                "original final-info payload is foreign or already fixed",
+            ));
+        }
+        script.final_info.insert(
+            task,
+            SingleRootFinalInfo {
+                operators,
+                truncated,
+                requested: false,
+            },
+        );
+        Ok(())
+    }
+
+    /// Actual successful codec/RPC reads, without exposing any Source or owner.
+    pub(crate) fn original_final_task_info_reads(&self) -> Vec<TaskIdentity> {
+        let state = self.peer.state.lock().expect("peer state");
+        if let Some(original) = state.participation_only.as_ref() {
+            return original.final_info_reads();
+        }
+        state.single_root.as_ref().map_or_else(Vec::new, |script| {
+            script
+                .final_info
+                .iter()
+                .filter_map(|(task, info)| info.requested.then_some(*task))
+                .collect()
+        })
+    }
+
+    /// Positive Worker Abort closure only at the actual RPC, after every
+    /// original roster member has its positive actual_stopped fact. Freezing
+    /// this option emits no receipt, Release, process fact or FE local exit.
+    pub(crate) fn close_original_stopped_roster_on_abort(&self) -> Result<(), Status> {
+        let mut state = self.peer.state.lock().expect("peer state");
+        let script = state
+            .single_root
+            .as_mut()
+            .ok_or_else(|| Status::failed_precondition("declare original Root first"))?;
+        if script.created || script.close_finished_tasks_on_abort {
+            return Err(Status::failed_precondition(
+                "original Abort closure mode freezes before Create",
+            ));
+        }
+        script.close_finished_tasks_on_abort = true;
+        Ok(())
+    }
+
+    /// Keep the original participation live for the failure-path Abort.
+    /// Ordinary Release observes the native NotReady verdict until Abort.
+    pub(crate) fn defer_single_root_release_until_abort(&self) -> Result<(), Status> {
+        let mut state = self.peer.state.lock().expect("peer state");
+        let script = state
+            .single_root
+            .as_mut()
+            .ok_or_else(|| Status::failed_precondition("declare original Root first"))?;
+        if script.created || script.defer_release_until_abort {
+            return Err(Status::failed_precondition(
+                "original Release fence freezes before Create",
+            ));
+        }
+        script.defer_release_until_abort = true;
+        Ok(())
+    }
+
+    /// Configure before Create. This withholds only terminal publications,
+    /// not any RPC, Root DATA/End, AP turn or subscription's running facts.
+    pub(crate) fn defer_single_root_terminal(&self) -> Result<(), Status> {
+        let mut state = self.peer.state.lock().expect("peer state");
+        let script = state
+            .single_root
+            .as_mut()
+            .ok_or_else(|| Status::failed_precondition("root is not declared"))?;
+        if script.created {
+            return Err(Status::failed_precondition(
+                "defer precedes original Create",
+            ));
+        }
+        script.terminal = None;
+        Ok(())
+    }
+    /// Original typed status frames travel through the same covered RPC stream.
+    /// Failure has the legal Running2 -> Failing3 -> Failed4 prefix.
+    pub(crate) fn publish_single_root_terminal(
+        &self,
+        original: Option<novarocks_execution_contract::TaskFailure>,
+    ) -> Result<(), Status> {
+        let mut state = self.peer.state.lock().expect("peer state");
+        let PeerState {
+            single_root, held, ..
+        } = &mut *state;
+        let script = single_root
+            .as_mut()
+            .ok_or_else(|| Status::failed_precondition("root is not declared"))?;
+        if !script.created
+            || script.terminal.is_some()
+            || script.quiesce.is_some()
+            || script.released
+            || script.abort_cause.is_some()
+        {
+            return Err(Status::failed_precondition(
+                "original deferred terminal is not live",
+            ));
+        }
+        script.terminal = Some(match original {
+            Some(original) => SingleRootTerminal::Failed(Box::new(original)),
+            None => SingleRootTerminal::Finished,
+        });
+        script.assign_terminal_revisions();
+        for frame in script.terminal_frames() {
+            TaskWirePeer::queue_single_root_frame(held, frame)?;
+        }
+        Ok(())
+    }
+
+    /// Hold this SAME first Root RPC before offering any DATA or End. Used
+    /// for real connection-loss observation, independently of Task terminal.
+    pub(crate) fn defer_single_root_first_reply(&self) -> Result<(), Status> {
+        let mut state = self.peer.state.lock().expect("peer state");
+        let script = state.single_root.as_mut().ok_or_else(|| {
+            Status::failed_precondition("declare original Root before its RPC gate")
+        })?;
+        if script.created || script.root_data_gate.is_some() {
+            return Err(Status::failed_precondition(
+                "first Root reply gate precedes Create",
+            ));
+        }
+        script.root_data_gate = Some(Arc::new(SingleRootIoGate::new()));
+        Ok(())
+    }
+    pub(crate) fn single_root_first_reply_waiting(&self) -> bool {
+        self.peer
+            .state
+            .lock()
+            .expect("peer state")
+            .single_root
+            .as_ref()
+            .and_then(|script| script.root_data_gate.as_ref())
+            .is_some_and(|gate| gate.waiting())
     }
 
     /// Two explicit test I/O gates. Configure before the original runtime.
@@ -1831,17 +2326,6 @@ impl Loopback {
         gate.release();
     }
 
-    pub(crate) fn single_root_create_waiting(&self) -> bool {
-        self.peer
-            .state
-            .lock()
-            .expect("peer state")
-            .single_root
-            .as_ref()
-            .and_then(|script| script.io_gates.as_ref())
-            .is_some_and(|gates| gates.create.waiting())
-    }
-
     pub(crate) fn release_single_root_create(&self) {
         let gate = {
             let state = self.peer.state.lock().expect("peer state");
@@ -1857,6 +2341,18 @@ impl Loopback {
         gate.release();
     }
 
+    pub(crate) fn single_root_result_progress(&self) -> (bool, u64) {
+        self.peer
+            .state
+            .lock()
+            .expect("peer state")
+            .single_root
+            .as_ref()
+            .map_or((false, 0), |original| {
+                (original.root_end_offered, original.root_consumed)
+            })
+    }
+
     pub(crate) fn single_root_release_observed(&self) -> bool {
         self.peer
             .state
@@ -1865,6 +2361,16 @@ impl Loopback {
             .single_root
             .as_ref()
             .is_some_and(|script| script.released)
+    }
+
+    pub(crate) fn single_root_abort_observed(&self) -> bool {
+        self.peer
+            .state
+            .lock()
+            .expect("peer state")
+            .single_root
+            .as_ref()
+            .is_some_and(|script| script.abort_cause.is_some())
     }
 
     pub(crate) fn bounded_root_descriptor(
@@ -1897,8 +2403,44 @@ impl Loopback {
         self.peer.close_held_subscriptions();
     }
 
+    /// First-party test-peer scripting only: these are the same original
+    /// covered response channel and captured physical request inventory.
+    pub(crate) fn expect_covered_frames_then_hold(
+        &self,
+        frames: Vec<proto::TaskStatusStreamEvent>,
+    ) {
+        self.peer
+            .expect_subscribe(SubscribeAnswer::EventsThenHold(frames));
+    }
+    pub(crate) fn expect_covered_rejection(&self, code: tonic::Code) {
+        self.peer.expect_subscribe(SubscribeAnswer::Reject(code));
+    }
+
+    pub(crate) fn expect_covered_frames_then_close(
+        &self,
+        frames: Vec<proto::TaskStatusStreamEvent>,
+    ) {
+        self.peer
+            .expect_subscribe(SubscribeAnswer::EventsThenClose(frames));
+    }
+
+    pub(crate) fn open_covered_subscriptions(&self) -> usize {
+        self.peer.open_held_subscriptions()
+    }
+    pub(crate) async fn publish_held_covered_event(&self, event: proto::TaskStatusStreamEvent) {
+        self.peer.send_held_event(event).await;
+    }
+
     pub(crate) fn applied_requests(&self) -> Vec<proto::ApplyTaskOperationsRequest> {
         self.peer.applied()
+    }
+    pub(crate) fn single_root_abort_refusals(&self) -> Vec<(TaskOperationId, tonic::Code)> {
+        self.peer
+            .state
+            .lock()
+            .expect("peer state")
+            .single_root_abort_refusals
+            .clone()
     }
 
     pub(crate) fn expect_transport_unknown(&self) {
@@ -1921,7 +2463,7 @@ impl Loopback {
         )]));
     }
 
-    pub(in crate::native) fn control_requests(&self) -> usize {
+    pub(crate) fn control_requests(&self) -> usize {
         self.peer.control_requests()
     }
 
@@ -1948,6 +2490,36 @@ impl Loopback {
     pub(in crate::native) fn fail_abort_owner(&self) {
         self.peer
             .expect_apply(ApplyAnswer::Outcomes(vec![OperationOutcome::OwnerFailed]));
+    }
+
+    /// Shut down only the accepted TCP socket of the SAME held Root RPC.
+    /// Actual Tonic ConnectedInfo identifies it. Other Control connections and
+    /// this original server remain live; settle() consumes its SAME final Join.
+    pub(crate) fn disconnect_original_root_connection(&self) {
+        let remote = self
+            .peer
+            .state
+            .lock()
+            .expect("peer state")
+            .original_root_socket
+            .expect("the original held Root RPC recorded its actual connection");
+        let live = self
+            .root_connections
+            .as_ref()
+            .expect("controlled original Root peer")
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(std::sync::Weak::upgrade)
+            .filter(|connection| connection.remote == remote)
+            .collect::<Vec<_>>();
+        assert_eq!(live.len(), 1, "one SAME actual accepted Root socket");
+        assert!(
+            live[0]
+                .shutdown_original()
+                .expect("shut down that actual original socket once")
+        );
+        // No typed failure/Ready/exit is emitted. Native independently observes IO.
     }
 
     pub(crate) async fn settle(&mut self) -> bool {
@@ -2007,6 +2579,7 @@ struct SinkFixture {
 
 mod governed_wire;
 mod message_limits;
+mod root_frontier;
 
 fn sink_fixture(loopback: Loopback, backend: BackendProcessId) -> SinkFixture {
     sink_fixture_with_budget(loopback, backend, TransportBudget::DEFAULT)
@@ -2150,7 +2723,6 @@ async fn missing_one_input_capability_rejects_the_original_before_any_rpc() {
     drop((sink, acks));
     governed.drive();
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    let subscriptions = runtime.drain_original_subscriptions_until(deadline).await;
     governed.drive();
     let apply = runtime.drain_original_apply_until(deadline).await;
     governed.drive();
@@ -2158,13 +2730,8 @@ async fn missing_one_input_capability_rejects_the_original_before_any_rpc() {
     let peer_exit = loopback.settle().await;
     drop((runtime, loopback));
     let shutdown = governed.finish();
-    if subscriptions.is_err()
-        || apply.is_err()
-        || outgoing.is_err()
-        || !peer_exit
-        || shutdown.is_err()
-    {
-        std::panic::panic_any((subscriptions, apply, outgoing, peer_exit, shutdown));
+    if apply.is_err() || outgoing.is_err() || !peer_exit || shutdown.is_err() {
+        std::panic::panic_any((apply, outgoing, peer_exit, shutdown));
     }
 }
 
@@ -2203,7 +2770,6 @@ async fn actual_dispatch_freezes_more_inputs_than_the_original_change_body() {
     drop((sink, acks));
     governed.drive();
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    let subscriptions = runtime.drain_original_subscriptions_until(deadline).await;
     governed.drive();
     let apply = runtime.drain_original_apply_until(deadline).await;
     governed.drive();
@@ -2211,13 +2777,8 @@ async fn actual_dispatch_freezes_more_inputs_than_the_original_change_body() {
     let peer_exit = loopback.settle().await;
     drop((runtime, loopback));
     let shutdown = governed.finish();
-    if subscriptions.is_err()
-        || apply.is_err()
-        || outgoing.is_err()
-        || !peer_exit
-        || shutdown.is_err()
-    {
-        std::panic::panic_any((subscriptions, apply, outgoing, peer_exit, shutdown));
+    if apply.is_err() || outgoing.is_err() || !peer_exit || shutdown.is_err() {
+        std::panic::panic_any((apply, outgoing, peer_exit, shutdown));
     }
 }
 
@@ -2425,23 +2986,6 @@ fn submit_batch(fixture: &SinkFixture, mut batch: DispatchBatch) {
         fixture.sink.try_submit(batch),
         TaskOperationSubmit::Accepted
     ));
-}
-
-async fn subscribe_requests(
-    peer: &TaskWirePeer,
-    count: usize,
-) -> Vec<proto::SubscribeTaskStatusRequest> {
-    for _ in 0..600 {
-        let requests = peer.subscribed();
-        if requests.len() >= count {
-            return requests;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    panic!(
-        "the subscriber opened {} of {count} streams",
-        peer.subscribed().len()
-    );
 }
 
 // -----------------------------------------------------------------------
@@ -2869,39 +3413,13 @@ fn task_cancel_leaves_update_backlog_first_and_reaches_control_capacity() {
         Duration::from_secs(1),
     )
     .expect("one ordinary and one control batch fit");
-    let dispatch = DispatchBudget::new(1, 1, 1, 1).expect("nonzero lane permits");
-    let mut dispatcher = OperationDispatcher::new(dispatch, transport);
-    dispatcher
-        .register_task(backend)
-        .expect("one task fits the backend");
-    dispatcher
-        .enqueue(update_intent(1, backend, 1), MonotonicInstant::ORIGIN)
-        .expect("first ordinary update");
-    let released_update = dispatcher
-        .take_batch()
-        .expect("the first update reaches transport");
-    let update_acceptance = released_update.acceptance();
-    dispatcher
-        .accept(update_acceptance)
-        .expect("the first update saturates its only permit");
-    assert_eq!(dispatcher.lane_in_flight(backend, DispatchLane::Update), 1);
-    dispatcher
-        .enqueue(update_intent(1, backend, 2), MonotonicInstant::ORIGIN)
-        .expect("second ordinary update");
-    dispatcher
-        .enqueue(cancel_intent(1, backend), MonotonicInstant::ORIGIN)
-        .expect("task cancellation");
-
-    let cancel = dispatcher
-        .take_batch()
-        .expect("control is selected before the update backlog");
+    // Queue selection and the saturated Update permit are checked against
+    // the actual pure dispatcher in AP's matching named test. This component
+    // checks the same Cancel metadata at the original Native capacity seam.
+    let cancel = released_batch(backend, vec![cancel_intent(1, backend)]);
     assert_eq!(cancel.operations().len(), 1);
     assert_eq!(cancel.operations()[0].kind(), OperationKind::CancelTask);
-    assert_eq!(
-        cancel.lane(),
-        DispatchLane::Control,
-        "task cancellation has an independent dispatch permit"
-    );
+    assert_eq!(cancel.lane(), DispatchLane::Control);
     assert_eq!(supervisor_lane(&cancel), NativeTransportLane::Control);
 
     let supervisor = NativeTransportSupervisor::from_transport(transport)
@@ -2943,12 +3461,6 @@ fn task_cancel_leaves_update_backlog_first_and_reaches_control_capacity() {
     drop(control_queue);
     drop(ordinary_encoding);
     drop(ordinary_queue);
-
-    assert_eq!(dispatcher.lane_queued(backend, DispatchLane::Update), 1);
-    assert!(
-        dispatcher.take_batch().is_none(),
-        "the queued update remains blocked by its saturated permit"
-    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -3260,6 +3772,7 @@ async fn goaway_loopback(
     let (control_endpoint, control_shutdown, control_served) = Loopback::serve(control_peer).await;
     Ok((
         Loopback {
+            root_connections: None,
             peer,
             endpoint,
             control_endpoint,
@@ -3643,71 +4156,6 @@ fn the_transport_status_classification_is_exact() {
 // The status subscription
 // -----------------------------------------------------------------------
 
-struct SubscriberFixture {
-    loopback: Loopback,
-    subscriber: TaskStatusSubscriber,
-    intake: StatusIntake,
-    wake: Arc<CountingWake>,
-    acks: TaskAckIntake,
-}
-
-struct ParticipationAwareSubscriberFixture {
-    loopback: Loopback,
-    subscriber: TaskStatusSubscriber,
-    status_intake: StatusIntake,
-    convergence_intake: ParticipationConvergenceIntake,
-}
-
-fn subscriber_fixture(
-    loopback: Loopback,
-    backend: BackendProcessId,
-    error_budget: u32,
-) -> SubscriberFixture {
-    let data_runtime = FrontendDataRuntime::new(tokio::runtime::Handle::current());
-    let wake = Arc::new(CountingWake::default());
-    let intake = StatusIntake::new(16, Arc::clone(&wake) as Arc<dyn StatusIntakeWake>);
-    let subscriber = TaskStatusSubscriber::new(
-        &[loopback.descriptor(backend)],
-        intake.handle(),
-        error_budget,
-        data_runtime,
-    )
-    .expect("one frozen backend target");
-    SubscriberFixture {
-        loopback,
-        subscriber,
-        intake,
-        wake,
-        acks: TaskAckIntake::new(Arc::new(CountingWake::default())),
-    }
-}
-
-fn participation_aware_subscriber_fixture(
-    loopback: Loopback,
-    backend: BackendProcessId,
-    error_budget: u32,
-    convergence_capacity: NonZeroUsize,
-) -> ParticipationAwareSubscriberFixture {
-    let data_runtime = FrontendDataRuntime::new(tokio::runtime::Handle::current());
-    let wake = Arc::new(CountingWake::default());
-    let status_intake = StatusIntake::new(16, Arc::clone(&wake) as Arc<dyn StatusIntakeWake>);
-    let convergence_intake = ParticipationConvergenceIntake::bounded(convergence_capacity);
-    let subscriber = TaskStatusSubscriber::new_participation_aware(
-        &[loopback.descriptor(backend)],
-        status_intake.handle(),
-        convergence_intake.handle(),
-        error_budget,
-        data_runtime,
-    )
-    .expect("one frozen participation-aware backend target");
-    ParticipationAwareSubscriberFixture {
-        loopback,
-        subscriber,
-        status_intake,
-        convergence_intake,
-    }
-}
-
 fn convergence_receipt(participation: ParticipationRef) -> ParticipationConvergenceReceipt {
     ParticipationConvergenceReceipt::new(
         participation,
@@ -3716,595 +4164,9 @@ fn convergence_receipt(participation: ParticipationRef) -> ParticipationConverge
     )
 }
 
-/// Real covered HTTP/2 observation must survive logical terminal cleanup.
-/// This scripted peer proves FE ownership/cursor behavior; the Worker Work
-/// gate and actual exit author are covered by the native system scenario.
-#[tokio::test]
-async fn covered_terminal_cleanup_keeps_original_stream_until_actual_participation_receipt() {
-    let (mut round, _) = crate::task_execution::tests::manifest_terminal_regression_fixture();
-    let participation = *round.execution().graph().participations().next().unwrap();
-    let mut loopback = Loopback::start().await;
-    let frame = |fact| {
-        encode_covered_status_event(&CoveredStatusStreamEvent {
-            fact,
-            source_revision: None,
-        })
-        .unwrap()
-    };
-    loopback
-        .peer
-        .expect_subscribe(SubscribeAnswer::EventsThenHold(vec![frame(
-            CoveredStatusStreamFact::CatchUpComplete(CoveredCatchUpComplete {
-                generation: 1,
-                initial_cut: 0,
-            }),
-        )]));
-    loopback
-        .peer
-        .expect_subscribe(SubscribeAnswer::EventsThenHold(Vec::new()));
-    let wake = Arc::new(CountingWake::default());
-    let intake = Arc::new(ObservationIntake::new(8, 16, 16 * 4096, 4096, wake).unwrap());
-    let role = CoveredRoleFixture::new();
-    let subscriber = Arc::new(
-        CoveredTaskStatusSubscriber::new(
-            &[loopback.descriptor(participation.backend_process_id())],
-            Arc::clone(&intake),
-            2,
-            role.runtime.clone(),
-            role.scope(),
-        )
-        .unwrap(),
-    );
-    round.install_covered_observation(Arc::clone(&subscriber), Arc::clone(&intake));
-    round.turn().unwrap();
-    subscribe_requests(&loopback.peer, 1).await;
-    round
-        .execution_mut()
-        .observe_actor_abort_participation_closed(participation)
-        .unwrap();
-    round.begin_terminal_cleanup();
-    round.turn().unwrap();
-    assert!(
-        subscriber.state(participation).is_some(),
-        "closing ACK cannot abort residual observation"
-    );
-    assert!(
-        round
-            .execution()
-            .participation_convergence_receipt(participation)
-            .is_none()
-    );
-    loopback.peer.close_held_subscriptions();
-    let requests = subscribe_requests(&loopback.peer, 2).await;
-    let request =
-        decode_covered_subscribe_task_status(&requests[1], FieldPath::root("cleanup_reconnect"))
-            .unwrap();
-    assert_eq!(request.participation, participation);
-    assert!(
-        request.participation_cursor.is_none(),
-        "no unobserved proof is fabricated"
-    );
-    let receipt = convergence_receipt(participation);
-    loopback
-        .peer
-        .send_held_event(frame(CoveredStatusStreamFact::ParticipationConvergence(
-            receipt,
-        )))
-        .await;
-    tokio::time::timeout(Duration::from_secs(3), async {
-        loop {
-            round.turn().unwrap();
-            if round
-                .execution()
-                .participation_convergence_receipt(participation)
-                == Some(receipt)
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("the original cleanup owner applies the late proof");
-    assert_eq!(
-        subscriber.state(participation),
-        None,
-        "only the applied proof retires this stream"
-    );
-    let replay = round
-        .execution()
-        .covered_subscription_request(participation, NonZeroU64::new(3).unwrap())
-        .unwrap();
-    assert_eq!(
-        replay.participation_cursor.unwrap().current_version(),
-        Some(receipt.version())
-    );
-    role.settle().await;
-    assert!(loopback.settle().await);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn covered_stream_preserves_every_frame_and_reconnects_from_applied_cursors() {
-    let backend = BackendProcessId::new_v7();
-    let mut loopback = Loopback::start().await;
-    let participation = participation(backend);
-    let task = identity(1, backend);
-    let frames = vec![
-        CoveredStatusStreamEvent {
-            fact: CoveredStatusStreamFact::Status(status_at(task, TaskStatusVersion::FIRST)),
-            source_revision: Some(1),
-        },
-        CoveredStatusStreamEvent {
-            fact: CoveredStatusStreamFact::TaskConvergence(TaskConvergenceReceipt::actual_stopped(
-                task,
-                TaskConvergenceVersion::FIRST,
-            )),
-            source_revision: Some(2),
-        },
-        CoveredStatusStreamEvent {
-            fact: CoveredStatusStreamFact::ParticipationConvergence(convergence_receipt(
-                participation,
-            )),
-            source_revision: Some(3),
-        },
-        CoveredStatusStreamEvent {
-            fact: CoveredStatusStreamFact::Quiesce(QuiesceParticipationReceipt::new(
-                participation,
-                1,
-                vec![task],
-                ParticipationState::Quiescing,
-            )),
-            source_revision: Some(4),
-        },
-        CoveredStatusStreamEvent {
-            fact: CoveredStatusStreamFact::StatusUnchanged(task),
-            source_revision: None,
-        },
-        CoveredStatusStreamEvent {
-            fact: CoveredStatusStreamFact::TaskConvergenceUnchanged(task),
-            source_revision: None,
-        },
-        CoveredStatusStreamEvent {
-            fact: CoveredStatusStreamFact::Unknown(task),
-            source_revision: None,
-        },
-        CoveredStatusStreamEvent {
-            fact: CoveredStatusStreamFact::Gone(task),
-            source_revision: Some(5),
-        },
-        CoveredStatusStreamEvent {
-            fact: CoveredStatusStreamFact::CatchUpComplete(CoveredCatchUpComplete {
-                generation: 7,
-                initial_cut: 4,
-            }),
-            source_revision: None,
-        },
-        CoveredStatusStreamEvent {
-            fact: CoveredStatusStreamFact::Bookmark(CoveredObservationBookmark {
-                generation: 7,
-                sequence: 1,
-                covered_prefix: 4,
-                source_cut: 5,
-            }),
-            source_revision: None,
-        },
-    ];
-    loopback
-        .peer
-        .expect_subscribe(SubscribeAnswer::EventsThenClose(
-            frames
-                .iter()
-                .map(|frame| encode_covered_status_event(frame).unwrap())
-                .collect(),
-        ));
-    loopback
-        .peer
-        .expect_subscribe(SubscribeAnswer::EventsThenHold(Vec::new()));
-    let wake = Arc::new(CountingWake::default());
-    let intake =
-        Arc::new(ObservationIntake::new(16, 32, 32 * 4096, 4096, wake).expect("bounded intake"));
-    let subscription_role = CoveredRoleFixture::new();
-    let subscriber = CoveredTaskStatusSubscriber::new(
-        &[loopback.descriptor(backend)],
-        Arc::clone(&intake),
-        3,
-        subscription_role.runtime.clone(),
-        subscription_role.scope(),
-    )
-    .expect("covered transport");
-    subscriber
-        .ensure(DecodedCoveredSubscription {
-            participation,
-            generation: NonZeroU64::new(7).unwrap(),
-            status_cursors: vec![TaskStatusCursor::at(task, TaskStatusVersion::FIRST)],
-            task_convergence_cursors: vec![TaskConvergenceCursor::at(
-                task,
-                TaskConvergenceVersion::FIRST,
-            )],
-            participation_cursor: Some(ParticipationConvergenceCursor::unobserved(participation)),
-            quiesce_cursor: Some(QuiesceObservationCursor {
-                participation,
-                fence_version: None,
-            }),
-            required_identities: vec![task],
-        })
-        .expect("covered subscription starts");
-    let requests = subscribe_requests(&loopback.peer, 2).await;
-    let first = decode_covered_subscribe_task_status(
-        &requests[0],
-        FieldPath::root("first_covered_request"),
-    )
-    .unwrap();
-    let second = decode_covered_subscribe_task_status(
-        &requests[1],
-        FieldPath::root("second_covered_request"),
-    )
-    .unwrap();
-    assert_eq!(first.generation.get(), 7);
-    assert_eq!(second.generation.get(), 8);
-    assert_eq!(first.required_identities, vec![task]);
-    assert_eq!(
-        second.status_cursors[0].current_version(),
-        Some(TaskStatusVersion::FIRST)
-    );
-    assert_eq!(
-        second.task_convergence_cursors[0].current_version(),
-        Some(TaskConvergenceVersion::FIRST)
-    );
-    assert_eq!(second.quiesce_cursor.unwrap().fence_version, None);
-
-    let mut runner = intake.try_enter().expect("one serial owner");
-    let observed = runner.drain_ordered(16);
-    assert_eq!(observed.len(), frames.len());
-    for (entry, expected) in observed.into_iter().zip(frames) {
-        assert!(matches!(
-            entry,
-            ObservationIntakeEntry::Frame(frame)
-                if matches!(
-                    frame.as_ref(),
-                    ObservationFrame::Covered {
-                        participation: observed_participation,
-                        generation: 7,
-                        event,
-                    } if *observed_participation == participation && event == &expected
-                )
-        ));
-    }
-    subscriber.stop(participation);
-    subscription_role.settle().await;
-    assert!(loopback.settle().await);
-}
-
-/// Real HTTP/2 transport plus production FE serial owners. The peer is a
-/// scripted covered source, so this does not claim a full BE system gate.
-#[tokio::test(flavor = "multi_thread")]
-async fn covered_loopback_backpressure_recovery_quiesce_settles_actual_root_seal() {
-    use crate::task_execution::round::TaskRound;
-    use novarocks_coordination_contract::MonotonicClock;
-    use novarocks_execution::task_execution::TerminationDetail;
-
-    async fn drive_until(round: &mut TaskRound, ready: impl Fn(&TaskRound) -> bool) {
-        tokio::time::timeout(Duration::from_secs(3), async {
-            loop {
-                round.turn().expect("the production serial owner advances");
-                if ready(round) {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-        })
-        .await
-        .expect("the expected applied fact reaches the serial owner");
-    }
-
-    let (mut round, clock, participation, missing) =
-        crate::task_execution::tests::covered_loopback_recovery_round();
-    let mut loopback = Loopback::start().await;
-    let frame = |fact, revision| {
-        encode_covered_status_event(&CoveredStatusStreamEvent {
-            fact,
-            source_revision: revision,
-        })
-        .unwrap()
-    };
-    loopback
-        .peer
-        .expect_subscribe(SubscribeAnswer::EventsThenHold(vec![
-            frame(
-                CoveredStatusStreamFact::Status(status_at(
-                    missing,
-                    TaskStatusVersion::new(2).unwrap(),
-                )),
-                None,
-            ),
-            frame(
-                CoveredStatusStreamFact::CatchUpComplete(CoveredCatchUpComplete {
-                    generation: 2,
-                    initial_cut: 2,
-                }),
-                None,
-            ),
-            frame(
-                CoveredStatusStreamFact::Bookmark(CoveredObservationBookmark {
-                    generation: 2,
-                    sequence: 1,
-                    covered_prefix: 2,
-                    source_cut: 3,
-                }),
-                None,
-            ),
-        ]));
-    loopback
-        .peer
-        .expect_subscribe(SubscribeAnswer::EventsThenHold(Vec::new()));
-    let wake = Arc::new(CountingWake::default());
-    let intake = Arc::new(
-        ObservationIntake::new_with_clock(
-            1,
-            3,
-            3 * 4096,
-            4096,
-            Arc::clone(&wake) as Arc<dyn StatusIntakeWake>,
-            Arc::clone(&clock) as Arc<dyn MonotonicClock>,
-        )
-        .unwrap(),
-    );
-    let subscription_role = CoveredRoleFixture::new();
-    let subscriber = Arc::new(
-        CoveredTaskStatusSubscriber::new(
-            &[loopback.descriptor(participation.backend_process_id())],
-            Arc::clone(&intake),
-            2,
-            subscription_role.runtime.clone(),
-            subscription_role.scope(),
-        )
-        .unwrap(),
-    );
-    round.install_covered_observation(Arc::clone(&subscriber), Arc::clone(&intake));
-    let source = round.take_root_status_source().unwrap();
-    subscriber
-        .ensure(
-            round
-                .execution()
-                .covered_subscription_request(participation, NonZeroU64::new(2).unwrap())
-                .unwrap(),
-        )
-        .unwrap();
-    subscribe_requests(&loopback.peer, 1).await;
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while wake.count() < 2 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
-    tokio::time::sleep(Duration::from_millis(5_200)).await;
-    clock.advance(Duration::from_millis(5_200));
-    assert_eq!(
-        wake.count(),
-        2,
-        "local pressure must stop the third wire read"
-    );
-    assert_eq!(
-        subscriber.state(participation),
-        Some(SubscriptionState::Live)
-    );
-    assert_eq!(
-        loopback.peer.subscribed().len(),
-        1,
-        "local pressure must not reconnect"
-    );
-    drive_until(&mut round, |_| wake.count() >= 3).await;
-    // The last frame may have been registered just after this turn.
-    drive_until(&mut round, |round| {
-        round
-            .execution()
-            .status_cursors(participation)
-            .iter()
-            .any(|cursor| {
-                cursor.identity() == missing
-                    && cursor.current_version() == Some(TaskStatusVersion::new(2).unwrap())
-            })
-    })
-    .await;
-    round.turn().unwrap();
-    let mut reply = source.begin_success_seal_request().unwrap();
-    round.turn().unwrap();
-    assert!(matches!(
-        reply.try_recv(),
-        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
-    ));
-    assert!(
-        !round.root_success_sealed(),
-        "a missing terminal remains required after a covered prefix"
-    );
-
-    loopback.peer.close_held_subscriptions();
-    let requests = subscribe_requests(&loopback.peer, 2).await;
-    let replay =
-        decode_covered_subscribe_task_status(&requests[1], FieldPath::root("owner_applied_replay"))
-            .unwrap();
-    assert_eq!(replay.generation.get(), 3);
-    assert!(
-        replay
-            .status_cursors
-            .iter()
-            .any(|cursor| cursor.identity() == missing
-                && cursor.current_version() == Some(TaskStatusVersion::new(2).unwrap()))
-    );
-    let accepted = round
-        .execution()
-        .graph()
-        .tasks()
-        .filter(|task| task.participation() == participation)
-        .map(|task| task.identity())
-        .collect::<Vec<_>>();
-    for (version, state) in [(3, TaskState::Canceling), (4, TaskState::Canceled)] {
-        loopback
-            .peer
-            .send_held_event(frame(
-                CoveredStatusStreamFact::Status(
-                    TaskStatus::try_new(
-                        missing,
-                        TaskStatusVersion::new(version).unwrap(),
-                        state,
-                        Some(TerminationDetail::Canceled(
-                            CancelReason::UpstreamNoLongerNeeded,
-                        )),
-                        TaskOutputFacts::new(false),
-                    )
-                    .unwrap(),
-                ),
-                None,
-            ))
-            .await;
-    }
-    loopback
-        .peer
-        .send_held_event(frame(
-            CoveredStatusStreamFact::Quiesce(QuiesceParticipationReceipt::new(
-                participation,
-                1,
-                accepted.clone(),
-                ParticipationState::Quiescing,
-            )),
-            None,
-        ))
-        .await;
-    drive_until(&mut round, |round| {
-        round
-            .execution()
-            .covered_subscription_request(participation, NonZeroU64::new(3).unwrap())
-            .unwrap()
-            .quiesce_cursor
-            .is_some_and(|cursor| cursor.fence_version.is_some())
-    })
-    .await;
-    assert!(
-        !round.covered_observation_ready(),
-        "terminal and Quiesce cannot cover an unfinished initial cut"
-    );
-    assert!(matches!(
-        reply.try_recv(),
-        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
-    ));
-    let applied = round
-        .execution()
-        .covered_subscription_request(participation, NonZeroU64::new(3).unwrap())
-        .unwrap();
-    assert_eq!(
-        applied.quiesce_cursor.unwrap().fence_version.unwrap().get(),
-        1
-    );
-    assert_eq!(
-        round.execution().owner(participation).unwrap().state(),
-        ParticipationState::Quiescing
-    );
-    loopback
-        .peer
-        .send_held_event(frame(
-            CoveredStatusStreamFact::CatchUpComplete(CoveredCatchUpComplete {
-                generation: 3,
-                initial_cut: 5,
-            }),
-            None,
-        ))
-        .await;
-    drive_until(&mut round, |round| round.root_success_sealed()).await;
-    assert_eq!(
-        reply.try_recv().unwrap(),
-        Ok(()),
-        "the actual result-pump seal reply must settle"
-    );
-    assert!(round.covered_observation_ready());
-    subscriber.stop(participation);
-    subscription_role.settle().await;
-    assert!(loopback.settle().await);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn covered_unchanged_requires_a_version_in_the_physical_request() {
-    for convergence in [false, true] {
-        let backend = BackendProcessId::new_v7();
-        let mut loopback = Loopback::start().await;
-        let participation = participation(backend);
-        let task = identity(1, backend);
-        loopback
-            .peer
-            .expect_subscribe(SubscribeAnswer::EventsThenHold(Vec::new()));
-        let intake = Arc::new(
-            ObservationIntake::new(2, 4, 4 * 4096, 4096, Arc::new(CountingWake::default()))
-                .unwrap(),
-        );
-        let subscription_role = CoveredRoleFixture::new();
-        let subscriber = CoveredTaskStatusSubscriber::new(
-            &[loopback.descriptor(backend)],
-            Arc::clone(&intake),
-            2,
-            subscription_role.runtime.clone(),
-            subscription_role.scope(),
-        )
-        .unwrap();
-        let mut request = DecodedCoveredSubscription {
-            participation,
-            generation: NonZeroU64::new(1).unwrap(),
-            status_cursors: vec![TaskStatusCursor::unobserved(task)],
-            task_convergence_cursors: vec![TaskConvergenceCursor::unobserved(task)],
-            participation_cursor: None,
-            quiesce_cursor: None,
-            required_identities: vec![task],
-        };
-        subscriber.ensure(request.clone()).unwrap();
-        subscribe_requests(&loopback.peer, 1).await;
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while loopback.peer.open_held_subscriptions() != 1 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the original physical subscription is open");
-
-        // An unrelated ACK can advance the serial owner's applied cursor
-        // while this physical stream still carries its older request.
-        request.status_cursors = vec![TaskStatusCursor::at(task, TaskStatusVersion::FIRST)];
-        request.task_convergence_cursors = vec![TaskConvergenceCursor::at(
-            task,
-            TaskConvergenceVersion::FIRST,
-        )];
-        subscriber.update_applied_request(request).unwrap();
-        assert_eq!(loopback.peer.subscribed().len(), 1);
-        let fact = if convergence {
-            CoveredStatusStreamFact::TaskConvergenceUnchanged(task)
-        } else {
-            CoveredStatusStreamFact::StatusUnchanged(task)
-        };
-        loopback
-            .peer
-            .send_held_event(
-                encode_covered_status_event(&CoveredStatusStreamEvent {
-                    fact,
-                    source_revision: None,
-                })
-                .unwrap(),
-            )
-            .await;
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while subscriber.state(participation) != Some(SubscriptionState::Rejected) {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("Unchanged cannot borrow a later applied cursor");
-        let mut runner = intake.try_enter().unwrap();
-        assert!(runner.drain_ordered(1).is_empty());
-        subscriber.stop(participation);
-        subscription_role.settle().await;
-        assert!(loopback.settle().await);
-    }
-}
-
 #[test]
 fn covered_unchanged_requires_the_exact_requested_identity() {
+    use super::wire::{CoveredRequestedVersions, validate_covered_event_participation};
     let backend = BackendProcessId::new_v7();
     let participation = participation(backend);
     let requested = identity(1, backend);
@@ -4340,96 +4202,6 @@ fn covered_unchanged_requires_the_exact_requested_identity() {
     }
 }
 
-/// Real H2 validates the foreign frame before the actual serial Task
-/// owner receives it. This is FE transport/owner integration evidence.
-#[tokio::test(flavor = "multi_thread")]
-async fn covered_foreign_status_process_reaches_actual_round_as_identity_violation() {
-    use crate::task_execution::error::{ParticipantObservationFailure, TaskExecutionError};
-    use novarocks_coordination_contract::MonotonicClock;
-
-    let (mut round, clock, participation, task) =
-        crate::task_execution::tests::covered_loopback_recovery_round();
-    let foreign = TaskIdentity::new(
-        task.query_execution_id(),
-        task.stage_id(),
-        task.task_id(),
-        BackendProcessId::new_v7(),
-    );
-    let mut loopback = Loopback::start().await;
-    loopback
-        .peer
-        .expect_subscribe(SubscribeAnswer::EventsThenHold(vec![
-            encode_covered_status_event(&CoveredStatusStreamEvent {
-                fact: CoveredStatusStreamFact::Status(status_at(foreign, TaskStatusVersion::FIRST)),
-                source_revision: None,
-            })
-            .unwrap(),
-        ]));
-    let intake = Arc::new(
-        ObservationIntake::new_with_clock(
-            1,
-            3,
-            3 * 4096,
-            4096,
-            Arc::new(CountingWake::default()),
-            clock as Arc<dyn MonotonicClock>,
-        )
-        .unwrap(),
-    );
-    let subscription_role = CoveredRoleFixture::new();
-    let subscriber = Arc::new(
-        CoveredTaskStatusSubscriber::new(
-            &[loopback.descriptor(participation.backend_process_id())],
-            Arc::clone(&intake),
-            2,
-            subscription_role.runtime.clone(),
-            subscription_role.scope(),
-        )
-        .unwrap(),
-    );
-    round.install_covered_observation(Arc::clone(&subscriber), Arc::clone(&intake));
-    subscriber
-        .ensure(
-            round
-                .execution()
-                .covered_subscription_request(participation, NonZeroU64::new(2).unwrap())
-                .unwrap(),
-        )
-        .unwrap();
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while subscriber.state(participation) != Some(SubscriptionState::ProcessMismatch) {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("the H2 foreign frame fixes an exact identity violation");
-    {
-        let mut runner = intake.try_enter().unwrap();
-        assert!(
-            runner.drain_ordered(1).is_empty(),
-            "foreign status never reaches the reducer"
-        );
-    }
-    intake.acknowledge_applied();
-    let error = round
-        .turn()
-        .expect_err("the actual Task owner must fail closed");
-    assert!(
-        matches!(error, TaskExecutionError::ParticipantUnobservable {
-        backend, state: ParticipantObservationFailure::IdentityViolation("process_mismatch")
-    } if backend == participation.backend_process_id()),
-        "{error:?}"
-    );
-    assert_eq!(
-        loopback.peer.subscribed().len(),
-        1,
-        "identity violations cannot reopen the source as transport recovery"
-    );
-    subscriber.stop(participation);
-    subscription_role.settle().await;
-    assert!(loopback.settle().await);
-}
-
 fn covered_validation_request(
     participation: ParticipationRef,
     task: TaskIdentity,
@@ -4448,145 +4220,11 @@ fn covered_validation_request(
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn actual_covered_rpc_abort_keeps_original_publisher_until_future_destruction_exits() {
-    use std::sync::{
-        Condvar,
-        atomic::{AtomicBool, Ordering},
-    };
-    use std::task::Poll;
-    struct Hold {
-        entered: tokio::sync::Notify,
-        release: Mutex<bool>,
-        changed: Condvar,
-        exited: AtomicBool,
-    }
-    struct HeldCoveredFuture {
-        inner: Pin<Box<dyn Future<Output = ()> + Send>>,
-        hold: Arc<Hold>,
-    }
-    impl Future for HeldCoveredFuture {
-        type Output = ();
-        fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<()> {
-            self.inner.as_mut().poll(cx)
-        }
-    }
-    impl Drop for HeldCoveredFuture {
-        fn drop(&mut self) {
-            self.hold.entered.notify_one();
-            let mut release = self.hold.release.lock().unwrap();
-            while !*release {
-                release = self.hold.changed.wait(release).unwrap();
-            }
-            self.hold.exited.store(true, Ordering::Release);
-            // The original Covered future/body fields drop only after this
-            // genuine destructor hold, on the protected original callback.
-        }
-    }
-    let mut loopback = Loopback::start().await;
-    loopback
-        .peer
-        .expect_subscribe(SubscribeAnswer::EventsThenHold(Vec::new()));
-    let mut role = CoveredRoleFixture::new();
-    let backend = BackendProcessId::new_v7();
-    let request = covered_validation_request(participation(backend), identity(1, backend));
-    let intake = Arc::new(
-        ObservationIntake::new(1, 3, 3 * 4096, 4096, Arc::new(CountingWake::default())).unwrap(),
-    );
-    let others = [intake.subscribe().unwrap(), intake.subscribe().unwrap()];
-    let publisher = Arc::new(intake.subscribe().unwrap());
-    let state = Arc::new(Mutex::new(SubscriptionState::Opening));
-    let applied = Arc::new(Mutex::new(request.clone()));
-    let (reconciliation, receiver) = tokio::sync::watch::channel(request);
-    let hold = Arc::new(Hold {
-        entered: tokio::sync::Notify::new(),
-        release: Mutex::new(false),
-        changed: Condvar::new(),
-        exited: AtomicBool::new(false),
-    });
-    let watchdog_hold = Arc::clone(&hold);
-    let watchdog = std::thread::spawn(move || {
-        let release = watchdog_hold.release.lock().unwrap();
-        let (mut release, _) = watchdog_hold
-            .changed
-            .wait_timeout_while(release, Duration::from_secs(3), |release| !*release)
-            .unwrap();
-        *release = true;
-        watchdog_hold.changed.notify_all();
-    });
-    let reservation = role
-        .runtime
-        .subscription_port()
-        .unwrap()
-        .reserve(
-            &role.scope(),
-            Some(Arc::clone(&publisher)),
-            Some(Arc::clone(&state)),
-        )
-        .unwrap();
-    let client = Client::for_endpoint(
-        loopback.endpoint.native_endpoint().clone(),
-        NativeEndpointDomain::BackendData,
-        backend,
-        role.runtime.clone(),
-    );
-    let lease = reservation
-        .start(HeldCoveredFuture {
-            inner: Box::pin(run_covered_subscription(
-                client,
-                receiver,
-                applied,
-                Arc::clone(&publisher),
-                3,
-                Arc::clone(&state),
-            )),
-            hold: Arc::clone(&hold),
-        })
-        .unwrap();
-    drop(publisher);
-    subscribe_requests(&loopback.peer, 1).await;
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while *state.lock().unwrap() != SubscriptionState::Live {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
-    lease.stop();
-    tokio::time::timeout(Duration::from_secs(2), hold.entered.notified())
-        .await
-        .unwrap();
-    let original_deadline = std::time::Instant::now() + Duration::from_millis(20);
-    let held_drain = role
-        .runtime
-        .drain_original_subscriptions_until(original_deadline)
-        .await;
-    let still_charged = intake.subscribe().is_err();
-    let not_joined = !role.runtime.original_subscriptions_joined();
-    *hold.release.lock().unwrap() = true;
-    hold.changed.notify_all();
-    let actual_drain = role
-        .runtime
-        .drain_original_subscriptions_until(std::time::Instant::now() + Duration::from_secs(2))
-        .await;
-    let publisher_returned = intake.subscribe().is_ok();
-    drop(lease);
-    drop(reconciliation);
-    drop(others);
-    watchdog.join().unwrap();
-    role.settle().await;
-    let peer_joined = loopback.settle().await;
-    assert!(held_drain.is_err() && still_charged && not_joined);
-    assert!(
-        actual_drain.is_ok()
-            && publisher_returned
-            && hold.exited.load(Ordering::Acquire)
-            && peer_joined
-    );
-}
-
 #[test]
 fn covered_identity_violations_retain_their_typed_failure_for_every_carrier() {
+    use super::wire::{
+        CoveredEventValidationError, CoveredRequestedVersions, validate_covered_event_participation,
+    };
     let backend = BackendProcessId::new_v7();
     let exact_participation = participation(backend);
     let exact_task = identity(1, backend);
@@ -4598,9 +4236,13 @@ fn covered_identity_violations_retain_their_typed_failure_for_every_carrier() {
         (
             exact_participation.query_execution_id(),
             BackendProcessId::new_v7(),
-            SubscriptionState::ProcessMismatch,
+            CoveredEventValidationError::ProcessMismatch,
         ),
-        (other_query, backend, SubscriptionState::QueryMismatch),
+        (
+            other_query,
+            backend,
+            CoveredEventValidationError::QueryMismatch,
+        ),
     ] {
         let foreign_task =
             TaskIdentity::new(query, exact_task.stage_id(), exact_task.task_id(), process);
@@ -4640,7 +4282,7 @@ fn covered_identity_violations_retain_their_typed_failure_for_every_carrier() {
             };
             let error = validate_covered_event_participation(&request, &requested_versions, &event)
                 .expect_err("foreign identity must be rejected");
-            assert_eq!(error.subscription_state(), expected, "{event:?}");
+            assert_eq!(error, expected, "{event:?}");
         }
     }
     let foreign_frontend = ParticipationRef::new(
@@ -4666,15 +4308,17 @@ fn covered_identity_violations_retain_their_typed_failure_for_every_carrier() {
                     source_revision: None
                 }
             )
-            .unwrap_err()
-            .subscription_state(),
-            SubscriptionState::QueryMismatch
+            .unwrap_err(),
+            CoveredEventValidationError::QueryMismatch
         );
     }
 }
 
 #[test]
 fn covered_version_and_generation_violations_remain_protocol_rejections() {
+    use super::wire::{
+        CoveredEventValidationError, CoveredRequestedVersions, validate_covered_event_participation,
+    };
     let backend = BackendProcessId::new_v7();
     let request = covered_validation_request(participation(backend), identity(1, backend));
     let versions = CoveredRequestedVersions::from_request(&request);
@@ -4696,11 +4340,11 @@ fn covered_version_and_generation_violations_remain_protocol_rejections() {
             fact,
             source_revision: None,
         };
-        assert_eq!(
-            validate_covered_event_participation(&request, &versions, &event)
-                .unwrap_err()
-                .subscription_state(),
-            SubscriptionState::Rejected,
+        assert!(
+            matches!(
+                validate_covered_event_participation(&request, &versions, &event).unwrap_err(),
+                CoveredEventValidationError::Protocol(_)
+            ),
             "{event:?}"
         );
     }
@@ -4727,1129 +4371,6 @@ fn covered_version_and_generation_violations_remain_protocol_rejections() {
     }
 }
 
-#[test]
-fn covered_connection_evidence_requires_typed_loss_and_resets_only_on_liveness() {
-    let mut evidence = CoveredConnectionEvidence::default();
-    for status in [
-        Status::unavailable("connection refused is only untrusted text"),
-        Status::deadline_exceeded("local read timeout"),
-    ] {
-        let error = CoveredSubscriptionOpenError::Rpc(status);
-        evidence.observe_loss(error.observed_connection_loss());
-        assert_eq!(
-            evidence.exhausted_state(),
-            SubscriptionState::BudgetExhausted
-        );
-    }
-    let opaque_channel = CoveredSubscriptionOpenError::Channel(
-        super::super::transport::ChannelAcquisitionError::retryable_network("connection reset"),
-    );
-    assert!(!opaque_channel.observed_connection_loss());
-    let actual = CoveredSubscriptionOpenError::Rpc(Status::from_error(Box::new(
-        std::io::Error::from(std::io::ErrorKind::ConnectionReset),
-    )));
-    evidence.observe_loss(actual.observed_connection_loss());
-    assert_eq!(
-        evidence.exhausted_state(),
-        SubscriptionState::ConnectionLossExhausted
-    );
-    // A newly opened stream without a real liveness frame cannot clear loss.
-    evidence.observe_loss(false);
-    assert_eq!(
-        evidence.exhausted_state(),
-        SubscriptionState::ConnectionLossExhausted
-    );
-    evidence.observe_liveness();
-    assert_eq!(
-        evidence.exhausted_state(),
-        SubscriptionState::BudgetExhausted
-    );
-    evidence.observe_loss(actual.observed_connection_loss());
-    assert_eq!(
-        evidence.exhausted_state(),
-        SubscriptionState::ConnectionLossExhausted
-    );
-}
-
-async fn covered_terminal_after_original_transport_failure(connection_lost: bool) {
-    let backend = BackendProcessId::new_v7();
-    let mut loopback = Loopback::start().await;
-    let descriptor = loopback.descriptor(backend);
-    if connection_lost {
-        assert!(loopback.settle().await);
-    } else {
-        loopback
-            .peer
-            .expect_subscribe(SubscribeAnswer::Reject(tonic::Code::Unavailable));
-    }
-    let participation = participation(backend);
-    let task = identity(1, backend);
-    let intake = Arc::new(
-        ObservationIntake::new(1, 3, 3 * 4096, 4096, Arc::new(CountingWake::default())).unwrap(),
-    );
-    let role = CoveredRoleFixture::new();
-    let subscriber = CoveredTaskStatusSubscriber::new(
-        &[descriptor],
-        intake,
-        1,
-        role.runtime.clone(),
-        role.scope(),
-    )
-    .unwrap();
-    subscriber
-        .ensure(DecodedCoveredSubscription {
-            participation,
-            generation: NonZeroU64::new(1).unwrap(),
-            status_cursors: vec![TaskStatusCursor::unobserved(task)],
-            task_convergence_cursors: Vec::new(),
-            participation_cursor: None,
-            quiesce_cursor: None,
-            required_identities: vec![task],
-        })
-        .unwrap();
-    let expected = if connection_lost {
-        SubscriptionState::ConnectionLossExhausted
-    } else {
-        SubscriptionState::BudgetExhausted
-    };
-    tokio::time::timeout(Duration::from_secs(8), async {
-        while !subscriber
-            .state(participation)
-            .is_some_and(SubscriptionState::is_fatal)
-        {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("original bounded transport failure must settle");
-    assert_eq!(subscriber.state(participation), Some(expected));
-    subscriber.stop(participation);
-    role.settle().await;
-    if !connection_lost {
-        assert!(loopback.settle().await);
-    }
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn covered_original_closed_endpoint_retains_typed_connection_loss() {
-    covered_terminal_after_original_transport_failure(true).await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn covered_plain_remote_unavailable_is_not_original_connection_loss() {
-    covered_terminal_after_original_transport_failure(false).await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn covered_subscription_blackhole_opening_exhausts_its_bounded_budget() {
-    let backend = BackendProcessId::new_v7();
-    let mut loopback = Loopback::start().await;
-    let participation = participation(backend);
-    let task = identity(1, backend);
-    loopback
-        .peer
-        .expect_subscribe(SubscribeAnswer::StallOpening);
-    let intake = Arc::new(
-        ObservationIntake::new(1, 3, 3 * 4096, 4096, Arc::new(CountingWake::default())).unwrap(),
-    );
-    let subscription_role = CoveredRoleFixture::new();
-    let subscriber = CoveredTaskStatusSubscriber::new(
-        &[loopback.descriptor(backend)],
-        intake,
-        1,
-        subscription_role.runtime.clone(),
-        subscription_role.scope(),
-    )
-    .unwrap();
-    subscriber
-        .ensure(DecodedCoveredSubscription {
-            participation,
-            generation: NonZeroU64::new(1).unwrap(),
-            status_cursors: vec![TaskStatusCursor::unobserved(task)],
-            task_convergence_cursors: Vec::new(),
-            participation_cursor: None,
-            quiesce_cursor: None,
-            required_identities: vec![task],
-        })
-        .unwrap();
-    subscribe_requests(&loopback.peer, 1).await;
-    tokio::time::timeout(Duration::from_secs(8), async {
-        while subscriber.state(participation) != Some(SubscriptionState::BudgetExhausted) {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("an opening blackhole cannot retain its transport indefinitely");
-    assert_eq!(loopback.peer.subscribed().len(), 1);
-    subscriber.stop(participation);
-    subscription_role.settle().await;
-    assert!(loopback.settle().await);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn covered_stream_stops_reading_while_its_one_pending_frame_waits() {
-    let backend = BackendProcessId::new_v7();
-    let mut loopback = Loopback::start().await;
-    let participation = participation(backend);
-    let task = identity(1, backend);
-    let frames = (1..=3)
-        .map(|version| {
-            encode_covered_status_event(&CoveredStatusStreamEvent {
-                fact: CoveredStatusStreamFact::Status(status_at(
-                    task,
-                    TaskStatusVersion::new(version).unwrap(),
-                )),
-                source_revision: Some(version),
-            })
-            .unwrap()
-        })
-        .collect();
-    loopback
-        .peer
-        .expect_subscribe(SubscribeAnswer::EventsThenHold(frames));
-    let wake = Arc::new(CountingWake::default());
-    let intake = Arc::new(
-        ObservationIntake::new(
-            1,
-            3,
-            3 * 4096,
-            4096,
-            Arc::clone(&wake) as Arc<dyn StatusIntakeWake>,
-        )
-        .expect("one queue frame and one pending frame"),
-    );
-    let subscription_role = CoveredRoleFixture::new();
-    let subscriber = CoveredTaskStatusSubscriber::new(
-        &[loopback.descriptor(backend)],
-        Arc::clone(&intake),
-        2,
-        subscription_role.runtime.clone(),
-        subscription_role.scope(),
-    )
-    .unwrap();
-    subscriber
-        .ensure(DecodedCoveredSubscription {
-            participation,
-            generation: NonZeroU64::new(1).unwrap(),
-            status_cursors: vec![TaskStatusCursor::unobserved(task)],
-            task_convergence_cursors: Vec::new(),
-            participation_cursor: None,
-            quiesce_cursor: None,
-            required_identities: vec![task],
-        })
-        .unwrap();
-    subscribe_requests(&loopback.peer, 1).await;
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while wake.count() < 2 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("the queue and pending slot fill");
-    assert_eq!(wake.count(), 2);
-    // Local application backpressure outlasts the wire idle budget. It
-    // must not consume transport failures or create a replacement stream.
-    tokio::time::sleep(Duration::from_millis(5_200)).await;
-    assert_eq!(
-        wake.count(),
-        2,
-        "paused local reads must retain both frames"
-    );
-    assert_eq!(
-        subscriber.state(participation),
-        Some(SubscriptionState::Live)
-    );
-    assert_eq!(
-        loopback.peer.subscribed().len(),
-        1,
-        "local pressure caused a reconnect"
-    );
-    {
-        let mut runner = intake.try_enter().unwrap();
-        assert_eq!(runner.drain_ordered(1).len(), 1);
-        intake.acknowledge_applied();
-    }
-    assert_eq!(wake.count(), 2, "the pending slot still stops this stream");
-    {
-        let mut runner = intake.try_enter().unwrap();
-        assert_eq!(runner.drain_ordered(1).len(), 1);
-        intake.acknowledge_applied();
-    }
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while wake.count() < 3 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("draining the pending slot resumes the stream");
-    let mut runner = intake.try_enter().unwrap();
-    assert_eq!(runner.drain_ordered(1).len(), 1);
-    intake.acknowledge_applied();
-    assert_eq!(
-        subscriber.state(participation),
-        Some(SubscriptionState::Live)
-    );
-    subscriber.stop(participation);
-    subscription_role.settle().await;
-    assert!(loopback.settle().await);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn covered_reconciliation_releases_an_unread_stream_permit() {
-    let backend = BackendProcessId::new_v7();
-    let mut loopback = Loopback::start().await;
-    let participation = participation(backend);
-    let task = identity(1, backend);
-    let first = encode_covered_status_event(&CoveredStatusStreamEvent {
-        fact: CoveredStatusStreamFact::Status(status_at(task, TaskStatusVersion::FIRST)),
-        source_revision: Some(1),
-    })
-    .unwrap();
-    let second = encode_covered_status_event(&CoveredStatusStreamEvent {
-        fact: CoveredStatusStreamFact::Bookmark(CoveredObservationBookmark {
-            generation: 2,
-            sequence: 1,
-            covered_prefix: 0,
-            source_cut: 1,
-        }),
-        source_revision: None,
-    })
-    .unwrap();
-    loopback
-        .peer
-        .expect_subscribe(SubscribeAnswer::EventsThenHold(vec![first]));
-    loopback
-        .peer
-        .expect_subscribe(SubscribeAnswer::EventsThenHold(vec![second]));
-    let wake = Arc::new(CountingWake::default());
-    let intake = Arc::new(
-        ObservationIntake::new(
-            1,
-            3,
-            3 * 4096,
-            4096,
-            Arc::clone(&wake) as Arc<dyn StatusIntakeWake>,
-        )
-        .unwrap(),
-    );
-    let subscription_role = CoveredRoleFixture::new();
-    let subscriber = CoveredTaskStatusSubscriber::new(
-        &[loopback.descriptor(backend)],
-        Arc::clone(&intake),
-        2,
-        subscription_role.runtime.clone(),
-        subscription_role.scope(),
-    )
-    .unwrap();
-    let request = DecodedCoveredSubscription {
-        participation,
-        generation: NonZeroU64::new(1).unwrap(),
-        status_cursors: vec![TaskStatusCursor::unobserved(task)],
-        task_convergence_cursors: Vec::new(),
-        participation_cursor: None,
-        quiesce_cursor: None,
-        required_identities: vec![task],
-    };
-    subscriber.ensure(request.clone()).unwrap();
-    subscribe_requests(&loopback.peer, 1).await;
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while wake.count() < 1 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("the first generation delivered its status");
-    for _ in 0..16 {
-        tokio::task::yield_now().await;
-    }
-    subscriber.reconcile(request).unwrap();
-    let requests = subscribe_requests(&loopback.peer, 2).await;
-    let replay = decode_covered_subscribe_task_status(
-        &requests[1],
-        FieldPath::root("reconciled_covered_request"),
-    )
-    .unwrap();
-    assert_eq!(replay.generation.get(), 2);
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while wake.count() < 2 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("the next stream can reserve after the old read was canceled");
-    let mut runner = intake.try_enter().unwrap();
-    assert_eq!(runner.drain_ordered(2).len(), 2);
-    subscriber.stop(participation);
-    subscription_role.settle().await;
-    assert!(loopback.settle().await);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn covered_automatic_reconnect_uses_the_latest_applied_cursor_without_restarting_early() {
-    let backend = BackendProcessId::new_v7();
-    let mut loopback = Loopback::start().await;
-    let participation = participation(backend);
-    let task = identity(1, backend);
-    loopback
-        .peer
-        .expect_subscribe(SubscribeAnswer::EventsThenHold(vec![
-            encode_covered_status_event(&CoveredStatusStreamEvent {
-                fact: CoveredStatusStreamFact::Status(status_at(task, TaskStatusVersion::FIRST)),
-                source_revision: Some(1),
-            })
-            .unwrap(),
-        ]));
-    loopback
-        .peer
-        .expect_subscribe(SubscribeAnswer::EventsThenHold(Vec::new()));
-    let wake = Arc::new(CountingWake::default());
-    let intake = Arc::new(
-        ObservationIntake::new(
-            2,
-            4,
-            4 * 4096,
-            4096,
-            Arc::clone(&wake) as Arc<dyn StatusIntakeWake>,
-        )
-        .unwrap(),
-    );
-    let subscription_role = CoveredRoleFixture::new();
-    let subscriber = CoveredTaskStatusSubscriber::new(
-        &[loopback.descriptor(backend)],
-        Arc::clone(&intake),
-        3,
-        subscription_role.runtime.clone(),
-        subscription_role.scope(),
-    )
-    .unwrap();
-    let mut request = DecodedCoveredSubscription {
-        participation,
-        generation: NonZeroU64::new(1).unwrap(),
-        status_cursors: vec![TaskStatusCursor::unobserved(task)],
-        task_convergence_cursors: Vec::new(),
-        participation_cursor: None,
-        quiesce_cursor: None,
-        required_identities: vec![task],
-    };
-    subscriber.ensure(request.clone()).unwrap();
-    subscribe_requests(&loopback.peer, 1).await;
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while wake.count() < 1 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
-    let mut runner = intake.try_enter().unwrap();
-    assert_eq!(runner.drain_ordered(1).len(), 1);
-    drop(runner);
-    request.status_cursors = vec![TaskStatusCursor::at(task, TaskStatusVersion::FIRST)];
-    subscriber.update_applied_request(request).unwrap();
-    assert_eq!(loopback.peer.subscribed().len(), 1);
-
-    loopback.peer.close_held_subscriptions();
-    let requests = subscribe_requests(&loopback.peer, 2).await;
-    let replay = decode_covered_subscribe_task_status(
-        &requests[1],
-        FieldPath::root("latest_applied_reconnect"),
-    )
-    .unwrap();
-    assert_eq!(replay.generation.get(), 2);
-    assert_eq!(
-        replay.status_cursors[0].current_version(),
-        Some(TaskStatusVersion::FIRST)
-    );
-    subscriber.stop(participation);
-    subscription_role.settle().await;
-    assert!(loopback.settle().await);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_participation_aware_stream_retains_convergence_and_reconnects_from_its_cursor() {
-    let backend = BackendProcessId::new_v7();
-    let mut fixture = participation_aware_subscriber_fixture(
-        Loopback::start().await,
-        backend,
-        2,
-        NonZeroUsize::MIN,
-    );
-    let subscribed_participation = participation(backend);
-    let receipt = convergence_receipt(subscribed_participation);
-    fixture
-        .loopback
-        .peer
-        .expect_subscribe(SubscribeAnswer::EventsThenClose(vec![
-            encode_participation_convergence_event(receipt),
-        ]));
-    fixture
-        .loopback
-        .peer
-        .expect_subscribe(SubscribeAnswer::EventsThenHold(Vec::new()));
-
-    fixture
-        .subscriber
-        .ensure(subscribed_participation, Vec::new())
-        .expect("the convergence-aware subscription starts");
-    let requests = subscribe_requests(&fixture.loopback.peer, 2).await;
-
-    let (first_participation, first_tasks, first_participation_cursor) =
-        decode_participation_aware_subscribe_task_status(
-            &requests[0],
-            FieldPath::root("first_context_aware_subscription"),
-        )
-        .expect("a legal participation-aware subscription");
-    assert_eq!(first_participation, subscribed_participation);
-    assert!(first_tasks.is_empty());
-    let first_participation_cursor =
-        first_participation_cursor.expect("convergence is always requested");
-    assert_eq!(
-        first_participation_cursor.participation(),
-        subscribed_participation
-    );
-    assert_eq!(first_participation_cursor.current_version(), None);
-
-    let (_, _, replayed_participation_cursor) = decode_participation_aware_subscribe_task_status(
-        &requests[1],
-        FieldPath::root("replayed_context_aware_subscription"),
-    )
-    .expect("a legal replay");
-    assert_eq!(
-        replayed_participation_cursor.and_then(|cursor| cursor.current_version()),
-        Some(ParticipationConvergenceVersion::FIRST),
-        "the stream advances its participation cursor only after the inbox retained the receipt"
-    );
-    assert_eq!(fixture.convergence_intake.pending(), 1);
-    assert_eq!(
-        fixture
-            .convergence_intake
-            .peek_retained()
-            .expect("the complete convergence receipt is retained")
-            .receipt(),
-        receipt
-    );
-    assert_eq!(
-        fixture.status_intake.queued(),
-        0,
-        "participation convergence never enters the task status route"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn task_reconciliation_reopens_one_stream_and_preserves_the_participation_cursor() {
-    let backend = BackendProcessId::new_v7();
-    let fixture = participation_aware_subscriber_fixture(
-        Loopback::start().await,
-        backend,
-        2,
-        NonZeroUsize::MIN,
-    );
-    let subscribed_participation = participation(backend);
-    let task = identity(1, backend);
-    fixture
-        .loopback
-        .peer
-        .expect_subscribe(SubscribeAnswer::EventsThenHold(vec![
-            encode_participation_convergence_event(convergence_receipt(subscribed_participation)),
-        ]));
-    fixture
-        .subscriber
-        .ensure(
-            subscribed_participation,
-            vec![TaskStatusCursor::unobserved(task)],
-        )
-        .expect("the first subscription starts");
-    for _ in 0..600 {
-        if fixture.convergence_intake.pending() == 1 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    assert_eq!(fixture.convergence_intake.pending(), 1);
-
-    fixture
-        .loopback
-        .peer
-        .expect_subscribe(SubscribeAnswer::EventsThenHold(Vec::new()));
-    fixture
-        .subscriber
-        .resubscribe(
-            subscribed_participation,
-            vec![TaskStatusCursor::at(task, TaskStatusVersion::FIRST)],
-        )
-        .expect("TaskRound reconciles its authoritative task cursor");
-    let requests = subscribe_requests(&fixture.loopback.peer, 2).await;
-    for _ in 0..600 {
-        if fixture.loopback.peer.open_held_subscriptions() == 1 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    assert_eq!(
-        fixture.loopback.peer.open_held_subscriptions(),
-        1,
-        "reconciliation closes the old stream before the same loop opens its replacement"
-    );
-    let (_, task_cursors, participation_cursor) = decode_participation_aware_subscribe_task_status(
-        &requests[1],
-        FieldPath::root("reconciled_context_aware_subscription"),
-    )
-    .expect("a legal reconciled subscription");
-    assert_eq!(
-        task_cursors[0].current_version(),
-        Some(TaskStatusVersion::FIRST)
-    );
-    assert_eq!(
-        participation_cursor.and_then(|cursor| cursor.current_version()),
-        Some(ParticipationConvergenceVersion::FIRST),
-        "task reconciliation cannot reset the independently retained convergence cursor"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn convergence_overflow_waits_for_capacity_without_spending_the_network_budget() {
-    let backend = BackendProcessId::new_v7();
-    let mut fixture = participation_aware_subscriber_fixture(
-        Loopback::start().await,
-        backend,
-        1,
-        NonZeroUsize::MIN,
-    );
-    let first = participation(backend);
-    let second = participation(backend);
-    fixture
-        .loopback
-        .peer
-        .expect_subscribe(SubscribeAnswer::EventsThenHold(vec![
-            encode_participation_convergence_event(convergence_receipt(first)),
-        ]));
-    fixture
-        .subscriber
-        .ensure(first, Vec::new())
-        .expect("the first subscription starts");
-    for _ in 0..600 {
-        if fixture.convergence_intake.pending() == 1 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    assert_eq!(fixture.convergence_intake.pending(), 1);
-
-    fixture
-        .loopback
-        .peer
-        .expect_subscribe(SubscribeAnswer::EventsThenHold(vec![
-            encode_participation_convergence_event(convergence_receipt(second)),
-        ]));
-    fixture
-        .subscriber
-        .ensure(second, Vec::new())
-        .expect("the second subscription starts");
-    let _ = subscribe_requests(&fixture.loopback.peer, 2).await;
-    tokio::time::sleep(RESUBSCRIBE_BACKOFF_STEP * 2).await;
-    assert_eq!(
-        fixture.loopback.peer.subscribed().len(),
-        2,
-        "local convergence backpressure does not reconnect or consume network budget"
-    );
-    assert_ne!(
-        fixture.subscriber.state(second),
-        Some(SubscriptionState::BudgetExhausted)
-    );
-
-    let first_lease = fixture
-        .convergence_intake
-        .peek_retained()
-        .expect("the first participation occupies the only slot");
-    assert_eq!(first_lease.receipt(), convergence_receipt(first));
-    assert_eq!(
-        first_lease.ack(),
-        crate::task_execution::participation_convergence::ParticipationConvergenceRetainedAck::Released
-    );
-    for _ in 0..600 {
-        let Some(lease) = fixture.convergence_intake.peek_retained() else {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-            continue;
-        };
-        assert_eq!(
-            lease.receipt(),
-            convergence_receipt(second),
-            "the blocked transport retries the same complete receipt after the epoch changes"
-        );
-        return;
-    }
-    panic!("the second convergence receipt was not retried after capacity became available");
-}
-
-#[tokio::test]
-async fn convergence_protocol_errors_leave_the_cursor_unchanged() {
-    let backend = BackendProcessId::new_v7();
-    let exact = participation(backend);
-    let stranger = participation(backend);
-    let owner = ParticipationConvergenceIntake::bounded(NonZeroUsize::MIN);
-    let handle = owner.handle();
-    let second_version = ParticipationConvergenceVersion::FIRST
-        .next()
-        .expect("version two");
-    let mut cursor = Some(ParticipationConvergenceCursor::at(exact, second_version));
-    assert_eq!(
-        observe_participation_convergence(
-            exact,
-            convergence_receipt(exact),
-            Some(&handle),
-            &mut cursor,
-        )
-        .await,
-        Err(SubscriptionState::Rejected)
-    );
-    assert_eq!(
-        cursor.and_then(|cursor| cursor.current_version()),
-        Some(second_version),
-        "an older receipt cannot move the subscriber cursor backwards"
-    );
-    assert_eq!(owner.pending(), 0);
-
-    let mut cursor = Some(ParticipationConvergenceCursor::unobserved(exact));
-    assert_eq!(
-        observe_participation_convergence(
-            exact,
-            convergence_receipt(stranger),
-            Some(&handle),
-            &mut cursor,
-        )
-        .await,
-        Err(SubscriptionState::Rejected)
-    );
-    assert_eq!(cursor.and_then(|cursor| cursor.current_version()), None);
-    assert_eq!(owner.pending(), 0);
-
-    let closed_owner = ParticipationConvergenceIntake::bounded(NonZeroUsize::MIN);
-    let closed = closed_owner.handle();
-    drop(closed_owner);
-    assert_eq!(
-        observe_participation_convergence(
-            exact,
-            convergence_receipt(exact),
-            Some(&closed),
-            &mut cursor,
-        )
-        .await,
-        Err(SubscriptionState::Rejected)
-    );
-    assert_eq!(cursor.and_then(|cursor| cursor.current_version()), None);
-}
-
-#[tokio::test]
-async fn task_status_replay_cannot_move_the_transport_cursor_backwards() {
-    let backend = BackendProcessId::new_v7();
-    let subscribed_participation = participation(backend);
-    let task = identity(1, backend);
-    let second_version = TaskStatusVersion::FIRST.next().expect("version two");
-    let intake = StatusIntake::new(2, Arc::new(CountingWake::default()));
-    let mut cursors = BTreeMap::from([(task, TaskStatusCursor::at(task, second_version))]);
-
-    assert_eq!(
-        observe_stream_event(
-            subscribed_participation,
-            &encode_status_event(&status_at(task, TaskStatusVersion::FIRST)),
-            &mut cursors,
-            &intake.handle(),
-            None,
-            &mut None,
-        )
-        .await,
-        Err(SubscriptionState::Rejected)
-    );
-    assert_eq!(
-        cursors
-            .get(&task)
-            .and_then(|cursor| cursor.current_version()),
-        Some(second_version)
-    );
-    assert_eq!(intake.queued(), 0);
-
-    assert_eq!(
-        observe_stream_event(
-            subscribed_participation,
-            &encode_status_event(&status_at(task, second_version)),
-            &mut cursors,
-            &intake.handle(),
-            None,
-            &mut None,
-        )
-        .await,
-        Ok(StreamObservation::Delivered)
-    );
-    assert_eq!(
-        cursors
-            .get(&task)
-            .and_then(|cursor| cursor.current_version()),
-        Some(second_version)
-    );
-    assert_eq!(
-        intake.queued(),
-        0,
-        "an exact replay is idempotent and does not consume bounded intake capacity"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_dropped_status_stream_resubscribes_from_its_cursors() {
-    let backend = BackendProcessId::new_v7();
-    let fixture = subscriber_fixture(Loopback::start().await, backend, 4);
-    let subscribed_participation = participation(backend);
-    let task = identity(1, backend);
-    let status = TaskStatus::created(task);
-    fixture
-        .loopback
-        .peer
-        .expect_subscribe(SubscribeAnswer::EventsThenClose(vec![encode_status_event(
-            &status,
-        )]));
-    fixture
-        .loopback
-        .peer
-        .expect_subscribe(SubscribeAnswer::EventsThenHold(Vec::new()));
-
-    fixture
-        .subscriber
-        .ensure(
-            subscribed_participation,
-            vec![TaskStatusCursor::unobserved(task)],
-        )
-        .expect("the subscription starts");
-    let requests = subscribe_requests(&fixture.loopback.peer, 2).await;
-
-    let (_, first) =
-        decode_subscribe_task_status(&requests[0], FieldPath::root("first_subscription"))
-            .expect("a legal subscription");
-    assert_eq!(first[0].current_version(), None, "nothing observed yet");
-    let (_, replayed) =
-        decode_subscribe_task_status(&requests[1], FieldPath::root("second_subscription"))
-            .expect("a legal subscription");
-    assert_eq!(replayed.len(), 1);
-    assert_eq!(replayed[0].identity(), task);
-    assert_eq!(
-        replayed[0].current_version(),
-        Some(TaskStatusVersion::FIRST),
-        "the replay resumes from the version this stream observed"
-    );
-
-    assert_eq!(fixture.intake.queued(), 1, "the snapshot was enqueued once");
-    let mut runner = fixture.intake.try_enter().expect("the runner slot is free");
-    let (observation_loss, statuses) = runner.drain_statuses(8);
-    assert!(
-        observation_loss,
-        "a lost stream is reported as observation loss"
-    );
-    assert_eq!(
-        statuses,
-        vec![StatusEvent::Published(Box::new(status))],
-        "the receive path enqueues the snapshot and nothing else"
-    );
-    drop(runner);
-    assert_eq!(
-        fixture.acks.queued(),
-        0,
-        "a lost stream never settles an operation, aborts a task, or touches a lease"
-    );
-    assert!(
-        !fixture
-            .subscriber
-            .state(subscribed_participation)
-            .expect("the subscription is tracked")
-            .is_fatal(),
-        "a lost observation channel is not fatal to the attempt"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn the_status_receive_path_only_enqueues_and_wakes() {
-    let backend = BackendProcessId::new_v7();
-    let fixture = subscriber_fixture(Loopback::start().await, backend, 2);
-    let subscribed_participation = participation(backend);
-    let first = identity(1, backend);
-    let second = identity(2, backend);
-    fixture
-        .loopback
-        .peer
-        .expect_subscribe(SubscribeAnswer::EventsThenHold(vec![
-            encode_status_event(&TaskStatus::created(first)),
-            encode_status_event(&TaskStatus::created(second)),
-        ]));
-
-    fixture
-        .subscriber
-        .ensure(subscribed_participation, Vec::new())
-        .expect("the subscription starts");
-    for _ in 0..600 {
-        if fixture.intake.queued() >= 2 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-
-    assert_eq!(fixture.intake.queued(), 2);
-    assert!(
-        fixture.wake.count() >= 2,
-        "every publish wakes the serial runner"
-    );
-    assert_eq!(fixture.acks.queued(), 0);
-    let mut runner = fixture.intake.try_enter().expect("the runner slot is free");
-    let (observation_loss, statuses) = runner.drain_statuses(8);
-    assert!(!observation_loss, "a live stream reports no loss");
-    assert_eq!(
-        statuses,
-        vec![
-            StatusEvent::Published(Box::new(TaskStatus::created(first))),
-            StatusEvent::Published(Box::new(TaskStatus::created(second))),
-        ]
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_status_event_from_another_process_is_fatal() {
-    let backend = BackendProcessId::new_v7();
-    let replacement = BackendProcessId::new_v7();
-    let fixture = subscriber_fixture(Loopback::start().await, backend, 2);
-    let subscribed_participation = participation(backend);
-    fixture
-        .loopback
-        .peer
-        .expect_subscribe(SubscribeAnswer::EventsThenHold(vec![encode_status_event(
-            &TaskStatus::created(identity(1, replacement)),
-        )]));
-
-    fixture
-        .subscriber
-        .ensure(subscribed_participation, Vec::new())
-        .expect("the subscription starts");
-    let mut observed = None;
-    for _ in 0..600 {
-        let state = fixture.subscriber.state(subscribed_participation);
-        if state == Some(SubscriptionState::ProcessMismatch) {
-            observed = state;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-
-    assert_eq!(observed, Some(SubscriptionState::ProcessMismatch));
-    assert!(observed.expect("a settled state").is_fatal());
-    let mut runner = fixture.intake.try_enter().expect("the runner is available");
-    let (observation_incomplete, statuses) = runner.drain_statuses(8);
-    assert!(
-        observation_incomplete,
-        "a fatal status identity mismatch fences a pending success seal"
-    );
-    assert!(
-        statuses.is_empty(),
-        "an event from a replaced process is never published"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_status_event_from_another_query_execution_is_fatal() {
-    let backend = BackendProcessId::new_v7();
-    let fixture = subscriber_fixture(Loopback::start().await, backend, 2);
-    let subscribed_participation = participation(backend);
-    let foreign_execution = QueryExecutionId::new(
-        execution_id().query_id(),
-        AttemptId::new(2).expect("attempt two is nonzero"),
-    )
-    .expect("a nonzero query id");
-    let foreign_task = TaskIdentity::new(
-        foreign_execution,
-        StageId::new(1).expect("a nonzero stage id"),
-        TaskId::new(1).expect("a nonzero task id"),
-        backend,
-    );
-    fixture
-        .loopback
-        .peer
-        .expect_subscribe(SubscribeAnswer::EventsThenHold(vec![encode_status_event(
-            &TaskStatus::created(foreign_task),
-        )]));
-
-    fixture
-        .subscriber
-        .ensure(subscribed_participation, Vec::new())
-        .expect("the subscription starts");
-    let mut observed = None;
-    for _ in 0..600 {
-        let state = fixture.subscriber.state(subscribed_participation);
-        if state == Some(SubscriptionState::QueryMismatch) {
-            observed = state;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-
-    assert_eq!(observed, Some(SubscriptionState::QueryMismatch));
-    assert!(observed.expect("a settled state").is_fatal());
-    assert_eq!(
-        fixture.intake.queued(),
-        0,
-        "an event from another query execution is never published"
-    );
-}
-
-#[test]
-fn intake_overflow_preserves_the_last_enqueued_status_cursor() {
-    let backend = BackendProcessId::new_v7();
-    let subscribed_participation = participation(backend);
-    let task = identity(1, backend);
-    let first = TaskStatus::created(task);
-    let second_version = TaskStatusVersion::FIRST.next().expect("version two");
-    let second = status_at(task, second_version);
-    let intake = StatusIntake::new(1, Arc::new(CountingWake::default()));
-    let handle = intake.handle();
-    let mut cursors = BTreeMap::from([(task, TaskStatusCursor::unobserved(task))]);
-
-    assert_eq!(
-        observe_event(
-            subscribed_participation,
-            &encode_status_event(&first),
-            &mut cursors,
-            &handle,
-        ),
-        Ok(())
-    );
-    assert_eq!(
-        cursors
-            .get(&task)
-            .and_then(|cursor| cursor.current_version()),
-        Some(TaskStatusVersion::FIRST)
-    );
-    assert_eq!(
-        observe_event(
-            subscribed_participation,
-            &encode_status_event(&second),
-            &mut cursors,
-            &handle,
-        ),
-        Err(SubscriptionState::Resubscribing)
-    );
-    assert_eq!(
-        cursors
-            .get(&task)
-            .and_then(|cursor| cursor.current_version()),
-        Some(TaskStatusVersion::FIRST),
-        "a status the bounded intake did not retain cannot advance the stream cursor"
-    );
-    let mut runner = intake.try_enter().expect("the runner slot is free");
-    let (observation_loss, statuses) = runner.drain_statuses(2);
-    assert!(observation_loss);
-    assert_eq!(statuses, vec![StatusEvent::Published(Box::new(first))]);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn intake_overflow_waits_for_task_round_resubscription_without_spending_error_budget() {
-    let backend = BackendProcessId::new_v7();
-    let loopback = Loopback::start().await;
-    let data_runtime = FrontendDataRuntime::new(tokio::runtime::Handle::current());
-    let intake = StatusIntake::new(1, Arc::new(CountingWake::default()));
-    let subscriber = TaskStatusSubscriber::new(
-        &[loopback.descriptor(backend)],
-        intake.handle(),
-        1,
-        data_runtime,
-    )
-    .expect("one frozen backend target");
-    let subscribed_participation = participation(backend);
-    let task = identity(1, backend);
-    let first = TaskStatus::created(task);
-    let second = status_at(task, TaskStatusVersion::FIRST.next().expect("version two"));
-    loopback
-        .peer
-        .expect_subscribe(SubscribeAnswer::EventsThenHold(vec![
-            encode_status_event(&first),
-            encode_status_event(&second),
-        ]));
-
-    subscriber
-        .ensure(
-            subscribed_participation,
-            vec![TaskStatusCursor::unobserved(task)],
-        )
-        .expect("the subscription starts");
-    for _ in 0..600 {
-        if subscriber.state(subscribed_participation) == Some(SubscriptionState::Resubscribing) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    assert_eq!(
-        subscriber.state(subscribed_participation),
-        Some(SubscriptionState::Resubscribing),
-        "local overflow waits for the serial runner instead of exhausting the network budget"
-    );
-    tokio::time::sleep(RESUBSCRIBE_BACKOFF_STEP * 2).await;
-    assert_eq!(
-        loopback.peer.subscribed().len(),
-        1,
-        "the receive task never privately resubscribes past a locally lost status"
-    );
-
-    let mut runner = intake.try_enter().expect("the runner slot is free");
-    let (observation_loss, statuses) = runner.drain_statuses(2);
-    assert!(observation_loss);
-    assert_eq!(statuses, vec![StatusEvent::Published(Box::new(first))]);
-    drop(runner);
-
-    loopback
-        .peer
-        .expect_subscribe(SubscribeAnswer::EventsThenHold(Vec::new()));
-    subscriber
-        .resubscribe(
-            subscribed_participation,
-            vec![TaskStatusCursor::at(task, TaskStatusVersion::FIRST)],
-        )
-        .expect("TaskRound replaces the subscription from its cursor");
-    let requests = subscribe_requests(&loopback.peer, 2).await;
-    let (_, cursors) =
-        decode_subscribe_task_status(&requests[1], FieldPath::root("post_overflow_subscription"))
-            .expect("a legal subscription");
-    assert_eq!(cursors.len(), 1);
-    assert_eq!(cursors[0].identity(), task);
-    assert_eq!(
-        cursors[0].current_version(),
-        Some(TaskStatusVersion::FIRST),
-        "TaskRound's applied cursor is the only position allowed after overflow"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_rejected_subscription_is_not_resubscribed() {
-    let backend = BackendProcessId::new_v7();
-    let fixture = subscriber_fixture(Loopback::start().await, backend, 4);
-    let subscribed_participation = participation(backend);
-    fixture
-        .loopback
-        .peer
-        .expect_subscribe(SubscribeAnswer::Reject(tonic::Code::InvalidArgument));
-
-    fixture
-        .subscriber
-        .ensure(subscribed_participation, Vec::new())
-        .expect("the subscription starts");
-    for _ in 0..600 {
-        if fixture.subscriber.state(subscribed_participation) == Some(SubscriptionState::Rejected) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-
-    assert_eq!(
-        fixture.subscriber.state(subscribed_participation),
-        Some(SubscriptionState::Rejected)
-    );
-    assert_eq!(
-        fixture.loopback.peer.subscribed().len(),
-        1,
-        "a typed rejection is never replayed"
-    );
-}
-
 #[tokio::test]
 async fn constructor_refusals_keep_their_actual_producer_facts() {
     use novarocks_coordination_contract::AttemptFailureClass;
@@ -5858,7 +4379,7 @@ async fn constructor_refusals_keep_their_actual_producer_facts() {
     use novarocks_query_application::execution_error::{
         ExecutionFailureInput, ExecutionFailureSite,
     };
-    let fixture = CoveredRoleFixture::new();
+    let fixture = NativeRoleFixture::new();
     let acks = TaskAckIntake::new(Arc::new(CountingWake::default()));
     let descriptor = test_descriptor(
         BackendProcessId::new_v7(),
@@ -5935,38 +4456,8 @@ async fn constructor_refusals_keep_their_actual_producer_facts() {
         input.attempt_class(),
         AttemptFailureClass::ContractViolation
     );
-    // Real original process owners, including both reapers, settle before this test returns.
+    // Real original Apply/outgoing owners settle before this test returns.
     fixture.settle().await;
-}
-
-#[test]
-fn a_subscription_needs_a_nonzero_error_budget() {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .expect("a test runtime");
-    let data_runtime = FrontendDataRuntime::new(runtime.handle().clone());
-    let error = TaskStatusSubscriber::new(
-        &[test_descriptor(
-            BackendProcessId::new_v7(),
-            RuntimeEndpoint::new("127.0.0.1", 9000).expect("a valid data endpoint"),
-            RuntimeEndpoint::new("control.test.invalid", 19061).expect("a valid control endpoint"),
-        )],
-        StatusIntake::new(1, Arc::new(CountingWake::default())).handle(),
-        0,
-        data_runtime,
-    )
-    .expect_err("a zero budget cannot bound anything");
-    assert_eq!(
-        error,
-        NativeTaskTransportCreationError::ZeroStatusErrorBudget
-    );
-    use novarocks_execution_contract::failure::{FailureClass, FailureProjection};
-    assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
-    assert_eq!(error.failure_fact().reason().code(), 106);
-    assert_eq!(
-        error.safe_detail().as_str(),
-        "native status subscription error budget must be nonzero"
-    );
 }
 
 #[test]
@@ -6353,3 +4844,11 @@ async fn a_cancel_settles_on_its_outcome_and_ignores_its_status_body() {
     assert_eq!(acks[0].worker_outcome(), Some(OperationOutcome::Accepted));
     assert_eq!(*acks[0].payload(), AckPayload::None);
 }
+
+#[path = "tests/original_root_connection.rs"]
+mod original_root_connection;
+#[path = "tests/three_task_recipe.rs"]
+mod three_task_recipe;
+
+#[path = "tests/participation_recipe.rs"]
+mod participation_recipe;

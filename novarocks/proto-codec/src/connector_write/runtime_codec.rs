@@ -228,6 +228,7 @@ pub trait ConnectorWriteFragmentDecoder: Send + Sync {
     fn decode_commit_fragment(
         &self,
         fragment: &ValidatedCommitFragment,
+        author: &novarocks_spi::connector::ConnectorPayloadRetentionGuard,
     ) -> Result<ConnectorCommitFragment, ConnectorWriteCodecError>;
 }
 
@@ -242,8 +243,9 @@ where
     fn decode_commit_fragment(
         &self,
         fragment: &ValidatedCommitFragment,
+        author: &novarocks_spi::connector::ConnectorPayloadRetentionGuard,
     ) -> Result<ConnectorCommitFragment, ConnectorWriteCodecError> {
-        self.decode_commit_fragment_payload(fragment.provider_payload())
+        self.decode_commit_fragment_payload(fragment.provider_payload(), author)
             .map_err(|error| wire_error(self.owner(), error))
     }
 }

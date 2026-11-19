@@ -16,6 +16,7 @@
 // under the License.
 
 //! Exact-owner call refinement. Binding validation and semantic refinement
+// Design: ADR-0238-self-contained-expression-units-and-explicit-environments.md
 //! share the implementation owner; this interface never performs name lookup.
 use crate::{FunctionBindingRequest, FunctionBindingSelection, FunctionId, FunctionKind};
 use novarocks_type_contract::{
@@ -44,9 +45,13 @@ pub enum CallArgumentUses<'a> {
         facts: &'a novarocks_type_contract::TemporalSourceFacts,
         channels: &'a [crate::TemporalSourceChannel<'a>],
     },
+    MaterializedInput {
+        context: novarocks_type_contract::RelationEffectContext,
+        input_type: &'a novarocks_type_contract::FunctionValueType,
+    },
     AggregateMerge {
         phase: crate::AggregateKernelPhase,
-        state_context: novarocks_type_contract::ExpressionEffectContext,
+        state_context: novarocks_type_contract::CallEffectContext,
         state_input_type: &'a novarocks_type_contract::FunctionValueType,
     },
 }
@@ -102,6 +107,16 @@ impl CallArgumentUses<'_> {
                     && left_context == right_context
                     && std::ptr::eq(left_type, right_type)
             }
+            (
+                Self::MaterializedInput {
+                    context: left,
+                    input_type: lt,
+                },
+                Self::MaterializedInput {
+                    context: right,
+                    input_type: rt,
+                },
+            ) => left == right && std::ptr::eq(lt, rt),
             _ => false,
         }
     }
@@ -109,7 +124,7 @@ impl CallArgumentUses<'_> {
 
 #[derive(Clone, Copy, Debug)]
 pub struct CallEffectInput<'a> {
-    pub context: novarocks_type_contract::ExpressionEffectContext,
+    pub context: novarocks_type_contract::CallEffectContext,
     pub argument_uses: CallArgumentUses<'a>,
     pub function_id: &'a FunctionId,
     pub kind: FunctionKind,
@@ -247,6 +262,11 @@ pub fn refine_call_effects<'a, O: FunctionEffectOwner + ?Sized>(
                 CompileControlError::ResourceExhausted,
             ));
         }
+        if !input.context.matches_kind(input.kind) {
+            return Err(CallEffectRefinementError::Contract(
+                EffectContractError::KindMismatch,
+            ));
+        }
         let selected_shape = match input.argument_uses {
             CallArgumentUses::SelectedChannels(uses) => uses.len() == input.request.arguments.len(),
             CallArgumentUses::RegexpCountPattern { channels, .. } => {
@@ -264,6 +284,15 @@ pub fn refine_call_effects<'a, O: FunctionEffectOwner + ?Sized>(
                     && facts.validate().is_ok()
                     && channels.len() == facts.shape().source_count()
             }
+            CallArgumentUses::MaterializedInput { context, .. } => {
+                input.kind == FunctionKind::Aggregate
+                    && input
+                        .context
+                        .relation()
+                        .is_some_and(|call| context.is_materialized_input_of(call))
+                    && input.request.arguments.len() == 1
+                    && input.request.logical_argument_count == 1
+            }
             CallArgumentUses::AggregateMerge {
                 phase,
                 state_context,
@@ -271,9 +300,7 @@ pub fn refine_call_effects<'a, O: FunctionEffectOwner + ?Sized>(
             } => {
                 input.kind == FunctionKind::Aggregate
                     && !phase.consumes_logical_arguments()
-                    && state_context.demand == novarocks_type_contract::EvaluationDemand::Value
-                    && state_context.use_id != input.context.use_id
-                    && state_context.domain != input.context.domain
+                    && state_context.is_aggregate_state_input_of(input.context)
                     && input.selected.aggregate.is_some()
                     && matches!(
                         input.selected.result_type,
@@ -292,7 +319,7 @@ pub fn refine_call_effects<'a, O: FunctionEffectOwner + ?Sized>(
             ));
         }
         if input.proof_scope != CallProofScope::Unconditional
-            && input.proof_scope != CallProofScope::Domain(input.context.domain)
+            && input.proof_scope != input.context.proof_scope()
         {
             return Err(CallEffectRefinementError::Contract(
                 EffectContractError::ProofScopeMismatch,
@@ -322,7 +349,8 @@ pub fn refine_call_effects<'a, O: FunctionEffectOwner + ?Sized>(
             CallArgumentUses::SelectedChannels(_)
             | CallArgumentUses::RegexpCountPattern { .. }
             | CallArgumentUses::ToBase64Bytes { .. }
-            | CallArgumentUses::TemporalSources { .. } => None,
+            | CallArgumentUses::TemporalSources { .. }
+            | CallArgumentUses::MaterializedInput { .. } => None,
             CallArgumentUses::AggregateMerge {
                 state_input_type, ..
             } => {
@@ -453,7 +481,30 @@ pub fn refine_call_effects<'a, O: FunctionEffectOwner + ?Sized>(
                     work.step().map_err(CallEffectRefinementError::Control)?;
                 }
             }
+            CallArgumentUses::MaterializedInput {
+                context,
+                input_type: _,
+            } => {
+                if declaration.argument_control
+                    != novarocks_type_contract::ArgumentControl::Aggregate
+                    || !input
+                        .context
+                        .relation()
+                        .is_some_and(|call| context.is_materialized_input_of(call))
+                {
+                    return Err(CallEffectRefinementError::InvalidInput(
+                        "materialized input requires its exact aggregate call",
+                    ));
+                }
+            }
             CallArgumentUses::TemporalSources { facts, channels } => {
+                let context =
+                    input
+                        .context
+                        .expression()
+                        .ok_or(CallEffectRefinementError::InvalidInput(
+                            "temporal source requires an expression context",
+                        ))?;
                 if declaration.argument_control
                     != novarocks_type_contract::ArgumentControl::TemporalSource(
                         facts.shape().kind(),
@@ -466,10 +517,10 @@ pub fn refine_call_effects<'a, O: FunctionEffectOwner + ?Sized>(
                 let roles = facts.shape().roles();
                 for (ordinal, channel) in channels.iter().enumerate() {
                     if roles[ordinal] != Some(channel.role)
-                        || channel.context.use_id == input.context.use_id
+                        || channel.context.use_id == context.use_id
                         || channel.context.demand
                             != novarocks_type_contract::EvaluationDemand::Value
-                        || (ordinal == 0) != (channel.context.domain == input.context.domain)
+                        || (ordinal == 0) != (channel.context.region == context.region)
                         || channels[..ordinal]
                             .iter()
                             .any(|other| other.context.use_id == channel.context.use_id)
@@ -701,6 +752,25 @@ fn validate_input_types<E: Error>(
         // universal equality requirement. The exact owner checks its meaning.
         validate(expected, work)?;
     }
+    if let CallArgumentUses::MaterializedInput { input_type, .. } = input.argument_uses {
+        validate(input_type, work)?;
+        let Some(crate::FunctionArgumentType::Value(expected)) =
+            input.selected.argument_types.first()
+        else {
+            return Err(CallEffectRefinementError::InvalidInput(
+                "materialized input is not a value channel",
+            ));
+        };
+        if !input_type
+            .same_physical_binding_ignoring_root_nullability_observed(expected, || work.step())
+            .map_err(CallEffectRefinementError::Control)?
+            || (input_type.nullable() && !expected.nullable())
+        {
+            return Err(CallEffectRefinementError::InvalidInput(
+                "materialized input differs from its complete logical channel",
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -777,7 +847,7 @@ impl RefinedCallEffects<'_> {
         input: CallEffectInput<'_>,
         arguments: ScopedExpressionEffects,
     ) -> Result<ScopedExpressionEffects, EffectContractError> {
-        if input.context != arguments.context() {
+        if input.context != arguments.context().into() {
             return Err(EffectContractError::CallIdentityMismatch);
         }
         self.validate_input(input)?;
@@ -804,6 +874,9 @@ pub struct ScopedExpressionEffects {
     effects: novarocks_type_contract::ExpressionEffects,
 }
 impl ScopedExpressionEffects {
+    pub(crate) fn into_call_effects(self) -> crate::ScopedCallEffects {
+        crate::ScopedCallEffects::new(self.context.into(), self.effects)
+    }
     pub const fn pure_value(context: novarocks_type_contract::ExpressionEffectContext) -> Self {
         Self {
             context,
@@ -831,7 +904,7 @@ impl ScopedExpressionEffects {
     }
     fn with_verified_call(self, call: &CallEffects) -> Result<Self, EffectContractError> {
         if !matches!(call.proof_scope, CallProofScope::Unconditional)
-            && call.proof_scope != CallProofScope::Domain(self.context.domain)
+            && call.proof_scope != CallProofScope::Region(self.context.region)
         {
             return Err(EffectContractError::ProofScopeMismatch);
         }
@@ -893,8 +966,8 @@ impl ScopedExpressionEffects {
     }
     /// Eager children must be in this same evaluation domain. Strong guarded
     /// children require the compiler's separate checked control-domain join.
-    pub fn join_same_domain(self, child: Self) -> Result<Self, EffectContractError> {
-        if self.context.domain != child.context.domain {
+    pub fn join_same_region(self, child: Self) -> Result<Self, EffectContractError> {
+        if self.context.region != child.context.region {
             return Err(EffectContractError::ProofScopeMismatch);
         }
         Ok(Self {
@@ -1074,11 +1147,11 @@ mod tests {
         let argument_uses = [Some(novarocks_type_contract::ExpressionUseId::new(1))];
         let context = novarocks_type_contract::ExpressionEffectContext {
             use_id: novarocks_type_contract::ExpressionUseId::new(0),
-            domain: novarocks_type_contract::EvaluationDomainId::new(0),
+            region: novarocks_type_contract::EvaluationRegionId::new(0),
             demand: novarocks_type_contract::EvaluationDemand::Value,
         };
         let input = CallEffectInput {
-            context,
+            context: context.into(),
             argument_uses: CallArgumentUses::SelectedChannels(&argument_uses),
             function_id: &id,
             kind: FunctionKind::Scalar,
@@ -1104,7 +1177,7 @@ mod tests {
         assert_eq!(
             result.compose_for_use(
                 CallEffectInput {
-                    context: other_context,
+                    context: (other_context).into(),
                     ..input
                 },
                 ScopedExpressionEffects::pure_value(other_context)
@@ -1339,7 +1412,7 @@ mod tests {
             },
         );
         let arguments = ScopedExpressionEffects::pure_value(context)
-            .join_same_domain(child)
+            .join_same_region(child)
             .unwrap();
         assert!(
             no_own_error
@@ -1351,9 +1424,9 @@ mod tests {
         );
         assert!(
             arguments
-                .join_same_domain(ScopedExpressionEffects::pure_value(
+                .join_same_region(ScopedExpressionEffects::pure_value(
                     novarocks_type_contract::ExpressionEffectContext {
-                        domain: novarocks_type_contract::EvaluationDomainId::new(1),
+                        region: novarocks_type_contract::EvaluationRegionId::new(1),
                         ..child_context
                     }
                 ))
@@ -1447,11 +1520,11 @@ mod tests {
         let argument_uses = [Some(novarocks_type_contract::ExpressionUseId::new(1))];
         let context = novarocks_type_contract::ExpressionEffectContext {
             use_id: novarocks_type_contract::ExpressionUseId::new(0),
-            domain: novarocks_type_contract::EvaluationDomainId::new(0),
+            region: novarocks_type_contract::EvaluationRegionId::new(0),
             demand: novarocks_type_contract::EvaluationDemand::Value,
         };
         let input = CallEffectInput {
-            context,
+            context: context.into(),
             argument_uses: CallArgumentUses::SelectedChannels(&argument_uses),
             function_id: &id,
             kind: FunctionKind::Scalar,
@@ -1509,11 +1582,11 @@ mod tests {
         let uses = [Some(novarocks_type_contract::ExpressionUseId::new(1))];
         let context = novarocks_type_contract::ExpressionEffectContext {
             use_id: novarocks_type_contract::ExpressionUseId::new(0),
-            domain: novarocks_type_contract::EvaluationDomainId::new(0),
+            region: novarocks_type_contract::EvaluationRegionId::new(0),
             demand: novarocks_type_contract::EvaluationDemand::Value,
         };
         let input = CallEffectInput {
-            context,
+            context: context.into(),
             argument_uses: CallArgumentUses::SelectedChannels(&uses),
             function_id: &id,
             kind: FunctionKind::Scalar,

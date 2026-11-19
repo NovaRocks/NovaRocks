@@ -37,9 +37,7 @@ pub(crate) fn statistics_publication_owned_bytes(
     table: &crate::iceberg::table::Table,
     expectations: &[novarocks_spi::connector::StatisticsArtifactIdentity],
 ) -> Result<std::num::NonZeroU64, novarocks_spi::connector::ConnectorError> {
-    use novarocks_spi::connector::{
-        ConnectorError, ConnectorErrorKind, MAX_CONNECTOR_STATISTICS_ARTIFACTS,
-    };
+    use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
     use std::mem::size_of;
     let overflow = || {
         ConnectorError::new(
@@ -47,12 +45,6 @@ pub(crate) fn statistics_publication_owned_bytes(
             "Statistics publication formation invoice overflow",
         )
     };
-    if drafts.len() > MAX_CONNECTOR_STATISTICS_ARTIFACTS {
-        return Err(ConnectorError::new(
-            ConnectorErrorKind::ResourceExhausted,
-            "Statistics artifact count exceeds its original contract",
-        ));
-    }
     let mut metadata = drafts
         .len()
         .checked_mul(
@@ -315,10 +307,7 @@ pub(crate) async fn write_puffin_artifacts_allocated(
         return Ok(None);
     }
     let object = writer
-        .allocate(
-            crate::commit::model::ArtifactClass::Attempt,
-            crate::commit::model::ArtifactKind::Statistics,
-        )
+        .allocate(crate::commit::model::ArtifactKind::Statistics)
         .map_err(|error| error.to_string())?;
     let statistics = write_puffin_artifacts(
         writer.file_io(),
@@ -373,10 +362,7 @@ pub(crate) async fn write_puffin_artifacts_allocated_scoped(
     if drafts.is_empty() {
         return Ok(None);
     }
-    let object = writer.allocate(
-        crate::commit::model::ArtifactClass::Attempt,
-        crate::commit::model::ArtifactKind::Statistics,
-    )?;
+    let object = writer.allocate(crate::commit::model::ArtifactKind::Statistics)?;
     let result = write_puffin_artifacts_original(
         writer.file_io(),
         object.path(),

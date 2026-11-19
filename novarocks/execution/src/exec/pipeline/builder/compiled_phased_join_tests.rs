@@ -346,10 +346,9 @@ fn b3_b0_retains_receiver_owned_throwing_probe_key_and_original_required_error()
     assert_eq!(required.batch_row(), 0);
     assert_eq!(
         required.root(),
-        ProgramExpressionRootSite::Node {
-            node: program.graph().root(),
-            role: ProgramNodeExpressionRole::JoinProbeKey { key: 0 }
-        }
+        join_condition(&program, program.graph().root()).keys()[0]
+            .probe
+            .root
     );
     assert!(declaration.prepared().unwrap().completion.check().is_err());
 }

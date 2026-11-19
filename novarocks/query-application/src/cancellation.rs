@@ -258,6 +258,10 @@ mod tests {
         let mut workers = Vec::new();
         for session_key in 1..=16 {
             let source = Arc::clone(&source);
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "This test owns and joins concurrent cancellation observers to check the original first-winner result."
+            )]
             workers.push(std::thread::spawn(move || {
                 source.request(QueryCancellationReason::ExplicitKill {
                     requester_session: crate::session_control::ClientSessionKey::new(session_key)
@@ -292,6 +296,10 @@ mod tests {
     async fn async_observer_wakes_after_subscription() {
         let source = QueryCancellationSource::new();
         let view = source.view();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "This test owns and joins concurrent cancellation observers to check the original first-winner result."
+        )]
         let observer = tokio::spawn(async move { view.cancelled().await });
         tokio::task::yield_now().await;
 

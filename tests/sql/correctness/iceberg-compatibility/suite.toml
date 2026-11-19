@@ -24,8 +24,8 @@ paths = [
     "novarocks/result-render/src/encoder.rs",
     "novarocks/functions/src/evaluation.rs",
     "novarocks/functions/src/kernel_input.rs",
-    "novarocks/execution/src/exec/expr/compiled_program.rs",
-    "novarocks/execution/src/exec/expr/compiled_program/**",
+    "novarocks/expression-contract/**",
+    "novarocks/expression/**",
     "novarocks/functions/src/cast.rs",
     "novarocks/frontend-application/src/query_execution/dml/mutation_flow.rs",
     "novarocks/sql/src/analyzer/write_assignment.rs",
@@ -73,9 +73,9 @@ paths = [
     "novarocks/sql/src/analyzer/declaration_widening.rs",
     "novarocks/frontend-application/src/query_execution/constant_eval.rs",
     "novarocks/frontend-application/src/query_execution/constant_eval/**",
-    "novarocks/frontend-application/src/coordinator/internal_result.rs",
-    "novarocks/frontend-application/src/coordinator/execution.rs",
-    "novarocks/frontend-application/src/coordinator/statement_native_attempt.rs",
+    "novarocks/frontend-application/src/query_execution/internal_consumer/write.rs",
+    "novarocks/frontend-application/src/query/statement_computation.rs",
+    "novarocks/query-application/src/coordination/executor/native.rs",
     "novarocks/frontend-application/src/query_execution/internal_result_cpu.rs",
 ]
 

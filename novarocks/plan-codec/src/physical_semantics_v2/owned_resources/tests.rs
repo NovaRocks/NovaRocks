@@ -115,9 +115,9 @@ fn one_pruning(values: usize) -> FrozenFragmentPruning {
         sources: Box::from([PruningSourceWitness {
             responsibility: PredicateResponsibilityRef {
                 fragment: FragmentId::new(u32::MAX),
-                site: ExpressionRootSite {
+                site: PredicateSourceSite {
                     node: NodeId::new(0),
-                    role: ExpressionRootRole::FilterPredicate { predicate: 0 },
+                    root: novarocks_expression_contract::RootOrdinal::new(0),
                 },
                 use_id: ExpressionUseId::new(u32::MAX),
             },
@@ -151,17 +151,13 @@ fn pruning_wire() -> wire::FrozenPruning {
             sources: vec![wire::PruningSourceWitness {
                 responsibility: Some(wire::PredicateResponsibilityRef {
                     fragment_id: Some(u32::MAX),
-                    site: Some(crate::physical_control_v2::encode_site(
-                        ExpressionRootSite {
-                            node: NodeId::new(0),
-                            role: ExpressionRootRole::FilterPredicate { predicate: 0 },
-                        },
-                    )),
+                    node_id: Some(0),
+                    root_ordinal: Some(0),
                     use_id: Some(u32::MAX),
                 }),
-                context: Some(wire::EffectContext {
+                context: Some(wire::ExpressionEffectContext {
                     use_id: Some(0),
-                    domain_id: Some(u32::MAX),
+                    region_id: Some(u32::MAX),
                     demand: novarocks_proto_models::physical_control_v2::EvaluationDemand::TruthOnly
                         as i32,
                 }),
@@ -244,7 +240,7 @@ fn pruning_observed_has_independent_wire_and_layout_oracles() {
 }
 #[test]
 fn calls_observed_reuses_actual_checked_fragment_and_all_nine_fields() {
-    let mut f = scalar_fixture(2, 0);
+    let mut f = relation_fixture(2, 0);
     f.calls[0].effects.environment = Box::from([SemanticParameterRef {
         id: SemanticParameterId::new(u32::MAX),
         expected_key: SemanticParameterKey::StatementStartUtc,
@@ -257,14 +253,13 @@ fn calls_observed_reuses_actual_checked_fragment_and_all_nine_fields() {
     .unwrap();
     assert_eq!(
         encoded,
-        encode_checked(&calls, &TestControl::default()).unwrap()
+        encode_relation_checked(&calls, &TestControl::default()).unwrap()
     );
     assert_eq!(facts.allocation_requests_upper_bound, 2);
     assert_eq!(facts.list_item_count, 3);
     let (decoded, _) = scope(&control, CompilePhase::Decode, |w| {
         decode_frozen_calls_observed(
             &f.fragment,
-            &f.uses,
             &encoded,
             SOURCE,
             ceilings(),
@@ -274,12 +269,11 @@ fn calls_observed_reuses_actual_checked_fragment_and_all_nine_fields() {
     })
     .unwrap();
     assert_eq!(decoded, calls);
-    let fother = scalar_fixture(2, u32::MAX);
+    let fother = relation_fixture(1, u32::MAX);
     assert!(matches!(
         scope(&control, CompilePhase::Decode, |w| {
             decode_frozen_calls_observed(
                 &fother.fragment,
-                &f.uses,
                 &encoded,
                 SOURCE,
                 ceilings(),
@@ -287,7 +281,7 @@ fn calls_observed_reuses_actual_checked_fragment_and_all_nine_fields() {
                 w,
             )
         }),
-        Err(E::Calls(FrozenCallError::Roots(_)))
+        Err(E::Calls(FrozenCallError::InvalidSite))
     ));
     assert!(
         trace(&control)
@@ -339,7 +333,7 @@ fn semantic_projection_exact_and_under_live_axes_preserve_typed_numeric_origin()
 }
 #[test]
 fn semantic_owned_small_success_and_ordinary_tails_keep_every_original_control_prefix() {
-    let f = scalar_fixture(1, 0);
+    let f = relation_fixture(1, 0);
     let calls = f.checked().unwrap();
     let (wire, _) = scope(&TestControl::default(), CompilePhase::Encode, |w| {
         encode_frozen_calls_observed(&calls, SOURCE, ceilings(), &mut |_| Ok(()), w)
@@ -352,30 +346,14 @@ fn semantic_owned_small_success_and_ordinary_tails_keep_every_original_control_p
     });
     prefixes(CompilePhase::Decode, |c| {
         scope(c, CompilePhase::Decode, |w| {
-            decode_frozen_calls_observed(
-                &f.fragment,
-                &f.uses,
-                &wire,
-                SOURCE,
-                ceilings(),
-                &mut |_| Ok(()),
-                w,
-            )
+            decode_frozen_calls_observed(&f.fragment, &wire, SOURCE, ceilings(), &mut |_| Ok(()), w)
         })
     });
     let mut bad = wire.clone();
     bad.entries[0].decimal_overflow_policy = None;
     prefixes(CompilePhase::Decode, |c| {
         scope(c, CompilePhase::Decode, |w| {
-            decode_frozen_calls_observed(
-                &f.fragment,
-                &f.uses,
-                &bad,
-                SOURCE,
-                ceilings(),
-                &mut |_| Ok(()),
-                w,
-            )
+            decode_frozen_calls_observed(&f.fragment, &bad, SOURCE, ceilings(), &mut |_| Ok(()), w)
         })
     });
     let source = one_pruning(3);
@@ -427,7 +405,7 @@ fn semantic_owned_small_success_and_ordinary_tails_keep_every_original_control_p
 }
 #[test]
 fn semantic_known_root_requests_win_before_caller_pending_255_late_causes() {
-    let f = scalar_fixture(1, 0);
+    let f = relation_fixture(1, 0);
     let calls = f.checked().unwrap();
     let (wire, _) = scope(&TestControl::default(), CompilePhase::Encode, |w| {
         encode_frozen_calls_observed(&calls, SOURCE, ceilings(), &mut |_| Ok(()), w)
@@ -445,15 +423,7 @@ fn semantic_known_root_requests_win_before_caller_pending_255_late_causes() {
         let mut l = ceilings();
         l.max_allocation_requests = 1;
         assert!(matches!(
-            decode_frozen_calls_observed(
-                &f.fragment,
-                &f.uses,
-                &wire,
-                SOURCE,
-                l,
-                &mut |_| Ok(()),
-                &mut work
-            ),
+            decode_frozen_calls_observed(&f.fragment, &wire, SOURCE, l, &mut |_| Ok(()), &mut work),
             Err(E::Control(CompileControlError::ResourceExhausted))
         ));
         assert_eq!(trace(&c), [(CompilePhase::Decode, 0)]);

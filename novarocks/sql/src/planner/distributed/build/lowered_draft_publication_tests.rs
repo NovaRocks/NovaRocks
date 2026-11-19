@@ -155,8 +155,11 @@ fn actual_lowering_reuses_each_captured_literal_and_preserves_distinct_sites() {
                 else {
                     panic!("original top-level literal must remain a checked constant")
                 };
-                let expression = fragment.expressions().get(call.arguments[0]).unwrap();
-                let novarocks_physical_plan::ExprKind::Constant(reference) = expression.kind else {
+                let expression = fragment
+                    .root_expression(node.id, call.arguments[0])
+                    .unwrap();
+                let novarocks_expression_contract::ExprKind::Constant(reference) = expression.kind
+                else {
                     panic!("lowering must reuse the original literal constant")
                 };
                 let actual = owner

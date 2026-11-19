@@ -20,7 +20,7 @@ use super::*;
 use arrow_schema::{DataType, Field};
 use novarocks_type_contract::{
     CallProofScope, CompileControlError, CompilePhase, DecimalOverflowPolicy, EvaluationDemand,
-    EvaluationDomainId, ExpressionEffectContext, ExpressionUseId, FunctionInstanceState,
+    EvaluationRegionId, ExpressionEffectContext, ExpressionUseId, FunctionInstanceState,
     FunctionNullBehavior, PureCompileControl, SemanticParameters,
 };
 use std::{mem::MaybeUninit, sync::Mutex, time::Duration};
@@ -68,12 +68,10 @@ impl KernelEvaluationControl for RuntimeControl {
         panic!("MIN/MAX never waits")
     }
 }
-fn context() -> ExpressionEffectContext {
-    ExpressionEffectContext {
-        use_id: ExpressionUseId::new(0),
-        domain: EvaluationDomainId::new(u32::MAX),
-        demand: EvaluationDemand::Value,
-    }
+fn context() -> novarocks_type_contract::RelationEffectContext {
+    novarocks_type_contract::RelationEffectContext::call(
+        novarocks_type_contract::RelationCallId::new(0),
+    )
 }
 fn ty(nullable: bool) -> FunctionValueType {
     FunctionValueType::from_legacy_declared_projection(arrow_schema::DataType::Int64, nullable)
@@ -172,11 +170,11 @@ impl Fixture {
                 expected_result_type: None,
             },
             argument_uses: crate::CallArgumentUses::SelectedChannels(&self.uses),
-            context: context(),
+            context: (context()).into(),
             parameters: &self.parameters,
             environment: &[],
             decimal_overflow_policy: self.policy,
-            proof_scope: CallProofScope::Domain(context().domain),
+            proof_scope: CallProofScope::Relation(context().identity),
         }
     }
     fn input_for_phase(&self, phase: AggregateKernelPhase) -> CallEffectInput<'_> {
@@ -186,11 +184,12 @@ impl Fixture {
             // from the selected logical signature. No production flow is inferred.
             input.argument_uses = crate::CallArgumentUses::AggregateMerge {
                 phase,
-                state_context: ExpressionEffectContext {
+                state_context: (ExpressionEffectContext {
                     use_id: ExpressionUseId::new(u32::MAX),
-                    domain: EvaluationDomainId::new(u32::MAX - 1),
+                    region: EvaluationRegionId::new(u32::MAX - 1),
                     demand: EvaluationDemand::Value,
-                },
+                })
+                .into(),
                 state_input_type: &self.state_input_type,
             };
         }
@@ -198,7 +197,7 @@ impl Fixture {
     }
     fn options(&self, phase: AggregateKernelPhase) -> PureCallPreparation {
         PureCallPreparation::Aggregate {
-            arguments: ScopedExpressionEffects::pure_value(context()),
+            arguments: ScopedRelationalEffects::pure_value(context()),
             options: AggregatePreparationOptions {
                 state_interpretation: None,
                 phase,
@@ -355,7 +354,7 @@ fn aggregate_extrema_installed_fresh_frozen_all_phases_exact_full_types_and_poli
                             actual.call_contract().selected(),
                             fixture.selected.as_ref()
                         ));
-                        assert_eq!(actual.call_contract().context(), context());
+                        assert_eq!(actual.call_contract().context(), context().into());
                         assert_eq!(actual.call_contract().parameters(), &fixture.parameters);
                         assert_eq!(actual.call_contract().decimal_overflow_policy(), policy);
                         assert_eq!(

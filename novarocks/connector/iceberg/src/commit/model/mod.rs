@@ -24,12 +24,18 @@ mod identity;
 mod intent;
 mod outcome;
 mod request;
+mod reuse;
 pub(crate) use request::{canonical_json, validate_document_expiry_update};
+pub use reuse::{
+    AddedManifestAuthor, ManifestReuseBasis, ManifestReuseIndex, ManifestRewriteReuse,
+};
 
 pub use artifacts::{
-    ArtifactClass, ArtifactKind, ArtifactLedger, ArtifactRecord, ArtifactWriteState,
-    ArtifactWriter, AttemptArtifacts, CleanupScope,
+    ArtifactKind, ArtifactLedger, ArtifactRecord, ArtifactReferences, ArtifactWriter,
+    AttemptArtifacts, CleanupScope, ReceivedPublication,
 };
+#[cfg(test)]
+pub use artifacts::{ArtifactOrigin, ArtifactWriteState};
 pub use dependency::Dependency;
 pub(crate) use fields::EntryFacts;
 pub use fields::{AddedContent, FrozenEntry, SeqField};

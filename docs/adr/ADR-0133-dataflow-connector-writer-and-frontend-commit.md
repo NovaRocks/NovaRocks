@@ -9,6 +9,9 @@ partially-superseded-by:
   - id: ADR-0198
     scope: "The all-participant-success commit gate and reliance on begin-session abort or age-gated GC for missing writer output; dataflow writers, one bounded root, frontend-only commit, per-driver ownership and statement-wide union bounds remain active"
     link: "ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md"
+  - id: ADR-0235
+    scope: "The fixed fragment and prepared-write-set limits at producer, root ingress and FE receive. Dataflow, per-driver custody, one resource-governed root and FE-only commit remain active"
+    link: "ADR-0235-iceberg-write-layout-and-data-plane-capacity.md"
 date: 2026-09-01
 provenance:
   - "discussion: 2026-09-01 distributed writer data plane and frontend commit boundary"

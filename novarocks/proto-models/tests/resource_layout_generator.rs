@@ -326,3 +326,99 @@ fn proto2_required_optional_and_packed_fields_are_generated() {
     assert!(generated.contains("packed : true"));
     assert!(generated.contains("packed : false"));
 }
+
+#[test]
+fn descriptor_reserved_ranges_are_message_local_and_oneofs_have_no_reserved_namespace() {
+    fn ranges(generated: &str, name: &str) -> Vec<(u32, u32)> {
+        let source = syn::parse_file(generated).unwrap();
+        let mut pending = source.items;
+        while let Some(item) = pending.pop() {
+            if let syn::Item::Mod(module) = &item
+                && let Some((_, items)) = &module.content
+            {
+                pending.extend(items.iter().cloned());
+            }
+            let syn::Item::Impl(item) = item else {
+                continue;
+            };
+            let syn::Type::Path(ty) = item.self_ty.as_ref() else {
+                continue;
+            };
+            if !ty.path.is_ident(name) {
+                continue;
+            }
+            for member in item.items {
+                let syn::ImplItem::Const(value) = member else {
+                    continue;
+                };
+                if value.ident != "RESOURCE_LAYOUT" {
+                    continue;
+                }
+                let syn::Expr::Reference(value) = value.expr else {
+                    panic!("layout reference")
+                };
+                let syn::Expr::Struct(value) = *value.expr else {
+                    panic!("layout literal")
+                };
+                let field = value
+                    .fields
+                    .into_iter()
+                    .find(|field| {
+                        field.member
+                            == syn::Member::Named(syn::Ident::new(
+                                "reserved",
+                                proc_macro2::Span::call_site(),
+                            ))
+                    })
+                    .unwrap();
+                let syn::Expr::Reference(value) = field.expr else {
+                    panic!("range reference")
+                };
+                let syn::Expr::Array(value) = *value.expr else {
+                    panic!("range array")
+                };
+                return value
+                    .elems
+                    .into_iter()
+                    .map(|range| {
+                        let syn::Expr::Tuple(range) = range else {
+                            panic!("range pair")
+                        };
+                        let numbers = range
+                            .elems
+                            .into_iter()
+                            .map(|value| {
+                                let syn::Expr::Lit(value) = value else {
+                                    panic!("range literal")
+                                };
+                                let syn::Lit::Int(value) = value.lit else {
+                                    panic!("range number")
+                                };
+                                value.base10_parse::<u32>().unwrap()
+                            })
+                            .collect::<Vec<_>>();
+                        assert_eq!(numbers.len(), 2);
+                        (numbers[0], numbers[1])
+                    })
+                    .collect();
+            }
+        }
+        panic!("missing generated layout {name}");
+    }
+    let schema = SCHEMA
+        .replace(
+            "message Empty {}",
+            "message Empty { reserved 20, 22 to 24; }",
+        )
+        .replace(
+            "message HTTP_node {",
+            "message HTTP_node { reserved 26 to max; ",
+        );
+    let mut fixture = Fixture::new(false, false, &schema);
+    let generated = fixture.generate();
+    // Exact half-open descriptor ranges, including the protobuf maximum tag.
+    assert_eq!(ranges(&generated, "Empty"), [(20, 21), (22, 25)]);
+    assert_eq!(ranges(&generated, "HttpNode"), [(26, 1 << 29)]);
+    assert_eq!(ranges(&generated, "Choice"), []);
+    assert_eq!(ranges(&generated, "String"), []);
+}

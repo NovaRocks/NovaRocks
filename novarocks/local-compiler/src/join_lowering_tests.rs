@@ -20,6 +20,10 @@
 //! and explicit refusals. Fixtures are authored with the real physical
 //! builder and published as checked packages.
 
+use crate::test_units::PureUnitFixture;
+use novarocks_expression::StaticExprKind;
+use novarocks_expression_contract::{BinaryOperator, ExprKind, RootOrdinal, RootScope};
+
 use super::*;
 use arrow_schema::DataType;
 use novarocks_connector_contract::PureProviderProgramCatalog;
@@ -30,24 +34,19 @@ use novarocks_functions::{
 };
 use novarocks_local_program::{
     JoinType, KernelAbiVersion, LocalOperatorOrigin, LocalProgram, NestedLoopJoinType,
-    ProgramChannelLayoutRole, ProgramChannelSite, ProgramExpressionArena,
-    ProgramExpressionRootSite, ProgramLexicalSource, ProgramNodeExpressionRole, ProgramNodeId,
-    ProgramNodeKind, ProgramUseRef, StaticExprKind,
+    ProgramChannelLayoutRole, ProgramChannelSite, ProgramNodeId, ProgramNodeKind, ProgramRootRef,
 };
 use novarocks_physical_plan::{
-    BinaryOperator, Distribution, ExprId, ExprKind, Fragment, FragmentBuilder, FragmentCuts,
-    FragmentId, FragmentPackage, FragmentPackageAdmission, FragmentPackageInput, FragmentSink,
-    FrozenFragmentCalls, FrozenFragmentPruning, JoinDistribution, JoinKey, JoinKind, JoinSide,
-    LiteralValue, NestLoopJoinDistribution, NodeId, NodeKind, PhysicalExpressionRoots,
-    PhysicalProperties, PhysicalRootUses, PipelineDopDomain, PlanLimits, PlanVersionId,
+    Distribution, Fragment, FragmentBuilder, FragmentCuts, FragmentId, FragmentPackage,
+    FragmentPackageAdmission, FragmentPackageInput, FragmentSink, FrozenFragmentPruning,
+    JoinDistribution, JoinKey, JoinKind, JoinSide, NestLoopJoinDistribution, NodeId, NodeKind,
+    PhysicalProperties, PipelineDopDomain, PlanLimits, PlanVersionId,
     PropertyProofProjectionLimits, RequiredContracts, ResultField, ResultPort, RowMultiplicity,
     ValueId, ValueOrigin,
 };
 use novarocks_type_contract::{
-    CompileControlError, CompilePhase, ControlShape, DecimalOverflowPolicy, EvaluationDomainId,
-    ExpressionControlFlow, ExpressionEffectContext, ExpressionEvaluationDomain,
-    ExpressionInvocation, ExpressionUseId, FunctionValueType, PureCompileControl,
-    SemanticParameters, control_argument_semantics,
+    CompileControlError, CompilePhase, DecimalOverflowPolicy, EvaluationDemand, FunctionValueType,
+    PureCompileControl, SemanticParameters,
 };
 use std::{
     collections::BTreeMap,
@@ -191,11 +190,12 @@ struct Fixture {
     right: [ValueId; 2],
     output: Vec<ValueId>,
     key: Option<JoinKey>,
-    residual: Option<ExprId>,
+    residual: Option<RootOrdinal>,
 }
 
 fn values(
     builder: &mut FragmentBuilder,
+    constants: &mut novarocks_physical_plan::ConstantPools,
     node: NodeId,
     rows: &[[i64; 2]],
     canonical: bool,
@@ -222,15 +222,33 @@ fn values(
             row.iter()
                 .map(|cell| {
                     builder
-                        .add_expression(
+                        .fixture_definition(
                             node,
                             ty.clone(),
-                            ExprKind::Literal(if canonical {
-                                LiteralValue::Utf8(cell.to_string().into())
+                            if canonical {
+                                crate::test_constants::utf8(
+                                    constants,
+                                    &ty,
+                                    &cell.to_string(),
+                                    options().constants,
+                                )
                             } else {
-                                LiteralValue::Int64(*cell)
-                            }),
+                                crate::test_constants::i64(
+                                    constants,
+                                    &ty,
+                                    *cell,
+                                    options().constants,
+                                )
+                            },
                         )
+                        .and_then(|definition| {
+                            builder.fixture_occurrence(
+                                node,
+                                definition,
+                                EvaluationDemand::Value,
+                                RootScope::AllPorts,
+                            )
+                        })
                         .unwrap()
                 })
                 .collect::<Vec<_>>()
@@ -263,6 +281,7 @@ fn fixture(case: Case) -> Fixture {
 
 fn try_fixture(case: Case) -> Result<Fixture, novarocks_physical_plan::ValidationErrors> {
     let fragment_id = FragmentId::new(41);
+    let mut constants = novarocks_physical_plan::ConstantPools::empty();
     let mut builder = FragmentBuilder::new(fragment_id);
     let kind = kind_of(case.family);
     let canonical = kind == JoinKind::LeftMark;
@@ -271,46 +290,87 @@ fn try_fixture(case: Case) -> Result<Fixture, novarocks_physical_plan::Validatio
     } else {
         int64()
     };
-    let left = values(&mut builder, LEFT, &[[1, 10], [2, 20], [3, 30]], canonical);
-    let right = values(&mut builder, RIGHT, &[[1, 15], [2, 5], [4, 40]], canonical);
+    let left = values(
+        &mut builder,
+        &mut constants,
+        LEFT,
+        &[[1, 10], [2, 20], [3, 30]],
+        canonical,
+    );
+    let right = values(
+        &mut builder,
+        &mut constants,
+        RIGHT,
+        &[[1, 15], [2, 5], [4, 40]],
+        canonical,
+    );
+    let mut key_left_definition = None;
     let key = match case.family {
-        Family::Hash { null_safe, .. } => Some(JoinKey {
-            left: builder
-                .add_expression(JOIN, key_ty.clone(), ExprKind::Value(left[0]))
-                .unwrap(),
-            right: builder
-                .add_expression(JOIN, key_ty.clone(), ExprKind::Value(right[0]))
-                .unwrap(),
-            null_safe,
-        }),
+        Family::Hash { null_safe, .. } => {
+            let left_definition = builder
+                .fixture_definition(JOIN, key_ty.clone(), ExprKind::Value(left[0]))
+                .unwrap();
+            key_left_definition = Some(left_definition);
+            let right_definition = builder
+                .fixture_definition(JOIN, key_ty.clone(), ExprKind::Value(right[0]))
+                .unwrap();
+            Some(JoinKey {
+                left: builder
+                    .fixture_occurrence(
+                        JOIN,
+                        left_definition,
+                        EvaluationDemand::Value,
+                        RootScope::Port(0),
+                    )
+                    .unwrap(),
+                right: builder
+                    .fixture_occurrence(
+                        JOIN,
+                        right_definition,
+                        EvaluationDemand::Value,
+                        RootScope::Port(1),
+                    )
+                    .unwrap(),
+                null_safe,
+            })
+        }
         Family::NestLoop { .. } => None,
     };
     let residual = match case.residual {
         Residual::None => None,
         Residual::Separate | Residual::SharedKey => {
             let lhs = if case.residual == Residual::SharedKey {
-                key.as_ref().expect("a shared key").left
+                key_left_definition.expect("a shared key definition")
             } else {
                 builder
-                    .add_expression(JOIN, int64(), ExprKind::Value(left[1]))
+                    .fixture_definition(JOIN, int64(), ExprKind::Value(left[1]))
                     .unwrap()
             };
             let rhs = builder
-                .add_expression(JOIN, int64(), ExprKind::Value(right[1]))
+                .fixture_definition(JOIN, int64(), ExprKind::Value(right[1]))
                 .unwrap();
+            let definition = builder
+                .fixture_definition(
+                    JOIN,
+                    FunctionValueType::new(DataType::Boolean, false),
+                    ExprKind::Binary {
+                        left: lhs,
+                        op: BinaryOperator::Lt,
+                        right: rhs,
+                        decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
+                        allow_throw_exception: None,
+                    },
+                )
+                .unwrap();
+            // NAA evaluates the nullable predicate value; ordinary join predicates only demand truth.
+            let demand = if kind == JoinKind::NullAwareLeftAnti {
+                EvaluationDemand::Value
+            } else {
+                EvaluationDemand::TruthOnly
+            };
             Some(
                 builder
-                    .add_expression(
-                        JOIN,
-                        FunctionValueType::new(DataType::Boolean, false),
-                        ExprKind::Binary {
-                            left: lhs,
-                            op: BinaryOperator::Lt,
-                            right: rhs,
-                            decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-                            allow_throw_exception: None,
-                        },
-                    )
+                    .fixture_occurrence(JOIN, definition, demand, RootScope::AllPorts)
                     .unwrap(),
             )
         }
@@ -399,6 +459,11 @@ fn try_fixture(case: Case) -> Result<Fixture, novarocks_physical_plan::Validatio
             node_kind,
         )
         .unwrap();
+    for node in [LEFT, RIGHT, JOIN] {
+        if builder.construction_unit(node).is_some() {
+            builder.finish_fixture_unit(node, &Control).unwrap();
+        }
+    }
     let fragment = builder.finish_definition(
         JOIN,
         FragmentSink::Result,
@@ -410,7 +475,7 @@ fn try_fixture(case: Case) -> Result<Fixture, novarocks_physical_plan::Validatio
         novarocks_physical_plan::StagePlacementPolicy::Singleton,
     )?;
     Ok(Fixture {
-        package: publish(fragment),
+        package: publish(fragment, constants),
         left,
         right,
         output,
@@ -419,86 +484,10 @@ fn try_fixture(case: Case) -> Result<Fixture, novarocks_physical_plan::Validatio
     })
 }
 
-/// One eager use per actual occurrence: a value or literal leaf, or a binary
-/// comparison over its two ordered operands.
-fn root_uses(fragment: &Fragment) -> PhysicalRootUses {
-    struct Author<'a> {
-        fragment: &'a Fragment,
-        next: u32,
-        uses: Vec<ExpressionInvocation<ExprId>>,
-    }
-    impl Author<'_> {
-        fn visit(
-            &mut self,
-            expr: ExprId,
-            domain: EvaluationDomainId,
-            demand: novarocks_type_contract::EvaluationDemand,
-        ) -> ExpressionUseId {
-            let id = ExpressionUseId::new(self.next);
-            self.next += 3;
-            let children = match &self.fragment.expressions().get(expr).unwrap().kind {
-                ExprKind::Binary { left, right, .. } => vec![*left, *right],
-                ExprKind::Literal(_) | ExprKind::Value(_) => vec![],
-                other => panic!("fixture has no {other:?}"),
-            };
-            let arguments = children
-                .iter()
-                .enumerate()
-                .map(|(ordinal, &child)| {
-                    let (child_demand, guard) = control_argument_semantics(
-                        ControlShape::Eager,
-                        children.len(),
-                        ordinal,
-                        demand,
-                    )
-                    .unwrap();
-                    assert!(guard.is_none());
-                    self.visit(child, domain, child_demand)
-                })
-                .collect::<Vec<_>>();
-            self.uses.push(ExpressionInvocation {
-                context: ExpressionEffectContext {
-                    use_id: id,
-                    domain,
-                    demand,
-                },
-                definition: expr,
-                control: ControlShape::Eager,
-                arguments: arguments.into_boxed_slice(),
-            });
-            id
-        }
-    }
-    let domain = EvaluationDomainId::new(5);
-    let mut author = Author {
-        fragment,
-        next: 7,
-        uses: vec![],
-    };
-    let roots = PhysicalExpressionRoots::try_new(fragment, &Control).unwrap();
-    let bindings = roots
-        .sites()
-        .iter()
-        .map(|(&site, root)| (site, author.visit(root.expr, domain, root.demand)))
-        .collect();
-    let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
-            id: domain,
-            parent: None,
-            guard: None,
-        }],
-        author.uses,
-        fragment.expressions(),
-        CompilePhase::Validate,
-        &Control,
-    )
-    .unwrap();
-    PhysicalRootUses::try_new(fragment, flow, bindings, &Control).unwrap()
-}
-
-fn publish(fragment: Fragment) -> Arc<FragmentPackage> {
-    let uses = root_uses(&fragment);
-    let calls = FrozenFragmentCalls::try_new(&fragment, &uses, vec![], &Control).unwrap();
+fn publish(
+    fragment: Fragment,
+    constants: novarocks_physical_plan::ConstantPools,
+) -> Arc<FragmentPackage> {
     let root = &fragment.nodes()[&fragment.root()];
     let result = ResultPort {
         scalar_schema: None,
@@ -523,12 +512,11 @@ fn publish(fragment: Fragment) -> Arc<FragmentPackage> {
     Arc::new(
         FragmentPackage::try_new(
             FragmentPackageInput {
-                constants: novarocks_physical_plan::ConstantPools::empty(),
+                constants,
                 version: PlanVersionId::try_new([41; 16]).unwrap(),
                 required: RequiredContracts::default(),
                 fragment,
-                expression_uses: uses,
-                calls,
+                statement_constant_policy: options().constants,
                 pruning: FrozenFragmentPruning::try_new(id, vec![], &Control).unwrap(),
                 cuts: FragmentCuts::default(),
                 result: Some(result),
@@ -536,6 +524,7 @@ fn publish(fragment: Fragment) -> Arc<FragmentPackage> {
                 scans: BTreeMap::new(),
                 writes: BTreeMap::new(),
                 annotations: Box::default(),
+                layouts: Default::default(),
             },
             admission(),
             &Control,
@@ -595,35 +584,84 @@ fn join_node(program: &LocalProgram) -> (ProgramNodeId, &ProgramNodeKind) {
     (node.local_id().unwrap(), node.kind())
 }
 
-fn site(node: ProgramNodeId, role: ProgramNodeExpressionRole) -> ProgramExpressionRootSite {
-    ProgramExpressionRootSite::Node { node, role }
+// Select an actual node field for an oracle; this is not an expression binding table.
+#[derive(Clone, Copy)]
+enum JoinField {
+    Probe { key: u32 },
+    Build { key: u32 },
+    Residual,
+    Predicate,
+    Project { expression: u32 },
+}
+fn site(node: ProgramNodeId, field: JoinField) -> (ProgramNodeId, JoinField) {
+    (node, field)
+}
+fn reference(program: &LocalProgram, (node, field): (ProgramNodeId, JoinField)) -> ProgramRootRef {
+    match (program.graph().nodes()[node.index()].kind(), field) {
+        (ProgramNodeKind::Join { condition, .. }, JoinField::Probe { key }) => {
+            condition.keys()[key as usize].probe
+        }
+        (ProgramNodeKind::Join { condition, .. }, JoinField::Build { key }) => {
+            condition.keys()[key as usize].build
+        }
+        (ProgramNodeKind::Join { condition, .. }, JoinField::Residual) => {
+            condition.residual_predicate().unwrap()
+        }
+        (ProgramNodeKind::NestedLoopJoin { join_conjunct, .. }, JoinField::Predicate) => {
+            join_conjunct.unwrap()
+        }
+        (ProgramNodeKind::Project { exprs, .. }, JoinField::Project { expression }) => {
+            exprs[expression as usize]
+        }
+        _ => panic!("the selected join field exists"),
+    }
 }
 
-/// Every slot read under `root`, with its checked lexical source.
+/// Read actual per-use ordinals against the exact local input layout selected by the node field.
 fn slot_sources(
     program: &LocalProgram,
-    root: ProgramExpressionRootSite,
+    selector: (ProgramNodeId, JoinField),
 ) -> Vec<(novarocks_types::SlotId, ProgramChannelSite)> {
-    let snapshot = program
-        .checked()
+    let (node, field) = selector;
+    let root_ref = reference(program, selector);
+    let unit = program.unit(root_ref.unit).unwrap();
+    let root = unit.root(root_ref.root).unwrap();
+    let role = match field {
+        JoinField::Probe { .. } => ProgramChannelLayoutRole::JoinLeft,
+        JoinField::Build { .. } => ProgramChannelLayoutRole::JoinRight,
+        JoinField::Residual | JoinField::Predicate => ProgramChannelLayoutRole::JoinScope,
+        JoinField::Project { .. } => ProgramChannelLayoutRole::NodeOutput,
+    };
+    let owner = if let JoinField::Project { .. } = field {
+        let ProgramNodeKind::Project { input, .. } = program.graph().nodes()[node.index()].kind()
+        else {
+            unreachable!()
+        };
+        *input
+    } else {
+        node
+    };
+    let input_layout = program
         .channels()
-        .expressions()
-        .resolved_calls()
-        .snapshot();
-    let flow = &snapshot.flows()[&ProgramExpressionArena::Main];
-    let arena = &snapshot.roots().arenas()[&ProgramExpressionArena::Main];
-    let mut stack = vec![snapshot.bindings()[&root]];
+        .channel_layout(program.graph(), owner, role)
+        .unwrap();
+    let flow = unit.control_flow();
+    let mut stack = vec![root.use_id];
     let mut out = Vec::new();
     while let Some(use_id) = stack.pop() {
         let invocation = &flow.uses()[&use_id];
-        if let StaticExprKind::SlotId(slot) = arena.node(invocation.definition).unwrap().kind() {
-            let ProgramLexicalSource::Input(source) = program.checked().slots()[&ProgramUseRef {
-                arena: ProgramExpressionArena::Main,
-                use_id,
-            }] else {
-                panic!("join slot reads an input channel")
-            };
-            out.push((*slot, source));
+        if matches!(
+            unit.definitions()
+                .node(invocation.definition)
+                .unwrap()
+                .kind(),
+            StaticExprKind::Input
+        ) {
+            let ordinal = unit.input(use_id).unwrap().ordinal;
+            out.push((
+                input_layout.slots()[ordinal as usize],
+                layout(owner, role, ordinal),
+            ));
         }
         stack.extend(invocation.arguments.iter().rev().copied());
     }
@@ -703,38 +741,33 @@ fn inner_join_with_right_build_keeps_orientation_and_publishes_canonical_output(
     // Each key root reads its own side; the residual reads the scope.
     use ProgramChannelLayoutRole as Role;
     assert_eq!(
-        slot_sources(
-            &program,
-            site(join, ProgramNodeExpressionRole::JoinProbeKey { key: 0 })
-        ),
+        slot_sources(&program, site(join, JoinField::Probe { key: 0 })),
         vec![(left_layout.slots()[0], layout(join, Role::JoinLeft, 0))]
     );
     assert_eq!(
-        slot_sources(
-            &program,
-            site(join, ProgramNodeExpressionRole::JoinBuildKey { key: 0 })
-        ),
+        slot_sources(&program, site(join, JoinField::Build { key: 0 })),
         vec![(right_layout.slots()[0], layout(join, Role::JoinRight, 0))]
     );
     assert_eq!(
-        slot_sources(
-            &program,
-            site(join, ProgramNodeExpressionRole::JoinResidual)
-        ),
+        slot_sources(&program, site(join, JoinField::Residual)),
         vec![
             (left_layout.slots()[1], layout(join, Role::JoinScope, 1)),
             (right_layout.slots()[1], layout(join, Role::JoinScope, 3)),
         ]
     );
     // Every join layout role is typed; the residual root is TruthOnly.
-    let channels = program.checked().channels();
+    let channels = program.channels();
     for role in [
         Role::JoinLeft,
         Role::JoinRight,
         Role::JoinScope,
         Role::NodeOutput,
     ] {
-        let width = channels.channel_layout(join, role).unwrap().slots().len();
+        let width = channels
+            .channel_layout(program.graph(), join, role)
+            .unwrap()
+            .slots()
+            .len();
         for ordinal in 0..width {
             assert!(
                 channels
@@ -743,13 +776,12 @@ fn inner_join_with_right_build_keeps_orientation_and_publishes_canonical_output(
             );
         }
     }
-    let snapshot = channels.expressions().resolved_calls().snapshot();
-    let residual_use = snapshot.bindings()[&site(join, ProgramNodeExpressionRole::JoinResidual)];
+    let residual_ref = reference(&program, site(join, JoinField::Residual));
+    let unit = program.unit(residual_ref.unit).unwrap();
+    let residual_use = unit.root(residual_ref.root).unwrap().use_id;
     assert_eq!(
-        snapshot.flows()[&ProgramExpressionArena::Main].uses()[&residual_use]
-            .context
-            .demand,
-        novarocks_type_contract::EvaluationDemand::TruthOnly
+        unit.control_flow().uses()[&residual_use].context.demand,
+        EvaluationDemand::TruthOnly
     );
     assert!(source.residual.is_some() && source.key.is_some());
 }
@@ -787,26 +819,17 @@ fn left_build_right_semi_and_anti_mirror_to_probe_preserving_left_kinds() {
         use ProgramChannelLayoutRole as Role;
         // The physical right key is the probe key, the left key the build key.
         assert_eq!(
-            slot_sources(
-                &program,
-                site(join, ProgramNodeExpressionRole::JoinProbeKey { key: 0 })
-            ),
+            slot_sources(&program, site(join, JoinField::Probe { key: 0 })),
             vec![(left_layout.slots()[0], layout(join, Role::JoinLeft, 0))]
         );
         assert_eq!(
-            slot_sources(
-                &program,
-                site(join, ProgramNodeExpressionRole::JoinBuildKey { key: 0 })
-            ),
+            slot_sources(&program, site(join, JoinField::Build { key: 0 })),
             vec![(right_layout.slots()[0], layout(join, Role::JoinRight, 0))]
         );
         // `left.v < right.w` reads the build side (physical left) after the
         // probe side (physical right) in the scope.
         assert_eq!(
-            slot_sources(
-                &program,
-                site(join, ProgramNodeExpressionRole::JoinResidual)
-            ),
+            slot_sources(&program, site(join, JoinField::Residual)),
             vec![
                 (right_layout.slots()[1], layout(join, Role::JoinScope, 3)),
                 (left_layout.slots()[1], layout(join, Role::JoinScope, 1)),
@@ -868,13 +891,7 @@ fn mirrored_right_outer_permutation_keeps_source_and_nullable_target_ordinals() 
     // Physical [source.w, target.k] maps to canonical [probe.w, extended-build.k].
     for (expression, ordinal) in [(0u32, 1u32), (1, 2)] {
         assert_eq!(
-            slot_sources(
-                &program,
-                site(
-                    root,
-                    ProgramNodeExpressionRole::ProjectOutput { expression }
-                )
-            ),
+            slot_sources(&program, site(root, JoinField::Project { expression })),
             vec![(
                 canonical.slots()[ordinal as usize],
                 layout(join, ProgramChannelLayoutRole::NodeOutput, ordinal)
@@ -903,29 +920,25 @@ fn one_definition_shared_by_key_and_residual_keeps_a_source_per_use() {
     else {
         unreachable!()
     };
-    let arena = program.graph().expressions();
-    let Some(StaticExprKind::Lt(shared, _)) = arena
-        .node(condition.residual_predicate().unwrap())
-        .map(|node| node.kind())
+    let residual = condition.residual_predicate().unwrap();
+    let unit = program.unit(residual.unit).unwrap();
+    let root = unit.root(residual.root).unwrap();
+    let StaticExprKind::Lt(shared, _) = unit.definitions().node(root.definition).unwrap().kind()
     else {
         panic!("the residual is the ordered comparison")
     };
     // One definition, two occurrences with different scopes.
-    assert_eq!(*shared, condition.keys()[0].probe);
+    let probe = condition.keys()[0].probe;
+    assert_eq!(probe.unit, residual.unit);
+    assert_eq!(*shared, unit.root(probe.root).unwrap().definition);
     use ProgramChannelLayoutRole as Role;
     let key = left_layout.slots()[0];
     assert_eq!(
-        slot_sources(
-            &program,
-            site(join, ProgramNodeExpressionRole::JoinProbeKey { key: 0 })
-        ),
+        slot_sources(&program, site(join, JoinField::Probe { key: 0 })),
         vec![(key, layout(join, Role::JoinLeft, 0))]
     );
     assert_eq!(
-        slot_sources(
-            &program,
-            site(join, ProgramNodeExpressionRole::JoinResidual)
-        ),
+        slot_sources(&program, site(join, JoinField::Residual)),
         vec![
             (key, layout(join, Role::JoinScope, 0)),
             (right_layout.slots()[1], layout(join, Role::JoinScope, 3)),
@@ -975,13 +988,7 @@ fn permuted_outer_output_selects_canonical_ordinals_and_null_extensions() {
     // `[NULL-extended right.w, left.k]` reads canonical `[3, 0]`.
     for (expression, canonical_ordinal) in [(0u32, 3u32), (1, 0)] {
         assert_eq!(
-            slot_sources(
-                &program,
-                site(
-                    root,
-                    ProgramNodeExpressionRole::ProjectOutput { expression }
-                )
-            ),
+            slot_sources(&program, site(root, JoinField::Project { expression })),
             vec![(
                 canonical.slots()[canonical_ordinal as usize],
                 layout(
@@ -1055,14 +1062,12 @@ fn nested_loop_kinds_lower_with_scope_predicates_and_singleton_mirroring() {
         assert_eq!(*left, local_of(&program, probe));
         assert_eq!(join_conjunct.is_some(), physical != JoinKind::Cross);
         if physical != JoinKind::Cross {
-            let snapshot = program
-                .checked()
-                .channels()
-                .expressions()
-                .resolved_calls()
-                .snapshot();
-            let root = snapshot.roots().sites()
-                [&site(join, ProgramNodeExpressionRole::NestedLoopPredicate)];
+            let root_ref = reference(&program, site(join, JoinField::Predicate));
+            let root = program
+                .unit(root_ref.unit)
+                .unwrap()
+                .root(root_ref.root)
+                .unwrap();
             assert_eq!(
                 root.demand,
                 if matches!(physical, JoinKind::NullAwareLeftAnti) {
@@ -1071,10 +1076,7 @@ fn nested_loop_kinds_lower_with_scope_predicates_and_singleton_mirroring() {
                     novarocks_type_contract::EvaluationDemand::TruthOnly
                 }
             );
-            let reads = slot_sources(
-                &program,
-                site(join, ProgramNodeExpressionRole::NestedLoopPredicate),
-            );
+            let reads = slot_sources(&program, site(join, JoinField::Predicate));
             assert_eq!(reads.len(), 2);
             for (slot, source) in reads {
                 let ProgramChannelSite::Layout { role, ordinal, .. } = source else {
@@ -1271,18 +1273,17 @@ fn hash_left_mark_lowers_canonical_keys_and_nullable_mark_without_build_output()
         &DataType::Boolean
     );
     assert!(output.schema().fields().last().unwrap().is_nullable());
-    let snapshot = program
-        .checked()
-        .channels()
-        .expressions()
-        .resolved_calls()
-        .snapshot();
-    for role in [
-        ProgramNodeExpressionRole::NaaValueProbeKey { key: 0 },
-        ProgramNodeExpressionRole::NaaValueBuildKey { key: 0 },
-    ] {
+    for role in [JoinField::Probe { key: 0 }, JoinField::Build { key: 0 }] {
         assert_eq!(
-            snapshot.roots().sites()[&site(join, role)].demand,
+            {
+                let root_ref = reference(&program, site(join, role));
+                program
+                    .unit(root_ref.unit)
+                    .unwrap()
+                    .root(root_ref.root)
+                    .unwrap()
+                    .demand
+            },
             novarocks_type_contract::EvaluationDemand::Value
         );
     }

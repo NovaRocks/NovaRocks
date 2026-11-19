@@ -53,6 +53,11 @@ use crate::runtime::task::sink::materialize_compiled_sink_for_pipeline;
 pub struct CompiledWriterBindings {
     writers: BTreeMap<ProgramNodeId, TableWriterRuntimeBinding>,
     finishers: BTreeMap<ProgramNodeId, TableFinishRuntimeBinding>,
+    layouts: BTreeMap<
+        ProgramNodeId,
+        Arc<dyn novarocks_spi::connector::binding::ConnectorPartitionKeyEvaluator>,
+    >,
+    layout_destinations: Box<[usize]>,
 }
 
 impl std::fmt::Debug for CompiledWriterBindings {
@@ -61,6 +66,7 @@ impl std::fmt::Debug for CompiledWriterBindings {
             .debug_struct("CompiledWriterBindings")
             .field("writers", &self.writers.keys().collect::<Vec<_>>())
             .field("finishers", &self.finishers.keys().collect::<Vec<_>>())
+            .field("layouts", &self.layouts.keys().collect::<Vec<_>>())
             .finish()
     }
 }
@@ -104,6 +110,65 @@ impl CompiledWriterBindings {
         Ok(())
     }
 
+    pub fn bind_write_layout(
+        &mut self,
+        node: ProgramNodeId,
+        evaluator: Arc<dyn novarocks_spi::connector::binding::ConnectorPartitionKeyEvaluator>,
+    ) -> crate::runtime::task::ExecutionResult<()> {
+        if self.layouts.insert(node, evaluator).is_some() {
+            return Err(crate::exec::fragment::error::program_binding_failure(
+                FragmentBindingErrorKind::InvalidAssignment,
+                "compiled write layout was bound twice",
+            ));
+        }
+        Ok(())
+    }
+
+    fn bind_layout_destinations(
+        &mut self,
+        assignment: &crate::runtime::task::instance::TaskSinkAssignment,
+    ) {
+        use crate::runtime::task::instance::TaskSinkAssignment;
+        if self.layouts.is_empty() {
+            return;
+        }
+        self.layout_destinations = match assignment {
+            TaskSinkAssignment::None => Box::default(),
+            TaskSinkAssignment::StreamDestinations { destinations, .. } => {
+                Box::new([destinations.len()])
+            }
+            TaskSinkAssignment::DestinationGroups { groups, .. } => {
+                groups.iter().map(Vec::len).collect()
+            }
+        };
+    }
+
+    #[cfg(any(test, novarocks_dev_controls))]
+    pub(crate) fn bind_component_layout(
+        &mut self,
+        node: ProgramNodeId,
+        evaluator: Arc<dyn novarocks_spi::connector::binding::ConnectorPartitionKeyEvaluator>,
+        assignment: &crate::runtime::task::instance::TaskSinkAssignment,
+    ) -> crate::runtime::task::ExecutionResult<()> {
+        self.bind_write_layout(node, evaluator)?;
+        self.bind_layout_destinations(assignment);
+        Ok(())
+    }
+
+    pub(crate) fn layout(
+        &self,
+        node: ProgramNodeId,
+        branch: usize,
+    ) -> Option<(
+        Arc<dyn novarocks_spi::connector::binding::ConnectorPartitionKeyEvaluator>,
+        usize,
+    )> {
+        Some((
+            Arc::clone(self.layouts.get(&node)?),
+            *self.layout_destinations.get(branch)?,
+        ))
+    }
+
     pub fn has_writers(&self) -> bool {
         !self.writers.is_empty()
     }
@@ -118,7 +183,7 @@ impl CompiledWriterBindings {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.writers.is_empty() && self.finishers.is_empty()
+        self.writers.is_empty() && self.finishers.is_empty() && self.layouts.is_empty()
     }
 
     pub(crate) fn writer(&self, node: ProgramNodeId) -> Option<&TableWriterRuntimeBinding> {
@@ -136,6 +201,7 @@ impl CompiledWriterBindings {
     pub fn validate(&self, program: &LocalProgram) -> crate::runtime::task::ExecutionResult<()> {
         let mut writers = BTreeSet::new();
         let mut finishers = BTreeSet::new();
+        let mut layouts = BTreeSet::new();
         for (index, node) in program.graph().nodes().iter().enumerate() {
             match node.kind() {
                 ProgramNodeKind::TableWriter { .. } => {
@@ -143,6 +209,9 @@ impl CompiledWriterBindings {
                 }
                 ProgramNodeKind::TableFinish { .. } => {
                     finishers.insert(ProgramNodeId::new(index));
+                }
+                ProgramNodeKind::WriteLayoutKey { .. } => {
+                    layouts.insert(ProgramNodeId::new(index));
                 }
                 _ => {}
             }
@@ -163,6 +232,12 @@ impl CompiledWriterBindings {
             return Err(crate::exec::fragment::error::program_binding_failure(
                 FragmentBindingErrorKind::InvalidAssignment,
                 "Task finish bindings do not cover exactly the program's table finishes",
+            ));
+        }
+        if layouts != self.layouts.keys().copied().collect() {
+            return Err(crate::exec::fragment::error::program_binding_failure(
+                FragmentBindingErrorKind::InvalidAssignment,
+                "Task write layout bindings do not cover exactly the program's layout nodes",
             ));
         }
         for (id, binding) in &self.finishers {
@@ -395,9 +470,10 @@ fn prepare_compiled_task_in(
         ));
     }
     // The write capabilities move into the one pipeline graph that owns them.
-    let writers = std::mem::take(&mut submission.writers);
+    let mut writers = std::mem::take(&mut submission.writers);
     let program = submission.program();
     let instance = submission.instance();
+    writers.bind_layout_destinations(instance.sink_assignment());
     let query_id = instance.query_id();
     let instance_task_key = instance.task_key().get();
     let pipeline_dop = i32::try_from(instance.pipeline_dop().get()).map_err(|_| {
@@ -434,14 +510,11 @@ fn prepare_compiled_task_in(
         ));
     }
     let mut resources = LocalTaskResources::new(
-        Arc::clone(&context.commit_port),
         Arc::clone(&context.exchange_receiver_port),
         context.cleanup_faults(),
     );
     resources.hold_query_task(context.query_task.take());
     let prepare_result = (|| {
-        resources.acquire_sink_commit(instance_task_key)?;
-        context.fail_if_injected(PrepareFailurePoint::AfterSinkCommit)?;
         let mut result_spec = context.result_spec.clone().unwrap_or_else(|| {
             ResultWriteSpec::new(
                 instance_task_key,

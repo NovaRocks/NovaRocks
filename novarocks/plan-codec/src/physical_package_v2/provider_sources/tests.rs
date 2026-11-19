@@ -198,15 +198,10 @@ pub(in crate::physical_package_v2) fn checked_read(metadata: bool) -> p::Fragmen
                     },
                 },
             )]),
-            expressions: p::ExprArena::try_from_definitions_observed(
-                std::iter::empty(),
-                &p::PlanLimits::FROZEN,
-                &Setup,
-            )
-            .unwrap(),
             nodes: BTreeMap::from([(
                 scan,
                 p::PhysicalNode {
+                    expressions: None,
                     id: scan,
                     inputs: Box::default(),
                     required_inputs: Box::default(),
@@ -365,19 +360,10 @@ pub(in crate::physical_package_v2) fn checked_read(metadata: bool) -> p::Fragmen
     )
     .unwrap();
     let frozen = c::FrozenConnectorRead::try_new(scan_owner, public).unwrap();
-    let flow = ExpressionControlFlow::try_new(
-        vec![],
-        vec![],
-        fragment.expressions(),
-        CompilePhase::Validate,
-        &Setup,
-    )
-    .unwrap();
-    let uses = p::PhysicalRootUses::try_new(&fragment, flow, vec![], &Setup).unwrap();
-    let calls = p::FrozenFragmentCalls::try_new(&fragment, &uses, vec![], &Setup).unwrap();
     let pruning = p::FrozenFragmentPruning::try_new(fragment.id(), vec![], &Setup).unwrap();
     p::FragmentPackage::try_new(
         p::FragmentPackageInput {
+            statement_constant_policy: crate::test_constants::policy(),
             constants: p::ConstantPools::empty(),
             version: p::PlanVersionId::try_new([7; 16]).unwrap(),
             required: p::RequiredContracts {
@@ -391,13 +377,12 @@ pub(in crate::physical_package_v2) fn checked_read(metadata: bool) -> p::Fragmen
                 runtime_filter_bindings: Box::default(),
             },
             result: None,
-            expression_uses: uses,
-            calls,
             pruning,
             parameters: SemanticParameters::try_new([]).unwrap(),
             scans: BTreeMap::from([(scan, frozen)]),
             writes: BTreeMap::new(),
             annotations: Box::default(),
+            layouts: Default::default(),
         },
         admission(),
         &Setup,

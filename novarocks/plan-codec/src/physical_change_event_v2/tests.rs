@@ -25,8 +25,8 @@ use crate::{
         ConnectorPayloadProjectionLimits, decode_connector_payloads, encode_connector_payloads,
     },
     physical_expression_v2::{
-        ExpressionProjectionLimits, ExpressionTypeIds, decode_expression_definitions,
-        encode_expression_definitions,
+        ExpressionDefinitionSource, ExpressionProjectionLimits, ExpressionTypeIds,
+        decode_expression_definitions, encode_expression_definitions,
     },
     physical_properties_v2::PhysicalPropertyProjectionLimits,
     physical_type_v2::{TypeProjectionLimits, decode_type_table, encode_type_table_sources},
@@ -38,6 +38,7 @@ use arrow::{
     datatypes::{DataType, Field},
 };
 use novarocks_constant_contract::{ConstantPolicy, ConstantPool};
+use novarocks_expression_contract::{ExprId, RootOrdinal};
 use novarocks_proto_models::physical_control_v2::Empty;
 use novarocks_type_contract::{
     CompileControlError, FunctionValueType, PureCompileControl, SemanticParameters,
@@ -193,10 +194,47 @@ fn reference(pool: u32, ordinal: u32) -> p::ConstantReference {
         ordinal,
     }
 }
+
+fn unit_from_sources(
+    nodes: impl IntoIterator<Item = novarocks_expression_contract::ExprNode>,
+    values: &[p::ValueDef],
+    control: &dyn PureCompileControl,
+) -> novarocks_expression_contract::BoundExprSet {
+    use novarocks_expression_contract::{BoundExprSetBuilder, ExprPort, RootScope, UnitLimits};
+    use novarocks_type_contract::{CompileCheckpoints, EvaluationDemand};
+    let mut builder = BoundExprSetBuilder::new(UnitLimits {
+        expression_semantic_depth: p::PlanLimits::FROZEN.expression_semantic_depth,
+    });
+    for node in nodes {
+        let demand = if *node.ty.data_type() == DataType::Boolean {
+            EvaluationDemand::TruthOnly
+        } else {
+            EvaluationDemand::Value
+        };
+        let id = builder.add(node.lambda_scope, node.ty, node.kind).unwrap();
+        assert_eq!(id, node.id);
+        builder.root(id, demand, RootScope::Port(0)).unwrap();
+    }
+    let ports = vec![ExprPort {
+        values: values
+            .iter()
+            .map(|value| (value.id, value.ty.clone()))
+            .collect(),
+    }];
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate).unwrap();
+    let unit = builder
+        .seal(ports, &mut work)
+        .unwrap()
+        .finish(std::collections::BTreeMap::new(), &mut work)
+        .unwrap();
+    work.finish().unwrap();
+    unit
+}
+
 struct Fixture {
     roots: Vec<(u32, FunctionValueType)>,
     definitions: Vec<p::ValueDef>,
-    arena: p::ExprArena,
+    unit: novarocks_expression_contract::BoundExprSet,
     parameters: SemanticParameters,
     pools: p::ConstantPools,
 }
@@ -205,7 +243,7 @@ impl Fixture {
         let value_type = FunctionValueType::new(DataType::Int64, true);
         let effect_type = FunctionValueType::new(DataType::Int8, false);
         let predicate_type = FunctionValueType::new(DataType::Boolean, false);
-        let definitions = [0, 7, u32::MAX]
+        let definitions: Vec<p::ValueDef> = [0, 7, u32::MAX]
             .into_iter()
             .map(|id| p::ValueDef {
                 id: p::ValueId::new(id),
@@ -246,38 +284,30 @@ impl Fixture {
             )
             .unwrap();
         let nodes = [
-            p::ExprNode {
-                id: p::ExprId::new(0),
-                owner: p::NodeId::new(u32::MAX),
+            novarocks_expression_contract::ExprNode {
+                id: ExprId::new(0),
                 lambda_scope: None,
                 ty: value_type.clone(),
-                kind: p::ExprKind::Constant(reference(u32::MAX, 1)),
+                kind: novarocks_expression_contract::ExprKind::Constant(reference(u32::MAX, 1)),
             },
-            p::ExprNode {
-                id: p::ExprId::new(7),
-                owner: p::NodeId::new(u32::MAX),
+            novarocks_expression_contract::ExprNode {
+                id: ExprId::new(1),
                 lambda_scope: None,
                 ty: value_type.clone(),
-                kind: p::ExprKind::Value(p::ValueId::new(0)),
+                kind: novarocks_expression_contract::ExprKind::Value(p::ValueId::new(0)),
             },
-            p::ExprNode {
-                id: p::ExprId::new(u32::MAX),
-                owner: p::NodeId::new(u32::MAX),
+            novarocks_expression_contract::ExprNode {
+                id: ExprId::new(2),
                 lambda_scope: None,
                 ty: predicate_type.clone(),
-                kind: p::ExprKind::Constant(reference(7, 1)),
+                kind: novarocks_expression_contract::ExprKind::Constant(reference(7, 1)),
             },
         ];
-        let arena = p::ExprArena::try_from_definitions_observed(
-            nodes.into_iter(),
-            &p::PlanLimits::default(),
-            &Control::default(),
-        )
-        .unwrap();
+        let unit = unit_from_sources(nodes, &definitions, &Control::default());
         Self {
             roots: vec![(0, value_type), (1, effect_type), (2, predicate_type)],
             definitions,
-            arena,
+            unit,
             parameters: SemanticParameters::try_new([]).unwrap(),
             pools,
         }
@@ -384,18 +414,18 @@ impl Fixture {
         )
         .unwrap();
         let inputs = self
-            .arena
+            .unit
+            .definitions()
             .iter()
-            .map(|(id, _)| ExpressionTypeIds {
-                expr: *id,
-                value_type_id: if id.get() == u32::MAX { 2 } else { 0 },
+            .map(|node| ExpressionTypeIds {
+                expr: node.id,
+                value_type_id: if node.id.get() == 2 { 2 } else { 0 },
                 lambda_parameter_type_ids: &[],
                 function_binding_id: None,
-                aggregate_binding_id: None,
             })
             .collect::<Vec<_>>();
         let expressions = encode_expression_definitions(
-            &self.arena,
+            Some(ExpressionDefinitionSource::from_unit(&self.unit)),
             &inputs,
             &types,
             &functions,
@@ -407,8 +437,10 @@ impl Fixture {
             control,
         )
         .unwrap();
+        let wire_roots = crate::test_constants::wire_roots(&self.unit);
         let read = decode_expression_definitions(
             expressions.as_wire(),
+            &wire_roots,
             &read_values,
             &functions_read,
             &aggregates_read,
@@ -430,6 +462,7 @@ fn property() -> p::PhysicalProperties {
 }
 fn source() -> p::PhysicalNode {
     p::PhysicalNode {
+        expressions: None,
         id: p::NodeId::new(u32::MAX),
         inputs: Box::from([p::NodeId::new(0)]),
         required_inputs: Box::from([p::PhysicalProperties {
@@ -453,7 +486,7 @@ fn source() -> p::PhysicalNode {
                     assignments: Box::from([
                         novarocks_physical_plan::ChangeAssignment::exact(
                             p::ValueId::new(0),
-                            Some(p::ExprId::new(0)),
+                            Some(RootOrdinal::new(0)),
                         ),
                         novarocks_physical_plan::ChangeAssignment::exact(
                             p::ValueId::new(u32::MAX),
@@ -462,30 +495,30 @@ fn source() -> p::PhysicalNode {
                     ]),
                 },
                 p::ChangeEventSpec {
-                    predicate: Some(p::ExprId::new(u32::MAX)),
+                    predicate: Some(RootOrdinal::new(2)),
                     effect: ConnectorRowMutationEffect::Replace,
                     assignments: Box::from([
                         novarocks_physical_plan::ChangeAssignment::exact(
                             p::ValueId::new(0),
-                            Some(p::ExprId::new(7)),
+                            Some(RootOrdinal::new(1)),
                         ),
                         novarocks_physical_plan::ChangeAssignment::exact(
                             p::ValueId::new(u32::MAX),
-                            Some(p::ExprId::new(0)),
+                            Some(RootOrdinal::new(0)),
                         ),
                     ]),
                 },
                 p::ChangeEventSpec {
-                    predicate: Some(p::ExprId::new(u32::MAX)),
+                    predicate: Some(RootOrdinal::new(2)),
                     effect: ConnectorRowMutationEffect::Insert,
                     assignments: Box::from([
                         novarocks_physical_plan::ChangeAssignment::exact(
                             p::ValueId::new(u32::MAX),
-                            Some(p::ExprId::new(7)),
+                            Some(RootOrdinal::new(1)),
                         ),
                         novarocks_physical_plan::ChangeAssignment::exact(
                             p::ValueId::new(0),
-                            Some(p::ExprId::new(0)),
+                            Some(RootOrdinal::new(0)),
                         ),
                     ]),
                 },
@@ -509,6 +542,7 @@ fn wire_property(unconstrained: bool) -> wire::PhysicalProperties {
 }
 fn expected() -> wire::PhysicalNode {
     wire::PhysicalNode {
+        expressions: None,
         id: u32::MAX,
         input_node_ids: vec![0],
         required_inputs: vec![wire_property(true)],
@@ -522,54 +556,54 @@ fn expected() -> wire::PhysicalNode {
                 effect_output_value_id: Some(7),
                 events: vec![
                     wire::ChangeEvent {
-                        predicate_expr_id: None,
+                        predicate_root: None,
                         effect: wire::RowMutationEffect::Delete as i32,
                         assignments: vec![
                             wire::ChangeAssignment {
                                 value_id: Some(0),
-                                expr_id: Some(0),
+                                root_ordinal: Some(0),
                                 write_input_value_type_id: None,
                                 storage_value_type_id: None,
                             },
                             wire::ChangeAssignment {
                                 value_id: Some(u32::MAX),
-                                expr_id: None,
+                                root_ordinal: None,
                                 write_input_value_type_id: None,
                                 storage_value_type_id: None,
                             },
                         ],
                     },
                     wire::ChangeEvent {
-                        predicate_expr_id: Some(u32::MAX),
+                        predicate_root: Some(2),
                         effect: wire::RowMutationEffect::Replace as i32,
                         assignments: vec![
                             wire::ChangeAssignment {
                                 value_id: Some(0),
-                                expr_id: Some(7),
+                                root_ordinal: Some(1),
                                 write_input_value_type_id: None,
                                 storage_value_type_id: None,
                             },
                             wire::ChangeAssignment {
                                 value_id: Some(u32::MAX),
-                                expr_id: Some(0),
+                                root_ordinal: Some(0),
                                 write_input_value_type_id: None,
                                 storage_value_type_id: None,
                             },
                         ],
                     },
                     wire::ChangeEvent {
-                        predicate_expr_id: Some(u32::MAX),
+                        predicate_root: Some(2),
                         effect: wire::RowMutationEffect::Insert as i32,
                         assignments: vec![
                             wire::ChangeAssignment {
                                 value_id: Some(u32::MAX),
-                                expr_id: Some(7),
+                                root_ordinal: Some(1),
                                 write_input_value_type_id: None,
                                 storage_value_type_id: None,
                             },
                             wire::ChangeAssignment {
                                 value_id: Some(0),
-                                expr_id: Some(0),
+                                root_ordinal: Some(0),
                                 write_input_value_type_id: None,
                                 storage_value_type_id: None,
                             },
@@ -616,7 +650,7 @@ fn change_event_complete_independent_dto_preserves_three_effects_sparse_ids_and_
         let mut node = source();
         events(&mut node)[0].assignments = Box::from([
             p::ChangeAssignment::exact(p::ValueId::new(0), None),
-            p::ChangeAssignment::exact(p::ValueId::new(0), Some(p::ExprId::new(0))),
+            p::ChangeAssignment::exact(p::ValueId::new(0), Some(RootOrdinal::new(0))),
         ]);
         c.arm(None);
         let wire = encode_change_event_node(&node, values, expressions, SOURCE, limits())
@@ -633,13 +667,13 @@ fn change_event_complete_independent_dto_preserves_three_effects_sparse_ids_and_
             &[
                 wire::ChangeAssignment {
                     value_id: Some(0),
-                    expr_id: None,
+                    root_ordinal: None,
                     write_input_value_type_id: None,
                     storage_value_type_id: None
                 },
                 wire::ChangeAssignment {
                     value_id: Some(0),
-                    expr_id: Some(0),
+                    root_ordinal: Some(0),
                     write_input_value_type_id: None,
                     storage_value_type_id: None
                 }
@@ -859,8 +893,8 @@ fn change_event_unknown_effect_missing_payload_and_absent_references_fail() {
                 7 => wire_events(&mut node).events[0].effect = i32::MAX,
                 8 => wire_events(&mut node).events[0].assignments[0].value_id = None,
                 9 => wire_events(&mut node).events[0].assignments[0].value_id = Some(99),
-                10 => wire_events(&mut node).events[0].predicate_expr_id = Some(99),
-                11 => wire_events(&mut node).events[0].assignments[0].expr_id = Some(99),
+                10 => wire_events(&mut node).events[0].predicate_root = Some(99),
+                11 => wire_events(&mut node).events[0].assignments[0].root_ordinal = Some(99),
                 _ => unreachable!(),
             }
             c.arm(None);
@@ -883,8 +917,8 @@ fn change_event_unknown_effect_missing_payload_and_absent_references_fail() {
                     }
                 }
                 2 => events(&mut node)[0].assignments[0].output = p::ValueId::new(99),
-                3 => events(&mut node)[0].predicate = Some(p::ExprId::new(99)),
-                4 => events(&mut node)[0].assignments[0].expression = Some(p::ExprId::new(99)),
+                3 => events(&mut node)[0].predicate = Some(RootOrdinal::new(99)),
+                4 => events(&mut node)[0].assignments[0].expression = Some(RootOrdinal::new(99)),
                 _ => unreachable!(),
             }
             c.arm(None);
@@ -932,7 +966,7 @@ fn change_event_inner_capacity_and_initial_work_are_admitted_before_visiting_ass
         wire_events(&mut wire).events[0].assignments = vec![
             wire::ChangeAssignment {
                 value_id: Some(0),
-                expr_id: None,
+                root_ordinal: None,
                 write_input_value_type_id: None,
                 storage_value_type_id: None
             };
@@ -954,11 +988,11 @@ fn change_event_inner_capacity_and_initial_work_are_admitted_before_visiting_ass
 fn small_source() -> p::PhysicalNode {
     let mut node = source();
     *events(&mut node) = Box::from([p::ChangeEventSpec {
-        predicate: Some(p::ExprId::new(u32::MAX)),
+        predicate: Some(RootOrdinal::new(2)),
         effect: ConnectorRowMutationEffect::Insert,
         assignments: Box::from([novarocks_physical_plan::ChangeAssignment::exact(
             p::ValueId::new(0),
-            Some(p::ExprId::new(0)),
+            Some(RootOrdinal::new(0)),
         )]),
     }]);
     node
@@ -966,11 +1000,11 @@ fn small_source() -> p::PhysicalNode {
 fn small_wire() -> wire::PhysicalNode {
     let mut node = expected();
     wire_events(&mut node).events = vec![wire::ChangeEvent {
-        predicate_expr_id: Some(u32::MAX),
+        predicate_root: Some(2),
         effect: wire::RowMutationEffect::Insert as i32,
         assignments: vec![wire::ChangeAssignment {
             value_id: Some(0),
-            expr_id: Some(0),
+            root_ordinal: Some(0),
             write_input_value_type_id: None,
             storage_value_type_id: None,
         }],

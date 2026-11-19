@@ -59,9 +59,12 @@ if mode=='fail':
 if mode=='incomplete':
     print('running 1 test\ntest actual_model ... ok')
     sys.exit(0)
-count=0 if mode=='empty' else 2
+families=['coalescing_input','concurrency','continuation','exit_custody','failure_publication','read_resource']
+if mode=='missing-family': families=families[:-1]
+if mode=='empty': families=[]
+count=len(families)
 print(f'running {count} tests')
-for number in range(count): print(f'test model_{number} ... ok')
+for family in families: print(f'test {family}::model ... ok')
 print(f'test result: ok. {count} passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s')
 ''')
         self.cargo.chmod(0o755)
@@ -88,8 +91,13 @@ print(f'test result: ok. {count} passed; 0 failed; 0 ignored; 0 measured; 0 filt
         evidence = self.evidence()
         self.assertTrue(evidence['complete'])
         self.assertTrue(evidence['sources_stable'])
-        targets = ['concurrency_loom', 'continuation_loom', 'exit_custody_loom', 'failure_publication_loom', 'read_resource_loom', 'coalescing_input_loom']
+        targets = ['loom']
         self.assertEqual([item['target'] for item in evidence['targets']], targets)
+        self.assertEqual(evidence['expected_targets'], targets)
+        self.assertEqual(evidence['targets'][0]['families'],
+                         {family: 1 for family in ('coalescing_input', 'concurrency', 'continuation',
+                                                  'exit_custody', 'failure_publication', 'read_resource')})
+        self.assertEqual(evidence['targets'][0]['missing_families'], [])
         commands = [json.loads(line) for line in (self.root / 'commands.jsonl').read_text().splitlines()]
         self.assertEqual(len(commands), len(targets))
         for target, command in zip(targets, commands):
@@ -108,7 +116,7 @@ print(f'test result: ok. {count} passed; 0 failed; 0 ignored; 0 measured; 0 filt
                 self.assertTrue((directory / 'stderr.log').is_file())
         sources = json.loads((self.root / 'evidence/sources-start.json').read_text())
         self.assertIn('novarocks/control-runtime/src/continuation.rs', sources)
-        self.assertIn('novarocks/control-runtime/tests/continuation_loom.rs', sources)
+        self.assertIn('novarocks/control-runtime/tests/loom/continuation.rs', sources)
         self.assertIn('novarocks/control-runtime-core/src/scope.rs', sources)
 
     def test_zero_model_and_truncated_run_are_not_passes(self):
@@ -121,7 +129,26 @@ print(f'test result: ok. {count} passed; 0 failed; 0 ignored; 0 measured; 0 filt
                 self.assertEqual(len(evidence['targets']), 1)
                 self.assertEqual(evidence['targets'][0]['exit'], 0, 'keep the real Cargo exit distinct from completeness')
 
-    def test_real_cargo_failure_is_preserved_and_later_targets_are_not_started(self):
+    def test_missing_model_family_is_incomplete_and_keeps_the_original_run(self):
+        result = self.invoke('missing-family')
+        self.assertEqual(result.returncode, 1, result.stderr)
+        evidence = self.evidence()
+        self.assertFalse(evidence['complete'])
+        self.assertEqual(len(evidence['targets']), 1)
+        target = evidence['targets'][0]
+        self.assertEqual(target['target'], 'loom')
+        self.assertEqual(target['exit'], 0, 'Cargo success does not prove every model family ran')
+        self.assertFalse(target['complete'])
+        self.assertEqual(target['passed'], 5)
+        self.assertEqual(target['missing_families'], ['read_resource'])
+        self.assertNotIn('read_resource', target['families'])
+        self.assertIn('read_resource', result.stderr)
+        directory = self.root / 'evidence/loom'
+        self.assertEqual(json.loads((directory / 'exit.json').read_text())['code'], 0)
+        self.assertIn('test result: ok. 5 passed;', (directory / 'stdout.log').read_text())
+        self.assertIn('test concurrency::model ... ok', (directory / 'stdout.log').read_text())
+
+    def test_real_cargo_failure_is_preserved(self):
         result = self.invoke('fail')
         self.assertEqual(result.returncode, 23, result.stderr)
         evidence = self.evidence()
@@ -129,7 +156,7 @@ print(f'test result: ok. {count} passed; 0 failed; 0 ignored; 0 measured; 0 filt
         self.assertFalse(evidence['complete'])
         self.assertEqual(evidence['targets'][0]['exit'], 23)
         self.assertEqual(len(evidence['targets']), 1)
-        self.assertIn('actual_model ... FAILED', (self.root / 'evidence/concurrency_loom/stdout.log').read_text())
+        self.assertIn('actual_model ... FAILED', (self.root / 'evidence/loom/stdout.log').read_text())
 
     def test_reusing_output_refuses_to_overwrite_original_attempt(self):
         self.assertEqual(self.invoke().returncode, 0)
@@ -137,7 +164,7 @@ print(f'test result: ok. {count} passed; 0 failed; 0 ignored; 0 measured; 0 filt
         repeated = self.invoke()
         self.assertNotEqual(repeated.returncode, 0)
         self.assertEqual((self.root / 'evidence/result.json').read_bytes(), previous)
-        self.assertEqual(len((self.root / 'commands.jsonl').read_text().splitlines()), 6)
+        self.assertEqual(len((self.root / 'commands.jsonl').read_text().splitlines()), 1)
 
     def test_encoded_flags_and_external_loom_early_stop_cannot_hide_configuration(self):
         result = self.invoke(environment={'CARGO_ENCODED_RUSTFLAGS': '--cfg\x1fnot_loom'})

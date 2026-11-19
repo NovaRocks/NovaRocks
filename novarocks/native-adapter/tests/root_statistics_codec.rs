@@ -27,9 +27,7 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use novarocks_native_adapter::root_statistics_codec::*;
-use novarocks_spi::connector::{
-    MAX_CONNECTOR_STATISTICS_ARTIFACT_BODY_BYTES, MAX_CONNECTOR_STATISTICS_RESULT_BODY_BYTES,
-};
+use novarocks_spi::connector::MAX_CONNECTOR_STATISTICS_ARTIFACT_BODY_BYTES;
 
 thread_local! {
     static TRACK: Cell<bool> = const { Cell::new(false) };
@@ -409,44 +407,10 @@ fn adversarial_duplicate_probes_obey_work_quantum_before_any_emission() {
 }
 
 #[test]
-fn cumulative_rows_body_and_metadata_are_checked_before_row_emission() {
-    for (totals, expected) in [
-        (
-            StatisticsCodecTotals {
-                rows: 4096,
-                ..Default::default()
-            },
-            StatisticsCodecError::RowLimit,
-        ),
-        (
-            StatisticsCodecTotals {
-                body_bytes: MAX_CONNECTOR_STATISTICS_RESULT_BODY_BYTES,
-                ..Default::default()
-            },
-            StatisticsCodecError::BodyLimit,
-        ),
-        (
-            StatisticsCodecTotals {
-                metadata_bytes: STATISTICS_METADATA_BYTES,
-                ..Default::default()
-            },
-            StatisticsCodecError::MetadataLimit,
-        ),
-    ] {
-        let input = one(&[7], "x", Some(b"a"));
-        let result = no_allocation(|| StatisticsArtifactEncoder::try_new(input, totals));
-        if expected == StatisticsCodecError::RowLimit {
-            assert!(matches!(result, Err(StatisticsCodecError::RowLimit)));
-        } else {
-            let mut encoder = result.unwrap();
-            let mut output = [0xab; 64];
-            assert_eq!(no_allocation(|| encoder.step(&mut output)), Err(expected));
-            assert_eq!(output, [0xab; 64]);
-        }
-    }
+fn only_cumulative_metadata_limits_artifact_emission() {
     let prior = StatisticsCodecTotals {
-        rows: 4095,
-        body_bytes: MAX_CONNECTOR_STATISTICS_RESULT_BODY_BYTES - 1,
+        rows: 4096,
+        body_bytes: 128 * 1024 * 1024,
         metadata_bytes: STATISTICS_METADATA_BYTES - 29,
     };
     let input = one(&[7], "x", Some(b"a"));
@@ -457,16 +421,20 @@ fn cumulative_rows_body_and_metadata_are_checked_before_row_emission() {
     assert_eq!(
         encoder.totals(),
         StatisticsCodecTotals {
-            rows: 4096,
-            body_bytes: MAX_CONNECTOR_STATISTICS_RESULT_BODY_BYTES,
+            rows: prior.rows + 1,
+            body_bytes: prior.body_bytes + 1,
             metadata_bytes: STATISTICS_METADATA_BYTES
         }
     );
     let next = one(&[7], "x", Some(b""));
-    assert!(matches!(
-        no_allocation(|| StatisticsArtifactEncoder::try_new(next, encoder.totals())),
-        Err(StatisticsCodecError::RowLimit)
-    ));
+    let mut encoder =
+        no_allocation(|| StatisticsArtifactEncoder::try_new(next, encoder.totals())).unwrap();
+    let mut output = [0xab; 64];
+    assert_eq!(
+        no_allocation(|| encoder.step(&mut output)),
+        Err(StatisticsCodecError::MetadataLimit)
+    );
+    assert_eq!(output, [0xab; 64]);
 }
 
 #[test]
@@ -536,8 +504,9 @@ fn exact_schema_order_names_and_nested_nullability_are_required() {
 }
 
 #[test]
-fn full_4096_row_input_fits_and_4097_is_rejected_before_data_walk() {
-    let rows = (0..4096)
+fn an_input_batch_with_more_than_4096_artifacts_is_emitted() {
+    let count = 4097;
+    let rows = (0..count)
         .map(|_| Row {
             fields: &[7],
             blob: "x",
@@ -546,25 +515,9 @@ fn full_4096_row_input_fits_and_4097_is_rejected_before_data_walk() {
         })
         .collect::<Vec<_>>();
     let (bytes, totals, turns) = encode(batch(&rows), 64 * 1024);
-    assert_eq!(bytes.len(), 4096 * 29);
-    assert_eq!(totals.rows, 4096);
+    assert_eq!(bytes.len(), count * 29);
+    assert_eq!(totals.rows, count);
     assert!(turns > 1);
-    let rows = (0..4097)
-        .map(|_| Row {
-            fields: &[7],
-            blob: "x",
-            body: Some(b""),
-            properties: &[],
-        })
-        .collect::<Vec<_>>();
-    let input = batch(&rows);
-    assert!(matches!(
-        no_allocation(|| StatisticsArtifactEncoder::try_new(
-            input,
-            StatisticsCodecTotals::default()
-        )),
-        Err(StatisticsCodecError::RowLimit)
-    ));
 }
 
 #[test]

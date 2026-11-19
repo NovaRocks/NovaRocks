@@ -108,7 +108,7 @@ fn full_prefixes(mut invoke: impl FnMut(&Control) -> Result<(), Error>) {
 }
 
 #[test]
-fn payload_namespace_complete_six_categories_have_independent_wire_and_typed_receiving_oracles() {
+fn payload_namespace_categories_have_independent_wire_and_typed_receiving_oracles() {
     let categories = [
         ConnectorCodecCategory::ReadTable,
         ConnectorCodecCategory::ReadView,
@@ -116,12 +116,13 @@ fn payload_namespace_complete_six_categories_have_independent_wire_and_typed_rec
         ConnectorCodecCategory::ReadSplit,
         ConnectorCodecCategory::WriteHandle,
         ConnectorCodecCategory::CommitFragment,
+        ConnectorCodecCategory::WriteLayout,
     ];
     let values: Vec<_> = categories
         .into_iter()
         .map(|c| payload(c, &[0, 255, 9]))
         .collect();
-    let ids = [u32::MAX, 0, 17, 9, 42, 3];
+    let ids = [u32::MAX, 0, 17, 9, 42, 3, 56];
     let inputs: Vec<_> = ids.into_iter().zip(values.iter()).collect();
     let control = Control::default();
     let encoded = encode_connector_payloads(&inputs, SOURCE, limits(), &control).unwrap();
@@ -205,7 +206,7 @@ fn payload_namespace_receiving_uses_sole_identity_grammar_and_rejects_required_h
         .unwrap()
         .catalog = None;
     invalids.push(value);
-    for category in [0, -1, 7, i32::MAX] {
+    for category in [0, -1, 8, i32::MAX] {
         invalids.push(expected(0, category, &[]));
     }
     let mut value = expected(0, 1, &[]);

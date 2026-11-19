@@ -29,7 +29,7 @@ use crate::{
 use arrow_buffer::{Buffer, OffsetBuffer};
 use novarocks_type_contract::{
     CallProofScope, CompileControlError, CompilePhase, DecimalOverflowPolicy, EvaluationDemand,
-    EvaluationDomainId, ExpressionEffectContext, ExpressionUseId, FunctionInstanceState,
+    EvaluationRegionId, ExpressionEffectContext, ExpressionUseId, FunctionInstanceState,
     FunctionNullBehavior, FunctionVolatility, PureCompileControl, SemanticParameters,
 };
 use std::{sync::Mutex, time::Duration};
@@ -546,7 +546,7 @@ fn string_locate_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_stal
             assert_eq!(selected.result_type, FunctionResultType::Scalar(target()));
             let context = ExpressionEffectContext {
                 use_id: ExpressionUseId::new(41),
-                domain: EvaluationDomainId::new(7),
+                region: EvaluationRegionId::new(7),
                 demand: EvaluationDemand::Value,
             };
             let uses: Vec<_> = (0..arity)
@@ -554,7 +554,7 @@ fn string_locate_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_stal
                 .collect();
             let params = SemanticParameters::try_new([]).unwrap();
             let input = crate::CallEffectInput {
-                context,
+                context: context.into(),
                 argument_uses: crate::CallArgumentUses::SelectedChannels(&uses),
                 function_id: owner.binding_declaration().function_id(),
                 kind: crate::FunctionKind::Scalar,
@@ -563,7 +563,7 @@ fn string_locate_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_stal
                 environment: &[],
                 parameters: &params,
                 decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-                proof_scope: CallProofScope::Domain(context.domain),
+                proof_scope: CallProofScope::Region(context.region),
             };
             let fresh = specialize_scalar(
                 &owner,
@@ -713,7 +713,11 @@ fn string_locate_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_stal
                     .is_err()
             );
             stale = input;
-            stale.context.use_id = ExpressionUseId::new(999);
+            stale.context = novarocks_type_contract::ExpressionEffectContext {
+                use_id: ExpressionUseId::new(999),
+                ..stale.context.expression().unwrap()
+            }
+            .into();
             assert!(
                 owner
                     .prepare_scalar(stale, canonical, crate::binding_test_control())
@@ -835,7 +839,7 @@ fn string_locate_constant_null_prepares_and_empty_invocation_does_not_search() {
     );
     let context = ExpressionEffectContext {
         use_id: ExpressionUseId::new(41),
-        domain: EvaluationDomainId::new(7),
+        region: EvaluationRegionId::new(7),
         demand: EvaluationDemand::Value,
     };
     let uses = [
@@ -844,7 +848,7 @@ fn string_locate_constant_null_prepares_and_empty_invocation_does_not_search() {
     ];
     let params = SemanticParameters::try_new([]).unwrap();
     let input = crate::CallEffectInput {
-        context,
+        context: context.into(),
         argument_uses: crate::CallArgumentUses::SelectedChannels(&uses),
         function_id: owner.binding_declaration().function_id(),
         kind: crate::FunctionKind::Scalar,
@@ -934,11 +938,11 @@ impl LocateCompileFixture {
     fn input(&self) -> crate::CallEffectInput<'_> {
         let context = ExpressionEffectContext {
             use_id: ExpressionUseId::new(41),
-            domain: EvaluationDomainId::new(7),
+            region: EvaluationRegionId::new(7),
             demand: EvaluationDemand::Value,
         };
         crate::CallEffectInput {
-            context,
+            context: context.into(),
             argument_uses: crate::CallArgumentUses::SelectedChannels(&self.uses),
             function_id: self.owner.binding_declaration().function_id(),
             kind: crate::FunctionKind::Scalar,
@@ -951,7 +955,7 @@ impl LocateCompileFixture {
             environment: &[],
             parameters: &self.parameters,
             decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
-            proof_scope: CallProofScope::Domain(context.domain),
+            proof_scope: CallProofScope::Region(context.region),
         }
     }
     fn canonical(&self) -> Arc<crate::ScalarCallContract> {
@@ -960,7 +964,7 @@ impl LocateCompileFixture {
             &self.owner,
             input,
             self.selected.clone(),
-            ScopedExpressionEffects::pure_value(input.context),
+            ScopedExpressionEffects::pure_value(input.context.expression().unwrap()),
             crate::binding_test_control(),
         )
         .unwrap();
@@ -992,7 +996,7 @@ fn string_locate_actual_refiner_keeps_identity_and_scope_refusals_before_late_co
             let mut wrong = fixture.input();
             match field {
                 0 => wrong.function_id = &foreign,
-                1 => wrong.proof_scope = CallProofScope::Domain(EvaluationDomainId::new(99)),
+                1 => wrong.proof_scope = CallProofScope::Region(EvaluationRegionId::new(99)),
                 _ => wrong.environment = &environment,
             }
             let before = Arc::strong_count(&fixture.selected);
@@ -1060,7 +1064,13 @@ fn string_locate_actual_prepare_keeps_stale_contract_refusal_and_releases_origin
             let mut wrong = fixture.input();
             match field {
                 0 => wrong.function_id = &foreign,
-                1 => wrong.context.use_id = ExpressionUseId::new(999),
+                1 => {
+                    wrong.context = novarocks_type_contract::ExpressionEffectContext {
+                        use_id: ExpressionUseId::new(999),
+                        ..wrong.context.expression().unwrap()
+                    }
+                    .into()
+                }
                 2 => wrong.selected = &copied_selected,
                 3 => wrong.decimal_overflow_policy = DecimalOverflowPolicy::OutputNull,
                 _ => wrong.proof_scope = CallProofScope::Unconditional,

@@ -11,6 +11,8 @@ workspace = true
 doctest = false
 
 [dependencies]
+novarocks-expression-contract.workspace = true
+novarocks-expression.workspace = true
 novarocks-connector-contract.workspace = true
 roaring.workspace = true
 novarocks-arrow-batch-codec.workspace = true
@@ -53,7 +55,6 @@ tracing.workspace = true
 [dev-dependencies]
 novarocks-test-compile-to-execute.workspace = true
 novarocks-sql-testkit.workspace = true
-novarocks-coordination-contract.workspace = true
 chrono.workspace = true
 hex.workspace = true
 serde = { workspace = true, features = ["derive"] }

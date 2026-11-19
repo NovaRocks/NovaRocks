@@ -17,7 +17,8 @@
 
 //! The sole original binding sender with exact original source loans and real host refusals.
 use arrow::datatypes::{DataType, Field};
-use novarocks_physical_plan::{BoundFunction, BoundTableFunction};
+use novarocks_expression_contract::BoundFunction;
+use novarocks_physical_plan::BoundTableFunction;
 use novarocks_plan_codec::{
     host_projection_v2::{AdmissionRefusal, ProjectionFailure},
     physical_binding_v2::{

@@ -21,9 +21,7 @@ use arrow::{
     datatypes::{DataType, Field},
 };
 use novarocks_constant_contract::{ConstantPool, ConstantValue};
-use novarocks_physical_plan::{
-    ConstantPoolId, ConstantReference, ExprId, LiteralValue, NodeId, ValueId,
-};
+use novarocks_physical_plan::{ConstantPoolId, ConstantReference, ExprId, ValueId};
 use novarocks_type_contract::{
     DecimalOverflowPolicy, FunctionValueType, PureCompileControl, SemanticParameterId,
     SemanticParameterKey, SemanticParameterRef, ValueLogicalType,
@@ -103,7 +101,6 @@ fn refusal_policy() -> ConstantPolicy {
 fn source(ty: FunctionValueType, kind: ExprKind) -> ExprNode {
     ExprNode {
         id: ExprId::new(0),
-        owner: NodeId::new(u32::MAX),
         lambda_scope: None,
         ty,
         kind,
@@ -180,6 +177,26 @@ fn keep_source(actual: &ConstantValue, pool: &ConstantPool, ordinal: u32) {
     assert_eq!(actual.value_type(), pool.value_type());
 }
 
+fn declared_json_list(nullable: bool, child_nullable: bool) -> FunctionValueType {
+    let child = FunctionValueType::try_with_logical_type(
+        DataType::Utf8,
+        child_nullable,
+        ValueLogicalType::Json,
+    )
+    .unwrap();
+    let layout = FunctionValueType::new(
+        DataType::List(Arc::new(Field::new("item", DataType::Utf8, child_nullable))),
+        nullable,
+    );
+    let value = novarocks_type_contract::ValueTypeRef::try_new(
+        novarocks_type_contract::ValueKind::List(child.value_type().clone()),
+        nullable,
+        novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+    )
+    .unwrap();
+    FunctionValueType::try_from_value(value, layout.typed_binding().layout().clone()).unwrap()
+}
+
 #[test]
 fn physical_call_request_preserves_original_float_bits_typed_null_field_backing_and_nonzero_ordinals()
  {
@@ -202,7 +219,7 @@ fn physical_call_request_never_turns_reference_type_or_address_errors_into_nonco
     ty = ty.with_nullable(false).unwrap();
     let ref1 = reference(1);
     assert!(
-        matches!(invoke(&source(ty, ExprKind::Constant(ref1)), &pools, policy(), &Control::good()), Err(PhysicalArgumentError::Reference(ConstantReferenceError::SourceTypeMismatch(actual))) if actual == ref1)
+        matches!(invoke(&source(ty, ExprKind::Constant(ref1)), &pools, policy(), &Control::good()), Err(PhysicalArgumentError::Reference(ConstantReferenceError::Table(novarocks_constant_contract::ConstantTableError::SourceTypeMismatch(actual)))) if actual == ref1)
     );
     let missing = ConstantReference {
         pool: ConstantPoolId::new(0),
@@ -210,7 +227,7 @@ fn physical_call_request_never_turns_reference_type_or_address_errors_into_nonco
     };
     let ty = FunctionValueType::new(DataType::Float32, true);
     assert!(
-        matches!(invoke(&source(ty.clone(), ExprKind::Constant(missing)), &pools, policy(), &Control::good()), Err(PhysicalArgumentError::Reference(ConstantReferenceError::MissingPool(actual))) if actual == missing.pool)
+        matches!(invoke(&source(ty.clone(), ExprKind::Constant(missing)), &pools, policy(), &Control::good()), Err(PhysicalArgumentError::Reference(ConstantReferenceError::Table(novarocks_constant_contract::ConstantTableError::MissingPool(actual)))) if actual == missing.pool)
     );
     assert!(matches!(
         invoke(
@@ -256,139 +273,10 @@ fn physical_call_request_never_turns_reference_type_or_address_errors_into_nonco
         false,
     );
     assert!(
-        matches!(invoke(&source(changed, ExprKind::Constant(ref1)), &table, policy(), &Control::good()), Err(PhysicalArgumentError::Reference(ConstantReferenceError::SourceTypeMismatch(actual))) if actual == ref1)
+        matches!(invoke(&source(changed, ExprKind::Constant(ref1)), &table, policy(), &Control::good()), Err(PhysicalArgumentError::Reference(ConstantReferenceError::Table(novarocks_constant_contract::ConstantTableError::SourceTypeMismatch(actual)))) if actual == ref1)
     );
 }
 
-#[test]
-fn physical_call_request_legacy_literal_uses_the_sole_factory_and_preserves_error_categories() {
-    let empty = ConstantPools::empty();
-    let ty = FunctionValueType::new(DataType::Float64, false);
-    let literal = LiteralValue::Float64Bits(0xfff8_0000_0000_0043);
-    let (_, actual) = value(
-        invoke(
-            &source(ty.clone(), ExprKind::Literal(literal.clone())),
-            &empty,
-            policy(),
-            &Control::good(),
-        )
-        .unwrap(),
-    );
-    let control = Control::good();
-    let mut work = CompileCheckpoints::try_new(&control, PHASE).unwrap();
-    let direct = novarocks_physical_plan::literal_constant_observed::<PhysicalArgumentError>(
-        &literal,
-        &ty,
-        policy(),
-        PHASE,
-        &mut work,
-    )
-    .unwrap();
-    work.finish().unwrap();
-    assert_eq!(
-        actual.unwrap().try_f64_bits().unwrap(),
-        Some(0xfff8_0000_0000_0043)
-    );
-    assert_eq!(direct.try_f64_bits().unwrap(), Some(0xfff8_0000_0000_0043));
-    assert_eq!(direct.value_type(), &ty);
-    assert_eq!(direct.field().name(), "constant");
-    assert!(matches!(
-        invoke(
-            &source(
-                FunctionValueType::new(DataType::Int64, false),
-                ExprKind::Literal(LiteralValue::Null)
-            ),
-            &empty,
-            policy(),
-            &Control::good()
-        ),
-        Err(PhysicalArgumentError::Constant(ConstantError::Invalid(
-            "NULL factory requires nullable exact type"
-        )))
-    ));
-    // Invalid declarations cannot enter an immutable value port.
-    assert!(matches!(
-        FunctionValueType::try_with_logical_type(
-            DataType::FixedSizeBinary(16),
-            false,
-            ValueLogicalType::Json
-        ),
-        Err(ValueTypeError::InvalidLogicalCarrier(
-            ValueLogicalType::Json
-        ))
-    ));
-    let node = source(
-        FunctionValueType::new(DataType::Int64, false),
-        ExprKind::Literal(LiteralValue::Int64(7)),
-    );
-    let exact = ConstantPolicy {
-        max_rows: 1,
-        ..policy()
-    };
-    assert!(invoke(&node, &empty, exact, &Control::good()).is_ok());
-    let low = ConstantPolicy {
-        max_rows: 0,
-        ..exact
-    };
-    assert!(matches!(
-        invoke(&node, &empty, low, &Control::good()),
-        Err(PhysicalArgumentError::Constant(ConstantError::Limit(_)))
-    ));
-    let control = Control::good();
-    assert!(matches!(
-        invoke(&node, &empty, low, &control),
-        Err(PhysicalArgumentError::Constant(ConstantError::Limit(_)))
-    ));
-    let direct_control = Control::good();
-    let mut work = CompileCheckpoints::try_new(&direct_control, PHASE).unwrap();
-    assert!(matches!(
-        author_physical_argument_observed(&node, &empty, low, PHASE, &mut work),
-        Err(PhysicalArgumentError::Constant(ConstantError::Limit(_)))
-    ));
-    assert_eq!(control.trace(), direct_control.trace());
-    for cause in [
-        CompileControlError::Cancelled,
-        CompileControlError::DeadlineExceeded,
-        CompileControlError::ResourceExhausted,
-    ] {
-        let control = Control {
-            refusal: Some((direct_control.trace().len(), cause)),
-            ..Control::good()
-        };
-        let error = invoke(&node, &empty, low, &control).unwrap_err();
-        let PhysicalArgumentError::Constant(source @ ConstantError::Limit(_)) = error else {
-            panic!("the original constant limit must remain primary");
-        };
-        use novarocks_failure_contract::{FailureClass, FailureProjection, domain};
-        let expected = source.failure_fact();
-        assert_eq!(expected.class(), FailureClass::Resource);
-        assert_eq!(expected.reason().domain(), domain::CONSTANT.get());
-        assert_eq!(expected.reason().code(), 2);
-        let compiled = crate::compiler::SqlCompileError::from(source);
-        assert_eq!(compiled.source_failure().unwrap().failure_fact(), expected);
-        assert_eq!(control.trace(), direct_control.trace());
-    }
-}
-
-fn declared_json_list(nullable: bool, child_nullable: bool) -> FunctionValueType {
-    let child = FunctionValueType::try_with_logical_type(
-        DataType::Utf8,
-        child_nullable,
-        ValueLogicalType::Json,
-    )
-    .unwrap();
-    let layout = FunctionValueType::new(
-        DataType::List(Arc::new(Field::new("item", DataType::Utf8, child_nullable))),
-        nullable,
-    );
-    let value = novarocks_type_contract::ValueTypeRef::try_new(
-        novarocks_type_contract::ValueKind::List(child.value_type().clone()),
-        nullable,
-        novarocks_type_contract::ValueTypeStorageLifetime::pure(),
-    )
-    .unwrap();
-    FunctionValueType::try_from_value(value, layout.typed_binding().layout().clone()).unwrap()
-}
 #[test]
 fn physical_call_request_lambda_keeps_nested_field_names_metadata_logical_tags_and_body_result_type()
  {
@@ -496,13 +384,13 @@ fn physical_call_request_value_and_cast_stay_nonconstant_with_actual_nullable_so
 #[test]
 fn physical_call_request_every_small_actual_callback_prefix_preserves_three_primary_causes_and_caller_tail()
  {
-    let (pools, _, ty) = float_source();
+    let (mut pools, _, ty) = float_source();
+    let integer_type = FunctionValueType::new(DataType::Int64, false);
+    let integer =
+        crate::test_constants::insert(&mut pools, crate::test_constants::i64(7)(&integer_type));
     let cases = [
         source(ty.clone(), ExprKind::Constant(reference(1))),
-        source(
-            FunctionValueType::new(DataType::Int64, false),
-            ExprKind::Literal(LiteralValue::Int64(7)),
-        ),
+        source(FunctionValueType::new(DataType::Int64, false), integer),
         source(
             ty,
             ExprKind::Constant(ConstantReference {
@@ -511,8 +399,8 @@ fn physical_call_request_every_small_actual_callback_prefix_preserves_three_prim
             }),
         ),
         source(
-            FunctionValueType::new(DataType::Int64, false),
-            ExprKind::Literal(LiteralValue::Null),
+            FunctionValueType::new(DataType::Float32, false),
+            ExprKind::Constant(reference(2)),
         ),
     ];
     for (index, node) in cases.iter().enumerate() {

@@ -25,7 +25,7 @@ use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::task::ExecutionFailureCause;
 use arrow::datatypes::DataType;
 use novarocks_functions::{FunctionKind, KernelFailure};
-use novarocks_physical_plan::LiteralValue;
+
 use novarocks_type_contract::FunctionValueType;
 fn whole_invocation_probe(step: usize, later_root_error: bool) {
     use WindowBound::{CurrentRow, UnboundedPreceding};
@@ -68,12 +68,22 @@ fn whole_invocation_probe(step: usize, later_root_error: bool) {
     let literal_rows = (0..4)
         .map(|row| {
             vec![
-                LiteralValue::Int64([10, 11, 20, 21][row]),
-                LiteralValue::Float64Bits(key0[row].to_bits()),
-                LiteralValue::Float64Bits(key1[row].to_bits()),
-                LiteralValue::Int64(if row < 2 { 1 } else { 2 }),
-                LiteralValue::Int64(row as i64),
-                LiteralValue::Int64(2),
+                crate::exec::operators::family_fixture::constant_sources::i64(
+                    [10, 11, 20, 21][row],
+                ),
+                crate::exec::operators::family_fixture::constant_sources::f64_bits(
+                    key0[row].to_bits(),
+                ),
+                crate::exec::operators::family_fixture::constant_sources::f64_bits(
+                    key1[row].to_bits(),
+                ),
+                crate::exec::operators::family_fixture::constant_sources::i64(if row < 2 {
+                    1
+                } else {
+                    2
+                }),
+                crate::exec::operators::family_fixture::constant_sources::i64(row as i64),
+                crate::exec::operators::family_fixture::constant_sources::i64(2),
             ]
         })
         .collect::<Vec<_>>();

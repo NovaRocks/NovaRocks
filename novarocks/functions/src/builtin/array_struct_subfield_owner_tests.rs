@@ -23,7 +23,7 @@ use arrow_array::{Array, ArrayRef, Int32Array, Int64Array, ListArray, StringArra
 use arrow_buffer::{NullBuffer, OffsetBuffer};
 use arrow_schema::{DataType, Field};
 use novarocks_type_contract::{
-    CallProofScope, CompilePhase, DecimalOverflowPolicy, EvaluationDemand, EvaluationDomainId,
+    CallProofScope, CompilePhase, DecimalOverflowPolicy, EvaluationDemand, EvaluationRegionId,
     ExpressionEffectContext, ExpressionUseId, SemanticParameters,
 };
 use std::sync::{
@@ -106,7 +106,7 @@ fn prepared_arguments_with_result_storage(
     let selected = Arc::new(bound.selected);
     let context = ExpressionEffectContext {
         use_id: ExpressionUseId::new(41),
-        domain: EvaluationDomainId::new(7),
+        region: EvaluationRegionId::new(7),
         demand: EvaluationDemand::Value,
     };
     let uses = (0..arguments.len())
@@ -116,7 +116,7 @@ fn prepared_arguments_with_result_storage(
     let specialization = catalogue
         .prepare_fresh_selected(
             CallEffectInput {
-                context,
+                context: context.into(),
                 argument_uses: CallArgumentUses::SelectedChannels(&uses),
                 function_id: &bound.function_id,
                 kind: FunctionKind::Scalar,

@@ -295,7 +295,7 @@ impl ArrayElementAtOwner {
             }
             if !input.environment.is_empty()
                 || !matches!(input.proof_scope, CallProofScope::Unconditional)
-                    && input.proof_scope != CallProofScope::Domain(input.context.domain)
+                    && input.proof_scope != input.context.proof_scope()
             {
                 return Err(FunctionBindingError::InvalidBinding(
                     "__array_element_at has no environment dependencies and requires an exact proof scope"
@@ -332,7 +332,8 @@ impl ArrayElementAtOwner {
                 || input.kind != FunctionKind::Scalar
                 || contract.function_id() != input.function_id
                 || !std::ptr::eq(contract.selected(), input.selected)
-                || contract.context() != input.context
+                || novarocks_type_contract::CallEffectContext::from(contract.context())
+                    != input.context
                 || contract.decimal_overflow_policy() != input.decimal_overflow_policy
                 || contract.effects() != &self.call_effects(input.proof_scope)
                 || !input.environment.is_empty()

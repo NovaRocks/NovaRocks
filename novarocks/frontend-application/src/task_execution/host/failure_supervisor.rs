@@ -23,7 +23,7 @@ use super::{
 };
 use crate::control_runtime::actor::{FrontendActor, FrontendEffect};
 use novarocks_control_runtime::{
-    actor_turn::{ActorRegistration, ActorRuntime, ActorTurnError, EffectTicket},
+    actor_turn::{ActorRegistration, ActorRuntime, EffectTicket},
     completion::ReportSlot,
     exit_custody::ExitCustody,
     exit_work::{ExitWorkError, PanicPayload, PanicSink, run_future},
@@ -55,8 +55,8 @@ pub(crate) struct FailureCleanupRequest {
         reason = "The original panic allocation remains in the failed attempt custody."
     )]
     pub(crate) core_panic: PanicPayload,
-    pub(crate) publication: Result<(), ActorTurnError>,
-    pub(crate) root_reply: Result<(), Arc<super::publication::PublicationError>>,
+    pub(crate) publication: Result<(), Arc<super::failure_publication::FailurePublicationError>>,
+    pub(crate) root_reply: Option<Result<(), Arc<super::publication::PublicationError>>>,
     pub(crate) observation_drain: Result<(), ObservationError>,
     pub(crate) unknown_participations: Box<[ParticipationRef]>,
 }
@@ -155,16 +155,13 @@ impl FailureSupervisor {
         let body_ticket = ticket.clone();
         let runtime = self.runtime.clone();
         let body = async move {
-            let publication = context.publish(
-                &runtime,
-                &body_ticket,
-                unresolved_actions.into_iter().collect(),
-            );
-            let root_reply = context
-                .publications
-                .deliver_committed_root_after_failure()
-                .await
-                .map_err(Arc::new);
+            let (publication, root_reply) = context
+                .publish_original(
+                    &runtime,
+                    &body_ticket,
+                    unresolved_actions.into_iter().collect(),
+                )
+                .await;
             let observation_drain = observations
                 .as_ref()
                 .map_or(Ok(()), OrderedObservationFailure::dispose_queued);
@@ -272,6 +269,18 @@ pub(crate) struct RunningFailureSupervisor {
 }
 
 impl RunningFailureSupervisor {
+    /// Passive evidence of the actual failed-owner transfer. The normal
+    /// unused-supervisor close has no failure ticket and cannot satisfy it.
+    pub(crate) fn holds_original_failure_ticket(
+        &self,
+        proof: &novarocks_control_runtime::actor_turn::ActorFailureProof,
+    ) -> bool {
+        self.registration.same_registration(proof.registration())
+            && self
+                .ticket
+                .as_ref()
+                .is_some_and(|ticket| ticket.actor == self.registration.actor())
+    }
     pub(crate) fn panic(&self) -> &PanicSink {
         &self.panic
     }

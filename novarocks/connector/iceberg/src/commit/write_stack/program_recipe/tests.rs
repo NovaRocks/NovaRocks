@@ -97,7 +97,9 @@ fn output(format: IcebergFileFormat) -> IcebergWriterOutput {
     IcebergWriterOutput::try_new(
         format,
         Compression::SNAPPY,
-        (format == IcebergFileFormat::Parquet).then_some(1024),
+        1024,
+        crate::catalog_config::DEFAULT_TARGET_FILE_SIZE_BYTES,
+        crate::catalog_config::DEFAULT_MAX_PARTITIONS_PER_WRITER,
     )
     .unwrap()
 }

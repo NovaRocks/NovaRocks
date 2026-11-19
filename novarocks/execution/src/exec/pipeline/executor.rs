@@ -700,6 +700,107 @@ pub fn run_compiled_component_for_test(
     runtime: Arc<crate::runtime::execution_runtime::ExecutionRuntime>,
     tracker: Arc<crate::runtime::mem_tracker::MemTracker>,
 ) -> ExecutionResult<Vec<crate::exec::chunk::Chunk>> {
+    run_compiled_component_with_writers(
+        program,
+        runtime,
+        tracker,
+        crate::runtime::task::CompiledWriterBindings::default(),
+    )
+}
+
+/// Exercise a compiled layout sender through the original graph and driver.
+/// The collector substitutes for Native delivery and receives the routed page.
+#[cfg(any(test, novarocks_dev_controls))]
+#[doc(hidden)]
+pub fn run_compiled_write_layout_component_for_test(
+    program: Arc<novarocks_local_program::LocalProgram>,
+    evaluate: impl Fn(
+        &arrow::record_batch::RecordBatch,
+    ) -> Result<arrow::array::Int64Array, novarocks_spi::connector::ConnectorError>
+    + Send
+    + Sync
+    + 'static,
+) -> ExecutionResult<Vec<crate::exec::chunk::Chunk>> {
+    use crate::runtime::endpoint::{RuntimeEndpoint, TaskDestination};
+    use crate::runtime::execution_runtime::test_execution_runtime_with_functions;
+    use crate::runtime::function_set::ExecutionFunctionSetBuilder;
+    use crate::runtime::mem_tracker::MemTracker;
+    use crate::runtime::task::CompiledWriterBindings;
+    use crate::runtime::task::instance::TaskSinkAssignment;
+    use novarocks_types::UniqueId;
+
+    struct Evaluator<F>(F);
+    impl<F> novarocks_spi::connector::binding::ConnectorPartitionKeyEvaluator for Evaluator<F>
+    where
+        F: Fn(
+                &arrow::record_batch::RecordBatch,
+            )
+                -> Result<arrow::array::Int64Array, novarocks_spi::connector::ConnectorError>
+            + Send
+            + Sync,
+    {
+        fn partition_keys(
+            &self,
+            input: &arrow::record_batch::RecordBatch,
+        ) -> Result<arrow::array::Int64Array, novarocks_spi::connector::ConnectorError> {
+            (self.0)(input)
+        }
+    }
+
+    let assignment = TaskSinkAssignment::StreamDestinations {
+        sender_id: None,
+        destinations: [21, 22]
+            .into_iter()
+            .map(|id| {
+                TaskDestination::new(
+                    UniqueId::new(1, id),
+                    RuntimeEndpoint::parse(&format!("fixture-{id}:8060")).unwrap(),
+                    UniqueId::new(1, 11),
+                    0,
+                    1,
+                )
+                .unwrap()
+            })
+            .collect(),
+    };
+    let mut writers = CompiledWriterBindings::default();
+    writers.bind_component_layout(
+        program.graph().root(),
+        Arc::new(Evaluator(evaluate)),
+        &assignment,
+    )?;
+    let catalogue =
+        novarocks_functions::builtin::catalogue::build_builtin_engine_function_catalog().unwrap();
+    let definition = catalogue
+        .definition("rand", novarocks_functions::FunctionKind::Scalar)
+        .unwrap();
+    let mut functions = ExecutionFunctionSetBuilder::new();
+    functions
+        .catalog_builder_mut()
+        .register(definition.clone())
+        .unwrap();
+    let runtime = test_execution_runtime_with_functions(Arc::new(functions.seal().unwrap()));
+    let result = run_compiled_component_with_writers(
+        program,
+        Arc::clone(&runtime),
+        MemTracker::new_root("write layout component"),
+        writers,
+    );
+    let drivers = runtime.shutdown_driver_execution();
+    let sinks = runtime.shutdown_sink_io();
+    let outputs = result?;
+    drivers?;
+    sinks?;
+    Ok(outputs)
+}
+
+#[cfg(any(test, novarocks_dev_controls))]
+fn run_compiled_component_with_writers(
+    program: Arc<novarocks_local_program::LocalProgram>,
+    runtime: Arc<crate::runtime::execution_runtime::ExecutionRuntime>,
+    tracker: Arc<crate::runtime::mem_tracker::MemTracker>,
+    writers: crate::runtime::task::CompiledWriterBindings,
+) -> ExecutionResult<Vec<crate::exec::chunk::Chunk>> {
     let state = Arc::new(RuntimeState::for_local_execution(
         None,
         None,
@@ -722,7 +823,7 @@ pub fn run_compiled_component_for_test(
         },
         ExchangeBindings::default(),
         ScanBindings::default(),
-        crate::runtime::task::CompiledWriterBindings::default(),
+        writers,
         None,
         None,
         dop,
@@ -1126,28 +1227,45 @@ mod tests {
     }
     #[test]
     fn typed_failure_required_root_preserves_original_sparse_row_journal_and_typed_site() {
-        use crate::runtime::task::{ExecutionFailureCause, RequiredExpressionRowError};
+        use crate::exec::expr::fixtures::{SeedMode, program};
+        use crate::runtime::task::ExecutionFailureCause;
+        use novarocks_expression::RequiredExpressionRowError;
         use novarocks_functions::{RowDataError, Selection};
-        use novarocks_local_program::{
-            ProgramExpressionRootSite, ProgramNodeExpressionRole, ProgramNodeId,
-        };
-        let site = ProgramExpressionRootSite::Node {
-            node: ProgramNodeId::new(41),
-            role: ProgramNodeExpressionRole::ProjectOutput { expression: 0 },
-        };
+        use novarocks_local_program::ProgramNodeKind;
+        let program = program(SeedMode::Input, false);
+        let (node, site) = program
+            .graph()
+            .nodes()
+            .iter()
+            .find_map(|node| {
+                let ProgramNodeKind::Project { exprs, .. } = node.kind() else {
+                    return None;
+                };
+                exprs.first().map(|site| (node.local_id().unwrap(), *site))
+            })
+            .expect("the actual fixture contains a Project root");
         let error = RowDataError::new(1, "required row error is not a successful SQL NULL");
         let selection = Selection::try_sparse(101, &[0, 50, 100]).unwrap();
-        let required = RequiredExpressionRowError::try_new(site, selection, error.clone()).unwrap();
+        let required =
+            RequiredExpressionRowError::try_new(site.root, selection, error.clone()).unwrap();
         assert_eq!(required.batch_row(), 50);
-        assert_eq!(required.root(), site);
+        assert_eq!(required.root(), site.root);
         assert_eq!(required.error(), &error);
-        let failure = run_typed_failure_source(required.clone().into(), false);
+        let failure = run_typed_failure_source(
+            ExecutionFailure::from(required.clone()).at_expression_node(node),
+            false,
+        );
+        assert_eq!(failure.expression_node(), Some(node));
         assert_eq!(
             failure.cause(),
             &ExecutionFailureCause::RequiredRow(required)
         );
         assert!(matches!(
-            RequiredExpressionRowError::try_new(site, selection, RowDataError::new(3, "outside")),
+            RequiredExpressionRowError::try_new(
+                site.root,
+                selection,
+                RowDataError::new(3, "outside")
+            ),
             Err(novarocks_functions::KernelFailure::Internal(_))
         ));
     }

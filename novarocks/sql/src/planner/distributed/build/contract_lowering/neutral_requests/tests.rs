@@ -29,9 +29,12 @@ use crate::planner::payload::PlanProjectNode;
 use crate::planner::physical::{PhysicalPlanKind, PhysicalPlanNode};
 use arrow::datatypes::DataType;
 use novarocks_functions::FunctionResultType;
-use novarocks_physical_plan::{AggregatePhase, ExprKind, NodeKind, PhysicalCallSite};
 use novarocks_type_contract::{CompilePhase, DecimalOverflowPolicy, PureCompileControl};
 use std::sync::{Arc, Mutex};
+use {
+    novarocks_expression_contract::ExprKind,
+    novarocks_physical_plan::{AggregatePhase, NodeKind, PhysicalCallSite},
+};
 
 #[derive(Default)]
 struct Control {
@@ -66,6 +69,16 @@ fn assert_request(
     actual: &PhysicalCallRequest,
     work: &mut CompileCheckpoints<'_>,
 ) {
+    assert_request_in_pools(owner.plan().constants(), original, policy, actual, work);
+}
+
+fn assert_request_in_pools(
+    pools: &novarocks_physical_plan::ConstantPools,
+    original: FunctionBindingRequest<'_>,
+    policy: ConstantPolicy,
+    actual: &PhysicalCallRequest,
+    work: &mut CompileCheckpoints<'_>,
+) {
     assert_eq!(
         actual.logical_argument_count,
         original.logical_argument_count
@@ -92,9 +105,7 @@ fn assert_request(
                 match (constant, reference) {
                     (None, None) => {}
                     (Some(expected), Some(reference)) => {
-                        let resolved = owner
-                            .plan()
-                            .constants()
+                        let resolved = pools
                             .resolve_observed(*reference, actual_type, work)
                             .unwrap();
                         assert_eq!(resolved.ordinal(), expected.ordinal());
@@ -141,29 +152,47 @@ fn assert_expression_requests(owner: &SqlAuthoredPhysicalPlan) {
         CompileCheckpoints::try_new(&control, CompilePhase::FunctionSpecialization).unwrap();
     let mut calls = 0;
     for fragment in owner.plan().fragments().values() {
-        for (_, source) in fragment.expressions().iter() {
-            if !matches!(
-                source.kind,
-                ExprKind::FunctionCall { .. } | ExprKind::WindowCall { .. }
-            ) {
-                continue;
+        for node in fragment.nodes().values() {
+            if let Some(unit) = &node.expressions {
+                for source in unit.definitions() {
+                    if !matches!(source.kind, ExprKind::FunctionCall { .. }) {
+                        continue;
+                    }
+                    let entry = owner
+                        .checked_expression_call_source_observed(fragment, node, source, &mut work)
+                        .unwrap();
+                    let canonical = entry.canonical_operational().unwrap();
+                    let actual = unit.requests().get(&source.id).unwrap();
+                    assert_request(
+                        owner,
+                        canonical.request(),
+                        entry.captured().constant_policy(),
+                        actual,
+                        &mut work,
+                    );
+                    calls += 1;
+                }
             }
-            let entry = owner
-                .checked_expression_call_source_observed(fragment, source, &mut work)
-                .unwrap();
-            let canonical = entry.canonical_operational().unwrap();
-            let actual = fragment
-                .call_requests()
-                .get(PhysicalCallDefinition::Expression(source.id))
-                .unwrap();
-            assert_request(
-                owner,
-                canonical.request(),
-                entry.captured().constant_policy(),
-                actual,
-                &mut work,
-            );
-            calls += 1;
+            if let NodeKind::Window(spec) = &node.kind {
+                for (ordinal, source) in spec.calls.iter().enumerate() {
+                    let site = PhysicalCallSite::Window {
+                        node: node.id,
+                        call: u32::try_from(ordinal).unwrap(),
+                    };
+                    let entry = owner
+                        .checked_window_source_observed(fragment, node, site, source, &mut work)
+                        .unwrap();
+                    let actual = fragment.call_requests().get(site).unwrap();
+                    assert_request(
+                        owner,
+                        entry.canonical_operational().request(),
+                        entry.captured().constant_policy(),
+                        actual,
+                        &mut work,
+                    );
+                    calls += 1;
+                }
+            }
         }
     }
     assert!(calls > 0);
@@ -192,17 +221,26 @@ fn neutral_sql_scalar_none_folded_constants_and_nonzero_cv_keep_original_identit
             DecimalOverflowPolicy::OutputNull,
         ));
         assert_expression_requests(&owner);
-        let (fragment, source) = scalar::scalar_source(&owner);
+        let (_fragment, unit_node, source) = scalar::scalar_source(&owner);
         let ExprKind::FunctionCall { args, .. } = &source.kind else {
             unreachable!()
         };
         assert!(matches!(
-            fragment.expressions().get(args[0]).unwrap().kind,
+            unit_node
+                .expressions
+                .as_ref()
+                .unwrap()
+                .definition(args[0])
+                .unwrap()
+                .kind,
             ExprKind::Constant(_)
         ));
-        let actual = fragment
-            .call_requests()
-            .get(PhysicalCallDefinition::Expression(source.id))
+        let actual = unit_node
+            .expressions
+            .as_ref()
+            .unwrap()
+            .requests()
+            .get(&source.id)
             .unwrap();
         assert!(matches!(
             actual.arguments[0],
@@ -212,10 +250,13 @@ fn neutral_sql_scalar_none_folded_constants_and_nonzero_cv_keep_original_identit
     }
     let (owner, pool, field) = scalar::operational_tests::selected_source_owner();
     assert_expression_requests(&owner);
-    let (fragment, source) = scalar::scalar_source(&owner);
-    let actual = fragment
-        .call_requests()
-        .get(PhysicalCallDefinition::Expression(source.id))
+    let (_fragment, unit_node, source) = scalar::scalar_source(&owner);
+    let actual = unit_node
+        .expressions
+        .as_ref()
+        .unwrap()
+        .requests()
+        .get(&source.id)
         .unwrap();
     let StaticFunctionArgument::Value {
         constant: Some(reference),
@@ -245,11 +286,11 @@ fn neutral_sql_scalar_none_folded_constants_and_nonzero_cv_keep_original_identit
         DecimalOverflowPolicy::OutputNull,
     ));
     assert_expression_requests(&owner);
-    let (fragment, source) = scalar::scalar_source(&owner);
+    let (fragment, unit_node, source) = scalar::scalar_source(&owner);
     let control = Control::default();
     let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
     let entry = owner
-        .checked_expression_call_source_observed(fragment, source, &mut work)
+        .checked_expression_call_source_observed(fragment, unit_node, source, &mut work)
         .unwrap();
     let original_request = entry.captured().request();
     let FunctionArgument::Value {
@@ -259,9 +300,12 @@ fn neutral_sql_scalar_none_folded_constants_and_nonzero_cv_keep_original_identit
     else {
         panic!("original bare NULL")
     };
-    let actual = fragment
-        .call_requests()
-        .get(PhysicalCallDefinition::Expression(source.id))
+    let actual = unit_node
+        .expressions
+        .as_ref()
+        .unwrap()
+        .requests()
+        .get(&source.id)
         .unwrap();
     let StaticFunctionArgument::Value {
         value_type,
@@ -290,31 +334,141 @@ fn neutral_sql_scalar_none_folded_constants_and_nonzero_cv_keep_original_identit
 
 #[test]
 fn neutral_sql_lambda_window_order_and_left_table_keep_distinct_original_channels() {
-    let owner = scalar::authored_lambda_source_for_test();
-    assert_expression_requests(&owner);
-    assert!(owner.plan().fragments().values().any(|fragment| {
-        fragment.call_requests().entries().values().any(|request| {
-            request
-                .arguments
-                .iter()
-                .any(|argument| matches!(argument, StaticFunctionArgument::Lambda { .. }))
-        })
-    }));
+    use super::super::original_emission_test_observer::{
+        OriginalEmissionObserver, OriginalEmissionView, lower_read_with_original_emission_observer,
+    };
+    struct ObserveTransfer {
+        calls: usize,
+        window: bool,
+    }
+    impl OriginalEmissionObserver for ObserveTransfer {
+        fn observe(
+            &mut self,
+            view: OriginalEmissionView<'_>,
+            work: &mut CompileCheckpoints<'_>,
+        ) -> Result<(), ContractLoweringError> {
+            self.calls += 1;
+            // The pure transfer component owns its actual output registry.
+            // This is neither the source environment nor a published plan.
+            let mut output = super::super::constant_emission::SqlConstantEmission::new();
+            let transferred =
+                transfer_neutral_requests_observed(view.journal(), work, |value, work| {
+                    output.register(value, value.value_type(), work)
+                })?;
+            let mut lambda = false;
+            let mut calls = 0;
+            let mut windows = 0;
+            for (&fragment, builder) in view.fragments() {
+                for (&node, actual_node) in builder.construction_nodes() {
+                    if let Some(unit) = builder.construction_unit(node) {
+                        for definition in unit.definitions() {
+                            if !matches!(definition.kind, ExprKind::FunctionCall { .. }) {
+                                continue;
+                            }
+                            let source =
+                                view.checked_scalar_source(fragment, node, definition.id, work)?;
+                            assert!(std::ptr::eq(source.source(), definition));
+                            let target = RequestTarget::Unit {
+                                node,
+                                definition: definition.id,
+                            };
+                            let actual = &transferred[&fragment]
+                                .iter()
+                                .find(|(actual, _)| *actual == target)
+                                .unwrap()
+                                .1;
+                            assert_request_in_pools(
+                                output.pools(),
+                                source.canonical_operational().unwrap().request(),
+                                source.captured().constant_policy(),
+                                actual,
+                                work,
+                            );
+                            lambda |= actual.arguments.iter().any(|argument| {
+                                matches!(argument, StaticFunctionArgument::Lambda { .. })
+                            });
+                            calls += 1;
+                        }
+                    }
+                    if let NodeKind::Window(spec) = &actual_node.kind {
+                        for (ordinal, call) in spec.calls.iter().enumerate() {
+                            let site = PhysicalCallSite::Window {
+                                node,
+                                call: u32::try_from(ordinal).unwrap(),
+                            };
+                            let emission = view.window_source(fragment, site, work)?;
+                            assert!(std::ptr::eq(emission.source(), call));
+                            let actual = &transferred[&fragment]
+                                .iter()
+                                .find(|(target, _)| *target == RequestTarget::Relation(site))
+                                .unwrap()
+                                .1;
+                            assert_request_in_pools(
+                                output.pools(),
+                                emission.canonical().request(),
+                                emission.captured().constant_policy(),
+                                actual,
+                                work,
+                            );
+                            assert_eq!(actual.logical_argument_count, 1);
+                            assert_eq!(actual.arguments.len(), 2);
+                            windows += 1;
+                        }
+                    }
+                }
+            }
+            assert_eq!(calls, view.journal().expression_entries.len());
+            assert_eq!(windows, view.journal().window_entries.len());
+            assert_eq!(
+                calls + windows,
+                transferred.values().map(Vec::len).sum::<usize>()
+            );
+            assert!(calls + windows > 0);
+            if self.window {
+                assert_eq!(windows, 1);
+            } else {
+                assert!(lambda);
+            }
+
+            Ok(())
+        }
+    }
     let order = crate::analysis::SortItem {
         expr: relational::integer(9),
         asc: false,
         nulls_first: true,
     };
-    let (source, _) = relational::window_fixture(vec![relational::integer(7)], vec![order]);
-    let owner = relational::finish(&source);
-    assert_expression_requests(&owner);
-    let (fragment, source) = relational::window_source(&owner);
-    let actual = fragment
-        .call_requests()
-        .get(PhysicalCallDefinition::Expression(source.id))
-        .unwrap();
-    assert_eq!(actual.logical_argument_count, 1);
-    assert_eq!(actual.arguments.len(), 2);
+    let (window_source, _) = relational::window_fixture(vec![relational::integer(7)], vec![order]);
+    for (source, window, overload) in [
+        (
+            plan(scalar::analyzed_lambda_expression_for_test()),
+            false,
+            "builtin.scalar/array_map/dynamic-v1",
+        ),
+        (
+            window_source,
+            true,
+            "builtin.aggregate/array_agg/derived-v1",
+        ),
+    ] {
+        let control = Control::default();
+        let mut observer = ObserveTransfer { calls: 0, window };
+        let result = lower_read_with_original_emission_observer(
+            &source,
+            version(),
+            dop(),
+            None,
+            crate::functions::builtin_sql_function_catalog().snapshot(),
+            false,
+            scalar::policy(),
+            &control,
+            &mut observer,
+        );
+        assert_eq!(observer.calls, 1);
+        assert!(matches!(result, Err(ContractLoweringError::FunctionBinding(
+            novarocks_functions::FunctionBindingError::UnavailableImplementation(ref actual)
+        )) if actual.as_str() == overload));
+    }
     let (source, binding) = relational::table_fixture(vec![relational::list_value(1)], true);
     let owner = relational::finish(&source);
     let (fragment, source) = relational::table_source(&owner);
@@ -326,9 +480,7 @@ fn neutral_sql_lambda_window_order_and_left_table_keep_distinct_original_channel
         .unwrap();
     let actual = fragment
         .call_requests()
-        .get(PhysicalCallDefinition::Relational(
-            PhysicalCallSite::Table { node: source.id },
-        ))
+        .get(PhysicalCallSite::Table { node: source.id })
         .unwrap();
     assert_request(
         &owner,
@@ -357,11 +509,12 @@ fn neutral_sql_partial_final_own_literal_requests_survive_fragment_pool_projecti
     let mut final_calls = 0;
     let mut request_only = 0;
     for fragment in owner.plan().fragments().values() {
-        let projected = owner
-            .plan()
-            .constants()
-            .project_fragment_observed(fragment, &mut work)
-            .unwrap();
+        let projected = novarocks_physical_plan::project_fragment_constants_observed(
+            owner.plan().constants(),
+            fragment,
+            &mut work,
+        )
+        .unwrap();
         for node in fragment.nodes().values() {
             let NodeKind::Aggregate { calls, .. } = &node.kind else {
                 continue;
@@ -374,10 +527,7 @@ fn neutral_sql_partial_final_own_literal_requests_survive_fragment_pool_projecti
                 let entry = owner
                     .checked_aggregate_source_observed(fragment, node, site, source, &mut work)
                     .unwrap();
-                let actual = fragment
-                    .call_requests()
-                    .get(PhysicalCallDefinition::Relational(site))
-                    .unwrap();
+                let actual = fragment.call_requests().get(site).unwrap();
                 let original = if source.binding.phase.consumes_logical_arguments() {
                     partial += 1;
                     let request = entry.canonical().unwrap().request();
@@ -421,7 +571,7 @@ fn neutral_sql_partial_final_own_literal_requests_survive_fragment_pool_projecti
                                 .unwrap(),
                             Some(7 | 9)
                         ));
-                        if !fragment.expressions().iter().any(|(_, expression)| matches!(expression.kind, ExprKind::Constant(found) if found == *reference)) {
+                        if !fragment.nodes().values().filter_map(|node| node.expressions.as_ref()).flat_map(|unit| unit.definitions()).any(|expression| matches!(expression.kind, ExprKind::Constant(found) if found == *reference)) {
                             request_only += 1;
                         }
                     }
@@ -470,10 +620,7 @@ fn neutral_sql_writer_final_keeps_own_capture_and_omissions_are_not_calls() {
                         fragment, node, site, source, &mut work,
                     )
                     .unwrap();
-                let actual = fragment
-                    .call_requests()
-                    .get(PhysicalCallDefinition::Relational(site))
-                    .unwrap();
+                let actual = fragment.call_requests().get(site).unwrap();
                 let request = if final_phase {
                     merges += 1;
                     let canonical = entry.canonical().unwrap();
@@ -504,14 +651,8 @@ fn neutral_sql_writer_final_keeps_own_capture_and_omissions_are_not_calls() {
                     .entries()
                     .keys()
                     .filter(|definition| match definition {
-                        PhysicalCallDefinition::Relational(PhysicalCallSite::WriterPartial {
-                            node: id,
-                            ..
-                        })
-                        | PhysicalCallDefinition::Relational(PhysicalCallSite::WriterFinal {
-                            node: id,
-                            ..
-                        }) => *id == node.id,
+                        PhysicalCallSite::WriterPartial { node: id, .. }
+                        | PhysicalCallSite::WriterFinal { node: id, .. } => *id == node.id,
                         _ => false,
                     })
                     .count(),
@@ -558,15 +699,15 @@ fn finish(source: &PhysicalPlanNode, control: &Control) -> Result<(), ContractLo
     )?
     .finish_observed(control)
     .map_err(ContractLoweringError::from)?;
+    let fragment = owner.plan().fragments().get(&ROOT_FRAGMENT_ID).unwrap();
+    assert_eq!(fragment.call_requests().entries().len(), 0);
     assert_eq!(
-        owner
-            .plan()
-            .fragments()
-            .get(&ROOT_FRAGMENT_ID)
-            .unwrap()
-            .call_requests()
-            .entries()
-            .len(),
+        fragment
+            .nodes()
+            .values()
+            .filter_map(|node| node.expressions.as_deref())
+            .map(|unit| unit.requests().len())
+            .sum::<usize>(),
         1
     );
     Ok(())
@@ -607,10 +748,16 @@ fn neutral_sql_transfer_success_and_ordinary_refusal_preserve_every_original_con
 
 // This negative fixture corrupts an actual completed emitter journal. It does
 // not mint a checked source or weaken the ordinary production source gate.
-fn finish_without_actual_canonical_source(
+#[derive(Clone, Copy, Debug)]
+enum MissingCanonicalGate {
+    FinishDraft,
+    NeutralTransfer,
+}
+fn without_actual_canonical_source_at(
     source: &PhysicalPlanNode,
     functions: &Arc<dyn crate::compiler::SqlFunctionCatalog>,
     control: &Control,
+    gate: MissingCanonicalGate,
 ) -> Result<(), ContractLoweringError> {
     use super::super::{
         ContractLoweringVisitor, FragmentSink, OutputPort, ResultPort, result_fields,
@@ -659,7 +806,31 @@ fn finish_without_actual_canonical_source(
         .unwrap();
     assert!(entry.canonical_operational.is_some());
     entry.canonical_operational = None;
-    visitor.finish_draft(result_port).map(|_| ())
+    match gate {
+        MissingCanonicalGate::FinishDraft => visitor.finish_draft(result_port).map(|_| ()),
+        MissingCanonicalGate::NeutralTransfer => {
+            // This is the original leaf before publication, borrowing the real
+            // emitter journal, pool registry and same visitor-owned work.
+            // It is not a replacement path through finish_draft's source gate.
+            let result = transfer_neutral_requests_observed(
+                &visitor.call_sources,
+                &mut visitor.work,
+                |value, work| {
+                    visitor
+                        .constant_emission
+                        .register(value, value.value_type(), work)
+                },
+            )
+            .map(|_| ());
+            if matches!(&result, Err(ContractLoweringError::Control(_))) {
+                return result;
+            }
+            // Original counting/reservation/entry lookup leaves genuine
+            // pending work on this ordinary refusal; do not inject steps.
+            visitor.work.finish()?;
+            result
+        }
+    }
 }
 
 #[test]
@@ -672,35 +843,61 @@ fn neutral_sql_finish_draft_missing_canonical_completes_pending_ordinary_tail_an
         DecimalOverflowPolicy::OutputNull,
     ));
     let functions = crate::functions::builtin_sql_function_catalog().snapshot();
-    let baseline = Control::default();
-    let result = finish_without_actual_canonical_source(&source, &functions, &baseline);
-    assert!(matches!(result,
-        Err(ContractLoweringError::InvalidFunctionBinding { ref detail })
-        if detail == "neutral expression request has no canonical original source"));
-    let expected = baseline.trace();
-    let &(phase, units) = expected
-        .last()
-        .expect("actual original completion callback");
-    assert_eq!(phase, CompilePhase::Validate);
-    assert!(
-        units > 0,
-        "ordinary finish_draft must flush its actually completed pending tail"
-    );
-    for at in 0..expected.len() {
-        for cause in [
-            CompileControlError::Cancelled,
-            CompileControlError::DeadlineExceeded,
-            CompileControlError::ResourceExhausted,
-        ] {
-            let control = Control {
-                trace: Mutex::new(Vec::new()),
-                refusal: Some((at, cause.clone())),
-            };
-            assert!(
-                matches!(finish_without_actual_canonical_source(&source, &functions, &control),
-                Err(ContractLoweringError::Control(actual)) if actual == cause)
-            );
-            assert_eq!(control.trace(), expected[..=at]);
+    for gate in [
+        MissingCanonicalGate::FinishDraft,
+        MissingCanonicalGate::NeutralTransfer,
+    ] {
+        let baseline = Control::default();
+        let result = without_actual_canonical_source_at(&source, &functions, &baseline, gate);
+        match gate {
+            MissingCanonicalGate::FinishDraft => {
+                assert!(matches!(
+                    result,
+                    Err(ContractLoweringError::Semantics(
+                        crate::planner::distributed::build::PackageSemanticsError::InvalidSource(
+                            "original scalar source has no canonical request"
+                        )
+                    ))
+                ));
+            }
+            MissingCanonicalGate::NeutralTransfer => {
+                assert!(matches!(result,
+                    Err(ContractLoweringError::InvalidFunctionBinding { ref detail })
+                    if detail == "neutral expression request has no canonical original source"));
+            }
+        }
+        let expected = baseline.trace();
+        let &(phase, units) = expected
+            .last()
+            .expect("actual original completion callback");
+        assert_eq!(phase, CompilePhase::Validate);
+        match gate {
+            MissingCanonicalGate::FinishDraft => assert_eq!(
+                units, 0,
+                "the original checked-source loan already flushed before missing canonical admission"
+            ),
+            MissingCanonicalGate::NeutralTransfer => assert!(
+                units > 0,
+                "ordinary neutral transfer must complete its actually pending source work"
+            ),
+        }
+        for at in 0..expected.len() {
+            for cause in [
+                CompileControlError::Cancelled,
+                CompileControlError::DeadlineExceeded,
+                CompileControlError::ResourceExhausted,
+            ] {
+                let control = Control {
+                    trace: Mutex::new(Vec::new()),
+                    refusal: Some((at, cause.clone())),
+                };
+                assert!(
+                    matches!(without_actual_canonical_source_at(&source, &functions, &control, gate),
+                    Err(ContractLoweringError::Control(actual)) if actual == cause),
+                    "gate {gate:?}, at {at}: {cause:?}"
+                );
+                assert_eq!(control.trace(), expected[..=at]);
+            }
         }
     }
 }

@@ -22,13 +22,13 @@ use arrow::{
     array::{Int64Array, RecordBatch, RecordBatchOptions},
     datatypes::{DataType, Field, Schema},
 };
-use novarocks_physical_plan::{
-    ConstantPools, FragmentBuilder, FragmentId, NodeId, SystemRelationData, ValueOrigin,
-};
+use novarocks_physical_plan::{ConstantPools, FragmentId, NodeId, SystemRelationData, ValueOrigin};
 use novarocks_type_contract::{FunctionValueType, ValueTypeStorageLifetime};
 use std::sync::Arc;
 #[test]
 fn system_relation_outputs_original_batches_in_order_then_finishes() {
+    let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
+
     let fields = Arc::from([Arc::new(Field::new("value", DataType::Int64, false))]);
     let schema = Arc::new(Schema::new(vec![Field::new(
         "value",
@@ -42,7 +42,11 @@ fn system_relation_outputs_original_batches_in_order_then_finishes() {
         })
         .collect::<Vec<_>>()
         .into();
-    let mut builder = FragmentBuilder::new(FragmentId::new(21));
+    let mut builder =
+        crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+            FragmentId::new(21),
+            &fixture_sources,
+        );
     let node = NodeId::new(0);
     let value = builder
         .add_value(
@@ -77,6 +81,8 @@ fn system_relation_outputs_original_batches_in_order_then_finishes() {
 }
 #[test]
 fn system_relation_zero_column_batch_and_empty_snapshot_keep_rows() {
+    let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
+
     for rows in [0, 5001] {
         let batches: Arc<[RecordBatch]> = if rows == 0 {
             Arc::from([])
@@ -88,7 +94,11 @@ fn system_relation_zero_column_batch_and_empty_snapshot_keep_rows() {
             )
             .unwrap()])
         };
-        let mut builder = FragmentBuilder::new(FragmentId::new(22));
+        let mut builder =
+            crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
+                FragmentId::new(22),
+                &fixture_sources,
+            );
         let node = NodeId::new(0);
         builder
             .add_system_relation(

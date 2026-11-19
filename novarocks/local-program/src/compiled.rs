@@ -15,17 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Final pure compilation product. The graph is owned exactly once by the
-//! mandatory checked expression/control/type/channel/lexical chain. Provider
-//! recipes and provenance are checked against that same graph before exposure.
-//! Execution's construction bridge consumes LocalProgramGraph separately and
-//! must be retired when the production compiler is connected.
+//! Final pure compilation product. It directly owns one immutable graph and
+//! its compiled unit table. Relation calls, typed channels, provider recipes and
+//! provenance are validated against those exact inputs before publication.
 
 use crate::{
     BindingRequirement, CompiledOriginsError, DiagnosticSourceNodeId, LocalOperatorProvenance,
-    LocalProgramGraph, ProgramCallSite, ProgramComparisonSite, ProgramLexicalBindings,
-    ProgramNodeId, ProgramNodeKind, ProgramPrimitiveError, ProgramProvenance, ProgramStateTemplate,
-    ProviderLinkError,
+    LocalProgramGraph, ProgramCallSite, ProgramNodeId, ProgramNodeKind, ProgramProvenance,
+    ProgramResolvedCalls, ProgramStateTemplate, ProgramTypedChannels, ProviderLinkError,
 };
 use novarocks_connector_contract::ConnectorWriteRecipe;
 use novarocks_type_contract::{
@@ -60,6 +57,9 @@ pub enum CompiledExchangeRouting {
 pub struct CompiledExchangeInput {
     /// Complete cut-source declarations in wire ordinal order, mapped to local slots.
     pub wire_layout: crate::StaticLayout,
+    /// Local decoded transport layout when the exchange carries an additional
+    /// write-layout key. The local writer shuffle consumes and removes the key.
+    pub routing_layout: Option<crate::StaticLayout>,
     pub role: crate::ProgramOutputRole,
     pub delivery: novarocks_execution_contract::ExchangeDeliveryRequirement,
     pub routing: CompiledExchangeRouting,
@@ -117,7 +117,11 @@ pub struct CompiledProgramFacts {
 
 #[derive(Debug)]
 pub struct LocalProgram {
-    expressions: std::sync::Arc<crate::ExpressionProgram>,
+    graph: LocalProgramGraph,
+    units: Box<[std::sync::Arc<novarocks_expression::CompiledExprSet>]>,
+    calls: ProgramResolvedCalls,
+    channels: ProgramTypedChannels,
+    _unit_storage: novarocks_type_contract::ValueTypeStorageLifetime,
     provenance: ProgramProvenance,
     writes: BTreeMap<ProgramNodeId, ConnectorWriteRecipe>,
     exchange_inputs: BTreeMap<ProgramNodeId, CompiledExchangeInput>,
@@ -146,13 +150,36 @@ pub enum LocalProgramCompileError {
     PartialFinalization(ProgramNodeId),
     Origins(CompiledOriginsError),
     Provider(ProviderLinkError),
-    Primitive(ProgramPrimitiveError),
+    Calls(crate::ProgramResolvedCallsError),
+    Channels(crate::ProgramChannelTypeError),
+    Sink(crate::StaticSinkError),
+    InvalidExpression,
+    TooManyDefinitions,
+    TooManyConstantBytes,
 }
-impl From<ProgramPrimitiveError> for LocalProgramCompileError {
-    fn from(error: ProgramPrimitiveError) -> Self {
+impl From<crate::StaticSinkError> for LocalProgramCompileError {
+    fn from(cause: crate::StaticSinkError) -> Self {
+        Self::Sink(cause)
+    }
+}
+impl From<CompileControlError> for LocalProgramCompileError {
+    fn from(cause: CompileControlError) -> Self {
+        Self::Control(cause)
+    }
+}
+impl From<crate::ProgramResolvedCallsError> for LocalProgramCompileError {
+    fn from(error: crate::ProgramResolvedCallsError) -> Self {
         match error {
-            ProgramPrimitiveError::Control(cause) => Self::Control(cause),
-            other => Self::Primitive(other),
+            crate::ProgramResolvedCallsError::Control(cause) => Self::Control(cause),
+            other => Self::Calls(other),
+        }
+    }
+}
+impl From<crate::ProgramChannelTypeError> for LocalProgramCompileError {
+    fn from(error: crate::ProgramChannelTypeError) -> Self {
+        match error {
+            crate::ProgramChannelTypeError::Control(cause) => Self::Control(cause),
+            other => Self::Channels(other),
         }
     }
 }
@@ -178,7 +205,18 @@ impl fmt::Display for LocalProgramCompileError {
             Self::Control(error) => error.fmt(f),
             Self::Origins(error) => error.fmt(f),
             Self::Provider(error) => error.fmt(f),
-            Self::Primitive(error) => error.fmt(f),
+            Self::Calls(error) => error.fmt(f),
+            Self::Channels(error) => error.fmt(f),
+            Self::Sink(error) => error.fmt(f),
+            Self::TooManyDefinitions => {
+                f.write_str("compiled unit table exceeds the shared definition limit")
+            }
+            Self::TooManyConstantBytes => {
+                f.write_str("compiled unit table exceeds the shared constant backing limit")
+            }
+            Self::InvalidExpression => {
+                f.write_str("local expression root is absent from its program unit")
+            }
             Self::MissingSink => f.write_str("compiled local program requires an exact sink"),
             Self::ExchangeInputMismatch(node) => write!(
                 f,
@@ -216,8 +254,13 @@ impl std::error::Error for LocalProgramCompileError {
             Self::Control(error) => Some(error),
             Self::Origins(error) => Some(error),
             Self::Provider(error) => Some(error),
-            Self::Primitive(error) => Some(error),
-            Self::MissingSink
+            Self::Calls(error) => Some(error),
+            Self::Channels(error) => Some(error),
+            Self::Sink(error) => Some(error),
+            Self::TooManyDefinitions
+            | Self::TooManyConstantBytes
+            | Self::InvalidExpression
+            | Self::MissingSink
             | Self::ExchangeInputMismatch(_)
             | Self::DuplicateExchangeReceiver(_)
             | Self::ScanInputMismatch(_)
@@ -238,25 +281,26 @@ impl<H> From<LocalProgramCompileError>
     }
 }
 impl LocalProgram {
-    /// Accept only the complete checked chain, not an AST and optional receipts.
-    /// Provenance is freshly authored against its actual local graph. Compiler
-    /// lowering remains responsible for physical-token/source correspondence,
-    /// output guarantees and the existence of synthetic non-node entities.
-    /// `exchange_inputs` addresses exactly the graph's `ExchangeSource` nodes,
-    /// which are exactly its `ExchangeInput` requirements; receivers are unique.
-    /// `scan_inputs` likewise addresses exactly its `Scan` nodes, which are
-    /// exactly its `Scan` requirements; physical scan nodes are unique.
-    /// `aggregates` addresses exactly its `Aggregate` nodes, and a node whose
-    /// calls finalize declares a complete grouping.
+    /// Build the final product from one graph and its actual compiled units.
+    /// Relation and channel authors borrow those exact inputs before publication.
     pub fn try_new(
-        checked: ProgramLexicalBindings,
+        graph: LocalProgramGraph,
+        units: Vec<std::sync::Arc<novarocks_expression::CompiledExprSet>>,
+        calls: Vec<(ProgramCallSite, novarocks_functions::PureCallSpecialization)>,
+        channels: Vec<(
+            crate::ProgramChannelSite,
+            novarocks_type_contract::FunctionValueType,
+        )>,
         operators: Vec<LocalOperatorProvenance>,
         allowed_sources: &BTreeSet<DiagnosticSourceNodeId>,
         facts: CompiledProgramFacts,
         control: &dyn PureCompileControl,
     ) -> Result<Self, LocalProgramCompileError> {
         Self::try_new_core::<std::convert::Infallible, crate::creation::NoFactory>(
-            checked,
+            graph,
+            units,
+            calls,
+            channels,
             operators,
             allowed_sources,
             facts,
@@ -276,20 +320,26 @@ impl LocalProgram {
             crate::ProgramCreationFailure::Creator(never) => match never {},
         })
     }
-    pub fn try_new_with_creator_in<H, F>(
-        checked: ProgramLexicalBindings,
+    pub fn try_new_with_creator_in<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
+        graph: LocalProgramGraph,
+        units: Vec<std::sync::Arc<novarocks_expression::CompiledExprSet>>,
+        calls: Vec<(ProgramCallSite, novarocks_functions::PureCallSpecialization)>,
+        channels: Vec<(
+            crate::ProgramChannelSite,
+            novarocks_type_contract::FunctionValueType,
+        )>,
         operators: Vec<LocalOperatorProvenance>,
         allowed_sources: &BTreeSet<DiagnosticSourceNodeId>,
         facts: CompiledProgramFacts,
         temporary: &mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>,
         retained_factory: &F,
         control: &dyn PureCompileControl,
-    ) -> Result<Self, crate::ProgramCreationFailure<LocalProgramCompileError, H>>
-    where
-        F: novarocks_type_contract::ValueSchemaCreationFactory<H>,
-    {
+    ) -> Result<Self, crate::ProgramCreationFailure<LocalProgramCompileError, H>> {
         Self::try_new_core(
-            checked,
+            graph,
+            units,
+            calls,
+            channels,
             operators,
             allowed_sources,
             facts,
@@ -298,64 +348,138 @@ impl LocalProgram {
             control,
         )
     }
-    fn try_new_core<H, F>(
-        checked: ProgramLexicalBindings,
+    fn try_new_core<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
+        graph: LocalProgramGraph,
+        units: Vec<std::sync::Arc<novarocks_expression::CompiledExprSet>>,
+        calls: Vec<(ProgramCallSite, novarocks_functions::PureCallSpecialization)>,
+        channels: Vec<(
+            crate::ProgramChannelSite,
+            novarocks_type_contract::FunctionValueType,
+        )>,
         operators: Vec<LocalOperatorProvenance>,
         allowed_sources: &BTreeSet<DiagnosticSourceNodeId>,
         facts: CompiledProgramFacts,
-        temporary: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
+        mut temporary: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
         retained_factory: Option<&F>,
         control: &dyn PureCompileControl,
-    ) -> Result<Self, crate::ProgramCreationFailure<LocalProgramCompileError, H>>
-    where
-        F: novarocks_type_contract::ValueSchemaCreationFactory<H>,
-    {
+    ) -> Result<Self, crate::ProgramCreationFailure<LocalProgramCompileError, H>> {
         let CompiledProgramFacts {
             writes,
             exchange_inputs,
             scan_inputs,
             aggregates,
         } = facts;
-        let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
-            control,
-            novarocks_type_contract::CompilePhase::LowerProgram,
-        )
-        .map_err(LocalProgramCompileError::Control)?;
-        let graph = checked
-            .channels()
-            .expressions()
-            .resolved_calls()
-            .snapshot()
-            .program();
-        let has_sink = graph.sink().is_some();
-        work.step().map_err(LocalProgramCompileError::Control)?;
-        work.flush().map_err(LocalProgramCompileError::Control)?;
-        if !has_sink {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
+        work.step()?;
+        work.flush()?;
+        if graph.sink().is_none() {
             return Err(LocalProgramCompileError::MissingSink.into());
         }
-        let provenance =
-            crate::compiled_origins::compile_origins(graph, operators, allowed_sources, control)
-                .map_err(LocalProgramCompileError::from)?;
-        crate::provider_links::validate_provider_links(&checked, &writes, control)
-            .map_err(LocalProgramCompileError::from)?;
-        validate_exchange_inputs(graph, &exchange_inputs, control)?;
-        validate_scan_inputs(graph, &scan_inputs, control)?;
-        validate_aggregates(graph, &aggregates, control)?;
-        let expressions = match retained_factory {
-            Some(factory) => crate::ExpressionProgram::try_new_with_creator_in(
-                checked,
-                temporary.expect("strong entry supplies the real temporary scope"),
-                factory,
-                control,
-            )
-            .map_err(|error| error.map_owner(LocalProgramCompileError::from))?,
-            None => crate::ExpressionProgram::try_new(checked, control)
-                .map_err(LocalProgramCompileError::from)?,
+        {
+            let creator = temporary.as_mut().map(|scope| {
+                &mut **scope as &mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>
+            });
+            let mut creation = crate::creation::ProgramCreation { creator };
+            validate_unit_budgets(&units, &mut creation, &mut work)?;
+        }
+        for node in graph.nodes() {
+            node.kind().try_for_each_expression(|reference, demand| {
+                work.step()?;
+                if reference.is_some_and(|r| {
+                    crate::unit_refs::root_type(&units, r).is_none()
+                        || units[r.unit.index()]
+                            .root(r.root)
+                            .is_none_or(|root| root.demand != demand)
+                }) {
+                    return Err(LocalProgramCompileError::InvalidExpression);
+                }
+                Ok(())
+            })?;
+        }
+        let sink = graph
+            .sink()
+            .expect("the actual graph sink was required above");
+        sink.validate_core::<LocalProgramCompileError>(&units, &mut || {
+            work.step().map_err(LocalProgramCompileError::Control)
+        })?;
+        // The previous checked root author never admitted executable split
+        // predicates. Table migration does not expand this compiled capability.
+        if !sink.split_exprs().is_empty() {
+            return Err(LocalProgramCompileError::InvalidExpression.into());
+        }
+        crate::unit_inputs::validate(
+            graph.nodes(),
+            graph.root(),
+            graph.sink(),
+            &units,
+            || work.step().map_err(LocalProgramCompileError::Control),
+            || LocalProgramCompileError::InvalidExpression,
+        )?;
+        work.flush()?;
+        let (calls, channels, units, unit_storage) = match retained_factory {
+            Some(factory) => {
+                let temporary = temporary.expect("strong entry borrows its actual temporary scope");
+                let mut retained = factory
+                    .begin_scope()
+                    .map_err(crate::ProgramCreationFailure::Creator)?;
+                let calls = ProgramResolvedCalls::try_new_with_creator_in(
+                    &graph,
+                    &units,
+                    calls,
+                    temporary,
+                    &mut retained,
+                    control,
+                )
+                .map_err(|e| e.map_owner(LocalProgramCompileError::from))?;
+                let channels = ProgramTypedChannels::try_new_with_creator_in(
+                    &graph,
+                    &units,
+                    &calls,
+                    channels,
+                    &mut retained,
+                    control,
+                )
+                .map_err(|e| e.map_owner(LocalProgramCompileError::from))?;
+                let mut creation = crate::creation::ProgramCreation {
+                    creator: Some(&mut retained),
+                };
+                let storage = creation.storage();
+                let mut published =
+                    creation.reserve::<LocalProgramCompileError, _>(units.len(), &mut work)?;
+                for unit in units {
+                    work.step()?;
+                    published.push(unit);
+                }
+                (calls, channels, published.into_boxed_slice(), storage)
+            }
+            None => {
+                let calls = ProgramResolvedCalls::try_new(&graph, &units, calls, control)
+                    .map_err(LocalProgramCompileError::from)?;
+                let channels =
+                    ProgramTypedChannels::try_new(&graph, &units, &calls, channels, control)
+                        .map_err(LocalProgramCompileError::from)?;
+                (
+                    calls,
+                    channels,
+                    units.into_boxed_slice(),
+                    novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+                )
+            }
         };
-        // Each delegated author finishes its completed work and propagates a
-        // first control refusal directly; no control object enters the product.
+        let provenance =
+            crate::compiled_origins::compile_origins(&graph, operators, allowed_sources, control)
+                .map_err(LocalProgramCompileError::from)?;
+        crate::provider_links::validate_provider_links(&graph, &channels, &writes, control)
+            .map_err(LocalProgramCompileError::from)?;
+        validate_exchange_inputs(&graph, &exchange_inputs, control)?;
+        validate_scan_inputs(&graph, &scan_inputs, control)?;
+        validate_aggregates(&graph, &aggregates, control)?;
         Ok(Self {
-            expressions,
+            graph,
+            units,
+            _unit_storage: unit_storage,
+            calls,
+            channels,
             provenance,
             writes,
             exchange_inputs,
@@ -363,11 +487,23 @@ impl LocalProgram {
             aggregates,
         })
     }
-    pub fn checked(&self) -> &ProgramLexicalBindings {
-        self.expressions.checked()
-    }
     pub fn graph(&self) -> &LocalProgramGraph {
-        self.expressions.graph()
+        &self.graph
+    }
+    pub fn units(&self) -> &[std::sync::Arc<novarocks_expression::CompiledExprSet>] {
+        &self.units
+    }
+    pub fn unit(
+        &self,
+        id: crate::ProgramUnitId,
+    ) -> Option<&std::sync::Arc<novarocks_expression::CompiledExprSet>> {
+        self.units.get(id.index())
+    }
+    pub fn resolved_calls(&self) -> &ProgramResolvedCalls {
+        &self.calls
+    }
+    pub fn channels(&self) -> &ProgramTypedChannels {
+        &self.channels
     }
     pub const fn provenance(&self) -> &ProgramProvenance {
         &self.provenance
@@ -375,73 +511,70 @@ impl LocalProgram {
     pub fn write_recipes(&self) -> &BTreeMap<ProgramNodeId, ConnectorWriteRecipe> {
         &self.writes
     }
-    /// Exact receiver address of every `ExchangeSource` node in this program.
     pub fn exchange_inputs(&self) -> &BTreeMap<ProgramNodeId, CompiledExchangeInput> {
         &self.exchange_inputs
     }
-    /// Exact physical scan address of every `Scan` node in this program.
     pub fn scan_inputs(&self) -> &BTreeMap<ProgramNodeId, CompiledScanInput> {
         &self.scan_inputs
     }
-    /// Exact grouping guarantee of every `Aggregate` node in this program.
     pub fn aggregates(&self) -> &BTreeMap<ProgramNodeId, CompiledAggregate> {
         &self.aggregates
     }
-    pub fn expressions(&self) -> &std::sync::Arc<crate::ExpressionProgram> {
-        &self.expressions
-    }
-    pub fn comparison_recipe(
-        &self,
-        site: ProgramComparisonSite,
-    ) -> Option<&novarocks_functions::PreparedComparisonRecipe> {
-        self.expressions.comparison_recipe(site)
-    }
-    pub fn null_safe_comparison_recipe(
-        &self,
-        site: crate::ProgramUseRef,
-    ) -> Option<&novarocks_functions::PreparedNullSafeComparisonRecipe> {
-        self.expressions.null_safe_comparison_recipe(site)
-    }
-    pub fn native_like_recipe(
-        &self,
-        site: crate::ProgramUseRef,
-    ) -> Option<&novarocks_functions::PreparedNativeLikeRecipe> {
-        self.expressions.native_like_recipe(site)
-    }
-    pub fn native_inlist_recipe(
-        &self,
-        site: crate::ProgramUseRef,
-    ) -> Option<&novarocks_functions::PreparedNativeInListRecipe> {
-        self.expressions.native_inlist_recipe(site)
-    }
-    pub fn native_negate_recipe(
-        &self,
-        site: crate::ProgramUseRef,
-    ) -> Option<&novarocks_functions::PreparedNativeNegateRecipe> {
-        self.expressions.native_negate_recipe(site)
-    }
-    pub fn native_bitnot_recipe(
-        &self,
-        site: crate::ProgramUseRef,
-    ) -> Option<&novarocks_functions::PreparedNativeBitNotRecipe> {
-        self.expressions.native_bitnot_recipe(site)
-    }
-    pub fn arithmetic_recipe(
-        &self,
-        site: crate::ProgramUseRef,
-    ) -> Option<&novarocks_functions::PreparedArithmeticRecipe> {
-        self.expressions.arithmetic_recipe(site)
-    }
-    pub fn cast_recipe(
-        &self,
-        site: crate::ProgramUseRef,
-    ) -> Option<&novarocks_functions::PreparedCastRecipe> {
-        self.expressions.cast_recipe(site)
-    }
-    /// Borrow the same expression owner's exact selected lifecycle.
     pub fn state_template(&self, site: ProgramCallSite) -> Option<ProgramStateTemplate<'_>> {
-        self.expressions.state_template(site)
+        self.calls.calls().get(&site).map(|c| c.state_template())
     }
+}
+
+/// Preserve the previous fragment-wide definition and constant-backing axes.
+/// Unit table positions are definitions even when their Arc is shared. Constant
+/// storage uses the original immutable pool's array identity and public facts.
+fn validate_unit_budgets<H>(
+    units: &[std::sync::Arc<novarocks_expression::CompiledExprSet>],
+    temporary: &mut crate::creation::ProgramCreation<'_, H>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), crate::ProgramCreationFailure<LocalProgramCompileError, H>> {
+    let mut definitions = 0usize;
+    for unit in units {
+        work.step()?;
+        definitions = definitions
+            .checked_add(unit.definitions().nodes().len())
+            .filter(|count| *count <= novarocks_expression::MAX_STATIC_EXPRESSIONS)
+            .ok_or(LocalProgramCompileError::TooManyDefinitions)?;
+    }
+    let mut arrays = BTreeSet::new();
+    let mut bytes = 0usize;
+    for unit in units {
+        work.step()?;
+        for definition in unit.definitions().nodes() {
+            work.step()?;
+            if let novarocks_expression::StaticExprKind::Constant(value) = definition.kind() {
+                let array = std::sync::Arc::as_ptr(value.pool().array()) as *const () as usize;
+                work.step()?;
+                if !arrays.contains(&array) {
+                    temporary.before_tree_insert::<LocalProgramCompileError, usize, ()>(
+                        arrays.len(),
+                        work,
+                    )?;
+                    arrays.insert(array);
+                    let facts = value.pool().resource_facts();
+                    let retained = facts
+                        .retained_buffer_capacity_bytes
+                        .checked_add(facts.metadata_bytes)
+                        .and_then(|bytes| usize::try_from(bytes).ok())
+                        .ok_or(LocalProgramCompileError::TooManyConstantBytes)?;
+                    bytes = bytes
+                        .checked_add(retained)
+                        .filter(|bytes| {
+                            *bytes <= novarocks_expression::MAX_STATIC_EXPRESSION_DYNAMIC_BYTES
+                        })
+                        .ok_or(LocalProgramCompileError::TooManyConstantBytes)?;
+                    work.step()?;
+                }
+            }
+        }
+    }
+    work.flush()?;
+    Ok(())
 }
 
 /// One compiled-only source address family: which nodes it addresses, which
@@ -495,8 +628,28 @@ fn validate_exchange_inputs(
         }
         for (id, input) in exchange_inputs {
             let layout = graph.nodes()[id.index()].output_layout();
-            let slots = layout.slots();
-            validate_exchange_wire_layout(*id, &input.wire_layout, layout, &mut work)?;
+            let transport = input.routing_layout.as_ref().unwrap_or(layout);
+            let slots = transport.slots();
+            validate_exchange_wire_layout(*id, &input.wire_layout, transport, &mut work)?;
+            if input.routing_layout.is_some() {
+                let [key] = input.hash_partition_slots.as_ref() else {
+                    return Err(LocalProgramCompileError::ExchangeInputMismatch(*id));
+                };
+                let prefix = layout.slots().len();
+                let exact = slots.len() == prefix + 1
+                    && slots.starts_with(layout.slots())
+                    && slots.last() == Some(key)
+                    && matches!(input.routing, CompiledExchangeRouting::Hash {
+                        algorithm: novarocks_type_contract::PartitionHashAlgorithm::NativeHierarchicalV1
+                    });
+                if !exact
+                    || !matches!(graph.nodes()[graph.root().index()].kind(),
+                    ProgramNodeKind::TableWriter { input, .. } if input == id)
+                {
+                    return Err(LocalProgramCompileError::ExchangeInputMismatch(*id));
+                }
+                validate_exchange_layout_prefix(*id, transport, layout, &mut work)?;
+            }
             let requirement = declarations.get(id).copied();
             if requirement != Some((input.role, input.delivery))
                 || (input.role != crate::ProgramOutputRole::Relational
@@ -563,8 +716,9 @@ fn validate_exchange_inputs(
                     if slot == key {
                         occurrences += 1;
                         supported = algorithm.is_some_and(|algorithm| {
-                            algorithm
-                                .supports_partition_key(layout.schema().field(ordinal).data_type())
+                            algorithm.supports_partition_key(
+                                transport.schema().field(ordinal).data_type(),
+                            )
                         });
                     }
                     work.step().map_err(LocalProgramCompileError::Control)?;
@@ -594,6 +748,15 @@ fn validate_exchange_wire_layout(
     if !wire.is_typed() || !local.is_typed() || wire.slots() != local.slots() {
         return Err(LocalProgramCompileError::ExchangeInputMismatch(id));
     }
+    validate_exchange_layout_prefix(id, wire, local, work)
+}
+
+fn validate_exchange_layout_prefix(
+    id: ProgramNodeId,
+    wire: &crate::StaticLayout,
+    local: &crate::StaticLayout,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), LocalProgramCompileError> {
     for ordinal in 0..local.slots().len() {
         work.step().map_err(LocalProgramCompileError::Control)?;
         let source = wire

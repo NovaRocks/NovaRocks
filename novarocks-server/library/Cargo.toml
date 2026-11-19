@@ -90,6 +90,8 @@ name = "json_object_invocation_runtime_funding"
 name = "window_output_schema_funding"
 
 [dev-dependencies]
+novarocks-expression.workspace = true
+novarocks-expression-contract.workspace = true
 novarocks-result-contract.workspace = true
 novarocks-local-program.workspace = true
 novarocks-execution = { workspace = true }

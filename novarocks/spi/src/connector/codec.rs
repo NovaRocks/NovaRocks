@@ -606,9 +606,12 @@ pub trait ConnectorWriteFragmentWireEncoder: Send + Sync {
 pub trait ConnectorWriteFragmentWireDecoder: Send + Sync {
     fn owner(&self) -> &str;
 
+    /// Retain the original result-window receipt for any newly owned artifact
+    /// backing until the decoded provider value exits.
     fn decode_commit_fragment_payload(
         &self,
         payload: &ConnectorEncodedPayload,
+        author: &super::ConnectorPayloadRetentionGuard,
     ) -> Result<ConnectorCommitFragment, ConnectorCodecError>;
 }
 

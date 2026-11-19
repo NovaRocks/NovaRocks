@@ -28,9 +28,10 @@ use crate::{
         value_type_clone_root_facts,
     },
 };
+use novarocks_expression_contract::PhysicalCallRequest;
 use novarocks_physical_plan::{
-    ConstantPolicy, ConstantPoolId, ConstantPools, ConstantReference, ExprId,
-    PhysicalCallDefinition, PhysicalCallRequest, PhysicalCallSite, StaticFunctionArgument,
+    ConstantPolicy, ConstantPoolId, ConstantPools, ConstantReference, PhysicalCallSite,
+    StaticFunctionArgument,
 };
 use novarocks_proto_models::physical_package_v2 as wire;
 use novarocks_type_contract::{
@@ -73,6 +74,7 @@ trait ReadFailure:
     + From<TypeCodecError>
     + From<CompileControlError>
     + From<novarocks_physical_plan::ConstantReferenceError>
+    + From<novarocks_constant_contract::ConstantTableError>
 {
     fn is_primary_refusal(&self) -> bool;
 }
@@ -90,16 +92,16 @@ type Parent<'a, F> = dyn FnMut(&Facts) -> Result<(), F> + 'a;
 
 /// This token loans the original DTO, checked type roots and admitted pools.
 /// Its raw output still requires the original Fragment coverage constructor.
-pub struct PreparedCallRequestsDecode<'loan> {
-    source: &'loan wire::FragmentCallRequests,
+pub struct PreparedCallRequestsDecode<'loan, W: RequestWire = wire::OriginalCallRequest> {
+    source: &'loan [W],
     types: CallRequestTypeOwner<'loan>,
     _pools: &'loan ConstantPools,
     control: &'loan dyn PureCompileControl,
     facts: Facts,
-    _keys: Vec<PhysicalCallDefinition>,
+    _keys: Vec<W::Key>,
     creation_storage: Option<novarocks_type_contract::ValueTypeStorageLifetime>,
 }
-impl PreparedCallRequestsDecode<'_> {
+impl<W: RequestWire> PreparedCallRequestsDecode<'_, W> {
     pub fn facts(&self) -> &Facts {
         &self.facts
     }
@@ -156,25 +158,15 @@ fn source_gate(source: usize, known: usize) -> Result<(), E> {
 fn required<T: Copy>(value: Option<T>, message: &'static str) -> Result<T, E> {
     value.ok_or_else(|| invalid(message))
 }
-fn definition(input: &wire::OriginalCallRequest) -> Result<PhysicalCallDefinition, E> {
+fn relation_definition(input: &wire::OriginalCallRequest) -> Result<PhysicalCallSite, E> {
     use wire::call_request_definition::Kind;
     match input.definition.as_ref().and_then(|d| d.kind.as_ref()) {
-        Some(Kind::ExpressionDefinitionId(id)) => {
-            Ok(PhysicalCallDefinition::Expression(ExprId::new(*id)))
-        }
-        Some(Kind::Relational(site)) => {
-            let site = crate::physical_semantics_v2::decode_call_site(site)?;
-            if matches!(site, PhysicalCallSite::Expression(_)) {
-                return Err(invalid(
-                    "expression use is not a relational request definition",
-                ));
-            }
-            Ok(PhysicalCallDefinition::Relational(site))
-        }
+        Some(Kind::Relational(site)) => Ok(crate::physical_semantics_v2::decode_call_site(site)?),
         None => Err(invalid("call request definition is absent")),
     }
 }
-fn policy(input: Option<&wire::SourceConstantPolicy>) -> Result<ConstantPolicy, E> {
+
+pub(crate) fn policy(input: Option<&wire::SourceConstantPolicy>) -> Result<ConstantPolicy, E> {
     let p = input.ok_or_else(|| invalid("call request constant policy is absent"))?;
     Ok(ConstantPolicy {
         max_rows: required(p.max_rows, "constant policy max_rows is absent")?,
@@ -283,6 +275,7 @@ struct Model {
     pools: usize,
     raw_work: usize,
     peak_work: usize,
+    output_map_work: usize,
 }
 impl Model {
     fn request<T>(&mut self, n: usize, copies: usize) -> Result<(), E> {
@@ -324,7 +317,7 @@ impl Model {
         let total = add(index, source_visits)?;
         let total = add(total, add(arguments, parameters)?)?;
         let total = add(total, add(references, self.comparisons)?)?;
-        self.raw_work = add(128, add(total, movement)?)?;
+        self.raw_work = add(self.output_map_work, add(128, add(total, movement)?)?)?;
         self.facts.cumulative_work_upper_bound = self.raw_work;
         if parent.is_some() {
             self.peak_work = self.peak_work.max(self.raw_work);
@@ -455,25 +448,26 @@ impl Model {
         Ok(compared.matches())
     }
 }
-fn capture_arguments<F: ReadFailure>(
-    entry: &wire::OriginalCallRequest,
+fn capture_arguments<F: ReadFailure, W: RequestWire>(
+    entry: &W,
     model: &mut Model,
     limits: Profile,
     parent: &mut Option<&mut Parent<'_, F>>,
 ) -> Result<(), F> {
-    model.arguments = add(model.arguments, entry.arguments.len())?;
+    model.arguments = add(model.arguments, entry.arguments().len())?;
     model.known = add(
         model.known,
-        bytes::<wire::OriginalFunctionArgument>(entry.arguments.capacity())?,
+        bytes::<wire::OriginalFunctionArgument>(entry.arguments().capacity())?,
     )?;
-    model.request::<StaticFunctionArgument>(entry.arguments.len(), 2)?;
+    model.request::<StaticFunctionArgument>(entry.arguments().len(), 2)?;
     if parent.is_some() {
         model.admit(limits, parent)?;
     }
     Ok(())
 }
-fn preflight<F: ReadFailure>(
-    source: &wire::FragmentCallRequests,
+fn preflight<F: ReadFailure, W: RequestWire>(
+    source: &[W],
+    source_capacity: usize,
     types: CallRequestTypeOwner<'_>,
     pools: &ConstantPools,
     invoice: usize,
@@ -481,13 +475,10 @@ fn preflight<F: ReadFailure>(
     parent: &mut Option<&mut Parent<'_, F>>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<Facts, F> {
-    let n = source.entries.len();
+    let n = source.len();
     let type_count = types.len();
     let pool_count = pools.entries().len();
-    let raw = add(
-        size_of::<wire::FragmentCallRequests>(),
-        bytes::<wire::OriginalCallRequest>(source.entries.capacity())?,
-    )?;
+    let raw = add(size_of::<Vec<W>>(), bytes::<W>(source_capacity)?)?;
     let type_roots = mul(
         type_count,
         add(size_of::<u32>(), size_of::<FunctionValueType>())?,
@@ -521,9 +512,28 @@ fn preflight<F: ReadFailure>(
         pools: pool_count,
         raw_work: 0,
         peak_work: 0,
+        output_map_work: 0,
     };
-    model.request::<PhysicalCallDefinition>(n, 1)?;
-    model.request::<(PhysicalCallDefinition, PhysicalCallRequest)>(n, 1)?;
+    model.request::<W::Key>(n, 1)?;
+    model.request::<(W::Key, PhysicalCallRequest)>(n, 1)?;
+    if W::MAP_OUTPUT {
+        let tree = crate::btree_resources_v2::insertion_only::<W::Key, PhysicalCallRequest>(n)
+            .map_err(|error| match error {
+                crate::btree_resources_v2::BTreeResourceError::Arithmetic(_) => resource(),
+                crate::btree_resources_v2::BTreeResourceError::SourceModel(message) => {
+                    invalid(message)
+                }
+            })?;
+        model.facts.allocation_requests_upper_bound = add(
+            model.facts.allocation_requests_upper_bound,
+            tree.allocation_requests_upper_bound,
+        )?;
+        model.facts.request_bytes_upper_bound = add(
+            model.facts.request_bytes_upper_bound,
+            tree.request_bytes_upper_bound,
+        )?;
+        model.output_map_work = tree.cumulative_work_upper_bound;
+    }
     observed(model.admit(limits, parent), w)?;
     // Visit the loaned pool namespace once. Maximum individual backing is an
     // alias-safe NECESSARY floor, not a complete host invoice or dedup upper.
@@ -541,32 +551,32 @@ fn preflight<F: ReadFailure>(
         )?;
     }
     model.known = add(model.known, maximum_pool_backing)?;
-    for entry in &source.entries {
+    for entry in source {
         if parent.is_some() {
             capture_arguments(entry, &mut model, limits, parent)?;
         }
-        let key = definition(entry);
+        let key = entry.definition();
         w.step()?;
         key?;
         let logical = required(
-            entry.logical_argument_count,
+            entry.logical_argument_count(),
             "request logical argument count is absent",
         );
         w.step()?;
         let logical = usize::try_from(logical?).map_err(|_| resource())?;
-        let valid = logical <= entry.arguments.len();
+        let valid = logical <= entry.arguments().len();
         w.step()?;
         if !valid {
             return Err(invalid("request logical argument count exceeds actual channels").into());
         }
-        let p = policy(entry.constant_policy.as_ref());
+        let p = policy(entry.constant_policy());
         w.step()?;
         p?;
         if parent.is_none() {
             capture_arguments(entry, &mut model, limits, parent)?;
         }
         observed(model.admit(limits, parent), w)?;
-        for argument in &entry.arguments {
+        for argument in entry.arguments() {
             match argument.kind.as_ref() {
                 Some(wire::original_function_argument::Kind::Value(input)) => {
                     model.facts.type_reference_count = add(model.facts.type_reference_count, 1)?;
@@ -623,7 +633,12 @@ fn preflight<F: ReadFailure>(
                         };
                         w.step()?;
                         if !matches {
-                            return Err(novarocks_physical_plan::ConstantReferenceError::SourceTypeMismatch(address).into());
+                            return Err(novarocks_physical_plan::ConstantReferenceError::Table(
+                                novarocks_constant_contract::ConstantTableError::SourceTypeMismatch(
+                                    address,
+                                ),
+                            )
+                            .into());
                         }
                     }
                 }
@@ -663,7 +678,7 @@ fn preflight<F: ReadFailure>(
             }
             w.step()?;
         }
-        if let Some(id) = entry.expected_result_value_type_id {
+        if let Some(id) = entry.expected_result_value_type_id() {
             model.facts.type_reference_count = add(model.facts.type_reference_count, 1)?;
             observed(model.admit(limits, parent), w)?;
             model.value(types, id, limits, parent, w)?;
@@ -676,8 +691,8 @@ fn preflight<F: ReadFailure>(
 // Same bounded heap-index geometry as the original BindingIndex, on complete
 // definition keys rather than dense/max-ID storage. Each comparison/move is
 // observed; there is no uninterruptible std sort or hidden key dictionary.
-fn sift(
-    keys: &mut [PhysicalCallDefinition],
+fn sift<K: Copy + Ord>(
+    keys: &mut [K],
     mut root: usize,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<(), E> {
@@ -706,13 +721,10 @@ fn sift(
         root = child;
     }
 }
-fn index(
-    source: &wire::FragmentCallRequests,
-    w: &mut CompileCheckpoints<'_>,
-) -> Result<Vec<PhysicalCallDefinition>, E> {
-    let mut keys = reserve(source.entries.len(), w)?;
-    for entry in &source.entries {
-        let key = definition(entry);
+fn index<W: RequestWire>(source: &[W], w: &mut CompileCheckpoints<'_>) -> Result<Vec<W::Key>, E> {
+    let mut keys = reserve(source.len(), w)?;
+    for entry in source {
+        let key = entry.definition();
         w.step()?;
         keys.push(key?);
     }
@@ -733,18 +745,19 @@ fn index(
     }
     Ok(keys)
 }
-fn prepare_core<'loan, 'control: 'loan, F: ReadFailure>(
-    source: Option<&'loan wire::FragmentCallRequests>,
+fn prepare_entries_core<'loan, 'control: 'loan, F: ReadFailure, W: RequestWire>(
+    source: &'loan [W],
+    source_capacity: usize,
     types: CallRequestTypeOwner<'loan>,
     pools: &'loan ConstantPools,
     source_retained_bytes: usize,
     limits: Profile,
     parent: &mut Option<&mut Parent<'_, F>>,
     work: &mut CompileCheckpoints<'control>,
-) -> Result<PreparedCallRequestsDecode<'loan>, F> {
-    let source = source.ok_or_else(|| invalid("fragment call request table is absent"))?;
+) -> Result<PreparedCallRequestsDecode<'loan, W>, F> {
     let facts = preflight(
         source,
+        source_capacity,
         types,
         pools,
         source_retained_bytes,
@@ -763,6 +776,27 @@ fn prepare_core<'loan, 'control: 'loan, F: ReadFailure>(
         _keys: keys,
         creation_storage: None,
     })
+}
+fn prepare_core<'loan, 'control: 'loan, F: ReadFailure>(
+    source: Option<&'loan wire::FragmentCallRequests>,
+    types: CallRequestTypeOwner<'loan>,
+    pools: &'loan ConstantPools,
+    source_retained_bytes: usize,
+    limits: Profile,
+    parent: &mut Option<&mut Parent<'_, F>>,
+    work: &mut CompileCheckpoints<'control>,
+) -> Result<PreparedCallRequestsDecode<'loan>, F> {
+    let source = source.ok_or_else(|| invalid("fragment call request table is absent"))?;
+    prepare_entries_core(
+        &source.entries,
+        source.entries.capacity(),
+        types,
+        pools,
+        source_retained_bytes,
+        limits,
+        parent,
+        work,
+    )
 }
 
 pub fn prepare_call_requests_decode<'loan>(
@@ -865,17 +899,17 @@ fn prepare_with_creator_core<'loan, 'control: 'loan, H>(
     Ok(token)
 }
 
-fn decode_core(
-    token: PreparedCallRequestsDecode<'_>,
+fn decode_core<W: RequestWire>(
+    token: PreparedCallRequestsDecode<'_, W>,
     work: &mut CompileCheckpoints<'_>,
     storage: Option<&novarocks_type_contract::ValueTypeStorageLifetime>,
-) -> Result<Vec<(PhysicalCallDefinition, PhysicalCallRequest)>, E> {
-    let mut output = reserve(token.source.entries.len(), work)?;
-    for entry in &token.source.entries {
-        let key = definition(entry);
+) -> Result<Vec<(W::Key, PhysicalCallRequest)>, E> {
+    let mut output = reserve(token.source.len(), work)?;
+    for entry in token.source {
+        let key = entry.definition();
         work.step()?;
-        let mut arguments = reserve(entry.arguments.len(), work)?;
-        for argument in &entry.arguments {
+        let mut arguments = reserve(entry.arguments().len(), work)?;
+        for argument in entry.arguments() {
             let argument = match argument.kind.as_ref() {
                 Some(wire::original_function_argument::Kind::Value(input)) => {
                     let id = required(
@@ -941,7 +975,7 @@ fn decode_core(
             arguments.push(argument);
             work.step()?;
         }
-        let expected_result_type = match entry.expected_result_value_type_id {
+        let expected_result_type = match entry.expected_result_value_type_id() {
             Some(id) => Some(clone_value_type_observed(
                 value(token.types, id, work)?,
                 work,
@@ -949,12 +983,12 @@ fn decode_core(
             None => None,
         };
         let logical = required(
-            entry.logical_argument_count,
+            entry.logical_argument_count(),
             "request logical argument count is absent",
         );
         work.step()?;
         let logical_argument_count = usize::try_from(logical?).map_err(|_| resource())?;
-        let constant_policy = policy(entry.constant_policy.as_ref());
+        let constant_policy = policy(entry.constant_policy());
         work.step()?;
         output.push((
             key?,
@@ -972,7 +1006,7 @@ fn decode_core(
 }
 pub fn decode_call_requests(
     token: PreparedCallRequestsDecode<'_>,
-) -> Result<Vec<(PhysicalCallDefinition, PhysicalCallRequest)>, E> {
+) -> Result<Vec<(PhysicalCallSite, PhysicalCallRequest)>, E> {
     let mut work = CompileCheckpoints::try_new(token.control, CompilePhase::Decode)?;
     let result = decode_core(token, &mut work, None);
     finish(work, result)
@@ -982,7 +1016,7 @@ pub(crate) fn decode_call_requests_in(
     token: PreparedCallRequestsDecode<'_>,
     admit: &mut CallRequestAdmit<'_>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<Vec<(PhysicalCallDefinition, PhysicalCallRequest)>, E> {
+) -> Result<Vec<(PhysicalCallSite, PhysicalCallRequest)>, E> {
     if !std::ptr::addr_eq(token.control, work.control()) {
         return Err(invalid(
             "call request prepared controller differs from caller",
@@ -994,17 +1028,17 @@ pub(crate) fn decode_call_requests_in(
     decode_core(token, work, None)
 }
 pub struct DecodedCallRequests {
-    entries: Vec<(PhysicalCallDefinition, PhysicalCallRequest)>,
+    entries: Vec<(PhysicalCallSite, PhysicalCallRequest)>,
     storage: novarocks_type_contract::ValueTypeStorageLifetime,
 }
 impl DecodedCallRequests {
-    pub fn entries(&self) -> &[(PhysicalCallDefinition, PhysicalCallRequest)] {
+    pub fn entries(&self) -> &[(PhysicalCallSite, PhysicalCallRequest)] {
         &self.entries
     }
     pub fn into_parts(
         self,
     ) -> (
-        Vec<(PhysicalCallDefinition, PhysicalCallRequest)>,
+        Vec<(PhysicalCallSite, PhysicalCallRequest)>,
         novarocks_type_contract::ValueTypeStorageLifetime,
     ) {
         (self.entries, self.storage)
@@ -1030,3 +1064,114 @@ pub fn decode_call_requests_with_creator_in<H>(
 #[cfg(test)]
 #[path = "read_tests.rs"]
 mod tests;
+
+/// Borrowed fields of the two disjoint request-address vocabularies. The
+/// original grammar, type/constant checks and Creator projection stay shared.
+pub trait RequestWire {
+    type Key: Copy + Ord;
+    const MAP_OUTPUT: bool;
+    fn definition(&self) -> Result<Self::Key, E>;
+    fn arguments(&self) -> &Vec<wire::OriginalFunctionArgument>;
+    fn logical_argument_count(&self) -> Option<u32>;
+    fn expected_result_value_type_id(&self) -> Option<u32>;
+    fn constant_policy(&self) -> Option<&wire::SourceConstantPolicy>;
+}
+impl RequestWire for wire::OriginalCallRequest {
+    type Key = PhysicalCallSite;
+    const MAP_OUTPUT: bool = false;
+    fn definition(&self) -> Result<Self::Key, E> {
+        relation_definition(self)
+    }
+    fn arguments(&self) -> &Vec<wire::OriginalFunctionArgument> {
+        &self.arguments
+    }
+    fn logical_argument_count(&self) -> Option<u32> {
+        self.logical_argument_count
+    }
+    fn expected_result_value_type_id(&self) -> Option<u32> {
+        self.expected_result_value_type_id
+    }
+    fn constant_policy(&self) -> Option<&wire::SourceConstantPolicy> {
+        self.constant_policy.as_ref()
+    }
+}
+impl RequestWire for wire::UnitCallRequest {
+    type Key = novarocks_expression_contract::ExprId;
+    const MAP_OUTPUT: bool = true;
+    fn definition(&self) -> Result<Self::Key, E> {
+        Ok(Self::Key::new(required(
+            self.definition_id,
+            "unit request definition is absent",
+        )?))
+    }
+    fn arguments(&self) -> &Vec<wire::OriginalFunctionArgument> {
+        &self.arguments
+    }
+    fn logical_argument_count(&self) -> Option<u32> {
+        self.logical_argument_count
+    }
+    fn expected_result_value_type_id(&self) -> Option<u32> {
+        self.expected_result_value_type_id
+    }
+    fn constant_policy(&self) -> Option<&wire::SourceConstantPolicy> {
+        self.constant_policy.as_ref()
+    }
+}
+type DecodedUnitRequests = (
+    std::collections::BTreeMap<novarocks_expression_contract::ExprId, PhysicalCallRequest>,
+    novarocks_type_contract::ValueTypeStorageLifetime,
+    Facts,
+);
+pub(crate) fn decode_unit_requests_in<H>(
+    source: &Vec<wire::UnitCallRequest>,
+    types: &DecodedTypeTable,
+    pools: &ConstantPools,
+    invoice: usize,
+    limits: Limits,
+    observe: &mut CallRequestAdmit<'_>,
+    mut creation: Option<&mut novarocks_type_contract::ValueSchemaCreation<'_, H>>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<DecodedUnitRequests, crate::host_projection_v2::ProjectionFailure<E, H>> {
+    use crate::host_projection_v2::ProjectionFailure as Failure;
+    let storage = creation.as_ref().map_or_else(
+        novarocks_type_contract::ValueTypeStorageLifetime::pure,
+        |creation| creation.storage_lifetime(),
+    );
+    let mut previous = 0usize;
+    let mut admit = |facts: &Facts| -> Result<(), Failure<E, H>> {
+        observe(facts).map_err(E::from)?;
+        let additional = facts
+            .request_bytes_upper_bound
+            .checked_sub(previous)
+            .ok_or_else(|| Failure::from(resource()))?;
+        if additional != 0
+            && let Some(creation) = creation.as_deref_mut()
+        {
+            creation
+                .observe_opaque_upper_bound(additional)
+                .map_err(Failure::Host)?;
+        }
+        previous = facts.request_bytes_upper_bound;
+        Ok(())
+    };
+    let token = prepare_entries_core(
+        source,
+        source.capacity(),
+        CallRequestTypeOwner::Package(types),
+        pools,
+        invoice,
+        limits.into(),
+        &mut Some(&mut admit),
+        work,
+    )?;
+    let facts = token.facts;
+    let entries = decode_core(token, work, Some(&storage))?;
+    let mut output = std::collections::BTreeMap::new();
+    for (id, request) in entries {
+        work.flush()?;
+        output.insert(id, request);
+        work.step()?;
+        work.flush()?;
+    }
+    Ok((output, storage, facts))
+}

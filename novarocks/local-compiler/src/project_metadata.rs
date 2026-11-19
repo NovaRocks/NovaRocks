@@ -19,7 +19,7 @@
 //! These pure requests establish no scope, domain or allocation permission.
 use crate::FragmentCompileError;
 use arrow_schema::{Field, FieldRef, Schema};
-use novarocks_local_program::{ProgramExprId, StaticLayout};
+use novarocks_local_program::{ProgramRootRef, StaticLayout};
 use novarocks_physical_plan::NodeId;
 use novarocks_type_contract::{
     CompileCheckpoints, CompleteMetadataRequestFacts, FunctionValueType, MetadataRequestError,
@@ -36,7 +36,7 @@ pub struct ProjectOutputRequestFacts {
 }
 pub struct ProjectMetadataOutput {
     pub layout: StaticLayout,
-    pub exprs: Vec<ProgramExprId>,
+    pub exprs: Vec<ProgramRootRef>,
     pub expr_slot_ids: Vec<SlotId>,
 }
 pub enum ProjectMetadataFailure<H, C = FragmentCompileError> {
@@ -168,7 +168,7 @@ fn typed_output_requests<'a>(
         }
         if project_vectors {
             fresh_push::<SlotId>(count, work, &mut sum)?;
-            fresh_push::<ProgramExprId>(count, work, &mut sum)?;
+            fresh_push::<ProgramRootRef>(count, work, &mut sum)?;
         }
         sum.allocation(layout::arc_layout(array::<FieldRef>(count)?)?, 1)?;
         sum.allocation(layout::arc_layout(Layout::new::<Schema>())?, 1)?;

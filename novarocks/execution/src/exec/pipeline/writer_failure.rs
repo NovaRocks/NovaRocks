@@ -52,14 +52,6 @@ pub enum WriterFailure {
         limit: usize,
     },
     AlreadyBound,
-    InputBatchRows {
-        rows: usize,
-        limit: usize,
-    },
-    InputBatchBytes {
-        bytes: usize,
-        limit: usize,
-    },
     QueueCapacity {
         dimension: ResourceDimension,
         incoming: usize,
@@ -83,10 +75,6 @@ pub enum WriterFailure {
     PartialDemandClosed,
     ActorInterrupted,
     ExitUnresolved,
-    CommitFragmentLimit {
-        requested: usize,
-        limit: usize,
-    },
     Panicked {
         operation: Option<ConnectorOperation>,
         detail: BoundedDetail,
@@ -110,14 +98,6 @@ impl fmt::Display for WriterFailure {
             Self::OutputBytes { bytes, limit } => write!(
                 f,
                 "table writer output requires {bytes} bytes under a {limit} byte construction profile"
-            ),
-            Self::InputBatchRows { rows, limit } => write!(
-                f,
-                "connector writer input batch has {rows} rows, above the per-batch limit of {limit} rows"
-            ),
-            Self::InputBatchBytes { bytes, limit } => write!(
-                f,
-                "connector writer input batch retains {bytes} bytes, above the per-batch limit of {limit} bytes"
             ),
             Self::QueueCapacity {
                 dimension,
@@ -145,10 +125,6 @@ impl fmt::Display for WriterFailure {
                 write!(f, "connector writer {operation} mailbox is closed")
             }
             Self::AlreadyBound => f.write_str("connector writer actor is already bound"),
-            Self::CommitFragmentLimit { requested, limit } => write!(
-                f,
-                "table writer commit fragment of {requested} bytes exceeds the frozen single-fragment budget of {limit} bytes"
-            ),
             Self::PartialDemandClosed => {
                 f.write_str("writer partial aggregate closed before the writer input ended")
             }
@@ -190,14 +166,6 @@ impl FailureProjection for WriterFailure {
             Self::OutputBytes { .. } => {
                 (FailureClass::Resource, ExecutionReason::WriterOutputBytes)
             }
-            Self::InputBatchRows { .. } => (
-                FailureClass::Resource,
-                ExecutionReason::WriterInputBatchRows,
-            ),
-            Self::InputBatchBytes { .. } => (
-                FailureClass::Resource,
-                ExecutionReason::WriterInputBatchBytes,
-            ),
             Self::QueueCapacity { .. } => {
                 (FailureClass::Resource, ExecutionReason::WriterQueueCapacity)
             }
@@ -232,10 +200,6 @@ impl FailureProjection for WriterFailure {
             Self::ActorInterrupted => {
                 (FailureClass::Unexpected, ExecutionReason::WriterInterrupted)
             }
-            Self::CommitFragmentLimit { .. } => (
-                FailureClass::Resource,
-                ExecutionReason::WriterCommitFragmentLimit,
-            ),
             Self::Panicked { .. } => (FailureClass::Unexpected, ExecutionReason::WriterPanicked),
             Self::AbortTimeout { .. } => {
                 (FailureClass::Control, ExecutionReason::WriterAbortTimeout)
@@ -246,22 +210,13 @@ impl FailureProjection for WriterFailure {
             ),
         };
         let fact = FailureFact::new(class, code.reason());
-        let capacity = match self {
-            Self::InputBatchRows { rows, limit } => {
-                Some((ResourceDimension::Positions, *rows, None, *limit))
-            }
-            Self::InputBatchBytes { bytes, limit } => {
-                Some((ResourceDimension::Bytes, *bytes, None, *limit))
-            }
-            Self::QueueCapacity {
-                dimension,
-                incoming,
-                live,
-                limit,
-            } => Some((*dimension, *incoming, Some(*live), *limit)),
-            _ => None,
-        };
-        if let Some((dimension, incoming, live, limit)) = capacity {
+        if let Self::QueueCapacity {
+            dimension,
+            incoming,
+            live,
+            limit,
+        } = *self
+        {
             return fact.with_resource(ResourceFacts {
                 request_scope: Some(ResourceScope::Request),
                 constraint_scope: Some(ResourceScope::Operator),
@@ -269,7 +224,7 @@ impl FailureProjection for WriterFailure {
                 requested: u64::try_from(incoming).ok(),
                 required_growth: None,
                 limit: u64::try_from(limit).ok(),
-                live: live.and_then(|live| u64::try_from(live).ok()),
+                live: u64::try_from(live).ok(),
                 committed: None,
             });
         }
@@ -284,8 +239,7 @@ impl FailureProjection for WriterFailure {
                 live: None,
                 committed: Some(*current),
             })
-        } else if let Self::CommitFragmentLimit { requested, limit }
-        | Self::OutputBytes {
+        } else if let Self::OutputBytes {
             bytes: requested,
             limit,
         } = self

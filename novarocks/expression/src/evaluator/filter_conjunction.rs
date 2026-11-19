@@ -1,0 +1,300 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+//! One ordered Filter/Scan conjunct consumer over the actual original root sites.
+//! The expression evaluator and BooleanRows remain their sole existing authors.
+use super::boolean_region::BooleanRows;
+use super::*;
+use novarocks_type_contract::EvaluationDemand;
+
+pub struct CompiledFilterConjunctionInstance {
+    roots: Vec<CompiledExpressionInstance>,
+    failed: bool,
+}
+fn same_input_scope(
+    left: &crate::ScopeLayout,
+    right: &crate::ScopeLayout,
+    work: &mut Work<'_, '_>,
+) -> Result<bool, KernelFailure> {
+    if std::ptr::eq(left, right) {
+        return Ok(true);
+    }
+    work.flush()?;
+    let same_metadata = left.schema().metadata() == right.schema().metadata();
+    work.flush()?;
+    if !same_metadata
+        || left.schema().fields().len() != right.schema().fields().len()
+        || left.ordinal_types().len() != right.ordinal_types().len()
+    {
+        return Ok(false);
+    }
+    if !Arc::ptr_eq(left.schema(), right.schema()) {
+        for (expected, actual) in left.schema().fields().iter().zip(right.schema().fields()) {
+            if !novarocks_type_contract::arrow_fields_exact_observed(expected, actual, || {
+                work.step()
+            })? {
+                return Ok(false);
+            }
+        }
+    }
+    for (expected, actual) in left.ordinal_types().iter().zip(right.ordinal_types()) {
+        if !expected.exactly_equals_checked_observed(actual, || work.step())? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+impl CompiledFilterConjunctionInstance {
+    pub fn try_new_with_allocator(
+        predicates: &[(Arc<CompiledExprSet>, RootOrdinal)],
+        control: &dyn KernelEvaluationControl,
+        allocator: Option<Arc<dyn novarocks_functions::AggregateStateAllocator>>,
+    ) -> Result<Self, KernelFailure> {
+        let observed = ObservedControl {
+            original: control,
+            refused: AtomicBool::new(false),
+            operation_aborted: AtomicBool::new(false),
+        };
+        let mut work: Work<'_, '_> = Work {
+            control: &observed,
+            pending: 0,
+            scalar_host: None,
+        };
+        let result = (|| {
+            work.control.checkpoint(0)?;
+            if predicates.is_empty() {
+                return Err(invalid("Filter conjunction has no original predicate"));
+            }
+            let mut roots = Vec::with_capacity(predicates.len());
+            let mut actual_input: Option<&crate::ScopeLayout> = None;
+            for (program, site) in predicates {
+                let site = *site;
+                let root = program
+                    .root(site)
+                    .ok_or_else(|| invalid("missing original Filter predicate root"))?;
+                if root.demand != EvaluationDemand::TruthOnly {
+                    return Err(invalid("Filter predicate differs from its original demand"));
+                }
+                let FunctionArgumentType::Value(ty) = program
+                    .types()
+                    .get(root.definition.index())
+                    .ok_or_else(|| invalid("missing Filter predicate full type"))?
+                else {
+                    return Err(invalid("Filter predicate is not a value"));
+                };
+                if *ty.data_type() != DataType::Boolean
+                    || ty.logical_type() != novarocks_type_contract::ValueLogicalType::Physical
+                {
+                    return Err(invalid(
+                        "Filter predicate is not its original physical Boolean",
+                    ));
+                }
+                let instance = CompiledExpressionInstance::try_new_with_allocator(
+                    Arc::clone(program),
+                    site,
+                    work.control,
+                    allocator.clone(),
+                )?;
+                if program.scopes().is_empty() {
+                    return Err(invalid("Filter predicate has no original input port"));
+                }
+                let input = program
+                    .scope(instance.input)
+                    .ok_or_else(|| invalid("Filter input scope is absent"))?;
+                if let Some(previous) = actual_input {
+                    if !same_input_scope(previous, input, &mut work)? {
+                        return Err(invalid(
+                            "Filter predicates read different original input ports",
+                        ));
+                    }
+                } else {
+                    actual_input = Some(input);
+                }
+                roots.push(instance);
+                work.step()?;
+            }
+            Ok(Self {
+                roots,
+                failed: false,
+            })
+        })();
+        work.finish(result)
+    }
+    #[cfg(test)]
+    pub(crate) fn constructed_root_call_instances(&self, predicate: usize) -> usize {
+        self.roots[predicate].instances.len()
+    }
+    fn root_is_pure(root: &CompiledExpressionInstance) -> Result<bool, KernelFailure> {
+        let compiled_root = root
+            .program
+            .root(root.root)
+            .ok_or_else(|| invalid("missing actual Filter root effects site"))?;
+        let invocation = &root.program.control_flow().uses()[&compiled_root.use_id];
+        root.effects
+            .get(&compiled_root.use_id)
+            .ok_or_else(|| invalid("missing actual Filter root effects"))?
+            .for_use(invocation.context)
+            .map(|effects| effects.permits_boolean_reordering())
+            .map_err(|_| invalid("Filter root effects differ from their original context"))
+    }
+    fn evaluate_once<'a, R>(
+        &mut self,
+        input: FrameInput<'_>,
+        selection: Selection<'a>,
+        work: &mut Work<'_, '_, R>,
+    ) -> Result<(SelectedValues<'a>, Box<[RootOrdinal]>), ExprEvaluationFailure<R>> {
+        if input.num_rows() != selection.batch_rows() {
+            return Err(invalid("Filter selection differs from its actual batch").into());
+        }
+        let mut boolean = BooleanRows::new(selection.len(), work)?;
+        let mut terminal = BTreeMap::new();
+        let mut origins = BTreeMap::new();
+        let mut remaining = Vec::with_capacity(selection.len());
+        for ordinal in 0..selection.len() {
+            remaining.push(ordinal);
+            work.step()?;
+        }
+        for root in &mut self.roots {
+            let pure = Self::root_is_pure(root)?;
+            work.step()?;
+            if !pure {
+                boolean.boundary(&mut terminal, &mut remaining, work)?;
+            }
+            if remaining.is_empty() {
+                if selection.is_empty() {
+                    // A zero-row invocation validates the entire original port,
+                    // but the existing Frame enters no child/kernel constructor.
+                    let output = root.evaluate_input_controlled::<R>(
+                        input,
+                        selection,
+                        selection,
+                        novarocks_functions::ScalarInvocationActivation::ValidateOnly,
+                        work.control,
+                        work.scalar_host
+                            .as_deref_mut()
+                            .expect("Filter lends its scalar host"),
+                    )?;
+                    work.flush()?;
+                    drop(output);
+                    work.flush()?;
+                    continue;
+                }
+                break;
+            }
+            let mut batch_rows = Vec::with_capacity(remaining.len());
+            for &parent in &remaining {
+                batch_rows.push(
+                    selection
+                        .row(parent)
+                        .ok_or_else(|| internal("Filter surviving ordinal has no batch row"))?,
+                );
+                work.step()?;
+            }
+            let actual_selection =
+                Selection::try_sparse_observed(input.num_rows(), &batch_rows, || work.step())?;
+            let output = root.evaluate_input_controlled::<R>(
+                input,
+                selection,
+                actual_selection,
+                novarocks_functions::ScalarInvocationActivation::Activated,
+                work.control,
+                work.scalar_host
+                    .as_deref_mut()
+                    .expect("Filter lends its scalar host"),
+            )?;
+            for error in output.errors() {
+                let parent = *remaining.get(error.selected_ordinal()).ok_or_else(|| {
+                    internal("Filter child error ordinal is outside its actual selection")
+                })?;
+                origins.entry(parent).or_insert(root.root);
+                work.step()?;
+            }
+            remaining = boolean.consume(
+                &output,
+                &remaining,
+                ControlShape::Conjunction,
+                EvaluationDemand::TruthOnly,
+                pure,
+                &mut terminal,
+                work,
+            )?;
+            work.flush()?;
+            drop(output);
+            work.flush()?;
+        }
+        let (values, errors) = boolean.finish(
+            ControlShape::Conjunction,
+            EvaluationDemand::TruthOnly,
+            terminal,
+            work,
+        )?;
+        let mut sites = Vec::with_capacity(errors.len());
+        for error in errors.iter() {
+            sites.push(
+                *origins.get(&error.selected_ordinal()).ok_or_else(|| {
+                    internal("required Filter error lost its original source site")
+                })?,
+            );
+            work.step()?;
+        }
+        let selected = SelectedValues::try_new(selection, &DataType::Boolean, values, errors)
+            .map_err(|_| internal("Filter conjunction produced invalid selected values"))?;
+        Ok((selected, sites.into_boxed_slice()))
+    }
+    /// Public error publication occurs only after the complete legal region.
+    /// It preserves the original predicate site and actual batch-row mapping.
+    pub fn evaluate<R>(
+        &mut self,
+        input: EvaluationInput<'_>,
+        selection: Selection<'_>,
+        control: &dyn KernelEvaluationControl,
+        host: &mut dyn ScalarCallHost<Refusal = R>,
+    ) -> Result<ArrayRef, ExprEvaluationFailure<R>> {
+        let input = FrameInput::new(input);
+        if self.failed {
+            return Err(KernelFailure::InstanceFailed.into());
+        }
+        let observed = ObservedControl {
+            original: control,
+            refused: AtomicBool::new(false),
+            operation_aborted: AtomicBool::new(false),
+        };
+        let mut work = Work {
+            control: &observed,
+            pending: 0,
+            scalar_host: Some(host),
+        };
+        let result = (|| {
+            work.control.checkpoint(0)?;
+            self.evaluate_once::<R>(input, selection, &mut work)
+        })();
+        let result = work.finish_evaluation(result);
+        let result = result.and_then(|(selected, sites)| {
+            let (selection, values, errors) = selected.into_parts();
+            if let Some(error) = errors.into_vec().into_iter().next() {
+                let site = *sites
+                    .first()
+                    .ok_or_else(|| internal("required Filter error has no source site"))?;
+                return Err(RequiredExpressionRowError::try_new(site, selection, error)?.into());
+            }
+            Ok(values)
+        });
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+}

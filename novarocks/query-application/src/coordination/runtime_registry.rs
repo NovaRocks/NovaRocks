@@ -17,16 +17,21 @@
 
 //! Process-owned logical-execution runtime registration.
 //!
-//! Reservation precedes actor spawn, and installation cannot fail after spawn.
-//! The registry retains both actor ingress and its join handle until a real
-//! join produces the exact move-only receipt required for retirement.
+//! Reservation precedes installation in the FE runtime. The same registration
+//! retains original ingress, actual runtime exit and Native return custody.
+//! Cancellation of a wait never replaces these original retirement facts.
 
 pub(super) mod health;
+mod runtime_installed;
+use crate::api::logical_runtime::{
+    InstalledLogicalExecution as InstalledRuntime, LogicalExit, LogicalSourceKind,
+};
+#[cfg(test)]
+use crate::api::logical_runtime::{LogicalHostFact, LogicalJoinReadiness};
+use runtime_installed::{RuntimeCarrier, RuntimeInstalledEntry};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::Poll;
@@ -35,16 +40,14 @@ use std::time::Instant;
 use super::original_exit::{OriginalAssociation, OriginalLogicalExit};
 use novarocks_execution_contract::ParticipationRef;
 use novarocks_types::identity::{QueryExecutionId, QueryId};
-use tokio::runtime::Handle;
 use tokio::sync::Notify;
-use tokio::task::{JoinError, JoinHandle};
 
-use crate::coordination::{
-    AttemptInstantiationPermit, LogicalExecutionActor, LogicalExecutionActorConfig,
-    LogicalExecutionActorError, LogicalExecutionOutputTransfer, RegistryClose,
-    RegistryParticipationConvergence, assert_shutdown_complete, spawn_logical_execution_actor,
-};
+use crate::coordination::assert_shutdown_complete;
 use novarocks_coordination_contract::LogicalExecutionActorId;
+use novarocks_logical_execution_protocol::input::RegistryClose;
+
+#[cfg(test)]
+use novarocks_logical_execution_protocol::input::RegistryParticipationConvergence;
 
 static NEXT_REGISTRY_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -98,7 +101,6 @@ impl Drop for LogicalExecutionRuntimeRegistry {
 
 struct RegistryInner {
     id: u64,
-    runtime: Handle,
     state: Mutex<RegistryState>,
     progress: Arc<Notify>,
     original_exit_ready: AtomicBool,
@@ -110,6 +112,12 @@ struct RegistryState {
     accepting: bool,
     next_generation: u64,
     entries: BTreeMap<QueryId, RegistryEntry>,
+}
+
+#[derive(Default)]
+pub(super) struct OriginalExitCursor {
+    key: Option<QueryId>,
+    active: bool,
 }
 
 impl Default for RegistryState {
@@ -131,13 +139,7 @@ impl Default for RegistryState {
 pub struct LogicalExecutionRegistryEntryGeometry {
     record: std::alloc::Layout,
     internal_health_field: std::alloc::Layout,
-    actor_join_backing: std::alloc::Layout,
-    actor_join_failure: std::alloc::Layout,
-    actor_join_wake: std::alloc::Layout,
-    close_wait_frame: std::alloc::Layout,
     native_active_slot: std::alloc::Layout,
-    native_consumer_future_frame: std::alloc::Layout,
-    native_tail_wake: std::alloc::Layout,
 }
 impl LogicalExecutionRegistryEntryGeometry {
     pub const fn record_layout(self) -> std::alloc::Layout {
@@ -145,24 +147,6 @@ impl LogicalExecutionRegistryEntryGeometry {
     }
     pub const fn internal_health_field_layout(self) -> std::alloc::Layout {
         self.internal_health_field
-    }
-    pub const fn actor_join_backing_layout(self) -> std::alloc::Layout {
-        self.actor_join_backing
-    }
-    pub const fn actor_join_failure_layout(self) -> std::alloc::Layout {
-        self.actor_join_failure
-    }
-    pub const fn actor_join_wake_layout(self) -> std::alloc::Layout {
-        self.actor_join_wake
-    }
-    pub const fn close_wait_frame_layout(self) -> std::alloc::Layout {
-        self.close_wait_frame
-    }
-    pub const fn native_consumer_future_layout(self) -> std::alloc::Layout {
-        self.native_consumer_future_frame
-    }
-    pub const fn native_tail_wake_layout(self) -> std::alloc::Layout {
-        self.native_tail_wake
     }
     pub const fn native_active_slot_layout(self) -> std::alloc::Layout {
         self.native_active_slot
@@ -179,216 +163,48 @@ impl LogicalExecutionRegistryEntryGeometry {
         )
     }
 }
+impl Default for LogicalExecutionRuntimeRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LogicalExecutionRuntimeRegistry {
     /// No registry, actor, consumer or allocation is created by this getter.
     pub fn entry_geometry() -> LogicalExecutionRegistryEntryGeometry {
         LogicalExecutionRegistryEntryGeometry {
             record: std::alloc::Layout::new::<RegistryEntry>(),
             internal_health_field: std::alloc::Layout::new::<Option<InternalConsumerHealth>>(),
-            actor_join_backing: novarocks_type_contract::owned_resources::layout::arc_layout(
-                std::alloc::Layout::new::<OriginalActorJoin>(),
-            )
-            .expect("fixed original join layout"),
-            actor_join_wake: novarocks_type_contract::owned_resources::layout::arc_layout(
-                std::alloc::Layout::new::<OriginalJoinWake>(),
-            )
-            .expect("fixed original join wake layout"),
-            actor_join_failure: novarocks_type_contract::owned_resources::layout::arc_layout(
-                std::alloc::Layout::new::<JoinError>(),
-            )
-            .expect("fixed original join failure layout"),
-            close_wait_frame: original_close_wait_layout(original_close_wait),
             native_active_slot: super::NativeActiveCustodyRegistry::slot_layout(),
-            native_consumer_future_frame:
-                super::NativeActiveCustodyRegistry::consumer_task_frame_layout(),
-            native_tail_wake: super::NativeActiveCustodyRegistry::tail_wake_layout(),
-        }
-    }
-}
-
-// Original actor join custody. The synchronous lease moves the SAME handle
-// only while polling outside both mutexes; Pending/unwind restores it.
-struct OriginalActorJoin {
-    state: Mutex<OriginalActorJoinState>,
-    wake: Arc<OriginalJoinWake>,
-}
-struct OriginalJoinWake {
-    registry: std::sync::Weak<RegistryInner>,
-    forward: futures::task::AtomicWaker,
-}
-impl std::task::Wake for OriginalJoinWake {
-    fn wake(self: Arc<Self>) {
-        self.wake_by_ref();
-    }
-    fn wake_by_ref(self: &Arc<Self>) {
-        if let Some(registry) = self.registry.upgrade() {
-            registry.original_exit_ready.store(true, Ordering::Release);
-            registry.progress.notify_waiters();
-        }
-        self.forward.wake();
-    }
-}
-#[derive(Default)]
-pub(super) struct OriginalExitCursor {
-    key: Option<QueryId>,
-    active: bool,
-}
-struct OriginalActorJoinState {
-    handle: Option<JoinHandle<()>>,
-    completed: bool,
-    unwound: bool,
-    waiting: bool,
-}
-struct OriginalActorJoinLoan {
-    owner: Arc<OriginalActorJoin>,
-    handle: Option<JoinHandle<()>>,
-    completed: bool,
-}
-impl OriginalActorJoin {
-    fn new(handle: JoinHandle<()>, registry: std::sync::Weak<RegistryInner>) -> Arc<Self> {
-        Arc::new(Self {
-            state: Mutex::new(OriginalActorJoinState {
-                handle: Some(handle),
-                completed: false,
-                unwound: false,
-                waiting: false,
-            }),
-            wake: Arc::new(OriginalJoinWake {
-                registry,
-                forward: futures::task::AtomicWaker::new(),
-            }),
-        })
-    }
-    fn is_finished(&self) -> bool {
-        let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        s.completed || s.handle.as_ref().is_some_and(JoinHandle::is_finished)
-    }
-    #[cfg(test)]
-    fn abort(self: &Arc<Self>) {
-        let handle = {
-            self.state
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .handle
-                .take()
-        };
-        if let Some(handle) = handle {
-            let lease = OriginalActorJoinLoan {
-                owner: Arc::clone(self),
-                handle: Some(handle),
-                completed: false,
-            };
-            lease.handle.as_ref().unwrap().abort();
-            drop(lease);
-        }
-    }
-    fn poll(
-        self: &Arc<Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> Poll<(Result<(), JoinError>, OriginalActorJoinLoan)> {
-        self.wake.forward.register(cx.waker());
-        let handle = {
-            let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            if s.completed || s.unwound {
-                return Poll::Pending;
-            }
-            let Some(handle) = s.handle.take() else {
-                s.waiting = true;
-                return Poll::Pending;
-            };
-            handle
-        };
-        let mut lease = OriginalActorJoinLoan {
-            owner: Arc::clone(self),
-            handle: Some(handle),
-            completed: false,
-        };
-        let wake = std::task::Waker::from(Arc::clone(&self.wake));
-        let mut join_context = std::task::Context::from_waker(&wake);
-        match Pin::new(lease.handle.as_mut().unwrap()).poll(&mut join_context) {
-            Poll::Pending => {
-                drop(lease);
-                Poll::Pending
-            }
-            Poll::Ready(result) => {
-                lease.completed = true;
-                Poll::Ready((result, lease))
-            }
-        }
-    }
-}
-impl Drop for OriginalActorJoinLoan {
-    fn drop(&mut self) {
-        let wake = {
-            let mut s = self.owner.state.lock().unwrap_or_else(|e| e.into_inner());
-            if self.completed {
-                s.completed = true;
-            } else {
-                assert!(s.handle.is_none());
-                s.handle = self.handle.take();
-                if std::thread::panicking() {
-                    s.unwound = true;
-                }
-            }
-            std::mem::take(&mut s.waiting)
-        };
-        // Completed handle destruction is AFTER stable original result install.
-        drop(self.handle.take());
-        if wake && !std::thread::panicking() {
-            self.owner.wake.forward.wake();
-        }
-    }
-}
-fn original_close_wait_layout<F: Future<Output = ()>>(
-    _: fn(tokio::sync::watch::Receiver<bool>) -> F,
-) -> std::alloc::Layout {
-    std::alloc::Layout::new::<F>()
-}
-async fn original_close_wait(mut closed: tokio::sync::watch::Receiver<bool>) {
-    while !*closed.borrow_and_update() {
-        if closed.changed().await.is_err() {
-            break;
         }
     }
 }
 
 enum RegistryEntry {
     Reserved(ReservedEntry),
-    Installed(InstalledEntry),
+    RuntimeInstalled(RuntimeInstalledEntry),
     Joined(JoinedEntry),
 }
 
 struct ReservedEntry {
     generation: u64,
-    initial_execution: QueryExecutionId,
     participations: BTreeSet<ParticipationRef>,
     original_exit: Option<Arc<OriginalLogicalExit>>,
     spawn_started: bool,
 }
 
-struct InstalledEntry {
-    generation: u64,
-    initial_execution: QueryExecutionId,
-    actor: LogicalExecutionActor,
-    join: Arc<OriginalActorJoin>,
-    original_exit: Option<Arc<OriginalLogicalExit>>,
-    original_close: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
-    ingress_closed: bool,
-    internal_health: Option<InternalConsumerHealth>,
-}
-
 // The original registration retains its same consumer and complete failure
 // packet. This fixed field is not a second record or a new task/identity.
 struct InternalConsumerHealth {
-    consumer: Arc<dyn crate::api::InternalComputationConsumer>,
-    failure: crate::api::StatementNativeHealthFailure,
+    _consumer: Arc<dyn crate::api::InternalComputationConsumer>,
+    _failure: crate::api::StatementNativeHealthFailure,
 }
 struct JoinedEntry {
     generation: u64,
     initial_execution: QueryExecutionId,
     actor_id: LogicalExecutionActorId,
     outcome: LogicalExecutionJoinOutcome,
-    original_result: Result<(), Arc<JoinError>>,
+    original_result: LogicalExit,
     original_exit: Option<Arc<OriginalLogicalExit>>,
     internal_health: Option<InternalConsumerHealth>,
 }
@@ -404,11 +220,11 @@ pub enum LogicalExecutionRuntimeRegistryError {
     InvalidParticipationSet,
     ParticipationNotRegistered,
     ConfigDoesNotMatchReservation,
-    Actor(LogicalExecutionActorError),
     JoinNotReady,
     JoinAlreadyCompleted,
     InternalConsumerHealthUnresolved,
     OriginalExitFailureUnresolved,
+    RuntimeSourceClosed,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -439,13 +255,10 @@ impl From<LogicalExecutionRuntimeRegistryError> for LogicalExecutionRuntimeShutd
 
 impl fmt::Display for LogicalExecutionRuntimeRegistryError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Actor(error) => write!(formatter, "logical execution actor failed: {error}"),
-            other => write!(
-                formatter,
-                "logical execution runtime registry error: {other:?}"
-            ),
-        }
+        write!(
+            formatter,
+            "logical execution runtime registry error: {self:?}"
+        )
     }
 }
 
@@ -456,7 +269,7 @@ impl novarocks_execution_contract::failure::FailureProjection
 {
     fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
         use novarocks_execution_contract::failure::{
-            FailureClass, FailureFact, FailureProjection, FailureReason, domain,
+            FailureClass, FailureFact, FailureReason, domain,
         };
         let (class, code, observed_stop) = match self {
             Self::AlreadyRegistered => (FailureClass::Invariant, 61, false),
@@ -470,6 +283,7 @@ impl novarocks_execution_contract::failure::FailureProjection
             Self::ConfigDoesNotMatchReservation => (FailureClass::Invariant, 69, false),
             Self::JoinNotReady => (FailureClass::Control, 70, false),
             Self::JoinAlreadyCompleted => (FailureClass::Control, 71, true),
+            Self::RuntimeSourceClosed => (FailureClass::Control, 92, true),
             Self::InternalConsumerHealthUnresolved => {
                 return crate::execution_error::QueryFailureReason::InternalConsumerPanicked
                     .failure_fact();
@@ -478,7 +292,6 @@ impl novarocks_execution_contract::failure::FailureProjection
                 return crate::execution_error::QueryFailureReason::LogicalFailureUnspecified
                     .failure_fact();
             }
-            Self::Actor(error) => return FailureProjection::failure_fact(error),
         };
         let reason = FailureReason::new(domain::QUERY, std::num::NonZeroU16::new(code).unwrap());
         if observed_stop {
@@ -516,21 +329,15 @@ impl LogicalExecutionRuntimeRegistryError {
             }
             Self::JoinNotReady => "logical execution runtime join is not ready",
             Self::JoinAlreadyCompleted => "logical execution runtime join already completed",
+            Self::RuntimeSourceClosed => "original logical runtime Registry source closed",
             Self::InternalConsumerHealthUnresolved => {
                 "logical execution retains an unresolved internal consumer failure"
             }
             Self::OriginalExitFailureUnresolved => {
                 "logical execution retains its original unhandled exit cause"
             }
-            Self::Actor(error) => return error.safe_detail(),
         };
         novarocks_execution_contract::SafeDetail::truncating(message)
-    }
-}
-
-impl From<LogicalExecutionActorError> for LogicalExecutionRuntimeRegistryError {
-    fn from(value: LogicalExecutionActorError) -> Self {
-        Self::Actor(value)
     }
 }
 
@@ -539,6 +346,7 @@ pub(crate) struct LogicalExecutionRuntimeReservation {
     initial_execution: QueryExecutionId,
     generation: u64,
     active: bool,
+    runtime_registration: Option<Arc<LogicalExecutionRegistration>>,
 }
 
 impl fmt::Debug for LogicalExecutionRuntimeReservation {
@@ -587,25 +395,6 @@ impl Drop for LogicalExecutionRuntimeReservation {
     }
 }
 
-#[must_use = "the installed logical execution must be handed to its runtime consumer"]
-pub(crate) struct InstalledLogicalExecution {
-    registration: LogicalExecutionRegistration,
-    initial_attempt: AttemptInstantiationPermit,
-    output: LogicalExecutionOutputTransfer,
-}
-
-impl InstalledLogicalExecution {
-    pub(crate) fn into_parts(
-        self,
-    ) -> (
-        LogicalExecutionRegistration,
-        AttemptInstantiationPermit,
-        LogicalExecutionOutputTransfer,
-    ) {
-        (self.registration, self.initial_attempt, self.output)
-    }
-}
-
 #[derive(Debug)]
 pub(crate) struct LogicalExecutionRegistration {
     registry_id: u64,
@@ -640,6 +429,7 @@ pub enum LogicalExecutionJoinOutcome {
     Completed,
     Cancelled,
     Panicked,
+    RuntimeOwnerFailed,
 }
 
 impl LogicalExecutionJoinReceipt {
@@ -650,7 +440,7 @@ impl LogicalExecutionJoinReceipt {
 }
 
 impl LogicalExecutionRuntimeRegistry {
-    pub fn new(runtime: Handle) -> Self {
+    pub fn new() -> Self {
         let id = NEXT_REGISTRY_ID
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_add(1)
@@ -663,7 +453,6 @@ impl LogicalExecutionRuntimeRegistry {
             handle: LogicalExecutionRuntimeRegistryHandle {
                 inner: Arc::new(RegistryInner {
                     id,
-                    runtime,
                     state: Mutex::new(RegistryState::default()),
                     progress: Arc::clone(&progress),
                     original_exit_ready: AtomicBool::new(false),
@@ -712,7 +501,7 @@ impl LogicalExecutionRuntimeRegistry {
             }
             return Err(error.into());
         }
-        let drain = self.handle.drain_actors_for_shutdown();
+        let drain = self.handle.drain_registrations_for_shutdown();
         match tokio::time::timeout_at(deadline.into(), drain).await {
             Ok(Ok(())) => {
                 debug_assert!(self.handle.lock().entries.is_empty());
@@ -800,24 +589,12 @@ impl LogicalExecutionRuntimeRegistryHandle {
         self.inner.health.changed().await;
     }
 
-    pub(crate) fn progress_root_ack_tails(&self) {
-        self.inner.active_native.poll_root_ack_tails();
-    }
-
-    pub(crate) async fn root_ack_tail_changed(&self) {
-        self.inner.active_native.root_ack_tail_changed().await;
-    }
-
-    pub(crate) fn root_ack_tail_count(&self) -> usize {
-        self.inner.active_native.root_ack_tail_count()
-    }
-
     pub(crate) fn process_health(&self) -> Option<crate::api::QueryExecutionError> {
         use novarocks_execution_contract::failure::FailureProjection as _;
         self.inner.health.health().or_else(|| {
             let state = self.lock();
             let retained = state.entries.values().any(|entry| match entry {
-                RegistryEntry::Installed(entry) => entry.internal_health.is_some(),
+                RegistryEntry::RuntimeInstalled(entry) => entry.internal_health.is_some(),
                 RegistryEntry::Joined(entry) => entry.internal_health.is_some(),
                 RegistryEntry::Reserved(_) => false,
             });
@@ -836,27 +613,9 @@ impl LogicalExecutionRuntimeRegistryHandle {
         })
     }
 
-    pub(crate) async fn wait_registration_consumers(
-        &self,
-        registration: &LogicalExecutionRegistration,
-    ) {
-        loop {
-            let changed = self.inner.progress.notified();
-            tokio::pin!(changed);
-            changed.as_mut().enable();
-            if !self
-                .inner
-                .active_native
-                .consumers_pending(registration.initial_execution, registration.generation)
-            {
-                return;
-            }
-            changed.await;
-        }
-    }
-
     /// Preserve the same NoRecovery consumer in its exact original record.
     /// All receiver inputs are borrowed until the empty stable field is known.
+    #[cfg(test)]
     pub(crate) fn retain_internal_consumer_health(
         &self,
         registration: &LogicalExecutionRegistration,
@@ -869,9 +628,9 @@ impl LogicalExecutionRuntimeRegistryHandle {
             .entries
             .get_mut(&registration.initial_execution.query_id())
         {
-            Some(RegistryEntry::Installed(entry))
-                if entry.generation == registration.generation
-                    && entry.initial_execution == registration.initial_execution =>
+            Some(RegistryEntry::RuntimeInstalled(entry))
+                if entry.registration.generation == registration.generation
+                    && entry.registration.initial_execution == registration.initial_execution =>
             {
                 &mut entry.internal_health
             }
@@ -885,15 +644,15 @@ impl LogicalExecutionRuntimeRegistryHandle {
             None => return Err(LogicalExecutionRuntimeRegistryError::UnknownRegistration),
         };
         if let Some(original) = target {
-            if !Arc::ptr_eq(&original.consumer, consumer)
-                || !std::ptr::eq(original.failure.cause(), failure.cause())
+            if !Arc::ptr_eq(&original._consumer, consumer)
+                || !std::ptr::eq(original._failure.cause(), failure.cause())
             {
                 return Err(LogicalExecutionRuntimeRegistryError::InternalConsumerHealthUnresolved);
             }
         } else {
             *target = Some(InternalConsumerHealth {
-                consumer: Arc::clone(consumer),
-                failure: failure.clone(),
+                _consumer: Arc::clone(consumer),
+                _failure: failure.clone(),
             });
         }
         state.accepting = false;
@@ -910,7 +669,8 @@ impl LogicalExecutionRuntimeRegistryHandle {
         registration: &LogicalExecutionRegistration,
         execution: QueryExecutionId,
         participations: &[ParticipationRef],
-    ) -> Result<super::NativeActiveCustodyReservation, LogicalExecutionRuntimeRegistryError> {
+    ) -> Result<super::NativeActivationReservationObligation, LogicalExecutionRuntimeRegistryError>
+    {
         self.validate_registry(registration)?;
         // Serialize the original custody insertion with begin_shutdown's
         // admission cut. No Native activation can acquire a slot after close
@@ -921,13 +681,16 @@ impl LogicalExecutionRuntimeRegistryHandle {
         if !state.accepting {
             return Err(LogicalExecutionRuntimeRegistryError::RegistryClosing);
         }
-        let Some(RegistryEntry::Installed(entry)) = state
+        let (generation, original_exit) = match state
             .entries
             .get(&registration.initial_execution.query_id())
-        else {
-            return Err(LogicalExecutionRuntimeRegistryError::UnknownRegistration);
+        {
+            Some(RegistryEntry::RuntimeInstalled(entry)) => {
+                (entry.registration.generation, entry.original_exit.as_ref())
+            }
+            _ => return Err(LogicalExecutionRuntimeRegistryError::UnknownRegistration),
         };
-        validate_generation(entry.generation, registration.generation)?;
+        validate_generation(generation, registration.generation)?;
         if execution.query_id() != registration.initial_execution.query_id() {
             return Err(LogicalExecutionRuntimeRegistryError::InvalidParticipationSet);
         }
@@ -938,14 +701,10 @@ impl LogicalExecutionRuntimeRegistryHandle {
                 execution,
             },
             participations,
-            self.clone(),
-            entry
-                .original_exit
-                .as_ref()
-                .map_or_else(std::sync::Weak::new, Arc::downgrade),
+            original_exit.map_or_else(std::sync::Weak::new, Arc::downgrade),
         );
         if reserved.is_some()
-            && let Some(source) = &entry.original_exit
+            && let Some(source) = original_exit
         {
             source.native_reserved_silent();
         }
@@ -953,92 +712,61 @@ impl LogicalExecutionRuntimeRegistryHandle {
         reserved.ok_or(LogicalExecutionRuntimeRegistryError::InvalidParticipationSet)
     }
 
-    pub(crate) async fn record_native_custody_closure(
+    /// Cleanup-only recovery of the same successful activation output. Existing
+    /// custody remains claimable during Closing; no new slot or activation is
+    /// admitted and no original native-return count is incremented.
+    pub(in crate::coordination) fn take_pending_native_for_cleanup(
         &self,
-        key: super::NativeActiveCustodyKey,
-        closure: &crate::api::NativeActiveConvergenceClosure,
-    ) -> Result<(), LogicalExecutionRuntimeRegistryError> {
-        let registration = LogicalExecutionRegistration {
-            registry_id: self.inner.id,
-            initial_execution: key.initial,
-            generation: key.generation,
+        registration: &LogicalExecutionRegistration,
+        original_exit: &Arc<OriginalLogicalExit>,
+        original_body: &Arc<tokio::sync::Mutex<super::original_exit::OriginalNativePreparation>>,
+        pending: &mut Option<super::native_active_custody::PendingNativeActivationObligation>,
+    ) -> Result<
+        (
+            super::NativeActivationReturnObligation,
+            Option<crate::api::NativeRowsAttemptRuntime>,
+        ),
+        super::PendingNativeCleanupRefusal,
+    > {
+        use super::PendingNativeCleanupRefusal as Refusal;
+        self.validate_registry(registration)
+            .map_err(Refusal::Registry)?;
+        let state = self.lock();
+        let (initial, generation, source) = match state
+            .entries
+            .get(&registration.initial_execution.query_id())
+        {
+            Some(RegistryEntry::RuntimeInstalled(entry)) => (
+                entry.registration.initial_execution,
+                entry.registration.generation,
+                entry.original_exit.as_ref(),
+            ),
+            Some(RegistryEntry::Joined(entry)) => (
+                entry.initial_execution,
+                entry.generation,
+                entry.original_exit.as_ref(),
+            ),
+            _ => {
+                return Err(Refusal::Registry(
+                    LogicalExecutionRuntimeRegistryError::UnknownRegistration,
+                ));
+            }
         };
-        let mut first_error = None;
-        match closure {
-            crate::api::NativeActiveConvergenceClosure::Evidence(
-                crate::api::NativeAttemptConvergence::AllWorkersStoppedAndParticipationsFenced,
-            ) => {
-                let participations = self
-                    .inner
-                    .active_native
-                    .participations(key)
-                    .ok_or(LogicalExecutionRuntimeRegistryError::UnknownRegistration)?;
-                for participation in participations {
-                    if let Err(error) = self
-                        .observe_worker_stopped_and_participation_fenced(
-                            &registration,
-                            participation,
-                        )
-                        .await
-                    {
-                        first_error.get_or_insert(error);
-                    }
-                }
-            }
-            crate::api::NativeActiveConvergenceClosure::Evidence(
-                crate::api::NativeAttemptConvergence::Participations(facts),
-            ) => {
-                for fact in facts {
-                    let result = match fact.kind() {
-                        crate::api::NativeParticipationConvergenceKind::NeverEstablished => {
-                            self.observe_participation_never_established(&registration, fact.participation())
-                                .await
-                        }
-                        crate::api::NativeParticipationConvergenceKind::WorkerStoppedAndParticipationFenced => {
-                            self.observe_worker_stopped_and_participation_fenced(
-                                &registration,
-                                fact.participation(),
-                            )
-                            .await
-                        }
-                        crate::api::NativeParticipationConvergenceKind::WorkerProcessReplaced => {
-                            self.observe_worker_process_replaced(&registration, fact.participation())
-                                .await
-                        }
-                    };
-                    if let Err(error) = result {
-                        first_error.get_or_insert(error);
-                    }
-                }
-            }
-            crate::api::NativeActiveConvergenceClosure::RemoteTrackingEnded {
-                exact_participations,
-            } => {
-                for &participation in exact_participations {
-                    if let Err(error) = self
-                        .end_remote_participation_tracking(&registration, participation)
-                        .await
-                    {
-                        first_error.get_or_insert(error);
-                    }
-                }
-            }
+        validate_generation(generation, registration.generation).map_err(Refusal::Registry)?;
+        if initial != registration.initial_execution
+            || !source.is_some_and(|source| Arc::ptr_eq(source, original_exit))
+            || !Arc::ptr_eq(&original_exit.native, original_body)
+        {
+            return Err(Refusal::ForeignSource);
         }
-        if first_error.is_none() {
-            let state = self.lock();
-            if let Some(RegistryEntry::Installed(entry)) =
-                state.entries.get(&key.initial.query_id())
-            {
-                validate_generation(entry.generation, key.generation)?;
-                if let Some(source) = &entry.original_exit {
-                    source.native_closure_silent();
-                }
-            }
-        }
-        if first_error.is_none() {
-            self.mark_original_exit_ready();
-        }
-        first_error.map_or(Ok(()), Err)
+        // Lock order stays Registry -> original custody map -> original owner.
+        // The caller keeps its unique original-body loan through this transfer.
+        self.inner.active_native.take_staged_for_cleanup(
+            initial,
+            generation,
+            original_exit,
+            pending,
+        )
     }
 
     async fn wait_active_native_custody(&self, registration: &LogicalExecutionRegistration) {
@@ -1057,6 +785,7 @@ impl LogicalExecutionRuntimeRegistryHandle {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn active_native_registration_health(
         &self,
         registration: &LogicalExecutionRegistration,
@@ -1072,13 +801,19 @@ impl LogicalExecutionRuntimeRegistryHandle {
         &self,
         source: &Arc<OriginalLogicalExit>,
     ) -> Option<health::LogicalExecutionHealthNotification> {
-        if source.health_published() {
+        if source.health_published() || !source.has_unhandled_failure() {
             return None;
         }
         let mut custody: Option<Box<dyn std::any::Any + Send>> = Some(Box::new(
             super::original_exit::LogicalExitHealthCustody::new(Arc::clone(source)),
         ));
-        let notice = self.inner.health.record_supervision_panic_in(&mut custody);
+        let notice = if let Some(error) = source.owner_failure() {
+            self.inner
+                .health
+                .record_owner_failure_in(&mut custody, error)
+        } else {
+            self.inner.health.record_supervision_panic_in(&mut custody)
+        };
         if custody.is_none() {
             source.mark_health_published_silent();
         } else {
@@ -1101,14 +836,6 @@ impl LogicalExecutionRuntimeRegistryHandle {
         self.inner.health.record_supervision_panic(original);
     }
 
-    pub(crate) fn record_native_supervision_join_failure(&self, error: tokio::task::JoinError) {
-        if error.is_panic() {
-            self.record_native_supervision_panic(error.into_panic());
-        } else {
-            self.inner.health.record_supervision_join_failure(error);
-        }
-    }
-
     #[cfg(test)]
     pub(crate) fn active_native_custody_count(&self) -> usize {
         self.inner.active_native.len()
@@ -1119,36 +846,27 @@ impl LogicalExecutionRuntimeRegistryHandle {
     }
 
     fn request_close_for_installed(&self) {
-        let actors = {
+        let runtime = {
             let state = self.lock();
             state
                 .entries
                 .values()
                 .filter_map(|entry| match entry {
-                    RegistryEntry::Installed(entry) => Some((
-                        entry.initial_execution,
-                        entry.generation,
-                        entry.actor.clone(),
-                    )),
-                    RegistryEntry::Reserved(_) | RegistryEntry::Joined(_) => None,
+                    RegistryEntry::RuntimeInstalled(entry) => Some(entry.carrier.clone()),
+                    _ => None,
                 })
                 .collect::<Vec<_>>()
         };
-        for (initial_execution, generation, actor) in actors {
-            // Closing actor ingress can complete its original WorkOwner even
-            // before its Registry join is polled. The same Native custody must
-            // therefore gate the close request itself, not only join().
-            if !self
-                .inner
-                .active_native
-                .blocks_registration(initial_execution, generation)
-            {
-                drop(actor.request_registry_close_for_join(RegistryClose::Shutdown));
-            }
+        for carrier in runtime {
+            carrier.installed.request_close(
+                novarocks_logical_execution_protocol::input::RegistryClose::Shutdown,
+            );
         }
     }
 
-    async fn drain_actors_for_shutdown(&self) -> Result<(), LogicalExecutionRuntimeRegistryError> {
+    async fn drain_registrations_for_shutdown(
+        &self,
+    ) -> Result<(), LogicalExecutionRuntimeRegistryError> {
         loop {
             let progress = self.inner.progress.notified();
             tokio::pin!(progress);
@@ -1169,18 +887,20 @@ impl LogicalExecutionRuntimeRegistryHandle {
                             actor_id: entry.actor_id,
                             outcome: entry.outcome,
                         }),
-                        RegistryEntry::Reserved(_) | RegistryEntry::Installed(_) => None,
+                        RegistryEntry::Reserved(_) | RegistryEntry::RuntimeInstalled(_) => None,
                     })
                     .collect::<Vec<_>>();
                 let registrations = state
                     .entries
                     .values()
                     .filter_map(|entry| match entry {
-                        RegistryEntry::Installed(entry) => Some(LogicalExecutionRegistration {
-                            registry_id: self.inner.id,
-                            initial_execution: entry.initial_execution,
-                            generation: entry.generation,
-                        }),
+                        RegistryEntry::RuntimeInstalled(entry) => {
+                            Some(LogicalExecutionRegistration {
+                                registry_id: self.inner.id,
+                                initial_execution: entry.registration.initial_execution,
+                                generation: entry.registration.generation,
+                            })
+                        }
                         RegistryEntry::Reserved(_) | RegistryEntry::Joined(_) => None,
                     })
                     .collect::<Vec<_>>();
@@ -1214,20 +934,8 @@ impl LogicalExecutionRuntimeRegistryHandle {
                 continue;
             }
 
-            let mut close_waiters = Vec::with_capacity(registrations.len());
-            for registration in registrations {
-                let actor = self.actor(&registration)?;
-                let closed = actor.request_registry_close_for_join(RegistryClose::Shutdown);
-                close_waiters.push((registration, closed));
-            }
-
-            for (mut registration, mut closed) in close_waiters {
-                while !*closed.borrow_and_update() {
-                    if closed.changed().await.is_err() {
-                        break;
-                    }
-                }
-                self.record_ingress_closed(&registration)?;
+            for mut registration in registrations {
+                self.close_ingress_for_join(&registration).await?;
                 let receipt = self.join(&mut registration).await?;
                 self.retire(receipt).map_err(|(error, _)| error)?;
             }
@@ -1244,8 +952,8 @@ impl LogicalExecutionRuntimeRegistryHandle {
             .entries
             .get_mut(&registration.initial_execution.query_id())
         {
-            Some(RegistryEntry::Installed(entry)) => {
-                validate_generation(entry.generation, registration.generation)?;
+            Some(RegistryEntry::RuntimeInstalled(entry)) => {
+                validate_generation(entry.registration.generation, registration.generation)?;
                 entry.ingress_closed = true;
                 Ok(())
             }
@@ -1261,6 +969,7 @@ impl LogicalExecutionRuntimeRegistryHandle {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn reserve(
         &self,
         initial_execution: QueryExecutionId,
@@ -1307,7 +1016,6 @@ impl LogicalExecutionRuntimeRegistryHandle {
             query,
             RegistryEntry::Reserved(ReservedEntry {
                 generation,
-                initial_execution,
                 participations,
                 original_exit,
                 spawn_started: false,
@@ -1318,48 +1026,11 @@ impl LogicalExecutionRuntimeRegistryHandle {
             initial_execution,
             generation,
             active: true,
+            runtime_registration: None,
         })
     }
 
-    pub(crate) fn actor(
-        &self,
-        registration: &LogicalExecutionRegistration,
-    ) -> Result<LogicalExecutionActor, LogicalExecutionRuntimeRegistryError> {
-        self.validate_registry(registration)?;
-        let state = self.lock();
-        match state
-            .entries
-            .get(&registration.initial_execution.query_id())
-        {
-            Some(RegistryEntry::Installed(entry)) => {
-                validate_generation(entry.generation, registration.generation)?;
-                Ok(entry.actor.clone())
-            }
-            Some(RegistryEntry::Joined(entry)) => {
-                validate_generation(entry.generation, registration.generation)?;
-                Err(LogicalExecutionRuntimeRegistryError::JoinAlreadyCompleted)
-            }
-            Some(RegistryEntry::Reserved(entry)) => {
-                validate_generation(entry.generation, registration.generation)?;
-                Err(LogicalExecutionRuntimeRegistryError::UnknownRegistration)
-            }
-            None => Err(LogicalExecutionRuntimeRegistryError::UnknownRegistration),
-        }
-    }
-
-    pub(crate) async fn observe_worker_stopped_and_participation_fenced(
-        &self,
-        registration: &LogicalExecutionRegistration,
-        participation: ParticipationRef,
-    ) -> Result<(), LogicalExecutionRuntimeRegistryError> {
-        self.observe_participation_convergence(
-            registration,
-            participation,
-            RegistryParticipationConvergence::WorkerStoppedAndParticipationFenced,
-        )
-        .await
-    }
-
+    #[cfg(test)]
     pub(crate) async fn observe_participation_never_established(
         &self,
         registration: &LogicalExecutionRegistration,
@@ -1373,65 +1044,100 @@ impl LogicalExecutionRuntimeRegistryHandle {
         .await
     }
 
-    pub(crate) async fn observe_worker_process_replaced(
-        &self,
-        registration: &LogicalExecutionRegistration,
-        participation: ParticipationRef,
-    ) -> Result<(), LogicalExecutionRuntimeRegistryError> {
-        self.observe_participation_convergence(
-            registration,
-            participation,
-            RegistryParticipationConvergence::WorkerProcessReplaced,
-        )
-        .await
-    }
-
-    /// Ends the FE's bounded observation of this participation without asserting
-    /// that the Worker stopped or released its resources. The actor records a
-    /// distinct retirement reason and returns only its governance tracking.
-    pub(crate) async fn end_remote_participation_tracking(
-        &self,
-        registration: &LogicalExecutionRegistration,
-        participation: ParticipationRef,
-    ) -> Result<(), LogicalExecutionRuntimeRegistryError> {
-        self.observe_participation_convergence(
-            registration,
-            participation,
-            RegistryParticipationConvergence::RemoteTrackingEnded,
-        )
-        .await
-    }
-
+    #[cfg(test)]
     pub(crate) async fn join_readiness(
         &self,
         registration: &LogicalExecutionRegistration,
     ) -> Result<LogicalExecutionJoinReadiness, LogicalExecutionRuntimeRegistryError> {
         self.validate_registry(registration)?;
-        if self
-            .inner
-            .active_native
-            .blocks_registration(registration.initial_execution, registration.generation)
-        {
-            return Ok(LogicalExecutionJoinReadiness::WaitingForConvergence);
-        }
-        {
+        let Some(carrier) = self.runtime_carrier(registration)? else {
             let state = self.lock();
-            if let Some(RegistryEntry::Installed(entry)) = state
+            return match state
                 .entries
                 .get(&registration.initial_execution.query_id())
             {
-                validate_generation(entry.generation, registration.generation)?;
-                if entry.join.is_finished() {
-                    return Ok(LogicalExecutionJoinReadiness::Ready);
+                Some(RegistryEntry::Joined(entry)) => {
+                    validate_generation(entry.generation, registration.generation)?;
+                    Err(LogicalExecutionRuntimeRegistryError::JoinAlreadyCompleted)
                 }
-            }
+                _ => Err(LogicalExecutionRuntimeRegistryError::UnknownRegistration),
+            };
+        };
+        carrier
+            .readiness(false)
+            .await
+            .map(|value| match value {
+                LogicalJoinReadiness::Ready
+                    if self.inner.active_native.blocks_registration(
+                        registration.initial_execution,
+                        registration.generation,
+                    ) =>
+                {
+                    LogicalExecutionJoinReadiness::WaitingForConvergence
+                }
+                LogicalJoinReadiness::Ready => LogicalExecutionJoinReadiness::Ready,
+                LogicalJoinReadiness::WaitingForConvergence => {
+                    LogicalExecutionJoinReadiness::WaitingForConvergence
+                }
+            })
+            .map_err(|_| LogicalExecutionRuntimeRegistryError::RuntimeSourceClosed)
+    }
+
+    /// Close only this original runtime ingress after its actual logical
+    /// owner failed. This never claims the Join or waits for the caller's own
+    /// actor exit; ordinary join/retirement still require the real HostExit.
+    pub(in crate::coordination) async fn close_runtime_ingress_after_owner_failure(
+        &self,
+        registration: &LogicalExecutionRegistration,
+        original: &Arc<OriginalLogicalExit>,
+    ) -> Result<(), LogicalExecutionRuntimeRegistryError> {
+        self.validate_registry(registration)?;
+        if original.owner_failure().is_none() {
+            return Err(LogicalExecutionRuntimeRegistryError::OriginalExitFailureUnresolved);
         }
-        let actor = self.actor(registration)?;
-        Ok(if actor.registry_join_readiness(false).await? {
-            LogicalExecutionJoinReadiness::Ready
-        } else {
-            LogicalExecutionJoinReadiness::WaitingForConvergence
-        })
+        let carrier = {
+            let state = self.lock();
+            let Some(RegistryEntry::RuntimeInstalled(entry)) = state
+                .entries
+                .get(&registration.initial_execution.query_id())
+            else {
+                return Err(LogicalExecutionRuntimeRegistryError::UnknownRegistration);
+            };
+            validate_generation(entry.registration.generation, registration.generation)?;
+            if !entry
+                .original_exit
+                .as_ref()
+                .is_some_and(|source| Arc::ptr_eq(source, original))
+            {
+                return Err(LogicalExecutionRuntimeRegistryError::OriginalExitFailureUnresolved);
+            }
+            Arc::clone(&entry.carrier)
+        };
+        carrier
+            .close_ingress_after_owner_failure()
+            .await
+            .map_err(|_| LogicalExecutionRuntimeRegistryError::RuntimeSourceClosed)?;
+        let mut state = self.lock();
+        let Some(RegistryEntry::RuntimeInstalled(entry)) = state
+            .entries
+            .get_mut(&registration.initial_execution.query_id())
+        else {
+            return Err(LogicalExecutionRuntimeRegistryError::UnknownRegistration);
+        };
+        validate_generation(entry.registration.generation, registration.generation)?;
+        if !Arc::ptr_eq(&entry.carrier, &carrier)
+            || !entry
+                .original_exit
+                .as_ref()
+                .is_some_and(|source| Arc::ptr_eq(source, original))
+            || !carrier.source_idle()
+        {
+            return Err(LogicalExecutionRuntimeRegistryError::RuntimeSourceClosed);
+        }
+        entry.ingress_closed = true;
+        drop(state);
+        self.inner.progress.notify_waiters();
+        Ok(())
     }
 
     pub(crate) async fn close_ingress_for_join(
@@ -1439,51 +1145,41 @@ impl LogicalExecutionRuntimeRegistryHandle {
         registration: &LogicalExecutionRegistration,
     ) -> Result<(), LogicalExecutionRuntimeRegistryError> {
         self.validate_registry(registration)?;
-        let actor = {
-            let mut state = self.lock();
-            match state
+        let Some(carrier) = self.runtime_carrier(registration)? else {
+            let state = self.lock();
+            return match state
                 .entries
-                .get_mut(&registration.initial_execution.query_id())
+                .get(&registration.initial_execution.query_id())
             {
-                Some(RegistryEntry::Installed(entry)) => {
-                    validate_generation(entry.generation, registration.generation)?;
-                    if entry.ingress_closed || entry.join.is_finished() {
-                        entry.ingress_closed = true;
-                        return Ok(());
-                    }
-                    entry.actor.clone()
-                }
                 Some(RegistryEntry::Joined(entry)) => {
                     validate_generation(entry.generation, registration.generation)?;
-                    return Err(LogicalExecutionRuntimeRegistryError::JoinAlreadyCompleted);
-                }
-                _ => return Err(LogicalExecutionRuntimeRegistryError::UnknownRegistration),
-            }
-        };
-        if actor.registry_join_readiness(true).await? {
-            let mut state = self.lock();
-            match state
-                .entries
-                .get_mut(&registration.initial_execution.query_id())
-            {
-                Some(RegistryEntry::Installed(entry)) => {
-                    validate_generation(entry.generation, registration.generation)?;
-                    entry.ingress_closed = true;
-                    Ok(())
+                    Err(LogicalExecutionRuntimeRegistryError::JoinAlreadyCompleted)
                 }
                 _ => Err(LogicalExecutionRuntimeRegistryError::UnknownRegistration),
+            };
+        };
+        self.claim_runtime_join(registration)?;
+        {
+            let state = self.lock();
+            if matches!(state.entries.get(&registration.initial_execution.query_id()),
+                Some(RegistryEntry::RuntimeInstalled(entry)) if entry.ingress_closed)
+            {
+                return Ok(());
             }
-        } else {
-            Err(LogicalExecutionRuntimeRegistryError::JoinNotReady)
         }
+        self.wait_active_native_custody(registration).await;
+        carrier.installed.request_close(RegistryClose::Retire);
+        carrier.wait_ingress().await;
+        self.record_ingress_closed(registration)
     }
 
-    /// Waits by polling the Registry-owned join handle in place. Cancelling
-    /// this future leaves the handle in the installed entry for a later wait.
+    /// Waits on the same installed runtime carrier. Cancelling this future
+    /// leaves its actual exit and the exclusive retirement claim in custody.
     pub(crate) async fn join(
         &self,
         registration: &mut LogicalExecutionRegistration,
     ) -> Result<LogicalExecutionJoinReceipt, LogicalExecutionRuntimeRegistryError> {
+        self.claim_runtime_join(registration)?;
         self.wait_active_native_custody(registration).await;
         self.close_ingress_for_join(registration).await?;
         let query = registration.initial_execution.query_id();
@@ -1526,83 +1222,24 @@ impl LogicalExecutionRuntimeRegistryHandle {
             LogicalExecutionRuntimeRegistryError,
         >,
     > {
-        let join = {
-            let state = self.lock();
-            match state.entries.get(&query) {
-                Some(RegistryEntry::Installed(entry)) => {
-                    validate_generation(entry.generation, generation)?;
-                    Arc::clone(&entry.join)
-                }
-                Some(RegistryEntry::Joined(entry)) => {
-                    validate_generation(entry.generation, generation)?;
-                    return Poll::Ready(Err(
-                        LogicalExecutionRuntimeRegistryError::JoinAlreadyCompleted,
-                    ));
-                }
-                _ => {
-                    return Poll::Ready(Err(
-                        LogicalExecutionRuntimeRegistryError::UnknownRegistration,
-                    ));
-                }
-            }
-        };
-        let (result, completed) = std::task::ready!(join.poll(cx));
-        let result = result.map_err(Arc::new);
-        let outcome = match &result {
-            Ok(()) => LogicalExecutionJoinOutcome::Completed,
-            Err(error) if error.is_cancelled() => LogicalExecutionJoinOutcome::Cancelled,
-            Err(_) => LogicalExecutionJoinOutcome::Panicked,
-        };
-        let (proof, removed, source) = {
-            let mut state = self.lock();
-            let Some(RegistryEntry::Installed(entry)) = state.entries.get_mut(&query) else {
-                unreachable!("actual join lease keeps its original installed entry");
-            };
-            assert_eq!(entry.generation, generation);
-            let source = entry.original_exit.clone();
-            let proof = (
-                entry.initial_execution,
-                entry.generation,
-                entry.actor.id(),
-                outcome,
-            );
-            if let Some(source) = &source {
-                source.joined_silent(
-                    OriginalAssociation {
-                        registry: self.inner.id,
-                        initial: entry.initial_execution,
-                        generation,
-                    },
-                    result.clone(),
-                );
-            }
-            let joined = JoinedEntry {
-                generation,
-                initial_execution: entry.initial_execution,
-                actor_id: entry.actor.id(),
-                outcome,
-                original_result: result,
-                original_exit: source.clone(),
-                internal_health: entry.internal_health.take(),
-            };
-            let removed = state.entries.insert(query, RegistryEntry::Joined(joined));
-            (proof, removed, source)
-        };
-        // Original JoinError is stable in Joined/source before any destructor
-        // or notification can run. This is also shutdown's sole join author.
-        drop(completed);
-        drop(removed);
-        if let Some(source) = source {
-            if source.has_failure() {
-                let notice = self.publish_original_exit_health_silent(&source);
-                if let Some(notice) = notice {
-                    notice.notify();
-                }
-            }
-            source.notify();
+        if let Some(carrier) = match self.runtime_carrier_for_query(query, generation) {
+            Ok(carrier) => carrier,
+            Err(error) => return Poll::Ready(Err(error)),
+        } {
+            return self.poll_runtime_join(query, generation, carrier, false, cx);
         }
-        self.inner.progress.notify_waiters();
-        Poll::Ready(Ok(proof))
+        let state = self.lock();
+        match state.entries.get(&query) {
+            Some(RegistryEntry::Joined(entry)) => {
+                validate_generation(entry.generation, generation)?;
+                Poll::Ready(Err(
+                    LogicalExecutionRuntimeRegistryError::JoinAlreadyCompleted,
+                ))
+            }
+            _ => Poll::Ready(Err(
+                LogicalExecutionRuntimeRegistryError::UnknownRegistration,
+            )),
+        }
     }
 
     pub(super) fn original_exit_pending(&self) -> bool {
@@ -1611,10 +1248,10 @@ impl LogicalExecutionRuntimeRegistryHandle {
                 .original_exit
                 .as_ref()
                 .is_some_and(|s| s.pending_actor()),
-            RegistryEntry::Installed(entry) => entry
-                .original_exit
-                .as_ref()
-                .is_some_and(|s| s.pending_actor()),
+            // Runtime actor custody belongs to this Registry. Its install-only
+            // role ending cannot keep the old supervisor role loop alive;
+            // process shutdown drains the same runtime entries afterwards.
+            RegistryEntry::RuntimeInstalled(_) => false,
             RegistryEntry::Joined(_) => false,
         })
     }
@@ -1655,14 +1292,10 @@ impl LogicalExecutionRuntimeRegistryHandle {
                         (
                             query,
                             match entry {
-                                RegistryEntry::Installed(entry)
-                                    if entry
-                                        .original_exit
-                                        .as_ref()
-                                        .is_some_and(|s| s.pending_actor()) =>
-                                {
-                                    Some((entry.generation, entry.initial_execution))
-                                }
+                                RegistryEntry::RuntimeInstalled(entry) => Some((
+                                    entry.registration.generation,
+                                    entry.registration.initial_execution,
+                                )),
                                 _ => None,
                             },
                         )
@@ -1677,90 +1310,58 @@ impl LogicalExecutionRuntimeRegistryHandle {
             let Some((generation, initial)) = selected else {
                 continue;
             };
-            if self
-                .inner
-                .active_native
-                .blocks_registration(initial, generation)
-            {
+            if let Ok(Some(carrier)) = self.runtime_carrier_for_query(query, generation) {
+                carrier.poll_source(cx);
+                // The installed handle keeps this observer registered for
+                // protocol-ready progress as well as final Scope removal.
+                let actually_exited = carrier.poll_exit(cx).is_ready();
+                if carrier.explicit_join_claimed() {
+                    // The explicit borrower owns the original receipt. Service
+                    // progress may stabilize its actual exit but cannot steal it.
+                    continue;
+                }
+                if !actually_exited {
+                    let may_close = !self
+                        .inner
+                        .active_native
+                        .blocks_registration(initial, generation);
+                    match carrier.poll_natural_retirement(cx, may_close) {
+                        Poll::Pending | Poll::Ready(Err(_)) => continue,
+                        Poll::Ready(Ok(())) => {}
+                    }
+                }
+                if let Poll::Ready(Ok(proof)) =
+                    self.poll_runtime_join(query, generation, carrier, true, cx)
+                {
+                    let receipt = LogicalExecutionJoinReceipt {
+                        registry_id: self.inner.id,
+                        initial_execution: proof.0,
+                        generation: proof.1,
+                        actor_id: proof.2,
+                        outcome: proof.3,
+                    };
+                    let _retained = self.retire(receipt);
+                    return Poll::Ready(());
+                }
                 continue;
             }
-            let (actor, close, join) = {
-                let mut state = self.lock();
-                let Some(RegistryEntry::Installed(entry)) = state.entries.get_mut(&query) else {
-                    continue;
-                };
-                (
-                    entry.actor.clone(),
-                    entry.original_close.take(),
-                    Arc::clone(&entry.join),
-                )
-            };
-            let mut close = close.unwrap_or_else(|| {
-                let closed = actor.request_registry_close_for_join(RegistryClose::Retire);
-                Box::pin(original_close_wait(closed))
-            });
-            join.wake.forward.register(cx.waker());
-            let close_wake = std::task::Waker::from(Arc::clone(&join.wake));
-            let mut close_context = std::task::Context::from_waker(&close_wake);
-            match close.as_mut().poll(&mut close_context) {
-                Poll::Pending => {
-                    let mut state = self.lock();
-                    if let Some(RegistryEntry::Installed(entry)) = state.entries.get_mut(&query) {
-                        assert!(entry.original_close.is_none());
-                        entry.original_close = Some(close);
-                    }
-                }
-                Poll::Ready(()) => {
-                    drop(close);
-                    {
-                        let mut state = self.lock();
-                        if let Some(RegistryEntry::Installed(entry)) = state.entries.get_mut(&query)
-                        {
-                            entry.ingress_closed = true;
-                        }
-                    }
-                    match self.poll_original_join(query, generation, cx) {
-                        Poll::Ready(Ok(proof)) => {
-                            let receipt = LogicalExecutionJoinReceipt {
-                                registry_id: self.inner.id,
-                                initial_execution: proof.0,
-                                generation: proof.1,
-                                actor_id: proof.2,
-                                outcome: proof.3,
-                            };
-                            let _retained = self.retire(receipt);
-                            return Poll::Ready(());
-                        }
-                        Poll::Ready(Err(_)) | Poll::Pending => {}
-                    }
-                }
-            }
-            drop(actor);
         }
         Poll::Ready(())
     }
 
-    /// Requests actor ingress closure, waits for the exact closure fact, then
-    /// consumes the Registry-owned join and retirement receipts. Cancelling
-    /// this future leaves both the actor task and join handle in the Registry.
+    /// Requests original ingress closure, waits for actual runtime exit and
+    /// consumes the exact retirement receipt. Cancelling this borrower leaves
+    /// the same carrier, source and exclusive claim in the Registry.
+    #[cfg(test)]
     pub(crate) async fn join_and_retire(
         &self,
         mut registration: LogicalExecutionRegistration,
     ) -> Result<(), LogicalExecutionRuntimeRegistryError> {
-        // The close request itself may complete the original actor WorkOwner.
-        // Preserve its same Native custody before closing ingress, as on the
-        // shutdown path; waiting only inside join() would already be too late.
+        self.claim_runtime_join(&registration)?;
         self.wait_active_native_custody(&registration).await;
-        let actor = self.actor(&registration)?;
-        let mut closed = actor.request_registry_close_for_join(RegistryClose::Retire);
-        while !*closed.borrow_and_update() {
-            if closed.changed().await.is_err() {
-                break;
-            }
-        }
-        self.record_ingress_closed(&registration)?;
+        self.close_ingress_for_join(&registration).await?;
         let receipt = self.join(&mut registration).await?;
-        self.retire(receipt).map_err(|(error, _receipt)| error)
+        self.retire(receipt).map_err(|(error, _)| error)
     }
 
     pub(crate) fn retire(
@@ -1788,14 +1389,7 @@ impl LogicalExecutionRuntimeRegistryHandle {
                     && entry.initial_execution == receipt.initial_execution
                     && entry.actor_id == receipt.actor_id
                     && entry.outcome == receipt.outcome
-                    && entry.outcome
-                        == match &entry.original_result {
-                            Ok(()) => LogicalExecutionJoinOutcome::Completed,
-                            Err(error) if error.is_cancelled() => {
-                                LogicalExecutionJoinOutcome::Cancelled
-                            }
-                            Err(_) => LogicalExecutionJoinOutcome::Panicked,
-                        } =>
+                    && entry.outcome == original_exit_outcome(&entry.original_result) =>
             {
                 if entry.internal_health.is_some() {
                     return fail(
@@ -1823,7 +1417,7 @@ impl LogicalExecutionRuntimeRegistryHandle {
                 LogicalExecutionRuntimeRegistryError::StaleGeneration,
                 receipt,
             ),
-            Some(RegistryEntry::Installed(_) | RegistryEntry::Reserved(_)) => {
+            Some(RegistryEntry::RuntimeInstalled(_) | RegistryEntry::Reserved(_)) => {
                 fail(LogicalExecutionRuntimeRegistryError::JoinNotReady, receipt)
             }
             None => fail(
@@ -1833,42 +1427,40 @@ impl LogicalExecutionRuntimeRegistryHandle {
         }
     }
 
+    #[cfg(test)]
     async fn observe_participation_convergence(
         &self,
         registration: &LogicalExecutionRegistration,
         participation: ParticipationRef,
         convergence: RegistryParticipationConvergence,
     ) -> Result<(), LogicalExecutionRuntimeRegistryError> {
-        let actor = {
-            self.validate_registry(registration)?;
-            let state = self.lock();
-            match state
-                .entries
-                .get(&registration.initial_execution.query_id())
-            {
-                Some(RegistryEntry::Installed(entry)) => {
-                    validate_generation(entry.generation, registration.generation)?;
-                    // The reservation freezes only the initial attempt's
-                    // participations. Replacement attempts keep the same logical
-                    // query identity but may select a different exact participation
-                    // set. The actor owns every current and residual attempt
-                    // ledger and performs the final exact-participation check.
-                    if participation.query_execution_id().query_id()
-                        != registration.initial_execution.query_id()
-                    {
-                        return Err(
-                            LogicalExecutionRuntimeRegistryError::ParticipationNotRegistered,
-                        );
-                    }
-                    entry.actor.clone()
-                }
-                _ => return Err(LogicalExecutionRuntimeRegistryError::UnknownRegistration),
-            }
-        };
-        actor
-            .observe_registry_participation_convergence(participation, convergence)
-            .await
-            .map_err(Into::into)
+        if let Some(carrier) = self.runtime_carrier(registration)? {
+            let activation = {
+                let state = self.lock();
+                let Some(RegistryEntry::RuntimeInstalled(entry)) = state
+                    .entries
+                    .get(&registration.initial_execution.query_id())
+                else {
+                    return Err(LogicalExecutionRuntimeRegistryError::UnknownRegistration);
+                };
+                *entry
+                    .activations
+                    .get(&participation.query_execution_id())
+                    .ok_or(LogicalExecutionRuntimeRegistryError::ParticipationNotRegistered)?
+            };
+            let reply = carrier.enqueue_fact(LogicalHostFact::RegistryParticipation {
+                activation,
+                participation,
+                convergence,
+            });
+            return carrier
+                .wait_reply(&reply)
+                .await
+                .map(|_| ())
+                .map_err(|_| LogicalExecutionRuntimeRegistryError::RuntimeSourceClosed);
+        }
+
+        Err(LogicalExecutionRuntimeRegistryError::UnknownRegistration)
     }
 
     fn validate_registry(
@@ -1890,95 +1482,6 @@ impl LogicalExecutionRuntimeRegistryHandle {
     }
 }
 
-impl LogicalExecutionRuntimeReservation {
-    pub(crate) fn spawn_and_install(
-        mut self,
-        config: LogicalExecutionActorConfig,
-    ) -> Result<InstalledLogicalExecution, LogicalExecutionRuntimeRegistryError> {
-        let query = self.initial_execution.query_id();
-        {
-            let state = self.registry.lock();
-            let Some(RegistryEntry::Reserved(entry)) = state.entries.get(&query) else {
-                return Err(LogicalExecutionRuntimeRegistryError::UnknownRegistration);
-            };
-            if entry.generation != self.generation {
-                return Err(LogicalExecutionRuntimeRegistryError::StaleGeneration);
-            }
-            let config_participations: BTreeSet<_> = config
-                .required_establish_participations()
-                .iter()
-                .copied()
-                .collect();
-            if config.initial_execution() != entry.initial_execution
-                || config_participations != entry.participations
-            {
-                return Err(LogicalExecutionRuntimeRegistryError::ConfigDoesNotMatchReservation);
-            }
-        }
-        {
-            let mut state = self.registry.lock();
-            if let Some(RegistryEntry::Reserved(entry)) = state.entries.get_mut(&query) {
-                entry.spawn_started = true;
-            }
-        }
-        let spawned = match spawn_logical_execution_actor(&self.registry.inner.runtime, config) {
-            Ok(spawned) => spawned,
-            Err(error) => {
-                let mut state = self.registry.lock();
-                if let Some(RegistryEntry::Reserved(entry)) = state.entries.get_mut(&query) {
-                    entry.spawn_started = false;
-                }
-                return Err(error.into());
-            }
-        };
-        let (owner, initial_attempt, output) = spawned.into_parts();
-        let (actor, join) = owner.into_registry_parts();
-        let registration = LogicalExecutionRegistration {
-            registry_id: self.registry.inner.id,
-            initial_execution: self.initial_execution,
-            generation: self.generation,
-        };
-        {
-            let mut state = self.registry.lock();
-            let reserved = match state.entries.remove(&query) {
-                Some(RegistryEntry::Reserved(reserved))
-                    if reserved.generation == self.generation =>
-                {
-                    reserved
-                }
-                _ => unreachable!("live reservation must retain its exact registry slot"),
-            };
-            if let Some(source) = &reserved.original_exit {
-                source.installed_silent(OriginalAssociation {
-                    registry: self.registry.inner.id,
-                    initial: self.initial_execution,
-                    generation: self.generation,
-                });
-            }
-            state.entries.insert(
-                query,
-                RegistryEntry::Installed(InstalledEntry {
-                    generation: reserved.generation,
-                    initial_execution: reserved.initial_execution,
-                    actor,
-                    join: OriginalActorJoin::new(join, Arc::downgrade(&self.registry.inner)),
-                    original_exit: reserved.original_exit,
-                    original_close: None,
-                    ingress_closed: false,
-                    internal_health: None,
-                }),
-            );
-        }
-        self.registry.inner.progress.notify_one();
-        self.active = false;
-        Ok(InstalledLogicalExecution {
-            registration,
-            initial_attempt,
-            output,
-        })
-    }
-}
-
 fn validate_generation(
     actual: u64,
     supplied: u64,
@@ -1990,1065 +1493,694 @@ fn validate_generation(
     }
 }
 
+fn original_exit_outcome(result: &LogicalExit) -> LogicalExecutionJoinOutcome {
+    match result {
+        LogicalExit::Completed => LogicalExecutionJoinOutcome::Completed,
+        LogicalExit::OwnerFailed(_) => LogicalExecutionJoinOutcome::RuntimeOwnerFailed,
+    }
+}
+
+/// Passive proof that this exact installed carrier was committed to its
+/// original Registry entry. Only this Registry constructs it. It owns no Work,
+/// capacity, Scope or checked obligation, and promises no future liveness.
+pub struct LogicalRegistryCommit {
+    original: std::sync::Weak<dyn InstalledRuntime>,
+}
+impl LogicalRegistryCommit {
+    pub fn matches(&self, original: &dyn InstalledRuntime) -> bool {
+        self.original.strong_count() != 0
+            && std::ptr::addr_eq(
+                self.original.as_ptr(),
+                original as *const dyn InstalledRuntime,
+            )
+    }
+}
+// The returned commit value retains the SAME aliases until its caller returns.
+// Their presence is custody, not another registration or exit authority.
+pub(crate) struct RuntimeInstalledLogicalExecution {
+    pub _registration: Arc<LogicalExecutionRegistration>,
+    pub _installed: Arc<dyn InstalledRuntime>,
+}
+
+/// An unsuccessful commit keeps the exact reserved registration and any
+/// already installed original Scope under its installer, never a fake join.
+pub(crate) struct RuntimeInstallRefusal {
+    pub error: LogicalExecutionRuntimeRegistryError,
+    pub reservation: LogicalExecutionRuntimeReservation,
+    pub installed: Arc<dyn InstalledRuntime>,
+}
+impl fmt::Debug for RuntimeInstallRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RuntimeInstallRefusal")
+            .field("error", &self.error)
+            .field("reservation", &self.reservation)
+            .finish_non_exhaustive()
+    }
+}
+
+impl LogicalExecutionRuntimeReservation {
+    /// Mint the original registration allocation once, before building Native
+    /// executors which must retain this SAME allocation across installation.
+    pub(crate) fn runtime_registration(&mut self) -> Arc<LogicalExecutionRegistration> {
+        self.runtime_registration
+            .get_or_insert_with(|| {
+                Arc::new(LogicalExecutionRegistration {
+                    registry_id: self.registry.inner.id,
+                    initial_execution: self.initial_execution,
+                    generation: self.generation,
+                })
+            })
+            .clone()
+    }
+
+    pub(crate) fn actor_instance(&self) -> LogicalExecutionActorId {
+        LogicalExecutionActorId::from_raw(self.generation)
+    }
+
+    /// Commit a previously installed FE carrier to its reserved original slot.
+    /// The installer retains its executors on any refusal and owns cleanup.
+    pub(crate) fn install_runtime(
+        mut self,
+        start: &novarocks_logical_execution_protocol::start::LogicalStart,
+        installed: Arc<dyn InstalledRuntime>,
+    ) -> Result<RuntimeInstalledLogicalExecution, RuntimeInstallRefusal> {
+        let invalid = {
+            let state = self.registry.lock();
+            match state.entries.get(&self.initial_execution.query_id()) {
+                Some(RegistryEntry::Reserved(entry)) if entry.generation == self.generation => {
+                    start.validate().is_err()
+                        || start.first_attempt.activation.execution() != self.initial_execution
+                        || start.actor_instance != self.actor_instance()
+                        || start.first_attempt.participations.len() != entry.participations.len()
+                        || start
+                            .first_attempt
+                            .participations
+                            .iter()
+                            .any(|p| !entry.participations.contains(p))
+                }
+                _ => true,
+            }
+        };
+        if invalid {
+            return Err(RuntimeInstallRefusal {
+                error: LogicalExecutionRuntimeRegistryError::ConfigDoesNotMatchReservation,
+                reservation: self,
+                installed,
+            });
+        }
+        let source = match installed.source(LogicalSourceKind::Registry) {
+            Ok(source) => source,
+            Err(_) => {
+                return Err(RuntimeInstallRefusal {
+                    error: LogicalExecutionRuntimeRegistryError::RuntimeSourceClosed,
+                    reservation: self,
+                    installed,
+                });
+            }
+        };
+        let registration = self.runtime_registration();
+        let carrier = RuntimeCarrier::new(
+            installed.clone(),
+            source,
+            Arc::downgrade(&self.registry.inner),
+        );
+        let query = self.initial_execution.query_id();
+        let closing = {
+            let mut state = self.registry.lock();
+            let reserved = match state.entries.remove(&query) {
+                Some(RegistryEntry::Reserved(entry)) if entry.generation == self.generation => {
+                    entry
+                }
+                _ => unreachable!("the unique original reservation retains its exact slot"),
+            };
+            if let Some(original) = &reserved.original_exit {
+                original.runtime_installed_silent(OriginalAssociation {
+                    registry: self.registry.inner.id,
+                    initial: self.initial_execution,
+                    generation: self.generation,
+                });
+            }
+            let closing = !state.accepting;
+            state.entries.insert(
+                query,
+                RegistryEntry::RuntimeInstalled(RuntimeInstalledEntry {
+                    registration: registration.clone(),
+                    actor_id: start.actor_instance,
+                    carrier: carrier.clone(),
+                    original_exit: reserved.original_exit,
+                    ingress_closed: false,
+                    internal_health: None,
+                    activations: BTreeMap::from([(
+                        start.first_attempt.activation.execution(),
+                        start.first_attempt.activation,
+                    )]),
+                }),
+            );
+            closing
+        };
+        self.active = false;
+        self.registry.inner.progress.notify_waiters();
+        if closing {
+            installed.request_close(
+                novarocks_logical_execution_protocol::input::RegistryClose::Shutdown,
+            );
+        }
+        // All original association/map metadata is committed before this
+        // foreign notification, and no Registry lock is held across it.
+        installed.registry_committed(LogicalRegistryCommit {
+            original: Arc::downgrade(&installed),
+        });
+        Ok(RuntimeInstalledLogicalExecution {
+            _registration: registration,
+            _installed: installed,
+        })
+    }
+}
+
+impl LogicalExecutionRuntimeRegistryHandle {
+    fn claim_runtime_join(
+        &self,
+        registration: &LogicalExecutionRegistration,
+    ) -> Result<(), LogicalExecutionRuntimeRegistryError> {
+        self.validate_registry(registration)?;
+        let state = self.lock();
+        if let Some(RegistryEntry::RuntimeInstalled(entry)) = state
+            .entries
+            .get(&registration.initial_execution.query_id())
+        {
+            validate_generation(entry.registration.generation, registration.generation)?;
+            entry.carrier.claim_explicit_join();
+        }
+        Ok(())
+    }
+
+    fn runtime_carrier(
+        &self,
+        registration: &LogicalExecutionRegistration,
+    ) -> Result<Option<Arc<RuntimeCarrier>>, LogicalExecutionRuntimeRegistryError> {
+        self.validate_registry(registration)?;
+        self.runtime_carrier_for_query(
+            registration.initial_execution.query_id(),
+            registration.generation,
+        )
+    }
+    fn runtime_carrier_for_query(
+        &self,
+        query: QueryId,
+        generation: u64,
+    ) -> Result<Option<Arc<RuntimeCarrier>>, LogicalExecutionRuntimeRegistryError> {
+        let state = self.lock();
+        match state.entries.get(&query) {
+            Some(RegistryEntry::RuntimeInstalled(entry)) => {
+                validate_generation(entry.registration.generation, generation)?;
+                Ok(Some(entry.carrier.clone()))
+            }
+            Some(RegistryEntry::Reserved(entry)) => {
+                validate_generation(entry.generation, generation)?;
+                Ok(None)
+            }
+            Some(RegistryEntry::Joined(entry)) => {
+                validate_generation(entry.generation, generation)?;
+                Ok(None)
+            }
+            None => Err(LogicalExecutionRuntimeRegistryError::UnknownRegistration),
+        }
+    }
+
+    /// Installation/activation author records the exact activation once. This
+    /// does not freeze a successor to the initial backend participation count.
+    pub(crate) fn register_runtime_activation(
+        &self,
+        registration: &LogicalExecutionRegistration,
+        activation: novarocks_coordination_contract::AttemptActivationIdentity,
+    ) -> Result<(), LogicalExecutionRuntimeRegistryError> {
+        self.validate_registry(registration)?;
+        let mut state = self.lock();
+        let Some(RegistryEntry::RuntimeInstalled(entry)) = state
+            .entries
+            .get_mut(&registration.initial_execution.query_id())
+        else {
+            return Err(LogicalExecutionRuntimeRegistryError::UnknownRegistration);
+        };
+        validate_generation(entry.registration.generation, registration.generation)?;
+        if activation.actor() != entry.actor_id
+            || activation.execution().query_id() != registration.initial_execution.query_id()
+        {
+            return Err(LogicalExecutionRuntimeRegistryError::ParticipationNotRegistered);
+        }
+        match entry.activations.entry(activation.execution()) {
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(activation);
+                Ok(())
+            }
+            std::collections::btree_map::Entry::Occupied(slot) if *slot.get() == activation => {
+                Ok(())
+            }
+            _ => Err(LogicalExecutionRuntimeRegistryError::StaleGeneration),
+        }
+    }
+
+    fn poll_runtime_join(
+        &self,
+        query: QueryId,
+        generation: u64,
+        carrier: Arc<RuntimeCarrier>,
+        natural: bool,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<
+        Result<
+            (
+                QueryExecutionId,
+                u64,
+                LogicalExecutionActorId,
+                LogicalExecutionJoinOutcome,
+            ),
+            LogicalExecutionRuntimeRegistryError,
+        >,
+    > {
+        carrier.poll_source(cx);
+        let result = std::task::ready!(carrier.poll_exit(cx));
+        let initial = {
+            let state = self.lock();
+            let Some(RegistryEntry::RuntimeInstalled(entry)) = state.entries.get(&query) else {
+                return Poll::Ready(Err(
+                    LogicalExecutionRuntimeRegistryError::JoinAlreadyCompleted,
+                ));
+            };
+            validate_generation(entry.registration.generation, generation)?;
+            entry.registration.initial_execution
+        };
+        if self
+            .inner
+            .active_native
+            .blocks_registration(initial, generation)
+            || !carrier.source_idle()
+        {
+            return Poll::Pending;
+        }
+        let original_result = result.clone();
+        let outcome = original_exit_outcome(&original_result);
+        let (proof, removed, source) = {
+            let mut state = self.lock();
+            let Some(RegistryEntry::RuntimeInstalled(entry)) = state.entries.get_mut(&query) else {
+                return Poll::Ready(Err(
+                    LogicalExecutionRuntimeRegistryError::JoinAlreadyCompleted,
+                ));
+            };
+            validate_generation(entry.registration.generation, generation)?;
+            if natural && carrier.explicit_join_claimed() {
+                return Poll::Pending;
+            }
+            let source = entry.original_exit.clone();
+            let proof = (initial, generation, entry.actor_id, outcome);
+            if let Some(source) = &source {
+                source.runtime_joined_silent(
+                    OriginalAssociation {
+                        registry: self.inner.id,
+                        initial,
+                        generation,
+                    },
+                    result,
+                );
+            }
+            let joined = JoinedEntry {
+                generation,
+                initial_execution: initial,
+                actor_id: entry.actor_id,
+                outcome,
+                original_result,
+                original_exit: source.clone(),
+                internal_health: entry.internal_health.take(),
+            };
+            let removed = state.entries.insert(query, RegistryEntry::Joined(joined));
+            (proof, removed, source)
+        };
+        drop(removed);
+        if let Some(source) = source {
+            // The install-only role's earlier completion deferred this body.
+            // Actual runtime Actor/Scope exit now permits its original tail.
+            source.retire_native_body_silent();
+            if source.has_failure()
+                && let Some(notice) = self.publish_original_exit_health_silent(&source)
+            {
+                notice.notify();
+            }
+            source.notify();
+        }
+        self.inner.progress.notify_waiters();
+        Poll::Ready(Ok(proof))
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroUsize;
-    use std::time::Duration;
-
-    use novarocks_types::identity::{AttemptId, BackendProcessId, FrontendProcessId};
-    use novarocks_workload_control::{
-        CancellationReason, ResourceConfig, Stage, WorkClass, WorkRequest, WorkloadConfig,
-        WorkloadControl,
+    //! Registry/Native-return component contracts only. The shared runtime
+    //! helper explicitly supplies a passive exit; no test here proves AP
+    //! success or a real FA Scope exit. Those obligations remain in the
+    //! accompanying migration manifest and actual installed-source tests.
+    use super::runtime_tests::{
+        install_native_component_runtime, install_native_component_runtime_for_original,
     };
-
     use super::*;
-    use crate::coordination::LogicalConclusion;
-    use novarocks_coordination_contract::ExecutionEffect;
+    use crate::coordination::native_active_custody::{
+        NativeActivationReturnObligation, PendingNativeCleanupRefusal,
+    };
+    use novarocks_coordination_contract::AttemptActivationIdentity;
+    use novarocks_execution_contract::TaskIdentity;
+    use novarocks_types::identity::{AttemptId, BackendProcessId, FrontendProcessId};
+    use novarocks_types::{StageId, TaskId};
+    use std::future::Future;
+    use std::num::NonZeroUsize;
+    use std::sync::atomic::AtomicBool;
+    use std::task::{Context, Wake, Waker};
+    use std::time::Duration;
 
     fn execution(tag: u64) -> QueryExecutionId {
         QueryExecutionId::new(QueryId::new(91, tag as i64), AttemptId::new(1).unwrap()).unwrap()
     }
-
-    fn config(
-        execution: QueryExecutionId,
-        participations: Vec<ParticipationRef>,
-    ) -> LogicalExecutionActorConfig {
-        config_observing_cancellation(execution, participations).0
-    }
-
-    /// Also returns a view of the work cancellation the actor owns.
-    fn config_observing_cancellation(
-        execution: QueryExecutionId,
-        participations: Vec<ParticipationRef>,
-    ) -> (
-        LogicalExecutionActorConfig,
-        novarocks_workload_control::CancellationView,
-    ) {
-        let control = WorkloadControl::try_new(
-            WorkloadConfig::default(),
-            ResourceConfig {
-                total_bytes: 1 << 20,
-                control_bytes: 1 << 12,
-                per_scope_bytes: (1 << 20) - (1 << 12),
-            },
-        )
-        .unwrap();
-        control.mark_ready().unwrap();
-        let root = control
-            .try_begin_root(WorkRequest::new(WorkClass::Query))
-            .unwrap();
-        let stage = root.owner.scope().try_acquire(Stage::Execution).unwrap();
-        let cancellation = root.owner.scope().cancellation().unwrap();
-        drop(root.business);
-        let config = LogicalExecutionActorConfig::single_attempt_completion(
-            execution,
-            ExecutionEffect::None,
-            NonZeroUsize::new(4).unwrap(),
-            participations,
-            NonZeroUsize::new(2).unwrap(),
-            NonZeroUsize::new(2).unwrap(),
-            root.owner,
-            stage,
-        )
-        .unwrap();
-        (config, cancellation)
-    }
-
-    #[derive(Debug)]
-    struct DropTrackedActiveOwner(Arc<std::sync::atomic::AtomicUsize>);
-    impl Drop for DropTrackedActiveOwner {
-        fn drop(&mut self) {
-            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        }
-    }
-    impl crate::api::ActiveNativeAttemptOwner for DropTrackedActiveOwner {
-        fn run<'a>(
-            &'a mut self,
-            _drive: &'a crate::coordination::NativeAttemptDrive,
-            _cancellation: novarocks_workload_control::CancellationView,
-        ) -> crate::api::NativeAttemptRunFuture<'a> {
-            Box::pin(async { panic!("custody fixture is not dispatched") })
-        }
-        fn converge<'a>(
-            &'a mut self,
-            _request: crate::api::NativeActiveConvergenceRequest,
-        ) -> crate::api::NativeActiveAttemptConvergenceFuture<'a> {
-            Box::pin(async { panic!("custody fixture returns original receipts explicitly") })
-        }
-    }
-
-    fn native_test_participation(execution: QueryExecutionId) -> ParticipationRef {
+    fn participation(execution: QueryExecutionId) -> ParticipationRef {
         ParticipationRef::new(
             execution,
             FrontendProcessId::new_v7(),
             BackendProcessId::new_v7(),
         )
     }
-
-    #[derive(Debug)]
-    struct NeverEstablishedAbortPort {
-        capacity: tokio::sync::watch::Sender<u64>,
-    }
-    impl crate::coordination::AbortParticipationEffectPort for NeverEstablishedAbortPort {
-        fn subscribe_capacity(&self) -> tokio::sync::watch::Receiver<u64> {
-            self.capacity.subscribe()
-        }
-        fn try_reserve(
-            &self,
-            identity: crate::coordination::AbortParticipationIssueIdentity,
-        ) -> crate::coordination::AbortParticipationEffectAdmission {
-            panic!("a never-established custody fixture must not issue Abort: {identity:?}")
-        }
-    }
-    fn native_custody_config(
-        execution: QueryExecutionId,
-        participation: ParticipationRef,
-    ) -> LogicalExecutionActorConfig {
-        let (capacity, _) = tokio::sync::watch::channel(0);
-        // A real nonempty participation manifest requires an Abort port before actor
-        // installation. These fixtures issue no admission or Establish, so any
-        // actual Abort request is a fixture violation, never a fabricated ACK.
-        config(execution, vec![participation]).with_abort_participation_effect_port(
-            Arc::new(NeverEstablishedAbortPort { capacity }),
-            NonZeroUsize::new(2).unwrap(),
+    fn root(participation: ParticipationRef) -> TaskIdentity {
+        TaskIdentity::new(
+            participation.query_execution_id(),
+            StageId::new(1).unwrap(),
+            TaskId::new(1).unwrap(),
+            participation.backend_process_id(),
         )
     }
-
-    #[tokio::test]
-    async fn unpolled_active_residual_returns_same_box_without_blocking_another_registration() {
-        let mut registry = LogicalExecutionRuntimeRegistry::new(Handle::current());
-        let exact = execution(71);
-        let participation = native_test_participation(exact);
-        let installed = registry
-            .reserve(exact, vec![participation])
-            .unwrap()
-            .spawn_and_install(native_custody_config(exact, participation))
-            .unwrap();
-        let (registration, initial, output) = installed.into_parts();
-        let _output = output.into_output();
-        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let owner = registry
-            .reserve_active_native_owner(&registration, exact, &[participation])
-            .unwrap()
-            .bind(Box::new(DropTrackedActiveOwner(Arc::clone(&drops))));
-        let actor = registry.actor(&registration).unwrap();
-        actor.initialization_failed(initial).await.unwrap();
-        // A queued residual can be dropped before its first poll. Its original
-        // Box must still be held by the pre-reserved original runtime record.
-        let unpolled = async move {
-            let _same_owner = owner;
-            std::future::pending::<()>().await;
-        };
-        drop(unpolled);
-        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 0);
-        assert_eq!(registry.active_native_custody_count(), 1);
-        assert!(
-            registry
-                .active_native_registration_health(&registration)
-                .is_some()
-        );
-        assert_eq!(
-            registry.join_readiness(&registration).await.unwrap(),
-            LogicalExecutionJoinReadiness::WaitingForConvergence
-        );
-
-        // Process health reports the problem; it does not become a global
-        // barrier that prevents a different original actor from retiring.
-        let other = execution(72);
-        let installed = registry
-            .reserve(other, Vec::new())
-            .unwrap()
-            .spawn_and_install(config(other, Vec::new()))
-            .unwrap();
-        let (other_registration, initial, output) = installed.into_parts();
-        let _other_output = output.into_output();
-        let actor = registry.actor(&other_registration).unwrap();
-        let running = actor.activate(initial.ready()).await.unwrap();
-        actor.complete_attempt(running).await.unwrap();
-        assert!(
-            registry
-                .active_native_registration_health(&other_registration)
-                .is_none()
-        );
-        registry.join_and_retire(other_registration).await.unwrap();
-        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 0);
-        registry.abandon_for_process_exit();
-        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn original_active_custody_retires_only_after_exact_actor_observations() {
-        let mut registry = LogicalExecutionRuntimeRegistry::new(Handle::current());
-        let exact = execution(73);
-        let participation = native_test_participation(exact);
-        let installed = registry
-            .reserve(exact, vec![participation])
-            .unwrap()
-            .spawn_and_install(native_custody_config(exact, participation))
-            .unwrap();
-        let (registration, initial, output) = installed.into_parts();
-        let _output = output.into_output();
-        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let mut owner = registry
-            .reserve_active_native_owner(&registration, exact, &[participation])
-            .unwrap()
-            .bind(Box::new(DropTrackedActiveOwner(Arc::clone(&drops))));
-        registry
-            .actor(&registration)
-            .unwrap()
-            .initialization_failed(initial)
-            .await
-            .unwrap();
-        owner
-            .record_and_close(crate::api::NativeActiveConvergenceClosure::Evidence(
-                crate::api::NativeAttemptConvergence::participations(vec![
-                    crate::api::NativeParticipationConvergence::never_established(participation),
-                ]),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(registry.active_native_custody_count(), 0);
-        registry.join_and_retire(registration).await.unwrap();
-        drop(owner);
-        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
-        registry
-            .shutdown_until(Instant::now() + Duration::from_secs(1))
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn duplicate_active_closure_keeps_original_box_and_custody_until_process_exit() {
-        let mut registry = LogicalExecutionRuntimeRegistry::new(Handle::current());
-        let exact = execution(74);
-        let participation = native_test_participation(exact);
-        let installed = registry
-            .reserve(exact, vec![participation])
-            .unwrap()
-            .spawn_and_install(native_custody_config(exact, participation))
-            .unwrap();
-        let (registration, initial, output) = installed.into_parts();
-        let _output = output.into_output();
-        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let mut owner = registry
-            .reserve_active_native_owner(&registration, exact, &[participation])
-            .unwrap()
-            .bind(Box::new(DropTrackedActiveOwner(Arc::clone(&drops))));
-        registry
-            .actor(&registration)
-            .unwrap()
-            .initialization_failed(initial)
-            .await
-            .unwrap();
-        let fact = crate::api::NativeParticipationConvergence::never_established(participation);
-        assert!(
-            owner
-                .record_and_close(crate::api::NativeActiveConvergenceClosure::Evidence(
-                    crate::api::NativeAttemptConvergence::participations(vec![fact, fact]),
-                ))
-                .await
-                .is_err()
-        );
-        drop(owner);
-        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 0);
-        assert_eq!(registry.active_native_custody_count(), 1);
-        registry.abandon_for_process_exit();
-        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn reservation_installs_actor_before_exposing_attempt_and_output() {
-        let registry = LogicalExecutionRuntimeRegistry::new(Handle::current());
-        let execution = execution(1);
-        let installed = registry
-            .reserve(execution, Vec::new())
-            .unwrap()
-            .spawn_and_install(config(execution, Vec::new()))
-            .unwrap();
-        let (mut registration, initial, output) = installed.into_parts();
-        assert_eq!(registration.initial_execution(), execution);
-        assert!(matches!(
-            output.into_output(),
-            crate::api::ExecutionOutput::Completion
-        ));
-
-        let actor = registry.actor(&registration).unwrap();
-        let running = actor.activate(initial.ready()).await.unwrap();
-        assert_eq!(
-            actor.complete_attempt(running).await.unwrap(),
-            LogicalConclusion::Succeeded
-        );
-        assert_eq!(
-            registry.join_readiness(&registration).await.unwrap(),
-            LogicalExecutionJoinReadiness::Ready
-        );
-
-        registry
-            .close_ingress_for_join(&registration)
-            .await
-            .unwrap();
-        let unpolled_join = registry.join(&mut registration);
-        drop(unpolled_join);
-        let receipt = registry.join(&mut registration).await.unwrap();
-        registry.retire(receipt).unwrap();
-        // Query identity allocation owns process-period uniqueness. The
-        // runtime registry does not retain an unbounded tombstone per query;
-        // its generation still prevents a stale registration from reaching a
-        // later occupant of the same map key.
-        let reused_query =
-            QueryExecutionId::new(execution.query_id(), AttemptId::new(2).unwrap()).unwrap();
-        let (mut reused_registration, reused_initial, reused_output) = registry
-            .reserve(reused_query, Vec::new())
-            .unwrap()
-            .spawn_and_install(config(reused_query, Vec::new()))
-            .unwrap()
-            .into_parts();
-        drop(reused_output);
-        assert_eq!(
-            registry.actor(&registration).unwrap_err(),
-            LogicalExecutionRuntimeRegistryError::StaleGeneration
-        );
-        let reused_actor = registry.actor(&reused_registration).unwrap();
-        let reused_running = reused_actor.activate(reused_initial.ready()).await.unwrap();
-        reused_actor.complete_attempt(reused_running).await.unwrap();
-        let receipt = registry.join(&mut reused_registration).await.unwrap();
-        registry.retire(receipt).unwrap();
-        registry.shutdown().unwrap();
-    }
-
-    #[tokio::test]
-    async fn cancelling_a_polled_join_wait_keeps_the_join_handle_registered() {
-        let registry = LogicalExecutionRuntimeRegistry::new(Handle::current());
-        let execution = execution(11);
-        let (mut registration, initial, _output) = registry
-            .reserve(execution, Vec::new())
-            .unwrap()
-            .spawn_and_install(config(execution, Vec::new()))
-            .unwrap()
-            .into_parts();
-        let actor = registry.actor(&registration).unwrap();
-        let running = actor.activate(initial.ready()).await.unwrap();
-
-        {
-            let mut state = registry.lock();
-            let Some(RegistryEntry::Installed(entry)) =
-                state.entries.get_mut(&execution.query_id())
-            else {
-                panic!("installed runtime must remain registered");
-            };
-            // Isolate the join-wait cancellation property from the actor's
-            // readiness gate: the production close path sets this only after
-            // the actor accepted its close command.
-            entry.ingress_closed = true;
+    fn borrowed(original: &LogicalExecutionRegistration) -> LogicalExecutionRegistration {
+        LogicalExecutionRegistration {
+            registry_id: original.registry_id,
+            initial_execution: original.initial_execution,
+            generation: original.generation,
         }
-        let mut pending_join = Box::pin(registry.join(&mut registration));
-        std::future::poll_fn(|context| {
-            assert!(matches!(pending_join.as_mut().poll(context), Poll::Pending));
-            Poll::Ready(())
-        })
-        .await;
-        drop(pending_join);
-        {
-            let mut state = registry.lock();
-            let Some(RegistryEntry::Installed(entry)) =
-                state.entries.get_mut(&execution.query_id())
-            else {
-                panic!("cancelled wait must not remove the installed runtime");
-            };
-            assert!(!entry.join.is_finished());
-            entry.ingress_closed = false;
+    }
+    fn original_return(
+        registry: &LogicalExecutionRuntimeRegistryHandle,
+        registration: &LogicalExecutionRegistration,
+        activation: AttemptActivationIdentity,
+        participation: ParticipationRef,
+    ) -> NativeActivationReturnObligation {
+        let mut reservation = registry
+            .reserve_active_native_owner(registration, activation.execution(), &[participation])
+            .unwrap();
+        let mut pending = None;
+        reservation.receive_activated_in(
+            &mut pending,
+            crate::api::ActivatedNativeAttempt::completion(activation),
+        );
+        reservation
+            .stage_activated_in(activation, root(participation), &mut pending)
+            .unwrap();
+        let (returned, rows) = reservation.finish_activated_in(&mut pending).unwrap();
+        assert!(pending.is_none() && rows.is_none());
+        returned
+    }
+    #[derive(Default)]
+    struct WakeFlag(AtomicBool);
+    impl Wake for WakeFlag {
+        fn wake(self: Arc<Self>) {
+            self.0.store(true, Ordering::Release);
         }
-
-        actor.complete_attempt(running).await.unwrap();
-        let receipt = registry.join(&mut registration).await.unwrap();
-        assert_eq!(receipt.outcome(), LogicalExecutionJoinOutcome::Completed);
-        registry.retire(receipt).unwrap();
-        registry.shutdown().unwrap();
-    }
-
-    #[test]
-    fn dropped_reservation_releases_the_exact_query_slot() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let registry = LogicalExecutionRuntimeRegistry::new(runtime.handle().clone());
-        let execution = execution(2);
-        drop(registry.reserve(execution, Vec::new()).unwrap());
-        assert!(registry.reserve(execution, Vec::new()).is_ok());
-        registry.shutdown().unwrap();
-    }
-
-    #[test]
-    fn process_shutdown_closes_reservations_and_retains_the_owner_until_empty() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let registry = LogicalExecutionRuntimeRegistry::new(runtime.handle().clone());
-        let reserved_execution = execution(12);
-        let reservation = registry.reserve(reserved_execution, Vec::new()).unwrap();
-        let (error, registry) = registry.shutdown().unwrap_err();
-        assert_eq!(
-            error,
-            LogicalExecutionRuntimeRegistryError::RegistryNotEmpty
-        );
-        assert_eq!(
-            registry.reserve(execution(13), Vec::new()).unwrap_err(),
-            LogicalExecutionRuntimeRegistryError::RegistryClosing
-        );
-        drop(reservation);
-        registry.shutdown().unwrap();
-    }
-
-    /// An owner abandoned by an unwind must not replace the panic that
-    /// abandoned it. Without the guard in its destructor this test does not
-    /// fail: it aborts the whole binary and takes every other test's result
-    /// with it.
-    #[tokio::test]
-    async fn an_owner_abandoned_by_an_unwind_reports_the_original_panic() {
-        let registry = LogicalExecutionRuntimeRegistry::new(Handle::current());
-
-        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-            let _abandoned = registry;
-            panic!("the assertion that actually failed");
-        }))
-        .expect_err("the closure panics");
-
-        assert_eq!(
-            *payload
-                .downcast_ref::<&str>()
-                .expect("the original panic payload survives the unwind"),
-            "the assertion that actually failed"
-        );
-    }
-
-    #[tokio::test]
-    async fn terminal_shutdown_error_after_empty_registry_records_convergence() {
-        let mut registry = LogicalExecutionRuntimeRegistry::new(Handle::current());
-        registry.inject_shutdown_error_once(LogicalExecutionRuntimeRegistryError::JoinNotReady);
-
-        assert_eq!(
-            registry
-                .shutdown_until(Instant::now() + Duration::from_secs(1))
-                .await,
-            Err(LogicalExecutionRuntimeShutdownError::Registry(
-                LogicalExecutionRuntimeRegistryError::JoinNotReady,
-            ))
-        );
-        assert!(registry.shutdown_complete);
-        registry
-            .shutdown_until(Instant::now() + Duration::from_secs(1))
-            .await
-            .expect("the converged owner must not replay a terminal diagnostic");
-    }
-
-    #[tokio::test]
-    async fn bounded_shutdown_joins_and_retires_completed_actors() {
-        let mut registry = LogicalExecutionRuntimeRegistry::new(Handle::current());
-        let execution = execution(15);
-        let (registration, initial, _output) = registry
-            .reserve(execution, Vec::new())
-            .unwrap()
-            .spawn_and_install(config(execution, Vec::new()))
-            .unwrap()
-            .into_parts();
-        let actor = registry.actor(&registration).unwrap();
-        let running = actor.activate(initial.ready()).await.unwrap();
-        actor.complete_attempt(running).await.unwrap();
-
-        registry
-            .shutdown_until(Instant::now() + Duration::from_secs(1))
-            .await
-            .unwrap();
-        assert_eq!(registry.entry_count(), 0);
-    }
-
-    #[tokio::test]
-    async fn retiring_a_concluded_actor_leaves_its_work_uncancelled() {
-        let mut registry = LogicalExecutionRuntimeRegistry::new(Handle::current());
-        let execution = execution(31);
-        let (config, cancellation) = config_observing_cancellation(execution, Vec::new());
-        let (registration, initial, _output) = registry
-            .reserve(execution, Vec::new())
-            .unwrap()
-            .spawn_and_install(config)
-            .unwrap()
-            .into_parts();
-        let actor = registry.actor(&registration).unwrap();
-        let running = actor.activate(initial.ready()).await.unwrap();
-        assert_eq!(
-            actor.complete_attempt(running).await.unwrap(),
-            LogicalConclusion::Succeeded
-        );
-
-        // Retirement follows the client-visible conclusion; closing the
-        // actor's ingress to join it must not revise that outcome.
-        registry
-            .handle()
-            .join_and_retire(registration)
-            .await
-            .unwrap();
-        assert_eq!(cancellation.reason(), None);
-        assert_eq!(registry.entry_count(), 0);
-        registry
-            .shutdown_until(Instant::now() + Duration::from_secs(1))
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn shutdown_cancels_the_work_of_an_actor_still_running() {
-        let mut registry = LogicalExecutionRuntimeRegistry::new(Handle::current());
-        let execution = execution(32);
-        let (config, cancellation) = config_observing_cancellation(execution, Vec::new());
-        let (registration, initial, _output) = registry
-            .reserve(execution, Vec::new())
-            .unwrap()
-            .spawn_and_install(config)
-            .unwrap()
-            .into_parts();
-        let actor = registry.actor(&registration).unwrap();
-        let running = actor.activate(initial.ready()).await.unwrap();
-
-        let shutdown = registry.shutdown_until(Instant::now()).await;
-        assert!(actor.registry_close_was_requested());
-        let reason = tokio::time::timeout(Duration::from_secs(5), cancellation.cancelled())
-            .await
-            .expect("shutdown cancels running work");
-        assert_eq!(reason, CancellationReason::ServerShutdown);
-        drop(running);
-        if shutdown.is_err() {
-            registry
-                .shutdown_until(Instant::now() + Duration::from_secs(1))
-                .await
-                .unwrap();
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.store(true, Ordering::Release);
         }
     }
 
     #[tokio::test]
-    async fn bounded_shutdown_timeout_retains_owner_for_exact_retry() {
-        let mut registry = LogicalExecutionRuntimeRegistry::new(Handle::current());
-        let reservation = registry.reserve(execution(16), Vec::new()).unwrap();
-
-        assert_eq!(
-            registry.shutdown_until(Instant::now()).await,
-            Err(LogicalExecutionRuntimeShutdownError::DeadlineExceeded {
-                remaining_entries: 1,
-            })
-        );
-        assert_eq!(
-            registry.reserve(execution(17), Vec::new()).unwrap_err(),
-            LogicalExecutionRuntimeRegistryError::RegistryClosing
-        );
-
-        drop(reservation);
-        registry
-            .shutdown_until(Instant::now() + Duration::from_secs(1))
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn expired_deadline_still_broadcasts_close_to_installed_actor() {
-        let mut registry = LogicalExecutionRuntimeRegistry::new(Handle::current());
-        let initial_execution = execution(22);
-        let (registration, initial, _output) = registry
-            .reserve(initial_execution, Vec::new())
-            .unwrap()
-            .spawn_and_install(config(initial_execution, Vec::new()))
-            .unwrap()
-            .into_parts();
-        let actor = registry.actor(&registration).unwrap();
-        let running = actor.activate(initial.ready()).await.unwrap();
-
-        let shutdown = registry.shutdown_until(Instant::now()).await;
-        assert!(matches!(
-            shutdown,
-            Ok(())
-                | Err(LogicalExecutionRuntimeShutdownError::DeadlineExceeded {
-                    remaining_entries: 1,
-                })
-        ));
-        assert!(actor.registry_close_was_requested());
-
-        let mut ingress_closed = actor.registry_ingress_closed();
-        while !*ingress_closed.borrow_and_update() {
-            ingress_closed.changed().await.unwrap();
-        }
-        drop(running);
-        if shutdown.is_err() {
-            registry
-                .shutdown_until(Instant::now() + Duration::from_secs(1))
-                .await
-                .unwrap();
-        }
-    }
-
-    #[tokio::test]
-    async fn bounded_shutdown_wakes_when_an_outstanding_reservation_is_dropped() {
-        let mut registry = LogicalExecutionRuntimeRegistry::new(Handle::current());
-        let reservation = registry.reserve(execution(19), Vec::new()).unwrap();
-        let mut shutdown =
-            Box::pin(registry.shutdown_until(Instant::now() + Duration::from_secs(60)));
-        std::future::poll_fn(|context| {
-            assert!(matches!(shutdown.as_mut().poll(context), Poll::Pending));
-            Poll::Ready(())
-        })
-        .await;
-
-        drop(reservation);
-        shutdown.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn cancelling_bounded_shutdown_wait_keeps_registry_join_ownership() {
-        let mut registry = LogicalExecutionRuntimeRegistry::new(Handle::current());
-        let execution = execution(18);
-        let (registration, initial, _output) = registry
-            .reserve(execution, Vec::new())
-            .unwrap()
-            .spawn_and_install(config(execution, Vec::new()))
-            .unwrap()
-            .into_parts();
-        let actor = registry.actor(&registration).unwrap();
-        let running = actor.activate(initial.ready()).await.unwrap();
-
-        let mut shutdown =
-            Box::pin(registry.shutdown_until(Instant::now() + Duration::from_secs(60)));
-        std::future::poll_fn(|context| {
-            assert!(matches!(shutdown.as_mut().poll(context), Poll::Pending));
-            Poll::Ready(())
-        })
-        .await;
-        drop(shutdown);
-
-        assert_eq!(registry.entry_count(), 1);
-        let mut ingress_closed = actor.registry_ingress_closed();
-        while !*ingress_closed.borrow_and_update() {
-            ingress_closed.changed().await.unwrap();
-        }
-        drop(running);
-        registry
-            .shutdown_until(Instant::now() + Duration::from_secs(1))
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn saturated_actor_mailbox_does_not_block_close_broadcast_to_other_actors() {
-        let mut registry = LogicalExecutionRuntimeRegistry::new(Handle::current());
-        let first_execution = execution(20);
-        let (first_registration, first_initial, _first_output) = registry
-            .reserve(first_execution, Vec::new())
-            .unwrap()
-            .spawn_and_install(config(first_execution, Vec::new()))
-            .unwrap()
-            .into_parts();
-        let first_actor = registry.actor(&first_registration).unwrap();
-        let first_running = first_actor.activate(first_initial.ready()).await.unwrap();
-
-        let second_execution = execution(21);
-        let (second_registration, second_initial, _second_output) = registry
-            .reserve(second_execution, Vec::new())
-            .unwrap()
-            .spawn_and_install(config(second_execution, Vec::new()))
-            .unwrap()
-            .into_parts();
-        let second_actor = registry.actor(&second_registration).unwrap();
-        let second_running = second_actor.activate(second_initial.ready()).await.unwrap();
-
-        let mut queued_snapshots = (0..4)
-            .map(|_| Box::pin(first_actor.snapshot()))
-            .collect::<Vec<_>>();
-        for snapshot in &mut queued_snapshots {
-            std::future::poll_fn(|context| {
-                assert!(matches!(snapshot.as_mut().poll(context), Poll::Pending));
-                Poll::Ready(())
-            })
-            .await;
-        }
-
-        let mut shutdown =
-            Box::pin(registry.shutdown_until(Instant::now() + Duration::from_secs(60)));
-        std::future::poll_fn(|context| {
-            assert!(matches!(shutdown.as_mut().poll(context), Poll::Pending));
-            Poll::Ready(())
-        })
-        .await;
-        assert!(first_actor.registry_close_was_requested());
-        assert!(second_actor.registry_close_was_requested());
-        drop(shutdown);
-        drop(queued_snapshots);
-
-        for actor in [&first_actor, &second_actor] {
-            let mut ingress_closed = actor.registry_ingress_closed();
-            while !*ingress_closed.borrow_and_update() {
-                ingress_closed.changed().await.unwrap();
-            }
-        }
-        drop(first_running);
-        drop(second_running);
-        registry
-            .shutdown_until(Instant::now() + Duration::from_secs(1))
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn actor_rejects_an_unregistered_participation_after_logical_identity_validation() {
-        let registry = LogicalExecutionRuntimeRegistry::new(Handle::current());
-        let execution = execution(3);
-        let (mut registration, initial, _output) = registry
-            .reserve(execution, Vec::new())
-            .unwrap()
-            .spawn_and_install(config(execution, Vec::new()))
-            .unwrap()
-            .into_parts();
-        let foreign_execution =
-            QueryExecutionId::new(QueryId::new(91, 99), AttemptId::new(1).unwrap()).unwrap();
-        let foreign_logical_participation = ParticipationRef::new(
-            foreign_execution,
-            FrontendProcessId::new_v7(),
-            BackendProcessId::new_v7(),
-        );
-        assert_eq!(
-            registry
-                .observe_worker_process_replaced(&registration, foreign_logical_participation)
-                .await,
-            Err(LogicalExecutionRuntimeRegistryError::ParticipationNotRegistered)
-        );
-        let foreign = ParticipationRef::new(
-            execution,
-            FrontendProcessId::new_v7(),
-            BackendProcessId::new_v7(),
-        );
-        assert_eq!(
-            registry
-                .observe_worker_process_replaced(&registration, foreign)
-                .await,
-            Err(LogicalExecutionRuntimeRegistryError::Actor(
-                LogicalExecutionActorError::StandDown(
-                    crate::coordination::ParticipationStandDownError::StandDownNotStarted,
-                ),
-            ))
-        );
-        drop(initial);
-        loop {
-            if registry.join_readiness(&registration).await.unwrap()
-                == LogicalExecutionJoinReadiness::Ready
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        let receipt = registry.join(&mut registration).await.unwrap();
-        registry.retire(receipt).unwrap();
-        registry.shutdown().unwrap();
-    }
-
-    #[tokio::test]
-    async fn failed_retirement_returns_the_join_receipt_for_exact_retry() {
-        let registry = LogicalExecutionRuntimeRegistry::new(Handle::current());
-        let foreign_registry = LogicalExecutionRuntimeRegistry::new(Handle::current());
-        let execution = execution(4);
-        let (mut registration, initial, _output) = registry
-            .reserve(execution, Vec::new())
-            .unwrap()
-            .spawn_and_install(config(execution, Vec::new()))
-            .unwrap()
-            .into_parts();
-        let actor = registry.actor(&registration).unwrap();
-        let running = actor.activate(initial.ready()).await.unwrap();
-        actor.complete_attempt(running).await.unwrap();
-        let receipt = registry.join(&mut registration).await.unwrap();
-        let (error, receipt) = foreign_registry.retire(receipt).unwrap_err();
-        assert_eq!(error, LogicalExecutionRuntimeRegistryError::ForeignRegistry);
-        registry.retire(receipt).unwrap();
-        foreign_registry.shutdown().unwrap();
-        registry.shutdown().unwrap();
-    }
-
-    #[tokio::test]
-    async fn cancelled_actor_join_still_produces_a_retirable_receipt() {
-        let registry = LogicalExecutionRuntimeRegistry::new(Handle::current());
-        let execution = execution(14);
-        let (mut registration, initial, _output) = registry
-            .reserve(execution, Vec::new())
-            .unwrap()
-            .spawn_and_install(config(execution, Vec::new()))
-            .unwrap()
-            .into_parts();
-        drop(initial);
-        let join = {
-            let mut state = registry.lock();
-            let Some(RegistryEntry::Installed(entry)) =
-                state.entries.get_mut(&execution.query_id())
-            else {
-                panic!("installed runtime must remain registered");
-            };
-            entry.ingress_closed = true;
-            Arc::clone(&entry.join)
-        };
-        join.abort();
-        drop(join);
-
-        let receipt = registry.join(&mut registration).await.unwrap();
-        assert_eq!(receipt.outcome(), LogicalExecutionJoinOutcome::Cancelled);
-        registry.retire(receipt).unwrap();
-        registry.shutdown().unwrap();
-    }
-
-    #[tokio::test]
-    async fn shutdown_keeps_unknown_native_actor_work_while_a_healthy_registration_really_joins() {
-        use std::future::Future;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let mut registry = LogicalExecutionRuntimeRegistry::new(Handle::current());
-        let exact = execution(75);
-        let participation = native_test_participation(exact);
-        let installed = registry
-            .reserve(exact, vec![participation])
-            .unwrap()
-            .spawn_and_install(native_custody_config(exact, participation))
-            .unwrap();
-        let (registration, initial, output) = installed.into_parts();
-        let _output = output.into_output();
-        let drops = Arc::new(AtomicUsize::new(0));
-        let original = registry
-            .reserve_active_native_owner(&registration, exact, &[participation])
-            .unwrap()
-            .bind(Box::new(DropTrackedActiveOwner(Arc::clone(&drops))));
-        registry
-            .actor(&registration)
-            .unwrap()
-            .initialization_failed(initial)
-            .await
-            .unwrap();
-        // This real enclosing-drop seam returns the same original Box to its
-        // exact pre-reserved health slot; no foreign exit receipt is invented.
-        drop(original);
-
-        let healthy = execution(76);
-        let installed = registry
-            .reserve(healthy, Vec::new())
-            .unwrap()
-            .spawn_and_install(config(healthy, Vec::new()))
-            .unwrap();
-        let (healthy_registration, initial, output) = installed.into_parts();
-        let _healthy_output = output.into_output();
-        let actor = registry.actor(&healthy_registration).unwrap();
-        let running = actor.activate(initial.ready()).await.unwrap();
-        actor.complete_attempt(running).await.unwrap();
+    async fn pending_cleanup_reclaims_same_staged_return_during_close_without_new_reservation() {
+        let mut registry = LogicalExecutionRuntimeRegistry::new();
+        let exact = execution(982);
+        let member = participation(exact);
+        let source = OriginalLogicalExit::new();
+        let observer =
+            super::super::original_exit::LogicalExecutionExitObserver::new(source.clone());
         let handle = registry.handle();
+        let (registration, activation, release) = install_native_component_runtime_for_original(
+            &handle,
+            exact,
+            vec![member],
+            Some(source.clone()),
+        );
+        let reservation = handle
+            .reserve_active_native_owner(&registration, exact, &[member])
+            .unwrap();
+        let mut body = source.native.lock().await;
+        reservation.receive_activated_in(
+            &mut body.pending_activated,
+            crate::api::ActivatedNativeAttempt::completion(activation),
+        );
+        reservation
+            .stage_activated_in(activation, root(member), &mut body.pending_activated)
+            .unwrap();
+        let address = body
+            .pending_activated
+            .as_ref()
+            .unwrap()
+            .staged_slot_address()
+            .unwrap();
+        drop(reservation);
+        assert_eq!(handle.active_native_custody_count(), 1);
+        assert_eq!(observer.view().unwrap().pending_native_returns(), 1);
+        let foreign = OriginalLogicalExit::new();
+        for wrong_body in [false, true] {
+            let (original, native) = if wrong_body {
+                (&source, &foreign.native)
+            } else {
+                (&foreign, &source.native)
+            };
+            assert!(matches!(
+                handle.take_pending_native_for_cleanup(
+                    &registration,
+                    original,
+                    native,
+                    &mut body.pending_activated,
+                ),
+                Err(PendingNativeCleanupRefusal::ForeignSource)
+            ));
+            assert_eq!(
+                body.pending_activated
+                    .as_ref()
+                    .unwrap()
+                    .staged_slot_address(),
+                Some(address)
+            );
+        }
+        handle.begin_shutdown();
+        assert!(matches!(
+            handle.reserve_active_native_owner(&registration, exact, &[member]),
+            Err(LogicalExecutionRuntimeRegistryError::RegistryClosing)
+        ));
+        let (mut returned, rows) = handle
+            .take_pending_native_for_cleanup(
+                &registration,
+                &source,
+                &source.native,
+                &mut body.pending_activated,
+            )
+            .unwrap();
+        assert!(rows.is_none() && body.pending_activated.is_none());
+        assert_eq!(handle.active_native_custody_count(), 1);
+        assert_eq!(
+            observer.view().unwrap().pending_native_returns(),
+            1,
+            "adoption reserves no second slot"
+        );
+        assert!(matches!(
+            handle.take_pending_native_for_cleanup(
+                &registration,
+                &source,
+                &source.native,
+                &mut body.pending_activated,
+            ),
+            Err(PendingNativeCleanupRefusal::NotStaged)
+        ));
+        drop(body);
+        // This task-free completion fixture models the exact original return
+        // author after its independently supplied local-exit qualification.
+        // It does not synthesize a Native owner, future, AP or Scope proof.
+        let changed = returned.retire_local();
+        changed.notify_waiters();
+        assert_eq!(handle.active_native_custody_count(), 0);
+        assert_eq!(observer.view().unwrap().pending_native_returns(), 0);
+        drop(returned);
+        release();
+        handle
+            .join_and_retire(borrowed(&registration))
+            .await
+            .unwrap();
+        assert_eq!(handle.entry_count(), 0);
+        registry
+            .shutdown_until(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn same_shutdown_wait_resumes_when_original_native_return_notifies_after_metadata() {
+        let mut registry = LogicalExecutionRuntimeRegistry::new();
+        let exact = execution(983);
+        let member = participation(exact);
+        let source = OriginalLogicalExit::new();
+        let observer =
+            super::super::original_exit::LogicalExecutionExitObserver::new(source.clone());
+        let handle = registry.handle();
+        let (registration, activation, release) = install_native_component_runtime_for_original(
+            &handle,
+            exact,
+            vec![member],
+            Some(source.clone()),
+        );
+        let mut returned = original_return(&handle, &registration, activation, member);
+        release(); // Explicit scripted runtime exit, not Native closure.
+        let flag = Arc::new(WakeFlag::default());
+        let wake = Waker::from(flag.clone());
+        let mut cx = Context::from_waker(&wake);
+        let mut wait = Box::pin(registry.shutdown_until(Instant::now() + Duration::from_secs(60)));
+        assert!(wait.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(handle.active_native_custody_count(), 1);
+        assert!(handle.lock().entries.contains_key(&exact.query_id()));
+        flag.0.store(false, Ordering::Release);
+        let progress = returned.retire_local();
+        assert_eq!(observer.view().unwrap().pending_native_returns(), 0);
+        assert_eq!(handle.active_native_custody_count(), 0);
+        progress.notify_waiters();
+        assert!(
+            flag.0.load(Ordering::Acquire),
+            "same pending shutdown receives original progress"
+        );
+        wait.await.unwrap();
+        drop(returned);
+        assert_eq!(handle.entry_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn same_explicit_retirement_wait_keeps_registration_until_original_native_return() {
+        let mut registry = LogicalExecutionRuntimeRegistry::new();
+        let exact = execution(984);
+        let member = participation(exact);
+        let source = OriginalLogicalExit::new();
+        let observer =
+            super::super::original_exit::LogicalExecutionExitObserver::new(source.clone());
+        let handle = registry.handle();
+        let (registration, activation, release) = install_native_component_runtime_for_original(
+            &handle,
+            exact,
+            vec![member],
+            Some(source.clone()),
+        );
+        let mut returned = original_return(&handle, &registration, activation, member);
+        release();
+        let mut wait = Box::pin(handle.join_and_retire(borrowed(&registration)));
+        assert!(futures::poll!(wait.as_mut()).is_pending());
+        assert_eq!(handle.active_native_custody_count(), 1);
+        assert!(handle.lock().entries.contains_key(&exact.query_id()));
+        let progress = returned.retire_local();
+        progress.notify_waiters();
+        wait.await.unwrap();
+        drop(returned);
+        assert_eq!(observer.view().unwrap().pending_native_returns(), 0);
+        assert_eq!(handle.entry_count(), 0);
+        registry
+            .shutdown_until(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn unknown_native_return_keeps_exact_registration_while_healthy_runtime_retires() {
+        let mut registry = LogicalExecutionRuntimeRegistry::new();
+        let handle = registry.handle();
+        let exact = execution(985);
+        let member = participation(exact);
+        let (unknown, activation, release_unknown) =
+            install_native_component_runtime(&handle, exact, vec![member]);
+        let returned = original_return(&handle, &unknown, activation, member);
+        drop(returned); // Explicitly unresolved return, never a positive close.
+        release_unknown();
+        let (healthy, _, release_healthy) =
+            install_native_component_runtime(&handle, execution(986), vec![]);
+        release_healthy();
+        // Both exits above are explicit scripted InstalledRuntime inputs.
+        // Only this SAME real Registry sweep may retire healthy B: an explicit
+        // join_and_retire(B) would bypass its skip-unknown scheduling contract.
         let mut shutdown =
-            Box::pin(registry.shutdown_until(Instant::now() + Duration::from_secs(1)));
-        // Poll the real Registry shutdown to actual healthy retirement. The
-        // one-second test cap is not a receipt; only removal after join is.
-        let healthy_retired = std::future::poll_fn(|cx| {
+            Box::pin(registry.shutdown_until(Instant::now() + Duration::from_secs(5)));
+        let healthy_retired_by_same_sweep = std::future::poll_fn(|cx| {
             if shutdown.as_mut().poll(cx).is_ready() {
                 return Poll::Ready(false);
             }
-            if !handle.lock().entries.contains_key(&healthy.query_id()) {
+            if !handle
+                .lock()
+                .entries
+                .contains_key(&execution(986).query_id())
+            {
                 Poll::Ready(true)
             } else {
                 Poll::Pending
             }
         })
         .await;
+        let same_wait_still_pending =
+            healthy_retired_by_same_sweep && futures::poll!(shutdown.as_mut()).is_pending();
+        // End only the borrowed wait. Keep the exact Registry and original
+        // unproven return; neither its timer nor B's exit proves A's exit.
         drop(shutdown);
-        let unknown_actor_still_live = match handle.lock().entries.get(&exact.query_id()) {
-            Some(RegistryEntry::Installed(entry)) => !entry.join.is_finished(),
-            _ => false,
-        };
-        let original_held = drops.load(Ordering::SeqCst) == 0;
-        let one_unknown = registry.active_native_custody_count() == 1;
-        let healthy_health_absent = registry
-            .active_native_registration_health(&healthy_registration)
-            .is_none();
+        let exact_a_kept = matches!(
+            handle.lock().entries.get(&exact.query_id()),
+            Some(RegistryEntry::RuntimeInstalled(entry))
+                if Arc::ptr_eq(&entry.registration, &unknown)
+        );
+        let original_return_still_blocks = handle
+            .inner
+            .active_native
+            .blocks_registration(exact, unknown.generation);
+        let one_return = handle.active_native_custody_count() == 1;
+        let a_health_kept = handle.active_native_registration_health(&unknown).is_some();
+        let b_health_absent = handle.active_native_registration_health(&healthy).is_none();
+        let original_entries_and_return = handle.entry_count() == 2;
+        // This component has no physical Native/AP resource. Only its explicit
+        // process-exit disposition releases the unresolved passive return slot.
         registry.abandon_for_process_exit();
-        assert!(
-            healthy_retired,
-            "one unknown Native registration cannot strand a healthy sibling join"
-        );
-        assert!(
-            unknown_actor_still_live,
-            "RegistryClose must not finish the original actor WorkOwner before Native exit"
-        );
-        assert!(original_held);
-        assert!(one_unknown);
-        assert!(healthy_health_absent);
-        assert_eq!(
-            drops.load(Ordering::SeqCst),
-            1,
-            "only explicit process-exit abandonment retires the unknown Box"
-        );
+        assert!(healthy_retired_by_same_sweep && same_wait_still_pending);
+        assert!(exact_a_kept && original_return_still_blocks && one_return);
+        assert!(a_health_kept && b_health_absent && original_entries_and_return);
+        assert_eq!(handle.entry_count(), 0);
     }
 
     #[tokio::test]
-    async fn the_same_shutdown_wait_closes_an_initially_skipped_actor_after_original_native_receipt()
-     {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let mut registry = LogicalExecutionRuntimeRegistry::new(Handle::current());
-        let exact = execution(77);
-        let participation = native_test_participation(exact);
-        let installed = registry
-            .reserve(exact, vec![participation])
-            .unwrap()
-            .spawn_and_install(native_custody_config(exact, participation))
-            .unwrap();
-        let (registration, initial, output) = installed.into_parts();
-        let _output = output.into_output();
-        let drops = Arc::new(AtomicUsize::new(0));
-        let mut original = registry
-            .reserve_active_native_owner(&registration, exact, &[participation])
-            .unwrap()
-            .bind(Box::new(DropTrackedActiveOwner(Arc::clone(&drops))));
-        registry
-            .actor(&registration)
-            .unwrap()
-            .initialization_failed(initial)
-            .await
-            .unwrap();
+    async fn shutdown_cut_refuses_late_native_return_reservation_without_activation() {
+        let mut registry = LogicalExecutionRuntimeRegistry::new();
         let handle = registry.handle();
-        let mut shutdown =
-            Box::pin(registry.shutdown_until(Instant::now() + Duration::from_secs(1)));
-        let initially_pending = std::future::poll_fn(|cx| {
-            Poll::Ready(std::future::Future::poll(shutdown.as_mut(), cx).is_pending())
-        })
-        .await;
-        tokio::task::yield_now().await;
-        let actor_kept_before_receipt = match handle.lock().entries.get(&exact.query_id()) {
-            Some(RegistryEntry::Installed(entry)) => !entry.join.is_finished(),
-            _ => false,
-        };
-        // The original prepared fixture never dispatched admission/Establish.
-        // This exact author receipt settles its same pre-reserved Native slot.
-        original
-            .record_and_close(crate::api::NativeActiveConvergenceClosure::Evidence(
-                crate::api::NativeAttemptConvergence::participations(vec![
-                    crate::api::NativeParticipationConvergence::never_established(participation),
-                ]),
-            ))
-            .await
-            .unwrap();
-        // No second shutdown call, new service or polling timer is involved:
-        // Native slot removal wakes the original registered progress waiter.
-        let result = shutdown.await;
-        let retired = !handle.lock().entries.contains_key(&exact.query_id());
-        drop(original);
-        let owner_dropped = drops.load(Ordering::SeqCst);
-        if result.is_err() {
-            registry.abandon_for_process_exit();
-        }
-        assert!(initially_pending);
-        assert!(actor_kept_before_receipt);
-        result.expect("the same shutdown wait must resume after normal custody removal");
-        assert!(retired);
-        assert_eq!(owner_dropped, 1);
-    }
-    #[tokio::test]
-    async fn retire_wait_keeps_original_actor_until_the_same_native_receipt() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let mut registry = LogicalExecutionRuntimeRegistry::new(Handle::current());
-        let exact = execution(78);
-        let participation = native_test_participation(exact);
-        let installed = registry
-            .reserve(exact, vec![participation])
-            .unwrap()
-            .spawn_and_install(native_custody_config(exact, participation))
-            .unwrap();
-        let (registration, initial, output) = installed.into_parts();
-        let _output = output.into_output();
-        let drops = Arc::new(AtomicUsize::new(0));
-        let mut original = registry
-            .reserve_active_native_owner(&registration, exact, &[participation])
-            .unwrap()
-            .bind(Box::new(DropTrackedActiveOwner(Arc::clone(&drops))));
-        registry
-            .actor(&registration)
-            .unwrap()
-            .initialization_failed(initial)
-            .await
-            .unwrap();
-        let handle = registry.handle();
-        let mut shutdown = Box::pin(handle.join_and_retire(registration));
-        let initially_pending = std::future::poll_fn(|cx| {
-            Poll::Ready(std::future::Future::poll(shutdown.as_mut(), cx).is_pending())
-        })
-        .await;
-        tokio::task::yield_now().await;
-        let actor_kept_before_receipt = match handle.lock().entries.get(&exact.query_id()) {
-            Some(RegistryEntry::Installed(entry)) => !entry.join.is_finished(),
-            _ => false,
-        };
-        // The original prepared fixture never dispatched admission/Establish.
-        // This exact author receipt settles its same pre-reserved Native slot.
-        original
-            .record_and_close(crate::api::NativeActiveConvergenceClosure::Evidence(
-                crate::api::NativeAttemptConvergence::participations(vec![
-                    crate::api::NativeParticipationConvergence::never_established(participation),
-                ]),
-            ))
-            .await
-            .unwrap();
-        // The same pending Retire wait observes the original custody receipt;
-        // no close request was allowed to race ahead of that receipt.
-        let result = shutdown.await;
-        let retired = !handle.lock().entries.contains_key(&exact.query_id());
-        drop(original);
-        let owner_dropped = drops.load(Ordering::SeqCst);
-        if result.is_err() {
-            registry.abandon_for_process_exit();
-        }
-        assert!(initially_pending);
-        assert!(actor_kept_before_receipt);
-        result.expect("Retire must resume only after original Native custody closes");
-        assert!(retired);
-        assert_eq!(owner_dropped, 1);
-        registry
-            .shutdown_until(Instant::now() + Duration::from_secs(1))
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn shutdown_cut_refuses_late_native_custody_before_activation() {
-        let mut registry = LogicalExecutionRuntimeRegistry::new(Handle::current());
-        let exact = execution(79);
-        let participation = native_test_participation(exact);
-        let installed = registry
-            .reserve(exact, vec![participation])
-            .unwrap()
-            .spawn_and_install(native_custody_config(exact, participation))
-            .unwrap();
-        let (registration, initial, output) = installed.into_parts();
-        let _output = output.into_output();
-        let handle = registry.handle();
+        let exact = execution(987);
+        let member = participation(exact);
+        let source = OriginalLogicalExit::new();
+        let observer =
+            super::super::original_exit::LogicalExecutionExitObserver::new(source.clone());
+        let (registration, _, release) = install_native_component_runtime_for_original(
+            &handle,
+            exact,
+            vec![member],
+            Some(source.clone()),
+        );
         handle.begin_shutdown();
-        let refused = handle.reserve_active_native_owner(&registration, exact, &[participation]);
         assert!(matches!(
-            refused,
+            handle.reserve_active_native_owner(&registration, exact, &[member]),
             Err(LogicalExecutionRuntimeRegistryError::RegistryClosing)
         ));
-        assert_eq!(registry.active_native_custody_count(), 0);
-        // This original fixture never dispatched Establish: the rejected
-        // reservation grants no Native activation or remote responsibility.
-        registry
-            .actor(&registration)
-            .unwrap()
-            .initialization_failed(initial)
-            .await
-            .unwrap();
-        handle
-            .observe_participation_never_established(&registration, participation)
-            .await
-            .unwrap();
+        assert_eq!(handle.active_native_custody_count(), 0);
+        assert_eq!(observer.view().unwrap().pending_native_returns(), 0);
+        release();
         registry
             .shutdown_until(Instant::now() + Duration::from_secs(1))
             .await
             .unwrap();
-        assert!(handle.lock().entries.is_empty());
-        assert_eq!(registry.active_native_custody_count(), 0);
+        assert_eq!(handle.entry_count(), 0);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3086,21 +2218,13 @@ mod tests {
                 Some(self.0.clone())
             }
         }
-        let mut registry = LogicalExecutionRuntimeRegistry::new(Handle::current());
+        // The registry seam reports an explicit scripted runtime exit. The
+        // blocking worker and its opaque panic payload below are genuine.
+        let mut registry = LogicalExecutionRuntimeRegistry::new();
         let exact = execution(95);
-        let installed = registry
-            .reserve(exact, Vec::new())
-            .unwrap()
-            .spawn_and_install(config(exact, Vec::new()))
-            .unwrap();
-        let (mut registration, initial, output) = installed.into_parts();
-        let _output = output.into_output();
-        registry
-            .actor(&registration)
-            .unwrap()
-            .initialization_failed(initial)
-            .await
-            .unwrap();
+        let (registration, _, release) =
+            install_native_component_runtime(&registry.handle(), exact, Vec::new());
+        let mut registration = borrowed(&registration);
         let mut workers = QueryBlockingExecutorOwner::try_new(QueryBlockingExecutorConfig::new(
             NonZeroUsize::new(1).unwrap(),
             NonZeroUsize::new(1).unwrap(),
@@ -3129,6 +2253,7 @@ mod tests {
         drop(consumer);
         drop(health);
         let before_join = drops.load(Ordering::Acquire);
+        release();
         let receipt = registry.join(&mut registration).await.unwrap();
         let (blocked, receipt) = match registry.retire(receipt) {
             Err((error, original)) => (
@@ -3180,7 +2305,7 @@ mod tests {
             geometry.internal_health_field_layout(),
             std::alloc::Layout::new::<Option<InternalConsumerHealth>>()
         );
-        assert!(geometry.record_layout().size() >= std::mem::size_of::<InstalledEntry>());
+        assert!(geometry.record_layout().size() >= std::mem::size_of::<RuntimeInstalledEntry>());
         assert!(geometry.record_layout().size() >= std::mem::size_of::<JoinedEntry>());
         assert_eq!(
             geometry.inline_bytes_for_entries(1),
@@ -3194,16 +2319,12 @@ mod tests {
 }
 
 #[cfg(test)]
-#[path = "original_exit_registry_tests.rs"]
-mod original_exit_registry_tests;
-
-#[cfg(test)]
 mod original_health_migration_tests {
     use super::*;
 
     #[tokio::test]
     async fn process_health_survives_runtime_shutdown_until_its_last_original_handle_exits() {
-        let registry = LogicalExecutionRuntimeRegistry::new(Handle::current());
+        let registry = LogicalExecutionRuntimeRegistry::new();
         let handle = registry.handle();
         let cause: Arc<dyn std::error::Error + Send + Sync> =
             Arc::new(std::io::Error::other("original process failure"));
@@ -3257,7 +2378,7 @@ mod process_exit_health_tests {
 
     #[tokio::test]
     async fn process_exit_drops_detached_health_outside_locks_and_keeps_later_cleanup_failure() {
-        let mut registry = LogicalExecutionRuntimeRegistry::new(Handle::current());
+        let mut registry = LogicalExecutionRuntimeRegistry::new();
         let handle = registry.handle();
         let dropped = Arc::new(AtomicBool::new(false));
         handle.record_native_supervision_panic(Box::new(CleanupHealth {
@@ -3273,3 +2394,7 @@ mod process_exit_health_tests {
         assert_eq!(handle.entry_count(), 0);
     }
 }
+
+#[cfg(test)]
+#[path = "runtime_registry/runtime_tests.rs"]
+pub(in crate::coordination) mod runtime_tests;

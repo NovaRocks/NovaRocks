@@ -242,6 +242,7 @@ enum Event<'source> {
         node: p::NodeId,
         source: &'source c::ConnectorWriteRecipeDraft,
     },
+    Layout(&'source c::ConnectorWriteLayoutRecipeDraft),
 }
 impl Event<'_> {
     fn header(self) -> Result<Counts, Error> {
@@ -286,6 +287,11 @@ impl Event<'_> {
                         .len(),
                 )?,
                 expression_ids: usize::from(source.scan().remaining_expression().is_some()),
+                ..Counts::default()
+            },
+            Self::Layout(_) => Counts {
+                providers: 1,
+                payloads: 1,
                 ..Counts::default()
             },
             Self::Writer { .. } => Counts {
@@ -359,6 +365,9 @@ fn visit_sources<'source>(
             budget,
             work,
         )?;
+    }
+    for recipe in package.layouts().values() {
+        visitor.capture(Event::Layout(recipe), budget, work)?;
     }
     Ok(())
 }
@@ -753,6 +762,11 @@ impl<'source> SourceVisitor<'source> for FillPass<'_, '_, 'source, '_> {
                     expressions: begin..self.sources.expression_ids.len(),
                 });
                 work.step()?;
+            }
+            Event::Layout(recipe) => {
+                self.sources
+                    .provider(ProviderBindingSource::Write(recipe.binding()), work)?;
+                self.sources.payload(recipe.payload(), work)?;
             }
             Event::Writer { node, source } => {
                 self.sources

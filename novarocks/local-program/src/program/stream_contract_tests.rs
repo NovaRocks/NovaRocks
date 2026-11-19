@@ -20,8 +20,7 @@
 use super::*;
 use crate::{
     DataStreamPartitionType, ExchangeDeliveryRequirement, KernelAbiVersion, ProgramOutputRole,
-    StaticExprKind, StaticExprNode, StaticRouterRoute, StaticStreamBranch, StaticStreamContract,
-    StaticStreamRouting,
+    StaticRouterRoute, StaticStreamBranch, StaticStreamContract, StaticStreamRouting,
 };
 use arrow_array::{ArrayRef, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
@@ -29,7 +28,7 @@ use novarocks_type_contract::{
     CompileControlError, CompilePhase, FunctionValueType, PureCompileControl,
     ValueTypeStorageLifetime,
 };
-use std::{collections::HashMap, num::NonZeroUsize, sync::Arc};
+use std::{num::NonZeroUsize, sync::Arc};
 
 struct Control;
 impl PureCompileControl for Control {
@@ -66,9 +65,6 @@ fn layout(fields: &[(&str, DataType, u32)]) -> StaticLayout {
         &Control,
     )
     .unwrap()
-}
-fn expressions() -> Arc<ImmutableExpressions> {
-    Arc::new(ImmutableExpressions::try_new(vec![], false, HashMap::new(), None).unwrap())
 }
 fn profile(layout: &StaticLayout) -> CompileProfile {
     CompileProfile::new(
@@ -136,7 +132,7 @@ fn router_graph(projection: RouteProjection) -> Result<LocalProgramGraph, LocalP
             columns,
             ProgramOutputRole::ProviderRoute { target },
         )],
-        expressions(),
+        &[],
         SlotId::new(1),
         vec![StaticRouterRoute {
             layout: crate::ProgramWriteLayoutPreference::None,
@@ -156,19 +152,15 @@ fn router_graph(projection: RouteProjection) -> Result<LocalProgramGraph, LocalP
         summary_layout.clone(),
     )
     .unwrap();
-    let main = Arc::new(
-        ImmutableExpressions::try_new(
-            vec![StaticExprNode::new(
-                StaticExprKind::SlotId(SlotId::new(2)),
-                DataType::Int64,
-                None,
-            )],
-            false,
-            HashMap::new(),
-            None,
-        )
-        .unwrap(),
-    );
+    let units = vec![crate::test_support::read_unit(
+        &input_layout,
+        &[FunctionValueType::new(DataType::Int64, false)],
+        &[(
+            novarocks_expression_contract::ValueId::new(2),
+            FunctionValueType::new(DataType::Int64, false),
+        )],
+        &[(0, novarocks_type_contract::EvaluationDemand::Value)],
+    )];
     let nodes = vec![
         ProgramNode::new(
             0,
@@ -187,7 +179,7 @@ fn router_graph(projection: RouteProjection) -> Result<LocalProgramGraph, LocalP
                     assignments: vec![ChangeEventOutputExpr {
                         write_input: None,
                         output_slot_id: SlotId::new(2),
-                        expr: Some(ProgramExprId::new(0)),
+                        expr: Some(crate::test_support::root(0, 0)),
                     }],
                 }],
                 output_slot_ids: vec![SlotId::new(1), SlotId::new(2)],
@@ -199,7 +191,7 @@ fn router_graph(projection: RouteProjection) -> Result<LocalProgramGraph, LocalP
     LocalProgramGraph::try_new_with_outputs(
         nodes,
         ProgramNodeId::new(1),
-        main,
+        &units,
         profile(&root_layout),
         BindingRequirements::try_new(vec![
             BindingRequirement::ExchangeOutput {
@@ -230,7 +222,15 @@ fn program_summary_table_rejects_duplicate_kinds_and_all_current_node_authors() 
         LocalProgramGraph::try_new_with_outputs(
             graph.nodes().to_vec(),
             graph.root(),
-            graph.expressions().clone(),
+            &[crate::test_support::read_unit(
+                graph.nodes()[0].output_layout(),
+                &[FunctionValueType::new(DataType::Int64, false)],
+                &[(
+                    novarocks_expression_contract::ValueId::new(2),
+                    FunctionValueType::new(DataType::Int64, false),
+                )],
+                &[(0, novarocks_type_contract::EvaluationDemand::Value)],
+            )],
             graph.profile(),
             graph.requirements().clone(),
             graph.sink().cloned(),
@@ -425,7 +425,7 @@ fn finish_graph(shape: SummaryInput) -> Result<LocalProgramGraph, LocalProgramEr
     LocalProgramGraph::try_new(
         nodes,
         root,
-        expressions(),
+        &[],
         profile(&root_layout),
         BindingRequirements::try_new(requirements).unwrap(),
     )

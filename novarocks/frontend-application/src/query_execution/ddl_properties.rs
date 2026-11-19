@@ -68,7 +68,6 @@ impl DdlPropertyConstantEvaluator<'_> {
             sql_semantics: self.sql_semantics,
             constant_policy: self.constant_policy,
             control: self.control,
-            version: super::physical_encoding::mint_plan_version(),
         })
         .map_err(compile_error)
     }
@@ -142,15 +141,8 @@ pub(crate) fn evaluation_error(error: SqlConstantEvaluationError) -> DdlProperty
             // input. A different Data or capability failure keeps its author.
             let selected_row = cause.failure_fact().class() == FailureClass::Data
                 && cause
-                    .downcast_ref::<novarocks_execution::runtime::task::ExecutionFailure>()
-                    .is_some_and(|error| {
-                        matches!(
-                            error.cause(),
-                            novarocks_execution::runtime::task::ExecutionFailureCause::RequiredRow(
-                                _
-                            )
-                        )
-                    });
+                    .downcast_ref::<novarocks_expression::RequiredExpressionRowError>()
+                    .is_some();
             let eligibility = cause
                 .downcast_ref::<super::required_constant_eval::RequiredConstantEligibilityFailure>()
                 .is_some();

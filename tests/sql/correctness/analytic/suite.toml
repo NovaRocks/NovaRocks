@@ -22,8 +22,8 @@ paths = [
     "novarocks/execution/src/exec/operators/analytic_*.rs",
     "novarocks/functions/src/evaluation.rs",
     "novarocks/functions/src/kernel_input.rs",
-    "novarocks/execution/src/exec/expr/compiled_program.rs",
-    "novarocks/execution/src/exec/expr/compiled_program/**",
+    "novarocks/expression-contract/**",
+    "novarocks/expression/**",
     "novarocks/execution/src/exec/operators/compiled_window*.rs",
     "novarocks/functions/src/window_call.rs",
     "novarocks/functions/src/window_invocation_input.rs",
@@ -35,6 +35,7 @@ paths = [
     "novarocks/functions/src/arrow_result_custody.rs",
     "novarocks/functions/src/array_backing_geometry.rs",
     "novarocks/functions/src/source_custody_resources.rs",
+    "novarocks/execution/src/exec/operators/sort/creation.rs",
 ]
 
 [reuse]

@@ -87,11 +87,19 @@ pub(super) fn build_table_writer(
             CompiledExchangeRouting::Hash {
                 algorithm: PartitionHashAlgorithm::NativeHierarchicalV1,
             } => {
+                let output = program.graph().nodes()[input.index()].output_layout();
                 let keys = frozen_routing_keys(
-                    program.graph().nodes()[input.index()].output_layout(),
+                    receiver.routing_layout.as_ref().unwrap_or(output),
                     &receiver.hash_partition_slots,
                 )?;
                 build = shuffle_compiled_typed_keys(build, ctx, node_id, keys, None, partitions);
+                if receiver.routing_layout.is_some() {
+                    build.pipeline.factories.push(Box::new(
+                        crate::exec::operators::write_layout_key::WriteLayoutProjectionFactory::drop_key(
+                            output.clone(),
+                        ),
+                    ));
+                }
             }
             CompiledExchangeRouting::Hash { .. }
             | CompiledExchangeRouting::BucketShuffle { .. } => {
