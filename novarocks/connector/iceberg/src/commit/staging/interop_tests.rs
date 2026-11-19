@@ -2914,7 +2914,7 @@ async fn iru13a_java_rest_recreated_table_rejects_stale_partition_evolution() {
         .publish(
             "stale-partition-evolution",
             request,
-            CatalogOperation::AlterPartitionSpec,
+            CatalogOperation::AlterProperties,
             context,
             None,
         )
@@ -2946,7 +2946,7 @@ async fn iru13a_java_rest_recreated_table_rejects_stale_partition_evolution() {
         .publish(
             "current-partition-evolution",
             request,
-            CatalogOperation::AlterPartitionSpec,
+            CatalogOperation::AlterProperties,
             context,
             None,
         )
@@ -3573,7 +3573,7 @@ async fn iru13b_java_rest_view_replacement_survives_version_id_reuse() {
                 "requirements": [uuid],
                 "updates": [
                     {"action": "set-properties", "updates": {"version.history.num-entries": "2"}},
-                    {"action": "add-view-version", "view-version": raw_view_version(2, schema_id, "select 26 as id", &["starrocks"])},
+                    {"action": "add-view-version", "view-version": raw_view_version(2, schema_id, "select 26 as id", &["trino"])},
                     {"action": "set-current-view-version", "view-version-id": -1},
                 ],
             }),
@@ -3602,7 +3602,7 @@ async fn iru13b_java_rest_view_replacement_survives_version_id_reuse() {
                 "identifier": identifier,
                 "requirements": [uuid],
                 "updates": [
-                    {"action": "add-view-version", "view-version": raw_view_version(3, schema_id, "select 3 as id", &["starrocks"])},
+                    {"action": "add-view-version", "view-version": raw_view_version(3, schema_id, "select 3 as id", &["trino"])},
                     {"action": "set-current-view-version", "view-version-id": -1},
                 ],
             }),
@@ -3637,7 +3637,7 @@ async fn iru13b_java_rest_view_replacement_keeps_dialects_unless_allowed() {
     let rest = NovaRocksRest::new(IRU13B, "dialects").await;
     let java = &rest.java;
     rest.create_namespace().await;
-    // Another engine's view, defined for both StarRocks and Spark.
+    // Another engine's view, defined for both Trino and Spark.
     let status = java
         .raw_view_request(
             "create-two-dialects",
@@ -3645,7 +3645,7 @@ async fn iru13b_java_rest_view_replacement_keeps_dialects_unless_allowed() {
             &json!({
                 "name": "v",
                 "schema": serde_json::to_value(schema()).unwrap(),
-                "view-version": raw_view_version(1, schema().schema_id(), "select 1 as id", &["starrocks", "spark"]),
+                "view-version": raw_view_version(1, schema().schema_id(), "select 1 as id", &["trino", "spark"]),
                 "properties": {},
             }),
         )

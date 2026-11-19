@@ -91,44 +91,6 @@ pub enum DdlPropertyChange {
     Reset(DdlPropertyValue),
 }
 
-/// Temporary facts from the original legacy property preparation owner.
-/// Actual input ordinals carry no final AST or command origin. Remove at P12.
-#[derive(Debug, PartialEq)]
-pub struct LegacyPreparedTableProperty {
-    pub input_index: usize,
-    pub value: LegacyPreparedTablePropertyValue,
-}
-#[derive(Debug, PartialEq)]
-pub enum LegacyPreparedTablePropertyValue {
-    Declared {
-        name: &'static str,
-        value: DdlPropertyValue,
-    },
-    Extra {
-        key: String,
-        value: String,
-    },
-}
-#[derive(Debug)]
-pub struct LegacyTablePropertyPreparationFailure {
-    pub input_index: Option<usize>,
-    pub error: ConnectorError,
-}
-impl LegacyTablePropertyPreparationFailure {
-    pub fn whole(error: ConnectorError) -> Self {
-        Self {
-            input_index: None,
-            error,
-        }
-    }
-    pub fn at(input_index: usize, error: ConnectorError) -> Self {
-        Self {
-            input_index: Some(input_index),
-            error,
-        }
-    }
-}
-
 /// Provider/application-authored metadata; this is not a session projector.
 ///
 /// Every declaration has an explicit default_value. Null means a SQL NULL
@@ -152,13 +114,13 @@ impl DdlPropertyDeclaration {
         default_value: DdlPropertyValue,
         hidden: bool,
     ) -> Result<Self, DdlPropertyDeclarationError> {
-        if let Some(actual) = default_value.value_type() {
-            if actual != value_type {
-                return Err(DdlPropertyDeclarationError::DefaultTypeMismatch {
-                    declared: value_type,
-                    actual,
-                });
-            }
+        if let Some(actual) = default_value.value_type()
+            && actual != value_type
+        {
+            return Err(DdlPropertyDeclarationError::DefaultTypeMismatch {
+                declared: value_type,
+                actual,
+            });
         }
         Ok(Self {
             name: name.into(),

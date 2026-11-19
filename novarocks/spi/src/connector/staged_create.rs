@@ -33,9 +33,9 @@ use super::{
     CatalogHandle, ConnectorColumnDefinition, ConnectorControlRuntimeId,
     ConnectorDocumentManagementAdmission, ConnectorError, ConnectorErrorKind,
     ConnectorInstanceDescriptor, ConnectorMutationFailure, ConnectorMutationOperationId,
-    ConnectorOperationControl, ConnectorPartitionTransform, ConnectorProviderBindingKey,
-    ConnectorRequestContext, ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableObjectId,
-    ConnectorWrite, ConnectorWriteReceipt, CreatePolicy, DdlPropertyDeclaration, DdlPropertyValue,
+    ConnectorOperationControl, ConnectorProviderBindingKey, ConnectorRequestContext,
+    ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableObjectId, ConnectorWrite,
+    ConnectorWriteReceipt, CreatePolicy, DdlPropertyDeclaration, DdlPropertyValue,
     ExternalMutationEffect, ExternalMutationEvidence, ExternalMutationFinalization,
     LakePublicationId, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MvExactPartitionField,
     MvExactPartitionTransform, ProviderBindingEpoch,
@@ -597,14 +597,12 @@ impl std::fmt::Debug for ConnectorStagedTableHandle {
 )]
 #[derive(Clone)]
 pub enum ConnectorStagedCreateMode {
-    /// Original raw CTAS route until the old SQL entry retires.
-    Ordinary,
     OrdinaryTyped {
         storage: Arc<ConnectorStagedCtasProperties>,
     },
     ApplicationDocumentManaged {
         admission: ConnectorDocumentManagementAdmission,
-        storage: Option<Arc<ConnectorStagedMvStorageProperties>>,
+        storage: Arc<ConnectorStagedMvStorageProperties>,
     },
 }
 
@@ -629,6 +627,7 @@ impl ConnectorStagedCtasProperties {
 pub struct ConnectorStagedMvStorageProperties {
     visible_partition_sources: Vec<Arc<str>>,
     properties: Arc<[(Arc<str>, DdlPropertyValue)]>,
+    application_properties: BTreeMap<Arc<str>, Arc<str>>,
 }
 
 impl ConnectorStagedMvStorageProperties {
@@ -638,6 +637,10 @@ impl ConnectorStagedMvStorageProperties {
 
     pub fn properties(&self) -> &[(Arc<str>, DdlPropertyValue)] {
         &self.properties
+    }
+
+    pub fn application_properties(&self) -> &BTreeMap<Arc<str>, Arc<str>> {
+        &self.application_properties
     }
 }
 
@@ -675,16 +678,13 @@ pub struct ConnectorStagedCreatePrepareRequest {
     pub operation_id: ConnectorStagedCreateOperationId,
     pub table: ConnectorTableIdentity,
     pub columns: Vec<ConnectorColumnDefinition>,
-    pub partitioning: Vec<ConnectorPartitionTransform>,
-    pub properties: BTreeMap<Arc<str>, Arc<str>>,
     pub policy: CreatePolicy,
     pub mode: ConnectorStagedCreateMode,
     pub context: ConnectorRequestContext,
 }
 
 impl ConnectorStagedCreatePrepareRequest {
-    /// Verify the same generation and that the evaluated input is sole owner
-    /// of ordinary staging properties and partitioning.
+    /// Verify that the evaluated input belongs to this staged generation.
     pub fn ordinary_typed_properties(
         &self,
     ) -> Result<Option<&ConnectorStagedCtasProperties>, ConnectorError> {
@@ -694,11 +694,6 @@ impl ConnectorStagedCreatePrepareRequest {
         if storage.owner != self.owner {
             return Err(invalid(
                 "Evaluated CTAS properties have a foreign generation",
-            ));
-        }
-        if !self.partitioning.is_empty() || !self.properties.is_empty() {
-            return Err(invalid(
-                "Typed CTAS also carries raw properties or partitioning",
             ));
         }
         Ok(Some(storage))
@@ -2572,35 +2567,8 @@ impl ConnectorStagedCreateSession {
         write_lease.matches_provider_binding_key(&self.provider_binding_key)
     }
 
-    /// Constructs the provider-private prepare carrier from facts already
-    /// frozen by the FE-owned control-runtime lease.
-    pub fn prepare_request(
-        &self,
-        publication_id: LakePublicationId,
-        operation_id: ConnectorStagedCreateOperationId,
-        table: ConnectorTableIdentity,
-        columns: Vec<ConnectorColumnDefinition>,
-        partitioning: Vec<ConnectorPartitionTransform>,
-        properties: BTreeMap<Arc<str>, Arc<str>>,
-        policy: CreatePolicy,
-        context: ConnectorRequestContext,
-    ) -> ConnectorStagedCreatePrepareRequest {
-        ConnectorStagedCreatePrepareRequest {
-            owner: self.provider_binding_key.clone(),
-            publication_id,
-            operation_id,
-            table,
-            columns,
-            partitioning,
-            properties,
-            policy,
-            mode: ConnectorStagedCreateMode::Ordinary,
-            context,
-        }
-    }
-
     /// Given actual source columns, build the ordinary typed request on the
-    /// same staged generation. Raw inputs belong exclusively to the old route.
+    /// same staged generation.
     pub fn prepare_typed_request(
         &self,
         publication_id: LakePublicationId,
@@ -2617,8 +2585,6 @@ impl ConnectorStagedCreateSession {
             operation_id,
             table,
             columns,
-            partitioning: Vec::new(),
-            properties: BTreeMap::new(),
             policy,
             mode: ConnectorStagedCreateMode::OrdinaryTyped { storage },
             context,
@@ -2627,37 +2593,10 @@ impl ConnectorStagedCreateSession {
         Ok(request)
     }
 
-    pub fn prepare_document_managed_request(
-        &self,
-        publication_id: LakePublicationId,
-        operation_id: ConnectorStagedCreateOperationId,
-        table: ConnectorTableIdentity,
-        columns: Vec<ConnectorColumnDefinition>,
-        partitioning: Vec<ConnectorPartitionTransform>,
-        properties: BTreeMap<Arc<str>, Arc<str>>,
-        policy: CreatePolicy,
-        admission: ConnectorDocumentManagementAdmission,
-        context: ConnectorRequestContext,
-    ) -> Result<ConnectorStagedCreatePrepareRequest, ConnectorError> {
-        let request = ConnectorStagedCreatePrepareRequest {
-            owner: self.provider_binding_key.clone(),
-            publication_id,
-            operation_id,
-            table,
-            columns,
-            partitioning,
-            properties,
-            policy,
-            mode: ConnectorStagedCreateMode::ApplicationDocumentManaged {
-                admission,
-                storage: None,
-            },
-            context,
-        };
-        request.validate_mode()?;
-        Ok(request)
-    }
-
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The staged request combines separately authored operation, evaluated storage, and document admission facts."
+    )]
     pub fn prepare_document_managed_typed_request(
         &self,
         publication_id: LakePublicationId,
@@ -2677,15 +2616,14 @@ impl ConnectorStagedCreateSession {
             operation_id,
             table,
             columns,
-            partitioning: Vec::new(),
-            properties: application_properties,
             policy,
             mode: ConnectorStagedCreateMode::ApplicationDocumentManaged {
                 admission,
-                storage: Some(Arc::new(ConnectorStagedMvStorageProperties {
+                storage: Arc::new(ConnectorStagedMvStorageProperties {
                     visible_partition_sources,
                     properties: storage_properties,
-                })),
+                    application_properties,
+                }),
             },
             context,
         };
@@ -3291,11 +3229,7 @@ impl ConnectorStagedCreateSession {
             } => {
                 self.validate_handle(handle, operation_id)?;
                 match (&request.mode, handle.document_target()) {
-                    (
-                        ConnectorStagedCreateMode::Ordinary
-                        | ConnectorStagedCreateMode::OrdinaryTyped { .. },
-                        None,
-                    ) => {}
+                    (ConnectorStagedCreateMode::OrdinaryTyped { .. }, None) => {}
                     (
                         ConnectorStagedCreateMode::ApplicationDocumentManaged { admission, .. },
                         Some(target),
@@ -4371,15 +4305,19 @@ mod tests {
                 namespace: Arc::from("db"),
                 table: Arc::from("t"),
             },
-            owner,
+            owner: owner.clone(),
             publication_id: LakePublicationId::try_from_bytes(operation_id.to_bytes())
                 .expect("staged create operation ID must be UUIDv7"),
             operation_id,
             columns: Vec::new(),
-            partitioning: Vec::new(),
-            properties: BTreeMap::new(),
             policy: CreatePolicy::FailIfExists,
-            mode: ConnectorStagedCreateMode::Ordinary,
+            mode: ConnectorStagedCreateMode::OrdinaryTyped {
+                storage: Arc::new(ConnectorStagedCtasProperties {
+                    owner,
+                    properties: Arc::from([]),
+                    comment: None,
+                }),
+            },
             context: context(),
         }
     }

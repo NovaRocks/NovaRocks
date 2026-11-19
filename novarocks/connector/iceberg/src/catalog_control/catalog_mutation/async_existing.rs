@@ -300,12 +300,11 @@ async fn properties(
                         authority,
                         expected_committed_partitioning,
                         ..
-                    } => prepare_legacy_property_change(
+                    } => prepare_property_change(
                         metadata,
                         changes,
                         *authority,
                         expected_committed_partitioning.as_ref(),
-                        &request.context,
                     )?,
                     SetTableProperties { properties, .. } => {
                         prepare_set_table_properties(metadata, properties, &request.context)?

@@ -142,12 +142,8 @@ pub fn normalize_data_size_property(
     Ok(Some(NormalizedDataSize { property, bytes }))
 }
 
-/// The declared byte range, shared by typed input and legacy representability.
-/// Nonnegative bytes are already established by each original parse author.
-pub(super) fn data_size_range_failure(
-    property: DataSizeProperty,
-    bytes: i64,
-) -> Option<DataSizeRangeFailure> {
+/// Width bounds after parsing the declared data size into nonnegative bytes.
+fn data_size_range_failure(property: DataSizeProperty, bytes: i64) -> Option<DataSizeRangeFailure> {
     if property != DataSizeProperty::ParquetWriterRowGroupSize {
         return None;
     }

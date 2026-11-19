@@ -1083,24 +1083,13 @@ mod tests {
                 || {},
             )
             .unwrap();
-        lease
-            .prepare(ConnectorStagedCreatePrepareRequest {
-                owner: lease.owner().clone(),
-                publication_id: publication,
-                operation_id: operation,
-                table: novarocks_spi::connector::ConnectorTableIdentity {
-                    instance_id: lease.owner().instance_id.clone(),
-                    namespace: "db".into(),
-                    table: "t".into(),
-                },
-                columns: vec![],
-                partitioning: vec![],
-                properties: BTreeMap::new(),
-                policy: CreatePolicy::FailIfExists,
-                mode: ConnectorStagedCreateMode::Ordinary,
-                context: fixture.context.clone(),
-            })
-            .unwrap();
+        let mut prepare = crate::catalog_control::staged_create::tests::stage_http_request(
+            &capability.adapter,
+            fixture.context.clone(),
+        );
+        prepare.operation_id = operation;
+        prepare.publication_id = publication;
+        lease.prepare(prepare).unwrap();
         lease.bind_write(handle.clone(), write.clone()).unwrap();
         let request = ConnectorStagedCreatePublishRequest {
             operation_id: operation,

@@ -311,7 +311,7 @@ pub struct ConnectorViewIdentity {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConnectorViewDialect {
-    StarRocks,
+    Trino,
 }
 
 /// One public named column and its complete view type declaration.
@@ -475,7 +475,7 @@ pub enum ConnectorSchemaChange {
 /// engine-reserved keys for `UserStatement` and accept them for `EngineOwned`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConnectorPropertyAuthority {
-    /// Reached from a user's DDL statement (e.g. ALTER TABLE SET TBLPROPERTIES).
+    /// Reached from a user's typed DDL property statement.
     UserStatement,
     /// The engine writing metadata it owns, such as an MV descriptor.
     EngineOwned,
@@ -603,11 +603,6 @@ pub enum ConnectorCatalogMutationOperation {
         table: ConnectorTableIdentity,
         changes: Vec<ConnectorSchemaChange>,
     },
-    AlterPartitionSpec {
-        table: ConnectorTableIdentity,
-        add: Vec<ConnectorPartitionTransform>,
-        drop: Vec<ConnectorPartitionTransform>,
-    },
     /// User-supplied declared properties evaluated for this table generation.
     SetTableProperties {
         table: ConnectorTableIdentity,
@@ -649,7 +644,6 @@ impl ConnectorCatalogMutationOperation {
             Self::CreateView { .. } => "create-view",
             Self::DropView { .. } => "drop-view",
             Self::AlterSchema { .. } => "alter-schema",
-            Self::AlterPartitionSpec { .. } => "alter-partition-spec",
             Self::SetTableProperties { .. } => "set-table-properties",
             Self::AlterProperties { .. } => "alter-properties",
             Self::AlterRef { .. } => "alter-ref",
@@ -1104,34 +1098,6 @@ pub trait ConnectorCatalogMutation: Send + Sync {
             "connector catalog mutation has no original initial dependency facts",
         ))
     }
-    /// Temporary legacy preparation, using real ordered rendered inputs and
-    /// the original operation control. Remove this entry and its DTOs at P12.
-    fn prepare_legacy_create_table_property_inputs(
-        &self,
-        _input: &[(Arc<str>, Arc<str>)],
-        _control: &dyn super::ConnectorOperationControl,
-    ) -> Result<Vec<super::LegacyPreparedTableProperty>, super::LegacyTablePropertyPreparationFailure>
-    {
-        Err(super::LegacyTablePropertyPreparationFailure::whole(
-            ConnectorError::new(
-                ConnectorErrorKind::Unsupported,
-                "connector catalog mutation has no legacy table property preparation",
-            ),
-        ))
-    }
-    /// Temporary legacy CREATE partition inverse on this original generation.
-    /// Remove this port with the legacy preparation entry.
-    fn prepare_legacy_create_table_partitioning_property(
-        &self,
-        _fields: &[ConnectorPartitionTransform],
-        _control: &dyn super::ConnectorOperationControl,
-    ) -> Result<super::DdlPropertyValue, ConnectorError> {
-        Err(ConnectorError::new(
-            ConnectorErrorKind::Unsupported,
-            "connector catalog mutation has no legacy partition preparation",
-        ))
-    }
-
     /// Pure table/storage declarations from this exact control generation.
     /// Absence of this capability is explicit; an empty list is not a default.
     fn table_property_declarations(
@@ -1315,29 +1281,6 @@ impl ConnectorCatalogMutationSession {
     /// Pure route facts from the same original generation lease.
     pub fn initial_dependencies(&self) -> Result<Vec<super::SharedDependency>, ConnectorError> {
         self.mutation.initial_dependencies()
-    }
-
-    /// Forward actual legacy input slots and control to this lease's provider.
-    /// Remove with the legacy preparation entry at P12.
-    pub fn prepare_legacy_create_table_property_inputs(
-        &self,
-        input: &[(Arc<str>, Arc<str>)],
-        control: &dyn super::ConnectorOperationControl,
-    ) -> Result<Vec<super::LegacyPreparedTableProperty>, super::LegacyTablePropertyPreparationFailure>
-    {
-        self.mutation
-            .prepare_legacy_create_table_property_inputs(input, control)
-    }
-
-    /// Forward actual legacy transforms and control through the same lease.
-    /// Remove with the legacy preparation entry.
-    pub fn prepare_legacy_create_table_partitioning_property(
-        &self,
-        fields: &[ConnectorPartitionTransform],
-        control: &dyn super::ConnectorOperationControl,
-    ) -> Result<super::DdlPropertyValue, ConnectorError> {
-        self.mutation
-            .prepare_legacy_create_table_partitioning_property(fields, control)
     }
 
     /// Borrow declarations through this session's original generation lease.
@@ -2175,27 +2118,8 @@ mod tests {
             || {},
         )
         .unwrap();
-        let context = ConnectorRequestContext::try_new(
-            std::time::Instant::now() + std::time::Duration::from_secs(30),
-            crate::connector::ConnectorStopOwner::new().view(),
-            1024,
-            4096,
-        )
-        .unwrap();
         assert_eq!(
             lease.initial_dependencies().unwrap_err().kind(),
-            ConnectorErrorKind::Unsupported
-        );
-        let failure = lease
-            .prepare_legacy_create_table_property_inputs(&[], &context)
-            .unwrap_err();
-        assert_eq!(failure.input_index, None);
-        assert_eq!(failure.error.kind(), ConnectorErrorKind::Unsupported);
-        assert_eq!(
-            lease
-                .prepare_legacy_create_table_partitioning_property(&[], &context)
-                .unwrap_err()
-                .kind(),
             ConnectorErrorKind::Unsupported
         );
         assert_eq!(
@@ -2209,6 +2133,13 @@ mod tests {
                 .kind(),
             ConnectorErrorKind::Unsupported
         );
+        let context = ConnectorRequestContext::try_new(
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+            crate::connector::ConnectorStopOwner::new().view(),
+            1024,
+            4096,
+        )
+        .unwrap();
         let error = lease
             .admit_operation(
                 ConnectorMutationOperationId::new(),
@@ -2232,7 +2163,6 @@ mod tests {
         struct PropertyCapability {
             descriptor: ConnectorInstanceDescriptor,
             epoch: ProviderBindingEpoch,
-            raw_input: Vec<(Arc<str>, Arc<str>)>,
         }
         impl ConnectorCatalogMutation for PropertyCapability {
             fn descriptor(&self) -> &ConnectorInstanceDescriptor {
@@ -2245,44 +2175,6 @@ mod tests {
                 &self,
             ) -> Result<Vec<crate::connector::SharedDependency>, ConnectorError> {
                 Ok(vec![crate::connector::SharedDependency::LocalHost])
-            }
-            fn prepare_legacy_create_table_property_inputs(
-                &self,
-                input: &[(Arc<str>, Arc<str>)],
-                control: &dyn crate::connector::ConnectorOperationControl,
-            ) -> Result<
-                Vec<crate::connector::LegacyPreparedTableProperty>,
-                crate::connector::LegacyTablePropertyPreparationFailure,
-            > {
-                control
-                    .check_active()
-                    .map_err(crate::connector::LegacyTablePropertyPreparationFailure::whole)?;
-                assert_eq!(input.len(), self.raw_input.len());
-                for (actual, original) in input.iter().zip(&self.raw_input) {
-                    assert!(Arc::ptr_eq(&actual.0, &original.0));
-                    assert!(Arc::ptr_eq(&actual.1, &original.1));
-                }
-                Ok(vec![crate::connector::LegacyPreparedTableProperty {
-                    input_index: 1,
-                    value: crate::connector::LegacyPreparedTablePropertyValue::Extra {
-                        key: input[1].0.to_string(),
-                        value: input[1].1.to_string(),
-                    },
-                }])
-            }
-            fn prepare_legacy_create_table_partitioning_property(
-                &self,
-                fields: &[ConnectorPartitionTransform],
-                control: &dyn crate::connector::ConnectorOperationControl,
-            ) -> Result<crate::connector::DdlPropertyValue, ConnectorError> {
-                control.check_active()?;
-                let [ConnectorPartitionTransform::Identity { column }] = fields else {
-                    panic!("original transform input must be forwarded");
-                };
-                assert!(Arc::ptr_eq(column, &self.raw_input[0].0));
-                Ok(crate::connector::DdlPropertyValue::ArrayVarchar(vec![
-                    Some(column.to_string()),
-                ]))
             }
             fn table_property_declarations(
                 &self,
@@ -2325,17 +2217,6 @@ mod tests {
             provider_id: ConnectorProviderId::parse("iceberg").unwrap(),
             instance_id: ConnectorInstanceId::parse("analytics").unwrap(),
         };
-        let raw_input: Vec<(Arc<str>, Arc<str>)> = vec![
-            (Arc::from("first.raw"), Arc::from("source zero")),
-            (Arc::from("MiXeD.Second"), Arc::from("source one")),
-        ];
-        let context = ConnectorRequestContext::try_new(
-            std::time::Instant::now() + std::time::Duration::from_secs(30),
-            crate::connector::ConnectorStopOwner::new().view(),
-            1024,
-            4096,
-        )
-        .unwrap();
         let epoch = ProviderBindingEpoch::from_bytes([9; 16]);
         let runtime = ConnectorControlRuntimeId::new();
         let released = Arc::new(AtomicBool::new(false));
@@ -2347,7 +2228,6 @@ mod tests {
             Arc::new(PropertyCapability {
                 descriptor: descriptor.clone(),
                 epoch,
-                raw_input: raw_input.clone(),
             }),
             move || {
                 release.store(true, Ordering::SeqCst);
@@ -2360,31 +2240,6 @@ mod tests {
         assert_eq!(
             lease.initial_dependencies().unwrap(),
             vec![crate::connector::SharedDependency::LocalHost]
-        );
-        let expected_preparation = vec![crate::connector::LegacyPreparedTableProperty {
-            input_index: 1,
-            value: crate::connector::LegacyPreparedTablePropertyValue::Extra {
-                key: "MiXeD.Second".into(),
-                value: "source one".into(),
-            },
-        }];
-        assert_eq!(
-            lease
-                .prepare_legacy_create_table_property_inputs(&raw_input, &context)
-                .unwrap(),
-            expected_preparation
-        );
-        let partitioning_input = [ConnectorPartitionTransform::Identity {
-            column: raw_input[0].0.clone(),
-        }];
-        let expected_partitioning = crate::connector::DdlPropertyValue::ArrayVarchar(vec![Some(
-            raw_input[0].0.to_string(),
-        )]);
-        assert_eq!(
-            lease
-                .prepare_legacy_create_table_partitioning_property(&partitioning_input, &context)
-                .unwrap(),
-            expected_partitioning
         );
         let properties = lease.table_property_declarations().unwrap();
         assert_eq!(properties.len(), 1);
@@ -2412,18 +2267,6 @@ mod tests {
         assert_eq!(
             retained.initial_dependencies().unwrap(),
             vec![crate::connector::SharedDependency::LocalHost]
-        );
-        assert_eq!(
-            retained
-                .prepare_legacy_create_table_property_inputs(&raw_input, &context)
-                .unwrap(),
-            expected_preparation
-        );
-        assert_eq!(
-            retained
-                .prepare_legacy_create_table_partitioning_property(&partitioning_input, &context)
-                .unwrap(),
-            expected_partitioning
         );
         drop(retained);
         assert!(released.load(Ordering::SeqCst));

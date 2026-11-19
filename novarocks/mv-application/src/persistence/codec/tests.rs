@@ -74,7 +74,7 @@ fn sample_definition() -> DefinitionDocument {
         1_700_000_000_000,
         QuerySource {
             effective_sql: "SELECT AVG(o.amount) AS average_amount FROM ice.sales.orders o UNION ALL SELECT AVG(o2.amount) AS average_amount FROM ice.sales.orders o2".to_string(),
-            dialect: QueryDialect::StarRocks,
+            dialect: QueryDialect::Trino,
             resolution: ResolutionContext {
                 default_catalog: "ice".to_string(),
                 default_namespace: "sales".to_string(),
@@ -316,7 +316,7 @@ fn sample_configuration() -> ConfigurationDocument {
 fn current_query_runtime_maps_purely_without_reprinting_sql() {
     let runtime = PersistedQueryDefinition::new(
         "/* keep */ SELECT  amount FROM orders -- keep\n",
-        PersistedQueryDialect::StarRocks,
+        PersistedQueryDialect::Trino,
         "ice",
         "sales",
     )
@@ -940,6 +940,23 @@ fn definition_time_is_a_required_wire_fact() {
     assert!(matches!(
         decode_definition(&dto.encode_to_vec()),
         Err(PersistenceCodecError::MissingField(_))
+    ));
+}
+
+#[test]
+fn definition_encodes_trino_and_rejects_the_legacy_dialect_discriminant() {
+    let definition = sample_definition();
+    let encoded = encode_definition(&definition).unwrap();
+    let mut dto = super::proto::DefinitionDocument::decode(encoded.as_bytes()).unwrap();
+    assert_eq!(dto.query.as_ref().unwrap().dialect, Some(2));
+    assert_eq!(decode_definition(encoded.as_bytes()).unwrap(), definition);
+    dto.query.as_mut().unwrap().dialect = Some(1);
+    assert!(matches!(
+        decode_definition(&dto.encode_to_vec()),
+        Err(PersistenceCodecError::UnknownEnum {
+            field: "definition.query.dialect",
+            value: 1
+        })
     ));
 }
 

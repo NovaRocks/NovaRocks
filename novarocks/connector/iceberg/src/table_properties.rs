@@ -20,16 +20,6 @@
 //! Declarations do not grant a setter or publication capability. Dedicated
 //! format-version, partition-spec and location changes retain their owners.
 
-mod legacy;
-pub(crate) use legacy::{
-    LegacyAlterSetPreparation, prepare_legacy_alter_set_table_property_inputs,
-};
-pub use legacy::{
-    LegacyPreparedTableProperty, LegacyPreparedTablePropertyValue,
-    LegacyTablePropertyPreparationFailure, prepare_legacy_create_table_partitioning_property,
-    prepare_legacy_create_table_property_inputs,
-};
-
 mod create;
 pub(crate) use create::{
     PreparedCreateTableProperties, prepare_create_table_properties, prepare_ctas_storage,

@@ -40,7 +40,9 @@ message QuerySource {
 
 enum QueryDialect {
   QUERY_DIALECT_UNSPECIFIED = 0;
-  QUERY_DIALECT_STARROCKS = 1;
+  reserved 1;
+  reserved "QUERY_DIALECT_STARROCKS";
+  QUERY_DIALECT_TRINO = 2;
 }
 
 message ResolutionContext {

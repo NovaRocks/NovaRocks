@@ -330,7 +330,7 @@ fn definition_to_proto(document: &DefinitionDocument) -> proto::DefinitionDocume
         query: Some(proto::QuerySource {
             effective_sql: Some(document.query.effective_sql.clone()),
             dialect: Some(match document.query.dialect {
-                QueryDialect::StarRocks => 1,
+                QueryDialect::Trino => proto::QueryDialect::Trino as i32,
             }),
             resolution: Some(proto::ResolutionContext {
                 default_catalog: Some(document.query.resolution.default_catalog.clone()),
@@ -403,7 +403,7 @@ fn definition_from_proto(
         query: QuerySource {
             effective_sql: required(query.effective_sql, "definition.query.effective_sql")?,
             dialect: enum_value(query.dialect, "definition.query.dialect", |value| {
-                (value == 1).then_some(QueryDialect::StarRocks)
+                (value == proto::QueryDialect::Trino as i32).then_some(QueryDialect::Trino)
             })?,
             resolution: ResolutionContext {
                 default_catalog: required(

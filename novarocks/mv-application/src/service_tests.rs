@@ -369,7 +369,7 @@ fn create_command() -> MvCreateCommand {
         definition: CreateMvDefinitionRequest {
             query_definition: PersistedQueryDefinition::new(
                 "SELECT 1",
-                PersistedQueryDialect::StarRocks,
+                PersistedQueryDialect::Trino,
                 "iceberg",
                 "db",
             )

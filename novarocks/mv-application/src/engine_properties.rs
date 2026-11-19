@@ -148,15 +148,6 @@ pub fn prepare_create_engine_properties(
     })
 }
 
-/// The legacy caller has already checked the interval syntax and its range.
-/// Construct the same initial configuration used by evaluated CREATE properties.
-pub fn prepare_legacy_create_refresh_configuration(
-    policy: MvDesiredRefreshPolicy,
-    interval_ms: Option<i64>,
-) -> Result<InitialMvRefreshConfiguration, MvEnginePropertyError> {
-    MvRefreshPropertyChanges::replace_policy(policy, interval_ms).initial_configuration()
-}
-
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MvRefreshPropertyChanges {
     policy: Option<MvDesiredRefreshPolicy>,
@@ -327,32 +318,6 @@ fn decimal_digits(text: &str) -> bool {
     !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())
 }
 
-/// The original legacy literal author supplies the parsed unsigned magnitude.
-/// This stage preserves its zero, invalid-unit and overflow refusal order.
-pub fn legacy_refresh_interval_millis(
-    amount: u64,
-    unit: &str,
-) -> Result<i64, MvEnginePropertyError> {
-    if amount == 0 {
-        return Err(nonpositive_interval());
-    }
-    let multiplier = match unit.to_ascii_uppercase().as_str() {
-        "SECOND" | "SECONDS" => SECOND_MS,
-        "MINUTE" | "MINUTES" => MINUTE_MS,
-        "HOUR" | "HOURS" => HOUR_MS,
-        "DAY" | "DAYS" => DAY_MS,
-        _ => {
-            return Err(invalid(
-                REFRESH_INTERVAL,
-                format!(
-                    "unsupported REFRESH ASYNC interval unit `{unit}`; expected SECOND, MINUTE, HOUR, or DAY",
-                ),
-            ));
-        }
-    };
-    checked_interval_millis(amount, multiplier, 0)
-}
-
 fn checked_interval_millis(
     whole: u64,
     multiplier: u64,
@@ -374,13 +339,6 @@ fn nonpositive_interval() -> MvEnginePropertyError {
 
 fn interval_too_large() -> MvEnginePropertyError {
     invalid(REFRESH_INTERVAL, "REFRESH ASYNC interval is too large")
-}
-
-/// Apply the same name/order check while the legacy caller owns parsed names.
-pub fn validate_legacy_primary_key<'a>(
-    columns: impl IntoIterator<Item = &'a str>,
-) -> Result<(), MvEnginePropertyError> {
-    validate_primary_key_names(columns.into_iter().map(Some))
 }
 
 fn validate_primary_key_names<'a>(
@@ -552,36 +510,19 @@ mod tests {
     }
 
     #[test]
-    fn intervals_use_the_original_signed_millisecond_range_and_legacy_error_order() {
+    fn intervals_use_the_signed_millisecond_range() {
         let last = i64::MAX as u64 / 1_000;
         let milliseconds = (last * 1_000) as i64;
-        assert_eq!(
-            legacy_refresh_interval_millis(last, "Seconds").unwrap(),
-            milliseconds
-        );
         assert_eq!(
             parse_refresh_interval(&format!("{last}s")).unwrap(),
             milliseconds
         );
         assert_eq!(
-            legacy_refresh_interval_millis(0, "WEEKS")
+            parse_refresh_interval(&format!("{}s", last + 1))
                 .unwrap_err()
                 .to_string(),
-            "REFRESH ASYNC interval must be positive",
+            "REFRESH ASYNC interval is too large",
         );
-        assert_eq!(
-            legacy_refresh_interval_millis(1, "WEEKS")
-                .unwrap_err()
-                .to_string(),
-            "unsupported REFRESH ASYNC interval unit `WEEKS`; expected SECOND, MINUTE, HOUR, or DAY",
-        );
-        for error in [
-            legacy_refresh_interval_millis(last + 1, "SECOND").unwrap_err(),
-            legacy_refresh_interval_millis(i64::MAX as u64, "SECOND").unwrap_err(),
-            parse_refresh_interval(&format!("{}s", last + 1)).unwrap_err(),
-        ] {
-            assert_eq!(error.to_string(), "REFRESH ASYNC interval is too large");
-        }
         for text in ["0s", "2ms", "-1m", "1w"] {
             assert_eq!(
                 parse_refresh_interval(text).unwrap_err().kind(),
