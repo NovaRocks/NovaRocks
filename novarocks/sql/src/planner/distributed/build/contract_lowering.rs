@@ -20003,7 +20003,8 @@ mod tests {
                 })),
             },
         ];
-        for (ordinal, kind) in kinds.into_iter().enumerate() {
+        for kind in kinds {
+            let membership = matches!(&kind, ExprKind::InList { .. });
             let expression = TypedExpr {
                 kind,
                 value_type: ValueType::new(DataType::Boolean, false),
@@ -20077,31 +20078,29 @@ mod tests {
                     &mut observer,
                 );
             assert_eq!(observer.calls, 1);
-            if ordinal != 1 {
-                // Equality, BETWEEN and the CASE comparison retain the real
-                // LargeInt recipe. Only native IN excludes this profile.
-                result.unwrap().finish_observed(&control).unwrap();
-                continue;
-            }
-            let error = match result {
-                Ok(_) => panic!("native LargeInt IN unexpectedly completed"),
-                Err(error) => error,
-            };
-            let ContractLoweringError::Semantics(
-                super::super::package_semantics::PackageSemanticsError::PrimitiveSource {
-                    source,
-                    cast: None,
-                },
-            ) = error
-            else {
-                panic!(
-                    "native LargeInt comparison {ordinal} must retain its unsupported profile: {error:?}"
+            let finalized = result.unwrap().finish_observed(&control).unwrap();
+            if membership {
+                let fragment = finalized.plan().fragments().get(&ROOT_FRAGMENT_ID).unwrap();
+                let root = fragment.nodes().get(&fragment.root()).unwrap();
+                let NodeKind::Values { rows } = &root.kind else {
+                    panic!("expected Values root");
+                };
+                let unit = fragment.unit(root.id).unwrap();
+                let expression = fragment.root_expression(root.id, rows[0][0]).unwrap();
+                let ContractExprKind::InList { expr, list, .. } = &expression.kind else {
+                    panic!("expected the finalized membership expression");
+                };
+                let [candidate] = list.as_ref() else {
+                    panic!("expected one converted membership candidate");
+                };
+                let source = unit.definition(*expr).unwrap();
+                let candidate = unit.definition(*candidate).unwrap();
+                assert_eq!(
+                    source.ty.logical_type(),
+                    novarocks_type_contract::ValueLogicalType::LargeInt
                 );
-            };
-            assert_eq!(
-                source.downcast_ref::<novarocks_functions::ComparisonPrepareError>(),
-                Some(&novarocks_functions::ComparisonPrepareError::Unsupported),
-            );
+                assert_eq!(candidate.ty, source.ty);
+            }
         }
     }
 

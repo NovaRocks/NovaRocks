@@ -1131,15 +1131,21 @@ pub(super) fn type_only_fixture(
     (unit, catalog(owner))
 }
 
-fn check_type_only_hidden_native_profile(kind: &str) {
-    use novarocks_failure_contract::{FailureClass, FailureProjection};
-    use novarocks_type_contract::ValueLogicalType;
+fn compile_type_only_hidden_native_profile(
+    kind: &str,
+) -> Result<Arc<CompiledExprSet>, ExprCompileError> {
     let mut b = builder();
-    let input_type = if kind == "in_float" {
-        FunctionValueType::new(DataType::Float64, false)
-    } else {
-        FunctionValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
-            .unwrap()
+    let input_type = match kind {
+        "in_float" => FunctionValueType::new(DataType::Float64, false),
+        "in_nested" => FunctionValueType::new(
+            DataType::List(Arc::new(Field::new("item", DataType::Int64, false))),
+            false,
+        ),
+        "like_json" | "between_json" => {
+            FunctionValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
+                .unwrap()
+        }
+        _ => unreachable!(),
     };
     let mut ports = vec![
         (ValueId::new(10), input_type.clone()),
@@ -1164,7 +1170,7 @@ fn check_type_only_hidden_native_profile(kind: &str) {
                 negated: false,
             }
         }
-        "in_float" => ExprKind::InList {
+        "in_float" | "in_nested" => ExprKind::InList {
             expr: input,
             list: Box::from([input]),
             negated: false,
@@ -1190,7 +1196,7 @@ fn check_type_only_hidden_native_profile(kind: &str) {
     let mut work = CompileCheckpoints::try_new(&c, CompilePhase::LowerProgram).unwrap();
     let layout = layouts(&ports);
     let parameters = SemanticParameters::try_new([]).unwrap();
-    let error = compile_expr_set_pure(
+    let compiled = compile_expr_set_pure(
         &unit,
         EvaluationEnvironment {
             constants: &ConstantPools::empty(),
@@ -1203,8 +1209,14 @@ fn check_type_only_hidden_native_profile(kind: &str) {
         policy(),
         &catalogue,
         &mut work,
-    )
-    .unwrap_err();
+    );
+    work.finish().unwrap();
+    assert_eq!(owner.instances.load(Ordering::SeqCst), 0);
+    compiled
+}
+
+fn check_type_only_hidden_native_profile_refusal(kind: &str) {
+    let error = compile_type_only_hidden_native_profile(kind).unwrap_err();
     assert!(
         matches!(
             error,
@@ -1212,22 +1224,48 @@ fn check_type_only_hidden_native_profile(kind: &str) {
         ),
         "{kind}: {error:?}"
     );
-    work.finish().unwrap();
     assert_eq!(error.failure_fact().class(), FailureClass::Unsupported);
-    assert_eq!(owner.instances.load(Ordering::SeqCst), 0);
 }
 
 #[test]
 fn type_only_hidden_json_like_keeps_the_original_profile_refusal() {
-    check_type_only_hidden_native_profile("like_json");
+    check_type_only_hidden_native_profile_refusal("like_json");
 }
 #[test]
-fn type_only_hidden_float_in_keeps_the_original_profile_refusal() {
-    check_type_only_hidden_native_profile("in_float");
+fn type_only_hidden_float_in_compiles_without_evaluating_arguments() {
+    let compiled = compile_type_only_hidden_native_profile("in_float").unwrap();
+    let [root] = compiled.roots() else {
+        panic!("expected one type-only root");
+    };
+    let uses = compiled.control_flow().uses();
+    assert_eq!(uses.len(), 1);
+    let invocation = &uses[&root.use_id];
+    assert_eq!(invocation.control, ControlShape::TypeOnly);
+    assert!(invocation.arguments.is_empty());
+
+    let definitions = compiled.definitions();
+    let StaticExprKind::BoundCall { args, .. } = definitions.node(root.definition).unwrap().kind()
+    else {
+        panic!("expected the original bound call");
+    };
+    let StaticExprKind::PreparedInList { child, values, .. } =
+        definitions.node(args[0]).unwrap().kind()
+    else {
+        panic!("expected the original floating-point membership definition");
+    };
+    assert_eq!(values.as_ref(), &[*child]);
+    assert_eq!(
+        definitions.node(*child).unwrap().value_type(),
+        Some(&FunctionValueType::new(DataType::Float64, false))
+    );
+}
+#[test]
+fn type_only_hidden_nested_in_keeps_the_profile_refusal() {
+    check_type_only_hidden_native_profile_refusal("in_nested");
 }
 #[test]
 fn type_only_hidden_json_between_keeps_the_original_profile_refusal() {
-    check_type_only_hidden_native_profile("between_json");
+    check_type_only_hidden_native_profile_refusal("between_json");
 }
 
 #[test]
