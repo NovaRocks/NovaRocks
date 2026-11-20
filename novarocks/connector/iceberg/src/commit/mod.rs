@@ -56,6 +56,12 @@ pub mod ref_action;
 pub mod report;
 mod rewrite_data_files;
 mod row_delta;
+#[allow(
+    dead_code,
+    reason = "The compact publication stage installs the retained facts."
+)]
+pub(crate) mod row_delta_facts;
+
 pub mod row_delta_dv_metadata;
 mod row_mutation_preparation;
 #[cfg(test)]

@@ -35,9 +35,9 @@ use crate::commit::write_stack::receiving::compact::{
     AddedCounters, CompactDeleteKind, PhysicalAdditionCounts,
 };
 use crate::delete_semantics::{DeleteKind, TypedPartition};
-use crate::iceberg::spec::{DataContentType, Operation, TableMetadata};
+use crate::iceberg::spec::{DataContentType, DataFile, Operation, TableMetadata};
 use crate::iceberg::{Error, ErrorKind, Result};
-use crate::manifest::target_query::{ManifestReadScope, TargetFacts};
+use crate::manifest::target_query::{ManifestReadScope, TargetFacts, TargetObservation};
 use crate::write_descriptor::decode_partition_descriptor_with_type;
 
 pub(in crate::commit::write_stack) struct MaterializedDeleteStep {
@@ -90,6 +90,7 @@ pub(super) struct Target {
 
 struct CompletedStep {
     scope: ManifestReadScope,
+    targets: TargetObservation,
     removed: Vec<LocatedEntry>,
 }
 
@@ -250,7 +251,11 @@ impl MaterializedDeleteStep {
                     }
                 }
                 io.check_active()?;
-                Ok::<_, Error>(CompletedStep { scope, removed })
+                Ok::<_, Error>(CompletedStep {
+                    scope,
+                    targets: observation,
+                    removed,
+                })
             })
             .await?;
         Ok(observed
@@ -258,6 +263,31 @@ impl MaterializedDeleteStep {
             .iter()
             .map(|entry| entry.frozen.clone())
             .collect())
+    }
+
+    #[allow(
+        dead_code,
+        reason = "The row-delta window is installed by the publication wiring."
+    )]
+    pub(crate) fn observed_data_file(
+        &self,
+        path: &str,
+    ) -> Result<(&TableMetadata, i32, &DataFile)> {
+        let observed = self
+            .observed
+            .get()
+            .ok_or_else(|| invalid("Materialized delete lost its source observation"))?;
+        let data = &observed
+            .targets
+            .files
+            .get(path)
+            .ok_or_else(|| invalid("Removed data file is absent from the source observation"))?
+            .data;
+        Ok((
+            observed.scope.metadata(),
+            data.frozen.facts().partition_spec_id,
+            observed.scope.observed_data_file(data)?,
+        ))
     }
 }
 
@@ -427,7 +457,11 @@ pub(crate) async fn observed_materialized_staging_fixture(
     }
     let step = Arc::new(MaterializedDeleteStep::new(targets));
     step.observed
-        .set(CompletedStep { scope, removed })
+        .set(CompletedStep {
+            scope,
+            targets: observed,
+            removed,
+        })
         .map_err(|_| invalid("fixture observation was already set"))?;
     Ok(step)
 }
@@ -443,22 +477,41 @@ impl Preparer for Arc<MaterializedDeleteStep> {
             .observed
             .get()
             .ok_or_else(|| invalid("materialized delete lost its source observation"))?;
-        let sources = observed.scope.snapshot_sources()?;
         let source_id = observed.scope.domain().endpoint().snapshot_id();
         let current = view
             .metadata()
             .snapshot_for_ref(view.target_ref())
-            .ok_or_else(|| invalid("materialized delete has no current source snapshot"))?;
+            .ok_or_else(|| missing("current target snapshot"))?;
         let original = observed
             .scope
             .metadata()
             .snapshot_by_id(source_id)
             .ok_or_else(|| invalid("completed source snapshot is absent"))?;
-        if current.snapshot_id() != source_id || current.manifest_list() != original.manifest_list()
+        let version = view.metadata().format_version();
+        if self
+            .compact
+            .as_ref()
+            .is_some_and(|compact| compact.counts.position_deletes.files != 0)
         {
-            return Err(invalid("materialized delete source changed before staging"));
+            crate::commit::new_manifests::validate_position_format(
+                observed.scope.metadata().format_version(),
+                version,
+            )?;
         }
-        let removed = observed.removed.iter().collect::<Vec<_>>();
+        let rebound;
+        let (scope, removed) = if current.snapshot_id() == source_id {
+            if current.manifest_list() != original.manifest_list() {
+                return Err(invalid(
+                    "An immutable materialized source snapshot changed its manifest list",
+                ));
+            }
+            (&observed.scope, observed.removed.as_slice())
+        } else {
+            rebound = observed.rebind(view, current.snapshot_id()).await?;
+            (&rebound.0, rebound.1.as_slice())
+        };
+        let sources = scope.snapshot_sources()?;
+        let removed = removed.iter().collect::<Vec<_>>();
         let mut summary = match &self.compact {
             Some(compact) => Summary {
                 data: compact.counts.data.into(),
@@ -525,7 +578,8 @@ impl Preparer for Arc<MaterializedDeleteStep> {
             &sources,
             &removed,
             added,
-            &observed.scope,
+            scope,
+            current.snapshot_id() != source_id,
         )
         .await?;
         crate::commit::overwrite::prepare_ordinary_snapshot_change(
@@ -533,6 +587,86 @@ impl Preparer for Arc<MaterializedDeleteStep> {
         )
         .await
     }
+}
+
+impl CompletedStep {
+    async fn rebind(
+        &self,
+        view: &StagedView<'_>,
+        snapshot: i64,
+    ) -> Result<(ManifestReadScope, Vec<LocatedEntry>)> {
+        let mut scope = self
+            .scope
+            .rebind(Arc::new(view.metadata().clone()), snapshot)?;
+        let targets = &self.targets.completion.targets;
+        // TypedPartition shares its field and value arrays with E. Charge
+        // newly backed path keys and map slots while both ranges coexist.
+        let target_bytes = targets.keys().try_fold(0u64, |total, path| {
+            std::mem::size_of::<(String, TypedPartition)>()
+                .checked_add(path.len())
+                .and_then(|bytes| u64::try_from(bytes).ok())
+                .and_then(|bytes| total.checked_add(bytes))
+                .ok_or_else(|| invalid("Materialized round target size overflow"))
+        })?;
+        scope.reserve_owned(target_bytes).await?;
+        let current = scope
+            .observe_present(targets.clone(), view.artifacts().file_io(), || {
+                view.artifacts().check_active()
+            })
+            .await?;
+        let sources = scope.snapshot_sources()?;
+        let required = self
+            .removed
+            .iter()
+            .map(|entry| (entry.frozen.identity(), &entry.frozen))
+            .collect::<BTreeMap<_, _>>();
+        let mut removed = Vec::new();
+        let mut seen = BTreeSet::new();
+        for (path, original) in &self.targets.files {
+            view.artifacts().check_active()?;
+            let actual = current.files.get(path).ok_or_else(|| missing(path))?;
+            if actual.data.frozen != original.data.frozen {
+                return Err(missing(path));
+            }
+            if required.contains_key(actual.data.frozen.identity()) {
+                push_removal(&mut removed, &mut seen, &sources, &actual.data)?;
+                for position in &actual.positions {
+                    let identity = position.entry.frozen.identity();
+                    if matches!(identity, EntryIdentity::DeletionVector { .. })
+                        && !required.contains_key(identity)
+                    {
+                        push_removal(&mut removed, &mut seen, &sources, &position.entry)?;
+                    }
+                }
+            }
+        }
+        // A B deletion vector can shadow an earlier live Parquet position
+        // delete in the row-read result. Required removals are physically
+        // identified and must be located independently of read precedence.
+        for entry in scope.live_position_entries() {
+            view.artifacts().check_active()?;
+            let identity = entry.frozen.identity();
+            if let Some(original) = required.get(identity) {
+                if **original != entry.frozen {
+                    return Err(missing(identity.path()));
+                }
+                push_removal(&mut removed, &mut seen, &sources, entry)?;
+            }
+        }
+        if let Some(identity) = required
+            .into_keys()
+            .find(|identity| !seen.contains(*identity))
+        {
+            return Err(missing(identity.path()));
+        }
+        Ok((scope, removed))
+    }
+}
+
+fn missing(path: &str) -> Error {
+    crate::commit::new_manifests::row_delta_validation_error(format!(
+        "Missing required files to delete: {path}"
+    ))
 }
 
 fn legacy_addition_summary(
@@ -643,3 +777,6 @@ fn add(left: u64, right: u64) -> Result<u64> {
 fn invalid(message: impl Into<String>) -> Error {
     Error::new(ErrorKind::DataInvalid, message.into())
 }
+
+#[cfg(test)]
+mod tests;
