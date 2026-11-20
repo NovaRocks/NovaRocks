@@ -1,49 +1,49 @@
 -- query 9
--- legacy
+-- types	boolean	boolean
 _col0	_col1
-1	1
+true	true
 
 -- query 11
--- legacy
+-- types	boolean	boolean
 _col0	_col1
-1	1
+true	true
 
 -- query 13
--- legacy
+-- types	boolean	boolean
 _col0	_col1
-1	1
+true	true
 
 -- query 15
--- legacy
+-- types	boolean	boolean
 _col0	_col1
-1	1
+true	true
 
 -- query 17
--- legacy
+-- types	boolean	boolean
 _col0	_col1
-1	1
+true	true
 
 -- query 19
--- legacy
+-- types	boolean	boolean
 _col0	_col1
-1	1
+true	true
 
 -- query 21
--- legacy
+-- types	boolean	boolean
 _col0	_col1
-1	1
+true	true
 
 -- query 23
--- legacy
+-- types	boolean	boolean
 _col0	_col1
-1	1
+true	true
 
 -- query 25
--- legacy
+-- types	boolean	boolean
 _col0	_col1
-1	1
+true	true
 
 -- query 27
--- legacy
+-- types	boolean	boolean
 _col0	_col1
-1	1
+true	true

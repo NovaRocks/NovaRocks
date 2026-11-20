@@ -178,26 +178,13 @@ impl Body {
             let DataType::Decimal256(_, scale) = recipe.source.data_type() else {
                 return Err(internal("decimal integer CAST lost its frozen scale"));
             };
-            let mut factor = Some(i256::ONE);
-            for _ in 0..scale.unsigned_abs() {
-                work.step()?;
-                factor = factor.and_then(|value| value.checked_mul(i256::from_i128(10)));
-            }
             let value = argument
                 .array()
                 .as_any()
                 .downcast_ref::<Decimal256Array>()
                 .ok_or_else(|| internal("decimal integer CAST has a foreign carrier"))?
                 .value(row);
-            let integral = factor
-                .and_then(|factor| {
-                    if *scale < 0 {
-                        value.checked_mul(factor)
-                    } else {
-                        value.checked_div(factor)
-                    }
-                })
-                .and_then(|value| value.to_i128())
+            let integral = decimal_integral_coefficient(value, *scale, work)?
                 .and_then(|value| i64::try_from(value).ok())
                 .and_then(
                     |value| match SignedWidth::from_type(recipe.result.data_type()) {
@@ -395,13 +382,44 @@ fn finish_numeric_null(
     if recipe.decimal_overflow_policy == DecimalOverflowPolicy::ReportError
         || (recipe.allow_throw_exception && decimal_to_decimal)
     {
-        return row_error(
-            ordinal,
-            "Expr evaluate meet error: The numeric type cast involving decimal overflows",
-            work,
-        );
+        return Ok(CastRowResult::RowError(decimal_overflow_error(
+            ordinal, work,
+        )?));
     }
     Ok(CastRowResult::Null)
+}
+
+/// Remove the Decimal scale with checked arithmetic and truncation toward zero.
+pub(crate) fn decimal_integral_coefficient(
+    value: i256,
+    scale: i8,
+    work: &mut EvaluationCheckpoints<'_>,
+) -> Result<Option<i128>, KernelFailure> {
+    let mut factor = Some(i256::ONE);
+    for _ in 0..scale.unsigned_abs() {
+        work.step()?;
+        factor = factor.and_then(|value| value.checked_mul(i256::from_i128(10)));
+    }
+    Ok(factor
+        .and_then(|factor| {
+            if scale < 0 {
+                value.checked_mul(factor)
+            } else {
+                value.checked_div(factor)
+            }
+        })
+        .and_then(|value| value.to_i128()))
+}
+
+pub(crate) fn decimal_overflow_error(
+    ordinal: usize,
+    work: &mut EvaluationCheckpoints<'_>,
+) -> Result<RowDataError, KernelFailure> {
+    numeric_range_error(
+        ordinal,
+        "Expr evaluate meet error: The numeric type cast involving decimal overflows",
+        work,
+    )
 }
 
 fn row_error(
@@ -409,6 +427,16 @@ fn row_error(
     message: &str,
     work: &mut EvaluationCheckpoints<'_>,
 ) -> Result<CastRowResult, KernelFailure> {
+    Ok(CastRowResult::RowError(numeric_range_error(
+        ordinal, message, work,
+    )?))
+}
+
+fn numeric_range_error(
+    ordinal: usize,
+    message: &str,
+    work: &mut EvaluationCheckpoints<'_>,
+) -> Result<RowDataError, KernelFailure> {
     work.flush()?;
     let error = RowDataError::with_reason(
         ordinal,
@@ -416,7 +444,7 @@ fn row_error(
         message,
     );
     work.flush()?;
-    Ok(CastRowResult::RowError(error))
+    Ok(error)
 }
 
 #[cfg(test)]

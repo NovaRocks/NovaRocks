@@ -15,13 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! The public SQL compiler refuses only the missing exact conversion shape.
+//! SQL analysis preserves exact LARGEINT conversion, typing, and control boundaries.
 
 use super::*;
 use arrow::datatypes::DataType;
 use std::sync::Arc;
 
-fn analyze_decimal_cast(
+fn analyze_largeint_cast(
     sql: &str,
     source_type: DataType,
     control: SqlCompileControl,
@@ -68,36 +68,35 @@ fn analyze_decimal_cast(
 }
 
 #[test]
-fn public_decimal_largeint_cast_is_an_exact_unsupported_expression() {
-    for source in [DataType::Decimal128(38, 15), DataType::Decimal256(50, 15)] {
-        let error = match analyze_decimal_cast(
-            "SELECT CAST(v AS LARGEINT) FROM t",
-            source,
-            SqlCompileControl::unbounded(),
-        ) {
-            Err(SqlCompileError::Analyze(error)) => error,
-            Err(error) => panic!("expected SQL analysis refusal, got {error:?}"),
-            Ok(_) => panic!("unimplemented decimal conversion was accepted"),
-        };
-        assert_eq!(
-            error.kind(),
-            crate::analyze_error::AnalyzeErrorKind::UnsupportedExpression,
+fn public_numeric_largeint_cast_accepts_all_five_new_source_types() {
+    // B8c-6 installs these conversions; the prior Decimal refusal is retired.
+    for source in [
+        DataType::Decimal128(38, 15),
+        DataType::Decimal256(50, 15),
+        DataType::Float32,
+        DataType::Float64,
+        DataType::Boolean,
+    ] {
+        assert!(
+            analyze_largeint_cast(
+                "SELECT CAST(v AS LARGEINT) FROM t",
+                source.clone(),
+                SqlCompileControl::unbounded(),
+            )
+            .is_ok(),
+            "the exact {source:?} -> LARGEINT conversion must bind"
         );
-        assert_eq!(error.code().as_str(), "sql.analyze.unsupported_expression");
-        assert!(error.span().is_some(), "use the actual CAST parser span");
-        assert!(error.control_error().is_none());
-        assert!(error.source_failure().is_none());
     }
 }
 
 #[test]
-fn public_decimal_largeint_refusal_preserves_null_and_other_conversion_paths() {
+fn public_largeint_cast_preserves_null_and_other_conversion_paths() {
     for sql in [
         "SELECT CAST(NULL AS LARGEINT)",
         "SELECT CAST(CAST(NULL AS DECIMAL(38,15)) AS LARGEINT)",
     ] {
         assert!(
-            analyze_decimal_cast(
+            analyze_largeint_cast(
                 sql,
                 DataType::Decimal128(38, 15),
                 SqlCompileControl::unbounded(),
@@ -107,7 +106,7 @@ fn public_decimal_largeint_refusal_preserves_null_and_other_conversion_paths() {
         );
     }
     assert!(
-        analyze_decimal_cast(
+        analyze_largeint_cast(
             "SELECT CAST(v AS LARGEINT) FROM t",
             DataType::Int64,
             SqlCompileControl::unbounded(),
@@ -115,7 +114,7 @@ fn public_decimal_largeint_refusal_preserves_null_and_other_conversion_paths() {
         .is_ok(),
         "the installed signed-integer conversion remains available"
     );
-    let error = match analyze_decimal_cast(
+    let error = match analyze_largeint_cast(
         "SELECT CAST(v AS LARGEINT) FROM t",
         DataType::Binary,
         SqlCompileControl::unbounded(),
@@ -132,14 +131,14 @@ fn public_decimal_largeint_refusal_preserves_null_and_other_conversion_paths() {
 }
 
 #[test]
-fn public_decimal_largeint_refusal_does_not_replace_cancellation() {
+fn public_decimal_largeint_cast_preserves_cancellation() {
     struct Cancelled;
     impl SqlCancellationObservation for Cancelled {
         fn is_cancelled(&self) -> bool {
             true
         }
     }
-    let result = analyze_decimal_cast(
+    let result = analyze_largeint_cast(
         "SELECT CAST(v AS LARGEINT) FROM t",
         DataType::Decimal128(38, 15),
         SqlCompileControl::new(None, Arc::new(Cancelled)),

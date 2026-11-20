@@ -1,7 +1,7 @@
 -- query 1
--- legacy
+-- types	bigint	varchar
 r	x
-0	
+0	""
 1	▓▓
 2	▓▓▓▓
 3	▓▓▓▓▓▓
@@ -14,7 +14,7 @@ r	x
 10	▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓
 
 -- query 2
--- legacy
+-- types	bigint	bigint
 r	x
 0	0
 1	1

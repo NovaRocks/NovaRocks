@@ -87,13 +87,18 @@ fn conversion_catalogue() -> PureEngineFunctionCatalog {
     builder
         .register(value_conversion_definition().unwrap())
         .unwrap();
-    // This independent installed manifest covers all ten real implementations
+    // This independent installed manifest covers every implementation
     // of the original hidden definition, without claiming a Server catalogue.
     for stem in [
         "array_common_coercion",
         "json_text_same_structure",
         "opaque_to_binary_same_structure",
         "signed_to_largeint",
+        "boolean_to_largeint",
+        "decimal128_to_largeint",
+        "decimal256_to_largeint",
+        "float32_to_largeint_null_invalid",
+        "float64_to_largeint_null_invalid",
         "largeint_to_signed_null_overflow",
         "largeint_to_decimal_exact",
         "largeint_to_float_round",

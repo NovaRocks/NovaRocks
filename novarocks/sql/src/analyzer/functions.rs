@@ -926,9 +926,9 @@ pub(crate) fn dynamic_scalar_return_type(name: &str, arg_types: &[DataType]) -> 
         // `add_months` always returns DATETIME.
         "add_months" => DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
         "date_add" | "date_sub" | "adddate" | "subdate" | "days_add" | "days_sub" | "weeks_add"
-        | "weeks_sub" | "months_add" | "months_sub" | "years_add" | "years_sub"
-        | "timestampadd" | "hours_add" | "hours_sub" | "minutes_add" | "minutes_sub"
-        | "seconds_add" | "seconds_sub" | "microseconds_add" | "microseconds_sub" => {
+        | "weeks_sub" | "months_add" | "months_sub" | "years_add" | "years_sub" | "hours_add"
+        | "hours_sub" | "minutes_add" | "minutes_sub" | "seconds_add" | "seconds_sub"
+        | "microseconds_add" | "microseconds_sub" => {
             // Return the same type as the date/timestamp input argument.
             if let Some(dt) = arg_types.first() {
                 match dt {

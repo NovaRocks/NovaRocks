@@ -1104,7 +1104,6 @@ mod input_source;
 mod node_recipes;
 pub(crate) mod scalar_invocation;
 mod unary;
-mod utf8_inlist;
 
 pub use filter_conjunction::CompiledFilterConjunctionInstance;
 

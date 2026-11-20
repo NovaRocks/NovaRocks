@@ -129,6 +129,11 @@ fn exact_hidden_owner_and_full_effects_are_declared() {
             .collect::<Vec<_>>(),
         [
             ARRAY_COMMON_COERCION,
+            BOOLEAN_LARGEINT,
+            DECIMAL128_LARGEINT,
+            DECIMAL256_LARGEINT,
+            FLOAT32_LARGEINT,
+            FLOAT64_LARGEINT,
             JSON_TEXT,
             LARGEINT_DECIMAL,
             LARGEINT_FLOAT,

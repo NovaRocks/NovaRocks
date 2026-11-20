@@ -325,18 +325,12 @@ fn register_string_fns(m: &mut HashMap<String, Vec<Signature>>) {
         "regexp_count",
         Signature::new(vec![TypeSpec::Utf8, TypeSpec::Utf8], TypeSpec::Int64),
     );
-    // equiwidth_bucket(value, min, max, buckets). The bounds are numeric
-    // rather than specifically Float64 -- integer bounds are the common case.
-    for bound in [TypeSpec::Float64, TypeSpec::Int64] {
-        add(
-            m,
-            "equiwidth_bucket",
-            Signature::new(
-                vec![bound.clone(), bound.clone(), bound.clone(), TypeSpec::Int64],
-                TypeSpec::Int64,
-            ),
-        );
-    }
+    // The executable equiwidth_bucket profile takes four BIGINT arguments.
+    add(
+        m,
+        "equiwidth_bucket",
+        Signature::new(vec![TypeSpec::Int64; 4], TypeSpec::Int64),
+    );
 
     // (Utf8, ...) -> Utf8 — variadic concat / format family.
     // CONCAT requires one string before the repeated tail. A single repeated
@@ -751,7 +745,6 @@ fn register_datetime_fns(m: &mut HashMap<String, Vec<Signature>>) {
         "months_sub",
         "years_add",
         "years_sub",
-        "timestampadd",
         "hours_add",
         "hours_sub",
         "minutes_add",
@@ -1041,9 +1034,7 @@ fn register_condition_fns(m: &mut HashMap<String, Vec<Signature>>) {
         "assert_true",
         Signature::new(vec![TypeSpec::Boolean], TypeSpec::Boolean),
     );
-    // `assert_true(bool, varchar) -> bool` — 2-arg form with a custom error
-    // message. The exec kernel already supports 2 args (assert_true.rs uses the
-    // 2nd arg as the message); only the SQL-layer signature was missing.
+    // `assert_true(bool, varchar) -> bool` supplies a custom failure message.
     add(
         m,
         "assert_true",
@@ -2073,13 +2064,15 @@ fn register_misc_fns(m: &mut HashMap<String, Vec<Signature>>) {
             Signature::variadic(vec![TypeSpec::AnyType], TypeSpec::Binary),
         );
     }
-    // aes_encrypt / aes_decrypt -> Utf8
+    // AES accepts text or binary carriers. Binding validates those carriers.
     for name in ["aes_encrypt", "aes_decrypt"] {
-        add(
-            m,
-            name,
-            Signature::variadic(vec![TypeSpec::AnyType], TypeSpec::Utf8),
-        );
+        for arity in [2, 4, 5] {
+            add(
+                m,
+                name,
+                Signature::new(vec![TypeSpec::AnyType; arity], TypeSpec::Utf8),
+            );
+        }
     }
     // encode_fingerprint_sha256 -> Binary
     add(

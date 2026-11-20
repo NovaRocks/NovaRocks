@@ -141,7 +141,7 @@ fn source_fixture() -> SourceFixture {
             ),
         ),
         utf8.clone(),
-        arrow::array::Array::to_data(&StringArray::from(vec![None, Some("key")])),
+        arrow::array::Array::to_data(&StringArray::from(vec![None, Some("$.key")])),
         constant_policy(),
         CompilePhase::Validate,
         &FixtureControl,
@@ -169,19 +169,22 @@ fn source_fixture() -> SourceFixture {
     let actual =
         novarocks_functions::builtin::catalogue::build_builtin_engine_function_catalog().unwrap();
     let functions = scalar_catalogue(&actual);
-    let (aes, _) = scalar_binding(&actual, "aes_encrypt", &arguments);
+    let (metadata_only, _) = scalar_binding(&actual, "get_json_string", &arguments);
     assert!(matches!(
         actual.pure_overload_declaration_observed(
-            &aes.function_id, FunctionKind::Scalar, &aes.overload, &FixtureControl,
+            &metadata_only.function_id,
+            FunctionKind::Scalar,
+            &metadata_only.overload,
+            &FixtureControl,
         ),
         Err(FunctionSpecializationFailure::MissingPureImplementation(overload))
-            if overload == aes.overload
+            if overload == metadata_only.overload
     ));
-    // AES still owns the original metadata selection. The sealed visitor
-    // source uses an installed eager owner over the same complete signature.
+    // The installed eager owner provides the same complete argument and result
+    // types for the visitor source as the metadata-only accessor.
     let (function, first_selected) = scalar_binding(functions.metadata(), "concat", &arguments);
-    assert_eq!(function.argument_types, aes.argument_types);
-    assert_eq!(function.result_type, aes.result_type);
+    assert_eq!(function.argument_types, metadata_only.argument_types);
+    assert_eq!(function.result_type, metadata_only.result_type);
     let first_type = function.result_type.clone();
     pools.0.insert(pool_id, pool).unwrap();
     let payload = builder

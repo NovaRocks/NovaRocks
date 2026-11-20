@@ -15,11 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod aes;
+mod assert_true;
 mod cast;
 mod comparison;
+mod from_binary;
 mod kernel_control;
 mod native_between;
+mod native_inlist;
+mod row_encoding;
+mod scalar_rows;
+mod synopse;
 mod time_text_cast;
+mod uuid;
+mod vector_distance;
 
 #[cfg(novarocks_dev_controls)]
 mod scalar_invocation;
