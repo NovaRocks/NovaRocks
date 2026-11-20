@@ -328,6 +328,7 @@ mod string_to_base64;
 mod string_to_base64_owner;
 pub mod to_base64_shared;
 
+mod aes_owner;
 pub mod aes_primitive;
 pub mod aes_rows;
 pub mod aggregate_ds_hll_core;
@@ -335,10 +336,17 @@ pub mod aggregate_ds_hll_failure;
 mod aggregate_ds_hll_kernel;
 mod aggregate_ds_hll_owner;
 pub mod aggregate_ds_hll_state;
+mod assert_true_owner;
 pub mod bytes_output;
 pub mod ds_hll_state_core;
 mod ds_hll_state_owner;
 mod ds_hll_state_selected;
+mod from_binary_owner;
+mod row_encoding_owner;
+mod scalar_rows_owner;
+mod synopse_owner;
+mod uuid_owner;
+mod vector_distance_owner;
 
 pub mod array_match_core;
 mod array_match_owner;

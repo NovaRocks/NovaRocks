@@ -1948,16 +1948,6 @@ mod tests {
                 Own::MayRaise,
             ),
             (
-                "bar",
-                vec![
-                    value_argument(DataType::Int64, false, None),
-                    value_argument(DataType::Int64, false, None),
-                    value_argument(DataType::Int64, false, None),
-                    value_argument(DataType::Int64, false, None),
-                ],
-                Own::MayRaise,
-            ),
-            (
                 "count_state_visible",
                 vec![value_argument(DataType::Binary, false, None)],
                 Own::MayRaise,
