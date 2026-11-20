@@ -35,6 +35,7 @@ paths = [
     "novarocks/execution/src/exec/operators/compiled_change_events.rs",
     "novarocks/type-contract/src/write_input_projection.rs",
     "novarocks/value-arrays/src/hydrate/**",
+    "tests/sql/fixtures/iceberg-add-files/**",
     "tests/sql/fixtures/iceberg-variant/generate.scala",
     "tests/sql/fixtures/iceberg-delete-applicability/generate.scala",
     "tests/sql/fixtures/iceberg-delete-applicability/avro.scala",

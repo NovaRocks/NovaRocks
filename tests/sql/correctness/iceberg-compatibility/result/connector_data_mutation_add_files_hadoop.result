@@ -1,0 +1,65 @@
+-- query 4
+-- types	varchar	bigint
+metric_name	metric_value
+added_data_files	1
+
+-- query 5
+-- types	bigint	varchar
+id	note
+11	alpha
+22	beta
+
+-- query 6
+-- types	varchar	bigint
+metric_name	metric_value
+added_data_files	1
+
+-- query 7
+-- types	bigint	varchar
+new_id	new_note
+33	mapped
+
+-- query 8
+-- types	varchar	bigint
+metric_name	metric_value
+added_data_files	1
+
+-- query 9
+-- types	integer	boolean	integer
+first_value	null_element	third_value
+17	true	42
+
+-- query 10
+-- types	varchar	bigint
+metric_name	metric_value
+added_data_files	1
+
+-- query 11
+-- types	bigint	integer
+id	flag
+-7	-2
+27	41
+2147483647	83
+NULL	NULL
+
+-- query 13
+-- types	bigint	integer
+id	flag
+27	41
+2147483647	83
+NULL	NULL
+
+-- query 14
+-- types	bigint	integer
+id	flag
+
+-- query 16
+-- types	bigint	integer
+id	flag
+27	41
+2147483647	83
+NULL	NULL
+
+-- query 17
+-- types	bigint	integer
+id	flag
