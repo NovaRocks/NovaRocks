@@ -27,9 +27,10 @@ use novarocks_spi::connector::{
     ConnectorDataMutationReconcileRequest, ConnectorDataMutationResolver,
     ConnectorDataMutationSession, ConnectorError, ConnectorErrorKind, ConnectorInstanceId,
     ConnectorMutationFailure, ConnectorMutationFailureKind, ConnectorMutationOperationId,
-    ConnectorRequestContext, ConnectorTableIdentity, ConnectorTableRequest,
-    ConnectorTableResolution, ExternalMutationEffect, ExternalMutationEvidence,
-    ExternalMutationFinalization, ExternalMutationOutcome,
+    ConnectorPayloadRetentionGuard, ConnectorRequestContext, ConnectorTableIdentity,
+    ConnectorTableRequest, ConnectorTableResolution, ExternalMutationEffect,
+    ExternalMutationEvidence, ExternalMutationFinalization, ExternalMutationOutcome,
+    REGISTER_EXISTING_FILES_KIND,
 };
 
 #[cfg(test)]
@@ -356,6 +357,22 @@ impl DataMutationSession {
         &mut self,
         cache_finalizer: &dyn DataMutationCacheFinalizer,
     ) -> ResolvedDataMutation {
+        self.execute_once_with_author(None, cache_finalizer)
+    }
+
+    pub(crate) fn execute_registration_once(
+        &mut self,
+        byte_author: ConnectorPayloadRetentionGuard,
+        cache_finalizer: &dyn DataMutationCacheFinalizer,
+    ) -> ResolvedDataMutation {
+        self.execute_once_with_author(Some(byte_author), cache_finalizer)
+    }
+
+    fn execute_once_with_author(
+        &mut self,
+        byte_author: Option<ConnectorPayloadRetentionGuard>,
+        cache_finalizer: &dyn DataMutationCacheFinalizer,
+    ) -> ResolvedDataMutation {
         if !matches!(self.phase, DataMutationSessionPhase::Planned) {
             return contract_failure(
                 ConnectorError::new(
@@ -365,10 +382,19 @@ impl DataMutationSession {
                 DataMutationDispatchState::ConfirmedNotDispatched,
             );
         }
-        let request = match ConnectorDataMutationExecuteRequest::try_new(
-            self.plan.clone(),
-            self.context.clone(),
-        ) {
+        let request =
+            ConnectorDataMutationExecuteRequest::try_new(self.plan.clone(), self.context.clone())
+                .and_then(|request| match byte_author {
+                    Some(author) => request.with_registration_byte_author(author),
+                    None if self.plan.operation_kind() == REGISTER_EXISTING_FILES_KIND => {
+                        Err(ConnectorError::new(
+                            ConnectorErrorKind::InvalidRequest,
+                            "registration is missing the original statement payload byte author",
+                        ))
+                    }
+                    None => Ok(request),
+                });
+        let request = match request {
             Ok(request) => request,
             Err(error) => {
                 self.phase = DataMutationSessionPhase::Terminal;
@@ -752,6 +778,9 @@ mod tests {
             request: ConnectorDataMutationExecuteRequest,
         ) -> Result<ExternalMutationOutcome<ConnectorDataMutationReceipt>, ConnectorError> {
             self.execute_calls.fetch_add(1, Ordering::SeqCst);
+            if request.plan.operation_kind() == REGISTER_EXISTING_FILES_KIND {
+                assert!(request.registration_byte_author().is_ok());
+            }
             if matches!(self.mode, Mode::ExecuteContractFailure) {
                 return Err(ConnectorError::new(
                     ConnectorErrorKind::Internal,
@@ -1005,6 +1034,51 @@ mod tests {
         )
     }
 
+    fn test_registration_author() -> ConnectorPayloadRetentionGuard {
+        use novarocks_spi::connector::ConnectorPayloadByteBudget;
+        struct TestAuthor;
+        impl ConnectorPayloadByteBudget for TestAuthor {
+            fn reserve_bytes(
+                &self,
+                _bytes: usize,
+            ) -> Result<ConnectorPayloadRetentionGuard, ConnectorError> {
+                unreachable!("the provider's synthetic receipt allocates no payload")
+            }
+        }
+        ConnectorPayloadRetentionGuard::from_byte_budget(Arc::new(TestAuthor))
+    }
+
+    #[test]
+    fn missing_registration_author_refuses_before_dispatch() {
+        let provider = FakeProvider::new(Mode::Committed);
+        let finalizer = Finalizer {
+            events: provider.events.clone(),
+            fail: false,
+        };
+        let resolver = Resolver::new(provider.clone());
+        let mut session = DataMutationSession::plan(
+            &resolver,
+            &provider.descriptor.instance_id,
+            ConnectorMutationOperationId::from_bytes([8; 16]),
+            table(&provider.descriptor.instance_id),
+            DataMutationIntent::register_existing_files(
+                Some("s3://bucket/import".into()),
+                Some(ConnectorAddFilesFormat::Parquet),
+                ConnectorAddFilesRecursion::Fail,
+            ),
+            context(),
+        )
+        .unwrap();
+        assert!(matches!(
+            session.execute_once(&finalizer),
+            ResolvedDataMutation::ContractFailure {
+                dispatch: DataMutationDispatchState::ConfirmedNotDispatched,
+                ..
+            }
+        ));
+        assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 0);
+    }
+
     #[test]
     fn exact_lease_loads_plans_and_executes_once_before_generic_finalization() {
         let provider = FakeProvider::new(Mode::Committed);
@@ -1030,7 +1104,7 @@ mod tests {
         assert_eq!(session.plan_ref().operation_id(), operation_id);
         assert_eq!(resolver.releases.load(Ordering::SeqCst), 0);
         assert!(matches!(
-            session.execute_once(&finalizer),
+            session.execute_registration_once(test_registration_author(), &finalizer),
             ResolvedDataMutation::KnownCommitted(_)
         ));
         assert_eq!(resolver.releases.load(Ordering::SeqCst), 0);

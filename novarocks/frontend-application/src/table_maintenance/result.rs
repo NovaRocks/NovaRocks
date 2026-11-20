@@ -147,26 +147,50 @@ pub(crate) fn optimize_result(
     else {
         return Err("OPTIMIZE requires data rewrite outcome facts".into());
     };
+    table_execute_metrics(
+        &[
+            (
+                "rewritten_data_files_count",
+                Some(i64::from(rewritten_data_files_count)),
+            ),
+            (
+                "removed_delete_files_count",
+                Some(i64::from(removed_delete_files_count)),
+            ),
+            (
+                "added_data_files_count",
+                added_data_files_count.map(i64::from),
+            ),
+        ],
+        "build Iceberg optimize metrics",
+    )
+    .map(MaintenanceStatementResult::Query)
+}
+
+pub(crate) fn add_files_result(file_count: u32) -> Result<QueryResult, String> {
+    table_execute_metrics(
+        &[("added_data_files", Some(i64::from(file_count)))],
+        "build Iceberg ADD FILES metrics",
+    )
+}
+
+fn table_execute_metrics(
+    rows: &[(&str, Option<i64>)],
+    context: &str,
+) -> Result<QueryResult, String> {
     build_query_result(
         vec![
             column("metric_name", DataType::Utf8, false),
             column("metric_value", DataType::Int64, true),
         ],
         vec![
-            Arc::new(StringArray::from(vec![
-                "rewritten_data_files_count",
-                "removed_delete_files_count",
-                "added_data_files_count",
-            ])) as ArrayRef,
-            Arc::new(Int64Array::from(vec![
-                Some(i64::from(rewritten_data_files_count)),
-                Some(i64::from(removed_delete_files_count)),
-                added_data_files_count.map(i64::from),
-            ])) as ArrayRef,
+            Arc::new(StringArray::from_iter_values(
+                rows.iter().map(|(name, _)| *name),
+            )) as ArrayRef,
+            Arc::new(Int64Array::from_iter(rows.iter().map(|(_, value)| *value))) as ArrayRef,
         ],
-        "build Iceberg optimize metrics",
+        context,
     )
-    .map(MaintenanceStatementResult::Query)
 }
 
 fn build_query_result(
@@ -183,3 +207,6 @@ fn column(name: &str, data_type: DataType, nullable: bool) -> QueryResultColumn 
         novarocks_type_contract::FunctionValueType::new(data_type, nullable),
     )
 }
+
+#[cfg(test)]
+mod tests;

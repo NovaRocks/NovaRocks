@@ -596,15 +596,48 @@ fn terminal_page_with_count(
 fn command_update_type(
     admission: novarocks_query_application::session::StatementAdmission,
 ) -> Option<&'static str> {
-    use novarocks_query_application::session::StatementOutputShape;
+    use novarocks_query_application::{
+        session::StatementOutputShape, statement_kind::StatementKind,
+    };
     match admission.shape {
         StatementOutputShape::Rows | StatementOutputShape::Empty => update_type(admission.kind),
         StatementOutputShape::ResultSet
-            if admission.kind
-                == novarocks_query_application::statement_kind::StatementKind::Optimize =>
+            if matches!(
+                admission.kind,
+                StatementKind::AddFiles | StatementKind::Optimize
+            ) =>
         {
             update_type(admission.kind)
         }
         StatementOutputShape::ResultSet | StatementOutputShape::UndeterminedCall => None,
+    }
+}
+
+#[cfg(test)]
+mod command_update_type_tests {
+    use super::*;
+    use novarocks_query_application::{
+        session::{StatementAdmission, StatementOutputShape},
+        statement_kind::StatementKind,
+    };
+
+    #[test]
+    fn table_execute_metrics_keep_update_type_with_result_set() {
+        for kind in [StatementKind::AddFiles, StatementKind::Optimize] {
+            assert_eq!(
+                command_update_type(StatementAdmission {
+                    kind,
+                    shape: StatementOutputShape::ResultSet
+                }),
+                Some("ALTER TABLE EXECUTE")
+            );
+        }
+        assert_eq!(
+            command_update_type(StatementAdmission {
+                kind: StatementKind::RewriteManifests,
+                shape: StatementOutputShape::ResultSet
+            }),
+            None
+        );
     }
 }

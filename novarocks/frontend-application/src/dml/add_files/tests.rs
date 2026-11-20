@@ -42,6 +42,9 @@ impl AddFilesPrepared for TestPrepared {
 struct RecordingAddFilesEngine {
     plan_calls: AtomicUsize,
     execute_calls: AtomicUsize,
+    adjudicate_calls: AtomicUsize,
+    outcome: Option<AddFilesOutcome>,
+    adjudicated: Option<AddFilesOutcome>,
 }
 
 impl AddFilesEngine for RecordingAddFilesEngine {
@@ -68,9 +71,18 @@ impl AddFilesEngine for RecordingAddFilesEngine {
         })
     }
 
-    fn execute_add_files(&self, _prepared: &dyn AddFilesPrepared) -> AddFilesOutcome {
+    fn execute_add_files(
+        &self,
+        _prepared: &dyn AddFilesPrepared,
+        byte_author: ConnectorPayloadRetentionGuard,
+    ) -> AddFilesOutcome {
         self.execute_calls.fetch_add(1, Ordering::SeqCst);
-        unreachable!("this test must not cross the dispatch edge")
+        let _receipt = byte_author
+            .reserve_owned_bytes(8)
+            .expect("original statement budget");
+        self.outcome
+            .clone()
+            .expect("test may cross the dispatch edge")
     }
 
     fn adjudicate_add_files(
@@ -78,7 +90,8 @@ impl AddFilesEngine for RecordingAddFilesEngine {
         _prepared: &dyn AddFilesPrepared,
         _evidence: &AddFilesEvidence,
     ) -> AddFilesOutcome {
-        unreachable!("this test must not adjudicate")
+        self.adjudicate_calls.fetch_add(1, Ordering::SeqCst);
+        self.adjudicated.clone().expect("test may adjudicate once")
     }
 }
 
@@ -105,27 +118,182 @@ fn context() -> RequestContext {
     ))
 }
 
+fn command() -> AddFilesCommand {
+    AddFilesCommand {
+        table_parts: vec!["ice".to_string(), "db".to_string(), "orders".to_string()],
+        arguments: AddFilesArguments {
+            location: Some("s3://bucket/source".into()),
+            format: Some(ConnectorAddFilesFormat::Parquet),
+            recursion: ConnectorAddFilesRecursion::Fail,
+        },
+    }
+}
+
+fn original_root() -> (
+    novarocks_workload_control::WorkloadControl,
+    novarocks_workload_control::RootWork,
+    ResultWindowAlias,
+) {
+    use novarocks_workload_control::{
+        ResourceConfig, ResultCapacityConfig, ResultWindowClass, WorkClass, WorkRequest,
+        WorkloadConfig, WorkloadControl,
+    };
+    let control = WorkloadControl::try_new(
+        WorkloadConfig::default(),
+        ResourceConfig {
+            total_bytes: 1 << 20,
+            control_bytes: 1024,
+            per_scope_bytes: (1 << 20) - 1024,
+        },
+    )
+    .unwrap();
+    control
+        .configure_result_capacity(ResultCapacityConfig::V1)
+        .unwrap();
+    control.mark_ready().unwrap();
+    let (root, window) = control
+        .root_admission()
+        .try_begin_root_with_result(
+            WorkRequest::new(WorkClass::Management),
+            ResultWindowClass::Local,
+        )
+        .unwrap();
+    (control, root, window.retain_alias())
+}
+
 #[test]
 fn planned_add_files_does_not_dispatch_until_the_second_edge() {
     let engine = RecordingAddFilesEngine::default();
     let prepared = DmlService::new()
-        .prepare_add_files(
-            &engine,
-            AddFilesCommand {
-                table_parts: vec!["ice".to_string(), "db".to_string(), "orders".to_string()],
-                arguments: AddFilesArguments {
-                    location: Some("s3://bucket/source".into()),
-                    format: Some(ConnectorAddFilesFormat::Parquet),
-                    recursion: ConnectorAddFilesRecursion::Fail,
-                },
-            },
-            &context(),
-            None,
-        )
+        .prepare_add_files(&engine, command(), &context(), None)
         .expect("plan ADD FILES without dispatch");
 
     assert_eq!(engine.plan_calls.load(Ordering::SeqCst), 1);
     assert_eq!(engine.execute_calls.load(Ordering::SeqCst), 0);
     drop(prepared);
     assert_eq!(engine.execute_calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn add_files_receipts_use_the_same_root_and_release_when_backing_exits() {
+    let (_control, _root, window) = original_root();
+    let author = registration_byte_author(window.clone());
+    let full = author
+        .reserve_owned_bytes(window.payload_capacity_bytes() as usize)
+        .unwrap();
+    assert_eq!(
+        window.retained_payload_bytes(),
+        window.payload_capacity_bytes()
+    );
+    let denied = author.reserve_owned_bytes(1).unwrap_err();
+    assert_eq!(denied.kind(), ConnectorErrorKind::ResourceExhausted);
+    let last = full.clone();
+    drop(full);
+    drop(author);
+    assert_eq!(
+        window.retained_payload_bytes(),
+        window.payload_capacity_bytes()
+    );
+    drop(last);
+    assert_eq!(window.retained_payload_bytes(), 0);
+}
+
+#[test]
+fn add_files_original_cause_survives_plan_refusal_and_dispatch_verdicts() {
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    use novarocks_spi::connector::LakePublicationDisposition;
+
+    let failure = AddFilesFailure::from_connector(ConnectorError::new(
+        ConnectorErrorKind::ResourceExhausted,
+        "original registration capacity refusal",
+    ));
+    let planned = plan_error(AddFilesPlanError::KnownUncommitted(failure.clone()));
+    let original = planned
+        .application_error()
+        .unwrap()
+        .failure_cause()
+        .unwrap();
+    assert_eq!(original.failure_fact().class(), FailureClass::Resource);
+    let cases = [
+        (
+            AddFilesOutcome::KnownUncommitted {
+                failure: failure.clone(),
+            },
+            LakePublicationDisposition::KnownUncommitted,
+        ),
+        (
+            AddFilesOutcome::ContractFailure {
+                failure: failure.clone(),
+                dispatch: AddFilesDispatchState::ConfirmedNotDispatched,
+            },
+            LakePublicationDisposition::KnownUncommitted,
+        ),
+        (
+            AddFilesOutcome::ContractFailure {
+                failure,
+                dispatch: AddFilesDispatchState::PossiblyDispatched,
+            },
+            LakePublicationDisposition::CommitUnknown,
+        ),
+    ];
+    let (_control, _root, window) = original_root();
+    for (outcome, disposition) in cases {
+        let engine = RecordingAddFilesEngine {
+            outcome: Some(outcome),
+            ..Default::default()
+        };
+        let dml = DmlService::new();
+        let prepared = dml
+            .prepare_add_files(&engine, command(), &context(), None)
+            .unwrap();
+        let error = dml
+            .execute_prepared_add_files(&engine, prepared, registration_byte_author(window.clone()))
+            .unwrap_err();
+        assert_eq!(
+            error.publication_terminal().unwrap().disposition(),
+            disposition
+        );
+        assert_eq!(
+            error.application_error().unwrap().failure_cause(),
+            Some(original)
+        );
+        assert_eq!(window.retained_payload_bytes(), 0);
+        assert_eq!(engine.execute_calls.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[test]
+fn add_files_unknown_adjudication_keeps_one_original_outcome() {
+    use novarocks_spi::connector::LakePublicationDisposition;
+    let failure = AddFilesFailure::from_connector(ConnectorError::new(
+        ConnectorErrorKind::Unavailable,
+        "response lost after dispatch",
+    ));
+    let evidence = AddFilesEvidence {
+        schema_version: 1,
+        digest: [0; 32],
+        wire_bytes: vec![1],
+    };
+    let unknown = AddFilesOutcome::CommitUnknown { failure, evidence };
+    let engine = RecordingAddFilesEngine {
+        outcome: Some(unknown.clone()),
+        adjudicated: Some(unknown),
+        ..Default::default()
+    };
+    let dml = DmlService::new();
+    let (_control, _root, window) = original_root();
+    let prepared = dml
+        .prepare_add_files(&engine, command(), &context(), None)
+        .unwrap();
+    let error = dml
+        .execute_prepared_add_files(&engine, prepared, registration_byte_author(window))
+        .unwrap_err();
+    let terminal = error.publication_terminal().unwrap();
+    assert_eq!(
+        terminal.disposition(),
+        LakePublicationDisposition::CommitUnknown
+    );
+    assert!(terminal.do_not_retry());
+    assert_eq!(engine.execute_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(engine.adjudicate_calls.load(Ordering::SeqCst), 1);
 }

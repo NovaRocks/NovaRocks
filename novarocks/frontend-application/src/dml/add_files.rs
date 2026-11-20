@@ -22,6 +22,7 @@
 
 use novarocks_proto_codec::lifecycle::QueryOptions;
 use novarocks_spi::connector::{
+    ConnectorError, ConnectorErrorKind, ConnectorPayloadByteBudget, ConnectorPayloadRetentionGuard,
     LakePublicationFamily, LakePublicationId, LakePublicationStatementTag, LakePublicationTarget,
     LakePublicationTerminal,
 };
@@ -33,10 +34,53 @@ use crate::dml::attempt::{
 use crate::dml::error::DmlError;
 use crate::dml::service::DmlService;
 use crate::query_execution::dml::add_files::{
-    AddFilesCommand, AddFilesEngine, AddFilesFailure, AddFilesFinalization, AddFilesOutcome,
-    AddFilesPlanError, AddFilesPlanFacts, PlanAddFilesRequest, PreparedAddFiles, ResolvedAddFiles,
+    AddFilesCommand, AddFilesDispatchState, AddFilesEngine, AddFilesFailure, AddFilesFinalization,
+    AddFilesOutcome, AddFilesPlanError, AddFilesPlanFacts, PlanAddFilesRequest, PreparedAddFiles,
+    ResolvedAddFiles,
 };
 use novarocks_query_application::admitted_query_context::RequestContext;
+use novarocks_workload_control::{CancellationReason, ResultWindowAlias, WorkError};
+use std::sync::Arc;
+
+struct RegistrationByteAuthor(ResultWindowAlias);
+
+impl ConnectorPayloadByteBudget for RegistrationByteAuthor {
+    fn reserve_bytes(
+        &self,
+        bytes: usize,
+    ) -> Result<ConnectorPayloadRetentionGuard, ConnectorError> {
+        let bytes = u64::try_from(bytes)
+            .map_err(|_| registration_work_error(WorkError::ArithmeticOverflow))?;
+        let receipt = self
+            .0
+            .reserve_payload_bytes(bytes)
+            .map_err(registration_work_error)?;
+        Ok(ConnectorPayloadRetentionGuard::new(receipt))
+    }
+}
+
+pub(crate) fn registration_byte_author(
+    window: ResultWindowAlias,
+) -> ConnectorPayloadRetentionGuard {
+    ConnectorPayloadRetentionGuard::from_byte_budget(Arc::new(RegistrationByteAuthor(window)))
+}
+
+fn registration_work_error(error: WorkError) -> ConnectorError {
+    let kind = match &error {
+        WorkError::Capacity(_) | WorkError::CapacityWaitTimeout | WorkError::ArithmeticOverflow => {
+            ConnectorErrorKind::ResourceExhausted
+        }
+        WorkError::Cancelled(
+            CancellationReason::DeadlineExceeded
+            | CancellationReason::FrontendDrainDeadlineExceeded,
+        ) => ConnectorErrorKind::DeadlineExceeded,
+        WorkError::Cancelled(_) | WorkError::Closed | WorkError::Released => {
+            ConnectorErrorKind::Cancelled
+        }
+        _ => ConnectorErrorKind::Internal,
+    };
+    ConnectorError::from_domain(kind, error)
+}
 
 /// A planned ADD FILES operation whose provider dispatch has not begun.
 ///
@@ -116,6 +160,7 @@ impl DmlService {
         &self,
         engine: &dyn AddFilesEngine,
         prepared: PreparedAddFilesAttempt,
+        byte_author: ConnectorPayloadRetentionGuard,
     ) -> Result<u32, DmlError> {
         let PreparedAddFilesAttempt {
             prepared,
@@ -124,7 +169,7 @@ impl DmlService {
         attempt
             .mark_dispatch_possible()
             .map_err(DmlError::executor)?;
-        finish(engine, prepared, &mut attempt)
+        finish(engine, prepared, &mut attempt, byte_author)
     }
 }
 
@@ -153,8 +198,9 @@ fn finish(
     engine: &dyn AddFilesEngine,
     prepared: PreparedAddFiles,
     attempt: &mut DmlPublicationAttempt,
+    byte_author: ConnectorPayloadRetentionGuard,
 ) -> Result<u32, DmlError> {
-    match engine.execute_add_files(prepared.handle.as_ref()) {
+    match engine.execute_add_files(prepared.handle.as_ref(), byte_author) {
         AddFilesOutcome::KnownCommitted {
             receipt,
             finalization,
@@ -183,10 +229,15 @@ fn finish(
                 }
             }
         }
-        // This boundary is deliberate: a plan was retained and execute was
-        // invoked, so even an adapter-local failure cannot grant a retry.
         AddFilesOutcome::KnownUncommitted { failure }
-        | AddFilesOutcome::ContractFailure { failure, .. } => unknown(attempt, failure),
+        | AddFilesOutcome::ContractFailure {
+            failure,
+            dispatch: AddFilesDispatchState::ConfirmedNotDispatched,
+        } => failed(attempt.terminal_known_uncommitted(), failure),
+        AddFilesOutcome::ContractFailure {
+            failure,
+            dispatch: AddFilesDispatchState::PossiblyDispatched,
+        } => failed(attempt.terminal_commit_unknown(), failure),
     }
 }
 
@@ -195,9 +246,8 @@ fn committed(
     file_count: u32,
     finalization: AddFilesFinalization,
 ) -> Result<u32, DmlError> {
-    let finalization = finalization_state(&finalization);
     let terminal = attempt
-        .terminal_known_committed(finalization)
+        .terminal_known_committed(finalization_state(&finalization))
         .map_err(DmlError::executor)?
         .clone();
     finalization_error(terminal, finalization, file_count)
@@ -209,26 +259,23 @@ fn committed_after_adjudication(
     file_count: u32,
     finalization: AddFilesFinalization,
 ) -> Result<u32, DmlError> {
-    let finalization = finalization_state(&finalization);
     let terminal = attempt
         .finish_adjudication(
             capability,
             DmlPublicationAdjudicationOutcome::KnownCommitted,
-            finalization,
+            finalization_state(&finalization),
         )
         .map_err(DmlError::executor)?
         .clone();
     finalization_error(terminal, finalization, file_count)
 }
 
-fn unknown(attempt: &mut DmlPublicationAttempt, failure: AddFilesFailure) -> Result<u32, DmlError> {
-    let terminal = attempt
-        .terminal_commit_unknown()
-        .map_err(DmlError::executor)?
-        .clone();
-    Err(DmlError::commit(&failure.message)
-        .with_compile_control(failure.compile_control_error())
-        .with_publication_terminal(terminal))
+fn failed(
+    terminal: Result<&LakePublicationTerminal, crate::dml::attempt::DmlPublicationAttemptError>,
+    failure: AddFilesFailure,
+) -> Result<u32, DmlError> {
+    let terminal = terminal.map_err(DmlError::executor)?.clone();
+    Err(DmlError::from_application(failure.into_service()).with_publication_terminal(terminal))
 }
 
 fn unknown_after_adjudication(
@@ -236,17 +283,14 @@ fn unknown_after_adjudication(
     capability: DmlPublicationAdjudication,
     failure: AddFilesFailure,
 ) -> Result<u32, DmlError> {
-    let terminal = attempt
-        .finish_adjudication(
+    failed(
+        attempt.finish_adjudication(
             capability,
             DmlPublicationAdjudicationOutcome::CommitUnknown,
             DmlPublicationFinalization::NotApplicable,
-        )
-        .map_err(DmlError::executor)?
-        .clone();
-    Err(DmlError::commit(&failure.message)
-        .with_compile_control(failure.compile_control_error())
-        .with_publication_terminal(terminal))
+        ),
+        failure,
+    )
 }
 
 fn finalization_state(finalization: &AddFilesFinalization) -> DmlPublicationFinalization {
@@ -258,24 +302,23 @@ fn finalization_state(finalization: &AddFilesFinalization) -> DmlPublicationFina
 
 fn finalization_error(
     terminal: LakePublicationTerminal,
-    finalization: DmlPublicationFinalization,
+    finalization: AddFilesFinalization,
     file_count: u32,
 ) -> Result<u32, DmlError> {
-    if finalization == DmlPublicationFinalization::Failed {
-        return Err(DmlError::known_committed_finalization_failed(
-            terminal,
-            "ADD FILES finalization failed",
-        ));
+    match finalization {
+        AddFilesFinalization::Complete => Ok(file_count),
+        AddFilesFinalization::Failed(failure) => {
+            Err(DmlError::from_application(failure.into_service())
+                .with_publication_terminal(terminal))
+        }
     }
-    Ok(file_count)
 }
 
 fn plan_error(error: AddFilesPlanError) -> DmlError {
     match error {
         AddFilesPlanError::KnownUncommitted(failure)
         | AddFilesPlanError::ContractFailure { failure, .. } => {
-            DmlError::executor(&failure.message)
-                .with_compile_control(failure.compile_control_error())
+            DmlError::from_application(failure.into_service())
         }
     }
 }

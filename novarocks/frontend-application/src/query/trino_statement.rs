@@ -1433,28 +1433,32 @@ impl FrontendQuerySession {
         let engine = Arc::clone(&self.service.add_files_engine);
         let planner = Arc::clone(&dml);
         let prepare_engine = Arc::clone(&engine);
+        let Some(window) = window else {
+            return Ok(self.governed_typed_error(
+                internal_error("ADD FILES has no original result window"),
+                statement,
+            ));
+        };
+        let byte_author = crate::dml::add_files::registration_byte_author(window.clone());
         let mut worker = Box::pin(execute_prepared_dml_statement(
             self.service.query_blocking_executor.clone(),
             input.cancellation.clone(),
             statement
                 .take_execution_owner()
                 .expect("same original ADD FILES owner"),
-            window,
+            Some(window),
             move || {
-                planner
-                    .prepare_resolved_add_files(
-                        prepare_engine.as_ref(),
-                        resolved,
-                        &input.request,
-                        Some(&input.options),
-                    )
-                    .map_err(|error| RoutedExecutionError::Engine(error.to_string()))
+                dml_result(planner.prepare_resolved_add_files(
+                    prepare_engine.as_ref(),
+                    resolved,
+                    &input.request,
+                    Some(&input.options),
+                ))
             },
             move |prepared| {
-                dml.execute_prepared_add_files(engine.as_ref(), prepared)
-                    .map_err(|error| RoutedExecutionError::Engine(error.to_string()))
+                dml_result(dml.execute_prepared_add_files(engine.as_ref(), prepared, byte_author))
                     .and_then(|count| {
-                        add_files_status(count)
+                        crate::table_maintenance::result::add_files_result(count)
                             .map(StatementResult::Query)
                             .map_err(RoutedExecutionError::Engine)
                     })

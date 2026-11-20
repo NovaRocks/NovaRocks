@@ -26,10 +26,14 @@
 use std::any::Any;
 use std::sync::{Arc, Mutex};
 
+use novarocks_failure_contract::{
+    BoundedDetail, FailureProjection, SharedFailureCause, connector_reason,
+};
 use novarocks_spi::connector::{
     ConnectorAddFilesFormat, ConnectorAddFilesRecursion, ConnectorError, ConnectorErrorKind,
     ConnectorMutationFailure, ConnectorMutationFailureKind, ConnectorMutationOperationId,
-    ExternalMutationEffect, ExternalMutationEvidence, ExternalMutationFinalization,
+    ConnectorPayloadRetentionGuard, ExternalMutationEffect, ExternalMutationEvidence,
+    ExternalMutationFinalization,
 };
 
 use crate::connector::data_mutation::{
@@ -78,36 +82,53 @@ pub struct PlanAddFilesRequest {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum AddFilesFailureKind {
-    Interrupted(novarocks_type_contract::CompileControlError),
-    InvalidRequest,
-    NotFound,
-    AlreadyExists,
-    Conflict,
-    Unauthenticated,
-    PermissionDenied,
-    Unsupported,
-    Cancelled,
-    DeadlineExceeded,
-    ResourceExhausted,
-    Unavailable,
-    CorruptData,
-    Internal,
+pub struct AddFilesFailure {
+    cause: SharedFailureCause,
+    interrupted: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AddFilesFailure {
-    pub kind: AddFilesFailureKind,
-    pub message: String,
-}
 impl AddFilesFailure {
-    pub(crate) fn compile_control_error(
-        &self,
-    ) -> Option<novarocks_type_contract::CompileControlError> {
-        match &self.kind {
-            AddFilesFailureKind::Interrupted(cause) => Some(cause.clone()),
-            _ => None,
-        }
+    pub(crate) fn from_connector(error: ConnectorError) -> Self {
+        let detail = authored_procedure_detail(&error).map(BoundedDetail::truncating);
+        let interrupted = error.kind() == ConnectorErrorKind::Interrupted;
+        let cause = match detail {
+            Some(detail) => SharedFailureCause::from_bounded_detail(error, detail),
+            None => SharedFailureCause::new(error),
+        };
+        Self { cause, interrupted }
+    }
+
+    pub(crate) fn into_service(
+        self,
+    ) -> novarocks_query_application::session_error::QueryServiceError {
+        let control = self
+            .interrupted
+            .then(|| novarocks_type_contract::CompileControlError::Source(self.cause.clone()));
+        novarocks_query_application::session_error::QueryServiceError::from_failure_cause(
+            self.cause,
+        )
+        .with_compile_control(control)
+    }
+}
+
+fn authored_procedure_detail(error: &ConnectorError) -> Option<&str> {
+    use connector_reason::*;
+    // These reasons carry provider-authored procedure diagnostics. For other
+    // connector errors require the producer's explicit public projection.
+    match error.failure_fact().reason() {
+        ADD_FILES_DISABLED
+        | PROCEDURE_ARGUMENT_INVALID
+        | LOCATION_NOT_FOUND
+        | SOURCE_TYPE_MISMATCH
+        | NOT_NULL_VIOLATION
+        | ICEBERG_COMMIT_ERROR
+        | ICEBERG_COMMIT_STATE_UNKNOWN
+        | COMMIT_TRANSACTION_CONFLICT => Some(
+            error
+                .public_failure_detail()
+                .unwrap_or_else(|| error.message()),
+        ),
+        _ => error.public_failure_detail(),
     }
 }
 
@@ -224,7 +245,11 @@ pub trait AddFilesEngine: Send + Sync {
         request: PlanAddFilesRequest,
     ) -> Result<PreparedAddFiles, AddFilesPlanError>;
 
-    fn execute_add_files(&self, prepared: &dyn AddFilesPrepared) -> AddFilesOutcome;
+    fn execute_add_files(
+        &self,
+        prepared: &dyn AddFilesPrepared,
+        byte_author: ConnectorPayloadRetentionGuard,
+    ) -> AddFilesOutcome;
 
     fn adjudicate_add_files(
         &self,
@@ -314,7 +339,7 @@ impl AddFilesEngine for DmlExecutionKernel {
         let public_plan_wire =
             plan.try_to_wire_v1()
                 .map_err(|error| AddFilesPlanError::ContractFailure {
-                    failure: project_connector_error(error),
+                    failure: AddFilesFailure::from_connector(error),
                     dispatch: AddFilesDispatchState::ConfirmedNotDispatched,
                 })?;
         let facts = AddFilesPlanFacts {
@@ -338,7 +363,11 @@ impl AddFilesEngine for DmlExecutionKernel {
         })
     }
 
-    fn execute_add_files(&self, prepared: &dyn AddFilesPrepared) -> AddFilesOutcome {
+    fn execute_add_files(
+        &self,
+        prepared: &dyn AddFilesPrepared,
+        byte_author: ConnectorPayloadRetentionGuard,
+    ) -> AddFilesOutcome {
         let prepared = match downcast_prepared(prepared) {
             Ok(prepared) => prepared,
             Err(outcome) => return outcome,
@@ -347,7 +376,7 @@ impl AddFilesEngine for DmlExecutionKernel {
             Ok(session) => session,
             Err(_) => return poisoned_session(),
         };
-        project_outcome(session.execute_once(self))
+        project_outcome(session.execute_registration_once(byte_author, self))
     }
 
     fn adjudicate_add_files(
@@ -368,7 +397,7 @@ impl AddFilesEngine for DmlExecutionKernel {
             }
             Ok(_) => {
                 return contract_outcome(
-                    AddFilesFailureKind::CorruptData,
+                    ConnectorErrorKind::CorruptData,
                     "ADD FILES evidence digest or schema version does not match its wire bytes",
                     AddFilesDispatchState::ConfirmedNotDispatched,
                 );
@@ -395,7 +424,7 @@ fn downcast_prepared(
         .downcast_ref::<CorePreparedAddFiles>()
         .ok_or_else(|| {
             contract_outcome(
-                AddFilesFailureKind::InvalidRequest,
+                ConnectorErrorKind::InvalidRequest,
                 "foreign ADD FILES prepared handle",
                 AddFilesDispatchState::ConfirmedNotDispatched,
             )
@@ -404,21 +433,21 @@ fn downcast_prepared(
 
 fn poisoned_session() -> AddFilesOutcome {
     contract_outcome(
-        AddFilesFailureKind::Internal,
+        ConnectorErrorKind::Internal,
         "ADD FILES prepared session lock is poisoned",
         AddFilesDispatchState::ConfirmedNotDispatched,
     )
 }
 
 fn plan_string_failure(message: String) -> AddFilesPlanError {
-    AddFilesPlanError::KnownUncommitted(AddFilesFailure {
-        kind: AddFilesFailureKind::InvalidRequest,
+    plan_connector_failure(ConnectorError::new(
+        ConnectorErrorKind::InvalidRequest,
         message,
-    })
+    ))
 }
 
 fn plan_connector_failure(error: ConnectorError) -> AddFilesPlanError {
-    AddFilesPlanError::KnownUncommitted(project_connector_error(error))
+    AddFilesPlanError::KnownUncommitted(AddFilesFailure::from_connector(error))
 }
 
 fn project_plan_error(outcome: ResolvedDataMutation) -> AddFilesPlanError {
@@ -428,16 +457,16 @@ fn project_plan_error(outcome: ResolvedDataMutation) -> AddFilesPlanError {
         }
         ResolvedDataMutation::ContractFailure { error, dispatch } => {
             AddFilesPlanError::ContractFailure {
-                failure: project_connector_error(error),
+                failure: AddFilesFailure::from_connector(error),
                 dispatch: project_dispatch(dispatch),
             }
         }
         ResolvedDataMutation::KnownCommitted(_) | ResolvedDataMutation::CommitUnknown { .. } => {
             AddFilesPlanError::ContractFailure {
-                failure: AddFilesFailure {
-                    kind: AddFilesFailureKind::Internal,
-                    message: "ADD FILES planning returned a post-dispatch outcome".to_string(),
-                },
+                failure: AddFilesFailure::from_connector(ConnectorError::new(
+                    ConnectorErrorKind::Internal,
+                    "ADD FILES planning returned a post-dispatch outcome",
+                )),
                 dispatch: AddFilesDispatchState::ConfirmedNotDispatched,
             }
         }
@@ -467,7 +496,7 @@ fn project_outcome(outcome: ResolvedDataMutation) -> AddFilesOutcome {
         }
         ResolvedDataMutation::ContractFailure { error, dispatch } => {
             AddFilesOutcome::ContractFailure {
-                failure: project_connector_error(error),
+                failure: AddFilesFailure::from_connector(error),
                 dispatch: project_dispatch(dispatch),
             }
         }
@@ -524,64 +553,26 @@ fn project_uncommitted(
     failure: KnownUncommittedDataMutation,
     cleanup: novarocks_spi::connector::ExternalMutationFinalization,
 ) -> AddFilesFailure {
-    let mut projected = match failure {
-        KnownUncommittedDataMutation::Planning(error) => project_connector_error(error),
+    if let ExternalMutationFinalization::Failed(error) = cleanup {
+        tracing::warn!(%error, "uncommitted ADD FILES retains incomplete cleanup");
+    }
+    match failure {
+        KnownUncommittedDataMutation::Planning(error) => AddFilesFailure::from_connector(error),
         KnownUncommittedDataMutation::Provider(failure) => project_mutation_failure(failure),
-    };
-    projected.message =
-        crate::connector::mutation::known_uncommitted_message(&projected.message, &cleanup);
-    projected
-}
-
-fn project_connector_error(error: ConnectorError) -> AddFilesFailure {
-    AddFilesFailure {
-        kind: match error.kind() {
-            ConnectorErrorKind::Interrupted => AddFilesFailureKind::Interrupted(
-                novarocks_type_contract::CompileControlError::Source(
-                    novarocks_failure_contract::SharedFailureCause::new(error.clone()),
-                ),
-            ),
-            ConnectorErrorKind::InvalidRequest => AddFilesFailureKind::InvalidRequest,
-            ConnectorErrorKind::NotFound => AddFilesFailureKind::NotFound,
-            ConnectorErrorKind::PermissionDenied => AddFilesFailureKind::PermissionDenied,
-            ConnectorErrorKind::Unsupported => AddFilesFailureKind::Unsupported,
-            ConnectorErrorKind::Cancelled => AddFilesFailureKind::Cancelled,
-            ConnectorErrorKind::DeadlineExceeded => AddFilesFailureKind::DeadlineExceeded,
-            ConnectorErrorKind::ResourceExhausted => AddFilesFailureKind::ResourceExhausted,
-            ConnectorErrorKind::Unavailable => AddFilesFailureKind::Unavailable,
-            ConnectorErrorKind::CorruptData => AddFilesFailureKind::CorruptData,
-            ConnectorErrorKind::Internal => AddFilesFailureKind::Internal,
-        },
-        message: error.to_string(),
     }
 }
 
 fn project_mutation_failure(failure: ConnectorMutationFailure) -> AddFilesFailure {
-    AddFilesFailure {
-        kind: match failure.kind() {
-            ConnectorMutationFailureKind::Interrupted => AddFilesFailureKind::Interrupted(
-                novarocks_type_contract::CompileControlError::Source(
-                    novarocks_failure_contract::SharedFailureCause::new(failure.clone()),
-                ),
-            ),
-            ConnectorMutationFailureKind::InvalidRequest => AddFilesFailureKind::InvalidRequest,
-            ConnectorMutationFailureKind::NotFound => AddFilesFailureKind::NotFound,
-            ConnectorMutationFailureKind::AlreadyExists => AddFilesFailureKind::AlreadyExists,
-            ConnectorMutationFailureKind::Conflict => AddFilesFailureKind::Conflict,
-            ConnectorMutationFailureKind::Unauthenticated => AddFilesFailureKind::Unauthenticated,
-            ConnectorMutationFailureKind::PermissionDenied => AddFilesFailureKind::PermissionDenied,
-            ConnectorMutationFailureKind::Unsupported => AddFilesFailureKind::Unsupported,
-            ConnectorMutationFailureKind::Cancelled => AddFilesFailureKind::Cancelled,
-            ConnectorMutationFailureKind::DeadlineExceeded => AddFilesFailureKind::DeadlineExceeded,
-            ConnectorMutationFailureKind::ResourceExhausted => {
-                AddFilesFailureKind::ResourceExhausted
-            }
-            ConnectorMutationFailureKind::Unavailable => AddFilesFailureKind::Unavailable,
-            ConnectorMutationFailureKind::CorruptData => AddFilesFailureKind::CorruptData,
-            ConnectorMutationFailureKind::Internal => AddFilesFailureKind::Internal,
-        },
-        message: failure.message().to_string(),
-    }
+    let interrupted = failure.kind() == ConnectorMutationFailureKind::Interrupted;
+    let detail = failure
+        .connector_source()
+        .and_then(authored_procedure_detail)
+        .map(BoundedDetail::truncating);
+    let cause = match detail {
+        Some(detail) => SharedFailureCause::from_bounded_detail(failure, detail),
+        None => SharedFailureCause::new(failure),
+    };
+    AddFilesFailure { cause, interrupted }
 }
 
 fn project_dispatch(dispatch: DataMutationDispatchState) -> AddFilesDispatchState {
@@ -595,7 +586,7 @@ fn project_dispatch(dispatch: DataMutationDispatchState) -> AddFilesDispatchStat
 
 fn project_contract_error(error: ConnectorError, possibly_dispatched: bool) -> AddFilesOutcome {
     AddFilesOutcome::ContractFailure {
-        failure: project_connector_error(error),
+        failure: AddFilesFailure::from_connector(error),
         dispatch: if possibly_dispatched {
             AddFilesDispatchState::PossiblyDispatched
         } else {
@@ -605,15 +596,12 @@ fn project_contract_error(error: ConnectorError, possibly_dispatched: bool) -> A
 }
 
 fn contract_outcome(
-    kind: AddFilesFailureKind,
+    kind: ConnectorErrorKind,
     message: impl Into<String>,
     dispatch: AddFilesDispatchState,
 ) -> AddFilesOutcome {
     AddFilesOutcome::ContractFailure {
-        failure: AddFilesFailure {
-            kind,
-            message: message.into(),
-        },
+        failure: AddFilesFailure::from_connector(ConnectorError::new(kind, message)),
         dispatch,
     }
 }
@@ -682,10 +670,7 @@ mod tests {
         assert!(matches!(
             outcome,
             AddFilesOutcome::KnownCommitted {
-                finalization: AddFilesFinalization::Failed(AddFilesFailure {
-                    kind: AddFilesFailureKind::Internal,
-                    ..
-                }),
+                finalization: AddFilesFinalization::Failed(_),
                 ..
             }
         ));
