@@ -37,7 +37,10 @@ if ! "$workspace/docker/iceberg-rest/spark-shell.sh" "$scala" > "$receipt_dir/pr
   tail -80 "$receipt_dir/prepareRest.log" >&2
   exit 1
 fi
-grep -x 'RWM17C_REST_SOURCE_READY' "$receipt_dir/prepareRest.log"
+if ! tr '\r' '\n' < "$receipt_dir/prepareRest.log" | grep -x 'RWM17C_REST_SOURCE_READY'; then
+  tail -80 "$receipt_dir/prepareRest.log" >&2
+  exit 1
+fi
 
 -- query 2
 -- @be_log_contains=NOVAROCKS_PARTICIPATION_ESTABLISH_APPLIED
@@ -199,7 +202,10 @@ if ! "$workspace/docker/iceberg-rest/spark-shell.sh" "$scala" > "$receipt_dir/ob
   tail -80 "$receipt_dir/observeRest.log" >&2
   exit 1
 fi
-grep -x 'RWM17C_REST_MAPPING_AND_EMPTY_APPEND_VERIFIED' "$receipt_dir/observeRest.log"
+if ! tr '\r' '\n' < "$receipt_dir/observeRest.log" | grep -x 'RWM17C_REST_MAPPING_AND_EMPTY_APPEND_VERIFIED'; then
+  tail -80 "$receipt_dir/observeRest.log" >&2
+  exit 1
+fi
 
 -- query 38
 DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_main_${uuid0};

@@ -38,10 +38,13 @@ if ! "$workspace/docker/iceberg-rest/spark-shell.sh" "$scala" > "$receipt_dir/pr
   tail -80 "$receipt_dir/prepareNested.log" >&2
   exit 1
 fi
-grep -x 'RWM17C_NESTED_SOURCE_READY' "$receipt_dir/prepareNested.log"
+if ! tr '\r' '\n' < "$receipt_dir/prepareNested.log" | grep -x 'RWM17C_NESTED_SOURCE_READY'; then
+  tail -80 "$receipt_dir/prepareNested.log" >&2
+  exit 1
+fi
 
 -- query 2
-SELECT id, details.note AS note, details.flag AS flag, details.fresh AS fresh
+SELECT id, details
 FROM iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_old_${uuid0}
 ORDER BY id;
 
@@ -49,7 +52,7 @@ ORDER BY id;
 ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_registered_${uuid0} EXECUTE add_files(location => '${iceberg_test_warehouse}/rwm17c-nested-${uuid0}/registered.parquet', format => 'PARQUET');
 
 -- query 4
-SELECT id, details.note AS note, details.flag AS flag, details.fresh AS fresh
+SELECT id, details
 FROM iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_registered_${uuid0}
 ORDER BY id;
 
@@ -59,7 +62,7 @@ ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_required_add_${uuid0
 
 -- query 6
 -- @expect_trino_error=GENERIC_USER_ERROR,USER_ERROR
-SELECT details.required_child FROM iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_required_read_${uuid0};
+SELECT details FROM iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_required_read_${uuid0};
 
 -- query 7
 -- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
@@ -70,10 +73,7 @@ ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_mixed_add_${uuid0} E
 SELECT id, note FROM iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_mixed_read_${uuid0};
 
 -- query 9
-SELECT id, details.flag AS flag, details.absent AS absent, details.initialized AS initialized,
-       CASE WHEN items IS NULL THEN NULL ELSE items[1].value END AS first_value,
-       CASE WHEN items IS NULL THEN NULL ELSE items[2] IS NULL END AS null_element,
-       element_at(codes, 'x') AS code
+SELECT id, details, items, codes
 FROM iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_v3_default_${uuid0}
 ORDER BY id;
 

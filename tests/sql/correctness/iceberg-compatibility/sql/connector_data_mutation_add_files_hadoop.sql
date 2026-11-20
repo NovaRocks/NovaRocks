@@ -40,7 +40,10 @@ if ! "$workspace/docker/iceberg-rest/spark-shell.sh" "$scala" > "$receipt_dir/pr
   tail -80 "$receipt_dir/prepareHadoop.log" >&2
   exit 1
 fi
-grep -x 'RWM17C_HADOOP_SOURCE_READY' "$receipt_dir/prepareHadoop.log"
+if ! tr '\r' '\n' < "$receipt_dir/prepareHadoop.log" | grep -x 'RWM17C_HADOOP_SOURCE_READY'; then
+  tail -80 "$receipt_dir/prepareHadoop.log" >&2
+  exit 1
+fi
 
 -- query 2
 CREATE CATALOG rwm17c_hadoop_${uuid0} USING iceberg WITH ("iceberg.catalog.type" = 'hadoop', "iceberg.add-files-procedure.enabled" = 'true', "iceberg.catalog.warehouse" = '${iceberg_test_warehouse}/rwm17c-hadoop-warehouse-${uuid0}', "aws.s3.endpoint" = '${oss_endpoint}', "credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-metadata.name" = '${iceberg_object_store_metadata_credential_name}', "credential.object-store-metadata.generation" = '${iceberg_object_store_credential_generation}', "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-data.name" = '${iceberg_object_store_data_credential_name}', "credential.object-store-data.generation" = '${iceberg_object_store_credential_generation}', "aws.s3.region" = '${oss_region}', "aws.s3.enable_path_style_access" = '${oss_path_style}');
@@ -79,34 +82,33 @@ SELECT new_id, new_note FROM existing_names WHERE new_id = 33;
 ALTER TABLE legacy_array EXECUTE add_files(location => '${iceberg_test_warehouse}/rwm17c-hadoop-sources-${uuid0}/legacy.parquet', format => 'PARQUET');
 
 -- query 9
-SELECT items[1].value AS first_value, items[2] IS NULL AS null_element,
-       items[3].value AS third_value FROM legacy_array;
+SELECT items FROM legacy_array;
 
 -- query 10
 ALTER TABLE metrics EXECUTE add_files(location => '${iceberg_test_warehouse}/rwm17c-hadoop-sources-${uuid0}/metrics.parquet', format => 'PARQUET');
 
 -- query 11
-SELECT id, details.flag AS flag FROM metrics ORDER BY id NULLS LAST;
+SELECT id, details FROM metrics ORDER BY id NULLS LAST;
 
 -- query 12
 SET SESSION enable_connector_static_predicate_pushdown = true;
 
 -- query 13
-SELECT id, details.flag AS flag FROM metrics WHERE id >= 0 OR id IS NULL ORDER BY id NULLS LAST;
+SELECT id, details FROM metrics WHERE id >= 0 OR id IS NULL ORDER BY id NULLS LAST;
 
 -- query 14
 -- @be_log_not_contains=NOVAROCKS_CONNECTOR_UNIT_READER_OPEN
-SELECT id, details.flag AS flag FROM metrics WHERE id < -100 ORDER BY id NULLS LAST;
+SELECT id, details FROM metrics WHERE id = 3000000000 ORDER BY id NULLS LAST;
 
 -- query 15
 SET SESSION enable_connector_static_predicate_pushdown = false;
 
 -- query 16
-SELECT id, details.flag AS flag FROM metrics WHERE id >= 0 OR id IS NULL ORDER BY id NULLS LAST;
+SELECT id, details FROM metrics WHERE id >= 0 OR id IS NULL ORDER BY id NULLS LAST;
 
 -- query 17
 -- @be_log_contains=NOVAROCKS_CONNECTOR_UNIT_READER_OPEN
-SELECT id, details.flag AS flag FROM metrics WHERE id < -100 ORDER BY id NULLS LAST;
+SELECT id, details FROM metrics WHERE id = 3000000000 ORDER BY id NULLS LAST;
 
 -- query 18
 SET SESSION enable_connector_static_predicate_pushdown = true;
@@ -131,7 +133,10 @@ if ! "$workspace/docker/iceberg-rest/spark-shell.sh" "$scala" > "$receipt_dir/ob
   tail -80 "$receipt_dir/observeHadoop.log" >&2
   exit 1
 fi
-grep -x 'RWM17C_HADOOP_MAPPING_AND_JAVA_METRICS_VERIFIED' "$receipt_dir/observeHadoop.log"
+if ! tr '\r' '\n' < "$receipt_dir/observeHadoop.log" | grep -x 'RWM17C_HADOOP_MAPPING_AND_JAVA_METRICS_VERIFIED'; then
+  tail -80 "$receipt_dir/observeHadoop.log" >&2
+  exit 1
+fi
 
 -- query 20
 DROP TABLE automatic_names;

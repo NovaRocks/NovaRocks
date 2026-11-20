@@ -25,9 +25,9 @@ metric_name	metric_value
 added_data_files	1
 
 -- query 9
--- types	integer	boolean	integer
-first_value	null_element	third_value
-17	true	42
+-- types	array(row(value integer))
+items
+[[17],null,[42]]
 
 -- query 10
 -- types	varchar	bigint
@@ -35,31 +35,31 @@ metric_name	metric_value
 added_data_files	1
 
 -- query 11
--- types	bigint	integer
-id	flag
--7	-2
-27	41
-2147483647	83
+-- types	bigint	row(flag integer, comment varchar)
+id	details
+-7	[-2,"aaa"]
+27	[41,"zzz"]
+2147483647	[83,null]
 NULL	NULL
 
 -- query 13
--- types	bigint	integer
-id	flag
-27	41
-2147483647	83
+-- types	bigint	row(flag integer, comment varchar)
+id	details
+27	[41,"zzz"]
+2147483647	[83,null]
 NULL	NULL
 
 -- query 14
--- types	bigint	integer
-id	flag
+-- types	bigint	row(flag integer, comment varchar)
+id	details
 
 -- query 16
--- types	bigint	integer
-id	flag
-27	41
-2147483647	83
+-- types	bigint	row(flag integer, comment varchar)
+id	details
+27	[41,"zzz"]
+2147483647	[83,null]
 NULL	NULL
 
 -- query 17
--- types	bigint	integer
-id	flag
+-- types	bigint	row(flag integer, comment varchar)
+id	details

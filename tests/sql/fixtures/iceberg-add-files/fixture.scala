@@ -279,7 +279,6 @@ object IcebergAddFilesFixture {
       {"field-id":${id("codes")},"names":["codes"],"fields":[
         {"field-id":${id("codes.key")},"names":["key"]},
         {"field-id":${id("codes.value")},"names":["value"]}]}]"""
-    v3.updateProperties().set("schema.name-mapping.default", mapping).commit()
     spark.conf.set("spark.sql.parquet.fieldId.write.enabled", "false")
     spark.conf.set("spark.sql.parquet.writeLegacyFormat", "true")
     val beforeDefault = s"$root/before-default"
@@ -292,6 +291,8 @@ object IcebergAddFilesFixture {
     v3.updateSchema()
       .addColumn("details", "initialized", Types.StringType.get(), Literal.of("seed"))
       .commit()
+    // Install the legacy mapping after Java has assigned the new column ID.
+    v3.updateProperties().set("schema.name-mapping.default", mapping).commit()
     println("RWM17C_NESTED_SOURCE_READY")
   }
 }
