@@ -649,7 +649,6 @@ fn user_location(error: &UserError, sql: &str) -> Option<TrinoErrorLocation> {
 }
 
 #[cfg(test)]
-#[path = "error_tests.rs"]
 mod tests;
 
 #[cfg(test)]
