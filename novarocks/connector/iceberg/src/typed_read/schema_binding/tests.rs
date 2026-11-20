@@ -22,8 +22,8 @@ use arrow::datatypes::Fields;
 
 use super::*;
 use crate::iceberg::spec::{
-    Literal as IcebergLiteral, NestedField, PartitionSpec, PrimitiveType,
-    Schema as IcebergSchema, Struct as IcebergStruct, StructType, Transform, Type,
+    Literal as IcebergLiteral, NestedField, PartitionSpec, PrimitiveType, Schema as IcebergSchema,
+    Struct as IcebergStruct, StructType, Transform, Type,
 };
 use crate::typed_read::column_handle::{IcebergColumnHandle, IcebergColumnHandleParams};
 
@@ -84,12 +84,8 @@ fn metadata_value_struct_keeps_nested_identity_and_values() {
                 1,
                 "payload",
                 Type::Struct(StructType::new(vec![
-                    NestedField::required(
-                        2,
-                        "metadata",
-                        Type::Primitive(PrimitiveType::Binary),
-                    )
-                    .into(),
+                    NestedField::required(2, "metadata", Type::Primitive(PrimitiveType::Binary))
+                        .into(),
                     NestedField::required(3, "value", Type::Primitive(PrimitiveType::Binary))
                         .into(),
                 ])),
@@ -142,8 +138,8 @@ fn a_matching_field_id_binds_to_the_physical_field() {
             .with_metadata(field_id_metadata(1)),
     ]));
     let columns = vec![handle(&schema, 1)];
-    let binding = bind_scan_columns(empty_binding_request(&schema, &file_schema, &columns))
-        .expect("binds");
+    let binding =
+        bind_scan_columns(empty_binding_request(&schema, &file_schema, &columns)).expect("binds");
     assert!(matches!(
         binding.columns()[0].source(),
         IcebergColumnSource::Physical {
@@ -212,8 +208,7 @@ fn a_legacy_file_without_field_ids_binds_through_the_name_mapping() {
         false,
     )]));
     let mapping: NameMapping =
-        serde_json::from_str(r#"[{"names":["legacy_id"],"field-id":1}]"#)
-            .expect("name mapping");
+        serde_json::from_str(r#"[{"names":["legacy_id"],"field-id":1}]"#).expect("name mapping");
     let columns = vec![handle(&schema, 1)];
     let binding = bind_scan_columns(IcebergSchemaBindingRequest {
         table_schema: &schema,
@@ -294,8 +289,8 @@ fn a_missing_column_with_an_initial_default_materializes_it() {
         Field::new("id", DataType::Int64, false).with_metadata(field_id_metadata(1)),
     ]));
     let columns = vec![handle(&schema, 4)];
-    let binding = bind_scan_columns(empty_binding_request(&schema, &file_schema, &columns))
-        .expect("binds");
+    let binding =
+        bind_scan_columns(empty_binding_request(&schema, &file_schema, &columns)).expect("binds");
     assert!(matches!(
         binding.columns()[0].source(),
         IcebergColumnSource::InitialDefault
@@ -326,8 +321,8 @@ fn a_missing_nullable_column_materializes_a_typed_null() {
         Field::new("id", DataType::Int64, false).with_metadata(field_id_metadata(1)),
     ]));
     let columns = vec![handle(&schema, 3)];
-    let binding = bind_scan_columns(empty_binding_request(&schema, &file_schema, &columns))
-        .expect("binds");
+    let binding =
+        bind_scan_columns(empty_binding_request(&schema, &file_schema, &columns)).expect("binds");
     assert!(matches!(
         binding.columns()[0].source(),
         IcebergColumnSource::TypedNull
@@ -443,8 +438,8 @@ fn an_int_column_promotes_to_long_when_it_is_materialized() {
         Field::new("id", DataType::Int32, false).with_metadata(field_id_metadata(1)),
     ]));
     let columns = vec![handle(&schema, 1)];
-    let binding = bind_scan_columns(empty_binding_request(&schema, &file_schema, &columns))
-        .expect("binds");
+    let binding =
+        bind_scan_columns(empty_binding_request(&schema, &file_schema, &columns)).expect("binds");
     let batch = RecordBatch::try_new(
         Arc::clone(&file_schema),
         vec![Arc::new(Int32Array::from(vec![5_i32, 6]))],
@@ -492,8 +487,8 @@ fn a_nested_projection_dereferences_by_field_id_and_keeps_parent_nulls() {
         .dereference(&[21])
         .expect("nested handle");
     let columns = vec![projected];
-    let binding = bind_scan_columns(empty_binding_request(&schema, &file_schema, &columns))
-        .expect("binds");
+    let binding =
+        bind_scan_columns(empty_binding_request(&schema, &file_schema, &columns)).expect("binds");
 
     let counts: ArrayRef = Arc::new(Int64Array::from(vec![Some(3_i64), Some(4)]));
     let detail = StructArray::new(
@@ -623,8 +618,8 @@ fn only_a_row_lineage_column_the_file_stores_joins_the_projection() {
         metadata_handle(IcebergMetadataColumn::RowId),
         metadata_handle(IcebergMetadataColumn::LastUpdatedSequenceNumber),
     ];
-    let binding = bind_scan_columns(empty_binding_request(&schema, &file_schema, &columns))
-        .expect("binds");
+    let binding =
+        bind_scan_columns(empty_binding_request(&schema, &file_schema, &columns)).expect("binds");
 
     assert!(matches!(
         binding.columns()[1].source(),
@@ -656,8 +651,8 @@ fn a_file_without_stored_row_lineage_synthesizes_both_columns() {
         metadata_handle(IcebergMetadataColumn::RowId),
         metadata_handle(IcebergMetadataColumn::LastUpdatedSequenceNumber),
     ];
-    let binding = bind_scan_columns(empty_binding_request(&schema, &file_schema, &columns))
-        .expect("binds");
+    let binding =
+        bind_scan_columns(empty_binding_request(&schema, &file_schema, &columns)).expect("binds");
 
     assert!(matches!(
         binding.columns()[1].source(),
@@ -840,8 +835,7 @@ fn scalar_integer_initial_defaults_and_missing_nulls_have_exact_domains() {
     for (default, expected) in [(Some(32767), Some(32767_i16)), (None, None)] {
         let mut field = NestedField::optional(21, "small", Type::Primitive(PrimitiveType::Int));
         if let Some(value) = default {
-            field =
-                field.with_initial_default(Literal::Primitive(PrimitiveLiteral::Int(value)));
+            field = field.with_initial_default(Literal::Primitive(PrimitiveLiteral::Int(value)));
         }
         let schema = IcebergSchema::builder()
             .with_fields(vec![Arc::new(field)])
@@ -851,8 +845,7 @@ fn scalar_integer_initial_defaults_and_missing_nulls_have_exact_domains() {
             .with_scalar_integer_domain(Some(ScalarIntegerDomain::Int16))
             .unwrap()];
         let empty = Arc::new(ArrowSchema::empty());
-        let binding =
-            bind_scan_columns(empty_binding_request(&schema, &empty, &columns)).unwrap();
+        let binding = bind_scan_columns(empty_binding_request(&schema, &empty, &columns)).unwrap();
         let batch = RecordBatch::try_new_with_options(
             empty,
             vec![],
@@ -962,12 +955,11 @@ fn nominal_targets_preserve_physical_buffers_nulls_and_repeated_occurrences() {
         // physical column handles remain domain-free.
         let mut request = |_: std::alloc::Layout| Ok(());
         let mut work = |_: usize| Ok(());
-        let mut creation =
-            novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation::new(
-                novarocks_type_contract::ValueTypeStorageLifetime::pure(),
-                &mut request,
-                &mut work,
-            );
+        let mut creation = novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation::new(
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            &mut request,
+            &mut work,
+        );
         let value = crate::schema_mapping::typed_value::from_declaration(
             schema.as_struct().fields()[0].field_type.as_ref(),
             true,
@@ -1021,12 +1013,10 @@ fn nominal_largeint_defaults_keep_original_refusal_and_missing_nulls() {
     use crate::schema_mapping::nominal_declaration::NominalSourceDomain;
     use arrow::array::FixedSizeBinaryArray;
     for default in [Some(i128::MIN.to_be_bytes()), None] {
-        let mut field =
-            NestedField::optional(23, "n", Type::Primitive(PrimitiveType::Fixed(16)));
+        let mut field = NestedField::optional(23, "n", Type::Primitive(PrimitiveType::Fixed(16)));
         if let Some(bytes) = default {
-            field = field.with_initial_default(Literal::Primitive(PrimitiveLiteral::Binary(
-                bytes.to_vec(),
-            )));
+            field = field
+                .with_initial_default(Literal::Primitive(PrimitiveLiteral::Binary(bytes.to_vec())));
         }
         let schema = IcebergSchema::builder()
             .with_fields(vec![Arc::new(field)])
@@ -1035,12 +1025,11 @@ fn nominal_largeint_defaults_keep_original_refusal_and_missing_nulls() {
         let columns = [handle(&schema, 23)];
         let mut request = |_: std::alloc::Layout| Ok(());
         let mut work = |_: usize| Ok(());
-        let mut creation =
-            novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation::new(
-                novarocks_type_contract::ValueTypeStorageLifetime::pure(),
-                &mut request,
-                &mut work,
-            );
+        let mut creation = novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation::new(
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            &mut request,
+            &mut work,
+        );
         let value = crate::schema_mapping::typed_value::from_declaration(
             schema.as_struct().fields()[0].field_type.as_ref(),
             true,
@@ -1054,8 +1043,7 @@ fn nominal_largeint_defaults_keep_original_refusal_and_missing_nulls() {
             novarocks_type_contract::ValueLogicalType::LargeInt
         );
         let empty = Arc::new(ArrowSchema::empty());
-        let binding =
-            bind_scan_columns(empty_binding_request(&schema, &empty, &columns)).unwrap();
+        let binding = bind_scan_columns(empty_binding_request(&schema, &empty, &columns)).unwrap();
         assert!(
             !binding.columns()[0]
                 .target()

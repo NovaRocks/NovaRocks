@@ -289,6 +289,10 @@ pub struct IcebergMetadataContext {
 
 #[allow(dead_code)]
 impl IcebergMetadataContext {
+    pub(crate) fn parquet_read_defaults(&self) -> crate::catalog_config::IcebergCatalogReadConfig {
+        self.control_state.configuration().read
+    }
+
     /// Construct one fully local provider generation.  REST and HMS client
     /// initialization is polled only through the runtime injected by server
     /// composition, so factory construction remains deterministic in every

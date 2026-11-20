@@ -5,12 +5,13 @@ domain: [provider-spi, filesystem]
 status: active
 supersedes: []
 superseded-by: null
+partially-superseded-by: [ADR-0245]
 date: 2026-07-29
 provenance:
   - "discussion: 2026-07-29 connector read and file foundation separation"
 code-anchors:
   - "novarocks/fs/src/lib.rs (crate boundary)"
-  - "novarocks/core/src/connector/hdfs.rs (temporary connector adapter)"
+  - "novarocks/fs/src/read.rs (FileReadRequest, ReaderSizing)"
 ---
 
 ## 问题
@@ -29,7 +30,7 @@ Iceberg、未来的 Paimon/Hudi 都需要 local、HDFS、S3、OSS 文件访问�
 
 ## 裁决
 
-采用选项 3。`novarocks-fs` 拥有受绑定的文件访问、range/cache、Parquet/ORC 物理解码、batch budget、物理 pruning DTO、cancellation/deadline 观察和中立指标。它不注册 Connector provider，不依赖 core 或 SPI，不拥有任何 table-format correctness。
+采用选项 3。`novarocks-fs` 拥有受绑定的文件访问、range/cache、Parquet/ORC 物理解码、物理 pruning DTO、cancellation/deadline 观察和中立指标。它不注册 Connector provider，不依赖 core 或 SPI，不拥有任何 table-format correctness。原批预算归属由 [ADR-0245](ADR-0245-parquet-reader-sizing-and-scan-output-policy.md) 部分替代。FS 确定 reader 打开时的批粒度，最终输出前缀由实际 producer 按引擎政策组装。
 
 Connector 负责把启动期 credential/config 绑定为进程内 access handle，并在其自身 reader 内完成 snapshot、delete/DV、schema evolution 和 virtual column correctness。Core 只消费 Connector 已完成 correctness 的 `RecordBatch`，并负责 SQL execution semantics。
 

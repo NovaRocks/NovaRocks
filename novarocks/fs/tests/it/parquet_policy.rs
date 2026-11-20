@@ -160,7 +160,7 @@ fn bad_last_arrow_hint_is_not_a_fallback_and_skip_policy_ignores_all_hints() {
     ));
     let mut reader = open_file_reader_with_parquet_inspection(request, Some(&inspection))
         .expect("same skip policy for decoder");
-    let batches = common::collect(reader.as_mut()).expect("read physical data");
+    let batches = crate::common::collect(reader.as_mut()).expect("read physical data");
     assert_eq!(
         batches
             .iter()

@@ -21,6 +21,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use arrow::array::StringArray;
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 use novarocks_fs::{
     FileCancellation, FileIoRuntime, FileIoSpawner, FileRangeScope, FileRangeService,
@@ -35,9 +36,10 @@ use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use parquet::file::properties::WriterProperties;
 
 use super::*;
-use crate::iceberg::spec::{
-    NestedField, PrimitiveType, Schema as IcebergSchema, Transform, Type,
-};
+
+mod dictionary_output;
+mod output_policy;
+use crate::iceberg::spec::{NestedField, PrimitiveType, Schema as IcebergSchema, Transform, Type};
 use crate::typed_read::schema_binding::IcebergMetadataColumn;
 use crate::typed_read::split::{
     IcebergDeleteFile, IcebergDeleteFileContent, IcebergDeleteFileParams, IcebergSplitParams,
@@ -58,6 +60,7 @@ fn read_context(runtime: &tokio::runtime::Runtime) -> FileReadContext {
     let io_spawner: Arc<dyn FileIoSpawner> =
         Arc::new(TokioFileIoSpawner::new(runtime.handle().clone()));
     FileReadContext {
+        turn: None,
         cancellation: FileCancellation::new(),
         deadline: Some(Instant::now() + Duration::from_secs(60)),
         runtime: file_runtime,
@@ -491,11 +494,17 @@ impl Harness {
             access_binding: self.binding.clone(),
             context: self.context.clone(),
             cache: None,
-            budget: FileReadBudget {
-                max_rows: NonZeroUsize::new(1024).expect("nonzero"),
-                max_bytes: NonZeroUsize::new(8 * 1024 * 1024).expect("nonzero"),
+            budget: ReaderSizing {
+                max_read_rows: NonZeroUsize::new(1024).expect("nonzero"),
+                max_read_bytes: 8 * 1024 * 1024,
             },
-            reader_options: FileReaderOptions::default(),
+            reader_options: FileReaderOptions {
+                parquet_interpretation_policy:
+                    novarocks_fs::ParquetInterpretationPolicy::DerivedByteRepresentation {
+                        preserve_top_level_dictionary: false,
+                    },
+                ..Default::default()
+            },
             scheduled_split_sequence_id: 0,
             dynamic_filter: Arc::new(
                 novarocks_spi::connector::read_stack::CompleteAllDynamicFilter::new(
@@ -504,6 +513,7 @@ impl Harness {
             ) as Arc<IcebergDynamicFilter>,
             prepared_input: None,
             pending_preparation_control: None,
+            output_projection: None,
         };
         let stream = create_iceberg_page_stream(request, &budget)?;
         Ok(DrivenStream::new(&self._runtime, stream, budget))
@@ -588,8 +598,7 @@ struct TestFilterState {
 
 impl TestDynamicFilter {
     fn new(covered_field_id: i32, schema: &IcebergSchema) -> Arc<Self> {
-        let handle =
-            IcebergColumnHandle::base_column_of(schema, covered_field_id).expect("handle");
+        let handle = IcebergColumnHandle::base_column_of(schema, covered_field_id).expect("handle");
         Arc::new(Self {
             covered: std::collections::BTreeSet::from([handle]),
             state: Mutex::new(TestFilterState {
@@ -684,15 +693,22 @@ impl Harness {
             access_binding: self.binding.clone(),
             context: self.context.clone(),
             cache: None,
-            budget: FileReadBudget {
-                max_rows: NonZeroUsize::new(1024).expect("nonzero"),
-                max_bytes: NonZeroUsize::new(8 * 1024 * 1024).expect("nonzero"),
+            budget: ReaderSizing {
+                max_read_rows: NonZeroUsize::new(1024).expect("nonzero"),
+                max_read_bytes: 8 * 1024 * 1024,
             },
-            reader_options: FileReaderOptions::default(),
+            reader_options: FileReaderOptions {
+                parquet_interpretation_policy:
+                    novarocks_fs::ParquetInterpretationPolicy::DerivedByteRepresentation {
+                        preserve_top_level_dictionary: false,
+                    },
+                ..Default::default()
+            },
             scheduled_split_sequence_id,
             dynamic_filter,
             prepared_input: None,
             pending_preparation_control: None,
+            output_projection: None,
         };
         let stream = create_iceberg_page_stream(request, &budget)?;
         Ok(DrivenStream::new(&self._runtime, stream, budget))
@@ -1034,6 +1050,7 @@ fn footer_cache_keeps_file_identity_and_checks_stop_on_hit() {
             &harness.context,
             &harness.file_name,
             harness.file_size,
+            novarocks_fs::ParquetInterpretationPolicy::SkipArrowHint,
         )
         .expect("first footer");
     let replacement_size = write_data_file(Path::new(&harness.file_name), 2);
@@ -1045,6 +1062,7 @@ fn footer_cache_keeps_file_identity_and_checks_stop_on_hit() {
             &harness.context,
             &harness.file_name,
             replacement_size,
+            novarocks_fs::ParquetInterpretationPolicy::SkipArrowHint,
         )
         .expect("different identity footer");
     assert_eq!(harness.footers.len().expect("footer count"), 2);
@@ -1057,6 +1075,7 @@ fn footer_cache_keeps_file_identity_and_checks_stop_on_hit() {
             &harness.context,
             &harness.file_name,
             harness.file_size,
+            novarocks_fs::ParquetInterpretationPolicy::SkipArrowHint,
         )
         .expect_err("stopped request cannot use cached footer");
     assert_eq!(error.kind(), ConnectorErrorKind::Cancelled);
@@ -1159,8 +1178,7 @@ fn absolute_row_positions_survive_row_group_pruning() {
     let ids = drain_ids(&mut source);
     assert_eq!(
         ids,
-        (1_000 + 2 * ROWS_PER_GROUP as i64..1_000 + 3 * ROWS_PER_GROUP as i64)
-            .collect::<Vec<_>>()
+        (1_000 + 2 * ROWS_PER_GROUP as i64..1_000 + 3 * ROWS_PER_GROUP as i64).collect::<Vec<_>>()
     );
 }
 
@@ -1562,15 +1580,22 @@ impl Harness {
                 access_binding: self.binding.clone(),
                 context: self.context.clone(),
                 cache: None,
-                budget: FileReadBudget {
-                    max_rows: NonZeroUsize::new(1024).expect("nonzero"),
-                    max_bytes: NonZeroUsize::new(8 * 1024 * 1024).expect("nonzero"),
+                budget: ReaderSizing {
+                    max_read_rows: NonZeroUsize::new(1024).expect("nonzero"),
+                    max_read_bytes: 8 * 1024 * 1024,
                 },
-                reader_options: FileReaderOptions::default(),
+                reader_options: FileReaderOptions {
+                    parquet_interpretation_policy:
+                        novarocks_fs::ParquetInterpretationPolicy::DerivedByteRepresentation {
+                            preserve_top_level_dictionary: false,
+                        },
+                    ..Default::default()
+                },
                 scheduled_split_sequence_id: 0,
                 dynamic_filter,
                 prepared_input: None,
                 pending_preparation_control: None,
+                output_projection: None,
             },
             budget,
         )
@@ -1932,9 +1957,7 @@ fn each_open_phase_of_a_stream_waits_on_its_own_read() {
             let mut released = 0;
             loop {
                 match futures::poll!(stream.next()) {
-                    std::task::Poll::Ready(Some(page)) => {
-                        ids.extend(page_ids(page.expect("page")))
-                    }
+                    std::task::Poll::Ready(Some(page)) => ids.extend(page_ids(page.expect("page"))),
                     std::task::Poll::Ready(None) => return (ids, released),
                     std::task::Poll::Pending => {
                         // A pending stream waits on the one read it

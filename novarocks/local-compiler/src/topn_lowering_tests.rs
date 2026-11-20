@@ -832,11 +832,7 @@ mod scan_split {
     use novarocks_type_contract::{
         CompileCheckpoints, CompileControlError, CompilePhase, EvaluationDemand, PureCompileControl,
     };
-    use std::{
-        collections::BTreeMap,
-        num::{NonZeroU64, NonZeroUsize},
-        sync::Arc,
-    };
+    use std::{collections::BTreeMap, num::NonZeroUsize, sync::Arc};
 
     const PRODUCER: FragmentId = FragmentId::new(1);
     const CONSUMER: FragmentId = FragmentId::new(2);
@@ -999,10 +995,6 @@ mod scan_split {
                             ordering: Box::default(),
                         },
                     })),
-                    read_budget: ScanReadBudget {
-                        max_batch_rows: 100,
-                        max_batch_bytes: 4096,
-                    },
                     provider_outputs: columns
                         .iter()
                         .cloned()
@@ -1174,8 +1166,6 @@ mod scan_split {
             TupleDomain::all(),
             None,
             vec![],
-            NonZeroU64::new(100).unwrap(),
-            NonZeroU64::new(4096).unwrap(),
         )
         .unwrap();
         let source = ConnectorReadStaticFacts::try_new(

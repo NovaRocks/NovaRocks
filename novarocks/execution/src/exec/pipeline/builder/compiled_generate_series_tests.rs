@@ -653,6 +653,7 @@ fn compiled_series_schema_and_slice_use_actual_creator_without_retaining_program
         Arc::clone(&program),
         program.graph().root(),
         Arc::new(RuntimeErrorState::default()),
+        std::num::NonZeroU32::MIN,
     )
     .unwrap();
     let mut missing = factory.create(1, 0);
@@ -722,6 +723,7 @@ fn compiled_series_prepare_keeps_typed_first_memory_refusal_without_later_constr
         Arc::clone(&program),
         program.graph().root(),
         Arc::new(RuntimeErrorState::default()),
+        std::num::NonZeroU32::MIN,
     )
     .unwrap();
     let tracker = MemTracker::new_root("series first schema refusal");

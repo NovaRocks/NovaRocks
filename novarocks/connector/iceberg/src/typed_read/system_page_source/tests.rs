@@ -28,8 +28,8 @@ use novarocks_spi::connector::read_stack::SchemaTableName;
 
 use crate::iceberg::spec::{
     DataFileBuilder, DataFileFormat, FormatVersion, ManifestListWriter, ManifestWriterBuilder,
-    NestedField, Operation, PartitionSpec, Snapshot, SnapshotReference, SortOrder, Struct,
-    Summary, TableMetadataBuilder, Transform,
+    NestedField, Operation, PartitionSpec, Snapshot, SnapshotReference, SortOrder, Struct, Summary,
+    TableMetadataBuilder, Transform,
 };
 use crate::typed_read::system_table::{
     IcebergSystemTableReferenceParams, SystemManifestSplitParams, TrinoManifestFileParams,
@@ -56,6 +56,7 @@ fn runtime_and_binding() -> (tokio::runtime::Runtime, IcebergReadBinding, FileRe
         Arc::clone(&io_spawner),
     );
     let context = FileReadContext {
+        turn: None,
         cancellation: FileCancellation::new(),
         deadline: Some(Instant::now() + Duration::from_secs(60)),
         runtime: file_runtime,
@@ -65,10 +66,7 @@ fn runtime_and_binding() -> (tokio::runtime::Runtime, IcebergReadBinding, FileRe
     (runtime, binding, context)
 }
 
-fn provider(
-    binding: &IcebergReadBinding,
-    context: &FileReadContext,
-) -> IcebergSystemTableProvider {
+fn provider(binding: &IcebergReadBinding, context: &FileReadContext) -> IcebergSystemTableProvider {
     IcebergSystemTableProvider::new(
         binding.clone(),
         context.clone(),
@@ -156,8 +154,7 @@ fn files_frozen_native_schema_round_trip_keeps_canonical_list_child_identity() {
 fn files_freezes_the_eighteen_public_columns_in_order() {
     let schema = test_schema();
     let specs = vec![identity_spec(&schema, 7, "region")];
-    let relation =
-        system_relation_schema(IcebergSystemTableType::Files, &schema, &specs).unwrap();
+    let relation = system_relation_schema(IcebergSystemTableType::Files, &schema, &specs).unwrap();
     assert_eq!(
         column_names(&relation),
         vec![
@@ -212,8 +209,7 @@ fn files_freezes_the_eighteen_public_columns_in_order() {
 fn files_bounds_keep_the_public_field_id_binary_map() {
     let schema = test_schema();
     let specs = vec![identity_spec(&schema, 7, "region")];
-    let relation =
-        system_relation_schema(IcebergSystemTableType::Files, &schema, &specs).unwrap();
+    let relation = system_relation_schema(IcebergSystemTableType::Files, &schema, &specs).unwrap();
     for name in ["lower_bounds", "upper_bounds"] {
         let field = relation.field_with_name(name).unwrap();
         assert_eq!(
@@ -301,8 +297,8 @@ fn snapshots_history_refs_and_manifests_freeze_their_exact_shapes() {
     let schema = test_schema();
     let specs = vec![identity_spec(&schema, 7, "region")];
 
-    let snapshots = system_relation_schema(IcebergSystemTableType::Snapshots, &schema, &specs)
-        .expect("schema");
+    let snapshots =
+        system_relation_schema(IcebergSystemTableType::Snapshots, &schema, &specs).expect("schema");
     assert_eq!(
         column_names(&snapshots),
         vec![
@@ -329,8 +325,8 @@ fn snapshots_history_refs_and_manifests_freeze_their_exact_shapes() {
         &map_type(DataType::Utf8, DataType::Utf8)
     );
 
-    let history = system_relation_schema(IcebergSystemTableType::History, &schema, &specs)
-        .expect("schema");
+    let history =
+        system_relation_schema(IcebergSystemTableType::History, &schema, &specs).expect("schema");
     assert_eq!(
         column_names(&history),
         vec![
@@ -372,8 +368,8 @@ fn snapshots_history_refs_and_manifests_freeze_their_exact_shapes() {
         ]
     );
 
-    let manifests = system_relation_schema(IcebergSystemTableType::Manifests, &schema, &specs)
-        .expect("schema");
+    let manifests =
+        system_relation_schema(IcebergSystemTableType::Manifests, &schema, &specs).expect("schema");
     assert_eq!(
         manifests
             .fields()
@@ -470,9 +466,7 @@ fn partition_value_slots_preserve_same_name_case_and_generated_name_collisions()
     ] {
         let output_schema = system_relation_schema(kind, &schema, &specs).unwrap();
         let columns = match kind {
-            IcebergSystemTableType::Files => {
-                files_columns(&output_schema, &rows, &schema).unwrap()
-            }
+            IcebergSystemTableType::Files => files_columns(&output_schema, &rows, &schema).unwrap(),
             IcebergSystemTableType::Entries => {
                 entries_columns(&output_schema, &rows, &schema).unwrap()
             }
@@ -652,25 +646,24 @@ async fn build_warehouse_with_deletes(
             spec.clone(),
         )
         .build_v2_deletes();
-        let delete =
-            |path: &str, content: DataContentType, region: &str, target: Option<&str>| {
-                let mut builder = DataFileBuilder::default();
-                builder
-                    .content(content)
-                    .file_path(path.to_owned())
-                    .file_format(DataFileFormat::Parquet)
-                    .partition(Struct::from_iter([Some(Literal::string(region))]))
-                    .partition_spec_id(0)
-                    .record_count(1)
-                    .file_size_in_bytes(128);
-                if content == DataContentType::EqualityDeletes {
-                    builder.equality_ids(Some(vec![1]));
-                }
-                if let Some(target) = target {
-                    builder.referenced_data_file(Some(target.to_owned()));
-                }
-                builder.build().unwrap()
-            };
+        let delete = |path: &str, content: DataContentType, region: &str, target: Option<&str>| {
+            let mut builder = DataFileBuilder::default();
+            builder
+                .content(content)
+                .file_path(path.to_owned())
+                .file_format(DataFileFormat::Parquet)
+                .partition(Struct::from_iter([Some(Literal::string(region))]))
+                .partition_spec_id(0)
+                .record_count(1)
+                .file_size_in_bytes(128);
+            if content == DataContentType::EqualityDeletes {
+                builder.equality_ids(Some(vec![1]));
+            }
+            if let Some(target) = target {
+                builder.referenced_data_file(Some(target.to_owned()));
+            }
+            builder.build().unwrap()
+        };
         writer
             .add_file(
                 delete(
@@ -905,8 +898,7 @@ fn manifest_splits(
         .map(|spec| {
             Ok((
                 spec.spec_id(),
-                serde_json::to_string(spec.as_ref())
-                    .map_err(|error| invalid(error.to_string()))?,
+                serde_json::to_string(spec.as_ref()).map_err(|error| invalid(error.to_string()))?,
             ))
         })
         .collect::<Result<std::collections::BTreeMap<_, _>, ConnectorError>>()?;
@@ -919,9 +911,7 @@ fn manifest_splits(
         .map(|manifest| {
             SystemManifestSplit::try_new(SystemManifestSplitParams {
                 reference: reference.clone(),
-                table_has_variant_history: crate::manifest::table_has_variant_history(
-                    &metadata,
-                ),
+                table_has_variant_history: crate::manifest::table_has_variant_history(&metadata),
                 manifest,
                 table_schema_json: serde_json::to_string(schema.as_ref())
                     .map_err(|error| invalid(error.to_string()))?,
@@ -1179,11 +1169,9 @@ fn entries_reads_each_manifest_once_and_keeps_deleted_rows() {
     );
     let splits = manifest_splits(&runtime, &provider, &reference).unwrap();
     assert_eq!(splits.len(), 2);
-    let schema = system_relation_schema_with_metadata(
-        IcebergSystemTableType::Entries,
-        &warehouse.metadata,
-    )
-    .unwrap();
+    let schema =
+        system_relation_schema_with_metadata(IcebergSystemTableType::Entries, &warehouse.metadata)
+            .unwrap();
     let columns = all_columns(&schema);
     let mut statuses = Vec::new();
     let mut paths = Vec::new();
@@ -1328,8 +1316,7 @@ fn files_materializes_one_manifest_split_with_public_binary_bounds() {
     let provider = provider(&binding, &context);
 
     let mut reader = FrozenMetadataReader::new(&binding, &context);
-    let files_reference =
-        reference(&warehouse, IcebergSystemTableType::Files, Some(SNAPSHOT_ID));
+    let files_reference = reference(&warehouse, IcebergSystemTableType::Files, Some(SNAPSHOT_ID));
     let metadata = runtime
         .block_on(reader.load_metadata(&files_reference))
         .expect("metadata");
@@ -1354,10 +1341,8 @@ fn files_materializes_one_manifest_split_with_public_binary_bounds() {
         table_has_variant_history: false,
         manifest: manifests[0].clone(),
         table_schema_json: serde_json::to_string(&schema).expect("schema json"),
-        metadata_table_schema_json: files_relation_schema_json_with_metadata(
-            &warehouse.metadata,
-        )
-        .expect("frozen files declaration"),
+        metadata_table_schema_json: files_relation_schema_json_with_metadata(&warehouse.metadata)
+            .expect("frozen files declaration"),
         partition_spec_jsons: specs
             .iter()
             .map(|spec| {
@@ -1367,11 +1352,9 @@ fn files_materializes_one_manifest_split_with_public_binary_bounds() {
                 )
             })
             .collect(),
-        partition_slot_field_ids: crate::partition_row::UnifiedPartitionRow::of(
-            &schema, &specs,
-        )
-        .unwrap()
-        .field_ids(),
+        partition_slot_field_ids: crate::partition_row::UnifiedPartitionRow::of(&schema, &specs)
+            .unwrap()
+            .field_ids(),
         partition_column_type_json: partition_row_type_with_metadata(&warehouse.metadata)
             .expect("partition declaration")
             .as_ref()
@@ -1383,13 +1366,10 @@ fn files_materializes_one_manifest_split_with_public_binary_bounds() {
     })
     .expect("split");
 
-    let relation = system_relation_schema_with_metadata(
-        IcebergSystemTableType::Files,
-        &warehouse.metadata,
-    )
-    .expect("schema");
-    let pages =
-        files_pages(&runtime, &provider, &split, &all_columns(&relation)).expect("pages");
+    let relation =
+        system_relation_schema_with_metadata(IcebergSystemTableType::Files, &warehouse.metadata)
+            .expect("schema");
+    let pages = files_pages(&runtime, &provider, &split, &all_columns(&relation)).expect("pages");
     let columns = &pages[0];
     assert_eq!(columns.len(), 18);
     assert_eq!(columns[0].len(), 2);
@@ -1644,8 +1624,7 @@ fn first_manifest_split(
     warehouse: &Warehouse,
 ) -> (SystemManifestSplit, Vec<IcebergColumnHandle>) {
     let mut reader = FrozenMetadataReader::new(binding, context);
-    let files_reference =
-        reference(warehouse, IcebergSystemTableType::Files, Some(SNAPSHOT_ID));
+    let files_reference = reference(warehouse, IcebergSystemTableType::Files, Some(SNAPSHOT_ID));
     let metadata = runtime
         .block_on(reader.load_metadata(&files_reference))
         .expect("metadata");
@@ -1669,10 +1648,8 @@ fn first_manifest_split(
         table_has_variant_history: false,
         manifest: manifests[0].clone(),
         table_schema_json: serde_json::to_string(&schema).expect("schema json"),
-        metadata_table_schema_json: files_relation_schema_json_with_metadata(
-            &warehouse.metadata,
-        )
-        .expect("frozen files declaration"),
+        metadata_table_schema_json: files_relation_schema_json_with_metadata(&warehouse.metadata)
+            .expect("frozen files declaration"),
         partition_spec_jsons: specs
             .iter()
             .map(|spec| {
@@ -1682,11 +1659,9 @@ fn first_manifest_split(
                 )
             })
             .collect(),
-        partition_slot_field_ids: crate::partition_row::UnifiedPartitionRow::of(
-            &schema, &specs,
-        )
-        .unwrap()
-        .field_ids(),
+        partition_slot_field_ids: crate::partition_row::UnifiedPartitionRow::of(&schema, &specs)
+            .unwrap()
+            .field_ids(),
         partition_column_type_json: partition_row_type_with_metadata(&warehouse.metadata)
             .expect("partition declaration")
             .as_ref()
@@ -1697,11 +1672,9 @@ fn first_manifest_split(
         encryption_key_id: None,
     })
     .expect("split");
-    let relation = system_relation_schema_with_metadata(
-        IcebergSystemTableType::Files,
-        &warehouse.metadata,
-    )
-    .expect("schema");
+    let relation =
+        system_relation_schema_with_metadata(IcebergSystemTableType::Files, &warehouse.metadata)
+            .expect("schema");
     (split, all_columns(&relation))
 }
 
@@ -1772,20 +1745,16 @@ fn renamed_partition_has_one_type_across_alias_provider_frozen_split_and_be() {
         serde_json::to_vec(&warehouse.metadata).unwrap(),
     )
     .unwrap();
-    let expected = DataType::Struct(
-        vec![Arc::new(Field::new("renamed_region", DataType::Utf8, true))].into(),
-    );
+    let expected =
+        DataType::Struct(vec![Arc::new(Field::new("renamed_region", DataType::Utf8, true))].into());
     assert_eq!(
         partition_row_type_with_metadata(&warehouse.metadata).unwrap(),
         Some(expected.clone())
     );
     let mut request = |_| Ok(());
     let mut work = |_| Ok(());
-    let mut creation = ConnectorReadSchemaCreation::new(
-        ValueTypeStorageLifetime::pure(),
-        &mut request,
-        &mut work,
-    );
+    let mut creation =
+        ConnectorReadSchemaCreation::new(ValueTypeStorageLifetime::pure(), &mut request, &mut work);
     let alias = crate::metadata_batch_reader::metadata_table_output_columns(
         crate::metadata_batch_reader::MetadataTableType::Files,
         &warehouse.metadata,
@@ -1793,11 +1762,9 @@ fn renamed_partition_has_one_type_across_alias_provider_frozen_split_and_be() {
     )
     .unwrap();
     let alias = crate::metadata_batch_reader::metadata_output_schema(&alias).unwrap();
-    let provider_schema = system_relation_schema_with_metadata(
-        IcebergSystemTableType::Files,
-        &warehouse.metadata,
-    )
-    .unwrap();
+    let provider_schema =
+        system_relation_schema_with_metadata(IcebergSystemTableType::Files, &warehouse.metadata)
+            .unwrap();
     assert_eq!(alias.fields(), provider_schema.fields());
     assert_eq!(
         provider_schema
@@ -1844,8 +1811,7 @@ fn assert_metadata_columns_compile(
             Ok(())
         }
     }
-    let mut checkpoints =
-        CompileCheckpoints::try_new(&Active, CompilePhase::LowerProgram).unwrap();
+    let mut checkpoints = CompileCheckpoints::try_new(&Active, CompilePhase::LowerProgram).unwrap();
     for (column, field) in columns.iter().zip(schema.fields()) {
         system_column_field_for_compile(
             kind,
@@ -1876,8 +1842,7 @@ fn assert_historical_manifest_summary(
         &warehouse.metadata,
     )
     .unwrap();
-    let pages =
-        single_backend_pages(runtime, provider, &reference, &all_columns(&schema)).unwrap();
+    let pages = single_backend_pages(runtime, provider, &reference, &all_columns(&schema)).unwrap();
     let summaries = pages[0][11].as_any().downcast_ref::<ListArray>().unwrap();
     for ordinal in 0..count {
         let value = summaries.value(ordinal);
@@ -1946,13 +1911,9 @@ fn dropped_partition_source_is_absent_from_all_metadata_authors_and_runtime() {
         .unwrap();
         let alias = crate::metadata_batch_reader::metadata_output_schema(&alias).unwrap();
         let borrowed = columns.iter().collect::<Vec<_>>();
-        let public = publish_read_schema_with_metadata(
-            kind,
-            &borrowed,
-            &warehouse.metadata,
-            &mut creation,
-        )
-        .unwrap();
+        let public =
+            publish_read_schema_with_metadata(kind, &borrowed, &warehouse.metadata, &mut creation)
+                .unwrap();
         assert_eq!(alias.fields(), schema.fields());
         assert_eq!(public.schema().fields(), schema.fields());
         assert_metadata_columns_compile(kind, &columns, &schema);
@@ -1963,13 +1924,10 @@ fn dropped_partition_source_is_absent_from_all_metadata_authors_and_runtime() {
         IcebergSystemTableType::Entries,
         Some(SNAPSHOT_ID),
     );
-    let schema = system_relation_schema_with_metadata(
-        IcebergSystemTableType::Entries,
-        &warehouse.metadata,
-    )
-    .unwrap();
-    let pages =
-        single_backend_pages(&runtime, &provider, &entries, &all_columns(&schema)).unwrap();
+    let schema =
+        system_relation_schema_with_metadata(IcebergSystemTableType::Entries, &warehouse.metadata)
+            .unwrap();
+    let pages = single_backend_pages(&runtime, &provider, &entries, &all_columns(&schema)).unwrap();
     assert_eq!(pages[0].len(), 21);
     assert_eq!(pages[0][0].len(), 3);
     let (split, columns) = first_manifest_split(&runtime, &binding, &context, &warehouse);
@@ -1982,10 +1940,7 @@ fn dropped_partition_source_is_absent_from_all_metadata_authors_and_runtime() {
 
 /// Real Avro facts retain the same source through Int -> Long -> removal.
 /// Both physical literal widths occur under the same spec in one snapshot.
-async fn build_promoted_partition_warehouse(
-    dir: &Path,
-    binding: IcebergReadBinding,
-) -> Warehouse {
+async fn build_promoted_partition_warehouse(dir: &Path, binding: IcebergReadBinding) -> Warehouse {
     let location = format!("file://{}", dir.display());
     std::fs::create_dir_all(dir.join("metadata")).unwrap();
     let schema = |id, region| {
@@ -2172,13 +2127,9 @@ fn dropped_promoted_partition_source_has_no_canonical_slot_or_output_column() {
         .unwrap();
         let alias = crate::metadata_batch_reader::metadata_output_schema(&alias).unwrap();
         let borrowed = columns.iter().collect::<Vec<_>>();
-        let public = publish_read_schema_with_metadata(
-            kind,
-            &borrowed,
-            &warehouse.metadata,
-            &mut creation,
-        )
-        .unwrap();
+        let public =
+            publish_read_schema_with_metadata(kind, &borrowed, &warehouse.metadata, &mut creation)
+                .unwrap();
         assert_eq!(alias.fields(), schema.fields());
         assert_eq!(public.schema().fields(), schema.fields());
         assert_metadata_columns_compile(kind, &columns, &schema);
@@ -2189,13 +2140,10 @@ fn dropped_promoted_partition_source_has_no_canonical_slot_or_output_column() {
         IcebergSystemTableType::Entries,
         Some(SNAPSHOT_ID),
     );
-    let schema = system_relation_schema_with_metadata(
-        IcebergSystemTableType::Entries,
-        &warehouse.metadata,
-    )
-    .unwrap();
-    let pages =
-        single_backend_pages(&runtime, &provider, &entries, &all_columns(&schema)).unwrap();
+    let schema =
+        system_relation_schema_with_metadata(IcebergSystemTableType::Entries, &warehouse.metadata)
+            .unwrap();
+    let pages = single_backend_pages(&runtime, &provider, &entries, &all_columns(&schema)).unwrap();
     assert_eq!(pages[0].len(), 21);
     assert_eq!(pages[0][0].len(), 3);
     let (split, columns) = first_manifest_split(&runtime, &binding, &context, &warehouse);
@@ -2297,10 +2245,7 @@ impl FileIoSpawner for ManifestReadFailureSpawner {
     }
 }
 
-fn split_with_variant_history(
-    split: &SystemManifestSplit,
-    history: bool,
-) -> SystemManifestSplit {
+fn split_with_variant_history(split: &SystemManifestSplit, history: bool) -> SystemManifestSplit {
     SystemManifestSplit::try_new(SystemManifestSplitParams {
         reference: split.reference().clone(),
         table_has_variant_history: history,
@@ -2390,8 +2335,7 @@ fn injected_manifest_read_preserves_failure(
         message,
         attempts: std::sync::atomic::AtomicUsize::new(0),
     });
-    let operations =
-        route_reads_through(&mut context, spawner.clone(), runtime.handle().clone());
+    let operations = route_reads_through(&mut context, spawner.clone(), runtime.handle().clone());
     let original = runtime
         .block_on(FrozenMetadataReader::new(&binding, &context).load_manifest(split.manifest()))
         .expect_err("manifest read dispatch is injected to fail");
@@ -2473,9 +2417,8 @@ fn every_single_backend_stream_emits_what_its_page_source_emits() {
         IcebergSystemTableType::Manifests,
     ] {
         let reference = reference(&warehouse, relation, Some(SNAPSHOT_ID));
-        let schema =
-            system_relation_schema(relation, warehouse.metadata.current_schema(), &specs)
-                .expect("schema");
+        let schema = system_relation_schema(relation, warehouse.metadata.current_schema(), &specs)
+            .expect("schema");
         let columns = all_columns(&schema);
         // One unit for the whole relation, so every later unit of work
         // yields its turn first and the yields count the units spent.

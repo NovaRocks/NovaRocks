@@ -102,8 +102,6 @@ fn input() -> ScanConstructionInput<ConnectorReadRelationRecipeDraft> {
         unenforced_predicate: TupleDomain::all(),
         remaining_expression: None,
         dynamic_filters: vec![],
-        max_batch_rows: NonZeroU64::new(17).unwrap(),
-        max_batch_bytes: NonZeroU64::new(101).unwrap(),
     }
 }
 fn variable() -> ConnectorExpression {
@@ -129,8 +127,6 @@ fn plain(
         i.unenforced_predicate,
         i.remaining_expression,
         i.dynamic_filters,
-        i.max_batch_rows,
-        i.max_batch_bytes,
     )
 }
 fn observed(
@@ -191,8 +187,6 @@ fn observed_scan_preserves_original_law_values_and_detached_expression_container
     let pointer = target.as_ref() as *const _;
     let scan = observed(i, &Control::default()).unwrap();
     assert_eq!(scan, old);
-    assert_eq!(scan.max_batch_rows().get(), 17);
-    assert_eq!(scan.max_batch_bytes().get(), 101);
     assert_eq!(scan.dynamic_filters()[0].filter_id(), u32::MAX);
     let ConnectorExpression::Call {
         function,

@@ -64,11 +64,9 @@ fn close_failure_is_reported_while_sibling_exit_is_still_pending() {
             "actual source operation failed",
         );
         let expected_reader: ExecutionFailure =
-            ConnectorCallFailure::new(ConnectorOperation::CloseReader, reader_error.clone())
-                .into();
+            ConnectorCallFailure::new(ConnectorOperation::CloseReader, reader_error.clone()).into();
         let expected_work: ExecutionFailure =
-            ConnectorCallFailure::new(ConnectorOperation::SourceExit, work_error.clone())
-                .into();
+            ConnectorCallFailure::new(ConnectorOperation::SourceExit, work_error.clone()).into();
         let (send, wait) = futures::channel::oneshot::channel::<ConnectorError>();
         let reader: BoxFuture<'static, Result<(), ConnectorError>> = if reader_first {
             Box::pin(futures::future::ready(Err(reader_error.clone())))
@@ -135,8 +133,7 @@ fn close_failure_is_reported_while_sibling_exit_is_still_pending() {
 }
 
 #[test]
-fn preparation_unknown_reports_cleanup_and_health_before_later_required_and_real_sibling_exit()
-{
+fn preparation_unknown_reports_cleanup_and_health_before_later_required_and_real_sibling_exit() {
     use novarocks_execution::runtime::task::ExecutionFailureReporter;
     use novarocks_spi::connector::{
         ConnectorErrorKind,

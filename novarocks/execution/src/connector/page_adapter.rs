@@ -249,11 +249,11 @@ fn convert_page(
     page.truncate_channels(slot_ids.len()).map_err(|error| {
         PageAdapterError::from_connector(error, "connector page channel projection")
     })?;
-    let (extracted_positions, columns, output_memory) =
-        page.into_accounted_columns().map_err(|error| {
-            PageAdapterError::from_connector(error, "connector page channel materialization")
-        })?;
-    debug_assert_eq!(positions, extracted_positions);
+    let parts = page.into_output_parts();
+    // Keep custody alive until the actual arrays have left on every refusal.
+    let custody = parts.2;
+    let columns = parts.1;
+    debug_assert_eq!(positions, parts.0);
     for (index, column) in columns.iter().enumerate() {
         if let Some(owner) = owner {
             owner.observe(
@@ -284,37 +284,71 @@ fn convert_page(
             owner.observe(index, &[], ArrayNormalizationStep::OpaqueOperationFinished)?;
         }
     }
-    let mut chunk =
-        if let Some(owner) = owner {
-            // The incoming Vec already belongs to the SourcePage. Only actual
-            // normalized wrappers and the new RecordBatch Arc are constructed.
-            Chunk::try_new_typed_with_columns_owned_observed::<ConstructionFailure, _>(
-                Arc::clone(output_schema),
+    let mut chunk = if let Some(owner) = owner {
+        // The incoming Vec already belongs to the SourcePage. Only actual
+        // normalized wrappers and the new RecordBatch Arc are constructed.
+        Chunk::try_new_typed_with_columns_owned_observed::<ConstructionFailure, _>(
+            crate::exec::chunk::ChunkSchema::reconcile_scan_carriers(
+                output_schema,
+                &columns,
+                owner.storage_lifetime(),
+                |layout| owner.request(layout),
+                |occurrence, step| owner.observe(occurrence, &[], step),
+            )?,
+            columns,
+            positions,
+            owner.storage_lifetime(),
+            |step| owner.observe(0, &[], step),
+        )?
+    } else {
+        #[cfg(not(test))]
+        return Err(ConstructionFailure::MissingOwner.into());
+        #[cfg(test)]
+        {
+            // The explicit pure fixture path uses the same complete declaration,
+            // including row count for a zero-channel page; it never derives types.
+            Chunk::try_new_typed_with_columns_observed::<crate::runtime::task::ExecutionFailure, _>(
+                crate::exec::chunk::ChunkSchema::reconcile_scan_carriers::<
+                    crate::runtime::task::ExecutionFailure,
+                >(
+                    output_schema,
+                    &columns,
+                    novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+                    |_| Ok(()),
+                    |_, _| Ok(()),
+                )
+                .map_err(|error| PageAdapterError::new(PageAdapterCause::Chunk, error))?,
                 columns,
                 positions,
-                owner.storage_lifetime(),
-                |step| owner.observe(0, &[], step),
-            )?
-        } else {
-            #[cfg(not(test))]
-            return Err(ConstructionFailure::MissingOwner.into());
-            #[cfg(test)]
-            {
-                // The explicit pure fixture path uses the same complete declaration,
-                // including row count for a zero-channel page; it never derives types.
-                Chunk::try_new_typed_with_columns_observed::<
-                    crate::runtime::task::ExecutionFailure,
-                    _,
-                >(Arc::clone(output_schema), columns, positions, |_| Ok(()))
-                .map_err(|error| PageAdapterError::new(PageAdapterCause::Chunk, error))?
-            }
-        };
+                |_| Ok(()),
+            )
+            .map_err(|error| PageAdapterError::new(PageAdapterCause::Chunk, error))?
+        }
+    };
 
-    let output_memory = if let Some(mut output_memory) = output_memory {
-        output_memory.shrink_to(visible_bytes).map_err(|error| {
+    let has_source = !custody.source_holds.is_empty() && !chunk.columns().is_empty();
+    if has_source {
+        if let Some(owner) = owner {
+            let layout = novarocks_type_contract::owned_resources::layout::arc_layout(
+                std::alloc::Layout::new::<Vec<novarocks_spi::connector::SharedSourceHold>>(),
+            )
+            .map_err(ConstructionFailure::from)?;
+            owner.request(layout)?;
+        }
+        chunk
+            .attach_connector_source_holds(Arc::new(custody.source_holds))
+            .map_err(|error| PageAdapterError::new(PageAdapterCause::Chunk, error))?;
+    }
+    let output_memory = if let Some(mut output_memory) = custody.new_output {
+        let remaining = if has_source {
+            visible_bytes.min(output_memory.bytes())
+        } else {
+            visible_bytes
+        };
+        output_memory.shrink_to(remaining).map_err(|error| {
             PageAdapterError::from_connector(error, "connector page visible output accounting")
         })?;
-        if visible_bytes > 0 {
+        if remaining > 0 {
             Some(output_memory)
         } else {
             None

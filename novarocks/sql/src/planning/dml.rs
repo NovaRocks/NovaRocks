@@ -410,26 +410,16 @@ impl DmlFinalizedWriteTargetSet {
     }
 }
 
-/// One already-negotiated provider read. The fact owns its exact physical scan
-/// occurrence; live readers, leases and credentials remain in the application
-/// runtime sidecar.
-pub struct DmlFinalizedProviderRead {
-    pub fact: crate::compiler::ProviderReadFact,
-    pub read_budget: novarocks_physical_plan::ScanReadBudget,
-}
-
 /// Closed provider-read fact set consumed exactly once by final lowering.
 pub struct DmlFinalizedProviderReadSet(crate::compiler::FinalizedProviderReadSet);
 
 impl DmlFinalizedProviderReadSet {
     pub fn try_new(
-        reads: impl IntoIterator<Item = DmlFinalizedProviderRead>,
+        reads: impl IntoIterator<Item = crate::compiler::ProviderReadFact>,
     ) -> Result<Self, String> {
-        crate::compiler::FinalizedProviderReadSet::try_from_facts(
-            reads.into_iter().map(|read| (read.fact, read.read_budget)),
-        )
-        .map(Self)
-        .map_err(|error| error.to_string())
+        crate::compiler::FinalizedProviderReadSet::try_from_facts(reads)
+            .map(Self)
+            .map_err(|error| error.to_string())
     }
 
     pub fn empty() -> Self {
@@ -4051,7 +4041,7 @@ mod tests {
     pub(super) fn statistics_final_context() -> super::DmlFinalPlanContext {
         use novarocks_physical_plan::{
             ExactInputVersion, PipelineDopDomain, PlanVersionId, ProviderColumnReference,
-            ProviderReadReference, ScanReadBudget, ValueType,
+            ProviderReadReference, ValueType,
         };
         use novarocks_spi::connector::read_stack::ConnectorReadBinding;
         use novarocks_spi::connector::read_stack::value::ConnectorValueType;
@@ -4142,10 +4132,6 @@ mod tests {
                     sql_binding,
                     novarocks_physical_plan::ProviderReadOccurrenceId::new(37),
                     contract,
-                    ScanReadBudget {
-                        max_batch_rows: 1024,
-                        max_batch_bytes: 1 << 20,
-                    },
                 ),
             ),
         )

@@ -42,11 +42,12 @@ use super::runtime::{
     ConnectorReadColumnBinding, ConnectorReadColumnHandle, ConnectorReadConstraint,
     ConnectorReadDynamicFilter, ConnectorReadDynamicFilterSnapshot, ConnectorReadFilterApplication,
     ConnectorReadLimitApplication, ConnectorReadMetadata, ConnectorReadPageSourceProvider,
-    ConnectorReadRelationKind, ConnectorReadRelationVersion, ConnectorReadSplit,
-    ConnectorReadSplitFacts, ConnectorReadSplitManager, ConnectorReadSplitSource,
-    ConnectorReadSystemTablePlan, ConnectorReadTableHandle, ConnectorReadTransactionHandle,
-    binding_error, column_handle, column_value, map_constraint, map_tuple_domain, split_handle,
-    split_value, table_handle, table_value, transaction_handle, transaction_value, type_error,
+    ConnectorReadRelation, ConnectorReadRelationKind, ConnectorReadRelationVersion,
+    ConnectorReadSplit, ConnectorReadSplitFacts, ConnectorReadSplitManager,
+    ConnectorReadSplitSource, ConnectorReadSystemTablePlan, ConnectorReadTableHandle,
+    ConnectorReadTransactionHandle, binding_error, column_handle, column_value, execution_input,
+    execution_value, map_constraint, map_tuple_domain, split_handle, split_value, table_handle,
+    table_value, transaction_handle, transaction_value, type_error,
 };
 use super::{
     Assignment, BoundsMatch, ColumnHandle, ColumnValueBounds, ConnectorExpression,
@@ -64,6 +65,7 @@ use crate::connector::{
 /// adapter: their only cross-role representation is an opaque SPI handle.
 pub trait ProviderReadRuntime: Send + Sync + 'static {
     type Table: Debug + Send + Sync + 'static;
+    type Execution: Send + Sync + 'static;
     type Column: ColumnHandle;
     type Transaction: Clone + Debug + Send + Sync + 'static;
     type Split: ConnectorSplit;
@@ -74,6 +76,14 @@ pub trait ProviderReadRuntime: Send + Sync + 'static {
     /// The transaction frozen with this exact provider binding.  It is copied
     /// only into an opaque relation at the provider-side creation boundary.
     fn transaction(&self) -> Self::Transaction;
+
+    fn freeze_read_execution(
+        &self,
+        _session: &ConnectorSession,
+        _table: &Self::Table,
+    ) -> Result<Option<Self::Execution>, ConnectorError> {
+        Ok(None)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -507,6 +517,7 @@ pub trait ProviderReadPageSourceProvider<P: ProviderReadRuntime>: Send + Sync {
         &self,
         session: &ConnectorSession,
         table: &P::Table,
+        execution: Option<&P::Execution>,
         split: &P::Split,
         scheduled_split_sequence_id: u64,
         columns: &[Assignment<P::Column>],
@@ -520,6 +531,7 @@ pub trait ProviderReadPageSourceProvider<P: ProviderReadRuntime>: Send + Sync {
         &self,
         _session: &ConnectorSession,
         _table: &P::Table,
+        _execution: Option<&P::Execution>,
         _split: &P::Split,
         _scheduled_split_sequence_id: u64,
         _columns: &[Assignment<P::Column>],
@@ -611,15 +623,53 @@ impl<P: ProviderReadRuntime> ReadRuntimeAdapter<P> {
     /// cannot observe or construct a transaction payload itself.
     pub fn relation(
         &self,
+        session: &ConnectorSession,
         kind: ConnectorReadRelationKind,
         table: ConnectorReadTableHandle,
-    ) -> Result<super::runtime::ConnectorReadRelation, ConnectorError> {
-        self.table(&table)?;
-        Ok(super::runtime::ConnectorReadRelation::new(
+    ) -> Result<ConnectorReadRelation, ConnectorError> {
+        let execution = self
+            .provider
+            .freeze_read_execution(session, self.table(&table)?)?;
+        let relation = ConnectorReadRelation::new(
             kind,
             table,
             self.wrap_transaction(self.provider.transaction()),
-        ))
+        );
+        match execution {
+            Some(execution) => self.bind_read_execution(relation, execution),
+            None => Ok(relation),
+        }
+    }
+
+    pub fn bind_read_execution(
+        &self,
+        relation: ConnectorReadRelation,
+        input: P::Execution,
+    ) -> Result<ConnectorReadRelation, ConnectorError> {
+        if relation.execution().is_some() {
+            return Err(ConnectorError::new(
+                crate::connector::ConnectorErrorKind::InvalidRequest,
+                "connector read execution is already frozen",
+            ));
+        }
+        self.table(relation.table())?;
+        self.transaction(relation.transaction())?;
+        Ok(relation.with_execution(execution_input(self.binding.clone(), input)))
+    }
+
+    pub fn read_execution<'a>(
+        &self,
+        relation: &'a ConnectorReadRelation,
+    ) -> Result<Option<&'a P::Execution>, ConnectorError> {
+        relation
+            .execution()
+            .map(|input| {
+                if input.binding() != &self.binding {
+                    return Err(binding_error());
+                }
+                execution_value(input).ok_or_else(type_error)
+            })
+            .transpose()
     }
 
     /// Wrap a provider table at a provider-owned codec or service boundary.
@@ -991,10 +1041,11 @@ impl<P: ProviderReadMetadata> ConnectorReadMetadata for ReadRuntimeAdapter<P> {
 
     fn relation(
         &self,
+        session: &ConnectorSession,
         kind: ConnectorReadRelationKind,
         table: ConnectorReadTableHandle,
     ) -> Result<super::runtime::ConnectorReadRelation, ConnectorError> {
-        ReadRuntimeAdapter::relation(self, kind, table)
+        ReadRuntimeAdapter::relation(self, session, kind, table)
     }
 
     fn get_table_handle(
@@ -1667,14 +1718,15 @@ impl<P: ProviderReadRuntime> ConnectorReadPageSourceProvider for AdapterPageSour
     fn create_page_stream(
         &self,
         session: &ConnectorSession,
-        table: &ConnectorReadTableHandle,
+        relation: &ConnectorReadRelation,
         split: &ConnectorReadSplit,
         scheduled_split_sequence_id: u64,
         columns: &[Assignment<ConnectorReadColumnHandle>],
         dynamic_filter: &Arc<ConnectorReadDynamicFilter>,
         budget: &ConnectorPollBudget,
     ) -> Result<OwnedConnectorPageStream, ConnectorError> {
-        let table = self.adapter.table(table)?;
+        let table = self.adapter.table(relation.table())?;
+        let execution = self.adapter.read_execution(relation)?;
         let split = self.adapter.split(split)?;
         let columns = self.adapter.typed_assignments(columns)?;
         let dynamic_filter = Arc::new(ProviderDynamicFilter::new(
@@ -1686,6 +1738,7 @@ impl<P: ProviderReadRuntime> ConnectorReadPageSourceProvider for AdapterPageSour
         let stream = self.provider.create_page_stream(
             session,
             table,
+            execution,
             split,
             scheduled_split_sequence_id,
             &columns,
@@ -1707,13 +1760,14 @@ impl<P: ProviderReadRuntime> ConnectorReadPageSourceProvider for AdapterPageSour
     fn prepare_page_source(
         &self,
         session: &ConnectorSession,
-        table: &ConnectorReadTableHandle,
+        relation: &ConnectorReadRelation,
         split: &ConnectorReadSplit,
         scheduled_split_sequence_id: u64,
         columns: &[Assignment<ConnectorReadColumnHandle>],
         dynamic_filter: &Arc<ConnectorReadDynamicFilter>,
     ) -> Result<ConnectorPreparationStart, ConnectorError> {
-        let table = self.adapter.table(table)?;
+        let table = self.adapter.table(relation.table())?;
+        let execution = self.adapter.read_execution(relation)?;
         let split = self.adapter.split(split)?;
         let columns = self.adapter.typed_assignments(columns)?;
         let preparation_filter = Arc::new(ProviderDynamicFilter::new(
@@ -1725,6 +1779,7 @@ impl<P: ProviderReadRuntime> ConnectorReadPageSourceProvider for AdapterPageSour
         match self.provider.prepare_page_source(
             session,
             table,
+            execution,
             split,
             scheduled_split_sequence_id,
             &columns,
@@ -1877,6 +1932,7 @@ mod tests {
 
     impl ProviderReadRuntime for Probe {
         type Table = Table;
+        type Execution = ();
         type Column = Column;
         type Transaction = ();
         type Split = Split;
@@ -2250,6 +2306,7 @@ mod tests {
             &self,
             _session: &ConnectorSession,
             _table: &Table,
+            _execution: Option<&()>,
             _split: &Split,
             _scheduled_split_sequence_id: u64,
             _columns: &[Assignment<Column>],
@@ -2903,7 +2960,11 @@ mod tests {
     fn relation_freezes_the_provider_transaction_without_exposing_payloads() {
         let adapter = ReadRuntimeAdapter::new(Arc::new(Probe::new()));
         let relation = adapter
-            .relation(ConnectorReadRelationKind::Table, adapter.wrap_table(Table))
+            .relation(
+                &session(),
+                ConnectorReadRelationKind::Table,
+                adapter.wrap_table(Table),
+            )
             .expect("same-binding table forms a relation");
         assert_eq!(relation.kind(), ConnectorReadRelationKind::Table);
         assert_eq!(
@@ -3116,6 +3177,9 @@ mod tests {
     fn creation_time_filter_contract_error_closes_the_unpublished_stream() {
         let (adapter, filter, table, split) = adapter_and_filter();
         let close_called = Arc::new(AtomicBool::new(false));
+        let relation = adapter
+            .relation(&session(), ConnectorReadRelationKind::Table, table)
+            .unwrap();
         let provider = AdapterPageSourceProvider {
             provider: Arc::new(TestProvider {
                 trigger_during_create: true,
@@ -3126,7 +3190,7 @@ mod tests {
 
         let error = match provider.create_page_stream(
             &session(),
-            &table,
+            &relation,
             &split,
             1,
             &[],
@@ -3146,6 +3210,9 @@ mod tests {
 
         let (adapter, filter, table, split) = adapter_and_filter();
         let close_called = Arc::new(AtomicBool::new(false));
+        let relation = adapter
+            .relation(&session(), ConnectorReadRelationKind::Table, table)
+            .unwrap();
         let provider = AdapterPageSourceProvider {
             provider: Arc::new(TestProvider {
                 trigger_during_create: false,
@@ -3156,7 +3223,7 @@ mod tests {
         let mut stream = provider
             .create_page_stream(
                 &session(),
-                &table,
+                &relation,
                 &split,
                 1,
                 &[],
@@ -3283,6 +3350,7 @@ mod tests {
             &self,
             _session: &ConnectorSession,
             _table: &Table,
+            _execution: Option<&()>,
             _split: &Split,
             _scheduled_split_sequence_id: u64,
             _columns: &[Assignment<Column>],
@@ -3300,6 +3368,7 @@ mod tests {
             &self,
             _session: &ConnectorSession,
             _table: &Table,
+            _execution: Option<&()>,
             _split: &Split,
             _scheduled_split_sequence_id: u64,
             _columns: &[Assignment<Column>],
@@ -3320,6 +3389,9 @@ mod tests {
     fn unsupported_preparation_never_opens_a_page_stream() {
         let (adapter, filter, table, split) = adapter_and_filter();
         let created = Arc::new(AtomicBool::new(false));
+        let relation = adapter
+            .relation(&session(), ConnectorReadRelationKind::Table, table)
+            .unwrap();
         let provider = AdapterPageSourceProvider {
             provider: Arc::new(TestPreparationProvider {
                 control: Arc::default(),
@@ -3331,7 +3403,7 @@ mod tests {
         };
         assert!(matches!(
             provider
-                .prepare_page_source(&session(), &table, &split, 1, &[], &filter)
+                .prepare_page_source(&session(), &relation, &split, 1, &[], &filter)
                 .expect("unsupported is an explicit verdict"),
             ConnectorPreparationStart::Unsupported
         ));
@@ -3355,6 +3427,9 @@ mod tests {
         let control = Arc::new(TestPreparationControl::default());
         let close_called = Arc::new(AtomicBool::new(false));
         let created = Arc::new(AtomicBool::new(false));
+        let relation = adapter
+            .relation(&session(), ConnectorReadRelationKind::Table, table)
+            .unwrap();
         let provider = AdapterPageSourceProvider {
             provider: Arc::new(TestPreparationProvider {
                 control: control.clone(),
@@ -3365,7 +3440,7 @@ mod tests {
             adapter,
         };
         let ConnectorPreparationStart::Prepared(mut prepared) = provider
-            .prepare_page_source(&session(), &table, &split, 1, &[], &initial_filter)
+            .prepare_page_source(&session(), &relation, &split, 1, &[], &initial_filter)
             .expect("preparation starts")
         else {
             panic!("provider supports preparation");

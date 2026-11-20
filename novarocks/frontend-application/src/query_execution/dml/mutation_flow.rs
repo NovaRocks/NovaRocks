@@ -406,16 +406,7 @@ fn finish_change_stream_write(
             })
             .collect::<Result<Vec<_>, String>>()?,
     )?;
-    let reads =
-        novarocks_sql::planning::dml::DmlFinalizedProviderReadSet::try_new(facts.into_iter().map(
-            |fact| novarocks_sql::planning::dml::DmlFinalizedProviderRead {
-                fact,
-                read_budget: novarocks_physical_plan::ScanReadBudget {
-                    max_batch_rows: novarocks_physical_plan::MAX_SCAN_BATCH_ROWS,
-                    max_batch_bytes: novarocks_physical_plan::MAX_SCAN_BATCH_BYTES,
-                },
-            },
-        ))?;
+    let reads = novarocks_sql::planning::dml::DmlFinalizedProviderReadSet::try_new(facts)?;
     let version = crate::query_execution::physical_encoding::mint_plan_version();
     let dop_domain =
         crate::query_execution::contract::completed_plan_dop_domain(query_options.as_ref())?;

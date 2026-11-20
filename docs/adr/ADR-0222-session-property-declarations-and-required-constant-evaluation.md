@@ -5,6 +5,7 @@ domain: [sql-language, sql-compiler]
 status: active
 supersedes: []
 superseded-by: null
+partially-superseded-by: [ADR-0245]
 date: 2026-11-07
 symptoms:
   - "同一属性从 SQL 和请求头设置时表现不同"
@@ -21,6 +22,8 @@ code-anchors:
   - "novarocks/frontend-application/src/query/session_property_computation.rs (SessionPropertyCpuInput::run)"
   - "novarocks/frontend-application/src/query/set_action.rs (SetStatementAction::poll_set)"
 ---
+
+[ADR-0245](ADR-0245-parquet-reader-sizing-and-scan-output-policy.md) 更新本记录关于生产 catalog 声明为空、BE 读设置尚未传递的阶段性安排。Iceberg 已有真实 catalog 声明，读侧按准确控制代和绑定提取原语句覆盖，BE 消费冻结的私有读载荷。声明、必求值、一次提交和原身份规则继续适用。
 
 ## 问题
 
@@ -64,7 +67,7 @@ HTTP 输入先由协议作者完成 URL/header framing 与重复名称处理，�
 3. **必求值规则。** SQL 在原空关系/常量准入边界分析，按属性目标类型只允许既有隐式转换；原 bound metadata 决定 lifecycle、稳定性、状态、副作用和 environment 准入。使用原 compiled kernels，保 CASE/IF/AND/OR/COALESCE 选支及未选分支不求值；实际选中错误不可当作 optional miss。optional FoldConstant 的开关、拒折与 fail-open 合同保持不变。
 4. **中立值与交接规则。** 跨 SQL/FE/QA 交中立 CV，验证实际选中 ordinal、完整逻辑/物理类型、NULL、来源与 creator。转换必须运行原转换作者，不重贴 metadata。原 CV 跟随 prepared effects 到原消费者接收；长期 SessionPropertyInputs 保 decoded/raw，不能持有旧 statement CV 来延长结果资源寿命。
 5. **原 CPU、一次提交规则。** SET 冻结初始会话和函数快照，全部 RHS 及 staged projection 在同 Root 的原受监督 Local CPU 工作中完成。业务结果、取消、raw health 和真实退出分别保留；必须先观察原 CPU 退出，再在原成功可见性/取消/代次门内短锁交换完整 staged state。任何一项失败均无部分 live 覆盖或成功 effects，旧 state 析构不在该锁内执行。
-6. **实例声明规则。** catalog 名经原 admission 得到 Absent/Unavailable/Ready。Ready 必须带原 attachment、instance、provider、generation 与同代已验证配置；工厂产物不可变。Unavailable 不是 Absent；同名重建不能复用旧 typed override。raw catalog 输入按 catalog 分开存放，但原身份仍决定覆盖是否适用。当前生产 provider 声明为空，不提前交付真实 catalog 属性或 BE ConnectorSession 传递。
+6. **实例声明规则。** catalog 名经原 admission 得到 Absent/Unavailable/Ready。Ready 必须带原 attachment、instance、provider、generation 与同代已验证配置；工厂产物不可变。Unavailable 不是 Absent；同名重建不能复用旧 typed override。raw catalog 输入按 catalog 分开存放，但原身份仍决定覆盖是否适用。生产 provider 声明在本记录裁决时为空，后续 BE 读取见 ADR-0245。
 7. **协议顺序与失败规则。** framing 错误仍走原 HTTP 400；格式合法后系统属性先于 catalog，缺 catalog 在前也不抢过未知系统属性。普通未知名、类型/NULL/值域拒绝为 14，真实缺 catalog 为 44；资源、取消、期限、内部不变量与实际 Source 保原 typed 类别/cause，不统一改成 14。失败不得输出 session effects。
 8. **响应与上下文规则。** SQL effect 从已求值目标值渲染：boolean、十进制 integer/bigint、原 varchar 及 Java 形式 double（如 `1.0`）；不是把 SQL RHS 原文回送。header 保原文用于元数据，同时执行 typed 值。`USE` 只表达 catalog/schema，不用 `Clear-Session: catalog` 伪装撤销属性；catalog 上下文不是可登记的伪系统属性。
 9. **原消费优先级规则。** `query_mem_limit` 与递归深度均为 statement hint > explicit session > 原消费默认/无覆盖。递归继续原有限截深机制；这项属性接线不引入另一套递归求值算法。
@@ -73,7 +76,7 @@ HTTP 输入先由协议作者完成 URL/header framing 与重复名称处理，�
 
 - **更严格的 header 输入。** boolean 只接受完整的 true/false（大小写不敏感），数字必须完整解析且可表示，随后仍受该属性自身领域校验；不会因统一 decoder 擅自扩大 finite-only 拒绝。这会拒绝部分宽松 Java 客户端过去能发送的输入，维护者必须把它当可见差异。
 - **纯常量能力边界。** volatile、有状态、有副作用及无实际环境事实的调用不能在此入口执行。确定性并不单独构成准入资格；完整 bound call 与现有 compiled 能力仍须成立。准确能力拒绝、未运行输入与不支持的 catalog 属性分别保留，不能借此声称全部 Trino 会话语义已交付。
-- **声明接口先于 catalog 功能。** 当前工厂/实例配置/代次链可表达准确声明，但生产 catalog 属性为空，BE 传递尚未交付。未来不能把这条空列表或本地元数据方法当成真实属性已生效的证据。
+- **声明接口先于 catalog 功能。** 本记录裁决时，工厂、实例配置和代次链已能表达准确声明，生产 catalog 属性及 BE 传递由后续功能交付。真实消费须核对原声明和实际使用位置。
 - **两种失败合同共用计算内核。** required evaluation 必须暴露真实失败，optional folding 仍可跳过优化；维护成本是分别保护两种合同，不能为减少接口把所有失败混成 miss 或 14。
 - **运行资格独立。** 声明、源码接线和局部 FE/Server 编译检查不证明 unit、协议场景或完整原生验收已通过。历史上游观察的原件不可用时只能保留历史指针，不能用源码推导冒充重采真值。
 

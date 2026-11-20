@@ -369,6 +369,7 @@ impl DeleteManager {
         hidden_columns(&sides, schema)
     }
 
+    #[cfg(test)]
     pub async fn open_split(
         &self,
         split: &IcebergSplit,
@@ -376,12 +377,30 @@ impl DeleteManager {
         bindings: &DeleteDomainBindings,
         mode: DeleteEvaluationMode,
     ) -> Result<SplitDeleteFilter, ConnectorError> {
+        self.open_split_sized(
+            split,
+            schema,
+            bindings,
+            mode,
+            crate::file_reader::default_parquet_reader_sizing(),
+        )
+        .await
+    }
+
+    pub(super) async fn open_split_sized(
+        &self,
+        split: &IcebergSplit,
+        schema: &Schema,
+        bindings: &DeleteDomainBindings,
+        mode: DeleteEvaluationMode,
+        sizing: novarocks_fs::ReaderSizing,
+    ) -> Result<SplitDeleteFilter, ConnectorError> {
         self.context.check_active().map_err(map_file_error)?;
         let sides = plan_sides(split, schema, bindings, &mode)?;
         let hidden = hidden_columns(&sides, schema)?;
         let mut loaded = Vec::new();
         for side in sides {
-            loaded.push(self.load_side(split, side).await?);
+            loaded.push(self.load_side(split, side, sizing).await?);
         }
         let verdict = match mode {
             DeleteEvaluationMode::ExcludeDeleted => FilterVerdict::Exclude(loaded.remove(0)),
@@ -407,6 +426,7 @@ impl DeleteManager {
         &self,
         split: &IcebergSplit,
         side: SidePlan,
+        sizing: novarocks_fs::ReaderSizing,
     ) -> Result<ResolvedDeletes, ConnectorError> {
         let domain_id = {
             let mut state = self.state.lock().map_err(|e| corrupt(e.to_string()))?;
@@ -493,6 +513,7 @@ impl DeleteManager {
                                             &group,
                                             &access,
                                             &load_context,
+                                            sizing,
                                             |rows| {
                                                 counters_load
                                                     .decoded_rows
@@ -508,6 +529,7 @@ impl DeleteManager {
                                                 &data_path,
                                                 &access,
                                                 &load_context,
+                                                sizing,
                                                 |rows| {
                                                     counters_load
                                                         .decoded_rows

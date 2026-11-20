@@ -219,6 +219,10 @@ struct OpenSplit {
     stream: OwnedConnectorPageStream,
     #[cfg(novarocks_dev_controls)]
     reader_marker: Option<TypedConnectorReaderMarker>,
+    #[cfg(novarocks_dev_controls)]
+    first_file_batch_observed: bool,
+    #[cfg(novarocks_dev_controls)]
+    first_chunk_observed: bool,
     successor_control_id: Option<u64>,
     file_metrics: PageSourceFileMetrics,
 }
@@ -306,7 +310,7 @@ impl TypedConnectorScanStream {
             .provider
             .create_page_stream(
                 &self.shared.session,
-                self.shared.descriptor.table(),
+                self.shared.descriptor.relation(),
                 split.split(),
                 split.sequence_id(),
                 self.shared.descriptor.assignments(),
@@ -380,6 +384,10 @@ impl TypedConnectorScanStream {
             stream,
             #[cfg(novarocks_dev_controls)]
             reader_marker,
+            #[cfg(novarocks_dev_controls)]
+            first_file_batch_observed: false,
+            #[cfg(novarocks_dev_controls)]
+            first_chunk_observed: false,
             successor_control_id: None,
             file_metrics: PageSourceFileMetrics::default(),
         }));
@@ -434,7 +442,7 @@ impl TypedConnectorScanStream {
             };
             let candidate = match self.provider.prepare_page_source(
                 &self.shared.session,
-                self.shared.descriptor.table(),
+                self.shared.descriptor.relation(),
                 next.split(),
                 next.sequence_id(),
                 self.shared.descriptor.assignments(),
@@ -540,14 +548,32 @@ impl Stream for TypedConnectorScanStream {
                         &mut split.file_metrics,
                         split.stream.metrics().file,
                     );
+                    #[cfg(novarocks_dev_controls)]
+                    if !split.first_file_batch_observed
+                        && let Some(marker) = &split.reader_marker
+                        && let Some(batch) = split.stream.first_file_batch()
+                    {
+                        marker.emit_first_file_batch(this.shared.plan_node_id, batch);
+                        split.first_file_batch_observed = true;
+                    }
                     match next {
                         Poll::Pending => {
                             this.step = SplitStep::Reading(split);
                             return Poll::Pending;
                         }
                         Poll::Ready(Some(Ok(page))) => {
+                            let output = this.chunk_of(page);
+                            #[cfg(novarocks_dev_controls)]
+                            if !split.first_chunk_observed
+                                && let Some(marker) = &split.reader_marker
+                                && let Ok(chunk) = &output
+                                && !chunk.is_empty()
+                            {
+                                marker.emit_first_chunk(this.shared.plan_node_id, chunk);
+                                split.first_chunk_observed = true;
+                            }
                             this.step = SplitStep::Reading(split);
-                            return match this.chunk_of(page) {
+                            return match output {
                                 Ok(chunk) => Poll::Ready(Some(Ok(chunk))),
                                 Err(error) => this.fail(error),
                             };

@@ -1025,7 +1025,6 @@ async fn plan_query_for_ctas_source_async(
     current_database: &str,
     query: &Query,
     execution: &QueryExecutionContext,
-    query_options: Option<&QueryOptions>,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     provider_source: &crate::query_execution::completion_facts::FrontendCompletionCustody,
 ) -> Result<PlannedCtasSourceQuery, CtasFailure> {
@@ -1074,9 +1073,9 @@ async fn plan_query_for_ctas_source_async(
         scope.with_snapshot_planning_owned(
             crate::query_execution::planning::sql_compile_control_from_execution(execution),
             execution.cancellation().clone(),
-            query_options,
         ),
         crate::query_execution::compiler::typed_connector_session().map_err(internal_failure)?,
+        Arc::clone(execution.session_property_inputs()),
     )
     .map_err(internal_failure)?;
     let compile_control =
@@ -1220,16 +1219,7 @@ async fn prepare_planned_ctas_connector_write_async(
     let access = access_sink
         .try_into_access()
         .map_err(|(error, _returned)| error.to_string())?;
-    let reads =
-        novarocks_sql::planning::dml::DmlFinalizedProviderReadSet::try_new(facts.into_iter().map(
-            |fact| novarocks_sql::planning::dml::DmlFinalizedProviderRead {
-                fact,
-                read_budget: novarocks_physical_plan::ScanReadBudget {
-                    max_batch_rows: novarocks_physical_plan::MAX_SCAN_BATCH_ROWS,
-                    max_batch_bytes: novarocks_physical_plan::MAX_SCAN_BATCH_BYTES,
-                },
-            },
-        ))?;
+    let reads = novarocks_sql::planning::dml::DmlFinalizedProviderReadSet::try_new(facts)?;
     let targets = novarocks_sql::planning::dml::DmlFinalizedWriteTargetSet::try_new([
         novarocks_sql::planning::dml::DmlFinalizedWriteTarget {
             ordinal: write_target_ordinal,
@@ -1516,7 +1506,6 @@ impl DmlExecutionKernel {
             &request.current_database,
             &request.command.source,
             &request.execution,
-            request.query_options.as_ref(),
             &connector_context,
             provider_source,
         )

@@ -34,19 +34,12 @@
 //!   them by comparing both complete endpoint closures. Added and removed
 //!   files use ordinary exclusion at their independently pinned endpoint.
 
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 
 use arrow::array::{ArrayRef, Int32Array};
-use futures::Stream;
-use futures::future::BoxFuture;
-use novarocks_fs::{FileReadBudget, FileReadContext, FileReaderOptions};
+use novarocks_fs::{FileReadContext, FileReaderOptions, ReaderSizing};
 use novarocks_spi::connector::ConnectorError;
-use novarocks_spi::connector::read_stack::{
-    ConnectorPageStream, ConnectorPollBudget, OwnedConnectorPageStream, PageSourceMetrics,
-    SourcePage,
-};
+use novarocks_spi::connector::read_stack::{ConnectorPollBudget, OwnedConnectorPageStream};
 
 use crate::access_binding::IcebergReadBinding;
 
@@ -56,6 +49,7 @@ use super::change_window::{
 };
 use super::column_handle::{IcebergColumnHandle, invalid, unsupported};
 use super::delete_manager::{DeleteEvaluationMode, DeleteManager, EndpointDeleteClosure};
+use super::output::{OutputProjection, OutputSlot as ScanOutputSlot};
 use super::page_source::{
     IcebergDynamicFilter, IcebergPageSourceRequest, IcebergReadRelation, ParquetFooterCache,
     create_iceberg_page_stream,
@@ -73,8 +67,9 @@ pub struct IcebergChangeWindowPageSourceRequest<'a> {
     pub access_binding: IcebergReadBinding,
     pub context: FileReadContext,
     pub cache: Option<novarocks_fs::DataCachePolicy>,
-    pub budget: FileReadBudget,
+    pub budget: ReaderSizing,
     pub reader_options: FileReaderOptions,
+    pub(super) output_layout: super::runtime::IcebergReadLayout,
     pub scheduled_split_sequence_id: u64,
     pub dynamic_filter: Arc<IcebergDynamicFilter>,
 }
@@ -91,11 +86,10 @@ pub fn create_iceberg_change_window_page_stream(
         delete_mode,
         output,
     } = ChangeWindowRead::of(&request)?;
-    let inner = create_iceberg_page_stream(
-        data_request(request, &relation, &base_columns, delete_mode),
+    create_iceberg_page_stream(
+        data_request(request, &relation, &base_columns, delete_mode, output),
         budget,
-    )?;
-    Ok(Box::pin(IcebergChangeWindowPageStream { inner, output }))
+    )
 }
 
 /// What a change-window split reads through the data reader, and how its
@@ -104,7 +98,7 @@ struct ChangeWindowRead {
     relation: IcebergReadRelation,
     base_columns: Vec<IcebergColumnHandle>,
     delete_mode: DeleteEvaluationMode,
-    output: ChangeOpOutput,
+    output: OutputProjection,
 }
 
 impl ChangeWindowRead {
@@ -127,12 +121,20 @@ impl ChangeWindowRead {
                     split.data().partition_spec_id(),
                     matches!(split, IcebergChangeSplit::DeletedDataFileRows(_)),
                 )?,
-            },
+            }
+            .with_output_layout(request.output_layout),
             delete_mode: delete_mode_of(split, request.handle)?,
-            output: ChangeOpOutput {
-                slots,
-                base_channel_count: base_columns.len(),
-                change_op: split.change_op(),
+            output: {
+                let sign: ArrayRef = Arc::new(Int32Array::from(vec![i32::from(split.change_op())]));
+                OutputProjection(
+                    slots
+                        .into_iter()
+                        .map(|slot| match slot {
+                            OutputSlot::Base => ScanOutputSlot::Base,
+                            OutputSlot::ChangeOp => ScanOutputSlot::Constant(sign.clone()),
+                        })
+                        .collect(),
+                )
             },
             base_columns,
         })
@@ -145,6 +147,7 @@ fn data_request<'a>(
     relation: &'a IcebergReadRelation,
     base_columns: &'a [IcebergColumnHandle],
     delete_mode: DeleteEvaluationMode,
+    output: OutputProjection,
 ) -> IcebergPageSourceRequest<'a> {
     IcebergPageSourceRequest {
         relation,
@@ -162,6 +165,7 @@ fn data_request<'a>(
         dynamic_filter: request.dynamic_filter,
         prepared_input: None,
         pending_preparation_control: None,
+        output_projection: Some(output),
     }
 }
 
@@ -248,86 +252,6 @@ impl ChangeOpProjection {
             slots,
             base_columns,
         })
-    }
-}
-
-/// How a change-window page is put back into the scan's output order.
-struct ChangeOpOutput {
-    slots: Vec<OutputSlot>,
-    base_channel_count: usize,
-    change_op: i8,
-}
-
-impl ChangeOpOutput {
-    fn project(&self, page: SourcePage) -> Result<SourcePage, ConnectorError> {
-        let (rows, base_columns) = page.into_columns()?;
-        if base_columns.len() != self.base_channel_count {
-            return Err(ConnectorError::new(
-                novarocks_spi::connector::ConnectorErrorKind::Internal,
-                format!(
-                    "iceberg change-window page produced {} channels for {} base columns",
-                    base_columns.len(),
-                    self.base_channel_count
-                ),
-            ));
-        }
-        let mut columns = Vec::with_capacity(self.slots.len());
-        let mut base = base_columns.into_iter();
-        for slot in &self.slots {
-            match slot {
-                OutputSlot::Base => {
-                    let Some(column) = base.next() else {
-                        return Err(ConnectorError::new(
-                            novarocks_spi::connector::ConnectorErrorKind::Internal,
-                            "iceberg change-window page ran out of base channels",
-                        ));
-                    };
-                    columns.push(column);
-                }
-                OutputSlot::ChangeOp => columns.push(change_op_column(self.change_op, rows)),
-            }
-        }
-        SourcePage::try_new(rows, columns)
-    }
-}
-
-/// The public sign column has the exact Int32 carrier declared by the provider.
-fn change_op_column(change_op: i8, rows: usize) -> ArrayRef {
-    Arc::new(Int32Array::from(vec![i32::from(change_op); rows]))
-}
-
-/// One change-window split read as a page stream: its data split's stream,
-/// with each page put back into the scan's order. It owns no cursor of its
-/// own: the data reader underneath decides what rows exist. It prepares no
-/// successor.
-pub struct IcebergChangeWindowPageStream {
-    inner: OwnedConnectorPageStream,
-    output: ChangeOpOutput,
-}
-
-impl Stream for IcebergChangeWindowPageStream {
-    type Item = Result<SourcePage, ConnectorError>;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.get_mut();
-        this.inner
-            .as_mut()
-            .poll_next(cx)
-            .map(|page| page.map(|page| page.and_then(|page| this.output.project(page))))
-    }
-}
-
-impl ConnectorPageStream for IcebergChangeWindowPageStream {
-    fn metrics(&self) -> PageSourceMetrics {
-        self.inner.metrics()
-    }
-
-    fn memory_usage_bytes(&self) -> u64 {
-        self.inner.memory_usage_bytes()
-    }
-
-    fn close(self: Pin<Box<Self>>) -> BoxFuture<'static, Result<(), ConnectorError>> {
-        Pin::into_inner(self).inner.close()
     }
 }
 

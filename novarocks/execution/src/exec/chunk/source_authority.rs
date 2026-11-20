@@ -17,7 +17,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use novarocks_spi::connector::ConnectorOutputMemoryToken;
+use novarocks_spi::connector::{ConnectorOutputMemoryToken, SharedSourceHold};
 
 use super::memory::ChunkAccounting;
 
@@ -27,18 +27,24 @@ use super::memory::ChunkAccounting;
 pub(crate) struct ChunkSourceAuthorityRef<'a> {
     native: Option<&'a Arc<ChunkAccounting>>,
     provider: Option<&'a Arc<Mutex<ConnectorOutputMemoryToken>>>,
+    shared_provider: Option<&'a Arc<Vec<SharedSourceHold>>>,
 }
 
 impl<'a> ChunkSourceAuthorityRef<'a> {
     pub(super) fn from_attached(
         native: Option<&'a Arc<ChunkAccounting>>,
         provider: Option<&'a Arc<Mutex<ConnectorOutputMemoryToken>>>,
+        shared_provider: Option<&'a Arc<Vec<SharedSourceHold>>>,
     ) -> Self {
-        Self { native, provider }
+        Self {
+            native,
+            provider,
+            shared_provider,
+        }
     }
 
     pub(crate) fn is_attached(self) -> bool {
-        self.native.is_some() || self.provider.is_some()
+        self.native.is_some() || self.provider.is_some() || self.shared_provider.is_some()
     }
 
     /// Shares the original charge without allocation, transfer or a new
@@ -52,6 +58,7 @@ impl<'a> ChunkSourceAuthorityRef<'a> {
         self.is_attached().then(|| ChunkSourceAuthority {
             _native: self.native.map(Arc::clone),
             _provider: self.provider.map(Arc::clone),
+            _shared_provider: self.shared_provider.map(Arc::clone),
         })
     }
 
@@ -82,10 +89,15 @@ impl<'a> ChunkSourceAuthorityRef<'a> {
 pub(crate) struct ChunkSourceAuthority {
     _native: Option<Arc<ChunkAccounting>>,
     _provider: Option<Arc<Mutex<ConnectorOutputMemoryToken>>>,
+    _shared_provider: Option<Arc<Vec<SharedSourceHold>>>,
 }
 
 impl ChunkSourceAuthority {
     pub(super) fn borrowed(&self) -> ChunkSourceAuthorityRef<'_> {
-        ChunkSourceAuthorityRef::from_attached(self._native.as_ref(), self._provider.as_ref())
+        ChunkSourceAuthorityRef::from_attached(
+            self._native.as_ref(),
+            self._provider.as_ref(),
+            self._shared_provider.as_ref(),
+        )
     }
 }

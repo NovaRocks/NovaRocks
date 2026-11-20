@@ -15,4 +15,5 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod scan_output_policy;
 mod write_arrival;

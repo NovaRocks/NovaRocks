@@ -37,11 +37,15 @@ pub mod codec;
 pub mod column_handle;
 pub mod delete_manager;
 pub mod merge;
+pub(crate) mod output;
 pub mod page_source;
 pub mod page_source_provider;
 mod preparation;
 pub(crate) mod prepared_source_proof;
 pub(crate) mod read_static_facts;
+#[cfg(any(test, feature = "reader-test-fixture"))]
+#[doc(hidden)]
+pub mod reader_test_fixture;
 pub mod rewrite_position_page_source;
 pub mod runtime;
 pub mod schema_binding;
@@ -66,8 +70,7 @@ pub use change_window::{
     TableChangesSplitParams, change_op_column_handle,
 };
 pub use change_window_page_source::{
-    IcebergChangeWindowPageSourceRequest, IcebergChangeWindowPageStream,
-    create_iceberg_change_window_page_stream,
+    IcebergChangeWindowPageSourceRequest, create_iceberg_change_window_page_stream,
 };
 pub use codec::IcebergConnectorReadWireAdapter;
 pub use column_handle::{

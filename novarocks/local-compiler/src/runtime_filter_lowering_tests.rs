@@ -49,7 +49,6 @@ use novarocks_type_contract::{
     CallProofScope, DecimalOverflowPolicy, EvaluationDemand, ExpressionEffects, RelationCallId,
     RelationEffectContext, SemanticParameters, ValueLogicalType,
 };
-use std::num::NonZeroU64;
 
 fn zero_port_root(
     builder: &mut FragmentBuilder,
@@ -284,10 +283,6 @@ fn add_scan_typed_at(
                     predicate_guarantees: Box::default(),
                     provided_properties: properties(distribution, RowMultiplicity::SingleCopy),
                 })),
-                read_budget: ScanReadBudget {
-                    max_batch_rows: 100,
-                    max_batch_bytes: 4096,
-                },
                 provider_outputs: columns.iter().cloned().zip(provider.clone()).collect(),
                 residuals: Box::default(),
                 derived_values: Box::default(),
@@ -365,8 +360,6 @@ fn frozen_read_declared_typed(
         TupleDomain::all(),
         None,
         dynamic_filters,
-        NonZeroU64::new(100).unwrap(),
-        NonZeroU64::new(4096).unwrap(),
     )
     .unwrap();
     let source = ConnectorReadStaticFacts::try_new(

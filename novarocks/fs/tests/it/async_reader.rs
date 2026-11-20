@@ -30,17 +30,17 @@ use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::common::{Fixture, collect};
 use arrow::array::{ArrayRef, Int32Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use crate::common::{Fixture, collect};
 use novarocks_fs::{
     AsyncFileBatchReader, BoundFile, FileBatch, FileCancellation, FileErrorKind, FileFormat,
     FileIdentity, FileIoFuture, FileIoJob, FileIoRuntime, FileIoSpawner, FileProjection,
-    FileRangeScope, FileRangeService, FileReadBudget, FileReadContext, FileReadRange,
-    FileReadRequest, FileReaderOptions, FileResult, FsAccessResolver, MinMaxPredicateOp,
-    MinMaxPredicateValue, PhysicalPageSelection, PhysicalPruning, ScanPredicate,
-    ScanPredicateDomain, ScanPredicateSource, TokioFileIoRuntime, inspect_parquet_metadata,
+    FileRangeScope, FileRangeService, FileReadContext, FileReadRange, FileReadRequest,
+    FileReaderOptions, FileResult, FsAccessResolver, MinMaxPredicateOp, MinMaxPredicateValue,
+    PhysicalPageSelection, PhysicalPruning, ReaderSizing, ScanPredicate, ScanPredicateDomain,
+    ScanPredicateSource, TokioFileIoRuntime, inspect_parquet_metadata,
     inspect_parquet_metadata_async, open_file_reader, open_file_reader_async,
 };
 use novarocks_spi::connector::StorageAccessDomainId;
@@ -204,9 +204,9 @@ fn request_through(
         format: FileFormat::Parquet,
         range: FileReadRange::WholeFile,
         projection: FileProjection::All,
-        budget: FileReadBudget {
-            max_rows: NonZeroUsize::new(4096).unwrap(),
-            max_bytes: NonZeroUsize::new(64 * 1024 * 1024).unwrap(),
+        sizing: ReaderSizing {
+            max_read_rows: NonZeroUsize::new(4096).unwrap(),
+            max_read_bytes: 64 * 1024 * 1024,
         },
         predicates: Vec::new(),
         pruning: PhysicalPruning::default(),
@@ -214,6 +214,7 @@ fn request_through(
         cache: None,
         prepared_input: None,
         context: FileReadContext {
+            turn: None,
             cancellation: FileCancellation::new(),
             deadline: None,
             runtime: Arc::new(TokioFileIoRuntime::new(handle.clone())) as Arc<dyn FileIoRuntime>,

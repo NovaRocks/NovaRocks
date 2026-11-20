@@ -65,9 +65,8 @@ use super::super::aggregate_fixture::{
 use super::super::family_fixture::{FixtureControl, constant_policy, int64, int64_rows};
 use crate::exec::chunk::Chunk;
 use crate::exec::operators::{ResultSinkBuffer, ResultSinkFactory};
-use crate::exec::pipeline::binding::ExchangeBindings;
-use crate::exec::pipeline::executor::prepare_compiled_program_pipeline_execution;
-use crate::runtime::query_options::QueryOptions;
+use crate::exec::pipeline::binding::{ExchangeBindings, ScanBindings};
+use crate::exec::pipeline::executor::prepare_compiled_program_with_sink_materializer;
 use crate::runtime::runtime_state::RuntimeState;
 use crate::runtime::task::io::NoopTaskEventSink;
 use crate::runtime::task::io::exchange::test_support::Fixture;
@@ -815,13 +814,10 @@ fn single_program(rows: &[Row], spec: &Spec, sorted: bool) -> Result<Arc<LocalPr
 /// or execution failure retains its typed source.
 fn try_run_single(
     program: &Arc<LocalProgram>,
-    batch_size: i32,
+    batch_size: u32,
 ) -> crate::runtime::task::ExecutionResult<Vec<Chunk>> {
     let state = Arc::new(RuntimeState::for_local_execution(
-        Some(QueryOptions {
-            batch_size: Some(batch_size),
-            ..QueryOptions::default()
-        }),
+        None,
         None,
         None,
         None,
@@ -833,21 +829,33 @@ fn try_run_single(
     ));
     let output = ResultSinkBuffer::new();
     let dop = i32::try_from(program.graph().profile().pipeline_dop().get()).unwrap();
-    let prepared = prepare_compiled_program_pipeline_execution(
+    let sink = Box::new(ResultSinkFactory::new(output.clone()));
+    let prepared = prepare_compiled_program_with_sink_materializer(
         Arc::clone(program),
         Duration::from_millis(10),
-        Box::new(ResultSinkFactory::new(output.clone())),
+        |_, authors| {
+            authors
+                .seal()
+                .expect("the table fixture declares no summaries");
+            Ok(crate::runtime::task::sink::MaterializedCompiledSink::single(sink))
+        },
         ExchangeBindings::default(),
+        ScanBindings::default(),
+        crate::runtime::task::CompiledWriterBindings::default(),
+        None,
         None,
         dop,
+        std::num::NonZeroU32::new(batch_size).expect("positive fixture batch size"),
         state,
         Arc::new(NoopTaskEventSink),
-    )?;
+        None,
+    )
+    .map_err(|error| error.cause().clone())?;
     prepared.start().join()?;
     Ok(output.take_chunks())
 }
 
-fn run_single(rows: &[Row], spec: &Spec, sorted: bool, batch_size: i32) -> Vec<Chunk> {
+fn run_single(rows: &[Row], spec: &Spec, sorted: bool, batch_size: u32) -> Vec<Chunk> {
     let program = single_program(rows, spec, sorted)
         .unwrap_or_else(|error| panic!("table function fragment compiles: {error}"));
     try_run_single(&program, batch_size)
@@ -1259,8 +1267,7 @@ fn unnest_at_four_drivers_keeps_every_row_and_each_parent_in_order() {
     }
 }
 
-#[path = "compiled_all_definition_source_tests.rs"]
-mod all_definition_source_tests;
+mod all_definition_source;
 
 #[test]
 fn compiled_table_schema_prepare_and_output_last_reference_use_real_owner() {
@@ -1280,6 +1287,7 @@ fn compiled_table_schema_prepare_and_output_last_reference_use_real_owner() {
         program.clone(),
         root,
         Arc::new(RuntimeErrorState::default()),
+        std::num::NonZeroU32::MIN,
     )
     .unwrap();
     let mut missing = factory.create(1, 0);
@@ -1290,10 +1298,12 @@ fn compiled_table_schema_prepare_and_output_last_reference_use_real_owner() {
     drop(missing);
     let tracker = MemTracker::new_root("table actual schema and output creator");
     let mut operator = factory.create(1, 0);
-    operator.set_construction_factory(super::super::aggregate_fixture::runtime_construction_factory(
-        tracker.clone(),
-        Arc::new(RuntimeErrorState::default()),
-    ));
+    operator.set_construction_factory(
+        super::super::aggregate_fixture::runtime_construction_factory(
+            tracker.clone(),
+            Arc::new(RuntimeErrorState::default()),
+        ),
+    );
     operator.prepare().unwrap();
     let ProgramNodeKind::TableFunction { input, .. } = program.graph().nodes()[root.index()].kind()
     else {
@@ -1330,18 +1340,7 @@ fn compiled_table_schema_prepare_and_output_last_reference_use_real_owner() {
         input::RawInput,
         step::{InputResult, NextStep},
     };
-    let state = RuntimeState::for_local_execution(
-        Some(QueryOptions {
-            batch_size: Some(1),
-            ..QueryOptions::default()
-        }),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-    );
+    let state = RuntimeState::for_local_execution(None, None, None, None, None, None, None);
     let control = state.error_state();
     operator.bind_runtime_state(&state).unwrap();
     let duplicate = input.clone();
@@ -1411,14 +1410,17 @@ fn compiled_table_prepare_preserves_real_memory_refusal_before_input() {
         program.clone(),
         program.graph().root(),
         Arc::new(RuntimeErrorState::default()),
+        std::num::NonZeroU32::MIN,
     )
     .unwrap();
     let tracker = MemTracker::new_root("table actual prepare refusal");
     let mut operator = factory.create(1, 0);
-    operator.set_construction_factory(super::super::aggregate_fixture::runtime_construction_factory(
-        tracker.clone(),
-        Arc::new(RuntimeErrorState::default()),
-    ));
+    operator.set_construction_factory(
+        super::super::aggregate_fixture::runtime_construction_factory(
+            tracker.clone(),
+            Arc::new(RuntimeErrorState::default()),
+        ),
+    );
     let baseline = tracker.current();
     assert!(baseline > 0);
     tracker.install_limit_once(baseline + 1).unwrap();

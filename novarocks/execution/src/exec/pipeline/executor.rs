@@ -397,6 +397,7 @@ pub(crate) fn prepare_compiled_program_pipeline_execution_with_profiler_and_sche
         exchange_finst_id,
         profiler,
         pipeline_dop,
+        novarocks_spi::connector::ENGINE_OUTPUT_POLICY.max_rows,
         runtime_state,
         event_sink,
         schema_preparation,
@@ -425,6 +426,7 @@ pub(crate) fn prepare_compiled_program_with_sink_materializer(
     exchange_finst_id: Option<(i64, i64)>,
     profiler: Option<Profiler>,
     pipeline_dop: i32,
+    output_batch_rows: std::num::NonZeroU32,
     runtime_state: Arc<RuntimeState>,
     event_sink: Arc<dyn TaskEventSink>,
     schema_preparation: Option<
@@ -500,6 +502,7 @@ pub(crate) fn prepare_compiled_program_with_sink_materializer(
         ordered.as_ref(),
         execution_runtime.config().local_exchange_buffer_mem_limit_per_driver,
         execution_runtime.config().local_exchange_max_buffered_rows,
+        output_batch_rows,
     )?;
         Ok(graph)
     })().map_err(compiled_pipeline_launch_error)?;
@@ -827,6 +830,7 @@ fn run_compiled_component_with_writers(
         None,
         None,
         dop,
+        novarocks_spi::connector::ENGINE_OUTPUT_POLICY.max_rows,
         state,
         Arc::new(crate::runtime::task::io::NoopTaskEventSink),
         None,

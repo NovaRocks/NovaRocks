@@ -18,6 +18,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::*;
+use crate::connector::read_stack::{PageOutputCustody, SourcePage};
 
 struct Ledger {
     retained: Arc<AtomicU64>,
@@ -103,4 +104,55 @@ fn only_output_reservations_can_cross_the_page_boundary() {
         reservation.into_output(1).unwrap_err().kind(),
         ConnectorErrorKind::InvalidRequest
     );
+}
+
+#[test]
+fn split_output_retains_the_source_and_settles_new_storage_independently() {
+    let retained = Arc::new(AtomicU64::new(0));
+    let resources = ConnectorExecutionResources::from_admitted_ledger(Arc::new(Ledger {
+        retained: Arc::clone(&retained),
+    }));
+    let reserve_output = |bytes| {
+        resources
+            .try_reserve(ConnectorResourceClass::ReaderOutput, bytes)
+            .unwrap()
+            .into_output(bytes)
+            .unwrap()
+    };
+    let source = reserve_output(64).into_shared_source();
+    let column: arrow::array::ArrayRef = Arc::new(arrow::array::Int32Array::from(vec![42]));
+    let first = SourcePage::try_new_with_custody(
+        1,
+        vec![Arc::clone(&column)],
+        PageOutputCustody {
+            source_holds: vec![source.clone()],
+            new_output: Some(reserve_output(16)),
+        },
+    )
+    .unwrap();
+    let second = SourcePage::try_new_with_custody(
+        1,
+        vec![column],
+        PageOutputCustody {
+            source_holds: vec![source.clone()],
+            new_output: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(retained.load(Ordering::Acquire), 80);
+    let (rows, columns, mut custody) = first.into_output_parts();
+    assert_eq!(rows, 1);
+    assert_eq!(columns.len(), 1);
+    assert!(custody.source_holds[0].same_source(&source));
+    custody.new_output.as_mut().unwrap().shrink_to(4).unwrap();
+    assert_eq!(retained.load(Ordering::Acquire), 68);
+    drop(source);
+    drop(columns);
+    drop(custody);
+    assert_eq!(retained.load(Ordering::Acquire), 64);
+    assert_eq!(
+        second.into_columns().unwrap_err().kind(),
+        ConnectorErrorKind::InvalidRequest
+    );
+    assert_eq!(retained.load(Ordering::Acquire), 0);
 }

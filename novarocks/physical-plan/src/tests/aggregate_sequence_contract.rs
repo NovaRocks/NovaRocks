@@ -171,7 +171,6 @@ fn add_provider_scan(
             kind: NodeKind::Scan {
                 occurrence: ProviderReadOccurrenceId::new(scan.get()),
                 relation: Box::new(relation),
-                read_budget: scan_budget(),
                 provider_outputs: columns
                     .into_iter()
                     .zip(values.iter().copied())

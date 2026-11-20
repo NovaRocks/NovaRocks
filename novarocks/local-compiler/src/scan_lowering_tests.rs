@@ -41,7 +41,7 @@ use novarocks_physical_plan::*;
 use novarocks_type_contract::{DecimalOverflowPolicy, EvaluationDemand};
 use std::{
     collections::{BTreeSet, HashMap},
-    num::{NonZeroU64, NonZeroUsize},
+    num::NonZeroUsize,
     sync::Mutex,
 };
 
@@ -417,10 +417,6 @@ fn fixture(spec: Spec) -> Fixture {
             NodeKind::Scan {
                 occurrence: ProviderReadOccurrenceId::new(0),
                 relation: Box::new(relation),
-                read_budget: ScanReadBudget {
-                    max_batch_rows: 100,
-                    max_batch_bytes: 4096,
-                },
                 provider_outputs: columns
                     .iter()
                     .cloned()
@@ -636,10 +632,6 @@ fn fixture(spec: Spec) -> Fixture {
                         predicate_guarantees: Box::default(),
                         provided_properties: properties.clone(),
                     })),
-                    read_budget: ScanReadBudget {
-                        max_batch_rows: 100,
-                        max_batch_bytes: 4096,
-                    },
                     provider_outputs: columns
                         .iter()
                         .cloned()
@@ -866,8 +858,6 @@ fn fixture(spec: Spec) -> Fixture {
         TupleDomain::all(),
         None,
         vec![],
-        NonZeroU64::new(100).unwrap(),
-        NonZeroU64::new(4096).unwrap(),
     )
     .unwrap();
     let source = ConnectorReadStaticFacts::try_new(

@@ -111,9 +111,9 @@ pub use range_service::{
     FileRangeService, FileRangeStart, FileStatRequest, FileStatStart,
 };
 pub use read::{
-    FileBatch, FileBatchReader, FileFormat, FileMetricsSnapshot, FileProjection, FileReadBudget,
-    FileReadContext, FileReadRange, FileReadRequest, FileReaderOptions,
-    ParquetInterpretationPolicy, PreparedFileInput, SMALL_FILE_PROBE_MAX_BYTES,
+    FileBatch, FileBatchReader, FileFormat, FileMetricsSnapshot, FileProjection, FileReadContext,
+    FileReadRange, FileReadRequest, FileReadTurn, FileReaderOptions, ParquetInterpretationPolicy,
+    PreparedFileInput, ReaderSizing, SMALL_FILE_PROBE_MAX_BYTES,
 };
 pub use resources::FsAccessResources;
 pub use runtime::{

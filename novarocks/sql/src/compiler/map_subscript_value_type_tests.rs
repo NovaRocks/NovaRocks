@@ -19,9 +19,7 @@
 
 use super::*;
 use arrow::datatypes::{DataType, TimeUnit};
-use novarocks_physical_plan::{
-    MAX_SCAN_BATCH_BYTES, MAX_SCAN_BATCH_ROWS, PipelineDopDomain, PlanVersionId, ScanReadBudget,
-};
+use novarocks_physical_plan::{PipelineDopDomain, PlanVersionId};
 use novarocks_type_contract::ValueLogicalType;
 
 #[test]
@@ -73,10 +71,6 @@ fn public_sql_map_subscript_preserves_largeint_key_identity() {
                 min: 1,
                 max: 8,
                 requires_power_of_two: true,
-            },
-            ScanReadBudget {
-                max_batch_rows: MAX_SCAN_BATCH_ROWS,
-                max_batch_bytes: MAX_SCAN_BATCH_BYTES,
             },
             DEFAULT_COMPLETION_LIMITS,
         );
@@ -153,10 +147,6 @@ fn public_sql_empty_map_lookup_keeps_uninhabited_key_and_actual_probe() {
                 min: 1,
                 max: 8,
                 requires_power_of_two: true,
-            },
-            ScanReadBudget {
-                max_batch_rows: MAX_SCAN_BATCH_ROWS,
-                max_batch_bytes: MAX_SCAN_BATCH_BYTES,
             },
             DEFAULT_COMPLETION_LIMITS,
         );

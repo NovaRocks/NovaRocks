@@ -99,6 +99,7 @@ pub struct CompiledTableFunctionProcessorFactory {
     left_outer: bool,
     output_layout: novarocks_local_program::StaticLayout,
     error: Arc<RuntimeErrorState>,
+    batch_rows: std::num::NonZeroU32,
 }
 
 impl CompiledTableFunctionProcessorFactory {
@@ -106,6 +107,7 @@ impl CompiledTableFunctionProcessorFactory {
         program: Arc<LocalProgram>,
         node: ProgramNodeId,
         error: Arc<RuntimeErrorState>,
+        batch_rows: std::num::NonZeroU32,
     ) -> ExecutionResult<Self> {
         let at = node.index();
         let nodes = program.graph().nodes();
@@ -264,6 +266,7 @@ impl CompiledTableFunctionProcessorFactory {
             left_outer: *is_left_join,
             output_layout,
             error,
+            batch_rows,
         })
     }
 }
@@ -288,7 +291,7 @@ impl OperatorFactory for CompiledTableFunctionProcessorFactory {
             construction: None,
             control: RuntimeKernelControl::new(Arc::clone(&self.error)),
             cursor: None,
-            batch_rows: None,
+            batch_rows: self.batch_rows,
             failed: false,
         }))
     }
@@ -308,7 +311,7 @@ struct CompiledTableFunctionProcessor {
     construction: Option<Arc<dyn InputConstructionFactory>>,
     control: RuntimeKernelControl,
     cursor: Option<OutputCursor>,
-    batch_rows: Option<std::num::NonZeroUsize>,
+    batch_rows: std::num::NonZeroU32,
     failed: bool,
 }
 
@@ -596,10 +599,6 @@ impl OperatorLifecycle for CompiledTableFunctionProcessor {
     }
     fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
         self.control.bind_runtime_memory(state);
-        self.batch_rows = Some(
-            std::num::NonZeroUsize::new(state.chunk_size())
-                .ok_or_else(|| self.failure(CompiledTableFailureKind::InvalidBatchRows))?,
-        );
         Ok(())
     }
     fn begin_exit(&mut self) -> ExecutionResult<()> {
@@ -642,10 +641,7 @@ impl TransformKernel for CompiledTableFunctionProcessor {
                 return Err(self.failure(CompiledTableFailureKind::InputValueBindings));
             }
         }
-        let chunk_rows = self
-            .batch_rows
-            .ok_or_else(|| self.failure(CompiledTableFailureKind::MissingBatchRows))?
-            .get();
+        let chunk_rows = self.batch_rows.get() as usize;
         let rows = u64::try_from(chunk.len()).expect("supported row count fits u64");
         let result = self
             .invoke(chunk.record_batch(), chunk_rows)
@@ -675,11 +671,7 @@ impl TransformKernel for CompiledTableFunctionProcessor {
         if !ctx.work().try_consume(1) {
             return Ok(StepResult::new(None, NextStep::Yield, 0));
         }
-        let rows = self
-            .batch_rows
-            .expect("an installed cursor has a prepared batch size")
-            .get()
-            .min(cursor.parent_rows.len() - cursor.offset);
+        let rows = (self.batch_rows.get() as usize).min(cursor.parent_rows.len() - cursor.offset);
         let output = match self.output_page(cursor, rows) {
             Ok(output) => output,
             Err(cause) => {

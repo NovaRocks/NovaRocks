@@ -27,8 +27,7 @@ use novarocks_fs::{
     FsAccessResolver, TokioFileIoRuntime, TokioFileIoSpawner,
 };
 use novarocks_spi::connector::read_stack::{
-    CompleteAllDynamicFilter, ConnectorSplit, SchemaTableName, SourcePage, SplitWeight,
-    TupleDomain,
+    CompleteAllDynamicFilter, ConnectorSplit, SchemaTableName, SourcePage, SplitWeight, TupleDomain,
 };
 use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
 
@@ -55,6 +54,7 @@ fn the_provider_shares_one_footer_cache_and_one_delete_manager() {
         Arc::clone(&io_spawner),
     );
     let context = FileReadContext {
+        turn: None,
         cancellation: FileCancellation::new(),
         deadline: Some(Instant::now() + Duration::from_secs(60)),
         runtime: file_runtime,
@@ -65,10 +65,6 @@ fn the_provider_shares_one_footer_cache_and_one_delete_manager() {
         binding,
         context,
         IcebergPageSourceProviderOptions {
-            budget: FileReadBudget {
-                max_rows: NonZeroUsize::new(1024).expect("nonzero"),
-                max_bytes: NonZeroUsize::new(1024 * 1024).expect("nonzero"),
-            },
             reader_options: FileReaderOptions::default(),
             cache_options: disabled_external_cache_options(),
         },
@@ -190,6 +186,7 @@ fn staged_small_file() -> (
         runtime.handle().clone(),
     );
     let context = FileReadContext {
+        turn: None,
         cancellation: FileCancellation::new(),
         deadline: Some(Instant::now() + Duration::from_secs(10)),
         runtime: Arc::clone(&file_runtime),
@@ -214,17 +211,28 @@ fn staged_small_file() -> (
                 enable_parquet_reader_page_index: true,
                 ..Default::default()
             },
-            ..IcebergPageSourceProviderOptions::with_default_budget()
+            ..IcebergPageSourceProviderOptions::default()
         },
     );
     let mut prepared = IcebergPreparedPageSource {
+        sizing: crate::file_reader::default_parquet_reader_sizing(),
+        output_layout: IcebergReadLayout::Offsets,
         table,
         split,
         columns: vec![IcebergColumnHandle::base_column_of(&schema, 1).unwrap()],
         sequence_id: 0,
         access_binding: provider.access_binding.clone(),
         context: provider.context.clone(),
-        options: provider.options.clone(),
+        options: IcebergPageSourceProviderOptions {
+            reader_options: FileReaderOptions {
+                parquet_interpretation_policy:
+                    novarocks_fs::ParquetInterpretationPolicy::DerivedByteRepresentation {
+                        preserve_top_level_dictionary: true,
+                    },
+                ..provider.options.reader_options
+            },
+            ..provider.options.clone()
+        },
         footers: Arc::clone(&provider.footers),
         delete_manager: Arc::clone(&provider.delete_manager),
         phase: FuturePreparationPhase::Unstarted,
@@ -245,7 +253,9 @@ fn staged_small_file() -> (
     let footer = prepared.footer.as_ref().expect("prepared footer");
     assert_eq!(
         footer.interpretation_policy(),
-        novarocks_fs::ParquetInterpretationPolicy::SkipArrowHint,
+        novarocks_fs::ParquetInterpretationPolicy::DerivedByteRepresentation {
+            preserve_top_level_dictionary: true
+        },
     );
     assert_eq!(footer.physical_columns()[0].field_id(), Some(1));
     assert_eq!(
@@ -367,7 +377,15 @@ fn the_provider_streams_a_data_split_and_refuses_a_pair_it_cannot_read() {
         <IcebergPageSourceProvider as ProviderReadPageSourceProvider<
             IcebergExecutionReadRuntime,
         >>::create_page_stream(
-            &provider, &session, table, split, 0, &columns, &filter, &budget,
+            &provider,
+            &session,
+            table,
+            Some(&IcebergReadExecution::default()),
+            split,
+            0,
+            &columns,
+            &filter,
+            &budget,
         )
     };
 
@@ -395,8 +413,7 @@ fn the_provider_streams_a_data_split_and_refuses_a_pair_it_cannot_read() {
     let reference = crate::typed_read::system_table::IcebergSystemTableReference::try_new(
         crate::typed_read::system_table::IcebergSystemTableReferenceParams {
             schema_table_name: SchemaTableName::try_new("sales", "orders").unwrap(),
-            system_table_type:
-                crate::typed_read::system_table::IcebergSystemTableType::Snapshots,
+            system_table_type: crate::typed_read::system_table::IcebergSystemTableType::Snapshots,
             metadata_file_location: "file:///metadata/00001.metadata.json".to_owned(),
             table_uuid: "7b7e3b8a-6a55-4c8e-9a5c-2b3f0c1d2e3f".to_owned(),
             snapshot_id: None,

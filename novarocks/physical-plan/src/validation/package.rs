@@ -280,7 +280,6 @@ fn validate_package_scans(input: &FragmentPackageInput, errors: &mut ValidationC
     for node in fragment.nodes().values() {
         let NodeKind::Scan {
             relation,
-            read_budget,
             provider_outputs,
             ..
         } = &node.kind
@@ -360,14 +359,6 @@ fn validate_package_scans(input: &FragmentPackageInput, errors: &mut ValidationC
             errors.push(ValidationError::new(
                 &path,
                 "frozen scan assignment type differs from its exact physical schema ordinal",
-            ));
-        }
-        if scan.max_batch_rows().get() != read_budget.max_batch_rows
-            || scan.max_batch_bytes().get() != read_budget.max_batch_bytes
-        {
-            errors.push(ValidationError::new(
-                &path,
-                "frozen scan execution bounds or work source differ from the physical scan",
             ));
         }
         let assignment_columns = scan

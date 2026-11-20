@@ -65,7 +65,6 @@ pub(crate) fn select_fragment_pipeline_dop(
 /// deliberately does not own runtime defaults or execution types.
 pub(crate) fn encode_query_options(src: &QueryOptions) -> wire::QueryOptions {
     wire::QueryOptions {
-        batch_size: src.batch_size.unwrap_or_default(),
         query_timeout: src.query_timeout.unwrap_or_default(),
         enable_profile: src.enable_profile,
         pipeline_dop: src.pipeline_dop.unwrap_or_default(),

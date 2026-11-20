@@ -30,8 +30,8 @@
 use std::sync::Arc;
 
 use novarocks_fs::{
-    BoundFile, CacheOptions, DataCachePolicy, FileIdentity, FileReadBudget, FileReadContext,
-    FileReadRange, FileReaderOptions, ParquetMetadataInspection, PreparedFileInput,
+    BoundFile, CacheOptions, DataCachePolicy, FileIdentity, FileReadContext, FileReadRange,
+    FileReaderOptions, ParquetMetadataInspection, PreparedFileInput, ReaderSizing,
     inspect_parquet_metadata_from_prepared, parquet_footer_range,
 };
 use novarocks_spi::connector::ConnectorError;
@@ -62,31 +62,23 @@ use super::rewrite_position_page_source::{
     IcebergRewritePositionDeleteFilesPageSourceRequest,
     create_iceberg_rewrite_position_delete_files_page_stream,
 };
+use super::runtime::{IcebergReadExecution, IcebergReadLayout};
 use super::table_execute::IcebergRewritePositionDeleteFilesSplit;
 use super::table_execute::{IcebergTableExecuteHandle, IcebergTableExecuteProcedureHandle};
 use super::{IcebergReadSplit, IcebergRuntimeRelation};
 
-/// Reader policy the fragment instance chose, not something a split carries.
+/// File and cache capabilities of the exact fragment scan binding.
 #[derive(Clone, Debug)]
 pub struct IcebergPageSourceProviderOptions {
-    /// The row and byte budget of one produced page.
-    pub budget: FileReadBudget,
     pub reader_options: FileReaderOptions,
     /// Query-scoped external cache policy, converted from the neutral SPI
     /// policy at the connector boundary.
     pub cache_options: CacheOptions,
 }
 
-impl IcebergPageSourceProviderOptions {
-    /// The budget a fragment instance uses when it states no preference. The
-    /// values match the other native reader budgets rather than introducing a
-    /// third number for the same idea.
-    pub fn with_default_budget() -> Self {
+impl Default for IcebergPageSourceProviderOptions {
+    fn default() -> Self {
         Self {
-            budget: FileReadBudget {
-                max_rows: std::num::NonZeroUsize::new(4096).expect("nonzero"),
-                max_bytes: std::num::NonZeroUsize::new(8 * 1024 * 1024).expect("nonzero"),
-            },
             reader_options: FileReaderOptions::default(),
             cache_options: disabled_external_cache_options(),
         }
@@ -127,6 +119,8 @@ struct IcebergPreparedPageSource {
     access_binding: IcebergReadBinding,
     context: FileReadContext,
     options: IcebergPageSourceProviderOptions,
+    sizing: ReaderSizing,
+    output_layout: super::runtime::IcebergReadLayout,
     footers: Arc<ParquetFooterCache>,
     delete_manager: Arc<DeleteManager>,
     phase: FuturePreparationPhase,
@@ -183,7 +177,7 @@ impl IcebergPreparedPageSource {
             file.clone(),
             input.clone(),
             self.context.clone(),
-            novarocks_fs::ParquetInterpretationPolicy::SkipArrowHint,
+            self.options.reader_options.parquet_interpretation_policy,
         )
         .map_err(map_file_error)?;
         self.footers.remember(inspection.clone())?;
@@ -201,7 +195,8 @@ impl IcebergPreparedPageSource {
             self.phase = FuturePreparationPhase::Ready;
             return Ok(false);
         }
-        let relation = IcebergReadRelation::of_table(&self.table, self.split.partition_spec_id())?;
+        let relation = IcebergReadRelation::of_table(&self.table, self.split.partition_spec_id())?
+            .with_output_layout(self.output_layout);
         let footer = self
             .footer
             .as_ref()
@@ -217,7 +212,7 @@ impl IcebergPreparedPageSource {
             cache: Some(DataCachePolicy::external(
                 self.options.cache_options.clone(),
             )),
-            budget: self.options.budget,
+            budget: self.sizing,
             reader_options: self.options.reader_options,
             row_group_ordinal: None,
         })?;
@@ -410,6 +405,7 @@ impl<P> ProviderPreparedPageSource<P> for IcebergPreparedPageSource
 where
     P: novarocks_spi::connector::read_stack::adapter::ProviderReadRuntime<
             Table = IcebergRuntimeRelation,
+            Execution = IcebergReadExecution,
             Column = IcebergColumnHandle,
             Transaction = super::HiveTransactionHandle,
             Split = IcebergReadSplit,
@@ -474,7 +470,8 @@ impl IcebergPreparedPageSource {
             FuturePreparationPhase::Unstarted | FuturePreparationPhase::Ready => {}
         }
         let control = Arc::clone(&self.control) as Arc<dyn ConnectorPreparationControl>;
-        let relation = IcebergReadRelation::of_table(&self.table, self.split.partition_spec_id())?;
+        let relation = IcebergReadRelation::of_table(&self.table, self.split.partition_spec_id())?
+            .with_output_layout(self.output_layout);
         Ok(Promotion {
             relation,
             input,
@@ -501,12 +498,13 @@ impl IcebergPreparedPageSource {
             cache: Some(DataCachePolicy::external(
                 self.options.cache_options.clone(),
             )),
-            budget: self.options.budget,
+            budget: self.sizing,
             reader_options: self.options.reader_options,
             scheduled_split_sequence_id: self.sequence_id,
             dynamic_filter: Arc::clone(dynamic_filter),
             prepared_input: input,
             pending_preparation_control: Some(control),
+            output_projection: None,
         }
     }
 }
@@ -521,7 +519,12 @@ impl IcebergPageSourceProvider {
         let system_tables = Arc::new(super::system_page_source::IcebergSystemTableProvider::new(
             access_binding.clone(),
             context.clone(),
-            options.budget.max_rows,
+            std::num::NonZeroUsize::new(
+                novarocks_spi::connector::ENGINE_OUTPUT_POLICY
+                    .max_rows
+                    .get() as usize,
+            )
+            .expect("output engine policy is nonzero"),
         ));
         Self {
             access_binding,
@@ -549,6 +552,7 @@ impl<P> novarocks_spi::connector::read_stack::adapter::ProviderReadPageSourcePro
 where
     P: novarocks_spi::connector::read_stack::adapter::ProviderReadRuntime<
             Table = IcebergRuntimeRelation,
+            Execution = IcebergReadExecution,
             Column = IcebergColumnHandle,
             Transaction = super::HiveTransactionHandle,
             Split = IcebergReadSplit,
@@ -558,11 +562,15 @@ where
         &self,
         _session: &ConnectorSession,
         table: &IcebergRuntimeRelation,
+        execution: Option<&IcebergReadExecution>,
         split: &IcebergReadSplit,
         scheduled_split_sequence_id: u64,
         columns: &[novarocks_spi::connector::read_stack::Assignment<IcebergColumnHandle>],
         _dynamic_filter: &Arc<dyn DynamicFilter<IcebergColumnHandle>>,
     ) -> Result<ProviderPreparationStart<P>, ConnectorError> {
+        let execution =
+            execution.ok_or_else(|| invalid("Iceberg read has no frozen execution settings"))?;
+        let settings = self.reader_settings(execution)?;
         let (IcebergRuntimeRelation::Table(table), IcebergReadSplit::Data(split)) = (table, split)
         else {
             return Ok(ProviderPreparationStart::Unsupported);
@@ -578,7 +586,8 @@ where
             .collect::<Vec<_>>();
         let binding = self.access_binding.clone();
         let footers = Arc::clone(&self.footers);
-        let options = self.options.clone();
+        let mut options = self.options.clone();
+        options.reader_options = settings.options;
         if self.context.range.is_none() {
             return Ok(ProviderPreparationStart::Unsupported);
         }
@@ -591,6 +600,8 @@ where
                 access_binding: binding,
                 context: self.context.clone(),
                 options,
+                sizing: settings.sizing,
+                output_layout: settings.layout,
                 footers,
                 delete_manager: Arc::clone(&self.delete_manager),
                 phase: FuturePreparationPhase::Unstarted,
@@ -606,12 +617,16 @@ where
         &self,
         _session: &ConnectorSession,
         table: &IcebergRuntimeRelation,
+        execution: Option<&IcebergReadExecution>,
         split: &IcebergReadSplit,
         scheduled_split_sequence_id: u64,
         columns: &[novarocks_spi::connector::read_stack::Assignment<IcebergColumnHandle>],
         dynamic_filter: &Arc<dyn DynamicFilter<IcebergColumnHandle>>,
         budget: &ConnectorPollBudget,
     ) -> Result<OwnedConnectorPageStream, ConnectorError> {
+        let execution =
+            execution.ok_or_else(|| invalid("Iceberg read has no frozen execution settings"))?;
+        let settings = self.reader_settings(execution)?;
         let columns = columns
             .iter()
             .map(|assignment| assignment.column().clone())
@@ -633,6 +648,7 @@ where
                     &columns,
                     scheduled_split_sequence_id,
                     dynamic_filter,
+                    settings,
                 ),
                 budget,
             ),
@@ -647,7 +663,8 @@ where
                 )
             }
             (IcebergRuntimeRelation::Table(table), IcebergReadSplit::Data(split)) => {
-                let relation = IcebergReadRelation::of_table(table, split.partition_spec_id())?;
+                let relation = IcebergReadRelation::of_table(table, split.partition_spec_id())?
+                    .with_output_layout(settings.layout);
                 create_iceberg_page_stream(
                     self.data_request(
                         &relation,
@@ -655,6 +672,7 @@ where
                         &columns,
                         scheduled_split_sequence_id,
                         dynamic_filter,
+                        settings,
                     ),
                     budget,
                 )
@@ -666,7 +684,43 @@ where
     }
 }
 
+fn reader_sizing(execution: &IcebergReadExecution) -> Result<ReaderSizing, ConnectorError> {
+    let max_read_rows = std::num::NonZeroUsize::new(execution.sizing.max_read_rows as usize)
+        .ok_or_else(|| invalid("Frozen Iceberg reader row limit is zero"))?;
+    let max_read_bytes = u64::try_from(execution.sizing.max_read_bytes)
+        .map_err(|_| invalid("Frozen Iceberg reader byte target is negative"))?;
+    Ok(ReaderSizing {
+        max_read_rows,
+        max_read_bytes,
+    })
+}
+
+struct ReaderSettings {
+    sizing: ReaderSizing,
+    options: FileReaderOptions,
+    layout: IcebergReadLayout,
+}
+
 impl IcebergPageSourceProvider {
+    fn reader_settings(
+        &self,
+        execution: &IcebergReadExecution,
+    ) -> Result<ReaderSettings, ConnectorError> {
+        let sizing = reader_sizing(execution)?;
+        let options = FileReaderOptions {
+            parquet_interpretation_policy:
+                novarocks_fs::ParquetInterpretationPolicy::DerivedByteRepresentation {
+                    preserve_top_level_dictionary: execution.preserve_top_level_dictionary,
+                },
+            ..self.options.reader_options
+        };
+        Ok(ReaderSettings {
+            sizing,
+            options,
+            layout: execution.layout,
+        })
+    }
+
     fn change_window_request<'a>(
         &self,
         handle: &'a IcebergChangeWindowHandle,
@@ -674,6 +728,7 @@ impl IcebergPageSourceProvider {
         columns: &'a [IcebergColumnHandle],
         scheduled_split_sequence_id: u64,
         dynamic_filter: &Arc<dyn DynamicFilter<IcebergColumnHandle>>,
+        settings: ReaderSettings,
     ) -> IcebergChangeWindowPageSourceRequest<'a> {
         IcebergChangeWindowPageSourceRequest {
             handle,
@@ -686,8 +741,9 @@ impl IcebergPageSourceProvider {
             cache: Some(DataCachePolicy::external(
                 self.options.cache_options.clone(),
             )),
-            budget: self.options.budget,
-            reader_options: self.options.reader_options,
+            budget: settings.sizing,
+            reader_options: settings.options,
+            output_layout: settings.layout,
             scheduled_split_sequence_id,
             dynamic_filter: Arc::clone(dynamic_filter),
         }
@@ -703,7 +759,6 @@ impl IcebergPageSourceProvider {
             columns,
             access_binding: self.access_binding.clone(),
             context: self.context.clone(),
-            budget: self.options.budget,
         }
     }
 
@@ -714,6 +769,7 @@ impl IcebergPageSourceProvider {
         columns: &'a [IcebergColumnHandle],
         scheduled_split_sequence_id: u64,
         dynamic_filter: &Arc<dyn DynamicFilter<IcebergColumnHandle>>,
+        settings: ReaderSettings,
     ) -> IcebergPageSourceRequest<'a> {
         IcebergPageSourceRequest {
             relation,
@@ -727,12 +783,13 @@ impl IcebergPageSourceProvider {
             cache: Some(DataCachePolicy::external(
                 self.options.cache_options.clone(),
             )),
-            budget: self.options.budget,
-            reader_options: self.options.reader_options,
+            budget: settings.sizing,
+            reader_options: settings.options,
             scheduled_split_sequence_id,
             dynamic_filter: Arc::clone(dynamic_filter),
             prepared_input: None,
             pending_preparation_control: None,
+            output_projection: None,
         }
     }
 }

@@ -22,6 +22,7 @@ use novarocks_spi::connector::{
     ConnectorCodecError, ConnectorDecodeContext, ConnectorPrivateDecoder, ConnectorPrivateEncoder,
 };
 
+use crate::typed_read::runtime::IcebergReadExecution;
 use crate::typed_read::{
     HiveTransactionHandle, IcebergColumnHandle, IcebergReadSplit, IcebergRuntimeRelation,
 };
@@ -66,16 +67,17 @@ impl IcebergReadCodecs {
     pub fn encode_table(
         &self,
         value: &IcebergRuntimeRelation,
+        execution: IcebergReadExecution,
     ) -> Result<Bytes, ConnectorCodecError> {
-        IcebergReadWireCodec.encode_private(value)
+        IcebergReadWireCodec.encode_read_table(value, execution)
     }
 
     pub fn decode_table(
         &self,
         payload: &[u8],
         context: &mut ConnectorDecodeContext<'_>,
-    ) -> Result<IcebergRuntimeRelation, ConnectorCodecError> {
-        IcebergReadWireCodec.decode_private(payload, context)
+    ) -> Result<(IcebergRuntimeRelation, IcebergReadExecution), ConnectorCodecError> {
+        IcebergReadWireCodec.decode_read_table(payload, context)
     }
 
     pub fn encode_column(&self, value: &IcebergColumnHandle) -> Result<Bytes, ConnectorCodecError> {

@@ -37,7 +37,7 @@ use arrow::datatypes::{Schema, SchemaRef};
 
 use crate::exec::node::table_writer::PositionShardChunkSource;
 use crate::runtime::mem_tracker::MemTracker;
-use novarocks_spi::connector::ConnectorOutputMemoryToken;
+use novarocks_spi::connector::{ConnectorOutputMemoryToken, SharedSourceHold};
 use novarocks_type_contract::ValueTypeStorageLifetime;
 use novarocks_type_contract::owned_resources::layout::LayoutResourceError;
 use novarocks_types::SlotId;
@@ -84,6 +84,7 @@ pub struct Chunk {
     /// charge for the same buffers. The last chunk owner releases the original
     /// provider charge.
     connector_output_memory: Option<Arc<Mutex<ConnectorOutputMemoryToken>>>,
+    connector_source_holds: Option<Arc<Vec<SharedSourceHold>>>,
     // Actual array type backing may be shared by later slices. The current
     // wrapper hold can then exit independently of the shared backing hold.
     array_type_storage: ValueTypeStorageLifetime,
@@ -99,6 +100,7 @@ pub struct ChunkBatchProjection {
     chunk_schema: ChunkSchemaRef,
     accounting: Option<ChunkAccountingCharge>,
     connector_output_memory: Option<Arc<Mutex<ConnectorOutputMemoryToken>>>,
+    connector_source_holds: Option<Arc<Vec<SharedSourceHold>>>,
     array_type_storage: ValueTypeStorageLifetime,
     construction_storage: ValueTypeStorageLifetime,
     output_column_metadata: Option<super::OutputColumnMetadata>,
@@ -110,6 +112,7 @@ struct ChunkSourceStorageHold {
     _schema: ChunkSchemaRef,
     _accounting: Option<ChunkAccountingCharge>,
     _connector_output_memory: Option<Arc<Mutex<ConnectorOutputMemoryToken>>>,
+    _connector_source_holds: Option<Arc<Vec<SharedSourceHold>>>,
     _array_type_storage: ValueTypeStorageLifetime,
     _construction_storage: ValueTypeStorageLifetime,
     _storage: ValueTypeStorageLifetime,
@@ -164,6 +167,7 @@ impl ChunkBatchProjection {
             chunk_schema: self.chunk_schema,
             accounting: self.accounting,
             connector_output_memory: self.connector_output_memory,
+            connector_source_holds: self.connector_source_holds,
             array_type_storage: self.array_type_storage,
             construction_storage: self.construction_storage,
             output_column_metadata: self.output_column_metadata,
@@ -197,11 +201,13 @@ impl Chunk {
                 super::ChunkSourceAuthorityRef::from_attached(
                     Some(owner),
                     self.connector_output_memory.as_ref(),
+                    self.connector_source_holds.as_ref(),
                 )
             }
             None => super::ChunkSourceAuthorityRef::from_attached(
                 None,
                 self.connector_output_memory.as_ref(),
+                self.connector_source_holds.as_ref(),
             ),
         }
     }
@@ -216,6 +222,7 @@ impl Chunk {
     ) -> Result<ValueTypeStorageLifetime, E> {
         if self.accounting.is_none()
             && self.connector_output_memory.is_none()
+            && self.connector_source_holds.is_none()
             && self.output_column_metadata.is_none()
         {
             let storage = storage.retaining_observed(&self.array_type_storage, &mut request)?;
@@ -232,6 +239,7 @@ impl Chunk {
                 _schema: self.chunk_schema.clone(),
                 _accounting: self.accounting.clone(),
                 _connector_output_memory: self.connector_output_memory.clone(),
+                _connector_source_holds: self.connector_source_holds.clone(),
                 _array_type_storage: self.array_type_storage.clone(),
                 _construction_storage: self.construction_storage.clone(),
                 _output_column_metadata: self.output_column_metadata.clone(),
@@ -265,6 +273,7 @@ impl Chunk {
                 _schema: source.chunk_schema.clone(),
                 _accounting: source.accounting.clone(),
                 _connector_output_memory: source.connector_output_memory.clone(),
+                _connector_source_holds: source.connector_source_holds.clone(),
                 _array_type_storage: source.array_type_storage.clone(),
                 _construction_storage: source.construction_storage.clone(),
                 _output_column_metadata: source.output_column_metadata.clone(),
@@ -291,6 +300,7 @@ impl Chunk {
             chunk_schema: self.chunk_schema.clone(),
             accounting: self.accounting.clone(),
             connector_output_memory: self.connector_output_memory.clone(),
+            connector_source_holds: self.connector_source_holds.clone(),
             array_type_storage: self.array_type_storage.clone(),
             construction_storage: self.construction_storage.clone(),
             output_column_metadata: self.output_column_metadata.clone(),
@@ -302,6 +312,7 @@ impl Chunk {
             chunk_schema: self.chunk_schema,
             accounting: self.accounting,
             connector_output_memory: self.connector_output_memory,
+            connector_source_holds: self.connector_source_holds,
             array_type_storage: self.array_type_storage,
             construction_storage: self.construction_storage,
             output_column_metadata: self.output_column_metadata,
@@ -317,6 +328,7 @@ impl Chunk {
     pub(super) fn retain_source_buffer_funding(&mut self, source: &Self) {
         self.accounting = source.accounting.clone();
         self.connector_output_memory = source.connector_output_memory.clone();
+        self.connector_source_holds = source.connector_source_holds.clone();
         self.output_column_metadata = source.output_column_metadata.clone();
     }
 
@@ -416,6 +428,7 @@ impl Chunk {
             chunk_schema,
             accounting: None,
             connector_output_memory: None,
+            connector_source_holds: None,
             array_type_storage: source.storage.clone(),
             construction_storage: source.storage,
             position_shard_source: None,
@@ -528,6 +541,7 @@ impl Chunk {
             chunk_schema,
             accounting: None,
             connector_output_memory: None,
+            connector_source_holds: None,
             array_type_storage: ValueTypeStorageLifetime::pure(),
             construction_storage: ValueTypeStorageLifetime::pure(),
             position_shard_source: None,
@@ -584,6 +598,7 @@ impl Chunk {
                 chunk_schema,
                 accounting: None,
                 connector_output_memory: None,
+                connector_source_holds: None,
                 array_type_storage: ValueTypeStorageLifetime::pure(),
                 construction_storage: ValueTypeStorageLifetime::pure(),
                 position_shard_source: None,
@@ -599,6 +614,7 @@ impl Chunk {
             chunk_schema,
             accounting: None,
             connector_output_memory: None,
+            connector_source_holds: None,
             array_type_storage: ValueTypeStorageLifetime::pure(),
             construction_storage: ValueTypeStorageLifetime::pure(),
             position_shard_source: None,
@@ -740,6 +756,7 @@ impl Chunk {
             chunk_schema: Arc::clone(&self.chunk_schema),
             accounting: None,
             connector_output_memory: self.connector_output_memory.clone(),
+            connector_source_holds: self.connector_source_holds.clone(),
             array_type_storage: self.array_type_storage.clone(),
             construction_storage: ValueTypeStorageLifetime::pure(),
             position_shard_source: self.position_shard_source.clone(),
@@ -830,6 +847,7 @@ impl Chunk {
             chunk_schema: self.chunk_schema_ref(),
             accounting: None,
             connector_output_memory: None,
+            connector_source_holds: None,
             array_type_storage: self.array_type_storage.clone(),
             construction_storage: storage,
             position_shard_source: self.position_shard_source.clone(),
@@ -883,7 +901,7 @@ impl Chunk {
             }
             return;
         }
-        if self.connector_output_memory.is_some() {
+        if self.connector_output_memory.is_some() || self.connector_source_holds.is_some() {
             return;
         }
         let bytes = chunk_bytes_i64(&self.batch);
@@ -911,7 +929,7 @@ impl Chunk {
                 ChunkAccountingCharge::AdditionalBuffers(_) => Ok(()),
             };
         }
-        if self.connector_output_memory.is_some() {
+        if self.connector_output_memory.is_some() || self.connector_source_holds.is_some() {
             return Ok(());
         }
         let bytes = chunk_bytes_i64(&self.batch);
@@ -948,6 +966,12 @@ impl Chunk {
         if let Some(ChunkAccountingCharge::WholeBatch(accounting)) = self.accounting.take() {
             return Some(ChunkMemoryCharge::native(accounting));
         }
+        if let Some(holds) = &self.connector_source_holds {
+            return Some(ChunkMemoryCharge::shared_connector(
+                Arc::clone(holds),
+                self.connector_output_memory.clone(),
+            ));
+        }
         let output_memory = self.connector_output_memory.take()?;
         if Arc::strong_count(&output_memory) == 1 {
             return Some(ChunkMemoryCharge::connector(output_memory));
@@ -969,6 +993,7 @@ impl Chunk {
             || !ledger.initialized()
             || self.accounting.is_some()
             || self.connector_output_memory.is_some()
+            || self.connector_source_holds.is_some()
         {
             return Err(novarocks_functions::KernelFailure::InvalidProgram(
                 novarocks_functions::KernelDiagnostic::new(
@@ -977,6 +1002,19 @@ impl Chunk {
             ));
         }
         self.accounting = Some(ChunkAccountingCharge::AdditionalBuffers(ledger));
+        Ok(())
+    }
+
+    pub(crate) fn attach_connector_source_holds(
+        &mut self,
+        source_holds: Arc<Vec<SharedSourceHold>>,
+    ) -> Result<(), ChunkConstructionFailure> {
+        if self.accounting.is_some() || self.connector_source_holds.is_some() {
+            return Err(ChunkConstructionFailure::source(
+                ChunkViolation::AccountingOwner,
+            ));
+        }
+        self.connector_source_holds = Some(source_holds);
         Ok(())
     }
 
@@ -1034,6 +1072,7 @@ impl Default for Chunk {
             chunk_schema: Arc::new(ChunkSchema::empty()),
             accounting: None,
             connector_output_memory: None,
+            connector_source_holds: None,
             array_type_storage: ValueTypeStorageLifetime::pure(),
             construction_storage: ValueTypeStorageLifetime::pure(),
             position_shard_source: None,

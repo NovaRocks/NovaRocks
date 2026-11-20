@@ -258,7 +258,7 @@ fn source_fixture() -> SourceFixture {
             },
         )
         .unwrap();
-    super::super::family_fixture::seal_no_call_units(&mut builder);
+    super::super::super::family_fixture::seal_no_call_units(&mut builder);
     builder
         .add_project(
             project,

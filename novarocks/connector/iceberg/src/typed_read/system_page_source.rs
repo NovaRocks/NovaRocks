@@ -2143,11 +2143,9 @@ pub fn project_system_relation_columns(
 /// means a page request never waits on object storage halfway through a
 /// relation whose rows have to agree with each other.
 pub struct IcebergSystemPageSource {
-    /// The projected output columns, already in assignment order.
-    columns: Vec<ArrayRef>,
-    row_count: usize,
+    context: FileReadContext,
+    output: super::output::OutputCursor,
     emitted: usize,
-    max_page_rows: usize,
     bytes_read: u64,
     retained_bytes: u64,
 }
@@ -2160,6 +2158,7 @@ impl IcebergSystemPageSource {
         row_count: usize,
         max_page_rows: NonZeroUsize,
         bytes_read: u64,
+        context: &FileReadContext,
     ) -> Result<Self, ConnectorError> {
         if relation_columns.len() != schema.fields().len() {
             return Err(internal(
@@ -2196,11 +2195,28 @@ impl IcebergSystemPageSource {
             .iter()
             .map(|column| column.get_array_memory_size() as u64)
             .sum();
+        use novarocks_value_arrays::measure::{OutputColumn, OutputRows};
+        let specs = columns
+            .iter()
+            .map(|column| OutputColumn::new(column, column.data_type()))
+            .collect::<Vec<_>>();
+        let max_rows = u32::try_from(max_page_rows.get())
+            .ok()
+            .and_then(std::num::NonZeroU32::new)
+            .ok_or_else(|| internal("Iceberg metadata output page size exceeds its row domain"))?;
+        let output = super::output::OutputCursor::with_policy(
+            &specs,
+            OutputRows::Contiguous(0..row_count),
+            context,
+            novarocks_spi::connector::ScanOutputPolicy {
+                max_rows,
+                ..novarocks_spi::connector::ENGINE_OUTPUT_POLICY
+            },
+        )?;
         Ok(Self {
-            columns,
-            row_count,
+            context: context.clone(),
+            output,
             emitted: 0,
-            max_page_rows: max_page_rows.get(),
             bytes_read,
             retained_bytes,
         })
@@ -2209,28 +2225,15 @@ impl IcebergSystemPageSource {
 
 impl MaterializedPages for IcebergSystemPageSource {
     fn next_page(&mut self) -> Result<Option<SourcePage>, ConnectorError> {
-        if self.is_exhausted() {
-            return Ok(None);
+        let page = self.output.next_page(&self.context)?;
+        if let Some(page) = &page {
+            self.emitted += page.position_count();
         }
-        let rows = (self.row_count - self.emitted).min(self.max_page_rows);
-        let page = if self.columns.is_empty() {
-            // A count-only scan legitimately reports positions and no column.
-            SourcePage::zero_channel(rows)
-        } else {
-            SourcePage::try_new(
-                rows,
-                self.columns
-                    .iter()
-                    .map(|column| column.slice(self.emitted, rows))
-                    .collect(),
-            )?
-        };
-        self.emitted += rows;
-        Ok(Some(page))
+        Ok(page)
     }
 
     fn is_exhausted(&self) -> bool {
-        self.emitted >= self.row_count
+        self.output.is_exhausted()
     }
 
     fn metrics(&self) -> PageSourceMetrics {
@@ -2341,7 +2344,7 @@ impl IcebergSystemTableProvider {
                     })
                 })?;
             let bytes_read = reader.bytes_read;
-            relation.into_page_source(&manifest, max_page_rows, bytes_read)
+            relation.into_page_source(&manifest, max_page_rows, bytes_read, &context)
         };
         Ok(Box::pin(MaterializedPageStream::new(
             Box::pin(load),
@@ -2488,6 +2491,7 @@ impl FilesSplitRelation {
         manifest: &Manifest,
         max_page_rows: NonZeroUsize,
         bytes_read: u64,
+        context: &FileReadContext,
     ) -> Result<IcebergSystemPageSource, ConnectorError> {
         let rows = manifest_rows(
             &self.manifest,
@@ -2524,6 +2528,7 @@ impl FilesSplitRelation {
             rows.len(),
             max_page_rows,
             bytes_read,
+            context,
         )
     }
 }
@@ -2632,6 +2637,7 @@ impl SingleBackendRelation {
         rendered: RenderedRelation,
         max_page_rows: NonZeroUsize,
         bytes_read: u64,
+        context: &FileReadContext,
     ) -> Result<IcebergSystemPageSource, ConnectorError> {
         IcebergSystemPageSource::new(
             &self.schema,
@@ -2640,6 +2646,7 @@ impl SingleBackendRelation {
             rendered.row_count,
             max_page_rows,
             bytes_read,
+            context,
         )
     }
 }
@@ -2664,7 +2671,7 @@ async fn read_single_backend(
         }
     };
     let bytes_read = reader.bytes_read;
-    relation.into_page_source(rendered, max_page_rows, bytes_read)
+    relation.into_page_source(rendered, max_page_rows, bytes_read, reader.context)
 }
 
 /// One pinned snapshot's manifest list.

@@ -16,7 +16,6 @@
 // under the License.
 
 use std::fs;
-use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -49,19 +48,12 @@ struct RewriteFixture {
 }
 
 impl RewriteFixture {
-    fn request(
-        &self,
-        max_rows: usize,
-    ) -> IcebergRewritePositionDeleteFilesPageSourceRequest<'_> {
+    fn request(&self, _max_rows: usize) -> IcebergRewritePositionDeleteFilesPageSourceRequest<'_> {
         IcebergRewritePositionDeleteFilesPageSourceRequest {
             split: &self.split,
             columns: &self.columns,
             access_binding: self.binding.clone(),
             context: self.context.clone(),
-            budget: FileReadBudget {
-                max_rows: NonZeroUsize::new(max_rows).expect("nonzero"),
-                max_bytes: NonZeroUsize::new(1024).expect("nonzero"),
-            },
         }
     }
 
@@ -151,6 +143,7 @@ fn rewrite_fixture() -> RewriteFixture {
         Arc::clone(&io_spawner),
     );
     let context = FileReadContext {
+        turn: None,
         cancellation: FileCancellation::new(),
         deadline: Some(Instant::now() + Duration::from_secs(10)),
         runtime: file_runtime,

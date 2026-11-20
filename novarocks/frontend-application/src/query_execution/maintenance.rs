@@ -884,12 +884,7 @@ fn freeze_rewrite_cohort_recipe(
             novarocks_sql::planning::dml::DmlFinalPlanContext::new(
                 crate::query_execution::physical_encoding::mint_plan_version(),
                 crate::query_execution::contract::completed_plan_dop_domain(None)?,
-                novarocks_sql::planning::dml::DmlFinalizedProviderReadSet::try_new([
-                    novarocks_sql::planning::dml::DmlFinalizedProviderRead {
-                        fact: read_fact,
-                        read_budget: rewrite_cohort_scan_read_budget(),
-                    },
-                ])?,
+                novarocks_sql::planning::dml::DmlFinalizedProviderReadSet::try_new([read_fact])?,
             ),
             novarocks_sql::planning::dml::DmlFinalizedWriteTargetSet::try_new([
                 novarocks_sql::planning::dml::DmlFinalizedWriteTarget {
@@ -990,13 +985,6 @@ fn finish_rewrite_cohort_recipe(
 ///
 /// A cohort has no session to lower this, so it states the contract's own
 /// maximum, which means "unconstrained" rather than a number someone chose.
-const fn rewrite_cohort_scan_read_budget() -> novarocks_physical_plan::ScanReadBudget {
-    novarocks_physical_plan::ScanReadBudget {
-        max_batch_rows: novarocks_physical_plan::MAX_SCAN_BATCH_ROWS,
-        max_batch_bytes: novarocks_physical_plan::MAX_SCAN_BATCH_BYTES,
-    }
-}
-
 fn rewrite_target_identity(
     session: &crate::query_execution::distributed_rewrite::ConnectorDistributedRewriteSession,
     cohort_id: ConnectorWriteCohortId,

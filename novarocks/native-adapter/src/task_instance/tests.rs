@@ -19,8 +19,8 @@ use std::num::{NonZeroU32, NonZeroUsize};
 
 use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_execution_contract::task_execution::descriptor::{
-    DataStreamPartitionType, ExchangeDestination, ExchangeEdge, ExchangeInbound,
-    ExchangeSource, ExchangeTopology, RuntimeEndpoint, TaskDescriptor,
+    DataStreamPartitionType, ExchangeDestination, ExchangeEdge, ExchangeInbound, ExchangeSource,
+    ExchangeTopology, RuntimeEndpoint, TaskDescriptor,
 };
 use novarocks_execution_contract::task_execution::domain::ExchangeEdgeId;
 use novarocks_execution_contract::task_execution::identity::TaskIdentity;
@@ -126,7 +126,6 @@ fn a_task_instance_is_projected_from_each_fact_owner() {
     let descriptor = descriptor();
     let participation_options = QueryOptions {
         pipeline_dop: Some(8),
-        batch_size: Some(1024),
         ..QueryOptions::default()
     };
     let instance = project_task_instance(
@@ -167,7 +166,6 @@ fn a_task_instance_is_projected_from_each_fact_owner() {
         Some(8),
         "the participation's options are taken as installed"
     );
-    assert_eq!(instance.query_options.batch_size(), Some(1024));
     assert_eq!(
         instance
             .raw_scan_ranges

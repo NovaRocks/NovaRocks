@@ -20,12 +20,9 @@ use crate::*;
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
 use novarocks_type_contract::ValueLogicalType;
-use std::{
-    num::NonZeroU64,
-    sync::{
-        Mutex,
-        atomic::{AtomicUsize, Ordering},
-    },
+use std::sync::{
+    Mutex,
+    atomic::{AtomicUsize, Ordering},
 };
 
 #[derive(Default)]
@@ -125,8 +122,6 @@ fn frozen_read(name: &str, count: usize) -> FrozenConnectorRead {
         TupleDomain::all(),
         None,
         vec![],
-        NonZeroU64::new(100).unwrap(),
-        NonZeroU64::new(4096).unwrap(),
     )
     .unwrap();
     let source = ConnectorReadStaticFacts::try_new(

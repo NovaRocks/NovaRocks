@@ -17,8 +17,10 @@
 
 mod async_reader;
 mod common;
+mod dictionary_representation;
 mod lifecycle;
 mod parquet_policy;
 mod parquet_session;
 mod reader;
+mod reader_sizing;
 mod writer_corpus;

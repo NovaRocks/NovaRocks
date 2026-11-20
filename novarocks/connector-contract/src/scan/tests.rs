@@ -21,10 +21,10 @@ use std::collections::BTreeMap;
 use crate::{
     CatalogHandle, CatalogVersion, ConnectorCodecCategory, ConnectorCodecRevision,
     ConnectorEncodedPayload, ConnectorEnvelopeHeader, ConnectorInstanceDescriptor,
-    ConnectorInstanceId, ConnectorProviderId, ConnectorReadBinding,
-    ConnectorReadRecipeSplitDraft, ConnectorReadRelationPayload,
-    ConnectorReadRelationRecipeCompiler, ConnectorReadRelationRecipeDraft,
-    ConnectorReadRelationRecipeError, ConnectorValue, Domain, ValueSet,
+    ConnectorInstanceId, ConnectorProviderId, ConnectorReadBinding, ConnectorReadRecipeSplitDraft,
+    ConnectorReadRelationPayload, ConnectorReadRelationRecipeCompiler,
+    ConnectorReadRelationRecipeDraft, ConnectorReadRelationRecipeError, ConnectorValue, Domain,
+    ValueSet,
 };
 use bytes::Bytes;
 
@@ -102,8 +102,6 @@ fn frozen_expression_trims_unused_call_capacity() {
             arguments,
         }),
         vec![],
-        NonZeroU64::new(1).unwrap(),
-        NonZeroU64::new(1).unwrap(),
     )
     .unwrap();
     let Some(ConnectorExpression::Call { arguments, .. }) = scan.remaining_expression() else {
@@ -130,8 +128,7 @@ fn rejects_aggregate_predicate_backing_over_scan_cap() {
         false,
     );
     let predicate =
-        TupleDomain::with_column_domains(BTreeMap::from([(ScanColumnId::new(0), domain)]))
-            .unwrap();
+        TupleDomain::with_column_domains(BTreeMap::from([(ScanColumnId::new(0), domain)])).unwrap();
     assert!(matches!(
         StaticConnectorScan::try_new(
             recipe(),
@@ -143,8 +140,6 @@ fn rejects_aggregate_predicate_backing_over_scan_cap() {
             TupleDomain::all(),
             None,
             vec![],
-            NonZeroU64::new(1).unwrap(),
-            NonZeroU64::new(1).unwrap(),
         ),
         Err(StaticConnectorScanError::TooManyRetainedBytes)
     ));
@@ -168,8 +163,6 @@ fn rejects_predicate_type_mismatch_before_binding() {
             TupleDomain::all(),
             None,
             vec![],
-            NonZeroU64::new(1).unwrap(),
-            NonZeroU64::new(1).unwrap(),
         ),
         Err(StaticConnectorScanError::PredicateTypeMismatch)
     ));
@@ -189,8 +182,6 @@ fn frozen_and_compiled_scans_share_one_public_contract() {
         TupleDomain::all(),
         None,
         vec![StaticScanDynamicFilter::new(7, Arc::from("v"))],
-        NonZeroU64::new(17).unwrap(),
-        NonZeroU64::new(8192).unwrap(),
     )
     .unwrap();
     let compiled = StaticConnectorScan::try_new(
@@ -200,15 +191,11 @@ fn frozen_and_compiled_scans_share_one_public_contract() {
         frozen.unenforced_predicate().clone(),
         frozen.remaining_expression().cloned(),
         frozen.dynamic_filters().to_vec(),
-        frozen.max_batch_rows(),
-        frozen.max_batch_bytes(),
     )
     .unwrap();
     assert_eq!(frozen.recipe(), compiled.recipe().draft());
     assert_eq!(frozen.assignments(), compiled.assignments());
     assert_eq!(frozen.dynamic_filters(), compiled.dynamic_filters());
-    assert_eq!(frozen.max_batch_rows().get(), 17);
-    assert_eq!(frozen.max_batch_bytes().get(), 8192);
     assert!(matches!(
         FrozenConnectorScan::try_new(
             frozen.recipe().clone(),
@@ -217,8 +204,6 @@ fn frozen_and_compiled_scans_share_one_public_contract() {
             TupleDomain::all(),
             None,
             vec![StaticScanDynamicFilter::new(7, Arc::from("unknown"))],
-            frozen.max_batch_rows(),
-            frozen.max_batch_bytes(),
         ),
         Err(StaticConnectorScanError::UnknownDynamicFilterVariable)
     ));

@@ -2935,7 +2935,6 @@ fn render_node_contract(
         NodeKind::Scan {
             occurrence,
             relation,
-            read_budget,
             provider_outputs,
             residuals,
             derived_values,
@@ -2948,11 +2947,9 @@ fn render_node_contract(
                 }
             };
             lines.push(format_args!(
-                "{pad}  occurrence=pr{}, relation={relation_kind}, schema-fields={}, read-budget={{rows={}, bytes={}}}",
+                "{pad}  occurrence=pr{}, relation={relation_kind}, schema-fields={}",
                 occurrence.get(),
                 relation.schema().len(),
-                read_budget.max_batch_rows,
-                read_budget.max_batch_bytes
             ));
             lines.push(format_args!(
                 "{pad}  provider-read={}",
@@ -3997,7 +3994,7 @@ mod tests {
     use arrow::datatypes::DataType;
     use novarocks_physical_plan::{
         ExactInputVersion, PipelineDopDomain, PlanVersionId, PredicateGuaranteeKind,
-        ProviderColumnReference, ProviderReadReference, ScanReadBudget,
+        ProviderColumnReference, ProviderReadReference,
     };
     use novarocks_spi::connector::read_stack::ConnectorReadBinding;
     use novarocks_spi::connector::{
@@ -4050,10 +4047,6 @@ mod tests {
                 min: 1,
                 max: 8,
                 requires_power_of_two: true,
-            },
-            ScanReadBudget {
-                max_batch_rows: 1024,
-                max_batch_bytes: 1024 * 1024,
             },
             DEFAULT_COMPLETION_LIMITS,
         )

@@ -168,6 +168,7 @@ struct Provider {
 }
 impl ProviderReadRuntime for Provider {
     type Table = Table;
+    type Execution = ();
     type Column = Column;
     type Transaction = ();
     type Split = Split;

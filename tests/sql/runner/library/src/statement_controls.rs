@@ -42,6 +42,21 @@ impl PlannedSubmission {
     }
 }
 
+pub(crate) fn iceberg_read_representation(
+    meta: &crate::types::QueryMeta,
+) -> Option<(&'static str, bool)> {
+    use crate::types::IcebergScanLayout;
+    if meta.iceberg_scan_layout.is_none() && meta.iceberg_dictionary_output.is_none() {
+        return None;
+    }
+    Some((
+        meta.iceberg_scan_layout
+            .unwrap_or(IcebergScanLayout::Offsets)
+            .as_str(),
+        meta.iceberg_dictionary_output.unwrap_or_default(),
+    ))
+}
+
 pub(crate) fn plan_submissions(
     prefix: &str,
     sql: &str,

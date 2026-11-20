@@ -20,6 +20,9 @@ explicit_only = false
 [impact]
 paths = [
     "novarocks/connector/iceberg/**",
+    "novarocks/fs/src/read.rs",
+    "novarocks/fs/src/physical_reader/**",
+    "novarocks/value-arrays/src/measure/**",
     "novarocks/execution/src/exec/operators/table_writer.rs",
     "novarocks/frontend-application/src/query_execution/dml/mutation_flow.rs",
     "novarocks/sql/src/analyzer/write_assignment.rs",

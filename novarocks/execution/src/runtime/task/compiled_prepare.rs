@@ -702,6 +702,7 @@ fn prepare_compiled_task_in(
             Some((instance_task_key.high(), instance_task_key.low())),
             context.profiler.clone(),
             pipeline_dop,
+            novarocks_spi::connector::ENGINE_OUTPUT_POLICY.max_rows,
             Arc::clone(&runtime_state),
             Arc::clone(&context.event_sink),
             schema_preparation,

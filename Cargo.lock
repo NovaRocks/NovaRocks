@@ -3425,6 +3425,7 @@ dependencies = [
  "novarocks-arrow-batch-codec",
  "novarocks-arrow-ipc-frame",
  "novarocks-connector-contract",
+ "novarocks-connector-iceberg",
  "novarocks-connector-iceberg-functions",
  "novarocks-control-runtime",
  "novarocks-control-runtime-core",

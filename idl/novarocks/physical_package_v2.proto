@@ -696,16 +696,13 @@ message OutputPort {
 message ScanNode {
   optional uint32 occurrence_id = 1;
   optional uint32 relation_id = 2;
-  ScanReadBudget read_budget = 3;
+  reserved 3;
+  reserved "read_budget";
   repeated ProviderOutput provider_outputs = 4;
   reserved 5;
   reserved "residual_expr_ids";
   repeated uint32 residual_roots = 7;
   repeated uint32 derived_value_ids = 6;
-}
-message ScanReadBudget {
-  uint64 max_batch_rows = 1;
-  uint64 max_batch_bytes = 2;
 }
 message ProviderOutput {
   optional uint32 column_payload_id = 1;
@@ -1570,8 +1567,8 @@ message ConnectorScanFacts {
   ScanTupleDomain unenforced_predicate = 3;
   optional uint32 remaining_connector_expression_id = 4;
   repeated StaticScanDynamicFilter dynamic_filters = 5;
-  uint64 max_batch_rows = 6;
-  uint64 max_batch_bytes = 7;
+  reserved 6, 7;
+  reserved "max_batch_rows", "max_batch_bytes";
   reserved 8;
   reserved "work_source";
 }

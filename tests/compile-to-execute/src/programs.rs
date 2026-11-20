@@ -33,12 +33,7 @@ use novarocks_sql::compiler::SqlAuthoredPhysicalPlan;
 use novarocks_type_contract::{
     CompileControlError, CompilePhase, PureCompileControl, ValueTypeStorageLifetime,
 };
-use std::{
-    collections::BTreeMap,
-    num::{NonZeroU64, NonZeroUsize},
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::BTreeMap, num::NonZeroUsize, sync::Arc, time::Duration};
 struct Control;
 impl PureCompileControl for Control {
     fn checkpoint(&self, _: CompilePhase, n: u32) -> Result<(), CompileControlError> {
@@ -163,7 +158,6 @@ pub fn frozen_reads_with_explicit_source_shape(
             if let NodeKind::Scan {
                 occurrence,
                 relation,
-                read_budget,
                 provider_outputs,
                 residuals,
                 derived_values,
@@ -220,8 +214,6 @@ pub fn frozen_reads_with_explicit_source_shape(
                     TupleDomain::all(),
                     None,
                     Vec::new(),
-                    NonZeroU64::new(read_budget.max_batch_rows).unwrap(),
-                    NonZeroU64::new(read_budget.max_batch_bytes).unwrap(),
                 )
                 .unwrap();
                 let facts = ConnectorReadStaticFacts::try_new(

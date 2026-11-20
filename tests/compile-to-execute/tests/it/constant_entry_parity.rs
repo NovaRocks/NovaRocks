@@ -837,10 +837,6 @@ fn metadata_cv_source_cross_entry(functions: &Arc<PureEngineFunctionCatalog>, sp
             max: 8,
             requires_power_of_two: true,
         },
-        novarocks_physical_plan::ScanReadBudget {
-            max_batch_rows: 64,
-            max_batch_bytes: 1 << 20,
-        },
         DEFAULT_COMPLETION_LIMITS,
     );
     let SqlCompileProgress::Complete(completed) =

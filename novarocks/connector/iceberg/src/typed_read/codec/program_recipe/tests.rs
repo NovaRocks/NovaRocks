@@ -17,7 +17,6 @@
 
 use std::{
     collections::{BTreeMap, HashMap},
-    num::NonZeroU64,
     sync::{Arc, Mutex},
 };
 
@@ -288,7 +287,11 @@ impl Fixture {
                 kind.unwrap_or(self.relation.kind()),
                 payload(
                     ConnectorCodecCategory::ReadTable,
-                    table_bytes.unwrap_or_else(|| codecs.encode_table(&self.relation).unwrap()),
+                    table_bytes.unwrap_or_else(|| {
+                        codecs
+                            .encode_table(&self.relation, Default::default())
+                            .unwrap()
+                    }),
                 ),
                 payload(
                     ConnectorCodecCategory::ReadView,
@@ -333,8 +336,6 @@ impl Fixture {
             TupleDomain::all(),
             Some(remaining),
             vec![StaticScanDynamicFilter::new(901, Arc::from("output_0"))],
-            NonZeroU64::new(1024).unwrap(),
-            NonZeroU64::new(1024 * 1024).unwrap(),
         )
         .unwrap();
         let public = ConnectorReadPublicFacts::try_new_typed(
@@ -619,7 +620,7 @@ fn codec_legal_table_function_and_merge_remain_unsupported_as_complete_static_re
         IcebergRuntimeRelation::MergeTable(merge),
     ] {
         let codecs = IcebergReadTypes::wire_codecs();
-        let bytes = codecs.encode_table(&relation).unwrap();
+        let bytes = codecs.encode_table(&relation, Default::default()).unwrap();
         // The DTO and private domain are legal. Borrowing real Table facts
         // here is intentionally a negative probe: there is no source author
         // for these two final-read variants, so no synthetic success is claimed.
@@ -1139,7 +1140,12 @@ fn fixture_public_read_schema(
 > {
     let columns: Vec<_> = columns.iter().collect();
     fixture_creation(|creation| {
-        crate::typed_read::codec::public_read_schema(relation, &columns, creation)
+        crate::typed_read::codec::public_read_schema(
+            relation,
+            &columns,
+            crate::typed_read::runtime::IcebergReadLayout::Offsets,
+            creation,
+        )
     })
     .map_err(|cause| match cause {
         novarocks_connector_contract::PureProviderCompileError::Provider(cause) => cause,
@@ -1563,7 +1569,7 @@ fn frozen_provider_nominal_properties_and_native_nested_domains_survive_complete
     let frozen = published(&fixture).build();
     assert_unchanged(&frozen);
     let bytes = IcebergReadTypes::wire_codecs()
-        .encode_table(&fixture.relation)
+        .encode_table(&fixture.relation, Default::default())
         .unwrap();
     assert!(!bytes.is_empty());
 }

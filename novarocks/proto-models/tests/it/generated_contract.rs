@@ -276,6 +276,7 @@ fn retired_query_option_fields_remain_reserved() {
         .get_message_by_name("novarocks.QueryOptions")
         .expect("QueryOptions descriptor");
     for (field_number, field_name) in [
+        (1, "batch_size"),
         (6, "connector_io_tasks_per_scan_operator"),
         (11, "enable_spill"),
         (12, "spill_options"),
@@ -565,16 +566,51 @@ fn the_typed_connector_scan_source_carries_no_split_list_or_private_payload() {
             (4, "unenforced_predicate".to_owned()),
             (5, "remaining_expression".to_owned()),
             (6, "dynamic_filters".to_owned()),
-            (7, "max_batch_rows".to_owned()),
-            (8, "max_batch_bytes".to_owned()),
         ]
     );
 
-    for (message, tag) in [
-        ("novarocks.connector_read.ConnectorTableScanSource", 9),
-        ("novarocks.physical_package_v2.DataRelation", 2),
-        ("novarocks.physical_package_v2.MetadataRelation", 3),
-        ("novarocks.physical_package_v2.ConnectorScanFacts", 8),
+    for (message, tag, retired_name) in [
+        (
+            "novarocks.connector_read.ConnectorTableScanSource",
+            7,
+            "max_batch_rows",
+        ),
+        (
+            "novarocks.connector_read.ConnectorTableScanSource",
+            8,
+            "max_batch_bytes",
+        ),
+        (
+            "novarocks.connector_read.ConnectorTableScanSource",
+            9,
+            "work_source",
+        ),
+        (
+            "novarocks.physical_package_v2.DataRelation",
+            2,
+            "work_source",
+        ),
+        (
+            "novarocks.physical_package_v2.MetadataRelation",
+            3,
+            "work_source",
+        ),
+        (
+            "novarocks.physical_package_v2.ConnectorScanFacts",
+            6,
+            "max_batch_rows",
+        ),
+        (
+            "novarocks.physical_package_v2.ConnectorScanFacts",
+            7,
+            "max_batch_bytes",
+        ),
+        (
+            "novarocks.physical_package_v2.ConnectorScanFacts",
+            8,
+            "work_source",
+        ),
+        ("novarocks.physical_package_v2.ScanNode", 3, "read_budget"),
     ] {
         let descriptor = pool
             .get_message_by_name(message)
@@ -584,11 +620,7 @@ fn the_typed_connector_scan_source_carries_no_split_list_or_private_payload() {
                 .reserved_ranges()
                 .any(|range| range.contains(&tag))
         );
-        assert!(
-            descriptor
-                .reserved_names()
-                .any(|name| name == "work_source")
-        );
+        assert!(descriptor.reserved_names().any(|name| name == retired_name));
     }
 
     // The whole point of the typed source: no eager split list, no provider

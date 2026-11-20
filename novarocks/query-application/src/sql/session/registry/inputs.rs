@@ -138,6 +138,24 @@ impl SessionPropertyInputs {
         catalog: &str,
         runtime: novarocks_spi::connector::ConnectorControlRuntimeId,
     ) -> novarocks_spi::connector::read_stack::ConnectorCatalogSession {
+        self.project_connector_overrides(catalog, |identity| identity.control_runtime_id == runtime)
+    }
+
+    pub fn connector_catalog_overrides_for_binding(
+        &self,
+        binding: &ConnectorProviderBindingKey,
+        runtime: novarocks_spi::connector::ConnectorControlRuntimeId,
+    ) -> novarocks_spi::connector::read_stack::ConnectorCatalogSession {
+        self.project_connector_overrides(binding.instance_id(), |identity| {
+            &identity.binding_key == binding && identity.control_runtime_id == runtime
+        })
+    }
+
+    fn project_connector_overrides(
+        &self,
+        catalog: &str,
+        matches: impl Fn(&CatalogPropertyIdentity) -> bool,
+    ) -> novarocks_spi::connector::read_stack::ConnectorCatalogSession {
         use novarocks_spi::connector::read_stack::SessionPropertyValue as ConnectorValue;
         self.catalogs
             .get(catalog)
@@ -151,7 +169,7 @@ impl SessionPropertyInputs {
                 else {
                     return None;
                 };
-                if identity.control_runtime_id != runtime {
+                if !matches(identity) {
                     return None;
                 }
                 let value = match property.value() {

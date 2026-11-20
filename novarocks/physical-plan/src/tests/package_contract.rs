@@ -18,7 +18,6 @@
 #[cfg(test)]
 use crate::tests::unit_fixture::DefinitionFixture;
 use std::collections::BTreeMap;
-use std::num::NonZeroU64;
 use std::sync::Arc;
 
 use novarocks_connector_contract::{
@@ -742,12 +741,7 @@ fn package_preserves_actual_case_branch_guards_and_root_occurrences() {
 }
 
 pub(super) fn frozen_scan(fragment: &Fragment) -> FrozenConnectorRead {
-    let NodeKind::Scan {
-        relation,
-        read_budget,
-        ..
-    } = &fragment.nodes()[&fragment.root()].kind
-    else {
+    let NodeKind::Scan { relation, .. } = &fragment.nodes()[&fragment.root()].kind else {
         unreachable!()
     };
     let read = relation.read();
@@ -771,8 +765,6 @@ pub(super) fn frozen_scan(fragment: &Fragment) -> FrozenConnectorRead {
         TupleDomain::all(),
         None,
         vec![],
-        NonZeroU64::new(read_budget.max_batch_rows).unwrap(),
-        NonZeroU64::new(read_budget.max_batch_bytes).unwrap(),
     )
     .unwrap();
     public_read(fragment, fragment.root(), scan).unwrap()
@@ -932,8 +924,6 @@ fn explicit_empty_pruning_table_keeps_actual_scan_and_provider_domains() {
         unenforced.clone(),
         None,
         vec![],
-        scan.max_batch_rows(),
-        scan.max_batch_bytes(),
     )
     .unwrap();
     let read = public_read(&fragment, fragment.root(), frozen).unwrap();
@@ -1104,7 +1094,7 @@ fn package_refuses_exact_relation_and_batch_contract_drift() {
     let frozen = frozen_scan(&fragment);
     let scan = frozen.scan();
     let recipe = scan.recipe();
-    for mutation in 0..3 {
+    for mutation in [0, 2] {
         let mut columns = recipe.columns().to_vec();
         if mutation == 0 {
             columns[0] = encoded(&binding, ConnectorCodecCategory::ReadColumn, 8);
@@ -1129,12 +1119,6 @@ fn package_refuses_exact_relation_and_batch_contract_drift() {
             TupleDomain::all(),
             None,
             vec![],
-            if mutation == 1 {
-                NonZeroU64::new(scan.max_batch_rows().get() + 1).unwrap()
-            } else {
-                scan.max_batch_rows()
-            },
-            scan.max_batch_bytes(),
         )
         .unwrap();
         let malformed = public_read(&fragment, fragment.root(), malformed);
@@ -1308,12 +1292,7 @@ fn duplicate_scan_payloads_keep_runtime_filter_assignment_occurrences() {
         call_requests: fragment.call_requests().clone(),
         calls: fragment.calls().clone(),
     });
-    let NodeKind::Scan {
-        relation,
-        read_budget,
-        ..
-    } = &fragment.nodes()[&scan_id].kind
-    else {
+    let NodeKind::Scan { relation, .. } = &fragment.nodes()[&scan_id].kind else {
         unreachable!()
     };
     let read = relation.read();
@@ -1352,8 +1331,6 @@ fn duplicate_scan_payloads_keep_runtime_filter_assignment_occurrences() {
                 101,
                 Arc::from(variable),
             )],
-            NonZeroU64::new(read_budget.max_batch_rows).unwrap(),
-            NonZeroU64::new(read_budget.max_batch_bytes).unwrap(),
         )
         .unwrap();
         input

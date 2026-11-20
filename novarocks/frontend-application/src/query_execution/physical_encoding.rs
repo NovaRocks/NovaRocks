@@ -1191,9 +1191,7 @@ mod tests {
         );
     }
 
-    use novarocks_physical_plan::{
-        MAX_SCAN_BATCH_BYTES, MAX_SCAN_BATCH_ROWS, PipelineDopDomain, PlanVersionId, ScanReadBudget,
-    };
+    use novarocks_physical_plan::{PipelineDopDomain, PlanVersionId};
     use novarocks_query_application::preparation::{
         FinalPlanCompletionDriver, ReadAccessSink, SqlCompletionFactSource,
     };
@@ -2061,10 +2059,6 @@ mod tests {
                 max: 8,
                 requires_power_of_two: true,
             },
-            ScanReadBudget {
-                max_batch_rows: MAX_SCAN_BATCH_ROWS,
-                max_batch_bytes: MAX_SCAN_BATCH_BYTES,
-            },
             DEFAULT_COMPLETION_LIMITS,
         );
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -2293,10 +2287,6 @@ mod tests {
                 max: 8,
                 requires_power_of_two: true,
             },
-            ScanReadBudget {
-                max_batch_rows: MAX_SCAN_BATCH_ROWS,
-                max_batch_bytes: MAX_SCAN_BATCH_BYTES,
-            },
             DEFAULT_COMPLETION_LIMITS,
         );
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -2398,10 +2388,6 @@ mod tests {
                 min: 1,
                 max: 8,
                 requires_power_of_two: true,
-            },
-            ScanReadBudget {
-                max_batch_rows: MAX_SCAN_BATCH_ROWS,
-                max_batch_bytes: MAX_SCAN_BATCH_BYTES,
             },
             DEFAULT_COMPLETION_LIMITS,
         );
@@ -3127,10 +3113,6 @@ mod tests {
                 NodeKind::Scan {
                     occurrence: ProviderReadOccurrenceId::new(0),
                     relation: Box::new(relation),
-                    read_budget: ScanReadBudget {
-                        max_batch_rows: 4096,
-                        max_batch_bytes: 8 * 1024 * 1024,
-                    },
                     provider_outputs: Box::from([(field, value)]),
                     residuals: Box::default(),
                     derived_values: Box::default(),
@@ -3256,10 +3238,6 @@ mod tests {
                 min: 1,
                 max: 8,
                 requires_power_of_two: true,
-            },
-            ScanReadBudget {
-                max_batch_rows: MAX_SCAN_BATCH_ROWS,
-                max_batch_bytes: MAX_SCAN_BATCH_BYTES,
             },
             DEFAULT_COMPLETION_LIMITS,
         )

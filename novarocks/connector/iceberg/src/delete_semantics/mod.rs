@@ -83,7 +83,7 @@ pub type Result<T> = std::result::Result<T, DeleteSemanticsError>;
 mod tests;
 
 /// An explicitly pinned fixture domain shared by all test owners of a relation.
-#[cfg(test)]
+#[cfg(any(test, feature = "reader-test-fixture"))]
 pub(crate) fn test_read_domain(
     schema: &crate::iceberg::spec::Schema,
     specs: &[crate::iceberg::spec::PartitionSpec],

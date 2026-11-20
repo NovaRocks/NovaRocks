@@ -174,6 +174,8 @@ pub(crate) struct FrontendProviderReadFacts {
     control: Arc<ConnectorControlHost>,
     bindings: Arc<QueryTableBindingStore>,
     session: ConnectorSession,
+    session_properties:
+        Arc<novarocks_query_application::sql::session::registry::SessionPropertyInputs>,
     context: ConnectorRequestContext,
     blocking: ConnectorBlockingIoSupervisor,
     capacity: novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
@@ -213,6 +215,9 @@ impl FrontendProviderReadFacts {
         control: Arc<ConnectorControlHost>,
         bindings: Arc<QueryTableBindingStore>,
         session: ConnectorSession,
+        session_properties: Arc<
+            novarocks_query_application::sql::session::registry::SessionPropertyInputs,
+        >,
         context: ConnectorRequestContext,
         blocking: ConnectorBlockingIoSupervisor,
         capacity: novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
@@ -222,6 +227,7 @@ impl FrontendProviderReadFacts {
             control,
             bindings,
             session,
+            session_properties,
             context,
             blocking,
             capacity,
@@ -460,11 +466,17 @@ impl FrontendProviderReadFacts {
                 self.bindings.as_ref(),
                 &self.context,
             )?);
-            prepare_observation(
-                source.prepared.as_mut().expect("stable opening"),
-                &self.session,
-            )
-            .await?;
+            let prepared = source.prepared.as_mut().expect("stable opening");
+            let pin = &prepared.opening.planning_pin;
+            let key = novarocks_spi::connector::ConnectorProviderBindingKey {
+                instance_id: pin.binding().descriptor().instance_id.clone(),
+                incarnation: pin.binding().incarnation(),
+            };
+            let session = self.session.clone().try_with_properties(
+                self.session_properties
+                    .connector_catalog_overrides_for_binding(&key, pin.control_runtime_id()),
+            )?;
+            prepare_observation(prepared, &session).await?;
             let responsibility = source.responsibility.as_ref().expect("same original child");
             let scope = responsibility.scope().map_err(ProviderReadError::from)?;
             #[cfg(test)]
@@ -490,7 +502,7 @@ impl FrontendProviderReadFacts {
                 );
             let input = ProviderReadCreatorInput::new(
                 source.prepared.take().expect("stable prepared input"),
-                self.session.clone(),
+                session,
                 self.context.clone(),
                 taken.deposits(),
             );
@@ -1224,7 +1236,7 @@ fn finish_read_from_opened(
     //    between sealing one and depositing it.
     let encoder = read.encoder();
     let provider_relation = metadata
-        .relation(relation_kind, negotiated.handle.clone())
+        .relation(session, relation_kind, negotiated.handle.clone())
         .map_err(|error| {
             ProviderReadError::from(error)
                 .context(format!("provider read of {name} has no frozen relation"))

@@ -29,7 +29,24 @@ use std::sync::Arc;
 
 use arrow::array::ArrayRef;
 
-use crate::connector::{ConnectorError, ConnectorErrorKind, ConnectorOutputMemoryToken};
+use crate::connector::{
+    ConnectorError, ConnectorErrorKind, ConnectorOutputMemoryToken, SharedSourceHold,
+};
+
+/// Accounting carried with the arrays a producer publishes.
+#[derive(Debug, Default)]
+pub struct PageOutputCustody {
+    /// Holds for source storage that the output still references.
+    pub source_holds: Vec<SharedSourceHold>,
+    /// Exclusive responsibility for the independently constructed storage.
+    pub new_output: Option<ConnectorOutputMemoryToken>,
+}
+
+impl PageOutputCustody {
+    fn is_empty(&self) -> bool {
+        self.new_output.is_none() && self.source_holds.is_empty()
+    }
+}
 
 /// One page produced by a connector.
 ///
@@ -41,7 +58,7 @@ use crate::connector::{ConnectorError, ConnectorErrorKind, ConnectorOutputMemory
 pub struct SourcePage {
     position_count: usize,
     channels: Vec<ArrayRef>,
-    output_memory: Option<ConnectorOutputMemoryToken>,
+    custody: PageOutputCustody,
 }
 
 impl SourcePage {
@@ -58,7 +75,7 @@ impl SourcePage {
         Ok(Self {
             position_count,
             channels: columns,
-            output_memory: None,
+            custody: PageOutputCustody::default(),
         })
     }
 
@@ -68,8 +85,23 @@ impl SourcePage {
         columns: Vec<ArrayRef>,
         output_memory: ConnectorOutputMemoryToken,
     ) -> Result<Self, ConnectorError> {
+        Self::try_new_with_custody(
+            position_count,
+            columns,
+            PageOutputCustody {
+                new_output: Some(output_memory),
+                source_holds: Vec::new(),
+            },
+        )
+    }
+
+    pub fn try_new_with_custody(
+        position_count: usize,
+        columns: Vec<ArrayRef>,
+        custody: PageOutputCustody,
+    ) -> Result<Self, ConnectorError> {
         let mut page = Self::try_new(position_count, columns)?;
-        page.output_memory = Some(output_memory);
+        page.custody = custody;
         Ok(page)
     }
 
@@ -78,7 +110,10 @@ impl SourcePage {
         Self {
             position_count,
             channels: Vec::new(),
-            output_memory: None,
+            custody: PageOutputCustody {
+                new_output: None,
+                source_holds: Vec::new(),
+            },
         }
     }
 
@@ -102,7 +137,7 @@ impl SourcePage {
 
     /// Hand back the columns in order.
     pub fn into_columns(self) -> Result<(usize, Vec<ArrayRef>), ConnectorError> {
-        if self.output_memory.is_some() {
+        if !self.custody.is_empty() {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
                 "accounted connector page requires move-aware column extraction",
@@ -116,11 +151,22 @@ impl SourcePage {
     pub fn into_accounted_columns(
         self,
     ) -> Result<(usize, Vec<ArrayRef>, Option<ConnectorOutputMemoryToken>), ConnectorError> {
-        Ok((self.position_count, self.channels, self.output_memory))
+        if !self.custody.source_holds.is_empty() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "connector page with shared sources requires full custody extraction",
+            ));
+        }
+        Ok((self.position_count, self.channels, self.custody.new_output))
+    }
+
+    /// Move all accounting together with the published arrays.
+    pub fn into_output_parts(self) -> (usize, Vec<ArrayRef>, PageOutputCustody) {
+        (self.position_count, self.channels, self.custody)
     }
 
     pub fn output_memory_bytes(&self) -> Option<u64> {
-        self.output_memory.as_ref().map(|token| token.bytes())
+        self.custody.new_output.as_ref().map(|token| token.bytes())
     }
 
     /// Keep only a prefix of the channels.

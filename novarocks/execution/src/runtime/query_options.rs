@@ -19,7 +19,6 @@ use std::time::Duration;
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct QueryOptions {
-    pub batch_size: Option<i32>,
     pub query_timeout: Option<i32>,
     pub query_delivery_timeout: Option<i32>,
     pub enable_profile: bool,
@@ -45,7 +44,6 @@ pub struct QueryOptions {
 /// without coupling to a protocol or application owner.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct QueryOptionsParts {
-    pub batch_size: Option<i32>,
     pub query_timeout: Option<i32>,
     pub query_delivery_timeout: Option<i32>,
     pub enable_profile: bool,
@@ -65,17 +63,6 @@ pub struct QueryOptionsParts {
     pub cache: QueryCacheOptions,
 }
 
-/// The effective processing target shared by runtime chunks and metadata batches.
-/// This is not an input rejection limit.
-pub fn chunk_size(options: Option<&QueryOptions>) -> usize {
-    options
-        .and_then(|options| options.batch_size)
-        .filter(|size| *size > 0)
-        .map(|size| size as usize)
-        .unwrap_or(4096)
-        .max(1)
-}
-
 impl QueryOptions {
     /// Records an SQL-owner decision already parsed at the ingress boundary.
     pub fn set_allow_throw_exception(&mut self, enabled: bool) {
@@ -84,7 +71,6 @@ impl QueryOptions {
 
     pub fn from_parts(parts: QueryOptionsParts) -> Self {
         Self {
-            batch_size: parts.batch_size,
             query_timeout: parts.query_timeout,
             query_delivery_timeout: parts.query_delivery_timeout,
             enable_profile: parts.enable_profile,
@@ -103,10 +89,6 @@ impl QueryOptions {
             global_runtime_filter_build_max_size: parts.global_runtime_filter_build_max_size,
             cache: parts.cache,
         }
-    }
-
-    pub const fn batch_size(&self) -> Option<i32> {
-        self.batch_size
     }
 
     pub const fn pipeline_dop(&self) -> Option<i32> {

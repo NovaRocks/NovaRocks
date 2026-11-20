@@ -45,7 +45,6 @@ type Error = ScanNodeCodecError;
 struct Physical<'a> {
     occurrence: p::ProviderReadOccurrenceId,
     relation: &'a p::Relation,
-    budget: p::ScanReadBudget,
     columns: &'a [(p::ProviderColumnReference, p::ValueId)],
     residuals: &'a [novarocks_expression_contract::RootOrdinal],
     derived: &'a [p::ValueId],
@@ -55,14 +54,12 @@ fn physical(input: &p::PhysicalNode) -> Result<Physical<'_>, Error> {
         p::NodeKind::Scan {
             occurrence,
             relation,
-            read_budget,
             provider_outputs,
             residuals,
             derived_values,
         } => Ok(Physical {
             occurrence: *occurrence,
             relation,
-            budget: *read_budget,
             columns: provider_outputs,
             residuals,
             derived: derived_values,
@@ -443,12 +440,6 @@ fn prepare_decode_core<'namespace, 'loan, 'wire, 'control>(
     let body = raw(input)?;
     required(body.occurrence_id, work)?;
     let relation_id = required(body.relation_id, work)?;
-    let budget = body
-        .read_budget
-        .as_ref()
-        .ok_or_else(|| invalid("Scan read budget is absent"));
-    work.step()?;
-    budget?;
     let port = input
         .output
         .as_ref()
@@ -682,10 +673,6 @@ fn emit_encode(
         kind: Some(wire::physical_node::Kind::Scan(wire::ScanNode {
             occurrence_id: Some(body.occurrence.get()),
             relation_id: Some(relation_id),
-            read_budget: Some(wire::ScanReadBudget {
-                max_batch_rows: body.budget.max_batch_rows,
-                max_batch_bytes: body.budget.max_batch_bytes,
-            }),
             provider_outputs: columns,
             residual_roots: residuals,
             derived_value_ids: encode_ids(body.derived, work)?,
@@ -758,10 +745,6 @@ fn emit_decode_core(
         residuals.push(novarocks_expression_contract::RootOrdinal::new(*id));
         work.step()?;
     }
-    let budget = body
-        .read_budget
-        .as_ref()
-        .ok_or_else(|| invalid("prepared Scan read budget is absent"))?;
     let node = p::PhysicalNode {
         expressions: None,
         id: p::NodeId::new(input.id),
@@ -772,10 +755,6 @@ fn emit_decode_core(
         kind: p::NodeKind::Scan {
             occurrence: p::ProviderReadOccurrenceId::new(required(body.occurrence_id, work)?),
             relation,
-            read_budget: p::ScanReadBudget {
-                max_batch_rows: budget.max_batch_rows,
-                max_batch_bytes: budget.max_batch_bytes,
-            },
             provider_outputs: boxed(columns, work)?,
             residuals: boxed(residuals, work)?,
             derived_values: decode_ids(&body.derived_value_ids, work)?,

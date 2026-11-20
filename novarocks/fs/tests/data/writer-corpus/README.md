@@ -1,9 +1,9 @@
 # FS writer corpus
 
-这些固定输入归 FS 测试 owner 维护，供 `novarocks/fs/tests/writer_corpus_conformance.rs` 经生产 FS reader 验证完整行值和绝对物理位置。运行不启动 producer、不下载、不重写数据；文件缺失或 SHA 不符直接失败。
+这些固定输入归 FS 测试 owner 维护，供 `novarocks/fs/tests/it/writer_corpus.rs` 经生产 FS reader 验证完整行值和绝对物理位置。运行不启动 producer、不下载、不重写数据；文件缺失或 SHA 不符直接失败。
 
 ```bash
-cargo test --locked -p novarocks-fs --test writer_corpus_conformance
+cargo test --locked -p novarocks-fs --test it writer_corpus::
 ```
 
 | Producer | 数据与来源收据 | 独立预期 |

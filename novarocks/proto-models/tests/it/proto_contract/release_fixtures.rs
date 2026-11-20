@@ -64,7 +64,6 @@ fn id(hi: i64, lo: i64) -> common::UniqueId {
 
 fn release_query_options() -> novarocks::QueryOptions {
     novarocks::QueryOptions {
-        batch_size: 4096,
         query_timeout: 300,
         enable_profile: true,
         pipeline_dop: 8,

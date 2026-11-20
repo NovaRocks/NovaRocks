@@ -28,8 +28,8 @@ use arrow::record_batch::RecordBatch;
 use novarocks_fs::{
     BoundFile, FileBatch, FileBatchReader, FileBytesFuture, FileCancellation, FileFormat,
     FileIdentity, FileIoFuture, FileIoJob, FileIoRuntime, FileIoSpawner, FileProjection,
-    FileReadBudget, FileReadContext, FileReadRange, FileReadRequest, FileResult, FileU64Future,
-    FsAccessResolver, PhysicalPruning,
+    FileReadContext, FileReadRange, FileReadRequest, FileResult, FileU64Future, FsAccessResolver,
+    PhysicalPruning, ReaderSizing,
 };
 use novarocks_spi::connector::StorageAccessDomainId;
 use parquet::arrow::ArrowWriter;
@@ -132,7 +132,7 @@ impl Fixture {
         format: FileFormat,
         projection: FileProjection,
         max_rows: usize,
-        max_bytes: usize,
+        max_bytes: u64,
     ) -> FileReadRequest {
         let runtime: Arc<dyn FileIoRuntime> = self.io.clone();
         let io_spawner: Arc<dyn FileIoSpawner> = self.io.clone();
@@ -141,9 +141,9 @@ impl Fixture {
             format,
             range: FileReadRange::WholeFile,
             projection,
-            budget: FileReadBudget {
-                max_rows: NonZeroUsize::new(max_rows).expect("positive rows"),
-                max_bytes: NonZeroUsize::new(max_bytes).expect("positive bytes"),
+            sizing: ReaderSizing {
+                max_read_rows: NonZeroUsize::new(max_rows).expect("positive rows"),
+                max_read_bytes: max_bytes,
             },
             predicates: Vec::new(),
             pruning: PhysicalPruning::default(),
@@ -151,6 +151,7 @@ impl Fixture {
             cache: None,
             prepared_input: None,
             context: FileReadContext {
+                turn: None,
                 cancellation: FileCancellation::new(),
                 deadline: None,
                 runtime,

@@ -546,7 +546,7 @@ mod tests {
                 write_access,
                 crate::resources::IcebergCatalogRuntime::new(data_runtime.handle().clone()),
             ),
-            IcebergPageSourceProviderOptions::with_default_budget(),
+            IcebergPageSourceProviderOptions::default(),
         );
         let normalized = NormalizedCatalogProperties::try_new(properties())
             .expect("normalized Iceberg properties");

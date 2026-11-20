@@ -62,8 +62,6 @@ pub(super) enum CompiledTableFailureKind {
     InputPort,
     InputValueBindings,
     AlreadyFailed,
-    MissingBatchRows,
-    InvalidBatchRows,
 }
 impl fmt::Display for CompiledTableFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -102,8 +100,6 @@ impl fmt::Display for CompiledTableFailure {
                 f.write_str("input differs from its complete frozen value bindings")
             }
             CompiledTableFailureKind::AlreadyFailed => f.write_str("instance has already failed"),
-            CompiledTableFailureKind::MissingBatchRows => f.write_str("batch size was not bound"),
-            CompiledTableFailureKind::InvalidBatchRows => f.write_str("batch size is zero"),
         }
     }
 }
@@ -147,8 +143,6 @@ impl FailureProjection for CompiledTableFailure {
             }
             InputPort | InputValueBindings => ExecutionReason::TableCursorInputPort,
             AlreadyFailed => ExecutionReason::TableCursorAlreadyFailed,
-            MissingBatchRows => ExecutionReason::TableCursorMissingBatchRows,
-            InvalidBatchRows => ExecutionReason::TableCursorInvalidBatchRows,
         };
         FailureFact::new(FailureClass::Invariant, reason.reason())
     }

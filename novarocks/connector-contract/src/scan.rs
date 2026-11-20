@@ -27,7 +27,6 @@ use novarocks_type_contract::{CompileCheckpoints, CompileControlError};
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
 use std::fmt;
-use std::num::NonZeroU64;
 use std::sync::Arc;
 
 use crate::{
@@ -119,8 +118,6 @@ struct ConnectorScanFacts {
     unenforced_predicate: TupleDomain<ScanColumnId>,
     remaining_expression: Option<ConnectorExpression>,
     dynamic_filters: Arc<[StaticScanDynamicFilter]>,
-    max_batch_rows: NonZeroU64,
-    max_batch_bytes: NonZeroU64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -161,8 +158,6 @@ impl<R: AsRef<ConnectorReadRelationRecipeDraft>> ConnectorScan<R> {
         unenforced_predicate: TupleDomain<ScanColumnId>,
         remaining_expression: Option<ConnectorExpression>,
         dynamic_filters: Vec<StaticScanDynamicFilter>,
-        max_batch_rows: NonZeroU64,
-        max_batch_bytes: NonZeroU64,
     ) -> Result<Self, StaticConnectorScanError> {
         let input = ScanConstructionInput {
             recipe,
@@ -171,8 +166,6 @@ impl<R: AsRef<ConnectorReadRelationRecipeDraft>> ConnectorScan<R> {
             unenforced_predicate,
             remaining_expression,
             dynamic_filters,
-            max_batch_rows,
-            max_batch_bytes,
         };
         let retained = match validate_scan(&input, &mut PlainScan) {
             Ok(bytes) => bytes,
@@ -188,8 +181,6 @@ impl<R: AsRef<ConnectorReadRelationRecipeDraft>> ConnectorScan<R> {
                 unenforced_predicate: input.unenforced_predicate,
                 remaining_expression,
                 dynamic_filters: input.dynamic_filters.into_boxed_slice().into(),
-                max_batch_rows: input.max_batch_rows,
-                max_batch_bytes: input.max_batch_bytes,
             }),
             retained_bytes: retained,
         })
@@ -245,8 +236,6 @@ impl<R: AsRef<ConnectorReadRelationRecipeDraft>> ConnectorScan<R> {
             unenforced_predicate: input.unenforced_predicate,
             remaining_expression,
             dynamic_filters,
-            max_batch_rows: input.max_batch_rows,
-            max_batch_bytes: input.max_batch_bytes,
         });
         context.step().map_err(lift_scan_resources)?;
         context.flush().map_err(lift_scan_resources)?;
@@ -279,14 +268,6 @@ impl<R: AsRef<ConnectorReadRelationRecipeDraft>> ConnectorScan<R> {
 
     pub fn dynamic_filters(&self) -> &[StaticScanDynamicFilter] {
         &self.facts.dynamic_filters
-    }
-
-    pub fn max_batch_rows(&self) -> NonZeroU64 {
-        self.facts.max_batch_rows
-    }
-
-    pub fn max_batch_bytes(&self) -> NonZeroU64 {
-        self.facts.max_batch_bytes
     }
 
     /// The checked conservative charge computed from these frozen facts.
@@ -327,8 +308,6 @@ pub struct ScanConstructionInput<R> {
     pub unenforced_predicate: TupleDomain<ScanColumnId>,
     pub remaining_expression: Option<ConnectorExpression>,
     pub dynamic_filters: Vec<StaticScanDynamicFilter>,
-    pub max_batch_rows: NonZeroU64,
-    pub max_batch_bytes: NonZeroU64,
 }
 
 #[derive(Debug)]

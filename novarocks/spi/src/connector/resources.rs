@@ -18,7 +18,7 @@
 //! Connector execution resource accounting.
 
 use std::fmt::{Debug, Formatter};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use super::{ConnectorError, ConnectorErrorKind};
 
@@ -183,6 +183,16 @@ impl ConnectorOutputMemoryToken {
     pub fn into_reservation(self) -> ConnectorResourceReservation {
         self.reservation
     }
+
+    /// Give the source and all outputs that depend on its storage access to
+    /// the lifetime of the original lease.
+    pub fn into_shared_source(self) -> SharedSourceHold {
+        SharedSourceHold {
+            // The backend is Send. The mutex protects custody across threads
+            // without granting access to the underlying reservation.
+            reservation: Arc::new(Mutex::new(self.reservation)),
+        }
+    }
 }
 
 impl Debug for ConnectorOutputMemoryToken {
@@ -190,6 +200,28 @@ impl Debug for ConnectorOutputMemoryToken {
         formatter
             .debug_struct("ConnectorOutputMemoryToken")
             .field("bytes", &self.bytes())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Shared lifetime of an original source reservation. The reservation is
+/// released only after the source and the last dependent output drop this hold.
+#[must_use = "keep the source hold with the storage that depends on it"]
+#[derive(Clone)]
+pub struct SharedSourceHold {
+    reservation: Arc<Mutex<ConnectorResourceReservation>>,
+}
+
+impl SharedSourceHold {
+    pub fn same_source(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.reservation, &other.reservation)
+    }
+}
+
+impl Debug for SharedSourceHold {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SharedSourceHold")
             .finish_non_exhaustive()
     }
 }

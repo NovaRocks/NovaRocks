@@ -24,9 +24,9 @@ use arrow::array::{ArrayData, ArrayRef, make_array};
 use arrow::datatypes::{DataType, Field, FieldRef};
 use bytes::Bytes;
 use novarocks_fs::{
-    BoundFile, FileBatch, FileFormat, FileIdentity, FileProjection, FileReadBudget,
-    FileReadContext, FileReadRange, FileReadRequest, FileResult, FsAccessHandle, MinMaxPredicateOp,
-    MinMaxPredicateValue, PhysicalPruning, ScanPredicate, ScanPredicateDomain, ScanPredicateSource,
+    BoundFile, FileBatch, FileFormat, FileIdentity, FileProjection, FileReadContext, FileReadRange,
+    FileReadRequest, FileResult, FsAccessHandle, MinMaxPredicateOp, MinMaxPredicateValue,
+    PhysicalPruning, ReaderSizing, ScanPredicate, ScanPredicateDomain, ScanPredicateSource,
     open_file_reader, open_file_reader_async,
 };
 use novarocks_spi::connector::ConnectorError;
@@ -327,6 +327,7 @@ pub(crate) async fn visit_parquet_batches_async(
     projection: FileProjection,
     predicates: Vec<ScanPredicate>,
     context: FileReadContext,
+    sizing: ReaderSizing,
     visit: impl FnMut(FileBatch) -> Result<(), ConnectorError>,
 ) -> Result<(), ConnectorError> {
     visit_parquet_batches_async_with_options(
@@ -336,7 +337,7 @@ pub(crate) async fn visit_parquet_batches_async(
         projection,
         predicates,
         context,
-        Default::default(),
+        (sizing, Default::default()),
         visit,
     )
     .await
@@ -350,7 +351,7 @@ pub(crate) async fn visit_parquet_batches_async_with_options(
     projection: FileProjection,
     predicates: Vec<ScanPredicate>,
     context: FileReadContext,
-    options: novarocks_fs::FileReaderOptions,
+    (sizing, options): (ReaderSizing, novarocks_fs::FileReaderOptions),
     mut visit: impl FnMut(FileBatch) -> Result<(), ConnectorError>,
 ) -> Result<novarocks_fs::FileMetricsSnapshot, ConnectorError> {
     context.check_active().map_err(map_file_error)?;
@@ -373,6 +374,7 @@ pub(crate) async fn visit_parquet_batches_async_with_options(
         context.clone(),
     );
     request.predicates = predicates;
+    request.sizing = sizing;
     request.options = iceberg_reader_options(options);
     let mut reader = open_file_reader_async(request, None)
         .await
@@ -459,6 +461,15 @@ pub(crate) fn iceberg_reader_options(
     options
 }
 
+pub(crate) fn default_parquet_reader_sizing() -> ReaderSizing {
+    let defaults = crate::catalog_config::IcebergCatalogReadConfig::default();
+    ReaderSizing {
+        max_read_rows: NonZeroUsize::new(defaults.max_read_rows as usize)
+            .expect("catalog default row limit is nonzero"),
+        max_read_bytes: defaults.max_read_bytes as u64,
+    }
+}
+
 fn whole_file_request(
     file: BoundFile,
     projection: FileProjection,
@@ -469,10 +480,7 @@ fn whole_file_request(
         format: FileFormat::Parquet,
         range: FileReadRange::WholeFile,
         projection,
-        budget: FileReadBudget {
-            max_rows: NonZeroUsize::new(4096).expect("constant is nonzero"),
-            max_bytes: NonZeroUsize::new(64 * 1024 * 1024).expect("constant is nonzero"),
-        },
+        sizing: default_parquet_reader_sizing(),
         predicates: Vec::new(),
         pruning: PhysicalPruning::default(),
         options: iceberg_reader_options(Default::default()),
@@ -617,6 +625,7 @@ pub(crate) mod tests {
                     )
                     .unwrap();
                 let context = FileReadContext {
+                    turn: None,
                     cancellation: FileCancellation::new(),
                     deadline: None,
                     runtime: Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
@@ -1052,6 +1061,7 @@ pub(crate) mod tests {
                 let receipts = RangeReceipts::default();
                 let access = recorded_access(&access, &receipts);
                 let context = FileReadContext {
+                    turn: None,
                     cancellation: FileCancellation::new(),
                     deadline: None,
                     runtime: Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
@@ -1076,10 +1086,13 @@ pub(crate) mod tests {
                         FileProjection::RootNames(vec!["file_path".into(), "pos".into()]),
                         vec![predicate],
                         context,
-                        FileReaderOptions {
-                            coalesce_reads: coalesce,
-                            ..Default::default()
-                        },
+                        (
+                            default_parquet_reader_sizing(),
+                            FileReaderOptions {
+                                coalesce_reads: coalesce,
+                                ..Default::default()
+                            },
+                        ),
                         |batch| {
                             let file_paths = batch
                                 .batch
@@ -1237,6 +1250,7 @@ pub(crate) mod tests {
             let receipts = RangeReceipts::default();
             let access = recorded_access(&access, &receipts);
             let context = FileReadContext {
+                turn: None,
                 cancellation: FileCancellation::new(),
                 deadline: None,
                 runtime: Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
@@ -1261,10 +1275,13 @@ pub(crate) mod tests {
                     FileProjection::RootNames(vec!["file_path".into(), "pos".into()]),
                     vec![predicate],
                     context,
-                    FileReaderOptions {
-                        coalesce_reads: coalesce,
-                        ..Default::default()
-                    },
+                    (
+                        default_parquet_reader_sizing(),
+                        FileReaderOptions {
+                            coalesce_reads: coalesce,
+                            ..Default::default()
+                        },
+                    ),
                     |batch| {
                         positions.extend(
                             batch
@@ -1321,6 +1338,7 @@ pub(crate) mod tests {
             )
             .unwrap();
         let context = FileReadContext {
+            turn: None,
             cancellation: FileCancellation::new(),
             deadline: None,
             runtime: Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
@@ -1358,6 +1376,7 @@ pub(crate) mod tests {
                     FileProjection::All,
                     Vec::new(),
                     context.clone(),
+                    default_parquet_reader_sizing(),
                     |_| Ok(()),
                 ))
                 .unwrap_err();
@@ -1375,6 +1394,7 @@ pub(crate) mod tests {
                 FileProjection::All,
                 Vec::new(),
                 context.clone(),
+                default_parquet_reader_sizing(),
                 |_| Ok(()),
             ))
             .unwrap_err();
@@ -1388,6 +1408,7 @@ pub(crate) mod tests {
                 FileProjection::All,
                 Vec::new(),
                 context,
+                default_parquet_reader_sizing(),
                 |_| Ok(()),
             ))
             .unwrap_err();
@@ -1441,6 +1462,7 @@ pub(crate) mod tests {
             operations.clone(),
         );
         let context = FileReadContext {
+            turn: None,
             cancellation: FileCancellation::new(),
             deadline: None,
             runtime: Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
@@ -1468,6 +1490,7 @@ pub(crate) mod tests {
                 FileProjection::All,
                 Vec::new(),
                 context,
+                default_parquet_reader_sizing(),
                 |_| Ok(()),
             ))
             .unwrap_err();

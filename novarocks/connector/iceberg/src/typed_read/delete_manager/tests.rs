@@ -1131,8 +1131,7 @@ fn split_prebinds_alias_projection_once_for_global_partition_and_both_endpoints(
     let mut window_dto = dto.clone();
     window_dto.read_domain = Some(super::super::split::encode_read_domain(&from));
     window_dto.deletes = vec![global.to_proto()];
-    let window_split =
-        IcebergSplit::from_proto(&window_dto, SplitWeight::STANDARD, None).unwrap();
+    let window_split = IcebergSplit::from_proto(&window_dto, SplitWeight::STANDARD, None).unwrap();
     let difference = fixture
         ._runtime
         .block_on(fixture.manager.open_split(
@@ -1379,8 +1378,7 @@ fn artifact_type_failure_publishes_no_partial_union_or_ready_application() {
         vec![StdArc::new(StringArray::from(vec![None::<&str>]))],
     )
     .unwrap();
-    let mut writer =
-        ArrowWriter::try_new(fs::File::create(&path).unwrap(), schema, None).unwrap();
+    let mut writer = ArrowWriter::try_new(fs::File::create(&path).unwrap(), schema, None).unwrap();
     writer.write(&batch).unwrap();
     writer.close().unwrap();
     let split = split_of(
@@ -1547,6 +1545,7 @@ impl FlightFixture {
             operations.clone(),
         );
         let context = FileReadContext {
+            turn: None,
             cancellation: FileCancellation::new(),
             deadline: Some(Instant::now() + Duration::from_secs(60)),
             runtime: Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),

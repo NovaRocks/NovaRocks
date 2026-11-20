@@ -3126,11 +3126,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                     node: "Scan",
                     fact: "provider read occurrence",
                 })?;
-        let FinalizedProviderRead {
-            binding,
-            contract,
-            read_budget,
-        } = self
+        let FinalizedProviderRead { binding, contract } = self
             .provider_reads
             .as_mut()
             .ok_or(ContractLoweringError::MissingPlannerFact {
@@ -3443,7 +3439,6 @@ impl<'a> ContractLoweringVisitor<'a> {
             NodeKind::Scan {
                 occurrence: scan_occurrence,
                 relation: Box::new(relation),
-                read_budget,
                 provider_outputs: provider_outputs.into_boxed_slice(),
                 residuals: residuals.into_boxed_slice(),
                 derived_values: derived_values.into_boxed_slice(),
@@ -16713,10 +16708,6 @@ mod tests {
                     bucket_contract.clone()
                 } else {
                     contract.clone()
-                },
-                novarocks_physical_plan::ScanReadBudget {
-                    max_batch_rows: 1024,
-                    max_batch_bytes: 1 << 20,
                 },
             );
             let result = lower_read_with_original_emission_observer(

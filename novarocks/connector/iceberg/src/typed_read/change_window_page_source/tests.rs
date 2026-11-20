@@ -255,6 +255,7 @@ impl Fixture {
             Arc::clone(&io_spawner),
         );
         let context = FileReadContext {
+            turn: None,
             cancellation: FileCancellation::new(),
             deadline: Some(Instant::now() + Duration::from_secs(60)),
             runtime: file_runtime,
@@ -358,6 +359,7 @@ impl Fixture {
         columns: &'a [IcebergColumnHandle],
     ) -> IcebergChangeWindowPageSourceRequest<'a> {
         IcebergChangeWindowPageSourceRequest {
+            output_layout: super::super::runtime::IcebergReadLayout::Offsets,
             handle,
             split,
             columns,
@@ -366,11 +368,17 @@ impl Fixture {
             access_binding: self.binding.clone(),
             context: self.context.clone(),
             cache: None,
-            budget: FileReadBudget {
-                max_rows: NonZeroUsize::new(1024).expect("nonzero"),
-                max_bytes: NonZeroUsize::new(8 * 1024 * 1024).expect("nonzero"),
+            budget: ReaderSizing {
+                max_read_rows: NonZeroUsize::new(1024).expect("nonzero"),
+                max_read_bytes: 8 * 1024 * 1024,
             },
-            reader_options: FileReaderOptions::default(),
+            reader_options: FileReaderOptions {
+                parquet_interpretation_policy:
+                    novarocks_fs::ParquetInterpretationPolicy::DerivedByteRepresentation {
+                        preserve_top_level_dictionary: false,
+                    },
+                ..Default::default()
+            },
             scheduled_split_sequence_id: 0,
             dynamic_filter: Arc::new(CompleteAllDynamicFilter::new(
                 std::collections::BTreeSet::new(),
@@ -420,7 +428,7 @@ fn drain_stream(
 }
 
 /// One page's `(id, __change_op)` pairs.
-fn signed_rows(page: SourcePage) -> Vec<(i64, i32)> {
+fn signed_rows(page: novarocks_spi::connector::read_stack::SourcePage) -> Vec<(i64, i32)> {
     let (count, columns) = page.into_columns().expect("materialize");
     assert_eq!(columns.len(), 2, "id and the derived sign");
     assert_eq!(
@@ -467,8 +475,7 @@ fn added_rows_emit_every_row_that_survives_at_the_upper_endpoint_with_a_plus_one
     let schema = iceberg_schema();
     let handle = change_window_handle(&schema);
     let split = IcebergChangeSplit::AddedRows(
-        IcebergAddedRows::try_new(fixture.data_split(Vec::new()), Vec::new())
-            .expect("added rows"),
+        IcebergAddedRows::try_new(fixture.data_split(Vec::new()), Vec::new()).expect("added rows"),
     );
 
     let mut source = fixture
@@ -516,8 +523,7 @@ fn difference(
     to: Vec<IcebergDeleteFile>,
 ) -> IcebergChangeSplit {
     IcebergChangeSplit::VisibilityDifference(
-        IcebergVisibilityDifferenceRows::try_new(fixture.data_split(to.clone()), from, to)
-            .unwrap(),
+        IcebergVisibilityDifferenceRows::try_new(fixture.data_split(to.clone()), from, to).unwrap(),
     )
 }
 fn removed(fixture: &Fixture, from: Vec<IcebergDeleteFile>) -> IcebergChangeSplit {
@@ -664,8 +670,7 @@ fn the_change_sign_matches_the_public_int32_declaration() {
     );
 
     let split = IcebergChangeSplit::AddedRows(
-        IcebergAddedRows::try_new(fixture.data_split(Vec::new()), Vec::new())
-            .expect("added rows"),
+        IcebergAddedRows::try_new(fixture.data_split(Vec::new()), Vec::new()).expect("added rows"),
     );
     let mut source = fixture
         .page_source(&handle, &split, &[column])
@@ -692,11 +697,8 @@ fn a_non_parquet_change_window_split_is_a_stable_unsupported_rather_than_a_wrong
     let handle = change_window_handle(&schema);
     for format in [IcebergFileFormat::Orc, IcebergFileFormat::Avro] {
         let split = IcebergChangeSplit::AddedRows(
-            IcebergAddedRows::try_new(
-                fixture.data_split_in_format(Vec::new(), format),
-                Vec::new(),
-            )
-            .expect("added rows"),
+            IcebergAddedRows::try_new(fixture.data_split_in_format(Vec::new(), format), Vec::new())
+                .expect("added rows"),
         );
         let error = fixture
             .page_source(&handle, &split, &id_and_change_op(&schema))
@@ -720,8 +722,7 @@ fn an_added_rows_split_narrowed_to_row_ids_is_rejected_rather_than_guessed() {
     let schema = iceberg_schema();
     let handle = change_window_handle(&schema);
     let split = IcebergChangeSplit::AddedRows(
-        IcebergAddedRows::try_new(fixture.data_split(Vec::new()), vec![0, 1])
-            .expect("added rows"),
+        IcebergAddedRows::try_new(fixture.data_split(Vec::new()), vec![0, 1]).expect("added rows"),
     );
 
     let error = fixture
@@ -758,8 +759,8 @@ fn a_scan_assignment_that_steals_the_sign_field_id_is_rejected() {
         ))])
         .build()
         .expect("schema");
-    let impostor = IcebergColumnHandle::base_column_of(&schema, ICEBERG_CHANGE_OP_FIELD_ID)
-        .expect("handle");
+    let impostor =
+        IcebergColumnHandle::base_column_of(&schema, ICEBERG_CHANGE_OP_FIELD_ID).expect("handle");
 
     let error = ChangeOpProjection::of(&[impostor])
         .err()

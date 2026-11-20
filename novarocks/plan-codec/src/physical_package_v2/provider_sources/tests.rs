@@ -53,7 +53,6 @@ use novarocks_proto_models::physical_package_v2 as wire;
 use novarocks_type_contract::*;
 use std::{
     collections::{BTreeMap, HashMap},
-    num::NonZeroU64,
     sync::{Arc, Mutex},
 };
 
@@ -213,10 +212,6 @@ pub(in crate::physical_package_v2) fn checked_read(metadata: bool) -> p::Fragmen
                     kind: p::NodeKind::Scan {
                         occurrence: p::ProviderReadOccurrenceId::new(0),
                         relation: Box::new(relation),
-                        read_budget: p::ScanReadBudget {
-                            max_batch_rows: 4096,
-                            max_batch_bytes: 4 * 1024 * 1024,
-                        },
                         provider_outputs: Box::from([(column, value)]),
                         residuals: Box::default(),
                         derived_values: Box::default(),
@@ -274,8 +269,6 @@ pub(in crate::physical_package_v2) fn checked_read(metadata: bool) -> p::Fragmen
             ],
         }),
         vec![],
-        NonZeroU64::new(4096).unwrap(),
-        NonZeroU64::new(4 * 1024 * 1024).unwrap(),
     )
     .unwrap();
     let facts = c::ConnectorReadStaticFacts::try_new(
@@ -1032,10 +1025,6 @@ fn project(
                 ))
             );
             let facts = scan_wire[0].facts.as_ref().unwrap();
-            assert_eq!(
-                (facts.max_batch_rows, facts.max_batch_bytes),
-                (4096, 4 * 1024 * 1024)
-            );
             assert!(facts.dynamic_filters.is_empty());
             assert_eq!(facts.remaining_connector_expression_id, Some(0));
             assert_eq!(facts.assignments[0].variable, "v0");

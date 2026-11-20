@@ -395,6 +395,7 @@ pub(crate) fn required(inputs: &[PreparedSqlInputs]) -> bool {
                 || !step.meta.query_lifecycle_faults.is_empty()
                 || step.meta.query_lifecycle_structured_assertion.is_some()
                 || step.meta.native_observation_attempts.is_some()
+                || statement_controls::iceberg_read_representation(&step.meta).is_some()
                 || step.meta.task_update_replay_barrier == Some(true)
                 || step.meta.imv_stateless_rebuild.is_some()
                 || step.meta.imv_accelerator_wipe_restart.is_some()
@@ -621,7 +622,9 @@ pub(crate) fn build(
                     meta.native_observation_attempts.is_none() || !observations.is_empty(),
                     "native_observation_attempts requires a selected Native observation marker"
                 );
-                let needs_nomination = !faults.is_empty()
+                let iceberg_read = statement_controls::iceberg_read_representation(meta);
+                let needs_nomination = iceberg_read.is_some()
+                    || !faults.is_empty()
                     || !observations.is_empty()
                     || meta.query_lifecycle_structured_assertion.is_some();
                 if needs_nomination {
@@ -675,6 +678,18 @@ pub(crate) fn build(
                         add(refs.get_mut(&be_key).unwrap(), "native", apply);
                     }
                     for submission in &submissions {
+                        if let Some((scan_layout, dictionary_output)) = iceberg_read {
+                            add(
+                                refs.get_mut(&fe_key).unwrap(),
+                                "iceberg-observation",
+                                json!({
+                                    "action": "read-representation",
+                                    "statement_run_token": submission.run_token,
+                                    "scan_layout": scan_layout,
+                                    "dictionary_output": dictionary_output,
+                                }),
+                            );
+                        }
                         for action in &observations {
                             for index in 0..cluster_size {
                                 let be_key = (
@@ -948,6 +963,45 @@ mod tests {
                 .to_string()
                 .contains("requires exactly one")
         );
+    }
+
+    #[test]
+    fn iceberg_representation_grants_follow_every_planned_submission() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let input = inputs(vec![step(
+            1,
+            "SELECT 1; SELECT 2",
+            QueryMeta {
+                iceberg_scan_layout: Some(IcebergScanLayout::View),
+                iceberg_dictionary_output: Some(true),
+                ..Default::default()
+            },
+        )]);
+        assert!(required(&input));
+        let (_, control) = plan(&input, file.path()).unwrap();
+        let selected = control.steps.values().next().unwrap();
+        assert!(selected.needs_nomination);
+        assert_eq!(selected.submissions.len(), 2);
+        let frontend = control
+            .planned_launches
+            .iter()
+            .find(|launch| launch.role == RoleSlot::Frontend)
+            .unwrap();
+        let grants = frontend
+            .grants
+            .iter()
+            .filter(|grant| grant.domain == "iceberg-observation")
+            .collect::<Vec<_>>();
+        assert_eq!(grants.len(), selected.submissions.len());
+        for (grant, submission) in grants.iter().zip(&selected.submissions) {
+            assert_eq!(grant.parameters["action"], "read-representation");
+            assert_eq!(
+                grant.parameters["statement_run_token"].as_str(),
+                Some(submission.run_token.as_str())
+            );
+            assert_eq!(grant.parameters["scan_layout"], "view");
+            assert_eq!(grant.parameters["dictionary_output"], true);
+        }
     }
 
     #[test]

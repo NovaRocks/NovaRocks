@@ -5,7 +5,7 @@ domain: [provider-spi]
 status: active
 supersedes: []
 superseded-by: null
-partially-superseded-by: [ADR-0214]
+partially-superseded-by: [ADR-0214, ADR-0244]
 date: 2026-11-03
 provenance:
   - "discussion: 2026-11-02 accepted Iceberg read interpretation and Historical/Current authority design"
@@ -17,6 +17,8 @@ code-anchors:
   - "novarocks/connector/iceberg/src/metadata_json.rs (bounded complete metadata decoding)"
   - "tests/sql/fixtures/iceberg-read-policy/fixture.scala (MetadataHistoryFixture)"
 ---
+
+[ADR-0244](ADR-0244-footer-derived-parquet-reader-representation.md) 部分替代本记录对 supplied schema 的否决，允许 FS 从真实 footer 的标准解释派生并校验 reader 局部字节载体。原始事实、按政策隔离的解释缓存与 Current/Historical 权威继续按本记录执行。
 
 ## 问题
 

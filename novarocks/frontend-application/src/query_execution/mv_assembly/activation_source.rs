@@ -268,6 +268,7 @@ impl MvWritePreparationCustody {
             scope,
             crate::query_execution::compiler::typed_connector_session()
                 .map_err(|error| F::Domain(contract_error(error)))?,
+            Arc::clone(self.execution.session_property_inputs()),
         )
         .map_err(|error| F::Domain(contract_error(error)))?;
         self.sink = Some(ReadAccessSink::new());

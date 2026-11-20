@@ -30,7 +30,7 @@ use novarocks_type_contract::{
 use novarocks_types::SlotId;
 use std::{
     collections::HashMap,
-    num::{NonZeroU64, NonZeroUsize},
+    num::NonZeroUsize,
     sync::{Arc, Mutex},
 };
 
@@ -172,8 +172,6 @@ fn frozen() -> FrozenConnectorRead {
         TupleDomain::all(),
         None,
         vec![],
-        NonZeroU64::new(100).unwrap(),
-        NonZeroU64::new(4096).unwrap(),
     )
     .unwrap();
     let source = ConnectorReadStaticFacts::try_new(
@@ -210,8 +208,6 @@ fn legacy() -> StaticConnectorScan {
         TupleDomain::all(),
         None,
         vec![],
-        NonZeroU64::new(100).unwrap(),
-        NonZeroU64::new(4096).unwrap(),
     )
     .unwrap()
 }
@@ -407,7 +403,6 @@ fn complete_read_seal_preserves_explicit_json_without_duplicating_root_field_tag
         b"canonical-private"
     );
 
-    assert_eq!(retained.frozen().scan().max_batch_rows().get(), 100);
     assert_eq!(
         retained.frozen().public_facts().source().selection_digest(),
         [7; 32]

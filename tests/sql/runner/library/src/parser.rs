@@ -90,6 +90,8 @@ pub fn parse_meta_line(line: &str, meta_re: &Regex) -> Option<(String, String)> 
             return (matches!(
                 key.trim().to_ascii_lowercase().as_str(),
                 "expect_trino_error"
+                    | "iceberg_scan_layout"
+                    | "iceberg_dictionary_output"
                     | "native_observation_attempts"
                     | "publication_catalog_fault_target"
                     | "publication_catalog_fault_timing"
@@ -872,6 +874,20 @@ fn parse_meta_with_name_binding(
                 }
                 meta.native_observation_attempts = Some(attempts);
             }
+            "iceberg_scan_layout" => {
+                meta.iceberg_scan_layout = Some(match raw_value.as_str() {
+                    "offsets" => IcebergScanLayout::Offsets,
+                    "view" => IcebergScanLayout::View,
+                    _ => bail!("@iceberg_scan_layout requires offsets or view"),
+                });
+            }
+            "iceberg_dictionary_output" => {
+                meta.iceberg_dictionary_output = Some(match raw_value.as_str() {
+                    "true" => true,
+                    "false" => false,
+                    _ => bail!("@iceberg_dictionary_output requires true or false"),
+                });
+            }
             "be_log_contains" => {
                 parse_observation_marker(&raw_value).with_context(|| format!("@{key}: {line}"))?;
                 meta.be_log_contains.push(raw_value);
@@ -1257,6 +1273,12 @@ pub fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
             .native_observation_attempts
             .clone()
             .or_else(|| base.native_observation_attempts.clone()),
+        iceberg_scan_layout: override_meta
+            .iceberg_scan_layout
+            .or(base.iceberg_scan_layout),
+        iceberg_dictionary_output: override_meta
+            .iceberg_dictionary_output
+            .or(base.iceberg_dictionary_output),
         be_log_contains: if override_meta.be_log_contains.is_empty() {
             base.be_log_contains.clone()
         } else {
@@ -1970,6 +1992,41 @@ mod opt5_directive_tests {
             assert!(validate_trino_error_expectation(&indexed, Some(sql)).is_err());
         }
         assert!(validate_trino_error_expectation(&merge_meta(&legacy, &indexed), None).is_err());
+    }
+
+    #[test]
+    fn iceberg_layout_and_dictionary_directives_are_independent_and_checked() {
+        let re = Regex::new(r"^--\s*@([a-zA-Z0-9_]+)\s*=\s*(.+)$").unwrap();
+        let parse = |value: &str| parse_meta(&[value.to_string()], &re);
+        let view = parse("-- @iceberg_scan_layout=view").unwrap();
+        assert_eq!(view.iceberg_scan_layout, Some(IcebergScanLayout::View));
+        assert_eq!(view.iceberg_dictionary_output, None);
+        let dict = parse("-- @iceberg_dictionary_output=true").unwrap();
+        assert_eq!(dict.iceberg_scan_layout, None);
+        assert_eq!(dict.iceberg_dictionary_output, Some(true));
+        let merged = merge_meta(&view, &dict);
+        assert_eq!(merged.iceberg_scan_layout, Some(IcebergScanLayout::View));
+        assert_eq!(merged.iceberg_dictionary_output, Some(true));
+        assert_eq!(
+            parse("-- @iceberg_scan_layout=offsets")
+                .unwrap()
+                .iceberg_scan_layout,
+            Some(IcebergScanLayout::Offsets)
+        );
+        assert_eq!(
+            parse("-- @iceberg_dictionary_output=false")
+                .unwrap()
+                .iceberg_dictionary_output,
+            Some(false)
+        );
+        for invalid in [
+            "-- @iceberg_scan_layout=",
+            "-- @iceberg_scan_layout=dictionary",
+            "-- @iceberg_dictionary_output=",
+            "-- @iceberg_dictionary_output=1",
+        ] {
+            assert!(parse(invalid).is_err(), "{invalid}");
+        }
     }
 
     #[test]

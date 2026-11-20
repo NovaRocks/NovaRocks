@@ -8895,9 +8895,8 @@ pub(crate) mod tests {
         };
         use novarocks_physical_plan::{
             FragmentId, FragmentPackage, FragmentPackageAdmission, FragmentSink,
-            FrozenFragmentPruning, MAX_SCAN_BATCH_BYTES, MAX_SCAN_BATCH_ROWS, NodeKind,
-            PipelineDopDomain, PlanLimits, PlanVersionId, PropertyProofProjectionLimits,
-            ScanReadBudget, extract_fragment_packages,
+            FrozenFragmentPruning, NodeKind, PipelineDopDomain, PlanLimits, PlanVersionId,
+            PropertyProofProjectionLimits, extract_fragment_packages,
         };
         use novarocks_plan_codec::physical_package_v2::encode_fragment_package;
         use novarocks_plan_codec::physical_package_v2::test_support::{
@@ -9537,10 +9536,6 @@ pub(crate) mod tests {
                     min: 1,
                     max: 8,
                     requires_power_of_two: true,
-                },
-                ScanReadBudget {
-                    max_batch_rows: MAX_SCAN_BATCH_ROWS,
-                    max_batch_bytes: MAX_SCAN_BATCH_BYTES,
                 },
                 DEFAULT_COMPLETION_LIMITS,
             )

@@ -55,6 +55,87 @@ const TARGET_MAX_FILE_SIZE: &str = "iceberg.target-max-file-size";
 pub(crate) const DEFAULT_MAX_PARTITIONS_PER_WRITER: u32 = 100;
 pub(crate) const DEFAULT_TARGET_FILE_SIZE_BYTES: u64 = 1 << 30;
 
+pub const PARQUET_READ_BLOCK_ROW_COUNT_SESSION_PROPERTY: &str = "parquet_max_read_block_row_count";
+pub const PARQUET_READ_BLOCK_SIZE_SESSION_PROPERTY: &str = "parquet_max_read_block_size";
+const PARQUET_MAX_READ_BLOCK_ROW_COUNT: &str = "parquet.max-read-block-row-count";
+const PARQUET_MAX_READ_BLOCK_SIZE: &str = "parquet.max-read-block-size";
+const DEFAULT_PARQUET_MAX_READ_ROWS: i32 = 8192;
+const DEFAULT_PARQUET_MAX_READ_SIZE: &str = "16MB";
+const DEFAULT_PARQUET_MAX_READ_BYTES: i64 = 16 << 20;
+
+/// Parquet decode sizing retained by the exact catalog generation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IcebergCatalogReadConfig {
+    pub max_read_rows: u32,
+    pub max_read_bytes: i64,
+}
+
+impl Default for IcebergCatalogReadConfig {
+    fn default() -> Self {
+        Self {
+            max_read_rows: DEFAULT_PARQUET_MAX_READ_ROWS as u32,
+            max_read_bytes: DEFAULT_PARQUET_MAX_READ_BYTES,
+        }
+    }
+}
+
+impl IcebergCatalogReadConfig {
+    fn parse(properties: &HashMap<String, String>) -> Result<(Self, &str), String> {
+        let rows = properties
+            .get(PARQUET_MAX_READ_BLOCK_ROW_COUNT)
+            .map(|text| text.trim().parse::<i32>())
+            .transpose()
+            .map_err(|_| format!("{PARQUET_MAX_READ_BLOCK_ROW_COUNT} requires a SQL INTEGER"))?
+            .unwrap_or(DEFAULT_PARQUET_MAX_READ_ROWS);
+        let size = properties
+            .get(PARQUET_MAX_READ_BLOCK_SIZE)
+            .map(String::as_str)
+            .unwrap_or(DEFAULT_PARQUET_MAX_READ_SIZE);
+        Ok((
+            Self {
+                max_read_rows: validate_parquet_read_block_rows(rows)?,
+                max_read_bytes: parse_parquet_read_block_size(size)?,
+            },
+            size,
+        ))
+    }
+
+    pub fn session_defaults(properties: &[(String, String)]) -> Result<(i32, String), String> {
+        let properties = normalized_properties(properties);
+        let (config, size) = Self::parse(&properties)?;
+        Ok((config.max_read_rows as i32, size.to_owned()))
+    }
+}
+
+pub fn validate_parquet_read_block_rows(rows: i32) -> Result<u32, String> {
+    if (128..=65536).contains(&rows) {
+        Ok(rows as u32)
+    } else {
+        Err(format!(
+            "{PARQUET_READ_BLOCK_ROW_COUNT_SESSION_PROPERTY} must be between 128 and 65536: {rows}"
+        ))
+    }
+}
+
+pub fn parse_parquet_read_block_size(size: &str) -> Result<i64, String> {
+    use crate::table_properties::DataSizeParseFailure;
+    crate::table_properties::parse_airlift_data_size(
+        size,
+        || Ok(()),
+        |failure, field| match failure {
+            DataSizeParseFailure::Syntax => {
+                format!("size is not a valid data size string: {field}")
+            }
+            DataSizeParseFailure::Unit => format!("Unknown unit: {field}"),
+            DataSizeParseFailure::IntegerOverflow if field.parse::<i64>().is_err() => {
+                format!("For input string: \"{field}\"")
+            }
+            DataSizeParseFailure::IntegerOverflow => "long overflow".to_owned(),
+            DataSizeParseFailure::DecimalOverflow => format!("size is too large: {field}"),
+        },
+    )
+}
+
 /// Catalog-local defaults for writer settings frozen when a write begins.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct IcebergCatalogWriteConfig {
@@ -175,6 +256,7 @@ pub struct IcebergCatalogConfiguration {
     pub object_store_config: Option<ObjectStoreConfig>,
     pub warehouse_path: PathBuf,
     pub write: IcebergCatalogWriteConfig,
+    pub read: IcebergCatalogReadConfig,
 }
 
 impl IcebergCatalogConfiguration {
@@ -459,6 +541,7 @@ fn parse_hadoop_configuration(
     endpoint_binding: Option<&ObjectStoreEndpointConfig>,
 ) -> Result<IcebergCatalogConfiguration, String> {
     let write = IcebergCatalogWriteConfig::parse(&properties)?;
+    let (read, _) = IcebergCatalogReadConfig::parse(&properties)?;
     let raw_warehouse = properties
         .get("iceberg.catalog.warehouse")
         .or_else(|| properties.get("warehouse"))
@@ -512,6 +595,7 @@ fn parse_hadoop_configuration(
         warehouse_uri.clone(),
     );
     Ok(IcebergCatalogConfiguration {
+        read,
         write,
         kind: IcebergCatalogKind::Hadoop,
         warehouse_uri,
@@ -529,6 +613,7 @@ fn parse_rest_configuration(
     endpoint_binding: Option<&ObjectStoreEndpointConfig>,
 ) -> Result<IcebergCatalogConfiguration, String> {
     let write = IcebergCatalogWriteConfig::parse(&properties)?;
+    let (read, _) = IcebergCatalogReadConfig::parse(&properties)?;
     // Every REST configuration passes here, so a definition that would let a
     // property override the role's authentication never yields a
     // configuration a generation could be built from.
@@ -564,6 +649,7 @@ fn parse_rest_configuration(
         );
     }
     Ok(IcebergCatalogConfiguration {
+        read,
         write,
         kind: IcebergCatalogKind::Rest,
         warehouse_uri,
@@ -581,6 +667,7 @@ fn parse_hive_configuration(
     endpoint_binding: Option<&ObjectStoreEndpointConfig>,
 ) -> Result<IcebergCatalogConfiguration, String> {
     let write = IcebergCatalogWriteConfig::parse(&properties)?;
+    let (read, _) = IcebergCatalogReadConfig::parse(&properties)?;
     for key in properties.keys() {
         let normalized = key.to_ascii_lowercase();
         if normalized.contains("kerberos")
@@ -632,6 +719,7 @@ fn parse_hive_configuration(
         );
     }
     Ok(IcebergCatalogConfiguration {
+        read,
         write,
         kind: IcebergCatalogKind::Hive,
         warehouse_uri,

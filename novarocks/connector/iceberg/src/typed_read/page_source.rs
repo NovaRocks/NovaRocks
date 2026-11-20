@@ -35,18 +35,18 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use arrow::array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, FixedSizeBinaryArray,
-    Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, LargeBinaryArray,
-    LargeStringArray, RecordBatch, StringArray, Time64MicrosecondArray, TimestampMicrosecondArray,
-    TimestampMillisecondArray, TimestampNanosecondArray, UInt64Array,
+    Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, FixedSizeBinaryArray,
+    Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, RecordBatch,
+    Time64MicrosecondArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+    TimestampNanosecondArray, UInt64Array,
 };
-use arrow::datatypes::{Field, FieldRef, Schema as ArrowSchema};
+use arrow::datatypes::{Field, Schema as ArrowSchema};
 use novarocks_fs::{
-    FileIdentity, FileProjection, FileReadBudget, FileReadContext, FileReadRange, FileReadRequest,
+    FileIdentity, FileProjection, FileReadContext, FileReadRange, FileReadRequest,
     FileReaderOptions, FsAccessHandle, MinMaxPredicateOp, MinMaxPredicateValue,
     ParquetMetadataInspection, ParquetPhysicalType, ParquetStatisticsSortOrder,
-    ParquetStatisticsValue, PhysicalPruning, PreparedFileInput, ScanPredicate, ScanPredicateDomain,
-    ScanPredicateSource, inspect_parquet_metadata, plan_parquet_input_ranges,
+    ParquetStatisticsValue, PhysicalPruning, PreparedFileInput, ReaderSizing, ScanPredicate,
+    ScanPredicateDomain, ScanPredicateSource, inspect_parquet_metadata, plan_parquet_input_ranges,
 };
 use novarocks_spi::connector::read_stack::DynamicFilter;
 use novarocks_spi::connector::read_stack::{
@@ -67,7 +67,14 @@ use super::column_handle::{IcebergColumnHandle, corrupt, invalid, parse_type, un
 use super::delete_manager::{DeleteEvaluationMode, DeleteManager, SplitDeleteFilter};
 use super::preparation::{PlannedInput, PreparedRangeCandidate, SuccessorPreparationGroup};
 
-type FooterCache = HashMap<(StorageAccessDomainId, FileIdentity), ParquetMetadataInspection>;
+type FooterCache = HashMap<
+    (
+        StorageAccessDomainId,
+        FileIdentity,
+        novarocks_fs::ParquetInterpretationPolicy,
+    ),
+    ParquetMetadataInspection,
+>;
 type FooterCacheGuard<'a> = std::sync::MutexGuard<'a, FooterCache>;
 
 mod stream;
@@ -210,6 +217,7 @@ fn file_predicate_value(value: &ConnectorValue) -> Option<MinMaxPredicateValue> 
     }
 }
 
+use super::runtime::IcebergReadLayout;
 use super::schema_binding::{
     FileFieldIdCoverage, IcebergColumnSource, IcebergSchemaBinding, IcebergSchemaBindingRequest,
     IcebergSplitFacts, bind_scan_columns,
@@ -668,22 +676,18 @@ impl ParquetFooterCache {
         context: &FileReadContext,
         path: &str,
         file_size: u64,
+        policy: novarocks_fs::ParquetInterpretationPolicy,
     ) -> Result<ParquetMetadataInspection, ConnectorError> {
         let file = access
             .bind_location(path, FileIdentity::new(path, file_size, None))
             .map_err(map_file_error)?;
         context.check_active().map_err(map_file_error)?;
-        let key = (file.access_domain(), file.identity().clone());
+        let key = (file.access_domain(), file.identity().clone(), policy);
         if let Some(cached) = self.lock()?.get(&key) {
             return Ok(cached.clone());
         }
-        let inspection = inspect_parquet_metadata(
-            file,
-            None,
-            context.clone(),
-            novarocks_fs::ParquetInterpretationPolicy::SkipArrowHint,
-        )
-        .map_err(map_file_error)?;
+        let inspection = inspect_parquet_metadata(file, None, context.clone(), policy)
+            .map_err(map_file_error)?;
         self.lock()?.insert(key, inspection.clone());
         Ok(inspection)
     }
@@ -695,23 +699,20 @@ impl ParquetFooterCache {
         context: &FileReadContext,
         path: &str,
         file_size: u64,
+        policy: novarocks_fs::ParquetInterpretationPolicy,
     ) -> Result<ParquetMetadataInspection, ConnectorError> {
         let file = access
             .bind_location(path, FileIdentity::new(path, file_size, None))
             .map_err(map_file_error)?;
         context.check_active().map_err(map_file_error)?;
-        let key = (file.access_domain(), file.identity().clone());
+        let key = (file.access_domain(), file.identity().clone(), policy);
         if let Some(cached) = self.lock()?.get(&key) {
             return Ok(cached.clone());
         }
-        let inspection = novarocks_fs::inspect_parquet_metadata_async(
-            file,
-            None,
-            context.clone(),
-            novarocks_fs::ParquetInterpretationPolicy::SkipArrowHint,
-        )
-        .await
-        .map_err(map_file_error)?;
+        let inspection =
+            novarocks_fs::inspect_parquet_metadata_async(file, None, context.clone(), policy)
+                .await
+                .map_err(map_file_error)?;
         self.lock()?.insert(key, inspection.clone());
         Ok(inspection)
     }
@@ -720,14 +721,11 @@ impl ParquetFooterCache {
     /// A later demanded reader reuses this exact snapshot through the normal
     /// file/domain lookup rather than issuing a second footer request.
     pub fn remember(&self, inspection: ParquetMetadataInspection) -> Result<(), ConnectorError> {
-        if inspection.interpretation_policy()
-            != novarocks_fs::ParquetInterpretationPolicy::SkipArrowHint
-        {
-            return Err(invalid(
-                "Iceberg footer requires the provider's Arrow hint policy",
-            ));
-        }
-        let key = (inspection.access_domain(), inspection.identity().clone());
+        let key = (
+            inspection.access_domain(),
+            inspection.identity().clone(),
+            inspection.interpretation_policy(),
+        );
         self.lock()?.entry(key).or_insert(inspection);
         Ok(())
     }
@@ -760,6 +758,8 @@ impl ParquetFooterCache {
 /// directly instead of forcing one relation to impersonate the other.
 #[derive(Clone, Debug)]
 pub struct IcebergReadRelation {
+    output_layout: IcebergReadLayout,
+    nominals: Arc<crate::schema_mapping::nominal_declaration::NominalSourceDeclarations>,
     table_schema: Arc<Schema>,
     partition_spec: PartitionSpec,
     name_mapping: Option<Arc<NameMapping>>,
@@ -775,6 +775,8 @@ impl IcebergReadRelation {
         partition_spec_id: i32,
     ) -> Result<Self, ConnectorError> {
         Ok(Self {
+            output_layout: IcebergReadLayout::Offsets,
+            nominals: Arc::new(handle.nominal_declarations().clone()),
             table_schema: Arc::new(handle.parse_table_schema()?),
             partition_spec: handle.parse_partition_spec(partition_spec_id)?,
             name_mapping: parse_name_mapping(handle.name_mapping_json())?,
@@ -798,6 +800,8 @@ impl IcebergReadRelation {
         partition_spec_id: i32,
     ) -> Result<Self, ConnectorError> {
         Ok(Self {
+            output_layout: IcebergReadLayout::Offsets,
+            nominals: Arc::new(handle.nominal_declarations().clone()),
             table_schema: Arc::new(handle.parse_table_schema()?),
             partition_spec: handle.parse_partition_spec(partition_spec_id)?,
             name_mapping: parse_name_mapping(handle.name_mapping_json())?,
@@ -834,6 +838,11 @@ impl IcebergReadRelation {
         Ok(relation)
     }
 
+    pub(super) fn with_output_layout(mut self, layout: IcebergReadLayout) -> Self {
+        self.output_layout = layout;
+        self
+    }
+
     pub fn table_schema(&self) -> &Arc<Schema> {
         &self.table_schema
     }
@@ -854,7 +863,7 @@ pub struct IcebergPageSourceRequest<'a> {
     pub access_binding: IcebergReadBinding,
     pub context: FileReadContext,
     pub cache: Option<novarocks_fs::DataCachePolicy>,
-    pub budget: FileReadBudget,
+    pub budget: ReaderSizing,
     pub reader_options: FileReaderOptions,
     /// Names this split within its task attempt; the only scheduling identity.
     pub scheduled_split_sequence_id: u64,
@@ -863,6 +872,7 @@ pub struct IcebergPageSourceRequest<'a> {
     /// still chooses the authoritative decode ranges and fills any misses.
     pub prepared_input: Option<PreparedFileInput>,
     pub pending_preparation_control: Option<Arc<dyn ConnectorPreparationControl>>,
+    pub(crate) output_projection: Option<super::output::OutputProjection>,
 }
 
 /// A split's facts once its format, encryption material and partition spec
@@ -943,11 +953,10 @@ fn partition_only_source(
     try_partition_only_page_source(
         request.split,
         request.columns,
-        &admitted.partition_spec,
+        request.relation,
         &admitted.partition_values,
-        &admitted.table_schema,
-        &admitted.effective_predicate,
-        request.budget,
+        request.context.clone(),
+        request.output_projection.clone(),
     )
 }
 
@@ -955,6 +964,8 @@ fn partition_only_source(
 /// stream can build it in its first poll.
 struct ParquetSplitRequest {
     split: IcebergSplit,
+    output_layout: IcebergReadLayout,
+    nominals: Arc<crate::schema_mapping::nominal_declaration::NominalSourceDeclarations>,
     name_mapping: Option<Arc<NameMapping>>,
     columns: Vec<IcebergColumnHandle>,
     delete_manager: Arc<DeleteManager>,
@@ -963,12 +974,13 @@ struct ParquetSplitRequest {
     access_binding: IcebergReadBinding,
     context: FileReadContext,
     cache: Option<novarocks_fs::DataCachePolicy>,
-    budget: FileReadBudget,
+    budget: ReaderSizing,
     reader_options: FileReaderOptions,
     scheduled_split_sequence_id: u64,
     dynamic_filter: Arc<IcebergDynamicFilter>,
     prepared_input: Option<PreparedFileInput>,
     pending_preparation_control: Option<Arc<dyn ConnectorPreparationControl>>,
+    output_projection: Option<super::output::OutputProjection>,
 }
 
 impl ParquetSplitRequest {
@@ -976,6 +988,8 @@ impl ParquetSplitRequest {
         (
             Self {
                 split: request.split.clone(),
+                output_layout: request.relation.output_layout,
+                nominals: request.relation.nominals.clone(),
                 name_mapping: request.relation.name_mapping.clone(),
                 columns: request.columns.to_vec(),
                 delete_manager: request.delete_manager,
@@ -990,6 +1004,7 @@ impl ParquetSplitRequest {
                 dynamic_filter: request.dynamic_filter,
                 prepared_input: request.prepared_input,
                 pending_preparation_control: request.pending_preparation_control,
+                output_projection: request.output_projection,
             },
             request.delete_mode,
         )
@@ -1024,6 +1039,8 @@ impl ParquetSplitRequest {
             delete_domains: self.delete_domains,
             delete_mode,
             table_schema: admitted.table_schema,
+            output_layout: self.output_layout,
+            nominals: self.nominals,
             name_mapping: self.name_mapping,
             partition_spec: admitted.partition_spec,
             partition_values: admitted.partition_values,
@@ -1055,6 +1072,9 @@ impl ParquetSplitRequest {
             retired_file_metrics: Default::default(),
             file_metrics: Default::default(),
             completed_positions: 0,
+            first_file_batch: None,
+            pending_output: None,
+            output_projection: self.output_projection,
             read_time_nanos: 0,
             retained_bytes: self.split.retained_size_in_bytes(),
             split: self.split,
@@ -1072,7 +1092,7 @@ pub(super) struct PreparedInputRequest<'a> {
     pub(super) access_binding: &'a IcebergReadBinding,
     pub(super) context: FileReadContext,
     pub(super) cache: Option<novarocks_fs::DataCachePolicy>,
-    pub(super) budget: FileReadBudget,
+    pub(super) budget: ReaderSizing,
     pub(super) reader_options: FileReaderOptions,
     pub(super) row_group_ordinal: Option<u32>,
 }
@@ -1122,11 +1142,10 @@ pub(super) fn plan_iceberg_prepared_input(
         && try_partition_only_page_source(
             split,
             columns,
-            &relation.partition_spec,
+            relation,
             &partition_values,
-            &relation.table_schema,
-            &relation.effective_predicate,
-            budget,
+            context.clone(),
+            None,
         )?
         .is_some()
     {
@@ -1183,14 +1202,13 @@ pub(super) fn plan_iceberg_prepared_input(
     // An incomplete runtime filter can arrive after preparation. Page-index
     // work here would embody an early predicate decision; use conservative
     // column ranges, leaving exact pages to the active decoder.
-    reader_options = crate::file_reader::iceberg_reader_options(reader_options);
     reader_options.enable_parquet_reader_page_index = false;
     let request = FileReadRequest {
         file: file.clone(),
         format: novarocks_fs::FileFormat::Parquet,
         range,
         projection,
-        budget,
+        sizing: budget,
         predicates: Vec::new(),
         pruning: PhysicalPruning {
             row_groups: row_group_ordinal.map(|ordinal| vec![ordinal as usize]),
@@ -1284,22 +1302,24 @@ fn parse_partition_values(
 fn try_partition_only_page_source(
     split: &IcebergSplit,
     columns: &[IcebergColumnHandle],
-    partition_spec: &PartitionSpec,
+    relation: &IcebergReadRelation,
     partition_values: &Struct,
-    table_schema: &Schema,
-    effective_predicate: &TupleDomain<IcebergColumnHandle>,
-    budget: FileReadBudget,
+    context: FileReadContext,
+    output_projection: Option<super::output::OutputProjection>,
 ) -> Result<Option<IcebergPartitionOnlyPageSource>, ConnectorError> {
-    if !split.is_whole_file() || !split.deletes().is_empty() || !effective_predicate.is_all() {
+    if !split.is_whole_file()
+        || !split.deletes().is_empty()
+        || !relation.effective_predicate.is_all()
+    {
         return Ok(None);
     }
     let binding = bind_scan_columns(IcebergSchemaBindingRequest {
-        table_schema,
+        table_schema: &relation.table_schema,
         // An empty file schema forces every column onto a non-physical source,
         // so a column that would need the file cannot slip into this path.
         file_schema: &Arc::new(ArrowSchema::empty()),
         name_mapping: None,
-        partition_spec: Some(partition_spec),
+        partition_spec: Some(&relation.partition_spec),
         partition_values: Some(partition_values),
         columns,
     });
@@ -1313,7 +1333,10 @@ fn try_partition_only_page_source(
     for column in binding.columns() {
         match column.source() {
             IcebergColumnSource::IdentityPartitionConstant(value) => {
-                constants.push((Arc::clone(column.target()), value.clone()));
+                let array = constant_column(value.as_ref(), column.target(), 1)?;
+                let target =
+                    output_carrier(column.target(), relation.output_layout, &relation.nominals)?;
+                constants.push((array, target));
             }
             IcebergColumnSource::Physical { .. }
             | IcebergColumnSource::MutationSpecId(_)
@@ -1334,17 +1357,19 @@ fn try_partition_only_page_source(
         constants,
         total_rows,
         emitted_rows: 0,
-        max_batch_rows: budget.max_rows.get(),
+        context,
+        output_projection,
         retained_bytes: split.retained_size_in_bytes(),
     }))
 }
 
 /// A split that needs no byte of its data file: its pages are constants.
 pub struct IcebergPartitionOnlyPageSource {
-    constants: Vec<(FieldRef, Option<Literal>)>,
+    constants: Vec<(ArrayRef, arrow::datatypes::DataType)>,
     total_rows: u64,
     emitted_rows: u64,
-    max_batch_rows: usize,
+    context: FileReadContext,
+    output_projection: Option<super::output::OutputProjection>,
     retained_bytes: u64,
 }
 
@@ -1354,22 +1379,29 @@ impl IcebergPartitionOnlyPageSource {
             return Ok(None);
         }
         let remaining = self.total_rows - self.emitted_rows;
-        let rows = usize::try_from(remaining.min(self.max_batch_rows as u64)).map_err(|_| {
-            ConnectorError::new(ConnectorErrorKind::Internal, "row budget overflow")
-        })?;
-        let page = if self.constants.is_empty() {
-            // A count-only or partition-only scan legitimately produces
-            // positions without producing a single column.
-            SourcePage::zero_channel(rows)
-        } else {
-            let mut columns = Vec::with_capacity(self.constants.len());
-            for (field, value) in &self.constants {
-                columns.push(constant_column(value.as_ref(), field.as_ref(), rows)?);
-            }
-            SourcePage::try_new(rows, columns)?
-        };
-        self.emitted_rows += rows as u64;
-        Ok(Some(page))
+        use novarocks_spi::connector::ENGINE_OUTPUT_POLICY;
+        use novarocks_value_arrays::measure::{OutputColumn, OutputRows};
+        let rows = remaining.min(u64::from(ENGINE_OUTPUT_POLICY.max_rows.get())) as usize;
+        let columns = self
+            .constants
+            .iter()
+            .map(|(array, target)| OutputColumn::constant(array, target))
+            .collect::<Vec<_>>();
+        let projected = self
+            .output_projection
+            .as_ref()
+            .map(|projection| projection.project(&columns))
+            .transpose()?;
+        let mut pending = super::output::OutputCursor::new(
+            projected.as_deref().unwrap_or(&columns),
+            OutputRows::Contiguous(0..rows),
+            &self.context,
+        )?;
+        let page = pending.next_page(&self.context)?;
+        if let Some(page) = &page {
+            self.emitted_rows += page.position_count() as u64;
+        }
+        Ok(page)
     }
 
     fn is_exhausted(&self) -> bool {
@@ -1446,6 +1478,7 @@ enum ReaderState {
         plan: RowGroupPlan,
         binding: IcebergSchemaBinding,
         page_schema: Arc<ArrowSchema>,
+        output_targets: Vec<arrow::datatypes::DataType>,
         checks: Vec<PredicateCheck>,
         positions_required: bool,
     },
@@ -1498,8 +1531,12 @@ struct PredicateCheck {
 
 /// The per-split Parquet reader state a page stream moves through its steps.
 pub struct IcebergParquetPageSource {
+    output_projection: Option<super::output::OutputProjection>,
+    pending_output: Option<super::output::OutputCursor>,
     split: IcebergSplit,
     table_schema: Arc<Schema>,
+    output_layout: IcebergReadLayout,
+    nominals: Arc<crate::schema_mapping::nominal_declaration::NominalSourceDeclarations>,
     name_mapping: Option<Arc<NameMapping>>,
     partition_spec: PartitionSpec,
     partition_values: Struct,
@@ -1515,7 +1552,7 @@ pub struct IcebergParquetPageSource {
     context: FileReadContext,
     cache: Option<novarocks_fs::DataCachePolicy>,
     footers: Arc<ParquetFooterCache>,
-    budget: FileReadBudget,
+    budget: ReaderSizing,
     reader_options: FileReaderOptions,
     dynamic_filter: LiveDynamicFilter,
     prepared_input: Option<PreparedFileInput>,
@@ -1544,6 +1581,7 @@ pub struct IcebergParquetPageSource {
     /// Monotonic total including the currently open reader.
     file_metrics: novarocks_fs::FileMetricsSnapshot,
     completed_positions: u64,
+    first_file_batch: Option<novarocks_spi::connector::read_stack::FileReaderFirstBatch>,
     read_time_nanos: u64,
     retained_bytes: u64,
     finished: bool,
@@ -1560,7 +1598,13 @@ impl IcebergParquetPageSource {
         let file_size = self.file_size()?;
         let footer = self
             .footers
-            .footer_async(&access, &self.context, self.split.path(), file_size)
+            .footer_async(
+                &access,
+                &self.context,
+                self.split.path(),
+                file_size,
+                self.reader_options.parquet_interpretation_policy,
+            )
             .await?;
         self.open_with_footer(footer)
     }
@@ -1615,6 +1659,12 @@ impl IcebergParquetPageSource {
                 .map(|column| Arc::clone(column.target()))
                 .collect::<Vec<_>>(),
         ));
+        let output_targets = page_schema
+            .fields()
+            .iter()
+            .take(self.prefix_len)
+            .map(|field| output_carrier(field, self.output_layout, &self.nominals))
+            .collect::<Result<Vec<_>, _>>()?;
         let checks = self.build_predicate_checks()?;
 
         // A whole-file split owns every footer row group by ordinal, so it can
@@ -1647,6 +1697,7 @@ impl IcebergParquetPageSource {
             plan,
             binding,
             page_schema,
+            output_targets,
             checks,
             positions_required,
         };
@@ -1874,7 +1925,7 @@ impl IcebergParquetPageSource {
             format: novarocks_fs::FileFormat::Parquet,
             range,
             projection,
-            budget: self.budget,
+            sizing: self.budget,
             predicates: static_file_predicates(&self.effective_predicate),
             pruning: PhysicalPruning {
                 row_groups: row_groups.map(|ordinals| {
@@ -1885,7 +1936,7 @@ impl IcebergParquetPageSource {
                 }),
                 pages: Vec::new(),
             },
-            options: crate::file_reader::iceberg_reader_options(self.reader_options),
+            options: self.reader_options,
             cache: self.cache.clone(),
             prepared_input: self.prepared_input.take(),
             context: self.context.clone(),
@@ -1967,6 +2018,8 @@ impl IcebergParquetPageSource {
                 return Ok(ConnectorPreparationProgress::Deferred);
             }
             let relation = IcebergReadRelation {
+                output_layout: self.output_layout,
+                nominals: self.nominals.clone(),
                 table_schema: Arc::clone(&self.table_schema),
                 partition_spec: self.partition_spec.clone(),
                 name_mapping: self.name_mapping.clone(),
@@ -2071,6 +2124,7 @@ impl IcebergParquetPageSource {
             Ok(())
         };
         self.prepared_retained_capacity = 0;
+        self.pending_output = None;
         reader_result
     }
 }
@@ -2088,20 +2142,35 @@ impl IcebergParquetPageSource {
             self.open().await?;
         }
         loop {
-            let Some(file_batch) = self.next_file_batch().await? else {
+            if let Some(cursor) = &mut self.pending_output {
+                budget.consume(1).await;
+                if let Some(page) = cursor.next_page(&self.context)? {
+                    if cursor.is_exhausted() {
+                        self.pending_output = None;
+                    }
+                    self.completed_positions = self
+                        .completed_positions
+                        .saturating_add(page.position_count() as u64);
+                    return Ok(Some(page));
+                }
+                self.pending_output = None;
+            }
+            let Some(file_batch) = self.next_file_batch(budget).await? else {
                 return Ok(None);
             };
-            let page = self.assemble_page(file_batch)?;
-            budget.consume(1).await;
-            if let Some(page) = page {
-                return Ok(Some(page));
+            self.plan_output(file_batch)?;
+            if self.pending_output.is_none() {
+                budget.consume(1).await;
             }
         }
     }
 
     /// The next decoded batch of the split, opening the next run of row
     /// groups whenever the current one is drained. `None` once the split is.
-    async fn next_file_batch(&mut self) -> Result<Option<novarocks_fs::FileBatch>, ConnectorError> {
+    async fn next_file_batch(
+        &mut self,
+        budget: &ConnectorPollBudget,
+    ) -> Result<Option<novarocks_fs::FileBatch>, ConnectorError> {
         loop {
             // A run ends at a row-group boundary, which is exactly where a
             // tighter dynamic filter can still save the next decode.
@@ -2118,13 +2187,27 @@ impl IcebergParquetPageSource {
                 self.finished = true;
                 return Ok(None);
             };
+            let reader_batch_rows = reader.reader_batch_rows();
             let next = reader.next_batch().await;
             if let Some(batch) = self.observe_batch(next)? {
+                if self.first_file_batch.is_none()
+                    && let Some(reader_batch_rows) = reader_batch_rows
+                    && batch.batch.num_rows() > 0
+                {
+                    self.first_file_batch =
+                        Some(novarocks_spi::connector::read_stack::FileReaderFirstBatch {
+                            max_read_rows: self.budget.max_read_rows.get(),
+                            max_read_bytes: self.budget.max_read_bytes,
+                            reader_batch_rows,
+                            decoded_rows: batch.batch.num_rows(),
+                        });
+                }
                 return Ok(Some(batch));
             }
             if self.retire_run()? {
                 return Ok(self.finish());
             }
+            budget.consume(1).await;
         }
     }
 
@@ -2168,16 +2251,13 @@ impl IcebergParquetPageSource {
         Ok(exhausted)
     }
 
-    /// Turns one decoded batch into the split's page: materialized, judged by
-    /// deletes and the remaining predicate over the complete page, and cut to
-    /// the scan's columns. `None` when nothing in it survives. No I/O.
-    fn assemble_page(
-        &mut self,
-        file_batch: novarocks_fs::FileBatch,
-    ) -> Result<Option<SourcePage>, ConnectorError> {
+    /// Apply table semantics once to the source batch and retain the surviving
+    /// row domain until the final producer publishes every prefix.
+    fn plan_output(&mut self, file_batch: novarocks_fs::FileBatch) -> Result<(), ConnectorError> {
         let ReaderState::Open {
             binding,
             page_schema,
+            output_targets,
             checks,
             positions_required,
             ..
@@ -2213,20 +2293,16 @@ impl IcebergParquetPageSource {
             file_first_row_id: self.split.file_first_row_id(),
             data_sequence_number: self.split.data_sequence_number(),
         };
-        let columns = binding.materialize(&file_batch.batch, positions.as_ref(), &facts)?;
         let rows = file_batch.batch.num_rows();
-        let runtime_schema = runtime_page_schema(page_schema, &columns);
-        let page_batch = RecordBatch::try_new_with_options(
-            runtime_schema,
-            columns.clone(),
-            &arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(rows)),
-        )
-        .map_err(|error| {
-            corrupt(format!(
-                "iceberg page assembly for {} failed: {error}",
-                self.split.path()
-            ))
-        })?;
+        if rows == 0 {
+            return Ok(());
+        }
+        let columns = binding.materialize_for_scan(
+            &file_batch.batch,
+            positions.as_ref(),
+            &facts,
+            self.prefix_len,
+        )?;
 
         // Deletes and the remaining predicate both judge the complete page,
         // hidden suffix included, before the suffix is dropped.
@@ -2241,18 +2317,27 @@ impl IcebergParquetPageSource {
             })?;
             // Equality keys bind against their unique internal projection.
             // Output columns may repeat the same field ID, including aliases.
-            let delete_columns: Vec<_> = (self.prefix_len..page_batch.num_columns()).collect();
-            let delete_batch = page_batch
-                .project(&delete_columns)
-                .map_err(|error| corrupt(format!("iceberg delete projection failed: {error}")))?;
+            let delete_fields = ArrowSchema::new(page_schema.fields()[self.prefix_len..].to_vec());
+            let delete_columns = columns[self.prefix_len..]
+                .iter()
+                .map(|column| Arc::clone(&column.array))
+                .collect::<Vec<_>>();
+            let delete_batch = RecordBatch::try_new_with_options(
+                runtime_page_schema(&delete_fields, &delete_columns),
+                delete_columns,
+                &arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(rows)),
+            )
+            .map_err(|error| corrupt(format!("iceberg delete projection failed: {error}")))?;
             Some(self.delete_filter.evaluate(&delete_batch, positions)?)
         };
         for check in checks.iter() {
-            let mask = evaluate_domain(
-                page_batch.column(check.channel),
-                &check.domain,
-                self.split.path(),
-            )?;
+            let column = &columns[check.channel];
+            let mask = evaluate_domain(&column.array, &check.domain, self.split.path())?;
+            let mask = if column.constant {
+                BooleanArray::from(vec![mask.value(0); rows])
+            } else {
+                mask
+            };
             keep = Some(match keep {
                 None => mask,
                 Some(previous) => arrow::compute::and(&previous, &mask).map_err(|error| {
@@ -2261,25 +2346,87 @@ impl IcebergParquetPageSource {
             });
         }
 
-        let mut page = SourcePage::try_new(rows, columns)?;
-        if let Some(keep) = keep {
-            let selected = surviving_positions(&keep);
-            if selected.len() != rows {
-                page.select_positions(&selected)?;
-            }
-        }
-        page.truncate_channels(self.prefix_len)?;
-        if page.position_count() == 0 {
-            // Everything in this batch was deleted or filtered out. The
-            // split is not finished, so the next row group is read rather
-            // than reporting an empty page as if it were data.
-            return Ok(None);
-        }
-        self.completed_positions = self
-            .completed_positions
-            .saturating_add(page.position_count() as u64);
-        Ok(Some(page))
+        use novarocks_value_arrays::measure::{OutputColumn, OutputRows};
+        let row_domain = match keep.as_ref().map(surviving_positions) {
+            Some(selected) if selected.is_empty() => return Ok(()),
+            Some(selected) if selected.len() < rows => OutputRows::SharedSelected(selected.into()),
+            _ if rows == 0 => return Ok(()),
+            _ => OutputRows::Contiguous(0..rows),
+        };
+        let output = columns
+            .iter()
+            .zip(output_targets)
+            .map(|(source, target)| {
+                let target = match source.array.data_type() {
+                    arrow::datatypes::DataType::Dictionary(keys, values)
+                        if **keys == arrow::datatypes::DataType::Int32
+                            && novarocks_type_contract::dictionary_value_layout(target)
+                                .as_ref()
+                                == Some(values.as_ref()) =>
+                    {
+                        source.array.data_type()
+                    }
+                    _ => target,
+                };
+                if source.constant {
+                    OutputColumn::constant(&source.array, target)
+                } else {
+                    OutputColumn::new(&source.array, target)
+                }
+            })
+            .collect::<Vec<_>>();
+        let projected = self
+            .output_projection
+            .as_ref()
+            .map(|projection| projection.project(&output))
+            .transpose()?;
+        self.pending_output = Some(super::output::OutputCursor::new(
+            projected.as_deref().unwrap_or(&output),
+            row_domain,
+            &self.context,
+        )?);
+        Ok(())
     }
+}
+
+/// Use the frozen Iceberg field IDs to exclude nominal leaves from the view
+/// selection. This is the same primitive carrier choice as the schema author.
+fn output_carrier(
+    field: &Field,
+    layout: IcebergReadLayout,
+    nominals: &crate::schema_mapping::nominal_declaration::NominalSourceDeclarations,
+) -> Result<arrow::datatypes::DataType, ConnectorError> {
+    use arrow::datatypes::{DataType, FieldRef};
+    use novarocks_type_contract::ValueLogicalType;
+    if layout == IcebergReadLayout::Offsets {
+        return Ok(field.data_type().clone());
+    }
+    let child = |field: &FieldRef| {
+        let carrier = output_carrier(field, layout, nominals)?;
+        Ok::<_, ConnectorError>(if &carrier == field.data_type() {
+            Arc::clone(field)
+        } else {
+            Arc::new(field.as_ref().clone().with_data_type(carrier))
+        })
+    };
+    Ok(match field.data_type() {
+        DataType::Struct(fields) => DataType::Struct(
+            fields
+                .iter()
+                .map(child)
+                .collect::<Result<Vec<_>, _>>()?
+                .into(),
+        ),
+        DataType::List(item) => DataType::List(child(item)?),
+        DataType::Map(entries, ordered) => DataType::Map(child(entries)?, *ordered),
+        ty => {
+            let id = crate::schema_mapping::field_id_for_arrow_field(field).map_err(corrupt)?;
+            let domain = id
+                .and_then(|id| nominals.get(&id))
+                .map_or(ValueLogicalType::Physical, |domain| domain.logical_type());
+            layout.byte_carrier(ty, domain)
+        }
+    })
 }
 
 fn file_metrics_saturating_add(
@@ -2358,6 +2505,31 @@ fn evaluate_domain(
     let null_allowed = domain.null_allowed();
     let values = domain.values();
     let mut keep = Vec::with_capacity(column.len());
+    if matches!(
+        domain.value_type(),
+        ConnectorValueType::Varchar | ConnectorValueType::Varbinary
+    ) {
+        let utf8 = domain.value_type() == ConnectorValueType::Varchar;
+        let source = super::output::byte_source(column, utf8)
+            .map_err(|error| corrupt(format!("iceberg predicate column of {path}: {error}")))?;
+        for row in 0..column.len() {
+            let value = source
+                .value(row)
+                .map_err(|error| corrupt(error.to_string()))?;
+            keep.push(match value {
+                None => null_allowed,
+                Some(text) if utf8 => {
+                    let text =
+                        std::str::from_utf8(text).map_err(|error| corrupt(error.to_string()))?;
+                    values.contains_value(&ConnectorValue::Varchar(Arc::from(text)))?
+                }
+                Some(bytes) => {
+                    values.contains_value(&ConnectorValue::Varbinary(Arc::from(bytes)))?
+                }
+            });
+        }
+        return Ok(BooleanArray::from(keep));
+    }
     for row in 0..column.len() {
         if column.is_null(row) {
             keep.push(null_allowed);
@@ -2444,22 +2616,9 @@ fn connector_value_at(
         ConnectorValueType::TimestampTzNanos => ConnectorValue::TimestampTzNanos(
             downcast::<TimestampNanosecondArray>(column, path)?.value(row),
         ),
-        ConnectorValueType::Varchar => match column.data_type() {
-            arrow::datatypes::DataType::LargeUtf8 => ConnectorValue::Varchar(Arc::from(
-                downcast::<LargeStringArray>(column, path)?.value(row),
-            )),
-            _ => ConnectorValue::Varchar(Arc::from(
-                downcast::<StringArray>(column, path)?.value(row),
-            )),
-        },
-        ConnectorValueType::Varbinary => match column.data_type() {
-            arrow::datatypes::DataType::LargeBinary => ConnectorValue::Varbinary(Arc::from(
-                downcast::<LargeBinaryArray>(column, path)?.value(row),
-            )),
-            _ => ConnectorValue::Varbinary(Arc::from(
-                downcast::<BinaryArray>(column, path)?.value(row),
-            )),
-        },
+        ConnectorValueType::Varchar | ConnectorValueType::Varbinary => {
+            unreachable!("byte domains use the source's logical value access")
+        }
         ConnectorValueType::Uuid => {
             let bytes = downcast::<FixedSizeBinaryArray>(column, path)?.value(row);
             ConnectorValue::Uuid(<[u8; 16]>::try_from(bytes).map_err(|_| {

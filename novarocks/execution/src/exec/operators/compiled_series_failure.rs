@@ -21,8 +21,6 @@ use std::{error::Error, fmt};
 #[derive(Debug)]
 pub(super) enum CompiledSeriesFailure {
     DuplicateBounds,
-    MissingBatchRows,
-    InvalidBatchRows,
     InputPort,
     Arrow(arrow::error::ArrowError),
     AlreadyFailed,
@@ -31,8 +29,6 @@ impl fmt::Display for CompiledSeriesFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::DuplicateBounds => "compiled series accepts its bounds port once",
-            Self::MissingBatchRows => "compiled series batch size was not bound",
-            Self::InvalidBatchRows => "compiled series batch size is zero",
             Self::InputPort => "compiled series input differs from its frozen bounds port",
             Self::AlreadyFailed => "compiled series instance has already failed",
             Self::Arrow(error) => return error.fmt(f),
@@ -51,8 +47,6 @@ impl FailureProjection for CompiledSeriesFailure {
     fn failure_fact(&self) -> FailureFact {
         let reason = match self {
             Self::DuplicateBounds => ExecutionReason::SeriesDuplicateBounds,
-            Self::MissingBatchRows => ExecutionReason::SeriesMissingBatchRows,
-            Self::InvalidBatchRows => ExecutionReason::SeriesInvalidBatchRows,
             Self::InputPort => ExecutionReason::SeriesInputPort,
             Self::Arrow(_) => ExecutionReason::SeriesArrow,
             Self::AlreadyFailed => ExecutionReason::SeriesAlreadyFailed,

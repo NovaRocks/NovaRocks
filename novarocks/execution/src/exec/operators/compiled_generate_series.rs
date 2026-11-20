@@ -33,7 +33,7 @@ use crate::exec::pipeline::{
     shape::{Transform, TransformKernel},
     step::{NextStep, StepResult},
 };
-use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
+use crate::runtime::runtime_state::RuntimeErrorState;
 use crate::runtime::task::{ExecutionFailure, ExecutionResult};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
@@ -60,12 +60,14 @@ pub(crate) struct CompiledGenerateSeriesProcessorFactory {
     parameters: Arc<[usize]>,
     output_layout: novarocks_local_program::StaticLayout,
     error: Arc<RuntimeErrorState>,
+    batch_rows: std::num::NonZeroU32,
 }
 impl CompiledGenerateSeriesProcessorFactory {
     pub(crate) fn try_new(
         program: Arc<LocalProgram>,
         node: ProgramNodeId,
         error: Arc<RuntimeErrorState>,
+        batch_rows: std::num::NonZeroU32,
     ) -> Result<Self, FragmentBindingError> {
         let graph_node = program.graph().nodes().get(node.index()).ok_or_else(|| {
             binding(
@@ -127,6 +129,7 @@ impl CompiledGenerateSeriesProcessorFactory {
             parameters: Arc::from(parameters),
             output_layout,
             error,
+            batch_rows,
         })
     }
     fn instance(
@@ -144,7 +147,7 @@ impl CompiledGenerateSeriesProcessorFactory {
             pending: None,
             offset: 0,
             accepted: false,
-            batch_rows: None,
+            batch_rows: self.batch_rows,
             failed: false,
         }
     }
@@ -201,7 +204,7 @@ struct CompiledGenerateSeriesProcessor {
     pending: Option<Chunk>,
     offset: usize,
     accepted: bool,
-    batch_rows: Option<std::num::NonZeroUsize>,
+    batch_rows: std::num::NonZeroU32,
     failed: bool,
 }
 impl CompiledGenerateSeriesProcessor {
@@ -321,13 +324,6 @@ impl OperatorLifecycle for CompiledGenerateSeriesProcessor {
     fn name(&self) -> &str {
         &self.name
     }
-    fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
-        self.batch_rows = Some(
-            std::num::NonZeroUsize::new(state.chunk_size())
-                .ok_or_else(|| CompiledSeriesFailure::InvalidBatchRows)?,
-        );
-        Ok(())
-    }
     fn begin_exit(&mut self) -> ExecutionResult<()> {
         self.pending = None;
         Ok(())
@@ -354,8 +350,6 @@ impl TransformKernel for CompiledGenerateSeriesProcessor {
             self.failed = true;
             return Err(CompiledSeriesFailure::DuplicateBounds.into());
         }
-        self.batch_rows
-            .ok_or_else(|| CompiledSeriesFailure::MissingBatchRows)?;
         self.accepted = true;
         let rows = u64::try_from(chunk.len()).expect("supported row count fits u64");
         match self.invoke(&chunk) {
@@ -386,11 +380,7 @@ impl TransformKernel for CompiledGenerateSeriesProcessor {
             return Ok(StepResult::new(None, NextStep::Finished, 0));
         };
         let total = chunk.len();
-        let rows = self
-            .batch_rows
-            .ok_or_else(|| CompiledSeriesFailure::MissingBatchRows)?
-            .get()
-            .min(total - self.offset);
+        let rows = (self.batch_rows.get() as usize).min(total - self.offset);
         let sliced = (|| -> ExecutionResult<Chunk> {
             let output = if chunk.chunk_schema().is_typed() {
                 use crate::exec::pipeline::operator::ConstructionFailure;

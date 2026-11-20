@@ -44,6 +44,7 @@ fn resource_creation() -> CreationFailure {
 pub(super) fn publish(
     relation: &IcebergRuntimeRelation,
     columns: &[&IcebergColumnHandle],
+    layout: crate::typed_read::runtime::IcebergReadLayout,
     creation: &mut ConnectorReadSchemaCreation<'_>,
 ) -> Result<ConnectorReadPublicSchema, CreationFailure> {
     creation.work(1)?;
@@ -166,6 +167,7 @@ pub(super) fn publish(
             column.nullable(),
             column_nominals,
             column.scalar_integer_domain(),
+            layout,
             creation,
         )?;
         let source_name = creation.text(&source.name)?;

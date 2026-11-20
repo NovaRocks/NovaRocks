@@ -82,7 +82,7 @@ pub(super) fn complete_dependency_fixture(
     sql: &str,
     optimizer_settings: novarocks_sql::compiler::SessionOptimizerSettings,
 ) -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
-    use novarocks_physical_plan::{PipelineDopDomain, PlanVersionId, ScanReadBudget};
+    use novarocks_physical_plan::{PipelineDopDomain, PlanVersionId};
     use novarocks_sql::compiler::{
         DEFAULT_COMPLETION_LIMITS, SqlCompileControl, SqlCompileIntent, SqlCompileProgress,
         SqlCompiler, SqlFinalPlanCompileRequest, SqlPlanningEnvironment, SqlSessionContext,
@@ -110,10 +110,6 @@ pub(super) fn complete_dependency_fixture(
             min: 1,
             max: 8,
             requires_power_of_two: true,
-        },
-        ScanReadBudget {
-            max_batch_rows: 64,
-            max_batch_bytes: 1 << 20,
         },
         DEFAULT_COMPLETION_LIMITS,
     );

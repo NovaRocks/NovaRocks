@@ -26,8 +26,8 @@ use arrow::array::{
 };
 use novarocks_fs::{
     FileCancellation, FileFormat, FileIdentity, FileIoRuntime, FileIoSpawner, FileProjection,
-    FileReadBudget, FileReadContext, FileReadRange, FileReadRequest, FsAccessResolver,
-    PhysicalPruning, inspect_parquet_metadata, open_file_reader,
+    FileReadContext, FileReadRange, FileReadRequest, FsAccessResolver, PhysicalPruning,
+    ReaderSizing, inspect_parquet_metadata, open_file_reader,
 };
 use novarocks_spi::connector::StorageAccessDomainId;
 use sha2::{Digest, Sha256};
@@ -259,6 +259,7 @@ fn assert_writer_via_production_fs(writer: Writer) {
     let runtime: Arc<dyn FileIoRuntime> = io.clone();
     let io_spawner: Arc<dyn FileIoSpawner> = io;
     let context = FileReadContext {
+        turn: None,
         cancellation: FileCancellation::new(),
         deadline: None,
         runtime,
@@ -294,9 +295,9 @@ fn assert_writer_via_production_fs(writer: Writer) {
         format: FileFormat::Parquet,
         range: FileReadRange::WholeFile,
         projection: FileProjection::All,
-        budget: FileReadBudget {
-            max_rows: NonZeroUsize::new(511).expect("positive rows"),
-            max_bytes: NonZeroUsize::new(1024 * 1024).expect("positive bytes"),
+        sizing: ReaderSizing {
+            max_read_rows: NonZeroUsize::new(511).expect("positive rows"),
+            max_read_bytes: 1024 * 1024,
         },
         predicates: Vec::new(),
         pruning: PhysicalPruning::default(),
@@ -306,6 +307,8 @@ fn assert_writer_via_production_fs(writer: Writer) {
         context,
     };
     let mut reader = open_file_reader(request).expect("open production FS reader");
+    let batch_rows = reader.reader_batch_rows().expect("nonempty corpus");
+    assert!((1..=511).contains(&batch_rows));
     let mut next_position = 0;
     let mut batches = 0;
     while let Some(file_batch) = reader
@@ -314,6 +317,7 @@ fn assert_writer_via_production_fs(writer: Writer) {
     {
         batches += 1;
         let batch = &file_batch.batch;
+        assert!((1..=batch_rows).contains(&batch.num_rows()));
         let positions = file_batch
             .physical_row_positions
             .as_ref()

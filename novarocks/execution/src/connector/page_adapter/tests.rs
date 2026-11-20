@@ -323,8 +323,7 @@ fn an_unbound_trailing_channel_is_dropped() {
 
 #[test]
 fn binding_more_channels_than_the_page_carries_is_rejected() {
-    let error =
-        convert_declared(SourcePage::zero_channel(4), true).expect_err("channel mismatch");
+    let error = convert_declared(SourcePage::zero_channel(4), true).expect_err("channel mismatch");
     assert_eq!(error.kind(), PageAdapterErrorKind::ChannelMismatch);
 }
 
@@ -481,4 +480,154 @@ fn frozen_zero_channel_scan_preserves_count_and_output_contract() {
     assert_eq!(chunk.len(), 19);
     assert!(chunk.columns().is_empty());
     assert_eq!(chunk.chunk_schema().slot_ids(), schema.slot_ids());
+}
+
+#[test]
+fn shared_page_backing_survives_early_page_and_source_exit() {
+    use novarocks_spi::connector::read_stack::PageOutputCustody;
+    use novarocks_type_contract::ValueTypeStorageLifetime;
+
+    let retained = Arc::new(AtomicU64::new(0));
+    let resources = ConnectorExecutionResources::from_admitted_ledger(Arc::new(OutputLedger {
+        retained: retained.clone(),
+    }));
+    let reserve = |bytes| {
+        resources
+            .try_reserve(ConnectorResourceClass::ReaderOutput, bytes)
+            .unwrap()
+            .into_output(bytes)
+            .unwrap()
+    };
+    let values: ArrayRef = Arc::new(Int64Array::from(vec![10_i64, 11, 12, 13]));
+    let source_bytes = values.get_array_memory_size() as u64;
+    let source = reserve(source_bytes).into_shared_source();
+    let first = SourcePage::try_new_with_custody(
+        2,
+        vec![values.slice(0, 2)],
+        PageOutputCustody {
+            source_holds: vec![source.clone()],
+            new_output: None,
+        },
+    )
+    .unwrap();
+    let mut converter = SourcePageConverter::with_output_schema(declared_schema(true));
+    let first = converter.convert(first).unwrap();
+    let second_values = values.slice(2, 2);
+    let new_values: ArrayRef = Arc::new(Int64Array::from(vec![100_i64, 200]));
+    let independent_output = reserve(new_values.get_array_memory_size() as u64);
+    let independent_bytes = independent_output.bytes();
+    let second_schema = Arc::new(
+        ChunkSchema::try_new_typed(
+            vec![
+                declared_schema(true).slots()[0].clone(),
+                declared_schema_at(true, SlotId::new(18)).slots()[0].clone(),
+            ],
+            ValueTypeStorageLifetime::pure(),
+        )
+        .unwrap(),
+    );
+    let second = SourcePage::try_new_with_custody(
+        2,
+        vec![second_values, new_values],
+        PageOutputCustody {
+            source_holds: vec![source.clone()],
+            new_output: Some(independent_output),
+        },
+    )
+    .unwrap();
+    let mut second = SourcePageConverter::with_output_schema(second_schema)
+        .convert(second)
+        .unwrap();
+    let tracker = MemTracker::new_root("shared page input");
+    first.clone().transfer_to(&tracker);
+    second.try_transfer_to(&tracker).unwrap();
+    let slice = second
+        .slice_typed_observed::<ExecutionFailure, _>(1, 1, ValueTypeStorageLifetime::pure(), |_| {
+            Ok(())
+        })
+        .unwrap();
+    let projection = slice.into_batch_projection();
+    let escape = projection.clone().into_chunk().source_storage_lifetime_observed::<
+        novarocks_type_contract::owned_resources::layout::LayoutResourceError,
+    >(ValueTypeStorageLifetime::pure(), |_| Ok(())).unwrap();
+    let copy: ArrayRef = Arc::new(Int64Array::from(vec![10_i64, 11]));
+    let copy_bytes = copy.get_array_memory_size() as u64;
+    let copied = converter
+        .convert(SourcePage::try_new_accounted(2, vec![copy], reserve(copy_bytes)).unwrap())
+        .unwrap();
+    assert_eq!(
+        retained.load(Ordering::Acquire),
+        source_bytes + independent_bytes + copy_bytes
+    );
+    let extracted = second.take_memory_lease().expect("shared handoff");
+    drop(first);
+    drop(second);
+    drop(values);
+    drop(source);
+    assert_eq!(
+        retained.load(Ordering::Acquire),
+        source_bytes + independent_bytes + copy_bytes
+    );
+    assert_eq!(tracker.current(), 0);
+    drop(projection);
+    drop(extracted);
+    assert_eq!(
+        retained.load(Ordering::Acquire),
+        source_bytes + independent_bytes + copy_bytes
+    );
+    drop(escape);
+    assert_eq!(retained.load(Ordering::Acquire), copy_bytes);
+    drop(copied);
+    assert_eq!(retained.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn dictionary_pages_reconcile_both_frozen_string_layouts_without_rebuilding_values() {
+    use arrow::array::{DictionaryArray, Int32Array, StringArray};
+    use arrow::datatypes::{DataType, Int32Type};
+    use novarocks_type_contract::{FunctionValueType, ValueTypeStorageLifetime};
+    let storage = ValueTypeStorageLifetime::pure();
+    let values: ArrayRef = Arc::new(StringArray::from(vec![Some("abc"), None]));
+    let tracker = MemTracker::new_root("dictionary source");
+    let factory = actual_factory(
+        &tracker,
+        Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
+    );
+    for layout in [DataType::Utf8, DataType::Utf8View] {
+        let slot = ChunkSlotSchema::try_new_typed(
+            SlotId::new(17),
+            Arc::new(Field::new("s", layout.clone(), true)),
+            FunctionValueType::new(layout.clone(), true)
+                .typed_binding()
+                .clone(),
+            None,
+            storage.clone(),
+        )
+        .unwrap();
+        let schema = Arc::new(ChunkSchema::try_new_typed(vec![slot], storage.clone()).unwrap());
+        let mut converter = SourcePageConverter::with_output_schema(schema);
+        for keys in [vec![Some(0), Some(1)], vec![None, Some(0)]] {
+            let dictionary: ArrayRef = Arc::new(
+                DictionaryArray::<Int32Type>::try_new(Int32Array::from(keys), values.clone())
+                    .unwrap(),
+            );
+            let page = SourcePage::try_new(2, vec![dictionary]).unwrap();
+            let chunk = converter
+                .convert_with_factory(page, factory.as_ref())
+                .unwrap();
+            let received = chunk.columns()[0]
+                .as_any()
+                .downcast_ref::<DictionaryArray<Int32Type>>()
+                .unwrap();
+            assert!(Arc::ptr_eq(received.values(), &values));
+            assert_eq!(
+                chunk.chunk_schema().slots()[0]
+                    .typed_binding()
+                    .layout()
+                    .data_type(),
+                &layout
+            );
+            assert_eq!(received.logical_null_count(), 1);
+        }
+    }
 }

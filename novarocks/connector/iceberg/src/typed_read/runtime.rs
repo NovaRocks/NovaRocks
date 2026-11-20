@@ -23,11 +23,19 @@
 
 use novarocks_spi::connector::read_stack::adapter::ProviderReadRuntime;
 use novarocks_spi::connector::read_stack::{
-    ConnectorMergeTableHandle as _, ConnectorReadRelationKind, ConnectorSplit,
+    ConnectorMergeTableHandle as _, ConnectorReadRelationKind, ConnectorSession, ConnectorSplit,
     ConnectorTableExecuteHandle as _, ConnectorTableHandle as _, HostAddress, SchemaTableName,
-    SplitWeight,
+    SessionPropertyValue, SplitWeight,
 };
-use novarocks_spi::connector::{CatalogHandle, ConnectorInstanceDescriptor};
+use novarocks_spi::connector::{
+    CatalogHandle, ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor,
+};
+
+use crate::catalog_config::{
+    IcebergCatalogReadConfig, PARQUET_READ_BLOCK_ROW_COUNT_SESSION_PROPERTY,
+    PARQUET_READ_BLOCK_SIZE_SESSION_PROPERTY, parse_parquet_read_block_size,
+    validate_parquet_read_block_rows,
+};
 
 use super::{
     IcebergChangeSplit, IcebergChangeWindowHandle, IcebergMergeTableHandle,
@@ -35,6 +43,79 @@ use super::{
     IcebergTableHandle, SystemManifestSplit, SystemRelationSplit, TableChangesFunctionHandle,
     TableChangesSplit,
 };
+
+#[cfg_attr(novarocks_dev_controls, derive(serde::Deserialize))]
+#[cfg_attr(novarocks_dev_controls, serde(rename_all = "kebab-case"))]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum IcebergReadLayout {
+    #[default]
+    Offsets,
+    View,
+}
+
+impl IcebergReadLayout {
+    pub(crate) fn byte_carrier(
+        self,
+        data_type: &arrow::datatypes::DataType,
+        domain: novarocks_type_contract::ValueLogicalType,
+    ) -> arrow::datatypes::DataType {
+        use arrow::datatypes::DataType;
+        use novarocks_type_contract::ValueLogicalType;
+        match (self, domain, data_type) {
+            (Self::View, ValueLogicalType::Physical, DataType::Utf8) => DataType::Utf8View,
+            (Self::View, ValueLogicalType::Physical, DataType::Binary) => DataType::BinaryView,
+            _ => data_type.clone(),
+        }
+    }
+
+    pub(crate) fn applies_to(relation: &IcebergRuntimeRelation) -> bool {
+        matches!(
+            relation,
+            IcebergRuntimeRelation::Table(_) | IcebergRuntimeRelation::ChangeWindow(_)
+        )
+    }
+}
+
+/// Execution settings frozen independently of the exact selected table.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct IcebergReadExecution {
+    pub(crate) sizing: IcebergCatalogReadConfig,
+    pub(crate) layout: IcebergReadLayout,
+    pub(crate) preserve_top_level_dictionary: bool,
+}
+
+impl IcebergReadExecution {
+    pub(crate) fn from_catalog_session(
+        defaults: IcebergCatalogReadConfig,
+        session: &ConnectorSession,
+    ) -> Result<Self, ConnectorError> {
+        fn invalid(message: impl Into<String>) -> ConnectorError {
+            ConnectorError::new(ConnectorErrorKind::InvalidRequest, message)
+        }
+        let max_read_rows = match session.property(PARQUET_READ_BLOCK_ROW_COUNT_SESSION_PROPERTY) {
+            Some(SessionPropertyValue::Integer(rows)) => {
+                validate_parquet_read_block_rows(*rows).map_err(invalid)?
+            }
+            Some(_) => return Err(invalid("Parquet read block row count must be INTEGER")),
+            None => defaults.max_read_rows,
+        };
+        let max_read_bytes = match session.property(PARQUET_READ_BLOCK_SIZE_SESSION_PROPERTY) {
+            Some(SessionPropertyValue::Varchar(size)) => {
+                parse_parquet_read_block_size(size).map_err(invalid)?
+            }
+            Some(_) => return Err(invalid("Parquet read block size must be VARCHAR")),
+            None => defaults.max_read_bytes,
+        };
+        Ok(Self {
+            sizing: IcebergCatalogReadConfig {
+                max_read_rows,
+                max_read_bytes,
+            },
+            layout: IcebergReadLayout::Offsets,
+            preserve_top_level_dictionary: false,
+        })
+    }
+}
 
 #[derive(Clone, Debug)]
 pub enum IcebergRuntimeRelation {
@@ -117,6 +198,7 @@ impl IcebergExecutionReadRuntime {
 
 impl ProviderReadRuntime for IcebergExecutionReadRuntime {
     type Table = IcebergRuntimeRelation;
+    type Execution = IcebergReadExecution;
     type Column = super::IcebergColumnHandle;
     type Transaction = super::HiveTransactionHandle;
     type Split = IcebergReadSplit;
@@ -222,5 +304,106 @@ mod tests {
             runtime.catalog_handle().version().as_bytes(),
             &std::array::from_fn(|index| index as u8),
         );
+    }
+}
+
+#[cfg(test)]
+mod read_settings_tests {
+    use std::sync::Arc;
+
+    use super::*;
+
+    fn session(
+        properties: impl IntoIterator<Item = (&'static str, SessionPropertyValue)>,
+    ) -> ConnectorSession {
+        ConnectorSession::try_new(
+            "reader",
+            "fixture",
+            "UTC",
+            "en",
+            std::time::SystemTime::UNIX_EPOCH,
+        )
+        .unwrap()
+        .try_with_properties(
+            properties
+                .into_iter()
+                .map(|(k, v)| (Arc::from(k), v))
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn exact_catalog_defaults_and_overrides_are_independent() {
+        let defaults = IcebergCatalogReadConfig {
+            max_read_rows: 512,
+            max_read_bytes: 1024,
+        };
+        let ordinary = IcebergReadExecution::from_catalog_session(defaults, &session([])).unwrap();
+        assert_eq!(ordinary.sizing, defaults);
+        assert_eq!(ordinary.layout, IcebergReadLayout::Offsets);
+        assert!(!ordinary.preserve_top_level_dictionary);
+
+        let rows = IcebergReadExecution::from_catalog_session(
+            defaults,
+            &session([(
+                PARQUET_READ_BLOCK_ROW_COUNT_SESSION_PROPERTY,
+                SessionPropertyValue::Integer(128),
+            )]),
+        )
+        .unwrap();
+        assert_eq!(
+            rows.sizing,
+            IcebergCatalogReadConfig {
+                max_read_rows: 128,
+                ..defaults
+            }
+        );
+        let bytes = IcebergReadExecution::from_catalog_session(
+            defaults,
+            &session([(
+                PARQUET_READ_BLOCK_SIZE_SESSION_PROPERTY,
+                SessionPropertyValue::Varchar("0B".into()),
+            )]),
+        )
+        .unwrap();
+        assert_eq!(
+            bytes.sizing,
+            IcebergCatalogReadConfig {
+                max_read_bytes: 0,
+                ..defaults
+            }
+        );
+        let reset = IcebergReadExecution::from_catalog_session(defaults, &session([])).unwrap();
+        assert_eq!(reset, ordinary);
+    }
+
+    #[test]
+    fn session_execution_refuses_values_of_the_wrong_type_or_catalog_range() {
+        for (key, value) in [
+            (
+                PARQUET_READ_BLOCK_ROW_COUNT_SESSION_PROPERTY,
+                SessionPropertyValue::Integer(127),
+            ),
+            (
+                PARQUET_READ_BLOCK_ROW_COUNT_SESSION_PROPERTY,
+                SessionPropertyValue::Varchar("8192".into()),
+            ),
+            (
+                PARQUET_READ_BLOCK_SIZE_SESSION_PROPERTY,
+                SessionPropertyValue::Integer(16),
+            ),
+            (
+                PARQUET_READ_BLOCK_SIZE_SESSION_PROPERTY,
+                SessionPropertyValue::Varchar("9223372036854775808B".into()),
+            ),
+        ] {
+            let error = IcebergReadExecution::from_catalog_session(
+                IcebergCatalogReadConfig::default(),
+                &session([(key, value)]),
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        }
     }
 }

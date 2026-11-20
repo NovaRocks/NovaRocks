@@ -174,6 +174,7 @@ impl ScopedOldPositions {
                             target,
                             &access,
                             &context,
+                            crate::file_reader::default_parquet_reader_sizing(),
                             |_| {},
                         )
                         .await?;
@@ -208,7 +209,10 @@ impl ScopedOldPositions {
                             Some(length),
                         );
                         let index = crate::position_delete::load_position_delete_index(
-                            &spec, &access, &context,
+                            &spec,
+                            &access,
+                            &context,
+                            crate::file_reader::default_parquet_reader_sizing(),
                         )
                         .await?;
                         let decoded = checked_positions(&index)?;

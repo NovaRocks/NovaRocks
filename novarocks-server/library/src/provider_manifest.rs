@@ -474,7 +474,7 @@ fn iceberg_execution_reader_options(
     config: &NovaRocksConfig,
 ) -> novarocks_connector_iceberg::typed_read::page_source_provider::IcebergPageSourceProviderOptions
 {
-    let mut options = novarocks_connector_iceberg::typed_read::page_source_provider::IcebergPageSourceProviderOptions::with_default_budget();
+    let mut options = novarocks_connector_iceberg::typed_read::page_source_provider::IcebergPageSourceProviderOptions::default();
     options.reader_options.coalesce_reads = config.runtime.io_coalesce_read_enable;
     options.reader_options.coalesce_max_bytes = config.runtime.io_coalesce_read_max_buffer_size;
     options.reader_options.coalesce_max_gap = config.runtime.io_coalesce_read_max_distance_size;
@@ -1039,7 +1039,11 @@ impl novarocks_query_application::sql::session::registry::CatalogPropertyDeclara
         novarocks_query_application::sql::session::registry::SessionPropertyError,
     > {
         use novarocks_connector_iceberg::catalog_config::{
-            IcebergCatalogWriteConfig, MAX_PARTITIONS_PER_WRITER_SESSION_PROPERTY,
+            IcebergCatalogReadConfig, IcebergCatalogWriteConfig,
+            MAX_PARTITIONS_PER_WRITER_SESSION_PROPERTY,
+            PARQUET_READ_BLOCK_ROW_COUNT_SESSION_PROPERTY,
+            PARQUET_READ_BLOCK_SIZE_SESSION_PROPERTY, parse_parquet_read_block_size,
+            validate_parquet_read_block_rows,
         };
         use novarocks_query_application::sql::session::registry::{
             PropertyDeclaration, SessionPropertyError, SessionPropertyType, SessionPropertyValue,
@@ -1048,7 +1052,11 @@ impl novarocks_query_application::sql::session::registry::CatalogPropertyDeclara
             .map_err(|_| SessionPropertyError::InvalidDeclaration {
                 detail: "Admitted Iceberg catalog has an invalid open partition limit",
             })?;
-        Ok(vec![PropertyDeclaration::catalog(
+        let (read_rows, read_size) = IcebergCatalogReadConfig::session_defaults(configuration)
+            .map_err(|_| SessionPropertyError::InvalidDeclaration {
+                detail: "Admitted Iceberg catalog has invalid Parquet read sizing",
+            })?;
+        let write_partitions = PropertyDeclaration::catalog(
             MAX_PARTITIONS_PER_WRITER_SESSION_PROPERTY,
             SessionPropertyType::Integer,
             Some(SessionPropertyValue::Integer(limit)),
@@ -1058,7 +1066,34 @@ impl novarocks_query_application::sql::session::registry::CatalogPropertyDeclara
                 SessionPropertyValue::Integer(value) if (1..=limit).contains(value) => Ok(()),
                 _ => Err(format!("Value must be between 1 and {limit}")),
             },
-        )?])
+        )?;
+        let parquet_rows = PropertyDeclaration::catalog(
+            PARQUET_READ_BLOCK_ROW_COUNT_SESSION_PROPERTY,
+            SessionPropertyType::Integer,
+            Some(SessionPropertyValue::Integer(read_rows)),
+            "Parquet: Maximum number of rows read in a batch",
+            false,
+            |value| match value {
+                SessionPropertyValue::Integer(rows) => {
+                    validate_parquet_read_block_rows(*rows).map(|_| ())
+                }
+                _ => Err("Expected INTEGER".to_owned()),
+            },
+        )?;
+        let parquet_bytes = PropertyDeclaration::catalog(
+            PARQUET_READ_BLOCK_SIZE_SESSION_PROPERTY,
+            SessionPropertyType::Varchar,
+            Some(SessionPropertyValue::Varchar(read_size)),
+            "Parquet: Maximum size of a block to read",
+            false,
+            |value| match value {
+                SessionPropertyValue::Varchar(size) => {
+                    parse_parquet_read_block_size(size).map(|_| ())
+                }
+                _ => Err("Expected VARCHAR".to_owned()),
+            },
+        )?;
+        Ok(vec![write_partitions, parquet_rows, parquet_bytes])
     }
 }
 

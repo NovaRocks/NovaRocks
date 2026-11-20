@@ -2,7 +2,7 @@
 //! Test receipt storage is explicit; this is not FE host admission or MEM proof.
 use arrow::datatypes::DataType;
 use novarocks_functions::builtin::catalogue::build_builtin_engine_function_catalog;
-use novarocks_physical_plan::{NodeKind, PipelineDopDomain, PlanVersionId, ScanReadBudget};
+use novarocks_physical_plan::{NodeKind, PipelineDopDomain, PlanVersionId};
 use novarocks_spi::connector::write_stack::WriteTargetOrdinal;
 use novarocks_spi::connector::{
     CatalogHandle, CatalogVersion, ConnectorCodecCategory, ConnectorCodecRevision,
@@ -113,10 +113,6 @@ fn query(
             min: 1,
             max: 8,
             requires_power_of_two: true,
-        },
-        ScanReadBudget {
-            max_batch_rows: 64,
-            max_batch_bytes: 1 << 20,
         },
         DEFAULT_COMPLETION_LIMITS,
     );

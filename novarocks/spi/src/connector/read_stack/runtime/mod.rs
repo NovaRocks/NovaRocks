@@ -392,6 +392,26 @@ pub struct ConnectorReadRelation {
     kind: ConnectorReadRelationKind,
     table: ConnectorReadTableHandle,
     transaction: ConnectorReadTransactionHandle,
+    execution: Option<ConnectorReadExecutionInput>,
+}
+
+opaque_handle!(
+    /// Immutable execution input authored for the exact read binding.
+    ConnectorReadExecutionInput
+);
+
+pub(super) fn execution_input<T: Send + Sync + 'static>(
+    binding: ConnectorReadBinding,
+    input: T,
+) -> ConnectorReadExecutionInput {
+    ConnectorReadExecutionInput {
+        binding,
+        payload: OpaquePayload::new(input),
+    }
+}
+
+pub(super) fn execution_value<T: 'static>(input: &ConnectorReadExecutionInput) -> Option<&T> {
+    input.payload.downcast_ref()
 }
 
 impl ConnectorReadRelation {
@@ -404,6 +424,7 @@ impl ConnectorReadRelation {
             kind,
             table,
             transaction,
+            execution: None,
         }
     }
 
@@ -417,6 +438,15 @@ impl ConnectorReadRelation {
 
     pub const fn transaction(&self) -> &ConnectorReadTransactionHandle {
         &self.transaction
+    }
+
+    pub(super) fn with_execution(mut self, execution: ConnectorReadExecutionInput) -> Self {
+        self.execution = Some(execution);
+        self
+    }
+
+    pub const fn execution(&self) -> Option<&ConnectorReadExecutionInput> {
+        self.execution.as_ref()
     }
 
     pub fn into_parts(
@@ -690,6 +720,7 @@ pub trait ConnectorReadMetadata: Send + Sync {
     /// inspect or manufacture its transaction payload.
     fn relation(
         &self,
+        session: &ConnectorSession,
         kind: ConnectorReadRelationKind,
         table: ConnectorReadTableHandle,
     ) -> Result<ConnectorReadRelation, ConnectorError>;
@@ -1269,7 +1300,7 @@ pub trait ConnectorReadPageSourceProvider: Send + Sync {
     fn create_page_stream(
         &self,
         session: &ConnectorSession,
-        table: &ConnectorReadTableHandle,
+        relation: &ConnectorReadRelation,
         split: &ConnectorReadSplit,
         scheduled_split_sequence_id: u64,
         columns: &[ConnectorReadAssignment],
@@ -1282,7 +1313,7 @@ pub trait ConnectorReadPageSourceProvider: Send + Sync {
     fn prepare_page_source(
         &self,
         _session: &ConnectorSession,
-        _table: &ConnectorReadTableHandle,
+        _relation: &ConnectorReadRelation,
         _split: &ConnectorReadSplit,
         _scheduled_split_sequence_id: u64,
         _columns: &[ConnectorReadAssignment],

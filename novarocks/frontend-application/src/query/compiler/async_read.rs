@@ -137,11 +137,11 @@ impl FrontendQueryCompiler {
                 .with_snapshot_planning(
                     sql_compile_control_from_execution(execution),
                     execution.cancellation().clone(),
-                    query_options.as_ref(),
                     Arc::clone(planning_cpu),
                 ),
                 crate::query_execution::compiler::typed_connector_session()
                     .map_err(FrontendQueryCompilerError::Engine)?,
+                Arc::clone(execution.session_property_inputs()),
             )
             .map_err(FrontendQueryCompilerError::Engine)?;
             let version = crate::query_execution::physical_encoding::mint_plan_version();
@@ -162,7 +162,6 @@ impl FrontendQueryCompiler {
                     self.constant_policy(),
                     sql_compile_control_from_execution(execution),
                     Self::pipeline_dop_domain(query_options.as_ref())?,
-                    Self::scan_read_budget(query_options.as_ref()),
                     novarocks_sql::compiler::DEFAULT_COMPLETION_LIMITS,
                 ),
                 version,

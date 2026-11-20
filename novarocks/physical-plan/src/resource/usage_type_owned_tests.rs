@@ -943,10 +943,6 @@ fn actual_scan_relation_schema_and_ordered_runtime_filter_use_the_same_type_auth
             NodeKind::Scan {
                 occurrence: ProviderReadOccurrenceId::new(0),
                 relation: Box::new(relation),
-                read_budget: ScanReadBudget {
-                    max_batch_rows: 1,
-                    max_batch_bytes: 8,
-                },
                 provider_outputs: Box::default(),
                 residuals: Box::default(),
                 derived_values: Box::default(),

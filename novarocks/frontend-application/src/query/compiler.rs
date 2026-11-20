@@ -29,9 +29,7 @@ use crate::query_execution::kernels::{
 };
 use crate::query_execution::planning::sql_compile_control_from_execution;
 use novarocks_parser::ast::Query;
-use novarocks_physical_plan::{
-    MAX_SCAN_BATCH_BYTES, MAX_SCAN_BATCH_ROWS, PipelineDopDomain, ScanReadBudget,
-};
+use novarocks_physical_plan::PipelineDopDomain;
 use novarocks_proto_codec::lifecycle::QueryOptions;
 use novarocks_query_application::admitted_query_context::{QueryExecutionContext, RequestContext};
 use novarocks_spi::connector::{
@@ -305,24 +303,6 @@ impl FrontendQueryCompiler {
     ) -> Result<PipelineDopDomain, FrontendQueryCompilerError> {
         crate::query_execution::contract::completed_plan_dop_domain(options)
             .map_err(FrontendQueryCompilerError::Engine)
-    }
-
-    /// How much one scan may return in a batch.
-    ///
-    /// This is a ceiling, not a target. The session may lower the row count;
-    /// nothing in this deployment lowers the byte count, so it stays at the
-    /// contract's own maximum, which states "unconstrained" rather than a
-    /// number someone chose.
-    fn scan_read_budget(query_options: Option<&QueryOptions>) -> ScanReadBudget {
-        let max_batch_rows = query_options
-            .map(|options| options.as_proto().batch_size)
-            .and_then(|rows| u64::try_from(rows).ok())
-            .filter(|rows| *rows > 0 && *rows <= MAX_SCAN_BATCH_ROWS)
-            .unwrap_or(MAX_SCAN_BATCH_ROWS);
-        ScanReadBudget {
-            max_batch_rows,
-            max_batch_bytes: MAX_SCAN_BATCH_BYTES,
-        }
     }
 }
 

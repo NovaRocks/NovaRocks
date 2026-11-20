@@ -28,6 +28,7 @@ pub(super) fn value(
     nominal: Option<ValueLogicalType>,
     integer: Option<crate::scalar_integer_domain::ScalarIntegerDomain>,
     nominals: &crate::schema_mapping::nominal_declaration::NominalSourceDeclarations,
+    read_layout: crate::typed_read::runtime::IcebergReadLayout,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), Failure> {
     work.step()?;
@@ -66,7 +67,7 @@ pub(super) fn value(
                 _ => false,
             };
             work.step()?;
-            if !same_kind || layout != &expected {
+            if !same_kind || layout != &read_layout.byte_carrier(&expected, domain) {
                 return Err(invalid(
                     "public execution value differs from its explicit Iceberg source domain/layout",
                 ));
@@ -105,6 +106,7 @@ pub(super) fn value(
                     nominals.get(&source.id).map(|domain| domain.logical_type()),
                     None,
                     nominals,
+                    read_layout,
                     work,
                 )?;
             }
@@ -134,6 +136,7 @@ pub(super) fn value(
                     .map(|domain| domain.logical_type()),
                 None,
                 nominals,
+                read_layout,
                 work,
             )?;
         }
@@ -173,6 +176,7 @@ pub(super) fn value(
                     .map(|domain| domain.logical_type()),
                 None,
                 nominals,
+                read_layout,
                 work,
             )?;
             self::value(
@@ -184,6 +188,7 @@ pub(super) fn value(
                     .map(|domain| domain.logical_type()),
                 None,
                 nominals,
+                read_layout,
                 work,
             )?;
         }

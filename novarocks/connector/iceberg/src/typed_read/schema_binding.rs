@@ -391,12 +391,33 @@ impl IcebergSchemaBinding {
         absolute_positions: Option<&UInt64Array>,
         facts: &IcebergSplitFacts<'_>,
     ) -> Result<Vec<ArrayRef>, ConnectorError> {
-        let row_count = batch.num_rows();
+        self.materialize_columns(batch, absolute_positions, facts, None)
+            .map(|columns| columns.into_iter().map(|column| column.array).collect())
+    }
+
+    pub(super) fn materialize_for_scan(
+        &self,
+        batch: &RecordBatch,
+        absolute_positions: Option<&UInt64Array>,
+        facts: &IcebergSplitFacts<'_>,
+        output_columns: usize,
+    ) -> Result<Vec<MaterializedScanColumn>, ConnectorError> {
+        self.materialize_columns(batch, absolute_positions, facts, Some(output_columns))
+    }
+
+    fn materialize_columns(
+        &self,
+        batch: &RecordBatch,
+        absolute_positions: Option<&UInt64Array>,
+        facts: &IcebergSplitFacts<'_>,
+        output_columns: Option<usize>,
+    ) -> Result<Vec<MaterializedScanColumn>, ConnectorError> {
+        let source_rows = batch.num_rows();
         if let Some(positions) = absolute_positions
-            && positions.len() != row_count
+            && positions.len() != source_rows
         {
             return Err(corrupt(format!(
-                "iceberg data file {} produced {} absolute row positions for {row_count} rows",
+                "iceberg data file {} produced {} absolute row positions for {source_rows} rows",
                 facts.path,
                 positions.len()
             )));
@@ -407,8 +428,19 @@ impl IcebergSchemaBinding {
         let physical = PhysicalIndex::build(&batch.schema(), self.name_mapping.as_deref())?;
 
         let mut columns = Vec::with_capacity(self.columns.len());
-        for bound in &self.columns {
-            columns.push(match &bound.source {
+        for (ordinal, bound) in self.columns.iter().enumerate() {
+            let constant = output_columns.is_some_and(|count| ordinal < count)
+                && matches!(
+                    &bound.source,
+                    IcebergColumnSource::IdentityPartitionConstant(_)
+                        | IcebergColumnSource::MutationSpecId(_)
+                        | IcebergColumnSource::MutationPartition(_)
+                        | IcebergColumnSource::InitialDefault
+                        | IcebergColumnSource::TypedNull
+                        | IcebergColumnSource::Metadata(IcebergMetadataColumn::Path)
+                );
+            let row_count = if constant { 1 } else { source_rows };
+            let array = match &bound.source {
                 IcebergColumnSource::Physical {
                     base_field_id,
                     dereference,
@@ -419,20 +451,25 @@ impl IcebergSchemaBinding {
                             facts.path
                         ))
                     })?;
-                    let base = adapt_array(
-                        batch.column(index),
-                        bound.base_target.as_ref(),
-                        facts.path,
-                        matches!(
-                            super::column_handle::parse_type(
-                                bound.handle.base_type_json(),
-                                "base_type_json"
-                            )?,
-                            Type::Variant(_)
-                        ),
-                    )?;
-                    let value =
-                        dereference_struct_path(&base, bound.base_target.as_ref(), dereference)?;
+                    let source = batch.column(index);
+                    let variant = matches!(
+                        super::column_handle::parse_type(
+                            bound.handle.base_type_json(),
+                            "base_type_json"
+                        )?,
+                        Type::Variant(_)
+                    );
+                    let base_target = bound.base_target.as_ref();
+                    let source_target = if output_columns.is_some() && !variant {
+                        base_target.clone().with_data_type(retained_byte_layout(
+                            source.data_type(),
+                            base_target.data_type(),
+                        ))
+                    } else {
+                        base_target.clone()
+                    };
+                    let base = adapt_array(source, &source_target, facts.path, variant)?;
+                    let value = dereference_struct_path(&base, &source_target, dereference)?;
                     match bound.handle.scalar_integer_domain() {
                         Some(domain) => domain.array(&value)?,
                         None => value,
@@ -459,6 +496,9 @@ impl IcebergSchemaBinding {
                 IcebergColumnSource::TypedNull => {
                     arrow::array::new_null_array(bound.target.data_type(), row_count)
                 }
+                IcebergColumnSource::Metadata(IcebergMetadataColumn::Path) if constant => {
+                    Arc::new(arrow::array::StringArray::from(vec![facts.path]))
+                }
                 IcebergColumnSource::Metadata(metadata) => metadata_column(
                     *metadata,
                     bound.target.as_ref(),
@@ -477,9 +517,64 @@ impl IcebergSchemaBinding {
                     absolute_positions,
                     facts,
                 )?,
-            });
+            };
+            columns.push(MaterializedScanColumn { array, constant });
         }
         Ok(columns)
+    }
+}
+
+pub(super) struct MaterializedScanColumn {
+    pub(super) array: ArrayRef,
+    pub(super) constant: bool,
+}
+
+/// Keep the decoder's byte storage through Iceberg predicates and deletes.
+/// The destination field tree still supplies names, IDs and logical types.
+fn retained_byte_layout(source: &DataType, target: &DataType) -> DataType {
+    fn retain_field(source: &Field, target: &FieldRef) -> FieldRef {
+        Arc::new(
+            target
+                .as_ref()
+                .clone()
+                .with_data_type(retained_byte_layout(source.data_type(), target.data_type())),
+        )
+    }
+    match (source, target) {
+        (DataType::Utf8View, DataType::Utf8 | DataType::LargeUtf8)
+        | (DataType::BinaryView, DataType::Binary | DataType::LargeBinary) => source.clone(),
+        (DataType::Dictionary(keys, values), DataType::Utf8 | DataType::LargeUtf8)
+            if **keys == DataType::Int32
+                && matches!(values.as_ref(), DataType::Utf8 | DataType::Utf8View) =>
+        {
+            source.clone()
+        }
+        (DataType::Struct(fields), DataType::Struct(declared))
+            if fields.len() == declared.len() =>
+        {
+            DataType::Struct(
+                fields
+                    .iter()
+                    .zip(declared)
+                    .map(|(from, to)| retain_field(from, to))
+                    .collect(),
+            )
+        }
+        (DataType::List(from), DataType::List(to)) => DataType::List(retain_field(from, to)),
+        (DataType::LargeList(from), DataType::LargeList(to)) => {
+            DataType::LargeList(retain_field(from, to))
+        }
+        (DataType::FixedSizeList(from, width), DataType::FixedSizeList(to, target_width))
+            if width == target_width =>
+        {
+            DataType::FixedSizeList(retain_field(from, to), *width)
+        }
+        (DataType::Map(from, ordered), DataType::Map(to, target_order))
+            if ordered == target_order =>
+        {
+            DataType::Map(retain_field(from, to), *ordered)
+        }
+        _ => target.clone(),
     }
 }
 

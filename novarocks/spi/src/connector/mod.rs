@@ -301,10 +301,11 @@ pub use read_session::{
     ConnectorReadSession, ConnectorReadSessionFinalizationContext, ConnectorReadSessionOutcome,
     SharedConnectorReadSession,
 };
+pub use read_stack::{ENGINE_OUTPUT_POLICY, ScanOutputPolicy};
 pub use resources::{
     ConnectorExecutionResources, ConnectorOutputMemoryToken, ConnectorReservationBackend,
     ConnectorResourceCheckpoint, ConnectorResourceClass, ConnectorResourceLedger,
-    ConnectorResourceReservation,
+    ConnectorResourceReservation, SharedSourceHold,
 };
 pub use row_mutation::{
     CONNECTOR_ROW_MUTATION_CONTRACT_VERSION, ConnectorMutationEffectField,

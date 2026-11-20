@@ -196,7 +196,6 @@ impl Fixture {
         .with_snapshot_planning(
             compile,
             cancellation,
-            None,
             FrontendPlanningCpuSource::new(blocking.clone()),
         );
         let source = super::source_in_registry(blocking, scope, registry).await;

@@ -25,7 +25,7 @@
 //! port, and the Task scan is a scripted stream of public-schema chunks.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::num::{NonZeroU64, NonZeroUsize};
+use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -178,8 +178,6 @@ fn typed_frozen_read_with_distribution(
         TupleDomain::all(),
         None,
         dynamic_filters,
-        NonZeroU64::new(100).unwrap(),
-        NonZeroU64::new(4096).unwrap(),
     )
     .unwrap();
     let source = ConnectorReadStaticFacts::try_new(
@@ -320,10 +318,6 @@ pub(crate) fn add_typed_scan_with_residual(
                     predicate_guarantees: Box::default(),
                     provided_properties: properties,
                 })),
-                read_budget: ScanReadBudget {
-                    max_batch_rows: 100,
-                    max_batch_bytes: 4096,
-                },
                 provider_outputs: columns.into_iter().zip(values.iter().copied()).collect(),
                 residuals,
                 derived_values: Box::default(),
@@ -440,10 +434,6 @@ pub(crate) fn scan_program(dop: usize, residual: bool) -> Arc<LocalProgram> {
             NodeKind::Scan {
                 occurrence: ProviderReadOccurrenceId::new(0),
                 relation: Box::new(relation),
-                read_budget: ScanReadBudget {
-                    max_batch_rows: 100,
-                    max_batch_bytes: 4096,
-                },
                 provider_outputs: columns
                     .iter()
                     .cloned()

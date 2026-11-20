@@ -69,10 +69,16 @@ pub enum FileProjection {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct FileReadBudget {
-    pub max_rows: NonZeroUsize,
-    pub max_bytes: NonZeroUsize,
+pub struct ReaderSizing {
+    pub max_read_rows: NonZeroUsize,
+    /// Soft input sizing target for opening the decoder. Zero requests one
+    /// row at a time when the projected row width is positive.
+    pub max_read_bytes: u64,
 }
+
+/// Source-local cooperation with the caller that polls the decoder.
+pub type FileReadTurn =
+    Arc<dyn Fn() -> Option<futures::future::BoxFuture<'static, ()>> + Send + Sync>;
 
 #[derive(Clone)]
 pub struct FileReadContext {
@@ -84,6 +90,7 @@ pub struct FileReadContext {
     /// the source the read is for. Without it a read goes straight to the
     /// object store.
     pub range: Option<crate::FileRangeBinding>,
+    pub turn: Option<FileReadTurn>,
 }
 
 /// One immutable, contiguous backing prepared for an exact authorized file.
@@ -186,6 +193,16 @@ impl PreparedFileInput {
 }
 
 impl FileReadContext {
+    pub(crate) async fn cooperate(&self) -> FileResult<()> {
+        self.check_active()?;
+        if let Some(turn) = &self.turn
+            && let Some(yielded) = turn()
+        {
+            yielded.await;
+        }
+        self.check_active()
+    }
+
     /// The read's stop bounded by its deadline: what every wait of the read
     /// observes.
     pub fn bounded_cancellation(&self) -> FileCancellation {
@@ -222,7 +239,7 @@ pub struct FileReadRequest {
     pub format: FileFormat,
     pub range: FileReadRange,
     pub projection: FileProjection,
-    pub budget: FileReadBudget,
+    pub sizing: ReaderSizing,
     pub predicates: Vec<ScanPredicate>,
     pub pruning: PhysicalPruning,
     pub options: FileReaderOptions,
@@ -237,11 +254,15 @@ pub struct FileReadRequest {
 /// facts, including field IDs or ordered key/value metadata. The version is part
 /// of the interpretation cache identity.
 // Design: ADR-0213 (docs/adr/ADR-0213-iceberg-read-interpretation-and-current-write-authority.md)
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub enum ParquetInterpretationPolicy {
     #[default]
     UseArrowHint,
     SkipArrowHint,
+    /// Derive decoder-only byte-array carriers from the standard schema.
+    DerivedByteRepresentation {
+        preserve_top_level_dictionary: bool,
+    },
 }
 
 impl ParquetInterpretationPolicy {
@@ -249,12 +270,18 @@ impl ParquetInterpretationPolicy {
         match self {
             Self::UseArrowHint => b"arrow-hint/use/v1",
             Self::SkipArrowHint => b"arrow-hint/skip/v1",
+            Self::DerivedByteRepresentation {
+                preserve_top_level_dictionary: false,
+            } => b"derived-byte-representation/view/v1",
+            Self::DerivedByteRepresentation {
+                preserve_top_level_dictionary: true,
+            } => b"derived-byte-representation/view-and-dictionary/v1",
         }
     }
 
     pub(crate) fn arrow_options(self) -> parquet::arrow::arrow_reader::ArrowReaderOptions {
         parquet::arrow::arrow_reader::ArrowReaderOptions::new()
-            .with_skip_arrow_metadata(self == Self::SkipArrowHint)
+            .with_skip_arrow_metadata(self != Self::UseArrowHint)
     }
 }
 
@@ -312,4 +339,7 @@ pub trait FileBatchReader: Send {
     fn close(&mut self) -> FileResult<()>;
 
     fn metrics_snapshot(&self) -> FileMetricsSnapshot;
+
+    /// Configured decoder batch limit, if the file has rows to decode.
+    fn reader_batch_rows(&self) -> Option<usize>;
 }

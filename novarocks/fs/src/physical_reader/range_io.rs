@@ -278,6 +278,7 @@ mod tests {
             .expect("test runtime");
         let handle = runtime.handle().clone();
         let context = FileReadContext {
+            turn: None,
             cancellation: FileCancellation::new(),
             deadline: None,
             runtime: Arc::new(TokioFileIoRuntime::new(handle.clone())) as Arc<dyn FileIoRuntime>,
@@ -356,6 +357,7 @@ mod tests {
         let reader = BoundChunkReader::new(
             file,
             FileReadContext {
+                turn: None,
                 cancellation: FileCancellation::new(),
                 deadline: None,
                 runtime: Arc::new(TokioFileIoRuntime::new(handle.clone())),
@@ -413,6 +415,7 @@ mod tests {
         let reader = BoundChunkReader::new(
             file.clone(),
             FileReadContext {
+                turn: None,
                 cancellation: FileCancellation::new(),
                 deadline: None,
                 runtime: Arc::new(TokioFileIoRuntime::new(handle.clone())),

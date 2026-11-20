@@ -31,7 +31,7 @@
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Int64Array, StringArray};
-use novarocks_fs::{FileReadBudget, FileReadContext};
+use novarocks_fs::FileReadContext;
 use novarocks_spi::connector::ConnectorError;
 use novarocks_spi::connector::read_stack::{
     ConnectorPollBudget, OwnedConnectorPageStream, PageSourceMetrics, SourcePage,
@@ -58,7 +58,6 @@ pub struct IcebergRewritePositionDeleteFilesPageSourceRequest<'a> {
     pub columns: &'a [IcebergColumnHandle],
     pub access_binding: IcebergReadBinding,
     pub context: FileReadContext,
-    pub budget: FileReadBudget,
 }
 
 /// Which of the two output columns one page channel carries.
@@ -177,7 +176,6 @@ pub fn create_iceberg_rewrite_position_delete_files_page_stream(
         columns,
         access_binding,
         mut context,
-        budget,
     } = request;
 
     let outputs = resolve_outputs(columns)?;
@@ -199,7 +197,7 @@ pub fn create_iceberg_rewrite_position_delete_files_page_stream(
             outputs,
             &specs,
             &positions,
-            budget,
+            context,
         )
     };
     Ok(Box::pin(MaterializedPageStream::new(
@@ -211,12 +209,10 @@ pub fn create_iceberg_rewrite_position_delete_files_page_stream(
 
 /// One split's worth of re-encoded delete positions.
 struct IcebergRewritePositionDeleteFilesPageSource {
-    data_file_path: String,
-    outputs: Vec<RewritePositionOutput>,
-    /// Every selected vector's positions, merged and ascending.
-    rows: Vec<i64>,
-    next_row: usize,
-    max_page_rows: usize,
+    context: FileReadContext,
+    output: super::output::OutputCursor,
+    emitted: usize,
+    retained_bytes: u64,
     bytes_read: u64,
 }
 
@@ -227,7 +223,7 @@ impl IcebergRewritePositionDeleteFilesPageSource {
         outputs: Vec<RewritePositionOutput>,
         specs: &[IcebergDeleteFileSpec],
         positions: &RoaringTreemap,
-        budget: FileReadBudget,
+        context: FileReadContext,
     ) -> Result<Self, ConnectorError> {
         let bytes_read = specs
             .iter()
@@ -242,12 +238,28 @@ impl IcebergRewritePositionDeleteFilesPageSource {
                 ))
             })?);
         }
+        use novarocks_value_arrays::measure::{OutputColumn, OutputRows};
+        let row_count = rows.len();
+        let retained_bytes = (rows.capacity() * size_of::<i64>() + data_file_path.len()) as u64;
+        let rows: ArrayRef = Arc::new(Int64Array::from(rows));
+        let path: ArrayRef = Arc::new(StringArray::from(vec![data_file_path]));
+        let columns = outputs
+            .iter()
+            .map(|output| match output {
+                RewritePositionOutput::FilePath => OutputColumn::constant(&path, path.data_type()),
+                RewritePositionOutput::Position => OutputColumn::new(&rows, rows.data_type()),
+            })
+            .collect::<Vec<_>>();
+        let output = super::output::OutputCursor::new(
+            &columns,
+            OutputRows::Contiguous(0..row_count),
+            &context,
+        )?;
         Ok(Self {
-            data_file_path: data_file_path.to_string(),
-            outputs,
-            rows,
-            next_row: 0,
-            max_page_rows: budget.max_rows.get(),
+            context,
+            output,
+            emitted: 0,
+            retained_bytes,
             bytes_read,
         })
     }
@@ -255,43 +267,28 @@ impl IcebergRewritePositionDeleteFilesPageSource {
 
 impl MaterializedPages for IcebergRewritePositionDeleteFilesPageSource {
     fn next_page(&mut self) -> Result<Option<SourcePage>, ConnectorError> {
-        if self.is_exhausted() {
-            return Ok(None);
+        let page = self.output.next_page(&self.context)?;
+        if let Some(page) = &page {
+            self.emitted += page.position_count();
         }
-        let end = (self.next_row + self.max_page_rows).min(self.rows.len());
-        let chunk = &self.rows[self.next_row..end];
-        self.next_row = end;
-        let columns = self
-            .outputs
-            .iter()
-            .map(|output| match output {
-                RewritePositionOutput::FilePath => Arc::new(StringArray::from(vec![
-                        self.data_file_path.as_str();
-                        chunk.len()
-                    ])) as ArrayRef,
-                RewritePositionOutput::Position => {
-                    Arc::new(Int64Array::from(chunk.to_vec())) as ArrayRef
-                }
-            })
-            .collect::<Vec<_>>();
-        SourcePage::try_new(chunk.len(), columns).map(Some)
+        Ok(page)
     }
 
     fn is_exhausted(&self) -> bool {
-        self.next_row >= self.rows.len()
+        self.output.is_exhausted()
     }
 
     fn metrics(&self) -> PageSourceMetrics {
         PageSourceMetrics {
             completed_bytes: self.bytes_read,
-            completed_positions: self.next_row as u64,
+            completed_positions: self.emitted as u64,
             read_time_nanos: 0,
             ..Default::default()
         }
     }
 
     fn memory_usage_bytes(&self) -> u64 {
-        (self.rows.len() * size_of::<i64>() + self.data_file_path.len()) as u64
+        self.retained_bytes
     }
 }
 

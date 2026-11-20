@@ -40,9 +40,7 @@ use novarocks_proto_codec::{FieldPath, ProtocolError, connector_read as codec};
 use novarocks_proto_models::{connector_read as cv, physical_package_v2 as w};
 use novarocks_type_contract::ValueSchemaCreation;
 use novarocks_type_contract::{CompileCheckpoints, CompileControlError};
-use std::{
-    alloc::Layout, collections::BTreeMap, convert::Infallible, fmt, num::NonZeroU64, sync::Arc,
-};
+use std::{alloc::Layout, collections::BTreeMap, convert::Infallible, fmt, sync::Arc};
 
 type E = ReadScanCodecError;
 #[derive(Debug)]
@@ -1720,8 +1718,6 @@ pub fn encode_read_scans_observed(
                 )?),
                 remaining_connector_expression_id,
                 dynamic_filters,
-                max_batch_rows: scan.max_batch_rows().get(),
-                max_batch_bytes: scan.max_batch_bytes().get(),
             }),
             public_facts: Some(encode_public(
                 source.read.public_facts(),
@@ -2077,16 +2073,6 @@ fn decode_read_scans_core<H>(
             filters.push(c::StaticScanDynamicFilter::new(id, name));
             work.step()?;
         }
-        let rows = required(
-            NonZeroU64::new(facts.max_batch_rows),
-            "scan max batch rows must be nonzero",
-            work,
-        )?;
-        let bytes = required(
-            NonZeroU64::new(facts.max_batch_bytes),
-            "scan max batch bytes must be nonzero",
-            work,
-        )?;
         let mut last = c::WriterOwnedResourceFacts::default();
         let scan = {
             let mut child_admit = |f: &c::WriterOwnedResourceFacts| {
@@ -2103,8 +2089,6 @@ fn decode_read_scans_core<H>(
                     unenforced_predicate: unenforced,
                     remaining_expression: remaining,
                     dynamic_filters: filters,
-                    max_batch_rows: rows,
-                    max_batch_bytes: bytes,
                 },
                 source_retained_bytes,
                 &mut child_admit,

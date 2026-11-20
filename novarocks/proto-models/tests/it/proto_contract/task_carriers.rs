@@ -163,7 +163,6 @@ fn topology() -> novarocks::TaskExchangeTopology {
 
 fn query_options() -> novarocks::QueryOptions {
     novarocks::QueryOptions {
-        batch_size: 4096,
         query_timeout: 300,
         enable_profile: true,
         pipeline_dop: 8,
@@ -211,9 +210,9 @@ fn query_options_runtime_consumed_fields_use_native_tags() {
     assert_eq!(
         fields,
         (1..=29)
-            .filter(|tag| ![6, 11, 12].contains(tag))
+            .filter(|tag| ![1, 6, 11, 12].contains(tag))
             .collect::<Vec<_>>(),
-        "QueryOptions must keep native runtime consumed fields on tags 1..=29 except reserved 6, 11, 12"
+        "QueryOptions must keep native runtime consumed fields on tags 1..=29 except reserved 1, 6, 11, 12"
     );
 }
 
