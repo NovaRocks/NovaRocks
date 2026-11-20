@@ -16,301 +16,73 @@
 -- under the License.
 
 -- @order_sensitive=true
--- Validate the admitted REMOVE ORPHAN FILES syntax and the Provider safety
--- refusal through the real native frontend/connector path. REST/Hadoop do not
--- prove writer fencing or Unknown/unreceived-object protection, so scanned GC
--- must return Unsupported even for empty tables or historical cutoffs.
--- Existing row/count readbacks and the final INSERT independently prove that
--- this refusal preserves committed data and ordinary maintenance/write access.
--- Exact snapshot metadata maintenance remains a separate supported operation.
---
--- Note: tbl$snapshots metadata table queries are not used here because the iceberg
--- suite's current_catalog mode causes the pre-query table-registration step to try
--- to load the metadata relation as a real Iceberg table, which fails. Instead,
--- correctness is verified through data-level assertions (SELECT COUNT(*), SELECT *).
---
--- The runner auto-creates `${case_db}` per case and drops it on cleanup, so
--- there is no explicit CREATE/DROP DATABASE here. All table refs are 2-part
--- `${case_db}.<table>` against the suite-level iceberg catalog
--- (`iceberg_cat_${suite_uuid0}`) selected by `SET catalog` at session setup.
-
--- ---------------------------------------------------------------------------
--- Case 1: Healthy table -> explicit scan refusal, data intact
--- Verifies: the rejected cleanup leaves every original row readable.
--- ---------------------------------------------------------------------------
+-- Exercise real orphan cleanup on an isolated REST/MinIO table with GC
+-- disabled, including the retained historical snapshot and a subsequent write.
+-- The dedicated Iceberg IVM case checks the materialized-view table guard.
 
 -- query 1
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.t1 (id INT, v VARCHAR(16)) WITH (format_version = 3);
+CREATE TABLE ${case_db}.orphan_gc_disabled (id INT, v VARCHAR)
+WITH (format_version = 3, gc_enabled = false);
 
 -- query 2
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t1 VALUES ROW(1, 'a');
+INSERT INTO ${case_db}.orphan_gc_disabled VALUES ROW(1, 'history');
 
 -- query 3
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t1 VALUES ROW(2, 'b');
+ALTER TABLE iceberg_cat_${suite_uuid0}.${case_db}.orphan_gc_disabled
+EXECUTE create_tag(name => 'before_cleanup', replace => false, if_not_exists => false);
 
 -- query 4
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t1 VALUES ROW(3, 'c');
+INSERT INTO ${case_db}.orphan_gc_disabled VALUES ROW(2, 'current');
 
 -- query 5
--- Sanity: 3 rows present before REMOVE ORPHAN FILES.
-SELECT COUNT(*) AS n FROM ${case_db}.t1;
+-- @expect_error=Retention specified (1.00d) is shorter than the minimum retention configured in the system (7.00d). Minimum retention can be changed with iceberg.remove-orphan-files.min-retention configuration property or iceberg.remove_orphan_files_min_retention session property
+ALTER TABLE ${case_db}.orphan_gc_disabled EXECUTE remove_orphan_files(retention_threshold => '1d');
 
 -- query 6
--- @expect_sql_code=query.execution.unsupported
--- @expect_sql_phase=Execution
--- The admitted old cutoff does not supply the missing Provider safety proof.
-ALTER TABLE ${case_db}.t1 EXECUTE remove_orphan_files(older_than => '2020-01-01 00:00:00');
+-- @iceberg_orphan_fixture=${case_db}.orphan_gc_disabled
+-- @iceberg_orphan_fixture_absent=true
+-- The fixture is installed before the step. The session statement completes
+-- before EXECUTE freezes its cutoff. The strict equal-time boundary is
+-- verified with independent file times in the Provider tests.
+SET SESSION iceberg_cat_${suite_uuid0}.remove_orphan_files_min_retention = '0s';
+ALTER TABLE ${case_db}.orphan_gc_disabled EXECUTE remove_orphan_files(retention_threshold => '0s');
 
 -- query 7
--- All 3 rows must remain visible after the explicit scan refusal.
-SELECT id, v FROM ${case_db}.t1 ORDER BY id;
+SELECT id, v FROM ${case_db}.orphan_gc_disabled ORDER BY id;
 
 -- query 8
--- Row count still 3 confirming no data files were removed.
-SELECT COUNT(*) AS n FROM ${case_db}.t1;
-
--- ---------------------------------------------------------------------------
--- Case 2: Empty table -> the same explicit scan refusal
--- Verifies: absence of current data does not invent a safety proof.
--- ---------------------------------------------------------------------------
+SELECT id, v FROM ${case_db}.orphan_gc_disabled FOR VERSION AS OF 'before_cleanup' ORDER BY id;
 
 -- query 9
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.t2 (id INT, v VARCHAR(16)) WITH (format_version = 3);
+CREATE TABLE ${case_db}.empty_v2 (id INT) WITH (format_version = 2);
 
 -- query 10
--- Table is empty before REMOVE ORPHAN FILES.
-SELECT COUNT(*) AS n FROM ${case_db}.t2;
+ALTER TABLE ${case_db}.empty_v2 EXECUTE remove_orphan_files(retention_threshold => '0s');
 
 -- query 11
--- @expect_sql_code=query.execution.unsupported
--- @expect_sql_phase=Execution
--- An empty table does not grant scanned-object deletion authority.
-ALTER TABLE ${case_db}.t2 EXECUTE remove_orphan_files(older_than => '2020-01-01 00:00:00');
+-- @skip_result_check=true
+RESET SESSION iceberg_cat_${suite_uuid0}.remove_orphan_files_min_retention;
 
 -- query 12
--- Still empty after the explicit scan refusal.
-SELECT COUNT(*) AS n FROM ${case_db}.t2;
-
--- ---------------------------------------------------------------------------
--- Case 3: Exact EXPIRE succeeds, scanned ORPHAN refuses, data is intact
--- Verifies: separate metadata maintenance does not grant scanned deletion.
--- The original readback remains required after both operations.
--- ---------------------------------------------------------------------------
+-- @expect_error=table procedure 'REMOVE_ORPHAN_FILES' property 'older_than' does not exist
+ALTER TABLE ${case_db}.orphan_gc_disabled EXECUTE remove_orphan_files(older_than => 1700000000000);
 
 -- query 13
--- @skip_result_check=true
-CREATE TABLE ${case_db}.t3 (id INT, v VARCHAR(16)) WITH (format_version = 3);
+-- @expect_trino_error=SYNTAX_ERROR,USER_ERROR
+ALTER TABLE ${case_db}.orphan_gc_disabled@dev EXECUTE remove_orphan_files(retention_threshold => '7d');
 
 -- query 14
--- @skip_result_check=true
-INSERT INTO ${case_db}.t3 VALUES ROW(10, 'x');
+-- @expect_trino_error=SYNTAX_ERROR,USER_ERROR
+ALTER TABLE ${case_db}.orphan_gc_disabled REMOVE ORPHAN FILES OLDER THAN '2020-01-01 00:00:00' WHERE size_in_bytes < 100;
 
 -- query 15
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t3 VALUES ROW(20, 'y');
+INSERT INTO ${case_db}.orphan_gc_disabled VALUES ROW(3, 'after');
 
 -- query 16
--- @skip_result_check=true
-INSERT INTO ${case_db}.t3 VALUES ROW(30, 'z');
-
--- query 17
--- Baseline: 3 rows before the EXPIRE+ORPHAN pipeline.
-SELECT COUNT(*) AS n FROM ${case_db}.t3;
-
--- query 18
--- @skip_result_check=true
--- Step 1: EXPIRE SNAPSHOTS (noop on live chain).
-ALTER TABLE ${case_db}.t3 EXECUTE expire_snapshots(older_than => '2020-01-01 00:00:00');
-
--- query 19
--- @expect_sql_code=query.execution.unsupported
--- @expect_sql_phase=Execution
--- Exact snapshot maintenance cannot authorize a later scanned-object sweep.
-ALTER TABLE ${case_db}.t3 EXECUTE remove_orphan_files(older_than => '2020-01-01 00:00:00');
-
--- query 20
--- All rows visible after exact EXPIRE and rejected scanned cleanup.
-SELECT id, v FROM ${case_db}.t3 ORDER BY id;
-
--- ---------------------------------------------------------------------------
--- Case 4: No OLDER THAN clause -> reject
--- Verifies: REMOVE ORPHAN FILES without OLDER THAN is a parse-time error.
--- ---------------------------------------------------------------------------
-
--- query 21
--- @skip_result_check=true
-CREATE TABLE ${case_db}.t4 (id INT, v VARCHAR(16)) WITH (format_version = 2);
-
--- query 22
--- @expect_trino_error=SYNTAX_ERROR,USER_ERROR
-ALTER TABLE ${case_db}.t4 REMOVE ORPHAN FILES;
-
--- ---------------------------------------------------------------------------
--- Case 5: Branch suffix -> reject
--- Verifies: ALTER TABLE EXECUTE does not admit a branch-qualified table.
--- ---------------------------------------------------------------------------
-
--- query 23
--- @skip_result_check=true
-CREATE TABLE ${case_db}.t5 (id INT, v VARCHAR(16)) WITH (format_version = 3);
-
--- query 24
--- @expect_trino_error=SYNTAX_ERROR,USER_ERROR
-ALTER TABLE ${case_db}.t5@dev EXECUTE remove_orphan_files(older_than => '2020-01-01 00:00:00');
-
--- ---------------------------------------------------------------------------
--- Case 6: V2 shares the safety refusal
--- Verifies: the scanned-object proof requirement is not format-version-specific.
--- ---------------------------------------------------------------------------
-
--- query 25
--- @skip_result_check=true
-CREATE TABLE ${case_db}.t6 (id INT, v VARCHAR(16)) WITH (format_version = 2);
-
--- query 26
--- @skip_result_check=true
-INSERT INTO ${case_db}.t6 VALUES ROW(1, 'first');
-
--- query 27
--- @skip_result_check=true
-INSERT INTO ${case_db}.t6 VALUES ROW(2, 'second');
-
--- query 28
--- Baseline: 2 rows before REMOVE ORPHAN FILES on v2 table.
-SELECT COUNT(*) AS n FROM ${case_db}.t6;
-
--- query 29
--- @expect_sql_code=query.execution.unsupported
--- @expect_sql_phase=Execution
--- V2 uses the same unproven scanned-object safety boundary.
-ALTER TABLE ${case_db}.t6 EXECUTE remove_orphan_files(older_than => '2020-01-01 00:00:00');
-
--- query 30
--- Data intact after the scan refusal on the v2 table.
-SELECT id, v FROM ${case_db}.t6 ORDER BY id;
-
--- ---------------------------------------------------------------------------
--- Case 7: Epoch-ms integer timestamp accepted
--- Verifies: OLDER THAN accepts a bare epoch-ms integer (e.g. 1700000000000).
--- ---------------------------------------------------------------------------
-
--- query 31
--- @skip_result_check=true
-CREATE TABLE ${case_db}.t7 (id INT, v VARCHAR(16)) WITH (format_version = 3);
-
--- query 32
--- @skip_result_check=true
-INSERT INTO ${case_db}.t7 VALUES ROW(1, 'one');
-
--- query 33
--- @skip_result_check=true
-INSERT INTO ${case_db}.t7 VALUES ROW(2, 'two');
-
--- query 34
--- @expect_sql_code=query.execution.unsupported
--- @expect_sql_phase=Execution
--- Epoch-ms syntax is admitted; age does not prove safe scanned deletion.
-ALTER TABLE ${case_db}.t7 EXECUTE remove_orphan_files(older_than => 1700000000000);
-
--- query 35
--- Data intact after the scan refusal with an admitted epoch-ms cutoff.
-SELECT id, v FROM ${case_db}.t7 ORDER BY id;
-
--- ---------------------------------------------------------------------------
--- Case 8: Trailing tokens after clause -> reject
--- Verifies: parser rejects extra tokens after the OLDER THAN timestamp.
--- ---------------------------------------------------------------------------
-
--- query 36
--- @skip_result_check=true
-CREATE TABLE ${case_db}.t8 (id INT, v VARCHAR(16)) WITH (format_version = 2);
-
--- query 37
--- @expect_trino_error=SYNTAX_ERROR,USER_ERROR
-ALTER TABLE ${case_db}.t8 REMOVE ORPHAN FILES OLDER THAN '2020-01-01 00:00:00' WHERE size_in_bytes < 100;
-
--- ---------------------------------------------------------------------------
--- Case 9: Historical cutoff syntax is accepted, scanned cleanup is refused
--- Verifies: age and current reachability are not Provider safety evidence.
--- ---------------------------------------------------------------------------
-
--- query 38
--- @skip_result_check=true
-CREATE TABLE ${case_db}.t9 (id INT, v VARCHAR(16)) WITH (format_version = 3);
-
--- query 39
--- @skip_result_check=true
-INSERT INTO ${case_db}.t9 VALUES ROW(100, 'alpha');
-
--- query 40
--- @skip_result_check=true
-INSERT INTO ${case_db}.t9 VALUES ROW(200, 'beta');
-
--- query 41
--- Baseline: 2 rows.
-SELECT COUNT(*) AS n FROM ${case_db}.t9;
-
--- query 42
--- @expect_sql_code=query.execution.unsupported
--- @expect_sql_phase=Execution
--- A historical cutoff is insufficient even while current files are live.
-ALTER TABLE ${case_db}.t9 EXECUTE remove_orphan_files(older_than => '2020-01-01 00:00:00');
-
--- query 43
--- Row count unchanged after the explicit scan refusal.
-SELECT COUNT(*) AS n FROM ${case_db}.t9;
-
--- ---------------------------------------------------------------------------
--- Case 10: Combined EXPIRE -> ORPHAN -> INSERT maintenance sequence
--- Verifies: exact EXPIRE and refused scanned cleanup preserve continued writes.
--- The subsequent INSERT and all original row/count readbacks remain required.
--- ---------------------------------------------------------------------------
-
--- query 44
--- @skip_result_check=true
-CREATE TABLE ${case_db}.t10 (id INT, v VARCHAR(16)) WITH (format_version = 3);
-
--- query 45
--- @skip_result_check=true
-INSERT INTO ${case_db}.t10 VALUES ROW(1, 'row1');
-
--- query 46
--- @skip_result_check=true
-INSERT INTO ${case_db}.t10 VALUES ROW(2, 'row2');
-
--- query 47
--- @skip_result_check=true
-INSERT INTO ${case_db}.t10 VALUES ROW(3, 'row3');
-
--- query 48
--- Pre-maintenance baseline: 3 rows.
-SELECT COUNT(*) AS n FROM ${case_db}.t10;
-
--- query 49
--- @skip_result_check=true
--- Maintenance step 1: expire old snapshots (noop on live chain).
-ALTER TABLE ${case_db}.t10 EXECUTE expire_snapshots(older_than => '2020-01-01 00:00:00');
-
--- query 50
--- @expect_sql_code=query.execution.unsupported
--- @expect_sql_phase=Execution
--- The unproven scanned-object phase refuses without authorizing deletion.
-ALTER TABLE ${case_db}.t10 EXECUTE remove_orphan_files(older_than => '2020-01-01 00:00:00');
-
--- query 51
--- @skip_result_check=true
--- Maintenance step 3: new INSERT proves snapshot parent chain is healthy.
-INSERT INTO ${case_db}.t10 VALUES ROW(4, 'row4');
-
--- query 52
--- All 4 rows visible: 3 pre-maintenance + 1 post-maintenance.
-SELECT id, v FROM ${case_db}.t10 ORDER BY id;
-
--- query 53
--- Total count confirms no data loss through the full maintenance pipeline.
-SELECT COUNT(*) AS n FROM ${case_db}.t10;
+SELECT id, v FROM ${case_db}.orphan_gc_disabled ORDER BY id;

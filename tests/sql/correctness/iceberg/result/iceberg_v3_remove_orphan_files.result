@@ -1,83 +1,30 @@
--- query 5
--- types	bigint
-n
-3
+-- query 6
+-- types	varchar	bigint
+metric_name	metric_value
+processed_manifests_count	2
+active_files_count	10
+scanned_files_count	11
+deleted_files_count	1
+deleted_bytes	25
 
 -- query 7
 -- types	integer	varchar
 id	v
-1	a
-2	b
-3	c
+1	history
+2	current
 
 -- query 8
--- types	bigint
-n
-3
+-- types	integer	varchar
+id	v
+1	history
 
 -- query 10
--- types	bigint
-n
-0
+-- types	varchar	bigint
+metric_name	metric_value
 
--- query 12
--- types	bigint
-n
-0
-
--- query 17
--- types	bigint
-n
-3
-
--- query 20
+-- query 16
 -- types	integer	varchar
 id	v
-10	x
-20	y
-30	z
-
--- query 28
--- types	bigint
-n
-2
-
--- query 30
--- types	integer	varchar
-id	v
-1	first
-2	second
-
--- query 35
--- types	integer	varchar
-id	v
-1	one
-2	two
-
--- query 41
--- types	bigint
-n
-2
-
--- query 43
--- types	bigint
-n
-2
-
--- query 48
--- types	bigint
-n
-3
-
--- query 52
--- types	integer	varchar
-id	v
-1	row1
-2	row2
-3	row3
-4	row4
-
--- query 53
--- types	bigint
-n
-4
+1	history
+2	current
+3	after
