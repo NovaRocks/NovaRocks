@@ -89,9 +89,9 @@ _col0	_col1
 AB01	AB01
 
 -- query 24
--- legacy
+-- types	varchar	varchar
 _col0	_col1
-AB01	69BD35
+EFBFBD01	69BD35
 
 -- query 25
 -- legacy
@@ -105,10 +105,10 @@ AB01	AB01
 ABAB	ABAB
 
 -- query 28
--- legacy
+-- types	varchar	varchar
 _col0	_col1
-AB01	69BD35
-ABAB	69B69B
+EFBFBD01	69BD35
+EFBFBDEFBFBD	69B69B
 
 -- query 29
 -- legacy

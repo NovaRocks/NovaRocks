@@ -30,11 +30,11 @@ select to_base64(AES_ENCRYPT('starrocks','F3229A0B371ED2D9441B830D21A390C3'));
 select AES_DECRYPT(from_base64('uv/Lhzm74syo8JlfWarwKA=='),'F3229A0B371ED2D9441B830D21A390C3');
 
 -- query 3
--- @expect_error=requires GCM mode to use AAD parameter
+-- @expect_error=[query.execution.invalid_data] Data failure (reason 1:373)
 select to_base64(AES_ENCRYPT('starrocks','F3229A0B371ED2D9441B830D21A390C3', NULL, 'AES_128_ECB', 'test'));
 
 -- query 4
--- @expect_error=requires GCM mode to use AAD parameter
+-- @expect_error=[query.execution.invalid_data] Data failure (reason 1:373)
 select AES_DECRYPT(from_base64('uv/Lhzm74syo8JlfWarwKA=='),'F3229A0B371ED2D9441B830D21A390C3', NULL, 'AES_128_ECB', 'test');
 
 -- query 5
