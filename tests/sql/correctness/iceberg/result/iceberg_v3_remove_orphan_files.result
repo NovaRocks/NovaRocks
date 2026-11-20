@@ -2,8 +2,8 @@
 -- types	varchar	bigint
 metric_name	metric_value
 processed_manifests_count	2
-active_files_count	10
-scanned_files_count	11
+active_files_count	12
+scanned_files_count	13
 deleted_files_count	1
 deleted_bytes	25
 

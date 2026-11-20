@@ -45,7 +45,7 @@ WITH (location = '${iceberg_rest_warehouse}/${case_db}');
 -- query 2
 -- @skip_result_check=true
 CREATE TABLE orphan_rest_${uuid0}.${case_db}.orphan_gc_disabled (id INT, v VARCHAR)
-WITH (format_version = 3, gc_enabled = false);
+WITH (format_version = 3, gc_enabled = false, statistics_collect_on_write = true);
 
 -- query 3
 -- @skip_result_check=true
@@ -67,6 +67,8 @@ ALTER TABLE orphan_rest_${uuid0}.${case_db}.orphan_gc_disabled EXECUTE remove_or
 -- query 7
 -- @iceberg_orphan_fixture=orphan_rest_${uuid0}.${case_db}.orphan_gc_disabled
 -- @iceberg_orphan_fixture_absent=true
+-- Protect two data files, two manifests, two manifest lists, four metadata
+-- JSON files, and two Puffin statistics files. Scan those plus one orphan.
 -- The fixture is installed before the step. The session statement completes
 -- before EXECUTE freezes its cutoff. The strict equal-time boundary is
 -- verified with independent file times in the Provider tests.
