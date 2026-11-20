@@ -57,11 +57,16 @@ pub(super) fn prepare(
     {
         return Ok(action);
     }
-    executor.reject_legacy_cleanup_call(
+    if let Some(action) = executor.prepare_legacy_cleanup_call(
         command,
         context.session().current_catalog(),
         context.session().current_database(),
-    )?;
+        context.execution(),
+        command_context.connector_context(),
+        family,
+    )? {
+        return Ok(action);
+    }
     prepare_metadata_action(context, command_context, family, || {
         executor.prepare_command(
             command,

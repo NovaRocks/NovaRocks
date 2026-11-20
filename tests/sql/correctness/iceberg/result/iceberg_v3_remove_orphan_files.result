@@ -1,4 +1,4 @@
--- query 6
+-- query 7
 -- types	varchar	bigint
 metric_name	metric_value
 processed_manifests_count	2
@@ -7,22 +7,22 @@ scanned_files_count	11
 deleted_files_count	1
 deleted_bytes	25
 
--- query 7
+-- query 8
 -- types	integer	varchar
 id	v
 1	history
 2	current
 
--- query 8
+-- query 9
 -- types	integer	varchar
 id	v
 1	history
 
--- query 10
+-- query 11
 -- types	varchar	bigint
 metric_name	metric_value
 
--- query 16
+-- query 17
 -- types	integer	varchar
 id	v
 1	history

@@ -87,7 +87,9 @@ SELECT COUNT(*) AS n FROM ${case_db}.t2;
 
 -- query 17
 -- @skip_result_check=true
+-- Leave the original partition spec unused.
 CREATE TABLE ${case_db}.t3 (id INT, v VARCHAR(16)) WITH (format_version = 3);
+ALTER TABLE ${case_db}.t3 SET PROPERTIES partitioning = ARRAY['bucket(id, 4)'];
 
 -- query 18
 -- @skip_result_check=true
@@ -95,10 +97,12 @@ INSERT INTO ${case_db}.t3 VALUES ROW(1, 'p');
 
 -- query 19
 -- @skip_result_check=true
+ALTER TABLE ${case_db}.t3 SET PROPERTIES partitioning = ARRAY['id'];
 INSERT INTO ${case_db}.t3 VALUES ROW(2, 'q');
 
 -- query 20
--- Dictionary cleanup is admitted with both retention inputs.
+-- Read the retained manifest lists on the original metadata CPU and remove
+-- the unused partition spec. Both snapshots and their data remain readable.
 ALTER TABLE ${case_db}.t3 EXECUTE expire_snapshots(retention_threshold => '7d', retain_last => 5, clean_expired_metadata => true);
 
 -- query 21

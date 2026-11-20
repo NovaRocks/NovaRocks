@@ -24,8 +24,7 @@ use super::{
     RequestScopedMaintenanceEngine, TableMaintenanceService,
 };
 use novarocks_query_application::{
-    api::{CommandError, CommandErrorKind},
-    protocol_delivery::QuerySessionOutput as StatementResult,
+    api::CommandError, protocol_delivery::QuerySessionOutput as StatementResult,
 };
 use novarocks_table_maintenance::runtime::TerminalError;
 
@@ -97,12 +96,18 @@ impl MaintenanceCommandExecutor {
         .map(Some)
     }
 
-    pub(crate) fn reject_legacy_cleanup_call(
+    pub(crate) fn prepare_legacy_cleanup_call(
         &self,
         command: &novarocks_sql::semantic::MaintenanceSqlCommand,
         current_catalog: Option<&str>,
         current_database: &str,
-    ) -> Result<(), CommandError> {
+        execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
+        connector: &novarocks_spi::connector::ConnectorRequestContext,
+        family: novarocks_result_contract::ClientPresentationFamily,
+    ) -> Result<
+        Option<Box<dyn novarocks_query_application::session_control::GovernedStatementAction>>,
+        CommandError,
+    > {
         let context = MaintenanceRequestContext {
             current_catalog,
             current_database,
@@ -110,16 +115,50 @@ impl MaintenanceCommandExecutor {
         let lowered =
             crate::table_maintenance::lower_semantic_maintenance_statement(command, context)
                 .map_err(maintenance_input_error)?;
-        if matches!(
-            lowered.action,
-            crate::table_maintenance::ParsedMaintenanceAction::RemoveOrphanFiles { .. }
-        ) {
-            return Err(CommandError::new(
-                CommandErrorKind::Unsupported,
-                "CALL remove_orphan_files is not supported. Use ALTER TABLE EXECUTE remove_orphan_files",
+        let crate::table_maintenance::ParsedMaintenanceStatement {
+            name_parts,
+            action:
+                crate::table_maintenance::ParsedMaintenanceAction::RemoveOrphanFiles { older_than_ms },
+        } = lowered
+        else {
+            return Ok(None);
+        };
+        let engine = RequestScopedMaintenanceEngine::new(
+            self.kernel.clone(),
+            execution.clone(),
+            connector.clone(),
+        );
+        let (target, provider) = engine
+            .resolve_target_with_provider(&name_parts, context)
+            .map_err(maintenance_target_error)?;
+        let identity = RequestScopedMaintenanceEngine::target_identity(&target)
+            .map_err(TerminalError::pre_dispatch_failed)
+            .map_err(crate::query::maintenance_command_error)?;
+        let planning = self
+            .kernel
+            .connector_control()
+            .acquire_current(&identity.instance_id)
+            .map_err(TerminalError::from_original_cause)
+            .map_err(crate::query::maintenance_command_error)?;
+        if planning.binding().descriptor().provider_id != provider {
+            return Err(crate::query::maintenance_command_error(
+                TerminalError::pre_dispatch_failed(
+                    "cleanup target provider differs from its retained generation",
+                ),
             ));
         }
-        Ok(())
+        super::cleanup_action::prepare(
+            &self.kernel,
+            target,
+            older_than_ms,
+            super::cleanup_action::CleanupEntry::LegacyCall,
+            planning,
+            execution,
+            connector,
+            family,
+        )
+        .map(Some)
+        .map_err(crate::query::maintenance_command_error)
     }
 
     /// Construct the actual original producer, without polling provider I/O.
@@ -213,87 +252,53 @@ impl MaintenanceCommandExecutor {
             provider_bytes,
         )
         .map_err(|e| format!("metadata source construction refused: {e:?}"))?;
-        let mut connector = connector_context.clone().with_io_admission(
+        let connector = connector_context.clone().with_io_admission(
             io.clone() as Arc<dyn novarocks_spi::connector::ConnectorIoAdmissionPort>
         );
-        let metadata_cpu = if let Some(retained) = &retained
-            && matches!(
-                retained.intent,
-                crate::connector::metadata_maintenance::MetadataMaintenanceIntent::TrinoExpireSnapshots {
-                    inputs: novarocks_spi::connector::ConnectorExpireSnapshotsExecute {
-                        clean_expired_metadata: true,
-                        ..
-                    },
+        let needs_metadata_cpu = retained.as_ref().is_some_and(|retained| matches!(
+            retained.intent,
+            crate::connector::metadata_maintenance::MetadataMaintenanceIntent::TrinoExpireSnapshots {
+                inputs: novarocks_spi::connector::ConnectorExpireSnapshotsExecute {
+                    clean_expired_metadata: true,
                     ..
-                }
-            )
-        {
-            let command_error = |error| {
-                crate::query::maintenance_command_error(TerminalError::from_original_cause(error))
-            };
-            let runtime = self.kernel.rewrite_runtime().map_err(command_error)?;
-            let wake = Arc::new(MetadataCpuWake::default());
-            // This authenticates the original control node. Submission still
-            // waits for the Call's actual I/O bootstrap on the same Root.
-            let port = runtime.execution.0.provider_creator_cpu().map_err(command_error)?
-                .planning_metadata_cpu_port(
-                    capacity.root_scope(),
-                    capacity.try_window_alias().map_err(command_error)?,
-                    &retained.planning,
-                    execution.cancellation().clone(),
-                    runtime.execution.0.runtime().clone(),
-                    wake.clone(),
-                ).map_err(command_error)?;
-            connector = connector.with_metadata_cpu(port.clone());
-            Some(MetadataCpu { port, wake, activated: false, close_failure: None })
-        } else {
-            None
-        };
-        let mut engine = RequestScopedMaintenanceEngine::new(
-            self.kernel.clone(),
-            execution.clone(),
-            connector.clone(),
-        );
-        let original = MaintenanceActionState::default();
-        if let Some(retained) = retained {
-            let table = RequestScopedMaintenanceEngine::target_identity(&retained.target)
-                .map_err(maintenance_input_error)?;
-            let call = crate::connector::metadata_maintenance::MetadataMaintenanceCall::try_new_on_session(
-                lease,
-                novarocks_spi::connector::ConnectorMutationOperationId::new(),
-                table,
-                retained.intent,
-                connector,
-            )
-            .map_err(|error| maintenance_input_error(format!("{error:?}")))?;
-            original
-                .install_call(call)
-                .map_err(maintenance_input_error)?;
-            engine = engine.with_metadata_target(retained.target, retained.planning);
-        }
-        original
-            .install_engine(engine.clone())
-            .map_err(maintenance_input_error)?;
-        let retained = original.clone();
-        let service = Arc::clone(self.kernel.service());
-        let catalog = context.current_catalog.map(str::to_owned);
-        let database = context.current_database.to_owned();
-        let future = Box::pin(make_metadata_product(MetadataProductInput {
-            service,
-            engine,
+                },
+                ..
+            }
+        ));
+        let pending = MetadataProductPreparation {
+            kernel: self.kernel.clone(),
+            execution: execution.clone(),
+            connector,
+            lease,
             retained,
             lowered,
             spark_call,
-            catalog,
-            database,
-        }));
+            catalog: context.current_catalog.map(str::to_owned),
+            database: context.current_database.to_owned(),
+        };
+        let original = MaintenanceActionState::default();
+        let (pending, future) = if needs_metadata_cpu {
+            // Preparing the I/O Source left its original Root dormant.
+            // Keep the exact inputs until the Action installs its dependencies.
+            (Some(Box::new(pending)), None)
+        } else {
+            (
+                None,
+                Some(
+                    pending
+                        .start(&original, None)
+                        .map_err(crate::query::maintenance_command_error)?,
+                ),
+            )
+        };
         Ok(MaintenanceCommandCall {
-            future: Some(future),
+            pending,
+            future,
             result: None,
             poll_unproven: false,
             original,
             io: Some(io),
-            metadata_cpu,
+            metadata_cpu: None,
         })
     }
 
@@ -411,7 +416,6 @@ impl crate::wake::StatusIntakeWake for MetadataCpuWake {
 struct MetadataCpu {
     port: Arc<dyn novarocks_spi::connector::ProviderMetadataCpuPort>,
     wake: Arc<MetadataCpuWake>,
-    activated: bool,
     close_failure: Option<novarocks_query_application::api::StatementNativeHealthFailure>,
 }
 
@@ -430,9 +434,96 @@ impl MetadataCpu {
     }
 }
 
+struct MetadataProductPreparation {
+    kernel: crate::query_execution::kernels::MaintenanceExecutionKernel,
+    execution: novarocks_query_application::admitted_query_context::QueryExecutionContext,
+    connector: novarocks_spi::connector::ConnectorRequestContext,
+    lease: novarocks_spi::connector::ConnectorMetadataMaintenanceSession,
+    retained: Option<table_execute::MetadataPreparation>,
+    lowered: crate::table_maintenance::ParsedMaintenanceStatement,
+    spark_call: bool,
+    catalog: Option<String>,
+    database: String,
+}
+
+impl MetadataProductPreparation {
+    fn bind_metadata_cpu(
+        &self,
+        io: &super::io_admission::MetadataIoAdmission,
+    ) -> Result<MetadataCpu, novarocks_workload_control::WorkError> {
+        let retained = self
+            .retained
+            .as_ref()
+            .expect("clean expiration has the original table binding");
+        let runtime = self.kernel.rewrite_runtime()?;
+        let capacity = io.root_capacity()?;
+        let wake = Arc::new(MetadataCpuWake::default());
+        let port = runtime
+            .execution
+            .0
+            .provider_creator_cpu()?
+            .planning_metadata_cpu_port(
+                capacity.root_scope(),
+                capacity.try_window_alias()?,
+                &retained.planning,
+                self.execution.cancellation().clone(),
+                runtime.execution.0.runtime().clone(),
+                wake.clone(),
+            )?;
+        Ok(MetadataCpu {
+            port,
+            wake,
+            close_failure: None,
+        })
+    }
+
+    fn start(
+        self,
+        original: &MaintenanceActionState,
+        metadata_cpu: Option<&MetadataCpu>,
+    ) -> Result<MaintenanceStatementFuture, TerminalError> {
+        let connector = match metadata_cpu {
+            Some(cpu) => self.connector.with_metadata_cpu(cpu.port.clone()),
+            None => self.connector,
+        };
+        let mut engine = RequestScopedMaintenanceEngine::new(
+            self.kernel.clone(),
+            self.execution,
+            connector.clone(),
+        );
+        if let Some(retained) = self.retained {
+            let table = RequestScopedMaintenanceEngine::target_identity(&retained.target)
+                .map_err(TerminalError::from)?;
+            let call = crate::connector::metadata_maintenance::MetadataMaintenanceCall::try_new_on_session(
+                self.lease,
+                novarocks_spi::connector::ConnectorMutationOperationId::new(),
+                table,
+                retained.intent,
+                connector,
+            )
+            .map_err(|error| TerminalError::from(format!("{error:?}")))?;
+            original.install_call(call).map_err(TerminalError::from)?;
+            engine = engine.with_metadata_target(retained.target, retained.planning);
+        }
+        original
+            .install_engine(engine.clone())
+            .map_err(TerminalError::from)?;
+        Ok(Box::pin(make_metadata_product(MetadataProductInput {
+            service: Arc::clone(self.kernel.service()),
+            engine,
+            retained: original.clone(),
+            lowered: self.lowered,
+            spark_call: self.spark_call,
+            catalog: self.catalog,
+            database: self.database,
+        })))
+    }
+}
+
 /// Source-owned product future and its independent fixed row. Field order
 /// leaves the row alive if completed Product F Drop unwinds. It is not a grant.
 pub struct MaintenanceCommandCall {
+    pending: Option<Box<MetadataProductPreparation>>,
     future: Option<MaintenanceStatementFuture>,
     result: Option<
         Result<MaintenanceStatementResult, novarocks_table_maintenance::runtime::TerminalError>,
@@ -561,23 +652,35 @@ impl MaintenanceCommandCall {
             cpu.wake.0.register(cx.waker());
         }
         match io.poll_progress(owner, cx) {
-            Err(_) if self.metadata_cpu.as_ref().is_some_and(|cpu| cpu.activated) => {
+            Err(_) if self.metadata_cpu.is_some() => {
                 // Give the same Product and CPU phase their real exit even
                 // when ordinary I/O control has already failed.
                 let _ = io.poll_actual_progress_continuing(cx);
             }
             Err(error) => return Poll::Ready(Err(io_terminal_error(error))),
             Ok(false) => return Poll::Pending,
-            Ok(true) => {
-                if let Some(cpu) = &mut self.metadata_cpu {
-                    cpu.activated = true;
-                }
-            }
+            Ok(true) => {}
         }
         if self.local_health_failure().is_some() {
             // Only an actual panic/disposition failure is unproven. Ordinary
             // exited abort errors are received and projected below.
             return Poll::Pending;
+        }
+        if let Some(pending) = self.pending.take() {
+            let started = pending
+                .bind_metadata_cpu(&io)
+                .map_err(TerminalError::from_original_cause)
+                .and_then(|cpu| {
+                    cpu.wake.0.register(cx.waker());
+                    self.metadata_cpu = Some(cpu);
+                    pending.start(&self.original, self.metadata_cpu.as_ref())
+                });
+            match started {
+                Ok(future) => self.future = Some(future),
+                // No Provider call has been polled. The same source still
+                // settles its paid I/O, plus the CPU port if it was bound.
+                Err(error) => self.result = Some(Err(error)),
+            }
         }
         if self.result.is_none() {
             match self.poll_product(cx) {
@@ -748,6 +851,7 @@ mod original_producer_tests {
         let drops = Arc::new(AtomicUsize::new(0));
         let state = MaintenanceActionState::default();
         let mut original = MaintenanceCommandCall {
+            pending: None,
             future: Some(Box::pin(OriginalGate {
                 release: receiver,
                 polls: Arc::clone(&polls),
@@ -790,6 +894,7 @@ mod original_producer_tests {
     #[test]
     fn completed_product_drop_panic_keeps_ready_and_original_row_outside_future() {
         let mut original = MaintenanceCommandCall {
+            pending: None,
             future: Some(Box::pin(ReadyThenPanic)),
             result: None,
             poll_unproven: false,

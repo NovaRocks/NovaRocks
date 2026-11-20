@@ -31,9 +31,9 @@ use novarocks_query_application::{
 use novarocks_spi::connector::{
     ConnectorCleanupAsyncExecution, ConnectorCleanupAsyncObservation, ConnectorCleanupAsyncStart,
     ConnectorCleanupMaintenanceSession, ConnectorCleanupOperationId, ConnectorControlPlanningPin,
-    ConnectorError, ConnectorMaintenanceRetention, ConnectorOriginalResultScope,
-    ConnectorRequestContext, ConnectorTableObjectId, LakePublicationDisposition,
-    ProviderMetadataCpuPort, SharedDependency,
+    ConnectorError, ConnectorErrorKind, ConnectorMaintenanceRetention,
+    ConnectorOriginalResultScope, ConnectorRequestContext, ConnectorTableObjectId,
+    LakePublicationDisposition, ProviderMetadataCpuPort, SharedDependency,
 };
 use novarocks_table_maintenance::{
     MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceTarget, ProcedureMetrics,
@@ -67,12 +67,16 @@ impl crate::wake::StatusIntakeWake for Wake {
         self.waker.wake()
     }
 }
+pub(super) enum CleanupEntry {
+    TableExecute(ConnectorMaintenanceRetention),
+    LegacyCall,
+}
 struct Body {
     engine: RequestScopedMaintenanceEngine,
     product: Arc<TableMaintenanceProduct>,
     target: MaintenanceTarget,
     older_than: i64,
-    retention: ConnectorMaintenanceRetention,
+    entry: CleanupEntry,
     cleanup_session: ConnectorCleanupMaintenanceSession,
     planning: ConnectorControlPlanningPin,
     context: ConnectorRequestContext,
@@ -121,11 +125,11 @@ fn health(error: impl std::error::Error + Send + Sync + 'static) -> StatementNat
     )
 }
 // Design: ADR-0243 (docs/adr/ADR-0243-statement-authorized-iceberg-metadata-maintenance.md)
-pub(crate) fn prepare(
+pub(super) fn prepare(
     kernel: &MaintenanceExecutionKernel,
     target: MaintenanceTarget,
     older_than: i64,
-    retention: ConnectorMaintenanceRetention,
+    entry: CleanupEntry,
     planning: ConnectorControlPlanningPin,
     execution: &QueryExecutionContext,
     connector: &ConnectorRequestContext,
@@ -171,7 +175,7 @@ pub(crate) fn prepare(
         product,
         target,
         older_than,
-        retention,
+        entry,
         cleanup_session,
         planning,
         context: connector.clone(),
@@ -582,7 +586,7 @@ async fn execute_cleanup(
         context,
         target,
         older_than,
-        retention,
+        entry,
         guarded_object,
         start,
         session,
@@ -592,6 +596,15 @@ async fn execute_cleanup(
         wake,
         ..
     } = &mut *body;
+    // The Product has admitted this exact target and run the MV guard.
+    let CleanupEntry::TableExecute(retention) = entry else {
+        let error = ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "CALL remove_orphan_files is not supported. Use ALTER TABLE EXECUTE remove_orphan_files",
+        )
+        .with_public_failure_detail();
+        return Err(source_terminal(error, None, false));
+    };
     *start = Some(ConnectorCleanupAsyncStart {
         table: RequestScopedMaintenanceEngine::target_identity(target)?,
         expected_object: guarded_object.take().ok_or_else(|| {

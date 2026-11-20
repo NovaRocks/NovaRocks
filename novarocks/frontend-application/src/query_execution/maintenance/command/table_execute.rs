@@ -247,7 +247,7 @@ impl MaintenanceCommandExecutor {
                     &self.kernel,
                     target,
                     older_than_ms,
-                    retention,
+                    super::super::cleanup_action::CleanupEntry::TableExecute(retention),
                     planning,
                     execution,
                     connector,
