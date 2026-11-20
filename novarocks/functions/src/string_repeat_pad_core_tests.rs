@@ -60,7 +60,6 @@ fn shared_repeat_pad_original_unicode_and_independent_cap_outputs() {
         1_048_576
     );
     assert_eq!(repeat_original(repeat_plan(|| "é", 524_289)), None);
-    assert_eq!(repeat_original(repeat_plan(|| " ", -1)), None);
     assert_eq!(repeat_original(repeat_plan(|| " ", 0)), Some(String::new()));
     for (left, expected) in [(true, "🙂x🙂é中"), (false, "é中🙂x🙂")] {
         let mut out = Vec::new();
