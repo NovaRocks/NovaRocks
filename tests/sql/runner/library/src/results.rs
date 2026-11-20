@@ -667,11 +667,14 @@ pub fn step_has_implicit_skip_result(step: &SqlStep) -> bool {
     let Some(statement) = statements.last() else {
         return false;
     };
-    // OPTIMIZE returns metric rows. Other known command completions
+    // Procedures with metric rows require typed goldens. Other known commands
     // retain their implicit skip even if comments precede the statement.
     use novarocks_parser::ast::TrinoStatement::*;
     match novarocks_parser::parser::parse_statement(statement) {
-        Ok(TableExecute(value)) => !value.procedure_name.value.eq_ignore_ascii_case("optimize"),
+        Ok(TableExecute(value)) => {
+            let name = &value.procedure_name.value;
+            !name.eq_ignore_ascii_case("optimize") && !name.eq_ignore_ascii_case("add_files")
+        }
         Ok(
             CreateCatalog(_)
             | DropCatalog(_)
@@ -897,6 +900,7 @@ mod implicit_skip_result_tests {
             "USE x; WITH t AS (SELECT 1) SELECT * FROM t;",
             "USE x; SHOW TABLES;",
             "ALTER TABLE t EXECUTE optimize;",
+            "ALTER TABLE t EXECUTE ADD_FILES(location => 's3://bucket/source', format => 'PARQUET');",
             "USE x; ALTER TABLE \"qualified\".\"table\" EXECUTE optimize;",
         ] {
             let step = step(sql);
