@@ -95,6 +95,7 @@ pub(super) struct StandaloneScalarStorage<'emission> {
     pub(super) brand: &'emission super::super::unit_source::StandaloneSourceBrand,
     pub(super) draft: &'emission mut novarocks_expression_contract::BoundExprSetBuilder,
     pub(super) events: &'emission mut Vec<ExprId>,
+    pub(super) value_types: &'emission BTreeMap<ValueId, ValueType>,
 }
 
 pub(super) enum ScalarStorage<'emission> {
@@ -120,7 +121,7 @@ impl ScalarStorage<'_> {
     pub(super) fn current_value_type(&self, value: ValueId) -> Option<&ValueType> {
         match self {
             Self::Node(storage) => storage.current_value_type(value),
-            Self::Standalone(_) => None,
+            Self::Standalone(storage) => storage.value_types.get(&value),
         }
     }
     pub(super) fn type_editor(
@@ -297,9 +298,8 @@ impl ScalarEmission<'_, '_> {
         value: ValueId,
     ) -> Result<Option<ExprId>, ContractLoweringError> {
         let ScalarStorage::Node(storage) = &self.storage else {
-            return Err(ContractLoweringError::InvalidFunctionBinding {
-                detail: "standalone scalar unit cannot read an input value".into(),
-            });
+            // Standalone inputs are caller-declared values and have no local definition.
+            return Ok(None);
         };
         let owner = storage.node;
         let fragment = &*storage.fragment;

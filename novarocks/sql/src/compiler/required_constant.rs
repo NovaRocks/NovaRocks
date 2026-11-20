@@ -72,6 +72,36 @@ pub struct RequiredConstantRequest<'a> {
     pub control: &'a SqlCompileControl,
 }
 
+/// One explicit input visible to standalone scalar analysis.
+#[cfg(novarocks_dev_controls)]
+pub struct SqlStandaloneScalarColumn<'a> {
+    pub name: &'a str,
+    pub value: novarocks_expression_contract::ValueId,
+    pub value_type: FunctionValueType,
+}
+
+/// The statement services and ordered layout for the development scalar entry.
+#[cfg(novarocks_dev_controls)]
+pub struct SqlStandaloneScalarRequest<'a> {
+    pub text: &'a str,
+    pub columns: &'a [SqlStandaloneScalarColumn<'a>],
+    pub catalog: &'a dyn SqlCatalogSnapshot,
+    pub current_database: &'a str,
+    pub functions: Arc<dyn SqlFunctionCatalog>,
+    pub sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
+    pub sql_semantics: &'a crate::sql_mode::SqlSemanticSettings,
+    pub constant_policy: ConstantPolicy,
+    pub control: &'a SqlCompileControl,
+}
+
+/// Analyze and lower one standalone development expression on its declared layout.
+#[cfg(novarocks_dev_controls)]
+pub fn author_standalone_scalar_for_test(
+    request: SqlStandaloneScalarRequest<'_>,
+) -> Result<SqlAuthoredScalarUnit, SqlCompileError> {
+    crate::analyzer::constant_expression::author_standalone(request)
+}
+
 /// The actual completed scalar unit and its original immutable SQL environment.
 /// The private producer retains its original source identity and journal.
 /// This source is not a plan, a fragment, or a resource grant.

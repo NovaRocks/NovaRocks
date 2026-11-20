@@ -39,6 +39,10 @@ pub use required_constant::{
     PreparedRequiredConstant, RequiredConstantInput, RequiredConstantRequest,
     RequiredConstantTarget, SqlAuthoredScalarUnit, prepare_required_constant,
 };
+#[cfg(novarocks_dev_controls)]
+pub use required_constant::{
+    SqlStandaloneScalarColumn, SqlStandaloneScalarRequest, author_standalone_scalar_for_test,
+};
 
 mod captured_catalog;
 mod dml_catalog;

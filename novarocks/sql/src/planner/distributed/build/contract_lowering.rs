@@ -30,6 +30,8 @@ mod neutral_requests;
 mod nullable_transaction;
 mod scalar_emission;
 mod standalone_scalar;
+#[cfg(novarocks_dev_controls)]
+pub(crate) use standalone_scalar::lower_standalone_scalar_unit;
 pub(crate) use standalone_scalar::{StandaloneScalarEmission, lower_required_constant_unit};
 mod scalar_nullability;
 mod unit_authorship;
