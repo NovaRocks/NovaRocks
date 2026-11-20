@@ -819,11 +819,23 @@ impl ActualStatisticsRun {
         drop(self.custody.take());
         drop(self.binding.take());
         drop(self.cohort.take());
-        drive_typed(&mut self.typed.as_mut().unwrap().driver);
-        assert!(
-            self.typed.as_ref().unwrap().retired.is_reclaimed().unwrap(),
-            "the original stage retires independently of the retained domain output"
-        );
+        // The role receipt can be visible before its last backing reference
+        // exits. Observe the exact stage reset under the same exit deadline.
+        let typed = self.typed.as_mut().unwrap();
+        tokio::time::timeout_at(exit_until.into(), async {
+            loop {
+                let progress = typed.driver.step();
+                if typed.retired.is_reclaimed().unwrap() {
+                    break;
+                }
+                if let joint::JointProgress::Idle(revision) = progress {
+                    typed.progress.wait_state_change(revision).await;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the original stage retires independently of the retained domain output");
         if case.is_success() {
             assert_eq!(
                 self.artifact_body.as_ref().unwrap().as_ref(),
