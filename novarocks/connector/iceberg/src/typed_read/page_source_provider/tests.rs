@@ -343,6 +343,91 @@ fn a_stream_promoted_from_a_prepared_split_counts_its_input_from_creation() {
 }
 
 #[test]
+fn a_frozen_byte_target_sizes_cold_and_prepared_reads_identically() {
+    use novarocks_spi::connector::read_stack::adapter::ProviderReadPageSourceProvider;
+    use novarocks_spi::connector::read_stack::{Assignment, ConnectorValueType};
+
+    let (runtime, _directory, fixture, file_size) = staged_small_file();
+    let provider = IcebergPageSourceProvider::new(
+        fixture.access_binding.clone(),
+        fixture.context.clone(),
+        fixture.options.clone(),
+    );
+    let provider: &dyn ProviderReadPageSourceProvider<IcebergExecutionReadRuntime> = &provider;
+    let session = ConnectorSession::try_new(
+        "q-1",
+        "test",
+        "UTC",
+        "en_US",
+        std::time::SystemTime::UNIX_EPOCH,
+    )
+    .expect("session");
+    let mut execution = IcebergReadExecution::default();
+    execution.sizing.max_read_bytes = 0;
+    let table = IcebergRuntimeRelation::Table(fixture.table.clone());
+    let split = IcebergReadSplit::Data(fixture.split.clone());
+    let columns = [Assignment::try_new(
+        "v_id",
+        fixture.columns[0].clone(),
+        ConnectorValueType::BigInt,
+    )
+    .expect("assignment")];
+    drop(fixture);
+    let filter: Arc<dyn DynamicFilter<IcebergColumnHandle>> =
+        Arc::new(CompleteAllDynamicFilter::new(Default::default()));
+    let assert_output = |stream, budget| {
+        let mut source = DrivenStream::new(&runtime, stream, budget);
+        for expected_id in 1..=3 {
+            let page = source.next_page().expect("read page").expect("one row");
+            assert_eq!(ids_of(page), vec![expected_id]);
+        }
+        assert!(source.next_page().expect("end of stream").is_none());
+        source.close().expect("close stream");
+    };
+
+    let budget = ConnectorPollBudget::new();
+    let stream = provider
+        .create_page_stream(
+            &session,
+            &table,
+            Some(&execution),
+            &split,
+            0,
+            &columns,
+            &filter,
+            &budget,
+        )
+        .expect("cold stream");
+    assert_output(stream, budget);
+
+    let ProviderPreparationStart::Prepared(mut prepared) = provider
+        .prepare_page_source(
+            &session,
+            &table,
+            Some(&execution),
+            &split,
+            0,
+            &columns,
+            &filter,
+        )
+        .expect("prepare the same split")
+    else {
+        panic!("the Parquet split must support preparation");
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while prepared.advance(file_size).expect("advance preparation")
+        != ConnectorPreparationProgress::Ready
+    {
+        assert!(Instant::now() < deadline, "preparation did not finish");
+        std::thread::yield_now();
+    }
+    assert_eq!(prepared.retained_input_bytes(), file_size);
+    let budget = ConnectorPollBudget::new();
+    let stream = prepared.promote(&filter, &budget).expect("prepared stream");
+    assert_output(stream, budget);
+}
+
+#[test]
 fn the_provider_streams_a_data_split_and_refuses_a_pair_it_cannot_read() {
     use futures::StreamExt;
     use novarocks_spi::connector::read_stack::adapter::ProviderReadPageSourceProvider;

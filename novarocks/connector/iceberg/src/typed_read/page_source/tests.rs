@@ -1284,10 +1284,15 @@ fn the_partition_only_fast_path_never_opens_the_data_file() {
     let schema = iceberg_schema();
     let handle = table_handle(&schema, true);
     let records = (2 * ROWS_PER_GROUP) as i64;
+    let region_value = "x".repeat(400 * 1024);
     let split = build_split(
         "s3://bucket/this/file/does/not/exist.parquet",
         SplitOptions {
-            partition_data_json: r#"{"version":1,"values":[{"string":"emea"}]}"#.to_owned(),
+            partition_data_json: serde_json::json!({
+                "version": 1,
+                "values": [{ "string": region_value }]
+            })
+            .to_string(),
             ..SplitOptions::whole_file(harness.file_size, records)
         },
     );
@@ -1306,8 +1311,10 @@ fn the_partition_only_fast_path_never_opens_the_data_file() {
             .as_any()
             .downcast_ref::<StringArray>()
             .expect("utf8 constant");
+        // Two full constants fit the construction target, but three do not.
+        assert_eq!(page.position_count(), 2);
         for row in 0..regions.len() {
-            assert_eq!(regions.value(row), "emea");
+            assert_eq!(regions.value(row), region_value);
         }
         positions += page.position_count();
     }

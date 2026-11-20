@@ -435,6 +435,41 @@ fn complete_table_preserves_reordered_repeated_columns_variables_predicates_and_
     assert_unchanged(&frozen);
 }
 
+#[test]
+fn the_frozen_read_recipe_distinguishes_zero_bytes_from_an_absent_target() {
+    use prost::Message;
+
+    let fixture = Fixture::table();
+    let mut execution = crate::typed_read::runtime::IcebergReadExecution::default();
+    execution.sizing.max_read_bytes = 0;
+    let codec = crate::wire::read::IcebergReadWireCodec;
+    let encoded = codec
+        .encode_read_table(&fixture.relation, execution)
+        .unwrap();
+    let frozen = fixture.build_modified(None, Some(encoded.clone()), None);
+    assert_unchanged(&frozen);
+
+    let mut payload = crate::wire::dto::IcebergReadTablePayload::decode(encoded).unwrap();
+    let settings = payload.execution.as_mut().unwrap();
+    assert_eq!(settings.max_read_bytes, Some(0));
+    settings.max_read_bytes = None;
+    let absent = fixture.build_modified(None, Some(payload.encode_to_vec().into()), None);
+    let error = ConnectorReadProgramRecipe::try_compile_with_provider(
+        &absent,
+        &IcebergReadRecipeCompiler,
+        &Control::accept(),
+    )
+    .unwrap_err();
+    let ConnectorReadProgramCompileError::Provider(error) = error else {
+        panic!("expected a provider payload error, got {error:?}");
+    };
+    assert_eq!(error.kind(), &ConnectorCodecErrorKind::MissingField);
+    assert_eq!(
+        error.path().to_string(),
+        "iceberg_read_table.execution.max_read_bytes"
+    );
+}
+
 fn system_fixture(kind: IcebergSystemTableType) -> Fixture {
     let schema = partitioned_schema();
     let specs = vec![PartitionSpec::unpartition_spec()];

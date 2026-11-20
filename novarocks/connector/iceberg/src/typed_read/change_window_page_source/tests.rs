@@ -86,14 +86,14 @@ fn arrow_file_schema() -> Arc<ArrowSchema> {
 }
 
 /// One Parquet data file whose rows are `ids`, at positions `0..ids.len()`.
-fn write_data_file(path: &Path, ids: &[i64]) -> u64 {
+fn write_data_file(path: &Path, ids: &[i64], region: impl FnMut(i64) -> String) -> u64 {
     let schema = arrow_file_schema();
     let batch = RecordBatch::try_new(
         Arc::clone(&schema),
         vec![
             Arc::new(Int64Array::from(ids.to_vec())),
             Arc::new(StringArray::from(
-                ids.iter().map(|id| format!("r{id}")).collect::<Vec<_>>(),
+                ids.iter().copied().map(region).collect::<Vec<_>>(),
             )),
         ],
     )
@@ -242,6 +242,10 @@ struct Fixture {
 impl Fixture {
     /// A fixture whose one data file holds `ids` at positions `0..n`.
     fn new(ids: &[i64]) -> Self {
+        Self::with_regions(ids, |id| format!("r{id}"))
+    }
+
+    fn with_regions(ids: &[i64], region: impl FnMut(i64) -> String) -> Self {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
         let file_runtime: Arc<dyn FileIoRuntime> =
             Arc::new(TokioFileIoRuntime::new(runtime.handle().clone()));
@@ -264,7 +268,7 @@ impl Fixture {
         };
         let directory = tempfile::tempdir().expect("temporary directory");
         let data_path = directory.path().join("data.parquet");
-        let data_file_size = write_data_file(&data_path, ids);
+        let data_file_size = write_data_file(&data_path, ids, region);
         Self {
             _runtime: runtime,
             directory,
@@ -482,6 +486,47 @@ fn added_rows_emit_every_row_that_survives_at_the_upper_endpoint_with_a_plus_one
         .page_source(&handle, &split, &id_and_change_op(&schema))
         .expect("page source");
     assert_eq!(drain(&mut source), vec![(10, 1), (11, 1), (12, 1)]);
+}
+
+#[test]
+fn the_change_sign_can_shorten_the_complete_output_prefix() {
+    // Two strings plus the three offsets use the full construction target.
+    let region_bytes = (1024 * 1024 - 3 * size_of::<i32>()) / 2;
+    let regions = ["x".repeat(region_bytes), "y".repeat(region_bytes)];
+    let fixture = Fixture::with_regions(&[0, 1], |id| regions[id as usize].clone());
+    let schema = iceberg_schema();
+    let handle = change_window_handle(&schema);
+    let split = IcebergChangeSplit::AddedRows(
+        IcebergAddedRows::try_new(fixture.data_split(Vec::new()), Vec::new()).expect("added rows"),
+    );
+    let region = IcebergColumnHandle::base_column_of(&schema, 2).expect("region");
+
+    let mut unsigned = fixture
+        .page_source(&handle, &split, std::slice::from_ref(&region))
+        .expect("unsigned page source");
+    let page = unsigned.next_page().expect("page").expect("two rows");
+    assert_eq!(page.position_count(), 2);
+    assert!(unsigned.next_page().expect("end of stream").is_none());
+    unsigned.close().expect("close unsigned source");
+
+    let mut signed = fixture
+        .page_source(
+            &handle,
+            &split,
+            &[region, change_op_column_handle().expect("change op")],
+        )
+        .expect("signed page source");
+    for expected in &regions {
+        let page = signed.next_page().expect("page").expect("one row");
+        let (rows, columns) = page.into_columns().expect("materialize page");
+        assert_eq!(rows, 1);
+        let regions = columns[0].as_any().downcast_ref::<StringArray>().unwrap();
+        let signs = columns[1].as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(regions.value(0), expected);
+        assert_eq!(signs.value(0), 1);
+    }
+    assert!(signed.next_page().expect("end of stream").is_none());
+    signed.close().expect("close signed source");
 }
 
 #[test]

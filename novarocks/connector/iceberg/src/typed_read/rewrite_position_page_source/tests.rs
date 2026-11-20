@@ -71,16 +71,20 @@ impl RewriteFixture {
     }
 }
 
-/// Two selected deletion vectors of one data file, in one Puffin file:
-/// positions {1, 4} and {4, 9}.
-fn rewrite_fixture() -> RewriteFixture {
+/// Two selected deletion vectors of one data file in one Puffin file.
+fn rewrite_fixture(
+    data_file_path: Option<String>,
+    extra_positions: impl IntoIterator<Item = u64>,
+) -> RewriteFixture {
     let directory = tempfile::tempdir().expect("temporary directory");
     let delete_path = directory.path().join("deletes.puffin");
-    let data_file_path = directory
-        .path()
-        .join("data.parquet")
-        .to_string_lossy()
-        .to_string();
+    let data_file_path = data_file_path.unwrap_or_else(|| {
+        directory
+            .path()
+            .join("data.parquet")
+            .to_string_lossy()
+            .to_string()
+    });
 
     let mut first = DeletionVector::new();
     first.insert(1).expect("position");
@@ -88,6 +92,9 @@ fn rewrite_fixture() -> RewriteFixture {
     let mut second = DeletionVector::new();
     second.insert(4).expect("position");
     second.insert(9).expect("position");
+    for position in extra_positions {
+        second.insert(position).expect("position");
+    }
     let first_payload = first.to_iceberg_payload().expect("first payload");
     let second_payload = second.to_iceberg_payload().expect("second payload");
     let mut payloads = first_payload.clone();
@@ -95,14 +102,14 @@ fn rewrite_fixture() -> RewriteFixture {
     fs::write(&delete_path, &payloads).expect("write deletion vectors");
 
     let delete_path = delete_path.to_string_lossy().to_string();
-    let delete = |offset: usize, payload: &[u8]| {
+    let delete = |offset: usize, payload: &[u8], record_count| {
         IcebergDeleteFile::try_new(IcebergDeleteFileParams {
             partition_spec_id: 0,
             partition_data_json: r#"{"version":1,"values":[]}"#.to_string(),
             content: IcebergDeleteFileContent::PositionDeletes,
             path: delete_path.clone(),
             format: IcebergFileFormat::Puffin,
-            record_count: 2,
+            record_count,
             file_size_in_bytes: payloads.len() as i64,
             equality_field_ids: Vec::new(),
             row_position_lower_bound: None,
@@ -122,8 +129,12 @@ fn rewrite_fixture() -> RewriteFixture {
             partition_spec_id: 0,
             partition_data_json: r#"{"version":1,"values":[]}"#.to_string(),
             selected_position_deletes: vec![
-                delete(0, &first_payload),
-                delete(first_payload.len(), &second_payload),
+                delete(0, &first_payload, first.cardinality() as i64),
+                delete(
+                    first_payload.len(),
+                    &second_payload,
+                    second.cardinality() as i64,
+                ),
             ],
             split_weight: SplitWeight::STANDARD,
         },
@@ -189,21 +200,23 @@ fn rows_of(page: SourcePage) -> Vec<(String, i64)> {
 
 #[test]
 fn a_rewrite_stream_reads_selected_vectors_and_emits_canonical_output_columns() {
-    let fixture = rewrite_fixture();
+    // Repeating a 4 KiB path and its offsets makes the 256th row exceed
+    // the output construction target.
+    let stem = "x".repeat(4096 - "s3://bucket/.parquet".len());
+    let fixture = rewrite_fixture(Some(format!("s3://bucket/{stem}.parquet")), 10..=263);
     let budget = ConnectorPollBudget::new();
     let stream =
         create_iceberg_rewrite_position_delete_files_page_stream(fixture.request(), &budget)
             .expect("page stream");
     let mut source = DrivenStream::new(&fixture.runtime, stream, budget);
-    let page = source
-        .next_page()
-        .expect("read page")
-        .expect("one output page");
-    let path = fixture.data_file_path.clone();
-    assert_eq!(
-        rows_of(page),
-        vec![(path.clone(), 1), (path.clone(), 4), (path, 9)]
-    );
+    let positions = [1, 4].into_iter().chain(9..=263).collect::<Vec<_>>();
+    for expected in positions.chunks(255) {
+        let page = source.next_page().expect("read page").expect("output page");
+        assert_eq!(page.position_count(), expected.len());
+        let rows = rows_of(page);
+        assert!(rows.iter().all(|(path, _)| path == &fixture.data_file_path));
+        assert!(rows.iter().map(|(_, position)| position).eq(expected));
+    }
     assert!(source.next_page().expect("finish the stream").is_none());
     assert!(source.is_finished());
     source.close().expect("close the drained stream");
@@ -213,7 +226,7 @@ fn a_rewrite_stream_reads_selected_vectors_and_emits_canonical_output_columns() 
 fn a_rewrite_stream_reads_nothing_until_polled_and_then_emits_the_merged_positions() {
     use futures::StreamExt;
 
-    let mut fixture = rewrite_fixture();
+    let mut fixture = rewrite_fixture(None, []);
     let (spawner, _task_operations) = fixture.gate_reads();
     let budget = ConnectorPollBudget::new();
     let mut stream =
@@ -249,7 +262,7 @@ fn a_rewrite_stream_reads_nothing_until_polled_and_then_emits_the_merged_positio
 fn closing_a_loading_rewrite_stream_stops_its_read_and_waits_for_its_exit() {
     use futures::StreamExt;
 
-    let mut fixture = rewrite_fixture();
+    let mut fixture = rewrite_fixture(None, []);
     let (spawner, task_operations) = fixture.gate_reads();
     let budget = ConnectorPollBudget::new();
     budget.refill(1024);

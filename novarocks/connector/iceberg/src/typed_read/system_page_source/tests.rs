@@ -74,6 +74,43 @@ fn provider(binding: &IcebergReadBinding, context: &FileReadContext) -> IcebergS
     )
 }
 
+#[test]
+fn metadata_pages_follow_the_engine_row_limit_and_keep_order() {
+    let (_runtime, _binding, context) = runtime_and_binding();
+    let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+        "id",
+        DataType::Int64,
+        false,
+    )]));
+    let max_rows = novarocks_spi::connector::ENGINE_OUTPUT_POLICY
+        .max_rows
+        .get() as usize;
+    let row_count = max_rows + 1;
+    let ids = Arc::new(Int64Array::from_iter_values(0..row_count as i64));
+    let mut source = IcebergSystemPageSource::new(
+        &schema,
+        vec![ids],
+        &[0],
+        row_count,
+        NonZeroUsize::new(max_rows).expect("nonzero engine row limit"),
+        0,
+        &context,
+    )
+    .expect("metadata source");
+    let first = source.next_page().expect("page").expect("first page");
+    assert_eq!(first.position_count(), max_rows);
+    let tail = source.next_page().expect("page").expect("last row");
+    assert_eq!(tail.position_count(), 1);
+    let rows = [first, tail].into_iter().flat_map(|page| {
+        let (_, columns) = page.into_columns().expect("materialize page");
+        let ids = columns[0].as_any().downcast_ref::<Int64Array>().unwrap();
+        ids.values().to_vec()
+    });
+    assert!(rows.eq(0..row_count as i64));
+    assert_eq!(source.metrics().completed_positions, row_count as u64);
+    assert!(source.next_page().expect("end of metadata").is_none());
+}
+
 // -- pure schema fixtures, no I/O -------------------------------------
 
 fn test_schema() -> Schema {
