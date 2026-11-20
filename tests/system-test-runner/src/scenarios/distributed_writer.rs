@@ -3504,10 +3504,32 @@ fn verify_grant_only_writer_stop(
             seen.contains_key("event=parked_dispatch_stopped")
                 && !seen.contains_key("event=dispatch_unparked")
                 && !seen.contains_key("event=deliver_started")
-                && !seen.contains_key("event=stop_started")
                 && seen.get("event=demand_started") == Some(&register_count)
-                && seen.get("event=demand_exited") == Some(&register_count),
-            "a new unary or missing actual stop overlapped the original subscriber: {seen:?}"
+                && seen.get("event=demand_exited") == Some(&register_count)
+                && seen.get("event=stop_started") == seen.get("event=stop_exited"),
+            "the held subscriber delivered Data, reopened Demand, or left active cleanup: {seen:?}"
+        );
+        // The root's failed Task supplies the FE snapshot above. Worker emits
+        // these retained terminals and the acknowledgement of the actual Abort.
+        let root_terminal = format!(
+            "{} execution_id={} stage={} task={} backend={} state=FAILED",
+            novarocks_failpoint::observation_marker::TASK_TERMINAL_RETAINED,
+            sender.field("execution_id"),
+            sender.field("destination_stage"),
+            sender.field("destination_task"),
+            sender.field("destination"),
+        );
+        let root_backend = (0..context.handle().be_count())
+            .find_map(|index| match context.handle().backend_process_id(index) {
+                Ok(process) if process == identity.backend_process_id() => Some(Ok(index)),
+                Ok(_) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .context("the original root BE must still be available")??;
+        let root_log = context.handle().be_current_log_contents(root_backend)?;
+        anyhow::ensure!(
+            root_log.contains(&root_terminal),
+            "the receiver must retain its own failure: {root_terminal}"
         );
         let terminal = format!(
             "{} execution_id={} stage={} task={} backend={} state=ABORTED",
@@ -3522,11 +3544,18 @@ fn verify_grant_only_writer_stop(
             sender.field("execution_id")
         );
         let sender_log = context.handle().be_current_log_contents(sender.backend)?;
+        let (abort_line, abort_pos) = sender_log
+            .match_indices(&abort)
+            .find_map(|(pos, _)| {
+                let line = sender_log[pos..].lines().next()?;
+                line.ends_with(&format!(" backend={}", sender.field("source")))
+                    .then_some((line, pos))
+            })
+            .context("the held sender must acknowledge the FE's original Abort")?;
         anyhow::ensure!(
             sender_log
-                .find(&abort)
-                .zip(sender_log.find(&terminal))
-                .is_some_and(|(control, exit)| control < exit),
+                .find(&terminal)
+                .is_some_and(|exit| abort_pos < exit),
             "the original FE Abort and actual retained sender termination must both occur: {terminal}"
         );
         assert_commit_never_invoked(
@@ -3542,8 +3571,9 @@ fn verify_grant_only_writer_stop(
                 "sender_backend_index": sender.backend,
                 "register_calls_settled_at_release": register_count,
                 "held_sender_events": seen,
-                "worker_abort": abort,
+                "worker_abort": abort_line,
                 "sender_terminal_after_abort": terminal,
+                "root_terminal": root_terminal,
                 "accepted_root_task": identity.to_string(),
                 "accepted_connector_reason": expected.reason().code(),
             }))?,
