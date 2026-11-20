@@ -138,3 +138,5 @@ fn compiled_filter_factory_accepts_only_an_owned_predicate_site() {
         );
     }
 }
+
+mod table_function;

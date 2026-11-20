@@ -58,11 +58,11 @@ use novarocks_type_contract::{
 
 use novarocks_types::UniqueId;
 
-use super::aggregate_fixture::{
+use super::super::aggregate_fixture::{
     LoopbackTransmitter, destination, edge, hash, receive, register, result_sink, stream_sink,
     try_compile, try_run_in_fixture,
 };
-use super::family_fixture::{FixtureControl, constant_policy, int64, int64_rows};
+use super::super::family_fixture::{FixtureControl, constant_policy, int64, int64_rows};
 use crate::exec::chunk::Chunk;
 use crate::exec::operators::{ResultSinkBuffer, ResultSinkFactory};
 use crate::exec::pipeline::binding::ExchangeBindings;
@@ -498,7 +498,7 @@ fn finish(
     source_pools: &ConstantPools,
     parameters: &SemanticParameters,
 ) -> crate::exec::operators::family_fixture::constant_sources::Fragment {
-    super::family_fixture::seal_no_call_units(&mut builder);
+    super::super::family_fixture::seal_no_call_units(&mut builder);
     let fragment = builder
         .finish_structure(
             root,
@@ -515,7 +515,7 @@ fn finish(
         .unwrap();
     let (fragment, constants) = fragment.into_parts();
     let mut evaluation_pools = source_pools.clone();
-    super::family_fixture::constant_sources::merge(&mut evaluation_pools, &constants);
+    super::super::family_fixture::constant_sources::merge(&mut evaluation_pools, &constants);
     let entries = sources
         .iter()
         .map(|(&node, source)| {
@@ -1290,7 +1290,7 @@ fn compiled_table_schema_prepare_and_output_last_reference_use_real_owner() {
     drop(missing);
     let tracker = MemTracker::new_root("table actual schema and output creator");
     let mut operator = factory.create(1, 0);
-    operator.set_construction_factory(super::aggregate_fixture::runtime_construction_factory(
+    operator.set_construction_factory(super::super::aggregate_fixture::runtime_construction_factory(
         tracker.clone(),
         Arc::new(RuntimeErrorState::default()),
     ));
@@ -1415,7 +1415,7 @@ fn compiled_table_prepare_preserves_real_memory_refusal_before_input() {
     .unwrap();
     let tracker = MemTracker::new_root("table actual prepare refusal");
     let mut operator = factory.create(1, 0);
-    operator.set_construction_factory(super::aggregate_fixture::runtime_construction_factory(
+    operator.set_construction_factory(super::super::aggregate_fixture::runtime_construction_factory(
         tracker.clone(),
         Arc::new(RuntimeErrorState::default()),
     ));

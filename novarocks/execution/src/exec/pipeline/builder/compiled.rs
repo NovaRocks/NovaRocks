@@ -1657,7 +1657,6 @@ mod join_pipelines;
 mod set_op_pipelines;
 
 #[cfg(test)]
-#[path = "compiled_tests.rs"]
 mod tests;
 
 #[cfg(test)]
@@ -1720,9 +1719,6 @@ pub(crate) use runtime_filter_tests::ordered_scan_with_numeric_membership_fixtur
 #[path = "compiled_runtime_filter_compile_tests.rs"]
 mod runtime_filter_compile_tests;
 
-#[cfg(test)]
-#[path = "compiled_table_function_tests.rs"]
-mod compiled_table_function_tests;
 
 #[cfg(test)]
 #[path = "compiled_window_fixture.rs"]
