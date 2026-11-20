@@ -18,6 +18,8 @@
 //! The operation owns physical objects through publication and actual cleanup.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::mem::size_of;
+use std::ops::Range;
 use std::sync::Arc;
 
 use super::{AttemptToken, ObjectIdentity, OperationToken, invalid};
@@ -25,6 +27,11 @@ use super::{ManifestReuseBasis, ManifestRewriteReuse};
 use crate::iceberg::Result;
 use crate::iceberg::io::FileIO;
 use crate::iceberg::spec::{ManifestFile, TableMetadata};
+use novarocks_spi::connector::{
+    ConnectorError, ConnectorErrorKind, ConnectorPayloadRetentionGuard,
+};
+
+use crate::commit::new_manifests::RegisteredPaths;
 
 /// A received object's explicit publication contract.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -135,6 +142,24 @@ pub trait ArtifactWriter: Send + Sync {
         existing_paths: &[String],
         replaces: &[String],
     ) -> Result<()>;
+    fn registered_manifest_paths(&self, _snapshot_id: i64) -> Result<Option<Arc<RegisteredPaths>>> {
+        Ok(None)
+    }
+    fn observe_registered_manifest(
+        &self,
+        _snapshot_id: i64,
+        _replaces: &[String],
+    ) -> Result<Option<RegisteredManifestObservation>> {
+        Ok(None)
+    }
+    fn record_registered_manifest(
+        &self,
+        _object: &ObjectIdentity,
+        _observation: RegisteredManifestObservation,
+        _replaces: &[String],
+    ) -> Result<()> {
+        Err(invariant("Manifest writer does not own a registered stage"))
+    }
     fn record_manifest_list(
         &self,
         object: &ObjectIdentity,
@@ -164,6 +189,9 @@ pub struct ArtifactRecord {
     pub covers: BTreeSet<ObjectIdentity>,
     pub added_entries: usize,
     pub resolved_added_entries: usize,
+    // Direct rolling outputs cover a consecutive slice of the immutable source
+    // sequence. The same fact is retained when a V1 output is reencoded.
+    registered_run: Option<Range<usize>>,
     pub list_snapshot_id: Option<i64>,
     pub replaces: Vec<String>,
     pub members: BTreeSet<ObjectIdentity>,
@@ -178,6 +206,7 @@ impl ArtifactRecord {
             covers: BTreeSet::new(),
             added_entries: 0,
             resolved_added_entries: 0,
+            registered_run: None,
             list_snapshot_id: None,
             replaces: Vec::new(),
             members: BTreeSet::new(),
@@ -192,6 +221,7 @@ impl ArtifactRecord {
             covers: BTreeSet::new(),
             added_entries: 0,
             resolved_added_entries: 0,
+            registered_run: None,
             list_snapshot_id: None,
             replaces: Vec::new(),
             members: BTreeSet::new(),
@@ -209,6 +239,95 @@ fn invariant(message: impl Into<String>) -> crate::iceberg::Error {
     )
 }
 
+fn registration_size_error(message: impl Into<String>) -> crate::iceberg::Error {
+    let message = message.into();
+    crate::iceberg::Error::new(crate::iceberg::ErrorKind::Unexpected, message.clone()).with_source(
+        ConnectorError::new(ConnectorErrorKind::ResourceExhausted, message),
+    )
+}
+
+struct RegisteredStage {
+    stage: usize,
+    paths: Option<Arc<RegisteredPaths>>,
+    snapshot: Option<i64>,
+}
+
+impl std::fmt::Debug for RegisteredStage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegisteredStage")
+            .field("stage", &self.stage)
+            .field("snapshot", &self.snapshot)
+            .field("paths", &self.paths.as_ref().map(|paths| paths.len()))
+            .finish()
+    }
+}
+
+// Collect path evidence using source positions. The writer can borrow a
+// DataFile path to check its identity before moving the file into the SDK.
+pub struct RegisteredManifestObservation {
+    paths: Arc<RegisteredPaths>,
+    snapshot: i64,
+    runs: Vec<Range<usize>>,
+    replaced: bool,
+    run_index: usize,
+    cursor: Option<usize>,
+    start: Option<usize>,
+    added: usize,
+    _run_backing: Option<ConnectorPayloadRetentionGuard>,
+}
+
+impl RegisteredManifestObservation {
+    pub(crate) fn push_added(&mut self, actual: &str) -> Result<()> {
+        let expected = match self.cursor {
+            Some(ordinal) => ordinal,
+            None if !self.replaced => self.paths.index(actual).ok_or_else(|| {
+                invariant("Manifest added a file outside its Iceberg registration")
+            })?,
+            None => {
+                return Err(invariant(
+                    "Manifest replaced fewer Iceberg registered files than it added",
+                ));
+            }
+        };
+        if self.paths.get(expected) != Some(actual) {
+            return Err(invariant(
+                "Manifest changed the Iceberg registered file sequence",
+            ));
+        }
+        let next = expected
+            .checked_add(1)
+            .ok_or_else(|| invariant("Iceberg registered file ordinal overflow"))?;
+        self.start.get_or_insert(expected);
+        self.added += 1;
+        self.cursor = if self.replaced && next == self.runs[self.run_index].end {
+            self.run_index += 1;
+            self.runs.get(self.run_index).map(|run| run.start)
+        } else {
+            Some(next)
+        };
+        Ok(())
+    }
+
+    fn finish(&self) -> Result<Option<Range<usize>>> {
+        if self.replaced && self.cursor.is_some() {
+            return Err(invariant("Manifest omitted an Iceberg registered file"));
+        }
+        if self.replaced && self.runs.len() != 1 {
+            // A merge can replace disjoint runs. The checked source order
+            // remains in the manifest replacements and needs no new path set.
+            return Ok(None);
+        }
+        self.start
+            .map(|start| {
+                start
+                    .checked_add(self.added)
+                    .map(|end| start..end)
+                    .ok_or_else(|| invariant("Iceberg registered manifest count overflow"))
+            })
+            .transpose()
+    }
+}
+
 #[derive(Debug)]
 pub struct ArtifactLedger {
     operation: OperationToken,
@@ -216,6 +335,7 @@ pub struct ArtifactLedger {
     registered_paths: BTreeSet<ObjectIdentity>,
     round_artifacts: BTreeMap<AttemptToken, Vec<ObjectIdentity>>,
     compact_received: Option<Arc<[ObjectIdentity]>>,
+    registration: Option<RegisteredStage>,
     written_stages: BTreeMap<i64, BTreeSet<ObjectIdentity>>,
 }
 impl ArtifactLedger {
@@ -226,6 +346,7 @@ impl ArtifactLedger {
             registered_paths: BTreeSet::new(),
             round_artifacts: BTreeMap::new(),
             compact_received: None,
+            registration: None,
             written_stages: BTreeMap::new(),
         }
     }
@@ -237,6 +358,21 @@ impl ArtifactLedger {
             && attempt.operation() != self.operation
         {
             return Err(invariant("Produced artifact belongs to another operation"));
+        }
+        if self.registration.is_some() && matches!(record.origin, ArtifactOrigin::Received { .. }) {
+            return Err(invariant(
+                "Registered Iceberg files and adopted writer objects cannot mix",
+            ));
+        }
+        if self
+            .registration
+            .as_ref()
+            .and_then(|stage| stage.paths.as_ref())
+            .is_some_and(|paths| paths.index(record.object.path()).is_some())
+        {
+            return Err(invariant(
+                "An Iceberg artifact cannot replace a registered external file",
+            ));
         }
         if !self.registered_paths.insert(record.object.clone()) {
             return Err(invariant(format!(
@@ -261,6 +397,193 @@ impl ArtifactLedger {
         for object in self.round_artifacts.remove(&attempt).into_iter().flatten() {
             self.retire(&object)?;
         }
+        Ok(())
+    }
+
+    pub(crate) fn install_registered_paths(
+        &mut self,
+        stage: usize,
+        paths: Arc<RegisteredPaths>,
+    ) -> Result<()> {
+        if self.registration.is_some() || !self.records.is_empty() {
+            return Err(invariant(
+                "Iceberg registered stage requires a fresh artifact ledger",
+            ));
+        }
+        self.registration = Some(RegisteredStage {
+            stage,
+            paths: Some(paths),
+            snapshot: None,
+        });
+        Ok(())
+    }
+
+    /// Release preparation-only aliases after the original attempt loop exits.
+    /// Recovery and cleanup continue to own the actual published artifacts.
+    pub(crate) fn take_registered_paths(&mut self) -> Option<Arc<RegisteredPaths>> {
+        self.registration.as_mut()?.paths.take()
+    }
+
+    pub(crate) fn registered_stage(&self) -> Option<usize> {
+        self.registration.as_ref().map(|stage| stage.stage)
+    }
+
+    pub(crate) fn registered_manifest_paths(
+        &self,
+        stage: usize,
+        snapshot: i64,
+    ) -> Result<Option<&Arc<RegisteredPaths>>> {
+        let Some(registration) = self
+            .registration
+            .as_ref()
+            .filter(|value| value.stage == stage)
+        else {
+            return Ok(None);
+        };
+        if registration.snapshot.is_some_and(|id| id != snapshot) {
+            return Err(invariant(
+                "Iceberg registered manifest changed its snapshot",
+            ));
+        }
+        registration
+            .paths
+            .as_ref()
+            .map(Some)
+            .ok_or_else(|| invariant("Iceberg registered preparation already exited"))
+    }
+
+    pub(crate) fn observe_registered_manifest(
+        &self,
+        stage: usize,
+        snapshot: i64,
+        replaces: &[String],
+    ) -> Result<Option<RegisteredManifestObservation>> {
+        let Some(paths) = self.registered_manifest_paths(stage, snapshot)? else {
+            return Ok(None);
+        };
+        let runs = replaces
+            .iter()
+            .filter_map(|path| self.records.get(path.as_str()))
+            .filter_map(|record| record.registered_run.as_ref());
+        let count = runs.clone().count();
+        let (mut expected, mut backing) = (Vec::new(), None);
+        if count != 0 {
+            let size = count
+                .checked_mul(size_of::<Range<usize>>())
+                .ok_or_else(|| {
+                    registration_size_error("Iceberg registered manifest run extent overflow")
+                })?;
+            backing = Some(paths.reserve(size, "Iceberg registered manifest source runs")?);
+            expected
+                .try_reserve_exact(count)
+                .map_err(|error| registration_size_error(error.to_string()))?;
+            expected.extend(runs.cloned());
+        }
+        Ok(Some(RegisteredManifestObservation {
+            paths: Arc::clone(paths),
+            snapshot,
+            cursor: expected.first().map(|run| run.start),
+            runs: expected,
+            replaced: !replaces.is_empty(),
+            run_index: 0,
+            start: None,
+            added: 0,
+            _run_backing: backing,
+        }))
+    }
+
+    pub(crate) fn record_registered_manifest(
+        &mut self,
+        object: &ObjectIdentity,
+        observation: RegisteredManifestObservation,
+        replaces: &[String],
+    ) -> Result<()> {
+        self.produced(object, ArtifactKind::Manifest)?;
+        let registration = self
+            .registration
+            .as_ref()
+            .ok_or_else(|| invariant("Missing Iceberg registered manifest source"))?;
+        if !registration
+            .paths
+            .as_ref()
+            .is_some_and(|paths| Arc::ptr_eq(paths, &observation.paths))
+            || registration
+                .snapshot
+                .is_some_and(|id| id != observation.snapshot)
+        {
+            return Err(invariant(
+                "Iceberg registered manifest observation lost its source",
+            ));
+        }
+        let range = observation.finish()?;
+        let record = self.records.get_mut(object).expect("checked manifest");
+        record.registered_run = range;
+        record.added_entries = observation.added;
+        record.resolved_added_entries = observation.added;
+        record.replaces = replaces.to_vec();
+        Ok(())
+    }
+
+    pub(crate) fn seal_registered_stage(
+        &mut self,
+        stage: usize,
+        snapshot: i64,
+        manifests: &[ManifestFile],
+        expected_entries: usize,
+    ) -> Result<()> {
+        let registration = self
+            .registration
+            .as_ref()
+            .filter(|registration| registration.stage == stage)
+            .ok_or_else(|| invariant("Iceberg registered manifest stage lost its input"))?;
+        let paths = registration
+            .paths
+            .as_ref()
+            .ok_or_else(|| invariant("Iceberg registered preparation already exited"))?;
+        if paths.len() != expected_entries || registration.snapshot.is_some_and(|id| id != snapshot)
+        {
+            return Err(invariant(
+                "Iceberg registered manifest stage changed its admitted source",
+            ));
+        }
+        let mut originals = BTreeSet::new();
+        let mut next = 0usize;
+        for descriptor in manifests {
+            let (object, record) = self
+                .records
+                .get_key_value(descriptor.manifest_path.as_str())
+                .ok_or_else(|| invariant("Missing newly written registered manifest"))?;
+            self.produced(object, ArtifactKind::Manifest)?;
+            if descriptor.added_snapshot_id != snapshot
+                || descriptor.added_files_count.map(|count| count as usize)
+                    != Some(record.added_entries)
+                || !originals.insert(object.clone())
+            {
+                return Err(invariant(
+                    "Iceberg registered manifest has unresolved or duplicate additions",
+                ));
+            }
+            let run = record
+                .registered_run
+                .as_ref()
+                .ok_or_else(|| invariant("Iceberg registered manifest has no source run"))?;
+            if run.start != next || run.len() != record.added_entries {
+                return Err(invariant(
+                    "Iceberg registered manifests changed the admitted file sequence",
+                ));
+            }
+            next = run.end;
+        }
+        if next != expected_entries {
+            return Err(invariant(
+                "Iceberg registered manifests do not cover the admitted file sequence",
+            ));
+        }
+        self.registration
+            .as_mut()
+            .expect("checked registration")
+            .snapshot = Some(snapshot);
+        self.written_stages.insert(snapshot, originals);
         Ok(())
     }
 
@@ -558,10 +881,19 @@ impl ArtifactLedger {
                 );
             }
         }
+        if observed_stages.len() != self.written_stages.len() {
+            return Err(invariant("Frozen request omits a compact snapshot stage"));
+        }
+        if self
+            .registration
+            .as_ref()
+            .is_some_and(|registration| registration.snapshot.is_none())
+        {
+            return Err(invariant(
+                "Frozen request omits unsealed Iceberg registered files",
+            ));
+        }
         if let Some(received) = &self.compact_received {
-            if observed_stages.len() != self.written_stages.len() {
-                return Err(invariant("Frozen request omits a compact snapshot stage"));
-            }
             return Ok(AttemptArtifacts {
                 attempt,
                 references: ArtifactReferences::new(Arc::clone(received), references),

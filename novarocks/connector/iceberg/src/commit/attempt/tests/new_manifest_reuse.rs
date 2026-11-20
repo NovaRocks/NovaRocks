@@ -180,3 +180,107 @@ async fn format_upgrade_reauthors_pending_v1_sequence_inheritance() {
         0
     );
 }
+
+#[tokio::test]
+async fn registered_manifests_preserve_source_and_snapshot_on_retry_and_v1_upgrade() {
+    use crate::commit::model::ArtifactWriter as _;
+    use crate::commit::new_manifests::tests::registered;
+    use crate::manifest::source::ManifestSource;
+
+    for version in [FormatVersion::V1, FormatVersion::V2] {
+        let fixture = registered::fixture();
+        let base = fixture.metadata(FormatVersion::V1);
+        let latest = base
+            .clone()
+            .into_builder(None)
+            .upgrade_format_version(version)
+            .unwrap()
+            .set_properties(HashMap::from([("concurrent".into(), "true".into())]))
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        let installed = registered::install(&fixture, &base, 3);
+        let intent = fixture
+            .intent(&base, "main", Vec::new())
+            .with_compact_stage(0)
+            .unwrap();
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let publisher =
+            ControlledPublisher::new(&fixture, base, Dispatch::ConflictThen(Box::new(latest)));
+        let report = crate::fs_io::TEST_STORAGE_REQUESTS
+            .scope(trace.clone(), async {
+                run(
+                    &fixture.operation,
+                    &intent,
+                    &PreparedChange::default(),
+                    &[&CompactFastAppendPreparer(fixture.operation.clone())],
+                    &publisher,
+                    policy(),
+                )
+                .await
+            })
+            .await;
+        assert!(
+            matches!(report.publication, PublicationOutcome::Committed(_)),
+            "{report:?}"
+        );
+        assert_eq!(installed.paid_files.load(Ordering::SeqCst), 0);
+        let metadata = publisher.metadata.lock().unwrap().clone();
+        let snapshot = metadata.current_snapshot().unwrap();
+        let reader = fixture.operation.begin_attempt().unwrap();
+        let list = crate::manifest::load_manifest_list(snapshot, reader.file_io(), &metadata)
+            .await
+            .unwrap();
+        let manifest = &list.entries()[0];
+        let source =
+            ManifestSource::committed(snapshot.snapshot_id(), snapshot.manifest_list(), manifest);
+        let raw = source.load_sized(reader.file_io()).await.unwrap();
+        assert_eq!(raw.metadata().format_version, version);
+        assert_eq!(manifest.added_files_count, Some(3));
+        let paths = raw
+            .entries()
+            .iter()
+            .map(|entry| entry.file_path())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            installed
+                .external
+                .iter()
+                .map(|path| format!("file://{}", path.display()))
+                .collect::<Vec<_>>()
+        );
+        let requests = publisher.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        for request in requests.iter() {
+            let added = request["updates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|update| update["action"] == "add-snapshot")
+                .unwrap();
+            assert_eq!(added["snapshot"]["snapshot-id"], snapshot.snapshot_id());
+        }
+        let artifacts = publisher.artifact_requests.lock().unwrap();
+        assert_eq!(
+            artifacts[0]
+                .iter()
+                .any(|object| object.path() == manifest.manifest_path),
+            version == FormatVersion::V1,
+        );
+        let events = trace.lock().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| {
+                    event.operation == "write" && event.path == manifest.manifest_path
+                })
+                .count(),
+            1
+        );
+        fixture.operation.release_registered_paths();
+        assert_eq!(installed.paid_paths.load(Ordering::SeqCst), 0);
+        assert_eq!(installed.paid_stage.load(Ordering::SeqCst), 0);
+    }
+}

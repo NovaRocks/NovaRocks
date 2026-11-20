@@ -320,3 +320,228 @@ fn incomplete_v3_delete_cannot_grant_cleanup_or_prepare_a_manifest() {
     assert!(path.is_file());
     assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
 }
+
+#[tokio::test]
+async fn registered_write_refusal_cleans_only_operation_owned_metadata() {
+    use crate::commit::new_manifests::tests::registered;
+
+    let fixture = registered::fixture();
+    let base = TableUpdate::SetProperties {
+        updates: HashMap::from([("commit.manifest.target-size-bytes".into(), "1".into())]),
+    }
+    .apply(fixture.metadata(FormatVersion::V2).into_builder(None))
+    .unwrap()
+    .build()
+    .unwrap()
+    .metadata;
+    let installed = registered::install(&fixture, &base, 3);
+    let intent = fixture
+        .intent(&base, "main", Vec::new())
+        .with_compact_stage(0)
+        .unwrap();
+    let publisher = ControlledPublisher::new(&fixture, base, Dispatch::Commit);
+    let trace = Arc::new(Mutex::new(Vec::new()));
+    let report = crate::fs_io::TEST_STORAGE_REQUESTS
+        .scope(trace.clone(), async {
+            crate::fs_io::TEST_AVRO_WRITES_BEFORE_FAILURE
+                .scope(
+                    std::cell::Cell::new(1),
+                    run_compact(&fixture, &intent, &publisher),
+                )
+                .await
+        })
+        .await;
+    assert!(matches!(
+        report.publication,
+        PublicationOutcome::KnownUncommitted(_)
+    ));
+    assert_eq!(
+        report.cleanup,
+        IcebergCleanupReport::Complete { deleted: 2 }
+    );
+    assert!(publisher.requests.lock().unwrap().is_empty());
+    assert_eq!(installed.paid_files.load(Ordering::SeqCst), 0);
+    assert_eq!(installed.paid_paths.load(Ordering::SeqCst), 0);
+    assert_eq!(installed.paid_stage.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        files_under(&fixture.directory.path().join("data")),
+        installed.external
+    );
+    assert!(files_under(&fixture.directory.path().join("metadata")).is_empty());
+    let events = trace.lock().unwrap();
+    let deletions = events
+        .iter()
+        .filter(|event| event.operation == "delete")
+        .collect::<Vec<_>>();
+    assert_eq!(deletions.len(), 2);
+    assert!(
+        deletions
+            .iter()
+            .all(|event| event.path.ends_with(".avro") && event.path.contains("/metadata/"))
+    );
+}
+
+#[tokio::test]
+async fn registered_cancel_before_preparation_refunds_all_inputs_and_keeps_source_files() {
+    use crate::commit::new_manifests::tests::registered;
+
+    let fixture = registered::fixture();
+    let base = fixture.metadata(FormatVersion::V2);
+    let installed = registered::install(&fixture, &base, 2);
+    let intent = fixture
+        .intent(&base, "main", Vec::new())
+        .with_compact_stage(0)
+        .unwrap();
+    let mut publisher = ControlledPublisher::new(&fixture, base, Dispatch::Commit);
+    publisher.cancel_after_load = true;
+    let report = run_compact(&fixture, &intent, &publisher).await;
+    let PublicationOutcome::KnownUncommitted(failure) = report.publication else {
+        panic!("{report:?}");
+    };
+    assert_eq!(failure.kind(), ConnectorMutationFailureKind::Cancelled);
+    assert_eq!(
+        report.cleanup,
+        IcebergCleanupReport::Complete { deleted: 0 }
+    );
+    assert!(publisher.requests.lock().unwrap().is_empty());
+    assert_eq!(installed.paid_files.load(Ordering::SeqCst), 0);
+    assert_eq!(installed.paid_paths.load(Ordering::SeqCst), 0);
+    assert_eq!(installed.paid_stage.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        files_under(&fixture.directory.path().join("data")),
+        installed.external
+    );
+}
+
+#[tokio::test]
+async fn registered_unknown_exits_preparation_before_retaining_only_owned_metadata() {
+    use crate::commit::new_manifests::tests::registered;
+
+    let fixture = registered::fixture();
+    let base = fixture.metadata(FormatVersion::V2);
+    let installed = registered::install(&fixture, &base, 2);
+    let intent = fixture
+        .intent(&base, "main", Vec::new())
+        .with_compact_stage(0)
+        .unwrap();
+    let publisher = ControlledPublisher::new(&fixture, base, Dispatch::Unknown);
+    let report = run_compact(&fixture, &intent, &publisher).await;
+    assert!(matches!(
+        report.publication,
+        PublicationOutcome::Unknown { .. }
+    ));
+    assert_eq!(report.cleanup, IcebergCleanupReport::NotAttempted);
+
+    assert_eq!(installed.paid_files.load(Ordering::SeqCst), 0);
+    assert!(installed.paid_paths.load(Ordering::SeqCst) > 0);
+    fixture.operation.release_registered_paths();
+    assert_eq!(installed.paid_paths.load(Ordering::SeqCst), 0);
+    assert_eq!(installed.paid_stage.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        files_under(&fixture.directory.path().join("data")),
+        installed.external
+    );
+    assert_eq!(
+        files_under(&fixture.directory.path().join("metadata")).len(),
+        2
+    );
+    let artifacts = fixture.operation.recovery_artifacts();
+    assert_eq!(artifacts.len(), 2);
+    assert!(artifacts.iter().all(|record| {
+        matches!(
+            record.origin,
+            crate::commit::model::ArtifactOrigin::Produced { .. }
+        ) && record.object.path().ends_with(".avro")
+            && record.object.path().contains("/metadata/")
+    }));
+    assert_eq!(publisher.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn registered_merge_preserves_added_paths_and_keeps_external_files() {
+    use crate::commit::model::ArtifactWriter as _;
+    use crate::commit::new_manifests::tests::registered;
+    use crate::iceberg::spec::ManifestStatus;
+    use crate::manifest::source::ManifestSource;
+
+    let parent = Fixture::new();
+    let base = append_state(&parent, parent.metadata(FormatVersion::V2), 2).await;
+    let parent_snapshot = base.current_snapshot().unwrap().snapshot_id();
+    let existing_path = format!(
+        "file://{}/race-2.parquet",
+        parent.directory.path().display()
+    );
+    let base = TableUpdate::SetProperties {
+        updates: HashMap::from([("commit.manifest.min-count-to-merge".into(), "2".into())]),
+    }
+    .apply(base.into_builder(None))
+    .unwrap()
+    .build()
+    .unwrap()
+    .metadata;
+    let fixture = registered::fixture();
+    let installed = registered::install(&fixture, &base, 3);
+    let intent = fixture
+        .intent(&base, "main", Vec::new())
+        .with_compact_stage(0)
+        .unwrap();
+    let publisher = ControlledPublisher::new(&fixture, base, Dispatch::Commit);
+    let report = run_compact(&fixture, &intent, &publisher).await;
+    assert!(
+        matches!(report.publication, PublicationOutcome::Committed(_)),
+        "{report:?}"
+    );
+    assert_eq!(
+        report.cleanup,
+        IcebergCleanupReport::Complete { deleted: 1 }
+    );
+    let committed = publisher.metadata.lock().unwrap().clone();
+    let snapshot = committed.current_snapshot().unwrap();
+    let attempt = fixture.operation.begin_attempt().unwrap();
+    let list = crate::manifest::load_manifest_list(snapshot, attempt.file_io(), &committed)
+        .await
+        .unwrap();
+    assert_eq!(list.entries().len(), 1);
+    let descriptor = &list.entries()[0];
+    assert_eq!(descriptor.added_files_count, Some(3));
+    assert_eq!(descriptor.added_rows_count, Some(6));
+    // append_state created one physical file containing two rows.
+    assert_eq!(descriptor.existing_files_count, Some(1));
+    assert_eq!(descriptor.existing_rows_count, Some(2));
+    assert_eq!(descriptor.deleted_files_count, Some(0));
+    let source =
+        ManifestSource::committed(snapshot.snapshot_id(), snapshot.manifest_list(), descriptor);
+    let raw = source.load_sized(attempt.file_io()).await.unwrap();
+    let existing = raw
+        .entries()
+        .iter()
+        .filter(|entry| entry.status() == ManifestStatus::Existing)
+        .map(|entry| (entry.file_path(), entry.record_count(), entry.snapshot_id()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        existing,
+        [(existing_path.as_str(), 2, Some(parent_snapshot))]
+    );
+    let added = raw
+        .entries()
+        .iter()
+        .filter(|entry| entry.status() == ManifestStatus::Added)
+        .map(|entry| entry.file_path())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        added,
+        installed
+            .external
+            .iter()
+            .map(|path| format!("file://{}", path.display()))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(installed.paid_files.load(Ordering::SeqCst), 0);
+    fixture.operation.release_registered_paths();
+    assert_eq!(installed.paid_paths.load(Ordering::SeqCst), 0);
+    assert_eq!(installed.paid_stage.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        files_under(&fixture.directory.path().join("data")),
+        installed.external
+    );
+}
