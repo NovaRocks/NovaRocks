@@ -60,11 +60,11 @@ pub(crate) struct RowDeltaWindowCheck {
 }
 
 impl RowDeltaWindowCheck {
+    pub(crate) const fn isolation(&self) -> IsolationLevel {
+        self.isolation
+    }
+
     // The write operation installs this dependency when it freezes its row-delta intent.
-    #[allow(
-        dead_code,
-        reason = "The write operation switches dependencies in RWM-12 integration"
-    )]
     pub(crate) fn new(
         isolation: IsolationLevel,
         scope: Arc<dyn MayMatch>,
@@ -107,6 +107,46 @@ impl PartialEq for RowDeltaWindowCheck {
 
 impl Eq for RowDeltaWindowCheck {}
 
+struct WindowTrace {
+    attempt: crate::commit::model::AttemptToken,
+    stage: Option<usize>,
+    start: Option<i64>,
+    parent: Option<i64>,
+    isolation: IsolationLevel,
+    window_len: Option<usize>,
+    checks: Vec<&'static str>,
+    failed_check: Option<&'static str>,
+    object: Option<String>,
+    complete: bool,
+}
+
+impl WindowTrace {
+    fn reject(&mut self, check: &'static str, object: Option<&str>) {
+        self.failed_check = Some(check);
+        self.object = object.map(ToOwned::to_owned);
+        self.complete = true;
+    }
+}
+
+impl Drop for WindowTrace {
+    fn drop(&mut self) {
+        tracing::debug!(
+            operation = ?self.attempt.operation(),
+            attempt = self.attempt.ordinal(),
+            stage = ?self.stage,
+            source_snapshot = ?self.start,
+            parent_snapshot = ?self.parent,
+            isolation = ?self.isolation,
+            window_len = ?self.window_len,
+            checks = ?self.checks,
+            failed_check = self.failed_check,
+            object = self.object.as_deref(),
+            complete = self.complete,
+            "Iceberg row-delta window validation",
+        );
+    }
+}
+
 pub(super) async fn validate_row_delta(
     dependency: &Dependency,
     check: &RowDeltaWindowCheck,
@@ -117,15 +157,29 @@ pub(super) async fn validate_row_delta(
 ) -> Result<Verdict> {
     io.check_active()?;
     let metadata = inputs.metadata;
+    let mut trace = WindowTrace {
+        attempt: io.attempt_token(),
+        stage: inputs.stage,
+        start,
+        parent: inputs.parent,
+        isolation: check.isolation,
+        window_len: None,
+        checks: vec!["ancestor", "history"],
+        failed_check: None,
+        object: None,
+        complete: false,
+    };
     let window = match history_window(metadata, start, inputs.parent) {
         Ok(window) => window,
         Err(reason) => {
+            trace.reject("history", None);
             return Ok(Verdict::Unprovable {
                 dependency: dependency.clone(),
                 reason,
             });
         }
     };
+    trace.window_len = Some(window.snapshots().len());
     let (start, _) = window.endpoints();
     let scan = WindowFiles {
         metadata,
@@ -134,6 +188,7 @@ pub(super) async fn validate_row_delta(
     };
     let facts = &check.facts;
     if check.writes_deletes && !facts.referenced.is_subset(&facts.removed) {
+        trace.checks.push("referenced_data_files");
         let owners = snapshot_ids(&window, DELETED_DATA_OPERATIONS);
         if let Some(path) = scan
             .find(
@@ -157,11 +212,13 @@ pub(super) async fn validate_row_delta(
             )
             .await?
         {
+            trace.reject("referenced_data_files", Some(&path));
             return conflict(format!("Cannot commit, missing data files: [{path}]"));
         }
     }
 
     if check.isolation == IsolationLevel::Serializable {
+        trace.checks.push("added_data_files");
         let owners = snapshot_ids(&window, ADDED_DATA_OPERATIONS);
         if let Some(path) = scan
             .find(
@@ -178,6 +235,7 @@ pub(super) async fn validate_row_delta(
             )
             .await?
         {
+            trace.reject("added_data_files", Some(&path));
             return conflict(format!(
                 "Found conflicting files that can contain records matching {}: [{path}]",
                 check.scope
@@ -186,6 +244,10 @@ pub(super) async fn validate_row_delta(
     }
 
     if check.writes_data {
+        if !facts.removed.is_empty() {
+            trace.checks.push("deletes_for_replaced_data");
+        }
+        trace.checks.push("added_delete_files");
         let start_sequence = start
             .and_then(|id| metadata.snapshot_by_id(id))
             .map_or(0, |snapshot| snapshot.sequence_number());
@@ -227,11 +289,13 @@ pub(super) async fn validate_row_delta(
         if facts.removed.is_empty() {
             first_delete = replaced;
         } else if let Some(path) = replaced {
+            trace.reject("deletes_for_replaced_data", Some(&path));
             return conflict(format!(
                 "Cannot commit, found new delete for replaced data file: {path}"
             ));
         }
         if let Some(path) = first_delete {
+            trace.reject("added_delete_files", Some(&path));
             return conflict(format!(
                 "Found new conflicting delete files that can apply to records matching {}: [{path}]",
                 check.scope
@@ -239,13 +303,16 @@ pub(super) async fn validate_row_delta(
         }
     }
 
+    trace.checks.push("removed_data_referenced_by_new_delete");
     if let Some(path) = facts.removed.intersection(&facts.referenced).next() {
+        trace.reject("removed_data_referenced_by_new_delete", Some(path));
         return conflict(format!(
             "Cannot delete data files [{path}] that are referenced by new delete files"
         ));
     }
 
     if !facts.dv_targets.is_empty() {
+        trace.checks.push("added_deletion_vectors");
         let owners = snapshot_ids(&window, ADDED_DV_OPERATIONS);
         if let Some(detail) = scan.find(ADDED_DV_OPERATIONS, ManifestContentType::Deletes, true, |entry| {
             let file = entry.raw.data_file();
@@ -265,11 +332,13 @@ pub(super) async fn validate_row_delta(
                 "Found concurrently added DV for {target}: DV{{location={path}, offset={offset}, length={length}, referencedDataFile={target}}}"
             )))
         }).await? {
+            trace.reject("added_deletion_vectors", Some(&detail));
             return conflict(detail);
         }
     }
 
     io.check_active()?;
+    trace.complete = true;
     Ok(Verdict::Holds)
 }
 

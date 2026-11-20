@@ -3436,7 +3436,7 @@ impl FrozenRewriteLake {
         ));
         let batch =
             RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(rows.to_vec()))]).unwrap();
-        self.stage_batch(session, target, batch, None, rows.len() as u64)
+        self.stage_batch(session, target, batch, None, rows.len() as u64, None)
     }
 
     fn stage_batch(
@@ -3446,6 +3446,9 @@ impl FrozenRewriteLake {
         batch: RecordBatch,
         source: Option<novarocks_spi::connector::write_stack::ConnectorPositionShardSource>,
         row_count: u64,
+        rewritten: Option<
+            &novarocks_spi::connector::read_stack::runtime::ConnectorRewrittenTargetFact,
+        >,
     ) -> u64 {
         use novarocks_spi::connector::write_stack::{
             ConnectorOpenWriterRequest, ConnectorWriteExecution, ConnectorWriterPhysicalContext,
@@ -3472,7 +3475,7 @@ impl FrozenRewriteLake {
                     target.ordinal(),
                     physical,
                 )),
-                None,
+                rewritten,
             )
             .unwrap();
         let fragments = self.executor.block_on(async {
@@ -3513,6 +3516,64 @@ impl FrozenRewriteLake {
         row_count
     }
 
+    fn prepare_row_delete(
+        &self,
+        context: &novarocks_spi::connector::ConnectorRequestContext,
+    ) -> novarocks_spi::connector::ConnectorRowMutationPreparation {
+        let novarocks_spi::connector::ConnectorRowMutationPreparationOutcome::Prepared(preparation) =
+            self.admit_row_delete(context)
+        else {
+            panic!("fixture table did not admit its ordinary DELETE");
+        };
+        preparation
+    }
+
+    fn admit_row_delete(
+        &self,
+        context: &novarocks_spi::connector::ConnectorRequestContext,
+    ) -> novarocks_spi::connector::ConnectorRowMutationPreparationOutcome {
+        use novarocks_spi::connector::{
+            ConnectorMetadata, ConnectorRowMutationIntent, ConnectorRowMutationPreparationRequest,
+            ConnectorTableIdentity, ConnectorTableRequest, ConnectorTableResolution,
+            ConnectorWriteOperationId, ConnectorWriteTargetRef,
+        };
+
+        let key = self.control.binding_key();
+        let provider = crate::metadata::IcebergMetadata::new(
+            descriptor("rewrite-local"),
+            key.incarnation,
+            self.runtime.clone(),
+        );
+        let loaded = crate::metadata::with_pure_schema_creation(context, |creation| {
+            provider
+                .load_table(
+                    ConnectorTableRequest {
+                        table: ConnectorTableIdentity {
+                            instance_id: key.instance_id.clone(),
+                            namespace: Arc::from("db"),
+                            table: Arc::from("t"),
+                        },
+                        resolution: ConnectorTableResolution::StrictBaseTable,
+                        context: context.clone(),
+                    },
+                    creation,
+                )
+                .map_err(crate::metadata::metadata_creation_error)
+        })
+        .unwrap();
+        crate::commit::row_mutation_preparation::prepare_row_mutation(
+            ConnectorRowMutationPreparationRequest {
+                operation_id: ConnectorWriteOperationId::new(),
+                table: loaded.table,
+                target_ref: ConnectorWriteTargetRef::main(),
+                intent: ConnectorRowMutationIntent::Delete,
+                context: context.clone(),
+            },
+            key,
+        )
+        .unwrap()
+    }
+
     fn seed_position_vector(&self, file: &DataFileWithStats) {
         use arrow::array::{BinaryArray, Int32Array, StructArray};
         use novarocks_spi::connector::ConnectorWriteInputRequest;
@@ -3535,13 +3596,22 @@ impl FrozenRewriteLake {
             &context,
         )
         .unwrap();
-        let base = crate::commit::write_shared::position_mutation_base(
-            table.metadata(),
-            table.metadata_location(),
-            "main",
-            snapshot,
+        let preparation = self.prepare_row_delete(&context);
+        let fact = crate::commit::conflict_scope::IcebergRewrittenTargetFact::new(
+            crate::commit::conflict_scope::RewrittenTargetBinding {
+                table_uuid: table.metadata().uuid(),
+                snapshot_id: snapshot,
+                preparation_digest: preparation.digest(),
+            },
+            table.metadata().current_schema().clone(),
+            &novarocks_spi::connector::read_stack::TupleDomain::all(),
+            &novarocks_spi::connector::read_stack::TupleDomain::all(),
         )
         .unwrap();
+        let fact = novarocks_spi::connector::ConnectorProcessLocalPayload::new(
+            self.control.binding_key().clone(),
+            Arc::new(fact),
+        );
         let session = self
             .control
             .begin_write(ConnectorWriteBeginRequest {
@@ -3551,12 +3621,9 @@ impl FrozenRewriteLake {
                 intent: novarocks_spi::connector::ConnectorWriteIntent::RowDelta,
                 purpose: ConnectorWriteAdmissionPurpose::OrdinaryDml,
                 input,
-                base: Some(base),
+                base: Some(preparation.base_version().clone()),
                 flavor: ConnectorWriteSessionFlavor::RowMutation {
-                    admission: novarocks_spi::connector::ConnectorProcessLocalPayload::new(
-                        self.control.binding_key().clone(),
-                        Arc::new(()),
-                    ),
+                    admission: preparation.admission(),
                 },
                 context,
             })
@@ -3599,7 +3666,7 @@ impl FrozenRewriteLake {
             ),
         ])
         .unwrap();
-        let row_count = self.stage_batch(&session, target, batch, Some(source), 1);
+        let row_count = self.stage_batch(&session, target, batch, Some(source), 1, Some(&fact));
         let result = self
             .control
             .finish_write(ConnectorWriteFinishRequest {
@@ -3668,8 +3735,9 @@ impl FrozenRewriteLake {
     }
 }
 
-#[path = "tests/baseline_contract_tests.rs"]
 mod baseline_contract_tests;
+#[path = "tests/baseline_contract_tests.rs"]
+mod row_mutation_begin;
 
 #[test]
 fn distributed_rewrite_inputs_are_attempt_owned_and_never_written() {

@@ -41,6 +41,7 @@ pub(crate) async fn validate_with_removed_data(
     removed_data: Option<&dyn RemovedDataFiles>,
 ) -> Result<Verdict> {
     let mut inputs = ValidationInputs::new(metadata, parent, io);
+    inputs.stage = intent.compact_stage();
     validate_dependency_checks(
         intent.dependencies(),
         intent.start().map(|start| start.snapshot_id),

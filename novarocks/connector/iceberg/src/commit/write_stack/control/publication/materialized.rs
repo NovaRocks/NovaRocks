@@ -265,10 +265,6 @@ impl MaterializedDeleteStep {
             .collect())
     }
 
-    #[allow(
-        dead_code,
-        reason = "The row-delta window is installed by the publication wiring."
-    )]
     pub(crate) fn observed_data_file(
         &self,
         path: &str,
@@ -595,9 +591,7 @@ impl CompletedStep {
         view: &StagedView<'_>,
         snapshot: i64,
     ) -> Result<(ManifestReadScope, Vec<LocatedEntry>)> {
-        let mut scope = self
-            .scope
-            .rebind(Arc::new(view.metadata().clone()), snapshot)?;
+        let mut scope = self.scope.rebind(view.metadata_ref(), snapshot)?;
         let targets = &self.targets.completion.targets;
         // TypedPartition shares its field and value arrays with E. Charge
         // newly backed path keys and map slots while both ranges coexist.

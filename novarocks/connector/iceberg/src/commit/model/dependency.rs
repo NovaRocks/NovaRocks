@@ -26,9 +26,5 @@ pub enum Dependency {
     RegisteredFilesNotLive(Vec<String>),
     /// Preparation-time check only; metadata publication has no atomic snapshot-existence requirement.
     MeasuredSnapshotExists(i64),
-    #[allow(
-        dead_code,
-        reason = "The row-delta publication path installs this dependency in P07"
-    )]
     RowDeltaWindow(RowDeltaWindowCheck),
 }

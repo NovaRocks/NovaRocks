@@ -223,10 +223,6 @@ impl IcebergReceiving {
         }
     }
 
-    #[allow(
-        dead_code,
-        reason = "The row-mutation write session installs the admitted binding in P07"
-    )]
     pub(crate) fn bind_rewritten_target(
         &mut self,
         owner: ConnectorProviderBindingKey,
@@ -254,10 +250,6 @@ impl IcebergReceiving {
         Ok(())
     }
 
-    #[allow(
-        dead_code,
-        reason = "The row-mutation publication takes custody of the conflict scope in P07"
-    )]
     pub(crate) fn row_conflict_scope(
         &mut self,
         source: &TableMetadata,

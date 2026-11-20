@@ -22,15 +22,7 @@
 
 mod action;
 pub(crate) mod attempt;
-#[allow(
-    dead_code,
-    reason = "The row-delta validator and dispatch integrate this contract in subsequent stages"
-)]
 pub(crate) mod conflict;
-#[allow(
-    dead_code,
-    reason = "The row-mutation publication connects the conflict scope in P07"
-)]
 pub(crate) mod conflict_scope;
 mod data_file;
 pub mod data_writer;
@@ -61,10 +53,6 @@ pub mod ref_action;
 pub mod report;
 mod rewrite_data_files;
 mod row_delta;
-#[allow(
-    dead_code,
-    reason = "The compact publication stage installs the retained facts."
-)]
 pub(crate) mod row_delta_facts;
 
 pub mod row_delta_dv_metadata;

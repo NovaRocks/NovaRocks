@@ -191,6 +191,7 @@ struct WriteRecipe<'a> {
     compact_stage: Option<usize>,
     materialized: Option<Arc<materialized::MaterializedDeleteStep>>,
     fixed_mutation: bool,
+    isolation: Option<IsolationLevel>,
     selected: Option<crate::commit::selected_rewrite::SelectedRewriteFiles>,
     start: Option<StartSnapshot>,
     target: TableTarget,
@@ -363,6 +364,7 @@ impl<'a> WriteRecipe<'a> {
             compact_stage: None,
             materialized,
             fixed_mutation,
+            isolation: handle.row_mutation_isolation(),
             selected,
             start: facts.base_snapshot_id().map(|id| StartSnapshot {
                 snapshot_id: id,
@@ -495,8 +497,20 @@ impl<'a> WriteRecipe<'a> {
             target_ref: self.target_ref.clone(),
             start: self.start,
             changes: FileChanges { added, removed },
-            dependencies: self.dependencies.clone(),
-            isolation: IsolationLevel::Serializable,
+            dependencies: match self.isolation {
+                Some(_) => vec![crate::commit::model::Dependency::RowDeltaWindow(
+                    operation
+                        .row_delta_check()
+                        .ok_or_else(|| {
+                            format_error(internal(
+                                "Iceberg row-delta operation lost its frozen validation",
+                            ))
+                        })?
+                        .clone(),
+                )],
+                None => self.dependencies.clone(),
+            },
+            isolation: self.isolation.unwrap_or(IsolationLevel::Serializable),
             shape: RequestShape::SnapshotProducing,
             summary: self.summary.clone(),
             token: operation.token(),
@@ -507,10 +521,10 @@ impl<'a> WriteRecipe<'a> {
                 None => intent,
             };
             Ok(
-                if self
-                    .summary
-                    .keys()
-                    .any(|key| key.starts_with(crate::document_storage::keyed::keys::RECORD_PREFIX))
+                if self.isolation.is_none()
+                    && self.summary.keys().any(|key| {
+                        key.starts_with(crate::document_storage::keyed::keys::RECORD_PREFIX)
+                    })
                 {
                     intent.with_snapshot_loading(crate::catalog::SnapshotLoading::Refs)
                 } else {
@@ -567,6 +581,20 @@ impl<'a> WriteRecipe<'a> {
                 Box::new(crate::commit::overwrite_partitions::OverwritePartitionsPreparer)
             }
             CommitOpKind::Truncate => Box::new(crate::commit::truncate::TruncatePreparer),
+        })
+    }
+}
+
+impl crate::commit::dependency::RemovedDataFiles for materialized::MaterializedDeleteStep {
+    fn removed_data_file(
+        &self,
+        path: &str,
+    ) -> crate::iceberg::Result<crate::commit::conflict::CandidateFile<'_>> {
+        let (metadata, spec_id, file) = self.observed_data_file(path)?;
+        Ok(crate::commit::conflict::CandidateFile {
+            metadata,
+            spec_id,
+            file,
         })
     }
 }
@@ -756,10 +784,21 @@ impl IcebergWriteSessionControl {
             .compact_files()
             .ok_or_else(|| internal("Expected compact write receiving"))?;
         let (operation, journal) = self.adopt_compact_operation(handle, compact, context)?;
-        let files = received
-            .take_compact_files()
-            .expect("adopted compact files");
         let recipe = WriteRecipe::freeze(handle, &[], documents).and_then(|mut recipe| {
+            let validation = recipe
+                .isolation
+                .map(|isolation| {
+                    let scope = received
+                        .row_conflict_scope(&recipe.source)?
+                        .ok_or_else(|| {
+                            internal("Iceberg row-delta operation has no original conflict scope")
+                        })?;
+                    Ok::<_, ConnectorError>((isolation, scope))
+                })
+                .transpose()?;
+            let files = received
+                .take_compact_files()
+                .expect("adopted compact files");
             let stage = usize::from(recipe.keyed_documents.is_some());
             recipe.compact_stage = Some(stage);
             recipe.output_facts.data_files = files.counts.data.files;
@@ -781,6 +820,23 @@ impl IcebergWriteSessionControl {
                 } else {
                     recipe.output_facts.deletion_vectors = files.counts.position_deletes.files;
                 }
+            }
+            if let Some((isolation, scope)) = validation {
+                let facts = crate::commit::row_delta_facts::extract(&files)?;
+                let check = crate::commit::dependency::RowDeltaWindowCheck::new(
+                    isolation,
+                    Arc::new(scope),
+                    Arc::clone(&facts.facts),
+                    files.counts.data.files != 0,
+                    files.counts.position_deletes.files != 0,
+                );
+                let source = recipe.materialized.as_ref().map(|step| {
+                    let source: Arc<dyn crate::commit::dependency::RemovedDataFiles> = step.clone();
+                    Arc::downgrade(&source)
+                });
+                operation
+                    .hold_row_delta_validation(check, facts, source)
+                    .map_err(|error| internal(error.to_string()))?;
             }
             operation
                 .install_stage_new_files(

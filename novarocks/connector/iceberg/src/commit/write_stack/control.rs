@@ -1356,11 +1356,16 @@ fn project_released_state(
         } => {
             // Abort cannot resolve ambiguity, and the staged objects stay
             // where reconciliation can still find them.
+            let failure = failure(
+                ConnectorMutationFailureKind::Unavailable,
+                format!("{message}; staged files remain at {staging_dir}"),
+            );
             Ok(ConnectorWriteAbortOutcome::CommitUnknown {
-                failure: failure(
-                    ConnectorMutationFailureKind::Unavailable,
-                    format!("{message}; staged files remain at {staging_dir}"),
-                ),
+                failure: if handle.row_mutation_isolation().is_some() {
+                    crate::commit::conflict::commit_state_unknown(failure)
+                } else {
+                    failure
+                },
                 evidence: handle.recovery_evidence()?,
             })
         }
@@ -1397,6 +1402,11 @@ impl IcebergWriteSessionControl {
         let mut outcome = self
             .adjudicate_session_inner_async(handle, evidence, context)
             .await?;
+        if let ExternalMutationOutcome::CommitUnknown { failure, .. } = &mut outcome
+            && handle.row_mutation_isolation().is_some()
+        {
+            *failure = crate::commit::conflict::commit_state_unknown(failure.clone());
+        }
         retain_reconciled_committed_fact(handle, &mut outcome);
         Ok(outcome)
     }
@@ -2289,12 +2299,17 @@ impl IcebergWriteSessionControl {
         if let ConnectorWriteSessionFlavor::DistributedRewrite { frozen, .. } = &request.flavor {
             frozen.validate_owner(&self.key)?;
         }
-        // A staged target is the one target that cannot be looked up: the
-        // catalog will not know it until the publication that owns it commits.
-        // So its frozen facts arrive with the request, and this branch reads
-        // them instead of loading. It is deliberately the only place a session
-        // accepts caller-supplied metadata, and it accepts it only for the
-        // flavor whose whole definition is "there is nothing to load".
+        let row_mutation = match &request.flavor {
+            ConnectorWriteSessionFlavor::RowMutation { admission } => {
+                Some(crate::commit::row_mutation_preparation::open_admission(
+                    &self.key, request, admission, namespace, table_name,
+                )?)
+            }
+            _ => None,
+        };
+        // A staged target is likewise absent from the catalog until its
+        // owning publication commits. Both flavors carry provider-authored
+        // immutable facts to the session admission boundary.
         let staged = match &request.flavor {
             ConnectorWriteSessionFlavor::StagedCreate(target) => Some(
                 crate::metadata::staged_target_metadata(&self.key.instance_id, target)?,
@@ -2308,8 +2323,8 @@ impl IcebergWriteSessionControl {
             }
             _ => false,
         };
-        let (table, metadata) = match &staged {
-            Some(staged) => {
+        let (table, metadata) = match (&staged, &row_mutation) {
+            (Some(staged), _) => {
                 if staged.namespace != namespace || staged.table != table_name {
                     return Err(invalid(
                         "Iceberg staged write target names a different table than its frozen facts",
@@ -2320,8 +2335,11 @@ impl IcebergWriteSessionControl {
                     IcebergAdmissionStatisticsMetadata::Owned(Box::new(staged.metadata.clone())),
                 )
             }
-            None => {
-                // Begin must observe the catalog after planning, even when FE shares one request cache.
+            (None, Some(admission)) => (
+                None,
+                IcebergAdmissionStatisticsMetadata::Shared(Arc::clone(&admission.metadata)),
+            ),
+            (None, None) => {
                 let physical = if let Some(io) = rewrite_io {
                     io.observe(namespace, table_name, &request.context).await
                 } else if fixed_position_read
@@ -2543,22 +2561,6 @@ impl IcebergWriteSessionControl {
                 ));
             }
         }
-        if matches!(
-            request.flavor,
-            ConnectorWriteSessionFlavor::RowMutation { .. }
-        ) {
-            let expected = crate::commit::write_shared::position_mutation_base(
-                &metadata,
-                table.as_ref().and_then(|table| table.metadata_location()),
-                target_ref,
-                base_snapshot_id,
-            )?;
-            if request.base.as_ref() != Some(&expected) {
-                return Err(invalid(
-                    "Iceberg row mutation base differs from its admitted target",
-                ));
-            }
-        }
         if let Some(base) = &request.base {
             if staged.is_some() {
                 return Err(invalid(
@@ -2675,10 +2677,11 @@ impl IcebergWriteSessionControl {
             repartition
                 .as_ref()
                 .map(|prepared| prepared.prospective_metadata()),
-            matches!(
-                &request.flavor,
-                ConnectorWriteSessionFlavor::DistributedRewrite { .. }
-            ),
+            row_mutation.is_some()
+                || matches!(
+                    &request.flavor,
+                    ConnectorWriteSessionFlavor::DistributedRewrite { .. }
+                ),
         )?;
         let authored_input = if matches!(
             &request.flavor,
@@ -2724,12 +2727,13 @@ impl IcebergWriteSessionControl {
             sign_input_shape(&facts, &authored_input)?
         };
         let mutation_read = if fixed_position_read {
-            let table = table
+            let location = row_mutation
                 .as_ref()
-                .ok_or_else(|| invalid("Iceberg row mutation requires a loaded target table"))?;
-            let location = table.metadata_location().ok_or_else(|| {
-                invalid("Iceberg row mutation target has no immutable metadata location")
-            })?;
+                .map(|admission| admission.metadata_location.as_str())
+                .or_else(|| table.as_ref().and_then(|table| table.metadata_location()))
+                .ok_or_else(|| {
+                    invalid("Iceberg row mutation target has no immutable metadata location")
+                })?;
             let snapshot = base_snapshot_id
                 .map(|id| {
                     let snapshot = metadata
@@ -2911,6 +2915,23 @@ impl IcebergWriteSessionControl {
                 })
                 .collect::<Result<Vec<_>, ConnectorError>>()?;
         }
+        let handle = if let Some(admission) = row_mutation {
+            let handle = handle.with_row_mutation_isolation(admission.isolation);
+            handle.with_active_receiving(|received| {
+                received.bind_rewritten_target(
+                    self.key.clone(),
+                    crate::commit::conflict_scope::RewrittenTargetBinding {
+                        table_uuid: metadata.uuid(),
+                        snapshot_id: base_snapshot_id,
+                        preparation_digest: admission.preparation_digest,
+                    },
+                    metadata.as_ref(),
+                )
+            })?;
+            handle
+        } else {
+            handle
+        };
         let handle = if handle.flavor() == IcebergWriteFlavor::StagedCreate {
             handle
         } else {

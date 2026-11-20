@@ -46,7 +46,6 @@ pub(crate) struct CandidateFile<'a> {
     /// Metadata of the same observation, including historical partition specs.
     pub(crate) metadata: &'a TableMetadata,
     pub(crate) spec_id: i32,
-    pub(crate) metadata: &'a crate::iceberg::spec::TableMetadata,
     pub(crate) file: &'a DataFile,
 }
 
@@ -122,6 +121,9 @@ pub(crate) fn transaction_conflict(
 }
 
 pub(crate) fn commit_state_unknown(original: ConnectorMutationFailure) -> ConnectorMutationFailure {
+    if original.failure_fact().reason() == ICEBERG_COMMIT_STATE_UNKNOWN {
+        return original;
+    }
     commit_failure(
         original.kind(),
         ICEBERG_COMMIT_STATE_UNKNOWN,

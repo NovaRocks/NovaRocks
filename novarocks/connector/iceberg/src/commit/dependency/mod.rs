@@ -24,10 +24,6 @@ mod row_delta;
 
 pub(crate) use builtin::diagnose_ref_unchanged;
 pub use builtin::validate;
-#[allow(
-    unused_imports,
-    reason = "P07 supplies the borrowed source observation"
-)]
 pub(crate) use builtin::validate_with_removed_data;
 pub use history::HistoryGap;
 #[cfg(test)]
@@ -65,10 +61,6 @@ pub enum Verdict<D = Dependency> {
 }
 
 impl Verdict {
-    #[allow(
-        dead_code,
-        reason = "P07 projects the typed row-delta failure before dispatch"
-    )]
     pub(crate) fn row_delta_conflict(
         &self,
         metadata: &TableMetadata,
