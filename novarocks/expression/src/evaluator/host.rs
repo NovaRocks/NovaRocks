@@ -16,7 +16,7 @@
 // under the License.
 
 use super::ScalarCallFailure;
-use novarocks_functions::AggregateStateAllocator;
+use novarocks_functions::{AggregateStateAllocator, KernelFailure};
 use std::sync::Arc;
 
 /// The evaluator owns the order of preparation and execution.
@@ -71,6 +71,15 @@ pub trait ScalarCallHost {
         facts: ScalarCallRequestFacts,
         body: &mut dyn FnMut() -> Result<(), ScalarCallFailure<Self::Refusal>>,
     ) -> Result<(), ScalarCallFailure<Self::Refusal>>;
+
+    /// Runtime hosts verify the frame's original allocator before a guarded
+    /// primitive creates opaque backing. Direct evaluation may use its heap.
+    fn validate_frame_allocator(
+        &self,
+        _allocator: Option<&Arc<dyn AggregateStateAllocator>>,
+    ) -> Result<(), KernelFailure> {
+        Ok(())
+    }
 
     /// Return requests for the original whole-invocation callback.
     fn callback_request_facts(

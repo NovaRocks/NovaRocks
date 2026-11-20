@@ -24,7 +24,10 @@ use crate::exec::operators::compiled_expression::RuntimeKernelControl;
 use novarocks_expression::{
     ScalarCallFailure, ScalarCallHost, ScalarCallPhase, ScalarCallRequestFacts,
 };
-use novarocks_functions::{AggregateStateAllocator, KernelEvaluationControl, ScalarResourceError};
+use novarocks_functions::{
+    AggregateStateAllocator, KernelDiagnostic, KernelEvaluationControl, KernelFailure,
+    ScalarResourceError,
+};
 use novarocks_memory::attribution::scope::{AmbientEntryObservation, AmbientExitObservation};
 use novarocks_memory::{CapacityError, ShortageReceipt};
 use std::sync::Arc;
@@ -221,6 +224,20 @@ impl ScalarCallHost for RuntimeScalarMemoryScope<'_> {
         Ok(())
     }
 
+    fn validate_frame_allocator(
+        &self,
+        allocator: Option<&Arc<dyn AggregateStateAllocator>>,
+    ) -> Result<(), KernelFailure> {
+        self.control
+            .invocation_host(allocator)
+            .map(|_| ())
+            .map_err(|_| {
+                KernelFailure::InvalidProgram(KernelDiagnostic::new(
+                    "Task comparison requires its original frame allocation owner",
+                ))
+            })
+    }
+
     fn callback_request_facts(
         &mut self,
         allocator: Option<&Arc<dyn AggregateStateAllocator>>,
@@ -309,6 +326,30 @@ mod tests {
                 RuntimeScalarMemoryRefusal::MissingQueryMemory,
             ))
         }
+    }
+
+    #[test]
+    fn runtime_scalar_memory_scope_checks_original_frame_allocator() {
+        use crate::runtime::mem_tracker::MemTracker;
+
+        let mut control = RuntimeKernelControl::new(Arc::default());
+        let mut foreign_control = RuntimeKernelControl::new(Arc::default());
+        let tracker = MemTracker::new_root("comparison-frame");
+        control.bind_mem_tracker(Arc::clone(&tracker));
+        // Two independently installed allocation hosts may share a tracker.
+        foreign_control.bind_mem_tracker(Arc::clone(&tracker));
+        let actual = control.allocator().unwrap();
+        let foreign = foreign_control.allocator().unwrap();
+        let mut journal = RuntimeScalarMemoryJournal::default();
+        let scope = RuntimeScalarMemoryScope::new(&control, &mut journal);
+        assert!(scope.validate_frame_allocator(Some(&actual)).is_ok());
+        for allocator in [None, Some(&foreign)] {
+            assert!(matches!(
+                scope.validate_frame_allocator(allocator),
+                Err(KernelFailure::InvalidProgram(_))
+            ));
+        }
+        assert_eq!(tracker.current(), 0);
     }
 
     #[test]

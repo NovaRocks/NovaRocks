@@ -687,7 +687,7 @@ impl<K> Frame<K> {
         work: &mut Work<'_, '_, impl Sized>,
         allocator: Option<&Arc<dyn novarocks_functions::AggregateStateAllocator>>,
     ) -> Result<(), KernelFailure> {
-        use novarocks_functions::native_inlist::{InRows, signed_equality_observed};
+        use novarocks_functions::native_inlist::InRows;
         let ordinal = self
             .next
             .checked_sub(1)
@@ -768,38 +768,22 @@ impl<K> Frame<K> {
             &parents,
             &mut |event| in_event(event, work),
         ))?;
-        let equalities = if expected.data_type() == &DataType::Utf8 {
-            if work.scalar_host.is_some() && allocator.is_none() {
-                return Err(invalid(
-                    "Task IN comparison has no original allocation owner",
-                ));
-            }
-            work.flush()?;
-            let control = work.control;
-            in_observed(super::utf8_inlist::utf8_equality_observed(
-                left.values(),
-                right.values(),
-                recipe.source_type().logical_type()
-                    == novarocks_type_contract::ValueLogicalType::Json,
-                allocator.cloned(),
-                control,
-                &mut |event| in_event(event, work),
-            ))?
-        } else {
-            super::utf8_inlist::Utf8Equalities::without_reservation(
-                in_observed(signed_equality_observed(
-                    left.values(),
-                    right.values(),
-                    &mut |event| in_event(event, work),
-                ))?
-                .ok_or_else(|| invalid("checked signed IN comparison lost its domain"))?,
-            )
-        };
-        in_observed(state.equalities_selected_observed(
-            equalities.array(),
-            &parents,
+        work.flush()?;
+        if let Some(host) = work.scalar_host.as_deref() {
+            host.validate_frame_allocator(allocator)?;
+        }
+        let control = work.control;
+        let equalities = in_observed(recipe.membership_equalities_observed(
+            left.values(),
+            right.values(),
+            allocator.cloned(),
+            control,
             &mut |event| in_event(event, work),
         ))?;
+        in_observed(
+            equalities
+                .apply_to_selected_observed(state, &parents, &mut |event| in_event(event, work)),
+        )?;
         // A match never suppresses the next original candidate invocation.
         work.flush()?;
         drop(equalities);
@@ -2718,9 +2702,8 @@ fn in_observed<T>(
     match result {
         Ok(value) => Ok(value),
         Err(novarocks_functions::native_inlist::InError::Host(error)) => Err(error),
-        // Exact signed recipes and actual carrier validation establish matching
-        // concrete types/lengths before Arrow equality. An error here violates
-        // that checked invariant; it is not a maskable SQL row-data result.
+        // Comparison and JSON normalization report invocation failures here.
+        // Candidate row errors have already been inherited by the frame.
         Err(novarocks_functions::native_inlist::InError::Operation(cause)) => Err(cause),
     }
 }

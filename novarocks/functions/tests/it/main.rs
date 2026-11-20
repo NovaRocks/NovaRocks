@@ -24,6 +24,7 @@ mod kernel_control;
 mod legacy_decimal_negation;
 mod native_between;
 mod native_bitnot;
+mod native_inlist;
 mod native_negate;
 mod row_encoding;
 mod scalar_rows;
