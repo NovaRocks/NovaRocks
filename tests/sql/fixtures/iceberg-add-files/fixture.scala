@@ -256,7 +256,9 @@ object IcebergAddFilesFixture {
       hadoopPath(mixedFile), spark.sparkContext.hadoopConfiguration))
     try {
       val fields = reader.getFooter.getFileMetaData.getSchema
-      require(fields.getType("id").getId.intValue() == 1 && fields.getType("note").getId == null)
+      val id = fields.getType(fields.getFieldIndex("id")).getId
+      val note = fields.getType(fields.getFieldIndex("note")).getId
+      require(id != null && id.intValue() == 1 && note == null)
     } finally reader.close()
     copy(spark, mixedFile, s"$root/mixed-add.parquet")
     addFixtureFile(spark, table("mixed_read"), mixedFile, 1)
