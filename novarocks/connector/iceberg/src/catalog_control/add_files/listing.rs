@@ -34,7 +34,6 @@ use opendal::{ErrorKind as StorageErrorKind, Metadata, Operator};
 use crate::access_binding::IcebergReadBinding;
 use crate::catalog::listing_admission::ListingAdmission;
 use crate::commit::model::ObjectIdentity;
-use crate::typed_read::split::validate_data_file_path;
 
 use super::{procedure_error, validate_registration_location};
 
@@ -196,7 +195,7 @@ impl CandidateFile {
                 return Err(unsupported("ADD FILES source entry is not a regular file"));
             }
         }
-        validate_data_file_path(path).map_err(|error| unsupported(error.message()))
+        Ok(())
     }
 
     pub(crate) fn into_parts(self) -> (ObjectIdentity, u64, ConnectorPayloadRetentionGuard) {
