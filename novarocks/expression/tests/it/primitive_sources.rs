@@ -133,6 +133,7 @@ fn every_unsupported_recipe_keeps_its_exact_owner() {
             &FunctionValueType::new(DataType::Int8, true),
             DecimalOverflowPolicy::ReportError,
             true,
+            None,
             &RecipeControl,
         )
         .unwrap_err(),
@@ -181,6 +182,7 @@ fn every_recipe_type_mismatch_preserves_original_primitive_error() {
             &integer,
             DecimalOverflowPolicy::ReportError,
             true,
+            None,
             &RecipeControl,
         )
         .unwrap_err(),
