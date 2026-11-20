@@ -162,7 +162,78 @@ fn spawn_exchange_call(
     })
 }
 
+#[cfg(novarocks_dev_controls)]
+struct NativeDispatchTestHold {
+    runtime: BackendDataRuntime,
+    scope: crate::test_controls::NativeFaultClaim,
+    observer: Option<Arc<dyn novarocks_execution::runtime::exchange::TestEventObserver>>,
+    stream: novarocks_execution_contract::ExchangeStreamIdentity,
+}
+
+#[cfg(novarocks_dev_controls)]
+impl novarocks_execution::runtime::task::io::exchange::ExchangeDispatchTestHold
+    for NativeDispatchTestHold
+{
+    fn run(
+        self: Box<Self>,
+        stop: CancellationToken,
+        activity: ExchangeCallActivity,
+        release: Box<
+            dyn FnOnce(Result<(), novarocks_execution_contract::failure::FailureFact>) + Send,
+        >,
+    ) {
+        let Self {
+            runtime,
+            scope,
+            observer,
+            stream,
+        } = *self;
+        spawn_exchange_call(&runtime, activity, async move {
+            observe_grant_only(observer.as_deref(), stream, "dispatch_parked");
+            tokio::select! {
+                biased;
+                _ = stop.cancelled() => {
+                    observe_grant_only(observer.as_deref(), stream, "parked_dispatch_stopped");
+                }
+                result = scope.wait_for_action_end() => {
+                    observe_grant_only(observer.as_deref(), stream, "dispatch_unparked");
+                    release(result.map_err(|_| unit_failure(
+                        novarocks_execution_contract::failure::FailureClass::Invariant, 464,
+                    )));
+                }
+            }
+        });
+    }
+}
+
 impl ExchangeFrameTransmitter for GrpcExchangeFrameTransmitter {
+    #[cfg(novarocks_dev_controls)]
+    fn test_dispatch_hold(
+        &self,
+        stream: novarocks_execution_contract::ExchangeStreamIdentity,
+    ) -> Result<
+        Option<Box<dyn novarocks_execution::runtime::task::io::exchange::ExchangeDispatchTestHold>>,
+        novarocks_execution_contract::failure::FailureFact,
+    > {
+        let control_failure = |_| {
+            unit_failure(
+                novarocks_execution_contract::failure::FailureClass::Invariant,
+                464,
+            )
+        };
+        let Some(scope) = self.grant_probe(stream).map_err(control_failure)? else {
+            return Ok(None);
+        };
+        let observer = self.probe_observer(stream).map_err(control_failure)?;
+        scope.record_hit().map_err(control_failure)?;
+        Ok(Some(Box::new(NativeDispatchTestHold {
+            runtime: self.runtime.clone(),
+            scope,
+            observer,
+            stream,
+        })))
+    }
+
     #[cfg(novarocks_dev_controls)]
     fn normal_close_accepted(
         &self,
@@ -264,51 +335,9 @@ impl ExchangeFrameTransmitter for GrpcExchangeFrameTransmitter {
         }
         let runtime = self.runtime.clone();
         let timeout = self.send_timeout;
-        #[cfg(novarocks_dev_controls)]
-        let hold = self.grant_probe(stream);
-        #[cfg(novarocks_dev_controls)]
-        let carries_end = matches!(
-            frame.receiver.item,
-            novarocks_execution::runtime::task::io::exchange_unit::ExchangeUnitItem::End(_)
-                | novarocks_execution::runtime::task::io::exchange_unit::ExchangeUnitItem::Unit {
-                    end_after_unit: true,
-                    ..
-                }
-        );
         spawn_exchange_call(&self.runtime, activity, async move {
             #[cfg(novarocks_dev_controls)]
-            match hold {
-                Ok(Some(hold)) => {
-                    if let Err(detail) = hold.record_hit() {
-                        done(ExchangeCallOutcome::NotProcessed(detail.into()));
-                        return;
-                    }
-                    observe_grant_only(observer.as_deref(), stream, "deliver_parked");
-                    if carries_end {
-                        observe_grant_only(observer.as_deref(), stream, "deliver_end_parked");
-                    }
-                    tokio::select! {
-                        biased;
-                        _ = stop.cancelled() => {
-                            observe_grant_only(observer.as_deref(), stream, "parked_delivery_stopped");
-                            done(ExchangeCallOutcome::NotProcessed("selected delivery stopped before RPC".into()));
-                            return;
-                        }
-                        release = hold.wait_for_action_end() => {
-                            if let Err(detail) = release {
-                                done(ExchangeCallOutcome::NotProcessed(detail.into()));
-                                return;
-                            }
-                        }
-                    }
-                    observe_grant_only(observer.as_deref(), stream, "deliver_unparked");
-                }
-                Ok(None) => {}
-                Err(detail) => {
-                    done(ExchangeCallOutcome::NotProcessed(detail.into()));
-                    return;
-                }
-            }
+            let _observation = observer;
             let client = NativeRpcClient::new_backend_endpoint(
                 runtime,
                 frame.destination.native_endpoint().clone(),

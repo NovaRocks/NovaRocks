@@ -533,6 +533,14 @@ struct MeasuredTransmitter {
     profiles: Arc<Mutex<Option<OperatorProfiles>>>,
 }
 impl ExchangeFrameTransmitter for MeasuredTransmitter {
+    #[cfg(novarocks_dev_controls)]
+    fn test_dispatch_hold(
+        &self,
+        stream: ExchangeStreamIdentity,
+    ) -> Result<Option<Box<dyn super::exchange::ExchangeDispatchTestHold>>, FailureFact> {
+        self.inner.test_dispatch_hold(stream)
+    }
+
     fn normal_close_accepted(&self, notice: super::exchange::ExchangeNormalCloseAccepted) {
         self.inner.normal_close_accepted(notice);
     }

@@ -3433,7 +3433,7 @@ fn verify_grant_only_writer_stop(
                         .find(|(trigger, seen)| {
                             sender.backend != trigger.backend
                                 && sender.shares_input(trigger)
-                                && seen.contains_key("event=deliver_parked")
+                                && seen.contains_key("event=dispatch_parked")
                         })
                         .map(|(trigger, _)| (sender.clone(), trigger.clone(), registered))
                 })
@@ -3499,8 +3499,8 @@ fn verify_grant_only_writer_stop(
         let events = grant_only_events(context)?;
         let seen = &events[&sender];
         anyhow::ensure!(
-            seen.contains_key("event=parked_delivery_stopped")
-                && !seen.contains_key("event=deliver_unparked")
+            seen.contains_key("event=parked_dispatch_stopped")
+                && !seen.contains_key("event=dispatch_unparked")
                 && seen.get("event=demand_started") == Some(&register_count)
                 && seen.get("event=demand_exited") == Some(&register_count),
             "a new unary or missing actual stop overlapped the original subscriber: {seen:?}"
