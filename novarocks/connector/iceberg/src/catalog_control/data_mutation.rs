@@ -21,7 +21,7 @@
 //! runtime supplied by the control factory. No catalog-name registry or
 //! process-global async runtime participates in this path.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use crate::iceberg::{NamespaceIdent, TableIdent};
@@ -152,20 +152,12 @@ struct RegistrationPlanPayload {
 enum PlannedIcebergMutation {
     RegisterExistingFiles {
         payload: RegistrationPlanPayload,
-        #[expect(
-            dead_code,
-            reason = "registration execution consumes the source location in P08"
-        )]
         location: Arc<str>,
-        #[expect(
-            dead_code,
-            reason = "registration execution consumes the recursion mode in P08"
-        )]
         recursion: ConnectorAddFilesRecursion,
     },
     Truncate {
         payload: IcebergDataMutationPlanPayloadV2,
-        source_metadata: TableMetadata,
+        source_metadata: Arc<TableMetadata>,
     },
 }
 
@@ -214,13 +206,14 @@ fn validate_registration_target(
                 "ADD_FILES is not supported for Iceberg table format version > 2. Table \"{namespace}\".\"{table}\" format version is {}.",
                 version as u8,
             ),
-        ));
+        ).with_public_failure_detail());
     }
     if format != ConnectorAddFilesFormat::Parquet {
         return Err(ConnectorError::new(
             ConnectorErrorKind::Unsupported,
             "NovaRocks ADD FILES only reads Parquet data files",
-        ));
+        )
+        .with_public_failure_detail());
     }
     Ok(())
 }
@@ -242,6 +235,7 @@ struct CachedPlan {
     request_digest: [u8; 32],
     plan: ConnectorDataMutationPlan,
     private: PlannedIcebergMutation,
+    execution: Arc<Mutex<()>>,
 }
 
 #[derive(Clone)]
@@ -251,11 +245,50 @@ struct TerminalRecord {
 }
 
 #[derive(Clone)]
+struct MutationRecoverySource {
+    target: DataFinalizationFacts,
+    target_ref: String,
+    base_snapshot_id: Option<i64>,
+    base_sequence_number: Option<i64>,
+}
+
+impl From<&IcebergDataMutationPlanPayloadV2> for MutationRecoverySource {
+    fn from(plan: &IcebergDataMutationPlanPayloadV2) -> Self {
+        Self {
+            target: DataFinalizationFacts {
+                namespace: plan.namespace.clone(),
+                table: plan.table.clone(),
+                table_uuid: plan.table_uuid.clone(),
+            },
+            target_ref: plan.target_ref.clone(),
+            base_snapshot_id: plan.base_snapshot_id,
+            base_sequence_number: plan.base_sequence_number,
+        }
+    }
+}
+
+impl MutationRecoverySource {
+    fn registration(plan: &RegistrationPlanPayload, start: Option<StartSnapshot>) -> Self {
+        Self {
+            target: DataFinalizationFacts {
+                namespace: plan.namespace.clone(),
+                table: plan.table.clone(),
+                table_uuid: plan.table_uuid.clone(),
+            },
+            target_ref: "main".into(),
+            base_snapshot_id: start.map(|s| s.snapshot_id),
+            base_sequence_number: start.map(|s| s.sequence_number),
+        }
+    }
+}
+
+#[derive(Clone)]
 struct MutationRecoveryTemplate {
     descriptor: ConnectorInstanceDescriptor,
     key: ConnectorProviderBindingKey,
     plan: ConnectorDataMutationPlan,
-    payload: IcebergDataMutationPlanPayloadV2,
+    source: MutationRecoverySource,
+    summary: ConnectorDataMutationPlanSummary,
 }
 
 impl MutationRecoveryTemplate {
@@ -263,14 +296,42 @@ impl MutationRecoveryTemplate {
         descriptor: ConnectorInstanceDescriptor,
         key: ConnectorProviderBindingKey,
         plan: ConnectorDataMutationPlan,
-        payload: IcebergDataMutationPlanPayloadV2,
+        source: MutationRecoverySource,
     ) -> Self {
+        let summary = plan.summary();
         Self {
             descriptor,
             key,
             plan,
-            payload,
+            source,
+            summary,
         }
+    }
+
+    fn marker(&self) -> IcebergDataMutationMarkerV1 {
+        IcebergDataMutationMarkerV1 {
+            version: MARKER_VALUE_VERSION,
+            identity_digest_hex: hex_encode(identity_digest(
+                &self.descriptor,
+                &self.key,
+                &self.plan,
+            )),
+            incarnation_hex: hex_encode(self.key.incarnation.to_bytes()),
+            operation_id_hex: hex_encode(self.plan.operation_id().to_bytes()),
+            operation_kind: self.plan.operation_kind().to_string(),
+            request_digest_hex: hex_encode(self.plan.request_digest()),
+            plan_digest_hex: hex_encode(self.plan.plan_digest()),
+            state_digest_hex: hex_encode(self.plan.state_digest()),
+            target_ref: self.source.target_ref.clone(),
+            base_snapshot_id: self.source.base_snapshot_id,
+            file_count: self.summary.file_count(),
+            row_count: self.summary.row_count(),
+            total_bytes: self.summary.total_bytes(),
+        }
+    }
+
+    fn finalization(&self) -> DataFinalizationFacts {
+        self.source.target.clone()
     }
 
     fn receipt(&self, snapshot_id: i64) -> Result<ConnectorDataMutationReceipt, ConnectorError> {
@@ -282,7 +343,7 @@ impl MutationRecoveryTemplate {
             self.plan.request_digest(),
             self.plan.plan_digest(),
             self.plan.state_digest(),
-            self.plan.summary(),
+            self.summary,
             durable_receipt_payload(snapshot_id)?,
         )
     }
@@ -290,11 +351,7 @@ impl MutationRecoveryTemplate {
     fn publication_receipt(&self, snapshot_id: i64) -> Result<DataPublication, ConnectorError> {
         Ok(DataPublication {
             receipt: self.receipt(snapshot_id)?,
-            finalization: DataFinalizationFacts {
-                namespace: self.payload.namespace.clone(),
-                table: self.payload.table.clone(),
-                table_uuid: self.payload.table_uuid.clone(),
-            },
+            finalization: self.finalization(),
         })
     }
 
@@ -302,15 +359,15 @@ impl MutationRecoveryTemplate {
         &self,
         publication: RecoveryPublication,
     ) -> Result<ExternalMutationEvidence, ConnectorError> {
-        let summary = self.plan.summary();
+        let summary = self.summary;
         let payload = IcebergDataMutationEvidenceV3 {
             version: EVIDENCE_PAYLOAD_VERSION,
-            namespace: self.payload.namespace.clone(),
-            table: self.payload.table.clone(),
-            target_ref: self.payload.target_ref.clone(),
-            table_uuid: self.payload.table_uuid.clone(),
-            base_snapshot_id: self.payload.base_snapshot_id,
-            base_sequence_number: self.payload.base_sequence_number,
+            namespace: self.source.target.namespace.clone(),
+            table: self.source.target.table.clone(),
+            target_ref: self.source.target_ref.clone(),
+            table_uuid: self.source.target.table_uuid.clone(),
+            base_snapshot_id: self.source.base_snapshot_id,
+            base_sequence_number: self.source.base_sequence_number,
             operation_id_hex: hex_encode(self.plan.operation_id().to_bytes()),
             operation_kind: self.plan.operation_kind().into(),
             request_digest_hex: hex_encode(self.plan.request_digest()),
@@ -413,6 +470,14 @@ trait IcebergDataMutationBackend: Send + Sync {
         marker: &IcebergDataMutationMarkerV1,
         recovery: &MutationRecoveryTemplate,
         context: &ConnectorRequestContext,
+    ) -> Result<ExternalMutationOutcome<ConnectorDataMutationReceipt>, ConnectorError>;
+
+    fn execute_registration(
+        &self,
+        planned: &PlannedIcebergMutation,
+        request: &ConnectorDataMutationExecuteRequest,
+        descriptor: &ConnectorInstanceDescriptor,
+        key: &ConnectorProviderBindingKey,
     ) -> Result<ExternalMutationOutcome<ConnectorDataMutationReceipt>, ConnectorError>;
 
     fn evidence_policy(&self) -> crate::catalog::publication::CatalogEvidencePolicy;
@@ -616,7 +681,7 @@ impl IcebergDataMutationBackend for RegisteredIcebergDataMutationBackend {
                 Ok((
                     PlannedIcebergMutation::Truncate {
                         payload,
-                        source_metadata: metadata.clone(),
+                        source_metadata: table.metadata_ref(),
                     },
                     state_digest,
                     ConnectorDataMutationPlanSummary::default(),
@@ -633,6 +698,16 @@ impl IcebergDataMutationBackend for RegisteredIcebergDataMutationBackend {
         context: &ConnectorRequestContext,
     ) -> Result<ExternalMutationOutcome<ConnectorDataMutationReceipt>, ConnectorError> {
         self.execute_publication(planned, marker, recovery, context)
+    }
+
+    fn execute_registration(
+        &self,
+        planned: &PlannedIcebergMutation,
+        request: &ConnectorDataMutationExecuteRequest,
+        descriptor: &ConnectorInstanceDescriptor,
+        key: &ConnectorProviderBindingKey,
+    ) -> Result<ExternalMutationOutcome<ConnectorDataMutationReceipt>, ConnectorError> {
+        self.publish_registration(planned, request, descriptor, key)
     }
 
     fn evidence_policy(&self) -> crate::catalog::publication::CatalogEvidencePolicy {
@@ -662,43 +737,52 @@ impl IcebergDataMutationBackend for RegisteredIcebergDataMutationBackend {
         context: &ConnectorRequestContext,
     ) -> Result<MarkerLookup, ConnectorError> {
         let table = self.reload_table(namespace, table, context)?;
-        let metadata = table.metadata();
-        let target_snapshot = target_snapshot_id(metadata, target_ref)?;
-        let mut by_id = HashMap::new();
-        for snapshot in metadata.snapshots() {
-            by_id.insert(snapshot.snapshot_id(), snapshot);
-        }
-        let mut cursor = target_snapshot;
-        let mut visited = HashSet::new();
-        while let Some(snapshot_id) = cursor {
-            if !visited.insert(snapshot_id) {
-                return Err(corrupt("Iceberg snapshot ancestry contains a cycle"));
-            }
-            let Some(snapshot) = by_id.get(&snapshot_id) else {
-                break;
-            };
-            if let Some(raw) = snapshot
-                .summary()
-                .additional_properties
-                .get(MARKER_PROPERTY)
-            {
-                let marker: IcebergDataMutationMarkerV1 =
-                    decode_canonical_json(raw.as_bytes(), "Iceberg data mutation marker")?;
-                if marker.operation_id_hex == operation_id_hex {
-                    return Ok(if marker.identity_digest_hex == identity_digest_hex {
-                        MarkerLookup::Matching { observation: crate::commit::publication_descriptor::PositiveAttributionObservation::SnapshotMarker {
+        find_marker(
+            table.metadata(),
+            target_ref,
+            operation_id_hex,
+            identity_digest_hex,
+        )
+    }
+}
+
+fn find_marker(
+    metadata: &TableMetadata,
+    target_ref: &str,
+    operation_id_hex: &str,
+    identity_digest_hex: &str,
+) -> Result<MarkerLookup, ConnectorError> {
+    let target_snapshot = target_snapshot_id(metadata, target_ref)?;
+    let mut cursor = target_snapshot;
+    let mut remaining = metadata.snapshots().len();
+    while let Some(snapshot_id) = cursor {
+        let Some(snapshot) = metadata.snapshot_by_id(snapshot_id) else {
+            break;
+        };
+        remaining = remaining
+            .checked_sub(1)
+            .ok_or_else(|| corrupt("Iceberg snapshot ancestry contains a cycle"))?;
+        if let Some(raw) = snapshot
+            .summary()
+            .additional_properties
+            .get(MARKER_PROPERTY)
+        {
+            let marker: IcebergDataMutationMarkerV1 =
+                decode_canonical_json(raw.as_bytes(), "Iceberg data mutation marker")?;
+            if marker.operation_id_hex == operation_id_hex {
+                return Ok(if marker.identity_digest_hex == identity_digest_hex {
+                    MarkerLookup::Matching { observation: crate::commit::publication_descriptor::PositiveAttributionObservation::SnapshotMarker {
                             table_uuid: metadata.uuid(), snapshot_id,
                             marker_key: MARKER_PROPERTY.to_owned(), marker_value: raw.clone(),
                         } }
-                    } else {
-                        MarkerLookup::Conflicting
-                    });
-                }
+                } else {
+                    MarkerLookup::Conflicting
+                });
             }
-            cursor = snapshot.parent_snapshot_id();
         }
-        Ok(MarkerLookup::Missing)
+        cursor = snapshot.parent_snapshot_id();
     }
+    Ok(MarkerLookup::Missing)
 }
 
 pub struct IcebergDataMutationAdapter {
@@ -747,27 +831,19 @@ impl IcebergDataMutationAdapter {
         Ok(())
     }
 
+    #[cfg(test)]
     fn marker(
         &self,
         plan: &ConnectorDataMutationPlan,
         payload: &IcebergDataMutationPlanPayloadV2,
     ) -> IcebergDataMutationMarkerV1 {
-        let summary = plan.summary();
-        IcebergDataMutationMarkerV1 {
-            version: MARKER_VALUE_VERSION,
-            identity_digest_hex: hex_encode(identity_digest(&self.descriptor, &self.key, plan)),
-            incarnation_hex: hex_encode(self.key.incarnation.to_bytes()),
-            operation_id_hex: hex_encode(plan.operation_id().to_bytes()),
-            operation_kind: plan.operation_kind().to_string(),
-            request_digest_hex: hex_encode(plan.request_digest()),
-            plan_digest_hex: hex_encode(plan.plan_digest()),
-            state_digest_hex: hex_encode(plan.state_digest()),
-            target_ref: payload.target_ref.clone(),
-            base_snapshot_id: payload.base_snapshot_id,
-            file_count: summary.file_count(),
-            row_count: summary.row_count(),
-            total_bytes: summary.total_bytes(),
-        }
+        MutationRecoveryTemplate::new(
+            self.descriptor.clone(),
+            self.key.clone(),
+            plan.clone(),
+            payload.into(),
+        )
+        .marker()
     }
 
     fn evidence(
@@ -779,7 +855,7 @@ impl IcebergDataMutationAdapter {
             self.descriptor.clone(),
             self.key.clone(),
             plan.clone(),
-            payload.clone(),
+            payload.into(),
         )
         .evidence(RecoveryPublication::MarkerOnly {})
     }
@@ -834,6 +910,7 @@ impl ConnectorDataMutation for IcebergDataMutationAdapter {
                 request_digest: request.request_digest(),
                 plan: plan.clone(),
                 private,
+                execution: Arc::new(Mutex::new(())),
             },
         );
         Ok(plan)
@@ -845,28 +922,6 @@ impl ConnectorDataMutation for IcebergDataMutationAdapter {
     ) -> Result<ExternalMutationOutcome<ConnectorDataMutationReceipt>, ConnectorError> {
         request.plan.validate()?;
         self.ensure_owner(request.plan.owner())?;
-        if let Some(record) = self
-            .terminal
-            .lock()
-            .map_err(|error| internal(format!("Iceberg data mutation terminal lock: {error}")))?
-            .get(&request.plan.operation_id())
-            .cloned()
-        {
-            if record.plan_digest == request.plan.plan_digest() {
-                if let ExternalMutationOutcome::CommitUnknown { evidence, .. } = &record.outcome
-                    && let Some((journal, entry)) =
-                        crate::commit::attempt::observation::PublicationJournal::<DataPublication>::from_evidence(evidence)?
-                    {
-                        return Ok(publication::project_external(
-                            journal.catalog_entry_outcome(entry),
-                        ));
-                    }
-                return Ok(record.outcome);
-            }
-            return Err(invalid(
-                "Iceberg data mutation operation was executed with a different plan",
-            ));
-        }
         let cached = self
             .plans
             .lock()
@@ -879,49 +934,80 @@ impl ConnectorDataMutation for IcebergDataMutationAdapter {
                 "Iceberg data mutation execute request conflicts with the planned operation",
             ));
         }
-        let Some((payload, _)) = cached.private.truncate_parts() else {
-            return Ok(publication::registration_pending());
-        };
-        let marker = self.marker(&request.plan, payload);
-        let outcome = match self.backend.lookup_marker(
-            &payload.namespace,
-            &payload.table,
-            &marker.target_ref,
-            &marker.operation_id_hex,
-            &marker.identity_digest_hex,
-            &request.context,
-        ) {
-            Ok(MarkerLookup::Matching { .. }) => ExternalMutationOutcome::CommitUnknown {
-                failure: failure(
-                    ConnectorMutationFailureKind::Unavailable,
-                    "An existing data mutation marker has no original local dispatch journal",
-                ),
-                evidence: self.evidence(&request.plan, payload)?,
-            },
-            Ok(MarkerLookup::Conflicting) => ExternalMutationOutcome::CommitUnknown {
-                failure: failure(
-                    ConnectorMutationFailureKind::Conflict,
-                    "Iceberg data mutation marker conflicts with this operation",
-                ),
-                evidence: self.evidence(&request.plan, payload)?,
-            },
-            Ok(MarkerLookup::Missing) => self.backend.execute(
-                &cached.private,
-                &marker,
-                &MutationRecoveryTemplate::new(
-                    self.descriptor.clone(),
-                    self.key.clone(),
-                    request.plan.clone(),
-                    payload.clone(),
-                ),
+        let _execution = cached
+            .execution
+            .lock()
+            .map_err(|error| internal(format!("Iceberg data mutation execution lock: {error}")))?;
+        if let Some(record) = self
+            .terminal
+            .lock()
+            .map_err(|error| internal(format!("Iceberg data mutation terminal lock: {error}")))?
+            .get(&request.plan.operation_id())
+            .cloned()
+        {
+            if record.plan_digest == request.plan.plan_digest() {
+                if let ExternalMutationOutcome::CommitUnknown { evidence, .. } = &record.outcome
+                    && let Some((journal, entry)) =
+                        crate::commit::attempt::observation::PublicationJournal::<DataPublication>::from_evidence(evidence)?
+                    {
+                        return Ok(publication::project_for_operation(
+                            journal.catalog_entry_outcome(entry), request.plan.operation_kind(),
+                        ));
+                    }
+                return Ok(record.outcome);
+            }
+            return Err(invalid(
+                "Iceberg data mutation operation was executed with a different plan",
+            ));
+        }
+        let outcome = if let Some((payload, _)) = cached.private.truncate_parts() {
+            let template = MutationRecoveryTemplate::new(
+                self.descriptor.clone(),
+                self.key.clone(),
+                request.plan.clone(),
+                payload.into(),
+            );
+            let marker = template.marker();
+            match self.backend.lookup_marker(
+                &payload.namespace,
+                &payload.table,
+                &marker.target_ref,
+                &marker.operation_id_hex,
+                &marker.identity_digest_hex,
                 &request.context,
-            )?,
-            Err(error) => ExternalMutationOutcome::KnownUncommitted {
-                failure: crate::commit::attempt::before_dispatch_failure(
-                    &publication::format_error(error),
-                ),
-                cleanup: ExternalMutationFinalization::Complete,
-            },
+            ) {
+                Ok(MarkerLookup::Matching { .. }) => ExternalMutationOutcome::CommitUnknown {
+                    failure: failure(
+                        ConnectorMutationFailureKind::Unavailable,
+                        "An existing data mutation marker has no original local dispatch journal",
+                    ),
+                    evidence: self.evidence(&request.plan, payload)?,
+                },
+                Ok(MarkerLookup::Conflicting) => ExternalMutationOutcome::CommitUnknown {
+                    failure: failure(
+                        ConnectorMutationFailureKind::Conflict,
+                        "Iceberg data mutation marker conflicts with this operation",
+                    ),
+                    evidence: self.evidence(&request.plan, payload)?,
+                },
+                Ok(MarkerLookup::Missing) => {
+                    self.backend
+                        .execute(&cached.private, &marker, &template, &request.context)?
+                }
+                Err(error) => ExternalMutationOutcome::KnownUncommitted {
+                    failure: crate::commit::attempt::before_dispatch_failure(
+                        &publication::format_error(error),
+                    ),
+                    cleanup: ExternalMutationFinalization::Complete,
+                },
+            }
+        } else {
+            self.backend.execute_registration(
+                &cached.private,
+                &request,
+                &self.descriptor,
+                &self.key,
+            )?
         };
         self.terminal
             .lock()
@@ -951,7 +1037,8 @@ impl ConnectorDataMutation for IcebergDataMutationAdapter {
         >::from_evidence(&request.evidence)?
         else {
             return Ok(ExternalMutationOutcome::CommitUnknown {
-                failure: failure(
+                failure: unknown_reconciliation_failure(
+                    &request,
                     ConnectorMutationFailureKind::Unavailable,
                     "Read-only data mutation reconciliation has no original in-process journal owner",
                 ),
@@ -961,15 +1048,27 @@ impl ConnectorDataMutation for IcebergDataMutationAdapter {
         if let committed @ ExternalMutationOutcome::KnownCommitted { .. } =
             journal.catalog_entry_outcome(entry)
         {
-            return Ok(publication::project_external(committed));
+            return Ok(publication::project_for_operation(
+                committed,
+                &request.operation_kind,
+            ));
         }
+        let fresh_context;
+        let observation_context = if request.operation_kind.as_ref()
+            == novarocks_spi::connector::REGISTER_EXISTING_FILES_KIND
+        {
+            fresh_context = request.context.clone().after_external_effect();
+            &fresh_context
+        } else {
+            &request.context
+        };
         match self.backend.lookup_marker(
             &evidence.namespace,
             &evidence.table,
             &evidence.target_ref,
             &evidence.operation_id_hex,
             &evidence.identity_digest_hex,
-            &request.context,
+            observation_context,
         )? {
             MarkerLookup::Matching { observation } => {
                 let descriptor = journal
@@ -986,10 +1085,14 @@ impl ConnectorDataMutation for IcebergDataMutationAdapter {
                     if let committed @ ExternalMutationOutcome::KnownCommitted { .. } =
                         journal.catalog_entry_outcome(entry)
                     {
-                        return Ok(publication::project_external(committed));
+                        return Ok(publication::project_for_operation(
+                            committed,
+                            &request.operation_kind,
+                        ));
                     }
                     return Ok(ExternalMutationOutcome::CommitUnknown {
-                        failure: failure(
+                        failure: unknown_reconciliation_failure(
+                            &request,
                             ConnectorMutationFailureKind::Conflict,
                             "Observed data mutation marker does not prove the exact original request",
                         ),
@@ -1017,23 +1120,40 @@ impl ConnectorDataMutation for IcebergDataMutationAdapter {
                     }
                     result = journal.catalog_entry_outcome(entry);
                 }
-                Ok(publication::project_external(result))
+                Ok(publication::project_for_operation(
+                    result,
+                    &request.operation_kind,
+                ))
             }
             MarkerLookup::Conflicting => Ok(ExternalMutationOutcome::CommitUnknown {
-                failure: failure(
+                failure: unknown_reconciliation_failure(
+                    &request,
                     ConnectorMutationFailureKind::Conflict,
                     "Iceberg data mutation marker conflicts with reconciliation evidence",
                 ),
                 evidence: request.evidence,
             }),
             MarkerLookup::Missing => Ok(ExternalMutationOutcome::CommitUnknown {
-                failure: failure(
+                failure: unknown_reconciliation_failure(
+                    &request,
                     ConnectorMutationFailureKind::Unavailable,
                     "Iceberg data mutation marker is not yet visible",
                 ),
                 evidence: request.evidence,
             }),
         }
+    }
+}
+
+fn unknown_reconciliation_failure(
+    request: &ConnectorDataMutationReconcileRequest,
+    kind: ConnectorMutationFailureKind,
+    detail: &'static str,
+) -> ConnectorMutationFailure {
+    if request.operation_kind.as_ref() == novarocks_spi::connector::REGISTER_EXISTING_FILES_KIND {
+        publication::registration_unknown(detail)
+    } else {
+        failure(kind, detail)
     }
 }
 

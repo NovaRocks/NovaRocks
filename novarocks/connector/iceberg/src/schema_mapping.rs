@@ -655,16 +655,23 @@ pub(crate) fn name_mapping_from_schema(schema: &crate::iceberg::spec::Schema) ->
 
 /// Resolve a recorded path in a later mapping with the same ancestor rule
 /// as file binding. An unmapped ancestor hides its entire physical subtree.
-#[allow(dead_code, reason = "ADD FILES publication consumes this fact in P08")]
+#[cfg(test)]
 pub(crate) fn mapped_path_id(
     mapping: &NameMapping,
     path: &[String],
 ) -> Result<Option<i32>, String> {
-    let Some((name, rest)) = path.split_first() else {
+    mapped_path_segments(mapping, path.iter().map(String::as_str))
+}
+
+pub(crate) fn mapped_path_segments<'a>(
+    mapping: &NameMapping,
+    mut segments: impl Iterator<Item = &'a str>,
+) -> Result<Option<i32>, String> {
+    let Some(name) = segments.next() else {
         return Ok(None);
     };
     let mut entry = mapped_field_for_name(mapping.fields().iter(), name)?;
-    for segment in rest {
+    for segment in segments {
         let Some(parent) = entry.filter(|parent| parent.field_id().is_some()) else {
             return Ok(None);
         };

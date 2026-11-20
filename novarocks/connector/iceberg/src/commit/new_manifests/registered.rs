@@ -48,10 +48,6 @@ pub(crate) struct RegisteredFile {
 }
 
 impl RegisteredFile {
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "Registered stage caller lands in P08")
-    )]
     pub(crate) fn try_new(
         file: DataFile,
         path: ObjectIdentity,
@@ -78,6 +74,10 @@ impl RegisteredFile {
         Ok(entry)
     }
 
+    pub(crate) fn path(&self) -> &str {
+        self.path.path()
+    }
+
     pub(super) fn take_for_manifest(&mut self, spec_id: i32) -> Result<ManifestEntryWrite> {
         let file = self
             .file
@@ -98,10 +98,6 @@ pub(crate) struct RegisteredNewFiles {
 }
 
 impl RegisteredNewFiles {
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "Registered stage caller lands in P08")
-    )]
     pub(crate) fn try_new(
         source: Arc<TableMetadata>,
         entries: Vec<RegisteredFile>,
@@ -155,8 +151,22 @@ impl RegisteredNewFiles {
         Ok(files)
     }
 
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
     pub(crate) fn counts(&self) -> AddedCounters {
         self.counts
+    }
+
+    pub(crate) fn candidate_index(&self, path: &str) -> Option<usize> {
+        self.entries
+            .binary_search_by(|entry| entry.path.path().cmp(path))
+            .ok()
+    }
+
+    pub(crate) fn candidate_path(&self, index: usize) -> Option<&str> {
+        self.entries.get(index).map(|entry| entry.path.path())
     }
 
     pub(in crate::commit) fn retain_paths(&self) -> Result<Arc<RegisteredPaths>> {
@@ -210,15 +220,19 @@ impl RegisteredPaths {
         }))
     }
 
-    pub(in crate::commit) fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.paths.len()
     }
 
-    pub(in crate::commit) fn get(&self, index: usize) -> Option<&str> {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.paths.is_empty()
+    }
+
+    pub(crate) fn get(&self, index: usize) -> Option<&str> {
         self.paths.get(index).map(|entry| entry.identity.path())
     }
 
-    pub(in crate::commit) fn index(&self, path: &str) -> Option<usize> {
+    pub(crate) fn index(&self, path: &str) -> Option<usize> {
         self.paths
             .binary_search_by(|entry| entry.identity.path().cmp(path))
             .ok()

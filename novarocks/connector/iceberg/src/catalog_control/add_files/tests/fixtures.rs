@@ -111,13 +111,19 @@ impl SourceHttpFixture {
                 let mut extra = String::new();
                 let mut content_length = bytes.len();
                 let body = if method == "GET" && !is_object {
-                    let listing = format!(
-                        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>source-bucket</Name><Prefix>incoming/</Prefix><KeyCount>2</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated><Contents><Key>incoming/a.parquet</Key><LastModified>2026-10-10T00:00:00.000Z</LastModified><ETag>\"external-stable\"</ETag><Size>{}</Size><StorageClass>STANDARD</StorageClass></Contents><Contents><Key>incoming/b.parquet</Key><LastModified>2026-10-10T00:00:00.000Z</LastModified><ETag>\"external-stable\"</ETag><Size>{}</Size><StorageClass>STANDARD</StorageClass></Contents></ListBucketResult>",
-                        bytes.len(),
-                        bytes.len()
-                    );
-                    content_length = listing.len();
-                    listing.into_bytes()
+                    if target.contains("a.parquet") {
+                        let listing = b"<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>source-bucket</Name><Prefix>incoming/a.parquet/</Prefix><KeyCount>0</KeyCount><IsTruncated>false</IsTruncated></ListBucketResult>";
+                        content_length = listing.len();
+                        listing.to_vec()
+                    } else {
+                        let listing = format!(
+                            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>source-bucket</Name><Prefix>incoming/</Prefix><KeyCount>2</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated><Contents><Key>incoming/a.parquet</Key><LastModified>2026-10-10T00:00:00.000Z</LastModified><ETag>\"external-stable\"</ETag><Size>{}</Size><StorageClass>STANDARD</StorageClass></Contents><Contents><Key>incoming/b.parquet</Key><LastModified>2026-10-10T00:00:00.000Z</LastModified><ETag>\"external-stable\"</ETag><Size>{}</Size><StorageClass>STANDARD</StorageClass></Contents></ListBucketResult>",
+                            bytes.len(),
+                            bytes.len()
+                        );
+                        content_length = listing.len();
+                        listing.into_bytes()
+                    }
                 } else if method == "HEAD" && is_object {
                     if stat_armed.swap(false, Ordering::SeqCst) {
                         tail_tx.send(()).unwrap();
@@ -160,9 +166,22 @@ impl SourceHttpFixture {
                     content_length = 0;
                     Vec::new()
                 };
-                write!(stream, "HTTP/1.1 {status}\r\nContent-Length: {content_length}\r\nETag: \"external-stable\"\r\nLast-Modified: Sat, 10 Oct 2026 00:00:00 GMT\r\nAccept-Ranges: bytes\r\n{extra}Connection: close\r\n\r\n").unwrap();
-                stream.write_all(&body).unwrap();
-                stream.flush().unwrap();
+                let reply = write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Length: {content_length}\r\nETag: \"external-stable\"\r\nLast-Modified: Sat, 10 Oct 2026 00:00:00 GMT\r\nAccept-Ranges: bytes\r\n{extra}Connection: close\r\n\r\n"
+                );
+                if let Err(error) = reply
+                    .and_then(|()| stream.write_all(&body))
+                    .and_then(|()| stream.flush())
+                {
+                    assert!(
+                        matches!(
+                            error.kind(),
+                            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                        ),
+                        "source fixture response: {error}"
+                    );
+                }
             }
         });
         Self {

@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod registration;
+
 use super::*;
 use crate::catalog_control::data_mutation::tests::{
     exact_provider_with_empty_table, table_context, write_external_parquet,
@@ -137,7 +139,7 @@ fn exercise_truncate(behavior: Behavior) {
         adapter.descriptor.clone(),
         adapter.key.clone(),
         plan.clone(),
-        payload.clone(),
+        payload.into(),
     );
     let runtime = provider.runtime();
     let table = runtime

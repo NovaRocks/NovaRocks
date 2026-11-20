@@ -40,18 +40,11 @@ pub(crate) struct ResolvedParquetLeaf {
 
 pub(crate) type ResolvedParquetLeaves = Vec<ResolvedParquetLeaf>;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct MappingUse {
-    pub(crate) path: Vec<String>,
-    pub(crate) field_id: Option<i32>,
-}
-
 #[derive(Clone, Debug)]
 pub(crate) struct ResolvedParquetFields {
     pub(crate) schema: SchemaRef,
     pub(crate) coverage: FileFieldIdCoverage,
     pub(crate) leaves: ResolvedParquetLeaves,
-    pub(crate) mapping_uses: Vec<MappingUse>,
 }
 
 #[derive(Debug)]
@@ -99,18 +92,13 @@ pub(crate) fn original_field_id_coverage(
 pub(crate) fn resolve_parquet_fields(
     footer: &ParquetMetadataInspection,
     mapping: Option<&NameMapping>,
+    observe: impl FnMut(&[&str], Option<i32>),
 ) -> Result<ResolvedParquetFields, FieldIdentityError> {
     if footer.interpretation_policy() != ParquetInterpretationPolicy::SkipArrowHint {
         return Err(corrupt("Iceberg field identity requires the original Parquet schema").into());
     }
     let coverage = original_field_id_coverage(footer.schema())?;
-    let mut mapping_uses = Vec::new();
-    let schema = resolve_arrow_fields(footer.schema(), coverage, mapping, |path, field_id| {
-        mapping_uses.push(MappingUse {
-            path: path.iter().map(|name| (*name).to_owned()).collect(),
-            field_id,
-        });
-    })?;
+    let schema = resolve_arrow_fields(footer.schema(), coverage, mapping, observe)?;
     let mut leaves = Vec::with_capacity(footer.physical_columns().len());
     let mut ids = HashSet::new();
     for field in schema.fields() {
@@ -134,7 +122,6 @@ pub(crate) fn resolve_parquet_fields(
         schema,
         coverage,
         leaves,
-        mapping_uses,
     })
 }
 

@@ -540,7 +540,6 @@ fn preflight_accounts_retained_map_tables_and_variable_bounds() {
         .unwrap()
         .request_bytes_upper_bound;
     assert_eq!(plan.retained_bytes(), 3 * counts + 2 * bounds + 6);
-    assert!(plan.encoded_size_estimate() >= 6);
     let result = plan.materialize().unwrap();
     assert_eq!(result.lower_bounds[&1], Datum::string("abc"));
 }

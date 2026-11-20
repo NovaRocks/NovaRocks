@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#[allow(dead_code, reason = "P08 reconnects the source I/O verification")]
 pub(crate) mod fixtures;
 mod listing;
 

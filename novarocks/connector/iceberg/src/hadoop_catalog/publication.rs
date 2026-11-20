@@ -415,7 +415,27 @@ impl FinalizationWork for HadoopHintFinalization {
     }
 }
 
+fn supports_native_install(access: &novarocks_fs::FsAccessHandle) -> bool {
+    access
+        .operator()
+        .info()
+        .capability()
+        .write_with_if_not_exists
+}
+
 impl HadoopFileSystemCatalog {
+    pub(crate) fn supports_native_update_install(
+        &self,
+        metadata_location: &str,
+        request: &ConnectorRequestContext,
+    ) -> Result<bool> {
+        request.check_active().map_err(connector_error)?;
+        let access = original_binding(self, request)?
+            .resolve_access(metadata_location)
+            .map_err(connector_error)?;
+        Ok(supports_native_install(&access))
+    }
+
     pub(crate) fn prepare_namespace_publication(
         self: Arc<Self>,
         namespace: &NamespaceIdent,
@@ -510,12 +530,7 @@ impl HadoopFileSystemCatalog {
         let access = original
             .resolve_access(&install.location)
             .map_err(connector_error)?;
-        if !access
-            .operator()
-            .info()
-            .capability()
-            .write_with_if_not_exists
-        {
+        if !supports_native_install(&access) {
             return Err(Error::new(
                 ErrorKind::FeatureUnsupported,
                 "Hadoop storage lacks native conditional install",

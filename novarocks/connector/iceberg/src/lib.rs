@@ -79,8 +79,6 @@ pub mod metadata_context;
 pub mod metadata_factory;
 mod metadata_json;
 pub mod metadata_read;
-// Wired to the original registration budget in P08.
-#[allow(dead_code)]
 mod parquet_metrics;
 mod partition_row;
 pub mod planning_facts;

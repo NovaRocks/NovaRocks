@@ -253,15 +253,11 @@ impl IcebergCommitOperation {
         Ok(())
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "Registered stage caller lands in P08")
-    )]
     pub(crate) fn install_registered_new_files(
         &self,
         stage: usize,
         files: RegisteredNewFiles,
-    ) -> Result<()> {
+    ) -> Result<Arc<RegisteredPaths>> {
         let mut artifacts = self
             .inner
             .artifacts
@@ -277,21 +273,18 @@ impl IcebergCommitOperation {
                 "Iceberg registration requires one new mutation append stage",
             ));
         }
+        let paths = files.retain_paths()?;
         artifacts
             .ledger
-            .install_registered_paths(stage, files.retain_paths()?)?;
+            .install_registered_paths(stage, Arc::clone(&paths))?;
         artifacts
             .new_files
             .insert(stage, StageNewFiles::Registered(files));
-        Ok(())
+        Ok(paths)
     }
 
     /// The caller has driven its original preparation loop to actual exit.
     /// Unknown publication can outlive this source without retaining its paths.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "Registered stage caller lands in P08")
-    )]
     pub(crate) fn release_registered_paths(&self) {
         let paths = self
             .inner

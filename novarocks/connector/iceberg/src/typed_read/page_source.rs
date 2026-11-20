@@ -1439,7 +1439,7 @@ enum ReaderState {
         /// groups are still being chosen.
         reader: Option<SplitReader>,
         plan: RowGroupPlan,
-        binding: IcebergSchemaBinding,
+        binding: Box<IcebergSchemaBinding>,
         page_schema: Arc<ArrowSchema>,
         checks: Vec<PredicateCheck>,
         positions_required: bool,
@@ -1640,7 +1640,7 @@ impl IcebergParquetPageSource {
         self.state = ReaderState::Open {
             reader: None,
             plan,
-            binding,
+            binding: Box::new(binding),
             page_schema,
             checks,
             positions_required,
@@ -2032,7 +2032,9 @@ impl IcebergParquetPageSource {
     /// preparation, which report their own live retention.
     fn retained_base_bytes(&self) -> u64 {
         let binding = match &self.state {
-            ReaderState::Open { binding, .. } => binding.retained_size_in_bytes(),
+            ReaderState::Open { binding, .. } => binding
+                .retained_size_in_bytes()
+                .saturating_add(size_of::<IcebergSchemaBinding>() as u64),
             ReaderState::NotOpened | ReaderState::Drained => 0,
         };
         self.retained_bytes

@@ -87,6 +87,26 @@ struct StructMember {
     adaptation: FieldAdaptation,
 }
 
+fn visit_field_leaf_ids(field: &Field, visit: &mut impl FnMut(i32)) -> Result<(), ConnectorError> {
+    match field.data_type() {
+        DataType::Struct(children) => {
+            for child in children {
+                visit_field_leaf_ids(child, visit)?;
+            }
+        }
+        DataType::List(child)
+        | DataType::LargeList(child)
+        | DataType::FixedSizeList(child, _)
+        | DataType::Map(child, _) => visit_field_leaf_ids(child, visit)?,
+        _ => {
+            if let Some(id) = field_id_for_arrow_field(field).map_err(corrupt)? {
+                visit(id);
+            }
+        }
+    }
+    Ok(())
+}
+
 impl FieldAdaptation {
     pub(super) fn bind(source: Option<&Field>, target: &FieldRef) -> Result<Self, AdaptationError> {
         let kind = match source {
@@ -153,6 +173,28 @@ impl FieldAdaptation {
                 Adaptation::Leaf(adaptation)
             }
         })
+    }
+
+    /// Visit only leaf identities for which the scan consumes this file's
+    /// values. A known ID under an unrelated physical parent is not a bound
+    /// field and its counts cannot describe the target's NULL/default values.
+    pub(super) fn visit_bound_leaf_ids(
+        &self,
+        visit: &mut impl FnMut(i32),
+    ) -> Result<(), ConnectorError> {
+        match &self.kind {
+            Adaptation::Leaf(_) => visit_field_leaf_ids(&self.target, visit),
+            Adaptation::Struct(children) => {
+                for child in children {
+                    child.adaptation.visit_bound_leaf_ids(visit)?;
+                }
+                Ok(())
+            }
+            Adaptation::List(child) | Adaptation::Map(child) => child.visit_bound_leaf_ids(visit),
+            Adaptation::InitialDefault | Adaptation::TypedNull | Adaptation::RequiredMissing => {
+                Ok(())
+            }
+        }
     }
 
     pub(super) fn retained_heap_bytes(&self) -> usize {

@@ -62,7 +62,6 @@ pub(crate) struct FooterMetricsPlan<'a> {
     lower_entries: usize,
     upper_entries: usize,
     retained_bytes: usize,
-    encoded_size_estimate: u64,
 }
 
 impl FooterMetricsPlan<'_> {
@@ -70,11 +69,6 @@ impl FooterMetricsPlan<'_> {
     /// excludes the inline DataFile and any storage owned by the caller.
     pub(crate) fn retained_bytes(&self) -> usize {
         self.retained_bytes
-    }
-
-    /// Uncompressed Avro estimate for the metric fields of the manifest entry.
-    pub(crate) fn encoded_size_estimate(&self) -> u64 {
-        self.encoded_size_estimate
     }
 
     /// The caller must keep the allocation receipt with the resulting backing.
@@ -145,8 +139,6 @@ pub(crate) fn analyze_footer_metrics<'a>(
         lower_entries: 0,
         upper_entries: 0,
         retained_bytes: 0,
-        // Allow for the record count, map union tags, block lengths and stops.
-        encoded_size_estimate: 8 * 12,
     };
     for (ordinal, leaf) in leaves.iter().enumerate() {
         let Some(id) = leaf.field_id else { continue };
@@ -156,12 +148,8 @@ pub(crate) fn analyze_footer_metrics<'a>(
             (&mut plan.value_entries, column.value_count),
             (&mut plan.null_entries, column.null_count),
         ] {
-            if let Some(count) = count {
+            if count.is_some() {
                 *entry_count += 1;
-                plan.encoded_size_estimate = checked_encoded_add(
-                    plan.encoded_size_estimate,
-                    avro_long_size(i64::from(id)) + avro_long_size(count as i64),
-                )?;
             }
         }
         if let Some(bounds) = column.bounds {
@@ -178,12 +166,6 @@ pub(crate) fn analyze_footer_metrics<'a>(
                 ) {
                     plan.retained_bytes = checked_backing_add(plan.retained_bytes, length)?;
                 }
-                let length = i64::try_from(length)
-                    .map_err(|_| resource("Parquet metric bound length overflows Avro long"))?;
-                plan.encoded_size_estimate = checked_encoded_add(
-                    plan.encoded_size_estimate,
-                    avro_long_size(i64::from(id)) + avro_long_size(length) + length as u64,
-                )?;
             }
         }
     }
@@ -325,11 +307,6 @@ fn add_counts(total: u64, count: i64, what: &str) -> Result<u64, ConnectorError>
         })
 }
 
-fn avro_long_size(value: i64) -> u64 {
-    let zigzag = ((value << 1) ^ (value >> 63)) as u64;
-    u64::from((u64::BITS - zigzag.leading_zeros()).max(1).div_ceil(7))
-}
-
 fn resource(detail: &str) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::ResourceExhausted, detail)
 }
@@ -337,11 +314,6 @@ fn resource(detail: &str) -> ConnectorError {
 fn checked_backing_add(left: usize, right: usize) -> Result<usize, ConnectorError> {
     left.checked_add(right)
         .ok_or_else(|| resource("Parquet metric backing size overflow"))
-}
-
-fn checked_encoded_add(left: u64, right: u64) -> Result<u64, ConnectorError> {
-    left.checked_add(right)
-        .ok_or_else(|| resource("Parquet metric encoding estimate overflow"))
 }
 
 fn map_bytes<T>(count: usize) -> Result<usize, ConnectorError> {

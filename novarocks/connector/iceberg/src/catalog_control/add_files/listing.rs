@@ -66,6 +66,7 @@ impl CandidateFiles {
         self.skipped_hidden
     }
 
+    #[cfg(test)]
     pub(crate) fn iter(&self) -> std::slice::Iter<'_, CandidateFile> {
         self.files.iter()
     }
@@ -166,6 +167,7 @@ impl CandidateFile {
         self.identity.path()
     }
 
+    #[cfg(test)]
     pub(crate) fn identity(&self) -> &ObjectIdentity {
         &self.identity
     }

@@ -318,6 +318,16 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
         Ok(())
     }
 
+    /// Whether this admitted adapter can compare the complete base version
+    /// and atomically install an append carrying a name-mapping update.
+    fn supports_atomic_registration_mapping(
+        &self,
+        _metadata_location: &str,
+        _request: &novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<bool, ConnectorError> {
+        Ok(false)
+    }
+
     /// A read-only positive attribution proves publication, but cannot claim
     /// that a lost owner's independent local finalization actually ran.
     #[cfg(not(test))]

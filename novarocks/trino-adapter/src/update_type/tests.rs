@@ -82,7 +82,7 @@ fn task_names_match_trino_and_novarocks_extensions() {
         (DropPartitionField, "DROP PARTITION FIELD"),
         (CreateTag, "CREATE TAG"),
         (DropTag, "DROP TAG"),
-        (AddFiles, "ADD FILES"),
+        (AddFiles, "ALTER TABLE EXECUTE"),
         (Optimize, "ALTER TABLE EXECUTE"),
         (RewriteManifests, "REWRITE MANIFESTS"),
         (ExpireSnapshots, "EXPIRE SNAPSHOTS"),

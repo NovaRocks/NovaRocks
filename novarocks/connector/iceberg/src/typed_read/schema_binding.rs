@@ -39,10 +39,6 @@
 
 mod adaptation;
 pub(crate) mod mutation_partition;
-#[allow(
-    dead_code,
-    reason = "ADD FILES registration consumes the preview in P08"
-)]
 pub(crate) mod registration;
 pub(crate) use mutation_partition::MutationMetadataSchema;
 

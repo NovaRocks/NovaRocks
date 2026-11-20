@@ -102,7 +102,7 @@ impl IcebergDataMutationBackend for FakeBackend {
                     default_spec_id: source.default_partition_spec_id(),
                     metadata_version_digest_hex: "aa".repeat(32),
                 },
-                source_metadata: source,
+                source_metadata: Arc::new(source),
             },
             [9; 32],
             ConnectorDataMutationPlanSummary::default(),
@@ -188,6 +188,16 @@ impl IcebergDataMutationBackend for FakeBackend {
         ))
     }
 
+    fn execute_registration(
+        &self,
+        _planned: &PlannedIcebergMutation,
+        _request: &ConnectorDataMutationExecuteRequest,
+        _descriptor: &ConnectorInstanceDescriptor,
+        _key: &ConnectorProviderBindingKey,
+    ) -> Result<ExternalMutationOutcome<ConnectorDataMutationReceipt>, ConnectorError> {
+        panic!("The fake backend only exercises TRUNCATE")
+    }
+
     fn evidence_policy(&self) -> crate::catalog::publication::CatalogEvidencePolicy {
         crate::catalog::publication::CatalogEvidencePolicy::default()
     }
@@ -261,18 +271,39 @@ pub(super) fn exact_provider_with_empty_table() -> (
     tempfile::TempDir,
     Arc<IcebergMetadata>,
 ) {
+    exact_provider_with_table(
+        FormatVersion::V2,
+        NestedField::optional(1, "value", Type::Primitive(PrimitiveType::Long)),
+        Vec::new(),
+        None,
+    )
+}
+
+pub(super) fn exact_provider_with_table(
+    version: FormatVersion,
+    field: NestedField,
+    properties: Vec<(String, String)>,
+    object_store: Option<novarocks_fs::ObjectStoreConfig>,
+) -> (
+    tokio::runtime::Runtime,
+    tempfile::TempDir,
+    Arc<IcebergMetadata>,
+) {
     let executor = tokio::runtime::Runtime::new().expect("runtime");
     let warehouse = tempfile::tempdir().expect("warehouse");
     let configuration = crate::catalog_config::parse_catalog_configuration(
         "ice",
-        &[(
-            "iceberg.catalog.warehouse".to_string(),
-            warehouse.path().display().to_string(),
-        )],
+        &[
+            (
+                "iceberg.catalog.warehouse".into(),
+                warehouse.path().display().to_string(),
+            ),
+            ("iceberg.add-files-procedure.enabled".into(), "true".into()),
+        ],
     )
     .expect("configuration");
     let binding = IcebergReadBinding::new(
-        None,
+        object_store,
         novarocks_fs::FsAccessResolver::new(),
         Arc::new(novarocks_fs::TokioFileIoRuntime::new(
             executor.handle().clone(),
@@ -307,9 +338,7 @@ pub(super) fn exact_provider_with_empty_table() -> (
             "{outcome:?}"
         );
         let schema = Schema::builder()
-            .with_fields(vec![
-                NestedField::optional(1, "value", Type::Primitive(PrimitiveType::Long)).into(),
-            ])
+            .with_fields(vec![field.into()])
             .build()
             .unwrap();
         let outcome = crate::catalog::admission_test_support::publish_catalog_fixture(
@@ -320,7 +349,8 @@ pub(super) fn exact_provider_with_empty_table() -> (
                 creation: TableCreation::builder()
                     .name("t".into())
                     .schema(schema)
-                    .format_version(FormatVersion::V2)
+                    .format_version(version)
+                    .properties(properties)
                     .build(),
                 no_op_if_exists: false,
             },

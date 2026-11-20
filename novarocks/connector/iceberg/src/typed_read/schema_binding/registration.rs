@@ -18,7 +18,7 @@
 //! Registration preview uses the same field identities and physical binding as the scan.
 
 use arrow::datatypes::{DataType, TimeUnit};
-use novarocks_fs::ParquetMetadataInspection;
+use novarocks_fs::{ParquetMetadataInspection, ParquetPhysicalType};
 use novarocks_spi::connector::ConnectorError;
 
 use crate::file_reader::field_identity::{
@@ -33,6 +33,7 @@ use super::{AdaptationError, FieldAdaptation, PhysicalIndex, annotated_read_sche
 #[derive(Debug)]
 pub(crate) enum RegistrationPreviewError {
     Identity(FieldIdentityError),
+    Caller(ConnectorError),
     Corrupt(ConnectorError),
     TypeMismatch {
         field: String,
@@ -50,10 +51,21 @@ pub(crate) fn preview_registration(
     footer: &ParquetMetadataInspection,
     table_schema: &Schema,
     mapping: Option<&NameMapping>,
+    bound_leaf_ids: &mut Vec<i32>,
+    mut observe: impl FnMut(&[&str], Option<i32>) -> Result<(), ConnectorError>,
 ) -> Result<ResolvedParquetFields, RegistrationPreviewError> {
     use RegistrationPreviewError as Error;
 
-    let fields = resolve_parquet_fields(footer, mapping).map_err(Error::Identity)?;
+    let mut observation_failure = None;
+    let fields = resolve_parquet_fields(footer, mapping, |path, id| {
+        if observation_failure.is_none() {
+            observation_failure = observe(path, id).err();
+        }
+    });
+    if let Some(error) = observation_failure {
+        return Err(Error::Caller(error));
+    }
+    let mut fields = fields.map_err(Error::Identity)?;
     let physical = PhysicalIndex::build(&fields.schema).map_err(Error::Corrupt)?;
     let target_schema = annotated_read_schema(table_schema).map_err(Error::Corrupt)?;
     for target in target_schema.fields() {
@@ -90,6 +102,26 @@ pub(crate) fn preview_registration(
             })?;
         if let Some(field) = adaptation.missing_required() {
             return Err(Error::MissingRequiredChild(field.to_owned()));
+        }
+        adaptation
+            .visit_bound_leaf_ids(&mut |id| bound_leaf_ids.push(id))
+            .map_err(Error::Corrupt)?;
+    }
+    bound_leaf_ids.sort_unstable();
+    for (leaf, physical) in fields.leaves.iter_mut().zip(footer.physical_columns()) {
+        let Some(id) = leaf.field_id else { continue };
+        let Some(field) = table_schema.field_by_id(id) else {
+            continue;
+        };
+        if bound_leaf_ids.binary_search(&id).is_err() {
+            leaf.field_id = None;
+            continue;
+        }
+        if physical.physical_type() == ParquetPhysicalType::Int96 {
+            return Err(Error::UnsupportedCarrier {
+                field: field.name.clone(),
+                source: DataType::Timestamp(TimeUnit::Nanosecond, None),
+            });
         }
     }
     Ok(fields)

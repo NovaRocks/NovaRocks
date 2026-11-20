@@ -114,6 +114,16 @@ fn map_bounded_read_error(error: &crate::iceberg::Error) -> ConnectorError {
 
 #[async_trait]
 impl NovaRocksCatalog for NovaRocksHadoopCatalog {
+    fn supports_atomic_registration_mapping(
+        &self,
+        metadata_location: &str,
+        request: &novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<bool, ConnectorError> {
+        self.client
+            .supports_native_update_install(metadata_location, request)
+            .map_err(|error| map_bounded_read_error(&error))
+    }
+
     fn freeze_create_publication(
         &self,
         request: super::catalog_request::CatalogCreatePublicationRequest,
