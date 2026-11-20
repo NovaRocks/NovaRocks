@@ -140,7 +140,7 @@ fn bound_complex_type_corpus_preserves_original_step_and_error_ordinals() -> Res
             }
             let frames = split_trino_step_sql(&step.sql, step.meta.expect_trino_error.as_ref())?;
             if bound.case_id == "complex_test_array_contains"
-                && (95..=96).contains(&step.query_number)
+                && (71..=72).contains(&step.query_number)
             {
                 let [prefix, refused] = frames.as_slice() else {
                     panic!(
