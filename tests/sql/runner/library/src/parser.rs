@@ -996,7 +996,8 @@ pub(crate) fn validate_trino_error_expectation(meta: &QueryMeta, sql: Option<&st
     ensure!(
         meta.expect_error_code.is_none()
             && !meta.has_sql_error_assertion()
-            && meta.expect_error_tier.is_none(),
+            && meta.expect_error_tier.is_none()
+            && (meta.expect_error.is_none() || expected.name != "SYNTAX_ERROR"),
         "@expect_trino_error cannot be combined with another error expectation"
     );
     if let Some(sql) = sql {

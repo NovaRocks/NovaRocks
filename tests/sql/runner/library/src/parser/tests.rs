@@ -95,7 +95,7 @@ fn trino_error_expectation_checks_protocol_fields_and_optional_ordinal() {
     for sql in ["SELECT 1", "USE fixture; SELECT idSELECT id; SELECT 3"] {
         assert!(validate_trino_error_expectation(&indexed, Some(sql)).is_err());
     }
-    validate_trino_error_expectation(&merge_meta(&legacy, &indexed), None).unwrap();
+    assert!(validate_trino_error_expectation(&merge_meta(&legacy, &indexed), None).is_err());
     assert!(
         validate_trino_error_expectation(&merge_meta(&competing_code, &indexed), None).is_err()
     );
