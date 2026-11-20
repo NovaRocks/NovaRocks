@@ -981,7 +981,12 @@ mod tests {
         let (_, control) = plan(&input, file.path()).unwrap();
         let selected = control.steps.values().next().unwrap();
         assert!(selected.needs_nomination);
-        assert_eq!(selected.submissions.len(), 2);
+        let submission_slots = selected
+            .submissions
+            .iter()
+            .map(|submission| (submission.transient_attempt, submission.statement_index))
+            .collect::<Vec<_>>();
+        assert_eq!(submission_slots, [(0, 0), (0, 1), (1, 0), (1, 1)]);
         let frontend = control
             .planned_launches
             .iter()
