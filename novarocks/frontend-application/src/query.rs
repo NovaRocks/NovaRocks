@@ -53,6 +53,7 @@ use novarocks_query_application::api::{
     MaintenanceCommandConsumer, OptionalCommandFuture, QueryExecutionError,
     StatisticsCommandConsumer,
 };
+use novarocks_query_application::api::{QueryResult, build_string_query_result};
 use novarocks_query_application::cancellation::{QueryCancellationReason, QueryCancellationView};
 use novarocks_query_application::cpu::QueryBlockingExecutor;
 #[cfg(test)]

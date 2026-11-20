@@ -1440,6 +1440,8 @@ impl FrontendQuerySession {
             ));
         };
         let byte_author = crate::dml::add_files::registration_byte_author(window.clone());
+        let planning_cancellation = input.cancellation.clone();
+        let dispatch_cancellation = input.cancellation.clone();
         let mut worker = Box::pin(execute_prepared_dml_statement(
             self.service.query_blocking_executor.clone(),
             input.cancellation.clone(),
@@ -1448,20 +1450,24 @@ impl FrontendQuerySession {
                 .expect("same original ADD FILES owner"),
             Some(window),
             move || {
-                dml_result(planner.prepare_resolved_add_files(
-                    prepare_engine.as_ref(),
-                    resolved,
-                    &input.request,
-                    Some(&input.options),
-                ))
+                add_files_dml_result(
+                    planner.prepare_resolved_add_files(
+                        prepare_engine.as_ref(),
+                        resolved,
+                        &input.request,
+                        Some(&input.options),
+                    ),
+                    &planning_cancellation,
+                )
             },
             move |prepared| {
-                dml_result(dml.execute_prepared_add_files(engine.as_ref(), prepared, byte_author))
-                    .and_then(|count| {
-                        crate::table_maintenance::result::add_files_result(count)
-                            .map(StatementResult::Query)
-                            .map_err(RoutedExecutionError::Engine)
-                    })
+                let count = add_files_dml_result(
+                    dml.execute_prepared_add_files(engine.as_ref(), prepared, byte_author),
+                    &dispatch_cancellation,
+                )?;
+                crate::table_maintenance::result::add_files_result(count)
+                    .map(StatementResult::Query)
+                    .map_err(RoutedExecutionError::Engine)
             },
         )) as TypedCommandWorker;
         self.finish_command_worker(
@@ -1471,6 +1477,47 @@ impl FrontendQuerySession {
             &mut worker,
         )
         .await
+    }
+}
+
+fn add_files_dml_result<T>(
+    result: Result<T, crate::dml::DmlError>,
+    cancellation: &QueryCancellationView,
+) -> Result<T, RoutedExecutionError> {
+    dml_result(result).map_err(|error| match error {
+        RoutedExecutionError::Application(error) => {
+            RoutedExecutionError::Application(error.reconcile_local_stop_observation(cancellation))
+        }
+        other => other,
+    })
+}
+
+#[cfg(test)]
+mod add_files_control_tests {
+    use super::*;
+    use novarocks_failure_contract::SharedFailureCause;
+    use novarocks_query_application::cancellation::QueryCancellationSource;
+    use novarocks_workload_control::{CancellationReason, WorkError};
+
+    #[test]
+    fn add_files_stop_uses_the_original_accepted_deadline_and_retains_the_cause() {
+        let cancellation = QueryCancellationSource::new();
+        let cause = SharedFailureCause::new(WorkError::Cancelled(CancellationReason::Requested));
+        let dml_error = || {
+            crate::dml::DmlError::from_application(QueryServiceError::from_failure_cause(
+                cause.clone(),
+            ))
+        };
+        let observed = routed_execution_service_error(
+            add_files_dml_result::<()>(Err(dml_error()), &cancellation.view()).unwrap_err(),
+        );
+        assert_ne!(observed.kind(), QueryServiceErrorKind::Timeout);
+        let _ = cancellation.request(QueryCancellationReason::DeadlineExceeded { timeout_ms: 51 });
+        let accepted = routed_execution_service_error(
+            add_files_dml_result::<()>(Err(dml_error()), &cancellation.view()).unwrap_err(),
+        );
+        assert_eq!(accepted.kind(), QueryServiceErrorKind::Timeout);
+        assert_eq!(accepted.failure_cause(), Some(&cause));
     }
 }
 
