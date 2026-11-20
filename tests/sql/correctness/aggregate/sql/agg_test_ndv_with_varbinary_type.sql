@@ -181,12 +181,12 @@ SELECT ndv(data1) AS ndv_data1,
 FROM tbinary_multi_distinct_test;
 
 -- query 25
--- @expect_error=unsupported agg function: ds_theta_count_distinct
-USE ${case_db};
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR
 SELECT category,
        ndv(data1) AS ndv_data1,
-       approx_count_distinct(data2) AS approx_data2
-FROM tbinary_multi_distinct_test
+       approx_count_distinct(data2) AS approx_data2,
+       ds_theta_count_distinct(data3) AS theta_data3
+FROM ${case_db}.tbinary_multi_distinct_test
 GROUP BY category
 ORDER BY category;
 
