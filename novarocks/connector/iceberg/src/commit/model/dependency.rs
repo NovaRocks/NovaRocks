@@ -17,6 +17,8 @@
 
 //! Only the dependencies used by current operation admission are represented here.
 
+use crate::commit::dependency::RowDeltaWindowCheck;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Dependency {
     RefUnchanged,
@@ -24,4 +26,9 @@ pub enum Dependency {
     RegisteredFilesNotLive(Vec<String>),
     /// Preparation-time check only; metadata publication has no atomic snapshot-existence requirement.
     MeasuredSnapshotExists(i64),
+    #[allow(
+        dead_code,
+        reason = "The row-delta publication path installs this dependency in P07"
+    )]
+    RowDeltaWindow(RowDeltaWindowCheck),
 }

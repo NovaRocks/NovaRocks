@@ -28,7 +28,7 @@ use novarocks_spi::connector::{
 };
 
 use super::model::EntryIdentity;
-use crate::iceberg::spec::DataFile;
+use crate::iceberg::spec::{DataFile, TableMetadata};
 
 /// Paths and identities needed by every prepare attempt, including after the
 /// operation has converted its compact additions into reusable manifests.
@@ -43,6 +43,8 @@ pub(crate) struct RowDeltaValidationFacts {
 /// One immutable manifest entry's partition, metrics and content, borrowed
 /// directly from the manifest data file.
 pub(crate) struct CandidateFile<'a> {
+    /// Metadata of the same observation, including historical partition specs.
+    pub(crate) metadata: &'a TableMetadata,
     pub(crate) spec_id: i32,
     pub(crate) file: &'a DataFile,
 }
