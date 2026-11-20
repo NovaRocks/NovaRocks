@@ -348,7 +348,8 @@ async fn reject_bound_iceberg_mv_table_async(
         mutation,
         documents.catalog_handle(),
         observed,
-    )
+    )?;
+    Ok(object_id)
 }
 
 /// Apply the same user mutation guard using the already-admitted table.
@@ -402,7 +403,7 @@ fn check_iceberg_mv_observation(
             key,
         }) => {
             return if mutation == IcebergMvUserMutation::DropTable {
-                Ok(object_id)
+                Ok(())
             } else {
                 Err(super::readiness::application_error(format!(
                     "LegacyFormat: {key}; only DROP TABLE is supported"
@@ -420,7 +421,7 @@ fn check_iceberg_mv_observation(
         return Err(materialized_view_denial(target, mutation));
     }
 
-    Ok(object_id)
+    Ok(())
 }
 
 fn materialized_view_denial(
