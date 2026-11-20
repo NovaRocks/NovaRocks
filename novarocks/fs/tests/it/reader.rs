@@ -15,8 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod common;
-
 use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
 
@@ -31,7 +29,7 @@ use novarocks_fs::{
 };
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
-use common::{Fixture, collect};
+use crate::common::{Fixture, collect};
 
 #[test]
 fn parquet_metadata_inspection_reports_stable_footer_facts() {

@@ -15,8 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod common;
-
 use arrow::array::Int32Array;
 use bytes::BytesMut;
 use novarocks_fs::{
@@ -28,7 +26,7 @@ use novarocks_fs::{
 };
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
-use common::{Fixture, collect};
+use crate::common::{Fixture, collect};
 
 #[test]
 fn prepared_footer_stages_exact_suffix_and_parses_without_second_get() {

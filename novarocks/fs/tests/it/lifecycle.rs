@@ -20,8 +20,6 @@
     reason = "Integration tests own and join their threads and runtime tasks; see ADR-0218."
 )]
 
-mod common;
-
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -31,7 +29,7 @@ use novarocks_fs::{
     FileIoRuntime, FileIoSpawner, FileProjection, FileResult, FileU64Future, open_file_reader,
 };
 
-use common::Fixture;
+use crate::common::Fixture;
 
 fn open_error(request: novarocks_fs::FileReadRequest) -> novarocks_fs::FileError {
     match open_file_reader(request) {

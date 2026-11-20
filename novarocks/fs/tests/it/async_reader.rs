@@ -24,8 +24,6 @@
 //! positions and storage reads, with a decoder request's independent ranges
 //! fetched concurrently through the source's range service.
 
-mod common;
-
 use std::collections::HashMap;
 use std::fs::File;
 use std::num::NonZeroUsize;
@@ -35,7 +33,7 @@ use std::sync::{Arc, Mutex};
 use arrow::array::{ArrayRef, Int32Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use common::{Fixture, collect};
+use crate::common::{Fixture, collect};
 use novarocks_fs::{
     AsyncFileBatchReader, BoundFile, FileBatch, FileCancellation, FileErrorKind, FileFormat,
     FileIdentity, FileIoFuture, FileIoJob, FileIoRuntime, FileIoSpawner, FileProjection,

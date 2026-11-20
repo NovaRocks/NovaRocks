@@ -19,8 +19,6 @@
 //! Expected values come from the writer's original schema and ordered footer
 //! entries; no Connector schema or table default participates in interpretation.
 
-mod common;
-
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -34,7 +32,7 @@ use novarocks_fs::{
 use parquet::arrow::{ARROW_SCHEMA_META_KEY, ArrowWriter, PARQUET_FIELD_ID_META_KEY};
 use parquet::file::metadata::KeyValue;
 
-use common::Fixture;
+use crate::common::Fixture;
 
 fn policy_fixture(bad_last_hint: bool) -> Fixture {
     let directory = tempfile::tempdir().expect("tempdir");

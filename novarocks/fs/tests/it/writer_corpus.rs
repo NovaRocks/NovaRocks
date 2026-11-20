@@ -15,8 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod common;
-
 use std::fmt::Write as _;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
@@ -34,7 +32,7 @@ use novarocks_fs::{
 use novarocks_spi::connector::StorageAccessDomainId;
 use sha2::{Digest, Sha256};
 
-use common::TestIo;
+use crate::common::TestIo;
 
 const ROWS: usize = 4096;
 
