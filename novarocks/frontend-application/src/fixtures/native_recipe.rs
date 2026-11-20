@@ -313,6 +313,10 @@ impl RecipeObservation {
         assert_eq!(self.activation_calls.load(Ordering::Acquire), 0);
         assert!(self.drop_fault.lock().unwrap().replace(fault).is_none());
     }
+    pub(crate) fn activation_dormant_drop_observed(&self) -> bool {
+        self.dormant_drops.load(Ordering::Acquire) != 0
+    }
+
     pub(crate) fn activation_drop_observation(&self) -> ActivationDropObservation {
         let original = self
             .original_drop_panic

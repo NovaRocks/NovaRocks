@@ -1193,7 +1193,13 @@ async fn run_activation_drop_child(fault: crate::fixtures::native_recipe::Activa
         async {
             loop {
                 let native_returned = logical_exit.view().unwrap().pending_native_returns() == 0;
-                if native_returned && *installed.fixture_exit.observe_actual_exit().borrow() {
+                // For a staged activation, the failed-owner cleanup awaits
+                // actual AP exit before it retires the original dormant owner.
+                // Observe that destructor separately from the paid Native return.
+                if native_returned
+                    && *installed.fixture_exit.observe_actual_exit().borrow()
+                    && original.logical.probe.activation_dormant_drop_observed()
+                {
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -1205,7 +1211,7 @@ async fn run_activation_drop_child(fault: crate::fixtures::native_recipe::Activa
     .await;
     assert!(
         exited.is_some(),
-        "same actual AP exit and Native return remain unproven"
+        "same AP exit, Native return, or original dormant Drop remains unproven"
     );
     let port_exit = novarocks_query_application::api::NativeInstalledAttemptPort::resources_exited(
         original.logical.binding.as_ref(),
