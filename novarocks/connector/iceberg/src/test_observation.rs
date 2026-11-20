@@ -35,10 +35,6 @@ impl std::fmt::Debug for IcebergObservationSlot {
             .finish_non_exhaustive()
     }
 }
-#[expect(
-    clippy::enum_variant_names,
-    reason = "Marker suffixes are part of the finite observation action names consumed by test controls"
-)]
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "kebab-case", deny_unknown_fields)]
 enum Parameters {
