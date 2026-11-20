@@ -1,5 +1,66 @@
--- query 4
+-- query 18
+-- types	varchar	bigint
+metric_name	metric_value
+added_data_files	1
+
+-- query 19
 -- types	bigint	varchar
-new_id	new_note
+id	note
 11	alpha
 22	beta
+
+-- query 21
+-- types	varchar	bigint
+metric_name	metric_value
+added_data_files	1
+
+-- query 22
+-- types	bigint	varchar
+id	note
+11	alpha
+22	beta
+
+-- query 23
+-- types	varchar	bigint
+metric_name	metric_value
+added_data_files	2
+
+-- query 24
+-- types	bigint	varchar
+id	note
+11	alpha
+11	alpha
+22	beta
+22	beta
+
+-- query 25
+-- types	varchar	bigint
+metric_name	metric_value
+added_data_files	1
+
+-- query 26
+-- types	bigint	varchar
+id	note
+11	alpha
+22	beta
+
+-- query 33
+-- types	varchar	bigint
+metric_name	metric_value
+added_data_files	0
+
+-- query 34
+-- types	varchar	bigint
+metric_name	metric_value
+added_data_files	1
+
+-- query 35
+-- types	bigint	varchar
+id	note
+11	alpha
+22	beta
+
+-- query 36
+-- types	bigint	bigint	bigint	bigint	bigint	bigint
+fail_rows	mixed_rows	bad_rows	null_rows	missing_rows	incompatible_rows
+0	0	0	0	0	0
