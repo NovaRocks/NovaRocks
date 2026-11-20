@@ -30,9 +30,10 @@ use novarocks_spi::connector::{
     LakePublicationDisposition, ProviderMetadataCpuPort,
 };
 
+use super::super::maintenance_admission::{RetentionProcedure, validate_retention_procedure};
 use super::*;
-use crate::catalog::CatalogTableName;
 use crate::catalog::admission::{CatalogAdmissionRequest, CatalogOperation, connector_unsupported};
+use crate::catalog::{CatalogTableName, SnapshotLoading};
 
 type StepF = Pin<Box<dyn Future<Output = Result<Output, ConnectorError>> + Send>>;
 
@@ -168,15 +169,38 @@ pub(super) fn install_in(
     let adapter = adapter.clone();
     let future = Box::pin(async move {
         input.original.check_active().map_err(scope_error)?;
+        let namespace = &input.table.namespace;
+        let table = &input.table.table;
         adapter
             .runtime
             .novarocks_catalog()
             .admit(&CatalogAdmissionRequest::new(
                 CatalogOperation::RemoveOrphanFiles,
-                CatalogTableName::new(input.table.namespace.as_ref(), input.table.table.as_ref()),
+                CatalogTableName::new(namespace.to_string(), table.to_string()),
                 input.context.initiation(),
             ))
             .map_err(connector_unsupported)?;
+        let physical = adapter
+            .runtime
+            .observe_table_original_for_request_with_snapshots_async(
+                namespace,
+                table,
+                &input.context,
+                SnapshotLoading::All,
+            )
+            .await?;
+        let metadata = physical.table.metadata();
+        validate_retention_procedure(
+            RetentionProcedure::RemoveOrphanFiles,
+            metadata.format_version() as u8,
+            metadata
+                .properties()
+                .get("write.location-provider.impl")
+                .map(String::as_str),
+            &format!("{namespace}.{table}"),
+            input.retention,
+            adapter.runtime.control_state().configuration().maintenance,
+        )?;
         Err(ConnectorError::new(
             ConnectorErrorKind::Unsupported,
             "scanned orphan cleanup is unsupported",

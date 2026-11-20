@@ -1288,7 +1288,7 @@ impl novarocks_table_maintenance::product::TableMaintenanceEffectPort
         _request: MaintenanceActionRequest,
     ) -> novarocks_table_maintenance::product::MaintenanceFuture<
         'a,
-        Result<MaintenanceActionOutcome, String>,
+        Result<MaintenanceActionOutcome, TerminalError>,
     > {
         Box::pin(product_port_execute_metadata(self, _request))
     }
@@ -1416,8 +1416,10 @@ async fn product_port_reject_user_action_on_mv<'a>(
 async fn product_port_execute_metadata(
     _this: &GovernedRewriteEffectPort,
     _request: MaintenanceActionRequest,
-) -> Result<MaintenanceActionOutcome, String> {
-    Err("Rewrite Source does not dispatch metadata maintenance".into())
+) -> Result<MaintenanceActionOutcome, TerminalError> {
+    Err(TerminalError::pre_dispatch_failed(
+        "Rewrite Source does not dispatch metadata maintenance",
+    ))
 }
 async fn product_port_begin_rewrite<'a>(
     this: &'a GovernedRewriteEffectPort,

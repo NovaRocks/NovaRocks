@@ -31,11 +31,11 @@ use novarocks_query_application::{
 use novarocks_spi::connector::{
     ConnectorCleanupAsyncExecution, ConnectorCleanupAsyncObservation, ConnectorCleanupAsyncStart,
     ConnectorCleanupMaintenanceSession, ConnectorCleanupOperationId, ConnectorControlPlanningPin,
-    ConnectorError, ConnectorOriginalResultScope, ConnectorRequestContext,
-    LakePublicationDisposition, ProviderMetadataCpuPort, SharedDependency,
+    ConnectorError, ConnectorMaintenanceRetention, ConnectorOriginalResultScope,
+    ConnectorRequestContext, LakePublicationDisposition, ProviderMetadataCpuPort, SharedDependency,
 };
 use novarocks_table_maintenance::{
-    MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceTarget,
+    MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceTarget, ProcedureMetrics,
     product::{
         DistributedRewriteSession, MaintenanceFuture, RewriteIntent, TableMaintenanceEffectPort,
         TableMaintenanceProduct,
@@ -71,6 +71,7 @@ struct Body {
     product: Arc<TableMaintenanceProduct>,
     target: MaintenanceTarget,
     older_than: i64,
+    retention: ConnectorMaintenanceRetention,
     cleanup_session: ConnectorCleanupMaintenanceSession,
     planning: ConnectorControlPlanningPin,
     context: ConnectorRequestContext,
@@ -87,7 +88,6 @@ struct State {
     io: Option<Arc<MetadataIoAdmission>>,
     cpu: Option<Arc<dyn ProviderMetadataCpuPort>>,
     origin: Option<ResultWindowAlias>,
-    spark_call: bool,
     local: Option<LocalResultProducer>,
     wake: Arc<Wake>,
     future: Option<ProductF>,
@@ -122,8 +122,8 @@ pub(crate) fn prepare(
     kernel: &MaintenanceExecutionKernel,
     target: MaintenanceTarget,
     older_than: i64,
-    retained_planning: Option<ConnectorControlPlanningPin>,
-    spark_call: bool,
+    retention: ConnectorMaintenanceRetention,
+    planning: ConnectorControlPlanningPin,
     execution: &QueryExecutionContext,
     connector: &ConnectorRequestContext,
     family: novarocks_result_contract::ClientPresentationFamily,
@@ -141,20 +141,11 @@ pub(crate) fn prepare(
     }
     let identity = RequestScopedMaintenanceEngine::target_identity(&target)
         .map_err(TerminalError::pre_dispatch_failed)?;
-    let planning = match retained_planning {
-        Some(planning) => {
-            if planning.binding().descriptor().instance_id != identity.instance_id {
-                return Err(TerminalError::pre_dispatch_failed(
-                    "cleanup target differs from its retained generation",
-                ));
-            }
-            planning
-        }
-        None => kernel
-            .connector_control()
-            .acquire_current(&identity.instance_id)
-            .map_err(TerminalError::from_original_cause)?,
-    };
+    if planning.binding().descriptor().instance_id != identity.instance_id {
+        return Err(TerminalError::pre_dispatch_failed(
+            "cleanup target differs from its retained generation",
+        ));
+    }
     let cleanup_session = kernel
         .connector_control()
         .acquire_exact_cleanup_maintenance(planning.control_runtime_id())
@@ -177,6 +168,7 @@ pub(crate) fn prepare(
         product,
         target,
         older_than,
+        retention,
         cleanup_session,
         planning,
         context: connector.clone(),
@@ -194,7 +186,6 @@ pub(crate) fn prepare(
             io: None,
             cpu: None,
             origin: Some(origin),
-            spark_call,
             local: None,
             wake,
             future: None,
@@ -242,7 +233,7 @@ impl State {
         // Freeze the original Local delivery allowance before the first
         // Provider effect; an observed successful terminal is not cancelled by
         // trying to acquire a fresh ticket after the commit.
-        if self.spark_call && self.local.is_none() {
+        if self.local.is_none() {
             let window = owner
                 .result_window_alias()
                 .ok_or_else(|| service("cleanup original Local result window is absent"))?;
@@ -339,18 +330,16 @@ impl State {
         self.selected = true;
         let disposition = self.disposition();
         let outcome = result.map_err(|error| {
-            let error = super::rewrite_job::computation_service_error(error);
+            let error = match super::iceberg::invalid_procedure_error(&error) {
+                Some(public) => public,
+                None => super::rewrite_job::computation_service_error(error),
+            };
             match disposition {
                 Some(d) => error
                     .attach_external_effect_disposition(crate::query::external_effect_from_lake(d)),
                 None => error,
             }
         })?;
-        if !self.spark_call {
-            return Poll::Ready(Ok(StatementActionValue::Ok(
-                novarocks_query_application::session_control::StatementCommandCompletion::empty(),
-            )));
-        }
         let producer = self
             .local
             .take()
@@ -521,8 +510,12 @@ impl TableMaintenanceEffectPort for Effects {
     fn execute_metadata<'a>(
         &'a self,
         _request: MaintenanceActionRequest,
-    ) -> MaintenanceFuture<'a, Result<MaintenanceActionOutcome, String>> {
-        Box::pin(async { Err("cleanup Source cannot dispatch a metadata command".into()) })
+    ) -> MaintenanceFuture<'a, Result<MaintenanceActionOutcome, TerminalError>> {
+        Box::pin(async {
+            Err(TerminalError::pre_dispatch_failed(
+                "cleanup Source cannot dispatch a metadata command",
+            ))
+        })
     }
     fn begin_rewrite<'a>(
         &'a self,
@@ -545,7 +538,12 @@ async fn reject_mv(
     target: &MaintenanceTarget,
 ) -> Result<(), TerminalError> {
     let body = original.lock().await;
-    crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_governed_planning_pin_and_context_async(body.engine.kernel.mv_storage_observation().as_ref(),&body.planning,body.engine.kernel.mv_readiness().as_ref(),&crate::catalog_application::resolver::TargetBackend{provider_id:body.cleanup_session.descriptor().provider_id.clone(),catalog:target.catalog.clone(),namespace:target.namespace.clone(),table:target.table.clone()},crate::mv::domain::iceberg_guard::IcebergMvUserMutation::Maintenance,body.context.clone(),body.cpu.as_ref().ok_or_else(|| TerminalError::pre_dispatch_failed("cleanup original metadata CPU is absent"))?.clone()).await.map_err(super::rewrite_job::guard_terminal_error)
+    crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_governed_planning_pin_and_context_async(body.engine.kernel.mv_storage_observation().as_ref(),&body.planning,body.engine.kernel.mv_readiness().as_ref(),&crate::catalog_application::resolver::TargetBackend{provider_id:body.cleanup_session.descriptor().provider_id.clone(),catalog:target.catalog.clone(),namespace:target.namespace.clone(),table:target.table.clone()},crate::mv::domain::iceberg_guard::IcebergMvUserMutation::Maintenance,body.context.clone(),body.cpu.as_ref().ok_or_else(|| TerminalError::pre_dispatch_failed("cleanup original metadata CPU is absent"))?.clone()).await.map_err(|error| {
+
+        super::iceberg::retention_format_error(
+            super::rewrite_job::guard_terminal_error(error), "remove_orphan_files", target,
+        )
+    })
 }
 
 async fn execute_cleanup(
@@ -556,6 +554,7 @@ async fn execute_cleanup(
         context,
         target,
         older_than,
+        retention,
         start,
         session,
         cpu,
@@ -568,6 +567,7 @@ async fn execute_cleanup(
         table: RequestScopedMaintenanceEngine::target_identity(target)?,
         operation_id: ConnectorCleanupOperationId::new(),
         older_than_ms: *older_than,
+        retention: *retention,
         context: context.clone(),
         original: original
             .as_ref()
@@ -598,11 +598,28 @@ async fn execute_cleanup(
     // failure in the output is not proof that its physical future exited.
     let exit = std::future::poll_fn(|cx| source.poll_closed(cx)).await;
     let (disposition, applied) = source.publication_fact();
-    output.map_err(|error| source_terminal(error, disposition, applied))?;
+    let output = output.map_err(|error| {
+        super::iceberg::retention_format_error(
+            source_terminal(error, disposition, applied),
+            "remove_orphan_files",
+            target,
+        )
+    })?;
     exit.map_err(TerminalError::from_original_cause)?;
-    Ok(MaintenanceActionOutcome::RemoveOrphanFiles {
-        orphan_file_locations: Vec::new(),
-    })
+    let metrics = output
+        .metrics
+        .map(|metrics| {
+            ProcedureMetrics::from_counts([
+                ("processed_manifests_count", metrics.processed_manifests),
+                ("active_files_count", metrics.active_files),
+                ("scanned_files_count", metrics.scanned_files),
+                ("deleted_files_count", metrics.deleted_files),
+                ("deleted_bytes", metrics.deleted_bytes),
+            ])
+        })
+        .transpose()
+        .map_err(TerminalError::known_committed_finalization_failed)?;
+    Ok(MaintenanceActionOutcome::Procedure { metrics })
 }
 
 fn source_terminal(
@@ -610,19 +627,15 @@ fn source_terminal(
     disposition: Option<LakePublicationDisposition>,
     applied: bool,
 ) -> TerminalError {
-    let detail = error.to_string();
-    let mut terminal = match disposition {
+    let classify = |detail| match disposition {
         Some(LakePublicationDisposition::CommitUnknown) => TerminalError::commit_unknown(detail),
         Some(LakePublicationDisposition::KnownCommitted) => TerminalError::failed(detail),
         Some(LakePublicationDisposition::KnownUncommitted) => {
             TerminalError::known_uncommitted(detail)
         }
         None => TerminalError::pre_dispatch_failed(detail),
-    }
-    .with_failure_cause(Some(SharedFailureCause::from_static_detail(
-        error,
-        "cleanup original provider operation failed",
-    )));
+    };
+    let mut terminal = super::iceberg::procedure_connector_terminal(error, classify);
     if applied {
         terminal = terminal.with_effect(novarocks_coordination_contract::ExecutionEffect::External);
     } else if disposition != Some(LakePublicationDisposition::CommitUnknown) {
@@ -693,13 +706,13 @@ mod tests {
         .unwrap();
         let result = produce_local(
             producer,
-            MaintenanceActionOutcome::RemoveOrphanFiles {
-                orphan_file_locations: vec!["file:///original.parquet".to_owned()],
+            MaintenanceActionOutcome::Procedure {
+                metrics: Some(ProcedureMetrics::from_counts([("deleted_files_count", 1)]).unwrap()),
             },
         )
         .unwrap();
         assert_eq!(result.row_count(), 1);
-        assert_eq!(result.columns().len(), 1);
+        assert_eq!(result.columns().len(), 2);
         drop(local);
         drop(result);
         assert_eq!(

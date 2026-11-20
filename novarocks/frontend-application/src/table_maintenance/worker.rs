@@ -60,7 +60,21 @@ impl TableMaintenanceEffectPort for LegacyMaintenanceEffects<'_> {
             self.engine
                 .reject_user_action_on_mv(target)
                 .await
-                .map_err(crate::query_execution::maintenance::rewrite_job::guard_terminal_error)
+                .map_err(|error| {
+                    let terminal =
+                        crate::query_execution::maintenance::rewrite_job::guard_terminal_error(
+                            error,
+                        );
+                    if self.state.is_some_and(|state| state.is_trino_expiry()) {
+                        crate::query_execution::maintenance::iceberg::retention_format_error(
+                            terminal,
+                            "expire_snapshots",
+                            target,
+                        )
+                    } else {
+                        terminal
+                    }
+                })
         })
     }
 
@@ -69,12 +83,14 @@ impl TableMaintenanceEffectPort for LegacyMaintenanceEffects<'_> {
         request: MaintenanceActionRequest,
     ) -> novarocks_table_maintenance::product::MaintenanceFuture<
         'a,
-        Result<MaintenanceActionOutcome, String>,
+        Result<MaintenanceActionOutcome, OptimizeTerminalError>,
     > {
         Box::pin(async move {
-            let state = self
-                .state
-                .ok_or("rewrite effect cannot dispatch metadata")?;
+            let state = self.state.ok_or_else(|| {
+                OptimizeTerminalError::pre_dispatch_failed(
+                    "rewrite effect cannot dispatch metadata",
+                )
+            })?;
             self.engine.execute_action(state, request).await
         })
     }

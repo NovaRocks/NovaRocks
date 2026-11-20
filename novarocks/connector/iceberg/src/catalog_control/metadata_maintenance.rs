@@ -58,6 +58,7 @@ use novarocks_spi::connector::{
     ExternalMutationFinalization, ExternalMutationOutcome,
 };
 
+use super::maintenance_admission::{RetentionProcedure, validate_retention_procedure};
 use crate::catalog::admission::{CatalogAdmissionRequest, CatalogOperation, connector_unsupported};
 use crate::catalog::{CatalogTableName, SnapshotLoading};
 use crate::commit::snapshot_lifecycle_helpers::rewrite_manifests::RewriteManifestsPreparer;
@@ -84,6 +85,10 @@ struct IcebergMetadataMaintenancePlanPayloadV1 {
     operation_kind: String,
     older_than_ms: Option<i64>,
     retain_last: Option<u32>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    sql_execute: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    clean_expired_metadata: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -219,13 +224,38 @@ impl MaintenanceEngine {
             .map_err(|(kind, message)| ConnectorError::new(kind, message))?;
         let table = loaded.into_table();
         let metadata = table.metadata();
-        let (older_than_ms, retain_last) = match request.operation() {
-            ConnectorMetadataMaintenanceOperation::RewriteMetadataLayout { .. } => (None, None),
+        let (older_than_ms, retain_last, sql_execute, clean_expired_metadata) = match request
+            .operation()
+        {
+            ConnectorMetadataMaintenanceOperation::RewriteMetadataLayout {
+                sql_execute, ..
+            } => (None, None, *sql_execute, false),
             ConnectorMetadataMaintenanceOperation::ExpireTableVersions {
                 older_than_ms,
                 retain_last,
+                sql_execute,
                 ..
-            } => (*older_than_ms, *retain_last),
+            } => {
+                if let Some(inputs) = sql_execute {
+                    validate_retention_procedure(
+                        RetentionProcedure::ExpireSnapshots,
+                        metadata.format_version() as u8,
+                        metadata
+                            .properties()
+                            .get("write.location-provider.impl")
+                            .map(String::as_str),
+                        &format!("{namespace}.{table_name}"),
+                        inputs.retention,
+                        self.runtime.control_state().configuration().maintenance,
+                    )?;
+                }
+                (
+                    *older_than_ms,
+                    *retain_last,
+                    sql_execute.is_some(),
+                    sql_execute.is_some_and(|inputs| inputs.clean_expired_metadata),
+                )
+            }
         };
         let payload = IcebergMetadataMaintenancePlanPayloadV1 {
             version: PAYLOAD_VERSION,
@@ -236,6 +266,8 @@ impl MaintenanceEngine {
             operation_kind: request.operation().kind().to_string(),
             older_than_ms,
             retain_last,
+            sql_execute,
+            clean_expired_metadata,
         };
         // Only immutable operation intent belongs to the plan digest. Current
         // schema, spec, metadata location and ref head belong to each attempt.

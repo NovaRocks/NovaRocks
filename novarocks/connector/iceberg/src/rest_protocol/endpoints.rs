@@ -272,7 +272,7 @@ impl RestEndpoints {
         let binding = self.binding().await?;
         let url = page_url(binding.namespaces_url(), page_token, page_size, OPERATION)?;
         match self.get(OPERATION, &binding, url, None, &[200]).await? {
-            Answer::Success { body, .. } => decode_document(OPERATION, body).await,
+            Answer::Success { body, .. } => decode_document(OPERATION, body, false).await,
             Answer::Status(code) => Err(status_error(OPERATION, code)),
         }
     }
@@ -293,7 +293,7 @@ impl RestEndpoints {
             OPERATION,
         )?;
         match self.get(OPERATION, &binding, url, None, &[200]).await? {
-            Answer::Success { body, .. } => decode_document(OPERATION, body).await,
+            Answer::Success { body, .. } => decode_document(OPERATION, body, false).await,
             Answer::Status(code) => Err(status_error(OPERATION, code)),
         }
     }
@@ -314,7 +314,7 @@ impl RestEndpoints {
             OPERATION,
         )?;
         match self.get(OPERATION, &binding, url, None, &[200]).await? {
-            Answer::Success { body, .. } => decode_document(OPERATION, body).await,
+            Answer::Success { body, .. } => decode_document(OPERATION, body, false).await,
             Answer::Status(404) => Err(not_found(OPERATION)),
             Answer::Status(code) => Err(status_error(OPERATION, code)),
         }
@@ -401,7 +401,7 @@ impl RestEndpoints {
         match (stage, body) {
             (DispatchStage::Status { code: 200, .. }, Some(body)) => {
                 let etag = body.header(reqwest::header::ETAG).cloned();
-                let response: LoadTableResult = decode_document(OPERATION, body).await?;
+                let response: LoadTableResult = decode_document(OPERATION, body, true).await?;
                 let (table, delegation) =
                     FrozenLoadTable::from_response(table.clone(), response, self.runtime.clone());
                 Ok(ConditionalTableLoad::Complete {
@@ -592,9 +592,11 @@ impl RestEndpoints {
             )
             .await?
         {
-            Answer::Success { body, .. } => decode_document::<NamespaceResponse>(OPERATION, body)
-                .await
-                .map(Into::into),
+            Answer::Success { body, .. } => {
+                decode_document::<NamespaceResponse>(OPERATION, body, false)
+                    .await
+                    .map(Into::into)
+            }
             Answer::Status(404) => Err(not_found(OPERATION)),
             Answer::Status(code) => Err(status_error(OPERATION, code)),
         }
@@ -642,7 +644,7 @@ impl RestEndpoints {
             .await?
         {
             Answer::Success { body, .. } => {
-                let response: LoadViewResult = decode_document(OPERATION, body).await?;
+                let response: LoadViewResult = decode_document(OPERATION, body, false).await?;
                 Ok(response.metadata)
             }
             Answer::Status(404) => Err(not_found(OPERATION)),
@@ -978,10 +980,20 @@ fn page_url(
 async fn decode_document<T: DeserializeOwned>(
     operation: &'static str,
     body: ResponseBody,
+    table_response: bool,
 ) -> Result<T, ConnectorError> {
     let bytes = read_document_bytes(operation, body).await?;
     crate::metadata_json::from_slice_document(&bytes, crate::metadata_json::Document::TableResponse)
         .map_err(|error| {
+            if table_response
+                && let Some(source) = crate::metadata_json::future_table_format_error(
+                    &error,
+                    &bytes,
+                    crate::metadata_json::Document::TableResponse,
+                )
+            {
+                return source;
+            }
             if error.is_unsupported() {
                 return ConnectorError::new(ConnectorErrorKind::Unsupported, error.to_string());
             }

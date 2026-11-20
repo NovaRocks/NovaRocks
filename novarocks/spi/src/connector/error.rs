@@ -16,5 +16,6 @@
 // under the License.
 
 pub use novarocks_connector_contract::{
-    ConnectorError, ConnectorErrorKind, ConnectorTableObjectBindingFailure,
+    ConnectorError, ConnectorErrorKind, ConnectorTableFormatVersionUnsupported,
+    ConnectorTableObjectBindingFailure,
 };

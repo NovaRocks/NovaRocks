@@ -24,7 +24,8 @@ use super::{
     RequestScopedMaintenanceEngine, TableMaintenanceService,
 };
 use novarocks_query_application::{
-    api::CommandError, protocol_delivery::QuerySessionOutput as StatementResult,
+    api::{CommandError, CommandErrorKind},
+    protocol_delivery::QuerySessionOutput as StatementResult,
 };
 use novarocks_table_maintenance::runtime::TerminalError;
 
@@ -96,18 +97,12 @@ impl MaintenanceCommandExecutor {
         .map(Some)
     }
 
-    pub(crate) fn prepare_cleanup_action(
+    pub(crate) fn reject_legacy_cleanup_call(
         &self,
         command: &novarocks_sql::semantic::MaintenanceSqlCommand,
         current_catalog: Option<&str>,
         current_database: &str,
-        execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
-        connector: &novarocks_spi::connector::ConnectorRequestContext,
-        family: novarocks_result_contract::ClientPresentationFamily,
-    ) -> Result<
-        Option<Box<dyn novarocks_query_application::session_control::GovernedStatementAction>>,
-        CommandError,
-    > {
+    ) -> Result<(), CommandError> {
         let context = MaintenanceRequestContext {
             current_catalog,
             current_database,
@@ -115,34 +110,16 @@ impl MaintenanceCommandExecutor {
         let lowered =
             crate::table_maintenance::lower_semantic_maintenance_statement(command, context)
                 .map_err(maintenance_input_error)?;
-        let crate::table_maintenance::ParsedMaintenanceStatement {
-            name_parts,
-            action:
-                crate::table_maintenance::ParsedMaintenanceAction::RemoveOrphanFiles { older_than_ms },
-        } = lowered
-        else {
-            return Ok(None);
-        };
-        let engine = RequestScopedMaintenanceEngine::new(
-            self.kernel.clone(),
-            execution.clone(),
-            connector.clone(),
-        );
-        let (target, _) = engine
-            .resolve_target_with_provider(&name_parts, context)
-            .map_err(maintenance_target_error)?;
-        super::cleanup_action::prepare(
-            &self.kernel,
-            target,
-            older_than_ms,
-            None,
-            true,
-            execution,
-            connector,
-            family,
-        )
-        .map(Some)
-        .map_err(crate::query::maintenance_command_error)
+        if matches!(
+            lowered.action,
+            crate::table_maintenance::ParsedMaintenanceAction::RemoveOrphanFiles { .. }
+        ) {
+            return Err(CommandError::new(
+                CommandErrorKind::Unsupported,
+                "CALL remove_orphan_files is not supported. Use ALTER TABLE EXECUTE remove_orphan_files",
+            ));
+        }
+        Ok(())
     }
 
     /// Construct the actual original producer, without polling provider I/O.

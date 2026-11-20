@@ -184,7 +184,7 @@ pub trait TableMaintenanceEffectPort: Sync {
     fn execute_metadata<'a>(
         &'a self,
         request: MaintenanceActionRequest,
-    ) -> crate::product::MaintenanceFuture<'a, Result<MaintenanceActionOutcome, String>>;
+    ) -> crate::product::MaintenanceFuture<'a, Result<MaintenanceActionOutcome, TerminalError>>;
     /// Executes one automatic metadata effect using the caller-frozen identity.
     /// Adapters must report the provider's actual terminal classification.
     /// Success is `KnownCommitted` only when the provider proves a commit;
@@ -311,10 +311,7 @@ impl TableMaintenanceProduct {
                 let _permit = self
                     .acquire_activity(&target, MaintenanceActivityFamily::Metadata)
                     .map_err(|error| error.to_string())?;
-                effects
-                    .execute_metadata(request)
-                    .await
-                    .map_err(TerminalError::from)
+                effects.execute_metadata(request).await
             }
         }
     }
@@ -729,7 +726,7 @@ mod tests {
         fn execute_metadata<'a>(
             &'a self,
             _request: MaintenanceActionRequest,
-        ) -> crate::product::MaintenanceFuture<'a, Result<MaintenanceActionOutcome, String>>
+        ) -> crate::product::MaintenanceFuture<'a, Result<MaintenanceActionOutcome, TerminalError>>
         {
             Box::pin(async move { unreachable!("rewrite test never executes metadata") })
         }
@@ -849,7 +846,7 @@ mod tests {
         fn execute_metadata<'a>(
             &'a self,
             _request: MaintenanceActionRequest,
-        ) -> crate::product::MaintenanceFuture<'a, Result<MaintenanceActionOutcome, String>>
+        ) -> crate::product::MaintenanceFuture<'a, Result<MaintenanceActionOutcome, TerminalError>>
         {
             Box::pin(
                 async move { unreachable!("automatic action must not use the user metadata port") },
@@ -1454,7 +1451,7 @@ mod tests {
         fn execute_metadata<'a>(
             &'a self,
             _request: MaintenanceActionRequest,
-        ) -> crate::product::MaintenanceFuture<'a, Result<MaintenanceActionOutcome, String>>
+        ) -> crate::product::MaintenanceFuture<'a, Result<MaintenanceActionOutcome, TerminalError>>
         {
             Box::pin(async move { unreachable!("release test never executes metadata") })
         }
@@ -1617,7 +1614,7 @@ mod tests {
         fn execute_metadata(
             &self,
             _: MaintenanceActionRequest,
-        ) -> MaintenanceFuture<'_, Result<MaintenanceActionOutcome, String>> {
+        ) -> MaintenanceFuture<'_, Result<MaintenanceActionOutcome, TerminalError>> {
             unreachable!("cleanup never executes metadata")
         }
 
@@ -1699,7 +1696,7 @@ mod async_metadata_tests {
         fn execute_metadata<'a>(
             &'a self,
             _: MaintenanceActionRequest,
-        ) -> crate::product::MaintenanceFuture<'a, Result<MaintenanceActionOutcome, String>>
+        ) -> crate::product::MaintenanceFuture<'a, Result<MaintenanceActionOutcome, TerminalError>>
         {
             Box::pin(async move {
                 self.entered.store(true, Ordering::SeqCst);

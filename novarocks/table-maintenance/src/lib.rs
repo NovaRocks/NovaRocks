@@ -92,6 +92,9 @@ pub enum MaintenanceActionRequest {
 /// Provider facts projected by one completed maintenance operation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MaintenanceActionOutcome {
+    Procedure {
+        metrics: Option<ProcedureMetrics>,
+    },
     RewriteDataFiles {
         target_snapshot_id: Option<i64>,
         rewritten_data_files_count: i32,
@@ -162,3 +165,25 @@ pub enum MaintenanceTargetRebind {
 #[cfg(test)]
 #[path = "tests_ports.rs"]
 mod port_tests;
+
+/// Ordered metric rows reported by an explicit table procedure.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProcedureMetrics(Vec<(&'static str, i64)>);
+
+impl ProcedureMetrics {
+    pub fn from_counts<const N: usize>(counts: [(&'static str, u64); N]) -> Result<Self, String> {
+        counts
+            .into_iter()
+            .map(|(name, value)| {
+                i64::try_from(value)
+                    .map(|value| (name, value))
+                    .map_err(|_| format!("Table procedure metric {name} exceeds bigint"))
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(Self)
+    }
+
+    pub fn into_rows(self) -> Vec<(&'static str, i64)> {
+        self.0
+    }
+}

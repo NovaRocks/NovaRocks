@@ -27,7 +27,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use novarocks_spi::connector::{
-    ConnectorError, ConnectorErrorKind, ConnectorInstanceId,
+    ConnectorError, ConnectorErrorKind, ConnectorExpireSnapshotsExecute, ConnectorInstanceId,
     ConnectorMaxCompactableDataFilesRequest, ConnectorMetadataMaintenanceExecuteRequest,
     ConnectorMetadataMaintenanceExecution, ConnectorMetadataMaintenanceOperation,
     ConnectorMetadataMaintenanceOutcome, ConnectorMetadataMaintenancePlan,
@@ -44,6 +44,12 @@ use novarocks_query_application::engine_error::EngineError;
 /// exact maintenance lease.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MetadataMaintenanceIntent {
+    TrinoOptimizeManifests,
+    TrinoExpireSnapshots {
+        older_than_ms: i64,
+        retain_last: Option<u32>,
+        inputs: ConnectorExpireSnapshotsExecute,
+    },
     RewriteMetadataLayout,
     ExpireTableVersions {
         older_than_ms: Option<i64>,
@@ -71,6 +77,19 @@ impl MetadataMaintenanceIntent {
         table: ConnectorTableHandle,
     ) -> Result<ConnectorMetadataMaintenanceOperation, ConnectorError> {
         match self {
+            Self::TrinoOptimizeManifests => Ok(
+                ConnectorMetadataMaintenanceOperation::optimize_manifests(table),
+            ),
+            Self::TrinoExpireSnapshots {
+                older_than_ms,
+                retain_last,
+                inputs,
+            } => ConnectorMetadataMaintenanceOperation::expire_snapshots(
+                table,
+                older_than_ms,
+                retain_last,
+                inputs,
+            ),
             Self::RewriteMetadataLayout => {
                 ConnectorMetadataMaintenanceOperation::rewrite_metadata_layout(table)
             }
@@ -300,6 +319,21 @@ impl MetadataMaintenanceCall {
                 },
             ) if self.preparation.is_none() && !self.preparation_poll_unproven => R::Disposed,
             _ => R::Retained,
+        }
+    }
+
+    pub(crate) fn is_trino_expiry(&self) -> bool {
+        matches!(
+            self.intent,
+            MetadataMaintenanceIntent::TrinoExpireSnapshots { .. }
+        )
+    }
+
+    pub(crate) fn trino_execute(&self) -> Option<&MetadataMaintenanceIntent> {
+        match &self.intent {
+            MetadataMaintenanceIntent::TrinoOptimizeManifests
+            | MetadataMaintenanceIntent::TrinoExpireSnapshots { .. } => Some(&self.intent),
+            _ => None,
         }
     }
 

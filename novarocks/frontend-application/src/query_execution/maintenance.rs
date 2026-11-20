@@ -126,7 +126,7 @@ pub trait TableMaintenanceEngine: Send + Sync {
         &self,
         state: &MaintenanceActionState,
         request: MaintenanceActionRequest,
-    ) -> Result<MaintenanceActionOutcome, String>;
+    ) -> Result<MaintenanceActionOutcome, TerminalError>;
 
     /// Automatic metadata effects retain the MV owner's exact identity and
     /// the provider's typed terminal state. A missing implementation closes
@@ -407,7 +407,7 @@ impl TableMaintenanceEngine for RequestScopedMaintenanceEngine {
         &self,
         state: &MaintenanceActionState,
         request: MaintenanceActionRequest,
-    ) -> Result<MaintenanceActionOutcome, String> {
+    ) -> Result<MaintenanceActionOutcome, TerminalError> {
         state.install_engine(self.clone())?;
         state.execute(request).await
     }

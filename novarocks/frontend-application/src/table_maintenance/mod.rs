@@ -21,7 +21,9 @@
 
 use novarocks_table_maintenance::product::TableMaintenanceProduct;
 use novarocks_table_maintenance::runtime::TerminalError;
-use novarocks_table_maintenance::{MaintenanceActionRequest, MaintenanceTarget};
+use novarocks_table_maintenance::{
+    MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceTarget,
+};
 use std::sync::Arc;
 
 pub(crate) use self::admission::{
@@ -95,7 +97,7 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
             .product
             .execute_user_action(&LegacyMaintenanceEffects::new(engine, state), request)
             .await?;
-        if spark_procedure {
+        if spark_procedure || matches!(outcome, MaintenanceActionOutcome::Procedure { .. }) {
             action_result(outcome).map_err(TerminalError::from)
         } else {
             Ok(MaintenanceStatementResult::Ok)

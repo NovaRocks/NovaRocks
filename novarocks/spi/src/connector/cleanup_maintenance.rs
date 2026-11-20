@@ -25,8 +25,9 @@ use uuid::Uuid;
 
 use super::{
     ConnectorControlRuntimeId, ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor,
-    ConnectorInstanceId, ConnectorMetadata, ConnectorProviderBindingKey, ConnectorRequestContext,
-    LakePublicationDisposition, ProviderBindingEpoch,
+    ConnectorInstanceId, ConnectorMaintenanceRetention, ConnectorMetadata,
+    ConnectorProviderBindingKey, ConnectorRequestContext, LakePublicationDisposition,
+    ProviderBindingEpoch,
 };
 
 /// Process-local statement identity selected by the frontend operation owner.
@@ -262,12 +263,23 @@ pub struct ConnectorCleanupAsyncStart {
     pub table: super::ConnectorTableIdentity,
     pub operation_id: ConnectorCleanupOperationId,
     pub older_than_ms: i64,
+    pub retention: ConnectorMaintenanceRetention,
     pub context: ConnectorRequestContext,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ConnectorOrphanCleanupMetrics {
+    pub processed_manifests: u64,
+    pub active_files: u64,
+    pub scanned_files: u64,
+    pub deleted_files: u64,
+    pub deleted_bytes: u64,
 }
 
 pub struct ConnectorCleanupAsyncOutput {
     pub owner: ConnectorProviderBindingKey,
     pub operation_id: ConnectorCleanupOperationId,
+    pub metrics: Option<ConnectorOrphanCleanupMetrics>,
 }
 
 /// The provider source owns the physical future, terminal facts and actual exit.

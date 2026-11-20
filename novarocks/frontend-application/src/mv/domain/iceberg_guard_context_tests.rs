@@ -312,7 +312,10 @@ impl novarocks_table_maintenance::product::TableMaintenanceEffectPort for GuardR
         _: novarocks_table_maintenance::MaintenanceActionRequest,
     ) -> novarocks_table_maintenance::product::MaintenanceFuture<
         'a,
-        Result<novarocks_table_maintenance::MaintenanceActionOutcome, String>,
+        Result<
+            novarocks_table_maintenance::MaintenanceActionOutcome,
+            novarocks_table_maintenance::runtime::TerminalError,
+        >,
     > {
         Box::pin(async { panic!("MV guard refusal precedes metadata effects") })
     }

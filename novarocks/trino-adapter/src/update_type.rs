@@ -19,7 +19,7 @@
 use novarocks_query_application::statement_kind::StatementKind;
 
 /// Returns a candidate update type. Row carriers suppress it except when
-/// Trino explicitly reports rows and an update type, as OPTIMIZE does.
+/// Trino table procedures report metrics and an update type.
 pub(crate) fn update_type(kind: StatementKind) -> Option<&'static str> {
     use StatementKind::*;
     Some(match kind {
@@ -74,10 +74,7 @@ pub(crate) fn update_type(kind: StatementKind) -> Option<&'static str> {
         CreateTag => "CREATE TAG",
         DropTag => "DROP TAG",
         AddFiles => "ADD FILES",
-        Optimize => "ALTER TABLE EXECUTE",
-        RewriteManifests => "REWRITE MANIFESTS",
-        ExpireSnapshots => "EXPIRE SNAPSHOTS",
-        RemoveOrphanFiles => "REMOVE ORPHAN FILES",
+        Optimize | RewriteManifests | ExpireSnapshots | RemoveOrphanFiles => "ALTER TABLE EXECUTE",
         AlterMaterializedViewRefresh => "ALTER MATERIALIZED VIEW REFRESH",
         PauseMaterializedViewRefresh => "PAUSE MATERIALIZED VIEW REFRESH",
         ResumeMaterializedViewRefresh => "RESUME MATERIALIZED VIEW REFRESH",

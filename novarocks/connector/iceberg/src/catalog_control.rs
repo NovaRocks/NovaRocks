@@ -36,6 +36,10 @@ pub mod cleanup_maintenance;
 #[path = "catalog_control/data_mutation.rs"]
 pub mod data_mutation;
 pub mod drop_cleanup;
+#[path = "catalog_control/maintenance_admission.rs"]
+mod maintenance_admission;
+#[path = "catalog_control/maintenance_error.rs"]
+pub(crate) mod maintenance_error;
 #[path = "catalog_control/metadata_maintenance.rs"]
 pub(crate) mod metadata_maintenance;
 #[path = "catalog_control/staged_create.rs"]
@@ -223,6 +227,7 @@ mod tests {
             object_store_config: None,
             warehouse_path: PathBuf::from("/tmp/warehouse"),
             write: Default::default(),
+            maintenance: Default::default(),
         });
 
         assert!(!state.is_s3());
@@ -247,6 +252,7 @@ mod tests {
                 object_store_config: None,
                 warehouse_path: PathBuf::from("/tmp/warehouse"),
                 write: Default::default(),
+                maintenance: Default::default(),
             })
         };
         registry

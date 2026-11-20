@@ -35,6 +35,7 @@ mod handle;
 mod identity;
 mod io_admission;
 mod listing;
+mod maintenance_duration;
 mod metadata;
 mod metadata_maintenance;
 mod mutation;
@@ -84,7 +85,7 @@ pub use cleanup_maintenance::{
     ConnectorCleanupAsyncExecution, ConnectorCleanupAsyncObservation, ConnectorCleanupAsyncOutput,
     ConnectorCleanupAsyncSource, ConnectorCleanupAsyncStart, ConnectorCleanupMaintenance,
     ConnectorCleanupMaintenanceResolver, ConnectorCleanupMaintenanceSession,
-    ConnectorCleanupOperationId,
+    ConnectorCleanupOperationId, ConnectorOrphanCleanupMetrics,
 };
 pub use codec::{
     ConnectorCodecCategory, ConnectorCodecContractError, ConnectorCodecError,
@@ -165,7 +166,10 @@ pub use distributed_rewrite::{
 };
 pub use distribution::ProviderBindingEpoch;
 pub use document_storage::*;
-pub use error::{ConnectorError, ConnectorErrorKind, ConnectorTableObjectBindingFailure};
+pub use error::{
+    ConnectorError, ConnectorErrorKind, ConnectorTableFormatVersionUnsupported,
+    ConnectorTableObjectBindingFailure,
+};
 pub use execution::{ConnectorPrepareSplitRequest, MAX_CONNECTOR_PREPARED_SCAN_UNITS_PER_SPLIT};
 pub use handle::{
     ConnectorPinnedFileSet, ConnectorScanHandle, ConnectorSplit, ConnectorTableHandle,
@@ -182,6 +186,11 @@ pub use io_admission::{
     SelectedThriftServiceOrigin, SharedDependency, ThriftServiceOrigin,
 };
 pub use listing::{ConnectorListingCollector, ConnectorListingPageSize};
+pub use maintenance_duration::{
+    ConnectorMaintenanceDuration, ConnectorMaintenanceRetention,
+    EXPIRE_SNAPSHOTS_MIN_RETENTION_SESSION_PROPERTY,
+    REMOVE_ORPHAN_FILES_MIN_RETENTION_SESSION_PROPERTY,
+};
 pub use metadata::{
     CONNECTOR_FIELD_HIDDEN_FROM_SQL, CONNECTOR_MV_APPLY_KEY_COLUMN_PROPERTY,
     CONNECTOR_MV_HIDDEN_COLUMNS_PROPERTY, ConnectorColumnDefault, ConnectorListNamespacesRequest,
@@ -206,7 +215,8 @@ pub use metadata::{
     MAX_CONNECTOR_TABLE_PLANNING_FACT_UNIQUE_CONSTRAINTS,
 };
 pub use metadata_maintenance::{
-    CONNECTOR_METADATA_MAINTENANCE_CONTRACT_VERSION, ConnectorMaxCompactableDataFiles,
+    CONNECTOR_METADATA_MAINTENANCE_CONTRACT_VERSION, ConnectorExpireSnapshotsExecute,
+    ConnectorManifestRewriteMetrics, ConnectorMaxCompactableDataFiles,
     ConnectorMaxCompactableDataFilesExecution, ConnectorMaxCompactableDataFilesRequest,
     ConnectorMaxCompactableDataFilesSource, ConnectorMetadataCleanupResponsibility,
     ConnectorMetadataMaintenance, ConnectorMetadataMaintenanceExecuteRequest,

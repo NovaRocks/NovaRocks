@@ -102,7 +102,7 @@ fn project_at(
         &statement,
         &ConnectorProviderId::parse("iceberg").unwrap(),
         &mut LiteralValues,
-        &mut OriginalTimestamp { source },
+        "lake",
         &control,
     )?;
     project_bound(
@@ -141,7 +141,7 @@ fn development_equality_procedure_keeps_original_rows_for_the_typed_sink() {
             &statement,
             provider,
             &mut LiteralValues,
-            &mut OriginalTimestamp { source: sql },
+            "lake",
             &control,
         )
     };
@@ -260,81 +260,63 @@ fn unset_property_procedure_keeps_provider_key_rules_and_default() {
 }
 
 #[test]
-fn typed_table_procedure_uses_original_absolute_time_conversion() {
+fn relative_procedures_use_one_supplied_statement_start() {
     assert_eq!(
         project("ALTER TABLE lake.ns.t EXECUTE optimize_manifests").unwrap(),
         Procedure::RewriteManifests,
     );
-    assert_eq!(
-        project("ALTER TABLE lake.ns.t EXECUTE expire_snapshots(older_than => TIMESTAMP '1970-01-01 00:00:07')").unwrap(),
-        Procedure::ExpireSnapshots { older_than_ms: Some(7000), retain_last: None },
-    );
-    assert_eq!(
-        project("ALTER TABLE lake.ns.t EXECUTE remove_orphan_files(older_than => TIMESTAMP '1970-01-01 00:00:03')").unwrap(),
-        Procedure::RemoveOrphanFiles(3000),
-    );
-    for (source, expected) in [
+    for (sql, cutoff, count, duration, clean) in [
+        ("expire_snapshots", 195_200_123, None, "7d", false),
         (
-            "ALTER TABLE t EXECUTE remove_orphan_files(older_than => 7001)",
-            7001,
+            "expire_snapshots(retention_threshold => '7d')",
+            195_200_123,
+            None,
+            "7d",
+            false,
         ),
         (
-            "ALTER TABLE t EXECUTE remove_orphan_files(older_than => '1970-01-01T01:00:07.123456+01:00')",
-            7123,
+            "expire_snapshots(retain_last => 2)",
+            195_200_123,
+            Some(2),
+            "7d",
+            false,
         ),
         (
-            "ALTER TABLE t EXECUTE remove_orphan_files(older_than => TIMESTAMP '1970-01-01T01:00:07.123456+01:00')",
-            7123,
-        ),
-        (
-            "ALTER TABLE t EXECUTE remove_orphan_files(older_than => TIMESTAMP '7001')",
-            7001,
+            "expire_snapshots(retention_threshold => '0d', retain_last => 2, clean_expired_metadata => TRUE)",
+            800_000_123,
+            Some(2),
+            "0d",
+            true,
         ),
     ] {
+        let source = format!("ALTER TABLE lake.ns.t EXECUTE {sql}");
         assert_eq!(
-            project(source).unwrap(),
-            Procedure::RemoveOrphanFiles(expected),
-            "{source}"
-        );
-    }
-}
-
-#[test]
-fn relative_procedures_use_bound_duration_and_one_supplied_statement_start() {
-    for source in [
-        "ALTER TABLE lake.ns.t EXECUTE expire_snapshots",
-        "ALTER TABLE lake.ns.t EXECUTE expire_snapshots(retention_threshold => '7d')",
-    ] {
-        assert_eq!(
-            project(source).unwrap(),
+            project(&source).unwrap(),
             Procedure::ExpireSnapshots {
-                older_than_ms: Some(195_200_123),
-                retain_last: None,
-            }
+                older_than_ms: cutoff,
+                retain_last: count,
+                duration: ConnectorMaintenanceDuration::parse(duration).unwrap(),
+                clean_expired_metadata: clean,
+            },
         );
     }
-    assert_eq!(
-        project("ALTER TABLE lake.ns.t EXECUTE remove_orphan_files").unwrap(),
-        Procedure::RemoveOrphanFiles(195_200_123),
-    );
-    assert_eq!(
-        project(
-            "ALTER TABLE lake.ns.t EXECUTE remove_orphan_files(retention_threshold => '0.5ms')"
-        )
-        .unwrap(),
-        Procedure::RemoveOrphanFiles(800_000_122),
-    );
-    assert_eq!(
-        project("ALTER TABLE lake.ns.t EXECUTE expire_snapshots(retention_threshold => '0d', retain_last => 2)").unwrap(),
-        Procedure::ExpireSnapshots { older_than_ms: Some(800_000_123), retain_last: Some(2) },
-    );
-    assert_eq!(
-        project("ALTER TABLE lake.ns.t EXECUTE expire_snapshots(retain_last => 2)").unwrap(),
-        Procedure::ExpireSnapshots {
-            older_than_ms: None,
-            retain_last: Some(2)
-        },
-    );
+    for (sql, cutoff, duration) in [
+        ("remove_orphan_files", 195_200_123, "7d"),
+        (
+            "remove_orphan_files(retention_threshold => '0.5ms')",
+            800_000_122,
+            "0.5ms",
+        ),
+    ] {
+        let source = format!("ALTER TABLE lake.ns.t EXECUTE {sql}");
+        assert_eq!(
+            project(&source).unwrap(),
+            Procedure::RemoveOrphanFiles {
+                older_than_ms: cutoff,
+                duration: ConnectorMaintenanceDuration::parse(duration).unwrap(),
+            },
+        );
+    }
 }
 
 #[test]
@@ -365,8 +347,10 @@ fn relative_procedures_keep_typed_argument_errors_and_original_cutoff_limits() {
         )
         .unwrap(),
         Procedure::ExpireSnapshots {
-            older_than_ms: Some(0),
-            retain_last: None
+            older_than_ms: 0,
+            retain_last: None,
+            duration: ConnectorMaintenanceDuration::parse("7ms").unwrap(),
+            clean_expired_metadata: false,
         },
     );
     for source in [
@@ -382,4 +366,29 @@ fn relative_procedures_keep_typed_argument_errors_and_original_cutoff_limits() {
             "{source}",
         );
     }
+}
+
+#[test]
+fn explicit_maintenance_refusals_keep_the_original_property_and_where_details() {
+    let retain_last = "ALTER TABLE lake.ns.t EXECUTE expire_snapshots(retain_last => 0)";
+    let error = project(retain_last).unwrap_err();
+    let user = error.user_error().unwrap();
+    assert_eq!(
+        user.code().as_str(),
+        "sql.admit.invalid_table_procedure_argument"
+    );
+    assert_eq!(
+        user.message(),
+        "Unable to set catalog 'lake' table procedure 'EXPIRE_SNAPSHOTS' property 'retain_last' to [0]: Number of snapshots to retain must be at least 1",
+    );
+    assert!(user.location().is_some());
+
+    let error =
+        project("ALTER TABLE lake.ns.t EXECUTE optimize_manifests WHERE id > 0").unwrap_err();
+    let user = error.user_error().unwrap();
+    assert_eq!(user.code().as_str(), "sql.admit.unsupported_statement");
+    assert_eq!(
+        user.message(),
+        "WHERE not supported for procedure OPTIMIZE_MANIFESTS"
+    );
 }

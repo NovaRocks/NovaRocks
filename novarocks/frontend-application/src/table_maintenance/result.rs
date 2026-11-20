@@ -23,12 +23,13 @@ use novarocks_query_application::api::{
 };
 use std::sync::Arc;
 
-use novarocks_table_maintenance::MaintenanceActionOutcome;
+use novarocks_table_maintenance::{MaintenanceActionOutcome, ProcedureMetrics};
 
 pub fn action_result(
     outcome: MaintenanceActionOutcome,
 ) -> Result<MaintenanceStatementResult, String> {
     let result = match outcome {
+        MaintenanceActionOutcome::Procedure { metrics } => procedure_metrics_result(metrics)?,
         MaintenanceActionOutcome::RewriteDataFiles {
             rewritten_data_files_count,
             added_data_files_count,
@@ -169,6 +170,27 @@ pub(crate) fn optimize_result(
     .map(MaintenanceStatementResult::Query)
 }
 
+pub(crate) fn procedure_metrics_result(
+    metrics: Option<ProcedureMetrics>,
+) -> Result<QueryResult, String> {
+    let (names, values): (Vec<_>, Vec<_>) = metrics
+        .map(ProcedureMetrics::into_rows)
+        .unwrap_or_default()
+        .into_iter()
+        .unzip();
+    build_query_result(
+        vec![
+            column("metric_name", DataType::Utf8, false),
+            column("metric_value", DataType::Int64, false),
+        ],
+        vec![
+            Arc::new(StringArray::from(names)) as ArrayRef,
+            Arc::new(Int64Array::from(values)) as ArrayRef,
+        ],
+        "build Iceberg procedure metrics",
+    )
+}
+
 fn build_query_result(
     columns: Vec<QueryResultColumn>,
     arrays: Vec<ArrayRef>,
@@ -182,4 +204,46 @@ fn column(name: &str, data_type: DataType, nullable: bool) -> QueryResultColumn 
         name,
         novarocks_type_contract::FunctionValueType::new(data_type, nullable),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_maintenance_keeps_metric_schema_without_rows() {
+        let result = procedure_metrics_result(None).unwrap();
+        assert_eq!(result.row_count(), 0);
+        assert_eq!(
+            result
+                .columns
+                .iter()
+                .map(|column| (column.name(), column.data_type()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("metric_name", &DataType::Utf8),
+                ("metric_value", &DataType::Int64)
+            ],
+        );
+        let result = procedure_metrics_result(Some(
+            ProcedureMetrics::from_counts([("scanned_files_count", 9), ("deleted_files_count", 1)])
+                .unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(result.row_count(), 2);
+        let batch = &result.batches[0];
+        let names = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let values = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(names.value(0), "scanned_files_count");
+        assert_eq!(names.value(1), "deleted_files_count");
+        assert_eq!(values.values().as_ref(), &[9, 1]);
+    }
 }

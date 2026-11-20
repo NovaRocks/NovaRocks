@@ -174,7 +174,7 @@ impl TableMaintenanceEffectPort for ProductExecution {
     fn execute_metadata<'a>(
         &'a self,
         _: MaintenanceActionRequest,
-    ) -> MaintenanceFuture<'a, Result<MaintenanceActionOutcome, String>> {
+    ) -> MaintenanceFuture<'a, Result<MaintenanceActionOutcome, TerminalError>> {
         Box::pin(async { panic!("the original worker dispatches Rewrite only") })
     }
     fn begin_rewrite<'a>(

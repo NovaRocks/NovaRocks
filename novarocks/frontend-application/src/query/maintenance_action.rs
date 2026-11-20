@@ -57,16 +57,11 @@ pub(super) fn prepare(
     {
         return Ok(action);
     }
-    if let Some(action) = executor.prepare_cleanup_action(
+    executor.reject_legacy_cleanup_call(
         command,
         context.session().current_catalog(),
         context.session().current_database(),
-        context.execution(),
-        command_context.connector_context(),
-        family,
-    )? {
-        return Ok(action);
-    }
+    )?;
     prepare_metadata_action(context, command_context, family, || {
         executor.prepare_command(
             command,
@@ -325,7 +320,12 @@ fn select_maintenance_completion(
     let committed = disposition == Some(LakePublicationDisposition::KnownCommitted);
     match result {
         Err(error) => {
-            let routed = product_command_error(maintenance_command_error(error));
+            let routed =
+                match crate::query_execution::maintenance::iceberg::invalid_procedure_error(&error)
+                {
+                    Some(public) => RoutedExecutionError::Application(public),
+                    None => product_command_error(maintenance_command_error(error)),
+                };
             Err(match cancellation {
                 Some(reason) if !committed => {
                     selected_execution_or_worker_fallback(Err(routed), cancellation_error(reason))
