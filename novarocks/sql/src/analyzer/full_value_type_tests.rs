@@ -534,6 +534,8 @@ fn round_and_truncate_decimal_result_is_the_exact_selected_binding() {
 struct ScalePreservingRoundResolver;
 
 impl ScalePreservingRoundResolver {
+    const OVERLOAD: &str = "test.scalar/scale_preserving_round/0/v1";
+
     fn selection(
         request: novarocks_functions::FunctionBindingRequest<'_>,
         control: &dyn PureCompileControl,
@@ -576,8 +578,7 @@ impl ScalePreservingRoundResolver {
             }
             work.step()?;
             Ok(FunctionBindingSelection {
-                overload: FunctionOverloadId::try_new("test.scalar/scale_preserving_round/0/v1")
-                    .unwrap(),
+                overload: FunctionOverloadId::try_new(Self::OVERLOAD).unwrap(),
                 argument_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(
                     vec![
                         FunctionArgumentType::Value(source.clone()),
@@ -616,6 +617,22 @@ impl novarocks_functions::FunctionBindingResolver for ScalePreservingRoundResolv
         Self::selection(request, control)
     }
 
+    fn select_at_overload_observed(
+        &self,
+        overload: &novarocks_functions::FunctionOverloadId,
+        request: novarocks_functions::FunctionBindingRequest<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<
+        novarocks_functions::FunctionBindingSelection,
+        novarocks_functions::FunctionBindingError,
+    > {
+        control.checkpoint(CompilePhase::FunctionSpecialization, 0)?;
+        if overload.as_str() != Self::OVERLOAD {
+            return Err(novarocks_functions::FunctionBindingError::NoMatchingOverload);
+        }
+        Self::selection(request, control)
+    }
+
     fn validate_selected(
         &self,
         selected: &novarocks_functions::FunctionBindingSelection,
@@ -647,7 +664,7 @@ fn same_spelling_custom_round_result_is_not_reauthored_by_analyzer() {
         identity.clone(),
         FunctionKind::Scalar,
         [FunctionOverloadDeclaration::from_effects(
-            FunctionOverloadId::try_new("test.scalar/scale_preserving_round/0/v1").unwrap(),
+            FunctionOverloadId::try_new(ScalePreservingRoundResolver::OVERLOAD).unwrap(),
             "Physical Decimal128(18,6), Physical signed integer",
             "Physical Decimal128(38,6), nullable; preserve the source scale",
             None,

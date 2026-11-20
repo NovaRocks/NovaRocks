@@ -81,6 +81,7 @@ struct StandaloneDraft {
     brand: StandaloneSourceBrand,
     draft: novarocks_expression_contract::BoundExprSetBuilder,
     events: Vec<ExprId>,
+    value_types: BTreeMap<ValueId, ValueType>,
     constants: constant_emission::SqlConstantEmission,
     lambda_scope: Vec<LoweringLambdaScope>,
     journal: SqlLogicalSourceJournal,
@@ -104,6 +105,7 @@ impl StandaloneDraft {
                 },
             ),
             events: Vec::new(),
+            value_types: BTreeMap::new(),
             constants: constant_emission::SqlConstantEmission::new(),
             lambda_scope: Vec::new(),
             journal: SqlLogicalSourceJournal::new(),
@@ -131,6 +133,7 @@ impl StandaloneDraft {
                 brand: &self.brand,
                 draft: &mut self.draft,
                 events: &mut self.events,
+                value_types: &self.value_types,
             }),
             call_sources: &mut self.journal,
         }
@@ -180,19 +183,51 @@ pub(crate) fn lower_required_constant_unit(
     policy: novarocks_constant_contract::ConstantPolicy,
     control: &dyn PureCompileControl,
 ) -> Result<StandaloneScalarEmission, ContractLoweringError> {
+    lower_standalone_scalar_unit(
+        expression,
+        &[],
+        functions,
+        sealed_functions,
+        allow_throw_exception,
+        policy,
+        control,
+    )
+}
+
+pub(crate) fn lower_standalone_scalar_unit(
+    expression: &TypedExpr,
+    inputs: &[(ColumnId, ValueId, ValueType)],
+    functions: Arc<dyn crate::compiler::SqlFunctionCatalog>,
+    sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
+    allow_throw_exception: bool,
+    policy: novarocks_constant_contract::ConstantPolicy,
+    control: &dyn PureCompileControl,
+) -> Result<StandaloneScalarEmission, ContractLoweringError> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
     work.flush()?;
     let mut source = StandaloneDraft::new(functions, allow_throw_exception, policy);
     work.step()?;
+    let mut visible = BTreeMap::new();
+    for (column, value, ty) in inputs {
+        work.step()?;
+        visible.insert(*column, *value);
+        source.value_types.insert(*value, ty.clone());
+    }
     // These are original lowering-frontier failures, before finish_draft's
     // ordinary footer. In particular, a source Limit must remain primary.
     let definition = source
         .emission(control, &mut work)
-        .lower_expression(expression, &BTreeMap::new())?;
+        .lower_expression(expression, &visible)?;
+    let ports = unit_authorship::standalone_input_ports_observed(&source.draft, inputs, &mut work)?;
+    let scope = if ports.is_empty() {
+        RootScope::AllPorts
+    } else {
+        RootScope::Port(0)
+    };
     let root = source.emission(control, &mut work).root_definition(
         definition,
         novarocks_type_contract::EvaluationDemand::Value,
-        novarocks_expression_contract::RootScope::AllPorts,
+        scope,
     )?;
     let result = (|| {
         source.rebind_nullability(control, &mut work)?;
@@ -236,7 +271,7 @@ pub(crate) fn lower_required_constant_unit(
         let authored = unit_authorship::finish_scalar_unit_observed(
             site,
             source.draft,
-            || Ok(Vec::new()),
+            || Ok(ports),
             source.constants.pools(),
             &parameters,
             &source.journal,

@@ -77,6 +77,41 @@ pub(super) fn admit_scalar_unit_sources_observed<'source>(
     Ok(())
 }
 
+/// Project referenced input values in the caller's declared layout order.
+pub(super) fn standalone_input_ports_observed(
+    draft: &novarocks_expression_contract::BoundExprSetBuilder,
+    inputs: &[(ColumnId, ValueId, ValueType)],
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Vec<novarocks_expression_contract::ExprPort>, ContractLoweringError> {
+    if inputs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut used = BTreeSet::new();
+    for definition in draft.definitions() {
+        work.step()?;
+        if let ContractExprKind::Value(value) = definition.kind {
+            used.insert(value);
+        }
+    }
+    if used.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut values = Vec::new();
+    work.flush()?;
+    values
+        .try_reserve_exact(used.len())
+        .map_err(|_| CompileControlError::ResourceExhausted)?;
+    for (_, value, ty) in inputs {
+        work.step()?;
+        if used.contains(value) {
+            values.push((*value, ty.clone()));
+        }
+    }
+    Ok(vec![novarocks_expression_contract::ExprPort {
+        values: values.into_boxed_slice(),
+    }])
+}
+
 /// Consume one actual draft through the expression-layer call author.
 /// SQL still pairs each call with its source journal and statement policy.
 /// Ports are authored at their original point after definition controls; this

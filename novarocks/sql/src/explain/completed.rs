@@ -31,6 +31,7 @@ use novarocks_physical_plan::{
 };
 use sha2::{Digest, Sha256};
 
+use crate::common::negation::{is_negation, write_negation};
 use crate::compiler::{SqlCompileError, SqlCompletedPlan, SqlDisplayAnnotation, SqlDisplayIntent};
 use crate::explain::ExplainLevel;
 
@@ -1785,10 +1786,7 @@ impl fmt::Display for ExprDefinitionDisplay<'_> {
                 formatter,
                 "({}{})",
                 match op {
-                    novarocks_expression_contract::UnaryOperator::Plus => "+",
-                    novarocks_expression_contract::UnaryOperator::Minus => "-",
                     novarocks_expression_contract::UnaryOperator::Not => "NOT ",
-                    novarocks_expression_contract::UnaryOperator::BitwiseNot => "~",
                 },
                 expr(*inner)
             ),
@@ -1819,6 +1817,14 @@ impl fmt::Display for ExprDefinitionDisplay<'_> {
                 binary_operator(*op),
                 expr(*right)
             ),
+            ExprKind::FunctionCall { function, args } if is_negation(&function.function_id) => {
+                let [operand] = args.as_ref() else {
+                    return Err(fmt::Error);
+                };
+                formatter.write_str("(")?;
+                write_negation(formatter, false, |out| write!(out, "{}", expr(*operand)))?;
+                formatter.write_str(")")
+            }
             ExprKind::FunctionCall { function, args } => write!(
                 formatter,
                 "{}@{}({})",
@@ -1968,9 +1974,6 @@ fn binary_operator(operator: novarocks_expression_contract::BinaryOperator) -> &
         novarocks_expression_contract::BinaryOperator::LtEq => "<=",
         novarocks_expression_contract::BinaryOperator::Gt => ">",
         novarocks_expression_contract::BinaryOperator::GtEq => ">=",
-        novarocks_expression_contract::BinaryOperator::BitAnd => "&",
-        novarocks_expression_contract::BinaryOperator::BitOr => "|",
-        novarocks_expression_contract::BinaryOperator::BitXor => "^",
     }
 }
 

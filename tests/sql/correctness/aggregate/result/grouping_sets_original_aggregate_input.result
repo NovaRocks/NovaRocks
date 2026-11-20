@@ -37,3 +37,10 @@ g	k	total
 0	30	2
 0	40	NULL
 1	NULL	4
+
+-- query 8
+-- types	integer	integer
+g	negated
+0	-2
+0	-1
+1	NULL

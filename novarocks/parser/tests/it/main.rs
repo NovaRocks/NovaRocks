@@ -52,6 +52,7 @@ mod printer_pattern;
 mod printer_routine;
 mod printer_special;
 mod roundtrip;
+mod syntax_call;
 mod trino_access;
 mod trino_advanced_relation;
 mod trino_pattern;

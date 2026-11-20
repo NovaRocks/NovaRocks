@@ -51,6 +51,7 @@ impl<'a> ScalarTypeRecipe<'a> {
         Ok(match self.spec {
             TypeSpec::Any(name)
             | TypeSpec::Decimal128Of(name)
+            | TypeSpec::Decimal256Of(name)
             | TypeSpec::MapWithUninhabitedKey { map: name, .. } => RealizationRule::Source(
                 self.bindings
                     .lookup_value_borrowed(name)

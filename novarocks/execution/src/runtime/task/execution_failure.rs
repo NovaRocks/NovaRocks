@@ -266,9 +266,8 @@ impl ExecutionFailure {
         }
     }
 
-    /// Render only neutral facts and typed execution location for status and
-    /// secondary diagnostics. A provider's arbitrary Display is local source
-    /// material, not a redaction guarantee, even when bounded by SafeDetail.
+    /// Render neutral facts, typed locations and explicitly public row facts.
+    /// A provider's arbitrary Display is local source material even when bounded.
     pub fn safe_detail(&self) -> novarocks_execution_contract::status::SafeDetail {
         use novarocks_failure_contract::FailureProjection;
         self.safe_detail_for_fact(self.failure_fact())
@@ -334,6 +333,11 @@ impl ExecutionFailure {
                     if let Some(prefix) = representation.representable_prefix {
                         write!(f, " representable_prefix={prefix}")?;
                     }
+                }
+                if let ExecutionFailureCause::RequiredRow(required) = self.0.cause()
+                    && let Some(detail) = required.error().public_diagnostic()
+                {
+                    write!(f, ": {detail}")?;
                 }
                 Ok(())
             }
@@ -1028,6 +1032,7 @@ mod required_row_source_properties {
                 batch_row: 4,
             })
         );
+        assert!(!failure.safe_detail().as_str().contains("out of range"));
         let mut source: &(dyn Error + 'static) = &failure;
         loop {
             if let Some(row) = source.downcast_ref::<RowDataError>() {

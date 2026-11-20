@@ -95,6 +95,7 @@ pub(super) struct StandaloneScalarStorage<'emission> {
     pub(super) brand: &'emission super::super::unit_source::StandaloneSourceBrand,
     pub(super) draft: &'emission mut novarocks_expression_contract::BoundExprSetBuilder,
     pub(super) events: &'emission mut Vec<ExprId>,
+    pub(super) value_types: &'emission BTreeMap<ValueId, ValueType>,
 }
 
 pub(super) enum ScalarStorage<'emission> {
@@ -120,7 +121,7 @@ impl ScalarStorage<'_> {
     pub(super) fn current_value_type(&self, value: ValueId) -> Option<&ValueType> {
         match self {
             Self::Node(storage) => storage.current_value_type(value),
-            Self::Standalone(_) => None,
+            Self::Standalone(storage) => storage.value_types.get(&value),
         }
     }
     pub(super) fn type_editor(
@@ -297,9 +298,8 @@ impl ScalarEmission<'_, '_> {
         value: ValueId,
     ) -> Result<Option<ExprId>, ContractLoweringError> {
         let ScalarStorage::Node(storage) = &self.storage else {
-            return Err(ContractLoweringError::InvalidFunctionBinding {
-                detail: "standalone scalar unit cannot read an input value".into(),
-            });
+            // Standalone inputs are caller-declared values and have no local definition.
+            return Ok(None);
         };
         let owner = storage.node;
         let fragment = &*storage.fragment;
@@ -563,11 +563,6 @@ impl ScalarEmission<'_, '_> {
                 when_then,
                 else_expr,
             } => {
-                // Every branch answers with the type the whole expression
-                // answers with. A branch that says only NULL, or says a
-                // narrower number than its siblings, was reconciled while the
-                // statement was analyzed; carry that reconciliation rather
-                // than leaving each branch its own type.
                 let mut operand = operand
                     .as_deref()
                     .map(|item| self.lower_expression(item, visible))
@@ -591,29 +586,30 @@ impl ScalarEmission<'_, '_> {
                         *when = self.cast_expression_to(*when, &compared)?;
                     }
                 }
-                let mut branches = Vec::with_capacity(when_then.len());
-                for ((_, then), when) in when_then.iter().zip(whens) {
-                    branches.push((
-                        when,
-                        self.lower_expression_as(
-                            then,
+                let lower_branch = |emission: &mut Self, item: &TypedExpr| {
+                    if operand.is_some() {
+                        emission.lower_expression_as(
+                            item,
                             visible,
                             &ty,
                             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                             None,
-                        )?,
-                    ));
-                }
-                let else_expr = match else_expr.as_deref() {
-                    Some(item) => Some(self.lower_expression_as(
-                        item,
-                        visible,
-                        &ty,
-                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-                        None,
-                    )?),
-                    None => None,
+                        )
+                    } else {
+                        // Searched CASE types each branch before lowering.
+                        // Actual input NULL promises still flow through the
+                        // emitted cast, definition and call rebind.
+                        emission.lower_expression(item, visible)
+                    }
                 };
+                let mut branches = Vec::with_capacity(when_then.len());
+                for ((_, then), when) in when_then.iter().zip(whens) {
+                    branches.push((when, lower_branch(self, then)?));
+                }
+                let else_expr = else_expr
+                    .as_deref()
+                    .map(|item| lower_branch(self, item))
+                    .transpose()?;
                 ContractExprKind::Case {
                     operand,
                     when_then: branches.into_boxed_slice(),

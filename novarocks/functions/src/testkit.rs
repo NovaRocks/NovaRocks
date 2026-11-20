@@ -118,5 +118,7 @@ pub fn installed_builtin_owner_catalogue() -> PureEngineFunctionCatalog {
         builder.register(definition.clone()).unwrap();
         installed.extend(records);
     }
-    builder.seal_pure(installed).unwrap()
+    let catalog = builder.seal_pure(installed).unwrap();
+    crate::validate_installed_operator_functions(&catalog, &control).unwrap();
+    catalog
 }

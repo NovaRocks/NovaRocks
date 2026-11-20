@@ -99,7 +99,7 @@ mod common_tests {
         assert_eq!(frame.frame_type, WindowFrameType::Rows);
         assert_eq!(LiteralValue::LargeInt(123), LiteralValue::LargeInt(123));
         assert_eq!(BinOp::EqForNull, BinOp::EqForNull);
-        assert_eq!(UnOp::BitwiseNot, UnOp::BitwiseNot);
+        assert_eq!(UnOp::Not, UnOp::Not);
 
         assert_eq!(
             ApplyKind::In { negated: true },

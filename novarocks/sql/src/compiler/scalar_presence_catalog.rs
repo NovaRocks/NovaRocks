@@ -187,18 +187,6 @@ impl SqlFunctionCatalog for ScalarPresenceCatalog {
         work.finish()?;
         result
     }
-    fn admit_native_bitnot_source_observed(
-        &self,
-        source: &novarocks_functions::FunctionValueType,
-        control: &dyn PureCompileControl,
-    ) -> Result<(), FunctionBindingError> {
-        novarocks_functions::PreparedNativeBitNotRecipe::try_new(source, source, control)
-            .map(|_| ())
-            .map_err(|error| match error.control_error() {
-                Some(cause) => FunctionBindingError::Control(cause),
-                None => FunctionBindingError::InvalidBinding(error.to_string().into()),
-            })
-    }
     fn snapshot(&self) -> Arc<dyn SqlFunctionCatalog> {
         Arc::new(self.clone())
     }
@@ -265,6 +253,16 @@ impl SqlFunctionCatalog for ScalarPresenceCatalog {
         self.original
             .resolve_scalar_signature(name, arg_types, control)
     }
+    fn recognizes_scalar_name(
+        &self,
+        name: &str,
+        arg_types: &[arrow::datatypes::DataType],
+        control: &dyn PureCompileControl,
+    ) -> Result<bool, novarocks_functions::FunctionResolutionError> {
+        self.original
+            .recognizes_scalar_name(name, arg_types, control)
+    }
+
     fn resolve_scalar_binding(
         &self,
         _name: &str,
@@ -279,6 +277,31 @@ impl SqlFunctionCatalog for ScalarPresenceCatalog {
             .resolve_scalar_binding(_name, _arguments, control)?;
         self.admit(binding, control)
     }
+    fn resolve_scalar_operator_binding(
+        &self,
+        operator: novarocks_type_contract::OperatorFunction,
+        request: novarocks_functions::FunctionBindingRequest<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
+        let binding = self
+            .original
+            .resolve_scalar_operator_binding(operator, request, control)?;
+        self.admit(binding, control)
+    }
+
+    fn finish_scalar_binding(
+        &self,
+        function: &novarocks_functions::FunctionId,
+        overload: &novarocks_functions::FunctionOverloadId,
+        request: novarocks_functions::FunctionBindingRequest<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
+        let binding = self
+            .original
+            .finish_scalar_binding(function, overload, request, control)?;
+        self.admit(binding, control)
+    }
+
     fn resolve_scalar_binding_with_expected_result(
         &self,
         _name: &str,

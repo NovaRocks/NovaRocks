@@ -775,6 +775,14 @@ fn expression_facts(
             (SqlMvPersistenceExpressionKind::Literal, None)
         }
         ExprKind::Cast { .. } => (SqlMvPersistenceExpressionKind::Cast, None),
+        ExprKind::FunctionCall { binding, .. }
+            if crate::common::negation::is_negation(&binding.function_id) =>
+        {
+            (
+                SqlMvPersistenceExpressionKind::Function,
+                Some(binding.function_id.as_str().to_owned()),
+            )
+        }
         ExprKind::FunctionCall { name, .. }
         | ExprKind::AggregateCall { name, .. }
         | ExprKind::WindowCall { name, .. } => (
@@ -1124,8 +1132,6 @@ fn binary_operator_identity(operator: BinOp) -> &'static str {
 fn unary_operator_identity(operator: UnOp) -> &'static str {
     match operator {
         UnOp::Not => "operator/not",
-        UnOp::Negate => "operator/negate",
-        UnOp::BitwiseNot => "operator/bitwise-not",
     }
 }
 

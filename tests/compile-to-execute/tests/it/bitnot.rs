@@ -497,8 +497,8 @@ fn native_bitnot_intrinsic_original_and_exact_utf8_largeint_source_keeps_convers
     let expected = novarocks_types::largeint::array_from_i128(&[Some(i128::MAX)]).unwrap();
     assert_eq!(outputs[0].to_data(), expected.to_data());
 
-    // Equal-width bytes are not authorization for either the conversion or
-    // the exact BitwiseNot recipe. Only the explicit nominal source is admitted.
+    // The value conversion owner must not authorize a nominal LARGEINT
+    // conversion from another equal-width byte carrier.
     for source in [
         FunctionValueType::new(DataType::FixedSizeBinary(16), true),
         FunctionValueType::try_with_logical_type(
@@ -509,8 +509,5 @@ fn native_bitnot_intrinsic_original_and_exact_utf8_largeint_source_keeps_convers
         .unwrap(),
     ] {
         assert!(resolve_value_conversion(&source, &expected_type, &Control).is_err());
-        assert!(!novarocks_functions::native_bitnot_source_supported(
-            &source
-        ));
     }
 }

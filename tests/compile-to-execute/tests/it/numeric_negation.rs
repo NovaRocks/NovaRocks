@@ -19,12 +19,18 @@ mod scalar {
         array::{Array, ArrayRef, Int8Array, Int16Array, Int32Array, Int64Array},
         datatypes::DataType,
     };
-    use novarocks_expression::CompiledExpressionInstance;
+    use novarocks_execution::runtime::task::execution_failure::ExecutionFailure;
     use novarocks_expression::testkit::PassThroughCallHost;
-    use novarocks_expression::{EvaluationInput, ExprEvaluationFailure};
+    use novarocks_expression::{
+        CompiledExpressionInstance, EvaluationInput, ExprEvaluationFailure,
+        RequiredExpressionRowError,
+    };
+    use novarocks_functions::testkit::shared_installed_builtin_owner_catalogue;
     use novarocks_functions::*;
     use novarocks_sql_testkit::sql_source;
-    use novarocks_test_compile_to_execute::programs::{batch, producer_root, programs};
+    use novarocks_test_compile_to_execute::programs::{
+        batch, producer_root, programs_with_catalogue,
+    };
     use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
     use std::{
         sync::{Arc, Mutex},
@@ -49,10 +55,20 @@ mod scalar {
     #[test]
     fn numeric_unary_owned_transaction_actual_sql_three_widths_frame_and_exchange_keep_public_receipt()
      {
-        for input in [
-            Arc::new(Int8Array::from(vec![i8::MIN, 1])) as ArrayRef,
-            Arc::new(Int16Array::from(vec![i16::MIN, 1])) as ArrayRef,
-            Arc::new(Int32Array::from(vec![i32::MIN, 1])) as ArrayRef,
+        let functions = shared_installed_builtin_owner_catalogue();
+        for (input, expected_detail) in [
+            (
+                Arc::new(Int8Array::from(vec![i8::MIN, 1])) as ArrayRef,
+                "tinyint negation overflow: -128",
+            ),
+            (
+                Arc::new(Int16Array::from(vec![i16::MIN, 1])) as ArrayRef,
+                "smallint negation overflow: -32768",
+            ),
+            (
+                Arc::new(Int32Array::from(vec![i32::MIN, 1])) as ArrayRef,
+                "integer negation overflow: -2147483648",
+            ),
         ] {
             let source = sql_source(
                 "SELECT -k AS original_negated FROM fixture",
@@ -79,7 +95,7 @@ mod scalar {
                     );
                 }
             }
-            let programs = programs(&source);
+            let programs = programs_with_catalogue(&source, &functions);
             let (program, root) = producer_root(&programs);
             let data = batch(&program, root, input.clone());
             let mut frame = CompiledExpressionInstance::try_new(
@@ -106,6 +122,14 @@ mod scalar {
                 selected.errors()[0].reason(),
                 DataFailureReason::NumericOutOfRange
             );
+            let required = RequiredExpressionRowError::try_new(
+                root.root,
+                selected.selection(),
+                selected.errors()[0].clone(),
+            )
+            .unwrap();
+            let failure = ExecutionFailure::from(required);
+            assert!(failure.safe_detail().as_str().ends_with(expected_detail));
             assert!(selected.values().is_null(0));
             assert_eq!(selected.values().null_count(), 1);
             let rows = [1];
@@ -154,13 +178,14 @@ mod scalar {
     #[test]
     fn numeric_unary_owned_transaction_actual_coalesce_isnull_and_if_are_consumers_of_computed_domain()
      {
+        let functions = shared_installed_builtin_owner_catalogue();
         for sql in [
             "SELECT COALESCE(-k,CAST(0 AS TINYINT)) AS observed FROM fixture",
             "SELECT -k IS NULL AS observed FROM fixture",
             "SELECT IF(k=CAST(-128 AS TINYINT),CAST(0 AS TINYINT),-k) AS observed FROM fixture",
         ] {
             let source = sql_source(sql, DataType::Int8);
-            let programs = programs(&source);
+            let programs = programs_with_catalogue(&source, &functions);
             let (program, root) = producer_root(&programs);
             let data = batch(&program, root, Arc::new(Int8Array::from(vec![i8::MIN, 1])));
             let mut frame = CompiledExpressionInstance::try_new(
@@ -216,7 +241,8 @@ mod scalar {
     fn numeric_unary_owned_transaction_actual_int64_inactive_overflow_and_failed_frame_preserve_exact_control()
      {
         let source = sql_source("SELECT -k AS observed FROM fixture", DataType::Int64);
-        let programs = programs(&source);
+        let programs =
+            programs_with_catalogue(&source, &shared_installed_builtin_owner_catalogue());
         let (program, root) = producer_root(&programs);
         let data = batch(
             &program,
