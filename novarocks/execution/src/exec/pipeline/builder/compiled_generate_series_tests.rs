@@ -653,7 +653,7 @@ fn compiled_series_schema_and_slice_use_actual_creator_without_retaining_program
         Arc::clone(&program),
         program.graph().root(),
         Arc::new(RuntimeErrorState::default()),
-        std::num::NonZeroU32::MIN,
+        novarocks_spi::connector::ENGINE_OUTPUT_POLICY.max_rows,
     )
     .unwrap();
     let mut missing = factory.create(1, 0);
