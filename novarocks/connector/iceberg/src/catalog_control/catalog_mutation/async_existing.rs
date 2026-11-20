@@ -106,7 +106,7 @@ impl Original {
                 cleanup: ExternalMutationFinalization::Complete,
             };
         };
-        let original_failure = self.journal.catalog_publication_failure().is_some();
+        let original_failure = self.journal.has_catalog_publication_failure();
         match self.journal.catalog_entry_outcome(entry) {
             Outcome::CommitUnknown { evidence, failure } => Outcome::CommitUnknown {
                 failure: if original_failure { failure } else { actual },

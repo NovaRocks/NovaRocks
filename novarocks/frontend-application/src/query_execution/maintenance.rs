@@ -33,14 +33,10 @@ pub(crate) mod rewrite_job;
 pub(crate) mod rewrite_preparation;
 pub use action_state::MaintenanceActionState;
 pub(crate) mod iceberg;
-#[cfg(test)]
-use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::connector::cleanup_maintenance::{CleanupBatchExecution, CleanupMaintenanceSession};
 use novarocks_query_application::api::QueryResult;
 use novarocks_spi::connector::{
-    CandidatePage, ConnectorCleanupOperationId, ConnectorCleanupOwnedRefSelection,
-    ConnectorRewriteCohortRead, ConnectorWriteCohortId, ConnectorWriteInputShape, PreparedBatch,
+    ConnectorRewriteCohortRead, ConnectorWriteCohortId, ConnectorWriteInputShape,
 };
 use novarocks_table_maintenance::runtime::TerminalError;
 use novarocks_table_maintenance::{
@@ -101,88 +97,6 @@ pub struct MaintenanceRequestContext<'a> {
     pub current_database: &'a str,
 }
 
-/// Write capability for one frontend-owned maintenance execution attempt.
-///
-/// This cancellation is deliberately provider-neutral. The frontend keeps the
-/// source and passes only [`MaintenanceAttemptContext`] through the engine
-/// port, so a lost coordination lease can stop subsequent connector work
-/// without exposing a lease, repository, or provider object to Core.
-#[cfg(test)]
-#[derive(Clone, Debug, Default)]
-pub struct MaintenanceAttemptCancellationSource {
-    cancelled: Arc<AtomicBool>,
-    stop: novarocks_spi::connector::ConnectorStopOwner,
-}
-
-#[cfg(test)]
-impl MaintenanceAttemptCancellationSource {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn context(&self) -> MaintenanceAttemptContext {
-        MaintenanceAttemptContext {
-            stop: self.stop.view(),
-        }
-    }
-
-    /// Returns true only for the first cancellation request.
-    pub fn cancel(&self) -> bool {
-        let first = !self.cancelled.swap(true, Ordering::AcqRel);
-        self.stop.request_stop();
-        first
-    }
-}
-
-/// Read-only cancellation view shared by all provider calls in one durable
-/// maintenance attempt.
-#[derive(Clone, Debug)]
-pub struct MaintenanceAttemptContext {
-    stop: novarocks_spi::connector::ConnectorStopView,
-}
-
-impl Default for MaintenanceAttemptContext {
-    fn default() -> Self {
-        let stop = novarocks_spi::connector::ConnectorStopOwner::new();
-        Self { stop: stop.view() }
-    }
-}
-
-impl MaintenanceAttemptContext {
-    pub fn uncancelled() -> Self {
-        Self::default()
-    }
-
-    #[cfg(test)]
-    pub fn is_cancelled(&self) -> bool {
-        self.stop.is_stopped()
-    }
-
-    #[cfg(test)]
-    fn connector_request_context(
-        &self,
-    ) -> Result<novarocks_spi::connector::ConnectorRequestContext, String> {
-        crate::connector::connector_request_context(None, self.stop.clone())
-    }
-
-    /// Preserve the statement's admitted connector deadline and cancellation
-    /// while also stopping subsequent provider work when this maintenance
-    /// attempt loses its frontend fence.
-    ///
-    /// A durable maintenance service owns the fence cancellation; it must not
-    /// replace the request cancellation captured by the SQL admission path.
-    pub(crate) fn connector_request_context_with_attempt(
-        &self,
-        request: &novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<novarocks_spi::connector::ConnectorRequestContext, String> {
-        Ok(request
-            .clone()
-            .without_attempt_capabilities()
-            .with_request_scope(novarocks_spi::connector::ConnectorRequestScope::new())
-            .with_additional_stop(self.stop.clone()))
-    }
-}
-
 #[derive(Clone, Debug)]
 pub enum MaintenanceStatementResult {
     Ok,
@@ -226,89 +140,6 @@ pub trait TableMaintenanceEngine: Send + Sync {
         Err(TerminalError::pre_dispatch_failed(
             "automatic metadata maintenance identity is unsupported",
         ))
-    }
-
-    /// Plan a provider-neutral FE-only orphan cleanup operation. The returned
-    /// session owns its exact connector generation for the durable frontend
-    /// operation; no BE or generic action route participates.
-    fn plan_cleanup_maintenance(
-        &self,
-        _target: &MaintenanceTarget,
-        _operation_id: ConnectorCleanupOperationId,
-        _older_than_ms: i64,
-    ) -> Result<CleanupMaintenanceSession, String> {
-        Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_string())
-    }
-
-    fn plan_cleanup_maintenance_with_attempt_context(
-        &self,
-        target: &MaintenanceTarget,
-        operation_id: ConnectorCleanupOperationId,
-        older_than_ms: i64,
-        _attempt: &MaintenanceAttemptContext,
-    ) -> Result<CleanupMaintenanceSession, String> {
-        self.plan_cleanup_maintenance(target, operation_id, older_than_ms)
-    }
-
-    /// Plan the second cleanup pass after the frontend has durably selected
-    /// exact mature owned refs. An empty selection is a valid ref-only plan;
-    /// it must never become an object sweep.
-    fn plan_selected_owned_ref_cleanup_maintenance(
-        &self,
-        _target: &MaintenanceTarget,
-        _operation_id: ConnectorCleanupOperationId,
-        _older_than_ms: i64,
-        _selection: ConnectorCleanupOwnedRefSelection,
-    ) -> Result<CleanupMaintenanceSession, String> {
-        Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_string())
-    }
-
-    fn plan_selected_owned_ref_cleanup_maintenance_with_attempt_context(
-        &self,
-        target: &MaintenanceTarget,
-        operation_id: ConnectorCleanupOperationId,
-        older_than_ms: i64,
-        selection: ConnectorCleanupOwnedRefSelection,
-        _attempt: &MaintenanceAttemptContext,
-    ) -> Result<CleanupMaintenanceSession, String> {
-        self.plan_selected_owned_ref_cleanup_maintenance(
-            target,
-            operation_id,
-            older_than_ms,
-            selection,
-        )
-    }
-
-    fn prepare_cleanup_batch(
-        &self,
-        _session: &CleanupMaintenanceSession,
-        _batch_ordinal: u32,
-    ) -> Result<PreparedBatch, String> {
-        Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_string())
-    }
-
-    fn execute_cleanup_batch(
-        &self,
-        _session: &CleanupMaintenanceSession,
-        _prepared: PreparedBatch,
-    ) -> Result<CleanupBatchExecution, String> {
-        Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_string())
-    }
-
-    fn read_cleanup_candidate_page(
-        &self,
-        _session: &CleanupMaintenanceSession,
-        _offset: u64,
-        _limit: u32,
-    ) -> Result<CandidatePage, String> {
-        Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_string())
-    }
-
-    fn finalize_cleanup_terminal(
-        &self,
-        _session: &CleanupMaintenanceSession,
-    ) -> Result<(), String> {
-        Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_string())
     }
 }
 
@@ -464,13 +295,6 @@ impl RequestScopedMaintenanceEngine {
         self
     }
 
-    fn connector_context_for_attempt(
-        &self,
-        attempt: &MaintenanceAttemptContext,
-    ) -> Result<novarocks_spi::connector::ConnectorRequestContext, String> {
-        attempt.connector_request_context_with_attempt(&self.connector_context)
-    }
-
     fn target_identity(
         target: &MaintenanceTarget,
     ) -> Result<novarocks_spi::connector::ConnectorTableIdentity, String> {
@@ -598,113 +422,6 @@ impl TableMaintenanceEngine for RequestScopedMaintenanceEngine {
             .install_engine(self.clone())
             .map_err(TerminalError::pre_dispatch_failed)?;
         state.execute_automatic(request, effect_id).await
-    }
-
-    fn plan_cleanup_maintenance(
-        &self,
-        target: &MaintenanceTarget,
-        operation_id: ConnectorCleanupOperationId,
-        older_than_ms: i64,
-    ) -> Result<CleanupMaintenanceSession, String> {
-        self.plan_cleanup_maintenance_with_attempt_context(
-            target,
-            operation_id,
-            older_than_ms,
-            &MaintenanceAttemptContext::uncancelled(),
-        )
-    }
-
-    fn plan_cleanup_maintenance_with_attempt_context(
-        &self,
-        target: &MaintenanceTarget,
-        operation_id: ConnectorCleanupOperationId,
-        older_than_ms: i64,
-        attempt: &MaintenanceAttemptContext,
-    ) -> Result<CleanupMaintenanceSession, String> {
-        let identity = Self::target_identity(target)?;
-        CleanupMaintenanceSession::plan(
-            self.kernel.connector_control().as_ref(),
-            &identity.instance_id.clone(),
-            operation_id,
-            identity,
-            older_than_ms,
-            self.connector_context_for_attempt(attempt)?,
-        )
-        .map_err(|error| format!("plan orphan cleanup operation: {error}"))
-    }
-
-    fn plan_selected_owned_ref_cleanup_maintenance(
-        &self,
-        target: &MaintenanceTarget,
-        operation_id: ConnectorCleanupOperationId,
-        older_than_ms: i64,
-        selection: ConnectorCleanupOwnedRefSelection,
-    ) -> Result<CleanupMaintenanceSession, String> {
-        self.plan_selected_owned_ref_cleanup_maintenance_with_attempt_context(
-            target,
-            operation_id,
-            older_than_ms,
-            selection,
-            &MaintenanceAttemptContext::uncancelled(),
-        )
-    }
-
-    fn plan_selected_owned_ref_cleanup_maintenance_with_attempt_context(
-        &self,
-        target: &MaintenanceTarget,
-        operation_id: ConnectorCleanupOperationId,
-        older_than_ms: i64,
-        selection: ConnectorCleanupOwnedRefSelection,
-        attempt: &MaintenanceAttemptContext,
-    ) -> Result<CleanupMaintenanceSession, String> {
-        let identity = Self::target_identity(target)?;
-        CleanupMaintenanceSession::plan_selected_owned_refs(
-            self.kernel.connector_control().as_ref(),
-            &identity.instance_id.clone(),
-            operation_id,
-            identity,
-            older_than_ms,
-            selection,
-            self.connector_context_for_attempt(attempt)?,
-        )
-        .map_err(|error| format!("plan selected owned-ref cleanup operation: {error}"))
-    }
-
-    fn prepare_cleanup_batch(
-        &self,
-        session: &CleanupMaintenanceSession,
-        batch_ordinal: u32,
-    ) -> Result<PreparedBatch, String> {
-        session
-            .prepare_batch(batch_ordinal)
-            .map_err(|error| format!("prepare orphan cleanup batch: {error}"))
-    }
-
-    fn execute_cleanup_batch(
-        &self,
-        session: &CleanupMaintenanceSession,
-        prepared: PreparedBatch,
-    ) -> Result<CleanupBatchExecution, String> {
-        session
-            .execute_batch(prepared)
-            .map_err(|error| format!("execute orphan cleanup batch: {error}"))
-    }
-
-    fn read_cleanup_candidate_page(
-        &self,
-        session: &CleanupMaintenanceSession,
-        offset: u64,
-        limit: u32,
-    ) -> Result<CandidatePage, String> {
-        session
-            .read_candidate_page(offset, limit)
-            .map_err(|error| format!("read orphan cleanup candidate page: {error}"))
-    }
-
-    fn finalize_cleanup_terminal(&self, session: &CleanupMaintenanceSession) -> Result<(), String> {
-        session
-            .finalize_terminal()
-            .map_err(|error| format!("finalize orphan cleanup artifacts: {error}"))
     }
 }
 
@@ -1036,135 +753,14 @@ fn rewrite_sink_mode(
 }
 
 #[cfg(test)]
-mod maintenance_attempt_context_tests {
-    use std::time::Duration;
-
+mod maintenance_target_rebind_tests {
     use novarocks_spi::connector::{
         ConnectorError, ConnectorErrorKind, ConnectorTableObjectBindingFailure,
-    };
-
-    use super::{
-        MaintenanceAttemptCancellationSource, MaintenanceAttemptContext,
-        maintenance_target_rebind_from_connector_result,
     };
     use novarocks_table_maintenance::MaintenanceTargetRebind;
     use novarocks_table_maintenance::runtime::MaintenanceJobState;
 
-    #[test]
-    fn source_context_and_connector_request_share_one_cancellation_flag() {
-        let source = MaintenanceAttemptCancellationSource::new();
-        let attempt = source.context();
-        let cloned = attempt.clone();
-        let connector = attempt
-            .connector_request_context()
-            .expect("connector request context");
-
-        assert!(!attempt.is_cancelled());
-        assert!(!connector.is_cancelled());
-        assert!(source.cancel());
-        assert!(!source.cancel());
-        assert!(attempt.is_cancelled());
-        assert!(cloned.is_cancelled());
-        assert!(connector.is_cancelled());
-    }
-
-    #[tokio::test]
-    async fn maintenance_fence_wakes_existing_and_new_stop_waiters() {
-        let source = MaintenanceAttemptCancellationSource::new();
-        let context = source.context();
-        let waiting = context.stop.stopped();
-        assert!(source.cancel());
-        tokio::time::timeout(Duration::from_secs(1), waiting)
-            .await
-            .expect("maintenance stop must wake an existing waiter");
-        tokio::time::timeout(Duration::from_secs(1), context.stop.stopped())
-            .await
-            .expect("maintenance stop must wake a new waiter");
-        assert!(context.is_cancelled());
-    }
-
-    #[test]
-    fn uncancelled_attempts_do_not_share_state() {
-        let first = MaintenanceAttemptContext::uncancelled();
-        let second_source = MaintenanceAttemptCancellationSource::new();
-        let second = second_source.context();
-
-        assert!(second_source.cancel());
-        assert!(!first.is_cancelled());
-        assert!(second.is_cancelled());
-    }
-
-    #[test]
-    fn attempt_context_preserves_request_cancellation_and_deadline() {
-        let request_stop = novarocks_spi::connector::ConnectorStopOwner::new();
-        let request = crate::connector::connector_request_context(None, request_stop.view())
-            .expect("request connector context");
-        let source = MaintenanceAttemptCancellationSource::new();
-        let combined = source
-            .context()
-            .connector_request_context_with_attempt(&request)
-            .expect("combined connector context");
-
-        assert_eq!(combined.deadline(), request.deadline());
-        assert_eq!(
-            combined.max_handle_payload_bytes(),
-            request.max_handle_payload_bytes()
-        );
-        assert_eq!(
-            combined.max_total_payload_bytes(),
-            request.max_total_payload_bytes()
-        );
-        assert!(!combined.is_cancelled());
-
-        request_stop.request_stop();
-        assert!(combined.is_cancelled());
-
-        let request = crate::connector::connector_request_context(
-            None,
-            novarocks_spi::connector::ConnectorStopOwner::new().view(),
-        )
-        .expect("fresh request connector context");
-        let source = MaintenanceAttemptCancellationSource::new();
-        let combined = source
-            .context()
-            .connector_request_context_with_attempt(&request)
-            .expect("combined connector context");
-        assert!(source.cancel());
-        assert!(combined.is_cancelled());
-    }
-
-    #[tokio::test]
-    async fn maintenance_attempt_combines_request_and_fence_stop() {
-        let request_owner = novarocks_spi::connector::ConnectorStopOwner::new();
-        let request = crate::connector::connector_request_context(None, request_owner.view())
-            .expect("request connector context");
-        let source = MaintenanceAttemptCancellationSource::new();
-        let combined = source
-            .context()
-            .connector_request_context_with_attempt(&request)
-            .expect("combined connector context");
-        let stop = combined.stop().clone();
-        request_owner.request_stop();
-        tokio::time::timeout(Duration::from_secs(1), stop.stopped())
-            .await
-            .expect("request stop must wake maintenance provider");
-        assert!(combined.is_cancelled());
-
-        let request_owner = novarocks_spi::connector::ConnectorStopOwner::new();
-        let request = crate::connector::connector_request_context(None, request_owner.view())
-            .expect("request connector context");
-        let source = MaintenanceAttemptCancellationSource::new();
-        let combined = source
-            .context()
-            .connector_request_context_with_attempt(&request)
-            .expect("combined connector context");
-        let stop = combined.stop().clone();
-        assert!(source.cancel());
-        tokio::time::timeout(Duration::from_secs(1), stop.stopped())
-            .await
-            .expect("fence stop must wake maintenance provider");
-        assert!(!request_owner.is_stopped());
-    }
+    use super::maintenance_target_rebind_from_connector_result;
 
     #[test]
     fn rebind_accepts_the_same_physical_object() {

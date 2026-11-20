@@ -46,7 +46,6 @@ enum CpuBody {
     Compaction(crate::catalog_control::metadata_maintenance::observation::CompactionWork),
     PreparedSource(Box<scoped_prepared_source::Work>),
     PreparedSplit(Box<scoped_prepared_split::Work>),
-    Cleanup(Box<crate::catalog_control::cleanup_maintenance::async_original::CpuWork>),
     ReadSnapshot(scoped_snapshot::SnapshotBody),
     Read(Box<scoped_read::ReadBody>),
     MetadataBinding {
@@ -229,25 +228,6 @@ impl IcebergMetadataCpuOriginal {
         };
         work.next()
     }
-    pub(crate) fn cleanup_source(
-        descriptor: novarocks_spi::connector::ConnectorInstanceDescriptor,
-        incarnation: novarocks_spi::connector::ProviderBindingEpoch,
-        work: crate::catalog_control::cleanup_maintenance::async_original::CpuWork,
-    ) -> Arc<Self> {
-        Self::new(descriptor, incarnation, CpuBody::Cleanup(Box::new(work)))
-    }
-    pub(in crate::catalog_control) fn take_cleanup_output(
-        &self,
-    ) -> Result<
-        crate::catalog_control::cleanup_maintenance::async_original::CpuOutput,
-        ConnectorError,
-    > {
-        let mut loan = BodyLoan::take(self);
-        let CpuBody::Cleanup(work) = &mut loan.body.as_mut().unwrap().body else {
-            return Err(invalid("cleanup CPU source differs"));
-        };
-        work.take_output()
-    }
 
     fn new(
         descriptor: novarocks_spi::connector::ConnectorInstanceDescriptor,
@@ -385,7 +365,6 @@ impl IcebergMetadataCpuOriginal {
             CpuBody::Compaction(work) => work.run(),
             CpuBody::PreparedSource(body) => body.run(),
             CpuBody::PreparedSplit(body) => body.run(),
-            CpuBody::Cleanup(work) => work.run(),
             CpuBody::Read(body) => body.run(),
             CpuBody::ReadSnapshot(body) => body.run(),
             CpuBody::MetadataBinding {
@@ -728,7 +707,6 @@ impl novarocks_spi::connector::ProviderMetadataCpuSource for IcebergMetadataCpuO
                         | CpuBody::PreparedSource(_)
                         | CpuBody::PreparedSplit(_)
                         | CpuBody::ReadSnapshot(_)
-                        | CpuBody::Cleanup(_)
                         | CpuBody::Compaction(_)
                 ) || matches!(&body.as_ref().unwrap().body,CpuBody::Read(read) if read.phase<=1
                 ),

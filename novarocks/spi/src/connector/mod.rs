@@ -81,19 +81,10 @@ pub use catalog::{
 };
 pub use catalog_runtime::{CatalogRuntime, CatalogRuntimeMaterializer};
 pub use cleanup_maintenance::{
-    BatchReceipt, BatchReceiptSummary, CONNECTOR_CLEANUP_MAINTENANCE_CONTRACT_VERSION,
-    CandidatePage, ConnectorCleanupAsyncExecution, ConnectorCleanupAsyncObservation,
-    ConnectorCleanupAsyncOutput, ConnectorCleanupAsyncSource, ConnectorCleanupAsyncStart,
-    ConnectorCleanupAsyncStep, ConnectorCleanupCandidate, ConnectorCleanupCandidatePageRequest,
-    ConnectorCleanupExecuteRequest, ConnectorCleanupFinalizeRequest, ConnectorCleanupMaintenance,
+    ConnectorCleanupAsyncExecution, ConnectorCleanupAsyncObservation, ConnectorCleanupAsyncOutput,
+    ConnectorCleanupAsyncSource, ConnectorCleanupAsyncStart, ConnectorCleanupMaintenance,
     ConnectorCleanupMaintenanceResolver, ConnectorCleanupMaintenanceSession,
-    ConnectorCleanupOperation, ConnectorCleanupOperationId, ConnectorCleanupOwnedRefIdentity,
-    ConnectorCleanupOwnedRefSelection, ConnectorCleanupPlan, ConnectorCleanupPlanSummary,
-    ConnectorCleanupPlanningRequest, ConnectorCleanupPrepareRequest, ConnectorCleanupScanSafety,
-    MAX_CONNECTOR_CLEANUP_BATCH_OBJECTS, MAX_CONNECTOR_CLEANUP_BATCHES,
-    MAX_CONNECTOR_CLEANUP_CANDIDATE_PAGE_BYTES, MAX_CONNECTOR_CLEANUP_CANDIDATE_PAGE_ITEMS,
-    MAX_CONNECTOR_CLEANUP_OWNED_REF_SELECTION_ITEMS, MAX_CONNECTOR_CLEANUP_PROVIDER_PAYLOAD_BYTES,
-    PreparedBatch, REMOVE_UNREFERENCED_OBJECTS_KIND,
+    ConnectorCleanupOperationId,
 };
 pub use codec::{
     ConnectorCodecCategory, ConnectorCodecContractError, ConnectorCodecError,

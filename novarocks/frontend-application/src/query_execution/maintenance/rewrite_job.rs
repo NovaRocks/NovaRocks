@@ -1274,27 +1274,6 @@ impl novarocks_table_maintenance::product::DistributedRewriteSession for Governe
 impl novarocks_table_maintenance::product::TableMaintenanceEffectPort
     for GovernedRewriteEffectPort
 {
-    fn observe_cleanup_owned_ref<'a>(
-        &'a self,
-        _: &'a novarocks_table_maintenance::gc_observation::GcOwnedRefObservationAccelerator,
-        _: novarocks_table_maintenance::gc_observation::GcOwnedRefObservation,
-        _: i64,
-        _: i64,
-    ) -> novarocks_table_maintenance::product::MaintenanceFuture<
-        'a,
-        Result<
-            novarocks_table_maintenance::gc_observation::GcOwnedRefObservationDecision,
-            novarocks_table_maintenance::runtime::TerminalError,
-        >,
-    > {
-        Box::pin(async {
-            Err(
-                novarocks_table_maintenance::runtime::TerminalError::pre_dispatch_failed(
-                    "this effect source cannot observe owned-ref cleanup",
-                ),
-            )
-        })
-    }
     fn reject_user_action_on_mv<'a>(
         &'a self,
         _target: &'a MaintenanceTarget,
@@ -1341,16 +1320,6 @@ impl novarocks_table_maintenance::product::TableMaintenanceEffectPort
         Box::pin(product_port_begin_rewrite_with_id(
             self, target, intent, effect,
         ))
-    }
-    fn begin_cleanup<'a>(
-        &'a self,
-        _target: &'a MaintenanceTarget,
-        _older: i64,
-    ) -> novarocks_table_maintenance::product::MaintenanceFuture<
-        'a,
-        Result<Box<dyn novarocks_table_maintenance::product::CleanupSession + 'a>, TerminalError>,
-    > {
-        Box::pin(product_port_begin_cleanup(self, _target, _older))
     }
 }
 
@@ -1494,15 +1463,6 @@ async fn product_port_begin_rewrite_with_id<'a>(
     )
     .await
     .map(|s| Box::new(s) as _)
-}
-async fn product_port_begin_cleanup<'a>(
-    _this: &'a GovernedRewriteEffectPort,
-    _target: &'a MaintenanceTarget,
-    _older: i64,
-) -> Result<Box<dyn novarocks_table_maintenance::product::CleanupSession + 'a>, TerminalError> {
-    Err(TerminalError::pre_dispatch_failed(
-        "Rewrite Source does not dispatch cleanup maintenance",
-    ))
 }
 
 async fn close_refused_cohort(

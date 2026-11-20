@@ -292,27 +292,6 @@ struct GuardRefusalPort {
     error: novarocks_query_application::session_error::QueryServiceError,
 }
 impl novarocks_table_maintenance::product::TableMaintenanceEffectPort for GuardRefusalPort {
-    fn observe_cleanup_owned_ref<'a>(
-        &'a self,
-        _: &'a novarocks_table_maintenance::gc_observation::GcOwnedRefObservationAccelerator,
-        _: novarocks_table_maintenance::gc_observation::GcOwnedRefObservation,
-        _: i64,
-        _: i64,
-    ) -> novarocks_table_maintenance::product::MaintenanceFuture<
-        'a,
-        Result<
-            novarocks_table_maintenance::gc_observation::GcOwnedRefObservationDecision,
-            novarocks_table_maintenance::runtime::TerminalError,
-        >,
-    > {
-        Box::pin(async {
-            Err(
-                novarocks_table_maintenance::runtime::TerminalError::pre_dispatch_failed(
-                    "this effect source cannot observe owned-ref cleanup",
-                ),
-            )
-        })
-    }
     fn reject_user_action_on_mv<'a>(
         &'a self,
         _: &'a novarocks_table_maintenance::MaintenanceTarget,
@@ -349,19 +328,6 @@ impl novarocks_table_maintenance::product::TableMaintenanceEffectPort for GuardR
         >,
     > {
         Box::pin(async { panic!("MV guard refusal precedes Rewrite") })
-    }
-    fn begin_cleanup<'a>(
-        &'a self,
-        _: &'a novarocks_table_maintenance::MaintenanceTarget,
-        _: i64,
-    ) -> novarocks_table_maintenance::product::MaintenanceFuture<
-        'a,
-        Result<
-            Box<dyn novarocks_table_maintenance::product::CleanupSession + 'a>,
-            novarocks_table_maintenance::runtime::TerminalError,
-        >,
-    > {
-        Box::pin(async { panic!("MV guard refusal precedes Cleanup session creation") })
     }
 }
 
@@ -427,7 +393,7 @@ async fn asynchronous_guard_provider_cause_survives_cleanup_product_and_service(
             );
             assert_eq!(error.failure_cause(), Some(&cause));
             assert_eq!(error.execution_failure().unwrap().fact(), expected);
-            let terminal = TableMaintenanceProduct::new(None)
+            let terminal = TableMaintenanceProduct::default()
                 .execute_user_action(
                     &GuardRefusalPort { error },
                     MaintenanceActionRequest::RemoveOrphanFiles {
@@ -473,7 +439,7 @@ async fn ordinary_mv_policy_denial_has_no_invented_source_or_failure_fact() {
         },
         IcebergMvUserMutation::Maintenance,
     );
-    let terminal = TableMaintenanceProduct::new(None)
+    let terminal = TableMaintenanceProduct::default()
         .execute_user_action(
             &GuardRefusalPort { error },
             MaintenanceActionRequest::RemoveOrphanFiles {
