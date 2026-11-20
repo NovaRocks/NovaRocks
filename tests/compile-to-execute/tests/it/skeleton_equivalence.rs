@@ -435,6 +435,8 @@ fn migrated_literals_control_and_conversions_share_the_full_unit() {
         "DATE '1970-01-03'",
         "TIME '01:02:03'",
         "TIMESTAMP '1970-01-02 00:00:00'",
+        "COALESCE(TIME '01:02:03', TIME '04:05:06')",
+        "CASE WHEN TRUE THEN TIME '01:02:03' ELSE TIME '04:05:06' END",
         "NULL IS NULL",
         "TRUE OR (NULL AND FALSE)",
         "CASE WHEN TRUE THEN 2147483648 ELSE 1 END",

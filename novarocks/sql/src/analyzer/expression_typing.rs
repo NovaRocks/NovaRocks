@@ -150,8 +150,15 @@ impl AnalyzerContext<'_> {
             };
             Ok(match emission {
                 LiteralEmission::Direct(value) => literal_expression(value, false),
-                LiteralEmission::Cast { input, conversion } => {
-                    cast_expression(literal_expression(input, false), conversion)
+                LiteralEmission::Cast {
+                    input,
+                    declared_result,
+                    conversion,
+                } => {
+                    let mut expression =
+                        cast_expression(literal_expression(input, false), conversion);
+                    expression.value_type = declared_result;
+                    expression
                 }
             })
         })

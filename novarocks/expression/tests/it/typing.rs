@@ -250,17 +250,24 @@ fn literal_typing_preserves_date_and_json_and_authors_the_temporal_cast() {
         json.value,
         novarocks_expression::typing::LiteralValue::String(r#"{"b":1, "a":2}"#.into())
     );
-    let NodeTyping::Literal(LiteralEmission::Cast { input, conversion }) = literal(
+    let NodeTyping::Literal(LiteralEmission::Cast {
+        input,
+        declared_result,
+        conversion,
+    }) = literal(
         LiteralSyntax::TypedString {
             name: "TIME",
             value: "01:02:03",
         },
         &mut work,
     )
-    .unwrap() else {
+    .unwrap()
+    else {
         panic!("expected temporal string CAST");
     };
     assert_eq!(input.value_type.data_type(), &DataType::Utf8);
+    assert_eq!(declared_result.data_type(), conversion.target.data_type());
+    assert!(!declared_result.nullable());
     assert_eq!(
         conversion.target.data_type(),
         &DataType::Time64(arrow::datatypes::TimeUnit::Microsecond)

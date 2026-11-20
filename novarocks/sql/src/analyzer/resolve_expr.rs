@@ -7403,7 +7403,7 @@ mod tests {
         let mut owned = source.loan(query, &control).unwrap();
         let assignment = SqlWriteAssignmentSite::try_new(
             0,
-            FunctionValueType::new(DataType::Int64, false),
+            FunctionValueType::new(DataType::Boolean, false),
             None,
             &control,
         )
@@ -7441,14 +7441,10 @@ mod tests {
             panic!("balanced root")
         };
         assert!(matches!(right.kind, ExprKind::Literal(LiteralValue::Null)));
-        assert_eq!(right.value_type, expected[2].value_type);
-        assert!(
-            crate::analysis::expr_identity::typed_expr_semantically_eq(
-                right,
-                &expected[2],
-                &control
-            )
-            .unwrap()
+        assert_eq!(expected[2].value_type.data_type(), &DataType::Null);
+        assert_eq!(
+            right.value_type,
+            FunctionValueType::new(DataType::Boolean, true)
         );
         let ExprKind::BinaryOp {
             left,
@@ -7469,11 +7465,11 @@ mod tests {
         let declared = owned.view().write_assignment_at(&logical.terms[1]).unwrap();
         assert_eq!(
             declared.input(),
-            &FunctionValueType::new(DataType::Int64, false)
+            &FunctionValueType::new(DataType::Boolean, false)
         );
         assert_eq!(
             right.value_type,
-            FunctionValueType::new(DataType::Int64, true)
+            FunctionValueType::new(DataType::Boolean, true)
         );
         for (actual_term, expected_term) in
             [left.as_ref(), right.as_ref()].into_iter().zip(&expected)

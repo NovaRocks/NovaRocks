@@ -64,6 +64,7 @@ pub enum LiteralEmission {
     Direct(TypedLiteral),
     Cast {
         input: TypedLiteral,
+        declared_result: FunctionValueType,
         conversion: CarrierConversion,
     },
 }
@@ -156,9 +157,8 @@ pub(super) fn type_literal(
                     .num_days();
                 (LiteralValue::Int(days), target, false)
             } else {
-                // Temporal text recipes can successfully produce NULL for an
-                // invalid value. SQL's physical cast transaction already
-                // preserves that fact; publish it with the literal's cast.
+                // SQL has a non-null temporal literal declaration. The checked
+                // physical text cast can produce NULL and must retain that fact.
                 let nullable = novarocks_functions::carrier_cast_can_produce_null_with_policy(
                     &DataType::Utf8,
                     &target,
@@ -172,6 +172,7 @@ pub(super) fn type_literal(
                         context.constant_policy,
                         work,
                     )?,
+                    declared_result: FunctionValueType::new(target.clone(), false),
                     conversion: CarrierConversion {
                         target: FunctionValueType::new(target, nullable),
                         decimal_overflow_policy: context.decimal_overflow_policy,

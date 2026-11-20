@@ -468,6 +468,8 @@ fn extract_binding_sole_canonical_helper_preserves_every_original_control_prefix
 // result owner. It is not an installed calendar CPU implementation.
 struct CustomYear;
 impl CustomYear {
+    const OVERLOAD: &str = "test.scalar/custom_year/0/v1";
+
     fn select(
         request: novarocks_functions::FunctionBindingRequest<'_>,
         control: &dyn PureCompileControl,
@@ -494,7 +496,7 @@ impl CustomYear {
                 return Err(FunctionBindingError::NoMatchingOverload);
             }
             Ok(FunctionBindingSelection {
-                overload: FunctionOverloadId::try_new("test.scalar/custom_year/0/v1").unwrap(),
+                overload: FunctionOverloadId::try_new(Self::OVERLOAD).unwrap(),
                 argument_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(
                     vec![FunctionArgumentType::Value(value_type.clone())].into_boxed_slice(),
                 ),
@@ -527,6 +529,23 @@ impl novarocks_functions::FunctionBindingResolver for CustomYear {
     > {
         Self::select(request, control)
     }
+
+    fn select_at_overload_observed(
+        &self,
+        overload: &novarocks_functions::FunctionOverloadId,
+        request: novarocks_functions::FunctionBindingRequest<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<
+        novarocks_functions::FunctionBindingSelection,
+        novarocks_functions::FunctionBindingError,
+    > {
+        control.checkpoint(CompilePhase::FunctionSpecialization, 0)?;
+        if overload.as_str() != Self::OVERLOAD {
+            return Err(novarocks_functions::FunctionBindingError::NoMatchingOverload);
+        }
+        Self::select(request, control)
+    }
+
     fn validate_selected(
         &self,
         selected: &novarocks_functions::FunctionBindingSelection,
@@ -557,7 +576,7 @@ fn extract_binding_custom_same_spelling_result_is_owned_by_actual_selected_decla
         identity.clone(),
         FunctionKind::Scalar,
         [FunctionOverloadDeclaration::from_effects(
-            FunctionOverloadId::try_new("test.scalar/custom_year/0/v1").unwrap(),
+            FunctionOverloadId::try_new(CustomYear::OVERLOAD).unwrap(),
             "Physical Date32 nonnullable",
             "Physical Int64 nonnullable",
             None,

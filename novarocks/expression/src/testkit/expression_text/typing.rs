@@ -279,8 +279,14 @@ impl<'a> TextTyping<'a> {
         };
         Ok(match emission {
             LiteralEmission::Direct(value) => TextNode::literal(value),
-            LiteralEmission::Cast { input, conversion } => {
-                TextNode::cast(TextNode::literal(input), conversion)
+            LiteralEmission::Cast {
+                input,
+                declared_result,
+                conversion,
+            } => {
+                let mut node = TextNode::cast(TextNode::literal(input), conversion);
+                node.typing.value_type = declared_result;
+                node
             }
         })
     }
@@ -493,7 +499,7 @@ impl TextNode {
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<ExprId, TextError> {
         work.step()?;
-        let ty = &self.typing.value_type;
+        let mut ty = self.typing.value_type.clone();
         let kind = match &self.kind {
             TextKind::Input(value) => ExprKind::Value(*value),
             TextKind::Literal => ExprKind::Constant(register_constant(
@@ -503,13 +509,21 @@ impl TextNode {
                     .as_ref()
                     .expect("typed literal includes its checked constant"),
             )),
-            TextKind::Cast { input, conversion } => ExprKind::Cast {
-                expr: input.emit(draft, constants, context, work)?,
-                target: ty.data_type().clone(),
-                decimal_overflow_policy: conversion.decimal_overflow_policy,
-                allow_throw_exception: context.allow_throw_exception,
-                array_failure_mode: None,
-            },
+            TextKind::Cast { input, conversion } => {
+                let expr = input.emit(draft, constants, context, work)?;
+                let input_type = emitted_type(draft, expr);
+                ty = conversion
+                    .target
+                    .with_nullable(conversion.target.nullable() || input_type.nullable())
+                    .map_err(TextError::ValueType)?;
+                ExprKind::Cast {
+                    expr,
+                    target: ty.data_type().clone(),
+                    decimal_overflow_policy: conversion.decimal_overflow_policy,
+                    allow_throw_exception: context.allow_throw_exception,
+                    array_failure_mode: None,
+                }
+            }
             TextKind::IsNull(input, negated) => ExprKind::IsNull {
                 expr: input.emit(draft, constants, context, work)?,
                 negated: *negated,
@@ -519,6 +533,9 @@ impl TextNode {
                     .iter()
                     .map(|child| child.emit(draft, constants, context, work))
                     .collect::<Result<Box<_>, _>>()?;
+                if args.iter().any(|id| emitted_type(draft, *id).nullable()) {
+                    ty = ty.with_nullable(true).map_err(TextError::ValueType)?;
+                }
                 match operator {
                     ast::LogicalOperator::And => ExprKind::Conjunction { args },
                     ast::LogicalOperator::Or => ExprKind::Disjunction { args },
@@ -555,15 +572,46 @@ impl TextNode {
                     .iter()
                     .map(|child| child.emit(draft, constants, context, work))
                     .collect::<Result<Box<_>, _>>()?;
-                let function = legacy_scalar_function(binding, ty);
-                let id = draft.add(None, ty.clone(), ExprKind::FunctionCall { function, args })?;
-                let request_args = arguments
-                    .iter()
-                    .map(|arg| FunctionArgument::Value {
-                        value_type: arg.typing.value_type.clone(),
-                        constant: arg.typing.constant.clone(),
-                    })
-                    .collect::<Vec<_>>();
+                let mut changed = false;
+                let mut request_args = Vec::with_capacity(args.len());
+                for (&id, argument) in args.iter().zip(arguments) {
+                    work.step()?;
+                    let actual = emitted_type(draft, id);
+                    changed |= actual.nullable() != argument.typing.value_type.nullable();
+                    request_args.push(FunctionArgument::Value {
+                        value_type: actual.clone(),
+                        constant: argument.typing.constant.clone(),
+                    });
+                }
+                let revised;
+                let binding = if changed {
+                    work.flush()?;
+                    let request = novarocks_functions::FunctionBindingRequest {
+                        arguments: &request_args,
+                        logical_argument_count: request_args.len(),
+                        expected_result_type: expected_result.as_ref(),
+                    };
+                    revised = context
+                        .functions
+                        .metadata()
+                        .resolve_bound_trusted_at_overload(
+                            &binding.function_id,
+                            FunctionKind::Scalar,
+                            &binding.selected.overload,
+                            request,
+                            work.control(),
+                        )
+                        .map_err(|cause| typing_error(cause.into(), novarocks_parser::SYNTHETIC))?;
+                    let FunctionResultType::Scalar(result) = &revised.selected.result_type else {
+                        unreachable!("the exact scalar overload has a scalar result")
+                    };
+                    ty = result.clone();
+                    &revised
+                } else {
+                    binding.as_ref()
+                };
+                let function = legacy_scalar_function(binding, &ty);
+                let id = draft.add(None, ty, ExprKind::FunctionCall { function, args })?;
                 let request = physical_call_request(
                     &request_args,
                     expected_result.as_ref(),
@@ -574,8 +622,12 @@ impl TextNode {
                 return Ok(id);
             }
         };
-        Ok(draft.add(None, ty.clone(), kind)?)
+        Ok(draft.add(None, ty, kind)?)
     }
+}
+
+fn emitted_type(draft: &BoundExprSetBuilder, id: ExprId) -> &FunctionValueType {
+    &draft.definition(id).expect("the child was just emitted").ty
 }
 
 fn predicate_name(predicate: &ast::Predicate) -> &'static str {
