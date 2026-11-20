@@ -68,7 +68,7 @@ id	varchar_val	varchar_to_decimal256_50_15	varchar_to_decimal256_76_20	varchar_t
 9	77777777777777777777777777777777777.777777777777777	NULL	NULL	77777777777777777777777777777777778
 
 -- query 7
--- legacy
+-- types	integer	decimal(38, 15)	tinyint	smallint	integer	bigint	varchar
 id	decimal256_50_15	decimal256_to_tinyint	decimal256_to_smallint	decimal256_to_int	decimal256_to_bigint	decimal256_to_largeint
 1	12345678901234567890123.123456789012345	NULL	NULL	NULL	NULL	12345678901234567890123
 2	0.000000000000000	0	0	0	0	0

@@ -1,65 +1,65 @@
 -- query 11
--- legacy
+-- types	bigint	bigint
 _col0	_col1
 10000	10000
 
 -- query 12
--- legacy
+-- types	bigint	bigint
 _col0	_col1
 5000	5000
 
 -- query 13
--- legacy
+-- types	bigint	bigint
 _col0	_col1
 10000	10000
 
 -- query 14
--- legacy
+-- types	bigint	bigint
 _col0	_col1
 10000	10000
 
 -- query 15
--- legacy
+-- types	bigint	bigint
 _col0	_col1
 5000	5000
 
 -- query 16
--- legacy
+-- types	bigint	bigint
 _col0	_col1
 100	100
 
 -- query 17
--- legacy
+-- types	bigint	bigint
 _col0	_col1
 10000	10000
 
 -- query 18
--- legacy
+-- types	bigint	bigint
 _col0	_col1
 5000	5000
 
 -- query 19
--- legacy
+-- types	bigint	bigint
 _col0	_col1
 100	100
 
 -- query 20
--- legacy
+-- types	bigint
 _col0
 10000
 
 -- query 21
--- legacy
+-- types	bigint
 _col0
 5000
 
 -- query 22
--- legacy
+-- types	bigint
 _col0
 100
 
 -- query 23
--- legacy
+-- types	bigint	bigint
 _col0	_col1
 10000	10000
 
@@ -69,72 +69,72 @@ _col0	_col1
 0	0
 
 -- query 25
--- legacy
+-- types	bigint	bigint
 _col0	_col1
 10000	10000
 
 -- query 26
--- legacy
+-- types	bigint
 _col0
 10000
 
 -- query 27
--- legacy
+-- types	bigint
 _col0
 5000
 
 -- query 28
--- legacy
+-- types	bigint
 _col0
 10000
 
 -- query 29
--- legacy
+-- types	bigint
 _col0
 10000
 
 -- query 30
--- legacy
+-- types	bigint
 _col0
 5000
 
 -- query 31
--- legacy
+-- types	bigint
 _col0
 100
 
 -- query 32
--- legacy
+-- types	bigint
 _col0
 10000
 
 -- query 33
--- legacy
+-- types	bigint
 _col0
 5000
 
 -- query 34
--- legacy
+-- types	bigint
 _col0
 100
 
 -- query 35
--- legacy
+-- types	bigint
 _col0
 10000
 
 -- query 36
--- legacy
+-- types	bigint
 _col0
 5000
 
 -- query 37
--- legacy
+-- types	bigint
 _col0
 100
 
 -- query 38
--- legacy
+-- types	bigint
 _col0
 10000
 
@@ -144,81 +144,81 @@ _col0
 0
 
 -- query 40
--- legacy
+-- types	bigint
 _col0
 10000
 
 -- query 41
--- legacy
+-- types	bigint	bigint
 _col0	_col1
 10000	10000
 
 -- query 42
--- legacy
+-- types	bigint	bigint
 _col0	_col1
 5000	5000
 
 -- query 43
--- legacy
+-- types	bigint	bigint
 _col0	_col1
 10000	10000
 
 -- query 44
--- legacy
+-- types	bigint	bigint
 _col0	_col1
 10000	10000
 
 -- query 45
--- legacy
+-- types	bigint	bigint
 _col0	_col1
 5000	5000
 
 -- query 46
--- legacy
+-- types	bigint	bigint
 _col0	_col1
 100	100
 
 -- query 47
--- legacy
+-- types	bigint	bigint
 _col0	_col1
 10000	10000
 
 -- query 48
--- legacy
+-- types	bigint	bigint
 _col0	_col1
 5000	5000
 
 -- query 49
--- legacy
+-- types	bigint	bigint
 _col0	_col1
 100	100
 
 -- query 50
--- legacy
+-- types	bigint
 _col0
 10000
 
 -- query 51
--- legacy
+-- types	bigint
 _col0
 5000
 
 -- query 52
--- legacy
+-- types	bigint
 _col0
 100
 
 -- query 53
--- legacy
+-- types	bigint	bigint
 _col0	_col1
 10000	10000
 
 -- query 54
--- legacy
+-- types	bigint	bigint
 _col0	_col1
 10000	0
 
 -- query 55
--- legacy
+-- types	bigint	bigint
 _col0	_col1
 10000	10000
