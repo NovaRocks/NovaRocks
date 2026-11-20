@@ -303,7 +303,7 @@ fn assert_failed(kernel: &ArrayKernel, state: &ArrayState) {
 }
 #[test]
 fn array_actual_owner_all_four_phases_keep_original_nested_state_codec() {
-    for name in ["array_agg", "array_agg_distinct", "array_unique_agg"] {
+    for name in ["array_agg", "array_agg_distinct"] {
         let single = kernel(name, AggregateKernelPhase::Single);
         let host = Arc::new(Host::default());
         let mut original = new_state(&single, host.clone());
@@ -339,7 +339,7 @@ fn array_actual_owner_all_four_phases_keep_original_nested_state_codec() {
 }
 #[test]
 fn array_every_real_nested_update_allocation_refusal_keeps_typed_cause_and_rolls_back() {
-    for name in ["array_agg", "array_agg_distinct", "array_unique_agg"] {
+    for name in ["array_agg", "array_agg_distinct"] {
         let kernel = kernel(name, AggregateKernelPhase::Single);
         let probe = Arc::new(Host::default());
         let mut state = new_state(&kernel, probe.clone());
@@ -374,7 +374,7 @@ fn array_every_real_nested_update_allocation_refusal_keeps_typed_cause_and_rolls
 }
 #[test]
 fn array_every_real_nested_merge_allocation_refusal_keeps_typed_cause_and_rolls_back() {
-    for name in ["array_agg", "array_agg_distinct", "array_unique_agg"] {
+    for name in ["array_agg", "array_agg_distinct"] {
         let partial = kernel(name, AggregateKernelPhase::Partial);
         let source_host = Arc::new(Host::default());
         let mut source = new_state(&partial, source_host.clone());
@@ -412,7 +412,7 @@ fn array_every_real_nested_merge_allocation_refusal_keeps_typed_cause_and_rolls_
 }
 #[test]
 fn array_every_update_checkpoint_preserves_seven_causes_and_failed_latch() {
-    for name in ["array_agg", "array_agg_distinct", "array_unique_agg"] {
+    for name in ["array_agg", "array_agg_distinct"] {
         let kernel = kernel(name, AggregateKernelPhase::Single);
         let probe = Arc::new(Host::default());
         let mut state = new_state(&kernel, probe.clone());
@@ -440,7 +440,7 @@ fn array_every_update_checkpoint_preserves_seven_causes_and_failed_latch() {
 }
 #[test]
 fn array_missing_host_and_real_constructor_refusals_never_publish_state() {
-    for name in ["array_agg", "array_agg_distinct", "array_unique_agg"] {
+    for name in ["array_agg", "array_agg_distinct"] {
         let kernel = kernel(name, AggregateKernelPhase::Single);
         assert!(matches!(
             kernel.create_state(&Control::default()),
@@ -458,7 +458,7 @@ fn array_missing_host_and_real_constructor_refusals_never_publish_state() {
 }
 #[test]
 fn array_all_phases_require_actual_producer_receipt() {
-    for name in ["array_agg", "array_agg_distinct", "array_unique_agg"] {
+    for name in ["array_agg", "array_agg_distinct"] {
         for phase in [
             AggregateKernelPhase::Single,
             AggregateKernelPhase::Partial,
@@ -478,7 +478,7 @@ fn array_all_phases_require_actual_producer_receipt() {
 
 #[test]
 fn array_every_merge_and_output_checkpoint_preserves_original_typed_cause() {
-    for name in ["array_agg", "array_agg_distinct", "array_unique_agg"] {
+    for name in ["array_agg", "array_agg_distinct"] {
         let partial = kernel(name, AggregateKernelPhase::Partial);
         let source_host = Arc::new(Host::default());
         let mut source = new_state(&partial, source_host.clone());
@@ -769,30 +769,6 @@ fn array_original_ordered_merge_offsets_error_drops_decoded_graph_and_latches() 
     assert_metadata_only(&target_host);
     drop(target);
     assert_released(&target_host);
-}
-
-#[test]
-fn array_unique_nonlist_inaccurate_profile_is_explicitly_rejected() {
-    for data_type in [DataType::Int64, DataType::Utf8, DataType::Boolean] {
-        for nullable in [false, true] {
-            for phase in [
-                AggregateKernelPhase::Single,
-                AggregateKernelPhase::Partial,
-                AggregateKernelPhase::Intermediate,
-                AggregateKernelPhase::Final,
-            ] {
-                let source =
-                    FunctionValueType::from_legacy_declared_projection(data_type.clone(), nullable);
-                let error = kernel_source("array_unique_agg", source, phase, true).unwrap_err();
-                assert!(
-                    error
-                        .to_string()
-                        .contains("array_unique_agg has no installed non-List input profile"),
-                    "{error}"
-                );
-            }
-        }
-    }
 }
 
 // Complete installed-owner evidence preserves the original phases and order

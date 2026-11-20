@@ -58,7 +58,7 @@ select count(distinct c1, c2, c3), avg(c3) from skew_agg group by c4;
 
 -- query 8
 USE ${case_db};
-select count(distinct c0), BITMAP_UNION_COUNT(TO_BITMAP(c0 + c3)) from skew_agg group by c2;
+select count(distinct c0) from skew_agg group by c2;
 
 -- query 9
 USE ${case_db};
@@ -94,7 +94,7 @@ select count(distinct c1, c2, c3), avg(c3) from skew_agg group by 'abc';
 
 -- query 17
 USE ${case_db};
-select count(distinct c0), BITMAP_UNION_COUNT(TO_BITMAP(c0 + c3)) from skew_agg group by 'abc';
+select count(distinct c0) from skew_agg group by 'abc';
 
 -- query 18
 USE ${case_db};
@@ -130,7 +130,7 @@ select count(distinct c1, c2, c3), avg(c3) from skew_agg;
 
 -- query 26
 USE ${case_db};
-select count(distinct c0), BITMAP_UNION_COUNT(TO_BITMAP(c0 + c3)) from skew_agg;
+select count(distinct c0) from skew_agg;
 
 -- query 27
 USE ${case_db};
@@ -182,22 +182,22 @@ select          (         ifnull(sum(murmur_hash3_32(week)), 0) + ifnull(sum(mur
 
 -- query 38
 USE ${case_db};
-select          (         ifnull(sum(murmur_hash3_32(week)), 0) + ifnull(sum(murmur_hash3_32(c0)), 0) + ifnull(sum(murmur_hash3_32(__col_0)), 0) + ifnull(sum(murmur_hash3_32(__col_1)), 0) + ifnull(sum(murmur_hash3_32(__col_2)), 0) + ifnull(sum(murmur_hash3_32(__col_3)), 0) + ifnull(sum(murmur_hash3_32(__col_4)), 0) + ifnull(sum(murmur_hash3_32(__col_5)), 0) + ifnull(sum(murmur_hash3_32(__col_6)), 0) + ifnull(sum(murmur_hash3_32(__col_7)), 0) + ifnull(sum(murmur_hash3_32(__col_8)), 0)     ) as fingerprint from     (         select             date_trunc('week', c2) as week,             c0, (array_length(array_agg(c1))) as __col_0, (sum(distinct length(c0))) as __col_1, (length(group_concat(cast(c1 as VARCHAR)))) as __col_2, (min(c3)) as __col_3, (strleft(variance(c1), 6)) as __col_4, (multi_distinct_count(length(c2))) as __col_5, (ndv(cast(c4 as BIGINT))) as __col_6, (hll_union_agg(hll_hash(c5))) as __col_7, (bitmap_union_int(cast(length(c1) as INT))) as __col_8         from
+select          (         ifnull(sum(murmur_hash3_32(week)), 0) + ifnull(sum(murmur_hash3_32(c0)), 0) + ifnull(sum(murmur_hash3_32(__col_0)), 0) + ifnull(sum(murmur_hash3_32(__col_1)), 0) + ifnull(sum(murmur_hash3_32(__col_2)), 0) + ifnull(sum(murmur_hash3_32(__col_3)), 0) + ifnull(sum(murmur_hash3_32(__col_4)), 0) + ifnull(sum(murmur_hash3_32(__col_5)), 0) + ifnull(sum(murmur_hash3_32(__col_6)), 0) + ifnull(sum(murmur_hash3_32(__col_7)), 0) + ifnull(sum(murmur_hash3_32(__col_8)), 0)     ) as fingerprint from     (         select             date_trunc('week', c2) as week,             c0, (array_length(array_agg(c1))) as __col_0, (sum(distinct length(c0))) as __col_1, (length(group_concat(cast(c1 as VARCHAR)))) as __col_2, (min(c3)) as __col_3, (strleft(variance(c1), 6)) as __col_4, (count(DISTINCT length(c2))) as __col_5, (ndv(cast(c4 as BIGINT))) as __col_6, (count(DISTINCT c5)) as __col_7, (count(DISTINCT length(c1))) as __col_8         from
       skew_agg         group by             date_trunc('week', c2),             c0     ) as t;
 
 -- query 39
 USE ${case_db};
-select          (         ifnull(sum(murmur_hash3_32(week)), 0) + ifnull(sum(murmur_hash3_32(c0)), 0) + ifnull(sum(murmur_hash3_32(__col_0)), 0) + ifnull(sum(murmur_hash3_32(__col_1)), 0) + ifnull(sum(murmur_hash3_32(__col_2)), 0) + ifnull(sum(murmur_hash3_32(__col_3)), 0) + ifnull(sum(murmur_hash3_32(__col_4)), 0) + ifnull(sum(murmur_hash3_32(__col_5)), 0) + ifnull(sum(murmur_hash3_32(__col_6)), 0) + ifnull(sum(murmur_hash3_32(__col_7)), 0) + ifnull(sum(murmur_hash3_32(__col_8)), 0)     ) as fingerprint from     (         select             date_trunc('week', c2) as week,             c0, (array_length(array_agg(c1))) as __col_0, (sum(distinct length(c0))) as __col_1, (length(group_concat(cast(c1 as VARCHAR)))) as __col_2, (min(c3)) as __col_3, (strleft(variance(c1), 6)) as __col_4, (multi_distinct_count(length(c2))) as __col_5, (ndv(cast(c4 as BIGINT))) as __col_6, (hll_union_agg(hll_hash(c5))) as __col_7, (bitmap_union_int(cast(length(c1) as INT))) as __col_8         from
+select          (         ifnull(sum(murmur_hash3_32(week)), 0) + ifnull(sum(murmur_hash3_32(c0)), 0) + ifnull(sum(murmur_hash3_32(__col_0)), 0) + ifnull(sum(murmur_hash3_32(__col_1)), 0) + ifnull(sum(murmur_hash3_32(__col_2)), 0) + ifnull(sum(murmur_hash3_32(__col_3)), 0) + ifnull(sum(murmur_hash3_32(__col_4)), 0) + ifnull(sum(murmur_hash3_32(__col_5)), 0) + ifnull(sum(murmur_hash3_32(__col_6)), 0) + ifnull(sum(murmur_hash3_32(__col_7)), 0) + ifnull(sum(murmur_hash3_32(__col_8)), 0)     ) as fingerprint from     (         select             date_trunc('week', c2) as week,             c0, (array_length(array_agg(c1))) as __col_0, (sum(distinct length(c0))) as __col_1, (length(group_concat(cast(c1 as VARCHAR)))) as __col_2, (min(c3)) as __col_3, (strleft(variance(c1), 6)) as __col_4, (count(DISTINCT length(c2))) as __col_5, (ndv(cast(c4 as BIGINT))) as __col_6, (count(DISTINCT c5)) as __col_7, (count(DISTINCT length(c1))) as __col_8         from
       skew_agg         group by             date_trunc('week', c2),             c0     ) as t;
 
 -- query 40
 USE ${case_db};
-select          (         ifnull(sum(murmur_hash3_32(week)), 0) + ifnull(sum(murmur_hash3_32(c0)), 0) + ifnull(sum(murmur_hash3_32(__col_0)), 0) + ifnull(sum(murmur_hash3_32(__col_1)), 0) + ifnull(sum(murmur_hash3_32(__col_2)), 0) + ifnull(sum(murmur_hash3_32(__col_3)), 0) + ifnull(sum(murmur_hash3_32(__col_4)), 0) + ifnull(sum(murmur_hash3_32(__col_5)), 0) + ifnull(sum(murmur_hash3_32(__col_6)), 0) + ifnull(sum(murmur_hash3_32(__col_7)), 0) + ifnull(sum(murmur_hash3_32(__col_8)), 0)     ) as fingerprint from     (         select             date_trunc('week', c2) as week,             c0, (array_length(array_agg(c1))) as __col_0, (sum(distinct length(c0))) as __col_1, (length(group_concat(cast(c1 as VARCHAR)))) as __col_2, (min(c3)) as __col_3, (strleft(variance(c1), 6)) as __col_4, (multi_distinct_count(length(c2))) as __col_5, (ndv(cast(c4 as BIGINT))) as __col_6, (hll_union_agg(hll_hash(c5))) as __col_7, (bitmap_union_int(cast(length(c1) as INT))) as __col_8         from
+select          (         ifnull(sum(murmur_hash3_32(week)), 0) + ifnull(sum(murmur_hash3_32(c0)), 0) + ifnull(sum(murmur_hash3_32(__col_0)), 0) + ifnull(sum(murmur_hash3_32(__col_1)), 0) + ifnull(sum(murmur_hash3_32(__col_2)), 0) + ifnull(sum(murmur_hash3_32(__col_3)), 0) + ifnull(sum(murmur_hash3_32(__col_4)), 0) + ifnull(sum(murmur_hash3_32(__col_5)), 0) + ifnull(sum(murmur_hash3_32(__col_6)), 0) + ifnull(sum(murmur_hash3_32(__col_7)), 0) + ifnull(sum(murmur_hash3_32(__col_8)), 0)     ) as fingerprint from     (         select             date_trunc('week', c2) as week,             c0, (array_length(array_agg(c1))) as __col_0, (sum(distinct length(c0))) as __col_1, (length(group_concat(cast(c1 as VARCHAR)))) as __col_2, (min(c3)) as __col_3, (strleft(variance(c1), 6)) as __col_4, (count(DISTINCT length(c2))) as __col_5, (ndv(cast(c4 as BIGINT))) as __col_6, (count(DISTINCT c5)) as __col_7, (count(DISTINCT length(c1))) as __col_8         from
       skew_agg         group by             date_trunc('week', c2),             c0     ) as t;
 
 -- query 41
 USE ${case_db};
-select          (         ifnull(sum(murmur_hash3_32(week)), 0) + ifnull(sum(murmur_hash3_32(c0)), 0) + ifnull(sum(murmur_hash3_32(__col_0)), 0) + ifnull(sum(murmur_hash3_32(__col_1)), 0) + ifnull(sum(murmur_hash3_32(__col_2)), 0) + ifnull(sum(murmur_hash3_32(__col_3)), 0) + ifnull(sum(murmur_hash3_32(__col_4)), 0) + ifnull(sum(murmur_hash3_32(__col_5)), 0) + ifnull(sum(murmur_hash3_32(__col_6)), 0) + ifnull(sum(murmur_hash3_32(__col_7)), 0) + ifnull(sum(murmur_hash3_32(__col_8)), 0)     ) as fingerprint from     (         select             date_trunc('week', c2) as week,             c0, (array_length(array_agg(c1))) as __col_0, (sum(distinct length(c0))) as __col_1, (length(group_concat(cast(c1 as VARCHAR)))) as __col_2, (min(c3)) as __col_3, (strleft(variance(c1), 6)) as __col_4, (multi_distinct_count(length(c2))) as __col_5, (ndv(cast(c4 as BIGINT))) as __col_6, (hll_union_agg(hll_hash(c5))) as __col_7, (bitmap_union_int(cast(length(c1) as INT))) as __col_8         from
+select          (         ifnull(sum(murmur_hash3_32(week)), 0) + ifnull(sum(murmur_hash3_32(c0)), 0) + ifnull(sum(murmur_hash3_32(__col_0)), 0) + ifnull(sum(murmur_hash3_32(__col_1)), 0) + ifnull(sum(murmur_hash3_32(__col_2)), 0) + ifnull(sum(murmur_hash3_32(__col_3)), 0) + ifnull(sum(murmur_hash3_32(__col_4)), 0) + ifnull(sum(murmur_hash3_32(__col_5)), 0) + ifnull(sum(murmur_hash3_32(__col_6)), 0) + ifnull(sum(murmur_hash3_32(__col_7)), 0) + ifnull(sum(murmur_hash3_32(__col_8)), 0)     ) as fingerprint from     (         select             date_trunc('week', c2) as week,             c0, (array_length(array_agg(c1))) as __col_0, (sum(distinct length(c0))) as __col_1, (length(group_concat(cast(c1 as VARCHAR)))) as __col_2, (min(c3)) as __col_3, (strleft(variance(c1), 6)) as __col_4, (count(DISTINCT length(c2))) as __col_5, (ndv(cast(c4 as BIGINT))) as __col_6, (count(DISTINCT c5)) as __col_7, (count(DISTINCT length(c1))) as __col_8         from
       skew_agg         group by             date_trunc('week', c2),             c0     ) as t;
 
 -- query 42

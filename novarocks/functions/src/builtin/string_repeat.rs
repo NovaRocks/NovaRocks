@@ -33,7 +33,6 @@ use std::{alloc::Layout, sync::Arc};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum StringRepeatOp {
     Repeat,
-    Space,
 }
 
 fn output_capacity(rows: usize, bytes: usize) -> Result<(), KernelFailure> {
@@ -87,7 +86,6 @@ pub(super) fn check_count(
 ) -> Result<usize, StaticProfileFailure> {
     let arity = match op {
         StringRepeatOp::Repeat => 2,
-        StringRepeatOp::Space => 1,
     };
     if types != arity || types != arguments {
         return Err(StaticProfileFailure::Count);
@@ -219,7 +217,6 @@ pub(super) fn evaluate_string_repeat<'a>(
             let output = (|| -> Result<RepeatPlan<'_>, KernelFailure> {
                 let count = counts.value(rows[count_index]);
                 Ok(match op {
-                    StringRepeatOp::Space => string_repeat_pad_core::space_plan(count),
                     StringRepeatOp::Repeat => {
                         let strings = strings
                             .ok_or_else(|| internal("repeat has no checked Utf8 carrier"))?;

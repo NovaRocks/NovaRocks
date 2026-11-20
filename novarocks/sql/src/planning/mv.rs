@@ -396,36 +396,6 @@ mod refresh_property_facade_tests {
         assert_eq!(input.analysis_facts().output_columns[1].name, "Total");
     }
 
-    #[test]
-    fn m07_mv_persistence_rejects_exact_scalar_and_aggregate_private_domains() {
-        for sql in [
-            "SELECT percentile_empty() AS state FROM fact_east",
-            "SELECT percentile_hash(CAST(amount AS DOUBLE)) AS state FROM fact_east",
-            "SELECT percentile_union(percentile_hash(CAST(amount AS DOUBLE))) AS state FROM fact_east",
-        ] {
-            let query = parse_query(sql);
-            let (resolved, _, factory) =
-                crate::analyzer::analyze(&query, &TestIcebergCatalog, "sales")
-                    .expect("installed producer must analyze");
-            let error = validate_persistable_output(&resolved, &factory)
-                .expect_err("private domain must not become VARBINARY");
-            assert_eq!(
-                error, "Object and Percentile result domains are unsupported for persisted schemas",
-                "{sql}"
-            );
-        }
-        let query =
-            parse_query("SELECT bitmap_to_binary(to_bitmap(id)) AS external FROM fact_east");
-        let (resolved, _, factory) =
-            crate::analyzer::analyze(&query, &TestIcebergCatalog, "sales").unwrap();
-        assert_eq!(
-            resolved.output_columns[0].value_type.data_type().clone(),
-            DataType::Binary
-        );
-        validate_persistable_output(&resolved, &factory)
-            .expect("ordinary external Binary is not an opaque domain");
-    }
-
     struct PersistenceDomainCatalog(ColumnDef);
 
     impl PlannerTableProvider for PersistenceDomainCatalog {
@@ -3609,12 +3579,10 @@ fn is_non_deterministic_function(name: &str, args: &[&Expr]) -> bool {
             | "current_timestamp"
             | "localtime"
             | "localtimestamp"
-            | "utc_timestamp"
             | "current_date"
             | "curdate"
             | "current_time"
             | "curtime"
-            | "utc_time"
             | "random"
             | "rand"
             | "uuid"
@@ -3631,7 +3599,6 @@ fn is_non_deterministic_bare_identifier(name: &str) -> bool {
             | "curdate"
             | "current_time"
             | "curtime"
-            | "utc_time"
     )
 }
 
@@ -3653,12 +3620,11 @@ fn is_window_only_function(name: &str) -> bool {
             | "lead"
             | "first_value"
             | "last_value"
-            | "session_number"
     )
 }
 
 fn is_grouping_function(name: &str) -> bool {
-    matches!(name, "grouping" | "grouping_id")
+    matches!(name, "grouping")
 }
 
 fn is_unsafe_scalar_function(name: &str) -> bool {
@@ -3684,34 +3650,13 @@ fn is_aggregate_function(name: &str) -> bool {
             | "array_agg"
             | "group_concat"
             | "string_agg"
-            | "bitmap_agg"
-            | "bitmap_union"
-            | "bitmap_union_count"
-            | "bitmap_union_int"
             | "array_agg_distinct"
-            | "array_unique_agg"
-            | "sum_map"
             | "map_agg"
             | "percentile_approx"
             | "percentile_approx_weighted"
-            | "percentile_cont"
-            | "percentile_disc"
-            | "percentile_disc_lc"
-            | "percentile_union"
             | "approx_count_distinct"
-            | "approx_count_distinct_hll_sketch"
             | "approx_top_k"
-            | "ds_hll_accumulate"
-            | "ds_hll_combine"
-            | "ds_hll_estimate"
-            | "ds_hll_count_distinct"
-            | "ds_hll_count_distinct_union"
-            | "ds_hll_count_distinct_merge"
-            | "hll_union"
-            | "hll_union_agg"
-            | "hll_raw_agg"
             | "hll_raw"
-            | "hll_cardinality"
             | "ndv"
             | "stddev"
             | "stddev_samp"
@@ -3733,9 +3678,6 @@ fn is_aggregate_function(name: &str) -> bool {
             | "window_funnel"
             | "histogram"
             | "histogram_hll_ndv"
-            | "mann_whitney_u_test"
-            | "dict_merge"
-            | "ds_theta_count_distinct"
             | "bool_or"
             | "bool_and"
             | "boolor_agg"
@@ -4657,9 +4599,7 @@ mod tests {
         );
         for sql in [
             "select approx_count_distinct(k1) from ice.ns.orders",
-            "select bitmap_union(k1) from ice.ns.orders",
             "select count_distinct(k1) from ice.ns.orders",
-            "select hll_union(k1) from ice.ns.orders",
             "select percentile_approx(v2, 0.5) from ice.ns.orders",
             "select max_by_v2(k1, v2) from ice.ns.orders",
             "select sum(distinct v2) from ice.ns.orders",
@@ -4696,7 +4636,6 @@ mod tests {
             "select lead(k1) from ice.ns.orders",
             "select first_value(k1) from ice.ns.orders",
             "select last_value(k1) from ice.ns.orders",
-            "select session_number() from ice.ns.orders",
         ] {
             assert_rejects_with(sql, "projection/filter");
         }
@@ -4711,10 +4650,6 @@ mod tests {
     fn rejects_grouping_functions() {
         assert_rejects_with(
             "select grouping(k1) from ice.ns.orders",
-            "projection/filter",
-        );
-        assert_rejects_with(
-            "select grouping_id(k1) from ice.ns.orders",
             "projection/filter",
         );
     }
@@ -4801,8 +4736,6 @@ mod tests {
             "select curtime() from ice.ns.orders",
             "select \"localtime\" from ice.ns.orders",
             "select \"localtimestamp\" from ice.ns.orders",
-            "select utc_time() from ice.ns.orders",
-            "select utc_timestamp() from ice.ns.orders",
             "select unix_timestamp() from ice.ns.orders",
         ] {
             assert_rejects_with(sql, "non-deterministic");
@@ -6308,12 +6241,10 @@ fn is_unsupported_contract_scalar_function(name: &str, arg_count: usize) -> bool
             | "current_timestamp"
             | "localtime"
             | "localtimestamp"
-            | "utc_timestamp"
             | "current_date"
             | "curdate"
             | "current_time"
             | "curtime"
-            | "utc_time"
             | "random"
             | "rand"
             | "uuid"
@@ -6323,7 +6254,6 @@ fn is_unsupported_contract_scalar_function(name: &str, arg_count: usize) -> bool
             | "current_user"
             | "user"
             | "grouping"
-            | "grouping_id"
     ) || (name.eq_ignore_ascii_case("unix_timestamp") && arg_count == 0)
 }
 

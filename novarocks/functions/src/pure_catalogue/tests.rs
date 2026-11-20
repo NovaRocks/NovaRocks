@@ -719,13 +719,13 @@ fn actual_builtin_rand_and_random_install_each_exact_cpu_record_and_observable_d
 }
 
 #[test]
-fn actual_builtin_numeric_unary_installs_all_182_exact_cpu_records() {
+fn actual_builtin_numeric_unary_installs_all_168_exact_cpu_records() {
     let mut builder = EngineFunctionCatalogBuilder::new();
     crate::builtin::catalogue::contribute_builtin_functions(&mut builder).unwrap();
     let names = [
-        "acos", "asin", "atan", "cbrt", "ceil", "ceiling", "dceil", "cos", "cot", "degress",
-        "dlog1", "exp", "dexp", "floor", "dfloor", "ln", "log10", "dlog10", "log2", "radians",
-        "sin", "sqrt", "dsqrt", "square", "tan", "positive",
+        "acos", "asin", "atan", "cbrt", "ceil", "ceiling", "dceil", "cos", "degress", "dlog1",
+        "exp", "dexp", "floor", "dfloor", "ln", "log10", "dlog10", "log2", "radians", "sin",
+        "sqrt", "dsqrt", "tan", "positive",
     ];
     let mut installed_count = 0;
     for name in names {
@@ -765,7 +765,7 @@ fn actual_builtin_numeric_unary_installs_all_182_exact_cpu_records() {
         }
         installed_count += attachment.implementations.len();
     }
-    assert_eq!(installed_count, 182);
+    assert_eq!(installed_count, 168);
     // Declared but unavailable names must not become new product support.
     for name in ["degrees", "sinh", "cosh", "tanh"] {
         assert!(builder.definition(name, FunctionKind::Scalar).is_none());
@@ -829,11 +829,11 @@ fn actual_builtin_numeric_binary_installs_all_216_exact_cpu_records() {
 }
 
 #[test]
-fn actual_builtin_mod_and_pmod_install_all_72_exact_cpu_records() {
+fn actual_builtin_mod_installs_all_36_exact_cpu_records() {
     let mut builder = EngineFunctionCatalogBuilder::new();
     crate::builtin::catalogue::contribute_builtin_functions(&mut builder).unwrap();
     let mut installed_count = 0;
-    for name in ["mod", "pmod"] {
+    for name in ["mod"] {
         let definition = builder.definition(name, FunctionKind::Scalar).unwrap();
         let binding = definition.binding.as_ref().unwrap();
         let attachment = binding
@@ -870,7 +870,7 @@ fn actual_builtin_mod_and_pmod_install_all_72_exact_cpu_records() {
         }
         installed_count += attachment.implementations.len();
     }
-    assert_eq!(installed_count, 72);
+    assert_eq!(installed_count, 36);
     assert!(matches!(
         builder.seal_pure(std::iter::empty()),
         Err(PureCatalogError::MissingOwner(_)

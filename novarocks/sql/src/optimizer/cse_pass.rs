@@ -254,13 +254,6 @@ fn collect_cse_semantic_guard_ids(
     id: ScalarId,
     guards: &mut HashSet<ScalarId>,
 ) {
-    if let ScalarNode::FunctionCall { name, args, .. } = scalars.node(id)
-        && name == "time_to_sec"
-    {
-        for &arg in args {
-            guard_sec_to_time_source_path(scalars, arg, guards);
-        }
-    }
     if let ScalarNode::InList { child, .. } = scalars.node(id)
         && is_complex_data_type(scalars.data_type(*child))
         && !scalar_contains_column_ref(scalars, *child)
@@ -287,23 +280,6 @@ fn guard_subtree(scalars: &ScalarArena, id: ScalarId, guards: &mut HashSet<Scala
     }
     for child in child_ids(scalars, id) {
         guard_subtree(scalars, child, guards);
-    }
-}
-
-fn guard_sec_to_time_source_path(
-    scalars: &ScalarArena,
-    id: ScalarId,
-    guards: &mut HashSet<ScalarId>,
-) {
-    match scalars.node(id) {
-        ScalarNode::FunctionCall { name, .. } if name == "sec_to_time" => {
-            guards.insert(id);
-        }
-        ScalarNode::Cast { child, .. } | ScalarNode::Nested(child) => {
-            guards.insert(id);
-            guard_sec_to_time_source_path(scalars, *child, guards);
-        }
-        _ => {}
     }
 }
 
@@ -1756,29 +1732,6 @@ mod tests {
 
         assert_eq!(
             pick_commons(&arena, &[current_timestamp, current_timestamp]),
-            Vec::<ScalarId>::new()
-        );
-    }
-
-    #[test]
-    fn sec_to_time_source_for_time_to_sec_is_not_common_candidate() {
-        let mut arena = ScalarArena::new();
-        let minus_one = int_lit(&mut arena, -1);
-        let sec_to_time = call(
-            &mut arena,
-            "sec_to_time",
-            vec![minus_one],
-            crate::functions::FunctionVolatility::Immutable,
-        );
-        let time_to_sec = call(
-            &mut arena,
-            "time_to_sec",
-            vec![sec_to_time],
-            crate::functions::FunctionVolatility::Immutable,
-        );
-
-        assert_eq!(
-            pick_commons(&arena, &[sec_to_time, time_to_sec]),
             Vec::<ScalarId>::new()
         );
     }

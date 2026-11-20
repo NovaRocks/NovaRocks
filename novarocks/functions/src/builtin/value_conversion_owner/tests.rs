@@ -1085,7 +1085,7 @@ fn conversion_recipe_refuses_a_real_foreign_canonical_kernel_without_a_later_cal
     };
     let bound = catalog
         .resolve_bound_user(
-            "to_days",
+            "length",
             FunctionKind::Scalar,
             request,
             crate::binding_test_control(),

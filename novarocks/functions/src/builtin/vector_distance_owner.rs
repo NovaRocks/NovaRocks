@@ -39,15 +39,13 @@ use crate::{
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Operation {
     Cosine,
-    NormalizedCosine,
     SquaredL2,
 }
 
 pub(super) fn operation(name: &str) -> Option<Operation> {
     match name {
-        "cosine_similarity" | "approx_cosine_similarity" => Some(Operation::Cosine),
-        "cosine_similarity_norm" => Some(Operation::NormalizedCosine),
-        "l2_distance" | "approx_l2_distance" => Some(Operation::SquaredL2),
+        "cosine_similarity" => Some(Operation::Cosine),
+        "l2_distance" => Some(Operation::SquaredL2),
         _ => None,
     }
 }
@@ -56,7 +54,6 @@ impl Operation {
     fn name(self) -> &'static str {
         match self {
             Self::Cosine => "cosine_similarity",
-            Self::NormalizedCosine => "cosine_similarity_norm",
             Self::SquaredL2 => "l2_distance",
         }
     }
@@ -277,7 +274,6 @@ fn evaluate_row(
                 let diff = left - right;
                 value += diff * diff;
             }
-            Operation::NormalizedCosine => value += left * right,
             Operation::Cosine => {
                 value += left * right;
                 base_norm += left * left;

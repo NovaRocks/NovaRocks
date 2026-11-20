@@ -950,13 +950,6 @@ mod tests {
                 ],
             ),
             (
-                "session_number",
-                vec![
-                    FunctionValueType::new(DataType::Int32, true),
-                    FunctionValueType::new(DataType::Int32, false),
-                ],
-            ),
-            (
                 "__map_element_at",
                 vec![
                     FunctionValueType::new(
@@ -1156,43 +1149,6 @@ mod tests {
         // args should give NoMatchingSignature, not Ok.
         let r = resolve_scalar_function("upper", &[DataType::Utf8, DataType::Utf8]);
         assert!(matches!(r, Err(ResolveError::NoMatchingSignature { .. })));
-    }
-
-    #[test]
-    fn slice_functions_bind_only_their_declared_temporal_domains() {
-        let timestamp = DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None);
-        for (name, domain) in [("time_slice", timestamp), ("date_slice", DataType::Date32)] {
-            for arity in [3, 4] {
-                let mut args = vec![domain.clone(), DataType::Int32, DataType::Utf8];
-                if arity == 4 {
-                    args.push(DataType::Utf8);
-                }
-                let result = resolve_scalar_function_signature(name, &args).unwrap();
-                assert_eq!(result.return_type, domain);
-                assert_eq!(result.argument_types, args);
-                assert!(result.enforce_argument_binding);
-            }
-            for bad in [DataType::Utf8, DataType::Boolean, DataType::Float64] {
-                assert!(matches!(
-                    resolve_scalar_function(name, &[bad, DataType::Int32, DataType::Utf8]),
-                    Err(ResolveError::NoMatchingSignature { .. })
-                ));
-            }
-            assert!(resolve_scalar_function(name, &[domain.clone(), DataType::Int32]).is_err());
-            assert!(
-                resolve_scalar_function(
-                    name,
-                    &[
-                        domain,
-                        DataType::Int32,
-                        DataType::Utf8,
-                        DataType::Utf8,
-                        DataType::Utf8
-                    ]
-                )
-                .is_err()
-            );
-        }
     }
 
     #[test]
@@ -1434,17 +1390,6 @@ mod tests {
     }
 
     #[test]
-    fn resolve_encode_row_id_accepts_a_mixed_argument_list() {
-        let resolved = resolve_scalar_function_signature(
-            "encode_row_id",
-            &[DataType::Utf8, DataType::Int64, DataType::Int32],
-        )
-        .expect("a per-argument hash does not bind every position to one type");
-
-        assert_eq!(resolved.return_type, DataType::Binary);
-    }
-
-    #[test]
     fn resolve_substring_wrong_arity_reports_enforced_no_match() {
         let err = resolve_scalar_function_signature("substring", &[DataType::Utf8])
             .expect_err("an enforced function with no matching arity must not fall back");
@@ -1487,28 +1432,6 @@ mod tests {
         assert!(
             binding_enforced_for_arity(&candidates, 2),
             "the matching-arity enforced overload must still block legacy fallback"
-        );
-    }
-
-    #[test]
-    fn field_signature_requires_one_frozen_type_and_two_arguments() {
-        for ty in [
-            DataType::Utf8,
-            DataType::Int64,
-            DataType::Float64,
-            DataType::Decimal256(50, 2),
-            DataType::FixedSizeBinary(16),
-        ] {
-            let resolved =
-                resolve_scalar_function_signature("field", &[ty.clone(), ty.clone(), ty.clone()])
-                    .unwrap();
-            assert_eq!(resolved.argument_types, vec![ty.clone(), ty.clone(), ty]);
-            assert_eq!(resolved.return_type, DataType::Int32);
-        }
-        assert!(resolve_scalar_function_signature("field", &[DataType::Int64]).is_err());
-        assert!(
-            resolve_scalar_function_signature("field", &[DataType::Int64, DataType::Float64])
-                .is_err()
         );
     }
 }

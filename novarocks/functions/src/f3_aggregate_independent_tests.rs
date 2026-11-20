@@ -46,12 +46,6 @@ impl ScalarStateAllocator for TestAllocator {
         ))
     }
 }
-impl crate::exact_percentile_core::ExactPercentileAllocator for TestAllocator {
-    type ParserReservation = ();
-    fn reserve_percentile_transient(&self, _: usize, _: &str) -> Result<(), crate::KernelFailure> {
-        Ok(())
-    }
-}
 #[test]
 fn f3_any_value_first_non_null_has_handwritten_value_and_empty_oracles() {
     // Derivation: any_value in this engine selects the first present value in
@@ -147,30 +141,6 @@ fn f3_array_aggregate_retains_order_duplicate_and_null_from_handwritten_input() 
     );
 }
 #[test]
-fn f3_exact_percentile_cont_and_disc_have_independent_rank_interpolation_oracles() {
-    // Frozen contract: continuous rank=(n-1)*q with linear interpolation;
-    // discrete rank=ceil((n-1)*q). Sorted values are [0,10,20,30].
-    use crate::exact_percentile_core::{ExactPercentileState, finalize_cont, finalize_disc};
-    let mut state = ExactPercentileState::new(TestAllocator);
-    assert!(finalize_cont(&state, &DataType::Float64).unwrap().is_none());
-    assert!(finalize_disc(&state).unwrap().is_none());
-    for value in [30, 0, 20, 10] {
-        state.push(T::Int64(value)).unwrap();
-    }
-    for (q, continuous, discrete) in [
-        (0.0, 0.0, 0),
-        (0.25, 7.5, 10),
-        (0.5, 15.0, 20),
-        (1.0, 30.0, 30),
-    ] {
-        state.rate = Some(q);
-        assert!(
-            matches!(finalize_cont(&state,&DataType::Float64).unwrap(),Some(V::Float64(v))if v==continuous)
-        );
-        assert!(matches!(finalize_disc(&state).unwrap(),Some(V::Int64(v))if v==discrete));
-    }
-}
-#[test]
 fn f3_approx_top_k_uncontended_counters_have_exact_value_and_frequency_oracles() {
     // Derivation: with more counters than distinct keys, no eviction occurs:
     // value 7 contributes twice, value 2 once. Counts descend in final order.
@@ -185,31 +155,4 @@ fn f3_approx_top_k_uncontended_counters_have_exact_value_and_frequency_oracles()
     assert_eq!(entries[1].1.count, 1);
     assert!(matches!(entries[0].1.value.as_ref(), Some(T::Int64(7))));
     assert!(matches!(entries[1].1.value.as_ref(), Some(T::Int64(2))));
-}
-
-#[test]
-fn f3_mann_whitney_equal_samples_without_continuity_have_independent_u_and_p() {
-    // Derivation: both samples are [1,2]. Their average tied ranks give U=2;
-    // without continuity correction z=0, so the two-sided normal p-value is 1.
-    use crate::builtin::aggregate_mann_whitney_core::{MannWhitneyInput, MannWhitneyState};
-    let arguments: Vec<ArrayRef> = vec![
-        Arc::new(Int64Array::from(vec![1, 2, 1, 2])),
-        Arc::new(arrow_array::BooleanArray::from(vec![
-            false, false, true, true,
-        ])),
-        Arc::new(arrow_array::StringArray::from(vec!["two-sided"])),
-        Arc::new(Int64Array::from(vec![0])),
-    ];
-    let input = MannWhitneyInput::try_new(&arguments).unwrap();
-    let mut state = MannWhitneyState::new(TestAllocator);
-    let mut work = ScalarWork::new(None);
-    for row in 0..4 {
-        input
-            .update_row(&mut state, [row, row, 0, 0], &mut work)
-            .unwrap();
-    }
-    let actual: serde_json::Value = serde_json::from_str(&state.build_result().unwrap()).unwrap();
-    assert_eq!(actual.as_array().unwrap().len(), 2);
-    assert_eq!(actual[0].as_f64(), Some(2.0));
-    assert_eq!(actual[1].as_f64(), Some(1.0));
 }

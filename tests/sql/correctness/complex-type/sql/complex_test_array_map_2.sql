@@ -193,10 +193,6 @@ select array_map(arg0 -> array_map(arg1 -> array_map(arg2 -> array_map(arg3 -> a
 USE ${case_db};
 
 -- query 40
-USE ${case_db};
-WITH SESSION query_mem_limit = 104857600 select /*+ SET_VAR(query_mem_limit=104857600)*/array_sum(array_map(x->array_contains((array_generate(1,10000)),x), array_generate(1,100000)));
-
--- query 41
 -- @skip_result_check=true
 USE ${case_db};
 CREATE TABLE "array_map_x" (
@@ -205,16 +201,16 @@ CREATE TABLE "array_map_x" (
   "arr_largeint" array<largeint(40)>
 ) WITH (format_version = 3);
 
--- query 42
+-- query 41
 -- @skip_result_check=true
 USE ${case_db};
 insert into array_map_x values ROW(1, array_repeat('abcdefghasdasdasirnqwrq', 2), array_repeat(CAST(100 AS LARGEINT), 2));
 
--- query 43
+-- query 42
 USE ${case_db};
 select cast(if (1 > rand(), '[]', '') as array<string>) l , array_map((x)-> (concat(x,l)), arr_str) from array_map_x;
 
--- query 44
+-- query 43
 -- @skip_result_check=true
 -- A catalog that cannot hold views cannot answer view enumeration, so
 -- DROP DATABASE ... FORCE is refused here rather than silently assuming

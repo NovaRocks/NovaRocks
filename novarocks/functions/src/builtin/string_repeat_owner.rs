@@ -42,7 +42,6 @@ use crate::{
 pub(super) fn operation(name: &str) -> Option<StringRepeatOp> {
     match name {
         "repeat" => Some(StringRepeatOp::Repeat),
-        "space" => Some(StringRepeatOp::Space),
         _ => None,
     }
 }

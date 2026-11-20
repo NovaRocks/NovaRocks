@@ -27,8 +27,6 @@
 SELECT
   LENGTH(REPEAT('a', 1048576)) AS repeat_limit_len,
   REPEAT('a', 1048577) IS NULL AS repeat_over_limit_is_null,
-  LENGTH(SPACE(1048576)) AS space_limit_len,
-  SPACE(1048577) IS NULL AS space_over_limit_is_null,
   LENGTH(LPAD('x', 1048576, 'ab')) AS lpad_limit_len,
   LPAD('x', 1048577, 'ab') IS NULL AS lpad_over_limit_is_null,
   LENGTH(RPAD('x', 1048576, 'ab')) AS rpad_limit_len,

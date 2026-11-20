@@ -18,7 +18,7 @@
 -- @order_sensitive=true
 -- @tags=aggregate,count_distinct,multi_column
 -- Test Objective:
--- 1. Validate COUNT(DISTINCT a,b) for composite key distinctness.
+-- 1. Validate COUNT(DISTINCT a,b) for composite keys with duplicates and NULLs.
 -- 2. Prevent regressions in multi-column distinct cardinality.
 -- Test Flow:
 -- 1. Create/reset source table.
@@ -34,7 +34,14 @@ INSERT INTO ${case_db}.t_agg_count_distinct_multi_column VALUES
     ROW(1, 'x'),
     ROW(1, 'y'),
     ROW(2, 'x'),
-    ROW(2, 'x');
+    ROW(2, 'x'),
+    ROW(1, NULL),
+    ROW(NULL, 'x'),
+    ROW(NULL, NULL);
 
 SELECT COUNT(DISTINCT a, b) AS cd_ab
 FROM ${case_db}.t_agg_count_distinct_multi_column;
+
+SELECT COUNT(DISTINCT a, b) AS cd_ab
+FROM ${case_db}.t_agg_count_distinct_multi_column
+WHERE FALSE;

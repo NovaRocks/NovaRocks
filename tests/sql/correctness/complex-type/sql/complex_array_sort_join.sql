@@ -26,5 +26,4 @@
 -- 3. Assert scalar output.
 SELECT
     ARRAY_SORT([3, 1, 2, NULL]) AS sorted_arr,
-    ARRAY_JOIN(['a', 'b', NULL], ',') AS joined_arr,
-    ARRAY_CUM_SUM([1, 2, 3]) AS cumsum_arr;
+    ARRAY_JOIN(['a', 'b', NULL], ',') AS joined_arr;

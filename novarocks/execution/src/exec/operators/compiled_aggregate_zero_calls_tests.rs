@@ -16,12 +16,68 @@
 // under the License.
 
 //! Genuine zero-call Physical aggregate; no invented LocalProgram or call token.
+use super::aggregate_fixture::{add_aggregate, compile, extrema_catalog, finish, packages, values};
+use super::family_fixture::{FixtureControl, int64};
 use super::*;
+use arrow::array::Int64Array;
+use novarocks_physical_plan::{
+    AggregateGrouping, FragmentId, FragmentSink, PlanVersionId, ResultPort,
+};
+
+fn run(
+    factory: &CompiledAggregateProcessorFactory,
+    input: &[Chunk],
+    tracker: Arc<MemTracker>,
+) -> Chunk {
+    let state = RuntimeState::default();
+    let mut operator = factory.create(2, 0);
+    operator.set_construction_factory(aggregate_fixture::runtime_construction_factory(
+        tracker.clone(),
+        factory.error.clone(),
+    ));
+    operator.set_mem_tracker(tracker);
+    operator.prepare().expect("prepare actual aggregate schema");
+    let mut processor =
+        crate::exec::pipeline::test_driver::TestDriver::new(operator.as_mut(), &state);
+    for chunk in input {
+        processor.input_without_output(chunk.clone()).unwrap();
+    }
+    processor.signal_eos().unwrap();
+    let result = processor
+        .advance_to_boundary()
+        .map(|step| step.output)
+        .unwrap()
+        .unwrap();
+    assert!(
+        processor
+            .advance_to_boundary()
+            .map(|step| step.output)
+            .unwrap()
+            .is_none()
+    );
+    result
+}
+fn input(program: &LocalProgram) -> Chunk {
+    let node = program
+        .graph()
+        .nodes()
+        .iter()
+        .find(|node| matches!(node.kind(), ProgramNodeKind::Values { .. }))
+        .unwrap();
+    let schema = ChunkSchema::from_compiled_layout(node.output_layout()).unwrap();
+    let array = Arc::new(Int64Array::from_iter_values(1..=100_000)) as ArrayRef;
+    Chunk::try_new_with_chunk_schema(
+        RecordBatch::try_new(schema.arrow_schema_ref(), vec![array]).unwrap(),
+        schema,
+    )
+    .unwrap()
+}
+
 fn zero_program() -> Arc<LocalProgram> {
     let fixture_sources = crate::exec::operators::family_fixture::constant_sources::Sources::new();
     let parameters = novarocks_type_contract::SemanticParameters::try_new([]).unwrap();
 
-    let catalog = aggregate_catalog(&[("ds_hll_count_distinct", PureKernelAbi::AggregateV1)]);
+    let catalog = extrema_catalog();
     let fragment = FragmentId::new(1);
     let mut builder =
         crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(

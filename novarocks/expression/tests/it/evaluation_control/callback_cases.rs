@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 use arrow::{
-    array::{ArrayRef, Int32Array},
+    array::{ArrayRef, Int32Array, StringArray},
     datatypes::{DataType, Field, Schema, SchemaRef},
     record_batch::RecordBatch,
 };
@@ -40,7 +40,7 @@ use novarocks_functions::{
 };
 use novarocks_type_contract::{
     CompileCheckpoints, CompilePhase, ControlShape, DecimalOverflowPolicy, EvaluationDemand,
-    FunctionValueType, FunctionVolatility, SemanticParameters, ValueLogicalType,
+    FunctionValueType, FunctionVolatility, SemanticParameters,
 };
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
@@ -164,8 +164,8 @@ fn allocation_host() -> (Arc<CountingAllocator>, Arc<dyn AggregateStateAllocator
 }
 
 #[test]
-fn hash_native_n1_actual_frame_seven_causes_exact_prefix_and_failed_group_latch() {
-    let ty = FunctionValueType::new(DataType::Int32, true);
+fn md5_actual_frame_seven_causes_exact_prefix_and_failed_group_latch() {
+    let ty = FunctionValueType::new(DataType::Utf8, true);
     let (unit, [root], schema) = compile_unit(
         "v",
         ty.clone(),
@@ -176,7 +176,7 @@ fn hash_native_n1_actual_frame_seven_causes_exact_prefix_and_failed_group_latch(
                 .unwrap();
             let author = ClaimAuthor::with_legacy_binding(
                 functions,
-                "percentile_hash",
+                "md5",
                 vec![FunctionArgument::Value {
                     value_type: ty,
                     constant: None,
@@ -189,12 +189,7 @@ fn hash_native_n1_actual_frame_seven_causes_exact_prefix_and_failed_group_latch(
             .with_decimal_policy(DecimalOverflowPolicy::OutputNull);
             assert_eq!(
                 author.result(),
-                FunctionValueType::try_with_logical_type(
-                    DataType::Binary,
-                    true,
-                    ValueLogicalType::Percentile
-                )
-                .unwrap(),
+                FunctionValueType::new(DataType::Utf8, true)
             );
             [add_call(draft, authors, author, vec![input])]
         },
@@ -208,7 +203,7 @@ fn hash_native_n1_actual_frame_seven_causes_exact_prefix_and_failed_group_latch(
         .unwrap()
         .kind()
     else {
-        panic!("actual HASH root");
+        panic!("actual MD5 root");
     };
     assert_eq!(args.len(), 1);
     assert_eq!(invocation.arguments.len(), 1);
@@ -217,19 +212,16 @@ fn hash_native_n1_actual_frame_seven_causes_exact_prefix_and_failed_group_latch(
         args[0],
     );
     let contract = unit.calls()[&compiled_root.use_id].call_contract();
-    assert_eq!(
-        contract.function_id().as_str(),
-        "builtin.scalar/percentile_hash/v1"
-    );
+    assert_eq!(contract.function_id().as_str(), "builtin.scalar/md5/v1");
     assert_eq!(contract.selected().argument_types.len(), 1);
     assert_eq!(contract.logical_argument_count(), 1);
     assert_eq!(
         contract.effects().value_stability,
         FunctionVolatility::Immutable
     );
-    let input = Int32Array::from(
+    let input = StringArray::from(
         (0..321)
-            .map(|i| (i % 3 != 1).then_some(i + 17))
+            .map(|i| (i % 3 != 1).then(|| (i + 17).to_string()))
             .collect::<Vec<_>>(),
     );
     let batch = RecordBatch::try_new(schema, vec![Arc::new(input)]).unwrap();
@@ -259,7 +251,7 @@ fn hash_native_n1_actual_frame_seven_causes_exact_prefix_and_failed_group_latch(
     assert_eq!(tracker.outstanding(), 0);
     let trace = control.trace();
     assert!(trace.contains(&256));
-    for cause in callback_causes(["original N1 source"; 3]) {
+    for cause in callback_causes(["original MD5 source"; 3]) {
         for stop in [0, trace.len() / 2, trace.len() - 1] {
             let control = Callback::new(stop + 1, cause.clone());
             let (tracker, host) = allocation_host();

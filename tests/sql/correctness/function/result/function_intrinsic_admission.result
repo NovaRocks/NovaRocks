@@ -18,12 +18,7 @@ row_number_value
 negated	narrow_type
 -1	tinyint
 
--- query 5
--- types	integer
-first_match
-1
-
--- query 10
+-- query 9
 -- legacy
-sorted_empty	minimum_null	maximum_null	top_empty	top_single_null	null_key_order
-[]	1	1	[]	[null]	[[2],[1]]
+sorted_empty	minimum_null	maximum_null	null_key_order
+[]	1	1	[[2],[1]]

@@ -41,7 +41,7 @@ use super::numeric_mod::NumericModOp;
 
 #[cfg(test)]
 pub(super) fn names() -> &'static [&'static str] {
-    &["mod", "pmod"]
+    &["mod"]
 }
 
 /// Startup selection covers the installed mathematical remainder operations.
@@ -49,7 +49,6 @@ pub(super) fn names() -> &'static [&'static str] {
 pub(super) fn operation(name: &str) -> Option<NumericModOp> {
     Some(match name {
         "mod" => NumericModOp::Mod,
-        "pmod" => NumericModOp::Pmod,
         _ => return None,
     })
 }
@@ -480,14 +479,9 @@ mod tests {
     }
 
     #[test]
-    fn startup_remainder_mapping_retains_two_exact_names_and_operations() {
-        assert_eq!(names(), &["mod", "pmod"]);
+    fn startup_remainder_mapping_selects_mod_only() {
+        assert_eq!(names(), &["mod"]);
         assert_eq!(operation("mod"), Some(NumericModOp::Mod));
-        assert_eq!(operation("pmod"), Some(NumericModOp::Pmod));
-        assert_ne!(
-            owner("mod").declaration.function_id(),
-            owner("pmod").declaration.function_id()
-        );
         for outside in [
             "fmod", "atan2", "pow", "fpow", "dpow", "power", "log", "degrees",
         ] {
@@ -496,7 +490,7 @@ mod tests {
     }
 
     #[test]
-    fn whole_production_catalogue_attaches_mod_owners_and_72_exact_records() {
+    fn whole_production_catalogue_attaches_mod_owners_and_36_exact_records() {
         let catalog = super::super::catalogue::build_builtin_engine_function_catalog().unwrap();
         let mut total = 0;
         for name in names() {
@@ -524,11 +518,11 @@ mod tests {
             }
             total += owner.implementation_declarations().len();
         }
-        assert_eq!(total, 72);
+        assert_eq!(total, 36);
     }
 
     #[test]
-    fn all_72_mod_profiles_and_nullable_pairs_preserve_exact_fresh_frozen_contracts() {
+    fn all_36_mod_profiles_and_nullable_pairs_preserve_exact_fresh_frozen_contracts() {
         let parameters = SemanticParameters::try_new([]).unwrap();
         let uses = [
             Some(ExpressionUseId::new(42)),
@@ -652,9 +646,8 @@ mod tests {
                 .is_err()
         );
         stale = (*selected).clone();
-        stale.overload = self::owner("pmod").declaration.overloads()[0]
-            .identity
-            .clone();
+        stale.overload =
+            crate::FunctionOverloadId::try_new("builtin.scalar/fmod/foreign-test").unwrap();
         assert!(
             owner
                 .validate_selected(&stale, request(&arguments), crate::binding_test_control())
@@ -687,7 +680,7 @@ mod tests {
 
     #[test]
     fn mod_refinement_requires_exact_environment_domain_and_function_identity() {
-        let owner = owner("pmod");
+        let owner = owner("mod");
         let arguments = [
             argument(FunctionValueType::new(DataType::Float64, false)),
             argument(FunctionValueType::new(DataType::Int64, false)),
@@ -721,7 +714,7 @@ mod tests {
                 FunctionBindingError::InvalidBinding(_)
             ))
         ));
-        let other = FunctionId::try_new("builtin.scalar/mod/v1").unwrap();
+        let other = FunctionId::try_new("builtin.scalar/fmod/v1").unwrap();
         foreign = input;
         foreign.function_id = &other;
         assert!(matches!(
@@ -743,7 +736,7 @@ mod tests {
 
     #[test]
     fn mod_preparation_rejects_foreign_context_policy_pointer_and_uncoerced_types() {
-        let owner = owner("pmod");
+        let owner = owner("mod");
         let arguments = [
             argument(FunctionValueType::new(DataType::Float64, false)),
             argument(FunctionValueType::new(DataType::Int64, true)),
@@ -835,7 +828,7 @@ mod tests {
     }
     #[test]
     fn mod_owner_preserves_original_three_compile_failures() {
-        let owner = owner("pmod");
+        let owner = owner("mod");
         let arguments = [
             argument(FunctionValueType::new(DataType::Float64, false)),
             argument(FunctionValueType::new(DataType::Int64, false)),

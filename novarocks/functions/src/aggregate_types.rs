@@ -551,10 +551,7 @@ pub(crate) fn matches_selected_array_types_observed(
     state: &crate::FunctionValueType,
     work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
 ) -> Result<bool, crate::FunctionBindingError> {
-    if !matches!(
-        name,
-        "array_agg" | "array_agg_distinct" | "array_unique_agg"
-    ) {
+    if !matches!(name, "array_agg" | "array_agg_distinct") {
         return Err(crate::FunctionBindingError::NoMatchingOverload);
     }
     let Some(crate::FunctionArgumentType::Value(first)) = arguments.first() else {
@@ -662,7 +659,7 @@ fn aggregate_type_recipes_core<'a>(
                 }),
             )
         }
-        "min" | "max" | "any_value" | "array_unique_agg" => (existing(), existing()),
+        "min" | "max" | "any_value" => (existing(), existing()),
         "group_concat" | "string_agg" => (scalar(DataType::Utf8), R::OrderedLists(arguments)),
         "bool_or" | "bool_and" | "boolor_agg" | "booland_agg" | "every" => {
             (scalar(DataType::Boolean), scalar(DataType::Boolean))
@@ -678,29 +675,10 @@ fn aggregate_type_recipes_core<'a>(
                 },
             )
         }
-        "sum_map" => {
-            if first == &DataType::Null {
-                (R::NullMap, R::NullMap)
-            } else {
-                (existing(), existing())
-            }
-        }
         "map_agg" => (R::Map(arguments, 0, 1), R::Map(arguments, 0, 1)),
-        "bitmap_agg"
-        | "bitmap_union"
-        | "hll_union"
-        | "hll_raw_agg"
-        | "ds_hll_count_distinct_union"
-        | "percentile_union" => (binary(), binary()),
-        "bitmap_union_count"
-        | "approx_count_distinct"
-        | "ndv"
-        | "approx_count_distinct_hll_sketch"
-        | "ds_hll_count_distinct"
-        | "ds_hll_count_distinct_merge"
-        | "hll_union_agg"
-        | "multi_distinct_count"
-        | "bitmap_union_int" => (scalar(DataType::Int64), binary()),
+        "approx_count_distinct" | "ndv" | "multi_distinct_count" => {
+            (scalar(DataType::Int64), binary())
+        }
         "multi_distinct_sum" => {
             let out = match first {
                 DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
@@ -718,11 +696,7 @@ fn aggregate_type_recipes_core<'a>(
             };
             (out, binary())
         }
-        "dict_merge" => (scalar(DataType::Utf8), scalar(DataType::Utf8)),
-        "mann_whitney_u_test" => (scalar(DataType::Utf8), binary()),
-        "max_by" | "min_by" | "percentile_cont" | "percentile_disc" | "percentile_disc_lc" => {
-            (existing(), binary())
-        }
+        "max_by" | "min_by" => (existing(), binary()),
         "covar_pop" | "covar_samp" | "corr" | "var_pop" | "var_samp" | "variance"
         | "variance_pop" | "variance_samp" | "stddev" | "stddev_pop" | "stddev_samp" | "std" => {
             (scalar(DataType::Float64), binary())

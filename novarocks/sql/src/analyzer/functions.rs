@@ -35,7 +35,6 @@ pub(super) fn is_window_only_function(name: &str) -> bool {
             | "lead"
             | "first_value"
             | "last_value"
-            | "session_number"
     )
 }
 
@@ -50,8 +49,6 @@ pub(super) fn is_supported_aggregate_window_function(name: &str) -> bool {
             | "avg"
             | "min"
             | "max"
-            | "bitmap_union"
-            | "bitmap_union_count"
             | "max_by"
             | "min_by"
             | "var_samp"
@@ -64,23 +61,16 @@ pub(super) fn is_supported_aggregate_window_function(name: &str) -> bool {
             | "corr"
             | "array_agg"
             | "array_agg_distinct"
-            | "array_unique_agg"
             | "approx_top_k"
     )
 }
 
 pub(super) fn aggregate_window_supports_distinct(name: &str) -> bool {
-    matches!(
-        name,
-        "array_agg" | "array_agg_distinct" | "array_unique_agg"
-    )
+    matches!(name, "array_agg" | "array_agg_distinct")
 }
 
 pub(super) fn aggregate_window_supports_function_order_by(name: &str) -> bool {
-    matches!(
-        name,
-        "array_agg" | "array_agg_distinct" | "array_unique_agg"
-    )
+    matches!(name, "array_agg" | "array_agg_distinct")
 }
 
 fn format_signature_type(data_type: &DataType, map_value_context: bool) -> String {
@@ -199,7 +189,7 @@ fn validate_scalar_function_call_impl(
             validate_arrays_overlap_arguments(arg_types)?;
         }
     }
-    if matches!(name, "array_contains_all" | "array_contains_seq") {
+    if matches!(name, "array_contains_seq") {
         validate_array_pair_arguments(name, arg_types)?;
     }
     if is_mv_state_scalar_function(name) {
@@ -579,106 +569,11 @@ fn arrays_overlap_decimal_family(precision: u8, scale: i8) -> &'static str {
     }
 }
 
-pub(super) fn validate_aggregate_function_call(
-    name: &str,
-    arg_types: &[DataType],
-) -> Result<(), String> {
-    match name {
-        "sum_map" => validate_sum_map_arguments(arg_types),
-        _ => Ok(()),
-    }
-}
-
 fn infer_date_trunc_return_type(arg_types: &[DataType]) -> DataType {
     match arg_types.get(1) {
         Some(DataType::Date32) => DataType::Date32,
         Some(DataType::Timestamp(unit, tz)) => DataType::Timestamp(*unit, tz.clone()),
         _ => DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
-    }
-}
-
-fn validate_sum_map_arguments(arg_types: &[DataType]) -> Result<(), String> {
-    let Some(arg_type) = arg_types.first() else {
-        return Ok(());
-    };
-    if matches!(arg_type, DataType::Null) {
-        return Ok(());
-    }
-    let DataType::Map(entries, _) = arg_type else {
-        return Ok(());
-    };
-    let DataType::Struct(fields) = entries.data_type() else {
-        return Ok(());
-    };
-    if fields.len() != 2 {
-        return Ok(());
-    }
-    if is_sum_map_scalar_kv_type(fields[0].data_type())
-        && is_sum_map_scalar_kv_type(fields[1].data_type())
-    {
-        if is_sum_map_supported_value_type(fields[1].data_type()) {
-            Ok(())
-        } else {
-            Err(format!(
-                "unsupported value type:{}",
-                sum_map_value_type_name(fields[1].data_type())
-            ))
-        }
-    } else {
-        Err("sum_map only support scalar KV".to_string())
-    }
-}
-
-fn is_sum_map_scalar_kv_type(data_type: &DataType) -> bool {
-    !matches!(
-        data_type,
-        DataType::List(_)
-            | DataType::LargeList(_)
-            | DataType::FixedSizeList(_, _)
-            | DataType::Struct(_)
-            | DataType::Map(_, _)
-            | DataType::Union(_, _)
-    )
-}
-
-fn is_sum_map_supported_value_type(data_type: &DataType) -> bool {
-    matches!(
-        data_type,
-        DataType::Null
-            | DataType::Int8
-            | DataType::Int16
-            | DataType::Int32
-            | DataType::Int64
-            | DataType::Float32
-            | DataType::Float64
-            | DataType::Decimal128(_, _)
-            | DataType::Decimal256(_, _)
-            | DataType::FixedSizeBinary(_)
-    )
-}
-
-fn sum_map_value_type_name(data_type: &DataType) -> &'static str {
-    match data_type {
-        DataType::Null => "NULL_TYPE",
-        DataType::Boolean => "BOOLEAN",
-        DataType::Int8 => "TINYINT",
-        DataType::Int16 => "SMALLINT",
-        DataType::Int32 => "INT",
-        DataType::Int64 => "BIGINT",
-        DataType::Float32 => "FLOAT",
-        DataType::Float64 => "DOUBLE",
-        DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => "DECIMAL",
-        DataType::Date32 => "DATE",
-        DataType::Timestamp(_, _) => "DATETIME",
-        DataType::Utf8 | DataType::LargeUtf8 => "VARCHAR",
-        DataType::FixedSizeBinary(_) => "LARGEINT",
-        DataType::Binary | DataType::LargeBinary => "VARBINARY",
-        DataType::List(_) => "ARRAY",
-        DataType::LargeList(_) | DataType::FixedSizeList(_, _) => "ARRAY",
-        DataType::Struct(_) => "STRUCT",
-        DataType::Map(_, _) => "MAP",
-        DataType::Union(_, _) => "UNION",
-        _ => "UNKNOWN",
     }
 }
 
@@ -757,50 +652,12 @@ pub(super) fn legacy_scalar_return_type_with_catalog(
 pub(crate) fn dynamic_scalar_return_type(name: &str, arg_types: &[DataType]) -> Option<DataType> {
     Some(match name {
         // String functions
-        "upper"
-        | "lower"
-        | "trim"
-        | "ltrim"
-        | "rtrim"
-        | "reverse"
-        | "replace"
-        | "lpad"
-        | "rpad"
-        | "concat"
-        | "concat_ws"
-        | "substr"
-        | "substring"
-        | "left"
-        | "right"
-        | "repeat"
-        | "space"
-        | "hex"
-        | "unhex"
-        | "md5"
-        | "sha2"
-        | "to_base64"
-        | "from_base64"
-        | "url_encode"
-        | "url_decode"
-        | "translate"
-        | "initcap"
-        | "regexp_extract"
-        | "regexp_extract_all"
-        | "regexp_replace"
-        | "bar"
-        | "append_trailing_char_if_absent"
-        | "money_format"
-        | "char"
-        | "elt"
-        | "format"
-        | "strleft"
-        | "strright"
-        | "md5sum"
-        | "sm3"
-        | "group_concat"
-        | "string_agg"
-        | "substring_index"
-        | "parse_url" => DataType::Utf8,
+        "upper" | "lower" | "trim" | "ltrim" | "rtrim" | "reverse" | "replace" | "lpad"
+        | "rpad" | "concat" | "concat_ws" | "substr" | "substring" | "left" | "right"
+        | "repeat" | "hex" | "unhex" | "md5" | "sha2" | "to_base64" | "from_base64"
+        | "url_encode" | "url_decode" | "translate" | "initcap" | "regexp_extract"
+        | "regexp_extract_all" | "regexp_replace" | "bar" | "char" | "format" | "strleft"
+        | "strright" | "group_concat" | "string_agg" | "parse_url" => DataType::Utf8,
         "str_to_map" => DataType::Map(
             Arc::new(arrow::datatypes::Field::new(
                 "entries",
@@ -837,54 +694,15 @@ pub(crate) fn dynamic_scalar_return_type(name: &str, arg_types: &[DataType]) -> 
         },
 
         // Math functions that return Float64
-        "mod"
-        | "pmod"
-        | "fmod"
-        | "pow"
-        | "fpow"
-        | "dpow"
-        | "power"
-        | "sqrt"
-        | "dsqrt"
-        | "cbrt"
-        | "exp"
-        | "dexp"
-        | "ln"
-        | "log"
-        | "log2"
-        | "log10"
-        | "dlog10"
-        | "dlog1"
-        | "dround"
-        | "sin"
-        | "cos"
-        | "tan"
-        | "asin"
-        | "acos"
-        | "atan"
-        | "atan2"
-        | "cot"
-        | "radians"
-        | "degrees"
-        | "degress"
-        | "pi"
-        | "e"
-        | "sign"
-        | "rand"
-        | "random"
-        | "square"
-        | "positive"
-        | "cosine_similarity"
-        | "cosine_similarity_norm"
-        | "approx_cosine_similarity"
-        | "l2_distance"
-        | "approx_l2_distance" => DataType::Float64,
+        "mod" | "fmod" | "pow" | "fpow" | "dpow" | "power" | "sqrt" | "dsqrt" | "cbrt" | "exp"
+        | "dexp" | "ln" | "log" | "log2" | "log10" | "dlog10" | "dlog1" | "dround" | "sin"
+        | "cos" | "tan" | "asin" | "acos" | "atan" | "atan2" | "radians" | "degrees"
+        | "degress" | "pi" | "e" | "sign" | "rand" | "random" | "positive"
+        | "cosine_similarity" | "l2_distance" => DataType::Float64,
 
         // String length/position -> Int32
-        "length" | "char_length" | "character_length" | "bit_length" | "instr" | "locate"
-        | "position" | "find_in_set" | "strcmp" | "ascii" | "ord" | "field" | "regexp_position" => {
-            DataType::Int32
-        }
+        "length" | "char_length" | "character_length" | "instr" | "locate" | "position"
+        | "ascii" | "regexp_position" => DataType::Int32,
         "regexp_count" | "equiwidth_bucket" => DataType::Int64,
 
         // Conditional functions -> widened type of value args.
@@ -914,21 +732,16 @@ pub(crate) fn dynamic_scalar_return_type(name: &str, arg_types: &[DataType]) -> 
 
         // Date/time
         "now" | "current_timestamp" | "current_date" | "curdate" | "convert_tz" | "to_datetime"
-        | "to_datetime_ntz" | "timestamp" => {
-            DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None)
-        }
+        | "timestamp" => DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
         "date" => DataType::Date32,
         // These function domains are fixed even in legacy return-type-only
         // inference. Executable calls still require the exact sealed binding.
-        "time_slice" => DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
-        "date_slice" => DataType::Date32,
-        "date_format" | "from_unixtime" | "time_format" | "sec_to_time" => DataType::Utf8,
+        "date_format" | "from_unixtime" => DataType::Utf8,
         // `add_months` always returns DATETIME.
         "add_months" => DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
         "date_add" | "date_sub" | "adddate" | "subdate" | "days_add" | "days_sub" | "weeks_add"
         | "weeks_sub" | "months_add" | "months_sub" | "years_add" | "years_sub" | "hours_add"
-        | "hours_sub" | "minutes_add" | "minutes_sub" | "seconds_add" | "seconds_sub"
-        | "microseconds_add" | "microseconds_sub" => {
+        | "hours_sub" | "minutes_add" | "minutes_sub" | "seconds_add" | "seconds_sub" => {
             // Return the same type as the date/timestamp input argument.
             if let Some(dt) = arg_types.first() {
                 match dt {
@@ -942,37 +755,19 @@ pub(crate) fn dynamic_scalar_return_type(name: &str, arg_types: &[DataType]) -> 
         }
         "date_trunc" => infer_date_trunc_return_type(arg_types),
         "year" | "month" | "day" | "dayofmonth" | "hour" | "minute" | "second" | "dayofweek"
-        | "yearweek" | "dayofyear" | "weekofyear" | "quarter" | "hour_from_unixtime" => {
-            DataType::Int32
-        }
+        | "dayofyear" | "weekofyear" | "quarter" => DataType::Int32,
         "unix_timestamp" | "to_unix_timestamp" | "datediff" | "timestampdiff" | "months_diff"
         | "years_diff" | "weeks_diff" | "days_diff" | "hours_diff" | "minutes_diff"
-        | "seconds_diff" | "to_days" | "time_to_sec" => DataType::Int64,
-        "to_date" | "str_to_date" | "from_days" | "makedate" | "last_day" | "next_day" => {
-            DataType::Date32
-        }
+        | "seconds_diff" => DataType::Int64,
+        "str_to_date" | "last_day" => DataType::Date32,
 
         // Misc
-        "version" | "database" | "current_user" | "user" | "uuid" | "bitmap_to_string" => {
-            DataType::Utf8
-        }
+        "version" | "database" | "current_user" | "user" | "uuid" => DataType::Utf8,
         "sleep" => DataType::Boolean,
         "murmur_hash3_32" => DataType::Int32,
-        "xx_hash3_64" => DataType::Int64,
-        "xx_hash3_128" => DataType::FixedSizeBinary(novarocks_types::largeint::LARGEINT_BYTE_WIDTH),
         // Symmetric ciphers / hashes: aes_*/encode_* return BE-style VARCHAR
         // (raw bytes interpreted as latin-1); to_base64 wraps them in tests.
-        "aes_encrypt" | "aes_decrypt" | "encode_sort_key" => DataType::Utf8,
-        "encode_fingerprint_sha256" => DataType::Binary,
         // Iceberg internal transform functions.
-        "__iceberg_transform_identity" => arg_types.first().cloned().unwrap_or(DataType::Null),
-        "__iceberg_transform_void" => DataType::Null,
-        "__iceberg_transform_year"
-        | "__iceberg_transform_month"
-        | "__iceberg_transform_day"
-        | "__iceberg_transform_hour" => DataType::Int64,
-        "__iceberg_transform_bucket" => DataType::Int32,
-        "__iceberg_transform_truncate" => arg_types.first().cloned().unwrap_or(DataType::Null),
         // Bitwise functions return the same integer width as the first
         // argument; mirror codegen so the lowering layer's integer-only
         // requirement is satisfied (e.g. shift on LARGEINT).
@@ -983,29 +778,7 @@ pub(crate) fn dynamic_scalar_return_type(name: &str, arg_types: &[DataType]) -> 
         | "bit_shift_left"
         | "bit_shift_right"
         | "bit_shift_right_logical" => arg_types.first().cloned().unwrap_or(DataType::Int64),
-        "md5sum_numeric" => {
-            DataType::FixedSizeBinary(novarocks_types::largeint::LARGEINT_BYTE_WIDTH)
-        }
-        "hll_hash"
-        | "ds_hll_count_distinct_state"
-        | "to_bitmap"
-        | "to_binary"
-        | "encode_row_id"
-        | "bitmap_or"
-        | "bitmap_xor"
-        | "bitmap_andnot"
-        | "bitmap_intersect"
-        | "bitmap_from_string"
-        | "bitmap_empty"
-        | "bitmap_and"
-        | "sub_bitmap"
-        | "bitmap_subset_limit"
-        | "bitmap_subset_in_range"
-        | "bitmap_to_binary"
-        | "bitmap_from_binary" => DataType::Binary,
-        "bitmap_to_base64" => DataType::Utf8,
-        "bitmap_contains" | "bitmap_has_any" => DataType::Boolean,
-        "bitmap_min" | "bitmap_max" | "bitmap_count" | "hll_cardinality" => DataType::Int64,
+        "to_binary" => DataType::Binary,
         "count_state_union"
         | "count_distinct_state_union"
         | "approx_count_distinct_state_union"
@@ -1028,24 +801,19 @@ pub(crate) fn dynamic_scalar_return_type(name: &str, arg_types: &[DataType]) -> 
         "bool_or_state_visible" | "bool_and_state_visible" => DataType::Boolean,
         "mv_group_row_id" => DataType::Utf8,
         "state_all_zero" => DataType::Boolean,
-        "bitmap_to_array" => DataType::List(Arc::new(arrow::datatypes::Field::new(
-            "item",
-            DataType::Int64,
-            true,
-        ))),
         "array_length" | "array_position" | "cardinality" | "map_size" => DataType::Int32,
-        "grouping" | "grouping_id" => DataType::Int64,
+        "grouping" => DataType::Int64,
         "split" => DataType::List(Arc::new(arrow::datatypes::Field::new(
             "item",
             DataType::Utf8,
             true,
         ))),
         "array_min" | "array_max" => array_item_type(arg_types.first()).unwrap_or(DataType::Null),
-        "all_match" | "any_match" | "array_contains" | "array_contains_all"
-        | "array_contains_seq" | "arrays_overlap" => DataType::Boolean,
-        "null_or_empty" => DataType::Boolean,
+        "all_match" | "any_match" | "array_contains" | "array_contains_seq" | "arrays_overlap" => {
+            DataType::Boolean
+        }
         "array_sort" | "array_sort_lambda" | "array_sortby" | "array_reverse" | "array_slice"
-        | "array_remove" | "array_filter" | "array_map" | "array_top_n" | "array_distinct" => {
+        | "array_remove" | "array_filter" | "array_map" | "array_distinct" => {
             arg_types.first().cloned().unwrap_or(DataType::Null)
         }
         "array_append" => infer_array_append_return_type(arg_types),
@@ -1053,9 +821,6 @@ pub(crate) fn dynamic_scalar_return_type(name: &str, arg_types: &[DataType]) -> 
         "array_flatten" => infer_array_flatten_return_type(arg_types),
         "array_intersect" => infer_array_intersect_return_type(arg_types),
         "array_repeat" => infer_array_repeat_return_type(arg_types),
-        "array_difference" | "array_cum_sum" => infer_array_numeric_list_return_type(arg_types),
-        "array_sum" => infer_array_sum_return_type(arg_types),
-        "array_avg" => infer_array_avg_return_type(arg_types),
         "array_generate" => {
             crate::functions::dynamic_scalar_data_type("array_generate", arg_types)?
         }
@@ -1080,8 +845,9 @@ pub(crate) fn dynamic_scalar_return_type(name: &str, arg_types: &[DataType]) -> 
         "map_entries" => infer_map_entries_return_type(arg_types),
         "arrays_zip" => infer_arrays_zip_return_type(arg_types),
         "map_concat" => infer_map_concat_return_type(arg_types),
-        "map_filter" | "distinct_map_keys" | "map_apply" | "transform_keys"
-        | "transform_values" => arg_types.first().cloned().unwrap_or(DataType::Null),
+        "map_filter" | "transform_keys" | "transform_values" => {
+            arg_types.first().cloned().unwrap_or(DataType::Null)
+        }
         "map" => infer_map_constructor_return_type(arg_types),
         "row" | "struct" => infer_struct_constructor_return_type(arg_types),
         "named_struct" => infer_named_struct_return_type(arg_types),
@@ -1110,8 +876,6 @@ pub(crate) fn dynamic_scalar_return_type(name: &str, arg_types: &[DataType]) -> 
             ),
             _ => DataType::Null,
         },
-        "percentile_hash" | "percentile_empty" => DataType::Binary,
-        "percentile_approx_raw" => DataType::Float64,
         "get_json_bool" | "get_variant_bool" | "json_exists" => DataType::Boolean,
         "get_json_int" | "get_variant_int" => DataType::Int64,
         "get_json_double" | "get_variant_double" => DataType::Float64,
@@ -1187,62 +951,6 @@ fn infer_array_intersect_return_type(arg_types: &[DataType]) -> DataType {
 
 fn infer_array_repeat_return_type(arg_types: &[DataType]) -> DataType {
     list_type(arg_types.first().cloned().unwrap_or(DataType::Null))
-}
-
-fn infer_array_numeric_list_return_type(arg_types: &[DataType]) -> DataType {
-    list_type(match array_item_type(arg_types.first()) {
-        Some(
-            DataType::Boolean
-            | DataType::Int8
-            | DataType::Int16
-            | DataType::Int32
-            | DataType::Int64,
-        ) => DataType::Int64,
-        Some(DataType::Float32 | DataType::Float64 | DataType::Decimal128(_, _)) => {
-            DataType::Float64
-        }
-        Some(other) => other,
-        None => DataType::Null,
-    })
-}
-
-fn infer_array_sum_return_type(arg_types: &[DataType]) -> DataType {
-    match array_item_type(arg_types.first()) {
-        Some(
-            DataType::Boolean
-            | DataType::Int8
-            | DataType::Int16
-            | DataType::Int32
-            | DataType::Int64,
-        ) => DataType::Int64,
-        Some(DataType::Float32 | DataType::Float64 | DataType::Utf8 | DataType::LargeUtf8) => {
-            DataType::Float64
-        }
-        Some(DataType::Decimal128(_precision, scale)) => DataType::Decimal128(38, scale),
-        Some(DataType::FixedSizeBinary(width))
-            if width == novarocks_types::largeint::LARGEINT_BYTE_WIDTH =>
-        {
-            DataType::FixedSizeBinary(width)
-        }
-        _ => DataType::Null,
-    }
-}
-
-fn infer_array_avg_return_type(arg_types: &[DataType]) -> DataType {
-    match array_item_type(arg_types.first()) {
-        Some(DataType::Decimal128(_precision, scale)) => {
-            let new_scale = if scale <= 6 {
-                scale + 6
-            } else if scale <= 12 {
-                12
-            } else {
-                scale
-            };
-            DataType::Decimal128(38, new_scale)
-        }
-        Some(_) => DataType::Float64,
-        None => DataType::Null,
-    }
 }
 
 fn map_key_value_types(data_type: &DataType) -> Option<(DataType, DataType)> {
@@ -1742,14 +1450,6 @@ mod tests {
     }
 
     #[test]
-    fn infer_scalar_return_type_for_sec_to_time_is_utf8() {
-        assert_eq!(
-            infer_scalar_return_type("sec_to_time", &[DataType::Int64]),
-            DataType::Utf8
-        );
-    }
-
-    #[test]
     fn arrays_overlap_rejects_non_array_second_argument_with_starrocks_error() {
         let err = validate_scalar_function_call(
             "arrays_overlap",
@@ -1872,32 +1572,6 @@ mod tests {
     }
 
     #[test]
-    fn sum_map_is_treated_as_aggregate_map_output() {
-        let map_type = DataType::Map(
-            Arc::new(arrow::datatypes::Field::new(
-                "entries",
-                DataType::Struct(
-                    vec![
-                        Arc::new(arrow::datatypes::Field::new("key", DataType::Int32, false)),
-                        Arc::new(arrow::datatypes::Field::new("value", DataType::Int64, true)),
-                    ]
-                    .into(),
-                ),
-                false,
-            )),
-            false,
-        );
-        assert!(is_aggregate_function(
-            crate::functions::builtin_sql_function_catalog(),
-            "sum_map"
-        ));
-        assert_eq!(
-            resolve_aggregate("sum_map", std::slice::from_ref(&map_type)),
-            map_type
-        );
-    }
-
-    #[test]
     fn sum_largeint_returns_largeint() {
         let largeint_type = DataType::FixedSizeBinary(largeint::LARGEINT_BYTE_WIDTH);
         // This fixture declares a SQL LARGEINT source; the carrier alone does
@@ -1991,62 +1665,6 @@ mod tests {
     }
 
     #[test]
-    fn sum_map_rejects_non_scalar_values() {
-        let map_type = DataType::Map(
-            Arc::new(arrow::datatypes::Field::new(
-                "entries",
-                DataType::Struct(
-                    vec![
-                        Arc::new(arrow::datatypes::Field::new("key", DataType::Int32, true)),
-                        Arc::new(arrow::datatypes::Field::new(
-                            "value",
-                            DataType::List(Arc::new(arrow::datatypes::Field::new(
-                                "item",
-                                DataType::Int32,
-                                true,
-                            ))),
-                            true,
-                        )),
-                    ]
-                    .into(),
-                ),
-                false,
-            )),
-            false,
-        );
-
-        let err = validate_aggregate_function_call("sum_map", &[map_type])
-            .expect_err("sum_map should reject non-scalar map values");
-        assert_eq!(err, "sum_map only support scalar KV");
-    }
-
-    #[test]
-    fn sum_map_rejects_unsupported_scalar_value_types() {
-        let map_type = DataType::Map(
-            Arc::new(arrow::datatypes::Field::new(
-                "entries",
-                DataType::Struct(
-                    vec![
-                        Arc::new(arrow::datatypes::Field::new("key", DataType::Int32, true)),
-                        Arc::new(arrow::datatypes::Field::new(
-                            "value",
-                            DataType::Date32,
-                            true,
-                        )),
-                    ]
-                    .into(),
-                ),
-                false,
-            )),
-            false,
-        );
-
-        let err = validate_aggregate_function_call("sum_map", &[map_type])
-            .expect_err("sum_map should reject date values");
-        assert_eq!(err, "unsupported value type:DATE");
-    }
-
-    #[test]
     fn array_intersection_keeps_string_common_type_for_float_and_datetime() {
         for scalar in [
             DataType::Float32,
@@ -2065,20 +1683,5 @@ mod tests {
             );
             validate_scalar_function_call("arrays_overlap", &[scalar_array, string_array]).unwrap();
         }
-    }
-    #[test]
-    fn bitmap_base64_legacy_and_selected_result_types_remain_text() {
-        assert_eq!(
-            infer_scalar_return_type("bitmap_to_base64", &[DataType::Binary]),
-            DataType::Utf8
-        );
-        assert_eq!(
-            dynamic_scalar_return_type("bitmap_to_base64", &[DataType::Binary]),
-            Some(DataType::Utf8)
-        );
-        assert_eq!(
-            dynamic_scalar_return_type("bitmap_to_binary", &[DataType::Binary]),
-            Some(DataType::Binary)
-        );
     }
 }

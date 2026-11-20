@@ -22,14 +22,12 @@ use crate::fold_observation::FoldProbe;
 use arrow::array::Decimal128Array;
 use arrow::datatypes::DataType;
 use novarocks_expression_contract::{BinaryOperator, ExprKind, UnaryOperator};
-use novarocks_functions::{ConstantValue, FunctionResultType};
-use novarocks_sql::binding::SqlResultConstraintOrigin;
-use novarocks_sql::compiler::{SqlAuthoredPhysicalPlan, SqlCallDependencySite, SqlCompileControl};
+use novarocks_functions::ConstantValue;
+use novarocks_sql::compiler::{SqlAuthoredPhysicalPlan, SqlCompileControl};
 use novarocks_sql::sql_mode::{SqlMode, SqlSemanticSettings};
 use novarocks_sql_testkit::sql_fixture_constant_policy;
 use novarocks_type_contract::{
-    CompileCheckpoints, CompilePhase, DecimalOverflowPolicy, RegexpCountPatternSource,
-    ValueLogicalType,
+    CompilePhase, DecimalOverflowPolicy, RegexpCountPatternSource, ValueLogicalType,
 };
 use std::sync::Arc;
 
@@ -286,80 +284,6 @@ fn regexp_count_real_sql_fold_author_attaches_existing_emitted_source_before_err
                 if function.function_id.as_str() == "builtin.scalar/regexp_count/v1"
         ))
     );
-}
-
-#[test]
-fn sql_fold_dependency_ds_scalar_actual_literal_three_arity_exact_source() {
-    const FUNCTION: &str = "builtin.scalar/ds_hll_count_distinct_state/v1";
-    for (count, sql) in [
-        (1, "SELECT ds_hll_count_distinct_state(7) AS folded"),
-        (2, "SELECT ds_hll_count_distinct_state(7,10) AS folded"),
-        (
-            3,
-            "SELECT ds_hll_count_distinct_state(7,10,'HLL_8') AS folded",
-        ),
-    ] {
-        let probe = Arc::new(FoldProbe::default());
-        let control = probe.control();
-        let owner = compile_table_free(sql, session(Default::default(), true), &control).unwrap();
-        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
-        let retained = expression_sources(&owner)
-            .filter(|(_, _, expression)| {
-                matches!(
-                    &expression.kind, ExprKind::FunctionCall { function, args }
-                        if function.function_id.as_str() == FUNCTION && args.len() == count
-                )
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            retained.len(),
-            1,
-            "opaque state must keep the executable call"
-        );
-        let (fragment, node, source) = retained[0];
-        let loan = owner
-            .borrow_call_dependency_observed(
-                SqlCallDependencySite::Expression {
-                    fragment,
-                    node,
-                    source,
-                },
-                &mut work,
-            )
-            .unwrap();
-        assert_eq!(loan.original_logical_argument_count(), count);
-        assert_eq!(loan.original_arguments().len(), count);
-        assert!(loan.original_binding().result_constraint().is_none());
-        assert_eq!(
-            loan.original_binding().result_constraint_origin(),
-            &SqlResultConstraintOrigin::Unconstrained
-        );
-        let canonical = loan.canonical().unwrap();
-        assert_eq!(source.ty.data_type(), &DataType::Binary);
-        assert_eq!(
-            canonical.selected().result_type,
-            FunctionResultType::Scalar(source.ty.clone())
-        );
-        for arg in loan.original_arguments() {
-            let novarocks_functions::FunctionArgument::Value {
-                value_type,
-                constant: Some(value),
-            } = arg
-            else {
-                panic!("the exact source keeps the constant input");
-            };
-            assert_eq!(value.value_type(), value_type);
-        }
-        work.finish().unwrap();
-        assert!(
-            probe
-                .receipts
-                .lock()
-                .unwrap()
-                .iter()
-                .all(|receipt| { !receipt.is_call(FUNCTION) || receipt.result.is_none() })
-        );
-    }
 }
 
 #[test]

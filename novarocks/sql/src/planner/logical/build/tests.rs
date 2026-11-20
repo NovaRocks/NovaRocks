@@ -1571,23 +1571,6 @@ fn test_plan_query_builds_nested_anchor_chain() {
 }
 
 #[test]
-fn test_sum_map_subscript_plans_as_aggregate() {
-    let plan =
-        parse_analyze_and_plan("SELECT sum_map(m)[1] FROM maps").expect("planner should succeed");
-
-    match &plan.kind {
-        LogicalPlanKind::Project(_) => match &plan.unary_input().kind {
-            LogicalPlanKind::Aggregate(agg) => {
-                assert_eq!(agg.aggregates.len(), 1);
-                assert_eq!(agg.aggregates[0].name, "sum_map");
-            }
-            other => panic!("expected Aggregate under Project, got {other:?}"),
-        },
-        other => panic!("expected Project root, got {other:?}"),
-    }
-}
-
-#[test]
 fn group_by_alias_expression_projects_aggregate_group_key() {
     let plan = parse_analyze_and_plan(
         "SELECT o_orderkey % 2 AS g, count(*) FROM orders GROUP BY g ORDER BY g",
@@ -3419,41 +3402,34 @@ fn assert_m07_planned_domains(sql: &str, expected: Vec<Option<novarocks_types::s
 fn m07_aggregate_symbol_rewrites_keep_original_output_domains() {
     use novarocks_types::schema::SqlType as S;
     for (sql, domain) in [
+        ("select any_value(CAST(NULL AS HLL)) from orders", S::Hll),
         (
-            "select hll_union(hll_hash(cast(o_orderkey as varchar))) from orders",
-            S::Hll,
-        ),
-        ("select hll_raw_agg(hll_hash('x')) from orders", S::Hll),
-        (
-            "select bitmap_union(to_bitmap(o_orderkey)) from orders",
+            "select any_value(CAST(NULL AS BITMAP)) from orders",
             S::Bitmap,
         ),
-        (
-            "select percentile_union(percentile_hash(cast(o_orderkey as double))) from orders",
-            S::Percentile,
-        ),
+        ("select any_value(parse_json('{}')) from orders", S::Json),
     ] {
         assert_m07_planned_domains(sql, vec![Some(domain)]);
     }
     assert_m07_planned_domains(
-        "select o_custkey,hll_union(hll_hash('x')) as h,bitmap_union(to_bitmap(o_orderkey)) as b,percentile_union(percentile_hash(1.0)) as p from orders group by o_custkey",
-        vec![None, Some(S::Hll), Some(S::Bitmap), Some(S::Percentile)],
+        "select o_custkey,any_value(CAST(NULL AS HLL)) as h,any_value(CAST(NULL AS BITMAP)) as b,any_value(parse_json('{}')) as p from orders group by o_custkey",
+        vec![None, Some(S::Hll), Some(S::Bitmap), Some(S::Json)],
     );
     assert_m07_planned_domains(
-        "select hll_union(hll_hash('x')) as x,hll_union(hll_hash('x')) as y from orders",
+        "select any_value(CAST(NULL AS HLL)) as x,any_value(CAST(NULL AS HLL)) as y from orders",
         vec![Some(S::Hll); 2],
     );
     assert_m07_planned_domains(
-        "select count(*),sum(o_orderkey),cast(hll_union(hll_hash('x')) as varbinary) from orders",
+        "select count(*),sum(o_orderkey),cast(any_value(CAST(NULL AS HLL)) as varbinary) from orders",
         vec![None; 3],
     );
     for (sql, expected) in [
         (
-            "select hll_union(hll_hash('x')) as h,cast(hll_union(hll_hash('x')) as varbinary) as raw from orders",
+            "select any_value(CAST(NULL AS HLL)) as h,cast(any_value(CAST(NULL AS HLL)) as varbinary) as raw from orders",
             vec![Some(S::Hll), None],
         ),
         (
-            "select cast(hll_union(hll_hash('x')) as varbinary) as raw,hll_union(hll_hash('x')) as h from orders",
+            "select cast(any_value(CAST(NULL AS HLL)) as varbinary) as raw,any_value(CAST(NULL AS HLL)) as h from orders",
             vec![None, Some(S::Hll)],
         ),
     ] {
@@ -3478,8 +3454,8 @@ fn m07_aggregate_symbol_rewrites_keep_original_output_domains() {
 fn m07_duplicate_and_window_projections_keep_complete_source_witnesses() {
     use novarocks_types::schema::SqlType as S;
     assert_m07_planned_domains(
-        "select hll_hash('x') as x,hll_hash('x') as y",
-        vec![Some(S::Hll); 2],
+        "select parse_json('{}') as x,parse_json('{}') as y",
+        vec![Some(S::Json); 2],
     );
     assert_m07_planned_domains(
         "select count(*) over () as x,count(*) over () as y from orders",
@@ -3494,9 +3470,9 @@ fn m07_duplicate_and_window_projections_keep_complete_source_witnesses() {
         vec![Some(S::Array(Box::new(S::Json))); 2],
     );
     // Exercise the duplicate-ID builder path with an actual analyzer-owned
-    // HLL expression; no window producer domain is inferred by this fixture.
+    // JSON expression; no window producer domain is inferred by this fixture.
     let (resolved, _, mut factory) =
-        parse_analyze_query("select hll_hash('x') as x,hll_hash('x') as y").unwrap();
+        parse_analyze_query("select parse_json('{}') as x,parse_json('{}') as y").unwrap();
     let QueryBody::Select(mut select) = resolved.body else {
         panic!("expected select");
     };
@@ -3524,14 +3500,15 @@ fn m07_duplicate_and_window_projections_keep_complete_source_witnesses() {
     assert_eq!(columns[0].column_id, original);
     assert_ne!(columns[1].column_id, original);
     for column in columns {
-        assert_eq!(factory.logical_type(column.column_id), Some(S::Hll));
+        assert_eq!(factory.logical_type(column.column_id), Some(S::Json));
     }
 }
 
 #[test]
 fn m07_shared_aggregate_symbol_refuses_conflicting_occurrence_facts() {
     use novarocks_types::schema::SqlType;
-    let sql = "select hll_union(hll_hash('x')) as x,hll_union(hll_hash('x')) as y from orders";
+    let sql =
+        "select any_value(CAST(NULL AS HLL)) as x,any_value(CAST(NULL AS HLL)) as y from orders";
     for conflict in [None, Some(SqlType::Bitmap)] {
         for ordinal in [0, 1] {
             let (resolved, registry, mut factory) = parse_analyze_query(sql).unwrap();

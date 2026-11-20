@@ -1997,8 +1997,8 @@ mod failure_latch_tests {
 }
 
 #[cfg(test)]
-#[path = "ds_hll_local_phase_factory_tests.rs"]
-mod ds_hll_local_phase_factory_tests;
+#[path = "compiled_aggregate_zero_calls_tests.rs"]
+mod compiled_aggregate_zero_calls_tests;
 
 #[cfg(test)]
 #[path = "copy_root_scratch_host_tests.rs"]

@@ -73,13 +73,13 @@ fn sql_presence_candidate_snapshot_keeps_exact_bindings_and_table_owner_separate
         admitted.admitted_execution_abi = None;
         assert_eq!(admitted, original_binding);
     }
-    let hour = [argument(DataType::Int64)];
+    let repeat = [argument(DataType::Int64), argument(DataType::Int64)];
     let bound = original
-        .resolve_scalar_binding("hour_from_unixtime", &hour, &control)
+        .resolve_scalar_binding("array_repeat", &repeat, &control)
         .unwrap();
     for scope in [scoped.as_ref(), again.as_ref()] {
         assert!(
-            matches!(scope.resolve_scalar_binding("hour_from_unixtime", &hour, &control), Err(FunctionBindingError::UnavailableImplementation(ref id)) if id == &bound.selected.overload)
+            matches!(scope.resolve_scalar_binding("array_repeat", &repeat, &control), Err(FunctionBindingError::UnavailableImplementation(ref id)) if id == &bound.selected.overload)
         );
     }
     // This uses the actual registered table owner, separately from scalar admission.
@@ -118,9 +118,9 @@ fn sql_presence_candidate_exact_selected_loan_cannot_bypass_missing_owner() {
     let original = builtin_sql_function_catalog().snapshot();
     let scoped = original.snapshot_for_scalar_presence();
     let control = SqlCompileControl::unbounded();
-    let args = [argument(DataType::Int64)];
+    let args = [argument(DataType::Int64), argument(DataType::Int64)];
     let bound = original
-        .resolve_scalar_binding("hour_from_unixtime", &args, &control)
+        .resolve_scalar_binding("array_repeat", &args, &control)
         .unwrap();
     let request = novarocks_functions::FunctionBindingRequest {
         arguments: &args,

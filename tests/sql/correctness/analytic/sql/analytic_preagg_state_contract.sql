@@ -32,9 +32,9 @@ INSERT INTO ${case_db}.analytic_preagg_state_contract VALUES
 
 -- @explain_contains=predicate: rk <= 2
 -- @explain_contains=WINDOW [avg(v)]
--- @explain_contains=WINDOW [bitmap_union_count(to_bitmap(v))]
+-- @explain_contains=WINDOW [count(v)]
 -- @explain_contains=WINDOW [rank()]
-SELECT grp, score, avg_v, bitmap_v, rk
+SELECT grp, score, avg_v, count_v, rk
 FROM (
     SELECT
         grp,
@@ -44,7 +44,7 @@ FROM (
             ORDER BY score DESC, v
             ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
         ) AS DECIMAL(18, 4)) AS avg_v,
-        bitmap_union_count(to_bitmap(v)) OVER (PARTITION BY grp) AS bitmap_v,
+        count(v) OVER (PARTITION BY grp) AS count_v,
         rank() OVER (PARTITION BY grp ORDER BY score DESC) AS rk
     FROM ${case_db}.analytic_preagg_state_contract
 ) t

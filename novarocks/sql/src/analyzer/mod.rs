@@ -3537,7 +3537,7 @@ fn is_grouping_call(expression: &ast::Expr) -> bool {
     matches!(expression, ast::Expr::GroupingOperation(_))
         || matches!(expression, ast::Expr::FunctionCall(function)
         if function.name.parts.len() == 1
-        && matches!(function.name.parts[0].value.to_ascii_lowercase().as_str(), "grouping" | "grouping_id"))
+        && function.name.parts[0].value.eq_ignore_ascii_case("grouping"))
 }
 
 fn expr_syntax_key(expr: &ast::Expr) -> Result<String, AnalyzeError> {
@@ -6534,14 +6534,6 @@ mod tests {
     }
 
     #[test]
-    fn test_time_slice_interval_literal_analyzes() {
-        let resolved =
-            parse_raw_and_analyze("SELECT time_slice('9999-12-31 23:59:59', 5, 'year', 'ceil')")
-                .expect("time_slice interval literal should analyze");
-        assert_eq!(resolved.output_columns.len(), 1);
-    }
-
-    #[test]
     fn test_any_match_lambda_analyzes_as_boolean() {
         let resolved = parse_raw_and_analyze("SELECT any_match(x -> x < 10, [1,2])")
             .expect("any_match should analyze lambda predicate");
@@ -7121,7 +7113,7 @@ mod tests {
             ] {
                 let args = vec!["a"; count].join(",");
                 let sql = format!(
-                    "SELECT grouping({args}), grouping_id({args}), abs(grouping({args})), grouping({args}) + CAST(1 AS INTEGER) FROM (VALUES (CAST(1 AS INTEGER))) t(a) {group_by}"
+                    "SELECT grouping({args}), grouping({args}), abs(grouping({args})), grouping({args}) + CAST(1 AS INTEGER) FROM (VALUES (CAST(1 AS INTEGER))) t(a) {group_by}"
                 );
                 let resolved = parse_raw_and_analyze(&sql).unwrap();
                 assert_eq!(resolved.output_columns[0].field_name, None);
@@ -7130,10 +7122,7 @@ mod tests {
                     &carrier,
                     "{sql}"
                 );
-                assert_eq!(
-                    resolved.output_columns[1].value_type.data_type(),
-                    &DataType::Int64
-                );
+                assert_eq!(resolved.output_columns[1].value_type.data_type(), &carrier);
                 let QueryBody::Select(select) = &resolved.body else {
                     panic!("select");
                 };
@@ -7358,16 +7347,6 @@ mod tests {
                 "original GROUP BY author: {sql}"
             );
         }
-        // GROUPING_ID keeps its existing Nova BIGINT extension, including 64 occurrences.
-        let args = vec!["a"; 64].join(",");
-        let resolved = parse_raw_and_analyze(&format!(
-            "SELECT grouping_id({args}) FROM (VALUES (1)) t(a) GROUP BY ROLLUP(a)"
-        ))
-        .unwrap();
-        assert_eq!(
-            resolved.output_columns[0].value_type.data_type(),
-            &DataType::Int64
-        );
     }
 
     #[test]
@@ -7486,7 +7465,7 @@ mod tests {
     #[test]
     fn p1_grouping_id_marker_replaced_inside_nested_projection() {
         let resolved = parse_and_analyze(
-            "SELECT abs(grouping_id(k1, k2)) AS gid \
+            "SELECT abs(grouping(k1, k2)) AS gid \
              FROM t1 \
              GROUP BY GROUPING SETS ((k1, k2), ())",
         )
@@ -7751,9 +7730,9 @@ mod tests {
     }
 
     #[test]
-    fn test_group_by_grouping_sets_with_grouping_id() {
+    fn test_group_by_grouping_sets_with_grouping() {
         let sql = "SELECT o_orderstatus, o_orderpriority, \
-                          grouping_id(o_orderstatus, o_orderpriority) as gid, \
+                          grouping(o_orderstatus, o_orderpriority) as gid, \
                           grouping(o_orderstatus, o_orderpriority) as grp, \
                           count(*) as cnt \
                    FROM orders \

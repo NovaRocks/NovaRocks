@@ -131,7 +131,7 @@ fn pool(array: ArrayRef) -> ConstantPool {
     .unwrap()
 }
 
-const NAMES: [&str; 2] = ["repeat", "space"];
+const NAMES: [&str; 1] = ["repeat"];
 fn sources(name: &str) -> Vec<FunctionValueType> {
     if name == "repeat" {
         vec![source(true), FunctionValueType::new(DataType::Int64, true)]
@@ -179,15 +179,6 @@ fn string_repeat_actual_profiles_preserve_negative_empty_null_unicode_and_i64_bo
         Some("".into()),
         None,
     ];
-    let spaces = integers(vec![
-        Some(0),
-        Some(1),
-        Some(3),
-        Some(-1),
-        Some(i64::MIN),
-        Some(i64::MAX),
-        None,
-    ]);
     for policy in [
         DecimalOverflowPolicy::OutputNull,
         DecimalOverflowPolicy::ReportError,
@@ -203,27 +194,6 @@ fn string_repeat_actual_profiles_preserve_negative_empty_null_unicode_and_i64_bo
                     .unwrap()
             ),
             expected
-        );
-        let mut space = ScalarEvaluationInstance::instantiate(
-            prepared_for_test_with_policy("space", &sources("space"), policy).unwrap(),
-        )
-        .unwrap();
-        let args = [EvaluatedArgument::Column(&spaces)];
-        assert_eq!(
-            output(
-                &space
-                    .evaluate(Selection::all(spaces.len()), &args, &Control::default())
-                    .unwrap()
-            ),
-            vec![
-                Some("".into()),
-                Some(" ".into()),
-                Some("   ".into()),
-                None,
-                None,
-                None,
-                None
-            ]
         );
     }
 }
@@ -275,30 +245,12 @@ fn string_repeat_row_cap_exact_boundary_remains_success_or_null_not_resource_err
     for row in [1, 3, 4] {
         assert!(array.is_null(row));
     }
-    let spaces = integers(vec![Some(CAP as i64), Some(CAP as i64 + 1)]);
-    let prepared = prepared_for_test_with_policy(
-        "space",
-        &[FunctionValueType::new(DataType::Int64, false)],
-        DecimalOverflowPolicy::ReportError,
-    )
-    .unwrap();
-    assert_eq!(prepared.contract().result_type(), &source(true));
-    let mut kernel = ScalarEvaluationInstance::instantiate(prepared).unwrap();
-    let args = [EvaluatedArgument::Column(&spaces)];
-    let result = kernel
-        .evaluate(Selection::all(2), &args, &Control::default())
-        .unwrap();
-    let array = result
-        .values()
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap();
-    assert_eq!(array.value(0).len(), CAP);
-    assert!(array.value(0).bytes().all(|b| b == b' '));
-    assert!(array.is_null(1));
-    // The same live instance remains usable after successful over-cap NULLs.
     let one = integers(vec![Some(1)]);
-    let args = [EvaluatedArgument::Column(&one)];
+    let text = strings(vec![Some(" ")]);
+    let args = [
+        EvaluatedArgument::Column(&text),
+        EvaluatedArgument::Column(&one),
+    ];
     assert_eq!(
         output(
             &kernel
@@ -355,16 +307,6 @@ fn string_repeat_sparse_slice_compact_scalar_and_constant_addressing_is_independ
     );
     assert_eq!(constant.ordinal(), 2);
     assert!(Arc::ptr_eq(constant.pool().array(), constants.array()));
-    let args = [EvaluatedArgument::SelectedColumn(&compact)];
-    let mut kernel = instance("space");
-    assert_eq!(
-        output(
-            &kernel
-                .evaluate(selection, &args, &Control::default())
-                .unwrap()
-        ),
-        vec![Some(" ".into()), Some("  ".into())]
-    );
 }
 
 #[test]
@@ -468,8 +410,11 @@ fn string_repeat_empty_selection_wrong_i32_and_required_child_errors_preserve_fa
         Box::from([crate::RowDataError::new(0, "required count failed")]),
     )
     .unwrap();
-    let args = [EvaluatedArgument::SelectedColumn(&failed)];
-    let mut kernel = instance("space");
+    let args = [
+        EvaluatedArgument::Column(&text),
+        EvaluatedArgument::SelectedColumn(&failed),
+    ];
+    let mut kernel = instance("repeat");
     assert!(matches!(
         kernel.evaluate(Selection::all(1), &args, &Control::default()),
         Err(ref cause) if crate::kernel_control::test_contract::input(cause)
@@ -554,15 +499,8 @@ fn string_repeat_runtime_small_and_quantum_callbacks_preserve_three_causes_and_n
 #[test]
 fn string_repeat_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_stale_sources() {
     for name in NAMES {
-        let arity = if name == "repeat" { 2 } else { 1 };
-        assert_eq!(
-            operation(name),
-            Some(if name == "repeat" {
-                StringRepeatOp::Repeat
-            } else {
-                StringRepeatOp::Space
-            })
-        );
+        let arity = 2;
+        assert_eq!(operation(name), Some(StringRepeatOp::Repeat));
         assert!(operation("substring_index").is_none());
         let owner = owner_for_test(name);
         let arguments: Vec<_> = sources(name)

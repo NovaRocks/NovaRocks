@@ -39,22 +39,10 @@ FROM (
 -- query 4
 -- @order_sensitive=true
 SELECT id,
-       first_value(to_bitmap(id)) OVER (ORDER BY id) AS bitmap_state,
-       lag(hll_hash(CAST(id AS BIGINT))) OVER (ORDER BY id) AS hll_state,
        lead(parse_json('{"a": 2}'), 1, parse_json('{}')) OVER (ORDER BY id) AS next_json
 FROM ${case_db}.window_result_domains ORDER BY id;
 
 -- query 5
 -- @order_sensitive=true
-SELECT id, first_value([to_bitmap(id), NULL]) OVER (ORDER BY id) AS bitmap_values
-FROM ${case_db}.window_result_domains ORDER BY id;
-
--- query 6
--- @order_sensitive=true
-SELECT id,
-       element_at(array_flatten([[to_bitmap(id)]]), 1) AS flattened_state,
-       element_at(array_repeat(hll_hash(CAST(id AS BIGINT)), 2), 1) AS repeated_state,
-       element_at(__array_struct_subfield([named_struct('payload', to_bitmap(id))], 'payload'), 1) AS selected_state,
-       arrays_zip([to_bitmap(id)], [parse_json('{}')])[1].col1 AS zipped_state,
-       bitmap_to_string(element_at(array_flatten([[to_bitmap(id)]]), 1)) AS flattened_members
+SELECT id
 FROM ${case_db}.window_result_domains ORDER BY id;

@@ -382,38 +382,6 @@ fn fixed_created_validation_preserves_first_h_and_control_prefix_without_tail() 
         }
     }
 }
-#[test]
-fn fixed_created_field_uses_real_wrapper_before_first_constructor() {
-    let catalog = build_builtin_engine_function_catalog().unwrap();
-    let args = [
-        FunctionArgument::Value {
-            value_type: FunctionValueType::new(DataType::Int64, false),
-            constant: None,
-        },
-        FunctionArgument::Value {
-            value_type: FunctionValueType::new(DataType::Int64, false),
-            constant: None,
-        },
-    ];
-    let bound = catalog
-        .resolve_bound_user("field", FunctionKind::Scalar, request(&args), &Control)
-        .unwrap();
-    let (facts, mut scope) = RequestScope::new(Some(1));
-    let control = Trace::default();
-    let result = created_map_validation(&catalog, &bound, &args, &mut scope, &control);
-    assert!(matches!(
-        result,
-        Err(crate::FunctionBindingCreationFailure::Creator(
-            CreatedRefusal::FirstCause
-        ))
-    ));
-    assert_eq!(facts.requests.lock().unwrap().len(), 1);
-    assert_eq!(facts.held.load(std::sync::atomic::Ordering::SeqCst), 0);
-    assert_eq!(
-        control.calls.lock().unwrap().first(),
-        Some(&(CompilePhase::FunctionSpecialization, 0))
-    );
-}
 
 #[derive(Default)]
 struct Trace {

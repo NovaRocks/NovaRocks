@@ -5,8 +5,8 @@ empty_contains	empty_position	singleton_contains	singleton_position	repeated_con
 
 -- query 2
 -- legacy
-removed	deduplicated	intersected	empty_intersection	shared_null	empty_overlap	contains_all_null	contains_null_seq
-[]	[null]	[null]	[]	1	0	1	1
+removed	deduplicated	intersected	empty_intersection	shared_null	empty_overlap	contains_null_seq
+[]	[null]	[null]	[]	1	0	1
 
 -- query 3
 -- legacy

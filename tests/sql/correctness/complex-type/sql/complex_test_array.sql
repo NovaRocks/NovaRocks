@@ -527,36 +527,16 @@ SELECT array_flatten(array_slice(COLB, 1, 2)) FROM flatten_one_layer_arr_test OR
 
 -- name: null_or_empty
 -- query 102
-USE ${case_db};
-select null_or_empty([1, 2]);
-
--- query 103
-USE ${case_db};
-select null_or_empty(null);
-
--- query 104
-USE ${case_db};
-select null_or_empty([]);
-
--- query 105
-USE ${case_db};
-select null_or_empty([[1,2],[1]]);
-
--- query 106
 -- @skip_result_check=true
 USE ${case_db};
 CREATE TABLE IF NOT EXISTS null_or_empty_test (COLA INT, COLB ARRAY<INT>) WITH (format_version = 3);
 
--- query 107
+-- query 103
 -- @skip_result_check=true
 USE ${case_db};
 INSERT INTO null_or_empty_test (COLA, COLB) VALUES ROW(1, []), ROW(2, NULL), ROW(3, [1,2]);
 
--- query 108
-USE ${case_db};
-SELECT null_or_empty(COLB) FROM flatten_test ORDER BY COLA;
-
--- query 109
+-- query 104
 -- @skip_result_check=true
 -- A catalog that cannot hold views cannot answer view enumeration, so
 -- DROP DATABASE ... FORCE is refused here rather than silently assuming

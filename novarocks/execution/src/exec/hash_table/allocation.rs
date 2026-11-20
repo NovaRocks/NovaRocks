@@ -47,20 +47,12 @@ impl novarocks_functions::aggregate_scalar::ScalarStateAllocator for AggregateAl
         self.allocation_error(_operation, source)
     }
 }
-impl novarocks_functions::exact_percentile_core::ExactPercentileAllocator for AggregateAllocator {
-    type ParserReservation = AggregateTransientReservation;
-    fn reserve_percentile_transient(
-        &self,
-        bytes: usize,
-        operation: &str,
-    ) -> Result<Self::ParserReservation, novarocks_functions::KernelFailure> {
-        self.reserve_transient(bytes, operation)
-    }
-}
+#[cfg(test)]
 #[derive(Clone, Copy, Debug)]
 struct AggregateRequestExtent {
     bytes: usize,
 }
+#[cfg(test)]
 impl std::fmt::Display for AggregateRequestExtent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -70,7 +62,9 @@ impl std::fmt::Display for AggregateRequestExtent {
         )
     }
 }
+#[cfg(test)]
 impl std::error::Error for AggregateRequestExtent {}
+#[cfg(test)]
 impl novarocks_failure_contract::FailureProjection for AggregateRequestExtent {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
         use novarocks_failure_contract::{
@@ -92,6 +86,7 @@ impl novarocks_failure_contract::FailureProjection for AggregateRequestExtent {
         })
     }
 }
+#[cfg(test)]
 impl novarocks_failure_contract::OuterFailureProjection for AggregateRequestExtent {}
 
 impl AggregateAllocator {
@@ -121,6 +116,7 @@ impl AggregateAllocator {
     /// library that cannot accept our allocator. The caller must prove the
     /// supplied byte bound covers the library's complete live allocation
     /// graph for the guarded operation.
+    #[cfg(test)]
     pub(crate) fn reserve_transient(
         &self,
         bytes: usize,
@@ -175,6 +171,7 @@ impl AggregateAllocator {
     }
 }
 
+#[cfg(test)]
 pub(crate) struct AggregateTransientReservation {
     allocator: AggregateAllocator,
     bytes: usize,
@@ -222,6 +219,7 @@ impl AggregateRetainedCharge {
     }
 }
 
+#[cfg(test)]
 impl Drop for AggregateTransientReservation {
     fn drop(&mut self) {
         self.allocator.release_charge(self.bytes);

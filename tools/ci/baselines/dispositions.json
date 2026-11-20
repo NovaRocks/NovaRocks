@@ -12,16 +12,6 @@
       "expires": "2026-12-15"
     },
     {
-      "unit": "sql-case:aggregate/agg_sum_map_basic",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "Missing installed pure implementation for builtin.scalar/map/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
-      "owner": "B7, B8, I1, I5",
-      "expires": "2026-12-15"
-    },
-    {
       "unit": "sql-case:aggregate/agg_test_agg_with_limit",
       "failure": {
         "class": "error_code",
@@ -62,16 +52,6 @@
       "expires": "2026-12-15"
     },
     {
-      "unit": "sql-case:aggregate/agg_test_dict_merge",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "The original case reaches statement 4 and the frozen selected overload builtin.aggregate/dict_merge/derived-v1 is refused for its selected carrier. No independent failed oracle or cleanup violation accompanies this refusal. Restore the named capability and pass the unchanged native case before removing this record.",
-      "owner": "UEA-5E B9",
-      "expires": "2026-12-15"
-    },
-    {
       "unit": "sql-case:aggregate/agg_test_groupby_array",
       "failure": {
         "class": "error_code",
@@ -102,26 +82,6 @@
       "expires": "2026-12-15"
     },
     {
-      "unit": "sql-case:aggregate/agg_test_sum_map",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "Missing installed pure implementation for builtin.scalar/map/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
-      "owner": "B7, B8, I1, I5",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:aggregate/opaque_result_domain_handoff",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "Missing installed pure implementation for builtin.scalar/to_bitmap/(any<T>...)->binary;strict;legacy; owner B8, I1, I5; remove after capability repair and native verification",
-      "owner": "B8, I1, I5",
-      "expires": "2026-12-15"
-    },
-    {
       "unit": "sql-case:analytic/analytic_lead_lag_array_type",
       "failure": {
         "class": "error_code",
@@ -142,16 +102,6 @@
       "expires": "2026-12-15"
     },
     {
-      "unit": "sql-case:analytic/analytic_session_number_gap",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "Missing installed pure implementation for builtin.window/session_number/(any<T>,i64)->i64;strict;legacy; owner B9, I1, I5; remove after capability repair and native verification",
-      "owner": "B9, I1, I5",
-      "expires": "2026-12-15"
-    },
-    {
       "unit": "sql-case:analytic/analytic_test_array_agg_over_window",
       "failure": {
         "class": "error_code",
@@ -159,16 +109,6 @@
       },
       "reason": "Missing installed pure implementation for builtin.aggregate/array_agg/derived-v1; owner B9, I1, I5; remove after capability repair and native verification",
       "owner": "B9, I1, I5",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:analytic/analytic_test_bitmap_union_window",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "Missing installed pure implementation for builtin.scalar/to_bitmap/(any<T>...)->binary;strict;legacy; owner B8, I1, I5; remove after capability repair and native verification",
-      "owner": "B8, I1, I5",
       "expires": "2026-12-15"
     },
     {
@@ -182,16 +122,6 @@
       "expires": "2026-12-15"
     },
     {
-      "unit": "sql-case:analytic/analytic_test_session_number",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "Missing installed pure implementation for builtin.window/session_number/(any<T>,i64)->i64;strict;legacy; owner B9, I1, I5; remove after capability repair and native verification",
-      "owner": "B9, I1, I5",
-      "expires": "2026-12-15"
-    },
-    {
       "unit": "sql-case:analytic/analytic_test_window_functions_with_complex_types",
       "failure": {
         "class": "error_code",
@@ -199,16 +129,6 @@
       },
       "reason": "Missing installed pure implementation for builtin.scalar/map/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
       "owner": "B7, B8, I1, I5",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:analytic/analytic_test_window_hll_bitmap",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "Missing installed pure implementation for builtin.scalar/to_bitmap/(any<T>...)->binary;strict;legacy; owner B8, I1, I5; remove after capability repair and native verification",
-      "owner": "B8, I1, I5",
       "expires": "2026-12-15"
     },
     {
@@ -532,16 +452,6 @@
       "expires": "2026-12-15"
     },
     {
-      "unit": "sql-case:complex-type/complex_test_array_top_n",
-      "failure": {
-        "class": "error_code",
-        "code": "query.execution.unsupported"
-      },
-      "reason": "Unsupported compiled cast from: List(Field { data_type: Null, nullable: true; owner B7, B8, I1, I5; remove after capability repair and native verification Native b722 and TST-G9b1 c30 both refuse unchanged step 3; the typed FE Coordinator projection now reports query.execution.unsupported. Original failure, repair owner and exit requirement remain.",
-      "owner": "B7, B8, I1, I5",
-      "expires": "2026-12-15"
-    },
-    {
       "unit": "sql-case:complex-type/complex_test_arrays_zip",
       "failure": {
         "class": "error_code",
@@ -612,26 +522,6 @@
       "expires": "2026-12-15"
     },
     {
-      "unit": "sql-case:function/bitmap_binary_ops",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "Missing installed pure implementation for builtin.scalar/to_bitmap/(any<T>...)->binary;strict;legacy; owner B8, I1, I5; remove after capability repair and native verification",
-      "owner": "B8, I1, I5",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:function/bitmap_to_base64_bound_result",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "Missing installed pure implementation for builtin.scalar/bitmap_empty/(any<T>...)->binary;strict;legacy; owner B8, I1, I5; remove after capability repair and native verification",
-      "owner": "B8, I1, I5",
-      "expires": "2026-12-15"
-    },
-    {
       "unit": "sql-case:function/concat_array_family",
       "failure": {
         "class": "error_code",
@@ -642,76 +532,6 @@
       "expires": "2026-12-15"
     },
     {
-      "unit": "sql-case:function/function_bitmap_binary",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "Missing installed pure implementation for builtin.scalar/bitmap_empty/(any<T>...)->binary;strict;legacy; owner B8, I1, I5; remove after capability repair and native verification",
-      "owner": "B8, I1, I5",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:function/function_bitmap_replace_if_not_null",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "Missing installed pure implementation for builtin.scalar/bitmap_from_string/(any<T>...)->binary;strict;legacy; owner B8, I1, I5; remove after capability repair and native verification",
-      "owner": "B8, I1, I5",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:function/function_bitmap_sub_bitmap",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "Missing installed pure implementation for builtin.scalar/bitmap_from_string/(any<T>...)->binary;strict;legacy; owner B8, I1, I5; remove after capability repair and native verification",
-      "owner": "B8, I1, I5",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:function/function_bitmap_to_array",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "Missing installed pure implementation for builtin.scalar/bitmap_empty/(any<T>...)->binary;strict;legacy; owner B8, I1, I5; remove after capability repair and native verification",
-      "owner": "B8, I1, I5",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:function/function_bitmap_to_base64",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "Missing installed pure implementation for builtin.scalar/bitmap_to_base64/(binary)->utf8;strict;legacy; owner B8, I1, I5; remove after capability repair and native verification",
-      "owner": "B8, I1, I5",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:function/function_bitmap_to_string",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "Missing installed pure implementation for builtin.scalar/bitmap_from_string/(any<T>...)->binary;strict;legacy; owner B8, I1, I5; remove after capability repair and native verification",
-      "owner": "B8, I1, I5",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:function/function_bitmap_unnest",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "Missing installed pure implementation for builtin.scalar/bitmap_empty/(any<T>...)->binary;strict;legacy; owner B8, I1, I5; remove after capability repair and native verification",
-      "owner": "B8, I1, I5",
-      "expires": "2026-12-15"
-    },
-    {
       "unit": "sql-case:function/function_conditional",
       "failure": {
         "class": "error_code",
@@ -719,16 +539,6 @@
       },
       "reason": "Missing installed pure implementation for builtin.scalar/map/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
       "owner": "B7, B8, I1, I5",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:function/function_iceberg_transform",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "Missing installed pure implementation for builtin.scalar/__iceberg_transform_truncate/(any<T>,i64)->any<T>;strict;legacy; owner B8, I1, I5; remove after capability repair and native verification",
-      "owner": "B8, I1, I5",
       "expires": "2026-12-15"
     },
     {
@@ -1662,16 +1472,6 @@
       "expires": "2026-12-15"
     },
     {
-      "unit": "sql-case:aggregate/agg_test_array_unique_agg",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "The original case reaches statement 9 and the frozen selected overload builtin.scalar/map/dynamic-v1 is refused for its selected carrier. No independent failed oracle or cleanup violation accompanies this refusal. Restore the named capability and pass the unchanged native case before removing this record.",
-      "owner": "UEA-5E B7",
-      "expires": "2026-12-15"
-    },
-    {
       "unit": "sql-case:aggregate/agg_test_distinct_agg",
       "failure": {
         "class": "error_code",
@@ -1778,16 +1578,6 @@
         "code": "sql.analyze.unavailable_implementation"
       },
       "reason": "The original case reaches statement 4 and the frozen selected overload builtin.scalar/array_remove/(list<any<T>>,any<T>)->list<any<T>>;widen;legacy is refused for its selected carrier. No independent failed oracle or cleanup violation accompanies this refusal. Restore the named capability and pass the unchanged native case before removing this record.",
-      "owner": "UEA-5E B7",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:complex-type/complex_test_array_sum_avg",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "The original case reaches statement 4 and the frozen selected overload builtin.scalar/array_sum/dynamic-v1 is refused for its selected carrier. No independent failed oracle or cleanup violation accompanies this refusal. Restore the named capability and pass the unchanged native case before removing this record.",
       "owner": "UEA-5E B7",
       "expires": "2026-12-15"
     },

@@ -18,7 +18,7 @@
 -- Migrated from dev/test/sql/test_cast/T/test_cast_to_datetime
 -- Test Objective:
 -- 1. Validate that CAST of out-of-range integers as DATETIME returns NULL.
--- 2. Covers overflow, zero, one, max uint64, and yearweek() with overflow.
+-- 2. Cover overflow, zero, one, and max uint64.
 -- 3. These values cannot represent valid DATETIME and must return NULL.
 
 -- query 1
@@ -32,6 +32,3 @@ select cast(1 AS DATETIME);
 
 -- query 4
 select cast(CAST('18446744073709551615' AS LARGEINT) AS DATETIME);
-
--- query 5
-select yearweek(CAST('-18446744073709551494' AS LARGEINT));

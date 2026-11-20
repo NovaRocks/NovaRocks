@@ -195,12 +195,7 @@ _col0
 _col0
 [[[[[2,3]]]]]
 
--- query 40
--- legacy
-_col0
-10000
-
--- query 43
+-- query 42
 -- legacy
 l	_col1
 []	[["abcdefghasdasdasirnqwrq"],["abcdefghasdasdasirnqwrq"]]

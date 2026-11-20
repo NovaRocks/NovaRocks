@@ -884,15 +884,8 @@ fn source_filters_aliases_distinct_and_general_query_controls_are_retained() {
 fn literal_target_casts_keep_original_bitmap_and_hll_declarations() {
     use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
     for (domain, source, target_name) in [
-        // The test owns opaque cast preservation, independently of the
-        // unavailable legacy to_bitmap overload. This real aggregate-backed
-        // scalar subquery preserves a concrete Bitmap producer and its domain.
-        (
-            ValueLogicalType::Bitmap,
-            "(SELECT bitmap_agg(10))",
-            "BITMAP",
-        ),
-        (ValueLogicalType::Hll, "hll_hash(10)", "HLL"),
+        (ValueLogicalType::Bitmap, "CAST(NULL AS BITMAP)", "BITMAP"),
+        (ValueLogicalType::Hll, "CAST(NULL AS HLL)", "HLL"),
     ] {
         let declared =
             FunctionValueType::try_with_logical_type(DataType::Binary, true, domain).unwrap();

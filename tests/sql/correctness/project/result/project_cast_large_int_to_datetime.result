@@ -17,8 +17,3 @@ NULL
 -- types	timestamp(6)
 _col0
 NULL
-
--- query 5
--- types	integer
-_col0
-NULL

@@ -23,26 +23,6 @@ use novarocks_failure_contract::{
 };
 use std::{error::Error, fmt, num::NonZeroU16, sync::Arc};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MoneyDataFailure {
-    NonFinite,
-    Overflow,
-}
-impl MoneyDataFailure {
-    pub(super) fn message(self) -> &'static str {
-        match self {
-            Self::NonFinite => "money_format input must be finite",
-            Self::Overflow => "money_format overflow",
-        }
-    }
-}
-impl fmt::Display for MoneyDataFailure {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.message())
-    }
-}
-impl Error for MoneyDataFailure {}
-
 /// Only a real SDK Syntax variant can create this maskable cause. It carries
 /// no input array or execution capability; compiled-size refusals never enter it.
 #[derive(Clone, Debug)]
@@ -60,7 +40,6 @@ impl Error for RegexSyntax {
 
 #[derive(Clone, Copy)]
 pub enum StringDataError<'a> {
-    Money(MoneyDataFailure),
     Regex(&'a RegexSyntax),
     RegexLiteral {
         pattern: &'a str,
@@ -70,7 +49,6 @@ pub enum StringDataError<'a> {
 impl fmt::Display for StringDataError<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Money(source) => source.fmt(f),
             Self::Regex(source) => source.fmt(f),
             Self::RegexLiteral { pattern, source } => write!(
                 f,
@@ -82,7 +60,6 @@ impl fmt::Display for StringDataError<'_> {
 
 #[derive(Debug)]
 enum RequiredStringCause {
-    Money(MoneyDataFailure),
     Regex(RegexSyntax),
     RegexLiteral {
         pattern: novarocks_failure_contract::BoundedDetail,
@@ -98,7 +75,6 @@ struct RequiredStringRowFailure {
 impl fmt::Display for RequiredStringRowFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.cause {
-            RequiredStringCause::Money(source) => source.fmt(f),
             RequiredStringCause::Regex(source) => source.fmt(f),
             RequiredStringCause::RegexLiteral { pattern, source } => write!(
                 f,
@@ -112,7 +88,6 @@ impl fmt::Display for RequiredStringRowFailure {
 impl Error for RequiredStringRowFailure {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         Some(match &self.cause {
-            RequiredStringCause::Money(source) => source as &dyn Error,
             RequiredStringCause::Regex(source)
             | RequiredStringCause::RegexLiteral { source, .. } => source as &dyn Error,
             RequiredStringCause::Journal(source) => source as &dyn Error,
@@ -122,7 +97,6 @@ impl Error for RequiredStringRowFailure {
 impl FailureProjection for RequiredStringRowFailure {
     fn failure_fact(&self) -> FailureFact {
         match &self.cause {
-            RequiredStringCause::Money(_) => DataFailureReason::NumericOutOfRange,
             RequiredStringCause::Regex(_) | RequiredStringCause::RegexLiteral { .. } => {
                 DataFailureReason::InvalidValue
             }
@@ -136,7 +110,6 @@ pub(super) fn required_row(row: usize, source: StringDataError<'_>) -> KernelFai
     KernelFailure::from_domain(RequiredStringRowFailure {
         _row: row,
         cause: match source {
-            StringDataError::Money(source) => RequiredStringCause::Money(source),
             StringDataError::Regex(source) => RequiredStringCause::Regex(source.clone()),
             StringDataError::RegexLiteral { pattern, source } => {
                 RequiredStringCause::RegexLiteral {
@@ -346,23 +319,6 @@ mod properties {
             original
         );
         assert!(failure.to_string().len() <= crate::MAX_ROW_ERROR_MESSAGE_BYTES);
-    }
-    #[test]
-    fn actual_money_refusal_has_numeric_reason_and_keeps_first_value_semantics() {
-        let input: ArrayRef = Arc::new(arrow_array::Float64Array::from(vec![f64::NAN, f64::MAX]));
-        let weak = Arc::downgrade(&input);
-        let failure = evaluate_required(StringOperation::Money, &[input], 2).unwrap_err();
-        assert!(weak.upgrade().is_none());
-        assert_eq!(failure.failure_fact().reason().code(), 41);
-        assert_eq!(
-            original_source::<RequiredStringRowFailure>(&failure)._row,
-            0
-        );
-        assert_eq!(
-            *original_source::<MoneyDataFailure>(&failure),
-            MoneyDataFailure::NonFinite
-        );
-        assert_eq!(failure.to_string(), "money_format input must be finite");
     }
 }
 

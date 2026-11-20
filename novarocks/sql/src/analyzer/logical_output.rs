@@ -885,7 +885,7 @@ mod scalar_domain_tests {
 
     #[test]
     fn m07_window_nested_value_identity_preserves_shape_and_null_siblings() {
-        let sql = "with q as (select [to_bitmap(1)] as b) select first_value(b) over (),last_value(b) over (),lead(b,1,b) over (),lag(b,1,null) over () from q";
+        let sql = "with q as (select [b] as b from t) select first_value(b) over (),last_value(b) over (),lead(b,1,b) over (),lag(b,1,null) over () from q";
         assert_eq!(
             output_domains(sql),
             vec![Some(SqlType::Array(Box::new(SqlType::Bitmap))); 4]
@@ -925,7 +925,7 @@ mod scalar_domain_tests {
             );
         }
         let expression =
-            output_expressions("select first_value(row(null,to_bitmap(1))) over ()").remove(0);
+            output_expressions("select first_value(row(null,b)) over () from t").remove(0);
         let DataType::Struct(fields) = &expression.value_type.data_type() else {
             panic!("struct output")
         };
@@ -938,7 +938,7 @@ mod scalar_domain_tests {
             Some(novarocks_type_contract::ValueLogicalType::Bitmap)
         );
         assert_eq!(
-            output_domains("select first_value(row(null,to_bitmap(1))) over ()"),
+            output_domains("select first_value(row(null,b)) over () from t"),
             vec![None]
         );
         let sql = "with q as (select [parse_json('{}')] as j,['plain'] as s) select lead(j,1,s) over () from q";
@@ -1005,7 +1005,7 @@ mod scalar_domain_tests {
         }
         // A NULL default cannot erase a known sibling in a partial Struct or
         // a nested Map value. SqlType has no complete Null-bearing counterpart.
-        let sql = "with q as (select row(null,map('k',to_bitmap(1))) as r) select lead(r,1,null) over (),lag(r,1,null) over () from q";
+        let sql = "with q as (select row(null,map('k',b)) as r from t) select lead(r,1,null) over (),lag(r,1,null) over () from q";
         for expression in output_expressions(sql) {
             let ExprKind::WindowCall { args, .. } = &original_window(&expression).kind else {
                 unreachable!()
@@ -1388,7 +1388,7 @@ mod scalar_domain_tests {
     #[test]
     fn m07_window_partial_null_value_keeps_known_origin_through_internal_cast() {
         let original =
-            output_expressions("select first_value(row(null,to_bitmap(1))) over ()").remove(0);
+            output_expressions("select first_value(row(null,b)) over () from t").remove(0);
         let ExprKind::WindowCall { args, binding, .. } = &original_window(&original).kind else {
             panic!("window");
         };
@@ -1455,22 +1455,12 @@ mod scalar_domain_tests {
             MAX_SCAN_BATCH_BYTES, MAX_SCAN_BATCH_ROWS, PipelineDopDomain, PlanVersionId,
             ResultValueDomain as D, ScanReadBudget,
         };
-        use novarocks_result_contract::{ScalarOpaqueType as O, ScalarValueType as V};
+        use novarocks_result_contract::ScalarValueType as V;
         for (sql, domain, scalar) in [
             (
                 "select first_value(parse_json('{}')) over ()",
                 D::Json,
                 V::Json,
-            ),
-            (
-                "with q as (select bitmap_agg(1) b) select last_value(b) over () from q",
-                D::Bitmap,
-                V::Opaque(O::Bitmap),
-            ),
-            (
-                "select first_value(hll_hash('x')) over ()",
-                D::Hll,
-                V::Opaque(O::Hll),
             ),
             (
                 "select lead(parse_json('{}'),1,null) over ()",
@@ -1571,7 +1561,7 @@ mod scalar_domain_tests {
     fn m07_projection_occurrences_retain_exact_binary_producer_witnesses() {
         for (sql, expected) in [
             (
-                "select percentile_hash(cast(1 as double)),to_bitmap(1),hll_hash('x')",
+                "select p,b,h from t",
                 vec![
                     Some(SqlType::Percentile),
                     Some(SqlType::Bitmap),
@@ -1579,7 +1569,7 @@ mod scalar_domain_tests {
                 ],
             ),
             (
-                "select percentile_hash(cast(1 as double)) as p,to_bitmap(1) as b,hll_hash('x') as h",
+                "select p as p,b as b,h as h from t",
                 vec![
                     Some(SqlType::Percentile),
                     Some(SqlType::Bitmap),
@@ -1587,11 +1577,11 @@ mod scalar_domain_tests {
                 ],
             ),
             (
-                "with q as (select percentile_hash(cast(1 as double)) as p) select p,p as again from q",
+                "with q as (select p as p from t) select p,p as again from q",
                 vec![Some(SqlType::Percentile); 2],
             ),
             (
-                "select to_bitmap(1) as b,b as again,bitmap_to_binary(b) as raw",
+                "select b as b,b as again,cast(b as varbinary) as raw from t",
                 vec![
                     Some(SqlType::Bitmap),
                     Some(SqlType::Bitmap),
@@ -1599,7 +1589,7 @@ mod scalar_domain_tests {
                 ],
             ),
             (
-                "with q as (select percentile_hash(cast(1 as double)) as p) select cast(p as varbinary) as raw,p from q",
+                "with q as (select p as p from t) select cast(p as varbinary) as raw,p from q",
                 vec![Some(SqlType::Binary), Some(SqlType::Percentile)],
             ),
         ] {
@@ -1630,9 +1620,7 @@ mod scalar_domain_tests {
     #[test]
     fn m07_scalar_exact_aggregate_and_window_producers_forward_domains() {
         assert_eq!(
-            output_domains(
-                "select bitmap_union(to_bitmap(1)),hll_union(hll_hash('x')),percentile_union(percentile_hash(1.0)),any_value(to_bitmap(1))"
-            ),
+            output_domains("select any_value(b),any_value(h),any_value(p),any_value(b) from t"),
             vec![
                 Some(SqlType::Bitmap),
                 Some(SqlType::Hll),
@@ -1641,13 +1629,11 @@ mod scalar_domain_tests {
             ]
         );
         assert_eq!(
-            output_domains("select bitmap_union(to_bitmap(1)) over ()"),
+            output_domains("select first_value(b) over () from t"),
             vec![Some(SqlType::Bitmap)]
         );
         assert_eq!(
-            output_domains(
-                "select array_agg(to_bitmap(1)),map_agg(cast(1 as bigint),hll_hash('x'))"
-            ),
+            output_domains("select array_agg(b),map_agg(cast(1 as bigint),h) from t"),
             vec![
                 Some(SqlType::Array(Box::new(SqlType::Bitmap))),
                 Some(SqlType::Map(
@@ -1662,7 +1648,7 @@ mod scalar_domain_tests {
     fn m07_scalar_nested_wrappers_and_selectors_keep_exact_value_origins() {
         assert_eq!(
             output_domains(
-                "select element_at([to_bitmap(1),null],1),element_at(map(1,hll_hash('x')),1),element_at(map_values(map(1,percentile_hash(1.0))),1),named_struct('value',to_bitmap(1)).value"
+                "select element_at([b,null],1),element_at(map(1,h),1),element_at(map_values(map(1,p)),1),named_struct('value',b).value from t"
             ),
             vec![
                 Some(SqlType::Bitmap),
@@ -1673,7 +1659,7 @@ mod scalar_domain_tests {
         );
         assert_eq!(
             output_domains(
-                "select element_at(array_slice([hll_hash('x')],1),1),element_at(array_sortby([to_bitmap(1)],[1]),1),element_at(map_from_arrays([cast(1 as bigint)],[percentile_hash(1.0)]),1)"
+                "select element_at(array_slice([h],1),1),element_at(array_sortby([b],[1]),1),element_at(map_from_arrays([cast(1 as bigint)],[p]),1) from t"
             ),
             vec![
                 Some(SqlType::Hll),
@@ -1693,9 +1679,8 @@ mod scalar_domain_tests {
 
     #[test]
     fn m07_scalar_null_companion_retains_actual_null_and_independent_marker() {
-        let expressions = output_expressions(
-            "select row(null,to_bitmap(1)),named_struct('missing',null,'value',percentile_hash(1.0))",
-        );
+        let expressions =
+            output_expressions("select row(null,b),named_struct('missing',null,'value',p) from t");
         for (expression, marker, names) in [
             (
                 &expressions[0],
@@ -1719,18 +1704,16 @@ mod scalar_domain_tests {
         }
         // SqlType has no Null member. The exact actual fields carry this proof,
         // rather than a fabricated all-members SqlType or a plain opaque value.
-        assert_eq!(output_domains("select row(null,to_bitmap(1))"), vec![None]);
+        assert_eq!(output_domains("select row(null,b) from t"), vec![None]);
         assert_eq!(
-            output_domains(
-                "select named_struct('missing',null,'value',percentile_hash(1.0)).value"
-            ),
+            output_domains("select named_struct('missing',null,'value',p).value from t"),
             vec![Some(SqlType::Percentile)]
         );
     }
 
     #[test]
     fn typed_scalar_wrapper_preserves_selected_full_result_without_output_adapter() {
-        let expression = output_expressions("select [to_bitmap(1),null]").remove(0);
+        let expression = output_expressions("select [b,null] from t").remove(0);
         let ExprKind::FunctionCall { binding, args, .. } = &expression.kind else {
             panic!("selected original function");
         };
@@ -1762,12 +1745,9 @@ mod scalar_domain_tests {
 
     #[test]
     fn m07_scalar_wrapper_mixed_domains_clear_and_missing_source_markers_refuse() {
-        let error = super::super::analyze(
-            &query("select element_at([to_bitmap(1),hll_hash('x')],1)"),
-            &Catalog,
-            "db",
-        )
-        .unwrap_err();
+        let error =
+            super::super::analyze(&query("select element_at([b,h],1) from t"), &Catalog, "db")
+                .unwrap_err();
         assert!(
             error.to_string().contains("no matching declared overload"),
             "{error}"
@@ -1798,14 +1778,14 @@ mod scalar_domain_tests {
             ]
         );
         assert_eq!(
-            output_domains("select cast(element_at([to_bitmap(1)],1) as varbinary)"),
+            output_domains("select cast(element_at([b],1) as varbinary) from t"),
             vec![Some(SqlType::Binary)]
         );
     }
 
     #[test]
     fn m07_scalar_shadowed_wrapper_binding_cannot_project_child_domain() {
-        let mut expression = output_expressions("select [to_bitmap(1)]").remove(0);
+        let mut expression = output_expressions("select [b] from t").remove(0);
         let ExprKind::FunctionCall { binding, args, .. } = &mut expression.kind else {
             panic!("real complete call");
         };
@@ -1868,7 +1848,7 @@ mod scalar_domain_tests {
     fn m07_container_transforms_forward_exact_leaf_domains() {
         assert_eq!(
             output_domains(
-                "select element_at(array_flatten([[to_bitmap(1)]]),1),element_at(array_repeat(parse_json('{}'),2),1),element_at(__array_struct_subfield([named_struct('payload',to_bitmap(1))],'PAYLOAD'),1)"
+                "select element_at(array_flatten([[b]]),1),element_at(array_repeat(parse_json('{}'),2),1),element_at(__array_struct_subfield([named_struct('payload',b)],'PAYLOAD'),1) from t"
             ),
             vec![
                 Some(SqlType::Bitmap),
@@ -1877,7 +1857,7 @@ mod scalar_domain_tests {
             ]
         );
         let expressions = output_expressions(
-            "select array_flatten([[parse_json('{}')]]),array_repeat(to_bitmap(1),2),__array_struct_subfield([named_struct('payload',parse_json('{}'))],'PAYLOAD')",
+            "select array_flatten([[parse_json('{}')]]),array_repeat(b,2),__array_struct_subfield([named_struct('payload',parse_json('{}'))],'PAYLOAD') from t",
         );
         for (expression, id, marker) in [
             (
@@ -1925,13 +1905,13 @@ mod scalar_domain_tests {
     #[test]
     fn m07_container_zip_preserves_selected_names_nullability_and_partial_null() {
         assert_eq!(
-            output_domains("select arrays_zip([to_bitmap(1)],[parse_json('{}')])"),
+            output_domains("select arrays_zip([b],[parse_json('{}')]) from t"),
             vec![Some(SqlType::Array(Box::new(SqlType::Struct(vec![
                 ("col1".to_owned(), SqlType::Bitmap),
                 ("col2".to_owned(), SqlType::Json),
             ]))))]
         );
-        let sql = "select arrays_zip([row(null,to_bitmap(1))],null)";
+        let sql = "select arrays_zip([row(null,b)],null) from t";
         assert_eq!(output_domains(sql), vec![None]);
         let expression = output_expressions(sql).remove(0);
         let ExprKind::FunctionCall { binding, .. } = &original_transform(&expression).kind else {
@@ -1976,9 +1956,9 @@ mod scalar_domain_tests {
     #[test]
     fn m07_container_transforms_preserve_null_siblings_and_ordinary_values() {
         for sql in [
-            "select array_flatten([[row(null,to_bitmap(1))]])",
-            "select array_repeat(row(null,to_bitmap(1)),2)",
-            "select __array_struct_subfield([named_struct('v',row(null,to_bitmap(1)))],'v')",
+            "select array_flatten([[row(null,b)]]) from t",
+            "select array_repeat(row(null,b),2) from t",
+            "select __array_struct_subfield([named_struct('v',row(null,b))],'v') from t",
         ] {
             assert_eq!(output_domains(sql), vec![None]);
             let expression = output_expressions(sql).remove(0);
@@ -2049,7 +2029,7 @@ mod scalar_domain_tests {
 
     #[test]
     fn m07_container_transform_requires_selected_identity_kind_and_result() {
-        let original = output_expressions("select array_repeat(to_bitmap(1),2)").remove(0);
+        let original = output_expressions("select array_repeat(b,2) from t").remove(0);
         let (binding, args) = match &original.kind {
             ExprKind::FunctionCall { binding, args, .. }
             | ExprKind::WindowCall { binding, args, .. } => (binding, args),
@@ -2125,7 +2105,7 @@ mod scalar_domain_tests {
     #[test]
     fn typed_container_sortby_subfield_keeps_selected_source_and_real_conversion_owner() {
         let expression = output_expressions(
-            "select array_sortby((x)->x.key,[named_struct('key',1,'payload',to_bitmap(1))])",
+            "select array_sortby((x)->x.key,[named_struct('key',1,'payload',b)]) from t",
         )
         .remove(0);
         assert_eq!(
@@ -2259,17 +2239,7 @@ mod scalar_domain_tests {
             NamedScalarField as N, ScalarField as F, ScalarOpaqueType as O, ScalarValueType as V,
         };
         for (sql, domain, scalar) in [
-            (
-                "select element_at([bitmap_agg(1)],1)",
-                D::Bitmap,
-                V::Opaque(O::Bitmap),
-            ),
             ("select element_at([parse_json('{}')],1)", D::Json, V::Json),
-            (
-                "select element_at(element_at([[bitmap_agg(1)]],1),1)",
-                D::Bitmap,
-                V::Opaque(O::Bitmap),
-            ),
             (
                 "select [parse_json('{}')]",
                 D::Plain,
@@ -2374,7 +2344,7 @@ mod scalar_domain_tests {
             }
         }
         let expression = output_expressions(
-            "select __array_struct_subfield([named_struct('Payload',to_bitmap(1))],'pAYLOAD')",
+            "select __array_struct_subfield([named_struct('Payload',b)],'pAYLOAD') from t",
         )
         .remove(0);
         assert_eq!(
@@ -2387,7 +2357,7 @@ mod scalar_domain_tests {
             Some(novarocks_type_contract::ValueLogicalType::Bitmap)
         );
         let expression = output_expressions(
-            "select array_sortby((x)->x.kEY,[named_struct('Key',1,'payload',to_bitmap(1))])",
+            "select array_sortby((x)->x.kEY,[named_struct('Key',1,'payload',b)]) from t",
         )
         .remove(0);
         assert_eq!(

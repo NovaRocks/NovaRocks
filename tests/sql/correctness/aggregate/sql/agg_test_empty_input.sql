@@ -35,38 +35,26 @@ CREATE TABLE "t0" (
 
 -- query 3
 USE ${case_db};
-select percentile_disc(v1,0.5) from t0;
+select max(v1),min(v1) from t0;
 
 -- query 4
 USE ${case_db};
-select percentile_cont(v1,0.5) from t0;
+select max(v1),count(*) from t0;
 
 -- query 5
 USE ${case_db};
-select percentile_disc_lc(v1,0.5) from t0;
+select count(v1) from t0;
 
 -- query 6
 USE ${case_db};
-select max(v1),min(v1) from t0;
-
--- query 7
-USE ${case_db};
-select max(v1),count(*) from t0;
-
--- query 8
-USE ${case_db};
-select count(v1) from t0;
-
--- query 9
-USE ${case_db};
 select count(*) from t0;
 
--- query 10
+-- query 7
 USE ${case_db};
 select count(distinct v1) from t0;
 
 -- name: test_empty_input_not_null_string
--- query 11
+-- query 8
 -- @skip_result_check=true
 USE ${case_db};
 CREATE TABLE "tt0" (
@@ -76,15 +64,15 @@ CREATE TABLE "tt0" (
   "c3" int(11)
 ) WITH (format_version = 3);
 
--- query 12
+-- query 9
 -- @skip_result_check=true
 USE ${case_db};
 insert into tt0 values ROW(1,'test','test',1);
 
--- query 13
+-- query 10
 USE ${case_db};
 select max(c2) from tt0 where 1=0;
 
--- query 14
+-- query 11
 USE ${case_db};
 select min(c2) from tt0 where 1=0;

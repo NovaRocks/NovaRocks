@@ -57,19 +57,6 @@ pub fn repeat_plan<'a>(text: impl FnOnce() -> &'a str, n: i64) -> RepeatPlan<'a>
         bytes: s.len() * (n as usize),
     }
 }
-pub fn space_plan(n: i64) -> RepeatPlan<'static> {
-    if n < 0 {
-        return RepeatPlan::Null;
-    }
-    if (n as u128) > MAX_STRING_BYTES as u128 {
-        return RepeatPlan::Null;
-    }
-    RepeatPlan::Repeated {
-        text: " ",
-        count: n as usize,
-        bytes: n as usize,
-    }
-}
 pub trait RepeatWriter {
     type Error;
     type Output;

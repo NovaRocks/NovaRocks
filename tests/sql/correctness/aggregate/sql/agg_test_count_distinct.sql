@@ -82,11 +82,11 @@ select v2, count(1), count(distinct v1) from test_cc group by v2 order by v2;
 
 -- query 12
 USE ${case_db};
-select v2, bitmap_union_count(to_bitmap(v4)), count(distinct v1) from test_cc group by v2 order by v2;
+select v2, count(distinct v1) from test_cc group by v2 order by v2;
 
 -- query 13
 USE ${case_db};
-select v2, hll_union_agg(hll_hash(v4)), count(distinct v1) from test_cc group by v2 order by v2;
+select v2, count(distinct v1) from test_cc group by v2 order by v2;
 
 -- query 14
 USE ${case_db};

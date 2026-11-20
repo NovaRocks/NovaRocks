@@ -237,19 +237,22 @@ pub(crate) fn bind(
             constant: None,
         })
         .collect::<Vec<_>>();
-    let bound = catalog
-        .metadata()
-        .resolve_bound_user(
-            name,
-            FunctionKind::Aggregate,
-            FunctionBindingRequest {
-                arguments: &request,
-                logical_argument_count: request.len(),
-                expected_result_type: None,
-            },
+    let request = FunctionBindingRequest {
+        arguments: &request,
+        logical_argument_count: request.len(),
+        expected_result_type: None,
+    };
+    let metadata = catalog.metadata();
+    let bound = if name == "multi_distinct_count" {
+        metadata.resolve_distinct_aggregate(
+            novarocks_functions::aggregate_types::DistinctAggregate::Count,
+            request,
             &FixtureControl,
         )
-        .unwrap_or_else(|error| panic!("{name} binds: {error}"));
+    } else {
+        metadata.resolve_bound_user(name, FunctionKind::Aggregate, request, &FixtureControl)
+    }
+    .unwrap_or_else(|error| panic!("{name} binds: {error}"));
     Bound {
         function_id: bound.function_id,
         selected: bound.selected,

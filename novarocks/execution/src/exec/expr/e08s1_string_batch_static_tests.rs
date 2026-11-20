@@ -31,7 +31,6 @@ fn full_binding(name: &str, mask: usize) -> ResolvedFunctionBinding {
     // resolver remains the nullability/result/overload author.
     let types = match name {
         "ascii" | "length" | "char_length" => vec![DataType::Utf8],
-        "space" => vec![DataType::Int64],
         "repeat" => vec![DataType::Utf8, DataType::Int64],
         "lpad" | "rpad" => vec![DataType::Utf8, DataType::Int64, DataType::Utf8],
         _ => unreachable!(),

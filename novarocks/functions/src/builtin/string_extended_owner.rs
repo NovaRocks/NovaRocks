@@ -41,7 +41,6 @@ use crate::{
 pub enum Operation {
     Unhex,
     ToBinary,
-    Money,
     Murmur,
     RegexpReplace,
     RegexpExtract,
@@ -51,7 +50,6 @@ pub(super) fn operation(name: &str) -> Option<Operation> {
     match name {
         "unhex" => Some(Operation::Unhex),
         "to_binary" => Some(Operation::ToBinary),
-        "money_format" => Some(Operation::Money),
         "murmur_hash3_32" => Some(Operation::Murmur),
         "regexp_replace" => Some(Operation::RegexpReplace),
         "regexp_extract" => Some(Operation::RegexpExtract),
@@ -64,10 +62,7 @@ pub(super) fn effects(operation: Operation) -> FunctionEffectDeclaration {
         value_stability: FunctionVolatility::Immutable,
         own_row_error: if matches!(
             operation,
-            Operation::Money
-                | Operation::RegexpReplace
-                | Operation::RegexpExtract
-                | Operation::RegexpExtractAll
+            Operation::RegexpReplace | Operation::RegexpExtract | Operation::RegexpExtractAll
         ) {
             FunctionIntrinsicRowError::MayRaise
         } else {

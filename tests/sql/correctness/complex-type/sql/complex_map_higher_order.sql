@@ -31,17 +31,9 @@
 -- Join-predicate coverage lives in the join suite (join_map_type).
 
 -- query 1
--- map_apply: body is a (new_key, new_value) tuple.
-SELECT map_apply((k, v) -> (k + 100, v * 2), MAP(1, 10, 2, 20)) AS applied;
-
--- query 2
 -- transform_keys: rewrite keys, values pass through.
 SELECT transform_keys((k, v) -> k + 100, MAP(1, 10, 2, 20)) AS keyed;
 
--- query 3
+-- query 2
 -- transform_values: rewrite values, keys pass through.
 SELECT transform_values((k, v) -> v * 2, MAP(1, 10, 2, 20)) AS valued;
-
--- query 4
--- Lambda body in a nested scalar position (wrapped by map_size).
-SELECT map_size(map_apply((k, v) -> (k, v + 1), MAP(1, 10, 2, 20))) AS sz;

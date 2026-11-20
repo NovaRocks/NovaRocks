@@ -188,12 +188,6 @@ impl AggregateSignatureResolver for BuiltinAggregateResolver {
                 binding_enforced: true,
             });
         }
-        if !builtin_aggregate_logical_arguments_match(declaration.name, argument_types) {
-            return Err(FunctionResolutionError::NoMatchingSignature {
-                candidates: 1,
-                binding_enforced: true,
-            });
-        }
         self.resolve_update_signature(&builtin_overload_identity(declaration)?, argument_types)
     }
 
@@ -235,12 +229,6 @@ impl AggregateSignatureResolver for BuiltinAggregateResolver {
         {
             return Err(FunctionResolutionError::BadSignature(format!(
                 "builtin aggregate `{}` does not support additional update channels",
-                declaration.name
-            )));
-        }
-        if !builtin_aggregate_logical_arguments_match(declaration.name, update_argument_types) {
-            return Err(FunctionResolutionError::BadSignature(format!(
-                "builtin aggregate `{}` update arguments do not match its logical type contract",
                 declaration.name
             )));
         }
@@ -442,11 +430,6 @@ impl BuiltinAggregateResolver {
             }
         }
         if !(declaration.min_args..=declaration.max_args).contains(&request.logical_argument_count)
-            || !builtin_aggregate_logical_arguments_match_source(
-                name,
-                arguments,
-                request.logical_argument_count,
-            )
         {
             return Err(FunctionBindingError::NoMatchingOverload);
         }
@@ -579,9 +562,6 @@ fn builtin_aggregate_output_nullable(name: &str) -> bool {
         "count"
             | "count_if"
             | "multi_distinct_count"
-            | "ds_hll_count_distinct"
-            | "ds_hll_count_distinct_merge"
-            | "approx_count_distinct_hll_sketch"
             | "count_state_signed"
             | "sum_state_signed"
             | "avg_state_signed"
@@ -594,19 +574,11 @@ fn builtin_aggregate_output_nullable(name: &str) -> bool {
 
 fn builtin_aggregate_output_domain(name: &str) -> ValueLogicalType {
     match name {
-        "hll_union" | "hll_raw_agg" => ValueLogicalType::Hll,
-        "bitmap_agg" | "bitmap_union" => ValueLogicalType::Bitmap,
-        "percentile_union" => ValueLogicalType::Percentile,
         _ => ValueLogicalType::Physical,
     }
 }
 fn builtin_aggregate_intermediate_domain(name: &str) -> ValueLogicalType {
     match name {
-        "hll_union" | "hll_raw_agg" | "hll_union_agg" => ValueLogicalType::Hll,
-        "bitmap_agg" | "bitmap_union" | "bitmap_union_count" | "bitmap_union_int" => {
-            ValueLogicalType::Bitmap
-        }
-        "percentile_union" => ValueLogicalType::Percentile,
         _ => ValueLogicalType::Physical,
     }
 }
@@ -618,39 +590,8 @@ fn builtin_aggregate_intermediate_nullable(name: &str) -> bool {
 fn builtin_supports_ordered_update_channels(name: &str) -> bool {
     matches!(
         name,
-        "array_agg" | "array_agg_distinct" | "array_unique_agg" | "group_concat" | "string_agg"
+        "array_agg" | "array_agg_distinct" | "group_concat" | "string_agg"
     )
-}
-
-fn builtin_aggregate_logical_arguments_match(name: &str, argument_types: &[DataType]) -> bool {
-    builtin_aggregate_logical_arguments_match_source(
-        name,
-        crate::aggregate_types::AggregateTypeArguments::Arrow(argument_types),
-        argument_types.len(),
-    )
-}
-fn builtin_aggregate_logical_arguments_match_source(
-    name: &str,
-    arguments: crate::aggregate_types::AggregateTypeArguments<'_>,
-    count: usize,
-) -> bool {
-    if name != "dict_merge" {
-        return true;
-    }
-    if count != 2 {
-        return false;
-    }
-    let (Some(value_type), Some(threshold_type)) = (arguments.data_type(0), arguments.data_type(1))
-    else {
-        return false;
-    };
-    let value_matches = matches!(value_type, DataType::Utf8)
-        || matches!(value_type, DataType::List(item) if matches!(item.data_type(), DataType::Utf8));
-    value_matches
-        && matches!(
-            threshold_type,
-            DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
-        )
 }
 
 /// How one builtin aggregate's single overload is spelled.
@@ -685,12 +626,7 @@ const ONE_ARG_AGGREGATES: &[&str] = &[
     "approx_count_distinct",
     "array_agg",
     "array_agg_distinct",
-    "array_unique_agg",
     "avg",
-    "bitmap_agg",
-    "bitmap_union",
-    "bitmap_union_count",
-    "bitmap_union_int",
     "bool_and",
     "bool_or",
     "booland_agg",
@@ -698,19 +634,12 @@ const ONE_ARG_AGGREGATES: &[&str] = &[
     "count_distinct_state",
     "count_distinct_state_merge",
     "count_if",
-    "ds_hll_count_distinct_merge",
-    "ds_hll_count_distinct_union",
-    "hll_raw_agg",
-    "hll_union",
-    "hll_union_agg",
     "max",
     "min",
     "multi_distinct_sum",
     "multi_distinct_avg",
     "ndv",
-    "percentile_union",
     "sum",
-    "sum_map",
     "variance",
     "variance_pop",
     "variance_samp",
@@ -776,7 +705,6 @@ fn builtin_aggregate_declarations() -> Vec<AggregateDeclaration> {
     declarations.extend([
         AggregateDeclaration::ranged("count", 0, 1, "()->i64 | (any)->i64"),
         AggregateDeclaration::ranged("multi_distinct_count", 1, usize::MAX, "(any...)->i64"),
-        AggregateDeclaration::exact("dict_merge", 2, "(utf8|list<utf8>,i8|i16|i32|i64)->utf8"),
         AggregateDeclaration::ranged("group_concat", 2, usize::MAX, "(any,utf8...)->utf8"),
         AggregateDeclaration::ranged("string_agg", 2, usize::MAX, "(any,utf8...)->utf8"),
         AggregateDeclaration::exact("map_agg", 2, "(any,any)->map"),
@@ -787,9 +715,6 @@ fn builtin_aggregate_declarations() -> Vec<AggregateDeclaration> {
         AggregateDeclaration::exact("corr", 2, "(any,any)->f64"),
         AggregateDeclaration::exact("covar_pop", 2, "(any,any)->f64"),
         AggregateDeclaration::exact("covar_samp", 2, "(any,any)->f64"),
-        AggregateDeclaration::exact("percentile_cont", 2, "(any,f64)->any"),
-        AggregateDeclaration::exact("percentile_disc", 2, "(any,f64)->any"),
-        AggregateDeclaration::exact("percentile_disc_lc", 2, "(any,f64)->any"),
         AggregateDeclaration::ranged("percentile_approx", 2, 3, "(any,f64[,i64])->f64"),
         AggregateDeclaration::ranged(
             "percentile_approx_weighted",
@@ -798,14 +723,6 @@ fn builtin_aggregate_declarations() -> Vec<AggregateDeclaration> {
             "(any,i64,f64[,i64])->f64",
         ),
         AggregateDeclaration::ranged("approx_top_k", 1, 3, "(any[,i64[,i64]])->list<struct>"),
-        AggregateDeclaration::ranged("ds_hll_count_distinct", 1, 3, "(any[,i64[,utf8]])->i64"),
-        AggregateDeclaration::ranged(
-            "approx_count_distinct_hll_sketch",
-            1,
-            3,
-            "(any[,i64[,utf8]])->i64",
-        ),
-        AggregateDeclaration::ranged("mann_whitney_u_test", 2, 4, "(any,bool[,utf8[,i64]])->utf8"),
     ]);
     declarations.sort_unstable_by_key(|declaration| declaration.name);
     declarations
@@ -846,92 +763,6 @@ fn validate_builtin_selected_domain(
     arguments: ScalarCarriers<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), FunctionBindingError> {
-    // Empty constructors ignore arguments. Value consumers must have every
-    // argument they actually read, and an input carrier implemented by that
-    // consumer. Do not infer this domain from the legacy Any declaration.
-    let binary_or_null = |ty: &DataType| matches!(ty, DataType::Binary | DataType::Null);
-    let text_or_bytes = |ty: &DataType| {
-        matches!(
-            ty,
-            DataType::Null
-                | DataType::Utf8
-                | DataType::LargeUtf8
-                | DataType::Binary
-                | DataType::LargeBinary
-        )
-    };
-    let numeric = |ty: &DataType| {
-        matches!(
-            ty,
-            DataType::Int8
-                | DataType::Int16
-                | DataType::Int32
-                | DataType::Int64
-                | DataType::Float32
-                | DataType::Float64
-                | DataType::Decimal128(..)
-        ) || novarocks_type_contract::is_largeint_data_type(ty)
-    };
-    let consumed = match name {
-        "aes_encrypt" | "aes_decrypt" => observed_all(arguments.iter(), text_or_bytes, work)?,
-        "bitmap_and" | "bitmap_has_any" => {
-            arguments.len() >= 2 && observed_all(arguments.iter().take(2), binary_or_null, work)?
-        }
-        "bitmap_count" | "bitmap_to_binary" | "bitmap_to_base64" => {
-            arguments.first().is_some_and(binary_or_null)
-        }
-        "bitmap_from_binary" | "bitmap_from_string" => arguments.first().is_some_and(text_or_bytes),
-        "percentile_hash" => arguments.first().is_some_and(numeric),
-        "hll_hash" => arguments.first().is_some_and(|ty| {
-            matches!(
-                ty,
-                DataType::Boolean
-                    | DataType::Int8
-                    | DataType::Int16
-                    | DataType::Int32
-                    | DataType::Int64
-                    | DataType::Float32
-                    | DataType::Float64
-                    | DataType::Date32
-                    | DataType::Timestamp(..)
-                    | DataType::Decimal128(..)
-                    | DataType::FixedSizeBinary(_)
-                    | DataType::Utf8
-                    | DataType::LargeUtf8
-                    | DataType::Binary
-                    | DataType::LargeBinary
-            )
-        }),
-        "to_bitmap" => arguments.first().is_some_and(|ty| {
-            matches!(
-                ty,
-                DataType::Boolean
-                    | DataType::Int8
-                    | DataType::Int16
-                    | DataType::Int32
-                    | DataType::Int64
-                    | DataType::UInt8
-                    | DataType::UInt16
-                    | DataType::UInt32
-                    | DataType::UInt64
-                    | DataType::Utf8
-                    | DataType::LargeUtf8
-                    | DataType::Binary
-                    | DataType::LargeBinary
-            )
-        }),
-        "array_cum_sum" | "array_difference" => {
-            arguments.len() == 1
-                && matches!(&arguments[0], DataType::List(item) if matches!(item.data_type(),
-                DataType::Boolean | DataType::Int8 | DataType::Int16 | DataType::Int32
-                    | DataType::Int64 | DataType::Float32 | DataType::Float64
-                    | DataType::Decimal128(..)))
-        }
-        _ => true,
-    };
-    if !consumed {
-        return Err(FunctionBindingError::NoMatchingOverload);
-    }
     let ordered_item = |ty: &DataType| {
         matches!(
             ty,
@@ -964,11 +795,7 @@ fn validate_builtin_selected_domain(
         "array_filter" => arguments.get(1).is_some_and(|ty| matches!(ty,DataType::List(item) if bool_item(item.data_type()))),
         "array_flatten" => arguments.len()==1 && matches!(&arguments[0],DataType::List(outer) if matches!(outer.data_type(),DataType::List(_))),
         "array_repeat" => arguments.len()==2 && arrow_cast::can_cast_types(&arguments[1],&DataType::Int64),
-        "distinct_map_keys" => arguments.first().is_some_and(|ty| matches!(ty,DataType::Map(entries,_) if
-            matches!(entries.data_type(),DataType::Struct(fields) if fields.len()==2 &&
-                ((ordered_item(fields[0].data_type()) && *fields[0].data_type()!=DataType::Null)
-                    || matches!(fields[0].data_type(),DataType::Decimal256(..)))))),
-        "array_contains_all" | "array_contains_seq" => match (arguments.len(), arguments.get(0), arguments.get(1)) {
+        "array_contains_seq" => match (arguments.len(), arguments.get(0), arguments.get(1)) {
             (2, Some(DataType::List(left)), Some(DataType::List(right))) => {
                 if arrow_cast::can_cast_types(right.data_type(),left.data_type()) {
                     builtin_array_equality_item(left.data_type())
@@ -985,9 +812,7 @@ fn validate_builtin_selected_domain(
         return Err(FunctionBindingError::NoMatchingOverload);
     }
     let ordered = match name {
-        "array_sort" | "array_top_n" | "array_min" | "array_max" => {
-            arguments.first().is_some_and(ordered_list)
-        }
+        "array_sort" | "array_min" | "array_max" => arguments.first().is_some_and(ordered_list),
         "array_sortby" => observed_all(arguments.iter().skip(1), ordered_list, work)?,
         _ => true,
     };
@@ -995,25 +820,6 @@ fn validate_builtin_selected_domain(
         return Err(FunctionBindingError::NoMatchingOverload);
     }
     let admitted = |ty: &DataType| match name {
-        "field" => {
-            matches!(
-                ty,
-                DataType::Null
-                    | DataType::Boolean
-                    | DataType::Int8
-                    | DataType::Int16
-                    | DataType::Int32
-                    | DataType::Int64
-                    | DataType::Float32
-                    | DataType::Float64
-                    | DataType::Decimal128(..)
-                    | DataType::Decimal256(..)
-                    | DataType::Utf8
-                    | DataType::LargeUtf8
-                    | DataType::Date32
-                    | DataType::Timestamp(..)
-            ) || novarocks_type_contract::is_largeint_data_type(ty)
-        }
         "mv_group_row_id" => matches!(
             ty,
             DataType::Boolean
@@ -1028,29 +834,6 @@ fn validate_builtin_selected_domain(
         ),
         // ENCODE_ROW_ID is the installed fingerprint alias. Its owner ignores
         // unencoded carriers; ENCODE_SORT_KEY instead rejects them.
-        "encode_fingerprint_sha256" | "encode_row_id" => true,
-        "encode_sort_key" => {
-            matches!(
-                ty,
-                DataType::Null
-                    | DataType::Boolean
-                    | DataType::Int8
-                    | DataType::Int16
-                    | DataType::Int32
-                    | DataType::Int64
-                    | DataType::UInt8
-                    | DataType::UInt16
-                    | DataType::UInt32
-                    | DataType::UInt64
-                    | DataType::Date32
-                    | DataType::Timestamp(..)
-                    | DataType::Utf8
-                    | DataType::Binary
-                    | DataType::Float32
-                    | DataType::Float64
-                    | DataType::Decimal128(..)
-            ) || matches!(ty, DataType::FixedSizeBinary(16))
-        }
         _ => true,
     };
     if observed_all(arguments.iter(), admitted, work)? {
@@ -1180,12 +963,8 @@ fn scalar_result_nullable_from_types(
             nullable_arguments(0..logical_argument_count, false, &value_nullable, work)?
         }
         // FIELD returns zero for NULL or absence, and a non-NULL first-match index otherwise.
-        "field" => false,
         // A NULL predicate fails the assertion; successful evaluations are true.
         "assert_true"
-        | "encode_row_id"
-        | "encode_fingerprint_sha256"
-        | "encode_sort_key"
         | "mv_group_row_id"
         | "state_all_zero"
         | "count_state_visible"
@@ -1244,11 +1023,9 @@ const TOTAL_SCALAR_FUNCTIONS: &[&str] = &[
     "abs",
     "sign",
     // Measuring a string cannot fail.
-    "bit_length",
     "char_length",
     "character_length",
     "length",
-    "octet_length",
     // The join key hashes every non-null pair and propagates null inputs.
     "join_row_key",
     // Case folding is defined for every string.
@@ -1976,18 +1753,13 @@ impl FunctionBindingResolver for BuiltinUnnestResolver {
 const DYNAMIC_SCALAR_FUNCTIONS: &[&str] = &[
     "__array_literal",
     "__array_struct_subfield",
-    "__iceberg_transform_void",
     "__struct_subfield",
-    "array_avg",
-    "array_cum_sum",
-    "array_difference",
     "array_flatten",
     "array_generate",
     "array_intersect",
     "array_map",
     "array_repeat",
     "array_sort_lambda",
-    "array_sum",
     "arrays_zip",
     "greatest",
     "least",
@@ -1995,10 +1767,7 @@ const DYNAMIC_SCALAR_FUNCTIONS: &[&str] = &[
     "map_concat",
     "map_entries",
     "map_from_arrays",
-    "map_apply",
-    "md5sum_numeric",
     "named_struct",
-    "null_or_empty",
     "round",
     "row",
     "str_to_map",
@@ -2008,7 +1777,6 @@ const DYNAMIC_SCALAR_FUNCTIONS: &[&str] = &[
     "transform_values",
     "try_variant_get",
     "variant_get",
-    "xx_hash3_128",
 ];
 
 /// Names whose result shape is bound from precise arguments or constants.
@@ -2205,39 +1973,7 @@ fn dynamic_scalar_data_type_with_construction<E>(
 ) -> Result<Option<DataType>, super::scalar_construction::Failure<E>> {
     Ok(Some(match name {
         "__array_struct_subfield" => DataType::Null,
-        "__iceberg_transform_void" => DataType::Null,
         "__struct_subfield" => DataType::Null,
-        "array_avg" => match argument_types.first().and_then(list_item_type) {
-            Some(DataType::Decimal128(_, scale)) => {
-                let scale = if scale <= 6 {
-                    scale + 6
-                } else if scale <= 12 {
-                    12
-                } else {
-                    scale
-                };
-                DataType::Decimal128(38, scale)
-            }
-            Some(_) => DataType::Float64,
-            None => DataType::Null,
-        },
-        "array_cum_sum" | "array_difference" => list_type_with_construction(
-            match argument_types.first().and_then(list_item_type) {
-                Some(
-                    DataType::Boolean
-                    | DataType::Int8
-                    | DataType::Int16
-                    | DataType::Int32
-                    | DataType::Int64,
-                ) => DataType::Int64,
-                Some(DataType::Float32 | DataType::Float64 | DataType::Decimal128(_, _)) => {
-                    DataType::Float64
-                }
-                Some(other) => other,
-                None => DataType::Null,
-            },
-            creation,
-        )?,
         "array_flatten" => match argument_types.first() {
             Some(DataType::List(outer)) => match outer.data_type() {
                 DataType::List(inner) => {
@@ -2262,25 +1998,6 @@ fn dynamic_scalar_data_type_with_construction<E>(
             argument_types.first().cloned().unwrap_or(DataType::Null),
             creation,
         )?,
-        "array_sum" => match argument_types.first().and_then(list_item_type) {
-            Some(
-                DataType::Boolean
-                | DataType::Int8
-                | DataType::Int16
-                | DataType::Int32
-                | DataType::Int64,
-            ) => DataType::Int64,
-            Some(DataType::Float32 | DataType::Float64 | DataType::Utf8 | DataType::LargeUtf8) => {
-                DataType::Float64
-            }
-            Some(DataType::Decimal128(_, scale)) => DataType::Decimal128(38, scale),
-            Some(DataType::FixedSizeBinary(width))
-                if width == novarocks_type_contract::LARGEINT_BYTE_WIDTH =>
-            {
-                DataType::FixedSizeBinary(width)
-            }
-            _ => DataType::Null,
-        },
         "arrays_zip" => {
             creation.collected_vec::<Arc<arrow_schema::Field>>(argument_types.len())?;
             let fields = argument_types
@@ -2354,9 +2071,6 @@ fn dynamic_scalar_data_type_with_construction<E>(
             }
             _ => DataType::Null,
         },
-        "md5sum_numeric" | "xx_hash3_128" => {
-            DataType::FixedSizeBinary(novarocks_type_contract::LARGEINT_BYTE_WIDTH)
-        }
         "named_struct" => {
             creation.collected_vec::<Arc<arrow_schema::Field>>(argument_types.len() / 2)?;
             let fields = argument_types
@@ -2373,7 +2087,6 @@ fn dynamic_scalar_data_type_with_construction<E>(
 
             DataType::Struct(fields.into())
         }
-        "null_or_empty" => DataType::Boolean,
         "row" | "struct" => {
             creation.collected_vec::<Arc<arrow_schema::Field>>(argument_types.len())?;
             let fields = argument_types
@@ -2390,7 +2103,7 @@ fn dynamic_scalar_data_type_with_construction<E>(
         }
         "str_to_map" => map_type_with_construction(DataType::Utf8, DataType::Utf8, creation)?,
         "try_variant_get" | "variant_get" => DataType::LargeBinary,
-        "array_map" | "array_sort_lambda" | "map_apply" | "transform_keys" | "transform_values" => {
+        "array_map" | "array_sort_lambda" | "transform_keys" | "transform_values" => {
             return Ok(None);
         }
         _ => return Ok(None),
@@ -2656,7 +2369,7 @@ fn bind_dynamic_scalar_result_with_creation<H>(
             })?;
             DataType::Struct(fields.into())
         }
-        "map_apply" | "transform_keys" | "transform_values" => {
+        "transform_keys" | "transform_values" => {
             let [
                 FunctionArgument::Lambda { result_type, .. },
                 FunctionArgument::Value { value_type, .. },
@@ -2948,7 +2661,7 @@ fn bind_dynamic_scalar_result_with_creation<H>(
                 borrow_creator(&mut creation),
             )?;
         }
-        "map_apply" | "transform_keys" | "transform_values" => {
+        "transform_keys" | "transform_values" => {
             let _ = full_map_items_with_creation(value(1)?, work, borrow_creator(&mut creation))?;
             let Some(FunctionArgument::Lambda { result_type, .. }) = request.arguments.first()
             else {
@@ -3051,26 +2764,6 @@ fn bind_dynamic_scalar_result_with_creation<H>(
                 full_result = projected;
             }
         }
-        "array_sum" | "array_avg" | "array_cum_sum" | "array_difference" => {
-            let item =
-                full_list_item_with_creation(value(0)?, work, borrow_creator(&mut creation))?;
-            let largeint = name == "array_sum" && item.logical_type() == ValueLogicalType::LargeInt;
-            if !largeint
-                && (item.logical_type() != ValueLogicalType::Physical
-                    || matches!(item.data_type(), DataType::FixedSizeBinary(_)))
-            {
-                return Err(FunctionBindingError::NoMatchingOverload.into());
-            }
-            if largeint {
-                full_result = dynamic_value(
-                    full_result.data_type().clone(),
-                    full_result.nullable(),
-                    ValueLogicalType::LargeInt,
-                    work,
-                    borrow_creator(&mut creation),
-                )?;
-            }
-        }
         "variant_get" | "try_variant_get" => {
             // The original runner has two input modes: nominal Variant bytes,
             // or Utf8 JSON text parsed and validated by json_to_variant. Text
@@ -3102,15 +2795,6 @@ fn bind_dynamic_scalar_result_with_creation<H>(
                     borrow_creator(&mut creation),
                 )?;
             }
-        }
-        "md5sum_numeric" | "xx_hash3_128" => {
-            full_result = dynamic_value(
-                full_result.data_type().clone(),
-                full_result.nullable(),
-                ValueLogicalType::LargeInt,
-                work,
-                borrow_creator(&mut creation),
-            )?;
         }
         "array_generate" => {
             let values =
@@ -3342,12 +3026,6 @@ pub(super) fn scalar_definition_parts(
                             .map(super::scalar_rows_owner::effects)
                     }
                     "nullif" => Some(super::nullif_owner::effects()),
-                    name if super::calendar_time_text_owner::operation(name).is_some() => {
-                        Some(super::calendar_time_text_owner::effects(
-                            super::calendar_time_text_owner::operation(name)
-                                .expect("matched TIME source owner"),
-                        ))
-                    }
                     name if super::control_owner::operation(name).is_some() => {
                         Some(super::control_owner::effects(
                             super::control_owner::operation(name)
@@ -3355,7 +3033,6 @@ pub(super) fn scalar_definition_parts(
                         ))
                     }
                     "crc32" => Some(super::crc32_owner::effects()),
-                    "bitmap_to_string" => Some(super::bitmap_to_string_owner::effects()),
                     "parse_json" => Some(super::parse_json_owner::effects()),
                     "__json_canonical_key" => Some(super::json_canonical_owner::effects()),
                     crate::native_like::ESCAPE_FUNCTION_NAME => {
@@ -3363,8 +3040,6 @@ pub(super) fn scalar_definition_parts(
                     }
                     "json_object" => Some(super::json_object_owner::effects()),
                     "array_sortby" => Some(super::array_sortby_owner::effects()),
-                    "percentile_hash" => Some(super::percentile_hash_owner::effects()),
-                    "hll_hash" => Some(super::hll_hash_owner::effects()),
                     name if super::string_measure_owner::operation(name).is_some() => {
                         Some(super::string_measure_owner::effects())
                     }
@@ -3375,10 +3050,6 @@ pub(super) fn scalar_definition_parts(
                         super::string_concat_owner::operation(name)
                             .map(super::string_concat_owner::effects)
                     }
-                    name if super::string_find_in_set_owner::operation(name).is_some() => {
-                        Some(super::string_find_in_set_owner::effects())
-                    }
-                    "field" => Some(super::string_field_owner::effects()),
                     name if super::string_trim_owner::operation(name).is_some() => {
                         Some(super::string_trim_owner::effects())
                     }
@@ -3393,9 +3064,6 @@ pub(super) fn scalar_definition_parts(
                     }
                     name if super::string_substring_owner::operation(name).is_some() => {
                         Some(super::string_substring_owner::effects())
-                    }
-                    name if super::string_substring_index_owner::operation(name).is_some() => {
-                        Some(super::string_substring_index_owner::effects())
                     }
                     name if super::string_left_right_owner::operation(name).is_some() => {
                         Some(super::string_left_right_owner::effects())
@@ -3418,9 +3086,6 @@ pub(super) fn scalar_definition_parts(
                     name if super::string_split_part_owner::operation(name).is_some() => {
                         Some(super::string_split_part_owner::effects())
                     }
-                    name if super::string_append_trailing_owner::operation(name).is_some() => {
-                        Some(super::string_append_trailing_owner::effects())
-                    }
                     name if super::string_sha2_owner::operation(name).is_some() => {
                         Some(super::string_sha2_owner::effects())
                     }
@@ -3433,40 +3098,21 @@ pub(super) fn scalar_definition_parts(
                     name if super::string_hex_owner::operation(name).is_some() => {
                         Some(super::string_hex_owner::effects())
                     }
-                    "md5sum" => Some(super::md5sum_owner::effects()),
                     "split" => Some(super::string_split_owner::effects()),
                     "__map_element_at" => Some(super::map_element_at_owner::effects()),
                     "__array_element_at" => Some(super::array_element_at_owner::effects()),
                     "array_append" => Some(super::array_append_owner::effects()),
-                    name if super::calendar_slice_owner::operation(name).is_some() => {
-                        Some(super::calendar_slice_owner::effects())
-                    }
                     name if super::calendar_unixtime_owner::operation(name).is_some() => {
                         Some(super::calendar_unixtime_owner::effects())
                     }
                     name if super::string_md5_owner::operation(name).is_some() => {
                         Some(super::string_md5_owner::effects())
                     }
-                    name if super::string_sm3_owner::operation(name).is_some() => {
-                        Some(super::string_sm3_owner::effects())
-                    }
-                    name if super::calendar_day_number_owner::operation(name).is_some() => {
-                        Some(super::calendar_day_number_owner::effects())
-                    }
-                    name if super::makedate_owner::operation(name).is_some() => {
-                        Some(super::makedate_owner::effects())
-                    }
                     name if super::map_projection_owner::operation(name).is_some() => {
                         Some(super::map_projection_owner::effects())
                     }
                     name if super::map_size_owner::operation(name) => {
                         Some(super::map_size_owner::effects())
-                    }
-                    name if super::ds_hll_state_owner::operation(name) => {
-                        Some(super::ds_hll_state_owner::effects())
-                    }
-                    name if super::percentile_approx_raw_owner::operation(name) => {
-                        Some(super::percentile_approx_raw_owner::effects())
                     }
                     name if super::array_match_owner::operation(name).is_some() => {
                         Some(super::array_match_owner::effects())
@@ -3497,12 +3143,6 @@ pub(super) fn scalar_definition_parts(
                     }
                     name if super::date_owner::operation(name).is_some() => {
                         Some(super::date_owner::effects())
-                    }
-                    name if super::calendar_to_date_owner::operation(name) => {
-                        Some(super::calendar_to_date_owner::effects())
-                    }
-                    name if super::calendar_sec_to_time_owner::operation(name).is_some() => {
-                        Some(super::calendar_sec_to_time_owner::effects())
                     }
                     "regexp_count" => Some(super::regexp_count_owner::effects()),
                     "parse_url" => Some(super::string_parse_url_owner::effects()),
@@ -3588,19 +3228,11 @@ pub(super) fn dynamic_definition_parts(
     let pure_effects = match name {
         "__array_struct_subfield" => Some(super::array_struct_subfield_owner::effects()),
         "map_entries" => Some(super::map_entries_owner::effects()),
-        name if super::array_difference_owner::operation(name).is_some() => {
-            Some(super::array_difference_owner::effects())
-        }
         "__array_literal" => Some(super::array_literal_owner::effects()),
-        "md5sum_numeric" => Some(super::md5sum_numeric_owner::effects()),
-        "null_or_empty" => Some(super::string_null_or_empty_owner::effects()),
         "truncate" => Some(super::truncate_owner::effects()),
         "round" => Some(super::round_owner::effects()),
         name if super::scalar_extrema_owner::operation(name) => {
             Some(super::scalar_extrema_owner::effects())
-        }
-        name if super::xx_hash3_128_owner::operation(name) => {
-            Some(super::xx_hash3_128_owner::effects())
         }
         _ => None,
     };
@@ -3650,25 +3282,13 @@ pub fn contribute_builtin_functions(
                 super::array_struct_subfield_owner::definition(name, declaration, resolver)?
             }
             "map_entries" => super::map_entries_owner::definition(name, declaration, resolver)?,
-            name if super::array_difference_owner::operation(name).is_some() => {
-                super::array_difference_owner::definition(name, declaration, resolver)?
-            }
             "__array_literal" => {
                 super::array_literal_owner::definition(name, declaration, resolver)?
-            }
-            "md5sum_numeric" => {
-                super::md5sum_numeric_owner::definition(name, declaration, resolver)?
-            }
-            "null_or_empty" => {
-                super::string_null_or_empty_owner::definition(name, declaration, resolver)?
             }
             "truncate" => super::truncate_owner::definition(declaration, resolver)?,
             "round" => super::round_owner::definition(declaration, resolver)?,
             name if super::scalar_extrema_owner::operation(name) => {
                 super::scalar_extrema_owner::definition(name, declaration, resolver)?
-            }
-            name if super::xx_hash3_128_owner::operation(name) => {
-                super::xx_hash3_128_owner::definition(name, declaration, resolver)?
             }
             _ => FunctionDefinition::bound_with_owner(
                 name,
@@ -3718,14 +3338,10 @@ pub fn contribute_builtin_functions(
                 super::scalar_rows_owner::definition(name, declaration, resolver)?
             }
             "nullif" => super::nullif_owner::definition(&name, declaration, resolver)?,
-            name if super::calendar_time_text_owner::operation(name).is_some() => {
-                super::calendar_time_text_owner::definition(name, declaration, resolver)?
-            }
             name if super::control_owner::operation(name).is_some() => {
                 super::control_owner::definition(name, declaration, resolver)?
             }
             "crc32" => super::crc32_owner::definition(declaration, resolver)?,
-            "bitmap_to_string" => super::bitmap_to_string_owner::definition(declaration, resolver)?,
             "parse_json" => super::parse_json_owner::definition(declaration, resolver)?,
             "__json_canonical_key" => {
                 super::json_canonical_owner::definition(declaration, resolver)?
@@ -3735,8 +3351,6 @@ pub fn contribute_builtin_functions(
             }
             "json_object" => super::json_object_owner::definition(declaration, resolver)?,
             "array_sortby" => super::array_sortby_owner::definition(declaration, resolver)?,
-            "percentile_hash" => super::percentile_hash_owner::definition(declaration, resolver)?,
-            "hll_hash" => super::hll_hash_owner::definition(declaration, resolver)?,
             name if super::string_measure_owner::operation(name).is_some() => {
                 super::string_measure_owner::definition(name, declaration, resolver)?
             }
@@ -3746,10 +3360,6 @@ pub fn contribute_builtin_functions(
             name if super::string_concat_owner::operation(name).is_some() => {
                 super::string_concat_owner::definition(name, declaration, resolver)?
             }
-            name if super::string_find_in_set_owner::operation(name).is_some() => {
-                super::string_find_in_set_owner::definition(name, declaration, resolver)?
-            }
-            "field" => super::string_field_owner::definition(&name, declaration, resolver)?,
             name if super::string_trim_owner::operation(name).is_some() => {
                 super::string_trim_owner::definition(name, declaration, resolver)?
             }
@@ -3764,9 +3374,6 @@ pub fn contribute_builtin_functions(
             }
             name if super::string_substring_owner::operation(name).is_some() => {
                 super::string_substring_owner::definition(name, declaration, resolver)?
-            }
-            name if super::string_substring_index_owner::operation(name).is_some() => {
-                super::string_substring_index_owner::definition(name, declaration, resolver)?
             }
             name if super::string_left_right_owner::operation(name).is_some() => {
                 super::string_left_right_owner::definition(name, declaration, resolver)?
@@ -3789,9 +3396,6 @@ pub fn contribute_builtin_functions(
             name if super::string_split_part_owner::operation(name).is_some() => {
                 super::string_split_part_owner::definition(name, declaration, resolver)?
             }
-            name if super::string_append_trailing_owner::operation(name).is_some() => {
-                super::string_append_trailing_owner::definition(name, declaration, resolver)?
-            }
             name if super::string_sha2_owner::operation(name).is_some() => {
                 super::string_sha2_owner::definition(name, declaration, resolver)?
             }
@@ -3804,7 +3408,6 @@ pub fn contribute_builtin_functions(
             name if super::string_hex_owner::operation(name).is_some() => {
                 super::string_hex_owner::definition(name, declaration, resolver)?
             }
-            "md5sum" => super::md5sum_owner::definition(&name, declaration, resolver)?,
             "split" => super::string_split_owner::definition(&name, declaration, resolver)?,
             "__map_element_at" => {
                 super::map_element_at_owner::definition(&name, declaration, resolver)?
@@ -3813,35 +3416,17 @@ pub fn contribute_builtin_functions(
                 super::array_element_at_owner::definition(&name, declaration, resolver)?
             }
             "array_append" => super::array_append_owner::definition(&name, declaration, resolver)?,
-            name if super::calendar_slice_owner::operation(name).is_some() => {
-                super::calendar_slice_owner::definition(name, declaration, resolver)?
-            }
             name if super::calendar_unixtime_owner::operation(name).is_some() => {
                 super::calendar_unixtime_owner::definition(name, declaration, resolver)?
             }
             name if super::string_md5_owner::operation(name).is_some() => {
                 super::string_md5_owner::definition(name, declaration, resolver)?
             }
-            name if super::string_sm3_owner::operation(name).is_some() => {
-                super::string_sm3_owner::definition(name, declaration, resolver)?
-            }
-            name if super::calendar_day_number_owner::operation(name).is_some() => {
-                super::calendar_day_number_owner::definition(name, declaration, resolver)?
-            }
-            name if super::makedate_owner::operation(name).is_some() => {
-                super::makedate_owner::definition(name, declaration, resolver)?
-            }
             name if super::map_projection_owner::operation(name).is_some() => {
                 super::map_projection_owner::definition(name, declaration, resolver)?
             }
             name if super::map_size_owner::operation(name) => {
                 super::map_size_owner::definition(name, declaration, resolver)?
-            }
-            name if super::ds_hll_state_owner::operation(name) => {
-                super::ds_hll_state_owner::definition(name, declaration, resolver)?
-            }
-            name if super::percentile_approx_raw_owner::operation(name) => {
-                super::percentile_approx_raw_owner::definition(name, declaration, resolver)?
             }
             name if super::array_match_owner::operation(name).is_some() => {
                 super::array_match_owner::definition(name, declaration, resolver)?
@@ -3866,12 +3451,6 @@ pub fn contribute_builtin_functions(
             }
             name if super::date_owner::operation(name).is_some() => {
                 super::date_owner::definition(name, declaration, resolver)?
-            }
-            name if super::calendar_to_date_owner::operation(name) => {
-                super::calendar_to_date_owner::definition(name, declaration, resolver)?
-            }
-            name if super::calendar_sec_to_time_owner::operation(name).is_some() => {
-                super::calendar_sec_to_time_owner::definition(name, declaration, resolver)?
             }
             "regexp_count" => super::regexp_count_owner::definition(&name, declaration, resolver)?,
             name if super::string_parse_url_owner::operation(name).is_some() => {
@@ -3938,35 +3517,19 @@ pub fn contribute_builtin_functions(
             [FunctionOverloadDeclaration {
                 effects: match declaration.name {
                     "group_concat" | "string_agg" => Some(super::aggregate_concat_owner::effects()),
-                    "array_agg" | "array_agg_distinct" | "array_unique_agg" => {
+                    "array_agg" | "array_agg_distinct" => {
                         Some(super::aggregate_array_owner::effects())
                     }
-                    "bitmap_union_int" | "bitmap_agg" => {
-                        Some(super::aggregate_bitmap_union_int_owner::effects())
-                    }
-                    "hll_union" | "hll_raw_agg" | "hll_union_agg" => {
-                        Some(super::aggregate_hll_payload_owner::effects())
-                    }
                     "ndv" | "approx_count_distinct" => Some(super::aggregate_hll_owner::effects()),
-                    "ds_hll_count_distinct"
-                    | "approx_count_distinct_hll_sketch"
-                    | "ds_hll_count_distinct_merge"
-                    | "ds_hll_count_distinct_union" => {
-                        Some(super::aggregate_ds_hll_owner::effects())
-                    }
                     "map_agg" => Some(super::aggregate_map_owner::effects()),
                     "count" => Some(super::aggregate_count_owner::effects()),
                     "multi_distinct_count" => {
                         Some(super::aggregate_count_distinct_owner::effects())
                     }
                     "any_value" => Some(super::aggregate_any_value_owner::effects()),
-                    "percentile_approx" | "percentile_approx_weighted" | "percentile_union" => {
+                    "percentile_approx" | "percentile_approx_weighted" => {
                         Some(super::aggregate_approx_percentile_owner::effects())
                     }
-                    "percentile_cont" | "percentile_disc" | "percentile_disc_lc" => {
-                        Some(super::aggregate_percentile_owner::effects())
-                    }
-                    "mann_whitney_u_test" => Some(super::aggregate_mann_whitney_owner::effects()),
                     "approx_top_k" => Some(super::aggregate_top_k_owner::effects()),
                     "max_by" | "min_by" => Some(super::aggregate_by_owner::effects()),
                     "min_n" | "max_n" => Some(super::aggregate_n_owner::effects()),
@@ -4008,10 +3571,7 @@ pub fn contribute_builtin_functions(
         // One resolver in both roles: it answers binding questions and it is
         // the typed signature contract an aggregate is resolved through.
         let resolver = Arc::new(BuiltinAggregateResolver { declaration });
-        if matches!(
-            declaration.name,
-            "array_agg" | "array_agg_distinct" | "array_unique_agg"
-        ) {
+        if matches!(declaration.name, "array_agg" | "array_agg_distinct") {
             builder.register(super::aggregate_array_owner::definition(
                 declaration.name,
                 binding_declaration,
@@ -4021,14 +3581,6 @@ pub fn contribute_builtin_functions(
         }
         if matches!(declaration.name, "group_concat" | "string_agg") {
             builder.register(super::aggregate_concat_owner::definition(
-                declaration.name,
-                binding_declaration,
-                resolver,
-            )?)?;
-            continue;
-        }
-        if declaration.name == "mann_whitney_u_test" {
-            builder.register(super::aggregate_mann_whitney_owner::definition(
                 declaration.name,
                 binding_declaration,
                 resolver,
@@ -4053,7 +3605,7 @@ pub fn contribute_builtin_functions(
         }
         if matches!(
             declaration.name,
-            "percentile_approx" | "percentile_approx_weighted" | "percentile_union"
+            "percentile_approx" | "percentile_approx_weighted"
         ) {
             builder.register(super::aggregate_approx_percentile_owner::definition(
                 declaration.name,
@@ -4064,31 +3616,6 @@ pub fn contribute_builtin_functions(
         }
         if declaration.name == "map_agg" {
             builder.register(super::aggregate_map_owner::definition(
-                declaration.name,
-                binding_declaration,
-                resolver,
-            )?)?;
-            continue;
-        }
-        if matches!(
-            declaration.name,
-            "percentile_cont" | "percentile_disc" | "percentile_disc_lc"
-        ) {
-            builder.register(super::aggregate_percentile_owner::definition(
-                declaration.name,
-                binding_declaration,
-                resolver,
-            )?)?;
-            continue;
-        }
-        if matches!(
-            declaration.name,
-            "ds_hll_count_distinct"
-                | "approx_count_distinct_hll_sketch"
-                | "ds_hll_count_distinct_merge"
-                | "ds_hll_count_distinct_union"
-        ) {
-            builder.register(super::aggregate_ds_hll_owner::definition(
                 declaration.name,
                 binding_declaration,
                 resolver,
@@ -4113,25 +3640,6 @@ pub fn contribute_builtin_functions(
         }
         if declaration.name == "multi_distinct_count" {
             builder.register(super::aggregate_count_distinct_owner::definition(
-                declaration.name,
-                binding_declaration,
-                resolver,
-            )?)?;
-            continue;
-        }
-        if matches!(
-            declaration.name,
-            "hll_union" | "hll_raw_agg" | "hll_union_agg"
-        ) {
-            builder.register(super::aggregate_hll_payload_owner::definition(
-                declaration.name,
-                binding_declaration,
-                resolver,
-            )?)?;
-            continue;
-        }
-        if matches!(declaration.name, "bitmap_union_int" | "bitmap_agg") {
-            builder.register(super::aggregate_bitmap_union_int_owner::definition(
                 declaration.name,
                 binding_declaration,
                 resolver,
@@ -4266,8 +3774,9 @@ pub fn builtin_engine_function_catalog() -> &'static EngineFunctionCatalog {
 pub fn builtin_function_volatility(name: &str) -> FunctionVolatility {
     match name.to_ascii_lowercase().as_str() {
         "rand" | "random" | "uuid" | "sleep" | "now" | "current_timestamp" | "current_date"
-        | "curdate" | "current_time" | "curtime" | "localtime" | "localtimestamp"
-        | "utc_timestamp" | "utc_time" => FunctionVolatility::Volatile,
+        | "curdate" | "current_time" | "curtime" | "localtime" | "localtimestamp" => {
+            FunctionVolatility::Volatile
+        }
         _ => FunctionVolatility::Immutable,
     }
 }
@@ -4925,126 +4434,6 @@ mod tests {
     }
 
     #[test]
-    fn dict_merge_keeps_its_logical_arity() {
-        let catalog = build_builtin_engine_function_catalog().expect("builtin catalog");
-
-        let dict = resolve_bound_aggregate(
-            &catalog,
-            "dict_merge",
-            &[DataType::Utf8, DataType::Int64],
-            &[DataType::Utf8, DataType::Int64],
-            false,
-            crate::binding_test_control(),
-        )
-        .expect("dict_merge logical value and threshold arguments resolve");
-        assert_eq!(dict.argument_types, [DataType::Utf8, DataType::Int64]);
-        assert!(
-            catalog
-                .resolve_selected_aggregate_update_trusted(
-                    "dict_merge",
-                    &dict.overload,
-                    &[DataType::Boolean, DataType::Float64],
-                )
-                .is_err(),
-            "selected update resolution must preserve dict_merge's logical type contract"
-        );
-        let list_utf8 = DataType::List(Arc::new(arrow_schema::Field::new(
-            "item",
-            DataType::Utf8,
-            true,
-        )));
-        for threshold_type in [
-            DataType::Int8,
-            DataType::Int16,
-            DataType::Int32,
-            DataType::Int64,
-        ] {
-            resolve_bound_aggregate(
-                &catalog,
-                "dict_merge",
-                &[list_utf8.clone(), threshold_type.clone()],
-                &[list_utf8.clone(), threshold_type.clone()],
-                false,
-                crate::binding_test_control(),
-            )
-            .unwrap_or_else(|error| {
-                panic!("dict_merge must accept {list_utf8:?}, {threshold_type:?}: {error}")
-            });
-        }
-        assert!(matches!(
-            resolve_bound_aggregate(
-                &catalog,
-                "dict_merge",
-                &[DataType::Utf8],
-                &[DataType::Utf8],
-                false,
-                crate::binding_test_control()
-            ),
-            Err(FunctionResolutionError::NoMatchingSignature { .. })
-        ));
-        assert!(matches!(
-            resolve_bound_aggregate(
-                &catalog,
-                "dict_merge",
-                &[DataType::Boolean, DataType::Float64],
-                &[DataType::Boolean, DataType::Float64],
-                false,
-                crate::binding_test_control()
-            ),
-            Err(FunctionResolutionError::NoMatchingSignature { .. })
-        ));
-        let unsupported_list = DataType::List(Arc::new(arrow_schema::Field::new(
-            "item",
-            DataType::Int64,
-            true,
-        )));
-        assert!(matches!(
-            resolve_bound_aggregate(
-                &catalog,
-                "dict_merge",
-                &[unsupported_list.clone(), DataType::Int64],
-                &[unsupported_list, DataType::Int64],
-                false,
-                crate::binding_test_control()
-            ),
-            Err(FunctionResolutionError::NoMatchingSignature { .. })
-        ));
-    }
-
-    #[test]
-    fn analyzer_macros_are_not_published_as_executable_aggregate_overloads() {
-        let catalog = build_builtin_engine_function_catalog().expect("builtin catalog");
-        for name in ["ds_hll_accumulate", "ds_hll_combine", "ds_hll_estimate"] {
-            assert!(
-                catalog.definition(name, FunctionKind::Aggregate).is_none(),
-                "{name} is analyzer syntax, not an executable aggregate"
-            );
-        }
-        assert!(
-            catalog
-                .definition("ds_hll_count_distinct_state", FunctionKind::Aggregate)
-                .is_none(),
-            "ds_hll_count_distinct_state is an executable scalar"
-        );
-        assert!(
-            catalog
-                .definition("ds_hll_count_distinct_state", FunctionKind::Scalar)
-                .is_some()
-        );
-        assert!(
-            catalog
-                .definition("every", FunctionKind::Aggregate)
-                .is_none(),
-            "EVERY is normalized to the executable BOOL_AND aggregate"
-        );
-        assert!(
-            catalog
-                .definition("bool_and", FunctionKind::Aggregate)
-                .is_some()
-        );
-    }
-
-    #[test]
     fn abs_exact_bindings_freeze_input_and_promoted_output_widths() {
         let catalog = build_builtin_engine_function_catalog().expect("builtin catalog");
         for (input, output) in [
@@ -5179,212 +4568,6 @@ mod tests {
     }
 
     #[test]
-    fn variadic_typed_encoders_close_unsupported_shape_before_optimization() {
-        let catalog = build_builtin_engine_function_catalog().unwrap();
-        for name in ["mv_group_row_id", "encode_sort_key"] {
-            let arguments = [value_argument(
-                DataType::List(Arc::new(arrow_schema::Field::new(
-                    "item",
-                    DataType::Int32,
-                    true,
-                ))),
-                true,
-                None,
-            )];
-            assert!(
-                catalog
-                    .resolve_bound_user(
-                        name,
-                        FunctionKind::Scalar,
-                        FunctionBindingRequest {
-                            expected_result_type: None,
-                            arguments: &arguments,
-                            logical_argument_count: 1
-                        },
-                        crate::binding_test_control()
-                    )
-                    .is_err(),
-                "{name}"
-            );
-        }
-        let arguments = [
-            value_argument(DataType::Int16, true, None),
-            value_argument(DataType::Utf8, true, None),
-        ];
-        for name in ["mv_group_row_id", "encode_sort_key", "encode_row_id"] {
-            let bound = resolve_exact_scalar(&catalog, name, &arguments);
-            assert_eq!(
-                bound.selected.argument_types.as_ref(),
-                arguments
-                    .iter()
-                    .map(FunctionArgument::argument_type)
-                    .collect::<Vec<_>>()
-            );
-            assert_eq!(
-                bound.semantics.intrinsic_row_error,
-                novarocks_type_contract::FunctionIntrinsicRowError::NoRowError
-            );
-        }
-        // Fingerprint intentionally ignores complex inputs in its installed owner.
-        let complex = [value_argument(
-            DataType::List(Arc::new(arrow_schema::Field::new(
-                "item",
-                DataType::Int32,
-                true,
-            ))),
-            true,
-            None,
-        )];
-        let bound = resolve_exact_scalar(&catalog, "encode_fingerprint_sha256", &complex);
-        assert_eq!(
-            bound.semantics.intrinsic_row_error,
-            novarocks_type_contract::FunctionIntrinsicRowError::NoRowError
-        );
-    }
-    #[test]
-    fn fingerprint_alias_preserves_ignored_container_selected_profiles() {
-        use arrow_schema::{Field, Fields};
-        use novarocks_type_contract::FunctionIntrinsicRowError;
-        let catalog = build_builtin_engine_function_catalog().unwrap();
-        let element = Arc::new(
-            Field::new("element", DataType::Int32, true).with_metadata(
-                [("PARQUET:field_id".to_string(), "5".to_string())]
-                    .into_iter()
-                    .collect::<std::collections::HashMap<String, String>>(),
-            ),
-        );
-        let fields: Fields = vec![
-            Arc::new(Field::new("key", DataType::Int32, false)),
-            Arc::new(Field::new("value", DataType::Utf8, true)),
-        ]
-        .into();
-        for ignored in [
-            DataType::List(element),
-            DataType::Struct(fields.clone()),
-            DataType::Map(
-                Arc::new(Field::new("entries", DataType::Struct(fields), false)),
-                false,
-            ),
-        ] {
-            let arguments = [
-                value_argument(DataType::Int64, false, None),
-                value_argument(DataType::Utf8, true, None),
-                value_argument(ignored, true, None),
-            ];
-            for name in ["encode_row_id", "encode_fingerprint_sha256"] {
-                let bound = resolve_exact_scalar(&catalog, name, &arguments);
-                assert_eq!(
-                    bound.selected.argument_types.as_ref(),
-                    arguments
-                        .iter()
-                        .map(FunctionArgument::argument_type)
-                        .collect::<Vec<_>>()
-                );
-                assert_eq!(scalar_result(&bound).data_type().clone(), DataType::Binary);
-                assert_eq!(
-                    bound.semantics.intrinsic_row_error,
-                    FunctionIntrinsicRowError::NoRowError
-                );
-                catalog
-                    .validate_bound(
-                        &bound,
-                        FunctionBindingRequest {
-                            expected_result_type: None,
-                            arguments: &arguments,
-                            logical_argument_count: arguments.len(),
-                        },
-                        crate::binding_test_control(),
-                    )
-                    .unwrap();
-            }
-            assert!(
-                catalog
-                    .resolve_bound_user(
-                        "encode_sort_key",
-                        FunctionKind::Scalar,
-                        FunctionBindingRequest {
-                            expected_result_type: None,
-                            arguments: &arguments,
-                            logical_argument_count: arguments.len()
-                        },
-                        crate::binding_test_control()
-                    )
-                    .is_err()
-            );
-        }
-    }
-
-    #[test]
-    fn field_exact_binding_rejects_containers_and_preserves_comparable_profiles() {
-        use arrow_schema::{Field, Fields, TimeUnit};
-        let catalog = build_builtin_engine_function_catalog().unwrap();
-        let item = Arc::new(Field::new("item", DataType::Int64, true));
-        let fields: Fields = vec![
-            Arc::new(Field::new("key", DataType::Int64, false)),
-            Arc::new(Field::new("value", DataType::Utf8, true)),
-        ]
-        .into();
-        for ty in [
-            DataType::List(item),
-            DataType::Struct(fields.clone()),
-            DataType::Map(
-                Arc::new(Field::new("entries", DataType::Struct(fields), false)),
-                false,
-            ),
-        ] {
-            let arguments = [
-                value_argument(ty.clone(), true, None),
-                value_argument(ty, true, None),
-            ];
-            assert!(
-                catalog
-                    .resolve_bound_user(
-                        "field",
-                        FunctionKind::Scalar,
-                        FunctionBindingRequest {
-                            expected_result_type: None,
-                            arguments: &arguments,
-                            logical_argument_count: 2
-                        },
-                        crate::binding_test_control()
-                    )
-                    .is_err()
-            );
-        }
-        for ty in [
-            DataType::Int8,
-            DataType::Int16,
-            DataType::Int64,
-            DataType::Decimal128(38, 9),
-            DataType::Decimal256(60, 9),
-            DataType::FixedSizeBinary(16),
-            DataType::Utf8,
-            DataType::Date32,
-            DataType::Timestamp(TimeUnit::Microsecond, None),
-        ] {
-            let arguments = [
-                value_argument(ty.clone(), true, None),
-                value_argument(ty, true, None),
-            ];
-            let bound = resolve_exact_scalar(&catalog, "field", &arguments);
-            assert_eq!(
-                bound.semantics.intrinsic_row_error,
-                novarocks_type_contract::FunctionIntrinsicRowError::NoRowError
-            );
-            catalog
-                .validate_bound(
-                    &bound,
-                    FunctionBindingRequest {
-                        expected_result_type: None,
-                        arguments: &arguments,
-                        logical_argument_count: 2,
-                    },
-                    crate::binding_test_control(),
-                )
-                .unwrap();
-        }
-    }
-    #[test]
     fn array_ordering_binding_closes_comparator_domain_and_preserves_sortby_values() {
         let catalog = build_builtin_engine_function_catalog().unwrap();
         let list = |ty| DataType::List(Arc::new(arrow_schema::Field::new("item", ty, true)));
@@ -5415,11 +4598,8 @@ mod tests {
             DataType::Decimal256(60, 2),
             DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into())),
         ] {
-            for name in ["array_sort", "array_min", "array_max", "array_top_n"] {
-                let mut arguments = vec![value_argument(list(ty.clone()), true, None)];
-                if name == "array_top_n" {
-                    arguments.push(value_argument(DataType::Int64, false, None));
-                }
+            for name in ["array_sort", "array_min", "array_max"] {
+                let arguments = vec![value_argument(list(ty.clone()), true, None)];
                 assert!(
                     catalog
                         .resolve_bound_user(
@@ -5495,166 +4675,6 @@ mod tests {
             .unwrap();
     }
 
-    #[test]
-    fn object_value_binding_rejects_unimplemented_carriers_and_missing_inputs() {
-        let catalog = build_builtin_engine_function_catalog().unwrap();
-        let list = DataType::List(Arc::new(arrow_schema::Field::new(
-            "item",
-            DataType::Int64,
-            true,
-        )));
-        for name in [
-            "hll_hash",
-            "percentile_hash",
-            "to_bitmap",
-            "bitmap_count",
-            "bitmap_to_binary",
-            "bitmap_from_binary",
-            "bitmap_from_string",
-            "bitmap_and",
-        ] {
-            for types in [vec![], vec![list.clone()], vec![list.clone(), list.clone()]] {
-                let arguments = types
-                    .into_iter()
-                    .map(|ty| value_argument(ty, true, None))
-                    .collect::<Vec<_>>();
-                assert!(
-                    catalog
-                        .resolve_bound_user(
-                            name,
-                            FunctionKind::Scalar,
-                            FunctionBindingRequest {
-                                expected_result_type: None,
-                                arguments: &arguments,
-                                logical_argument_count: arguments.len()
-                            },
-                            crate::binding_test_control()
-                        )
-                        .is_err(),
-                    "{name}"
-                );
-            }
-        }
-        for (name, ty) in [
-            ("hll_hash", DataType::Date32),
-            ("hll_hash", DataType::FixedSizeBinary(16)),
-            ("percentile_hash", DataType::Decimal128(38, 2)),
-            ("percentile_hash", DataType::FixedSizeBinary(16)),
-            ("to_bitmap", DataType::UInt64),
-            ("to_bitmap", DataType::LargeBinary),
-            ("bitmap_count", DataType::Null),
-            ("bitmap_from_binary", DataType::LargeUtf8),
-        ] {
-            let arguments = [value_argument(ty, true, None)];
-            let bound = resolve_exact_scalar(&catalog, name, &arguments);
-            assert_eq!(
-                bound.semantics.intrinsic_row_error,
-                novarocks_type_contract::FunctionIntrinsicRowError::NoRowError
-            );
-            catalog
-                .validate_bound(
-                    &bound,
-                    FunctionBindingRequest {
-                        expected_result_type: None,
-                        arguments: &arguments,
-                        logical_argument_count: 1,
-                    },
-                    crate::binding_test_control(),
-                )
-                .unwrap();
-        }
-        let arguments = [
-            value_argument(DataType::Binary, true, None),
-            value_argument(DataType::Binary, true, None),
-        ];
-        for name in ["bitmap_and", "bitmap_has_any"] {
-            let bound = resolve_exact_scalar(&catalog, name, &arguments);
-            catalog
-                .validate_bound(
-                    &bound,
-                    FunctionBindingRequest {
-                        expected_result_type: None,
-                        arguments: &arguments,
-                        logical_argument_count: 2,
-                    },
-                    crate::binding_test_control(),
-                )
-                .unwrap();
-        }
-        // These installed constructors consume no row values, including no input.
-        for name in ["bitmap_empty", "percentile_empty"] {
-            let bound = resolve_exact_scalar(&catalog, name, &[]);
-            catalog
-                .validate_bound(
-                    &bound,
-                    FunctionBindingRequest {
-                        expected_result_type: None,
-                        arguments: &[],
-                        logical_argument_count: 0,
-                    },
-                    crate::binding_test_control(),
-                )
-                .unwrap();
-        }
-    }
-
-    #[test]
-    fn dynamic_array_numeric_binding_closes_the_installed_output_domain() {
-        let catalog = build_builtin_engine_function_catalog().unwrap();
-        let list = |ty| DataType::List(Arc::new(arrow_schema::Field::new("item", ty, true)));
-        for name in ["array_cum_sum", "array_difference"] {
-            for ty in [
-                DataType::Null,
-                DataType::Utf8,
-                DataType::Decimal256(60, 2),
-                list(DataType::Int64),
-            ] {
-                let arguments = [value_argument(list(ty), true, None)];
-                assert!(
-                    catalog
-                        .resolve_bound_user(
-                            name,
-                            FunctionKind::Scalar,
-                            FunctionBindingRequest {
-                                expected_result_type: None,
-                                arguments: &arguments,
-                                logical_argument_count: 1
-                            },
-                            crate::binding_test_control()
-                        )
-                        .is_err(),
-                    "{name}"
-                );
-            }
-            for (input, output) in [
-                (DataType::Boolean, DataType::Int64),
-                (DataType::Int16, DataType::Int64),
-                (DataType::Float32, DataType::Float64),
-                (DataType::Decimal128(38, 2), DataType::Float64),
-            ] {
-                let arguments = [value_argument(list(input), true, None)];
-                let bound = resolve_exact_scalar(&catalog, name, &arguments);
-                assert_eq!(
-                    bound.selected.result_type,
-                    FunctionResultType::Scalar(FunctionValueType::from_legacy_declared_projection(
-                        list(output),
-                        true
-                    ))
-                );
-                catalog
-                    .validate_bound(
-                        &bound,
-                        FunctionBindingRequest {
-                            expected_result_type: None,
-                            arguments: &arguments,
-                            logical_argument_count: 1,
-                        },
-                        crate::binding_test_control(),
-                    )
-                    .unwrap();
-            }
-        }
-    }
     #[test]
     fn selected_collection_shapes_preserve_recursive_equality_and_masks() {
         let catalog = build_builtin_engine_function_catalog().unwrap();
@@ -5814,11 +4834,8 @@ mod tests {
     fn selected_array_ordering_retains_null_only_and_empty_profiles() {
         let catalog = build_builtin_engine_function_catalog().unwrap();
         let list = |ty| DataType::List(Arc::new(arrow_schema::Field::new("item", ty, true)));
-        for name in ["array_sort", "array_min", "array_max", "array_top_n"] {
-            let mut arguments = vec![value_argument(list(DataType::Null), true, None)];
-            if name == "array_top_n" {
-                arguments.push(value_argument(DataType::Int64, false, None));
-            }
+        for name in ["array_sort", "array_min", "array_max"] {
+            let arguments = vec![value_argument(list(DataType::Null), true, None)];
             let bound = resolve_exact_scalar(&catalog, name, &arguments);
             catalog
                 .validate_bound(
@@ -5833,11 +4850,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 bound.semantics.intrinsic_row_error,
-                if name == "array_top_n" {
-                    novarocks_type_contract::FunctionIntrinsicRowError::MayRaise
-                } else {
-                    novarocks_type_contract::FunctionIntrinsicRowError::NoRowError
-                }
+                novarocks_type_contract::FunctionIntrinsicRowError::NoRowError
             );
         }
         let arguments = [
@@ -5923,30 +4936,6 @@ pub(super) mod constant_binding_tests;
 /// Construct the actual private DS scalar definition for cross-crate runtime
 /// tests before public catalogue registration. No production caller enables
 /// this feature; binding, metadata and installed declarations keep one author.
-#[cfg(novarocks_dev_controls)]
-pub fn ds_hll_scalar_private_test_catalog() -> EngineFunctionCatalog {
-    let original = build_builtin_engine_function_catalog().unwrap();
-    let (name, signatures) = registry::builtin_scalar_declarations()
-        .into_iter()
-        .find(|(name, _)| name == "ds_hll_count_distinct_state")
-        .expect("original DS scalar declaration");
-    let (declaration, resolver) =
-        scalar_definition_parts(&name, &signatures, FunctionKind::Scalar).unwrap();
-    let mut builder = EngineFunctionCatalogBuilder::new();
-    builder
-        .register(super::ds_hll_state_owner::definition(&name, declaration, resolver).unwrap())
-        .unwrap();
-    // The compact child fixture also borrows the actual installed IF owner.
-    builder
-        .register(
-            original
-                .definition("if", FunctionKind::Scalar)
-                .unwrap()
-                .clone(),
-        )
-        .unwrap();
-    builder.seal().unwrap()
-}
 
 #[cfg(test)]
 pub(super) fn ndv_invocation_data_test_catalog() -> EngineFunctionCatalog {
@@ -5974,117 +4963,6 @@ pub(super) fn ndv_invocation_data_test_catalog() -> EngineFunctionCatalog {
         builder
             .register(
                 super::aggregate_hll_owner::definition(declaration.name, binding, resolver)
-                    .unwrap(),
-            )
-            .unwrap();
-    }
-    builder.seal().unwrap()
-}
-
-#[cfg(test)]
-pub(super) fn ds_hll_host_test_catalog() -> EngineFunctionCatalog {
-    let original = build_builtin_engine_function_catalog().unwrap();
-    let mut builder = EngineFunctionCatalogBuilder::new();
-    for declaration in builtin_aggregate_declarations().into_iter().filter(|item| {
-        matches!(
-            item.name,
-            "ds_hll_count_distinct"
-                | "approx_count_distinct_hll_sketch"
-                | "ds_hll_count_distinct_merge"
-                | "ds_hll_count_distinct_union"
-        )
-    }) {
-        let raw = original
-            .definition(declaration.name, FunctionKind::Aggregate)
-            .unwrap()
-            .binding_declaration()
-            .unwrap();
-        let binding = FunctionBindingDeclaration::try_new(
-            raw.function_id().clone(),
-            raw.kind(),
-            raw.overloads().iter().cloned().map(|mut overload| {
-                overload.effects = Some(super::aggregate_ds_hll_owner::effects());
-                overload
-            }),
-        )
-        .unwrap();
-        builder
-            .register(
-                super::aggregate_ds_hll_owner::definition(
-                    declaration.name,
-                    binding,
-                    Arc::new(BuiltinAggregateResolver { declaration }),
-                )
-                .unwrap(),
-            )
-            .unwrap();
-    }
-    builder.seal().unwrap()
-}
-
-#[cfg(test)]
-pub(super) fn bitmap_union_int_test_catalog() -> EngineFunctionCatalog {
-    let original = build_builtin_engine_function_catalog().unwrap();
-    let mut builder = EngineFunctionCatalogBuilder::new();
-    for declaration in builtin_aggregate_declarations()
-        .into_iter()
-        .filter(|item| matches!(item.name, "bitmap_union_int" | "bitmap_agg"))
-    {
-        let raw = original
-            .definition(declaration.name, FunctionKind::Aggregate)
-            .unwrap()
-            .binding_declaration()
-            .unwrap();
-        let binding = FunctionBindingDeclaration::try_new(
-            raw.function_id().clone(),
-            raw.kind(),
-            raw.overloads().iter().cloned().map(|mut overload| {
-                overload.effects = Some(super::aggregate_bitmap_union_int_owner::effects());
-                overload
-            }),
-        )
-        .unwrap();
-        let resolver = Arc::new(BuiltinAggregateResolver { declaration });
-        builder
-            .register(
-                super::aggregate_bitmap_union_int_owner::definition(
-                    declaration.name,
-                    binding,
-                    resolver,
-                )
-                .unwrap(),
-            )
-            .unwrap();
-    }
-    builder.seal().unwrap()
-}
-
-#[cfg(test)]
-pub(super) fn hll_payload_aggregate_test_catalog() -> EngineFunctionCatalog {
-    let original = build_builtin_engine_function_catalog().unwrap();
-    let mut builder = EngineFunctionCatalogBuilder::new();
-    for declaration in builtin_aggregate_declarations()
-        .into_iter()
-        .filter(|item| matches!(item.name, "hll_union" | "hll_raw_agg" | "hll_union_agg"))
-    {
-        let raw = original
-            .definition(declaration.name, FunctionKind::Aggregate)
-            .unwrap()
-            .binding_declaration()
-            .unwrap();
-        let binding = FunctionBindingDeclaration::try_new(
-            raw.function_id().clone(),
-            raw.kind(),
-            raw.overloads().iter().cloned().map(|mut overload| {
-                overload.effects = Some(super::aggregate_hll_payload_owner::effects());
-                overload
-            }),
-        )
-        .unwrap();
-        let resolver = Arc::new(BuiltinAggregateResolver { declaration });
-        builder
-            .register(
-                super::aggregate_hll_payload_owner::definition(declaration.name, binding, resolver)
                     .unwrap(),
             )
             .unwrap();
@@ -6126,22 +5004,6 @@ pub(super) fn map_agg_private_catalog_for_test() -> EngineFunctionCatalog {
 
 /// Actual complete original declaration and original binding/metadata authors.
 /// This test-only factory enables no public registration or binding fallback.
-#[cfg(novarocks_dev_controls)]
-pub fn percentile_raw_private_test_catalog() -> EngineFunctionCatalog {
-    let (name, signatures) = registry::builtin_scalar_declarations()
-        .into_iter()
-        .find(|(name, _)| name == "percentile_approx_raw")
-        .expect("original ANY2 declaration");
-    let (declaration, resolver) =
-        scalar_definition_parts(&name, &signatures, FunctionKind::Scalar).unwrap();
-    let mut builder = EngineFunctionCatalogBuilder::new();
-    builder
-        .register(
-            super::percentile_approx_raw_owner::definition(&name, declaration, resolver).unwrap(),
-        )
-        .unwrap();
-    builder.seal().unwrap()
-}
 
 /// Existing test entry delegates to the same installed public BY owners.
 #[cfg(any(test, novarocks_dev_controls))]
@@ -6151,41 +5013,6 @@ pub fn by_window_private_test_catalog() -> EngineFunctionCatalog {
 
 /// Private Union capability for original full-domain binding/runtime probes.
 /// This attachment enables no public production registration.
-#[cfg(any(test, novarocks_dev_controls))]
-pub fn percentile_union_private_test_catalog() -> EngineFunctionCatalog {
-    let original = build_builtin_engine_function_catalog().unwrap();
-    let raw = original
-        .definition("percentile_union", FunctionKind::Aggregate)
-        .unwrap()
-        .binding_declaration()
-        .unwrap();
-    let binding = FunctionBindingDeclaration::try_new(
-        raw.function_id().clone(),
-        raw.kind(),
-        raw.overloads().iter().cloned().map(|mut overload| {
-            overload.effects = Some(super::aggregate_approx_percentile_owner::effects());
-            overload
-        }),
-    )
-    .unwrap();
-    let declaration = builtin_aggregate_declarations()
-        .into_iter()
-        .find(|item| item.name == "percentile_union")
-        .unwrap();
-    let resolver = Arc::new(BuiltinAggregateResolver { declaration });
-    let mut builder = EngineFunctionCatalogBuilder::new();
-    builder
-        .register(
-            super::aggregate_approx_percentile_owner::definition(
-                "percentile_union",
-                binding,
-                resolver,
-            )
-            .unwrap(),
-        )
-        .unwrap();
-    builder.seal().unwrap()
-}
 
 /// Cross-crate transport probes borrow the REAL ARRAY dynamic declaration and
 /// resolver. This private catalogue is not a public supported capability.
@@ -6392,125 +5219,6 @@ mod explicit_domain_owner_regression_tests {
                 crate::binding_test_control(),
             )
             .unwrap()
-    }
-    #[test]
-    fn installed_binary_producers_author_complete_domains_and_keep_count_results_plain() {
-        let catalog = build_builtin_engine_function_catalog().unwrap();
-        for (name, args, domain) in [
-            (
-                "sub_bitmap",
-                vec![
-                    value(DataType::Binary),
-                    value(DataType::Int64),
-                    value(DataType::Int64),
-                ],
-                ValueLogicalType::Bitmap,
-            ),
-            (
-                "bitmap_subset_limit",
-                vec![
-                    value(DataType::Binary),
-                    value(DataType::Int64),
-                    value(DataType::Int64),
-                ],
-                ValueLogicalType::Bitmap,
-            ),
-            (
-                "bitmap_subset_in_range",
-                vec![
-                    value(DataType::Binary),
-                    value(DataType::Int64),
-                    value(DataType::Int64),
-                ],
-                ValueLogicalType::Bitmap,
-            ),
-            (
-                "percentile_hash",
-                vec![value(DataType::Float64)],
-                ValueLogicalType::Percentile,
-            ),
-            ("percentile_empty", vec![], ValueLogicalType::Percentile),
-        ] {
-            let bound = resolve(&catalog, name, FunctionKind::Scalar, &args);
-            let FunctionResultType::Scalar(result) = &bound.selected.result_type else {
-                panic!("scalar");
-            };
-            assert_eq!(result.logical_type(), domain, "{name}");
-            assert_eq!(result.data_type(), &DataType::Binary, "{name}");
-            catalog
-                .validate_bound(
-                    &bound,
-                    FunctionBindingRequest {
-                        arguments: &args,
-                        logical_argument_count: args.len(),
-                        expected_result_type: None,
-                    },
-                    crate::binding_test_control(),
-                )
-                .unwrap();
-            if name == "percentile_hash" {
-                assert!(
-                    super::super::percentile_hash_selected::original_native_profile(
-                        &bound.selected,
-                        1
-                    )
-                );
-                let mut changed = bound.selected.clone();
-                changed.result_type =
-                    FunctionResultType::Scalar(FunctionValueType::new(DataType::Binary, true));
-                assert!(
-                    !super::super::percentile_hash_selected::original_native_profile(&changed, 1)
-                );
-            }
-        }
-        let args = [value(DataType::Binary)];
-        let bound = resolve(&catalog, "percentile_union", FunctionKind::Aggregate, &args);
-        let FunctionResultType::Scalar(result) = &bound.selected.result_type else {
-            panic!("aggregate scalar");
-        };
-        assert_eq!(result.logical_type(), ValueLogicalType::Percentile);
-        assert_eq!(
-            bound
-                .selected
-                .aggregate
-                .as_ref()
-                .unwrap()
-                .intermediate_type
-                .logical_type(),
-            ValueLogicalType::Percentile
-        );
-        catalog
-            .validate_bound(
-                &bound,
-                FunctionBindingRequest {
-                    arguments: &args,
-                    logical_argument_count: 1,
-                    expected_result_type: None,
-                },
-                crate::binding_test_control(),
-            )
-            .unwrap();
-        let count = resolve(
-            &catalog,
-            "bitmap_union_count",
-            FunctionKind::Aggregate,
-            &args,
-        );
-        let FunctionResultType::Scalar(result) = &count.selected.result_type else {
-            panic!("count");
-        };
-        assert_eq!(result.logical_type(), ValueLogicalType::Physical);
-        assert_eq!(result.data_type(), &DataType::Int64);
-        assert_eq!(
-            count
-                .selected
-                .aggregate
-                .as_ref()
-                .unwrap()
-                .intermediate_type
-                .logical_type(),
-            ValueLogicalType::Bitmap
-        );
     }
     #[test]
     fn actual_scalar_catalog_replay_refuses_child_null_drift_in_both_directions() {

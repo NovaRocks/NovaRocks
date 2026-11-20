@@ -29,29 +29,24 @@ SELECT row_number() OVER () AS row_number_value;
 SELECT -CAST(1 AS SMALLINT) AS negated, typeof(CAST(1 AS TINYINT)) AS narrow_type;
 
 -- query 5
-SELECT field(1,1,2) AS first_match;
-
--- query 6
 -- @expect_error=no admitted selected scalar implementation
 SELECT array_reverse([1]) WHERE FALSE;
 
--- query 7
+-- query 6
 -- Invalid arity must be rejected even when the row predicate is false.
--- @expect_error=no matching declared overload
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR
 SELECT next_day('2020-01-01') WHERE FALSE;
 
--- query 8
+-- query 7
 -- @expect_error=Unknown function
 SELECT intrinsic_definitely_unknown(1) WHERE FALSE;
 
--- query 9
+-- query 8
 -- @expect_error=no admitted selected scalar implementation
 SELECT map_filter(map(1,10),[TRUE]) WHERE FALSE;
 
--- query 10
+-- query 9
 SELECT array_sort([]) AS sorted_empty,
        array_min([NULL]) IS NULL AS minimum_null,
        array_max([NULL]) IS NULL AS maximum_null,
-       array_top_n([],3) AS top_empty,
-       array_top_n([NULL],3) AS top_single_null,
        array_sortby([[2],[1]],[NULL,NULL]) AS null_key_order;

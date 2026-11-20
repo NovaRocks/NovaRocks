@@ -279,43 +279,19 @@ mod tests {
             Some(1.0),
             None,
         ];
-        let expected_pmod = [
-            Some(0.0),
-            Some(9223372036854775808.0),
-            Some(0.0),
-            Some(9223372036854775808.0),
-            Some(9223372036854775808.0),
-            Some(1.0),
-            Some(2.0),
-            Some(2.0),
-            Some(1.0),
-            Some(1.0),
-            None,
-        ];
-        for (name, expected) in [("mod", expected_mod), ("pmod", expected_pmod)] {
+        for (name, expected) in [("mod", expected_mod)] {
             let result = dense(
                 name,
                 Arc::new(Int64Array::from(left.to_vec())),
                 Arc::new(Int64Array::from(right.to_vec())),
             );
             assert_values(&result, &expected);
-            if name == "pmod" {
-                assert_eq!(
-                    result
-                        .as_any()
-                        .downcast_ref::<Float64Array>()
-                        .unwrap()
-                        .value(1)
-                        .to_bits(),
-                    0x43e0000000000000
-                );
-            }
         }
     }
 
     #[test]
     fn signed_sources_keep_full_integer_precision_until_final_float_output() {
-        for name in ["mod", "pmod"] {
+        for name in ["mod"] {
             let result = dense(
                 name,
                 Arc::new(Int64Array::from(vec![9007199254740993, i64::MAX, i64::MIN])),
@@ -350,30 +326,17 @@ mod tests {
             Some(-f64::MAX),
             Some(0.9),
         ];
-        for (name, expected) in [
-            (
-                "mod",
-                [
-                    Some(-1.0),
-                    Some(1.0),
-                    Some(0.0),
-                    Some(-1.0),
-                    Some(-1.0),
-                    None,
-                ],
-            ),
-            (
-                "pmod",
-                [
-                    Some(2.0),
-                    Some(1.0),
-                    Some(0.0),
-                    Some(9223372036854775808.0),
-                    Some(9223372036854775808.0),
-                    None,
-                ],
-            ),
-        ] {
+        for (name, expected) in [(
+            "mod",
+            [
+                Some(-1.0),
+                Some(1.0),
+                Some(0.0),
+                Some(-1.0),
+                Some(-1.0),
+                None,
+            ],
+        )] {
             assert_values(&floats(name, left.clone(), right.clone()), &expected);
             let result = dense(
                 name,
@@ -386,7 +349,7 @@ mod tests {
 
     #[test]
     fn nonfinite_zero_divisor_and_null_are_successful_null_without_row_errors() {
-        for name in ["mod", "pmod"] {
+        for name in ["mod"] {
             let result = floats(
                 name,
                 vec![
@@ -429,7 +392,7 @@ mod tests {
                 Arc::new(Float64Array::from(vec![f64::from(value)])),
             ]
         }
-        for (name, expected) in [("mod", -1.0), ("pmod", 2.0)] {
+        for (name, expected) in [("mod", -1.0)] {
             let mut pairs = 0;
             for left in profiles(-7) {
                 for right in profiles(3) {
@@ -457,12 +420,12 @@ mod tests {
             FunctionValueType::new(DataType::Int64, false),
             FunctionValueType::new(DataType::Int16, false),
         ];
-        let mut instance = instance("pmod", &types);
+        let mut instance = instance("mod", &types);
         let result = instance
             .evaluate(selection, &arguments, &Control::default())
             .unwrap();
         assert_eq!(result.selection(), selection);
-        assert_values(result.values(), &[Some(2.0), Some(1.0)]);
+        assert_values(result.values(), &[Some(-1.0), Some(-2.0)]);
     }
 
     #[test]
@@ -479,13 +442,13 @@ mod tests {
             FunctionValueType::new(DataType::Int8, false),
             FunctionValueType::new(DataType::Int8, false),
         ];
-        let mut broadcast = instance("pmod", &types);
+        let mut broadcast = instance("mod", &types);
         assert_values(
             broadcast
                 .evaluate(selection, &arguments, &Control::default())
                 .unwrap()
                 .values(),
-            &[Some(2.0), Some(2.0)],
+            &[Some(-1.0), Some(-1.0)],
         );
 
         let left: ArrayRef = Arc::new(Float64Array::from(vec![Some(-8.9), None]));
@@ -552,13 +515,13 @@ mod tests {
             EvaluatedArgument::Constant(&left),
             EvaluatedArgument::Constant(&right),
         ];
-        let mut instance = instance("pmod", &[ty.clone(), ty]);
+        let mut instance = instance("mod", &[ty.clone(), ty]);
         assert_values(
             instance
                 .evaluate(Selection::all(3), &arguments, &Control::default())
                 .unwrap()
                 .values(),
-            &[Some(2.0); 3],
+            &[Some(-1.0); 3],
         );
         assert!(Arc::ptr_eq(left.pool().array(), right.pool().array()));
     }
@@ -572,7 +535,7 @@ mod tests {
             EvaluatedArgument::Scalar(&right),
         ];
         let source = FunctionValueType::new(DataType::Float64, true);
-        for name in ["mod", "pmod"] {
+        for name in ["mod"] {
             let mut instance = instance(name, &[source.clone(), source.clone()]);
             let control = Control::default();
             let result = instance
@@ -599,7 +562,7 @@ mod tests {
         let source = FunctionValueType::new(DataType::Float64, true);
         let types = [source.clone(), source];
         let selection = Selection::all(320);
-        for name in ["mod", "pmod"] {
+        for name in ["mod"] {
             let mut baseline = instance(name, &types);
             let control = Control::default();
             baseline.evaluate(selection, &arguments, &control).unwrap();
@@ -649,7 +612,7 @@ mod tests {
             EvaluatedArgument::Scalar(&right),
         ];
         let source = FunctionValueType::new(DataType::Float64, true);
-        for name in ["mod", "pmod"] {
+        for name in ["mod"] {
             let mut instance = instance(name, &[source.clone(), source.clone()]);
             let control = Control::default();
             assert_eq!(
@@ -679,7 +642,7 @@ mod tests {
             FunctionValueType::new(DataType::Int64, false),
         ];
         let selection = Selection::all(513);
-        for name in ["mod", "pmod"] {
+        for name in ["mod"] {
             let mut baseline = instance(name, &types);
             let control = Control::default();
             baseline.evaluate(selection, &arguments, &control).unwrap();

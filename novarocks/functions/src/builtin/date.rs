@@ -43,7 +43,3 @@ use std::sync::Arc;
 #[cfg(test)]
 #[path = "date_tests.rs"]
 mod tests;
-
-#[cfg(test)]
-#[path = "calendar_to_date_tests.rs"]
-mod to_date_tests;

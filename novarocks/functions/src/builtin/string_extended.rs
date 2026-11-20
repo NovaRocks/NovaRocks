@@ -22,7 +22,7 @@ pub use super::murmur::{
     format_float64_for_varchar, format_timestamp_for_varchar, murmur_hash3_32,
 };
 pub use super::string_extended_owner::Operation as StringOperation;
-pub use super::string_failure::{MoneyDataFailure, RegexSyntax, StringDataError};
+pub use super::string_failure::{RegexSyntax, StringDataError};
 use crate::{
     EvaluatedArgument, FunctionArgumentType, KernelEvaluationControl, KernelFailure, RowDataError,
     ScalarCallContract, ScalarCallInput, SelectedValues, Selection,
@@ -45,7 +45,7 @@ pub(super) fn validate_profile(
 ) -> Result<(), KernelFailure> {
     let types = &contract.selected().argument_types;
     let arity = match op {
-        Operation::Unhex | Operation::Money => types.len() == 1,
+        Operation::Unhex => types.len() == 1,
         Operation::ToBinary => types.len() == 1 || types.len() == 2,
         Operation::Murmur => !types.is_empty(),
         Operation::RegexpReplace | Operation::RegexpExtract | Operation::RegexpExtractAll => {
@@ -74,13 +74,6 @@ pub(super) fn validate_profile(
                     } else {
                         ty.data_type() == &DataType::Int32
                     }
-            }
-            Operation::Money => {
-                physical
-                    && matches!(
-                        ty.data_type(),
-                        DataType::Int64 | DataType::Float64 | DataType::Decimal128(..)
-                    )
             }
             Operation::Murmur => {
                 (physical
@@ -117,10 +110,9 @@ pub(super) fn validate_profile(
     }
     let expected = match op {
         Operation::Unhex | Operation::ToBinary => DataType::Binary,
-        Operation::Money
-        | Operation::RegexpReplace
-        | Operation::RegexpExtract
-        | Operation::RegexpExtractAll => DataType::Utf8,
+        Operation::RegexpReplace | Operation::RegexpExtract | Operation::RegexpExtractAll => {
+            DataType::Utf8
+        }
         Operation::Murmur => DataType::Int32,
     };
     step()?;
@@ -147,7 +139,6 @@ fn reserve<T>(n: usize, work: &mut EvaluationCheckpoints<'_>) -> Result<Vec<T>, 
 pub(super) enum Row {
     Null,
     Value,
-    Error(MoneyDataFailure),
 }
 /// Carrier-neutral shared arguments. The shell owns binding and projection.
 /// Optional adapter for promoting a producer-declared string row failure.
@@ -230,7 +221,6 @@ fn visit_row(
             };
             super::string_binary::visit(text, format, matches!(op, Operation::Unhex), work, emit)
         }
-        Operation::Money => super::string_money::visit(array.as_ref(), row, work, emit),
         Operation::RegexpReplace => {
             Err(internal("regexp_replace must use its shared selected core"))
         }
@@ -358,9 +348,6 @@ fn evaluate_murmur_selected<'a>(
                     values.push(0);
                     has_null = true;
                 }
-                Row::Error(_) => {
-                    return Err(internal("Murmur3 violated its outer-only failure contract"));
-                }
             }
             work.step()?;
         }
@@ -408,16 +395,14 @@ pub fn evaluate_selected<'a>(
     let mut work = EvaluationCheckpoints::new(control);
     let target = match op {
         Operation::Unhex | Operation::ToBinary => DataType::Binary,
-        Operation::Money
-        | Operation::RegexpReplace
-        | Operation::RegexpExtract
-        | Operation::RegexpExtractAll => DataType::Utf8,
+        Operation::RegexpReplace | Operation::RegexpExtract | Operation::RegexpExtractAll => {
+            DataType::Utf8
+        }
         Operation::Murmur => DataType::Int32,
     };
     let result = (|| {
         let selection = input.selection();
         let mut total = 0usize;
-        let mut errors = 0usize;
         for (ordinal, batch) in selection.iter().enumerate() {
             let mut length = 0usize;
             let row = visit_row(op, &input, ordinal, batch, &mut work, |_| {
@@ -432,12 +417,6 @@ pub fn evaluate_selected<'a>(
                         .checked_add(length)
                         .ok_or(KernelFailure::ResourceExhausted)?
                 }
-                Row::Error(message) => {
-                    if let Some(boundary) = input.error_boundary {
-                        boundary(ordinal, StringDataError::Money(message))?;
-                    }
-                    errors += 1;
-                }
                 Row::Null => {}
             }
             work.step()?;
@@ -451,7 +430,7 @@ pub fn evaluate_selected<'a>(
                 .ok_or(KernelFailure::ResourceExhausted)?,
             &mut work,
         )?;
-        let mut row_errors = reserve::<RowDataError>(errors, &mut work)?;
+        let row_errors = reserve::<RowDataError>(0, &mut work)?;
         work.flush()?;
         let mut validity = BooleanBufferBuilder::new(selection.len());
         work.flush()?;
@@ -470,21 +449,12 @@ pub fn evaluate_selected<'a>(
             if !valid {
                 bytes.truncate(start);
             }
-            if let Row::Error(message) = row {
-                work.flush()?;
-                row_errors.push(RowDataError::with_reason(
-                    ordinal,
-                    crate::DataFailureReason::NumericOutOfRange,
-                    message.message(),
-                ));
-                work.flush()?;
-            }
             validity.append(valid);
             has_null |= !valid;
             offsets.push(i32::try_from(bytes.len()).map_err(|_| KernelFailure::ResourceExhausted)?);
             work.step()?;
         }
-        if bytes.len() != total || row_errors.len() != errors {
+        if bytes.len() != total {
             return Err(internal("extended string measured output extent differs"));
         }
         work.flush()?;
@@ -494,14 +464,13 @@ pub fn evaluate_selected<'a>(
                     "fixed-width Murmur3 reached variable-width output",
                 ));
             }
-            Operation::Money
-            | Operation::RegexpReplace
-            | Operation::RegexpExtract
-            | Operation::RegexpExtractAll => Arc::new(StringArray::new(
-                OffsetBuffer::new(offsets.into()),
-                Buffer::from(bytes),
-                has_null.then(|| NullBuffer::new(validity.finish())),
-            )),
+            Operation::RegexpReplace | Operation::RegexpExtract | Operation::RegexpExtractAll => {
+                Arc::new(StringArray::new(
+                    OffsetBuffer::new(offsets.into()),
+                    Buffer::from(bytes),
+                    has_null.then(|| NullBuffer::new(validity.finish())),
+                ))
+            }
             _ => Arc::new(BinaryArray::new(
                 OffsetBuffer::new(offsets.into()),
                 Buffer::from(bytes),
@@ -590,7 +559,7 @@ pub fn murmur_supported_carrier(ty: &DataType) -> bool {
 #[cfg(test)]
 mod shared_legacy_tests {
     use super::*;
-    use arrow_array::{Float64Array, Int32Array, StructArray};
+    use arrow_array::{Int32Array, StructArray};
     use arrow_schema::Field;
 
     #[test]
@@ -642,17 +611,6 @@ mod shared_legacy_tests {
         let binary = output.as_any().downcast_ref::<BinaryArray>().unwrap();
         assert_eq!(binary.value(0), [0, 255]);
         assert!(binary.is_null(1));
-    }
-
-    #[test]
-    fn shared_string_legacy_money_failfast_keeps_first_original_error() {
-        let input: ArrayRef = Arc::new(Float64Array::from(vec![f64::NAN, f64::MAX]));
-        assert_eq!(
-            evaluate_required(StringOperation::Money, &[input], 2)
-                .unwrap_err()
-                .to_string(),
-            "money_format input must be finite"
-        );
     }
 }
 
