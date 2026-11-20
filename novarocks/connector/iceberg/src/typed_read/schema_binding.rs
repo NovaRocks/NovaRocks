@@ -37,7 +37,13 @@
 //! There is no name fallback, no ordinal fallback, and no implicit widening
 //! outside the promotions Iceberg actually defines.
 
+mod adaptation;
 pub(crate) mod mutation_partition;
+#[allow(
+    dead_code,
+    reason = "ADD FILES registration consumes the preview in P08"
+)]
+pub(crate) mod registration;
 pub(crate) use mutation_partition::MutationMetadataSchema;
 
 use std::collections::HashMap;
@@ -53,6 +59,9 @@ use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use crate::default_value::{
     ICEBERG_INITIAL_DEFAULT_META_KEY, build_iceberg_default_array, literal_to_constant_array,
 };
+use crate::file_reader::field_identity::{
+    FieldIdentityError, original_field_id_coverage, resolve_arrow_fields,
+};
 use crate::file_reader::variant::collapse_variant_struct_to_largebinary;
 use crate::iceberg::spec::{
     Literal, NameMapping, NestedField, PartitionSpec, PrimitiveType, Schema, Struct, Transform,
@@ -64,10 +73,9 @@ use crate::row_lineage_synth::{
     ICEBERG_ROW_ID_COL, ICEBERG_ROW_POS_COL, IcebergRowLineageColumn, StoredRowLineageIndices,
     stored_row_lineage_indices, synthesize_last_updated_sequence_number, synthesize_row_id,
 };
-use crate::schema_mapping::{
-    apply_name_mapping_to_schema, field_id_for_arrow_field, schema_field_id_coverage,
-    sql_read_schema_from_iceberg, unidentified_fields_are_only_opaque_variants,
-};
+use crate::schema_mapping::{field_id_for_arrow_field, sql_read_schema_from_iceberg};
+
+use adaptation::{AdaptationError, FieldAdaptation};
 
 use super::column_handle::{IcebergColumnHandle, corrupt, invalid, parse_type, unsupported};
 
@@ -328,7 +336,16 @@ pub struct IcebergSchemaBinding {
     columns: Vec<IcebergBoundColumn>,
     physical_base_field_ids: Vec<i32>,
     coverage: FileFieldIdCoverage,
-    name_mapping: Option<Arc<NameMapping>>,
+    root_projection: Vec<usize>,
+    reader_schema: SchemaRef,
+    physical: HashMap<i32, BoundPhysicalRoot>,
+    projected_dereferences: Vec<Vec<usize>>,
+}
+
+#[derive(Clone, Debug)]
+struct BoundPhysicalRoot {
+    slot: usize,
+    adaptation: FieldAdaptation,
 }
 
 impl IcebergSchemaBinding {
@@ -337,13 +354,17 @@ impl IcebergSchemaBinding {
     }
 
     /// The base-column field IDs this binding reads, ascending and deduped.
-    /// This is exactly the projection the physical reader must open.
     pub fn physical_base_field_ids(&self) -> &[i32] {
         &self.physical_base_field_ids
     }
 
     pub const fn coverage(&self) -> FileFieldIdCoverage {
         self.coverage
+    }
+
+    /// File root indices, in the order emitted by the Parquet reader.
+    pub(crate) fn root_projection(&self) -> &[usize] {
+        &self.root_projection
     }
 
     /// Whether any bound column reads a physical field at all.
@@ -369,8 +390,21 @@ impl IcebergSchemaBinding {
 
     /// Best-effort retained size of the binding itself.
     pub fn retained_size_in_bytes(&self) -> u64 {
-        let mut retained =
-            size_of::<Self>() + self.physical_base_field_ids.len() * size_of::<i32>();
+        let mut retained = size_of::<Self>()
+            + self.physical_base_field_ids.capacity() * size_of::<i32>()
+            + self.root_projection.capacity() * size_of::<usize>()
+            + self.projected_dereferences.capacity() * size_of::<Vec<usize>>()
+            + self
+                .projected_dereferences
+                .iter()
+                .map(|slots| slots.capacity() * size_of::<usize>())
+                .sum::<usize>()
+            + self.physical.capacity() * size_of::<(i32, BoundPhysicalRoot)>()
+            + self
+                .physical
+                .values()
+                .map(|root| root.adaptation.retained_heap_bytes())
+                .sum::<usize>();
         for column in &self.columns {
             retained += size_of::<IcebergBoundColumn>()
                 + column.handle.base_type_json().len()
@@ -401,38 +435,30 @@ impl IcebergSchemaBinding {
                 positions.len()
             )));
         }
-        // The physical schema is re-indexed per batch because a reader may
-        // legally reorder or narrow its output; the binding decisions
-        // themselves never change.
-        let physical = PhysicalIndex::build(&batch.schema(), self.name_mapping.as_deref())?;
+        if batch.schema_ref().fields() != self.reader_schema.fields() {
+            return Err(corrupt(format!(
+                "iceberg data file {} returned a different reader projection than was bound",
+                facts.path
+            )));
+        }
+        let mut materialized_roots = vec![None; self.root_projection.len()];
 
         let mut columns = Vec::with_capacity(self.columns.len());
-        for bound in &self.columns {
+        for (bound, dereference) in self.columns.iter().zip(&self.projected_dereferences) {
             columns.push(match &bound.source {
-                IcebergColumnSource::Physical {
-                    base_field_id,
-                    dereference,
-                } => {
-                    let index = physical.index_of(*base_field_id).ok_or_else(|| {
-                        corrupt(format!(
-                            "iceberg data file {} no longer exposes field id {base_field_id}",
-                            facts.path
-                        ))
-                    })?;
-                    let base = adapt_array(
-                        batch.column(index),
-                        bound.base_target.as_ref(),
-                        facts.path,
-                        matches!(
-                            super::column_handle::parse_type(
-                                bound.handle.base_type_json(),
-                                "base_type_json"
-                            )?,
-                            Type::Variant(_)
-                        ),
+                IcebergColumnSource::Physical { base_field_id, .. } => {
+                    let root = &self.physical[base_field_id];
+                    let value = &mut materialized_roots[root.slot];
+                    if value.is_none() {
+                        *value = Some(
+                            root.adaptation
+                                .materialize(batch.column(root.slot), facts.path)?,
+                        );
+                    }
+                    let value = dereference_struct_path(
+                        value.as_ref().expect("the bound root was materialized"),
+                        dereference,
                     )?;
-                    let value =
-                        dereference_struct_path(&base, bound.base_target.as_ref(), dereference)?;
                     match bound.handle.scalar_integer_domain() {
                         Some(domain) => domain.array(&value)?,
                         None => value,
@@ -507,15 +533,17 @@ pub fn bind_scan_columns(
     // Name mapping repairs a legacy file, so it is consulted only when the
     // file identifies nothing. Applying it to a partly identified file would
     // be a rename, which Iceberg's name mapping is explicitly not.
-    let name_mapping = match (coverage, request.name_mapping) {
-        (FileFieldIdCoverage::None, Some(mapping)) => Some(mapping),
-        (FileFieldIdCoverage::None, None) | (FileFieldIdCoverage::Complete, _) => None,
-    };
-    let physical = PhysicalIndex::build(request.file_schema, None)?;
-    let mapped_physical = match name_mapping.as_deref() {
-        Some(mapping) => Some(PhysicalIndex::build(request.file_schema, Some(mapping))?),
-        None => None,
-    };
+    let physical = PhysicalIndex::build(request.file_schema)?;
+    let resolved_schema = resolve_arrow_fields(
+        request.file_schema,
+        coverage,
+        request.name_mapping.as_deref(),
+        |_, _| {},
+    )?;
+    let mapped_physical = (!Arc::ptr_eq(&resolved_schema, request.file_schema))
+        .then(|| PhysicalIndex::build(&resolved_schema))
+        .transpose()?;
+    let resolved_index = mapped_physical.as_ref().unwrap_or(&physical);
 
     let read_schema = annotated_read_schema(request.table_schema)?;
     let identity_partitions = identity_partition_values(
@@ -574,11 +602,63 @@ pub fn bind_scan_columns(
     }
     physical_base_field_ids.sort_unstable();
 
+    // FS reads whole Parquet roots in physical order. These slots index the
+    // projected Arrow batch; they need not be the original file indices.
+    let mut root_projection = physical_base_field_ids
+        .iter()
+        .map(|id| {
+            resolved_index.index_of(*id).ok_or_else(|| {
+                corrupt(format!(
+                    "iceberg data file does not expose bound field id {id}"
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    root_projection.sort_unstable();
+    let reader_schema = Arc::new(
+        request
+            .file_schema
+            .project(&root_projection)
+            .map_err(|error| corrupt(format!("iceberg reader projection: {error}")))?,
+    );
+    let mut physical = HashMap::new();
+    for bound in &columns {
+        if let IcebergColumnSource::Physical { base_field_id, .. } = bound.source
+            && let std::collections::hash_map::Entry::Vacant(entry) = physical.entry(base_field_id)
+        {
+            let original_slot = resolved_index
+                .index_of(base_field_id)
+                .expect("a bound physical root was projected");
+            let slot = root_projection
+                .binary_search(&original_slot)
+                .expect("the projected physical root is present");
+            let adaptation = FieldAdaptation::bind(
+                Some(resolved_schema.field(original_slot)),
+                &bound.base_target,
+            )
+            .map_err(AdaptationError::into_read_error)?;
+            entry.insert(BoundPhysicalRoot { slot, adaptation });
+        }
+    }
+
+    let projected_dereferences = columns
+        .iter()
+        .map(|bound| match &bound.source {
+            IcebergColumnSource::Physical { dereference, .. } => {
+                bind_struct_dereference(&bound.base_target, dereference)
+            }
+            _ => Ok(Vec::new()),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
     Ok(IcebergSchemaBinding {
         columns,
         physical_base_field_ids,
         coverage,
-        name_mapping,
+        root_projection,
+        reader_schema,
+        physical,
+        projected_dereferences,
     })
 }
 
@@ -591,22 +671,7 @@ pub fn bind_scan_columns(
 pub fn file_field_id_coverage(
     file_schema: &SchemaRef,
 ) -> Result<FileFieldIdCoverage, ConnectorError> {
-    let (identified, total) = schema_field_id_coverage(file_schema)
-        .map_err(|error| corrupt(format!("iceberg data file schema: {error}")))?;
-    if identified == total {
-        return Ok(FileFieldIdCoverage::Complete);
-    }
-    if identified == 0 {
-        return Ok(FileFieldIdCoverage::None);
-    }
-    if unidentified_fields_are_only_opaque_variants(file_schema)
-        .map_err(|error| corrupt(format!("iceberg data file schema: {error}")))?
-    {
-        return Ok(FileFieldIdCoverage::Complete);
-    }
-    Err(corrupt(
-        "iceberg data file mixes fields with and without field ids",
-    ))
+    original_field_id_coverage(file_schema).map_err(FieldIdentityError::into_read_error)
 }
 
 /// Decide whether a physical carrier may become a target carrier at all.
@@ -774,15 +839,7 @@ struct PhysicalIndex {
 }
 
 impl PhysicalIndex {
-    fn build(
-        schema: &SchemaRef,
-        name_mapping: Option<&NameMapping>,
-    ) -> Result<Self, ConnectorError> {
-        let schema = match name_mapping {
-            None => Arc::clone(schema),
-            Some(mapping) => apply_name_mapping_to_schema(schema, mapping)
-                .map_err(|error| corrupt(format!("iceberg name mapping: {error}")))?,
-        };
+    fn build(schema: &SchemaRef) -> Result<Self, ConnectorError> {
         let mut by_field_id = HashMap::with_capacity(schema.fields().len());
         for (index, field) in schema.fields().iter().enumerate() {
             let Some(field_id) = field_id_for_arrow_field(field.as_ref())
@@ -1180,7 +1237,17 @@ fn adapt_array(
     path: &str,
     logical_variant: bool,
 ) -> Result<ArrayRef, ConnectorError> {
-    match physical_adaptation(source.data_type(), target.data_type(), logical_variant)? {
+    let adaptation = physical_adaptation(source.data_type(), target.data_type(), logical_variant)?;
+    apply_adaptation(source, target, path, adaptation)
+}
+
+fn apply_adaptation(
+    source: &ArrayRef,
+    target: &Field,
+    path: &str,
+    adaptation: IcebergPhysicalAdaptation,
+) -> Result<ArrayRef, ConnectorError> {
+    match adaptation {
         IcebergPhysicalAdaptation::Identity => Ok(Arc::clone(source)),
         IcebergPhysicalAdaptation::RetagNestedMetadata => {
             crate::file_reader::retag_iceberg_array(source, target.data_type()).map_err(|error| {
@@ -1282,30 +1349,34 @@ fn adapt_representation(
     Ok(make_array(converted))
 }
 
-/// Extract a nested struct field, propagating every ancestor's null mask.
-fn dereference_struct_path(
-    base: &ArrayRef,
-    base_target: &Field,
+fn bind_struct_dereference(
+    base: &Field,
     field_id_path: &[i32],
-) -> Result<ArrayRef, ConnectorError> {
+) -> Result<Vec<usize>, ConnectorError> {
+    let mut field = base;
+    field_id_path
+        .iter()
+        .map(|id| {
+            let DataType::Struct(children) = field.data_type() else {
+                return Err(corrupt(
+                    "iceberg dereference expected a bound struct carrier",
+                ));
+            };
+            let (index, child) = children
+                .iter()
+                .enumerate()
+                .find(|(_, child)| field_id_for_arrow_field(child).ok().flatten() == Some(*id))
+                .ok_or_else(|| corrupt(format!("iceberg dereference field {id} is missing")))?;
+            field = child;
+            Ok(index)
+        })
+        .collect()
+}
+
+/// Extract through the frozen slots, propagating every ancestor's mask.
+fn dereference_struct_path(base: &ArrayRef, slots: &[usize]) -> Result<ArrayRef, ConnectorError> {
     let mut current = Arc::clone(base);
-    let mut current_field = Arc::new(base_target.clone());
-    for field_id in field_id_path {
-        let DataType::Struct(children) = current_field.data_type().clone() else {
-            return Err(unsupported(format!(
-                "iceberg projection of field id {field_id} descends into a non-struct carrier"
-            )));
-        };
-        let index = children
-            .iter()
-            .position(|child| {
-                field_id_for_arrow_field(child.as_ref()).ok().flatten() == Some(*field_id)
-            })
-            .ok_or_else(|| {
-                corrupt(format!(
-                    "iceberg dereference path field id {field_id} is not a struct field"
-                ))
-            })?;
+    for &index in slots {
         let parent = current
             .as_any()
             .downcast_ref::<StructArray>()
@@ -1321,11 +1392,10 @@ fn dereference_struct_path(
             .build()
             .map_err(|error| {
                 corrupt(format!(
-                    "iceberg dereference of field id {field_id} failed: {error}"
+                    "iceberg dereference at slot {index} failed: {error}"
                 ))
             })?;
         current = make_array(data);
-        current_field = Arc::clone(&children[index]);
     }
     Ok(current)
 }

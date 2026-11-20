@@ -211,8 +211,8 @@ fn file_predicate_value(value: &ConnectorValue) -> Option<MinMaxPredicateValue> 
 }
 
 use super::schema_binding::{
-    FileFieldIdCoverage, IcebergColumnSource, IcebergSchemaBinding, IcebergSchemaBindingRequest,
-    IcebergSplitFacts, bind_scan_columns,
+    IcebergColumnSource, IcebergSchemaBinding, IcebergSchemaBindingRequest, IcebergSplitFacts,
+    bind_scan_columns,
 };
 use super::split::{IcebergFileFormat, IcebergSplit, ParquetFileDecryptionData};
 use super::table_handle::IcebergTableHandle;
@@ -1159,12 +1159,7 @@ pub(super) fn plan_iceberg_prepared_input(
         partition_values: Some(&partition_values),
         columns: &bound_handles,
     })?;
-    let projection = match binding.coverage() {
-        FileFieldIdCoverage::None => FileProjection::All,
-        FileFieldIdCoverage::Complete => {
-            FileProjection::FieldIds(binding.physical_base_field_ids().to_vec())
-        }
-    };
+    let projection = FileProjection::RootIndices(binding.root_projection().to_vec());
     let range = if split.is_whole_file() {
         FileReadRange::WholeFile
     } else {
@@ -1248,7 +1243,7 @@ fn parse_name_mapping(json: Option<&str>) -> Result<Option<Arc<NameMapping>>, Co
     let Some(json) = json else {
         return Ok(None);
     };
-    let mapping: NameMapping = crate::metadata_json::from_str(json)
+    let mapping = crate::schema_mapping::parse_name_mapping(json)
         .map_err(|error| invalid(format!("iceberg name mapping json is invalid: {error}")))?;
     Ok(Some(Arc::new(mapping)))
 }
@@ -1846,14 +1841,7 @@ impl IcebergParquetPageSource {
                 "iceberg page source opened a reader before binding its columns",
             ));
         };
-        let projection = match binding.coverage() {
-            // A legacy file has no field ids to project by, so the whole file
-            // is opened and the name mapping resolves the columns afterwards.
-            FileFieldIdCoverage::None => FileProjection::All,
-            FileFieldIdCoverage::Complete => {
-                FileProjection::FieldIds(binding.physical_base_field_ids().to_vec())
-            }
-        };
+        let projection = FileProjection::RootIndices(binding.root_projection().to_vec());
         let range = if self.split.is_whole_file() {
             FileReadRange::WholeFile
         } else {

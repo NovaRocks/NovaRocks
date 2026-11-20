@@ -43,6 +43,11 @@ pub mod equality_delete;
 pub mod execution_installer;
 #[path = "execution_payload.rs"]
 pub mod execution_payload;
+#[allow(
+    dead_code,
+    reason = "ADD FILES registration consumes the footer preview in P08"
+)]
+pub(crate) mod field_identity;
 #[path = "variant.rs"]
 pub mod variant;
 

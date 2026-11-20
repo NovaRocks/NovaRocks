@@ -212,12 +212,19 @@ fn sql_read_data_type(
 /// canonical serialization with the provider prevents catalog mutation and
 /// write planning callers from each accepting a slightly different mapping.
 pub fn canonical_name_mapping(raw: &str) -> Result<String, String> {
+    encode_name_mapping(&parse_name_mapping(raw)?)
+}
+
+pub(crate) fn parse_name_mapping(raw: &str) -> Result<NameMapping, String> {
     let value: serde_json::Value = crate::metadata_json::from_str(raw)
         .map_err(|error| format!("decode schema.name-mapping.default: {error}"))?;
     validate_name_mapping_json(&value)?;
-    let mapping: NameMapping = serde_json::from_value(value)
-        .map_err(|error| format!("decode schema.name-mapping.default: {error}"))?;
-    serde_json::to_string(&mapping)
+    serde_json::from_value(value)
+        .map_err(|error| format!("decode schema.name-mapping.default: {error}"))
+}
+
+pub(crate) fn encode_name_mapping(mapping: &NameMapping) -> Result<String, String> {
+    serde_json::to_string(mapping)
         .map_err(|error| format!("encode canonical schema.name-mapping.default: {error}"))
 }
 
@@ -237,22 +244,22 @@ fn validate_name_mapping_json(value: &serde_json::Value) -> Result<(), String> {
             {
                 return Err("Iceberg name mapping contains an unknown field".to_string());
             }
-            let id = object
-                .get("field-id")
-                .and_then(serde_json::Value::as_i64)
-                .ok_or_else(|| "Iceberg name mapping field-id is required".to_string())?;
-            if id <= 0 || !ids.insert(id) {
-                return Err(format!(
-                    "Iceberg name mapping has duplicate or invalid ID {id}"
-                ));
+            if let Some(value) = object.get("field-id")
+                && !value.is_null()
+            {
+                let id = value.as_i64().ok_or_else(|| {
+                    "Iceberg name mapping field-id must be an integer".to_string()
+                })?;
+                if id <= 0 || !ids.insert(id) {
+                    return Err(format!(
+                        "Iceberg name mapping has duplicate or invalid ID {id}"
+                    ));
+                }
             }
             let names = object
                 .get("names")
                 .and_then(serde_json::Value::as_array)
                 .ok_or_else(|| "Iceberg name mapping names must be an array".to_string())?;
-            if names.is_empty() {
-                return Err("Iceberg name mapping names must not be empty".to_string());
-            }
             for name in names {
                 let name = name
                     .as_str()
@@ -289,16 +296,26 @@ pub fn apply_name_mapping_to_schema(
     schema: &SchemaRef,
     name_mapping: &NameMapping,
 ) -> Result<SchemaRef, String> {
-    let mappings = name_mapping
-        .fields()
-        .iter()
-        .cloned()
-        .map(Arc::new)
-        .collect::<Vec<_>>();
+    apply_name_mapping(schema, name_mapping, |_, _| {})
+}
+
+/// Resolve the logical paths of an ID-less file. The observer sees the
+/// result at each path we looked up, including an unmatched field at the
+/// boundary of an ignored subtree.
+pub(crate) fn apply_name_mapping(
+    schema: &SchemaRef,
+    name_mapping: &NameMapping,
+    mut observe: impl FnMut(&[&str], Option<i32>),
+) -> Result<SchemaRef, String> {
+    let mut resolver = NameMappingResolver {
+        observe: &mut observe,
+        used_ids: HashSet::new(),
+    };
+    let mut path = Vec::new();
     let fields = schema
         .fields()
         .iter()
-        .map(|field| map_field_id_recursive(field.as_ref(), &mappings))
+        .map(|field| resolver.resolve(field, field.name(), name_mapping.fields().iter(), &mut path))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Arc::new(Schema::new_with_metadata(
         fields,
@@ -430,75 +447,101 @@ fn scan_list_child(field: &Field, frozen: &IcebergSchemaFieldDef) -> Result<Fiel
     apply_scan_field_id_recursive(field, child)
 }
 
-fn map_field_id_recursive(field: &Field, mappings: &[Arc<MappedField>]) -> Result<Field, String> {
-    let mapped = mapped_field_for_name(mappings, field.name())?;
-    let field_id = mapped.field_id().ok_or_else(|| {
-        format!(
-            "Iceberg name mapping entry for {} does not contain a field ID",
-            field.name()
-        )
-    })?;
-    let mut metadata = field.metadata().clone();
-    metadata.insert(PARQUET_FIELD_ID_META_KEY.to_string(), field_id.to_string());
-    let data_type = match field.data_type() {
-        data_type if is_variant_struct_data_type(data_type) => data_type.clone(),
-        DataType::Struct(children) => DataType::Struct(
-            children
-                .iter()
-                .map(|child| map_field_id_recursive(child.as_ref(), mapped.fields()))
-                .collect::<Result<Vec<_>, _>>()?
-                .into(),
-        ),
-        DataType::List(child) => DataType::List(Arc::new(map_field_id_recursive(
-            child.as_ref(),
-            mapped.fields(),
-        )?)),
-        DataType::LargeList(child) => DataType::LargeList(Arc::new(map_field_id_recursive(
-            child.as_ref(),
-            mapped.fields(),
-        )?)),
-        DataType::FixedSizeList(child, size) => DataType::FixedSizeList(
-            Arc::new(map_field_id_recursive(child.as_ref(), mapped.fields())?),
-            *size,
-        ),
-        DataType::Map(entries, sorted) => {
-            let DataType::Struct(entry_fields) = entries.data_type() else {
-                return Err(format!(
-                    "Iceberg mapped map field {} has non-struct entries",
-                    field.name()
-                ));
-            };
-            if entry_fields.len() != 2 {
-                return Err(format!(
-                    "Iceberg mapped map field {} must have key and value entries",
-                    field.name()
-                ));
+struct NameMappingResolver<'a, F> {
+    observe: &'a mut F,
+    used_ids: HashSet<i32>,
+}
+
+impl<F: FnMut(&[&str], Option<i32>)> NameMappingResolver<'_, F> {
+    fn resolve<'a, 'm>(
+        &mut self,
+        field: &'a Field,
+        segment: &'a str,
+        mappings: impl Iterator<Item = &'m MappedField>,
+        path: &mut Vec<&'a str>,
+    ) -> Result<Field, String> {
+        path.push(segment);
+        let mapped = mapped_field_for_name(mappings, segment)?;
+        let field_id = mapped.and_then(MappedField::field_id);
+        (self.observe)(path, field_id);
+        let resolved = match (mapped, field_id) {
+            (Some(mapped), Some(id)) => {
+                if !self.used_ids.insert(id) {
+                    return Err(format!(
+                        "Iceberg name mapping resolves multiple physical fields to ID {id}"
+                    ));
+                }
+                let data_type = self.resolve_children(field, mapped.fields(), path)?;
+                let mut metadata = field.metadata().clone();
+                metadata.insert(PARQUET_FIELD_ID_META_KEY.to_string(), id.to_string());
+                field
+                    .clone()
+                    .with_data_type(data_type)
+                    .with_metadata(metadata)
             }
-            let key = map_field_id_recursive(entry_fields[0].as_ref(), mapped.fields())?;
-            let value = map_field_id_recursive(entry_fields[1].as_ref(), mapped.fields())?;
-            let entries = Field::new(
-                entries.name(),
-                DataType::Struct(vec![key, value].into()),
-                entries.is_nullable(),
-            )
-            .with_metadata(entries.metadata().clone());
-            DataType::Map(Arc::new(entries), *sorted)
-        }
-        data_type => data_type.clone(),
-    };
-    Ok(Field::new(field.name(), data_type, field.is_nullable()).with_metadata(metadata))
+            _ => field.clone(),
+        };
+        path.pop();
+        Ok(resolved)
+    }
+
+    fn resolve_children<'a>(
+        &mut self,
+        field: &'a Field,
+        mappings: &[Arc<MappedField>],
+        path: &mut Vec<&'a str>,
+    ) -> Result<DataType, String> {
+        let mut resolve = |child: &'a Field, name: &'a str| {
+            self.resolve(child, name, mappings.iter().map(Arc::as_ref), path)
+                .map(Arc::new)
+        };
+        Ok(match field.data_type() {
+            data_type if is_variant_struct_data_type(data_type) => data_type.clone(),
+            DataType::Struct(children) => DataType::Struct(
+                children
+                    .iter()
+                    .map(|child| resolve(child, child.name()))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into(),
+            ),
+            DataType::List(child) => DataType::List(resolve(child, "element")?),
+            DataType::LargeList(child) => DataType::LargeList(resolve(child, "element")?),
+            DataType::FixedSizeList(child, size) => {
+                DataType::FixedSizeList(resolve(child, "element")?, *size)
+            }
+            DataType::Map(entries, sorted) => {
+                let DataType::Struct(entry_fields) = entries.data_type() else {
+                    return Err(format!(
+                        "Iceberg mapped map field {} has non-struct entries",
+                        field.name()
+                    ));
+                };
+                let [key, value] = entry_fields.as_ref() else {
+                    return Err(format!(
+                        "Iceberg mapped map field {} must have key and value entries",
+                        field.name()
+                    ));
+                };
+                let key = resolve(key, "key")?;
+                let value = resolve(value, "value")?;
+                let entries = entries
+                    .as_ref()
+                    .clone()
+                    .with_data_type(DataType::Struct(vec![key, value].into()));
+                DataType::Map(Arc::new(entries), *sorted)
+            }
+            data_type => data_type.clone(),
+        })
+    }
 }
 
 fn mapped_field_for_name<'a>(
-    mappings: &'a [Arc<MappedField>],
+    mappings: impl Iterator<Item = &'a MappedField>,
     name: &str,
-) -> Result<&'a MappedField, String> {
-    let mut matches = mappings
-        .iter()
-        .filter(|mapped| mapped.names().iter().any(|candidate| candidate == name));
-    let mapped = matches
-        .next()
-        .ok_or_else(|| format!("Iceberg name mapping does not contain physical field {name}"))?;
+) -> Result<Option<&'a MappedField>, String> {
+    let mut matches =
+        mappings.filter(|mapped| mapped.names().iter().any(|candidate| candidate == name));
+    let mapped = matches.next();
     if matches.next().is_some() {
         return Err(format!(
             "Iceberg name mapping contains duplicate aliases for physical field {name}"
@@ -576,3 +619,56 @@ pub fn unidentified_fields_are_only_opaque_variants(schema: &SchemaRef) -> Resul
 mod tests;
 
 pub(crate) mod catalog_value;
+
+/// Author the default mapping from Iceberg's logical schema, including its
+/// canonical element/key/value roles. Names are individual path components.
+#[allow(dead_code, reason = "ADD FILES publication consumes this fact in P08")]
+pub(crate) fn name_mapping_from_schema(schema: &crate::iceberg::spec::Schema) -> NameMapping {
+    use crate::iceberg::spec::{NestedField, Type};
+
+    fn field_mapping(field: &NestedField, name: &str) -> MappedField {
+        let children = match field.field_type.as_ref() {
+            Type::Struct(structure) => structure
+                .fields()
+                .iter()
+                .map(|child| field_mapping(child, &child.name))
+                .collect(),
+            Type::List(list) => vec![field_mapping(&list.element_field, "element")],
+            Type::Map(map) => vec![
+                field_mapping(&map.key_field, "key"),
+                field_mapping(&map.value_field, "value"),
+            ],
+            Type::Primitive(_) | Type::Variant(_) => Vec::new(),
+        };
+        MappedField::new(Some(field.id), vec![name.to_owned()], children)
+    }
+
+    NameMapping::new(
+        schema
+            .as_struct()
+            .fields()
+            .iter()
+            .map(|field| field_mapping(field, &field.name))
+            .collect(),
+    )
+}
+
+/// Resolve a recorded path in a later mapping with the same ancestor rule
+/// as file binding. An unmapped ancestor hides its entire physical subtree.
+#[allow(dead_code, reason = "ADD FILES publication consumes this fact in P08")]
+pub(crate) fn mapped_path_id(
+    mapping: &NameMapping,
+    path: &[String],
+) -> Result<Option<i32>, String> {
+    let Some((name, rest)) = path.split_first() else {
+        return Ok(None);
+    };
+    let mut entry = mapped_field_for_name(mapping.fields().iter(), name)?;
+    for segment in rest {
+        let Some(parent) = entry.filter(|parent| parent.field_id().is_some()) else {
+            return Ok(None);
+        };
+        entry = mapped_field_for_name(parent.fields().iter().map(Arc::as_ref), segment)?;
+    }
+    Ok(entry.and_then(MappedField::field_id))
+}

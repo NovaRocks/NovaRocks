@@ -32,6 +32,8 @@ use novarocks_spi::connector::read_stack::{
     TupleDomain,
 };
 
+use sha2::{Digest, Sha256};
+
 use crate::iceberg::spec::Type;
 use crate::read_model::IcebergReadFile;
 #[cfg(test)]
@@ -49,6 +51,10 @@ use super::split::{
     ParquetFileDecryptionData, iceberg_split_weight,
 };
 use super::table_handle::{IcebergTableHandle, identity_partition_source_field_ids};
+
+fn data_file_affinity_key(path: &str) -> String {
+    format!("{:x}", Sha256::digest(path.as_bytes()))
+}
 
 /// The Iceberg default target split size.
 pub const DEFAULT_TARGET_SPLIT_SIZE_BYTES: u64 = 128 * 1024 * 1024;
@@ -276,6 +282,7 @@ impl IcebergSplitSource {
         };
 
         let mut splits = Vec::with_capacity(ranges.len());
+        let affinity_key = data_file_affinity_key(&read_file.path);
         for (start, length) in ranges {
             splits.push(IcebergSplit::try_new(IcebergSplitParams {
                 read_domain: read_file.read_domain().clone(),
@@ -295,7 +302,7 @@ impl IcebergSplitSource {
                 split_weight: iceberg_split_weight(length, &deletes, self.weight_parameters)?,
                 // Ranges of one file share a footer and a delete closure, so
                 // co-locating them lets a worker reuse both.
-                affinity_key: Some(read_file.path.clone()),
+                affinity_key: Some(affinity_key.clone()),
             })?);
         }
         Ok(splits)
@@ -849,6 +856,7 @@ impl ChangeWindowContext<'_> {
         let read_file = &file.read_file;
         let deletes = IcebergSplitDeletes::Planned(read_file.deletes.clone());
         let mut splits = Vec::with_capacity(facts.ranges.len());
+        let affinity_key = data_file_affinity_key(&read_file.path);
         for (start, length) in &facts.ranges {
             splits.push(IcebergSplit::try_new(IcebergSplitParams {
                 read_domain: read_file.read_domain().clone(),
@@ -866,7 +874,7 @@ impl ChangeWindowContext<'_> {
                 file_first_row_id: read_file.first_row_id,
                 decryption_data: None,
                 split_weight: iceberg_split_weight(*length, &deletes, self.weight_parameters)?,
-                affinity_key: Some(read_file.path.clone()),
+                affinity_key: Some(affinity_key.clone()),
             })?);
         }
         Ok(splits)
@@ -1959,6 +1967,33 @@ mod tests {
             .iter()
             .map(|split| (split.data().path().to_string(), split.change_op()))
             .collect()
+    }
+
+    #[test]
+    fn long_file_paths_keep_the_same_affinity_in_both_scan_families() {
+        use novarocks_proto_codec::connector_read::{MAX_AFFINITY_KEY_BYTES, MAX_PATH_BYTES};
+        use novarocks_spi::connector::read_stack::ConnectorSplit;
+
+        let path = format!(
+            "s3://warehouse/{}.parquet",
+            "x".repeat(MAX_AFFINITY_KEY_BYTES)
+        );
+        assert!(path.len() <= MAX_PATH_BYTES);
+        let planned = endpoint_file(&path, vec![]);
+        let handle = handle_with(None, BTreeSet::new());
+        let mut ordinary = split_source_for(&handle, vec![planned.clone()]);
+        let regular = all_splits(&mut ordinary, 8);
+        let changes = window_plan(vec![], vec![planned]).unwrap();
+        let changed = changes.splits()[0].data();
+        assert_eq!(regular[0].path(), path);
+        assert_eq!(changed.path(), path);
+        assert_eq!(regular[0].affinity_key(), changed.affinity_key());
+        assert_eq!(changed.affinity_key().unwrap().len(), 64);
+
+        assert!(
+            crate::typed_read::split::validate_data_file_path(&"x".repeat(MAX_PATH_BYTES + 1))
+                .is_err()
+        );
     }
 
     #[test]

@@ -462,3 +462,71 @@ fn frozen_nested_iceberg_primitives_use_exact_sql_read_carriers() {
     };
     assert_eq!(entries[1].data_type(), &DataType::LargeBinary);
 }
+
+#[test]
+fn maps_list_roles_and_keeps_unused_and_idless_entries() {
+    let physical_element = Arc::new(Field::new(
+        "array",
+        DataType::Struct(vec![Field::new("value.with.dot", DataType::Int64, true)].into()),
+        true,
+    ));
+    let input = Arc::new(arrow::datatypes::Schema::new(vec![
+        Field::new("legacy_items", DataType::List(physical_element), true),
+        Field::new("ignored", DataType::Int64, true),
+    ]));
+    let mapping = super::parse_name_mapping(
+        r#"[{"field-id":1,"names":["legacy_items"],"fields":[{"field-id":2,"names":["element"],"fields":[{"field-id":3,"names":["value.with.dot"]}]}]},{"field-id":4,"names":[]},{"names":["ignored"]}]"#,
+    ).unwrap();
+    let mut observed = Vec::new();
+    let mapped = super::apply_name_mapping(&input, &mapping, |path, id| {
+        observed.push((
+            path.iter()
+                .map(|segment| segment.to_string())
+                .collect::<Vec<_>>(),
+            id,
+        ));
+    })
+    .unwrap();
+    assert_eq!(
+        super::field_id_for_arrow_field(mapped.field(1)).unwrap(),
+        None
+    );
+    let DataType::List(element) = mapped.field(0).data_type() else {
+        panic!("expected a list")
+    };
+    assert_eq!(element.name(), "array");
+    assert_eq!(super::field_id_for_arrow_field(element).unwrap(), Some(2));
+    let DataType::Struct(fields) = element.data_type() else {
+        panic!("expected element struct")
+    };
+    assert_eq!(
+        super::field_id_for_arrow_field(&fields[0]).unwrap(),
+        Some(3)
+    );
+    assert_eq!(
+        observed[2],
+        (
+            vec![
+                "legacy_items".into(),
+                "element".into(),
+                "value.with.dot".into()
+            ],
+            Some(3)
+        )
+    );
+    assert_eq!(observed[3], (vec!["ignored".into()], None));
+    for (path, id) in observed {
+        assert_eq!(super::mapped_path_id(&mapping, &path).unwrap(), id);
+    }
+}
+
+#[test]
+fn two_physical_aliases_cannot_claim_one_iceberg_field() {
+    let input = Arc::new(arrow::datatypes::Schema::new(vec![
+        Field::new("old", DataType::Int64, true),
+        Field::new("new", DataType::Int64, true),
+    ]));
+    let mapping = super::parse_name_mapping(r#"[{"field-id":1,"names":["old","new"]}]"#).unwrap();
+    let error = super::apply_name_mapping_to_schema(&input, &mapping).unwrap_err();
+    assert!(error.contains("multiple physical fields to ID 1"));
+}
