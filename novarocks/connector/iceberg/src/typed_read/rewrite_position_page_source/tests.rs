@@ -48,7 +48,7 @@ struct RewriteFixture {
 }
 
 impl RewriteFixture {
-    fn request(&self, _max_rows: usize) -> IcebergRewritePositionDeleteFilesPageSourceRequest<'_> {
+    fn request(&self) -> IcebergRewritePositionDeleteFilesPageSourceRequest<'_> {
         IcebergRewritePositionDeleteFilesPageSourceRequest {
             split: &self.split,
             columns: &self.columns,
@@ -192,7 +192,7 @@ fn a_rewrite_stream_reads_selected_vectors_and_emits_canonical_output_columns() 
     let fixture = rewrite_fixture();
     let budget = ConnectorPollBudget::new();
     let stream =
-        create_iceberg_rewrite_position_delete_files_page_stream(fixture.request(16), &budget)
+        create_iceberg_rewrite_position_delete_files_page_stream(fixture.request(), &budget)
             .expect("page stream");
     let mut source = DrivenStream::new(&fixture.runtime, stream, budget);
     let page = source
@@ -217,24 +217,28 @@ fn a_rewrite_stream_reads_nothing_until_polled_and_then_emits_the_merged_positio
     let (spawner, _task_operations) = fixture.gate_reads();
     let budget = ConnectorPollBudget::new();
     let mut stream =
-        create_iceberg_rewrite_position_delete_files_page_stream(fixture.request(2), &budget)
+        create_iceberg_rewrite_position_delete_files_page_stream(fixture.request(), &budget)
             .expect("page stream");
     assert_eq!(spawner.started(), 0, "creating the stream reads nothing");
 
     spawner.release(64);
-    // One unit for two pages: the second page yields its turn first.
+    // Three positions and their paths fit one complete engine output prefix.
     budget.refill(1);
     let rows = fixture.runtime.block_on(async {
-        let mut rows = Vec::new();
-        while let Some(page) = stream.next().await {
-            rows.extend(rows_of(page.expect("page")));
-        }
-        rows
+        let page = stream
+            .next()
+            .await
+            .expect("one output prefix")
+            .expect("page");
+        assert_eq!(page.position_count(), 3);
+        assert!(stream.next().await.is_none());
+        rows_of(page)
     });
     assert_eq!(spawner.started(), 2, "one read per selected vector");
     let path = fixture.data_file_path.clone();
     assert_eq!(rows, vec![(path.clone(), 1), (path.clone(), 4), (path, 9)]);
-    assert_eq!(budget.exhaustions(), 1);
+    assert_eq!(budget.remaining(), 0);
+    assert_eq!(budget.exhaustions(), 0);
     fixture
         .runtime
         .block_on(stream.close())
@@ -250,7 +254,7 @@ fn closing_a_loading_rewrite_stream_stops_its_read_and_waits_for_its_exit() {
     let budget = ConnectorPollBudget::new();
     budget.refill(1024);
     let mut stream =
-        create_iceberg_rewrite_position_delete_files_page_stream(fixture.request(16), &budget)
+        create_iceberg_rewrite_position_delete_files_page_stream(fixture.request(), &budget)
             .expect("page stream");
     fixture.runtime.block_on(async {
         tokio::time::timeout(Duration::from_secs(5), async {
