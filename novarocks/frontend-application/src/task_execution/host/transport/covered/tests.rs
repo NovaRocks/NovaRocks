@@ -513,7 +513,6 @@ async fn failed_subscription_generation_waits_for_its_original_result_position()
     for capture in releases {
         capture.dispose();
     }
-    inbox.finish();
     parent.body_exited().unwrap();
     parent.captures_exited().unwrap();
     payer.finish().unwrap();
@@ -523,6 +522,7 @@ async fn failed_subscription_generation_waits_for_its_original_result_position()
             .unwrap()
     );
     scope.close_external().unwrap();
+    inbox.finish();
     ledger.remove_scope(scope.id()).unwrap();
     assert!(ledger.is_empty());
     assert!(peer.settle().await);
