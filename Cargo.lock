@@ -4374,8 +4374,6 @@ dependencies = [
  "novarocks-failure-contract",
  "novarocks-query-application",
  "novarocks-type-contract",
- "serde",
- "serde_json",
  "tokio",
 ]
 

@@ -12,8 +12,6 @@ novarocks-failure-contract.workspace = true
 novarocks-type-contract.workspace = true
 novarocks-coordination-contract.workspace = true
 novarocks-query-application.workspace = true
-serde = { workspace = true, features = ["derive"] }
-serde_json.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "time"] }
