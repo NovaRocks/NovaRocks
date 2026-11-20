@@ -499,7 +499,7 @@ impl ExecutionExchangeRegistry {
             .get(&key)
             .cloned();
         if let Some(receiver) = receiver
-            && let Err(error) = receiver.retire_units()
+            && let Err(error) = receiver.retire_units(false)
         {
             let owner = receiver.unit_owner();
             if let Some(owner) = owner {
@@ -524,6 +524,14 @@ impl ExecutionExchangeRegistry {
     }
 
     pub fn cancel_exchange_key(&self, key: ExchangeKey) {
+        self.cancel_exchange_key_with_disposition(key, false);
+    }
+
+    pub fn fail_exchange_key(&self, key: ExchangeKey) {
+        self.cancel_exchange_key_with_disposition(key, true);
+    }
+
+    fn cancel_exchange_key_with_disposition(&self, key: ExchangeKey, failed: bool) {
         mark_key_canceled(self, key);
         let receiver = self
             .receivers
@@ -532,7 +540,7 @@ impl ExecutionExchangeRegistry {
             .get(&key)
             .cloned();
         if let Some(receiver) = receiver {
-            if let Err(error) = receiver.retire_units() {
+            if let Err(error) = receiver.retire_units(failed) {
                 let owner = receiver.unit_owner();
                 if let Some(owner) = owner {
                     owner.report_failure(error);

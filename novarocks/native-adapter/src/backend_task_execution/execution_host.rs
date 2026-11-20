@@ -1359,9 +1359,25 @@ impl NativeTaskExecutionHost {
         &self,
         descriptor: &TaskDescriptor,
     ) -> Result<Option<NativeReceiverRetirement>, HostRejection> {
-        self.capabilities
+        let mut captured = self
+            .capabilities
             .remove_with_capture(descriptor, || self.take_receiver_retirement(descriptor))
-            .map_err(host_failure)
+            .map_err(host_failure)?;
+        self.bind_failed_receiver_retirement(descriptor, &mut captured);
+        Ok(captured)
+    }
+
+    fn bind_failed_receiver_retirement(
+        &self,
+        descriptor: &TaskDescriptor,
+        captured: &mut Option<NativeReceiverRetirement>,
+    ) {
+        if let Some(captured) = captured
+            && let Some(retirement) = captured.retirement.as_mut()
+            && self.capabilities.task_route_failure_stopped(descriptor)
+        {
+            retirement.record_failure_stop();
+        }
     }
 
     /// Close using the actual receiver author's exact facts, preserving strict
@@ -1383,9 +1399,11 @@ impl NativeTaskExecutionHost {
         // The checked capability operation has returned, releasing both its
         // writer fence and capability state lock. Only neutral error projection
         // happens here; actual capture disposal remains the host's next phase.
-        captured
+        let mut captured = captured
             .expect("the checked normal close invoked its original capture once")
-            .map_err(host_failure)
+            .map_err(host_failure)?;
+        self.bind_failed_receiver_retirement(descriptor, &mut captured);
+        Ok(captured)
     }
 
     /// Assembles the runtime inputs a typed connector scan needs.
@@ -1770,7 +1788,10 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
         descriptor: &TaskDescriptor,
         retirement: novarocks_worker::TaskIngressRetirement,
     ) -> Result<(), HostRejection> {
-        if retirement == novarocks_worker::TaskIngressRetirement::Remove {
+        if retirement != novarocks_worker::TaskIngressRetirement::PreserveNormalClose {
+            if retirement == novarocks_worker::TaskIngressRetirement::PreserveFailureStop {
+                self.capabilities.stop_failed_task(descriptor);
+            }
             let captured = self.capture_receiver_after_removal(descriptor)?;
             dispose_receiver_capture(captured);
             return Ok(());
@@ -1887,6 +1908,7 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
         let completion_reporter = reporter.clone();
         let completion_runtime = Arc::clone(&runtime);
         let close_descriptor = descriptor.clone();
+        let capabilities = Arc::clone(&self.capabilities);
         let mut final_statistics = runtime
             .final_statistics
             .lock()
@@ -1920,6 +1942,9 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
                     let completion_worker = completion_worker
                         .upgrade()
                         .expect("an installed Task retains its runnable until actual completion");
+                    if matches!(fact.outcome(), LocalTaskOutcome::Failed(_)) {
+                        capabilities.stop_failed_task(&close_descriptor);
+                    }
                     // Preserve the kernel's original removal/cancellation
                     // disposition before any fact can make the task retire.
                     // Only the inbound-close owner performs physical cleanup.
@@ -4123,13 +4148,9 @@ pub(crate) mod tests {
         assert!(rejection.detail().as_str().contains("participation closed"));
         capabilities.abort_participation(participation);
         assert!(capabilities.participation_admission_aborted(participation.query_execution_id()));
-        let claim = claim_frame(&capabilities, route());
-        let InboundFrameClaim::Refused(detail) = claim else {
-            panic!("a true abort must refuse its still-installed destination");
-        };
-        assert!(
-            detail.contains("data-plane admission is closed"),
-            "{detail}"
+        assert_eq!(
+            claim_frame(&capabilities, route()),
+            InboundFrameClaim::FailureStopped { sender_count: 1 },
         );
         assert_eq!(
             capabilities.authorize_frame(task_key, node, producer_key, 0, 1),
@@ -6114,6 +6135,10 @@ pub(crate) mod tests {
             self.cancelled.fetch_add(1, Ordering::SeqCst);
             self.inner.cancel(key);
         }
+        fn cancel_failed(&self, key: novarocks_execution::runtime::task::io::ExchangeReceiverKey) {
+            self.cancelled.fetch_add(1, Ordering::SeqCst);
+            self.inner.cancel_failed(key);
+        }
         fn remove(&self, key: novarocks_execution::runtime::task::io::ExchangeReceiverKey) {
             self.removed.fetch_add(1, Ordering::SeqCst);
             self.inner.remove(key);
@@ -6820,6 +6845,13 @@ pub(crate) mod tests {
             );
         }
         if matches!(stop, ReceiverStop::QuiesceThenAbort) {
+            while port.snapshot(key).is_some() {
+                assert!(
+                    std::time::Instant::now() < until,
+                    "normal receiver retirement must precede the subsequent Abort"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
             drop(
                 await_original(node.control.abort(
                     novarocks_execution_contract::AbortParticipation::new(
@@ -6879,6 +6911,8 @@ pub(crate) mod tests {
         );
         if normal && !matches!(stop, ReceiverStop::QuiesceThenAbort) {
             assert!(matches!(claim, InboundFrameClaim::NormallyClosed(_)));
+        } else if matches!(stop, ReceiverStop::Abort | ReceiverStop::QuiesceThenAbort) {
+            assert_eq!(claim, InboundFrameClaim::FailureStopped { sender_count: 1 });
         } else {
             assert_eq!(claim, InboundFrameClaim::NotHeld);
         }

@@ -15,19 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Shared exact retained normal-close cost and neutral record layout.
+//! Shared retained Exchange route cost and neutral record layout.
 
 use novarocks_execution_contract::{
     ExchangeInbound, ExchangeSource, ExchangeStreamClose, TaskDescriptor, TaskIdentity,
 };
 use std::mem::size_of;
 
-/// The bounded, payload-free remainder of a receiver that normally stopped.
+/// The bounded, payload-free remainder of an installed receiver that stopped.
 #[derive(Debug)]
-pub struct NormalClosedInboundRecord {
+pub struct RetainedInboundRecord {
     pub destination: TaskIdentity,
     pub inbound: Vec<ExchangeInbound>,
-    pub closes: Box<[ExchangeStreamClose]>,
+    /// A failure fence retains only the exact roster.
+    pub closes: Option<Box<[ExchangeStreamClose]>>,
 }
 
 pub fn record_bytes(descriptor: &TaskDescriptor, retained_owner_bytes: usize) -> Option<usize> {
@@ -35,7 +36,7 @@ pub fn record_bytes(descriptor: &TaskDescriptor, retained_owner_bytes: usize) ->
         return Some(0);
     }
     descriptor.topology().inbound().iter().try_fold(
-        size_of::<NormalClosedInboundRecord>()
+        size_of::<RetainedInboundRecord>()
             .checked_add(128)?
             .checked_add(retained_owner_bytes)?,
         |bytes, node| {

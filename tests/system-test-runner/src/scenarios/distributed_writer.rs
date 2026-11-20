@@ -60,7 +60,7 @@ use novarocks_execution_contract::{
     TaskFailurePhase,
     failure::{FailureClass, FailureFact, FailureReason, domain},
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -2994,6 +2994,8 @@ struct DistributedWriterFaults {
 const V3_FAULT_TABLE: &str =
     "distributed_writer_faults.distributed_writer_fault_db.v3_materialization_fault";
 const V3_FAULT_KIND: &str = "connector-write-root-read-after-prefix-failure";
+const GRANT_ONLY_HOLD: &str = "exchange-deliver-before-rpc-hold";
+const ROOT_VALIDATION_FAULT: &str = "connector-write-root-failure";
 
 fn v3_fault_sql() -> String {
     format!("DELETE FROM {V3_FAULT_TABLE} WHERE v = 2 AND v > 0")
@@ -3046,6 +3048,25 @@ impl Scenario for DistributedWriterFaults {
                 })
                 .collect(),
         });
+        let root_fault_index = WRITE_FAULTS
+            .iter()
+            .position(|fault| matches!(fault, WriteFault::RootValidation))
+            .expect("original root Connector failure");
+        let mut grant_only = writer_fault_specs(cluster_size).remove(root_fault_index);
+        assert!(
+            grant_only
+                .faults
+                .iter()
+                .all(|(_, kind)| *kind == ROOT_VALIDATION_FAULT)
+        );
+        grant_only
+            .faults
+            .extend((0..cluster_size).map(|index| (index, GRANT_ONLY_HOLD)));
+        grant_only.observations = (0..cluster_size).flat_map(|index| [
+            (index, novarocks_failpoint::observation_marker::ObservationAction::ExchangeSnapshot.as_str(), None),
+            (index, novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol.as_str(), None),
+        ]).collect();
+        specs.push(grant_only);
         Ok(Some(self.intent.freeze_remote_writer_sender(
             specs,
             selected,
@@ -3170,8 +3191,11 @@ impl Scenario for DistributedWriterFaults {
                 )?;
                 Ok((before_terminals, before, before_injections, writer))
             })();
-            let retirement = if matches!(fault, WriteFault::SealedAfterRootPrefix) {
-                // The next DELETE selects this same fault kind under its own token.
+            let retirement = if matches!(
+                fault,
+                WriteFault::SealedAfterRootPrefix | WriteFault::RootValidation
+            ) {
+                // Later cases bind these same actions to independent statements.
                 retire_selected_writer_faults(context, &selected)
             } else {
                 Ok(())
@@ -3287,6 +3311,13 @@ impl Scenario for DistributedWriterFaults {
         }
 
         verify_materialization_fault(context, &mut control, self.intent.take(WRITE_FAULTS.len())?)?;
+        verify_grant_only_writer_stop(
+            context,
+            &mut control,
+            &insert,
+            &target,
+            self.intent.take(WRITE_FAULTS.len() + 1)?,
+        )?;
 
         // The cluster is still able to write after the whole matrix, which is
         // what makes "nothing was left behind" a statement about resources
@@ -3313,6 +3344,217 @@ impl Scenario for DistributedWriterFaults {
         }
         Ok(())
     }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct GrantOnlyRoute {
+    backend: usize,
+    fields: String,
+}
+
+impl GrantOnlyRoute {
+    fn field(&self, name: &str) -> &str {
+        self.fields
+            .split_ascii_whitespace()
+            .filter_map(|entry| entry.split_once('='))
+            .find_map(|(key, value)| (key == name).then_some(value))
+            .expect("original Exchange probe field")
+    }
+
+    fn shares_input(&self, other: &Self) -> bool {
+        [
+            "execution_id",
+            "destination",
+            "destination_stage",
+            "destination_task",
+            "node_id",
+        ]
+        .iter()
+        .all(|name| self.field(name) == other.field(name))
+    }
+}
+
+fn grant_only_events(
+    context: &mut ScenarioContext,
+) -> Result<BTreeMap<GrantOnlyRoute, BTreeMap<String, usize>>> {
+    let marker = novarocks_failpoint::observation_marker::EXCHANGE_GRANT_ONLY_PROBE;
+    let mut observations = BTreeMap::<_, BTreeMap<String, usize>>::new();
+    for backend in 0..context.handle().be_count() {
+        let log = context.handle().be_current_log_contents(backend)?;
+        for (_, body) in log.lines().filter_map(|line| line.split_once(marker)) {
+            let (event, fields) = body
+                .trim()
+                .split_once(' ')
+                .context("Exchange probe fields")?;
+            let key = GrantOnlyRoute {
+                backend,
+                fields: fields.to_owned(),
+            };
+            *observations
+                .entry(key)
+                .or_default()
+                .entry(event.to_owned())
+                .or_default() += 1;
+        }
+    }
+    Ok(observations)
+}
+
+fn verify_grant_only_writer_stop(
+    context: &mut ScenarioContext,
+    control: &mut SqlSession,
+    insert: &str,
+    target: &str,
+    selected: SelectedStatement,
+) -> Result<()> {
+    context.action("stop a remote writer with a live Grant subscription and no unary RPC");
+    let snapshots = snapshot_count(control, target)?;
+    let publication = publication_terminals(context, WRITE_FAMILY)?;
+    let actor = WriterActor::start(context, insert, selected.clone(), None)?;
+    let primary = (|| {
+        let (sender, trigger, register_count) = loop {
+            let events = grant_only_events(context)?;
+            if let Some((sender, trigger, register_count)) =
+                events.iter().find_map(|(sender, seen)| {
+                    let registered = seen.get("event=demand_started").copied().unwrap_or(0);
+                    if !seen.contains_key("event=deliver_parked")
+                        || !seen.contains_key("event=grant_observed")
+                        || registered == 0
+                        || seen.get("event=demand_exited") != Some(&registered)
+                        || sender.field("source") == sender.field("destination")
+                        || seen.contains_key("event=stop_started")
+                    {
+                        return None;
+                    }
+                    events
+                        .iter()
+                        .find(|(trigger, seen)| {
+                            sender.backend != trigger.backend
+                                && sender.shares_input(trigger)
+                                && seen.contains_key("event=deliver_parked")
+                        })
+                        .map(|(trigger, _)| (sender.clone(), trigger.clone(), registered))
+                })
+            {
+                break (sender, trigger, register_count);
+            }
+            match actor.done.try_recv() {
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                result => bail!(
+                    "the original write exited before its live Grant-only interleaving: {result:?}"
+                ),
+            }
+            thread::sleep(
+                context
+                    .remaining("observe the original Grant-only sender and its sibling")?
+                    .min(Duration::from_millis(20)),
+            );
+        };
+        anyhow::ensure!(
+            sender.field("source")
+                == context
+                    .handle()
+                    .backend_process_id(sender.backend)?
+                    .to_string(),
+            "Grant subscriber must be the actual remote sender"
+        );
+        context.action(format!(
+            "hold the original RPC-free Grant sender {} and release sibling {}",
+            sender.fields, trigger.fields,
+        ));
+        context.handle().end_selected_query_lifecycle_fault(
+            trigger.backend,
+            GRANT_ONLY_HOLD,
+            &selected.token,
+        )?;
+        let outcome = actor
+            .done
+            .recv_timeout(context.remaining("await the original root Connector failure")?)?;
+        let deadline = context.deadline();
+        let snapshot = context
+            .handle()
+            .await_query_lifecycle_statement_observation(actor.observation(), false, deadline)?;
+        let expected = WriteFault::RootValidation
+            .originating_connector_fact()
+            .unwrap();
+        assert_connector_failure(
+            context,
+            &outcome,
+            Some(&snapshot),
+            expected,
+            "Grant-only writer stop",
+        )?;
+        let Some(QueryLifecycleFailureSite::Task { identity, .. }) = snapshot.failure_site else {
+            bail!("the original failure lost its Task identity");
+        };
+        anyhow::ensure!(
+            snapshot.execution_id.as_deref() == Some(sender.field("execution_id"))
+                && identity.backend_process_id().to_string() == sender.field("destination")
+                && identity.stage_id().get().to_string() == sender.field("destination_stage")
+                && identity.task_id().get().to_string() == sender.field("destination_task"),
+            "the original Connector failure came from another receiver Task: {identity}"
+        );
+        let events = grant_only_events(context)?;
+        let seen = &events[&sender];
+        anyhow::ensure!(
+            seen.contains_key("event=parked_delivery_stopped")
+                && !seen.contains_key("event=deliver_unparked")
+                && seen.get("event=demand_started") == Some(&register_count)
+                && seen.get("event=demand_exited") == Some(&register_count),
+            "a new unary or missing actual stop overlapped the original subscriber: {seen:?}"
+        );
+        let terminal = format!(
+            "{} execution_id={} stage={} task={} backend={} state=ABORTED",
+            novarocks_failpoint::observation_marker::TASK_TERMINAL_RETAINED,
+            sender.field("execution_id"),
+            sender.field("source_stage"),
+            sender.field("source_task"),
+            sender.field("source"),
+        );
+        let abort = format!(
+            "{PARTICIPATION_ABORT_APPLIED} execution_id={} ",
+            sender.field("execution_id")
+        );
+        let sender_log = context.handle().be_current_log_contents(sender.backend)?;
+        anyhow::ensure!(
+            sender_log
+                .find(&abort)
+                .zip(sender_log.find(&terminal))
+                .is_some_and(|(control, exit)| control < exit),
+            "the original FE Abort and actual retained sender termination must both occur: {terminal}"
+        );
+        assert_commit_never_invoked(
+            publication,
+            publication_terminals(context, WRITE_FAMILY)?,
+            "Grant-only writer stop",
+        )?;
+        std::fs::write(
+            context.scenario_root().join("grant-only-exchange.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "held_sender": sender.fields,
+                "released_sibling": trigger.fields,
+                "sender_backend_index": sender.backend,
+                "register_calls_settled_at_release": register_count,
+                "held_sender_events": seen,
+                "worker_abort": abort,
+                "sender_terminal_after_abort": terminal,
+                "accepted_root_task": identity.to_string(),
+                "accepted_connector_reason": expected.reason().code(),
+            }))?,
+        )?;
+        Ok(outcome)
+    })();
+    let retired = retire_selected_writer_faults(context, &selected);
+    let outcome = actor.settle(context, retain_write_result(primary, retired))?;
+    anyhow::ensure!(
+        matches!(outcome, Err(StatementFailure::Trino(_))),
+        "Grant-only write must fail"
+    );
+    anyhow::ensure!(
+        row_count(control, target)? == 0 && snapshot_count(control, target)? == snapshots,
+        "Grant-only write committed rows or a snapshot"
+    );
+    Ok(())
 }
 
 fn verify_materialization_fault(

@@ -150,6 +150,13 @@ impl NativeExchangeDataPlane {
                             Err(fact) => codec::DecodedExchangeDeliveryOutcome::Refused(fact),
                         }
                 }
+                Err(InboundFrameClaim::FailureStopped { sender_count: expected })
+                    if sender_count == expected =>
+                {
+                    codec::DecodedExchangeDeliveryOutcome::Refused(
+                        novarocks_execution::runtime::task::io::exchange_unit::EXCHANGE_ROUTE_FAILURE_STOP,
+                    )
+                }
                 Err(claim) => {
                     codec::DecodedExchangeDeliveryOutcome::Refused(unit_claim_failure(claim))
                 }
@@ -204,6 +211,9 @@ impl NativeExchangeDataPlane {
                 Err(InboundFrameClaim::NormallyClosed(proof)) => {
                     unit_normal_close_facts(proof, stream, None)
                 }
+                Err(InboundFrameClaim::FailureStopped { .. }) => Err(
+                    novarocks_execution::runtime::task::io::exchange_unit::EXCHANGE_ROUTE_FAILURE_STOP,
+                ),
                 Err(claim) => Err(unit_claim_failure(claim)),
             };
             outcomes.push(codec::DecodedExchangeDemandResult { stream, outcome });
@@ -313,6 +323,7 @@ fn unit_claim_failure(
 ) -> novarocks_execution_contract::failure::FailureFact {
     match claim {
         InboundFrameClaim::NormallyClosed(_)
+        | InboundFrameClaim::FailureStopped { .. }
         | InboundFrameClaim::NotHeld
         | InboundFrameClaim::Refused(_)
         | InboundFrameClaim::Authorized => unit_route_failure(460),
@@ -378,6 +389,70 @@ mod tests {
         assert!(
             matches!(outcome,codec::DecodedExchangeDeliveryOutcome::Refused(fact) if fact.reason().code()==460)
         );
+    }
+    #[test]
+    fn failed_installed_route_projects_only_correlated_stop_observations() {
+        use novarocks_execution::runtime::task::io::exchange_unit::{
+            EXCHANGE_ROUTE_FAILURE_STOP, ExchangeUnitSequence,
+        };
+        let mut frame = request();
+        let plane = plane(&frame);
+        let stream = frame.stream;
+        let descriptor = crate::exchange_transmitter::tests::unit_frame_descriptor(stream);
+        plane
+            .unit_capabilities
+            .install(Arc::new(descriptor.clone()))
+            .unwrap();
+        plane.unit_capabilities.stop_failed_task(&descriptor);
+        plane.unit_capabilities.remove(&descriptor);
+        let caller = stream.source().task().backend_process_id();
+        let request = codec::encode_delivery_request(frame.clone());
+        let response = plane.deliver_unit(request, caller).unwrap();
+        assert!(matches!(
+            codec::decode_delivery_response(&response, stream, frame.item.sequence(), FieldPath::root("test")).unwrap(),
+            codec::DecodedExchangeDeliveryOutcome::Refused(fact) if fact == EXCHANGE_ROUTE_FAILURE_STOP
+        ));
+        assert!(
+            codec::decode_delivery_response(
+                &response,
+                stream,
+                ExchangeUnitSequence::FIRST,
+                FieldPath::root("test"),
+            )
+            .is_err()
+        );
+        frame.sender_count += 1;
+        let wrong_count = plane
+            .deliver_unit(codec::encode_delivery_request(frame.clone()), caller)
+            .unwrap();
+        assert!(matches!(
+            codec::decode_delivery_response(&wrong_count, stream, frame.item.sequence(), FieldPath::root("test")).unwrap(),
+            codec::DecodedExchangeDeliveryOutcome::Refused(fact) if fact == unit_route_failure(460)
+        ));
+        for operation in [
+            codec::ExchangeDemandOperation::Demand(
+                novarocks_execution_contract::ordered_retained_stream::exchange::ExchangeUnitDemand {
+                    sequence: ExchangeUnitSequence::FIRST,
+                    wire_bytes: 1,
+                },
+            ),
+            codec::ExchangeDemandOperation::StopSender,
+        ] {
+            let request = codec::encode_demand_request(
+                &[codec::DecodedExchangeDemandEntry { stream, operation }],
+                FieldPath::root("test"),
+            ).unwrap();
+            let response = plane.register_unit_demands(request, caller).unwrap();
+            let results = codec::decode_demand_response(&response, &[stream], FieldPath::root("test")).unwrap();
+            assert_eq!(results[0].outcome, Err(EXCHANGE_ROUTE_FAILURE_STOP));
+            let other = ExchangeStreamIdentity::try_new(
+                descriptor.topology().inbound()[0].sources()[0],
+                stream.destination(),
+                stream.destination_task_key(),
+                stream.destination_node(),
+            ).unwrap();
+            assert!(codec::decode_demand_response(&response, &[other], FieldPath::root("test")).is_err());
+        }
     }
     #[test]
     fn malformed_unit_envelope_is_refused_before_worker_or_receiver_authorization() {

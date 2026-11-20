@@ -221,6 +221,10 @@ mod owner_tests {
             self.cancelled.fetch_add(1, Ordering::SeqCst);
             self.delegate.cancel(key);
         }
+        fn cancel_failed(&self, key: ExchangeReceiverKey) {
+            self.cancelled.fetch_add(1, Ordering::SeqCst);
+            self.delegate.cancel_failed(key);
+        }
         fn remove(&self, key: ExchangeReceiverKey) {
             self.removed.fetch_add(1, Ordering::SeqCst);
             self.delegate.remove(key);
@@ -1949,6 +1953,9 @@ mod owner_tests {
         }
         fn cancel(&self, key: ExchangeReceiverKey) {
             self.inner.cancel(key);
+        }
+        fn cancel_failed(&self, key: ExchangeReceiverKey) {
+            self.inner.cancel_failed(key);
         }
         fn remove(&self, key: ExchangeReceiverKey) {
             self.inner.remove(key);

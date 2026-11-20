@@ -49,8 +49,9 @@ use crate::runtime::task::ExecutionReason;
 use super::ExchangeFrameTransmitter;
 use super::exchange::ExchangeNormalCloseAccepted;
 use super::exchange_unit::{
-    ExchangeCallActivity, ExchangeCallOutcome, ExchangeDemandCallOutcome, ExchangeDemandEntry,
-    ExchangeDemandOperation, ExchangeGrantNotice, ExchangeUnitFrame, ExchangeUnitReceiverFrame,
+    EXCHANGE_ROUTE_FAILURE_STOP, ExchangeCallActivity, ExchangeCallOutcome,
+    ExchangeDemandCallOutcome, ExchangeDemandEntry, ExchangeDemandOperation, ExchangeGrantNotice,
+    ExchangeUnitFrame, ExchangeUnitReceiverFrame,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -365,6 +366,9 @@ pub enum ExchangeStreamSenderStatus {
     Open,
     /// Every item is in receiver custody. This does not author Consumed.
     CustodyComplete,
+    /// The destination fenced this exact route. The original Task still
+    /// owns the decision to stop this execution.
+    AwaitingTaskStop,
     Withdrawn,
     Stopped,
     Failed(FailureFact),
@@ -695,6 +699,27 @@ impl ExchangeStreamSender {
         self.notify();
     }
 
+    fn observe_failure_stop(self: &Arc<Self>) {
+        {
+            let mut state = self.state.lock().expect("exchange stream sender lock");
+            state.stop_obligation = ExchangeSenderStopState::RouteRetired;
+            if matches!(
+                state.status,
+                ExchangeStreamSenderStatus::Open | ExchangeStreamSenderStatus::CustodyComplete
+            ) {
+                state.status = ExchangeStreamSenderStatus::AwaitingTaskStop;
+                state.kernel.seal();
+                state.payloads.clear();
+                state.pending = None;
+                state.replay_due.clear();
+                state.retry_pending.clear();
+            }
+        }
+        self.stop_cancellation.cancel();
+        self.notify();
+        self.refresh();
+    }
+
     fn drive_stop(self: &Arc<Self>) {
         {
             let mut state = self.state.lock().expect("exchange stream sender lock");
@@ -785,6 +810,11 @@ impl ExchangeStreamSender {
                             self.merge_locked(&mut state, facts)
                         }
                         Ok(_) => Err(contract_failure()),
+                        Err(failure) if failure == EXCHANGE_ROUTE_FAILURE_STOP => {
+                            drop(state);
+                            self.observe_failure_stop();
+                            return;
+                        }
                         Err(failure) => Err(failure),
                     }
                 }
@@ -877,6 +907,9 @@ impl ExchangeStreamSender {
         state: &mut SenderState,
         facts: ExchangeStreamFacts,
     ) -> Result<Option<ExchangeNormalCloseAccepted>, FailureFact> {
+        if state.status == ExchangeStreamSenderStatus::AwaitingTaskStop {
+            return Ok(None);
+        }
         let custody_through = self.validate_facts_locked(state, facts)?;
         let confirms_stop = facts.sender_stopped || facts.receiver_closed.is_some();
         if matches!(
@@ -926,6 +959,9 @@ impl ExchangeStreamSender {
     fn observe(self: &Arc<Self>, notice: ExchangeGrantNotice) {
         let result = {
             let mut state = self.state.lock().expect("exchange stream sender lock");
+            if state.status == ExchangeStreamSenderStatus::AwaitingTaskStop {
+                return;
+            }
             match notice {
                 ExchangeGrantNotice::Facts(facts) => self.merge_locked(&mut state, facts),
                 ExchangeGrantNotice::Refused(failure) => Err(failure),
@@ -1083,6 +1119,9 @@ impl ExchangeStreamSender {
                 }
                 match results[0].1 {
                     Ok(facts) => self.observe(ExchangeGrantNotice::Facts(facts)),
+                    Err(failure) if failure == EXCHANGE_ROUTE_FAILURE_STOP => {
+                        self.observe_failure_stop();
+                    }
                     Err(failure) => self.fail(failure),
                 }
             }
@@ -1256,6 +1295,9 @@ impl ExchangeStreamSender {
         match outcome {
             ExchangeCallOutcome::Observed(receipt) => {
                 self.observe(ExchangeGrantNotice::Facts(receipt.facts))
+            }
+            ExchangeCallOutcome::Refused(failure) if failure == EXCHANGE_ROUTE_FAILURE_STOP => {
+                self.observe_failure_stop();
             }
             ExchangeCallOutcome::Refused(failure) => self.fail(failure),
             ExchangeCallOutcome::NotProcessed(_) | ExchangeCallOutcome::Unknown(_) => {

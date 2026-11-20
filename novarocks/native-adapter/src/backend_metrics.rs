@@ -951,7 +951,7 @@ impl BackendMetricsRegistry {
         let inbound = self
             .inbound_retention
             .as_ref()
-            .and_then(|owner| owner.try_normal_close_retention_snapshot())
+            .and_then(|owner| owner.try_inbound_retention_snapshot())
             .and_then(inbound_retention_values);
         self.protocol_retention_available
             .with_label_values(&["inbound"])

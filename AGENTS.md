@@ -383,7 +383,7 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
 
 - `novarocks/execution/src/runtime/function_set.rs`
   只封存真实 EngineFunctionCatalog metadata；不持有旧实现 map、legacy registry 或 implementation manifest。
-  `novarocks/version/src/lib.rs` 的 material encoding domain 为 v8，生产 epoch 为 15、test-only 为 13；旧执行实现摘要不再参与，
+  `novarocks/version/src/lib.rs` 的 material encoding domain 为 v8，生产 epoch 为 16、test-only 为 13；旧执行实现摘要不再参与，
   函数目录、pure 目录、descriptor、plan contract 与 Provider/carrier 事实仍保持 exact-island 判定。
 
 - `novarocks/execution/src/exec/operators/**`
@@ -461,6 +461,9 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
 - `novarocks/execution/src/runtime/{exchange.rs,exchange/unit_ingress.rs,exchange_slots.rs}`
   接收 registry、原队列与结构 slot owner。唯一解码资格、提交、真实移交和退休由同一实例串行化；
   roster 与原 Task failure owner 在 Installed 前冻结，slot 只数单元，不是内存容量。
+  接收路由的失败封闭由 Worker 保留准确 roster 到原请求期限。Native 在已核对的一元回执中投影
+  原停止事实，发送流停发并等待原 Task 控制链。失败退役释放接收资源，已取得的 decode lease
+  仍按实际退出结算。
 
 - `novarocks/execution/src/runtime/task/io/**`
   `exchange_edge.rs` 拥有 Installed/正常撤回门；`exchange_sender_group.rs` 将同一 factory 的

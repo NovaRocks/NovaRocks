@@ -88,19 +88,22 @@ impl StaticPlanInterpreter {
 
 /// Explicit compatibility epoch for an execution-contract change that cannot
 /// be represented by the descriptor or the closed carrier manifest.
+/// Epoch 16 carries exact Exchange route failure stops in the existing
+/// refusal envelope. Epoch-15 senders treat this observation as a new Task
+/// failure, so they cannot share the same island.
+///
 /// Planner-declared row assertion violations change the package descriptor and
 /// plan contract revision, so those exact inputs separate their compatibility
 /// islands without an additional execution-only epoch change.
 /// Node-owned expression units and relation Window calls change the package
 /// descriptor and plan contract revision 27. Those exact-island inputs already
-/// distinguish the interpretation; the execution-only epoch remains 15.
+/// distinguished that update without increasing its execution-only epoch.
 ///
 /// RWM-7 retires COW vocabulary and freezes explicit writer W/T declarations,
 /// projected writer values and selected-assignment construction in the package
 /// descriptor and current plan revision 27. Iceberg revision 10 also freezes the private
 /// DATA input seal and removes its retired read proof. These exact components
-/// already separate the new interpretation from prior peers; epoch 15 remains
-/// unchanged because no additional execution-only boundary is unrepresented.
+/// separated that update from prior peers without an execution-only change.
 ///
 /// Epoch 15 gives signed integer arithmetic its declared width, checked
 /// overflow and integer division semantics. Epoch-14 peers interpret the same
@@ -139,7 +142,7 @@ impl StaticPlanInterpreter {
 /// boundary under the synchronous creation and direct release contract, so
 /// the two never share an island.
 #[cfg(not(feature = "native-compatibility-test-fixture"))]
-pub const NATIVE_COMPAT_EPOCH: u64 = 15;
+pub const NATIVE_COMPAT_EPOCH: u64 = 16;
 
 /// Test-only alternate epoch used to produce an actual different-island binary.
 #[cfg(feature = "native-compatibility-test-fixture")]
@@ -696,7 +699,7 @@ mod tests {
         #[cfg(feature = "native-compatibility-test-fixture")]
         assert_eq!(NATIVE_COMPAT_EPOCH, 13);
         #[cfg(not(feature = "native-compatibility-test-fixture"))]
-        assert_eq!(NATIVE_COMPAT_EPOCH, 15);
+        assert_eq!(NATIVE_COMPAT_EPOCH, 16);
     }
     #[test]
     fn receiver_authorized_exchange_isolates_the_previous_write_runtime_and_test_island() {
@@ -711,7 +714,7 @@ mod tests {
             )
             .unwrap()
         };
-        for previous in [10, 11] {
+        for previous in [10, 11, 15] {
             assert_ne!(NATIVE_COMPAT_EPOCH, previous);
             assert_ne!(at(NATIVE_COMPAT_EPOCH).id(), at(previous).id());
         }

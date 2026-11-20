@@ -16,13 +16,18 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{BackendDataRuntime, NativeRpcClient};
 
-pub fn grpc_exchange_transmitter(
+#[cfg(novarocks_dev_controls)]
+pub(crate) struct ExchangeTestHooks {
+    pub(crate) observations:
+        Option<Arc<crate::test_observation_controls::NativeObservationControls>>,
+    pub(crate) faults: Arc<crate::test_controls::NativeTestControls>,
+}
+
+pub(crate) fn grpc_exchange_transmitter(
     runtime: BackendDataRuntime,
     send_timeout: Duration,
     capabilities: Arc<novarocks_worker::TaskInboundCapabilities>,
-    #[cfg(novarocks_dev_controls)] observations: Option<
-        Arc<crate::test_observation_controls::NativeObservationControls>,
-    >,
+    #[cfg(novarocks_dev_controls)] test: Option<ExchangeTestHooks>,
 ) -> Arc<dyn ExchangeFrameTransmitter> {
     let grants = crate::exchange_grant_subscription::ExchangeGrantClients::new(
         runtime.clone(),
@@ -34,17 +39,74 @@ pub fn grpc_exchange_transmitter(
         capabilities,
         grants,
         #[cfg(novarocks_dev_controls)]
-        observations,
+        test,
     })
 }
 
 struct GrpcExchangeFrameTransmitter {
     #[cfg(novarocks_dev_controls)]
-    observations: Option<Arc<crate::test_observation_controls::NativeObservationControls>>,
+    test: Option<ExchangeTestHooks>,
     runtime: BackendDataRuntime,
     send_timeout: Duration,
     capabilities: Arc<novarocks_worker::TaskInboundCapabilities>,
     grants: Arc<crate::exchange_grant_subscription::ExchangeGrantClients>,
+}
+
+#[cfg(novarocks_dev_controls)]
+fn observe_grant_only(
+    observer: Option<&dyn novarocks_execution::runtime::exchange::TestEventObserver>,
+    stream: novarocks_execution_contract::ExchangeStreamIdentity,
+    event: &str,
+) {
+    let Some(observer) = observer.filter(|observer| observer.is_active()) else {
+        return;
+    };
+    let source = stream.source().task();
+    let destination = stream.destination();
+    let execution = source.query_execution_id();
+    observer.observe(&format!(
+        "{} event={event} execution_id={}:{}:{} source={} source_stage={} source_task={} destination={} destination_stage={} destination_task={} node_id={}",
+        novarocks_failpoint::observation_marker::EXCHANGE_GRANT_ONLY_PROBE,
+        execution.query_id().high(), execution.query_id().low(), execution.attempt_id().get(),
+        source.backend_process_id(), source.stage_id().get(), source.task_id().get(),
+        destination.backend_process_id(), destination.stage_id().get(), destination.task_id().get(),
+        stream.destination_node().get(),
+    ));
+}
+
+#[cfg(novarocks_dev_controls)]
+impl GrpcExchangeFrameTransmitter {
+    fn grant_probe(
+        &self,
+        stream: novarocks_execution_contract::ExchangeStreamIdentity,
+    ) -> Result<Option<crate::test_controls::NativeFaultClaim>, String> {
+        self.test.as_ref().map_or(Ok(None), |test| {
+            let source = stream.source().task();
+            test.faults.claim(
+                novarocks_failpoint::QueryLifecycleFaultKind::ExchangeDeliverBeforeRpcHold,
+                source.query_execution_id(),
+                source.backend_process_id(),
+                true,
+            )
+        })
+    }
+
+    fn probe_observer(
+        &self,
+        stream: novarocks_execution_contract::ExchangeStreamIdentity,
+    ) -> Result<Option<Arc<dyn novarocks_execution::runtime::exchange::TestEventObserver>>, String>
+    {
+        self.test
+            .as_ref()
+            .and_then(|test| test.observations.as_deref())
+            .map_or(Ok(None), |controls| {
+                controls.observation_for(
+                    novarocks_failpoint::observation_marker::ObservationAction::ExchangeSnapshot
+                        .as_str(),
+                    stream.source().task().query_execution_id(),
+                )
+            })
+    }
 }
 
 // The inner future (including a never-polled retry closure) is destroyed before
@@ -117,16 +179,10 @@ impl ExchangeFrameTransmitter for GrpcExchangeFrameTransmitter {
         {
             return;
         }
-        let Some(controls) = self.observations.as_deref() else {
-            return;
-        };
         // The original sender has already accepted these facts. Observation
         // authorization can suppress diagnostics, but cannot roll back that
         // acceptance or turn it into a new protocol failure.
-        let Ok(Some(observer)) = controls.observation_for(
-            novarocks_failpoint::observation_marker::ObservationAction::ExchangeSnapshot.as_str(),
-            stream.source().task().query_execution_id(),
-        ) else {
+        let Ok(Some(observer)) = self.probe_observer(stream) else {
             return;
         };
         observer.observe(&format!(
@@ -155,19 +211,8 @@ impl ExchangeFrameTransmitter for GrpcExchangeFrameTransmitter {
         // Keep the original pre-dispatch binding check: a conflicting
         // observation scope still refuses this request before any I/O.
         #[cfg(novarocks_dev_controls)]
-        let _observer = match self
-            .observations
-            .as_deref()
-            .map(|controls| {
-                controls.observation_for(
-                    novarocks_failpoint::observation_marker::ObservationAction::ExchangeSnapshot
-                        .as_str(),
-                    stream.source().task().query_execution_id(),
-                )
-            })
-            .transpose()
-        {
-            Ok(observer) => observer.flatten(),
+        let observer = match self.probe_observer(stream) {
+            Ok(observer) => observer,
             Err(_) => {
                 done(ExchangeCallOutcome::Refused(unit_failure(
                     novarocks_execution_contract::failure::FailureClass::Invariant,
@@ -219,9 +264,39 @@ impl ExchangeFrameTransmitter for GrpcExchangeFrameTransmitter {
         }
         let runtime = self.runtime.clone();
         let timeout = self.send_timeout;
+        #[cfg(novarocks_dev_controls)]
+        let hold = self.grant_probe(stream);
         spawn_exchange_call(&self.runtime, activity, async move {
             #[cfg(novarocks_dev_controls)]
-            let _observation = _observer;
+            match hold {
+                Ok(Some(hold)) => {
+                    if let Err(detail) = hold.record_hit() {
+                        done(ExchangeCallOutcome::NotProcessed(detail.into()));
+                        return;
+                    }
+                    observe_grant_only(observer.as_deref(), stream, "deliver_parked");
+                    tokio::select! {
+                        biased;
+                        _ = stop.cancelled() => {
+                            observe_grant_only(observer.as_deref(), stream, "parked_delivery_stopped");
+                            done(ExchangeCallOutcome::NotProcessed("selected delivery stopped before RPC".into()));
+                            return;
+                        }
+                        release = hold.wait_for_action_end() => {
+                            if let Err(detail) = release {
+                                done(ExchangeCallOutcome::NotProcessed(detail.into()));
+                                return;
+                            }
+                        }
+                    }
+                    observe_grant_only(observer.as_deref(), stream, "deliver_unparked");
+                }
+                Ok(None) => {}
+                Err(detail) => {
+                    done(ExchangeCallOutcome::NotProcessed(detail.into()));
+                    return;
+                }
+            }
             let client = NativeRpcClient::new_backend_endpoint(
                 runtime,
                 frame.destination.native_endpoint().clone(),
@@ -326,10 +401,9 @@ impl ExchangeFrameTransmitter for GrpcExchangeFrameTransmitter {
         }
         // Encoding is complete before the asynchronous request takes over.
         drop(entries);
-        // Read only the original destination Context's positive abort fact.
         // Same-process routing still uses Native RPC for data and ordinary
-        // control. This fact discharges only an already-stopped stream's debt;
-        // it neither fabricates receiver facts nor releases request activity.
+        // control. Only the exact installed route's stop proof discharges
+        // this already-stopped stream's debt locally.
         if stopping_one
             && first.source().task().query_execution_id()
                 == first.destination().query_execution_id()
@@ -337,16 +411,33 @@ impl ExchangeFrameTransmitter for GrpcExchangeFrameTransmitter {
                 == Some(novarocks_native_trust::NativeProcessIdentity::Backend(
                     first.destination().backend_process_id(),
                 ))
-            && self
-                .capabilities
-                .participation_admission_aborted(first.destination().query_execution_id())
+            && matches!(
+                self.capabilities.claim_stream(first),
+                Err(novarocks_worker::InboundFrameClaim::FailureStopped { .. })
+            )
         {
             done(ExchangeDemandCallOutcome::RouteRetired(first));
             return;
         }
         let runtime = self.runtime.clone();
         let timeout = self.send_timeout;
+        #[cfg(novarocks_dev_controls)]
+        let observer = self
+            .grant_probe(first)
+            .ok()
+            .flatten()
+            .and_then(|_| self.probe_observer(first).ok().flatten());
         spawn_exchange_call(&self.runtime, activity, async move {
+            #[cfg(novarocks_dev_controls)]
+            observe_grant_only(
+                observer.as_deref(),
+                first,
+                if stopping_one {
+                    "stop_started"
+                } else {
+                    "demand_started"
+                },
+            );
             let outcome = async move {
                 let client = NativeRpcClient::new_backend_endpoint(
                     runtime,
@@ -381,6 +472,16 @@ impl ExchangeFrameTransmitter for GrpcExchangeFrameTransmitter {
                 }
             }
             .await;
+            #[cfg(novarocks_dev_controls)]
+            observe_grant_only(
+                observer.as_deref(),
+                first,
+                if stopping_one {
+                    "stop_exited"
+                } else {
+                    "demand_exited"
+                },
+            );
             done(outcome);
         });
     }
@@ -391,6 +492,17 @@ impl ExchangeFrameTransmitter for GrpcExchangeFrameTransmitter {
         stream: novarocks_execution_contract::ExchangeStreamIdentity,
         wake: novarocks_execution::runtime::task::io::exchange_unit::ExchangeGrantWake,
     ) -> Result<(), novarocks_execution_contract::failure::FailureFact> {
+        #[cfg(novarocks_dev_controls)]
+        if self.grant_probe(stream).ok().flatten().is_some()
+            && let Ok(Some(observer)) = self.probe_observer(stream)
+        {
+            return self.grants.watch(destination, stream, Arc::new(move |notice| {
+                if matches!(&notice, novarocks_execution::runtime::task::io::exchange_unit::ExchangeGrantNotice::Facts(_)) {
+                    observe_grant_only(Some(observer.as_ref()), stream, "grant_observed");
+                }
+                wake(notice);
+            }));
+        }
         self.grants.watch(destination, stream, wake)
     }
 
@@ -545,6 +657,37 @@ pub(crate) mod tests {
                 next_demand: None,
             },
         }
+    }
+
+    pub(crate) fn unit_frame_descriptor(
+        stream: ExchangeStreamIdentity,
+    ) -> novarocks_execution_contract::TaskDescriptor {
+        use novarocks_execution_contract::{
+            ExchangeDeliveryRequirement, ExchangeInbound, ExchangeTopology, TaskDescriptor,
+        };
+        let other = TaskIdentity::new(
+            stream.source().task().query_execution_id(),
+            stream.source().task().stage_id(),
+            TaskId::new(3).unwrap(),
+            stream.source().task().backend_process_id(),
+        );
+        let input = ExchangeInbound::try_new(
+            stream.destination_node(),
+            vec![
+                ExchangeSource::new(other, UniqueId::new(31, 32), 0),
+                stream.source(),
+            ],
+            ExchangeDeliveryRequirement::MustDrain,
+        )
+        .unwrap();
+        TaskDescriptor::try_new(
+            stream.destination(),
+            stream.destination_task_key(),
+            std::num::NonZeroUsize::MIN,
+            Vec::new(),
+            ExchangeTopology::try_new(Vec::new(), vec![input]).unwrap(),
+        )
+        .unwrap()
     }
     fn response(
         frame: &ExchangeUnitFrame,
@@ -820,7 +963,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn only_the_local_destination_abort_fence_retires_stop_without_dialing() {
+    fn only_the_exact_local_destination_abort_fence_retires_stop_without_dialing() {
         use novarocks_execution::runtime::task::io::exchange_unit::{
             ExchangeDemandCallOutcome, ExchangeDemandEntry, ExchangeDemandOperation,
         };
@@ -870,6 +1013,8 @@ pub(crate) mod tests {
             call(stream, ExchangeDemandOperation::StopSender),
             ExchangeDemandCallOutcome::NotProcessed(_)
         ));
+        let descriptor = unit_frame_descriptor(stream);
+        capabilities.install(Arc::new(descriptor.clone())).unwrap();
         capabilities.close_participation(participation);
         assert!(matches!(
             call(stream, ExchangeDemandOperation::StopSender),
@@ -892,6 +1037,7 @@ pub(crate) mod tests {
         // The original positive abort fences all routes and late installation
         // even after their receiver descriptors have actually been removed.
         capabilities.abort_participation(participation);
+        capabilities.remove(&descriptor);
         assert!(
             matches!(call(stream, ExchangeDemandOperation::StopSender), ExchangeDemandCallOutcome::RouteRetired(actual) if actual == stream)
         );

@@ -582,7 +582,10 @@ fn compose_backend_application_services(
             execution_runtime.exchange_flow_limits().transport_timeout(),
             Arc::clone(&inbound_capabilities),
             #[cfg(novarocks_dev_controls)]
-            test_session.and_then(|session| session.observation.clone()),
+            test_session.map(|session| crate::exchange_transmitter::ExchangeTestHooks {
+                observations: session.observation.clone(),
+                faults: Arc::clone(&session.native),
+            }),
         ),
         native_result_writer(
             Arc::clone(&result_retained_budget),
