@@ -153,7 +153,6 @@ pub(crate) fn evaluation_error(error: SqlConstantEvaluationError) -> DdlProperty
                 QueryServiceError::from_failure_cause(cause).into()
             }
         }
-        SqlConstantEvaluationError::Evaluation(message) => internal(message),
     }
 }
 
