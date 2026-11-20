@@ -27,6 +27,11 @@ pub(crate) mod attempt;
     reason = "The row-delta validator and dispatch integrate this contract in subsequent stages"
 )]
 pub(crate) mod conflict;
+#[allow(
+    dead_code,
+    reason = "The row-mutation publication connects the conflict scope in P07"
+)]
+pub(crate) mod conflict_scope;
 mod data_file;
 pub mod data_writer;
 pub(crate) mod dependency;

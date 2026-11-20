@@ -46,6 +46,7 @@ pub(crate) struct CandidateFile<'a> {
     /// Metadata of the same observation, including historical partition specs.
     pub(crate) metadata: &'a TableMetadata,
     pub(crate) spec_id: i32,
+    pub(crate) metadata: &'a crate::iceberg::spec::TableMetadata,
     pub(crate) file: &'a DataFile,
 }
 
