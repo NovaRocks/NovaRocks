@@ -10,3 +10,7 @@ catalogs = []
 # These are the defaults. A table's write.target-file-size-bytes overrides
 # the file target. A catalog session can lower its open-partition cap with
 # SET SESSION lake.max_partitions_per_writer = 32, where lake is the catalog.
+
+# Opt in to ALTER TABLE EXECUTE add_files on this Iceberg catalog.
+# The property is a string Boolean and defaults to "false".
+# "iceberg.add-files-procedure.enabled" = "true"

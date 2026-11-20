@@ -6,6 +6,9 @@ status: active
 supersedes: []
 superseded-by: null
 partially-superseded-by:
+  - id: ADR-0244
+    scope: "Section 1 ADD FILES dependency on the exact main reference"
+    link: "ADR-0244-iceberg-add-files-uses-read-binding-and-atomic-registration.md"
   - id: ADR-0239
     scope: "Section 1 addition representation for compact receiving; WholeSet intents, dependencies, inheritance and publication authority remain active"
     link: "ADR-0239-iceberg-compact-receiving-and-rolling-manifests.md"
@@ -43,6 +46,8 @@ code-anchors:
   - "novarocks/connector/iceberg/src/commit/recovery.rs (FrozenPublicationFacts)"
   - "novarocks/connector/iceberg/src/catalog_control/staged_create/publication.rs (publish)"
 ---
+
+> 第 1 节的 ADD FILES 依赖由 [ADR-0244](ADR-0244-iceberg-add-files-uses-read-binding-and-atomic-registration.md) 接替。登记在准确 main 快照上匹配候选，沿原提交内核冻结 ref 条件。
 
 ## 问题
 
