@@ -156,7 +156,7 @@ fn is_wire_encodable_literal_type(data_type: &DataType) -> bool {
     ) || novarocks_types::largeint::is_largeint_data_type(data_type)
 }
 
-// Design: ADR-0241 (docs/adr/ADR-0241-constant-folding-compiles-expression-units.md)
+// Design: ADR-0242 (docs/adr/ADR-0242-constant-folding-compiles-expression-units.md)
 pub(crate) struct FoldConstant;
 
 impl LogicalRewriteRule for FoldConstant {

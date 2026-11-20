@@ -1,5 +1,5 @@
 ---
-id: ADR-0241
+id: ADR-0242
 title: "Constant folding compiles expression units"
 domain: [sql-compiler, crate-boundary, pipeline-execution]
 status: active

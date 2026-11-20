@@ -5,7 +5,7 @@ domain: [sql-compiler, crate-boundary, pipeline-execution]
 status: active
 supersedes: []
 superseded-by: null
-partially-superseded-by: [ADR-0239, ADR-0241]
+partially-superseded-by: [ADR-0239, ADR-0242]
 date: 2026-11-17
 implementation-status: partial
 provenance:
@@ -62,7 +62,7 @@ code-anchors:
 2. **输入与环境规则。** `Value` 只能读取根作用域中的精确端口类型。Scan 端口只含 provider 输出，派生值在单元内引用定义。调用方保留真实常量 pool/ordinal、完整语义参数与策略；不制造默认环境、重建来源或复制单元常量表。
 3. **关系边界规则。** 节点字段引用本节点单元的 `RootOrdinal`；关系调用及 writer 物化输入使用真实关系身份和上下文。窗口调用属于 Window 节点，参数/函数内排序引用单元根，帧偏移直接引用常量，不能保留永不执行的 offset 根。关系效应仍由 Functions 实际 owner 重算并核对精确 proof、环境与完整输入类型。
 4. **声明与错误时点规则。** SQL 在降级期一次撰写全部标量和关系调用声明与静态请求；冻结 package 只验证原事实，不再补推导语义。准确能力拒绝随原降级报告，控制、资源与数据错误保留 typed 分类和原作者。
-   （标量调用的控制形状、调用声明与效应摘要归属由 [ADR-0241](ADR-0241-constant-folding-compiles-expression-units.md) 部分替代。）
+   （标量调用的控制形状、调用声明与效应摘要归属由 [ADR-0242](ADR-0242-constant-folding-compiles-expression-units.md) 部分替代。）
 5. **程序与兼容规则。** 终态 `LocalProgram` 持有编译单元表，节点或 sink 按单元与根引用它；BE 合成读取也经同一单元构造/编译入口。wire 单元只放 PhysicalNode 信封，退役字段号和名字保留。计划修订号推进至27、descriptor 摘要随之变化，epoch15保持；这条结构裁决不承诺跨版本互通。fragment 总量沿既有上限对全部单元求和，不新增按单元配额。
 6. **既有裁决关系。** [ADR-0153](ADR-0153-completed-physical-plan-is-the-static-execution-authority.md) 的完成 PhysicalPlan 静态权威与 [ADR-0185](ADR-0185-compiled-packages-are-the-sole-static-plan-path.md) 的唯一 compiled-package 路径继续有效；单元不成为第二份关系计划。词汇扩展遵循 [执行词汇 ADR-0216](ADR-0216-execution-vocabulary-participation-task-and-handles.md)。[必需常量 ADR-0222](ADR-0222-session-property-declarations-and-required-constant-evaluation.md) 的真实失败、精确类型与原受监督 CPU/lifecycle 继续有效，终态由独立空端口单元替代构造整份关系计划。
 

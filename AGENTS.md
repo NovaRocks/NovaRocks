@@ -360,7 +360,7 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
   `ScalarArena` 同寿命。折叠宿主沿原编译控制检查点，必需常量仍在 FE 原语句资源作用域求值。
   `novarocks/expression/src/call_authorship/**` 撰写标量调用控制形状、声明与效应摘要；
   SQL 核对原绑定、请求与来源日志，密封 Functions 目录随编译请求进入 SQL。
-  见 [ADR-0241](docs/adr/ADR-0241-constant-folding-compiles-expression-units.md)。
+  见 [ADR-0242](docs/adr/ADR-0242-constant-folding-compiles-expression-units.md)。
 
 - `novarocks/execution/src/exec/operators/compiled_expression.rs` 与 `novarocks/execution/src/runtime/scalar_memory.rs`
   Execution 在此绑定输入、控制、资源准入、结算与失败投影。`novarocks/execution/src/exec/expr/**` 承接存量测试与 fixture。
@@ -1304,7 +1304,7 @@ the guide differ.
   `novarocks/expression/src/compiled.rs`。节点端口、根及关系站点由 physical-plan 核对。
   SQL 降级调用表达式层的标量调用作者，并保有关系调用站点和来源核对。
   package 冻结和 BE 解码阶段只校验原始事实。折叠与标量调用作者见
-  [ADR-0241](docs/adr/ADR-0241-constant-folding-compiles-expression-units.md)。
+  [ADR-0242](docs/adr/ADR-0242-constant-folding-compiles-expression-units.md)。
   `novarocks/frontend-application/src/query_execution/required_constant_eval.rs` 直接编译必需常量的
   零端口单根单元，在同一原语句工作范围内求值。
 - **Package decode / compiled preparation**：从 `novarocks/plan-codec/src/physical_package_v2/**`、
