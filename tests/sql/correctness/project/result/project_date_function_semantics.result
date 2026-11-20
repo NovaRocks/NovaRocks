@@ -1,4 +1,4 @@
 -- query 1
--- legacy
+-- types	bigint	bigint
 years_diff_v	years_diff_neg_v
 1	-1

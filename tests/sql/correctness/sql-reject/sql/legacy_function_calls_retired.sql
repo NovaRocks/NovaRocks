@@ -51,11 +51,3 @@ SELECT map_apply((k,v) -> ROW(k,v), MAP(1, 2));
 -- query 9
 -- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR
 SELECT array_sum(ARRAY[1]);
-
--- query 10
-CREATE TABLE ${case_db}.function_retirement_source (v INTEGER) WITH (format_version = 3);
-
--- query 11
--- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR
-CREATE MATERIALIZED VIEW ${case_db}.function_retirement_mv AS
-SELECT md5sum(CAST(v AS VARCHAR)) AS v FROM ${case_db}.function_retirement_source;

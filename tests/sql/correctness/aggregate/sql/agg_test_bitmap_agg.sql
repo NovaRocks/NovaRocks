@@ -17,7 +17,7 @@
 
 -- Migrated from dev/test/sql/test_agg_function/R/test_bitmap_agg
 -- Test Objective:
--- Preserve legacy aggregate coverage in a self-contained SQL test case.
+-- Preserve COUNT(DISTINCT) over nullable inputs and over multiple selected columns.
 -- query 1
 -- @skip_result_check=true
 USE ${case_db};
@@ -48,106 +48,17 @@ INSERT INTO t1 values
     ROW(6, null, null, null, null, '36893488147419103232', '680564733841876926926749214863536422912');
 
 -- query 4
--- @skip_result_check=true
--- The legacy source checked StarRocks FE bitmap MV rewrite here. Keep this
--- aggregate case focused on bitmap aggregate semantics; MV rewrite coverage
--- belongs to the materialized-view suite.
-USE ${case_db};
-
--- query 5
--- @skip_result_check=true
-USE ${case_db};
-
--- query 6
--- @skip_result_check=true
-USE ${case_db};
-
--- query 7
--- @skip_result_check=true
-USE ${case_db};
-
--- query 8
--- @skip_result_check=true
-USE ${case_db};
-
--- query 9
--- @skip_result_check=true
-USE ${case_db};
-
--- query 10
--- @skip_result_check=true
-USE ${case_db};
-
--- query 11
--- @skip_result_check=true
-USE ${case_db};
-
--- query 12
--- @skip_result_check=true
-USE ${case_db};
-
--- query 13
--- @skip_result_check=true
-USE ${case_db};
-
--- query 14
 USE ${case_db};
 select c1, count(distinct c2) from t1 group by c1 order by c1;
 
--- query 15
+-- query 5
 USE ${case_db};
 select c1, count(DISTINCT c2), count(DISTINCT c3), count(DISTINCT c4) from t1 group by c1 order by c1;
 
--- query 16
+-- query 6
 USE ${case_db};
 select c1, count(distinct c2), count(distinct c3), count(distinct c4) from t1 group by c1 order by c1;
 
--- query 17
--- @skip_result_check=true
--- No materialized view is created in this aggregate-focused case.
-USE ${case_db};
-
--- query 18
--- @skip_result_check=true
-USE ${case_db};
-
--- query 19
--- @skip_result_check=true
-USE ${case_db};
-
--- query 20
--- @skip_result_check=true
-USE ${case_db};
-
--- query 21
--- @skip_result_check=true
-USE ${case_db};
-
--- query 22
--- @skip_result_check=true
-USE ${case_db};
-
--- query 23
--- @skip_result_check=true
-USE ${case_db};
-
--- query 24
--- @skip_result_check=true
-USE ${case_db};
-
--- query 25
--- @skip_result_check=true
-USE ${case_db};
-
--- query 26
--- @skip_result_check=true
-USE ${case_db};
-
--- query 27
+-- query 7
 USE ${case_db};
 select c1, count(distinct c2) from t1 group by c1 order by c1;
-
--- query 28
--- @skip_result_check=true
--- No materialized view is created in this aggregate-focused case.
-USE ${case_db};

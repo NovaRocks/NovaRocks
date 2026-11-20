@@ -18,7 +18,7 @@
 -- Migrated from dev/test/sql/test_grouping_sets/T/test_grouping_sets_v2
 -- Test Objective:
 -- 1. Validate GROUPING SETS, ROLLUP, CUBE with enable_rewrite_groupingsets_to_union_all=true.
--- 2. Validate GROUPING() and grouping() pseudo-columns.
+-- 2. Validate grouping masks and the declared result widths.
 -- 3. Cover NULL handling in grouping key columns.
 -- 4. Cover CTE + JOIN + multi_distinct_count / count(distinct) with grouping sets.
 
@@ -113,28 +113,28 @@ FROM tbl_with_null1 GROUP BY CUBE(k1, k2) ORDER BY k1, k2, v1;
 -- grouping_id/grouping with GROUPING SETS (k1)
 -- @order_sensitive=true
 USE ${case_db};
-SELECT k1, GROUPING(k1) AS f1, grouping(k1) AS f2, sum(k8) AS v1
+SELECT k1, CAST(GROUPING(k1) AS BIGINT) AS f1, grouping(k1) AS f2, sum(k8) AS v1
 FROM tbl_with_null1 GROUP BY GROUPING SETS((), (k1)) ORDER BY k1, f1, f2, v1;
 
 -- query 10
 -- grouping_id/grouping with GROUPING SETS (k1, k2)
 -- @order_sensitive=true
 USE ${case_db};
-SELECT k1, k2, GROUPING(k1, k2) AS f1, grouping(k1, k2) AS f2, sum(k8) AS v1
+SELECT k1, k2, CAST(GROUPING(k1, k2) AS BIGINT) AS f1, grouping(k1, k2) AS f2, sum(k8) AS v1
 FROM tbl_with_null1 GROUP BY GROUPING SETS((), (k1, k2)) ORDER BY f1, f2, k1, k2, v1;
 
 -- query 11
 -- grouping_id/grouping with CUBE(k1, k2)
 -- @order_sensitive=true
 USE ${case_db};
-SELECT k1, k2, GROUPING(k1, k2) AS f1, grouping(k1, k2) AS f2, sum(k8) AS v1
+SELECT k1, k2, CAST(GROUPING(k1, k2) AS BIGINT) AS f1, grouping(k1, k2) AS f2, sum(k8) AS v1
 FROM tbl_with_null1 GROUP BY CUBE(k1, k2) ORDER BY f1, f2, k1, k2, v1;
 
 -- query 12
 -- grouping_id/grouping with ROLLUP(k1, k2)
 -- @order_sensitive=true
 USE ${case_db};
-SELECT k1, k2, GROUPING(k1, k2) AS f1, grouping(k1, k2) AS f2, sum(k8) AS v1
+SELECT k1, k2, CAST(GROUPING(k1, k2) AS BIGINT) AS f1, grouping(k1, k2) AS f2, sum(k8) AS v1
 FROM tbl_with_null1 GROUP BY ROLLUP(k1, k2) ORDER BY f1, f2, k1, k2, v1;
 
 -- query 13

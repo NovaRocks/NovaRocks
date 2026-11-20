@@ -118,6 +118,11 @@ mod fold_frontiers {
 
     #[test]
     fn retired_trc_6d1_names_are_unknown_to_sql_analysis() {
+        use novarocks_functions::{
+            FunctionKind, FunctionVisibility, builtin::catalogue::builtin_engine_function_catalog,
+        };
+
+        let catalog = builtin_engine_function_catalog();
         let probe = Arc::new(FoldProbe::default());
         for name in [
             "__iceberg_transform_bucket",
@@ -238,6 +243,29 @@ mod fold_frontiers {
             "xx_hash3_64",
             "yearweek",
         ] {
+            for kind in [
+                FunctionKind::Scalar,
+                FunctionKind::Aggregate,
+                FunctionKind::Window,
+                FunctionKind::Table,
+            ] {
+                let expected = if kind == FunctionKind::Aggregate
+                    && matches!(
+                        name,
+                        "multi_distinct_count" | "multi_distinct_sum" | "multi_distinct_avg"
+                    ) {
+                    Some(FunctionVisibility::Hidden)
+                } else {
+                    None
+                };
+                assert_eq!(
+                    catalog
+                        .definition(name, kind)
+                        .map(|entry| entry.visibility()),
+                    expected,
+                    "catalogue entry for {kind:?} {name}"
+                );
+            }
             let sql = format!("SELECT {name}(1)");
             let error = analyze(&sql, &probe).unwrap_err();
             let SqlCompileError::Analyze(error) = error else {

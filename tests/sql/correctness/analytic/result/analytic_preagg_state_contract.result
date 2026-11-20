@@ -1,5 +1,5 @@
 -- query 3
--- legacy
+-- types	integer	integer	decimal(18, 4)	bigint	bigint
 grp	score	avg_v	count_v	rk
 1	100	10.0000	3	1
 1	90	15.0000	3	2

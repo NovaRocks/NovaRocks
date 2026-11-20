@@ -1,12 +1,12 @@
 -- query 1
--- legacy
+-- types	integer	array(varchar)	array(varchar)
 g	names_all	names_distinct
 1	["Tom","Tom","May"]	["May","Tom"]
 2	["Ti","Ti"]	["Ti"]
 3	["Zoe"]	["Zoe"]
 
 -- query 2
--- legacy
+-- types	integer	varchar	varchar
 g	names_concat	distinct_scores
 1	Tom|Tom|May	80,90
 2	Ti|Ti	98,99

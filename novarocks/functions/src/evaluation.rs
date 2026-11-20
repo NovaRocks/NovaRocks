@@ -267,7 +267,6 @@ impl<'a> EvaluatedArgument<'a> {
 #[derive(Clone, Debug)]
 enum RowDiagnostic {
     Bounded(Box<str>),
-    Host(crate::aggregate_invocation_backing::HostDiagnostic),
     Domain(novarocks_failure_contract::SharedFailureCause),
     NegationOverflow(NegationOverflow),
 }
@@ -406,7 +405,6 @@ impl RowDataError {
     pub fn message(&self) -> &str {
         match &self.message {
             RowDiagnostic::Bounded(message) => message,
-            RowDiagnostic::Host(message) => message.message(),
             RowDiagnostic::Domain(source) => source.detail(),
             RowDiagnostic::NegationOverflow(overflow) => overflow.message(),
         }
@@ -419,30 +417,13 @@ impl RowDataError {
             _ => None,
         }
     }
-    /// Remap the true selected ordinal without clipping or reformatting the
-    /// diagnostic. A host-backed diagnostic loans its actual shared block.
+    /// Remap the true selected ordinal without clipping or reformatting the diagnostic.
     pub fn with_selected_ordinal(&self, selected_ordinal: usize) -> Self {
         Self {
             selected_ordinal,
             reason: self.reason,
             message: self.message.clone(),
         }
-    }
-    pub(crate) fn prepare_host_with_reason(
-        selected_ordinal: usize,
-        reason: DataFailureReason,
-        allocator: &crate::aggregate_host_allocator::HostAggregateAllocator,
-        work: &mut crate::kernel_input::EvaluationCheckpoints<'_>,
-        formatter: impl FnOnce(&mut dyn fmt::Write) -> fmt::Result,
-    ) -> Result<Self, crate::KernelFailure> {
-        let diagnostic = crate::aggregate_invocation_backing::HostDiagnostic::prepare(
-            allocator, work, formatter,
-        )?;
-        Ok(Self {
-            selected_ordinal,
-            reason,
-            message: RowDiagnostic::Host(diagnostic),
-        })
     }
 }
 

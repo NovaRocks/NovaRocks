@@ -29,6 +29,7 @@ use arrow_array::{Array, ArrayRef, make_array};
 use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer};
 use arrow_data::ArrayData;
 use arrow_schema::DataType;
+#[cfg(test)]
 use novarocks_type_contract::owned_resources::layout::arc_layout;
 use std::{alloc::Layout, marker::PhantomData};
 use std::{any::Any, panic::RefUnwindSafe, sync::Arc};
@@ -279,11 +280,13 @@ fn custody_node_metadata_facts(
     Ok(bytes)
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FlatByteKind {
     Binary,
     Utf8,
 }
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RequestUpper {
     pub(crate) bytes: usize,
@@ -291,6 +294,7 @@ pub(crate) struct RequestUpper {
 }
 /// Original default byte-builder finish and direct opaque custody only.
 /// Payload capacities and allocator metadata have their own source authors.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct FlatDirectByteFacts {
     pub(crate) finish_global: RequestUpper,
@@ -308,6 +312,7 @@ pub(crate) struct FlatDirectByteFacts {
 /// Facts from the actual private direct-opaque types, without constructing an
 /// array, charge, holder or fabricated validity bitmap. Validity is an upper
 /// shape, not a claim that the original builder will actually create it.
+#[cfg(test)]
 pub(crate) fn direct_flat_byte_facts(
     kind: FlatByteKind,
     validity_upper: bool,

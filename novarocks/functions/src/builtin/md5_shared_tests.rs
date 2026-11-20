@@ -19,7 +19,7 @@ use crate::{
     EvaluatedArgument, FunctionValueType, KernelEvaluationControl, ScalarEvaluationInstance,
     kernel_control::{internal, invalid},
 };
-use arrow_array::{LargeBinaryArray, LargeStringArray, StructArray};
+use arrow_array::{LargeBinaryArray, StructArray};
 use std::sync::{Arc, Mutex};
 #[derive(Default)]
 struct Control {

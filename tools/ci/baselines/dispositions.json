@@ -2,16 +2,6 @@
   "schema": 1,
   "known_failures": [
     {
-      "unit": "sql-case:aggregate/agg_collection_string_dict_semantics",
-      "failure": {
-        "class": "error_code",
-        "code": "query.execution.unsupported"
-      },
-      "reason": "Unsupported compiled cast from: List(Field { data_type: Null, nullable: true; owner B7, B8, I1, I5; remove after capability repair and native verification Native b722 and TST-G9b1 c30 both refuse unchanged step 1; the typed FE Coordinator projection now reports query.execution.unsupported. Original failure, repair owner and exit requirement remain.",
-      "owner": "B7, B8, I1, I5",
-      "expires": "2026-12-15"
-    },
-    {
       "unit": "sql-case:aggregate/agg_test_agg_with_limit",
       "failure": {
         "class": "error_code",
@@ -92,16 +82,6 @@
       "expires": "2026-12-15"
     },
     {
-      "unit": "sql-case:analytic/analytic_preagg_state_contract",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "Missing installed pure implementation for builtin.scalar/to_bitmap/(any<T>...)->binary;strict;legacy; owner B8, I1, I5; remove after capability repair and native verification",
-      "owner": "B8, I1, I5",
-      "expires": "2026-12-15"
-    },
-    {
       "unit": "sql-case:analytic/analytic_test_array_agg_over_window",
       "failure": {
         "class": "error_code",
@@ -129,16 +109,6 @@
       },
       "reason": "Missing installed pure implementation for builtin.scalar/map/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
       "owner": "B7, B8, I1, I5",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:analytic/analytic_test_window_pre_agg_with_rank",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "Partition TopN now passes its original row oracle after strict R_old-equivalent format migration. The next original failure is statement 7: selected overload builtin.scalar/to_bitmap/(any<T>...)->binary;strict;legacy has no installed implementation (line 5 column 28), sql.analyze.unavailable_implementation. B7d owns bitmap scalar implementations under the accepted B5 handoff. Query 7 remains Legacy and its result oracle is unexecuted; preserve the raw failure and suffix gap. Confirmed by independent normal native 1FE+3BE verify; keep the original expiry and remove only after the complete case passes.",
-      "owner": "B7d",
       "expires": "2026-12-15"
     },
     {
@@ -208,16 +178,6 @@
         "code": "sql.analyze.unavailable_implementation"
       },
       "reason": "Missing installed pure implementation for builtin.scalar/row/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
-      "owner": "B7, B8, I1, I5",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:complex-type/complex_array_basic_functions",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "Missing installed pure implementation for builtin.scalar/array_sum/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
       "owner": "B7, B8, I1, I5",
       "expires": "2026-12-15"
     },
@@ -1272,16 +1232,6 @@
       "expires": "2026-12-15"
     },
     {
-      "unit": "sql-case:project/project_date_function_semantics",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "Missing installed pure implementation for builtin.scalar/hour_from_unixtime/(i64)->i32;strict;legacy; owner B8, I1, I5; remove after capability repair and native verification",
-      "owner": "B8, I1, I5",
-      "expires": "2026-12-15"
-    },
-    {
       "unit": "sql-case:runtime-filter/runtime_filter_multi_columns",
       "failure": {
         "class": "error_code",
@@ -1359,16 +1309,6 @@
       },
       "reason": "Observed on clean f1227548a4a8ca0cfbd000698f9d0e69e54f0395, step 5, substatement 1/1, sha256=f9d290e625ddc02f178d965206a16f5a206b0391499d79cec554f0a7de5677c7: builtin.window/lag/(any<T>,i64,any<D>)->any<T>;strict;legacy: three-argument Decimal result/default outside installed nullable numeric/Utf8 default profile. No failed independent expectation. P00 same-statement detail plus current exact owner predicate identifies the capability; current sanitized message alone is not a recipe trace. Exit: B9 implements builtin.window/lag/(any<T>,i64,any<D>)->any<T>;strict;legacy: three-argument Decimal result/default outside installed nullable numeric/Utf8 default profile; the original entire decimal/test_decimal256_window_functions native case passes with all required oracles, then remove this disposition. Unreached suffixes remain unverified until that run. Re-observed same exact statement and actual code on clean fffbffe8; no executed independent oracle failed and no secondary cleanup failure observed.",
       "owner": "B9 aggregate/window/table-function remainder capability",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:decimal/test_decimal_overflow",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "builtin.scalar/array_sum/dynamic-v1 missing installed pure implementation. Actual clean fffbffe8 step29; no executed independent oracle failed. B7 installs the original array_sum pure owner/effect/carrier contract, then the entire unchanged case passes all original result/numeric expected-error oracles; admission alone does not close this record.",
-      "owner": "B7",
       "expires": "2026-12-15"
     },
     {
@@ -1469,16 +1409,6 @@
       },
       "reason": "The original case reaches statement 8 and the frozen selected overload builtin.aggregate/sum_state/derived-v1 is refused for its selected carrier. No independent failed oracle or cleanup violation accompanies this refusal. Restore the named capability and pass the unchanged native case before removing this record.",
       "owner": "UEA-5E B1",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:aggregate/agg_test_distinct_agg",
-      "failure": {
-        "class": "error_code",
-        "code": "sql.analyze.unavailable_implementation"
-      },
-      "reason": "The original case reaches statement 8 and the frozen selected overload builtin.scalar/to_bitmap/(any<T>...)->binary;strict;legacy is refused for its selected carrier. No independent failed oracle or cleanup violation accompanies this refusal. Restore the named capability and pass the unchanged native case before removing this record.",
-      "owner": "UEA-5E B7",
       "expires": "2026-12-15"
     },
     {
@@ -1770,13 +1700,6 @@
       "review_by": "2026-12-15",
       "reason": "D0-5(d), spec 5.6 K7(b): the existing MV refresh owner explicitly refuses occurrence-aware SQL field rebinding after a referenced source rename. Current native step 7 returns the untyped original message MV refresh requires occurrence-aware SQL field rebinding (MySQL 1105/HY000, SQL code absent); step 8 is not reached, original step 9 cleanup passed. This is the approved intentional MV-arc refusal, not a newly inferred UnsupportedCompiledShape code. Preserve the original positive refresh/output oracle. Reobserved in complete private01: original step 7 gives the same untyped original message; raw FAIL and unfulfilled suffix remain. All three private suite lifecycles closed successfully. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. No conversion to UnsupportedCompiledShape and no quarantine closure.",
       "exit_condition": "UEA-7B3/UEA-7B5 deliver occurrence-aware SQL field rebinding for the same field-id-preserving referenced rename; rerun this unchanged complete native case so step 7 refresh succeeds, step 8 returns the original expected region output including id=4, and original cleanup passes. Remove this exact quarantine only then; do not accept renaming the oracle, parsing the old message into a new code, or reusing the passed prefix."
-    },
-    {
-      "unit": "sql-case:aggregate/agg_test_bitmap_agg",
-      "reason": "The original negative oracle at statement8 is masked by the named selected-carrier refusal sql.analyze.unavailable_implementation for builtin.aggregate/bitmap_agg/derived-v1. The expected-error assertion really fails. D0-6 does not authorize a known-failure match or reordering error precedence; retain this raw failure until the named family restores the capability.",
-      "owner": "UEA-5E B9",
-      "exit_condition": "UEA-5E B9 restores builtin.aggregate/bitmap_agg/derived-v1; rerun this original complete native1FE+3BE case with all original result, expected-error, fault, lifecycle and cleanup assertions passing, then remove this quarantine.",
-      "review_by": "2026-12-15"
     },
     {
       "unit": "sql-case:aggregate/agg_test_group_concat",

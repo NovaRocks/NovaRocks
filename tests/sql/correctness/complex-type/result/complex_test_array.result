@@ -122,12 +122,12 @@ _col0
 13336
 
 -- query 34
--- legacy
+-- types	array(integer)
 _col0
 [1]
 
 -- query 35
--- legacy
+-- types	array(integer)
 _col0
 [1]
 

@@ -89,11 +89,11 @@ _col0
 -0.12345678901234567890
 
 -- query 29
--- legacy
+-- types	decimal(38, 31)
 adjust_lt
 -147.8839239587535745703798959387468
 
 -- query 30
--- legacy
+-- types	decimal(38, 31)
 adjust_lt
 -291.2137392418358345703798959387468

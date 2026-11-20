@@ -1,5 +1,5 @@
--- query 14
--- legacy
+-- query 4
+-- types	integer	bigint
 c1	_col1
 1	1
 2	1
@@ -8,7 +8,7 @@ c1	_col1
 5	1
 6	0
 
--- query 15
+-- query 5
 -- types	integer	bigint	bigint	bigint
 c1	_col1	_col2	_col3
 1	1	1	1
@@ -18,7 +18,7 @@ c1	_col1	_col2	_col3
 5	1	1	1
 6	0	0	0
 
--- query 16
+-- query 6
 -- types	integer	bigint	bigint	bigint
 c1	_col1	_col2	_col3
 1	1	1	1
@@ -28,8 +28,8 @@ c1	_col1	_col2	_col3
 5	1	1	1
 6	0	0	0
 
--- query 27
--- legacy
+-- query 7
+-- types	integer	bigint
 c1	_col1
 1	1
 2	1

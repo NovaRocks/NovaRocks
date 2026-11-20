@@ -1142,68 +1142,6 @@ impl FixedScalarResultDecision<'_> {
 }
 
 impl BuiltinScalarResolver {
-    /// Validate the complete already-selected type profile through the same
-    /// original fixed-overload signature and nullability authors. This does
-    /// not resolve a new function binding, build a request, inspect constants,
-    /// prepare a kernel, or certify emitted source-role facts.
-    pub(super) fn check_instantiated_type_profile_observed(
-        &self,
-        selected: &FunctionBindingSelection,
-        logical_argument_count: usize,
-        control: &dyn PureCompileControl,
-    ) -> Result<(), FunctionBindingError> {
-        binding_control::scope(control, |work| {
-            work.step()?;
-            if selected.aggregate.is_some()
-                || selected.argument_types.len() != logical_argument_count
-            {
-                return Err(FunctionBindingError::NoMatchingOverload);
-            }
-            let index = self.overload_index_observed(&selected.overload, work)?;
-            let mut types = Vec::with_capacity(logical_argument_count);
-            for argument in &selected.argument_types {
-                work.step()?;
-                let FunctionArgumentType::Value(value_type) = argument else {
-                    return Err(FunctionBindingError::NoMatchingOverload);
-                };
-                types.push(value_type.clone());
-            }
-            work.flush()?;
-            let resolved = resolver::resolve_scalar_value_signature_at_overload(
-                &self.canonical_name,
-                index,
-                &types,
-                work.control(),
-            )
-            .map_err(binding_resolution_error)?;
-            if resolved.argument_types.len() != types.len() {
-                return Err(FunctionBindingError::NoMatchingOverload);
-            }
-            for (actual, required) in types.iter().zip(&resolved.argument_types) {
-                if !binding_control::exact_type(actual, required, work)? {
-                    return Err(FunctionBindingError::NoMatchingOverload);
-                }
-            }
-            let value_nullable = |index: usize| types.get(index).is_some_and(|ty| ty.nullable());
-            let nullable = scalar_result_nullable_from_types(
-                &self.canonical_name,
-                logical_argument_count,
-                types.first(),
-                value_nullable,
-                work,
-            )?;
-            let mut expected = resolved.return_type;
-            expected = expected.with_nullable(nullable)?;
-            let FunctionResultType::Scalar(actual) = &selected.result_type else {
-                return Err(FunctionBindingError::NoMatchingOverload);
-            };
-            if !binding_control::exact_type(actual, &expected, work)? {
-                return Err(FunctionBindingError::NoMatchingOverload);
-            }
-            Ok(())
-        })
-    }
-
     fn overload_index_observed(
         &self,
         overload: &FunctionOverloadId,
@@ -5195,12 +5133,6 @@ mod aggregate_recipe_tests {
 #[cfg(test)]
 mod explicit_domain_owner_regression_tests {
     use super::*;
-    fn value(ty: DataType) -> FunctionArgument {
-        FunctionArgument::Value {
-            value_type: FunctionValueType::new(ty, true),
-            constant: None,
-        }
-    }
     fn resolve(
         catalog: &EngineFunctionCatalog,
         name: &str,
