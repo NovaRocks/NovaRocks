@@ -42,15 +42,6 @@ use novarocks_sql::compiler::{
 use novarocks_sql::sql_mode::SqlSemanticSettings;
 use novarocks_type_contract::CompilePhase;
 
-pub(super) fn query_ast(sql: &str) -> Box<novarocks_parser::ast::Query> {
-    let mut statements = novarocks_parser::parse(sql).unwrap();
-    assert_eq!(statements.len(), 1);
-    let novarocks_parser::ast::Statement::Query(query) = statements.pop().unwrap() else {
-        panic!("expected one SQL query");
-    };
-    Box::new(query)
-}
-
 pub(super) fn session(semantics: SqlSemanticSettings, fold: bool) -> SqlSessionContext {
     let mut optimizer_settings = SessionOptimizerSettings {
         enable_materialized_view_rewrite: Some(false),
@@ -77,7 +68,7 @@ pub(super) fn table_free_request(
 ) -> SqlFinalPlanCompileRequest {
     SqlFinalPlanCompileRequest::new(
         PlanVersionId::try_new([84; 16]).unwrap(),
-        SqlStatementInput::parsed_query(query_ast(sql)),
+        SqlStatementInput::parsed_query(novarocks_sql_testkit::parse_query(sql)),
         SqlCompileIntent::Query,
         session,
         SqlPlanningEnvironment::Distributed,
@@ -144,7 +135,7 @@ pub(super) fn analyze_table_free(
     let catalog = novarocks_sql::planning::catalog::PlannerMemoryCatalog::default();
     let tables = SqlPlannerTableSnapshot::new(&catalog);
     SqlCompiler::analyze(SqlAnalyzeRequest::new(
-        SqlStatementInput::parsed_query(query_ast(sql)),
+        SqlStatementInput::parsed_query(novarocks_sql_testkit::parse_query(sql)),
         intent,
         session,
         SqlPlanningEnvironment::Distributed,
