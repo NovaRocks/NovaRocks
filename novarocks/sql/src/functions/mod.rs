@@ -1885,6 +1885,8 @@ mod tests {
     #[test]
     fn abs_exact_bindings_freeze_input_and_promoted_output_widths() {
         let catalog = build_builtin_engine_function_catalog().expect("builtin catalog");
+        let control = crate::compiler::SqlCompileControl::unbounded();
+        let negate = novarocks_type_contract::OperatorFunction::Negation.function_id();
         for (input, output) in [
             (DataType::Int8, DataType::Int16),
             (DataType::Int16, DataType::Int32),
@@ -1910,35 +1912,26 @@ mod tests {
                     value_type: input_type.clone(),
                     constant: None,
                 }];
+                let request = FunctionBindingRequest {
+                    expected_result_type: None,
+                    arguments: &arguments,
+                    logical_argument_count: 1,
+                };
                 let binding = resolve_exact_scalar(&catalog, "abs", &arguments);
                 assert_eq!(scalar_result(&binding).data_type().clone(), output);
                 assert_eq!(scalar_result(&binding).nullable(), nullable);
                 assert_eq!(
                     binding.selected.argument_types.as_ref(),
-                    &[FunctionArgumentType::Value(input_type)]
+                    &[FunctionArgumentType::Value(input_type.clone())]
                 );
                 catalog
-                    .validate_bound(
-                        &binding,
-                        FunctionBindingRequest {
-                            expected_result_type: None,
-                            arguments: &arguments,
-                            logical_argument_count: 1,
-                        },
-                        &crate::compiler::SqlCompileControl::unbounded(),
-                    )
+                    .validate_bound(&binding, request, &control)
                     .expect("the frozen ABS profile must validate without changing the input type");
 
-                let negative = resolver::resolve_scalar_function_signature(
-                    "negative",
-                    std::slice::from_ref(&input),
-                )
-                .unwrap();
-                assert_eq!(negative.return_type, input);
-                assert!(matches!(
-                    builtin_disposition("negative"),
-                    Some(BuiltinDisposition::LoweredOnly)
-                ));
+                let negation = catalog
+                    .resolve_bound_trusted_by_id(&negate, FunctionKind::Scalar, request, &control)
+                    .expect("the exact negation overload for this input");
+                assert_eq!(scalar_result(&negation), &input_type);
             }
         }
     }

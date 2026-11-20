@@ -26,7 +26,7 @@ mod tests {
 
     #[test]
     fn every_declared_builtin_has_one_explicit_disposition_and_unknown_has_none() {
-        let declared = novarocks_functions::builtin::registry::builtin_scalar_declarations()
+        let mut declared = novarocks_functions::builtin::registry::builtin_scalar_declarations()
             .into_iter()
             .map(|(name, _)| name)
             .chain(
@@ -35,6 +35,12 @@ mod tests {
                     .map(|name| (*name).to_owned()),
             )
             .collect::<BTreeSet<_>>();
+        // The retired registry spelling still has a SQL diagnostic disposition.
+        assert!(declared.insert("negative".to_owned()));
+        assert_eq!(
+            builtin_disposition("negative"),
+            Some(BuiltinDisposition::LoweredOnly)
+        );
         let admitted = builtin_dispositions()
             .iter()
             .map(|(name, _)| (*name).to_owned())
