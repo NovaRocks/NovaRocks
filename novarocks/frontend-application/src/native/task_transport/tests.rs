@@ -507,6 +507,14 @@ struct SingleRootIoGates {
     create: Arc<SingleRootIoGate>,
 }
 
+pub(crate) struct SingleRootReleaseGuard(Arc<SingleRootIoGate>);
+
+impl Drop for SingleRootReleaseGuard {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
 /// The default peer remains the original empty root. EncodedData is one
 /// caller-authored canonical segment; this peer never encodes domain values or
 /// derives a row count from an artifact, query, Task status or payload length.
@@ -536,6 +544,7 @@ struct SingleRootLifecycle {
     io_gates: Option<SingleRootIoGates>,
     root_data_gate: Option<Arc<SingleRootIoGate>>,
     root_end_gate: Option<Arc<SingleRootIoGate>>,
+    release_gate: Option<Arc<SingleRootIoGate>>,
     root: TaskIdentity,
     kind: novarocks_result_contract::RootOutputKind,
     result: SingleRootResult,
@@ -772,7 +781,7 @@ impl TaskWirePeer {
             gate.wait().await;
         }
         if scripted {
-            return self.apply_single_root(request);
+            return self.apply_single_root(request).await;
         }
         let answer = {
             let mut state = self.state.lock().expect("peer state");
@@ -850,7 +859,7 @@ impl TaskWirePeer {
 
     /// Fixed single-root branch only; the existing generic wire tests keep
     /// their original explicit answer queues. Unknown commands never succeed.
-    fn apply_single_root(
+    async fn apply_single_root(
         &self,
         request: proto::ApplyTaskOperationsRequest,
     ) -> Result<Response<proto::ApplyTaskOperationsResponse>, Status> {
@@ -868,6 +877,31 @@ impl TaskWirePeer {
                     .map_err(|_| Status::invalid_argument("single-root operation did not decode"))
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let release_gate = {
+            let state = self.state.lock().expect("peer state");
+            let script = state
+                .single_root
+                .as_ref()
+                .expect("enabled fixed single-root script");
+            script
+                .release_gate
+                .as_ref()
+                .filter(|_| {
+                    decoded.iter().any(|operation| {
+                        matches!(
+                            operation,
+                            D::ReleaseParticipation(original)
+                                if script.require_participation(original.participation()).is_ok()
+                        )
+                    })
+                })
+                .cloned()
+        };
+        if let Some(gate) = release_gate {
+            // Hold this original Release RPC before mutating the peer. Its
+            // BackendData RPC must remain free to deliver the real Root ACK.
+            gate.wait().await;
+        }
         let mut state = self.state.lock().expect("peer state");
         state.applied.push(request.clone());
         let PeerState {
@@ -1769,6 +1803,13 @@ impl NovaRocksGrpc for TaskWirePeer {
                 }
                 if !script.released {
                     script.root_consumed = script.root_consumed.max(read.consumed());
+                    if let Some(gate) = &script.release_gate
+                        && script.root_end_offered
+                        && read.wanted().is_none()
+                        && read.consumed() == script.root_offered_through
+                    {
+                        gate.release();
+                    }
                 }
                 let outcome = if script.released {
                     RootReadOutcome::AwaitTerminalControl
@@ -2086,6 +2127,7 @@ impl Loopback {
             final_info: std::collections::BTreeMap::new(),
             root_data_gate: None,
             root_end_gate: None,
+            release_gate: None,
             io_gates: None,
             root,
             kind,
@@ -2201,6 +2243,26 @@ impl Loopback {
         }
         script.defer_release_until_abort = true;
         Ok(())
+    }
+
+    /// Hold the original Release until the peer accepts its final Root ACK.
+    /// Dropping the guard unblocks the RPC on test unwind.
+    pub(crate) fn hold_single_root_release_for_final_ack(
+        &self,
+    ) -> Result<SingleRootReleaseGuard, Status> {
+        let mut state = self.peer.state.lock().expect("peer state");
+        let script = state
+            .single_root
+            .as_mut()
+            .ok_or_else(|| Status::failed_precondition("declare original Root first"))?;
+        if script.created || script.release_gate.is_some() {
+            return Err(Status::failed_precondition(
+                "original Release gate freezes once before Create",
+            ));
+        }
+        let gate = Arc::new(SingleRootIoGate::new());
+        script.release_gate = Some(gate.clone());
+        Ok(SingleRootReleaseGuard(gate))
     }
 
     /// Configure before Create. This withholds only terminal publications,
