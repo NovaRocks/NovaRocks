@@ -1,0 +1,11 @@
+-- query 7
+-- types	double
+common_key
+NULL
+0.0
+NaN
+
+-- query 8
+-- types	integer
+unmatched_key
+3

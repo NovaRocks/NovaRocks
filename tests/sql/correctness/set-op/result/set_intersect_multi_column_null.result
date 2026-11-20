@@ -1,5 +1,5 @@
 -- query 1
--- legacy
+-- types	bigint	varchar
 k	v
 1	x
 1	NULL

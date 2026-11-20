@@ -1,0 +1,21 @@
+-- query 5
+-- types	bigint
+k
+-1
+2
+NULL
+
+-- query 6
+-- types	bigint
+k
+1
+
+-- query 7
+-- types	integer
+k
+-1
+1
+2
+2
+9
+NULL
