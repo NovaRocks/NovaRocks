@@ -33,6 +33,8 @@ code-anchors:
 
 取负的有符号整数和 LARGEINT 重载发布 `MayRaise`，浮点和 DECIMAL 重载发布 `NoRowError`。Strict 调用沿实际输入决定可空性。浮点符号由 IEEE 取反决定，DECIMAL 保留原载体、精度和刻度。有符号极值通过原选择序号返回行错误。
 
+取负 kernel 按准确类型生成固定的极值溢出诊断。Execution 将这项有限信息附到原数据失败的安全摘要，再沿原 Task 状态和 Trino 错误映射返回 `NUMERIC_VALUE_OUT_OF_RANGE`。任意内部诊断与 provider 原文仍由本地失败保管。
+
 ## 考虑过的选项
 
 1. **每类运算符继续使用专用执行节点。设计否决。** 容易直接识别语法，却要重复维护名称绑定、物理请求、求值、效应和编解码，每次新增能力都扩展第二条路径。

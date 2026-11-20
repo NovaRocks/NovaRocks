@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::{fmt::Display, sync::Arc};
+use std::sync::Arc;
 
 use arrow_array::builder::{FixedSizeBinaryBuilder, PrimitiveBuilder};
 use arrow_array::types::{
@@ -26,11 +26,12 @@ use arrow_array::{Array, ArrayRef, PrimitiveArray};
 use arrow_schema::DataType;
 use novarocks_type_contract::{LARGEINT_BYTE_WIDTH, ValueLogicalType};
 
+use crate::evaluation::NegationOverflow;
 use crate::kernel_control::{internal, invalid};
 use crate::kernel_input::EvaluationCheckpoints;
 use crate::{
-    DataFailureReason, EvaluatedArgument, KernelEvaluationControl, KernelFailure, RowDataError,
-    ScalarCallInput, SelectedValues, Selection, largeint,
+    EvaluatedArgument, KernelEvaluationControl, KernelFailure, RowDataError, ScalarCallInput,
+    SelectedValues, Selection, largeint,
 };
 
 pub(super) fn evaluate<'a>(
@@ -49,22 +50,42 @@ pub(super) fn evaluate<'a>(
     let output = match (result.logical_type(), carrier) {
         (ValueLogicalType::Physical, DataType::Int8) => {
             primitive::<Int8Type>(*argument, selection, &mut work, |row, value| {
-                integer(value.checked_neg(), value, "tinyint", row, &mut errors)
+                integer(
+                    value.checked_neg(),
+                    NegationOverflow::TinyInt,
+                    row,
+                    &mut errors,
+                )
             })
         }
         (ValueLogicalType::Physical, DataType::Int16) => {
             primitive::<Int16Type>(*argument, selection, &mut work, |row, value| {
-                integer(value.checked_neg(), value, "smallint", row, &mut errors)
+                integer(
+                    value.checked_neg(),
+                    NegationOverflow::SmallInt,
+                    row,
+                    &mut errors,
+                )
             })
         }
         (ValueLogicalType::Physical, DataType::Int32) => {
             primitive::<Int32Type>(*argument, selection, &mut work, |row, value| {
-                integer(value.checked_neg(), value, "integer", row, &mut errors)
+                integer(
+                    value.checked_neg(),
+                    NegationOverflow::Integer,
+                    row,
+                    &mut errors,
+                )
             })
         }
         (ValueLogicalType::Physical, DataType::Int64) => {
             primitive::<Int64Type>(*argument, selection, &mut work, |row, value| {
-                integer(value.checked_neg(), value, "bigint", row, &mut errors)
+                integer(
+                    value.checked_neg(),
+                    NegationOverflow::BigInt,
+                    row,
+                    &mut errors,
+                )
             })
         }
         (ValueLogicalType::LargeInt, DataType::FixedSizeBinary(LARGEINT_BYTE_WIDTH)) => {
@@ -160,7 +181,12 @@ fn negate_largeint(
         }
         let value = largeint::value_at(array, row)
             .map_err(|_| internal("Invalid LARGEINT in checked negation input"))?;
-        match integer(value.checked_neg(), value, "largeint", ordinal, errors)? {
+        match integer(
+            value.checked_neg(),
+            NegationOverflow::LargeInt,
+            ordinal,
+            errors,
+        )? {
             Some(value) => builder
                 .append_value(largeint::i128_to_be_bytes(value))
                 .map_err(|_| internal("Invalid LARGEINT negation result width"))?,
@@ -171,10 +197,9 @@ fn negate_largeint(
     Ok(Arc::new(builder.finish()))
 }
 
-fn integer<T: Display>(
+fn integer<T>(
     negated: Option<T>,
-    original: T,
-    name: &str,
+    overflow: NegationOverflow,
     ordinal: usize,
     errors: &mut Vec<RowDataError>,
 ) -> Result<Option<T>, KernelFailure> {
@@ -182,11 +207,7 @@ fn integer<T: Display>(
         errors
             .try_reserve(1)
             .map_err(|_| KernelFailure::ResourceExhausted)?;
-        errors.push(RowDataError::with_reason(
-            ordinal,
-            DataFailureReason::NumericOutOfRange,
-            &format!("{name} negation overflow: {original}"),
-        ));
+        errors.push(RowDataError::negation_overflow(ordinal, overflow));
     }
     Ok(negated)
 }

@@ -149,10 +149,9 @@ fn check_overflow(output: &SelectedValues<'_>, name: &str, value: impl std::fmt:
     assert_eq!(error.reason(), DataFailureReason::NumericOutOfRange);
     assert_eq!(error.selected_ordinal(), 2);
     assert_eq!(output.selection().row(error.selected_ordinal()), Some(3));
-    assert_eq!(
-        error.message(),
-        format!("{name} negation overflow: {value}")
-    );
+    let expected = format!("{name} negation overflow: {value}");
+    assert_eq!(error.message(), expected);
+    assert_eq!(error.public_diagnostic(), Some(expected.as_str()));
 }
 
 #[test]

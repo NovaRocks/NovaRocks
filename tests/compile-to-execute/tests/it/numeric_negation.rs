@@ -19,9 +19,12 @@ mod scalar {
         array::{Array, ArrayRef, Int8Array, Int16Array, Int32Array, Int64Array},
         datatypes::DataType,
     };
-    use novarocks_expression::CompiledExpressionInstance;
+    use novarocks_execution::runtime::task::execution_failure::ExecutionFailure;
     use novarocks_expression::testkit::PassThroughCallHost;
-    use novarocks_expression::{EvaluationInput, ExprEvaluationFailure};
+    use novarocks_expression::{
+        CompiledExpressionInstance, EvaluationInput, ExprEvaluationFailure,
+        RequiredExpressionRowError,
+    };
     use novarocks_functions::testkit::shared_installed_builtin_owner_catalogue;
     use novarocks_functions::*;
     use novarocks_sql_testkit::sql_source;
@@ -53,10 +56,19 @@ mod scalar {
     fn numeric_unary_owned_transaction_actual_sql_three_widths_frame_and_exchange_keep_public_receipt()
      {
         let functions = shared_installed_builtin_owner_catalogue();
-        for input in [
-            Arc::new(Int8Array::from(vec![i8::MIN, 1])) as ArrayRef,
-            Arc::new(Int16Array::from(vec![i16::MIN, 1])) as ArrayRef,
-            Arc::new(Int32Array::from(vec![i32::MIN, 1])) as ArrayRef,
+        for (input, expected_detail) in [
+            (
+                Arc::new(Int8Array::from(vec![i8::MIN, 1])) as ArrayRef,
+                "tinyint negation overflow: -128",
+            ),
+            (
+                Arc::new(Int16Array::from(vec![i16::MIN, 1])) as ArrayRef,
+                "smallint negation overflow: -32768",
+            ),
+            (
+                Arc::new(Int32Array::from(vec![i32::MIN, 1])) as ArrayRef,
+                "integer negation overflow: -2147483648",
+            ),
         ] {
             let source = sql_source(
                 "SELECT -k AS original_negated FROM fixture",
@@ -110,6 +122,14 @@ mod scalar {
                 selected.errors()[0].reason(),
                 DataFailureReason::NumericOutOfRange
             );
+            let required = RequiredExpressionRowError::try_new(
+                root.root,
+                selected.selection(),
+                selected.errors()[0].clone(),
+            )
+            .unwrap();
+            let failure = ExecutionFailure::from(required);
+            assert!(failure.safe_detail().as_str().ends_with(expected_detail));
             assert!(selected.values().is_null(0));
             assert_eq!(selected.values().null_count(), 1);
             let rows = [1];
