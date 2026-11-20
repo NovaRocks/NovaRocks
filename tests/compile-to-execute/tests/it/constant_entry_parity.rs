@@ -462,9 +462,8 @@ fn constant_entry_every_family_matches_real_noop_sql_constant_root() {
         }
         fixture.assert_both(&functions, FoldOutcome::Folded, Expected::Value(expected));
     }
-    // Subtracting two positive zeros authors positive zero. Unary minus and
-    // a text CAST each author negative zero. Preserve the real subexpressions
-    // and typed NULL alongside the depth-one cases.
+    // Compare the sign bit for subtraction, Trino's signed literal, and a
+    // cast of signed text.
     for (expression, family, nullable, outcome, expected) in [
         (
             "(0e0 - 0e0) * 1e0",
@@ -477,7 +476,7 @@ fn constant_entry_every_family_matches_real_noop_sql_constant_root() {
             "-0e0 * 1e0",
             Family::Arithmetic,
             true,
-            FoldOutcome::Kept,
+            FoldOutcome::Folded,
             float(-0.0),
         ),
         (

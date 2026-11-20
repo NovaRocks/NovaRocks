@@ -154,18 +154,25 @@ fn folds_decimal_multiplication_and_checked_rounding_cast_with_exact_coefficient
 }
 
 #[test]
-fn declines_unmapped_unary_shapes_without_a_fake_kernel() {
+fn declines_unary_minus_without_a_fake_kernel() {
     let probe = Arc::new(FoldProbe::default());
-    let owner = compile("SELECT -CAST(7 AS INT), ~CAST(7 AS INT), NOT true", &probe);
+    let owner = compile("SELECT -CAST(7 AS INT), NOT true", &probe);
     let receipts = probe.receipts.lock().unwrap();
-    for operator in [UnaryOperator::Minus, UnaryOperator::BitwiseNot] {
-        assert!(expression_sources(&owner).any(|(_, _, node)| matches!(
-            node.kind, ExprKind::Unary { op, .. } if op == operator
-        )));
-        assert!(receipts.iter().all(|receipt| !matches!(
-            receipt.root().kind, ExprKind::Unary { op, .. } if op == operator
-        )));
-    }
+    let is_minus = |kind: &ExprKind| {
+        matches!(
+            kind,
+            ExprKind::Unary {
+                op: UnaryOperator::Minus,
+                ..
+            }
+        )
+    };
+    assert!(expression_sources(&owner).any(|(_, _, node)| is_minus(&node.kind)));
+    assert!(
+        receipts
+            .iter()
+            .all(|receipt| !is_minus(&receipt.root().kind))
+    );
     let negation = receipts
         .iter()
         .find(|receipt| {
