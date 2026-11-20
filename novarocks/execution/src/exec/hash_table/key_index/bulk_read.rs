@@ -20,7 +20,7 @@
 //! graph may place it behind its final immutable publication boundary.
 
 use super::{
-    ExportedKeys, IndexPurpose, KeyId, KeyIndex, KeyMatch, KeySpec, LocalHashBatch,
+    BulkWork, ExportedKeys, IndexPurpose, KeyId, KeyIndex, KeyMatch, KeySpec, LocalHashBatch,
     LocalHashPolicy, NullPolicy, OwnedKeyReadBatch, PreparedKeyBatch, checkpoint_at,
     direct_int::Storage,
     export, hash_batch,
@@ -433,13 +433,6 @@ impl IndexView {
     }
     /// Only requested partition/ID metadata is grouped. Borrowed typed pages
     /// are moved by the original read author, with no copied key payload.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Frozen K typed read/export API; current join consumes lookup and assignments."
-        )
-    )]
     pub(crate) fn read_keys(
         &self,
         keys: &[BulkKey],
@@ -526,13 +519,6 @@ impl IndexView {
             }
         }
     }
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Frozen K typed read/export API; current join consumes lookup and assignments."
-        )
-    )]
     pub(crate) fn export_keys(
         &self,
         keys: &[BulkKey],
@@ -546,15 +532,34 @@ impl IndexView {
         let read = self.read_keys(keys, owner, control)?;
         export::construct(&read, &self.spec, targets, owner, host, control)
     }
+
+    /// Export selected classes from one partition in increasing local ID order.
+    pub(crate) fn export_partition_range(
+        &self,
+        partition: usize,
+        ids: Range<usize>,
+        mut selected: impl FnMut(usize) -> ExecutionResult<bool>,
+        targets: &[FunctionValueType],
+        work: &BulkWork<'_>,
+    ) -> ExecutionResult<ExportedKeys> {
+        check(work.control)?;
+        if ids.start > ids.end || ids.end > self.key_count(partition)? {
+            return Err(invariant(ValueViolation::Bounds));
+        }
+        let mut keys = vector(work.owner, ids.len())?;
+        for (ordinal, id) in ids.enumerate() {
+            checkpoint_at(ordinal, &|| check(work.control))?;
+            if selected(id)? {
+                keys.push(BulkKey {
+                    partition,
+                    id: KeyId(id),
+                });
+            }
+        }
+        self.export_keys(&keys, targets, work.owner, work.host.clone(), work.control)
+    }
 }
 #[derive(Clone, Copy)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Partition grouping metadata belongs to the frozen K typed read/export path."
-    )
-)]
 struct Request {
     key: BulkKey,
     ordinal: usize,
@@ -646,5 +651,4 @@ fn each_partition(
 }
 
 #[cfg(test)]
-#[path = "bulk_read_tests.rs"]
 mod tests;

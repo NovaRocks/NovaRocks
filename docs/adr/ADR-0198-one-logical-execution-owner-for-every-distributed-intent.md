@@ -6,6 +6,9 @@ status: active
 supersedes: []
 superseded-by: null
 partially-superseded-by:
+  - id: ADR-0243
+    scope: "The external-effect fencing prerequisite for explicit remove_orphan_files and the rules for cleanup of NovaRocks-owned refs. Original publication, cancellation, actual exit and unanchored CTAS rules remain active."
+    link: "ADR-0243-statement-authorized-iceberg-metadata-maintenance.md"
   - id: ADR-0237
     scope: "The compromise of an asynchronous imperative logical-execution actor and distributed authorization decisions. Logical identity, computation readiness, publication, recovery constraints and actual convergence remain active."
     link: "ADR-0237-pure-logical-execution-and-original-host-custody.md"

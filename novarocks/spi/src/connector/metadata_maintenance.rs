@@ -26,9 +26,9 @@ use sha2::{Digest, Sha256};
 
 use super::{
     ConnectorControlRuntimeId, ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor,
-    ConnectorInstanceId, ConnectorMetadata, ConnectorMutationOperationId,
-    ConnectorProviderBindingKey, ConnectorRequestContext, ConnectorTableHandle,
-    ExternalMutationEvidence, ExternalMutationOutcome, ProviderBindingEpoch,
+    ConnectorInstanceId, ConnectorMaintenanceRetention, ConnectorMetadata,
+    ConnectorMutationOperationId, ConnectorProviderBindingKey, ConnectorRequestContext,
+    ConnectorTableHandle, ExternalMutationEvidence, ExternalMutationOutcome, ProviderBindingEpoch,
 };
 
 /// Pure fixed backing of the original Provider metadata action factory.
@@ -133,21 +133,32 @@ const RECEIPT_DOMAIN: &[u8] = b"novarocks.connector-metadata-maintenance.receipt
 pub const REWRITE_METADATA_LAYOUT_KIND: &str = "rewrite-metadata-layout";
 pub const EXPIRE_TABLE_VERSIONS_KIND: &str = "expire-table-versions";
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConnectorExpireSnapshotsExecute {
+    pub retention: ConnectorMaintenanceRetention,
+    pub clean_expired_metadata: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConnectorMetadataMaintenanceOperation {
     RewriteMetadataLayout {
         table: ConnectorTableHandle,
+        sql_execute: bool,
     },
     ExpireTableVersions {
         table: ConnectorTableHandle,
         older_than_ms: Option<i64>,
         retain_last: Option<u32>,
+        sql_execute: Option<ConnectorExpireSnapshotsExecute>,
     },
 }
 
 impl ConnectorMetadataMaintenanceOperation {
     pub fn rewrite_metadata_layout(table: ConnectorTableHandle) -> Result<Self, ConnectorError> {
-        Ok(Self::RewriteMetadataLayout { table })
+        Ok(Self::RewriteMetadataLayout {
+            table,
+            sql_execute: false,
+        })
     }
 
     pub fn expire_table_versions(
@@ -159,6 +170,30 @@ impl ConnectorMetadataMaintenanceOperation {
             table,
             older_than_ms,
             retain_last,
+            sql_execute: None,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub fn optimize_manifests(table: ConnectorTableHandle) -> Self {
+        Self::RewriteMetadataLayout {
+            table,
+            sql_execute: true,
+        }
+    }
+
+    pub fn expire_snapshots(
+        table: ConnectorTableHandle,
+        older_than_ms: i64,
+        retain_last: Option<u32>,
+        inputs: ConnectorExpireSnapshotsExecute,
+    ) -> Result<Self, ConnectorError> {
+        let value = Self::ExpireTableVersions {
+            table,
+            older_than_ms: Some(older_than_ms),
+            retain_last,
+            sql_execute: Some(inputs),
         };
         value.validate()?;
         Ok(value)
@@ -173,7 +208,7 @@ impl ConnectorMetadataMaintenanceOperation {
 
     pub const fn table(&self) -> &ConnectorTableHandle {
         match self {
-            Self::RewriteMetadataLayout { table } | Self::ExpireTableVersions { table, .. } => {
+            Self::RewriteMetadataLayout { table, .. } | Self::ExpireTableVersions { table, .. } => {
                 table
             }
         }
@@ -183,13 +218,14 @@ impl ConnectorMetadataMaintenanceOperation {
         if let Self::ExpireTableVersions {
             older_than_ms,
             retain_last,
+            sql_execute,
             ..
         } = self
         {
-            if older_than_ms.is_none() && retain_last.is_none() {
+            if (sql_execute.is_some() || retain_last.is_none()) && older_than_ms.is_none() {
                 return Err(ConnectorError::new(
                     ConnectorErrorKind::InvalidRequest,
-                    "expire table versions requires older_than or retain_last",
+                    "expire table versions requires an applicable cutoff or retain_last",
                 ));
             }
             if retain_last.is_some_and(|value| value == 0) {
@@ -206,16 +242,28 @@ impl ConnectorMetadataMaintenanceOperation {
         digest_bytes(hash, self.kind().as_bytes());
         digest_bytes(hash, self.table().owner().as_str().as_bytes());
         digest_bytes(hash, self.table().payload());
-        if let Self::ExpireTableVersions {
-            older_than_ms,
-            retain_last,
-            ..
-        } = self
-        {
-            hash.update(older_than_ms.unwrap_or_default().to_be_bytes());
-            hash.update([u8::from(older_than_ms.is_some())]);
-            hash.update(retain_last.unwrap_or_default().to_be_bytes());
-            hash.update([u8::from(retain_last.is_some())]);
+        match self {
+            Self::ExpireTableVersions {
+                older_than_ms,
+                retain_last,
+                sql_execute,
+                ..
+            } => {
+                hash.update(older_than_ms.unwrap_or_default().to_be_bytes());
+                hash.update([u8::from(older_than_ms.is_some())]);
+                hash.update(retain_last.unwrap_or_default().to_be_bytes());
+                hash.update([u8::from(retain_last.is_some())]);
+                if let Some(inputs) = sql_execute {
+                    hash.update([1, u8::from(inputs.clean_expired_metadata)]);
+                    inputs.retention.digest_into(hash);
+                }
+            }
+            Self::RewriteMetadataLayout {
+                sql_execute: true, ..
+            } => hash.update([1]),
+            Self::RewriteMetadataLayout {
+                sql_execute: false, ..
+            } => {}
         }
     }
 }
@@ -494,12 +542,21 @@ impl ConnectorMetadataMaintenanceExecuteRequest {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ConnectorManifestRewriteMetrics {
+    pub rewritten: u64,
+    pub added: u64,
+    pub kept: u64,
+    pub processed_entries: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ConnectorMetadataMaintenanceReceiptSummary {
     pub affected_versions: u64,
     pub rewritten_items: u64,
     pub added_items: u64,
     pub cleanup_succeeded: u64,
     pub cleanup_failed: u64,
+    pub manifest_rewrite_metrics: Option<ConnectorManifestRewriteMetrics>,
 }
 
 #[derive(Clone, Eq, PartialEq)]

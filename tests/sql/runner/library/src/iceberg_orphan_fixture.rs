@@ -24,11 +24,14 @@
 
 use std::env;
 use std::sync::Arc;
+use std::time::Instant;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
+use novarocks_cluster_harness::fixture_run::canonical_s3;
 use novarocks_fs::{FileCancellation, FileErrorKind, FileIdentity, FsAccessHandle};
 
 use crate::fixture_object_store::FixtureObjectStore;
+use crate::namespace_guard::NamespaceGuard;
 
 #[derive(Clone, Debug)]
 pub(crate) struct OrphanFixture {
@@ -37,26 +40,39 @@ pub(crate) struct OrphanFixture {
     location: String,
 }
 
-pub(crate) fn install(table: &str) -> Result<OrphanFixture> {
-    let (namespace, table_name) = table
-        .trim()
-        .split_once('.')
-        .ok_or_else(|| anyhow::anyhow!("@iceberg_orphan_fixture requires namespace.table"))?;
-    if namespace.is_empty() || table_name.is_empty() || table_name.contains('.') {
-        bail!("@iceberg_orphan_fixture requires exactly namespace.table");
-    }
+pub(crate) fn install(
+    target: &str,
+    guard: &NamespaceGuard,
+    deadline: Instant,
+) -> Result<OrphanFixture> {
+    let parts = target.trim().split('.').collect::<Vec<_>>();
+    let (catalog, namespace, table_name) = match parts.as_slice() {
+        [namespace, table] => (None, *namespace, *table),
+        [catalog, namespace, table] => (Some(*catalog), *namespace, *table),
+        _ => bail!("@iceberg_orphan_fixture requires [catalog.]namespace.table"),
+    };
+    ensure!(
+        parts.iter().all(|value| !value.is_empty()
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')),
+        "@iceberg_orphan_fixture requires plain catalog, namespace and table names"
+    );
     let rest_uri = required_env("NOVAROCKS_ICEBERG_REST_URI")?;
+    let url = guard.orphan_fixture_table_url(catalog, namespace, table_name, &rest_uri)?;
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    ensure!(
+        !remaining.is_zero(),
+        "original orphan fixture deadline expired"
+    );
     let endpoint = required_env("AWS_S3_ENDPOINT")?;
     let response: serde_json::Value = reqwest::blocking::Client::builder()
         .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .context("build REST Catalog fixture client")?
-        .get(format!(
-            "{}/v1/namespaces/{}/tables/{}",
-            rest_uri.trim_end_matches('/'),
-            namespace,
-            table_name
-        ))
+        .get(url)
+        .timeout(remaining)
         .send()
         .context("read REST Catalog table for orphan fixture")?
         .error_for_status()
@@ -66,8 +82,12 @@ pub(crate) fn install(table: &str) -> Result<OrphanFixture> {
     let location = response
         .pointer("/metadata/location")
         .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| anyhow::anyhow!("REST Catalog table response has no metadata.location"))?
-        .to_string();
+        .ok_or_else(|| anyhow::anyhow!("REST Catalog table response has no metadata.location"))?;
+    let location = scoped_table_location(
+        &required_env("NOVAROCKS_ICEBERG_REST_WAREHOUSE")?,
+        namespace,
+        location,
+    )?;
     let (bucket, prefix) = parse_s3_location(&location)?;
     let access_key = required_env("AWS_S3_ACCESS_KEY_ID")?;
     let secret_key = required_env("AWS_S3_SECRET_ACCESS_KEY")?;
@@ -84,7 +104,7 @@ pub(crate) fn install(table: &str) -> Result<OrphanFixture> {
     let location = format!("s3://{bucket}/{path}");
     let access = runtime()?
         .block_on(async {
-            let cancellation = FileCancellation::new();
+            let cancellation = FileCancellation::new().with_deadline(Some(deadline));
             let access = storage.resolve(&location, &cancellation).await?;
             storage
                 .overwrite(
@@ -135,6 +155,17 @@ fn runtime() -> Result<tokio::runtime::Runtime> {
         .context("build MinIO orphan fixture runtime")
 }
 
+fn scoped_table_location(warehouse: &str, namespace: &str, location: &str) -> Result<String> {
+    let warehouse = canonical_s3(warehouse)?;
+    let location = canonical_s3(location)?;
+    let scope = format!("{warehouse}/{namespace}/");
+    ensure!(
+        location.starts_with(&scope),
+        "orphan fixture table location leaves its original REST namespace"
+    );
+    Ok(location)
+}
+
 fn parse_s3_location(location: &str) -> Result<(&str, &str)> {
     let raw = location
         .strip_prefix("s3://")
@@ -146,4 +177,30 @@ fn parse_s3_location(location: &str) -> Result<(&str, &str)> {
         bail!("REST Catalog location is invalid: {location}");
     }
     Ok((bucket, prefix))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn orphan_fixture_location_must_be_inside_the_original_namespace() {
+        let warehouse = "s3://novarocks/scratch/rest/";
+        let valid = "s3://novarocks/scratch/rest/case/table";
+        assert_eq!(
+            scoped_table_location(warehouse, "case", valid).unwrap(),
+            valid
+        );
+        for invalid in [
+            "s3://novarocks/scratch/rest/case-other/table",
+            "s3://novarocks/scratch/rest/case/../other/table",
+            "s3://novarocks/scratch/rest-other/case/table",
+            "s3://unowned/scratch/rest/case/table",
+        ] {
+            assert!(
+                scoped_table_location(warehouse, "case", invalid).is_err(),
+                "{invalid}"
+            );
+        }
+    }
 }

@@ -996,6 +996,9 @@ fn build_node(
         ProgramNodeKind::UnionAll { inputs } => {
             build_union_all(program, id, node_id, inputs, ctx, error, ordered)
         }
+        ProgramNodeKind::SetOp { kind, inputs } => {
+            set_op_pipelines::build_set_op(program, id, node_id, *kind, inputs, ctx, error, ordered)
+        }
         ProgramNodeKind::GroupedTopN { input, .. } => {
             let factory = CompiledGroupedTopNProcessorFactory::try_new(
                 Arc::clone(program),
@@ -1335,13 +1338,6 @@ fn build_node(
                 id.index()
             ),
         )),
-        _ => Err(program_failure(
-            FragmentBindingErrorKind::InvalidAssignment,
-            format!(
-                "compiled node family at local node {} has no compiled processor yet",
-                id.index()
-            ),
-        )),
     }?;
     for pipeline in std::iter::once(&mut build.pipeline).chain(build.extra_pipelines.iter_mut()) {
         pipeline.factories = pipeline
@@ -1491,7 +1487,7 @@ fn build_union_all(
     error: &Arc<RuntimeErrorState>,
     ordered: Option<&CompiledOrderedFilterContext>,
 ) -> ExecutionResult<PipelineBuildResult> {
-    validate_union_branches(program, id, inputs)?;
+    validate_set_branches(program, id, inputs, "UnionAll")?;
     let mut builds = Vec::with_capacity(inputs.len());
     let mut producers = 0usize;
     for input in inputs {
@@ -1521,12 +1517,13 @@ fn build_union_all(
     })
 }
 
-/// Every UnionAll input must be a subordinate normalizing Project whose layout
-/// is exactly the union's: same complete fields, metadata and slot order.
-fn validate_union_branches(
+/// Every set operation input must be a subordinate normalizing Project whose layout
+/// is exactly the operator's: same complete fields, metadata and slot order.
+fn validate_set_branches(
     program: &LocalProgram,
     id: ProgramNodeId,
     inputs: &[ProgramNodeId],
+    family: &str,
 ) -> ExecutionResult<()> {
     let nodes = program.graph().nodes();
     let layout = nodes
@@ -1534,7 +1531,7 @@ fn validate_union_branches(
         .ok_or_else(|| {
             program_failure(
                 FragmentBindingErrorKind::MissingAssignment,
-                format!("missing compiled UnionAll node {}", id.index()),
+                format!("missing compiled {family} node {}", id.index()),
             )
         })?
         .output_layout();
@@ -1542,7 +1539,7 @@ fn validate_union_branches(
         return Err(program_failure(
             FragmentBindingErrorKind::InvalidAssignment,
             format!(
-                "compiled UnionAll at local node {} has fewer than two branches",
+                "compiled {family} at local node {} has fewer than two branches",
                 id.index()
             ),
         ));
@@ -1551,7 +1548,7 @@ fn validate_union_branches(
         let branch = nodes.get(input.index()).ok_or_else(|| {
             program_failure(
                 FragmentBindingErrorKind::MissingAssignment,
-                format!("missing compiled UnionAll branch {}", input.index()),
+                format!("missing compiled {family} branch {}", input.index()),
             )
         })?;
         let normalizer = matches!(
@@ -1567,7 +1564,7 @@ fn validate_union_branches(
             return Err(program_failure(
                 FragmentBindingErrorKind::InvalidAssignment,
                 format!(
-                    "compiled UnionAll at local node {} branch {ordinal} is not a normalizer owning the union layout",
+                    "compiled {family} at local node {} branch {ordinal} is not a normalizer owning the set layout",
                     id.index()
                 ),
             ));
@@ -1655,6 +1652,9 @@ pub(crate) use writer_tests::{
 
 #[path = "compiled_join.rs"]
 mod join_pipelines;
+
+#[path = "compiled/set_op.rs"]
+mod set_op_pipelines;
 
 #[cfg(test)]
 #[path = "compiled_tests.rs"]

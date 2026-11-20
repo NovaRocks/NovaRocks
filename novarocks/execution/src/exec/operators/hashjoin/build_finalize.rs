@@ -20,10 +20,6 @@
 
 use super::{
     build_collection::{BeginClaim, BuildCollection},
-    build_match_bitmap::{
-        BitmapFreeze, BitmapInitClaim, BuildMatchBitmap, BuildMatchBitmapInit, InitObligation,
-        InitProgress,
-    },
     build_pages::{BuildInputReceipt, BuildRows, CapturesForGraphs, ProjectionKind},
     build_projection::{
         IndexedBuild, ProjectionBuild, ProjectionCapture, ProjectionStep, ProjectionWorker,
@@ -32,6 +28,7 @@ use super::{
     build_state::{NaaValueMode, ProjectionDomains, build_contract},
     join_completion::{
         JoinCompletion, JoinParticipants, PublishResult, RemainingDemand, funded_shared,
+        new_join_completion,
     },
 };
 use crate::{
@@ -39,9 +36,12 @@ use crate::{
         hash_table::key_index::{BulkWork, IndexPurpose},
         operators::local_exchanger::LocalExchanger,
         pipeline::driver_step::TurnWork,
+        shared_stage::key_bitmap::{
+            BitmapFreeze, BitmapInitClaim, InitObligation, InitProgress, KeyBitmap, KeyBitmapInit,
+        },
     },
     runtime::{
-        observable::{Observable, ObserverSubscription},
+        observable::Observable,
         task::{ExecutionFailure, ExecutionResult},
     },
 };
@@ -64,7 +64,7 @@ pub(crate) enum BuildLookup {
 pub(crate) struct FinalizedBuild {
     pub(crate) rows: Arc<BuildRows>,
     pub(crate) lookup: BuildLookup,
-    pub(crate) matches: Option<Arc<BuildMatchBitmap>>,
+    pub(crate) matches: Option<Arc<KeyBitmap>>,
     _storage: ValueTypeStorageLifetime,
 }
 pub(crate) struct FinalizeOptions {
@@ -139,8 +139,8 @@ impl Projections {
 struct ActiveBuild {
     rows: Arc<BuildRows>,
     projections: Projections,
-    bitmap: Option<Arc<BuildMatchBitmapInit>>,
-    ready_bitmap: OnceLock<Arc<BuildMatchBitmap>>,
+    bitmap: Option<Arc<KeyBitmapInit>>,
+    ready_bitmap: OnceLock<Arc<KeyBitmap>>,
     _storage: ValueTypeStorageLifetime,
 }
 impl ActiveBuild {
@@ -189,7 +189,6 @@ pub(crate) struct JoinBuildFrame {
     state: Mutex<State>,
     live_slots: NonZeroUsize,
     match_bits: bool,
-    activation: OnceLock<ExecutionResult<Option<ObserverSubscription>>>,
     _storage: ValueTypeStorageLifetime,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -230,7 +229,7 @@ impl JoinBuildFrame {
         work: &BulkWork<'_>,
     ) -> ExecutionResult<Arc<Self>> {
         let changed = funded_shared(work.owner, Observable::new())?;
-        let completion = JoinCompletion::new(
+        let completion = new_join_completion(
             options.participants,
             options.handoff,
             Arc::clone(&changed),
@@ -250,7 +249,6 @@ impl JoinBuildFrame {
                 test_control: OnceLock::new(),
                 live_slots: options.live_slots,
                 match_bits: options.match_bits,
-                activation: OnceLock::new(),
                 _storage: work.owner.storage_lifetime(),
             },
         )
@@ -271,28 +269,8 @@ impl JoinBuildFrame {
             })
             .clone()
     }
-    /// Registration belongs to admitted operator activation. Preparation
-    /// creates only dormant metadata, never a live subscription.
     pub(crate) fn activate(&self, work: &BulkWork<'_>) -> ExecutionResult<()> {
-        self.activation
-            .get_or_init(|| {
-                let Some(closed) = self.completion.handoff_closed_observable() else {
-                    return Ok(None);
-                };
-                let changed = self.completion.observable();
-                let weak = Arc::downgrade(&changed);
-                let retention = work.owner.storage_lifetime();
-                let callback = funded_shared(work.owner, move || {
-                    let _retention = &retention;
-                    if let Some(changed) = weak.upgrade() {
-                        changed.notify_observers();
-                    }
-                })?;
-                Ok(Some(closed.subscribe(callback)))
-            })
-            .as_ref()
-            .map(|_| ())
-            .map_err(Clone::clone)
+        self.completion.activate(work.owner)
     }
     fn state(&self) -> ExecutionResult<std::sync::MutexGuard<'_, State>> {
         self.state.lock().map_err(|p| {
@@ -446,12 +424,13 @@ impl JoinBuildFrame {
             let bitmap = self
                 .match_bits
                 .then(|| {
-                    BuildMatchBitmapInit::new(
+                    KeyBitmapInit::new(
                         rows.len(),
                         workers,
                         self.completion.observable(),
                         work.owner,
                         work.control,
+                        build_contract,
                     )
                 })
                 .transpose()?;

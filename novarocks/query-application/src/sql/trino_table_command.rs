@@ -37,8 +37,7 @@ use super::property_evaluation::{
     evaluate_ddl_properties, statement_property_assignments,
 };
 use super::table_procedure::{
-    BoundTableProcedure, TableProcedureAbsoluteTimePort, TableProcedureInputArgument,
-    bind_arguments, resolve_table_procedure,
+    BoundTableProcedure, TableProcedureInputArgument, bind_arguments, resolve_table_procedure,
 };
 use super::trino_admission::unsupported_statement;
 use super::{lower_command_literal, lower_object_name, lower_sql_type};
@@ -383,7 +382,7 @@ pub fn bind_trino_table_execute<'a>(
     statement: &'a ast::TrinoTableExecute,
     provider: &ConnectorProviderId,
     constants: &mut dyn DdlPropertyConstantPort,
-    absolute_time: &mut dyn TableProcedureAbsoluteTimePort,
+    catalog: &str,
     control: &dyn PureCompileControl,
 ) -> Result<BoundTableProcedure<'a>, QueryServiceError> {
     if let Some(branch) = &statement.table.branch {
@@ -402,6 +401,19 @@ pub fn bind_trino_table_execute<'a>(
     }
     let procedure = resolve_table_procedure(provider, &statement.procedure_name)?;
     if let Some(selection) = &statement.selection {
+        use super::table_procedure::TableProcedureKind;
+        if matches!(
+            procedure.kind(),
+            TableProcedureKind::OptimizeManifests
+                | TableProcedureKind::ExpireSnapshots
+                | TableProcedureKind::RemoveOrphanFiles
+        ) {
+            return Err(super::trino_admission::unsupported_statement_detail(
+                source,
+                statement.span,
+                format!("WHERE not supported for procedure {}", procedure.name()),
+            ));
+        }
         return Err(unsupported_statement(
             source,
             selection.span(),
@@ -419,7 +431,7 @@ pub fn bind_trino_table_execute<'a>(
         source,
         statement.span,
         constants,
-        absolute_time,
+        catalog,
         control,
     )
 }

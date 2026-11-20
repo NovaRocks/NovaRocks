@@ -166,6 +166,51 @@ pub(crate) struct TableViewRequest {
     property_value_lengths: Vec<usize>,
     removed_snapshots: Vec<i64>,
     retention_refs: Vec<String>,
+    removed_metadata_ids: [Vec<i32>; 2],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MetadataIdKind {
+    Schema,
+    PartitionSpec,
+}
+
+impl MetadataIdKind {
+    pub(crate) const ALL: [Self; 2] = [Self::Schema, Self::PartitionSpec];
+
+    const fn ordinal(self) -> usize {
+        match self {
+            Self::Schema => 0,
+            Self::PartitionSpec => 1,
+        }
+    }
+
+    const fn array_field(self) -> &'static str {
+        match self {
+            Self::Schema => "metadata.schemas",
+            Self::PartitionSpec => "metadata.partition-specs",
+        }
+    }
+
+    const fn id_key(self) -> &'static str {
+        match self {
+            Self::Schema => "schema-id",
+            Self::PartitionSpec => "spec-id",
+        }
+    }
+
+    const fn id_field(self) -> &'static str {
+        match self {
+            Self::Schema => "metadata.schemas[].schema-id",
+            Self::PartitionSpec => "metadata.partition-specs[].spec-id",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RemovedMetadataIdCheck {
+    pub(crate) id: i32,
+    pub(crate) present: bool,
 }
 
 impl TableViewRequest {
@@ -204,6 +249,7 @@ impl TableViewRequest {
             property_value_lengths,
             removed_snapshots: Vec::new(),
             retention_refs: Vec::new(),
+            removed_metadata_ids: Default::default(),
         })
     }
 
@@ -216,12 +262,15 @@ impl TableViewRequest {
         mut self,
         removed_snapshots: Vec<i64>,
         refs: Vec<String>,
+        removed_schemas: Vec<i32>,
+        removed_specs: Vec<i32>,
     ) -> Result<Self, ViewRequestError> {
         if refs.iter().any(|name| name.len() > MAX_KEY_LEN) {
             return Err(ViewRequestError::RefNameTooLong);
         }
         self.removed_snapshots = removed_snapshots;
         self.retention_refs = refs;
+        self.removed_metadata_ids = [removed_schemas, removed_specs];
         Ok(self)
     }
     pub(crate) fn removed_snapshots(&self) -> &[i64] {
@@ -229,6 +278,10 @@ impl TableViewRequest {
     }
     pub(crate) fn retention_refs(&self) -> &[String] {
         &self.retention_refs
+    }
+
+    pub(crate) fn removed_metadata_ids(&self, kind: MetadataIdKind) -> &[i32] {
+        &self.removed_metadata_ids[kind.ordinal()]
     }
 
     pub(crate) fn snapshot(&self) -> Option<i64> {
@@ -302,6 +355,17 @@ pub(crate) struct TableResponseView {
     pub(crate) properties: Vec<(String, PropertyValue)>,
     pub(crate) retention_snapshots: Vec<SnapshotCheck>,
     pub(crate) retention_refs: Vec<(String, bool, Option<i64>)>,
+    /// Dictionary evidence is only retained for requests that remove IDs.
+    removed_metadata_ids: Option<Box<[Vec<RemovedMetadataIdCheck>; 2]>>,
+}
+
+impl TableResponseView {
+    pub(crate) fn removed_metadata_ids(&self, kind: MetadataIdKind) -> &[RemovedMetadataIdCheck] {
+        self.removed_metadata_ids
+            .as_ref()
+            .map(|ids| ids[kind.ordinal()].as_slice())
+            .unwrap_or_default()
+    }
 }
 
 impl fmt::Debug for TableResponseView {
@@ -333,6 +397,9 @@ pub(crate) enum TableNode {
     Property(usize),
     RetentionRef(usize),
     RetentionRefSnapshotId(usize),
+    MetadataIdArray(MetadataIdKind),
+    MetadataIdItem(MetadataIdKind),
+    MetadataIdValue(MetadataIdKind),
     MetadataLog,
     MetadataLogEntry,
     MetadataLogFile,
@@ -352,6 +419,10 @@ pub(crate) struct TableResponseSink {
     seen_target_ref: bool,
     seen_ref_snapshot_id: bool,
     seen_element_snapshot_id: bool,
+    seen_metadata_id_arrays: [bool; 2],
+    seen_metadata_id_items: [bool; 2],
+    seen_element_metadata_id: bool,
+    removed_metadata_ids_present: [Vec<bool>; 2],
     seen_property: Vec<bool>,
     metadata_location: LocationField,
     table_location: Option<String>,
@@ -377,6 +448,8 @@ impl TableResponseSink {
         let keys = request.property_keys.len();
         let removed = request.removed_snapshots.len();
         let refs = request.retention_refs.len();
+        let removed_metadata_ids_present =
+            MetadataIdKind::ALL.map(|kind| vec![false; request.removed_metadata_ids(kind).len()]);
         Self {
             request,
             seen_location: false,
@@ -389,6 +462,10 @@ impl TableResponseSink {
             seen_target_ref: false,
             seen_ref_snapshot_id: false,
             seen_element_snapshot_id: false,
+            seen_metadata_id_arrays: [false; 2],
+            seen_metadata_id_items: [false; 2],
+            seen_element_metadata_id: false,
+            removed_metadata_ids_present,
             seen_property: vec![false; keys],
             metadata_location: LocationField::Absent,
             table_location: None,
@@ -453,6 +530,16 @@ impl ViewSink for TableResponseSink {
             }
             TableNode::SnapshotId => {
                 expect_kind(kind, &[Number], "metadata.snapshots[].snapshot-id")?;
+                return Ok(INTEGER_TEXT_LIMIT);
+            }
+            TableNode::MetadataIdArray(id) => expect_kind(kind, &[Array], id.array_field())?,
+            TableNode::MetadataIdItem(id) => {
+                expect_kind(kind, &[Object], id.array_field())?;
+                self.seen_element_metadata_id = false;
+                self.seen_metadata_id_items[id.ordinal()] = true;
+            }
+            TableNode::MetadataIdValue(id) => {
+                expect_kind(kind, &[Number], id.id_field())?;
                 return Ok(INTEGER_TEXT_LIMIT);
             }
             TableNode::Refs => expect_kind(kind, &[Object, Null], "metadata.refs")?,
@@ -556,6 +643,36 @@ impl ViewSink for TableResponseSink {
                 first(&mut self.seen_refs, "metadata.refs")?;
                 Some(TableNode::Refs)
             }
+            (TableNode::Metadata, "schemas")
+                if !self
+                    .request
+                    .removed_metadata_ids(MetadataIdKind::Schema)
+                    .is_empty() =>
+            {
+                let id = MetadataIdKind::Schema;
+                first(
+                    &mut self.seen_metadata_id_arrays[id.ordinal()],
+                    id.array_field(),
+                )?;
+                Some(TableNode::MetadataIdArray(id))
+            }
+            (TableNode::Metadata, "partition-specs")
+                if !self
+                    .request
+                    .removed_metadata_ids(MetadataIdKind::PartitionSpec)
+                    .is_empty() =>
+            {
+                let id = MetadataIdKind::PartitionSpec;
+                first(
+                    &mut self.seen_metadata_id_arrays[id.ordinal()],
+                    id.array_field(),
+                )?;
+                Some(TableNode::MetadataIdArray(id))
+            }
+            (TableNode::MetadataIdItem(id), key) if key == id.id_key() => {
+                first(&mut self.seen_element_metadata_id, id.id_field())?;
+                Some(TableNode::MetadataIdValue(id))
+            }
             (TableNode::Metadata, "properties") if !self.request.property_keys.is_empty() => {
                 first(&mut self.seen_properties, "metadata.properties")?;
                 Some(TableNode::Properties)
@@ -622,6 +739,7 @@ impl ViewSink for TableResponseSink {
     fn element(&mut self, array: TableNode, _index: u64) -> Result<Option<TableNode>, ScanError> {
         Ok(match array {
             TableNode::Snapshots => Some(TableNode::Snapshot),
+            TableNode::MetadataIdArray(id) => Some(TableNode::MetadataIdItem(id)),
             TableNode::MetadataLog => Some(TableNode::MetadataLogEntry),
             _ => None,
         })
@@ -669,6 +787,16 @@ impl ViewSink for TableResponseSink {
                     self.retention_snapshots_present[index] = true;
                 }
             }
+            TableNode::MetadataIdValue(kind) => {
+                let field = kind.id_field();
+                let id = retained_integer(value, field)?
+                    .and_then(|id| i32::try_from(id).ok())
+                    .filter(|id| *id >= 0)
+                    .ok_or(ScanError::InvalidValue(field))?;
+                if let Ok(index) = self.request.removed_metadata_ids(kind).binary_search(&id) {
+                    self.removed_metadata_ids_present[kind.ordinal()][index] = true;
+                }
+            }
             TableNode::TargetRefSnapshotId => {
                 self.ref_snapshot_id =
                     retained_integer(value, "metadata.refs.<target>.snapshot-id")?;
@@ -702,6 +830,11 @@ impl ViewSink for TableResponseSink {
         {
             return Err(ScanError::MissingField("metadata.snapshots[].snapshot-id"));
         }
+        if let TableNode::MetadataIdItem(id) = node
+            && !self.seen_element_metadata_id
+        {
+            return Err(ScanError::MissingField(id.id_field()));
+        }
         if node == TableNode::MetadataLogEntry {
             use crate::catalog::transaction::MetadataPredecessorObservation;
             self.metadata_predecessor = match (
@@ -722,6 +855,31 @@ impl ViewSink for TableResponseSink {
     }
 
     fn finish(self) -> Result<TableResponseView, ScanError> {
+        for kind in MetadataIdKind::ALL {
+            if !self.request.removed_metadata_ids(kind).is_empty()
+                && (!self.seen_metadata_id_arrays[kind.ordinal()]
+                    || !self.seen_metadata_id_items[kind.ordinal()])
+            {
+                return Err(ScanError::MissingField(kind.array_field()));
+            }
+        }
+        let removed_metadata_ids = MetadataIdKind::ALL.map(|kind| {
+            self.request
+                .removed_metadata_ids(kind)
+                .iter()
+                .copied()
+                .zip(
+                    self.removed_metadata_ids_present[kind.ordinal()]
+                        .iter()
+                        .copied(),
+                )
+                .map(|(id, present)| RemovedMetadataIdCheck { id, present })
+                .collect::<Vec<_>>()
+        });
+        let removed_metadata_ids = removed_metadata_ids
+            .iter()
+            .any(|ids| !ids.is_empty())
+            .then(|| Box::new(removed_metadata_ids));
         let snapshot = self.request.snapshot.map(|snapshot_id| SnapshotCheck {
             snapshot_id,
             present: self.snapshot_present,
@@ -764,6 +922,7 @@ impl ViewSink for TableResponseSink {
             table_uuid: self.table_uuid,
             retention_snapshots,
             retention_refs,
+            removed_metadata_ids,
             snapshot,
             target_ref,
             properties,

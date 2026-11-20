@@ -92,8 +92,6 @@ pub(crate) enum SourceContractFailure {
     InputEdge,
     InputEos,
     RequestedInput,
-    MissingRuntimeBinding,
-    ColumnCount { expected: usize, actual: usize },
 }
 impl std::fmt::Display for SourceContractFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -101,11 +99,6 @@ impl std::fmt::Display for SourceContractFailure {
             Self::InputEdge => f.write_str("source does not accept an input edge"),
             Self::InputEos => f.write_str("source received input EOS from a nonexistent edge"),
             Self::RequestedInput => f.write_str("source requested input from a nonexistent edge"),
-            Self::MissingRuntimeBinding => f.write_str("source runtime binding is missing"),
-            Self::ColumnCount { expected, actual } => write!(
-                f,
-                "source output binding has {expected} slots but the produced frame has {actual} columns"
-            ),
         }
     }
 }
@@ -118,8 +111,6 @@ impl novarocks_failure_contract::FailureProjection for SourceContractFailure {
             Self::InputEdge => ExecutionReason::SourceInputEdge,
             Self::InputEos => ExecutionReason::SourceInputEos,
             Self::RequestedInput => ExecutionReason::SourceRequestedInput,
-            Self::MissingRuntimeBinding => ExecutionReason::SourceMissingRuntimeBinding,
-            Self::ColumnCount { .. } => ExecutionReason::SourceColumnCount,
         };
         FailureFact::new(FailureClass::Invariant, reason.reason())
     }

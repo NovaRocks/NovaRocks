@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! What the three StateStore consumers do when the store fails them.
+//! What these StateStore consumers do when the store fails them.
 //!
-//! Catalog attachment, the MV Accelerator and the GC observation accelerator
+//! Catalog attachment and the MV Accelerator
 //! each translate one shared runner outcome into their own vocabulary. The
 //! translation is where the dangerous mistakes live: calling an unknown commit
 //! an absent one, retrying a write the store proved dead, or treating a
@@ -60,10 +60,6 @@ use novarocks_state_store_api::{
 };
 use novarocks_state_store_runtime::StateStoreRunPolicy;
 use novarocks_state_store_testkit::testing::InMemoryStateStore;
-use novarocks_table_maintenance::gc_observation::{
-    GcOwnedRefObservation, GcOwnedRefObservationAccelerator, GcOwnedRefObservationDecision,
-    GcOwnedRefObservationErrorKind,
-};
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -393,23 +389,11 @@ fn projection_facts() -> MvKeyedDocumentProjection {
         .expect("validated keyed MV document projection")
 }
 
-fn observation() -> GcOwnedRefObservation {
-    GcOwnedRefObservation::try_new(
-        Uuid::from_u128(0x3c1),
-        "__novarocks_gc_candidate".to_string(),
-        101,
-        1,
-        [9; 32],
-        1,
-    )
-    .expect("valid owned-ref observation")
-}
-
 fn mv_target() -> MvTarget {
     MvTarget::from_parts(Some("ice"), "sales", "orders_mv")
 }
 
-/// Every durable record any of the three families could have written.
+/// Every durable record either family could have written.
 ///
 /// A failing write that still leaves a record behind is the worst outcome
 /// available, so the budget and definite-failure cases assert on this rather
@@ -525,73 +509,30 @@ async fn mv_accelerator_waits_out_admission_saturation_and_creates_exactly_once(
     );
 }
 
-/// Same property for GC. Here a spurious failure is worse than an error
-/// message: GC is fail-closed, so a refused observation stalls reclamation for
-/// as long as the instance stays busy.
-#[tokio::test]
-async fn gc_observation_waits_out_admission_saturation_and_records_exactly_once() {
-    let store = ScriptedStateStore::with_attempt_capacity("gc-saturation", 1);
-    let handle: Arc<dyn StateStore> = Arc::clone(&store) as Arc<dyn StateStore>;
-    let accelerator = GcOwnedRefObservationAccelerator::open(
-        Arc::clone(&handle),
-        quick_policy(Duration::from_secs(3)),
-    )
-    .await
-    .expect("open GC observation accelerator");
-
-    let held = store.attempts().reserve().expect("hold the only attempt");
-
-    let mut pending = Box::pin(accelerator.observe(observation(), 1_000, 500));
-    assert!(
-        tokio::time::timeout(Duration::from_millis(120), &mut pending)
-            .await
-            .is_err(),
-        "a saturated instance must leave the observation waiting"
-    );
-    assert_eq!(store.begin_write_calls(), 0);
-
-    drop(held);
-    let decision = pending
-        .await
-        .expect("saturation is transient, not a failure");
-
-    assert_eq!(
-        decision,
-        GcOwnedRefObservationDecision::NotMature {
-            first_observed_at_ms: 1_000
-        }
-    );
-    assert_eq!(
-        (store.begin_write_calls(), store.commit_calls()),
-        (1, 1),
-        "waiting out saturation must not spend an attempt"
-    );
-}
-
 /// The other half of the distinction: `LimitExceeded` is a permanent property
 /// of the request. Waiting it out the way saturation is waited out would burn
 /// the whole operation budget on a request that can never succeed.
 #[tokio::test]
 async fn a_permanent_limit_breach_is_answered_at_once_rather_than_waited_out() {
-    let store = ScriptedStateStore::new("gc-limit-exceeded");
+    let store = ScriptedStateStore::new("catalog-limit-exceeded");
     let handle: Arc<dyn StateStore> = Arc::clone(&store) as Arc<dyn StateStore>;
-    let accelerator = GcOwnedRefObservationAccelerator::open(
+    let repository = CatalogAttachmentRepository::open(
         Arc::clone(&handle),
         quick_policy(Duration::from_secs(3)),
     )
     .await
-    .expect("open GC observation accelerator");
+    .expect("open catalog attachment repository");
     store.fail_operations(StateStoreError::new(
         StateStoreErrorKind::LimitExceeded,
         "record is outside a fixed storage limit",
     ));
 
-    let error = accelerator
-        .observe(observation(), 1_000, 500)
+    let error = repository
+        .create(attachment())
         .await
         .expect_err("a permanent limit breach must fail the operation");
 
-    assert_eq!(error.kind(), GcOwnedRefObservationErrorKind::Store);
+    assert_eq!(error.kind(), CatalogAttachmentErrorKind::Unavailable);
     assert_eq!(
         (store.begin_write_calls(), store.commit_calls()),
         (1, 0),
@@ -678,34 +619,6 @@ async fn mv_accelerator_reports_an_unknown_commit_instead_of_calling_it_absent()
     );
 }
 
-/// GC is fail-closed: an unknown observation write must not be reported as a
-/// plain store failure, because the caller's recovery for the two differs --
-/// an unknown write may already have started somebody's safety clock.
-#[tokio::test]
-async fn gc_observation_reports_an_unknown_commit_instead_of_calling_it_absent() {
-    let store = ScriptedStateStore::new("gc-commit-unknown");
-    let handle: Arc<dyn StateStore> = Arc::clone(&store) as Arc<dyn StateStore>;
-    let accelerator = GcOwnedRefObservationAccelerator::open(
-        Arc::clone(&handle),
-        quick_policy(Duration::from_secs(3)),
-    )
-    .await
-    .expect("open GC observation accelerator");
-    store.script_commits(CommitScript::UnknownAndUnresolvable);
-
-    let error = accelerator
-        .observe(observation(), 1_000, 500)
-        .await
-        .expect_err("an unresolvable commit is not a decision");
-
-    assert_eq!(error.kind(), GcOwnedRefObservationErrorKind::CommitUnknown);
-    assert_eq!(
-        (store.begin_write_calls(), store.commit_calls()),
-        (1, 1),
-        "an unresolvable attempt must not be replayed"
-    );
-}
-
 // ---------------------------------------------------------------------------
 // 3. A commit the store proved dead is never tried again
 // ---------------------------------------------------------------------------
@@ -755,32 +668,6 @@ async fn mv_accelerator_never_retries_a_commit_the_store_proved_dead() {
         .expect_err("a proven-dead commit is not a success");
 
     assert_eq!(error.kind(), MvRepositoryErrorKind::Unavailable);
-    assert_eq!(
-        (store.begin_write_calls(), store.commit_calls()),
-        (1, 1),
-        "a proven-dead commit is asked exactly once"
-    );
-    assert_eq!(frontend_record_count(handle.as_ref()).await, 0);
-}
-
-#[tokio::test]
-async fn gc_observation_never_retries_a_commit_the_store_proved_dead() {
-    let store = ScriptedStateStore::new("gc-definite-failure");
-    let handle: Arc<dyn StateStore> = Arc::clone(&store) as Arc<dyn StateStore>;
-    let accelerator = GcOwnedRefObservationAccelerator::open(
-        Arc::clone(&handle),
-        quick_policy(Duration::from_secs(3)),
-    )
-    .await
-    .expect("open GC observation accelerator");
-    store.script_commits(CommitScript::DefiniteFailure);
-
-    let error = accelerator
-        .observe(observation(), 1_000, 500)
-        .await
-        .expect_err("a proven-dead commit is not a decision");
-
-    assert_eq!(error.kind(), GcOwnedRefObservationErrorKind::Store);
     assert_eq!(
         (store.begin_write_calls(), store.commit_calls()),
         (1, 1),
@@ -883,50 +770,6 @@ async fn mv_accelerator_reports_a_spent_budget_without_writing_twice() {
     // from simply trying again, and it sends an operator looking for an
     // in-doubt write that cannot exist.
     assert_eq!(error.kind(), MvRepositoryErrorKind::Unavailable);
-    assert_eq!(
-        (stalled.begin_write_calls(), stalled.commit_calls()),
-        (1, 0)
-    );
-    assert_eq!(frontend_record_count(stalled_handle.as_ref()).await, 0);
-}
-
-#[tokio::test]
-async fn gc_observation_reports_a_spent_budget_without_writing_twice() {
-    let store = ScriptedStateStore::new("gc-retry-exhausted");
-    let handle: Arc<dyn StateStore> = Arc::clone(&store) as Arc<dyn StateStore>;
-    let accelerator = GcOwnedRefObservationAccelerator::open(
-        Arc::clone(&handle),
-        quick_policy(Duration::from_secs(3)),
-    )
-    .await
-    .expect("open GC observation accelerator");
-    store.script_commits(CommitScript::Conflict);
-
-    let error = accelerator
-        .observe(observation(), 1_000, 500)
-        .await
-        .expect_err("an exhausted retry budget is not a decision");
-    assert_eq!(error.kind(), GcOwnedRefObservationErrorKind::Store);
-    assert_eq!((store.begin_write_calls(), store.commit_calls()), (2, 2));
-    assert_eq!(frontend_record_count(handle.as_ref()).await, 0);
-
-    let stalled = ScriptedStateStore::new("gc-deadline");
-    let stalled_handle: Arc<dyn StateStore> = Arc::clone(&stalled) as Arc<dyn StateStore>;
-    let accelerator = GcOwnedRefObservationAccelerator::open(
-        Arc::clone(&stalled_handle),
-        quick_policy(Duration::from_millis(200)),
-    )
-    .await
-    .expect("open GC observation accelerator");
-    stalled.stall_begin_write(Duration::from_secs(30));
-
-    let error = accelerator
-        .observe(observation(), 1_000, 500)
-        .await
-        .expect_err("an expired budget is not a decision");
-    // A runner deadline is only produced before dispatch, so a plain store
-    // failure is the precise answer here.
-    assert_eq!(error.kind(), GcOwnedRefObservationErrorKind::Store);
     assert_eq!(
         (stalled.begin_write_calls(), stalled.commit_calls()),
         (1, 0)

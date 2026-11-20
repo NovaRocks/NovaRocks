@@ -272,6 +272,14 @@ impl HadoopFileSystemCatalog {
             crate::metadata_json::Document::TableMetadata,
         )
         .map_err(|error| {
+            if let Some(source) = crate::metadata_json::future_table_format_error(
+                &error,
+                document,
+                crate::metadata_json::Document::TableMetadata,
+            ) {
+                return Error::new(ErrorKind::FeatureUnsupported, "Unsupported Iceberg format")
+                    .with_source(source);
+            }
             Error::new(error.iceberg_kind(), "Failed to parse table metadata JSON")
                 .with_source(error)
         })?;

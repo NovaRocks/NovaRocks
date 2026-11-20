@@ -30,6 +30,12 @@ use novarocks_fs::{
     normalize_aws_s3_catalog_properties, object_store_config_from_aws_s3_catalog_properties,
 };
 
+use novarocks_spi::connector::ConnectorMaintenanceDuration;
+pub use novarocks_spi::connector::{
+    EXPIRE_SNAPSHOTS_MIN_RETENTION_SESSION_PROPERTY,
+    REMOVE_ORPHAN_FILES_MIN_RETENTION_SESSION_PROPERTY,
+};
+
 use crate::rest_protocol::binding::{is_authentication_header, is_protocol_header};
 
 /// Catalog property declaring which request headers a REST server may supply
@@ -158,6 +164,42 @@ fn parse_file_size(value: &str) -> Option<u64> {
     (bytes != 0).then_some(bytes)
 }
 
+pub const EXPIRE_SNAPSHOTS_MIN_RETENTION: &str = "iceberg.expire-snapshots.min-retention";
+pub const REMOVE_ORPHAN_FILES_MIN_RETENTION: &str = "iceberg.remove-orphan-files.min-retention";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IcebergCatalogMaintenanceConfig {
+    pub expire_snapshots_min_retention: ConnectorMaintenanceDuration,
+    pub remove_orphan_files_min_retention: ConnectorMaintenanceDuration,
+}
+
+impl Default for IcebergCatalogMaintenanceConfig {
+    fn default() -> Self {
+        Self {
+            expire_snapshots_min_retention: ConnectorMaintenanceDuration::SEVEN_DAYS,
+            remove_orphan_files_min_retention: ConnectorMaintenanceDuration::SEVEN_DAYS,
+        }
+    }
+}
+
+impl IcebergCatalogMaintenanceConfig {
+    fn parse(properties: &HashMap<String, String>) -> Result<Self, String> {
+        let retention = |property| match properties.get(property) {
+            Some(text) => ConnectorMaintenanceDuration::parse(text)
+                .ok_or_else(|| format!("Invalid duration for Iceberg catalog property {property}")),
+            None => Ok(ConnectorMaintenanceDuration::SEVEN_DAYS),
+        };
+        Ok(Self {
+            expire_snapshots_min_retention: retention(EXPIRE_SNAPSHOTS_MIN_RETENTION)?,
+            remove_orphan_files_min_retention: retention(REMOVE_ORPHAN_FILES_MIN_RETENTION)?,
+        })
+    }
+
+    pub fn from_properties(properties: &[(String, String)]) -> Result<Self, String> {
+        Self::parse(&normalized_properties(properties))
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IcebergCatalogKind {
     Hadoop,
@@ -175,6 +217,7 @@ pub struct IcebergCatalogConfiguration {
     pub object_store_config: Option<ObjectStoreConfig>,
     pub warehouse_path: PathBuf,
     pub write: IcebergCatalogWriteConfig,
+    pub maintenance: IcebergCatalogMaintenanceConfig,
 }
 
 impl IcebergCatalogConfiguration {
@@ -459,6 +502,7 @@ fn parse_hadoop_configuration(
     endpoint_binding: Option<&ObjectStoreEndpointConfig>,
 ) -> Result<IcebergCatalogConfiguration, String> {
     let write = IcebergCatalogWriteConfig::parse(&properties)?;
+    let maintenance = IcebergCatalogMaintenanceConfig::parse(&properties)?;
     let raw_warehouse = properties
         .get("iceberg.catalog.warehouse")
         .or_else(|| properties.get("warehouse"))
@@ -513,6 +557,7 @@ fn parse_hadoop_configuration(
     );
     Ok(IcebergCatalogConfiguration {
         write,
+        maintenance,
         kind: IcebergCatalogKind::Hadoop,
         warehouse_uri,
         rest_uri: None,
@@ -529,6 +574,7 @@ fn parse_rest_configuration(
     endpoint_binding: Option<&ObjectStoreEndpointConfig>,
 ) -> Result<IcebergCatalogConfiguration, String> {
     let write = IcebergCatalogWriteConfig::parse(&properties)?;
+    let maintenance = IcebergCatalogMaintenanceConfig::parse(&properties)?;
     // Every REST configuration passes here, so a definition that would let a
     // property override the role's authentication never yields a
     // configuration a generation could be built from.
@@ -565,6 +611,7 @@ fn parse_rest_configuration(
     }
     Ok(IcebergCatalogConfiguration {
         write,
+        maintenance,
         kind: IcebergCatalogKind::Rest,
         warehouse_uri,
         rest_uri: Some(uri),
@@ -581,6 +628,7 @@ fn parse_hive_configuration(
     endpoint_binding: Option<&ObjectStoreEndpointConfig>,
 ) -> Result<IcebergCatalogConfiguration, String> {
     let write = IcebergCatalogWriteConfig::parse(&properties)?;
+    let maintenance = IcebergCatalogMaintenanceConfig::parse(&properties)?;
     for key in properties.keys() {
         let normalized = key.to_ascii_lowercase();
         if normalized.contains("kerberos")
@@ -633,6 +681,7 @@ fn parse_hive_configuration(
     }
     Ok(IcebergCatalogConfiguration {
         write,
+        maintenance,
         kind: IcebergCatalogKind::Hive,
         warehouse_uri,
         rest_uri: None,
@@ -1298,5 +1347,33 @@ mod tests {
         .expect_err("kerberos must fail");
 
         assert!(error.contains("plaintext thrift"));
+    }
+}
+
+#[cfg(test)]
+mod maintenance_configuration_tests {
+    use super::*;
+
+    #[test]
+    fn catalog_maintenance_durations_default_and_preserve_configured_units() {
+        let defaults = IcebergCatalogMaintenanceConfig::from_properties(&[]).unwrap();
+        assert_eq!(defaults, IcebergCatalogMaintenanceConfig::default());
+        let parsed = IcebergCatalogMaintenanceConfig::from_properties(&[
+            (EXPIRE_SNAPSHOTS_MIN_RETENTION.into(), "168h".into()),
+            (REMOVE_ORPHAN_FILES_MIN_RETENTION.into(), "5d".into()),
+        ])
+        .unwrap();
+        assert_eq!(parsed.expire_snapshots_min_retention.to_string(), "168.00h");
+        assert_eq!(
+            parsed.remove_orphan_files_min_retention.rounded_millis(),
+            Some(5 * 86_400_000)
+        );
+        assert!(
+            IcebergCatalogMaintenanceConfig::from_properties(&[(
+                REMOVE_ORPHAN_FILES_MIN_RETENTION.into(),
+                "-1d".into()
+            ),])
+            .is_err()
+        );
     }
 }

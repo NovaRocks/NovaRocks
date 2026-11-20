@@ -1,0 +1,1593 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use super::*;
+use novarocks_execution_contract::{
+    SafeDetail,
+    failure::{FailureClass, FailureFact},
+};
+use novarocks_query_application::execution_error::{
+    EXECUTION_ERROR_CODE_DESCRIPTORS, ExecutionFailureSite,
+};
+use novarocks_user_error::{
+    ErrorCodeDescriptor, ErrorCodeId, ErrorCodeStatus, ErrorPhase, RetryClass, UserErrorLocation,
+};
+
+// Independent wire oracle from Trino StandardErrorCode and IcebergErrorCode.
+const TRINO_ERROR_CODES: &[(&str, i32, &str)] = &[
+    ("GENERIC_USER_ERROR", 0, "USER_ERROR"),
+    ("SYNTAX_ERROR", 1, "USER_ERROR"),
+    ("ABANDONED_QUERY", 2, "USER_ERROR"),
+    ("USER_CANCELED", 3, "USER_ERROR"),
+    ("PERMISSION_DENIED", 4, "USER_ERROR"),
+    ("NOT_FOUND", 5, "USER_ERROR"),
+    ("FUNCTION_NOT_FOUND", 6, "USER_ERROR"),
+    ("INVALID_FUNCTION_ARGUMENT", 7, "USER_ERROR"),
+    ("DIVISION_BY_ZERO", 8, "USER_ERROR"),
+    ("INVALID_CAST_ARGUMENT", 9, "USER_ERROR"),
+    ("INVALID_VIEW", 11, "USER_ERROR"),
+    ("ALREADY_EXISTS", 12, "USER_ERROR"),
+    ("NOT_SUPPORTED", 13, "USER_ERROR"),
+    ("INVALID_SESSION_PROPERTY", 14, "USER_ERROR"),
+    ("INVALID_WINDOW_FRAME", 15, "USER_ERROR"),
+    ("NUMERIC_VALUE_OUT_OF_RANGE", 19, "USER_ERROR"),
+    ("PROCEDURE_NOT_FOUND", 29, "USER_ERROR"),
+    ("INVALID_PROCEDURE_ARGUMENT", 30, "USER_ERROR"),
+    ("QUERY_TEXT_TOO_LARGE", 35, "USER_ERROR"),
+    ("ADMINISTRATIVELY_KILLED", 38, "USER_ERROR"),
+    ("INVALID_ANALYZE_PROPERTY", 42, "USER_ERROR"),
+    ("INVALID_CATALOG_PROPERTY", 124, "USER_ERROR"),
+    ("INVALID_SCHEMA_PROPERTY", 33, "USER_ERROR"),
+    ("INVALID_TABLE_PROPERTY", 18, "USER_ERROR"),
+    ("NOT_IN_TRANSACTION", 21, "USER_ERROR"),
+    ("INVALID_MATERIALIZED_VIEW_PROPERTY", 95, "USER_ERROR"),
+    ("INVALID_BRANCH_PROPERTY", 136, "USER_ERROR"),
+    ("CATALOG_NOT_FOUND", 44, "USER_ERROR"),
+    ("SCHEMA_NOT_FOUND", 45, "USER_ERROR"),
+    ("TABLE_NOT_FOUND", 46, "USER_ERROR"),
+    ("TABLE_ALREADY_EXISTS", 50, "USER_ERROR"),
+    ("SCHEMA_ALREADY_EXISTS", 49, "USER_ERROR"),
+    ("COLUMN_NOT_FOUND", 47, "USER_ERROR"),
+    ("DUPLICATE_NAMED_QUERY", 53, "USER_ERROR"),
+    ("DUPLICATE_COLUMN_NAME", 54, "USER_ERROR"),
+    ("MISSING_COLUMN_NAME", 55, "USER_ERROR"),
+    ("TYPE_MISMATCH", 58, "USER_ERROR"),
+    ("INVALID_LITERAL", 59, "USER_ERROR"),
+    ("MISMATCHED_COLUMN_ALIASES", 61, "USER_ERROR"),
+    ("INVALID_ARGUMENTS", 76, "USER_ERROR"),
+    ("TOO_MANY_ARGUMENTS", 77, "USER_ERROR"),
+    ("DUPLICATE_PROPERTY", 79, "USER_ERROR"),
+    ("VIEW_IS_STALE", 81, "USER_ERROR"),
+    ("VIEW_IS_RECURSIVE", 82, "USER_ERROR"),
+    ("DUPLICATE_WINDOW_NAME", 92, "USER_ERROR"),
+    ("MERGE_TARGET_ROW_MULTIPLE_MATCHES", 119, "USER_ERROR"),
+    ("ICEBERG_INVALID_METADATA", 0x0504_0001, "EXTERNAL"),
+    ("ICEBERG_FILESYSTEM_ERROR", 0x0504_0008, "EXTERNAL"),
+    ("ICEBERG_COMMIT_ERROR", 0x0504_000C, "EXTERNAL"),
+    ("GENERIC_INTERNAL_ERROR", 65536, "INTERNAL_ERROR"),
+    ("PAGE_TRANSPORT_ERROR", 65539, "INTERNAL_ERROR"),
+    ("PAGE_TRANSPORT_TIMEOUT", 65540, "INTERNAL_ERROR"),
+    ("REMOTE_TASK_ERROR", 65542, "INTERNAL_ERROR"),
+    ("SERVER_SHUTTING_DOWN", 65545, "INTERNAL_ERROR"),
+    ("SERVER_STARTING_UP", 65548, "INTERNAL_ERROR"),
+    ("REMOTE_HOST_GONE", 65558, "INTERNAL_ERROR"),
+    (
+        "GENERIC_INSUFFICIENT_RESOURCES",
+        131072,
+        "INSUFFICIENT_RESOURCES",
+    ),
+    ("EXCEEDED_TIME_LIMIT", 131075, "INSUFFICIENT_RESOURCES"),
+];
+fn assert_wire(error: &TrinoQueryError, name: &str) {
+    let (_, number, kind) = TRINO_ERROR_CODES
+        .iter()
+        .find(|(candidate, _, _)| *candidate == name)
+        .unwrap_or_else(|| panic!("{name} is missing from the Trino error code oracle"));
+    assert_eq!(
+        (error.error_name, error.error_code, error.error_type),
+        (name, *number, *kind)
+    );
+}
+
+#[test]
+fn retired_metadata_commands_are_syntax_errors_at_the_trino_boundary() {
+    for sql in [
+        "SHOW VIEWS",
+        "SHOW VIEWS FROM x",
+        "SHOW VIEWS IN x",
+        "SHOW BASIC STATS META",
+        "SHOW HISTOGRAM STATS META",
+        "SHOW ALTER TABLE OPTIMIZE",
+        "SHOW ANALYZE",
+        "SHOW ANALYZE JOBS",
+        "SHOW TABLE STATS t",
+        "SHOW MATERIALIZED VIEWS",
+        "SHOW BACKENDS",
+        "CANCEL ANALYZE 1",
+        "KILL ANALYZE 1",
+        "ADMIN RAISE ENGINE ERROR 'CommitUnknown'",
+        "DROP STATS t",
+        "DROP HISTOGRAM ON t (c)",
+        "DROP MULTIPLE COLUMNS STATS t",
+        "ANALYZE FULL TABLE t",
+        "ANALYZE SAMPLE TABLE t",
+        "ANALYZE TABLE t WITH SYNC MODE",
+    ] {
+        let parse = novarocks_parser::parser::parse_statement(sql)
+            .expect_err("retired metadata command must fail in parsing");
+        let user = parse.to_user_error(sql);
+        assert_eq!(user.code().as_str(), "sql.parse.unexpected_token", "{sql}");
+        let service = QueryServiceError::from_user_error(user);
+        let wire = query_error(TrinoErrorSource::Service {
+            error: &service,
+            sql,
+        });
+        assert_wire(&wire, "SYNTAX_ERROR");
+    }
+}
+
+#[test]
+fn query_text_too_large_has_the_frozen_trino_identity_without_text_classification() {
+    let error = query_error(TrinoErrorSource::QueryTextTooLarge {
+        message: "opaque admission fact",
+    });
+    assert_wire(&error, "QUERY_TEXT_TOO_LARGE");
+    let wire = serde_json::to_value(&error).unwrap();
+    assert_eq!(wire["errorCode"], 35);
+    assert_eq!(wire["errorName"], "QUERY_TEXT_TOO_LARGE");
+    assert_eq!(wire["errorType"], "USER_ERROR");
+    assert_eq!(wire["message"], "opaque admission fact");
+    assert!(error.error_location.is_none());
+    assert!(error.sql_state.is_none());
+    assert!(error.failure_info.is_none());
+}
+
+fn expected_descriptor_name(code: &str) -> &'static str {
+    match code {
+        "sql.lex.unexpected_character"
+        | "sql.lex.unterminated_string"
+        | "sql.lex.unterminated_quoted_identifier"
+        | "sql.lex.unterminated_comment"
+        | "sql.parse.unexpected_token"
+        | "sql.validate.invalid_structure" => "SYNTAX_ERROR",
+        "sql.validate.duplicate_cte_name" => "DUPLICATE_NAMED_QUERY",
+        "sql.validate.duplicate_window_name" => "DUPLICATE_WINDOW_NAME",
+        "sql.validate.invalid_window_frame_bounds" => "INVALID_WINDOW_FRAME",
+        "sql.analyze.unknown_catalog" => "CATALOG_NOT_FOUND",
+        "sql.analyze.unknown_schema" => "SCHEMA_NOT_FOUND",
+        "sql.analyze.unknown_table" => "TABLE_NOT_FOUND",
+        "sql.admit.table_already_exists" => "TABLE_ALREADY_EXISTS",
+        "sql.admit.schema_already_exists" => "SCHEMA_ALREADY_EXISTS",
+        "sql.analyze.unknown_column" => "COLUMN_NOT_FOUND",
+        "sql.analyze.unknown_function" => "FUNCTION_NOT_FOUND",
+        "sql.analyze.missing_column_name" => "MISSING_COLUMN_NAME",
+        "sql.analyze.duplicate_column_name" => "DUPLICATE_COLUMN_NAME",
+        "sql.analyze.mismatched_column_aliases" => "MISMATCHED_COLUMN_ALIASES",
+        "sql.analyze.invalid_view" => "INVALID_VIEW",
+        "sql.analyze.view_is_stale" => "VIEW_IS_STALE",
+        "sql.analyze.view_is_recursive" => "VIEW_IS_RECURSIVE",
+        "sql.analyze.type_mismatch" => "TYPE_MISMATCH",
+        "sql.analyze.invalid_literal" => "INVALID_LITERAL",
+        "sql.analyze.invalid_argument" => "INVALID_ARGUMENTS",
+        "sql.analyze.invalid_analyze_property" => "INVALID_ANALYZE_PROPERTY",
+        "sql.admit.invalid_catalog_property" => "INVALID_CATALOG_PROPERTY",
+        "sql.admit.invalid_schema_property" => "INVALID_SCHEMA_PROPERTY",
+        "sql.admit.invalid_table_property" => "INVALID_TABLE_PROPERTY",
+        "sql.admit.invalid_materialized_view_property" => "INVALID_MATERIALIZED_VIEW_PROPERTY",
+        "sql.admit.invalid_analyze_property" => "INVALID_ANALYZE_PROPERTY",
+        "sql.admit.invalid_branch_property" => "INVALID_BRANCH_PROPERTY",
+        "sql.admit.invalid_table_procedure_arguments" => "INVALID_ARGUMENTS",
+        "sql.admit.table_procedure_not_found" => "PROCEDURE_NOT_FOUND",
+        "sql.admit.invalid_table_procedure_argument" => "INVALID_PROCEDURE_ARGUMENT",
+        "sql.admit.duplicate_table_procedure_argument" => "DUPLICATE_PROPERTY",
+        "sql.analyze.too_many_arguments" => "TOO_MANY_ARGUMENTS",
+        "sql.analyze.invalid_query_shape" | "query.execution.invalid_data" => "GENERIC_USER_ERROR",
+        "query.execution.merge_target_row_multiple_matches"
+        | "query.execution.update_target_row_multiple_matches" => {
+            "MERGE_TARGET_ROW_MULTIPLE_MATCHES"
+        }
+        "sql.admit.not_in_transaction" => "NOT_IN_TRANSACTION",
+        "sql.parse.unsupported_statement"
+        | "sql.admit.unsupported_statement"
+        | "sql.analyze.unsupported_expression"
+        | "sql.analyze.unsupported_query_shape"
+        | "sql.analyze.unavailable_implementation"
+        | "sql.admit.session_global_scope_unsupported"
+        | "sql.admit.session_transaction_unsupported"
+        | "sql.admit.kill_connection_unsupported"
+        | "sql.admit.persisted_definition_semantics_unsupported"
+        | "sql.admit.client_type_unsupported"
+        | "sql.admit.delete_requires_where"
+        | "sql.admit.delete_unsupported_form"
+        | "sql.admit.update_unsupported_form"
+        | "sql.admit.merge_unsupported_form"
+        | "sql.admit.insert_unsupported_form"
+        | "sql.admit.create_table_unsupported_form"
+        | "UnsupportedCompiledShape"
+        | "query.execution.unsupported" => "NOT_SUPPORTED",
+        "sql.admit.invalid_session_property" => "INVALID_SESSION_PROPERTY",
+        "sql.admit.session_catalog_not_found" => "CATALOG_NOT_FOUND",
+        "sql.admit.kill_denied" => "PERMISSION_DENIED",
+        "sql.analyze.internal"
+        | "query.execution.invariant"
+        | "query.execution.unexpected"
+        | "query.execution.control"
+        | "query.execution.commit_unknown" => "GENERIC_INTERNAL_ERROR",
+        "query.execution.numeric_out_of_range" => "NUMERIC_VALUE_OUT_OF_RANGE",
+        "query.execution.division_by_zero" => "DIVISION_BY_ZERO",
+        "query.execution.invalid_cast_argument" => "INVALID_CAST_ARGUMENT",
+        "query.execution.invalid_function_argument" => "INVALID_FUNCTION_ARGUMENT",
+        "query.execution.cancelled" => "USER_CANCELED",
+        "query.execution.deadline_exceeded" => "EXCEEDED_TIME_LIMIT",
+        "query.execution.resource_exhausted" | "query.execution.representation" => {
+            "GENERIC_INSUFFICIENT_RESOURCES"
+        }
+        "query.execution.dependency" => "REMOTE_TASK_ERROR",
+        _ => {
+            panic!("new descriptor {code} requires an explicit Trino mapping and expected contract")
+        }
+    }
+}
+
+#[test]
+fn column_and_view_analysis_errors_preserve_their_trino_wire_identity() {
+    use novarocks_parser::Span;
+    use novarocks_sql::analyze_error::AnalyzeError;
+
+    let sql = "SELECT 1";
+    let span = Span::new(0, 6);
+    let detail = "arbitrary domain detail";
+    for (analysis, name) in [
+        (
+            AnalyzeError::missing_column_name(detail, span),
+            "MISSING_COLUMN_NAME",
+        ),
+        (
+            AnalyzeError::duplicate_column_name(detail, span),
+            "DUPLICATE_COLUMN_NAME",
+        ),
+        (
+            AnalyzeError::mismatched_column_aliases(detail, span),
+            "MISMATCHED_COLUMN_ALIASES",
+        ),
+        (AnalyzeError::invalid_view(detail, span), "INVALID_VIEW"),
+        (AnalyzeError::view_is_stale(detail, span), "VIEW_IS_STALE"),
+        (
+            AnalyzeError::view_is_recursive(detail, span),
+            "VIEW_IS_RECURSIVE",
+        ),
+        (
+            AnalyzeError::too_many_arguments(detail, span),
+            "TOO_MANY_ARGUMENTS",
+        ),
+    ] {
+        let service = QueryServiceError::from_user_error(analysis.to_user_error(Some(sql)));
+        let wire = query_error(TrinoErrorSource::Service {
+            error: &service,
+            sql,
+        });
+        assert_wire(&wire, name);
+        let json = serde_json::to_value(&wire).unwrap();
+        assert_eq!(json["errorName"], name);
+        assert_eq!(json["errorCode"], wire.error_code);
+        assert_eq!(json["errorType"], "USER_ERROR");
+        assert_eq!(
+            json["errorLocation"],
+            serde_json::json!({"lineNumber": 1, "columnNumber": 1})
+        );
+        assert_eq!(
+            wire.message,
+            format!("[{}] {detail} at line 1 column 1", analysis.code())
+        );
+    }
+}
+
+#[test]
+fn every_registered_user_descriptor_has_an_explicit_trino_mapping() {
+    let descriptors = [
+        novarocks_parser::ERROR_CODE_DESCRIPTORS,
+        novarocks_sql::analyze_error::ERROR_CODE_DESCRIPTORS,
+        novarocks_query_application::sql::session_admit::SESSION_ERROR_CODE_DESCRIPTORS,
+        novarocks_query_application::sql::trino_admission::TRINO_STATEMENT_ERROR_CODE_DESCRIPTORS,
+        novarocks_query_application::sql::property_admit::DDL_PROPERTY_ERROR_CODE_DESCRIPTORS,
+        novarocks_query_application::sql::table_procedure::TABLE_PROCEDURE_ERROR_CODE_DESCRIPTORS,
+        novarocks_query_application::sql::dml_admission::DML_ADMISSION_ERROR_CODE_DESCRIPTORS,
+        EXECUTION_ERROR_CODE_DESCRIPTORS,
+    ];
+    let mut seen = std::collections::BTreeSet::new();
+    for descriptor in descriptors.into_iter().flatten() {
+        assert!(
+            seen.insert(descriptor.code.as_str()),
+            "duplicate descriptor {}",
+            descriptor.code
+        );
+        let user = UserError::from_descriptor(
+            *descriptor,
+            "original domain detail",
+            None,
+            RetryClass::Never,
+        );
+        let service = QueryServiceError::from_user_error(user);
+        let wire = query_error(TrinoErrorSource::Service {
+            error: &service,
+            sql: "SELECT 1",
+        });
+        assert!(
+            user_code(descriptor.code.as_str()).is_some(),
+            "unmapped {}",
+            descriptor.code
+        );
+        assert_wire(&wire, expected_descriptor_name(descriptor.code.as_str()));
+        // Trino standard row-match errors deliberately use the standard text
+        // without a NovaRocks descriptor prefix or publication suffix.
+        let expected = match descriptor.code.as_str() {
+            "query.execution.merge_target_row_multiple_matches" => {
+                "One MERGE target table row matched more than one source row".to_owned()
+            }
+            "query.execution.update_target_row_multiple_matches" => {
+                "One UPDATE target table row matched more than one source row".to_owned()
+            }
+            _ => format!("[{}] original domain detail", descriptor.code),
+        };
+        assert_eq!(wire.message, expected);
+    }
+}
+
+#[test]
+fn client_type_unsupported_has_a_frozen_admission_mapping() {
+    // Construct through P05's real author; the same descriptor is also covered
+    // by the session registry iteration above after wave integration.
+    let error = QueryServiceError::from_user_error(
+        novarocks_query_application::sql::session_admit::client_type_unsupported_error(
+            "column c is unsupported",
+        ),
+    );
+    assert_wire(
+        &query_error(TrinoErrorSource::Service {
+            error: &error,
+            sql: "SELECT c",
+        }),
+        "NOT_SUPPORTED",
+    );
+}
+
+#[test]
+fn service_kinds_are_typed_and_do_not_inspect_catalog_words() {
+    use QueryServiceErrorKind::*;
+    for (kind, expected) in [
+        (Parse, "SYNTAX_ERROR"),
+        (BadDatabase, "SCHEMA_NOT_FOUND"),
+        (Unsupported, "NOT_SUPPORTED"),
+        (PermissionDenied, "PERMISSION_DENIED"),
+        (NoSuchSession, "NOT_FOUND"),
+        (Interrupted, "USER_CANCELED"),
+        (Timeout, "EXCEEDED_TIME_LIMIT"),
+        (InvalidValue, "GENERIC_USER_ERROR"),
+        (Unavailable, "SERVER_STARTING_UP"),
+        (FrontendDraining, "SERVER_SHUTTING_DOWN"),
+        (Internal, "GENERIC_INTERNAL_ERROR"),
+    ] {
+        let error = QueryServiceError::new(kind, "Catalog missing; syntax unsupported timeout");
+        let wire = query_error(TrinoErrorSource::Service {
+            error: &error,
+            sql: "USE missing.s",
+        });
+        assert_wire(&wire, expected);
+        assert_eq!(wire.message, error.message());
+    }
+    // No current QueryServiceErrorKind separately identifies a missing catalog.
+    // The adapter must preserve the originating generic kind in that case.
+}
+
+#[test]
+fn unknown_user_identity_is_internal_even_when_message_looks_supported() {
+    let error = QueryServiceError::from_user_error(UserError::from_descriptor(
+        ErrorCodeDescriptor {
+            code: ErrorCodeId::new("sql.analyze.future_code"),
+            phase: ErrorPhase::Analyze,
+            status: ErrorCodeStatus::Active,
+        },
+        "unknown table: permission denied",
+        None,
+        RetryClass::Never,
+    ));
+    assert_wire(
+        &query_error(TrinoErrorSource::Service {
+            error: &error,
+            sql: "SELECT 1",
+        }),
+        "GENERIC_INTERNAL_ERROR",
+    );
+}
+
+#[test]
+fn cancellations_preserve_the_original_requester_category() {
+    use QueryCancellationReason::*;
+    let requester_session =
+        novarocks_query_application::session_control::ClientSessionKey::new(7).unwrap();
+    for (reason, expected) in [
+        (ExecutionCancellationRequested, "USER_CANCELED"),
+        (ClientCancelRequested, "USER_CANCELED"),
+        (ClientDisconnected, "ABANDONED_QUERY"),
+        (ExecutionOwnerDropped, "GENERIC_INTERNAL_ERROR"),
+        (
+            ExplicitKill { requester_session },
+            "ADMINISTRATIVELY_KILLED",
+        ),
+        (
+            ExplicitKillConnection { requester_session },
+            "ADMINISTRATIVELY_KILLED",
+        ),
+        (DeadlineExceeded { timeout_ms: 10 }, "EXCEEDED_TIME_LIMIT"),
+        (
+            FrontendDrainDeadlineExceeded { timeout_ms: 10 },
+            "SERVER_SHUTTING_DOWN",
+        ),
+        (ServerShutdown, "SERVER_SHUTTING_DOWN"),
+    ] {
+        assert_wire(
+            &query_error(TrinoErrorSource::Cancellation {
+                reason: &reason,
+                message: "original cancellation detail",
+            }),
+            expected,
+        );
+    }
+}
+
+fn execution(reason: QueryFailureReason) -> QueryExecutionError {
+    QueryExecutionError::from_execution(ExecutionFailureInput::new(
+        reason.failure_fact(),
+        SafeDetail::truncating("original execution detail"),
+        ExecutionFailureSite::Coordinator,
+    ))
+}
+#[test]
+fn open_iceberg_partition_limit_projects_the_typed_counts() {
+    use novarocks_failure_contract::{
+        FailureClass, FailureFact, ResourceDimension, ResourceFacts, ResourceScope,
+        connector_reason::ICEBERG_TOO_MANY_OPEN_PARTITIONS,
+    };
+    let fact = FailureFact::new(FailureClass::Resource, ICEBERG_TOO_MANY_OPEN_PARTITIONS)
+        .with_resource(ResourceFacts {
+            request_scope: Some(ResourceScope::Request),
+            constraint_scope: Some(ResourceScope::Operator),
+            dimension: ResourceDimension::Items,
+            requested: Some(4),
+            required_growth: Some(1),
+            limit: Some(3),
+            live: Some(3),
+            committed: None,
+        });
+    let error = QueryExecutionError::from_execution(ExecutionFailureInput::new(
+        fact,
+        SafeDetail::truncating("diagnostic detail irrelevant to Trino presentation"),
+        ExecutionFailureSite::Coordinator,
+    ));
+    let projected = query_error(TrinoErrorSource::Execution {
+        error: &error,
+        sql: "INSERT INTO t VALUES (1)",
+    });
+    assert_eq!(projected.error_code, 0x0504_0002);
+    assert_eq!(projected.error_name, "ICEBERG_TOO_MANY_OPEN_PARTITIONS");
+    assert_eq!(projected.error_type, "USER_ERROR");
+    assert_eq!(
+        projected.message,
+        "Exceeded limit of 3 open writers for partitions: 4"
+    );
+}
+
+#[test]
+fn iceberg_maintenance_errors_project_original_typed_details() {
+    use novarocks_failure_contract::SharedFailureCause;
+
+    #[derive(Debug)]
+    struct Origin(FailureFact, &'static str);
+
+    impl std::fmt::Display for Origin {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str(self.1)
+        }
+    }
+
+    impl std::error::Error for Origin {}
+
+    impl FailureProjection for Origin {
+        fn failure_fact(&self) -> FailureFact {
+            self.0
+        }
+    }
+
+    let sql = "ALTER TABLE ns.t EXECUTE expire_snapshots";
+    for (class, reason, name, detail) in [
+        (
+            FailureClass::Data,
+            ICEBERG_INVALID_METADATA,
+            "ICEBERG_INVALID_METADATA",
+            "Manifest file does not exist: s3://warehouse/snap.avro",
+        ),
+        (
+            FailureClass::Dependency,
+            ICEBERG_FILESYSTEM_ERROR,
+            "ICEBERG_FILESYSTEM_ERROR",
+            "Failed removing orphan files for table: ns.t",
+        ),
+        (
+            FailureClass::Dependency,
+            ICEBERG_COMMIT_ERROR,
+            "ICEBERG_COMMIT_ERROR",
+            "Failed to commit during expire_snapshots: the catalog rejected the commit",
+        ),
+    ] {
+        let fact = FailureFact::new(class, reason);
+        let error =
+            QueryServiceError::from_failure_cause(SharedFailureCause::new(Origin(fact, detail)));
+        let service = query_error(TrinoErrorSource::Service { error: &error, sql });
+        assert_wire(&service, name);
+        assert_eq!(service.message, detail);
+
+        let error = QueryExecutionError::from_execution(ExecutionFailureInput::new(
+            fact,
+            SafeDetail::truncating(detail),
+            ExecutionFailureSite::Coordinator,
+        ));
+        let execution = query_error(TrinoErrorSource::Execution { error: &error, sql });
+        assert_eq!(execution, service);
+
+        let control = ExecutionFailureInput::new(
+            FailureFact::stop_observation(reason),
+            SafeDetail::truncating(detail),
+            ExecutionFailureSite::Coordinator,
+        );
+        assert_ne!(execution_code(&control).fields().1, name);
+    }
+}
+
+#[test]
+fn iceberg_commit_error_retains_the_original_unknown_effect() {
+    let detail = "Failed to commit during optimize_manifests: [CommitUnknown] the catalog did not confirm the commit";
+    let error = QueryServiceError::from_execution_failure(ExecutionFailureInput::new(
+        FailureFact::new(FailureClass::Dependency, ICEBERG_COMMIT_ERROR),
+        SafeDetail::truncating(detail),
+        ExecutionFailureSite::Coordinator,
+    ))
+    .attach_external_effect_disposition(StatementExternalEffectDisposition::CommitUnknown);
+    let wire = query_error(TrinoErrorSource::Service {
+        error: &error,
+        sql: "ALTER TABLE ns.t EXECUTE optimize_manifests",
+    });
+    assert_wire(&wire, "ICEBERG_COMMIT_ERROR");
+    assert!(wire.message.starts_with(detail));
+    assert!(
+        wire.message
+            .contains("external effect disposition=CommitUnknown")
+    );
+    assert!(wire.message.contains("do_not_retry=true"));
+}
+
+#[test]
+fn execution_facts_retain_their_class_before_dependency_refinement() {
+    for (reason, expected) in [
+        (QueryFailureReason::BackendLost, "REMOTE_HOST_GONE"),
+        (QueryFailureReason::ObservationLost, "REMOTE_HOST_GONE"),
+        (
+            QueryFailureReason::TransportDeadline,
+            "PAGE_TRANSPORT_TIMEOUT",
+        ),
+        (QueryFailureReason::TransportRefused, "PAGE_TRANSPORT_ERROR"),
+        (
+            QueryFailureReason::RecoveryPreparationBudgetExceeded,
+            "REMOTE_TASK_ERROR",
+        ),
+        (
+            QueryFailureReason::TransportCapacity,
+            "GENERIC_INSUFFICIENT_RESOURCES",
+        ),
+        (
+            QueryFailureReason::TaskLeaseExpired,
+            "GENERIC_INTERNAL_ERROR",
+        ),
+        (QueryFailureReason::Cancelled, "USER_CANCELED"),
+        (QueryFailureReason::DeadlineExceeded, "EXCEEDED_TIME_LIMIT"),
+        (QueryFailureReason::CommitUnknown, "GENERIC_INTERNAL_ERROR"),
+    ] {
+        let error = execution(reason);
+        let from_execution = query_error(TrinoErrorSource::Execution {
+            error: &error,
+            sql: "INSERT INTO t SELECT 1",
+        });
+        assert_wire(&from_execution, expected);
+        assert!(from_execution.message.starts_with('['));
+        let service =
+            QueryServiceError::from_execution_failure(error.execution_failure().unwrap().clone());
+        assert_eq!(
+            query_error(TrinoErrorSource::Service {
+                error: &service,
+                sql: "INSERT INTO t SELECT 1"
+            }),
+            from_execution
+        );
+    }
+    let error = execution(QueryFailureReason::CommitUnknown);
+    let wire = query_error(TrinoErrorSource::Execution {
+        error: &error,
+        sql: "INSERT INTO t SELECT 1",
+    });
+    assert_eq!(
+        wire.message,
+        "[query.execution.commit_unknown] original execution detail"
+    );
+}
+
+#[test]
+fn dependency_refinements_do_not_change_foreign_classes() {
+    let reason = QueryFailureReason::BackendLost.failure_fact().reason();
+    for (class, expected) in [
+        (FailureClass::Unsupported, "NOT_SUPPORTED"),
+        (FailureClass::Data, "GENERIC_USER_ERROR"),
+        (FailureClass::Resource, "GENERIC_INSUFFICIENT_RESOURCES"),
+        (
+            FailureClass::Representation,
+            "GENERIC_INSUFFICIENT_RESOURCES",
+        ),
+        (FailureClass::Invariant, "GENERIC_INTERNAL_ERROR"),
+        (FailureClass::Unexpected, "GENERIC_INTERNAL_ERROR"),
+        (FailureClass::Control, "GENERIC_INTERNAL_ERROR"),
+        (FailureClass::Dependency, "REMOTE_HOST_GONE"),
+    ] {
+        let error = QueryExecutionError::from_execution(ExecutionFailureInput::new(
+            FailureFact::new(class, reason),
+            SafeDetail::truncating("detail"),
+            ExecutionFailureSite::Coordinator,
+        ));
+        assert_wire(
+            &query_error(TrinoErrorSource::Execution {
+                error: &error,
+                sql: "SELECT 1",
+            }),
+            expected,
+        );
+    }
+}
+
+#[test]
+fn already_exists_requires_the_original_connector_data_fact() {
+    use novarocks_execution_contract::failure::{FailureReason, domain};
+    use std::num::NonZeroU16;
+
+    for (class, producer, reason, message, expected) in [
+        (
+            FailureClass::Data,
+            domain::CONNECTOR,
+            6002,
+            "opaque",
+            "ALREADY_EXISTS",
+        ),
+        (
+            FailureClass::Data,
+            domain::QUERY,
+            6002,
+            "AlreadyExists",
+            "GENERIC_USER_ERROR",
+        ),
+        (
+            FailureClass::Data,
+            domain::CONNECTOR,
+            6000,
+            "AlreadyExists",
+            "GENERIC_USER_ERROR",
+        ),
+        (
+            FailureClass::Dependency,
+            domain::CONNECTOR,
+            6002,
+            "AlreadyExists",
+            "REMOTE_TASK_ERROR",
+        ),
+        (
+            FailureClass::Unexpected,
+            domain::CONNECTOR,
+            6002,
+            "AlreadyExists",
+            "GENERIC_INTERNAL_ERROR",
+        ),
+    ] {
+        let input = ExecutionFailureInput::new(
+            FailureFact::new(
+                class,
+                FailureReason::new(producer, NonZeroU16::new(reason).unwrap()),
+            ),
+            SafeDetail::truncating(message),
+            ExecutionFailureSite::Coordinator,
+        );
+        let execution = QueryExecutionError::from_execution(input.clone());
+        let wire = query_error(TrinoErrorSource::Execution {
+            error: &execution,
+            sql: "CREATE TABLE t(k INT)",
+        });
+        assert_wire(&wire, expected);
+        let service = QueryServiceError::from_execution_failure(input.clone());
+        assert_eq!(
+            query_error(TrinoErrorSource::Service {
+                error: &service,
+                sql: "CREATE TABLE t(k INT)"
+            }),
+            wire
+        );
+        assert_eq!(service.execution_failure(), Some(&input));
+    }
+}
+
+#[test]
+fn integer_data_reasons_survive_execution_and_service_projection() {
+    use novarocks_execution_contract::failure::{FailureReason, domain};
+    use std::num::NonZeroU16;
+
+    // Stable function facts, independently paired with the Trino oracle.
+    for (reason, expected) in [(41, "NUMERIC_VALUE_OUT_OF_RANGE"), (43, "DIVISION_BY_ZERO")] {
+        let error = QueryExecutionError::from_execution(ExecutionFailureInput::new(
+            FailureFact::new(
+                FailureClass::Data,
+                FailureReason::new(domain::KERNEL, NonZeroU16::new(reason).unwrap()),
+            ),
+            SafeDetail::truncating("unrelated safe detail"),
+            ExecutionFailureSite::Coordinator,
+        ));
+        let wire = query_error(TrinoErrorSource::Execution {
+            error: &error,
+            sql: "SELECT 1 / 0",
+        });
+        assert_wire(&wire, expected);
+        let service =
+            QueryServiceError::from_execution_failure(error.execution_failure().unwrap().clone());
+        assert_eq!(
+            wire,
+            query_error(TrinoErrorSource::Service {
+                error: &service,
+                sql: "SELECT 1 / 0"
+            })
+        );
+    }
+}
+
+#[test]
+fn invalid_cast_argument_keeps_the_original_fact_at_both_client_exits() {
+    use novarocks_execution_contract::failure::{FailureReason, domain};
+    use std::num::NonZeroU16;
+    // Independent stable kernel identity and pinned StandardErrorCode oracle.
+    let reason = FailureReason::new(domain::KERNEL, NonZeroU16::new(44).unwrap());
+    let fact = FailureFact::new(FailureClass::Data, reason);
+    let error = QueryExecutionError::from_execution(ExecutionFailureInput::new(
+        fact,
+        SafeDetail::truncating("unrelated numeric overflow"),
+        ExecutionFailureSite::Coordinator,
+    ));
+    let original = error.execution_failure().unwrap();
+    assert_eq!(original.fact(), fact);
+    let wire = query_error(TrinoErrorSource::Execution {
+        error: &error,
+        sql: "SELECT CAST('bad' AS INTEGER)",
+    });
+    assert_wire(&wire, "INVALID_CAST_ARGUMENT");
+    let service = QueryServiceError::from_execution_failure(original.clone());
+    assert_eq!(
+        wire,
+        query_error(TrinoErrorSource::Service {
+            error: &service,
+            sql: "SELECT CAST('bad' AS INTEGER)"
+        })
+    );
+}
+
+#[test]
+fn invalid_cast_words_do_not_reclassify_other_facts() {
+    use novarocks_execution_contract::failure::{FailureReason, domain};
+    use std::num::NonZeroU16;
+    let kernel = |code| FailureReason::new(domain::KERNEL, NonZeroU16::new(code).unwrap());
+    for (class, reason, expected) in [
+        (
+            FailureClass::Representation,
+            kernel(44),
+            "GENERIC_INSUFFICIENT_RESOURCES",
+        ),
+        (
+            FailureClass::Invariant,
+            kernel(44),
+            "GENERIC_INTERNAL_ERROR",
+        ),
+        (FailureClass::Control, kernel(44), "GENERIC_INTERNAL_ERROR"),
+        (
+            FailureClass::Resource,
+            kernel(44),
+            "GENERIC_INSUFFICIENT_RESOURCES",
+        ),
+        (FailureClass::Unsupported, kernel(44), "NOT_SUPPORTED"),
+        (
+            FailureClass::Data,
+            FailureReason::new(domain::EXECUTION, NonZeroU16::new(44).unwrap()),
+            "GENERIC_USER_ERROR",
+        ),
+        (FailureClass::Data, kernel(40), "GENERIC_USER_ERROR"),
+        (FailureClass::Data, kernel(41), "NUMERIC_VALUE_OUT_OF_RANGE"),
+        (FailureClass::Data, kernel(43), "DIVISION_BY_ZERO"),
+    ] {
+        let fact = FailureFact::new(class, reason);
+        let error = QueryExecutionError::from_execution(ExecutionFailureInput::new(
+            fact,
+            SafeDetail::truncating("invalid cast argument"),
+            ExecutionFailureSite::Coordinator,
+        ));
+        assert_eq!(error.execution_failure().unwrap().fact(), fact);
+        let wire = query_error(TrinoErrorSource::Execution {
+            error: &error,
+            sql: "SELECT CAST('bad' AS INTEGER)",
+        });
+        assert_wire(&wire, expected);
+    }
+}
+
+#[test]
+fn invalid_function_argument_keeps_the_original_fact_at_both_client_exits() {
+    use novarocks_execution_contract::failure::{FailureReason, domain};
+    use std::num::NonZeroU16;
+    // Independent stable kernel identity and pinned StandardErrorCode oracle.
+    let reason = FailureReason::new(domain::KERNEL, NonZeroU16::new(45).unwrap());
+    let fact = FailureFact::new(FailureClass::Data, reason);
+    let error = QueryExecutionError::from_execution(ExecutionFailureInput::new(
+        fact,
+        SafeDetail::truncating("unrelated numeric overflow"),
+        ExecutionFailureSite::Coordinator,
+    ));
+    let original = error.execution_failure().unwrap();
+    assert_eq!(original.fact(), fact);
+    let wire = query_error(TrinoErrorSource::Execution {
+        error: &error,
+        sql: "SELECT CAST(ARRAY['invalid raw JSON'] AS ARRAY(JSON))",
+    });
+    assert_wire(&wire, "INVALID_FUNCTION_ARGUMENT");
+    let service = QueryServiceError::from_execution_failure(original.clone());
+    assert_eq!(
+        wire,
+        query_error(TrinoErrorSource::Service {
+            error: &service,
+            sql: "SELECT CAST(ARRAY['invalid raw JSON'] AS ARRAY(JSON))"
+        })
+    );
+}
+
+#[test]
+fn invalid_function_words_do_not_reclassify_other_facts() {
+    use novarocks_execution_contract::failure::{FailureReason, domain};
+    use std::num::NonZeroU16;
+    let kernel = |code| FailureReason::new(domain::KERNEL, NonZeroU16::new(code).unwrap());
+    for (class, reason, expected) in [
+        (
+            FailureClass::Representation,
+            kernel(45),
+            "GENERIC_INSUFFICIENT_RESOURCES",
+        ),
+        (
+            FailureClass::Invariant,
+            kernel(45),
+            "GENERIC_INTERNAL_ERROR",
+        ),
+        (FailureClass::Control, kernel(45), "GENERIC_INTERNAL_ERROR"),
+        (
+            FailureClass::Resource,
+            kernel(45),
+            "GENERIC_INSUFFICIENT_RESOURCES",
+        ),
+        (FailureClass::Unsupported, kernel(45), "NOT_SUPPORTED"),
+        (
+            FailureClass::Data,
+            FailureReason::new(domain::EXECUTION, NonZeroU16::new(45).unwrap()),
+            "GENERIC_USER_ERROR",
+        ),
+        (FailureClass::Data, kernel(40), "GENERIC_USER_ERROR"),
+        (FailureClass::Data, kernel(41), "NUMERIC_VALUE_OUT_OF_RANGE"),
+        (FailureClass::Data, kernel(43), "DIVISION_BY_ZERO"),
+        (FailureClass::Data, kernel(44), "INVALID_CAST_ARGUMENT"),
+        (FailureClass::Dependency, kernel(45), "REMOTE_TASK_ERROR"),
+        (
+            FailureClass::Unexpected,
+            kernel(45),
+            "GENERIC_INTERNAL_ERROR",
+        ),
+    ] {
+        let fact = FailureFact::new(class, reason);
+        let error = QueryExecutionError::from_execution(ExecutionFailureInput::new(
+            fact,
+            SafeDetail::truncating("invalid function argument"),
+            ExecutionFailureSite::Coordinator,
+        ));
+        assert_eq!(error.execution_failure().unwrap().fact(), fact);
+        let wire = query_error(TrinoErrorSource::Execution {
+            error: &error,
+            sql: "SELECT CAST(ARRAY['invalid raw JSON'] AS ARRAY(JSON))",
+        });
+        assert_wire(&wire, expected);
+    }
+}
+
+#[test]
+fn application_execution_errors_are_mapped_without_text_classification() {
+    use QueryExecutionErrorKind::*;
+    for (kind, expected) in [
+        (InvalidRequest, "GENERIC_USER_ERROR"),
+        (Rejected, "GENERIC_INSUFFICIENT_RESOURCES"),
+        (Cancelled, "USER_CANCELED"),
+        (DeadlineExceeded, "EXCEEDED_TIME_LIMIT"),
+        (Failed, "GENERIC_INTERNAL_ERROR"),
+    ] {
+        let error = QueryExecutionError::new(kind, "permission denied timeout");
+        assert_wire(
+            &query_error(TrinoErrorSource::Execution {
+                error: &error,
+                sql: "SELECT 1",
+            }),
+            expected,
+        );
+    }
+}
+
+fn located(line: u32, column: u32) -> QueryServiceError {
+    QueryServiceError::from_user_error(UserError::from_descriptor(
+        novarocks_parser::ERROR_CODE_DESCRIPTORS[4],
+        "unexpected token",
+        Some(UserErrorLocation::new(line, column, None, None)),
+        RetryClass::Never,
+    ))
+}
+#[test]
+fn location_requires_a_positive_real_utf8_boundary_in_the_original_sql() {
+    let sql = "SELECT 1;\nSELECT 名";
+    let error = located(2, 8);
+    let wire = query_error(TrinoErrorSource::Service { error: &error, sql });
+    assert_eq!(
+        wire.error_location,
+        Some(TrinoErrorLocation {
+            line_number: 2,
+            column_number: 8
+        })
+    );
+    let json = serde_json::to_value(&wire).unwrap();
+    assert_eq!(
+        json["errorLocation"],
+        serde_json::json!({"lineNumber": 2, "columnNumber": 8})
+    );
+    assert!(json["sqlState"].is_null());
+    assert!(json["failureInfo"].is_null());
+    for (line, column) in [(0, 1), (1, 0), (3, 1), (1, 50), (2, 9), (2, 11)] {
+        let error = located(line, column);
+        let wire = query_error(TrinoErrorSource::Service { error: &error, sql });
+        assert_eq!(wire.error_location, None, "{line}:{column}");
+        assert!(
+            serde_json::to_value(wire)
+                .unwrap()
+                .get("errorLocation")
+                .is_none()
+        );
+    }
+    let error = QueryServiceError::new(QueryServiceErrorKind::Parse, "line 2 column 8");
+    assert_eq!(
+        query_error(TrinoErrorSource::Service { error: &error, sql }).error_location,
+        None
+    );
+}
+
+#[test]
+fn location_columns_are_java_utf16_indices_at_the_same_original_character() {
+    // The byte-column source contract is different from Java substring's
+    // indexing. Multiple Chinese/non-BMP characters also expose CLI OOB risk.
+    for (sql, line, byte_column, utf16_column) in [
+        ("SELECT '中中中中中', missing", 1, 27, 17),
+        ("SELECT '😀😀😀', missing", 1, 24, 18),
+        ("-- 中文😀 comment\n  SELECT '中😀中', );;", 2, 24, 18),
+    ] {
+        let error = located(line, byte_column);
+        let wire = query_error(TrinoErrorSource::Service { error: &error, sql });
+        assert_eq!(
+            wire.error_location,
+            Some(TrinoErrorLocation {
+                line_number: line,
+                column_number: utf16_column,
+            }),
+            "{sql}"
+        );
+        let text = sql.split('\n').nth((line - 1) as usize).unwrap();
+        assert!(utf16_column - 1 < text.encode_utf16().count() as u32);
+        let byte_prefix = &text[..(byte_column - 1) as usize];
+        assert_eq!(byte_prefix.encode_utf16().count() as u32, utf16_column - 1);
+    }
+    for (sql, byte_column) in [("SELECT 名", 9), ("SELECT 😀", 10), ("SELECT 名", 11)] {
+        assert_eq!(
+            query_error(TrinoErrorSource::Service {
+                error: &located(1, byte_column),
+                sql
+            })
+            .error_location,
+            None,
+            "invalid UTF-8 boundary and EOF remain absent"
+        );
+    }
+}
+
+#[test]
+fn session_and_adapter_sources_have_their_own_typed_projection() {
+    let error = StatementSessionError::InvalidSessionProperty {
+        name: "unknown".into(),
+        detail: "not registered".into(),
+    };
+    assert_wire(
+        &query_error(TrinoErrorSource::Session {
+            error: &error,
+            sql: "SELECT 1",
+        }),
+        "INVALID_SESSION_PROPERTY",
+    );
+    let error = StatementSessionError::TimeZoneNotSupported {
+        zone: "wrong".into(),
+    };
+    assert_wire(
+        &query_error(TrinoErrorSource::Session {
+            error: &error,
+            sql: "SELECT 1",
+        }),
+        "NOT_SUPPORTED",
+    );
+    let error = StatementSessionError::Service(QueryServiceError::new(
+        QueryServiceErrorKind::BadDatabase,
+        "missing schema",
+    ));
+    assert_wire(
+        &query_error(TrinoErrorSource::Session {
+            error: &error,
+            sql: "USE s",
+        }),
+        "SCHEMA_NOT_FOUND",
+    );
+    assert_wire(
+        &query_error(TrinoErrorSource::Unsupported {
+            message: "transaction unsupported",
+        }),
+        "NOT_SUPPORTED",
+    );
+    assert_wire(
+        &query_error(TrinoErrorSource::RowTooLarge {
+            message: "row exceeds page budget",
+        }),
+        "GENERIC_INSUFFICIENT_RESOURCES",
+    );
+    assert_wire(
+        &query_error(TrinoErrorSource::FrontendDraining),
+        "SERVER_SHUTTING_DOWN",
+    );
+}
+
+#[test]
+fn bounded_messages_keep_typed_codes_locations_and_stable_prefixes() {
+    use crate::diagnostics::MAX_MESSAGE_JSON_BYTES;
+    let descriptor = ErrorCodeDescriptor {
+        code: ErrorCodeId::new("query.execution.commit_unknown"),
+        phase: ErrorPhase::Execution,
+        status: ErrorCodeStatus::Active,
+    };
+    let original = QueryServiceError::from_user_error(UserError::from_descriptor(
+        descriptor,
+        format!("{}終", "\u{0000}\"\\😀".repeat(MAX_MESSAGE_JSON_BYTES)),
+        Some(UserErrorLocation::new(1, 1, None, None)),
+        RetryClass::Never,
+    ));
+    let projected = query_error(TrinoErrorSource::Service {
+        error: &original,
+        sql: "INSERT INTO t SELECT 1",
+    });
+    assert_wire(&projected, "GENERIC_INTERNAL_ERROR");
+    assert!(
+        projected
+            .message
+            .starts_with("[query.execution.commit_unknown] ")
+    );
+    assert!(original.message().starts_with(&projected.message));
+    assert!(projected.message.len() < original.message().len());
+    assert!(serde_json::to_string(&projected.message).unwrap().len() <= MAX_MESSAGE_JSON_BYTES);
+    assert_eq!(
+        projected.error_location,
+        Some(TrinoErrorLocation {
+            line_number: 1,
+            column_number: 1
+        })
+    );
+    assert!(
+        original.message().ends_with(" at line 1 column 1"),
+        "the domain diagnostic remains complete"
+    );
+    let logged = query_error_for_query(
+        "20261028_120000_00001_abcde",
+        TrinoErrorSource::Service {
+            error: &original,
+            sql: "INSERT INTO t SELECT 1",
+        },
+    );
+    assert_eq!(logged, projected);
+}
+
+#[test]
+fn structured_session_errors_are_bounded_during_formatting() {
+    use crate::diagnostics::MAX_MESSAGE_JSON_BYTES;
+    for original in [
+        StatementSessionError::InvalidSessionProperty {
+            name: "query_timeout".into(),
+            detail: "\"\n中".repeat(MAX_MESSAGE_JSON_BYTES),
+        },
+        StatementSessionError::TimeZoneNotSupported {
+            zone: "😀\u{001f}".repeat(MAX_MESSAGE_JSON_BYTES),
+        },
+    ] {
+        let projected = query_error(TrinoErrorSource::Session {
+            error: &original,
+            sql: "SELECT 1",
+        });
+        assert!(original.to_string().starts_with(&projected.message));
+        assert!(serde_json::to_string(&projected.message).unwrap().len() <= MAX_MESSAGE_JSON_BYTES);
+        assert!(projected.message.len() < original.to_string().len());
+    }
+}
+
+#[test]
+fn execution_rendering_matches_original_public_author_without_rewriting_effect_suffixes() {
+    for reason in [
+        QueryFailureReason::CommitUnknown,
+        QueryFailureReason::Cancelled,
+        QueryFailureReason::BackendLost,
+    ] {
+        let error = execution(reason);
+        let expected = novarocks_query_application::session_error::execution_public_message(&error);
+        let projected = query_error(TrinoErrorSource::Execution {
+            error: &error,
+            sql: "SELECT 1",
+        });
+        assert_eq!(projected.message, expected.as_ref());
+    }
+    let input = execution(QueryFailureReason::CommitUnknown)
+        .execution_failure()
+        .unwrap()
+        .clone();
+    let error = QueryServiceError::from_execution_failure(input)
+        .attach_external_effect_disposition(
+            novarocks_query_application::api::StatementExternalEffectDisposition::CommitUnknown,
+        );
+    let original = error.message();
+    assert!(original.contains("external effect disposition=CommitUnknown"));
+    assert!(original.contains("do_not_retry=true; do not retry statement"));
+    let projected = query_error(TrinoErrorSource::Service {
+        error: &error,
+        sql: "INSERT INTO t SELECT 1",
+    });
+    assert_eq!(projected.message, original);
+    assert_wire(&projected, "GENERIC_INTERNAL_ERROR");
+}
+
+#[test]
+fn full_original_diagnostic_and_client_query_id_are_logged_only_when_truncated() {
+    use std::{
+        collections::BTreeMap,
+        sync::{Arc, Mutex},
+    };
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<BTreeMap<String, String>>>>);
+    impl tracing::Subscriber for Capture {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Fields(BTreeMap<String, String>);
+            impl tracing::field::Visit for Fields {
+                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                    self.0.insert(field.name().into(), value.into());
+                }
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    self.0.insert(field.name().into(), format!("{value:?}"));
+                }
+            }
+            let mut fields = Fields(BTreeMap::new());
+            event.record(&mut fields);
+            self.0.lock().unwrap().push(fields.0);
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+    let capture = Capture::default();
+    let original = QueryServiceError::new(
+        QueryServiceErrorKind::Internal,
+        format!(
+            "{}FULL_ORIGINAL_DIAGNOSTIC_END",
+            "\"中\u{0000}".repeat(crate::diagnostics::MAX_MESSAGE_JSON_BYTES)
+        ),
+    );
+    let small = QueryServiceError::new(QueryServiceErrorKind::Internal, "short diagnostic");
+    tracing::subscriber::with_default(capture.clone(), || {
+        query_error_for_query(
+            "20261028_120000_00001_abcde",
+            TrinoErrorSource::Service {
+                error: &small,
+                sql: "SELECT 1",
+            },
+        );
+        query_error_for_query(
+            "20261028_120000_00001_abcde",
+            TrinoErrorSource::Service {
+                error: &original,
+                sql: "SELECT 1",
+            },
+        );
+        query_error(TrinoErrorSource::Service {
+            error: &original,
+            sql: "SELECT 1",
+        });
+    });
+    let events = capture.0.lock().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["client_query_id"], "20261028_120000_00001_abcde");
+    assert_eq!(events[0]["full_error"], original.message());
+    assert!(events[0]["full_error"].ends_with("FULL_ORIGINAL_DIAGNOSTIC_END"));
+}
+
+#[test]
+fn execution_control_heavy_safe_detail_stays_complete_when_it_fits_wire_bound() {
+    let error = QueryExecutionError::from_execution(ExecutionFailureInput::new(
+        QueryFailureReason::CommitUnknown.failure_fact(),
+        SafeDetail::truncating(&"\u{0000}".repeat(crate::diagnostics::MAX_MESSAGE_JSON_BYTES)),
+        ExecutionFailureSite::Coordinator,
+    ));
+    let original = novarocks_query_application::session_error::execution_public_message(&error);
+    let projected = query_error(TrinoErrorSource::Execution {
+        error: &error,
+        sql: "INSERT INTO t SELECT 1",
+    });
+    assert_wire(&projected, "GENERIC_INTERNAL_ERROR");
+    assert!(
+        projected
+            .message
+            .starts_with("[query.execution.commit_unknown] ")
+    );
+    assert!(original.starts_with(&projected.message));
+    assert_eq!(original.as_ref(), projected.message);
+    assert!(
+        serde_json::to_string(&projected.message).unwrap().len()
+            <= crate::diagnostics::MAX_MESSAGE_JSON_BYTES
+    );
+}
+
+#[test]
+fn originating_connector_mutation_cause_reaches_the_service_mapping_with_its_effect() {
+    use novarocks_failure_contract::SharedFailureCause;
+    use novarocks_query_application::api::StatementExternalEffectDisposition;
+    use novarocks_spi::connector::{ConnectorMutationFailure, ConnectorMutationFailureKind};
+    for (kind, message, expected) in [
+        (
+            ConnectorMutationFailureKind::AlreadyExists,
+            "opaque provider detail",
+            "ALREADY_EXISTS",
+        ),
+        (
+            ConnectorMutationFailureKind::Internal,
+            "AlreadyExists: misleading detail",
+            "GENERIC_INTERNAL_ERROR",
+        ),
+    ] {
+        let original = ConnectorMutationFailure::new(kind, message);
+        let original_fact = original.failure_fact();
+        let cause = SharedFailureCause::new(original);
+        let service = QueryServiceError::from_failure_cause(cause.clone())
+            .attach_external_effect_disposition(
+                StatementExternalEffectDisposition::KnownUncommitted,
+            );
+        let mapped = query_error(TrinoErrorSource::Service {
+            error: &service,
+            sql: "CREATE TABLE t(k BIGINT)",
+        });
+        assert_wire(&mapped, expected);
+        assert_eq!(service.execution_failure().unwrap().fact(), original_fact);
+        assert_eq!(service.failure_cause(), Some(&cause));
+        assert_eq!(
+            service.external_effect_disposition(),
+            Some(StatementExternalEffectDisposition::KnownUncommitted)
+        );
+        assert!(mapped.message.contains(message));
+        assert!(!mapped.message.contains("do_not_retry=true"));
+    }
+}
+
+#[test]
+fn declared_row_match_identity_controls_standard_error_without_reclassifying_other_assertions() {
+    use novarocks_failure_contract::{execution_reason, sql_reason};
+    for (reason, message) in [
+        (
+            sql_reason::MERGE_TARGET_ROW_MULTIPLE_MATCHES,
+            "One MERGE target table row matched more than one source row",
+        ),
+        (
+            sql_reason::UPDATE_TARGET_ROW_MULTIPLE_MATCHES,
+            "One UPDATE target table row matched more than one source row",
+        ),
+    ] {
+        let input = ExecutionFailureInput::new(
+            FailureFact::new(FailureClass::Data, reason),
+            SafeDetail::truncating("keyed assertion (reason 7:317): private physical key detail"),
+            ExecutionFailureSite::Coordinator,
+        );
+        let error = QueryServiceError::from_execution_failure(input.clone())
+            .attach_external_effect_disposition(StatementExternalEffectDisposition::KnownCommitted);
+        let wire = query_error(TrinoErrorSource::Service {
+            error: &error,
+            sql: "opaque statement",
+        });
+        assert_wire(&wire, "MERGE_TARGET_ROW_MULTIPLE_MATCHES");
+        assert_eq!(wire.message, message);
+        assert!(wire.sql_state.is_none());
+        assert!(wire.error_location.is_none());
+        assert_eq!(error.execution_failure(), Some(&input));
+        assert_eq!(
+            error.external_effect_disposition(),
+            Some(StatementExternalEffectDisposition::KnownCommitted)
+        );
+        let execution = QueryExecutionError::from_execution(input);
+        let wire = query_error(TrinoErrorSource::Execution {
+            error: &execution,
+            sql: "opaque statement",
+        });
+        assert_wire(&wire, "MERGE_TARGET_ROW_MULTIPLE_MATCHES");
+        assert_eq!(wire.message, message);
+    }
+    for (class, reason, name) in [
+        (
+            FailureClass::Data,
+            execution_reason::ASSERT_ROWS_DUPLICATE_KEY,
+            "GENERIC_USER_ERROR",
+        ),
+        (
+            FailureClass::Invariant,
+            sql_reason::MERGE_TARGET_ROW_MULTIPLE_MATCHES,
+            "GENERIC_INTERNAL_ERROR",
+        ),
+    ] {
+        let input = ExecutionFailureInput::new(
+            FailureFact::new(class, reason),
+            SafeDetail::truncating("One MERGE target table row matched more than one source row"),
+            ExecutionFailureSite::Coordinator,
+        );
+        let error = QueryExecutionError::from_execution(input);
+        assert_wire(
+            &query_error(TrinoErrorSource::Execution {
+                error: &error,
+                sql: "MERGE",
+            }),
+            name,
+        );
+    }
+}
+
+#[test]
+fn ddl_property_scopes_publish_real_user_errors_with_exact_trino_identity_and_location() {
+    use novarocks_query_application::sql::property_admit::DdlPropertyScope;
+    // The original error location uses byte columns; the wire uses UTF-16.
+    let source = "-- 中文😀\nWITH (\"😀\" = 1, broken = 2)";
+    let start = source.find("broken").unwrap();
+    let span = novarocks_parser::Span::new(start, start + "broken".len());
+    for (scope, descriptor, name, number) in [
+        (
+            DdlPropertyScope::Catalog,
+            "sql.admit.invalid_catalog_property",
+            "INVALID_CATALOG_PROPERTY",
+            124,
+        ),
+        (
+            DdlPropertyScope::Schema,
+            "sql.admit.invalid_schema_property",
+            "INVALID_SCHEMA_PROPERTY",
+            33,
+        ),
+        (
+            DdlPropertyScope::Table,
+            "sql.admit.invalid_table_property",
+            "INVALID_TABLE_PROPERTY",
+            18,
+        ),
+        (
+            DdlPropertyScope::MaterializedView,
+            "sql.admit.invalid_materialized_view_property",
+            "INVALID_MATERIALIZED_VIEW_PROPERTY",
+            95,
+        ),
+        (
+            DdlPropertyScope::Analyze,
+            "sql.admit.invalid_analyze_property",
+            "INVALID_ANALYZE_PROPERTY",
+            42,
+        ),
+        (
+            DdlPropertyScope::Branch,
+            "sql.admit.invalid_branch_property",
+            "INVALID_BRANCH_PROPERTY",
+            136,
+        ),
+    ] {
+        let detail = "same original property detail";
+        let user = scope.to_user_error(source, span, detail);
+        assert_eq!(user.code().as_str(), descriptor);
+        assert_eq!(user.phase(), ErrorPhase::Admit);
+        assert_eq!(user.retry(), RetryClass::Never);
+        assert_eq!(user.location().unwrap().line(), 2);
+        assert_eq!(user.location().unwrap().column(), 19);
+        let service = QueryServiceError::from_user_error(user);
+        let wire = query_error(TrinoErrorSource::Service {
+            error: &service,
+            sql: source,
+        });
+        assert_wire(&wire, name);
+        assert_eq!(
+            (wire.error_code, wire.error_name, wire.error_type),
+            (number, name, "USER_ERROR")
+        );
+        assert_eq!(
+            wire.error_location,
+            Some(TrinoErrorLocation {
+                line_number: 2,
+                column_number: 17
+            })
+        );
+        assert!(wire.message.contains(detail));
+        assert!(wire.message.starts_with(&format!("[{descriptor}]")));
+        assert!(wire.sql_state.is_none());
+        assert!(wire.failure_info.is_none());
+        let encoded = serde_json::to_value(&wire).unwrap();
+        assert_eq!(encoded["errorName"], name);
+        assert_eq!(encoded["errorCode"], number);
+        assert_eq!(encoded["errorType"], "USER_ERROR");
+        assert_eq!(
+            encoded["errorLocation"],
+            serde_json::json!({"lineNumber": 2, "columnNumber": 17})
+        );
+        assert_eq!(service.user_error().unwrap().code().as_str(), descriptor);
+
+        let user = scope.without_location(detail);
+        assert_eq!(user.code().as_str(), descriptor);
+        assert_eq!(user.phase(), ErrorPhase::Admit);
+        assert_eq!(user.retry(), RetryClass::Never);
+        assert!(user.location().is_none());
+        let service = QueryServiceError::from_user_error(user);
+        let wire = query_error(TrinoErrorSource::Service {
+            error: &service,
+            sql: source,
+        });
+        assert_wire(&wire, name);
+        assert!(wire.error_location.is_none());
+        assert!(
+            serde_json::to_value(&wire)
+                .unwrap()
+                .get("errorLocation")
+                .is_none()
+        );
+    }
+}
+
+#[test]
+fn ddl_property_mapping_keeps_the_old_analyzer_owner_and_never_classifies_error_wording() {
+    let analysis = novarocks_sql::analyze_error::AnalyzeError::invalid_analyze_property(
+        "old analyzer property detail",
+    );
+    let user = analysis.to_user_error(None);
+    assert_eq!(user.code().as_str(), "sql.analyze.invalid_analyze_property");
+    assert_eq!(user.phase(), ErrorPhase::Analyze);
+    let service = QueryServiceError::from_user_error(user);
+    assert_wire(
+        &query_error(TrinoErrorSource::Service {
+            error: &service,
+            sql: "ANALYZE t",
+        }),
+        "INVALID_ANALYZE_PROPERTY",
+    );
+    for (kind, name) in [
+        (QueryServiceErrorKind::InvalidValue, "GENERIC_USER_ERROR"),
+        (QueryServiceErrorKind::Unsupported, "NOT_SUPPORTED"),
+        (QueryServiceErrorKind::Interrupted, "USER_CANCELED"),
+        (QueryServiceErrorKind::Internal, "GENERIC_INTERNAL_ERROR"),
+    ] {
+        let service =
+            QueryServiceError::new(kind, "INVALID_TABLE_PROPERTY invalid catalog property");
+        let wire = query_error(TrinoErrorSource::Service {
+            error: &service,
+            sql: "SELECT 1",
+        });
+        assert_wire(&wire, name);
+    }
+}
+
+#[test]
+fn table_property_descriptor_with_original_cause_and_late_effect_maps_to_eighteen() {
+    use novarocks_query_application::{
+        api::StatementExternalEffectDisposition, sql::property_admit::DdlPropertyScope,
+    };
+    use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind, InvalidTableProperty};
+    let original = ConnectorError::new(
+        ConnectorErrorKind::InvalidRequest,
+        "actual property producer detail",
+    );
+    let marked = InvalidTableProperty::from_property_error(original);
+    let cause = novarocks_failure_contract::SharedFailureCause::new(marked);
+    let service = QueryServiceError::from_user_error_with_cause(
+        DdlPropertyScope::Table.without_location("actual property producer detail"),
+        cause.clone(),
+    )
+    .attach_external_effect_disposition(StatementExternalEffectDisposition::KnownUncommitted);
+    let wire = query_error(TrinoErrorSource::Service {
+        error: &service,
+        sql: "CREATE TABLE actual_source",
+    });
+    assert_eq!(
+        (wire.error_code, wire.error_name, wire.error_type),
+        (18, "INVALID_TABLE_PROPERTY", "USER_ERROR")
+    );
+    assert!(wire.error_location.is_none());
+    assert_eq!(service.failure_cause(), Some(&cause));
+    assert_eq!(
+        service.external_effect_disposition(),
+        Some(StatementExternalEffectDisposition::KnownUncommitted)
+    );
+}
+
+#[test]
+fn ctas_existing_target_uses_the_original_statement_location_and_trino_code() {
+    use novarocks_query_application::sql::dml_admission::DmlAdmissionError;
+
+    let source = "-- comment before the statement\n  CREATE TABLE test.s.destination AS SELECT 1";
+    let start = source.find("CREATE").unwrap();
+    let user = DmlAdmissionError::TableAlreadyExists.to_user_error(
+        source,
+        novarocks_parser::Span::new(start, source.len()),
+        "Destination table 'test.s.destination' already exists",
+    );
+    assert_eq!(user.code().as_str(), "sql.admit.table_already_exists");
+    assert_eq!(user.retry(), RetryClass::Never);
+    let error = QueryServiceError::from_user_error(user);
+    let wire = query_error(TrinoErrorSource::Service {
+        error: &error,
+        sql: source,
+    });
+    assert_eq!(
+        (wire.error_code, wire.error_name, wire.error_type),
+        (50, "TABLE_ALREADY_EXISTS", "USER_ERROR"),
+    );
+    assert_eq!(
+        wire.error_location,
+        Some(TrinoErrorLocation {
+            line_number: 2,
+            column_number: 3
+        }),
+    );
+    assert!(wire.message.contains("test.s.destination"));
+}

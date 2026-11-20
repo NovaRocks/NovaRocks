@@ -1241,6 +1241,17 @@ impl<'a> AnalyzerContext<'a> {
                     operation.span,
                 ));
             }
+            let unsupported_all = match (operation.operator, operation.distinct) {
+                (ast::SetOperator::Intersect, false) => Some("INTERSECT ALL is not supported"),
+                (ast::SetOperator::Except, false) => Some("EXCEPT ALL is not supported"),
+                _ => None,
+            };
+            if let Some(message) = unsupported_all {
+                return Err(AnalyzeError::unsupported_query_shape(
+                    message,
+                    operation.span,
+                ));
+            }
             let Some(first) = operation.inputs.first() else {
                 return Err(AnalyzeError::invalid_query_shape(
                     "set operation has no input",

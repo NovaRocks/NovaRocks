@@ -24,7 +24,7 @@ use super::super::{
     },
     csr_slots::SlotsProgress,
     join_completion::tests::{Control, fixture},
-    join_completion::{JoinCompletion, JoinParticipants, funded_shared},
+    join_completion::{JoinCompletion, JoinParticipants, funded_shared, new_join_completion},
 };
 use super::*;
 use crate::exec::hash_table::key_index::{
@@ -85,7 +85,7 @@ pub(crate) fn captured_graph_for(
             .unwrap();
         receipts.push(writer.seal(work).unwrap());
     }
-    let completion: Arc<JoinCompletion<NoArtifact>> = JoinCompletion::new(
+    let completion: Arc<JoinCompletion<NoArtifact>> = new_join_completion(
         JoinParticipants {
             inputs: receipts.len(),
             finalizers: NonZeroUsize::new(3).unwrap(),

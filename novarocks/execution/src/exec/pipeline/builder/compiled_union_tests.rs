@@ -180,23 +180,28 @@ fn compiled_union_all_refuses_a_branch_that_does_not_own_the_union_layout() {
     let ProgramNodeKind::UnionAll { inputs } = program.graph().nodes()[union.index()].kind() else {
         panic!("the compiler emits a local UnionAll root");
     };
-    assert!(super::validate_union_branches(&program, union, inputs).is_ok());
+    assert!(super::validate_set_branches(&program, union, inputs, "UnionAll").is_ok());
     // A branch's raw Values child is not its normalizer.
     let ProgramNodeKind::Project { input: raw, .. } =
         program.graph().nodes()[inputs[0].index()].kind()
     else {
         panic!("normalizer");
     };
-    let error = super::validate_union_branches(&program, union, &[*raw, inputs[1]]).unwrap_err();
+    let error =
+        super::validate_set_branches(&program, union, &[*raw, inputs[1]], "UnionAll").unwrap_err();
     assert!(
         error
             .to_string()
-            .contains("branch 0 is not a normalizer owning the union layout"),
+            .contains("branch 0 is not a normalizer owning the set layout"),
         "{error}"
     );
-    let error =
-        super::validate_union_branches(&program, union, &[ProgramNodeId::new(inputs[1].index())])
-            .unwrap_err();
+    let error = super::validate_set_branches(
+        &program,
+        union,
+        &[ProgramNodeId::new(inputs[1].index())],
+        "UnionAll",
+    )
+    .unwrap_err();
     assert!(
         error.to_string().contains("fewer than two branches"),
         "{error}"

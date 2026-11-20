@@ -5358,6 +5358,16 @@ impl<'a> ContractLoweringVisitor<'a> {
         redistribute: &crate::planner::physical::RedistributeNode,
         shared_hash_scheme: Option<HashPartitionScheme>,
     ) -> Result<LoweredNode, ContractLoweringError> {
+        let source = self.lower_redistribute_source(plan, redistribute)?;
+        let layout = self.redistribute_layout(redistribute, shared_hash_scheme)?;
+        self.append_exchange(source, &plan.output_columns, layout)
+    }
+
+    fn lower_redistribute_source(
+        &mut self,
+        plan: &PhysicalPlanNode,
+        redistribute: &crate::planner::physical::RedistributeNode,
+    ) -> Result<LoweredNode, ContractLoweringError> {
         expect_children(plan, 1)?;
         require_output_shape(
             "Redistribute",
@@ -5370,20 +5380,36 @@ impl<'a> ContractLoweringVisitor<'a> {
             &plan.children[0].output_columns,
         )?;
 
+        self.lower_exchange_source(&plan.children[0], "Redistribute")
+    }
+
+    fn lower_exchange_source(
+        &mut self,
+        plan: &PhysicalPlanNode,
+        owner: &'static str,
+    ) -> Result<LoweredNode, ContractLoweringError> {
         let destination = self.current_fragment;
         let source_fragment = self.allocate_fragment()?;
         self.current_fragment = source_fragment;
-        let source = self.lower_node(&plan.children[0])?;
+        let lowered = self.lower_node(plan);
+        self.current_fragment = destination;
+        let source = lowered?;
         if source.fragment != source_fragment {
             return Err(ContractLoweringError::UnexpectedFragment {
-                node: "Redistribute",
+                node: owner,
                 expected: source_fragment,
                 actual: source.fragment,
             });
         }
-        self.current_fragment = destination;
+        Ok(source)
+    }
 
-        let layout = match &redistribute.mode {
+    fn redistribute_layout(
+        &mut self,
+        redistribute: &crate::planner::physical::RedistributeNode,
+        shared_hash_scheme: Option<HashPartitionScheme>,
+    ) -> Result<ExchangeLayout, ContractLoweringError> {
+        Ok(match &redistribute.mode {
             RedistributeMode::Gather => {
                 require_no_partition_expressions("Gather", &redistribute.partition_exprs)?;
                 ExchangeLayout::Gather
@@ -5421,8 +5447,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                     scheme,
                 }
             }
-        };
-        self.append_exchange(source, &plan.output_columns, layout)
+        })
     }
 
     fn append_exchange(
@@ -5505,6 +5530,11 @@ impl<'a> ContractLoweringVisitor<'a> {
                 Distribution::Broadcast,
                 Distribution::Broadcast,
                 RowMultiplicity::Replicated,
+            ),
+            ExchangeLayout::RoundRobin => (
+                Distribution::RoundRobin,
+                Distribution::RoundRobin,
+                RowMultiplicity::SingleCopy,
             ),
             ExchangeLayout::ConditionalKey {
                 applies,
@@ -6353,78 +6383,20 @@ impl<'a> ContractLoweringVisitor<'a> {
         for (child, mapped_columns) in plan.children.iter().zip(&set_op.child_output_columns) {
             require_output_shape("SetOp child", &child.output_columns, mapped_columns)?;
         }
-        // A set operation that compares its branches needs them in one
-        // partition space. A branch that arrives already partitioned brings
-        // the space with it -- a chained `EXCEPT` feeding an `INTERSECT` is
-        // one -- and the shuffles beside it join that space; only when every
-        // branch is a shuffle of its own is a new space minted here.
-        let shuffles_itself = |child: &PhysicalPlanNode| {
-            matches!(
-                &child.kind,
-                PhysicalPlanKind::Redistribute(redistribute)
-                    if matches!(redistribute.mode, RedistributeMode::Hash { .. })
-            )
+        let inputs = match kind {
+            SetOperationKind::UnionAll => self.lower_union_all_inputs(plan, set_op)?,
+            SetOperationKind::Intersect | SetOperationKind::Except => {
+                self.lower_comparison_set_inputs(plan, set_op)?
+            }
         };
-        let mut lowered_children = plan
-            .children
-            .iter()
-            .map(|_| None)
-            .collect::<Vec<Option<LoweredNode>>>();
-        let mut shared_hash_scheme = None;
-        if kind != SetOperationKind::UnionAll {
-            for (ordinal, child) in plan.children.iter().enumerate() {
-                if shuffles_itself(child) {
-                    continue;
-                }
-                let lowered = self.lower_node(child)?;
-                if let Distribution::Hash { scheme, .. } = &lowered.properties.distribution {
-                    if shared_hash_scheme
-                        .as_ref()
-                        .is_some_and(|expected| expected != scheme)
-                    {
-                        return Err(ContractLoweringError::InvalidSetOp {
-                            detail: "inputs arrive in different hash partition spaces",
-                        });
-                    }
-                    shared_hash_scheme = Some(scheme.clone());
-                }
-                lowered_children[ordinal] = Some(lowered);
-            }
-            if shared_hash_scheme.is_none() && plan.children.iter().all(shuffles_itself) {
-                shared_hash_scheme = Some(self.allocate_hash_scheme()?);
-            }
-        }
-        let mut inputs = Vec::with_capacity(plan.children.len());
-        for (ordinal, (child, mapped_columns)) in plan
-            .children
-            .iter()
-            .zip(&set_op.child_output_columns)
-            .enumerate()
-        {
-            let lowered = match lowered_children[ordinal].take() {
-                Some(lowered) => lowered,
-                None => match (&child.kind, &shared_hash_scheme) {
-                    (PhysicalPlanKind::Redistribute(redistribute), Some(scheme)) => {
-                        self.lower_redistribute(child, redistribute, Some(scheme.clone()))?
-                    }
-                    _ => self.lower_node(child)?,
-                },
-            };
-            if lowered.fragment != self.current_fragment {
+        for input in &inputs {
+            if input.fragment != self.current_fragment {
                 return Err(ContractLoweringError::UnexpectedFragment {
                     node: "SetOp",
                     expected: self.current_fragment,
-                    actual: lowered.fragment,
+                    actual: input.fragment,
                 });
             }
-            // A set operation's column is one type, which its branches were
-            // reconciled to while the statement was analyzed: a decimal beside
-            // a double answers as a double. Carry that reconciliation here, so
-            // the branches this node reads already agree with what it
-            // publishes.
-            let lowered =
-                self.align_set_op_branch(lowered, mapped_columns, &plan.output_columns)?;
-            inputs.push(lowered);
         }
         let node = self.fragment_mut().reserve_node_id()?;
         let mut published_types = plan
@@ -6635,6 +6607,204 @@ impl<'a> ContractLoweringVisitor<'a> {
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
         })
+    }
+
+    fn lower_union_all_inputs(
+        &mut self,
+        plan: &PhysicalPlanNode,
+        set_op: &crate::planner::physical::PhysicalSetOpNode,
+    ) -> Result<Vec<LoweredNode>, ContractLoweringError> {
+        let singleton_inputs = plan
+            .children
+            .iter()
+            .map(|child| self.is_set_op_singleton_source(child))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mixed = singleton_inputs.iter().any(|singleton| !singleton);
+        let mut inputs = Vec::with_capacity(plan.children.len());
+        for ((child, columns), singleton) in plan
+            .children
+            .iter()
+            .zip(&set_op.child_output_columns)
+            .zip(singleton_inputs)
+        {
+            let input = if mixed && singleton {
+                let source = self.lower_exchange_source(child, "UnionAll")?;
+                // Preserve any selected-constant proof at its source. The
+                // exchange import carries a value, not its original definition.
+                let (source, aligned_columns) =
+                    self.align_set_op_exchange_source(source, columns, &plan.output_columns)?;
+                self.append_exchange(source, &aligned_columns, ExchangeLayout::RoundRobin)?
+            } else {
+                let input = self.lower_node(child)?;
+                self.align_set_op_branch(input, columns, &plan.output_columns)?
+            };
+            inputs.push(input);
+        }
+        Ok(inputs)
+    }
+
+    /// These sources have no split or incoming edge to assign their rows to
+    /// instances. An independent fragment gives them a single execution.
+    fn is_set_op_singleton_source(
+        &mut self,
+        plan: &PhysicalPlanNode,
+    ) -> Result<bool, ContractLoweringError> {
+        let mut pending = vec![plan];
+        while let Some(node) = pending.pop() {
+            self.work.step()?;
+            match &node.kind {
+                PhysicalPlanKind::Scan(_)
+                | PhysicalPlanKind::Redistribute(_)
+                | PhysicalPlanKind::CTEConsume(_) => return Ok(false),
+                PhysicalPlanKind::Values(_)
+                | PhysicalPlanKind::SystemTable(_)
+                | PhysicalPlanKind::GenerateSeries(_)
+                    if node.children.is_empty() => {}
+                _ if node.children.is_empty() => return Ok(false),
+                _ => {
+                    pending
+                        .try_reserve(node.children.len())
+                        .map_err(|_| CompileControlError::ResourceExhausted)?;
+                    pending.extend(node.children.iter());
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    fn lower_comparison_set_inputs(
+        &mut self,
+        plan: &PhysicalPlanNode,
+        set_op: &crate::planner::physical::PhysicalSetOpNode,
+    ) -> Result<Vec<LoweredNode>, ContractLoweringError> {
+        // A naturally partitioned input (for example an inner EXCEPT) lends
+        // its space to the shuffles beside it as long as its keys need no cast.
+        let mut inputs = Vec::with_capacity(plan.children.len());
+        let mut shared_hash_scheme = None;
+        for (child, columns) in plan.children.iter().zip(&set_op.child_output_columns) {
+            let needs_cast = columns.iter().zip(&plan.output_columns).any(|(from, to)| {
+                let from = value_type(from);
+                from != set_op_comparison_type(to, &from)
+            });
+            let needs_exchange = match &child.kind {
+                PhysicalPlanKind::Redistribute(redistribute) => {
+                    matches!(redistribute.mode, RedistributeMode::Hash { .. })
+                }
+                _ => needs_cast && !self.is_set_op_singleton_source(child)?,
+            };
+            if needs_exchange {
+                inputs.push(None);
+                continue;
+            }
+
+            let input = self.lower_node(child)?;
+            if let Distribution::Hash { scheme, .. } = &input.properties.distribution {
+                if self.set_op_branch_needs_cast(&input, columns, &plan.output_columns)? {
+                    return Err(ContractLoweringError::InvalidSetOp {
+                        detail: "a partitioned input needs alignment before its hash exchange",
+                    });
+                }
+                if shared_hash_scheme
+                    .as_ref()
+                    .is_some_and(|expected| expected != scheme)
+                {
+                    return Err(ContractLoweringError::InvalidSetOp {
+                        detail: "inputs arrive in different hash partition spaces",
+                    });
+                }
+                shared_hash_scheme = Some(scheme.clone());
+                inputs.push(Some(input));
+            } else {
+                inputs.push(Some(self.align_set_op_branch(
+                    input,
+                    columns,
+                    &plan.output_columns,
+                )?));
+            }
+        }
+
+        if !inputs.iter().any(Option::is_none) {
+            return Ok(inputs.into_iter().flatten().collect());
+        }
+        let scheme = match shared_hash_scheme {
+            Some(scheme) => scheme,
+            None => self.allocate_hash_scheme()?,
+        };
+        plan.children
+            .iter()
+            .zip(&set_op.child_output_columns)
+            .zip(inputs)
+            .map(|((child, columns), input)| match input {
+                Some(input) => Ok(input),
+                None => self.lower_comparison_set_exchange(
+                    child,
+                    columns,
+                    &plan.output_columns,
+                    scheme.clone(),
+                ),
+            })
+            .collect()
+    }
+
+    fn lower_comparison_set_exchange(
+        &mut self,
+        child: &PhysicalPlanNode,
+        columns: &[OutputColumn],
+        published: &[OutputColumn],
+        scheme: HashPartitionScheme,
+    ) -> Result<LoweredNode, ContractLoweringError> {
+        let (source, layout) = match &child.kind {
+            PhysicalPlanKind::Redistribute(redistribute) => (
+                self.lower_redistribute_source(child, redistribute)?,
+                Some(self.redistribute_layout(redistribute, Some(scheme.clone()))?),
+            ),
+            _ => {
+                let source = self.lower_exchange_source(child, "SetOp")?;
+                if !matches!(source.properties.distribution, Distribution::Hash { .. }) {
+                    return Err(ContractLoweringError::MissingPlannerFact {
+                        node: "SetOp",
+                        fact: "a partitioned input for re-shuffling comparison values",
+                    });
+                }
+                (source, None)
+            }
+        };
+        let (source, aligned_columns) =
+            self.align_set_op_exchange_source(source, columns, published)?;
+        let layout = layout.unwrap_or_else(|| {
+            let mut seen = BTreeSet::new();
+            let keys = aligned_columns
+                .iter()
+                .zip(&source.output)
+                .filter_map(|(column, &value)| seen.insert(value).then_some(column.column_id))
+                .collect();
+            ExchangeLayout::Hash { keys, scheme }
+        });
+        let input = self.append_exchange(source, &aligned_columns, layout)?;
+        if self.set_op_branch_needs_cast(&input, columns, published)? {
+            return Err(ContractLoweringError::InvalidSetOp {
+                detail: "comparison exchange does not carry the aligned type",
+            });
+        }
+        Ok(input)
+    }
+
+    fn align_set_op_exchange_source(
+        &mut self,
+        source: LoweredNode,
+        columns: &[OutputColumn],
+        published: &[OutputColumn],
+    ) -> Result<(LoweredNode, Vec<OutputColumn>), ContractLoweringError> {
+        let destination = self.current_fragment;
+        self.current_fragment = source.fragment;
+        let source = self.align_set_op_branch(source, columns, published);
+        self.current_fragment = destination;
+        let source = source?;
+        let mut aligned_columns = columns.to_vec();
+        for (column, &value) in aligned_columns.iter_mut().zip(&source.output) {
+            column.value_type = self.value_declared_type_in(source.fragment, value)?;
+        }
+        Ok((source, aligned_columns))
     }
 
     fn lower_hash_aggregate(
@@ -7720,31 +7890,31 @@ impl<'a> ContractLoweringVisitor<'a> {
     ///
     /// Returns the branch unchanged where every column already answers with
     /// the published type.
+    fn set_op_branch_needs_cast(
+        &mut self,
+        branch: &LoweredNode,
+        mapped_columns: &[OutputColumn],
+        output_columns: &[OutputColumn],
+    ) -> Result<bool, ContractLoweringError> {
+        for (column, published) in mapped_columns.iter().zip(output_columns) {
+            let value = branch.columns.get(&column.column_id).copied().ok_or(
+                ContractLoweringError::UnknownColumnReference(column.column_id),
+            )?;
+            let actual = self.value_declared_type(value)?;
+            if actual != set_op_comparison_type(published, &actual) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     fn align_set_op_branch(
         &mut self,
         branch: LoweredNode,
         mapped_columns: &[OutputColumn],
         output_columns: &[OutputColumn],
     ) -> Result<LoweredNode, ContractLoweringError> {
-        // Both sides read in the plan's own vocabulary, where a map's entries
-        // are named `entries`/`key`/`value`: a branch that came from a
-        // provider would otherwise differ from a branch that came from a
-        // projection over decoration neither of them compares by.
-        let mut needs_cast = false;
-        for (column, published) in mapped_columns.iter().zip(output_columns) {
-            let value = branch.columns.get(&column.column_id).copied().ok_or(
-                ContractLoweringError::UnknownColumnReference(column.column_id),
-            )?;
-            let actual = self.value_declared_type(value)?;
-            let expected = value_type(published)
-                .with_nullable(actual.nullable())
-                .expect("validated root NULL contract");
-            if actual != expected {
-                needs_cast = true;
-                break;
-            }
-        }
-        if !needs_cast {
+        if !self.set_op_branch_needs_cast(&branch, mapped_columns, output_columns)? {
             return Ok(branch);
         }
 
@@ -7757,9 +7927,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                 ContractLoweringError::UnknownColumnReference(column.column_id),
             )?;
             let source_type = self.value_declared_type(source)?;
-            let published_type = (value_type(published))
-                .with_nullable(source_type.nullable())
-                .expect("validated root NULL contract");
+            let published_type = set_op_comparison_type(published, &source_type);
             // A selected checked NULL has no payload to convert. Keep the
             // branch itself evaluated, but author its aligned output in the
             // published type, just as lower_expression_as does for syntax NULL.
@@ -10970,6 +11138,7 @@ struct HashJoinRequirement<'a> {
 enum ExchangeLayout {
     Gather,
     Broadcast,
+    RoundRobin,
     ConditionalKey {
         applies: ColumnId,
         keys: Box<[ColumnId]>,
@@ -11745,6 +11914,12 @@ fn hash_join_output_distribution(
         ) => right.properties.distribution.clone(),
         (ContractJoinKind::FullOuter | ContractJoinKind::Cross, _) => Distribution::Unconstrained,
     }
+}
+
+fn set_op_comparison_type(published: &OutputColumn, source: &ValueType) -> ValueType {
+    value_type(published)
+        .with_nullable(source.nullable())
+        .expect("validated root NULL contract")
 }
 
 fn occurrence_representatives(values: &[ValueId]) -> Vec<usize> {
@@ -13573,6 +13748,8 @@ pub(super) mod lowered_writer_state_tests;
 
 #[cfg(test)]
 mod tests {
+    mod set_operations;
+
     use std::collections::HashMap;
 
     use novarocks_physical_plan::{

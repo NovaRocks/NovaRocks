@@ -44,12 +44,12 @@ id	v
 6	60
 
 -- query 10
--- legacy
+-- types	bigint
 rows_changed_by_optimize
 0
 
 -- query 11
--- legacy
+-- types	bigint
 baseline_rows_missing_after_optimize
 0
 

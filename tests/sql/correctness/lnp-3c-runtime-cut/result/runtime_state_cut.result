@@ -1,0 +1,7 @@
+-- query 9
+-- types	varchar	bigint
+metric_name	metric_value
+rewritten_manifests_count	3
+added_manifests_count	1
+kept_manifests_count	0
+processed_manifest_entries_count	3

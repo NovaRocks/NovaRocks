@@ -349,6 +349,8 @@ impl AttributionExpectation {
     ) -> Result<Self, ExpectationError> {
         let mut snapshots = std::collections::BTreeSet::new();
         let mut refs = std::collections::BTreeMap::new();
+        let mut schemas = std::collections::BTreeSet::new();
+        let mut specs = std::collections::BTreeSet::new();
         for update in updates {
             match update {
                 crate::iceberg::TableUpdate::RemoveSnapshots { snapshot_ids } => {
@@ -363,6 +365,12 @@ impl AttributionExpectation {
                 crate::iceberg::TableUpdate::RemoveSnapshotRef { ref_name } => {
                     refs.insert(ref_name.clone(), None);
                 }
+                crate::iceberg::TableUpdate::RemoveSchemas { schema_ids } => {
+                    schemas.extend(schema_ids.iter().copied());
+                }
+                crate::iceberg::TableUpdate::RemovePartitionSpecs { spec_ids } => {
+                    specs.extend(spec_ids.iter().copied());
+                }
                 _ => {}
             }
         }
@@ -372,6 +380,8 @@ impl AttributionExpectation {
         expected.view_request = Some(TableViewRequest::default().with_retention(
             removed_snapshots.clone(),
             refs.iter().map(|(name, _)| name.clone()).collect(),
+            schemas.into_iter().collect(),
+            specs.into_iter().collect(),
         )?);
         expected.retention = Some(RetentionExpectation {
             removed_snapshots,
@@ -843,6 +853,7 @@ fn attribute_table(
         .view_request
         .as_ref()
         .ok_or(anomaly(AnomalyCause::ViewMismatch))?;
+    use super::minimal_view::MetadataIdKind;
     let scanned_keys = view.properties.iter().map(|(key, _)| key);
     if view.snapshot.map(|check| check.snapshot_id) != request.snapshot()
         || view.target_ref.as_ref().map(|check| check.name.as_str()) != request.target_ref()
@@ -857,6 +868,13 @@ fn attribute_table(
             .iter()
             .map(|(name, _, _)| name)
             .eq(request.retention_refs().iter())
+        || MetadataIdKind::ALL.into_iter().any(|kind| {
+            !view
+                .removed_metadata_ids(kind)
+                .iter()
+                .map(|check| check.id)
+                .eq(request.removed_metadata_ids(kind).iter().copied())
+        })
     {
         return Err(anomaly(AnomalyCause::ViewMismatch));
     }
@@ -889,6 +907,11 @@ fn attribute_table(
             .retention_snapshots
             .iter()
             .any(|snapshot| snapshot.present)
+            || MetadataIdKind::ALL.into_iter().any(|kind| {
+                view.removed_metadata_ids(kind)
+                    .iter()
+                    .any(|check| check.present)
+            })
             || retention.refs.iter().zip(&view.retention_refs).any(
                 |((_, expected), (_, present, observed))| match expected {
                     Some(snapshot) => !*present || observed != &Some(*snapshot),
@@ -2271,5 +2294,70 @@ mod tests {
             classify(&status(200), read(&expect, &duplicate_ref), &expect),
             RestEvidence::Unknown { .. }
         ));
+    }
+
+    #[test]
+    fn dictionary_only_retention_requires_valid_arrays_and_each_requested_id_absent() {
+        use crate::iceberg::TableUpdate;
+        let expected = AttributionExpectation::ref_retention(
+            uuid(TABLE_UUID),
+            &[
+                TableUpdate::RemoveSchemas {
+                    schema_ids: vec![7, 5],
+                },
+                TableUpdate::RemovePartitionSpecs {
+                    spec_ids: vec![4, 3],
+                },
+            ],
+        )
+        .unwrap();
+        let response = serde_json::json!({
+            "metadata-location": "s3://warehouse/t/metadata/v2.json",
+            "metadata": {
+                "table-uuid": TABLE_UUID,
+                "schemas": [{"schema-id": 0, "fields": []}, {"schema-id": 6}],
+                "partition-specs": [{"spec-id": 0, "fields": []}, {"spec-id": 2}]
+            }
+        });
+        let classify_view = |value: &serde_json::Value| {
+            classify(&status(200), read(&expected, &value.to_string()), &expected)
+        };
+        assert!(matches!(
+            classify_view(&response),
+            RestEvidence::Applied { .. }
+        ));
+        for (array, field, id) in [
+            ("schemas", "schema-id", 5),
+            ("schemas", "schema-id", 7),
+            ("partition-specs", "spec-id", 3),
+            ("partition-specs", "spec-id", 4),
+        ] {
+            let mut unchanged = response.clone();
+            unchanged["metadata"][array][0][field] = id.into();
+            assert_eq!(
+                unknown_reason(&classify_view(&unchanged)),
+                &UnknownReason::Unattributable(UnattributableCause::RetentionPostconditionMismatch),
+            );
+        }
+        for array in ["schemas", "partition-specs"] {
+            let mut missing = response.clone();
+            missing["metadata"].as_object_mut().unwrap().remove(array);
+            assert!(matches!(
+                classify_view(&missing),
+                RestEvidence::Unknown { .. }
+            ));
+            for malformed in [
+                serde_json::json!(null),
+                serde_json::json!([{}]),
+                serde_json::json!([]),
+            ] {
+                let mut invalid = response.clone();
+                invalid["metadata"][array] = malformed;
+                assert!(matches!(
+                    classify_view(&invalid),
+                    RestEvidence::Unknown { .. }
+                ));
+            }
+        }
     }
 }

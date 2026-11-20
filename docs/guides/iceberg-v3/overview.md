@@ -39,7 +39,7 @@ under the License.
 - ✅ 需要时间旅行（snapshot id / timestamp / branch / tag）
 - ✅ 需要通过 HMS 读取 Spark 等外部引擎写入的 Iceberg 表、元数据表与时间旅行，具体边界见 [Catalog 接入](catalog.md)
 - ✅ 需要在 Iceberg 上做物化视图，且关心 IVM（增量刷新）能跟上基表的 MERGE / UPDATE 变化
-- ✅ 已支持 EXPIRE SNAPSHOTS / REMOVE ORPHAN FILES / REWRITE MANIFESTS（同步执行，v2+v3）
+- ✅ 需要在 REST 或 Hadoop catalog 上通过语句过期快照、回收表内孤儿文件或聚簇重写数据 manifest。见 [维护](maintenance.md)。
 
 ## 当前不适合的场景
 

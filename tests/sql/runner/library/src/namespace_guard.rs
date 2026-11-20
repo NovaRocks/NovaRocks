@@ -139,13 +139,16 @@ impl CatalogFacts {
             .context("owned REST proxy downstream has no fixture storage binding")?;
         self.bind_origins(&[alias], owner)
     }
-    fn private_rest(&self, origin: &str) -> Result<bool> {
+    fn rest_storage_owner(&self, origin: &str) -> Result<Option<RestObjectStoreOwner>> {
         Ok(self
             .1
             .lock()
             .map_err(|_| anyhow::anyhow!("SQL REST owner facts lock poisoned"))?
             .get(origin.trim_end_matches('/'))
-            == Some(&RestObjectStoreOwner::PrivateObjectStore))
+            .copied())
+    }
+    fn private_rest(&self, origin: &str) -> Result<bool> {
+        Ok(self.rest_storage_owner(origin)? == Some(RestObjectStoreOwner::PrivateObjectStore))
     }
 }
 
@@ -451,6 +454,36 @@ impl NamespaceGuard {
             .push(namespace);
         Ok(url)
     }
+    pub(crate) fn orphan_fixture_table_url(
+        &self,
+        catalog: Option<&str>,
+        namespace: &str,
+        table: &str,
+        rest_endpoint: &str,
+    ) -> Result<reqwest::Url> {
+        ensure!(
+            self.owned(namespace) && self.namespace.as_deref() == Some(namespace),
+            "orphan fixture must address the original case namespace"
+        );
+        let catalog = catalog
+            .or(self.catalog.as_deref())
+            .context("orphan fixture has no bound catalog")?;
+        let Some(Catalog::Rest(base)) = self.catalog_fact(catalog)? else {
+            anyhow::bail!("orphan fixture catalog {catalog} is not a bound REST catalog");
+        };
+        ensure!(
+            base == rest_endpoint.trim_end_matches('/')
+                && self.facts.rest_storage_owner(&base)?.is_some(),
+            "orphan fixture catalog differs from the original REST fixture"
+        );
+        let mut url = Self::namespace_url(&base, namespace)?;
+        url.path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("invalid orphan fixture table URI"))?
+            .push("tables")
+            .push(table);
+        Ok(url)
+    }
+
     fn verify_object(
         &self,
         base: &str,
@@ -518,6 +551,55 @@ mod tests {
             Instant::now() + Duration::from_secs(10),
         )
     }
+    #[test]
+    fn orphan_fixture_requires_the_bound_rest_catalog_and_exact_case_namespace() {
+        let mut guard = guard();
+        let namespace = format!("{}_case", guard.identity.run_id);
+        guard.set_session_context(Some("catalog".into()), Some(namespace.clone()));
+        let endpoint = "http://127.0.0.1:1";
+        guard.after("CREATE CATALOG catalog USING iceberg WITH (\"iceberg.catalog.warehouse\" = 's3://novarocks/guard-tests')").unwrap();
+        assert!(
+            guard
+                .orphan_fixture_table_url(None, &namespace, "test", endpoint)
+                .is_err()
+        );
+
+        guard.after("CREATE CATALOG owned_rest USING iceberg WITH (\"iceberg.catalog.type\" = 'rest', \"uri\" = 'http://127.0.0.1:1')").unwrap();
+        assert!(
+            guard
+                .orphan_fixture_table_url(Some("owned_rest"), &namespace, "test", endpoint)
+                .is_err()
+        );
+        guard
+            .facts
+            .bind_origins(&[endpoint], RestObjectStoreOwner::MachineScratch)
+            .unwrap();
+        let url = guard
+            .orphan_fixture_table_url(Some("owned_rest"), &namespace, "test", endpoint)
+            .unwrap();
+        assert_eq!(
+            url.as_str(),
+            format!("{endpoint}/v1/namespaces/{namespace}/tables/test")
+        );
+        assert!(
+            guard
+                .orphan_fixture_table_url(
+                    Some("owned_rest"),
+                    &namespace,
+                    "test",
+                    "http://127.0.0.1:2"
+                )
+                .is_err()
+        );
+        let foreign_case = format!("{}_peer", guard.identity.run_id);
+        assert!(guard.owned(&foreign_case));
+        assert!(
+            guard
+                .orphan_fixture_table_url(Some("owned_rest"), &foreign_case, "test", endpoint)
+                .is_err()
+        );
+    }
+
     fn server(responses: Vec<serde_json::Value>) -> (String, std::thread::JoinHandle<Vec<String>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());

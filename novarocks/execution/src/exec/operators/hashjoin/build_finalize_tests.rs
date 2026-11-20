@@ -458,7 +458,7 @@ fn original_handoff_all_closed_event_wakes_frame_without_partial_close_withdrawa
     )
     .unwrap();
     assert!(
-        frame.activation.get().is_none(),
+        !frame.completion.activation_started(),
         "prepare must remain dormant"
     );
     frame.activate(&work).unwrap();

@@ -1039,7 +1039,9 @@ impl novarocks_query_application::sql::session::registry::CatalogPropertyDeclara
         novarocks_query_application::sql::session::registry::SessionPropertyError,
     > {
         use novarocks_connector_iceberg::catalog_config::{
+            EXPIRE_SNAPSHOTS_MIN_RETENTION_SESSION_PROPERTY, IcebergCatalogMaintenanceConfig,
             IcebergCatalogWriteConfig, MAX_PARTITIONS_PER_WRITER_SESSION_PROPERTY,
+            REMOVE_ORPHAN_FILES_MIN_RETENTION_SESSION_PROPERTY,
         };
         use novarocks_query_application::sql::session::registry::{
             PropertyDeclaration, SessionPropertyError, SessionPropertyType, SessionPropertyValue,
@@ -1048,17 +1050,53 @@ impl novarocks_query_application::sql::session::registry::CatalogPropertyDeclara
             .map_err(|_| SessionPropertyError::InvalidDeclaration {
                 detail: "Admitted Iceberg catalog has an invalid open partition limit",
             })?;
-        Ok(vec![PropertyDeclaration::catalog(
-            MAX_PARTITIONS_PER_WRITER_SESSION_PROPERTY,
-            SessionPropertyType::Integer,
-            Some(SessionPropertyValue::Integer(limit)),
-            "Maximum open Iceberg partition writers per driver",
-            false,
-            move |value| match value {
-                SessionPropertyValue::Integer(value) if (1..=limit).contains(value) => Ok(()),
-                _ => Err(format!("Value must be between 1 and {limit}")),
-            },
-        )?])
+        use novarocks_spi::connector::ConnectorMaintenanceDuration;
+        let maintenance =
+            IcebergCatalogMaintenanceConfig::from_properties(configuration).map_err(|_| {
+                SessionPropertyError::InvalidDeclaration {
+                    detail: "Admitted Iceberg catalog has an invalid maintenance duration",
+                }
+            })?;
+        let duration_property = |name, value: ConnectorMaintenanceDuration, description| {
+            PropertyDeclaration::catalog(
+                name,
+                SessionPropertyType::Varchar,
+                Some(SessionPropertyValue::Varchar(value.to_string())),
+                description,
+                false,
+                |value| match value {
+                    SessionPropertyValue::Varchar(text)
+                        if ConnectorMaintenanceDuration::parse(text).is_some() =>
+                    {
+                        Ok(())
+                    }
+                    _ => Err("Value must be a valid duration".to_owned()),
+                },
+            )
+        };
+        Ok(vec![
+            PropertyDeclaration::catalog(
+                MAX_PARTITIONS_PER_WRITER_SESSION_PROPERTY,
+                SessionPropertyType::Integer,
+                Some(SessionPropertyValue::Integer(limit)),
+                "Maximum open Iceberg partition writers per driver",
+                false,
+                move |value| match value {
+                    SessionPropertyValue::Integer(value) if (1..=limit).contains(value) => Ok(()),
+                    _ => Err(format!("Value must be between 1 and {limit}")),
+                },
+            )?,
+            duration_property(
+                EXPIRE_SNAPSHOTS_MIN_RETENTION_SESSION_PROPERTY,
+                maintenance.expire_snapshots_min_retention,
+                "Minimum retention for expiring Iceberg snapshots",
+            )?,
+            duration_property(
+                REMOVE_ORPHAN_FILES_MIN_RETENTION_SESSION_PROPERTY,
+                maintenance.remove_orphan_files_min_retention,
+                "Minimum retention for removing Iceberg orphan files",
+            )?,
+        ])
     }
 }
 
@@ -1094,7 +1132,13 @@ mod iceberg_session_properties_tests {
                     provider_id: provider,
                     generation: 1,
                 },
-                &[("iceberg.max-partitions-per-writer".into(), "30".into())],
+                &[
+                    ("iceberg.max-partitions-per-writer".into(), "30".into()),
+                    (
+                        "iceberg.expire-snapshots.min-retention".into(),
+                        "168h".into(),
+                    ),
+                ],
             )
             .unwrap();
         let property = "max_partitions_per_writer";
@@ -1111,5 +1155,23 @@ mod iceberg_session_properties_tests {
         );
         assert!(metadata.prepare_header("lake", property, "31").is_err());
         assert!(metadata.prepare_header("lake", property, "0").is_err());
+        let expire = "expire_snapshots_min_retention";
+        let orphan = "remove_orphan_files_min_retention";
+        assert_eq!(
+            metadata.lookup(expire).unwrap().default_value(),
+            Some(&SessionPropertyValue::Varchar("168.00h".into())),
+        );
+        assert_eq!(
+            metadata.lookup(orphan).unwrap().default_value(),
+            Some(&SessionPropertyValue::Varchar("7.00d".into())),
+        );
+        assert_eq!(
+            metadata
+                .prepare_header("lake", orphan, "0s")
+                .unwrap()
+                .value(),
+            &SessionPropertyValue::Varchar("0s".into()),
+        );
+        assert!(metadata.prepare_header("lake", expire, "-7d").is_err());
     }
 }

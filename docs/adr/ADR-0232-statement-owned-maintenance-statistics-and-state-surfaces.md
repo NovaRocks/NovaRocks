@@ -5,6 +5,10 @@ domain: [table-maintenance, provider-spi, sql-language, frontend-mv]
 status: active
 supersedes: []
 superseded-by: null
+partially-superseded-by:
+  - id: ADR-0243
+    scope: "Retention of the GC first-observation Accelerator. Original statement execution, catalog admission, publication outcomes and actual exit remain active."
+    link: "ADR-0243-statement-authorized-iceberg-metadata-maintenance.md"
 partially-supersedes:
   - id: ADR-0169
     scope: "StatementJob/JobAttempt admission and catalog-dependent Detached/AwaitTerminal completion, job-based completion and cancellation in decisions 4-6; owner admission, HMS read-only and publication separation remain"
