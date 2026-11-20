@@ -1315,7 +1315,6 @@ impl ScalarEmission<'_, '_> {
             &source,
             target,
             policy,
-            self.root_allow_throw_exception,
             array_failure_mode,
             self.control,
         )

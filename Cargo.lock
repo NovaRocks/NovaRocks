@@ -3581,7 +3581,6 @@ dependencies = [
  "parquet",
  "prometheus",
  "prost 0.13.5",
- "regex",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -4136,6 +4135,7 @@ dependencies = [
  "novarocks-connector-contract",
  "novarocks-connector-iceberg-functions",
  "novarocks-constant-contract",
+ "novarocks-expression",
  "novarocks-expression-contract",
  "novarocks-failure-contract",
  "novarocks-functions",
@@ -4370,19 +4370,11 @@ dependencies = [
 name = "novarocks-table-maintenance"
 version = "0.1.0"
 dependencies = [
- "bytes",
- "hex",
  "novarocks-coordination-contract",
  "novarocks-failure-contract",
  "novarocks-query-application",
- "novarocks-state-store-api",
- "novarocks-state-store-runtime",
- "novarocks-state-store-testkit",
  "novarocks-type-contract",
- "serde",
- "serde_json",
  "tokio",
- "uuid",
 ]
 
 [[package]]

@@ -136,7 +136,7 @@ pub(in crate::runtime::task) fn sql_gather_receiver_program() -> Arc<LocalProgra
     use novarocks_sql::compiler::{
         DEFAULT_COMPLETION_LIMITS, SessionOptimizerSettings, SqlCompileControl, SqlCompileIntent,
         SqlCompiler, SqlFinalPlanCompileRequest, SqlPlanningEnvironment, SqlSessionContext,
-        SqlStatementInput, builtin_sql_function_catalog, noop_constant_evaluator,
+        SqlStatementInput, builtin_sql_function_catalog,
     };
 
     // Explicit table-free fixture limits; no scan or runtime creator is mocked.
@@ -165,7 +165,7 @@ pub(in crate::runtime::task) fn sql_gather_receiver_program() -> Arc<LocalProgra
         },
         SqlPlanningEnvironment::Distributed,
         builtin_sql_function_catalog().snapshot(),
-        noop_constant_evaluator(),
+        novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
         policy,
         SqlCompileControl::unbounded(),
         PipelineDopDomain {

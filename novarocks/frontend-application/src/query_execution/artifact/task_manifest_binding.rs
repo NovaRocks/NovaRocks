@@ -2143,7 +2143,7 @@ mod tests {
             },
             SqlPlanningEnvironment::Distributed,
             builtin_sql_function_catalog().snapshot(),
-            crate::query_execution::constant_eval::constant_evaluator(),
+            novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
             crate::application::test_constant_policy(),
             SqlCompileControl::unbounded(),
             PipelineDopDomain {

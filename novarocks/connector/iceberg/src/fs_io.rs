@@ -458,10 +458,9 @@ impl Storage for IcebergFsStorage {
         let (access, relative_path) = self.resolve_path("metadata", path).await?;
         let result = access.operator().stat(&relative_path).await;
         self.check_read_active("metadata")?;
-        let meta = result.map_err(|e| {
-            Error::new(
-                ErrorKind::DataInvalid,
-                format!("fs metadata({path}) through {relative_path}: {e}"),
+        let meta = result.map_err(|error| {
+            Error::new(ErrorKind::DataInvalid, "fs metadata stat failed").with_source(
+                ConnectorError::from(novarocks_fs::map_object_store_listing_error(error)),
             )
         })?;
         Ok(FileMetadata {
@@ -1303,6 +1302,17 @@ pub fn resolve_access_for_location(
     binding: &IcebergReadBinding,
 ) -> std::result::Result<IcebergFsAccess, String> {
     resolve_access_for_locations(std::iter::once(location), binding)
+}
+
+/// Resolve the original request-bound operator without blocking on client setup.
+pub(crate) async fn resolve_request_access_for_location(
+    location: &str,
+    binding: &IcebergReadBinding,
+) -> std::result::Result<IcebergFsAccess, ConnectorError> {
+    binding
+        .resolve_access_for_request_async(location)
+        .await
+        .map(IcebergFsAccess::new)
 }
 
 pub fn resolve_access_for_locations<I, S>(

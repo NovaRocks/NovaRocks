@@ -95,15 +95,23 @@ pub(super) fn string_fixture(
     let parameters = SemanticParameters::try_new([]).unwrap();
     let mut work = CompileCheckpoints::try_new(&HarnessControl, CompilePhase::Validate).unwrap();
     register_call_requests(&mut draft, &authors, &mut constants);
-    declare_call_controls(&mut draft, &authors, &mut work);
+    declare_call_controls(
+        &mut draft,
+        functions,
+        &constants,
+        &parameters,
+        COMPILE_POLICY,
+        &mut work,
+    );
     let sealed = draft.seal(vec![port], &mut work).unwrap();
     let neutral = finish_unit(
         functions,
         sealed,
         &authors,
+        &constants,
         &parameters,
+        COMPILE_POLICY,
         &mut work,
-        |_, _, effects| effects,
     );
     work.finish().unwrap();
     let unit = compile_fixture_unit(

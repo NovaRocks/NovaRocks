@@ -293,6 +293,9 @@ impl ExchangeSenderGroup {
     pub(crate) fn can_publish(&self, stream: ExchangeStreamIdentity) -> bool {
         self.entry(stream).is_ok_and(|entry| {
             let snapshot = entry.sender.snapshot();
+            if snapshot.status == ExchangeStreamSenderStatus::AwaitingTaskStop {
+                return false;
+            }
             // Definitive terminal/AfterEnd outcomes must remain runnable so
             // the driver surfaces them, rather than parking without a wake.
             snapshot.status != ExchangeStreamSenderStatus::Open
@@ -318,8 +321,12 @@ impl ExchangeSenderGroup {
             return Err(failure);
         }
         let entry = self.entry(stream)?;
-        if entry.sender.snapshot().status == ExchangeStreamSenderStatus::Withdrawn {
-            return Ok(GroupPublication::Withdrawn);
+        match entry.sender.snapshot().status {
+            ExchangeStreamSenderStatus::AwaitingTaskStop => {
+                return Ok(GroupPublication::Backpressured);
+            }
+            ExchangeStreamSenderStatus::Withdrawn => return Ok(GroupPublication::Withdrawn),
+            _ => {}
         }
         if end
             && entry
@@ -364,8 +371,12 @@ impl ExchangeSenderGroup {
             return Err(failure);
         }
         let entry = self.entry(stream)?;
-        if entry.sender.snapshot().status == ExchangeStreamSenderStatus::Withdrawn {
-            return Ok(GroupPublication::Withdrawn);
+        match entry.sender.snapshot().status {
+            ExchangeStreamSenderStatus::AwaitingTaskStop => {
+                return Ok(GroupPublication::Backpressured);
+            }
+            ExchangeStreamSenderStatus::Withdrawn => return Ok(GroupPublication::Withdrawn),
+            _ => {}
         }
         match entry
             .end
@@ -391,6 +402,7 @@ impl ExchangeSenderGroup {
             snapshot.active_calls == 0
                 && snapshot.active_control_calls == 0
                 && snapshot.stop_obligation != ExchangeSenderStopState::Pending
+                && snapshot.status != ExchangeStreamSenderStatus::AwaitingTaskStop
                 && (!matches!(snapshot.status, ExchangeStreamSenderStatus::Failed(_))
                     || (entry.failure.get().is_some() && self.first_failure.get().is_some()))
                 && (snapshot.status != ExchangeStreamSenderStatus::Open
@@ -400,6 +412,9 @@ impl ExchangeSenderGroup {
 
     fn stopped_publication(&self, entry: &Entry) -> ExecutionResult<GroupPublication> {
         let snapshot = entry.sender.snapshot();
+        if snapshot.status == ExchangeStreamSenderStatus::AwaitingTaskStop {
+            return Ok(GroupPublication::Backpressured);
+        }
         if matches!(snapshot.status, ExchangeStreamSenderStatus::Failed(_)) {
             // Failure publication releases the sender lock before notifying
             // its original Task. Let that same occurrence become observable;
@@ -518,6 +533,14 @@ struct MeasuredTransmitter {
     profiles: Arc<Mutex<Option<OperatorProfiles>>>,
 }
 impl ExchangeFrameTransmitter for MeasuredTransmitter {
+    #[cfg(novarocks_dev_controls)]
+    fn test_dispatch_hold(
+        &self,
+        stream: ExchangeStreamIdentity,
+    ) -> Result<Option<Box<dyn super::exchange::ExchangeDispatchTestHold>>, FailureFact> {
+        self.inner.test_dispatch_hold(stream)
+    }
+
     fn normal_close_accepted(&self, notice: super::exchange::ExchangeNormalCloseAccepted) {
         self.inner.normal_close_accepted(notice);
     }

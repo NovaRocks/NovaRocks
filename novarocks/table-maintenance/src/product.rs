@@ -19,22 +19,15 @@
 //!
 //! Provider and Native query adapters retain opaque sessions and execute their
 //! physical effects.  This module owns the business ordering around those
-//! effects: target conflict rights, cleanup maturity, rewrite cohort/commit
+//! effects: target conflict rights, cleanup dispatch, rewrite cohort/commit
 //! transitions, and the interpretation of terminal provider facts.
 
+#[cfg(test)]
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-use novarocks_state_store_api::StateStore;
-use novarocks_state_store_runtime::StateStoreRunPolicy;
-use uuid::Uuid;
 
 use crate::activity::{
     MaintenanceActivityBusy, MaintenanceActivityFamily, MaintenanceActivityPermit,
     TableMaintenanceActivity,
-};
-use crate::gc_observation::{
-    GcOwnedRefObservation, GcOwnedRefObservationAccelerator, GcOwnedRefObservationDecision,
 };
 use crate::runtime::{MaintenanceJobState, TerminalError};
 use crate::{
@@ -178,65 +171,12 @@ pub trait DistributedRewriteSession: Send {
 }
 
 /// One owned-ref fact eligible for the GC first-observation safety window.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CleanupOwnedRefFact {
-    pub table_uuid: Uuid,
-    pub ref_name: String,
-    pub head_snapshot_id: i64,
-    pub provenance_version: u16,
-    pub provenance_digest: [u8; 32],
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum CleanupCandidate {
-    Object,
-    OwnedRef(CleanupOwnedRefFact),
-}
-
-/// Final provider fact for cleanup.  The product, not the adapter, decides how
-/// that fact maps to a statement failure and whether retry is safe.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum CleanupTerminal {
-    NoOp { locations: Vec<String> },
-    KnownCommitted { locations: Vec<String> },
-    KnownUncommitted { failure: String },
-    CommitUnknown { failure: String },
-    KnownCommittedFinalizationFailed { failure: String },
-}
-
-/// Opaque provider session for one cleanup operation.
-pub trait CleanupSession: Send {
-    /// Current reachability and safe_gc_age never authorize a scanned-object
-    /// deletion. The real Provider must supply its checked safety capability.
-    fn require_scanned_object_gc(&self) -> Result<(), String> {
-        Err("scanned orphan cleanup is unsupported without Provider writer-fencing, Unknown/unreceived and restart safety evidence".to_string())
-    }
-    fn candidates(&self) -> &[CleanupCandidate];
-    fn select_owned_refs<'a>(
-        &'a mut self,
-        candidate_indexes: &'a [usize],
-    ) -> crate::product::MaintenanceFuture<'a, Result<(), TerminalError>>;
-    fn execute<'a>(
-        &'a mut self,
-    ) -> crate::product::MaintenanceFuture<'a, Result<CleanupTerminal, TerminalError>>;
-}
-
 /// The only adapter surface needed by the table-maintenance product.
 ///
 /// Implementations may own provider leases, Native encoders, and query clients,
-/// but return only typed effect facts.  They do not own activity gates, GC
-/// maturity, worker lifecycle, or commit terminal interpretation.
+/// but return only typed effect facts. The Product owns activity gates, worker
+/// lifecycle, and commit terminal interpretation.
 pub trait TableMaintenanceEffectPort: Sync {
-    /// Observe the owned-ref safety window through this effect owner's actual
-    /// execution context. The Product alone decides which indexes are mature.
-    fn observe_cleanup_owned_ref<'a>(
-        &'a self,
-        observations: &'a GcOwnedRefObservationAccelerator,
-        observation: GcOwnedRefObservation,
-        now_ms: i64,
-        safe_gc_age_ms: i64,
-    ) -> MaintenanceFuture<'a, Result<GcOwnedRefObservationDecision, TerminalError>>;
-
     fn reject_user_action_on_mv<'a>(
         &'a self,
         target: &'a MaintenanceTarget,
@@ -244,7 +184,7 @@ pub trait TableMaintenanceEffectPort: Sync {
     fn execute_metadata<'a>(
         &'a self,
         request: MaintenanceActionRequest,
-    ) -> crate::product::MaintenanceFuture<'a, Result<MaintenanceActionOutcome, String>>;
+    ) -> crate::product::MaintenanceFuture<'a, Result<MaintenanceActionOutcome, TerminalError>>;
     /// Executes one automatic metadata effect using the caller-frozen identity.
     /// Adapters must report the provider's actual terminal classification.
     /// Success is `KnownCommitted` only when the provider proves a commit;
@@ -289,50 +229,26 @@ pub trait TableMaintenanceEffectPort: Sync {
             ))
         })
     }
-    fn begin_cleanup<'a>(
+    fn execute_cleanup<'a>(
         &'a self,
-        target: &'a MaintenanceTarget,
-        older_than_ms: i64,
-    ) -> crate::product::MaintenanceFuture<'a, Result<Box<dyn CleanupSession + 'a>, TerminalError>>;
+        _target: &'a MaintenanceTarget,
+        _older_than_ms: i64,
+    ) -> MaintenanceFuture<'a, Result<MaintenanceActionOutcome, TerminalError>> {
+        Box::pin(async {
+            Err(TerminalError::pre_dispatch_failed(
+                "cleanup requires its original governed statement source",
+            ))
+        })
+    }
 }
 
 /// Single process-local business owner for every table-maintenance operation.
+#[derive(Default)]
 pub struct TableMaintenanceProduct {
     activity: TableMaintenanceActivity,
-    observations: Option<Arc<GcOwnedRefObservationAccelerator>>,
-    safe_gc_age: Option<Duration>,
 }
 
 impl TableMaintenanceProduct {
-    pub async fn open(
-        durable: Option<(Arc<dyn StateStore>, StateStoreRunPolicy)>,
-    ) -> Result<Self, String> {
-        let observations = match durable {
-            Some((store, policy)) => Some(Arc::new(
-                GcOwnedRefObservationAccelerator::open(store, policy)
-                    .await
-                    .map_err(|error| {
-                        format!("open table-maintenance GC owned-ref observation accelerator failed: {error}")
-                    })?,
-            )),
-            None => None,
-        };
-        Ok(Self::new(observations))
-    }
-
-    pub fn new(observations: Option<Arc<GcOwnedRefObservationAccelerator>>) -> Self {
-        Self {
-            activity: TableMaintenanceActivity::default(),
-            observations,
-            safe_gc_age: None,
-        }
-    }
-
-    pub fn with_safe_gc_age(mut self, safe_gc_age: Duration) -> Self {
-        self.safe_gc_age = Some(safe_gc_age);
-        self
-    }
-
     pub fn acquire_activity(
         &self,
         target: &MaintenanceTarget,
@@ -395,10 +311,7 @@ impl TableMaintenanceProduct {
                 let _permit = self
                     .acquire_activity(&target, MaintenanceActivityFamily::Metadata)
                     .map_err(|error| error.to_string())?;
-                effects
-                    .execute_metadata(request)
-                    .await
-                    .map_err(TerminalError::from)
+                effects.execute_metadata(request).await
             }
         }
     }
@@ -438,11 +351,9 @@ impl TableMaintenanceProduct {
                     .await?;
                 Self::run_rewrite_session_terminal(session, intent).await
             }
-            MaintenanceActionRequest::RemoveOrphanFiles { .. } => {
-                Err(TerminalError::pre_dispatch_failed(
-                    "automatic scanned orphan cleanup is unsupported: Provider safety evidence and an effect identity terminal port are unavailable",
-                ))
-            }
+            MaintenanceActionRequest::RemoveOrphanFiles { .. } => Err(
+                TerminalError::pre_dispatch_failed("automatic orphan cleanup is unsupported"),
+            ),
             request => {
                 let target = request.target().clone();
                 let _permit = self
@@ -554,112 +465,8 @@ impl TableMaintenanceProduct {
         let _permit = self
             .acquire_activity(&target, MaintenanceActivityFamily::Cleanup)
             .map_err(|error| error.to_string())?;
-        // This is only the owned-ref maturity policy, never a scan capability.
-        let (now_ms, safe_gc_age_ms) = self.gc_timing(older_than_ms)?;
-        let mut session = effects.begin_cleanup(&target, older_than_ms).await?;
-        let candidates = session.candidates();
-        let has_owned = candidates
-            .iter()
-            .any(|candidate| matches!(candidate, CleanupCandidate::OwnedRef(_)));
-        let has_objects = candidates
-            .iter()
-            .any(|candidate| matches!(candidate, CleanupCandidate::Object));
-        if has_owned && has_objects {
-            return Err(TerminalError::pre_dispatch_failed(
-                "cleanup discovery mixed owned-ref and object candidates",
-            ));
-        }
-        if has_objects {
-            session.require_scanned_object_gc()?;
-        }
-        if has_owned {
-            let observations = self.observations.as_ref().ok_or_else(|| {
-                "orphan cleanup is unavailable because the GC observation accelerator is not configured"
-                    .to_string()
-            })?;
-            let indexes =
-                mature_owned_ref_indexes(effects, observations, candidates, now_ms, safe_gc_age_ms)
-                    .await?;
-            if indexes.is_empty() {
-                return Ok(MaintenanceActionOutcome::RemoveOrphanFiles {
-                    orphan_file_locations: Vec::new(),
-                });
-            }
-            session.select_owned_refs(&indexes).await?;
-        }
-        match session.execute().await? {
-            CleanupTerminal::NoOp { locations } | CleanupTerminal::KnownCommitted { locations } => {
-                Ok(MaintenanceActionOutcome::RemoveOrphanFiles {
-                    orphan_file_locations: locations,
-                })
-            }
-            CleanupTerminal::KnownUncommitted { failure } => Err(TerminalError::known_uncommitted(
-                format!("orphan cleanup was not applied: {failure}"),
-            )),
-            CleanupTerminal::CommitUnknown { failure } => {
-                Err(TerminalError::commit_unknown(format!(
-                    "orphan cleanup dispatch outcome is unknown: {failure}; do not retry automatically"
-                )))
-            }
-            CleanupTerminal::KnownCommittedFinalizationFailed { failure } => {
-                Err(TerminalError::known_committed_finalization_failed(format!(
-                    "orphan cleanup committed but finalization failed: {failure}"
-                )))
-            }
-        }
+        effects.execute_cleanup(&target, older_than_ms).await
     }
-
-    fn gc_timing(&self, older_than_ms: i64) -> Result<(i64, i64), String> {
-        let safe_gc_age = self.safe_gc_age.ok_or_else(|| {
-            "orphan cleanup is unsupported until the lake publication runtime policy is installed"
-                .to_string()
-        })?;
-        let now_ms = now_unix_millis()?;
-        let safe_gc_age_ms = i64::try_from(safe_gc_age.as_millis())
-            .map_err(|_| "orphan cleanup is unsupported because safe GC age exceeds i64")?;
-        let cutoff = now_ms.checked_sub(safe_gc_age_ms).ok_or_else(|| {
-            "orphan cleanup is unsupported because safe GC cutoff underflows".to_string()
-        })?;
-        if older_than_ms <= 0 || older_than_ms > cutoff {
-            return Err(format!(
-                "orphan cleanup cutoff {older_than_ms} is newer than the shared safe GC boundary {cutoff}"
-            ));
-        }
-        Ok((now_ms, safe_gc_age_ms))
-    }
-}
-
-async fn mature_owned_ref_indexes<P: TableMaintenanceEffectPort + ?Sized>(
-    effects: &P,
-    observations: &GcOwnedRefObservationAccelerator,
-    candidates: &[CleanupCandidate],
-    now_ms: i64,
-    safe_gc_age_ms: i64,
-) -> Result<Vec<usize>, TerminalError> {
-    let mut indexes = Vec::new();
-    for (index, candidate) in candidates.iter().enumerate() {
-        let CleanupCandidate::OwnedRef(candidate) = candidate else {
-            continue;
-        };
-        let observation = GcOwnedRefObservation::try_new(
-            candidate.table_uuid,
-            candidate.ref_name.clone(),
-            candidate.head_snapshot_id,
-            candidate.provenance_version,
-            candidate.provenance_digest,
-            now_ms,
-        )
-        .map_err(|error| format!("build GC owned-ref observation failed: {error}"))?;
-        if matches!(
-            effects
-                .observe_cleanup_owned_ref(observations, observation, now_ms, safe_gc_age_ms)
-                .await?,
-            GcOwnedRefObservationDecision::Mature { .. }
-        ) {
-            indexes.push(index);
-        }
-    }
-    Ok(indexes)
 }
 
 async fn abort_rewrite_terminal(
@@ -837,16 +644,6 @@ pub fn rewrite_position_delete_intent(
     })
 }
 
-fn now_unix_millis() -> Result<i64, String> {
-    i64::try_from(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| "orphan cleanup is unsupported because wall clock is unsafe")?
-            .as_millis(),
-    )
-    .map_err(|_| "orphan cleanup is unsupported because wall clock exceeds i64".to_string())
-}
-
 trait ActionTarget {
     fn target(&self) -> &MaintenanceTarget;
 }
@@ -919,15 +716,6 @@ mod tests {
     }
 
     impl TableMaintenanceEffectPort for FixedRewritePort {
-        fn observe_cleanup_owned_ref<'a>(
-            &'a self,
-            _: &'a GcOwnedRefObservationAccelerator,
-            _: GcOwnedRefObservation,
-            _: i64,
-            _: i64,
-        ) -> MaintenanceFuture<'a, Result<GcOwnedRefObservationDecision, TerminalError>> {
-            Box::pin(async { panic!("this fixture has no owned-ref cleanup observation") })
-        }
         fn reject_user_action_on_mv<'a>(
             &'a self,
             _target: &'a MaintenanceTarget,
@@ -938,7 +726,7 @@ mod tests {
         fn execute_metadata<'a>(
             &'a self,
             _request: MaintenanceActionRequest,
-        ) -> crate::product::MaintenanceFuture<'a, Result<MaintenanceActionOutcome, String>>
+        ) -> crate::product::MaintenanceFuture<'a, Result<MaintenanceActionOutcome, TerminalError>>
         {
             Box::pin(async move { unreachable!("rewrite test never executes metadata") })
         }
@@ -958,17 +746,6 @@ mod tests {
                 })
                     as Box<dyn DistributedRewriteSession + 'a>)
             })
-        }
-
-        fn begin_cleanup<'a>(
-            &'a self,
-            _target: &'a MaintenanceTarget,
-            _older_than_ms: i64,
-        ) -> crate::product::MaintenanceFuture<
-            'a,
-            Result<Box<dyn CleanupSession + 'a>, TerminalError>,
-        > {
-            Box::pin(async move { unreachable!("rewrite test never starts cleanup") })
         }
     }
 
@@ -1059,15 +836,6 @@ mod tests {
     }
 
     impl TableMaintenanceEffectPort for AutomaticPort {
-        fn observe_cleanup_owned_ref<'a>(
-            &'a self,
-            _: &'a GcOwnedRefObservationAccelerator,
-            _: GcOwnedRefObservation,
-            _: i64,
-            _: i64,
-        ) -> MaintenanceFuture<'a, Result<GcOwnedRefObservationDecision, TerminalError>> {
-            Box::pin(async { panic!("this fixture has no owned-ref cleanup observation") })
-        }
         fn reject_user_action_on_mv<'a>(
             &'a self,
             _target: &'a MaintenanceTarget,
@@ -1078,7 +846,7 @@ mod tests {
         fn execute_metadata<'a>(
             &'a self,
             _request: MaintenanceActionRequest,
-        ) -> crate::product::MaintenanceFuture<'a, Result<MaintenanceActionOutcome, String>>
+        ) -> crate::product::MaintenanceFuture<'a, Result<MaintenanceActionOutcome, TerminalError>>
         {
             Box::pin(
                 async move { unreachable!("automatic action must not use the user metadata port") },
@@ -1135,17 +903,6 @@ mod tests {
                     as Box<dyn DistributedRewriteSession + 'a>)
             })
         }
-
-        fn begin_cleanup<'a>(
-            &'a self,
-            _target: &'a MaintenanceTarget,
-            _older_than_ms: i64,
-        ) -> crate::product::MaintenanceFuture<
-            'a,
-            Result<Box<dyn CleanupSession + 'a>, TerminalError>,
-        > {
-            Box::pin(async move { unreachable!("automatic action must not use cleanup") })
-        }
     }
 
     fn automatic_rewrite_request() -> MaintenanceActionRequest {
@@ -1161,7 +918,7 @@ mod tests {
 
     #[tokio::test]
     async fn automatic_metadata_passes_exact_id_and_typed_terminal() {
-        let product = TableMaintenanceProduct::new(None);
+        let product = TableMaintenanceProduct::default();
         let id = MaintenanceEffectId::from_bytes([7; 16]);
         let request = MaintenanceActionRequest::RewriteManifests {
             target: target(),
@@ -1193,7 +950,7 @@ mod tests {
 
     #[tokio::test]
     async fn automatic_rewrite_passes_exact_id_and_preserves_commit_terminals() {
-        let product = TableMaintenanceProduct::new(None);
+        let product = TableMaintenanceProduct::default();
         let id = MaintenanceEffectId::from_bytes([9; 16]);
         let port = AutomaticPort::new();
         assert!(matches!(
@@ -1261,7 +1018,7 @@ mod tests {
 
     #[tokio::test]
     async fn automatic_expire_and_position_delete_rewrite_each_pass_their_frozen_id() {
-        let product = TableMaintenanceProduct::new(None);
+        let product = TableMaintenanceProduct::default();
         let expire_id = MaintenanceEffectId::from_bytes([12; 16]);
         let expire = AutomaticPort {
             metadata: Ok(AutomaticMaintenanceOutcome::KnownCommitted(
@@ -1319,7 +1076,7 @@ mod tests {
 
     #[tokio::test]
     async fn automatic_rewrite_without_id_capability_fails_before_dispatch() {
-        let product = TableMaintenanceProduct::new(None);
+        let product = TableMaintenanceProduct::default();
         let error = product
             .execute_automatic_action(
                 &FixedRewritePort {
@@ -1339,7 +1096,7 @@ mod tests {
 
     #[tokio::test]
     async fn automatic_rewrite_noop_does_not_report_a_committed_effect() {
-        let product = TableMaintenanceProduct::new(None);
+        let product = TableMaintenanceProduct::default();
         let id = MaintenanceEffectId::from_bytes([14; 16]);
         let port = AutomaticPort {
             noop: true,
@@ -1437,7 +1194,7 @@ mod tests {
 
     #[tokio::test]
     async fn rewrite_commit_unknown_is_a_product_terminal_not_a_retry() {
-        let product = TableMaintenanceProduct::new(None);
+        let product = TableMaintenanceProduct::default();
         let error = product
             .execute_rewrite_terminal(
                 &FixedRewritePort {
@@ -1456,7 +1213,7 @@ mod tests {
 
     #[tokio::test]
     async fn known_committed_finalization_failure_keeps_its_terminal_fact() {
-        let product = TableMaintenanceProduct::new(None);
+        let product = TableMaintenanceProduct::default();
         let error = product
             .execute_rewrite_terminal(
                 &FixedRewritePort {
@@ -1684,15 +1441,6 @@ mod tests {
     }
 
     impl TableMaintenanceEffectPort for ReleaseRewritePort {
-        fn observe_cleanup_owned_ref<'a>(
-            &'a self,
-            _: &'a GcOwnedRefObservationAccelerator,
-            _: GcOwnedRefObservation,
-            _: i64,
-            _: i64,
-        ) -> MaintenanceFuture<'a, Result<GcOwnedRefObservationDecision, TerminalError>> {
-            Box::pin(async { panic!("this fixture has no owned-ref cleanup observation") })
-        }
         fn reject_user_action_on_mv<'a>(
             &'a self,
             _target: &'a MaintenanceTarget,
@@ -1703,7 +1451,7 @@ mod tests {
         fn execute_metadata<'a>(
             &'a self,
             _request: MaintenanceActionRequest,
-        ) -> crate::product::MaintenanceFuture<'a, Result<MaintenanceActionOutcome, String>>
+        ) -> crate::product::MaintenanceFuture<'a, Result<MaintenanceActionOutcome, TerminalError>>
         {
             Box::pin(async move { unreachable!("release test never executes metadata") })
         }
@@ -1728,17 +1476,6 @@ mod tests {
                 })
                     as Box<dyn DistributedRewriteSession + 'a>)
             })
-        }
-
-        fn begin_cleanup<'a>(
-            &'a self,
-            _target: &'a MaintenanceTarget,
-            _older_than_ms: i64,
-        ) -> crate::product::MaintenanceFuture<
-            'a,
-            Result<Box<dyn CleanupSession + 'a>, TerminalError>,
-        > {
-            Box::pin(async move { unreachable!("rewrite release test never starts cleanup") })
         }
     }
 
@@ -1797,7 +1534,7 @@ mod tests {
                 vec!["plan", "cohort", "commit"],
             ),
         ];
-        let product = TableMaintenanceProduct::new(None);
+        let product = TableMaintenanceProduct::default();
         for (name, expected_state, expected_calls) in cases {
             let content = Arc::new(());
             let weak = Arc::downgrade(&content);
@@ -1861,308 +1598,80 @@ mod tests {
         }
     }
 
-    struct ReleaseCleanupPort {
-        content: Mutex<Option<Arc<()>>>,
-        executed: Arc<Mutex<bool>>,
-        terminal: Result<CleanupTerminal, TerminalError>,
-        object_candidates: bool,
+    struct CleanupPort {
+        calls: std::sync::atomic::AtomicUsize,
+        terminal: Result<MaintenanceActionOutcome, TerminalError>,
     }
 
-    struct ReleaseCleanupSession {
-        _content: Arc<()>,
-        executed: Arc<Mutex<bool>>,
-        terminal: Result<CleanupTerminal, TerminalError>,
-        object_candidates: bool,
-    }
-
-    impl CleanupSession for ReleaseCleanupSession {
-        fn candidates(&self) -> &[CleanupCandidate] {
-            if self.object_candidates {
-                &[CleanupCandidate::Object]
-            } else {
-                &[]
-            }
-        }
-
-        fn select_owned_refs<'a>(
-            &'a mut self,
-            _candidate_indexes: &'a [usize],
-        ) -> crate::product::MaintenanceFuture<'a, Result<(), TerminalError>> {
-            Box::pin(async move { unreachable!("object cleanup has no owned refs") })
-        }
-
-        fn execute<'a>(
-            &'a mut self,
-        ) -> crate::product::MaintenanceFuture<'a, Result<CleanupTerminal, TerminalError>> {
-            Box::pin(async move {
-                *self.executed.lock().unwrap() = true;
-                self.terminal.clone()
-            })
-        }
-    }
-
-    impl TableMaintenanceEffectPort for ReleaseCleanupPort {
-        fn observe_cleanup_owned_ref<'a>(
-            &'a self,
-            _: &'a GcOwnedRefObservationAccelerator,
-            _: GcOwnedRefObservation,
-            _: i64,
-            _: i64,
-        ) -> MaintenanceFuture<'a, Result<GcOwnedRefObservationDecision, TerminalError>> {
-            Box::pin(async { panic!("this fixture has no owned-ref cleanup observation") })
-        }
+    impl TableMaintenanceEffectPort for CleanupPort {
         fn reject_user_action_on_mv<'a>(
             &'a self,
-            _target: &'a MaintenanceTarget,
-        ) -> crate::product::MaintenanceFuture<'a, Result<(), TerminalError>> {
-            Box::pin(async move { Ok(()) })
+            _: &'a MaintenanceTarget,
+        ) -> MaintenanceFuture<'a, Result<(), TerminalError>> {
+            Box::pin(async { Ok(()) })
         }
 
-        fn execute_metadata<'a>(
-            &'a self,
-            _request: MaintenanceActionRequest,
-        ) -> crate::product::MaintenanceFuture<'a, Result<MaintenanceActionOutcome, String>>
-        {
-            Box::pin(async move { unreachable!("cleanup release test never executes metadata") })
+        fn execute_metadata(
+            &self,
+            _: MaintenanceActionRequest,
+        ) -> MaintenanceFuture<'_, Result<MaintenanceActionOutcome, TerminalError>> {
+            unreachable!("cleanup never executes metadata")
         }
 
         fn begin_rewrite<'a>(
             &'a self,
-            _target: &'a MaintenanceTarget,
-            _intent: RewriteIntent,
-        ) -> crate::product::MaintenanceFuture<
-            'a,
-            Result<Box<dyn DistributedRewriteSession + 'a>, String>,
-        > {
-            Box::pin(async move { unreachable!("cleanup release test never starts rewrite") })
+            _: &'a MaintenanceTarget,
+            _: RewriteIntent,
+        ) -> MaintenanceFuture<'a, Result<Box<dyn DistributedRewriteSession + 'a>, String>>
+        {
+            unreachable!("cleanup never starts rewrite")
         }
 
-        fn begin_cleanup<'a>(
+        fn execute_cleanup<'a>(
             &'a self,
-            _target: &'a MaintenanceTarget,
-            _older_than_ms: i64,
-        ) -> crate::product::MaintenanceFuture<
-            'a,
-            Result<Box<dyn CleanupSession + 'a>, TerminalError>,
-        > {
-            Box::pin(async move {
-                Ok(Box::new(ReleaseCleanupSession {
-                    _content: self.content.lock().unwrap().take().expect("begin once"),
-                    executed: self.executed.clone(),
-                    terminal: self.terminal.clone(),
-                    object_candidates: self.object_candidates,
-                }) as Box<dyn CleanupSession + 'a>)
-            })
+            _: &'a MaintenanceTarget,
+            _: i64,
+        ) -> MaintenanceFuture<'a, Result<MaintenanceActionOutcome, TerminalError>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async { self.terminal.clone() })
         }
     }
 
     #[tokio::test]
-    async fn cleanup_terminal_paths_release_attempt_content() {
-        let cases = [
-            (
-                Ok(CleanupTerminal::NoOp {
-                    locations: Vec::new(),
-                }),
-                None,
-            ),
-            (
-                Ok(CleanupTerminal::KnownCommitted {
-                    locations: Vec::new(),
-                }),
-                None,
-            ),
-            (
-                Err(TerminalError::pre_dispatch_failed(
-                    "cleanup execution failed",
-                )),
-                Some("cleanup execution failed"),
-            ),
-            (
-                Ok(CleanupTerminal::KnownUncommitted {
-                    failure: "conflict".into(),
-                }),
-                Some("orphan cleanup was not applied"),
-            ),
-            (
-                Ok(CleanupTerminal::CommitUnknown {
-                    failure: "receipt lost".into(),
-                }),
-                Some("orphan cleanup dispatch outcome is unknown"),
-            ),
-            (
-                Ok(CleanupTerminal::KnownCommittedFinalizationFailed {
-                    failure: "projection unavailable".into(),
-                }),
-                Some("orphan cleanup committed but finalization failed"),
-            ),
-        ];
-        let product = TableMaintenanceProduct::new(None).with_safe_gc_age(Duration::ZERO);
-        for (terminal, expected_error) in cases {
-            let content = Arc::new(());
-            let weak = Arc::downgrade(&content);
-            let port = ReleaseCleanupPort {
-                content: Mutex::new(Some(content)),
-                executed: Arc::new(Mutex::new(false)),
-                terminal,
-                object_candidates: false,
-            };
-            assert!(weak.upgrade().is_some(), "fixture owns content");
-            let result = product
-                .execute_action(
-                    &port,
-                    MaintenanceActionRequest::RemoveOrphanFiles {
-                        target: target(),
-                        older_than_ms: 1,
-                    },
-                )
-                .await;
-            match expected_error {
-                Some(message) => assert!(
-                    result
-                        .as_ref()
-                        .expect_err("cleanup failed")
-                        .message
-                        .contains(message)
-                ),
-                None => assert!(matches!(
-                    result.as_ref().expect("cleanup committed"),
-                    MaintenanceActionOutcome::RemoveOrphanFiles { orphan_file_locations }
-                        if orphan_file_locations.is_empty()
-                )),
-            }
-            assert!(*port.executed.lock().unwrap(), "cleanup reached dispatch");
-            assert!(port.content.lock().unwrap().is_none(), "cleanup began");
-            assert!(
-                weak.upgrade().is_none(),
-                "terminal result and live port must release content"
-            );
-        }
-    }
-    #[derive(Debug)]
-    struct CleanupOrigin;
-    impl std::fmt::Display for CleanupOrigin {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str("original cleanup domain refusal")
-        }
-    }
-    impl std::error::Error for CleanupOrigin {}
-    impl novarocks_failure_contract::FailureProjection for CleanupOrigin {
-        fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
-            use novarocks_failure_contract::*;
-            FailureFact::new(
-                FailureClass::Data,
-                FailureReason::new(domain::CONNECTOR, std::num::NonZeroU16::new(31).unwrap()),
-            )
-        }
-    }
-    #[tokio::test]
-    async fn cleanup_product_preserves_original_cause_fact_and_effect() {
+    async fn cleanup_preserves_the_governed_terminal_and_blocks_automatic_dispatch() {
         use novarocks_coordination_contract::ExecutionEffect;
-        use novarocks_failure_contract::{FailureProjection, SharedFailureCause};
-        let product = TableMaintenanceProduct::new(None).with_safe_gc_age(Duration::ZERO);
-        for state in [
-            MaintenanceJobState::KnownUncommitted,
-            MaintenanceJobState::CommitUnknown,
-            MaintenanceJobState::KnownCommittedFinalizationFailed,
-        ] {
-            let cause =
-                SharedFailureCause::from_static_detail(CleanupOrigin, "original cleanup refusal");
-            let original = match state {
-                MaintenanceJobState::KnownUncommitted => {
-                    TerminalError::known_uncommitted("original")
-                }
-                MaintenanceJobState::CommitUnknown => TerminalError::commit_unknown("original"),
-                _ => TerminalError::known_committed_finalization_failed("original"),
-            }
-            .with_failure_cause(Some(cause.clone()));
-            let expected_effect = original.effect;
-            let port = ReleaseCleanupPort {
-                content: Mutex::new(Some(Arc::new(()))),
-                executed: Arc::new(Mutex::new(false)),
-                terminal: Err(original),
-                object_candidates: false,
-            };
-            let actual = product
-                .execute_action(
-                    &port,
-                    MaintenanceActionRequest::RemoveOrphanFiles {
-                        target: target(),
-                        older_than_ms: 1,
-                    },
-                )
-                .await
-                .unwrap_err();
-            assert_eq!(actual.state, state);
-            assert_eq!(actual.failure_cause.as_ref(), Some(&cause));
-            assert_eq!(actual.selected_failure_fact(), Some(cause.failure_fact()));
-            assert_eq!(actual.effect, expected_effect);
-            if state == MaintenanceJobState::KnownCommittedFinalizationFailed {
-                assert_eq!(actual.effect, Some(ExecutionEffect::External));
-            }
-            assert!(*port.executed.lock().unwrap());
-        }
-    }
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
-    #[tokio::test]
-    async fn unproven_object_cleanup_never_executes_even_with_safe_age() {
-        let product = TableMaintenanceProduct::new(None).with_safe_gc_age(Duration::ZERO);
-        let content = Arc::new(());
-        let weak = Arc::downgrade(&content);
-        let port = ReleaseCleanupPort {
-            content: Mutex::new(Some(content)),
-            executed: Arc::new(Mutex::new(false)),
-            terminal: Ok(CleanupTerminal::KnownCommitted {
-                locations: Vec::new(),
-            }),
-            object_candidates: true,
+        let product = TableMaintenanceProduct::default();
+        let terminal = TerminalError::known_uncommitted("original cleanup refusal")
+            .with_effect(ExecutionEffect::External);
+        let effects = CleanupPort {
+            calls: AtomicUsize::new(0),
+            terminal: Err(terminal),
         };
-        let error = product
-            .execute_action(
-                &port,
-                MaintenanceActionRequest::RemoveOrphanFiles {
-                    target: target(),
-                    older_than_ms: 1,
-                },
-            )
-            .await
-            .unwrap_err();
-        assert!(
-            error
-                .message
-                .contains("scanned orphan cleanup is unsupported")
-        );
-        assert!(!*port.executed.lock().unwrap());
-        assert!(port.content.lock().unwrap().is_none());
-        assert!(
-            weak.upgrade().is_none(),
-            "refusal releases only the empty local test session"
-        );
-        let automatic = ReleaseCleanupPort {
-            content: Mutex::new(Some(Arc::new(()))),
-            executed: Arc::new(Mutex::new(false)),
-            terminal: Ok(CleanupTerminal::KnownCommitted {
-                locations: Vec::new(),
-            }),
-            object_candidates: true,
+        let request = MaintenanceActionRequest::RemoveOrphanFiles {
+            target: target(),
+            older_than_ms: 1,
         };
         assert!(
             product
                 .execute_automatic_action(
-                    &automatic,
-                    MaintenanceActionRequest::RemoveOrphanFiles {
-                        target: target(),
-                        older_than_ms: 1,
-                    },
+                    &effects,
+                    request.clone(),
                     MaintenanceEffectId::from_bytes([6; 16])
                 )
                 .await
                 .is_err()
         );
-        assert!(
-            automatic.content.lock().unwrap().is_some(),
-            "automatic entry must not begin discovery"
-        );
-        assert!(!*automatic.executed.lock().unwrap());
+        assert_eq!(effects.calls.load(Ordering::SeqCst), 0);
+
+        let error = product
+            .execute_user_action(&effects, request)
+            .await
+            .unwrap_err();
+        assert_eq!(error.message, "original cleanup refusal");
+        assert_eq!(error.effect, Some(ExecutionEffect::External));
+        assert_eq!(effects.calls.load(Ordering::SeqCst), 1);
     }
 }
 
@@ -2178,15 +1687,6 @@ mod async_metadata_tests {
         release: tokio::sync::Notify,
     }
     impl TableMaintenanceEffectPort for GatedMetadata {
-        fn observe_cleanup_owned_ref<'a>(
-            &'a self,
-            _: &'a GcOwnedRefObservationAccelerator,
-            _: GcOwnedRefObservation,
-            _: i64,
-            _: i64,
-        ) -> MaintenanceFuture<'a, Result<GcOwnedRefObservationDecision, TerminalError>> {
-            Box::pin(async { panic!("this fixture has no owned-ref cleanup observation") })
-        }
         fn reject_user_action_on_mv<'a>(
             &'a self,
             _: &'a MaintenanceTarget,
@@ -2196,7 +1696,7 @@ mod async_metadata_tests {
         fn execute_metadata<'a>(
             &'a self,
             _: MaintenanceActionRequest,
-        ) -> crate::product::MaintenanceFuture<'a, Result<MaintenanceActionOutcome, String>>
+        ) -> crate::product::MaintenanceFuture<'a, Result<MaintenanceActionOutcome, TerminalError>>
         {
             Box::pin(async move {
                 self.entered.store(true, Ordering::SeqCst);
@@ -2221,20 +1721,10 @@ mod async_metadata_tests {
         > {
             Box::pin(async move { panic!("metadata cannot enter rewrite") })
         }
-        fn begin_cleanup<'a>(
-            &'a self,
-            _: &'a MaintenanceTarget,
-            _: i64,
-        ) -> crate::product::MaintenanceFuture<
-            'a,
-            Result<Box<dyn CleanupSession + 'a>, TerminalError>,
-        > {
-            Box::pin(async move { panic!("metadata cannot enter cleanup") })
-        }
     }
     #[tokio::test]
     async fn original_product_keeps_target_activity_across_actual_metadata_wait() {
-        let product = TableMaintenanceProduct::new(None);
+        let product = TableMaintenanceProduct::default();
         let target = MaintenanceTarget {
             catalog: "ice.main".into(),
             namespace: "db".into(),
@@ -2325,7 +1815,3 @@ mod async_metadata_tests {
         }
     }
 }
-
-#[cfg(test)]
-#[path = "product/gc_original_tests.rs"]
-mod gc_original_tests;

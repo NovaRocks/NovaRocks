@@ -18,7 +18,7 @@
 use novarocks_spi::connector::{
     ConnectorControlPlanningPin, ConnectorControlResolver, ConnectorInstanceId,
     ConnectorRequestContext, ConnectorTableIdentity, ConnectorTableObjectCaptureRequest,
-    ConnectorTableObjectSelector, ConnectorTableResolution,
+    ConnectorTableObjectId, ConnectorTableObjectSelector, ConnectorTableResolution,
 };
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -239,6 +239,7 @@ pub(crate) async fn reject_if_iceberg_mv_table_with_planning_pin_and_context_asy
         binding,
     )
     .await
+    .map(drop)
 }
 
 /// Same original guard algorithm, with the selected generation's governed binding CPU.
@@ -251,8 +252,25 @@ pub(crate) async fn reject_if_iceberg_mv_table_with_governed_planning_pin_and_co
     context: ConnectorRequestContext,
     cpu: Arc<dyn novarocks_spi::connector::ProviderMetadataCpuPort>,
 ) -> Result<(), novarocks_query_application::session_error::QueryServiceError> {
+    guarded_iceberg_table_object_with_cpu(exact_lease, readiness, target, mutation, context, cpu)
+        .await
+        .map(drop)
+}
+
+/// Carry the exact object checked by the original MV guard to a later effect.
+pub(crate) async fn guarded_iceberg_table_object_with_cpu(
+    exact_lease: &ConnectorControlPlanningPin,
+    readiness: &crate::mv::domain::readiness::MvReadinessPort,
+    target: &TargetBackend,
+    mutation: IcebergMvUserMutation,
+    context: ConnectorRequestContext,
+    cpu: Arc<dyn novarocks_spi::connector::ProviderMetadataCpuPort>,
+) -> Result<
+    Option<ConnectorTableObjectId>,
+    novarocks_query_application::session_error::QueryServiceError,
+> {
     if target.provider_id.as_str() != "iceberg" {
-        return Ok(());
+        return Ok(None);
     }
 
     let instance_id = ConnectorInstanceId::parse(&target.catalog).map_err(|error| {
@@ -296,6 +314,7 @@ pub(crate) async fn reject_if_iceberg_mv_table_with_governed_planning_pin_and_co
         binding,
     )
     .await
+    .map(Some)
 }
 
 async fn reject_bound_iceberg_mv_table_async(
@@ -306,7 +325,7 @@ async fn reject_bound_iceberg_mv_table_async(
     context: ConnectorRequestContext,
     identity: ConnectorTableIdentity,
     binding: novarocks_spi::connector::ConnectorTableObjectBinding,
-) -> Result<(), novarocks_query_application::session_error::QueryServiceError> {
+) -> Result<ConnectorTableObjectId, novarocks_query_application::session_error::QueryServiceError> {
     if binding.metadata.identity != identity {
         return Err(super::readiness::application_error(
             "connector loaded a different table while checking the MV mutation guard",
@@ -315,10 +334,11 @@ async fn reject_bound_iceberg_mv_table_async(
     let documents = exact_lease
         .derive_document_storage_lease()
         .map_err(super::readiness::connector_application_error)?;
+    let object_id = binding.object_id;
     let request = crate::mv::domain::staged_create::keyed_request(
         &documents,
         identity,
-        binding.object_id,
+        object_id.clone(),
         context,
     );
     let observed = documents.observe_keyed_documents_async(request).await;
@@ -382,7 +402,7 @@ fn check_iceberg_mv_observation(
             key,
         }) => {
             return if mutation == IcebergMvUserMutation::DropTable {
-                Ok(())
+                Ok(object_id)
             } else {
                 Err(super::readiness::application_error(format!(
                     "LegacyFormat: {key}; only DROP TABLE is supported"
@@ -400,7 +420,7 @@ fn check_iceberg_mv_observation(
         return Err(materialized_view_denial(target, mutation));
     }
 
-    Ok(())
+    Ok(object_id)
 }
 
 fn materialized_view_denial(

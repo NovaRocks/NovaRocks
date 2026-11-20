@@ -1407,6 +1407,99 @@ fn invalid_late_stop_proofs_fail_without_confirming_or_reviving_the_sealed_strea
 }
 
 #[test]
+fn a_correlated_route_failure_parks_strict_delivery_until_task_stop() {
+    let transport = Scripted::granting();
+    let scheduler = scheduler(16);
+    let sender = sender(
+        transport.clone(),
+        scheduler.clone(),
+        1,
+        ExchangeDeliveryRequirement::MustDrain,
+    );
+    publish(&sender, b"one", true);
+    let call = transport.take();
+    (call.done)(ExchangeCallOutcome::Refused(EXCHANGE_ROUTE_FAILURE_STOP));
+    let parked = sender.snapshot();
+    assert_eq!(parked.status, ExchangeStreamSenderStatus::AwaitingTaskStop);
+    assert_eq!(
+        parked.stop_obligation,
+        ExchangeSenderStopState::RouteRetired
+    );
+    assert_eq!(parked.active_calls, 1);
+    assert_eq!(scheduler.snapshot().bytes, 3);
+    assert_eq!(parked.retention.consumed_through, 0);
+    assert!(sender.failure().is_none());
+
+    sender.observe(ExchangeGrantNotice::Facts(ExchangeStreamFacts {
+        granted_through: 1,
+        custody_through: 2,
+        ..Default::default()
+    }));
+    sender.observe(ExchangeGrantNotice::Resynchronize);
+    assert_eq!(sender.snapshot(), parked);
+    assert!(matches!(
+        sender.finish(),
+        Err(ExchangeUnitSenderError::Stopped)
+    ));
+    assert!(matches!(
+        sender.publish(&Bytes::from_static(b"two"), false),
+        Err(ExchangeUnitSenderError::Stopped)
+    ));
+    assert!(transport.calls.lock().unwrap().is_empty());
+    sender.stop();
+    assert_eq!(
+        sender.snapshot().status,
+        ExchangeStreamSenderStatus::Stopped
+    );
+    assert_eq!(sender.snapshot().active_calls, 1);
+    drop(call.activity);
+    assert_eq!(sender.snapshot().active_calls, 0);
+    assert_eq!(scheduler.snapshot().bytes, 0);
+    assert!(transport.normal_closes.lock().unwrap().is_empty());
+}
+
+#[test]
+fn exact_demand_and_stop_sender_responses_discharge_only_route_stop_debt() {
+    for stopping in [false, true] {
+        let transport = Scripted::granting();
+        let sender = sender(
+            transport.clone(),
+            scheduler(16),
+            1,
+            ExchangeDeliveryRequirement::MustDrain,
+        );
+        let stopped = ExchangeDemandCallOutcome::Observed(vec![(
+            sender.config.stream,
+            Err(EXCHANGE_ROUTE_FAILURE_STOP),
+        )]);
+        if stopping {
+            publish(&sender, b"one", false);
+            transport.stop_replies.lock().unwrap().push_back(stopped);
+            sender.stop();
+            assert_eq!(
+                sender.snapshot().status,
+                ExchangeStreamSenderStatus::Stopped
+            );
+            drop(transport.take());
+        } else {
+            transport.demand_replies.lock().unwrap().push_back(stopped);
+            publish(&sender, b"one", false);
+            assert_eq!(
+                sender.snapshot().status,
+                ExchangeStreamSenderStatus::AwaitingTaskStop
+            );
+            sender.stop();
+        }
+        assert_eq!(
+            sender.snapshot().stop_obligation,
+            ExchangeSenderStopState::RouteRetired
+        );
+        assert_eq!(sender.snapshot().retention.consumed_through, 0);
+        assert!(sender.failure().is_none());
+    }
+}
+
+#[test]
 fn stop_rpc_proofs_require_the_same_delivery_end_and_custody_validation() {
     for facts in invalid_stop_proofs() {
         let transport = Scripted::granting();

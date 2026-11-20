@@ -3,76 +3,115 @@
 n
 3
 
+-- query 6
+-- types	varchar	bigint
+metric_name	metric_value
+
 -- query 7
+-- types	bigint
+snapshots
+1
+
+-- query 8
 -- types	integer	varchar
 id	v
 1	a
 2	b
 3	c
 
--- query 8
+-- query 9
 -- types	bigint
 n
 3
 
--- query 13
+-- query 14
 -- types	bigint
 n
 3
 
 -- query 15
+-- types	varchar	bigint
+metric_name	metric_value
+
+-- query 16
 -- types	bigint
 n
 3
 
 -- query 20
+-- types	varchar	bigint
+metric_name	metric_value
+
+-- query 21
 -- types	integer	varchar
 id	v
 1	p
 2	q
 
--- query 27
+-- query 28
 -- types	bigint
 n
 3
 
 -- query 29
+-- types	varchar	bigint
+metric_name	metric_value
+
+-- query 30
+-- types	bigint
+snapshots
+2
+
+-- query 31
+-- types	integer	varchar
+id	v
+1	alpha
+
+-- query 32
 -- types	integer	varchar
 id	v
 1	alpha
 2	beta
 3	gamma
 
--- query 39
+-- query 42
 -- types	bigint
 n
 2
 
--- query 41
+-- query 43
+-- types	varchar	bigint
+metric_name	metric_value
+
+-- query 44
 -- types	integer	varchar
 id	v
 1	first
 2	second
 
--- query 46
+-- query 49
 -- types	integer	varchar
 id	v
 1	one
 2	two
 
--- query 49
+-- query 52
 -- types	bigint
 n
 0
 
--- query 55
+-- query 56
+-- types	varchar	bigint
+metric_name	metric_value
+
+-- query 58
 -- types	integer	varchar
 id	v
 1	row1
 2	row2
 3	row3
 
--- query 56
+-- query 59
 -- types	bigint
 n
 3

@@ -26,11 +26,13 @@ fn product_primary_survives_two_cleanup_errors_after_real_cell_exit() {
         "original Product rejection",
     );
     let mut call = MaintenanceCommandCall {
+        pending: None,
         future: None,
         result: Some(Err(primary.clone())),
         poll_unproven: false,
         original: MaintenanceActionState::default(),
         io: Some(Arc::clone(&source)),
+        metadata_cpu: None,
     };
     call.project_saved_cleanup(source.cleanup_failure());
     let projected = call.result.as_ref().unwrap().as_ref().unwrap_err();
@@ -52,11 +54,13 @@ fn product_primary_survives_two_cleanup_errors_after_real_cell_exit() {
 fn successful_product_keeps_success_and_the_original_cleanup_receipt() {
     let (source, first, _) = super::super::io_admission::cleanup_tests::two_failures(false);
     let mut call = MaintenanceCommandCall {
+        pending: None,
         future: None,
         result: Some(Ok(MaintenanceStatementResult::Ok)),
         poll_unproven: false,
         original: MaintenanceActionState::default(),
         io: Some(Arc::clone(&source)),
+        metadata_cpu: None,
     };
     call.project_saved_cleanup(source.cleanup_failure());
     let disposition = call.publication_disposition();
@@ -81,11 +85,13 @@ fn actual_product_finalization_failure_keeps_its_original_classification() {
         "original required cache finalization failed",
     );
     let mut call = MaintenanceCommandCall {
+        pending: None,
         future: None,
         result: Some(Err(primary.clone())),
         poll_unproven: false,
         original: MaintenanceActionState::default(),
         io: Some(Arc::clone(&source)),
+        metadata_cpu: None,
     };
     call.project_saved_cleanup(source.cleanup_failure());
     let error = call.result.as_ref().unwrap().as_ref().unwrap_err();

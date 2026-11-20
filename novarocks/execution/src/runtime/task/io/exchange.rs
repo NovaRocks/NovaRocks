@@ -13,10 +13,29 @@ pub struct ExchangeNormalCloseAccepted {
     pub facts: ExchangeStreamFacts,
 }
 
+/// Development-only hold of an original stream before the first offer.
+#[cfg(novarocks_dev_controls)]
+pub trait ExchangeDispatchTestHold: Send {
+    fn run(
+        self: Box<Self>,
+        stop: tokio_util::sync::CancellationToken,
+        activity: super::exchange_unit::ExchangeCallActivity,
+        release: Box<dyn FnOnce(Result<(), novarocks_failure_contract::FailureFact>) + Send>,
+    );
+}
+
 /// All implementations explicitly install the Unit/End, demand and observation
 /// contract. Data call activity remains with its actual request owner through
 /// exit, independently of receipt, timeout or cancellation observations.
 pub trait ExchangeFrameTransmitter: Send + Sync + 'static {
+    #[cfg(novarocks_dev_controls)]
+    fn test_dispatch_hold(
+        &self,
+        _stream: ExchangeStreamIdentity,
+    ) -> Result<Option<Box<dyn ExchangeDispatchTestHold>>, novarocks_failure_contract::FailureFact>
+    {
+        Ok(None)
+    }
     /// Observe only a successfully merged typed receiver close, regardless of
     /// whether it arrived through delivery, demand or a grant subscription.
     /// The caller has released the original sender's state lock.

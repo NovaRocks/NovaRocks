@@ -151,30 +151,13 @@ mod dependency_projection_tests {
         api::BackendTopologySnapshot,
         cancellation::{QueryCancellationReason, QueryCancellationSource},
     };
-    use novarocks_sql::compiler::{
-        SessionOptimizerSettings, SqlFoldDependencyInput, SqlFoldDependencyObserver,
-        SqlFoldEvaluationOutcome,
-    };
+    use novarocks_sql::compiler::{SessionOptimizerSettings, SqlFoldDependencyObserver};
     use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     struct Observer;
-    impl SqlFoldDependencyObserver for Observer {
-        fn before_fold_dependency_observed(
-            &self,
-            _: SqlFoldDependencyInput<'_>,
-            _: &dyn PureCompileControl,
-        ) -> Result<(), CompileControlError> {
-            Ok(())
-        }
-        fn after_fold_dependency_observed(
-            &self,
-            _: SqlFoldDependencyInput<'_>,
-            _: SqlFoldEvaluationOutcome<'_>,
-        ) {
-        }
-    }
+    impl SqlFoldDependencyObserver for Observer {}
 
     #[test]
     fn sql_dependency_execution_projector_keeps_original_deadline_and_cancellation() {

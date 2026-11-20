@@ -45,6 +45,7 @@ use novarocks_spi::connector::MvStorageObservationPort;
 #[derive(Clone)]
 pub struct QueryPreparationKernel {
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
+    sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     constant_policy: novarocks_functions::ConstantPolicy,
     static_plan_carrier: CompiledPackageCarrier,
     catalog_service: Arc<QueryCatalogService>,
@@ -73,6 +74,10 @@ impl SystemTableQueryKernel {
 }
 
 impl QueryPreparationKernel {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The query preparation kernel consumes separately owned topology, catalogue, connector, and compile capabilities."
+    )]
     pub fn new(
         functions: Arc<novarocks_functions::EngineFunctionCatalog>,
         catalog_service: Arc<QueryCatalogService>,
@@ -84,9 +89,11 @@ impl QueryPreparationKernel {
         _exchange_port: u16,
         constant_policy: novarocks_functions::ConstantPolicy,
         static_plan_carrier: CompiledPackageCarrier,
+        sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     ) -> Self {
         Self {
             functions,
+            sealed_functions,
             constant_policy,
             static_plan_carrier,
             catalog_service,
@@ -104,6 +111,10 @@ impl QueryPreparationKernel {
 
     pub(crate) fn function_catalog(&self) -> &Arc<novarocks_functions::EngineFunctionCatalog> {
         &self.functions
+    }
+
+    pub(crate) fn sealed_functions(&self) -> &Arc<novarocks_functions::PureEngineFunctionCatalog> {
+        &self.sealed_functions
     }
 
     /// The static carrier this kernel freezes completed plans into.
@@ -149,6 +160,7 @@ impl QueryPreparationKernel {
 #[derive(Clone)]
 pub struct DmlExecutionKernel {
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
+    sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     constant_policy: novarocks_functions::ConstantPolicy,
     static_plan_carrier: CompiledPackageCarrier,
     catalog_service: Arc<QueryCatalogService>,
@@ -174,6 +186,7 @@ pub struct DmlExecutionKernel {
 #[derive(Clone)]
 pub struct DmlPlanningServices {
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
+    sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     constant_policy: novarocks_functions::ConstantPolicy,
     static_plan_carrier: CompiledPackageCarrier,
     catalog_service: Arc<QueryCatalogService>,
@@ -189,9 +202,11 @@ impl DmlPlanningServices {
         static_plan_carrier: CompiledPackageCarrier,
         view_service: Arc<dyn ViewService>,
         system_relations: Arc<SystemTableRegistry>,
+        sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     ) -> Self {
         Self {
             functions,
+            sealed_functions,
             constant_policy,
             static_plan_carrier,
             catalog_service,
@@ -215,6 +230,7 @@ impl DmlExecutionKernel {
             view_service,
             system_relations,
             functions,
+            sealed_functions,
             constant_policy,
             static_plan_carrier,
             catalog_service,
@@ -223,6 +239,7 @@ impl DmlExecutionKernel {
             view_service,
             system_relations,
             functions,
+            sealed_functions,
             constant_policy,
             static_plan_carrier,
             catalog_service,
@@ -341,6 +358,10 @@ impl DmlExecutionKernel {
         &self.functions
     }
 
+    pub(crate) fn sealed_functions(&self) -> &Arc<novarocks_functions::PureEngineFunctionCatalog> {
+        &self.sealed_functions
+    }
+
     /// The static carrier this kernel freezes completed plans into.
     pub(crate) const fn static_plan_carrier(&self) -> &CompiledPackageCarrier {
         &self.static_plan_carrier
@@ -453,10 +474,10 @@ impl ViewExecutionKernel {
 /// Table-maintenance command dependencies.
 #[derive(Clone)]
 pub struct MaintenanceExecutionKernel {
-    state_store: Option<crate::state_store::execution::StateStoreOriginalBinding>,
     rewrite_runtime: Option<MaintenanceRewriteRuntime>,
     constant_policy: novarocks_functions::ConstantPolicy,
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
+    sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     static_plan_carrier: CompiledPackageCarrier,
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
@@ -481,6 +502,10 @@ pub(crate) struct MaintenanceRewriteRuntime {
 }
 
 impl MaintenanceExecutionKernel {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Maintenance assembles independently owned connector, catalogue, statistics, and compile capabilities."
+    )]
     pub fn new(
         functions: Arc<novarocks_functions::EngineFunctionCatalog>,
         catalog_service: Arc<QueryCatalogService>,
@@ -492,12 +517,13 @@ impl MaintenanceExecutionKernel {
         service: Arc<dyn TableMaintenanceService>,
         constant_policy: novarocks_functions::ConstantPolicy,
         static_plan_carrier: CompiledPackageCarrier,
+        sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     ) -> Self {
         Self {
-            state_store: None,
             rewrite_runtime: None,
             constant_policy,
             functions,
+            sealed_functions,
             static_plan_carrier,
             catalog_service,
             catalog_application,
@@ -509,22 +535,8 @@ impl MaintenanceExecutionKernel {
         }
     }
 
-    pub(crate) fn with_state_store_original(
-        mut self,
-        binding: Option<crate::state_store::execution::StateStoreOriginalBinding>,
-    ) -> Self {
-        self.state_store = binding;
-        self
-    }
-    pub(crate) fn state_store_original(
-        &self,
-    ) -> Result<
-        &crate::state_store::execution::StateStoreOriginalBinding,
-        novarocks_state_store_api::StateStoreOriginalUnsupported,
-    > {
-        self.state_store
-            .as_ref()
-            .ok_or(novarocks_state_store_api::StateStoreOriginalUnsupported)
+    pub(crate) fn sealed_functions(&self) -> &Arc<novarocks_functions::PureEngineFunctionCatalog> {
+        &self.sealed_functions
     }
 
     pub(crate) fn with_rewrite_runtime(mut self, original: MaintenanceRewriteRuntime) -> Self {

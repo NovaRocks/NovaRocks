@@ -19,42 +19,32 @@ under the License.
 
 # 维护 / 治理
 
-> Iceberg 的运维操作包括压缩小文件、清理历史 snapshot、回收孤儿文件、重写 manifest 与重写 deletion vector。NovaRocks 支持按 Trino 规则选择文件的 OPTIMIZE、EXPIRE SNAPSHOTS、REWRITE MANIFESTS 与 V3 Puffin deletion-vector repack；扫描型回收要求 Provider 安全证明；当前源码用 `ConnectorCleanupScanSafety::Unproven` 在扫描/删除前明确拒绝 REST/Hadoop 缺证路径。完整调用面与原生验收仍需独立核对，不能据本文宣称全部迁移完成。增量压缩、sort-order rewrite 和通用定时调度仍待补。
+Iceberg 表可压缩小文件、清理历史快照、回收孤儿文件、重写 manifest 与重写 deletion vector。
+以下维护操作均在原语句内执行。增量压缩、按排序顺序重写和通用定时调度仍待支持。
 
 | 能力 | 状态 | 备注 |
 | --- | --- | --- |
 | `ALTER TABLE ... OPTIMIZE`（选择文件压缩） | ✅ | 原语句内执行，返回三行指标 |
 | `OPTIMIZE` 选择文件 | ✅ | 默认阈值 100MB；任意 WHERE 与阈值参数尚未开放 |
-| `EXPIRE SNAPSHOTS` | ✅ | 语句内 action |
-| `REMOVE ORPHAN FILES` | 受限 | REST/Hadoop 安全证明为 UNPROVEN；缺证应明确拒绝 |
-| `REWRITE MANIFESTS` | ✅ | 语句内 action |
+| `EXECUTE expire_snapshots` | ✅ | 保留期、分支与标签保留规则，可清理未使用的 schema 和 partition spec |
+| `EXECUTE remove_orphan_files` | ✅ | REST/Hadoop 表内扫描，按保留期与完整有效文件名集合判定 |
+| `EXECUTE optimize_manifests` | ✅ | 聚簇重写数据 manifest，实际重写时返回四行指标 |
 | `rewrite_position_delete_files`（V3 Puffin DV repack） | ✅ | 语句内 Spark-style `CALL` |
 | V2 Parquet position delete → V3 DV 升级 | ❌ | |
 | `REWRITE DATA FILES BY SORT ORDER` | ❌ | |
 | 自动 maintenance 调度器 | ❌ | |
 
-“语句内”只描述 SQL 的返回方式：调用等待相应业务结果，而不是先返回后台 job。
-它不要求 Rust 控制 I/O 同步阻塞，也不把可延后的安全 GC 作为必要业务成功屏障；
-具体异步切换与结算边界仍须按实际二进制验证。
+语句等待相应业务结果与原执行 Source 的实际退出。快照过期的物理回收与元数据提交各自取证。
 
----
+## 执行边界
 
-## Owner、执行边界与 StateStore
-
-maintenance 的三层职责是固定的：
-
-- Frontend 的 governed Action 拥有原语句的 Root、查询许可、冻结会话设置与原执行 Source。
-- `TableMaintenanceProduct` 保留表级活动互斥、共享业务算法与 GC first-observation；不拥有后台 job、队列、worker 或历史。
-- Iceberg connector 拥有 catalog、snapshot/file、rewrite/expire/orphan、commit、cache invalidation 与 MV target snapshot adopt 的外部事实。
-
-OPTIMIZE 与 ANALYZE 都等待本语句的必要业务结果及实际资源退出，随后返回结果；不再提交进程内作业。
-StateStore 在维护领域仅可保存 GC first-observation Accelerator；该记录可重建，不授予 catalog mutation、
-跨重启接管或删除权。是否配置 StateStore 都不能解除扫描 GC 的缺证限制。
-
-同表 OPTIMIZE 沿原表级活动互斥，不同表可并行。取消先停止尚未派发的工作，并让原 Source 驱动取消、
-关闭与实际退出；业务终态、取消意图、shutdown 等待期限都不能代替 Provider/Native/CPU 的真实退出。
-publication 仍区分 KnownUncommitted、KnownCommitted 与 CommitUnknown；未知结果不自动重试或回滚。
-该边界不提供跨 FE 或外部 writer 的锁，正确性仍依赖 Catalog OCC。见 [ADR-0232](../../adr/ADR-0232-statement-owned-maintenance-statistics-and-state-surfaces.md)。
+- Frontend 的 governed Action 冻结语句开始时间、会话、准确表对象与 catalog generation，
+  并持有原执行 Source、查询许可与表级活动闸门。同表维护互斥，不同表可并行。
+- Iceberg Provider 持有 catalog、快照、文件、提交与回收事实。取消停止启动尚未派发的工作；
+  已派发的工作须实际退出。提交区分 KnownUncommitted、KnownCommitted 与 CommitUnknown。
+- 维护由本次语句授权。首次观察与其 StateStore Accelerator 已退役。并发提交仍依据 Catalog OCC，
+  同表活动闸门约束本 FE 的维护。见 [ADR-0232](../../adr/ADR-0232-statement-owned-maintenance-statistics-and-state-surfaces.md)
+  与 [ADR-0243](../../adr/ADR-0243-statement-authorized-iceberg-metadata-maintenance.md)。
 
 ## ✅ OPTIMIZE
 
@@ -96,80 +86,91 @@ Trino `updateType` 为 `ALTER TABLE EXECUTE`，不填 `updateCount`；客户端�
 
 任意 `WHERE`、自定义文件阈值与 sort-order rewrite 尚未开放；当前旧写法使用上述固定选择规则。
 
-## ✅ EXPIRE SNAPSHOTS
+## 元数据维护的保留期与返回值
 
-### 行为
+`expire_snapshots` 与 `remove_orphan_files` 都用语句开始时间减去 `retention_threshold`
+确定截止时间。该参数默认 `'7d'`，两个过程各有独立的最小保留期，catalog 默认均为 7 天。
+配置写入该 catalog 的 `[catalogs.properties]`；catalog 会话属性覆盖配置的下限。
 
-从 `metadata.json` 中移除满足保留策略且未受保护的快照。OLDER THAN 和 RETAIN LAST 可单独或组合使用，
-两个条件取交集：同时指定时，只有既早于时间戳、又不属于最近 N 个的 snapshot 才会被过期。
+| 过程 | Catalog 配置 | Catalog 会话属性 |
+| --- | --- | --- |
+| `expire_snapshots` | `iceberg.expire-snapshots.min-retention` | `expire_snapshots_min_retention` |
+| `remove_orphan_files` | `iceberg.remove-orphan-files.min-retention` | `remove_orphan_files_min_retention` |
 
-快照元数据发布与物理文件回收是不同事实。Provider 保留原过期计划、提交证据与回收结果，
-文件删除仍核对实际引用、访问权限和相应回收前提。已提交的快照过期不保证所有文件已经删除；
-后续回收失败不能改写提交事实。该路径也不授予任意扫描表目录、删除足够老文件的权限，
-`REMOVE ORPHAN FILES` 仍受下节的 UNPROVEN 限制。
+例如，catalog 名为 `lake` 时可执行
+`SET SESSION lake.expire_snapshots_min_retention = '14d'`。
+随后须传入至少 `'14d'` 的保留期；省略参数仍取 `'7d'`。参数短于有效下限会返回
+`INVALID_PROCEDURE_ARGUMENT`。两个过程拒绝格式版本大于 3 的表与使用自定义
+`write.location-provider.impl` 的表。仅含内嵌 manifest 列表的旧式 v1 快照经 SDK 读取时会报错。
+HMS 为只读入口，三个过程在 MV 存储表上均拒绝执行。
 
-### 示例
+三个元数据维护过程的结果均有 `metric_name varchar` 与 `metric_value bigint` 两列，
+Trino HTTP 的 `updateType` 为 `ALTER TABLE EXECUTE`，省略 `updateCount`。
+结果无行时仍声明列，省略 `data`。客户端须继续取到终页确认。
 
-``` sql
-ALTER TABLE orders EXECUTE expire_snapshots(older_than => '2026-04-01 00:00:00');
-ALTER TABLE orders EXECUTE expire_snapshots(retain_last => 5);
-ALTER TABLE orders EXECUTE expire_snapshots(older_than => '2026-04-01 00:00:00', retain_last => 5);
-```
-
-### 支持的子集
-
-- Branch / Tag 当前指向的 snapshot 永不过期（所有 ref 头保护）
-- RETAIN LAST 仅对 main ancestor chain 生效
-- per-branch retention 属性（`branch.<n>.min-snapshots-to-keep` 等）**未读取**
-- 至少要给一个 OLDER THAN 或 RETAIN LAST，否则拒绝（防止误清全部历史）
-- 不支持 `t.branch_<x>` 后缀（parse-time reject）
-
-### 入口
-
-`novarocks/connector/iceberg/src/catalog_control/metadata_maintenance.rs` 与
-`novarocks/connector/iceberg/src/commit/snapshot_lifecycle_helpers/{retention,reclamation}.rs`
-
-## 受限：REMOVE ORPHAN FILES 与其它扫描回收
-
-本节记录 [ADR-0198](../../adr/ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md) 已接受的准入契约。
-当前 `ConnectorCleanupMaintenance::scan_gc_safety` 默认缺证；Iceberg 的 prepare、执行与原 orphan
-候选入口调用同一 `require_scanned_object_gc`，Table Maintenance 的扫描清理入口也先核该能力。
-这是当前源码锚点，不能替代目标二进制及全部手动/自动调用面的原生验收。
-
-### 安全准入与缺证拒绝
-
-REMOVE ORPHAN FILES 扫描表路径的 data/metadata 候选，并按引用和 OLDER THAN 过滤。
-但“当前 metadata 不引用”和“文件足够老”都不能证明迟到的合法 publication 不会引用它。
-SQL 手动调用与自动入口使用同一判据，用户指定删除阈值不替代 Provider 安全证明。
-
-| Catalog / 回收路径 | 安全状态与支持边界 |
-|---|---|
-| Iceberg REST，静态或 vended 凭据，表内 orphan 扫描 | UNPROVEN；按缺证能力明确拒绝，凭据来源不改变证明 |
-| Iceberg Hadoop，file 或 object store，表内 orphan 扫描 | UNPROVEN；前台同样受限，原有 Background 拒绝继续成立 |
-| NovaRocks owned-ref 成熟回收 | UNPROVEN；provenance、first-observation 与 exact CAS 不单独排除仍合法的旧业务 |
-| 无表锚 CTAS 根扫描 | UNPROVEN；年龄与 fresh NotFound 不能排除迟到的 staged publication |
-| Iceberg Hive / Paimon | Hive mutation 不支持；Paimon 只读，无写入或 GC 能力 |
-
-缺证入口应返回明确的 unsupported 能力结果，说明缺失的安全前提，不能静默执行删除或返回
-清理成功。增大 OLDER THAN、只部署一个 FE 或换成静态凭据都不能解除 UNPROVEN。
-此处 UNPROVEN 表示契约和证据不足，不代表已复现误删，也不代表这些外部系统永远无法支持安全回收。
-
-恢复某个扫描能力前，Provider 必须证明真实 writer/潜在外部效果的截止或有效 fencing，
-说明时钟与列举假设、并发提交和 Unknown 保护，并覆盖宣称支持的重启范围。
-`safe_gc_age > max_attempt_duration + ...` 只有后者真正约束外部效果才有效；本地语句
-超时、请求幂等键、进程内 Unknown 记录或 GC first-observation 表都不能独自提供这一保证。
-
-### SQL 形状与候选保护
+## ✅ 过期快照（`expire_snapshots`）
 
 ``` sql
--- SQL 形状仍保留；未取得安全能力的 catalog 应明确拒绝。
-ALTER TABLE orders EXECUTE remove_orphan_files(older_than => '2026-04-01 00:00:00');
+ALTER TABLE orders EXECUTE expire_snapshots;
+ALTER TABLE orders EXECUTE expire_snapshots(retention_threshold => '14d', retain_last => 5);
+ALTER TABLE orders EXECUTE expire_snapshots(retention_threshold => '14d', clean_expired_metadata => true);
 ```
 
-OLDER THAN 是必需的候选过滤条件，不能据“至少三天”推断安全。现有实现还保护当前和
-metadata-log 中的 metadata，以及仍有 live data file 引用的整个 DV Puffin 对象；
-这些保护应保留，但不替代无未来引用证明。file/s3/oss 的列举实现不等于安全准入；
-hdfs 列举仍未支持，`t.branch_<x>` 后缀仍在 parse-time 拒绝。
+- `retain_last` 至少为 1，省略时采用表属性 `history.expire.min-snapshots-to-keep`（默认 1）。
+  首先按各 ref 的 `max-ref-age-ms` 选出保留的 ref。每个保留下来的分支按其
+  `min-snapshots-to-keep` 和 `max-snapshot-age-ms` 保留祖先前缀，标签保留其指向的快照。
+  未设分支覆盖时使用本次过程的保留数和截止时间。
+  只有从保留 ref 不可达的快照才使用全局截止时间兜底。
+- `clean_expired_metadata` 默认为 `false`。设为 `true` 后，同一次提交移除未被保留快照使用的
+  schema 与 partition spec，保留当前 schema 与默认 spec。即使没有快照过期，也可以提交该字典清理。
+- `gc.enabled=false` 时拒绝快照过期。快照过期提交确定成功后才回收只被过期快照引用的文件。
+  文件回收失败记入日志和指标，已提交的快照过期仍然成功。提交结果未知时暂不回收。成功结果始终无行。
+
+## ✅ 回收孤儿文件（`remove_orphan_files`）
+
+``` sql
+ALTER TABLE orders EXECUTE remove_orphan_files;
+ALTER TABLE orders EXECUTE remove_orphan_files(retention_threshold => '14d');
+```
+
+仅显式 `ALTER TABLE ... EXECUTE remove_orphan_files` 授予下列扫描删除权限。Provider 用原维护操作
+绑定的准确表对象及 catalog 授权列举该表根下的文件，遇表对象替换时拒绝继续。文件须同时满足以下条件才可删除。
+
+- 文件修改时间严格早于截止时间。
+- 文件名（路径最后一段）不在有效集合中。第一次删除派发前会收集当前 metadata JSON、metadata log、
+  所有快照（包含无分支或标签指向的历史快照）的 manifest list、数据与删除 manifest、各 manifest
+  存活条目引用的文件、表统计和分区统计，以及 `version-hint.text`。不同目录的同名文件同样受保护。
+- 解析后的完整位置在已绑定表根内，且未命中 catalog 发现根保护。Hadoop catalog 的规范编号 metadata
+  文件和 hint 即使已不在 `metadata-log` 中仍受保护。见 [ADR-0196](../../adr/ADR-0196-hadoop-test-catalog-complete-version-installation.md)。
+
+S3 兼容存储递归列举，本地文件系统和 HDFS 逐层列举。后端已知无法提供所需修改时间与大小时，
+在列举前返回 `NOT_SUPPORTED`。对已准入后端，缺少文件的时间或大小、列举或删除失败会返回
+`ICEBERG_FILESYSTEM_ERROR`，缺失 manifest 返回 `ICEBERG_INVALID_METADATA`。
+
+保留期应覆盖正常写入完成所需的时间。与 Trino 484 一样，即使 `gc.enabled=false`，本过程仍按
+上述规则执行。只应扫描该表独占的目录，因为有效集合只包含该表的引用。若与其它表共享目录，
+或写入在有效集合收集之后才发布早于截止时间的文件（例如外部引擎登记旧文件或提交迟到），
+这些文件可能被删除。
+
+无当前快照时直接成功，结果无行。其它成功扫描依次返回：
+
+| `metric_name` | `metric_value` |
+| --- | --- |
+| `processed_manifests_count` | 读取并去重的 manifest 数 |
+| `active_files_count` | 有效文件名数，不计 `version-hint.text` |
+| `scanned_files_count` | 表根下列出的文件数 |
+| `deleted_files_count` | 已确认成功删除的文件数 |
+| `deleted_bytes` | 已确认删除的文件在列举时记录的字节数 |
+
+取消、超时或错误会停止启动新批次。已派发批次可能已对外生效，原 Source 等待其实际退出并保留
+已确认的部分删除事实。回执不足的批次结果记为未知。重新执行时从新的表元数据和列举重新判断。
+
+## 旧 `CALL`、提交与其它清理
+
+Spark 风格旧 `CALL` 保留其各自的参数与结果形状，其中适用的旧入口继续接收 `older_than`。
+本页的 EXECUTE 参数和显式扫描授权只适用于对应的 ALTER TABLE 过程。
+自动入口和无表锚 CTAS 扫描仍按各自原有的删除授权，参见
+[ADR-0198](../../adr/ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md)。
 
 ### 与提交、必要 finalize 和精确清理的关系
 
@@ -222,47 +223,34 @@ Client 返回结果仍使用原 Client window。物理 CPU、Blocking 队列与 
 背压，不能由结果窗口数推导 worker 数，也不新增每依赖域 cleanup 配额或最低线程公式。
 
 共享 executor 的全部 worker 永久阻塞时，其它业务与结算也可能等待到各自原期限；本文不承诺
-故障域独立执行位置或整进程内存上界。job 的业务终态与历史裁剪分开，仍有原退出观察、Unknown
-或实际对象责任的记录不能为压缩历史而驱逐。
+故障域独立执行位置或整进程内存上界。原 operation 继续持有未完成的退出观察、Unknown
+或实际对象责任，直到对应事实已经处置。
 
-这些规则不改变扫描的 UNPROVEN 拒绝：仍须在 list/delete 前拒绝。owned-ref 成熟度记录与
-exact CAS 不能自行解除该限制；精确 operation-owned cleanup 继续依据原 ledger 的独立安全事实。
-实现迁移及手动/自动调用面的原生与最终全工作区验证仍待完成，本文不提供性能测量结论。
-
-### 入口
-
-`novarocks/connector/iceberg/src/catalog_control/{cleanup_maintenance,cleanup_candidates,unanchored_ctas_cleanup}.rs`，
-owned-ref 选择位于同目录的 `owned_ref_cleanup.rs`，first-observation 位于
-`novarocks/table-maintenance/src/gc_observation.rs`，其 `observe_in` 借实际执行 context，
-复用同一成熟度算法。它保留原 StateStore failure/CommitObservation，不把 observation 成熟当作
-外部对象可删除或动作已退出的证明。SPI 的能力作者位于 `novarocks/spi/src/connector/cleanup_maintenance.rs`，Table Maintenance
-入口位于 `novarocks/table-maintenance/src/product.rs`。原安全准入与拒绝仍须对实际二进制验收；
-普通提交、精确 operation-owned 清理与独立安全 metadata 维护不因该扫描限制而停用。
-
-## ✅ REWRITE MANIFESTS
-
-### 行为
-
-按 `(partition_spec_id, content_type)` 分组将多个 manifest 合并为单个 manifest，发出 `operation=replace` 快照。不移动或重写 data file，仅重建 manifest 层。
-
-### 示例
+## ✅ 重写 manifest（`optimize_manifests`）
 
 ``` sql
 ALTER TABLE orders EXECUTE optimize_manifests;
 ```
 
-### 支持的子集
+该过程只重写数据 manifest，保留删除 manifest 与现有数据文件。没有数据 manifest，或仅有一个
+小于 `commit.manifest.target-size-bytes` 的数据 manifest 时，无需提交，结果无行。目标大小默认 8 MiB。
+需要重写时，以数据 manifest 总长度除以目标大小并向上取整决定组数，最多 200 组。多组时按当前
+partition spec 第一字段的有序值聚簇，缺少该字段或值为 NULL 的条目归第 0 组。各组按历史 spec
+分别滚动写出 manifest，保留存活条目的原快照、序列与 v3 行谱系。提交生成 `replace` 快照。
 
-- 单 manifest / 空表 / 全 singleton 组 → noop（不写新快照）
-- V3 row-lineage 字段（`first_row_id`、`referenced_data_file` 等）保留 round-trip
-- DELETED entry 在合并时丢弃；ADDED + EXISTING 都改成 EXISTING
-- `snapshot.sequence_number` 严格 +1（catalog 不变量），但 entry-level `data_sequence_number` / `file_sequence_number` 保留原值
-- 不支持 `t.branch_<x>` 后缀（parse-time reject）
+实际重写成功时依次返回：
 
-### 入口
+| `metric_name` | `metric_value` |
+| --- | --- |
+| `rewritten_manifests_count` | 被替换的数据 manifest 数 |
+| `added_manifests_count` | 本次新增的 manifest 数 |
+| `kept_manifests_count` | 本次保留的 manifest 数 |
+| `processed_manifest_entries_count` | 本次重写处理的条目数 |
 
-`novarocks/connector/iceberg/src/catalog_control/metadata_maintenance.rs` 与
-`novarocks/connector/iceberg/src/commit/snapshot_lifecycle_helpers/rewrite_manifests.rs`
+此过程无需参数。三个元数据维护过程均不开放 `WHERE` 与 `table.branch_<name>` 后缀。
+
+实现入口为 Iceberg Provider 的 `catalog_control/metadata_maintenance.rs`、
+`catalog_control/orphan_files.rs` 及 `commit/snapshot_lifecycle_helpers/`。
 
 ## ✅ REWRITE POSITION DELETE FILES
 

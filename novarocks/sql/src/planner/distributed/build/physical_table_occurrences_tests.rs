@@ -18,10 +18,6 @@
 use super::super::contract_lowering::{NodeExpressionEffects, node_effects_with_test_summaries};
 use super::super::{
     expression_occurrences::{AuthoredPhysicalOccurrences, author_physical_occurrences_observed},
-    physical_expression_effects::{
-        PhysicalExpressionEffectsError, PhysicalExpressionEffectsInput,
-        author_physical_expression_effects_observed,
-    },
     physical_table_requests::{
         AuthoredPhysicalTableRequest, PhysicalTableRequestError,
         author_physical_table_request_observed,
@@ -402,7 +398,7 @@ fn root(
 fn seal_fixture_units(
     builder: &mut FragmentBuilder,
     pools: &ConstantPools,
-    catalog: &EngineFunctionCatalog,
+    _catalog: &EngineFunctionCatalog,
 ) -> BTreeMap<NodeId, NodeExpressionEffects> {
     // Fixed structural fixtures retain the original scalar author's summaries
     // beside exactly the Arc installed in their real node. No SQL journal is
@@ -426,20 +422,16 @@ fn seal_fixture_units(
         let control = Control::default();
         let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
         let sealed = draft.seal(ports, &mut work).unwrap();
-        let authored = author_physical_expression_effects_observed(
-            PhysicalExpressionEffectsInput {
-                owner: crate::planner::distributed::build::unit_source::ScalarUnitOwner::Node(node),
-                unit: &sealed,
-                constants: pools,
-                parameters: &parameters,
-                literal_policy: policy(),
-                call_scopes: &BTreeMap::new(),
-            },
-            catalog,
-            &Control::default(),
+        let authored = super::super::expression_component_test_fixture::author_component_calls(
+            &sealed,
+            pools,
+            &parameters,
+            policy(),
+            DecimalOverflowPolicy::OutputNull,
+            &mut work,
         )
         .unwrap();
-        let unit = Arc::new(sealed.finish(authored.calls, &mut work).unwrap());
+        let unit = Arc::new(sealed.finish(authored.claims, &mut work).unwrap());
         work.finish().unwrap();
         effects.insert(
             node,
@@ -1108,11 +1100,9 @@ fn fragment_prefixes(
                 assert_eq!(trace, [(PHASE, 0)]);
             }
             PhysicalFragmentEffectsError::Control(_)
-            | PhysicalFragmentEffectsError::Expressions(
-                PhysicalExpressionEffectsError::Argument(PhysicalArgumentError::Constant(
-                    ConstantError::Limit(_),
-                )),
-            ) => {}
+            | PhysicalFragmentEffectsError::TableRequest(PhysicalTableRequestError::Argument(
+                PhysicalArgumentError::Constant(ConstantError::Limit(_)),
+            )) => {}
             _ => panic!("unexpected original table composition refusal: {original:?}"),
         }
         for cause in CAUSES {
@@ -1135,13 +1125,13 @@ fn fragment_prefixes(
                     PhysicalFragmentEffectsError::Control(original),
                 ) => assert_eq!(actual, original),
                 (
-                    PhysicalFragmentEffectsError::Expressions(
-                        PhysicalExpressionEffectsError::Argument(PhysicalArgumentError::Constant(
+                    PhysicalFragmentEffectsError::TableRequest(
+                        PhysicalTableRequestError::Argument(PhysicalArgumentError::Constant(
                             actual @ ConstantError::Limit(_),
                         )),
                     ),
-                    PhysicalFragmentEffectsError::Expressions(
-                        PhysicalExpressionEffectsError::Argument(PhysicalArgumentError::Constant(
+                    PhysicalFragmentEffectsError::TableRequest(
+                        PhysicalTableRequestError::Argument(PhysicalArgumentError::Constant(
                             original @ ConstantError::Limit(_),
                         )),
                     ),

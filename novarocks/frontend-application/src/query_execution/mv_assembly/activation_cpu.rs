@@ -53,6 +53,7 @@ use std::sync::{
 pub(crate) struct MvWriteAnalysisContext {
     pub(crate) catalog: SqlCapturedCatalog,
     pub(crate) functions: Arc<novarocks_functions::EngineFunctionCatalog>,
+    pub(crate) sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     pub(crate) constant_policy: novarocks_functions::ConstantPolicy,
     pub(crate) control: SqlCompileControl,
     pub(crate) current_catalog: Option<String>,
@@ -137,8 +138,7 @@ impl MvWriteAnalysisInput {
                         environment: Distributed,
                         catalog: &c.catalog,
                         functions: c.functions.as_ref(),
-                        constant_evaluator:
-                            crate::query_execution::constant_eval::constant_evaluator(),
+                        sealed_functions: Arc::clone(&c.sealed_functions),
                         constant_policy: c.constant_policy,
                         control: c.control,
                         sink,
@@ -166,8 +166,7 @@ impl MvWriteAnalysisInput {
                         environment: Distributed,
                         catalog: &c.catalog,
                         functions: c.functions.as_ref(),
-                        constant_evaluator:
-                            crate::query_execution::constant_eval::constant_evaluator(),
+                        sealed_functions: Arc::clone(&c.sealed_functions),
                         constant_policy: c.constant_policy,
                         control: c.control,
                         sink,
@@ -194,8 +193,7 @@ impl MvWriteAnalysisInput {
                         environment: Distributed,
                         catalog: &c.catalog,
                         functions: c.functions.as_ref(),
-                        constant_evaluator:
-                            crate::query_execution::constant_eval::constant_evaluator(),
+                        sealed_functions: Arc::clone(&c.sealed_functions),
                         constant_policy: c.constant_policy,
                         control: c.control,
                     },
@@ -224,8 +222,7 @@ impl MvWriteAnalysisInput {
                         environment: Distributed,
                         catalog: &c.catalog,
                         functions: c.functions.as_ref(),
-                        constant_evaluator:
-                            crate::query_execution::constant_eval::constant_evaluator(),
+                        sealed_functions: Arc::clone(&c.sealed_functions),
                         constant_policy: c.constant_policy,
                         control: c.control,
                     },

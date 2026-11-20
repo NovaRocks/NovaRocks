@@ -353,11 +353,18 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
   compiled 复用的中立值描述、scan/writer 等运行能力；不构造旧执行树。
   不得按目录名删除共享值类型、typed failure 或实际 construction helper。
 
+- `novarocks/sql/src/optimizer/rewrite/rules/fold_constant.rs` 与 `fold_constant/{evaluation,admission}.rs`
+  在 `LogicalNormalize` 逐节点折叠。候选节点与常量子节点经 `planner/optimizer_bridge/scalar.rs` 物化后，
+  复用 `planner/distributed/build/contract_lowering/standalone_scalar.rs` 的零端口单根降级，
+  由 `compile_expr_set_pure` 编译并在一行零列批次上求值。结果按原 arena 类型准入，缓存与
+  `ScalarArena` 同寿命。折叠宿主沿原编译控制检查点，必需常量仍在 FE 原语句资源作用域求值。
+  `novarocks/expression/src/call_authorship/**` 撰写标量调用控制形状、声明与效应摘要；
+  SQL 核对原绑定、请求与来源日志，密封 Functions 目录随编译请求进入 SQL。
+  见 [ADR-0242](docs/adr/ADR-0242-constant-folding-compiles-expression-units.md)。
+
 - `novarocks/execution/src/exec/operators/compiled_expression.rs` 与 `novarocks/execution/src/runtime/scalar_memory.rs`
   Execution 在此绑定输入、控制、资源准入、结算与失败投影。`novarocks/execution/src/exec/expr/**` 承接存量测试与 fixture。
-  折叠走 SQL `compiler/fold_node.rs` 的 FrozenFoldCall/Intrinsic 与共享 lowering 作者 → FE
-  `query_execution/constant_eval.rs` 端口 → `novarocks/expression/src/evaluator/constant_node.rs` 单节点入口，
-  复用 `guarded::Frame` 和 Functions 的实际计算。原 admitted CV 与 canonical runtime 参数分开保留。
+  原 admitted CV 与 canonical runtime 参数分开保留。
   同形常量规范化保留原 pool/ordinal 与实际 creator；source custody 按真实 Arrow 子树的
   geometry/validity 预检并续接。根无 Buffer 不代表后代无 Buffer；来源持有不授予容量。
   控制结果的 carrier 准入、精确宽度/NULL 与布局预检共用 Functions `control_values.rs` 和
@@ -379,7 +386,7 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
 
 - `novarocks/execution/src/runtime/function_set.rs`
   只封存真实 EngineFunctionCatalog metadata；不持有旧实现 map、legacy registry 或 implementation manifest。
-  `novarocks/version/src/lib.rs` 的 material encoding domain 为 v8，生产 epoch 为 15、test-only 为 13；旧执行实现摘要不再参与，
+  `novarocks/version/src/lib.rs` 的 material encoding domain 为 v8，生产 epoch 为 16、test-only 为 13；旧执行实现摘要不再参与，
   函数目录、pure 目录、descriptor、plan contract 与 Provider/carrier 事实仍保持 exact-island 判定。
 
 - `novarocks/execution/src/exec/operators/**`
@@ -394,6 +401,8 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
 - `novarocks/execution/src/exec/pipeline/builder/compiled.rs`
   从 `LocalProgram` 和本 Task 准确绑定的能力建立 pipeline；`builder.rs` 拥有共享图值。
   `binding.rs` 定义 `ExchangeBindings`、`ScanBindings`，writer bindings 在 `runtime/task`。
+
+- `novarocks/execution/src/exec/shared_stage/**` 提供共享阶段件，`novarocks/execution/src/exec/operators/setop/staged/**` 拥有 DISTINCT 集合运算的构建、探测与导出。见 [ADR-0243](docs/adr/ADR-0243-set-operation-shared-stages-and-exactly-once-placement.md)。
 
 - `novarocks/execution/src/exec/pipeline/executor.rs`
   生产入口 `prepare_compiled_program_with_sink_materializer` 先建立计算图，再按实际 root DOP
@@ -457,6 +466,9 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
 - `novarocks/execution/src/runtime/{exchange.rs,exchange/unit_ingress.rs,exchange_slots.rs}`
   接收 registry、原队列与结构 slot owner。唯一解码资格、提交、真实移交和退休由同一实例串行化；
   roster 与原 Task failure owner 在 Installed 前冻结，slot 只数单元，不是内存容量。
+  接收路由的失败封闭由 Worker 保留准确 roster 到原请求期限。Native 在已核对的一元回执中投影
+  原停止事实，发送流停发并等待原 Task 控制链。失败退役释放接收资源，已取得的 decode lease
+  仍按实际退出结算。
 
 - `novarocks/execution/src/runtime/task/io/**`
   `exchange_edge.rs` 拥有 Installed/正常撤回门；`exchange_sender_group.rs` 将同一 factory 的
@@ -796,7 +808,13 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
   catalog session 属性 `max_partitions_per_writer` 可在 1 到该值间覆盖。
   `iceberg.target-max-file-size` 接受正字节数或带单位的大小，默认 1 GiB，
   表属性 `write.target-file-size-bytes` 优先。表属性 `write.parquet.row-group-size-bytes` 默认 128 MiB。
-  这些属性经 catalog properties 与 FE 写会话冻结。示例见 `novarocks-catalogs.toml.example`。
+  这些属性经 catalog properties 与 FE 写会话冻结。
+
+- Iceberg catalog 维护属性
+  `iceberg.expire-snapshots.min-retention` 与 `iceberg.remove-orphan-files.min-retention` 各默认 7 天。
+  同 catalog 的会话属性 `expire_snapshots_min_retention` 与 `remove_orphan_files_min_retention`
+  分别覆盖下限，两个 EXECUTE 的缺省 `retention_threshold` 均为 `'7d'`。
+  示例见 `novarocks-catalogs.toml.example`。
 
 - `[standalone_server]`
   `trino_port`（默认 `8080`，`0` 由 OS 分配）、`trino_client_timeout_ms`（默认 `300000`）、
@@ -1296,7 +1314,9 @@ the guide differ.
   [ADR-0238](docs/adr/ADR-0238-self-contained-expression-units-and-explicit-environments.md)，
   从 `novarocks/expression-contract/src/{unit,builder,claims,request}.rs` 开始，编译入口在
   `novarocks/expression/src/compiled.rs`。节点端口、根及关系站点由 physical-plan 核对。
-  SQL 降级期撰写调用声明，package 冻结和 BE 解码阶段只校验该原始事实。
+  SQL 降级调用表达式层的标量调用作者，并保有关系调用站点和来源核对。
+  package 冻结和 BE 解码阶段只校验原始事实。折叠与标量调用作者见
+  [ADR-0242](docs/adr/ADR-0242-constant-folding-compiles-expression-units.md)。
   `novarocks/frontend-application/src/query_execution/required_constant_eval.rs` 直接编译必需常量的
   零端口单根单元，在同一原语句工作范围内求值。
 - **Package decode / compiled preparation**：从 `novarocks/plan-codec/src/physical_package_v2/**`、
@@ -1344,7 +1364,10 @@ the guide differ.
   `commit/attempt/observation.rs`；CTAS 完整 CREATE 请求在 `catalog_control/staged_create/publication.rs`。
   读 [ADR-0171](docs/adr/ADR-0171-commit-operation-model.md)、[ADR-0179](docs/adr/ADR-0179-iceberg-publication-lifecycle-and-evidence.md) 与 [ADR-0198](docs/adr/ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md) 后再改身份、字段继承、派发或清理授权。
   BE seal 先不可回退撤销 writer 删除权；FE 收齐后做本地交接。缺产物清单不能报 cleanup Complete。
-  精确 operation-owned cleanup 与扫描 GC 分开；REST/Hadoop 扫描安全仍为 UNPROVEN，手动/自动入口共用缺证限制，不能以本地 deadline 或年龄授予删除权。
+  精确 operation-owned cleanup 与扫描 GC 各自使用原授权。显式 `EXECUTE remove_orphan_files`
+  由原 Iceberg Provider 核对准确表对象、固定截止时间、完整有效文件名与 Hadoop 发现根后逐批删除，
+  保留已确认的部分回执直至实际退出。自有 ref 成熟回收与首次观察状态族已经退役；无表锚 CTAS
+  与自动入口沿原准入。三项元数据维护的提交、删除与 SQL 结果契约见 [ADR-0243](docs/adr/ADR-0243-statement-authorized-iceberg-metadata-maintenance.md)。
   必要业务事实与原 receipt/cause 由同 canonical `ConnectorWriteNeededReady` Arc 保管；
   `query_execution/write_session/publication_call.rs` 保留同一 Provider F 到真实退出，安全 GC 由同 Call 的残留继续驱动。
   NeededReady、cleanup Pending/Observed、实际 F 退出及库存 Disposed 不可互换；封存必要 finalize 失败不能授权最终 CTAS publication。

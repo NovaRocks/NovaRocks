@@ -435,6 +435,7 @@ enum ApplyAnswer {
     Truncated(Vec<OperationOutcome>),
     /// One receipt per request item, each with its own body.
     WithAck(Vec<(OperationOutcome, Option<proto::task_operation_verdict::Ack>)>),
+    IdentityMismatchAfter(Arc<tokio::sync::Notify>),
     Reject(tonic::Code),
     RejectWithMessage(tonic::Code, &'static str),
 }
@@ -820,6 +821,14 @@ impl TaskWirePeer {
                 true,
             ),
             ApplyAnswer::WithAck(items) => (items, false, false),
+            ApplyAnswer::IdentityMismatchAfter(release) => {
+                release.notified().await;
+                (
+                    vec![(OperationOutcome::IdentityMismatch, None); request.operations.len()],
+                    false,
+                    false,
+                )
+            }
             ApplyAnswer::Reject(code) => {
                 return Err(Status::new(code, "task wire test peer rejection"));
             }
@@ -2552,6 +2561,14 @@ impl Loopback {
     pub(in crate::native) fn fail_abort_owner(&self) {
         self.peer
             .expect_apply(ApplyAnswer::Outcomes(vec![OperationOutcome::OwnerFailed]));
+    }
+
+    pub(in crate::native) fn reject_identity_mismatch_after(
+        &self,
+        release: Arc<tokio::sync::Notify>,
+    ) {
+        self.peer
+            .expect_apply(ApplyAnswer::IdentityMismatchAfter(release));
     }
 
     /// Shut down only the accepted TCP socket of the SAME held Root RPC.

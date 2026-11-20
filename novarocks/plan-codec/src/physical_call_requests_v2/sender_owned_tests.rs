@@ -483,3 +483,178 @@ fn caller_sender_actual_captured_type_and_cv_prefix_refuse_before_pending_flush(
         }
     }
 }
+
+fn with_result_constrained_request(
+    test: impl FnOnce(
+        &FragmentCallRequests,
+        &EncodedTypeTable<'_>,
+        &ConstantPools,
+        CallRequestTypeIds<'_>,
+    ),
+) {
+    let fragment = relation_fixture_with_result_constraint(Some(int()));
+    let requests = fragment.call_requests();
+    let site = *requests.entries().first_key_value().unwrap().0;
+    let roots = [(0, int())];
+    let types =
+        encode_type_table_sources(&roots, &[], types_limits(), &Control::default()).unwrap();
+    test(
+        requests,
+        &types,
+        &ConstantPools::empty(),
+        CallRequestTypeIds {
+            definition: site,
+            arguments: &[],
+            expected_result_type: Some(0),
+        },
+    );
+}
+
+#[test]
+fn sql_dependency_request_host_abort_three_control_causes_at_every_checkpoint_have_no_tail() {
+    use std::convert::Infallible;
+
+    with_result_constrained_request(|requests, types, pools, ids| {
+        let ids = [ids];
+        let control = Control::default();
+        let invoke = || -> Result<wire::FragmentCallRequests, HostError<Infallible>> {
+            let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Encode)?;
+            let mut admit = |_: &CallRequestProjectionFacts| Ok(());
+            let token = prepare_call_requests_encode_with_host_in(
+                requests,
+                types,
+                &ids,
+                pools,
+                SOURCE,
+                limits(),
+                &mut admit,
+                &mut work,
+            )?;
+            let wire = token.emit_with_host_in(&mut admit, &mut work)?;
+            work.finish()?;
+            Ok(wire)
+        };
+
+        control.arm(None);
+        invoke().unwrap();
+        let trace = control.trace();
+        assert!(!trace.is_empty());
+        for at in 0..trace.len() {
+            for cause in CAUSES {
+                control.arm(Some((at, cause.clone())));
+                assert!(matches!(
+                    invoke(),
+                    Err(ProjectionFailure::Codec(Error::Control(actual))) if actual == cause
+                ));
+                assert_eq!(control.trace(), trace[..=at]);
+            }
+        }
+    });
+}
+
+#[test]
+fn sql_dependency_request_host_abort_foreign_controller_preserves_original_text_before_callback() {
+    use std::convert::Infallible;
+
+    with_result_constrained_request(|requests, types, pools, ids| {
+        let ids = [ids];
+        let control = Control::default();
+        let other = Control::default();
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Encode).unwrap();
+        let mut foreign = CompileCheckpoints::try_new(&other, CompilePhase::Encode).unwrap();
+        let plain = prepare_call_requests_encode_in(
+            requests,
+            types,
+            &ids,
+            pools,
+            SOURCE,
+            limits(),
+            &mut |_| Ok(()),
+            &mut work,
+        )
+        .unwrap();
+        let mut called = 0;
+        let plain = plain
+            .emit_in(
+                &mut |_| {
+                    called += 1;
+                    Ok(())
+                },
+                &mut foreign,
+            )
+            .unwrap_err();
+        assert_eq!(called, 0);
+
+        let host = prepare_call_requests_encode_in(
+            requests,
+            types,
+            &ids,
+            pools,
+            SOURCE,
+            limits(),
+            &mut |_| Ok(()),
+            &mut work,
+        )
+        .unwrap();
+        let host = host
+            .emit_with_host_in(
+                &mut |_| -> Result<(), AdmissionRefusal<Infallible>> {
+                    called += 1;
+                    Ok(())
+                },
+                &mut foreign,
+            )
+            .unwrap_err()
+            .without_host();
+        assert_eq!(host.to_string(), plain.to_string());
+        assert_eq!(called, 0);
+    });
+}
+
+#[test]
+fn sql_dependency_request_host_abort_invalid_type_id_keeps_original_codec_error() {
+    use std::convert::Infallible;
+
+    with_result_constrained_request(|requests, types, pools, ids| {
+        // The checked relation came with a declared result constraint. Only
+        // its value-type table ID is stale in the projection input.
+        let invalid = [CallRequestTypeIds {
+            expected_result_type: Some(1),
+            ..ids
+        }];
+        let control = Control::default();
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Encode).unwrap();
+        let plain = prepare_call_requests_encode_in(
+            requests,
+            types,
+            &invalid,
+            pools,
+            SOURCE,
+            limits(),
+            &mut |_| Ok(()),
+            &mut work,
+        )
+        .err()
+        .unwrap();
+
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Encode).unwrap();
+        let host = prepare_call_requests_encode_with_host_in(
+            requests,
+            types,
+            &invalid,
+            pools,
+            SOURCE,
+            limits(),
+            &mut |_| -> Result<(), AdmissionRefusal<Infallible>> { Ok(()) },
+            &mut work,
+        )
+        .err()
+        .unwrap()
+        .without_host();
+        assert_eq!(host.to_string(), plain.to_string());
+        assert_eq!(
+            plain.to_string(),
+            "request supplied value type ID is absent"
+        );
+    });
+}

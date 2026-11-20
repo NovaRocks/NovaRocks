@@ -597,11 +597,17 @@ fn command_update_type(
     admission: novarocks_query_application::session::StatementAdmission,
 ) -> Option<&'static str> {
     use novarocks_query_application::session::StatementOutputShape;
+    use novarocks_query_application::statement_kind::StatementKind;
     match admission.shape {
         StatementOutputShape::Rows | StatementOutputShape::Empty => update_type(admission.kind),
         StatementOutputShape::ResultSet
-            if admission.kind
-                == novarocks_query_application::statement_kind::StatementKind::Optimize =>
+            if matches!(
+                admission.kind,
+                StatementKind::Optimize
+                    | StatementKind::RewriteManifests
+                    | StatementKind::ExpireSnapshots
+                    | StatementKind::RemoveOrphanFiles
+            ) =>
         {
             update_type(admission.kind)
         }

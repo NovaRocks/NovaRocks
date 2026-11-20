@@ -34,7 +34,7 @@ use novarocks_physical_plan::{
     FragmentBuilder, FragmentCuts, FragmentPackage, FragmentPackageAdmission, FragmentPackageInput,
     FragmentSink, FrozenFragmentPruning, NodeId, PipelineDopDomain, PlanLimits, PlanVersionId,
     PropertyProofProjectionLimits, RequiredContracts, ResultField, ResultPort,
-    StagePlacementPolicy,
+    StagePlacementPolicy, ValueId, ValueOrigin, ValueType,
 };
 use novarocks_type_contract::{
     CompileCheckpoints, CompilePhase, PureCompileControl, SemanticParameters,
@@ -139,35 +139,12 @@ pub(super) fn package(
         output: builder.construction_node(root_node).unwrap().output.clone(),
         fields,
     };
-    // Seal any unit authored by the fixture with its real ordered node ports.
-    // These intrinsic-only fragments do not make a function claim.
-    let nodes = builder
-        .construction_nodes()
-        .map(|(&node, _)| node)
-        .filter(|node| builder.construction_unit(*node).is_some())
-        .collect::<Vec<_>>();
-    let mut work = CompileCheckpoints::try_new(&HarnessControl, CompilePhase::Validate).unwrap();
-    for node in nodes {
-        let ports = builder.node_ports(node).unwrap();
-        let unit = builder
-            .take_unit_builder(node)
-            .unwrap()
-            .seal(ports, &mut work)
-            .unwrap()
-            .finish(BTreeMap::new(), &mut work)
-            .unwrap();
-        builder.install_unit(node, Arc::new(unit)).unwrap();
-    }
-    work.finish().unwrap();
+    seal_units(&mut builder);
     let fragment = builder
         .finish_definition(
             root_node,
             FragmentSink::Result,
-            PipelineDopDomain {
-                min: 1,
-                max: 1,
-                requires_power_of_two: false,
-            },
+            DOP,
             StagePlacementPolicy::Singleton,
         )
         .unwrap();
@@ -220,16 +197,86 @@ pub(super) fn install_claims(
     let ports = builder.node_ports(node).unwrap();
     let mut draft = builder.take_unit_builder(node).unwrap();
     register_call_requests(&mut draft, authors, constants);
-    declare_call_controls(&mut draft, authors, &mut work);
+    declare_call_controls(
+        &mut draft,
+        functions,
+        constants,
+        parameters,
+        options().constants,
+        &mut work,
+    );
     let sealed = draft.seal(ports, &mut work).unwrap();
     let unit = finish_unit(
         functions,
         sealed,
         authors,
+        constants,
         parameters,
+        options().constants,
         &mut work,
-        |_, _, effects| effects,
     );
     builder.install_unit(node, Arc::new(unit)).unwrap();
+    work.finish().unwrap();
+}
+
+pub(super) const DOP: PipelineDopDomain = PipelineDopDomain {
+    min: 1,
+    max: 1,
+    requires_power_of_two: false,
+};
+
+pub(super) fn output_value(
+    builder: &mut FragmentBuilder,
+    node: NodeId,
+    ordinal: u32,
+    ty: ValueType,
+) -> ValueId {
+    builder
+        .add_value(
+            ty,
+            ValueOrigin::NodeOutput {
+                node,
+                output_ordinal: ordinal,
+            },
+        )
+        .unwrap()
+}
+
+pub(super) fn empty_values(
+    builder: &mut FragmentBuilder,
+    types: &[ValueType],
+) -> (NodeId, Vec<ValueId>) {
+    let node = builder.reserve_node_id().unwrap();
+    let values: Vec<_> = types
+        .iter()
+        .enumerate()
+        .map(|(ordinal, ty)| output_value(builder, node, ordinal as u32, ty.clone()))
+        .collect();
+    builder
+        .add_values(node, Box::default(), values.clone().into())
+        .unwrap();
+    (node, values)
+}
+
+pub(super) fn seal_units(builder: &mut FragmentBuilder) {
+    // Seal any unit authored by the fixture with its real ordered node ports.
+    // These intrinsic-only fragments do not make a function claim.
+    let nodes = builder
+        .construction_nodes()
+        .map(|(&node, _)| node)
+        .filter(|node| builder.construction_unit(*node).is_some())
+        .collect::<Vec<_>>();
+    let mut work = CompileCheckpoints::try_new(&HarnessControl, CompilePhase::Validate).unwrap();
+    for node in nodes {
+        let ports = builder.node_ports(node).unwrap();
+        let unit = builder
+            .take_unit_builder(node)
+            .unwrap()
+            .seal(ports, &mut work)
+            .unwrap()
+            .finish(BTreeMap::new(), &mut work)
+            .unwrap();
+        builder.install_unit(node, Arc::new(unit)).unwrap();
+    }
     work.finish().unwrap();
 }

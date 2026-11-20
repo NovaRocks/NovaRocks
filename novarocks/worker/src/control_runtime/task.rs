@@ -982,8 +982,8 @@ impl TaskHostRecord {
     /// meaningful only after the same failed scope has closed fresh issuers:
     /// old EnqueuePreparation guards fail their generation check, while any
     /// previously handed-off job is covered by its existing preparation row.
-    /// Loading data and RPC deliveries cannot create a Native execution trait
-    /// projection and are not execution borrowers.
+    /// The checked receiver cleanup in the original RetireBorrowing job
+    /// drains admitted deliveries that still use the installed execution port.
     pub(crate) fn take_failed_retire_borrowing_job(
         &self,
         drained: &super::failure::ScopePublicationsDrained<'_>,

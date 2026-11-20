@@ -502,6 +502,10 @@ mod tests {
         // on a plain non-IMV plan.
         let pipeline = query_rewrite_pipeline();
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
+        ctx.set_function_catalog(crate::functions::test_function_catalog_snapshot());
+        ctx.set_sealed_functions(
+            novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
+        );
         ctx.set_query_stats_input(
             crate::optimizer::stats_input::OptimizerStatsInput::from_test_table_statistics(
                 &std::collections::HashMap::new(),

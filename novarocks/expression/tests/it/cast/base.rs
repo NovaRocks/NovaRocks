@@ -96,20 +96,22 @@ fn truthful_nonnullable_widening_is_preserved_and_complete_package_rejects_false
             }
         }
     }
-    let fixture = cast_fixture(
+    // The call author refuses this declaration before runtime: a non-null Int8
+    // result cannot promise successful NULL for a narrowing Int64 cast.
+    let error = match cast_fixture(
         FunctionValueType::new(DataType::Int64, false),
         FunctionValueType::new(DataType::Int8, false),
         Source::Column,
         Wrap::Bare,
         DecimalOverflowPolicy::ReportError,
         true,
-    );
-    // The original structural package accepts this declaration. The real pure
-    // compiler must reject the missing successful-NULL promise before runtime.
-    let error = fixture.compile(&Control).unwrap_err();
+    ) {
+        Err(error) => error,
+        Ok(_) => panic!("narrowing cast was admitted"),
+    };
     assert!(!matches!(
         error,
-        novarocks_expression::ExprCompileError::Control(_)
+        novarocks_expression::CallAuthorError::Control(_)
     ));
     assert!(error.to_string().contains("successful-NULL"));
 }

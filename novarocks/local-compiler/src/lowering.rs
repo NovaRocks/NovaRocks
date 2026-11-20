@@ -425,13 +425,7 @@ fn lower_with_creation<
     let mut derived_definitions = 0usize;
     let mut channel_count = 0usize;
     for node in physical.nodes().values() {
-        let pieces = if matches!(
-            node.kind,
-            NodeKind::SetOp {
-                kind: novarocks_physical_plan::SetOperationKind::UnionAll,
-                ..
-            }
-        ) {
+        let pieces = if matches!(node.kind, NodeKind::SetOp { .. }) {
             node.inputs
                 .len()
                 .checked_add(1)
@@ -486,13 +480,7 @@ fn lower_with_creation<
                 .checked_add(definitions)
                 .ok_or(CompileControlError::ResourceExhausted)?;
         }
-        if matches!(
-            node.kind,
-            NodeKind::SetOp {
-                kind: novarocks_physical_plan::SetOperationKind::UnionAll,
-                ..
-            }
-        ) {
+        if matches!(node.kind, NodeKind::SetOp { .. }) {
             expanded_nodes = expanded_nodes
                 .checked_add(node.inputs.len())
                 .ok_or(CompileControlError::ResourceExhausted)?;
@@ -587,7 +575,7 @@ fn lower_with_creation<
     order
         .try_reserve_exact(physical.nodes().len())
         .map_err(|_| CompileControlError::ResourceExhausted)?;
-    // Only a join's own build receiver may arrive replicated.
+    // A join may consume one replica of a complete build subtree.
     let replicated_builds = crate::join::replicated_build_inputs(physical, work)?;
     stack.push((physical.root(), false, 1usize));
     while let Some((id, exiting, depth)) = stack.pop() {
@@ -621,9 +609,8 @@ fn lower_with_creation<
         // are placed; its gather-and-Final sequence is a checked plan fact. A
         // family that consumes per-driver key co-location must author its own
         // local partitioning instead of relying on this. Copied rows and
-        // broadcast placement stay refused, except the broadcast receiver a
-        // join consumes as its complete build side.
-        if !replicated_builds.contains(&id)
+        // broadcast placement are allowed only in a complete build subtree.
+        if replicated_builds.get(&id) != Some(&true)
             && (!matches!(
                 node.output_properties.distribution,
                 Distribution::Singleton
@@ -640,13 +627,7 @@ fn lower_with_creation<
             })
             .into());
         }
-        let union = matches!(
-            node.kind,
-            NodeKind::SetOp {
-                kind: novarocks_physical_plan::SetOperationKind::UnionAll,
-                ..
-            }
-        );
+        let set_operation = matches!(node.kind, NodeKind::SetOp { .. });
         let supported = match &node.kind {
             NodeKind::GenerateSeries { .. } => {
                 crate::generate_series::admit(package, node, work)?;
@@ -695,10 +676,7 @@ fn lower_with_creation<
                 crate::window::admit_window(package, node, functions, work)?;
                 true
             }
-            NodeKind::SetOp {
-                kind: novarocks_physical_plan::SetOperationKind::UnionAll,
-                ..
-            } => node.inputs.len() >= 2,
+            NodeKind::SetOp { .. } => node.inputs.len() >= 2,
             // The writer family, under its own admission below.
             NodeKind::TableWriter { .. } => node.inputs.len() == 1,
             NodeKind::TableFinish(spec) => {
@@ -719,7 +697,6 @@ fn lower_with_creation<
                 crate::table_function::admit_table_function(node, functions, work)?;
                 true
             }
-            _ => false,
         };
         if !supported {
             return Err((FragmentCompileError::Unsupported {
@@ -757,9 +734,10 @@ fn lower_with_creation<
         }
         stack.push((id, true, depth));
         for &child in node.inputs.iter().rev() {
-            // A join's selection, a union's normalizer and a table function's
-            // argument Project each add one local node above the child.
-            let derived = union || join || matches!(node.kind, NodeKind::TableFunction { .. });
+            // Join selections, set operation normalizers and table function
+            // argument Projects each add one local node above the child.
+            let derived =
+                set_operation || join || matches!(node.kind, NodeKind::TableFunction { .. });
             stack.push((child, false, depth + if derived { 2 } else { 1 }));
             work.step()?;
         }
@@ -785,15 +763,10 @@ fn lower_with_creation<
     }
     // Expansion conservatively loses distribution knowledge. It still has
     // the exact input placement at every admitted driver width; descendants of this
-    // actual expansion can consume that uncertainty. A runtime-split scan is
-    // an unconstrained source in its own right: its rows land on any instance
-    // and driver, and only its transparent Project/Filter/Limit descendants
-    // and a Partial row-count TopN inherit that placement. The partial keeps
-    // a subset of each instance's rows where they already are; its Final
-    // reads them only through a checked gather. A Partial-grouping aggregate
-    // is such a source too: it merges only the rows each driver already holds,
-    // so its output is placed wherever its input was, and the physical
-    // contract lets only an exchange-fed later phase complete its groups.
+    // actual expansion can consume that uncertainty. A scan with runtime
+    // splits, a single-copy routed receiver and a singleton stage each prove
+    // placement without needing an output partition key. A partial TopN or
+    // partial aggregation works only with the rows the instance already has.
     let mut properties = BTreeMap::<NodeId, (bool, bool, bool)>::new();
     for &id in order.iter().rev() {
         let node = &physical.nodes()[&id];
@@ -838,19 +811,6 @@ fn lower_with_creation<
             NodeKind::NestLoopJoin { .. } if node.inputs.len() == 2 => Some(node.inputs[0]),
             _ => None,
         };
-        // A UnionAll concatenates the rows each driver already holds, so it is
-        // placed wherever all of its inputs are.
-        let union_placed = matches!(
-            node.kind,
-            NodeKind::SetOp {
-                kind: novarocks_physical_plan::SetOperationKind::UnionAll,
-                ..
-            }
-        ) && !node.inputs.is_empty()
-            && node
-                .inputs
-                .iter()
-                .all(|input| properties.get(input).is_some_and(|p| p.2));
         // Projection may drop a checked hash key and therefore publish
         // Unconstrained distribution. Its rows still run in the exact input
         // instances; losing the key does not create a new placement source.
@@ -883,6 +843,21 @@ fn lower_with_creation<
                         ))
             })
         };
+        // A UnionAll preserves the exact instance placement of all of its
+        // inputs, even when their layouts cannot yield one shared key.
+        let union_placed = matches!(
+            node.kind,
+            NodeKind::SetOp {
+                kind: novarocks_physical_plan::SetOperationKind::UnionAll,
+                ..
+            }
+        ) && node.inputs.iter().all(|input| {
+            properties.get(input).is_some_and(|p| p.2)
+                || physical
+                    .nodes()
+                    .get(input)
+                    .is_some_and(|node| has_single_copy_partitioning(&node.output_properties))
+        });
         // Repeat emits its frozen grouping sets on the exact input instances.
         // Its property author may drop partition keys after nullifying them,
         // but that does not create a new placement or ordering source.
@@ -894,12 +869,17 @@ fn lower_with_creation<
         // placement. Keep that placement fact, not a guessed distribution.
         // Network join admissibility was checked by orient_join above.
         let join_placed = probe_input.is_some() && node.inputs.iter().all(checked_input_placement);
-        // The exact inbound cut places each row even when the routing key
-        // was consumed at the exchange and the node has no visible hash key.
-        let routed_exchange =
-            matches!(node.kind, NodeKind::ExchangeSource { .. }) && routing_receivers.contains(&id);
-        let runtime_placed = matches!(node.kind, NodeKind::Scan { .. })
-            || routed_exchange
+        // The cut can place each row exactly once with or without a visible
+        // routing key after the exchange.
+        let exchange_placed = matches!(node.kind, NodeKind::ExchangeSource { .. })
+            && (routing_receivers.contains(&id)
+                || has_single_copy_partitioning(&node.output_properties));
+        let singleton_placed = *physical.stage_placement()
+            == novarocks_physical_plan::StagePlacementPolicy::Singleton
+            && node.output_properties.row_multiplicity == RowMultiplicity::SingleCopy;
+        let placed = singleton_placed
+            || matches!(node.kind, NodeKind::Scan { .. })
+            || exchange_placed
             || projected_placement
             || repeat_placed
             || join_placed
@@ -915,7 +895,7 @@ fn lower_with_creation<
         // descendant could consume.
         let writer_rooted = matches!(node.kind, NodeKind::TableWriter { .. });
         work.step()?;
-        if unknown && !expanded && !changes && !runtime_placed && !writer_rooted {
+        if unknown && !expanded && !changes && !placed && !writer_rooted {
             return Err((FragmentCompileError::Unsupported {
                 node: Some(id),
                 feature: "unconstrained distribution without a runtime-split scan placement",
@@ -950,7 +930,11 @@ fn lower_with_creation<
             })
             .into());
         }
-        let ordered = global || (sorted && (transparent || window));
+        let global_assertion = matches!(
+            node.kind,
+            NodeKind::AssertOneRow(novarocks_physical_plan::RowCountAssertionSpec::Global { .. })
+        );
+        let ordered = global || (sorted && (transparent || window || global_assertion));
         if !(node.output_properties.ordering.is_empty() || ordered) {
             return Err((FragmentCompileError::Unsupported {
                 node: Some(id),
@@ -958,7 +942,7 @@ fn lower_with_creation<
             })
             .into());
         }
-        properties.insert(id, (expanded || changes, ordered, runtime_placed));
+        properties.insert(id, (expanded || changes, ordered, placed));
     }
     work.flush()?;
     let channels_plan =
@@ -1231,28 +1215,25 @@ fn lower_with_creation<
             local_ids.insert(source, id);
             continue;
         }
-        if matches!(
-            node.kind,
-            NodeKind::SetOp {
-                kind: novarocks_physical_plan::SetOperationKind::UnionAll,
-                ..
-            }
-        ) {
-            let branches = channels_plan
-                .unions
-                .get(&source)
-                .ok_or(FragmentCompileError::Invalid("missing UnionAll branches"))?;
+        if matches!(node.kind, NodeKind::SetOp { .. }) {
+            let branches =
+                channels_plan
+                    .unions
+                    .get(&source)
+                    .ok_or(FragmentCompileError::Invalid(
+                        "missing set operation branches",
+                    ))?;
             let branches = &branches[..node.inputs.len()];
             let definitions =
                 expressions
                     .union_ids
                     .get(&source)
                     .ok_or(FragmentCompileError::Invalid(
-                        "missing UnionAll definitions",
+                        "missing set operation definitions",
                     ))?;
             let definitions = &definitions[..node.inputs.len()];
             work.flush()?;
-            let emitted = crate::union::lower_union_with_creation(
+            let emitted = crate::union::lower_set_operation_with_creation(
                 package,
                 node,
                 id,
@@ -1272,10 +1253,12 @@ fn lower_with_creation<
                 let emitted_id = emitted_node
                     .local_id()
                     .ok_or(FragmentCompileError::Invalid(
-                        "missing UnionAll local node identity",
+                        "missing set operation local node identity",
                     ))?;
                 if emitted_id.index() != nodes.len() {
-                    return Err((FragmentCompileError::Invalid("UnionAll schedule differs")).into());
+                    return Err(
+                        (FragmentCompileError::Invalid("set operation schedule differs")).into(),
+                    );
                 }
                 for (ordinal, value) in node.output.columns.iter().enumerate() {
                     work.flush()?;
@@ -2517,13 +2500,24 @@ fn lower_position_shard<H>(
     ))
 }
 
+fn has_single_copy_partitioning(properties: &novarocks_physical_plan::PhysicalProperties) -> bool {
+    properties.row_multiplicity == RowMultiplicity::SingleCopy
+        && matches!(
+            properties.distribution,
+            Distribution::RoundRobin
+                | Distribution::Hash { .. }
+                | Distribution::ConditionalKey { .. }
+                | Distribution::BucketShuffle { .. }
+        )
+}
+
 /// Which node shape has no local owner, so a refusal names it.
 fn unsupported_node_shape(kind: &NodeKind) -> &'static str {
     match kind {
         NodeKind::Filter { .. } => "filter with other than one predicate or input",
         NodeKind::Sort { .. } => "sort with other than one input",
         NodeKind::TopN { .. } => "TopN with other than one input",
-        NodeKind::SetOp { .. } => "INTERSECT or EXCEPT set operation",
+        NodeKind::SetOp { .. } => "set operation with fewer than two inputs",
         NodeKind::GenerateSeries { .. } => "generate_series source",
         NodeKind::PositionShard(_) => "position shard aggregation",
         _ => "node family or occurrence shape",

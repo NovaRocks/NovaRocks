@@ -23,11 +23,9 @@ use novarocks_spi::connector::{
     CatalogHandle, CatalogProperties, CatalogProperty, CatalogVersion, ConnectorBeginScanRequest,
     ConnectorCatalogMutation, ConnectorCatalogMutationReceipt,
     ConnectorCatalogMutationReconcileRequest, ConnectorCatalogMutationRequest,
-    ConnectorCatalogMutationResolver, ConnectorCleanupCandidatePageRequest,
-    ConnectorCleanupExecuteRequest, ConnectorCleanupFinalizeRequest, ConnectorCleanupMaintenance,
-    ConnectorCleanupPlan, ConnectorCleanupPlanningRequest, ConnectorCleanupPrepareRequest,
-    ConnectorControlBinding, ConnectorControlResolver, ConnectorControlRuntimeId,
-    ConnectorDataMutation, ConnectorDataMutationExecuteRequest, ConnectorDataMutationPlan,
+    ConnectorCatalogMutationResolver, ConnectorCleanupMaintenance, ConnectorControlBinding,
+    ConnectorControlResolver, ConnectorControlRuntimeId, ConnectorDataMutation,
+    ConnectorDataMutationExecuteRequest, ConnectorDataMutationPlan,
     ConnectorDataMutationPlanningRequest, ConnectorDataMutationReceipt,
     ConnectorDataMutationReconcileRequest, ConnectorDistributedRewrite,
     ConnectorDistributedRewritePlan, ConnectorDistributedRewritePlanningRequest,
@@ -273,41 +271,6 @@ impl ConnectorCleanupMaintenance for TestCleanupMaintenance {
 
     fn binding_key(&self) -> &ConnectorProviderBindingKey {
         &self.key
-    }
-
-    fn plan_cleanup(
-        &self,
-        _request: ConnectorCleanupPlanningRequest,
-    ) -> Result<ConnectorCleanupPlan, ConnectorError> {
-        Err(unsupported())
-    }
-
-    fn prepare_batch(
-        &self,
-        _request: ConnectorCleanupPrepareRequest,
-    ) -> Result<novarocks_spi::connector::PreparedBatch, ConnectorError> {
-        Err(unsupported())
-    }
-
-    fn execute_batch(
-        &self,
-        _request: ConnectorCleanupExecuteRequest,
-    ) -> Result<novarocks_spi::connector::BatchReceipt, ConnectorError> {
-        Err(unsupported())
-    }
-
-    fn read_candidate_page(
-        &self,
-        _request: ConnectorCleanupCandidatePageRequest,
-    ) -> Result<novarocks_spi::connector::CandidatePage, ConnectorError> {
-        Err(unsupported())
-    }
-
-    fn finalize_terminal(
-        &self,
-        _request: ConnectorCleanupFinalizeRequest,
-    ) -> Result<(), ConnectorError> {
-        Err(unsupported())
     }
 }
 

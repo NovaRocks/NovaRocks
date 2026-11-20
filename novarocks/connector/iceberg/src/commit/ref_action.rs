@@ -387,38 +387,6 @@ impl RefActionPlan {
             requirements,
         })
     }
-
-    /// A stale cleanup candidate grants no destructive request.
-    pub(crate) fn prepare_exact_drop(
-        loaded: &crate::iceberg::table::Table,
-        expected_table_uuid: &str,
-        name: &str,
-        expected_head_snapshot_id: i64,
-    ) -> Option<crate::commit::staging::PreparedChange> {
-        let metadata = loaded.metadata();
-        let reference = metadata.refs().get(name)?;
-        if metadata.uuid().to_string() != expected_table_uuid
-            || !reference.is_branch()
-            || reference.snapshot_id != expected_head_snapshot_id
-            || metadata.snapshot_by_id(expected_head_snapshot_id).is_none()
-        {
-            return None;
-        }
-        Some(crate::commit::staging::PreparedChange {
-            requirements: vec![
-                TableRequirement::UuidMatch {
-                    uuid: metadata.uuid(),
-                },
-                TableRequirement::RefSnapshotIdMatch {
-                    r#ref: name.to_owned(),
-                    snapshot_id: Some(expected_head_snapshot_id),
-                },
-            ],
-            updates: vec![TableUpdate::RemoveSnapshotRef {
-                ref_name: name.to_owned(),
-            }],
-        })
-    }
 }
 
 #[cfg(test)]
@@ -687,48 +655,6 @@ mod tests {
             assert_eq!(ref_name, "release");
             assert_eq!(reference.snapshot_id, 11);
             assert_eq!(reference.retention, retention);
-        }
-    }
-    #[tokio::test]
-    async fn exact_branch_drop_commit_pins_table_incarnation_and_branch_head() {
-        let loaded = table(
-            metadata()
-                .into_builder(None)
-                .set_ref(
-                    "owned",
-                    SnapshotReference::new(7, SnapshotRetention::branch(None, None, None)),
-                )
-                .unwrap()
-                .build()
-                .unwrap()
-                .metadata,
-        );
-        let uuid = Uuid::from_u128(7).to_string();
-        let change = RefActionPlan::prepare_exact_drop(&loaded, &uuid, "owned", 7).unwrap();
-        assert_eq!(
-            change.requirements,
-            vec![
-                TableRequirement::UuidMatch {
-                    uuid: Uuid::from_u128(7)
-                },
-                TableRequirement::RefSnapshotIdMatch {
-                    r#ref: "owned".into(),
-                    snapshot_id: Some(7)
-                }
-            ]
-        );
-        assert_eq!(
-            change.updates,
-            vec![TableUpdate::RemoveSnapshotRef {
-                ref_name: "owned".into()
-            }]
-        );
-        for (uuid, name, head) in [
-            (Uuid::from_u128(8).to_string(), "owned", 7),
-            (uuid.clone(), "owned", 11),
-            (uuid, "missing", 7),
-        ] {
-            assert!(RefActionPlan::prepare_exact_drop(&loaded, &uuid, name, head).is_none());
         }
     }
 }

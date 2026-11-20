@@ -112,16 +112,6 @@
       "expires": "2026-12-15"
     },
     {
-      "unit": "sql-case:aggregate/agg_test_serialize_key_agg",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Missing local lowering: unconstrained distribution without a runtime-split scan placement; owner B4, I5; remove after capability repair and native verification",
-      "owner": "B4, I5",
-      "expires": "2026-12-15"
-    },
-    {
       "unit": "sql-case:aggregate/agg_test_sum_map",
       "failure": {
         "class": "error_code",
@@ -617,8 +607,8 @@
         "class": "error_code",
         "code": "UnsupportedCompiledShape"
       },
-      "reason": "Missing local lowering: unconstrained distribution without a runtime-split scan placement; owner B4, I5; remove after capability repair and native verification",
-      "owner": "B4, I5",
+      "reason": "B4a restores statement 10 and the original plain verification reaches statement 16. The native query and an isolated CONTRACT EXPLAIN both return UnsupportedCompiledShape before rendering. An independent typed replay of statement 16 with the original employees schema, row count and NULL facts reproduces SQL StructuralWaitCycle (domain 11, reason 14) for the shared const_cte output. Its no-statistics control admits a multicast plan, so retain the native public refusal and use the typed replay for the B4c handoff. Statement 16's original result oracle remains unexecuted. Evidence: p07-plain/cte.jsonl, p07-cte-contract and p07-cte-typed/result-explain-rows-25.log. Remove only after the complete original native 1FE+3BE case and cleanup pass.",
+      "owner": "UEA-5E B4c",
       "expires": "2026-12-15"
     },
     {
@@ -829,16 +819,6 @@
       },
       "reason": "Missing installed pure implementation for builtin.scalar/map/dynamic-v1; owner B7, B8, I1, I5; remove after capability repair and native verification",
       "owner": "B7, B8, I1, I5",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:iceberg/iceberg_v3_branch_row_lineage",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Missing local lowering: INTERSECT or EXCEPT set operation; owner B4; remove after capability repair and native verification",
-      "owner": "B4",
       "expires": "2026-12-15"
     },
     {
@@ -1622,136 +1602,6 @@
       "expires": "2026-12-15"
     },
     {
-      "unit": "sql-case:set-op/set_chain_ops",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Missing local lowering: INTERSECT or EXCEPT set operation; owner B4, I5; remove after capability repair and native verification",
-      "owner": "B4, I5",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:set-op/set_except_basic",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Missing local lowering: INTERSECT or EXCEPT set operation; owner B4, I5; remove after capability repair and native verification",
-      "owner": "B4, I5",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:set-op/set_except_multi_stage_null",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Missing local lowering: INTERSECT or EXCEPT set operation; owner B4, I5; remove after capability repair and native verification",
-      "owner": "B4, I5",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:set-op/set_except_three_stage_null_duplicates",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Missing local lowering: INTERSECT or EXCEPT set operation; owner B4, I5; remove after capability repair and native verification",
-      "owner": "B4, I5",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:set-op/set_except_varchar_cast",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Missing local lowering: INTERSECT or EXCEPT set operation; owner B4, I5; remove after capability repair and native verification",
-      "owner": "B4, I5",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:set-op/set_except_with_null",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Missing local lowering: INTERSECT or EXCEPT set operation; owner B4, I5; remove after capability repair and native verification",
-      "owner": "B4, I5",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:set-op/set_intersect_basic",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Missing local lowering: INTERSECT or EXCEPT set operation; owner B4, I5; remove after capability repair and native verification",
-      "owner": "B4, I5",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:set-op/set_intersect_multi_column_null",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Missing local lowering: INTERSECT or EXCEPT set operation; owner B4, I5; remove after capability repair and native verification",
-      "owner": "B4, I5",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:set-op/set_intersect_three_way_null_duplicates",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Missing local lowering: INTERSECT or EXCEPT set operation; owner B4, I5; remove after capability repair and native verification",
-      "owner": "B4, I5",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:set-op/set_intersect_with_null",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Missing local lowering: INTERSECT or EXCEPT set operation; owner B4, I5; remove after capability repair and native verification",
-      "owner": "B4, I5",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:set-op/set_union_distinct_dedup",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Missing local lowering: unconstrained distribution without a runtime-split scan placement; owner B4, I5; remove after capability repair and native verification",
-      "owner": "B4, I5",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:set-op/set_union_distinct_with_null",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Missing local lowering: unconstrained distribution without a runtime-split scan placement; owner B4, I5; remove after capability repair and native verification",
-      "owner": "B4, I5",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:set-op/set_union_mixed_all_distinct_chain",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Missing local lowering: unconstrained distribution without a runtime-split scan placement; owner B4, I5; remove after capability repair and native verification",
-      "owner": "B4, I5",
-      "expires": "2026-12-15"
-    },
-    {
       "unit": "sql-case:sort/ranking_window_topn_correctness",
       "failure": {
         "class": "error_code",
@@ -2104,11 +1954,12 @@
     {
       "unit": "sql-case:iceberg/iceberg_v3_optimize_row_lineage",
       "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
+        "class": "mismatch",
+        "statement": 7,
+        "actual_digest": "3da8eb2fb2d449a97685dcbf06d905139c83771e2ec7f231542b8b0e4d6b0d50"
       },
-      "reason": "Statement 10 EXCEPT reaches LocalCompiler's unsupported SetOp path (INTERSECT or EXCEPT set operation), projected as UnsupportedCompiledShape; the earlier OPTIMIZE and reached row checks passed. Current clean 2b51 statement/code match the retained separate typed BE diagnostic and unchanged lowering author. B6a restored metadata work-unit reads; the unexecuted suffix remains unverified. Exit: B4 restores this exact EXCEPT capability and the unchanged entire native case and cleanup pass. Evidence: workflow/handoffs/2026-10-21-uea-5e-b6a/closeout-20261022/p09-reconciliation.md.",
-      "owner": "UEA-5E B4",
+      "reason": "Statement 7 ALTER TABLE olineage EXECUTE optimize returns data/delete/added counts 4/2/1 against typed 3/1/1 at the clean 90a81eec8 baseline and after B4a. RWM-7 changed the preceding partial UPDATE from COW to MOR, retaining the original data file and adding a data file and a deletion vector. The prior COW golden remains in force. The original plain verify suffix is unexecuted after statement 7. Independent native B4a conversion proves equivalence of both original EXCEPT results at statements 10 and 11, and the isolated 4/2/1 diagnostic passes the remaining row and lineage oracles. Evidence: p00-iceberg-optimize-recheck, p07-exact/optimize-diagnostic and p07-plain/iceberg.jsonl. Remove after the Iceberg fixture owner verifies the complete native case with its exact rewrite and lineage checks.",
+      "owner": "RWM-7 Iceberg UPDATE and OPTIMIZE fixture",
       "expires": "2026-12-15"
     },
     {
@@ -2248,9 +2099,9 @@
     },
     {
       "unit": "sql-case:decimal/decimal_error_policy_contract",
-      "reason": "D0-6: step24 sha256=27f41a5a8bd8f7e42ab6cbadb7de027f05eb0cd5b40cbe84f8db7df9d72d813c expects query.execution.numeric_out_of_range (1690/22003, Execution), but first native failure is UnsupportedCompiledShape (1105/HY000); P00 exact same statement names unconstrained distribution without a runtime-split scan placement, still explicitly refused by the current unchanged LocalCompiler guard. The independent expected_error oracle is FAIL, so known_failure is ineligible. No error-priority, SQL, oracle or deadline change. Re-observed on clean fffbffe8 step24, identical statement hash; original numeric expected-error oracle FAIL retained.",
-      "owner": "B4 set-operation/CTE/topology capability",
-      "exit_condition": "B4 restores the missing UNION/topology placement capability; decimal/decimal_error_policy_contract then passes its original exact query.execution.numeric_out_of_range negative oracle at step 24 and every remaining required oracle; remove this quarantine after native verification.",
+      "reason": "D0-6: B4a restores execution of the original mixed UNION ALL at statement 24. The scan branch SET_VAR is a block comment under TRC-5e and the original statement succeeds, so its required query.execution.numeric_out_of_range Execution oracle fails. An isolated root WITH SESSION sql_mode = ERROR_IF_OVERFLOW control passes that oracle while preserving the constant and scan branches. The original plain verify suffix is unexecuted. Separate diagnostic recordings show a different cast error at statement 27, a generic nested Decimal cast refusal at 28, and unsupported array cast source execution at 29 and 30 with result comparisons unexecuted. Evidence: p07-plain/decimal.jsonl and p07-cte-decimal-diagnostic/decimal/results.jsonl. Preserve the original SQL and all its oracles.",
+      "owner": "TRC-5e SQL migration and Decimal cast owners",
+      "exit_condition": "Restore the strict scan branch overflow requirement in supported Trino query syntax and satisfy the original exact numeric_out_of_range Execution oracle at statement 24. Restore the original promoted FLOAT-to-Decimal and nested Decimal cast oracles and verify every remaining required oracle and cleanup in the complete native 1FE+3BE case before removal.",
       "review_by": "2026-12-15"
     },
     {

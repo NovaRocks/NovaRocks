@@ -77,8 +77,8 @@ pub(super) fn admit_scalar_unit_sources_observed<'source>(
     Ok(())
 }
 
-/// Consume one actual draft through the original controls, SDK seal, scopes,
-/// fresh effects and claim-consuming finish. No Node or relation is invented.
+/// Consume one actual draft through the expression-layer call author.
+/// SQL still pairs each call with its source journal and statement policy.
 /// Ports are authored at their original point after definition controls; this
 /// closure supplies declarations only, never capacity or source credentials.
 pub(super) fn finish_scalar_unit_observed(
@@ -89,11 +89,11 @@ pub(super) fn finish_scalar_unit_observed(
     parameters: &SemanticParameters,
     journal: &SqlLogicalSourceJournal,
     functions: &Arc<dyn crate::compiler::SqlFunctionCatalog>,
+    sealed_functions: &novarocks_functions::PureEngineFunctionCatalog,
     policy: novarocks_constant_contract::ConstantPolicy,
-    control: &dyn PureCompileControl,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<AuthoredScalarUnit, ContractLoweringError> {
-    let controls = {
+    {
         let source = SqlUnitSourceLoan {
             site: site.clone(),
             definitions: super::super::unit_source::UnitDefinitions::from_builder(
@@ -105,11 +105,36 @@ pub(super) fn finish_scalar_unit_observed(
             journal,
             functions,
         };
-        super::super::expression_occurrences::author_original_unit_controls_observed(&source, work)
-            .map_err(PackageSemanticsError::from)?
+        for ordinal in 0..draft.len() {
+            let id = novarocks_expression_contract::ExprId::new(
+                u32::try_from(ordinal).map_err(|_| CompileControlError::ResourceExhausted)?,
+            );
+            let Some(definition) = draft.definition(id) else {
+                return Err(PackageSemanticsError::InvalidSource(
+                    "scalar draft is missing a definition",
+                )
+                .into());
+            };
+            work.step()?;
+            if !matches!(definition.kind, ContractExprKind::FunctionCall { .. }) {
+                continue;
+            }
+            source.checked_expression_source_observed(definition, work)?;
+        }
+    }
+    let empty_decimal = BTreeMap::new();
+    let control_inputs = novarocks_expression::CallAuthorInputs {
+        environment: novarocks_expression::EvaluationEnvironment {
+            constants,
+            parameters,
+        },
+        constant_policy: policy,
+        functions: sealed_functions,
+        decimal_overflow: &empty_decimal,
     };
-    for (definition, control) in controls {
-        draft.definition_control(definition, control)?;
+    let controls = novarocks_expression::author_call_controls(&draft, &control_inputs, work);
+    for (definition, shape) in controls.map_err(package_author_error)? {
+        draft.definition_control(definition, shape)?;
         work.step()?;
     }
     let ports = ports()?;
@@ -122,7 +147,7 @@ pub(super) fn finish_scalar_unit_observed(
         journal,
         functions,
     };
-    let mut scopes = BTreeMap::new();
+    let mut decimal = BTreeMap::new();
     for (&id, invocation) in sealed.uses() {
         let definition = sealed.definition(invocation.definition).ok_or(
             PackageSemanticsError::InvalidSource("sealed unit invocation has no actual definition"),
@@ -147,38 +172,66 @@ pub(super) fn finish_scalar_unit_observed(
             .into());
         }
         work.flush()?;
-        scopes.insert(
-            id,
-            super::super::physical_expression_effects::PhysicalCallSourceScope {
-                source: definition,
-                decimal_overflow_policy: entry.captured().binding().decimal_overflow_policy(),
-                environment: &[],
-                proof_scope: novarocks_type_contract::CallProofScope::Region(
-                    invocation.context.region,
-                ),
-            },
+        decimal.insert(
+            invocation.definition,
+            entry.captured().binding().decimal_overflow_policy(),
         );
         work.step()?;
     }
-    let authored =
-        super::super::physical_expression_effects::author_sql_expression_effects_observed(
-            &source,
-            super::super::physical_expression_effects::PhysicalExpressionEffectsInput {
-                owner: site.owner(),
-                unit: &sealed,
-                constants,
-                parameters,
-                literal_policy: policy,
-                call_scopes: &scopes,
-            },
-            control,
-        )
-        .map_err(PackageSemanticsError::from)?;
-    let unit = Arc::new(sealed.finish(authored.calls, work)?);
+    let effect_inputs = novarocks_expression::CallAuthorInputs {
+        environment: novarocks_expression::EvaluationEnvironment {
+            constants,
+            parameters,
+        },
+        constant_policy: policy,
+        functions: sealed_functions,
+        decimal_overflow: &decimal,
+    };
+    let authored = novarocks_expression::author_unit_calls(&sealed, &effect_inputs, work);
+    let authored = authored.map_err(package_author_error)?;
+    let unit = Arc::new(sealed.finish(authored.claims, work)?);
     Ok(AuthoredScalarUnit {
         unit,
         summaries: authored.summaries,
     })
+}
+
+pub(in crate::planner::distributed::build) fn package_author_error(
+    error: novarocks_expression::CallAuthorError,
+) -> PackageSemanticsError {
+    use novarocks_expression::{CallAuthorError, CapabilityRefusal, InvariantRefusal};
+    match error {
+        CallAuthorError::Control(cause) => PackageSemanticsError::Control(cause),
+        CallAuthorError::Capability(CapabilityRefusal::ConstantLimit(cause)) => {
+            PackageSemanticsError::ConstantSource(cause)
+        }
+        CallAuthorError::Capability(CapabilityRefusal::Occurrence(detail)) => {
+            PackageSemanticsError::Occurrence(detail)
+        }
+        CallAuthorError::Capability(CapabilityRefusal::Effects(detail)) => {
+            PackageSemanticsError::Effects(detail)
+        }
+        CallAuthorError::Capability(CapabilityRefusal::Unsupported(detail)) => {
+            PackageSemanticsError::UnsupportedCapability(detail)
+        }
+        CallAuthorError::Capability(CapabilityRefusal::Primitive { source, cast }) => {
+            PackageSemanticsError::PrimitiveSource { source, cast }
+        }
+        CallAuthorError::Invariant(InvariantRefusal::ConstantPolicy) => {
+            PackageSemanticsError::Effects(
+                "InvalidSource(\"SQL expression occurrence changes its original captured policy\")"
+                    .into(),
+            )
+        }
+        CallAuthorError::Invariant(InvariantRefusal::MissingOverflow(definition)) => {
+            PackageSemanticsError::Effects(format!(
+                "call definition {definition:?} has no decimal overflow policy"
+            ))
+        }
+        CallAuthorError::Invariant(InvariantRefusal::Source(detail)) => {
+            PackageSemanticsError::InvalidSource(detail)
+        }
+    }
 }
 
 impl ContractLoweringVisitor<'_> {
@@ -347,8 +400,8 @@ impl ContractLoweringVisitor<'_> {
                 parameters,
                 &self.call_sources,
                 &self.functions,
+                self.sealed_functions.as_ref(),
                 self.constant_policy,
-                self.control,
                 &mut self.work,
             )?;
             let unit = authored.unit;

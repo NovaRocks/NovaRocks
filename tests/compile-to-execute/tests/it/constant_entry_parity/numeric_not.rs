@@ -15,89 +15,65 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::{Control, Expected, Family, Fixture, FoldOutcome, boolean};
 use arrow::array::{Array, ArrayRef, BooleanArray, Float64Array, Int64Array};
-use arrow::datatypes::DataType;
-use novarocks_expression::constant_node::*;
 use novarocks_expression::testkit::PassThroughCallHost;
 use novarocks_expression::{CompiledExpressionInstance, EvaluationInput};
-use novarocks_functions::{
-    ConstantPolicy, ConstantValue, FunctionValueType, KernelEvaluationControl, KernelFailure,
-    ScalarInvocationActivation, ScalarInvocationScope,
-};
-use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
+use novarocks_functions::{ScalarInvocationActivation, ScalarInvocationScope};
 use std::sync::Arc;
-
-struct Control;
-impl PureCompileControl for Control {
-    fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
-        Ok(())
-    }
-}
-impl KernelEvaluationControl for Control {
-    fn checkpoint(&self, _: u32) -> Result<(), KernelFailure> {
-        Ok(())
-    }
-    fn wait(&self, _: std::time::Duration) -> Result<(), KernelFailure> {
-        panic!("numeric NOT cannot wait")
-    }
-}
-fn policy() -> ConstantPolicy {
-    ConstantPolicy {
-        max_rows: 16,
-        max_array_nodes: 128,
-        max_logical_elements: 1024,
-        max_retained_buffer_bytes: 1 << 20,
-        max_type_depth: 64,
-        max_type_nodes: 4096,
-        max_dictionary_depth: 64,
-        max_metadata_bytes: 1 << 20,
-        max_library_validation_work: 1 << 20,
-        max_library_validation_bytes: 1 << 20,
-    }
-}
-fn constant(array: ArrayRef) -> ConstantValue {
-    let ty = FunctionValueType::new(array.data_type().clone(), array.null_count() != 0);
-    ConstantValue::from_scalar_array(
-        Arc::new(ty.try_to_field("literal").unwrap()),
-        ty,
-        array.to_data(),
-        policy(),
-        CompilePhase::FunctionSpecialization,
-        &Control,
-    )
-    .unwrap()
-}
-fn array(outcome: ConstantNodeOutcome) -> ArrayRef {
-    match outcome {
-        ConstantNodeOutcome::Value(value) => value,
-        other => panic!("expected a value: {other:?}"),
-    }
-}
 
 #[test]
 fn numeric_not_actual_sql_program_and_constant_entry_keep_the_same_sparse_values() {
     use novarocks_sql_testkit::sql_source;
     use novarocks_test_compile_to_execute::programs::{batch, programs_with_catalogue};
     let functions = novarocks_functions::testkit::installed_builtin_owner_catalogue();
-    let inputs: Vec<ArrayRef> = vec![
-        Arc::new(arrow::array::Int8Array::from(vec![0, 1, -1, 0])),
-        Arc::new(arrow::array::Int16Array::from(vec![0, 1, -1, 0])),
-        Arc::new(arrow::array::Int32Array::from(vec![0, 1, -1, 0])),
-        Arc::new(Int64Array::from(vec![0, 1, -1, 0])),
-        Arc::new(arrow::array::Float32Array::from(vec![
-            0.0,
-            1.0,
-            f32::NAN,
-            -0.0,
-        ])),
-        Arc::new(Float64Array::from(vec![0.0, 1.0, f64::NAN, -0.0])),
-        Arc::new(
-            arrow::array::Decimal128Array::from(vec![0, 1, -1, 0])
-                .with_precision_and_scale(18, 4)
-                .unwrap(),
+    let inputs: Vec<(&str, [&str; 4], ArrayRef)> = vec![
+        (
+            "TINYINT",
+            ["0", "1", "0-1", "0"],
+            Arc::new(arrow::array::Int8Array::from(vec![0, 1, -1, 0])),
+        ),
+        (
+            "SMALLINT",
+            ["0", "1", "0-1", "0"],
+            Arc::new(arrow::array::Int16Array::from(vec![0, 1, -1, 0])),
+        ),
+        (
+            "INT",
+            ["0", "1", "0-1", "0"],
+            Arc::new(arrow::array::Int32Array::from(vec![0, 1, -1, 0])),
+        ),
+        (
+            "BIGINT",
+            ["0", "1", "0-1", "0"],
+            Arc::new(Int64Array::from(vec![0, 1, -1, 0])),
+        ),
+        (
+            "FLOAT",
+            ["0e0", "1e0", "'NaN'", "'-0'"],
+            Arc::new(arrow::array::Float32Array::from(vec![
+                0.0,
+                1.0,
+                f32::NAN,
+                -0.0,
+            ])),
+        ),
+        (
+            "DOUBLE",
+            ["0e0", "1e0", "'NaN'", "'-0'"],
+            Arc::new(Float64Array::from(vec![0.0, 1.0, f64::NAN, -0.0])),
+        ),
+        (
+            "DECIMAL(18,4)",
+            ["'0'", "'0.0001'", "'-0.0001'", "'0'"],
+            Arc::new(
+                arrow::array::Decimal128Array::from(vec![0, 1, -1, 0])
+                    .with_precision_and_scale(18, 4)
+                    .unwrap(),
+            ),
         ),
     ];
-    for input in inputs {
+    for (sql_type, literals, input) in inputs {
         let source = sql_source(
             "SELECT NOT k AS inverted FROM fixture.source",
             input.data_type().clone(),
@@ -172,24 +148,15 @@ fn numeric_not_actual_sql_program_and_constant_entry_keep_the_same_sparse_values
             sparse.values().to_data(),
             BooleanArray::from(vec![true, false]).to_data()
         );
-        for (row, expected) in [true, false, false, true].into_iter().enumerate() {
-            let output = array(
-                evaluate_constant_node(
-                    ConstantNode::Not,
-                    &[constant(input.slice(row, 1))],
-                    &FunctionValueType::new(DataType::Boolean, false),
-                    &Control,
-                    CompilePhase::FunctionSpecialization,
-                )
-                .unwrap(),
-            );
-            assert_eq!(
-                output
-                    .as_any()
-                    .downcast_ref::<BooleanArray>()
-                    .unwrap()
-                    .value(0),
-                expected
+        for (literal, expected) in literals.into_iter().zip([true, false, false, true]) {
+            let expression = format!("NOT CAST({literal} AS {sql_type})");
+            // The text parser yields NULL for a NaN spelling in the frozen
+            // mode. The typed column above supplies IEEE NaN to numeric NOT.
+            let expected = (literal != "'NaN'").then_some(expected);
+            Fixture::compile(&expression, Family::Not, "32", &functions).assert_both(
+                &functions,
+                FoldOutcome::Folded,
+                Expected::Value(boolean(expected)),
             );
         }
     }

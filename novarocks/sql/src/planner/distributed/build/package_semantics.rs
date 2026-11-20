@@ -23,8 +23,6 @@ use std::fmt;
 
 use super::expression_occurrences::ExpressionOccurrenceError;
 use super::lowered_draft::SqlSourceJournalError;
-#[cfg(test)]
-use super::physical_expression_effects::PhysicalExpressionEffectsError;
 use super::physical_fragment_effects::PhysicalFragmentEffectsError;
 use novarocks_physical_plan::{FrozenPruningError, PhysicalCallSite};
 use novarocks_type_contract::CompileControlError;
@@ -158,20 +156,10 @@ fn constant_limit_from_effects(
     error: PhysicalFragmentEffectsError,
 ) -> Result<novarocks_functions::ConstantError, PhysicalFragmentEffectsError> {
     use super::physical_aggregate_requests::PhysicalAggregateRequestError as A;
-    use super::physical_expression_effects::PhysicalExpressionEffectsError as E;
-    use super::physical_scalar_requests::PhysicalScalarRequestError as S;
     use super::physical_table_requests::PhysicalTableRequestError as T;
     use super::physical_window_requests::PhysicalWindowRequestError as W;
     use super::physical_writer_requests::PhysicalWriterRequestError as R;
     match error {
-        PhysicalFragmentEffectsError::Expressions(E::Argument(argument)) => argument
-            .into_constant_limit()
-            .map_err(|argument| PhysicalFragmentEffectsError::Expressions(E::Argument(argument))),
-        PhysicalFragmentEffectsError::Expressions(E::Request(S::Argument(argument))) => {
-            argument.into_constant_limit().map_err(|argument| {
-                PhysicalFragmentEffectsError::Expressions(E::Request(S::Argument(argument)))
-            })
-        }
         PhysicalFragmentEffectsError::WindowRequest(W::Argument(argument)) => argument
             .into_constant_limit()
             .map_err(|argument| PhysicalFragmentEffectsError::WindowRequest(W::Argument(argument))),
@@ -192,55 +180,14 @@ fn constant_limit_from_effects(
     }
 }
 
-impl From<super::physical_expression_effects::PhysicalExpressionEffectsError>
-    for PackageSemanticsError
-{
-    fn from(error: super::physical_expression_effects::PhysicalExpressionEffectsError) -> Self {
-        Self::from(PhysicalFragmentEffectsError::Expressions(error))
-    }
-}
 impl From<PhysicalFragmentEffectsError> for PackageSemanticsError {
     fn from(error: PhysicalFragmentEffectsError) -> Self {
-        use super::physical_expression_effects::PhysicalExpressionEffectsError as E;
-        use novarocks_failure_contract::SharedFailureCause;
-        use novarocks_functions::{
-            ArithmeticPrepareError as A, CastPrepareError as C, ComparisonPrepareError as B,
-            KernelFailure,
-        };
         let error = match constant_limit_from_effects(error) {
             Ok(cause) => return Self::ConstantSource(cause),
             Err(error) => error,
         };
         match error {
-            PhysicalFragmentEffectsError::Control(cause)
-            | PhysicalFragmentEffectsError::Expressions(
-                E::Control(cause)
-                | E::Cast(C::Control(cause) | C::Kernel(KernelFailure::CompileControl(cause)))
-                | E::Arithmetic(A::Control(cause) | A::Kernel(KernelFailure::CompileControl(cause)))
-                | E::Comparison(B::Control(cause) | B::Kernel(KernelFailure::CompileControl(cause))),
-            ) => Self::Control(cause),
-            PhysicalFragmentEffectsError::Expressions(E::UnsupportedCast { source, from, to }) => {
-                Self::PrimitiveSource {
-                    source: SharedFailureCause::new(source),
-                    cast: Some((from, to)),
-                }
-            }
-            PhysicalFragmentEffectsError::Expressions(E::Cast(source)) => Self::PrimitiveSource {
-                source: SharedFailureCause::new(source),
-                cast: None,
-            },
-            PhysicalFragmentEffectsError::Expressions(E::Arithmetic(source)) => {
-                Self::PrimitiveSource {
-                    source: SharedFailureCause::new(source),
-                    cast: None,
-                }
-            }
-            PhysicalFragmentEffectsError::Expressions(E::Comparison(source)) => {
-                Self::PrimitiveSource {
-                    source: SharedFailureCause::new(source),
-                    cast: None,
-                }
-            }
+            PhysicalFragmentEffectsError::Control(cause) => Self::Control(cause),
             other => Self::Effects(format!("{other:?}")),
         }
     }
@@ -264,6 +211,7 @@ impl From<FrozenPruningError> for PackageSemanticsError {
 
 #[cfg(test)]
 mod capability_projection_tests {
+    use super::super::contract_lowering::package_author_error as author_error;
     use super::*;
     use arrow::datatypes::{DataType, Field};
     use novarocks_failure_contract::{FailureClass, FailureProjection};
@@ -276,11 +224,13 @@ mod capability_projection_tests {
     fn assert_primitive_source<E>(original: E)
     where
         E: std::error::Error + FailureProjection + Clone + PartialEq + Send + Sync + 'static,
-        PhysicalExpressionEffectsError: From<E>,
     {
         let expected = original.failure_fact();
-        let error = PackageSemanticsError::from(PhysicalFragmentEffectsError::from(
-            PhysicalExpressionEffectsError::from(original.clone()),
+        let error = author_error(novarocks_expression::CallAuthorError::Capability(
+            novarocks_expression::CapabilityRefusal::Primitive {
+                source: novarocks_failure_contract::SharedFailureCause::new(original.clone()),
+                cast: None,
+            },
         ));
         assert_eq!(error.failure_fact(), expected);
         assert!(std::error::Error::source(&error).is_some());
@@ -296,11 +246,10 @@ mod capability_projection_tests {
     fn package_semantics_keeps_exact_cast_refusals_separate_from_invalid_programs() {
         let from = DataType::List(Arc::new(Field::new("item", DataType::Int8, true)));
         let to = DataType::List(Arc::new(Field::new("item", DataType::Int64, true)));
-        let error = PackageSemanticsError::from(PhysicalFragmentEffectsError::Expressions(
-            PhysicalExpressionEffectsError::UnsupportedCast {
-                source: C::Unsupported,
-                from: from.clone(),
-                to: to.clone(),
+        let error = author_error(novarocks_expression::CallAuthorError::Capability(
+            novarocks_expression::CapabilityRefusal::Primitive {
+                source: novarocks_failure_contract::SharedFailureCause::new(C::Unsupported),
+                cast: Some((from.clone(), to.clone())),
             },
         ));
         assert_eq!(error.failure_fact(), C::Unsupported.failure_fact());
@@ -310,8 +259,8 @@ mod capability_projection_tests {
         assert_eq!(cast, Some((from, to)));
         assert_eq!(source.downcast_ref::<C>(), Some(&C::Unsupported));
         assert_primitive_source(C::TypeMismatch);
-        let error = PackageSemanticsError::from(PhysicalFragmentEffectsError::Expressions(
-            PhysicalExpressionEffectsError::InvalidSource("UnsupportedCast diagnostic"),
+        let error = author_error(novarocks_expression::CallAuthorError::Invariant(
+            novarocks_expression::InvariantRefusal::Source("UnsupportedCast diagnostic"),
         ));
         assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
     }
@@ -443,33 +392,11 @@ mod capability_projection_tests {
                 PackageSemanticsError::from(PhysicalFragmentEffectsError::Control(cause.clone()));
             assert_eq!(direct.failure_fact(), expected);
             assert!(matches!(direct, PackageSemanticsError::Control(actual) if actual == cause));
-            for error in [
-                PhysicalExpressionEffectsError::Cast(C::Control(cause.clone())),
-                PhysicalExpressionEffectsError::Arithmetic(A::Control(cause.clone())),
-                PhysicalExpressionEffectsError::Comparison(B::Control(cause.clone())),
-                PhysicalExpressionEffectsError::Cast(C::Kernel(KernelFailure::CompileControl(
-                    cause.clone(),
-                ))),
-                PhysicalExpressionEffectsError::Arithmetic(A::Kernel(
-                    KernelFailure::CompileControl(cause.clone()),
-                )),
-                PhysicalExpressionEffectsError::Comparison(B::Kernel(
-                    KernelFailure::CompileControl(cause.clone()),
-                )),
-                PhysicalExpressionEffectsError::from(C::Kernel(KernelFailure::CompileControl(
-                    cause.clone(),
-                ))),
-                PhysicalExpressionEffectsError::from(A::Kernel(KernelFailure::CompileControl(
-                    cause.clone(),
-                ))),
-                PhysicalExpressionEffectsError::from(B::Kernel(KernelFailure::CompileControl(
-                    cause.clone(),
-                ))),
-            ] {
-                let error = PackageSemanticsError::from(PhysicalFragmentEffectsError::from(error));
-                assert_eq!(error.failure_fact(), expected);
-                assert!(matches!(error, PackageSemanticsError::Control(actual) if actual == cause));
-            }
+            let authored = author_error(novarocks_expression::CallAuthorError::Control(
+                cause.clone(),
+            ));
+            assert_eq!(authored.failure_fact(), expected);
+            assert!(matches!(authored, PackageSemanticsError::Control(actual) if actual == cause));
         }
     }
 }
@@ -478,7 +405,6 @@ mod capability_projection_tests {
 mod constant_limit_projection_tests {
     use super::super::physical_aggregate_requests::PhysicalAggregateRequestError as A;
     use super::super::physical_call_arguments::PhysicalArgumentError;
-    use super::super::physical_scalar_requests::PhysicalScalarRequestError as S;
     use super::super::physical_table_requests::PhysicalTableRequestError as T;
     use super::super::physical_window_requests::PhysicalWindowRequestError as W;
     use super::super::physical_writer_requests::PhysicalWriterRequestError as R;
@@ -502,17 +428,12 @@ mod constant_limit_projection_tests {
 
     #[test]
     fn typed_limits_survive_all_physical_call_argument_wrappers() {
-        use super::super::physical_expression_effects::PhysicalExpressionEffectsError as E;
         let expected = FailureFact::new(
             FailureClass::Resource,
             FailureReason::new(domain::CONSTANT, NonZeroU16::new(2).unwrap()),
         );
         for reference in [false, true] {
             let errors = [
-                PhysicalFragmentEffectsError::Expressions(E::Argument(argument(reference))),
-                PhysicalFragmentEffectsError::Expressions(E::Request(S::Argument(argument(
-                    reference,
-                )))),
                 PhysicalFragmentEffectsError::WindowRequest(W::Argument(argument(reference))),
                 PhysicalFragmentEffectsError::AggregateRequest(A::Argument(argument(reference))),
                 PhysicalFragmentEffectsError::TableRequest(T::Argument(argument(reference))),
@@ -542,7 +463,7 @@ mod constant_limit_projection_tests {
                 novarocks_type_contract::ValueTypeError::TooDeep,
             )),
         ] {
-            let error = PhysicalFragmentEffectsError::Expressions(E::Argument(argument));
+            let error = PhysicalFragmentEffectsError::TableRequest(T::Argument(argument));
             assert!(matches!(
                 PackageSemanticsError::from(error),
                 PackageSemanticsError::Effects(_)
@@ -575,9 +496,13 @@ mod comparison_source_projection_tests {
     }
 
     fn package(original: ComparisonPrepareError) -> PackageSemanticsError {
-        PackageSemanticsError::from(PhysicalFragmentEffectsError::from(
-            PhysicalExpressionEffectsError::from(original),
-        ))
+        if let Some(control) = original.control_error() {
+            return PackageSemanticsError::Control(control);
+        }
+        PackageSemanticsError::PrimitiveSource {
+            source: SharedFailureCause::new(original),
+            cast: None,
+        }
     }
 
     #[test]
@@ -638,9 +563,7 @@ mod comparison_source_projection_tests {
                 Some(&original)
             );
         }
-        let invalid = PackageSemanticsError::from(PhysicalFragmentEffectsError::Expressions(
-            PhysicalExpressionEffectsError::InvalidSource("comparison unsupported"),
-        ));
+        let invalid = PackageSemanticsError::Effects("comparison unsupported".into());
         assert!(matches!(invalid, PackageSemanticsError::Effects(_)));
         assert_eq!(invalid.failure_fact().class(), FailureClass::Invariant);
     }
@@ -674,13 +597,6 @@ mod comparison_source_projection_tests {
             let error = package(original);
             assert_eq!(error.failure_fact(), control.failure_fact());
             assert!(matches!(error, PackageSemanticsError::Control(actual) if actual == control));
-            // The package boundary must also normalize a directly nested control.
-            let nested = PackageSemanticsError::from(PhysicalFragmentEffectsError::Expressions(
-                PhysicalExpressionEffectsError::Comparison(ComparisonPrepareError::Control(
-                    control.clone(),
-                )),
-            ));
-            assert!(matches!(nested, PackageSemanticsError::Control(actual) if actual == control));
         }
     }
 

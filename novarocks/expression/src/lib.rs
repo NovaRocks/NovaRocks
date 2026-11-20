@@ -23,6 +23,11 @@ mod creation;
 pub use creation::ProgramCreationFailure as ExprConstructionFailure;
 mod compiler;
 pub use compiler::{ExprCompileError, ExprCompileFailure};
+mod call_authorship;
+pub use call_authorship::{
+    CallAuthorError, CallAuthorInputs, CapabilityRefusal, InvariantRefusal, UnitCallAuthorship,
+    author_call_controls, author_unit_calls,
+};
 mod original_requests;
 mod primitives;
 pub use primitives::{
@@ -40,7 +45,6 @@ use compiled::CompiledParts;
 pub(crate) use creation::ProgramCreationFailure;
 
 mod evaluator;
-pub use evaluator::constant_node;
 pub use evaluator::{
     CompiledExpressionInstance, CompiledFilterConjunctionInstance, EvaluationInput,
     ExprEvaluationFailure, InputColumnProjection, InputSourceStorage, InputStorageFailure,

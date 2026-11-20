@@ -3174,6 +3174,141 @@ fn sparse_non_dfs_nested_shared_calls_keep_actual_edges_claims_and_compile_prefi
 }
 
 #[test]
+fn zero_port_compiler_keeps_unsupported_primitive_capabilities() {
+    use crate::zero_port;
+    use arrow::array::{
+        ArrayRef, BooleanArray, Date32Array, FixedSizeBinaryArray, Float64Array, new_null_array,
+    };
+    use novarocks_functions::{ArithmeticPrepareError, CastPrepareError, ComparisonPrepareError};
+
+    let allow_id = SemanticParameterId::new(0);
+    let parameters = SemanticParameters::try_new([(
+        allow_id,
+        SemanticParameterValue::AllowThrowException(true),
+    )])
+    .unwrap();
+    let allow = SemanticParameterRef {
+        id: allow_id,
+        expected_key: SemanticParameterKey::AllowThrowException,
+    };
+    let add = |left, right| ExprKind::Binary {
+        left,
+        op: BinaryOperator::Add,
+        right,
+        decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
+        allow_throw_exception: Some(allow),
+    };
+
+    let mut draft = builder();
+    let mut pools = ConstantPools::empty();
+    let flag = zero_port::add_constant(
+        &mut draft,
+        &mut pools,
+        Arc::new(BooleanArray::from(vec![true])),
+        boolean(false),
+    );
+    let root = draft.add(None, int(true), add(flag, flag)).unwrap();
+    draft
+        .root(root, EvaluationDemand::Value, RootScope::AllPorts)
+        .unwrap();
+    let control = Control::good();
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
+    assert!(matches!(
+        draft.seal(Vec::new(), &mut work),
+        Err(UnitError::Invalid { definition: Some(id), root: None, message })
+            if id == root && message.ends_with("binary expression types are inconsistent with its operator")
+    ));
+    work.finish().unwrap();
+
+    // LARGEINT + DOUBLE has a frozen DOUBLE result. The arithmetic recipe
+    // declines the mixed carrier when the compiler prepares the sealed unit.
+    let mut draft = builder();
+    let largeint = zero_port::add_constant(
+        &mut draft,
+        &mut pools,
+        Arc::new(FixedSizeBinaryArray::try_from_iter([1_i128.to_be_bytes()].into_iter()).unwrap()),
+        FunctionValueType::try_with_logical_type(
+            DataType::FixedSizeBinary(16),
+            false,
+            ValueLogicalType::LargeInt,
+        )
+        .unwrap(),
+    );
+    let double = zero_port::add_constant(
+        &mut draft,
+        &mut pools,
+        Arc::new(Float64Array::from(vec![2.0])),
+        FunctionValueType::new(DataType::Float64, false),
+    );
+    let root = draft
+        .add(
+            None,
+            FunctionValueType::new(DataType::Float64, true),
+            add(largeint, double),
+        )
+        .unwrap();
+    draft
+        .root(root, EvaluationDemand::Value, RootScope::AllPorts)
+        .unwrap();
+    let unit = finish(draft, Vec::new());
+    let result = compile(
+        &unit,
+        &pools,
+        &parameters,
+        ScopeLayouts {
+            ports: &[],
+            all_ports: None,
+        },
+        &control,
+    );
+    assert!(matches!(
+        result,
+        Err(ExprCompileError::Arithmetic(
+            ArithmeticPrepareError::Unsupported
+        ))
+    ));
+
+    let result = zero_port::primitive(
+        [Arc::new(Date32Array::from(vec![1])) as ArrayRef],
+        FunctionValueType::new(DataType::Int8, true),
+        |args| ExprKind::Cast {
+            expr: args[0],
+            target: DataType::Int8,
+            decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
+            allow_throw_exception: allow,
+            array_failure_mode: None,
+        },
+        &parameters,
+    );
+    assert!(matches!(
+        result,
+        Err(ExprCompileError::Cast(CastPrepareError::Unsupported))
+    ));
+
+    let ty = DataType::List(Arc::new(Field::new("item", DataType::Int64, true)));
+    for op in [BinaryOperator::Eq, BinaryOperator::EqForNull] {
+        let result = zero_port::primitive(
+            [new_null_array(&ty, 1), new_null_array(&ty, 1)],
+            boolean(op == BinaryOperator::Eq),
+            |args| ExprKind::Binary {
+                left: args[0],
+                op,
+                right: args[1],
+                decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
+                allow_throw_exception: None,
+            },
+            &parameters,
+        );
+        assert!(matches!(
+            result,
+            Err(ExprCompileError::Comparison(
+                ComparisonPrepareError::Unsupported
+            ))
+        ));
+    }
+}
+
+#[test]
 fn null_list_json_carrier_compiles_live_and_unused_with_exact_scalar_policy() {
     let source = ValueType::new(
         DataType::List(Arc::new(Field::new("source-item", DataType::Null, true))),

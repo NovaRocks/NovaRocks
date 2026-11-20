@@ -86,7 +86,7 @@ fn source(
         SqlPlanningEnvironment::Distributed,
         &catalog,
         &functions,
-        novarocks_sql::compiler::noop_constant_evaluator(),
+        novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
         None,
         super::test_support::constant_policy(),
         control.clone(),
@@ -367,7 +367,10 @@ fn wide_collect_true_source() -> (
     let functions = builder.seal_bound().unwrap();
     let catalog = PlannerMemoryCatalog::default();
     let catalog = SqlPlannerTableSnapshot::new(&catalog);
-    let settings = SessionOptimizerSettings::default();
+    let settings = SessionOptimizerSettings {
+        disabled_rules: vec!["FoldConstant".into()],
+        ..Default::default()
+    };
     let control = SqlCompileControl::unbounded();
     let columns = (0..1024)
         .map(|i| ColumnDef {
@@ -401,7 +404,7 @@ fn wide_collect_true_source() -> (
         SqlPlanningEnvironment::Distributed,
         &catalog,
         &functions,
-        novarocks_sql::compiler::noop_constant_evaluator(),
+        novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
         None,
         FROZEN_CONSTANT_POLICY,
         control.clone(),

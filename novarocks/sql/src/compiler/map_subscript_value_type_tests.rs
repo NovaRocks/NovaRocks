@@ -66,7 +66,7 @@ fn public_sql_map_subscript_preserves_largeint_key_identity() {
             },
             SqlPlanningEnvironment::Distributed,
             builtin_sql_function_catalog().snapshot(),
-            noop_constant_evaluator(),
+            novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
             crate::constant::test_constant_policy(),
             SqlCompileControl::unbounded(),
             PipelineDopDomain {
@@ -146,7 +146,7 @@ fn public_sql_empty_map_lookup_keeps_uninhabited_key_and_actual_probe() {
             },
             SqlPlanningEnvironment::Distributed,
             builtin_sql_function_catalog().snapshot(),
-            noop_constant_evaluator(),
+            novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
             crate::constant::test_constant_policy(),
             SqlCompileControl::unbounded(),
             PipelineDopDomain {
@@ -193,109 +193,5 @@ fn public_sql_empty_map_lookup_keeps_uninhabited_key_and_actual_probe() {
             assert!(ty.nullable(), "empty lookup result: {sql}");
         }
         novarocks_physical_plan::validate_plan(completed.plan()).unwrap();
-    }
-}
-
-#[test]
-fn public_sql_map_float_probe_keeps_nullable_cast_before_optional_folding() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    struct Probe;
-    static PROBE: Probe = Probe;
-    static OBSERVED: AtomicUsize = AtomicUsize::new(0);
-    impl SqlConstantEvaluator for Probe {
-        fn eval_scalar(
-            &self,
-            request: &FoldRequest,
-            _: &dyn novarocks_type_contract::PureCompileControl,
-        ) -> Result<Option<novarocks_functions::ConstantValue>, SqlConstantEvaluationError>
-        {
-            if matches!(
-                &request.kind,
-                FrozenFoldNode::Intrinsic(FrozenFoldIntrinsic::Cast { .. })
-            ) && request.result_type.data_type() == &DataType::Int32
-                && request.args.len() == 1
-                && request.args[0].value_type.data_type() == &DataType::Float64
-            {
-                assert_eq!(
-                    request.result_type.logical_type(),
-                    ValueLogicalType::Physical
-                );
-                assert!(
-                    request.result_type.nullable(),
-                    "float-to-int can return successful NULL before late lowering repairs"
-                );
-                assert!(!request.args[0].value_type.nullable());
-                assert_eq!(
-                    request.args[0].value.value_type(),
-                    &request.args[0].value_type
-                );
-                OBSERVED.fetch_add(1, Ordering::SeqCst);
-            }
-            // Observe the actual frozen source only; do not supply another
-            // evaluator or convert a computed value into a replacement literal.
-            Ok(None)
-        }
-    }
-    for sql in [
-        "SELECT map_agg(CAST(1 AS INT),'one')[1e0]",
-        "SELECT map_agg(CAST(1 AS INT),'one')[1e100]",
-    ] {
-        let before = OBSERVED.load(Ordering::SeqCst);
-        let request = SqlFinalPlanCompileRequest::new(
-            PlanVersionId::try_new([37; 16]).unwrap(),
-            SqlStatementInput::parsed_query(crate::compiler::test_query(sql)),
-            SqlCompileIntent::Query,
-            SqlSessionContext {
-                sql_semantics: Default::default(),
-                current_catalog: None,
-                current_database: "db".into(),
-                optimizer_settings: Default::default(),
-            },
-            SqlPlanningEnvironment::Distributed,
-            builtin_sql_function_catalog().snapshot(),
-            &PROBE,
-            crate::constant::test_constant_policy(),
-            SqlCompileControl::unbounded(),
-            PipelineDopDomain {
-                min: 1,
-                max: 8,
-                requires_power_of_two: true,
-            },
-            ScanReadBudget {
-                max_batch_rows: MAX_SCAN_BATCH_ROWS,
-                max_batch_bytes: MAX_SCAN_BATCH_BYTES,
-            },
-            DEFAULT_COMPLETION_LIMITS,
-        );
-        let SqlCompileProgress::Complete(completed) = SqlCompiler::start(
-            request.try_into_completion().unwrap(),
-            &SqlCompileControl::unbounded(),
-        )
-        .unwrap_or_else(|error| panic!("actual map_agg/probe source {sql}: {error:?}")) else {
-            panic!("source-free map_agg must not need table metadata")
-        };
-        assert!(
-            OBSERVED.load(Ordering::SeqCst) > before,
-            "the original float CAST must reach optional folding: {sql}"
-        );
-        let owner = completed.into_plan();
-        let result = owner.plan().result_port().unwrap();
-        assert_eq!(result.fields.len(), 1);
-        assert_eq!(result.fields[0].ty.data_type(), &DataType::Utf8);
-        assert_eq!(
-            result.fields[0].ty.logical_type(),
-            ValueLogicalType::Physical
-        );
-        assert!(result.fields[0].ty.nullable());
-        owner
-            .require_statement_constant_policy(crate::constant::test_constant_policy())
-            .unwrap_or_else(|error| panic!("real package source for {sql}: {error:#?}"));
-        for fragment in owner.plan().fragments().values() {
-            fragment
-                .calls()
-                .validate_fragment(fragment, &SqlCompileControl::unbounded())
-                .unwrap();
-        }
-        novarocks_physical_plan::validate_plan(owner.plan()).unwrap();
     }
 }

@@ -557,3 +557,9 @@ mod error_projection_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod literal_source_tests;
+
+#[cfg(test)]
+mod request_host_tests;

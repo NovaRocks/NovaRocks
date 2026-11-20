@@ -2120,6 +2120,7 @@ mod original_stage_tests {
                     crate::application::test_constant_policy(),
                     Arc::new(novarocks_query_application::view::QueryViewService::new()),
                     trc_system_relations,
+                    novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
                 )
             };
             let wake = Arc::new(Wake::default());

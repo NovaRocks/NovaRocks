@@ -197,12 +197,14 @@ pub enum QueryLifecycleFaultKind {
     /// is cancelled. This is a debug-only rendezvous used to prove that a
     /// query deadline aborts an already-open provider writer.
     ConnectorWriteAppendHold,
+    /// Holds original Exchange deliveries before an RPC exists.
+    ExchangeDeliverBeforeRpcHold,
     /// Holds the selected mark join at its original sole build publication point.
     JoinBuildBeforePublishHold,
 }
 
 impl QueryLifecycleFaultKind {
-    pub const ALL: [Self; 31] = [
+    pub const ALL: [Self; 32] = [
         Self::TerminalAckDrop,
         Self::TerminalSnapshotConflict,
         Self::RuntimeFilterContributionAckDrop,
@@ -233,6 +235,7 @@ impl QueryLifecycleFaultKind {
         Self::ConnectorWriteFinalMergeFailure,
         Self::ConnectorWriteFinalFinalizeFailure,
         Self::ConnectorWriteAppendHold,
+        Self::ExchangeDeliverBeforeRpcHold,
         Self::JoinBuildBeforePublishHold,
     ];
 
@@ -280,6 +283,7 @@ impl QueryLifecycleFaultKind {
             Self::ConnectorWriteFinalMergeFailure => "connector-write-final-merge-failure",
             Self::ConnectorWriteFinalFinalizeFailure => "connector-write-final-finalize-failure",
             Self::ConnectorWriteAppendHold => "connector-write-append-hold",
+            Self::ExchangeDeliverBeforeRpcHold => "exchange-deliver-before-rpc-hold",
             Self::JoinBuildBeforePublishHold => "join-build-before-publish-hold",
         }
     }
@@ -300,7 +304,7 @@ impl QueryLifecycleFaultKind {
 /// Both the SQL runner's directive vocabulary and the cluster harness's
 /// arm-by-kind path read this list, so a fault that belongs to one belongs to
 /// both.
-pub const RUNNER_RFO_KINDS: [QueryLifecycleFaultKind; 28] = [
+pub const RUNNER_RFO_KINDS: [QueryLifecycleFaultKind; 29] = [
     QueryLifecycleFaultKind::RuntimeFilterContributionAckDrop,
     QueryLifecycleFaultKind::RuntimeFilterContributionAckDropRendezvous,
     QueryLifecycleFaultKind::RuntimeFilterFeedbackContractDigestCorrupt,
@@ -348,6 +352,7 @@ pub const RUNNER_RFO_KINDS: [QueryLifecycleFaultKind; 28] = [
     QueryLifecycleFaultKind::ConnectorWriteFinalMergeFailure,
     QueryLifecycleFaultKind::ConnectorWriteFinalFinalizeFailure,
     QueryLifecycleFaultKind::ConnectorWriteAppendHold,
+    QueryLifecycleFaultKind::ExchangeDeliverBeforeRpcHold,
 ];
 
 pub fn parse_runner_rfo_kind(value: &str) -> Option<QueryLifecycleFaultKind> {

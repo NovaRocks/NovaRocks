@@ -9,6 +9,9 @@ partially-superseded-by:
   - id: ADR-0191
     scope: "Frozen binding-owned requests and shared compiled single-node evaluation replace literal-node mapping and the retained evaluator implementation; compiler port, stateless lifetime and optional-fold policy remain active"
     link: "ADR-0191-frozen-fold-facts-and-shared-compiled-evaluation.md"
+  - id: ADR-0242
+    scope: "Compiler port and evaluator singleton retire; optional folding, placement and result admission remain active"
+    link: "ADR-0242-constant-folding-compiles-expression-units.md"
 date: 2026-08-20
 provenance:
   - "PR: number pending — SQL constant folding (FoldConstant rule + frontend constant evaluator)"

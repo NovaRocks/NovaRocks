@@ -175,6 +175,7 @@ impl StandaloneDraft {
 pub(crate) fn lower_required_constant_unit(
     expression: &TypedExpr,
     functions: Arc<dyn crate::compiler::SqlFunctionCatalog>,
+    sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     allow_throw_exception: bool,
     policy: novarocks_constant_contract::ConstantPolicy,
     control: &dyn PureCompileControl,
@@ -240,8 +241,8 @@ pub(crate) fn lower_required_constant_unit(
             &parameters,
             &source.journal,
             &source.functions,
+            sealed_functions.as_ref(),
             policy,
-            control,
             &mut work,
         )?;
         Ok(StandaloneScalarEmission {

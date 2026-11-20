@@ -191,3 +191,6 @@ impl OriginalBindingRecordWriter {
         self.artifact.bytes_written()
     }
 }
+
+#[cfg(test)]
+mod tests;

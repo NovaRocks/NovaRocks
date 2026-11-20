@@ -824,21 +824,21 @@ impl ActualStatisticsRun {
         drop(self.custody.take());
         drop(self.binding.take());
         drop(self.cohort.take());
-        // The role receipt can be visible before its last backing reference
-        // exits. Observe the exact stage reset under the same exit deadline.
         let typed = self.typed.as_mut().unwrap();
-        tokio::time::timeout_at(exit_until.into(), async {
-            loop {
-                let progress = typed.driver.step();
-                if typed.retired.is_reclaimed().unwrap() {
-                    break;
+        let retired = &typed.retired;
+        // An idle driver only observes the current queue. The host may still
+        // hold the final stage reference after publishing its exit receipt.
+        drive_until_with_original_clock(
+            &process,
+            &mut typed.driver,
+            async {
+                while !retired.is_reclaimed().unwrap() {
+                    tokio::task::yield_now().await;
                 }
-                if let joint::JointProgress::Idle(revision) = progress {
-                    typed.progress.wait_state_change(revision).await;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
+            },
+            exit_until,
+            None,
+        )
         .await
         .expect("the original stage retires independently of the retained domain output");
         if case.is_success() {

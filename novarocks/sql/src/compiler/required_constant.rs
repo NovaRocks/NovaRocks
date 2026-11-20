@@ -66,6 +66,7 @@ pub struct RequiredConstantRequest<'a> {
     pub catalog: &'a dyn SqlCatalogSnapshot,
     pub current_database: &'a str,
     pub functions: Arc<dyn SqlFunctionCatalog>,
+    pub sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     pub sql_semantics: &'a crate::sql_mode::SqlSemanticSettings,
     pub constant_policy: ConstantPolicy,
     pub control: &'a SqlCompileControl,

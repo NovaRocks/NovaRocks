@@ -15,35 +15,140 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! Direct relation fixtures use the production expression author.
+use std::collections::BTreeMap;
+
+use novarocks_expression::{
+    CallAuthorError, CallAuthorInputs, EvaluationEnvironment, UnitCallAuthorship,
+    author_call_controls, author_unit_calls,
+};
+use novarocks_expression_contract::{
+    ExprId, ExprKind, ExprNode, RootOrdinal, RootScope, SealedUnit, UnitError,
+};
+use novarocks_functions::ConstantPolicy;
+use novarocks_physical_plan::{ConstantPools, FragmentBuilder, FragmentId, NodeId};
+use novarocks_type_contract::{
+    CompileCheckpoints, CompileControlError, DecimalOverflowPolicy, EvaluationDemand,
+    ExpressionControlFlow, ExpressionUseId, FunctionValueType, SemanticParameters,
+};
+
 use super::{
     contract_lowering::transfer_component_request_for_test,
-    expression_occurrences::{ExpressionOccurrenceError, scalar_shape},
-    physical_scalar_requests::{
-        author_physical_scalar_request_observed, author_scalar_result_selection_observed,
-    },
+    physical_scalar_requests::author_physical_scalar_request_observed,
     unit_source::UnitDefinitions,
 };
-use crate::compiler::SqlFunctionCatalog;
-use novarocks_expression_contract::{
-    BoundExprSet, DefinitionControl, ExprId, ExprKind, ExprNode, ExpressionCallClaim, RootOrdinal,
-    RootScope, SealedUnit, UnitError, UnitLimits, UnitParts,
-};
-use novarocks_functions::{ConstantPolicy, EngineFunctionCatalog};
-use novarocks_physical_plan::{ConstantPools, FragmentId, NodeId, PlanLimits};
-use novarocks_type_contract::{
-    CompileCheckpoints, CompileControlError, CompilePhase, EvaluationDemand, ExpressionControlFlow,
-    ExpressionUseId, FunctionValueType, PureCompileControl,
-};
-use std::collections::BTreeMap;
-struct FixtureControl;
-impl PureCompileControl for FixtureControl {
-    fn checkpoint(&self, _: CompilePhase, units: u32) -> Result<(), CompileControlError> {
-        assert!(units <= 256);
-        Ok(())
-    }
+
+pub(super) fn author_component_calls(
+    unit: &SealedUnit,
+    constants: &ConstantPools,
+    parameters: &SemanticParameters,
+    policy: ConstantPolicy,
+    overflow: DecimalOverflowPolicy,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<UnitCallAuthorship, CallAuthorError> {
+    let functions = novarocks_functions::testkit::shared_installed_builtin_owner_catalogue();
+    let decimal_overflow = unit
+        .uses()
+        .values()
+        .filter_map(|usage| {
+            let definition = unit.definition(usage.definition)?;
+            matches!(definition.kind, ExprKind::FunctionCall { .. })
+                .then_some((definition.id, overflow))
+        })
+        .collect();
+    author_unit_calls(
+        unit,
+        &CallAuthorInputs {
+            environment: EvaluationEnvironment {
+                constants,
+                parameters,
+            },
+            constant_policy: policy,
+            functions: &functions,
+            decimal_overflow: &decimal_overflow,
+        },
+        work,
+    )
 }
-// One direct-component source, owned by an actual node draft. This fixture
-// never mints a SQL journal receipt or claims fragment/package publication.
+
+pub(super) fn seal_node_observed(
+    fragment: &mut FragmentBuilder,
+    node: NodeId,
+    constants: &ConstantPools,
+    functions: &novarocks_functions::PureEngineFunctionCatalog,
+    policy: ConstantPolicy,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<SealedUnit, ComponentSealError> {
+    let definitions = UnitDefinitions::from_draft(fragment, node);
+    let mut requests = Vec::new();
+    for source in fragment.construction_unit(node).unwrap().definitions() {
+        if !matches!(source.kind, ExprKind::FunctionCall { .. }) {
+            continue;
+        }
+        let input = author_physical_scalar_request_observed(
+            source,
+            definitions.clone(),
+            constants,
+            policy,
+            work,
+        )
+        .map_err(ComponentSealError::request)?;
+        let request = transfer_component_request_for_test(
+            input.request(),
+            policy,
+            work,
+            &mut |value, work| {
+                for (&pool_id, pool) in constants.entries() {
+                    work.step()?;
+                    if pool.backing_identity() == value.pool().backing_identity() {
+                        return Ok(novarocks_physical_plan::ConstantReference {
+                            pool: pool_id,
+                            ordinal: value.ordinal(),
+                        });
+                    }
+                }
+                Err(
+                    super::contract_lowering::ContractLoweringError::InvalidFunctionBinding {
+                        detail: "component request has no original constant pool".into(),
+                    },
+                )
+            },
+        )
+        .map_err(ComponentSealError::transfer)?;
+        requests.push((source.id, request));
+    }
+    let ports = if fragment.construction_node(node).is_some() {
+        fragment.node_ports(node).unwrap()
+    } else {
+        vec![]
+    };
+    let mut draft = fragment.take_unit_builder(node).unwrap();
+    for (id, request) in requests {
+        draft
+            .request(id, request)
+            .map_err(ComponentSealError::unit)?;
+    }
+    let parameters = SemanticParameters::try_new([]).unwrap();
+    let decimal_overflow = BTreeMap::new();
+    let inputs = CallAuthorInputs {
+        environment: EvaluationEnvironment {
+            constants,
+            parameters: &parameters,
+        },
+        constant_policy: policy,
+        functions,
+        decimal_overflow: &decimal_overflow,
+    };
+    for (definition, control) in
+        author_call_controls(&draft, &inputs, work).map_err(ComponentSealError::author)?
+    {
+        draft
+            .definition_control(definition, control)
+            .map_err(ComponentSealError::unit)?;
+    }
+    draft.seal(ports, work).map_err(ComponentSealError::unit)
+}
+
 pub(super) struct FixtureBuilder {
     pub(super) fragment: novarocks_physical_plan::FragmentBuilder,
     pub(super) node: NodeId,
@@ -77,199 +182,29 @@ impl FixtureBuilder {
             .root(definition, demand, RootScope::AllPorts)
             .unwrap()
     }
-    pub(super) fn seal(
-        self,
-        catalog: &EngineFunctionCatalog,
-        constant_policy: ConstantPolicy,
-    ) -> UnitFixture {
-        self.seal_setup(catalog, constant_policy, true)
-    }
-    // The caller lends its existing observed work scope to real request,
-    // installed-control and SDK seal authors. This is test-only setup, not a
-    // SQL source credential or a second occurrence expansion implementation.
     pub(super) fn seal_observed(
-        self,
-        catalog: &dyn SqlFunctionCatalog,
-        constant_policy: ConstantPolicy,
-        work: &mut CompileCheckpoints<'_>,
-    ) -> Result<UnitFixture, ComponentSealError> {
-        self.seal_component(catalog, constant_policy, true, work)
-    }
-    pub(super) fn seal_without_requests(
-        self,
-        catalog: &EngineFunctionCatalog,
-        constant_policy: ConstantPolicy,
-    ) -> UnitFixture {
-        self.seal_setup(catalog, constant_policy, false)
-    }
-    fn seal_setup(
-        self,
-        catalog: &dyn SqlFunctionCatalog,
-        constant_policy: ConstantPolicy,
-        with_requests: bool,
-    ) -> UnitFixture {
-        let mut work =
-            CompileCheckpoints::try_new(&FixtureControl, CompilePhase::FunctionSpecialization)
-                .unwrap();
-        let result = self.seal_component(catalog, constant_policy, with_requests, &mut work);
-        work.finish_result(result, ComponentSealError::Control)
-            .unwrap()
-    }
-    fn seal_component(
         mut self,
-        catalog: &dyn SqlFunctionCatalog,
-        constant_policy: ConstantPolicy,
-        with_requests: bool,
+        functions: &novarocks_functions::PureEngineFunctionCatalog,
+        policy: ConstantPolicy,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<UnitFixture, ComponentSealError> {
-        let sealed = seal_node_component(
-            &mut self.fragment,
-            self.node,
-            &self.constants,
-            catalog,
-            constant_policy,
-            with_requests,
-            work,
-        )?;
         Ok(UnitFixture {
-            node: self.node,
-            sealed,
-            constants: self.constants,
+            sealed: seal_node_observed(
+                &mut self.fragment,
+                self.node,
+                &self.constants,
+                functions,
+                policy,
+                work,
+            )?,
         })
     }
 }
-
-pub(super) fn seal_node_observed(
-    fragment: &mut novarocks_physical_plan::FragmentBuilder,
-    node: NodeId,
-    constants: &ConstantPools,
-    catalog: &dyn SqlFunctionCatalog,
-    constant_policy: ConstantPolicy,
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<SealedUnit, ComponentSealError> {
-    seal_node_component(
-        fragment,
-        node,
-        constants,
-        catalog,
-        constant_policy,
-        true,
-        work,
-    )
-}
-fn seal_node_component(
-    fragment: &mut novarocks_physical_plan::FragmentBuilder,
-    node: NodeId,
-    constants: &ConstantPools,
-    catalog: &dyn SqlFunctionCatalog,
-    constant_policy: ConstantPolicy,
-    with_requests: bool,
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<SealedUnit, ComponentSealError> {
-    let definitions: Vec<_> = fragment
-        .construction_unit(node)
-        .unwrap()
-        .definitions()
-        .filter_map(|source| {
-            matches!(source.kind, ExprKind::FunctionCall { .. }).then_some(source.id)
-        })
-        .collect();
-    for id in definitions {
-        let (record, shape) = {
-            let definitions = UnitDefinitions::from_draft(fragment, node);
-            let source = definitions.definition(id).unwrap();
-            let ExprKind::FunctionCall { function, args } = &source.kind else {
-                unreachable!()
-            };
-            let request = if with_requests {
-                Some(
-                    author_physical_scalar_request_observed(
-                        source,
-                        definitions,
-                        constants,
-                        constant_policy,
-                        work,
-                    )
-                    .map_err(ComponentSealError::request)?,
-                )
-            } else {
-                None
-            };
-            let selected = match &request {
-                Some(request) => std::sync::Arc::clone(request.selected()),
-                None => author_scalar_result_selection_observed(function, None, work)?,
-            };
-            let logical_count = request.as_ref().map_or(args.len(), |request| {
-                request.request().logical_argument_count
-            });
-            work.flush()?;
-            let (_, control) = crate::compiler::selected_scalar_call::selected_scalar_control(
-                catalog,
-                &function.function_id,
-                function.kind,
-                &selected,
-                logical_count,
-                work.control(),
-            )
-            .map_err(|error| {
-                ComponentSealError::occurrence(ExpressionOccurrenceError::function(error))
-            })?;
-            let shape = scalar_shape(control, args.len()).ok_or_else(|| {
-                ComponentSealError::Occurrence(ExpressionOccurrenceError::InvalidFunctionControl(
-                    id,
-                ))
-            })?;
-            let record = match request {
-                    Some(request) => Some(transfer_component_request_for_test(request.request(), constant_policy, work,
-                        &mut |value, work| {
-                            for (&pool_id, pool) in constants.entries() {
-                                work.step()?;
-                                if pool.backing_identity() == value.pool().backing_identity() {
-                                    return Ok(novarocks_physical_plan::ConstantReference { pool: pool_id, ordinal: value.ordinal() });
-                                }
-                            }
-                            Err(super::contract_lowering::ContractLoweringError::InvalidFunctionBinding {
-                                detail: "component request has no original constant pool".into(),
-                            })
-                        }).map_err(ComponentSealError::transfer)?),
-                    None => None,
-                };
-            (record, shape)
-        };
-        let draft = fragment.unit(node).unwrap();
-        if let Some(record) = record {
-            draft
-                .request(id, record)
-                .map_err(ComponentSealError::unit)?;
-        }
-        draft
-            .definition_control(
-                id,
-                DefinitionControl {
-                    shape,
-                    temporal_sources: None,
-                },
-            )
-            .map_err(ComponentSealError::unit)?;
-    }
-    let ports = if fragment.construction_node(node).is_some() {
-        fragment.node_ports(node).unwrap()
-    } else {
-        vec![]
-    };
-    let sealed = fragment
-        .take_unit_builder(node)
-        .unwrap()
-        .seal(ports, work)
-        .map_err(ComponentSealError::unit)?;
-    Ok(sealed)
-}
-
 #[derive(Debug)]
 pub(super) enum ComponentSealError {
     Control(CompileControlError),
     Request(super::physical_scalar_requests::PhysicalScalarRequestError),
-    Occurrence(ExpressionOccurrenceError),
+    Author(CallAuthorError),
     Transfer(super::contract_lowering::ContractLoweringError),
     Unit(UnitError),
 }
@@ -287,10 +222,10 @@ impl ComponentSealError {
             other => Self::Request(other),
         }
     }
-    fn occurrence(error: ExpressionOccurrenceError) -> Self {
+    fn author(error: CallAuthorError) -> Self {
         match error {
-            ExpressionOccurrenceError::Control(cause) => Self::Control(cause),
-            other => Self::Occurrence(other),
+            CallAuthorError::Control(cause) => Self::Control(cause),
+            other => Self::Author(other),
         }
     }
     fn transfer(error: super::contract_lowering::ContractLoweringError) -> Self {
@@ -308,17 +243,9 @@ impl ComponentSealError {
 }
 
 pub(super) struct UnitFixture {
-    pub(super) node: NodeId,
     pub(super) sealed: SealedUnit,
-    pub(super) constants: ConstantPools,
 }
 impl UnitFixture {
-    pub(super) fn definitions(&self) -> UnitDefinitions<'_> {
-        UnitDefinitions::from_sealed(
-            crate::planner::distributed::build::unit_source::ScalarUnitOwner::Node(self.node),
-            &self.sealed,
-        )
-    }
     pub(super) fn definition(&self, id: ExprId) -> &ExprNode {
         self.sealed.definition(id).unwrap()
     }
@@ -327,31 +254,5 @@ impl UnitFixture {
     }
     pub(super) fn root_use(&self, root: RootOrdinal) -> ExpressionUseId {
         self.sealed.root_use_ids()[root.get() as usize]
-    }
-    pub(super) fn validate_claims(
-        &self,
-        claims: BTreeMap<ExpressionUseId, ExpressionCallClaim>,
-    ) -> BoundExprSet {
-        let parts = UnitParts::new(
-            self.sealed.ports().to_vec().into_boxed_slice(),
-            self.sealed.definitions().to_vec().into_boxed_slice(),
-            self.sealed.roots().to_vec().into_boxed_slice(),
-            self.sealed.root_use_ids().to_vec().into_boxed_slice(),
-            self.sealed.control_flow().clone(),
-            claims,
-            self.sealed.requests().clone(),
-        );
-        let control = FixtureControl;
-        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
-        let unit = BoundExprSet::try_from_parts_in(
-            parts,
-            UnitLimits {
-                expression_semantic_depth: PlanLimits::FROZEN.expression_semantic_depth,
-            },
-            &mut work,
-        )
-        .unwrap();
-        work.finish().unwrap();
-        unit
     }
 }

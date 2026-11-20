@@ -19,6 +19,9 @@
 use novarocks_query_application::api::ExecutionFailurePresentation;
 
 use crate::diagnostics::{self, BoundedMessage};
+use novarocks_execution_contract::failure::connector_reason::{
+    ICEBERG_COMMIT_ERROR, ICEBERG_FILESYSTEM_ERROR, ICEBERG_INVALID_METADATA,
+};
 use novarocks_execution_contract::failure::{FailureClass, FailureProjection, domain};
 use novarocks_query_application::{
     api::{QueryExecutionError, QueryExecutionErrorKind, StatementExternalEffectDisposition},
@@ -81,7 +84,7 @@ pub(crate) struct TrinoErrorLocation {
     pub(crate) column_number: u32,
 }
 
-// Numeric identities and error types are frozen by Trino StandardErrorCode.
+// Numeric identities and error types are frozen by Trino StandardErrorCode and IcebergErrorCode.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Code {
     GenericUser,
@@ -131,7 +134,9 @@ enum Code {
     ViewIsRecursive,
     DuplicateWindowName,
     MergeTargetRowMultipleMatches,
+    IcebergInvalidMetadata,
     IcebergTooManyOpenPartitions,
+    IcebergFilesystemError,
     IcebergCommitError,
     TransactionConflict,
     GenericInternal,
@@ -145,7 +150,15 @@ enum Code {
     ExceededTimeLimit,
 }
 impl Code {
+    fn uses_iceberg_maintenance_detail(self) -> bool {
+        matches!(
+            self,
+            Self::IcebergInvalidMetadata | Self::IcebergFilesystemError | Self::IcebergCommitError
+        )
+    }
+
     fn fields(self) -> (i32, &'static str, &'static str) {
+        const EXTERNAL: &str = "EXTERNAL";
         use Code::*;
         match self {
             GenericUser => (0, "GENERIC_USER_ERROR", "USER_ERROR"),
@@ -198,12 +211,14 @@ impl Code {
             MergeTargetRowMultipleMatches => {
                 (119, "MERGE_TARGET_ROW_MULTIPLE_MATCHES", "USER_ERROR")
             }
+            IcebergInvalidMetadata => (0x0504_0001, "ICEBERG_INVALID_METADATA", EXTERNAL),
+            IcebergFilesystemError => (0x0504_0008, "ICEBERG_FILESYSTEM_ERROR", EXTERNAL),
+            IcebergCommitError => (0x0504_000C, "ICEBERG_COMMIT_ERROR", EXTERNAL),
             IcebergTooManyOpenPartitions => (
                 0x0504_0002,
                 "ICEBERG_TOO_MANY_OPEN_PARTITIONS",
                 "USER_ERROR",
             ),
-            IcebergCommitError => (0x0504_000C, "ICEBERG_COMMIT_ERROR", "EXTERNAL"),
             TransactionConflict => (17, "TRANSACTION_CONFLICT", "USER_ERROR"),
             GenericInternal => (65536, "GENERIC_INTERNAL_ERROR", "INTERNAL_ERROR"),
             PageTransportError => (65539, "PAGE_TRANSPORT_ERROR", "INTERNAL_ERROR"),
@@ -303,7 +318,10 @@ fn project_source(
         }
         TrinoErrorSource::Execution { error, sql: _sql } => {
             let (code, message) = match error.execution_failure() {
-                Some(input) => (execution_code(input), execution_message(input)),
+                Some(input) => {
+                    let code = execution_code(input);
+                    (code, execution_message(input, code))
+                }
                 None => (
                     match error.kind() {
                         QueryExecutionErrorKind::InvalidRequest => Code::GenericUser,
@@ -445,13 +463,17 @@ fn service_error(
         return project(code, diagnostics::bound_display(message), None);
     }
     if let Some(input) = error.execution_failure() {
-        if matches!(code, Code::IcebergCommitError | Code::TransactionConflict) {
-            let message = execution_message(input);
+        let message = execution_message(input, code);
+        if matches!(message, PublicMessage::CommitFailure { .. }) {
             let public = error.diagnostic_with_execution_detail(&message, effect);
             return project_public_diagnostic(query_id, code, &public, None);
         }
-        if code == Code::IcebergTooManyOpenPartitions {
-            return project_message(query_id, code, execution_message(input), None, effect);
+        if code == Code::IcebergTooManyOpenPartitions || code.uses_iceberg_maintenance_detail() {
+            let effect = StatementExternalEffectDisposition::combine(
+                error.external_effect_disposition(),
+                effect,
+            );
+            return project_message(query_id, code, message, None, effect);
         }
     }
     let public = error.diagnostic_with_external_effect(effect);
@@ -530,9 +552,12 @@ fn commit_failure(input: &ExecutionFailureInput) -> Option<(Code, bool)> {
     }
 }
 
-fn execution_message(input: &ExecutionFailureInput) -> PublicMessage<'_> {
+fn execution_message(input: &ExecutionFailureInput, code: Code) -> PublicMessage<'_> {
     if let Some((_, unknown)) = commit_failure(input) {
         return PublicMessage::CommitFailure { input, unknown };
+    }
+    if code.uses_iceberg_maintenance_detail() {
+        return PublicMessage::Borrowed(input.detail().as_str());
     }
     match open_partition_limit(input) {
         Some((limit, opening)) => PublicMessage::OpenPartitionLimit { limit, opening },
@@ -550,13 +575,21 @@ fn execution_code(input: &ExecutionFailureInput) -> Code {
     if input.row_match_violation_message().is_some() {
         return Code::MergeTargetRowMultipleMatches;
     }
+    let fact = input.fact();
+    match (fact.class(), fact.reason()) {
+        (FailureClass::Data, ICEBERG_INVALID_METADATA) => return Code::IcebergInvalidMetadata,
+        (FailureClass::Dependency, ICEBERG_FILESYSTEM_ERROR) => {
+            return Code::IcebergFilesystemError;
+        }
+        (FailureClass::Dependency, ICEBERG_COMMIT_ERROR) => return Code::IcebergCommitError,
+        _ => {}
+    }
     let descriptor = input.descriptor().descriptor;
     let code = user_code(descriptor.code.as_str()).unwrap_or(Code::GenericInternal);
     // ConnectorMutationFailureKind::AlreadyExists owns the Data/CONNECTOR/6002
     // fact (spi/connector/mutation.rs). Its entity is unspecified, so the wire
     // uses Trino's general ALREADY_EXISTS rather than guessing a table kind.
     // CatalogApplicationErrorKind::AlreadyExists owns Data/METADATA/902.
-    let fact = input.fact();
     if code == Code::GenericUser
         && fact.class() == FailureClass::Data
         && ((fact.reason().domain() == domain::CONNECTOR.get() && fact.reason().code() == 6002)

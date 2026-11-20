@@ -35,3 +35,15 @@ pub const ICEBERG_COMMIT_VALIDATION_CONFLICT: FailureReason =
 /// The catalog may have applied the Iceberg write, but the outcome is unknown.
 pub const ICEBERG_COMMIT_STATE_UNKNOWN: FailureReason =
     FailureReason::new(domain::CONNECTOR, NonZeroU16::new(53).unwrap());
+
+/// Iceberg metadata required by maintenance is missing or invalid.
+pub const ICEBERG_INVALID_METADATA: FailureReason =
+    FailureReason::new(domain::CONNECTOR, NonZeroU16::new(54).unwrap());
+
+/// An Iceberg maintenance filesystem operation failed.
+pub const ICEBERG_FILESYSTEM_ERROR: FailureReason =
+    FailureReason::new(domain::CONNECTOR, NonZeroU16::new(55).unwrap());
+
+/// An explicit Iceberg metadata maintenance procedure failed to commit.
+pub const ICEBERG_COMMIT_ERROR: FailureReason =
+    FailureReason::new(domain::CONNECTOR, NonZeroU16::new(56).unwrap());

@@ -17,7 +17,7 @@
 
 use std::any::Any;
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
@@ -28,7 +28,7 @@ use crate::column_id::ColumnRefFactory;
 use crate::compiler::SqlCompileError;
 use crate::optimizer::options::SessionOptimizerSettings;
 use crate::optimizer::rewrite::trace::RewriteTrace;
-use crate::optimizer::scalar::ScalarArena;
+use crate::optimizer::scalar::{ScalarArena, ScalarId};
 use crate::optimizer::stats_input::OptimizerStatsInput;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,12 +80,11 @@ pub(crate) struct RewriteContext<'a> {
     /// rewrite phase (mirrors `column_ref_factory`); rules that inspect or
     /// build scalars go through this. Unwrapped into `Memo.scalars` at convert.
     scalar_arena: Option<Rc<RefCell<ScalarArena>>>,
-    /// Process-lifetime constant evaluator injected at the compiler boundary.
-    /// `None` means the compile path has no execution capability attached, and
-    /// constant folding degrades to a no-op.
-    constant_evaluator: Option<&'static dyn crate::compiler::SqlConstantEvaluator>,
+    /// Indexed by the rebuilt scalar with all constant children.
+    fold_cache: RefCell<HashMap<ScalarId, Option<ScalarId>>>,
     fold_dependency_observer: Option<Arc<dyn crate::compiler::SqlFoldDependencyObserver>>,
     function_catalog: Option<Arc<dyn crate::compiler::SqlFunctionCatalog>>,
+    sealed_functions: Option<Arc<novarocks_functions::PureEngineFunctionCatalog>>,
 }
 
 impl<'a> RewriteContext<'a> {
@@ -109,9 +108,11 @@ impl<'a> RewriteContext<'a> {
             deadline: None,
             column_ref_factory: None,
             scalar_arena: None,
-            constant_evaluator: None,
+            fold_cache: RefCell::new(HashMap::new()),
+
             fold_dependency_observer: None,
             function_catalog: None,
+            sealed_functions: None,
         }
     }
 
@@ -244,17 +245,17 @@ impl<'a> RewriteContext<'a> {
         self.column_ref_factory.as_ref()
     }
 
-    pub(crate) fn set_constant_evaluator(
+    pub(crate) fn set_sealed_functions(
         &mut self,
-        evaluator: &'static dyn crate::compiler::SqlConstantEvaluator,
+        functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     ) {
-        self.constant_evaluator = Some(evaluator);
+        self.sealed_functions = Some(functions);
     }
 
-    pub(crate) fn constant_evaluator(
+    pub(crate) fn sealed_functions(
         &self,
-    ) -> Option<&'static dyn crate::compiler::SqlConstantEvaluator> {
-        self.constant_evaluator
+    ) -> Option<&Arc<novarocks_functions::PureEngineFunctionCatalog>> {
+        self.sealed_functions.as_ref()
     }
 
     pub(crate) fn set_fold_dependency_observer(
@@ -276,12 +277,25 @@ impl<'a> RewriteContext<'a> {
     }
 
     pub(crate) fn function_catalog(&self) -> &dyn crate::compiler::SqlFunctionCatalog {
+        self.function_catalog_arc().as_ref()
+    }
+
+    pub(crate) fn function_catalog_arc(&self) -> &Arc<dyn crate::compiler::SqlFunctionCatalog> {
         self.function_catalog
-            .as_deref()
+            .as_ref()
             .expect("function catalog must be set before optimizer rewrite")
     }
 
+    pub(crate) fn cached_fold(&self, input: ScalarId) -> Option<Option<ScalarId>> {
+        self.fold_cache.borrow().get(&input).copied()
+    }
+
+    pub(crate) fn cache_fold(&self, input: ScalarId, folded: Option<ScalarId>) {
+        self.fold_cache.borrow_mut().insert(input, folded);
+    }
+
     pub(crate) fn set_scalar_arena(&mut self, arena: Rc<RefCell<ScalarArena>>) {
+        self.fold_cache.get_mut().clear();
         self.scalar_arena = Some(arena);
     }
 

@@ -83,13 +83,14 @@ fn compile(score_type: DataType, predicate: &str) -> SqlOptimizedOutput {
             optimizer_settings: SessionOptimizerSettings {
                 enable_materialized_view_rewrite: Some(false),
                 enable_common_subexpr_reuse: Some(false),
+                disabled_rules: vec!["FoldConstant".into()],
                 ..Default::default()
             },
         },
         SqlPlanningEnvironment::Distributed,
         &snapshot,
         crate::functions::builtin_sql_function_catalog(),
-        noop_constant_evaluator(),
+        novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
         None,
         crate::constant::test_constant_policy(),
         control.clone(),

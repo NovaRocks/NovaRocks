@@ -49,6 +49,7 @@ pub(crate) struct StatisticsComputationPlanningServices<'a> {
     pub(crate) completion: CompletionFactOwners,
     pub(crate) blocking: &'a ConnectorBlockingIoSupervisor,
     pub(crate) functions: Arc<novarocks_functions::EngineFunctionCatalog>,
+    pub(crate) sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     pub(crate) constant_policy: novarocks_functions::ConstantPolicy,
     pub(crate) static_plan_carrier: CompiledPackageCarrier,
     pub(crate) wake: Arc<dyn crate::wake::StatusIntakeWake>,
@@ -246,6 +247,7 @@ pub(crate) async fn prepare_statistics_computation_in(
             access: custody.access.take(),
             program: Some(program),
             functions: services.functions,
+            sealed_functions: services.sealed_functions,
             constant_policy: services.constant_policy,
             static_plan_carrier: services.static_plan_carrier,
             staged: None,
@@ -305,6 +307,7 @@ pub(crate) struct StatisticsPlanCpuInput {
     access: Option<FinalPlanRuntimeAccess<FrozenProviderRead>>,
     program: Option<StatisticsCollectionProgram>,
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
+    sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     constant_policy: novarocks_functions::ConstantPolicy,
     static_plan_carrier: CompiledPackageCarrier,
     staged: Option<Result<StatisticsPlanParts, DistributedQueryError>>,
@@ -374,6 +377,8 @@ impl StatisticsPlanCpuInput {
                 novarocks_functions::builtin::catalogue::build_builtin_engine_function_catalog()
                     .unwrap(),
             ),
+            sealed_functions:
+                novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
             constant_policy: crate::application::test_constant_policy(),
             static_plan_carrier: CompiledPackageCarrier::for_test(
                 novarocks_physical_plan::FragmentPackageAdmission {
@@ -404,6 +409,7 @@ impl StatisticsPlanCpuInput {
             self.access.as_ref().expect("original read access"),
             self.program.as_ref().expect("original statistics program"),
             self.functions.as_ref(),
+            Arc::clone(&self.sealed_functions),
             self.constant_policy,
             &self.static_plan_carrier,
         ));
@@ -512,6 +518,7 @@ fn build_statistics_plan_parts(
     access: &FinalPlanRuntimeAccess<FrozenProviderRead>,
     program: &StatisticsCollectionProgram,
     functions: &novarocks_functions::EngineFunctionCatalog,
+    sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     constant_policy: novarocks_functions::ConstantPolicy,
     static_plan_carrier: &CompiledPackageCarrier,
 ) -> Result<StatisticsPlanParts, DistributedQueryError> {
@@ -521,6 +528,7 @@ fn build_statistics_plan_parts(
         scan,
         program.required_aggregations(),
         functions,
+        sealed_functions,
         execution.optimizer_settings(),
         novarocks_sql::planning::dml::DmlFinalPlanContext::new(
             crate::query_execution::physical_encoding::mint_plan_version(),

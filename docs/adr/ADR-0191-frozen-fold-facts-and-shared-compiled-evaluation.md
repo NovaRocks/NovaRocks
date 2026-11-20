@@ -9,6 +9,9 @@ partially-superseded-by:
   - id: ADR-0233
     scope: "Only COW root declaration, Complete rows, selection conversion/requiredness handoff and signed-layout normalization retire; shared folding, conversion, CAST and typed failure rules remain active"
     link: "ADR-0233-iceberg-mor-only-and-provider-owned-write-validation.md"
+  - id: ADR-0242
+    scope: "Frozen fold requests, FE projection and the single-node entry retire; the original binding, conversion and typed failure rules remain active"
+    link: "ADR-0242-constant-folding-compiles-expression-units.md"
 partially-supersedes:
   - id: ADR-0100
     scope: "Frozen binding-owned requests and shared compiled single-node evaluation replace SQL/execution literal-node mapping and the retained evaluator implementation; the compiler port, stateless lifetime and optional-fold policy remain active"

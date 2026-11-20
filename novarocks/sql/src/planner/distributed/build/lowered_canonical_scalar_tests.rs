@@ -101,6 +101,7 @@ pub(in crate::planner::distributed::build) fn lower_draft_with_control(
         version(),
         dop(),
         crate::functions::builtin_sql_function_catalog().snapshot(),
+        novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
         false,
         policy(),
         control,
@@ -424,6 +425,7 @@ fn canonical_scalar_actual_emission_preserves_each_success_and_ordinary_control_
                 version(),
                 dop(),
                 functions.clone(),
+                novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
                 false,
                 policy(),
                 control,
@@ -456,81 +458,5 @@ fn canonical_scalar_actual_emission_preserves_each_success_and_ordinary_control_
                 assert_eq!(control.trace(), baseline[..=stop]);
             }
         }
-    }
-}
-
-#[test]
-fn fold_and_real_lowering_share_operational_selection_and_prepared_effects() {
-    use crate::compiler::{FoldArg, selected_scalar_call::freeze_fold_call};
-    for argument in [
-        text("ABC-é"),
-        TypedExpr {
-            kind: ExprKind::Literal(LiteralValue::Null),
-            value_type: ValueType::new(DataType::Null, true),
-        },
-    ] {
-        let expression = lower_call(argument.clone(), DecimalOverflowPolicy::ReportError);
-        let ExprKind::FunctionCall { binding, .. } = &expression.kind else {
-            panic!("actual LOWER call")
-        };
-        let binding = binding.clone();
-        let FunctionArgument::Value {
-            value_type,
-            constant: Some(value),
-        } = crate::analysis::function_argument(&argument, policy(), &Control::default()).unwrap()
-        else {
-            panic!("admitted constant input")
-        };
-        let original = value.clone();
-        let args = [FoldArg { value, value_type }];
-        let owner = authored(expression);
-        let (fragment, unit_node, source) = source_named(&owner, "lower");
-        let receipt = loan(&owner, fragment, unit_node, source, &Control::default()).unwrap();
-        let call = freeze_fold_call(
-            owner.function_catalog().as_ref(),
-            &binding,
-            &args,
-            policy(),
-            true,
-            &Control::default(),
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(
-            call.selected().as_ref(),
-            receipt.canonical_selection().unwrap().as_ref()
-        );
-        assert_eq!(call.prepared_result_type(), &source.ty);
-        let operational = operational_arguments(&owner, &receipt, &Control::default()).unwrap();
-        assert_eq!(
-            call.arguments()[0].value_type,
-            constant(&operational[0]).unwrap().value_type().clone()
-        );
-        assert_eq!(
-            args[0].value.pool().backing_identity(),
-            original.pool().backing_identity()
-        );
-        if original.value_type().data_type() != &DataType::Null {
-            assert_eq!(
-                args[0].value.pool().backing_identity(),
-                original.pool().backing_identity()
-            );
-        }
-        owner.require_statement_constant_policy(policy()).unwrap();
-        let unit = unit_node.expressions.as_ref().unwrap();
-        let actual = unit
-            .claims()
-            .iter()
-            .find_map(|(use_id, frozen)| {
-                (unit.control_flow().uses()[use_id].definition == source.id).then_some(frozen)
-            })
-            .expect("actual same-node same-source LOWER preparation");
-        assert_eq!(&actual.effects, call.prepared().call_contract().effects());
-        assert_eq!(
-            actual.decimal_overflow_policy,
-            call.prepared().call_contract().decimal_overflow_policy()
-        );
-        assert_eq!(actual.regexp_count_pattern_source, None);
-        assert_eq!(actual.to_base64_byte_source, None);
     }
 }

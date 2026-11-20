@@ -5,6 +5,7 @@ domain: [pipeline-execution, runtime-filter]
 status: active
 supersedes: []
 superseded-by: null
+partially-superseded-by: [ADR-0243]
 partially-supersedes: [ADR-0027, ADR-0208]
 date: 2026-10-31
 provenance:
@@ -53,6 +54,7 @@ code-anchors:
 4. **控制独立推进规则。** 需求与累计事实订阅复用准确来源和原治理，不等待数据位置或重新取得同一数据许可。订阅 gap 或断连按新 generation 重建；数据超时恢复同一有序项，不换身份、不造默认授予。
 5. **结构等待唯一算法规则。** 精确区分消费等待与反压传播，在实际输入 occurrence 上建图；SQL 在冻结前仅对允许的可选 RF 等待降级，必要数据环明确拒绝。无共享产出计划的既有 RF 结果保持不变。完成计划使用同一纯图只读检查，不重新选择 activation，不以运行时 timeout 放宽静态证明。ADR-0001/0003 的静态分层与默认 blocking 原则保留。
 6. **观察无授权规则。** 指标只读取原 ledger、原 scheduler 和实际 Runtime。Busy 表达 unavailable，不能零化；分时快照不得拼成跨 owner 的原子退出或内存上界。故障注入必须绑定真实角色、准确工作身份与有限测试会话；控制结束、helper join、实际角色退出分别取证。
+7. **失败路由关闭规则。** 接收 Task 的已接受失败或 Participation 的实际 Abort 封住已安装的准确路由。Worker 沿原留存账本保留冻结的发送者与目的身份到请求期限，实际接收清理保留既有 decode lease。Native 在 Deliver、Demand 和 StopSender 的原请求回执中复用 `FailureFact` 投影具名停止事实。发送流核对原请求与响应后封住后续发送，等待原 Task 的停止结论。准确事实可结清该流的远端停止债务，已有活动仍按真实退出结算。失败清理不发布正常撤回。仅订阅 Grant 的发送端继续由原 Worker→FE→Worker 控制链停机。生产 Native epoch 16 依 ADR-0124 隔离仍把该回执读为新失败的旧发送端。
 
 Task RPC 从原 typed source 收到远端 `GOAWAY(NO_ERROR)` 时，即使 Tonic 投影为 `Internal`，仍保留远端效果未知，沿原 `TransportUnknown` 重发同一个不可变请求。只失效仍匹配原 acquired slot/generation 的连接；不重规划、不换 Task 身份，也不推断 Worker 未执行。消息文字不授予恢复权：无本地 typed cause 的远端 `Internal`、`PROTOCOL_ERROR` 和回复 grammar 预检拒绝继续保留各自原裁决。
 

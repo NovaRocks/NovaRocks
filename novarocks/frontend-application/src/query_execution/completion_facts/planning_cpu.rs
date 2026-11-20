@@ -35,7 +35,7 @@ use novarocks_query_application::{
 };
 use novarocks_sql::compiler::{
     CatalogRelationFact, ExplainLevel, ExplainRenderBudget, SqlCompilation, SqlCompileControl,
-    SqlCompileError, SqlCompileProgress, SqlCompletedPlan, SqlConstantEvaluator, SqlFactBatch,
+    SqlCompileError, SqlCompileProgress, SqlCompletedPlan, SqlFactBatch,
     SqlFinalPlanCompileRequest, SqlFunctionCatalog, SqlLogicalExplainCatalog,
     SqlPlanningEnvironment, SqlSessionContext,
 };
@@ -146,7 +146,7 @@ struct ReadEncodedParts {
 pub(crate) struct LogicalFinishInput {
     pub(crate) logical: SqlLogicalExplainCatalog,
     pub(crate) functions: Arc<dyn SqlFunctionCatalog>,
-    pub(crate) evaluator: &'static dyn SqlConstantEvaluator,
+    pub(crate) sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     pub(crate) policy: novarocks_functions::ConstantPolicy,
     pub(crate) environment: SqlPlanningEnvironment,
     pub(crate) level: ExplainLevel,
@@ -472,7 +472,7 @@ impl PlanningCpuOriginal {
                 PlanningCpuOutput::LogicalLines(input.logical.finish(
                     &[],
                     input.functions.as_ref(),
-                    input.evaluator,
+                    input.sealed_functions,
                     input.policy,
                     input.environment,
                     input.level,
@@ -1502,7 +1502,7 @@ mod map64_planning_worker_tests {
     };
     use novarocks_sql::compiler::{
         DEFAULT_COMPLETION_LIMITS, SessionOptimizerSettings, SqlCompileIntent, SqlStatementInput,
-        builtin_sql_function_catalog, noop_constant_evaluator,
+        builtin_sql_function_catalog,
     };
 
     fn request() -> SqlFinalPlanCompileRequest {
@@ -1529,7 +1529,7 @@ mod map64_planning_worker_tests {
             },
             SqlPlanningEnvironment::Distributed,
             builtin_sql_function_catalog().snapshot(),
-            noop_constant_evaluator(),
+            novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
             crate::application::test_constant_policy(),
             SqlCompileControl::unbounded(),
             PipelineDopDomain {

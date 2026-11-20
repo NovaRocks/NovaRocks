@@ -272,7 +272,14 @@ pub fn program(shape: Shape) -> Program {
     register_call_requests(&mut builder, &authors, &mut constants);
     let parameters = SemanticParameters::try_new([]).unwrap();
     let mut work = CompileCheckpoints::try_new(&Control, CompilePhase::Validate).unwrap();
-    declare_call_controls(&mut builder, &authors, &mut work);
+    declare_call_controls(
+        &mut builder,
+        &functions,
+        &constants,
+        &parameters,
+        constant_policy(),
+        &mut work,
+    );
     let sealed = builder
         .seal(
             vec![ExprPort {
@@ -291,9 +298,10 @@ pub fn program(shape: Shape) -> Program {
         &functions,
         sealed,
         &authors,
+        &constants,
         &parameters,
+        constant_policy(),
         &mut work,
-        |_, _, children| children,
     );
     work.finish().unwrap();
     let mut work = CompileCheckpoints::try_new(&Control, CompilePhase::LowerProgram).unwrap();

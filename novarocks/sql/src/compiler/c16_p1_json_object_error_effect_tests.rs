@@ -85,7 +85,7 @@ fn compile_with_id_type(sql: &str, id_type: DataType) -> SqlOptimizedOutput {
         SqlPlanningEnvironment::Distributed,
         &snapshot,
         crate::functions::builtin_sql_function_catalog(),
-        noop_constant_evaluator(),
+        novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
         None,
         crate::constant::test_constant_policy(),
         control.clone(),

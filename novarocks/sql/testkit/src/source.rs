@@ -47,7 +47,7 @@ use novarocks_physical_plan::{PipelineDopDomain, PlanVersionId, ScanReadBudget};
 use novarocks_sql::compiler::{
     DEFAULT_COMPLETION_LIMITS, SessionOptimizerSettings, SqlCompileControl, SqlCompileIntent,
     SqlCompileProgress, SqlCompiler, SqlFinalPlanCompileRequest, SqlPlanningEnvironment,
-    SqlSessionContext, SqlStatementInput, builtin_sql_function_catalog, noop_constant_evaluator,
+    SqlSessionContext, SqlStatementInput, builtin_sql_function_catalog,
 };
 
 pub fn sql_source(sql: &str, dtype: DataType) -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
@@ -64,6 +64,34 @@ pub fn sql_source_with_semantics(
 ) -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
     sql_source_with_explicit_single_field(sql, Field::new("k", dtype, false), sql_semantics, None)
 }
+/// Compile the same fixture with the normal SQL constant-folding rule enabled.
+pub fn sql_source_with_folding(
+    sql: &str,
+    dtype: DataType,
+) -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
+    sql_source_with_folding_and_semantics(
+        sql,
+        dtype,
+        novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+    )
+}
+
+/// Enable constant folding with the exact semantics used by the unfolded oracle.
+pub fn sql_source_with_folding_and_semantics(
+    sql: &str,
+    dtype: DataType,
+    sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings,
+) -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
+    try_sql_source_with_explicit_fields(
+        sql,
+        &[Field::new("k", dtype, false)],
+        sql_semantics,
+        None,
+        true,
+    )
+    .unwrap()
+}
+
 /// A fixture source fact is explicit; it is never inferred from test data.
 pub fn sql_source_with_single_field(
     sql: &str,
@@ -116,7 +144,8 @@ fn sql_source_with_explicit_fields(
     sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings,
     static_predicate_offer: Option<bool>,
 ) -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
-    try_sql_source_with_explicit_fields(sql, fields, sql_semantics, static_predicate_offer).unwrap()
+    try_sql_source_with_explicit_fields(sql, fields, sql_semantics, static_predicate_offer, false)
+        .unwrap()
 }
 
 pub fn try_sql_source_with_declared_fields(
@@ -131,6 +160,7 @@ pub fn try_sql_source_with_declared_fields(
         fields,
         novarocks_sql::sql_mode::SqlSemanticSettings::default(),
         None,
+        false,
     )
 }
 
@@ -139,6 +169,7 @@ fn try_sql_source_with_explicit_fields(
     fields: &[Field],
     sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings,
     static_predicate_offer: Option<bool>,
+    fold_constants: bool,
 ) -> Result<
     novarocks_sql::compiler::SqlAuthoredPhysicalPlan,
     novarocks_sql::compiler::SqlCompileProgressError,
@@ -153,6 +184,11 @@ fn try_sql_source_with_explicit_fields(
             current_catalog: None,
             current_database: "fixture".into(),
             optimizer_settings: SessionOptimizerSettings {
+                disabled_rules: if fold_constants {
+                    Vec::new()
+                } else {
+                    vec!["FoldConstant".into()]
+                },
                 enable_materialized_view_rewrite: Some(false),
                 enable_common_subexpr_reuse: Some(false),
                 enable_connector_static_predicate_pushdown: static_predicate_offer,
@@ -161,7 +197,7 @@ fn try_sql_source_with_explicit_fields(
         },
         SqlPlanningEnvironment::Distributed,
         builtin_sql_function_catalog().snapshot(),
-        noop_constant_evaluator(),
+        novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
         // Explicit fixture admission; neither capacity grant nor defaults.
         crate::sql_fixture_constant_policy(),
         control.clone(),
@@ -176,7 +212,7 @@ fn try_sql_source_with_explicit_fields(
         },
         DEFAULT_COMPLETION_LIMITS,
     );
-    let mut progress = SqlCompiler::start(request.try_into_completion().unwrap(), &control)?;
+    let mut progress = SqlCompiler::start(request.try_into_completion()?, &control)?;
     let mut bindings = SqlTableBindingAllocator::new_unique().unwrap();
     loop {
         let compilation = match progress {

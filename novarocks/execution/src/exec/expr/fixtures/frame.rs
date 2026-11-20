@@ -22,17 +22,15 @@ use novarocks_expression::testkit::ClaimAuthor as Author;
 use novarocks_expression::testkit::{
     add_call, declare_call_controls, finish_unit, register_call_requests,
 };
-use novarocks_expression_contract::{ExprId, SealedUnit};
-use novarocks_functions::{FunctionArgument, PureEngineFunctionCatalog, ScopedExpressionEffects};
+use novarocks_expression_contract::ExprId;
+use novarocks_functions::{FunctionArgument, PureEngineFunctionCatalog};
 use novarocks_local_compiler::{compile_fragment, validate_fragment_providers};
 use novarocks_local_program::LocalProgram;
 use novarocks_physical_plan::{
     FragmentBuilder, FragmentCuts, FragmentPackage, FragmentPackageInput, FragmentSink,
     FrozenFragmentPruning, NodeId, PipelineDopDomain, PlanVersionId, RequiredContracts, ResultPort,
 };
-use novarocks_type_contract::{
-    CompileCheckpoints, CompilePhase, ControlShape, ExpressionInvocation, SemanticParameters,
-};
+use novarocks_type_contract::{CompileCheckpoints, CompilePhase, ControlShape, SemanticParameters};
 use std::{collections::BTreeMap, sync::Arc};
 
 pub(crate) fn author(
@@ -67,19 +65,22 @@ fn finish_fixture_units(
     authors: &BTreeMap<ExprId, Author>,
     parameters: &SemanticParameters,
     source_pools: novarocks_physical_plan::ConstantPools,
-    mut primitive_effects: impl FnMut(
-        &SealedUnit,
-        &ExpressionInvocation<ExprId>,
-        ScopedExpressionEffects,
-    ) -> ScopedExpressionEffects,
 ) -> novarocks_physical_plan::ConstantPools {
     let mut constants = source_pools;
+    let policy = options(1).constants;
     if !authors.is_empty() {
         register_call_requests(builder.unit(author_node).unwrap(), authors, &mut constants);
     }
     let mut work = CompileCheckpoints::try_new(&FixtureControl, CompilePhase::Validate).unwrap();
     if !authors.is_empty() {
-        declare_call_controls(builder.unit(author_node).unwrap(), authors, &mut work);
+        declare_call_controls(
+            builder.unit(author_node).unwrap(),
+            functions,
+            &constants,
+            parameters,
+            policy,
+            &mut work,
+        );
     }
     let nodes = builder
         .construction_nodes()
@@ -102,9 +103,10 @@ fn finish_fixture_units(
             } else {
                 &no_authors
             },
+            &constants,
             parameters,
+            policy,
             &mut work,
-            &mut primitive_effects,
         );
         builder.install_unit(node, Arc::new(unit)).unwrap();
     }
@@ -128,7 +130,6 @@ pub(crate) fn compile_checked_fragment_with_parameters(
         authors,
         &parameters,
         source_pools,
-        |_, _, children| children,
     );
     let fragment = builder
         .finish_definition(

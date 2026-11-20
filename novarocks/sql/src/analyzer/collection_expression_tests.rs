@@ -391,27 +391,23 @@ fn null_json_list_conversion_plan_retains_the_explicit_carrier_step() {
         .analyze_expr(projection(&query("SELECT []")), &ctx.new_scope())
         .unwrap();
     let target = json_list_target();
-    for allow in [false, true] {
-        let conversion = plan_conversion(
-            ctx.function_catalog,
-            &source.value_type,
-            &target,
-            DecimalOverflowPolicy::OutputNull,
-            allow,
-            None,
-            &control,
-        )
-        .unwrap();
-        let PlannedConversion::Carrier(step) = conversion else {
-            panic!("the declared NULL lifting must remain an original carrier CAST")
-        };
-        assert_eq!(step.target(), &target);
-        assert_eq!(
-            step.decimal_overflow_policy(),
-            DecimalOverflowPolicy::OutputNull
-        );
-        assert_eq!(step.allow_throw_exception(), allow);
-    }
+    let conversion = plan_conversion(
+        ctx.function_catalog,
+        &source.value_type,
+        &target,
+        DecimalOverflowPolicy::OutputNull,
+        None,
+        &control,
+    )
+    .unwrap();
+    let PlannedConversion::Carrier(step) = conversion else {
+        panic!("the declared NULL lifting must remain an original carrier CAST")
+    };
+    assert_eq!(step.target(), &target);
+    assert_eq!(
+        step.decimal_overflow_policy(),
+        DecimalOverflowPolicy::OutputNull
+    );
     let text = ctx
         .analyze_expr(projection(&query("SELECT ['not json']")), &ctx.new_scope())
         .unwrap();
@@ -421,7 +417,6 @@ fn null_json_list_conversion_plan_retains_the_explicit_carrier_step() {
             &text.value_type,
             &target,
             DecimalOverflowPolicy::OutputNull,
-            false,
             None,
             &control
         )

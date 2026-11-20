@@ -139,11 +139,26 @@ impl Receiver {
             .expect("exchange unit owner lock")
             .clone()
     }
-    pub(super) fn retire_units(&self) -> Result<(), ExchangeFailure> {
+    pub(super) fn retire_units(&self, failed: bool) -> Result<(), ExchangeFailure> {
         let owner = self.unit_owner();
         let Some(owner) = owner else {
             return Ok(());
         };
+        let clear_queue = || {
+            let mut st = self.mu.lock().expect("exchange receiver lock");
+            st.canceled = true;
+            st.chunks.clear();
+            st.units.pending.clear();
+            st.units.boundaries.clear();
+        };
+        if failed {
+            owner
+                .slots
+                .retire_failed_with(clear_queue)
+                .map_err(ExchangeFailure::from)?;
+            self.observable.defer_notify().arm();
+            return Ok(());
+        }
         let closes = owner
             .streams
             .iter()
@@ -165,13 +180,7 @@ impl Receiver {
             .collect::<Result<Vec<_>, ExchangeFailure>>()?;
         owner
             .slots
-            .retire_with(&closes, || {
-                let mut st = self.mu.lock().expect("exchange receiver lock");
-                st.canceled = true;
-                st.chunks.clear();
-                st.units.pending.clear();
-                st.units.boundaries.clear();
-            })
+            .retire_with(&closes, clear_queue)
             .map_err(ExchangeFailure::from)?;
         self.observable.defer_notify().arm();
         Ok(())
@@ -1063,6 +1072,12 @@ mod tests {
 
     #[test]
     fn receiver_retirement_keeps_decoding_responsibility_until_actual_work_exit() {
+        for failed in [false, true] {
+            assert_receiver_retirement_keeps_real_decode(failed);
+        }
+    }
+
+    fn assert_receiver_retirement_keeps_real_decode(failed: bool) {
         let f = Fixture::new(1);
         let frame = f.frame(1, &[4], true);
         f.register(&frame);
@@ -1081,13 +1096,17 @@ mod tests {
         });
         entered.wait();
         let owner = f.registry.unit_slots.get(receiver_key(f.key)).unwrap();
-        f.registry.cancel_exchange_key(f.key);
+        if failed {
+            f.registry.fail_exchange_key(f.key);
+        } else {
+            f.registry.cancel_exchange_key(f.key);
+        }
         assert_eq!(owner.snapshot().decoding, 1);
         assert_eq!(owner.snapshot().in_use, 1);
-        assert!(matches!(
+        assert_eq!(
             owner.facts(f.stream).unwrap().receiver_closed,
-            Some(ExchangeCloseDisposition::Withdrawn)
-        ));
+            (!failed).then_some(ExchangeCloseDisposition::Withdrawn)
+        );
         release.wait();
         work.join().unwrap().unwrap();
         assert_eq!(owner.snapshot().in_use, 0);

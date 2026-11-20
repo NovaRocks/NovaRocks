@@ -19,11 +19,11 @@
 //!
 //! Statement-owned table maintenance and its shared target gate.
 
-use novarocks_state_store_api::StateStore;
-use novarocks_state_store_runtime::StateStoreRunPolicy;
 use novarocks_table_maintenance::product::TableMaintenanceProduct;
 use novarocks_table_maintenance::runtime::TerminalError;
-use novarocks_table_maintenance::{MaintenanceActionRequest, MaintenanceTarget};
+use novarocks_table_maintenance::{
+    MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceTarget,
+};
 use std::sync::Arc;
 
 pub(crate) use self::admission::{
@@ -50,23 +50,17 @@ pub struct FrontendTableMaintenanceService {
     #[cfg(novarocks_dev_controls)]
     controls: Option<Arc<test_controls::MaintenanceTestControls>>,
 }
-impl FrontendTableMaintenanceService {
-    pub async fn open(
-        durable: Option<(Arc<dyn StateStore>, StateStoreRunPolicy)>,
-    ) -> Result<Self, String> {
-        Ok(Self {
-            product: Arc::new(TableMaintenanceProduct::open(durable).await?),
+impl Default for FrontendTableMaintenanceService {
+    fn default() -> Self {
+        Self {
+            product: Arc::new(TableMaintenanceProduct::default()),
             #[cfg(novarocks_dev_controls)]
             controls: None,
-        })
+        }
     }
-    pub fn with_lake_publication_runtime_policy(
-        self,
-        policy: novarocks_query_application::publication::LakePublicationRuntimePolicy,
-    ) -> Self {
-        Self { product: Arc::new(Arc::try_unwrap(self.product).unwrap_or_else(|_| panic!("table-maintenance product is uniquely configured before service publication")).with_safe_gc_age(policy.safe_gc_age())), #[cfg(novarocks_dev_controls)] controls: self.controls }
-    }
-    #[cfg(novarocks_dev_controls)]
+}
+#[cfg(novarocks_dev_controls)]
+impl FrontendTableMaintenanceService {
     pub(crate) fn with_test_controls(
         mut self,
         controls: Option<Arc<test_controls::MaintenanceTestControls>>,
@@ -103,7 +97,7 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
             .product
             .execute_user_action(&LegacyMaintenanceEffects::new(engine, state), request)
             .await?;
-        if spark_procedure {
+        if spark_procedure || matches!(outcome, MaintenanceActionOutcome::Procedure { .. }) {
             action_result(outcome).map_err(TerminalError::from)
         } else {
             Ok(MaintenanceStatementResult::Ok)

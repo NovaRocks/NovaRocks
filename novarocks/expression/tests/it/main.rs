@@ -24,10 +24,10 @@ mod arithmetic;
 #[cfg(novarocks_dev_controls)]
 mod array_invocation_frames;
 mod byte_guarded;
+mod call_authorship;
 mod case;
 mod cast;
 mod concat_trim;
-mod constant_node;
 mod ds_hll_state_frame;
 mod ds_hll_state_private_frame;
 mod equality;
@@ -49,3 +49,4 @@ mod temporal;
 mod to_binary;
 mod unary;
 mod value_conversion;
+mod zero_port;

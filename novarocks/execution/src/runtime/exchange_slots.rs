@@ -991,6 +991,18 @@ impl ExchangeSlotInstance {
         closes: &[(ExchangeStreamIdentity, ExchangeUnitCloseDisposition)],
         clear_queue: impl FnOnce(),
     ) -> Result<(), ExchangeSlotError> {
+        self.retire_receivers(Some(closes), clear_queue)
+    }
+
+    pub fn retire_failed_with(&self, clear_queue: impl FnOnce()) -> Result<(), ExchangeSlotError> {
+        self.retire_receivers(None, clear_queue)
+    }
+
+    fn retire_receivers(
+        &self,
+        closes: Option<&[(ExchangeStreamIdentity, ExchangeUnitCloseDisposition)]>,
+        clear_queue: impl FnOnce(),
+    ) -> Result<(), ExchangeSlotError> {
         let mut changes = Vec::new();
         {
             let mut state = self
@@ -998,46 +1010,56 @@ impl ExchangeSlotInstance {
                 .state
                 .lock()
                 .expect("exchange slot instance lock");
-            let close_map: BTreeMap<_, _> = closes.iter().copied().collect();
-            if closes.len() != state.streams.len()
-                || close_map.len() != closes.len()
-                || close_map.keys().ne(state.streams.keys())
-            {
-                return Err(ExchangeSlotError::InvalidCloseSet);
-            }
-            // Prevalidate every close so one invalid stream cannot commit a prefix.
-            for (stream, disposition) in &close_map {
-                let receipt = &state.streams[stream];
-                if let Some(previous) = receipt.facts().receiver_closed {
-                    if previous != *disposition {
-                        return Err(ExchangeReceiptError::CloseConflict.into());
-                    }
-                } else if let ExchangeUnitCloseDisposition::Consumed { final_sequence } =
-                    disposition
-                    && (receipt.observed_end() != Some(*final_sequence)
-                        || receipt.handed_off_through() != final_sequence.get())
+            if let Some(closes) = closes {
+                let close_map: BTreeMap<_, _> = closes.iter().copied().collect();
+                if closes.len() != state.streams.len()
+                    || close_map.len() != closes.len()
+                    || close_map.keys().ne(state.streams.keys())
                 {
-                    return Err(ExchangeReceiptError::InputNotConsumed.into());
+                    return Err(ExchangeSlotError::InvalidCloseSet);
                 }
+                // Prevalidate every close so one invalid stream cannot commit a prefix.
+                for (stream, disposition) in &close_map {
+                    let receipt = &state.streams[stream];
+                    if let Some(previous) = receipt.facts().receiver_closed {
+                        if previous != *disposition {
+                            return Err(ExchangeReceiptError::CloseConflict.into());
+                        }
+                    } else if let ExchangeUnitCloseDisposition::Consumed { final_sequence } =
+                        disposition
+                        && (receipt.observed_end() != Some(*final_sequence)
+                            || receipt.handed_off_through() != final_sequence.get())
+                    {
+                        return Err(ExchangeReceiptError::InputNotConsumed.into());
+                    }
+                }
+                if state.closed {
+                    return Ok(());
+                }
+                for (stream, disposition) in close_map {
+                    let before = state.observation(stream)?.facts;
+                    let released = state
+                        .receipt_mut(stream)?
+                        .close_receiver(disposition)?
+                        .len();
+                    state.in_use -= released;
+                    let observation = state.observation(stream)?;
+                    if observation.facts != before {
+                        changes.push(observation);
+                    }
+                }
+            } else {
+                if state.closed {
+                    return Ok(());
+                }
+                let released: usize = state
+                    .streams
+                    .values_mut()
+                    .map(|receipt| receipt.fail_receiver().len())
+                    .sum();
+                state.in_use -= released;
             }
             // The first retire owns final-fact handoff and directory removal.
-            // A concurrent replay must not remove the entry while that handoff
-            // is still running outside this lock.
-            if state.closed {
-                return Ok(());
-            }
-            for (stream, disposition) in close_map {
-                let before = state.observation(stream)?.facts;
-                let released = state
-                    .receipt_mut(stream)?
-                    .close_receiver(disposition)?
-                    .len();
-                state.in_use -= released;
-                let observation = state.observation(stream)?;
-                if observation.facts != before {
-                    changes.push(observation);
-                }
-            }
             state.closed = true;
             state.demand.clear();
             state.queued.clear();

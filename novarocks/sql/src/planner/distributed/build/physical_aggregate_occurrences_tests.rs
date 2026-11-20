@@ -22,9 +22,6 @@ use super::super::{
         AuthoredPhysicalAggregateUpdateRequest, PhysicalAggregateRequestError,
         author_physical_aggregate_update_request_observed,
     },
-    physical_expression_effects::{
-        PhysicalExpressionEffectsInput, author_physical_expression_effects_observed,
-    },
     physical_relational_effects::PhysicalRelationalEffectsError,
 };
 use super::*;
@@ -468,7 +465,7 @@ fn root(
 fn seal_fixture_units(
     builder: &mut FragmentBuilder,
     pools: &ConstantPools,
-    catalog: &EngineFunctionCatalog,
+    _catalog: &EngineFunctionCatalog,
 ) -> BTreeMap<NodeId, NodeExpressionEffects> {
     // Fixed structural fixtures retain the original scalar author's summaries
     // beside exactly the Arc installed in their real node. No SQL journal is
@@ -492,20 +489,16 @@ fn seal_fixture_units(
         let control = Control::default();
         let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
         let sealed = draft.seal(ports, &mut work).unwrap();
-        let authored = author_physical_expression_effects_observed(
-            PhysicalExpressionEffectsInput {
-                owner: crate::planner::distributed::build::unit_source::ScalarUnitOwner::Node(node),
-                unit: &sealed,
-                constants: pools,
-                parameters: &parameters,
-                literal_policy: policy(),
-                call_scopes: &BTreeMap::new(),
-            },
-            catalog,
-            &Control::default(),
+        let authored = super::super::expression_component_test_fixture::author_component_calls(
+            &sealed,
+            pools,
+            &parameters,
+            policy(),
+            DecimalOverflowPolicy::OutputNull,
+            &mut work,
         )
         .unwrap();
-        let unit = Arc::new(sealed.finish(authored.calls, &mut work).unwrap());
+        let unit = Arc::new(sealed.finish(authored.claims, &mut work).unwrap());
         work.finish().unwrap();
         effects.insert(
             node,

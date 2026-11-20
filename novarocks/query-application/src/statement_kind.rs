@@ -98,8 +98,8 @@ impl StatementKind {
     ///
     /// This is not proof of a completion carrier when false: CALL may produce
     /// rows. An adapter inspects the actual carrier; row output suppresses
-    /// updateType except for Trino table procedures such as OPTIMIZE that
-    /// explicitly report both. Empty has no updateType.
+    /// updateType except for Trino table procedures that report metrics
+    /// alongside ALTER TABLE EXECUTE. Empty has no updateType.
     pub const fn is_row_kind(self) -> bool {
         match self {
             Self::Query

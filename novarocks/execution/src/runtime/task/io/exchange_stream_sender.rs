@@ -49,8 +49,9 @@ use crate::runtime::task::ExecutionReason;
 use super::ExchangeFrameTransmitter;
 use super::exchange::ExchangeNormalCloseAccepted;
 use super::exchange_unit::{
-    ExchangeCallActivity, ExchangeCallOutcome, ExchangeDemandCallOutcome, ExchangeDemandEntry,
-    ExchangeDemandOperation, ExchangeGrantNotice, ExchangeUnitFrame, ExchangeUnitReceiverFrame,
+    EXCHANGE_ROUTE_FAILURE_STOP, ExchangeCallActivity, ExchangeCallOutcome,
+    ExchangeDemandCallOutcome, ExchangeDemandEntry, ExchangeDemandOperation, ExchangeGrantNotice,
+    ExchangeUnitFrame, ExchangeUnitReceiverFrame,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -365,6 +366,9 @@ pub enum ExchangeStreamSenderStatus {
     Open,
     /// Every item is in receiver custody. This does not author Consumed.
     CustodyComplete,
+    /// The destination fenced this exact route. The original Task still
+    /// owns the decision to stop this execution.
+    AwaitingTaskStop,
     Withdrawn,
     Stopped,
     Failed(FailureFact),
@@ -419,6 +423,15 @@ impl fmt::Debug for ExchangeStreamSenderDiagnosticSnapshot {
 struct RetainedPayload {
     bytes: Bytes,
 }
+
+#[cfg(novarocks_dev_controls)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TestDispatch {
+    Unchecked,
+    Held,
+    Open,
+}
+
 struct SenderState {
     kernel: OrderedRetainedStream,
     payloads: BTreeMap<u64, RetainedPayload>,
@@ -443,6 +456,8 @@ struct SenderState {
     stop_obligation: ExchangeSenderStopState,
     stop_active: bool,
     stop_retry_waiting: bool,
+    #[cfg(novarocks_dev_controls)]
+    test_dispatch: TestDispatch,
 }
 
 #[derive(Clone, Copy)]
@@ -521,6 +536,8 @@ impl ExchangeStreamSender {
                 stop_obligation: ExchangeSenderStopState::NotRequired,
                 stop_active: false,
                 stop_retry_waiting: false,
+                #[cfg(novarocks_dev_controls)]
+                test_dispatch: TestDispatch::Unchecked,
             }),
         }))
     }
@@ -695,6 +712,27 @@ impl ExchangeStreamSender {
         self.notify();
     }
 
+    fn observe_failure_stop(self: &Arc<Self>) {
+        {
+            let mut state = self.state.lock().expect("exchange stream sender lock");
+            state.stop_obligation = ExchangeSenderStopState::RouteRetired;
+            if matches!(
+                state.status,
+                ExchangeStreamSenderStatus::Open | ExchangeStreamSenderStatus::CustodyComplete
+            ) {
+                state.status = ExchangeStreamSenderStatus::AwaitingTaskStop;
+                state.kernel.seal();
+                state.payloads.clear();
+                state.pending = None;
+                state.replay_due.clear();
+                state.retry_pending.clear();
+            }
+        }
+        self.stop_cancellation.cancel();
+        self.notify();
+        self.refresh();
+    }
+
     fn drive_stop(self: &Arc<Self>) {
         {
             let mut state = self.state.lock().expect("exchange stream sender lock");
@@ -785,6 +823,11 @@ impl ExchangeStreamSender {
                             self.merge_locked(&mut state, facts)
                         }
                         Ok(_) => Err(contract_failure()),
+                        Err(failure) if failure == EXCHANGE_ROUTE_FAILURE_STOP => {
+                            drop(state);
+                            self.observe_failure_stop();
+                            return;
+                        }
                         Err(failure) => Err(failure),
                     }
                 }
@@ -877,6 +920,9 @@ impl ExchangeStreamSender {
         state: &mut SenderState,
         facts: ExchangeStreamFacts,
     ) -> Result<Option<ExchangeNormalCloseAccepted>, FailureFact> {
+        if state.status == ExchangeStreamSenderStatus::AwaitingTaskStop {
+            return Ok(None);
+        }
         let custody_through = self.validate_facts_locked(state, facts)?;
         let confirms_stop = facts.sender_stopped || facts.receiver_closed.is_some();
         if matches!(
@@ -926,6 +972,9 @@ impl ExchangeStreamSender {
     fn observe(self: &Arc<Self>, notice: ExchangeGrantNotice) {
         let result = {
             let mut state = self.state.lock().expect("exchange stream sender lock");
+            if state.status == ExchangeStreamSenderStatus::AwaitingTaskStop {
+                return;
+            }
             match notice {
                 ExchangeGrantNotice::Facts(facts) => self.merge_locked(&mut state, facts),
                 ExchangeGrantNotice::Refused(failure) => Err(failure),
@@ -982,7 +1031,15 @@ impl ExchangeStreamSender {
             let (demand, watch, terminal, forget) = {
                 let mut state = self.state.lock().expect("exchange stream sender lock");
                 let terminal = state.status != ExchangeStreamSenderStatus::Open;
-                let demand = if !terminal && !state.demand_active && !state.demand_retry_waiting {
+                #[cfg(novarocks_dev_controls)]
+                let permit_demand = state.test_dispatch != TestDispatch::Held;
+                #[cfg(not(novarocks_dev_controls))]
+                let permit_demand = true;
+                let demand = if !terminal
+                    && permit_demand
+                    && !state.demand_active
+                    && !state.demand_retry_waiting
+                {
                     state
                         .pending
                         .filter(|pending| state.demand_registered != Some(*pending))
@@ -1055,7 +1112,13 @@ impl ExchangeStreamSender {
                 }
             }
             if !terminal && self.candidate().is_some() {
-                self.scheduler.request(self);
+                #[cfg(novarocks_dev_controls)]
+                let permit_dispatch = self.test_dispatch_permitted();
+                #[cfg(not(novarocks_dev_controls))]
+                let permit_dispatch = true;
+                if permit_dispatch {
+                    self.scheduler.request(self);
+                }
             }
             let mut state = self.state.lock().expect("exchange stream sender lock");
             if state.refresh_again {
@@ -1065,6 +1128,68 @@ impl ExchangeStreamSender {
                 break;
             }
         }
+    }
+
+    #[cfg(novarocks_dev_controls)]
+    fn test_dispatch_permitted(self: &Arc<Self>) -> bool {
+        {
+            let state = self.state.lock().expect("exchange stream sender lock");
+            match state.test_dispatch {
+                TestDispatch::Held => return false,
+                TestDispatch::Open => return true,
+                TestDispatch::Unchecked => {}
+            }
+            if self.config.delivery != ExchangeDeliveryRequirement::MustDrain
+                || state.pending.is_none()
+            {
+                return true;
+            }
+        }
+        let hold = match self.transmitter.test_dispatch_hold(self.config.stream) {
+            Ok(Some(hold)) => hold,
+            Ok(None) => {
+                self.state
+                    .lock()
+                    .expect("exchange stream sender lock")
+                    .test_dispatch = TestDispatch::Open;
+                return true;
+            }
+            Err(failure) => {
+                self.fail(failure);
+                return false;
+            }
+        };
+        {
+            let mut state = self.state.lock().expect("exchange stream sender lock");
+            if state.status != ExchangeStreamSenderStatus::Open {
+                return false;
+            }
+            state.test_dispatch = TestDispatch::Held;
+            state.active_control_calls = state
+                .active_control_calls
+                .checked_add(1)
+                .expect("exchange control activity count exhausted");
+        }
+        let sender = Arc::downgrade(self);
+        hold.run(
+            self.cancellation.clone(),
+            self.retry_activity(),
+            Box::new(move |result| {
+                if let Some(sender) = sender.upgrade() {
+                    if let Err(failure) = result {
+                        sender.fail(failure);
+                        return;
+                    }
+                    sender
+                        .state
+                        .lock()
+                        .expect("exchange stream sender lock")
+                        .test_dispatch = TestDispatch::Open;
+                    sender.refresh();
+                }
+            }),
+        );
+        false
     }
 
     fn demand_outcome(self: &Arc<Self>, outcome: ExchangeDemandCallOutcome) {
@@ -1083,6 +1208,9 @@ impl ExchangeStreamSender {
                 }
                 match results[0].1 {
                     Ok(facts) => self.observe(ExchangeGrantNotice::Facts(facts)),
+                    Err(failure) if failure == EXCHANGE_ROUTE_FAILURE_STOP => {
+                        self.observe_failure_stop();
+                    }
                     Err(failure) => self.fail(failure),
                 }
             }
@@ -1256,6 +1384,9 @@ impl ExchangeStreamSender {
         match outcome {
             ExchangeCallOutcome::Observed(receipt) => {
                 self.observe(ExchangeGrantNotice::Facts(receipt.facts))
+            }
+            ExchangeCallOutcome::Refused(failure) if failure == EXCHANGE_ROUTE_FAILURE_STOP => {
+                self.observe_failure_stop();
             }
             ExchangeCallOutcome::Refused(failure) => self.fail(failure),
             ExchangeCallOutcome::NotProcessed(_) | ExchangeCallOutcome::Unknown(_) => {

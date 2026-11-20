@@ -344,13 +344,6 @@ struct Shard {
 pub(super) struct RepresentativePages {
     pub(super) base: usize,
     pub(super) len: usize,
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Retains actual Direct key representative arrays for the frozen typed read/export API."
-        )
-    )]
     pages: Vec<ArrayRef>,
     _storage: ValueTypeStorageLifetime,
 }
@@ -565,13 +558,6 @@ impl Storage {
             .get()
             .ok_or_else(|| invariant(ValueViolation::RowTransaction))
     }
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Direct typed read/export locates the separately constructed NULL class."
-        )
-    )]
     pub(super) fn null_array(&self) -> ExecutionResult<Option<&ArrayRef>> {
         self.null_representative
             .get()
@@ -665,13 +651,6 @@ impl Storage {
 // This private coordinate keeps REPRESENTATIVE_ROWS inside its constructing
 // author. A NULL page is the original typed one-row array, never a fake value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Private location tag for the frozen Direct typed read/export API."
-    )
-)]
 enum DirectPageId {
     Values { shard: usize, page: usize },
     Null,
@@ -689,13 +668,6 @@ impl Storage {
             .copied()
             .ok_or_else(|| invariant(ValueViolation::RowTransaction))
     }
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Frozen Direct typed read/export preserves dense KeyIds and the original representative author."
-        )
-    )]
     fn locate_id(
         &self,
         id: KeyId,
@@ -741,13 +713,6 @@ impl Storage {
             local % REPRESENTATIVE_ROWS,
         ))
     }
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Frozen Direct typed read/export preserves dense KeyIds and the original representative author."
-        )
-    )]
     fn read_array(&self, page: DirectPageId) -> ExecutionResult<&ArrayRef> {
         match page {
             DirectPageId::Values { shard, page } => self
@@ -762,13 +727,6 @@ impl Storage {
     }
     /// Borrow exact immutable representative arrays in requested ID order.
     /// Every location is O(log W); no slot scan, per-key Arrow array or codec.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Frozen Direct typed read/export preserves dense KeyIds and the original representative author."
-        )
-    )]
     pub(super) fn read_keys(
         &self,
         ids: &[KeyId],
@@ -811,13 +769,7 @@ impl Storage {
     }
     /// The existing output author enforces exact signed target/NULL semantics
     /// and owns actual selected copy plus result/Buffer creator custody.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Frozen Direct typed read/export preserves dense KeyIds and the original representative author."
-        )
-    )]
+    #[cfg(test)]
     pub(super) fn export_keys(
         &self,
         ids: &[KeyId],
