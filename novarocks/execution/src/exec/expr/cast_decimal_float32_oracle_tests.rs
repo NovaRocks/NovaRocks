@@ -556,6 +556,7 @@ fn r(
         ),
         policy,
         allow,
+        None,
         &Control,
     )
     .unwrap()
@@ -669,6 +670,7 @@ fn complete(wide: bool) {
                 &FunctionValueType::new(DataType::Float32, true),
                 policy,
                 allow,
+                None,
                 &Control,
             )
             .unwrap();

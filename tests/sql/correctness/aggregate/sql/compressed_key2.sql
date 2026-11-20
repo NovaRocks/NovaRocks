@@ -43,23 +43,22 @@ CREATE TABLE t3 (
     c_2_13 LARGEINT NOT NULL,
     c_2_14 LARGEINT NOT NULL,
     c_2_15 LARGEINT NOT NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 3
 -- @skip_result_check=true
 USE ${case_db};
-insert into t3 values (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+insert into t3 values ROW(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
 
 -- query 4
 -- @skip_result_check=true
 USE ${case_db};
-insert into t3 values (128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128);
+insert into t3 values ROW(128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128);
 
 -- query 5
 -- @skip_result_check=true
 USE ${case_db};
-insert into t3 values (1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1);
+insert into t3 values ROW(1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1);
 
 -- query 6
 USE ${case_db};
@@ -90,13 +89,12 @@ ORDER BY trc2_output.c_2_0, trc2_output.c_2_1, trc2_output.c_2_2, trc2_output.c_
 USE ${case_db};
 CREATE TABLE t4 (
     c_2_0 LARGEINT NOT NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 8
 -- @skip_result_check=true
 USE ${case_db};
-insert into t4 values (1024), (-2139922094);
+insert into t4 values ROW(1024), ROW(-2139922094);
 
 -- query 9
 -- @expect_error=Column 't4' cannot be resolved.

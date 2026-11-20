@@ -244,7 +244,7 @@ pub(super) fn branch_union_queries(
         .into_iter()
         .map(|body| {
             let mut branch_query = query.clone();
-            branch_query.body = Box::new(body);
+            branch_query.body = ast::AstBox::new(body);
             Ok(branch_query)
         })
         .collect()
@@ -259,19 +259,15 @@ fn append_physical_apply_key(mut query: ast::Query) -> Result<ast::Query, String
         &[(HIDDEN_APPLY_KEY_COLUMN_NAME, "apply key")],
     )?;
     for item in &select.projection {
-        if matches!(
-            item,
-            ast::SelectItem::Wildcard { .. } | ast::SelectItem::QualifiedWildcard { .. }
-        ) {
+        if matches!(item, ast::SelectItem::AllColumns(_)) {
             return Err(
                 "iceberg MV physical SELECT requires explicit projection columns".to_string(),
             );
         }
     }
     select.projection.push(build::item(
-        build::identifier(build::ident("_row_id", None)),
-        Some(build::ident(HIDDEN_APPLY_KEY_COLUMN_NAME, None)),
-        true,
+        build::identifier(build::ident("_row_id", false)),
+        Some(build::ident(HIDDEN_APPLY_KEY_COLUMN_NAME, false)),
     ));
     Ok(query)
 }
@@ -282,9 +278,17 @@ fn validate_reserved_projection_output_names(
 ) -> Result<(), String> {
     for item in &select.projection {
         let output_name = match item {
-            ast::SelectItem::UnnamedExpr(expr) => Some(printer::print_expr(expr)),
-            ast::SelectItem::ExprWithAlias { alias, .. } => Some(alias.value.clone()),
-            ast::SelectItem::Wildcard { .. } | ast::SelectItem::QualifiedWildcard { .. } => None,
+            ast::SelectItem::SingleColumn(column) => Some(
+                column
+                    .alias
+                    .as_ref()
+                    .map_or_else(
+                        || printer::print_expression(&column.expression),
+                        |alias| Ok(alias.value.clone()),
+                    )
+                    .map_err(|error| error.to_string())?,
+            ),
+            ast::SelectItem::AllColumns(_) => None,
         };
         let Some(output_name) = output_name else {
             continue;
@@ -309,30 +313,37 @@ fn validate_union_projection_set_expr(
     match set_expr {
         ast::SetExpr::SetOperation(ast::SetOperation {
             operator,
-            quantifier,
-            left,
-            right,
+            distinct,
+            inputs,
+            corresponding,
             ..
         }) => {
-            if *operator != ast::SetOperator::Union || *quantifier != ast::SetQuantifier::All {
+            if corresponding.is_some() {
+                return Err(
+                    "iceberg UNION ALL MV full refresh does not support CORRESPONDING".to_string(),
+                );
+            }
+            if *operator != ast::SetOperator::Union || *distinct {
                 return Err("iceberg UNION ALL MV full refresh supports UNION ALL only".to_string());
             }
+            if inputs.len() < 2 {
+                return Err(
+                    "iceberg UNION ALL MV full refresh requires at least 2 inputs".to_string(),
+                );
+            }
             *saw_union_all = true;
-            validate_union_projection_set_expr(
-                left,
-                branch_count,
-                validated_branch_count,
-                saw_union_all,
-            )?;
-            validate_union_projection_set_expr(
-                right,
-                branch_count,
-                validated_branch_count,
-                saw_union_all,
-            )
+            for input in inputs {
+                validate_union_projection_set_expr(
+                    input,
+                    branch_count,
+                    validated_branch_count,
+                    saw_union_all,
+                )?;
+            }
+            Ok(())
         }
         ast::SetExpr::Query(query) => validate_union_projection_set_expr(
-            query.body.as_ref(),
+            query.query.body.as_ref(),
             branch_count,
             validated_branch_count,
             saw_union_all,
@@ -362,12 +373,19 @@ fn append_union_projection_hidden_columns(
     next_branch_id: &mut i32,
 ) -> Result<(), String> {
     match set_expr {
-        ast::SetExpr::SetOperation(ast::SetOperation { left, right, .. }) => {
-            append_union_projection_hidden_columns(left.as_mut(), next_branch_id)?;
-            append_union_projection_hidden_columns(right.as_mut(), next_branch_id)
+        ast::SetExpr::SetOperation(operation) => {
+            if operation.corresponding.is_some() {
+                return Err(
+                    "iceberg UNION ALL MV full refresh does not support CORRESPONDING".to_string(),
+                );
+            }
+            for input in &mut operation.inputs {
+                append_union_projection_hidden_columns(input, next_branch_id)?;
+            }
+            Ok(())
         }
         ast::SetExpr::Query(query) => {
-            append_union_projection_hidden_columns(query.body.as_mut(), next_branch_id)
+            append_union_projection_hidden_columns(query.query.body.as_mut(), next_branch_id)
         }
         ast::SetExpr::Select(select) => {
             let branch_id = *next_branch_id;
@@ -375,17 +393,15 @@ fn append_union_projection_hidden_columns(
                 .checked_add(1)
                 .ok_or_else(|| "iceberg UNION ALL MV branch id overflow".to_string())?;
             select.projection.push(build::item(
-                build::identifier(build::ident("_row_id", None)),
-                Some(build::ident(HIDDEN_APPLY_KEY_COLUMN_NAME, None)),
-                true,
+                build::identifier(build::ident("_row_id", false)),
+                Some(build::ident(HIDDEN_APPLY_KEY_COLUMN_NAME, false)),
             ));
             select.projection.push(build::item(
                 build::cast(
                     build::integer(i64::from(branch_id)),
                     build::simple_type("INT"),
                 ),
-                Some(build::ident(BRANCH_ID_COLUMN_NAME, None)),
-                true,
+                Some(build::ident(BRANCH_ID_COLUMN_NAME, false)),
             ));
             Ok(())
         }
@@ -457,32 +473,27 @@ fn walk_set_expr(
     }
     match expr {
         ast::SetExpr::Select(select) => {
-            for table_with_joins in &mut select.from {
-                walk_table_with_joins(table_with_joins, visible_ctes, state);
+            if let Some(relation) = &mut select.from {
+                walk_factor(relation, visible_ctes, state);
             }
         }
-        ast::SetExpr::SetOperation(ast::SetOperation { left, right, .. }) => {
-            walk_set_expr(left.as_mut(), visible_ctes, state);
-            walk_set_expr(right.as_mut(), visible_ctes, state);
+        ast::SetExpr::SetOperation(operation) => {
+            if operation.corresponding.is_some() {
+                state.first_error =
+                    Some("iceberg MV first refresh does not support CORRESPONDING".to_string());
+                return;
+            }
+            for input in &mut operation.inputs {
+                walk_set_expr(input, visible_ctes, state);
+            }
         }
-        ast::SetExpr::Query(query) => walk_query(query.as_mut(), visible_ctes, state),
+        ast::SetExpr::Query(query) => walk_query(query.query.as_mut(), visible_ctes, state),
         _ => {}
     }
 }
 
-fn walk_table_with_joins(
-    table_with_joins: &mut ast::TableWithJoins,
-    visible_ctes: &HashSet<String>,
-    state: &mut InjectState<'_>,
-) {
-    walk_factor(&mut table_with_joins.relation, visible_ctes, state);
-    for join in &mut table_with_joins.joins {
-        walk_factor(&mut join.relation, visible_ctes, state);
-    }
-}
-
 fn walk_factor(
-    factor: &mut ast::TableFactor,
+    factor: &mut ast::Relation,
     visible_ctes: &HashSet<String>,
     state: &mut InjectState<'_>,
 ) {
@@ -490,7 +501,8 @@ fn walk_factor(
         return;
     }
     match factor {
-        ast::TableFactor::Table { name, version, .. } => {
+        ast::Relation::Table(table) => {
+            let name = &table.name;
             let parts = name
                 .parts
                 .iter()
@@ -523,7 +535,7 @@ fn walk_factor(
                 ));
                 return;
             }
-            if version.is_some() {
+            if table.query_period.is_some() {
                 state.first_error = Some(format!(
                     "refresh SELECT must not write explicit FOR VERSION AS OF for occurrence {} ({}); refresh pin would conflict",
                     pinned.occurrence_id().get(),
@@ -531,20 +543,22 @@ fn walk_factor(
                 ));
                 return;
             }
-            *version = Some(ast::TableVersion {
-                kind: ast::TableVersionKind::ForVersionAsOf,
-                value: build::integer(pinned.snapshot_id()),
+            table.query_period = Some(ast::QueryPeriod {
+                range_type: ast::QueryPeriodRangeType::Version,
+                start: None,
+                end: Some(ast::AstBox::new(build::integer(pinned.snapshot_id()))),
                 span: Span::new(0, 0),
             });
             state.next_occurrence += 1;
             state.count += 1;
         }
-        ast::TableFactor::Derived { subquery, .. } => {
-            walk_query(subquery.as_mut(), visible_ctes, state)
+        ast::Relation::TableSubquery(node) => walk_query(&mut node.query, visible_ctes, state),
+        ast::Relation::Lateral(node) => walk_query(&mut node.query, visible_ctes, state),
+        ast::Relation::Aliased(node) => walk_factor(&mut node.relation, visible_ctes, state),
+        ast::Relation::Join(node) => {
+            walk_factor(&mut node.left, visible_ctes, state);
+            walk_factor(&mut node.right, visible_ctes, state);
         }
-        ast::TableFactor::NestedJoin {
-            table_with_joins, ..
-        } => walk_table_with_joins(table_with_joins.as_mut(), visible_ctes, state),
         _ => {}
     }
 }
@@ -589,23 +603,34 @@ fn flatten_branch_union_all_set_expr(
     match body {
         ast::SetExpr::SetOperation(ast::SetOperation {
             operator,
-            quantifier,
-            left,
-            right,
+            distinct,
+            inputs,
+            corresponding,
             ..
         }) => {
-            if !matches!(operator, ast::SetOperator::Union)
-                || !matches!(quantifier, ast::SetQuantifier::All)
-            {
+            if corresponding.is_some() {
+                return Err("iceberg branch UNION ALL aggregate first refresh does not support CORRESPONDING".to_string());
+            }
+            if !matches!(operator, ast::SetOperator::Union) || *distinct {
                 return Err(
                     "iceberg branch UNION ALL aggregate first refresh supports UNION ALL only"
                         .to_string(),
                 );
             }
-            flatten_branch_union_all_set_expr(left, out)?;
-            flatten_branch_union_all_set_expr(right, out)
+            if inputs.len() < 2 {
+                return Err(
+                    "iceberg branch UNION ALL aggregate first refresh requires at least 2 inputs"
+                        .to_string(),
+                );
+            }
+            for input in inputs {
+                flatten_branch_union_all_set_expr(input, out)?;
+            }
+            Ok(())
         }
-        ast::SetExpr::Query(query) => flatten_branch_union_all_set_expr(query.body.as_ref(), out),
+        ast::SetExpr::Query(query) => {
+            flatten_branch_union_all_set_expr(query.query.body.as_ref(), out)
+        }
         ast::SetExpr::Select(_) => {
             out.push(body.clone());
             Ok(())
@@ -621,10 +646,7 @@ mod tests {
     use super::*;
 
     fn parse_query(sql: &str) -> ast::Query {
-        let statements = novarocks_parser::parse(sql).expect("parse query");
-        let [ast::Statement::Query(query)] = statements.as_slice() else {
-            panic!("fixture must be a query");
-        };
+        let query = &novarocks_parser::parser::parse_query(sql).expect("parse query");
         query.clone()
     }
 
@@ -679,6 +701,104 @@ mod tests {
         )));
         assert_eq!(pin.occurrences()[0].occurrence_id().get(), 7);
         assert_eq!(pin.occurrences()[1].occurrence_id().get(), 42);
+
+        let union = parse_query(
+            "(SELECT l.id FROM ice.db.fact AS l) UNION ALL SELECT r.id FROM ice.db.fact AS r",
+        );
+        let original_union = union.clone();
+        let original_pin = pin.clone();
+        let prepared = prepare_union_projection_full_read_sql(&union, 2, &pin, Some("ice"), "db")
+            .expect("positional UNION ALL preserves repeated pinned occurrences");
+        let ast::SetExpr::SetOperation(original) = union.body.as_ref() else {
+            panic!("source UNION ALL");
+        };
+        let ast::SetExpr::SetOperation(operation) = prepared.body.as_ref() else {
+            panic!("prepared UNION ALL");
+        };
+        assert_eq!(operation.inputs.len(), 2);
+        assert!(matches!(&operation.inputs[0], ast::SetExpr::Query(_)));
+        for (index, (input, source)) in operation.inputs.iter().zip(&original.inputs).enumerate() {
+            let (select, source_select) = match (input, source) {
+                (ast::SetExpr::Query(query), ast::SetExpr::Query(source_query)) => {
+                    assert_eq!(query.span, source_query.span);
+                    let ast::SetExpr::Select(select) = query.query.body.as_ref() else {
+                        panic!("wrapped SELECT");
+                    };
+                    let ast::SetExpr::Select(source) = source_query.query.body.as_ref() else {
+                        panic!("source wrapped SELECT");
+                    };
+                    (select, source)
+                }
+                (ast::SetExpr::Select(select), ast::SetExpr::Select(source)) => (select, source),
+                _ => panic!("source Query boundary changed"),
+            };
+            assert_eq!(select.projection[0], source_select.projection[0]);
+            type RelationAlias<'a> = (&'a ast::Ident, &'a Option<Vec<ast::Ident>>, Span);
+
+            fn base(relation: &ast::Relation) -> (&ast::Table, Option<RelationAlias<'_>>) {
+                match relation {
+                    ast::Relation::Table(table) => (table, None),
+                    ast::Relation::Aliased(alias) => {
+                        let ast::Relation::Table(table) = alias.relation.as_ref() else {
+                            panic!("base table")
+                        };
+                        (table, Some((&alias.alias, &alias.column_names, alias.span)))
+                    }
+                    _ => panic!("base table"),
+                }
+            }
+            let (table, alias) = base(select.from.as_ref().unwrap());
+            let (original_table, original_alias) = base(source_select.from.as_ref().unwrap());
+            assert_eq!(table.name, original_table.name);
+            assert_eq!(alias, original_alias);
+            let version = table.query_period.as_ref().expect("pinned query period");
+            assert_eq!(version.range_type, ast::QueryPeriodRangeType::Version);
+            assert!(
+                crate::analyzer::iceberg_ref::query_period_end(version)
+                    .unwrap()
+                    .syntax_eq(&build::integer(if index == 0 { 11 } else { 22 }))
+            );
+            let ast::SelectItem::SingleColumn(projection_column) =
+                select.projection.last().unwrap()
+            else {
+                panic!("branch id");
+            };
+            let ast::SingleColumn {
+                expression: expr,
+                alias: Some(alias),
+                ..
+            } = projection_column.as_ref()
+            else {
+                panic!("branch id");
+            };
+            assert_eq!(alias.value, BRANCH_ID_COLUMN_NAME);
+            assert!(expr.syntax_eq(&build::cast(
+                build::integer(index as i64),
+                build::simple_type("INT")
+            )));
+        }
+        assert_eq!(union, original_union);
+        assert_eq!(pin, original_pin);
+        for columns in [Vec::new(), vec![build::ident("id", false)]] {
+            let mut corresponding = union.clone();
+            let ast::SetExpr::SetOperation(operation) = corresponding.body.as_mut() else {
+                panic!("UNION ALL");
+            };
+            operation.corresponding = Some(ast::Corresponding {
+                columns,
+                span: Span::new(0, 0),
+            });
+            assert!(
+                prepare_union_projection_full_read_sql(&corresponding, 2, &pin, Some("ice"), "db")
+                    .unwrap_err()
+                    .contains("CORRESPONDING")
+            );
+            assert!(
+                branch_union_queries(&corresponding, 2, &pin, Some("ice"), "db")
+                    .unwrap_err()
+                    .contains("CORRESPONDING")
+            );
+        }
     }
 
     #[test]

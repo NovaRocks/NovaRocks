@@ -17,34 +17,17 @@
 
 //! Native typed-query table-reference extraction and catalog stripping.
 
-use novarocks_parser::ast::{self as ast, Fold, TableFactor};
+use novarocks_parser::ast::{self as ast, Fold};
 
 struct CatalogStripper;
 
 impl Fold for CatalogStripper {
-    fn fold_table_factor(&mut self, factor: TableFactor) -> TableFactor {
-        let factor = ast::fold_table_factor(self, factor);
-        match factor {
-            TableFactor::Table {
-                mut name,
-                metadata,
-                alias,
-                version,
-                span,
-            } => {
-                if name.parts.len() == 3 {
-                    name.parts.remove(0);
-                }
-                TableFactor::Table {
-                    name,
-                    metadata,
-                    alias,
-                    version,
-                    span,
-                }
-            }
-            other => other,
+    fn fold_table(&mut self, mut table: ast::Table) -> ast::Table {
+        table = ast::fold_table(self, table);
+        if table.name.parts.len() == 3 {
+            table.name.parts.remove(0);
         }
+        table
     }
 }
 
@@ -58,15 +41,11 @@ pub(crate) fn strip_catalog_from_three_part_names(query: &mut ast::Query) {
 
 #[cfg(test)]
 mod tests {
-    use novarocks_parser::ast::Statement;
 
     use super::*;
 
     fn parse_query(sql: &str) -> ast::Query {
-        let statements = novarocks_parser::parse(sql).expect("parse native SQL");
-        let [Statement::Query(query)] = statements.as_slice() else {
-            panic!("expected query");
-        };
+        let query = &novarocks_parser::parser::parse_query(sql).expect("parse native SQL");
         query.clone()
     }
 
@@ -78,7 +57,7 @@ mod tests {
         );
         strip_catalog_from_three_part_names(&mut query);
         assert_eq!(
-            novarocks_parser::printer::print_query(&query),
+            novarocks_parser::printer::print_query(&query).unwrap(),
             "WITH x AS (SELECT * FROM db.seed) SELECT (SELECT count(*) FROM db.t) FROM db.outer_t"
         );
     }

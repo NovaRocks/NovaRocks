@@ -27,12 +27,11 @@
 CREATE TABLE ${case_db}.t_agg_empty_input_null_semantics (
     g INT,
     v INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t_agg_empty_input_null_semantics VALUES
-    (1, 10),
-    (2, NULL);
+    ROW(1, 10),
+    ROW(2, NULL);
 
 SELECT
     COUNT(*) AS c_all,

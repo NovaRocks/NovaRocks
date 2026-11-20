@@ -23,7 +23,7 @@ pub use crate::mv_refresh::{
 };
 pub use crate::planner::vocabulary::ApplyKeySource;
 use novarocks_parser::{
-    ast::{self as ast, Expr, ObjectName, Query, Select, SelectItem, SetExpr, TableFactor},
+    ast::{self as ast, Expr, ObjectName, Query, Select, SelectItem, SetExpr},
     printer,
 };
 use novarocks_type_contract::{
@@ -95,69 +95,6 @@ pub const MV_JOIN_APPLY_KEY_COLUMN_NAME: &str =
 /// contracts.
 pub const MV_GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME: &str =
     crate::planner::vocabulary::GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME;
-
-/// Reject non-COUNT aggregate stars at the Iceberg IMV boundary before the
-/// generic analyzer attempts to resolve the parser-native `*` as a column.
-///
-/// `COUNT(*)` has a typed empty-argument representation in the analyzer. All
-/// other supported IMV aggregates require one expression argument, so their
-/// syntactic star must produce the same contract error as an empty call.
-///
-/// This validation runs before generic analysis resolves `*` as a
-/// column. This is a direct parser-AST rejection, so it preserves the
-/// function-call span and uses the analyze-domain argument category.
-pub fn validate_imv_aggregate_star_arguments(query: &Query) -> Result<(), AnalyzeError> {
-    validate_imv_aggregate_star_set_expr(query.body.as_ref())
-}
-
-fn validate_imv_aggregate_star_set_expr(expr: &SetExpr) -> Result<(), AnalyzeError> {
-    match expr {
-        SetExpr::Select(select) => {
-            for item in &select.projection {
-                let expr = match item {
-                    SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => expr,
-                    SelectItem::Wildcard { .. } | SelectItem::QualifiedWildcard { .. } => continue,
-                };
-                validate_imv_aggregate_star_expr(expr)?;
-            }
-            Ok(())
-        }
-        SetExpr::SetOperation(operation) => {
-            validate_imv_aggregate_star_set_expr(&operation.left)?;
-            validate_imv_aggregate_star_set_expr(&operation.right)
-        }
-        SetExpr::Query(query) => validate_imv_aggregate_star_set_expr(query.body.as_ref()),
-        SetExpr::Values(_) => Ok(()),
-    }
-}
-
-fn validate_imv_aggregate_star_expr(expr: &Expr) -> Result<(), AnalyzeError> {
-    let Expr::FunctionCall(function) = expr else {
-        return Ok(());
-    };
-    let [Expr::Identifier(argument)] = function.arguments.as_slice() else {
-        return Ok(());
-    };
-    if argument.value != "*"
-        || !matches!(function.quantifier, ast::FunctionQuantifier::None)
-        || function.name.parts.len() != 1
-    {
-        return Ok(());
-    }
-    let name = function.name.parts[0].value.to_ascii_lowercase();
-    if matches!(
-        name.as_str(),
-        "sum" | "avg" | "min" | "max" | "bool_or" | "boolor_agg" | "bool_and" | "booland_agg"
-    ) {
-        return Err(AnalyzeError::invalid_argument(
-            format!(
-                "Iceberg IMV refresh contract requires exactly one argument for aggregate function `{name}`"
-            ),
-            function.span,
-        ));
-    }
-    Ok(())
-}
 
 /// Immutable SQL-owned classification of an MV hidden apply key.
 ///
@@ -330,10 +267,7 @@ mod refresh_property_facade_tests {
     use novarocks_types::schema::ColumnDef;
 
     fn parse_query(sql: &str) -> Query {
-        let statements = novarocks_parser::parse(sql).expect("parse query");
-        let [ast::Statement::Query(query)] = statements.as_slice() else {
-            panic!("expected query");
-        };
+        let query = &novarocks_parser::parser::parse_query(sql).expect("parse query");
         query.clone()
     }
 
@@ -2088,31 +2022,13 @@ fn output_column_facts(
 }
 
 fn first_union_branch_query(query: &Query) -> Result<Query, String> {
-    fn first_branch_body(body: &SetExpr) -> Result<&SetExpr, String> {
-        match body {
-            SetExpr::SetOperation(ast::SetOperation {
-                operator,
-                quantifier,
-                left,
-                ..
-            }) if *operator == ast::SetOperator::Union
-                && matches!(quantifier, ast::SetQuantifier::All) =>
-            {
-                first_branch_body(left)
-            }
-            SetExpr::SetOperation(_) => {
-                Err("aggregate MV first branch requires UNION ALL set operations".to_string())
-            }
-            SetExpr::Query(inner) => first_branch_body(inner.body.as_ref()),
-            _ => Ok(body),
-        }
-    }
-
-    let body = first_branch_body(query.body.as_ref())?;
-    // `SqlMvAggregateLayoutFacts` needs a full query wrapper for the existing
-    // FROM-agnostic aggregate extractor. Keep the wrapper private to SQL.
+    let mut branches = Vec::new();
+    flatten_union_all(query.body.as_ref(), &mut branches)?;
+    let body = branches.first().ok_or_else(union_all_error)?;
+    // This private wrapper selects the actual first source branch, without
+    // rebuilding the source set-operation association or its inputs.
     let mut branch = query.clone();
-    branch.body = Box::new(body.clone());
+    branch.body = ast::AstBox::new((*body).clone());
     Ok(branch)
 }
 
@@ -2368,31 +2284,40 @@ pub fn extract_aggregate_sql_calls(query: &Query) -> Result<SqlMvAggregateCalls,
 }
 
 /// Extract the table names and aliases from a two-relation plain SELECT join.
+fn direct_join(select: &Select) -> Option<&ast::Join> {
+    let ast::Relation::Join(join) = select.from.as_ref()? else {
+        return None;
+    };
+    if join.kind == ast::JoinType::Implicit {
+        return None;
+    }
+    Some(join)
+}
+fn plain_table(relation: &ast::Relation) -> Option<(&ast::Table, Option<&ast::AliasedRelation>)> {
+    match relation {
+        ast::Relation::Table(table) => Some((table, None)),
+        ast::Relation::Aliased(alias)
+            if !alias.column_names.as_ref().is_some_and(Vec::is_empty) =>
+        {
+            if let ast::Relation::Table(table) = alias.relation.as_ref() {
+                Some((table, Some(alias)))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 pub fn extract_join_aliases(query: &Query) -> Result<SqlMvJoinAliases, String> {
     let SetExpr::Select(select) = query.body.as_ref() else {
         return Err(
             "extract_join_aliases: expected a plain SELECT body, not a set operation".to_string(),
         );
     };
-    let [from] = select.from.as_slice() else {
-        return Err(
-            "extract_join_aliases: expected exactly one FROM clause entry for a two-relation join"
-                .to_string(),
-        );
-    };
-    let [join] = from.joins.as_slice() else {
-        if from.joins.is_empty() {
-            return Err(
-                "extract_join_aliases: expected a two-relation join (FROM ... JOIN ...), but the FROM clause has no joins".to_string(),
-            );
-        }
-        return Err(format!(
-            "extract_join_aliases: expected exactly one JOIN, found {}",
-            from.joins.len()
-        ));
-    };
-    let (left_name, left_alias) = table_factor_name_and_alias(&from.relation)?;
-    let (right_name, right_alias) = table_factor_name_and_alias(&join.relation)?;
+    let join = direct_join(select).ok_or_else(|| "extract_join_aliases: expected a two-relation join (FROM ... JOIN ...), but the FROM clause has no joins".to_string())?;
+    let (left_name, left_alias) = table_factor_name_and_alias(&join.left)?;
+    let (right_name, right_alias) = table_factor_name_and_alias(&join.right)?;
     Ok(SqlMvJoinAliases {
         left_table: printer::print_object_name(&left_name),
         left_alias,
@@ -2439,11 +2364,9 @@ pub fn extract_refresh_join_analysis(query: &Query) -> Result<SqlMvRefreshJoinAn
     let SetExpr::Select(select) = query.body.as_ref() else {
         unreachable!("direct join aliases require SELECT");
     };
-    let join = &select.from[0].joins[0];
-    match (&join.operator, &join.constraint) {
-        (ast::JoinOperator::Cross, ast::JoinConstraint::None) => {
-            Ok(SqlMvRefreshJoinAnalysis::ZeroKeyCrossJoin)
-        }
+    let join = direct_join(select).expect("direct join aliases require Join");
+    match (&join.kind, &join.criteria) {
+        (ast::JoinType::Cross, None) => Ok(SqlMvRefreshJoinAnalysis::ZeroKeyCrossJoin),
         _ => extract_join_equality_predicates(query).map(SqlMvRefreshJoinAnalysis::InnerEquiJoin),
     }
 }
@@ -2465,27 +2388,19 @@ pub fn extract_join_equality_predicates(
                 .to_string(),
         );
     };
-    let [from] = select.from.as_slice() else {
-        return Err(
-            "extract_join_equality_predicates: expected exactly one FROM clause entry".to_string(),
-        );
-    };
-    let [join] = from.joins.as_slice() else {
-        return Err(format!(
-            "extract_join_equality_predicates: expected exactly one JOIN, found {}",
-            from.joins.len()
-        ));
-    };
-    if !matches!(
-        join.operator,
-        ast::JoinOperator::Inner | ast::JoinOperator::InnerExplicit
-    ) {
+    let join = direct_join(select)
+        .ok_or_else(|| "extract_join_equality_predicates: expected exactly one JOIN".to_string())?;
+    if !matches!(join.kind, ast::JoinType::Inner) {
         return Err(format!(
             "extract_join_equality_predicates: incremental join refresh supports an inner join, not {:?}",
-            join.operator
+            join.kind
         ));
     }
-    let ast::JoinConstraint::On(condition) = &join.constraint else {
+    let Some(ast::JoinCriteria::On(ast::JoinOn {
+        expression: condition,
+        ..
+    })) = &join.criteria
+    else {
         return Err(
             "extract_join_equality_predicates: incremental join refresh requires an ON condition"
                 .to_string(),
@@ -2506,25 +2421,28 @@ fn collect_join_equality_predicates(
     predicates: &mut Vec<SqlMvJoinPredicateColumns>,
 ) -> Result<(), String> {
     match condition {
-        ast::Expr::Nested(nested) => {
-            collect_join_equality_predicates(&nested.expression, predicates)
+        ast::Expr::Logical(logical) if logical.operator == ast::LogicalOperator::And => {
+            for term in &logical.terms {
+                collect_join_equality_predicates(term, predicates)?;
+            }
+            Ok(())
         }
-        ast::Expr::Binary(binary) => match binary.operator {
-            ast::BinaryOperator::And => {
-                collect_join_equality_predicates(&binary.left, predicates)?;
-                collect_join_equality_predicates(&binary.right, predicates)
+        ast::Expr::Predicated(node) => {
+            let ast::Predicate::Comparison(predicate) = &node.predicate else {
+                return Err("extract_join_equality_predicates: an ON condition may only conjoin ordinary equalities".into());
+            };
+            if predicate.operator != ast::ComparisonOperator::Equal {
+                return Err(format!(
+                    "extract_join_equality_predicates: an ON condition may only conjoin equalities, not {:?}",
+                    predicate.operator
+                ));
             }
-            ast::BinaryOperator::Equal => {
-                predicates.push(SqlMvJoinPredicateColumns {
-                    left: join_column_ref(&binary.left)?,
-                    right: join_column_ref(&binary.right)?,
-                });
-                Ok(())
-            }
-            other => Err(format!(
-                "extract_join_equality_predicates: an ON condition may only conjoin equalities, not {other:?}"
-            )),
-        },
+            predicates.push(SqlMvJoinPredicateColumns {
+                left: join_column_ref(&node.value)?,
+                right: join_column_ref(&predicate.right)?,
+            });
+            Ok(())
+        }
         other => Err(format!(
             "extract_join_equality_predicates: unsupported ON condition shape {:?}",
             std::mem::discriminant(other)
@@ -2533,21 +2451,27 @@ fn collect_join_equality_predicates(
 }
 
 fn join_column_ref(expr: &ast::Expr) -> Result<SqlMvJoinColumnRef, String> {
-    let ast::Expr::CompoundIdentifier(compound) = expr else {
+    let Some(chain) = ast::identifier_chain_observed(expr, |_| Ok::<(), String>(()))? else {
         return Err(
             "extract_join_equality_predicates: each side of an equality must be a qualified column"
                 .to_string(),
         );
     };
-    let [qualifier, column] = compound.parts.as_slice() else {
+    if chain.len() < 2 {
+        return Err(
+            "extract_join_equality_predicates: each side of an equality must be a qualified column"
+                .to_string(),
+        );
+    }
+    if chain.len() != 2 {
         return Err(format!(
             "extract_join_equality_predicates: expected `qualifier`.`column`, found {} parts",
-            compound.parts.len()
+            chain.len()
         ));
-    };
+    }
     Ok(SqlMvJoinColumnRef {
-        qualifier: qualifier.value.clone(),
-        column: column.value.clone(),
+        qualifier: chain.first().value.clone(),
+        column: chain.last().value.clone(),
     })
 }
 
@@ -2559,19 +2483,20 @@ pub fn extract_single_scan_table_fqn(query: &Query) -> Result<String, String> {
                 .to_string(),
         );
     };
-    let [from] = select.from.as_slice() else {
-        return Err(
-            "extract_single_scan_table_fqn: expected exactly one FROM clause entry for a single scan"
-                .to_string(),
-        );
-    };
-    if !from.joins.is_empty() {
+    let relation = select.from.as_ref().ok_or_else(|| "extract_single_scan_table_fqn: expected exactly one FROM clause entry for a single scan".to_string())?;
+    if let ast::Relation::Join(join) = relation {
+        if join.kind == ast::JoinType::Implicit {
+            return Err(
+                "extract_single_scan_table_fqn: expected exactly one FROM clause entry for a single scan"
+                    .to_string(),
+            );
+        }
         return Err(
             "extract_single_scan_table_fqn: expected a single-scan FROM, but the FROM clause has joins"
                 .to_string(),
         );
     }
-    let (name, _alias) = table_factor_name_and_alias(&from.relation)?;
+    let (name, _alias) = table_factor_name_and_alias(relation)?;
     Ok(printer::print_object_name(&name))
 }
 
@@ -2633,26 +2558,35 @@ fn flatten_union_all<'a>(body: &'a SetExpr, out: &mut Vec<&'a SetExpr>) -> Resul
     match body {
         SetExpr::SetOperation(ast::SetOperation {
             operator,
-            quantifier,
-            left,
-            right,
+            distinct,
+            inputs,
+            corresponding,
             ..
         }) => {
-            if !matches!(operator, ast::SetOperator::Union)
-                || !matches!(quantifier, ast::SetQuantifier::All)
-            {
+            if corresponding.is_some() {
+                return Err("incremental UNION ALL MV does not support CORRESPONDING".to_string());
+            }
+            if !matches!(operator, ast::SetOperator::Union) || *distinct {
                 return Err(union_all_non_all_error());
             }
-            flatten_union_all(left, out)?;
-            flatten_union_all(right, out)
+            if inputs.len() < 2 {
+                return Err(union_all_error());
+            }
+            for input in inputs {
+                flatten_union_all(input, out)?;
+            }
+            Ok(())
         }
-        SetExpr::Select(_) => {
+        SetExpr::Select(select) => {
+            if !select.modifiers.is_empty() {
+                return Err(union_all_error());
+            }
             out.push(body);
             Ok(())
         }
         SetExpr::Query(inner) => {
-            reject_unsupported_query_clauses(inner).map_err(|_| union_all_error())?;
-            flatten_union_all(inner.body.as_ref(), out)
+            reject_unsupported_query_clauses(&inner.query).map_err(|_| union_all_error())?;
+            flatten_union_all(inner.query.body.as_ref(), out)
         }
         _ => Err(union_all_error()),
     }
@@ -2660,7 +2594,7 @@ fn flatten_union_all<'a>(body: &'a SetExpr, out: &mut Vec<&'a SetExpr>) -> Resul
 
 fn wrap_setexpr_as_query(outer: &Query, body: &SetExpr) -> Query {
     let mut query = outer.clone();
-    query.body = Box::new(body.clone());
+    query.body = ast::AstBox::new(body.clone());
     query
 }
 
@@ -2749,22 +2683,21 @@ fn classify_aggregate_mv_query(query: &Query) -> Result<AggregateMvShape, String
 }
 
 fn extract_union_all_fan_in_bases(select: &Select) -> Result<Vec<ObjectName>, String> {
-    let [from] = select.from.as_slice() else {
+    let Some(relation) = &select.from else {
         return Ok(Vec::new());
     };
-    if !from.joins.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let TableFactor::Derived {
-        lateral, subquery, ..
-    } = &from.relation
-    else {
-        return Ok(Vec::new());
+    let relation = if let ast::Relation::Aliased(node) = relation {
+        node.relation.as_ref()
+    } else {
+        relation
     };
-    if *lateral {
+    if matches!(relation, ast::Relation::Lateral(_)) {
         return Err(aggregate_error());
     }
+    let ast::Relation::TableSubquery(node) = relation else {
+        return Ok(Vec::new());
+    };
+    let subquery = &node.query;
     reject_unsupported_query_clauses(subquery).map_err(|_| aggregate_error())?;
     if !matches!(subquery.body.as_ref(), SetExpr::SetOperation(_)) {
         return Ok(Vec::new());
@@ -2818,12 +2751,12 @@ pub fn classify_aggregate_select_outputs(
     select: &Select,
 ) -> Result<AggregateSelectOutputs, String> {
     let group_by_exprs = aggregate_group_by_exprs(&select.group_by)?;
-    for expr in group_by_exprs {
+    for expr in &group_by_exprs {
         reject_unsupported_expr(expr).map_err(aggregate_expr_error)?;
     }
 
     let mut group_keys = group_by_exprs
-        .iter()
+        .into_iter()
         .cloned()
         .map(|expr| GroupKeyShape {
             output_name: String::new(),
@@ -2833,12 +2766,16 @@ pub fn classify_aggregate_select_outputs(
     let mut aggregates = Vec::new();
     let mut visible_outputs = Vec::with_capacity(select.projection.len());
     let mut projected_group_keys = vec![false; group_keys.len()];
+    let group_keys_sql = group_keys
+        .iter()
+        .map(|key| printer::print_expression(&key.expr))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
 
     for item in &select.projection {
         let (expr, output_name) = projection_expr_and_output_name(item)?;
-        if let Some(group_key_index) = group_keys
-            .iter()
-            .position(|group_key| printer::print_expr(&group_key.expr) == printer::print_expr(expr))
+        let expression_sql = printer::print_expression(expr).map_err(|error| error.to_string())?;
+        if let Some(group_key_index) = group_keys_sql.iter().position(|key| *key == expression_sql)
         {
             if group_keys[group_key_index].output_name.is_empty() {
                 group_keys[group_key_index].output_name = output_name;
@@ -2885,25 +2822,21 @@ fn classify_join_projection_filter_mv_query(
 fn classify_join_projection_filter_mv_query_for_select(
     select: &Select,
 ) -> Result<JoinProjectionFilterMvShape, String> {
-    let [from] = select.from.as_slice() else {
-        return Err(join_projection_filter_error());
-    };
-    let [join] = from.joins.as_slice() else {
+    let join = direct_join(select).ok_or_else(join_projection_filter_error)?;
+    // The original sequence of JOINs is lowered as a left-deep relation tree.
+    if matches!(join.left.as_ref(), ast::Relation::Join(_)) {
         return Err("incremental join MV requires exactly two Iceberg base tables".to_string());
-    };
-    if !matches!(
-        join.operator,
-        ast::JoinOperator::Inner | ast::JoinOperator::InnerExplicit
-    ) {
+    }
+    if !matches!(join.kind, ast::JoinType::Inner) {
         return Err("incremental join MV supports only two-table inner equi-join".to_string());
     }
-    let (left_table, left_alias) = table_factor_name_and_alias(&from.relation)?;
-    let (right_table, right_alias) = table_factor_name_and_alias(&join.relation)?;
+    let (left_table, left_alias) = table_factor_name_and_alias(&join.left)?;
+    let (right_table, right_alias) = table_factor_name_and_alias(&join.right)?;
     if left_alias.eq_ignore_ascii_case(&right_alias) {
         return Err("incremental join MV requires distinct join aliases".to_string());
     }
-    let condition = match &join.constraint {
-        ast::JoinConstraint::On(expr) => expr,
+    let condition = match &join.criteria {
+        Some(ast::JoinCriteria::On(on)) => &on.expression,
         _ => return Err("incremental join MV requires JOIN ... ON equi predicates".to_string()),
     };
     let mut join_keys = Vec::new();
@@ -2920,18 +2853,17 @@ fn classify_join_projection_filter_mv_query_for_select(
     })
 }
 
-pub fn table_factor_name_and_alias(factor: &TableFactor) -> Result<(ObjectName, String), String> {
-    let TableFactor::Table {
-        name,
-        alias,
-        version,
-        metadata,
-        ..
-    } = factor
-    else {
-        return Err("incremental join MV base relation must be a table".to_string());
-    };
-    if metadata.is_some() || version.is_some() || !is_three_part_object_name(name) {
+pub fn table_factor_name_and_alias(
+    relation: &ast::Relation,
+) -> Result<(ObjectName, String), String> {
+    let (table, alias) = plain_table(relation)
+        .ok_or_else(|| "incremental join MV base relation must be a table".to_string())?;
+    let name = &table.name;
+    if crate::analyzer::TableNameView::new(name).metadata.is_some()
+        || table.query_period.is_some()
+        || table.branch.is_some()
+        || !is_three_part_object_name(name)
+    {
         return Err(
             "incremental join MV base relation must be a plain 3-part Iceberg table".to_string(),
         );
@@ -2941,11 +2873,12 @@ pub fn table_factor_name_and_alias(factor: &TableFactor) -> Result<(ObjectName, 
         .last()
         .map(|part| part.value.clone())
         .ok_or_else(|| "incremental join MV table name has no identifier".to_string())?;
-    let alias = alias
-        .as_ref()
-        .map(|a| a.name.value.clone())
-        .unwrap_or(fallback);
-    Ok((name.clone(), alias))
+    Ok((
+        name.clone(),
+        alias
+            .map(|alias| alias.alias.value.clone())
+            .unwrap_or(fallback),
+    ))
 }
 
 fn collect_equi_join_keys(
@@ -2955,29 +2888,38 @@ fn collect_equi_join_keys(
     out: &mut Vec<JoinKeyPairShape>,
 ) -> Result<(), String> {
     match expr {
-        Expr::Nested(inner) => {
-            collect_equi_join_keys(&inner.expression, left_alias, right_alias, out)
+        Expr::Logical(logical) if logical.operator == ast::LogicalOperator::And => {
+            for term in &logical.terms {
+                collect_equi_join_keys(term, left_alias, right_alias, out)?;
+            }
+            Ok(())
         }
-        Expr::Binary(binary) if binary.operator == ast::BinaryOperator::And => {
-            collect_equi_join_keys(&binary.left, left_alias, right_alias, out)?;
-            collect_equi_join_keys(&binary.right, left_alias, right_alias, out)
-        }
-        Expr::Binary(binary) if binary.operator == ast::BinaryOperator::Equal => {
-            let left_q = qualified_column_alias(&binary.left)?;
-            let right_q = qualified_column_alias(&binary.right)?;
+        Expr::Predicated(node) => {
+            let ast::Predicate::Comparison(predicate) = &node.predicate else {
+                return Err(
+                    "incremental join MV supports only AND-combined equi-join predicates".into(),
+                );
+            };
+            if predicate.operator != ast::ComparisonOperator::Equal {
+                return Err(
+                    "incremental join MV supports only AND-combined equi-join predicates".into(),
+                );
+            }
+            let left_q = qualified_column_alias(&node.value)?;
+            let right_q = qualified_column_alias(&predicate.right)?;
             if left_q.eq_ignore_ascii_case(left_alias) && right_q.eq_ignore_ascii_case(right_alias)
             {
                 out.push(JoinKeyPairShape {
-                    left_expr: (*binary.left).clone(),
-                    right_expr: (*binary.right).clone(),
+                    left_expr: node.value.clone(),
+                    right_expr: predicate.right.clone(),
                 });
                 Ok(())
             } else if left_q.eq_ignore_ascii_case(right_alias)
                 && right_q.eq_ignore_ascii_case(left_alias)
             {
                 out.push(JoinKeyPairShape {
-                    left_expr: (*binary.right).clone(),
-                    right_expr: (*binary.left).clone(),
+                    left_expr: predicate.right.clone(),
+                    right_expr: node.value.clone(),
                 });
                 Ok(())
             } else {
@@ -2992,25 +2934,22 @@ fn collect_equi_join_keys(
 }
 
 fn qualified_column_alias(expr: &Expr) -> Result<String, String> {
-    if let Expr::Nested(inner) = expr {
-        return qualified_column_alias(&inner.expression);
-    }
-    let Expr::CompoundIdentifier(parts) = expr else {
-        return Err(
-            "incremental join MV join key must be a qualified column reference".to_string(),
-        );
-    };
-    let [alias, _column] = parts.parts.as_slice() else {
+    let chain = ast::identifier_chain_observed(expr, |_| Ok::<(), String>(()))?
+        .filter(|chain| chain.len() > 1)
+        .ok_or_else(|| {
+            "incremental join MV join key must be a qualified column reference".to_string()
+        })?;
+    if chain.len() != 2 {
         return Err("incremental join MV join key must be <alias>.<column>".to_string());
-    };
-    Ok(alias.value.clone())
+    }
+    Ok(chain.first().value.clone())
 }
 
 fn is_probably_join_query(query: &Query) -> bool {
     let SetExpr::Select(select) = query.body.as_ref() else {
         return false;
     };
-    select.from.len() > 1 || select.from.iter().any(|from| !from.joins.is_empty())
+    matches!(select.from.as_ref(), Some(ast::Relation::Join(_)))
 }
 
 fn join_projection_filter_error() -> String {
@@ -3019,11 +2958,13 @@ fn join_projection_filter_error() -> String {
 }
 
 fn reject_unsupported_query_clauses(query: &Query) -> Result<(), String> {
-    if query.with.is_some()
-        || !query.order_by.is_empty()
-        || query.limit.is_some()
-        || query.offset.is_some()
-        || query.fetch.is_some()
+    if !query.session_properties.is_empty()
+        || !query.functions.is_empty()
+        || query.with.is_some()
+        || query.modifiers.order_by.is_some()
+        || query.modifiers.limit.is_some()
+        || query.modifiers.offset.is_some()
+        || matches!(query.body.as_ref(), SetExpr::Select(select) if !select.modifiers.is_empty())
     {
         return Err(projection_filter_error());
     }
@@ -3031,15 +2972,11 @@ fn reject_unsupported_query_clauses(query: &Query) -> Result<(), String> {
 }
 
 fn reject_unsupported_select_clauses(select: &Select) -> Result<(), String> {
-    if !select.hints.is_empty()
-        || !matches!(
-            select.quantifier,
-            ast::SelectQuantifier::None | ast::SelectQuantifier::All(_)
-        )
-        || !matches!(select.group_by, ast::GroupBy::None)
+    if select.distinct
+        || select.group_by.is_some()
         || select.having.is_some()
         || !select.windows.is_empty()
-        || select.qualify.is_some()
+        || !select.modifiers.is_empty()
     {
         return Err(projection_filter_error());
     }
@@ -3047,14 +2984,10 @@ fn reject_unsupported_select_clauses(select: &Select) -> Result<(), String> {
 }
 
 fn reject_unsupported_aggregate_select_clauses(select: &Select) -> Result<(), String> {
-    if !select.hints.is_empty()
-        || !matches!(
-            select.quantifier,
-            ast::SelectQuantifier::None | ast::SelectQuantifier::All(_)
-        )
+    if select.distinct
         || select.having.is_some()
         || !select.windows.is_empty()
-        || select.qualify.is_some()
+        || !select.modifiers.is_empty()
     {
         return Err(aggregate_error());
     }
@@ -3066,58 +2999,45 @@ fn extract_single_base_table(
     shape_error: fn() -> String,
     single_table_error: fn() -> String,
 ) -> Result<ObjectName, String> {
-    let [from] = select.from.as_slice() else {
-        return Err(single_table_error());
-    };
-    if !from.joins.is_empty() {
-        return Err(single_table_error());
-    }
-
-    let TableFactor::Table {
-        name,
-        version,
-        metadata,
-        ..
-    } = &from.relation
-    else {
-        return Err(shape_error());
-    };
-    if metadata.is_some() || version.is_some() {
-        return Err(single_table_error());
-    }
-    if !is_three_part_object_name(name) {
+    let relation = select.from.as_ref().ok_or_else(single_table_error)?;
+    let (table, _) = plain_table(relation).ok_or_else(shape_error)?;
+    let name = &table.name;
+    if table.query_period.is_some()
+        || table.branch.is_some()
+        || crate::analyzer::TableNameView::new(name).metadata.is_some()
+        || !is_three_part_object_name(name)
+    {
         return Err(single_table_error());
     }
     Ok(name.clone())
 }
 
-fn aggregate_group_by_exprs(group_by: &ast::GroupBy) -> Result<&[Expr], String> {
-    match group_by {
-        ast::GroupBy::Expressions { expressions, .. } => {
-            if matches!(expressions.as_slice(), [Expr::Identifier(ident)] if !ident.quoted && ident.value.eq_ignore_ascii_case("all")) {
-                return Err(
-                    "incremental aggregate MV requires an explicit non-empty GROUP BY; GROUP BY ALL is unsupported"
-                        .to_string(),
-                );
-            }
-            if expressions.is_empty() {
-                return Err("incremental aggregate MV requires a non-empty GROUP BY".to_string());
-            }
-            Ok(expressions)
-        }
-        ast::GroupBy::None => Err("incremental aggregate MV requires a non-empty GROUP BY".to_string()),
-        ast::GroupBy::Rollup { .. } | ast::GroupBy::Cube { .. } | ast::GroupBy::GroupingSets { .. } => Err(
-            "incremental aggregate MV requires an explicit non-empty GROUP BY; GROUP BY ALL is unsupported"
-                .to_string(),
-        ),
+fn aggregate_group_by_exprs(group_by: &Option<ast::GroupBy>) -> Result<Vec<&Expr>, String> {
+    let expressions = crate::analyzer::simple_group_by_expressions(group_by).ok_or_else(|| "incremental aggregate MV requires an explicit non-empty GROUP BY; GROUP BY ALL is unsupported".to_string())?;
+    if matches!(expressions.as_slice(), [Expr::Identifier(ident)] if !ident.quoted && ident.value.eq_ignore_ascii_case("all"))
+    {
+        return Err("incremental aggregate MV requires an explicit non-empty GROUP BY; GROUP BY ALL is unsupported".to_string());
     }
+    if expressions.is_empty() {
+        return Err("incremental aggregate MV requires a non-empty GROUP BY".to_string());
+    }
+    Ok(expressions)
 }
 
 fn projection_expr_and_output_name(item: &SelectItem) -> Result<(&Expr, String), String> {
     match item {
-        SelectItem::UnnamedExpr(expr) => Ok((expr, printer::print_expr(expr))),
-        SelectItem::ExprWithAlias { expr, alias, .. } => Ok((expr, alias.value.clone())),
-        SelectItem::QualifiedWildcard { .. } | SelectItem::Wildcard { .. } => Err(
+        SelectItem::SingleColumn(column) => Ok((
+            &column.expression,
+            column
+                .alias
+                .as_ref()
+                .map_or_else(
+                    || printer::print_expression(&column.expression),
+                    |alias| Ok(alias.value.clone()),
+                )
+                .map_err(|error| error.to_string())?,
+        )),
+        SelectItem::AllColumns(_) => Err(
             "incremental aggregate MV projection can only contain expressions or aliases"
                 .to_string(),
         ),
@@ -3133,20 +3053,29 @@ fn classify_aggregate_call(expr: &Expr, output_name: String) -> Result<Aggregate
     };
     if function.name.parts.len() != 1
         || function.null_treatment.is_some()
-        || function.over.is_some()
+        || function.window.is_some()
+        || function.processing_mode.is_some()
+        || function
+            .arguments
+            .iter()
+            .any(|argument| argument.name.is_some())
         || function.filter.is_some()
-        || !function.order_by.is_empty()
+        || function.order_by.is_some()
     {
         return Err(aggregate_error());
     }
 
-    let args = &function.arguments;
+    let argument_values = function
+        .arguments
+        .iter()
+        .map(|argument| &argument.value)
+        .collect::<Vec<_>>();
+    let args = argument_values.as_slice();
     let function_name = function.name.parts[0].value.to_ascii_lowercase();
-    if function_name == "count" && matches!(function.quantifier, ast::FunctionQuantifier::Distinct)
-    {
+    if function_name == "count" && function.distinct {
         return classify_count_distinct_from_distinct_syntax(args, output_name);
     }
-    if !matches!(function.quantifier, ast::FunctionQuantifier::None) {
+    if function.distinct {
         return Err(format!(
             "incremental aggregate MV DISTINCT modifier is not supported on `{function_name}`; only count(DISTINCT col) is supported"
         ));
@@ -3185,7 +3114,7 @@ fn classify_aggregate_call(expr: &Expr, output_name: String) -> Result<Aggregate
 }
 
 fn classify_count_distinct_from_distinct_syntax(
-    args: &[Expr],
+    args: &[&Expr],
     output_name: String,
 ) -> Result<AggregateCallShape, String> {
     Ok(AggregateCallShape {
@@ -3195,7 +3124,10 @@ fn classify_count_distinct_from_distinct_syntax(
     })
 }
 
-fn classify_count_input(args: &[Expr]) -> Result<(AggregateFunctionKind, AggregateInput), String> {
+fn classify_count_input(args: &[&Expr]) -> Result<(AggregateFunctionKind, AggregateInput), String> {
+    if args.is_empty() {
+        return Ok((AggregateFunctionKind::Count, AggregateInput::Star));
+    }
     let [arg] = args else {
         return Err(aggregate_error());
     };
@@ -3207,13 +3139,13 @@ fn classify_count_input(args: &[Expr]) -> Result<(AggregateFunctionKind, Aggrega
             reject_unsupported_expr(expr).map_err(aggregate_expr_error)?;
             Ok((
                 AggregateFunctionKind::Count,
-                AggregateInput::Expr(Box::new(expr.clone())),
+                AggregateInput::Expr(Box::new((**expr).clone())),
             ))
         }
     }
 }
 
-fn classify_count_distinct_input(args: &[Expr]) -> Result<AggregateInput, String> {
+fn classify_count_distinct_input(args: &[&Expr]) -> Result<AggregateInput, String> {
     if args.len() > 1 {
         return Err(format!(
             "COUNT(DISTINCT) with {} arguments is not supported in incremental materialized views; multi-column DISTINCT cannot be incrementally maintained",
@@ -3227,10 +3159,10 @@ fn classify_count_distinct_input(args: &[Expr]) -> Result<AggregateInput, String
         return Err("COUNT(DISTINCT *) is not supported".to_string());
     }
     reject_unsupported_expr(arg).map_err(aggregate_expr_error)?;
-    Ok(AggregateInput::Expr(Box::new(arg.clone())))
+    Ok(AggregateInput::Expr(Box::new((**arg).clone())))
 }
 
-fn classify_approx_count_distinct_input(args: &[Expr]) -> Result<AggregateInput, String> {
+fn classify_approx_count_distinct_input(args: &[&Expr]) -> Result<AggregateInput, String> {
     if args.len() > 1 {
         return Err(format!(
             "APPROX_COUNT_DISTINCT with {} arguments is not supported in incremental materialized views; the precision hint argument is not supported in IVM. Please use the single-argument form: APPROX_COUNT_DISTINCT(col)",
@@ -3244,10 +3176,10 @@ fn classify_approx_count_distinct_input(args: &[Expr]) -> Result<AggregateInput,
         return Err("APPROX_COUNT_DISTINCT(*) is not supported".to_string());
     }
     reject_unsupported_expr(arg).map_err(aggregate_expr_error)?;
-    Ok(AggregateInput::Expr(Box::new(arg.clone())))
+    Ok(AggregateInput::Expr(Box::new((**arg).clone())))
 }
 
-fn classify_sum_input(args: &[Expr]) -> Result<AggregateInput, String> {
+fn classify_sum_input(args: &[&Expr]) -> Result<AggregateInput, String> {
     let [arg] = args else {
         return Err(aggregate_error());
     };
@@ -3255,10 +3187,10 @@ fn classify_sum_input(args: &[Expr]) -> Result<AggregateInput, String> {
         return Err(aggregate_error());
     }
     reject_unsupported_expr(arg).map_err(aggregate_expr_error)?;
-    Ok(AggregateInput::Expr(Box::new(arg.clone())))
+    Ok(AggregateInput::Expr(Box::new((**arg).clone())))
 }
 
-fn classify_avg_input(args: &[Expr]) -> Result<AggregateInput, String> {
+fn classify_avg_input(args: &[&Expr]) -> Result<AggregateInput, String> {
     let [arg] = args else {
         return Err("AVG aggregate requires a column expression argument".to_string());
     };
@@ -3266,10 +3198,10 @@ fn classify_avg_input(args: &[Expr]) -> Result<AggregateInput, String> {
         return Err("AVG aggregate requires a column expression argument".to_string());
     }
     reject_unsupported_expr(arg).map_err(aggregate_expr_error)?;
-    Ok(AggregateInput::Expr(Box::new(arg.clone())))
+    Ok(AggregateInput::Expr(Box::new((**arg).clone())))
 }
 
-fn classify_min_max_input(args: &[Expr]) -> Result<AggregateInput, String> {
+fn classify_min_max_input(args: &[&Expr]) -> Result<AggregateInput, String> {
     let [arg] = args else {
         return Err("MIN/MAX aggregate requires a column expression argument".to_string());
     };
@@ -3277,10 +3209,10 @@ fn classify_min_max_input(args: &[Expr]) -> Result<AggregateInput, String> {
         return Err("MIN/MAX aggregate requires a column expression argument".to_string());
     }
     reject_unsupported_expr(arg).map_err(aggregate_expr_error)?;
-    Ok(AggregateInput::Expr(Box::new(arg.clone())))
+    Ok(AggregateInput::Expr(Box::new((**arg).clone())))
 }
 
-fn classify_bool_or_and_input(args: &[Expr]) -> Result<AggregateInput, String> {
+fn classify_bool_or_and_input(args: &[&Expr]) -> Result<AggregateInput, String> {
     // BOOL_OR / BOOL_AND require a single scalar Boolean-typed expression.
     // The input type is enforced later when state column physical types are
     // validated (`validate_state_column_type`); shape classification only
@@ -3292,7 +3224,7 @@ fn classify_bool_or_and_input(args: &[Expr]) -> Result<AggregateInput, String> {
         return Err("BOOL_OR/BOOL_AND aggregate requires a column expression argument".to_string());
     }
     reject_unsupported_expr(arg).map_err(aggregate_expr_error)?;
-    Ok(AggregateInput::Expr(Box::new(arg.clone())))
+    Ok(AggregateInput::Expr(Box::new((**arg).clone())))
 }
 
 pub fn query_has_aggregate_surface(query: &Query) -> bool {
@@ -3313,78 +3245,115 @@ fn is_probably_aggregate_query(query: &Query) -> bool {
 
 fn select_item_contains_aggregate_function(item: &SelectItem) -> bool {
     match item {
-        SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
-            expr_contains_aggregate_function(expr)
-        }
-        SelectItem::QualifiedWildcard { .. } | SelectItem::Wildcard { .. } => false,
+        SelectItem::SingleColumn(column) => expr_contains_aggregate_function(&column.expression),
+        SelectItem::AllColumns(_) => false,
     }
+}
+
+/// Borrow only the predicate's actual expression fields. Query scope is
+/// handled by the consumer's existing Subquery branch.
+fn predicate_exprs(predicate: &ast::Predicate) -> Vec<&Expr> {
+    match predicate {
+        ast::Predicate::Comparison(p) => vec![&p.right],
+        ast::Predicate::DistinctFrom(p) => vec![&p.right],
+        ast::Predicate::Between(p) => vec![&p.min, &p.max],
+        ast::Predicate::Like(p) => std::iter::once(&p.pattern).chain(p.escape.iter()).collect(),
+        ast::Predicate::In(p) => vec![&p.value_list],
+        ast::Predicate::Overlaps(p) => vec![&p.right],
+        ast::Predicate::QuantifiedComparison(p) => vec![&p.subquery],
+        ast::Predicate::Match(p) => vec![&p.subquery],
+        ast::Predicate::BooleanTest(_) | ast::Predicate::IsNull(_) => vec![],
+    }
+}
+
+fn case_contains_aggregate_function(clauses: &[ast::WhenClause], default: Option<&Expr>) -> bool {
+    clauses.iter().any(|clause| matches!(&clause.match_value, ast::WhenMatch::Operand(value) if expr_contains_aggregate_function(value)) || expr_contains_aggregate_function(&clause.result))
+        || default.is_some_and(expr_contains_aggregate_function)
 }
 
 fn expr_contains_aggregate_function(expr: &Expr) -> bool {
     match expr {
+        Expr::JsonQuery(node) => {
+            expr_contains_aggregate_function(&node.path_invocation.input_expression)
+        }
+        Expr::GroupingOperation(node) => node
+            .grouping_columns
+            .iter()
+            .any(expr_contains_aggregate_function),
+        Expr::Trim(node) => {
+            expr_contains_aggregate_function(&node.trim_source)
+                || node
+                    .trim_character
+                    .as_ref()
+                    .is_some_and(expr_contains_aggregate_function)
+        }
+        Expr::Extract(node) => expr_contains_aggregate_function(&node.expression),
+        Expr::If(node) => {
+            expr_contains_aggregate_function(&node.condition)
+                || expr_contains_aggregate_function(&node.true_value)
+                || node
+                    .false_value
+                    .as_ref()
+                    .is_some_and(expr_contains_aggregate_function)
+        }
+        Expr::NullIf(node) => {
+            expr_contains_aggregate_function(&node.first)
+                || expr_contains_aggregate_function(&node.second)
+        }
+        Expr::Coalesce(node) => node.operands.iter().any(expr_contains_aggregate_function),
+        Expr::Try(node) => expr_contains_aggregate_function(&node.inner),
+        Expr::Format(node) => node.arguments.iter().any(expr_contains_aggregate_function),
+
         Expr::FunctionCall(function) => {
             let name = printer::print_object_name(&function.name).to_ascii_lowercase();
             is_aggregate_function(&name)
                 || function
                     .arguments
                     .iter()
-                    .any(expr_contains_aggregate_function)
+                    .any(|argument| expr_contains_aggregate_function(&argument.value))
                 || function
                     .filter
                     .as_ref()
-                    .is_some_and(|filter| expr_contains_aggregate_function(filter))
+                    .is_some_and(expr_contains_aggregate_function)
                 || function
                     .order_by
                     .iter()
-                    .any(|order_by| expr_contains_aggregate_function(&order_by.expr))
+                    .flat_map(|order| &order.items)
+                    .any(|order_by| expr_contains_aggregate_function(&order_by.sort_key))
         }
         Expr::Binary(binary) => {
             let left = &binary.left;
             let right = &binary.right;
             expr_contains_aggregate_function(left) || expr_contains_aggregate_function(right)
         }
+        Expr::Logical(logical) => logical.terms.iter().any(expr_contains_aggregate_function),
         Expr::Unary(unary) => expr_contains_aggregate_function(&unary.expression),
-        Expr::Nested(nested) => expr_contains_aggregate_function(&nested.expression),
-        Expr::Cast(cast) => expr_contains_aggregate_function(&cast.expr),
-        Expr::InList(list) => {
-            expr_contains_aggregate_function(&list.expr)
-                || list.list.iter().any(expr_contains_aggregate_function)
+        Expr::Cast(cast) => expr_contains_aggregate_function(&cast.expression),
+        Expr::Predicated(node) => {
+            expr_contains_aggregate_function(&node.value)
+                || predicate_exprs(&node.predicate)
+                    .into_iter()
+                    .any(expr_contains_aggregate_function)
         }
-        Expr::Between(between) => {
-            expr_contains_aggregate_function(&between.expr)
-                || expr_contains_aggregate_function(&between.low)
-                || expr_contains_aggregate_function(&between.high)
+        Expr::InList(list) => list.values.iter().any(expr_contains_aggregate_function),
+        Expr::SearchedCase(case) => {
+            case_contains_aggregate_function(&case.when_clauses, case.default_value.as_ref())
         }
-        Expr::Case(case) => {
-            case.operand
-                .as_ref()
-                .is_some_and(|operand| expr_contains_aggregate_function(operand))
-                || case
-                    .conditions
-                    .iter()
-                    .zip(&case.results)
-                    .any(|(when, then)| {
-                        expr_contains_aggregate_function(when)
-                            || expr_contains_aggregate_function(then)
-                    })
-                || case
-                    .else_result
-                    .as_ref()
-                    .is_some_and(|else_result| expr_contains_aggregate_function(else_result))
+        Expr::SimpleCase(case) => {
+            expr_contains_aggregate_function(&case.operand)
+                || case_contains_aggregate_function(&case.when_clauses, case.default_value.as_ref())
         }
-        Expr::Tuple(tuple) => tuple
-            .expressions
-            .iter()
-            .any(expr_contains_aggregate_function),
-        Expr::Array(array) => array.elements.iter().any(expr_contains_aggregate_function),
-        Expr::Struct(record) => record
+        Expr::Array(array) => array.values.iter().any(expr_contains_aggregate_function),
+        Expr::Dereference(node) => expr_contains_aggregate_function(&node.base),
+        Expr::ArrayWildcardSubscript(node) => expr_contains_aggregate_function(&node.base),
+        Expr::Subscript(node) => {
+            expr_contains_aggregate_function(&node.base)
+                || expr_contains_aggregate_function(&node.index)
+        }
+        Expr::Row(record) => record
             .fields
             .iter()
-            .any(|field| expr_contains_aggregate_function(&field.value)),
-        Expr::Map(map) => map.entries.iter().any(|entry| {
-            expr_contains_aggregate_function(&entry.key)
-                || expr_contains_aggregate_function(&entry.value)
-        }),
+            .any(|field| expr_contains_aggregate_function(&field.expression)),
         _ => false,
     }
 }
@@ -3401,22 +3370,20 @@ fn reject_unsupported_projection_filter_exprs(select: &Select) -> Result<(), Str
 
 fn reject_unsupported_select_item_expr(item: &SelectItem) -> Result<(), String> {
     match item {
-        SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
-            reject_unsupported_expr(expr)
-        }
-        SelectItem::QualifiedWildcard { .. } | SelectItem::Wildcard { .. } => Ok(()),
+        SelectItem::SingleColumn(column) => reject_unsupported_expr(&column.expression),
+        SelectItem::AllColumns(_) => Ok(()),
     }
 }
 
 fn reject_match_against_before_from_shape_check(select: &Select) -> Result<(), String> {
     for item in &select.projection {
         match item {
-            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
-                if contains_match_against(expr) {
+            SelectItem::SingleColumn(column) => {
+                if contains_match_against(&column.expression) {
                     return Err(projection_filter_error());
                 }
             }
-            SelectItem::QualifiedWildcard { .. } | SelectItem::Wildcard { .. } => {}
+            SelectItem::AllColumns(_) => {}
         }
     }
     if let Some(selection) = &select.selection
@@ -3431,60 +3398,144 @@ fn contains_match_against(expr: &Expr) -> bool {
     matches!(expr, Expr::FunctionCall(function) if printer::print_object_name(&function.name).eq_ignore_ascii_case("match"))
 }
 
+fn reject_unsupported_case(
+    clauses: &[ast::WhenClause],
+    default: Option<&Expr>,
+) -> Result<(), String> {
+    for clause in clauses {
+        let ast::WhenMatch::Operand(value) = &clause.match_value else {
+            return Err(projection_filter_error());
+        };
+        reject_unsupported_expr(value)?;
+        reject_unsupported_expr(&clause.result)?;
+    }
+    if let Some(default) = default {
+        reject_unsupported_expr(default)?;
+    }
+    Ok(())
+}
+
 fn reject_unsupported_expr(expr: &Expr) -> Result<(), String> {
+    if crate::analyzer::unsupported_control_expression_reason(expr).is_some() {
+        return Err(projection_filter_error());
+    }
     match expr {
-        Expr::Subquery(_) | Expr::Exists(_) | Expr::InSubquery(_) => {
+        Expr::GroupingOperation(_)
+        | Expr::AtLocal(_)
+        | Expr::AtTimeZone(_)
+        | Expr::Overlay(_)
+        | Expr::IntervalValueExpression(_)
+        | Expr::MethodCall(_)
+        | Expr::StaticMethodCall(_)
+        | Expr::CurrentCatalog(_)
+        | Expr::CurrentDate(_)
+        | Expr::CurrentPath(_)
+        | Expr::CurrentSchema(_)
+        | Expr::CurrentUser(_)
+        | Expr::CurrentTime(_)
+        | Expr::CurrentTimestamp(_)
+        | Expr::LocalTime(_)
+        | Expr::LocalTimestamp(_) => return Err(projection_filter_error()),
+        Expr::Trim(node) => {
+            if node.trim_character.is_some() {
+                return Err(projection_filter_error());
+            }
+            reject_unsupported_expr(&node.trim_source)?;
+        }
+        Expr::JsonObject(node) => {
+            if !crate::analyzer::is_supported_json_object_profile(node) {
+                return Err(projection_filter_error());
+            }
+            for member in &node.members {
+                reject_unsupported_expr(&member.key)?;
+                reject_unsupported_expr(&member.value)?;
+            }
+        }
+        Expr::JsonArray(node) => {
+            if !crate::analyzer::is_supported_json_array_profile(node) {
+                return Err(projection_filter_error());
+            }
+            for element in &node.elements {
+                reject_unsupported_expr(&element.value)?;
+            }
+        }
+
+        Expr::JsonQuery(node) => {
+            if !crate::analyzer::is_plain_json_query(node) {
+                return Err(projection_filter_error());
+            }
+            reject_unsupported_expr(&node.path_invocation.input_expression)?;
+        }
+
+        Expr::JsonConstructor(_)
+        | Expr::JsonExists(_)
+        | Expr::JsonValue(_)
+        | Expr::JsonSerialize(_) => return Err(projection_filter_error()),
+
+        Expr::Subquery(_) | Expr::Exists(_) | Expr::Unique(_) | Expr::WindowOperation(_) => {
             return Err(projection_filter_error());
         }
+        Expr::If(node) => {
+            reject_unsupported_expr(&node.condition)?;
+            reject_unsupported_expr(&node.true_value)?;
+            if let Some(value) = &node.false_value {
+                reject_unsupported_expr(value)?;
+            }
+        }
+        Expr::NullIf(node) => {
+            reject_unsupported_expr(&node.first)?;
+            reject_unsupported_expr(&node.second)?;
+        }
+        Expr::Coalesce(node) => reject_unsupported_exprs(&node.operands)?,
+        Expr::Try(node) => reject_unsupported_expr(&node.inner)?,
+        Expr::Format(node) => reject_unsupported_exprs(&node.arguments)?,
+        Expr::Extract(node) => reject_unsupported_expr(&node.expression)?,
         Expr::FunctionCall(function) => reject_unsupported_function(function)?,
-        Expr::Access(access) => reject_unsupported_access_expr(access)?,
+        Expr::Dereference(node) => {
+            if node.field.is_none() {
+                return Err(projection_filter_error());
+            }
+            let qualified = ast::identifier_chain_observed(expr, |_| Ok::<(), String>(()))?
+                .is_some_and(|chain| chain.len() >= 2);
+            if !qualified {
+                reject_unsupported_expr(&node.base)?;
+            }
+        }
+        Expr::Subscript(node) => {
+            reject_unsupported_expr(&node.base)?;
+            reject_unsupported_expr(&node.index)?;
+        }
+        Expr::ArrayWildcardSubscript(_) => return Err(projection_filter_error()),
         Expr::Unary(unary) => reject_unsupported_expr(&unary.expression)?,
-        Expr::Nested(nested) => reject_unsupported_expr(&nested.expression)?,
-        Expr::InList(list) => {
-            reject_unsupported_expr(&list.expr)?;
-            reject_unsupported_exprs(&list.list)?;
+        Expr::Predicated(node) => {
+            if crate::analyzer::unsupported_predicate_reason(node).is_some() {
+                return Err(projection_filter_error());
+            }
+            reject_unsupported_expr(&node.value)?;
+            for child in predicate_exprs(&node.predicate) {
+                reject_unsupported_expr(child)?;
+            }
         }
-        Expr::Between(between) => {
-            reject_unsupported_expr(&between.expr)?;
-            reject_unsupported_expr(&between.low)?;
-            reject_unsupported_expr(&between.high)?;
-        }
+        Expr::InList(list) => reject_unsupported_exprs(&list.values)?,
         Expr::Binary(binary) => {
             reject_unsupported_expr(&binary.left)?;
             reject_unsupported_expr(&binary.right)?;
         }
-        Expr::Like(like) => {
-            reject_unsupported_expr(&like.expr)?;
-            reject_unsupported_expr(&like.pattern)?;
+        Expr::Logical(logical) => reject_unsupported_exprs(&logical.terms)?,
+        Expr::Cast(cast) => reject_unsupported_expr(&cast.expression)?,
+        Expr::SearchedCase(case) => {
+            reject_unsupported_case(&case.when_clauses, case.default_value.as_ref())?
         }
-        Expr::IsPredicate(predicate) => reject_unsupported_expr(&predicate.expr)?,
-        Expr::Cast(cast) => reject_unsupported_expr(&cast.expr)?,
-        Expr::Case(case) => {
-            if let Some(operand) = &case.operand {
-                reject_unsupported_expr(operand)?;
-            }
-            for (when, then) in case.conditions.iter().zip(&case.results) {
-                reject_unsupported_expr(when)?;
-                reject_unsupported_expr(then)?;
-            }
-            if let Some(else_result) = &case.else_result {
-                reject_unsupported_expr(else_result)?;
-            }
+        Expr::SimpleCase(case) => {
+            reject_unsupported_expr(&case.operand)?;
+            reject_unsupported_case(&case.when_clauses, case.default_value.as_ref())?;
         }
-        Expr::Tuple(tuple) => reject_unsupported_exprs(&tuple.expressions)?,
-        Expr::Array(array) => reject_unsupported_exprs(&array.elements)?,
-        Expr::Struct(record) => {
+        Expr::Array(array) => reject_unsupported_exprs(&array.values)?,
+        Expr::Row(record) => {
             for field in &record.fields {
-                reject_unsupported_expr(&field.value)?;
+                reject_unsupported_expr(&field.expression)?;
             }
         }
-        Expr::Map(map) => {
-            for entry in &map.entries {
-                reject_unsupported_expr(&entry.key)?;
-                reject_unsupported_expr(&entry.value)?;
-            }
-        }
-        Expr::Interval(interval) => reject_unsupported_expr(&interval.value)?,
         Expr::Lambda(lambda) => reject_unsupported_expr(&lambda.body)?,
         Expr::Identifier(ident) => {
             if is_non_deterministic_bare_identifier(&ident.value) {
@@ -3494,7 +3545,8 @@ fn reject_unsupported_expr(expr: &Expr) -> Result<(), String> {
                 );
             }
         }
-        Expr::CompoundIdentifier(_) | Expr::Literal(_) | Expr::TypedString(_) => {}
+        Expr::AllRows(_) | Expr::Parameter(_) => return Err(projection_filter_error()),
+        Expr::Literal(_) => {}
     }
     Ok(())
 }
@@ -3506,19 +3558,17 @@ fn reject_unsupported_exprs(exprs: &[Expr]) -> Result<(), String> {
     Ok(())
 }
 
-fn reject_unsupported_access_expr(access: &ast::AccessExpr) -> Result<(), String> {
-    let ast::AccessExpr { expr, kind, .. } = access;
-    reject_unsupported_expr(expr)?;
-    match kind {
-        ast::AccessKind::Field(_) => Ok(()),
-        ast::AccessKind::Subscript(index) => reject_unsupported_expr(index),
-        ast::AccessKind::Json { path, .. } => reject_unsupported_expr(path),
-    }
-}
-
 fn reject_unsupported_function(function: &ast::FunctionCall) -> Result<(), String> {
     let function_name = printer::print_object_name(&function.name).to_ascii_lowercase();
-    if is_non_deterministic_function(&function_name, &function.arguments) {
+    if let Some(reason) = crate::analyzer::unsupported_call_facts(function) {
+        return Err(reason.to_string());
+    }
+    let argument_values = function
+        .arguments
+        .iter()
+        .map(|argument| &argument.value)
+        .collect::<Vec<_>>();
+    if is_non_deterministic_function(&function_name, &argument_values) {
         return Err(
             "incremental MV projection/filter query contains non-deterministic function"
                 .to_string(),
@@ -3530,25 +3580,29 @@ fn reject_unsupported_function(function: &ast::FunctionCall) -> Result<(), Strin
         || is_unsafe_scalar_function(&function_name)
         || function_name == "match"
         || function.null_treatment.is_some()
-        || function.over.is_some()
-        || !function.order_by.is_empty()
-        || function.separator.is_some()
+        || function.window.is_some()
+        || function.processing_mode.is_some()
+        || function
+            .arguments
+            .iter()
+            .any(|argument| argument.name.is_some())
+        || function.order_by.is_some()
         || function.filter.is_some()
-        || !matches!(function.quantifier, ast::FunctionQuantifier::None)
+        || function.distinct
     {
         return Err(projection_filter_error());
     }
-    reject_unsupported_function_arguments(&function.arguments)
+    reject_unsupported_function_arguments(&argument_values)
 }
 
-fn reject_unsupported_function_arguments(args: &[Expr]) -> Result<(), String> {
+fn reject_unsupported_function_arguments(args: &[&Expr]) -> Result<(), String> {
     for arg in args {
         reject_unsupported_expr(arg)?;
     }
     Ok(())
 }
 
-fn is_non_deterministic_function(name: &str, args: &[Expr]) -> bool {
+fn is_non_deterministic_function(name: &str, args: &[&Expr]) -> bool {
     matches!(
         name,
         "now"
@@ -3581,7 +3635,7 @@ fn is_non_deterministic_bare_identifier(name: &str) -> bool {
     )
 }
 
-fn function_argument_count(args: &[Expr]) -> Option<usize> {
+fn function_argument_count(args: &[&Expr]) -> Option<usize> {
     Some(args.len())
 }
 
@@ -3694,14 +3748,9 @@ fn is_aggregate_function(name: &str) -> bool {
     )
 }
 
-fn is_empty_group_by(group_by: &ast::GroupBy) -> bool {
-    match group_by {
-        ast::GroupBy::None => true,
-        ast::GroupBy::Expressions { expressions, .. } => expressions.is_empty(),
-        ast::GroupBy::Rollup { .. }
-        | ast::GroupBy::Cube { .. }
-        | ast::GroupBy::GroupingSets { .. } => false,
-    }
+fn is_empty_group_by(group_by: &Option<ast::GroupBy>) -> bool {
+    crate::analyzer::simple_group_by_expressions(group_by)
+        .is_some_and(|expressions| expressions.is_empty())
 }
 
 fn is_three_part_object_name(name: &ObjectName) -> bool {
@@ -3754,10 +3803,7 @@ mod tests {
     const NATIVE_PARSE_REJECTION: &str = "native SQL parser rejection: ";
 
     fn parse_query(sql: &str) -> Query {
-        let statements = novarocks_parser::parse(sql).expect("parse");
-        let [ast::Statement::Query(query)] = statements.as_slice() else {
-            panic!("not a query");
-        };
+        let query = &novarocks_parser::parser::parse_query(sql).expect("parse");
         query.clone()
     }
 
@@ -3810,44 +3856,13 @@ mod tests {
 
     /// Like `classify_sql` but propagates native parse errors instead of panicking.
     fn try_classify_sql(sql: &str) -> Result<IncrementalMvShape, String> {
-        let statements =
-            novarocks_parser::parse(sql).map_err(|e| format!("{NATIVE_PARSE_REJECTION}{e}"))?;
-        let [ast::Statement::Query(query)] = statements.as_slice() else {
-            return Err("not a query".to_string());
-        };
+        let query = &novarocks_parser::parser::parse_query(sql)
+            .map_err(|e| format!("{NATIVE_PARSE_REJECTION}{e}"))?;
         classify_incremental_mv_query(query)
     }
 
     fn parse_shape(sql: &str) -> Result<IncrementalMvShape, String> {
         classify_incremental_mv_query(&parse_query(sql))
-    }
-
-    #[test]
-    fn imv_aggregate_star_prevalidation_keeps_contract_errors_ahead_of_column_resolution() {
-        for (sql, expected) in [
-            (
-                "SELECT k, AVG(*) FROM measurements GROUP BY k",
-                "Iceberg IMV refresh contract requires exactly one argument for aggregate function `avg`",
-            ),
-            (
-                "SELECT k, MIN(*) FROM measurements GROUP BY k",
-                "Iceberg IMV refresh contract requires exactly one argument for aggregate function `min`",
-            ),
-        ] {
-            let error = validate_imv_aggregate_star_arguments(&parse_query(sql))
-                .expect_err("non-COUNT aggregate star must fail at the IMV boundary");
-            assert_eq!(error.message(), expected);
-            assert_eq!(
-                error.kind(),
-                crate::analyze_error::AnalyzeErrorKind::InvalidArgument
-            );
-            assert_eq!(error.span(), Some(Span::new(10, 16)));
-        }
-
-        validate_imv_aggregate_star_arguments(&parse_query(
-            "SELECT k, COUNT(*) FROM measurements GROUP BY k",
-        ))
-        .expect("COUNT(*) remains a supported IMV aggregate input");
     }
 
     #[test]
@@ -3890,6 +3905,73 @@ mod tests {
             err.contains(needle) || err.starts_with(NATIVE_PARSE_REJECTION),
             "expected error to contain `{needle}` or a native parser rejection for `{sql}`, got `{err}`"
         );
+    }
+
+    #[test]
+    fn typed_json_keeps_existing_mv_profiles_and_rejects_volatile_children() {
+        let mut query = parse_query("SELECT k1 AS value FROM ice.ns.orders");
+        let SetExpr::Select(select) = query.body.as_mut() else {
+            panic!("SELECT")
+        };
+        select.projection[0] = novarocks_parser::build::item(
+            Expr::JsonObject(novarocks_parser::ast::AstBox::new(ast::JsonObject {
+                members: vec![ast::JsonObjectMember {
+                    key: novarocks_parser::build::string("k"),
+                    value: novarocks_parser::build::identifier(novarocks_parser::build::ident(
+                        "k1", false,
+                    )),
+                    format: None,
+                    span: novarocks_parser::SYNTHETIC,
+                }],
+                null_on_null: true,
+                unique_keys: false,
+                returned_type: None,
+                output_format: None,
+                span: novarocks_parser::SYNTHETIC,
+            })),
+            Some(novarocks_parser::build::ident("value", false)),
+        );
+        assert!(classify_incremental_mv_query(&query).is_ok());
+        let SetExpr::Select(select) = query.body.as_mut() else {
+            panic!("SELECT")
+        };
+        let ast::SelectItem::SingleColumn(projection_column) = &mut select.projection[0] else {
+            panic!("JSON_OBJECT")
+        };
+        let ast::SingleColumn {
+            alias: Some(_),
+            expression: Expr::JsonObject(node),
+            ..
+        } = projection_column.as_mut()
+        else {
+            panic!("JSON_OBJECT")
+        };
+        node.members[0].value = novarocks_parser::build::function(
+            novarocks_parser::build::object_name(vec![novarocks_parser::build::ident(
+                "rand", false,
+            )])
+            .unwrap(),
+            vec![],
+        );
+        let error = classify_incremental_mv_query(&query).unwrap_err();
+        assert!(error.contains("non-deterministic"), "{error}");
+        let SetExpr::Select(select) = query.body.as_mut() else {
+            panic!("SELECT")
+        };
+        select.projection[0] = novarocks_parser::build::item(
+            Expr::JsonQuery(ast::AstBox::new(ast::JsonQuery::plain(
+                ast::JsonPathInvocation::plain(
+                    novarocks_parser::build::identifier(novarocks_parser::build::ident(
+                        "k1", false,
+                    )),
+                    ast::JsonPathString::new("$.a".to_string(), novarocks_parser::SYNTHETIC),
+                    novarocks_parser::SYNTHETIC,
+                ),
+                novarocks_parser::SYNTHETIC,
+            ))),
+            Some(novarocks_parser::build::ident("value", false)),
+        );
+        assert!(classify_incremental_mv_query(&query).is_ok());
     }
 
     #[test]
@@ -3958,6 +4040,27 @@ mod tests {
                 || err.starts_with(NATIVE_PARSE_REJECTION),
             "unexpected: {err}"
         );
+        for columns in [
+            Vec::new(),
+            vec![novarocks_parser::build::ident("k1", false)],
+        ] {
+            let mut query =
+                parse_query("select k1 from ice.ns.t1 union all select k1 from ice.ns.t2");
+            let SetExpr::SetOperation(operation) = query.body.as_mut() else {
+                panic!("UNION ALL");
+            };
+            operation.corresponding = Some(ast::Corresponding {
+                columns,
+                span: Span::new(0, 0),
+            });
+            let error = classify_incremental_mv_query(&query).unwrap_err();
+            assert!(error.contains("CORRESPONDING"), "{error}");
+            assert!(
+                first_union_branch_query(&query)
+                    .unwrap_err()
+                    .contains("CORRESPONDING")
+            );
+        }
     }
 
     #[test]
@@ -3994,17 +4097,23 @@ mod tests {
     }
 
     #[test]
-    fn rejects_union_all_branch_with_parenthesized_limit() {
-        let err = classify_sql(
-            "(select k1, sum(v2) as s from ice.ns.t1 group by k1 limit 1) \
-             union all \
-             select k1, sum(v2) as s from ice.ns.t2 group by k1",
-        )
-        .expect_err("branch-local LIMIT must be rejected");
-        assert!(
-            err.contains("UNION ALL") || err.contains("incremental"),
-            "unexpected: {err}"
-        );
+    fn rejects_union_all_branch_with_parenthesized_modifiers() {
+        for suffix in [
+            "limit 1",
+            "order by k1",
+            "offset 1",
+            "fetch first 1 row only",
+        ] {
+            let sql = format!(
+                "(select k1, sum(v2) as s from ice.ns.t1 group by k1 {suffix}) \
+                 union all select k1, sum(v2) as s from ice.ns.t2 group by k1"
+            );
+            let err = classify_sql(&sql).expect_err("branch-local modifiers must be rejected");
+            assert!(
+                err.contains("UNION ALL") || err.contains("incremental"),
+                "{suffix}: {err}"
+            );
+        }
     }
 
     #[test]
@@ -4094,7 +4203,10 @@ mod tests {
         );
         assert_eq!(shape.group_keys.len(), 1);
         assert_eq!(shape.group_keys[0].output_name, "k1");
-        assert_eq!(printer::print_expr(&shape.group_keys[0].expr), "k1");
+        assert_eq!(
+            printer::print_expression(&shape.group_keys[0].expr).unwrap(),
+            "k1"
+        );
         assert_eq!(shape.aggregates.len(), 3);
         assert_eq!(shape.aggregates[0].output_name, "c");
         assert_eq!(shape.aggregates[0].function, AggregateFunctionKind::Count);
@@ -4103,13 +4215,13 @@ mod tests {
         assert_eq!(shape.aggregates[1].function, AggregateFunctionKind::Count);
         assert!(matches!(
             &shape.aggregates[1].input,
-            AggregateInput::Expr(expr) if printer::print_expr(expr) == "v2"
+            AggregateInput::Expr(expr) if printer::print_expression(expr).is_ok_and(|sql| sql == "v2")
         ));
         assert_eq!(shape.aggregates[2].output_name, "s");
         assert_eq!(shape.aggregates[2].function, AggregateFunctionKind::Sum);
         assert!(matches!(
             &shape.aggregates[2].input,
-            AggregateInput::Expr(expr) if printer::print_expr(expr) == "v2"
+            AggregateInput::Expr(expr) if printer::print_expression(expr).is_ok_and(|sql| sql == "v2")
         ));
         assert_eq!(
             shape.visible_outputs,
@@ -4220,7 +4332,10 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(err.contains("APPROX_COUNT_DISTINCT(*)"), "got: {err}");
+        assert!(
+            err.contains("APPROX_COUNT_DISTINCT requires exactly one column expression"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -4286,6 +4401,55 @@ mod tests {
             }
             other => panic!("expected join shape, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn logical_join_terms_keep_key_order_and_alias_orientation_and_reject_or() {
+        let query = parse_query(
+            "SELECT l.k FROM ice.ns.left_table l JOIN ice.ns.right_table r ON l.a = r.x AND r.y = l.b AND (l.c = r.z)",
+        );
+        let predicates = extract_join_equality_predicates(&query).unwrap();
+        assert_eq!(
+            predicates
+                .iter()
+                .map(|key| (
+                    key.left.qualifier.as_str(),
+                    key.left.column.as_str(),
+                    key.right.qualifier.as_str(),
+                    key.right.column.as_str()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("l", "a", "r", "x"),
+                ("r", "y", "l", "b"),
+                ("l", "c", "r", "z")
+            ]
+        );
+        let IncrementalMvShape::JoinProjectionFilter(shape) =
+            classify_incremental_mv_query(&query).unwrap()
+        else {
+            panic!("join shape")
+        };
+        assert_eq!(
+            shape
+                .join_keys
+                .iter()
+                .map(|key| (
+                    printer::print_expression(&key.left_expr).unwrap(),
+                    printer::print_expression(&key.right_expr).unwrap()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("l.a".into(), "r.x".into()),
+                ("l.b".into(), "r.y".into()),
+                ("l.c".into(), "r.z".into())
+            ]
+        );
+        let disjunction = parse_query(
+            "SELECT l.k FROM ice.ns.left_table l JOIN ice.ns.right_table r ON l.a = r.x OR l.b = r.y",
+        );
+        assert!(extract_join_equality_predicates(&disjunction).is_err());
+        assert!(classify_incremental_mv_query(&disjunction).is_err());
     }
 
     #[test]
@@ -4465,7 +4629,7 @@ mod tests {
         assert_eq!(shape.aggregates[0].function, AggregateFunctionKind::Avg);
         assert!(matches!(
             &shape.aggregates[0].input,
-            AggregateInput::Expr(expr) if printer::print_expr(expr) == "v2"
+            AggregateInput::Expr(expr) if printer::print_expression(expr).is_ok_and(|sql| sql == "v2")
         ));
     }
 
@@ -4576,13 +4740,16 @@ mod tests {
     fn rejects_unsafe_scalar_functions() {
         for sql in [
             "select sleep(1) from ice.ns.orders",
-            "select current_user() from ice.ns.orders",
             "select database() from ice.ns.orders",
             "select version() from ice.ns.orders",
             "select user() from ice.ns.orders",
         ] {
             assert_rejects_with(sql, "projection/filter");
         }
+        let query = novarocks_parser::parser::parse_query("select current_user from ice.ns.orders")
+            .unwrap();
+        let error = classify_incremental_mv_query(&query).unwrap_err();
+        assert!(error.contains("projection/filter"));
     }
 
     #[test]
@@ -4591,10 +4758,29 @@ mod tests {
             "select abs(distinct v2) from ice.ns.orders",
             "projection/filter",
         );
-        assert_rejects_with(
-            "select abs(k1) ignore nulls from ice.ns.orders",
-            "projection/filter",
-        );
+        let no_window = "select abs(k1) ignore nulls from ice.ns.orders";
+        let refusal = novarocks_parser::parser::parse_query(no_window)
+            .expect_err("Trino requires OVER after a null treatment");
+        assert!(refusal.to_string().contains("OVER after a null treatment"));
+
+        // Keep the classifier check on a single null-treatment flag. Trino
+        // requires a window to author it, so remove the window after parsing.
+        let mut query = novarocks_parser::parser::parse_query(
+            "select abs(k1) ignore nulls over () from ice.ns.orders",
+        )
+        .unwrap();
+        let ast::SetExpr::Select(select) = &mut *query.body else {
+            panic!("expected a SELECT fixture");
+        };
+        let ast::SelectItem::SingleColumn(column) = &mut select.projection[0] else {
+            panic!("expected the scalar fixture");
+        };
+        let ast::Expr::FunctionCall(call) = &mut column.expression else {
+            panic!("expected the scalar call");
+        };
+        call.window = None;
+        let error = classify_incremental_mv_query(&query).unwrap_err();
+        assert!(error.contains("projection/filter"));
         assert_rejects_with(
             "select {fn abs(k1)} from ice.ns.orders",
             "projection/filter",
@@ -4615,17 +4801,23 @@ mod tests {
 
     #[test]
     fn rejects_non_deterministic_now() {
+        // A qualified column keeps its original atomic name eligibility even
+        // when the table alias spells a nondeterministic bare identifier.
+        assert!(
+            parse_shape("select \"current_date\".k1 from ice.ns.orders as \"current_date\"",)
+                .is_ok()
+        );
         assert_rejects_with("select k1, now() from ice.ns.orders", "non-deterministic");
         assert_rejects_with(
-            "select k1, current_timestamp from ice.ns.orders",
+            "select k1, \"current_timestamp\" from ice.ns.orders",
             "non-deterministic",
         );
         for sql in [
-            "select current_date from ice.ns.orders",
-            "select current_time from ice.ns.orders",
+            "select \"current_date\" from ice.ns.orders",
+            "select \"current_time\" from ice.ns.orders",
             "select curtime() from ice.ns.orders",
-            "select localtime from ice.ns.orders",
-            "select localtimestamp from ice.ns.orders",
+            "select \"localtime\" from ice.ns.orders",
+            "select \"localtimestamp\" from ice.ns.orders",
             "select utc_time() from ice.ns.orders",
             "select utc_timestamp() from ice.ns.orders",
             "select unix_timestamp() from ice.ns.orders",
@@ -4641,7 +4833,7 @@ mod tests {
             "non-deterministic",
         );
         assert_rejects_with(
-            "select k1 from ice.ns.orders where k1 is not distinct from current_timestamp",
+            "select k1 from ice.ns.orders where k1 is not distinct from \"current_timestamp\"",
             "non-deterministic",
         );
     }

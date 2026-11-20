@@ -29,33 +29,30 @@ DROP TABLE IF EXISTS ${case_db}.t_rf_right_semi_residual_r;
 CREATE TABLE ${case_db}.t_rf_right_semi_residual_l (
     k INT,
     score INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 CREATE TABLE ${case_db}.t_rf_right_semi_residual_r (
     k INT,
     threshold INT,
     tag VARCHAR(20)
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t_rf_right_semi_residual_l VALUES
-    (1, 10),
-    (1, 2),
-    (2, 7),
-    (3, 5);
+    ROW(1, 10),
+    ROW(1, 2),
+    ROW(2, 7),
+    ROW(3, 5);
 
 INSERT INTO ${case_db}.t_rf_right_semi_residual_r VALUES
-    (1, 5, 'r1_pass'),
-    (1, 15, 'r1_fail'),
-    (2, 8, 'r2_fail'),
-    (3, 3, 'r3_pass'),
-    (4, 1, 'r4_nomatch'),
-    (NULL, 1, 'rnull');
+    ROW(1, 5, 'r1_pass'),
+    ROW(1, 15, 'r1_fail'),
+    ROW(2, 8, 'r2_fail'),
+    ROW(3, 3, 'r3_pass'),
+    ROW(4, 1, 'r4_nomatch'),
+    ROW(NULL, 1, 'rnull');
 
--- @explain_contains=RIGHT SEMI
+-- @explain_contains=LEFT SEMI
 -- @explain_contains=producer binding
 SELECT r.k, r.threshold, r.tag
-FROM ${case_db}.t_rf_right_semi_residual_l l
-RIGHT SEMI JOIN ${case_db}.t_rf_right_semi_residual_r r
-  ON l.k = r.k AND l.score > r.threshold
+FROM ${case_db}.t_rf_right_semi_residual_r r
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t_rf_right_semi_residual_l l WHERE l.k = r.k AND l.score > r.threshold)
 ORDER BY r.k, r.threshold;

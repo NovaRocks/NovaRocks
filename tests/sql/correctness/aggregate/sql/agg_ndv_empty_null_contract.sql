@@ -21,14 +21,13 @@
 -- Count non-null distinct values on empty, all-null, and mixed input across groups.
 -- query 1
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.ndv_null_contract (k INT, v INT, s VARCHAR(8))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.ndv_null_contract (k INT, v INT, s VARCHAR(8)) WITH (format_version = 3);
 
 -- query 2
 -- @skip_result_check=true
 INSERT INTO ${case_db}.ndv_null_contract VALUES
-    (1, NULL, 'a'), (1, NULL, 'a'), (2, 7, 'a'), (2, NULL, 'a'),
-    (2, 7, 'a'), (3, 7, 'a'), (3, 8, 'a');
+    ROW(1, NULL, 'a'), ROW(1, NULL, 'a'), ROW(2, 7, 'a'), ROW(2, NULL, 'a'),
+    ROW(2, 7, 'a'), ROW(3, 7, 'a'), ROW(3, 8, 'a');
 
 -- query 3
 SELECT ndv(v) AS ndv_empty, approx_count_distinct(v) AS approx_empty,

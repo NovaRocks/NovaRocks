@@ -34,32 +34,15 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE EXTERNAL CATALOG mvrw_${uuid0}
-PROPERTIES (
-  "type" = "iceberg",
-  "iceberg.catalog.type" = "rest",
-  "uri" = "${iceberg_rest_uri}",
-  "warehouse" = "${iceberg_rest_warehouse}",
-  "aws.s3.endpoint" = "${oss_endpoint}",
-  "credential.object-store-metadata.consumer-role" = "frontend",
-  "credential.object-store-metadata.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-metadata.name" = "${iceberg_object_store_metadata_credential_name}",
-  "credential.object-store-metadata.generation" = "${iceberg_object_store_credential_generation}",
-  "credential.object-store-data.consumer-role" = "backend",
-  "credential.object-store-data.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-data.name" = "${iceberg_object_store_data_credential_name}",
-  "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
-  "aws.s3.region" = "${oss_region}",
-  "aws.s3.enable_path_style_access" = "${oss_path_style}"
-);
+CREATE CATALOG mvrw_${uuid0} USING iceberg WITH ("iceberg.catalog.type" = 'rest', "uri" = '${iceberg_rest_uri}', "warehouse" = '${iceberg_rest_warehouse}', "aws.s3.endpoint" = '${oss_endpoint}', "credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-metadata.name" = '${iceberg_object_store_metadata_credential_name}', "credential.object-store-metadata.generation" = '${iceberg_object_store_credential_generation}', "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-data.name" = '${iceberg_object_store_data_credential_name}', "credential.object-store-data.generation" = '${iceberg_object_store_credential_generation}', "aws.s3.region" = '${oss_region}', "aws.s3.enable_path_style_access" = '${oss_path_style}');
 
 -- query 2
 -- @skip_result_check=true
-CREATE DATABASE mvrw_${uuid0}.ns_${uuid0};
+CREATE SCHEMA mvrw_${uuid0}.ns_${uuid0};
 
 -- query 3
 -- @skip_result_check=true
-CREATE DATABASE mvrw_${uuid0}.ns2_${uuid0};
+CREATE SCHEMA mvrw_${uuid0}.ns2_${uuid0};
 
 -- query 4
 -- @skip_result_check=true
@@ -68,7 +51,7 @@ CREATE TABLE mvrw_${uuid0}.ns_${uuid0}.sales_data (
   order_id BIGINT,
   category_l1 STRING,
   sales_amount BIGINT
-) TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+) WITH (format_version = 3);
 
 -- query 5
 -- @skip_result_check=true
@@ -90,14 +73,11 @@ USE mvrw_${uuid0}.ns_${uuid0};
 -- query 8
 -- full-projection SPJ MV over the wide base table
 -- @skip_result_check=true
-CREATE MATERIALIZED VIEW sales_full_mv
-DISTRIBUTED BY HASH(customer_id) BUCKETS 1
-PROPERTIES ('storage_engine' = 'iceberg')
-AS SELECT customer_id, order_id, category_l1, sales_amount FROM sales_data;
+CREATE MATERIALIZED VIEW sales_full_mv AS SELECT customer_id, order_id, category_l1, sales_amount FROM sales_data;
 
 -- query 9
 -- @skip_result_check=true
-REFRESH MATERIALIZED VIEW sales_full_mv WITH SYNC MODE;
+REFRESH MATERIALIZED VIEW sales_full_mv;
 
 -- query 10
 -- CTE + DISTINCT + scalar subqueries + APPROX_COUNT_DISTINCT: must plan and
@@ -110,8 +90,8 @@ dairy_buyers AS (
   SELECT DISTINCT customer_id FROM sales_data WHERE category_l1 = 'Dairy'
 )
 SELECT
-  (SELECT COUNT(*) FROM dairy_buyers) AS dairy_cnt,
-  (SELECT COUNT(*) FROM snack_buyers) AS snack_cnt;
+  (SELECT COUNT() FROM dairy_buyers) AS dairy_cnt,
+  (SELECT COUNT() FROM snack_buyers) AS snack_cnt;
 
 -- query 11
 -- APPROX_COUNT_DISTINCT over the base with the candidate present
@@ -119,7 +99,7 @@ SELECT APPROX_COUNT_DISTINCT(customer_id) AS acd FROM sales_data;
 
 -- query 12
 -- self-join: each branch may rewrite independently; result must be exact
-SELECT a.category_l1, COUNT(*) AS c
+SELECT a.category_l1, COUNT() AS c
 FROM sales_data a
 JOIN sales_data b ON a.order_id = b.order_id
 GROUP BY a.category_l1 ORDER BY a.category_l1;
@@ -131,15 +111,12 @@ USE ns2_${uuid0};
 
 -- query 14
 -- @skip_result_check=true
-CREATE MATERIALIZED VIEW xns_mv
-DISTRIBUTED BY HASH(category_l1) BUCKETS 1
-PROPERTIES ('storage_engine' = 'iceberg')
-AS SELECT category_l1, COUNT(*) AS c, SUM(sales_amount) AS s
+CREATE MATERIALIZED VIEW xns_mv AS SELECT category_l1, COUNT(*) AS c, SUM(sales_amount) AS s
 FROM mvrw_${uuid0}.ns_${uuid0}.sales_data GROUP BY category_l1;
 
 -- query 15
 -- @skip_result_check=true
-REFRESH MATERIALIZED VIEW xns_mv WITH SYNC MODE;
+REFRESH MATERIALIZED VIEW xns_mv;
 
 -- query 16
 -- query issued from ns2 against the ns base table -> the cross-namespace MV
@@ -159,9 +136,7 @@ CREATE TABLE mvrw_${uuid0}.ns_${uuid0}.part_sales (
   region STRING,
   day STRING,
   amount BIGINT
-)
-PARTITION BY (region)
-TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+) WITH (partitioning = ARRAY['region'], format_version = 3);
 
 -- query 19
 -- @skip_result_check=true
@@ -178,14 +153,11 @@ USE ns_${uuid0};
 
 -- query 21
 -- @skip_result_check=true
-CREATE MATERIALIZED VIEW part_mv
-DISTRIBUTED BY HASH(region) BUCKETS 1
-PROPERTIES ('storage_engine' = 'iceberg')
-AS SELECT region, day, SUM(amount) AS s FROM part_sales GROUP BY region, day;
+CREATE MATERIALIZED VIEW part_mv AS SELECT region, day, SUM(amount) AS s FROM part_sales GROUP BY region, day;
 
 -- query 22
 -- @skip_result_check=true
-REFRESH MATERIALIZED VIEW part_mv WITH SYNC MODE;
+REFRESH MATERIALIZED VIEW part_mv;
 
 -- query 23
 -- @skip_result_check=true
@@ -224,22 +196,22 @@ DROP MATERIALIZED VIEW IF EXISTS ns_${uuid0}.sales_full_mv;
 -- query 30
 -- @cleanup=true
 -- @skip_result_check=true
-DROP TABLE IF EXISTS mvrw_${uuid0}.ns_${uuid0}.part_sales FORCE;
+DROP TABLE IF EXISTS mvrw_${uuid0}.ns_${uuid0}.part_sales ;
 
 -- query 31
 -- @cleanup=true
 -- @skip_result_check=true
-DROP TABLE IF EXISTS mvrw_${uuid0}.ns_${uuid0}.sales_data FORCE;
+DROP TABLE IF EXISTS mvrw_${uuid0}.ns_${uuid0}.sales_data ;
 
 -- query 32
 -- @cleanup=true
 -- @skip_result_check=true
-DROP DATABASE IF EXISTS mvrw_${uuid0}.ns2_${uuid0};
+DROP SCHEMA IF EXISTS mvrw_${uuid0}.ns2_${uuid0};
 
 -- query 33
 -- @cleanup=true
 -- @skip_result_check=true
-DROP DATABASE IF EXISTS mvrw_${uuid0}.ns_${uuid0};
+DROP SCHEMA IF EXISTS mvrw_${uuid0}.ns_${uuid0};
 
 -- query 34
 -- @cleanup=true

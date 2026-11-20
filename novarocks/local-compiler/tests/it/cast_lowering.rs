@@ -87,6 +87,7 @@ fn cast_fixture(
                     None,
                     ty.clone(),
                     ExprKind::Cast {
+                        array_failure_mode: None,
                         expr: exact,
                         target: DataType::Float32,
                         decimal_overflow_policy: policy,
@@ -153,6 +154,7 @@ fn cast_fixture(
             None,
             result_type.clone(),
             ExprKind::Cast {
+                array_failure_mode: None,
                 expr: child,
                 target: result_type.data_type().clone(),
                 decimal_overflow_policy: policy,

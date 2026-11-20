@@ -30,29 +30,27 @@ CREATE TABLE ${case_db}.t_rf_inner_null_safe_str_l (
     id INT,
     k VARCHAR(20),
     v VARCHAR(20)
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 CREATE TABLE ${case_db}.t_rf_inner_null_safe_str_r (
     k VARCHAR(20),
     tag VARCHAR(20)
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t_rf_inner_null_safe_str_l VALUES
-    (1, NULL, 'ln1'),
-    (2, NULL, 'ln2'),
-    (3, 'a', 'la'),
-    (4, 'b', 'lb');
+    ROW(1, NULL, 'ln1'),
+    ROW(2, NULL, 'ln2'),
+    ROW(3, 'a', 'la'),
+    ROW(4, 'b', 'lb');
 
 INSERT INTO ${case_db}.t_rf_inner_null_safe_str_r VALUES
-    (NULL, 'rn1'),
-    ('a', 'ra1'),
-    ('c', 'rc1');
+    ROW(NULL, 'rn1'),
+    ROW('a', 'ra1'),
+    ROW('c', 'rc1');
 
 -- @explain_contains=producer binding
 -- @explain_contains=consumer binding
 SELECT l.id, l.v, r.tag
 FROM ${case_db}.t_rf_inner_null_safe_str_l l
 INNER JOIN ${case_db}.t_rf_inner_null_safe_str_r r
-  ON l.k <=> r.k
+  ON l.k  IS NOT DISTINCT FROM  r.k
 ORDER BY l.id, l.v, r.tag;

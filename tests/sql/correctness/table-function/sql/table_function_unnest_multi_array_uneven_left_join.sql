@@ -32,7 +32,7 @@ FROM (
     UNION ALL
     SELECT CAST(3 AS BIGINT)
 ) b
-LEFT JOIN LATERAL UNNEST(
+LEFT JOIN  UNNEST(
     IF(
         b.id = 1,
         [CAST(1 AS BIGINT), 2, 3],

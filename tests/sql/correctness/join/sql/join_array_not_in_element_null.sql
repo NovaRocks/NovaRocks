@@ -30,32 +30,30 @@
 -- query 1
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.arr_lhs (
-  `pk` int(11) NOT NULL,
-  `d_1` Array<DECIMAL(26, 2)>
-)
-TBLPROPERTIES ("format-version" = "3");
+  "pk" int(11) NOT NULL,
+  "d_1" Array<DECIMAL(26, 2)>
+) WITH (format_version = 3);
 
 -- query 2
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.arr_rhs (
-  `pk` int(11) NOT NULL,
-  `i_0` Array<INT> NOT NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+  "pk" int(11) NOT NULL,
+  "i_0" Array<INT> NOT NULL
+) WITH (format_version = 3);
 
 -- query 3
 -- @skip_result_check=true
 INSERT INTO ${case_db}.arr_lhs VALUES
-    (1, [1.00, 2.00]),
-    (2, [1.00, NULL]),
-    (3, [3.00, 4.00]);
+    ROW(1, [1.00, 2.00]),
+    ROW(2, [1.00, NULL]),
+    ROW(3, [3.00, 4.00]);
 
 -- query 4
 -- @skip_result_check=true
 INSERT INTO ${case_db}.arr_rhs VALUES
-    (1, [1, 2]),
-    (2, [1, NULL]),
-    (3, [9, 9]);
+    ROW(1, [1, 2]),
+    ROW(2, [1, NULL]),
+    ROW(3, [9, 9]);
 
 -- pk=1 d_1=[1.00,2.00]: matches arr_rhs.pk=1 [1,2] → IN=TRUE → NOT IN=FALSE → excluded
 -- pk=2 d_1=[1.00,NULL]: arr_rhs.pk=2 [1,NULL] makes eq=NULL (element-NULL) → IN=NULL → NOT IN=NULL → excluded

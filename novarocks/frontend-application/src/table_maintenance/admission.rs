@@ -20,20 +20,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::query_execution::maintenance::MaintenanceRequestContext;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use novarocks_sql::semantic::command::{
-    CommandLiteral, ExpireSnapshotsOptionSql, MaintenanceSqlCommand, MaintenanceValueSql,
-    ProcedureArgumentModeSql,
+    CommandLiteral, MaintenanceSqlCommand, MaintenanceValueSql, ProcedureArgumentModeSql,
 };
 use novarocks_types::naming::normalize_identifier;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ParsedMaintenanceStatement {
-    Execute {
-        name_parts: Vec<String>,
-        action: ParsedMaintenanceAction,
-    },
-    SubmitOptimize {
-        name_parts: Vec<String>,
-    },
+pub struct ParsedMaintenanceStatement {
+    pub(crate) name_parts: Vec<String>,
+    pub(crate) action: ParsedMaintenanceAction,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -67,76 +61,12 @@ pub(crate) fn lower_semantic_maintenance_statement(
     statement: &MaintenanceSqlCommand,
     context: MaintenanceRequestContext<'_>,
 ) -> Result<ParsedMaintenanceStatement, String> {
-    match statement {
-        MaintenanceSqlCommand::Call {
-            procedure,
-            arguments,
-            argument_mode,
-        } => lower_semantic_call(procedure, arguments, *argument_mode, context),
-        MaintenanceSqlCommand::Optimize { table } => {
-            Ok(ParsedMaintenanceStatement::SubmitOptimize {
-                name_parts: normalize_semantic_object_name(table)?,
-            })
-        }
-        MaintenanceSqlCommand::RewriteManifests { table } => {
-            let name_parts = normalize_semantic_object_name(table)?;
-            reject_branch_suffix(&name_parts, "REWRITE MANIFESTS")?;
-            Ok(ParsedMaintenanceStatement::Execute {
-                name_parts,
-                action: ParsedMaintenanceAction::RewriteManifests {
-                    use_caching: None,
-                    spec_id: None,
-                },
-            })
-        }
-        MaintenanceSqlCommand::ExpireSnapshots { table, options } => {
-            let name_parts = normalize_semantic_object_name(table)?;
-            reject_branch_suffix(&name_parts, "EXPIRE SNAPSHOTS")?;
-            let mut older_than_ms = None;
-            let mut retain_last = None;
-            for option in options {
-                match option {
-                    ExpireSnapshotsOptionSql::OlderThan(value) => {
-                        if older_than_ms.is_some() {
-                            return Err("EXPIRE SNAPSHOTS: duplicate OLDER THAN clause".to_string());
-                        }
-                        older_than_ms = Some(lower_semantic_expire_timestamp_ms(value)?);
-                    }
-                    ExpireSnapshotsOptionSql::RetainLast(value) => {
-                        if retain_last.is_some() {
-                            return Err(
-                                "EXPIRE SNAPSHOTS: duplicate RETAIN LAST clause".to_string()
-                            );
-                        }
-                        retain_last = Some(lower_semantic_expire_retain_last(value)?);
-                    }
-                }
-            }
-            if older_than_ms.is_none() && retain_last.is_none() {
-                return Err(
-                    "EXPIRE SNAPSHOTS requires at least OLDER THAN or RETAIN LAST clause"
-                        .to_string(),
-                );
-            }
-            Ok(ParsedMaintenanceStatement::Execute {
-                name_parts,
-                action: ParsedMaintenanceAction::ExpireSnapshots {
-                    older_than_ms,
-                    retain_last,
-                },
-            })
-        }
-        MaintenanceSqlCommand::RemoveOrphanFiles { table, older_than } => {
-            let name_parts = normalize_semantic_object_name(table)?;
-            reject_branch_suffix(&name_parts, "REMOVE ORPHAN FILES")?;
-            Ok(ParsedMaintenanceStatement::Execute {
-                name_parts,
-                action: ParsedMaintenanceAction::RemoveOrphanFiles {
-                    older_than_ms: lower_semantic_expire_timestamp_ms(older_than)?,
-                },
-            })
-        }
-    }
+    let MaintenanceSqlCommand::Call {
+        procedure,
+        arguments,
+        argument_mode,
+    } = statement;
+    lower_semantic_call(procedure, arguments, *argument_mode, context)
 }
 
 fn lower_semantic_call(
@@ -230,48 +160,6 @@ fn lower_semantic_procedure_literal(value: &CommandLiteral) -> Result<ProcedureA
     }
 }
 
-fn lower_semantic_expire_timestamp_ms(value: &MaintenanceValueSql) -> Result<i64, String> {
-    let MaintenanceValueSql::Literal(value) = value else {
-        return Err(
-            "EXPIRE SNAPSHOTS: expected timestamp literal (quoted string or integer)".to_string(),
-        );
-    };
-    match value {
-        CommandLiteral::String(value) => {
-            if let Ok(value) = DateTime::parse_from_rfc3339(value) {
-                return Ok(value.with_timezone(&Utc).timestamp_millis());
-            }
-            if let Ok(value) = NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S") {
-                return Ok(value.and_utc().timestamp_millis());
-            }
-            Err(format!(
-                "EXPIRE SNAPSHOTS: cannot parse timestamp '{value}'; expected RFC 3339 (e.g. '2026-04-01T00:00:00Z') or 'YYYY-MM-DD HH:MM:SS'"
-            ))
-        }
-        CommandLiteral::Number(value) => value.parse::<i64>().map_err(|error| {
-            format!("EXPIRE SNAPSHOTS: invalid epoch-ms integer '{value}': {error}")
-        }),
-        _ => Err(
-            "EXPIRE SNAPSHOTS: expected timestamp literal (quoted string or integer)".to_string(),
-        ),
-    }
-}
-
-fn lower_semantic_expire_retain_last(value: &MaintenanceValueSql) -> Result<u32, String> {
-    let MaintenanceValueSql::Literal(CommandLiteral::Number(value)) = value else {
-        return Err("EXPIRE SNAPSHOTS: expected integer for RETAIN LAST".to_string());
-    };
-    let value = value.parse::<u64>().map_err(|error| {
-        format!("EXPIRE SNAPSHOTS: invalid RETAIN LAST value '{value}': {error}")
-    })?;
-    if value == 0 {
-        return Err("EXPIRE SNAPSHOTS: RETAIN LAST must be >= 1".to_string());
-    }
-    value
-        .try_into()
-        .map_err(|_| "EXPIRE SNAPSHOTS: RETAIN LAST value too large".to_string())
-}
-
 fn normalize_semantic_object_name(
     name: &novarocks_sql::semantic::ObjectName,
 ) -> Result<Vec<String>, String> {
@@ -279,20 +167,6 @@ fn normalize_semantic_object_name(
         .iter()
         .map(|part| normalize_identifier(part))
         .collect()
-}
-
-fn reject_branch_suffix(name_parts: &[String], action: &str) -> Result<(), String> {
-    if name_parts.len() >= 2
-        && name_parts
-            .last()
-            .is_some_and(|part| part.starts_with("branch_") || part.starts_with("tag_"))
-    {
-        return Err(format!(
-            "{action} does not support branch/tag suffix on table name: {}",
-            name_parts.join(".")
-        ));
-    }
-    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -379,10 +253,10 @@ fn lower_call_procedure(
         },
         other => return Err(format!("unsupported Iceberg system procedure `{other}`")),
     };
-    Ok(ParsedMaintenanceStatement::Execute { name_parts, action })
+    Ok(ParsedMaintenanceStatement { name_parts, action })
 }
 
-fn parse_timestamp_millis(value: &str) -> Result<i64, String> {
+pub(crate) fn parse_timestamp_millis(value: &str) -> Result<i64, String> {
     if let Ok(value) = DateTime::parse_from_rfc3339(value) {
         return Ok(value.with_timezone(&Utc).timestamp_millis());
     }
@@ -727,15 +601,16 @@ mod semantic_tests {
     }
 
     fn semantic_maintenance(source: &str) -> MaintenanceSqlCommand {
-        let statement = novarocks_query_application::sql::parse_single_statement(source)
-            .expect("parse semantic maintenance command");
-        let Some(novarocks_query_application::sql::ProductSqlCommand::Maintenance(command)) =
-            novarocks_query_application::sql::lower_product_sql_command(&statement)
-                .expect("lower semantic maintenance command")
-        else {
-            panic!("expected semantic maintenance command");
+        use novarocks_parser::ast::TrinoStatement;
+        use novarocks_query_application::sql::{PreparedMaintenanceCall, parse_single_statement};
+
+        let TrinoStatement::Call(statement) = parse_single_statement(source).unwrap() else {
+            panic!("expected a typed maintenance call");
         };
-        command
+        PreparedMaintenanceCall::from_trino(&statement)
+            .unwrap()
+            .maintenance_command()
+            .unwrap()
     }
 
     #[test]
@@ -743,11 +618,11 @@ mod semantic_tests {
         assert_eq!(
             lower_semantic_maintenance_statement(
                 &semantic_maintenance(
-                    "CALL ice.system.rewrite_manifests(table => 'analytics.orders', use_caching => TRUE, spec_id => 3)",
+                    "CALL ice.system.rewrite_manifests(\"table\" => 'analytics.orders', use_caching => TRUE, spec_id => 3)",
                 ),
                 context(),
             ),
-            Ok(ParsedMaintenanceStatement::Execute {
+            Ok(ParsedMaintenanceStatement {
                 name_parts: vec!["ice".into(), "analytics".into(), "orders".into()],
                 action: ParsedMaintenanceAction::RewriteManifests {
                     use_caching: Some(true),
@@ -758,11 +633,11 @@ mod semantic_tests {
         assert_eq!(
             lower_semantic_maintenance_statement(
                 &semantic_maintenance(
-                    "ALTER TABLE ice.analytics.orders EXPIRE SNAPSHOTS OLDER THAN 1700000000000 RETAIN LAST 3",
+                    r#"CALL ice.system.expire_snapshots("table" => 'analytics.orders', older_than => TIMESTAMP '2023-11-14 22:13:20', retain_last => 3)"#,
                 ),
                 context(),
             ),
-            Ok(ParsedMaintenanceStatement::Execute {
+            Ok(ParsedMaintenanceStatement {
                 name_parts: vec!["ice".into(), "analytics".into(), "orders".into()],
                 action: ParsedMaintenanceAction::ExpireSnapshots {
                     older_than_ms: Some(1_700_000_000_000),
@@ -776,15 +651,15 @@ mod semantic_tests {
     fn semantic_maintenance_rejects_invalid_admission_values() {
         for (source, expected) in [
             (
-                "ALTER TABLE ice.db.branch_main REWRITE MANIFESTS",
-                "does not support branch/tag suffix",
+                r#"CALL ice.public.rewrite_manifests("table" => 'db.orders')"#,
+                "must use system namespace",
             ),
             (
-                "ALTER TABLE ice.db.orders EXPIRE SNAPSHOTS OLDER THAN TIMESTAMP '2026-01-01 00:00:00'",
-                "expected timestamp literal",
+                r#"CALL ice.system.expire_snapshots("table" => 'db.orders')"#,
+                "requires `older_than` or `retain_last`",
             ),
             (
-                "CALL ice.system.rewrite_data_files(table => 'db.orders', options => MAP('rewrite-all', 1))",
+                "CALL ice.system.rewrite_data_files(\"table\" => 'db.orders', options => MAP('rewrite-all', 1))",
                 "map key/value expects a single quoted string",
             ),
         ] {

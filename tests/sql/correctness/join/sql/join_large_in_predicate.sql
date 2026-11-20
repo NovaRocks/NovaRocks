@@ -62,8 +62,7 @@ CREATE TABLE ${case_db}.t_int (
     int_col int,
     bigint_col bigint,
     value varchar(50)
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 9
 -- @skip_result_check=true
@@ -73,8 +72,7 @@ CREATE TABLE ${case_db}.t_string (
     char_col char(10),
     text_col text,
     category varchar(20)
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 10
 -- @skip_result_check=true
@@ -88,8 +86,7 @@ CREATE TABLE ${case_db}.t_mixed (
     date_val date,
     datetime_val datetime,
     bool_val boolean
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 11
 -- @skip_result_check=true
@@ -99,8 +96,7 @@ CREATE TABLE ${case_db}.t_large (
     status varchar(20),
     score double,
     created_date date
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 12
 -- @skip_result_check=true
@@ -108,98 +104,97 @@ CREATE TABLE ${case_db}.t_dimension (
     dim_id int NOT NULL,
     dim_name varchar(50),
     dim_type varchar(20)
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 13
 -- @skip_result_check=true
 INSERT INTO ${case_db}.t_int VALUES
-(1, 10, 100, 1000, 10000, 'value1'),
-(2, 20, 200, 2000, 20000, 'value2'),
-(3, 30, 300, 3000, 30000, 'value3'),
-(4, 40, 400, 4000, 40000, 'value4'),
-(5, 50, 500, 5000, 50000, 'value5'),
-(6, 60, 600, 6000, 60000, 'value6'),
-(7, 70, 700, 7000, 70000, 'value7'),
-(8, 80, 800, 8000, 80000, 'value8'),
-(9, 90, 900, 9000, 90000, 'value9'),
-(10, 100, 1000, 10000, 100000, 'value10'),
-(11, -10, -100, -1000, -10000, 'negative1'),
-(12, -20, -200, -2000, -20000, 'negative2'),
-(13, 0, 0, 0, 0, 'zero'),
-(14, null, null, null, null, 'null_values'),
-(15, 15, 150, 1500, 15000, 'extra1');
+ROW(1, 10, 100, 1000, 10000, 'value1'),
+ROW(2, 20, 200, 2000, 20000, 'value2'),
+ROW(3, 30, 300, 3000, 30000, 'value3'),
+ROW(4, 40, 400, 4000, 40000, 'value4'),
+ROW(5, 50, 500, 5000, 50000, 'value5'),
+ROW(6, 60, 600, 6000, 60000, 'value6'),
+ROW(7, 70, 700, 7000, 70000, 'value7'),
+ROW(8, 80, 800, 8000, 80000, 'value8'),
+ROW(9, 90, 900, 9000, 90000, 'value9'),
+ROW(10, 100, 1000, 10000, 100000, 'value10'),
+ROW(11, -10, -100, -1000, -10000, 'negative1'),
+ROW(12, -20, -200, -2000, -20000, 'negative2'),
+ROW(13, 0, 0, 0, 0, 'zero'),
+ROW(14, null, null, null, null, 'null_values'),
+ROW(15, 15, 150, 1500, 15000, 'extra1');
 
 -- query 14
 -- @skip_result_check=true
 INSERT INTO ${case_db}.t_string VALUES
-(1, 'apple', 'fruit', 'This is apple text', 'food'),
-(2, 'banana', 'fruit', 'This is banana text', 'food'),
-(3, 'carrot', 'vegetable', 'This is carrot text', 'food'),
-(4, 'dog', 'animal', 'This is dog text', 'pet'),
-(5, 'elephant', 'animal', 'This is elephant text', 'wild'),
-(6, 'fish', 'animal', 'This is fish text', 'aquatic'),
-(7, 'grape', 'fruit', 'This is grape text', 'food'),
-(8, 'house', 'building', 'This is house text', 'shelter'),
-(9, 'ice', 'water', 'This is ice text', 'cold'),
-(10, 'jungle', 'nature', 'This is jungle text', 'wild'),
-(11, 'a''b', 'special', 'Text with quote', 'test'),
-(12, 'c"d', 'special', 'Text with double quote', 'test'),
-(13, 'e\\f', 'special', 'Text with backslash', 'test'),
-(14, '', 'empty', 'Empty string test', 'test'),
-(15, null, null, null, null);
+ROW(1, 'apple', 'fruit', 'This is apple text', 'food'),
+ROW(2, 'banana', 'fruit', 'This is banana text', 'food'),
+ROW(3, 'carrot', 'vegetable', 'This is carrot text', 'food'),
+ROW(4, 'dog', 'animal', 'This is dog text', 'pet'),
+ROW(5, 'elephant', 'animal', 'This is elephant text', 'wild'),
+ROW(6, 'fish', 'animal', 'This is fish text', 'aquatic'),
+ROW(7, 'grape', 'fruit', 'This is grape text', 'food'),
+ROW(8, 'house', 'building', 'This is house text', 'shelter'),
+ROW(9, 'ice', 'water', 'This is ice text', 'cold'),
+ROW(10, 'jungle', 'nature', 'This is jungle text', 'wild'),
+ROW(11, 'a''b', 'special', 'Text with quote', 'test'),
+ROW(12, 'c"d', 'special', 'Text with double quote', 'test'),
+ROW(13, 'e\f', 'special', 'Text with backslash', 'test'),
+ROW(14, '', 'empty', 'Empty string test', 'test'),
+ROW(15, null, null, null, null);
 
 -- query 15
 -- @skip_result_check=true
 INSERT INTO ${case_db}.t_mixed VALUES
-(1, 100, 'str100', 1.1, 1.11, 100.50, '2024-01-01', '2024-01-01 10:00:00', true),
-(2, 200, 'str200', 2.2, 2.22, 200.75, '2024-01-02', '2024-01-02 11:00:00', false),
-(3, 300, 'str300', 3.3, 3.33, 300.25, '2024-01-03', '2024-01-03 12:00:00', true),
-(4, 400, 'str400', 4.4, 4.44, 400.00, '2024-01-04', '2024-01-04 13:00:00', false),
-(5, 500, 'str500', 5.5, 5.55, 500.99, '2024-01-05', '2024-01-05 14:00:00', true),
-(6, 600, 'str600', 6.6, 6.66, 600.10, '2024-01-06', '2024-01-06 15:00:00', false),
-(7, 700, 'str700', 7.7, 7.77, 700.20, '2024-01-07', '2024-01-07 16:00:00', true),
-(8, 800, 'str800', 8.8, 8.88, 800.30, '2024-01-08', '2024-01-08 17:00:00', false),
-(9, 900, 'str900', 9.9, 9.99, 900.40, '2024-01-09', '2024-01-09 18:00:00', true),
-(10, 1000, 'str1000', 10.0, 10.10, 1000.50, '2024-01-10', '2024-01-10 19:00:00', false);
+ROW(1, 100, 'str100', 1.1, 1.11, 100.50, '2024-01-01', '2024-01-01 10:00:00', true),
+ROW(2, 200, 'str200', 2.2, 2.22, 200.75, '2024-01-02', '2024-01-02 11:00:00', false),
+ROW(3, 300, 'str300', 3.3, 3.33, 300.25, '2024-01-03', '2024-01-03 12:00:00', true),
+ROW(4, 400, 'str400', 4.4, 4.44, 400.00, '2024-01-04', '2024-01-04 13:00:00', false),
+ROW(5, 500, 'str500', 5.5, 5.55, 500.99, '2024-01-05', '2024-01-05 14:00:00', true),
+ROW(6, 600, 'str600', 6.6, 6.66, 600.10, '2024-01-06', '2024-01-06 15:00:00', false),
+ROW(7, 700, 'str700', 7.7, 7.77, 700.20, '2024-01-07', '2024-01-07 16:00:00', true),
+ROW(8, 800, 'str800', 8.8, 8.88, 800.30, '2024-01-08', '2024-01-08 17:00:00', false),
+ROW(9, 900, 'str900', 9.9, 9.99, 900.40, '2024-01-09', '2024-01-09 18:00:00', true),
+ROW(10, 1000, 'str1000', 10.0, 10.10, 1000.50, '2024-01-10', '2024-01-10 19:00:00', false);
 
 -- query 16
 -- @skip_result_check=true
 INSERT INTO ${case_db}.t_large VALUES
-(1, 1, 'active', 85.5, '2024-01-01'),
-(2, 1, 'inactive', 72.3, '2024-01-02'),
-(3, 2, 'active', 91.2, '2024-01-03'),
-(4, 2, 'pending', 68.7, '2024-01-04'),
-(5, 3, 'active', 94.1, '2024-01-05'),
-(6, 3, 'inactive', 55.9, '2024-01-06'),
-(7, 4, 'active', 88.8, '2024-01-07'),
-(8, 4, 'pending', 77.4, '2024-01-08'),
-(9, 5, 'active', 92.6, '2024-01-09'),
-(10, 5, 'inactive', 63.2, '2024-01-10'),
-(11, 1, 'active', 89.3, '2024-01-11'),
-(12, 2, 'active', 95.7, '2024-01-12'),
-(13, 3, 'pending', 71.8, '2024-01-13'),
-(14, 4, 'active', 84.4, '2024-01-14'),
-(15, 5, 'inactive', 59.6, '2024-01-15'),
-(16, 1, 'pending', 78.9, '2024-01-16'),
-(17, 2, 'active', 93.2, '2024-01-17'),
-(18, 3, 'active', 87.1, '2024-01-18'),
-(19, 4, 'inactive', 66.5, '2024-01-19'),
-(20, 5, 'active', 90.8, '2024-01-20');
+ROW(1, 1, 'active', 85.5, '2024-01-01'),
+ROW(2, 1, 'inactive', 72.3, '2024-01-02'),
+ROW(3, 2, 'active', 91.2, '2024-01-03'),
+ROW(4, 2, 'pending', 68.7, '2024-01-04'),
+ROW(5, 3, 'active', 94.1, '2024-01-05'),
+ROW(6, 3, 'inactive', 55.9, '2024-01-06'),
+ROW(7, 4, 'active', 88.8, '2024-01-07'),
+ROW(8, 4, 'pending', 77.4, '2024-01-08'),
+ROW(9, 5, 'active', 92.6, '2024-01-09'),
+ROW(10, 5, 'inactive', 63.2, '2024-01-10'),
+ROW(11, 1, 'active', 89.3, '2024-01-11'),
+ROW(12, 2, 'active', 95.7, '2024-01-12'),
+ROW(13, 3, 'pending', 71.8, '2024-01-13'),
+ROW(14, 4, 'active', 84.4, '2024-01-14'),
+ROW(15, 5, 'inactive', 59.6, '2024-01-15'),
+ROW(16, 1, 'pending', 78.9, '2024-01-16'),
+ROW(17, 2, 'active', 93.2, '2024-01-17'),
+ROW(18, 3, 'active', 87.1, '2024-01-18'),
+ROW(19, 4, 'inactive', 66.5, '2024-01-19'),
+ROW(20, 5, 'active', 90.8, '2024-01-20');
 
 -- query 17
 -- @skip_result_check=true
 INSERT INTO ${case_db}.t_dimension VALUES
-(1, 'Category A', 'primary'),
-(2, 'Category B', 'secondary'),
-(3, 'Category C', 'primary'),
-(4, 'Category D', 'tertiary'),
-(5, 'Category E', 'secondary'),
-(6, 'Category F', 'primary'),
-(7, 'Category G', 'tertiary'),
-(8, 'Category H', 'secondary'),
-(9, 'Category I', 'primary'),
-(10, 'Category J', 'tertiary');
+ROW(1, 'Category A', 'primary'),
+ROW(2, 'Category B', 'secondary'),
+ROW(3, 'Category C', 'primary'),
+ROW(4, 'Category D', 'tertiary'),
+ROW(5, 'Category E', 'secondary'),
+ROW(6, 'Category F', 'primary'),
+ROW(7, 'Category G', 'tertiary'),
+ROW(8, 'Category H', 'secondary'),
+ROW(9, 'Category I', 'primary'),
+ROW(10, 'Category J', 'tertiary');
 
 -- ============================================================
 -- Basic IN predicate on integer column
@@ -551,7 +546,7 @@ SELECT id, int_col FROM ${case_db}.t_int WHERE int_col IN (1000, 1000, 2000, 200
 -- ============================================================
 -- query 59
 -- @order_sensitive=true
-SELECT id, varchar_col FROM ${case_db}.t_string WHERE varchar_col IN ('a''b', 'c"d', 'e\\f', 'normal') ORDER BY id;
+SELECT id, varchar_col FROM ${case_db}.t_string WHERE varchar_col IN ('a''b', 'c"d', 'e\f', 'normal') ORDER BY id;
 
 -- ============================================================
 -- Empty string in IN list

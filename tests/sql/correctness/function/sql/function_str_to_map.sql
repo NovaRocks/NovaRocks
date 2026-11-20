@@ -23,8 +23,7 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.t1(c1 INT, c2 STRING)
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.t1(c1 INT, c2 STRING) WITH (format_version = 3);
 
 -- query 2
 -- @skip_result_check=true
@@ -33,4 +32,4 @@ insert into t1 select generate_series, generate_series from TABLE(generate_serie
 
 -- query 3
 USE ${case_db};
-select sum(cardinality(str_to_map(c2, ",", ":"))) from t1;
+select sum(cardinality(str_to_map(c2, ',', ':'))) from t1;

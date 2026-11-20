@@ -28,11 +28,10 @@ USE ${case_db};
 USE ${case_db};
 CREATE TABLE t1 (
     idx BIGINT,
-    k BIGINT NULL,
-    val1 BIGINT NULL,
-    val2 BIGINT NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+    k BIGINT ,
+    val1 BIGINT ,
+    val2 BIGINT
+) WITH (format_version = 3);
 
 -- query 3
 -- @skip_result_check=true
@@ -42,67 +41,66 @@ CREATE TABLE t1_nonnull (
     k BIGINT NOT NULL,
     val1 BIGINT NOT NULL,
     val2 BIGINT NOT NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 4
 -- @skip_result_check=true
 USE ${case_db};
 INSERT INTO t1 (val2, val1, k, idx) values
-    (10, 1,1,2),
-    (20, 2,2,4),
-    (30, 3,3,6),
-    (NULL, 4,4,8),
-    (50, NULL,5,10),
-    (NULL, NULL,6,12),
-    (70, NULL,7,14),
-    (80, 8,8,16),
-    (90, 9,9,18),
-    (100, 10,10,20);
+    ROW(10, 1,1,2),
+    ROW(20, 2,2,4),
+    ROW(30, 3,3,6),
+    ROW(NULL, 4,4,8),
+    ROW(50, NULL,5,10),
+    ROW(NULL, NULL,6,12),
+    ROW(70, NULL,7,14),
+    ROW(80, 8,8,16),
+    ROW(90, 9,9,18),
+    ROW(100, 10,10,20);
 
 -- query 5
 -- @skip_result_check=true
 USE ${case_db};
 INSERT INTO t1_nonnull (val2, val1, k, idx) values
-    (10, 1,1,2),
-    (20, 2,2,4),
-    (30, 3,3,6),
-    (40, 4,4,8),
-    (50, 5,5,10),
-    (60, 6,6,12),
-    (70, 7,7,14),
-    (80, 8,8,16),
-    (90, 9,9,18),
-    (100, 10,10,20);
+    ROW(10, 1,1,2),
+    ROW(20, 2,2,4),
+    ROW(30, 3,3,6),
+    ROW(40, 4,4,8),
+    ROW(50, 5,5,10),
+    ROW(60, 6,6,12),
+    ROW(70, 7,7,14),
+    ROW(80, 8,8,16),
+    ROW(90, 9,9,18),
+    ROW(100, 10,10,20);
 
 -- query 6
 USE ${case_db};
-with w1 as (select column_0 as c1 from ( values (1), (2), (3) )t(column_0))
+with w1 as (select column_0 as c1 from ( values ROW(1), ROW(2), ROW(3) )t(column_0))
 select round(var_samp(c1), 3) from w1 where c1 > 10;
 
 -- query 7
 USE ${case_db};
-with w1 as (select column_0 as c1 from ( values (1) )t(column_0))
+with w1 as (select column_0 as c1 from ( values ROW(1) )t(column_0))
 select round(var_samp(c1), 3) from w1;
 
 -- query 8
 USE ${case_db};
-with w1 as (select column_0 as c1 from ( values (1), (null), (null) )t(column_0))
+with w1 as (select column_0 as c1 from ( values ROW(1), ROW(null), ROW(null) )t(column_0))
 select round(var_samp(c1), 3) from w1;
 
 -- query 9
 USE ${case_db};
-with w1 as (select column_0 as c1 from ( values (null), (null) )t(column_0))
+with w1 as (select column_0 as c1 from ( values ROW(null), ROW(null) )t(column_0))
 select round(var_samp(c1), 3) from w1;
 
 -- query 10
 USE ${case_db};
-with w1 as (select column_0 as c1 from ( values (1), (2), (3) )t(column_0))
+with w1 as (select column_0 as c1 from ( values ROW(1), ROW(2), ROW(3) )t(column_0))
 select round(var_samp(c1), 3) from w1;
 
 -- query 11
 USE ${case_db};
-with w1 as (select column_0 as c1 from ( values (1), (2), (null), (3) )t(column_0))
+with w1 as (select column_0 as c1 from ( values ROW(1), ROW(2), ROW(null), ROW(3) )t(column_0))
 select round(var_samp(c1), 3) from w1;
 
 -- query 12
@@ -163,32 +161,32 @@ select round(var_samp(val1), 3) from t1;
 
 -- query 22
 USE ${case_db};
-with w1 as (select column_0 as c1 from ( values (1), (2), (3) )t(column_0))
+with w1 as (select column_0 as c1 from ( values ROW(1), ROW(2), ROW(3) )t(column_0))
 select round(variance_samp(c1), 3) from w1 where c1 > 10;
 
 -- query 23
 USE ${case_db};
-with w1 as (select column_0 as c1 from ( values (1) )t(column_0))
+with w1 as (select column_0 as c1 from ( values ROW(1) )t(column_0))
 select round(variance_samp(c1), 3) from w1;
 
 -- query 24
 USE ${case_db};
-with w1 as (select column_0 as c1 from ( values (1), (null), (null) )t(column_0))
+with w1 as (select column_0 as c1 from ( values ROW(1), ROW(null), ROW(null) )t(column_0))
 select round(variance_samp(c1), 3) from w1;
 
 -- query 25
 USE ${case_db};
-with w1 as (select column_0 as c1 from ( values (null), (null) )t(column_0))
+with w1 as (select column_0 as c1 from ( values ROW(null), ROW(null) )t(column_0))
 select round(variance_samp(c1), 3) from w1;
 
 -- query 26
 USE ${case_db};
-with w1 as (select column_0 as c1 from ( values (1), (2), (3) )t(column_0))
+with w1 as (select column_0 as c1 from ( values ROW(1), ROW(2), ROW(3) )t(column_0))
 select round(variance_samp(c1), 3) from w1;
 
 -- query 27
 USE ${case_db};
-with w1 as (select column_0 as c1 from ( values (1), (2), (null), (3) )t(column_0))
+with w1 as (select column_0 as c1 from ( values ROW(1), ROW(2), ROW(null), ROW(3) )t(column_0))
 select round(variance_samp(c1), 3) from w1;
 
 -- query 28
@@ -249,32 +247,32 @@ select round(variance_samp(val1), 3) from t1;
 
 -- query 38
 USE ${case_db};
-with w1 as (select column_0 as c1 from ( values (1), (2), (3) )t(column_0))
+with w1 as (select column_0 as c1 from ( values ROW(1), ROW(2), ROW(3) )t(column_0))
 select round(stddev_samp(c1), 3) from w1 where c1 > 10;
 
 -- query 39
 USE ${case_db};
-with w1 as (select column_0 as c1 from ( values (1) )t(column_0))
+with w1 as (select column_0 as c1 from ( values ROW(1) )t(column_0))
 select round(stddev_samp(c1), 3) from w1;
 
 -- query 40
 USE ${case_db};
-with w1 as (select column_0 as c1 from ( values (1), (null), (null) )t(column_0))
+with w1 as (select column_0 as c1 from ( values ROW(1), ROW(null), ROW(null) )t(column_0))
 select round(stddev_samp(c1), 3) from w1;
 
 -- query 41
 USE ${case_db};
-with w1 as (select column_0 as c1 from ( values (null), (null) )t(column_0))
+with w1 as (select column_0 as c1 from ( values ROW(null), ROW(null) )t(column_0))
 select round(stddev_samp(c1), 3) from w1;
 
 -- query 42
 USE ${case_db};
-with w1 as (select column_0 as c1 from ( values (1), (2), (3) )t(column_0))
+with w1 as (select column_0 as c1 from ( values ROW(1), ROW(2), ROW(3) )t(column_0))
 select round(stddev_samp(c1), 3) from w1;
 
 -- query 43
 USE ${case_db};
-with w1 as (select column_0 as c1 from ( values (1), (2), (null), (3) )t(column_0))
+with w1 as (select column_0 as c1 from ( values ROW(1), ROW(2), ROW(null), ROW(3) )t(column_0))
 select round(stddev_samp(c1), 3) from w1;
 
 -- query 44
@@ -335,47 +333,47 @@ select round(stddev_samp(val1), 3) from t1;
 
 -- query 54
 USE ${case_db};
-with w1 as (select column_0 as c1, column_1 as c2 from ( values (1, 10), (2, 20), (3, 30) )t(column_0, column_1))
+with w1 as (select column_0 as c1, column_1 as c2 from ( values ROW(1, 10), ROW(2, 20), ROW(3, 30) )t(column_0, column_1))
 select round(covar_samp(c1, c2), 3) from w1 where c1 > 10;
 
 -- query 55
 USE ${case_db};
-with w1 as (select column_0 as c1, column_1 as c2 from ( values (1, 10) )t(column_0, column_1))
+with w1 as (select column_0 as c1, column_1 as c2 from ( values ROW(1, 10) )t(column_0, column_1))
 select round(covar_samp(c1, c2), 3) from w1;
 
 -- query 56
 USE ${case_db};
-with w1 as (select column_0 as c1, column_1 as c2 from ( values (1, 10), (null, null), (null, null) )t(column_0, column_1))
+with w1 as (select column_0 as c1, column_1 as c2 from ( values ROW(1, 10), ROW(null, null), ROW(null, null) )t(column_0, column_1))
 select round(covar_samp(c1, c2), 3) from w1;
 
 -- query 57
 USE ${case_db};
-with w1 as (select column_0 as c1, column_1 as c2 from ( values (1, 10), (null, 20), (null, null) )t(column_0, column_1))
+with w1 as (select column_0 as c1, column_1 as c2 from ( values ROW(1, 10), ROW(null, 20), ROW(null, null) )t(column_0, column_1))
 select round(covar_samp(c1, c2), 3) from w1;
 
 -- query 58
 USE ${case_db};
-with w1 as (select column_0 as c1, column_1 as c2 from ( values (1, 10), (null, 20), (3, null) )t(column_0, column_1))
+with w1 as (select column_0 as c1, column_1 as c2 from ( values ROW(1, 10), ROW(null, 20), ROW(3, null) )t(column_0, column_1))
 select round(covar_samp(c1, c2), 3) from w1;
 
 -- query 59
 USE ${case_db};
-with w1 as (select column_0 as c1, column_1 as c2 from ( values (null, null), (null, null) )t(column_0, column_1))
+with w1 as (select column_0 as c1, column_1 as c2 from ( values ROW(null, null), ROW(null, null) )t(column_0, column_1))
 select round(covar_samp(c1, c2), 3) from w1;
 
 -- query 60
 USE ${case_db};
-with w1 as (select column_0 as c1, column_1 as c2 from ( values (1, 10), (2, 20), (3, 30) )t(column_0, column_1))
+with w1 as (select column_0 as c1, column_1 as c2 from ( values ROW(1, 10), ROW(2, 20), ROW(3, 30) )t(column_0, column_1))
 select round(covar_samp(c1, c2), 3) from w1;
 
 -- query 61
 USE ${case_db};
-with w1 as (select column_0 as c1, column_1 as c2 from ( values (1, 10), (2, 20), (null, null), (3, 30) )t(column_0, column_1))
+with w1 as (select column_0 as c1, column_1 as c2 from ( values ROW(1, 10), ROW(2, 20), ROW(null, null), ROW(3, 30) )t(column_0, column_1))
 select round(covar_samp(c1, c2), 3) from w1;
 
 -- query 62
 USE ${case_db};
-with w1 as (select column_0 as c1, column_1 as c2 from ( values (1, 10), (2, 20), (4, null), (3, 30), (null, 50) )t(column_0, column_1))
+with w1 as (select column_0 as c1, column_1 as c2 from ( values ROW(1, 10), ROW(2, 20), ROW(4, null), ROW(3, 30), ROW(null, 50) )t(column_0, column_1))
 select round(covar_samp(c1, c2), 3) from w1;
 
 -- query 63
@@ -438,47 +436,47 @@ select round(covar_samp(val1, val2), 3) from t1;
 
 -- query 73
 USE ${case_db};
-with w1 as (select column_0 as c1, column_1 as c2 from ( values (1, 10), (2, 20), (3, 30) )t(column_0, column_1))
+with w1 as (select column_0 as c1, column_1 as c2 from ( values ROW(1, 10), ROW(2, 20), ROW(3, 30) )t(column_0, column_1))
 select round(corr(c1, c2), 3) from w1 where c1 > 10;
 
 -- query 74
 USE ${case_db};
-with w1 as (select column_0 as c1, column_1 as c2 from ( values (1, 10) )t(column_0, column_1))
+with w1 as (select column_0 as c1, column_1 as c2 from ( values ROW(1, 10) )t(column_0, column_1))
 select round(corr(c1, c2), 3) from w1;
 
 -- query 75
 USE ${case_db};
-with w1 as (select column_0 as c1, column_1 as c2 from ( values (1, 10), (null, null), (null, null) )t(column_0, column_1))
+with w1 as (select column_0 as c1, column_1 as c2 from ( values ROW(1, 10), ROW(null, null), ROW(null, null) )t(column_0, column_1))
 select round(corr(c1, c2), 3) from w1;
 
 -- query 76
 USE ${case_db};
-with w1 as (select column_0 as c1, column_1 as c2 from ( values (1, 10), (null, 20), (null, null) )t(column_0, column_1))
+with w1 as (select column_0 as c1, column_1 as c2 from ( values ROW(1, 10), ROW(null, 20), ROW(null, null) )t(column_0, column_1))
 select round(corr(c1, c2), 3) from w1;
 
 -- query 77
 USE ${case_db};
-with w1 as (select column_0 as c1, column_1 as c2 from ( values (1, 10), (null, 20), (3, null) )t(column_0, column_1))
+with w1 as (select column_0 as c1, column_1 as c2 from ( values ROW(1, 10), ROW(null, 20), ROW(3, null) )t(column_0, column_1))
 select round(corr(c1, c2), 3) from w1;
 
 -- query 78
 USE ${case_db};
-with w1 as (select column_0 as c1, column_1 as c2 from ( values (null, null), (null, null) )t(column_0, column_1))
+with w1 as (select column_0 as c1, column_1 as c2 from ( values ROW(null, null), ROW(null, null) )t(column_0, column_1))
 select round(corr(c1, c2), 3) from w1;
 
 -- query 79
 USE ${case_db};
-with w1 as (select column_0 as c1, column_1 as c2 from ( values (1, 10), (2, 20), (3, 30) )t(column_0, column_1))
+with w1 as (select column_0 as c1, column_1 as c2 from ( values ROW(1, 10), ROW(2, 20), ROW(3, 30) )t(column_0, column_1))
 select round(corr(c1, c2), 3) from w1;
 
 -- query 80
 USE ${case_db};
-with w1 as (select column_0 as c1, column_1 as c2 from ( values (1, 10), (2, 20), (null, null), (3, 30) )t(column_0, column_1))
+with w1 as (select column_0 as c1, column_1 as c2 from ( values ROW(1, 10), ROW(2, 20), ROW(null, null), ROW(3, 30) )t(column_0, column_1))
 select round(corr(c1, c2), 3) from w1;
 
 -- query 81
 USE ${case_db};
-with w1 as (select column_0 as c1, column_1 as c2 from ( values (1, 10), (2, 20), (4, null), (3, 30), (null, 50) )t(column_0, column_1))
+with w1 as (select column_0 as c1, column_1 as c2 from ( values ROW(1, 10), ROW(2, 20), ROW(4, null), ROW(3, 30), ROW(null, 50) )t(column_0, column_1))
 select round(corr(c1, c2), 3) from w1;
 
 -- query 82
@@ -541,32 +539,32 @@ select round(corr(val1, val2), 3) from t1;
 
 -- query 92
 USE ${case_db};
-with w1 as (select column_0 as c1 from ( values (1), (2), (3) )t(column_0))
+with w1 as (select column_0 as c1 from ( values ROW(1), ROW(2), ROW(3) )t(column_0))
 select round(var_samp(c1), 3) from w1 where c1 > 10;
 
 -- query 93
 USE ${case_db};
-with w1 as (select column_0 as c1 from ( values (1) )t(column_0))
+with w1 as (select column_0 as c1 from ( values ROW(1) )t(column_0))
 select round(var_samp(c1), 3) from w1;
 
 -- query 94
 USE ${case_db};
-with w1 as (select column_0 as c1 from ( values (1), (null), (null) )t(column_0))
+with w1 as (select column_0 as c1 from ( values ROW(1), ROW(null), ROW(null) )t(column_0))
 select round(var_samp(c1), 3) from w1;
 
 -- query 95
 USE ${case_db};
-with w1 as (select column_0 as c1 from ( values (null), (null) )t(column_0))
+with w1 as (select column_0 as c1 from ( values ROW(null), ROW(null) )t(column_0))
 select round(var_samp(c1), 3) from w1;
 
 -- query 96
 USE ${case_db};
-with w1 as (select column_0 as c1 from ( values (1), (2), (3) )t(column_0))
+with w1 as (select column_0 as c1 from ( values ROW(1), ROW(2), ROW(3) )t(column_0))
 select round(var_samp(c1), 3) from w1;
 
 -- query 97
 USE ${case_db};
-with w1 as (select column_0 as c1 from ( values (1), (2), (null), (3) )t(column_0))
+with w1 as (select column_0 as c1 from ( values ROW(1), ROW(2), ROW(null), ROW(3) )t(column_0))
 select round(var_samp(c1), 3) from w1;
 
 -- query 98
@@ -627,32 +625,32 @@ select round(var_samp(val1), 3) from t1;
 
 -- query 108
 USE ${case_db};
-with w1 as (select column_0 as c1 from ( values (1), (2), (3) )t(column_0))
+with w1 as (select column_0 as c1 from ( values ROW(1), ROW(2), ROW(3) )t(column_0))
 select round(variance_samp(c1), 3) from w1 where c1 > 10;
 
 -- query 109
 USE ${case_db};
-with w1 as (select column_0 as c1 from ( values (1) )t(column_0))
+with w1 as (select column_0 as c1 from ( values ROW(1) )t(column_0))
 select round(variance_samp(c1), 3) from w1;
 
 -- query 110
 USE ${case_db};
-with w1 as (select column_0 as c1 from ( values (1), (null), (null) )t(column_0))
+with w1 as (select column_0 as c1 from ( values ROW(1), ROW(null), ROW(null) )t(column_0))
 select round(variance_samp(c1), 3) from w1;
 
 -- query 111
 USE ${case_db};
-with w1 as (select column_0 as c1 from ( values (null), (null) )t(column_0))
+with w1 as (select column_0 as c1 from ( values ROW(null), ROW(null) )t(column_0))
 select round(variance_samp(c1), 3) from w1;
 
 -- query 112
 USE ${case_db};
-with w1 as (select column_0 as c1 from ( values (1), (2), (3) )t(column_0))
+with w1 as (select column_0 as c1 from ( values ROW(1), ROW(2), ROW(3) )t(column_0))
 select round(variance_samp(c1), 3) from w1;
 
 -- query 113
 USE ${case_db};
-with w1 as (select column_0 as c1 from ( values (1), (2), (null), (3) )t(column_0))
+with w1 as (select column_0 as c1 from ( values ROW(1), ROW(2), ROW(null), ROW(3) )t(column_0))
 select round(variance_samp(c1), 3) from w1;
 
 -- query 114
@@ -713,32 +711,32 @@ select round(variance_samp(val1), 3) from t1;
 
 -- query 124
 USE ${case_db};
-with w1 as (select column_0 as c1 from ( values (1), (2), (3) )t(column_0))
+with w1 as (select column_0 as c1 from ( values ROW(1), ROW(2), ROW(3) )t(column_0))
 select round(stddev_samp(c1), 3) from w1 where c1 > 10;
 
 -- query 125
 USE ${case_db};
-with w1 as (select column_0 as c1 from ( values (1) )t(column_0))
+with w1 as (select column_0 as c1 from ( values ROW(1) )t(column_0))
 select round(stddev_samp(c1), 3) from w1;
 
 -- query 126
 USE ${case_db};
-with w1 as (select column_0 as c1 from ( values (1), (null), (null) )t(column_0))
+with w1 as (select column_0 as c1 from ( values ROW(1), ROW(null), ROW(null) )t(column_0))
 select round(stddev_samp(c1), 3) from w1;
 
 -- query 127
 USE ${case_db};
-with w1 as (select column_0 as c1 from ( values (null), (null) )t(column_0))
+with w1 as (select column_0 as c1 from ( values ROW(null), ROW(null) )t(column_0))
 select round(stddev_samp(c1), 3) from w1;
 
 -- query 128
 USE ${case_db};
-with w1 as (select column_0 as c1 from ( values (1), (2), (3) )t(column_0))
+with w1 as (select column_0 as c1 from ( values ROW(1), ROW(2), ROW(3) )t(column_0))
 select round(stddev_samp(c1), 3) from w1;
 
 -- query 129
 USE ${case_db};
-with w1 as (select column_0 as c1 from ( values (1), (2), (null), (3) )t(column_0))
+with w1 as (select column_0 as c1 from ( values ROW(1), ROW(2), ROW(null), ROW(3) )t(column_0))
 select round(stddev_samp(c1), 3) from w1;
 
 -- query 130
@@ -799,47 +797,47 @@ select round(stddev_samp(val1), 3) from t1;
 
 -- query 140
 USE ${case_db};
-with w1 as (select column_0 as c1, column_1 as c2 from ( values (1, 10), (2, 20), (3, 30) )t(column_0, column_1))
+with w1 as (select column_0 as c1, column_1 as c2 from ( values ROW(1, 10), ROW(2, 20), ROW(3, 30) )t(column_0, column_1))
 select round(covar_samp(c1, c2), 3) from w1 where c1 > 10;
 
 -- query 141
 USE ${case_db};
-with w1 as (select column_0 as c1, column_1 as c2 from ( values (1, 10) )t(column_0, column_1))
+with w1 as (select column_0 as c1, column_1 as c2 from ( values ROW(1, 10) )t(column_0, column_1))
 select round(covar_samp(c1, c2), 3) from w1;
 
 -- query 142
 USE ${case_db};
-with w1 as (select column_0 as c1, column_1 as c2 from ( values (1, 10), (null, null), (null, null) )t(column_0, column_1))
+with w1 as (select column_0 as c1, column_1 as c2 from ( values ROW(1, 10), ROW(null, null), ROW(null, null) )t(column_0, column_1))
 select round(covar_samp(c1, c2), 3) from w1;
 
 -- query 143
 USE ${case_db};
-with w1 as (select column_0 as c1, column_1 as c2 from ( values (1, 10), (null, 20), (null, null) )t(column_0, column_1))
+with w1 as (select column_0 as c1, column_1 as c2 from ( values ROW(1, 10), ROW(null, 20), ROW(null, null) )t(column_0, column_1))
 select round(covar_samp(c1, c2), 3) from w1;
 
 -- query 144
 USE ${case_db};
-with w1 as (select column_0 as c1, column_1 as c2 from ( values (1, 10), (null, 20), (3, null) )t(column_0, column_1))
+with w1 as (select column_0 as c1, column_1 as c2 from ( values ROW(1, 10), ROW(null, 20), ROW(3, null) )t(column_0, column_1))
 select round(covar_samp(c1, c2), 3) from w1;
 
 -- query 145
 USE ${case_db};
-with w1 as (select column_0 as c1, column_1 as c2 from ( values (null, null), (null, null) )t(column_0, column_1))
+with w1 as (select column_0 as c1, column_1 as c2 from ( values ROW(null, null), ROW(null, null) )t(column_0, column_1))
 select round(covar_samp(c1, c2), 3) from w1;
 
 -- query 146
 USE ${case_db};
-with w1 as (select column_0 as c1, column_1 as c2 from ( values (1, 10), (2, 20), (3, 30) )t(column_0, column_1))
+with w1 as (select column_0 as c1, column_1 as c2 from ( values ROW(1, 10), ROW(2, 20), ROW(3, 30) )t(column_0, column_1))
 select round(covar_samp(c1, c2), 3) from w1;
 
 -- query 147
 USE ${case_db};
-with w1 as (select column_0 as c1, column_1 as c2 from ( values (1, 10), (2, 20), (null, null), (3, 30) )t(column_0, column_1))
+with w1 as (select column_0 as c1, column_1 as c2 from ( values ROW(1, 10), ROW(2, 20), ROW(null, null), ROW(3, 30) )t(column_0, column_1))
 select round(covar_samp(c1, c2), 3) from w1;
 
 -- query 148
 USE ${case_db};
-with w1 as (select column_0 as c1, column_1 as c2 from ( values (1, 10), (2, 20), (4, null), (3, 30), (null, 50) )t(column_0, column_1))
+with w1 as (select column_0 as c1, column_1 as c2 from ( values ROW(1, 10), ROW(2, 20), ROW(4, null), ROW(3, 30), ROW(null, 50) )t(column_0, column_1))
 select round(covar_samp(c1, c2), 3) from w1;
 
 -- query 149
@@ -902,47 +900,47 @@ select round(covar_samp(val1, val2), 3) from t1;
 
 -- query 159
 USE ${case_db};
-with w1 as (select column_0 as c1, column_1 as c2 from ( values (1, 10), (2, 20), (3, 30) )t(column_0, column_1))
+with w1 as (select column_0 as c1, column_1 as c2 from ( values ROW(1, 10), ROW(2, 20), ROW(3, 30) )t(column_0, column_1))
 select round(corr(c1, c2), 3) from w1 where c1 > 10;
 
 -- query 160
 USE ${case_db};
-with w1 as (select column_0 as c1, column_1 as c2 from ( values (1, 10) )t(column_0, column_1))
+with w1 as (select column_0 as c1, column_1 as c2 from ( values ROW(1, 10) )t(column_0, column_1))
 select round(corr(c1, c2), 3) from w1;
 
 -- query 161
 USE ${case_db};
-with w1 as (select column_0 as c1, column_1 as c2 from ( values (1, 10), (null, null), (null, null) )t(column_0, column_1))
+with w1 as (select column_0 as c1, column_1 as c2 from ( values ROW(1, 10), ROW(null, null), ROW(null, null) )t(column_0, column_1))
 select round(corr(c1, c2), 3) from w1;
 
 -- query 162
 USE ${case_db};
-with w1 as (select column_0 as c1, column_1 as c2 from ( values (1, 10), (null, 20), (null, null) )t(column_0, column_1))
+with w1 as (select column_0 as c1, column_1 as c2 from ( values ROW(1, 10), ROW(null, 20), ROW(null, null) )t(column_0, column_1))
 select round(corr(c1, c2), 3) from w1;
 
 -- query 163
 USE ${case_db};
-with w1 as (select column_0 as c1, column_1 as c2 from ( values (1, 10), (null, 20), (3, null) )t(column_0, column_1))
+with w1 as (select column_0 as c1, column_1 as c2 from ( values ROW(1, 10), ROW(null, 20), ROW(3, null) )t(column_0, column_1))
 select round(corr(c1, c2), 3) from w1;
 
 -- query 164
 USE ${case_db};
-with w1 as (select column_0 as c1, column_1 as c2 from ( values (null, null), (null, null) )t(column_0, column_1))
+with w1 as (select column_0 as c1, column_1 as c2 from ( values ROW(null, null), ROW(null, null) )t(column_0, column_1))
 select round(corr(c1, c2), 3) from w1;
 
 -- query 165
 USE ${case_db};
-with w1 as (select column_0 as c1, column_1 as c2 from ( values (1, 10), (2, 20), (3, 30) )t(column_0, column_1))
+with w1 as (select column_0 as c1, column_1 as c2 from ( values ROW(1, 10), ROW(2, 20), ROW(3, 30) )t(column_0, column_1))
 select round(corr(c1, c2), 3) from w1;
 
 -- query 166
 USE ${case_db};
-with w1 as (select column_0 as c1, column_1 as c2 from ( values (1, 10), (2, 20), (null, null), (3, 30) )t(column_0, column_1))
+with w1 as (select column_0 as c1, column_1 as c2 from ( values ROW(1, 10), ROW(2, 20), ROW(null, null), ROW(3, 30) )t(column_0, column_1))
 select round(corr(c1, c2), 3) from w1;
 
 -- query 167
 USE ${case_db};
-with w1 as (select column_0 as c1, column_1 as c2 from ( values (1, 10), (2, 20), (4, null), (3, 30), (null, 50) )t(column_0, column_1))
+with w1 as (select column_0 as c1, column_1 as c2 from ( values ROW(1, 10), ROW(2, 20), ROW(4, null), ROW(3, 30), ROW(null, 50) )t(column_0, column_1))
 select round(corr(c1, c2), 3) from w1;
 
 -- query 168

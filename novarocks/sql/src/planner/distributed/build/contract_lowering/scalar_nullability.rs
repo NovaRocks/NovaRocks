@@ -39,11 +39,22 @@ pub(super) fn current_constraint(
             }
             Ok(None)
         }
-        SqlResultConstraintOrigin::EmptyArrayLiteral => {
-            if !arguments.is_empty() {
-                return Err(invalid("empty-array result constraint acquired arguments"));
-            }
-            Ok(binding.result_constraint().cloned())
+        SqlResultConstraintOrigin::ArrayCommonCoercion => {
+            let [novarocks_functions::FunctionArgument::Value { value_type, .. }] = arguments
+            else {
+                return Err(invalid(
+                    "ARRAY common constraint lacks its original value source",
+                ));
+            };
+            let target = binding
+                .result_constraint()
+                .ok_or_else(|| invalid("ARRAY common constraint lost its authored target"))?;
+            work.flush()?;
+            let target = target
+                .with_nullable(target.nullable() || value_type.nullable())
+                .expect("validated root NULL contract");
+            work.step()?;
+            Ok(Some(target))
         }
         SqlResultConstraintOrigin::ValueDomainConversion { final_target } => {
             let [novarocks_functions::FunctionArgument::Value { value_type, .. }] = arguments
@@ -119,72 +130,80 @@ impl ScalarEmission<'_, '_> {
         if matches!(&old.kind, ContractExprKind::FunctionCall { .. }) && dependency_changed {
             return self.rebind_scalar_call_entry(id);
         }
-        let revised =
-            match &old.kind {
-                ContractExprKind::Unary {
-                    op: UnaryOperator::Minus,
-                    expr,
-                } => novarocks_functions::native_negate_computed_result_type(
-                    &self.nullability_definition(*expr)?.ty,
-                    self.control,
-                )
-                .map_err(|error| {
-                    if let Some(cause) = error.control_error() {
-                        ContractLoweringError::Control(cause)
-                    } else {
-                        ContractLoweringError::InvalidFunctionBinding {
-                            detail: format!("native negate preparation: {error:?}"),
-                        }
+        let revised = match &old.kind {
+            ContractExprKind::Unary {
+                op: UnaryOperator::Minus,
+                expr,
+            } => novarocks_functions::native_negate_computed_result_type(
+                &self.nullability_definition(*expr)?.ty,
+                self.control,
+            )
+            .map_err(|error| {
+                if let Some(cause) = error.control_error() {
+                    ContractLoweringError::Control(cause)
+                } else {
+                    ContractLoweringError::InvalidFunctionBinding {
+                        detail: format!("native negate preparation: {error:?}"),
                     }
-                })?,
-                ContractExprKind::Cast {
-                    expr,
-                    target,
-                    allow_throw_exception,
-                    decimal_overflow_policy,
-                } => {
-                    // The same statement owner authored this occurrence's reference.
-                    // Read its frozen boolean, never an ambient setting or default.
-                    if *allow_throw_exception != self.root_allow_throw_reference() {
-                        return Err(invalid(
-                            "cast seed differs from its statement semantic source",
-                        ));
+                }
+            })?,
+            ContractExprKind::Cast {
+                array_failure_mode,
+                expr,
+                target,
+                allow_throw_exception,
+                decimal_overflow_policy,
+            } => {
+                // The same statement owner authored this occurrence's reference.
+                // Read its frozen boolean, never an ambient setting or default.
+                if *allow_throw_exception != self.root_allow_throw_reference() {
+                    return Err(invalid(
+                        "cast seed differs from its statement semantic source",
+                    ));
+                }
+                let input = &self.nullability_definition(*expr)?.ty;
+                let conversion_can_produce_null = match array_failure_mode {
+                    Some(mode) => {
+                        *mode == novarocks_type_contract::ArrayCastFailureMode::OutputNull
                     }
-                    let input = &self.nullability_definition(*expr)?.ty;
-                    let mut revised = old.ty.clone();
-                    revised = revised.with_nullable(revised.nullable() || (input.nullable()
-                    || novarocks_functions::carrier_cast_can_produce_null_with_policy(
+                    None => novarocks_functions::carrier_cast_can_produce_null_with_policy(
                         input.data_type(),
                         target,
                         *decimal_overflow_policy,
                         self.root_allow_throw_exception,
-                    ))).expect("validated root NULL contract");
-                    revised
+                    ),
+                };
+                old.ty
+                    .clone()
+                    .with_nullable(
+                        old.ty.nullable() || input.nullable() || conversion_can_produce_null,
+                    )
+                    .expect("validated root NULL contract")
+            }
+            ContractExprKind::Value(value) if dependency_changed => published_value_type(
+                &old.ty,
+                self.storage
+                    .current_value_type(*value)
+                    .ok_or_else(|| invalid("nullable transaction value is absent"))?,
+            ),
+            ContractExprKind::Lambda { body, .. } if dependency_changed => {
+                published_value_type(&old.ty, &self.nullability_definition(*body)?.ty)
+            }
+            _ if dependency_changed && kind_follows_operand_nullability(&old.kind) => {
+                let mut revised = old.ty.clone();
+                for operand in operands {
+                    self.work.step()?;
+                    revised = revised
+                        .with_nullable(
+                            revised.nullable()
+                                || (self.nullability_definition(operand)?.ty.nullable()),
+                        )
+                        .expect("validated root NULL contract");
                 }
-                ContractExprKind::Value(value) if dependency_changed => published_value_type(
-                    &old.ty,
-                    self.storage
-                        .current_value_type(*value)
-                        .ok_or_else(|| invalid("nullable transaction value is absent"))?,
-                ),
-                ContractExprKind::Lambda { body, .. } if dependency_changed => {
-                    published_value_type(&old.ty, &self.nullability_definition(*body)?.ty)
-                }
-                _ if dependency_changed && kind_follows_operand_nullability(&old.kind) => {
-                    let mut revised = old.ty.clone();
-                    for operand in operands {
-                        self.work.step()?;
-                        revised = revised
-                            .with_nullable(
-                                revised.nullable()
-                                    || (self.nullability_definition(operand)?.ty.nullable()),
-                            )
-                            .expect("validated root NULL contract");
-                    }
-                    revised
-                }
-                _ => old.ty.clone(),
-            };
+                revised
+            }
+            _ => old.ty.clone(),
+        };
         if revised.nullable() != old.ty.nullable() {
             self.storage
                 .type_editor()?

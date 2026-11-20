@@ -39,9 +39,8 @@ use crate::connector::data_mutation::{
 use crate::query_execution::kernels::DmlExecutionKernel;
 use novarocks_proto_codec::lifecycle::QueryOptions;
 use novarocks_query_application::admitted_query_context::QueryExecutionContext;
-use novarocks_sql::semantic::ObjectName;
 
-/// Lowered, parser-owned `ALTER TABLE ... ADD FILES FROM ...` syntax.
+/// Lowered table and source location from TABLE EXECUTE argument binding.
 ///
 /// Table resolution remains a frontend concern; this command deliberately
 /// carries no parser-private AST or raw SQL source.
@@ -51,38 +50,18 @@ pub struct AddFilesCommand {
     pub location: String,
 }
 
-/// Lowers the typed Iceberg command into the ADD FILES mutation input.
-pub fn command_from_typed_statement(
-    statement: &novarocks_parser::ast::AlterIcebergTable,
-) -> Result<AddFilesCommand, String> {
-    let novarocks_parser::ast::IcebergTableAction::AddFiles(add_files) = &statement.action else {
-        return Err("typed Iceberg statement is not ADD FILES".to_string());
-    };
-    let table_parts = statement
-        .table
-        .parts
-        .iter()
-        .map(|part| part.value.clone())
-        .collect::<Vec<_>>();
-    if !(1..=3).contains(&table_parts.len()) {
-        return Err("ADD FILES table name must have one to three parts".to_string());
-    }
-    let novarocks_parser::ast::LiteralKind::String(location) = &add_files.location.kind else {
-        return Err("ADD FILES requires a quoted non-empty location".to_string());
-    };
-    if location.is_empty() {
-        return Err("ADD FILES requires a quoted non-empty location".to_string());
-    }
-    Ok(AddFilesCommand {
-        table_parts,
-        location: location.clone(),
-    })
+pub(crate) struct ResolvedAddFiles {
+    pub(crate) target: crate::catalog_application::resolver::TargetBackend,
+    pub(crate) planning: novarocks_spi::connector::ConnectorControlPlanningPin,
+    pub(crate) location: String,
 }
 
 pub struct PlanAddFilesRequest {
     pub command: AddFilesCommand,
-    pub current_catalog: Option<String>,
-    pub current_database: String,
+    pub(crate) retained: Option<(
+        crate::catalog_application::resolver::TargetBackend,
+        novarocks_spi::connector::ConnectorControlPlanningPin,
+    )>,
     pub mutation_operation_id: [u8; 16],
     pub query_options: Option<QueryOptions>,
     /// This is the immutable execution context admitted by the frontend. The
@@ -265,21 +244,11 @@ impl AddFilesEngine for DmlExecutionKernel {
         &self,
         request: PlanAddFilesRequest,
     ) -> Result<PreparedAddFiles, AddFilesPlanError> {
-        let target = crate::catalog_application::resolver::resolve_existing_table_target(
-            self,
-            &ObjectName {
-                parts: request.command.table_parts,
-            },
-            request.current_catalog.as_deref(),
-            &request.current_database,
-        )
-        .map_err(|error| match error {
-            crate::catalog_application::resolver::TargetResolutionError::Message(message) => {
-                plan_string_failure(message)
-            }
-            crate::catalog_application::resolver::TargetResolutionError::Unsupported(error) => {
-                plan_connector_failure(error)
-            }
+        let (target, planning) = request.retained.ok_or_else(|| {
+            plan_connector_failure(ConnectorError::new(
+                ConnectorErrorKind::Internal,
+                "ADD FILES has no retained table procedure binding",
+            ))
         })?;
         if target.provider_id.as_str() != "iceberg" {
             return Err(plan_string_failure(format!(
@@ -287,32 +256,47 @@ impl AddFilesEngine for DmlExecutionKernel {
                 target.namespace, target.table
             )));
         }
-        crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_ports(
-            self.connector_control().as_ref(),
-            self.mv_storage_observation().as_ref(),
-            self.mv_readiness().as_ref(),
-            &target,
-            crate::mv::domain::iceberg_guard::IcebergMvUserMutation::Insert,
-        )
-        .map_err(plan_string_failure)?;
+        let descriptor = planning.binding().descriptor();
+        if descriptor.instance_id.as_str() != target.catalog
+            || descriptor.provider_id != target.provider_id
+        {
+            return Err(plan_connector_failure(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "ADD FILES target differs from its retained binding",
+            )));
+        }
         let connector_context = self
             .connector_request_context_for_execution(
                 request.query_options.as_ref(),
                 &request.execution,
             )
             .map_err(plan_string_failure)?;
-        let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
-            .map_err(|error| plan_connector_failure(error.into()))?;
-        let session = DataMutationSession::plan(
-            self.connector_control().as_ref(),
-            &instance_id,
-            ConnectorMutationOperationId::from_bytes(request.mutation_operation_id),
-            novarocks_spi::connector::ConnectorTableIdentity {
-                instance_id: instance_id.clone(),
-                namespace: target.namespace.clone().into(),
-                table: target.table.clone().into(),
-            },
-            DataMutationIntent::register_existing_files(request.command.location.clone()),
+        crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_planning_pin_and_context(
+            self.mv_storage_observation().as_ref(),
+            &planning,
+            self.mv_readiness().as_ref(),
+            &target,
+            crate::mv::domain::iceberg_guard::IcebergMvUserMutation::Insert,
+            connector_context.clone(),
+        )
+        .map_err(plan_string_failure)?;
+        let instance_id = descriptor.instance_id.clone();
+        let table = novarocks_spi::connector::ConnectorTableIdentity {
+            instance_id: instance_id.clone(),
+            namespace: target.namespace.clone().into(),
+            table: target.table.clone().into(),
+        };
+        let operation = ConnectorMutationOperationId::from_bytes(request.mutation_operation_id);
+        let intent = DataMutationIntent::register_existing_files(request.command.location.clone());
+        let lease = self
+            .connector_control()
+            .acquire_exact_data_mutation(planning.control_runtime_id())
+            .map_err(plan_connector_failure)?;
+        let session = DataMutationSession::plan_on_session(
+            lease,
+            operation,
+            table,
+            intent,
             connector_context,
         )
         .map_err(project_plan_error)?;
@@ -658,44 +642,6 @@ mod tests {
     fn reverse_port_is_object_safe() {
         fn accepts_object_safe_port(_: &dyn AddFilesEngine) {}
         let _ = accepts_object_safe_port;
-    }
-
-    #[test]
-    fn typed_add_files_lowering_preserves_only_lifecycle_inputs() {
-        let statement = novarocks_parser::parse(
-            "ALTER TABLE ice.db.orders ADD FILES FROM 's3://bucket/source'",
-        )
-        .expect("parse")
-        .pop()
-        .expect("statement");
-        let novarocks_parser::ast::Statement::Iceberg(
-            novarocks_parser::ast::IcebergStatement::AlterTable(statement),
-        ) = statement
-        else {
-            panic!("typed Iceberg ADD FILES");
-        };
-        assert_eq!(
-            command_from_typed_statement(&statement).expect("lower"),
-            AddFilesCommand {
-                table_parts: vec!["ice".to_string(), "db".to_string(), "orders".to_string()],
-                location: "s3://bucket/source".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn typed_add_files_lowering_rejects_empty_source() {
-        let statement = novarocks_parser::parse("ALTER TABLE t ADD FILES FROM ''")
-            .expect("parse")
-            .pop()
-            .expect("statement");
-        let novarocks_parser::ast::Statement::Iceberg(
-            novarocks_parser::ast::IcebergStatement::AlterTable(statement),
-        ) = statement
-        else {
-            panic!("typed Iceberg ADD FILES");
-        };
-        assert!(command_from_typed_statement(&statement).is_err());
     }
 
     #[test]

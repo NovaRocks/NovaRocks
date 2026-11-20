@@ -29,25 +29,23 @@ DROP TABLE IF EXISTS ${case_db}.t_rf_inner_join_build_predicate_r;
 CREATE TABLE ${case_db}.t_rf_inner_join_build_predicate_l (
     id INT,
     k INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 CREATE TABLE ${case_db}.t_rf_inner_join_build_predicate_r (
     k INT,
     score INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t_rf_inner_join_build_predicate_l VALUES
-    (1, 1),
-    (2, 2),
-    (3, 3),
-    (4, 4);
+    ROW(1, 1),
+    ROW(2, 2),
+    ROW(3, 3),
+    ROW(4, 4);
 
 INSERT INTO ${case_db}.t_rf_inner_join_build_predicate_r VALUES
-    (1, 10),
-    (2, 20),
-    (3, 30),
-    (4, 40);
+    ROW(1, 10),
+    ROW(2, 20),
+    ROW(3, 30),
+    ROW(4, 40);
 
 SELECT l.id, l.k, r.score
 FROM ${case_db}.t_rf_inner_join_build_predicate_l l

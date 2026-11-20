@@ -347,6 +347,7 @@ fn recipe(
         &FunctionValueType::new(DataType::Date32, result_nullable),
         policy,
         allow,
+        None,
         &Control,
     )
     .unwrap()

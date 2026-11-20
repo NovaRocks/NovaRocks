@@ -17,21 +17,11 @@
 
 //! Iceberg materialized-view metadata statement dispatch.
 
-use crate::mv::domain::application::{MvAlterAction, MvCreateRefreshPolicy};
+use novarocks_mv_application::engine_properties::MvRefreshPropertyChanges;
 use novarocks_mv_application::persistence::codec::{ConfigurationDocument, RefreshPolicy};
 use novarocks_mv_application::persistence::definition::MvDesiredRefreshPolicy;
 use novarocks_parser::ast::Visit;
 use novarocks_types::naming::normalize_identifier;
-
-fn stored_refresh_policy(policy: &MvCreateRefreshPolicy) -> (MvDesiredRefreshPolicy, Option<i64>) {
-    match policy {
-        MvCreateRefreshPolicy::Manual => (MvDesiredRefreshPolicy::Manual, None),
-        MvCreateRefreshPolicy::AsyncOnChange => (MvDesiredRefreshPolicy::AsyncOnChange, None),
-        MvCreateRefreshPolicy::AsyncInterval { interval_ms } => {
-            (MvDesiredRefreshPolicy::AsyncInterval, Some(*interval_ms))
-        }
-    }
-}
 
 fn desired_refresh_configuration(
     configuration: &ConfigurationDocument,
@@ -57,42 +47,17 @@ fn desired_refresh_configuration(
     )
 }
 
-#[allow(
-    dead_code,
-    reason = "Retained for staged materialized-view integration and recovery wiring."
-)]
-pub(crate) fn initial_refresh_configuration_for_create(
-    policy: &MvCreateRefreshPolicy,
-) -> novarocks_mv_application::repository::InitialMvRefreshConfiguration {
-    let (policy, interval_ms) = stored_refresh_policy(policy);
-    novarocks_mv_application::repository::InitialMvRefreshConfiguration {
-        policy,
-        paused: false,
-        interval_ms,
-        max_staleness_ms: None,
-    }
-}
-
 /// The pure configuration transition used by original control preparation.
 pub(crate) fn configuration_after_alter(
     configuration: &ConfigurationDocument,
-    action: &MvAlterAction,
+    changes: &MvRefreshPropertyChanges,
 ) -> Result<novarocks_mv_application::persistence::semantic::MvRefreshDesiredConfiguration, String>
 {
     let current = desired_refresh_configuration(configuration)
         .map_err(|error| format!("stored Iceberg MV refresh configuration is invalid: {error}"))?;
-    match action {
-        MvAlterAction::SetRefresh(policy) => {
-            let (policy, interval_ms) = stored_refresh_policy(policy);
-            current.with_policy(policy, interval_ms)
-        }
-        MvAlterAction::PauseRefresh => current.with_paused(true),
-        MvAlterAction::ResumeRefresh => current.with_paused(false),
-        MvAlterAction::Repartition(_) | MvAlterAction::SetProperties(_) => {
-            unreachable!("repartition and properties returned before metadata update")
-        }
-    }
-    .map_err(|error| format!("invalid Iceberg MV refresh transition: {error}"))
+    changes
+        .apply(current)
+        .map_err(|error| format!("invalid Iceberg MV refresh transition: {error}"))
 }
 
 /// Analyze the output column types of a MV SELECT SQL without executing it.
@@ -162,17 +127,20 @@ fn query_three_part_table_refs(
     struct Collector(Vec<(String, String, String)>);
 
     impl novarocks_parser::ast::Visit for Collector {
-        fn visit_table_factor(&mut self, factor: &novarocks_parser::ast::TableFactor) {
-            if let novarocks_parser::ast::TableFactor::Table { name, .. } = factor
-                && let [catalog, namespace, table] = name.parts.as_slice()
-            {
-                self.0.push((
-                    catalog.value.clone(),
-                    namespace.value.clone(),
-                    table.value.clone(),
-                ));
+        fn visit_relation(&mut self, factor: &novarocks_parser::ast::Relation) {
+            if let novarocks_parser::ast::Relation::Table(table_node) = factor {
+                let parts = novarocks_sql::TableNameView::new(&table_node.name)
+                    .parts()
+                    .collect::<Vec<_>>();
+                if let [catalog, namespace, table] = parts.as_slice() {
+                    self.0.push((
+                        catalog.to_string(),
+                        namespace.to_string(),
+                        table.to_string(),
+                    ));
+                }
             }
-            novarocks_parser::ast::walk_table_factor(self, factor);
+            novarocks_parser::ast::walk_relation(self, factor);
         }
     }
 
@@ -274,11 +242,7 @@ mod tests {
     }
 
     fn parse_query(sql: &str) -> novarocks_parser::ast::Query {
-        let statements = novarocks_parser::parse(sql).expect("parse query");
-        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
-            panic!("expected query");
-        };
-        query.clone()
+        novarocks_parser::parser::parse_query(sql).expect("parse query")
     }
 
     fn base_ref() -> novarocks_types::naming::TableIdentity {

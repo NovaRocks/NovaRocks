@@ -95,6 +95,20 @@ impl StaticPlanInterpreter {
 /// descriptor and plan contract revision 27. Those exact-island inputs already
 /// distinguish the interpretation; the execution-only epoch remains 15.
 ///
+/// Plan revision 26 admits explicit physical NULL-list lifting to declared
+/// nullable JSON and UTF8 list elements. Earlier peers lack these prepared
+/// casts; the exact plan revision separates them without changing epoch 15.
+/// Plan revision 27 additionally freezes the optional explicit-array CAST
+/// failure mode in the package descriptor. Absent modes retain the existing
+/// interpretation, so this change does not require an execution-only epoch.
+/// Revision 28 adds strict signed/decimal and raw-text JSON array conversion
+/// recipes and their precise successful-NULL obligations. A revision-27 peer
+/// cannot prepare these new shapes; absence keeps the original interpretation.
+/// Revision 29 adds ARRAY common-type coercion profiles and binds their real
+/// ordered conversion overload. The original scalar policy remains separate.
+/// Revision 30 adds explicit signed-to-text and Trino text-to-date array
+/// profiles; full Date32 presentation shares the original calendar author.
+///
 /// RWM-7 retires COW vocabulary and freezes explicit writer W/T declarations,
 /// projected writer values and selected-assignment construction in the package
 /// descriptor and current plan revision 27. Iceberg revision 10 also freezes the private

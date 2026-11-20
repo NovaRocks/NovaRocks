@@ -31,15 +31,13 @@ use crate::mv::domain::analysis::refresh_property::{
 };
 use crate::mv::domain::analysis::{
     MvAnalysis, canonicalize_iceberg_mv_select_query, output_column_to_table_column,
-    validate_mv_partition_columns,
 };
 use crate::mv::domain::analysis_adapter::{
     BaseColumnDescriptor, BaseTableDescriptor, validate_ivm_primary_key,
 };
 use crate::mv::domain::application::MvCreateProjectionSeed;
 use crate::mv::domain::application::{
-    MvApplicationError, MvApplicationErrorKind, MvCreateRefreshPolicy, MvCreateStatement,
-    MvRefreshRequest,
+    MvApplicationError, MvApplicationErrorKind, MvCreateStatement, MvRefreshRequest,
 };
 use crate::mv::domain::lifecycle::RefreshPlan;
 use crate::mv::domain::model::{MvStorageEngine, RefreshMode};
@@ -99,7 +97,7 @@ use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_spi::connector::{
     CONNECTOR_MV_APPLY_KEY_COLUMN_PROPERTY as APPLY_KEY_COLUMN_PROPERTY,
     CONNECTOR_MV_HIDDEN_COLUMNS_PROPERTY as HIDDEN_COLUMNS_PROPERTY, ConnectorControlRegistry,
-    ConnectorInstanceId, ConnectorTableObjectId,
+    ConnectorInstanceId, ConnectorProviderBindingKey, ConnectorTableObjectId, DdlPropertyValue,
 };
 #[cfg(test)]
 use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
@@ -115,8 +113,8 @@ use novarocks_sql::planning::mv::{
     SqlMvAggregateLayoutScope, SqlMvApplyKeySourceFacts, extract_join_aliases,
     mv_apply_key_source_from_column_name,
 };
-use novarocks_sql::semantic::{IcebergPartitionFieldExpr, TableColumnDef};
-use novarocks_types::naming::{TableIdentity, normalize_identifier};
+use novarocks_sql::semantic::TableColumnDef;
+use novarocks_types::naming::TableIdentity;
 
 /// SQL-owned bridge for refresh planning.  It owns only analysis and immutable
 /// facts; all durable intent, ref mutations, and writer execution are handed
@@ -236,6 +234,12 @@ impl crate::catalog_application::query_catalog::CatalogServiceSource for Iceberg
     }
 }
 
+pub(crate) struct MvStagedStorage {
+    pub(crate) binding: ConnectorProviderBindingKey,
+    pub(crate) visible_partition_sources: Vec<Arc<str>>,
+    pub(crate) properties: Arc<[(Arc<str>, DdlPropertyValue)]>,
+}
+
 pub(crate) struct IcebergMvCreatePlan {
     pub(crate) target: IcebergMvTarget,
     pub(crate) refresh_contract: ImvRefreshContract,
@@ -259,8 +263,8 @@ pub(crate) struct IcebergMvCreatePlan {
     pub(crate) aggregate_runtime_layout:
         novarocks_types::mv_aggregate_layout::MvAggregateRuntimeLayout,
     pub(crate) columns: Vec<TableColumnDef>,
-    pub(crate) partition_fields: Vec<IcebergPartitionFieldExpr>,
-    pub(crate) target_properties: Vec<(String, String)>,
+    pub(crate) storage: MvStagedStorage,
+    pub(crate) application_properties: Vec<(String, String)>,
 }
 impl IcebergMvCreatePlan {
     pub(crate) fn staged_write_fields(
@@ -282,7 +286,7 @@ impl IcebergMvCreatePlan {
                 query_definition:
                     novarocks_query_application::persisted_query_definition::PersistedQueryDefinition::new(
                         statement.select_sql.clone(),
-                        novarocks_query_application::persisted_query_definition::PersistedQueryDialect::StarRocks,
+                        novarocks_query_application::persisted_query_definition::PersistedQueryDialect::Trino,
                         current_catalog.unwrap_or("default_catalog"),
                         current_database,
                     )
@@ -295,31 +299,9 @@ impl IcebergMvCreatePlan {
                 target_table: Some(self.target.table.clone()),
                 created_at_ms: self.created_at_ms,
             },
-            refresh: initial_refresh_configuration_for_create(&statement.refresh_policy),
+            refresh: statement.refresh.clone(),
             dependencies: self.dependencies.clone(),
         })
-    }
-}
-
-fn initial_refresh_configuration_for_create(
-    policy: &crate::mv::domain::application::MvCreateRefreshPolicy,
-) -> novarocks_mv_application::repository::InitialMvRefreshConfiguration {
-    let (policy, interval_ms) = match policy {
-        crate::mv::domain::application::MvCreateRefreshPolicy::Manual => {
-            (MvDesiredRefreshPolicy::Manual, None)
-        }
-        crate::mv::domain::application::MvCreateRefreshPolicy::AsyncOnChange => {
-            (MvDesiredRefreshPolicy::AsyncOnChange, None)
-        }
-        crate::mv::domain::application::MvCreateRefreshPolicy::AsyncInterval { interval_ms } => {
-            (MvDesiredRefreshPolicy::AsyncInterval, Some(*interval_ms))
-        }
-    };
-    novarocks_mv_application::repository::InitialMvRefreshConfiguration {
-        policy,
-        paused: false,
-        interval_ms,
-        max_staleness_ms: None,
     }
 }
 
@@ -331,134 +313,23 @@ fn now_ms() -> i64 {
         .min(i64::MAX as u128) as i64
 }
 
-fn partition_fields_for_create(
-    fields: Option<&Vec<crate::mv::domain::application::MvCreatePartitionField>>,
-) -> Vec<IcebergPartitionFieldExpr> {
-    fields
-        .into_iter()
-        .flatten()
-        .map(|field| match field {
-            crate::mv::domain::application::MvCreatePartitionField::Identity { column } => {
-                IcebergPartitionFieldExpr::Identity {
-                    column: column.clone(),
-                }
-            }
-            crate::mv::domain::application::MvCreatePartitionField::Year { column } => {
-                IcebergPartitionFieldExpr::Year {
-                    column: column.clone(),
-                }
-            }
-            crate::mv::domain::application::MvCreatePartitionField::Month { column } => {
-                IcebergPartitionFieldExpr::Month {
-                    column: column.clone(),
-                }
-            }
-            crate::mv::domain::application::MvCreatePartitionField::Day { column } => {
-                IcebergPartitionFieldExpr::Day {
-                    column: column.clone(),
-                }
-            }
-            crate::mv::domain::application::MvCreatePartitionField::Hour { column } => {
-                IcebergPartitionFieldExpr::Hour {
-                    column: column.clone(),
-                }
-            }
-            crate::mv::domain::application::MvCreatePartitionField::Bucket {
-                column,
-                num_buckets,
-            } => IcebergPartitionFieldExpr::Bucket {
-                column: column.clone(),
-                num_buckets: *num_buckets,
-            },
-            crate::mv::domain::application::MvCreatePartitionField::Truncate { column, width } => {
-                IcebergPartitionFieldExpr::Truncate {
-                    column: column.clone(),
-                    width: *width,
-                }
-            }
-            crate::mv::domain::application::MvCreatePartitionField::Void { column } => {
-                IcebergPartitionFieldExpr::Void {
-                    column: column.clone(),
-                }
-            }
-        })
-        .collect()
-}
-
 pub(crate) struct MvCreateShape {
     pub(crate) target: IcebergMvTarget,
     pub(crate) canonical_select_query: ast::Query,
     pub(crate) analysis: MvAnalysis,
     pub(crate) refresh_contract: ImvRefreshContract,
-    pub(crate) partition_fields: Vec<IcebergPartitionFieldExpr>,
     pub(crate) created_at_ms: i64,
     pub(crate) resolved_dependencies:
         crate::mv::domain::dependency_resolver::ResolvedCreateMvDependencies,
 }
 
-pub(crate) fn prepare_mv_create_target(
-    current_catalog: Option<&str>,
-    current_database: &str,
-    stmt: &MvCreateStatement,
-) -> Result<IcebergMvTarget, novarocks_sql::compiler::SqlCompileError> {
-    let storage_engine = stmt
-        .properties
-        .iter()
-        .find(|(key, _)| key.eq_ignore_ascii_case("storage_engine"))
-        .map(|(_, value)| value.trim().to_ascii_lowercase())
-        .unwrap_or_else(|| "iceberg".to_string());
-    match storage_engine.as_str() {
-        "iceberg" => {}
-        "starrocks" => return Err(("storage_engine='starrocks' is no longer supported for standalone materialized views; use storage_engine='iceberg'".to_string()).into()),
-        _ => return Err((format!("unknown materialized view storage_engine `{storage_engine}`")).into()),
-    }
-    let current_catalog = current_catalog.ok_or_else(|| {
-        "storage_engine='iceberg' requires current catalog to be an Iceberg catalog".to_string()
-    })?;
-    let (namespace, table) = match stmt.name_parts.as_slice() {
-        [table] => (
-            normalize_identifier(current_database)?,
-            normalize_identifier(table)?,
-        ),
-        [namespace, table] => (
-            normalize_identifier(namespace)?,
-            normalize_identifier(table)?,
-        ),
-        [catalog, namespace, table] if normalize_identifier(catalog)? == "default_catalog" => (
-            normalize_identifier(namespace)?,
-            normalize_identifier(table)?,
-        ),
-        [catalog, ..] => {
-            return Err((format!(
-                "materialized view name catalog must be `default_catalog`, got {}",
-                normalize_identifier(catalog)?
-            ))
-            .into());
-        }
-        _ => {
-            return Err(
-                ("materialized view name must have one, two, or three parts".to_string()).into(),
-            );
-        }
-    };
-    let target = IcebergMvTarget {
-        catalog: normalize_identifier(current_catalog)?,
-        namespace,
-        table,
-    };
-    Ok(target)
-}
-
 pub(crate) fn prepare_mv_create_shape(
     target: IcebergMvTarget,
-    stmt: &MvCreateStatement,
     canonical_select_query: ast::Query,
     analysis: MvAnalysis,
     completion_control: &novarocks_sql::compiler::SqlCompileControl,
 ) -> Result<MvCreateShape, novarocks_sql::compiler::SqlCompileError> {
     let refresh_contract = derive_imv_refresh_contract(&analysis, completion_control)?;
-    let partition_fields = partition_fields_for_create(stmt.partition_by.as_ref());
-    validate_mv_partition_columns(Some(&partition_fields), &analysis.output_columns)?;
     let created_at_ms = now_ms();
     let resolved_dependencies =
         crate::mv::domain::dependency_resolver::resolve_create_mv_dependencies(
@@ -470,7 +341,6 @@ pub(crate) fn prepare_mv_create_shape(
         canonical_select_query,
         analysis,
         refresh_contract,
-        partition_fields,
         created_at_ms,
         resolved_dependencies,
     })
@@ -508,7 +378,6 @@ pub(crate) fn finish_mv_create_preparation(
         canonical_select_query,
         analysis,
         refresh_contract,
-        partition_fields,
         created_at_ms,
         resolved_dependencies,
     } = shape;
@@ -537,7 +406,11 @@ pub(crate) fn finish_mv_create_preparation(
             TargetIdentity::GroupRowId(_) => return Err(("iceberg-backed aggregate materialized views do not support PRIMARY KEY".to_string()).into()),
         }
     }
-    if !partition_fields.is_empty() && property.is_composed_aggregate_schema_contract_fallback() {
+    let has_partitioning = stmt.storage.properties.iter().any(|(name, value)| {
+        name.as_ref() == "partitioning"
+            && matches!(value, DdlPropertyValue::ArrayVarchar(fields) if !fields.is_empty())
+    });
+    if has_partitioning && property.is_composed_aggregate_schema_contract_fallback() {
         return Err(
             ("partitioned composed aggregate Iceberg MV is not supported".to_string()).into(),
         );
@@ -598,8 +471,7 @@ pub(crate) fn finish_mv_create_preparation(
                 )
                 .expect("empty aggregate layout is a valid stateless CREATE carrier")
             });
-    let mut target_properties = vec![
-        ("format-version".to_string(), "3".to_string()),
+    let mut application_properties = vec![
         (
             APPLY_KEY_COLUMN_PROPERTY.to_string(),
             apply_key_column_name.to_string(),
@@ -614,11 +486,20 @@ pub(crate) fn finish_mv_create_preparation(
         ),
     ];
     if !aggregate_state_hidden_columns.is_empty() {
-        target_properties.push((
+        application_properties.push((
             HIDDEN_COLUMNS_PROPERTY.to_string(),
             aggregate_state_hidden_columns.join(","),
         ));
     }
+    let storage = MvStagedStorage {
+        binding: stmt.storage.binding.clone(),
+        visible_partition_sources: analysis
+            .output_columns
+            .iter()
+            .map(|column| Arc::from(column.name.as_str()))
+            .collect(),
+        properties: stmt.storage.properties.clone(),
+    };
     Ok(Arc::new(IcebergMvCreatePlan {
         target,
         refresh_contract,
@@ -631,8 +512,8 @@ pub(crate) fn finish_mv_create_preparation(
         binding_document,
         columns,
         aggregate_runtime_layout,
-        partition_fields,
-        target_properties,
+        storage,
+        application_properties,
         created_at_ms,
     }))
 }
@@ -984,37 +865,6 @@ fn create_apply_key_source_property(apply_key: &ApplyKeyContract) -> &'static st
         .table_property_value()
 }
 
-#[allow(
-    dead_code,
-    reason = "Retained for staged materialized-view integration and recovery wiring."
-)]
-fn refresh_policy_descriptor_json(
-    policy: &MvCreateRefreshPolicy,
-    paused: bool,
-) -> serde_json::Value {
-    match policy {
-        MvCreateRefreshPolicy::Manual => serde_json::json!({
-            "policy": "DEFERRED_MANUAL",
-            "interval_ms": null,
-            "paused": paused,
-        }),
-        MvCreateRefreshPolicy::AsyncOnChange => {
-            serde_json::json!({
-                "policy": "ASYNC_ON_CHANGE",
-                "interval_ms": null,
-                "paused": paused,
-            })
-        }
-        MvCreateRefreshPolicy::AsyncInterval { interval_ms } => {
-            serde_json::json!({
-                "policy": "ASYNC_INTERVAL",
-                "interval_ms": interval_ms,
-                "paused": paused,
-            })
-        }
-    }
-}
-
 pub(crate) fn configuration_document(
     desired: novarocks_mv_application::persistence::semantic::MvRefreshDesiredConfiguration,
 ) -> Result<novarocks_mv_application::persistence::codec::ConfigurationDocument, String> {
@@ -1138,83 +988,57 @@ fn from_clause_is_fan_in_union(query: &ast::Query) -> bool {
     let ast::SetExpr::Select(select) = query.body.as_ref() else {
         return false;
     };
-    let [from] = select.from.as_slice() else {
+    let Some(mut relation) = select.from.as_ref() else {
         return false;
     };
-    if !from.joins.is_empty() {
-        return false;
+    if let ast::Relation::Aliased(alias) = relation {
+        relation = &alias.relation;
     }
-    let ast::TableFactor::Derived {
-        lateral, subquery, ..
-    } = &from.relation
-    else {
+    let ast::Relation::TableSubquery(node) = relation else {
         return false;
     };
-    if *lateral {
-        return false;
-    }
-    matches!(subquery.body.as_ref(), ast::SetExpr::SetOperation(_))
+    matches!(node.query.body.as_ref(), ast::SetExpr::SetOperation(_))
 }
 
 fn validate_composed_aggregate_fallback_query(query: &ast::Query) -> Result<(), String> {
     let ast::SetExpr::Select(select) = query.body.as_ref() else {
         return Err("composed aggregate fallback requires a plain SELECT body".to_string());
     };
-    if select.from.len() != 1 {
+    let Some(from) = &select.from else {
         return Err(
             "composed aggregate fallback requires a single direct FROM join tree".to_string(),
         );
-    }
-    let from = &select.from[0];
-    if from.joins.is_empty() {
+    };
+    if !matches!(from, ast::Relation::Join(_)) {
         return Err(
             "composed aggregate fallback requires the aggregate input to be a direct join tree"
                 .to_string(),
         );
     }
-    validate_composed_aggregate_table_factor(&from.relation)?;
-    for join in &from.joins {
-        validate_composed_aggregate_join(&join.operator, &join.constraint)?;
-        validate_composed_aggregate_table_factor(&join.relation)?;
-    }
-    Ok(())
+    validate_composed_aggregate_table_factor(from)
 }
 
-fn validate_composed_aggregate_table_factor(factor: &ast::TableFactor) -> Result<(), String> {
+fn validate_composed_aggregate_table_factor(factor: &ast::Relation) -> Result<(), String> {
     match factor {
-        ast::TableFactor::Table { .. } => Ok(()),
-        ast::TableFactor::NestedJoin { table_with_joins, .. } => {
-            validate_composed_aggregate_table_factor(&table_with_joins.relation)?;
-            if table_with_joins.joins.is_empty() {
-                return Err(
-                    "composed aggregate fallback nested join must contain at least one join"
-                        .to_string(),
-                );
-            }
-            for join in &table_with_joins.joins {
-                validate_composed_aggregate_join(&join.operator, &join.constraint)?;
-                validate_composed_aggregate_table_factor(&join.relation)?;
-            }
-            Ok(())
+        ast::Relation::Table(_) => Ok(()),
+        ast::Relation::Aliased(alias) => validate_composed_aggregate_table_factor(&alias.relation),
+        ast::Relation::Join(join) => {
+            validate_composed_aggregate_table_factor(&join.left)?;
+            validate_composed_aggregate_join(&join.kind, join.criteria.as_ref())?;
+            validate_composed_aggregate_table_factor(&join.right)
         }
-        _ => Err(
-            "composed aggregate fallback supports only direct base-table joins, not subqueries or table functions"
-                .to_string(),
-        ),
+        _ => Err("composed aggregate fallback supports only direct base-table joins, not subqueries or table functions".to_string()),
     }
 }
 
 fn validate_composed_aggregate_join(
-    operator: &ast::JoinOperator,
-    constraint: &ast::JoinConstraint,
+    operator: &ast::JoinType,
+    constraint: Option<&ast::JoinCriteria>,
 ) -> Result<(), String> {
     match (operator, constraint) {
-        (ast::JoinOperator::Inner | ast::JoinOperator::InnerExplicit, ast::JoinConstraint::On(_)) => Ok(()),
-        (ast::JoinOperator::Cross, ast::JoinConstraint::None) => Ok(()),
-        _ => Err(
-            "composed aggregate fallback supports only direct INNER JOIN ... ON predicates or CROSS JOIN"
-                .to_string(),
-        ),
+        (ast::JoinType::Inner, Some(ast::JoinCriteria::On(_))) => Ok(()),
+        (ast::JoinType::Cross, None) => Ok(()),
+        _ => Err("composed aggregate fallback supports only direct INNER JOIN ... ON predicates or CROSS JOIN".to_string()),
     }
 }
 
@@ -1223,10 +1047,11 @@ fn validate_composed_aggregate_join(
 fn union_branch_count(query: &ast::Query) -> u32 {
     fn count(body: &ast::SetExpr) -> u32 {
         match body {
-            ast::SetExpr::SetOperation(operation) => {
-                count(&operation.left) + count(&operation.right)
+            ast::SetExpr::SetOperation(operation) => operation.inputs.iter().map(count).sum(),
+            ast::SetExpr::Query(subquery) => {
+                let inner = &subquery.query;
+                count(inner.body.as_ref())
             }
-            ast::SetExpr::Query(inner) => count(inner.body.as_ref()),
             _ => 1,
         }
     }
@@ -1513,11 +1338,7 @@ mod tests {
     }
 
     fn parse_select_query(sql: &str) -> ast::Query {
-        let statements = novarocks_parser::parse(sql).expect("parse");
-        let [ast::Statement::Query(q)] = statements.as_slice() else {
-            panic!("expected SELECT");
-        };
-        q.clone()
+        novarocks_parser::parser::parse_query(sql).expect("parse")
     }
 
     #[test]
@@ -2308,20 +2129,26 @@ pub fn join_base_refs_for_definition<'a>(
     reason = "Retained for staged materialized-view integration and recovery wiring."
 )]
 fn rewrite_snapshot_table_factor(
-    factor: &mut ast::TableFactor,
+    factor: &mut ast::Relation,
     base: &TableIdentity,
     snapshot_id: i64,
     default_alias: Option<&str>,
 ) -> Result<(), String> {
-    let ast::TableFactor::Table {
-        name,
-        version,
-        alias,
-        ..
-    } = factor
-    else {
+    let (relation, has_alias) = match &mut *factor {
+        ast::Relation::Aliased(alias) => (alias.relation.as_mut(), true),
+        other => (other, false),
+    };
+    let ast::Relation::Table(table) = relation else {
         return Err("join snapshot side must be a table".to_string());
     };
+    if table.branch.is_some() {
+        return Err("join snapshot side must not be branch-qualified".to_string());
+    }
+    let ast::Table {
+        name,
+        query_period: version,
+        ..
+    } = table.as_mut();
     if !object_name_matches_base(name, base)? {
         return Err(format!(
             "join snapshot rewrite expected base {}, got {}",
@@ -2330,7 +2157,10 @@ fn rewrite_snapshot_table_factor(
         ));
     }
     if let Some(version) = version {
-        let rendered = novarocks_parser::printer::print_expr(&version.value);
+        let value = novarocks_sql::planning::catalog::query_period_end(version)
+            .map_err(|error| error.to_string())?;
+        let rendered = novarocks_parser::printer::print_expression(value)
+            .map_err(|error| error.to_string())?;
         if !rendered.contains(&snapshot_id.to_string()) {
             return Err(format!(
                 "join snapshot side {} has conflicting version {rendered}",
@@ -2340,15 +2170,9 @@ fn rewrite_snapshot_table_factor(
     }
     *name = synthetic_snapshot_object_name(base, snapshot_id);
     *version = None;
-    if alias.is_none()
-        && let Some(default_alias) = default_alias
-    {
-        *alias = Some(ast::TableAlias {
-            name: generated_ident(default_alias),
-            columns: Vec::new(),
-            explicit_as: true,
-            span: Span::new(0, 0),
-        });
+    if !has_alias && let Some(default_alias) = default_alias {
+        *factor =
+            novarocks_parser::build::alias(factor.clone(), generated_ident(default_alias), None);
     }
     Ok(())
 }
@@ -2408,7 +2232,6 @@ fn generated_ident(value: &str) -> ast::Ident {
     ast::Ident {
         value: value.to_string(),
         quoted: false,
-        quote_style: None,
         span: Span::new(0, 0),
     }
 }
@@ -2539,39 +2362,43 @@ mod join_delta_append_only_fast_path_tests {
     #[test]
     fn join_delta_append_only_fast_path_requires_append_only_inner_or_cross_join() {
         assert!(should_use_join_delta_append_only_fast_path(
-            &parse_query("select l.id from ice.ns.left l join ice.ns.right r on l.id = r.id"),
+            &parse_query(
+                "select l.id from ice.ns.\"left\" l join ice.ns.\"right\" r on l.id = r.id"
+            ),
             false,
             false,
         ));
         assert!(should_use_join_delta_append_only_fast_path(
-            &parse_query("select l.id from ice.ns.left l cross join ice.ns.right r"),
+            &parse_query("select l.id from ice.ns.\"left\" l cross join ice.ns.\"right\" r"),
             false,
             false,
         ));
 
         assert!(!should_use_join_delta_append_only_fast_path(
-            &parse_query("select l.id from ice.ns.left l join ice.ns.right r on l.id = r.id"),
+            &parse_query(
+                "select l.id from ice.ns.\"left\" l join ice.ns.\"right\" r on l.id = r.id"
+            ),
             true,
             false,
         ));
         assert!(!should_use_join_delta_append_only_fast_path(
-            &parse_query("select l.id from ice.ns.left l join ice.ns.right r on l.id = r.id"),
+            &parse_query(
+                "select l.id from ice.ns.\"left\" l join ice.ns.\"right\" r on l.id = r.id"
+            ),
             false,
             true,
         ));
         assert!(!should_use_join_delta_append_only_fast_path(
-            &parse_query("select l.id from ice.ns.left l left join ice.ns.right r on l.id = r.id"),
+            &parse_query(
+                "select l.id from ice.ns.\"left\" l left join ice.ns.\"right\" r on l.id = r.id"
+            ),
             false,
             false,
         ));
     }
 
     fn parse_query(sql: &str) -> ast::Query {
-        let statements = novarocks_parser::parse(sql).expect("parse");
-        let [ast::Statement::Query(query)] = statements.as_slice() else {
-            panic!("expected query");
-        };
-        query.clone()
+        novarocks_parser::parser::parse_query(sql).expect("parse")
     }
 }
 

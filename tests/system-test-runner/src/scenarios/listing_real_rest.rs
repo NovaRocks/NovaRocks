@@ -758,14 +758,14 @@ impl Scenario for RealRestListing {
         )?);
         ensure!(
             admission
-                .matches("CREATE EXTERNAL CATALOG cl_normal ")
+                .matches("CREATE CATALOG cl_normal USING iceberg ")
                 .count()
                 == 1,
             "discovery catalog replacement must have one exact name"
         );
         let discovery = admission.replacen(
-            "CREATE EXTERNAL CATALOG cl_normal ",
-            "CREATE EXTERNAL CATALOG cl_discovery ",
+            "CREATE CATALOG cl_normal USING iceberg ",
+            "CREATE CATALOG cl_discovery USING iceberg ",
             1,
         );
         phases.push(record_listing_phase(
@@ -861,7 +861,7 @@ impl Scenario for RealRestListing {
                 let result = fixture.phase("drop_success", timeout, None, || {
                     listing_sql(
                         &mut control,
-                        "DROP DATABASE cl_normal.cl_ns_0000 FORCE",
+                        "DROP SCHEMA cl_normal.cl_ns_0000 CASCADE",
                         deadline,
                     )?;
                     Ok(json!({"dropped_namespace":"cl_ns_0000"}))

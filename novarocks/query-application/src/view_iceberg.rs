@@ -17,9 +17,14 @@
 
 use crate::persisted_query_definition::{PersistedQueryDefinition, PersistedQueryDialect};
 use crate::view::{
-    CreateExternalViewRequest, ViewEngine, ViewRequestContext, ViewStatementResult, ViewTarget,
+    CreateExternalViewRequest, CreateViewCommand, ViewEngine, ViewRequestContext,
+    ViewStatementResult, ViewTarget,
 };
-use novarocks_parser::ast::{CreateView, ObjectName};
+use novarocks_parser::{
+    ast::ObjectName,
+    build::{ident_from_catalog, object_name},
+    printer::print_create_view_definition,
+};
 use novarocks_spi::connector::DropPolicy;
 use novarocks_types::naming::normalize_identifier;
 
@@ -83,7 +88,7 @@ pub(crate) fn resolve_external_target_parts(
 pub(crate) fn create_external_view(
     engine: &dyn ViewEngine,
     target: ViewTarget,
-    statement: &CreateView,
+    statement: CreateViewCommand<'_>,
     context: ViewRequestContext<'_>,
     local_views: &crate::view::LocalViewSnapshot,
 ) -> Result<ViewStatementResult, crate::api::CommandError> {
@@ -92,8 +97,8 @@ pub(crate) fn create_external_view(
         .ok_or_else(|| "external view mutation requires connector request context".to_string())?;
 
     let definition = PersistedQueryDefinition::new(
-        statement.raw_query_source.clone(),
-        PersistedQueryDialect::StarRocks,
+        statement.raw_query,
+        PersistedQueryDialect::Trino,
         context.current_catalog.unwrap_or(DEFAULT_CATALOG),
         context.current_database,
     )?;
@@ -102,7 +107,7 @@ pub(crate) fn create_external_view(
             catalog: &definition.resolution.default_catalog,
             database: &definition.resolution.default_database,
             target: &target,
-            query: &statement.query,
+            query: statement.query,
             local_views,
         },
         connector_context,
@@ -112,7 +117,7 @@ pub(crate) fn create_external_view(
             target,
             columns,
             definition,
-            comment: statement.comment.as_ref().map(literal_to_string),
+            comment: statement.comment.map(str::to_owned),
             or_replace: statement.or_replace,
             if_not_exists: statement.if_not_exists,
             properties: Vec::new(),
@@ -120,16 +125,6 @@ pub(crate) fn create_external_view(
         connector_context,
     )?;
     Ok(ViewStatementResult::Ok)
-}
-
-fn literal_to_string(literal: &novarocks_parser::ast::Literal) -> String {
-    match &literal.kind {
-        novarocks_parser::ast::LiteralKind::String(value)
-        | novarocks_parser::ast::LiteralKind::HexString(value)
-        | novarocks_parser::ast::LiteralKind::Number(value) => value.clone(),
-        novarocks_parser::ast::LiteralKind::Null => "NULL".to_string(),
-        novarocks_parser::ast::LiteralKind::Boolean(value) => value.to_string(),
-    }
 }
 
 pub(crate) fn drop_external_view(
@@ -178,14 +173,19 @@ pub(crate) fn show_create_view(
                 target.catalog, target.database, target.view
             )
         })?;
-    let mut ddl = format!(
-        "CREATE VIEW `{}`.`{}`.`{}`",
-        target.catalog, target.database, target.view
-    );
-    if let Some(comment) = &view.comment {
-        ddl.push_str(&format!("\nCOMMENT \"{}\"", comment.replace('"', "\\\"")));
-    }
-    ddl.push_str(&format!("\nAS {};", view.definition.raw_query_source));
+    let name = object_name(
+        [&target.catalog, &target.database, &target.view]
+            .into_iter()
+            .map(|part| ident_from_catalog(part.as_str()))
+            .collect(),
+    )
+    .map_err(|error| error.to_string())?;
+    let ddl = print_create_view_definition(
+        &name,
+        view.comment.as_deref(),
+        &view.definition.raw_query_source,
+    )
+    .map_err(|error| error.to_string())?;
     Ok(ViewStatementResult::Query(build_query_result(vec![
         ("View".to_string(), vec![target.view]),
         ("Create View".to_string(), vec![ddl]),

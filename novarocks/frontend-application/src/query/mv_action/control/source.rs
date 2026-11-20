@@ -271,7 +271,7 @@ impl ControlSource {
             wake,
             io,
             requests,
-            capture: CurrentMetadataCapture::new(),
+            capture: crate::mv::domain::staged_create::new_current_metadata_capture(),
             current: CurrentProjectionRegistration::new(),
             call: CatalogCall::new(),
             finite: OnceLock::new(),
@@ -413,7 +413,7 @@ impl ControlSource {
                     .map_err(connector)?
                     .clone();
                 let result = if matches!(&self.request, MvControlRequest::Alter { statement, .. }
-                    if matches!(statement.action, MvAlterAction::SetProperties(_))) {
+                    if matches!(statement.action, MvAlterAction::Storage { .. })) {
                     crate::mv::domain::staged_create::install_admitted_current_projection_async_in(
                         &entrance,&view,body.input.ports.connector_control(),catalog,self.target.clone(),self.operation,
                         context,&factory,&self.current).await

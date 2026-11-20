@@ -20,10 +20,9 @@
 -- runtime AssertOneRow error.  This is the base guarantee that
 -- RankingWindowPredicatePushdown must not change: returning >1 row in a scalar
 -- position must always error, regardless of whether the rule fires or not.
-CREATE DATABASE IF NOT EXISTS ${case_db};
+CREATE SCHEMA IF NOT EXISTS ${case_db};
 USE ${case_db};
-CREATE TABLE smr (k INT, v INT)
-TBLPROPERTIES ("format-version" = "3");
-INSERT INTO smr VALUES (1, 10), (1, 20);
+CREATE TABLE smr (k INT, v INT) WITH (format_version = 3);
+INSERT INTO smr VALUES ROW(1, 10), ROW(1, 20);
 -- @expect_error=[query.execution.invalid_data] Data failure (reason 7:316)
 SELECT (SELECT v FROM smr WHERE k = 1);

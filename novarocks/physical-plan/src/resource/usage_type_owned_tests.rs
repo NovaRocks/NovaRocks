@@ -283,6 +283,7 @@ fn checked_scalar_unit() -> (
             None,
             ValueType::new(DataType::Int32, false),
             ExprKind::Cast {
+                array_failure_mode: None,
                 expr: call,
                 target: DataType::Int32,
                 decimal_overflow_policy:

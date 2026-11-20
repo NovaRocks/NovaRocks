@@ -64,7 +64,7 @@ fn call(name: &str, args: Vec<TypedExpr>) -> TypedExpr {
     TypedExpr {
         kind: ExprKind::FunctionCall {
             name: name.into(),
-            args,
+            args: (args).into(),
             distinct: false,
             binding: SqlFunctionBinding::new(resolved, DecimalOverflowPolicy::OutputNull),
             volatility,
@@ -75,7 +75,8 @@ fn call(name: &str, args: Vec<TypedExpr>) -> TypedExpr {
 fn cast(input: TypedExpr, target: DataType) -> TypedExpr {
     TypedExpr {
         kind: ExprKind::Cast {
-            expr: Box::new(input),
+            array_failure_mode: None,
+            expr: novarocks_parser::ast::AstBox::new(input),
             target: target.clone(),
             decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
         },

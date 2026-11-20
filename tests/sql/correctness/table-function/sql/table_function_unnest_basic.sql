@@ -28,5 +28,5 @@ SELECT x
 FROM (
     SELECT [1, 2, 3] AS arr
 ) t
-CROSS JOIN LATERAL UNNEST(t.arr) AS u(x)
+CROSS JOIN  UNNEST(t.arr) AS u(x)
 ORDER BY x;

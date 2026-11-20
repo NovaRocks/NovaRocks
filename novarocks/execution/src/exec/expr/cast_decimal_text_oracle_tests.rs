@@ -70,6 +70,7 @@ fn recipe(input: &ArrayRef, policy: DecimalOverflowPolicy, allow: bool) -> Prepa
         &FunctionValueType::new(DataType::Utf8, true),
         policy,
         allow,
+        None,
         &Control,
     )
     .unwrap()
@@ -425,6 +426,7 @@ fn compare_with_nullability(
         &FunctionValueType::new(DataType::Utf8, nullable),
         policy,
         allow,
+        None,
         &Control,
     )
     .unwrap();

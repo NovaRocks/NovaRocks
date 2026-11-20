@@ -26,15 +26,14 @@
 -- @skip_result_check=true
 USE ${case_db};
 CREATE TABLE IF NOT EXISTS test_order (
-    id varchar(150) NOT NULL COMMENT '',
-    reset_period_data varchar(32) NULL COMMENT ""
-)
-TBLPROPERTIES ("format-version" = "3");
+    id varchar(150) NOT NULL,
+    reset_period_data varchar(32)
+) WITH (format_version = 3);
 
 -- query 2
 -- @skip_result_check=true
 USE ${case_db};
-INSERT INTO test_order VALUES('1','2023-10-11 00:00:01.030');
+INSERT INTO test_order VALUES ROW('1','2023-10-11 00:00:01.030');
 
 -- query 3
 -- DATE_FORMAT with %f microsecond specifier

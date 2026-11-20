@@ -21,8 +21,7 @@
 -- query 1
 -- @skip_result_check=true
 SET SESSION pipeline_dop = 1;
-CREATE TABLE ${case_db}.rwm13_open_limit (p BIGINT)
-PARTITION BY (p);
+CREATE TABLE ${case_db}.rwm13_open_limit (p BIGINT) WITH (partitioning = ARRAY['p']);
 
 -- query 2
 -- @expect_trino_error=INVALID_SESSION_PROPERTY,USER_ERROR
@@ -42,7 +41,7 @@ SELECT count(*) AS n FROM ${case_db}.rwm13_open_limit;
 
 -- query 6
 -- @skip_result_check=true
-INSERT INTO ${case_db}.rwm13_open_limit VALUES (42);
+INSERT INTO ${case_db}.rwm13_open_limit VALUES ROW(42);
 
 -- query 7
 SELECT p FROM ${case_db}.rwm13_open_limit ORDER BY p;
@@ -50,4 +49,4 @@ SELECT p FROM ${case_db}.rwm13_open_limit ORDER BY p;
 -- query 8
 -- @cleanup=true
 -- @skip_result_check=true
-DROP TABLE IF EXISTS ${case_db}.rwm13_open_limit FORCE;
+DROP TABLE IF EXISTS ${case_db}.rwm13_open_limit ;

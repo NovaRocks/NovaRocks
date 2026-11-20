@@ -22,16 +22,11 @@
 
 -- query 1
 -- @skip_result_check=true
-DROP TABLE IF EXISTS ${case_db}.t_mor_lineage_sequence FORCE;
-DROP TABLE IF EXISTS ${case_db}.s_mor_lineage_sequence FORCE;
-CREATE TABLE ${case_db}.t_mor_lineage_sequence (id BIGINT, v STRING)
-TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true",
-  "novarocks.update.mode" = "merge-on-read"
-);
-INSERT INTO ${case_db}.t_mor_lineage_sequence VALUES (1, 'a'), (2, 'b'), (3, 'c');
-ALTER TABLE iceberg_dml_cat_${suite_uuid0}.${case_db}.t_mor_lineage_sequence CREATE TAG before_mutation;
+DROP TABLE IF EXISTS ${case_db}.t_mor_lineage_sequence ;
+DROP TABLE IF EXISTS ${case_db}.s_mor_lineage_sequence ;
+CREATE TABLE ${case_db}.t_mor_lineage_sequence (id BIGINT, v STRING) WITH (format_version = 3, extra_properties = MAP(ARRAY['novarocks.update.mode'], ARRAY['merge-on-read']));
+INSERT INTO ${case_db}.t_mor_lineage_sequence VALUES ROW(1, 'a'), ROW(2, 'b'), ROW(3, 'c');
+ALTER TABLE iceberg_dml_cat_${suite_uuid0}.${case_db}.t_mor_lineage_sequence EXECUTE create_tag(name => 'before_mutation', replace => false, if_not_exists => false);
 
 -- query 2
 SELECT id, v, _last_updated_sequence_number AS sequence_number
@@ -49,9 +44,8 @@ ORDER BY id;
 
 -- query 5
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.s_mor_lineage_sequence (id BIGINT, v STRING)
-TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
-INSERT INTO ${case_db}.s_mor_lineage_sequence VALUES (2, 'bbb'), (4, 'd');
+CREATE TABLE ${case_db}.s_mor_lineage_sequence (id BIGINT, v STRING) WITH (format_version = 3);
+INSERT INTO ${case_db}.s_mor_lineage_sequence VALUES ROW(2, 'bbb'), ROW(4, 'd');
 MERGE INTO ${case_db}.t_mor_lineage_sequence AS t
 USING ${case_db}.s_mor_lineage_sequence AS s
 ON t.id = s.id
@@ -81,6 +75,6 @@ FROM ${case_db}.t_mor_lineage_sequence;
 
 -- query 9
 -- @skip_result_check=true
-ALTER TABLE iceberg_dml_cat_${suite_uuid0}.${case_db}.t_mor_lineage_sequence DROP TAG before_mutation;
-DROP TABLE ${case_db}.t_mor_lineage_sequence FORCE;
-DROP TABLE ${case_db}.s_mor_lineage_sequence FORCE;
+ALTER TABLE iceberg_dml_cat_${suite_uuid0}.${case_db}.t_mor_lineage_sequence EXECUTE drop_tag(name => 'before_mutation', if_exists => false);
+DROP TABLE ${case_db}.t_mor_lineage_sequence ;
+DROP TABLE ${case_db}.s_mor_lineage_sequence ;

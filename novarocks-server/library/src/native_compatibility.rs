@@ -151,7 +151,10 @@ mod tests {
             COMPILED,
         )
         .unwrap();
-        assert_eq!(current.plan_contract_revision(), 27);
+        assert_eq!(
+            current.plan_contract_revision(),
+            novarocks_physical_plan::PLAN_CONTRACT_REVISION
+        );
         assert_ne!(current.plan_contract_digest(), prior.plan_contract_digest());
         assert_ne!(current.id(), prior.id());
         assert_eq!(current.descriptor_digest(), prior.descriptor_digest());
@@ -170,11 +173,38 @@ mod tests {
             COMPILED,
         )
         .unwrap();
-        assert_eq!(current.plan_contract_revision(), 27);
+        assert_eq!(
+            current.plan_contract_revision(),
+            novarocks_physical_plan::PLAN_CONTRACT_REVISION
+        );
         assert_eq!(prior.plan_contract_revision(), 26);
         assert_ne!(current.plan_contract_digest(), prior.plan_contract_digest());
         assert_ne!(current.id(), prior.id());
         assert_eq!(current.descriptor_digest(), prior.descriptor_digest());
+    }
+
+    #[test]
+    fn peer_on_revision_27_has_a_distinct_compatibility_island() {
+        let manifest = server_manifest();
+        let current =
+            resolve_native_compatibility_material(manifest.contracts(), [0x31; 32], COMPILED)
+                .unwrap();
+        let prior = novarocks_version::derive_repository_native_compatibility_material(
+            native_carrier_declarations(manifest.contracts()).unwrap(),
+            [0x31; 32],
+            27,
+            COMPILED,
+        )
+        .unwrap();
+        assert_eq!(prior.plan_contract_revision(), 27);
+        assert_ne!(
+            current.plan_contract_revision(),
+            prior.plan_contract_revision()
+        );
+        assert_ne!(current.plan_contract_digest(), prior.plan_contract_digest());
+        assert_ne!(current.id(), prior.id());
+        assert_eq!(current.descriptor_digest(), prior.descriptor_digest());
+        assert_eq!(current.carriers(), prior.carriers());
     }
 
     #[test]

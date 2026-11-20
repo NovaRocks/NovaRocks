@@ -91,6 +91,17 @@ impl ControlSource {
             &instance,
         )
         .map_err(connector)?;
+        if let MvControlRequest::Alter { statement, .. } = &self.request
+            && let MvAlterAction::Storage { owner, .. }
+            | MvAlterAction::RefreshAndStorage { owner, .. } = &statement.action
+            && (owner.instance_id != planning.binding().descriptor().instance_id
+                || owner.incarnation != planning.binding().incarnation())
+        {
+            return Err(MvProviderFailure::new(
+                MvProviderFailureKind::TargetReplaced,
+                "MV storage property scope belongs to a different connector generation",
+            ));
+        }
         body.planning = Some(planning.clone());
         let table = ConnectorTableIdentity {
             instance_id: instance,
@@ -211,29 +222,22 @@ impl ControlSource {
                 });
             }
             MvControlRequest::Alter { statement, .. } => match &statement.action {
-                MvAlterAction::Repartition(_) => {
-                    return Err(invalid(
-                        "ALTER MATERIALIZED VIEW REPARTITION requires its original data-producing step",
-                    ));
-                }
-                MvAlterAction::SetProperties(properties) => {
-                    body.operation = Some(ConnectorCatalogMutationOperation::AlterProperties {
+                MvAlterAction::Storage { properties, .. } => {
+                    if properties
+                        .iter()
+                        .any(|(name, _)| name.as_ref() == "partitioning")
+                    {
+                        return Err(invalid(
+                            "MV partitioning requires its original data-producing step",
+                        ));
+                    }
+                    body.operation = Some(ConnectorCatalogMutationOperation::SetTableProperties {
                         table,
-                        changes: properties
-                            .iter()
-                            .map(|(key, value)| {
-                                novarocks_spi::connector::ConnectorPropertyChange::Set {
-                                    key: Arc::from(key.as_str()),
-                                    value: Arc::from(value.as_str()),
-                                }
-                            })
-                            .collect(),
-                        authority:
-                            novarocks_spi::connector::ConnectorPropertyAuthority::UserStatement,
-                        expected_committed_partitioning: None,
+                        properties: Arc::clone(properties),
                     });
                 }
-                action => {
+                MvAlterAction::Refresh(changes)
+                | MvAlterAction::RefreshAndStorage { changes, .. } => {
                     ready
                         .candidate_reader()
                         .observe_current_application_async(&documents, request.clone())
@@ -292,7 +296,7 @@ impl ControlSource {
                     }
                     let desired = crate::mv::domain::flow::configuration_after_alter(
                         &observed.configuration,
-                        action,
+                        changes,
                     )
                     .map_err(invalid)?;
                     let configuration =
@@ -315,15 +319,24 @@ impl ControlSource {
                             .map_err(connector)?,
                         )
                         .map_err(connector)?;
+                    let change =
+                        keyed_configuration_slot_change(&configuration).map_err(document)?;
+                    let mutation = if let MvAlterAction::RefreshAndStorage { properties, .. } =
+                        &statement.action
+                    {
+                        KeyedMutation::SlotChangeWithTableProperties {
+                            change,
+                            properties: Arc::clone(properties),
+                        }
+                    } else {
+                        KeyedMutation::SlotChange(change)
+                    };
                     body.operation = Some(ConnectorCatalogMutationOperation::KeyedDocuments {
                         intent: KeyedMutationIntent {
                             admission,
                             expected_metadata: observed.view.metadata_version.clone(),
                             expected_snapshot: observed.view.current_snapshot,
-                            mutation: KeyedMutation::SlotChange(
-                                keyed_configuration_slot_change(&configuration)
-                                    .map_err(document)?,
-                            ),
+                            mutation,
                         },
                     });
                 }

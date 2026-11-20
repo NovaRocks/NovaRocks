@@ -33,9 +33,9 @@ CREATE TABLE ${case_db}.t_temporal_insert_sink (
   dt DATETIME
 );
 INSERT INTO ${case_db}.t_temporal_insert_src VALUES
-  (1, '1970-01-01', '1970-01-01 00:00:00'),
-  (2, '2024-02-29', '2024-02-29 23:59:59'),
-  (3, NULL, NULL);
+  ROW(1, '1970-01-01', '1970-01-01 00:00:00'),
+  ROW(2, '2024-02-29', '2024-02-29 23:59:59'),
+  ROW(3, NULL, NULL);
 INSERT INTO ${case_db}.t_temporal_insert_sink
 SELECT id, d, dt
 FROM ${case_db}.t_temporal_insert_src;

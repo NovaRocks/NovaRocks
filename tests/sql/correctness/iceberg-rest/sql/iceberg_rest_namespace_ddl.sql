@@ -22,17 +22,17 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE DATABASE iceberg_rest_${suite_uuid0}.iceberg_rest_ns_db_${uuid0};
+CREATE SCHEMA iceberg_rest_${suite_uuid0}.iceberg_rest_ns_db_${uuid0};
 
 -- query 2
 -- @skip_result_check=true
 -- IF NOT EXISTS on an existing namespace must be a no-op.
-CREATE DATABASE IF NOT EXISTS iceberg_rest_${suite_uuid0}.iceberg_rest_ns_db_${uuid0};
+CREATE SCHEMA IF NOT EXISTS iceberg_rest_${suite_uuid0}.iceberg_rest_ns_db_${uuid0};
 
 -- query 3
 -- @expect_error=exists
 -- Bare CREATE DATABASE on an existing namespace must fail.
-CREATE DATABASE iceberg_rest_${suite_uuid0}.iceberg_rest_ns_db_${uuid0};
+CREATE SCHEMA iceberg_rest_${suite_uuid0}.iceberg_rest_ns_db_${uuid0};
 
 -- query 4
 -- @skip_result_check=true
@@ -40,7 +40,7 @@ CREATE TABLE iceberg_rest_${suite_uuid0}.iceberg_rest_ns_db_${uuid0}.t_ns_${uuid
 
 -- query 5
 -- @skip_result_check=true
-INSERT INTO iceberg_rest_${suite_uuid0}.iceberg_rest_ns_db_${uuid0}.t_ns_${uuid0} VALUES (1), (2);
+INSERT INTO iceberg_rest_${suite_uuid0}.iceberg_rest_ns_db_${uuid0}.t_ns_${uuid0} VALUES ROW(1), ROW(2);
 
 -- query 6
 -- The namespace works for table operations: read back the inserted rows.
@@ -52,9 +52,9 @@ DROP TABLE iceberg_rest_${suite_uuid0}.iceberg_rest_ns_db_${uuid0}.t_ns_${uuid0}
 
 -- query 8
 -- @skip_result_check=true
-DROP DATABASE iceberg_rest_${suite_uuid0}.iceberg_rest_ns_db_${uuid0};
+DROP SCHEMA iceberg_rest_${suite_uuid0}.iceberg_rest_ns_db_${uuid0};
 
 -- query 9
 -- @skip_result_check=true
 -- IF EXISTS on already-dropped namespace must be a no-op.
-DROP DATABASE IF EXISTS iceberg_rest_${suite_uuid0}.iceberg_rest_ns_db_${uuid0};
+DROP SCHEMA IF EXISTS iceberg_rest_${suite_uuid0}.iceberg_rest_ns_db_${uuid0};

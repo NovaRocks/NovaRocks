@@ -29,22 +29,20 @@ DROP TABLE IF EXISTS ${case_db}.t_join_inner_residual_r;
 CREATE TABLE ${case_db}.t_join_inner_residual_l (
   id INT,
   lv INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 CREATE TABLE ${case_db}.t_join_inner_residual_r (
   id INT,
   rv INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 INSERT INTO ${case_db}.t_join_inner_residual_l VALUES
-  (1, 5),
-  (2, 20),
-  (3, 7);
+  ROW(1, 5),
+  ROW(2, 20),
+  ROW(3, 7);
 INSERT INTO ${case_db}.t_join_inner_residual_r VALUES
-  (1, 10),
-  (2, 15),
-  (3, 7),
-  (4, 100);
+  ROW(1, 10),
+  ROW(2, 15),
+  ROW(3, 7),
+  ROW(4, 100);
 SELECT l.id, l.lv, r.rv
 FROM ${case_db}.t_join_inner_residual_l l
 INNER JOIN ${case_db}.t_join_inner_residual_r r

@@ -28,15 +28,14 @@ DROP TABLE IF EXISTS ${case_db}.t_topn_order_limit_offset;
 CREATE TABLE ${case_db}.t_topn_order_limit_offset (
   id INT,
   val INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 INSERT INTO ${case_db}.t_topn_order_limit_offset VALUES
-  (1, 100),
-  (2, 90),
-  (3, 90),
-  (4, 80),
-  (5, 70);
+  ROW(1, 100),
+  ROW(2, 90),
+  ROW(3, 90),
+  ROW(4, 80),
+  ROW(5, 70);
 SELECT id, val
 FROM ${case_db}.t_topn_order_limit_offset
 ORDER BY val DESC, id ASC
-LIMIT 2 OFFSET 2;
+OFFSET 2 LIMIT 2;

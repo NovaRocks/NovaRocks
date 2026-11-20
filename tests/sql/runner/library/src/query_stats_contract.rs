@@ -18,7 +18,7 @@
 //! Closed, runner-owned assertions over one completed EXPLAIN COSTS response.
 //! Inputs are fixture policy and immutable display facts, never catalog reads.
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -189,12 +189,34 @@ impl QueryStatsContract {
 
     /// Reject unsupported statements before the runner executes a fixture step.
     pub fn validate_sql(&self, sql: &str) -> Result<()> {
-        use novarocks_parser::ast::{ExplainFormat, Statement};
-        let statements =
-            novarocks_parser::parse(sql).map_err(|error| anyhow::anyhow!("{error}"))?;
+        use novarocks_parser::ast::{
+            Expr, LiteralKind, TrinoExplainFormat, TrinoExplainOptionKind, TrinoExplainType,
+            TrinoStatement,
+        };
+        let pieces = crate::session::split_trino_sql_statements(sql)?;
+        let [piece] = pieces.as_slice() else {
+            bail!("@query_stats_contract requires exactly one physical EXPLAIN COSTS query");
+        };
+        let statement = novarocks_parser::parser::parse_statement(piece)?;
+        let TrinoStatement::Explain(explain) = statement else {
+            bail!("@query_stats_contract requires exactly one physical EXPLAIN COSTS query");
+        };
+        let TrinoStatement::Query(query) = explain.statement.as_ref() else {
+            bail!("@query_stats_contract requires exactly one physical EXPLAIN COSTS query");
+        };
+        let costs = query.session_properties.iter().any(|property| {
+            let [name] = property.name.parts.as_slice() else { return false };
+            name.value.eq_ignore_ascii_case("explain_detail")
+                && matches!(&property.value, Expr::Literal(value)
+                    if matches!(&value.kind, LiteralKind::String(level) if level.eq_ignore_ascii_case("COSTS")))
+        });
         ensure!(
-            matches!(statements.as_slice(), [Statement::ExplainQuery(query)]
-            if query.format == ExplainFormat::Costs && !query.logical),
+            costs
+                && explain.options.iter().all(|option| matches!(
+                    option.kind,
+                    TrinoExplainOptionKind::Type(TrinoExplainType::Distributed)
+                        | TrinoExplainOptionKind::Format(TrinoExplainFormat::Text)
+                )),
             "@query_stats_contract requires exactly one physical EXPLAIN COSTS query"
         );
         Ok(())
@@ -409,7 +431,7 @@ fn require_keys(fields: &BTreeMap<&str, &str>, required: &[&str]) -> Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    const SQL: &str = "EXPLAIN COSTS SELECT 1";
+    const SQL: &str = "EXPLAIN WITH SESSION explain_detail = 'COSTS'  SELECT 1";
 
     fn exact_contract() -> String {
         r#"{"tables":[],"broadcast":{"distribution":"BROADCAST","join_kind":"INNER","verdict":"feasible","forced":false,"backends":3,"risk_multiplier":2,"per_node_budget_bytes":268435456,"cluster_network_budget_bytes":268435456},"payload":{"kind":"exact","bytes":80},"hash_table":{"kind":"exact","build_rows":10,"load_factor":0.75,"per_row_overhead_bytes":16}}"#.to_string()
@@ -459,7 +481,7 @@ mod tests {
         assert!(contract.verify("SELECT 1", &good).is_err());
         assert!(
             contract
-                .verify("EXPLAIN COSTS SELECT 1; EXPLAIN COSTS SELECT 2", &good)
+                .verify("EXPLAIN WITH SESSION explain_detail = 'COSTS'  SELECT 1; EXPLAIN WITH SESSION explain_detail = 'COSTS'  SELECT 2", &good)
                 .is_err()
         );
     }

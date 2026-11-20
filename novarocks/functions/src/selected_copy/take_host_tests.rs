@@ -269,13 +269,31 @@ impl Drop for FlatSourceLease {
 
 #[test]
 fn independent_flat_take_releases_source_but_keeps_real_new_backing_until_last_alias() {
-    use arrow_array::{BooleanArray, Float64Array, Int32Array, UInt64Array};
+    use arrow_array::{
+        BooleanArray, Float64Array, Int32Array, TimestampMicrosecondArray,
+        TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt64Array,
+    };
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     let sources: Vec<ArrayRef> = vec![
         Arc::new(BooleanArray::from(vec![Some(false), None, Some(true)])),
         Arc::new(Int32Array::from(vec![Some(i32::MIN), None, Some(i32::MAX)])),
         Arc::new(Int64Array::from(vec![Some(i64::MIN), None, Some(i64::MAX)])),
         Arc::new(Float64Array::from(vec![Some(-3.0), None, Some(7.5)])),
+        Arc::new(TimestampSecondArray::from(vec![Some(-1), None, Some(1)])),
+        Arc::new(TimestampMillisecondArray::from(vec![
+            Some(-1_001),
+            None,
+            Some(1_001),
+        ])),
+        Arc::new(TimestampMicrosecondArray::from(vec![
+            Some(-1_000_001),
+            None,
+            Some(1_000_001),
+        ])),
+        Arc::new(
+            TimestampNanosecondArray::from(vec![Some(-1_000_000_001), None, Some(1_000_000_001)])
+                .with_timezone("America/Los_Angeles"),
+        ),
         Arc::new(StringArray::from(vec![
             Some("unselected"),
             None,

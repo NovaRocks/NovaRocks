@@ -95,15 +95,15 @@ reconciliation 命令。
 对上述带公开 marker 的操作，先从 SQL 错误、statement log 或平台 audit 记录中取得
 `LakePublicationId`，然后在同一 external catalog 中运行只读查询（替换表名和 ID）：
 
-```sql
+``` sql
 -- 1. 找到声明该 publication 的 snapshot marker。
 SELECT snapshot_id, parent_id, committed_at, summary
-FROM catalog_name.db_name.table_name$snapshots
+FROM catalog_name.db_name."table_name$snapshots"
 WHERE CAST(summary AS STRING) LIKE '%<LakePublicationId>%';
 
 -- 2. 读取当前 ref/main 和 table identity，确认 snapshot 仍被当前历史引用。
 SELECT name, type, snapshot_id
-FROM catalog_name.db_name.table_name$refs;
+FROM catalog_name.db_name."table_name$refs";
 
 -- 3. CTAS 还要读取新表的公开属性；表不存在时没有正向锚，仍是 Unknown。
 SHOW CREATE TABLE catalog_name.db_name.created_table;

@@ -603,11 +603,8 @@ impl ConnectorManagedPartitionField {
 
 fn validate_managed_partition_fields(
     fields: &[ConnectorManagedPartitionField],
-    allow_empty: bool,
 ) -> Result<(), ConnectorError> {
-    if (!allow_empty && fields.is_empty())
-        || fields.len() > MAX_CONNECTOR_MANAGED_PARTITION_SPEC_FIELDS
-    {
+    if fields.len() > MAX_CONNECTOR_MANAGED_PARTITION_SPEC_FIELDS {
         return Err(ConnectorError::new(
             ConnectorErrorKind::InvalidRequest,
             "connector managed partition spec field count is invalid or exceeds its bound",
@@ -649,7 +646,7 @@ impl ConnectorManagedPartitionSpecObservation {
                 "connector managed prior partition spec ID must be non-negative",
             ));
         }
-        validate_managed_partition_fields(fields, true)?;
+        validate_managed_partition_fields(fields)?;
         let mut hasher = Sha256::new();
         hasher.update(CONNECTOR_MANAGED_PARTITION_SPEC_OBSERVATION_DOMAIN);
         hasher.update(provider_spec_id.to_be_bytes());
@@ -699,14 +696,22 @@ pub enum ConnectorManagedPartitionSpecReplacementTarget {
 }
 
 /// Complete, signed logical facts for replacing the default partition spec in
-/// the same external commit that publishes the managed snapshot.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// the same external commit that publishes the managed snapshot. An empty
+/// replacement selects an unpartitioned spec.
+#[derive(Clone, Debug)]
 pub struct ConnectorManagedPartitionSpecReplacement {
     operation_id: ConnectorWriteOperationId,
     replacement_id: ConnectorManagedPartitionSpecReplacementId,
     target: ConnectorManagedPartitionSpecReplacementTarget,
     expected_prior_default: ConnectorManagedPartitionSpecObservation,
     fields: Vec<ConnectorManagedPartitionField>,
+    storage_properties: Option<ManagedRepartitionStorageProperties>,
+}
+
+#[derive(Clone, Debug)]
+struct ManagedRepartitionStorageProperties {
+    ordered: Arc<[(Arc<str>, super::DdlPropertyChange)]>,
+    partitioning_index: usize,
 }
 
 impl ConnectorManagedPartitionSpecReplacement {
@@ -715,13 +720,55 @@ impl ConnectorManagedPartitionSpecReplacement {
         expected_prior_default: ConnectorManagedPartitionSpecObservation,
         fields: Vec<ConnectorManagedPartitionField>,
     ) -> Result<Self, ConnectorError> {
-        validate_managed_partition_fields(&fields, false)?;
+        validate_managed_partition_fields(&fields)?;
         Ok(Self {
             operation_id,
             replacement_id: ConnectorManagedPartitionSpecReplacementId::derive(operation_id),
             target: ConnectorManagedPartitionSpecReplacementTarget::MainPublication,
             expected_prior_default,
             fields,
+            storage_properties: None,
+        })
+    }
+
+    /// Retain the original evaluated request and the exact slot consumed by
+    /// the partition replacement. Clone shares the backing of every value.
+    pub fn with_storage_properties(
+        mut self,
+        properties: Arc<[(Arc<str>, super::DdlPropertyChange)]>,
+        partitioning_index: usize,
+    ) -> Result<Self, ConnectorError> {
+        if self.storage_properties.is_some() || properties.len() < 2 {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "managed storage properties must be attached once with at least one other change",
+            ));
+        }
+        if partitioning_index >= properties.len()
+            || properties.iter().enumerate().any(|(index, (name, _))| {
+                (index == partitioning_index) != (name.as_ref() == "partitioning")
+            })
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "managed storage properties do not identify their single partitioning entry",
+            ));
+        }
+        self.storage_properties = Some(ManagedRepartitionStorageProperties {
+            ordered: properties,
+            partitioning_index,
+        });
+        Ok(self)
+    }
+
+    /// The original ordered entries for the ordinary property author.
+    pub fn storage_properties(
+        &self,
+    ) -> Option<impl Iterator<Item = &(Arc<str>, super::DdlPropertyChange)> + Clone + '_> {
+        self.storage_properties.as_ref().map(|storage| {
+            let (before, partitioning_and_after) =
+                storage.ordered.split_at(storage.partitioning_index);
+            before.iter().chain(&partitioning_and_after[1..])
         })
     }
 
@@ -749,7 +796,7 @@ impl ConnectorManagedPartitionSpecReplacement {
         &self,
         operation_id: ConnectorWriteOperationId,
     ) -> Result<(), ConnectorError> {
-        validate_managed_partition_fields(&self.fields, false)?;
+        validate_managed_partition_fields(&self.fields)?;
         if self.operation_id != operation_id
             || self.replacement_id
                 != ConnectorManagedPartitionSpecReplacementId::derive(operation_id)
@@ -760,6 +807,51 @@ impl ConnectorManagedPartitionSpecReplacement {
             ));
         }
         Ok(())
+    }
+}
+
+impl PartialEq for ConnectorManagedPartitionSpecReplacement {
+    fn eq(&self, other: &Self) -> bool {
+        self.operation_id == other.operation_id
+            && self.replacement_id == other.replacement_id
+            && self.target == other.target
+            && self.expected_prior_default == other.expected_prior_default
+            && self.fields == other.fields
+            && match (&self.storage_properties, &other.storage_properties) {
+                (None, None) => true,
+                (Some(left), Some(right)) => {
+                    left.partitioning_index == right.partitioning_index
+                        && (Arc::ptr_eq(&left.ordered, &right.ordered)
+                            || (left.ordered.len() == right.ordered.len()
+                                && left.ordered.iter().zip(right.ordered.iter()).all(
+                                    |((left_name, left), (right_name, right))| {
+                                        left_name == right_name
+                                            && exact_storage_change_eq(left, right)
+                                    },
+                                )))
+                }
+                _ => false,
+            }
+    }
+}
+
+impl Eq for ConnectorManagedPartitionSpecReplacement {}
+
+fn exact_storage_change_eq(
+    left: &super::DdlPropertyChange,
+    right: &super::DdlPropertyChange,
+) -> bool {
+    use super::{DdlPropertyChange as Change, DdlPropertyValue as Value};
+    match (left, right) {
+        (Change::Set(left), Change::Set(right)) | (Change::Reset(left), Change::Reset(right)) => {
+            match (left, right) {
+                // A publication declaration compares the exact evaluated input,
+                // including signed zero and every representable floating value.
+                (Value::Double(left), Value::Double(right)) => left.to_bits() == right.to_bits(),
+                _ => left == right,
+            }
+        }
+        _ => false,
     }
 }
 
@@ -827,6 +919,7 @@ pub struct ConnectorManagedPartitionSpecPreview {
     committed_partitioning: ConnectorCommittedPartitioning,
     exact_partition_spec_version: Bytes,
     exact_partition_fields: Vec<MvExactPartitionField>,
+    storage_projection_digest: Option<[u8; 32]>,
 }
 
 impl ConnectorManagedPartitionSpecPreview {
@@ -849,7 +942,19 @@ impl ConnectorManagedPartitionSpecPreview {
             committed_partitioning,
             exact_partition_spec_version,
             exact_partition_fields,
+            storage_projection_digest: None,
         })
+    }
+
+    /// Binds the prospective writer facts to the original target and operation.
+    /// The provider must derive the same projection again at Begin.
+    pub fn with_storage_projection_digest(mut self, digest: [u8; 32]) -> Self {
+        self.storage_projection_digest = Some(digest);
+        self
+    }
+
+    pub const fn storage_projection_digest(&self) -> Option<[u8; 32]> {
+        self.storage_projection_digest
     }
 
     pub const fn owner(&self) -> &ConnectorProviderBindingKey {
@@ -1023,7 +1128,7 @@ impl ConnectorCommittedPartitionField {
 fn validate_committed_partition_fields(
     fields: &[ConnectorCommittedPartitionField],
 ) -> Result<(), ConnectorError> {
-    if fields.is_empty() || fields.len() > MAX_CONNECTOR_MANAGED_PARTITION_SPEC_FIELDS {
+    if fields.len() > MAX_CONNECTOR_MANAGED_PARTITION_SPEC_FIELDS {
         return Err(ConnectorError::new(
             ConnectorErrorKind::InvalidRequest,
             "connector committed partition field count is invalid or exceeds its bound",
@@ -1056,7 +1161,8 @@ fn validate_committed_partition_fields(
 }
 
 /// Exact partitioning facts returned after an atomic managed publication.
-/// The physical spec and partition field IDs are provider-assigned.
+/// The physical spec and partition field IDs are provider-assigned. An exact
+/// spec with zero fields is distinct from a receipt with no partitioning fact.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConnectorCommittedPartitioning {
     spec_id: i32,
@@ -1559,8 +1665,7 @@ impl ConnectorWriteReceipt {
                         .try_into()
                         .expect("fixed-width committed partition digest");
                     let field_count = read_u32(&mut offset)?;
-                    if field_count == 0 || field_count > MAX_CONNECTOR_MANAGED_PARTITION_SPEC_FIELDS
-                    {
+                    if field_count > MAX_CONNECTOR_MANAGED_PARTITION_SPEC_FIELDS {
                         return Err(ConnectorError::new(
                             ConnectorErrorKind::CorruptData,
                             "connector committed partition field count is invalid",
@@ -1714,6 +1819,20 @@ pub trait ConnectorWriteControl: Send + Sync {
         Err(ConnectorError::new(
             ConnectorErrorKind::Unsupported,
             "connector write control does not implement row-mutation preparation",
+        ))
+    }
+
+    /// Decode a managed repartition property element using this provider's
+    /// partition grammar. Schema binding follows at managed partition preview.
+    fn parse_managed_partitioning_element(
+        &self,
+        _field: Option<&str>,
+        _index: usize,
+        _control: &dyn super::ConnectorOperationControl,
+    ) -> Result<super::ConnectorPartitionTransform, ConnectorError> {
+        Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "connector write control does not implement managed partition property parsing",
         ))
     }
 
@@ -1924,14 +2043,39 @@ impl ConnectorWrite {
         Ok(outcome)
     }
 
+    pub fn parse_managed_partitioning_element(
+        &self,
+        table: &ConnectorTableHandle,
+        field: Option<&str>,
+        index: usize,
+        control: &dyn super::ConnectorOperationControl,
+    ) -> Result<super::ConnectorPartitionTransform, ConnectorError> {
+        if !self.matches_provider_instance(table.owner()) {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "managed partition property table does not match the connector instance",
+            ));
+        }
+        control.check_active()?;
+        self.control
+            .parse_managed_partitioning_element(field, index, control)
+    }
+
     pub fn preview_managed_partition_spec(
         &self,
         request: ConnectorManagedPartitionSpecPreviewRequest,
     ) -> Result<ConnectorManagedPartitionSpecPreview, ConnectorError> {
         request.validate(&self.provider_binding_key)?;
         let operation_id = request.operation_id();
+        let combined = request.replacement().storage_properties().is_some();
         let preview = self.control.preview_managed_partition_spec(request)?;
         preview.validate_for_request(&self.provider_binding_key, operation_id)?;
+        if combined != preview.storage_projection_digest().is_some() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "managed partition preview does not retain its exact storage projection",
+            ));
+        }
         Ok(preview)
     }
 
@@ -2339,6 +2483,48 @@ mod tests {
     }
 
     #[test]
+    fn managed_repartition_borrows_original_storage_entries_around_the_partition_slot() {
+        use super::super::{DdlPropertyChange as Change, DdlPropertyValue as Value};
+
+        let operation_id = ConnectorWriteOperationId::new();
+        let prior = ConnectorManagedPartitionSpecObservation::try_from_fields(0, &[]).unwrap();
+        let base =
+            ConnectorManagedPartitionSpecReplacement::try_new(operation_id, prior, vec![]).unwrap();
+        let values: Arc<[_]> = Arc::from([
+            (
+                Arc::from("data_location"),
+                Change::Set(Value::Varchar("s3://b/writes".into())),
+            ),
+            (
+                Arc::from("partitioning"),
+                Change::Set(Value::ArrayVarchar(vec![])),
+            ),
+            (
+                Arc::from("extra_properties"),
+                Change::Set(Value::MapVarcharVarchar(vec![(
+                    "read.split.target-size".into(),
+                    Some("1024".into()),
+                )])),
+            ),
+        ]);
+        assert!(
+            base.clone()
+                .with_storage_properties(Arc::clone(&values), 2)
+                .is_err()
+        );
+        assert!(base.storage_properties().is_none());
+        let combined = base
+            .with_storage_properties(Arc::clone(&values), 1)
+            .unwrap();
+        let cloned = combined.clone();
+        assert_eq!(combined, cloned);
+        let received: Vec<_> = cloned.storage_properties().unwrap().collect();
+        assert!(std::ptr::eq(received[0], &values[0]));
+        assert!(std::ptr::eq(received[1], &values[2]));
+        assert_eq!(received.len(), 2);
+    }
+
+    #[test]
     fn managed_partition_replacement_is_bounded_ordered_and_operation_scoped() {
         assert!(
             ConnectorManagedPartitionField::try_new(
@@ -2378,14 +2564,14 @@ mod tests {
             )
             .is_ok()
         );
-        assert!(
-            ConnectorManagedPartitionSpecReplacement::try_new(
-                ConnectorWriteOperationId::new(),
-                prior,
-                Vec::new(),
-            )
-            .is_err()
-        );
+        let unpartitioned = ConnectorManagedPartitionSpecReplacement::try_new(
+            ConnectorWriteOperationId::new(),
+            prior,
+            Vec::new(),
+        )
+        .expect("explicit unpartitioned replacement");
+        assert!(unpartitioned.fields().is_empty());
+        assert_eq!(unpartitioned.expected_prior_default(), prior);
 
         let operation_id = ConnectorWriteOperationId::new();
         let replacement = ConnectorManagedPartitionSpecReplacement::try_new(
@@ -2485,6 +2671,44 @@ mod tests {
                 .expect("decode repartition receipt");
         assert_eq!(decoded, receipt);
         assert_eq!(decoded.committed_partitioning(), Some(&partitioning));
+    }
+
+    #[test]
+    fn receipt_wire_distinguishes_unpartitioned_replacement_from_no_transition() {
+        let version =
+            ConnectorCommittedVersion::try_new(Bytes::from_static(b"version"), Some(8)).unwrap();
+        let payload = Bytes::from_static(b"provider receipt");
+        let ordinary = ConnectorWriteReceipt::try_new_with_committed_facts(
+            payload.clone(),
+            version.clone(),
+            Some(14),
+        )
+        .unwrap();
+        let committed = ConnectorCommittedPartitioning::try_new(4, vec![]).unwrap();
+        let exact = ConnectorWriteReceipt::try_new_with_committed_facts_and_partitioning(
+            payload,
+            version,
+            Some(14),
+            committed.clone(),
+        )
+        .unwrap();
+        let wire = exact.try_to_wire_v1().unwrap();
+        let decoded = ConnectorWriteReceipt::try_from_wire_v1(&wire).unwrap();
+        assert_eq!(decoded, exact);
+        assert_eq!(decoded.committed_partitioning(), Some(&committed));
+        assert!(
+            ConnectorWriteReceipt::try_from_wire_v1(&ordinary.try_to_wire_v1().unwrap())
+                .unwrap()
+                .committed_partitioning()
+                .is_none()
+        );
+        // The zero field count occupies the final four bytes. Corrupt the
+        // preceding digest to prove the decoded empty fact is still checked.
+        let mut tampered = wire.to_vec();
+        let digest_end = tampered.len() - 5;
+        tampered[digest_end] ^= 1;
+        let error = ConnectorWriteReceipt::try_from_wire_v1(&tampered).unwrap_err();
+        assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
     }
 
     #[test]

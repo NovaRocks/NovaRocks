@@ -641,7 +641,7 @@ mod tests {
 
     #[test]
     fn parser_user_error_is_preserved_without_message_classification() {
-        let parser_error = novarocks_parser::parse("SHOW")
+        let parser_error = novarocks_parser::parser::parse_statement("SHOW")
             .expect_err("incomplete SHOW command must be a parser error")
             .to_user_error("SHOW");
         let error = QueryServiceError::from_user_error(parser_error.clone());

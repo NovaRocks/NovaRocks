@@ -1088,9 +1088,9 @@ mod tests {
         let right_typed = crate::planner::optimizer_bridge::scalar::materialize(arena, right);
         let expr = crate::analysis::TypedExpr {
             kind: ExprKind::BinaryOp {
-                left: Box::new(left_typed),
+                left: novarocks_parser::ast::AstBox::new(left_typed),
                 op,
-                right: Box::new(right_typed),
+                right: novarocks_parser::ast::AstBox::new(right_typed),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
@@ -2857,6 +2857,7 @@ mod tests {
         );
         let order = arena.intern(
             ScalarNode::Cast {
+                array_failure_mode: None,
                 child: key,
                 target: DataType::Decimal128(9, 0),
                 decimal_overflow_policy: ReportError,

@@ -25,9 +25,8 @@
 -- query 1
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.row_util_base (
-  k1 BIGINT NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+  k1 BIGINT
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.row_util_base SELECT generate_series FROM TABLE(generate_series(0, 100 - 1));
 INSERT INTO ${case_db}.row_util_base SELECT * FROM ${case_db}.row_util_base;
@@ -36,18 +35,16 @@ INSERT INTO ${case_db}.row_util_base SELECT * FROM ${case_db}.row_util_base;
 INSERT INTO ${case_db}.row_util_base SELECT * FROM ${case_db}.row_util_base;
 
 CREATE TABLE ${case_db}.row_util (
-  idx BIGINT NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+  idx BIGINT
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.row_util SELECT row_number() over() AS idx FROM ${case_db}.row_util_base;
 
 CREATE TABLE ${case_db}.t1 (
-  idx BIGINT NULL,
-  c1  BIGINT NULL,
-  c2  BIGINT NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+  idx BIGINT ,
+  c1  BIGINT ,
+  c2  BIGINT
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t1 SELECT idx, 1, 1 FROM ${case_db}.row_util;
 INSERT INTO ${case_db}.t1 SELECT idx, 2, 2 FROM ${case_db}.row_util WHERE idx < 1600 - 10;
@@ -58,16 +55,19 @@ INSERT INTO ${case_db}.t1 SELECT idx, 6, 6 FROM ${case_db}.row_util WHERE idx < 
 INSERT INTO ${case_db}.t1 SELECT idx, idx, idx FROM ${case_db}.row_util WHERE idx > 4;
 
 -- @skip_result_check=true
-ANALYZE TABLE ${case_db}.t1;
+ANALYZE ${case_db}.t1;
 
-set pipeline_dop = 8;
-set global_runtime_filter_wait_timeout = 10000;
-set runtime_filter_scan_wait_time = 10000;
-set global_runtime_filter_build_max_size = 3201;
+SET SESSION pipeline_dop = 8;
+SET SESSION global_runtime_filter_wait_timeout = 10000;
+SET SESSION runtime_filter_scan_wait_time = 10000;
+SET SESSION global_runtime_filter_build_max_size = 3201;
 
 -- query 2
-select count(1) from ${case_db}.t1 left semi join  ${case_db}.t1 t2 on t1.c1 = t2.c1 and t2.c2 < 10;
+select count(1) from ${case_db}.t1
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 t2 WHERE t1.c1 = t2.c1 and t2.c2 < 10);
 -- query 3
-select count(1) from ${case_db}.t1 left semi join  ${case_db}.t1 t2 on t1.c1 = t2.c1 and t2.c2 < 10;
+select count(1) from ${case_db}.t1
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 t2 WHERE t1.c1 = t2.c1 and t2.c2 < 10);
 -- query 4
-select count(1) from ${case_db}.t1 left semi join  ${case_db}.t1 t2 on t1.c1 = t2.c1 and t2.c2 < 10;
+select count(1) from ${case_db}.t1
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 t2 WHERE t1.c1 = t2.c1 and t2.c2 < 10);

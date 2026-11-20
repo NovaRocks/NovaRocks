@@ -584,6 +584,21 @@ impl MetadataIoAdmission {
         )
     }
 
+    pub(crate) fn for_profiled_probe(
+        owner: &WorkOwner,
+        profile: ConnectorMetadataMaintenanceIoProfile,
+        mut read_dependencies: Vec<SharedDependency>,
+    ) -> Result<Arc<Self>, WorkError> {
+        read_dependencies.push(SharedDependency::LocalHost);
+        extend_original_dependencies(&mut read_dependencies, profile.initial_dependencies());
+        Self::from_original_facts(
+            owner.scope(),
+            read_dependencies,
+            profile.geometry().metadata_bytes().get(),
+            profile.initial_owned_bytes(),
+        )
+    }
+
     /// Borrow the original Root owner and the selected Provider's actual
     /// dependencies. SDK geometry and future commit concurrency are not an
     /// authority for this metadata Source's preparation or I/O.
@@ -758,6 +773,18 @@ impl MetadataIoAdmission {
         }
         None
     }
+    pub(crate) fn check_original_positive_owner(&self, owner: &WorkOwner) -> Result<(), WorkError> {
+        let original = self.loan_body().ok_or(WorkError::Conflict)?;
+        let body = original.body.as_ref().ok_or(WorkError::Released)?;
+        if !owner.is_for_scope(&body.root) {
+            return Err(WorkError::ForeignAuthority);
+        }
+        if !body.first_ready || body.payload.is_none() {
+            return Err(WorkError::NotReady);
+        }
+        Ok(())
+    }
+
     fn loan_body(&self) -> Option<Loan<'_, Body>> {
         self.try_loan_body().ok()
     }

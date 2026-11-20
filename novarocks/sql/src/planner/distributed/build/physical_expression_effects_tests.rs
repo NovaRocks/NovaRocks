@@ -337,6 +337,7 @@ fn cast(
         ty(DataType::Timestamp(target, None), nullable),
         ExprKind::Cast {
             expr: child,
+            array_failure_mode: None,
             target: DataType::Timestamp(target, None),
             decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
             allow_throw_exception: allow_ref(),

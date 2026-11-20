@@ -64,6 +64,7 @@ fn recipe(dtype: DataType, allow: bool) -> PreparedCastRecipe {
         &FunctionValueType::new(DataType::Time64(TimeUnit::Microsecond), true),
         DecimalOverflowPolicy::ReportError,
         allow,
+        None,
         &Control::default(),
     )
     .unwrap()
@@ -158,6 +159,7 @@ fn text_time_kernel_original_parser_full_domain_keeps_distinct_carriers_and_type
                 &target,
                 DecimalOverflowPolicy::OutputNull,
                 false,
+                None,
                 &Control::default()
             )
             .is_err()
@@ -366,6 +368,7 @@ fn calendar_time_exact_successful_null_fact_retains_nonnullable_date_and_nano_do
                 &FunctionValueType::new(DataType::Time64(TimeUnit::Microsecond), false),
                 DecimalOverflowPolicy::ReportError,
                 false,
+                None,
                 &Control::default()
             )
             .is_ok()
@@ -389,6 +392,7 @@ fn calendar_time_exact_successful_null_fact_retains_nonnullable_date_and_nano_do
                 &FunctionValueType::new(DataType::Time64(TimeUnit::Microsecond), false),
                 DecimalOverflowPolicy::ReportError,
                 false,
+                None,
                 &Control::default()
             ),
             Err(CastPrepareError::TypeMismatch)

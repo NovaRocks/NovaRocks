@@ -38,7 +38,6 @@ fn internal_target_column(kind: SqlMvInternalTargetColumn) -> TableColumnDef {
         name: facts.name,
         data_type: facts.data_type,
         nullable: facts.nullable,
-        aggregation: None,
         default: None,
     }
 }

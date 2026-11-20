@@ -678,9 +678,10 @@ async fn prepare_keyed_variant(
             ],
         )
         .unwrap();
-        let expected = crate::commit::write_stack::repartition::preview_managed_repartition(
+        let expected = crate::commit::write_stack::repartition::prepare_managed_repartition(
             metadata,
             &replacement,
+            &context(),
         )
         .unwrap()
         .committed()

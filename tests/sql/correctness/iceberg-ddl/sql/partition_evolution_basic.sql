@@ -18,28 +18,27 @@
 -- @order_sensitive=true
 -- Validate Iceberg bucket partition evolution query correctness and pruning explain text.
 -- query 1
-CREATE DATABASE iceberg_ddl_cat_${suite_uuid0}.iceberg_part_db_${uuid0};
+CREATE SCHEMA iceberg_ddl_cat_${suite_uuid0}.iceberg_part_db_${uuid0};
 USE iceberg_ddl_cat_${suite_uuid0}.iceberg_part_db_${uuid0};
 DROP TABLE IF EXISTS test_users_bucketed;
 CREATE TABLE test_users_bucketed (
   user_id BIGINT,
   country STRING,
   score DOUBLE
-)
-PARTITION BY bucket(user_id, 16);
+) WITH (partitioning = ARRAY['bucket(user_id, 16)']);
 INSERT INTO test_users_bucketed VALUES
-  (1, 'US', 1.0),
-  (2, 'US', 2.0),
-  (3, 'CN', 3.0),
-  (4, 'CN', 4.0),
-  (5, 'JP', 5.0);
-ALTER TABLE test_users_bucketed DROP PARTITION COLUMN bucket(user_id, 16);
-ALTER TABLE test_users_bucketed ADD PARTITION COLUMN bucket(user_id, 32);
+  ROW(1, 'US', 1.0),
+  ROW(2, 'US', 2.0),
+  ROW(3, 'CN', 3.0),
+  ROW(4, 'CN', 4.0),
+  ROW(5, 'JP', 5.0);
+ALTER TABLE test_users_bucketed SET PROPERTIES partitioning = ARRAY[];
+ALTER TABLE test_users_bucketed SET PROPERTIES partitioning = ARRAY['bucket(user_id, 32)'];
 INSERT INTO test_users_bucketed VALUES
-  (6, 'US', 6.0),
-  (7, 'CN', 7.0),
-  (16, 'US', 16.0),
-  (32, 'CN', 32.0);
+  ROW(6, 'US', 6.0),
+  ROW(7, 'CN', 7.0),
+  ROW(16, 'US', 16.0),
+  ROW(32, 'CN', 32.0);
 SELECT COUNT(*) AS cnt, SUM(score) AS sum_score
 FROM test_users_bucketed;
 
@@ -60,7 +59,7 @@ WHERE user_id IN (1, 2, 3, 4);
 -- @result_contains=min-max stats
 -- @result_contains=predicates: user_id IN (1, 2, 3, 4, 5, 6, 7, 16, 32)
 USE iceberg_ddl_cat_${suite_uuid0}.iceberg_part_db_${uuid0};
-EXPLAIN VERBOSE
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
 SELECT COUNT(*), SUM(score)
 FROM test_users_bucketed
 WHERE user_id IN (1, 2, 3, 4, 5, 6, 7, 16, 32);
@@ -69,9 +68,9 @@ WHERE user_id IN (1, 2, 3, 4, 5, 6, 7, 16, 32);
 -- @result_contains=min-max stats
 -- @result_contains=predicates: user_id IN (1, 2, 3, 4)
 USE iceberg_ddl_cat_${suite_uuid0}.iceberg_part_db_${uuid0};
-EXPLAIN VERBOSE
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
 SELECT COUNT(*), SUM(score)
 FROM test_users_bucketed
 WHERE user_id IN (1, 2, 3, 4);
-DROP TABLE iceberg_ddl_cat_${suite_uuid0}.iceberg_part_db_${uuid0}.test_users_bucketed FORCE;
-DROP DATABASE iceberg_ddl_cat_${suite_uuid0}.iceberg_part_db_${uuid0};
+DROP TABLE iceberg_ddl_cat_${suite_uuid0}.iceberg_part_db_${uuid0}.test_users_bucketed ;
+DROP SCHEMA iceberg_ddl_cat_${suite_uuid0}.iceberg_part_db_${uuid0};

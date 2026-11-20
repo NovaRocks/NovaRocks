@@ -23,6 +23,7 @@ use arrow::{
 };
 use novarocks_constant_contract::{ConstantError, ConstantPool};
 use novarocks_failure_contract::FailureProjection;
+use novarocks_parser::ast::AstBox;
 use novarocks_type_contract::DecimalOverflowPolicy;
 use std::sync::Mutex;
 
@@ -218,7 +219,8 @@ fn standalone_selected_cv_and_nullability_keep_actual_sources_and_every_control_
     }
     let cast = TypedExpr {
         kind: ExprKind::Cast {
-            expr: Box::new(text("not-an-integer")),
+            array_failure_mode: None,
+            expr: AstBox::new(text("not-an-integer")),
             target: DataType::Int64,
             decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
         },
@@ -227,7 +229,7 @@ fn standalone_selected_cv_and_nullability_keep_actual_sources_and_every_control_
     let negate = TypedExpr {
         kind: ExprKind::UnaryOp {
             op: UnOp::Negate,
-            expr: Box::new(TypedExpr {
+            expr: AstBox::new(TypedExpr {
                 kind: ExprKind::Literal(LiteralValue::Decimal("7".into())),
                 value_type: ValueType::new(DataType::Decimal128(2, 0), false),
             }),
@@ -394,15 +396,12 @@ fn standalone_runtime_dead_branch_still_admits_its_actual_static_call_source() {
     // A constant-false CASE branch is runtime-dead but remains reachable from
     // the original root. Do not invent an installed TypeOnly owner or an
     // unrooted definition, which the unit contract would independently reject.
-    let statements = novarocks_parser::parse(
-        "SELECT CASE WHEN FALSE THEN ARRAY_MAP(x -> LOWER(x), ['AA','BB']) ELSE NULL END AS mapped",
+    let query = novarocks_parser::parser::parse_query(
+        "SELECT CASE WHEN FALSE THEN ARRAY_MAP(x -> LOWER(x), ARRAY['AA','BB']) ELSE NULL END AS mapped",
     )
     .unwrap();
-    let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
-        panic!("one original scalar query")
-    };
     let (query, _, _) = crate::analyzer::analyze(
-        query,
+        &query,
         &crate::catalog::memory::PlannerMemoryCatalog::default(),
         "default",
     )

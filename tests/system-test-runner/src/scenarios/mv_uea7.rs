@@ -93,22 +93,21 @@ impl ManagedMvRestFixture {
         let endpoints = rest.endpoints().clone();
         let identity = rest.static_s3_identity();
         let create_catalog_sql = format!(
-            "CREATE EXTERNAL CATALOG {catalog} PROPERTIES(\
-             \"type\"=\"iceberg\",\
-             \"iceberg.catalog.type\"=\"rest\",\
-             \"uri\"=\"{}\",\
-             \"warehouse\"=\"{}\",\
-             \"credential.object-store-metadata.consumer-role\"=\"frontend\",\
-             \"credential.object-store-metadata.mode\"=\"static\",\
-             \"credential.object-store-metadata.name\"=\"{CREDENTIAL_NAME}\",\
-             \"credential.object-store-metadata.generation\"=\"{CREDENTIAL_GENERATION}\",\
-             \"credential.object-store-data.consumer-role\"=\"backend\",\
-             \"credential.object-store-data.mode\"=\"static\",\
-             \"credential.object-store-data.name\"=\"{CREDENTIAL_NAME}\",\
-             \"credential.object-store-data.generation\"=\"{CREDENTIAL_GENERATION}\",\
-             \"aws.s3.endpoint\"=\"{}\",\
-             \"aws.s3.region\"=\"us-east-1\",\
-             \"aws.s3.enable_path_style_access\"=\"true\")",
+            "CREATE CATALOG {catalog} USING iceberg WITH (\
+             \"iceberg.catalog.type\"='rest',\
+             \"uri\"='{}',\
+             \"warehouse\"='{}',\
+             \"credential.object-store-metadata.consumer-role\"='frontend',\
+             \"credential.object-store-metadata.mode\"='static',\
+             \"credential.object-store-metadata.name\"='{CREDENTIAL_NAME}',\
+             \"credential.object-store-metadata.generation\"='{CREDENTIAL_GENERATION}',\
+             \"credential.object-store-data.consumer-role\"='backend',\
+             \"credential.object-store-data.mode\"='static',\
+             \"credential.object-store-data.name\"='{CREDENTIAL_NAME}',\
+             \"credential.object-store-data.generation\"='{CREDENTIAL_GENERATION}',\
+             \"aws.s3.endpoint\"='{}',\
+             \"aws.s3.region\"='us-east-1',\
+             \"aws.s3.enable_path_style_access\"='true')",
             endpoints.rest_uri, endpoints.rest_warehouse, endpoints.minio_endpoint,
         );
         let mut child_environment = CrossProcessChildEnvironment::default();
@@ -254,14 +253,13 @@ impl Scenario for MvManagementReadmission {
             context,
             &mut conn,
             "create managed MV namespace",
-            "CREATE DATABASE uea7_mv_readmission.ns",
+            "CREATE SCHEMA uea7_mv_readmission.ns",
         )?;
         execute(
             context,
             &mut conn,
             "create row-lineage source table",
-            "CREATE TABLE uea7_mv_readmission.ns.orders (k1 INT, v2 BIGINT) \
-             TBLPROPERTIES (\"format-version\"=\"3\", \"write.row-lineage\"=\"true\")",
+            "CREATE TABLE uea7_mv_readmission.ns.orders (k1 INT, v2 BIGINT) WITH (format_version = 3)",
         )?;
         execute(
             context,
@@ -274,15 +272,13 @@ impl Scenario for MvManagementReadmission {
             context,
             &mut conn,
             "create document-managed Iceberg MV",
-            "CREATE MATERIALIZED VIEW orders_mv DISTRIBUTED BY HASH(k1) BUCKETS 1 \
-             REFRESH DEFERRED MANUAL PROPERTIES ('storage_engine' = 'iceberg') \
-             AS SELECT k1, SUM(v2) AS total FROM orders GROUP BY k1",
+            "CREATE MATERIALIZED VIEW orders_mv WITH (refresh_policy = 'MANUAL') AS SELECT k1, SUM(v2) AS total FROM orders GROUP BY k1",
         )?;
         execute(
             context,
             &mut conn,
             "publish first MV snapshot",
-            "REFRESH MATERIALIZED VIEW orders_mv WITH SYNC MODE",
+            "REFRESH MATERIALIZED VIEW orders_mv",
         )?;
         assert_rows(
             context,
@@ -326,7 +322,7 @@ impl Scenario for MvManagementReadmission {
         )?;
         select_catalog_and_namespace(context, &mut conn, "uea7_mv_readmission")?;
         context.action("verify refresh is refused before readmission");
-        let error = match conn.execute("REFRESH MATERIALIZED VIEW orders_mv WITH SYNC MODE") {
+        let error = match conn.execute("REFRESH MATERIALIZED VIEW orders_mv") {
             Err(error) => error,
             Ok(_) => bail!(
                 "closed management accepted refresh before readmission; {}",
@@ -384,11 +380,10 @@ impl Scenario for MvManagementReadmission {
             "insert source row after readmission",
             "INSERT INTO orders VALUES (1, 5)",
         )?;
-        execute(
+        full_refresh_orders(
             context,
             &mut conn,
             "publish an explicit full refresh after readmission",
-            "REFRESH MATERIALIZED VIEW orders_mv FULL WITH SYNC MODE",
         )?;
         assert_rows(
             context,
@@ -445,6 +440,44 @@ pub(super) fn execute(
     context.action(action);
     conn.execute(sql)
         .with_context(|| format!("{action}: {sql}"))
+        .map(|_| ())
+}
+
+pub(super) fn full_refresh_orders(
+    context: &mut ScenarioContext,
+    conn: &mut SqlSession,
+    action: &str,
+) -> Result<()> {
+    context.remaining(action)?;
+    context.action(action);
+    let catalog = conn
+        .session()
+        .catalog
+        .as_ref()
+        .context("FULL refresh has no selected catalog")?;
+    let name = format!("{catalog}.incremental_refresh_enabled");
+    let qualified = format!(
+        "\"{}\".incremental_refresh_enabled",
+        catalog.replace('"', "\"\"")
+    );
+    let restore = match conn.session().properties.get(&name) {
+        Some(value) => {
+            let prior = value
+                .parse::<bool>()
+                .context("existing refresh setting is not Boolean")?;
+            format!("SET SESSION {qualified} = {prior}")
+        }
+        None => format!("RESET SESSION {qualified}"),
+    };
+    conn.execute(format!("SET SESSION {qualified} = false"))
+        .context("disable incremental refresh for this System statement")?;
+    let refresh = conn.execute("REFRESH MATERIALIZED VIEW orders_mv");
+    let cleanup = conn
+        .execute(restore)
+        .map(|_| ())
+        .context("restore incremental refresh setting");
+    mv_response_with_cleanup(refresh, cleanup)?
+        .with_context(|| action.to_owned())
         .map(|_| ())
 }
 

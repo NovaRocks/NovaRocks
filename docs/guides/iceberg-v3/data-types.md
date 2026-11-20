@@ -86,11 +86,11 @@ Spec：V3 引入 `unknown` 类型作为字段值未确定时的占位（schema �
 ```sql
 CREATE TABLE t (
   id BIGINT,
-  profile STRUCT<
-    name: STRING,
-    tags: ARRAY<STRING>,
-    attrs: MAP<STRING, STRING>
-  >
+  profile ROW(
+    name VARCHAR,
+    tags ARRAY(VARCHAR),
+    attrs MAP(VARCHAR, VARCHAR)
+  )
 );
 ```
 

@@ -58,8 +58,7 @@ create table all_t0 (
     c22 char(100) NOT NULL,
     c23 float NOT NULL,
     c24 double NOT NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 3
 -- @skip_result_check=true
@@ -69,43 +68,43 @@ insert into all_t0 SELECT x%200, x%200, x%200, x%200, x%200, x, x, x%200, x, x, 
 -- query 4
 -- @skip_result_check=true
 USE ${case_db};
-insert into all_t0 values (null, null, null, null, null, null, null, null, null, null, null, null, -1,-2,-3,-4,-5, '2000-01-28', '2000-01-28', 'literal', 'literal', 'literal', -1, -1);
+insert into all_t0 values ROW(null, null, null, null, null, null, null, null, null, null, null, null, -1,-2,-3,-4,-5, '2000-01-28', '2000-01-28', 'literal', 'literal', 'literal', -1, -1);
 
 -- query 5
 -- @skip_result_check=true
 USE ${case_db};
-insert into all_t0 values (-1, -2, -3, null, null, null, null, null, null, null, null, null, -1,-2,-3,-4,-5, '2000-01-28', '2000-01-28', 'literal', 'literal', 'literal', -1, -1);
+insert into all_t0 values ROW(-1, -2, -3, null, null, null, null, null, null, null, null, null, -1,-2,-3,-4,-5, '2000-01-28', '2000-01-28', 'literal', 'literal', 'literal', -1, -1);
 
 -- query 6
 -- @skip_result_check=true
 USE ${case_db};
-set pipeline_dop=2;
+SET SESSION pipeline_dop = 2;
 
 -- query 7
 -- @skip_result_check=true
 USE ${case_db};
-set group_concat_max_len=65535;
+SET SESSION group_concat_max_len = 65535;
 
 -- query 8
 USE ${case_db};
 WITH result AS (
-    SELECT c1, c2, c3, COUNT(*) AS cnt FROM all_t0 GROUP BY c1, c2, c3 ORDER BY c1, c2, c3 LIMIT 100
-) SELECT 'Test Case 39' AS test_name, MD5(GROUP_CONCAT(CAST(c1 AS STRING) || ':' || CAST(c2 AS STRING) || ':' || CAST(c3 AS STRING) || ':' || CAST(cnt AS STRING))) AS result_hash FROM result;
+    SELECT c1, c2, c3, COUNT() AS cnt FROM all_t0 GROUP BY c1, c2, c3 ORDER BY c1, c2, c3 LIMIT 100
+) SELECT 'Test Case 39' AS test_name, MD5(GROUP_CONCAT(CAST(CAST(c1 AS STRING) AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR CAST(CAST(c2 AS STRING) AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR CAST(CAST(c3 AS STRING) AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR CAST(CAST(cnt AS STRING) AS BOOLEAN))) AS result_hash FROM result;
 
 -- query 9
 USE ${case_db};
 WITH result AS (
-    SELECT c6, c7, c8, COUNT(*) AS cnt FROM all_t0 GROUP BY c6, c7, c8 ORDER BY c6, c7, c8 LIMIT 100
-) SELECT 'Test Case 40' AS test_name, MD5(GROUP_CONCAT(CAST(c6 AS STRING) || ':' || CAST(c7 AS STRING) || ':' || c8 || ':' || CAST(cnt AS STRING))) AS result_hash FROM result;
+    SELECT c6, c7, c8, COUNT() AS cnt FROM all_t0 GROUP BY c6, c7, c8 ORDER BY c6, c7, c8 LIMIT 100
+) SELECT 'Test Case 40' AS test_name, MD5(GROUP_CONCAT(CAST(CAST(c6 AS STRING) AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR CAST(CAST(c7 AS STRING) AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR CAST(c8 AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR CAST(CAST(cnt AS STRING) AS BOOLEAN))) AS result_hash FROM result;
 
 -- query 10
 USE ${case_db};
 WITH result AS (
-    SELECT c13, c14, c15, COUNT(*) AS cnt FROM all_t0 GROUP BY c13, c14, c15 ORDER BY c13, c14, c15 LIMIT 100
-) SELECT 'Test Case 42' AS test_name, MD5(GROUP_CONCAT(CAST(c13 AS STRING) || ':' || CAST(c14 AS STRING) || ':' || CAST(c15 AS STRING) || ':' || CAST(cnt AS STRING))) AS result_hash FROM result;
+    SELECT c13, c14, c15, COUNT() AS cnt FROM all_t0 GROUP BY c13, c14, c15 ORDER BY c13, c14, c15 LIMIT 100
+) SELECT 'Test Case 42' AS test_name, MD5(GROUP_CONCAT(CAST(CAST(c13 AS STRING) AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR CAST(CAST(c14 AS STRING) AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR CAST(CAST(c15 AS STRING) AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR CAST(CAST(cnt AS STRING) AS BOOLEAN))) AS result_hash FROM result;
 
 -- query 11
 USE ${case_db};
 WITH result AS (
-    SELECT c9, COUNT(*) AS cnt FROM all_t0 GROUP BY c9 ORDER BY c9 LIMIT 100
-) SELECT 'Test Case 51' AS test_name, MD5(GROUP_CONCAT(c9 || ':' || CAST(cnt AS STRING))) AS result_hash FROM result;
+    SELECT c9, COUNT() AS cnt FROM all_t0 GROUP BY c9 ORDER BY c9 LIMIT 100
+) SELECT 'Test Case 51' AS test_name, MD5(GROUP_CONCAT(CAST(c9 AS BOOLEAN) OR CAST(':' AS BOOLEAN) OR CAST(CAST(cnt AS STRING) AS BOOLEAN))) AS result_hash FROM result;

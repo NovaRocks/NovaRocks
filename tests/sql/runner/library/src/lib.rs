@@ -46,10 +46,16 @@ mod results_record;
 mod runner;
 mod session;
 mod shell;
+mod source_map;
 mod sql_error_codes;
 mod statement_controls;
 mod suite_manifest;
 mod types;
+
+pub use parser::{CaseSourceDefinition, CaseSourceStep, extract_case_source_definition};
+pub use types::QueryMeta;
+
+pub use session::split_trino_sql_statements;
 
 #[path = "../../../../../novarocks/types/src/engine_error_codes.rs"]
 mod engine_error_codes;
@@ -228,10 +234,11 @@ fn expected_error_location_result(
 fn expected_error_expectation_label(meta: &QueryMeta) -> String {
     let mut labels = Vec::new();
     if let Some(expected) = &meta.expect_trino_error {
-        labels.push(format!(
-            "trino_error={},{}",
-            expected.name, expected.error_type
-        ));
+        let mut label = format!("trino_error={},{}", expected.name, expected.error_type);
+        if let Some(ordinal) = expected.statement_ordinal {
+            label.push_str(&format!(",{ordinal}"));
+        }
+        labels.push(label);
     }
     if let Some(code) = meta.expect_error_code.as_deref() {
         labels.push(format!("engine_error_code={code}"));
@@ -260,19 +267,31 @@ fn evaluate_expected_error_outcome(
     outcome: Option<&SqlExecutionOutcome>,
 ) -> Option<Result<(), String>> {
     if let Some(expected) = &meta.expect_trino_error {
+        let count = expected.statement_count();
         let actual = outcome.and_then(|outcome| {
             if ok || outcome.0 || outcome.3.len() != 1 {
                 return None;
             }
             let attempt = &outcome.3[0];
-            if attempt.statement_count != 1
-                || attempt.statements.len() != 1
+            if attempt.statement_count != count
+                || attempt.statements.len() != count
                 || !attempt.local_failures.is_empty()
             {
                 return None;
             }
-            let statement = &attempt.statements[0];
-            if statement.ordinal != 0 || !statement.submission_started || !statement.completed {
+            let (statement, prior) = attempt.statements.split_last()?;
+            if prior.iter().enumerate().any(|(index, statement)| {
+                statement.ordinal != index
+                    || !statement.submission_started
+                    || !statement.completed
+                    || !statement.failures.is_empty()
+            }) {
+                return None;
+            }
+            if statement.ordinal != prior.len()
+                || !statement.submission_started
+                || !statement.completed
+            {
                 return None;
             }
             match statement.failures.as_slice() {
@@ -291,11 +310,11 @@ fn evaluate_expected_error_outcome(
                 Ok(())
             }
             Some(error) => Err(format!(
-                "expected Trino error {},{}, got {},{}: {}",
+                "expected Trino error {},{} at statement {count}, got {},{}: {}",
                 expected.name, expected.error_type, error.error_name, error.error_type, err_msg
             )),
             None => Err(format!(
-                "expected one actual Trino statement error {},{}, got success, multiple outcomes, or an infrastructure/local failure: {}",
+                "expected Trino error {},{} at statement {count} after successful preceding statements: {}",
                 expected.name, expected.error_type, err_msg
             )),
         });
@@ -976,21 +995,17 @@ fn run_imv_equivalence_check(
     let schema = db
         .filter(|value| !value.is_empty())
         .map(|value| {
-            let statements = novarocks_parser::parse(&format!("USE {value}")).map_err(|error| {
-                format!("@imv_equivalence_check: invalid database context: {error}")
-            })?;
-            let [
-                novarocks_parser::ast::Statement::Session(
-                    novarocks_parser::ast::SessionStatement::Use(context),
-                ),
-            ] = statements.as_slice()
-            else {
+            let statement = novarocks_parser::parser::parse_statement(&format!("USE {value}"))
+                .map_err(|error| {
+                    format!("@imv_equivalence_check: invalid database context: {error}")
+                })?;
+            let novarocks_parser::ast::TrinoStatement::Use(context) = statement else {
                 return Err(
                     "@imv_equivalence_check: database context must be one USE namespace"
                         .to_string(),
                 );
             };
-            Ok(context.database.value.clone())
+            Ok(context.schema.value)
         })
         .transpose()?;
     let matched: Vec<&Vec<String>> = show_result
@@ -1143,7 +1158,7 @@ fn run_imv_stateless_rebuild_check(
 
     let catalog = directive.catalog.as_deref().unwrap_or("ice");
     let call = format!(
-        "CALL {catalog}.system.novarocks_imv_stateless_rebuild(table => '{fqn}', level => '{}')",
+        "CALL {catalog}.system.novarocks_imv_stateless_rebuild(\"table\" => '{fqn}', level => '{}')",
         directive.level.as_sql()
     );
     let _ = writeln!(log, "    @imv_stateless_rebuild: {call}");
@@ -1185,39 +1200,49 @@ fn run_imv_stateless_rebuild_check(
 // @explain_* helpers
 // ---------------------------------------------------------------------------
 
-/// If `sql` begins with an EXPLAIN prefix, strip it so the runner can
-/// wrap `EXPLAIN VERBOSE` around the underlying query body. Handles
-/// `EXPLAIN [VERBOSE|COSTS|ANALYZE]` case-insensitively.
+/// Resolve the actual source child of a query or refresh EXPLAIN.
 fn explain_contains_target_body(sql: &str) -> String {
-    let trimmed = sql.trim_start();
-    let lower = trimmed.to_ascii_lowercase();
-    for prefix in [
-        "explain verbose ",
-        "explain costs ",
-        "explain analyze ",
-        "explain ",
-    ] {
-        if lower.starts_with(prefix) {
-            return trimmed[prefix.len()..].trim_start().to_string();
+    use novarocks_parser::ast::TrinoStatement;
+    let Ok(frames) = novarocks_parser::parser::frame_statements(sql) else {
+        return String::new();
+    };
+    let [frame] = frames.as_slice() else {
+        return String::new();
+    };
+    let source = &sql[frame.source.start()..frame.source.end()];
+    let Ok(statement) = novarocks_parser::parser::parse_statement(source) else {
+        return String::new();
+    };
+    let target = match &statement {
+        TrinoStatement::Explain(value) => value.statement.as_ref(),
+        TrinoStatement::ExplainAnalyze(value) => value.statement.as_ref(),
+        _ => &statement,
+    };
+    let span = target.span();
+    let mut body = source[span.start()..span.end()].to_owned();
+    if let TrinoStatement::Query(query) = target {
+        // A query-local detail wins over the temporary request header.
+        // Retain all other local overrides and their exact source spans.
+        for property in query.session_properties.iter().rev() {
+            if matches!(property.name.parts.as_slice(), [name] if name.value.eq_ignore_ascii_case("explain_detail"))
+            {
+                let value = property.value.span();
+                body.replace_range(
+                    value.start() - span.start()..value.end() - span.start(),
+                    "'VERBOSE'",
+                );
+            }
         }
     }
-    trimmed.to_string()
+    body
 }
 
-/// Cheap leading-keyword sniff: SELECT/WITH and REFRESH MATERIALIZED VIEW
-/// bodies are valid EXPLAIN targets. Other DDL and DML are explicitly
-/// rejected for @explain_* directives.
 fn is_select_or_with(body: &str) -> bool {
-    let head = body
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    if head == "select" || head == "with" {
-        return true;
-    }
-    let lower = body.trim_start().to_ascii_lowercase();
-    lower.starts_with("refresh materialized view ")
+    use novarocks_parser::ast::TrinoStatement;
+    matches!(
+        novarocks_parser::parser::parse_statement(body),
+        Ok(TrinoStatement::Query(_) | TrinoStatement::RefreshMaterializedView(_))
+    )
 }
 
 fn explain_matching_lines(explain_text: &str, needle: &str) -> Vec<String> {
@@ -1229,7 +1254,7 @@ fn explain_matching_lines(explain_text: &str, needle: &str) -> Vec<String> {
 }
 
 /// Run the `@explain_contains` and `@explain_not_contains` assertions for a
-/// step: issue `EXPLAIN VERBOSE` on the step's SQL body and assert each
+/// step: issue EXPLAIN in VERBOSE mode on the step's SQL body and assert each
 /// required/forbidden substring.
 /// Returns `Ok(())` if all assertions pass, or `Err(message)` on the first failure.
 fn run_explain_directive_checks(
@@ -1246,9 +1271,9 @@ fn run_explain_directive_checks(
             body.split_whitespace().next().unwrap_or("(empty)")
         ));
     }
-    let explain_sql = format!("EXPLAIN VERBOSE {}", body);
+    let explain_sql = format!("EXPLAIN {body}");
     let _ = writeln!(log, "    @explain directives: running EXPLAIN VERBOSE");
-    let outcome = session.execute_query(query_timeout, &explain_sql, None);
+    let outcome = session.execute_verbose_explain(query_timeout, &explain_sql);
     let (ok, exec, msg) = outcome.into_summary();
     if !ok {
         return Err(format!(
@@ -1640,6 +1665,7 @@ fn execute_target_query_with_selected_control(
                 query_timeout,
                 sql,
                 db,
+                meta.expect_trino_error.as_ref(),
                 !fault_injection::has_client_query_cancellation(meta)
                     && meta.expect_trino_error.is_none(),
                 |transient, statement_index, client_query_id, submitted, _cancel| {
@@ -5759,7 +5785,7 @@ fn restart_frontend_after_step(
     let catalog = wipe.catalog.as_deref().unwrap_or("ice");
     let fqn = wipe.mv.as_str();
     let call = format!(
-        "CALL {catalog}.system.novarocks_imv_stateless_rebuild(table => '{fqn}', level => 'wipe')"
+        "CALL {catalog}.system.novarocks_imv_stateless_rebuild(\"table\" => '{fqn}', level => 'wipe')"
     );
     let _ = writeln!(log, "    @imv_accelerator_wipe_restart: {call}");
     let result = execute_required_query(session, 60, &call)
@@ -6726,12 +6752,13 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
                     }
                     continue;
                 }
-                match parser::load_sql_case_from_file(
+                let loaded = parser::load_sql_case_from_file(
                     &sql_file,
                     &meta_re,
                     &marker_re,
                     &placeholder_vars,
-                ) {
+                );
+                match loaded {
                     Ok(Some(case)) => cases.push(case),
                     Ok(None) => {
                         load_failures.push(CaseLoadFailure {
@@ -8127,7 +8154,7 @@ mod tests {
             "  update t set v = 1",
             "-- a comment\nMERGE INTO t USING s ON t.id = s.id",
             "-- one\n-- two\nINSERT INTO t VALUES (1)",
-            "ALTER TABLE t ADD EQUALITY DELETE (id) VALUES (1)",
+            "ALTER TABLE t EXECUTE add_equality_delete(columns => ARRAY['id'], rows => ARRAY[ROW(1)])",
         ] {
             assert!(
                 statement_starts_dml_operation(sql),
@@ -8880,22 +8907,22 @@ mod tests {
             "--suite",
             "ssb",
             "--target-session-sql",
-            "SET first = true",
+            "SET SESSION first = true",
             "--target-session-sql",
-            "SET second = false",
+            "SET SESSION second = false",
         ]);
 
         assert_eq!(
             cli.target_session_sql,
-            ["SET first = true", "SET second = false"]
+            ["SET SESSION first = true", "SET SESSION second = false"]
         );
     }
 
     #[test]
     fn target_session_sql_failure_prevents_case_step() {
         let statements = vec![
-            "SET first = true".to_string(),
-            "SET rejected = true".to_string(),
+            "SET SESSION first = true".to_string(),
+            "SET SESSION rejected = true".to_string(),
         ];
         let mut events = Vec::new();
 
@@ -8915,11 +8942,14 @@ mod tests {
         assert_eq!(
             setup,
             Err(
-                "target session SQL failed for \"SET rejected = true\": session override rejected"
+                "target session SQL failed for \"SET SESSION rejected = true\": session override rejected"
                     .to_string()
             )
         );
-        assert_eq!(events, ["SET first = true", "SET rejected = true"]);
+        assert_eq!(
+            events,
+            ["SET SESSION first = true", "SET SESSION rejected = true"]
+        );
         assert!(!events.iter().any(|event| event == "CASE STEP"));
     }
 
@@ -10023,15 +10053,17 @@ access_key_secret = "admin123"
     fn explain_contains_target_body_strips_explain_prefix() {
         assert_eq!(crate::explain_contains_target_body("SELECT 1"), "SELECT 1");
         assert_eq!(
-            crate::explain_contains_target_body("EXPLAIN VERBOSE SELECT 1"),
-            "SELECT 1"
+            crate::explain_contains_target_body(
+                "EXPLAIN WITH SESSION explain_detail='COSTS' SELECT 1"
+            ),
+            "WITH SESSION explain_detail='VERBOSE' SELECT 1"
         );
         assert_eq!(
             crate::explain_contains_target_body("explain analyze select 2"),
             "select 2"
         );
         assert_eq!(
-            crate::explain_contains_target_body("EXPLAIN COSTS SELECT 3"),
+            crate::explain_contains_target_body("EXPLAIN (TYPE DISTRIBUTED) SELECT 3"),
             "SELECT 3"
         );
         assert_eq!(

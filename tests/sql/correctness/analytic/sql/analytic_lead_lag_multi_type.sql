@@ -32,13 +32,12 @@ CREATE TABLE ${case_db}.t_ll_types (
   c4 FLOAT,
   c5 DECIMAL128(38, 20) NOT NULL,
   c6 DATE NOT NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t_ll_types VALUES
-  (1, 1, 'a', 'b', 1.23, 3.33, '2021-11-11'),
-  (2, 600000, 'aa', 'bb', 2.23, 4.33, '2022-12-11'),
-  (3, 400000, 'aaa', 'bbb', 3.23, 5.33, '2022-06-11');
+  ROW(1, 1, 'a', 'b', 1.23, 3.33, '2021-11-11'),
+  ROW(2, 600000, 'aa', 'bb', 2.23, 4.33, '2022-12-11'),
+  ROW(3, 400000, 'aaa', 'bbb', 3.23, 5.33, '2022-06-11');
 
 -- query 2
 -- INT: implicit null default (offset 5 > 3 rows, so all rows fall back to NULL)

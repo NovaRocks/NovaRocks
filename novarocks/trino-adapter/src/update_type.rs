@@ -30,7 +30,8 @@ pub(crate) fn update_type(kind: StatementKind) -> Option<&'static str> {
         | ShowStats
         | ShowCreateTable
         | ExplainMaterializedViewRefresh
-        | ShowCreateView => return None,
+        | ShowCreateView
+        | ShowCreateMaterializedView => return None,
         Analyze => "ANALYZE",
         CreateCatalog => "CREATE CATALOG",
         DropCatalog => "DROP CATALOG",
@@ -59,6 +60,7 @@ pub(crate) fn update_type(kind: StatementKind) -> Option<&'static str> {
         Update => "UPDATE",
         Merge => "MERGE",
         SetSession => "SET SESSION",
+        ResetSession => "RESET SESSION",
         Use => "USE",
         BeginTransaction => "START TRANSACTION",
         Commit => "COMMIT",

@@ -22,33 +22,16 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE EXTERNAL CATALOG trc_views_${uuid0}
-PROPERTIES (
-    "type"="iceberg",
-    "iceberg.catalog.type"="rest",
-    "uri"="${iceberg_rest_uri}",
-    "warehouse"="${iceberg_rest_warehouse}",
-    "credential.object-store-metadata.consumer-role" = "frontend",
-    "credential.object-store-metadata.mode" = "${iceberg_object_store_credential_mode}",
-    "credential.object-store-metadata.name" = "${iceberg_object_store_metadata_credential_name}",
-    "credential.object-store-metadata.generation" = "${iceberg_object_store_credential_generation}",
-    "credential.object-store-data.consumer-role" = "backend",
-    "credential.object-store-data.mode" = "${iceberg_object_store_credential_mode}",
-    "credential.object-store-data.name" = "${iceberg_object_store_data_credential_name}",
-    "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
-    "aws.s3.endpoint"="${oss_endpoint}",
-    "aws.s3.region"="${oss_region}",
-    "aws.s3.enable_path_style_access"="${oss_path_style}"
-);
+CREATE CATALOG trc_views_${uuid0} USING iceberg WITH ("iceberg.catalog.type" = 'rest', "uri" = '${iceberg_rest_uri}', "warehouse" = '${iceberg_rest_warehouse}', "credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-metadata.name" = '${iceberg_object_store_metadata_credential_name}', "credential.object-store-metadata.generation" = '${iceberg_object_store_credential_generation}', "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-data.name" = '${iceberg_object_store_data_credential_name}', "credential.object-store-data.generation" = '${iceberg_object_store_credential_generation}', "aws.s3.endpoint" = '${oss_endpoint}', "aws.s3.region" = '${oss_region}', "aws.s3.enable_path_style_access" = '${oss_path_style}');
 
-CREATE DATABASE trc_views_${uuid0}.views_${uuid0};
+CREATE SCHEMA trc_views_${uuid0}.views_${uuid0};
 USE trc_views_${uuid0}.views_${uuid0};
 
 -- query 2
 CREATE TABLE trc_views_${uuid0}.views_${uuid0}.header_source (a integer, b integer);
 
 -- query 3
-INSERT INTO trc_views_${uuid0}.views_${uuid0}.header_source VALUES (1, 2);
+INSERT INTO trc_views_${uuid0}.views_${uuid0}.header_source VALUES ROW(1, 2);
 
 -- query 4
 CREATE VIEW trc_views_${uuid0}.views_${uuid0}.header_view AS SELECT * FROM trc_views_${uuid0}.views_${uuid0}.header_source;
@@ -63,7 +46,7 @@ DROP TABLE trc_views_${uuid0}.views_${uuid0}.header_source;
 CREATE TABLE trc_views_${uuid0}.views_${uuid0}.header_source (b integer, c integer);
 
 -- query 8
-INSERT INTO trc_views_${uuid0}.views_${uuid0}.header_source VALUES (20, 30);
+INSERT INTO trc_views_${uuid0}.views_${uuid0}.header_source VALUES ROW(20, 30);
 
 -- query 9
 -- @expect_trino_error=VIEW_IS_STALE,USER_ERROR
@@ -84,7 +67,7 @@ SELECT * FROM trc_views_${uuid0}.views_${uuid0}.header_view;
 CREATE TABLE trc_views_${uuid0}.views_${uuid0}.type_source (a bigint);
 
 -- query 14
-INSERT INTO trc_views_${uuid0}.views_${uuid0}.type_source VALUES (CAST(1 AS integer));
+INSERT INTO trc_views_${uuid0}.views_${uuid0}.type_source VALUES ROW(CAST(1 AS integer));
 
 -- query 15
 CREATE VIEW trc_views_${uuid0}.views_${uuid0}.type_bigint AS SELECT * FROM trc_views_${uuid0}.views_${uuid0}.type_source;
@@ -96,7 +79,7 @@ DROP TABLE trc_views_${uuid0}.views_${uuid0}.type_source;
 CREATE TABLE trc_views_${uuid0}.views_${uuid0}.type_source (a integer);
 
 -- query 18
-INSERT INTO trc_views_${uuid0}.views_${uuid0}.type_source VALUES (2);
+INSERT INTO trc_views_${uuid0}.views_${uuid0}.type_source VALUES ROW(2);
 
 -- query 19
 SELECT * FROM trc_views_${uuid0}.views_${uuid0}.type_bigint;
@@ -111,7 +94,7 @@ DROP TABLE trc_views_${uuid0}.views_${uuid0}.type_source;
 CREATE TABLE trc_views_${uuid0}.views_${uuid0}.type_source (a bigint);
 
 -- query 23
-INSERT INTO trc_views_${uuid0}.views_${uuid0}.type_source VALUES (3);
+INSERT INTO trc_views_${uuid0}.views_${uuid0}.type_source VALUES ROW(3);
 
 -- query 24
 DROP TABLE trc_views_${uuid0}.views_${uuid0}.type_source;
@@ -120,7 +103,7 @@ DROP TABLE trc_views_${uuid0}.views_${uuid0}.type_source;
 CREATE TABLE trc_views_${uuid0}.views_${uuid0}.type_source (a varchar);
 
 -- query 26
-INSERT INTO trc_views_${uuid0}.views_${uuid0}.type_source VALUES ('4');
+INSERT INTO trc_views_${uuid0}.views_${uuid0}.type_source VALUES ROW('4');
 
 -- query 27
 -- @expect_trino_error=VIEW_IS_STALE,USER_ERROR
@@ -176,10 +159,10 @@ SELECT * FROM trc_views_${uuid0}.views_${uuid0}.depth_7;
 
 -- query 43
 -- @expect_trino_error=MISSING_COLUMN_NAME,USER_ERROR
-CREATE VIEW trc_views_${uuid0}.views_${uuid0}.values_body AS VALUES (CAST(1 AS integer));
+CREATE VIEW trc_views_${uuid0}.views_${uuid0}.values_body AS VALUES ROW(CAST(1 AS integer));
 
 -- query 44
-CREATE VIEW trc_views_${uuid0}.views_${uuid0}.values_body AS SELECT * FROM (VALUES (CAST(1 AS integer))) AS t (a);
+CREATE VIEW trc_views_${uuid0}.views_${uuid0}.values_body AS SELECT * FROM (VALUES ROW(CAST(1 AS integer))) AS t (a);
 
 -- query 45
 SELECT * FROM trc_views_${uuid0}.views_${uuid0}.values_body;
@@ -194,7 +177,7 @@ SELECT * FROM trc_views_${uuid0}.views_${uuid0}.set_body ORDER BY a;
 CREATE TABLE trc_views_${uuid0}.views_${uuid0}.local_header_source (a integer, b integer);
 
 -- query 49
-INSERT INTO trc_views_${uuid0}.views_${uuid0}.local_header_source VALUES (1, 2);
+INSERT INTO trc_views_${uuid0}.views_${uuid0}.local_header_source VALUES ROW(1, 2);
 
 -- query 50
 CREATE VIEW default_catalog.default.trc_local_header_${uuid0} AS SELECT * FROM trc_views_${uuid0}.views_${uuid0}.local_header_source;
@@ -209,7 +192,7 @@ DROP TABLE trc_views_${uuid0}.views_${uuid0}.local_header_source;
 CREATE TABLE trc_views_${uuid0}.views_${uuid0}.local_header_source (b integer, c integer);
 
 -- query 54
-INSERT INTO trc_views_${uuid0}.views_${uuid0}.local_header_source VALUES (20, 30);
+INSERT INTO trc_views_${uuid0}.views_${uuid0}.local_header_source VALUES ROW(20, 30);
 
 -- query 55
 -- @expect_trino_error=VIEW_IS_STALE,USER_ERROR
@@ -228,8 +211,8 @@ SELECT * FROM default_catalog.default.trc_local_header_${uuid0};
 
 -- query 59
 -- @skip_result_check=true
-CREATE DATABASE trc_views_${uuid0}.saved_${uuid0};
-CREATE DATABASE trc_views_${uuid0}.caller_${uuid0};
+CREATE SCHEMA trc_views_${uuid0}.saved_${uuid0};
+CREATE SCHEMA trc_views_${uuid0}.caller_${uuid0};
 
 -- query 60
 CREATE TABLE trc_views_${uuid0}.saved_${uuid0}.context_source AS SELECT CAST(11 AS integer) AS v;
@@ -255,7 +238,7 @@ USE caller_${uuid0};
 SELECT * FROM trc_views_${uuid0}.saved_${uuid0}.context_view;
 
 -- query 67
-WITH context_source(v) AS (VALUES (CAST(99 AS integer))) SELECT * FROM trc_views_${uuid0}.saved_${uuid0}.context_view;
+WITH context_source(v) AS (VALUES ROW(CAST(99 AS integer))) SELECT * FROM trc_views_${uuid0}.saved_${uuid0}.context_view;
 
 -- query 68
 SELECT * FROM trc_views_${uuid0}.saved_${uuid0}.context_exists;
@@ -278,7 +261,7 @@ USE caller_${uuid0};
 SELECT * FROM default_catalog.default.trc_local_context_${uuid0};
 
 -- query 74
-WITH context_source(v) AS (VALUES (CAST(99 AS integer))) SELECT * FROM default_catalog.default.trc_local_context_${uuid0};
+WITH context_source(v) AS (VALUES ROW(CAST(99 AS integer))) SELECT * FROM default_catalog.default.trc_local_context_${uuid0};
 
 -- query 75
 SELECT * FROM default_catalog.default.trc_local_exists_${uuid0};
@@ -316,13 +299,13 @@ DROP TABLE IF EXISTS trc_views_${uuid0}.views_${uuid0}.type_source;
 DROP TABLE IF EXISTS trc_views_${uuid0}.views_${uuid0}.local_header_source;
 DROP TABLE IF EXISTS trc_views_${uuid0}.saved_${uuid0}.context_source;
 DROP TABLE IF EXISTS trc_views_${uuid0}.caller_${uuid0}.context_source;
-DROP DATABASE IF EXISTS trc_views_${uuid0}.saved_${uuid0};
-DROP DATABASE IF EXISTS trc_views_${uuid0}.caller_${uuid0};
+DROP SCHEMA IF EXISTS trc_views_${uuid0}.saved_${uuid0};
+DROP SCHEMA IF EXISTS trc_views_${uuid0}.caller_${uuid0};
 
 -- query 78
 -- @cleanup=true
 -- @skip_result_check=true
 
 USE iceberg_ddl_cat_${suite_uuid0}.${case_db};
-DROP DATABASE IF EXISTS trc_views_${uuid0}.views_${uuid0};
+DROP SCHEMA IF EXISTS trc_views_${uuid0}.views_${uuid0};
 DROP CATALOG trc_views_${uuid0};

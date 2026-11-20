@@ -1359,6 +1359,7 @@ mod is_known_rule_name_tests {
     ) -> crate::optimizer::scalar::ScalarId {
         arena.intern(
             ScalarNode::Cast {
+                array_failure_mode: None,
                 child,
                 target: DataType::Int64,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
@@ -1735,10 +1736,7 @@ mod is_known_rule_name_tests {
         }
 
         let sql = "SELECT k1 FROM t1";
-        let statements = novarocks_parser::parse(sql).expect("parse query");
-        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
-            panic!("expected a query");
-        };
+        let query = &novarocks_parser::parser::parse_query(sql).expect("parse query");
         let (resolved, cte_registry, mut factory) =
             crate::analyzer::analyze(query, &MinimalCatalog, "default").expect("analyze");
         let logical = crate::planner::plan_query(
@@ -1876,10 +1874,7 @@ mod is_known_rule_name_tests {
             WHERE rk <= 2
             ORDER BY region, amount DESC
         ";
-        let statements = novarocks_parser::parse(sql).expect("parse query");
-        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
-            panic!("expected a query");
-        };
+        let query = &novarocks_parser::parser::parse_query(sql).expect("parse query");
         let (resolved, cte_registry, mut factory) =
             crate::analyzer::analyze(query, &RankingCatalog, "default").expect("analyze");
         let logical = crate::planner::plan_query(
@@ -1992,10 +1987,7 @@ mod is_known_rule_name_tests {
         let sql = "SELECT k1 FROM t1 WHERE k1 = (SELECT max(k2) FROM t2 WHERE t2.k1 = t1.k1)";
 
         // parse → analyze
-        let statements = novarocks_parser::parse(sql).expect("parse must succeed");
-        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
-            panic!("expected a query");
-        };
+        let query = &novarocks_parser::parser::parse_query(sql).expect("parse must succeed");
         let (resolved, cte_registry, mut factory) =
             crate::analyzer::analyze(query, &MinimalCatalog, "default")
                 .expect("analyze with apply framework must succeed");

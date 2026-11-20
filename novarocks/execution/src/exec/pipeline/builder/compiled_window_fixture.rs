@@ -311,6 +311,7 @@ fn typed_literal_values(
                                 None,
                                 ty.clone(),
                                 ExprKind::Cast {
+                                    array_failure_mode: None,
                                     expr: source,
                                     target: ty.data_type().clone(),
                                     decimal_overflow_policy: POLICY,

@@ -26,6 +26,90 @@ use novarocks_query_application::session_control::{
 };
 use novarocks_workload_control::ResultWindowClass;
 
+use crate::query::analyze_property_computation::{AnalyzeProperties, AnalyzePropertyCpuInput};
+use crate::query_execution::completion_facts::FrontendPlanningCpuSource;
+
+pub(crate) enum AnalyzeColumns {
+    Ready(StatisticsColumnIntent),
+    Declared(Box<AnalyzeProperties>),
+}
+
+type PropertyFuture = Pin<
+    Box<
+        dyn Future<
+                Output = Result<
+                    Result<StatisticsColumnIntent, QueryServiceError>,
+                    StatementNativeHealthFailure,
+                >,
+            > + Send,
+    >,
+>;
+
+struct ColumnProperties {
+    source: Arc<FrontendPlanningCpuSource>,
+    pending: Option<Box<AnalyzeProperties>>,
+    future: Option<PropertyFuture>,
+    result: Option<Result<StatisticsColumnIntent, QueryServiceError>>,
+    health: Option<StatementNativeHealthFailure>,
+}
+
+impl ColumnProperties {
+    fn new(pending: Box<AnalyzeProperties>) -> Self {
+        Self {
+            source: pending.cpu.clone(),
+            pending: Some(pending),
+            future: None,
+            result: None,
+            health: None,
+        }
+    }
+
+    fn start(&mut self, statistics: &ConnectorStatisticsSession) {
+        if let Some(properties) = self.pending.take() {
+            let cpu = self.source.clone();
+            let statistics = statistics.clone();
+            self.future = Some(Box::pin(async move {
+                let AnalyzeProperties {
+                    source,
+                    syntax,
+                    context,
+                    ..
+                } = *properties;
+                cpu.analyze_properties(AnalyzePropertyCpuInput {
+                    source,
+                    syntax,
+                    context,
+                    statistics,
+                })
+                .await
+            }));
+        }
+    }
+
+    fn poll_close(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), StatementNativeHealthFailure>> {
+        if let Some(future) = self.future.as_mut() {
+            match std::task::ready!(future.as_mut().poll(cx)) {
+                Ok(result) => self.result = Some(result),
+                Err(error) => self.health = Some(error),
+            }
+            drop(self.future.take());
+        }
+        if let Some(health) = self.local_health() {
+            return Poll::Ready(Err(health));
+        }
+        self.source.poll_closed(cx)
+    }
+
+    fn local_health(&self) -> Option<StatementNativeHealthFailure> {
+        self.health
+            .clone()
+            .or_else(|| self.source.local_health_failure())
+    }
+}
+
 type CaptureFuture = Pin<
     Box<dyn Future<Output = Result<StatisticsTargetCapture, StatisticsApplicationError>> + Send>,
 >;
@@ -37,7 +121,7 @@ pub(crate) trait StatisticsStatementExecutor: Send + Sync {
         &self,
         resolver: Arc<dyn StatisticsTargetResolver>,
         target: StatisticsTableTarget,
-        columns: StatisticsColumnIntent,
+        columns: AnalyzeColumns,
         execution: &QueryExecutionContext,
         context: &ConnectorRequestContext,
     ) -> Result<Box<dyn GovernedStatementAction>, StatisticsApplicationError>;
@@ -47,7 +131,7 @@ impl StatisticsStatementExecutor for FrontendStatisticsAttemptExecutor {
         &self,
         resolver: Arc<dyn StatisticsTargetResolver>,
         target: StatisticsTableTarget,
-        columns: StatisticsColumnIntent,
+        columns: AnalyzeColumns,
         execution: &QueryExecutionContext,
         context: &ConnectorRequestContext,
     ) -> Result<Box<dyn GovernedStatementAction>, StatisticsApplicationError> {
@@ -82,11 +166,16 @@ impl StatisticsStatementExecutor for FrontendStatisticsAttemptExecutor {
             std::mem::size_of::<StatementStatisticsAction>() as u64,
         )
         .map_err(fail)?;
+        let (columns, properties) = match columns {
+            AnalyzeColumns::Ready(ready) => (Some(ready), None),
+            AnalyzeColumns::Declared(preparation) => {
+                (None, Some(ColumnProperties::new(preparation)))
+            }
+        };
         let input = Arc::new(StatementInput {
             ports: self.ports.clone(),
             resolver,
             target,
-            columns,
             execution: execution.clone(),
             context: context.clone().with_io_admission(io.clone()),
             planning,
@@ -97,6 +186,8 @@ impl StatisticsStatementExecutor for FrontendStatisticsAttemptExecutor {
             origin,
             io,
             input: Some(input),
+            columns,
+            properties,
             cpu: None,
             wake: Arc::new(StatisticsWake::default()),
             capture: None,
@@ -111,7 +202,6 @@ struct StatementInput {
     ports: StatisticsAttemptExecutorPorts,
     resolver: Arc<dyn StatisticsTargetResolver>,
     target: StatisticsTableTarget,
-    columns: StatisticsColumnIntent,
     execution: QueryExecutionContext,
     context: ConnectorRequestContext,
     planning: ConnectorControlPlanningPin,
@@ -123,6 +213,8 @@ struct StatementStatisticsAction {
     origin: novarocks_workload_control::ResultWindowAlias,
     io: Arc<MetadataIoAdmission>,
     input: Option<Arc<StatementInput>>,
+    columns: Option<StatisticsColumnIntent>,
+    properties: Option<ColumnProperties>,
     cpu: Option<Arc<dyn StatisticsCpuPort>>,
     wake: Arc<StatisticsWake>,
     capture: Option<CaptureFuture>,
@@ -212,6 +304,22 @@ impl StatementStatisticsAction {
             return Poll::Ready(Err(error.to_query_service_error()));
         }
         owner.scope().check().map_err(scope_failure)?;
+        if let Some(properties) = self.properties.as_mut() {
+            properties.start(&input.statistics_session);
+            match std::task::ready!(properties.poll_close(cx)) {
+                Ok(()) => {}
+                Err(health) => {
+                    properties.health = Some(health);
+                    return Poll::Pending;
+                }
+            }
+            let columns = properties
+                .result
+                .take()
+                .expect("ANALYZE property CPU delivered its result")?;
+            self.columns = Some(columns);
+            drop(self.properties.take());
+        }
         let initial = InitialComputationReservation::new(
             input
                 .ports
@@ -250,7 +358,10 @@ impl StatementStatisticsAction {
             namespace: captured.namespace,
             table: captured.table,
             object_id: captured.object_id,
-            columns: input.columns.clone(),
+            columns: self
+                .columns
+                .take()
+                .expect("one original ANALYZE column intent"),
         };
         #[cfg(novarocks_dev_controls)]
         let observation = execution
@@ -341,6 +452,10 @@ impl StatementStatisticsAction {
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), StatementNativeHealthFailure>> {
         self.wake.0.register(cx.waker());
+        if let Some(properties) = self.properties.as_mut() {
+            std::task::ready!(properties.poll_close(cx))?;
+            drop(self.properties.take());
+        }
         if let Some(state) = self.state.as_mut() {
             return state.poll_close(cx);
         }
@@ -392,13 +507,16 @@ impl GovernedStatementAction for StatementStatisticsAction {
             .map(crate::query::external_effect_from_lake)
     }
     fn local_health_failure(&self) -> Option<StatementNativeHealthFailure> {
-        self.state
+        self.properties
             .as_ref()
-            .and_then(|state| {
-                state
-                    .health
-                    .clone()
-                    .or_else(|| state.computation.local_health_failure())
+            .and_then(ColumnProperties::local_health)
+            .or_else(|| {
+                self.state.as_ref().and_then(|state| {
+                    state
+                        .health
+                        .clone()
+                        .or_else(|| state.computation.local_health_failure())
+                })
             })
             .or_else(|| self.io.health_failure())
             .or_else(|| {
@@ -425,6 +543,8 @@ impl GovernedStatementAction for StatementStatisticsAction {
             origin: self.origin.clone(),
             io: self.io.clone(),
             input: self.input.take(),
+            columns: self.columns.take(),
+            properties: self.properties.take(),
             cpu: self.cpu.take(),
             wake: self.wake.clone(),
             capture: self.capture.take(),

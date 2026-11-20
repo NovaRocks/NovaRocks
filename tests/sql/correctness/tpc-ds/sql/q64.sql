@@ -20,7 +20,7 @@
 -- per-BE pipeline fan-out at one so the 1FE+3BE correctness run stays within
 -- the fixed CI timeout while preserving the standard result contract.
 -- @skip_result_check=true
-SET pipeline_dop = 1;
+SET SESSION pipeline_dop = 1;
 
 -- query 2
 with cs_ui as
@@ -48,7 +48,7 @@ cross_sales as
      ,d1.d_year as syear
      ,d2.d_year as fsyear
      ,d3.d_year s2year
-     ,count(*) cnt
+     ,count() cnt
      ,sum(ss_wholesale_cost) s1
      ,sum(ss_list_price) s2
      ,sum(ss_coupon_amt) s3

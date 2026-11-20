@@ -68,7 +68,7 @@ select
  	,w_county
  	,w_state
  	,w_country
- 	,'DHL' || ',' || 'BARIAN' as ship_carriers
+    ,CAST('DHL' AS BOOLEAN) OR CAST(',' AS BOOLEAN) OR CAST('BARIAN' AS BOOLEAN) as ship_carriers
        ,d_year as year
  	,sum(case when d_moy = 1 
  		then ws_ext_sales_price* ws_quantity else 0 end) as jan_sales
@@ -148,7 +148,7 @@ select
  	,w_county
  	,w_state
  	,w_country
- 	,'DHL' || ',' || 'BARIAN' as ship_carriers
+    ,CAST('DHL' AS BOOLEAN) OR CAST(',' AS BOOLEAN) OR CAST('BARIAN' AS BOOLEAN) as ship_carriers
        ,d_year as year
  	,sum(case when d_moy = 1 
  		then cs_sales_price* cs_quantity else 0 end) as jan_sales

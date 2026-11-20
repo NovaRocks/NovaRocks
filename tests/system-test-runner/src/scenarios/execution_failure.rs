@@ -38,7 +38,7 @@ use std::{fs, path::Path, time::Instant};
 const BACKENDS: usize = 3;
 // The finite UNION ALL uses real compiled Native preparation. The hint is
 // statement-scoped; neither subsequent query inherits its one-byte hard limit.
-const RESOURCE_SQL: &str = "SELECT /*+ SET_VAR(query_mem_limit=1) */ CAST(v AS VARCHAR) AS payload FROM (SELECT 17 AS v UNION ALL SELECT 19) t ORDER BY v";
+const RESOURCE_SQL: &str = "WITH SESSION query_mem_limit = 1 SELECT CAST(v AS VARCHAR) AS payload FROM (SELECT 17 AS v UNION ALL SELECT 19) t ORDER BY v";
 pub(super) const NEXT_SQL: &str =
     "SELECT CAST(v AS VARCHAR) AS payload FROM (SELECT 17 AS v UNION ALL SELECT 19) t ORDER BY v";
 pub(super) const INDEPENDENT_SQL: &str = "SELECT CAST(v AS VARCHAR) AS payload FROM (SELECT TRUE AS v UNION ALL SELECT TRUE) t ORDER BY v";

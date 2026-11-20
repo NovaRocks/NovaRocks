@@ -27,16 +27,15 @@
 CREATE TABLE ${case_db}.t_agg_variance_stddev (
     g INT,
     v INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t_agg_variance_stddev VALUES
-    (1, 10),
-    (1, 20),
-    (1, 30),
-    (2, 3),
-    (2, 7),
-    (2, 11);
+    ROW(1, 10),
+    ROW(1, 20),
+    ROW(1, 30),
+    ROW(2, 3),
+    ROW(2, 7),
+    ROW(2, 11);
 
 SELECT
     g,

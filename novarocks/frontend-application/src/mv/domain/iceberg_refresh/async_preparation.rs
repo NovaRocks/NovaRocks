@@ -18,7 +18,8 @@
 use super::*;
 use crate::query_execution::mv_assembly::refresh_preparation::async_facts::PreparationError as RefreshError;
 use crate::query_execution::mv_assembly::refresh_preparation::io_gate::MvRefreshPreparationIo;
-use novarocks_spi::connector::ConnectorOperationControl;
+use novarocks_query_application::sql::session::registry::SessionPropertyInputs;
+use novarocks_spi::connector::{ConnectorOperationControl, ConnectorProviderBindingKey};
 
 /// Borrowed facts from the same retained refresh generation.
 pub(crate) struct RefreshPlanningFacts<'a> {
@@ -37,6 +38,12 @@ struct OccurrenceSnapshotWindow<'a> {
     current: &'a BTreeMap<SqlMvRelationOccurrenceId, Option<i64>>,
 }
 
+pub(crate) struct PlannedRequestedRefresh {
+    pub(crate) plan: RefreshPlan,
+    pub(crate) target_binding: ConnectorProviderBindingKey,
+    pub(crate) full_overwrite: bool,
+}
+
 pub(crate) async fn plan_iceberg_mv_refresh_with_connector_context(
     io: &MvRefreshPreparationIo,
     source: &IcebergMvCorePorts,
@@ -45,14 +52,9 @@ pub(crate) async fn plan_iceberg_mv_refresh_with_connector_context(
     stmt: &MvRefreshRequest,
     target: MvTarget,
     full_sources: bool,
+    session_properties: Option<&SessionPropertyInputs>,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<RefreshPlan, RefreshError> {
-    let full_statement = full_sources.then(|| {
-        let mut full = stmt.clone();
-        full.full = true;
-        full
-    });
-    let stmt = full_statement.as_ref().unwrap_or(stmt);
+) -> Result<PlannedRequestedRefresh, RefreshError> {
     let iceberg_target =
         resolve_refresh_target(current_catalog, current_database, &stmt.name_parts)
             .map_err(RefreshError::from)?;
@@ -109,6 +111,36 @@ pub(crate) async fn plan_iceberg_mv_refresh_with_connector_context(
             "{snapshot_error}; sealed Current was installed as a read-only MV candidate; management Current readmission is required before refresh",
         )));
     }
+    let lease = target_binding.planning_pin();
+    let target_binding_key = ConnectorProviderBindingKey {
+        instance_id: lease.binding().descriptor().instance_id.clone(),
+        incarnation: lease.binding().incarnation(),
+    };
+    let full_overwrite = match session_properties {
+        Some(inputs) => novarocks_mv_application::session_properties::manual_refresh_is_full(
+            inputs,
+            &target_binding_key,
+            stmt.full,
+        )
+        .map_err(|message| {
+            RefreshError(MvApplicationError::new(
+                MvApplicationErrorKind::Engine,
+                message,
+            ))
+        })?,
+        None => stmt.full,
+    };
+    let full_statement = (full_sources || full_overwrite).then(|| {
+        let mut full = stmt.clone();
+        full.full = true;
+        full
+    });
+    let stmt = full_statement.as_ref().unwrap_or(stmt);
+    let finish = |plan| PlannedRequestedRefresh {
+        plan,
+        target_binding: target_binding_key.clone(),
+        full_overwrite,
+    };
     // D's own occurrence inventory is the base-locator authority now; the
     // retired projection copy of the resolved FQN list is gone.
     let refresh_state_baseline = build_refresh_state_baseline(&mv_definition, &target_binding)
@@ -192,7 +224,8 @@ pub(crate) async fn plan_iceberg_mv_refresh_with_connector_context(
                 branch_count,
                 connector_context,
             )
-            .await;
+            .await
+            .map(finish);
         }
         // Aggregate shapes: single-base, fan-in, branch-union, and join
         // aggregate all route through the aggregate planner, which selects the
@@ -219,7 +252,8 @@ pub(crate) async fn plan_iceberg_mv_refresh_with_connector_context(
                 &canonical_select_query,
                 connector_context,
             )
-            .await;
+            .await
+            .map(finish);
         }
         // Join / single-base projection-filter: fall through to the inline
         // paths below.
@@ -368,7 +402,7 @@ pub(crate) async fn plan_iceberg_mv_refresh_with_connector_context(
         }
         let affected_partitions = unknown_join_affected_partitions();
         log_planned_iceberg_mv_affected_partitions(&iceberg_target, &affected_partitions);
-        return Ok(RefreshPlan {
+        return Ok(finish(RefreshPlan {
             contract: RefreshPlanContract {
                 mv_id: Some(mv_definition.mv_id),
                 target,
@@ -379,7 +413,7 @@ pub(crate) async fn plan_iceberg_mv_refresh_with_connector_context(
                 snapshot_pins,
                 affected_partitions,
             },
-        });
+        }));
     }
     // The capability dispatch above (has_agg=false, SingleBase, non-join) routes only
     // single-base projection/filter MVs to this point. No classify guard needed.
@@ -451,7 +485,7 @@ pub(crate) async fn plan_iceberg_mv_refresh_with_connector_context(
             snapshot_pins.insert(base_occurrence.occurrence_id, None);
             let affected_partitions = noop_affected_partitions(target_binding.partition());
             log_planned_iceberg_mv_affected_partitions(&iceberg_target, &affected_partitions);
-            return Ok(RefreshPlan {
+            return Ok(finish(RefreshPlan {
                 contract: RefreshPlanContract {
                     mv_id: Some(mv_definition.mv_id),
                     target,
@@ -462,7 +496,7 @@ pub(crate) async fn plan_iceberg_mv_refresh_with_connector_context(
                     snapshot_pins,
                     affected_partitions,
                 },
-            });
+            }));
         }
         ExecutableRefreshDecision::FirstRefresh
         | ExecutableRefreshDecision::MetadataOnly
@@ -502,7 +536,7 @@ pub(crate) async fn plan_iceberg_mv_refresh_with_connector_context(
     )
     .await?;
     log_planned_iceberg_mv_affected_partitions(&iceberg_target, &affected_partitions);
-    Ok(RefreshPlan {
+    Ok(finish(RefreshPlan {
         contract: RefreshPlanContract {
             mv_id: Some(mv_definition.mv_id),
             target,
@@ -513,7 +547,7 @@ pub(crate) async fn plan_iceberg_mv_refresh_with_connector_context(
             snapshot_pins,
             affected_partitions,
         },
-    })
+    }))
 }
 
 pub(crate) async fn plan_iceberg_union_projection_mv_refresh(

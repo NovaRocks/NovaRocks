@@ -19,9 +19,9 @@
 -- The input domain, overflow-to-NULL, and all coefficients are independent oracles.
 -- query 1
 CREATE TABLE ${case_db}.scalar_integer_domain(id INT,t TINYINT,age SMALLINT,i INT);
-INSERT INTO ${case_db}.scalar_integer_domain SELECT x,x,x,x FROM generate_series(127,128) g(x);
-INSERT INTO ${case_db}.scalar_integer_domain SELECT x,x,x,x FROM generate_series(32767,32768) g(x);
-INSERT INTO ${case_db}.scalar_integer_domain SELECT x,x,x,x FROM generate_series(-129,-128) g(x);
+INSERT INTO ${case_db}.scalar_integer_domain SELECT x,x,x,x FROM TABLE(generate_series(127,128)) g(x);
+INSERT INTO ${case_db}.scalar_integer_domain SELECT x,x,x,x FROM TABLE(generate_series(32767,32768)) g(x);
+INSERT INTO ${case_db}.scalar_integer_domain SELECT x,x,x,x FROM TABLE(generate_series(-129,-128)) g(x);
 SELECT id,t,age,i FROM ${case_db}.scalar_integer_domain ORDER BY id;
 
 -- query 2
@@ -48,27 +48,27 @@ FROM ${case_db}.scalar_integer_domain GROUP BY 1,2;
 
 -- query 7
 -- @expect_error=Iceberg MODIFY cannot change a nominal scalar integer domain without rewriting stored values
-ALTER TABLE ${case_db}.scalar_integer_domain MODIFY COLUMN age INT;
+ALTER TABLE ${case_db}.scalar_integer_domain ALTER COLUMN age SET DATA TYPE INT;
 
 -- query 8
-ALTER TABLE ${case_db}.scalar_integer_domain MODIFY COLUMN renamed TINYINT;
+ALTER TABLE ${case_db}.scalar_integer_domain ALTER COLUMN renamed SET DATA TYPE TINYINT;
 SELECT typeof(renamed) AS tiny_type,sum(CAST(renamed AS INT)) AS widened_sum,count(renamed) AS tiny_count
 FROM ${case_db}.scalar_integer_domain GROUP BY 1;
 
 -- query 9
 -- ADR-0182 binds a declared narrow domain to INT storage throughout its history.
 -- @expect_error=Iceberg MODIFY cannot change a nominal scalar integer domain without rewriting stored values
-ALTER TABLE ${case_db}.scalar_integer_domain MODIFY COLUMN renamed BIGINT;
+ALTER TABLE ${case_db}.scalar_integer_domain ALTER COLUMN renamed SET DATA TYPE BIGINT;
 
 -- query 10
 -- Refusal leaves the original domain and values intact; 128 still overflows TINYINT.
-INSERT INTO ${case_db}.scalar_integer_domain (id,renamed) VALUES(999,128);
+INSERT INTO ${case_db}.scalar_integer_domain (id,renamed) VALUES ROW(999,128);
 SELECT typeof(renamed) AS tiny_type,sum(renamed) AS tiny_sum,count(renamed) AS tiny_count
 FROM ${case_db}.scalar_integer_domain GROUP BY 1;
 
 -- query 11
 -- An ordinary field without a nominal declaration can still widen normally.
-ALTER TABLE ${case_db}.scalar_integer_domain MODIFY COLUMN t BIGINT;
+ALTER TABLE ${case_db}.scalar_integer_domain ALTER COLUMN t SET DATA TYPE BIGINT;
 SELECT typeof(t) AS wide_type,count(t) AS wide_count
 FROM ${case_db}.scalar_integer_domain GROUP BY 1;
 

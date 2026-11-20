@@ -23,23 +23,23 @@
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.object_store_rows (
     id INT,
-    `value` STRING
-) TBLPROPERTIES ("format-version" = "2");
+    "value" STRING
+) WITH (format_version = 2);
 
 -- query 2
 -- @skip_result_check=true
 INSERT INTO ${case_db}.object_store_rows VALUES
-    (1, 'alpha'), (2, 'beta'), (3, 'gamma');
+    ROW(1, 'alpha'), ROW(2, 'beta'), ROW(3, 'gamma');
 
 -- query 3
-SELECT id, `value` FROM ${case_db}.object_store_rows ORDER BY id;
+SELECT id, "value" FROM ${case_db}.object_store_rows ORDER BY id;
 
 -- query 4
 -- @skip_result_check=true
 DELETE FROM ${case_db}.object_store_rows WHERE id = 2;
 
 -- query 5
-SELECT id, `value` FROM ${case_db}.object_store_rows ORDER BY id;
+SELECT id, "value" FROM ${case_db}.object_store_rows ORDER BY id;
 
 -- query 6
 -- @skip_result_check=true

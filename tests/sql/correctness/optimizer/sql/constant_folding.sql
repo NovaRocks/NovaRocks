@@ -34,9 +34,9 @@
 DROP TABLE IF EXISTS ${case_db}.t_fold_dates;
 CREATE TABLE ${case_db}.t_fold_dates (id INT, dt DATE);
 INSERT INTO ${case_db}.t_fold_dates VALUES
-    (1, '2019-12-31'),
-    (2, '2020-01-01'),
-    (3, '2020-01-02');
+    ROW(1, '2019-12-31'),
+    ROW(2, '2020-01-01'),
+    ROW(3, '2020-01-02');
 
 -- ---------------------------------------------------------------------------
 -- 1. Constant arithmetic collapses to one literal.
@@ -74,11 +74,11 @@ SELECT id FROM ${case_db}.t_fold_dates WHERE dt = DATE '2020-01-01';
 -- ---------------------------------------------------------------------------
 -- @skip_result_check=true
 -- @result_contains=[rand()]
-EXPLAIN VERBOSE SELECT rand();
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'  SELECT rand();
 
 -- @skip_result_check=true
 -- @result_contains=[now()]
-EXPLAIN VERBOSE SELECT now();
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'  SELECT now();
 
 -- ---------------------------------------------------------------------------
 -- 6. Environment-sensitive builtins are immutable but read the process
@@ -87,7 +87,7 @@ EXPLAIN VERBOSE SELECT now();
 -- ---------------------------------------------------------------------------
 -- @skip_result_check=true
 -- @result_contains=[from_unixtime(1577836800)]
-EXPLAIN VERBOSE SELECT from_unixtime(1577836800);
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'  SELECT from_unixtime(1577836800);
 
 -- ---------------------------------------------------------------------------
 -- 7. Integer division by zero is a typed error in folded and runtime paths.
@@ -99,7 +99,7 @@ SELECT 1 / 0;
 -- ---------------------------------------------------------------------------
 -- 8. Disabling the rule restores the unfolded plan; results are unchanged.
 -- ---------------------------------------------------------------------------
-SET disable_optimizer_rules = 'FoldConstant';
+SET SESSION disable_optimizer_rules = 'FoldConstant';
 
 -- @explain_contains=[40000 + 2000 + 96 AS
 SELECT 40000 + 2000 + 96;
@@ -113,8 +113,8 @@ SELECT id FROM ${case_db}.t_fold_dates WHERE dt = '2020-01-01';
 --    runtime as an independent result oracle. Keep explicit aliases so plan
 --    assertions cannot accidentally match a parsed expression in a column label.
 -- ---------------------------------------------------------------------------
-SET disable_optimizer_rules = '';
-SET sql_mode = '32';
+SET SESSION disable_optimizer_rules = '';
+SET SESSION sql_mode = '32';
 
 -- @explain_contains=['MIXED' AS folded_upper]
 SELECT upper('MiXeD') AS folded_upper;
@@ -150,10 +150,10 @@ SELECT CAST(12.30 AS DECIMAL(4,2)) = CAST(12.3 AS DECIMAL(3,1)) AS folded_decima
 SELECT CAST('2020-01-01' AS DATE) = '2020-01-01' AS folded_temporal_compare;
 
 -- @explain_contains=[true AS folded_nullsafe_equal]
-SELECT CAST(NULL AS INT) <=> CAST(NULL AS INT) AS folded_nullsafe_equal;
+SELECT CAST(NULL AS INT)  IS NOT DISTINCT FROM  CAST(NULL AS INT) AS folded_nullsafe_equal;
 
 -- @explain_contains=[false AS folded_nullsafe_distinct]
-SELECT CAST(NULL AS INT) <=> CAST(1 AS INT) AS folded_nullsafe_distinct;
+SELECT CAST(NULL AS INT)  IS NOT DISTINCT FROM  CAST(1 AS INT) AS folded_nullsafe_distinct;
 
 -- @explain_contains=[12 AS folded_narrow]
 SELECT CAST(12 AS TINYINT) AS folded_narrow;
@@ -174,7 +174,7 @@ SELECT CAST(1000 AS DECIMAL(3,0)) AS folded_decimal_overflow;
 -- 10. Disable folding and require the original operation to remain visible.
 --     Every result must match the corresponding folded query above.
 -- ---------------------------------------------------------------------------
-SET disable_optimizer_rules = 'FoldConstant';
+SET SESSION disable_optimizer_rules = 'FoldConstant';
 
 -- @explain_contains=[upper(
 SELECT upper('MiXeD') AS folded_upper;
@@ -210,10 +210,10 @@ SELECT CAST(12.30 AS DECIMAL(4,2)) = CAST(12.3 AS DECIMAL(3,1)) AS folded_decima
 SELECT CAST('2020-01-01' AS DATE) = '2020-01-01' AS folded_temporal_compare;
 
 -- @explain_contains=<=>
-SELECT CAST(NULL AS INT) <=> CAST(NULL AS INT) AS folded_nullsafe_equal;
+SELECT CAST(NULL AS INT)  IS NOT DISTINCT FROM  CAST(NULL AS INT) AS folded_nullsafe_equal;
 
 -- @explain_contains=<=>
-SELECT CAST(NULL AS INT) <=> CAST(1 AS INT) AS folded_nullsafe_distinct;
+SELECT CAST(NULL AS INT)  IS NOT DISTINCT FROM  CAST(1 AS INT) AS folded_nullsafe_distinct;
 
 -- @explain_contains=[CAST(12 AS
 SELECT CAST(12 AS TINYINT) AS folded_narrow;
@@ -234,32 +234,32 @@ SELECT CAST(1000 AS DECIMAL(3,0)) AS folded_decimal_overflow;
 -- 11. ERROR_IF_OVERFLOW still folds successful rounding, and an actual row
 --     error stays unfolded so execution owns the same error in both modes.
 -- ---------------------------------------------------------------------------
-SET disable_optimizer_rules = '';
-SET sql_mode = 'ERROR_IF_OVERFLOW';
+SET SESSION disable_optimizer_rules = '';
+SET SESSION sql_mode = 'ERROR_IF_OVERFLOW';
 
 -- @explain_contains=[12.35 AS checked_decimal_rounding]
 SELECT CAST(CAST(12.345 AS DECIMAL(5,3)) AS DECIMAL(4,2)) AS checked_decimal_rounding;
 
 -- @skip_result_check=true
 -- @result_contains=[CAST(1000 AS
-EXPLAIN VERBOSE SELECT CAST(1000 AS DECIMAL(3,0)) AS checked_decimal_overflow;
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'  SELECT CAST(1000 AS DECIMAL(3,0)) AS checked_decimal_overflow;
 
 -- @skip_result_check=true
 -- @expect_sql_code=query.execution.numeric_out_of_range
 SELECT CAST(1000 AS DECIMAL(3,0)) AS checked_decimal_overflow;
 
-SET disable_optimizer_rules = 'FoldConstant';
+SET SESSION disable_optimizer_rules = 'FoldConstant';
 
 -- @explain_contains=[CAST(CAST(12.345 AS
 SELECT CAST(CAST(12.345 AS DECIMAL(5,3)) AS DECIMAL(4,2)) AS checked_decimal_rounding;
 
 -- @skip_result_check=true
 -- @result_contains=[CAST(1000 AS
-EXPLAIN VERBOSE SELECT CAST(1000 AS DECIMAL(3,0)) AS checked_decimal_overflow;
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'  SELECT CAST(1000 AS DECIMAL(3,0)) AS checked_decimal_overflow;
 
 -- @skip_result_check=true
 -- @expect_sql_code=query.execution.numeric_out_of_range
 SELECT CAST(1000 AS DECIMAL(3,0)) AS checked_decimal_overflow;
 
-SET sql_mode = '32';
-SET disable_optimizer_rules = '';
+SET SESSION sql_mode = '32';
+SET SESSION disable_optimizer_rules = '';

@@ -30,25 +30,25 @@ INSERT INTO ${case_db}.t_dnn_dl
 INSERT INTO ${case_db}.t_dnn_dr
     SELECT CASE WHEN generate_series % 12 = 0 THEN generate_series ELSE NULL END, generate_series
     FROM TABLE(generate_series(1, 2000));
-ANALYZE TABLE ${case_db}.t_dnn_dl;
-ANALYZE TABLE ${case_db}.t_dnn_dr;
+ANALYZE ${case_db}.t_dnn_dl;
+ANALYZE ${case_db}.t_dnn_dr;
 
-SET disable_optimizer_rules = 'JoinCommutativity';
+SET SESSION disable_optimizer_rules = 'JoinCommutativity';
 
 -- @result_contains=predicates: l.k IS NOT NULL
 -- @result_contains=predicates: r.k IS NOT NULL
-EXPLAIN VERBOSE
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
 SELECT l.v, r.v
 FROM ${case_db}.t_dnn_dl l
 INNER JOIN ${case_db}.t_dnn_dr r ON l.k = r.k;
 
-SET disable_optimizer_rules = 'DeriveJoinNotNullPredicate,JoinCommutativity';
+SET SESSION disable_optimizer_rules = 'DeriveJoinNotNullPredicate,JoinCommutativity';
 
 -- @result_not_contains=predicates: l.k IS NOT NULL
 -- @result_not_contains=predicates: r.k IS NOT NULL
-EXPLAIN VERBOSE
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
 SELECT l.v, r.v
 FROM ${case_db}.t_dnn_dl l
 INNER JOIN ${case_db}.t_dnn_dr r ON l.k = r.k;
 
-SET disable_optimizer_rules = '';
+SET SESSION disable_optimizer_rules = '';

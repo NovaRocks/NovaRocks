@@ -24,12 +24,12 @@ under the License.
 | 能力 | 状态 | 备注 |
 | --- | --- | --- |
 | 分区写入：identity / bucket / truncate / year / month / day / hour | ✅ | |
-| Partition evolution DDL（`ADD/DROP PARTITION COLUMN`） | ✅ | |
+| Partition evolution DDL（`SET PROPERTIES partitioning`） | ✅ | |
 | 跨历史 partition spec 的扫描 | ✅ | |
 | DELETE 跨历史 partition spec | ✅ | |
 | OPTIMIZE 跨历史 spec（compact 到当前 spec） | ✅ | |
 | Partition transform `void`（V3） | ❌ | |
-| Dynamic partition overwrite | ❌ | |
+| Dynamic partition overwrite | ✅ | `INSERT OVERWRITE PARTITIONS` |
 | Partition stats puffin（V3 `partition-stats-blob`） | ❌ | 写入 + 消费均未实现 |
 | Partition spec 修复 / 等价合并 | ❌ | |
 
@@ -41,15 +41,15 @@ under the License.
 CREATE TABLE events (
   id BIGINT,
   ts TIMESTAMP,
-  country STRING,
+  country VARCHAR,
   user_id BIGINT
 )
-PARTITION BY (
-  day(ts),                 -- year(ts) / month(ts) / hour(ts) 同理
-  country,                 -- identity
-  bucket(64, user_id),
-  truncate(10, country)
-);
+WITH (partitioning = ARRAY[
+  'day(ts)',
+  'country',
+  'bucket(user_id, 64)',
+  'truncate(country, 10)'
+]);
 ```
 
 读 / 写 / DELETE / UPDATE 都会自动按 partition transform 路由。
@@ -57,11 +57,16 @@ PARTITION BY (
 ## ✅ Partition evolution DDL
 
 ```sql
-ALTER TABLE events ADD PARTITION COLUMN month(ts);
-ALTER TABLE events DROP PARTITION COLUMN day(ts);
+ALTER TABLE events SET PROPERTIES partitioning = ARRAY[
+  'country', 'bucket(user_id, 64)', 'truncate(country, 10)'
+];
+
+ALTER TABLE events SET PROPERTIES partitioning = ARRAY[
+  'country', 'bucket(user_id, 64)', 'truncate(country, 10)', 'month(ts)'
+];
 ```
 
-NovaRocks 实现：
+从上例建表的分区规格开始，第一次提交移除 `day(ts)`，第二次提交加入 `month(ts)`。同一列的分区规格一次使用一种时间粒度。每条语句都声明完整的目标分区规格。保留的变换继续使用现有分区字段 ID 和名称。
 
 - ✅ 跨历史 partition spec 的扫描：老 data file 仍按其当时的 spec_id 解释，新写入按当前 spec
 - ✅ DELETE 跨历史 spec：DELETE 计划会同时考虑历史 spec 文件
@@ -71,15 +76,11 @@ NovaRocks 实现：
 
 Spec：v3 引入 `void(col)` transform，作用是"声明这一列不再用作分区，但仍保留 column 在 schema 里"。等价于隐藏旧分区的快捷写法。
 
-**TODO**：未实现。当前不接受 `void(col)` 语法，要"隐藏旧分区"只能 `DROP PARTITION COLUMN`。
+通过 `SET PROPERTIES partitioning` 声明仍参与分区的完整变换列表，即可移除旧规格中的变换。
 
-## ❌ Dynamic partition overwrite
+## ✅ Dynamic partition overwrite
 
-Spec / Spark 行为：`INSERT OVERWRITE` 默认替换整张表；带 `OVERWRITE PARTITIONS` 子句或在 dynamic 模式下，仅替换被本次写入命中的分区。
-
-**TODO**：未实现。当前 `INSERT OVERWRITE` 总是替换全表（或显式指定的静态分区），动态分区覆盖不可用。
-
-替代方案：先 `DELETE FROM t WHERE <partition condition>`，再 `INSERT INTO t SELECT ...`。
+`INSERT OVERWRITE PARTITIONS` 只替换本次写入命中的分区。`INSERT OVERWRITE` 替换整张表。
 
 ## ❌ Partition stats puffin（V3 `partition-stats-blob`）
 

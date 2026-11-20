@@ -39,48 +39,27 @@ use crate::query_execution::planning::write_sink::{
 };
 use arrow::datatypes::{DataType, TimeUnit};
 use chrono::NaiveDateTime;
-use novarocks_parser::ast::{
-    BinaryOperator, Delete, Expr, FunctionCall, IsPredicate, LiteralKind,
-    ObjectName as ParserObjectName, Query, UnaryOperator,
-};
+use novarocks_parser::ast::{Expr, FunctionCall, LiteralKind, Predicate, Query, UnaryOperator};
+
+use super::PreparedPredicateDelete;
 use novarocks_parser::{SYNTHETIC, ast, build};
 use novarocks_query_application::admitted_query_context::QueryExecutionContext;
 use novarocks_spi::connector::ConnectorRowMutationStrategy;
 use novarocks_spi::connector::ConnectorWriteOperationId;
-use novarocks_sql::planning::dml::{DmlWriteSinkMode, IcebergRefSuffix, split_ref_suffix};
+use novarocks_sql::planning::dml::DmlWriteSinkMode;
 use novarocks_sql::planning::query_execution::FrozenConnectorScanIdentity;
-use novarocks_sql::semantic::ObjectName as SqlObjectName;
 use novarocks_types::schema::ColumnDef;
 
 pub(super) fn resolve_target(
     state: &DmlExecutionKernel,
-    stmt: &Delete,
+    stmt: &PreparedPredicateDelete,
     current_catalog: Option<&str>,
     current_database: &str,
 ) -> Result<(TargetBackend, String), crate::catalog_application::resolver::TargetResolutionError> {
-    // Detect branch/tag suffix in the target table name.
-    let target_name = sql_object_name(&stmt.target);
-    let (stripped_parts, ref_suffix) = split_ref_suffix(&target_name.parts);
-    let effective_name;
-    let table_name: &SqlObjectName = match ref_suffix {
-        Some(IcebergRefSuffix::Tag(ref tag_name)) => {
-            return Err((format!(
-                "iceberg ref: tag '{tag_name}' is read-only; use a branch as DML target"
-            ))
-            .into());
-        }
-        Some(IcebergRefSuffix::Branch(_)) => {
-            effective_name = SqlObjectName {
-                parts: stripped_parts,
-            };
-            &effective_name
-        }
-        None => &target_name,
-    };
-    let target_ref = match &ref_suffix {
-        Some(IcebergRefSuffix::Branch(b)) => b.clone(),
-        _ => "main".to_string(),
-    };
+    let (table_name, target_ref) = stmt
+        .target
+        .table_and_reference()
+        .map_err(crate::catalog_application::resolver::TargetResolutionError::from)?;
 
     // Resolve only local catalog admission facts.
     let target =
@@ -92,11 +71,11 @@ pub(super) fn resolve_target(
         ))
         .into());
     }
-    Ok((target, target_ref))
+    Ok((target, target_ref.to_owned()))
 }
 
 fn delete_where_expr<'a>(
-    stmt: &'a Delete,
+    stmt: &'a PreparedPredicateDelete,
     target_binding: &crate::connector::write_target::ConnectorWriteTargetBinding,
 ) -> Result<&'a Expr, crate::dml::error::DmlExecutionError> {
     let where_clause = stmt.selection.as_ref().ok_or_else(|| {
@@ -110,7 +89,7 @@ fn delete_where_expr<'a>(
 
 pub(super) async fn prepare_delete_statement_async(
     state: &DmlExecutionKernel,
-    stmt: &Delete,
+    stmt: &PreparedPredicateDelete,
     target: &TargetBackend,
     target_ref: &str,
     planning_pin: novarocks_spi::connector::ConnectorControlPlanningPin,
@@ -169,7 +148,7 @@ pub(super) async fn prepare_delete_statement_async(
     let from = super::super::mutation_match_read::mutation_match_select(&mut delete_query)?;
     let match_read = super::super::mutation_match_read::bind_mutation_match_read(
         target,
-        &mut from.relation,
+        from,
         false,
         &mutation,
         target_binding.metadata(),
@@ -300,60 +279,31 @@ fn delete_position_sink_query_ast(
 ) -> Result<Query, String> {
     let projection = sink_columns
         .iter()
-        .map(|column| {
-            build::item(
-                build::identifier(build::ident(&column.name, Some('`'))),
-                None,
-                false,
-            )
-        })
+        .map(|column| build::item(build::identifier(build::ident(&column.name, true)), None))
         .collect();
     let name = build::object_name(
         [&target.catalog, &target.namespace, &target.table]
             .into_iter()
-            .map(|part| build::ident(part, Some('`')))
+            .map(|part| build::ident(part, true))
             .collect(),
     )
     .map_err(|error| format!("internal DELETE query construction failed: {error}"))?;
-    let version = (target_ref != "main").then(|| ast::TableVersion {
-        kind: ast::TableVersionKind::ForVersionAsOf,
-        value: build::string(target_ref),
+    let version = (target_ref != "main").then(|| ast::QueryPeriod {
+        range_type: ast::QueryPeriodRangeType::Version,
+        start: None,
+        end: Some(ast::AstBox::new(build::string(target_ref))),
         span: SYNTHETIC,
     });
     let select = build::select(
         projection,
-        vec![build::relation(build::table(name, version, None))],
-        Some(delete_selection_for_query(where_clause)),
-        ast::GroupBy::None,
+        Some(build::table(name, version, None)),
+        Some(where_clause.clone()),
+        None,
     )
     .map_err(|error| format!("internal DELETE query construction failed: {error}"))?;
-    Ok(build::query(ast::SetExpr::Select(Box::new(select))))
-}
-
-/// Preserve the grouping at DELETE's generated-query boundary while retaining
-/// the original predicate leaves and their source locations.
-fn delete_selection_for_query(selection: &Expr) -> Expr {
-    use ast::Fold;
-    struct SelectionGrouping;
-    impl ast::Fold for SelectionGrouping {
-        fn fold_expr(&mut self, expression: Expr) -> Expr {
-            let expression = ast::fold_expr(self, expression);
-            let Expr::Binary(binary) = expression else {
-                return expression;
-            };
-            if !matches!(binary.operator, BinaryOperator::And | BinaryOperator::Or) {
-                return Expr::Binary(binary);
-            }
-            let mut right = *binary.right;
-            if matches!(&right, Expr::Binary(value) if value.operator == binary.operator) {
-                right = build::nested(right);
-            }
-            // Rebalance exactly once after grouping the original children.
-            // Revisiting newly balanced nodes would introduce extra groups.
-            build::binary(*binary.left, binary.operator, right)
-        }
-    }
-    SelectionGrouping.fold_expr(selection.clone())
+    Ok(build::query(ast::SetExpr::Select(
+        novarocks_parser::ast::AstBox::new(select),
+    )))
 }
 
 /// The delete-shaped input this statement asks the session to admit.
@@ -415,12 +365,6 @@ fn write_input_columns(
         .collect()
 }
 
-fn sql_object_name(name: &ParserObjectName) -> SqlObjectName {
-    SqlObjectName {
-        parts: name.parts.iter().map(|part| part.value.clone()).collect(),
-    }
-}
-
 /// Check that a DELETE `WHERE` clause is inside the subset this engine supports.
 ///
 /// Nothing is produced: the distributed SELECT planner owns the actual filtering
@@ -469,54 +413,49 @@ fn validate_where_predicate(
     columns: &[ColumnDef],
 ) -> Result<(), crate::dml::error::DmlExecutionError> {
     match expr {
-        Expr::Binary(binary) => match binary.operator {
-            BinaryOperator::And | BinaryOperator::Or => {
-                validate_where_predicate(&binary.left, columns)?;
-                validate_where_predicate(&binary.right, columns)
+        Expr::Logical(logical) => {
+            for term in &logical.terms {
+                validate_where_predicate(term, columns)?;
             }
-            BinaryOperator::Equal
-            | BinaryOperator::NotEqual
-            | BinaryOperator::LessThan
-            | BinaryOperator::LessThanOrEqual
-            | BinaryOperator::GreaterThan
-            | BinaryOperator::GreaterThanOrEqual => {
+            Ok(())
+        }
+        Expr::Predicated(expression) => match &expression.predicate {
+            Predicate::Comparison(comparison) => {
                 // Detect scalar_fn(col) <op> literal pattern first.
                 // Function-call predicates cannot be pushed into Iceberg column
                 // statistics (the function obscures the underlying column value),
                 // so we return AlwaysTrue here to scan all files and leave
                 // correctness to the per-row evaluator in evaluate_where_at_row.
-                if extract_scalar_fn_comparison(&binary.left, &binary.right).is_some()
-                    || extract_variant_get_comparison(&binary.left, &binary.right).is_some()
+                if extract_scalar_fn_comparison(&expression.value, &comparison.right).is_some()
+                    || extract_variant_get_comparison(&expression.value, &comparison.right)
+                        .is_some()
                 {
                     return Ok(());
                 }
                 let (col_name, value_expr, _flipped) =
-                    extract_comparison(&binary.left, &binary.right)?;
+                    extract_comparison(&expression.value, &comparison.right)?;
                 validate_literal_for_column(value_expr, columns, &col_name).map_err(Into::into)
             }
-            other => Err(format!(
-                "phase 1 DELETE WHERE does not support binary operator `{other:?}`"
-            )
-            .into()),
-        },
-        Expr::InList(in_list) => {
-            let col_name = expr_to_column_name(&in_list.expr)?;
-            for literal in &in_list.list {
-                validate_literal_for_column(literal, columns, &col_name)?;
+            Predicate::In(predicate) => {
+                let Expr::InList(list) = &predicate.value_list else {
+                    return Err("phase 1 DELETE WHERE IN requires a literal value list".into());
+                };
+                if list.values.is_empty() {
+                    return Err("phase 1 DELETE WHERE IN requires a nonempty value list".into());
+                }
+                let col_name = expr_to_column_name(&expression.value)?;
+                for literal in &list.values {
+                    validate_literal_for_column(literal, columns, &col_name)?;
+                }
+                Ok(())
             }
-            Ok(())
-        }
-        Expr::IsPredicate(predicate)
-            if matches!(
-                predicate.predicate,
-                IsPredicate::Null | IsPredicate::NotNull
-            ) =>
-        {
-            expr_to_column_name(&predicate.expr)
+            Predicate::IsNull(_) => expr_to_column_name(&expression.value)
                 .map(|_| ())
-                .map_err(Into::into)
-        }
-        Expr::Nested(nested) => validate_where_predicate(&nested.expression, columns),
+                .map_err(Into::into),
+            other => {
+                Err(format!("phase 1 DELETE WHERE does not support predicate `{other:?}`").into())
+            }
+        },
         other => Err(format!(
             "phase 1 DELETE WHERE supports comparison / IN / IS NULL / AND / OR \
              over primitive columns; rewrite this clause and retry. Unsupported: {other:?}"
@@ -647,12 +586,21 @@ fn expr_as_supported_scalar_fn_on_col(expr: &Expr) -> Option<(String, String)> {
 }
 
 fn function_expr_args(func: &FunctionCall) -> Option<Vec<&Expr>> {
-    (func.quantifier == novarocks_parser::ast::FunctionQuantifier::None
-        && func.order_by.is_empty()
-        && func.separator.is_none()
+    (!func.distinct
+        && func.order_by.is_none()
         && func.filter.is_none()
-        && func.over.is_none())
-    .then(|| func.arguments.iter().collect())
+        && func.window.is_none()
+        && func.processing_mode.is_none()
+        && func
+            .arguments
+            .iter()
+            .all(|argument| argument.name.is_none()))
+    .then(|| {
+        func.arguments
+            .iter()
+            .map(|argument| &argument.value)
+            .collect()
+    })
 }
 
 /// The set of deterministic, single-argument scalar functions that the phase-1
@@ -674,26 +622,15 @@ fn is_literal_expr(expr: &Expr) -> bool {
         Expr::Unary(unary) if unary.operator == UnaryOperator::Minus => {
             matches!(unary.expression.as_ref(), Expr::Literal(_))
         }
-        Expr::Nested(nested) => is_literal_expr(&nested.expression),
         _ => false,
     }
 }
 
 fn expr_to_column_name(expr: &Expr) -> Result<String, String> {
-    match expr {
-        Expr::Identifier(ident) => Ok(ident.value.to_lowercase()),
-        Expr::CompoundIdentifier(parts) => {
-            // a.b.c → take the last part (the column name); table-qualified
-            // refs work because the Predicate is bound against the
-            // single-table schema via TableScan.with_filter.
-            parts
-                .parts
-                .last()
-                .map(|p| p.value.to_lowercase())
-                .ok_or_else(|| "compound identifier has no parts".to_string())
-        }
-        other => Err(format!(
-            "phase 1 DELETE WHERE expected a column identifier here, got {other:?}"
+    match novarocks_parser::ast::identifier_chain_observed(expr, |_| Ok::<(), String>(()))? {
+        Some(chain) => Ok(chain.last().value.to_lowercase()),
+        None => Err(format!(
+            "phase 1 DELETE WHERE expected a column identifier here, got {expr:?}"
         )),
     }
 }
@@ -747,7 +684,9 @@ fn validate_literal_for_column(
         Expr::Unary(unary) if unary.operator == UnaryOperator::Minus
     );
     let lit_str = match &lit_value.kind {
-        LiteralKind::Number(s) | LiteralKind::String(s) => s.clone(),
+        LiteralKind::Decimal(s) | LiteralKind::String(s) => s.clone(),
+        LiteralKind::Long { parsed_value, .. } => parsed_value.to_string(),
+        LiteralKind::Double(value) => format!("{:?}", value.get()),
         LiteralKind::Boolean(b) => b.to_string(),
         LiteralKind::Null => {
             return Err(format!(
@@ -816,7 +755,6 @@ fn extract_string_literal(expr: &Expr) -> Option<&str> {
             LiteralKind::String(value) => Some(value.as_str()),
             _ => None,
         },
-        Expr::Nested(nested) => extract_string_literal(&nested.expression),
         _ => None,
     }
 }
@@ -825,7 +763,7 @@ fn extract_string_literal(expr: &Expr) -> Option<&str> {
 mod tests {
     use arrow::datatypes::DataType;
     use novarocks_parser::Span;
-    use novarocks_parser::ast::{DmlStatement, Expr, Literal, LiteralKind, Statement};
+    use novarocks_parser::ast::{Expr, Literal, LiteralKind};
 
     fn column(name: &str, data_type: DataType) -> novarocks_types::schema::ColumnDef {
         novarocks_types::schema::ColumnDef {
@@ -838,12 +776,13 @@ mod tests {
     }
 
     fn where_expr(sql: &str) -> Expr {
-        let statements = novarocks_parser::parse(&format!("DELETE FROM orders WHERE {sql}"))
-            .expect("parse DELETE");
-        let Statement::Dml(DmlStatement::Delete(delete)) = &statements[0] else {
+        let source = format!("DELETE FROM orders WHERE {sql}");
+        let novarocks_parser::ast::TrinoStatement::Delete(delete) =
+            novarocks_parser::parser::parse_statement(&source).unwrap()
+        else {
             panic!("expected DELETE");
         };
-        delete.selection.clone().expect("where clause")
+        delete.predicate.expect("WHERE clause")
     }
 
     /// Variant columns reach row DML as LargeBinary, which is what keeps them
@@ -853,6 +792,64 @@ mod tests {
             column("id", DataType::Int32),
             column("v", DataType::LargeBinary),
         ]
+    }
+
+    #[test]
+    fn delete_predicates_keep_advanced_and_malformed_in_shapes_unsupported() {
+        let columns = [column("n", DataType::Int32)];
+        for source in [
+            "n IS NOT DISTINCT FROM 1",
+            "n BETWEEN 1 AND 2",
+            "n IS TRUE",
+            "n LIKE '1%'",
+        ] {
+            let error = super::validate_where(&where_expr(source), &columns).unwrap_err();
+            let crate::dml::error::DmlExecutionError::Engine(error) = error else {
+                panic!("unsupported predicate error");
+            };
+            assert!(
+                error.contains("does not support predicate"),
+                "{source}: {error}"
+            );
+        }
+        let mut predicate = where_expr("n IN (1, 2)");
+        let Expr::Predicated(expression) = &mut predicate else {
+            panic!("IN predicate");
+        };
+        let novarocks_parser::ast::Predicate::In(in_predicate) = &mut expression.predicate else {
+            panic!("IN payload");
+        };
+        let bare_list = in_predicate.value_list.clone();
+        assert!(super::validate_where(&bare_list, &columns).is_err());
+        let Expr::InList(list) = &mut in_predicate.value_list else {
+            panic!("IN list");
+        };
+        list.values.clear();
+        assert!(super::validate_where(&predicate, &columns).is_err());
+        let Expr::Predicated(expression) = &mut predicate else {
+            unreachable!();
+        };
+        let novarocks_parser::ast::Predicate::In(in_predicate) = &mut expression.predicate else {
+            unreachable!();
+        };
+        in_predicate.value_list = novarocks_parser::build::string("not a value list");
+        assert!(super::validate_where(&predicate, &columns).is_err());
+    }
+
+    #[test]
+    fn delete_logical_validation_reports_the_first_original_term() {
+        let columns = [column("n", DataType::Int8)];
+        for (predicate, first) in [
+            ("n = 128 AND n = 129 AND n = 130", 128),
+            ("n = 130 OR n = 129 OR n = 128", 130),
+            ("n = 1 AND (n = 129 OR n = 130)", 129),
+        ] {
+            let error = super::validate_where(&where_expr(predicate), &columns).unwrap_err();
+            let crate::dml::error::DmlExecutionError::Engine(error) = error else {
+                panic!("original literal validation error");
+            };
+            assert!(error.contains(&format!("literal `{first}`")), "{error}");
+        }
     }
 
     #[test]
@@ -987,19 +984,21 @@ mod tests {
         assert_eq!(select.selection.as_ref(), Some(&where_clause));
         assert_eq!(select.projection.len(), 3);
         for (item, expected) in select.projection.iter().zip(["_file", "_pos", "region"]) {
-            let novarocks_parser::ast::SelectItem::UnnamedExpr(Expr::Identifier(name)) = item
-            else {
+            let novarocks_parser::ast::SelectItem::SingleColumn(column) = item else {
+                panic!("identity or partition-source column");
+            };
+            assert!(column.alias.is_none());
+            let Expr::Identifier(name) = &column.expression else {
                 panic!("identity or partition-source column");
             };
             assert_eq!(name.value, expected);
             assert!(name.quoted);
-            assert_eq!(name.quote_style, Some('`'));
         }
-        let novarocks_parser::ast::TableFactor::Table { name, version, .. } =
-            &select.from[0].relation
-        else {
+        let Some(novarocks_parser::ast::Relation::Table(table)) = &select.from else {
             panic!("target table");
         };
+        let name = &table.name;
+        let version = &table.query_period;
         assert_eq!(
             name.parts
                 .iter()
@@ -1007,7 +1006,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["ice", "db", "orders"]
         );
-        assert!(name.parts.iter().all(|part| part.quote_style == Some('`')));
+        assert!(name.parts.iter().all(|part| part.quoted));
         assert!(version.is_none());
     }
 
@@ -1032,11 +1031,11 @@ mod tests {
         let novarocks_parser::ast::SetExpr::Select(select) = query.body.as_ref() else {
             panic!("SELECT");
         };
-        let novarocks_parser::ast::TableFactor::Table { name, version, .. } =
-            &select.from[0].relation
-        else {
+        let Some(novarocks_parser::ast::Relation::Table(table)) = &select.from else {
             panic!("target table");
         };
+        let name = &table.name;
+        let version = &table.query_period;
         assert_eq!(
             name.parts
                 .iter()
@@ -1045,12 +1044,13 @@ mod tests {
             vec!["ice", "db", "orders"]
         );
         let version = version.as_ref().expect("branch pin");
+        assert!(version.start.is_none());
         assert_eq!(
-            version.kind,
-            novarocks_parser::ast::TableVersionKind::ForVersionAsOf
+            version.range_type,
+            novarocks_parser::ast::QueryPeriodRangeType::Version
         );
         assert!(
-            matches!(&version.value, Expr::Literal(literal) if literal.kind == LiteralKind::String("dev".into()))
+            matches!(version.end.as_deref(), Some(Expr::Literal(literal)) if literal.kind == LiteralKind::String("dev".into()))
         );
     }
 
@@ -1075,21 +1075,18 @@ mod tests {
             panic!("SELECT");
         };
         assert_eq!(select.selection.as_ref(), Some(&where_clause));
-        let novarocks_parser::ast::TableFactor::Table {
-            version: Some(version),
-            ..
-        } = &select.from[0].relation
-        else {
-            panic!("branch pin");
+        let Some(novarocks_parser::ast::Relation::Table(table)) = &select.from else {
+            panic!("target table");
         };
+        let version = table.query_period.as_ref().expect("branch pin");
         assert!(
-            matches!(&version.value, Expr::Literal(literal) if literal.kind == LiteralKind::String(branch.into()))
+            matches!(version.end.as_deref(), Some(Expr::Literal(literal)) if literal.kind == LiteralKind::String(branch.into()))
         );
     }
 
     #[test]
     fn delete_position_sink_retains_boolean_grouping_and_source_leaves() {
-        use novarocks_parser::ast::{self, SyntaxEq, Visit};
+        use novarocks_parser::ast::{self, Visit};
         #[derive(Default)]
         struct Leaves(Vec<Expr>);
         impl ast::Visit for Leaves {
@@ -1116,14 +1113,6 @@ mod tests {
                     .map(|value| format!("id = {value}"))
                     .collect::<Vec<_>>()
                     .join(&format!(" {operator} "));
-                let expected = if count == 4 {
-                    format!("id = 1 {operator} id = 2 {operator} (id = 3 {operator} id = 4)")
-                } else {
-                    format!(
-                        "id = 1 {operator} id = 2 {operator} (id = 3 {operator} id = 4) \
-                         {operator} (id = 5 {operator} id = 6 {operator} (id = 7 {operator} id = 8))"
-                    )
-                };
                 let original = where_expr(&input);
                 let query =
                     super::build_delete_position_sink_query(&target, &original, &columns, "main")
@@ -1132,7 +1121,21 @@ mod tests {
                     panic!("DELETE selection query");
                 };
                 let actual = select.selection.as_ref().unwrap();
-                assert!(actual.syntax_eq(&where_expr(&expected)), "{input}");
+                let Expr::Logical(original_logical) = &original else {
+                    panic!("original logical chain");
+                };
+                let Expr::Logical(actual_logical) = actual else {
+                    panic!("generated logical chain");
+                };
+                assert_eq!(actual_logical.operator, original_logical.operator);
+                assert_eq!(actual_logical.terms.len(), count);
+                for (actual_term, original_term) in
+                    actual_logical.terms.iter().zip(&original_logical.terms)
+                {
+                    assert_eq!(actual_term, original_term, "{input}");
+                    assert_eq!(actual_term.span(), original_term.span(), "{input}");
+                }
+                assert_eq!(actual, &original, "{input}");
                 let mut original_leaves = Leaves::default();
                 let mut actual_leaves = Leaves::default();
                 original_leaves.visit_expr(&original);
@@ -1149,10 +1152,20 @@ mod tests {
         let ast::SetExpr::Select(select) = query.body.as_ref() else {
             panic!("DELETE selection query");
         };
-        assert!(select.selection.as_ref().unwrap().syntax_eq(&where_expr(
-            "id <= 18000 OR (id > 20000 AND id <= 38000) \
-             OR ((id > 40000 AND id <= 58000) OR (id > 60000 AND id <= 78000))"
-        )));
+        let actual = select.selection.as_ref().unwrap();
+        assert_eq!(actual, &predicate);
+        let Expr::Logical(logical) = actual else {
+            panic!("original OR chain");
+        };
+        assert_eq!(logical.operator, ast::LogicalOperator::Or);
+        assert_eq!(logical.terms.len(), 4);
+        for term in &logical.terms[1..] {
+            let Expr::Logical(group) = term else {
+                panic!("original grouped AND");
+            };
+            assert_eq!(group.operator, ast::LogicalOperator::And);
+            assert_eq!(group.terms.len(), 2);
+        }
     }
 
     // --------------- Timestamp predicate tests ---------------

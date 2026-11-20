@@ -31,26 +31,24 @@ CREATE TABLE ${case_db}.t_agg_sketch_bitmap_source (
     id_int INT,
     name STRING,
     vb VARBINARY
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 CREATE TABLE ${case_db}.t_agg_ds_hll_state (
     grp INT,
     ds_vb BINARY
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t_agg_sketch_bitmap_source VALUES
-    (1, 1, 'alpha', to_binary('alpha', 'utf8')),
-    (1, 2, 'beta', to_binary('beta', 'utf8')),
-    (1, 2, 'beta-dup', to_binary('beta', 'utf8')),
-    (1, 3, 'gamma', to_binary('gamma', 'utf8')),
-    (2, 3, 'gamma-dup', to_binary('gamma', 'utf8')),
-    (2, 4, 'delta', to_binary('delta', 'utf8')),
-    (2, 5, 'epsilon', to_binary('epsilon', 'utf8')),
-    (2, NULL, 'null-vb', NULL),
-    (3, 6, 'zeta', to_binary('zeta', 'utf8')),
-    (3, 6, 'zeta-dup', to_binary('zeta', 'utf8'));
+    ROW(1, 1, 'alpha', to_binary('alpha', 'utf8')),
+    ROW(1, 2, 'beta', to_binary('beta', 'utf8')),
+    ROW(1, 2, 'beta-dup', to_binary('beta', 'utf8')),
+    ROW(1, 3, 'gamma', to_binary('gamma', 'utf8')),
+    ROW(2, 3, 'gamma-dup', to_binary('gamma', 'utf8')),
+    ROW(2, 4, 'delta', to_binary('delta', 'utf8')),
+    ROW(2, 5, 'epsilon', to_binary('epsilon', 'utf8')),
+    ROW(2, NULL, 'null-vb', NULL),
+    ROW(3, 6, 'zeta', to_binary('zeta', 'utf8')),
+    ROW(3, 6, 'zeta-dup', to_binary('zeta', 'utf8'));
 
 INSERT INTO ${case_db}.t_agg_ds_hll_state
 SELECT

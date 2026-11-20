@@ -28,11 +28,10 @@
 -- @skip_result_check=true
 DROP TABLE IF EXISTS ${case_db}.t_cte_multi;
 CREATE TABLE ${case_db}.t_cte_multi (
-    y bigint NULL,
-    v bigint NULL
-)
-TBLPROPERTIES ("format-version" = "3");
-INSERT INTO ${case_db}.t_cte_multi VALUES (2001, 10), (2002, 20), (2003, 30);
+    y bigint ,
+    v bigint
+) WITH (format_version = 3);
+INSERT INTO ${case_db}.t_cte_multi VALUES ROW(2001, 10), ROW(2002, 20), ROW(2003, 30);
 
 -- query 2
 -- @order_sensitive=true

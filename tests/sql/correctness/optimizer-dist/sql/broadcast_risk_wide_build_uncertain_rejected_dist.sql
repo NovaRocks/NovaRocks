@@ -16,21 +16,20 @@
 -- under the License.
 
 -- @tags=optimizer,bc1,distribution,dist-only
-CREATE DATABASE IF NOT EXISTS ${case_db};
+CREATE SCHEMA IF NOT EXISTS ${case_db};
 USE ${case_db};
 CREATE TABLE probe_1m_exact (k INT);
-CREATE TABLE build_wide_unanalyzed (k INT, pad VARCHAR(500))
-TBLPROPERTIES ('novarocks.statistics.collect-on-write' = 'false');
+CREATE TABLE build_wide_unanalyzed (k INT, pad VARCHAR(500)) WITH (statistics_collect_on_write = false);
 INSERT INTO probe_1m_exact
     SELECT generate_series FROM TABLE(generate_series(1, 1000000));
 INSERT INTO build_wide_unanalyzed
     SELECT generate_series, repeat('z', 500) FROM TABLE(generate_series(1, 200000));
-ANALYZE TABLE probe_1m_exact;
-SET cbo_broadcast_node_mem_budget_bytes = 268435456;
+ANALYZE probe_1m_exact;
+SET SESSION cbo_broadcast_node_mem_budget_bytes = 268435456;
 -- @explain_contains=HASH JOIN (PARTITIONED
 -- @explain_not_contains=BROADCAST, INNER
 -- @explain_not_contains=memory=inf
-SELECT COUNT(*) AS cnt FROM probe_1m_exact p JOIN build_wide_unanalyzed b ON p.k = b.k;
+SELECT COUNT() AS cnt FROM probe_1m_exact p JOIN build_wide_unanalyzed b ON p.k = b.k;
 
 -- Assert the selected distribution and the edge contract, without node numbers.
 -- @skip_result_check=true
@@ -45,8 +44,8 @@ SELECT COUNT(*) AS cnt FROM probe_1m_exact p JOIN build_wide_unanalyzed b ON p.k
 -- @result_contains=RUNTIME FILTER GRAPH
 -- @result_contains=activation = BlockingSnapshot
 -- @result_contains=columns: k
-EXPLAIN VERBOSE
-SELECT COUNT(*) AS cnt FROM probe_1m_exact p JOIN build_wide_unanalyzed b ON p.k = b.k;
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
+SELECT COUNT() AS cnt FROM probe_1m_exact p JOIN build_wide_unanalyzed b ON p.k = b.k;
 
 -- The build has ten i64 keys: 80 payload bytes; every backend receives it.
 -- @skip_result_check=true
@@ -58,7 +57,7 @@ SELECT COUNT(*) AS cnt FROM probe_1m_exact p JOIN build_wide_unanalyzed b ON p.k
 -- @result_contains=activation = BlockingSnapshot
 -- @result_not_contains=HASH JOIN (PARTITIONED
 -- @query_stats_contract={"tables":[],"broadcast":{"distribution":"BROADCAST","join_kind":"INNER","verdict":"feasible","forced":false,"backends":3,"risk_multiplier":2,"per_node_budget_bytes":268435456,"cluster_network_budget_bytes":268435456},"payload":{"kind":"exact","bytes":80},"hash_table":{"kind":"exact","build_rows":10,"load_factor":0.75,"per_row_overhead_bytes":16}}
-EXPLAIN COSTS
+EXPLAIN WITH SESSION explain_detail = 'COSTS'
 WITH p AS (
     SELECT generate_series AS k
     FROM TABLE(generate_series(1, 1000))
@@ -67,5 +66,5 @@ b AS (
     SELECT generate_series AS k
     FROM TABLE(generate_series(1, 10))
 )
-SELECT COUNT(*) AS cnt
+SELECT COUNT() AS cnt
 FROM p JOIN b ON p.k = b.k;

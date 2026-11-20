@@ -21,12 +21,12 @@
 
 -- query 1
 -- @skip_result_check=true
-DROP TABLE IF EXISTS ${case_db}.sqlx2_delete_unsupported_predicate FORCE;
+DROP TABLE IF EXISTS ${case_db}.sqlx2_delete_unsupported_predicate ;
 CREATE TABLE ${case_db}.sqlx2_delete_unsupported_predicate (
   id BIGINT,
   v STRING
-) TBLPROPERTIES ("format-version" = "3");
-INSERT INTO ${case_db}.sqlx2_delete_unsupported_predicate VALUES (1, 'alpha');
+) WITH (format_version = 3);
+INSERT INTO ${case_db}.sqlx2_delete_unsupported_predicate VALUES ROW(1, 'alpha');
 
 -- query 2
 -- @expect_error=phase 1 DELETE WHERE
@@ -39,4 +39,4 @@ ORDER BY id;
 
 -- query 4
 -- @skip_result_check=true
-DROP TABLE ${case_db}.sqlx2_delete_unsupported_predicate FORCE;
+DROP TABLE ${case_db}.sqlx2_delete_unsupported_predicate ;

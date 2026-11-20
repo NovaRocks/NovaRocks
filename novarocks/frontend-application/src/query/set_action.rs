@@ -24,12 +24,12 @@ use super::{
 };
 use crate::query::compiler::FrontendQueryCompiler;
 use crate::query::session_property_computation::{
-    PreparedSessionProperties, SessionPropertyCpuInput,
+    PreparedSessionProperties, ScopedSessionMutation, SessionPropertyCpuInput,
+    SessionPropertyMutation,
 };
 use crate::query_execution::completion_facts::FrontendPlanningCpuSource;
 use crate::query_execution::planning::sql_cancellation_observation;
 use crate::query_execution::required_constant_eval::RequiredConstantInterpreter;
-use novarocks_parser::ast;
 use novarocks_query_application::api::StatementNativeHealthFailure;
 use novarocks_query_application::session_control::{
     GovernedActionContext, GovernedQueryStatementOwner, GovernedStatementAction,
@@ -128,11 +128,10 @@ impl GovernedStatementResidual for SetNativeTail {
 
 struct SetStatementAction {
     source: Arc<str>,
-    set: Option<ast::SetStatement>,
+    mutation: Option<SessionPropertyMutation>,
     live: Arc<Mutex<SessionSqlState>>,
     compiler: FrontendQueryCompiler,
     registry: Arc<SessionPropertyRegistry>,
-    catalog_properties: novarocks_query_application::sql::catalog::SessionCatalogService,
     interpreter: Arc<RequiredConstantInterpreter>,
     control: SqlCompileControl,
     tail: Option<Box<SetNativeTail>>,
@@ -154,7 +153,7 @@ impl SetStatementAction {
             self.error
                 .get_or_insert_with(|| governed_cancellation_error(reason));
         }
-        if self.set.is_some() && self.error.is_none() {
+        if self.mutation.is_some() && self.error.is_none() {
             // Only copy the immutable initial session under this short lock.
             // Analysis, kernels and staged projection all run in the CPU turn.
             let staged = match self.live.lock() {
@@ -172,10 +171,11 @@ impl SetStatementAction {
                     Some(window) => {
                         let input = self.compiler.session_property_input(
                             Arc::clone(&self.source),
-                            self.set.take().expect("one admitted SET payload"),
+                            self.mutation
+                                .take()
+                                .expect("one admitted session property mutation"),
                             staged,
                             Arc::clone(&self.registry),
-                            Arc::clone(&self.catalog_properties),
                             Arc::clone(&self.interpreter),
                             self.control.clone(),
                             owner.scope().clone(),
@@ -268,10 +268,32 @@ impl GovernedStatementAction for SetStatementAction {
 }
 
 impl FrontendQuerySession {
-    pub(super) async fn execute_observed_set(
+    pub(super) async fn execute_observed_scoped_session_mutation(
         &self,
         source: Arc<str>,
-        set: ast::SetStatement,
+        mutation: ScopedSessionMutation,
+        deadline: Option<Instant>,
+        statement: GovernedQueryStatementOwner,
+    ) -> Result<StatementResult, QueryServiceError> {
+        let catalogs: Arc<
+            dyn novarocks_query_application::sql::session::registry::SessionCatalogPropertyPort,
+        > = self.service.session_catalog_resolver.clone();
+        self.execute_observed_session_mutation(
+            source,
+            SessionPropertyMutation {
+                mutation: Box::new(mutation),
+                catalogs,
+            },
+            deadline,
+            statement,
+        )
+        .await
+    }
+
+    async fn execute_observed_session_mutation(
+        &self,
+        source: Arc<str>,
+        mutation: SessionPropertyMutation,
         deadline: Option<Instant>,
         statement: GovernedQueryStatementOwner,
     ) -> Result<StatementResult, QueryServiceError> {
@@ -282,11 +304,10 @@ impl FrontendQuerySession {
         let control = SqlCompileControl::new(deadline, sql_cancellation_observation(cancellation));
         let action = SetStatementAction {
             source,
-            set: Some(set),
+            mutation: Some(mutation),
             live: Arc::clone(&self.state),
             compiler: self.service.query_compiler.clone(),
             registry: Arc::clone(&self.service.session_properties),
-            catalog_properties: Arc::clone(&self.service.session_catalog_resolver),
             interpreter: Arc::clone(&self.service.required_constant_interpreter),
             control,
             tail: Some(Box::new(SetNativeTail {

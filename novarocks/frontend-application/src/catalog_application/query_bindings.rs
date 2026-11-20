@@ -89,6 +89,10 @@ pub enum QueryTableBindingSelector {
     SessionWriteTarget(u32),
     Snapshot(i64),
     Metadata(SqlMetadataTableKind),
+    QualifiedMetadata {
+        kind: SqlMetadataTableKind,
+        binding: novarocks_spi::connector::ConnectorProviderBindingKey,
+    },
     /// One frozen materialized-view target.  The target UUID distinguishes a
     /// recreated table at the same name, while the snapshot keeps target-state
     /// and target-locator scans on the exact refresh baseline.
@@ -156,6 +160,27 @@ impl QueryTableBindingKey {
             table,
             QueryTableBindingSelector::Metadata(kind),
         )
+    }
+
+    pub(super) fn metadata_with_qualification(
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+        kind: SqlMetadataTableKind,
+        binding: Option<&novarocks_spi::connector::ConnectorProviderBindingKey>,
+    ) -> Self {
+        match binding {
+            Some(binding) => Self::new(
+                catalog,
+                namespace,
+                table,
+                QueryTableBindingSelector::QualifiedMetadata {
+                    kind,
+                    binding: binding.clone(),
+                },
+            ),
+            None => Self::metadata(catalog, namespace, table, kind),
+        }
     }
 
     /// Identity for a materialized-view refresh target captured during
@@ -602,6 +627,13 @@ pub struct QueryTableBindingStore {
     exact_binding_receipts: ExactBindingReceiptStore,
     entries: Mutex<HashMap<QueryTableBindingKey, Result<StoredBinding, String>>>,
     by_id: Mutex<HashMap<SqlTableBindingId, Arc<QueryTableBinding>>>,
+    qualifications: Mutex<super::quoted_metadata_qualification::CatalogQualificationBook>,
+    // The canonical table memo is shared across completion rounds. Its typed
+    // causes travel with it when a round recreates the materializer.
+    pub(super) resolution_errors:
+        Mutex<HashMap<QueryTableBindingKey, super::query_catalog::CatalogResolutionError>>,
+    pub(super) original_resolution_errors:
+        Mutex<HashMap<QueryTableBindingKey, crate::mv::domain::application::MvApplicationError>>,
     local_views: Mutex<
         Option<
             Result<
@@ -638,6 +670,9 @@ impl QueryTableBindingStore {
             entries: Mutex::new(HashMap::new()),
             by_id: Mutex::new(HashMap::new()),
             relations: Mutex::new(HashMap::new()),
+            qualifications: Mutex::new(Default::default()),
+            resolution_errors: Mutex::new(HashMap::new()),
+            original_resolution_errors: Mutex::new(HashMap::new()),
             local_views: Mutex::new(None),
             #[cfg(test)]
             sealed_for_topology_replan: AtomicBool::new(false),
@@ -701,6 +736,68 @@ impl QueryTableBindingStore {
             .lock()
             .expect("query table binding allocator lock")
             .scope()
+    }
+
+    /// Observe only the SQL prepass's demand list, once per catalog in this
+    /// binding scope. The compiler receives provider and binding identities,
+    /// while the original runtime observation remains application-owned.
+    pub(crate) fn observe_catalog_qualifications(
+        &self,
+        candidates: &[novarocks_spi::connector::ConnectorInstanceId],
+        catalogs: Option<&dyn novarocks_catalog_application::CatalogApplicationPort>,
+    ) -> Result<
+        novarocks_sql::compiler::CatalogQualifications,
+        novarocks_sql::compiler::SqlCompileError,
+    > {
+        use super::quoted_metadata_qualification::CatalogQualificationObservation;
+        use novarocks_sql::compiler::{
+            CatalogQualification, CatalogQualifications, SqlCompileError,
+        };
+
+        let mut result = CatalogQualifications::default();
+        if candidates.is_empty() {
+            return Ok(result);
+        }
+        let mut original = self.qualifications.lock().map_err(|_| {
+            SqlCompileError::Compilation(
+                "catalog qualification observation lock is poisoned".into(),
+            )
+        })?;
+        for instance in candidates {
+            if !original.contains(instance) {
+                self.require_catalog_observation_allowed()
+                    .map_err(SqlCompileError::Compilation)?;
+            }
+            let observation = original
+                .observe(instance, catalogs)
+                .map_err(super::query_catalog::catalog_application_resolution_error)
+                .map_err(super::query_catalog::CatalogResolutionError::into_compile)?;
+            let qualification = match observation {
+                CatalogQualificationObservation::Absent => CatalogQualification::Absent,
+                CatalogQualificationObservation::Unavailable => CatalogQualification::Unavailable,
+                CatalogQualificationObservation::Ready(read) => read.sql_qualification(),
+            };
+            result.record(instance.clone(), qualification)?;
+        }
+        Ok(result)
+    }
+
+    pub(super) fn qualified_catalog_read(
+        &self,
+        binding: &novarocks_spi::connector::ConnectorProviderBindingKey,
+    ) -> super::query_catalog::CatalogResolutionResult<
+        super::quoted_metadata_qualification::QualifiedCatalogRead,
+    > {
+        self.qualifications
+            .lock()
+            .map_err(|_| {
+                super::query_catalog::CatalogResolutionError::failed(
+                    "catalog qualification observation lock is poisoned",
+                )
+            })?
+            .selected_read(binding)
+            .cloned()
+            .map_err(super::query_catalog::catalog_application_resolution_error)
     }
 
     pub(crate) fn capture_local_views(

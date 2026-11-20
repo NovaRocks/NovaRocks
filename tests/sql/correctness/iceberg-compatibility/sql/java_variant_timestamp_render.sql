@@ -33,4 +33,4 @@ WHERE id IN (17,18,22,23) ORDER BY id;
 
 -- query 3
 -- @skip_result_check=true
-DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_variant_timestamp_${uuid0} FORCE;
+DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_variant_timestamp_${uuid0} ;

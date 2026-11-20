@@ -30,7 +30,7 @@ CREATE TABLE ${case_db}.residual_or_r (k INT, payload INT);
 -- @result_contains=r.k IS NOT NULL
 -- @result_not_contains=UNION ALL
 -- @result_not_contains=NEST LOOP JOIN
-EXPLAIN VERBOSE
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
 SELECT l.payload, r.payload
 FROM ${case_db}.residual_or_l l
 JOIN ${case_db}.residual_or_r r ON l.k = r.k

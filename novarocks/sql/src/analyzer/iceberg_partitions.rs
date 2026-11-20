@@ -18,12 +18,12 @@
 //! SQL-owned partition aggregation over the same frozen Files binding.
 
 use novarocks_parser::{Span, ast};
+use novarocks_types::naming::TableIdentity;
 
 fn ident(value: &str, span: Span) -> ast::Ident {
     ast::Ident {
         value: value.into(),
         quoted: false,
-        quote_style: None,
         span,
     }
 }
@@ -31,114 +31,144 @@ fn column(value: &str, span: Span) -> ast::Expr {
     ast::Expr::Identifier(ident(value, span))
 }
 fn call(name: &str, argument: &str, span: Span) -> ast::Expr {
-    ast::Expr::FunctionCall(ast::FunctionCall {
+    ast::Expr::FunctionCall(ast::AstBox::new(ast::FunctionCall {
         name: ast::ObjectName {
             parts: vec![ident(name, span)],
             span,
         },
-        arguments: vec![column(argument, span)],
-        quantifier: ast::FunctionQuantifier::None,
-        order_by: Vec::new(),
-        separator: None,
+        arguments: vec![novarocks_parser::build::call_argument(
+            column(argument, span),
+            None,
+        )]
+        .into(),
+        distinct: false,
+        processing_mode: None,
+        order_by: None,
         filter: None,
         null_treatment: None,
-        over: None,
-        substring_from_syntax: false,
+        window: None,
         span,
-    })
+    }))
 }
 fn number(value: &str, span: Span) -> ast::Expr {
     ast::Expr::Literal(ast::Literal {
-        kind: ast::LiteralKind::Number(value.into()),
+        kind: ast::LiteralKind::Long {
+            spelling: value.into(),
+            parsed_value: value
+                .parse::<i64>()
+                .expect("partition integer constructor receives a signed integer"),
+        },
         span,
     })
 }
 fn comparison(
     left: ast::Expr,
-    operator: ast::BinaryOperator,
+    operator: ast::ComparisonOperator,
     right: ast::Expr,
     span: Span,
 ) -> ast::Expr {
-    ast::Expr::Binary(ast::BinaryExpr {
-        left: Box::new(left),
-        operator,
-        right: Box::new(right),
+    ast::Expr::Predicated(ast::AstBox::new(ast::PredicatedExpr {
+        value: left,
+        predicate: ast::Predicate::Comparison(ast::ComparisonPredicate {
+            operator,
+            right,
+            span,
+        }),
         span,
-    })
+    }))
 }
 
 /// Preserve metadata syntax separately from the ordinary relation name, so
 /// an equal table or CTE name cannot shadow the frozen metadata relation.
-pub(super) fn partitions_query(name: &ast::ObjectName, partitioned: bool) -> ast::Query {
+pub(super) fn partitions_query(
+    name: &ast::ObjectName,
+    partitioned: bool,
+    qualified: Option<&TableIdentity>,
+) -> ast::Query {
     let span = name.span;
-    let mut source = name.clone();
-    for part in &mut source.parts {
-        part.value = part.value.to_lowercase();
-    }
+    let source = if let Some(base) = qualified {
+        // Keep the generated reference on the exact qualified Files fact.
+        // Its full name also prevents an outer CTE from shadowing this read.
+        ast::ObjectName {
+            parts: vec![
+                ident(&base.catalog, span),
+                ident(&base.namespace, span),
+                ast::Ident {
+                    value: format!("{}$files", base.table),
+                    quoted: true,
+                    span,
+                },
+            ],
+            span,
+        }
+    } else {
+        let mut source = name.clone();
+        for part in &mut source.parts {
+            part.value = part.value.to_lowercase();
+        }
+        if let Some(last) = source.parts.last_mut() {
+            let base = super::TableNameView::new(name)
+                .parts()
+                .last()
+                .expect("the last identifier requires a nonempty table name")
+                .to_lowercase();
+            last.value = format!("{base}$files");
+            last.quoted = false;
+        }
+        source
+    };
     let mut projection = Vec::new();
     if partitioned {
-        projection.push(ast::SelectItem::UnnamedExpr(column("partition", span)));
+        projection.push(novarocks_parser::build::item(
+            column("partition", span),
+            None,
+        ));
     }
     for (name, argument, alias) in [
         ("sum", "record_count", "record_count"),
         ("count", "*", "file_count"),
         ("sum", "file_size_in_bytes", "total_size"),
     ] {
-        projection.push(ast::SelectItem::ExprWithAlias {
-            expr: call(name, argument, span),
-            alias: ident(alias, span),
-            explicit_as: true,
-            span,
-        });
+        projection.push(ast::SelectItem::SingleColumn(ast::AstBox::new(
+            ast::SingleColumn {
+                expression: call(name, argument, span),
+                alias: Some(ident(alias, span)),
+                span,
+            },
+        )));
     }
     ast::Query {
+        session_properties: Vec::new().into(),
+        functions: Vec::new().into(),
         with: None,
-        body: Box::new(ast::SetExpr::Select(Box::new(ast::Select {
-            hints: Vec::new(),
-            quantifier: ast::SelectQuantifier::None,
-            projection,
-            from: vec![ast::TableWithJoins {
-                relation: ast::TableFactor::Table {
-                    name: source,
-                    metadata: Some(ident("files", span)),
-                    alias: None,
-                    version: None,
-                    span,
-                },
-                joins: Vec::new(),
-                span,
-            }],
+        body: ast::AstBox::new(ast::SetExpr::Select(ast::AstBox::new(ast::Select {
+            distinct: false,
+            projection: projection.into(),
+            from: Some(novarocks_parser::build::table(source, None, None)),
             selection: Some(comparison(
                 column("content", span),
-                ast::BinaryOperator::Equal,
+                ast::ComparisonOperator::Equal,
                 number("0", span),
                 span,
             )),
             group_by: if partitioned {
-                ast::GroupBy::Expressions {
-                    expressions: vec![column("partition", span)],
-                    span,
-                }
+                novarocks_parser::build::group_by(vec![column("partition", span)])
             } else {
-                ast::GroupBy::None
+                None
             },
             having: (!partitioned).then(|| {
                 comparison(
                     call("count", "*", span),
-                    ast::BinaryOperator::GreaterThan,
+                    ast::ComparisonOperator::GreaterThan,
                     number("0", span),
                     span,
                 )
             }),
-            qualify: None,
-            windows: Vec::new(),
+            windows: Vec::new().into(),
+            modifiers: Default::default(),
             span,
         }))),
-        order_by: Vec::new(),
-        limit: None,
-        offset: None,
-        limit_comma_offset: false,
-        fetch: None,
+        modifiers: Default::default(),
         span,
     }
 }
@@ -159,46 +189,42 @@ mod tests {
                 span,
             };
             for partitioned in [true, false] {
-                let query = partitions_query(&name, partitioned);
+                let query = partitions_query(&name, partitioned, None);
                 let ast::SetExpr::Select(select) = query.body.as_ref() else {
                     panic!("select")
                 };
-                let ast::TableFactor::Table {
-                    name: inner,
-                    metadata,
-                    ..
-                } = &select.from[0].relation
-                else {
+                let Some(ast::Relation::Table(table)) = &select.from else {
                     panic!("metadata table")
                 };
+                let view = crate::analyzer::TableNameView::new(&table.name);
                 assert_eq!(
-                    inner
-                        .parts
-                        .iter()
-                        .map(|p| p.value.as_str())
-                        .collect::<Vec<_>>(),
+                    view.parts().collect::<Vec<_>>(),
                     parts.iter().map(|p| p.to_lowercase()).collect::<Vec<_>>()
                 );
-                assert_eq!(metadata.as_ref().unwrap().value, "files");
-                let ast::Expr::Binary(filter) = select.selection.as_ref().unwrap() else {
+                assert_eq!(view.metadata.unwrap().value, "files");
+                let ast::Expr::Predicated(filter) = select.selection.as_ref().unwrap() else {
                     panic!("content filter")
                 };
-                assert_eq!(*filter.left, column("content", span));
-                assert_eq!(filter.operator, ast::BinaryOperator::Equal);
-                assert_eq!(*filter.right, number("0", span));
+                assert_eq!(filter.value, column("content", span));
+                let ast::Predicate::Comparison(predicate) = &filter.predicate else {
+                    panic!("comparison")
+                };
+                assert_eq!(predicate.operator, ast::ComparisonOperator::Equal);
+                assert_eq!(predicate.right, number("0", span));
                 assert_eq!(select.projection.len(), if partitioned { 4 } else { 3 });
                 if partitioned {
                     assert!(
-                        matches!(&select.group_by, ast::GroupBy::Expressions { expressions, .. } if expressions == &vec![column("partition", span)])
+                        crate::analyzer::simple_group_by_expressions(&select.group_by).unwrap()
+                            == vec![&column("partition", span)]
                     );
                     assert!(select.having.is_none());
                 } else {
-                    assert!(matches!(select.group_by, ast::GroupBy::None));
+                    assert!(select.group_by.is_none());
                     assert_eq!(
                         select.having,
                         Some(comparison(
                             call("count", "*", span),
-                            ast::BinaryOperator::GreaterThan,
+                            ast::ComparisonOperator::GreaterThan,
                             number("0", span),
                             span
                         ))
@@ -212,7 +238,6 @@ mod tests {
 #[cfg(test)]
 mod analysis_tests {
     use super::super::iceberg_metadata::{IcebergMetadataDerivedTypes, metadata_table_schema_with};
-    use super::*;
     use crate::analysis::{QueryBody, Relation};
     use crate::catalog::{
         IcebergMetadataTableProvider, PlannerTableProvider, ResolvedAnalyzerTable,
@@ -235,6 +260,15 @@ mod analysis_tests {
         ) -> Result<ResolvedAnalyzerTable, String> {
             Err("ordinary table lookup must not capture the metadata relation".into())
         }
+        fn resolve_quoted_iceberg_metadata(
+            &self,
+            name: &novarocks_parser::ast::ObjectName,
+            catalog: Option<&str>,
+            database: &str,
+        ) -> Option<crate::catalog::QuotedMetadataTable> {
+            crate::compiler::resolve_quoted_iceberg_metadata_for_test(name, catalog, database, self)
+        }
+
         fn iceberg_metadata_provider(&self) -> Option<&dyn IcebergMetadataTableProvider> {
             Some(self)
         }
@@ -292,19 +326,16 @@ mod analysis_tests {
     fn partitions_analysis_schema_matches_nullable_sums_and_required_count() {
         for partitioned in [false, true] {
             for sql in [
-                "SELECT * FROM orders$partitions",
-                "SELECT p.* FROM DB.ORDERS$partitions p",
-                "SELECT `orders$partitions`.* FROM ICE.DB.ORDERS$partitions",
-                "WITH orders AS (SELECT 7 AS content) SELECT p.* FROM orders$partitions p",
+                "SELECT * FROM \"orders$partitions\"",
+                "SELECT p.* FROM DB.\"ORDERS$partitions\" p",
+                "SELECT \"orders$partitions\".* FROM ICE.DB.\"ORDERS$partitions\"",
+                "WITH orders AS (SELECT 7 AS content) SELECT p.* FROM \"orders$partitions\" p",
             ] {
                 let catalog = Catalog {
                     partitioned,
                     calls: Default::default(),
                 };
-                let mut parsed = novarocks_parser::parse(sql).unwrap();
-                let ast::Statement::Query(query) = parsed.remove(0) else {
-                    panic!("query")
-                };
+                let query = novarocks_parser::parser::parse_query(sql).unwrap();
                 let (resolved, _, _) = super::super::analyze(&query, &catalog, "db").unwrap();
                 let partition = partitioned.then(|| {
                     DataType::Struct(vec![Field::new("region", DataType::Int32, true)].into())

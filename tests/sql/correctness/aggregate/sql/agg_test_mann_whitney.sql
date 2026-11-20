@@ -105,19 +105,18 @@ CREATE TABLE t1 (
     c5 bigint,
     c6 largeint,
     c7 string
-    )
-TBLPROPERTIES ("format-version" = "3");
+    ) WITH (format_version = 3);
 
 -- query 13
 -- @skip_result_check=true
 USE ${case_db};
 INSERT INTO t1 values
-    (1, true, 11, 111, 1111, 11111, "111111"),
-    (2, false, 22, 222, 2222, 22222, "222222"),
-    (3, true, 33, 333, 3333, 33333, "333333"),
-    (4, null, null, null, null, null, null),
-    (5, -1, -11, -111, -1111, -11111, "-111111"),
-    (6, null, null, null, null, "36893488147419103232", "680564733841876926926749214863536422912");
+    ROW(1, true, 11, 111, 1111, 11111, '111111'),
+    ROW(2, false, 22, 222, 2222, 22222, '222222'),
+    ROW(3, true, 33, 333, 3333, 33333, '333333'),
+    ROW(4, null, null, null, null, null, null),
+    ROW(5, -1, -11, -111, -1111, -11111, '-111111'),
+    ROW(6, null, null, null, null, '36893488147419103232', '680564733841876926926749214863536422912');
 
 -- query 14
 USE ${case_db};
@@ -215,11 +214,11 @@ group by c1 % 2;
 
 -- query 29
 USE ${case_db};
-SELECT mann_whitney_u_test(col1, col2) FROM (VALUES (1, false)) AS tmp(col1, col2);
+SELECT mann_whitney_u_test(col1, col2) FROM (VALUES ROW(1, false)) AS tmp(col1, col2);
 
 -- query 30
 USE ${case_db};
-SELECT mann_whitney_u_test(col1, col2) FROM (VALUES (1, true),(1, false),(2, true),(2, false),(3, false),(3, null)) AS tmp(col1, col2);
+SELECT mann_whitney_u_test(col1, col2) FROM (VALUES ROW(1, true),ROW(1, false),ROW(2, true),ROW(2, false),ROW(3, false),ROW(3, null)) AS tmp(col1, col2);
 
 -- query 31
 USE ${case_db};

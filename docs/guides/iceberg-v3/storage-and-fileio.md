@@ -38,43 +38,24 @@ under the License.
 
 ## ✅ 本地文件系统
 
-```sql
-CREATE EXTERNAL CATALOG ice
-PROPERTIES (
-  "type" = "iceberg",
-  "iceberg.catalog.type" = "hadoop",
-  "warehouse" = "file:///var/iceberg/warehouse"
-);
+``` sql
+CREATE CATALOG ice USING iceberg WITH ("iceberg.catalog.type" = 'hadoop', "warehouse" = 'file:///var/iceberg/warehouse');
 ```
 
 适合本地学习 / 开发 / 单测；生产请用对象存储或 HDFS。
 
 ## ✅ HDFS
 
-```sql
-CREATE EXTERNAL CATALOG ice
-PROPERTIES (
-  "type" = "iceberg",
-  "iceberg.catalog.type" = "hadoop",
-  "warehouse" = "hdfs://nameservice1/iceberg"
-);
+``` sql
+CREATE CATALOG ice USING iceberg WITH ("iceberg.catalog.type" = 'hadoop', "warehouse" = 'hdfs://nameservice1/iceberg');
 ```
 
 > TODO: 列出可识别的 HDFS / Kerberos 相关 properties。
 
 ## ✅ S3 / S3-compatible（含 MinIO）
 
-```sql
-CREATE EXTERNAL CATALOG ice
-PROPERTIES (
-  "type" = "iceberg",
-  "iceberg.catalog.type" = "hadoop",
-  "warehouse" = "s3://my-bucket/wh",
-  "s3.endpoint" = "http://minio:9000",
-  "s3.access-key" = "...",
-  "s3.secret-key" = "...",
-  "s3.region" = "us-east-1"
-);
+``` sql
+CREATE CATALOG ice USING iceberg WITH ("iceberg.catalog.type" = 'hadoop', "warehouse" = 's3://my-bucket/wh', "s3.endpoint" = 'http://minio:9000', "s3.access-key" = '...', "s3.secret-key" = '...', "s3.region" = 'us-east-1');
 ```
 
 > TODO: 列出完整的 `s3.*` / `aws.*` properties 与 NovaRocks 的对应关系；标注哪些会在未来切到 catalog credential vending。

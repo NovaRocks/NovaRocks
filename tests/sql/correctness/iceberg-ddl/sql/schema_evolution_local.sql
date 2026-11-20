@@ -19,23 +19,21 @@
 -- Validate top-level Iceberg schema evolution over the local Hadoop-style catalog.
 
 -- query 1
-CREATE DATABASE iceberg_ddl_cat_${suite_uuid0}.schema_evolution_local_${uuid0};
+CREATE SCHEMA iceberg_ddl_cat_${suite_uuid0}.schema_evolution_local_${uuid0};
 USE iceberg_ddl_cat_${suite_uuid0}.schema_evolution_local_${uuid0};
 DROP TABLE IF EXISTS orders_local;
 CREATE TABLE orders_local (
   id INT,
   amount FLOAT
-) TBLPROPERTIES (
-  "format-version" = "2"
-);
-INSERT INTO orders_local VALUES (1, 10.5), (2, 20.25);
+) WITH (format_version = 2);
+INSERT INTO orders_local VALUES ROW(1, 10.5), ROW(2, 20.25);
 ALTER TABLE orders_local ADD COLUMN note_text STRING DEFAULT NULL;
 
 -- query 2
 SELECT id, amount, note_text FROM orders_local ORDER BY id;
 
 -- query 3
-INSERT INTO orders_local (id, amount, note_text) VALUES (3, 30.75, 'new');
+INSERT INTO orders_local (id, amount, note_text) VALUES ROW(3, 30.75, 'new');
 
 -- query 4
 SELECT id, amount, note_text FROM orders_local ORDER BY id;
@@ -47,7 +45,7 @@ ALTER TABLE orders_local RENAME COLUMN amount TO total_amount;
 SELECT id, total_amount, note_text FROM orders_local ORDER BY id;
 
 -- query 7
-ALTER TABLE orders_local MODIFY COLUMN id BIGINT;
+ALTER TABLE orders_local ALTER COLUMN id SET DATA TYPE BIGINT;
 
 -- query 8
 SELECT id + 10000000000 AS widened_id, total_amount FROM orders_local ORDER BY id;
@@ -69,7 +67,7 @@ ALTER TABLE orders_local ADD COLUMN note_text STRING DEFAULT NULL;
 SELECT id, total_amount, note_text FROM orders_local ORDER BY id;
 
 -- query 14
-INSERT INTO orders_local (id, total_amount, note_text) VALUES (4, 40.5, 'fresh');
+INSERT INTO orders_local (id, total_amount, note_text) VALUES ROW(4, 40.5, 'fresh');
 
 -- query 15
 SELECT id, total_amount, note_text FROM orders_local ORDER BY id;
@@ -80,12 +78,12 @@ ALTER TABLE orders_local DROP COLUMN _row_id;
 
 -- query 17
 -- @skip_result_check=true
-ALTER TABLE orders_local ADD EQUALITY DELETE (id) VALUES (1);
+ALTER TABLE orders_local EXECUTE add_equality_delete(columns => ARRAY['id'], rows => ARRAY[ROW(1)]);
 
 -- query 18
 -- @expect_error=DROP COLUMN `id` is blocked because an Iceberg equality-delete file references `id`
 ALTER TABLE orders_local DROP COLUMN id;
 
 -- query 19
-DROP TABLE iceberg_ddl_cat_${suite_uuid0}.schema_evolution_local_${uuid0}.orders_local FORCE;
-DROP DATABASE iceberg_ddl_cat_${suite_uuid0}.schema_evolution_local_${uuid0};
+DROP TABLE iceberg_ddl_cat_${suite_uuid0}.schema_evolution_local_${uuid0}.orders_local ;
+DROP SCHEMA iceberg_ddl_cat_${suite_uuid0}.schema_evolution_local_${uuid0};

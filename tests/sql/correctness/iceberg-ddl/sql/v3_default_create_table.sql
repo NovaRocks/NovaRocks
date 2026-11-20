@@ -22,20 +22,17 @@
 
 -- query 1
 -- @skip_result_check=true
-DROP TABLE IF EXISTS ${case_db}.t_v3_default_ct FORCE;
+DROP TABLE IF EXISTS ${case_db}.t_v3_default_ct ;
 CREATE TABLE ${case_db}.t_v3_default_ct (
   a INT,
   b INT DEFAULT 5
-)
-TBLPROPERTIES (
-  "format-version" = "3"
-);
-INSERT INTO ${case_db}.t_v3_default_ct (a) VALUES (1);
-INSERT INTO ${case_db}.t_v3_default_ct (a, b) VALUES (2, 7);
+) WITH (format_version = 3);
+INSERT INTO ${case_db}.t_v3_default_ct (a) VALUES ROW(1);
+INSERT INTO ${case_db}.t_v3_default_ct (a, b) VALUES ROW(2, 7);
 
 -- query 2
 SELECT a, b FROM ${case_db}.t_v3_default_ct ORDER BY a;
 
 -- query 3
 -- @skip_result_check=true
-DROP TABLE ${case_db}.t_v3_default_ct FORCE;
+DROP TABLE ${case_db}.t_v3_default_ct ;

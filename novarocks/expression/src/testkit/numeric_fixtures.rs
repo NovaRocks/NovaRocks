@@ -451,6 +451,7 @@ fn result_literal(
             None,
             result.clone(),
             ExprKind::Cast {
+                array_failure_mode: None,
                 expr: value,
                 target: result.data_type().clone(),
                 decimal_overflow_policy: policy,
@@ -500,6 +501,7 @@ pub fn cast_fixture(
                     None,
                     ty.clone(),
                     ExprKind::Cast {
+                        array_failure_mode: None,
                         expr: exact,
                         target: DataType::Float32,
                         decimal_overflow_policy: policy,
@@ -580,6 +582,7 @@ pub fn cast_fixture(
                     None,
                     source_type.clone(),
                     ExprKind::Cast {
+                        array_failure_mode: None,
                         expr: exact,
                         target: DataType::Float32,
                         decimal_overflow_policy: policy,
@@ -665,6 +668,7 @@ pub fn cast_fixture(
             None,
             result_type.clone(),
             ExprKind::Cast {
+                array_failure_mode: None,
                 expr: child,
                 target: result_type.data_type().clone(),
                 decimal_overflow_policy: policy,
@@ -1257,6 +1261,7 @@ pub fn inherited_round_fixture_with_target(allow: bool, target: DataType) -> Com
             None,
             result_type.clone(),
             ExprKind::Cast {
+                array_failure_mode: None,
                 expr: child,
                 target,
                 decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
@@ -1299,6 +1304,7 @@ pub fn narrow_unsigned_constant(narrow: DataType) -> CompiledFixture {
             None,
             FunctionValueType::new(narrow.clone(), true),
             ExprKind::Cast {
+                array_failure_mode: None,
                 expr: literal,
                 target: narrow,
                 decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
@@ -1311,6 +1317,7 @@ pub fn narrow_unsigned_constant(narrow: DataType) -> CompiledFixture {
             None,
             FunctionValueType::new(DataType::UInt64, true),
             ExprKind::Cast {
+                array_failure_mode: None,
                 expr: inner,
                 target: DataType::UInt64,
                 decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,

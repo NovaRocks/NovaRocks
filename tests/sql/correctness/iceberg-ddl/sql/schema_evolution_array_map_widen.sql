@@ -23,27 +23,25 @@
 -- `connector::iceberg::catalog::schema_update`.
 
 -- query 1
-CREATE DATABASE iceberg_ddl_cat_${suite_uuid0}.schema_arrmap_${uuid0};
+CREATE SCHEMA iceberg_ddl_cat_${suite_uuid0}.schema_arrmap_${uuid0};
 USE iceberg_ddl_cat_${suite_uuid0}.schema_arrmap_${uuid0};
 DROP TABLE IF EXISTS samples;
 CREATE TABLE samples (
   id INT,
   scores ARRAY<INT>,
   attrs MAP<STRING, INT>
-) TBLPROPERTIES (
-  "format-version" = "2"
-);
+) WITH (format_version = 2);
 
 -- query 2
-ALTER TABLE samples MODIFY COLUMN scores.element BIGINT;
+ALTER TABLE samples ALTER COLUMN scores.element SET DATA TYPE BIGINT;
 
 -- query 3
-ALTER TABLE samples MODIFY COLUMN attrs.value BIGINT;
+ALTER TABLE samples ALTER COLUMN attrs.value SET DATA TYPE BIGINT;
 
 -- query 4
 -- @expect_error=unsupported Iceberg type evolution
-ALTER TABLE samples MODIFY COLUMN scores.element INT;
+ALTER TABLE samples ALTER COLUMN scores.element SET DATA TYPE INT;
 
 -- query 5
 DROP TABLE samples;
-DROP DATABASE iceberg_ddl_cat_${suite_uuid0}.schema_arrmap_${uuid0};
+DROP SCHEMA iceberg_ddl_cat_${suite_uuid0}.schema_arrmap_${uuid0};

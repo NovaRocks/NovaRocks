@@ -354,6 +354,7 @@ code-anchors:
 normalizer、AST mutation或printer生成的内部表示。运行期可以按请求派生typed/canonical facts，但派生物不能反向成为
 语言或durable authority。
 
+- [ADR-0241](ADR-0241-sole-trino-sql-dialect-and-closed-syntax-extensions.md) — Trino SQL 为何是唯一文法，语法扩展、AST 差异、能力准入与 printer 的边界（active；补充 ADR-0090／0101／0231）
 - [ADR-0232](ADR-0232-statement-owned-maintenance-statistics-and-state-surfaces.md) — 维护与统计为何归原语句执行，取消为何保留原 Source 至真实退出，状态为何分别由统计、MV 系统关系与管理 API 提供（active；部分替代 ADR-0169/0111/0226，GC Accelerator、Catalog 准入与三态 publication 保留）
 - [ADR-0222](ADR-0222-session-property-declarations-and-required-constant-evaluation.md) — 会话属性为何共用唯一声明、分离四层输入与实例代次，并由原受监督 CPU 必求值后一次提交（active；补充 ADR-0100/0191/0203，optional folding 与原协议生命周期保留）
 - [ADR-0220](ADR-0220-canonical-json-membership-and-utc-variant-timestamps.md) — JSON membership为何共用规范键与哈希null-aware LeftMark、JSON与VARIANT为何分析期隔离、Variant时间戳为何纯UTC渲染（active；补充ADR-0212的mark输出，原join生命周期保留）

@@ -29,21 +29,20 @@ CREATE TABLE ${case_db}.t_dg (
     g INT,
     x INT,
     a BIGINT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 3
 -- @skip_result_check=true
 INSERT INTO ${case_db}.t_dg
 VALUES
-    (1, 100, 10), (1, 100, 20), (1, 200, 30),
-    (2, 100, 40), (2, 300, 50), (2, 300, 60),
-    (3, 400, 70);
+    ROW(1, 100, 10), ROW(1, 100, 20), ROW(1, 200, 30),
+    ROW(2, 100, 40), ROW(2, 300, 50), ROW(2, 300, 60),
+    ROW(3, 400, 70);
 
 -- query 4
 -- @skip_result_check=true
 -- Force this case through SplitDistinctAgg's distributed multi-phase path.
-SET disable_optimizer_rules = 'AggToHashAgg';
+SET SESSION disable_optimizer_rules = 'AggToHashAgg';
 
 -- query 5
 -- @explain_contains=HASH AGGREGATE (LOCAL,
@@ -57,4 +56,4 @@ ORDER BY g;
 
 -- query 6
 -- @skip_result_check=true
-SET disable_optimizer_rules = '';
+SET SESSION disable_optimizer_rules = '';

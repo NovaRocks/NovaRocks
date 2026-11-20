@@ -96,7 +96,7 @@ fn sample_definition() -> DefinitionDocument {
         1_700_000_000_000,
         QuerySource {
             effective_sql: "SELECT AVG(o.amount) AS average_amount FROM ice.sales.orders o UNION ALL SELECT AVG(o2.amount) AS average_amount FROM ice.sales.orders o2".to_string(),
-            dialect: QueryDialect::StarRocks,
+            dialect: QueryDialect::Trino,
             resolution: ResolutionContext {
                 default_catalog: "ice".to_string(),
                 default_namespace: "sales".to_string(),
@@ -624,7 +624,7 @@ pub fn union_all_keyed_projection_fixture(
         1_700_000_000_000,
         QuerySource {
             effective_sql: balanced_union(&selects),
-            dialect: QueryDialect::StarRocks,
+            dialect: QueryDialect::Trino,
             resolution: ResolutionContext {
                 default_catalog: "ice".into(),
                 default_namespace: "sales".into(),

@@ -40,18 +40,17 @@ CREATE TABLE tbl_with_null1 (
     K11 float,
     K12 double,
     K13 decimal(27,9)
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 2
 -- @skip_result_check=true
 USE ${case_db};
 INSERT INTO tbl_with_null1 VALUES
- ('2020-10-22','2020-10-23 12:12:12','k1','k4',0,1,2,3,4,5,1.1,1.12,2.889)
-,('2020-10-23','2020-10-23 12:12:12','k2','k4',0,0,2,3,4,5,1.1,1.12,2.889)
-,('2020-10-24','2020-10-23 12:12:12','k3','k4',0,1,2,3,4,5,1.1,1.12,2.889)
-,('2020-10-25','2020-10-23 12:12:12','k4','k4',0,1,2,3,4,NULL,NULL,NULL,2.889)
-,('2020-10-26',NULL, NULL, NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL);
+ ROW('2020-10-22','2020-10-23 12:12:12','k1','k4',0,1,2,3,4,5,1.1,1.12,2.889)
+,ROW('2020-10-23','2020-10-23 12:12:12','k2','k4',0,0,2,3,4,5,1.1,1.12,2.889)
+,ROW('2020-10-24','2020-10-23 12:12:12','k3','k4',0,1,2,3,4,5,1.1,1.12,2.889)
+,ROW('2020-10-25','2020-10-23 12:12:12','k4','k4',0,1,2,3,4,NULL,NULL,NULL,2.889)
+,ROW('2020-10-26',NULL, NULL, NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL);
 
 -- query 3
 -- @skip_result_check=true
@@ -70,18 +69,17 @@ CREATE TABLE tbl_with_null2 (
     K11 float,
     K12 double,
     K13 decimal(27,9)
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 4
 -- @skip_result_check=true
 USE ${case_db};
 INSERT INTO tbl_with_null2 VALUES
- ('2020-10-22','2020-10-23 12:12:12','k1','k4',0,1,2,3,4,5,1.1,1.12,2.889)
-,('2020-10-23','2020-10-23 12:12:12','k2','k4',0,0,2,3,4,5,1.1,1.12,2.889)
-,('2020-10-24','2020-10-23 12:12:12','k3','k4',0,1,2,3,4,5,1.1,1.12,2.889)
-,('2020-10-25','2020-10-23 12:12:12','k4','k4',0,1,2,3,4,NULL,NULL,NULL,2.889)
-,('2020-10-26',NULL, NULL, NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL);
+ ROW('2020-10-22','2020-10-23 12:12:12','k1','k4',0,1,2,3,4,5,1.1,1.12,2.889)
+,ROW('2020-10-23','2020-10-23 12:12:12','k2','k4',0,0,2,3,4,5,1.1,1.12,2.889)
+,ROW('2020-10-24','2020-10-23 12:12:12','k3','k4',0,1,2,3,4,5,1.1,1.12,2.889)
+,ROW('2020-10-25','2020-10-23 12:12:12','k4','k4',0,1,2,3,4,NULL,NULL,NULL,2.889)
+,ROW('2020-10-26',NULL, NULL, NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL);
 
 -- query 5
 -- GROUPING SETS: () and (k1)
@@ -146,7 +144,7 @@ USE ${case_db};
 WITH cte1 AS (SELECT * FROM tbl_with_null1 ORDER BY k1)
 SELECT multi_distinct_count(k4) AS v1, k1, grouping(k1) AS f_k1, k2, grouping(k2) AS f_k2
 FROM cte1 GROUP BY GROUPING SETS ((), (k1), (k1, k2))
-ORDER BY f_k1 DESC, k1 ASC, f_k2 DESC, k2 ASC, v1 LIMIT 10 OFFSET 0;
+ORDER BY f_k1 DESC, k1 ASC, f_k2 DESC, k2 ASC, v1 OFFSET 0 LIMIT 10;
 
 -- query 14
 -- CTE + JOIN on k1 + count(distinct) + grouping sets
@@ -155,7 +153,7 @@ USE ${case_db};
 WITH cte1 AS (SELECT t1.k1, t2.k2, t1.k3, t2.k4, t2.k5 FROM tbl_with_null1 t1 JOIN tbl_with_null2 t2 ON t1.k1=t2.k1 ORDER BY t1.k1)
 SELECT count(DISTINCT k3) AS v1, count(DISTINCT k4) AS v2, count(DISTINCT k5) AS v3, k1, grouping(k1) AS f_k1, k2, grouping(k2) AS f_k2
 FROM cte1 GROUP BY GROUPING SETS ((), (k1), (k1, k2))
-ORDER BY f_k1 DESC, k1 ASC, f_k2 DESC, k2 ASC, v1, v2, v3 LIMIT 10 OFFSET 0;
+ORDER BY f_k1 DESC, k1 ASC, f_k2 DESC, k2 ASC, v1, v2, v3 OFFSET 0 LIMIT 10;
 
 -- query 15
 -- CTE + JOIN on k6 + count(distinct) + grouping sets
@@ -164,4 +162,4 @@ USE ${case_db};
 WITH cte1 AS (SELECT t1.k1, t2.k2, t1.k3, t2.k4, t2.k5 FROM tbl_with_null1 t1 JOIN tbl_with_null2 t2 ON t1.k6=t2.k6 ORDER BY t1.k6)
 SELECT count(DISTINCT k3) AS v1, count(DISTINCT k4) AS v2, count(DISTINCT k5) AS v3, k1, grouping(k1) AS f_k1, k2, grouping(k2) AS f_k2
 FROM cte1 GROUP BY GROUPING SETS ((), (k1), (k1, k2))
-ORDER BY f_k1 DESC, k1 ASC, f_k2 DESC, k2 ASC, v1, v2, v3 LIMIT 10 OFFSET 0;
+ORDER BY f_k1 DESC, k1 ASC, f_k2 DESC, k2 ASC, v1, v2, v3 OFFSET 0 LIMIT 10;

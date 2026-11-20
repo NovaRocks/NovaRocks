@@ -28,15 +28,14 @@ CREATE TABLE ${case_db}.t_analytic_row_rank_dense (
     grp VARCHAR(10),
     id INT,
     score INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t_analytic_row_rank_dense VALUES
-    ('A', 1, 100),
-    ('A', 2, 100),
-    ('A', 3, 90),
-    ('B', 4, 80),
-    ('B', 5, 70);
+    ROW('A', 1, 100),
+    ROW('A', 2, 100),
+    ROW('A', 3, 90),
+    ROW('B', 4, 80),
+    ROW('B', 5, 70);
 
 SELECT
     grp,

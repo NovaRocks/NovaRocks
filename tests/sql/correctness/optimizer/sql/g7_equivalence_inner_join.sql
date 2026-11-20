@@ -36,11 +36,11 @@ DROP TABLE IF EXISTS ${case_db}.g7_l;
 DROP TABLE IF EXISTS ${case_db}.g7_r;
 CREATE TABLE ${case_db}.g7_l (lk BIGINT, payload BIGINT);
 CREATE TABLE ${case_db}.g7_r (rk BIGINT, payload BIGINT);
-EXPLAIN VERBOSE
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
 SELECT l.lk, r.rk
 FROM ${case_db}.g7_l l
 JOIN ${case_db}.g7_r r ON l.lk = r.rk AND l.lk = 10;
-EXPLAIN VERBOSE
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
 SELECT l.lk, r.rk
 FROM ${case_db}.g7_l l
 JOIN ${case_db}.g7_r r ON l.lk = r.rk AND r.rk = 20;

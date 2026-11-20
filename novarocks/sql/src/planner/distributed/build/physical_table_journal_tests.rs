@@ -331,7 +331,7 @@ fn table_journal_computed_none_stays_none_when_emitted_as_constant() {
     let value = list_value(1);
     let input = TypedExpr {
         value_type: value.value_type.clone(),
-        kind: ExprKind::Nested(Box::new(value)),
+        kind: ExprKind::Nested(novarocks_parser::ast::AstBox::new(value)),
     };
     let (source, _) = table_fixture(vec![input], false);
     let owner = finish(&source);

@@ -40,7 +40,7 @@ printf 'SPARK_SQL_OK\n'
 
 -- query 2
 SELECT count(*) AS n_data_files
-FROM iceberg_compat_${suite_uuid0}.${case_db}.composite_units_${uuid0}$files
+FROM iceberg_compat_${suite_uuid0}.${case_db}."composite_units_${uuid0}$files"
 WHERE content = 0;
 
 -- query 3
@@ -52,4 +52,4 @@ FROM iceberg_compat_${suite_uuid0}.${case_db}.composite_units_${uuid0};
 
 -- query 4
 -- @skip_result_check=true
-DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.composite_units_${uuid0} FORCE;
+DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.composite_units_${uuid0} ;

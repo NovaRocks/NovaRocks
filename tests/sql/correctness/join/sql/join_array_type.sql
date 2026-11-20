@@ -50,18 +50,17 @@ ai_1  Array<Array<BigInt>>,
 as_1  Array<Array<String>>,
 aas_1 Array<Array<Array<String>>>,
 aad_1 Array<Array<Array<DECIMAL(26, 2)>>>
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 3
 -- @skip_result_check=true
 INSERT INTO ${case_db}.array_test VALUES
-(1,[null], ['a', 'b', 'c'], [1.0, 2.0, 3.0, 4.0, 10.0], [1.0, 2.0, 3.0, 4.0, 10.0, 1.1, 2.1, 3.2, 4.3, -1, -10, 100], [4.0, 10.0, 1.1, 2.1, 3.2, 4.3, -1, -10, 100, 1.0, 2.0, 3.0], [4.0, 10.0, 1.1, -10, 100, 1.0, 2.0, 3.0, 2.1, 3.2, 4.3, -1], [4.0, 2.1, 3.2, 10.0, 1.1, -10, 100, -1, 1.0, 2.0, 3.0, 4.3], [4.0, 2.1, 3.2, 10.0, 2.0, 3.0, 1.1, -1, -10, 100, 1.0, 4.3], [4.0, 2.1, 3.0, 1.1, 4.3, 3.2, -10, 100, 1.0, 10.0, -1, 2.0], [4.0, 2.1, 100, 1.0, 4.3, 3.2, 10.0, 2.0, 3.0, 1.1, -1, -10], [[1, 2, 3, 4], [5, 2, 6, 4], [100, -1, 92, 8], [66, 4, 32, -10]], [['1', '2', '3', '4'], ['-1', 'a', '-100', '100'], ['a', 'b', 'c']], [[['1'],['2'],['3']], [['6'],['5'],['4']], [['-1', '-2'],['-2', '10'],['100','23']]], [[[1],[2],[3]], [[6],[5],[4]], [[-1, -2],[-2, 10],[100,23]]]),
-(2,[1], ['-1', '10', '1', '100', '2'], NULL, [10.0, 20.0, 30.0, 4.0, 100.0, 10.1, 2.1, 30.2, 40.3, -1, -10, 100], [40.0, 100.0, 01.1, 2.1, 30.2, 40.3, -1, -100, 1000, 1.0, 2.0, 3.0], [40.0, 100.0, 01.1, -10, 1000, 10.0, 2.0, 30.0, 20.1, 3.2, 4.3, -1], NULL, NULL, [40.0, 20.1, 30.0, 10.1, 40.30, 30.20, -100, 1000, 1.0, 100.0, -10, 2.0], [40.0, 20.1, 1000, 10.0, 40.30, 30.20, 100.0, 20.0, 3.0, 10.1, -10, -10], NULL, NULL, [[['10'],['20'],['30']], [['60'],['5'],['4']], [['-100', '-2'],['-20', '10'],['100','23']]], [[[10],[20],[30]], [[60],[50],[4]], [[-1, -2],[-2, 100],[100,23]]]),
-(4,[1,2,3,4,10], ['a', NULL, 'c', 'e', 'd'], [1.0, 2.0, 3.0, 4.0, 10.0], [1.0, 2.0, 3.0, 4.0, 10.0, NULL, 1.1, 2.1, 3.2, NULL, 4.3, -1, -10, 100], [4.0, 10.0, 1.1, 2.1,NULL, 3.2, 4.3, -1, -10, 100, 1.0, 2.0, 3.0], [4.0, 10.0, 1.1, -10, 100, 1.0, 2.0, 3.0, 2.1, 3.2, 4.3, -1], [4.0, 2.1, 3.2, 10.0, 1.1, -10, 100, -1, 1.0, 2.0, 3.0, 4.3], [4.0, 2.1, 3.2, 10.0, 2.0, 3.0, 1.1, -1, -10, 100, 1.0, 4.3], [4.0, 2.1, 3.0, 1.1, 4.3, 3.2, -10, 100, 1.0, 10.0, -1, 2.0], [4.0, 2.1, 100, NULL, 1.0, 4.3, 3.2, 10.0, 2.0, 3.0, 1.1, -1, -10], [[1, 2, 3, NULL, 4], [5, 2, 6, 4], NULL, [100, -1, 92, 8], [66, 4, 32, -10]], [['1', '2', '3', '4'], ['-1', 'a', '-100', '100'], ['a', 'b', 'c']], [[['1'],['2'],['3']], [['6'],['5'],['4']], [['-1', '-2'],NULL,['-2', '10'],['100','23']]], [[[1],NULL,[2],[3]], [[6],[5],[4]], NULL, [[-1, -2],[-2, 10],[100,23]]]),
-(3,[null,null,null,null,null], NULL, [1.0, 2.0, 3.0, 4.0, 10.0], NULL, [40.0, 10.0, 1.1, 2.1, 3.2, 4.3, -10, -10, 100, 10.0, 20.0, 3.0], [4.0, 10.0, 1.1, -10, 100, 1.0, 20.0, 3.0, 2.1, 3.2, 4.3, -1], [40.0, 20.1, 3.2, 10.0, 10.1, -10, 100, -1, 10.0, 2.0, 30.0, 4.3], [4.0, 2.1, 3.2, 10.0, 20.0, 3.0, 1.1, -10, -100, 100, 10.0, 4.3], NULL, NULL, [[1, 2, 30, 4], [50, 2, 6, 4], [100, -10, 92, 8], [66, 40, 32, -100]], [['1', '20', '3', '4'], ['-1', 'a00', '-100', '100'], ['a', 'b0', 'c']], NULL, NULL),
-(5,[1,2],  ['1','2'], [1, 2], [1.0, 2.0], [1.00, 2.00], [1.00, 2.00], [1.00, 2.00], [1.00, 2.00], [1.00, 2.00], [1.00, 2.00], [[1, 2], [50, 2, 6, 4]], [['1', '2'], ['50', '2', '6', '4']], [[['1', '2'],['3']], [['50', '2', '6', '4']]], [[[1, 2],[3]], [[50, 2, 6, 4]]]),
-(6,[1,null], ['1',null], [1, null], [1.0, null], [1.00, null], [1.00, null], [1.00, null], [1.00, null], [1.00, null], [1.00, null], [[1, null], [50, 2, 6, 4]], [['1', null], ['50', '2', '6', '4']], [[['1', null],['3'],null], [['50', '2', '6', '4']]], [[[1, null],[3],null], [[50, 2, 6, 4]]]);
+ROW(1,[null], ['a', 'b', 'c'], [1.0, 2.0, 3.0, 4.0, 10.0], [1.0, 2.0, 3.0, 4.0, 10.0, 1.1, 2.1, 3.2, 4.3, -1, -10, 100], [4.0, 10.0, 1.1, 2.1, 3.2, 4.3, -1, -10, 100, 1.0, 2.0, 3.0], [4.0, 10.0, 1.1, -10, 100, 1.0, 2.0, 3.0, 2.1, 3.2, 4.3, -1], [4.0, 2.1, 3.2, 10.0, 1.1, -10, 100, -1, 1.0, 2.0, 3.0, 4.3], [4.0, 2.1, 3.2, 10.0, 2.0, 3.0, 1.1, -1, -10, 100, 1.0, 4.3], [4.0, 2.1, 3.0, 1.1, 4.3, 3.2, -10, 100, 1.0, 10.0, -1, 2.0], [4.0, 2.1, 100, 1.0, 4.3, 3.2, 10.0, 2.0, 3.0, 1.1, -1, -10], [[1, 2, 3, 4], [5, 2, 6, 4], [100, -1, 92, 8], [66, 4, 32, -10]], [['1', '2', '3', '4'], ['-1', 'a', '-100', '100'], ['a', 'b', 'c']], [[['1'],['2'],['3']], [['6'],['5'],['4']], [['-1', '-2'],['-2', '10'],['100','23']]], [[[1],[2],[3]], [[6],[5],[4]], [[-1, -2],[-2, 10],[100,23]]]),
+ROW(2,[1], ['-1', '10', '1', '100', '2'], NULL, [10.0, 20.0, 30.0, 4.0, 100.0, 10.1, 2.1, 30.2, 40.3, -1, -10, 100], [40.0, 100.0, 01.1, 2.1, 30.2, 40.3, -1, -100, 1000, 1.0, 2.0, 3.0], [40.0, 100.0, 01.1, -10, 1000, 10.0, 2.0, 30.0, 20.1, 3.2, 4.3, -1], NULL, NULL, [40.0, 20.1, 30.0, 10.1, 40.30, 30.20, -100, 1000, 1.0, 100.0, -10, 2.0], [40.0, 20.1, 1000, 10.0, 40.30, 30.20, 100.0, 20.0, 3.0, 10.1, -10, -10], NULL, NULL, [[['10'],['20'],['30']], [['60'],['5'],['4']], [['-100', '-2'],['-20', '10'],['100','23']]], [[[10],[20],[30]], [[60],[50],[4]], [[-1, -2],[-2, 100],[100,23]]]),
+ROW(4,[1,2,3,4,10], ['a', NULL, 'c', 'e', 'd'], [1.0, 2.0, 3.0, 4.0, 10.0], [1.0, 2.0, 3.0, 4.0, 10.0, NULL, 1.1, 2.1, 3.2, NULL, 4.3, -1, -10, 100], [4.0, 10.0, 1.1, 2.1,NULL, 3.2, 4.3, -1, -10, 100, 1.0, 2.0, 3.0], [4.0, 10.0, 1.1, -10, 100, 1.0, 2.0, 3.0, 2.1, 3.2, 4.3, -1], [4.0, 2.1, 3.2, 10.0, 1.1, -10, 100, -1, 1.0, 2.0, 3.0, 4.3], [4.0, 2.1, 3.2, 10.0, 2.0, 3.0, 1.1, -1, -10, 100, 1.0, 4.3], [4.0, 2.1, 3.0, 1.1, 4.3, 3.2, -10, 100, 1.0, 10.0, -1, 2.0], [4.0, 2.1, 100, NULL, 1.0, 4.3, 3.2, 10.0, 2.0, 3.0, 1.1, -1, -10], [[1, 2, 3, NULL, 4], [5, 2, 6, 4], NULL, [100, -1, 92, 8], [66, 4, 32, -10]], [['1', '2', '3', '4'], ['-1', 'a', '-100', '100'], ['a', 'b', 'c']], [[['1'],['2'],['3']], [['6'],['5'],['4']], [['-1', '-2'],NULL,['-2', '10'],['100','23']]], [[[1],NULL,[2],[3]], [[6],[5],[4]], NULL, [[-1, -2],[-2, 10],[100,23]]]),
+ROW(3,[null,null,null,null,null], NULL, [1.0, 2.0, 3.0, 4.0, 10.0], NULL, [40.0, 10.0, 1.1, 2.1, 3.2, 4.3, -10, -10, 100, 10.0, 20.0, 3.0], [4.0, 10.0, 1.1, -10, 100, 1.0, 20.0, 3.0, 2.1, 3.2, 4.3, -1], [40.0, 20.1, 3.2, 10.0, 10.1, -10, 100, -1, 10.0, 2.0, 30.0, 4.3], [4.0, 2.1, 3.2, 10.0, 20.0, 3.0, 1.1, -10, -100, 100, 10.0, 4.3], NULL, NULL, [[1, 2, 30, 4], [50, 2, 6, 4], [100, -10, 92, 8], [66, 40, 32, -100]], [['1', '20', '3', '4'], ['-1', 'a00', '-100', '100'], ['a', 'b0', 'c']], NULL, NULL),
+ROW(5,[1,2],  ['1','2'], [1, 2], [1.0, 2.0], [1.00, 2.00], [1.00, 2.00], [1.00, 2.00], [1.00, 2.00], [1.00, 2.00], [1.00, 2.00], [[1, 2], [50, 2, 6, 4]], [['1', '2'], ['50', '2', '6', '4']], [[['1', '2'],['3']], [['50', '2', '6', '4']]], [[[1, 2],[3]], [[50, 2, 6, 4]]]),
+ROW(6,[1,null], ['1',null], [1, null], [1.0, null], [1.00, null], [1.00, null], [1.00, null], [1.00, null], [1.00, null], [1.00, null], [[1, null], [50, 2, 6, 4]], [['1', null], ['50', '2', '6', '4']], [[['1', null],['3'],null], [['50', '2', '6', '4']]], [[[1, null],[3],null], [[50, 2, 6, 4]]]);
 
 -- ============================================================
 -- INNER JOIN: Array<String> = Array<BigInt> (cross-type equality)
@@ -75,7 +74,7 @@ SELECT s.s_1, t.i_1 FROM ${case_db}.array_test s JOIN ${case_db}.array_test t ON
 -- ============================================================
 -- query 5
 -- @order_sensitive=true
-SELECT s.s_1, t.i_1 FROM ${case_db}.array_test s JOIN ${case_db}.array_test t ON s.s_1 <=> t.i_1 ORDER BY 1, 2;
+SELECT s.s_1, t.i_1 FROM ${case_db}.array_test s JOIN ${case_db}.array_test t ON s.s_1  IS NOT DISTINCT FROM  t.i_1 ORDER BY 1, 2;
 
 -- ============================================================
 -- INNER JOIN: Array<String> > Array<BigInt> (comparison)
@@ -144,7 +143,7 @@ SELECT s.aas_1, t.aas_1 FROM ${case_db}.array_test s JOIN ${case_db}.array_test 
 -- ============================================================
 -- query 14
 -- @order_sensitive=true
-SELECT s.aas_1, t.aas_1 FROM ${case_db}.array_test s JOIN ${case_db}.array_test t ON s.aas_1 <=> t.aas_1 ORDER BY 1, 2;
+SELECT s.aas_1, t.aas_1 FROM ${case_db}.array_test s JOIN ${case_db}.array_test t ON s.aas_1  IS NOT DISTINCT FROM  t.aas_1 ORDER BY 1, 2;
 
 -- ============================================================
 -- INNER JOIN: with additional array_length predicate
@@ -157,7 +156,7 @@ SELECT s.i_1, t.i_1 FROM ${case_db}.array_test s JOIN ${case_db}.array_test t ON
 -- INNER JOIN: count with cross-type <=> and =
 -- ============================================================
 -- query 16
-SELECT count(*) FROM ${case_db}.array_test s JOIN ${case_db}.array_test t ON s.i_1 <=> t.s_1;
+SELECT count(*) FROM ${case_db}.array_test s JOIN ${case_db}.array_test t ON s.i_1  IS NOT DISTINCT FROM  t.s_1;
 
 -- query 17
 SELECT count(*) FROM ${case_db}.array_test s JOIN ${case_db}.array_test t ON s.i_1 = t.s_1;
@@ -221,14 +220,14 @@ SELECT s_1 FROM ${case_db}.array_test s WHERE EXISTS (SELECT 1 FROM ${case_db}.a
 -- predicate"; NovaRocks lowers the NULL-safe correlation into a
 -- proper join condition (same as join_struct_type query 27).
 -- @skip_result_check=true
-SELECT i_0 FROM ${case_db}.array_test s WHERE EXISTS (SELECT 1 FROM ${case_db}.array_test t WHERE t.i_0 <=> s.d_4) ORDER BY 1;
+SELECT i_0 FROM ${case_db}.array_test s WHERE EXISTS (SELECT 1 FROM ${case_db}.array_test t WHERE t.i_0  IS NOT DISTINCT FROM  s.d_4) ORDER BY 1;
 
 -- ============================================================
 -- FE error: EXISTS with incompatible nested array types
 -- ============================================================
 -- query 28
 -- @expect_error=does not support binary predicate operation
-SELECT i_0 FROM ${case_db}.array_test s WHERE EXISTS (SELECT 1 FROM ${case_db}.array_test t WHERE t.i_0 <=> s.ai_1) ORDER BY 1;
+SELECT i_0 FROM ${case_db}.array_test s WHERE EXISTS (SELECT 1 FROM ${case_db}.array_test t WHERE t.i_0  IS NOT DISTINCT FROM  s.ai_1) ORDER BY 1;
 
 -- ============================================================
 -- NOT EXISTS subquery on array columns
@@ -318,7 +317,7 @@ SELECT s.as_1, t.as_1 FROM ${case_db}.array_test s LEFT JOIN ${case_db}.array_te
 -- ============================================================
 -- query 43
 -- @order_sensitive=true
-SELECT s.aas_1, t.aas_1 FROM ${case_db}.array_test s LEFT JOIN ${case_db}.array_test t ON s.aas_1 <=> t.aas_1 ORDER BY 1, 2;
+SELECT s.aas_1, t.aas_1 FROM ${case_db}.array_test s LEFT JOIN ${case_db}.array_test t ON s.aas_1  IS NOT DISTINCT FROM  t.aas_1 ORDER BY 1, 2;
 
 -- ============================================================
 -- RIGHT JOIN: Array<String> = Array<BigInt>
@@ -332,7 +331,7 @@ SELECT s.s_1, t.i_1 FROM ${case_db}.array_test s RIGHT JOIN ${case_db}.array_tes
 -- ============================================================
 -- query 45
 -- @order_sensitive=true
-SELECT s.s_1, t.i_1 FROM ${case_db}.array_test s RIGHT JOIN ${case_db}.array_test t ON s.s_1 <=> t.i_1 ORDER BY 1, 2;
+SELECT s.s_1, t.i_1 FROM ${case_db}.array_test s RIGHT JOIN ${case_db}.array_test t ON s.s_1  IS NOT DISTINCT FROM  t.i_1 ORDER BY 1, 2;
 
 -- ============================================================
 -- RIGHT JOIN: nested array equality (ai_1 = ai_1)
@@ -346,7 +345,7 @@ SELECT s.ai_1, t.ai_1 FROM ${case_db}.array_test s RIGHT JOIN ${case_db}.array_t
 -- ============================================================
 -- query 47
 -- @order_sensitive=true
-SELECT s.aad_1, t.aad_1 FROM ${case_db}.array_test s RIGHT JOIN ${case_db}.array_test t ON s.aad_1 <=> t.aad_1 ORDER BY 1, 2;
+SELECT s.aad_1, t.aad_1 FROM ${case_db}.array_test s RIGHT JOIN ${case_db}.array_test t ON s.aad_1  IS NOT DISTINCT FROM  t.aad_1 ORDER BY 1, 2;
 
 -- ============================================================
 -- FULL JOIN: Array<String> = Array<BigInt>
@@ -359,7 +358,7 @@ SELECT s.s_1, t.i_1 FROM ${case_db}.array_test s FULL JOIN ${case_db}.array_test
 -- FE error: syntax error with => operator
 -- ============================================================
 -- query 49
--- @expect_error=syntax error
+-- @expect_trino_error=SYNTAX_ERROR,USER_ERROR
 SELECT s.s_1, t.i_1 FROM ${case_db}.array_test s FULL JOIN ${case_db}.array_test t ON s.s_1 => t.i_1 ORDER BY 1, 2;
 
 -- ============================================================
@@ -367,7 +366,7 @@ SELECT s.s_1, t.i_1 FROM ${case_db}.array_test s FULL JOIN ${case_db}.array_test
 -- ============================================================
 -- query 50
 -- @order_sensitive=true
-SELECT s.aas_1, t.aas_1 FROM ${case_db}.array_test s FULL JOIN ${case_db}.array_test t ON s.aas_1 <=> t.aas_1 ORDER BY 1, 2;
+SELECT s.aas_1, t.aas_1 FROM ${case_db}.array_test s FULL JOIN ${case_db}.array_test t ON s.aas_1  IS NOT DISTINCT FROM  t.aas_1 ORDER BY 1, 2;
 
 -- ============================================================
 -- FULL JOIN: 3-nested array != (aad_1)
@@ -385,13 +384,13 @@ SELECT s.i_1, t.d_1 FROM ${case_db}.array_test s JOIN ${case_db}.array_test t ON
 
 -- query 53
 -- Internal and outer NULLs are UNKNOWN for =/!=, but equal under <=>.
-SELECT pk, ai_1 = ai_1 AS eq, ai_1 != ai_1 AS ne, ai_1 <=> ai_1 AS safe
+SELECT pk, ai_1 = ai_1 AS eq, ai_1 != ai_1 AS ne, ai_1  IS NOT DISTINCT FROM  ai_1 AS safe
 FROM ${case_db}.array_test ORDER BY pk;
 
 -- query 54
 -- Pin identities: outer NULL (3,2), internal NULL (6,6), valid (5,5).
 SELECT s.pk AS probe_pk, t.pk AS build_pk
-FROM ${case_db}.array_test s JOIN ${case_db}.array_test t ON s.s_1 <=> t.i_1
+FROM ${case_db}.array_test s JOIN ${case_db}.array_test t ON s.s_1  IS NOT DISTINCT FROM  t.i_1
 ORDER BY s.pk, t.pk;
 
 -- query 55

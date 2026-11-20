@@ -494,18 +494,7 @@ impl AnalyzerScope {
             }
         }
         for ((qualifier, name), (id, dt)) in &other.qualified {
-            // Left wins: in `t1 LEFT JOIN t1 AS t2`, the aliased-side scan
-            // also registers its columns under the original table name
-            // (`t1`) for SQL like `SELECT t1.c FROM t1 AS x` that mixes
-            // alias and table-name references. In a self-join the LEFT
-            // scan's `("t1", "k1")` is the true left binding, and the
-            // RIGHT scan's `("t1", "k1")` is the back-compat alias of its
-            // own slot. An unconditional insert here let the right's
-            // secondary registration silently shadow the left's primary,
-            // so a downstream `t1.k1` ColumnRef bound to the right side's
-            // ColumnId — and unmatched-left rows in a LEFT OUTER join
-            // surfaced as all-NULL on the left columns
-            // (`join_range_direct_mapping` step 20).
+            // Preserve a qualified binding already selected by this scope.
             self.qualified
                 .entry((qualifier.clone(), name.clone()))
                 .or_insert_with(|| (*id, dt.clone()));
@@ -703,7 +692,7 @@ impl AnalyzerScope {
                     volatility: crate::functions::builtin_function_volatility("coalesce"),
                     name: "coalesce".to_string(),
                     binding: bound.binding,
-                    args: bound.args,
+                    args: (bound.args).into(),
                     distinct: false,
                 },
                 value_type,
@@ -832,34 +821,6 @@ impl AnalyzerScope {
                 self.canonical_qualifier.insert(name, q);
             }
         }
-    }
-
-    /// Register columns only in the qualified map (not unqualified or ordered).
-    /// Used when an alias is present and differs from the table name, so that
-    /// both `alias.col` and `table.col` resolve but the duplicate does not
-    /// appear in SELECT * expansion.
-    pub(super) fn add_table_qualified_only(
-        &mut self,
-        qualifier: &str,
-        columns: &[ColumnDef],
-        control: &dyn PureCompileControl,
-    ) -> Result<(), AnalyzeError> {
-        for col in columns {
-            let ty = super::helpers::column_value_type(col, control)?;
-            let name = col.name.to_lowercase();
-            let id = if let Some((id, _)) = self.unqualified.get(&name) {
-                *id
-            } else {
-                self.factory.borrow_mut().create(
-                    Some(qualifier.to_string()),
-                    col.name.clone(),
-                    ty.clone(),
-                )
-            };
-            self.qualified
-                .insert((qualifier.to_lowercase(), name), (id, ty));
-        }
-        Ok(())
     }
 }
 

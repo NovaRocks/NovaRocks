@@ -27,14 +27,44 @@ pub(crate) fn unexpected_token(expected: &str, found: &str) -> String {
     format!("expected {expected}, found {found}")
 }
 
-pub(crate) fn unsupported_statement(statement: &str) -> String {
-    format!("recognized but unsupported statement {statement}")
-}
-
 use crate::StructuralViolation;
 
 pub(crate) fn invalid_structure(violation: StructuralViolation) -> String {
     match violation {
+        StructuralViolation::ConflictingTablePeriodAndBranch => {
+            "invalid SQL structure: a table period and branch cannot be combined".to_owned()
+        }
+        StructuralViolation::InvalidJoinCriteria => {
+            "invalid SQL structure: invalid join criteria".to_owned()
+        }
+        StructuralViolation::EmptyJoinUsingColumns => {
+            "invalid SQL structure: empty JOIN USING column list".to_owned()
+        }
+        StructuralViolation::EmptyPivotAggregations => {
+            "invalid SQL structure: empty PIVOT aggregation list".to_owned()
+        }
+        StructuralViolation::EmptyPivotColumns => {
+            "invalid SQL structure: empty PIVOT column list".to_owned()
+        }
+        StructuralViolation::EmptyPivotValueGroups => {
+            "invalid SQL structure: empty PIVOT value-group list".to_owned()
+        }
+        StructuralViolation::EmptyPivotValues => {
+            "invalid SQL structure: empty PIVOT value list".to_owned()
+        }
+        StructuralViolation::EmptyDescriptorFields => {
+            "invalid SQL structure: empty DESCRIPTOR field list".to_owned()
+        }
+        StructuralViolation::EmptyPatternVariableDefinitions => {
+            "invalid SQL structure: empty row-pattern variable definition list".to_owned()
+        }
+        StructuralViolation::InvalidPatternRowsPerMatch => {
+            "invalid SQL structure: WINDOW rows per match is not valid for MATCH_RECOGNIZE"
+                .to_owned()
+        }
+        StructuralViolation::InvalidQueryPeriod => {
+            "invalid SQL structure: a query period requires only an end expression".to_owned()
+        }
         StructuralViolation::EmptyWithCteList => {
             "invalid SQL structure: empty WITH common-table-expression list".to_owned()
         }
@@ -45,14 +75,55 @@ pub(crate) fn invalid_structure(violation: StructuralViolation) -> String {
         StructuralViolation::EmptySelectProjection => {
             "invalid SQL structure: empty SELECT projection list".to_owned()
         }
+        StructuralViolation::EmptyGroupingSets => {
+            "invalid SQL structure: empty grouping-set list".to_owned()
+        }
+        StructuralViolation::InvalidSetOperationOperandCount => {
+            "invalid SQL structure: invalid set operation operand count".to_owned()
+        }
+        StructuralViolation::InvalidLimitRowCount => {
+            "invalid SQL structure: LIMIT count must be ALL, a long literal, or a parameter"
+                .to_owned()
+        }
+        StructuralViolation::InvalidOffsetRowCount => {
+            "invalid SQL structure: OFFSET count must be a long literal or a parameter".to_owned()
+        }
+        StructuralViolation::InvalidFetchFirstRowCount => {
+            "invalid SQL structure: FETCH count must be a long literal or a parameter".to_owned()
+        }
+        StructuralViolation::EmptyPatternList => {
+            "invalid SQL structure: empty row-pattern list".to_owned()
+        }
+        StructuralViolation::EmptySubsetIdentifierList => {
+            "invalid SQL structure: empty SUBSET identifier list".to_owned()
+        }
+        StructuralViolation::EmptyOrderBy => {
+            "invalid SQL structure: empty ORDER BY list".to_owned()
+        }
+        StructuralViolation::EmptyInList => "invalid SQL structure: empty IN list".to_owned(),
+        StructuralViolation::InvalidLogicalTermCount => {
+            "invalid SQL structure: logical expression requires at least two terms".to_owned()
+        }
+        StructuralViolation::InvalidQueryModifierOwner => {
+            "direct SELECT modifiers must belong to the query specification".to_string()
+        }
+        StructuralViolation::SpecialExpressionInvariant(error) => {
+            format!("invalid SQL structure: {error}")
+        }
+        StructuralViolation::JsonConstructorInvariant(error) => {
+            format!("invalid SQL structure: {error}")
+        }
         StructuralViolation::EmptyUnnestExpressionList => {
             "invalid SQL structure: empty UNNEST expression list".to_owned()
         }
-        StructuralViolation::MismatchedCaseArms => {
-            "invalid SQL structure: mismatched CASE condition and result arms".to_owned()
+        StructuralViolation::TooFewCoalesceOperands => {
+            "invalid SQL structure: COALESCE requires at least two operands".to_owned()
         }
-        StructuralViolation::DuplicateTableColumnName => {
-            "invalid SQL structure: duplicate CREATE TABLE column name".to_owned()
+        StructuralViolation::TooFewFormatArguments => {
+            "invalid SQL structure: FORMAT requires at least two arguments".to_owned()
+        }
+        StructuralViolation::EmptyCaseBranches => {
+            "invalid SQL structure: empty CASE branch list".to_owned()
         }
     }
 }

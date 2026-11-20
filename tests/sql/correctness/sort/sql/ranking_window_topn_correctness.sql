@@ -24,7 +24,7 @@
 -- The rule fires by inserting partition_limit=K into the analytic Sort; the Filter and
 -- Window nodes are preserved, so per-partition truncation must not alter the result set.
 
-CREATE DATABASE IF NOT EXISTS ${case_db};
+CREATE SCHEMA IF NOT EXISTS ${case_db};
 USE ${case_db};
 
 DROP TABLE IF EXISTS ${case_db}.rw_c;
@@ -35,22 +35,22 @@ CREATE TABLE ${case_db}.rw_c (
 );
 INSERT INTO ${case_db}.rw_c VALUES
     -- group A: 4 rows, top-1 is score=400
-    ('A', 1, 400),
-    ('A', 2, 300),
-    ('A', 3, 300),
-    ('A', 4, 100),
+    ROW('A', 1, 400),
+    ROW('A', 2, 300),
+    ROW('A', 3, 300),
+    ROW('A', 4, 100),
     -- group B: 3 rows, tie at rank 2 (scores 90,90); rank()<=2 must return all 3
-    ('B', 5, 200),
-    ('B', 6, 90),
-    ('B', 7, 90),
+    ROW('B', 5, 200),
+    ROW('B', 6, 90),
+    ROW('B', 7, 90),
     -- group C: 1 row only (single-row partition)
-    ('C', 8, 50),
+    ROW('C', 8, 50),
     -- group D: rows with NULL score
-    ('D', 9,  NULL),
-    ('D', 10, 500),
-    ('D', 11, 400);
+    ROW('D', 9,  NULL),
+    ROW('D', 10, 500),
+    ROW('D', 11, 400);
 
-ANALYZE TABLE ${case_db}.rw_c;
+ANALYZE ${case_db}.rw_c;
 
 -- ===========================================================================
 -- Case 1: rank() = 1 (top-1 per partition, rule ON)
@@ -65,7 +65,7 @@ FROM (
 WHERE rk = 1
 ORDER BY grp, oid;
 
-SET disable_optimizer_rules='RankingWindowPredicatePushdown';
+SET SESSION disable_optimizer_rules = 'RankingWindowPredicatePushdown';
 
 -- Case 1 rule OFF — must produce identical rows as Case 1 rule ON.
 SELECT grp, oid, score, rk
@@ -77,7 +77,7 @@ FROM (
 WHERE rk = 1
 ORDER BY grp, oid;
 
-SET disable_optimizer_rules='';
+SET SESSION disable_optimizer_rules = '';
 
 -- ===========================================================================
 -- Case 2: rank() <= 2 with tie AT boundary (group B has 2 rows at rank 2).
@@ -92,7 +92,7 @@ FROM (
 WHERE rk <= 2
 ORDER BY grp, rk, oid;
 
-SET disable_optimizer_rules='RankingWindowPredicatePushdown';
+SET SESSION disable_optimizer_rules = 'RankingWindowPredicatePushdown';
 
 -- Case 2 rule OFF — must produce identical rows as Case 2 rule ON.
 SELECT grp, oid, score, rk
@@ -104,7 +104,7 @@ FROM (
 WHERE rk <= 2
 ORDER BY grp, rk, oid;
 
-SET disable_optimizer_rules='';
+SET SESSION disable_optimizer_rules = '';
 
 -- ===========================================================================
 -- Case 3: dense_rank() <= 2 with ties (group B has two rows at dense_rank=2).
@@ -118,7 +118,7 @@ FROM (
 WHERE drk <= 2
 ORDER BY grp, drk, oid;
 
-SET disable_optimizer_rules='RankingWindowPredicatePushdown';
+SET SESSION disable_optimizer_rules = 'RankingWindowPredicatePushdown';
 
 -- Case 3 rule OFF — must produce identical rows as Case 3 rule ON.
 SELECT grp, oid, score, drk
@@ -130,7 +130,7 @@ FROM (
 WHERE drk <= 2
 ORDER BY grp, drk, oid;
 
-SET disable_optimizer_rules='';
+SET SESSION disable_optimizer_rules = '';
 
 -- ===========================================================================
 -- Case 4: row_number() <= 2 (exactly 2 rows per partition, no tie expansion).
@@ -144,7 +144,7 @@ FROM (
 WHERE rn <= 2
 ORDER BY grp, rn;
 
-SET disable_optimizer_rules='RankingWindowPredicatePushdown';
+SET SESSION disable_optimizer_rules = 'RankingWindowPredicatePushdown';
 
 -- Case 4 rule OFF — must produce identical rows as Case 4 rule ON.
 SELECT grp, oid, score, rn
@@ -156,7 +156,7 @@ FROM (
 WHERE rn <= 2
 ORDER BY grp, rn;
 
-SET disable_optimizer_rules='';
+SET SESSION disable_optimizer_rules = '';
 
 -- ===========================================================================
 -- Case 5: NULL in ORDER BY key — group D has one NULL score.
@@ -172,7 +172,7 @@ FROM (
 WHERE rk <= 1
 ORDER BY grp, oid;
 
-SET disable_optimizer_rules='RankingWindowPredicatePushdown';
+SET SESSION disable_optimizer_rules = 'RankingWindowPredicatePushdown';
 
 -- Case 5 rule OFF — must produce identical rows as Case 5 rule ON.
 SELECT grp, oid, score, rk
@@ -185,7 +185,7 @@ FROM (
 WHERE rk <= 1
 ORDER BY grp, oid;
 
-SET disable_optimizer_rules='';
+SET SESSION disable_optimizer_rules = '';
 
 -- ===========================================================================
 -- Case 6: Single-row partition (group C). rank()<=1 must still return that row.
@@ -200,7 +200,7 @@ FROM (
 WHERE rk <= 1
 ORDER BY grp, oid;
 
-SET disable_optimizer_rules='RankingWindowPredicatePushdown';
+SET SESSION disable_optimizer_rules = 'RankingWindowPredicatePushdown';
 
 -- Case 6 rule OFF — must produce identical rows as Case 6 rule ON.
 SELECT grp, oid, score, rk
@@ -213,7 +213,7 @@ FROM (
 WHERE rk <= 1
 ORDER BY grp, oid;
 
-SET disable_optimizer_rules='';
+SET SESSION disable_optimizer_rules = '';
 
 -- ===========================================================================
 -- Case 7: Scalar subquery with rank window — returns exactly 1 row (OK path).
@@ -230,7 +230,7 @@ SELECT (
     WHERE rk <= 1
 ) AS top_c_score;
 
-SET disable_optimizer_rules='RankingWindowPredicatePushdown';
+SET SESSION disable_optimizer_rules = 'RankingWindowPredicatePushdown';
 
 -- Case 7 rule OFF — scalar subquery still returns the same single value.
 SELECT (
@@ -244,7 +244,7 @@ SELECT (
     WHERE rk <= 1
 ) AS top_c_score;
 
-SET disable_optimizer_rules='';
+SET SESSION disable_optimizer_rules = '';
 
 -- ===========================================================================
 -- Case 8: Scalar subquery that returns >1 row must error identically rule ON and OFF.
@@ -263,7 +263,7 @@ SELECT (
     WHERE rk = 1
 );
 
-SET disable_optimizer_rules='RankingWindowPredicatePushdown';
+SET SESSION disable_optimizer_rules = 'RankingWindowPredicatePushdown';
 
 -- Case 8 rule OFF — same error must fire.
 -- @expect_error=assert_num_rows failed
@@ -278,7 +278,7 @@ SELECT (
     WHERE rk = 1
 );
 
-SET disable_optimizer_rules='';
+SET SESSION disable_optimizer_rules = '';
 
 -- ===========================================================================
 -- Case 9: Two ranking fns with DIFFERENT ORDER BY — rule must NOT fire.
@@ -289,7 +289,7 @@ SET disable_optimizer_rules='';
 -- ===========================================================================
 DROP TABLE IF EXISTS ${case_db}.rw_c9;
 CREATE TABLE ${case_db}.rw_c9 (grp INT, a INT, b INT);
-INSERT INTO ${case_db}.rw_c9 VALUES (1,40,1),(1,30,2),(1,20,3),(1,10,4);
+INSERT INTO ${case_db}.rw_c9 VALUES ROW(1,40,1),ROW(1,30,2),ROW(1,20,3),ROW(1,10,4);
 
 -- @explain_not_contains=partition_limit=
 SELECT grp,a,b,rka,rkb
@@ -302,7 +302,7 @@ FROM (
 WHERE rkb <= 2
 ORDER BY b DESC;
 
-SET disable_optimizer_rules='RankingWindowPredicatePushdown';
+SET SESSION disable_optimizer_rules = 'RankingWindowPredicatePushdown';
 
 -- Case 9 rule OFF — must produce identical rows as Case 9 rule ON.
 SELECT grp,a,b,rka,rkb
@@ -315,4 +315,4 @@ FROM (
 WHERE rkb <= 2
 ORDER BY b DESC;
 
-SET disable_optimizer_rules='';
+SET SESSION disable_optimizer_rules = '';

@@ -467,6 +467,7 @@ fn create_command(name: &str) -> CatalogCreateCommand {
     CatalogCreateCommand {
         instance_id: catalog(name),
         display_name: name.to_string(),
+        connector_name: None,
         properties: vec![("type".to_string(), "iceberg".to_string())],
         if_not_exists: false,
     }

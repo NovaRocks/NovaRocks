@@ -268,21 +268,39 @@ impl SqlMvFirstRefreshArtifact {
         &self.0.query
     }
 
-    /// Declare catalog facts for this original opaque query artifact. Its AST
-    /// stays SQL-owned; the caller observes only exact SchemaOnly requests.
+    /// Declare the catalog observations for the artifact's quoted relations
+    /// without giving the application custody of the query AST.
+    pub fn quoted_metadata_catalogs(
+        &self,
+        current_catalog: Option<&str>,
+        current_database: &str,
+        control: &crate::compiler::SqlCompileControl,
+    ) -> Result<Vec<novarocks_spi::connector::ConnectorInstanceId>, crate::compiler::SqlCompileError>
+    {
+        crate::compiler::quoted_metadata_catalogs(
+            self.query(),
+            current_catalog,
+            current_database,
+            control,
+        )
+    }
+
+    /// Declare exact SchemaOnly requests for this original opaque query.
     pub fn catalog_preparation(
         &self,
         current_catalog: Option<&str>,
         current_database: &str,
         control: crate::compiler::SqlCompileControl,
+        qualifications: crate::compiler::CatalogQualifications,
     ) -> Result<crate::compiler::SqlCapturedCatalogPreparation, crate::compiler::SqlCompileError>
     {
         control.check()?;
-        crate::compiler::SqlCapturedCatalogPreparation::try_new(
+        crate::compiler::SqlCapturedCatalogPreparation::try_new_with_qualifications(
             self.query().clone(),
             current_catalog,
             current_database,
             control,
+            qualifications,
         )
     }
 }
@@ -1056,8 +1074,20 @@ fn alias_incremental_aggregate_group_key_projection(
             format!("aggregate MV group key projection position {projection_index} is missing")
         })?;
         alias_incremental_select_projection_item(item, expected_name)?;
-        if let ast::GroupBy::Expressions { expressions, .. } = &mut select.group_by
-            && let Some(group_expr) = expressions.get_mut(*group_key_index)
+        if let Some(group_by) = &mut select.group_by
+            && !group_by.distinct
+            && let Some(group_expr) = group_by
+                .elements
+                .iter_mut()
+                .filter_map(|element| {
+                    if let ast::GroupingElement::Simple(simple) = element {
+                        Some(simple.columns.iter_mut())
+                    } else {
+                        None
+                    }
+                })
+                .flatten()
+                .nth(*group_key_index)
         {
             *group_expr = ast::Expr::Identifier(incremental_alias_ident(expected_name));
         }
@@ -1073,23 +1103,14 @@ fn alias_incremental_select_projection_item(
 
     let alias = incremental_alias_ident(alias);
     match item {
-        SelectItem::UnnamedExpr(expr) => {
-            let expr = expr.clone();
-            *item = SelectItem::ExprWithAlias {
-                expr,
-                alias,
-                explicit_as: true,
-                span: Span::new(0, 0),
-            };
+        SelectItem::SingleColumn(column) => {
+            if column.alias.is_none() {
+                column.span = Span::new(0, 0);
+            }
+            column.alias = Some(alias);
             Ok(())
         }
-        SelectItem::ExprWithAlias {
-            alias: existing, ..
-        } => {
-            *existing = alias;
-            Ok(())
-        }
-        SelectItem::QualifiedWildcard { .. } | SelectItem::Wildcard { .. } => {
+        SelectItem::AllColumns(_) => {
             Err("aggregate MV group key projection cannot be a wildcard".to_string())
         }
     }
@@ -1106,14 +1127,12 @@ fn incremental_alias_ident(alias: &str) -> ast::Ident {
         ast::Ident {
             value: alias.to_string(),
             quoted: false,
-            quote_style: None,
             span: Span::new(0, 0),
         }
     } else {
         ast::Ident {
             value: alias.to_string(),
             quoted: true,
-            quote_style: Some('`'),
             span: Span::new(0, 0),
         }
     }
@@ -2760,7 +2779,7 @@ pub(crate) fn prepare_branch_union_aggregate_first_refresh_write_sql_with_target
                 target_schema,
                 None,
             )?;
-            Ok(*query.body)
+            Ok(query.body.into_inner())
         })
         .collect::<Result<Vec<_>, String>>()?;
     let query = build::query(build::union_all(bodies).map_err(|error| error.to_string())?);
@@ -2838,7 +2857,7 @@ fn aggregate_physical_query(
         .collect::<Vec<_>>();
     projection.push(aggregate_projection_item(
         build::function(
-            build::object_name(vec![build::ident("mv_group_row_id", None)])
+            build::object_name(vec![build::ident("mv_group_row_id", false)])
                 .map_err(|error| error.to_string())?,
             group_key_refs,
         ),
@@ -2926,7 +2945,7 @@ fn aggregate_physical_query(
                     build::function(
                         build::object_name(vec![build::ident(
                             aggregate_visible_function(aggregate.function),
-                            None,
+                            false,
                         )])
                         .map_err(|error| error.to_string())?,
                         arguments,
@@ -2967,22 +2986,23 @@ fn aggregate_physical_query(
             BRANCH_ID_COLUMN_NAME,
         ));
     }
-    Ok(build::query(ast::SetExpr::Select(Box::new(
+    Ok(build::query(ast::SetExpr::Select(ast::AstBox::new(
         build::select(
             projection,
-            vec![build::relation(build::derived(
-                state_query,
-                Some(build::alias(build::ident("state", None), Vec::new(), true)),
-            ))],
+            Some(build::alias(
+                build::derived(state_query),
+                build::ident("state", false),
+                None,
+            )),
             None,
-            ast::GroupBy::None,
+            None,
         )
         .map_err(|error| error.to_string())?,
     ))))
 }
 
 fn aggregate_projection_item(expr: ast::Expr, alias: &str) -> ast::SelectItem {
-    build::item(expr, Some(build::ident(alias, Some('`'))), true)
+    build::item(expr, Some(build::ident(alias, true)))
 }
 
 fn aggregate_visible_type_witness(data_type: &DataType) -> Result<ast::Expr, String> {
@@ -2998,20 +3018,12 @@ fn aggregate_visible_type_witness(data_type: &DataType) -> Result<ast::Expr, Str
         DataType::Date32 => build::simple_type("DATE"),
         DataType::Timestamp(_, _) => build::simple_type("DATETIME"),
         DataType::Decimal128(precision, scale) if *scale >= 0 => build::type_name(
-            build::object_name(vec![build::ident("DECIMAL", None)])
-                .map_err(|error| error.to_string())?,
+            build::ident("DECIMAL", false),
             [i64::from(*precision), i64::from(*scale)]
                 .into_iter()
-                .map(|value| {
-                    ast::TypeNameArgument::Literal(ast::Literal {
-                        kind: ast::LiteralKind::Number(value.to_string()),
-                        span: novarocks_parser::SYNTHETIC,
-                    })
-                })
+                .map(build::numeric_parameter)
                 .collect(),
-            vec![false],
-        )
-        .map_err(|error| error.to_string())?,
+        ),
         other => {
             return Err(format!(
                 "unsupported MV aggregate visible target type {other:?}"
@@ -3071,10 +3083,7 @@ fn aggregate_visible_function(kind: AggregateFunctionKind) -> &'static str {
 }
 
 fn qualified_column(qualifier: &str, column: &str) -> ast::Expr {
-    build::column(
-        build::ident(qualifier, Some('`')),
-        build::ident(column, Some('`')),
-    )
+    build::column(build::ident(qualifier, true), build::ident(column, true))
 }
 
 #[cfg(test)]
@@ -3180,10 +3189,7 @@ mod tests {
     >;
 
     fn parse_query(sql: &str) -> ast::Query {
-        let statements = novarocks_parser::parse(sql).expect("parse query");
-        let [ast::Statement::Query(query)] = statements.as_slice() else {
-            panic!("fixture must be a query");
-        };
+        let query = &novarocks_parser::parser::parse_query(sql).expect("parse query");
         query.clone()
     }
 
@@ -3535,7 +3541,13 @@ mod tests {
         let ast::SetExpr::Select(select) = query.body.as_ref() else {
             panic!("fixture must retain SELECT body");
         };
-        let ast::SelectItem::ExprWithAlias { alias, .. } = &select.projection[0] else {
+        let ast::SelectItem::SingleColumn(projection_column) = &select.projection[0] else {
+            panic!("group key must have SQL-owned alias");
+        };
+        let ast::SingleColumn {
+            alias: Some(alias), ..
+        } = projection_column.as_ref()
+        else {
             panic!("group key must have SQL-owned alias");
         };
         assert_eq!(alias.value, "k");
@@ -3833,7 +3845,7 @@ mod tests {
                 "__apply_key__".to_string(),
             ),
             artifact: SqlMvFirstRefreshArtifactInput::Sql(MvFirstRefreshPhysicalQuery {
-                query: Box::new(parse_query("SELECT 1 AS `__apply_key__`")),
+                query: Box::new(parse_query("SELECT 1 AS \"__apply_key__\"")),
                 root_hash_column: "__apply_key__".to_string(),
             }),
         })
@@ -3856,7 +3868,7 @@ mod tests {
             target_binding: sqlx2_target_binding(),
             root_distribution,
             artifact: SqlMvFirstRefreshArtifactInput::Sql(MvFirstRefreshPhysicalQuery {
-                query: Box::new(parse_query("SELECT 1 AS `__apply_key__`")),
+                query: Box::new(parse_query("SELECT 1 AS \"__apply_key__\"")),
                 root_hash_column: "__apply_key__".to_string(),
             }),
         };
@@ -3880,8 +3892,13 @@ mod tests {
             .projection
             .iter()
             .find_map(|item| match item {
-                ast::SelectItem::ExprWithAlias { expr, alias, .. } if alias.value == output => {
-                    Some(expr)
+                ast::SelectItem::SingleColumn(column)
+                    if column
+                        .alias
+                        .as_ref()
+                        .is_some_and(|alias| alias.value == output) =>
+                {
+                    Some(&column.expression)
                 }
                 _ => None,
             })
@@ -3917,23 +3934,22 @@ mod tests {
         use ast::Visit;
         struct Versions(Vec<String>);
         impl ast::Visit for Versions {
-            fn visit_table_factor(&mut self, factor: &ast::TableFactor) {
-                if let ast::TableFactor::Table {
-                    version: Some(version),
-                    ..
-                } = factor
-                {
-                    assert_eq!(version.kind, ast::TableVersionKind::ForVersionAsOf);
+            fn visit_table(&mut self, table: &ast::Table) {
+                if let Some(version) = &table.query_period {
+                    assert_eq!(version.range_type, ast::QueryPeriodRangeType::Version);
                     let ast::Expr::Literal(ast::Literal {
-                        kind: ast::LiteralKind::Number(value),
+                        kind:
+                            ast::LiteralKind::Long {
+                                spelling: value, ..
+                            },
                         ..
-                    }) = &version.value
+                    }) = crate::analyzer::iceberg_ref::query_period_end(version).unwrap()
                     else {
                         panic!("expected snapshot integer");
                     };
                     self.0.push(value.clone());
                 }
-                ast::walk_table_factor(self, factor);
+                ast::walk_table(self, table);
             }
         }
         let mut versions = Versions(Vec::new());
@@ -4220,8 +4236,7 @@ mod tests {
             .unwrap();
         use ast::SyntaxEq;
         let expected = novarocks_parser::parser::parse_expression(
-            "avg_state_visible(`state`.`__agg_state_a_d_avg_sum`, `state`.`__agg_state_a_d_avg_count`, CAST(4 AS BIGINT), CAST(NULL AS DECIMAL(38,12)))",
-            &novarocks_parser::lex("avg_state_visible(`state`.`__agg_state_a_d_avg_sum`, `state`.`__agg_state_a_d_avg_count`, CAST(4 AS BIGINT), CAST(NULL AS DECIMAL(38,12)))").unwrap(),
+            "avg_state_visible(\"state\".\"__agg_state_a_d_avg_sum\", \"state\".\"__agg_state_a_d_avg_count\", CAST(4 AS BIGINT), CAST(NULL AS DECIMAL(38,12)))",
         ).unwrap();
         assert!(projection_expression(prepared.query(), "a_d").syntax_eq(&expected));
     }
@@ -4249,7 +4264,7 @@ mod tests {
     }
 
     #[test]
-    fn branch_union_first_refresh_balances_four_original_branch_outputs() {
+    fn branch_union_first_refresh_preserves_four_original_branch_outputs() {
         let queries = (0..4)
             .map(|index| format!("SELECT k, sum(v) AS total FROM ice.db.t{index} GROUP BY k"))
             .collect::<Vec<_>>();
@@ -4273,8 +4288,47 @@ mod tests {
         let ast::SetExpr::SetOperation(root) = prepared.query().body.as_ref() else {
             panic!("expected UNION ALL");
         };
-        assert!(matches!(root.left.as_ref(), ast::SetExpr::SetOperation(_)));
-        assert!(matches!(root.right.as_ref(), ast::SetExpr::SetOperation(_)));
+        assert_eq!(root.operator, ast::SetOperator::Union);
+        assert!(!root.distinct);
+        assert!(root.corresponding.is_none());
+        assert_eq!(root.inputs.len(), 4);
+        for (index, input) in root.inputs.iter().enumerate() {
+            let branch = build::query(input.clone());
+            assert_eq!(snapshot_literals(&branch), vec![(10 + index).to_string()]);
+            let ast::SetExpr::Select(select) = input else {
+                panic!("branch SELECT");
+            };
+            for name in ["k", "total", SQL_MV_ROW_ID_COLUMN, BRANCH_ID_COLUMN_NAME] {
+                assert!(
+                    select.projection.iter().any(|item| matches!(item,
+                        ast::SelectItem::SingleColumn(column)
+                            if column.alias.as_ref().is_some_and(|alias| alias.value == name && alias.quoted)
+                    )),
+                    "branch {index} lost exact output alias {name}"
+                );
+            }
+            let Some(ast::Relation::Aliased(alias)) = &select.from else {
+                panic!("derived state source alias");
+            };
+            let ast::Relation::TableSubquery(node) = alias.relation.as_ref() else {
+                panic!("derived state source");
+            };
+            assert_eq!(alias.alias.value, "state");
+            let ast::SetExpr::Select(state) = node.query.body.as_ref() else {
+                panic!("state SELECT");
+            };
+            let Some(ast::Relation::Table(table)) = &state.from else {
+                panic!("original table");
+            };
+            let name = &table.name;
+            assert_eq!(
+                name.parts
+                    .iter()
+                    .map(|part| part.value.clone())
+                    .collect::<Vec<_>>(),
+                vec!["ice".to_string(), "db".to_string(), format!("t{index}")]
+            );
+        }
         assert_eq!(
             snapshot_literals(prepared.query()),
             vec!["10", "11", "12", "13"]
@@ -4282,18 +4336,22 @@ mod tests {
         fn collect_branch_ids(body: &ast::SetExpr, ids: &mut Vec<String>) {
             match body {
                 ast::SetExpr::SetOperation(operation) => {
-                    collect_branch_ids(&operation.left, ids);
-                    collect_branch_ids(&operation.right, ids);
+                    for input in &operation.inputs {
+                        collect_branch_ids(input, ids);
+                    }
                 }
                 ast::SetExpr::Select(select) => {
                     let expr = select
                         .projection
                         .iter()
                         .find_map(|item| match item {
-                            ast::SelectItem::ExprWithAlias { expr, alias, .. }
-                                if alias.value == BRANCH_ID_COLUMN_NAME =>
+                            ast::SelectItem::SingleColumn(column)
+                                if column
+                                    .alias
+                                    .as_ref()
+                                    .is_some_and(|alias| alias.value == BRANCH_ID_COLUMN_NAME) =>
                             {
-                                Some(expr)
+                                Some(&column.expression)
                             }
                             _ => None,
                         })
@@ -4302,9 +4360,12 @@ mod tests {
                         panic!("branch id CAST");
                     };
                     let ast::Expr::Literal(ast::Literal {
-                        kind: ast::LiteralKind::Number(value),
+                        kind:
+                            ast::LiteralKind::Long {
+                                spelling: value, ..
+                            },
                         ..
-                    }) = cast.expr.as_ref()
+                    }) = &cast.expression
                     else {
                         panic!("branch id integer");
                     };
@@ -4335,12 +4396,8 @@ mod tests {
                 Some(&[Some(DataType::Float64)]),
             )
             .unwrap();
-        let source = "avg_state_visible(`state`.`__agg_state_total_avg_sum`, `state`.`__agg_state_total_avg_count`, CAST(-1 AS BIGINT), CAST(NULL AS DOUBLE))";
-        let expected = novarocks_parser::parser::parse_expression(
-            source,
-            &novarocks_parser::lex(source).unwrap(),
-        )
-        .unwrap();
+        let source = "avg_state_visible(\"state\".\"__agg_state_total_avg_sum\", \"state\".\"__agg_state_total_avg_count\", CAST(-1 AS BIGINT), CAST(NULL AS DOUBLE))";
+        let expected = novarocks_parser::parser::parse_expression(source).unwrap();
         assert!(projection_expression(prepared.query(), "total").syntax_eq(&expected));
     }
 
@@ -4455,7 +4512,7 @@ mod tests {
     fn join_two_phase_analysis_keeps_root_decimal_policy_in_the_consumed_request() {
         use novarocks_type_contract::DecimalOverflowPolicy;
 
-        let query = parse_query("SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ 1");
+        let query = parse_query("WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' SELECT 1");
         let base = crate::sql_mode::SqlSemanticSettings::default();
         assert_eq!(
             base.sql_mode().decimal_overflow_policy(),

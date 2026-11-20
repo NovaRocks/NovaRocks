@@ -15,10 +15,10 @@
 -- specific language governing permissions and limitations
 -- under the License.
 
-select  distinct(i_product_name)
+select  distinct i_product_name
  from item i1
  where i_manufact_id between 738 and 738+40 
-   and (select count(*) as item_cnt
+   and (select count() as item_cnt
         from item
         where (i_manufact = i1.i_manufact and
         ((i_category = 'Women' and 

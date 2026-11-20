@@ -68,6 +68,7 @@ fn lazy_type_issues_keep_cast_connective_case_and_arity_details() {
             None,
             integer(false),
             ExprKind::Cast {
+                array_failure_mode: None,
                 expr: source,
                 target: DataType::Int32,
                 decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,

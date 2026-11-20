@@ -27,8 +27,8 @@ CREATE TABLE ${case_db}.t (k INT, v INT);
 
 -- query 2
 -- @skip_result_check=true
-ALTER TABLE ${case_db}.t ALTER COLUMN k COMMENT 'key column';
-ALTER TABLE ${case_db}.t ALTER COLUMN v COMMENT 'value column';
+COMMENT ON COLUMN ${case_db}.t.k IS 'key column';
+COMMENT ON COLUMN ${case_db}.t.v IS 'value column';
 
 -- query 3
 -- @result_contains=COMMENT 'key column'

@@ -22,9 +22,8 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.merge_duplicates_${uuid0} (id BIGINT, v STRING)
-TBLPROPERTIES ('format-version'='3', 'novarocks.update.mode'='merge-on-read');
-INSERT INTO ${case_db}.merge_duplicates_${uuid0} VALUES (1,'a');
+CREATE TABLE ${case_db}.merge_duplicates_${uuid0} (id BIGINT, v STRING) WITH (format_version = 3, extra_properties = MAP(ARRAY['novarocks.update.mode'], ARRAY['merge-on-read']));
+INSERT INTO ${case_db}.merge_duplicates_${uuid0} VALUES ROW(1,'a');
 
 -- query 2
 -- @expect_error_tier=drift
@@ -79,4 +78,4 @@ SELECT COUNT(*) AS total_rows, COUNT(DISTINCT _row_id) AS unique_ids FROM ${case
 -- query 11
 -- @skip_result_check=true
 -- @cleanup=true
-DROP TABLE ${case_db}.merge_duplicates_${uuid0} FORCE;
+DROP TABLE ${case_db}.merge_duplicates_${uuid0} ;

@@ -19,10 +19,10 @@
 -- Ordinary binary struct fields must never be recognized as logical Variant.
 -- query 1
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.struct_named_metadata_value (id INT,s STRUCT<metadata BINARY,value BINARY>);
+CREATE TABLE ${case_db}.struct_named_metadata_value (id INT,s ROW(metadata BINARY,value BINARY));
 INSERT INTO ${case_db}.struct_named_metadata_value VALUES
-  (1,named_struct('metadata',X'0100','value',X'FF00')),
-  (2,named_struct('metadata',NULL,'value',X'')),(3,NULL);
+  ROW(1,named_struct('metadata',X'0100','value',X'FF00')),
+  ROW(2,named_struct('metadata',NULL,'value',X'')),ROW(3,NULL);
 
 -- query 2
 SELECT id,hex(s.metadata) AS metadata_hex,hex(s.value) AS value_hex,s IS NULL AS whole_null

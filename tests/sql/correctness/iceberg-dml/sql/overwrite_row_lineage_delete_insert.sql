@@ -27,15 +27,11 @@
 CREATE TABLE ${case_db}.t_full_overwrite_lineage (
   id INT,
   v INT
-)
-TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
-);
+) WITH (format_version = 3);
 INSERT INTO ${case_db}.t_full_overwrite_lineage VALUES
-  (1, 10),
-  (2, 20);
-ALTER TABLE iceberg_dml_cat_${suite_uuid0}.${case_db}.t_full_overwrite_lineage CREATE TAG before_overwrite;
+  ROW(1, 10),
+  ROW(2, 20);
+ALTER TABLE iceberg_dml_cat_${suite_uuid0}.${case_db}.t_full_overwrite_lineage EXECUTE create_tag(name => 'before_overwrite', replace => false, if_not_exists => false);
 
 -- query 2
 SELECT id, v
@@ -45,8 +41,8 @@ ORDER BY id;
 -- query 3
 -- @skip_result_check=true
 INSERT OVERWRITE ${case_db}.t_full_overwrite_lineage VALUES
-  (1, 10),
-  (2, 20);
+  ROW(1, 10),
+  ROW(2, 20);
 
 -- query 4
 SELECT id, v
@@ -71,5 +67,5 @@ ON cur.id = old.id;
 
 -- query 6
 -- @skip_result_check=true
-ALTER TABLE iceberg_dml_cat_${suite_uuid0}.${case_db}.t_full_overwrite_lineage DROP TAG before_overwrite;
-DROP TABLE ${case_db}.t_full_overwrite_lineage FORCE;
+ALTER TABLE iceberg_dml_cat_${suite_uuid0}.${case_db}.t_full_overwrite_lineage EXECUTE drop_tag(name => 'before_overwrite', if_exists => false);
+DROP TABLE ${case_db}.t_full_overwrite_lineage ;

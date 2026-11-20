@@ -33,11 +33,12 @@ use super::{
     CatalogHandle, ConnectorColumnDefinition, ConnectorControlRuntimeId,
     ConnectorDocumentManagementAdmission, ConnectorError, ConnectorErrorKind,
     ConnectorInstanceDescriptor, ConnectorMutationFailure, ConnectorMutationOperationId,
-    ConnectorPartitionTransform, ConnectorProviderBindingKey, ConnectorRequestContext,
+    ConnectorOperationControl, ConnectorProviderBindingKey, ConnectorRequestContext,
     ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableObjectId, ConnectorWrite,
-    ConnectorWriteReceipt, CreatePolicy, ExternalMutationEffect, ExternalMutationEvidence,
-    ExternalMutationFinalization, LakePublicationId, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
-    MvExactPartitionField, MvExactPartitionTransform, ProviderBindingEpoch,
+    ConnectorWriteReceipt, CreatePolicy, DdlPropertyDeclaration, DdlPropertyValue,
+    ExternalMutationEffect, ExternalMutationEvidence, ExternalMutationFinalization,
+    LakePublicationId, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MvExactPartitionField,
+    MvExactPartitionTransform, ProviderBindingEpoch,
 };
 
 pub const CONNECTOR_STAGED_CREATE_CONTRACT_VERSION: u32 = 1;
@@ -596,10 +597,51 @@ impl std::fmt::Debug for ConnectorStagedTableHandle {
 )]
 #[derive(Clone)]
 pub enum ConnectorStagedCreateMode {
-    Ordinary,
+    OrdinaryTyped {
+        storage: Arc<ConnectorStagedCtasProperties>,
+    },
     ApplicationDocumentManaged {
         admission: ConnectorDocumentManagementAdmission,
+        storage: Arc<ConnectorStagedMvStorageProperties>,
     },
+}
+
+/// Evaluated ordinary CTAS inputs admitted by this staged generation.
+pub struct ConnectorStagedCtasProperties {
+    owner: ConnectorProviderBindingKey,
+    properties: Arc<[(Arc<str>, DdlPropertyValue)]>,
+    comment: Option<Arc<str>>,
+}
+
+impl ConnectorStagedCtasProperties {
+    pub fn properties(&self) -> &[(Arc<str>, DdlPropertyValue)] {
+        &self.properties
+    }
+
+    pub fn comment(&self) -> Option<&str> {
+        self.comment.as_deref()
+    }
+}
+
+/// Immutable evaluated storage retained through all aliases of one prepare request.
+pub struct ConnectorStagedMvStorageProperties {
+    visible_partition_sources: Vec<Arc<str>>,
+    properties: Arc<[(Arc<str>, DdlPropertyValue)]>,
+    application_properties: BTreeMap<Arc<str>, Arc<str>>,
+}
+
+impl ConnectorStagedMvStorageProperties {
+    pub fn visible_partition_sources(&self) -> &[Arc<str>] {
+        &self.visible_partition_sources
+    }
+
+    pub fn properties(&self) -> &[(Arc<str>, DdlPropertyValue)] {
+        &self.properties
+    }
+
+    pub fn application_properties(&self) -> &BTreeMap<Arc<str>, Arc<str>> {
+        &self.application_properties
+    }
 }
 
 impl ConnectorStagedCreateMode {
@@ -609,7 +651,7 @@ impl ConnectorStagedCreateMode {
         operation_id: ConnectorStagedCreateOperationId,
         table: &ConnectorTableIdentity,
     ) -> Result<(), ConnectorError> {
-        if let Self::ApplicationDocumentManaged { admission } = self {
+        if let Self::ApplicationDocumentManaged { admission, .. } = self {
             admission.validate()?;
             if admission.owner() != owner
                 || admission.operation_id() != operation_id
@@ -636,11 +678,33 @@ pub struct ConnectorStagedCreatePrepareRequest {
     pub operation_id: ConnectorStagedCreateOperationId,
     pub table: ConnectorTableIdentity,
     pub columns: Vec<ConnectorColumnDefinition>,
-    pub partitioning: Vec<ConnectorPartitionTransform>,
-    pub properties: BTreeMap<Arc<str>, Arc<str>>,
     pub policy: CreatePolicy,
     pub mode: ConnectorStagedCreateMode,
     pub context: ConnectorRequestContext,
+}
+
+impl ConnectorStagedCreatePrepareRequest {
+    /// Verify that the evaluated input belongs to this staged generation.
+    pub fn ordinary_typed_properties(
+        &self,
+    ) -> Result<Option<&ConnectorStagedCtasProperties>, ConnectorError> {
+        let ConnectorStagedCreateMode::OrdinaryTyped { storage } = &self.mode else {
+            return Ok(None);
+        };
+        if storage.owner != self.owner {
+            return Err(invalid(
+                "Evaluated CTAS properties have a foreign generation",
+            ));
+        }
+        Ok(Some(storage))
+    }
+
+    fn validate_mode(&self) -> Result<(), ConnectorError> {
+        self.mode
+            .validate_for(&self.owner, self.operation_id, &self.table)?;
+        self.ordinary_typed_properties()?;
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1264,6 +1328,46 @@ impl ConnectorStagedCreatePublication {
 }
 
 pub trait ConnectorStagedCreate: Send + Sync {
+    /// Pure ordinary CTAS declarations from this exact staged generation.
+    fn ctas_property_declarations(&self) -> Result<Vec<DdlPropertyDeclaration>, ConnectorError> {
+        Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "connector does not declare ordinary CTAS properties",
+        ))
+    }
+
+    /// Distinguish a recognized unsupported provider property from an
+    /// unknown name. The evaluator still rejects names without declarations.
+    fn check_ctas_property_name(&self, _canonical: &str) -> Result<(), ConnectorError> {
+        Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "connector does not admit ordinary CTAS property names",
+        ))
+    }
+
+    /// Pure validation before reading source schema or opening a stage.
+    fn validate_ctas_properties(
+        &self,
+        _properties: &[(Arc<str>, DdlPropertyValue)],
+        _comment: Option<&str>,
+        _control: &dyn ConnectorOperationControl,
+    ) -> Result<(), ConnectorError> {
+        Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "connector does not validate evaluated ordinary CTAS properties",
+        ))
+    }
+
+    /// Provider declarations exposed by this exact retained generation.
+    fn mv_storage_property_declarations(
+        &self,
+    ) -> Result<Vec<DdlPropertyDeclaration>, ConnectorError> {
+        Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "connector does not declare materialized-view storage properties",
+        ))
+    }
+
     /// Pure construction only. Unsupported does not invoke the legacy method.
     fn begin_publish_original(
         &self,
@@ -1868,6 +1972,41 @@ struct StagedCreateReleaseGuard {
 }
 
 impl ConnectorStagedCreateSession {
+    pub fn ctas_property_declarations(
+        &self,
+    ) -> Result<Vec<DdlPropertyDeclaration>, ConnectorError> {
+        self.capability.ctas_property_declarations()
+    }
+
+    pub fn check_ctas_property_name(&self, canonical: &str) -> Result<(), ConnectorError> {
+        self.capability.check_ctas_property_name(canonical)
+    }
+
+    /// Retain the evaluator's original values after pure staged-provider
+    /// validation. No lookup, write authority, or operation slot is issued.
+    pub fn prepare_ctas_properties(
+        &self,
+        properties: Arc<[(Arc<str>, DdlPropertyValue)]>,
+        comment: Option<Arc<str>>,
+        control: &dyn ConnectorOperationControl,
+    ) -> Result<Arc<ConnectorStagedCtasProperties>, ConnectorError> {
+        control.check_active()?;
+        self.capability
+            .validate_ctas_properties(&properties, comment.as_deref(), control)?;
+        control.check_active()?;
+        Ok(Arc::new(ConnectorStagedCtasProperties {
+            owner: self.provider_binding_key.clone(),
+            properties,
+            comment,
+        }))
+    }
+
+    pub fn mv_storage_property_declarations(
+        &self,
+    ) -> Result<Vec<DdlPropertyDeclaration>, ConnectorError> {
+        self.capability.mv_storage_property_declarations()
+    }
+
     /// The immutable generation owner already pinned by this exact lease.
     pub fn owner(&self) -> &ConnectorProviderBindingKey {
         &self.provider_binding_key
@@ -1956,9 +2095,7 @@ impl ConnectorStagedCreateSession {
                 "staged-create operation ID must equal its statement publication ID",
             ));
         }
-        request
-            .mode
-            .validate_for(&request.owner, request.operation_id, &request.table)?;
+        request.validate_mode()?;
         let retained_request = request.clone();
         let operation_id = request.operation_id;
         {
@@ -2430,41 +2567,45 @@ impl ConnectorStagedCreateSession {
         write_lease.matches_provider_binding_key(&self.provider_binding_key)
     }
 
-    /// Constructs the provider-private prepare carrier from facts already
-    /// frozen by the FE-owned control-runtime lease.
-    pub fn prepare_request(
+    /// Given actual source columns, build the ordinary typed request on the
+    /// same staged generation.
+    pub fn prepare_typed_request(
         &self,
         publication_id: LakePublicationId,
         operation_id: ConnectorStagedCreateOperationId,
         table: ConnectorTableIdentity,
         columns: Vec<ConnectorColumnDefinition>,
-        partitioning: Vec<ConnectorPartitionTransform>,
-        properties: BTreeMap<Arc<str>, Arc<str>>,
+        storage: Arc<ConnectorStagedCtasProperties>,
         policy: CreatePolicy,
         context: ConnectorRequestContext,
-    ) -> ConnectorStagedCreatePrepareRequest {
-        ConnectorStagedCreatePrepareRequest {
+    ) -> Result<ConnectorStagedCreatePrepareRequest, ConnectorError> {
+        let request = ConnectorStagedCreatePrepareRequest {
             owner: self.provider_binding_key.clone(),
             publication_id,
             operation_id,
             table,
             columns,
-            partitioning,
-            properties,
             policy,
-            mode: ConnectorStagedCreateMode::Ordinary,
+            mode: ConnectorStagedCreateMode::OrdinaryTyped { storage },
             context,
-        }
+        };
+        request.validate_mode()?;
+        Ok(request)
     }
 
-    pub fn prepare_document_managed_request(
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The staged request combines separately authored operation, evaluated storage, and document admission facts."
+    )]
+    pub fn prepare_document_managed_typed_request(
         &self,
         publication_id: LakePublicationId,
         operation_id: ConnectorStagedCreateOperationId,
         table: ConnectorTableIdentity,
         columns: Vec<ConnectorColumnDefinition>,
-        partitioning: Vec<ConnectorPartitionTransform>,
-        properties: BTreeMap<Arc<str>, Arc<str>>,
+        visible_partition_sources: Vec<Arc<str>>,
+        storage_properties: Arc<[(Arc<str>, DdlPropertyValue)]>,
+        application_properties: BTreeMap<Arc<str>, Arc<str>>,
         policy: CreatePolicy,
         admission: ConnectorDocumentManagementAdmission,
         context: ConnectorRequestContext,
@@ -2475,15 +2616,18 @@ impl ConnectorStagedCreateSession {
             operation_id,
             table,
             columns,
-            partitioning,
-            properties,
             policy,
-            mode: ConnectorStagedCreateMode::ApplicationDocumentManaged { admission },
+            mode: ConnectorStagedCreateMode::ApplicationDocumentManaged {
+                admission,
+                storage: Arc::new(ConnectorStagedMvStorageProperties {
+                    visible_partition_sources,
+                    properties: storage_properties,
+                    application_properties,
+                }),
+            },
             context,
         };
-        request
-            .mode
-            .validate_for(&request.owner, request.operation_id, &request.table)?;
+        request.validate_mode()?;
         Ok(request)
     }
 
@@ -2517,9 +2661,7 @@ impl ConnectorStagedCreateSession {
                 "staged-create operation ID must equal its statement publication ID",
             ));
         }
-        request
-            .mode
-            .validate_for(&request.owner, request.operation_id, &request.table)?;
+        request.validate_mode()?;
         let retained_request = request.clone();
         let operation_id = request.operation_id;
         {
@@ -3087,9 +3229,9 @@ impl ConnectorStagedCreateSession {
             } => {
                 self.validate_handle(handle, operation_id)?;
                 match (&request.mode, handle.document_target()) {
-                    (ConnectorStagedCreateMode::Ordinary, None) => {}
+                    (ConnectorStagedCreateMode::OrdinaryTyped { .. }, None) => {}
                     (
-                        ConnectorStagedCreateMode::ApplicationDocumentManaged { admission },
+                        ConnectorStagedCreateMode::ApplicationDocumentManaged { admission, .. },
                         Some(target),
                     ) if target.owner() == &request.owner
                         && target.catalog_handle() == admission.catalog_handle()
@@ -4163,15 +4305,19 @@ mod tests {
                 namespace: Arc::from("db"),
                 table: Arc::from("t"),
             },
-            owner,
+            owner: owner.clone(),
             publication_id: LakePublicationId::try_from_bytes(operation_id.to_bytes())
                 .expect("staged create operation ID must be UUIDv7"),
             operation_id,
             columns: Vec::new(),
-            partitioning: Vec::new(),
-            properties: BTreeMap::new(),
             policy: CreatePolicy::FailIfExists,
-            mode: ConnectorStagedCreateMode::Ordinary,
+            mode: ConnectorStagedCreateMode::OrdinaryTyped {
+                storage: Arc::new(ConnectorStagedCtasProperties {
+                    owner,
+                    properties: Arc::from([]),
+                    comment: None,
+                }),
+            },
             context: context(),
         }
     }

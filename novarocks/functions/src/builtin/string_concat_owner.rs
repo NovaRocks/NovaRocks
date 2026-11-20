@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Each installed string concatenation shares its binding, effects and CPU preparation owner.
+//! Strict builtin string and array concatenation bindings, effects and preparation.
 
 use std::sync::Arc;
 
@@ -37,17 +37,29 @@ use crate::{
     ScalarCallContract, ScalarCallInput, ScalarKernelInstance, SelectedValues,
 };
 
-/// Only the actually registered variadic Utf8 concat declaration is installed.
-pub(super) fn operation(name: &str) -> Option<()> {
-    (name == "concat").then_some(())
+#[derive(Clone, Copy, Debug)]
+pub(super) enum ConcatKind {
+    String,
+    Array,
 }
 
-/// UTF-8 concatenation is strict and total for representable Utf8 results.
-/// The kernel has no mutable instance state, even across batches.
-pub(super) fn effects() -> FunctionEffectDeclaration {
+pub(super) fn operation(name: &str) -> Option<ConcatKind> {
+    match name {
+        "concat" => Some(ConcatKind::String),
+        "array_concat" => Some(ConcatKind::Array),
+        _ => None,
+    }
+}
+
+/// Concatenation is strict and stateless. Array calls with one non-null
+/// argument report a row error.
+pub(super) fn effects(kind: ConcatKind) -> FunctionEffectDeclaration {
     FunctionEffectDeclaration {
         value_stability: FunctionVolatility::Immutable,
-        own_row_error: FunctionIntrinsicRowError::NoRowError,
+        own_row_error: match kind {
+            ConcatKind::String => FunctionIntrinsicRowError::NoRowError,
+            ConcatKind::Array => FunctionIntrinsicRowError::MayRaise,
+        },
         failure_behavior: FunctionFailureBehavior::Propagate,
         null_behavior: FunctionNullBehavior::Strict,
         argument_control: ArgumentControl::Eager,
@@ -62,32 +74,33 @@ pub(super) fn definition(
     declaration: FunctionBindingDeclaration,
     resolver: BuiltinScalarResolver,
 ) -> Result<FunctionDefinition, FunctionCatalogError> {
-    let owner = Arc::new(StringConcatOwner::new(name, declaration, resolver)?);
+    let owner = Arc::new(ConcatOwner::new(name, declaration, resolver)?);
     FunctionDefinition::try_new_pure_scalar(name, FunctionVisibility::Public, owner).map_err(
         |error| FunctionCatalogError::InvalidStableIdentity {
-            subject: "builtin string concatenation pure owner",
+            subject: "builtin concatenation pure owner",
             value: error.to_string().into(),
         },
     )
 }
 
-pub(super) struct StringConcatOwner {
+pub(super) struct ConcatOwner {
+    kind: ConcatKind,
     resolver: Arc<BuiltinScalarResolver>,
     declaration: FunctionBindingDeclaration,
     implementations: Box<[PureImplementationDeclaration]>,
 }
-impl StringConcatOwner {
+impl ConcatOwner {
     fn new(
         name: &str,
         declaration: FunctionBindingDeclaration,
         resolver: BuiltinScalarResolver,
     ) -> Result<Self, FunctionCatalogError> {
-        operation(name).ok_or_else(|| FunctionCatalogError::InvalidStableIdentity {
-            subject: "uninstalled string concatenation",
+        let kind = operation(name).ok_or_else(|| FunctionCatalogError::InvalidStableIdentity {
+            subject: "uninstalled concatenation",
             value: name.into(),
         })?;
         let function = format!("builtin.scalar/{name}/v1");
-        let expected = effects();
+        let expected = effects(kind);
         if declaration.function_id().as_str() != function
             || declaration.kind() != FunctionKind::Scalar
             || declaration.overloads().len() != 1
@@ -96,7 +109,7 @@ impl StringConcatOwner {
             })
         {
             return Err(FunctionCatalogError::InvalidStableIdentity {
-                subject: "builtin string concatenation pure declaration",
+                subject: "builtin concatenation pure declaration",
                 value: declaration.function_id().as_str().into(),
             });
         }
@@ -112,17 +125,23 @@ impl StringConcatOwner {
             })
             .collect();
         Ok(Self {
+            kind,
             resolver: Arc::new(resolver),
             declaration,
             implementations,
         })
     }
 
-    fn call_effects(&self, scope: CallProofScope) -> CallEffects {
-        let base = effects();
+    fn call_effects(&self, scope: CallProofScope, arguments: usize) -> CallEffects {
+        let base = effects(self.kind);
+        let own_row_error = if arguments == 1 {
+            base.own_row_error
+        } else {
+            FunctionIntrinsicRowError::NoRowError
+        };
         CallEffects {
             value_stability: base.value_stability,
-            own_row_error: base.own_row_error,
+            own_row_error,
             failure_behavior: base.failure_behavior,
             null_behavior: base.null_behavior,
             argument_control: base.argument_control,
@@ -134,7 +153,7 @@ impl StringConcatOwner {
     }
 }
 
-impl FunctionBindingResolver for StringConcatOwner {
+impl FunctionBindingResolver for ConcatOwner {
     fn resolve(
         &self,
         request: FunctionBindingRequest<'_>,
@@ -163,7 +182,7 @@ impl FunctionBindingResolver for StringConcatOwner {
     }
 }
 
-impl PureFunctionMetadataOwner for StringConcatOwner {
+impl PureFunctionMetadataOwner for ConcatOwner {
     fn binding_resolver_owner(self: Arc<Self>) -> crate::FunctionBindingResolverOwner {
         crate::FunctionBindingResolverOwner::fixed_scalar(Arc::clone(&self.resolver))
     }
@@ -177,7 +196,7 @@ impl PureFunctionMetadataOwner for StringConcatOwner {
     }
 }
 
-impl FunctionEffectOwner for StringConcatOwner {
+impl FunctionEffectOwner for ConcatOwner {
     type Error = FunctionBindingError;
 
     fn declaration(
@@ -214,7 +233,7 @@ impl FunctionEffectOwner for StringConcatOwner {
     }
 }
 
-impl PureScalarImplementation for StringConcatOwner {
+impl PureScalarImplementation for ConcatOwner {
     fn prepare_scalar(
         &self,
         input: CallEffectInput<'_>,
@@ -240,20 +259,27 @@ impl PureScalarImplementation for StringConcatOwner {
 }
 
 #[derive(Debug)]
-struct PreparedStringConcat {
+struct PreparedConcat {
+    kind: ConcatKind,
     contract: Arc<ScalarCallContract>,
 }
-impl PreparedScalarKernel for PreparedStringConcat {
+impl PreparedScalarKernel for PreparedConcat {
     fn contract(&self) -> &Arc<ScalarCallContract> {
         &self.contract
     }
 
     fn instance_retained_upper_bound(&self) -> usize {
-        std::mem::size_of::<StringConcatInstance>()
+        match self.kind {
+            ConcatKind::String => std::mem::size_of::<StringConcatInstance>(),
+            ConcatKind::Array => std::mem::size_of::<ArrayConcatInstance>(),
+        }
     }
 
     fn create_instance(&self) -> Result<Box<dyn ScalarKernelInstance>, KernelFailure> {
-        Ok(Box::new(StringConcatInstance))
+        Ok(match self.kind {
+            ConcatKind::String => Box::new(StringConcatInstance),
+            ConcatKind::Array => Box::new(ArrayConcatInstance),
+        })
     }
 }
 
@@ -272,15 +298,30 @@ impl ScalarKernelInstance for StringConcatInstance {
     }
 }
 
+struct ArrayConcatInstance;
+impl ScalarKernelInstance for ArrayConcatInstance {
+    fn evaluate<'a>(
+        &mut self,
+        input: ScalarCallInput<'_, 'a>,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<SelectedValues<'a>, KernelFailure> {
+        super::array_concat::evaluate(input, control)
+    }
+
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+    }
+}
+
 #[cfg(test)]
-pub(super) fn owner_for_test(name: &str) -> StringConcatOwner {
+pub(super) fn owner_for_test(name: &str) -> ConcatOwner {
     let (_, signatures) = super::registry::builtin_scalar_declarations()
         .into_iter()
         .find(|(candidate, _)| candidate == name)
         .unwrap();
     let (declaration, resolver) =
         super::catalogue::scalar_definition_parts(name, &signatures, FunctionKind::Scalar).unwrap();
-    StringConcatOwner::new(name, declaration, resolver).unwrap()
+    ConcatOwner::new(name, declaration, resolver).unwrap()
 }
 #[cfg(test)]
 pub(super) fn prepared_for_test_with_policy(
@@ -347,7 +388,7 @@ pub(super) fn prepared_for_test_with_control(
     .map(|specialization| specialization.into_prepared())
 }
 
-impl StringConcatOwner {
+impl ConcatOwner {
     fn refine_selected_core(
         &self,
         input: CallEffectInput<'_>,
@@ -368,7 +409,7 @@ impl StringConcatOwner {
                     && input.proof_scope != input.context.proof_scope()
             {
                 return Err(FunctionBindingError::InvalidBinding(
-                "string concatenation has no environment dependencies and requires an exact proof scope".into(),
+                "concatenation has no environment dependencies and requires an exact proof scope".into(),
             )
             .into());
             }
@@ -377,7 +418,7 @@ impl StringConcatOwner {
                 FunctionBindingError::Control(error) => FunctionEffectOwnerError::Control(error),
                 other => FunctionEffectOwnerError::Owner(other),
             })?;
-            Ok(self.call_effects(input.proof_scope))
+            Ok(self.call_effects(input.proof_scope, input.selected.argument_types.len()))
         })();
         if matches!(&result, Err(FunctionEffectOwnerError::Control(_))) {
             return result;
@@ -403,21 +444,30 @@ impl StringConcatOwner {
                 || novarocks_type_contract::CallEffectContext::from(contract.context())
                     != input.context
                 || contract.decimal_overflow_policy() != input.decimal_overflow_policy
-                || contract.effects() != &self.call_effects(input.proof_scope)
+                || contract.effects()
+                    != &self.call_effects(input.proof_scope, input.selected.argument_types.len())
                 || !input.environment.is_empty()
             {
                 return Err(invalid(
-                    "string concatenation preparation differs from its exact checked call",
+                    "concatenation preparation differs from its exact checked call",
                 ));
             }
             work.flush().map_err(compile_failure)?;
             validate().map_err(|error| match error {
                 FunctionBindingError::Control(error) => compile_failure(error),
-                _ => invalid("string concatenation preparation has a stale selected binding"),
+                _ => invalid("concatenation preparation has a stale selected binding"),
             })?;
             // The prepared object retains the same canonical contract. Its body is
             // a static pure implementation and needs no live resolver or authority.
-            Ok(Arc::new(PreparedStringConcat { contract }) as Arc<dyn PreparedScalarKernel>)
+            if matches!(self.kind, ConcatKind::Array) {
+                super::array_concat::validate_profile(&contract, || {
+                    work.step().map_err(compile_failure)
+                })?;
+            }
+            Ok(Arc::new(PreparedConcat {
+                kind: self.kind,
+                contract,
+            }) as Arc<dyn PreparedScalarKernel>)
         })();
         if result.as_ref().is_err_and(KernelFailure::is_interruption) {
             return result;

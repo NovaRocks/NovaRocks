@@ -70,7 +70,7 @@ pub struct QuerySource {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QueryDialect {
-    StarRocks,
+    Trino,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -85,7 +85,7 @@ impl TryFrom<PersistedQueryDefinition> for QuerySource {
     fn try_from(value: PersistedQueryDefinition) -> Result<Self, Self::Error> {
         value.validate()?;
         let dialect = match value.dialect {
-            PersistedQueryDialect::StarRocks => QueryDialect::StarRocks,
+            PersistedQueryDialect::Trino => QueryDialect::Trino,
         };
         Ok(Self {
             effective_sql: value.raw_query_source,
@@ -103,7 +103,7 @@ impl TryFrom<QuerySource> for PersistedQueryDefinition {
 
     fn try_from(value: QuerySource) -> Result<Self, Self::Error> {
         let dialect = match value.dialect {
-            QueryDialect::StarRocks => PersistedQueryDialect::StarRocks,
+            QueryDialect::Trino => PersistedQueryDialect::Trino,
         };
         PersistedQueryDefinition::new(
             value.effective_sql,

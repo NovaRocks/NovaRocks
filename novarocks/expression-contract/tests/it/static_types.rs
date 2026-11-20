@@ -21,7 +21,67 @@ use arrow_schema::{DataType, Field, TimeUnit};
 use novarocks_expression_contract::*;
 use novarocks_failure_contract::{FailureClass, FailureProjection};
 use novarocks_type_contract::*;
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
+
+fn type_only_root(b: &mut BoundExprSetBuilder, child: ExprId, output: ValueType) -> ExprId {
+    // This is the same explicit neutral fixture declaration as the existing
+    // control_derivation TypeOnly case, not a runtime function installation.
+    let function = function(
+        "fixture/static-types/type-only",
+        vec![FunctionArgumentType::Value(output)],
+        boolean(false),
+    );
+    let request = request(&function);
+    let root = b
+        .add(
+            None,
+            boolean(false),
+            ExprKind::FunctionCall {
+                function,
+                args: Box::new([child]),
+            },
+        )
+        .unwrap();
+    b.request(root, request).unwrap();
+    b.definition_control(
+        root,
+        DefinitionControl {
+            shape: ControlShape::TypeOnly,
+            temporal_sources: None,
+        },
+    )
+    .unwrap();
+    root
+}
+
+fn seal_fixture(
+    b: BoundExprSetBuilder,
+    ports: Vec<ExprPort>,
+    hidden: bool,
+    control: &Control,
+) -> Result<BoundExprSet, UnitError> {
+    if !hidden {
+        return no_calls(b, ports, control);
+    }
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
+    let result = (|| {
+        with_call_claims(
+            b.seal(ports, &mut work)?,
+            ArgumentControl::TypeOnly,
+            &mut work,
+        )
+    })();
+    if result.as_ref().err().is_some_and(|error| {
+        matches!(
+            error.failure_fact().class(),
+            FailureClass::Control | FailureClass::Resource | FailureClass::Representation
+        )
+    }) {
+        return result;
+    }
+    work.finish()?;
+    result
+}
 
 fn checked(
     inputs: &[ValueType],
@@ -46,34 +106,7 @@ fn checked(
         .collect();
     let definition = b.add(None, output.clone(), kind(&definitions)).unwrap();
     let root = if hidden {
-        // This is the same explicit neutral fixture declaration as the existing
-        // control_derivation TypeOnly case, not a runtime function installation.
-        let function = function(
-            "fixture/static-types/type-only",
-            vec![FunctionArgumentType::Value(output)],
-            boolean(false),
-        );
-        let request = request(&function);
-        let root = b
-            .add(
-                None,
-                boolean(false),
-                ExprKind::FunctionCall {
-                    function,
-                    args: Box::new([definition]),
-                },
-            )
-            .unwrap();
-        b.request(root, request).unwrap();
-        b.definition_control(
-            root,
-            DefinitionControl {
-                shape: ControlShape::TypeOnly,
-                temporal_sources: None,
-            },
-        )
-        .unwrap();
-        root
+        type_only_root(&mut b, definition, output)
     } else {
         definition
     };
@@ -85,28 +118,7 @@ fn checked(
             .map(|(ordinal, ty)| (ValueId::new(ordinal as u32), ty.clone()))
             .collect(),
     }];
-    let unit = if hidden {
-        let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
-        let result = (|| {
-            with_call_claims(
-                b.seal(ports, &mut work)?,
-                ArgumentControl::TypeOnly,
-                &mut work,
-            )
-        })();
-        if result.as_ref().err().is_some_and(|error| {
-            matches!(
-                error.failure_fact().class(),
-                FailureClass::Control | FailureClass::Resource | FailureClass::Representation
-            )
-        }) {
-            return result.map(|unit| (unit, definition));
-        }
-        work.finish()?;
-        result?
-    } else {
-        no_calls(b, ports, control)?
-    };
+    let unit = seal_fixture(b, ports, hidden, control)?;
     assert_eq!(
         unit.definition(definition).unwrap().ty,
         if hidden {
@@ -519,5 +531,273 @@ fn wide_static_comparison_type_checks_keep_every_original_control_prefix() {
                 }
             }
         }
+    }
+}
+
+fn cast_list_type(item: DataType, child_nullable: bool, root_nullable: bool) -> ValueType {
+    ValueType::new(
+        DataType::List(Arc::new(Field::new("declared-item", item, child_nullable))),
+        root_nullable,
+    )
+}
+
+fn cast_json_list_type(child_nullable: bool, root_nullable: bool) -> ValueType {
+    let storage = ValueTypeStorageLifetime::pure();
+    let child = ValueTypeRef::try_new(
+        ValueKind::Nominal(ValueLogicalType::Json),
+        child_nullable,
+        storage.clone(),
+    )
+    .unwrap();
+    let value =
+        ValueTypeRef::try_new(ValueKind::List(child), root_nullable, storage.clone()).unwrap();
+    let layout = ValueLayout::try_new(
+        &DataType::List(Arc::new(Field::new(
+            "declared-item",
+            DataType::Utf8,
+            child_nullable,
+        ))),
+        storage,
+    )
+    .unwrap();
+    ValueType::try_from_value(value, layout).unwrap()
+}
+
+fn checked_array_cast(
+    source: ValueType,
+    result: ValueType,
+    source_kind: ExprKind,
+    mode: Option<ArrayCastFailureMode>,
+    policy: DecimalOverflowPolicy,
+    unused: bool,
+) -> Result<(BoundExprSet, ExprId), UnitError> {
+    let input = ValueId::new(0);
+    let mut builder = BoundExprSetBuilder::new(limits());
+    let child = builder.add(None, source.clone(), source_kind).unwrap();
+    let allow = SemanticParameterRef {
+        id: SemanticParameterId::new(7),
+        expected_key: SemanticParameterKey::AllowThrowException,
+    };
+    let cast = builder
+        .add(
+            None,
+            result.clone(),
+            ExprKind::Cast {
+                expr: child,
+                target: result.data_type().clone(),
+                decimal_overflow_policy: policy,
+                allow_throw_exception: allow,
+                array_failure_mode: mode,
+            },
+        )
+        .unwrap();
+    let root = if unused {
+        type_only_root(&mut builder, cast, result.clone())
+    } else {
+        cast
+    };
+    builder
+        .root(root, EvaluationDemand::Value, RootScope::Port(0))
+        .unwrap();
+    let unit = seal_fixture(
+        builder,
+        vec![ExprPort {
+            values: Box::new([(input, source.clone())]),
+        }],
+        unused,
+        &Control::good(),
+    )?;
+    let retained = unit.definition(cast).unwrap();
+    assert_eq!(unit.definition(child).unwrap().ty, source);
+    assert_eq!(retained.ty, result);
+    assert!(matches!(
+        &retained.kind,
+        ExprKind::Cast {
+            expr,
+            target,
+            decimal_overflow_policy,
+            allow_throw_exception,
+            array_failure_mode,
+        } if *expr == child
+            && target == result.data_type()
+            && *decimal_overflow_policy == policy
+            && *allow_throw_exception == allow
+            && *array_failure_mode == mode
+    ));
+    assert_eq!(unit.control_flow().uses().len(), if unused { 1 } else { 2 });
+    assert_eq!(
+        unit.control_flow()
+            .uses()
+            .values()
+            .any(|usage| usage.definition == cast),
+        !unused
+    );
+    Ok((unit, cast))
+}
+
+#[test]
+fn explicit_array_cast_modes_check_live_and_unused_definitions() {
+    use ArrayCastFailureMode as Mode;
+    let list = |item, nullable| cast_list_type(item, true, nullable);
+    let nested = |item, nullable| {
+        list(
+            DataType::List(Arc::new(Field::new("inner", item, nullable))),
+            true,
+        )
+    };
+    for unused in [false, true] {
+        for mode in [Mode::ReportError, Mode::OutputNull] {
+            for (source, result, accepted) in [
+                (
+                    list(DataType::Int32, true),
+                    list(DataType::Int64, true),
+                    true,
+                ),
+                (
+                    list(DataType::Int32, false),
+                    list(DataType::Int64, false),
+                    mode == Mode::ReportError,
+                ),
+                (
+                    list(DataType::Int32, true),
+                    cast_list_type(DataType::Int64, false, true),
+                    false,
+                ),
+                (
+                    nested(DataType::Int32, true),
+                    nested(DataType::Int64, false),
+                    false,
+                ),
+                (integer(true), list(DataType::Int64, true), false),
+                (list(DataType::Int32, true), integer(true), false),
+                (
+                    list(DataType::Int32, true),
+                    list(DataType::Int64, false),
+                    false,
+                ),
+            ] {
+                let actual = checked_array_cast(
+                    source,
+                    result,
+                    ExprKind::Value(ValueId::new(0)),
+                    Some(mode),
+                    DecimalOverflowPolicy::ReportError,
+                    unused,
+                );
+                if accepted {
+                    actual.unwrap();
+                } else {
+                    type_error(actual, "explicit array CAST mode differs");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn null_list_json_cast_checks_live_and_unused_definitions_and_full_types() {
+    let input = ExprKind::Value(ValueId::new(0));
+    for unused in [false, true] {
+        for (source_nullable, result_nullable) in [(false, false), (false, true), (true, true)] {
+            for policy in [
+                DecimalOverflowPolicy::OutputNull,
+                DecimalOverflowPolicy::ReportError,
+            ] {
+                checked_array_cast(
+                    cast_list_type(DataType::Null, true, source_nullable),
+                    cast_json_list_type(true, result_nullable),
+                    input.clone(),
+                    None,
+                    policy,
+                    unused,
+                )
+                .unwrap();
+            }
+        }
+        for (source, result) in [
+            (
+                cast_list_type(DataType::Null, true, false),
+                cast_json_list_type(false, true),
+            ),
+            (
+                cast_list_type(DataType::Null, true, true),
+                cast_json_list_type(true, false),
+            ),
+            (
+                ValueType::new(DataType::Null, true),
+                cast_json_list_type(true, true),
+            ),
+        ] {
+            type_error(
+                checked_array_cast(
+                    source,
+                    result,
+                    input.clone(),
+                    None,
+                    DecimalOverflowPolicy::OutputNull,
+                    unused,
+                ),
+                "carrier CAST cannot establish or erase a logical identity",
+            );
+        }
+    }
+}
+
+#[test]
+fn checked_nonempty_utf8_constant_cannot_gain_json_identity_in_live_or_unused_cast() {
+    use arrow_array::{
+        Array,
+        builder::{ListBuilder, StringBuilder},
+    };
+    use novarocks_constant_contract::{
+        ConstantPool, ConstantPoolId, ConstantPools, ConstantReference,
+    };
+    let mut builder = ListBuilder::new(StringBuilder::new()).with_field(Arc::new(Field::new(
+        "declared-item",
+        DataType::Utf8,
+        true,
+    )));
+    builder.values().append_value("original nonempty UTF8");
+    builder.append(true);
+    let array = builder.finish();
+    let source = ValueType::new(array.data_type().clone(), false);
+    let target = cast_json_list_type(true, true);
+    assert_eq!(source.data_type(), target.data_type());
+    let control = Control::good();
+    let pool = ConstantPool::try_new(
+        Arc::new(Field::new(
+            "original_utf8_list",
+            array.data_type().clone(),
+            false,
+        )),
+        source.clone(),
+        array.to_data(),
+        policy(),
+        CompilePhase::Validate,
+        &control,
+    )
+    .unwrap();
+    let reference = ConstantReference {
+        pool: ConstantPoolId::new(4),
+        ordinal: 0,
+    };
+    let mut pools = ConstantPools::empty();
+    pools.insert(reference.pool, pool).unwrap();
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
+    let original = pools.resolve_source_observed(reference, &mut work).unwrap();
+    assert_eq!(original.value_type(), &source);
+    work.finish().unwrap();
+    for unused in [false, true] {
+        type_error(
+            checked_array_cast(
+                original.value_type().clone(),
+                target.clone(),
+                ExprKind::Constant(reference),
+                None,
+                DecimalOverflowPolicy::OutputNull,
+                unused,
+            ),
+            "carrier CAST cannot establish or erase a logical identity",
+        );
     }
 }

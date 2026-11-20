@@ -3152,6 +3152,166 @@ mod tests {
         workload.mark_ready().unwrap();
         (workload, capacity)
     }
+    #[tokio::test(start_paused = true)]
+    async fn original_statement_action_binds_one_timeout_visible_to_early_observers() {
+        use crate::cancellation::{QueryCancellationReason, QueryCancellationView};
+        use crate::session_control::{
+            GovernedActionContext, GovernedStatementAction, QuerySessionDeadline,
+            SessionQueryAdmission, StatementActionValue, StatementCommandCompletion,
+            StatementCompletionProjection,
+        };
+        use novarocks_workload_control::ResultWindowClass;
+        use std::{
+            future::Future,
+            task::{Context, Poll},
+            time::Duration,
+        };
+
+        struct OriginalPreparation {
+            release: Option<futures::channel::oneshot::Receiver<()>>,
+            complete: futures::channel::oneshot::Receiver<()>,
+            scope: novarocks_workload_control::WorkScope,
+            queue: Option<SessionQueryAdmission>,
+            received: bool,
+        }
+        impl GovernedStatementAction for OriginalPreparation {
+            fn poll_action(
+                &mut self,
+                owner: &mut GovernedActionContext<'_>,
+                cx: &mut Context<'_>,
+            ) -> Poll<Result<StatementActionValue, crate::session_error::QueryServiceError>>
+            {
+                assert_eq!(owner.scope().id(), self.scope.id());
+                assert!(owner.cancellation().is_for_scope(&self.scope));
+                if let Some(gate) = &mut self.release {
+                    let alias = owner.result_window_alias().unwrap();
+                    assert!(alias.is_root_backed_internal() && alias.is_for_scope(&self.scope));
+                    if std::pin::Pin::new(gate).poll(cx).is_pending() {
+                        return Poll::Pending;
+                    }
+                    self.release.take();
+                    self.queue = Some(
+                        owner
+                            .queue_after_session_preparation(Some(Duration::from_millis(1000)))
+                            .unwrap(),
+                    );
+                }
+                if let Some(queue) = &mut self.queue {
+                    let mut grant = match queue.as_mut().poll(cx) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(grant) => Some(grant.unwrap()),
+                    };
+                    owner.accept_session_query_grant_in(&mut grant).unwrap();
+                    assert!(grant.is_none());
+                    self.queue.take();
+                    self.received = true;
+                }
+                assert!(self.received);
+                let alias = owner.result_window_alias().unwrap();
+                assert_eq!(alias.class(), ResultWindowClass::Client);
+                assert!(alias.is_for_scope(&self.scope));
+                assert_eq!(owner.timeout_ms(), Some(1000));
+                if std::pin::Pin::new(&mut self.complete).poll(cx).is_pending() {
+                    return Poll::Pending;
+                }
+                Poll::Ready(Ok(StatementActionValue::Ok(
+                    StatementCommandCompletion::empty(),
+                )))
+            }
+        }
+
+        let control = Arc::new(QueryApplicationControl::default());
+        let service = QueryControlService::new(control.clone());
+        let (workload, capacity) = local_workload();
+        let slot = crate::session_control::StatementProgressSlot::empty();
+        slot.install(
+            service.clone(),
+            std::num::NonZeroUsize::new(WorkloadConfig::default().scope_records_limit).unwrap(),
+        )
+        .unwrap();
+        let mut owner = Some(
+            service
+                .begin_governed_query_session_preparation(
+                    register(&control, "root"),
+                    &workload.root_admission(),
+                    QuerySessionDeadline::ResolveFromProperties,
+                    Arc::<str>::from("WITH SESSION query_timeout = 1 SELECT 1"),
+                    ResultWindowClass::Client,
+                )
+                .unwrap(),
+        );
+        let original = owner.as_ref().unwrap();
+        let scope = original.scope().clone();
+        let early =
+            QueryCancellationView::governed(original.cancellation().clone(), original.timeout_ms());
+        let (release, wait_for_preparation) = futures::channel::oneshot::channel();
+        let (complete, finish_action) = futures::channel::oneshot::channel();
+        let mut action: Option<Box<dyn GovernedStatementAction>> =
+            Some(Box::new(OriginalPreparation {
+                release: Some(wait_for_preparation),
+                complete: finish_action,
+                scope: scope.clone(),
+                queue: None,
+                received: false,
+            }));
+        let mut wait = None;
+        service
+            .publish_statement_action_in(
+                &mut owner,
+                &mut action,
+                StatementCompletionProjection::new(
+                    crate::session::StatementOutputShape::Empty,
+                    novarocks_result_contract::ClientPresentationFamily::TrinoJson(
+                        novarocks_result_contract::TrinoJsonFacts {
+                            parametric_datetime: true,
+                            variant: false,
+                            variant_binary: false,
+                        },
+                    ),
+                ),
+                &mut wait,
+            )
+            .unwrap()
+            .finish()
+            .unwrap();
+        drive_original_statement_actions(&slot);
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+        assert_eq!(workload.snapshot().root_responsibilities, 1);
+        assert_eq!(workload.snapshot().admitted_queries, 0);
+        assert_eq!(workload.next_deadline(), None);
+        assert_eq!(early.governed_timeout_for_scope(&scope).unwrap(), None);
+
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert!(early.reason().is_none());
+        let cut = tokio::time::Instant::now();
+        release.send(()).unwrap();
+        drive_original_statement_actions(&slot);
+        assert_eq!(
+            workload.next_deadline(),
+            Some(cut + Duration::from_millis(1000))
+        );
+        assert_eq!(
+            early.governed_timeout_for_scope(&scope).unwrap(),
+            Some(1000)
+        );
+        assert_eq!(capacity.snapshot().held_positions, [1, 0, 0, 0]);
+        assert_eq!(workload.snapshot().admitted_queries, 1);
+        assert_eq!(workload.snapshot().root_responsibilities, 1);
+
+        tokio::time::advance(Duration::from_millis(1000)).await;
+        workload.expire_deadlines();
+        assert_eq!(
+            early.cancelled().await,
+            QueryCancellationReason::DeadlineExceeded { timeout_ms: 1000 }
+        );
+        drop(wait.take());
+        complete.send(()).unwrap();
+        drive_original_statement_actions(&slot);
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+        assert_eq!(workload.snapshot().admitted_queries, 0);
+        assert_eq!(workload.snapshot().root_responsibilities, 0);
+    }
+
     #[tokio::test]
     async fn abandoned_explain_dispatch_retains_local_window_until_actual_action_exit() {
         let control = Arc::new(QueryApplicationControl::default());

@@ -26,33 +26,30 @@
 -- @skip_result_check=true
 
 CREATE TABLE ${case_db}.t0 (
-  c0 INT NULL,
-  c1 VARCHAR(20) NULL,
-  c2 VARCHAR(200) NULL,
-  c3 INT NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+  c0 INT ,
+  c1 VARCHAR(20) ,
+  c2 VARCHAR(200) ,
+  c3 INT
+) WITH (format_version = 3);
 
 CREATE TABLE ${case_db}.t1 (
-  c0 INT NULL,
-  c1 VARCHAR(20) NULL,
-  c2 VARCHAR(200) NULL,
-  c3 INT NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+  c0 INT ,
+  c1 VARCHAR(20) ,
+  c2 VARCHAR(200) ,
+  c3 INT
+) WITH (format_version = 3);
 
 CREATE TABLE ${case_db}.small_table (
-  c0 INT NULL,
-  c1 VARCHAR(20) NULL,
-  c2 VARCHAR(200) NULL,
-  c3 INT NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+  c0 INT ,
+  c1 VARCHAR(20) ,
+  c2 VARCHAR(200) ,
+  c3 INT
+) WITH (format_version = 3);
 
-CREATE TABLE ${case_db}.empty_t LIKE ${case_db}.t0;
+CREATE TABLE ${case_db}.empty_t (LIKE ${case_db}.t0);
 
 INSERT INTO ${case_db}.t0 SELECT generate_series, generate_series, generate_series, generate_series FROM TABLE(generate_series(1, 12000));
-INSERT INTO ${case_db}.t0 VALUES (null, null, null, null);
+INSERT INTO ${case_db}.t0 VALUES ROW(null, null, null, null);
 INSERT INTO ${case_db}.t1 SELECT * FROM ${case_db}.t0;
 INSERT INTO ${case_db}.small_table SELECT generate_series, generate_series, generate_series, generate_series FROM TABLE(generate_series(1, 100));
 
@@ -120,19 +117,19 @@ select  ${case_db}.t0.*,${case_db}.t1.* from ${case_db}.t0 join  ${case_db}.smal
 
 -- null equality
 -- query 27
-select count(l.c0), avg(l.c0), count(l.c1), count(l.c0), count(r.c1) from ${case_db}.t0 l join  ${case_db}.t1 r on l.c0 <=> r.c0 and l.c1 <=> r.c1 where r.c3 < 10;
+select count(l.c0), avg(l.c0), count(l.c1), count(l.c0), count(r.c1) from ${case_db}.t0 l join  ${case_db}.t1 r on l.c0  IS NOT DISTINCT FROM  r.c0 and l.c1  IS NOT DISTINCT FROM  r.c1 where r.c3 < 10;
 
 -- cross join: in colocate group upper
 -- query 28
-select count(l.c0), avg(l.c0), count(l.c1), count(l.c0), count(r.c1) from ${case_db}.t0 l join  ${case_db}.t1 r on l.c0 = r.c0 and l.c1 = r.c1 join  ${case_db}.small_table t3 where r.c3 < 10 and t3.c0 < 3;
+select count(l.c0), avg(l.c0), count(l.c1), count(l.c0), count(r.c1) from ${case_db}.t0 l join  ${case_db}.t1 r on l.c0 = r.c0 and l.c1 = r.c1 CROSS JOIN  ${case_db}.small_table t3 where r.c3 < 10 and t3.c0 < 3;
 -- cross join: in colocate group lower
 -- query 29
-select count(l.c0), avg(l.c0), count(l.c1), count(l.c0), count(r.c1) from ${case_db}.t0 l join  ${case_db}.small_table t3 join  ${case_db}.t1 r on l.c0 = r.c0 and l.c1 = r.c1 where r.c3 < 10 and t3.c0 < 3;
+select count(l.c0), avg(l.c0), count(l.c1), count(l.c0), count(r.c1) from ${case_db}.t0 l CROSS JOIN  ${case_db}.small_table t3 join  ${case_db}.t1 r on l.c0 = r.c0 and l.c1 = r.c1 where r.c3 < 10 and t3.c0 < 3;
 -- cross join with runtime filter
 -- query 30
-select count(l.c0), avg(l.c0), count(l.c1), count(l.c0), count(r.c1) from ${case_db}.t0 l join  ${case_db}.small_table t3 join  ${case_db}.t1 r on l.c0 = r.c0 and l.c1 = r.c1 where r.c3 < 10 and t3.c0 = 3;
+select count(l.c0), avg(l.c0), count(l.c1), count(l.c0), count(r.c1) from ${case_db}.t0 l CROSS JOIN  ${case_db}.small_table t3 join  ${case_db}.t1 r on l.c0 = r.c0 and l.c1 = r.c1 where r.c3 < 10 and t3.c0 = 3;
 -- query 31
-select count(l.c0), avg(l.c0), count(l.c1), count(l.c0), count(r.c1) from ${case_db}.t0 l join  ${case_db}.t1 r on l.c0 = r.c0 and l.c1 = r.c1 join  ${case_db}.small_table t3 where r.c3 < 10 and t3.c0 = 3;
+select count(l.c0), avg(l.c0), count(l.c1), count(l.c0), count(r.c1) from ${case_db}.t0 l join  ${case_db}.t1 r on l.c0 = r.c0 and l.c1 = r.c1 CROSS JOIN  ${case_db}.small_table t3 where r.c3 < 10 and t3.c0 = 3;
 
 -- CTE
 -- query 32
@@ -158,11 +155,14 @@ with agged_table as (select distinct c0, c1 from ${case_db}.t0) select  count(*)
 -- query 40
 with agged_table as (select distinct c0, c1 from ${case_db}.t0) select  count(*), sum(l.c0), sum(r.c0), sum(l.c1), sum(r.c1) from agged_table l left join  agged_table r on l.c0 = r.c0 and l.c1 = r.c1;
 -- query 41
-with flat_table as (select c0, c1 from ${case_db}.t0) select  l.c0, l.c1, count(*) from flat_table l join  flat_table r on l.c0 = r.c0 and l.c1 = r.c1 group by 1,2 order by 1,2 limit 10000,2;
+with flat_table as (select c0, c1 from ${case_db}.t0) select  l.c0, l.c1, count(*) from flat_table l join  flat_table r on l.c0 = r.c0 and l.c1 = r.c1 group by 1,2 order by 1,2 OFFSET 10000
+LIMIT 2;
 -- query 42
-with flat_table as (select c0, c1 from ${case_db}.t0) select  l.c0, l.c1, count(*) from flat_table l right join  flat_table r on l.c0 = r.c0 and l.c1 = r.c1 group by 1,2 order by 1,2 limit 10000,2;
+with flat_table as (select c0, c1 from ${case_db}.t0) select  l.c0, l.c1, count(*) from flat_table l right join  flat_table r on l.c0 = r.c0 and l.c1 = r.c1 group by 1,2 order by 1,2 OFFSET 10000
+LIMIT 2;
 -- query 43
-with flat_table as (select c0, c1 from ${case_db}.t0) select  l.c0, l.c1, count(*) from flat_table l left join  flat_table r on l.c0 = r.c0 and l.c1 = r.c1 group by 1,2 order by 1,2 limit 10000,2;
+with flat_table as (select c0, c1 from ${case_db}.t0) select  l.c0, l.c1, count(*) from flat_table l left join  flat_table r on l.c0 = r.c0 and l.c1 = r.c1 group by 1,2 order by 1,2 OFFSET 10000
+LIMIT 2;
 
 -- bucket shuffle join with runtime filter
 -- query 44
@@ -193,7 +193,8 @@ select count(*), sum(c0), sum(c1) from (select l.c0, l.c1 from (select c0, c1 fr
 -- WITH TOPN
 -- @order_sensitive=true
 -- query 53
-select l.c0, l.c1, r.c1 from ${case_db}.t0 l join  ${case_db}.t1 r on l.c0 = r.c0 and l.c1 = r.c1 order by 1,2,3 limit 10000, 10;
+select l.c0, l.c1, r.c1 from ${case_db}.t0 l join  ${case_db}.t1 r on l.c0 = r.c0 and l.c1 = r.c1 order by 1,2,3 OFFSET 10000
+LIMIT  10;
 
 -- WITH WINDOW FUNCTION (not in the same fragment)
 -- query 54
@@ -215,21 +216,26 @@ select count(*), sum(lc0), sum(lc1), sum(rc1) from (select l.c0 lc0, l.c1 lc1, r
 
 -- WITH PARTITION-TOP-N and AGG
 -- query 60
-select count(*) from (select c0l, c1l from (select l.c0 c0l, l.c1 c1l, r.c1 c1r, row_number() over () rn from ${case_db}.t0 l join  ${case_db}.t1 r on l.c0 = r.c0 and l.c1 = r.c1) tb where rn < 10 group by 1,2 order by 1,2 limit 2000, 1) tb;
+select count(*) from (select c0l, c1l from (select l.c0 c0l, l.c1 c1l, r.c1 c1r, row_number() over () rn from ${case_db}.t0 l join  ${case_db}.t1 r on l.c0 = r.c0 and l.c1 = r.c1) tb where rn < 10 group by 1,2 order by 1,2 OFFSET 2000
+LIMIT  1) tb;
 -- @order_sensitive=true
 -- query 61
-select c0l, c1l from (select l.c0 c0l, l.c1 c1l, r.c1 c1r, row_number() over (partition by l.c0) rn from ${case_db}.t0 l join  ${case_db}.t1 r on l.c0 = r.c0 and l.c1 = r.c1) tb where rn < 10 group by 1,2 order by 1,2 limit 2000, 1;
+select c0l, c1l from (select l.c0 c0l, l.c1 c1l, r.c1 c1r, row_number() over (partition by l.c0) rn from ${case_db}.t0 l join  ${case_db}.t1 r on l.c0 = r.c0 and l.c1 = r.c1) tb where rn < 10 group by 1,2 order by 1,2 OFFSET 2000
+LIMIT  1;
 -- @order_sensitive=true
 -- query 62
-select c0l, c1l from (select l.c0 c0l, l.c1 c1l, r.c1 c1r, row_number() over (partition by l.c0, l.c1) rn from ${case_db}.t0 l join  ${case_db}.t1 r on l.c0 = r.c0 and l.c1 = r.c1) tb where rn < 10 group by 1,2 order by 1,2 limit 2000, 1;
+select c0l, c1l from (select l.c0 c0l, l.c1 c1l, r.c1 c1r, row_number() over (partition by l.c0, l.c1) rn from ${case_db}.t0 l join  ${case_db}.t1 r on l.c0 = r.c0 and l.c1 = r.c1) tb where rn < 10 group by 1,2 order by 1,2 OFFSET 2000
+LIMIT  1;
 
 -- assert nodes
 -- @order_sensitive=true
 -- query 63
-select c0,c1 in (select c1 from ${case_db}.t1 where c0 = 10) from (select l.c0, r.c1 from ${case_db}.t0 l join  ${case_db}.t1 r on l.c0 = r.c0 and l.c1 = r.c1) tb order by 1, 2 limit 10000, 1;
+select c0,c1 in (select c1 from ${case_db}.t1 where c0 = 10) from (select l.c0, r.c1 from ${case_db}.t0 l join  ${case_db}.t1 r on l.c0 = r.c0 and l.c1 = r.c1) tb order by 1, 2 OFFSET 10000
+LIMIT  1;
 -- @order_sensitive=true
 -- query 64
-select c0,c1 = (select c1 from ${case_db}.t1 where c0 = 10) from (select l.c0, r.c1 from ${case_db}.t0 l join  ${case_db}.t1 r on l.c0 = r.c0 and l.c1 = r.c1) tb order by 1, 2 limit 10000, 1;
+select c0,c1 = (select c1 from ${case_db}.t1 where c0 = 10) from (select l.c0, r.c1 from ${case_db}.t0 l join  ${case_db}.t1 r on l.c0 = r.c0 and l.c1 = r.c1) tb order by 1, 2 OFFSET 10000
+LIMIT  1;
 
 -- tablet prune (prune left table)
 -- query 65

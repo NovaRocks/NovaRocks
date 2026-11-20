@@ -17,139 +17,105 @@
 
 //! Syntax-only SQL abstract syntax tree nodes.
 
-pub(crate) mod catalog;
-pub(crate) mod command;
-pub(crate) mod dml;
+mod control_expr;
+mod special_expr;
+pub use special_expr::*;
 mod equivalence;
 mod expr;
-pub(crate) mod iceberg;
-pub(crate) mod maintenance;
-pub(crate) mod materialized_view;
+mod name_chain;
+mod predicate;
+pub use control_expr::*;
 mod query;
+pub use predicate::*;
 mod relation;
-pub(crate) mod session;
-pub(crate) mod statistics;
-pub(crate) mod table;
+mod routine;
+
+pub use routine::{
+    AssignmentStatement, CaseStatement, CaseStatementWhenClause, CompoundStatement,
+    ControlStatement, ElseClause, ElseIfClause, FunctionParameter, FunctionSpecification,
+    IfStatement, IterateStatement, LeaveStatement, LoopStatement, RepeatStatement, ReturnStatement,
+    RoutineBody, RoutineCharacteristic, RoutineProperty, RoutineSecurity, VariableDeclaration,
+    WhileStatement,
+};
+mod catalog_schema;
+mod storage;
+pub use catalog_schema::*;
+mod table_alter;
+pub use table_alter::*;
+mod table_statement;
+pub use table_statement::*;
+mod view_statement;
+pub use view_statement::*;
+mod ctas_statement;
+pub use ctas_statement::*;
+mod branch_statement;
+pub use branch_statement::*;
+mod show_statement;
+pub use show_statement::*;
+mod write_statement;
+pub use write_statement::*;
+mod prepared_statement;
+pub use prepared_statement::*;
+mod merge_call;
+pub use merge_call::*;
+mod permission_statement;
+pub use permission_statement::*;
+mod metadata_session;
+pub use metadata_session::*;
+mod trino_statement;
+pub use trino_statement::*;
+mod type_literal;
+pub use type_literal::*;
+mod row_pattern;
 mod validate;
-pub(crate) mod view;
 mod visit;
 mod window;
+pub use storage::{AstBox, AstVec};
 
-pub use catalog::{
-    CatalogProperty, CatalogStatement, CreateCatalog, CreateDatabase, DropCatalog, DropDatabase,
-    DropTable, ShowCreateTable, TruncateTable,
-};
-pub use command::{Property, PropertyKeyValue};
-pub use dml::{
-    AddEqualityDelete, Assignment, CreateTableAsSelect, Delete, DmlStatement, Insert,
-    InsertPartitionEntry, InsertPartitions, Merge, MergeClause, MergeMatchedAction,
-    MergeNotMatchedAction, MutationSource, Update,
-};
-pub use equivalence::{SyntaxEq, syntax_eq_explain_query, syntax_eq_expr, syntax_eq_query};
+pub use equivalence::{SyntaxEq, syntax_eq_expr, syntax_eq_query};
 pub use expr::{
-    AccessExpr, AccessKind, ArrayExpr, BetweenExpr, BinaryExpr, BinaryOperator, CaseExpr, CastExpr,
-    CastKind, CompoundIdentifier, ExistsExpr, Expr, FunctionCall, FunctionOrderBy,
-    FunctionQuantifier, InListExpr, InSubqueryExpr, IntervalExpr, IntervalField, IsPredicate,
-    IsPredicateExpr, JsonOperator, LambdaExpr, LikeExpr, LikeOperator, MapEntry, MapExpr,
-    NestedExpr, NullTreatment, StructExpr, StructExprField, SubqueryExpr, TupleExpr,
-    TypedStringExpr, UnaryExpr, UnaryOperator,
+    AllRows, ArrayExpr, ArrayWildcardSubscriptExpr, BinaryExpr, BinaryOperator, CallArgument,
+    DereferenceExpr, Expr, FunctionCall, IntervalField, LogicalExpr, LogicalOperator,
+    NullTreatment, Parameter, ProcessingMode, ProcessingModeKind, RowExpr, RowField, SubqueryExpr,
+    SubscriptExpr, UnaryExpr, UnaryOperator,
 };
-pub use iceberg::{
-    AddFiles, AlterIcebergTable, ColumnPath, ColumnPosition, IcebergColumnAction,
-    IcebergPartitionChange, IcebergPartitionField, IcebergPropertiesAction, IcebergReferenceAction,
-    IcebergReferenceKind, IcebergSchemaChange, IcebergStatement, IcebergTableAction,
-    RawReferenceOptions, ReferenceAnchor,
-};
-pub use maintenance::{
-    CallStatement, ExpireSnapshots, ExpireSnapshotsOption, MaintenanceStatement, MaintenanceValue,
-    OptimizeTable, ProcedureArgument, ProcedureArgumentMode, ProcedureMap, ProcedureMapEntry,
-    RemoveOrphanFiles, RewriteManifests,
-};
-pub use materialized_view::{
-    AlterMaterializedView, CreateMaterializedView, DropMaterializedView,
-    ExplainRefreshMaterializedView, MaterializedViewAlterAction, MaterializedViewDistribution,
-    MaterializedViewExplainLevel, MaterializedViewPartitionArgument,
-    MaterializedViewPartitionField, MaterializedViewProperty, MaterializedViewRefreshMode,
-    MaterializedViewRefreshPolicy, MaterializedViewStatement, RefreshMaterializedView,
-};
+
 pub use query::{
-    Cte, ExplainFormat, ExplainQuery, Fetch, GroupBy, Offset, OffsetRows, OrderByExpr, Query,
-    ReplaceSelectItem, Select, SelectHint, SelectHintValue, SelectItem, SelectQuantifier, SetExpr,
-    SetOperation, SetOperator, SetQuantifier, Values, WildcardOptions, With,
+    AllColumns, AutoGroupBy, Corresponding, Cte, FetchFirst, GroupBy, GroupingElement,
+    GroupingSets, GroupingSetsKind, Limit, NullOrdering, Offset, OrderBy, Query, QueryLimit,
+    QueryModifiers, Select, SelectItem, SessionProperty, SetExpr, SetOperation, SetOperator,
+    SimpleGroupBy, SingleColumn, SortItem, SortOrdering, Values, ValuesRowCells, With,
 };
-pub use relation::{
-    Join, JoinConstraint, JoinOperator, TableAlias, TableFactor, TableFunctionSyntax, TableVersion,
-    TableVersionKind, TableWithJoins,
+pub use relation::*;
+pub use row_pattern::{
+    MeasureDefinition, PatternAnchorKind, PatternInteger, PatternQuantifier, PatternSearchMode,
+    PatternSearchModeKind, RowPattern, SkipTo, SubsetDefinition, VariableDefinition,
 };
-pub use session::ShowProcessList;
-pub use session::{
-    KillKind, KillStatement, SessionStatement, SetAssignment, SetScope, SetStatement,
-    TransactionControlKind, TransactionControlStatement, UseStatement,
-};
-pub use statistics::{AnalyzeTable, ShowStats, StatisticsStatement};
-pub use table::{
-    ColumnDefinition, CreateTable, LegacyRangePartition, LegacyRangePartitionDefinition,
-    PartitionTransform, TableDistribution, TableKey, TableKeyKind, TablePartition,
-    TablePartitionTransform, TableProperty, TableStatement,
-};
-pub use validate::{validate_statement, validate_statements};
-pub use view::{CreateView, DropView, ShowCreateView, ViewStatement};
+
+pub use validate::validate_statement;
+
 pub use visit::{
-    Fold, Visit, fold_binary_expr, fold_expr, fold_function_call, fold_ident, fold_literal,
-    fold_nested_expr, fold_object_name, fold_query, fold_select, fold_statement, fold_table_factor,
-    fold_type_name, fold_unary_expr, fold_view_statement, walk_binary_expr, walk_expr,
-    walk_function_call, walk_ident, walk_literal, walk_nested_expr, walk_object_name, walk_query,
-    walk_statement, walk_table_factor, walk_type_name, walk_unary_expr, walk_view_statement,
+    Fold, Visit, fold_all_columns, fold_auto_group_by, fold_binary_expr, fold_cte, fold_expr,
+    fold_function_call, fold_group_by, fold_grouping_element, fold_grouping_sets, fold_ident,
+    fold_logical_expr, fold_object_name, fold_query, fold_select, fold_select_item, fold_set_expr,
+    fold_simple_group_by, fold_single_column, fold_unary_expr, fold_values, fold_with,
+    walk_all_columns, walk_auto_group_by, walk_binary_expr, walk_cte, walk_expr,
+    walk_function_call, walk_group_by, walk_grouping_element, walk_grouping_sets, walk_ident,
+    walk_logical_expr, walk_object_name, walk_query, walk_select, walk_select_item,
+    walk_simple_group_by, walk_single_column, walk_unary_expr, walk_values, walk_with,
 };
 pub use window::{
-    NamedWindow, WindowFrame, WindowFrameBound, WindowFrameExclusion, WindowFrameUnits, WindowSpec,
+    Window, WindowDefinition, WindowFrame, WindowFrameBound, WindowFrameExclusion,
+    WindowFrameUnits, WindowOperation, WindowReference, WindowSpecification,
 };
 
 use crate::Span;
 
-/// A top-level SQL statement.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum Statement {
-    ShowProcessList(ShowProcessList),
-    Statistics(StatisticsStatement),
-    Catalog(CatalogStatement),
-    Iceberg(IcebergStatement),
-    Maintenance(MaintenanceStatement),
-    MaterializedView(MaterializedViewStatement),
-    View(ViewStatement),
-    Table(TableStatement),
-    Dml(DmlStatement),
-    Session(SessionStatement),
-    Query(Query),
-    ExplainQuery(ExplainQuery),
-}
-
-impl Statement {
-    pub const fn span(&self) -> Span {
-        match self {
-            Self::ShowProcessList(statement) => statement.span,
-            Self::Statistics(statement) => statement.span(),
-            Self::Catalog(statement) => statement.span(),
-            Self::Iceberg(statement) => statement.span(),
-            Self::Maintenance(statement) => statement.span(),
-            Self::MaterializedView(statement) => statement.span(),
-            Self::View(statement) => statement.span(),
-            Self::Table(statement) => statement.span(),
-            Self::Dml(statement) => statement.span(),
-            Self::Session(statement) => statement.span(),
-            Self::Query(query) => query.span,
-            Self::ExplainQuery(query) => query.span,
-        }
-    }
-}
-
-/// An SQL identifier preserving its source spelling.
+/// Decoded identifier text and whether its source name was delimited.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Ident {
     pub value: String,
     pub quoted: bool,
-    /// Original delimiter when the identifier was quoted.
-    pub quote_style: Option<char>,
     pub span: Span,
 }
 
@@ -158,49 +124,6 @@ pub struct Ident {
 pub struct ObjectName {
     pub parts: Vec<Ident>,
     pub span: Span,
-}
-
-/// A syntax-level type name, deliberately independent of execution data types.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TypeName {
-    pub name: ObjectName,
-    pub arguments: Vec<TypeNameArgument>,
-    /// Trivia after each argument comma, retained for canonical reparse compatibility.
-    pub argument_separator_spaces: Vec<bool>,
-    pub span: Span,
-}
-
-/// A type parameter retained without lowering it into an execution type.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum TypeNameArgument {
-    Type(TypeName),
-    Literal(Literal),
-    Field(StructField),
-}
-
-/// One named field in a `STRUCT<...>` type.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct StructField {
-    pub name: Ident,
-    pub data_type: TypeName,
-    pub span: Span,
-}
-
-/// A source literal and its syntactic category.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Literal {
-    pub kind: LiteralKind,
-    pub span: Span,
-}
-
-/// Literal categories initially required by the parser foundation.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum LiteralKind {
-    Null,
-    Boolean(bool),
-    Number(String),
-    String(String),
-    HexString(String),
 }
 
 #[cfg(test)]
@@ -218,26 +141,26 @@ mod tests {
             parts: vec![Ident {
                 value: "catalog".to_owned(),
                 quoted: false,
-                quote_style: None,
                 span: span(0, 7),
             }],
             span: span(0, 7),
         };
         let type_name = TypeName {
-            name: name.clone(),
-            arguments: Vec::new(),
-            argument_separator_spaces: Vec::new(),
+            kind: TypeKind::Generic(GenericDataType {
+                name: name.parts[0].clone(),
+                arguments: AstVec::new(),
+            }),
             span: span(0, 7),
         };
         let literal = Literal {
-            kind: LiteralKind::Number("42".to_owned()),
+            kind: LiteralKind::Long {
+                spelling: "42".to_owned(),
+                parsed_value: ("42".to_owned()).parse::<i64>().unwrap(),
+            },
             span: span(8, 10),
         };
         let expression = Expr::Literal(literal.clone());
-        let statement = Statement::ShowProcessList(ShowProcessList {
-            full: false,
-            span: span(11, 24),
-        });
+        let statement = TrinoStatement::Commit(span(11, 24));
 
         assert_eq!(name.span, span(0, 7));
         assert_eq!(type_name.span, span(0, 7));
@@ -261,36 +184,40 @@ mod tests {
         }
 
         let expression = Expr::Binary(BinaryExpr {
-            left: Box::new(Expr::Identifier(Ident {
+            left_operand_span: span(0, 1),
+            left: crate::ast::AstBox::new(Expr::Identifier(Ident {
                 value: "a".to_owned(),
                 quoted: false,
-                quote_style: None,
                 span: span(0, 1),
             })),
             operator: BinaryOperator::Add,
-            right: Box::new(Expr::FunctionCall(FunctionCall {
+            right: crate::ast::AstBox::new(Expr::FunctionCall(AstBox::new(FunctionCall {
                 name: ObjectName {
                     parts: vec![Ident {
                         value: "abs".to_owned(),
                         quoted: false,
-                        quote_style: None,
                         span: span(4, 7),
                     }],
                     span: span(4, 7),
                 },
                 arguments: vec![Expr::Literal(Literal {
-                    kind: LiteralKind::Number("1".to_owned()),
+                    kind: LiteralKind::Long {
+                        spelling: "1".to_owned(),
+                        parsed_value: ("1".to_owned()).parse::<i64>().unwrap(),
+                    },
                     span: span(8, 9),
-                })],
-                quantifier: FunctionQuantifier::None,
-                order_by: Vec::new(),
-                separator: None,
+                })]
+                .into_iter()
+                .map(|value| crate::build::call_argument(value, None))
+                .collect(),
+                processing_mode: None,
+                distinct: false,
+                order_by: None,
                 filter: None,
                 null_treatment: None,
-                over: None,
-                substring_from_syntax: false,
+                window: None,
                 span: span(4, 10),
-            })),
+            }))),
             span: span(0, 10),
         });
 
@@ -312,11 +239,11 @@ mod tests {
             }
         }
 
-        let expression = Expr::Nested(NestedExpr {
-            expression: Box::new(Expr::Identifier(Ident {
+        let expression = Expr::Unary(UnaryExpr {
+            operator: UnaryOperator::Not,
+            expression: crate::ast::AstBox::new(Expr::Identifier(Ident {
                 value: "old".to_owned(),
                 quoted: false,
-                quote_style: None,
                 span: span(1, 4),
             })),
             span: span(0, 5),
@@ -325,11 +252,11 @@ mod tests {
         let expression = Rename.fold_expr(expression);
         assert_eq!(
             expression,
-            Expr::Nested(NestedExpr {
-                expression: Box::new(Expr::Identifier(Ident {
+            Expr::Unary(UnaryExpr {
+                operator: UnaryOperator::Not,
+                expression: crate::ast::AstBox::new(Expr::Identifier(Ident {
                     value: "new".to_owned(),
                     quoted: false,
-                    quote_style: None,
                     span: span(1, 4),
                 })),
                 span: span(0, 5),
@@ -337,3 +264,84 @@ mod tests {
         );
     }
 }
+
+pub use routine::{
+    fold_assignment_statement, fold_case_statement, fold_case_statement_when_clause,
+    fold_compound_statement, fold_control_statement, fold_else_clause, fold_else_if_clause,
+    fold_function_parameter, fold_function_specification, fold_if_statement,
+    fold_iterate_statement, fold_leave_statement, fold_loop_statement, fold_repeat_statement,
+    fold_return_statement, fold_routine_body, fold_routine_characteristic, fold_routine_property,
+    fold_variable_declaration, fold_while_statement, walk_assignment_statement,
+    walk_case_statement, walk_case_statement_when_clause, walk_compound_statement,
+    walk_control_statement, walk_else_clause, walk_else_if_clause, walk_function_parameter,
+    walk_function_specification, walk_if_statement, walk_iterate_statement, walk_leave_statement,
+    walk_loop_statement, walk_repeat_statement, walk_return_statement, walk_routine_body,
+    walk_routine_characteristic, walk_routine_property, walk_variable_declaration,
+    walk_while_statement,
+};
+
+pub use visit::{fold_query_modifiers, walk_query_modifiers};
+
+mod json;
+
+pub use json::{
+    JsonArray, JsonArrayElement, JsonAstInvariantError, JsonConstructor, JsonExists,
+    JsonExistsErrorBehavior, JsonFormat, JsonObject, JsonObjectMember, JsonPathInvocation,
+    JsonPathParameter, JsonPathString, JsonQuery, JsonQueryBehavior, JsonQueryQuotesBehavior,
+    JsonQueryWrapperBehavior, JsonSerialize, JsonSerializeErrorBehavior, JsonTable,
+    JsonTableColumn, JsonTableDefaultPlan, JsonTableErrorBehavior, JsonTableNestedColumns,
+    JsonTableOrdinalityColumn, JsonTableParentChildPlanType, JsonTablePlan, JsonTablePlanLeaf,
+    JsonTablePlanParentChild, JsonTablePlanSiblings, JsonTableQueryColumn,
+    JsonTableSiblingsPlanType, JsonTableSpecificPlan, JsonTableValueColumn, JsonValue,
+    JsonValueBehavior,
+};
+
+// Re-export helpers if following the existing ast module API.
+pub use json::{
+    fold_json_array, fold_json_array_element, fold_json_constructor, fold_json_exists,
+    fold_json_object, fold_json_object_member, fold_json_path_invocation, fold_json_path_parameter,
+    fold_json_path_string, fold_json_query, fold_json_serialize, fold_json_table,
+    fold_json_table_column, fold_json_table_default_plan, fold_json_table_nested_columns,
+    fold_json_table_ordinality_column, fold_json_table_plan, fold_json_table_plan_leaf,
+    fold_json_table_plan_parent_child, fold_json_table_plan_siblings, fold_json_table_query_column,
+    fold_json_table_specific_plan, fold_json_table_value_column, fold_json_value, walk_json_array,
+    walk_json_array_element, walk_json_constructor, walk_json_exists, walk_json_object,
+    walk_json_object_member, walk_json_path_invocation, walk_json_path_parameter,
+    walk_json_path_string, walk_json_query, walk_json_serialize, walk_json_table,
+    walk_json_table_column, walk_json_table_default_plan, walk_json_table_nested_columns,
+    walk_json_table_ordinality_column, walk_json_table_plan, walk_json_table_plan_leaf,
+    walk_json_table_plan_parent_child, walk_json_table_plan_siblings, walk_json_table_query_column,
+    walk_json_table_specific_plan, walk_json_table_value_column, walk_json_value,
+};
+
+#[cfg(test)]
+mod control_expr_tests;
+
+pub use visit::{fold_row_expr, fold_row_field, walk_row_expr, walk_row_field};
+
+pub use name_chain::{IdentifierChain, identifier_chain_observed};
+pub use visit::{
+    fold_array_wildcard_subscript_expr, fold_dereference_expr, fold_subscript_expr,
+    walk_array_wildcard_subscript_expr, walk_dereference_expr, walk_subscript_expr,
+};
+
+pub use visit::{fold_order_by, fold_sort_item, walk_order_by, walk_sort_item};
+
+pub use row_pattern::{
+    fold_measure_definition, fold_pattern_integer, fold_pattern_quantifier,
+    fold_pattern_search_mode, fold_row_pattern, fold_skip_to, fold_subset_definition,
+    fold_variable_definition, walk_measure_definition, walk_pattern_integer,
+    walk_pattern_quantifier, walk_pattern_search_mode, walk_row_pattern, walk_skip_to,
+    walk_subset_definition, walk_variable_definition,
+};
+pub use visit::{
+    fold_window, fold_window_definition, fold_window_frame, fold_window_operation,
+    fold_window_reference, fold_window_specification, walk_window, walk_window_definition,
+    walk_window_frame, walk_window_operation, walk_window_reference, walk_window_specification,
+};
+
+pub use visit::{
+    fold_call_argument, fold_processing_mode, walk_call_argument, walk_processing_mode,
+};
+
+pub use visit::{fold_set_operation, walk_set_operation};

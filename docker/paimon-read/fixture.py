@@ -1094,22 +1094,23 @@ access_key_secret = "${{ENV:AWS_S3_SECRET_ACCESS_KEY}}"
         f'paimon_object_store_credential_generation = "{runtime.credential_generation}"\n'
     )
     atomic_write(output_dir / "sql-runner.toml", sql_config.encode())
-    catalog_sql = f'''CREATE EXTERNAL CATALOG paimon_fixture
-PROPERTIES (
-  "type" = "paimon",
-  "paimon.catalog.type" = "filesystem",
-  "warehouse" = "{scope.warehouse_uri}",
-  "aws.s3.endpoint" = "{runtime.minio_endpoint_host}",
-  "aws.s3.region" = "us-east-1",
-  "aws.s3.enable_path_style_access" = "true",
-  "credential.object-store-metadata.consumer-role" = "frontend",
-  "credential.object-store-metadata.mode" = "static",
-  "credential.object-store-metadata.name" = "{runtime.credential_name}",
-  "credential.object-store-metadata.generation" = "{runtime.credential_generation}",
-  "credential.object-store-data.consumer-role" = "backend",
-  "credential.object-store-data.mode" = "static",
-  "credential.object-store-data.name" = "{runtime.credential_name}",
-  "credential.object-store-data.generation" = "{runtime.credential_generation}"
+    def sql_string(value):
+        return "'" + str(value).replace("'", "''") + "'"
+
+    catalog_sql = f'''CREATE CATALOG paimon_fixture USING paimon WITH (
+  "paimon.catalog.type" = 'filesystem',
+  "warehouse" = {sql_string(scope.warehouse_uri)},
+  "aws.s3.endpoint" = {sql_string(runtime.minio_endpoint_host)},
+  "aws.s3.region" = 'us-east-1',
+  "aws.s3.enable_path_style_access" = 'true',
+  "credential.object-store-metadata.consumer-role" = 'frontend',
+  "credential.object-store-metadata.mode" = 'static',
+  "credential.object-store-metadata.name" = {sql_string(runtime.credential_name)},
+  "credential.object-store-metadata.generation" = {sql_string(runtime.credential_generation)},
+  "credential.object-store-data.consumer-role" = 'backend',
+  "credential.object-store-data.mode" = 'static',
+  "credential.object-store-data.name" = {sql_string(runtime.credential_name)},
+  "credential.object-store-data.generation" = {sql_string(runtime.credential_generation)}
 );
 '''
     atomic_write(output_dir / "catalog.sql", catalog_sql.encode())

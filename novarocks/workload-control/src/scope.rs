@@ -26,7 +26,9 @@ use crate::{
     CancellationReason, CancellationView, LocalResourceAuthority, ResourceClass, ResourceConfig,
     WorkError, WorkloadObservationHandle,
     admission::{PendingAdmission, Stage},
-    cancellation::{CancellationRequestOutcome, CancellationSuccessSealOutcome},
+    cancellation::{
+        CancellationRequestOutcome, CancellationSuccessSealOutcome, DeadlineBinding, WorkDeadline,
+    },
     observation::{
         ControlIntents, ObligationKey, ObligationRecord, OwnerState, RootLifecycleSnapshot,
     },
@@ -335,7 +337,7 @@ impl State {
         &mut self,
         class: WorkClass,
         id: WorkId,
-        deadline: Option<Instant>,
+        deadline: DeadlineBinding,
     ) -> Result<SlotId, WorkError> {
         let slot = self.cancellations.take_root(class, id, deadline)?;
         if let Some(claim) = self.cancellations.slots[slot.0].claim
@@ -820,7 +822,11 @@ fn install_root_window(
                 return Err(WorkError::Capacity("scope records"));
             }
             let id = WorkId(state.next_id()?);
-            let cancellation = state.take_root_cancellation(class, id, request.deadline)?;
+            let cancellation = state.take_root_cancellation(
+                class,
+                id,
+                DeadlineBinding::Fixed(request.deadline),
+            )?;
             let mut node = Node::new(None, id, class, cancellation);
             node.business = true;
             state.nodes.insert(id, node);
@@ -866,21 +872,30 @@ fn begin_warehouse_root(
     inner: &Arc<Inner>,
     request: WorkRequest,
 ) -> Result<PendingQueryRoot, WorkError> {
+    let deadline = DeadlineBinding::Fixed(request.deadline);
+    begin_warehouse_root_with_deadline(inner, request.class, deadline)
+}
+
+fn begin_warehouse_root_with_deadline(
+    inner: &Arc<Inner>,
+    class: WorkClass,
+    deadline: DeadlineBinding,
+) -> Result<PendingQueryRoot, WorkError> {
     let mut destination = None;
-    install_warehouse_root(inner, request, &mut destination)?;
+    install_warehouse_root(inner, class, deadline, &mut destination)?;
     Ok(destination.expect("successful warehouse publication installs its original owner"))
 }
 
 fn install_warehouse_root(
     inner: &Arc<Inner>,
-    request: WorkRequest,
+    class: WorkClass,
+    deadline: DeadlineBinding,
     destination: &mut Option<PendingQueryRoot>,
 ) -> Result<(), WorkError> {
     if destination.is_some() {
         return Err(WorkError::Conflict);
     }
     inner.update(|state| {
-        let class = request.class;
         let result = (|| {
             if !class.uses_warehouse_concurrency() {
                 return Err(WorkError::Conflict);
@@ -898,7 +913,7 @@ fn install_warehouse_root(
                 return Err(WorkError::Capacity("scope records"));
             }
             let id = WorkId(state.next_id()?);
-            let cancellation = state.take_root_cancellation(class, id, request.deadline)?;
+            let cancellation = state.take_root_cancellation(class, id, deadline)?;
             state
                 .nodes
                 .insert(id, Node::new(None, id, class, cancellation));
@@ -965,7 +980,12 @@ impl RootAdmissionHandle {
         request: WorkRequest,
         destination: &mut Option<PendingQueryRoot>,
     ) -> Result<(), WorkError> {
-        install_warehouse_root(&self.inner, request, destination)
+        install_warehouse_root(
+            &self.inner,
+            request.class,
+            DeadlineBinding::Fixed(request.deadline),
+            destination,
+        )
     }
 
     pub fn try_begin_root(&self, request: WorkRequest) -> Result<RootWork, WorkError> {
@@ -995,6 +1015,13 @@ impl RootAdmissionHandle {
             return Err(WorkError::Conflict);
         }
         begin_warehouse_root(&self.inner, request)
+    }
+
+    /// Register the original Query Root for preparation before its statement
+    /// deadline is known. The same owner must bind the result of preparation
+    /// before queueing for warehouse concurrency or deriving children.
+    pub fn begin_query_root_with_deferred_deadline(&self) -> Result<PendingQueryRoot, WorkError> {
+        begin_warehouse_root_with_deadline(&self.inner, WorkClass::Query, DeadlineBinding::Deferred)
     }
 
     /// Register one compute-producing warehouse root before it receives the
@@ -1389,6 +1416,31 @@ impl WorkOwner {
 
     pub fn scope(&self) -> WorkScope {
         self.scope.as_ref().unwrap().clone()
+    }
+
+    /// Fix a deferred Root deadline and its original duration together.
+    /// None is the final no-timeout decision.
+    pub fn bind_deferred_root_timeout(
+        &self,
+        started: Instant,
+        timeout: Option<Duration>,
+    ) -> Result<(), WorkError> {
+        let scope = self.scope.as_ref().unwrap();
+        let cell = scope.inner.update(|state| {
+            let node = state.nodes.get(&scope.id).ok_or(WorkError::Released)?;
+            node.check(&state.cancellations)?;
+            if node.parent.is_some() || node.owner != OwnerState::Active {
+                return Err(WorkError::Conflict);
+            }
+            let cell = state.cancellations.cell(node.cancellation);
+            let deadline = WorkDeadline::from_configured_timeout(started, timeout)?;
+            cell.bind_root_deadline(deadline)?;
+            Ok(Arc::clone(cell))
+        })?;
+        let _reclaim = ReclaimWakeOnExit::new(&scope.inner);
+        cell.wake_deadline_observers();
+        drop(cell);
+        Ok(())
     }
 
     /// Derive a cloneable capability that may only request cancellation for
@@ -1814,6 +1866,139 @@ mod tests {
         .owner;
         control.mark_ready().unwrap();
         control
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn binding_pending_query_deadline_updates_the_original_view_and_role_expiry() {
+        use std::sync::atomic::AtomicUsize;
+
+        struct WakeCount(AtomicUsize);
+        impl Wake for WakeCount {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let control = controller();
+        let owner = control
+            .root_admission()
+            .begin_query_root_with_deferred_deadline()
+            .unwrap()
+            .owner;
+        let scope = owner.scope();
+        let view = scope.cancellation().unwrap();
+        assert!(view.is_for_scope(&scope));
+        assert_eq!(view.deadline(), None);
+        assert_eq!(control.snapshot().root_responsibilities, 1);
+        assert!(matches!(scope.admit_query(), Err(WorkError::NotReady)));
+        assert!(matches!(scope.child_inherited(), Err(WorkError::NotReady)));
+
+        let role_timer = control.deadline_expiry_handle();
+        let revision = role_timer.progress_revision();
+        assert_eq!(role_timer.next_deadline(), None);
+        let mut role_wait = std::pin::pin!(role_timer.wait_state_change(revision));
+        let role_wakes = Arc::new(WakeCount(AtomicUsize::new(0)));
+        let role_waker = Waker::from(Arc::clone(&role_wakes));
+        assert!(
+            role_wait
+                .as_mut()
+                .poll(&mut Context::from_waker(&role_waker))
+                .is_pending()
+        );
+        let mut waiting = std::pin::pin!(view.cancelled());
+        let view_wakes = Arc::new(WakeCount(AtomicUsize::new(0)));
+        let view_waker = Waker::from(Arc::clone(&view_wakes));
+        let mut view_context = Context::from_waker(&view_waker);
+        assert!(waiting.as_mut().poll(&mut view_context).is_pending());
+
+        let start = Instant::now();
+        let timeout = Duration::from_secs(3);
+        let deadline = start + timeout;
+        owner
+            .bind_deferred_root_timeout(start, Some(timeout))
+            .unwrap();
+        assert!(view_wakes.0.load(Ordering::Relaxed) > 0);
+        assert!(role_wakes.0.load(Ordering::Relaxed) > 0);
+        assert!(
+            role_wait
+                .as_mut()
+                .poll(&mut Context::from_waker(&role_waker))
+                .is_ready()
+        );
+        assert_eq!(role_timer.next_deadline(), Some(deadline));
+        assert!(view.is_for_scope(&scope));
+        assert_eq!(view.deadline(), Some(deadline));
+        assert_eq!(view.configured_timeout(), Some(timeout));
+        assert!(waiting.as_mut().poll(&mut view_context).is_pending());
+        assert!(matches!(
+            owner.bind_deferred_root_timeout(start, None),
+            Err(WorkError::Conflict)
+        ));
+        let permit = scope.admit_query().unwrap().await.unwrap();
+        let child = scope.child_inherited().unwrap();
+        assert_eq!(
+            child.scope().cancellation().unwrap().deadline(),
+            Some(deadline)
+        );
+        assert_eq!(control.snapshot().root_responsibilities, 1);
+
+        tokio::time::advance(Duration::from_secs(3)).await;
+        role_timer.expire_deadlines();
+        assert!(matches!(
+            waiting.as_mut().poll(&mut view_context),
+            std::task::Poll::Ready(CancellationReason::DeadlineExceeded)
+        ));
+        assert!(matches!(
+            child.scope().check(),
+            Err(WorkError::Cancelled(CancellationReason::DeadlineExceeded))
+        ));
+        child.complete_after_terminal_cancel_settled();
+        drop(permit);
+        owner.complete_after_terminal_cancel_settled();
+        assert_eq!(control.snapshot().root_responsibilities, 0);
+    }
+
+    #[test]
+    fn deferred_no_deadline_is_final_and_a_stopped_fixed_root_cannot_be_armed() {
+        let (control, _joint, _driver) = fixed_control_storage_tests::prototype_profile(4, 1, 1, 1);
+        let admission = control.root_admission();
+        let completed = admission
+            .begin_query_root_with_deferred_deadline()
+            .unwrap()
+            .owner;
+        let completed_scope = completed.scope();
+        let original_view = completed_scope.cancellation().unwrap();
+        completed
+            .bind_deferred_root_timeout(Instant::now(), None)
+            .unwrap();
+        assert_eq!(original_view.deadline(), None);
+        assert!(matches!(
+            completed.bind_deferred_root_timeout(Instant::now(), Some(Duration::from_secs(1))),
+            Err(WorkError::Conflict)
+        ));
+        drop(original_view);
+        completed.complete();
+
+        let stopped = admission
+            .begin_query_root_with_deferred_deadline()
+            .unwrap()
+            .owner;
+        let stopped_view = stopped.scope().cancellation().unwrap();
+        stopped.cancel(CancellationReason::ClientCancelRequested);
+        assert!(matches!(
+            stopped.bind_deferred_root_timeout(Instant::now(), Some(Duration::from_secs(1))),
+            Err(WorkError::Cancelled(
+                CancellationReason::ClientCancelRequested
+            ))
+        ));
+        assert_eq!(
+            stopped_view.reason(),
+            Some(CancellationReason::ClientCancelRequested)
+        );
+        assert_eq!(stopped_view.deadline(), None);
+        drop(stopped_view);
+        stopped.complete_after_terminal_cancel_settled();
+        assert_eq!(control.snapshot().root_responsibilities, 0);
     }
 
     #[tokio::test]

@@ -209,6 +209,44 @@ impl std::fmt::Debug for ConnectorDocumentManagementAdmission {
     }
 }
 
+/// Ordered replacement of an existing slot in the same managed publication.
+/// The old digest includes the prior slot writer. The provider supplies the
+/// new writer from the snapshot selected by the original overwrite attempt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConnectorDocumentPublicationSlotUpdate {
+    name: super::ConnectorSlotName,
+    expected_old: super::DocumentIdentity,
+    value: super::ConnectorSlotValue,
+}
+
+impl ConnectorDocumentPublicationSlotUpdate {
+    pub fn try_new(
+        name: super::ConnectorSlotName,
+        expected_old: super::DocumentIdentity,
+        value: super::ConnectorSlotValue,
+    ) -> Result<Self, ConnectorError> {
+        name.validate()?;
+        value.validate()?;
+        Ok(Self {
+            name,
+            expected_old,
+            value,
+        })
+    }
+
+    pub const fn name(&self) -> &super::ConnectorSlotName {
+        &self.name
+    }
+
+    pub const fn expected_old(&self) -> super::DocumentIdentity {
+        self.expected_old
+    }
+
+    pub const fn value(&self) -> &super::ConnectorSlotValue {
+        &self.value
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConnectorDocumentPublicationDeclaration {
     publication_id: LakePublicationId,
@@ -219,6 +257,8 @@ pub struct ConnectorDocumentPublicationDeclaration {
     empty_input: crate::connector::ConnectorManagedPublicationEmptyInputDisposition,
     partition_spec_replacement: Option<crate::connector::ConnectorManagedPartitionSpecReplacement>,
     expected_committed_partitioning: Option<crate::connector::ConnectorCommittedPartitioning>,
+    storage_projection_digest: Option<[u8; 32]>,
+    slot_update: Option<ConnectorDocumentPublicationSlotUpdate>,
 }
 
 impl ConnectorDocumentPublicationDeclaration {
@@ -234,6 +274,32 @@ impl ConnectorDocumentPublicationDeclaration {
         >,
         expected_committed_partitioning: Option<crate::connector::ConnectorCommittedPartitioning>,
     ) -> Result<Self, ConnectorError> {
+        Self::try_new_with_storage_projection(
+            publication_id,
+            admission,
+            target_object_id,
+            expected_base,
+            technique,
+            empty_input,
+            partition_spec_replacement,
+            expected_committed_partitioning,
+            None,
+        )
+    }
+
+    pub fn try_new_with_storage_projection(
+        publication_id: LakePublicationId,
+        admission: ConnectorDocumentManagementAdmission,
+        target_object_id: ConnectorTableObjectId,
+        expected_base: ConnectorWriteBaseVersion,
+        technique: crate::connector::ConnectorManagedPublicationTechnique,
+        empty_input: crate::connector::ConnectorManagedPublicationEmptyInputDisposition,
+        partition_spec_replacement: Option<
+            crate::connector::ConnectorManagedPartitionSpecReplacement,
+        >,
+        expected_committed_partitioning: Option<crate::connector::ConnectorCommittedPartitioning>,
+        storage_projection_digest: Option<[u8; 32]>,
+    ) -> Result<Self, ConnectorError> {
         admission.validate()?;
         expected_base.validate()?;
         if admission.operation() != ConnectorDocumentManagementOperation::Publication
@@ -247,6 +313,14 @@ impl ConnectorDocumentPublicationDeclaration {
         if partition_spec_replacement.is_some() != expected_committed_partitioning.is_some() {
             return Err(invalid(
                 "document publication partition replacement is incomplete",
+            ));
+        }
+        let combined = partition_spec_replacement
+            .as_ref()
+            .is_some_and(|replacement| replacement.storage_properties().is_some());
+        if combined != storage_projection_digest.is_some() {
+            return Err(invalid(
+                "document publication storage changes require their exact provider preview",
             ));
         }
         if let Some(replacement) = &partition_spec_replacement {
@@ -272,6 +346,8 @@ impl ConnectorDocumentPublicationDeclaration {
             empty_input,
             partition_spec_replacement,
             expected_committed_partitioning,
+            storage_projection_digest,
+            slot_update: None,
         })
     }
 
@@ -304,6 +380,27 @@ impl ConnectorDocumentPublicationDeclaration {
         &self,
     ) -> Option<&crate::connector::ConnectorCommittedPartitioning> {
         self.expected_committed_partitioning.as_ref()
+    }
+
+    pub const fn storage_projection_digest(&self) -> Option<[u8; 32]> {
+        self.storage_projection_digest
+    }
+
+    pub fn with_slot_update(
+        mut self,
+        update: ConnectorDocumentPublicationSlotUpdate,
+    ) -> Result<Self, ConnectorError> {
+        if self.partition_spec_replacement.is_none() || self.slot_update.is_some() {
+            return Err(invalid(
+                "document publication slot update requires one exact managed partition replacement",
+            ));
+        }
+        self.slot_update = Some(update);
+        Ok(self)
+    }
+
+    pub const fn slot_update(&self) -> Option<&ConnectorDocumentPublicationSlotUpdate> {
+        self.slot_update.as_ref()
     }
 
     pub(crate) fn validate_for_write(
@@ -476,6 +573,33 @@ impl ConnectorDocumentStorage {
             .await?;
         view.validate_for(&request)?;
         Ok(view)
+    }
+    pub async fn observe_keyed_document_definition(
+        &self,
+        target: ConnectorTableIdentity,
+        context: ConnectorRequestContext,
+    ) -> Result<super::KeyedDocumentDefinition, super::KeyedDocumentReadError> {
+        let request = super::KeyedDocumentDefinitionRequest {
+            owner: self.owner().clone(),
+            catalog_handle: self.catalog_handle().clone(),
+            target,
+            context,
+        };
+        request.validate()?;
+        let definition = self
+            .observation()?
+            .observe_keyed_document_definition(&request)
+            .await?;
+        definition
+            .view
+            .validate_for(&super::KeyedDocumentObservationRequest {
+                owner: request.owner,
+                catalog_handle: request.catalog_handle,
+                target: request.target,
+                object_id: definition.view.object_id.clone(),
+                context: request.context,
+            })?;
+        Ok(definition)
     }
     pub fn observe_full_keyed_documents(
         &self,

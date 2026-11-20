@@ -869,14 +869,30 @@ pub fn first_union_branch_query(
     ) -> Result<&novarocks_parser::ast::SetExpr, String> {
         match body {
             novarocks_parser::ast::SetExpr::SetOperation(operation) => {
-                first_branch_body(&operation.left)
+                if operation.operator != novarocks_parser::ast::SetOperator::Union
+                    || operation.distinct
+                    || operation.corresponding.is_some()
+                {
+                    return Err(
+                        "MV branch extraction requires UNION ALL without CORRESPONDING".into(),
+                    );
+                }
+                let first = operation
+                    .inputs
+                    .first()
+                    .ok_or_else(|| "MV UNION ALL has no input branches".to_string())?;
+                first_branch_body(first)
             }
-            novarocks_parser::ast::SetExpr::Query(inner) => first_branch_body(inner.body.as_ref()),
+            novarocks_parser::ast::SetExpr::Query(subquery) => {
+                let inner = &subquery.query;
+                first_branch_body(inner.body.as_ref())
+            }
             other => Ok(other),
         }
     }
     let mut branch = query.clone();
-    branch.body = Box::new(first_branch_body(query.body.as_ref())?.clone());
+    branch.body =
+        novarocks_parser::ast::AstBox::new(first_branch_body(query.body.as_ref())?.clone());
     Ok(branch)
 }
 

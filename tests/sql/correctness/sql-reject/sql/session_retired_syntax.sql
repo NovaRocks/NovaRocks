@@ -54,9 +54,13 @@ SELECT * FROM t1 JOIN [broadcast] t2 ON t1.a = t2.a;
 SELECT count(*) FROM t [_META_];
 
 -- query 9
--- @expect_trino_error=SYNTAX_ERROR,USER_ERROR
+-- The parser treats hint-shaped block comments as ordinary comments.
 SELECT /*+ set_user_variable(@v = 1) */ 1;
 
 -- query 10
 -- @expect_trino_error=INVALID_SESSION_PROPERTY,USER_ERROR
-SET CATALOG = default_catalog;
+SET SESSION catalog = default_catalog;
+
+-- query 11
+-- @expect_trino_error=SYNTAX_ERROR,USER_ERROR
+SELECT `retired_identifier`;

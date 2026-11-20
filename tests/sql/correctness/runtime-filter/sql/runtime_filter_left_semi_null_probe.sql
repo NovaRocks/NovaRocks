@@ -29,26 +29,23 @@ DROP TABLE IF EXISTS ${case_db}.t_rf_left_semi_null_probe_r;
 CREATE TABLE ${case_db}.t_rf_left_semi_null_probe_l (
     id INT,
     k INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 CREATE TABLE ${case_db}.t_rf_left_semi_null_probe_r (
     k INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t_rf_left_semi_null_probe_l VALUES
-    (1, 10),
-    (2, NULL),
-    (3, 30),
-    (4, 40);
+    ROW(1, 10),
+    ROW(2, NULL),
+    ROW(3, 30),
+    ROW(4, 40);
 
 INSERT INTO ${case_db}.t_rf_left_semi_null_probe_r VALUES
-    (10),
-    (NULL),
-    (50);
+    ROW(10),
+    ROW(NULL),
+    ROW(50);
 
 SELECT l.id, l.k
 FROM ${case_db}.t_rf_left_semi_null_probe_l l
-LEFT SEMI JOIN ${case_db}.t_rf_left_semi_null_probe_r r
-  ON l.k = r.k
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t_rf_left_semi_null_probe_r r WHERE l.k = r.k)
 ORDER BY l.id;

@@ -25,14 +25,12 @@
 CREATE TABLE ${case_db}.rf_dist_broadcast_probe (
     id INT NOT NULL,
     k INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 CREATE TABLE ${case_db}.rf_dist_broadcast_build (
     k INT,
     flag VARCHAR(8)
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.rf_dist_broadcast_probe
 SELECT generate_series AS id, generate_series % 600 AS k
@@ -43,14 +41,14 @@ SELECT generate_series % 600 AS k,
        CASE WHEN generate_series % 600 IN (11, 29) THEN 'Y' ELSE 'N' END AS flag
 FROM TABLE(generate_series(1, 600));
 
-ANALYZE TABLE ${case_db}.rf_dist_broadcast_probe;
-ANALYZE TABLE ${case_db}.rf_dist_broadcast_build;
+ANALYZE ${case_db}.rf_dist_broadcast_probe;
+ANALYZE ${case_db}.rf_dist_broadcast_build;
 
-SET global_runtime_filter_build_max_size = 10737418240;
-SET global_runtime_filter_probe_min_selectivity = 0.0;
-SET cbo_broadcast_node_mem_budget_bytes = 10737418240;
+SET SESSION global_runtime_filter_build_max_size = 10737418240;
+SET SESSION global_runtime_filter_probe_min_selectivity = 0.0;
+SET SESSION cbo_broadcast_node_mem_budget_bytes = 10737418240;
 
-SET disable_optimizer_rules = 'RuntimeFilterPushDown';
+SET SESSION disable_optimizer_rules = 'RuntimeFilterPushDown';
 SELECT 'broadcast_anyof' AS scenario, COUNT(*) AS row_count, COALESCE(SUM(p.id), 0) AS id_sum
 FROM ${case_db}.rf_dist_broadcast_probe p
 JOIN ${case_db}.rf_dist_broadcast_build b ON p.k = b.k
@@ -65,7 +63,7 @@ FROM ${case_db}.rf_dist_broadcast_probe p
 JOIN ${case_db}.rf_dist_broadcast_build b ON p.k = b.k
 WHERE b.flag = 'Y';
 
-SET disable_optimizer_rules = '';
+SET SESSION disable_optimizer_rules = '';
 -- @explain_contains=HASH JOIN (BROADCAST
 -- @explain_contains=producer binding
 -- @explain_contains=consumer binding

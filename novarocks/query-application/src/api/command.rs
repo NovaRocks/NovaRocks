@@ -19,8 +19,10 @@ use crate::execution_error::ExecutionFailurePresentation;
 
 use std::{error::Error, fmt, future::Future, pin::Pin, sync::Arc};
 
-use novarocks_parser::ast::MaterializedViewStatement;
-use novarocks_spi::connector::ConnectorRequestContext;
+use novarocks_spi::connector::{
+    ConnectorCatalogMutationSession, ConnectorControlPlanningPin, ConnectorNamespaceIdentity,
+    ConnectorRequestContext, ConnectorTableIdentity,
+};
 use novarocks_sql::semantic::{CatalogSqlCommand, MaintenanceSqlCommand, StatisticsSqlCommand};
 use novarocks_workload_control::{ResultWindowAlias, ResultWindowClass, WorkError, WorkScope};
 
@@ -271,6 +273,17 @@ impl CommandError {
         failure
     }
 
+    /// Retain the original complete domain outcome beside its owner's explicit
+    /// user descriptor. No message or generic failure kind selects that scope.
+    pub fn from_user_error_with_cause(
+        error: novarocks_user_error::UserError,
+        cause: novarocks_failure_contract::SharedFailureCause,
+    ) -> Self {
+        let mut failure = Self::from_user_error(error);
+        failure.failure_cause = Some(cause);
+        failure
+    }
+
     pub fn user_error(&self) -> Option<&novarocks_user_error::UserError> {
         self.user_error.as_ref()
     }
@@ -376,7 +389,179 @@ impl Error for CommandError {
     }
 }
 
+/// The actual read source and its original retained metadata generation.
+/// This binding grants no I/O, Root, mutation, or publication authority.
+pub struct CatalogTableReadBinding {
+    table: ConnectorTableIdentity,
+    planning: ConnectorControlPlanningPin,
+}
+
+impl CatalogTableReadBinding {
+    pub fn try_new(
+        table: ConnectorTableIdentity,
+        planning: ConnectorControlPlanningPin,
+    ) -> Result<Self, CommandError> {
+        if table.instance_id != planning.binding().descriptor().instance_id {
+            return Err(CommandError::from_failure_cause(
+                novarocks_failure_contract::SharedFailureCause::new(
+                    novarocks_spi::connector::ConnectorError::new(
+                        novarocks_spi::connector::ConnectorErrorKind::Internal,
+                        "Table read source does not match its original planning instance",
+                    ),
+                ),
+            ));
+        }
+        Ok(Self { table, planning })
+    }
+
+    pub fn table(&self) -> &ConnectorTableIdentity {
+        &self.table
+    }
+    pub fn planning(&self) -> &ConnectorControlPlanningPin {
+        &self.planning
+    }
+    pub fn into_parts(self) -> (ConnectorTableIdentity, ConnectorControlPlanningPin) {
+        (self.table, self.planning)
+    }
+}
+
+/// The original table target and its retained preparation capabilities.
+/// This is not a final semantic command or an I/O/publication authorization.
+/// The mutation lease is derived once from this exact planning pin; neither
+/// callers nor later consumers may supply a different current generation.
+pub struct CatalogTablePropertyBinding {
+    table: ConnectorTableIdentity,
+    planning: ConnectorControlPlanningPin,
+    mutation: ConnectorCatalogMutationSession,
+}
+
+impl CatalogTablePropertyBinding {
+    pub fn try_new(
+        table: ConnectorTableIdentity,
+        planning: ConnectorControlPlanningPin,
+    ) -> Result<Self, CommandError> {
+        if table.instance_id != planning.binding().descriptor().instance_id {
+            return Err(CommandError::from_failure_cause(
+                novarocks_failure_contract::SharedFailureCause::new(
+                    novarocks_spi::connector::ConnectorError::new(
+                        novarocks_spi::connector::ConnectorErrorKind::Internal,
+                        "Table property target does not match its original planning instance",
+                    ),
+                ),
+            ));
+        }
+        let mutation = planning.derive_mutation_lease().map_err(|cause| {
+            CommandError::from_failure_cause(novarocks_failure_contract::SharedFailureCause::new(
+                cause,
+            ))
+        })?;
+        Ok(Self {
+            table,
+            planning,
+            mutation,
+        })
+    }
+
+    pub fn table(&self) -> &ConnectorTableIdentity {
+        &self.table
+    }
+    pub fn planning(&self) -> &ConnectorControlPlanningPin {
+        &self.planning
+    }
+    pub fn mutation(&self) -> &ConnectorCatalogMutationSession {
+        &self.mutation
+    }
+    pub fn into_parts(
+        self,
+    ) -> (
+        ConnectorTableIdentity,
+        ConnectorControlPlanningPin,
+        ConnectorCatalogMutationSession,
+    ) {
+        (self.table, self.planning, self.mutation)
+    }
+}
+
+/// A namespace and the mutation lease derived once from its actual retained
+/// planning generation. Passing this value grants no I/O/publication.
+pub struct CatalogNamespacePropertyBinding {
+    namespace: ConnectorNamespaceIdentity,
+    planning: ConnectorControlPlanningPin,
+    mutation: ConnectorCatalogMutationSession,
+}
+
+impl CatalogNamespacePropertyBinding {
+    pub fn try_new(
+        namespace: ConnectorNamespaceIdentity,
+        planning: ConnectorControlPlanningPin,
+    ) -> Result<Self, CommandError> {
+        use novarocks_failure_contract::SharedFailureCause;
+        if namespace.instance_id != planning.binding().descriptor().instance_id {
+            return Err(CommandError::from_failure_cause(SharedFailureCause::new(
+                novarocks_spi::connector::ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::Internal,
+                    "Schema property target does not match its original planning instance",
+                ),
+            )));
+        }
+        let mutation = planning
+            .derive_mutation_lease()
+            .map_err(|cause| CommandError::from_failure_cause(SharedFailureCause::new(cause)))?;
+        Ok(Self {
+            namespace,
+            planning,
+            mutation,
+        })
+    }
+
+    pub fn namespace(&self) -> &ConnectorNamespaceIdentity {
+        &self.namespace
+    }
+    pub fn planning(&self) -> &ConnectorControlPlanningPin {
+        &self.planning
+    }
+    pub fn mutation(&self) -> &ConnectorCatalogMutationSession {
+        &self.mutation
+    }
+}
+
 pub trait CatalogCommandConsumer: Send + Sync + 'static {
+    fn acquire_namespace_property_binding(
+        &self,
+        _name: &novarocks_sql::semantic::ObjectName,
+        _request_context: &RequestContext,
+    ) -> Result<CatalogNamespacePropertyBinding, CommandError> {
+        Err(CommandError::new(
+            CommandErrorKind::Unsupported,
+            "catalog consumer does not provide namespace property bindings",
+        ))
+    }
+
+    /// Acquire one real read source without deriving a mutation capability.
+    fn acquire_table_read_binding(
+        &self,
+        _name: &novarocks_sql::semantic::ObjectName,
+        _request_context: &RequestContext,
+    ) -> Result<CatalogTableReadBinding, CommandError> {
+        Err(CommandError::new(
+            CommandErrorKind::Unsupported,
+            "catalog consumer does not provide table read bindings",
+        ))
+    }
+
+    /// Acquire the actual target and one retained provider generation for
+    /// property preparation under this immutable admitted request.
+    fn acquire_table_property_binding(
+        &self,
+        _name: &novarocks_sql::semantic::ObjectName,
+        _request_context: &RequestContext,
+    ) -> Result<CatalogTablePropertyBinding, CommandError> {
+        Err(CommandError::new(
+            CommandErrorKind::Unsupported,
+            "catalog consumer does not provide table property bindings",
+        ))
+    }
+
     fn prepare_statement_action(
         &self,
         _command: CatalogSqlCommand,
@@ -439,36 +624,6 @@ pub trait MaintenanceCommandConsumer: Send + Sync + 'static {
         request_context: RequestContext,
         command_context: CommandContext,
     ) -> CommandFuture;
-}
-
-pub struct MaterializedViewCommand {
-    statement: MaterializedViewStatement,
-}
-
-impl MaterializedViewCommand {
-    /// The SQL application retains the parser-admitted statement until the
-    /// injected role adapter performs product-specific lowering.
-    pub fn new(statement: MaterializedViewStatement) -> Self {
-        Self { statement }
-    }
-
-    pub const fn statement(&self) -> &MaterializedViewStatement {
-        &self.statement
-    }
-}
-
-/// Protocol-neutral SQL-to-MV product consumer. Query Application owns the
-/// statement and immutable admission contexts; role composition supplies the
-/// adapter that owns Connector and query-execution capabilities.
-pub trait MaterializedViewCommandConsumer: Send + Sync + 'static {
-    /// Prepare the original asynchronous action for a parser-admitted MV statement.
-    /// The caller retains the existing statement admission and supervision.
-    fn prepare_statement_action(
-        &self,
-        command: MaterializedViewCommand,
-        context: RequestContext,
-        command_context: CommandContext,
-    ) -> Result<Box<dyn crate::session_control::GovernedStatementAction>, CommandError>;
 }
 
 #[cfg(test)]
@@ -641,22 +796,6 @@ mod tests {
         drop(consumer);
         assert_eq!(capacity.snapshot().held_positions, [0; 4]);
         assert_eq!(control.snapshot().root_responsibilities, 0);
-    }
-
-    #[test]
-    fn materialized_view_command_retains_the_parser_admitted_shape() {
-        let statements = novarocks_parser::parse("DROP MATERIALIZED VIEW analytics.mv")
-            .expect("MV statement should parse");
-        let [novarocks_parser::ast::Statement::MaterializedView(statement)] = statements.as_slice()
-        else {
-            panic!("expected one parser-admitted MV statement");
-        };
-
-        let command = MaterializedViewCommand::new(statement.clone());
-        assert!(matches!(
-            command.statement(),
-            novarocks_parser::ast::MaterializedViewStatement::Drop(_)
-        ));
     }
 }
 

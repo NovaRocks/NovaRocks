@@ -26,11 +26,11 @@ CREATE TABLE ${case_db}.misleading_sales_fact_dim_lineitem (
     payload INT
 );
 INSERT INTO ${case_db}.misleading_sales_fact_dim_lineitem VALUES
-    (1, 10),
-    (2, 20),
-    (3, 30);
-ANALYZE TABLE ${case_db}.misleading_sales_fact_dim_lineitem;
+    ROW(1, 10),
+    ROW(2, 20),
+    ROW(3, 30);
+ANALYZE ${case_db}.misleading_sales_fact_dim_lineitem;
 
-EXPLAIN VERBOSE
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
 SELECT payload
 FROM ${case_db}.misleading_sales_fact_dim_lineitem;

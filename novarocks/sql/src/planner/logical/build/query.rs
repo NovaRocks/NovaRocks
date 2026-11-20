@@ -200,7 +200,7 @@ fn plan_nested_subquery_chain(
                     limit,
                     offset,
                 });
-                current = *query;
+                current = query.into_inner();
             }
             other => {
                 select.from = other;

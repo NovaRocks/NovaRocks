@@ -16,7 +16,7 @@
 -- under the License.
 
 select  c_customer_id as customer_id
-       , coalesce(c_last_name,'') || ', ' || coalesce(c_first_name,'') as customername
+       , CAST(coalesce(c_last_name,'') AS BOOLEAN) OR CAST(', ' AS BOOLEAN) OR CAST(coalesce(c_first_name,'') AS BOOLEAN) as customername
  from customer
      ,customer_address
      ,customer_demographics

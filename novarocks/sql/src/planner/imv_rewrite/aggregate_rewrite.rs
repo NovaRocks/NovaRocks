@@ -487,9 +487,9 @@ fn build_relational_aggregate_change_stream(
             join_type: JoinKind::LeftOuter,
             condition: Some(TypedExpr {
                 kind: ExprKind::BinaryOp {
-                    left: Box::new(column_ref(&delta_row_id)),
+                    left: novarocks_parser::ast::AstBox::new(column_ref(&delta_row_id)),
                     op: BinOp::Eq,
-                    right: Box::new(column_ref(&old_row_id)),
+                    right: novarocks_parser::ast::AstBox::new(column_ref(&old_row_id)),
                     decimal_overflow_policy:
                         novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 },
@@ -530,7 +530,7 @@ fn build_relational_aggregate_change_stream(
         branch_marker_eq(branch_marker, CHANGE_BRANCH_DELETE),
         TypedExpr {
             kind: ExprKind::IsNull {
-                expr: Box::new(column_ref(old_row_id_join)),
+                expr: novarocks_parser::ast::AstBox::new(column_ref(old_row_id_join)),
                 negated: true,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
@@ -550,11 +550,11 @@ fn build_relational_aggregate_change_stream(
         TypedExpr {
             kind: ExprKind::UnaryOp {
                 op: UnOp::Not,
-                expr: Box::new(TypedExpr {
+                expr: novarocks_parser::ast::AstBox::new(TypedExpr {
                     kind: ExprKind::FunctionCall {
                         volatility: crate::functions::builtin_function_volatility("state_all_zero"),
                         name: "state_all_zero".to_string(),
-                        args: state_all_zero_args,
+                        args: (state_all_zero_args).into(),
                         distinct: false,
                         binding: state_all_zero_binding,
                     },
@@ -618,9 +618,9 @@ fn change_branch_values(column: OutputColumn) -> LogicalPlanNode {
 fn branch_marker_eq(branch_marker: &OutputColumn, branch: i8) -> TypedExpr {
     TypedExpr {
         kind: ExprKind::BinaryOp {
-            left: Box::new(column_ref(branch_marker)),
+            left: novarocks_parser::ast::AstBox::new(column_ref(branch_marker)),
             op: BinOp::Eq,
-            right: Box::new(tinyint_literal(branch)),
+            right: novarocks_parser::ast::AstBox::new(tinyint_literal(branch)),
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         },
         value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
@@ -630,7 +630,8 @@ fn branch_marker_eq(branch_marker: &OutputColumn, branch: i8) -> TypedExpr {
 fn tinyint_literal(value: i8) -> TypedExpr {
     TypedExpr {
         kind: ExprKind::Cast {
-            expr: Box::new(TypedExpr {
+            array_failure_mode: None,
+            expr: novarocks_parser::ast::AstBox::new(TypedExpr {
                 kind: ExprKind::Literal(LiteralValue::Int(value as i64)),
                 value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
             }),
@@ -644,9 +645,9 @@ fn tinyint_literal(value: i8) -> TypedExpr {
 fn bool_and(left: TypedExpr, right: TypedExpr) -> TypedExpr {
     TypedExpr {
         kind: ExprKind::BinaryOp {
-            left: Box::new(left),
+            left: novarocks_parser::ast::AstBox::new(left),
             op: BinOp::And,
-            right: Box::new(right),
+            right: novarocks_parser::ast::AstBox::new(right),
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         },
         value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
@@ -656,9 +657,9 @@ fn bool_and(left: TypedExpr, right: TypedExpr) -> TypedExpr {
 fn bool_or(left: TypedExpr, right: TypedExpr) -> TypedExpr {
     TypedExpr {
         kind: ExprKind::BinaryOp {
-            left: Box::new(left),
+            left: novarocks_parser::ast::AstBox::new(left),
             op: BinOp::Or,
-            right: Box::new(right),
+            right: novarocks_parser::ast::AstBox::new(right),
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         },
         value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
@@ -705,7 +706,7 @@ fn delta_state_with_row_id(
                 volatility: crate::functions::builtin_function_volatility("mv_group_row_id"),
                 name: "mv_group_row_id".to_string(),
                 binding: row_id_binding,
-                args: row_id_args,
+                args: (row_id_args).into(),
                 distinct: false,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
@@ -760,7 +761,7 @@ fn merged_state_expr(
                 kind: ExprKind::FunctionCall {
                     volatility: crate::functions::builtin_function_volatility(name),
                     name: name.to_string(),
-                    args,
+                    args: (args).into(),
                     distinct: false,
                     binding,
                 },
@@ -774,10 +775,10 @@ fn merged_state_expr(
         SqlImvAggregateStateRole::RetractionCount => Ok(TypedExpr {
             kind: ExprKind::Case {
                 operand: None,
-                when_then: vec![(
+                when_then: (vec![(
                     TypedExpr {
                         kind: ExprKind::IsNull {
-                            expr: Box::new(column_ref(old)),
+                            expr: novarocks_parser::ast::AstBox::new(column_ref(old)),
                             negated: false,
                         },
                         value_type: novarocks_type_contract::FunctionValueType::new(
@@ -786,12 +787,13 @@ fn merged_state_expr(
                         ),
                     },
                     column_ref(delta),
-                )],
-                else_expr: Some(Box::new(TypedExpr {
+                )])
+                .into(),
+                else_expr: Some(novarocks_parser::ast::AstBox::new(TypedExpr {
                     kind: ExprKind::BinaryOp {
-                        left: Box::new(column_ref(old)),
+                        left: novarocks_parser::ast::AstBox::new(column_ref(old)),
                         op: BinOp::Add,
-                        right: Box::new(column_ref(delta)),
+                        right: novarocks_parser::ast::AstBox::new(column_ref(delta)),
                         decimal_overflow_policy:
                             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     },
@@ -1013,7 +1015,7 @@ fn aggregate_insert_expr_for_output(
             kind: ExprKind::FunctionCall {
                 volatility: crate::functions::builtin_function_volatility(name),
                 name: name.to_string(),
-                args,
+                args: (args).into(),
                 distinct: false,
                 binding,
             },
@@ -1078,11 +1080,12 @@ fn branch_case_expr(
     TypedExpr {
         kind: ExprKind::Case {
             operand: None,
-            when_then: vec![(
+            when_then: (vec![(
                 branch_marker_eq(branch_marker, CHANGE_BRANCH_DELETE),
                 delete_expr,
-            )],
-            else_expr: Some(Box::new(insert_expr)),
+            )])
+            .into(),
+            else_expr: Some(novarocks_parser::ast::AstBox::new(insert_expr)),
         },
         value_type,
     }
@@ -1105,7 +1108,8 @@ fn branch_case_arm_expr(
     let nullable = expr.value_type.nullable();
     TypedExpr {
         kind: ExprKind::Cast {
-            expr: Box::new(expr),
+            array_failure_mode: None,
+            expr: novarocks_parser::ast::AstBox::new(expr),
             target: target.data_type().clone(),
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         },
@@ -1446,7 +1450,7 @@ fn branch_scope_predicate(
     let branch_column = find_output_column_by_name(outputs, &scope.branch_id_column_name)?;
     Ok(TypedExpr {
         kind: ExprKind::BinaryOp {
-            left: Box::new(TypedExpr {
+            left: novarocks_parser::ast::AstBox::new(TypedExpr {
                 kind: ExprKind::ColumnRef {
                     column_id: branch_column.column_id,
                     qualifier: None,
@@ -1455,7 +1459,7 @@ fn branch_scope_predicate(
                 value_type: branch_column.value_type.clone(),
             }),
             op: BinOp::Eq,
-            right: Box::new(TypedExpr {
+            right: novarocks_parser::ast::AstBox::new(TypedExpr {
                 kind: ExprKind::Literal(LiteralValue::Int(scope.branch_id as i64)),
                 value_type: (branch_column.value_type.clone())
                     .with_nullable(false)
@@ -2320,10 +2324,10 @@ fn nonnull_retraction_count_expr(child: &OutputColumn, column_id: ColumnId) -> T
     TypedExpr {
         kind: ExprKind::Case {
             operand: None,
-            when_then: vec![(
+            when_then: (vec![(
                 TypedExpr {
                     kind: ExprKind::IsNull {
-                        expr: Box::new(value.clone()),
+                        expr: novarocks_parser::ast::AstBox::new(value.clone()),
                         negated: false,
                     },
                     value_type: novarocks_type_contract::FunctionValueType::new(
@@ -2337,8 +2341,9 @@ fn nonnull_retraction_count_expr(child: &OutputColumn, column_id: ColumnId) -> T
                         .with_nullable(false)
                         .expect("valid value root nullability transform"),
                 },
-            )],
-            else_expr: Some(Box::new(value)),
+            )])
+            .into(),
+            else_expr: Some(novarocks_parser::ast::AstBox::new(value)),
         },
         value_type: (child.value_type.clone())
             .with_nullable(false)
@@ -2547,7 +2552,7 @@ fn signed_state_input(
         kind: ExprKind::FunctionCall {
             volatility: crate::functions::FunctionVolatility::Immutable,
             name: "named_struct".to_string(),
-            args,
+            args: (args).into(),
             distinct: false,
             binding,
         },

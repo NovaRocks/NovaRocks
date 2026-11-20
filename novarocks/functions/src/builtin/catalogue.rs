@@ -1173,6 +1173,9 @@ fn scalar_result_nullable_from_types(
         },
         // Invalid JSON is a required Data failure, not a NULL result.
         "__json_canonical_key" => first_value.is_some_and(FunctionValueType::nullable),
+        crate::native_like::ESCAPE_FUNCTION_NAME => {
+            nullable_arguments(0..logical_argument_count, false, &value_nullable, work)?
+        }
         // FIELD returns zero for NULL or absence, and a non-NULL first-match index otherwise.
         "field" => false,
         // A NULL predicate fails the assertion; successful evaluations are true.
@@ -2174,10 +2177,6 @@ fn dynamic_scalar_data_type_with_construction<E>(
     creation: &mut super::scalar_construction::ScalarConstruction<'_, E>,
 ) -> Result<Option<DataType>, super::scalar_construction::Failure<E>> {
     Ok(Some(match name {
-        "__array_literal" => list_type_with_construction(
-            widen_dynamic_carriers(argument_types.iter().cloned(), creation)?,
-            creation,
-        )?,
         "__array_struct_subfield" => DataType::Null,
         "__iceberg_transform_void" => DataType::Null,
         "__struct_subfield" => DataType::Null,
@@ -2479,6 +2478,7 @@ fn dynamic_struct<H>(
 }
 fn bind_dynamic_scalar_result_with_creation<H>(
     function_id: &FunctionId,
+    overload: &FunctionOverloadId,
     name: &str,
     request: FunctionBindingRequest<'_>,
     work: &mut CompileCheckpoints<'_>,
@@ -2492,18 +2492,36 @@ fn bind_dynamic_scalar_result_with_creation<H>(
             borrow_creator(&mut creation),
         );
     }
-    if function_id.as_str() == "builtin.scalar/__array_literal/v1"
-        && request.arguments.is_empty()
-        && let Some(expected) = request.expected_result_type
-    {
-        if expected.logical_type() != ValueLogicalType::Physical
-            || expected.nullable()
-            || !matches!(expected.data_type(), DataType::List(_))
-        {
-            return Err(FunctionBindingError::NoMatchingOverload.into());
-        }
-        binding_control::value_type(expected, work)?;
-        return Ok(expected.clone());
+    if function_id.as_str() == "builtin.scalar/__array_literal/v1" {
+        let arguments = dynamic_values_with_creation(request, work, borrow_creator(&mut creation))?;
+        return with_binding_creation(borrow_creator(&mut creation), work, |cx| {
+            novarocks_type_contract::array_constructor_result_with_construction(
+                &arguments,
+                cx.storage(),
+                cx.observer(),
+            )
+            .map_err(|error| match error {
+                novarocks_type_contract::ArrayCommonTypeFailure::Construction(source) => source,
+                novarocks_type_contract::ArrayCommonTypeFailure::Rule(reason) => {
+                    use novarocks_type_contract::ArrayCommonRuleFailure as Rule;
+                    let error = match reason {
+                        Rule::IncompatibleDomains | Rule::IncompatibleScalarTypes => {
+                            FunctionBindingError::NoMatchingOverload
+                        }
+                        Rule::UnreviewedHeterogeneousFamily
+                        | Rule::UnreviewedLayoutReconciliation => {
+                            FunctionBindingError::UnavailableImplementation(overload.clone())
+                        }
+                        Rule::NonnullableUnknown | Rule::MissingListChild => {
+                            FunctionBindingError::InvalidBinding(
+                                "ARRAY common source has contradictory type facts".into(),
+                            )
+                        }
+                    };
+                    novarocks_type_contract::ValueConstructionFailure::Observer(error.into())
+                }
+            })
+        });
     }
     let argument_types =
         dynamic_argument_data_types_with_creation(request, work, borrow_creator(&mut creation))?;
@@ -2559,30 +2577,6 @@ fn bind_dynamic_scalar_result_with_creation<H>(
                 return Err(FunctionBindingError::NoMatchingOverload.into());
             }
             value_type.data_type().clone()
-        }
-        "__array_literal" => {
-            // The element type is the one every element fits in, not the one
-            // the first element happens to have. Taking the first meant
-            // `[1, 300]` was an array of TINYINT and the 300 became NULL, and
-            // `[1, 2.5]` was an array of integers with the 2.5 truncated --
-            // silently, since nothing downstream can tell a narrowed literal
-            // from a NULL the query asked for.
-            let mut item_type = None;
-            for argument in &argument_types {
-                work.step()?;
-                item_type = Some(match item_type {
-                    None => argument.clone(),
-                    Some(left) => {
-                        with_binding_creation(borrow_creator(&mut creation), work, |cx| {
-                            cx.wider(&left, argument)
-                        })?
-                    }
-                });
-            }
-            let item_type = item_type.unwrap_or(DataType::Null);
-            with_binding_creation(borrow_creator(&mut creation), work, |cx| {
-                list_type_with_construction(item_type, cx)
-            })?
         }
         "__struct_subfield" => {
             let Some(field_name) = utf8_constant(request.arguments.get(1), work)? else {
@@ -2677,7 +2671,7 @@ fn bind_dynamic_scalar_result_with_creation<H>(
         }
     }
     let nullable = match name {
-        "__array_literal" | "map" | "named_struct" | "row" | "struct" => false,
+        "map" | "named_struct" | "row" | "struct" => false,
         "__struct_subfield" | "__array_struct_subfield" => true,
         _ => scalar_result_nullable(name, request, work)?,
     };
@@ -2695,21 +2689,6 @@ fn bind_dynamic_scalar_result_with_creation<H>(
         borrow_creator(&mut creation),
     )?;
     match name {
-        "__array_literal" => {
-            let arguments =
-                dynamic_values_with_creation(request, work, borrow_creator(&mut creation))?;
-            let item = fold_value_types_with_creation(
-                arguments.iter().copied(),
-                work,
-                borrow_creator(&mut creation),
-            )?;
-            full_result = dynamic_list(
-                &item,
-                full_result.nullable(),
-                work,
-                borrow_creator(&mut creation),
-            )?;
-        }
         "array_repeat" => {
             if value(1)?.logical_type() != ValueLogicalType::Physical {
                 return Err(FunctionBindingError::NoMatchingOverload.into());
@@ -3143,6 +3122,7 @@ impl BuiltinDynamicScalarResolver {
         }
         let result = bind_dynamic_scalar_result_with_creation(
             &self.function_id,
+            &self.overload,
             &self.canonical_name,
             request,
             work,
@@ -3242,28 +3222,6 @@ impl BuiltinDynamicScalarResolver {
                     FunctionBindingError::UnknownOverload(selected.overload.clone()).into(),
                 );
             }
-            let request = if self.function_id.as_str() == "builtin.scalar/__array_literal/v1"
-                && request.arguments.is_empty()
-            {
-                let FunctionResultType::Scalar(result) = &selected.result_type else {
-                    return Err(FunctionBindingError::NoMatchingOverload.into());
-                };
-                if let Some(expected) = request.expected_result_type
-                    && !binding_control::exact_type(expected, result, work)?
-                {
-                    return Err(FunctionBindingError::InvalidBinding(
-                        "selected empty array differs from its explicit result constraint".into(),
-                    )
-                    .into());
-                }
-                // This is the existing explicit empty-array declaration rule.
-                FunctionBindingRequest {
-                    expected_result_type: Some(result),
-                    ..request
-                }
-            } else {
-                request
-            };
             work.flush()?;
             let expected =
                 self.resolve_with_creation(request, borrow_creator(&mut creation), work.control())?;
@@ -3368,6 +3326,9 @@ pub(super) fn scalar_definition_parts(
                     "bitmap_to_string" => Some(super::bitmap_to_string_owner::effects()),
                     "parse_json" => Some(super::parse_json_owner::effects()),
                     "__json_canonical_key" => Some(super::json_canonical_owner::effects()),
+                    crate::native_like::ESCAPE_FUNCTION_NAME => {
+                        Some(super::like_escape_owner::effects())
+                    }
                     "json_object" => Some(super::json_object_owner::effects()),
                     "array_sortby" => Some(super::array_sortby_owner::effects()),
                     "percentile_hash" => Some(super::percentile_hash_owner::effects()),
@@ -3378,8 +3339,9 @@ pub(super) fn scalar_definition_parts(
                     name if super::string_case_owner::operation(name).is_some() => {
                         Some(super::string_case_owner::effects())
                     }
-                    name if super::string_concat_owner::operation(name).is_some() => {
-                        Some(super::string_concat_owner::effects())
+                    name @ ("concat" | "array_concat") => {
+                        super::string_concat_owner::operation(name)
+                            .map(super::string_concat_owner::effects)
                     }
                     name if super::string_find_in_set_owner::operation(name).is_some() => {
                         Some(super::string_find_in_set_owner::effects())
@@ -3729,6 +3691,9 @@ pub fn contribute_builtin_functions(
             "parse_json" => super::parse_json_owner::definition(declaration, resolver)?,
             "__json_canonical_key" => {
                 super::json_canonical_owner::definition(declaration, resolver)?
+            }
+            crate::native_like::ESCAPE_FUNCTION_NAME => {
+                super::like_escape_owner::definition(declaration, resolver)?
             }
             "json_object" => super::json_object_owner::definition(declaration, resolver)?,
             "array_sortby" => super::array_sortby_owner::definition(declaration, resolver)?,

@@ -71,11 +71,12 @@ PLAN FRAGMENT 2
   STREAM DATA SINK
     EXCHANGE ID: 4
     PARTITION: BROADCAST
-5:SCAN ${case_db}.oq12_stats_join_r (alias=r) stats={rows=720}
-     TABLE: ${case_db}.oq12_stats_join_r
-     columns: k
-     min-max stats
-     predicates: r.k IS NOT NULL
+5:PROJECT [r.k] stats={rows=720}
+  6:SCAN ${case_db}.oq12_stats_join_r (alias=r) stats={rows=720}
+       TABLE: ${case_db}.oq12_stats_join_r
+       columns: k
+       min-max stats
+       predicates: r.k IS NOT NULL
 
 -- query 11
 -- types	varchar
@@ -109,7 +110,8 @@ PLAN FRAGMENT 2
   STREAM DATA SINK
     EXCHANGE ID: 4
     PARTITION: BROADCAST
-5:SCAN ${case_db}.oq12_stats_join_r (alias=r) stats={rows=800}
-     TABLE: ${case_db}.oq12_stats_join_r
-     columns: k
-     min-max stats
+5:PROJECT [r.k] stats={rows=800}
+  6:SCAN ${case_db}.oq12_stats_join_r (alias=r) stats={rows=800}
+       TABLE: ${case_db}.oq12_stats_join_r
+       columns: k
+       min-max stats

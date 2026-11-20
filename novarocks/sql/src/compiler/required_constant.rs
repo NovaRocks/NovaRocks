@@ -26,7 +26,7 @@ use novarocks_type_contract::FunctionValueType;
 
 use super::{SqlCatalogSnapshot, SqlCompileControl, SqlCompileError, SqlFunctionCatalog};
 
-/// The admitted SQL targets of a required session-property computation.
+/// The admitted SQL targets of a required constant computation.
 /// This vocabulary carries no application registry or setter authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RequiredConstantTarget {
@@ -35,15 +35,20 @@ pub enum RequiredConstantTarget {
     Bigint,
     Double,
     Varchar,
+    ArrayVarchar,
+    /// Accept an already typed Physical timestamp or an UNKNOWN NULL.
+    /// Preserve its exact timestamp carrier, precision and zone annotation.
+    Timestamp,
 }
 impl RequiredConstantTarget {
-    pub const fn data_type(self) -> DataType {
+    pub const fn scalar_data_type(self) -> Option<DataType> {
         match self {
-            Self::Boolean => DataType::Boolean,
-            Self::Integer => DataType::Int32,
-            Self::Bigint => DataType::Int64,
-            Self::Double => DataType::Float64,
-            Self::Varchar => DataType::Utf8,
+            Self::Boolean => Some(DataType::Boolean),
+            Self::Integer => Some(DataType::Int32),
+            Self::Bigint => Some(DataType::Int64),
+            Self::Double => Some(DataType::Float64),
+            Self::Varchar => Some(DataType::Utf8),
+            Self::ArrayVarchar | Self::Timestamp => None,
         }
     }
 }

@@ -151,6 +151,7 @@ fn cast_package_with_cells(
                             target: types[column].data_type().clone(),
                             decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
                             allow_throw_exception: ALLOW,
+                            array_failure_mode: None,
                         },
                     )
                     .unwrap(),

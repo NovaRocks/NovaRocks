@@ -59,24 +59,8 @@ REST catalog 的认证只有一个入口：catalog 定义中的凭证绑定。�
 
 catalog 定义没有 `CatalogControl` 绑定时，FE 的请求不带 `Authorization`。两个绑定必须引用不同的 `name`/`generation`。一个委派模式 catalog 的示例（其余对象存储属性按部署补齐）：
 
-```sql
-CREATE EXTERNAL CATALOG rest_vended PROPERTIES (
-  "type" = "iceberg",
-  "iceberg.catalog.type" = "rest",
-  "uri" = "https://catalog.example/api",
-  "iceberg.catalog.warehouse" = "wh",
-  "header.x-tenant" = "t1",
-  "credential.catalog-control.consumer-role" = "frontend",
-  "credential.catalog-control.mode" = "static",
-  "credential.catalog-control.name" = "rest-control",
-  "credential.catalog-control.generation" = "v1",
-  "credential.object-store-data.consumer-role" = "backend",
-  "credential.object-store-data.mode" = "vended",
-  "credential.data-credential-vending.consumer-role" = "backend",
-  "credential.data-credential-vending.mode" = "static",
-  "credential.data-credential-vending.name" = "rest-executor",
-  "credential.data-credential-vending.generation" = "v1"
-);
+``` sql
+CREATE CATALOG rest_vended USING iceberg WITH ("iceberg.catalog.type" = 'rest', "uri" = 'https://catalog.example/api', "iceberg.catalog.warehouse" = 'wh', "header.x-tenant" = 't1', "credential.catalog-control.consumer-role" = 'frontend', "credential.catalog-control.mode" = 'static', "credential.catalog-control.name" = 'rest-control', "credential.catalog-control.generation" = 'v1', "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = 'vended', "credential.data-credential-vending.consumer-role" = 'backend', "credential.data-credential-vending.mode" = 'static', "credential.data-credential-vending.name" = 'rest-executor', "credential.data-credential-vending.generation" = 'v1');
 ```
 
 材料在 FE 与每个 BE 的配置中各自声明。OAuth2 client credentials 用 `kind = "iceberg-rest-oauth2"`，bearer 令牌用 `kind = "iceberg-rest-bearer"` 与 `token`；secret 可以写成 `${ENV:NAME}` 引用：

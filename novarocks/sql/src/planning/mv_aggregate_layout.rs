@@ -310,7 +310,6 @@ fn physical_column(
             name,
             data_type,
             nullable,
-            aggregation: None,
             default: None,
         },
         visible,

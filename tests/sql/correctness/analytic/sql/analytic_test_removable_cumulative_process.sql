@@ -26,19 +26,18 @@
 -- query 1
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t1 (
-    v1 int(11) NULL,
-    v2 int(11) NULL,
+    v1 int(11) ,
+    v2 int(11) ,
     v3 int(11) NOT NULL,
-    v4 int(11) NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+    v4 int(11)
+) WITH (format_version = 3);
 INSERT INTO ${case_db}.t1 VALUES
-(1, 1, 1, NULL), (1, 1, 2, NULL), (1, NULL, 3, NULL), (1, NULL, 4, NULL),
-(1, 2, 5, NULL), (1, 2, 6, NULL), (1, NULL, 7, NULL), (1, NULL, 8, NULL),
-(2, 3, 9, NULL), (2, 3, 10, NULL), (2, NULL, 11, NULL), (2, NULL, 12, NULL),
-(2, 4, 13, NULL), (2, 4, 14, NULL), (2, NULL, 15, NULL), (2, NULL, 16, NULL),
-(NULL, 3, 17, NULL), (NULL, 3, 18, NULL), (NULL, NULL, 19, NULL), (NULL, NULL, 20, NULL),
-(NULL, 4, 21, NULL), (NULL, 4, 22, NULL), (NULL, NULL, 23, NULL), (NULL, NULL, 24, NULL);
+ROW(1, 1, 1, NULL), ROW(1, 1, 2, NULL), ROW(1, NULL, 3, NULL), ROW(1, NULL, 4, NULL),
+ROW(1, 2, 5, NULL), ROW(1, 2, 6, NULL), ROW(1, NULL, 7, NULL), ROW(1, NULL, 8, NULL),
+ROW(2, 3, 9, NULL), ROW(2, 3, 10, NULL), ROW(2, NULL, 11, NULL), ROW(2, NULL, 12, NULL),
+ROW(2, 4, 13, NULL), ROW(2, 4, 14, NULL), ROW(2, NULL, 15, NULL), ROW(2, NULL, 16, NULL),
+ROW(NULL, 3, 17, NULL), ROW(NULL, 3, 18, NULL), ROW(NULL, NULL, 19, NULL), ROW(NULL, NULL, 20, NULL),
+ROW(NULL, 4, 21, NULL), ROW(NULL, 4, 22, NULL), ROW(NULL, NULL, 23, NULL), ROW(NULL, NULL, 24, NULL);
 
 -- ========================================================= COUNT =========================================================
 
@@ -177,14 +176,13 @@ SELECT v3, AVG(v3) OVER(ORDER BY v3 ROWS BETWEEN CURRENT ROW AND 2 FOLLOWING) AS
 -- query 32
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t2 (
-    v1 int(11) NULL,
-    v2 STRING NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+    v1 int(11) ,
+    v2 STRING
+) WITH (format_version = 3);
 INSERT INTO ${case_db}.t2 VALUES
-(1, '1'), (2, NULL), (3, '2'), (4, '2'), (5, '2'),
-(6, '3'), (7, '3'), (8, '200'), (9, '40'), (10, '50'),
-(11, '60'), (12, '10'), (13, '20');
+ROW(1, '1'), ROW(2, NULL), ROW(3, '2'), ROW(4, '2'), ROW(5, '2'),
+ROW(6, '3'), ROW(7, '3'), ROW(8, '200'), ROW(9, '40'), ROW(10, '50'),
+ROW(11, '60'), ROW(12, '10'), ROW(13, '20');
 
 -- query 33
 -- @order_sensitive=true

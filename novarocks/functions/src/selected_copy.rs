@@ -2519,7 +2519,11 @@ pub fn preflight_guarded_interleave(
     }
     if !matches!(
         ty,
-        DataType::Utf8 | DataType::Binary | DataType::LargeUtf8 | DataType::LargeBinary
+        DataType::Null
+            | DataType::Utf8
+            | DataType::Binary
+            | DataType::LargeUtf8
+            | DataType::LargeBinary
     ) {
         return preflight_fixed_interleave(ty, sources, choices, observe);
     }
@@ -2532,10 +2536,11 @@ pub fn preflight_guarded_interleave(
     );
     work.boundary()?;
     let result = (|| {
-        guarded_interleave_extent(ty, choices.len())?;
+        guarded_result_extent(ty, choices.len())?;
         work.step()?;
         validate_interleave_plan(ty, sources, choices, &mut work)?;
         match ty {
+            DataType::Null => Ok(()),
             DataType::Utf8 => interleave_byte_payload::<arrow_array::types::Utf8Type, _>(
                 sources, choices, false, &mut work,
             ),
@@ -2549,7 +2554,7 @@ pub fn preflight_guarded_interleave(
                 arrow_array::types::LargeBinaryType,
                 _,
             >(sources, choices, true, &mut work),
-            _ => unreachable!("checked offset byte carrier"),
+            _ => unreachable!("checked Null or offset byte carrier"),
         }
     })();
     if matches!(&result, Err(CopyError::Control(_) | CopyError::Extent(_))) {

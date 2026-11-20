@@ -30,59 +30,32 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE EXTERNAL CATALOG ice_ivm_union_reject_${uuid0}
-PROPERTIES (
-  "type" = "iceberg",
-  "iceberg.catalog.type" = "rest",
-  "uri" = "${iceberg_rest_uri}",
-  "warehouse" = "${iceberg_rest_warehouse}",
-  "aws.s3.endpoint" = "${oss_endpoint}",
-  "credential.object-store-metadata.consumer-role" = "frontend",
-  "credential.object-store-metadata.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-metadata.name" = "${iceberg_object_store_metadata_credential_name}",
-  "credential.object-store-metadata.generation" = "${iceberg_object_store_credential_generation}",
-  "credential.object-store-data.consumer-role" = "backend",
-  "credential.object-store-data.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-data.name" = "${iceberg_object_store_data_credential_name}",
-  "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
-  "aws.s3.region" = "${oss_region}",
-  "aws.s3.enable_path_style_access" = "${oss_path_style}"
-);
-CREATE DATABASE ice_ivm_union_reject_${uuid0}.ns_${uuid0};
+CREATE CATALOG ice_ivm_union_reject_${uuid0} USING iceberg WITH ("iceberg.catalog.type" = 'rest', "uri" = '${iceberg_rest_uri}', "warehouse" = '${iceberg_rest_warehouse}', "aws.s3.endpoint" = '${oss_endpoint}', "credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-metadata.name" = '${iceberg_object_store_metadata_credential_name}', "credential.object-store-metadata.generation" = '${iceberg_object_store_credential_generation}', "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-data.name" = '${iceberg_object_store_data_credential_name}', "credential.object-store-data.generation" = '${iceberg_object_store_credential_generation}', "aws.s3.region" = '${oss_region}', "aws.s3.enable_path_style_access" = '${oss_path_style}');
+CREATE SCHEMA ice_ivm_union_reject_${uuid0}.ns_${uuid0};
 CREATE TABLE ice_ivm_union_reject_${uuid0}.ns_${uuid0}.t1 (
   id BIGINT NOT NULL,
   region STRING,
   amount BIGINT
-)
-TBLPROPERTIES ("format-version" = "3",
-  "write.row-lineage" = "true");
+) WITH (format_version = 3);
 CREATE TABLE ice_ivm_union_reject_${uuid0}.ns_${uuid0}.t2 (
   id BIGINT NOT NULL,
   region STRING,
   amount BIGINT
-)
-TBLPROPERTIES ("format-version" = "3",
-  "write.row-lineage" = "true");
+) WITH (format_version = 3);
 CREATE TABLE ice_ivm_union_reject_${uuid0}.ns_${uuid0}.t3 (
   id BIGINT NOT NULL,
   region STRING,
   amount BIGINT
-)
-TBLPROPERTIES ("format-version" = "3",
-  "write.row-lineage" = "true");
+) WITH (format_version = 3);
 -- Give every source a real v3 snapshot before testing unrelated UNION shape admission.
-INSERT INTO ice_ivm_union_reject_${uuid0}.ns_${uuid0}.t1 VALUES (1, 'seed', 1);
-INSERT INTO ice_ivm_union_reject_${uuid0}.ns_${uuid0}.t2 VALUES (1, 'seed', 1);
-INSERT INTO ice_ivm_union_reject_${uuid0}.ns_${uuid0}.t3 VALUES (1, 'seed', 1);
+INSERT INTO ice_ivm_union_reject_${uuid0}.ns_${uuid0}.t1 VALUES ROW(1, 'seed', 1);
+INSERT INTO ice_ivm_union_reject_${uuid0}.ns_${uuid0}.t2 VALUES ROW(1, 'seed', 1);
+INSERT INTO ice_ivm_union_reject_${uuid0}.ns_${uuid0}.t3 VALUES ROW(1, 'seed', 1);
 USE ice_ivm_union_reject_${uuid0}.ns_${uuid0};
 
 -- query 2
 -- @expect_error=Iceberg IMV refresh contract only supports UNION ALL set operations
-CREATE MATERIALIZED VIEW union_distinct_mv_${uuid0}
-DISTRIBUTED BY HASH(id) BUCKETS 1
-PROPERTIES ('storage_engine' = 'iceberg')
-AS
-SELECT id, region
+CREATE MATERIALIZED VIEW union_distinct_mv_${uuid0} AS SELECT id, region
 FROM ice_ivm_union_reject_${uuid0}.ns_${uuid0}.t1
 UNION
 SELECT id, region
@@ -90,11 +63,7 @@ FROM ice_ivm_union_reject_${uuid0}.ns_${uuid0}.t2;
 
 -- query 3
 -- @expect_error=requires homogeneous UNION ALL branches
-CREATE MATERIALIZED VIEW union_mixed_mv_${uuid0}
-DISTRIBUTED BY HASH(region) BUCKETS 1
-PROPERTIES ('storage_engine' = 'iceberg')
-AS
-SELECT region, amount
+CREATE MATERIALIZED VIEW union_mixed_mv_${uuid0} AS SELECT region, amount
 FROM ice_ivm_union_reject_${uuid0}.ns_${uuid0}.t1
 UNION ALL
 SELECT region, SUM(amount) AS amount
@@ -103,11 +72,7 @@ GROUP BY region;
 
 -- query 4
 -- @expect_error=Iceberg IMV refresh contract requires compatible aggregate branch contracts
-CREATE MATERIALIZED VIEW union_incompatible_agg_mv_${uuid0}
-DISTRIBUTED BY HASH(region) BUCKETS 1
-PROPERTIES ('storage_engine' = 'iceberg')
-AS
-SELECT region, COUNT(*) AS c, SUM(amount) AS s
+CREATE MATERIALIZED VIEW union_incompatible_agg_mv_${uuid0} AS SELECT region, COUNT(*) AS c, SUM(amount) AS s
 FROM ice_ivm_union_reject_${uuid0}.ns_${uuid0}.t1
 GROUP BY region
 UNION ALL
@@ -117,11 +82,7 @@ GROUP BY region, amount;
 
 -- query 5
 -- @skip_result_check=true
-CREATE MATERIALIZED VIEW union_duplicate_base_mv_${uuid0}
-DISTRIBUTED BY HASH(region) BUCKETS 1
-PROPERTIES ('storage_engine' = 'iceberg')
-AS
-SELECT region, COUNT(*) AS c
+CREATE MATERIALIZED VIEW union_duplicate_base_mv_${uuid0} AS SELECT region, COUNT(*) AS c
 FROM ice_ivm_union_reject_${uuid0}.ns_${uuid0}.t1
 GROUP BY region
 UNION ALL
@@ -131,11 +92,7 @@ GROUP BY region;
 
 -- query 6
 -- @expect_error=reserved for internal branch id
-CREATE MATERIALIZED VIEW union_reserved_branch_id_mv_${uuid0}
-DISTRIBUTED BY HASH(__branch_id__) BUCKETS 1
-PROPERTIES ('storage_engine' = 'iceberg')
-AS
-SELECT id AS __branch_id__, region
+CREATE MATERIALIZED VIEW union_reserved_branch_id_mv_${uuid0} AS SELECT id AS __branch_id__, region
 FROM ice_ivm_union_reject_${uuid0}.ns_${uuid0}.t1
 UNION ALL
 SELECT id AS __branch_id__, region
@@ -143,11 +100,7 @@ FROM ice_ivm_union_reject_${uuid0}.ns_${uuid0}.t2;
 
 -- query 7
 -- @expect_error=a composed UNION ALL of aggregates is only supported when every branch shares the same base tables and structure
-CREATE MATERIALIZED VIEW union_hetero_composed_join_agg_mv_${uuid0}
-DISTRIBUTED BY HASH(region) BUCKETS 1
-PROPERTIES ('storage_engine' = 'iceberg')
-AS
-SELECT t1.region, COUNT(*) AS c, SUM(t2.amount) AS s
+CREATE MATERIALIZED VIEW union_hetero_composed_join_agg_mv_${uuid0} AS SELECT t1.region, COUNT(*) AS c, SUM(t2.amount) AS s
 FROM ice_ivm_union_reject_${uuid0}.ns_${uuid0}.t1 t1
 JOIN ice_ivm_union_reject_${uuid0}.ns_${uuid0}.t2 t2 ON t1.id = t2.id
 GROUP BY t1.region
@@ -159,11 +112,7 @@ GROUP BY t1.region;
 
 -- query 8
 -- @expect_error=Iceberg IMV refresh contract supports join keys only over direct scan inputs
-CREATE MATERIALIZED VIEW union_join_of_aggregate_reject_${uuid0}
-DISTRIBUTED BY HASH(region) BUCKETS 1
-PROPERTIES ('storage_engine' = 'iceberg')
-AS
-SELECT d.region, SUM(g.sv) AS total
+CREATE MATERIALIZED VIEW union_join_of_aggregate_reject_${uuid0} AS SELECT d.region, SUM(g.sv) AS total
 FROM (
     SELECT id, SUM(amount) AS sv
     FROM ice_ivm_union_reject_${uuid0}.ns_${uuid0}.t1
@@ -176,8 +125,8 @@ GROUP BY d.region;
 -- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW union_duplicate_base_mv_${uuid0};
-DROP TABLE ice_ivm_union_reject_${uuid0}.ns_${uuid0}.t1 FORCE;
-DROP TABLE ice_ivm_union_reject_${uuid0}.ns_${uuid0}.t2 FORCE;
-DROP TABLE ice_ivm_union_reject_${uuid0}.ns_${uuid0}.t3 FORCE;
-DROP DATABASE ice_ivm_union_reject_${uuid0}.ns_${uuid0};
+DROP TABLE ice_ivm_union_reject_${uuid0}.ns_${uuid0}.t1 ;
+DROP TABLE ice_ivm_union_reject_${uuid0}.ns_${uuid0}.t2 ;
+DROP TABLE ice_ivm_union_reject_${uuid0}.ns_${uuid0}.t3 ;
+DROP SCHEMA ice_ivm_union_reject_${uuid0}.ns_${uuid0};
 DROP CATALOG ice_ivm_union_reject_${uuid0};

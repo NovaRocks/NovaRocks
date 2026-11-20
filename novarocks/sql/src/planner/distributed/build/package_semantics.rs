@@ -353,6 +353,7 @@ mod capability_projection_tests {
             &to,
             DecimalOverflowPolicy::OutputNull,
             false,
+            None,
             &control,
         )
         .unwrap_err();

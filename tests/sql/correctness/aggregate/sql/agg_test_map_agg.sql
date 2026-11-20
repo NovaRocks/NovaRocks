@@ -39,19 +39,18 @@ CREATE TABLE t1 (
     c10 datetime,
     c11 array<int>,
     c12 map<varchar(5), double>,
-    c13 struct<a bigint, b string>
-    )
-TBLPROPERTIES ("format-version" = "3");
+    c13 ROW(a bigint, b string)
+    ) WITH (format_version = 3);
 
 -- query 3
 -- @skip_result_check=true
 USE ${case_db};
 INSERT INTO t1 values
-    (1, true, 11, 111, 1111, 11111, "111111", 1.1, "2024-09-01", "2024-09-01 18:00:00", [1, 2, 3], map('key', 5.5), row(100, "abc")),
-    (2, false, 22, 222, 2222, 22222, "222222", 2.2, "2024-09-02", "2024-09-02 11:00:00", [3, 4, 5], map('key', 511.2), row(200, "bcd")),
-    (3, true, 33, 333, 3333, 33333, "333333", 3.3,  "2024-09-03", "2024-09-03 00:00:00", [4, 1, 2], map('key', 666.6), row(300, "cccecd")),
-    (4, false, 11, 444, 4444, 44444, "444444", 4.4, "2024-09-04", "2024-09-04 12:00:00", [7, 7, 5], map('key', 444.4), row(400, "efdg")),
-    (5, null, null, null, null, null, null, null, null, null, null, null, null);
+    ROW(1, true, 11, 111, 1111, 11111, '111111', 1.1, '2024-09-01', '2024-09-01 18:00:00', [1, 2, 3], map('key', 5.5), row(100, 'abc')),
+    ROW(2, false, 22, 222, 2222, 22222, '222222', 2.2, '2024-09-02', '2024-09-02 11:00:00', [3, 4, 5], map('key', 511.2), row(200, 'bcd')),
+    ROW(3, true, 33, 333, 3333, 33333, '333333', 3.3,  '2024-09-03', '2024-09-03 00:00:00', [4, 1, 2], map('key', 666.6), row(300, 'cccecd')),
+    ROW(4, false, 11, 444, 4444, 44444, '444444', 4.4, '2024-09-04', '2024-09-04 12:00:00', [7, 7, 5], map('key', 444.4), row(400, 'efdg')),
+    ROW(5, null, null, null, null, null, null, null, null, null, null, null, null);
 
 -- query 4
 -- @skip_result_check=true

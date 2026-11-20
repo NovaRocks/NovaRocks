@@ -210,6 +210,25 @@ impl MetadataMaintenanceCall {
                     MetadataMaintenanceDispatchState::ConfirmedNotDispatched,
                 )
             })?;
+        Self::try_new_on_session(maintenance_session, operation_id, table, intent, context)
+    }
+
+    pub(crate) fn try_new_on_session(
+        maintenance_session: ConnectorMetadataMaintenanceSession,
+        operation_id: ConnectorMutationOperationId,
+        table: ConnectorTableIdentity,
+        intent: MetadataMaintenanceIntent,
+        context: ConnectorRequestContext,
+    ) -> Result<Self, ResolvedMetadataMaintenance> {
+        if maintenance_session.descriptor().instance_id != table.instance_id {
+            return Err(contract_failure(
+                ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "connector metadata maintenance table does not belong to retained instance",
+                ),
+                MetadataMaintenanceDispatchState::ConfirmedNotDispatched,
+            ));
+        }
         let preparation = Box::pin(MetadataMaintenanceSession::plan_on_session(
             maintenance_session.clone(),
             operation_id,
@@ -1276,6 +1295,40 @@ mod tests {
             provider.events.lock().unwrap().as_slice(),
             ["provider", "generic"]
         );
+    }
+
+    #[tokio::test]
+    async fn original_call_consumes_the_exact_maintenance_session() {
+        let provider = FakeProvider::new(Mode::Committed);
+        let resolver = Resolver::new(provider.clone());
+        let finalizer = Finalizer {
+            events: provider.events.clone(),
+        };
+        let exact = resolver
+            .acquire_exact_metadata_maintenance(ConnectorControlRuntimeId::from_bytes([8; 16]))
+            .unwrap();
+        let target = table(&provider.descriptor.instance_id);
+        let operation = ConnectorMutationOperationId::from_bytes([9; 16]);
+        let intent = MetadataMaintenanceIntent::rewrite_metadata_layout();
+        let mut call = MetadataMaintenanceCall::try_new_on_session(
+            exact,
+            operation,
+            target.clone(),
+            intent.clone(),
+            context(),
+        )
+        .unwrap();
+        assert!(call.matches(&target.instance_id, operation, &target, &intent));
+        assert_eq!(provider.metadata_calls.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            super::resolve_metadata_maintenance(&mut call, &finalizer).await,
+            ResolvedMetadataMaintenance::KnownCommitted(_)
+        ));
+        assert_eq!(provider.plan_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(resolver.releases.load(Ordering::SeqCst), 0);
+        drop(call);
+        assert_eq!(resolver.releases.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

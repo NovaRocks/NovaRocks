@@ -563,7 +563,7 @@ fn state_sources_union_two_partials_and_intermediate_keep_every_actual_source_in
 fn state_sources_none_and_nonzero_cv_keep_own_backing_and_same_lineage_new_revision_is_not_pair_proof()
  {
     let none = TypedExpr {
-        kind: ExprKind::Nested(Box::new(integer(7))),
+        kind: ExprKind::Nested(novarocks_parser::ast::AstBox::new(integer(7))),
         value_type: ValueType::new(DataType::Int64, false),
     };
     let left = local("min", vec![none.clone()]);

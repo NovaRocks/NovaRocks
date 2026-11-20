@@ -30,25 +30,23 @@ DROP TABLE IF EXISTS ${case_db}.m1_build;
 CREATE TABLE ${case_db}.m1_probe (
   k INT,
   v INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 CREATE TABLE ${case_db}.m1_build (
   k INT,
   threshold_v INT,
   tag INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 INSERT INTO ${case_db}.m1_probe VALUES
-  (1, 10),
-  (1, 30),
-  (2, 20),
-  (3, 40),
-  (NULL, 50);
+  ROW(1, 10),
+  ROW(1, 30),
+  ROW(2, 20),
+  ROW(3, 40),
+  ROW(NULL, 50);
 INSERT INTO ${case_db}.m1_build VALUES
-  (1, 15, 100),
-  (1, 25, 200),
-  (2, 10, 300),
-  (NULL, 0, 400);
+  ROW(1, 15, 100),
+  ROW(1, 25, 200),
+  ROW(2, 10, 300),
+  ROW(NULL, 0, 400);
 SELECT p.k, p.v, b.threshold_v, b.tag
 FROM ${case_db}.m1_probe p
 JOIN ${case_db}.m1_build b

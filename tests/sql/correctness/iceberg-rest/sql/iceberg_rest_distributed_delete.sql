@@ -23,7 +23,7 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE DATABASE iceberg_rest_${suite_uuid0}.iceberg_rest_del_db_${uuid0};
+CREATE SCHEMA iceberg_rest_${suite_uuid0}.iceberg_rest_del_db_${uuid0};
 
 -- query 2
 -- @skip_result_check=true
@@ -31,13 +31,12 @@ CREATE TABLE iceberg_rest_${suite_uuid0}.iceberg_rest_del_db_${uuid0}.t_del_${uu
   id INT,
   region STRING,
   amount INT
-)
-PARTITION BY (region);
+) WITH (partitioning = ARRAY['region']);
 
 -- query 3
 -- @skip_result_check=true
 INSERT INTO iceberg_rest_${suite_uuid0}.iceberg_rest_del_db_${uuid0}.t_del_${uuid0}
-VALUES (1, 'east', 10), (2, 'east', 20), (3, 'west', 30);
+VALUES ROW(1, 'east', 10), ROW(2, 'east', 20), ROW(3, 'west', 30);
 
 -- query 4
 -- @skip_result_check=true
@@ -54,13 +53,12 @@ SELECT id, region, amount
 CREATE TABLE iceberg_rest_${suite_uuid0}.iceberg_rest_del_db_${uuid0}.t_del_v3_${uuid0} (
   id INT,
   region STRING
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 7
 -- @skip_result_check=true
 INSERT INTO iceberg_rest_${suite_uuid0}.iceberg_rest_del_db_${uuid0}.t_del_v3_${uuid0}
-VALUES (1, 'east');
+VALUES ROW(1, 'east');
 
 -- query 8
 -- @skip_result_check=true
@@ -88,4 +86,4 @@ DROP TABLE iceberg_rest_${suite_uuid0}.iceberg_rest_del_db_${uuid0}.t_del_${uuid
 
 -- query 13
 -- @skip_result_check=true
-DROP DATABASE iceberg_rest_${suite_uuid0}.iceberg_rest_del_db_${uuid0};
+DROP SCHEMA iceberg_rest_${suite_uuid0}.iceberg_rest_del_db_${uuid0};

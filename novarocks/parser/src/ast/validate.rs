@@ -26,50 +26,46 @@ use std::collections::HashSet;
 use crate::{StructuralViolation, ValidateError};
 
 use super::{
-    Cte, Expr, GroupBy, Query, Select, SelectItem, SetExpr, Statement, TableFactor, TableStatement,
-    TableWithJoins, Values, WindowFrame, WindowFrameBound, WindowSpec,
+    Cte, Expr, GroupBy, Query, Select, SelectItem, SetExpr, TrinoStatement, Values, WindowFrame,
+    WindowFrameBound, WindowSpecification,
 };
 
-/// Validates every statement in a public parser result.
-pub fn validate_statements(statements: &[Statement]) -> Result<(), ValidateError> {
-    for statement in statements {
-        validate_statement(statement)?;
-    }
-    Ok(())
-}
-
-/// Validates one complete syntax tree without invoking semantic analysis.
-pub fn validate_statement(statement: &Statement) -> Result<(), ValidateError> {
+/// Validates known syntax-tree invariants without resolving names or types.
+#[recursive::recursive]
+pub fn validate_statement(statement: &TrinoStatement) -> Result<(), ValidateError> {
     match statement {
-        Statement::Query(query) => validate_query(query),
-        Statement::ExplainQuery(explain) => validate_query(&explain.query),
-        Statement::Table(TableStatement::Create(table)) => validate_create_table(table),
-        Statement::ShowProcessList(_)
-        | Statement::Statistics(_)
-        | Statement::Catalog(_)
-        | Statement::Iceberg(_)
-        | Statement::Maintenance(_)
-        | Statement::MaterializedView(_)
-        | Statement::View(_)
-        | Statement::Dml(_) => Ok(()),
-        Statement::Session(_) => Ok(()),
+        TrinoStatement::Query(query) => validate_query(query),
+        TrinoStatement::Explain(explain) => validate_statement(&explain.statement),
+        TrinoStatement::ExplainAnalyze(explain) => validate_statement(&explain.statement),
+        _ => Ok(()),
     }
 }
 
-fn validate_create_table(table: &super::CreateTable) -> Result<(), ValidateError> {
-    let mut names = HashSet::with_capacity(table.columns.len());
-    for column in &table.columns {
-        if !names.insert(identifier_key(&column.name.value, column.name.quoted)) {
-            return Err(ValidateError::invalid_structure(
-                StructuralViolation::DuplicateTableColumnName,
-                column.name.span,
-            ));
-        }
-    }
-    Ok(())
-}
+#[recursive::recursive]
 
 fn validate_query(query: &Query) -> Result<(), ValidateError> {
+    if matches!(query.body.as_ref(), SetExpr::Select(_)) && !query.modifiers.is_empty() {
+        return Err(ValidateError::invalid_structure(
+            StructuralViolation::InvalidQueryModifierOwner,
+            query.span,
+        ));
+    }
+    for function in &query.functions {
+        struct FunctionExpressions(Result<(), ValidateError>);
+        impl super::Visit for FunctionExpressions {
+            fn visit_expr(&mut self, expression: &Expr) {
+                if self.0.is_ok() {
+                    self.0 = validate_expr(expression);
+                }
+            }
+        }
+        let mut expressions = FunctionExpressions(Ok(()));
+        super::Visit::visit_function_specification(&mut expressions, function);
+        expressions.0?;
+    }
+    for property in &query.session_properties {
+        validate_expr(&property.value)?;
+    }
     if let Some(with) = &query.with {
         if with.ctes.is_empty() {
             return Err(ValidateError::invalid_structure(
@@ -83,19 +79,33 @@ fn validate_query(query: &Query) -> Result<(), ValidateError> {
         }
     }
     validate_set_expr(&query.body)?;
-    for order_by in &query.order_by {
-        validate_expr(&order_by.expr)?;
+    validate_query_modifiers(&query.modifiers)?;
+    Ok(())
+}
+
+fn validate_query_modifiers(modifiers: &super::QueryModifiers) -> Result<(), ValidateError> {
+    if let Some(order_by) = &modifiers.order_by {
+        validate_order_by(order_by)?;
     }
-    if let Some(limit) = &query.limit {
-        validate_expr(limit)?;
+    if let Some(offset) = &modifiers.offset {
+        validate_row_count(
+            &offset.row_count,
+            false,
+            StructuralViolation::InvalidOffsetRowCount,
+        )?;
     }
-    if let Some(offset) = &query.offset {
-        validate_expr(&offset.value)?;
-    }
-    if let Some(fetch) = &query.fetch
-        && let Some(quantity) = &fetch.quantity
-    {
-        validate_expr(quantity)?;
+    match &modifiers.limit {
+        Some(super::QueryLimit::Limit(node)) => validate_row_count(
+            &node.row_count,
+            true,
+            StructuralViolation::InvalidLimitRowCount,
+        )?,
+        Some(super::QueryLimit::FetchFirst(node)) => {
+            if let Some(count) = &node.row_count {
+                validate_row_count(count, false, StructuralViolation::InvalidFetchFirstRowCount)?;
+            }
+        }
+        None => {}
     }
     Ok(())
 }
@@ -113,64 +123,46 @@ fn validate_unique_ctes(ctes: &[Cte]) -> Result<(), ValidateError> {
     Ok(())
 }
 
+#[recursive::recursive]
 fn validate_set_expr(set_expr: &SetExpr) -> Result<(), ValidateError> {
     match set_expr {
         SetExpr::Select(select) => validate_select(select),
         SetExpr::Values(values) => validate_values(values),
-        SetExpr::Query(query) => validate_query(query),
+        SetExpr::Table(table) => validate_table(table),
+        SetExpr::Query(query) => validate_query(&query.query),
         SetExpr::SetOperation(operation) => {
-            validate_set_expr(&operation.left)?;
-            validate_set_expr(&operation.right)
+            let multi_union_all = operation.operator == super::SetOperator::Union
+                && !operation.distinct
+                && operation.corresponding.is_none();
+            if operation.inputs.len() < 2 || (!multi_union_all && operation.inputs.len() != 2) {
+                return Err(ValidateError::invalid_structure(
+                    StructuralViolation::InvalidSetOperationOperandCount,
+                    operation.span,
+                ));
+            }
+            for input in &operation.inputs {
+                validate_set_expr(input)?;
+            }
+            Ok(())
         }
     }
 }
 
+#[recursive::recursive]
 fn validate_values(values: &Values) -> Result<(), ValidateError> {
-    if values.rows.is_empty() {
-        return Err(ValidateError::invalid_structure(
-            StructuralViolation::EmptyValuesRowList,
-            values.span,
-        ));
-    }
     for row in &values.rows {
-        if row.is_empty() {
-            return Err(ValidateError::invalid_structure(
-                StructuralViolation::EmptyValuesRow,
-                values.span,
-            ));
-        }
-        for expression in row {
-            validate_expr(expression)?;
-        }
+        validate_expr(row)?;
     }
     Ok(())
 }
 
+#[recursive::recursive]
 fn validate_select(select: &Select) -> Result<(), ValidateError> {
-    for hint in &select.hints {
-        match &hint.value {
-            super::SelectHintValue::Bare => {}
-            super::SelectHintValue::Call { arguments } => {
-                for argument in arguments {
-                    validate_expr(argument)?;
-                }
-            }
-            super::SelectHintValue::Assignment { value } => validate_expr(value)?,
-        }
-    }
     if select.projection.is_empty() {
         return Err(ValidateError::invalid_structure(
             StructuralViolation::EmptySelectProjection,
             select.span,
         ));
-    }
-    match &select.quantifier {
-        super::SelectQuantifier::Distinct { on, .. } => {
-            for expression in on {
-                validate_expr(expression)?;
-            }
-        }
-        super::SelectQuantifier::None | super::SelectQuantifier::All(_) => {}
     }
     for item in &select.projection {
         validate_select_item(item)?;
@@ -183,10 +175,10 @@ fn validate_select(select: &Select) -> Result<(), ValidateError> {
                 window.name.span,
             ));
         }
-        validate_window_spec(&window.specification)?;
+        validate_window_specification(&window.specification)?;
     }
-    for relation in &select.from {
-        validate_table_with_joins(relation)?;
+    if let Some(relation) = &select.from {
+        validate_relation(relation)?;
     }
     if let Some(selection) = &select.selection {
         validate_expr(selection)?;
@@ -194,95 +186,222 @@ fn validate_select(select: &Select) -> Result<(), ValidateError> {
     if let Some(having) = &select.having {
         validate_expr(having)?;
     }
-    if let Some(qualify) = &select.qualify {
-        validate_expr(qualify)?;
+    if let Some(group_by) = &select.group_by {
+        validate_group_by(group_by)?;
     }
-    validate_group_by(&select.group_by)?;
+    validate_query_modifiers(&select.modifiers)?;
     Ok(())
 }
 
+#[recursive::recursive]
 fn validate_select_item(item: &SelectItem) -> Result<(), ValidateError> {
     match item {
-        SelectItem::UnnamedExpr(expression)
-        | SelectItem::ExprWithAlias {
-            expr: expression, ..
-        } => validate_expr(expression),
-        SelectItem::Wildcard { options, .. } | SelectItem::QualifiedWildcard { options, .. } => {
-            for replacement in &options.replace {
-                validate_expr(&replacement.expr)?;
+        SelectItem::SingleColumn(node) => validate_expr(&node.expression),
+        SelectItem::AllColumns(node) => {
+            if let Some(target) = &node.target {
+                validate_expr(target)?;
             }
             Ok(())
         }
     }
 }
 
+#[recursive::recursive]
 fn validate_group_by(group_by: &GroupBy) -> Result<(), ValidateError> {
-    match group_by {
-        GroupBy::None => Ok(()),
-        GroupBy::Expressions { expressions, .. }
-        | GroupBy::Rollup { expressions, .. }
-        | GroupBy::Cube { expressions, .. } => {
-            for expression in expressions {
-                validate_expr(expression)?;
-            }
-            Ok(())
-        }
-        GroupBy::GroupingSets { sets, .. } => {
-            for set in sets {
-                for expression in set {
+    for element in &group_by.elements {
+        match element {
+            super::GroupingElement::Simple(node) => {
+                for expression in &node.columns {
                     validate_expr(expression)?;
                 }
             }
-            Ok(())
-        }
-    }
-}
-
-fn validate_table_with_joins(table_with_joins: &TableWithJoins) -> Result<(), ValidateError> {
-    validate_table_factor(&table_with_joins.relation)?;
-    for join in &table_with_joins.joins {
-        validate_table_factor(&join.relation)?;
-        if let super::JoinConstraint::On(expression) = &join.constraint {
-            validate_expr(expression)?;
+            super::GroupingElement::Sets(node) => {
+                if node.sets.is_empty() {
+                    return Err(ValidateError::invalid_structure(
+                        StructuralViolation::EmptyGroupingSets,
+                        node.span,
+                    ));
+                }
+                for set in &node.sets {
+                    for expression in set {
+                        validate_expr(expression)?;
+                    }
+                }
+            }
+            super::GroupingElement::Auto(_) => {}
         }
     }
     Ok(())
 }
 
-fn validate_table_factor(table_factor: &TableFactor) -> Result<(), ValidateError> {
-    match table_factor {
-        TableFactor::Table { version, .. } => {
-            if let Some(version) = version {
-                validate_expr(&version.value)?;
+#[recursive::recursive]
+fn validate_relation(relation: &super::Relation) -> Result<(), ValidateError> {
+    use super::{JoinCriteria, JoinType, Relation, TableFunctionArgumentValue};
+    match relation {
+        Relation::Table(node) => validate_table(node)?,
+        Relation::TableSubquery(node) => validate_query(&node.query)?,
+        Relation::Lateral(node) => validate_query(&node.query)?,
+        Relation::Aliased(node) => validate_relation(&node.relation)?,
+        Relation::Unnest(node) => {
+            for expr in &node.expressions {
+                validate_expr(expr)?;
             }
-            Ok(())
         }
-        TableFactor::Derived { subquery, .. } => validate_query(subquery),
-        TableFactor::TableFunction { expr, .. } => validate_expr(expr),
-        TableFactor::Unnest { array_exprs, .. } => {
-            if array_exprs.is_empty() {
+        Relation::Join(node) => {
+            let valid = match node.kind {
+                JoinType::Cross | JoinType::Implicit => node.criteria.is_none(),
+                _ => node.criteria.is_some(),
+            };
+            if !valid {
                 return Err(ValidateError::invalid_structure(
-                    StructuralViolation::EmptyUnnestExpressionList,
-                    table_factor.span(),
+                    StructuralViolation::InvalidJoinCriteria,
+                    node.span,
                 ));
             }
-            for expression in array_exprs {
+            validate_relation(&node.left)?;
+            validate_relation(&node.right)?;
+            if let Some(criteria) = &node.criteria {
+                match criteria {
+                    JoinCriteria::On(node) => validate_expr(&node.expression)?,
+                    JoinCriteria::Using(node) if node.columns.is_empty() => {
+                        return Err(ValidateError::invalid_structure(
+                            StructuralViolation::EmptyJoinUsingColumns,
+                            node.span,
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Relation::Sampled(node) => {
+            validate_relation(&node.relation)?;
+            validate_expr(&node.sample_percentage)?;
+        }
+        Relation::Pivot(node) => {
+            for (empty, violation) in [
+                (
+                    node.aggregations.is_empty(),
+                    StructuralViolation::EmptyPivotAggregations,
+                ),
+                (
+                    node.pivot_columns.is_empty(),
+                    StructuralViolation::EmptyPivotColumns,
+                ),
+                (
+                    node.value_groups.is_empty(),
+                    StructuralViolation::EmptyPivotValueGroups,
+                ),
+            ] {
+                if empty {
+                    return Err(ValidateError::invalid_structure(violation, node.span));
+                }
+            }
+            validate_relation(&node.input)?;
+            for aggregation in &node.aggregations {
+                validate_expr(&aggregation.expression)?;
+            }
+            for expression in &node.pivot_columns {
                 validate_expr(expression)?;
             }
-            Ok(())
+            for group in &node.value_groups {
+                if group.values.is_empty() {
+                    return Err(ValidateError::invalid_structure(
+                        StructuralViolation::EmptyPivotValues,
+                        group.span,
+                    ));
+                }
+                for expr in &group.values {
+                    validate_expr(expr)?;
+                }
+            }
+            if let Some(group) = &node.group_by {
+                validate_group_by(group)?;
+            }
         }
-        TableFactor::NestedJoin {
-            table_with_joins, ..
-        } => validate_table_with_joins(table_with_joins),
+        Relation::Nearest(node) => {
+            validate_relation(&node.relation)?;
+            if let Some(expr) = &node.where_clause {
+                validate_expr(expr)?;
+            }
+            validate_expr(&node.match_expression)?;
+        }
+        Relation::TableFunction(node) => {
+            for argument in &node.arguments {
+                match &argument.value {
+                    TableFunctionArgumentValue::Expression(expr) => validate_expr(expr)?,
+                    TableFunctionArgumentValue::Table(table) => {
+                        validate_relation(&table.table)?;
+                        if let Some(columns) = &table.partition_by {
+                            for expr in columns {
+                                validate_expr(expr)?;
+                            }
+                        }
+                        if let Some(order) = &table.order_by {
+                            validate_order_by(order)?;
+                        }
+                    }
+                    TableFunctionArgumentValue::Descriptor(descriptor) => {
+                        if let Some(descriptor) = &descriptor.descriptor
+                            && descriptor.fields.is_empty()
+                        {
+                            return Err(ValidateError::invalid_structure(
+                                StructuralViolation::EmptyDescriptorFields,
+                                descriptor.span,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        Relation::JsonTable(node) => {
+            validate_json_root(|visitor| super::Visit::visit_json_table(visitor, node))?
+        }
+        Relation::PatternRecognition(node) => {
+            if node.rows_per_match == Some(super::RowsPerMatch::Window) {
+                return Err(ValidateError::invalid_structure(
+                    StructuralViolation::InvalidPatternRowsPerMatch,
+                    node.span,
+                ));
+            }
+            if node.variable_definitions.is_empty() {
+                return Err(ValidateError::invalid_structure(
+                    StructuralViolation::EmptyPatternVariableDefinitions,
+                    node.span,
+                ));
+            }
+            validate_relation(&node.input)?;
+            for expr in &node.partition_by {
+                validate_expr(expr)?;
+            }
+            if let Some(order) = &node.order_by {
+                validate_order_by(order)?;
+            }
+            for measure in &node.measures {
+                validate_expr(&measure.expression)?;
+            }
+            validate_row_pattern(&node.pattern)?;
+            for subset in &node.subsets {
+                if subset.identifiers.is_empty() {
+                    return Err(ValidateError::invalid_structure(
+                        StructuralViolation::EmptySubsetIdentifierList,
+                        subset.span,
+                    ));
+                }
+            }
+            for definition in &node.variable_definitions {
+                validate_expr(&definition.expression)?;
+            }
+        }
     }
+    Ok(())
 }
-
-fn validate_window_spec(specification: &WindowSpec) -> Result<(), ValidateError> {
+#[recursive::recursive]
+fn validate_window_specification(specification: &WindowSpecification) -> Result<(), ValidateError> {
     for expression in &specification.partition_by {
         validate_expr(expression)?;
     }
-    for order_by in &specification.order_by {
-        validate_expr(&order_by.expr)?;
+    if let Some(order_by) = &specification.order_by {
+        validate_order_by(order_by)?;
     }
     if let Some(frame) = &specification.window_frame {
         validate_window_frame(frame)?;
@@ -290,6 +409,7 @@ fn validate_window_spec(specification: &WindowSpec) -> Result<(), ValidateError>
     Ok(())
 }
 
+#[recursive::recursive]
 fn validate_window_frame(frame: &WindowFrame) -> Result<(), ValidateError> {
     validate_window_frame_bound(&frame.start_bound)?;
     if let Some(end_bound) = &frame.end_bound {
@@ -308,9 +428,29 @@ fn validate_window_frame(frame: &WindowFrame) -> Result<(), ValidateError> {
     if let Some(end_bound @ WindowFrameBound::Preceding(None, _)) = &frame.end_bound {
         return Err(ValidateError::invalid_window_frame_bounds(end_bound.span()));
     }
+
+    // Optional pattern clauses are syntax facts even when the analyzer cannot execute them.
+    for measure in &frame.measures {
+        validate_expr(&measure.expression)?;
+    }
+    if let Some(pattern) = &frame.pattern {
+        validate_row_pattern(pattern)?;
+    }
+    for subset in &frame.subsets {
+        if subset.identifiers.is_empty() {
+            return Err(ValidateError::invalid_structure(
+                StructuralViolation::EmptySubsetIdentifierList,
+                subset.span,
+            ));
+        }
+    }
+    for variable in &frame.variable_definitions {
+        validate_expr(&variable.expression)?;
+    }
     Ok(())
 }
 
+#[recursive::recursive]
 fn validate_window_frame_bound(bound: &WindowFrameBound) -> Result<(), ValidateError> {
     match bound {
         WindowFrameBound::Preceding(Some(expression), _)
@@ -362,128 +502,209 @@ fn bound_position(bound: &WindowFrameBound) -> FramePosition {
     }
 }
 
+#[recursive::recursive]
 fn validate_expr(expression: &Expr) -> Result<(), ValidateError> {
     // The query validator only needs to descend into syntax nodes that can
-    // contain a Query or WindowSpec. Other expression-local invariants are
+    // contain a Query or WindowSpecification. Other expression-local invariants are
     // enforced by their parser production and remain valid after construction.
     match expression {
+        Expr::AtLocal(node) => {
+            validate_special_root(|visitor| super::Visit::visit_at_local(visitor, node))?;
+        }
+        Expr::AtTimeZone(node) => {
+            node.validate_constructor_invariants().map_err(|error| {
+                ValidateError::invalid_structure(
+                    StructuralViolation::SpecialExpressionInvariant(error),
+                    node.span,
+                )
+            })?;
+            validate_special_root(|visitor| super::Visit::visit_at_time_zone(visitor, node))?;
+        }
+        Expr::GroupingOperation(node) => {
+            node.validate_constructor_invariants().map_err(|error| {
+                ValidateError::invalid_structure(
+                    StructuralViolation::SpecialExpressionInvariant(error),
+                    node.span,
+                )
+            })?;
+            validate_special_root(|visitor| super::Visit::visit_grouping_operation(visitor, node))?;
+        }
+        Expr::Trim(node) => {
+            validate_special_root(|visitor| super::Visit::visit_trim(visitor, node))?;
+        }
+        Expr::Overlay(node) => {
+            validate_special_root(|visitor| super::Visit::visit_overlay(visitor, node))?;
+        }
+        Expr::IntervalValueExpression(node) => {
+            validate_special_root(|visitor| {
+                super::Visit::visit_interval_value_expression(visitor, node)
+            })?;
+        }
+        Expr::MethodCall(node) => {
+            validate_special_root(|visitor| super::Visit::visit_method_call(visitor, node))?;
+        }
+        Expr::StaticMethodCall(node) => {
+            validate_special_root(|visitor| super::Visit::visit_static_method_call(visitor, node))?;
+        }
+        Expr::CurrentCatalog(_) => {}
+        Expr::CurrentDate(_) => {}
+        Expr::CurrentPath(_) => {}
+        Expr::CurrentSchema(_) => {}
+        Expr::CurrentUser(_) => {}
+        Expr::CurrentTime(_) => {}
+        Expr::CurrentTimestamp(_) => {}
+        Expr::LocalTime(_) => {}
+        Expr::LocalTimestamp(_) => {}
+
+        Expr::JsonConstructor(node) => {
+            validate_json_root(|visitor| super::Visit::visit_json_constructor(visitor, node))?
+        }
+        Expr::JsonExists(node) => {
+            validate_json_root(|visitor| super::Visit::visit_json_exists(visitor, node))?
+        }
+        Expr::JsonValue(node) => {
+            validate_json_root(|visitor| super::Visit::visit_json_value(visitor, node))?
+        }
+        Expr::JsonQuery(node) => {
+            validate_json_root(|visitor| super::Visit::visit_json_query(visitor, node))?
+        }
+        Expr::JsonSerialize(node) => {
+            validate_json_root(|visitor| super::Visit::visit_json_serialize(visitor, node))?
+        }
+        Expr::JsonObject(node) => {
+            validate_json_root(|visitor| super::Visit::visit_json_object(visitor, node))?
+        }
+        Expr::JsonArray(node) => {
+            validate_json_root(|visitor| super::Visit::visit_json_array(visitor, node))?
+        }
+
+        Expr::If(node) => {
+            validate_expr(&node.condition)?;
+            validate_expr(&node.true_value)?;
+            if let Some(value) = &node.false_value {
+                validate_expr(value)?;
+            }
+        }
+        Expr::NullIf(node) => {
+            validate_expr(&node.first)?;
+            validate_expr(&node.second)?;
+        }
+        Expr::Coalesce(node) => {
+            if node.operands.len() < 2 {
+                return Err(ValidateError::invalid_structure(
+                    StructuralViolation::TooFewCoalesceOperands,
+                    node.span,
+                ));
+            }
+            for value in &node.operands {
+                validate_expr(value)?;
+            }
+        }
+        Expr::Try(node) => validate_expr(&node.inner)?,
+        Expr::Format(node) => {
+            if node.arguments.len() < 2 {
+                return Err(ValidateError::invalid_structure(
+                    StructuralViolation::TooFewFormatArguments,
+                    node.span,
+                ));
+            }
+            for value in &node.arguments {
+                validate_expr(value)?;
+            }
+        }
+        Expr::Extract(node) => validate_expr(&node.expression)?,
+        Expr::WindowOperation(node) => validate_window(&node.window)?,
         Expr::FunctionCall(function) => {
             for argument in &function.arguments {
-                validate_expr(argument)?;
+                validate_call_argument(argument)?;
             }
-            for order_by in &function.order_by {
-                validate_expr(&order_by.expr)?;
-            }
-            if let Some(separator) = &function.separator {
-                validate_expr(separator)?;
+            if let Some(order_by) = &function.order_by {
+                validate_order_by(order_by)?;
             }
             if let Some(filter) = &function.filter {
                 validate_expr(filter)?;
             }
-            if let Some(window) = &function.over {
-                validate_window_spec(window)?;
+            if let Some(window) = &function.window {
+                validate_window(window)?;
             }
         }
         Expr::Subquery(subquery) => validate_query(&subquery.query)?,
-        Expr::Exists(exists) => validate_query(&exists.query)?,
-        Expr::InSubquery(in_subquery) => {
-            validate_expr(&in_subquery.expr)?;
-            validate_query(&in_subquery.query)?;
-        }
+        Expr::Exists(exists) => validate_expr(&exists.subquery)?,
+        Expr::Unique(unique) => validate_expr(&unique.subquery)?,
+
         Expr::Unary(unary) => validate_expr(&unary.expression)?,
+        Expr::Predicated(node) => {
+            validate_expr(&node.value)?;
+            struct Children(Result<(), ValidateError>);
+            impl super::Visit for Children {
+                fn visit_expr(&mut self, expression: &Expr) {
+                    if self.0.is_ok() {
+                        self.0 = validate_expr(expression);
+                    }
+                }
+            }
+            let mut children = Children(Ok(()));
+            super::Visit::visit_predicate(&mut children, &node.predicate);
+            children.0?;
+        }
+        Expr::InList(list) => {
+            if list.values.is_empty() {
+                return Err(ValidateError::invalid_structure(
+                    StructuralViolation::EmptyInList,
+                    list.span,
+                ));
+            }
+            for value in &list.values {
+                validate_expr(value)?;
+            }
+        }
+        Expr::Logical(logical) => {
+            if logical.terms.len() < 2 {
+                return Err(ValidateError::invalid_structure(
+                    StructuralViolation::InvalidLogicalTermCount,
+                    logical.span,
+                ));
+            }
+            for term in &logical.terms {
+                validate_expr(term)?;
+            }
+        }
         Expr::Binary(binary) => {
             validate_expr(&binary.left)?;
             validate_expr(&binary.right)?;
         }
-        Expr::Nested(nested) => validate_expr(&nested.expression)?,
-        Expr::Between(between) => {
-            validate_expr(&between.expr)?;
-            validate_expr(&between.low)?;
-            validate_expr(&between.high)?;
-        }
-        Expr::InList(in_list) => {
-            validate_expr(&in_list.expr)?;
-            for item in &in_list.list {
-                validate_expr(item)?;
-            }
-        }
-        Expr::Like(like) => {
-            validate_expr(&like.expr)?;
-            validate_expr(&like.pattern)?;
-            if let Some(escape) = &like.escape {
-                validate_expr(escape)?;
-            }
-        }
-        Expr::IsPredicate(predicate) => validate_expr(&predicate.expr)?,
-        Expr::Case(case) => {
-            if case.conditions.len() != case.results.len() {
-                return Err(ValidateError::invalid_structure(
-                    StructuralViolation::MismatchedCaseArms,
-                    case.span,
-                ));
-            }
-            if let Some(operand) = &case.operand {
-                validate_expr(operand)?;
-            }
-            for condition in &case.conditions {
-                validate_expr(condition)?;
-            }
-            for result in &case.results {
-                validate_expr(result)?;
-            }
-            if let Some(else_result) = &case.else_result {
-                validate_expr(else_result)?;
-            }
-        }
-        Expr::Cast(cast) => {
-            validate_expr(&cast.expr)?;
-            if let Some(format) = &cast.format {
-                validate_expr(format)?;
-            }
-        }
-        Expr::Interval(interval) => {
-            validate_expr(&interval.value)?;
-            if let Some(precision) = &interval.leading_precision {
-                validate_expr(precision)?;
-            }
-            if let Some(precision) = &interval.fractional_seconds_precision {
-                validate_expr(precision)?;
-            }
-        }
-        Expr::Tuple(tuple) => {
-            for expression in &tuple.expressions {
-                validate_expr(expression)?;
+
+        Expr::SearchedCase(case) => validate_case(
+            None,
+            &case.when_clauses,
+            case.default_value.as_ref(),
+            case.span,
+        )?,
+        Expr::SimpleCase(case) => validate_case(
+            Some(&case.operand),
+            &case.when_clauses,
+            case.default_value.as_ref(),
+            case.span,
+        )?,
+        Expr::Cast(cast) => validate_expr(&cast.expression)?,
+        Expr::Row(row) => {
+            for field in &row.fields {
+                validate_expr(&field.expression)?;
             }
         }
         Expr::Array(array) => {
-            for expression in &array.elements {
+            for expression in &array.values {
                 validate_expr(expression)?;
             }
         }
-        Expr::Map(map) => {
-            for entry in &map.entries {
-                validate_expr(&entry.key)?;
-                validate_expr(&entry.value)?;
-            }
-        }
-        Expr::Struct(struct_expr) => {
-            for field in &struct_expr.fields {
-                validate_expr(&field.value)?;
-            }
-        }
         Expr::Lambda(lambda) => validate_expr(&lambda.body)?,
-        Expr::Access(access) => {
-            validate_expr(&access.expr)?;
-            match &access.kind {
-                super::AccessKind::Field(_) => {}
-                super::AccessKind::Subscript(index) => validate_expr(index)?,
-                super::AccessKind::Json { path, .. } => validate_expr(path)?,
-            }
+        Expr::Subscript(node) => {
+            validate_expr(&node.base)?;
+            validate_expr(&node.index)?;
         }
-        Expr::Identifier(_)
-        | Expr::CompoundIdentifier(_)
-        | Expr::Literal(_)
-        | Expr::TypedString(_) => {}
+        Expr::ArrayWildcardSubscript(node) => validate_expr(&node.base)?,
+        Expr::Dereference(node) => validate_expr(&node.base)?,
+        Expr::Identifier(_) | Expr::Literal(_) | Expr::AllRows(_) | Expr::Parameter(_) => {}
     }
     Ok(())
 }
@@ -493,5 +714,232 @@ fn identifier_key(value: &str, quoted: bool) -> String {
         format!("quoted:{value}")
     } else {
         format!("unquoted:{}", value.to_ascii_lowercase())
+    }
+}
+
+struct JsonValidation(Result<(), ValidateError>);
+impl super::Visit for JsonValidation {
+    fn visit_expr(&mut self, expression: &Expr) {
+        if self.0.is_ok() {
+            self.0 = validate_expr(expression);
+        }
+    }
+    fn visit_json_value(&mut self, node: &super::JsonValue) {
+        if self.0.is_err() {
+            return;
+        }
+        self.0 = node.validate_constructor_invariants().map_err(|error| {
+            ValidateError::invalid_structure(
+                StructuralViolation::JsonConstructorInvariant(error),
+                node.span,
+            )
+        });
+        if self.0.is_ok() {
+            super::walk_json_value(self, node);
+        }
+    }
+    fn visit_json_table_value_column(&mut self, node: &super::JsonTableValueColumn) {
+        if self.0.is_err() {
+            return;
+        }
+        self.0 = node.validate_constructor_invariants().map_err(|error| {
+            ValidateError::invalid_structure(
+                StructuralViolation::JsonConstructorInvariant(error),
+                node.span,
+            )
+        });
+        if self.0.is_ok() {
+            super::walk_json_table_value_column(self, node);
+        }
+    }
+    fn visit_json_table(&mut self, node: &super::JsonTable) {
+        if self.0.is_err() {
+            return;
+        }
+        self.0 = node.validate_constructor_invariants().map_err(|error| {
+            ValidateError::invalid_structure(
+                StructuralViolation::JsonConstructorInvariant(error),
+                node.span,
+            )
+        });
+        if self.0.is_ok() {
+            super::walk_json_table(self, node);
+        }
+    }
+    fn visit_json_table_nested_columns(&mut self, node: &super::JsonTableNestedColumns) {
+        if self.0.is_err() {
+            return;
+        }
+        self.0 = node.validate_constructor_invariants().map_err(|error| {
+            ValidateError::invalid_structure(
+                StructuralViolation::JsonConstructorInvariant(error),
+                node.span,
+            )
+        });
+        if self.0.is_ok() {
+            super::walk_json_table_nested_columns(self, node);
+        }
+    }
+    fn visit_json_table_plan_siblings(&mut self, node: &super::JsonTablePlanSiblings) {
+        if self.0.is_err() {
+            return;
+        }
+        self.0 = node.validate_constructor_invariants().map_err(|error| {
+            ValidateError::invalid_structure(
+                StructuralViolation::JsonConstructorInvariant(error),
+                node.span,
+            )
+        });
+        if self.0.is_ok() {
+            super::walk_json_table_plan_siblings(self, node);
+        }
+    }
+}
+#[recursive::recursive]
+fn validate_json_root(walk: impl FnOnce(&mut JsonValidation)) -> Result<(), ValidateError> {
+    let mut visitor = JsonValidation(Ok(()));
+    walk(&mut visitor);
+    visitor.0
+}
+
+fn validate_case(
+    operand: Option<&Expr>,
+    clauses: &[super::WhenClause],
+    default: Option<&Expr>,
+    span: crate::Span,
+) -> Result<(), ValidateError> {
+    if clauses.is_empty() {
+        return Err(ValidateError::invalid_structure(
+            StructuralViolation::EmptyCaseBranches,
+            span,
+        ));
+    }
+    if let Some(operand) = operand {
+        validate_expr(operand)?;
+    }
+    struct Children(Result<(), ValidateError>);
+    impl super::Visit for Children {
+        fn visit_expr(&mut self, expression: &Expr) {
+            if self.0.is_ok() {
+                self.0 = validate_expr(expression);
+            }
+        }
+    }
+    for clause in clauses {
+        let mut children = Children(Ok(()));
+        super::Visit::visit_when_clause(&mut children, clause);
+        children.0?;
+    }
+    if let Some(default) = default {
+        validate_expr(default)?;
+    }
+    Ok(())
+}
+
+#[recursive::recursive]
+fn validate_order_by(order: &super::OrderBy) -> Result<(), ValidateError> {
+    if order.items.is_empty() {
+        return Err(ValidateError::invalid_structure(
+            StructuralViolation::EmptyOrderBy,
+            order.span,
+        ));
+    }
+    for item in &order.items {
+        validate_expr(&item.sort_key)?;
+    }
+    Ok(())
+}
+
+#[recursive::recursive]
+fn validate_window(window: &super::Window) -> Result<(), ValidateError> {
+    match window {
+        super::Window::Reference(_) => Ok(()),
+        super::Window::Specification(node) => validate_window_specification(node),
+    }
+}
+#[recursive::recursive]
+fn validate_row_pattern(pattern: &super::RowPattern) -> Result<(), ValidateError> {
+    use super::RowPattern;
+    match pattern {
+        RowPattern::Alternation { patterns, span }
+        | RowPattern::Concatenation { patterns, span }
+        | RowPattern::Permutation { patterns, span } => {
+            if patterns.is_empty() {
+                return Err(ValidateError::invalid_structure(
+                    StructuralViolation::EmptyPatternList,
+                    *span,
+                ));
+            }
+            for child in patterns {
+                validate_row_pattern(child)?;
+            }
+        }
+        RowPattern::Excluded { pattern, .. } | RowPattern::Quantified { pattern, .. } => {
+            validate_row_pattern(pattern)?
+        }
+        RowPattern::Variable { .. } | RowPattern::Empty { .. } | RowPattern::Anchor { .. } => {}
+    }
+    Ok(())
+}
+
+#[recursive::recursive]
+fn validate_call_argument(argument: &super::CallArgument) -> Result<(), ValidateError> {
+    validate_expr(&argument.value)
+}
+
+fn validate_row_count(
+    node: &Expr,
+    allow_all: bool,
+    violation: StructuralViolation,
+) -> Result<(), ValidateError> {
+    if matches!(
+        node,
+        Expr::Literal(super::Literal {
+            kind: super::LiteralKind::Long { .. },
+            ..
+        }) | Expr::Parameter(_)
+    ) || (allow_all && matches!(node, Expr::AllRows(_)))
+    {
+        return Ok(());
+    }
+    Err(ValidateError::invalid_structure(violation, node.span()))
+}
+
+#[recursive::recursive]
+fn validate_table(table: &super::Table) -> Result<(), ValidateError> {
+    if table.query_period.is_some() && table.branch.is_some() {
+        return Err(ValidateError::invalid_structure(
+            StructuralViolation::ConflictingTablePeriodAndBranch,
+            table.span,
+        ));
+    }
+    if let Some(period) = &table.query_period {
+        if period.start.is_some() || period.end.is_none() {
+            return Err(ValidateError::invalid_structure(
+                StructuralViolation::InvalidQueryPeriod,
+                period.span,
+            ));
+        }
+        if let Some(end) = &period.end {
+            validate_expr(end)?;
+        }
+    }
+    Ok(())
+}
+
+#[recursive::recursive]
+fn validate_special_root(
+    walk: impl FnOnce(&mut SpecialExpressionValidation),
+) -> Result<(), ValidateError> {
+    let mut visitor = SpecialExpressionValidation(Ok(()));
+    walk(&mut visitor);
+    visitor.0
+}
+struct SpecialExpressionValidation(Result<(), ValidateError>);
+impl super::Visit for SpecialExpressionValidation {
+    fn visit_expr(&mut self, node: &Expr) {
+        if self.0.is_ok() {
+            self.0 = validate_expr(node);
+        }
     }
 }

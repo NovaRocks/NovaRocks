@@ -439,6 +439,19 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
                 }
                 if expected.staged_table_uuid != staged.initial_metadata().uuid()
                     || expected.snapshot_id != request.ref_snapshot_after(request.target_ref())
+                    || expected
+                        .final_table_location
+                        .as_deref()
+                        .is_some_and(|location| {
+                            request.final_table_location_update() != Some(location)
+                        })
+                    || expected.final_metadata_path.as_ref().is_some_and(|path| {
+                        use crate::catalog::staged_metadata_path::WRITE_METADATA_PATH;
+                        request.final_property_update(WRITE_METADATA_PATH) != Some(path.as_str())
+                            || !expected.properties.iter().any(|(key, value)| {
+                                key == WRITE_METADATA_PATH && value == path.as_str()
+                            })
+                    })
                     || !expected
                         .properties
                         .iter()
@@ -455,6 +468,11 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
                     snapshot,
                     expected.properties,
                 )
+                .map(|expect| {
+                    expect
+                        .with_final_table_location(expected.final_table_location)
+                        .with_final_metadata_path(expected.final_metadata_path)
+                })
             }
         }
         .map_err(|_| {
@@ -1854,12 +1872,23 @@ mod tests {
                     name: Arc::from("id"),
                     data_type: ConnectorDataType::BigInt,
                     nullable: false,
-                    aggregation: None,
                     default: None,
                 }],
-                key: None,
-                partitioning: vec![],
-                properties: vec![],
+                comment: None,
+                properties: vec![
+                    (
+                        "format".into(),
+                        novarocks_spi::connector::DdlPropertyValue::Varchar("PARQUET".into()),
+                    ),
+                    (
+                        "format_version".into(),
+                        novarocks_spi::connector::DdlPropertyValue::Integer(2),
+                    ),
+                    (
+                        "partitioning".into(),
+                        novarocks_spi::connector::DdlPropertyValue::ArrayVarchar(vec![]),
+                    ),
+                ],
                 policy: CreatePolicy::NoOpIfExists,
             },
             ConnectorCatalogMutationOperation::DropTable {
@@ -2563,6 +2592,8 @@ mod evidence_tests {
                 Some(StagedPublicationExpectation {
                     staged_table_uuid: staged_uuid,
                     snapshot_id: Some(30),
+                    final_table_location: None,
+                    final_metadata_path: None,
                     properties: vec![marker.clone()],
                 }),
             )

@@ -20,7 +20,7 @@
 CREATE TABLE ${case_db}.window_result_domains (id INT);
 
 -- query 2
-INSERT INTO ${case_db}.window_result_domains VALUES (1),(2);
+INSERT INTO ${case_db}.window_result_domains VALUES ROW(1),ROW(2);
 
 -- query 3
 -- @order_sensitive=true

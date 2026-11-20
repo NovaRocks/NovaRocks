@@ -145,9 +145,9 @@ fn ordinary_carrier_matches(declared: &D, actual: &DataType) -> bool {
         | (D::Double, DataType::Float64)
         | (D::Date, DataType::Date32)
         | (D::Time, DataType::Time64(TimeUnit::Microsecond))
-        | (D::DateTime, DataType::Timestamp(TimeUnit::Microsecond, _))
-        | (D::DateTimeNs, DataType::Timestamp(TimeUnit::Nanosecond, _))
-        | (D::String, DataType::Utf8 | DataType::LargeUtf8)
+        | (D::Timestamp { precision: 6, .. }, DataType::Timestamp(TimeUnit::Microsecond, _))
+        | (D::Timestamp { precision: 9, .. }, DataType::Timestamp(TimeUnit::Nanosecond, _))
+        | (D::String | D::Uuid, DataType::Utf8 | DataType::LargeUtf8)
         // The independent ordinary Binary declaration permits both offset
         // widths without granting Variant identity from the carrier alone.
         | (D::Binary { fixed_length: None }, DataType::Binary | DataType::LargeBinary) => true,

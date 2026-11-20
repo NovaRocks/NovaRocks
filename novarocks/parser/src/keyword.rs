@@ -15,259 +15,667 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! MySQL/StarRocks keyword classification for the parser foundation.
+//! Keyword recognition and identifier reservedness for the SQL grammar.
 
-use crate::Keyword;
+use crate::token::Keyword;
 
-/// Whether a recognized keyword is reserved in the initial parser dialect.
-///
-/// The lexer records only [`Keyword`] in a token. This classification is kept
-/// separately so grammar families can decide which non-reserved words they
-/// accept as identifiers without changing lexical recognition.
+/// Whether a recognized keyword can be used as an unquoted identifier.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum KeywordClass {
     Reserved,
     NonReserved,
 }
 
-/// Looks up a keyword using ASCII-only case folding.
-///
-/// Identifiers retain their original source spelling; only the comparison here
-/// is case-insensitive.
+/// Recognizes a word without allocating or changing its original spelling.
 pub fn lookup(word: &str) -> Option<Keyword> {
     KEYWORDS
-        .iter()
-        .find(|(spelling, _)| word.eq_ignore_ascii_case(spelling))
-        .map(|(_, keyword)| *keyword)
+        .binary_search_by(|(spelling, _)| {
+            spelling
+                .bytes()
+                .cmp(word.bytes().map(|byte| byte.to_ascii_uppercase()))
+        })
+        .ok()
+        .map(|index| KEYWORDS[index].1)
 }
 
-/// Returns the reservedness recorded for a recognized keyword.
+/// Whether a word can be used as an unquoted identifier.
 pub const fn class(keyword: Keyword) -> KeywordClass {
     match keyword {
-        Keyword::Add
-        | Keyword::Alter
-        | Keyword::Analyze
+        Keyword::Alter
         | Keyword::And
         | Keyword::As
+        | Keyword::Auto
         | Keyword::Between
-        | Keyword::Call
-        | Keyword::Cancel
+        | Keyword::By
         | Keyword::Case
         | Keyword::Cast
+        | Keyword::Constraint
         | Keyword::Create
         | Keyword::Cross
+        | Keyword::Cube
+        | Keyword::CurrentCatalog
+        | Keyword::CurrentDate
+        | Keyword::CurrentPath
+        | Keyword::CurrentRole
+        | Keyword::CurrentSchema
+        | Keyword::CurrentTime
+        | Keyword::CurrentTimestamp
+        | Keyword::CurrentUser
+        | Keyword::Deallocate
+        | Keyword::Delete
+        | Keyword::Describe
         | Keyword::Distinct
         | Keyword::Drop
         | Keyword::Else
         | Keyword::End
+        | Keyword::Escape
         | Keyword::Except
-        | Keyword::Explain
-        | Keyword::Fetch
+        | Keyword::Exists
+        | Keyword::Extract
         | Keyword::False
-        | Keyword::From
         | Keyword::For
+        | Keyword::From
+        | Keyword::Full
         | Keyword::Group
+        | Keyword::Grouping
         | Keyword::Having
         | Keyword::In
         | Keyword::Inner
+        | Keyword::Insert
         | Keyword::Intersect
+        | Keyword::Into
         | Keyword::Is
         | Keyword::Join
-        | Keyword::Kill
+        | Keyword::JsonArray
+        | Keyword::JsonExists
+        | Keyword::JsonObject
+        | Keyword::JsonQuery
+        | Keyword::JsonSerialize
+        | Keyword::JsonTable
+        | Keyword::JsonValue
+        | Keyword::Left
         | Keyword::Like
-        | Keyword::Limit
+        | Keyword::Listagg
+        | Keyword::Localtime
+        | Keyword::Localtimestamp
+        | Keyword::Natural
+        | Keyword::Normalize
         | Keyword::Not
         | Keyword::Null
         | Keyword::On
-        | Keyword::Only
         | Keyword::Or
         | Keyword::Order
         | Keyword::Outer
+        | Keyword::Overlaps
+        | Keyword::Prepare
+        | Keyword::Recursive
+        | Keyword::Right
+        | Keyword::Rollup
         | Keyword::Select
-        | Keyword::Show
+        | Keyword::Skip
+        | Keyword::Table
         | Keyword::Then
+        | Keyword::Trim
         | Keyword::True
-        | Keyword::Truncate
+        | Keyword::Uescape
         | Keyword::Union
+        | Keyword::Unnest
         | Keyword::Using
         | Keyword::Values
         | Keyword::When
         | Keyword::Where
         | Keyword::With => KeywordClass::Reserved,
-        _ => KeywordClass::NonReserved,
+        Keyword::Absent
+        | Keyword::Add
+        | Keyword::Admin
+        | Keyword::After
+        | Keyword::All
+        | Keyword::Analyze
+        | Keyword::Any
+        | Keyword::Array
+        | Keyword::Asc
+        | Keyword::Asymmetric
+        | Keyword::At
+        | Keyword::Authorization
+        | Keyword::Begin
+        | Keyword::Bernoulli
+        | Keyword::Both
+        | Keyword::Branch
+        | Keyword::Branches
+        | Keyword::Call
+        | Keyword::Called
+        | Keyword::Cascade
+        | Keyword::Catalog
+        | Keyword::Catalogs
+        | Keyword::Column
+        | Keyword::Columns
+        | Keyword::Comment
+        | Keyword::Commit
+        | Keyword::Committed
+        | Keyword::Conditional
+        | Keyword::Copartition
+        | Keyword::Corresponding
+        | Keyword::Count
+        | Keyword::Current
+        | Keyword::Data
+        | Keyword::Date
+        | Keyword::Day
+        | Keyword::Declare
+        | Keyword::Default
+        | Keyword::Define
+        | Keyword::Definer
+        | Keyword::Deny
+        | Keyword::Desc
+        | Keyword::Descriptor
+        | Keyword::Deterministic
+        | Keyword::Distributed
+        | Keyword::Do
+        | Keyword::Double
+        | Keyword::Elseif
+        | Keyword::Empty
+        | Keyword::Encoding
+        | Keyword::Error
+        | Keyword::Exclude
+        | Keyword::Excluding
+        | Keyword::Execute
+        | Keyword::Explain
+        | Keyword::Fail
+        | Keyword::Fast
+        | Keyword::Fetch
+        | Keyword::Filter
+        | Keyword::Final
+        | Keyword::First
+        | Keyword::Following
+        | Keyword::Format
+        | Keyword::Forward
+        | Keyword::Function
+        | Keyword::Functions
+        | Keyword::Grace
+        | Keyword::Grant
+        | Keyword::Granted
+        | Keyword::Grants
+        | Keyword::Graphviz
+        | Keyword::Groups
+        | Keyword::Hour
+        | Keyword::If
+        | Keyword::Ignore
+        | Keyword::Immediate
+        | Keyword::Including
+        | Keyword::Initial
+        | Keyword::Inline
+        | Keyword::Input
+        | Keyword::Interval
+        | Keyword::Invoker
+        | Keyword::Io
+        | Keyword::Isolation
+        | Keyword::Iterate
+        | Keyword::Json
+        | Keyword::Keep
+        | Keyword::Key
+        | Keyword::Keys
+        | Keyword::Language
+        | Keyword::Last
+        | Keyword::Lateral
+        | Keyword::Leading
+        | Keyword::Leave
+        | Keyword::Level
+        | Keyword::Limit
+        | Keyword::Local
+        | Keyword::Logical
+        | Keyword::Loop
+        | Keyword::Map
+        | Keyword::Match
+        | Keyword::Matched
+        | Keyword::Matches
+        | Keyword::MatchRecognize
+        | Keyword::Materialized
+        | Keyword::Measures
+        | Keyword::Merge
+        | Keyword::Minute
+        | Keyword::Month
+        | Keyword::Nearest
+        | Keyword::Nested
+        | Keyword::Next
+        | Keyword::Nfc
+        | Keyword::Nfd
+        | Keyword::Nfkc
+        | Keyword::Nfkd
+        | Keyword::No
+        | Keyword::None
+        | Keyword::Nullif
+        | Keyword::Nulls
+        | Keyword::Object
+        | Keyword::Of
+        | Keyword::Offset
+        | Keyword::Omit
+        | Keyword::One
+        | Keyword::Only
+        | Keyword::Option
+        | Keyword::Ordinality
+        | Keyword::Others
+        | Keyword::Output
+        | Keyword::Over
+        | Keyword::Overflow
+        | Keyword::Overlay
+        | Keyword::Partial
+        | Keyword::Partition
+        | Keyword::Partitions
+        | Keyword::Passing
+        | Keyword::Past
+        | Keyword::Path
+        | Keyword::Pattern
+        | Keyword::Per
+        | Keyword::Period
+        | Keyword::Permute
+        | Keyword::Pivot
+        | Keyword::Placing
+        | Keyword::Plan
+        | Keyword::Position
+        | Keyword::Preceding
+        | Keyword::Precision
+        | Keyword::Privileges
+        | Keyword::Properties
+        | Keyword::Prune
+        | Keyword::Quotes
+        | Keyword::Range
+        | Keyword::Read
+        | Keyword::Refresh
+        | Keyword::Rename
+        | Keyword::Repeat
+        | Keyword::Repeatable
+        | Keyword::Replace
+        | Keyword::Reset
+        | Keyword::Respect
+        | Keyword::Restrict
+        | Keyword::Return
+        | Keyword::Returning
+        | Keyword::Returns
+        | Keyword::Revoke
+        | Keyword::Role
+        | Keyword::Roles
+        | Keyword::Rollback
+        | Keyword::Row
+        | Keyword::Rows
+        | Keyword::Running
+        | Keyword::Scalar
+        | Keyword::Schema
+        | Keyword::Schemas
+        | Keyword::Second
+        | Keyword::Security
+        | Keyword::Seek
+        | Keyword::Serializable
+        | Keyword::Session
+        | Keyword::Set
+        | Keyword::Sets
+        | Keyword::Show
+        | Keyword::Simple
+        | Keyword::Some
+        | Keyword::Stale
+        | Keyword::Start
+        | Keyword::Stats
+        | Keyword::TextString
+        | Keyword::Subset
+        | Keyword::Substring
+        | Keyword::Symmetric
+        | Keyword::System
+        | Keyword::Tables
+        | Keyword::Tablesample
+        | Keyword::Text
+        | Keyword::Ties
+        | Keyword::Time
+        | Keyword::Timestamp
+        | Keyword::To
+        | Keyword::Trailing
+        | Keyword::Transaction
+        | Keyword::Truncate
+        | Keyword::TryCast
+        | Keyword::Type
+        | Keyword::Unbounded
+        | Keyword::Uncommitted
+        | Keyword::Unconditional
+        | Keyword::Unique
+        | Keyword::Unknown
+        | Keyword::Unmatched
+        | Keyword::Until
+        | Keyword::Update
+        | Keyword::Use
+        | Keyword::User
+        | Keyword::Utf16
+        | Keyword::Utf32
+        | Keyword::Utf8
+        | Keyword::Validate
+        | Keyword::Value
+        | Keyword::Verbose
+        | Keyword::Version
+        | Keyword::View
+        | Keyword::While
+        | Keyword::Window
+        | Keyword::Within
+        | Keyword::Without
+        | Keyword::Work
+        | Keyword::Wrapper
+        | Keyword::Write
+        | Keyword::Year
+        | Keyword::Zone => KeywordClass::NonReserved,
     }
 }
 
-const KEYWORDS: &[(&str, Keyword)] = &[
+/// The complete word-token vocabulary in deterministic spelling order.
+pub const KEYWORDS: &[(&str, Keyword)] = &[
+    ("ABSENT", Keyword::Absent),
     ("ADD", Keyword::Add),
+    ("ADMIN", Keyword::Admin),
+    ("AFTER", Keyword::After),
+    ("ALL", Keyword::All),
     ("ALTER", Keyword::Alter),
     ("ANALYZE", Keyword::Analyze),
     ("AND", Keyword::And),
-    ("ANTI", Keyword::Anti),
     ("ANY", Keyword::Any),
     ("ARRAY", Keyword::Array),
     ("AS", Keyword::As),
     ("ASC", Keyword::Asc),
+    ("ASYMMETRIC", Keyword::Asymmetric),
     ("AT", Keyword::At),
-    ("ASYNC", Keyword::Async),
-    ("BACKEND", Keyword::Backend),
-    ("BASIC", Keyword::Basic),
+    ("AUTHORIZATION", Keyword::Authorization),
+    ("AUTO", Keyword::Auto),
+    ("BEGIN", Keyword::Begin),
+    ("BERNOULLI", Keyword::Bernoulli),
     ("BETWEEN", Keyword::Between),
+    ("BOTH", Keyword::Both),
     ("BRANCH", Keyword::Branch),
-    ("BUCKETS", Keyword::Buckets),
+    ("BRANCHES", Keyword::Branches),
     ("BY", Keyword::By),
     ("CALL", Keyword::Call),
-    ("CANCEL", Keyword::Cancel),
-    ("CATALOG", Keyword::Catalog),
+    ("CALLED", Keyword::Called),
+    ("CASCADE", Keyword::Cascade),
     ("CASE", Keyword::Case),
     ("CAST", Keyword::Cast),
+    ("CATALOG", Keyword::Catalog),
+    ("CATALOGS", Keyword::Catalogs),
     ("COLUMN", Keyword::Column),
     ("COLUMNS", Keyword::Columns),
     ("COMMENT", Keyword::Comment),
-    ("COSTS", Keyword::Costs),
+    ("COMMIT", Keyword::Commit),
+    ("COMMITTED", Keyword::Committed),
+    ("CONDITIONAL", Keyword::Conditional),
+    ("CONSTRAINT", Keyword::Constraint),
+    ("COPARTITION", Keyword::Copartition),
+    ("CORRESPONDING", Keyword::Corresponding),
+    ("COUNT", Keyword::Count),
     ("CREATE", Keyword::Create),
     ("CROSS", Keyword::Cross),
     ("CUBE", Keyword::Cube),
     ("CURRENT", Keyword::Current),
-    ("DATABASE", Keyword::Database),
+    ("CURRENT_CATALOG", Keyword::CurrentCatalog),
+    ("CURRENT_DATE", Keyword::CurrentDate),
+    ("CURRENT_PATH", Keyword::CurrentPath),
+    ("CURRENT_ROLE", Keyword::CurrentRole),
+    ("CURRENT_SCHEMA", Keyword::CurrentSchema),
+    ("CURRENT_TIME", Keyword::CurrentTime),
+    ("CURRENT_TIMESTAMP", Keyword::CurrentTimestamp),
+    ("CURRENT_USER", Keyword::CurrentUser),
+    ("DATA", Keyword::Data),
     ("DATE", Keyword::Date),
+    ("DAY", Keyword::Day),
+    ("DEALLOCATE", Keyword::Deallocate),
+    ("DECLARE", Keyword::Declare),
     ("DEFAULT", Keyword::Default),
+    ("DEFINE", Keyword::Define),
+    ("DEFINER", Keyword::Definer),
+    ("DELETE", Keyword::Delete),
+    ("DENY", Keyword::Deny),
     ("DESC", Keyword::Desc),
+    ("DESCRIBE", Keyword::Describe),
+    ("DESCRIPTOR", Keyword::Descriptor),
+    ("DETERMINISTIC", Keyword::Deterministic),
     ("DISTINCT", Keyword::Distinct),
+    ("DISTRIBUTED", Keyword::Distributed),
+    ("DO", Keyword::Do),
+    ("DOUBLE", Keyword::Double),
     ("DROP", Keyword::Drop),
     ("ELSE", Keyword::Else),
+    ("ELSEIF", Keyword::Elseif),
+    ("EMPTY", Keyword::Empty),
+    ("ENCODING", Keyword::Encoding),
     ("END", Keyword::End),
+    ("ERROR", Keyword::Error),
     ("ESCAPE", Keyword::Escape),
     ("EXCEPT", Keyword::Except),
+    ("EXCLUDE", Keyword::Exclude),
+    ("EXCLUDING", Keyword::Excluding),
+    ("EXECUTE", Keyword::Execute),
     ("EXISTS", Keyword::Exists),
-    ("EXPIRE", Keyword::Expire),
     ("EXPLAIN", Keyword::Explain),
-    ("EXTERNAL", Keyword::External),
+    ("EXTRACT", Keyword::Extract),
+    ("FAIL", Keyword::Fail),
     ("FALSE", Keyword::False),
+    ("FAST", Keyword::Fast),
     ("FETCH", Keyword::Fetch),
-    ("FILES", Keyword::Files),
     ("FILTER", Keyword::Filter),
+    ("FINAL", Keyword::Final),
     ("FIRST", Keyword::First),
     ("FOLLOWING", Keyword::Following),
     ("FOR", Keyword::For),
-    ("FORCE", Keyword::Force),
+    ("FORMAT", Keyword::Format),
+    ("FORWARD", Keyword::Forward),
     ("FROM", Keyword::From),
     ("FULL", Keyword::Full),
+    ("FUNCTION", Keyword::Function),
+    ("FUNCTIONS", Keyword::Functions),
+    ("GRACE", Keyword::Grace),
+    ("GRANT", Keyword::Grant),
+    ("GRANTED", Keyword::Granted),
+    ("GRANTS", Keyword::Grants),
+    ("GRAPHVIZ", Keyword::Graphviz),
     ("GROUP", Keyword::Group),
     ("GROUPING", Keyword::Grouping),
     ("GROUPS", Keyword::Groups),
     ("HAVING", Keyword::Having),
-    ("HISTOGRAM", Keyword::Histogram),
+    ("HOUR", Keyword::Hour),
     ("IF", Keyword::If),
     ("IGNORE", Keyword::Ignore),
-    ("ILIKE", Keyword::Ilike),
+    ("IMMEDIATE", Keyword::Immediate),
     ("IN", Keyword::In),
+    ("INCLUDING", Keyword::Including),
+    ("INITIAL", Keyword::Initial),
+    ("INLINE", Keyword::Inline),
     ("INNER", Keyword::Inner),
+    ("INPUT", Keyword::Input),
+    ("INSERT", Keyword::Insert),
     ("INTERSECT", Keyword::Intersect),
     ("INTERVAL", Keyword::Interval),
+    ("INTO", Keyword::Into),
+    ("INVOKER", Keyword::Invoker),
+    ("IO", Keyword::Io),
     ("IS", Keyword::Is),
-    ("JOBS", Keyword::Jobs),
+    ("ISOLATION", Keyword::Isolation),
+    ("ITERATE", Keyword::Iterate),
     ("JOIN", Keyword::Join),
-    ("KILL", Keyword::Kill),
-    ("LATERAL", Keyword::Lateral),
+    ("JSON", Keyword::Json),
+    ("JSON_ARRAY", Keyword::JsonArray),
+    ("JSON_EXISTS", Keyword::JsonExists),
+    ("JSON_OBJECT", Keyword::JsonObject),
+    ("JSON_QUERY", Keyword::JsonQuery),
+    ("JSON_SERIALIZE", Keyword::JsonSerialize),
+    ("JSON_TABLE", Keyword::JsonTable),
+    ("JSON_VALUE", Keyword::JsonValue),
+    ("KEEP", Keyword::Keep),
+    ("KEY", Keyword::Key),
+    ("KEYS", Keyword::Keys),
+    ("LANGUAGE", Keyword::Language),
     ("LAST", Keyword::Last),
+    ("LATERAL", Keyword::Lateral),
+    ("LEADING", Keyword::Leading),
+    ("LEAVE", Keyword::Leave),
     ("LEFT", Keyword::Left),
+    ("LEVEL", Keyword::Level),
     ("LIKE", Keyword::Like),
     ("LIMIT", Keyword::Limit),
+    ("LISTAGG", Keyword::Listagg),
+    ("LOCAL", Keyword::Local),
+    ("LOCALTIME", Keyword::Localtime),
+    ("LOCALTIMESTAMP", Keyword::Localtimestamp),
     ("LOGICAL", Keyword::Logical),
-    ("MANIFESTS", Keyword::Manifests),
+    ("LOOP", Keyword::Loop),
+    ("MAP", Keyword::Map),
+    ("MATCH", Keyword::Match),
+    ("MATCHED", Keyword::Matched),
+    ("MATCHES", Keyword::Matches),
+    ("MATCH_RECOGNIZE", Keyword::MatchRecognize),
     ("MATERIALIZED", Keyword::Materialized),
-    ("META", Keyword::Meta),
+    ("MEASURES", Keyword::Measures),
+    ("MERGE", Keyword::Merge),
+    ("MINUTE", Keyword::Minute),
+    ("MONTH", Keyword::Month),
     ("NATURAL", Keyword::Natural),
+    ("NEAREST", Keyword::Nearest),
+    ("NESTED", Keyword::Nested),
     ("NEXT", Keyword::Next),
+    ("NFC", Keyword::Nfc),
+    ("NFD", Keyword::Nfd),
+    ("NFKC", Keyword::Nfkc),
+    ("NFKD", Keyword::Nfkd),
+    ("NO", Keyword::No),
+    ("NONE", Keyword::None),
+    ("NORMALIZE", Keyword::Normalize),
     ("NOT", Keyword::Not),
     ("NULL", Keyword::Null),
+    ("NULLIF", Keyword::Nullif),
     ("NULLS", Keyword::Nulls),
+    ("OBJECT", Keyword::Object),
     ("OF", Keyword::Of),
     ("OFFSET", Keyword::Offset),
+    ("OMIT", Keyword::Omit),
     ("ON", Keyword::On),
+    ("ONE", Keyword::One),
     ("ONLY", Keyword::Only),
+    ("OPTION", Keyword::Option),
+    ("OR", Keyword::Or),
     ("ORDER", Keyword::Order),
     ("ORDINALITY", Keyword::Ordinality),
-    ("OR", Keyword::Or),
-    ("ORPHAN", Keyword::Orphan),
+    ("OTHERS", Keyword::Others),
     ("OUTER", Keyword::Outer),
+    ("OUTPUT", Keyword::Output),
     ("OVER", Keyword::Over),
+    ("OVERFLOW", Keyword::Overflow),
+    ("OVERLAPS", Keyword::Overlaps),
+    ("OVERLAY", Keyword::Overlay),
+    ("PARTIAL", Keyword::Partial),
     ("PARTITION", Keyword::Partition),
+    ("PARTITIONS", Keyword::Partitions),
+    ("PASSING", Keyword::Passing),
+    ("PAST", Keyword::Past),
+    ("PATH", Keyword::Path),
+    ("PATTERN", Keyword::Pattern),
+    ("PER", Keyword::Per),
+    ("PERIOD", Keyword::Period),
+    ("PERMUTE", Keyword::Permute),
+    ("PIVOT", Keyword::Pivot),
+    ("PLACING", Keyword::Placing),
+    ("PLAN", Keyword::Plan),
     ("POSITION", Keyword::Position),
     ("PRECEDING", Keyword::Preceding),
-    ("PERCENT", Keyword::Percent),
+    ("PRECISION", Keyword::Precision),
+    ("PREPARE", Keyword::Prepare),
+    ("PRIVILEGES", Keyword::Privileges),
     ("PROPERTIES", Keyword::Properties),
-    ("QUALIFY", Keyword::Qualify),
+    ("PRUNE", Keyword::Prune),
+    ("QUOTES", Keyword::Quotes),
     ("RANGE", Keyword::Range),
+    ("READ", Keyword::Read),
     ("RECURSIVE", Keyword::Recursive),
     ("REFRESH", Keyword::Refresh),
-    ("REMOVE", Keyword::Remove),
+    ("RENAME", Keyword::Rename),
+    ("REPEAT", Keyword::Repeat),
+    ("REPEATABLE", Keyword::Repeatable),
+    ("REPLACE", Keyword::Replace),
+    ("RESET", Keyword::Reset),
     ("RESPECT", Keyword::Respect),
-    ("REWRITE", Keyword::Rewrite),
+    ("RESTRICT", Keyword::Restrict),
+    ("RETURN", Keyword::Return),
+    ("RETURNING", Keyword::Returning),
+    ("RETURNS", Keyword::Returns),
+    ("REVOKE", Keyword::Revoke),
     ("RIGHT", Keyword::Right),
-    ("RLIKE", Keyword::Rlike),
+    ("ROLE", Keyword::Role),
+    ("ROLES", Keyword::Roles),
+    ("ROLLBACK", Keyword::Rollback),
     ("ROLLUP", Keyword::Rollup),
     ("ROW", Keyword::Row),
     ("ROWS", Keyword::Rows),
-    ("SAMPLE", Keyword::Sample),
+    ("RUNNING", Keyword::Running),
+    ("SCALAR", Keyword::Scalar),
+    ("SCHEMA", Keyword::Schema),
+    ("SCHEMAS", Keyword::Schemas),
+    ("SECOND", Keyword::Second),
+    ("SECURITY", Keyword::Security),
+    ("SEEK", Keyword::Seek),
     ("SELECT", Keyword::Select),
-    ("SEMI", Keyword::Semi),
+    ("SERIALIZABLE", Keyword::Serializable),
+    ("SESSION", Keyword::Session),
     ("SET", Keyword::Set),
     ("SETS", Keyword::Sets),
     ("SHOW", Keyword::Show),
-    ("SIMILAR", Keyword::Similar),
+    ("SIMPLE", Keyword::Simple),
+    ("SKIP", Keyword::Skip),
     ("SOME", Keyword::Some),
-    ("SNAPSHOTS", Keyword::Snapshots),
+    ("STALE", Keyword::Stale),
+    ("START", Keyword::Start),
     ("STATS", Keyword::Stats),
-    ("STRUCT", Keyword::Struct),
+    ("STRING", Keyword::TextString),
+    ("SUBSET", Keyword::Subset),
     ("SUBSTRING", Keyword::Substring),
-    ("SYNC", Keyword::Sync),
+    ("SYMMETRIC", Keyword::Symmetric),
     ("SYSTEM", Keyword::System),
-    ("SYSTEM_TIME", Keyword::SystemTime),
     ("TABLE", Keyword::Table),
     ("TABLES", Keyword::Tables),
-    ("TAG", Keyword::Tag),
+    ("TABLESAMPLE", Keyword::Tablesample),
+    ("TEXT", Keyword::Text),
     ("THEN", Keyword::Then),
+    ("TIES", Keyword::Ties),
     ("TIME", Keyword::Time),
     ("TIMESTAMP", Keyword::Timestamp),
-    ("TIES", Keyword::Ties),
     ("TO", Keyword::To),
+    ("TRAILING", Keyword::Trailing),
+    ("TRANSACTION", Keyword::Transaction),
+    ("TRIM", Keyword::Trim),
     ("TRUE", Keyword::True),
     ("TRUNCATE", Keyword::Truncate),
     ("TRY_CAST", Keyword::TryCast),
+    ("TYPE", Keyword::Type),
+    ("UESCAPE", Keyword::Uescape),
     ("UNBOUNDED", Keyword::Unbounded),
+    ("UNCOMMITTED", Keyword::Uncommitted),
+    ("UNCONDITIONAL", Keyword::Unconditional),
     ("UNION", Keyword::Union),
-    ("UNNEST", Keyword::Unnest),
-    ("UNSET", Keyword::Unset),
+    ("UNIQUE", Keyword::Unique),
     ("UNKNOWN", Keyword::Unknown),
+    ("UNMATCHED", Keyword::Unmatched),
+    ("UNNEST", Keyword::Unnest),
+    ("UNTIL", Keyword::Until),
+    ("UPDATE", Keyword::Update),
+    ("USE", Keyword::Use),
+    ("USER", Keyword::User),
     ("USING", Keyword::Using),
+    ("UTF16", Keyword::Utf16),
+    ("UTF32", Keyword::Utf32),
+    ("UTF8", Keyword::Utf8),
+    ("VALIDATE", Keyword::Validate),
+    ("VALUE", Keyword::Value),
+    ("VALUES", Keyword::Values),
     ("VERBOSE", Keyword::Verbose),
     ("VERSION", Keyword::Version),
-    ("VALUES", Keyword::Values),
     ("VIEW", Keyword::View),
-    ("VIEWS", Keyword::Views),
-    ("WITH", Keyword::With),
     ("WHEN", Keyword::When),
     ("WHERE", Keyword::Where),
+    ("WHILE", Keyword::While),
     ("WINDOW", Keyword::Window),
+    ("WITH", Keyword::With),
     ("WITHIN", Keyword::Within),
+    ("WITHOUT", Keyword::Without),
+    ("WORK", Keyword::Work),
+    ("WRAPPER", Keyword::Wrapper),
+    ("WRITE", Keyword::Write),
+    ("YEAR", Keyword::Year),
     ("ZONE", Keyword::Zone),
 ];
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn lookup_is_ascii_case_insensitive_without_normalizing_identifiers() {
-        assert_eq!(lookup("sHoW"), Some(Keyword::Show));
-        assert_eq!(lookup("backends"), None);
-        assert_eq!(lookup("SeLeCt"), Some(Keyword::Select));
-        assert_eq!(lookup("try_cast"), Some(Keyword::TryCast));
-        assert_eq!(lookup("backends_x"), None);
-        assert_eq!(class(Keyword::Window), KeywordClass::NonReserved);
-        assert_eq!(class(Keyword::Select), KeywordClass::Reserved);
-        assert_eq!(class(Keyword::Show), KeywordClass::Reserved);
-    }
-}

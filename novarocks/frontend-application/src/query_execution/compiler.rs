@@ -20,6 +20,7 @@ use std::sync::Arc;
 use novarocks_parser::ast::Query;
 use novarocks_proto_codec::lifecycle::QueryOptions;
 
+use crate::catalog_application::query_bindings::QueryTableBindingStore;
 use crate::catalog_application::query_catalog::QueryCatalogService;
 use novarocks_types::naming::normalize_identifier;
 
@@ -975,6 +976,26 @@ pub(crate) fn iceberg_write_shuffle_by_output_name(
     novarocks_sql::compiler::RootDistributionRequirement::ShuffleOutputName(output_name.into())
 }
 
+/// Capture SQL's demanded catalog qualifications in the same binding store
+/// that will supply the original DML source's catalog relations.
+pub(crate) fn observe_dml_catalog_qualifications(
+    query: &Query,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    control: &novarocks_sql::compiler::SqlCompileControl,
+    bindings: &QueryTableBindingStore,
+    catalog_application: Option<&dyn novarocks_catalog_application::CatalogApplicationPort>,
+) -> Result<novarocks_sql::compiler::CatalogQualifications, novarocks_sql::compiler::SqlCompileError>
+{
+    let candidates = novarocks_sql::compiler::quoted_metadata_catalogs(
+        query,
+        current_catalog,
+        current_database,
+        control,
+    )?;
+    bindings.observe_catalog_qualifications(&candidates, catalog_application)
+}
+
 /// Compile the original INSERT source after asynchronously observing its
 /// catalog, statistics and provider facts. The statement action must retain
 /// `provider_source` until its close proves the original creator actually exited.
@@ -1039,6 +1060,15 @@ pub(crate) async fn prepare_query_as_iceberg_write_with_write_session_and_consta
     }
     let compile_control =
         crate::query_execution::planning::sql_compile_control_from_execution(execution);
+    let qualifications = observe_dml_catalog_qualifications(
+        &prepared,
+        current_catalog,
+        current_database,
+        &compile_control,
+        table_bindings.as_ref(),
+        state.catalog_application().map(Arc::as_ref),
+    )
+    .map_err(crate::dml::error::DmlExecutionError::from_compile)?;
     let statement = match constants {
         Some(constants) => {
             novarocks_sql::compiler::SqlStatementInput::query_with_expression_constants(
@@ -1059,18 +1089,20 @@ pub(crate) async fn prepare_query_as_iceberg_write_with_write_session_and_consta
         })
         .transpose()
         .map_err(crate::dml::error::DmlExecutionError::from_compile)?;
-    let mut preparation = novarocks_sql::compiler::SqlDmlCatalogPreparation::try_new(
-        statement,
-        novarocks_sql::compiler::SqlSessionContext {
-            sql_semantics: execution.sql_semantics().clone(),
-            current_catalog: current_catalog.map(str::to_string),
-            current_database: current_database.to_string(),
-            optimizer_settings: execution.optimizer_settings().clone(),
-        },
-        compile_control.clone(),
-        root_distribution,
-    )
-    .map_err(crate::dml::error::DmlExecutionError::from_compile)?;
+    let mut preparation =
+        novarocks_sql::compiler::SqlDmlCatalogPreparation::try_new_for_intent_with_qualifications(
+            statement,
+            novarocks_sql::compiler::SqlSessionContext {
+                sql_semantics: execution.sql_semantics().clone(),
+                current_catalog: current_catalog.map(str::to_string),
+                current_database: current_database.to_string(),
+                optimizer_settings: execution.optimizer_settings().clone(),
+            },
+            compile_control.clone(),
+            novarocks_sql::compiler::SqlCompileIntent::IcebergWrite { root_distribution },
+            qualifications,
+        )
+        .map_err(crate::dml::error::DmlExecutionError::from_compile)?;
     if let Some(assignments) = assignments {
         preparation = preparation
             .with_write_assignments(assignments)
@@ -1342,116 +1374,6 @@ const fn in_process_exchange_endpoint_sentinel() -> u16 {
     // The lifetime-held TestSerializationGuard keeps this nonzero topology
     // marker isolated from concurrent standalone semantic tests.
     1
-}
-
-// ---------------------------------------------------------------------------
-// EXPLAIN COSTS helper
-// ---------------------------------------------------------------------------
-
-#[allow(
-    dead_code,
-    reason = "Parser helper is retained for EXPLAIN compatibility parsing coverage."
-)]
-fn trim_ascii_whitespace_end(sql: &str, mut idx: usize) -> usize {
-    let bytes = sql.as_bytes();
-    while idx > 0 && bytes[idx - 1].is_ascii_whitespace() {
-        idx -= 1;
-    }
-    idx
-}
-
-#[allow(
-    dead_code,
-    reason = "Parser helper is retained for EXPLAIN compatibility parsing coverage."
-)]
-fn find_table_ref_start(sql: &str, mut idx: usize) -> usize {
-    let bytes = sql.as_bytes();
-    while idx > 0 {
-        let b = bytes[idx - 1];
-        if b.is_ascii_alphanumeric() || matches!(b, b'_' | b'$' | b'.' | b'`') {
-            idx -= 1;
-        } else {
-            break;
-        }
-    }
-    idx
-}
-
-#[allow(
-    dead_code,
-    reason = "Parser helper is retained for EXPLAIN compatibility parsing coverage."
-)]
-fn find_word_start(sql: &str, mut idx: usize) -> usize {
-    let bytes = sql.as_bytes();
-    while idx > 0 && is_identifier_byte(Some(bytes[idx - 1])) {
-        idx -= 1;
-    }
-    idx
-}
-
-#[allow(
-    dead_code,
-    reason = "Parser helper is retained for EXPLAIN compatibility parsing coverage."
-)]
-fn skip_ascii_whitespace(bytes: &[u8], mut idx: usize) -> usize {
-    while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
-        idx += 1;
-    }
-    idx
-}
-
-#[allow(
-    dead_code,
-    reason = "Parser helper is retained for EXPLAIN compatibility parsing coverage."
-)]
-fn is_identifier_byte(byte: Option<u8>) -> bool {
-    byte.is_some_and(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'$'))
-}
-
-#[allow(
-    dead_code,
-    reason = "Parser helper is retained for EXPLAIN compatibility parsing coverage."
-)]
-fn find_matching_paren(sql: &str, open: usize) -> Option<usize> {
-    let bytes = sql.as_bytes();
-    if bytes.get(open) != Some(&b'(') {
-        return None;
-    }
-    let mut depth = 0usize;
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut idx = open;
-    while idx < bytes.len() {
-        let b = bytes[idx];
-        if in_single {
-            if b == b'\'' {
-                in_single = false;
-            }
-            idx += 1;
-            continue;
-        }
-        if in_double {
-            if b == b'"' {
-                in_double = false;
-            }
-            idx += 1;
-            continue;
-        }
-        match b {
-            b'\'' => in_single = true,
-            b'"' => in_double = true,
-            b'(' => depth += 1,
-            b')' => {
-                depth = depth.saturating_sub(1);
-                if depth == 0 {
-                    return Some(idx);
-                }
-            }
-            _ => {}
-        }
-        idx += 1;
-    }
-    None
 }
 
 // ---------------------------------------------------------------------------

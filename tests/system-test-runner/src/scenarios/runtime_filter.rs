@@ -673,7 +673,7 @@ fn run_ncp5_partitioned_feedback_pruning(context: &mut ScenarioContext) -> Resul
 
         rf_execute(
             control,
-            "SET enable_global_runtime_filter = false",
+            "SET SESSION enable_global_runtime_filter = false",
             deadline,
         )
         .context("disable Runtime Filter for NCP-5 baseline")?;
@@ -681,8 +681,12 @@ fn run_ncp5_partitioned_feedback_pruning(context: &mut ScenarioContext) -> Resul
             .and_then(integer_rows)
             .context("execute NCP-5 Runtime Filter disabled baseline")?;
 
-        rf_execute(control, "SET enable_global_runtime_filter = true", deadline)
-            .context("enable Runtime Filter for NCP-5 candidate")?;
+        rf_execute(
+            control,
+            "SET SESSION enable_global_runtime_filter = true",
+            deadline,
+        )
+        .context("enable Runtime Filter for NCP-5 candidate")?;
         let enabled: Vec<i64> = rf_execute(control, &query, deadline)
             .and_then(integer_rows)
             .context("execute NCP-5 Runtime Filter candidate")?;
@@ -1203,7 +1207,7 @@ fn create_runtime_filter_tables(
     create_hadoop_catalog(control, &tables.catalog, &warehouse, context.deadline())?;
     rf_execute(
         control,
-        format!("CREATE DATABASE {}.{}", tables.catalog, tables.database),
+        format!("CREATE SCHEMA {}.{}", tables.catalog, tables.database),
         deadline,
     )
     .context("create Runtime Filter scenario database")?;
@@ -1240,7 +1244,7 @@ fn create_runtime_filter_tables(
     rf_execute(
         control,
         format!(
-            "ANALYZE TABLE {}.{}.{}",
+            "ANALYZE {}.{}.{}",
             tables.catalog, tables.database, tables.probe
         ),
         deadline,
@@ -1249,7 +1253,7 @@ fn create_runtime_filter_tables(
     rf_execute(
         control,
         format!(
-            "ANALYZE TABLE {}.{}.{}",
+            "ANALYZE {}.{}.{}",
             tables.catalog, tables.database, tables.build
         ),
         deadline,
@@ -1275,7 +1279,7 @@ fn create_ncp5_pruning_tables(
     create_hadoop_catalog(control, &tables.catalog, &warehouse, context.deadline())?;
     rf_execute(
         control,
-        format!("CREATE DATABASE {}.{}", tables.catalog, tables.database),
+        format!("CREATE SCHEMA {}.{}", tables.catalog, tables.database),
         deadline,
     )
     .context("create NCP-5 database")?;
@@ -1291,7 +1295,7 @@ fn create_ncp5_pruning_tables(
     rf_execute(
         control,
         format!(
-            "ALTER TABLE {}.{}.{} SET TBLPROPERTIES ('write.parquet.row-group-size-bytes'='1024')",
+            "ALTER TABLE {}.{}.{} SET PROPERTIES parquet_writer_row_group_size = '1024B'",
             tables.catalog, tables.database, tables.probe
         ),
         deadline,
@@ -1321,7 +1325,7 @@ fn create_ncp5_pruning_tables(
     rf_execute(
         control,
         format!(
-            "INSERT INTO {}.{}.{} VALUES (3, 'Y'), (3, 'N'), (4, 'N')",
+            "INSERT INTO {}.{}.{} VALUES ROW(3, 'Y'), ROW(3, 'N'), ROW(4, 'N')",
             tables.catalog, tables.database, tables.build
         ),
         deadline,
@@ -1330,7 +1334,7 @@ fn create_ncp5_pruning_tables(
     rf_execute(
         control,
         format!(
-            "ANALYZE TABLE {}.{}.{}",
+            "ANALYZE {}.{}.{}",
             tables.catalog, tables.database, tables.probe
         ),
         deadline,
@@ -1339,7 +1343,7 @@ fn create_ncp5_pruning_tables(
     rf_execute(
         control,
         format!(
-            "ANALYZE TABLE {}.{}.{}",
+            "ANALYZE {}.{}.{}",
             tables.catalog, tables.database, tables.build
         ),
         deadline,
@@ -1355,9 +1359,9 @@ fn create_hadoop_catalog(
     warehouse: &Path,
     deadline: Instant,
 ) -> Result<()> {
-    let warehouse = warehouse.to_string_lossy().replace('"', "\\\"");
+    let warehouse = warehouse.to_string_lossy().replace('\'', "''");
     rf_execute(control, format!(
-            "CREATE EXTERNAL CATALOG {catalog} PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"hadoop\",\"iceberg.catalog.warehouse\"=\"{warehouse}\")"
+            "CREATE CATALOG {catalog} USING iceberg WITH (\"iceberg.catalog.type\" = 'hadoop', \"iceberg.catalog.warehouse\" = '{warehouse}')"
         ), deadline)
         .with_context(|| format!("create local Hadoop Iceberg catalog {catalog}"))
         .map(|_| ())
@@ -1366,7 +1370,7 @@ fn create_hadoop_catalog(
 fn configure_broadcast_runtime_filter(control: &mut SqlSession, deadline: Instant) -> Result<()> {
     configure_runtime_filter(
         control,
-        "SET cbo_broadcast_node_mem_budget_bytes = 10737418240",
+        "SET SESSION cbo_broadcast_node_mem_budget_bytes = 10737418240",
         deadline,
     )
 }
@@ -1374,7 +1378,7 @@ fn configure_broadcast_runtime_filter(control: &mut SqlSession, deadline: Instan
 fn configure_partitioned_runtime_filter(control: &mut SqlSession, deadline: Instant) -> Result<()> {
     configure_runtime_filter(
         control,
-        "SET cbo_broadcast_node_mem_budget_bytes = 0",
+        "SET SESSION cbo_broadcast_node_mem_budget_bytes = 0",
         deadline,
     )
 }
@@ -1385,10 +1389,10 @@ fn configure_runtime_filter(
     deadline: Instant,
 ) -> Result<()> {
     for setting in [
-        "SET global_runtime_filter_build_max_size = 10737418240",
-        "SET global_runtime_filter_probe_min_selectivity = 0.0",
+        "SET SESSION global_runtime_filter_build_max_size = 10737418240",
+        "SET SESSION global_runtime_filter_probe_min_selectivity = 0.0",
         join_distribution,
-        "SET disable_optimizer_rules = ''",
+        "SET SESSION disable_optimizer_rules = ''",
     ] {
         rf_execute(control, setting, deadline)
             .with_context(|| format!("configure Runtime Filter setting {setting}"))?;
@@ -1413,7 +1417,10 @@ fn assert_partitioned_runtime_filter_plan(
 ) -> Result<()> {
     let explain: Vec<String> = rf_execute(
         control,
-        format!("EXPLAIN VERBOSE {}", runtime_filter_count_query(tables)),
+        format!(
+            "EXPLAIN WITH SESSION explain_detail = 'VERBOSE' {}",
+            runtime_filter_count_query(tables)
+        ),
         deadline,
     )
     .and_then(text_rows)

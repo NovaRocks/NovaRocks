@@ -53,36 +53,36 @@ fn type_metadata(ty: &FunctionValueType) -> Value {
 const ORIGINAL_SQL: &[(usize, &str)] = &[
     (
         4,
-        r#"SELECT id, json_object(k, v, 'n', n, 'b', flag, 'day', day, 'amount', amount, 'dup', v, 'dup', n) AS object_value
+        r#"SELECT id, json_object(k: v, 'n': n, 'b': flag, 'day': day, 'amount': amount, 'dup': v, 'dup': n) AS object_value
 FROM t ORDER BY id;"#,
     ),
     (
         5,
-        r#"SELECT id, json_object(k) AS odd_tail FROM t ORDER BY id;"#,
+        r#"SELECT id, json_object(k: NULL) AS odd_tail FROM t ORDER BY id;"#,
     ),
     (
         6,
-        r#"SELECT id, json_object(k, [id, n]) AS debug_value FROM t ORDER BY id;"#,
+        r#"SELECT id, json_object(k: [id, n]) AS debug_value FROM t ORDER BY id;"#,
     ),
     (
         7,
-        r#"SELECT id, json_object(k, v, 'n', n) AS selected_value FROM t WHERE id IN (1, 3, 5) ORDER BY id;"#,
+        r#"SELECT id, json_object(k: v, 'n': n) AS selected_value FROM t WHERE id IN (1, 3, 5) ORDER BY id;"#,
     ),
     (
         8,
-        r#"SELECT id, json_object(k, v) AS empty_value FROM t WHERE id < 0 ORDER BY id;"#,
+        r#"SELECT id, json_object(k: v) AS empty_value FROM t WHERE id < 0 ORDER BY id;"#,
     ),
     (
         9,
-        r#"SELECT json_object(IF(id = 2, NULL, [id, n]), n) AS complex_key FROM t WHERE id = 1;"#,
+        r#"SELECT json_object(IF(id = 2, NULL, [id, n]): n) AS complex_key FROM t WHERE id = 1;"#,
     ),
     (
         10,
-        r#"SELECT id FROM (SELECT id, json_object(IF(id = 2, NULL, [id, n]), n) AS unused_error FROM t) s ORDER BY id;"#,
+        r#"SELECT id FROM (SELECT id, json_object(IF(id = 2, NULL, [id, n]): n) AS unused_error FROM t) s ORDER BY id;"#,
     ),
     (
         11,
-        r#"SELECT id FROM (SELECT id, json_object(IF(id = 2, NULL, [id, n]), n) AS unused_error FROM t) s WHERE id = 2 ORDER BY id;"#,
+        r#"SELECT id FROM (SELECT id, json_object(IF(id = 2, NULL, [id, n]): n) AS unused_error FROM t) s WHERE id = 2 ORDER BY id;"#,
     ),
 ];
 

@@ -34,28 +34,11 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE EXTERNAL CATALOG mvsc_${uuid0}
-PROPERTIES (
-  "type" = "iceberg",
-  "iceberg.catalog.type" = "rest",
-  "uri" = "${iceberg_rest_uri}",
-  "warehouse" = "${iceberg_rest_warehouse}",
-  "credential.object-store-metadata.consumer-role" = "frontend",
-  "credential.object-store-metadata.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-metadata.name" = "${iceberg_object_store_metadata_credential_name}",
-  "credential.object-store-metadata.generation" = "${iceberg_object_store_credential_generation}",
-  "credential.object-store-data.consumer-role" = "backend",
-  "credential.object-store-data.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-data.name" = "${iceberg_object_store_data_credential_name}",
-  "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
-  "aws.s3.endpoint" = "${oss_endpoint}",
-  "aws.s3.region" = "${oss_region}",
-  "aws.s3.enable_path_style_access" = "${oss_path_style}"
-);
+CREATE CATALOG mvsc_${uuid0} USING iceberg WITH ("iceberg.catalog.type" = 'rest', "uri" = '${iceberg_rest_uri}', "warehouse" = '${iceberg_rest_warehouse}', "credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-metadata.name" = '${iceberg_object_store_metadata_credential_name}', "credential.object-store-metadata.generation" = '${iceberg_object_store_credential_generation}', "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-data.name" = '${iceberg_object_store_data_credential_name}', "credential.object-store-data.generation" = '${iceberg_object_store_credential_generation}', "aws.s3.endpoint" = '${oss_endpoint}', "aws.s3.region" = '${oss_region}', "aws.s3.enable_path_style_access" = '${oss_path_style}');
 
 -- query 2
 -- @skip_result_check=true
-CREATE DATABASE mvsc_${uuid0}.ns_${uuid0};
+CREATE SCHEMA mvsc_${uuid0}.ns_${uuid0};
 
 -- query 3
 -- @skip_result_check=true
@@ -63,7 +46,7 @@ CREATE TABLE mvsc_${uuid0}.ns_${uuid0}.moves (
   account STRING,
   peer STRING,
   amount BIGINT
-) TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+) WITH (format_version = 3);
 
 -- query 4
 -- @skip_result_check=true
@@ -72,7 +55,7 @@ CREATE TABLE mvsc_${uuid0}.ns_${uuid0}.moves (
 -- one, which keeps the numbers below about the pins rather than about join
 -- multiplicity.
 INSERT INTO mvsc_${uuid0}.ns_${uuid0}.moves VALUES
-  ('a', 'b', 10), ('b', 'c', 4), ('c', 'a', 6);
+  ROW('a', 'b', 10), ROW('b', 'c', 4), ROW('c', 'a', 6);
 
 -- query 5
 -- @skip_result_check=true
@@ -84,11 +67,7 @@ USE mvsc_${uuid0}.ns_${uuid0};
 -- query 7
 -- Two occurrences of `moves`: outgoing and the incoming it is matched against.
 -- @skip_result_check=true
-CREATE MATERIALIZED VIEW move_balance
-DISTRIBUTED BY HASH(account) BUCKETS 1
-REFRESH DEFERRED MANUAL
-PROPERTIES ('storage_engine' = 'iceberg')
-AS SELECT out.account AS account, SUM(out.amount) AS sent, SUM(inb.amount) AS received
+CREATE MATERIALIZED VIEW move_balance WITH (refresh_policy = 'MANUAL') AS SELECT out.account AS account, SUM(out.amount) AS sent, SUM(inb.amount) AS received
 FROM moves out JOIN moves inb ON out.account = inb.peer
 GROUP BY out.account;
 
@@ -103,7 +82,7 @@ SELECT * FROM system.runtime.materialized_view_states WHERE catalog_name = 'mvsc
 -- query 9
 -- @skip_result_check=true
 USE mvsc_${uuid0}.ns_${uuid0};
-REFRESH MATERIALIZED VIEW move_balance WITH SYNC MODE;
+REFRESH MATERIALIZED VIEW move_balance;
 
 -- query 10
 -- `a` sent 10 and received 6, `b` sent 4 and received 10, `c` sent 6 and
@@ -117,8 +96,8 @@ ORDER BY account;
 -- @skip_result_check=true
 USE mvsc_${uuid0}.ns_${uuid0};
 DROP MATERIALIZED VIEW move_balance;
-DROP TABLE mvsc_${uuid0}.ns_${uuid0}.moves FORCE;
-DROP DATABASE mvsc_${uuid0}.ns_${uuid0};
+DROP TABLE mvsc_${uuid0}.ns_${uuid0}.moves ;
+DROP SCHEMA mvsc_${uuid0}.ns_${uuid0};
 -- Dropping the attachment matters: two attachments onto one warehouse make the
 -- same physical MV discoverable under two catalog names, and its management
 -- binds to whichever attachment discovered it first -- so the next case's

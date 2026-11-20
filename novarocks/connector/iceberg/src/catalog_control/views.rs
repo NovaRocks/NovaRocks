@@ -27,7 +27,7 @@ use crate::catalog::CatalogNamespaceName;
 use crate::catalog::CatalogTableName;
 #[cfg(test)]
 use crate::catalog::error::CatalogOutcome;
-pub(crate) use crate::catalog::view_request::VIEW_DIALECT_STARROCKS;
+pub(crate) use crate::catalog::view_request::VIEW_DIALECT_TRINO;
 use crate::catalog::view_request::ViewDefinition;
 #[cfg(test)]
 use crate::catalog::view_request::{ValidatedViewReplace, ViewCreate};
@@ -77,7 +77,7 @@ fn view_ident(namespace: &str, view: &str) -> Result<(NamespaceIdent, TableIdent
 fn novarocks_source_context(
     definition: &ConnectorViewDefinition,
 ) -> Result<(String, NamespaceIdent), String> {
-    if definition.dialect != ConnectorViewDialect::StarRocks {
+    if definition.dialect != ConnectorViewDialect::Trino {
         return Err("unsupported SQL dialect for NovaRocks Iceberg view creation".to_string());
     }
     if definition.raw_sql.is_empty() {
@@ -379,18 +379,23 @@ pub(crate) fn materialize_view_metadata(
                 "Iceberg view current version is absent from its same metadata observation",
             )
         })?;
-    let selected = version
-        .representations()
-        .iter()
-        .map(|representation| {
+    let representations = || {
+        version.representations().iter().map(|representation| {
             let ViewRepresentation::Sql(sql) = representation;
             sql
         })
-        .find(|sql| sql.dialect.eq_ignore_ascii_case(VIEW_DIALECT_STARROCKS))
+    };
+    let selected = representations()
+        .find(|sql| sql.dialect.eq_ignore_ascii_case(VIEW_DIALECT_TRINO))
         .ok_or_else(|| {
+            let available = representations()
+                .map(|sql| sql.dialect.as_str())
+                .collect::<std::collections::BTreeSet<_>>();
             ConnectorError::new(
                 ConnectorErrorKind::Unsupported,
-                format!("Iceberg view {ident} has no supported SQL representation"),
+                format!(
+                    "Iceberg view {ident} has no supported SQL representation for dialect '{VIEW_DIALECT_TRINO}'; available dialects: {available:?}"
+                ),
             )
         })?;
     let schema = metadata.schema_by_id(version.schema_id()).ok_or_else(|| {
@@ -411,7 +416,7 @@ pub(crate) fn materialize_view_metadata(
     ConnectorViewMetadataValue::try_new(
         request.view,
         ConnectorViewDefinition {
-            dialect: ConnectorViewDialect::StarRocks,
+            dialect: ConnectorViewDialect::Trino,
             raw_sql: selected.sql.as_str().into(),
             default_catalog: version.default_catalog().map(|value| value.as_str().into()),
             default_namespace: version
@@ -605,7 +610,7 @@ mod tests {
 
     pub(super) fn novarocks_definition(raw_sql: &str) -> ConnectorViewDefinition {
         ConnectorViewDefinition {
-            dialect: ConnectorViewDialect::StarRocks,
+            dialect: ConnectorViewDialect::Trino,
             raw_sql: raw_sql.into(),
             default_catalog: Some("source_catalog".into()),
             default_namespace: "source_namespace".into(),
@@ -820,7 +825,7 @@ mod tests {
                             "timestamp-ms": 1_600_000_000_000i64,
                             "summary": {"engine-name": "novarocks"},
                             "representations": [
-                                {"type": "sql", "sql": "select 1 as a", "dialect": "starrocks"},
+                                {"type": "sql", "sql": "select 1 as a", "dialect": "trino"},
                                 {"type": "sql", "sql": "select 1 as a", "dialect": "spark"}
                             ],
                             "default-namespace": ["db"]
@@ -1395,7 +1400,7 @@ mod declaration_tests {
             "location":"s3://warehouse/db/v", "current-version-id":version,
             "versions":[{"version-id":version, "schema-id":definition.schema.schema_id(),
                 "timestamp-ms":1_600_000_000_000_i64, "summary":definition.summary,
-                "representations":[{"type":"sql", "sql":definition.sql, "dialect":"starrocks"}],
+                "representations":[{"type":"sql", "sql":definition.sql, "dialect":"trino"}],
                 "default-catalog":definition.default_catalog,
                 "default-namespace":definition.default_namespace}],
             "version-log":[{"version-id":version,"timestamp-ms":1_600_000_000_000_i64}],
@@ -1428,6 +1433,12 @@ mod declaration_tests {
                 .unwrap()
                 .into_parts();
         assert_eq!(schema.schema_id(), version.schema_id);
+        assert_eq!(version.representations.len(), 1);
+        assert_eq!(version.representations[0].dialect, "trino");
+        assert_eq!(
+            version.representations[0].sql,
+            "SELECT  /* exact source */ CAST(NULL AS integer) AS a"
+        );
         assert!(schema.as_struct().fields()[0].required);
         let observed = load(&metadata(stored, 1)).unwrap();
         assert_eq!(
@@ -1448,6 +1459,58 @@ mod declaration_tests {
             FunctionValueType::new(DataType::Int32, true)
         );
     }
+    #[test]
+    fn stored_view_selects_the_trino_representation_case_insensitively() {
+        let stored = prepared(FunctionValueType::new(DataType::Int32, true));
+        let mut json = serde_json::to_value(metadata(stored, 1)).unwrap();
+        let version = &mut json["versions"][0];
+        version["representations"] = serde_json::json!([
+            {"type": "sql", "dialect": "starrocks", "sql": "SELECT 9 AS a"},
+            {"type": "sql", "dialect": "TrInO", "sql": "SELECT  /* authored */ 1 AS a"},
+            {"type": "sql", "dialect": "spark", "sql": "SELECT 8 AS a"}
+        ]);
+        version.as_object_mut().unwrap().remove("default-catalog");
+        let metadata: ViewMetadata = serde_json::from_value(json).unwrap();
+        let observed = load(&metadata).unwrap();
+        assert_eq!(observed.definition.dialect, ConnectorViewDialect::Trino);
+        assert_eq!(
+            observed.definition.raw_sql.as_ref(),
+            "SELECT  /* authored */ 1 AS a"
+        );
+        assert_eq!(observed.definition.default_catalog, None);
+        assert_eq!(
+            observed.definition.default_namespace.as_ref(),
+            "source_namespace"
+        );
+    }
+
+    #[test]
+    fn stored_view_rejects_foreign_sql_representations_with_available_dialects() {
+        let stored = prepared(FunctionValueType::new(DataType::Int32, true));
+        let mut json = serde_json::to_value(metadata(stored, 1)).unwrap();
+        for dialects in [vec!["starrocks"], vec!["starrocks", "Spark"]] {
+            json["versions"][0]["representations"] = serde_json::json!(
+                dialects
+                    .iter()
+                    .map(|dialect| serde_json::json!({
+                        "type": "sql", "dialect": dialect, "sql": "SELECT 9 AS a",
+                    }))
+                    .collect::<Vec<_>>()
+            );
+            let metadata: ViewMetadata = serde_json::from_value(json.clone()).unwrap();
+            let error = load(&metadata).unwrap_err();
+            assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+            assert!(
+                error
+                    .message()
+                    .contains("no supported SQL representation for dialect 'trino'")
+            );
+            for dialect in dialects {
+                assert!(error.message().contains(dialect));
+            }
+        }
+    }
+
     #[test]
     fn standard_view_types_do_not_require_an_engine_or_private_type_summary() {
         for value in [

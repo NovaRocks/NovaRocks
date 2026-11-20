@@ -32,44 +32,28 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE EXTERNAL CATALOG br_rl_${uuid0}
-PROPERTIES (
-  "type" = "iceberg",
-  "iceberg.catalog.type" = "hadoop",
-  "iceberg.catalog.warehouse" = "${iceberg_test_warehouse}/br_rl_${uuid0}",
-  "aws.s3.endpoint" = "${oss_endpoint}",
-  "credential.object-store-metadata.consumer-role" = "frontend",
-  "credential.object-store-metadata.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-metadata.name" = "${iceberg_object_store_metadata_credential_name}",
-  "credential.object-store-metadata.generation" = "${iceberg_object_store_credential_generation}",
-  "credential.object-store-data.consumer-role" = "backend",
-  "credential.object-store-data.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-data.name" = "${iceberg_object_store_data_credential_name}",
-  "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
-  "aws.s3.enable_path_style_access" = "${oss_path_style}"
-);
-CREATE DATABASE br_rl_${uuid0}.ns_${uuid0};
-CREATE TABLE br_rl_${uuid0}.ns_${uuid0}.brlineage (id INT, v INT)
-TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
-INSERT INTO br_rl_${uuid0}.ns_${uuid0}.brlineage VALUES (1, 10), (2, 20), (3, 30);
+CREATE CATALOG br_rl_${uuid0} USING iceberg WITH ("iceberg.catalog.type" = 'hadoop', "iceberg.catalog.warehouse" = '${iceberg_test_warehouse}/br_rl_${uuid0}', "aws.s3.endpoint" = '${oss_endpoint}', "credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-metadata.name" = '${iceberg_object_store_metadata_credential_name}', "credential.object-store-metadata.generation" = '${iceberg_object_store_credential_generation}', "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-data.name" = '${iceberg_object_store_data_credential_name}', "credential.object-store-data.generation" = '${iceberg_object_store_credential_generation}', "aws.s3.enable_path_style_access" = '${oss_path_style}');
+CREATE SCHEMA br_rl_${uuid0}.ns_${uuid0};
+CREATE TABLE br_rl_${uuid0}.ns_${uuid0}.brlineage (id INT, v INT) WITH (format_version = 3);
+INSERT INTO br_rl_${uuid0}.ns_${uuid0}.brlineage VALUES ROW(1, 10), ROW(2, 20), ROW(3, 30);
 
 -- query 2
 -- @skip_result_check=true
 -- Tag and branch off the initial state.
-ALTER TABLE br_rl_${uuid0}.ns_${uuid0}.brlineage CREATE TAG snap0;
-ALTER TABLE br_rl_${uuid0}.ns_${uuid0}.brlineage CREATE BRANCH feat;
+ALTER TABLE br_rl_${uuid0}.ns_${uuid0}.brlineage EXECUTE create_tag(name => 'snap0', replace => false, if_not_exists => false);
+CREATE BRANCH feat IN TABLE br_rl_${uuid0}.ns_${uuid0}.brlineage;
 
 -- query 3
 -- @skip_result_check=true
 -- Mutate the branch only.
-INSERT INTO br_rl_${uuid0}.ns_${uuid0}.brlineage.branch_feat VALUES (4, 40);
-UPDATE br_rl_${uuid0}.ns_${uuid0}.brlineage.branch_feat SET v = 99 WHERE id = 2;
-DELETE FROM br_rl_${uuid0}.ns_${uuid0}.brlineage.branch_feat WHERE id = 3;
+INSERT INTO br_rl_${uuid0}.ns_${uuid0}.brlineage @feat VALUES (4, 40);
+UPDATE br_rl_${uuid0}.ns_${uuid0}.brlineage @feat SET v = 99 WHERE id = 2;
+DELETE FROM br_rl_${uuid0}.ns_${uuid0}.brlineage @feat WHERE id = 3;
 
 -- query 4
 -- main is unchanged: still 3 rows with their original row-lineage triples.
 -- @db=br_rl_${uuid0}.ns_${uuid0}
-SELECT count(*) AS n_main_rows, count(DISTINCT _row_id) AS n_main_unique
+SELECT count() AS n_main_rows, count(DISTINCT _row_id) AS n_main_unique
   FROM brlineage;
 
 -- query 5
@@ -86,7 +70,7 @@ SELECT count(*) AS n_main_diverged
 -- query 6
 -- branch_feat sees: 1 (unchanged), 2 (UPDATEd, _row_id preserved), 4 (new).
 -- @db=br_rl_${uuid0}.ns_${uuid0}
-SELECT count(*) AS n_branch_rows, count(DISTINCT _row_id) AS n_branch_unique
+SELECT count() AS n_branch_rows, count(DISTINCT _row_id) AS n_branch_unique
   FROM brlineage FOR VERSION AS OF 'feat';
 
 -- query 7
@@ -102,8 +86,8 @@ SELECT
 
 -- query 8
 -- @skip_result_check=true
-ALTER TABLE br_rl_${uuid0}.ns_${uuid0}.brlineage DROP TAG snap0;
-ALTER TABLE br_rl_${uuid0}.ns_${uuid0}.brlineage DROP BRANCH feat;
-DROP TABLE br_rl_${uuid0}.ns_${uuid0}.brlineage FORCE;
-DROP DATABASE br_rl_${uuid0}.ns_${uuid0};
+ALTER TABLE br_rl_${uuid0}.ns_${uuid0}.brlineage EXECUTE drop_tag(name => 'snap0', if_exists => false);
+DROP BRANCH feat IN TABLE br_rl_${uuid0}.ns_${uuid0}.brlineage;
+DROP TABLE br_rl_${uuid0}.ns_${uuid0}.brlineage ;
+DROP SCHEMA br_rl_${uuid0}.ns_${uuid0};
 DROP CATALOG br_rl_${uuid0};

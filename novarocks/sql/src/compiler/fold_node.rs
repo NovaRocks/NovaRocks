@@ -114,8 +114,12 @@ pub struct CarrierStep {
     pub(crate) target: FunctionValueType,
     pub(crate) decimal_overflow_policy: DecimalOverflowPolicy,
     pub(crate) allow_throw_exception: bool,
+    pub(crate) array_failure_mode: Option<novarocks_type_contract::ArrayCastFailureMode>,
 }
 impl CarrierStep {
+    pub fn array_failure_mode(&self) -> Option<novarocks_type_contract::ArrayCastFailureMode> {
+        self.array_failure_mode
+    }
     pub fn target(&self) -> &FunctionValueType {
         &self.target
     }

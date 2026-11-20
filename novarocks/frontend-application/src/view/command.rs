@@ -19,7 +19,7 @@
 
 use crate::query_execution::kernels::ViewExecutionKernel;
 use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
-use novarocks_query_application::view::{ViewRequestContext, ViewStatementResult};
+use novarocks_query_application::view::{ViewCommand, ViewRequestContext, ViewStatementResult};
 use novarocks_spi::connector::ConnectorRequestContext;
 
 #[derive(Clone)]
@@ -32,19 +32,18 @@ impl ViewCommandExecutor {
         Self { kernel }
     }
 
-    /// Execute a View command already admitted by `novarocks-parser`.
-    pub(crate) fn execute(
+    pub(crate) fn execute_command(
         &self,
-        statement: &novarocks_parser::ast::ViewStatement,
+        command: ViewCommand<'_>,
         current_catalog: Option<&str>,
         current_database: &str,
         connector_context: &ConnectorRequestContext,
     ) -> Result<StatementResult, novarocks_query_application::api::CommandError> {
         self.kernel
             .view_service()
-            .execute_statement(
+            .execute_command(
                 &crate::view::engine::FrontendViewEngine::new(self.kernel.clone()),
-                statement,
+                command,
                 ViewRequestContext {
                     current_catalog,
                     current_database,

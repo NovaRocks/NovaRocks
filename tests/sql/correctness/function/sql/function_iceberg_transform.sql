@@ -23,13 +23,12 @@
 -- query 1
 -- @skip_result_check=true
 USE ${case_db};
-CREATE TABLE t0 (c1 decimal(4,2))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE t0 (c1 decimal(4,2)) WITH (format_version = 3);
 
 -- query 2
 -- @skip_result_check=true
 USE ${case_db};
-INSERT INTO t0 VALUES (10.65);
+INSERT INTO t0 VALUES ROW(10.65);
 
 -- query 3
 USE ${case_db};

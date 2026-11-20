@@ -26,56 +26,55 @@ USE ${case_db};
 -- query 2
 -- @skip_result_check=true
 USE ${case_db};
-CREATE TABLE `test_cc` (
-  `v1` varchar(65533) NULL COMMENT "",
-  `v2` varchar(65533) NULL COMMENT "",
-  `v3` datetime NULL COMMENT "",
-  `v4` int null,
-  `v5` decimal(32, 2) null,
-  `v6` array<int> null,
-  `v7` struct<a bigint(20), b char(20)>  NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE "test_cc" (
+  "v1" varchar(65533),
+  "v2" varchar(65533),
+  "v3" datetime,
+  "v4" int ,
+  "v5" decimal(32, 2) ,
+  "v6" array<int> ,
+  "v7" ROW(a bigint(20), b char(20))
+) WITH (format_version = 3);
 
 -- query 3
 -- @skip_result_check=true
 USE ${case_db};
-insert into test_cc values('a','a', '2022-04-18 01:01:00', 1, 1.2,  [1, 2, 3], row(1, 'a'));
+insert into test_cc values ROW('a','a', '2022-04-18 01:01:00', 1, 1.2,  [1, 2, 3], row(1, 'a'));
 
 -- query 4
 -- @skip_result_check=true
 USE ${case_db};
-insert into test_cc values('a','b', '2022-04-18 02:01:00', 2, 1.3,  [2, 1, 3], row(2, 'a'));
+insert into test_cc values ROW('a','b', '2022-04-18 02:01:00', 2, 1.3,  [2, 1, 3], row(2, 'a'));
 
 -- query 5
 -- @skip_result_check=true
 USE ${case_db};
-insert into test_cc values('a','a', '2022-04-18 02:05:00', 1, 2.3,  [2, 2, 3], row(3, 'a'));
+insert into test_cc values ROW('a','a', '2022-04-18 02:05:00', 1, 2.3,  [2, 2, 3], row(3, 'a'));
 
 -- query 6
 -- @skip_result_check=true
 USE ${case_db};
-insert into test_cc values('a','b', '2022-04-18 02:15:00', 3, 3.31,  [2, 2, 3], row(4, 'a'));
+insert into test_cc values ROW('a','b', '2022-04-18 02:15:00', 3, 3.31,  [2, 2, 3], row(4, 'a'));
 
 -- query 7
 -- @skip_result_check=true
 USE ${case_db};
-insert into test_cc values('a','b', '2022-04-18 03:15:00', 1, 100.3,  [3, 1, 3], row(2, 'a'));
+insert into test_cc values ROW('a','b', '2022-04-18 03:15:00', 1, 100.3,  [3, 1, 3], row(2, 'a'));
 
 -- query 8
 -- @skip_result_check=true
 USE ${case_db};
-insert into test_cc values('c','a', '2022-04-18 03:45:00', 1, 200.3,  [2, 2, 3], row(3, 'a'));
+insert into test_cc values ROW('c','a', '2022-04-18 03:45:00', 1, 200.3,  [2, 2, 3], row(3, 'a'));
 
 -- query 9
 -- @skip_result_check=true
 USE ${case_db};
-insert into test_cc values('c','a', '2022-04-18 03:25:00', 2, 300.3,  null, row(2, 'a'));
+insert into test_cc values ROW('c','a', '2022-04-18 03:25:00', 2, 300.3,  null, row(2, 'a'));
 
 -- query 10
 -- @skip_result_check=true
 USE ${case_db};
-insert into test_cc values('c','a', '2022-04-18 03:27:00', 3, 400.3,  [3, 1, 3], null);
+insert into test_cc values ROW('c','a', '2022-04-18 03:27:00', 3, 400.3,  [3, 1, 3], null);
 
 -- query 11
 USE ${case_db};
@@ -95,7 +94,7 @@ select count(distinct 1, 2, 3, 4) from test_cc;
 
 -- query 15
 USE ${case_db};
-select /*+ new_planner_agg_stage = 3 */ count(distinct 1, 2, 3, 4) from test_cc group by v2;
+select count(distinct 1, 2, 3, 4) from test_cc group by v2;
 
 -- query 16
 USE ${case_db};
@@ -103,7 +102,7 @@ select count(distinct 1, v2) from test_cc;
 
 -- query 17
 USE ${case_db};
-select /*+ new_planner_agg_stage = 2 */ count(distinct 1, v2) from test_cc;
+select count(distinct 1, v2) from test_cc;
 
 -- query 18
 USE ${case_db};

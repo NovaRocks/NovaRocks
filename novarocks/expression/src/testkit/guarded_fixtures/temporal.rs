@@ -135,6 +135,7 @@ pub fn program(fixture: Shape, dtype: DataType) -> Fixture {
                     None,
                     normal_type.clone(),
                     ExprKind::Cast {
+                        array_failure_mode: None,
                         expr: source_expr,
                         target: normal_type.data_type().clone(),
                         decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
@@ -158,6 +159,7 @@ pub fn program(fixture: Shape, dtype: DataType) -> Fixture {
                     None,
                     normal_type.clone(),
                     ExprKind::Cast {
+                        array_failure_mode: None,
                         expr: source_expr,
                         target: normal_type.data_type().clone(),
                         decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
@@ -189,6 +191,7 @@ pub fn program(fixture: Shape, dtype: DataType) -> Fixture {
                         true,
                     ),
                     ExprKind::Cast {
+                        array_failure_mode: None,
                         expr: normal,
                         target: DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
                         decimal_overflow_policy: DecimalOverflowPolicy::ReportError,

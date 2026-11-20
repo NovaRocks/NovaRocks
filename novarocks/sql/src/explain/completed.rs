@@ -4013,9 +4013,10 @@ mod tests {
         CatalogRelationFact, CatalogRelationNeed, DEFAULT_COMPLETION_LIMITS,
         ProviderReadColumnFact, ProviderReadFact, ProviderReadLimitFact, ProviderReadPredicateFact,
         ProviderReadProperties, ProviderReadRequestBinding, SessionOptimizerSettings,
-        SqlCompilation, SqlCompileControl, SqlCompileIntent, SqlCompileProgress, SqlCompiler,
-        SqlFactBatch, SqlFinalPlanCompileRequest, SqlPlanningEnvironment, SqlSessionContext,
-        SqlStatementInput, StatisticsFact, builtin_sql_function_catalog, noop_constant_evaluator,
+        SqlCompilation, SqlCompileControl, SqlCompileIntent, SqlCompileProgress,
+        SqlCompileProgressError, SqlCompiler, SqlFactBatch, SqlFinalPlanCompileRequest,
+        SqlPlanningEnvironment, SqlSessionContext, SqlStatementInput, StatisticsFact,
+        builtin_sql_function_catalog, noop_constant_evaluator,
     };
     use crate::planner::table::{
         ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity, SqlTableVersionSelector, TableDef,
@@ -4063,16 +4064,125 @@ mod tests {
     }
 
     fn completed_sql(sql: &str, intent: SqlCompileIntent, version_byte: u8) -> SqlCompletedPlan {
-        let request = request(sql, intent, version_byte)
-            .try_into_completion()
-            .expect("completion request");
         let SqlCompileProgress::Complete(completed) =
-            SqlCompiler::start(request, &crate::compiler::SqlCompileControl::unbounded())
-                .expect("completed values plan")
+            complete_sql_progress(sql, intent, version_byte).expect("completed values plan")
         else {
             panic!("VALUES must not require external facts");
         };
         completed
+    }
+
+    fn complete_sql_progress(
+        sql: &str,
+        intent: SqlCompileIntent,
+        version_byte: u8,
+    ) -> Result<SqlCompileProgress, SqlCompileProgressError> {
+        let request = request(sql, intent, version_byte)
+            .try_into_completion()
+            .map_err(SqlCompileProgressError::Compile)?;
+        SqlCompiler::start(request, &SqlCompileControl::unbounded())
+    }
+
+    /// Deep legal source must exit through the original compiler result or its
+    /// existing physical expression-depth admission, including ordinary drop.
+    #[test]
+    fn deep_scalar_source_returns_a_plan_or_the_existing_physical_depth_error() {
+        use crate::compiler::CompletionProtocolError;
+        use novarocks_expression_contract::UnitError;
+        use novarocks_failure_contract::{FailureClass, FailureProjection, domain};
+        use novarocks_physical_plan::{ValidationErrorCategory, ValidationErrors};
+        use novarocks_type_contract::ExpressionControlFlowError;
+
+        fn original_depth_rejection(message: &str) -> bool {
+            let prefix = "physical plan retains 1 validation error(s); [resource-limit] fragments[";
+            let Some(rest) = message.strip_prefix(prefix) else {
+                return false;
+            };
+            let Some((fragment, detail)) = rest.split_once("].expressions: ") else {
+                return false;
+            };
+            !fragment.is_empty()
+                && fragment.bytes().all(|byte| byte.is_ascii_digit())
+                && detail
+                    == format!(
+                        "expression semantic depth exceeds {}",
+                        novarocks_physical_plan::PlanLimits::FROZEN.expression_semantic_depth
+                    )
+        }
+
+        const DEPTH: usize = 5_000;
+        let baseline = completed_sql(
+            "SELECT abs(x) AS result FROM (VALUES (1)) AS t(x)",
+            SqlCompileIntent::Query,
+            7,
+        );
+        let expected = baseline.plan().result_port().expect("baseline result port");
+        assert_eq!(expected.fields.len(), 1);
+        assert_eq!(expected.fields[0].alias.as_deref(), Some("result"));
+        let sql = format!(
+            "SELECT {}x{} AS result FROM (VALUES (1)) AS t(x)",
+            "abs(".repeat(DEPTH),
+            ")".repeat(DEPTH),
+        );
+        // A self-contained query can reach physical validation while preparing
+        // the first completion step, before start consumes that step.
+        let result = complete_sql_progress(&sql, SqlCompileIntent::Query, 7);
+        match result {
+            Ok(SqlCompileProgress::Complete(completed)) => {
+                let actual = completed.plan().result_port().expect("deep result port");
+                assert_eq!(actual.fields.len(), expected.fields.len());
+                assert_eq!(actual.fields[0].alias, expected.fields[0].alias);
+                assert_eq!(actual.fields[0].ty, expected.fields[0].ty);
+                eprintln!(
+                    "Deep source completed with {} fragment(s)",
+                    completed.plan().fragments().len()
+                );
+                drop(completed);
+            }
+            Err(SqlCompileProgressError::Compile(SqlCompileError::CompilationSource(source))) => {
+                let unit_depth = ExpressionControlFlowError::TooDeep.failure_fact();
+                if source.failure_fact() == unit_depth {
+                    return;
+                }
+                if matches!(
+                    source.downcast_ref::<UnitError>(),
+                    Some(UnitError::Resource(
+                        "expression semantic depth exceeds the caller limit"
+                    ))
+                ) {
+                    assert_eq!(source.failure_fact().class(), FailureClass::Resource);
+                    assert_eq!(
+                        source.failure_fact().reason().domain(),
+                        domain::EXPRESSION_CONTRACT.get()
+                    );
+                    return;
+                }
+                let errors = source
+                    .downcast_ref::<ValidationErrors>()
+                    .unwrap_or_else(|| panic!("unexpected deep-source compiler cause: {source:?}"));
+                let [error] = errors.errors() else {
+                    panic!("expected one original physical depth refusal: {errors}");
+                };
+                assert_eq!(error.category(), ValidationErrorCategory::ResourceLimit);
+                assert_eq!(source.failure_fact().class(), FailureClass::Resource);
+                assert_eq!(
+                    source.failure_fact().reason().domain(),
+                    domain::PHYSICAL_PLAN.get()
+                );
+                assert!(original_depth_rejection(&errors.to_string()), "{errors}");
+            }
+            Err(SqlCompileProgressError::Protocol(CompletionProtocolError::PlanValidation(
+                message,
+            ))) => {
+                assert!(original_depth_rejection(&message), "{message}");
+                eprintln!("Deep source rejected at original physical admission: {message}");
+            }
+            Ok(SqlCompileProgress::Incomplete(_)) => {
+                panic!("self-contained source requires no external facts")
+            }
+            Err(error) => panic!("unexpected deep-source compiler error: {error}"),
+        }
+        drop(baseline);
     }
 
     /// Shapes that generated SQL actually produces at scale.
@@ -4129,37 +4239,58 @@ mod tests {
         ]
     }
 
-    /// A chain wide enough to exhaust the stack is refused, not aborted on.
-    ///
-    /// The engine cannot report a stack overflow: it aborts the process rather
-    /// than unwinding. So the width that would get there has to be an error a
-    /// client can see, raised before the walks that would consume the stack.
+    /// Ordinary wide AND/OR chains complete on a bounded planning stack.
+    /// The 20,000-term witness also reaches the original typed control limit
+    /// when its physical expression unit exceeds the reference budget.
     #[test]
-    fn an_unboundedly_wide_boolean_chain_is_refused_rather_than_aborted_on() {
-        // Parsing and analysis now keep this chain shallow enough to reject it
-        // on a bounded planning stack.
+    fn wide_boolean_chains_compile_through_the_original_complete_pipeline() {
         std::thread::Builder::new()
             .stack_size(8 * 1024 * 1024)
-            .spawn(check_wide_boolean_chain_is_refused)
+            .spawn(check_wide_boolean_chains_compile)
             .expect("spawn")
             .join()
-            .expect("refusal thread");
+            .expect("wide Boolean compilation thread");
     }
 
-    fn check_wide_boolean_chain_is_refused() {
-        let conjuncts = (0..crate::analyzer::MAX_BOOLEAN_CHAIN_OPERANDS + 1)
-            .map(|i| format!("c0 <> {i}"))
-            .collect::<Vec<_>>()
-            .join(" AND ");
-        let sql = format!("SELECT c0 FROM (VALUES (1, 2)) AS t(c0, c1) WHERE {conjuncts}");
-        let error = match request(&sql, SqlCompileIntent::Query, 7).try_into_completion() {
-            Ok(_) => panic!("a chain this wide must be refused"),
-            Err(error) => error,
-        };
-        assert!(
-            format!("{error:?}").contains("exceeds the supported maximum"),
-            "{error:?}"
+    fn check_wide_boolean_chains_compile() {
+        use novarocks_failure_contract::FailureProjection;
+        use novarocks_type_contract::ExpressionControlFlowError;
+
+        let baseline = completed_sql(
+            "SELECT c0 FROM (VALUES (1, 2)) AS t(c0, c1)",
+            SqlCompileIntent::Query,
+            7,
         );
+        let expected = baseline.plan().result_port().expect("baseline result port");
+        assert_eq!(expected.fields.len(), 1);
+        for (keyword, count) in [("AND", 4_097), ("OR", 4_097), ("OR", 20_000)] {
+            let conditions = (0..count)
+                .map(|index| format!("c0 <> {index}"))
+                .collect::<Vec<_>>()
+                .join(&format!(" {keyword} "));
+            let sql = format!("SELECT c0 FROM (VALUES (1, 2)) AS t(c0, c1) WHERE {conditions}");
+            let completed = match complete_sql_progress(&sql, SqlCompileIntent::Query, 7) {
+                Ok(SqlCompileProgress::Complete(completed)) => completed,
+                Err(SqlCompileProgressError::Compile(SqlCompileError::CompilationSource(
+                    source,
+                ))) if count == 20_000 => {
+                    assert_eq!(
+                        source.failure_fact(),
+                        ExpressionControlFlowError::TooManyItems.failure_fact()
+                    );
+                    continue;
+                }
+                _ => panic!("expected a completed {keyword} plan at {count} terms"),
+            };
+            let physical = completed.plan();
+            assert!(!physical.fragments().is_empty(), "{keyword}");
+            let actual = physical.result_port().expect("wide result port");
+            assert_eq!(actual.fields.len(), expected.fields.len(), "{keyword}");
+            assert_eq!(actual.fields[0].name, expected.fields[0].name, "{keyword}");
+            assert_eq!(actual.fields[0].ty, expected.fields[0].ty, "{keyword}");
+            // Both the completed product and its intermediate owners must exit.
+            drop(completed);
+        }
     }
 
     #[test]
@@ -4461,6 +4592,10 @@ mod tests {
             .next()
             .unwrap()
             .replace("${case_db}", "db");
+        let sql = sql
+            .trim()
+            .strip_suffix(';')
+            .expect("one terminated suite query");
         fn table(need: &CatalogRelationNeed) -> ResolvedAnalyzerTable {
             let relation = need.relation();
             let (binding, names) = match relation.table.as_str() {
@@ -4500,7 +4635,7 @@ mod tests {
             )
         }
         let completed = completed_external_sql_with_tables(
-            &sql,
+            sql,
             85,
             PredicateGuaranteeKind::Exact,
             SqlCompileIntent::Query,

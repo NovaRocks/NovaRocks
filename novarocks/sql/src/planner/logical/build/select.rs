@@ -60,8 +60,8 @@ impl From<ResolvedSelect> for PlanningSelect {
             has_aggregation: select.has_aggregation,
             distinct: select.distinct,
             repeat: select.repeat,
-            apply_specs: select.apply_specs,
-            predicate_apply_specs: select.predicate_apply_specs,
+            apply_specs: select.apply_specs.into_inner(),
+            predicate_apply_specs: select.predicate_apply_specs.into_inner(),
         }
     }
 }

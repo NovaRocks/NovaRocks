@@ -24,15 +24,15 @@
 -- 3. Single-use CTE inline keeps a real join plan (no dedicated alias operator).
 DROP TABLE IF EXISTS ${case_db}.oq6_alias_base;
 CREATE TABLE ${case_db}.oq6_alias_base (k INT, v INT);
-INSERT INTO ${case_db}.oq6_alias_base VALUES (1, 10), (2, 20), (3, 30);
-ANALYZE TABLE ${case_db}.oq6_alias_base;
+INSERT INTO ${case_db}.oq6_alias_base VALUES ROW(1, 10), ROW(2, 20), ROW(3, 30);
+ANALYZE ${case_db}.oq6_alias_base;
 
-EXPLAIN VERBOSE
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
 SELECT s.k
 FROM (SELECT k, v FROM ${case_db}.oq6_alias_base) s
 WHERE s.v > 10;
 
-EXPLAIN VERBOSE
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
 SELECT renamed_k
 FROM (SELECT k FROM ${case_db}.oq6_alias_base) s(renamed_k)
 ORDER BY renamed_k;
@@ -41,7 +41,7 @@ SELECT renamed_k
 FROM (SELECT k FROM ${case_db}.oq6_alias_base) s(renamed_k)
 ORDER BY renamed_k;
 
-EXPLAIN VERBOSE WITH w AS (
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'  WITH w AS (
     SELECT k, v FROM ${case_db}.oq6_alias_base WHERE k < 3
 )
 SELECT count(*)

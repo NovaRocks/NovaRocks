@@ -67,15 +67,15 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
         .collect()
 }
 fn selected_sql(case: Case) -> String {
-    let (hint, rhs) = match case {
+    let (session, rhs) = match case {
         Case::Capacity => (
-            format!(" /*+ SET_VAR(query_mem_limit={CAPACITY_BYTES}) */"),
+            format!("WITH SESSION query_mem_limit = {CAPACITY_BYTES} "),
             "big_rhs",
         ),
         _ => (String::new(), "rhs"),
     };
     format!(
-        "SELECT{hint} p.id, parse_json(p.txt) IN (SELECT parse_json(txt) FROM {CATALOG}.{DATABASE}.{rhs}) AS present FROM {CATALOG}.{DATABASE}.probe p ORDER BY p.id"
+        "{session}SELECT p.id, parse_json(p.txt) IN (SELECT parse_json(txt) FROM {CATALOG}.{DATABASE}.{rhs}) AS present FROM {CATALOG}.{DATABASE}.probe p ORDER BY p.id"
     )
 }
 impl Scenario for JsonMembership {
@@ -159,7 +159,7 @@ impl Scenario for JsonMembership {
             SqlSession::new(context.sql_user(), context.trino_port(), context.deadline())?;
         let warehouse = create_warehouse(context, "json-mark")?;
         create_catalog(&mut control, CATALOG, &warehouse)?;
-        control.execute(format!("CREATE DATABASE {CATALOG}.{DATABASE}"))?;
+        control.execute(format!("CREATE SCHEMA {CATALOG}.{DATABASE}"))?;
         control.execute(format!(
             "CREATE TABLE {CATALOG}.{DATABASE}.probe (id BIGINT, txt STRING)"
         ))?;
@@ -174,7 +174,7 @@ impl Scenario for JsonMembership {
             control.execute(format!("INSERT INTO {CATALOG}.{DATABASE}.rhs SELECT CONCAT('{{\"b\":1,\"a\":',CAST(generate_series AS STRING),'}}') FROM TABLE(generate_series({low},{high}))"))?;
         }
         control.execute(format!(
-            "INSERT INTO {CATALOG}.{DATABASE}.rhs VALUES(NULL),('{{\"b\":1,\"a\":0}}')"
+            "INSERT INTO {CATALOG}.{DATABASE}.rhs VALUES ROW(NULL), ROW('{{\"b\":1,\"a\":0}}')"
         ))?;
         if matches!(self.case, Case::Capacity) {
             seed_capacity(context, &mut control)?;
@@ -334,7 +334,7 @@ impl Scenario for JsonMembership {
         if matches!(self.case, Case::Capacity) {
             control.execute(format!("DROP TABLE {CATALOG}.{DATABASE}.big_rhs"))?;
         }
-        control.execute(format!("DROP DATABASE {CATALOG}.{DATABASE}"))?;
+        control.execute(format!("DROP SCHEMA {CATALOG}.{DATABASE}"))?;
         control.execute(format!("DROP CATALOG {CATALOG}"))?;
         Ok(())
     }
@@ -526,7 +526,7 @@ fn seed_capacity(context: &mut ScenarioContext, control: &mut SqlSession) -> Res
     // that producer. The private snapshot and frozen execution options match
     // the target. No build is retained in this independent producer control.
     let produced = control.execute(format!(
-        "SELECT /*+ SET_VAR(query_mem_limit={CAPACITY_BYTES}) */ COUNT(*), SUM(LENGTH(CAST(parse_json(txt) AS STRING))) FROM {CATALOG}.{DATABASE}.big_rhs"))?;
+        "WITH SESSION query_mem_limit = {CAPACITY_BYTES} SELECT COUNT(*), SUM(LENGTH(CAST(parse_json(txt) AS STRING))) FROM {CATALOG}.{DATABASE}.big_rhs"))?;
     require_result_types(&produced, &["bigint", "bigint"])?;
     // Original renderer syntax has 22 bytes plus the decimal key digits.
     // Each source key is distinct, so the canonical set cannot collapse it.
@@ -545,7 +545,7 @@ fn seed_capacity(context: &mut ScenarioContext, control: &mut SqlSession) -> Res
     context.action("begin same-budget small mark control");
     let small = control.execute(selected_sql(Case::FullEos).replacen(
         "SELECT ",
-        &format!("SELECT /*+ SET_VAR(query_mem_limit={CAPACITY_BYTES}) */ "),
+        &format!("WITH SESSION query_mem_limit = {CAPACITY_BYTES} SELECT "),
         1,
     ))?;
     require_membership_result(&small, "same-budget small RHS")?;

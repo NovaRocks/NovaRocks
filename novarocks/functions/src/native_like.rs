@@ -14,10 +14,12 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//! Original Unicode/backslash LIKE math. No arena, decoder or environment.
-//! Observation grants no capacity; raw wrappers preserve full legacy errors.
+//! Unicode LIKE matching shared by native predicates and the explicit ESCAPE function.
 use arrow_array::{Array, ArrayRef, BooleanArray, StringArray};
-use std::{convert::Infallible, sync::Arc};
+use std::{convert::Infallible, fmt, sync::Arc};
+
+pub const ESCAPE_FUNCTION_NAME: &str = "__like_with_escape";
+
 #[derive(Clone, Copy, Debug)]
 pub enum LikeObservation {
     Step,
@@ -26,8 +28,38 @@ pub enum LikeObservation {
 #[derive(Debug)]
 pub enum LikeError<E> {
     Operation(crate::KernelFailure),
+    Pattern(LikePatternError),
     Host(E),
 }
+
+#[derive(Debug)]
+pub enum LikePatternError {
+    EscapeLength,
+    InvalidEscape,
+}
+
+impl fmt::Display for LikePatternError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::EscapeLength => "Escape string must be a single character",
+            Self::InvalidEscape => {
+                "Escape character must be followed by '%', '_' or the escape character itself"
+            }
+        })
+    }
+}
+impl std::error::Error for LikePatternError {}
+impl novarocks_failure_contract::FailureProjection for LikePatternError {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::{FailureClass, FailureFact};
+        FailureFact::new(
+            FailureClass::Data,
+            novarocks_function_contract::kernel_failure::INVALID_FUNCTION_ARGUMENT,
+        )
+    }
+}
+impl novarocks_failure_contract::OuterFailureProjection for LikePatternError {}
+
 fn event<E>(
     observe: &mut dyn FnMut(LikeObservation) -> Result<(), E>,
     e: LikeObservation,
@@ -42,6 +74,7 @@ fn required<T>(
     match run(&mut |_| Ok(())) {
         Ok(v) => Ok(v),
         Err(LikeError::Operation(cause)) => Err(cause),
+        Err(LikeError::Pattern(cause)) => Err(crate::KernelFailure::from_domain(cause)),
         Err(LikeError::Host(never)) => match never {},
     }
 }
@@ -53,76 +86,104 @@ pub fn like_match_observed<E>(
     pattern: &str,
     observe: &mut dyn FnMut(LikeObservation) -> Result<(), E>,
 ) -> Result<bool, LikeError<E>> {
-    event(observe, LikeObservation::OpaqueBoundary)?;
-    // One original chars decoder; observation is injected into this iterator.
-    let text_chars: Vec<char> = text
-        .chars()
-        .map(|c| {
-            event(observe, LikeObservation::Step)?;
-            Ok(c)
-        })
-        .collect::<Result<_, LikeError<E>>>()?;
-    event(observe, LikeObservation::OpaqueBoundary)?;
-    let pattern_chars: Vec<char> = pattern
-        .chars()
-        .map(|c| {
-            event(observe, LikeObservation::Step)?;
-            Ok(c)
-        })
-        .collect::<Result<_, LikeError<E>>>()?;
-    event(observe, LikeObservation::OpaqueBoundary)?;
-    like_match_recursive(&text_chars, 0, &pattern_chars, 0, observe)
+    match_observed(text, pattern, None, observe)
 }
-fn match_literal<E>(
-    text: &[char],
-    text_idx: usize,
-    pattern: &[char],
-    next_pattern_idx: usize,
-    literal: char,
+
+pub(crate) fn like_with_escape_observed<E>(
+    text: &str,
+    pattern: &str,
+    escape: &str,
     observe: &mut dyn FnMut(LikeObservation) -> Result<(), E>,
 ) -> Result<bool, LikeError<E>> {
-    if text_idx >= text.len() || text[text_idx] != literal {
-        return Ok(false);
-    }
-    like_match_recursive(text, text_idx + 1, pattern, next_pattern_idx, observe)
+    let mut chars = escape.chars();
+    let Some(escape) = chars
+        .next()
+        .filter(|c| c.len_utf16() == 1 && chars.next().is_none())
+    else {
+        return Err(LikeError::Pattern(LikePatternError::EscapeLength));
+    };
+    match_observed(text, pattern, Some(escape), observe)
 }
-fn like_match_recursive<E>(
-    text: &[char],
-    text_idx: usize,
-    pattern: &[char],
-    pattern_idx: usize,
+
+#[derive(Clone, Copy)]
+enum PatternToken {
+    Literal(char),
+    AnyOne,
+    AnySequence,
+}
+
+fn parse_pattern<E>(
+    pattern: &str,
+    escape: Option<char>,
     observe: &mut dyn FnMut(LikeObservation) -> Result<(), E>,
-) -> Result<bool, LikeError<E>> {
-    event(observe, LikeObservation::Step)?;
-    if pattern_idx >= pattern.len() {
-        return Ok(text_idx >= text.len());
-    }
-    match pattern[pattern_idx] {
-        '%' => {
-            if like_match_recursive(text, text_idx, pattern, pattern_idx + 1, observe)? {
-                return Ok(true);
+) -> Result<Vec<PatternToken>, LikeError<E>> {
+    let mut tokens = Vec::new();
+    let mut chars = pattern.chars();
+    while let Some(character) = chars.next() {
+        event(observe, LikeObservation::Step)?;
+        let token = if Some(character) == escape {
+            let escaped = chars
+                .next()
+                .filter(|escaped| matches!(*escaped, '%' | '_') || *escaped == character)
+                .ok_or(LikeError::Pattern(LikePatternError::InvalidEscape))?;
+            event(observe, LikeObservation::Step)?;
+            PatternToken::Literal(escaped)
+        } else {
+            match character {
+                '%' => PatternToken::AnySequence,
+                '_' => PatternToken::AnyOne,
+                _ => PatternToken::Literal(character),
             }
-            for i in text_idx..text.len() {
-                if like_match_recursive(text, i + 1, pattern, pattern_idx + 1, observe)? {
-                    return Ok(true);
+        };
+        if tokens.len() == tokens.capacity() {
+            event(observe, LikeObservation::OpaqueBoundary)?;
+            tokens
+                .try_reserve(1)
+                .map_err(|_| LikeError::Operation(crate::KernelFailure::ResourceExhausted))?;
+            event(observe, LikeObservation::OpaqueBoundary)?;
+        }
+        tokens.push(token);
+    }
+    Ok(tokens)
+}
+
+fn match_observed<E>(
+    text: &str,
+    pattern: &str,
+    escape: Option<char>,
+    observe: &mut dyn FnMut(LikeObservation) -> Result<(), E>,
+) -> Result<bool, LikeError<E>> {
+    // Validate the whole pattern even when a mismatch at the start of the
+    // input would be sufficient to decide the match.
+    let tokens = parse_pattern(pattern, escape, observe)?;
+    let mut text = text.chars();
+    let mut pattern_index = 0;
+    let mut wildcard = None;
+    loop {
+        event(observe, LikeObservation::Step)?;
+        match tokens.get(pattern_index).copied() {
+            Some(PatternToken::AnySequence) => {
+                pattern_index += 1;
+                wildcard = Some((pattern_index, text.clone()));
+            }
+            Some(PatternToken::AnyOne) if text.next().is_some() => pattern_index += 1,
+            Some(PatternToken::Literal(literal)) if text.next() == Some(literal) => {
+                pattern_index += 1;
+            }
+            None if text.as_str().is_empty() => return Ok(true),
+            _ => {
+                // Retry the suffix after the most recent '%' with one more
+                // input code point consumed by that wildcard.
+                let Some((resume_pattern, resume_text)) = &mut wildcard else {
+                    return Ok(false);
+                };
+                if resume_text.next().is_none() {
+                    return Ok(false);
                 }
+                pattern_index = *resume_pattern;
+                text = resume_text.clone();
             }
-            Ok(false)
         }
-        '_' => {
-            if text_idx >= text.len() {
-                return Ok(false);
-            }
-            like_match_recursive(text, text_idx + 1, pattern, pattern_idx + 1, observe)
-        }
-        '\\' => {
-            if pattern_idx + 1 >= pattern.len() {
-                return match_literal(text, text_idx, pattern, pattern_idx + 1, '\\', observe);
-            }
-            let escaped = pattern[pattern_idx + 1];
-            match_literal(text, text_idx, pattern, pattern_idx + 2, escaped, observe)
-        }
-        c => match_literal(text, text_idx, pattern, pattern_idx + 1, c, observe),
     }
 }
 fn row_observed<E>(
@@ -386,6 +447,7 @@ impl PreparedNativeLikeRecipe {
                 .map_err(|error| match error {
                     LikeError::Host(cause) => cause,
                     LikeError::Operation(cause) => cause,
+                    LikeError::Pattern(cause) => KernelFailure::from_domain(cause),
                 })?;
                 values.push(value);
                 work.step()?;

@@ -30,30 +30,27 @@ DROP TABLE IF EXISTS ${case_db}.t_join_chain_c;
 CREATE TABLE ${case_db}.t_join_chain_a (
   id INT,
   av STRING
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 CREATE TABLE ${case_db}.t_join_chain_b (
   id INT,
   mid INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 CREATE TABLE ${case_db}.t_join_chain_c (
   mid INT,
   cv STRING
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 INSERT INTO ${case_db}.t_join_chain_a VALUES
-  (1, 'A1'),
-  (2, 'A2'),
-  (3, 'A3');
+  ROW(1, 'A1'),
+  ROW(2, 'A2'),
+  ROW(3, 'A3');
 INSERT INTO ${case_db}.t_join_chain_b VALUES
-  (1, 10),
-  (2, 20),
-  (4, 40);
+  ROW(1, 10),
+  ROW(2, 20),
+  ROW(4, 40);
 INSERT INTO ${case_db}.t_join_chain_c VALUES
-  (10, 'C10'),
-  (20, 'C20'),
-  (30, 'C30');
+  ROW(10, 'C10'),
+  ROW(20, 'C20'),
+  ROW(30, 'C30');
 SELECT a.id, a.av, c.cv
 FROM ${case_db}.t_join_chain_a a
 INNER JOIN ${case_db}.t_join_chain_b b

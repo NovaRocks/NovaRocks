@@ -2130,11 +2130,7 @@ mod tests {
         }
 
         let version = PlanVersionId::try_new([83; 16]).expect("finite component plan version");
-        let mut statements = novarocks_parser::parse("SELECT 7 AS payload").unwrap();
-        assert_eq!(statements.len(), 1);
-        let novarocks_parser::ast::Statement::Query(query) = statements.pop().unwrap() else {
-            panic!("expected one query");
-        };
+        let query = novarocks_parser::parser::parse_query("SELECT 7 AS payload").unwrap();
         let request = SqlFinalPlanCompileRequest::new(
             version,
             SqlStatementInput::parsed_query(Box::new(query)),

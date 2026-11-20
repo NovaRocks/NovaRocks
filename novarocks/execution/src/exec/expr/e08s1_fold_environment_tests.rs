@@ -24,7 +24,7 @@ fn e08s1_fold_environment_exact_missing_authors_refuse_parent_before_children() 
     for (sql, name) in [
         (
             "SELECT GROUP_CONCAT(REVERSE('abc'))",
-            "builtin.aggregate/group_concat/",
+            "builtin.aggregate/string_agg/",
         ),
         (
             "SELECT FROM_UNIXTIME(CAST(ABS(CAST(1 AS BIGINT)) AS BIGINT))",

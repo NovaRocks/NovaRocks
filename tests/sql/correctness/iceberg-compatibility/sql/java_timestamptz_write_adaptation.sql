@@ -30,8 +30,8 @@ receipt_dir="$(mktemp -d "$receipt_parent/$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")"
 -- query 2
 -- @skip_result_check=true
 INSERT INTO iceberg_compat_${suite_uuid0}.${case_db}.java_timestamptz_target_${uuid0} VALUES
- (1,'2024-01-02 03:04:05.123456',12.34,'東京',X'FF00'),
- (2,NULL,NULL,NULL,NULL);
+ ROW(1,'2024-01-02 03:04:05.123456',12.34,'東京',X'FF00'),
+ ROW(2,NULL,NULL,NULL,NULL);
 
 -- query 3
 SELECT id,CAST(ts AS VARCHAR) AS instant,d,s,hex(raw) AS raw_hex
@@ -43,12 +43,11 @@ FROM iceberg_compat_${suite_uuid0}.${case_db}.java_timestamptz_target_${uuid0} O
 -- adaptation with expressible timestamptz, decimal and string keys.
 -- query 4
 -- @skip_result_check=true
-ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_timestamptz_target_${uuid0} ADD EQUALITY DELETE (ts,d,s)
-VALUES ('2024-01-02 03:04:05.123456',12.34,'東京');
+ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_timestamptz_target_${uuid0} EXECUTE add_equality_delete(columns => ARRAY['ts', 'd', 's'], rows => ARRAY[ROW('2024-01-02 03:04:05.123456',12.34,'東京')]);
 
 -- query 5
 SELECT id FROM iceberg_compat_${suite_uuid0}.${case_db}.java_timestamptz_target_${uuid0} ORDER BY id;
 
 -- query 6
 -- @skip_result_check=true
-DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_timestamptz_target_${uuid0} FORCE;
+DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_timestamptz_target_${uuid0} ;

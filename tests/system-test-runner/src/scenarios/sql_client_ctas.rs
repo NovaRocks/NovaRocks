@@ -125,7 +125,7 @@ access_key_secret = "${ENV:NOVA_PUBLICATION_SECRET_KEY}"
                 .execute(catalog_sql(fixture))
                 .context("create isolated fenced REST CTAS catalog")?;
             client
-                .execute(format!("CREATE DATABASE {CATALOG}.ns"))
+                .execute(format!("CREATE SCHEMA {CATALOG}.ns"))
                 .context("create isolated CTAS namespace")?;
             context.action("CTAS positive: submit literal source rows [1, 3]");
             let created = client
@@ -205,18 +205,19 @@ access_key_secret = "${ENV:NOVA_PUBLICATION_SECRET_KEY}"
 
 fn catalog_sql(fixture: &PublicationFixture) -> String {
     let endpoints = fixture.rest().endpoints();
+    let sql_text = |value: &str| value.replace('\'', "''");
     format!(
-        r#"CREATE EXTERNAL CATALOG {CATALOG} PROPERTIES(
-        "type"="iceberg", "iceberg.catalog.type"="rest", "uri"="{}", "warehouse"="{}",
-        "novarocks.publication.evidence-timeout-ms"="{PUBLICATION_EVIDENCE_MS}",
-        "credential.object-store-metadata.consumer-role"="frontend", "credential.object-store-metadata.mode"="static",
-        "credential.object-store-metadata.name"="publication-fixture", "credential.object-store-metadata.generation"="v1",
-        "credential.object-store-data.consumer-role"="backend", "credential.object-store-data.mode"="static",
-        "credential.object-store-data.name"="publication-fixture", "credential.object-store-data.generation"="v1",
-        "aws.s3.endpoint"="{}", "aws.s3.region"="us-east-1", "aws.s3.enable_path_style_access"="true")"#,
-        fixture.uri(),
-        endpoints.rest_warehouse,
-        endpoints.minio_endpoint
+        r#"CREATE CATALOG {CATALOG} USING iceberg WITH (
+        "iceberg.catalog.type" = 'rest', "uri" = '{}', "warehouse" = '{}',
+        "novarocks.publication.evidence-timeout-ms" = '{PUBLICATION_EVIDENCE_MS}',
+        "credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = 'static',
+        "credential.object-store-metadata.name" = 'publication-fixture', "credential.object-store-metadata.generation" = 'v1',
+        "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = 'static',
+        "credential.object-store-data.name" = 'publication-fixture', "credential.object-store-data.generation" = 'v1',
+        "aws.s3.endpoint" = '{}', "aws.s3.region" = 'us-east-1', "aws.s3.enable_path_style_access" = 'true')"#,
+        sql_text(fixture.uri()),
+        sql_text(&endpoints.rest_warehouse),
+        sql_text(&endpoints.minio_endpoint)
     )
 }
 
@@ -225,7 +226,7 @@ fn cleanup_sql(client: &mut sql::SqlSession) -> Result<()> {
     for statement in [
         format!("DROP TABLE IF EXISTS {RAW_TABLE}"),
         format!("DROP TABLE IF EXISTS {TABLE}"),
-        format!("DROP DATABASE IF EXISTS {CATALOG}.ns"),
+        format!("DROP SCHEMA IF EXISTS {CATALOG}.ns"),
         format!("DROP CATALOG IF EXISTS {CATALOG}"),
     ] {
         if let Err(error) = client.execute(&statement) {

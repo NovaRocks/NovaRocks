@@ -23,28 +23,27 @@
 -- query 1
 -- @skip_result_check=true
 -- Create test database.
-CREATE DATABASE iceberg_dml_cat_${suite_uuid0}.iceberg_bw_db_${uuid0};
+CREATE SCHEMA iceberg_dml_cat_${suite_uuid0}.iceberg_bw_db_${uuid0};
 
 -- query 2
 -- @skip_result_check=true
 -- Create v3 row-lineage table (branch writes require v3).
-CREATE TABLE iceberg_dml_cat_${suite_uuid0}.iceberg_bw_db_${uuid0}.t_bw_${uuid0} (id INT, v INT)
-TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+CREATE TABLE iceberg_dml_cat_${suite_uuid0}.iceberg_bw_db_${uuid0}.t_bw_${uuid0} (id INT, v INT) WITH (format_version = 3);
 
 -- query 3
 -- @skip_result_check=true
 -- Initial INSERT to main (creates first snapshot).
-INSERT INTO iceberg_dml_cat_${suite_uuid0}.iceberg_bw_db_${uuid0}.t_bw_${uuid0} VALUES (1, 10), (2, 20);
+INSERT INTO iceberg_dml_cat_${suite_uuid0}.iceberg_bw_db_${uuid0}.t_bw_${uuid0} VALUES ROW(1, 10), ROW(2, 20);
 
 -- query 4
 -- @skip_result_check=true
 -- Branch dev off main.
-ALTER TABLE iceberg_dml_cat_${suite_uuid0}.iceberg_bw_db_${uuid0}.t_bw_${uuid0} CREATE BRANCH dev;
+CREATE BRANCH dev IN TABLE iceberg_dml_cat_${suite_uuid0}.iceberg_bw_db_${uuid0}.t_bw_${uuid0};
 
 -- query 5
 -- @skip_result_check=true
 -- INSERT to branch dev.
-INSERT INTO iceberg_dml_cat_${suite_uuid0}.iceberg_bw_db_${uuid0}.t_bw_${uuid0}.branch_dev VALUES (3, 30);
+INSERT INTO iceberg_dml_cat_${suite_uuid0}.iceberg_bw_db_${uuid0}.t_bw_${uuid0} @dev VALUES (3, 30);
 
 -- query 6
 -- main should still have only 2 rows.
@@ -59,7 +58,7 @@ SELECT id, v FROM iceberg_dml_cat_${suite_uuid0}.iceberg_bw_db_${uuid0}.t_bw_${u
 -- query 8
 -- @skip_result_check=true
 -- UPDATE on branch dev: set v=99 for row id=1.
-UPDATE iceberg_dml_cat_${suite_uuid0}.iceberg_bw_db_${uuid0}.t_bw_${uuid0}.branch_dev
+UPDATE iceberg_dml_cat_${suite_uuid0}.iceberg_bw_db_${uuid0}.t_bw_${uuid0} @dev
   SET v = 99 WHERE id = 1;
 
 -- query 9
@@ -75,7 +74,7 @@ SELECT id, v FROM iceberg_dml_cat_${suite_uuid0}.iceberg_bw_db_${uuid0}.t_bw_${u
 -- query 11
 -- @skip_result_check=true
 -- DELETE on branch dev: remove row id=2.
-DELETE FROM iceberg_dml_cat_${suite_uuid0}.iceberg_bw_db_${uuid0}.t_bw_${uuid0}.branch_dev
+DELETE FROM iceberg_dml_cat_${suite_uuid0}.iceberg_bw_db_${uuid0}.t_bw_${uuid0} @dev
   WHERE id = 2;
 
 -- query 12
@@ -91,7 +90,7 @@ SELECT id, v FROM iceberg_dml_cat_${suite_uuid0}.iceberg_bw_db_${uuid0}.t_bw_${u
 -- query 14
 -- @skip_result_check=true
 -- Cleanup: drop branch, table, database.
-ALTER TABLE iceberg_dml_cat_${suite_uuid0}.iceberg_bw_db_${uuid0}.t_bw_${uuid0} DROP BRANCH dev;
+DROP BRANCH dev IN TABLE iceberg_dml_cat_${suite_uuid0}.iceberg_bw_db_${uuid0}.t_bw_${uuid0};
 
 -- query 15
 -- @skip_result_check=true
@@ -99,4 +98,4 @@ DROP TABLE iceberg_dml_cat_${suite_uuid0}.iceberg_bw_db_${uuid0}.t_bw_${uuid0};
 
 -- query 16
 -- @skip_result_check=true
-DROP DATABASE iceberg_dml_cat_${suite_uuid0}.iceberg_bw_db_${uuid0};
+DROP SCHEMA iceberg_dml_cat_${suite_uuid0}.iceberg_bw_db_${uuid0};

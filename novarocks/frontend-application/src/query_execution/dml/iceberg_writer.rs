@@ -533,20 +533,14 @@ fn wrap_insert_query_with_write_projection(
         };
         let expression = match source {
             Some((ordinal, name)) => build::column(
-                build::ident(source_alias, Some('`')),
-                build::ident_at(
-                    name,
-                    Some('`'),
-                    insert_source_expression_span(query, ordinal),
-                ),
+                build::ident(source_alias, true),
+                build::ident_at(name, true, insert_source_expression_span(query, ordinal)),
             ),
             None => crate::dml::insert::omitted_insert_expr(column)?,
         };
-        let expression = crate::dml::insert::canonical_insert_wrapper_expression(expression)?;
         projection.push(build::item(
             expression,
-            Some(build::ident(&column.name, Some('`'))),
-            true,
+            Some(build::ident(&column.name, true)),
         ));
     }
     let alias_source_columns = if insert_columns.is_empty() {
@@ -560,22 +554,21 @@ fn wrap_insert_query_with_write_projection(
             .map(String::as_str)
             .collect::<Vec<_>>()
     };
-    let wrapped = build::query(ast::SetExpr::Select(Box::new(
+    let alias_source_columns = alias_source_columns
+        .into_iter()
+        .map(|name| build::ident(name, true))
+        .collect::<Vec<_>>();
+    let alias_source_columns = (!alias_source_columns.is_empty()).then_some(alias_source_columns);
+    let wrapped = build::query(ast::SetExpr::Select(novarocks_parser::ast::AstBox::new(
         build::select(
             projection,
-            vec![build::relation(build::derived(
-                query.clone(),
-                Some(build::alias(
-                    build::ident(source_alias, Some('`')),
-                    alias_source_columns
-                        .into_iter()
-                        .map(|name| build::ident(name, Some('`')))
-                        .collect(),
-                    true,
-                )),
-            ))],
+            Some(build::alias(
+                build::derived(query.clone()),
+                build::ident(source_alias, true),
+                alias_source_columns,
+            )),
             None,
-            ast::GroupBy::None,
+            None,
         )
         .map_err(|error| error.to_string())?,
     )));
@@ -591,12 +584,14 @@ fn insert_source_expression_span(query: &Query, ordinal: usize) -> novarocks_par
                 .projection
                 .get(ordinal)
                 .map_or(SYNTHETIC, |item| match item {
-                    ast::SelectItem::UnnamedExpr(expr)
-                    | ast::SelectItem::ExprWithAlias { expr, .. } => expr.span(),
+                    ast::SelectItem::SingleColumn(column) => column.expression.span(),
                     _ => SYNTHETIC,
                 })
         }
-        ast::SetExpr::Query(query) => insert_source_expression_span(query, ordinal),
+        ast::SetExpr::Query(subquery) => {
+            let query = &subquery.query;
+            insert_source_expression_span(query, ordinal)
+        }
         _ => SYNTHETIC,
     }
 }
@@ -944,17 +939,19 @@ mod tests {
                 .expect("checked columns")
             );
             assert_eq!(
-                printer::print_type_name(
+                printer::print_type(
                     &novarocks_sql::sql_type_syntax(&declared.declared_value_type().unwrap())
                         .expect("declared type")
-                ),
+                )
+                .unwrap(),
                 spelling
             );
             assert_eq!(
-                printer::print_type_name(
+                printer::print_type(
                     &novarocks_sql::sql_type_syntax(&plain.declared_value_type().unwrap())
                         .expect("plain type")
-                ),
+                )
+                .unwrap(),
                 "VARBINARY"
             );
         }
@@ -978,10 +975,7 @@ mod tests {
     }
 
     pub(super) fn parse_query(sql: &str) -> Query {
-        let statements = novarocks_parser::parse(sql).expect("parse query");
-        let [ast::Statement::Query(query)] = statements.as_slice() else {
-            panic!("expected exactly one query statement");
-        };
+        let query = novarocks_parser::parser::parse_query(sql).expect("parse query");
         query.clone()
     }
 
@@ -1051,11 +1045,14 @@ mod tests {
         let ast::SetExpr::Values(values) = query.body.as_ref() else {
             panic!(
                 "expected VALUES query, got: {}",
-                printer::print_query(&query)
+                printer::print_query(&query).unwrap()
             );
         };
         let row = values.rows.first().expect("one row");
-        let rendered: Vec<String> = row.iter().map(printer::print_expr).collect();
+        let rendered: Vec<String> = ast::ValuesRowCells::new(row)
+            .iter()
+            .map(|expr| printer::print_expression(expr).unwrap())
+            .collect();
         assert_eq!(rendered, vec!["10", "5", "30"]);
     }
 
@@ -1086,12 +1083,18 @@ mod tests {
         let ast::SetExpr::Values(values) = query.body.as_ref() else {
             panic!(
                 "expected VALUES query, got: {}",
-                printer::print_query(&query)
+                printer::print_query(&query).unwrap()
             );
         };
-        let first_row: Vec<String> = values.rows[0].iter().map(printer::print_expr).collect();
-        let second_row: Vec<String> = values.rows[1].iter().map(printer::print_expr).collect();
-        assert_eq!(first_row, vec!["1", "'us'", "10.5"]);
+        let first_row: Vec<String> = ast::ValuesRowCells::new(&values.rows[0])
+            .iter()
+            .map(|expr| printer::print_expression(expr).unwrap())
+            .collect();
+        let second_row: Vec<String> = ast::ValuesRowCells::new(&values.rows[1])
+            .iter()
+            .map(|expr| printer::print_expression(expr).unwrap())
+            .collect();
+        assert_eq!(first_row, vec!["1", "'us'", "DECIMAL '10.5'"]);
         assert_eq!(second_row, vec!["2", "'eu'", "20"]);
     }
 
@@ -1117,10 +1120,13 @@ mod tests {
         let ast::SetExpr::Values(values) = query.body.as_ref() else {
             panic!(
                 "expected VALUES query, got: {}",
-                printer::print_query(&query)
+                printer::print_query(&query).unwrap()
             );
         };
-        let row: Vec<String> = values.rows[0].iter().map(printer::print_expr).collect();
+        let row: Vec<String> = ast::ValuesRowCells::new(&values.rows[0])
+            .iter()
+            .map(|expr| printer::print_expression(expr).unwrap())
+            .collect();
         assert_eq!(row, vec!["1", "NULL", "10"]);
     }
 
@@ -1159,10 +1165,11 @@ mod tests {
         let ast::SetExpr::Values(values) = query.body.as_ref() else {
             panic!(
                 "expected VALUES query, got: {}",
-                printer::print_query(&query)
+                printer::print_query(&query).unwrap()
             );
         };
-        let ast::Expr::Literal(value) = &values.rows[0][0] else {
+        let ast::Expr::Literal(value) = ast::ValuesRowCells::new(&values.rows[0]).get(0).unwrap()
+        else {
             panic!("original source string literal");
         };
         let ast::LiteralKind::String(s) = &value.kind else {
@@ -1185,10 +1192,11 @@ mod tests {
         let ast::SetExpr::Values(values) = query.body.as_ref() else {
             panic!(
                 "expected VALUES query, got: {}",
-                printer::print_query(&query)
+                printer::print_query(&query).unwrap()
             );
         };
-        let ast::Expr::Literal(value) = &values.rows[0][0] else {
+        let ast::Expr::Literal(value) = ast::ValuesRowCells::new(&values.rows[0]).get(0).unwrap()
+        else {
             panic!("original literal");
         };
         let ast::LiteralKind::String(s) = &value.kind else {
@@ -1243,7 +1251,7 @@ mod tests {
 
         use ast::SyntaxEq;
         let expected = parse_query(
-            "SELECT `__nr_insert_src`.`a` AS `a`, 7 AS `b`, `__nr_insert_src`.`c` AS `c` FROM (SELECT x, y FROM src) AS `__nr_insert_src`(`c`, `a`)",
+            "SELECT \"__nr_insert_src\".\"a\" AS \"a\", 7 AS \"b\", \"__nr_insert_src\".\"c\" AS \"c\" FROM (SELECT x, y FROM src) AS \"__nr_insert_src\"(\"c\", \"a\")",
         );
         assert!(
             query.syntax_eq(&expected),
@@ -1252,9 +1260,13 @@ mod tests {
         let ast::SetExpr::Select(outer) = query.body.as_ref() else {
             panic!("outer SELECT");
         };
-        let ast::TableFactor::Derived { subquery, .. } = &outer.from[0].relation else {
+        let Some(ast::Relation::Aliased(alias)) = &outer.from else {
+            panic!("source alias");
+        };
+        let ast::Relation::TableSubquery(node) = alias.relation.as_ref() else {
             panic!("derived source");
         };
+        let subquery = &node.query;
         assert_eq!(
             subquery.as_ref(),
             &source,
@@ -1263,9 +1275,14 @@ mod tests {
         let ast::SetExpr::Select(original) = source.body.as_ref() else {
             panic!("source SELECT");
         };
-        let ast::SelectItem::ExprWithAlias { expr, .. } = &outer.projection[0] else {
+        let ast::SelectItem::SingleColumn(single_column) = &outer.projection[0] else {
             panic!("target source reference");
         };
+        let Some(_) = &single_column.alias else {
+            panic!("target source reference");
+        };
+        let expr = &single_column.expression;
+
         assert_eq!(expr.span(), original.projection[1].span());
     }
 
@@ -1297,9 +1314,14 @@ mod tests {
             panic!("outer SELECT");
         };
         for item in &outer.projection[1..] {
-            let ast::SelectItem::ExprWithAlias { expr, .. } = item else {
+            let ast::SelectItem::SingleColumn(single_column) = item else {
                 panic!("target source expression");
             };
+            let Some(_) = &single_column.alias else {
+                panic!("target source expression");
+            };
+            let expr = &single_column.expression;
+
             assert!(
                 matches!(
                     expr,
@@ -1311,6 +1333,71 @@ mod tests {
                 "omitted complex NULL waits for full typed target context"
             );
         }
+    }
+    #[test]
+    fn write_projection_keeps_singleton_struct_default_and_quoted_source_identity() {
+        let target_columns = vec![
+            test_column("id", DataType::Int64, None),
+            test_column(
+                "s",
+                test_struct_type(vec![("only", DataType::Int64)]),
+                Some(ColumnDefault::Struct(vec![(
+                    "only".into(),
+                    ColumnDefault::Int64(7),
+                )])),
+            ),
+        ];
+        let source = parse_query("SELECT idx FROM row_util");
+        let query = wrap_insert_query_with_write_projection(
+            &source,
+            &["id".into()],
+            &target_columns,
+            &target_columns,
+        )
+        .unwrap();
+        let ast::SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("outer SELECT");
+        };
+        let ast::SelectItem::SingleColumn(single_column) = &select.projection[0] else {
+            panic!("source column reference");
+        };
+        let Some(alias) = &single_column.alias else {
+            panic!("source column reference");
+        };
+        let ast::Expr::Dereference(reference) = &single_column.expression else {
+            panic!("source column reference");
+        };
+
+        assert!(alias.quoted);
+        assert!(reference.field.as_ref().unwrap().quoted);
+        assert!(
+            matches!(&reference.base, ast::Expr::Identifier(qualifier) if qualifier.quoted && qualifier.value == "__nr_insert_src")
+        );
+        assert_eq!(reference.span, insert_source_expression_span(&source, 0));
+        let ast::SelectItem::SingleColumn(single_column) = &select.projection[1] else {
+            panic!("default projection");
+        };
+        let Some(alias) = &single_column.alias else {
+            panic!("default projection");
+        };
+        let expr = &single_column.expression;
+
+        assert!(alias.quoted);
+        assert!(matches!(expr, ast::Expr::Row(row) if row.fields.len() == 1));
+        assert_eq!(
+            novarocks_sql::literal::expr_to_literal(expr).unwrap(),
+            novarocks_sql::semantic::Literal::Struct(vec![novarocks_sql::semantic::Literal::Int(
+                7
+            )])
+        );
+        let Some(ast::Relation::Aliased(alias)) = &select.from else {
+            panic!("source alias");
+        };
+        let ast::Relation::TableSubquery(node) = alias.relation.as_ref() else {
+            panic!("source query");
+        };
+        let subquery = &node.query;
+        assert_eq!(subquery.as_ref(), &source);
     }
 }
 

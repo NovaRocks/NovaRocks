@@ -17,7 +17,12 @@
 
 //! Query-application session cancellation control contract.
 
-use std::sync::{Arc, Weak};
+use std::{
+    future::Future,
+    pin::Pin,
+    sync::{Arc, Weak},
+    time::Duration,
+};
 
 mod background_source;
 mod statement_action;
@@ -38,11 +43,11 @@ pub use statement_action::{StatementActionSource, StatementProgressSlot};
 use tokio::time::Instant;
 
 use crate::cancellation::{
-    QueryCancellationReason, QueryCancellationSource, QueryCancellationView,
+    QueryCancellationReason, QueryCancellationSource, QueryCancellationView, governed_timeout_ms,
 };
 use novarocks_workload_control::{
-    BusinessPermit, CancellationReason, CancellationView, QueryConcurrencyPermit, ResultClosingCut,
-    ResultWindowAlias, ResultWindowClass, ResultWindowGrant, RootAdmissionHandle,
+    BusinessPermit, CancellationReason, CancellationView, PendingQueryRoot, QueryConcurrencyPermit,
+    ResultClosingCut, ResultWindowAlias, ResultWindowClass, ResultWindowGrant, RootAdmissionHandle,
     WorkCancellationRequestOutcome, WorkClass, WorkError, WorkOwner, WorkRequest, WorkScope,
     WorkSuccessSealer,
 };
@@ -543,6 +548,104 @@ impl QueryControlService {
         let root = admission
             .begin_query_root(request)
             .map_err(GovernedQueryStatementBeginError::Admission)?;
+        let (root, registration) = self.register_query_root(root, session, statement_text)?;
+        let scope = root.owner.scope();
+        let admitted = (|| {
+            let retention = if window == Some(ResultWindowClass::Internal) {
+                Some(StatementResultCapacity::RootRetention(
+                    ResultWindowAlias::from_root_owner(&root.owner)?,
+                ))
+            } else {
+                None
+            };
+            Ok::<_, WorkError>((queue_original_query(&scope, window)?, retention))
+        })();
+        let (queue, retention) = match admitted {
+            Ok(value) => value,
+            Err(error) => {
+                root.owner.complete_after_terminal_cancel_settled();
+                let _ = self.port.fail_governed_statement(registration.token());
+                return Err(GovernedQueryStatementBeginError::Admission(error));
+            }
+        };
+        let grant = match queue.await {
+            Ok(grant) => grant,
+            Err(error) => {
+                if matches!(error, WorkError::Cancelled(_)) {
+                    root.owner.complete_after_terminal_cancel_settled();
+                    let _ = self.port.finish_governed_statement(registration.token());
+                } else {
+                    root.owner.complete_after_terminal_cancel_settled();
+                    let _ = self.port.fail_governed_statement(registration.token());
+                }
+                return Err(GovernedQueryStatementBeginError::Admission(error));
+            }
+        };
+        let mut owner = self.own_registered_query(root, registration, timeout_ms);
+        owner.result_window = grant
+            .window
+            .map(StatementResultCapacity::Window)
+            .or(retention);
+        owner.query_concurrency = Some(grant.permit);
+        Ok(owner)
+    }
+
+    /// Register the original query before the property preparation Action
+    /// starts. Its Root may provide scalar storage while it is not queued.
+    pub fn begin_governed_query_session_preparation(
+        &self,
+        session: SessionToken,
+        admission: &RootAdmissionHandle,
+        clock: QuerySessionDeadline,
+        statement_text: Arc<str>,
+        class: ResultWindowClass,
+    ) -> Result<GovernedQueryStatementOwner, GovernedQueryStatementBeginError> {
+        if class == ResultWindowClass::Closing {
+            return Err(GovernedQueryStatementBeginError::Admission(
+                WorkError::Conflict,
+            ));
+        }
+        let (root, timeout_ms) = match clock {
+            QuerySessionDeadline::Inherit {
+                deadline,
+                timeout_ms,
+            } => {
+                let mut request = WorkRequest::new(WorkClass::Query);
+                request.deadline = deadline;
+                (admission.begin_query_root(request), timeout_ms)
+            }
+            QuerySessionDeadline::ResolveFromProperties => {
+                (admission.begin_query_root_with_deferred_deadline(), None)
+            }
+        };
+        let root = root.map_err(GovernedQueryStatementBeginError::Admission)?;
+        let (root, registration) = self.register_query_root(root, session, Some(statement_text))?;
+        let mut owner = self.own_registered_query(root, registration, timeout_ms);
+        let retention = match ResultWindowAlias::from_root_owner(
+            owner
+                .execution_owner
+                .as_ref()
+                .expect("the original prepared query Root"),
+        ) {
+            Ok(retention) => retention,
+            Err(error) => return Err(owner.refuse_unpublished_queue(error)),
+        };
+        owner.result_window = Some(StatementResultCapacity::RootRetention(retention));
+        owner.session_query_admission = Some(SessionQueryAdmissionSlots {
+            class,
+            bind_timeout: matches!(clock, QuerySessionDeadline::ResolveFromProperties),
+            queue_started: false,
+        });
+        Ok(owner)
+    }
+
+    fn register_query_root(
+        &self,
+        root: PendingQueryRoot,
+        session: SessionToken,
+        statement_text: Option<Arc<str>>,
+    ) -> Result<(PendingQueryRoot, GovernedStatementRegistration), GovernedQueryStatementBeginError>
+    {
         let cancellation = match GovernedStatementCancellation::new(&root.owner) {
             Ok(cancellation) => cancellation,
             Err(error) => {
@@ -561,68 +664,29 @@ impl QueryControlService {
                 return Err(GovernedQueryStatementBeginError::QueryControl(error));
             }
         };
-        let scope = root.owner.scope();
-        let admitted = match window {
-            None => scope.admit_query().map(|admission| {
-                Box::pin(async move { admission.await.map(|permit| (permit, None)) })
-                    as std::pin::Pin<Box<dyn std::future::Future<Output = _> + Send>>
-            }),
-            Some(ResultWindowClass::Internal) => ResultWindowAlias::from_root_owner(&root.owner)
-                .and_then(|retention| {
-                    scope.admit_query().map(|admission| {
-                        Box::pin(async move {
-                            admission.await.map(|permit| {
-                                (
-                                    permit,
-                                    Some(StatementResultCapacity::RootRetention(retention)),
-                                )
-                            })
-                        })
-                            as std::pin::Pin<Box<dyn std::future::Future<Output = _> + Send>>
-                    })
-                }),
-            Some(class) => scope.admit_query_with_result(class).map(|admission| {
-                Box::pin(async move {
-                    admission.await.map(|(permit, window)| {
-                        (permit, Some(StatementResultCapacity::Window(window)))
-                    })
-                }) as std::pin::Pin<Box<dyn std::future::Future<Output = _> + Send>>
-            }),
-        };
-        let query_admission = match admitted {
-            Ok(admission) => admission,
-            Err(error) => {
-                root.owner.complete_after_terminal_cancel_settled();
-                let _ = self.port.fail_governed_statement(registration.token());
-                return Err(GovernedQueryStatementBeginError::Admission(error));
-            }
-        };
-        let (permit, result_window) = match query_admission.await {
-            Ok(admitted) => admitted,
-            Err(error) => {
-                if matches!(error, WorkError::Cancelled(_)) {
-                    root.owner.complete_after_terminal_cancel_settled();
-                    let _ = self.port.finish_governed_statement(registration.token());
-                } else {
-                    root.owner.complete_after_terminal_cancel_settled();
-                    let _ = self.port.fail_governed_statement(registration.token());
-                }
-                return Err(GovernedQueryStatementBeginError::Admission(error));
-            }
-        };
-        Ok(GovernedQueryStatementOwner {
+        Ok((root, registration))
+    }
+
+    fn own_registered_query(
+        &self,
+        root: PendingQueryRoot,
+        registration: GovernedStatementRegistration,
+        timeout_ms: Option<u64>,
+    ) -> GovernedQueryStatementOwner {
+        GovernedQueryStatementOwner {
             service: GovernedControlLink::Strong(self.clone()),
             registration,
-            scope,
+            scope: root.owner.scope(),
             execution_owner: Some(root.owner),
             business: None,
-            query_concurrency: Some(permit),
-            result_window,
+            query_concurrency: None,
+            result_window: None,
+            session_query_admission: None,
             accepted_delivery_cut: None,
             timeout_ms,
             success_visibility_sealed: false,
             finished: false,
-        })
+        }
     }
 
     /// Admit one protocol-visible statement under its actual workload class.
@@ -733,6 +797,7 @@ impl QueryControlService {
             business: Some(root.business),
             query_concurrency: None,
             result_window,
+            session_query_admission: None,
             accepted_delivery_cut: None,
             timeout_ms,
             success_visibility_sealed: false,
@@ -912,6 +977,65 @@ impl StatementVisibilityLoan<'_> {
     }
 }
 
+/// The clock selected by the original statement route. A plain EXPLAIN
+/// keeps its outer admitted deadline while using the scoped plan settings.
+#[derive(Clone, Copy)]
+pub enum QuerySessionDeadline {
+    Inherit {
+        deadline: Option<Instant>,
+        timeout_ms: Option<u64>,
+    },
+    ResolveFromProperties,
+}
+
+#[derive(Debug)]
+pub enum SessionQueryAdmissionError {
+    BindDeadline(WorkError),
+    Queue(WorkError),
+}
+
+pub type SessionQueryAdmission =
+    Pin<Box<dyn Future<Output = Result<QueuedQueryGrant, WorkError>> + Send>>;
+
+/// The original queue return. Callers can only install it on the matching
+/// statement before that Action derives its planning/runtime capabilities.
+pub struct QueuedQueryGrant {
+    permit: QueryConcurrencyPermit,
+    window: Option<ResultWindowGrant>,
+}
+
+fn queue_original_query(
+    scope: &WorkScope,
+    class: Option<ResultWindowClass>,
+) -> Result<SessionQueryAdmission, WorkError> {
+    match class {
+        None | Some(ResultWindowClass::Internal) => {
+            let pending = scope.admit_query()?;
+            Ok(Box::pin(async move {
+                pending.await.map(|permit| QueuedQueryGrant {
+                    permit,
+                    window: None,
+                })
+            }))
+        }
+        Some(class) => {
+            let pending = scope.admit_query_with_result(class)?;
+            Ok(Box::pin(async move {
+                pending.await.map(|(permit, window)| QueuedQueryGrant {
+                    permit,
+                    window: Some(window),
+                })
+            }))
+        }
+    }
+}
+
+struct SessionQueryAdmissionSlots {
+    class: ResultWindowClass,
+    bind_timeout: bool,
+    queue_started: bool,
+}
+
 /// A synchronous borrow of one original action's existing root slots.
 /// This view owns no Work, result alias, registration, permit or authority;
 /// constructing it neither admits work nor manufactures a background root.
@@ -923,6 +1047,8 @@ pub struct GovernedActionContext<'a> {
     timeout_ms: Option<u64>,
     result_window: Option<&'a ResultWindowAlias>,
     query_permit: Option<&'a mut Option<QueryConcurrencyPermit>>,
+    query_result: Option<&'a mut Option<StatementResultCapacity>>,
+    session_query_admission: Option<&'a mut Option<SessionQueryAdmissionSlots>>,
     visibility: Option<StatementVisibilityLoan<'a>>,
 }
 
@@ -941,6 +1067,8 @@ impl<'a> GovernedActionContext<'a> {
             timeout_ms,
             result_window,
             query_permit: None,
+            query_result: None,
+            session_query_admission: None,
             visibility: None,
         }
     }
@@ -957,6 +1085,82 @@ impl<'a> GovernedActionContext<'a> {
     fn with_query_permit(mut self, permit: &'a mut Option<QueryConcurrencyPermit>) -> Self {
         self.query_permit = Some(permit);
         self
+    }
+
+    /// Fix the original statement clock after the required CPU turn has
+    /// exited, then queue the same Root. The Action retains this future.
+    pub fn queue_after_session_preparation(
+        &mut self,
+        timeout: Option<Duration>,
+    ) -> Result<SessionQueryAdmission, SessionQueryAdmissionError> {
+        let slots = self
+            .session_query_admission
+            .as_deref_mut()
+            .and_then(Option::as_mut)
+            .ok_or(SessionQueryAdmissionError::Queue(WorkError::Conflict))?;
+        if slots.queue_started {
+            return Err(SessionQueryAdmissionError::Queue(WorkError::Conflict));
+        }
+        if slots.bind_timeout {
+            let owner =
+                self.execution_owner
+                    .as_ref()
+                    .ok_or(SessionQueryAdmissionError::BindDeadline(
+                        WorkError::Released,
+                    ))?;
+            owner
+                .bind_deferred_root_timeout(Instant::now(), timeout)
+                .map_err(SessionQueryAdmissionError::BindDeadline)?;
+        }
+        slots.queue_started = true;
+        queue_original_query(self.scope, Some(slots.class))
+            .map_err(SessionQueryAdmissionError::Queue)
+    }
+
+    /// Accept ownership only from this Action's original Root admission.
+    /// Validation leaves the original grant slot untouched on refusal.
+    pub fn accept_session_query_grant_in(
+        &mut self,
+        grant: &mut Option<QueuedQueryGrant>,
+    ) -> Result<(), WorkError> {
+        self.scope.check()?;
+        let slots = self
+            .session_query_admission
+            .as_deref_mut()
+            .ok_or(WorkError::Conflict)?;
+        let pending = slots
+            .as_ref()
+            .filter(|pending| pending.queue_started)
+            .ok_or(WorkError::Conflict)?;
+        let result = self
+            .query_result
+            .as_deref_mut()
+            .ok_or(WorkError::Conflict)?;
+        let permit = self
+            .query_permit
+            .as_deref_mut()
+            .ok_or(WorkError::Conflict)?;
+        let grant_ref = grant.as_ref().ok_or(WorkError::Conflict)?;
+        if permit.is_some()
+            || !grant_ref.permit.is_for_scope(self.scope)
+            || !matches!(result, Some(StatementResultCapacity::RootRetention(_)))
+        {
+            return Err(WorkError::Conflict);
+        }
+        match (pending.class, grant_ref.window.as_ref()) {
+            (ResultWindowClass::Internal, None) => {}
+            (class, Some(window)) if class == window.class() && window.is_for_scope(self.scope) => {
+            }
+            _ => return Err(WorkError::Conflict),
+        }
+        let grant = grant.take().expect("matched the original queue grant");
+        *permit = Some(grant.permit);
+        let retired = grant
+            .window
+            .and_then(|window| result.replace(StatementResultCapacity::Window(window)));
+        *slots = None;
+        drop(retired);
+        Ok(())
     }
 
     /// A synchronous handoff from this exact SQL source after its active
@@ -984,14 +1188,17 @@ impl<'a> GovernedActionContext<'a> {
         self.cancellation
     }
 
-    pub const fn timeout_ms(&self) -> Option<u64> {
-        self.timeout_ms
+    pub fn timeout_ms(&self) -> Option<u64> {
+        governed_timeout_ms(self.cancellation, self.timeout_ms)
     }
 
     /// Retain only the same original window when the actual result needs it.
     /// A missing alias remains missing; this view cannot acquire a new window.
     pub fn result_window_alias(&self) -> Option<ResultWindowAlias> {
-        self.result_window.cloned()
+        match &self.query_result {
+            Some(slot) => slot.as_ref().map(StatementResultCapacity::retain_alias),
+            None => self.result_window.cloned(),
+        }
     }
 
     pub fn execution_owner_slot(&mut self) -> &mut Option<WorkOwner> {
@@ -1022,6 +1229,7 @@ pub struct GovernedQueryStatementOwner {
     /// The original result policy. Root data retention carries the configured
     /// byte budget without occupying the later computation's position.
     result_window: Option<StatementResultCapacity>,
+    session_query_admission: Option<SessionQueryAdmissionSlots>,
     accepted_delivery_cut: Option<ResultClosingCut>,
     timeout_ms: Option<u64>,
     success_visibility_sealed: bool,
@@ -1058,6 +1266,8 @@ impl GovernedQueryStatementOwner {
             timeout_ms: self.timeout_ms,
             result_window,
             query_permit: Some(&mut self.query_concurrency),
+            query_result: Some(&mut self.result_window),
+            session_query_admission: Some(&mut self.session_query_admission),
             visibility: Some(StatementVisibilityLoan {
                 service: &self.service,
                 token: self.registration.token(),
@@ -1095,8 +1305,18 @@ impl GovernedQueryStatementOwner {
         self.registration.cancellation()
     }
 
-    pub const fn timeout_ms(&self) -> Option<u64> {
-        self.timeout_ms
+    pub fn timeout_ms(&self) -> Option<u64> {
+        governed_timeout_ms(self.cancellation(), self.timeout_ms)
+    }
+
+    fn refuse_unpublished_queue(mut self, error: WorkError) -> GovernedQueryStatementBeginError {
+        self.finished = true;
+        self.complete_local_owner_after_terminal();
+        let _ = self
+            .service
+            .port()
+            .fail_governed_statement(self.registration.token());
+        GovernedQueryStatementBeginError::Admission(error)
     }
 
     /// Retain the statement's original result author. Internal retention alone

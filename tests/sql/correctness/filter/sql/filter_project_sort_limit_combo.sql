@@ -30,14 +30,13 @@ CREATE TABLE ${case_db}.t_filter_project_sort_limit_combo (
   name STRING,
   qty INT,
   price INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 INSERT INTO ${case_db}.t_filter_project_sort_limit_combo VALUES
-  (1, 'apple', 2, 5),
-  (2, 'banana', NULL, 3),
-  (3, 'carrot', 7, 2),
-  (4, 'apple', 6, 4),
-  (5, 'durian', 10, 1);
+  ROW(1, 'apple', 2, 5),
+  ROW(2, 'banana', NULL, 3),
+  ROW(3, 'carrot', 7, 2),
+  ROW(4, 'apple', 6, 4),
+  ROW(5, 'durian', 10, 1);
 SELECT
   name,
   qty * price AS revenue

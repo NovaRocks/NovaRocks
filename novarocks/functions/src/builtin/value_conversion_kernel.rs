@@ -20,8 +20,8 @@
 //! work bracketed by the original control. No allocation grant is claimed.
 
 use super::value_conversion::{
-    JSON_TEXT, LARGEINT_DECIMAL, LARGEINT_FLOAT, LARGEINT_SIGNED, LARGEINT_TEXT, NULL_LIFT,
-    OPAQUE_BINARY, SIGNED_LARGEINT, UTF8_LARGEINT,
+    ARRAY_COMMON_COERCION, JSON_TEXT, LARGEINT_DECIMAL, LARGEINT_FLOAT, LARGEINT_SIGNED,
+    LARGEINT_TEXT, NULL_LIFT, OPAQUE_BINARY, SIGNED_LARGEINT, UTF8_LARGEINT,
 };
 use crate::{
     EvaluatedArgument, FunctionArgumentType, FunctionBindingSelection, KernelEvaluationControl,
@@ -74,6 +74,7 @@ enum Operation {
     LargeIntText,
     Utf8LargeInt,
     NullLift,
+    ArrayCommon,
 }
 #[derive(Clone, Copy, Debug)]
 enum JsonKind {
@@ -98,6 +99,9 @@ pub(super) struct ConversionRecipe {
     context: ExpressionEffectContext,
     policy: DecimalOverflowPolicy,
     operation: Operation,
+    // The inline root is counted by size_of::<Self>(); all actually created
+    // recursive recipe/projection heap is counted by the original CAST author.
+    array_common: Option<crate::PreparedCastRecipe>,
     nodes: Vec<JsonNode>,
     edges: Vec<usize>,
     retained: usize,
@@ -139,6 +143,21 @@ impl ConversionRecipe {
                 LARGEINT_TEXT => Operation::LargeIntText,
                 UTF8_LARGEINT => Operation::Utf8LargeInt,
                 NULL_LIFT => Operation::NullLift,
+                ARRAY_COMMON_COERCION => {
+                    // Pure identity and NULL-promise widening reuse the original
+                    // metadata reconstruction author, including UNKNOWN children.
+                    // Root UNKNOWN identity remains the constructor's capability.
+                    if source.data_type() != &DataType::Null
+                        && source
+                            .same_physical_binding_ignoring_nullability_observed(target, || {
+                                work.step().map_err(compile_failure)
+                            })?
+                    {
+                        Operation::SameShape
+                    } else {
+                        Operation::ArrayCommon
+                    }
+                }
                 _ => return Err(invalid("conversion has an unknown canonical overload")),
             };
             work.step().map_err(compile_failure)?;
@@ -147,12 +166,22 @@ impl ConversionRecipe {
                 context: contract.context(),
                 policy: contract.decimal_overflow_policy(),
                 operation,
+                array_common: None,
                 nodes: Vec::new(),
                 edges: Vec::new(),
                 retained: 0,
             };
             if matches!(operation, Operation::SameShape) {
                 recipe.prepare_json(source.data_type(), target.data_type(), &mut work)?;
+            }
+            if matches!(operation, Operation::ArrayCommon) {
+                work.flush().map_err(compile_failure)?;
+                let common = crate::PreparedCastRecipe::prepare_array_common_coercion(
+                    source, target, control,
+                )
+                .map_err(common_preparation_failure)?;
+                work.flush().map_err(compile_failure)?;
+                recipe.array_common = Some(common);
             }
             recipe.retained = std::mem::size_of::<Self>()
                 .checked_add(
@@ -172,6 +201,15 @@ impl ConversionRecipe {
                 })
                 .filter(|bytes| *bytes <= isize::MAX as usize)
                 .ok_or(KernelFailure::ResourceExhausted)?;
+            if let Some(common) = &recipe.array_common {
+                let heap =
+                    common.retained_heap_bytes_observed(|| work.step().map_err(compile_failure))?;
+                recipe.retained = recipe
+                    .retained
+                    .checked_add(heap)
+                    .filter(|bytes| *bytes <= isize::MAX as usize)
+                    .ok_or(KernelFailure::ResourceExhausted)?;
+            }
             Ok(recipe)
         })();
         work.finish_result(outcome, compile_failure)
@@ -285,6 +323,32 @@ impl ConversionRecipe {
         // refusal directly; never add a tail callback after its error.
         work.flush()?;
         validate_argument_observed(*argument, input.selection(), source, control)?;
+        if matches!(self.operation, Operation::ArrayCommon) {
+            let result = (|| {
+                let recipe = self.array_common.as_ref().ok_or_else(|| {
+                    internal("ARRAY common conversion lost its prepared strict recipe")
+                })?;
+                let inherited = match argument {
+                    EvaluatedArgument::SelectedColumn(values) => values.errors(),
+                    _ => &[],
+                };
+                // The original eager/strict host has already excluded source
+                // errors. Retain this exact slice identity, even when empty.
+                if !inherited.is_empty() {
+                    return Err(invalid(
+                        "ARRAY common conversion received an unresolved source journal",
+                    ));
+                }
+                work.flush()?;
+                let output =
+                    recipe.evaluate_selected(*argument, input.selection(), inherited, control)?;
+                work.flush()?;
+                Ok(output)
+            })();
+            // All originating Outer failures stop here with no new footer.
+            // Row Data remains the recipe's original successful journal value.
+            return work.finish_result(result);
+        }
         let outcome = (|| {
             let target = input.contract().result_type();
             let selection = input.selection();
@@ -337,6 +401,11 @@ impl ConversionRecipe {
                     Operation::Utf8LargeInt => utf8_largeint(*argument, selection, &mut work)?,
                     Operation::NullLift => {
                         return Err(internal("NULL lift active domain was not excluded"));
+                    }
+                    Operation::ArrayCommon => {
+                        return Err(internal(
+                            "ARRAY common conversion bypassed its prepared selected port",
+                        ));
                     }
                 }
             };
@@ -968,3 +1037,31 @@ fn check_classes(
 
 #[cfg(test)]
 mod tests;
+
+/// Preserve the actual preparation author's stable Unsupported/Invariant fact
+/// and source chain. Existing Kernel/control failures stay exactly original.
+#[derive(Debug)]
+struct CommonPreparationFailure(crate::CastPrepareError);
+impl std::fmt::Display for CommonPreparationFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+impl std::error::Error for CommonPreparationFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+impl novarocks_failure_contract::FailureProjection for CommonPreparationFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        novarocks_failure_contract::FailureProjection::failure_fact(&self.0)
+    }
+}
+impl novarocks_failure_contract::OuterFailureProjection for CommonPreparationFailure {}
+fn common_preparation_failure(cause: crate::CastPrepareError) -> KernelFailure {
+    match cause {
+        crate::CastPrepareError::Control(source) => compile_failure(source),
+        crate::CastPrepareError::Kernel(source) => source,
+        other => KernelFailure::from_domain(CommonPreparationFailure(other)),
+    }
+}

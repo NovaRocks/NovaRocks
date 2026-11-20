@@ -571,3 +571,346 @@ fn raw_map_and_entry_parent_offsets_are_applied_once_by_original_pool() {
 
 #[path = "borrowed_reader_tests.rs"]
 mod borrowed_reader_tests;
+
+fn utf8_list() -> (ListArray, StringArray) {
+    let original = StringArray::from(vec![
+        Some("hidden"),
+        Some("prefix"),
+        Some("雪☃"),
+        Some(""),
+        None,
+        Some("tail"),
+        Some("unused"),
+    ]);
+    let values: ArrayRef = Arc::new(original.slice(1, 5));
+    let item = Arc::new(
+        Field::new("source_item", DataType::Utf8, true)
+            .with_metadata(HashMap::from([("child-source".into(), "retained".into())])),
+    );
+    let array = ListArray::try_new(
+        item,
+        OffsetBuffer::new(vec![0_i32, 1, 4, 4, 4, 5].into()),
+        values,
+        Some(NullBuffer::from(vec![true, true, false, true, true])),
+    )
+    .unwrap();
+    (array, original)
+}
+
+#[test]
+fn utf8_list_borrows_nonzero_ordinal_complete_source_and_child_payload() {
+    let (array, original) = utf8_list();
+    let field = Arc::new(
+        Field::new("original_list", array.data_type().clone(), true)
+            .with_metadata(HashMap::from([("source-owned".into(), "original".into())])),
+    );
+    let value_type = FunctionValueType::try_from_field(&field).unwrap();
+    let p = ConstantPool::try_new(
+        field.clone(),
+        value_type.clone(),
+        array.to_data(),
+        policy(),
+        PHASE,
+        &Control::default(),
+    )
+    .unwrap();
+    let value = p.value(1).unwrap();
+    let backing = p.backing_identity();
+    let control = Control::default();
+    let view = value.utf8_list_observed(PHASE, &control).unwrap().unwrap();
+    assert!(std::ptr::eq(view.source(), &value));
+    assert!(Arc::ptr_eq(view.source().pool().field_ref(), &field));
+    assert!(std::ptr::eq(view.source().value_type(), p.value_type()));
+    assert_eq!(view.source().value_type(), &value_type);
+    assert_eq!(view.source().pool().backing_identity(), backing);
+    assert_eq!(view.source().ordinal(), 1);
+    assert_eq!(view.source().field().metadata()["source-owned"], "original");
+    let DataType::List(item) = view.source().field().data_type() else {
+        panic!()
+    };
+    assert_eq!(item.metadata()["child-source"], "retained");
+    assert!(view.source().value_type().nullable());
+    assert!(view.source().value_type().child_at(0).unwrap().nullable());
+    assert!(std::ptr::eq(view.child, &p.0.data.child_data()[0]));
+    assert_eq!(view.len(), 3);
+    assert!(!view.is_empty());
+    assert_eq!(view.item(0, PHASE, &control).unwrap(), Some("雪☃"));
+    assert_eq!(view.item(1, PHASE, &control).unwrap(), Some(""));
+    assert_eq!(view.item(2, PHASE, &control).unwrap(), None);
+    let text = view.item(0, PHASE, &control).unwrap().unwrap();
+    assert_eq!(text.as_ptr(), original.value(2).as_ptr());
+    assert_eq!(value.ordinal(), 1);
+    assert_eq!(p.backing_identity(), backing);
+    assert!(Arc::ptr_eq(p.field_ref(), &field));
+    assert_eq!(value.value_type(), &value_type);
+    assert_eq!(
+        p.value(0)
+            .unwrap()
+            .utf8_list_observed(PHASE, &control)
+            .unwrap()
+            .unwrap()
+            .item(0, PHASE, &control)
+            .unwrap(),
+        Some("prefix"),
+    );
+}
+
+#[test]
+fn utf8_list_root_null_child_null_empty_and_real_parent_slice_are_distinct() {
+    let (array, _) = utf8_list();
+    let p = pool(Arc::new(array.clone()));
+    let control = Control::default();
+    assert!(
+        p.value(2)
+            .unwrap()
+            .utf8_list_observed(PHASE, &control)
+            .unwrap()
+            .is_none()
+    );
+    let empty_value = p.value(3).unwrap();
+    let empty = empty_value
+        .utf8_list_observed(PHASE, &control)
+        .unwrap()
+        .unwrap();
+    assert!(empty.is_empty());
+    assert_eq!(empty.len(), 0);
+    assert!(matches!(
+        empty.item(0, PHASE, &control),
+        Err(ConstantError::Invalid(_))
+    ));
+    let selected = p.value(1).unwrap();
+    let view = selected
+        .utf8_list_observed(PHASE, &control)
+        .unwrap()
+        .unwrap();
+    assert_eq!(view.item(2, PHASE, &control).unwrap(), None);
+    let sliced = pool(Arc::new(array.slice(1, 4)));
+    let selected = sliced.value(3).unwrap();
+    let view = selected
+        .utf8_list_observed(PHASE, &control)
+        .unwrap()
+        .unwrap();
+    assert_eq!(view.source().ordinal(), 3);
+    assert_eq!(view.len(), 1);
+    assert_eq!(view.item(0, PHASE, &control).unwrap(), Some("tail"));
+    let selected = sliced.value(0).unwrap();
+    let view = selected
+        .utf8_list_observed(PHASE, &control)
+        .unwrap()
+        .unwrap();
+    assert_eq!(view.item(0, PHASE, &control).unwrap(), Some("雪☃"));
+    assert_eq!(view.item(2, PHASE, &control).unwrap(), None);
+    assert!(
+        sliced
+            .value(1)
+            .unwrap()
+            .utf8_list_observed(PHASE, &control)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        sliced
+            .value(2)
+            .unwrap()
+            .utf8_list_observed(PHASE, &control)
+            .unwrap()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn utf8_list_required_children_keep_their_original_nullability() {
+    let item = Arc::new(Field::new("source_required_item", DataType::Utf8, false));
+    let array = ListArray::try_new(
+        item,
+        OffsetBuffer::new(vec![0_i32, 1, 2].into()),
+        Arc::new(StringArray::from(vec!["first", "selected"])),
+        None,
+    )
+    .unwrap();
+    let field = Arc::new(Field::new(
+        "required_list",
+        array.data_type().clone(),
+        false,
+    ));
+    let ty = FunctionValueType::try_from_field(&field).unwrap();
+    let p = ConstantPool::try_new(
+        field.clone(),
+        ty.clone(),
+        array.to_data(),
+        policy(),
+        PHASE,
+        &Control::default(),
+    )
+    .unwrap();
+    let value = p.value(1).unwrap();
+    let view = value
+        .utf8_list_observed(PHASE, &Control::default())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        view.item(0, PHASE, &Control::default()).unwrap(),
+        Some("selected")
+    );
+    assert!(!view.source().value_type().nullable());
+    assert!(!view.source().value_type().child_at(0).unwrap().nullable());
+    assert_eq!(view.source().value_type(), &ty);
+    assert!(Arc::ptr_eq(view.source().pool().field_ref(), &field));
+}
+
+#[test]
+fn utf8_list_resolves_only_original_root_dictionary_and_run_encodings() {
+    let (array, _) = utf8_list();
+    let dictionary = DictionaryArray::<Int8Type>::try_new(
+        Int8Array::from(vec![Some(1), Some(4), None, Some(2)]),
+        Arc::new(array.clone()),
+    )
+    .unwrap();
+    let p = pool(Arc::new(dictionary));
+    let value = p.value(1).unwrap();
+    let view = value
+        .utf8_list_observed(PHASE, &Control::default())
+        .unwrap()
+        .unwrap();
+    assert_eq!(view.source().ordinal(), 1);
+    assert_eq!(
+        view.item(0, PHASE, &Control::default()).unwrap(),
+        Some("tail")
+    );
+    for ordinal in [2, 3] {
+        assert!(
+            p.value(ordinal)
+                .unwrap()
+                .utf8_list_observed(PHASE, &Control::default())
+                .unwrap()
+                .is_none()
+        );
+    }
+    let run =
+        RunArray::<Int32Type>::try_new(&Int32Array::from(vec![2, 4, 6, 8, 10]), &array).unwrap();
+    let p = pool(Arc::new(run));
+    let value = p.value(3).unwrap();
+    let view = value
+        .utf8_list_observed(PHASE, &Control::default())
+        .unwrap()
+        .unwrap();
+    assert_eq!(view.source().ordinal(), 3);
+    assert_eq!(
+        view.item(0, PHASE, &Control::default()).unwrap(),
+        Some("雪☃")
+    );
+    assert!(
+        p.value(5)
+            .unwrap()
+            .utf8_list_observed(PHASE, &Control::default())
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        p.value(6)
+            .unwrap()
+            .utf8_list_observed(PHASE, &Control::default())
+            .unwrap()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn utf8_list_wrong_nonnull_carriers_and_bad_indices_keep_original_control_tails() {
+    let large = LargeListArray::try_new(
+        Arc::new(Field::new("item", DataType::Utf8, true)),
+        OffsetBuffer::new(vec![0_i64, 1].into()),
+        Arc::new(StringArray::from(vec!["value"])),
+        None,
+    )
+    .unwrap();
+    let large_text = ListArray::try_new(
+        Arc::new(Field::new("item", DataType::LargeUtf8, true)),
+        OffsetBuffer::new(vec![0_i32, 1].into()),
+        Arc::new(arrow_array::LargeStringArray::from(vec!["value"])),
+        None,
+    )
+    .unwrap();
+    for array in [
+        Arc::new(list()) as ArrayRef,
+        Arc::new(large),
+        Arc::new(large_text),
+    ] {
+        let value = pool(array).value(0).unwrap();
+        assert_prefix(
+            |control| value.utf8_list_observed(PHASE, control).map(|_| ()),
+            true,
+        );
+    }
+    let value = pool(Arc::new(utf8_list().0)).value(1).unwrap();
+    for index in [3, usize::MAX] {
+        assert_prefix(
+            |control| {
+                value
+                    .utf8_list_observed(PHASE, control)?
+                    .unwrap()
+                    .item(index, PHASE, control)
+            },
+            true,
+        );
+    }
+}
+
+#[test]
+fn utf8_list_reads_reuse_caller_meter_and_never_read_null_payloads() {
+    let hidden = "x".repeat(320 * 1024);
+    let mut bytes = Vec::from(b"one".as_slice());
+    bytes.extend_from_slice(hidden.as_bytes());
+    let values: ArrayRef = Arc::new(StringArray::new(
+        OffsetBuffer::new(vec![0_i32, 3, i32::try_from(bytes.len()).unwrap()].into()),
+        Buffer::from(bytes),
+        Some(NullBuffer::from(vec![true, false])),
+    ));
+    let array = ListArray::try_new(
+        Arc::new(Field::new("item", DataType::Utf8, true)),
+        OffsetBuffer::new(vec![0_i32, 2].into()),
+        values,
+        None,
+    )
+    .unwrap();
+    let value = pool(Arc::new(array)).value(0).unwrap();
+    let view = value
+        .utf8_list_observed(PHASE, &Control::default())
+        .unwrap()
+        .unwrap();
+    let control = Control::default();
+    assert_eq!(view.item(1, PHASE, &control).unwrap(), None);
+    assert!(!control.trace.lock().unwrap().contains(&256));
+    assert_eq!(view.item(0, PHASE, &control).unwrap(), Some("one"));
+    assert_prefix(
+        |control| {
+            let mut work = CompileCheckpoints::try_new(control, PHASE)?;
+            let result = (|| {
+                let view = value.utf8_list_in(&mut work)?.unwrap();
+                for index in 0..view.len() {
+                    view.item_observed(index, &mut work)?;
+                }
+                Ok(())
+            })();
+            finish(work, result)
+        },
+        false,
+    );
+    let source = pool(Arc::new(utf8_list().0));
+    for ordinal in [1, 2, 3] {
+        let value = source.value(ordinal).unwrap();
+        assert_prefix(
+            |control| {
+                if let Some(view) = value.utf8_list_observed(PHASE, control)? {
+                    for index in 0..view.len() {
+                        view.item(index, PHASE, control)?;
+                    }
+                }
+                Ok(())
+            },
+            false,
+        );
+    }
+}

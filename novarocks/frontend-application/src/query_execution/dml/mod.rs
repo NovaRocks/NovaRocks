@@ -1,7 +1,6 @@
 //! Query-execution DML reverse ports, sealed write facts, and provider-neutral helpers.
 
 pub mod add_files;
-pub(crate) mod aggregate;
 pub mod ctas;
 pub mod delete;
 #[allow(

@@ -28,6 +28,11 @@ pub const NUMERIC_OUT_OF_RANGE: FailureReason =
     FailureReason::new(domain::KERNEL, NonZeroU16::new(41).unwrap());
 pub const DIVISION_BY_ZERO: FailureReason =
     FailureReason::new(domain::KERNEL, NonZeroU16::new(43).unwrap());
+pub const INVALID_CAST_ARGUMENT: FailureReason =
+    FailureReason::new(domain::KERNEL, NonZeroU16::new(44).unwrap());
+
+pub const INVALID_FUNCTION_ARGUMENT: FailureReason =
+    FailureReason::new(domain::KERNEL, NonZeroU16::new(45).unwrap());
 
 // These reasons belong to the actual pure-function preparation authors.
 // Consumers may preserve their identity; the constants select no SQL policy.

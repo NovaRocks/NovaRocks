@@ -1,0 +1,212 @@
+-- query 1
+-- types	varchar
+result
+ab
+
+-- query 2
+-- types	varchar
+result
+NULL
+
+-- query 3
+-- types	varchar
+result
+NULL
+
+-- query 4
+-- types	boolean
+result
+true
+
+-- query 5
+-- types	array(integer)
+result
+[1,2]
+
+-- query 6
+-- types	integer
+orders
+1
+
+-- query 7
+-- types	integer
+a"b
+2
+
+-- query 8
+-- types	integer	integer	integer
+MiXeD	mixed	MIXED
+3	3	3
+
+-- query 9
+-- types	integer
+select
+4
+
+-- query 10
+-- types	integer
+t$snapshots
+5
+
+-- query 11
+-- types	varchar
+result
+a'b
+
+-- query 12
+-- types	varchar
+result
+"a\\tb"
+
+-- query 13
+-- types	varchar
+result
+"a\\"
+
+-- query 14
+-- types	varchar
+result
+"a\tb"
+
+-- query 15
+-- types	varchar
+result
+😀
+
+-- query 16
+-- types	varchar
+result
+"a\tb"
+
+-- query 17
+-- types	varchar
+result
+"a\\b"
+
+-- query 18
+-- types	varchar
+result
+"a\nb"
+
+-- query 19
+-- types	boolean
+result
+false
+
+-- query 20
+-- types	boolean
+result
+true
+
+-- query 21
+-- types	boolean
+result
+true
+
+-- query 22
+-- types	boolean
+result
+true
+
+-- query 23
+-- types	integer
+result
+31
+
+-- query 24
+-- types	integer
+result
+15
+
+-- query 25
+-- types	integer
+result
+11
+
+-- query 26
+-- types	integer
+result
+1234
+
+-- query 27
+-- types	integer
+result
+255
+
+-- query 28
+-- types	integer
+result
+15
+
+-- query 29
+-- types	integer
+result
+9
+
+-- query 30
+-- types	integer
+result
+255
+
+-- query 31
+-- types	integer
+result
+7
+
+-- query 32
+-- types	integer
+result
+8
+
+-- query 33
+-- types	integer
+result
+9
+
+-- query 34
+-- types	integer
+result
+10
+
+-- query 35
+-- types	array(integer)
+result
+[1,null,2]
+NULL
+[4]
+
+-- query 37
+-- types	array(integer)
+_col0
+NULL
+
+-- query 39
+-- types	boolean
+_col0
+NULL
+
+-- query 40
+-- types	boolean
+_col0
+NULL
+true
+
+-- query 43
+-- types	boolean
+_col0
+true
+
+-- query 44
+-- types	boolean
+_col0
+NULL
+
+-- query 45
+-- types	boolean
+_col0
+NULL
+
+-- query 47
+-- types	boolean
+_col0
+false

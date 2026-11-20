@@ -277,7 +277,8 @@ fn nested_interleave_rejects_exact_type_source_choice_and_static_extent_failures
 #[test]
 fn nested_guarded_carriers_do_not_admit_other_encoding_or_child_protocols() {
     for ty in [
-        DataType::Null,
+        DataType::List(Arc::new(Field::new("item", DataType::Null, true))),
+        DataType::Struct(vec![Arc::new(Field::new("item", DataType::Null, true))].into()),
         DataType::FixedSizeBinary(0),
         DataType::FixedSizeBinary(-1),
         DataType::Union(

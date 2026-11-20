@@ -25,28 +25,27 @@
 -- Setup: create table and insert test data
 -- @skip_result_check=true
 USE ${case_db};
-CREATE TABLE t0 (id int, a string, b string)
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE t0 (id int, a string, b string) WITH (format_version = 3);
 
 -- query 2
 -- @skip_result_check=true
 USE ${case_db};
-INSERT INTO t0(id, a, b) VALUES (0, "hello", "world"), (1, "hello", "starrocks");
+INSERT INTO t0(id, a, b) VALUES ROW(0, 'hello', 'world'), ROW(1, 'hello', 'starrocks');
 
 -- query 3
 -- xx_hash3_128 on individual columns, extracting high and low 64 bits
 USE ${case_db};
-SELECT CAST(bit_shift_right(xx_hash3_128(a), 64) AS VARCHAR) AS `bit_shift_right(xx_hash3_128(a), 64)`,
-    CAST(bitand(xx_hash3_128(a), CAST('18446744073709551615' AS LARGEINT)) AS VARCHAR) AS `bitand(xx_hash3_128(a), 18446744073709551615)`,
+SELECT CAST(bit_shift_right(xx_hash3_128(a), 64) AS VARCHAR) AS "bit_shift_right(xx_hash3_128(a), 64)",
+    CAST(bitand(xx_hash3_128(a), CAST('18446744073709551615' AS LARGEINT)) AS VARCHAR) AS "bitand(xx_hash3_128(a), 18446744073709551615)",
     a,
-    CAST(bit_shift_right(xx_hash3_128(b), 64) AS VARCHAR) AS `bit_shift_right(xx_hash3_128(b), 64)`,
-    CAST(bitand(xx_hash3_128(b), CAST('18446744073709551615' AS LARGEINT)) AS VARCHAR) AS `bitand(xx_hash3_128(b), 18446744073709551615)`,
+    CAST(bit_shift_right(xx_hash3_128(b), 64) AS VARCHAR) AS "bit_shift_right(xx_hash3_128(b), 64)",
+    CAST(bitand(xx_hash3_128(b), CAST('18446744073709551615' AS LARGEINT)) AS VARCHAR) AS "bitand(xx_hash3_128(b), 18446744073709551615)",
     b
 FROM t0 WHERE id = 1;
 
 -- query 4
 -- xx_hash3_128 on multiple columns combined
 USE ${case_db};
-SELECT CAST(bit_shift_right(xx_hash3_128(a,b), 64) AS VARCHAR) AS `bit_shift_right(xx_hash3_128(a, b), 64)`,
-    CAST(bitand(xx_hash3_128(a,b), CAST('18446744073709551615' AS LARGEINT)) AS VARCHAR) AS `bitand(xx_hash3_128(a, b), 18446744073709551615)`,
+SELECT CAST(bit_shift_right(xx_hash3_128(a,b), 64) AS VARCHAR) AS "bit_shift_right(xx_hash3_128(a, b), 64)",
+    CAST(bitand(xx_hash3_128(a,b), CAST('18446744073709551615' AS LARGEINT)) AS VARCHAR) AS "bitand(xx_hash3_128(a, b), 18446744073709551615)",
     concat(a, b) FROM t0 ORDER BY id;

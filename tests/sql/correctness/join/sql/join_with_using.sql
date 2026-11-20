@@ -40,8 +40,7 @@ CREATE TABLE ${case_db}.left_table (
     id2 INT,
     salary DECIMAL(10,2),
     status VARCHAR(10)
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 4
 -- @skip_result_check=true
@@ -50,27 +49,26 @@ CREATE TABLE ${case_db}.right_table (
     id1 INT,
     bonus DECIMAL(8,2),
     id2 INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 5
 -- @skip_result_check=true
 INSERT INTO ${case_db}.left_table VALUES
-    ('Alice', 1, 25, 'New York', 100, 5000.00, 'Active'),
-    ('Bob', 2, 30, 'Boston', 200, 6000.00, 'Active'),
-    ('Charlie', 3, 35, 'Chicago', 300, 7000.00, 'Inactive'),
-    ('David', 4, 28, 'Denver', NULL, 5500.00, 'Active'),
-    ('Eve', 5, 32, 'Seattle', 500, 6500.00, 'Active'),
-    ('Frank', 6, 40, NULL, 600, 8000.00, 'Inactive');
+    ROW('Alice', 1, 25, 'New York', 100, 5000.00, 'Active'),
+    ROW('Bob', 2, 30, 'Boston', 200, 6000.00, 'Active'),
+    ROW('Charlie', 3, 35, 'Chicago', 300, 7000.00, 'Inactive'),
+    ROW('David', 4, 28, 'Denver', NULL, 5500.00, 'Active'),
+    ROW('Eve', 5, 32, 'Seattle', 500, 6500.00, 'Active'),
+    ROW('Frank', 6, 40, NULL, 600, 8000.00, 'Inactive');
 
 -- query 6
 -- @skip_result_check=true
 INSERT INTO ${case_db}.right_table VALUES
-    ('Engineering', 1, 1000.00, 100),
-    ('Marketing', 2, 800.00, 200),
-    ('Sales', 7, 1200.00, 700),
-    ('HR', 8, 900.00, NULL),
-    ('Finance', 9, NULL, 900);
+    ROW('Engineering', 1, 1000.00, 100),
+    ROW('Marketing', 2, 800.00, 200),
+    ROW('Sales', 7, 1200.00, 700),
+    ROW('HR', 8, 900.00, NULL),
+    ROW('Finance', 9, NULL, 900);
 
 -- query 7
 -- INNER JOIN with multi-key USING
@@ -119,12 +117,16 @@ SELECT * FROM ${case_db}.left_table LEFT JOIN ${case_db}.right_table USING(id1, 
 -- query 16
 -- RIGHT SEMI JOIN with USING
 -- @order_sensitive=true
-SELECT * FROM ${case_db}.left_table RIGHT SEMI JOIN ${case_db}.right_table USING(id1, id2) ORDER BY id1;
+SELECT right_table.id1, right_table.id2, right_table.dept, right_table.bonus FROM ${case_db}.right_table
+WHERE EXISTS (SELECT 1 FROM ${case_db}.left_table WHERE ${case_db}.left_table.id1 = ${case_db}.right_table.id1 AND ${case_db}.left_table.id2 = ${case_db}.right_table.id2)
+ORDER BY id1;
 
 -- query 17
 -- RIGHT ANTI JOIN with USING
 -- @order_sensitive=true
-SELECT * FROM ${case_db}.left_table RIGHT ANTI JOIN ${case_db}.right_table USING(id1, id2) ORDER BY id1;
+SELECT right_table.id1, right_table.id2, right_table.dept, right_table.bonus FROM ${case_db}.right_table
+WHERE NOT EXISTS (SELECT 1 FROM ${case_db}.left_table WHERE ${case_db}.left_table.id1 = ${case_db}.right_table.id1 AND ${case_db}.left_table.id2 = ${case_db}.right_table.id2)
+ORDER BY id1;
 
 -- query 18
 -- CROSS JOIN (no USING, baseline)
@@ -134,12 +136,16 @@ SELECT * FROM ${case_db}.left_table CROSS JOIN ${case_db}.right_table ORDER BY l
 -- query 19
 -- LEFT SEMI JOIN with multi-key USING
 -- @order_sensitive=true
-SELECT * FROM ${case_db}.left_table LEFT SEMI JOIN ${case_db}.right_table USING(id1, id2) ORDER BY id1;
+SELECT left_table.id1, left_table.id2, left_table.name, left_table.age, left_table.city, left_table.salary, left_table.status FROM ${case_db}.left_table
+WHERE EXISTS (SELECT 1 FROM ${case_db}.right_table WHERE ${case_db}.left_table.id1 = ${case_db}.right_table.id1 AND ${case_db}.left_table.id2 = ${case_db}.right_table.id2)
+ORDER BY id1;
 
 -- query 20
 -- LEFT ANTI JOIN with multi-key USING
 -- @order_sensitive=true
-SELECT * FROM ${case_db}.left_table LEFT ANTI JOIN ${case_db}.right_table USING(id1, id2) ORDER BY id1;
+SELECT left_table.id1, left_table.id2, left_table.name, left_table.age, left_table.city, left_table.salary, left_table.status FROM ${case_db}.left_table
+WHERE NOT EXISTS (SELECT 1 FROM ${case_db}.right_table WHERE ${case_db}.left_table.id1 = ${case_db}.right_table.id1 AND ${case_db}.left_table.id2 = ${case_db}.right_table.id2)
+ORDER BY id1;
 
 -- query 21
 -- Single-key USING: LEFT JOIN
@@ -159,22 +165,30 @@ SELECT * FROM ${case_db}.left_table FULL OUTER JOIN ${case_db}.right_table USING
 -- query 24
 -- Single-key USING: LEFT SEMI JOIN
 -- @order_sensitive=true
-SELECT * FROM ${case_db}.left_table LEFT SEMI JOIN ${case_db}.right_table USING(id1) ORDER BY id1;
+SELECT left_table.id1, left_table.name, left_table.age, left_table.city, left_table.id2, left_table.salary, left_table.status FROM ${case_db}.left_table
+WHERE EXISTS (SELECT 1 FROM ${case_db}.right_table WHERE ${case_db}.left_table.id1 = ${case_db}.right_table.id1)
+ORDER BY id1;
 
 -- query 25
 -- Single-key USING: LEFT ANTI JOIN
 -- @order_sensitive=true
-SELECT * FROM ${case_db}.left_table LEFT ANTI JOIN ${case_db}.right_table USING(id1) ORDER BY id1;
+SELECT left_table.id1, left_table.name, left_table.age, left_table.city, left_table.id2, left_table.salary, left_table.status FROM ${case_db}.left_table
+WHERE NOT EXISTS (SELECT 1 FROM ${case_db}.right_table WHERE ${case_db}.left_table.id1 = ${case_db}.right_table.id1)
+ORDER BY id1;
 
 -- query 26
 -- Single-key USING: RIGHT SEMI JOIN
 -- @order_sensitive=true
-SELECT * FROM ${case_db}.left_table RIGHT SEMI JOIN ${case_db}.right_table USING(id1) ORDER BY id1;
+SELECT right_table.id1, right_table.dept, right_table.bonus, right_table.id2 FROM ${case_db}.right_table
+WHERE EXISTS (SELECT 1 FROM ${case_db}.left_table WHERE ${case_db}.left_table.id1 = ${case_db}.right_table.id1)
+ORDER BY id1;
 
 -- query 27
 -- Single-key USING: RIGHT ANTI JOIN
 -- @order_sensitive=true
-SELECT * FROM ${case_db}.left_table RIGHT ANTI JOIN ${case_db}.right_table USING(id1) ORDER BY id1;
+SELECT right_table.id1, right_table.dept, right_table.bonus, right_table.id2 FROM ${case_db}.right_table
+WHERE NOT EXISTS (SELECT 1 FROM ${case_db}.left_table WHERE ${case_db}.left_table.id1 = ${case_db}.right_table.id1)
+ORDER BY id1;
 
 -- query 28
 -- USING column aliasing

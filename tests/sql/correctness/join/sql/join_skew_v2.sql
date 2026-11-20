@@ -52,8 +52,7 @@ CREATE TABLE ${case_db}.t1 (
     c_date     DATE,
     c_datetime DATETIME,
     c_string   STRING
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 4
 -- @skip_result_check=true
@@ -70,8 +69,7 @@ CREATE TABLE ${case_db}.t2 (
     c_date     DATE,
     c_datetime DATETIME,
     c_string   STRING
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 5
 -- @skip_result_check=true
@@ -92,11 +90,11 @@ TRUNCATE TABLE ${case_db}.t2;
 
 -- query 9
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t1(c_key, c_tinyint) VALUES (1, 1), (2, 1), (3, 1), (4, 2), (5, 2), (6, 3);
+INSERT INTO ${case_db}.t1(c_key, c_tinyint) VALUES ROW(1, 1), ROW(2, 1), ROW(3, 1), ROW(4, 2), ROW(5, 2), ROW(6, 3);
 
 -- query 10
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t2(c_key, c_tinyint) VALUES (1, 1), (2, 2), (3, 3);
+INSERT INTO ${case_db}.t2(c_key, c_tinyint) VALUES ROW(1, 1), ROW(2, 2), ROW(3, 3);
 
 -- query 11
 -- @order_sensitive=true
@@ -119,11 +117,11 @@ TRUNCATE TABLE ${case_db}.t2;
 
 -- query 15
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t1(c_key, c_int) VALUES (1, 1), (2, 1), (3, 1), (4, 1234567), (5, 1234567), (6, 3);
+INSERT INTO ${case_db}.t1(c_key, c_int) VALUES ROW(1, 1), ROW(2, 1), ROW(3, 1), ROW(4, 1234567), ROW(5, 1234567), ROW(6, 3);
 
 -- query 16
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t2(c_key, c_int) VALUES (1, 1), (2, 1234567), (3, 3);
+INSERT INTO ${case_db}.t2(c_key, c_int) VALUES ROW(1, 1), ROW(2, 1234567), ROW(3, 3);
 
 -- query 17
 -- @order_sensitive=true
@@ -146,11 +144,11 @@ TRUNCATE TABLE ${case_db}.t2;
 
 -- query 21
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t1(c_key, c_bigint) VALUES (1, 1), (2, 1), (3, 1), (4, 12345678912), (5, 12345678912), (6, 3);
+INSERT INTO ${case_db}.t1(c_key, c_bigint) VALUES ROW(1, 1), ROW(2, 1), ROW(3, 1), ROW(4, 12345678912), ROW(5, 12345678912), ROW(6, 3);
 
 -- query 22
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t2(c_key, c_bigint) VALUES (1, 1), (2, 12345678912), (3, 3);
+INSERT INTO ${case_db}.t2(c_key, c_bigint) VALUES ROW(1, 1), ROW(2, 12345678912), ROW(3, 3);
 
 -- query 23
 -- @order_sensitive=true
@@ -174,12 +172,12 @@ TRUNCATE TABLE ${case_db}.t2;
 -- query 27
 -- @skip_result_check=true
 INSERT INTO ${case_db}.t1(c_key, c_date) VALUES
-    (1, "2024-01-01"), (2, "2024-01-01"), (3, "2024-01-01"),
-    (4, "2024-01-02"), (5, "2024-01-02"), (6, "2024-01-03");
+    ROW(1, '2024-01-01'), ROW(2, '2024-01-01'), ROW(3, '2024-01-01'),
+    ROW(4, '2024-01-02'), ROW(5, '2024-01-02'), ROW(6, '2024-01-03');
 
 -- query 28
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t2(c_key, c_date) VALUES (1, "2024-01-01"), (2, "2024-01-02"), (3, "2024-01-03");
+INSERT INTO ${case_db}.t2(c_key, c_date) VALUES ROW(1, '2024-01-01'), ROW(2, '2024-01-02'), ROW(3, '2024-01-03');
 
 -- query 29
 -- @order_sensitive=true
@@ -202,11 +200,11 @@ TRUNCATE TABLE ${case_db}.t2;
 
 -- query 33
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t1(c_key, c_string) VALUES ("1", "1"), ("2", "1"), ("3", "1"), ("4", "1234567"), ("5", "1234567"), ("6", "3");
+INSERT INTO ${case_db}.t1(c_key, c_string) VALUES ROW('1', '1'), ROW('2', '1'), ROW('3', '1'), ROW('4', '1234567'), ROW('5', '1234567'), ROW('6', '3');
 
 -- query 34
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t2(c_key, c_string) VALUES ("1", "1"), ("2", "1234567"), ("3", "3");
+INSERT INTO ${case_db}.t2(c_key, c_string) VALUES ROW('1', '1'), ROW('2', '1234567'), ROW('3', '3');
 
 -- query 35
 -- @order_sensitive=true
@@ -229,11 +227,11 @@ TRUNCATE TABLE ${case_db}.t2;
 
 -- query 39
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t1(c_key, c_int) VALUES (1, 1), (2, 1), (3, 1), (4, 1234567), (5, 1234567), (6, 3);
+INSERT INTO ${case_db}.t1(c_key, c_int) VALUES ROW(1, 1), ROW(2, 1), ROW(3, 1), ROW(4, 1234567), ROW(5, 1234567), ROW(6, 3);
 
 -- query 40
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t2(c_key, c_bigint) VALUES (1, 1), (2, 1234567), (3, 3);
+INSERT INTO ${case_db}.t2(c_key, c_bigint) VALUES ROW(1, 1), ROW(2, 1234567), ROW(3, 3);
 
 -- query 41
 -- @order_sensitive=true
@@ -256,11 +254,11 @@ TRUNCATE TABLE ${case_db}.t2;
 
 -- query 45
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t1(c_key, c_bigint) VALUES (1, 1), (2, 1), (3, 1), (4, 1234567), (5, 1234567), (6, 3);
+INSERT INTO ${case_db}.t1(c_key, c_bigint) VALUES ROW(1, 1), ROW(2, 1), ROW(3, 1), ROW(4, 1234567), ROW(5, 1234567), ROW(6, 3);
 
 -- query 46
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t2(c_key, c_int) VALUES (1, 1), (2, 1234567), (3, 3);
+INSERT INTO ${case_db}.t2(c_key, c_int) VALUES ROW(1, 1), ROW(2, 1234567), ROW(3, 3);
 
 -- query 47
 -- @order_sensitive=true
@@ -294,11 +292,11 @@ TRUNCATE TABLE ${case_db}.t2;
 
 -- query 53
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t1(c_key, c_bigint) VALUES (1, null), (2, 1), (3, 2), (4, -1);
+INSERT INTO ${case_db}.t1(c_key, c_bigint) VALUES ROW(1, null), ROW(2, 1), ROW(3, 2), ROW(4, -1);
 
 -- query 54
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t2(c_key, c_int) VALUES (1, 1), (2, 2), (3, 3);
+INSERT INTO ${case_db}.t2(c_key, c_int) VALUES ROW(1, 1), ROW(2, 2), ROW(3, 3);
 
 -- query 55
 SELECT count(*) FROM ${case_db}.t1 t1 LEFT JOIN  ${case_db}.t2 t2 ON abs(t1.c_bigint)=abs(t2.c_int);
@@ -319,11 +317,11 @@ TRUNCATE TABLE ${case_db}.t2;
 
 -- query 59
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t1(c_key, c_bigint) VALUES (1, 1), (2, 1), (3, 1), (4, 1234567), (5, 1234567), (6, 3);
+INSERT INTO ${case_db}.t1(c_key, c_bigint) VALUES ROW(1, 1), ROW(2, 1), ROW(3, 1), ROW(4, 1234567), ROW(5, 1234567), ROW(6, 3);
 
 -- query 60
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t2(c_key, c_int) VALUES (1, 1), (2, 1234567), (3, 3);
+INSERT INTO ${case_db}.t2(c_key, c_int) VALUES ROW(1, 1), ROW(2, 1234567), ROW(3, 3);
 
 -- query 61
 -- @order_sensitive=true
@@ -375,11 +373,11 @@ SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 LEFT JOIN  ${case_db}.t2 t2 ON t
 -- ============================================================
 -- query 70
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t1(c_key, c_bigint) VALUES (7,4);
+INSERT INTO ${case_db}.t1(c_key, c_bigint) VALUES ROW(7,4);
 
 -- query 71
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t2(c_key, c_int) VALUES (4,9);
+INSERT INTO ${case_db}.t2(c_key, c_int) VALUES ROW(4,9);
 
 -- query 72
 -- @order_sensitive=true
@@ -435,8 +433,7 @@ CREATE TABLE ${case_db}.skew_t1 (
     c_date     DATE,
     c_datetime DATETIME,
     c_string   STRING
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 82
 -- @skip_result_check=true
@@ -507,18 +504,16 @@ DROP TABLE IF EXISTS ${case_db}.t_mcv_r;
 -- query 99
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t_mcv_l (
-    k bigint null,
-    v int null
-)
-TBLPROPERTIES ("format-version" = "3");
+    k bigint ,
+    v int
+) WITH (format_version = 3);
 
 -- query 100
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t_mcv_r (
-    k bigint null,
-    v int null
-)
-TBLPROPERTIES ("format-version" = "3");
+    k bigint ,
+    v int
+) WITH (format_version = 3);
 
 -- query 101
 -- @skip_result_check=true
@@ -556,11 +551,11 @@ INSERT INTO ${case_db}.t_mcv_r SELECT (generate_series % 2502) + 1, 1 FROM TABLE
 
 -- query 111
 -- @skip_result_check=true
-ANALYZE TABLE ${case_db}.t_mcv_l;
+ANALYZE ${case_db}.t_mcv_l;
 
 -- query 112
 -- @skip_result_check=true
-ANALYZE TABLE ${case_db}.t_mcv_r;
+ANALYZE ${case_db}.t_mcv_r;
 
 -- query 113
 -- @skip_result_check=true
@@ -624,18 +619,16 @@ DROP TABLE IF EXISTS ${case_db}.t_mcv_r2;
 -- query 128
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t_mcv_l2 (
-    k bigint null,
-    v int null
-)
-TBLPROPERTIES ("format-version" = "3");
+    k bigint ,
+    v int
+) WITH (format_version = 3);
 
 -- query 129
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t_mcv_r2 (
-    k bigint null,
-    v int null
-)
-TBLPROPERTIES ("format-version" = "3");
+    k bigint ,
+    v int
+) WITH (format_version = 3);
 
 -- query 130
 -- @skip_result_check=true
@@ -655,11 +648,11 @@ INSERT INTO ${case_db}.t_mcv_r2 SELECT generate_series + 2, 1 FROM TABLE(generat
 
 -- query 134
 -- @skip_result_check=true
-ANALYZE TABLE ${case_db}.t_mcv_l2;
+ANALYZE ${case_db}.t_mcv_l2;
 
 -- query 135
 -- @skip_result_check=true
-ANALYZE TABLE ${case_db}.t_mcv_r2;
+ANALYZE ${case_db}.t_mcv_r2;
 
 -- query 136
 -- @skip_result_check=true
@@ -692,18 +685,16 @@ DROP TABLE IF EXISTS ${case_db}.t_null_r;
 -- query 143
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t_null_l (
-    k bigint null,
-    v int null
-)
-TBLPROPERTIES ("format-version" = "3");
+    k bigint ,
+    v int
+) WITH (format_version = 3);
 
 -- query 144
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t_null_r (
-    k bigint null,
-    v int null
-)
-TBLPROPERTIES ("format-version" = "3");
+    k bigint ,
+    v int
+) WITH (format_version = 3);
 
 -- query 145
 -- @skip_result_check=true
@@ -723,11 +714,11 @@ INSERT INTO ${case_db}.t_null_r SELECT (generate_series % 2000) + 1, 1 FROM TABL
 
 -- query 149
 -- @skip_result_check=true
-ANALYZE TABLE ${case_db}.t_null_l;
+ANALYZE ${case_db}.t_null_l;
 
 -- query 150
 -- @skip_result_check=true
-ANALYZE TABLE ${case_db}.t_null_r;
+ANALYZE ${case_db}.t_null_r;
 
 -- query 151
 -- @skip_result_check=true

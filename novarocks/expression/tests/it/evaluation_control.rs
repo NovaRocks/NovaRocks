@@ -181,6 +181,7 @@ fn signed_in_callback_root() -> (Arc<CompiledExprSet>, RootOrdinal) {
                     None,
                     widen_to.clone(),
                     ExprKind::Cast {
+                        array_failure_mode: None,
                         expr: literal,
                         target: DataType::Int64,
                         decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,

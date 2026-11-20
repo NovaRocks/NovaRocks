@@ -21,13 +21,13 @@
 DROP TABLE IF EXISTS ${case_db}.materialized_output_layout_dist_t;
 CREATE TABLE ${case_db}.materialized_output_layout_dist_t (dept INT, score INT);
 INSERT INTO ${case_db}.materialized_output_layout_dist_t VALUES
-    (1, 10),
-    (1, 20),
-    (1, 30),
-    (2, 5),
-    (2, 15),
-    (2, 25);
-ANALYZE TABLE ${case_db}.materialized_output_layout_dist_t;
+    ROW(1, 10),
+    ROW(1, 20),
+    ROW(1, 30),
+    ROW(2, 5),
+    ROW(2, 15),
+    ROW(2, 25);
+ANALYZE ${case_db}.materialized_output_layout_dist_t;
 
 -- @skip_result_check=true
 -- @explain_contains=HASH AGGREGATE (LOCAL,

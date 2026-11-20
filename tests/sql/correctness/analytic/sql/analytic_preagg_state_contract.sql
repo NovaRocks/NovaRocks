@@ -21,15 +21,14 @@ CREATE TABLE ${case_db}.analytic_preagg_state_contract (
     score INT,
     v BIGINT,
     d DOUBLE
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 INSERT INTO ${case_db}.analytic_preagg_state_contract VALUES
-    (1, 100, 10, 0.10),
-    (1, 90, 20, 0.20),
-    (1, 90, 30, 0.30),
-    (2, 100, 100, 0.40),
-    (2, 80, 200, 0.50),
-    (2, 70, NULL, NULL);
+    ROW(1, 100, 10, 0.10),
+    ROW(1, 90, 20, 0.20),
+    ROW(1, 90, 30, 0.30),
+    ROW(2, 100, 100, 0.40),
+    ROW(2, 80, 200, 0.50),
+    ROW(2, 70, NULL, NULL);
 
 -- @explain_contains=predicate: rk <= 2
 -- @explain_contains=WINDOW [avg(v)]

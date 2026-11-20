@@ -27,13 +27,12 @@
 -- query 1
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t0 (
-  c0 INT NULL,
-  c1 INT NULL,
-  c2 VARCHAR(65533) NULL,
-  c3 VARCHAR(65533) NULL,
-  c4 ARRAY<VARCHAR(65533)> NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+  c0 INT ,
+  c1 INT ,
+  c2 VARCHAR(65533) ,
+  c3 VARCHAR(65533) ,
+  c4 ARRAY<VARCHAR(65533)>
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t0
 SELECT
@@ -62,9 +61,9 @@ SELECT assert_true(count(pred) = count(IF(pred, 1, NULL))) FROM cte1;
 -- first_value IGNORE NULLS
 WITH cte AS (
     SELECT
-        first_value(c2 IGNORE NULLS) OVER (PARTITION BY c0 ORDER BY c1) AS a,
-        first_value(c3 IGNORE NULLS) OVER (PARTITION BY c0 ORDER BY c1) AS b,
-        first_value(c4 IGNORE NULLS) OVER (PARTITION BY c0 ORDER BY c1) AS c
+        first_value(c2 ) IGNORE NULLS OVER (PARTITION BY c0 ORDER BY c1) AS a,
+        first_value(c3 ) IGNORE NULLS OVER (PARTITION BY c0 ORDER BY c1) AS b,
+        first_value(c4 ) IGNORE NULLS OVER (PARTITION BY c0 ORDER BY c1) AS c
     FROM ${case_db}.t0
 ),
 cte1 AS (
@@ -90,9 +89,9 @@ SELECT assert_true(count(pred) = count(IF(pred, 1, NULL))) FROM cte1;
 -- last_value IGNORE NULLS
 WITH cte AS (
     SELECT
-        last_value(c2 IGNORE NULLS) OVER (PARTITION BY c0 ORDER BY c1) AS a,
-        last_value(c3 IGNORE NULLS) OVER (PARTITION BY c0 ORDER BY c1) AS b,
-        last_value(c4 IGNORE NULLS) OVER (PARTITION BY c0 ORDER BY c1) AS c
+        last_value(c2 ) IGNORE NULLS OVER (PARTITION BY c0 ORDER BY c1) AS a,
+        last_value(c3 ) IGNORE NULLS OVER (PARTITION BY c0 ORDER BY c1) AS b,
+        last_value(c4 ) IGNORE NULLS OVER (PARTITION BY c0 ORDER BY c1) AS c
     FROM ${case_db}.t0
 ),
 cte1 AS (
@@ -118,9 +117,9 @@ SELECT assert_true(count(pred) = count(IF(pred, 1, NULL))) FROM cte1;
 -- lead IGNORE NULLS
 WITH cte AS (
     SELECT
-        lead(c2 IGNORE NULLS) OVER (PARTITION BY c0 ORDER BY c1) AS a,
-        lead(c3 IGNORE NULLS) OVER (PARTITION BY c0 ORDER BY c1) AS b,
-        lead(c4 IGNORE NULLS) OVER (PARTITION BY c0 ORDER BY c1) AS c
+        lead(c2 ) IGNORE NULLS OVER (PARTITION BY c0 ORDER BY c1) AS a,
+        lead(c3 ) IGNORE NULLS OVER (PARTITION BY c0 ORDER BY c1) AS b,
+        lead(c4 ) IGNORE NULLS OVER (PARTITION BY c0 ORDER BY c1) AS c
     FROM ${case_db}.t0
 ),
 cte1 AS (
@@ -146,9 +145,9 @@ SELECT assert_true(count(pred) = count(IF(pred, 1, NULL))) FROM cte1;
 -- lag IGNORE NULLS
 WITH cte AS (
     SELECT
-        lag(c2 IGNORE NULLS) OVER (PARTITION BY c0 ORDER BY c1) AS a,
-        lag(c3 IGNORE NULLS) OVER (PARTITION BY c0 ORDER BY c1) AS b,
-        lag(c4 IGNORE NULLS) OVER (PARTITION BY c0 ORDER BY c1) AS c
+        lag(c2 ) IGNORE NULLS OVER (PARTITION BY c0 ORDER BY c1) AS a,
+        lag(c3 ) IGNORE NULLS OVER (PARTITION BY c0 ORDER BY c1) AS b,
+        lag(c4 ) IGNORE NULLS OVER (PARTITION BY c0 ORDER BY c1) AS c
     FROM ${case_db}.t0
 ),
 cte1 AS (

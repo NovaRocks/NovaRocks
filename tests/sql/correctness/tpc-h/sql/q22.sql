@@ -17,7 +17,7 @@
 
 select
     cntrycode,
-    count(*) as numcust,
+    count() as numcust,
     sum(c_acctbal) as totacctbal
 from
     (

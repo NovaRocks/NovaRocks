@@ -31,44 +31,41 @@ CREATE TABLE t1 (
   province VARCHAR(64),
   age SMALLINT,
   dt VARCHAR(10)
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 3
 -- @skip_result_check=true
 USE ${case_db};
 CREATE TABLE t2 (
-  `id` bigint,
-  `dt` varchar(10),
-  `ds_id` binary,
-  `ds_province` binary,
-  `ds_age` binary,
-  `ds_dt` binary
-)
-TBLPROPERTIES ("format-version" = "3");
+  "id" bigint,
+  "dt" varchar(10),
+  "ds_id" binary,
+  "ds_province" binary,
+  "ds_age" binary,
+  "ds_dt" binary
+) WITH (format_version = 3);
 
 -- query 4
 -- @skip_result_check=true
 USE ${case_db};
 CREATE TABLE t3 (
-  `id` bigint NOT NULL,
-  `dt` varchar(10) NOT NULL,
-  `ds_id` binary,
-  `ds_province` binary,
-  `ds_age` binary,
-  `ds_dt` binary
-)
-TBLPROPERTIES ("format-version" = "3");
+  "id" bigint NOT NULL,
+  "dt" varchar(10) NOT NULL,
+  "ds_id" binary,
+  "ds_province" binary,
+  "ds_age" binary,
+  "ds_dt" binary
+) WITH (format_version = 3);
 
 -- query 5
 -- @skip_result_check=true
 USE ${case_db};
-insert into t1 select generate_series, generate_series, generate_series % 100, "2024-07-24" from table(generate_series(1, 1000));
+insert into t1 select generate_series, generate_series, generate_series % 100, '2024-07-24' from table(generate_series(1, 1000));
 
 -- query 6
 -- @skip_result_check=true
 USE ${case_db};
-INSERT INTO t1 VALUES (NULL, NULL, NULL, NULL), (NULL, 'a', 1, '2024-07-24'), (1, NULL, 1, '2024-07-24');
+INSERT INTO t1 VALUES ROW(NULL, NULL, NULL, NULL), ROW(NULL, 'a', 1, '2024-07-24'), ROW(1, NULL, 1, '2024-07-24');
 
 -- query 7
 -- @skip_result_check=true
@@ -76,13 +73,13 @@ USE ${case_db};
 INSERT INTO t2 SELECT id, dt,
   ds_hll_count_distinct_state(id),
   ds_hll_count_distinct_state(province, 10),
-  ds_hll_count_distinct_state(age, 20, "HLL_6"),
-  ds_hll_count_distinct_state(dt, 10, "HLL_8") FROM t1;
+  ds_hll_count_distinct_state(age, 20, 'HLL_6'),
+  ds_hll_count_distinct_state(dt, 10, 'HLL_8') FROM t1;
 
 -- query 8
 -- @skip_result_check=true
 USE ${case_db};
-INSERT INTO t2 VALUES (NULL, NULL, NULL, NULL, NULL, NULL), (NULL, 'a', to_binary('AgEHEQMIAQQ9nPUc', 'encode64'), to_binary('AgEHEQMIAQQ9nPUc', 'encode64'), to_binary('AgEHEQMIAQQ9nPUc', 'encode64'), to_binary('AgEHEQMIAQQ9nPUc', 'encode64')), (1, NULL, to_binary('AgEHEQMIAQQ9nPUc', 'encode64'), to_binary('AgEHEQMIAQQ9nPUc', 'encode64'), to_binary('AgEHEQMIAQQ9nPUc', 'encode64'), to_binary('AgEHEQMIAQQ9nPUc', 'encode64'));
+INSERT INTO t2 VALUES ROW(NULL, NULL, NULL, NULL, NULL, NULL), ROW(NULL, 'a', to_binary('AgEHEQMIAQQ9nPUc', 'encode64'), to_binary('AgEHEQMIAQQ9nPUc', 'encode64'), to_binary('AgEHEQMIAQQ9nPUc', 'encode64'), to_binary('AgEHEQMIAQQ9nPUc', 'encode64')), ROW(1, NULL, to_binary('AgEHEQMIAQQ9nPUc', 'encode64'), to_binary('AgEHEQMIAQQ9nPUc', 'encode64'), to_binary('AgEHEQMIAQQ9nPUc', 'encode64'), to_binary('AgEHEQMIAQQ9nPUc', 'encode64'));
 
 -- query 9
 -- @skip_result_check=true
@@ -112,7 +109,7 @@ select DS_HLL_ESTIMATE(dt) from t1;
 -- query 14
 -- @skip_result_check=true
 USE ${case_db};
-SELECT dt, DS_HLL_ACCUMULATE(id), DS_HLL_ACCUMULATE(province, 20),  DS_HLL_ACCUMULATE(age, 12, "HLL_6"), DS_HLL_ACCUMULATE(dt) FROM t1 GROUP BY dt ORDER BY 1 limit 3;
+SELECT dt, DS_HLL_ACCUMULATE(id), DS_HLL_ACCUMULATE(province, 20),  DS_HLL_ACCUMULATE(age, 12, 'HLL_6'), DS_HLL_ACCUMULATE(dt) FROM t1 GROUP BY dt ORDER BY 1 limit 3;
 
 -- query 15
 -- @skip_result_check=true
@@ -215,13 +212,13 @@ USE ${case_db};
 INSERT INTO t2 SELECT id, dt,
   ds_hll_count_distinct_state(id),
   ds_hll_count_distinct_state(province, 10),
-  ds_hll_count_distinct_state(age, 20, "HLL_6"),
-  ds_hll_count_distinct_state(dt, 10, "HLL_8") FROM t1;
+  ds_hll_count_distinct_state(age, 20, 'HLL_6'),
+  ds_hll_count_distinct_state(dt, 10, 'HLL_8') FROM t1;
 
 -- query 27
 -- @skip_result_check=true
 USE ${case_db};
-INSERT INTO t2 VALUES (NULL, NULL, NULL, NULL, NULL, NULL), (NULL, 'a', to_binary('AgEHEQMIAQQ9nPUc', 'encode64'), to_binary('AgEHEQMIAQQ9nPUc', 'encode64'), to_binary('AgEHEQMIAQQ9nPUc', 'encode64'), to_binary('AgEHEQMIAQQ9nPUc', 'encode64')), (1, NULL, to_binary('AgEHEQMIAQQ9nPUc', 'encode64'), to_binary('AgEHEQMIAQQ9nPUc', 'encode64'), to_binary('AgEHEQMIAQQ9nPUc', 'encode64'), to_binary('AgEHEQMIAQQ9nPUc', 'encode64'));
+INSERT INTO t2 VALUES ROW(NULL, NULL, NULL, NULL, NULL, NULL), ROW(NULL, 'a', to_binary('AgEHEQMIAQQ9nPUc', 'encode64'), to_binary('AgEHEQMIAQQ9nPUc', 'encode64'), to_binary('AgEHEQMIAQQ9nPUc', 'encode64'), to_binary('AgEHEQMIAQQ9nPUc', 'encode64')), ROW(1, NULL, to_binary('AgEHEQMIAQQ9nPUc', 'encode64'), to_binary('AgEHEQMIAQQ9nPUc', 'encode64'), to_binary('AgEHEQMIAQQ9nPUc', 'encode64'), to_binary('AgEHEQMIAQQ9nPUc', 'encode64'));
 
 -- query 28
 -- @skip_result_check=true

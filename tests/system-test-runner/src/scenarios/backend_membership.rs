@@ -482,14 +482,10 @@ impl Scenario for PreReadyReplan {
             context.remaining("connect replan setup client")?;
             SqlSession::new(context.sql_user(), context.trino_port(), context.deadline())?
         };
-        setup
-            .execute(format!(
-                "CREATE EXTERNAL CATALOG {catalog} PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"hadoop\",\"iceberg.catalog.warehouse\"=\"{}\")",
-                warehouse.display()
-            ))
+        super::connector::create_catalog(&mut setup, catalog, &warehouse)
             .context("create replan Hadoop Iceberg catalog")?;
         setup
-            .execute(format!("CREATE DATABASE {catalog}.ns"))
+            .execute(format!("CREATE SCHEMA {catalog}.ns"))
             .context("create replan Iceberg namespace")?;
         setup
             .execute(format!("USE {catalog}.ns"))
@@ -702,14 +698,10 @@ impl Scenario for PreReadyDmlNoRecovery {
             context.remaining("connect DML setup client")?;
             SqlSession::new(context.sql_user(), context.trino_port(), context.deadline())?
         };
-        setup
-            .execute(format!(
-                "CREATE EXTERNAL CATALOG {catalog} PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"hadoop\",\"iceberg.catalog.warehouse\"=\"{}\")",
-                warehouse.display()
-            ))
+        super::connector::create_catalog(&mut setup, catalog, &warehouse)
             .context("create DML Hadoop Iceberg catalog")?;
         setup
-            .execute(format!("CREATE DATABASE {catalog}.ns"))
+            .execute(format!("CREATE SCHEMA {catalog}.ns"))
             .context("create DML Iceberg namespace")?;
         setup
             .execute(format!("USE {catalog}.ns"))

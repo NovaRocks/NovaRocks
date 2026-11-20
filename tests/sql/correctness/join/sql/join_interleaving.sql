@@ -31,20 +31,19 @@ DROP TABLE IF EXISTS ${case_db}.lineitem;
 -- query 2
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.lineitem (
-  `l_orderkey` int(11) NOT NULL,
-  `l_partkey` int(11) NOT NULL,
-  `l_suppkey` int(11)
-)
-TBLPROPERTIES ("format-version" = "3");
+  "l_orderkey" int(11) NOT NULL,
+  "l_partkey" int(11) NOT NULL,
+  "l_suppkey" int(11)
+) WITH (format_version = 3);
 
 -- query 3
 -- @skip_result_check=true
 INSERT INTO ${case_db}.lineitem VALUES
-  (1,1,1),(1,2,1),(1,3,2),(11,1,11),(11,2,1),(2,3,2),(2,3,NULL);
+  ROW(1,1,1),ROW(1,2,1),ROW(1,3,2),ROW(11,1,11),ROW(11,2,1),ROW(2,3,2),ROW(2,3,NULL);
 
 -- query 4
 -- @skip_result_check=true
-set pipeline_dop = 1;
+SET SESSION pipeline_dop = 1;
 
 -- ============================================================
 -- chunk_size = 2, inequality join condition (<>)

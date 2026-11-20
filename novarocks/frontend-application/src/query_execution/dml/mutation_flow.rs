@@ -32,8 +32,7 @@ use novarocks_parser::{SYNTHETIC, ast, build};
 use novarocks_query_application::admitted_query_context::QueryExecutionContext;
 use novarocks_sql::planning::dml::{
     DmlChangeStreamCompileRequest, DmlChangeStreamKind, DmlChangeStreamRoute,
-    DmlPreExpandKeyedAssert, DmlWriteSinkMode, IcebergRefSuffix,
-    dml_change_stream_optimizer_settings, split_ref_suffix,
+    DmlPreExpandKeyedAssert, DmlWriteSinkMode, dml_change_stream_optimizer_settings,
 };
 use novarocks_sql::planning::query_execution::FrozenConnectorScanIdentity;
 use novarocks_sql::semantic::ObjectName;
@@ -470,7 +469,7 @@ fn finish_change_stream_write(
 /// Admitted syntax is the sole mutation input.
 #[derive(Clone, Debug)]
 pub(crate) struct PreparedUpdateStatement {
-    pub(crate) table: ObjectName,
+    pub(crate) table: super::mutation::RowMutationTarget,
     pub(crate) alias: Option<novarocks_parser::ast::Ident>,
     pub(crate) assignments: Vec<PreparedMutationAssignment>,
     pub(crate) source: Option<PreparedMutationSource>,
@@ -479,7 +478,7 @@ pub(crate) struct PreparedUpdateStatement {
 impl PreparedUpdateStatement {}
 #[derive(Clone, Debug)]
 pub(crate) struct PreparedMergeStatement {
-    pub(crate) table: ObjectName,
+    pub(crate) table: super::mutation::RowMutationTarget,
     pub(crate) target_alias: Option<novarocks_parser::ast::Ident>,
     pub(crate) source: PreparedMutationSource,
     pub(crate) on: novarocks_parser::ast::Expr,
@@ -580,29 +579,10 @@ pub(super) fn resolve_update_target(
     (crate::catalog_application::resolver::TargetBackend, String),
     crate::catalog_application::resolver::TargetResolutionError,
 > {
-    // Detect branch/tag suffix in the target table name.
-    let (stripped_parts, ref_suffix) = split_ref_suffix(&stmt.table.parts);
-    let effective_name;
-    let table_name: &ObjectName = match ref_suffix {
-        Some(IcebergRefSuffix::Tag(ref tag_name)) => {
-            return Err((format!(
-                "iceberg ref: tag '{tag_name}' is read-only; use a branch as DML target"
-            ))
-            .into());
-        }
-        Some(IcebergRefSuffix::Branch(_)) => {
-            effective_name = ObjectName {
-                parts: stripped_parts,
-            };
-            &effective_name
-        }
-        None => &stmt.table,
-    };
-    let target_ref = match &ref_suffix {
-        Some(IcebergRefSuffix::Branch(b)) => b.clone(),
-        _ => "main".to_string(),
-    };
-
+    let (table_name, target_ref) = stmt
+        .table
+        .table_and_reference()
+        .map_err(crate::catalog_application::resolver::TargetResolutionError::from)?;
     let target = crate::catalog_application::resolver::resolve_existing_table_target(
         state,
         table_name,
@@ -617,7 +597,7 @@ pub(super) fn resolve_update_target(
         .into());
     }
 
-    Ok((target, target_ref))
+    Ok((target, target_ref.to_owned()))
 }
 
 fn finish_update_mutation_preparation(
@@ -691,27 +671,10 @@ pub(super) fn resolve_merge_target(
     (crate::catalog_application::resolver::TargetBackend, String),
     crate::catalog_application::resolver::TargetResolutionError,
 > {
-    let (stripped_parts, ref_suffix) = split_ref_suffix(&stmt.table.parts);
-    let effective_name;
-    let table_name: &ObjectName = match ref_suffix {
-        Some(IcebergRefSuffix::Tag(ref tag_name)) => {
-            return Err((format!(
-                "iceberg ref: tag '{tag_name}' is read-only; use a branch as DML target"
-            ))
-            .into());
-        }
-        Some(IcebergRefSuffix::Branch(_)) => {
-            effective_name = ObjectName {
-                parts: stripped_parts,
-            };
-            &effective_name
-        }
-        None => &stmt.table,
-    };
-    let target_ref = match &ref_suffix {
-        Some(IcebergRefSuffix::Branch(branch)) => branch.clone(),
-        _ => "main".to_string(),
-    };
+    let (table_name, target_ref) = stmt
+        .table
+        .table_and_reference()
+        .map_err(crate::catalog_application::resolver::TargetResolutionError::from)?;
     let target = crate::catalog_application::resolver::resolve_existing_table_target(
         state,
         table_name,
@@ -725,7 +688,7 @@ pub(super) fn resolve_merge_target(
         ))
         .into());
     }
-    Ok((target, target_ref))
+    Ok((target, target_ref.to_owned()))
 }
 
 fn finish_merge_mutation_preparation(
@@ -799,11 +762,11 @@ fn finish_merge_mutation_preparation(
     })
 }
 
-fn generated_name(parts: &[&str], quote: Option<char>) -> Result<ast::ObjectName, String> {
+fn generated_name(parts: &[&str], quoted: bool) -> Result<ast::ObjectName, String> {
     build::object_name(
         parts
             .iter()
-            .map(|part| build::ident(*part, quote))
+            .map(|part| build::ident(*part, quoted))
             .collect(),
     )
     .map_err(|error| error.to_string())
@@ -813,19 +776,21 @@ fn mutation_target_relation(
     target: &crate::catalog_application::resolver::TargetBackend,
     alias: ast::Ident,
     target_ref: &str,
-) -> Result<ast::TableFactor, String> {
-    let version = (target_ref != "main").then(|| ast::TableVersion {
-        kind: ast::TableVersionKind::ForVersionAsOf,
-        value: build::string(target_ref),
+) -> Result<ast::Relation, String> {
+    let version = (target_ref != "main").then(|| ast::QueryPeriod {
+        range_type: ast::QueryPeriodRangeType::Version,
+        start: None,
+        end: Some(ast::AstBox::new(build::string(target_ref))),
         span: SYNTHETIC,
     });
-    Ok(build::table(
-        generated_name(
-            &[&target.catalog, &target.namespace, &target.table],
-            Some('`'),
-        )?,
-        version,
-        Some(build::alias(alias, vec![], true)),
+    Ok(build::alias(
+        build::table(
+            generated_name(&[&target.catalog, &target.namespace, &target.table], true)?,
+            version,
+            None,
+        ),
+        alias,
+        None,
     ))
 }
 
@@ -844,14 +809,14 @@ fn mutation_source_table_name(
     } else {
         vec![resolved.table.as_str()]
     };
-    generated_name(&parts, None)
+    generated_name(&parts, false)
 }
 
 fn mutation_source_relation(
     source: &PreparedMutationSource,
     current_catalog: Option<&str>,
     target: &crate::catalog_application::resolver::TargetBackend,
-) -> Result<ast::TableFactor, String> {
+) -> Result<ast::Relation, String> {
     match source {
         PreparedMutationSource::Table { name, alias } => {
             let resolved = novarocks_types::naming::resolve_catalog_table_name(
@@ -859,25 +824,24 @@ fn mutation_source_relation(
                 current_catalog,
                 &target.namespace,
             )?;
-            Ok(build::table(
-                mutation_source_table_name(&resolved, target)?,
-                None,
-                alias
-                    .clone()
-                    .map(|a| build::alias(build::ident_at(a.value, None, a.span), vec![], true)),
-            ))
+            let relation = build::table(mutation_source_table_name(&resolved, target)?, None, None);
+            Ok(match alias {
+                Some(alias) => build::alias(
+                    relation,
+                    build::ident_at(&alias.value, false, alias.span),
+                    None,
+                ),
+                None => relation,
+            })
         }
         PreparedMutationSource::Query { query, alias } => {
             let alias = alias
                 .as_ref()
                 .ok_or_else(|| "MERGE/UPDATE subquery source requires an alias".to_owned())?;
-            Ok(build::derived(
-                query.as_ref().clone(),
-                Some(build::alias(
-                    build::ident_at(&alias.value, None, alias.span),
-                    vec![],
-                    true,
-                )),
+            Ok(build::alias(
+                build::derived(query.as_ref().clone()),
+                build::ident_at(&alias.value, false, alias.span),
+                None,
             ))
         }
     }
@@ -900,17 +864,17 @@ fn update_assignment_projection(
                     )
                 })?;
             Ok((
-                build::ident_at(&column.name, None, assignment.column_span),
-                build::nested(assignment.value.clone()),
+                build::ident_at(&column.name, false, assignment.column_span),
+                assignment.value.clone(),
             ))
         })
         .collect()
 }
 
 fn build_update_match_query(
-    target: ast::TableFactor,
+    target: ast::Relation,
     target_alias: ast::Ident,
-    source: Option<ast::TableFactor>,
+    source: Option<ast::Relation>,
     assignments: Vec<(ast::Ident, ast::Expr)>,
     selection: Option<ast::Expr>,
 ) -> Result<ast::Query, String> {
@@ -928,9 +892,8 @@ fn build_update_match_query(
     .into_iter()
     .map(|(name, alias)| {
         build::item(
-            build::column(target_alias.clone(), build::ident(name, None)),
-            Some(build::ident(alias, None)),
-            true,
+            build::column(target_alias.clone(), build::ident(name, false)),
+            Some(build::ident(alias, false)),
         )
     })
     .collect::<Vec<_>>();
@@ -941,24 +904,20 @@ fn build_update_match_query(
             expr,
             Some(build::ident_at(
                 format!("__nr_new_{}", column.value),
-                None,
+                false,
                 column.span,
             )),
-            true,
         )
     }));
-    let mut from = build::relation(target);
+    let mut from = target;
     if let Some(source) = source {
-        from = build::join(
-            from,
-            ast::JoinOperator::Cross,
-            source,
-            ast::JoinConstraint::None,
-        );
+        from = build::join(from, novarocks_parser::ast::JoinType::Cross, source, None);
     }
-    let select = build::select(projection, vec![from], selection, ast::GroupBy::None)
+    let select = build::select(projection, Some(from), selection, None)
         .map_err(|error| error.to_string())?;
-    Ok(build::query(ast::SetExpr::Select(Box::new(select))))
+    Ok(build::query(ast::SetExpr::Select(
+        novarocks_parser::ast::AstBox::new(select),
+    )))
 }
 
 fn build_update_mor_producer(
@@ -978,8 +937,8 @@ fn build_update_mor_producer(
     let alias = stmt
         .alias
         .clone()
-        .unwrap_or_else(|| build::ident("__nr_t", None));
-    let alias = build::ident_at(alias.value, None, alias.span);
+        .unwrap_or_else(|| build::ident("__nr_t", false));
+    let alias = build::ident_at(alias.value, false, alias.span);
     let query = build_update_match_query(
         mutation_target_relation(target, alias.clone(), target_ref)?,
         alias,
@@ -1015,9 +974,9 @@ fn build_update_mor_producer(
     reason = "The MERGE query author preserves each admitted clause and frozen target declaration."
 )]
 fn build_merge_match_query(
-    target: ast::TableFactor,
+    target: ast::Relation,
     target_alias: ast::Ident,
-    source: ast::TableFactor,
+    source: ast::Relation,
     on: ast::Expr,
     matched_predicate: Option<ast::Expr>,
     not_matched_predicate: Option<ast::Expr>,
@@ -1027,7 +986,7 @@ fn build_merge_match_query(
     matched_action: Option<i32>,
     has_not_matched_insert: bool,
 ) -> Result<ast::Query, String> {
-    let qualify = |name: &str| build::column(target_alias.clone(), build::ident(name, Some('`')));
+    let qualify = |name: &str| build::column(target_alias.clone(), build::ident(name, true));
     let nullable = |name: &str| {
         build::case_when(
             vec![(build::is_null(qualify("_file"), true), qualify(name))],
@@ -1038,21 +997,21 @@ fn build_merge_match_query(
     let mut action_cases = Vec::new();
     if let Some(action) = matched_action {
         action_cases.push((
-            build::binary(
+            build::and_all(vec![
                 build::is_null(qualify("_file"), true),
-                ast::BinaryOperator::And,
-                build::nested(matched_predicate.unwrap_or_else(|| build::boolean(true))),
-            ),
+                matched_predicate.unwrap_or_else(|| build::boolean(true)),
+            ])
+            .expect("MERGE matched action has two predicates"),
             build::integer(i64::from(action)),
         ));
     }
     if has_not_matched_insert {
         action_cases.push((
-            build::binary(
+            build::and_all(vec![
                 build::is_null(qualify("_file"), false),
-                ast::BinaryOperator::And,
-                build::nested(not_matched_predicate.unwrap_or_else(|| build::boolean(true))),
-            ),
+                not_matched_predicate.unwrap_or_else(|| build::boolean(true)),
+            ])
+            .expect("MERGE not-matched action has two predicates"),
             build::integer(i64::from(MERGE_ACTION_NOT_MATCHED_INSERT)),
         ));
     }
@@ -1076,20 +1035,17 @@ fn build_merge_match_query(
     ] {
         projection.push(build::item(
             nullable(name)?,
-            Some(build::ident(alias, None)),
-            true,
+            Some(build::ident(alias, false)),
         ));
     }
     projection.push(build::item(
-        build::nested(action),
-        Some(build::ident("__nr_merge_action", None)),
-        true,
+        action,
+        Some(build::ident("__nr_merge_action", false)),
     ));
     for column in target_columns {
         projection.push(build::item(
             nullable(&column.name)?,
-            Some(build::ident(&column.name, Some('`'))),
-            true,
+            Some(build::ident(&column.name, true)),
         ));
     }
     for (prefix, values) in [
@@ -1098,25 +1054,29 @@ fn build_merge_match_query(
     ] {
         projection.extend(values.into_iter().map(|(column, expr)| {
             build::item(
-                build::nested(expr),
+                expr,
                 Some(build::ident_at(
                     format!("{prefix}{}", column.value),
-                    None,
+                    false,
                     column.span,
                 )),
-                true,
             )
         }));
     }
-    let from = build::join(
-        build::relation(source),
-        ast::JoinOperator::LeftOuter,
-        target,
-        ast::JoinConstraint::On(on),
-    );
-    let select = build::select(projection, vec![from], None, ast::GroupBy::None)
-        .map_err(|error| error.to_string())?;
-    Ok(build::query(ast::SetExpr::Select(Box::new(select))))
+    let from = build::join(source, novarocks_parser::ast::JoinType::Left, target, {
+        let expression = on;
+        Some(novarocks_parser::ast::JoinCriteria::On(
+            novarocks_parser::ast::JoinOn {
+                span: expression.span(),
+                expression,
+            },
+        ))
+    });
+    let select =
+        build::select(projection, Some(from), None, None).map_err(|error| error.to_string())?;
+    Ok(build::query(ast::SetExpr::Select(
+        novarocks_parser::ast::AstBox::new(select),
+    )))
 }
 
 fn build_merge_mor_producer(
@@ -1137,20 +1097,15 @@ fn build_merge_mor_producer(
     let alias = stmt
         .target_alias
         .clone()
-        .unwrap_or_else(|| build::ident(MERGE_TARGET_DEFAULT_ALIAS, None));
-    let alias = build::ident_at(alias.value, None, alias.span);
+        .unwrap_or_else(|| build::ident(MERGE_TARGET_DEFAULT_ALIAS, false));
+    let alias = build::ident_at(alias.value, false, alias.span);
     let mut source = mutation_source_relation(&stmt.source, current_catalog, target)?;
-    match &mut source {
-        ast::TableFactor::Table { alias, .. } | ast::TableFactor::Derived { alias, .. }
-            if alias.is_none() =>
-        {
-            *alias = Some(build::alias(
-                build::ident(MERGE_SOURCE_DEFAULT_ALIAS, None),
-                vec![],
-                true,
-            ))
-        }
-        _ => {}
+    if !matches!(&source, ast::Relation::Aliased(_)) {
+        source = build::alias(
+            source,
+            build::ident(MERGE_SOURCE_DEFAULT_ALIAS, false),
+            None,
+        );
     }
     let matched_assignments = match stmt.matched.as_ref().map(|clause| &clause.action) {
         Some(PreparedMergeMatchedAction::Update { assignments }) => assignments
@@ -1166,8 +1121,8 @@ fn build_merge_mor_producer(
                         )
                     })?;
                 Ok((
-                    build::ident_at(&column.name, None, assignment.column_span),
-                    build::nested(assignment.value.clone()),
+                    build::ident_at(&column.name, false, assignment.column_span),
+                    assignment.value.clone(),
                 ))
             })
             .collect::<Result<Vec<_>, String>>()?,
@@ -1178,7 +1133,7 @@ fn build_merge_mor_producer(
         for column in columns {
             if let Some(index) = column.value_index {
                 let expr = clause.action.values[index].clone();
-                insert_values.push((build::ident(&column.name, None), build::nested(expr)));
+                insert_values.push((build::ident(&column.name, false), expr));
             }
         }
     }
@@ -1385,44 +1340,40 @@ mod tests {
     use novarocks_types::schema::ColumnDef;
 
     fn test_query(source: &str) -> ast::Query {
-        let [ast::Statement::Query(query)]: [ast::Statement; 1] =
-            novarocks_parser::parse(source).unwrap().try_into().unwrap()
-        else {
-            panic!("query fixture");
-        };
-        query
+        novarocks_parser::parser::parse_query(source).unwrap()
     }
     fn test_expr(source: &str) -> ast::Expr {
         let query = test_query(&format!("SELECT {source}"));
-        let ast::SetExpr::Select(mut select) = *query.body else {
+        let ast::SetExpr::Select(mut select) = query.body.into_inner() else {
             panic!("select fixture");
         };
-        let ast::SelectItem::UnnamedExpr(expr) = select.projection.remove(0) else {
+        let ast::SelectItem::SingleColumn(column) = select.projection.remove(0) else {
             panic!("expression fixture");
         };
-        expr
+        assert!(column.alias.is_none());
+        column.into_inner().expression
     }
     fn prepared_update(source: &str) -> PreparedUpdateStatement {
-        let [ast::Statement::Dml(statement)]: [ast::Statement; 1] =
-            novarocks_parser::parse(source).unwrap().try_into().unwrap()
+        let ast::TrinoStatement::Update(statement) =
+            novarocks_parser::parser::parse_statement(source).unwrap()
         else {
             panic!("update fixture");
         };
         let super::super::mutation::OwnedMutationStatement::Update(prepared) =
-            super::super::mutation::lower_statement(&statement, source).unwrap()
+            crate::dml::mutation::prepare_trino_update_shape(statement, source).unwrap()
         else {
             panic!("update fixture");
         };
         *prepared
     }
     fn prepared_merge(source: &str) -> PreparedMergeStatement {
-        let [ast::Statement::Dml(statement)]: [ast::Statement; 1] =
-            novarocks_parser::parse(source).unwrap().try_into().unwrap()
+        let ast::TrinoStatement::Merge(statement) =
+            novarocks_parser::parser::parse_statement(source).unwrap()
         else {
             panic!("merge fixture");
         };
         let super::super::mutation::OwnedMutationStatement::Merge(prepared) =
-            super::super::mutation::lower_statement(&statement, source).unwrap()
+            crate::dml::mutation::prepare_trino_merge_shape(statement, source).unwrap()
         else {
             panic!("merge fixture");
         };
@@ -1435,12 +1386,12 @@ mod tests {
             value: test_expr(value),
         }
     }
-    fn test_relation(source: &str) -> ast::TableFactor {
+    fn test_relation(source: &str) -> ast::Relation {
         let query = test_query(&format!("SELECT * FROM {source}"));
-        let ast::SetExpr::Select(mut select) = *query.body else {
+        let ast::SetExpr::Select(mut select) = query.body.into_inner() else {
             panic!("select fixture");
         };
-        select.from.remove(0).relation
+        select.from.take().expect("FROM relation")
     }
     #[expect(
         clippy::too_many_arguments,
@@ -1461,7 +1412,7 @@ mod tests {
     ) -> ast::Query {
         build_merge_match_query(
             test_relation(target),
-            build::ident(target_alias, None),
+            build::ident(target_alias, false),
             test_relation(source),
             test_expr(on),
             matched_predicate.map(test_expr),
@@ -1469,11 +1420,11 @@ mod tests {
             columns,
             assignments
                 .iter()
-                .map(|(name, value)| (build::ident(*name, None), test_expr(value)))
+                .map(|(name, value)| (build::ident(*name, false), test_expr(value)))
                 .collect(),
             inserts
                 .iter()
-                .map(|(name, value)| (build::ident(*name, None), test_expr(value)))
+                .map(|(name, value)| (build::ident(*name, false), test_expr(value)))
                 .collect(),
             matched_action,
             insert,
@@ -1546,29 +1497,31 @@ mod tests {
 
     #[test]
     fn mor_source_table_and_internal_names_keep_admitted_identity() {
-        let prepared = prepared_update(
-            "UPDATE ice.db1.t AS t SET `odd name` = 7 FROM other.db2.source AS s WHERE t.id = s.id",
+        let merge = prepared_merge(
+            "MERGE INTO ice.db1.t AS t\nUSING other.db2.source AS s\nON t.id = s.id\nWHEN MATCHED THEN UPDATE SET \"odd name\" = 7",
         );
-        let source = mutation_source_relation(
-            prepared.source.as_ref().unwrap(),
-            Some("ice"),
-            &iceberg_target(),
-        )
-        .unwrap();
-        let ast::TableFactor::Table { name, .. } = source else {
+        let source =
+            mutation_source_relation(&merge.source, Some("ice"), &iceberg_target()).unwrap();
+        let ast::Relation::Aliased(source) = source else {
+            panic!("source alias");
+        };
+        let ast::Relation::Table(table) = source.relation.as_ref() else {
             panic!("source table");
         };
         assert_eq!(
-            name.parts
+            table
+                .name
+                .parts
                 .iter()
                 .map(|part| part.value.as_str())
                 .collect::<Vec<_>>(),
             ["other", "db2", "source"]
         );
+        let prepared = prepared_update("UPDATE ice.db1.t SET \"odd name\" = 7 WHERE id = 1");
         let columns = [col("id"), col("odd name")];
         let query = build_update_match_query(
-            mutation_target_relation(&iceberg_target(), build::ident("t", None), "main").unwrap(),
-            build::ident("t", None),
+            mutation_target_relation(&iceberg_target(), build::ident("t", false), "main").unwrap(),
+            build::ident("t", false),
             None,
             update_assignment_projection(&prepared.assignments, &columns).unwrap(),
             prepared.selection.clone(),
@@ -1577,9 +1530,13 @@ mod tests {
         let ast::SetExpr::Select(select) = query.body.as_ref() else {
             panic!("SELECT");
         };
-        let ast::SelectItem::ExprWithAlias { alias, .. } = select.projection.last().unwrap() else {
+        let ast::SelectItem::SingleColumn(single_column) = select.projection.last().unwrap() else {
             panic!("assignment alias");
         };
+        let Some(alias) = &single_column.alias else {
+            panic!("assignment alias");
+        };
+
         assert_eq!(alias.value, "__nr_new_odd name");
         assert_eq!(alias.span, prepared.assignments[0].column_span);
     }
@@ -1587,16 +1544,18 @@ mod tests {
     #[test]
     fn mor_target_branch_literal_keeps_backslashes_without_text_escaping() {
         let relation =
-            mutation_target_relation(&iceberg_target(), build::ident("t", None), "dev\\branch")
+            mutation_target_relation(&iceberg_target(), build::ident("t", false), "dev\\branch")
                 .unwrap();
-        let ast::TableFactor::Table {
-            version: Some(version),
-            ..
-        } = relation
-        else {
+        let ast::Relation::Aliased(alias) = &relation else {
+            panic!("target alias");
+        };
+        let ast::Relation::Table(table) = alias.relation.as_ref() else {
+            panic!("target table");
+        };
+        let Some(version) = &table.query_period else {
             panic!("versioned target");
         };
-        assert_eq!(version.value, build::string("dev\\branch"));
+        assert_eq!(version.end.as_deref(), Some(&build::string("dev\\branch")));
     }
 
     #[test]
@@ -1605,12 +1564,9 @@ mod tests {
         let columns = [col("id"), col("v")];
         let source = "UPDATE ice.db1.t SET v = 99 WHERE id = 1";
         let original = prepared_update(source);
-        let [ast::Statement::Dml(mut statement)]: [ast::Statement; 1] =
-            novarocks_parser::parse(source).unwrap().try_into().unwrap()
+        let ast::TrinoStatement::Update(mut update) =
+            novarocks_parser::parser::parse_statement(source).unwrap()
         else {
-            panic!("UPDATE");
-        };
-        let ast::DmlStatement::Update(update) = &mut statement else {
             panic!("UPDATE");
         };
         let ast::Expr::Literal(value) = &mut update.assignments[0].value else {
@@ -1618,7 +1574,7 @@ mod tests {
         };
         value.span = novarocks_parser::Span::new(source.len() + 1, source.len() + 2);
         let super::super::mutation::OwnedMutationStatement::Update(lowered) =
-            super::super::mutation::lower_statement(&statement, source).unwrap()
+            crate::dml::mutation::prepare_trino_update_shape(update, source).unwrap()
         else {
             panic!("UPDATE");
         };
@@ -1632,19 +1588,12 @@ mod tests {
 
         let source = "MERGE INTO ice.db1.t t USING (SELECT 1 AS id, 3 AS v) s ON t.id = s.id WHEN MATCHED THEN UPDATE SET v = 99";
         let original = prepared_merge(source);
-        let [ast::Statement::Dml(mut statement)]: [ast::Statement; 1] =
-            novarocks_parser::parse(source).unwrap().try_into().unwrap()
+        let ast::TrinoStatement::Merge(mut merge) =
+            novarocks_parser::parser::parse_statement(source).unwrap()
         else {
             panic!("MERGE");
         };
-        let ast::DmlStatement::Merge(merge) = &mut statement else {
-            panic!("MERGE");
-        };
-        let ast::MergeClause::Matched {
-            action: ast::MergeMatchedAction::Update { assignments, .. },
-            ..
-        } = &mut merge.clauses[0]
-        else {
+        let ast::TrinoMergeCase::Update { assignments, .. } = &mut merge.cases[0] else {
             panic!("UPDATE clause");
         };
         let ast::Expr::Literal(value) = &mut assignments[0].value else {
@@ -1652,7 +1601,7 @@ mod tests {
         };
         value.span = novarocks_parser::Span::new(source.len() + 1, source.len() + 2);
         let super::super::mutation::OwnedMutationStatement::Merge(lowered) =
-            super::super::mutation::lower_statement(&statement, source).unwrap()
+            crate::dml::mutation::prepare_trino_merge_shape(merge, source).unwrap()
         else {
             panic!("MERGE");
         };
@@ -1694,10 +1643,13 @@ mod tests {
                     .iter()
                     .enumerate()
                     .find_map(|(ordinal, item)| match item {
-                        ast::SelectItem::ExprWithAlias { alias, expr, .. }
-                            if alias.value == "__nr_new_v" =>
+                        ast::SelectItem::SingleColumn(column)
+                            if column
+                                .alias
+                                .as_ref()
+                                .is_some_and(|alias| alias.value == "__nr_new_v") =>
                         {
-                            Some((ordinal, expr.span()))
+                            Some((ordinal, column.expression.span()))
                         }
                         _ => None,
                     })
@@ -1770,8 +1722,11 @@ mod tests {
             };
             // Supply exactly the external target's facts through a local
             // relation, retaining the production-generated expression tree.
-            select.from[0].joins[0].relation = test_relation(
-                "(SELECT 1 AS id, 2 AS v, 'f' AS _file, CAST(0 AS BIGINT) AS _pos, CAST(1 AS BIGINT) AS _row_id, CAST(1 AS BIGINT) AS _last_updated_sequence_number, CAST(0 AS INT) AS _spec_id, CAST(NULL AS STRUCT<bucket INT>) AS _partition) AS t",
+            let Some(ast::Relation::Join(join)) = select.from.as_mut() else {
+                panic!("MERGE join");
+            };
+            *join.right = test_relation(
+                "(SELECT 1 AS id, 2 AS v, 'f' AS _file, CAST(0 AS BIGINT) AS _pos, CAST(1 AS BIGINT) AS _row_id, CAST(1 AS BIGINT) AS _last_updated_sequence_number, CAST(0 AS INTEGER) AS _spec_id, CAST(NULL AS ROW(bucket INTEGER)) AS _partition) AS t",
             );
             let error = analyze_mutation_query(query).unwrap_err();
             let error = crate::dml::error::DmlExecutionError::from_compile(error)
@@ -1814,7 +1769,7 @@ mod tests {
         assert!(projected[0].1.syntax_eq(&test_expr("(NULL)")));
         let query = build_update_match_query(
             test_relation("ice.db.t AS t"),
-            build::ident("t", None),
+            build::ident("t", false),
             None,
             projected,
             Some(test_expr("t.id = 1")),
@@ -1834,9 +1789,9 @@ mod tests {
         use ast::SyntaxEq;
         let query = build_update_match_query(
             test_relation("ice.db1.t AS t"),
-            build::ident("t", None),
+            build::ident("t", false),
             Some(test_relation("staging.s AS s")),
-            vec![(build::ident("v", None), test_expr("s.v"))],
+            vec![(build::ident("v", false), test_expr("s.v"))],
             Some(test_expr("t.id = s.id")),
         )
         .unwrap();
@@ -1847,9 +1802,9 @@ mod tests {
     fn update_change_stream_target_pins_branch_read_snapshot() {
         use ast::SyntaxEq;
         let target =
-            mutation_target_relation(&iceberg_target(), build::ident("t", None), "dev").unwrap();
+            mutation_target_relation(&iceberg_target(), build::ident("t", false), "dev").unwrap();
         assert!(target.syntax_eq(&test_relation(
-            "`ice`.`db1`.`t` FOR VERSION AS OF 'dev' AS t"
+            r#""ice"."db1"."t" FOR VERSION AS OF 'dev' AS t"#
         )));
     }
 
@@ -1881,14 +1836,14 @@ mod tests {
         )
         .expect("assignment projection");
         let query = build_update_match_query(
-            mutation_target_relation(&iceberg_target(), build::ident("t", None), "main").unwrap(),
-            build::ident("t", None),
+            mutation_target_relation(&iceberg_target(), build::ident("t", false), "main").unwrap(),
+            build::ident("t", false),
             Some(test_relation("staging.s AS s")),
             projected,
             Some(test_expr("t.id = s.id")),
         )
         .unwrap();
-        assert!(query.syntax_eq(&test_query("SELECT t._file AS __nr_file, t._pos AS __nr_pos, t._row_id AS __nr_row_id, t._last_updated_sequence_number AS __nr_last_updated_sequence_number, t._spec_id AS __nr_spec_id, t._partition AS __nr_partition, t.*, (src_v) AS __nr_new_v FROM `ice`.`db1`.`t` AS t CROSS JOIN staging.s AS s WHERE t.id = s.id")));
+        assert!(query.syntax_eq(&test_query("SELECT t._file AS __nr_file, t._pos AS __nr_pos, t._row_id AS __nr_row_id, t._last_updated_sequence_number AS __nr_last_updated_sequence_number, t._spec_id AS __nr_spec_id, t._partition AS __nr_partition, t.*, (src_v) AS __nr_new_v FROM \"ice\".\"db1\".\"t\" AS t CROSS JOIN staging.s AS s WHERE t.id = s.id")));
     }
 
     fn typed_col(name: &str, data_type: DataType) -> ColumnDef {
@@ -1898,6 +1853,94 @@ mod tests {
             nullable: false,
             write_default: None,
             logical_type: None,
+        }
+    }
+
+    #[test]
+    fn merge_actions_keep_clause_predicates_nested_in_original_order() {
+        let matched = test_expr("s.v > 5 OR (s.v = 5 AND s.id > 0)");
+        let inserted = test_expr("s.id > 10 AND (s.v > 0 OR s.v IS NULL)");
+        let query = build_merge_match_query(
+            test_relation("ice.db1.t AS t"),
+            build::ident("t", false),
+            test_relation("staging.s AS s"),
+            test_expr("t.id = s.id"),
+            Some(matched.clone()),
+            Some(inserted.clone()),
+            &[col("id"), col("v")],
+            Vec::new(),
+            Vec::new(),
+            Some(MERGE_ACTION_MATCHED_UPDATE),
+            true,
+        )
+        .unwrap();
+        let ast::SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("SELECT");
+        };
+        let action = select
+            .projection
+            .iter()
+            .find_map(|item| match item {
+                ast::SelectItem::SingleColumn(column)
+                    if column
+                        .alias
+                        .as_ref()
+                        .is_some_and(|alias| alias.value == "__nr_merge_action") =>
+                {
+                    Some(&column.expression)
+                }
+                _ => None,
+            })
+            .unwrap();
+        let ast::Expr::SearchedCase(case) = action else {
+            panic!("ordered action CASE");
+        };
+        assert_eq!(case.when_clauses.len(), 2);
+        assert!(matches!(
+            &case.default_value,
+            Some(ast::Expr::Literal(ast::Literal {
+                kind: ast::LiteralKind::Long {
+                    parsed_value: 0,
+                    ..
+                },
+                ..
+            }))
+        ));
+        for (index, (original, guard, result)) in [
+            (&matched, true, MERGE_ACTION_MATCHED_UPDATE),
+            (&inserted, false, MERGE_ACTION_NOT_MATCHED_INSERT),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let branch = &case.when_clauses[index];
+            let ast::WhenMatch::Operand(condition) = &branch.match_value else {
+                panic!("searched CASE condition must be an operand");
+            };
+            let ast::Expr::Logical(condition) = condition else {
+                panic!("action AND");
+            };
+            assert_eq!(condition.operator, ast::LogicalOperator::And);
+            assert_eq!(condition.terms.len(), 2);
+            let ast::Expr::Predicated(predicate) = &condition.terms[0] else {
+                panic!("action null guard");
+            };
+            assert!(
+                matches!(&predicate.predicate, ast::Predicate::IsNull(null) if null.negated == guard)
+            );
+            assert!(
+                ast::identifier_chain_observed(&predicate.value, |_| Ok::<
+                    (),
+                    std::convert::Infallible,
+                >(()))
+                .unwrap_or_else(|never| match never {})
+                .is_some_and(|chain| chain.last().value == "_file")
+            );
+            assert_eq!(&condition.terms[1], original);
+            assert_eq!(condition.terms[1].span(), original.span());
+            assert!(
+                matches!(&branch.result, ast::Expr::Literal(ast::Literal { kind: ast::LiteralKind::Long { parsed_value, .. }, .. }) if *parsed_value == i64::from(result))
+            );
         }
     }
 
@@ -1920,18 +1963,20 @@ mod tests {
         let ast::SetExpr::Select(select) = query.body.as_ref() else {
             panic!("SELECT");
         };
-        assert!(!select.projection.iter().any(|item| matches!(
-            item,
-            ast::SelectItem::QualifiedWildcard { .. } | ast::SelectItem::Wildcard { .. }
-        )));
+        assert!(
+            !select
+                .projection
+                .iter()
+                .any(|item| matches!(item, ast::SelectItem::AllColumns(_)))
+        );
         for (alias, expected) in [
             (
                 "id",
-                "CASE WHEN t.`_file` IS NOT NULL THEN t.`id` ELSE NULL END",
+                r#"CASE WHEN t."_file" IS NOT NULL THEN t."id" ELSE NULL END"#,
             ),
             (
                 "__nr_row_id",
-                "CASE WHEN t.`_file` IS NOT NULL THEN t.`_row_id` ELSE NULL END",
+                r#"CASE WHEN t."_file" IS NOT NULL THEN t."_row_id" ELSE NULL END"#,
             ),
             ("__nr_new_v", "(s.v)"),
             ("__nr_ins_id", "(s.id)"),
@@ -1940,15 +1985,20 @@ mod tests {
                 .projection
                 .iter()
                 .find_map(|item| match item {
-                    ast::SelectItem::ExprWithAlias {
-                        expr, alias: name, ..
-                    } if name.value == alias => Some(expr),
+                    ast::SelectItem::SingleColumn(column)
+                        if column
+                            .alias
+                            .as_ref()
+                            .is_some_and(|name| name.value == alias) =>
+                    {
+                        Some(&column.expression)
+                    }
                     _ => None,
                 })
                 .expect("projected alias");
             assert!(expr.syntax_eq(&test_expr(expected)), "{alias}");
         }
-        assert!(select.projection.iter().any(|item| matches!(item, ast::SelectItem::ExprWithAlias { alias, .. } if alias.value == "__nr_merge_action")));
+        assert!(select.projection.iter().any(|item| matches!(item, ast::SelectItem::SingleColumn(column) if column.alias.as_ref().is_some_and(|alias| alias.value == "__nr_merge_action"))));
     }
 
     // ---- the merge-on-read write-session data plane ----------------------

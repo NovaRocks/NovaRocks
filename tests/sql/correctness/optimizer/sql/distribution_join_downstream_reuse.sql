@@ -20,10 +20,10 @@ DROP TABLE IF EXISTS ${case_db}.oq8_down_l;
 DROP TABLE IF EXISTS ${case_db}.oq8_down_r;
 CREATE TABLE ${case_db}.oq8_down_l (k INT, v INT);
 CREATE TABLE ${case_db}.oq8_down_r (k INT, w INT);
-INSERT INTO ${case_db}.oq8_down_l VALUES (1, 10), (2, 20), (3, 30);
-INSERT INTO ${case_db}.oq8_down_r VALUES (1, 100), (2, 200), (3, 300);
-ANALYZE TABLE ${case_db}.oq8_down_l;
-ANALYZE TABLE ${case_db}.oq8_down_r;
+INSERT INTO ${case_db}.oq8_down_l VALUES ROW(1, 10), ROW(2, 20), ROW(3, 30);
+INSERT INTO ${case_db}.oq8_down_r VALUES ROW(1, 100), ROW(2, 200), ROW(3, 300);
+ANALYZE ${case_db}.oq8_down_l;
+ANALYZE ${case_db}.oq8_down_r;
 
 -- @explain_contains=HASH JOIN (PARTITIONED
 -- @explain_contains=WINDOW [

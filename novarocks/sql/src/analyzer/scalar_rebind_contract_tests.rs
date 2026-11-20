@@ -91,7 +91,7 @@ fn lambda() -> TypedExpr {
                 slot_id: 19,
                 value_type: ty.clone(),
             }],
-            body: Box::new(TypedExpr {
+            body: novarocks_parser::ast::AstBox::new(TypedExpr {
                 kind: ExprKind::LambdaParamRef {
                     name: "x".into(),
                     slot_id: 19,
@@ -281,7 +281,7 @@ fn bind(
             let ExprKind::FunctionCall { args, binding, .. } = expr.kind else {
                 panic!("bound call");
             };
-            Ok((args, binding, expr.value_type))
+            Ok((args.into_inner(), binding, expr.value_type))
         }
     }
 }
@@ -370,6 +370,7 @@ fn scalar_rebind_lawful_canonical_source_keeps_policy_and_catalog_owned_changed_
                 FunctionValueType::new(DataType::Int64, false)
             );
             let ExprKind::Cast {
+                array_failure_mode: None,
                 expr,
                 target,
                 decimal_overflow_policy,

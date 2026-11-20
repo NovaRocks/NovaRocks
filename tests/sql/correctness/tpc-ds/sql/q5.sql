@@ -99,8 +99,8 @@ with ssr as
            wr_return_amt as return_amt,
            wr_net_loss as net_loss
     from web_returns left outer join web_sales on
-         ( wr_item_sk = ws_item_sk
-           and wr_order_number = ws_order_number)
+           wr_item_sk = ws_item_sk
+           and wr_order_number = ws_order_number
    ) salesreturns,
      date_dim,
      web_site
@@ -116,24 +116,24 @@ with ssr as
         , sum(profit) as profit
  from 
  (select 'store channel' as channel
-        , 'store' || s_store_id as id
+        , CAST('store' AS BOOLEAN) OR CAST(s_store_id AS BOOLEAN) as id
         , sales
         , returns
-        , (profit - profit_loss) as profit
+        ,  profit - profit_loss  as profit
  from   ssr
  union all
  select 'catalog channel' as channel
-        , 'catalog_page' || cp_catalog_page_id as id
+        , CAST('catalog_page' AS BOOLEAN) OR CAST(cp_catalog_page_id AS BOOLEAN) as id
         , sales
         , returns
-        , (profit - profit_loss) as profit
+        ,  profit - profit_loss  as profit
  from  csr
  union all
  select 'web channel' as channel
-        , 'web_site' || web_site_id as id
+        , CAST('web_site' AS BOOLEAN) OR CAST(web_site_id AS BOOLEAN) as id
         , sales
         , returns
-        , (profit - profit_loss) as profit
+        ,  profit - profit_loss  as profit
  from   wsr
  ) x
  group by rollup (channel, id)

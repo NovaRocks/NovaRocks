@@ -19,7 +19,7 @@
 -- Negative widening matrix.
 
 -- query 1
-CREATE DATABASE iceberg_ddl_cat_${suite_uuid0}.schema_reject_${uuid0};
+CREATE SCHEMA iceberg_ddl_cat_${suite_uuid0}.schema_reject_${uuid0};
 USE iceberg_ddl_cat_${suite_uuid0}.schema_reject_${uuid0};
 DROP TABLE IF EXISTS bad;
 CREATE TABLE bad (
@@ -27,24 +27,24 @@ CREATE TABLE bad (
   d DOUBLE,
   s STRING,
   ts DATETIME
-) TBLPROPERTIES ("format-version" = "2");
+) WITH (format_version = 2);
 
 -- query 2
 -- @expect_error=unsupported Iceberg type evolution
-ALTER TABLE bad MODIFY COLUMN i INT;
+ALTER TABLE bad ALTER COLUMN i SET DATA TYPE INT;
 
 -- query 3
 -- @expect_error=unsupported Iceberg type evolution
-ALTER TABLE bad MODIFY COLUMN d FLOAT;
+ALTER TABLE bad ALTER COLUMN d SET DATA TYPE FLOAT;
 
 -- query 4
 -- @expect_error=unsupported Iceberg type evolution
-ALTER TABLE bad MODIFY COLUMN s VARBINARY;
+ALTER TABLE bad ALTER COLUMN s SET DATA TYPE VARBINARY;
 
 -- query 5
 -- @expect_error=unsupported Iceberg type evolution
-ALTER TABLE bad MODIFY COLUMN ts DATE;
+ALTER TABLE bad ALTER COLUMN ts SET DATA TYPE DATE;
 
 -- query 6
 DROP TABLE bad;
-DROP DATABASE iceberg_ddl_cat_${suite_uuid0}.schema_reject_${uuid0};
+DROP SCHEMA iceberg_ddl_cat_${suite_uuid0}.schema_reject_${uuid0};

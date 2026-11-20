@@ -24,11 +24,11 @@ DROP TABLE IF EXISTS ${case_db}.g3_pt_a;
 DROP TABLE IF EXISTS ${case_db}.g3_pt_b;
 CREATE TABLE ${case_db}.g3_pt_a (k INT, v INT);
 CREATE TABLE ${case_db}.g3_pt_b (k INT, w INT);
-INSERT INTO ${case_db}.g3_pt_a VALUES (1, 10), (2, 20);
-INSERT INTO ${case_db}.g3_pt_b VALUES (1, 100), (2, 200);
-ANALYZE TABLE ${case_db}.g3_pt_a;
-ANALYZE TABLE ${case_db}.g3_pt_b;
-EXPLAIN VERBOSE
+INSERT INTO ${case_db}.g3_pt_a VALUES ROW(1, 10), ROW(2, 20);
+INSERT INTO ${case_db}.g3_pt_b VALUES ROW(1, 100), ROW(2, 200);
+ANALYZE ${case_db}.g3_pt_a;
+ANALYZE ${case_db}.g3_pt_b;
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
 SELECT a.k, SUM(a.v + b.w) AS s
 FROM ${case_db}.g3_pt_a a
 INNER JOIN ${case_db}.g3_pt_b b ON a.k = b.k

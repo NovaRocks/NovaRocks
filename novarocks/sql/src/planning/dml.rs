@@ -5225,22 +5225,28 @@ mod tests {
             ("ERROR_IF_OVERFLOW", "SELECT 1 AS x", false),
             (
                 "32",
-                "SELECT /*+ SET_VAR(sql_mode='ALLOW_THROW_EXCEPTION') */ 1 AS x",
+                "WITH SESSION sql_mode = 'ALLOW_THROW_EXCEPTION' SELECT 1 AS x",
                 true,
             ),
             (
                 "ALLOW_THROW_EXCEPTION",
-                "SELECT /*+ SET_VAR(sql_mode=32) */ 1 AS x",
+                "WITH SESSION sql_mode = 32 SELECT 1 AS x",
                 false,
             ),
+            ("32", "SELECT x FROM (SELECT 1 AS x) s", false),
             (
-                "32",
-                "SELECT x FROM (SELECT /*+ SET_VAR(sql_mode='ALLOW_THROW_EXCEPTION') */ 1 AS x) s",
-                false,
+                "ALLOW_THROW_EXCEPTION",
+                "SELECT x FROM (SELECT 1 AS x) s",
+                true,
             ),
             (
                 "ALLOW_THROW_EXCEPTION",
-                "SELECT x FROM (SELECT /*+ SET_VAR(sql_mode=32) */ 1 AS x) s",
+                "SELECT 1 AS x UNION ALL SELECT 2",
+                true,
+            ),
+            (
+                "ALLOW_THROW_EXCEPTION",
+                "WITH s AS (SELECT 1 AS x) SELECT x FROM s",
                 true,
             ),
         ] {

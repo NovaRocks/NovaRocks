@@ -34,10 +34,7 @@ fn column(name: &str, data_type: DataType) -> ColumnDef {
 }
 
 fn parse_query(sql: &str) -> ast::Query {
-    let statements = novarocks_parser::parse(sql).expect("test query should parse");
-    let [ast::Statement::Query(query)] = statements.as_slice() else {
-        panic!("expected one query");
-    };
+    let query = novarocks_parser::parser::parse_query(sql).expect("test query should parse");
     query.clone()
 }
 
@@ -80,7 +77,7 @@ fn baseline_target_cast(expr: ast::Expr, type_sql: &str) -> ast::Expr {
     };
     let mut cast = cast.clone();
     cast.span = expr.span();
-    cast.expr = Box::new(expr);
+    cast.expression = expr;
     ast::Expr::Cast(cast)
 }
 
@@ -89,10 +86,25 @@ fn baseline_default_values(default: ast::Expr, default_type_sql: &str) -> ast::Q
     let ast::SetExpr::Values(values) = query.body.as_mut() else {
         panic!("baseline VALUES source");
     };
-    values.rows[0] = vec![
-        baseline_target_cast(values.rows[0][0].clone(), "INT"),
-        baseline_target_cast(default, default_type_sql),
-    ];
+    let span = values.rows[0].span();
+    let original = ast::ValuesRowCells::new(&values.rows[0])
+        .get(0)
+        .unwrap()
+        .clone();
+    values.rows[0] = ast::Expr::Row(ast::RowExpr {
+        fields: vec![
+            baseline_target_cast(original, "INT"),
+            baseline_target_cast(default, default_type_sql),
+        ]
+        .into_iter()
+        .map(|expression| ast::RowField {
+            name: None,
+            span: expression.span(),
+            expression,
+        })
+        .collect(),
+        span,
+    });
     query
 }
 
@@ -128,24 +140,35 @@ fn shape(sql: &str, columns: &[ColumnDef]) -> ast::Query {
         .expect("literal source should use target shaping")
 }
 
-fn rows(query: &ast::Query) -> &[Vec<ast::Expr>] {
+fn rows(query: &ast::Query) -> Vec<Vec<&ast::Expr>> {
     let ast::SetExpr::Values(values) = query.body.as_ref() else {
         panic!("expected VALUES");
     };
-    &values.rows
+    values
+        .rows
+        .iter()
+        .map(|row| {
+            let cells = ast::ValuesRowCells::new(row);
+            assert!(!cells.has_named_fields());
+            cells.iter().collect()
+        })
+        .collect()
 }
 
 fn select(body: &ast::SetExpr) -> &ast::Select {
     match body {
         ast::SetExpr::Select(select) => select,
-        ast::SetExpr::Query(query) => select(&query.body),
+        ast::SetExpr::Query(subquery) => {
+            let query = &subquery.query;
+            select(&query.body)
+        }
         _ => panic!("expected SELECT leaf"),
     }
 }
 
 fn projection_expr(select: &ast::Select, index: usize) -> &ast::Expr {
     match &select.projection[index] {
-        ast::SelectItem::UnnamedExpr(expr) | ast::SelectItem::ExprWithAlias { expr, .. } => expr,
+        ast::SelectItem::SingleColumn(column) => &column.expression,
         _ => panic!("expected expression projection"),
     }
 }
@@ -154,30 +177,32 @@ fn cast_input<'a>(expr: &'a ast::Expr, target: &str) -> &'a ast::Expr {
     let ast::Expr::Cast(cast) = expr else {
         panic!("expected target CAST, got {expr:?}");
     };
-    assert_eq!(printer::print_type_name(&cast.data_type), target);
-    &cast.expr
+    assert_eq!(printer::print_type(&cast.data_type).unwrap(), target);
+    &cast.expression
 }
 
-fn number_text(expr: &ast::Expr) -> &str {
-    let ast::Expr::Literal(ast::Literal {
-        kind: ast::LiteralKind::Number(text),
-        ..
-    }) = expr
-    else {
+fn number_text(expr: &ast::Expr) -> String {
+    let ast::Expr::Literal(literal) = expr else {
         panic!("expected exact numeric literal, got {expr:?}");
     };
-    text
+    match &literal.kind {
+        ast::LiteralKind::Long { spelling, .. } | ast::LiteralKind::Decimal(spelling) => {
+            spelling.clone()
+        }
+        ast::LiteralKind::Double(value) => format!("{:?}", value.get()),
+        _ => panic!("expected exact numeric literal, got {expr:?}"),
+    }
 }
 
 fn literal_bytes(expr: &ast::Expr) -> Vec<u8> {
     let ast::Expr::Literal(ast::Literal {
-        kind: ast::LiteralKind::HexString(text),
+        kind: ast::LiteralKind::Binary(bytes),
         ..
     }) = expr
     else {
         panic!("expected binary literal, got {expr:?}");
     };
-    hex::decode(text).expect("binary literal must have valid hex")
+    bytes.clone()
 }
 
 fn decimal_type() -> DataType {
@@ -214,24 +239,36 @@ fn recursive_array_map_and_struct_literals_keep_exact_decimal_children() {
         column("m", map_type(decimal_type(), decimal_array)),
         column("s", structure),
     ];
-    let query = shape(
-        "VALUES ([123456789.123456789, 1.25e2, NULL], map(123456789.123456789, [123456789.123456789, NULL]), row(123456789.123456789, [123456789.123456789]))",
-        &columns,
+    let source = parse_query(
+        "VALUES ROW(ARRAY[123456789.123456789, 1.25e2, NULL], map(123456789.123456789, ARRAY[123456789.123456789, NULL]), ROW(123456789.123456789, ARRAY[123456789.123456789]))",
     );
+    let query = shape_insert_source(&source, &[], &columns, &columns)
+        .expect("literal source should shape")
+        .expect("literal source should use target shaping");
     let row = &rows(&query)[0];
-    let ast::Expr::Array(array) = cast_input(&row[0], "ARRAY<DECIMAL(18, 9)>") else {
+    let ast::Expr::Array(array) = cast_input(row[0], "ARRAY(DECIMAL(18, 9))") else {
         panic!("expected direct ARRAY");
     };
     assert_eq!(
-        number_text(cast_input(&array.elements[0], "DECIMAL(18, 9)")),
+        number_text(cast_input(&array.values[0], "DECIMAL(18, 9)")),
         "123456789.123456789"
     );
-    assert_eq!(
-        number_text(cast_input(&array.elements[1], "DECIMAL(18, 9)")),
-        "1.25e2"
-    );
+    let exponent = cast_input(&array.values[1], "DECIMAL(18, 9)");
+    let ast::Expr::Literal(ast::Literal {
+        kind: ast::LiteralKind::Double(value),
+        ..
+    }) = exponent
+    else {
+        panic!("source exponent must retain its Double category");
+    };
+    assert_eq!(value.get().to_bits(), 125.0_f64.to_bits());
+    let ast::Expr::Array(source_array) = rows(&source)[0][0] else {
+        panic!("source ARRAY");
+    };
+    assert_eq!(exponent, &source_array.values[1]);
+    assert_eq!(exponent.span(), source_array.values[1].span());
     assert!(matches!(
-        cast_input(&array.elements[2], "DECIMAL(18, 9)"),
+        cast_input(&array.values[2], "DECIMAL(18, 9)"),
         ast::Expr::Literal(ast::Literal {
             kind: ast::LiteralKind::Null,
             ..
@@ -239,39 +276,43 @@ fn recursive_array_map_and_struct_literals_keep_exact_decimal_children() {
     ));
 
     let ast::Expr::FunctionCall(map) =
-        cast_input(&row[1], "MAP<DECIMAL(18, 9), ARRAY<DECIMAL(18, 9)>>")
+        cast_input(row[1], "MAP(DECIMAL(18, 9), ARRAY(DECIMAL(18, 9)))")
     else {
         panic!("expected MAP constructor");
     };
     assert_eq!(
-        number_text(cast_input(&map.arguments[0], "DECIMAL(18, 9)")),
+        number_text(cast_input(&map.arguments[0].value, "DECIMAL(18, 9)")),
         "123456789.123456789"
     );
-    let ast::Expr::Array(map_array) = cast_input(&map.arguments[1], "ARRAY<DECIMAL(18, 9)>") else {
+    let ast::Expr::Array(map_array) = cast_input(&map.arguments[1].value, "ARRAY(DECIMAL(18, 9))")
+    else {
         panic!("expected MAP array value");
     };
     assert_eq!(
-        number_text(cast_input(&map_array.elements[0], "DECIMAL(18, 9)")),
+        number_text(cast_input(&map_array.values[0], "DECIMAL(18, 9)")),
         "123456789.123456789"
     );
 
-    let ast::Expr::FunctionCall(structure) = cast_input(
-        &row[2],
-        "STRUCT<`d` DECIMAL(18, 9), `a` ARRAY<DECIMAL(18, 9)>>",
+    let ast::Expr::Row(structure) = cast_input(
+        row[2],
+        r#"ROW("d" DECIMAL(18, 9), "a" ARRAY(DECIMAL(18, 9)))"#,
     ) else {
         panic!("expected ROW constructor");
     };
     assert_eq!(
-        number_text(cast_input(&structure.arguments[0], "DECIMAL(18, 9)")),
+        number_text(cast_input(
+            &structure.fields[0].expression,
+            "DECIMAL(18, 9)"
+        )),
         "123456789.123456789"
     );
     let ast::Expr::Array(struct_array) =
-        cast_input(&structure.arguments[1], "ARRAY<DECIMAL(18, 9)>")
+        cast_input(&structure.fields[1].expression, "ARRAY(DECIMAL(18, 9))")
     else {
         panic!("expected STRUCT array field");
     };
     assert_eq!(
-        number_text(cast_input(&struct_array.elements[0], "DECIMAL(18, 9)")),
+        number_text(cast_input(&struct_array.values[0], "DECIMAL(18, 9)")),
         "123456789.123456789"
     );
 }
@@ -285,9 +326,14 @@ fn explicit_casts_keep_their_original_expression_and_declared_type() {
             "DECIMAL(18, 9)",
         ),
         (
-            "VALUES (CAST([123456789.123456789, 1.25e2] AS ARRAY<DOUBLE>))",
+            "VALUES ROW(CAST(ARRAY[123456789.123456789, 1.25e2] AS ARRAY(DOUBLE)))",
             array_type(decimal_type()),
-            "ARRAY<DECIMAL(18, 9)>",
+            "ARRAY(DECIMAL(18, 9))",
+        ),
+        (
+            "VALUES ROW(CAST(ARRAY[123456789.123456789, 1.25e2] AS DOUBLE ARRAY))",
+            array_type(decimal_type()),
+            "ARRAY(DECIMAL(18, 9))",
         ),
     ] {
         let source = parse_query(sql);
@@ -295,11 +341,38 @@ fn explicit_casts_keep_their_original_expression_and_declared_type() {
         let shaped = shape_insert_source(&source, &[], &columns, &columns)
             .unwrap()
             .unwrap();
-        assert_eq!(
-            cast_input(&rows(&shaped)[0][0], target),
-            &rows(&source)[0][0]
-        );
+        assert_eq!(cast_input(rows(&shaped)[0][0], target), rows(&source)[0][0]);
     }
+}
+
+#[test]
+fn explicit_safe_cast_keeps_original_child_type_and_source_positions() {
+    let mut source = parse_query("VALUES (CAST(123456789.123456789 AS DOUBLE))");
+    let ast::SetExpr::Values(values) = source.body.as_mut() else {
+        panic!("VALUES");
+    };
+    let ast::Expr::Cast(cast) = super::values_cell_mut(&mut values.rows[0], 0)
+        .unwrap()
+        .unwrap()
+    else {
+        panic!("explicit CAST");
+    };
+    cast.safe = true;
+    let original = ast::ValuesRowCells::new(&values.rows[0])
+        .get(0)
+        .unwrap()
+        .clone();
+    let columns = [column("d", decimal_type())];
+    let shaped = shape_insert_source(&source, &[], &columns, &columns)
+        .unwrap()
+        .unwrap();
+    let preserved = cast_input(rows(&shaped)[0][0], "DECIMAL(18, 9)");
+    assert_eq!(preserved, &original);
+    let ast::Expr::Cast(cast) = preserved else {
+        panic!("original safe CAST");
+    };
+    assert!(cast.safe);
+    assert_eq!(preserved.span(), original.span());
 }
 
 #[test]
@@ -328,7 +401,9 @@ fn variant_direct_and_explicit_cast_inputs_use_canonical_payloads() {
         .unwrap();
         let query = shape(sql, &[variant]);
         let expr = match query.body.as_ref() {
-            ast::SetExpr::Values(values) => &values.rows[0][0],
+            ast::SetExpr::Values(values) => {
+                ast::ValuesRowCells::new(&values.rows[0]).get(0).unwrap()
+            }
             body => projection_expr(select(body), 0),
         };
         let mut input = cast_input(expr, "VARIANT");
@@ -353,7 +428,9 @@ fn binary_literals_and_defaults_preserve_every_latin1_byte() {
     let ast::SetExpr::Values(values) = source.body.as_mut() else {
         panic!("expected VALUES");
     };
-    values.rows[0][0] = ast::Expr::Literal(ast::Literal {
+    *super::values_cell_mut(&mut values.rows[0], 0)
+        .unwrap()
+        .unwrap() = ast::Expr::Literal(ast::Literal {
         kind: ast::LiteralKind::String(text),
         span: Span::new(0, 0),
     });
@@ -362,11 +439,11 @@ fn binary_literals_and_defaults_preserve_every_latin1_byte() {
         .unwrap()
         .unwrap();
     assert_eq!(
-        literal_bytes(cast_input(&rows(&query)[0][0], "VARBINARY")),
+        literal_bytes(cast_input(rows(&query)[0][0], "VARBINARY")),
         expected
     );
     assert_eq!(
-        literal_bytes(cast_input(&rows(&query)[1][0], "VARBINARY")),
+        literal_bytes(cast_input(rows(&query)[1][0], "VARBINARY")),
         [255, 0]
     );
     let mut default = columns[0].clone();
@@ -377,7 +454,7 @@ fn binary_literals_and_defaults_preserve_every_latin1_byte() {
     );
     assert_eq!(
         literal_bytes(cast_input(
-            &rows(&shape("VALUES ('ÿ')", &columns))[0][0],
+            rows(&shape("VALUES ('ÿ')", &columns))[0][0],
             "VARBINARY"
         )),
         [255]
@@ -408,28 +485,25 @@ fn typed_decimal_defaults_keep_coefficients_beyond_source_integer_width() {
     .unwrap()
     .unwrap();
     assert_eq!(
-        number_text(cast_input(&rows(&shaped)[0][1], "DECIMAL(38, 0)")),
+        number_text(cast_input(rows(&shaped)[0][1], "DECIMAL(38, 0)")),
         coefficient.to_string()
     );
-    // The original number author retained this coefficient as a raw Number;
-    // the analyzer still rejects an integer literal wider than i64 before CAST.
+    // Typed decimal defaults use their declared numeric category, even when
+    // their exact coefficient exceeds the source integer literal width.
     let baseline = baseline_default_values(
         ast::Expr::Literal(ast::Literal {
-            kind: ast::LiteralKind::Number(coefficient.to_string()),
+            kind: ast::LiteralKind::Decimal(coefficient.to_string()),
             span: SYNTHETIC,
         }),
         "DECIMAL(38, 0)",
     );
-    assert_existing_default_rejection(
-        shaped,
-        baseline,
-        AnalyzeErrorKind::InvalidLiteral,
-        &format!("invalid integer literal: {coefficient}"),
-    );
+    assert!(shaped.syntax_eq(&baseline));
+    analyze_shaped_query(baseline).expect("typed decimal coefficient should analyze");
+    analyze_shaped_query(shaped).expect("shaped typed decimal coefficient should analyze");
 }
 
 #[test]
-fn typed_single_field_struct_defaults_keep_their_values_tuple() {
+fn typed_single_field_struct_defaults_keep_their_values_row() {
     let mut structure = column(
         "s",
         DataType::Struct(Fields::from(vec![Arc::new(Field::new(
@@ -443,11 +517,11 @@ fn typed_single_field_struct_defaults_keep_their_values_tuple() {
         ColumnDefault::Int64(7),
     )]));
     let original = omitted_insert_expr(&structure).unwrap();
-    let ast::Expr::Tuple(tuple) = &original else {
+    let ast::Expr::Row(tuple) = &original else {
         panic!("typed Struct value");
     };
-    assert_eq!(tuple.expressions.len(), 1);
-    assert_eq!(number_text(&tuple.expressions[0]), "7");
+    assert_eq!(tuple.fields.len(), 1);
+    assert_eq!(number_text(&tuple.fields[0].expression), "7");
     let columns = [column("id", DataType::Int32), structure];
     let shaped = shape_insert_source(
         &parse_query("VALUES (1)"),
@@ -457,37 +531,68 @@ fn typed_single_field_struct_defaults_keep_their_values_tuple() {
     )
     .unwrap()
     .unwrap();
-    let ast::Expr::Cast(cast) = &rows(&shaped)[0][1] else {
+    let ast::Expr::Cast(cast) = rows(&shaped)[0][1] else {
         panic!("Struct target cast");
     };
-    assert!(matches!(cast.expr.as_ref(), ast::Expr::Tuple(tuple) if tuple.expressions.len() == 1));
-    // The original tuple author kept even one field as Tuple, and recursive
-    // target shaping cast its child. The analyzer rejects that Tuple unchanged.
+    assert!(matches!(&cast.expression, ast::Expr::Row(tuple) if tuple.fields.len() == 1));
     let baseline = baseline_default_values(
-        ast::Expr::Tuple(ast::TupleExpr {
-            expressions: vec![baseline_target_cast(
-                ast::Expr::Literal(ast::Literal {
-                    kind: ast::LiteralKind::Number("7".into()),
-                    span: SYNTHETIC,
-                }),
-                "BIGINT",
-            )],
+        ast::Expr::Row(ast::RowExpr {
+            fields: vec![ast::RowField {
+                name: None,
+                expression: baseline_target_cast(
+                    ast::Expr::Literal(ast::Literal {
+                        kind: ast::LiteralKind::Long {
+                            spelling: "7".into(),
+                            parsed_value: 7,
+                        },
+                        span: SYNTHETIC,
+                    }),
+                    "BIGINT",
+                ),
+                span: SYNTHETIC,
+            }]
+            .into(),
             span: SYNTHETIC,
         }),
-        "STRUCT<`only` BIGINT>",
+        r#"ROW("only" BIGINT)"#,
     );
+    assert!(shaped.syntax_eq(&baseline));
+    // This input originally failed at SQL's unsupported Row branch, not at
+    // the VALUES wrapper. Preserve the exact default value as an independent
+    // literal oracle while the original row binding now owns scalar analysis.
+    let value = novarocks_sql::literal::expr_to_literal(rows(&shaped)[0][1]).unwrap();
+    assert_eq!(
+        value,
+        novarocks_sql::semantic::Literal::Struct(vec![novarocks_sql::semantic::Literal::Int(7)])
+    );
+    let ast::Expr::Cast(cast) = rows(&shaped)[0][1] else {
+        panic!("Struct target cast");
+    };
+    let ast::Expr::Row(row) = &cast.expression else {
+        panic!("singleton value row");
+    };
+    assert_eq!(row.fields.len(), 1);
+    assert_eq!(
+        number_text(cast_input(&row.fields[0].expression, "BIGINT")),
+        "7"
+    );
+    assert_eq!(
+        columns[1].declared_value_type().unwrap().data_type(),
+        &DataType::Struct(Fields::from(vec![Arc::new(Field::new(
+            "only",
+            DataType::Int64,
+            true
+        ))]))
+    );
+    // Both actual source forms now reach the original row overload. Its
+    // installed-implementation boundary still rejects the default; preserving
+    // literal values above does not imply successful compilation or execution.
     assert_existing_default_rejection(
         shaped,
         baseline,
-        AnalyzeErrorKind::UnsupportedExpression,
-        "unsupported expression: (CAST(7 AS BIGINT))",
+        AnalyzeErrorKind::UnavailableImplementation,
+        "selected overload `builtin.scalar/row/dynamic-v1` has no installed implementation for the selected carrier",
     );
-    // The old SELECT wrapper reparsed '(7)' as parentheses. Only that wrapper
-    // takes the canonical syntax path; VALUES must keep its typed tuple.
-    assert!(matches!(
-        super::canonical_insert_wrapper_expression(original).unwrap(),
-        ast::Expr::Nested(_)
-    ));
 }
 
 #[test]
@@ -504,12 +609,12 @@ fn select_wrapper_normalizes_generated_defaults_and_retains_user_positions() {
         .unwrap()
         .unwrap();
     let expected = parse_query(
-        "SELECT CAST(1 AS INT), CAST(-123.45 AS DECIMAL(5, 2)) FROM (SELECT 1 AS original) AS __nr_insert_literal_src",
+        "SELECT CAST(1 AS INT), CAST(DECIMAL '-123.45' AS DECIMAL(5, 2)) FROM (SELECT 1 AS original) AS __nr_insert_literal_src",
     );
     let ast::SetExpr::Query(wrapper) = shaped.body.as_ref() else {
         panic!("target wrapper");
     };
-    assert!(wrapper.as_ref().syntax_eq(&expected));
+    assert!(wrapper.query.as_ref().syntax_eq(&expected));
     let ast::SetExpr::Select(inner) = source.body.as_ref() else {
         panic!("original SELECT");
     };
@@ -518,7 +623,7 @@ fn select_wrapper_normalizes_generated_defaults_and_retains_user_positions() {
         panic!("target cast");
     };
     assert_eq!(cast.span, projection_expr(inner, 0).span());
-    assert_eq!(cast.expr.span(), projection_expr(inner, 0).span());
+    assert_eq!(cast.expression.span(), projection_expr(inner, 0).span());
     analyze_shaped_query(shaped).expect("the original generated default keeps its typed value");
 }
 
@@ -548,25 +653,25 @@ fn recursive_nonempty_defaults_preserve_decimal_coefficients_and_nulls() {
             ColumnDefault::Map(vec![(ColumnDefault::Int32(7), decimal_default)]),
         ),
     ]));
-    let ast::Expr::Tuple(structure) = omitted_insert_expr(&nested).unwrap() else {
+    let ast::Expr::Row(structure) = omitted_insert_expr(&nested).unwrap() else {
         panic!("expected structured default");
     };
-    let ast::Expr::Array(array) = &structure.expressions[0] else {
+    let ast::Expr::Array(array) = &structure.fields[0].expression else {
         panic!("expected nonempty ARRAY default");
     };
-    assert_eq!(number_text(&array.elements[0]), "-123456789.123456789");
+    assert_eq!(number_text(&array.values[0]), "-123456789.123456789");
     assert!(matches!(
-        &array.elements[1],
+        &array.values[1],
         ast::Expr::Literal(ast::Literal {
             kind: ast::LiteralKind::Null,
             ..
         })
     ));
-    let ast::Expr::Map(map) = &structure.expressions[1] else {
-        panic!("expected nonempty MAP default");
+    let ast::Expr::FunctionCall(map) = &structure.fields[1].expression else {
+        panic!("expected nonempty ordinary MAP default");
     };
-    assert_eq!(number_text(&map.entries[0].key), "7");
-    assert_eq!(number_text(&map.entries[0].value), "-123456789.123456789");
+    assert_eq!(number_text(&map.arguments[0].value), "7");
+    assert_eq!(number_text(&map.arguments[1].value), "-123456789.123456789");
 
     let columns = [column("id", DataType::Int32), nested];
     let shaped = shape_insert_source(
@@ -577,18 +682,19 @@ fn recursive_nonempty_defaults_preserve_decimal_coefficients_and_nulls() {
     )
     .unwrap()
     .unwrap();
-    let ast::Expr::Tuple(structure) = cast_input(
-        &rows(&shaped)[0][1],
-        "STRUCT<`a` ARRAY<DECIMAL(18, 9)>, `m` MAP<INT, DECIMAL(18, 9)>>",
+    let ast::Expr::Row(structure) = cast_input(
+        rows(&shaped)[0][1],
+        r#"ROW("a" ARRAY(DECIMAL(18, 9)), "m" MAP(INT, DECIMAL(18, 9)))"#,
     ) else {
         panic!("expected target-shaped structured default");
     };
-    let ast::Expr::Array(array) = cast_input(&structure.expressions[0], "ARRAY<DECIMAL(18, 9)>")
+    let ast::Expr::Array(array) =
+        cast_input(&structure.fields[0].expression, "ARRAY(DECIMAL(18, 9))")
     else {
         panic!("expected target-shaped ARRAY default");
     };
     assert_eq!(
-        number_text(cast_input(&array.elements[0], "DECIMAL(18, 9)")),
+        number_text(cast_input(&array.values[0], "DECIMAL(18, 9)")),
         "-123456789.123456789"
     );
 }
@@ -668,12 +774,15 @@ fn column_mapping_reorders_and_fills_only_omitted_columns() {
     )
     .unwrap()
     .unwrap();
-    let rendered: Vec<_> = rows(&query)[0].iter().map(printer::print_expr).collect();
+    let rendered: Vec<_> = rows(&query)[0]
+        .iter()
+        .map(|expr| printer::print_expression(expr).unwrap())
+        .collect();
     assert_eq!(
         rendered,
         [
             "CAST(10 AS INT)",
-            "CAST(123456789.123456789 AS DECIMAL(18, 9))",
+            "CAST(DECIMAL '123456789.123456789' AS DECIMAL(18, 9))",
             "CAST(30 AS INT)"
         ]
     );
@@ -690,7 +799,7 @@ fn column_mapping_reorders_and_fills_only_omitted_columns() {
     assert_eq!(
         rows(&query)[0]
             .iter()
-            .map(printer::print_expr)
+            .map(|expr| printer::print_expression(expr).unwrap())
             .collect::<Vec<_>>(),
         rendered
     );
@@ -744,15 +853,16 @@ fn source_filters_aliases_distinct_and_general_query_controls_are_retained() {
         number_text(cast_input(expr, "DECIMAL(18, 9)")),
         "123456789.123456789"
     );
-    let [relation] = outer.from.as_slice() else {
+    let Some(ast::Relation::Aliased(alias)) = &outer.from else {
         panic!("source controls must precede the target projection");
     };
-    let ast::TableFactor::Derived { subquery, .. } = &relation.relation else {
+    let ast::Relation::TableSubquery(node) = alias.relation.as_ref() else {
         panic!("expected preserved source query");
     };
+    let subquery = &node.query;
     assert!(subquery.body.syntax_eq(&source.body));
     assert!(
-        matches!(&select(&subquery.body).projection[0], ast::SelectItem::ExprWithAlias { alias, .. } if alias.value == "d")
+        matches!(&select(&subquery.body).projection[0], ast::SelectItem::SingleColumn(column) if column.alias.as_ref().is_some_and(|alias| alias.value == "d"))
     );
     for sql in [
         "SELECT 123456789.123456789 ORDER BY 1 LIMIT 0",
@@ -787,12 +897,12 @@ fn literal_target_casts_keep_original_bitmap_and_hll_declarations() {
         let declared =
             FunctionValueType::try_with_logical_type(DataType::Binary, true, domain).unwrap();
         let target = ColumnDef::from_value_type("v".into(), declared, None).unwrap();
-        let query = shape(&format!("VALUES (({source}))"), &[target]);
-        let ast::Expr::Nested(nested) = cast_input(&rows(&query)[0][0], target_name) else {
-            panic!("source parentheses must stay on the original path");
-        };
-        let original_call = cast_input(&nested.expression, target_name);
-        assert_eq!(printer::print_expr(original_call), source);
+        let query = shape(&format!("VALUES ROW({source})"), &[target]);
+        let original_call = cast_input(rows(&query)[0][0], target_name);
+        assert!(ast::SyntaxEq::syntax_eq(
+            original_call,
+            &novarocks_parser::parser::parse_expression(source).unwrap(),
+        ));
         analyze_shaped_query(query)
             .expect("the actual compiler must accept the original complete opaque cast");
         let error =
@@ -803,4 +913,152 @@ fn literal_target_casts_keep_original_bitmap_and_hll_declarations() {
             "{error}"
         );
     }
+}
+
+#[test]
+fn typed_float_defaults_keep_double_category_and_signed_zero() {
+    for value in [-0.0_f64, 1.0, f64::MAX] {
+        let mut column = column("f", DataType::Float64);
+        column.write_default = Some(ColumnDefault::Float64 {
+            bits: value.to_bits(),
+        });
+        let ast::Expr::Literal(ast::Literal {
+            kind: ast::LiteralKind::Double(actual),
+            ..
+        }) = omitted_insert_expr(&column).unwrap()
+        else {
+            panic!("typed floating default must remain a double");
+        };
+        assert_eq!(actual.get().to_bits(), value.to_bits());
+    }
+}
+
+#[test]
+fn select_projection_keeps_singleton_source_and_default_row_values() {
+    let mut structure = column(
+        "s",
+        DataType::Struct(Fields::from(vec![Arc::new(Field::new(
+            "only",
+            DataType::Int64,
+            true,
+        ))])),
+    );
+    structure.write_default = Some(ColumnDefault::Struct(vec![(
+        "only".into(),
+        ColumnDefault::Int64(7),
+    )]));
+    let source = parse_query("SELECT row(7)");
+    let shaped = shape_insert_source(
+        &source,
+        &["s".into()],
+        &[structure.clone()],
+        &[structure.clone()],
+    )
+    .unwrap()
+    .unwrap();
+    let expression = projection_expr(select(&shaped.body), 0);
+    let ast::Expr::Row(row) = cast_input(expression, r#"ROW("only" BIGINT)"#) else {
+        panic!("source singleton Row must keep its value shape");
+    };
+    assert_eq!(row.fields.len(), 1);
+    assert_eq!(
+        novarocks_sql::literal::expr_to_literal(expression).unwrap(),
+        novarocks_sql::semantic::Literal::Struct(vec![novarocks_sql::semantic::Literal::Int(7)])
+    );
+    let columns = [column("id", DataType::Int32), structure];
+    let shaped = shape_insert_source(
+        &parse_query("SELECT 1 AS id"),
+        &["id".into()],
+        &columns,
+        &columns,
+    )
+    .unwrap()
+    .unwrap();
+    let expression = projection_expr(select(&shaped.body), 1);
+    assert!(
+        matches!(cast_input(expression, r#"ROW("only" BIGINT)"#), ast::Expr::Row(row) if row.fields.len() == 1)
+    );
+    assert_eq!(
+        novarocks_sql::literal::expr_to_literal(expression).unwrap(),
+        novarocks_sql::semantic::Literal::Struct(vec![novarocks_sql::semantic::Literal::Int(7)])
+    );
+}
+
+#[test]
+fn literal_values_shaping_preserves_outer_row_span_and_single_struct_cell() {
+    let source = parse_query("VALUES ROW(ROW(7))");
+    let ast::SetExpr::Values(original) = source.body.as_ref() else {
+        panic!("VALUES");
+    };
+    let outer_span = original.rows[0].span();
+    let source_cells = ast::ValuesRowCells::new(&original.rows[0]);
+    assert_eq!(source_cells.len(), 1);
+    let ast::Expr::Row(inner) = source_cells.get(0).unwrap() else {
+        panic!("inner Struct cell");
+    };
+    assert_eq!(inner.fields.len(), 1);
+    let target = column(
+        "s",
+        DataType::Struct(Fields::from(vec![Arc::new(Field::new(
+            "only",
+            DataType::Int64,
+            true,
+        ))])),
+    );
+    let shaped = shape_insert_source(
+        &source,
+        &[],
+        std::slice::from_ref(&target),
+        std::slice::from_ref(&target),
+    )
+    .unwrap()
+    .unwrap();
+    let ast::SetExpr::Values(values) = shaped.body.as_ref() else {
+        panic!("shaped VALUES");
+    };
+    assert_eq!(values.rows[0].span(), outer_span);
+    let ast::Expr::Row(outer) = &values.rows[0] else {
+        panic!("real outer row");
+    };
+    assert_eq!(outer.fields.len(), 1);
+    assert!(outer.fields[0].name.is_none());
+    assert_eq!(outer.fields[0].span, outer.fields[0].expression.span());
+    let ast::Expr::Row(shaped_inner) =
+        cast_input(&outer.fields[0].expression, r#"ROW("only" BIGINT)"#)
+    else {
+        panic!("Struct value must remain one cell");
+    };
+    assert_eq!(shaped_inner.span, inner.span);
+    assert_eq!(shaped_inner.fields.len(), 1);
+    assert_eq!(shaped_inner.fields[0].name, inner.fields[0].name);
+    assert_eq!(shaped_inner.fields[0].span, inner.fields[0].span);
+    assert_eq!(
+        cast_input(&shaped_inner.fields[0].expression, "BIGINT"),
+        &inner.fields[0].expression
+    );
+
+    let mut named = source.clone();
+    let ast::SetExpr::Values(values) = named.body.as_mut() else {
+        unreachable!()
+    };
+    let ast::Expr::Row(outer) = &mut values.rows[0] else {
+        unreachable!()
+    };
+    outer.fields[0].name = Some(novarocks_parser::build::ident_at(
+        "named cell",
+        true,
+        Span::new(7, 12),
+    ));
+    let before = named.clone();
+    assert_eq!(
+        shape_insert_source(
+            &named,
+            &[],
+            std::slice::from_ref(&target),
+            std::slice::from_ref(&target)
+        )
+        .unwrap_err(),
+        "INSERT literal VALUES source does not support named row fields"
+    );
+    assert_eq!(named, before);
 }

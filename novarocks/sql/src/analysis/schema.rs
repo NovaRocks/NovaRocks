@@ -195,7 +195,6 @@ mod tests {
         let aliases = ["a", "B"].map(|value| novarocks_parser::ast::Ident {
             value: value.into(),
             quoted: false,
-            quote_style: None,
             span,
         });
         assert_eq!(

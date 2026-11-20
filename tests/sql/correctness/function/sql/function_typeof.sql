@@ -65,7 +65,7 @@ select typeof(cast('s' as BINARY));
 select typeof(cast('2023-03-07' as date));
 
 -- query 15
-select typeof(cast('2023-03-07 11:22:33' as datetime));
+SELECT typeof(CAST('2023-03-07 11:22:33' AS datetime));
 
 -- query 16
 select typeof([1, 2, 3]);
@@ -74,7 +74,7 @@ select typeof([1, 2, 3]);
 select typeof(get_json_object('{"k1":1, "k2":"v2"}', '$.k1'));
 
 -- query 18
-select typeof(map{1:"apple", 2:"orange", 3:"pear"});
+select typeof(map(1,'apple', 2,'orange', 3,'pear'));
 
 -- query 19
 select typeof(struct(1, 2, 3, 4));
@@ -113,11 +113,10 @@ create table t1 (
   c16 array<tinyint>,
   c17 string,
   c18 map<tinyint, varchar>,
-  c19 struct<col1 tinyint, col2 tinyint, col3 tinyint, col4 tinyint>,
+  c19 ROW(col1 tinyint, col2 tinyint, col3 tinyint, col4 tinyint),
   c20 json
-)
-TBLPROPERTIES ("format-version" = "3");
-insert into t1 values (
+) WITH (format_version = 3);
+insert into t1 values ROW(
   NULL, NULL, NULL, NULL, NULL,
   NULL, NULL, NULL, NULL, NULL,
   NULL, NULL, NULL, NULL, NULL,
@@ -151,16 +150,15 @@ select typeof(c1)
 -- query 26
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.pv_bitmap (
-    dt INT(11) NULL COMMENT "",
-    page VARCHAR(10) NULL COMMENT "",
-    user_id bitmap NULL COMMENT ""
-)
-TBLPROPERTIES ("format-version" = "3");
+    dt INT(11),
+    page VARCHAR(10),
+    user_id bitmap
+) WITH (format_version = 3);
 
 -- query 27
 -- @skip_result_check=true
 USE ${case_db};
-insert into pv_bitmap values(1, 'test', to_bitmap(10));
+insert into pv_bitmap values ROW(1, 'test', to_bitmap(10));
 
 -- query 28
 USE ${case_db};
@@ -172,13 +170,12 @@ CREATE TABLE ${case_db}.test_uv(
     dt date,
     id int,
     uv_set hll
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 30
 -- @skip_result_check=true
 USE ${case_db};
-insert into test_uv values('2024-01-01', 1, hll_hash(10));
+insert into test_uv values ROW('2024-01-01', 1, hll_hash(10));
 
 -- query 31
 USE ${case_db};

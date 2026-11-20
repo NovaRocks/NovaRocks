@@ -21,18 +21,16 @@
 
 -- query 1
 -- @skip_result_check=true
-DROP TABLE IF EXISTS ${case_db}.t_merge_row_id FORCE;
-DROP TABLE IF EXISTS ${case_db}.s_merge_row_id FORCE;
-CREATE TABLE ${case_db}.t_merge_row_id (id BIGINT, v STRING)
-TBLPROPERTIES ("format-version"="3", "write.row-lineage"="true");
-CREATE TABLE ${case_db}.s_merge_row_id (id BIGINT, v STRING)
-TBLPROPERTIES ("format-version"="3", "write.row-lineage"="true");
-INSERT INTO ${case_db}.t_merge_row_id VALUES (1,'a'),(2,'b'),(3,'c');
-INSERT INTO ${case_db}.s_merge_row_id VALUES (2,'bb'),(4,'d'),(5,'e');
-ALTER TABLE iceberg_dml_cat_${suite_uuid0}.${case_db}.t_merge_row_id CREATE TAG before_merge;
+DROP TABLE IF EXISTS ${case_db}.t_merge_row_id ;
+DROP TABLE IF EXISTS ${case_db}.s_merge_row_id ;
+CREATE TABLE ${case_db}.t_merge_row_id (id BIGINT, v STRING) WITH (format_version = 3);
+CREATE TABLE ${case_db}.s_merge_row_id (id BIGINT, v STRING) WITH (format_version = 3);
+INSERT INTO ${case_db}.t_merge_row_id VALUES ROW(1,'a'),ROW(2,'b'),ROW(3,'c');
+INSERT INTO ${case_db}.s_merge_row_id VALUES ROW(2,'bb'),ROW(4,'d'),ROW(5,'e');
+ALTER TABLE iceberg_dml_cat_${suite_uuid0}.${case_db}.t_merge_row_id EXECUTE create_tag(name => 'before_merge', replace => false, if_not_exists => false);
 MERGE INTO ${case_db}.t_merge_row_id AS t USING ${case_db}.s_merge_row_id AS s ON t.id=s.id
 WHEN MATCHED THEN UPDATE SET v=s.v WHEN NOT MATCHED THEN INSERT (id,v) VALUES (s.id,s.v);
-INSERT INTO ${case_db}.t_merge_row_id VALUES (6,'f'),(7,'g');
+INSERT INTO ${case_db}.t_merge_row_id VALUES ROW(6,'f'),ROW(7,'g');
 
 -- query 2
 SELECT COUNT(*) AS total_rows, COUNT(DISTINCT _row_id) AS unique_row_ids,
@@ -48,6 +46,6 @@ SELECT id,v FROM ${case_db}.t_merge_row_id ORDER BY id;
 
 -- query 5
 -- @skip_result_check=true
-ALTER TABLE iceberg_dml_cat_${suite_uuid0}.${case_db}.t_merge_row_id DROP TAG before_merge;
-DROP TABLE ${case_db}.t_merge_row_id FORCE;
-DROP TABLE ${case_db}.s_merge_row_id FORCE;
+ALTER TABLE iceberg_dml_cat_${suite_uuid0}.${case_db}.t_merge_row_id EXECUTE drop_tag(name => 'before_merge', if_exists => false);
+DROP TABLE ${case_db}.t_merge_row_id ;
+DROP TABLE ${case_db}.s_merge_row_id ;

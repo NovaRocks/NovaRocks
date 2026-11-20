@@ -131,6 +131,14 @@ const INTEGER_TYPES: &[TypeSpec] = &[
 // ---------------------------------------------------------------------------
 
 fn register_string_fns(m: &mut HashMap<String, Vec<Signature>>) {
+    add(
+        m,
+        crate::native_like::ESCAPE_FUNCTION_NAME,
+        Signature::new(
+            vec![TypeSpec::Utf8, TypeSpec::Utf8, TypeSpec::Utf8],
+            TypeSpec::Boolean,
+        ),
+    );
     // (Utf8) -> Utf8 — single-arg string transforms.
     for name in [
         "upper",

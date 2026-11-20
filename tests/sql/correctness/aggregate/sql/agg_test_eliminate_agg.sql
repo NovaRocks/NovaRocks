@@ -27,76 +27,74 @@ USE ${case_db};
 -- query 2
 -- @skip_result_check=true
 USE ${case_db};
-CREATE TABLE `test_agg_group_single_key_values` (
+CREATE TABLE "test_agg_group_single_key_values" (
   id INT NOT NULL,
   big_value BIGINT,
   double_value DOUBLE,
   decimal_value DECIMAL(10, 5),
   varchar_value VARCHAR(255)
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 3
 -- @skip_result_check=true
 USE ${case_db};
-CREATE TABLE `test_agg_group_multi_key_values` (
+CREATE TABLE "test_agg_group_multi_key_values" (
   id INT NOT NULL,
   big_value BIGINT,
   double_value DOUBLE,
   decimal_value DECIMAL(10, 5),
   varchar_value VARCHAR(255)
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 4
 -- @skip_result_check=true
 USE ${case_db};
-INSERT INTO `test_agg_group_single_key_values` (id, big_value, double_value, decimal_value, varchar_value) VALUES
-(1, 100000, 1.23, 123.45678, 'Test1'),
-(2, 200000, 2.34, 234.56789, 'Test2'),
-(3, 300000, 3.45, 345.67890, 'Test3'),
-(4, 400000, 4.56, 456.78901, 'Test4'),
-(5, 500000, 5.67, 567.89012, NULL),
-(6, 600000, 6.78, 678.90123, 'Test6'),
-(7, 700000, 7.89, 789.01234, NULL),
-(8, 800000, 8.90, 890.12345, 'Test8'),
-(9, 900000, 9.01, 901.23456, NULL),
-(10, 1000000, 10.12, 1012.34567, 'Test10'),
-(11, 1100000, 11.23, 1123.45678, 'Test11'),
-(12, 1200000, 12.34, 1234.56789, 'Test12'),
-(13, 1300000, 13.45, 1345.67890, NULL),
-(14, 1400000, 14.56, 1456.78901, 'Test14'),
-(15, 1500000, 15.67, 1567.89012, 'Test15'),
-(16, 1600000, 16.78, 1678.90123, NULL),
-(17, 1700000, 17.89, 1789.01234, 'Test17'),
-(18, 1800000, 18.90, 1890.12345, 'Test18'),
-(19, 1900000, 19.01, 1901.23456, NULL),
-(20, 2000000, 20.12, 2012.34567, 'Test20');
+INSERT INTO "test_agg_group_single_key_values" (id, big_value, double_value, decimal_value, varchar_value) VALUES
+ROW(1, 100000, 1.23, 123.45678, 'Test1'),
+ROW(2, 200000, 2.34, 234.56789, 'Test2'),
+ROW(3, 300000, 3.45, 345.67890, 'Test3'),
+ROW(4, 400000, 4.56, 456.78901, 'Test4'),
+ROW(5, 500000, 5.67, 567.89012, NULL),
+ROW(6, 600000, 6.78, 678.90123, 'Test6'),
+ROW(7, 700000, 7.89, 789.01234, NULL),
+ROW(8, 800000, 8.90, 890.12345, 'Test8'),
+ROW(9, 900000, 9.01, 901.23456, NULL),
+ROW(10, 1000000, 10.12, 1012.34567, 'Test10'),
+ROW(11, 1100000, 11.23, 1123.45678, 'Test11'),
+ROW(12, 1200000, 12.34, 1234.56789, 'Test12'),
+ROW(13, 1300000, 13.45, 1345.67890, NULL),
+ROW(14, 1400000, 14.56, 1456.78901, 'Test14'),
+ROW(15, 1500000, 15.67, 1567.89012, 'Test15'),
+ROW(16, 1600000, 16.78, 1678.90123, NULL),
+ROW(17, 1700000, 17.89, 1789.01234, 'Test17'),
+ROW(18, 1800000, 18.90, 1890.12345, 'Test18'),
+ROW(19, 1900000, 19.01, 1901.23456, NULL),
+ROW(20, 2000000, 20.12, 2012.34567, 'Test20');
 
 -- query 5
 -- @skip_result_check=true
 USE ${case_db};
-INSERT INTO `test_agg_group_multi_key_values` (id, big_value, double_value, decimal_value, varchar_value) VALUES
-(1, 100000, 1.23, 123.45678, 'Test1'),
-(2, 200000, 2.34, 234.56789, 'Test2'),
-(3, 300000, 3.45, 345.67890, 'Test3'),
-(4, 400000, 4.56, 456.78901, 'Test4'),
-(5, 500000, 5.67, 567.89012, NULL),
-(6, 600000, 6.78, 678.90123, 'Test6'),
-(7, 700000, 7.89, 789.01234, NULL),
-(8, 800000, 8.90, 890.12345, 'Test8'),
-(9, 900000, 9.01, 901.23456, NULL),
-(10, 1000000, 10.12, 1012.34567, 'Test10'),
-(11, 1100000, 11.23, 1123.45678, 'Test11'),
-(12, 1200000, 12.34, 1234.56789, 'Test12'),
-(13, 1300000, 13.45, 1345.67890, NULL),
-(14, 1400000, 14.56, 1456.78901, 'Test14'),
-(15, 1500000, 15.67, 1567.89012, 'Test15'),
-(16, 1600000, 16.78, 1678.90123, NULL),
-(17, 1700000, 17.89, 1789.01234, 'Test17'),
-(18, 1800000, 18.90, 1890.12345, 'Test18'),
-(19, 1900000, 19.01, 1901.23456, NULL),
-(20, 2000000, 20.12, 2012.34567, 'Test20');
+INSERT INTO "test_agg_group_multi_key_values" (id, big_value, double_value, decimal_value, varchar_value) VALUES
+ROW(1, 100000, 1.23, 123.45678, 'Test1'),
+ROW(2, 200000, 2.34, 234.56789, 'Test2'),
+ROW(3, 300000, 3.45, 345.67890, 'Test3'),
+ROW(4, 400000, 4.56, 456.78901, 'Test4'),
+ROW(5, 500000, 5.67, 567.89012, NULL),
+ROW(6, 600000, 6.78, 678.90123, 'Test6'),
+ROW(7, 700000, 7.89, 789.01234, NULL),
+ROW(8, 800000, 8.90, 890.12345, 'Test8'),
+ROW(9, 900000, 9.01, 901.23456, NULL),
+ROW(10, 1000000, 10.12, 1012.34567, 'Test10'),
+ROW(11, 1100000, 11.23, 1123.45678, 'Test11'),
+ROW(12, 1200000, 12.34, 1234.56789, 'Test12'),
+ROW(13, 1300000, 13.45, 1345.67890, NULL),
+ROW(14, 1400000, 14.56, 1456.78901, 'Test14'),
+ROW(15, 1500000, 15.67, 1567.89012, 'Test15'),
+ROW(16, 1600000, 16.78, 1678.90123, NULL),
+ROW(17, 1700000, 17.89, 1789.01234, 'Test17'),
+ROW(18, 1800000, 18.90, 1890.12345, 'Test18'),
+ROW(19, 1900000, 19.01, 1901.23456, NULL),
+ROW(20, 2000000, 20.12, 2012.34567, 'Test20');
 
 -- query 6
 USE ${case_db};

@@ -17,6 +17,7 @@
 
 use crate::planner::table::TableDef;
 use crate::planning::catalog::MetadataTableKind;
+use novarocks_parser::ast;
 use novarocks_types::naming::TableIdentity;
 use novarocks_types::schema::CatalogTable;
 
@@ -55,6 +56,14 @@ impl ResolvedAnalyzerTable {
     }
 }
 
+/// A captured metadata lookup for a quoted relation in a selected Iceberg catalog.
+#[derive(Clone, Debug)]
+pub struct QuotedMetadataTable {
+    pub relation: TableIdentity,
+    pub kind: MetadataTableKind,
+    pub resolved: Result<ResolvedAnalyzerTable, String>,
+}
+
 /// Planner-facing table materialization extension.
 ///
 /// This is the only ordinary analyzer/planner lookup seam: implementations
@@ -74,7 +83,7 @@ pub trait PlannerTableProvider {
         _catalog: Option<&str>,
         _database: &str,
         _table: &str,
-        version: &novarocks_parser::ast::TableVersion,
+        version: &novarocks_parser::ast::QueryPeriod,
     ) -> Result<ResolvedAnalyzerTable, crate::analyze_error::AnalyzeError> {
         Err(crate::analyze_error::AnalyzeError::unsupported_query_shape(
             "catalog does not supply historical table facts",
@@ -108,7 +117,7 @@ pub trait PlannerTableProvider {
         catalog: Option<&str>,
         database: &str,
         table: &str,
-        version: &novarocks_parser::ast::TableVersion,
+        version: &novarocks_parser::ast::QueryPeriod,
     ) -> Result<ResolvedAnalyzerTable, crate::analyze_error::AnalyzeError> {
         self.resolve_table_version_for_analysis(catalog, database, table, version)
     }
@@ -126,7 +135,7 @@ pub trait PlannerTableProvider {
         _catalog: Option<&str>,
         _database: &str,
         _table: &str,
-        _version: Option<&novarocks_parser::ast::TableVersion>,
+        _version: Option<&novarocks_parser::ast::QueryPeriod>,
     ) -> Result<
         Option<&std::sync::Arc<crate::system_table::SystemTableDeclaration>>,
         crate::analyze_error::AnalyzeError,
@@ -138,7 +147,7 @@ pub trait PlannerTableProvider {
         catalog: Option<&str>,
         database: &str,
         table: &str,
-        version: Option<&novarocks_parser::ast::TableVersion>,
+        version: Option<&novarocks_parser::ast::QueryPeriod>,
     ) -> Result<
         Option<&std::sync::Arc<crate::system_table::SystemTableDeclaration>>,
         crate::analyze_error::AnalyzeError,
@@ -148,6 +157,17 @@ pub trait PlannerTableProvider {
 
     /// A replacement definition's target; absent relations still resolve Missing.
     fn view_definition_target(&self) -> Option<&TableIdentity> {
+        None
+    }
+
+    /// Select a captured metadata lookup using the full authored object name.
+    /// A selected lookup keeps its resolution result, including a missing table.
+    fn resolve_quoted_iceberg_metadata(
+        &self,
+        _name: &ast::ObjectName,
+        _catalog: Option<&str>,
+        _database: &str,
+    ) -> Option<QuotedMetadataTable> {
         None
     }
 

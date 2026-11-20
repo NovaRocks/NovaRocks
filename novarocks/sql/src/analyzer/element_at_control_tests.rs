@@ -170,10 +170,7 @@ fn analyze_with_policy_and_control(
     policy: novarocks_functions::ConstantPolicy,
     control: &crate::compiler::SqlCompileControl,
 ) -> Result<ResolvedQuery, crate::analyze_error::AnalyzeError> {
-    let statements = novarocks_parser::parse(sql).unwrap();
-    let [ast::Statement::Query(query)] = statements.as_slice() else {
-        panic!("query");
-    };
+    let query = &novarocks_parser::parser::parse_query(sql).unwrap();
     super::analyze_with_function_catalog(
         query,
         &EmptyCatalog,
@@ -206,19 +203,21 @@ fn element_at_type_probe_preserves_first_catalog_control_without_rebinding() {
 #[test]
 fn element_at_type_probe_keeps_original_ordinary_binding_error_without_rebinding() {
     for sql in ["SELECT element_at([1,2],1)", "SELECT element_at( [1,2], 1)"] {
-        let statements = novarocks_parser::parse(sql).unwrap();
-        let [ast::Statement::Query(query)] = statements.as_slice() else {
-            panic!("query");
-        };
+        let query = &novarocks_parser::parser::parse_query(sql).unwrap();
         let ast::SetExpr::Select(select) = query.body.as_ref() else {
             panic!("select");
         };
-        let [ast::SelectItem::UnnamedExpr(ast::Expr::FunctionCall(function))] =
-            select.projection.as_slice()
+        let [ast::SelectItem::SingleColumn(projection_column)] = select.projection.as_slice()
         else {
             panic!("element_at call");
         };
-        let Some(ast::Expr::Array(array)) = function.arguments.first() else {
+        assert!(projection_column.alias.is_none(), "anonymous projection");
+        let ast::Expr::FunctionCall(function) = &projection_column.expression else {
+            panic!("element_at call");
+        };
+        let Some(ast::Expr::Array(array)) =
+            function.arguments.first().map(|argument| &argument.value)
+        else {
             panic!("original array argument");
         };
         let array_span = array.span;
@@ -377,7 +376,7 @@ fn element_at_type_probe_preserves_selected_unavailable_without_rebinding() {
 #[test]
 fn element_at_type_probe_routes_actual_array_and_map_sources_without_overload_guessing() {
     let query = analyze(
-        "SELECT element_at([1,2],1), [1,2][1], element_at(map{1:2},1), map{1:2}[1]",
+        "SELECT element_at([1,2],1), [1,2][1], element_at(map(1,2),1), map(1,2)[1]",
         crate::functions::builtin_sql_function_catalog(),
     )
     .unwrap();

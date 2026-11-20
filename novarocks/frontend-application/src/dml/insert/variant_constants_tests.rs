@@ -27,10 +27,7 @@ use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
 use novarocks_types::schema::ColumnDef;
 
 fn parse_query(sql: &str) -> ast::Query {
-    let statements = novarocks_parser::parse(sql).unwrap();
-    let [ast::Statement::Query(query)] = statements.as_slice() else {
-        panic!("query")
-    };
+    let query = novarocks_parser::parser::parse_query(sql).unwrap();
     query.clone()
 }
 fn columns() -> Vec<ColumnDef> {
@@ -122,7 +119,10 @@ fn original_encoder_keeps_variant_constants_and_mixed_multiline_syntax() {
     assert!(shaped.body.syntax_eq(&original.body));
     for (row, original_row) in actual.rows.iter().zip(&expected.rows) {
         assert!(
-            row[0].syntax_eq(&original_row[0]),
+            ast::ValuesRowCells::new(row)
+                .get(0)
+                .unwrap()
+                .syntax_eq(ast::ValuesRowCells::new(original_row).get(0).unwrap()),
             "other cells use their original source"
         );
     }
@@ -271,6 +271,41 @@ fn all_original_select_nested_and_union_leaves_keep_encoded_constants() {
     }
 }
 #[test]
+fn nary_and_parenthesized_union_constants_keep_original_order_and_source_paths() {
+    let columns = vec![columns().remove(1)];
+    for sql in [
+        "SELECT parse_json('42') UNION ALL SELECT parse_json('null') UNION ALL SELECT parse_json('{\"a\":1}')",
+        "(SELECT parse_json('42') UNION ALL SELECT parse_json('null')) UNION ALL SELECT parse_json('{\"a\":1}')",
+        "SELECT parse_json('42') UNION ALL (SELECT parse_json('null') UNION ALL SELECT parse_json('{\"a\":1}'))",
+    ] {
+        let (query, constants) = shape_insert_source_with_constants(
+            &parse_query(sql),
+            &[],
+            &columns,
+            &columns,
+            crate::application::test_constant_policy(),
+            &SqlCompileControl::unbounded(),
+        )
+        .unwrap()
+        .unwrap();
+        let constants = constants.unwrap();
+        assert_eq!(constants.len(), 3, "one authored value per original branch");
+        for (constant, json) in constants.iter().zip(["42", "null", r#"{"a":1}"#]) {
+            let bytes =
+                novarocks_types::value::variant_encode::encode_json_text_to_variant_bytes(json)
+                    .unwrap();
+            assert_eq!(
+                constant.value().try_binary().unwrap(),
+                Some(bytes.as_slice())
+            );
+        }
+        // Real compiler replay checks every published ordinal against this
+        // exact shaped tree, including retained Query parentheses.
+        analyze(query, Some(constants)).unwrap_or_else(|error| panic!("{sql}: {error}"));
+    }
+}
+
+#[test]
 fn select_filter_having_and_distinct_keep_the_original_inner_owner() {
     let source =
         parse_query("SELECT DISTINCT parse_json('42') AS v WHERE false HAVING v IS NOT NULL");
@@ -288,12 +323,16 @@ fn select_filter_having_and_distinct_keep_the_original_inner_owner() {
     let ast::SetExpr::Query(wrapper) = query.body.as_ref() else {
         panic!("target wrapper")
     };
-    let ast::SetExpr::Select(wrapper) = wrapper.body.as_ref() else {
+    let ast::SetExpr::Select(wrapper) = wrapper.query.body.as_ref() else {
         panic!("target SELECT")
     };
-    let ast::TableFactor::Derived { subquery, .. } = &wrapper.from[0].relation else {
-        panic!("inner owner")
+    let Some(ast::Relation::Aliased(alias)) = &wrapper.from else {
+        panic!("inner alias");
     };
+    let ast::Relation::TableSubquery(node) = alias.relation.as_ref() else {
+        panic!("inner owner");
+    };
+    let subquery = &node.query;
     assert!(subquery.body.syntax_eq(&source.body));
     analyze(query, constants)
         .expect("the original SELECT still owns its cardinality and alias policies");

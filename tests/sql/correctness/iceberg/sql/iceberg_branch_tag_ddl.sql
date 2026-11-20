@@ -20,7 +20,7 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE DATABASE iceberg_cat_${suite_uuid0}.iceberg_ref_db_${uuid0};
+CREATE SCHEMA iceberg_cat_${suite_uuid0}.iceberg_ref_db_${uuid0};
 
 -- query 2
 -- @skip_result_check=true
@@ -28,36 +28,36 @@ CREATE TABLE iceberg_cat_${suite_uuid0}.iceberg_ref_db_${uuid0}.t_ref_${uuid0} (
 
 -- query 3
 -- @skip_result_check=true
-INSERT INTO iceberg_cat_${suite_uuid0}.iceberg_ref_db_${uuid0}.t_ref_${uuid0} VALUES (1, 10), (2, 20);
+INSERT INTO iceberg_cat_${suite_uuid0}.iceberg_ref_db_${uuid0}.t_ref_${uuid0} VALUES ROW(1, 10), ROW(2, 20);
 
 -- query 4
 -- @skip_result_check=true
 -- @nova_extension=iceberg branch and tag DDL
-ALTER TABLE iceberg_cat_${suite_uuid0}.iceberg_ref_db_${uuid0}.t_ref_${uuid0} CREATE BRANCH dev;
+CREATE BRANCH dev IN TABLE iceberg_cat_${suite_uuid0}.iceberg_ref_db_${uuid0}.t_ref_${uuid0};
 
 -- query 5
 -- @skip_result_check=true
-ALTER TABLE iceberg_cat_${suite_uuid0}.iceberg_ref_db_${uuid0}.t_ref_${uuid0} CREATE BRANCH IF NOT EXISTS dev;
+CREATE BRANCH IF NOT EXISTS dev IN TABLE iceberg_cat_${suite_uuid0}.iceberg_ref_db_${uuid0}.t_ref_${uuid0};
 
 -- query 6
 -- @skip_result_check=true
-ALTER TABLE iceberg_cat_${suite_uuid0}.iceberg_ref_db_${uuid0}.t_ref_${uuid0} CREATE OR REPLACE BRANCH dev;
+CREATE OR REPLACE BRANCH dev IN TABLE iceberg_cat_${suite_uuid0}.iceberg_ref_db_${uuid0}.t_ref_${uuid0};
 
 -- query 7
 -- @skip_result_check=true
-ALTER TABLE iceberg_cat_${suite_uuid0}.iceberg_ref_db_${uuid0}.t_ref_${uuid0} CREATE TAG release_v1;
+ALTER TABLE iceberg_cat_${suite_uuid0}.iceberg_ref_db_${uuid0}.t_ref_${uuid0} EXECUTE create_tag(name => 'release_v1', replace => false, if_not_exists => false);
 
 -- query 8
 -- @skip_result_check=true
-ALTER TABLE iceberg_cat_${suite_uuid0}.iceberg_ref_db_${uuid0}.t_ref_${uuid0} DROP TAG release_v1;
+ALTER TABLE iceberg_cat_${suite_uuid0}.iceberg_ref_db_${uuid0}.t_ref_${uuid0} EXECUTE drop_tag(name => 'release_v1', if_exists => false);
 
 -- query 9
 -- @skip_result_check=true
-ALTER TABLE iceberg_cat_${suite_uuid0}.iceberg_ref_db_${uuid0}.t_ref_${uuid0} DROP BRANCH IF EXISTS dev;
+DROP BRANCH IF EXISTS dev IN TABLE iceberg_cat_${suite_uuid0}.iceberg_ref_db_${uuid0}.t_ref_${uuid0};
 
 -- query 10
 -- @skip_result_check=true
-ALTER TABLE iceberg_cat_${suite_uuid0}.iceberg_ref_db_${uuid0}.t_ref_${uuid0} DROP BRANCH IF EXISTS dev;
+DROP BRANCH IF EXISTS dev IN TABLE iceberg_cat_${suite_uuid0}.iceberg_ref_db_${uuid0}.t_ref_${uuid0};
 
 -- query 11
 -- @skip_result_check=true
@@ -65,4 +65,4 @@ DROP TABLE iceberg_cat_${suite_uuid0}.iceberg_ref_db_${uuid0}.t_ref_${uuid0};
 
 -- query 12
 -- @skip_result_check=true
-DROP DATABASE iceberg_cat_${suite_uuid0}.iceberg_ref_db_${uuid0};
+DROP SCHEMA iceberg_cat_${suite_uuid0}.iceberg_ref_db_${uuid0};

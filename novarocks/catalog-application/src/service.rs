@@ -435,6 +435,7 @@ impl CatalogApplicationService {
                             },
                             control_runtime_id,
                             configuration,
+                            binding_key,
                         })
                     }
                     Ok(_) => CatalogConfigurationAdmission::Unavailable {
@@ -1384,7 +1385,8 @@ impl CatalogApplicationService {
                 .require_ready(&command.instance_id);
         }
 
-        let provider_id = provider_id_from_properties(&provider_properties)?;
+        let provider_id =
+            catalog_provider_id(command.connector_name.as_deref(), &provider_properties)?;
         let mut durable_properties = provider_properties;
         durable_properties.sort_by(|left, right| left.0.cmp(&right.0));
         let attachment = CatalogAttachment {
@@ -1685,6 +1687,25 @@ fn invalid_credential_property(message: impl Into<String>) -> CatalogApplication
     CatalogApplicationError::new(CatalogApplicationErrorKind::InvalidRequest, message)
 }
 
+fn catalog_provider_id(
+    connector_name: Option<&str>,
+    properties: &[(String, String)],
+) -> Result<ConnectorProviderId, CatalogApplicationError> {
+    let Some(connector_name) = connector_name else {
+        return provider_id_from_properties(properties);
+    };
+    if properties
+        .iter()
+        .any(|(key, _)| key.eq_ignore_ascii_case("type"))
+    {
+        return Err(CatalogApplicationError::new(
+            CatalogApplicationErrorKind::InvalidRequest,
+            "Catalog property 'type' cannot override the USING connector",
+        ));
+    }
+    parse_catalog_provider_id(connector_name)
+}
+
 fn provider_id_from_properties(
     properties: &[(String, String)],
 ) -> Result<ConnectorProviderId, CatalogApplicationError> {
@@ -1704,6 +1725,12 @@ fn provider_id_from_properties(
             "CREATE CATALOG requires exactly one type property",
         ));
     }
+    parse_catalog_provider_id(provider)
+}
+
+fn parse_catalog_provider_id(
+    provider: &str,
+) -> Result<ConnectorProviderId, CatalogApplicationError> {
     ConnectorProviderId::parse(provider).map_err(|error| {
         CatalogApplicationError::new(
             CatalogApplicationErrorKind::InvalidRequest,
@@ -1785,6 +1812,7 @@ mod tests {
                         CatalogCreateCommand {
                             instance_id: instance_id.clone(),
                             display_name: name.into(),
+                            connector_name: None,
                             properties: vec![],
                             if_not_exists: conditional,
                         },
@@ -2339,6 +2367,36 @@ mod tests {
         })
         .await
         .expect("a retired projection must be materialized again");
+    }
+
+    #[test]
+    fn using_provider_name_controls_selection_independently_of_configuration() {
+        let properties = vec![("iceberg.catalog.type".to_owned(), "rest".to_owned())];
+        assert_eq!(
+            catalog_provider_id(Some("iceberg"), &properties)
+                .expect("public provider identity")
+                .as_str(),
+            "iceberg"
+        );
+        assert_eq!(
+            catalog_provider_id(Some("paimon"), &properties)
+                .expect("properties do not rename the selected provider")
+                .as_str(),
+            "paimon"
+        );
+        let override_property = vec![("TyPe".to_owned(), "paimon".to_owned())];
+        assert_eq!(
+            catalog_provider_id(Some("iceberg"), &override_property)
+                .expect_err("caller cannot author a second provider")
+                .kind(),
+            CatalogApplicationErrorKind::InvalidRequest
+        );
+        assert_eq!(
+            catalog_provider_id(None, &override_property)
+                .expect("legacy property author remains available")
+                .as_str(),
+            "paimon"
+        );
     }
 
     #[test]
@@ -3688,6 +3746,16 @@ mod tests {
             assert_eq!(second_snapshot.configuration.as_ref(), second.config());
             let repeated = ready(&service, first.config().instance_id());
             assert_eq!(repeated.runtime, first_snapshot.runtime);
+            assert_eq!(repeated.binding_key, first_snapshot.binding_key);
+            for snapshot in [&first_snapshot, &second_snapshot] {
+                assert_eq!(
+                    snapshot.binding_key,
+                    service
+                        .control
+                        .observe_current_binding(&snapshot.runtime.instance_id)
+                        .unwrap()
+                );
+            }
             assert!(Arc::ptr_eq(
                 &repeated.configuration,
                 &first_snapshot.configuration
@@ -3729,6 +3797,7 @@ mod tests {
             assert_eq!(current.runtime.provider_id, old.runtime.provider_id);
             assert_ne!(current.runtime.attachment_id, old.runtime.attachment_id);
             assert_ne!(current.runtime.generation, old.runtime.generation);
+            assert_ne!(current.binding_key, old.binding_key);
             assert_eq!(old.configuration.as_ref(), first.config());
             assert_eq!(current.configuration.as_ref(), next.config());
             assert!(!Arc::ptr_eq(&old.configuration, &current.configuration));

@@ -20,7 +20,6 @@ use std::sync::{Arc, Mutex};
 
 use arrow::datatypes::{DataType, Field, TimeUnit};
 use novarocks_functions::{ConstantPolicy, FunctionArgumentType, FunctionResultType};
-use novarocks_parser::ast;
 use novarocks_type_contract::{
     CompileControlError, CompilePhase, DecimalOverflowPolicy, FunctionValueType,
     PureCompileControl, ValueLogicalType,
@@ -85,10 +84,7 @@ fn analyze(
     source: &SourceCatalog,
     policy: ConstantPolicy,
 ) -> Result<ResolvedQuery, AnalyzeError> {
-    let statements = novarocks_parser::parse(sql).unwrap();
-    let [ast::Statement::Query(query)] = statements.as_slice() else {
-        panic!("query");
-    };
+    let query = &novarocks_parser::parser::parse_query(sql).unwrap();
     super::analyze_with_function_catalog_and_sql_semantics(
         query,
         source,
@@ -203,6 +199,7 @@ fn canonical_day_arithmetic_and_ordinary_calls_keep_four_units_zones_and_source_
                 let date = &call(expression).2[0];
                 if carrier != target {
                     let ExprKind::Cast {
+                        array_failure_mode: None,
                         expr,
                         target: cast_target,
                         decimal_overflow_policy,
@@ -237,20 +234,18 @@ fn canonical_day_arithmetic_and_ordinary_calls_keep_four_units_zones_and_source_
 }
 
 #[test]
-fn canonical_day_arithmetic_keeps_lexical_policy_and_required_nullable_sources() {
+fn canonical_day_arithmetic_inherits_root_policy_and_required_nullable_sources() {
     use DecimalOverflowPolicy::{OutputNull, ReportError};
     let source = SourceCatalog {
         carrier: DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
         logical: None,
         nullable: true,
     };
-    for (outer, inner, outer_policy, inner_policy) in [
-        ("ERROR_IF_OVERFLOW", "32", ReportError, OutputNull),
-        ("32", "ERROR_IF_OVERFLOW", OutputNull, ReportError),
-    ] {
+    for (outer, outer_policy) in [("ERROR_IF_OVERFLOW", ReportError), ("32", OutputNull)] {
         let sql = format!(
-            "SELECT /*+ SET_VAR(sql_mode='{outer}') */ q.x+CAST(1 AS INT), days_add(q.x,CAST(1 AS INT)) FROM (SELECT /*+ SET_VAR(sql_mode='{inner}') */ x,x-CAST(1 AS INT) AS shifted FROM temporal_source) q"
+            "WITH SESSION sql_mode = '{outer}' SELECT q.x+CAST(1 AS INT), days_add(q.x,CAST(1 AS INT)) FROM (SELECT x,x-CAST(1 AS INT) AS shifted FROM temporal_source) q"
         );
+        // The admitted root policy also governs expressions in the derived query.
         let query = analyze(&sql, &source, crate::constant::test_constant_policy()).unwrap();
         for ordinal in [0, 1] {
             let (_, binding, args) = call(project(&query, ordinal));
@@ -279,7 +274,7 @@ fn canonical_day_arithmetic_keeps_lexical_policy_and_required_nullable_sources()
             panic!("subquery");
         };
         let (_, binding, args) = call(project(inner_query, 1));
-        assert_eq!(binding.decimal_overflow_policy(), inner_policy);
+        assert_eq!(binding.decimal_overflow_policy(), outer_policy);
         let ExprKind::Cast {
             decimal_overflow_policy,
             ..
@@ -287,7 +282,7 @@ fn canonical_day_arithmetic_keeps_lexical_policy_and_required_nullable_sources()
         else {
             panic!("source cast");
         };
-        assert_eq!(*decimal_overflow_policy, inner_policy);
+        assert_eq!(*decimal_overflow_policy, outer_policy);
     }
     // Typed temporal NULL is a legitimate source; it does not authorize a
     // bare untyped NULL arithmetic domain or an extra raw carrier profile.
@@ -338,15 +333,39 @@ fn canonical_hidden_array_literal_materializes_common_width_and_keeps_null_and_n
                 false,
             ),
         );
-        let ExprKind::Cast { expr, target, .. } = &call(first).2[0].kind else {
-            panic!("common width source cast");
+        let coercion = &call(first).2[0];
+        let ExprKind::FunctionCall { binding, args, .. } = &coercion.kind else {
+            panic!("ordered common width conversion");
         };
-        assert_eq!(*target, DataType::Int16);
         assert_eq!(
-            expr.value_type,
+            binding.function_id.as_str(),
+            novarocks_functions::builtin::value_conversion::VALUE_CONVERSION_FUNCTION_ID
+        );
+        assert_eq!(
+            binding.selected.overload.as_str(),
+            novarocks_functions::builtin::value_conversion::ARRAY_COMMON_COERCION
+        );
+        assert_eq!(
+            coercion.value_type,
+            FunctionValueType::new(DataType::Int16, nullable)
+        );
+        assert_eq!(binding.result_constraint(), Some(&coercion.value_type));
+        assert!(matches!(
+            binding.result_constraint_origin(),
+            crate::binding::SqlResultConstraintOrigin::ArrayCommonCoercion
+        ));
+        assert_eq!(args.len(), 1);
+        assert_eq!(
+            args[0].value_type,
             FunctionValueType::new(DataType::Int8, nullable)
         );
-        assert!(matches!(expr.kind, ExprKind::ColumnRef { .. }));
+        assert_eq!(
+            binding.selected.argument_types.as_ref(),
+            &[novarocks_functions::FunctionArgumentType::Value(
+                args[0].value_type.clone()
+            )]
+        );
+        assert!(matches!(args[0].kind, ExprKind::ColumnRef { .. }));
         let second = project(&query, 1);
         assert_bound(
             second,
@@ -522,6 +541,7 @@ fn canonical_resolved_helper_materializes_text_and_preserves_success_error_contr
                 &FunctionValueType::new(DataType::Date32, true),
             );
             let ExprKind::Cast {
+                array_failure_mode: None,
                 expr,
                 target,
                 decimal_overflow_policy,

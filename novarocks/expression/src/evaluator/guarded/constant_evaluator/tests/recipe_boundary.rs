@@ -59,6 +59,7 @@ fn every_recipe_unsupported_declines_as_capability_missing() {
             &FunctionValueType::new(DataType::Int8, true),
             DecimalOverflowPolicy::ReportError,
             true,
+            None,
             &Control,
         )
         .unwrap_err(),
@@ -111,6 +112,7 @@ fn every_recipe_type_mismatch_preserves_original_primitive_error() {
             &integer,
             DecimalOverflowPolicy::ReportError,
             true,
+            None,
             &Control,
         )
         .unwrap_err(),
@@ -228,6 +230,7 @@ fn public_entry_declines_each_real_unsupported_recipe_family() {
                 target: &tiny,
                 decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
                 allow_throw_exception: true,
+                array_failure_mode: None,
             })),
             vec![original_constant(Arc::new(Date32Array::from(vec![1])))],
             tiny.clone(),
@@ -286,6 +289,7 @@ fn public_entry_preserves_each_real_type_mismatch_as_original_primitive_error() 
                 target: &nonnullable,
                 decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
                 allow_throw_exception: true,
+                array_failure_mode: None,
             })),
             vec![original_constant(Arc::new(Int64Array::from(vec![None])))],
             nonnullable.clone(),

@@ -105,7 +105,7 @@ fn read_data_sqls() -> Vec<String> {
         ),
         format!("SELECT count(*) FROM {catalog}.fixture.empty_append"),
         format!(
-            "SELECT id, CAST(c_decimal AS STRING), HEX(c_binary), CAST(c_timestamp AS STRING) FROM {catalog}.fixture.type_matrix ORDER BY id"
+            "SELECT id, CAST(c_decimal AS VARCHAR), HEX(c_binary), CAST(c_timestamp AS VARCHAR) FROM {catalog}.fixture.type_matrix ORDER BY id"
         ),
     ]
 }
@@ -577,7 +577,7 @@ impl Scenario for PaimonCancelAndBudget {
 
             let budget_error = control
                 .execute(format!(
-                    "SELECT /*+ SET_VAR(query_mem_limit=1) */ * \
+                    "WITH SESSION query_mem_limit = 1 SELECT * \
                  FROM {CATALOG}.fixture.type_matrix"
                 ))
                 .expect_err("one-byte query memory budget must reject the Paimon read");
@@ -661,7 +661,9 @@ impl Scenario for PaimonUnsupportedAndBinding {
         )?;
         expect_error_any(
             control
-                .execute(format!("ALTER TABLE {CATALOG}.fixture.pk_default OPTIMIZE"))
+                .execute(format!(
+                    "ALTER TABLE {CATALOG}.fixture.pk_default EXECUTE optimize"
+                ))
                 .map(|_| ()),
             &[
                 "no metadata maintenance capability",
@@ -671,7 +673,7 @@ impl Scenario for PaimonUnsupportedAndBinding {
         )?;
         expect_error_any(
             control
-                .execute(format!("ANALYZE TABLE {CATALOG}.fixture.pk_default"))
+                .execute(format!("ANALYZE {CATALOG}.fixture.pk_default"))
                 .map(|_| ()),
             &["no statistics capability", "no active statistics binding"],
             "Paimon ANALYZE",
@@ -715,10 +717,9 @@ impl Scenario for PaimonUnsupportedAndBinding {
         expect_error_any(
             control
                 .execute(format!(
-                    "CREATE EXTERNAL CATALOG paimon_bad_binding PROPERTIES(\
-                 \"type\"=\"paimon\",\
-                 \"paimon.catalog.type\"=\"rest\",\
-                 \"warehouse\"=\"{}\")",
+                    "CREATE CATALOG paimon_bad_binding USING paimon WITH (\
+                 \"paimon.catalog.type\" = 'rest',\
+                 \"warehouse\" = '{}')",
                     sql_string(&fixture.warehouse)
                 ))
                 .map(|_| ()),
@@ -797,12 +798,12 @@ impl Scenario for IcebergPaimonRead {
         let warehouse = create_warehouse(context, "iceberg-paimon-read")?;
         create_catalog(&mut control, ICEBERG, &warehouse)?;
         control
-            .execute(format!("CREATE DATABASE {ICEBERG}.fixture"))
+            .execute(format!("CREATE SCHEMA {ICEBERG}.fixture"))
             .map(|_| ())
             .context("create Iceberg cross-provider database")?;
         control
             .execute(format!(
-                "CREATE TABLE {ICEBERG}.fixture.dim (id BIGINT, label STRING)"
+                "CREATE TABLE {ICEBERG}.fixture.dim (id BIGINT, label VARCHAR)"
             ))
             .map(|_| ())
             .context("create Iceberg cross-provider table")?;
@@ -833,7 +834,7 @@ impl Scenario for IcebergPaimonRead {
         assert_query_completed_across_boundary(context, &snapshot, "Iceberg/Paimon join")?;
         await_resource_convergence(context, &baseline, "Iceberg/Paimon join")?;
         control
-            .execute(format!("DROP TABLE {ICEBERG}.fixture.dim FORCE"))
+            .execute(format!("DROP TABLE {ICEBERG}.fixture.dim"))
             .map(|_| ())
             .context("drop Iceberg cross-provider table")?;
         drop_catalog(&mut control, ICEBERG)?;
@@ -1314,21 +1315,20 @@ pub(super) fn create_paimon_catalog(
         .with_context(|| format!("remove stale Paimon catalog {name}"))?;
     control
         .execute(format!(
-            "CREATE EXTERNAL CATALOG {name} PROPERTIES(\
-             \"type\"=\"paimon\",\
-             \"paimon.catalog.type\"=\"filesystem\",\
-             \"warehouse\"=\"{}\",\
-             \"aws.s3.endpoint\"=\"{}\",\
-             \"aws.s3.region\"=\"{}\",\
-             \"aws.s3.enable_path_style_access\"=\"true\",\
-             \"credential.object-store-metadata.consumer-role\"=\"frontend\",\
-             \"credential.object-store-metadata.mode\"=\"static\",\
-             \"credential.object-store-metadata.name\"=\"{}\",\
-             \"credential.object-store-metadata.generation\"=\"{}\",\
-             \"credential.object-store-data.consumer-role\"=\"backend\",\
-             \"credential.object-store-data.mode\"=\"static\",\
-             \"credential.object-store-data.name\"=\"{}\",\
-             \"credential.object-store-data.generation\"=\"{}\")",
+            "CREATE CATALOG {name} USING paimon WITH (\
+             \"paimon.catalog.type\" = 'filesystem',\
+             \"warehouse\" = '{}',\
+             \"aws.s3.endpoint\" = '{}',\
+             \"aws.s3.region\" = '{}',\
+             \"aws.s3.enable_path_style_access\" = 'true',\
+             \"credential.object-store-metadata.consumer-role\" = 'frontend',\
+             \"credential.object-store-metadata.mode\" = 'static',\
+             \"credential.object-store-metadata.name\" = '{}',\
+             \"credential.object-store-metadata.generation\" = '{}',\
+             \"credential.object-store-data.consumer-role\" = 'backend',\
+             \"credential.object-store-data.mode\" = 'static',\
+             \"credential.object-store-data.name\" = '{}',\
+             \"credential.object-store-data.generation\" = '{}')",
             sql_string(&fixture.warehouse),
             sql_string(&fixture.endpoint),
             sql_string(&fixture.region),
@@ -1349,7 +1349,7 @@ fn drop_catalog(control: &mut SqlSession, name: &str) -> Result<()> {
 }
 
 fn sql_string(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
+    value.replace('\'', "''")
 }
 
 fn verify_fixture(root: &Path) -> Result<()> {

@@ -1183,6 +1183,7 @@ mod tests {
             instance_id: novarocks_spi::connector::ConnectorInstanceId::parse("catalog.analytics")
                 .expect("instance ID"),
             display_name: "catalog.analytics".to_string(),
+            connector_name: None,
             properties: vec![("type".to_string(), "iceberg".to_string())],
             if_not_exists,
         }

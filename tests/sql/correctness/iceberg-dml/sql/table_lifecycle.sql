@@ -29,8 +29,8 @@ CREATE TABLE ${case_db}.t_table_lifecycle (
   v1 STRING
 );
 INSERT INTO ${case_db}.t_table_lifecycle VALUES
-  (1, 'a'),
-  (2, 'b');
+  ROW(1, 'a'),
+  ROW(2, 'b');
 
 -- query 2
 SELECT k1, v1
@@ -47,7 +47,7 @@ FROM ${case_db}.t_table_lifecycle;
 
 -- query 5
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t_table_lifecycle VALUES (10, 'z');
+INSERT INTO ${case_db}.t_table_lifecycle VALUES ROW(10, 'z');
 
 -- query 6
 SELECT k1, v1

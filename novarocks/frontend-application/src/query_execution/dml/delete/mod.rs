@@ -17,6 +17,7 @@
 
 //! Typed DELETE input and preparation for the supervised write action.
 
+#[cfg(any(test, novarocks_dev_controls))]
 pub(crate) mod equality;
 pub(crate) mod standard;
 
@@ -26,22 +27,40 @@ use crate::query_execution::kernels::DmlExecutionKernel;
 use novarocks_proto_codec::lifecycle::QueryOptions;
 use novarocks_query_application::admitted_query_context::QueryExecutionContext;
 
-/// One parser-owned DELETE variant admitted by the typed statement router.
-///
-/// The source is retained separately in [`DeleteStatementInput`] and may only
-/// be sliced through the selected AST node's [`novarocks_parser::Span`].
-#[derive(Clone, Copy, Debug)]
-pub enum DeleteStatement<'a> {
-    Predicate(&'a novarocks_parser::ast::Delete),
-    Equality,
+/// The authored WHERE and target facts retained by the original DELETE action.
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedPredicateDelete {
+    pub(crate) target: super::mutation::RowMutationTarget,
+    pub(crate) selection: Option<novarocks_parser::ast::Expr>,
+    pub(crate) span: novarocks_parser::Span,
 }
 
-/// The exact parser-owned statement retained by the supervised write action.
+/// The admitted statement retained by the supervised write action.
 /// Source text is never reparsed to rediscover the statement or its target.
 #[derive(Clone, Debug)]
 pub(crate) enum OwnedDeleteStatement {
-    Predicate(novarocks_parser::ast::Delete),
-    Equality(novarocks_parser::ast::AddEqualityDelete),
+    Predicate(PreparedPredicateDelete),
+    #[cfg(novarocks_dev_controls)]
+    TrinoEquality {
+        statement: equality::PreparedEqualityDelete,
+        resolved: ResolvedEqualityDeleteTarget,
+    },
+}
+
+#[cfg(novarocks_dev_controls)]
+#[derive(Clone)]
+pub(crate) struct ResolvedEqualityDeleteTarget {
+    pub(crate) target: crate::catalog_application::resolver::TargetBackend,
+    pub(crate) planning: novarocks_spi::connector::ConnectorControlPlanningPin,
+}
+
+#[cfg(novarocks_dev_controls)]
+impl std::fmt::Debug for ResolvedEqualityDeleteTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedEqualityDeleteTarget")
+            .field("target", &self.target)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Resolve only local catalog admission and parser-owned target facts. The
@@ -59,9 +78,12 @@ pub(crate) fn resolve_target(
         OwnedDeleteStatement::Predicate(statement) => {
             standard::resolve_target(state, statement, current_catalog, current_database)
         }
-        OwnedDeleteStatement::Equality(statement) => {
-            equality::resolve_target(state, statement, current_catalog, current_database)
-        }
+        #[cfg(novarocks_dev_controls)]
+        OwnedDeleteStatement::TrinoEquality { .. } => Err(
+            "Trino equality delete requires its retained target and planning pin"
+                .to_owned()
+                .into(),
+        ),
     }
 }
 
@@ -191,7 +213,8 @@ pub(crate) async fn prepare_delete_write_async(
             )
             .await
         }
-        OwnedDeleteStatement::Equality(statement) => {
+        #[cfg(novarocks_dev_controls)]
+        OwnedDeleteStatement::TrinoEquality { statement, .. } => {
             equality::prepare_equality_delete_statement_async(
                 state,
                 statement,
@@ -256,24 +279,6 @@ async fn begin_delete_write_session_async(
     .map_err(|error| format!("begin connector write session: {error}"))
 }
 
-/// DELETE statements recognized by the frontend command router.
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DeleteStatementKind {
-    Predicate,
-    Equality,
-}
-
-impl DeleteStatement<'_> {
-    #[cfg(test)]
-    pub const fn kind(self) -> DeleteStatementKind {
-        match self {
-            Self::Predicate(_) => DeleteStatementKind::Predicate,
-            Self::Equality => DeleteStatementKind::Equality,
-        }
-    }
-}
-
 /// Complete original DELETE input retained by its governed statement source.
 pub struct DeleteStatementInput {
     pub(crate) statement: OwnedDeleteStatement,
@@ -307,25 +312,5 @@ impl DeleteEngine for DmlExecutionKernel {
         crate::catalog_application::resolver::TargetResolutionError,
     > {
         crate::query::delete_action::prepare(self.clone(), input)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use novarocks_parser::ast::{DmlStatement, Statement};
-
-    #[test]
-    fn typed_variant_determines_delete_kind() {
-        let statements =
-            novarocks_parser::parse("DELETE FROM t WHERE id = 1").expect("parse DELETE");
-        let Statement::Dml(DmlStatement::Delete(delete)) = &statements[0] else {
-            panic!("expected DELETE");
-        };
-
-        assert_eq!(
-            DeleteStatement::Predicate(delete).kind(),
-            DeleteStatementKind::Predicate
-        );
     }
 }

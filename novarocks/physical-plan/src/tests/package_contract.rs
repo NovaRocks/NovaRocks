@@ -2415,6 +2415,7 @@ fn intrinsic_package_fixture(
                 decimal_overflow_policy:
                     novarocks_type_contract::DecimalOverflowPolicy::ReportError,
                 allow_throw_exception: intrinsic_reference(u32::MAX),
+                array_failure_mode: None,
             },
         )
         .unwrap();

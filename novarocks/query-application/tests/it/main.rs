@@ -16,3 +16,7 @@
 // under the License.
 mod fixtures;
 mod frozen_output_contract;
+
+mod property_evaluation;
+
+mod unsupported_admission;

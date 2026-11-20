@@ -22,18 +22,15 @@
 
 -- query 1
 -- @skip_result_check=true
-DROP TABLE IF EXISTS ${case_db}.t_v3_default_complex FORCE;
+DROP TABLE IF EXISTS ${case_db}.t_v3_default_complex ;
 CREATE TABLE ${case_db}.t_v3_default_complex (
   id INT
-)
-TBLPROPERTIES (
-  "format-version" = "3"
-);
+) WITH (format_version = 3);
 
 -- query 2
--- @expect_error=[sql.parse.unexpected_token] expected literal
+-- @expect_trino_error=SYNTAX_ERROR,USER_ERROR
 ALTER TABLE ${case_db}.t_v3_default_complex ADD COLUMN c ARRAY<INT> DEFAULT [1,2];
 
 -- query 3
 -- @skip_result_check=true
-DROP TABLE ${case_db}.t_v3_default_complex FORCE;
+DROP TABLE ${case_db}.t_v3_default_complex ;

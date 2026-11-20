@@ -22,14 +22,13 @@
 -- query 1
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.max_min_by_null_value
-(seq INT, v INT, k DECIMAL(18,9), neg_k DECIMAL(18,9), d DECIMAL(18,9))
-TBLPROPERTIES ("format-version" = "3");
+(seq INT, v INT, k DECIMAL(18,9), neg_k DECIMAL(18,9), d DECIMAL(18,9)) WITH (format_version = 3);
 
 -- query 2
 -- @skip_result_check=true
 INSERT INTO ${case_db}.max_min_by_null_value VALUES
-(1,4,4008,-4008,4),(2,9,9006,-9006,9),
-(3,NULL,6,-6,NULL),(4,999,NULL,NULL,999);
+ROW(1,4,4008,-4008,4),ROW(2,9,9006,-9006,9),
+ROW(3,NULL,6,-6,NULL),ROW(4,999,NULL,NULL,999);
 
 -- query 3
 SELECT max_by(v,k) AS max_v, min_by(v,k) AS min_v,

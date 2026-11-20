@@ -30,6 +30,7 @@ pub struct SqlLogicalExplainCatalog {
     catalog: CatalogCompletionState,
     session: SqlSessionContext,
     control: SqlCompileControl,
+    root_session_admitted: bool,
 }
 
 impl SqlLogicalExplainCatalog {
@@ -38,22 +39,65 @@ impl SqlLogicalExplainCatalog {
         session: SqlSessionContext,
         control: SqlCompileControl,
     ) -> Result<Self, SqlCompileError> {
+        Self::try_new_for_input(
+            SqlStatementInput::parsed_query(Box::new(query)),
+            session,
+            control,
+        )
+    }
+
+    pub fn try_new_for_input(
+        input: SqlStatementInput,
+        session: SqlSessionContext,
+        control: SqlCompileControl,
+    ) -> Result<Self, SqlCompileError> {
+        Self::try_new_for_input_with_qualifications(
+            input,
+            session,
+            control,
+            super::CatalogQualifications::default(),
+        )
+    }
+
+    pub fn try_new_for_input_with_qualifications(
+        input: SqlStatementInput,
+        session: SqlSessionContext,
+        control: SqlCompileControl,
+        qualifications: super::CatalogQualifications,
+    ) -> Result<Self, SqlCompileError> {
         control.check()?;
-        let query = crate::sql_mode::normalize_concat_query(query, &session.sql_semantics)
-            .map_err(SqlCompileError::from)?;
-        let catalog = CatalogCompletionState::try_new_with_semantics(
+        let (query, root_session_admitted) = match input.kind {
+            super::SqlStatementInputKind::ParsedQuery(query) => (*query, false),
+            super::SqlStatementInputKind::AdmittedSessionQuery(query) => (*query, true),
+            _ => {
+                return Err(SqlCompileError::InvalidRequest(
+                    "logical EXPLAIN requires a parsed query".into(),
+                ));
+            }
+        };
+        let query = if root_session_admitted {
+            crate::sql_mode::normalize_concat_query_with_semantics(query, &session.sql_semantics)
+        } else {
+            crate::sql_mode::normalize_concat_query(query, &session.sql_semantics)
+                .map_err(SqlCompileError::from)?
+        };
+        let catalog = CatalogCompletionState::try_new_with_qualifications(
             query,
+            &[],
+            &[],
             session.current_catalog.as_deref(),
             &session.current_database,
             crate::catalog::TableLookupMode::ExplainStats,
             0,
             &session.sql_semantics,
+            qualifications,
         )?
         .with_exchange_budget(super::DEFAULT_COMPLETION_LIMITS)?;
         Ok(Self {
             catalog,
             session,
             control,
+            root_session_admitted,
         })
     }
 
@@ -81,8 +125,14 @@ impl SqlLogicalExplainCatalog {
         self.control.check()?;
         let facts = self.catalog.fact_catalog(facts)?;
         let snapshot = SqlPlannerTableSnapshot::new(&facts);
+        let query = Box::new(self.catalog.query().clone());
+        let input = if self.root_session_admitted {
+            SqlStatementInput::query_with_admitted_session(query)
+        } else {
+            SqlStatementInput::parsed_query(query)
+        };
         let request = SqlAnalyzeRequest::new(
-            SqlStatementInput::parsed_query(Box::new(self.catalog.query().clone())),
+            input,
             SqlCompileIntent::LogicalOnly,
             self.session,
             environment,
@@ -104,10 +154,7 @@ mod tests {
     use super::*;
 
     fn query(sql: &str) -> novarocks_parser::ast::Query {
-        let mut parsed = novarocks_parser::parse(sql).unwrap();
-        let [novarocks_parser::ast::Statement::Query(query)] = parsed.as_mut_slice() else {
-            panic!("query fixture")
-        };
+        let query = &mut novarocks_parser::parser::parse_query(sql).unwrap();
         query.clone()
     }
     fn session() -> SqlSessionContext {
@@ -158,6 +205,34 @@ mod tests {
             .into_explain_lines(ExplainLevel::Normal, true, &control)
             .unwrap();
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn logical_explain_carries_admitted_session_through_catalog_and_final_analysis() {
+        let sql = "WITH SESSION decimal_overflow_to_double = true AND true SELECT 1 AS a";
+        let query = novarocks_parser::parser::parse_query(sql).unwrap();
+        let mut effective = session();
+        effective.sql_semantics = effective
+            .sql_semantics
+            .with_decimal_overflow_to_double(true);
+        let logical = SqlLogicalExplainCatalog::try_new_for_input(
+            SqlStatementInput::query_with_admitted_session(Box::new(query)),
+            effective,
+            SqlCompileControl::unbounded(),
+        )
+        .unwrap();
+        assert!(logical.needs().is_empty());
+        let lines = logical
+            .finish(
+                &[],
+                crate::functions::builtin_sql_function_catalog(),
+                super::super::noop_constant_evaluator(),
+                crate::constant::test_constant_policy(),
+                SqlPlanningEnvironment::Distributed,
+                ExplainLevel::Normal,
+            )
+            .unwrap();
+        assert!(!lines.is_empty());
     }
 
     #[test]

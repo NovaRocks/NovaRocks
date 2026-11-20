@@ -25,99 +25,60 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE EXTERNAL CATALOG ice_mv_apply_agg_${uuid0}
-PROPERTIES (
-  "type" = "iceberg",
-  "iceberg.catalog.type" = "rest",
-  "uri" = "${iceberg_rest_uri}",
-  "warehouse" = "${iceberg_rest_warehouse}",
-  "aws.s3.endpoint" = "${oss_endpoint}",
-  "credential.object-store-metadata.consumer-role" = "frontend",
-  "credential.object-store-metadata.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-metadata.name" = "${iceberg_object_store_metadata_credential_name}",
-  "credential.object-store-metadata.generation" = "${iceberg_object_store_credential_generation}",
-  "credential.object-store-data.consumer-role" = "backend",
-  "credential.object-store-data.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-data.name" = "${iceberg_object_store_data_credential_name}",
-  "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
-  "aws.s3.region" = "${oss_region}",
-  "aws.s3.enable_path_style_access" = "${oss_path_style}"
-);
-CREATE DATABASE ice_mv_apply_agg_${uuid0}.ns_${uuid0};
+CREATE CATALOG ice_mv_apply_agg_${uuid0} USING iceberg WITH ("iceberg.catalog.type" = 'rest', "uri" = '${iceberg_rest_uri}', "warehouse" = '${iceberg_rest_warehouse}', "aws.s3.endpoint" = '${oss_endpoint}', "credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-metadata.name" = '${iceberg_object_store_metadata_credential_name}', "credential.object-store-metadata.generation" = '${iceberg_object_store_credential_generation}', "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-data.name" = '${iceberg_object_store_data_credential_name}', "credential.object-store-data.generation" = '${iceberg_object_store_credential_generation}', "aws.s3.region" = '${oss_region}', "aws.s3.enable_path_style_access" = '${oss_path_style}');
+CREATE SCHEMA ice_mv_apply_agg_${uuid0}.ns_${uuid0};
 CREATE TABLE ice_mv_apply_agg_${uuid0}.ns_${uuid0}.orders_${uuid0} (
   id BIGINT NOT NULL,
   region STRING,
   amount BIGINT
-)
-TBLPROPERTIES ("format-version" = "3",
-  "write.row-lineage" = "true");
+) WITH (format_version = 3);
 CREATE TABLE ice_mv_apply_agg_${uuid0}.ns_${uuid0}.fact_${uuid0} (
   id BIGINT NOT NULL,
   dim_id BIGINT,
   amount BIGINT
-)
-TBLPROPERTIES ("format-version" = "3",
-  "write.row-lineage" = "true");
+) WITH (format_version = 3);
 CREATE TABLE ice_mv_apply_agg_${uuid0}.ns_${uuid0}.dim_${uuid0} (
   id BIGINT NOT NULL,
   region STRING
-)
-TBLPROPERTIES ("format-version" = "3",
-  "write.row-lineage" = "true");
+) WITH (format_version = 3);
 CREATE TABLE ice_mv_apply_agg_${uuid0}.ns_${uuid0}.t1_${uuid0} (
   id BIGINT NOT NULL,
   region STRING,
   amount BIGINT
-)
-TBLPROPERTIES ("format-version" = "3",
-  "write.row-lineage" = "true");
+) WITH (format_version = 3);
 CREATE TABLE ice_mv_apply_agg_${uuid0}.ns_${uuid0}.t2_${uuid0} (
   id BIGINT NOT NULL,
   region STRING,
   amount BIGINT
-)
-TBLPROPERTIES ("format-version" = "3",
-  "write.row-lineage" = "true");
+) WITH (format_version = 3);
 USE ice_mv_apply_agg_${uuid0}.ns_${uuid0};
 
 -- query 2
 -- @skip_result_check=true
 INSERT INTO ice_mv_apply_agg_${uuid0}.ns_${uuid0}.orders_${uuid0} VALUES
-  (1, 'east', 10),
-  (2, 'east', -10),
-  (3, 'west', 5);
+  ROW(1, 'east', 10),
+  ROW(2, 'east', -10),
+  ROW(3, 'west', 5);
 INSERT INTO ice_mv_apply_agg_${uuid0}.ns_${uuid0}.dim_${uuid0} VALUES
-  (10, 'east'),
-  (20, 'west');
+  ROW(10, 'east'),
+  ROW(20, 'west');
 INSERT INTO ice_mv_apply_agg_${uuid0}.ns_${uuid0}.fact_${uuid0} VALUES
-  (1, 10, 100),
-  (2, 20, 50);
+  ROW(1, 10, 100),
+  ROW(2, 20, 50);
 INSERT INTO ice_mv_apply_agg_${uuid0}.ns_${uuid0}.t1_${uuid0} VALUES
-  (1, 'k1', 10),
-  (2, 'k2', 5);
+  ROW(1, 'k1', 10),
+  ROW(2, 'k2', 5);
 INSERT INTO ice_mv_apply_agg_${uuid0}.ns_${uuid0}.t2_${uuid0} VALUES
-  (3, 'k1', 100),
-  (4, 'k3', 7);
-CREATE MATERIALIZED VIEW agg_apply_mv_${uuid0}
-DISTRIBUTED BY HASH(region) BUCKETS 1
-PROPERTIES ('storage_engine' = 'iceberg')
-AS
-SELECT region, COUNT(*) AS c, SUM(amount) AS s
+  ROW(3, 'k1', 100),
+  ROW(4, 'k3', 7);
+CREATE MATERIALIZED VIEW agg_apply_mv_${uuid0} AS SELECT region, COUNT(*) AS c, SUM(amount) AS s
 FROM orders_${uuid0}
 GROUP BY region;
-CREATE MATERIALIZED VIEW join_agg_apply_mv_${uuid0}
-DISTRIBUTED BY HASH(region) BUCKETS 1
-PROPERTIES ('storage_engine' = 'iceberg')
-AS
-SELECT d.region, COUNT(*) AS c, SUM(f.amount) AS s
+CREATE MATERIALIZED VIEW join_agg_apply_mv_${uuid0} AS SELECT d.region, COUNT(*) AS c, SUM(f.amount) AS s
 FROM fact_${uuid0} AS f
 JOIN dim_${uuid0} AS d ON f.dim_id = d.id
 GROUP BY d.region;
-CREATE MATERIALIZED VIEW branch_agg_apply_mv_${uuid0}
-DISTRIBUTED BY HASH(region) BUCKETS 1
-PROPERTIES ('storage_engine' = 'iceberg')
-AS
-SELECT region, COUNT(*) AS c, SUM(amount) AS s
+CREATE MATERIALIZED VIEW branch_agg_apply_mv_${uuid0} AS SELECT region, COUNT(*) AS c, SUM(amount) AS s
 FROM t1_${uuid0}
 GROUP BY region
 UNION ALL
@@ -142,8 +103,8 @@ ORDER BY region;
 -- query 5
 -- @skip_result_check=true
 INSERT INTO ice_mv_apply_agg_${uuid0}.ns_${uuid0}.orders_${uuid0} VALUES
-  (4, 'east', 0),
-  (5, 'north', 7);
+  ROW(4, 'east', 0),
+  ROW(5, 'north', 7);
 DELETE FROM ice_mv_apply_agg_${uuid0}.ns_${uuid0}.orders_${uuid0}
 WHERE region = 'west';
 
@@ -185,9 +146,9 @@ WHERE id = 10;
 DELETE FROM ice_mv_apply_agg_${uuid0}.ns_${uuid0}.fact_${uuid0}
 WHERE id = 2;
 INSERT INTO ice_mv_apply_agg_${uuid0}.ns_${uuid0}.dim_${uuid0} VALUES
-  (30, 'south');
+  ROW(30, 'south');
 INSERT INTO ice_mv_apply_agg_${uuid0}.ns_${uuid0}.fact_${uuid0} VALUES
-  (3, 30, 70);
+  ROW(3, 30, 70);
 
 -- query 12
 -- @skip_result_check=true
@@ -231,7 +192,7 @@ ORDER BY region, s;
 DELETE FROM ice_mv_apply_agg_${uuid0}.ns_${uuid0}.t2_${uuid0}
 WHERE region = 'k1';
 INSERT INTO ice_mv_apply_agg_${uuid0}.ns_${uuid0}.t1_${uuid0} VALUES
-  (5, 'k1', 50);
+  ROW(5, 'k1', 50);
 
 -- query 18
 -- @skip_result_check=true
@@ -263,10 +224,10 @@ ORDER BY region, s;
 DROP MATERIALIZED VIEW branch_agg_apply_mv_${uuid0};
 DROP MATERIALIZED VIEW join_agg_apply_mv_${uuid0};
 DROP MATERIALIZED VIEW agg_apply_mv_${uuid0};
-DROP TABLE ice_mv_apply_agg_${uuid0}.ns_${uuid0}.t2_${uuid0} FORCE;
-DROP TABLE ice_mv_apply_agg_${uuid0}.ns_${uuid0}.t1_${uuid0} FORCE;
-DROP TABLE ice_mv_apply_agg_${uuid0}.ns_${uuid0}.dim_${uuid0} FORCE;
-DROP TABLE ice_mv_apply_agg_${uuid0}.ns_${uuid0}.fact_${uuid0} FORCE;
-DROP TABLE ice_mv_apply_agg_${uuid0}.ns_${uuid0}.orders_${uuid0} FORCE;
-DROP DATABASE ice_mv_apply_agg_${uuid0}.ns_${uuid0};
+DROP TABLE ice_mv_apply_agg_${uuid0}.ns_${uuid0}.t2_${uuid0} ;
+DROP TABLE ice_mv_apply_agg_${uuid0}.ns_${uuid0}.t1_${uuid0} ;
+DROP TABLE ice_mv_apply_agg_${uuid0}.ns_${uuid0}.dim_${uuid0} ;
+DROP TABLE ice_mv_apply_agg_${uuid0}.ns_${uuid0}.fact_${uuid0} ;
+DROP TABLE ice_mv_apply_agg_${uuid0}.ns_${uuid0}.orders_${uuid0} ;
+DROP SCHEMA ice_mv_apply_agg_${uuid0}.ns_${uuid0};
 DROP CATALOG ice_mv_apply_agg_${uuid0};

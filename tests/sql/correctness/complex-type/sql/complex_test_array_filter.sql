@@ -26,18 +26,17 @@ USE ${case_db};
 -- query 2
 -- @skip_result_check=true
 USE ${case_db};
-CREATE TABLE `t` (
-  `k` bigint(20) NOT NULL COMMENT "",
-  `arr_0` array<bigint(20)> NOT NULL COMMENT "",
-  `arr_1` array<bigint(20)> NULL COMMENT "",
-  `arr_2` array<bigint(20)> NULL COMMENT ""
-)
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE "t" (
+  "k" bigint(20) NOT NULL,
+  "arr_0" array<bigint(20)> NOT NULL,
+  "arr_1" array<bigint(20)>,
+  "arr_2" array<bigint(20)>
+) WITH (format_version = 3);
 
 -- query 3
 -- @skip_result_check=true
 USE ${case_db};
-insert into t values (1,[1,2],[1,2],[0,1]),(2,[1,2],null,[1,1]),(3,[1,2],[1,2],null),(4,[1,2],[null,null],[null,null]),(5,[1],[1,2],[0,0,1]);
+insert into t values ROW(1,[1,2],[1,2],[0,1]),ROW(2,[1,2],null,[1,1]),ROW(3,[1,2],[1,2],null),ROW(4,[1,2],[null,null],[null,null]),ROW(5,[1],[1,2],[0,0,1]);
 
 -- query 4
 USE ${case_db};

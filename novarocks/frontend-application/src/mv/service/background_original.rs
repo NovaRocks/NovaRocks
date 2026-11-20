@@ -116,7 +116,7 @@ impl BackgroundManagementPass {
             requests: None,
             context: None,
             metadata_cpu: None,
-            capture: CurrentMetadataCapture::new(),
+            capture: crate::mv::domain::staged_create::new_current_metadata_capture(),
             execution: None,
             wake: Arc::new(BackgroundWake::default()),
             stopped: std::sync::atomic::AtomicBool::new(false),

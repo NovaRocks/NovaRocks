@@ -30,9 +30,13 @@ use arrow_schema::DataType;
 use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
 use std::{alloc::Layout, cell::RefCell};
 
-/// Only carrier/nullability shape is narrowed. Original target Field names and
-/// all admitted metadata are retained by the shared body, not a whitelist.
+/// Admit the observed carrier profiles and the explicit NULL-to-JSON list
+/// conversion. The original complete target Field remains the representation
+/// author; a shared UTF8 carrier alone grants no nominal conversion.
 pub(crate) fn profile(source: &FunctionValueType, result: &FunctionValueType) -> bool {
+    if novarocks_type_contract::is_null_list_to_json_cast(source, result) {
+        return true;
+    }
     let (DataType::List(source_item), DataType::List(target_item)) =
         (source.data_type(), result.data_type())
     else {
@@ -51,7 +55,7 @@ pub(crate) fn profile(source: &FunctionValueType, result: &FunctionValueType) ->
         && target_semantic.nullable()
         && matches!(
             (source_item.data_type(), target_item.data_type()),
-            (DataType::Null, DataType::Int32) | (DataType::Utf8, DataType::Utf8)
+            (DataType::Null, DataType::Int32 | DataType::Utf8) | (DataType::Utf8, DataType::Utf8)
         )
 }
 fn copy_error(error: CopyError) -> KernelFailure {
@@ -172,33 +176,38 @@ pub(crate) fn evaluate<'a>(
         let DataType::List(target_field) = result.data_type() else {
             return Err(internal("prepared List CAST target is not a List"));
         };
+        let null_lift_profile = profile(source, result);
         let mut observe = |event| match event {
             ListCastObservation::Step => work.borrow_mut().step(),
             ListCastObservation::OpaqueBoundary => work.borrow_mut().flush(),
         };
-        let out =
-            list_cast_core::cast_observed(
-                &compact,
-                target_field,
-                &mut |child, target| {
-                    if child.data_type() != &DataType::Null || target != &DataType::Int32 {
-                        return Err(ListCastError::Host(internal(
-                            "prepared List CAST has a foreign child operation",
-                        )));
-                    }
-                    list_cast_core::null_source_observed(child.len(), target, &mut |event| {
-                        match event {
-                            ListCastObservation::Step => work.borrow_mut().step(),
-                            ListCastObservation::OpaqueBoundary => work.borrow_mut().flush(),
-                        }
-                    })
-                },
-                &mut observe,
-            )
-            .map_err(|cause| match cause {
-                ListCastError::Host(cause) => cause,
-                ListCastError::Domain(cause) => KernelFailure::from_domain(cause),
-            })?;
+        let out = list_cast_core::cast_observed(
+            &compact,
+            target_field,
+            &mut |child, target| {
+                if child.data_type() != &DataType::Null
+                    || target != target_field.data_type()
+                    || (!null_lift_profile || !matches!(target, DataType::Int32 | DataType::Utf8))
+                {
+                    return Err(ListCastError::Host(internal(
+                        "prepared List CAST has a foreign child operation",
+                    )));
+                }
+                list_cast_core::null_source_observed(
+                    child.len(),
+                    target,
+                    &mut |event| match event {
+                        ListCastObservation::Step => work.borrow_mut().step(),
+                        ListCastObservation::OpaqueBoundary => work.borrow_mut().flush(),
+                    },
+                )
+            },
+            &mut observe,
+        )
+        .map_err(|cause| match cause {
+            ListCastError::Host(cause) => cause,
+            ListCastError::Domain(cause) => KernelFailure::from_domain(cause),
+        })?;
         let mut errors = reserve::<RowDataError>(inherited.len(), &work)?;
         for error in inherited {
             work.borrow_mut().flush()?;

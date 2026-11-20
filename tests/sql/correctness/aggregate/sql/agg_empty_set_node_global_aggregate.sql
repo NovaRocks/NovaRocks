@@ -25,7 +25,7 @@
 -- 2. Force an empty input with a constant-false predicate.
 -- 3. Assert aggregate null/count semantics on zero rows.
 SELECT
-    COUNT(*) AS c_all,
+    COUNT() AS c_all,
     COUNT(v) AS c_not_null,
     SUM(v) AS s_v,
     AVG(v) AS avg_v,

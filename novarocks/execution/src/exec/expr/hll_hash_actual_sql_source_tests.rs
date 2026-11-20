@@ -189,7 +189,7 @@ fn hll_sql_source_with_semantics(
     }
 }
 
-const TYPEDESC_SQL: &str = "SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation') */ grp, CAST(avg(v) AS DECIMAL(18,4)) AS avg_v, ndv(k) AS ndv_k, hll_union_agg(hll_hash(k)) AS hll_k, CAST(percentile_approx(d,0.5) AS DECIMAL(18,4)) AS p50_d FROM fixture.agg_state_typedesc_contract GROUP BY grp ORDER BY grp";
+const TYPEDESC_SQL: &str = "WITH SESSION streaming_preaggregation_mode = 'force_preaggregation' SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation') */ grp, CAST(avg(v) AS DECIMAL(18,4)) AS avg_v, ndv(k) AS ndv_k, hll_union_agg(hll_hash(k)) AS hll_k, CAST(percentile_approx(d,0.5) AS DECIMAL(18,4)) AS p50_d FROM fixture.agg_state_typedesc_contract GROUP BY grp ORDER BY grp";
 const HLL_SQL: &str = "select hll_union(hll_hash(c1)) from fixture.t1";
 fn sources() -> Vec<novarocks_sql::compiler::SqlAuthoredPhysicalPlan> {
     vec![

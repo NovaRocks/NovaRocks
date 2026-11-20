@@ -29,16 +29,16 @@ DROP TABLE IF EXISTS ${case_db}.g3_bj_small;
 CREATE TABLE ${case_db}.g3_bj_left  (k INT, v INT);
 CREATE TABLE ${case_db}.g3_bj_right (k INT, w INT);
 CREATE TABLE ${case_db}.g3_bj_small (s INT, x INT);
-INSERT INTO ${case_db}.g3_bj_left  VALUES (1, 10), (2, 20);
-INSERT INTO ${case_db}.g3_bj_right VALUES (1, 100), (2, 200);
-INSERT INTO ${case_db}.g3_bj_small VALUES (1, 1000);
-ANALYZE TABLE ${case_db}.g3_bj_left;
-ANALYZE TABLE ${case_db}.g3_bj_right;
-ANALYZE TABLE ${case_db}.g3_bj_small;
+INSERT INTO ${case_db}.g3_bj_left  VALUES ROW(1, 10), ROW(2, 20);
+INSERT INTO ${case_db}.g3_bj_right VALUES ROW(1, 100), ROW(2, 200);
+INSERT INTO ${case_db}.g3_bj_small VALUES ROW(1, 1000);
+ANALYZE ${case_db}.g3_bj_left;
+ANALYZE ${case_db}.g3_bj_right;
+ANALYZE ${case_db}.g3_bj_small;
 -- Inner BROADCAST(small) join above an INNER SHUFFLE join keyed on a.k.
 -- Window keyed on a.k must add a ShuffleAgg HASH EXCHANGE above the
 -- Broadcast output instead of reusing the ShuffleJoin source directly.
-EXPLAIN VERBOSE
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
 SELECT a.k, a.v, b.w, ROW_NUMBER() OVER (PARTITION BY a.k ORDER BY a.v) AS rn
 FROM ${case_db}.g3_bj_left  a
 INNER JOIN ${case_db}.g3_bj_right b ON a.k = b.k

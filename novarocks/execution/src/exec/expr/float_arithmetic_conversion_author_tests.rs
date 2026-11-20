@@ -68,6 +68,7 @@ fn assert_conversion_bits(array: ArrayRef, expected: &[Option<u64>]) {
                 &target,
                 policy,
                 allow,
+                None,
                 &Control,
             )
             .unwrap();

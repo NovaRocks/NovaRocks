@@ -30,7 +30,7 @@
 DROP TABLE IF EXISTS ${case_db}.tab1;
 CREATE TABLE ${case_db}.tab1 (
   c0 INT,
-  c1 STRUCT<v1 INT, v2 STRUCT<v3 INT, v4 INT>>
+  c1 ROW(v1 INT, v2 ROW(v3 INT, v4 INT))
 );
 
 -- query 2

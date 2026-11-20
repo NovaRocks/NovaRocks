@@ -340,9 +340,9 @@ mod tests {
     fn eq(left: TypedExpr, right: TypedExpr) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::BinaryOp {
-                left: Box::new(left),
+                left: novarocks_parser::ast::AstBox::new(left),
                 op: BinOp::Eq,
-                right: Box::new(right),
+                right: novarocks_parser::ast::AstBox::new(right),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
@@ -352,9 +352,9 @@ mod tests {
     fn and(left: TypedExpr, right: TypedExpr) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::BinaryOp {
-                left: Box::new(left),
+                left: novarocks_parser::ast::AstBox::new(left),
                 op: BinOp::And,
-                right: Box::new(right),
+                right: novarocks_parser::ast::AstBox::new(right),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
@@ -365,7 +365,7 @@ mod tests {
         let data_type = expr.value_type.data_type().clone();
         let nullable = expr.value_type.nullable();
         TypedExpr {
-            kind: ExprKind::Nested(Box::new(expr)),
+            kind: ExprKind::Nested(novarocks_parser::ast::AstBox::new(expr)),
             value_type: novarocks_type_contract::FunctionValueType::new(data_type, nullable),
         }
     }
@@ -484,8 +484,8 @@ mod tests {
         );
         let predicate = TypedExpr {
             kind: ExprKind::InList {
-                expr: Box::new(col("c", 1)),
-                list: vec![int_lit(1), int_lit(2), int_lit(3)],
+                expr: novarocks_parser::ast::AstBox::new(col("c", 1)),
+                list: (vec![int_lit(1), int_lit(2), int_lit(3)]).into(),
                 negated: false,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),

@@ -43,6 +43,7 @@ mod original_result_scope;
 mod payload_retention;
 mod predicate;
 mod process_local;
+mod property;
 pub mod provider;
 mod provider_binding;
 mod publication;
@@ -233,17 +234,16 @@ pub use mutation::{
     ConnectorCatalogMutationObservation, ConnectorCatalogMutationOperation,
     ConnectorCatalogMutationReceipt, ConnectorCatalogMutationReceiving,
     ConnectorCatalogMutationReconcileRequest, ConnectorCatalogMutationRequest,
-    ConnectorCatalogMutationResolver, ConnectorCatalogMutationSession, ConnectorColumnAggregation,
-    ConnectorColumnDefinition, ConnectorColumnPath, ConnectorColumnPosition,
-    ConnectorCommittedVersion, ConnectorDataType, ConnectorDefaultValue,
-    ConnectorDropTableDataDisposition, ConnectorMutationFailure, ConnectorMutationFailureKind,
-    ConnectorMutationOperationId, ConnectorPartitionTransform, ConnectorPropertyAuthority,
-    ConnectorPropertyChange, ConnectorRefAction, ConnectorRefKind,
+    ConnectorCatalogMutationResolver, ConnectorCatalogMutationSession, ConnectorColumnDefinition,
+    ConnectorColumnPath, ConnectorColumnPosition, ConnectorCommittedVersion, ConnectorDataType,
+    ConnectorDefaultValue, ConnectorDropTableDataDisposition, ConnectorMutationFailure,
+    ConnectorMutationFailureKind, ConnectorMutationOperationId, ConnectorPartitionTransform,
+    ConnectorPropertyAuthority, ConnectorPropertyChange, ConnectorRefAction, ConnectorRefKind,
     ConnectorRefreshPublicationGuard, ConnectorSchemaChange, ConnectorStructField,
-    ConnectorTableKey, ConnectorTableKeyKind, ConnectorViewColumn, ConnectorViewDefinition,
-    ConnectorViewDialect, ConnectorViewIdentity, CreateOrReplacePolicy, CreatePolicy, DropPolicy,
-    ExternalMutationEffect, ExternalMutationEvidence, ExternalMutationFinalization,
-    ExternalMutationOutcome, MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES,
+    ConnectorViewColumn, ConnectorViewDefinition, ConnectorViewDialect, ConnectorViewIdentity,
+    CreateOrReplacePolicy, CreatePolicy, DropPolicy, ExternalMutationEffect,
+    ExternalMutationEvidence, ExternalMutationFinalization, ExternalMutationOutcome,
+    MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES,
 };
 pub use mv_storage_observation::{
     MAX_MV_OBSERVATION_FIELDS, MAX_MV_OBSERVATION_PARTITION_FIELDS, MAX_MV_OBSERVATION_REFS,
@@ -267,6 +267,10 @@ pub use predicate::{
     MAX_CONNECTOR_STATIC_LITERAL_PAYLOAD_BYTES, MAX_CONNECTOR_STATIC_PREDICATES,
     MAX_CONNECTOR_STATIC_VARIABLE_LITERAL_BYTES, normalize_predicate_dispositions,
     validate_static_predicates,
+};
+pub use property::{
+    DdlPropertyChange, DdlPropertyDeclaration, DdlPropertyDeclarationError, DdlPropertyType,
+    DdlPropertyValue, InvalidTableProperty,
 };
 pub use provider::{
     CatalogActivityEvents, CatalogActivityPhase, CatalogActivityReader, CatalogActivitySnapshot,
@@ -330,7 +334,8 @@ pub use staged_create::{
     ConnectorStagedCreatePublicationReceiving, ConnectorStagedCreatePublicationRecorder,
     ConnectorStagedCreatePublicationSource, ConnectorStagedCreatePublishOutcome,
     ConnectorStagedCreatePublishRequest, ConnectorStagedCreateReceipt,
-    ConnectorStagedCreateReceiptPhase, ConnectorStagedCreateSession, ConnectorStagedTableHandle,
+    ConnectorStagedCreateReceiptPhase, ConnectorStagedCreateSession, ConnectorStagedCtasProperties,
+    ConnectorStagedMvStorageProperties, ConnectorStagedTableHandle,
     ConnectorStagedWritePlanningBinding, ConnectorStagedWritePlanningRequest,
     ConnectorStagedWriteProof, ConnectorUnanchoredCtasCleanup,
     ConnectorUnanchoredCtasCleanupSession,

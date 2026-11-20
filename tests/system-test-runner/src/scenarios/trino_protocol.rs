@@ -238,15 +238,15 @@ impl TrinoProtocol {
                 registration,
             });
         fs::create_dir_all(&warehouse)?;
-        let warehouse = warehouse.to_string_lossy().replace('"', "\\\"");
+        let warehouse = warehouse.to_string_lossy().replace('\'', "''");
         success(
             actor,
             &format!(
-                "CREATE EXTERNAL CATALOG trc1_catalog PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"hadoop\",\"iceberg.catalog.warehouse\"=\"{warehouse}\")"
+                "CREATE CATALOG trc1_catalog USING iceberg WITH (\"iceberg.catalog.type\" = 'hadoop', \"iceberg.catalog.warehouse\" = '{warehouse}')"
             ),
         )?;
-        success(actor, "CREATE DATABASE trc1_catalog.first")?;
-        success(actor, "CREATE DATABASE trc1_catalog.second")?;
+        success(actor, "CREATE SCHEMA trc1_catalog.first")?;
+        success(actor, "CREATE SCHEMA trc1_catalog.second")?;
         success(actor, "CREATE TABLE trc1_catalog.first.items (id INT)")?;
         success(
             actor,
@@ -313,7 +313,7 @@ fn failed_query(actor: &TrinoClient, sql: &str, expected: (i64, &str, &str)) -> 
 }
 fn paging_sql() -> String {
     format!(
-        "SELECT generate_series AS id, REPEAT('x', {PAYLOAD_BYTES}) AS payload FROM generate_series(1, {PAGING_ROWS}) ORDER BY generate_series"
+        "SELECT generate_series AS id, REPEAT('x', {PAYLOAD_BYTES}) AS payload FROM TABLE(generate_series(1, {PAGING_ROWS})) ORDER BY generate_series"
     )
 }
 fn assert_row(row: &Value, expected: usize) -> Result<()> {
@@ -499,7 +499,43 @@ fn replay_next(actor: &TrinoClient, uri: &str) -> Result<Option<String>> {
     }
     Ok(next)
 }
+fn single_statement_admission(actor: &TrinoClient) -> Result<()> {
+    for sql in [
+        "SET SESSION pipeline_dop = 3; SELECT 1",
+        "SET SESSION pipeline_dop = 3; SELECT 'unterminated",
+    ] {
+        // The raw Trino actor sends the complete text in one POST.
+        let pages = actor.execute(sql)?;
+        require_error(terminal(&pages)?, (1, "SYNTAX_ERROR", "USER_ERROR"))?;
+        for page in &pages {
+            ensure!(
+                !page.headers.contains_key("x-trino-set-session"),
+                "rejected request applied its first SET statement: {sql}"
+            );
+        }
+    }
+
+    failed_query(
+        actor,
+        "CREATE SCHEMA trc1_catalog.single_statement_boundary; SELECT 1",
+        (1, "SYNTAX_ERROR", "USER_ERROR"),
+    )?;
+    failed_query(
+        actor,
+        "USE trc1_catalog.single_statement_boundary",
+        (45, "SCHEMA_NOT_FOUND", "USER_ERROR"),
+    )?;
+    success(
+        actor,
+        "CREATE SCHEMA trc1_catalog.single_statement_boundary",
+    )?;
+    success(actor, "DROP SCHEMA trc1_catalog.single_statement_boundary")?;
+    Ok(())
+}
+
 fn session_effects(context: &mut ScenarioContext, actor: &TrinoClient) -> Result<()> {
+    single_statement_admission(actor)?;
+    context.action("verified one POST cannot apply the first SET or CREATE in a rejected batch");
     let client = actor.with_session(&[
         ("x-trino-catalog", "trc1_catalog"),
         ("x-trino-schema", "first"),
@@ -541,7 +577,7 @@ fn session_effects(context: &mut ScenarioContext, actor: &TrinoClient) -> Result
         );
     }
     stateful.apply_effects(end)?;
-    success(&stateful, "DROP DATABASE trc1_catalog.second")?;
+    success(&stateful, "DROP SCHEMA trc1_catalog.second")?;
     let pages = success(&stateful, "USE trc1_catalog.first")?;
     ensure!(
         terminal(&pages)?
@@ -581,7 +617,7 @@ fn session_effects(context: &mut ScenarioContext, actor: &TrinoClient) -> Result
             );
         }
     }
-    let pages = success(actor, "SET query_timeout = 1")?;
+    let pages = success(actor, "SET SESSION query_timeout = 1")?;
     let end = terminal(&pages)?;
     ensure!(
         end.headers
@@ -866,7 +902,7 @@ fn update_types(context: &mut ScenarioContext, actor: &TrinoClient) -> Result<()
             "CREATE TABLE",
         ),
         ("DROP TABLE trc1_catalog.first.update_type", "DROP TABLE"),
-        ("SET query_timeout = 60", "SET SESSION"),
+        ("SET SESSION query_timeout = 60", "SET SESSION"),
     ] {
         assert_raw_completion(actor, sql, expected, RawCompletionExpectation::Empty)?;
     }
@@ -1076,7 +1112,7 @@ fn command_completion(context: &mut ScenarioContext, actor: &TrinoClient) -> Res
     // cases. Format3 row lineage is the already supported P01 DML input.
     for (sql, update_type, expected) in [
         (
-            "CREATE TABLE trc1_catalog.first.completion_items (id INT, v INT) TBLPROPERTIES (\"format-version\"=\"3\", \"write.row-lineage\"=\"true\")",
+            "CREATE TABLE trc1_catalog.first.completion_items (id INT, v INT) WITH (format_version = 3)",
             "CREATE TABLE",
             Empty,
         ),
@@ -1113,14 +1149,14 @@ fn command_completion(context: &mut ScenarioContext, actor: &TrinoClient) -> Res
             Empty,
         ),
         (
-            "ALTER TABLE trc1_catalog.first.completion_optimize_empty OPTIMIZE",
+            "ALTER TABLE trc1_catalog.first.completion_optimize_empty EXECUTE optimize",
             "ALTER TABLE EXECUTE",
             OptimizeMetrics([0, 0, 0]),
         ),
         // ANALYZE finishes its original collection/publication in this same
         // statement and retains Trino's NULL count result.
         (
-            "ANALYZE TABLE trc1_catalog.first.completion_items",
+            "ANALYZE trc1_catalog.first.completion_items",
             "ANALYZE",
             NoCount,
         ),

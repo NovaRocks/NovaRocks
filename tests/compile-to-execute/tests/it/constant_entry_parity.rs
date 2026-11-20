@@ -279,6 +279,7 @@ impl Fixture {
             operation: CastOperation::Carrier,
             decimal_overflow_policy,
             allow_throw_exception,
+            array_failure_mode,
             ..
         } = self.kind(at)
         else {
@@ -288,6 +289,7 @@ impl Fixture {
             target: self.ty(at),
             decimal_overflow_policy: *decimal_overflow_policy,
             allow_throw_exception: *allow_throw_exception,
+            array_failure_mode: *array_failure_mode,
         }
     }
     // Stop at the independently declared ORIGINAL input type, so explicit SQL
@@ -531,7 +533,7 @@ fn constant_entry_every_family_matches_real_noop_sql_constant_root() {
             boolean(Some(true)),
         ),
         (
-            "1 <=> 1",
+            "1 IS NOT DISTINCT FROM 1",
             Family::NullSafe,
             false,
             vec![int(Some(1)), int(Some(1))],
@@ -602,16 +604,23 @@ fn constant_entry_every_family_matches_real_noop_sql_constant_root() {
         }
         fixture.direct(children, Expected::Value(expected));
     }
-    // Native unary minus is zero subtraction: +0 - +0 is +0. An explicit
-    // text CAST authors the separate -0 bit pattern. Preserve both real child
-    // subexpressions, plus typed NULL, without replacing the depth-one cases.
+    // Subtracting two positive zeros authors the positive zero bit pattern.
+    // Unary minus and a text CAST each author a separate negative zero.
+    // Preserve these child subexpressions and typed NULL beside the depth-one cases.
     for (expression, family, nullable, children, expected) in [
         (
-            "-0e0 * 1e0",
+            "(0e0 - 0e0) * 1e0",
             Family::Arithmetic,
             true,
             vec![float(0.0), float(1.0)],
             float(0.0),
+        ),
+        (
+            "-0e0 * 1e0",
+            Family::Arithmetic,
+            true,
+            vec![float(-0.0), float(1.0)],
+            float(-0.0),
         ),
         (
             "CAST('-0' AS DOUBLE) * 1e0",
@@ -642,7 +651,7 @@ fn constant_entry_every_family_matches_real_noop_sql_constant_root() {
             bigint(None),
         ),
         (
-            "CAST(NULL AS BIGINT) <=> CAST(NULL AS BIGINT)",
+            "CAST(NULL AS BIGINT) IS NOT DISTINCT FROM CAST(NULL AS BIGINT)",
             Family::NullSafe,
             false,
             vec![bigint(None), bigint(None)],

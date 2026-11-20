@@ -3251,6 +3251,7 @@ fn grouped_writer_fragment_with_sources(
                     finish,
                     ty,
                     ExprKind::Cast {
+                        array_failure_mode: None,
                         expr: literal,
                         target: DataType::Utf8,
                         decimal_overflow_policy:

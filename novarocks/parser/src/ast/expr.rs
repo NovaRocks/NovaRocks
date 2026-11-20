@@ -17,103 +17,142 @@
 
 use crate::{
     Span,
-    ast::{Ident, Literal, ObjectName, Query, TypeName, window::WindowSpec},
+    ast::{AstBox, AstVec, Ident, Literal, ObjectName, OrderBy, Query},
 };
 
 /// A SQL expression with source spans retained at every syntax node.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Expr {
+    JsonConstructor(AstBox<super::JsonConstructor>),
+    JsonExists(AstBox<super::JsonExists>),
+    JsonValue(AstBox<super::JsonValue>),
+    JsonQuery(AstBox<super::JsonQuery>),
+    JsonSerialize(AstBox<super::JsonSerialize>),
+    JsonObject(AstBox<super::JsonObject>),
+    JsonArray(AstBox<super::JsonArray>),
+
     Identifier(Ident),
-    CompoundIdentifier(CompoundIdentifier),
+    AllRows(AllRows),
+    Parameter(Parameter),
     Literal(Literal),
-    FunctionCall(FunctionCall),
+    FunctionCall(AstBox<FunctionCall>),
+    Extract(AstBox<super::ExtractExpr>),
+    If(AstBox<super::IfExpr>),
+    NullIf(AstBox<super::NullIfExpr>),
+    Coalesce(AstBox<super::CoalesceExpr>),
+    Try(AstBox<super::TryExpr>),
+    Format(AstBox<super::FormatExpr>),
+
+    AtLocal(AstBox<super::AtLocal>),
+    AtTimeZone(AstBox<super::AtTimeZone>),
+    GroupingOperation(AstBox<super::GroupingOperation>),
+    Trim(AstBox<super::Trim>),
+    Overlay(AstBox<super::Overlay>),
+    IntervalValueExpression(AstBox<super::IntervalValueExpression>),
+    MethodCall(AstBox<super::MethodCall>),
+    StaticMethodCall(AstBox<super::StaticMethodCall>),
+    CurrentCatalog(super::CurrentCatalog),
+    CurrentDate(super::CurrentDate),
+    CurrentPath(super::CurrentPath),
+    CurrentSchema(super::CurrentSchema),
+    CurrentUser(super::CurrentUser),
+    CurrentTime(super::CurrentTime),
+    CurrentTimestamp(super::CurrentTimestamp),
+    LocalTime(super::LocalTime),
+    LocalTimestamp(super::LocalTimestamp),
+    WindowOperation(AstBox<super::WindowOperation>),
     Unary(UnaryExpr),
     Binary(BinaryExpr),
-    Nested(NestedExpr),
-    Between(BetweenExpr),
-    InList(InListExpr),
-    InSubquery(InSubqueryExpr),
-    Exists(ExistsExpr),
-    Like(LikeExpr),
-    IsPredicate(IsPredicateExpr),
-    Case(CaseExpr),
-    Cast(CastExpr),
-    Interval(IntervalExpr),
+    Logical(LogicalExpr),
+    Predicated(AstBox<super::PredicatedExpr>),
+    InList(AstBox<super::InListExpr>),
+    Exists(AstBox<super::ExistsExpr>),
+    SearchedCase(AstBox<super::SearchedCaseExpr>),
+    SimpleCase(AstBox<super::SimpleCaseExpr>),
+    Unique(AstBox<super::UniqueExpr>),
+    Cast(AstBox<super::CastExpr>),
     Subquery(SubqueryExpr),
-    Tuple(TupleExpr),
+    Row(RowExpr),
     Array(ArrayExpr),
-    Map(MapExpr),
-    Struct(StructExpr),
-    Lambda(LambdaExpr),
-    Access(AccessExpr),
-    TypedString(TypedStringExpr),
+    Lambda(AstBox<super::LambdaExpr>),
+    Subscript(AstBox<SubscriptExpr>),
+    ArrayWildcardSubscript(AstBox<ArrayWildcardSubscriptExpr>),
+    Dereference(AstBox<DereferenceExpr>),
 }
 
 impl Expr {
-    pub const fn span(&self) -> Span {
+    pub fn span(&self) -> Span {
         match self {
+            Self::JsonConstructor(node) => node.span,
+            Self::JsonExists(node) => node.span,
+            Self::JsonValue(node) => node.span,
+            Self::JsonQuery(node) => node.span,
+            Self::JsonSerialize(node) => node.span,
+            Self::JsonObject(node) => node.span,
+            Self::JsonArray(node) => node.span,
+
             Self::Identifier(ident) => ident.span,
-            Self::CompoundIdentifier(ident) => ident.span,
+            Self::AllRows(node) => node.span,
+            Self::Parameter(node) => node.span,
             Self::Literal(literal) => literal.span,
             Self::FunctionCall(call) => call.span,
+            Self::Extract(node) => node.span,
+            Self::If(node) => node.span,
+            Self::NullIf(node) => node.span,
+            Self::Coalesce(node) => node.span,
+            Self::Try(node) => node.span,
+            Self::Format(node) => node.span,
+
+            Self::AtLocal(node) => node.span,
+            Self::AtTimeZone(node) => node.span,
+            Self::GroupingOperation(node) => node.span,
+            Self::Trim(node) => node.span,
+            Self::Overlay(node) => node.span,
+            Self::IntervalValueExpression(node) => node.span,
+            Self::MethodCall(node) => node.span,
+            Self::StaticMethodCall(node) => node.span,
+            Self::CurrentCatalog(node) => node.span,
+            Self::CurrentDate(node) => node.span,
+            Self::CurrentPath(node) => node.span,
+            Self::CurrentSchema(node) => node.span,
+            Self::CurrentUser(node) => node.span,
+            Self::CurrentTime(node) => node.span,
+            Self::CurrentTimestamp(node) => node.span,
+            Self::LocalTime(node) => node.span,
+            Self::LocalTimestamp(node) => node.span,
+            Self::WindowOperation(node) => node.span,
             Self::Unary(expression) => expression.span,
             Self::Binary(expression) => expression.span,
-            Self::Nested(expression) => expression.span,
-            Self::Between(expression) => expression.span,
+            Self::Logical(expression) => expression.span,
             Self::InList(expression) => expression.span,
-            Self::InSubquery(expression) => expression.span,
+            Self::Predicated(expression) => expression.span,
             Self::Exists(expression) => expression.span,
-            Self::Like(expression) => expression.span,
-            Self::IsPredicate(expression) => expression.span,
-            Self::Case(expression) => expression.span,
+            Self::SearchedCase(node) => node.span,
+            Self::SimpleCase(node) => node.span,
+            Self::Unique(node) => node.span,
             Self::Cast(expression) => expression.span,
-            Self::Interval(expression) => expression.span,
             Self::Subquery(expression) => expression.span,
-            Self::Tuple(expression) => expression.span,
+            Self::Row(expression) => expression.span,
             Self::Array(expression) => expression.span,
-            Self::Map(expression) => expression.span,
-            Self::Struct(expression) => expression.span,
             Self::Lambda(expression) => expression.span,
-            Self::Access(expression) => expression.span,
-            Self::TypedString(expression) => expression.span,
+            Self::Subscript(expression) => expression.span,
+            Self::ArrayWildcardSubscript(expression) => expression.span,
+            Self::Dereference(expression) => expression.span,
         }
     }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CompoundIdentifier {
-    pub parts: Vec<Ident>,
-    pub span: Span,
 }
 
 /// A function name and its argument expressions.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FunctionCall {
     pub name: ObjectName,
-    pub arguments: Vec<Expr>,
-    pub quantifier: FunctionQuantifier,
-    pub order_by: Vec<FunctionOrderBy>,
-    pub separator: Option<Box<Expr>>,
-    pub filter: Option<Box<Expr>>,
+    pub arguments: AstVec<CallArgument>,
+    pub distinct: bool,
+    pub order_by: Option<OrderBy>,
+    pub filter: Option<Expr>,
     pub null_treatment: Option<NullTreatment>,
-    pub over: Option<Box<WindowSpec>>,
-    /// Whether SUBSTRING used its `value FROM start [FOR length]` spelling.
-    pub substring_from_syntax: bool,
-    pub span: Span,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum FunctionQuantifier {
-    None,
-    Distinct,
-    All,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FunctionOrderBy {
-    pub expr: Expr,
-    pub asc: Option<bool>,
-    pub nulls_first: Option<bool>,
+    pub window: Option<super::Window>,
+    pub processing_mode: Option<ProcessingMode>,
     pub span: Span,
 }
 
@@ -127,228 +166,88 @@ pub enum NullTreatment {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UnaryExpr {
     pub operator: UnaryOperator,
-    pub expression: Box<Expr>,
+    pub expression: AstBox<Expr>,
     pub span: Span,
 }
 
 /// A binary expression.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BinaryExpr {
-    pub left: Box<Expr>,
+    /// The original left operand's diagnostic source range.
+    pub left_operand_span: Span,
+    pub left: AstBox<Expr>,
     pub operator: BinaryOperator,
-    pub right: Box<Expr>,
-    pub span: Span,
-}
-
-/// A parenthesized expression.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct NestedExpr {
-    pub expression: Box<Expr>,
-    pub span: Span,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BetweenExpr {
-    pub expr: Box<Expr>,
-    pub negated: bool,
-    pub low: Box<Expr>,
-    pub high: Box<Expr>,
-    pub span: Span,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct InListExpr {
-    pub expr: Box<Expr>,
-    pub negated: bool,
-    pub list: Vec<Expr>,
-    pub span: Span,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct InSubqueryExpr {
-    pub expr: Box<Expr>,
-    pub negated: bool,
-    pub query: Box<Query>,
-    pub span: Span,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ExistsExpr {
-    pub negated: bool,
-    pub query: Box<Query>,
-    pub span: Span,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LikeExpr {
-    pub expr: Box<Expr>,
-    pub negated: bool,
-    pub operator: LikeOperator,
-    pub pattern: Box<Expr>,
-    pub escape: Option<Box<Expr>>,
-    pub span: Span,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum LikeOperator {
-    Like,
-    ILike,
-    RLike,
-    SimilarTo,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct IsPredicateExpr {
-    pub expr: Box<Expr>,
-    pub predicate: IsPredicate,
-    pub span: Span,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum IsPredicate {
-    Null,
-    NotNull,
-    True,
-    NotTrue,
-    False,
-    NotFalse,
-    Unknown,
-    NotUnknown,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CaseExpr {
-    pub operand: Option<Box<Expr>>,
-    pub conditions: Vec<Expr>,
-    pub results: Vec<Expr>,
-    pub else_result: Option<Box<Expr>>,
-    pub span: Span,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CastExpr {
-    pub expr: Box<Expr>,
-    pub data_type: TypeName,
-    pub kind: CastKind,
-    pub format: Option<Box<Expr>>,
-    pub span: Span,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CastKind {
-    Cast,
-    TryCast,
-    Convert,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct IntervalExpr {
-    pub value: Box<Expr>,
-    pub leading_field: IntervalField,
-    pub leading_precision: Option<Box<Expr>>,
-    pub last_field: Option<IntervalField>,
-    pub fractional_seconds_precision: Option<Box<Expr>>,
+    pub right: AstBox<Expr>,
     pub span: Span,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IntervalField {
     Year,
-    Quarter,
     Month,
-    Week,
     Day,
     Hour,
     Minute,
     Second,
-    Millisecond,
-    Microsecond,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SubqueryExpr {
-    pub query: Box<Query>,
+    pub query: AstBox<Query>,
     pub span: Span,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TupleExpr {
-    pub expressions: Vec<Expr>,
+pub struct RowExpr {
+    pub fields: AstVec<RowField>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RowField {
+    pub name: Option<Ident>,
+    pub expression: Expr,
     pub span: Span,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ArrayExpr {
-    /// Optional element type from StarRocks' `ARRAY<type>[...]` literal
-    /// spelling. Bare `[ ... ]` literals leave this absent for inference.
-    pub element_type: Option<TypeName>,
-    pub elements: Vec<Expr>,
+    pub values: AstVec<Expr>,
     pub span: Span,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MapExpr {
-    pub entries: Vec<MapEntry>,
+pub struct SubscriptExpr {
+    pub base: Expr,
+    pub index: Expr,
     pub span: Span,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MapEntry {
-    pub key: Expr,
-    pub value: Expr,
+pub struct ArrayWildcardSubscriptExpr {
+    pub base: Expr,
     pub span: Span,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct StructExpr {
-    pub fields: Vec<StructExprField>,
+pub struct DereferenceExpr {
+    pub base: Expr,
+    pub field: Option<Ident>,
     pub span: Span,
 }
 
+/// Ordered operands of one syntactic AND or OR expression.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct StructExprField {
-    pub name: Option<Ident>,
-    pub value: Expr,
+pub struct LogicalExpr {
+    pub operator: LogicalOperator,
+    pub terms: AstVec<Expr>,
     pub span: Span,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LambdaExpr {
-    pub parameters: Vec<Ident>,
-    /// Whether a single parameter appeared in parentheses in the source.
-    pub parenthesized_single_parameter: bool,
-    pub body: Box<Expr>,
-    pub span: Span,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AccessExpr {
-    pub expr: Box<Expr>,
-    pub kind: AccessKind,
-    pub span: Span,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum AccessKind {
-    Field(Ident),
-    Subscript(Box<Expr>),
-    Json {
-        operator: JsonOperator,
-        path: Box<Expr>,
-    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum JsonOperator {
-    Arrow,
-    ArrowText,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TypedStringExpr {
-    pub data_type: TypeName,
-    pub value: Literal,
-    pub span: Span,
+pub enum LogicalOperator {
+    And,
+    Or,
 }
 
 /// Prefix operators initially recognized by the Pratt parser.
@@ -357,33 +256,57 @@ pub enum UnaryOperator {
     Not,
     Plus,
     Minus,
-    BitwiseNot,
 }
 
 /// Infix operators initially recognized by the Pratt parser.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BinaryOperator {
-    NamedArgument,
-    Or,
-    And,
-    Equal,
-    NullSafeEqual,
-    NotEqual,
-    LessThan,
-    LessThanOrEqual,
-    GreaterThan,
-    GreaterThanOrEqual,
     Add,
     Subtract,
     Multiply,
     Divide,
     Modulo,
-    BitwiseAnd,
-    BitwiseOr,
-    BitwiseXor,
-    ShiftLeft,
-    ShiftRight,
-    StringConcat,
-    IsDistinctFrom,
-    IsNotDistinctFrom,
+}
+
+/// One positional or named function argument with its original expression.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CallArgument {
+    pub name: Option<Ident>,
+    pub value: Expr,
+    pub span: Span,
+}
+
+/// An explicit RUNNING or FINAL function processing qualifier.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProcessingMode {
+    pub mode: ProcessingModeKind,
+    pub span: Span,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProcessingModeKind {
+    Running,
+    Final,
+}
+
+/// The explicit unbounded row count, distinct from an absent LIMIT clause.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AllRows {
+    pub span: Span,
+}
+/// A positional parameter fact; numbering belongs to the source parser.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Parameter {
+    pub position: usize,
+    pub span: Span,
+}
+impl AllRows {
+    pub const fn span(&self) -> Span {
+        self.span
+    }
+}
+impl Parameter {
+    pub const fn span(&self) -> Span {
+        self.span
+    }
 }

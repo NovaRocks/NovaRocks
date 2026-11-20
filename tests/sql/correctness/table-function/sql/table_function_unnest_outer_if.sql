@@ -30,5 +30,5 @@ FROM (
     UNION ALL
     SELECT CAST(2 AS BIGINT)
 ) b
-CROSS JOIN LATERAL UNNEST(IF(b.id = 1, [10, 20], [30])) AS u(x)
+CROSS JOIN  UNNEST(IF(b.id = 1, [10, 20], [30])) AS u(x)
 ORDER BY b.id, x;

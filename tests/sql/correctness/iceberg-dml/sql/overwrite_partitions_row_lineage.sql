@@ -26,18 +26,13 @@
 CREATE TABLE ${case_db}.t_partition_overwrite_lineage (
   id INT,
   region VARCHAR(8)
-)
-PARTITION BY (region)
-TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
-);
+) WITH (partitioning = ARRAY['region'], format_version = 3);
 INSERT INTO ${case_db}.t_partition_overwrite_lineage VALUES
-  (1, 'us'),
-  (2, 'us'),
-  (3, 'eu'),
-  (4, 'eu');
-ALTER TABLE iceberg_dml_cat_${suite_uuid0}.${case_db}.t_partition_overwrite_lineage CREATE TAG before_overwrite;
+  ROW(1, 'us'),
+  ROW(2, 'us'),
+  ROW(3, 'eu'),
+  ROW(4, 'eu');
+ALTER TABLE iceberg_dml_cat_${suite_uuid0}.${case_db}.t_partition_overwrite_lineage EXECUTE create_tag(name => 'before_overwrite', replace => false, if_not_exists => false);
 
 -- query 2
 SELECT region, COUNT(*) AS n
@@ -48,8 +43,8 @@ ORDER BY region;
 -- query 3
 -- @skip_result_check=true
 INSERT OVERWRITE PARTITIONS ${case_db}.t_partition_overwrite_lineage VALUES
-  (1, 'us'),
-  (99, 'us');
+  ROW(1, 'us'),
+  ROW(99, 'us');
 
 -- query 4
 SELECT id, region
@@ -76,7 +71,7 @@ ON cur.id = old.id AND cur.region = old.region;
 -- query 6
 -- @skip_result_check=true
 INSERT INTO ${case_db}.t_partition_overwrite_lineage VALUES
-  (100, 'ap');
+  ROW(100, 'ap');
 
 -- query 7
 SELECT
@@ -86,5 +81,5 @@ FROM ${case_db}.t_partition_overwrite_lineage;
 
 -- query 8
 -- @skip_result_check=true
-ALTER TABLE iceberg_dml_cat_${suite_uuid0}.${case_db}.t_partition_overwrite_lineage DROP TAG before_overwrite;
-DROP TABLE ${case_db}.t_partition_overwrite_lineage FORCE;
+ALTER TABLE iceberg_dml_cat_${suite_uuid0}.${case_db}.t_partition_overwrite_lineage EXECUTE drop_tag(name => 'before_overwrite', if_exists => false);
+DROP TABLE ${case_db}.t_partition_overwrite_lineage ;

@@ -60,4 +60,4 @@ FROM iceberg_compat_${suite_uuid0}.${case_db}.spark_v3_readd_${uuid0}
 ORDER BY id;
 
 -- query 3
-DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.spark_v3_readd_${uuid0} FORCE;
+DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.spark_v3_readd_${uuid0} ;

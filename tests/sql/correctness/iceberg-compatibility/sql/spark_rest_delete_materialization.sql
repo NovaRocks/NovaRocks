@@ -45,4 +45,4 @@ FROM iceberg_compat_${suite_uuid0}.${case_db}.rwm6_${uuid0}_materialization_hist
 ORDER BY id;
 
 -- query 6
-DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm6_${uuid0}_materialization_history FORCE;
+DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm6_${uuid0}_materialization_history ;

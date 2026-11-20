@@ -15,7 +15,7 @@
 -- specific language governing permissions and limitations
 -- under the License.
 
-select case when (select count(*) 
+select case when (select count(*)
                   from store_sales 
                   where ss_quantity between 1 and 20) > 74219
             then (select avg(ss_ext_discount_amt) 

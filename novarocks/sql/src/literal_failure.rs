@@ -44,10 +44,6 @@ enum Cause {
         source: novarocks_types::value::variant_encode::VariantEncodeFailure,
     },
     Bitmap(novarocks_types::value::bitmap::BitmapValueFailure),
-    Parameter {
-        context: BoundedDetail,
-        source: std::num::ParseIntError,
-    },
     Layout {
         required: u128,
         source: std::alloc::LayoutError,
@@ -90,12 +86,6 @@ impl LiteralFailure {
     ) -> Self {
         Self(Box::new(Cause::Variant { context, source }))
     }
-    pub(super) fn parameter(context: impl fmt::Display, source: std::num::ParseIntError) -> Self {
-        Self(Box::new(Cause::Parameter {
-            context: BoundedDetail::truncating_display(context),
-            source,
-        }))
-    }
     pub(super) fn layout(required: u128, source: std::alloc::LayoutError) -> Self {
         Self(Box::new(Cause::Layout { required, source }))
     }
@@ -114,7 +104,6 @@ impl fmt::Display for LiteralFailure {
             Cause::Rejected(detail) => f.write_str(detail.as_str()),
             Cause::Numeric(detail) => f.write_str(detail),
             Cause::Hex { context, source } => write!(f, "{}: {source}", context.as_str()),
-            Cause::Parameter { context, source } => write!(f, "{}: {source}", context.as_str()),
             Cause::Address { required, source } => write!(
                 f,
                 "literal value storage requires {required} bytes beyond its addressable count: {source}"
@@ -141,7 +130,6 @@ impl Error for LiteralFailure {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self.0.as_ref() {
             Cause::Hex { source, .. } => Some(source),
-            Cause::Parameter { source, .. } => Some(source),
             Cause::Base64(source) => Some(source),
             Cause::DecimalParameters(source) => Some(source),
             Cause::Address { source, .. } => Some(source),
@@ -165,9 +153,6 @@ impl FailureProjection for LiteralFailure {
             }
             Cause::Hex { .. } | Cause::Base64(_) => {
                 return novarocks_functions::DataFailureReason::InvalidEncoding.failure_fact();
-            }
-            Cause::Parameter { .. } => {
-                return novarocks_functions::DataFailureReason::InvalidValue.failure_fact();
             }
             Cause::Variant { source, .. } => return source.failure_fact(),
             Cause::Bitmap(source) => return source.failure_fact(),

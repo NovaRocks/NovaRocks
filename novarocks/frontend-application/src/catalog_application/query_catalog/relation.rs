@@ -95,7 +95,7 @@ pub(crate) fn project_view(
     expected: &ConnectorTableIdentity,
 ) -> CatalogResolutionResult<ConnectorQueryViewMaterialization> {
     match value.definition.dialect {
-        ConnectorViewDialect::StarRocks => {}
+        ConnectorViewDialect::Trino => {}
     }
     if value.identity.instance_id != expected.instance_id
         || value.identity.namespace != expected.namespace

@@ -495,12 +495,13 @@ fn partial_array_agg_cv_order_retains_original_ordinals_backing_and_final_logica
 fn partial_elided_cast_nested_constants_keep_none_in_operational_and_final_capture() {
     for arg in [
         TypedExpr {
-            kind: ExprKind::Nested(Box::new(integer(7))),
+            kind: ExprKind::Nested(novarocks_parser::ast::AstBox::new(integer(7))),
             value_type: ValueType::new(DataType::Int64, false),
         },
         TypedExpr {
             kind: ExprKind::Cast {
-                expr: Box::new(integer(9)),
+                array_failure_mode: None,
+                expr: novarocks_parser::ast::AstBox::new(integer(9)),
                 target: DataType::Int64,
                 decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
             },

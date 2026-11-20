@@ -98,6 +98,17 @@ pub enum IcebergMutationEvidenceTarget {
         preselected_snapshot: i64,
         slots: Vec<(String, String)>,
     },
+    KeyedSlotStorageChange {
+        namespace: String,
+        table: String,
+        table_uuid: String,
+        operation_id: [u8; 16],
+        asserted_parent: Option<i64>,
+        preselected_snapshot: i64,
+        slots: Vec<(String, String)>,
+        effect_digest: [u8; 32],
+        request_fingerprint: [u8; 32],
+    },
     KeyedExpiry {
         namespace: String,
         table: String,

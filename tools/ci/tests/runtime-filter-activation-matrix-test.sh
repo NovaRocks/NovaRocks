@@ -66,9 +66,9 @@ for invocation in 1 2; do
     assert_arg_pair "$args" -j "1"
 done
 assert_arg_pair "$FAKE_CARGO_LOG/args.1" --target-session-sql \
-    "SET enable_global_runtime_filter = true"
+    'SET SESSION enable_global_runtime_filter = true'
 assert_arg_pair "$FAKE_CARGO_LOG/args.2" --target-session-sql \
-    "SET enable_global_runtime_filter = false"
+    'SET SESSION enable_global_runtime_filter = false'
 [[ -f "$tmpdir/success-output/rf-on.log" ]]
 [[ -f "$tmpdir/success-output/rf-off.log" ]]
 

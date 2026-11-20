@@ -24,7 +24,7 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE DATABASE iceberg_rest_${suite_uuid0}.iceberg_rest_io_db_${uuid0};
+CREATE SCHEMA iceberg_rest_${suite_uuid0}.iceberg_rest_io_db_${uuid0};
 
 -- query 2
 -- @skip_result_check=true
@@ -32,13 +32,12 @@ CREATE TABLE iceberg_rest_${suite_uuid0}.iceberg_rest_io_db_${uuid0}.t_io_${uuid
   id BIGINT,
   region STRING,
   amount DOUBLE
-)
-PARTITION BY (region);
+) WITH (partitioning = ARRAY['region']);
 
 -- query 3
 -- @skip_result_check=true
 INSERT INTO iceberg_rest_${suite_uuid0}.iceberg_rest_io_db_${uuid0}.t_io_${uuid0}
-VALUES (1, 'us', 10.5), (2, 'us', 20.0), (3, 'eu', 30.25);
+VALUES ROW(1, 'us', 10.5), ROW(2, 'us', 20.0), ROW(3, 'eu', 30.25);
 
 -- query 4
 -- After 3 rows inserted: count = 3.
@@ -64,7 +63,7 @@ SELECT COUNT(*) AS n FROM iceberg_rest_${suite_uuid0}.iceberg_rest_io_db_${uuid0
 -- query 8
 -- @skip_result_check=true
 INSERT OVERWRITE iceberg_rest_${suite_uuid0}.iceberg_rest_io_db_${uuid0}.t_io_${uuid0}
-VALUES (999, 'ap', 0.0), (998, 'ap', 1.0);
+VALUES ROW(999, 'ap', 0.0), ROW(998, 'ap', 1.0);
 
 -- query 9
 -- After INSERT OVERWRITE: count = 2.
@@ -82,4 +81,4 @@ DROP TABLE iceberg_rest_${suite_uuid0}.iceberg_rest_io_db_${uuid0}.t_io_${uuid0}
 
 -- query 12
 -- @skip_result_check=true
-DROP DATABASE iceberg_rest_${suite_uuid0}.iceberg_rest_io_db_${uuid0};
+DROP SCHEMA iceberg_rest_${suite_uuid0}.iceberg_rest_io_db_${uuid0};

@@ -82,6 +82,7 @@ fn prepare(
         &result,
         policy,
         allow,
+        None,
         &CompileControl::default(),
     )
     .unwrap()
@@ -332,6 +333,7 @@ fn float_result_nullability_depends_only_on_source_and_types_are_not_domain_gues
                                 &ty(target.clone(), result_nullable),
                                 policy,
                                 allow,
+                                None,
                                 &CompileControl::default(),
                             );
                             if source_nullable && !result_nullable {
@@ -368,6 +370,7 @@ fn float_result_nullability_depends_only_on_source_and_types_are_not_domain_gues
                     &ty(target, false),
                     DecimalOverflowPolicy::OutputNull,
                     false,
+                    None,
                     &CompileControl::default()
                 ),
                 Err(CastPrepareError::Unsupported)
@@ -386,6 +389,7 @@ fn float_result_nullability_depends_only_on_source_and_types_are_not_domain_gues
                 &ty(DataType::Decimal128(10, 0), false),
                 DecimalOverflowPolicy::OutputNull,
                 false,
+                None,
                 &CompileControl::default(),
             ),
             Err(CastPrepareError::TypeMismatch)
@@ -413,6 +417,7 @@ fn float_result_nullability_depends_only_on_source_and_types_are_not_domain_gues
                 &ty(DataType::Float64, false),
                 DecimalOverflowPolicy::OutputNull,
                 false,
+                None,
                 &CompileControl::default()
             ),
             Err(CastPrepareError::Unsupported)
@@ -425,6 +430,7 @@ fn float_result_nullability_depends_only_on_source_and_types_are_not_domain_gues
             &ty(DataType::Float64, false),
             DecimalOverflowPolicy::OutputNull,
             false,
+            None,
             &CompileControl::default(),
         ),
         Err(CastPrepareError::TypeMismatch)
@@ -644,6 +650,7 @@ fn float_identity_compile_three_causes_keep_entry_metadata_quantum_and_exact_ref
             &target,
             DecimalOverflowPolicy::OutputNull,
             false,
+            None,
             &baseline,
         );
         let trace = baseline.trace.lock().unwrap().clone();
@@ -668,6 +675,7 @@ fn float_identity_compile_three_causes_keep_entry_metadata_quantum_and_exact_ref
                     &target,
                     DecimalOverflowPolicy::OutputNull,
                     false,
+                    None,
                     &control,
                 )
                 .unwrap_err();

@@ -39,6 +39,7 @@ fn container_identity_requires_complete_nominal_semantics() {
             &plain,
             DecimalOverflowPolicy::ReportError,
             true,
+            None,
             &Control
         ),
         Err(CastPrepareError::Unsupported)
@@ -51,6 +52,7 @@ fn container_identity_requires_complete_nominal_semantics() {
             &same_semantics,
             DecimalOverflowPolicy::ReportError,
             true,
+            None,
             &Control
         )
         .unwrap()

@@ -31,16 +31,15 @@
 -- query 1
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.lineitem (
-  `l_orderkey` int(11) NOT NULL COMMENT "",
-  `l_partkey` int(11) NOT NULL COMMENT "",
-  `l_suppkey` int(11),
-  `l_shipdate` date
-)
-TBLPROPERTIES ("format-version" = "3");
+  "l_orderkey" int(11) NOT NULL,
+  "l_partkey" int(11) NOT NULL,
+  "l_suppkey" int(11),
+  "l_shipdate" date
+) WITH (format_version = 3);
 
 -- query 2
 -- @skip_result_check=true
-INSERT INTO ${case_db}.lineitem VALUES (1,1,1,'2000-01-01'),(1,2,1,'2000-01-01'),(1,3,2,'2000-01-02'),(11,1,11,'2000-01-01'),(11,2,1,'2000-01-02'),(2,3,2,'2000-01-03'),(2,3,null,null);
+INSERT INTO ${case_db}.lineitem VALUES ROW(1,1,1,'2000-01-01'),ROW(1,2,1,'2000-01-01'),ROW(1,3,2,'2000-01-02'),ROW(11,1,11,'2000-01-01'),ROW(11,2,1,'2000-01-02'),ROW(2,3,2,'2000-01-03'),ROW(2,3,null,null);
 
 -- query 3
 -- @order_sensitive=true
@@ -80,15 +79,21 @@ SELECT * FROM ${case_db}.lineitem t1 RIGHT JOIN (SELECT '2000-01-01' AS col1) t2
 
 -- query 12
 -- @order_sensitive=true
-SELECT * FROM ${case_db}.lineitem t1 LEFT SEMI JOIN (SELECT '2000-01-01' AS col1) t2 ON t1.l_shipdate=t2.col1 ORDER BY 1,2,3 LIMIT 3;
+SELECT * FROM ${case_db}.lineitem t1
+WHERE EXISTS (SELECT 1 FROM (SELECT '2000-01-01' AS col1) t2 WHERE t1.l_shipdate=t2.col1)
+ORDER BY 1,2,3 LIMIT 3;
 
 -- query 13
 -- @order_sensitive=true
-SELECT * FROM ${case_db}.lineitem t1 LEFT SEMI JOIN (SELECT '2000-01-01' AS col1) t2 ON t1.l_shipdate=t2.col1 WHERE t1.l_orderkey > 10 ORDER BY 1,2,3 LIMIT 3;
+SELECT * FROM ${case_db}.lineitem t1
+WHERE EXISTS (SELECT 1 FROM (SELECT '2000-01-01' AS col1) t2 WHERE t1.l_shipdate=t2.col1) AND (t1.l_orderkey > 10)
+ORDER BY 1,2,3 LIMIT 3;
 
 -- query 14
 -- @order_sensitive=true
-SELECT * FROM ${case_db}.lineitem t1 RIGHT SEMI JOIN (SELECT '2000-01-01' AS col1) t2 ON t1.l_shipdate=t2.col1 ORDER BY 1 LIMIT 3;
+SELECT * FROM (SELECT '2000-01-01' AS col1) t2
+WHERE EXISTS (SELECT 1 FROM ${case_db}.lineitem t1 WHERE t1.l_shipdate=t2.col1)
+ORDER BY 1 LIMIT 3;
 
 -- query 15
 -- @order_sensitive=true
@@ -100,4 +105,6 @@ SELECT * FROM ${case_db}.lineitem t1 FULL OUTER JOIN (SELECT '2000-01-01' AS col
 
 -- query 17
 -- @order_sensitive=true
-SELECT * FROM ${case_db}.lineitem t1 LEFT ANTI JOIN (SELECT '2000-01-01' AS col1) t2 ON t1.l_shipdate=t2.col1 ORDER BY 1,2,3 LIMIT 3;
+SELECT * FROM ${case_db}.lineitem t1
+WHERE NOT EXISTS (SELECT 1 FROM (SELECT '2000-01-01' AS col1) t2 WHERE t1.l_shipdate=t2.col1)
+ORDER BY 1,2,3 LIMIT 3;

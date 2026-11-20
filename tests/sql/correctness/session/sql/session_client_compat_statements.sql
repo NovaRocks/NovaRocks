@@ -34,12 +34,12 @@ SELECT 1;
 -- query 3
 -- @expect_trino_error=INVALID_SESSION_PROPERTY,USER_ERROR
 -- @skip_result_check=true
-SET autocommit = 1;
+SET SESSION autocommit = 1;
 
 -- query 4
 -- @expect_trino_error=INVALID_SESSION_PROPERTY,USER_ERROR
 -- @skip_result_check=true
-SET character_set_results = NULL;
+SET SESSION character_set_results = NULL;
 
 -- query 5
 -- @expect_trino_error=SYNTAX_ERROR,USER_ERROR
@@ -76,7 +76,7 @@ SET CATALOG default_catalog;
 -- query 12
 -- @expect_trino_error=INVALID_SESSION_PROPERTY,USER_ERROR
 -- @skip_result_check=true
-SET catalog = default_catalog;
+SET SESSION catalog = default_catalog;
 
 -- query 13
 -- @expect_trino_error=SYNTAX_ERROR,USER_ERROR
@@ -93,20 +93,20 @@ USE default;
 SELECT 1;
 
 -- query 16
--- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+-- @expect_trino_error=SYNTAX_ERROR,USER_ERROR
 -- GLOBAL is refused for unknown and recognized property names alike.
 -- @skip_result_check=true
 SET GLOBAL sqlp9_unknown_scope_probe=1, query_timeout=1;
 
 -- query 17
 -- @skip_result_check=true
-SET query_timeout = 0;
+SET SESSION query_timeout = 0;
 
 -- query 18
 -- @expect_trino_error=SYNTAX_ERROR,USER_ERROR
 -- ON is a reserved expression token; the parser rejects it before lookup.
 -- @skip_result_check=true
-SET autocommit = ON;
+SET SESSION autocommit = ON;
 
 -- query 19
 -- @expect_trino_error=SYNTAX_ERROR,USER_ERROR

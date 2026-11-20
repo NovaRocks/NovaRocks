@@ -18,7 +18,7 @@
 -- @order_sensitive=true
 -- Validate Iceberg TIME round-trip through the Parquet write/read path.
 -- query 1
-CREATE DATABASE iceberg_ddl_cat_${suite_uuid0}.iceberg_time_db_${uuid0};
+CREATE SCHEMA iceberg_ddl_cat_${suite_uuid0}.iceberg_time_db_${uuid0};
 -- query 2
 CREATE TABLE iceberg_ddl_cat_${suite_uuid0}.iceberg_time_db_${uuid0}.iceberg_time_tbl_${uuid0} (
   col_id INT,
@@ -26,15 +26,15 @@ CREATE TABLE iceberg_ddl_cat_${suite_uuid0}.iceberg_time_db_${uuid0}.iceberg_tim
 );
 -- query 3
 INSERT INTO iceberg_ddl_cat_${suite_uuid0}.iceberg_time_db_${uuid0}.iceberg_time_tbl_${uuid0} VALUES
-  (1, '01:02:03'),
-  (2, '20:20:20'),
-  (3, NULL);
+  ROW(1, '01:02:03'),
+  ROW(2, '20:20:20'),
+  ROW(3, NULL);
 -- query 4
 SELECT col_id, col_time
 FROM iceberg_ddl_cat_${suite_uuid0}.iceberg_time_db_${uuid0}.iceberg_time_tbl_${uuid0}
 ORDER BY col_id;
 -- query 5
 -- query 6
-DROP TABLE iceberg_ddl_cat_${suite_uuid0}.iceberg_time_db_${uuid0}.iceberg_time_tbl_${uuid0} FORCE;
+DROP TABLE iceberg_ddl_cat_${suite_uuid0}.iceberg_time_db_${uuid0}.iceberg_time_tbl_${uuid0} ;
 -- query 7
-DROP DATABASE iceberg_ddl_cat_${suite_uuid0}.iceberg_time_db_${uuid0};
+DROP SCHEMA iceberg_ddl_cat_${suite_uuid0}.iceberg_time_db_${uuid0};

@@ -400,6 +400,7 @@ fn actual_compiled_bool_cast_full_type_nullable_and_uninstalled_nominal_profiles
             &FunctionValueType::new(DataType::Int64, false),
             DecimalOverflowPolicy::OutputNull,
             false,
+            None,
             &Control,
         ),
         Err(novarocks_functions::CastPrepareError::TypeMismatch)

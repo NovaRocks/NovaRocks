@@ -55,20 +55,19 @@
 CREATE TABLE ${case_db}.fe_crash (
   id BIGINT,
   delay_s BIGINT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 2
 -- @skip_result_check=true
-INSERT INTO ${case_db}.fe_crash VALUES (1, 15);
+INSERT INTO ${case_db}.fe_crash VALUES ROW(1, 15);
 
 -- query 3
 -- @skip_result_check=true
-INSERT INTO ${case_db}.fe_crash VALUES (2, 15);
+INSERT INTO ${case_db}.fe_crash VALUES ROW(2, 15);
 
 -- query 4
 -- @skip_result_check=true
-INSERT INTO ${case_db}.fe_crash VALUES (3, 15);
+INSERT INTO ${case_db}.fe_crash VALUES ROW(3, 15);
 
 -- query 5
 -- @kill_fe_after_be_log_contains=NOVAROCKS_PARTICIPATION_LEASE_RENEWED

@@ -28,21 +28,24 @@ CREATE TABLE ${case_db}.t_agg_group_concat_empty_separator (
     g INT,
     ord INT,
     s STRING
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t_agg_group_concat_empty_separator VALUES
-    (1, 1, 'a'),
-    (1, 2, 'b'),
-    (1, 3, NULL),
-    (1, 4, 'c'),
-    (2, 1, NULL),
-    (2, 2, 'x'),
-    (2, 3, 'y');
+    ROW(1, 1, 'a'),
+    ROW(1, 2, 'b'),
+    ROW(1, 3, NULL),
+    ROW(1, 4, 'c'),
+    ROW(2, 1, NULL),
+    ROW(2, 2, 'x'),
+    ROW(2, 3, 'y');
 
 SELECT
     g,
-    group_concat(s ORDER BY ord SEPARATOR '') AS gc
+    string_agg(s
+,
+ ''
+ORDER BY ord
+) AS gc
 FROM ${case_db}.t_agg_group_concat_empty_separator
 GROUP BY g
 ORDER BY g;

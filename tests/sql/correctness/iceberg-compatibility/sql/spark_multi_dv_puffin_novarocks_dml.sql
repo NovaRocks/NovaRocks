@@ -87,4 +87,4 @@ SELECT id, value FROM iceberg_compat_${suite_uuid0}.${case_db}.shared_puffin_${u
 
 -- query 7
 -- @skip_result_check=true
-DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.shared_puffin_${uuid0} FORCE;
+DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.shared_puffin_${uuid0} ;

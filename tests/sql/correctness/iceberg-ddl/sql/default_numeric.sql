@@ -24,8 +24,8 @@
 --    defaults distinct from the small literals in v3_default_primitive_types.
 
 DROP TABLE IF EXISTS ${case_db}.t;
-CREATE TABLE ${case_db}.t (id INT, name STRING) TBLPROPERTIES ("format-version" = "3");
-INSERT INTO ${case_db}.t VALUES (1, 'alice'), (2, 'bob');
+CREATE TABLE ${case_db}.t (id INT, name STRING) WITH (format_version = 3);
+INSERT INTO ${case_db}.t VALUES ROW(1, 'alice'), ROW(2, 'bob');
 
 ALTER TABLE ${case_db}.t ADD COLUMN score SMALLINT DEFAULT 100;
 ALTER TABLE ${case_db}.t ADD COLUMN salary INT DEFAULT 50000;
@@ -38,7 +38,7 @@ ALTER TABLE ${case_db}.t ADD COLUMN neg_v INT DEFAULT -100;
 SELECT id, name, score, salary, revenue, rating, percentage, zero_v, neg_v
 FROM ${case_db}.t ORDER BY id;
 
-INSERT INTO ${case_db}.t (id, name) VALUES (3, 'charlie');
+INSERT INTO ${case_db}.t (id, name) VALUES ROW(3, 'charlie');
 
 SELECT id, name, score, salary, revenue, rating, percentage, zero_v, neg_v
 FROM ${case_db}.t ORDER BY id;

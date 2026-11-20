@@ -694,14 +694,18 @@ impl novarocks_query_application::view::ViewEngine for ViewEngine {
 async fn default_catalog_reads_the_original_local_view_snapshot_without_table_listing() {
     let service = QueryViewService::new();
     let context = context();
-    let statements = novarocks_parser::parse("CREATE VIEW v AS SELECT 1 AS x").unwrap();
-    let [novarocks_parser::ast::Statement::View(statement)] = statements.as_slice() else {
-        panic!("view")
+    let sql = "CREATE VIEW v AS SELECT 1 AS x";
+    let novarocks_parser::ast::TrinoStatement::CreateView(statement) =
+        novarocks_parser::parser::parse_statement(sql).unwrap()
+    else {
+        panic!("view");
     };
+    let command =
+        novarocks_query_application::view::ViewCommand::trino_create(sql, &statement).unwrap();
     service
-        .execute_statement(
+        .execute_command(
             &ViewEngine,
-            statement,
+            command,
             novarocks_query_application::view::ViewRequestContext {
                 current_catalog: None,
                 current_database: "db",

@@ -173,7 +173,7 @@ mod tests {
         .expect("write z case");
         std::fs::write(
             sql_dir.join("a_case.sql"),
-            "-- @nova_extension=materialized view refresh\nREFRESH MATERIALIZED VIEW mv WITH SYNC MODE;\n",
+            "-- @nova_extension=materialized view refresh\nREFRESH MATERIALIZED VIEW mv;\n",
         )
         .expect("write a case");
 
@@ -194,7 +194,7 @@ mod tests {
         );
         assert_eq!(
             render_extension_manifest(&entries),
-            "# NovaRocks SQL extension manifest\n# suite\tcase\tstatement\textension\tstatement_summary\nextensions\ta_case\t1\tmaterialized view refresh\tREFRESH MATERIALIZED VIEW mv WITH SYNC MODE;\nextensions\tz_case\t1\tbranch DDL\tALTER TABLE ${case_db}.t CREATE BRANCH dev;\n"
+            "# NovaRocks SQL extension manifest\n# suite\tcase\tstatement\textension\tstatement_summary\nextensions\ta_case\t1\tmaterialized view refresh\tREFRESH MATERIALIZED VIEW mv;\nextensions\tz_case\t1\tbranch DDL\tALTER TABLE ${case_db}.t CREATE BRANCH dev;\n"
         );
     }
     #[test]

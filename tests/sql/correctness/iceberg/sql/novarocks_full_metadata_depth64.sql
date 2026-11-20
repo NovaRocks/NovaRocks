@@ -28,27 +28,10 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE EXTERNAL CATALOG metadata64_${uuid0}
-PROPERTIES (
-  "type" = "iceberg",
-  "iceberg.catalog.type" = "rest",
-  "uri" = "${iceberg_rest_uri}",
-  "warehouse" = "${iceberg_rest_warehouse}",
-  "aws.s3.endpoint" = "${oss_endpoint}",
-  "credential.object-store-metadata.consumer-role" = "frontend",
-  "credential.object-store-metadata.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-metadata.name" = "${iceberg_object_store_metadata_credential_name}",
-  "credential.object-store-metadata.generation" = "${iceberg_object_store_credential_generation}",
-  "credential.object-store-data.consumer-role" = "backend",
-  "credential.object-store-data.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-data.name" = "${iceberg_object_store_data_credential_name}",
-  "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
-  "aws.s3.region" = "${oss_region}",
-  "aws.s3.enable_path_style_access" = "${oss_path_style}"
-);
-CREATE DATABASE metadata64_${uuid0}.${case_db};
+CREATE CATALOG metadata64_${uuid0} USING iceberg WITH ("iceberg.catalog.type" = 'rest', "uri" = '${iceberg_rest_uri}', "warehouse" = '${iceberg_rest_warehouse}', "aws.s3.endpoint" = '${oss_endpoint}', "credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-metadata.name" = '${iceberg_object_store_metadata_credential_name}', "credential.object-store-metadata.generation" = '${iceberg_object_store_credential_generation}', "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-data.name" = '${iceberg_object_store_data_credential_name}', "credential.object-store-data.generation" = '${iceberg_object_store_credential_generation}', "aws.s3.region" = '${oss_region}', "aws.s3.enable_path_style_access" = '${oss_path_style}');
+CREATE SCHEMA metadata64_${uuid0}.${case_db};
 USE metadata64_${uuid0}.${case_db};
-SET enable_materialized_view_rewrite = false;
+SET SESSION enable_materialized_view_rewrite = false;
 
 -- query 2
 -- @skip_result_check=true
@@ -76,12 +59,12 @@ printf 'METADATA_DEPTH_READY\n'
 SELECT id,deep FROM metadata_depth ORDER BY id;
 
 -- query 4
-SELECT typeof(deep[1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1]) AS leaf_type,COUNT(*) AS row_count FROM metadata_depth GROUP BY 1;
+SELECT typeof(deep[1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1]) AS leaf_type,COUNT() AS row_count FROM metadata_depth GROUP BY 1;
 
 -- query 5
 -- @skip_result_check=true
-INSERT INTO metadata_depth(id) VALUES (3);
-INSERT INTO metadata_depth(id,deep) VALUES (5,[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[7]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]);
+INSERT INTO metadata_depth(id) VALUES ROW(3);
+INSERT INTO metadata_depth(id,deep) VALUES ROW(5,[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[7]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]);
 CREATE TABLE metadata_depth_copy AS SELECT id,deep FROM metadata_depth;
 
 -- query 6
@@ -140,7 +123,7 @@ SELECT id,deep FROM metadata_depth FOR VERSION AS OF 'depth_initial' ORDER BY id
 -- query 11
 -- @expect_error_tier=drift
 -- @expect_error=Iceberg schema JSON exceeds 127 container levels
-CREATE TABLE metadata_depth_rejected (id BIGINT,deep STRUCT<n1 STRUCT<n2 STRUCT<n3 STRUCT<n4 STRUCT<n5 STRUCT<n6 STRUCT<n7 STRUCT<n8 STRUCT<n9 STRUCT<n10 STRUCT<n11 STRUCT<n12 STRUCT<n13 STRUCT<n14 STRUCT<n15 STRUCT<n16 STRUCT<n17 STRUCT<n18 STRUCT<n19 STRUCT<n20 STRUCT<n21 STRUCT<n22 STRUCT<n23 STRUCT<n24 STRUCT<n25 STRUCT<n26 STRUCT<n27 STRUCT<n28 STRUCT<n29 STRUCT<n30 STRUCT<n31 STRUCT<n32 STRUCT<n33 STRUCT<n34 STRUCT<n35 STRUCT<n36 STRUCT<n37 STRUCT<n38 STRUCT<n39 STRUCT<n40 STRUCT<n41 STRUCT<n42 STRUCT<n43 STRUCT<n44 STRUCT<n45 STRUCT<n46 STRUCT<n47 STRUCT<n48 STRUCT<n49 STRUCT<n50 STRUCT<n51 STRUCT<n52 STRUCT<n53 STRUCT<n54 STRUCT<n55 STRUCT<n56 STRUCT<n57 STRUCT<n58 STRUCT<n59 STRUCT<n60 STRUCT<n61 STRUCT<n62 STRUCT<n63 INT>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>);
+CREATE TABLE metadata_depth_rejected (id BIGINT,deep ROW(n1 ROW(n2 ROW(n3 ROW(n4 ROW(n5 ROW(n6 ROW(n7 ROW(n8 ROW(n9 ROW(n10 ROW(n11 ROW(n12 ROW(n13 ROW(n14 ROW(n15 ROW(n16 ROW(n17 ROW(n18 ROW(n19 ROW(n20 ROW(n21 ROW(n22 ROW(n23 ROW(n24 ROW(n25 ROW(n26 ROW(n27 ROW(n28 ROW(n29 ROW(n30 ROW(n31 ROW(n32 ROW(n33 ROW(n34 ROW(n35 ROW(n36 ROW(n37 ROW(n38 ROW(n39 ROW(n40 ROW(n41 ROW(n42 ROW(n43 ROW(n44 ROW(n45 ROW(n46 ROW(n47 ROW(n48 ROW(n49 ROW(n50 ROW(n51 ROW(n52 ROW(n53 ROW(n54 ROW(n55 ROW(n56 ROW(n57 ROW(n58 ROW(n59 ROW(n60 ROW(n61 ROW(n62 ROW(n63 INT))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))));
 
 -- query 12
 -- @skip_result_check=true
@@ -151,8 +134,8 @@ DROP TABLE metadata_depth_rejected;
 -- query 13
 -- @cleanup=true
 -- @skip_result_check=true
-DROP TABLE IF EXISTS metadata64_${uuid0}.${case_db}.metadata_depth_rejected FORCE;
-DROP TABLE IF EXISTS metadata64_${uuid0}.${case_db}.metadata_depth_copy FORCE;
-DROP TABLE IF EXISTS metadata64_${uuid0}.${case_db}.metadata_depth FORCE;
-DROP DATABASE metadata64_${uuid0}.${case_db};
+DROP TABLE IF EXISTS metadata64_${uuid0}.${case_db}.metadata_depth_rejected ;
+DROP TABLE IF EXISTS metadata64_${uuid0}.${case_db}.metadata_depth_copy ;
+DROP TABLE IF EXISTS metadata64_${uuid0}.${case_db}.metadata_depth ;
+DROP SCHEMA metadata64_${uuid0}.${case_db};
 DROP CATALOG metadata64_${uuid0};

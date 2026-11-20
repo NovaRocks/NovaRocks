@@ -105,6 +105,7 @@ fn prepare(
         &ty(target.clone(), nullable),
         policy,
         allow,
+        None,
         &CompileControl::default(),
     )
     .unwrap()
@@ -264,6 +265,7 @@ fn all_thirteen_bool_profiles_freeze_full_types_inert_policies_and_source_only_n
                         &ty(target.clone(), true),
                         policy,
                         allow,
+                        None,
                         &CompileControl::default(),
                     )
                     .unwrap();
@@ -274,6 +276,7 @@ fn all_thirteen_bool_profiles_freeze_full_types_inert_policies_and_source_only_n
                             &ty(target.clone(), false),
                             policy,
                             allow,
+                            None,
                             &CompileControl::default()
                         ),
                         Err(CastPrepareError::TypeMismatch)
@@ -597,6 +600,7 @@ fn bool_cast_does_not_author_nominal_fixed_bytes_encoded_or_unsupported_operatio
                     result,
                     DecimalOverflowPolicy::OutputNull,
                     true,
+                    None,
                     &CompileControl::default()
                 ),
                 Err(CastPrepareError::Unsupported)
@@ -615,6 +619,7 @@ fn bool_cast_does_not_author_nominal_fixed_bytes_encoded_or_unsupported_operatio
             &boolean,
             DecimalOverflowPolicy::OutputNull,
             true,
+            None,
             &CompileControl::default(),
         ),
         Err(CastPrepareError::Unsupported)
@@ -637,6 +642,7 @@ fn bool_cast_does_not_author_nominal_fixed_bytes_encoded_or_unsupported_operatio
                 &boolean,
                 DecimalOverflowPolicy::ReportError,
                 true,
+                None,
                 &CompileControl::default()
             ),
             Err(CastPrepareError::Unsupported)
@@ -674,6 +680,7 @@ fn bool_cast_compile_three_causes_keep_entry_metadata_quantum_and_exact_primary_
             &target,
             DecimalOverflowPolicy::ReportError,
             true,
+            None,
             &baseline,
         );
         let trace = baseline.trace.lock().unwrap().clone();
@@ -698,6 +705,7 @@ fn bool_cast_compile_three_causes_keep_entry_metadata_quantum_and_exact_primary_
                     &target,
                     DecimalOverflowPolicy::ReportError,
                     true,
+                    None,
                     &control,
                 )
                 .unwrap_err();

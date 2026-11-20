@@ -26,86 +26,76 @@
 -- Case 1: precision=39 basic test
 -- query 1
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.decimal_test_p39_s5 (d1 decimal(38,5))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_p39_s5 (d1 decimal(38,5)) WITH (format_version = 3);
 INSERT INTO ${case_db}.decimal_test_p39_s5 SELECT 123456789012345678901234567890123.12345;
-INSERT INTO ${case_db}.decimal_test_p39_s5 SELECT -123456789012345678901234567890123.12345;
+INSERT INTO ${case_db}.decimal_test_p39_s5 SELECT (- (DECIMAL '123456789012345678901234567890123.12345'));
 
 -- Case 2: precision=50 medium precision test
-CREATE TABLE ${case_db}.decimal_test_p50_s10 (d1 decimal(38,10))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_p50_s10 (d1 decimal(38,10)) WITH (format_version = 3);
 INSERT INTO ${case_db}.decimal_test_p50_s10 SELECT 1234567890123456789012345678.1234567890;
-INSERT INTO ${case_db}.decimal_test_p50_s10 SELECT -1234567890123456789012345678.1234567890;
+INSERT INTO ${case_db}.decimal_test_p50_s10 SELECT (- (DECIMAL '1234567890123456789012345678.1234567890'));
 
 -- Case 3: precision=65 high precision test
-CREATE TABLE ${case_db}.decimal_test_p65_s15 (d1 decimal(38,15))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_p65_s15 (d1 decimal(38,15)) WITH (format_version = 3);
 INSERT INTO ${case_db}.decimal_test_p65_s15 SELECT 12345678901234567890123.123456789012345;
-INSERT INTO ${case_db}.decimal_test_p65_s15 SELECT -12345678901234567890123.123456789012345;
+INSERT INTO ${case_db}.decimal_test_p65_s15 SELECT (- (DECIMAL '12345678901234567890123.123456789012345'));
 
 -- ============================================
 -- Part 2: Boundary value tests
 -- ============================================
 
 -- Case 4: precision=39 boundary test (just within limit)
-CREATE TABLE ${case_db}.decimal_test_p39_s0 (d1 decimal(38,0))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_p39_s0 (d1 decimal(38,0)) WITH (format_version = 3);
 INSERT INTO ${case_db}.decimal_test_p39_s0 SELECT CAST('99999999999999999999999999999999999999' AS DECIMAL(38,0));  -- 39 digits of 9
 INSERT INTO ${case_db}.decimal_test_p39_s0 SELECT CAST('-99999999999999999999999999999999999999' AS DECIMAL(38,0));
 
 -- Case 5: precision=76 maximum precision boundary test
-CREATE TABLE ${case_db}.decimal_test_p76_s20 (d1 decimal(38,20))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_p76_s20 (d1 decimal(38,20)) WITH (format_version = 3);
 INSERT INTO ${case_db}.decimal_test_p76_s20 SELECT 123456789012345678.12345678901234567890;
-INSERT INTO ${case_db}.decimal_test_p76_s20 SELECT -123456789012345678.12345678901234567890;
+INSERT INTO ${case_db}.decimal_test_p76_s20 SELECT (- (DECIMAL '123456789012345678.12345678901234567890'));
 
 -- ============================================
 -- Part 3: FE Cast Null scenario tests
 -- ============================================
 
 -- Case 6: FE cast null test - decimal(76, 40), integer part limit = 77-40 = 37 digits
-CREATE TABLE ${case_db}.decimal_test_p76_s40_fe_null (d1 decimal(38,38))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_p76_s40_fe_null (d1 decimal(38,38)) WITH (format_version = 3);
 -- Integer part has 38 digits > 37, should be cast to null by FE
 INSERT INTO ${case_db}.decimal_test_p76_s40_fe_null SELECT 0.12345678901234567890123456789012345678;
-INSERT INTO ${case_db}.decimal_test_p76_s40_fe_null SELECT -0.12345678901234567890123456789012345678;
+INSERT INTO ${case_db}.decimal_test_p76_s40_fe_null SELECT (- (DECIMAL '0.12345678901234567890123456789012345678'));
 -- Integer part has 37 digits = 37, less than INT256_MAX. be throw exception.
 INSERT INTO ${case_db}.decimal_test_p76_s40_fe_null SELECT 0.12345678901234567890123456789012345678;
-INSERT INTO ${case_db}.decimal_test_p76_s40_fe_null SELECT -0.12345678901234567890123456789012345678;
+INSERT INTO ${case_db}.decimal_test_p76_s40_fe_null SELECT (- (DECIMAL '0.12345678901234567890123456789012345678'));
 
 -- Case 7: FE cast null test - decimal(76, 50), integer part limit = 77-50 = 27 digits
-CREATE TABLE ${case_db}.decimal_test_p76_s50_fe_null (d1 decimal(38,38))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_p76_s50_fe_null (d1 decimal(38,38)) WITH (format_version = 3);
 -- Integer part has 28 digits > 27, should be cast to null by FE
 INSERT INTO ${case_db}.decimal_test_p76_s50_fe_null SELECT 0.12345678901234567890123456789012345678;
-INSERT INTO ${case_db}.decimal_test_p76_s50_fe_null SELECT -0.12345678901234567890123456789012345678;
+INSERT INTO ${case_db}.decimal_test_p76_s50_fe_null SELECT (- (DECIMAL '0.12345678901234567890123456789012345678'));
 -- Integer part has 27 digits = 27, less than INT256_MAX. be throw exception.
 INSERT INTO ${case_db}.decimal_test_p76_s50_fe_null SELECT 0.12345678901234567890123456789012345678;
-INSERT INTO ${case_db}.decimal_test_p76_s50_fe_null SELECT -0.12345678901234567890123456789012345678;
+INSERT INTO ${case_db}.decimal_test_p76_s50_fe_null SELECT (- (DECIMAL '0.12345678901234567890123456789012345678'));
 -- Integer part has 26 digits = 26, less than INT256_MAX.
-INSERT INTO ${case_db}.decimal_test_p76_s50_fe_null SELECT -0.12345678901234567890123456789012345678;
+INSERT INTO ${case_db}.decimal_test_p76_s50_fe_null SELECT (- (DECIMAL '0.12345678901234567890123456789012345678'));
 
 -- ============================================
 -- Part 4: BE exception scenario tests (insufficient precision)
 -- ============================================
 
 -- Case 8: Scale causes total digits to exceed precision
-CREATE TABLE ${case_db}.decimal_test_p40_s35 (d1 decimal(38,35))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_p40_s35 (d1 decimal(38,35)) WITH (format_version = 3);
 INSERT INTO ${case_db}.decimal_test_p40_s35 SELECT 123.12345678901234567890123456789012345;  -- 6+35=41 > 40, should cause BE exception
 INSERT INTO ${case_db}.decimal_test_p40_s35 SELECT 123.12345678901234567890123456789012345;   -- 5+35=40, exactly fits
 INSERT INTO ${case_db}.decimal_test_p40_s35 SELECT 123.12345678901234567890123456789012345; -- 7+35=42 > 40, should cause BE exception
 
 -- Case 9: Similar example as mentioned
-CREATE TABLE ${case_db}.decimal_test_p50_s45 (d1 decimal(38,38))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_p50_s45 (d1 decimal(38,38)) WITH (format_version = 3);
 INSERT INTO ${case_db}.decimal_test_p50_s45 SELECT 0.12345678901234567890123456789012345678;  -- 6+45=51 > 50, should cause BE exception
 INSERT INTO ${case_db}.decimal_test_p50_s45 SELECT 0.12345678901234567890123456789012345678;   -- 5+45=50, exactly fits
 INSERT INTO ${case_db}.decimal_test_p50_s45 SELECT 0.12345678901234567890123456789012345678; -- 7+45=52 > 50, should cause BE exception
 
 -- Case 10: High precision scale overflow test
-CREATE TABLE ${case_db}.decimal_test_p55_s50 (d1 decimal(38,38))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_p55_s50 (d1 decimal(38,38)) WITH (format_version = 3);
 INSERT INTO ${case_db}.decimal_test_p55_s50 SELECT 0.12345678901234567890123456789012345678; -- 6+50=56 > 55, should cause BE exception
 INSERT INTO ${case_db}.decimal_test_p55_s50 SELECT 0.12345678901234567890123456789012345678;  -- 5+50=55, exactly fits
 
@@ -114,45 +104,39 @@ INSERT INTO ${case_db}.decimal_test_p55_s50 SELECT 0.123456789012345678901234567
 -- ============================================
 
 -- Case 11: Maximum precision all integers
-CREATE TABLE ${case_db}.decimal_test_p76_s0 (d1 decimal(38,0))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_p76_s0 (d1 decimal(38,0)) WITH (format_version = 3);
 INSERT INTO ${case_db}.decimal_test_p76_s0 SELECT CAST('12345678901234567890123456789012345678' AS DECIMAL(38,0));
 INSERT INTO ${case_db}.decimal_test_p76_s0 SELECT CAST('-12345678901234567890123456789012345678' AS DECIMAL(38,0));
 
 -- Case 12: Maximum precision all decimals
-CREATE TABLE ${case_db}.decimal_test_p76_s76 (d1 decimal(38,38))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_p76_s76 (d1 decimal(38,38)) WITH (format_version = 3);
 INSERT INTO ${case_db}.decimal_test_p76_s76 SELECT 0.12345678901234567890123456789012345678;
-INSERT INTO ${case_db}.decimal_test_p76_s76 SELECT -0.12345678901234567890123456789012345678;
+INSERT INTO ${case_db}.decimal_test_p76_s76 SELECT (- (DECIMAL '0.12345678901234567890123456789012345678'));
 
 -- Case 13: Near maximum precision mixed test
-CREATE TABLE ${case_db}.decimal_test_p75_s35 (d1 decimal(38,35))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_p75_s35 (d1 decimal(38,35)) WITH (format_version = 3);
 INSERT INTO ${case_db}.decimal_test_p75_s35 SELECT 123.12345678901234567890123456789012345;
-INSERT INTO ${case_db}.decimal_test_p75_s35 SELECT -123.12345678901234567890123456789012345;
+INSERT INTO ${case_db}.decimal_test_p75_s35 SELECT (- (DECIMAL '123.12345678901234567890123456789012345'));
 
 -- ============================================
 -- Part 6: Special values and edge cases
 -- ============================================
 
 -- Case 14: Zero values in different precision tests
-CREATE TABLE ${case_db}.decimal_test_p60_s30 (d1 decimal(38,30))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_p60_s30 (d1 decimal(38,30)) WITH (format_version = 3);
 INSERT INTO ${case_db}.decimal_test_p60_s30 SELECT 0;
 INSERT INTO ${case_db}.decimal_test_p60_s30 SELECT 0.0;
 INSERT INTO ${case_db}.decimal_test_p60_s30 SELECT 0.000000000000000000000000000000;
 
 -- Case 15: Large integers with all zeros after decimal point
-CREATE TABLE ${case_db}.decimal_test_p55_s25 (d1 decimal(38,25))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_p55_s25 (d1 decimal(38,25)) WITH (format_version = 3);
 INSERT INTO ${case_db}.decimal_test_p55_s25 SELECT 1234567890123.0000000000000000000000000;
-INSERT INTO ${case_db}.decimal_test_p55_s25 SELECT -1234567890123.0000000000000000000000000;
+INSERT INTO ${case_db}.decimal_test_p55_s25 SELECT (- (DECIMAL '1234567890123.0000000000000000000000000'));
 
 -- Case 16: Zero integer part with large decimal part
-CREATE TABLE ${case_db}.decimal_test_p70_s69 (d1 decimal(38,38))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_p70_s69 (d1 decimal(38,38)) WITH (format_version = 3);
 INSERT INTO ${case_db}.decimal_test_p70_s69 SELECT 0.12345678901234567890123456789012345678;
-INSERT INTO ${case_db}.decimal_test_p70_s69 SELECT -0.12345678901234567890123456789012345678;
+INSERT INTO ${case_db}.decimal_test_p70_s69 SELECT (- (DECIMAL '0.12345678901234567890123456789012345678'));
 
 -- ============================================
 -- Part 7: Systematic Testing for Different Precision Ranges
@@ -160,91 +144,77 @@ INSERT INTO ${case_db}.decimal_test_p70_s69 SELECT -0.12345678901234567890123456
 
 -- Case 17: precision=41 test
 -- be throw exception
-CREATE TABLE ${case_db}.decimal_test_p41_s8 (d1 decimal(38,8))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_p41_s8 (d1 decimal(38,8)) WITH (format_version = 3);
 INSERT INTO ${case_db}.decimal_test_p41_s8 SELECT 123456789012345678901234567890.12345678;
-INSERT INTO ${case_db}.decimal_test_p41_s8 SELECT -123456789012345678901234567890.12345678;
+INSERT INTO ${case_db}.decimal_test_p41_s8 SELECT (- (DECIMAL '123456789012345678901234567890.12345678'));
 
 -- Case 18: precision=43 test
-CREATE TABLE ${case_db}.decimal_test_p43_s12 (d1 decimal(38,12))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_p43_s12 (d1 decimal(38,12)) WITH (format_version = 3);
 INSERT INTO ${case_db}.decimal_test_p43_s12 SELECT 12345678901234567890123456.123456789012;
-INSERT INTO ${case_db}.decimal_test_p43_s12 SELECT -12345678901234567890123456.123456789012;
+INSERT INTO ${case_db}.decimal_test_p43_s12 SELECT (- (DECIMAL '12345678901234567890123456.123456789012'));
 
 -- Case 19: precision=47 test
-CREATE TABLE ${case_db}.decimal_test_p47_s18 (d1 decimal(38,18))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_p47_s18 (d1 decimal(38,18)) WITH (format_version = 3);
 INSERT INTO ${case_db}.decimal_test_p47_s18 SELECT 12345678901234567890.123456789012345678;
-INSERT INTO ${case_db}.decimal_test_p47_s18 SELECT -12345678901234567890.123456789012345678;
+INSERT INTO ${case_db}.decimal_test_p47_s18 SELECT (- (DECIMAL '12345678901234567890.123456789012345678'));
 
 -- Case 20: precision=52 test
-CREATE TABLE ${case_db}.decimal_test_p52_s25 (d1 decimal(38,25))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_p52_s25 (d1 decimal(38,25)) WITH (format_version = 3);
 INSERT INTO ${case_db}.decimal_test_p52_s25 SELECT 1234567890123.1234567890123456789012345;
-INSERT INTO ${case_db}.decimal_test_p52_s25 SELECT -1234567890123.1234567890123456789012345;
+INSERT INTO ${case_db}.decimal_test_p52_s25 SELECT (- (DECIMAL '1234567890123.1234567890123456789012345'));
 
 -- Case 21: precision=58 test
-CREATE TABLE ${case_db}.decimal_test_p58_s30 (d1 decimal(38,30))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_p58_s30 (d1 decimal(38,30)) WITH (format_version = 3);
 INSERT INTO ${case_db}.decimal_test_p58_s30 SELECT 12345678.123456789012345678901234567890;
-INSERT INTO ${case_db}.decimal_test_p58_s30 SELECT -12345678.123456789012345678901234567890;
+INSERT INTO ${case_db}.decimal_test_p58_s30 SELECT (- (DECIMAL '12345678.123456789012345678901234567890'));
 
 -- Case 22: precision=62 test
-CREATE TABLE ${case_db}.decimal_test_p62_s35 (d1 decimal(38,35))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_p62_s35 (d1 decimal(38,35)) WITH (format_version = 3);
 INSERT INTO ${case_db}.decimal_test_p62_s35 SELECT 123.12345678901234567890123456789012345;
-INSERT INTO ${case_db}.decimal_test_p62_s35 SELECT -123.12345678901234567890123456789012345;
+INSERT INTO ${case_db}.decimal_test_p62_s35 SELECT (- (DECIMAL '123.12345678901234567890123456789012345'));
 
 -- Case 23: precision=68 test
-CREATE TABLE ${case_db}.decimal_test_p68_s40 (d1 decimal(38,38))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_p68_s40 (d1 decimal(38,38)) WITH (format_version = 3);
 INSERT INTO ${case_db}.decimal_test_p68_s40 SELECT 0.12345678901234567890123456789012345678;
-INSERT INTO ${case_db}.decimal_test_p68_s40 SELECT -0.12345678901234567890123456789012345678;
+INSERT INTO ${case_db}.decimal_test_p68_s40 SELECT (- (DECIMAL '0.12345678901234567890123456789012345678'));
 
 -- Case 24: precision=72 test
-CREATE TABLE ${case_db}.decimal_test_p72_s45 (d1 decimal(38,38))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_p72_s45 (d1 decimal(38,38)) WITH (format_version = 3);
 INSERT INTO ${case_db}.decimal_test_p72_s45 SELECT 0.12345678901234567890123456789012345678;
-INSERT INTO ${case_db}.decimal_test_p72_s45 SELECT -0.12345678901234567890123456789012345678;
+INSERT INTO ${case_db}.decimal_test_p72_s45 SELECT (- (DECIMAL '0.12345678901234567890123456789012345678'));
 
 -- ============================================
 -- Part 8: Different Precision Tests with Scale=0
 -- ============================================
 
 -- Case 25: precision=42, scale=0
-CREATE TABLE ${case_db}.decimal_test_p42_s0 (d1 decimal(38,0))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_p42_s0 (d1 decimal(38,0)) WITH (format_version = 3);
 INSERT INTO ${case_db}.decimal_test_p42_s0 SELECT CAST('12345678901234567890123456789012345678' AS DECIMAL(38,0));
 INSERT INTO ${case_db}.decimal_test_p42_s0 SELECT CAST('-12345678901234567890123456789012345678' AS DECIMAL(38,0));
 
 -- Case 26: precision=48, scale=0
-CREATE TABLE ${case_db}.decimal_test_p48_s0 (d1 decimal(38,0))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_p48_s0 (d1 decimal(38,0)) WITH (format_version = 3);
 INSERT INTO ${case_db}.decimal_test_p48_s0 SELECT CAST('12345678901234567890123456789012345678' AS DECIMAL(38,0));
 INSERT INTO ${case_db}.decimal_test_p48_s0 SELECT CAST('-12345678901234567890123456789012345678' AS DECIMAL(38,0));
-INSERT INTO ${case_db}.decimal_test_p48_s0 SELECT -1234567890123456789012345678901234567.9;
+INSERT INTO ${case_db}.decimal_test_p48_s0 SELECT (- (DECIMAL '1234567890123456789012345678901234567.9'));
 
 -- Case 27: precision=54, scale=0
-CREATE TABLE ${case_db}.decimal_test_p54_s0 (d1 decimal(38,0))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_p54_s0 (d1 decimal(38,0)) WITH (format_version = 3);
 INSERT INTO ${case_db}.decimal_test_p54_s0 SELECT CAST('12345678901234567890123456789012345678' AS DECIMAL(38,0));
 INSERT INTO ${case_db}.decimal_test_p54_s0 SELECT CAST('-12345678901234567890123456789012345678' AS DECIMAL(38,0));
 
 -- Case 28: precision=60, scale=0
-CREATE TABLE ${case_db}.decimal_test_p60_s0 (d1 decimal(38,0))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_p60_s0 (d1 decimal(38,0)) WITH (format_version = 3);
 INSERT INTO ${case_db}.decimal_test_p60_s0 SELECT CAST('12345678901234567890123456789012345678' AS DECIMAL(38,0));
 INSERT INTO ${case_db}.decimal_test_p60_s0 SELECT CAST('-12345678901234567890123456789012345678' AS DECIMAL(38,0));
 
 -- Case 29: precision=66, scale=0
-CREATE TABLE ${case_db}.decimal_test_p66_s0 (d1 decimal(38,0))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_p66_s0 (d1 decimal(38,0)) WITH (format_version = 3);
 INSERT INTO ${case_db}.decimal_test_p66_s0 SELECT CAST('12345678901234567890123456789012345678' AS DECIMAL(38,0));
 INSERT INTO ${case_db}.decimal_test_p66_s0 SELECT CAST('-12345678901234567890123456789012345678' AS DECIMAL(38,0));
 
 -- Case 30: precision=70, scale=0
-CREATE TABLE ${case_db}.decimal_test_p70_s0 (d1 decimal(38,0))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_p70_s0 (d1 decimal(38,0)) WITH (format_version = 3);
 INSERT INTO ${case_db}.decimal_test_p70_s0 SELECT CAST('12345678901234567890123456789012345678' AS DECIMAL(38,0));
 INSERT INTO ${case_db}.decimal_test_p70_s0 SELECT CAST('-12345678901234567890123456789012345678' AS DECIMAL(38,0));
 
@@ -253,110 +223,97 @@ INSERT INTO ${case_db}.decimal_test_p70_s0 SELECT CAST('-12345678901234567890123
 -- ============================================
 
 -- Case 31: High scale test - precision=45, scale=40
-CREATE TABLE ${case_db}.decimal_test_p45_s40 (d1 decimal(38,38))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_p45_s40 (d1 decimal(38,38)) WITH (format_version = 3);
 INSERT INTO ${case_db}.decimal_test_p45_s40 SELECT 0.12345678901234567890123456789012345678;
-INSERT INTO ${case_db}.decimal_test_p45_s40 SELECT -0.12345678901234567890123456789012345678;
+INSERT INTO ${case_db}.decimal_test_p45_s40 SELECT (- (DECIMAL '0.12345678901234567890123456789012345678'));
 
 -- Case 32: High scale test - precision=51, scale=45
-CREATE TABLE ${case_db}.decimal_test_p51_s45 (d1 decimal(38,38))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_p51_s45 (d1 decimal(38,38)) WITH (format_version = 3);
 INSERT INTO ${case_db}.decimal_test_p51_s45 SELECT 0.12345678901234567890123456789012345678;
-INSERT INTO ${case_db}.decimal_test_p51_s45 SELECT -0.12345678901234567890123456789012345678;
+INSERT INTO ${case_db}.decimal_test_p51_s45 SELECT (- (DECIMAL '0.12345678901234567890123456789012345678'));
 
 -- Case 33: High scale test - precision=57, scale=50
-CREATE TABLE ${case_db}.decimal_test_p57_s50 (d1 decimal(38,38))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_p57_s50 (d1 decimal(38,38)) WITH (format_version = 3);
 INSERT INTO ${case_db}.decimal_test_p57_s50 SELECT 0.12345678901234567890123456789012345678;
-INSERT INTO ${case_db}.decimal_test_p57_s50 SELECT -0.12345678901234567890123456789012345678;
+INSERT INTO ${case_db}.decimal_test_p57_s50 SELECT (- (DECIMAL '0.12345678901234567890123456789012345678'));
 
 -- Case 34: High scale test - precision=63, scale=55
-CREATE TABLE ${case_db}.decimal_test_p63_s55 (d1 decimal(38,38))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_p63_s55 (d1 decimal(38,38)) WITH (format_version = 3);
 INSERT INTO ${case_db}.decimal_test_p63_s55 SELECT 0.12345678901234567890123456789012345678;
-INSERT INTO ${case_db}.decimal_test_p63_s55 SELECT -0.12345678901234567890123456789012345678;
+INSERT INTO ${case_db}.decimal_test_p63_s55 SELECT (- (DECIMAL '0.12345678901234567890123456789012345678'));
 
 -- Case 35: High scale test - precision=69, scale=60
-CREATE TABLE ${case_db}.decimal_test_p69_s60 (d1 decimal(38,38))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_p69_s60 (d1 decimal(38,38)) WITH (format_version = 3);
 INSERT INTO ${case_db}.decimal_test_p69_s60 SELECT 0.12345678901234567890123456789012345678;
-INSERT INTO ${case_db}.decimal_test_p69_s60 SELECT -0.12345678901234567890123456789012345678;
+INSERT INTO ${case_db}.decimal_test_p69_s60 SELECT (- (DECIMAL '0.12345678901234567890123456789012345678'));
 
 -- ============================================
 -- Part 10: FE Binary Style Overflow Tests (More Scenarios)
 -- ============================================
 
 -- Case 36: FE cast null test - decimal(70, 45), integer part limit = 77-45 = 32 digits
-CREATE TABLE ${case_db}.decimal_test_p70_s45_fe_null (d1 decimal(38,38))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_p70_s45_fe_null (d1 decimal(38,38)) WITH (format_version = 3);
 -- Integer part has 33 digits > 32, should be cast to null by FE
 INSERT INTO ${case_db}.decimal_test_p70_s45_fe_null SELECT 0.12345678901234567890123456789012345678;
-INSERT INTO ${case_db}.decimal_test_p70_s45_fe_null SELECT -0.12345678901234567890123456789012345678;
+INSERT INTO ${case_db}.decimal_test_p70_s45_fe_null SELECT (- (DECIMAL '0.12345678901234567890123456789012345678'));
 -- Integer part has 32 digits = 32, be throw exception
 INSERT INTO ${case_db}.decimal_test_p70_s45_fe_null SELECT 0.12345678901234567890123456789012345678;
-INSERT INTO ${case_db}.decimal_test_p70_s45_fe_null SELECT -0.12345678901234567890123456789012345678;
+INSERT INTO ${case_db}.decimal_test_p70_s45_fe_null SELECT (- (DECIMAL '0.12345678901234567890123456789012345678'));
 
 -- Case 37: FE cast null test - decimal(65, 55), integer part limit = 77-55 = 22 digits
-CREATE TABLE ${case_db}.decimal_test_p65_s55_fe_null (d1 decimal(38,38))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_p65_s55_fe_null (d1 decimal(38,38)) WITH (format_version = 3);
 -- Integer part has 23 digits > 22, should be cast to null by FE
 INSERT INTO ${case_db}.decimal_test_p65_s55_fe_null SELECT 0.12345678901234567890123456789012345678;
-INSERT INTO ${case_db}.decimal_test_p65_s55_fe_null SELECT -0.12345678901234567890123456789012345678;
+INSERT INTO ${case_db}.decimal_test_p65_s55_fe_null SELECT (- (DECIMAL '0.12345678901234567890123456789012345678'));
 -- Integer part has 22 digits = 22, be throw exception
 INSERT INTO ${case_db}.decimal_test_p65_s55_fe_null SELECT 0.12345678901234567890123456789012345678;
-INSERT INTO ${case_db}.decimal_test_p65_s55_fe_null SELECT -0.12345678901234567890123456789012345678;
+INSERT INTO ${case_db}.decimal_test_p65_s55_fe_null SELECT (- (DECIMAL '0.12345678901234567890123456789012345678'));
 
 -- Case 38: FE cast null test - decimal(60, 60), integer part limit = 77-60 = 17 digits
-CREATE TABLE ${case_db}.decimal_test_p60_s60_fe_null (d1 decimal(38,38))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_p60_s60_fe_null (d1 decimal(38,38)) WITH (format_version = 3);
 -- Integer part has 18 digits > 17, should be cast to null by FE
 INSERT INTO ${case_db}.decimal_test_p60_s60_fe_null SELECT 0.12345678901234567890123456789012345678;
-INSERT INTO ${case_db}.decimal_test_p60_s60_fe_null SELECT -0.12345678901234567890123456789012345678;
+INSERT INTO ${case_db}.decimal_test_p60_s60_fe_null SELECT (- (DECIMAL '0.12345678901234567890123456789012345678'));
 -- Integer part has 17 digits = 17, should work
 INSERT INTO ${case_db}.decimal_test_p60_s60_fe_null SELECT 0.12345678901234567890123456789012345678;
-INSERT INTO ${case_db}.decimal_test_p60_s60_fe_null SELECT -0.12345678901234567890123456789012345678;
+INSERT INTO ${case_db}.decimal_test_p60_s60_fe_null SELECT (- (DECIMAL '0.12345678901234567890123456789012345678'));
 -- Integer part has 1 digits = 1, be also throw exception
 INSERT INTO ${case_db}.decimal_test_p60_s60_fe_null SELECT 1;
 INSERT INTO ${case_db}.decimal_test_p60_s60_fe_null SELECT -1;
 -- Integer part has 0 digits = 0, should work
 INSERT INTO ${case_db}.decimal_test_p60_s60_fe_null SELECT 0.1;
-INSERT INTO ${case_db}.decimal_test_p60_s60_fe_null SELECT -0.1;
+INSERT INTO ${case_db}.decimal_test_p60_s60_fe_null SELECT (- (DECIMAL '0.1'));
 
 -- ============================================
 -- Part 11: BE Overflow Exception Tests (More Scenarios)
 -- ============================================
 
 -- Case 39: precision=41, scale=38 overflow test
-CREATE TABLE ${case_db}.decimal_test_p41_s38 (d1 decimal(38,38))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_p41_s38 (d1 decimal(38,38)) WITH (format_version = 3);
 INSERT INTO ${case_db}.decimal_test_p41_s38 SELECT 0.12345678901234567890123456789012345678; -- 4+38=42 > 41, should BE exception
 INSERT INTO ${case_db}.decimal_test_p41_s38 SELECT 0.12345678901234567890123456789012345678;  -- 3+38=41, exactly fits
 INSERT INTO ${case_db}.decimal_test_p41_s38 SELECT 0.12345678901234567890123456789012345678; -- 5+38=43 > 41, should BE exception
 
 -- Case 40: precision=46, scale=42 overflow test
-CREATE TABLE ${case_db}.decimal_test_p46_s42 (d1 decimal(38,38))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_p46_s42 (d1 decimal(38,38)) WITH (format_version = 3);
 INSERT INTO ${case_db}.decimal_test_p46_s42 SELECT 0.12345678901234567890123456789012345678; -- 5+42=47 > 46, should BE exception
 INSERT INTO ${case_db}.decimal_test_p46_s42 SELECT 0.12345678901234567890123456789012345678;  -- 4+42=46, exactly fits
 INSERT INTO ${case_db}.decimal_test_p46_s42 SELECT 0.12345678901234567890123456789012345678; -- 6+42=48 > 46, should BE exception
 
 -- Case 41: precision=56, scale=52 overflow test
-CREATE TABLE ${case_db}.decimal_test_p56_s52 (d1 decimal(38,38))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_p56_s52 (d1 decimal(38,38)) WITH (format_version = 3);
 INSERT INTO ${case_db}.decimal_test_p56_s52 SELECT 0.12345678901234567890123456789012345678; -- 5+52=57 > 56, should BE exception
 INSERT INTO ${case_db}.decimal_test_p56_s52 SELECT 0.12345678901234567890123456789012345678;  -- 4+52=56, exactly fits
 INSERT INTO ${case_db}.decimal_test_p56_s52 SELECT 0.12345678901234567890123456789012345678; -- 6+52=58 > 56, should BE exception
 
 -- Case 42: precision=61, scale=58 overflow test
-CREATE TABLE ${case_db}.decimal_test_p61_s58 (d1 decimal(38,38))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_p61_s58 (d1 decimal(38,38)) WITH (format_version = 3);
 INSERT INTO ${case_db}.decimal_test_p61_s58 SELECT 0.12345678901234567890123456789012345678; -- 4+58=62 > 61, should BE exception
 INSERT INTO ${case_db}.decimal_test_p61_s58 SELECT 0.12345678901234567890123456789012345678;  -- 3+58=61, exactly fits
 INSERT INTO ${case_db}.decimal_test_p61_s58 SELECT 0.12345678901234567890123456789012345678; -- 5+58=63 > 61, should BE exception
 
 -- Case 43: precision=67, scale=63 overflow test
-CREATE TABLE ${case_db}.decimal_test_p67_s63 (d1 decimal(38,38))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_p67_s63 (d1 decimal(38,38)) WITH (format_version = 3);
 INSERT INTO ${case_db}.decimal_test_p67_s63 SELECT 0.12345678901234567890123456789012345678; -- 5+63=68 > 67, should BE exception
 INSERT INTO ${case_db}.decimal_test_p67_s63 SELECT 0.12345678901234567890123456789012345678;  -- 4+63=67, exactly fits
 INSERT INTO ${case_db}.decimal_test_p67_s63 SELECT 0.12345678901234567890123456789012345678; -- 6+63=69 > 67, should BE exception
@@ -366,26 +323,22 @@ INSERT INTO ${case_db}.decimal_test_p67_s63 SELECT 0.123456789012345678901234567
 -- ============================================
 
 -- Case 44: All 1s digit test
-CREATE TABLE ${case_db}.decimal_test_p40_s20 (d1 decimal(38,20))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_p40_s20 (d1 decimal(38,20)) WITH (format_version = 3);
 INSERT INTO ${case_db}.decimal_test_p40_s20 SELECT 111111111111111111.11111111111111111111;
-INSERT INTO ${case_db}.decimal_test_p40_s20 SELECT -111111111111111111.11111111111111111111;
+INSERT INTO ${case_db}.decimal_test_p40_s20 SELECT (- (DECIMAL '111111111111111111.11111111111111111111'));
 
 -- Case 45: All 9s digit test
-CREATE TABLE ${case_db}.decimal_test_p45_s22 (d1 decimal(38,22))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_p45_s22 (d1 decimal(38,22)) WITH (format_version = 3);
 INSERT INTO ${case_db}.decimal_test_p45_s22 SELECT 9999999999999999.9999999999999999999999;
-INSERT INTO ${case_db}.decimal_test_p45_s22 SELECT -9999999999999999.9999999999999999999999;
+INSERT INTO ${case_db}.decimal_test_p45_s22 SELECT (- (DECIMAL '9999999999999999.9999999999999999999999'));
 
 -- Case 46: Alternating digit pattern test
-CREATE TABLE ${case_db}.decimal_test_p50_s25 (d1 decimal(38,25))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_p50_s25 (d1 decimal(38,25)) WITH (format_version = 3);
 INSERT INTO ${case_db}.decimal_test_p50_s25 SELECT 1234567890123.1234567890123456789012345;
 INSERT INTO ${case_db}.decimal_test_p50_s25 SELECT 9876543210987.9876543210987654321098765;
 
 -- Case 47: Repeating digit pattern test
-CREATE TABLE ${case_db}.decimal_test_p55_s27 (d1 decimal(38,27))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_p55_s27 (d1 decimal(38,27)) WITH (format_version = 3);
 INSERT INTO ${case_db}.decimal_test_p55_s27 SELECT 12121212121.123123123123123123123123123;
 INSERT INTO ${case_db}.decimal_test_p55_s27 SELECT 34343434343.456456456456456456456456456;
 
@@ -394,113 +347,100 @@ INSERT INTO ${case_db}.decimal_test_p55_s27 SELECT 34343434343.45645645645645645
 -- ============================================
 
 -- Case 48: precision=39 boundary precise test
-CREATE TABLE ${case_db}.decimal_test_p39_s19 (d1 decimal(38,19))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_p39_s19 (d1 decimal(38,19)) WITH (format_version = 3);
 INSERT INTO ${case_db}.decimal_test_p39_s19 SELECT 9999999999999999999.9999999999999999999;
-INSERT INTO ${case_db}.decimal_test_p39_s19 SELECT -9999999999999999999.9999999999999999999;
+INSERT INTO ${case_db}.decimal_test_p39_s19 SELECT (- (DECIMAL '9999999999999999999.9999999999999999999'));
 
 -- Case 49: precision=76 boundary precise test
-CREATE TABLE ${case_db}.decimal_test_p76_s38 (d1 decimal(38,38))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_p76_s38 (d1 decimal(38,38)) WITH (format_version = 3);
 INSERT INTO ${case_db}.decimal_test_p76_s38 SELECT 0.99999999999999999999999999999999999999;
-INSERT INTO ${case_db}.decimal_test_p76_s38 SELECT -0.99999999999999999999999999999999999999;
+INSERT INTO ${case_db}.decimal_test_p76_s38 SELECT (- (DECIMAL '0.99999999999999999999999999999999999999'));
 
 -- Case 50: Mid-range precision boundary test
-CREATE TABLE ${case_db}.decimal_test_p58_s29 (d1 decimal(38,29))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_p58_s29 (d1 decimal(38,29)) WITH (format_version = 3);
 INSERT INTO ${case_db}.decimal_test_p58_s29 SELECT 999999999.99999999999999999999999999999;
-INSERT INTO ${case_db}.decimal_test_p58_s29 SELECT -999999999.99999999999999999999999999999;
+INSERT INTO ${case_db}.decimal_test_p58_s29 SELECT (- (DECIMAL '999999999.99999999999999999999999999999'));
 
 -- ============================================
 -- Part 14: Simple value tests (1, -1, 0) across different precisions
 -- ============================================
 
 -- Case 51: Simple values with precision=39
-CREATE TABLE ${case_db}.decimal_test_simple_p39_s0 (d1 decimal(38,0))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_simple_p39_s0 (d1 decimal(38,0)) WITH (format_version = 3);
 INSERT INTO ${case_db}.decimal_test_simple_p39_s0 SELECT 1;
 INSERT INTO ${case_db}.decimal_test_simple_p39_s0 SELECT -1;
 INSERT INTO ${case_db}.decimal_test_simple_p39_s0 SELECT 0;
 
 -- Case 52: Simple values with precision=39 and scale=10
-CREATE TABLE ${case_db}.decimal_test_simple_p39_s10 (d1 decimal(38,10))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_simple_p39_s10 (d1 decimal(38,10)) WITH (format_version = 3);
 INSERT INTO ${case_db}.decimal_test_simple_p39_s10 SELECT 1;
 INSERT INTO ${case_db}.decimal_test_simple_p39_s10 SELECT -1;
 INSERT INTO ${case_db}.decimal_test_simple_p39_s10 SELECT 0;
 INSERT INTO ${case_db}.decimal_test_simple_p39_s10 SELECT 1.0000000000;
-INSERT INTO ${case_db}.decimal_test_simple_p39_s10 SELECT -1.0000000000;
+INSERT INTO ${case_db}.decimal_test_simple_p39_s10 SELECT (- (DECIMAL '1.0000000000'));
 INSERT INTO ${case_db}.decimal_test_simple_p39_s10 SELECT 0.0000000000;
 
 -- Case 53: Simple values with precision=50 and scale=0
-CREATE TABLE ${case_db}.decimal_test_simple_p50_s0 (d1 decimal(38,0))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_simple_p50_s0 (d1 decimal(38,0)) WITH (format_version = 3);
 INSERT INTO ${case_db}.decimal_test_simple_p50_s0 SELECT 1;
 INSERT INTO ${case_db}.decimal_test_simple_p50_s0 SELECT -1;
 INSERT INTO ${case_db}.decimal_test_simple_p50_s0 SELECT 0;
 
 -- Case 54: Simple values with precision=50 and scale=25
-CREATE TABLE ${case_db}.decimal_test_simple_p50_s25 (d1 decimal(38,25))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_simple_p50_s25 (d1 decimal(38,25)) WITH (format_version = 3);
 INSERT INTO ${case_db}.decimal_test_simple_p50_s25 SELECT 1;
 INSERT INTO ${case_db}.decimal_test_simple_p50_s25 SELECT -1;
 INSERT INTO ${case_db}.decimal_test_simple_p50_s25 SELECT 0;
 INSERT INTO ${case_db}.decimal_test_simple_p50_s25 SELECT 1.0000000000000000000000000;
-INSERT INTO ${case_db}.decimal_test_simple_p50_s25 SELECT -1.0000000000000000000000000;
+INSERT INTO ${case_db}.decimal_test_simple_p50_s25 SELECT (- (DECIMAL '1.0000000000000000000000000'));
 INSERT INTO ${case_db}.decimal_test_simple_p50_s25 SELECT 0.0000000000000000000000000;
 
 -- Case 55: Simple values with precision=65 and scale=0
-CREATE TABLE ${case_db}.decimal_test_simple_p65_s0 (d1 decimal(38,0))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_simple_p65_s0 (d1 decimal(38,0)) WITH (format_version = 3);
 INSERT INTO ${case_db}.decimal_test_simple_p65_s0 SELECT 1;
 INSERT INTO ${case_db}.decimal_test_simple_p65_s0 SELECT -1;
 INSERT INTO ${case_db}.decimal_test_simple_p65_s0 SELECT 0;
 
 -- Case 56: Simple values with precision=65 and scale=32
-CREATE TABLE ${case_db}.decimal_test_simple_p65_s32 (d1 decimal(38,32))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_simple_p65_s32 (d1 decimal(38,32)) WITH (format_version = 3);
 INSERT INTO ${case_db}.decimal_test_simple_p65_s32 SELECT 1;
 INSERT INTO ${case_db}.decimal_test_simple_p65_s32 SELECT -1;
 INSERT INTO ${case_db}.decimal_test_simple_p65_s32 SELECT 0;
 INSERT INTO ${case_db}.decimal_test_simple_p65_s32 SELECT 1.00000000000000000000000000000000;
-INSERT INTO ${case_db}.decimal_test_simple_p65_s32 SELECT -1.00000000000000000000000000000000;
+INSERT INTO ${case_db}.decimal_test_simple_p65_s32 SELECT (- (DECIMAL '1.00000000000000000000000000000000'));
 INSERT INTO ${case_db}.decimal_test_simple_p65_s32 SELECT 0.00000000000000000000000000000000;
 
 -- Case 57: Simple values with maximum precision=76 and scale=0
-CREATE TABLE ${case_db}.decimal_test_simple_p76_s0 (d1 decimal(38,0))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_simple_p76_s0 (d1 decimal(38,0)) WITH (format_version = 3);
 INSERT INTO ${case_db}.decimal_test_simple_p76_s0 SELECT 1;
 INSERT INTO ${case_db}.decimal_test_simple_p76_s0 SELECT -1;
 INSERT INTO ${case_db}.decimal_test_simple_p76_s0 SELECT 0;
 
 -- Case 58: Simple values with maximum precision=76 and scale=38
-CREATE TABLE ${case_db}.decimal_test_simple_p76_s38 (d1 decimal(38,38))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_simple_p76_s38 (d1 decimal(38,38)) WITH (format_version = 3);
 INSERT INTO ${case_db}.decimal_test_simple_p76_s38 SELECT 1;
 INSERT INTO ${case_db}.decimal_test_simple_p76_s38 SELECT -1;
 INSERT INTO ${case_db}.decimal_test_simple_p76_s38 SELECT 0;
 INSERT INTO ${case_db}.decimal_test_simple_p76_s38 SELECT 0.00000000000000000000000000000000000000;
-INSERT INTO ${case_db}.decimal_test_simple_p76_s38 SELECT -0.00000000000000000000000000000000000000;
+INSERT INTO ${case_db}.decimal_test_simple_p76_s38 SELECT (- (DECIMAL '0.00000000000000000000000000000000000000'));
 INSERT INTO ${case_db}.decimal_test_simple_p76_s38 SELECT 0.00000000000000000000000000000000000000;
 
 -- Case 59: Simple values with maximum precision=76 and high scale=60
-CREATE TABLE ${case_db}.decimal_test_simple_p76_s60 (d1 decimal(38,38))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_simple_p76_s60 (d1 decimal(38,38)) WITH (format_version = 3);
 INSERT INTO ${case_db}.decimal_test_simple_p76_s60 SELECT 1;
 INSERT INTO ${case_db}.decimal_test_simple_p76_s60 SELECT -1;
 INSERT INTO ${case_db}.decimal_test_simple_p76_s60 SELECT 0;
 INSERT INTO ${case_db}.decimal_test_simple_p76_s60 SELECT 0.00000000000000000000000000000000000000;
-INSERT INTO ${case_db}.decimal_test_simple_p76_s60 SELECT -0.00000000000000000000000000000000000000;
+INSERT INTO ${case_db}.decimal_test_simple_p76_s60 SELECT (- (DECIMAL '0.00000000000000000000000000000000000000'));
 INSERT INTO ${case_db}.decimal_test_simple_p76_s60 SELECT 0.00000000000000000000000000000000000000;
 
 -- Case 60: Simple values with maximum precision=76 and maximum scale=76
-CREATE TABLE ${case_db}.decimal_test_simple_p76_s76 (d1 decimal(38,38))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_simple_p76_s76 (d1 decimal(38,38)) WITH (format_version = 3);
 INSERT INTO ${case_db}.decimal_test_simple_p76_s76 SELECT 1;
 INSERT INTO ${case_db}.decimal_test_simple_p76_s76 SELECT -1;
 INSERT INTO ${case_db}.decimal_test_simple_p76_s76 SELECT 0;
 INSERT INTO ${case_db}.decimal_test_simple_p76_s76 SELECT 0.10000000000000000000000000000000000000;
-INSERT INTO ${case_db}.decimal_test_simple_p76_s76 SELECT -0.10000000000000000000000000000000000000;
+INSERT INTO ${case_db}.decimal_test_simple_p76_s76 SELECT (- (DECIMAL '0.10000000000000000000000000000000000000'));
 INSERT INTO ${case_db}.decimal_test_simple_p76_s76 SELECT 0.00000000000000000000000000000000000000;
 
 -- ============================================
@@ -508,117 +448,106 @@ INSERT INTO ${case_db}.decimal_test_simple_p76_s76 SELECT 0.00000000000000000000
 -- ============================================
 
 -- Case 61: Simple values with precision=40 and scale=39 (almost all decimal)
-CREATE TABLE ${case_db}.decimal_test_simple_p40_s39 (d1 decimal(38,38))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_simple_p40_s39 (d1 decimal(38,38)) WITH (format_version = 3);
 INSERT INTO ${case_db}.decimal_test_simple_p40_s39 SELECT 1;
 INSERT INTO ${case_db}.decimal_test_simple_p40_s39 SELECT -1;
 INSERT INTO ${case_db}.decimal_test_simple_p40_s39 SELECT 0;
 INSERT INTO ${case_db}.decimal_test_simple_p40_s39 SELECT 0.10000000000000000000000000000000000000;
-INSERT INTO ${case_db}.decimal_test_simple_p40_s39 SELECT -0.10000000000000000000000000000000000000;
+INSERT INTO ${case_db}.decimal_test_simple_p40_s39 SELECT (- (DECIMAL '0.10000000000000000000000000000000000000'));
 INSERT INTO ${case_db}.decimal_test_simple_p40_s39 SELECT 0.00000000000000000000000000000000000000;
 
 -- Case 62: Simple values with precision=45 and scale=44 (almost all decimal)
-CREATE TABLE ${case_db}.decimal_test_simple_p45_s44 (d1 decimal(38,38))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_simple_p45_s44 (d1 decimal(38,38)) WITH (format_version = 3);
 INSERT INTO ${case_db}.decimal_test_simple_p45_s44 SELECT 1;
 INSERT INTO ${case_db}.decimal_test_simple_p45_s44 SELECT -1;
 INSERT INTO ${case_db}.decimal_test_simple_p45_s44 SELECT 0;
 INSERT INTO ${case_db}.decimal_test_simple_p45_s44 SELECT 0.10000000000000000000000000000000000000;
-INSERT INTO ${case_db}.decimal_test_simple_p45_s44 SELECT -0.10000000000000000000000000000000000000;
+INSERT INTO ${case_db}.decimal_test_simple_p45_s44 SELECT (- (DECIMAL '0.10000000000000000000000000000000000000'));
 INSERT INTO ${case_db}.decimal_test_simple_p45_s44 SELECT 0.00000000000000000000000000000000000000;
 
 -- Case 63: Simple values with precision=55 and scale=1 (mostly integer)
-CREATE TABLE ${case_db}.decimal_test_simple_p55_s1 (d1 decimal(38,1))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_simple_p55_s1 (d1 decimal(38,1)) WITH (format_version = 3);
 INSERT INTO ${case_db}.decimal_test_simple_p55_s1 SELECT 1;
 INSERT INTO ${case_db}.decimal_test_simple_p55_s1 SELECT -1;
 INSERT INTO ${case_db}.decimal_test_simple_p55_s1 SELECT 0;
 INSERT INTO ${case_db}.decimal_test_simple_p55_s1 SELECT 1.0;
-INSERT INTO ${case_db}.decimal_test_simple_p55_s1 SELECT -1.0;
+INSERT INTO ${case_db}.decimal_test_simple_p55_s1 SELECT (- (DECIMAL '1.0'));
 INSERT INTO ${case_db}.decimal_test_simple_p55_s1 SELECT 0.0;
 INSERT INTO ${case_db}.decimal_test_simple_p55_s1 SELECT 1.1;
-INSERT INTO ${case_db}.decimal_test_simple_p55_s1 SELECT -1.1;
+INSERT INTO ${case_db}.decimal_test_simple_p55_s1 SELECT (- (DECIMAL '1.1'));
 INSERT INTO ${case_db}.decimal_test_simple_p55_s1 SELECT 0.1;
 
 -- Case 64: Simple values with precision=70 and scale=35 (half and half)
-CREATE TABLE ${case_db}.decimal_test_simple_p70_s35 (d1 decimal(38,35))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_simple_p70_s35 (d1 decimal(38,35)) WITH (format_version = 3);
 INSERT INTO ${case_db}.decimal_test_simple_p70_s35 SELECT 1;
 INSERT INTO ${case_db}.decimal_test_simple_p70_s35 SELECT -1;
 INSERT INTO ${case_db}.decimal_test_simple_p70_s35 SELECT 0;
 INSERT INTO ${case_db}.decimal_test_simple_p70_s35 SELECT 1.00000000000000000000000000000000000;
-INSERT INTO ${case_db}.decimal_test_simple_p70_s35 SELECT -1.00000000000000000000000000000000000;
+INSERT INTO ${case_db}.decimal_test_simple_p70_s35 SELECT (- (DECIMAL '1.00000000000000000000000000000000000'));
 INSERT INTO ${case_db}.decimal_test_simple_p70_s35 SELECT 0.00000000000000000000000000000000000;
 
 -- Case 65: Mixed simple values with various decimal representations
-CREATE TABLE ${case_db}.decimal_test_simple_mixed_p60_s20 (d1 decimal(38,20))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_simple_mixed_p60_s20 (d1 decimal(38,20)) WITH (format_version = 3);
 INSERT INTO ${case_db}.decimal_test_simple_mixed_p60_s20 SELECT 1;
 INSERT INTO ${case_db}.decimal_test_simple_mixed_p60_s20 SELECT -1;
 INSERT INTO ${case_db}.decimal_test_simple_mixed_p60_s20 SELECT 0;
 INSERT INTO ${case_db}.decimal_test_simple_mixed_p60_s20 SELECT 1.0;
-INSERT INTO ${case_db}.decimal_test_simple_mixed_p60_s20 SELECT -1.0;
+INSERT INTO ${case_db}.decimal_test_simple_mixed_p60_s20 SELECT (- (DECIMAL '1.0'));
 INSERT INTO ${case_db}.decimal_test_simple_mixed_p60_s20 SELECT 0.0;
 INSERT INTO ${case_db}.decimal_test_simple_mixed_p60_s20 SELECT 1.00000000000000000000;
-INSERT INTO ${case_db}.decimal_test_simple_mixed_p60_s20 SELECT -1.00000000000000000000;
+INSERT INTO ${case_db}.decimal_test_simple_mixed_p60_s20 SELECT (- (DECIMAL '1.00000000000000000000'));
 INSERT INTO ${case_db}.decimal_test_simple_mixed_p60_s20 SELECT 0.00000000000000000000;
 INSERT INTO ${case_db}.decimal_test_simple_mixed_p60_s20 SELECT 1.10000000000000000000;
-INSERT INTO ${case_db}.decimal_test_simple_mixed_p60_s20 SELECT -1.10000000000000000000;
+INSERT INTO ${case_db}.decimal_test_simple_mixed_p60_s20 SELECT (- (DECIMAL '1.10000000000000000000'));
 INSERT INTO ${case_db}.decimal_test_simple_mixed_p60_s20 SELECT 0.10000000000000000000;
 
 -- Case 66: FE cast null boundary test - decimal(76, 76), integer part limit = 77-76 = 1 digit
-CREATE TABLE ${case_db}.decimal_test_p76_s76_fe_null (d1 decimal(38,38))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_p76_s76_fe_null (d1 decimal(38,38)) WITH (format_version = 3);
 -- Integer part has 2 digits > 1, should be cast to null by FE
 INSERT INTO ${case_db}.decimal_test_p76_s76_fe_null SELECT 0.12345678901234567890123456789012345678;
-INSERT INTO ${case_db}.decimal_test_p76_s76_fe_null SELECT -0.12345678901234567890123456789012345678;
+INSERT INTO ${case_db}.decimal_test_p76_s76_fe_null SELECT (- (DECIMAL '0.12345678901234567890123456789012345678'));
 -- Integer part has 1 digit = 1, be throw exception
 INSERT INTO ${case_db}.decimal_test_p76_s76_fe_null SELECT 0.12345678901234567890123456789012345678;
-INSERT INTO ${case_db}.decimal_test_p76_s76_fe_null SELECT -0.12345678901234567890123456789012345678;
+INSERT INTO ${case_db}.decimal_test_p76_s76_fe_null SELECT (- (DECIMAL '0.12345678901234567890123456789012345678'));
 -- Integer part has 0 digits (pure decimal), should work
 INSERT INTO ${case_db}.decimal_test_p76_s76_fe_null SELECT 0.12345678901234567890123456789012345678;
-INSERT INTO ${case_db}.decimal_test_p76_s76_fe_null SELECT -0.12345678901234567890123456789012345678;
+INSERT INTO ${case_db}.decimal_test_p76_s76_fe_null SELECT (- (DECIMAL '0.12345678901234567890123456789012345678'));
 
 -- Case 67: FE cast null test - decimal(50, 30), integer part limit = 77-30 = 47 digits
-CREATE TABLE ${case_db}.decimal_test_p50_s30_fe_null (d1 decimal(38,30))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_p50_s30_fe_null (d1 decimal(38,30)) WITH (format_version = 3);
 -- Integer part has 48 digits > 47, should be cast to null by FE
 INSERT INTO ${case_db}.decimal_test_p50_s30_fe_null SELECT 12345678.123456789012345678901234567890;
-INSERT INTO ${case_db}.decimal_test_p50_s30_fe_null SELECT -12345678.123456789012345678901234567890;
+INSERT INTO ${case_db}.decimal_test_p50_s30_fe_null SELECT (- (DECIMAL '12345678.123456789012345678901234567890'));
 -- be throw exception
-INSERT INTO ${case_db}.decimal_test_p50_s30_fe_null SELECT -12345678.123456789012345678901234567890;
+INSERT INTO ${case_db}.decimal_test_p50_s30_fe_null SELECT (- (DECIMAL '12345678.123456789012345678901234567890'));
 
 -- Case 68: FE cast null test - decimal(40, 35), integer part limit = 77-35 = 42 digits
-CREATE TABLE ${case_db}.decimal_test_p40_s35_fe_null (d1 decimal(38,35))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_p40_s35_fe_null (d1 decimal(38,35)) WITH (format_version = 3);
 -- Integer part has 43 digits > 42, should be cast to null by FE
 INSERT INTO ${case_db}.decimal_test_p40_s35_fe_null SELECT 123.12345678901234567890123456789012345;
-INSERT INTO ${case_db}.decimal_test_p40_s35_fe_null SELECT -123.12345678901234567890123456789012345;
+INSERT INTO ${case_db}.decimal_test_p40_s35_fe_null SELECT (- (DECIMAL '123.12345678901234567890123456789012345'));
 -- Integer part has 42 digits = 42, be throw exception
 INSERT INTO ${case_db}.decimal_test_p40_s35_fe_null SELECT 123.12345678901234567890123456789012345;
-INSERT INTO ${case_db}.decimal_test_p40_s35_fe_null SELECT -123.12345678901234567890123456789012345;
+INSERT INTO ${case_db}.decimal_test_p40_s35_fe_null SELECT (- (DECIMAL '123.12345678901234567890123456789012345'));
 
 -- Case 69: Edge case - decimal(76, 10), integer part limit = 77-10 = 67 digits
-CREATE TABLE ${case_db}.decimal_test_p76_s10_fe_null (d1 decimal(38,10))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_p76_s10_fe_null (d1 decimal(38,10)) WITH (format_version = 3);
 -- Integer part has 68 digits > 67, should be cast to null by FE
 INSERT INTO ${case_db}.decimal_test_p76_s10_fe_null SELECT 1234567890123456789012345678.1234567890;
-INSERT INTO ${case_db}.decimal_test_p76_s10_fe_null SELECT -1234567890123456789012345678.1234567890;
+INSERT INTO ${case_db}.decimal_test_p76_s10_fe_null SELECT (- (DECIMAL '1234567890123456789012345678.1234567890'));
 
 -- Case 70: Edge case - decimal(76, 5), integer part limit = 77-5 = 72 digits
-CREATE TABLE ${case_db}.decimal_test_p76_s5_fe_null (d1 decimal(38,5))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_p76_s5_fe_null (d1 decimal(38,5)) WITH (format_version = 3);
 -- Integer part has 73 digits > 72, should be cast to null by FE
 INSERT INTO ${case_db}.decimal_test_p76_s5_fe_null SELECT 123456789012345678901234567890123.12345;
-INSERT INTO ${case_db}.decimal_test_p76_s5_fe_null SELECT -123456789012345678901234567890123.12345;
+INSERT INTO ${case_db}.decimal_test_p76_s5_fe_null SELECT (- (DECIMAL '123456789012345678901234567890123.12345'));
 
 -- ============================================
 -- Part 16: Default Scale Behavior Tests (BE Exception Cases)
 -- ============================================
 
 -- Case 71: decimal(60, 58) - inserting integer will auto-pad 58 zeros, causing BE exception
-CREATE TABLE ${case_db}.decimal_test_p60_s58_default_scale (d1 decimal(38,38))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_p60_s58_default_scale (d1 decimal(38,38)) WITH (format_version = 3);
 -- Insert 555 -> becomes 555.0000....(58 zeros) = 3+58=61 digits > 60, should cause BE exception
 INSERT INTO ${case_db}.decimal_test_p60_s58_default_scale SELECT 555;
 INSERT INTO ${case_db}.decimal_test_p60_s58_default_scale SELECT -555;
@@ -629,8 +558,7 @@ INSERT INTO ${case_db}.decimal_test_p60_s58_default_scale SELECT -55;
 INSERT INTO ${case_db}.decimal_test_p60_s58_default_scale SELECT 5555;
 
 -- Case 72: decimal(50, 48) - inserting integer will auto-pad 48 zeros
-CREATE TABLE ${case_db}.decimal_test_p50_s48_default_scale (d1 decimal(38,38))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_p50_s48_default_scale (d1 decimal(38,38)) WITH (format_version = 3);
 -- Insert 123 -> becomes 123.000....(48 zeros) = 3+48=51 digits > 50, should cause BE exception
 INSERT INTO ${case_db}.decimal_test_p50_s48_default_scale SELECT 123;
 INSERT INTO ${case_db}.decimal_test_p50_s48_default_scale SELECT -123;
@@ -641,8 +569,7 @@ INSERT INTO ${case_db}.decimal_test_p50_s48_default_scale SELECT -12;
 INSERT INTO ${case_db}.decimal_test_p50_s48_default_scale SELECT 1234;
 
 -- Case 73: decimal(45, 43) - inserting integer will auto-pad 43 zeros
-CREATE TABLE ${case_db}.decimal_test_p45_s43_default_scale (d1 decimal(38,38))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_p45_s43_default_scale (d1 decimal(38,38)) WITH (format_version = 3);
 -- Insert 789 -> becomes 789.000....(43 zeros) = 3+43=46 digits > 45, should cause BE exception
 INSERT INTO ${case_db}.decimal_test_p45_s43_default_scale SELECT 789;
 INSERT INTO ${case_db}.decimal_test_p45_s43_default_scale SELECT -789;
@@ -653,8 +580,7 @@ INSERT INTO ${case_db}.decimal_test_p45_s43_default_scale SELECT -78;
 INSERT INTO ${case_db}.decimal_test_p45_s43_default_scale SELECT 7890;
 
 -- Case 74: decimal(40, 38) - inserting integer will auto-pad 38 zeros
-CREATE TABLE ${case_db}.decimal_test_p40_s38_default_scale (d1 decimal(38,38))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_p40_s38_default_scale (d1 decimal(38,38)) WITH (format_version = 3);
 -- Insert 999 -> becomes 999.000....(38 zeros) = 3+38=41 digits > 40, should cause BE exception
 INSERT INTO ${case_db}.decimal_test_p40_s38_default_scale SELECT 999;
 INSERT INTO ${case_db}.decimal_test_p40_s38_default_scale SELECT -999;
@@ -665,8 +591,7 @@ INSERT INTO ${case_db}.decimal_test_p40_s38_default_scale SELECT -99;
 INSERT INTO ${case_db}.decimal_test_p40_s38_default_scale SELECT 9999;
 
 -- Case 75: decimal(35, 33) - inserting integer will auto-pad 33 zeros
-CREATE TABLE ${case_db}.decimal_test_p35_s33_default_scale (d1 decimal(35, 33))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_p35_s33_default_scale (d1 decimal(35, 33)) WITH (format_version = 3);
 -- Insert 111 -> becomes 111.000....(33 zeros) = 3+33=36 digits > 35, should cause BE exception
 INSERT INTO ${case_db}.decimal_test_p35_s33_default_scale SELECT 111;
 INSERT INTO ${case_db}.decimal_test_p35_s33_default_scale SELECT -111;
@@ -677,8 +602,7 @@ INSERT INTO ${case_db}.decimal_test_p35_s33_default_scale SELECT -11;
 INSERT INTO ${case_db}.decimal_test_p35_s33_default_scale SELECT 1111;
 
 -- Case 76: decimal(76, 75) - maximum precision with high scale
-CREATE TABLE ${case_db}.decimal_test_p76_s75_default_scale (d1 decimal(38,38))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_p76_s75_default_scale (d1 decimal(38,38)) WITH (format_version = 3);
 -- Insert 12 -> becomes 12.000....(75 zeros) = 2+75=77 digits > 76, should cause BE exception
 INSERT INTO ${case_db}.decimal_test_p76_s75_default_scale SELECT 12;
 INSERT INTO ${case_db}.decimal_test_p76_s75_default_scale SELECT -12;
@@ -689,8 +613,7 @@ INSERT INTO ${case_db}.decimal_test_p76_s75_default_scale SELECT -1;
 INSERT INTO ${case_db}.decimal_test_p76_s75_default_scale SELECT 123;
 
 -- Case 77: decimal(70, 68) - inserting integer will auto-pad 68 zeros
-CREATE TABLE ${case_db}.decimal_test_p70_s68_default_scale (d1 decimal(38,38))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_p70_s68_default_scale (d1 decimal(38,38)) WITH (format_version = 3);
 -- Insert 333 -> becomes 333.000....(68 zeros) = 3+68=71 digits > 70, should cause BE exception
 INSERT INTO ${case_db}.decimal_test_p70_s68_default_scale SELECT 333;
 INSERT INTO ${case_db}.decimal_test_p70_s68_default_scale SELECT -333;
@@ -701,8 +624,7 @@ INSERT INTO ${case_db}.decimal_test_p70_s68_default_scale SELECT -33;
 INSERT INTO ${case_db}.decimal_test_p70_s68_default_scale SELECT 3333;
 
 -- Case 78: decimal(55, 53) - inserting integer will auto-pad 53 zeros
-CREATE TABLE ${case_db}.decimal_test_p55_s53_default_scale (d1 decimal(38,38))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_p55_s53_default_scale (d1 decimal(38,38)) WITH (format_version = 3);
 -- Insert 777 -> becomes 777.000....(53 zeros) = 3+53=56 digits > 55, should cause BE exception
 INSERT INTO ${case_db}.decimal_test_p55_s53_default_scale SELECT 777;
 INSERT INTO ${case_db}.decimal_test_p55_s53_default_scale SELECT -777;
@@ -717,13 +639,11 @@ INSERT INTO ${case_db}.decimal_test_p55_s53_default_scale SELECT 7777;
 -- ============================================
 
 -- Case 79: decimal(76, 76) - all decimal places, inserting 0
-CREATE TABLE ${case_db}.decimal_test_p76_s76_zero_default (d1 decimal(38,38))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_p76_s76_zero_default (d1 decimal(38,38)) WITH (format_version = 3);
 INSERT INTO ${case_db}.decimal_test_p76_s76_zero_default SELECT 0;
 
 -- Case 80: decimal(65, 64) - inserting single digits
-CREATE TABLE ${case_db}.decimal_test_p65_s64_single_digit (d1 decimal(38,38))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_p65_s64_single_digit (d1 decimal(38,38)) WITH (format_version = 3);
 -- Insert 2 -> becomes 2.000....(64 zeros) = 1+64=65 digits = 65, should work
 INSERT INTO ${case_db}.decimal_test_p65_s64_single_digit SELECT 2;
 INSERT INTO ${case_db}.decimal_test_p65_s64_single_digit SELECT -2;
@@ -732,8 +652,7 @@ INSERT INTO ${case_db}.decimal_test_p65_s64_single_digit SELECT 22;
 INSERT INTO ${case_db}.decimal_test_p65_s64_single_digit SELECT -22;
 
 -- Case 81: decimal(42, 40) - boundary test with default scale
-CREATE TABLE ${case_db}.decimal_test_p42_s40_boundary_default (d1 decimal(38,38))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_p42_s40_boundary_default (d1 decimal(38,38)) WITH (format_version = 3);
 -- Insert 123 -> becomes 123.000....(40 zeros) = 3+40=43 digits > 42, should cause BE exception
 INSERT INTO ${case_db}.decimal_test_p42_s40_boundary_default SELECT 123;
 INSERT INTO ${case_db}.decimal_test_p42_s40_boundary_default SELECT -123;
@@ -748,36 +667,33 @@ INSERT INTO ${case_db}.decimal_test_p42_s40_boundary_default SELECT 1234;
 -- ============================================
 
 -- Case 82: decimal(50, 10) - Decimal part exceeds scale, requires rounding
-CREATE TABLE ${case_db}.decimal_test_p50_s10_rounding (d1 decimal(38,10))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_p50_s10_rounding (d1 decimal(38,10)) WITH (format_version = 3);
 -- Integer part: 40 digits < 50-10=40 digit limit, Decimal part: 15 digits > 10 digits, requires rounding
 INSERT INTO ${case_db}.decimal_test_p50_s10_rounding SELECT 12345678901234567890123.123456789012345;
-INSERT INTO ${case_db}.decimal_test_p50_s10_rounding SELECT -12345678901234567890123.123456789012345;
+INSERT INTO ${case_db}.decimal_test_p50_s10_rounding SELECT (- (DECIMAL '12345678901234567890123.123456789012345'));
 -- Test rounding up: 11th decimal digit is 6, should round up
 INSERT INTO ${case_db}.decimal_test_p50_s10_rounding SELECT 123.12345678906789;
-INSERT INTO ${case_db}.decimal_test_p50_s10_rounding SELECT -123.12345678906789;
+INSERT INTO ${case_db}.decimal_test_p50_s10_rounding SELECT (- (DECIMAL '123.12345678906789'));
 -- Test rounding down: 11th decimal digit is 4, should round down
 INSERT INTO ${case_db}.decimal_test_p50_s10_rounding SELECT 123.12345678904321;
-INSERT INTO ${case_db}.decimal_test_p50_s10_rounding SELECT -123.12345678904321;
+INSERT INTO ${case_db}.decimal_test_p50_s10_rounding SELECT (- (DECIMAL '123.12345678904321'));
 -- Test rounding up: 11th decimal digit is 5, should round up
 INSERT INTO ${case_db}.decimal_test_p50_s10_rounding SELECT 123.12345678905000;
-INSERT INTO ${case_db}.decimal_test_p50_s10_rounding SELECT -123.12345678905000;
+INSERT INTO ${case_db}.decimal_test_p50_s10_rounding SELECT (- (DECIMAL '123.12345678905000'));
 
 -- Case 83: decimal(50, 10) - Integer part exceeds precision limit
-CREATE TABLE ${case_db}.decimal_test_p50_s10_overflow (d1 decimal(38,10))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_p50_s10_overflow (d1 decimal(38,10)) WITH (format_version = 3);
 -- Integer part: 41 digits > 50-10=40 digit limit, Decimal part: 5 digits < 10 digits, should cause BE error
 INSERT INTO ${case_db}.decimal_test_p50_s10_overflow SELECT 123456789012345678901234567890123.12345;
-INSERT INTO ${case_db}.decimal_test_p50_s10_overflow SELECT -123456789012345678901234567890123.12345;
+INSERT INTO ${case_db}.decimal_test_p50_s10_overflow SELECT (- (DECIMAL '123456789012345678901234567890123.12345'));
 -- Total digits exceed 50 digits case
 INSERT INTO ${case_db}.decimal_test_p50_s10_overflow SELECT 123456789012345678901234567890123.12345;
 
 -- Case 84: decimal(50, 10) - Both integer and decimal parts exceed limits
-CREATE TABLE ${case_db}.decimal_test_p50_s10_both_overflow (d1 decimal(38,10))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.decimal_test_p50_s10_both_overflow (d1 decimal(38,10)) WITH (format_version = 3);
 INSERT INTO ${case_db}.decimal_test_p50_s10_both_overflow SELECT 123456789012345678901234567.12345678954;
 INSERT INTO ${case_db}.decimal_test_p50_s10_both_overflow SELECT 123456789012345678901234567.12345678955;
-INSERT INTO ${case_db}.decimal_test_p50_s10_both_overflow SELECT -123456789012345678901234567.12345678955;
+INSERT INTO ${case_db}.decimal_test_p50_s10_both_overflow SELECT (- (DECIMAL '123456789012345678901234567.12345678955'));
 
 -- ============================================
 -- Part 19: Iceberg append-table read/write coverage with Decimal256
@@ -791,16 +707,15 @@ CREATE TABLE ${case_db}.decimal_append_test_p39_s0 (
     shop_id int NOT NULL,
     day_bucket DATE NOT NULL,
     value DECIMAL(38,0) NOT NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- Insert final append-table rows for deterministic read coverage
 INSERT INTO ${case_db}.decimal_append_test_p39_s0 VALUES
-('user001', 'asset001', '2024-01-01 10:00:00', 1, '2024-01-01', CAST('98765432109876543210987654321098765432' AS DECIMAL(38,0)));
+ROW('user001', 'asset001', '2024-01-01 10:00:00', 1, '2024-01-01', CAST('98765432109876543210987654321098765432' AS DECIMAL(38,0)));
 INSERT INTO ${case_db}.decimal_append_test_p39_s0 VALUES
-('user003', 'asset003', '2024-01-03 20:45:00', 3, '2024-01-03', CAST('99999999999999999999999999999999999999' AS DECIMAL(38,0)));
+ROW('user003', 'asset003', '2024-01-03 20:45:00', 3, '2024-01-03', CAST('99999999999999999999999999999999999999' AS DECIMAL(38,0)));
 INSERT INTO ${case_db}.decimal_append_test_p39_s0 VALUES
-('user002', 'asset002', '2024-01-02 15:30:00', 2, '2024-01-02', CAST('11111111111111111111111111111111111111' AS DECIMAL(38,0)));
+ROW('user002', 'asset002', '2024-01-02 15:30:00', 2, '2024-01-02', CAST('11111111111111111111111111111111111111' AS DECIMAL(38,0)));
 
 -- Case 86: Append table with decimal(50, 10) as value column and multiple id columns
 CREATE TABLE ${case_db}.decimal_append_test_p50_s10 (
@@ -810,24 +725,21 @@ CREATE TABLE ${case_db}.decimal_append_test_p50_s10 (
     decimal_value DECIMAL(38,10) NOT NULL,
     decimal_nullable DECIMAL(38,15),
     regular_value bigint
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- Insert deterministic append-table rows
+INSERT INTO ${case_db}.decimal_append_test_p50_s10 VALUES ROW(2, 'key002', 200, (- (DECIMAL '9876543210987654321098765432.9876543210')), (- (DECIMAL '98765432109876543210987.987654321098765')), 2000);
 INSERT INTO ${case_db}.decimal_append_test_p50_s10 VALUES
-(2, 'key002', 200, -9876543210987654321098765432.9876543210, -98765432109876543210987.987654321098765, 2000);
-INSERT INTO ${case_db}.decimal_append_test_p50_s10 VALUES
-(3, 'key003', 300, 5555555555555555555555555555.5555555555, 55555555555555555555555.555555555555555, 3000);
+ROW(3, 'key003', 300, 5555555555555555555555555555.5555555555, 55555555555555555555555.555555555555555, 3000);
 -- Test with NULL values
 INSERT INTO ${case_db}.decimal_append_test_p50_s10 VALUES
-(4, 'key004', 400, 1111111111111111111111111111.1111111111, NULL, NULL);
+ROW(4, 'key004', 400, 1111111111111111111111111111.1111111111, NULL, NULL);
 INSERT INTO ${case_db}.decimal_append_test_p50_s10 VALUES
-(1, 'key001', 100, 9999999999999999999999999999.9999999999, 99999999999999999999999.999999999999999, 9999);
+ROW(1, 'key001', 100, 9999999999999999999999999999.9999999999, 99999999999999999999999.999999999999999, 9999);
 -- Test boundary values
 INSERT INTO ${case_db}.decimal_append_test_p50_s10 VALUES
-(5, 'key005', 500, 0.0000000001, 0.000000000000001, 0);
-INSERT INTO ${case_db}.decimal_append_test_p50_s10 VALUES
-(6, 'key006', 600, -0.0000000001, -0.000000000000001, -1);
+ROW(5, 'key005', 500, 0.0000000001, 0.000000000000001, 0);
+INSERT INTO ${case_db}.decimal_append_test_p50_s10 VALUES ROW(6, 'key006', 600, (- (DECIMAL '0.0000000001')), (- (DECIMAL '0.000000000000001')), -1);
 
 -- query 2
 SELECT * FROM ${case_db}.decimal_test_p39_s5 ORDER BY d1;

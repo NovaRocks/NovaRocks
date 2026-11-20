@@ -30,27 +30,25 @@ CREATE TABLE ${case_db}.t_agg_sum_map_basic (
     m_int MAP<INT, INT>,
     m_str MAP<STRING, BIGINT>,
     m_double MAP<INT, DOUBLE>
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 CREATE TABLE ${case_db}.t_agg_sum_map_nullable (
     id INT,
     m_nullable MAP<INT, INT>
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t_agg_sum_map_basic VALUES
-    (1, map{1:10, 2:20, 3:30}, map{'a':100, 'b':200}, map{1:1.5, 2:2.5}),
-    (1, map{1:5, 2:15, 4:40}, map{'a':50, 'c':150}, map{1:0.5, 3:3.5}),
-    (2, map{2:25, 3:35, 5:50}, map{'b':250, 'c':350}, map{2:1.0, 3:2.0}),
-    (2, map{}, map{}, map{});
+    ROW(1, map(1,10, 2,20, 3,30), map('a',100, 'b',200), map(1,1.5, 2,2.5)),
+    ROW(1, map(1,5, 2,15, 4,40), map('a',50, 'c',150), map(1,0.5, 3,3.5)),
+    ROW(2, map(2,25, 3,35, 5,50), map('b',250, 'c',350), map(2,1.0, 3,2.0)),
+    ROW(2, map(), map(), map());
 
 INSERT INTO ${case_db}.t_agg_sum_map_nullable VALUES
-    (1, map{1:10, 2:20}),
-    (2, NULL),
-    (3, map{1:5, 3:30}),
-    (4, map{}),
-    (5, map{1:-5, 4:40});
+    ROW(1, map(1,10, 2,20)),
+    ROW(2, NULL),
+    ROW(3, map(1,5, 3,30)),
+    ROW(4, map()),
+    ROW(5, map(1,-5, 4,40));
 SELECT
     sum_map(m_int)[1] AS int_k1,
     sum_map(m_int)[2] AS int_k2,

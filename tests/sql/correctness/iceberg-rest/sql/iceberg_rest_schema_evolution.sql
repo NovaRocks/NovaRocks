@@ -22,7 +22,7 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE DATABASE iceberg_rest_${suite_uuid0}.iceberg_rest_se_db_${uuid0};
+CREATE SCHEMA iceberg_rest_${suite_uuid0}.iceberg_rest_se_db_${uuid0};
 
 -- query 2
 -- @skip_result_check=true
@@ -30,7 +30,7 @@ CREATE TABLE iceberg_rest_${suite_uuid0}.iceberg_rest_se_db_${uuid0}.t_se_${uuid
 
 -- query 3
 -- @skip_result_check=true
-INSERT INTO iceberg_rest_${suite_uuid0}.iceberg_rest_se_db_${uuid0}.t_se_${uuid0} VALUES (1, 10), (2, 20);
+INSERT INTO iceberg_rest_${suite_uuid0}.iceberg_rest_se_db_${uuid0}.t_se_${uuid0} VALUES ROW(1, 10), ROW(2, 20);
 
 -- query 4
 -- @skip_result_check=true
@@ -38,7 +38,7 @@ ALTER TABLE iceberg_rest_${suite_uuid0}.iceberg_rest_se_db_${uuid0}.t_se_${uuid0
 
 -- query 5
 -- @skip_result_check=true
-INSERT INTO iceberg_rest_${suite_uuid0}.iceberg_rest_se_db_${uuid0}.t_se_${uuid0} VALUES (3, 30, 'three');
+INSERT INTO iceberg_rest_${suite_uuid0}.iceberg_rest_se_db_${uuid0}.t_se_${uuid0} VALUES ROW(3, 30, 'three');
 
 -- query 6
 -- Old rows must read c as NULL; new row must read c='three'.
@@ -58,7 +58,7 @@ SELECT id, val, c
 
 -- query 9
 -- @skip_result_check=true
-ALTER TABLE iceberg_rest_${suite_uuid0}.iceberg_rest_se_db_${uuid0}.t_se_${uuid0} MODIFY COLUMN id BIGINT;
+ALTER TABLE iceberg_rest_${suite_uuid0}.iceberg_rest_se_db_${uuid0}.t_se_${uuid0} ALTER COLUMN id SET DATA TYPE BIGINT;
 
 -- query 10
 -- After widen INT→BIGINT, existing values must be readable.
@@ -82,4 +82,4 @@ DROP TABLE iceberg_rest_${suite_uuid0}.iceberg_rest_se_db_${uuid0}.t_se_${uuid0}
 
 -- query 14
 -- @skip_result_check=true
-DROP DATABASE iceberg_rest_${suite_uuid0}.iceberg_rest_se_db_${uuid0};
+DROP SCHEMA iceberg_rest_${suite_uuid0}.iceberg_rest_se_db_${uuid0};

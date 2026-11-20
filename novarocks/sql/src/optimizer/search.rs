@@ -761,9 +761,9 @@ mod tests {
     fn minus_int(expr: TypedExpr, value: i64) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::BinaryOp {
-                left: Box::new(expr),
+                left: novarocks_parser::ast::AstBox::new(expr),
                 op: BinOp::Sub,
-                right: Box::new(TypedExpr {
+                right: novarocks_parser::ast::AstBox::new(TypedExpr {
                     kind: ExprKind::Literal(LiteralValue::Int(value)),
                     value_type: novarocks_type_contract::FunctionValueType::new(
                         DataType::Int64,

@@ -18,19 +18,19 @@
 -- @order_sensitive=true
 -- Validate Iceberg complex-type readback and the frozen provider schema.
 -- query 1
-CREATE DATABASE iceberg_ddl_cat_${suite_uuid0}.iceberg_db_${uuid0};
+CREATE SCHEMA iceberg_ddl_cat_${suite_uuid0}.iceberg_db_${uuid0};
 CREATE TABLE iceberg_ddl_cat_${suite_uuid0}.iceberg_db_${uuid0}.ice_tbl_${uuid0} (
-  name ARRAY<STRUCT<
+  name ARRAY<ROW(
     user STRING,
     family STRING,
     given ARRAY<STRING>,
     prefix ARRAY<STRING>,
     suffix ARRAY<STRING>
-  >>
+  )>
 );
 INSERT INTO iceberg_ddl_cat_${suite_uuid0}.iceberg_db_${uuid0}.ice_tbl_${uuid0} VALUES
-([named_struct('user', 'official', 'family', 'Glover433', 'given', ['Kira861'], 'prefix', ['Ms.'], 'suffix', NULL)]);
-SELECT array_filter(x -> x.`user` = 'official', name)[1].family AS family_name
+ROW([named_struct('user', 'official', 'family', 'Glover433', 'given', ['Kira861'], 'prefix', ['Ms.'], 'suffix', NULL)]);
+SELECT array_filter(x -> x."user" = 'official', name)[1].family AS family_name
 FROM iceberg_ddl_cat_${suite_uuid0}.iceberg_db_${uuid0}.ice_tbl_${uuid0};
 
 -- query 2
@@ -45,8 +45,8 @@ FROM iceberg_ddl_cat_${suite_uuid0}.iceberg_db_${uuid0}.ice_tbl_${uuid0};
 -- @result_contains="given": List(Utf8
 -- @result_contains="prefix": List(Utf8
 -- @result_contains="suffix": List(Utf8
-EXPLAIN CONTRACT
-SELECT array_filter(x -> x.`user` = 'official', name)[1].family AS family_name
+EXPLAIN WITH SESSION explain_detail = 'CONTRACT'
+SELECT array_filter(x -> x."user" = 'official', name)[1].family AS family_name
 FROM iceberg_ddl_cat_${suite_uuid0}.iceberg_db_${uuid0}.ice_tbl_${uuid0};
-DROP TABLE iceberg_ddl_cat_${suite_uuid0}.iceberg_db_${uuid0}.ice_tbl_${uuid0} FORCE;
-DROP DATABASE iceberg_ddl_cat_${suite_uuid0}.iceberg_db_${uuid0};
+DROP TABLE iceberg_ddl_cat_${suite_uuid0}.iceberg_db_${uuid0}.ice_tbl_${uuid0} ;
+DROP SCHEMA iceberg_ddl_cat_${suite_uuid0}.iceberg_db_${uuid0};

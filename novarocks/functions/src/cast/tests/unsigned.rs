@@ -162,6 +162,7 @@ fn prepare(
         ),
         policy,
         allow,
+        None,
         &CompileControl::default(),
     )
     .unwrap()
@@ -413,6 +414,7 @@ fn all_seventy_two_unsigned_profiles_preserve_full_types_nullable_policy_and_exa
                         &ty(target.clone(), false),
                         policy,
                         allow,
+                        None,
                         &CompileControl::default(),
                     );
                     if nullable || can_null {
@@ -427,6 +429,7 @@ fn all_seventy_two_unsigned_profiles_preserve_full_types_nullable_policy_and_exa
                         &ty(target.clone(), true),
                         policy,
                         allow,
+                        None,
                         &CompileControl::default(),
                     )
                     .unwrap();
@@ -966,6 +969,7 @@ fn unsigned_cast_checks_class_full_constant_type_address_and_journal_before_null
                     target,
                     DecimalOverflowPolicy::OutputNull,
                     true,
+                    None,
                     &CompileControl::default()
                 ),
                 Err(CastPrepareError::Unsupported)
@@ -1004,6 +1008,7 @@ fn unsigned_cast_compile_three_causes_keep_actual_metadata_quantum_and_every_exa
             &target,
             DecimalOverflowPolicy::ReportError,
             true,
+            None,
             &baseline,
         );
         let trace = baseline.trace.lock().unwrap().clone();
@@ -1028,6 +1033,7 @@ fn unsigned_cast_compile_three_causes_keep_actual_metadata_quantum_and_every_exa
                     &target,
                     DecimalOverflowPolicy::ReportError,
                     true,
+                    None,
                     &control,
                 )
                 .unwrap_err();

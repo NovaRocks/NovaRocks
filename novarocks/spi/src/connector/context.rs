@@ -489,6 +489,7 @@ pub struct ConnectorRequestContext {
     request_scope: ConnectorRequestScope,
     execution_source: Option<ExecutionSource>,
     io_admission: Option<std::sync::Weak<dyn super::ConnectorIoAdmissionPort>>,
+    metadata_cpu: Option<Arc<dyn super::ProviderMetadataCpuPort>>,
     io_phase: Option<super::ConnectorIoPermit>,
     io_weak_phase: Option<super::ConnectorIoWeakPhase>,
     fresh_catalog_observation_required: bool,
@@ -545,7 +546,9 @@ pub struct ConnectorAttemptContext {
 }
 
 impl ConnectorAttemptContext {
-    pub fn from_admitted_request(request: ConnectorRequestContext) -> Self {
+    pub fn from_admitted_request(mut request: ConnectorRequestContext) -> Self {
+        // An FE metadata author is not an execution-attempt capability.
+        request.metadata_cpu = None;
         Self { request }
     }
 
@@ -584,6 +587,7 @@ impl ConnectorRequestContext {
             request_scope: ConnectorRequestScope::new(),
             execution_source: None,
             io_admission: None,
+            metadata_cpu: None,
             io_phase: None,
             io_weak_phase: None,
             fresh_catalog_observation_required: false,
@@ -598,6 +602,17 @@ impl ConnectorRequestContext {
     }
     pub fn io_admission(&self) -> Option<&std::sync::Weak<dyn super::ConnectorIoAdmissionPort>> {
         self.io_admission.as_ref()
+    }
+
+    /// Install the same FE action's authenticated metadata CPU author.
+    /// This capability never authorizes an execution attempt or a new Root.
+    pub fn with_metadata_cpu(mut self, port: Arc<dyn super::ProviderMetadataCpuPort>) -> Self {
+        self.metadata_cpu = Some(port);
+        self
+    }
+
+    pub fn metadata_cpu(&self) -> Option<&Arc<dyn super::ProviderMetadataCpuPort>> {
+        self.metadata_cpu.as_ref()
     }
 
     /// Continue the SAME already-admitted position in a nested serial request
@@ -680,6 +695,8 @@ impl ConnectorRequestContext {
         range_scope: ConnectorRangeScope,
         operations: ConnectorSourceOperations,
     ) -> Self {
+        // Attempt projection cannot carry the FE metadata CPU capability.
+        self.metadata_cpu = None;
         self.execution_source = Some(ExecutionSource {
             range_scope,
             operations,
@@ -1191,6 +1208,64 @@ mod tests {
         .expect("collection")
         .without_attempt_capabilities();
         assert!(ConnectorPlanningContext::try_from_request(projected).is_ok());
+    }
+
+    #[test]
+    fn metadata_cpu_is_an_explicit_same_action_capability_and_is_attenuated_for_attempts() {
+        use crate::connector::{
+            ConnectorAttemptContext, ProviderMetadataCpuInput, ProviderMetadataCpuPort,
+        };
+        use std::task::{Context, Poll};
+        struct NotInvoked;
+        impl ProviderMetadataCpuPort for NotInvoked {
+            fn submit_metadata_in(
+                &self,
+                _: &mut Option<ProviderMetadataCpuInput>,
+            ) -> Result<(), ConnectorError> {
+                panic!("context projection must not execute CPU");
+            }
+            fn poll_finished(&self, _: &mut Context<'_>) -> Poll<Result<(), ConnectorError>> {
+                panic!("context projection must not poll CPU");
+            }
+            fn poll_closed(&self, _: &mut Context<'_>) -> Poll<Result<(), ConnectorError>> {
+                panic!("context projection must not close CPU");
+            }
+            fn local_failure(&self) -> Option<Arc<dyn std::error::Error + Send + Sync>> {
+                None
+            }
+        }
+        let stop = ConnectorStopOwner::new();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let original = ConnectorRequestContext::try_new(
+            deadline,
+            stop.view(),
+            MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+            MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+        )
+        .unwrap();
+        assert!(original.metadata_cpu().is_none());
+        let cpu: Arc<dyn ProviderMetadataCpuPort> = Arc::new(NotInvoked);
+        let original = original.with_metadata_cpu(cpu.clone());
+        for projected in [
+            original.clone(),
+            original.clone().with_earlier_deadline(deadline),
+            original.clone().after_external_effect(),
+        ] {
+            assert!(Arc::ptr_eq(projected.metadata_cpu().unwrap(), &cpu));
+            assert_eq!(projected.deadline(), deadline);
+        }
+        let attempt = ConnectorAttemptContext::from_admitted_request(original.clone());
+        assert!(attempt.request().metadata_cpu().is_none());
+        let scoped = original.clone().with_execution_source(
+            ConnectorRangeScope::for_test(1, 2, 3, 4, 5, 6).unwrap(),
+            ConnectorSourceOperations::for_test(),
+        );
+        assert!(scoped.metadata_cpu().is_none());
+        stop.request_stop();
+        assert_eq!(
+            original.check_active().unwrap_err().kind(),
+            ConnectorErrorKind::Cancelled
+        );
     }
 }
 

@@ -55,7 +55,7 @@ mod diagnostic;
 mod selected_collections;
 mod selected_scalar;
 mod selected_scalar_read;
-pub use selected_collections::{SelectedInt32List, SelectedUtf8Map};
+pub use selected_collections::{SelectedInt32List, SelectedUtf8List, SelectedUtf8Map};
 
 use arrow_array::{Array, ArrayRef, make_array};
 use arrow_data::ArrayData;

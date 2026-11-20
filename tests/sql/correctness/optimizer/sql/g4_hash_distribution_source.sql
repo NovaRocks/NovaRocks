@@ -25,17 +25,17 @@ DROP TABLE IF EXISTS ${case_db}.lineitem;
 DROP TABLE IF EXISTS ${case_db}.orders;
 CREATE TABLE ${case_db}.lineitem (k INT, v INT);
 CREATE TABLE ${case_db}.orders (k INT, w INT);
-INSERT INTO ${case_db}.lineitem VALUES (1, 10), (2, 20);
-INSERT INTO ${case_db}.orders VALUES (1, 100), (2, 200);
-ANALYZE TABLE ${case_db}.lineitem;
-ANALYZE TABLE ${case_db}.orders;
+INSERT INTO ${case_db}.lineitem VALUES ROW(1, 10), ROW(2, 20);
+INSERT INTO ${case_db}.orders VALUES ROW(1, 100), ROW(2, 200);
+ANALYZE ${case_db}.lineitem;
+ANALYZE ${case_db}.orders;
 
-SET disable_optimizer_rules = 'JoinCommutativity';
+SET SESSION disable_optimizer_rules = 'JoinCommutativity';
 
-EXPLAIN VERBOSE
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
 SELECT l.k, l.v, r.w,
        ROW_NUMBER() OVER (PARTITION BY l.k ORDER BY l.v) AS rn
 FROM ${case_db}.lineitem l
 LEFT JOIN ${case_db}.orders r ON l.k = r.k;
 
-SET disable_optimizer_rules = '';
+SET SESSION disable_optimizer_rules = '';

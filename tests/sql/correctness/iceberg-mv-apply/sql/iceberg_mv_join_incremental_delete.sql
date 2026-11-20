@@ -24,53 +24,28 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE EXTERNAL CATALOG ice_mv_apply_${uuid0}
-PROPERTIES (
-  "type" = "iceberg",
-  "iceberg.catalog.type" = "rest",
-  "uri" = "${iceberg_rest_uri}",
-  "warehouse" = "${iceberg_rest_warehouse}",
-  "aws.s3.endpoint" = "${oss_endpoint}",
-  "credential.object-store-metadata.consumer-role" = "frontend",
-  "credential.object-store-metadata.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-metadata.name" = "${iceberg_object_store_metadata_credential_name}",
-  "credential.object-store-metadata.generation" = "${iceberg_object_store_credential_generation}",
-  "credential.object-store-data.consumer-role" = "backend",
-  "credential.object-store-data.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-data.name" = "${iceberg_object_store_data_credential_name}",
-  "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
-  "aws.s3.region" = "${oss_region}",
-  "aws.s3.enable_path_style_access" = "${oss_path_style}"
-);
-CREATE DATABASE ice_mv_apply_${uuid0}.ns_${uuid0};
+CREATE CATALOG ice_mv_apply_${uuid0} USING iceberg WITH ("iceberg.catalog.type" = 'rest', "uri" = '${iceberg_rest_uri}', "warehouse" = '${iceberg_rest_warehouse}', "aws.s3.endpoint" = '${oss_endpoint}', "credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-metadata.name" = '${iceberg_object_store_metadata_credential_name}', "credential.object-store-metadata.generation" = '${iceberg_object_store_credential_generation}', "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-data.name" = '${iceberg_object_store_data_credential_name}', "credential.object-store-data.generation" = '${iceberg_object_store_credential_generation}', "aws.s3.region" = '${oss_region}', "aws.s3.enable_path_style_access" = '${oss_path_style}');
+CREATE SCHEMA ice_mv_apply_${uuid0}.ns_${uuid0};
 CREATE TABLE ice_mv_apply_${uuid0}.ns_${uuid0}.fact_${uuid0} (
   id BIGINT NOT NULL,
   dim_id BIGINT,
   amount INT
-)
-TBLPROPERTIES ("format-version" = "3",
-  "write.row-lineage" = "true");
+) WITH (format_version = 3);
 CREATE TABLE ice_mv_apply_${uuid0}.ns_${uuid0}.dim_${uuid0} (
   id BIGINT NOT NULL,
   label STRING
-)
-TBLPROPERTIES ("format-version" = "3",
-  "write.row-lineage" = "true");
+) WITH (format_version = 3);
 USE ice_mv_apply_${uuid0}.ns_${uuid0};
 
 -- query 2
 -- @skip_result_check=true
 INSERT INTO ice_mv_apply_${uuid0}.ns_${uuid0}.dim_${uuid0} VALUES
-  (10, 'old-a'),
-  (20, 'old-b');
+  ROW(10, 'old-a'),
+  ROW(20, 'old-b');
 INSERT INTO ice_mv_apply_${uuid0}.ns_${uuid0}.fact_${uuid0} VALUES
-  (1, 10, 100),
-  (2, 20, 200);
-CREATE MATERIALIZED VIEW join_apply_mv_${uuid0}
-DISTRIBUTED BY HASH(id) BUCKETS 1
-PROPERTIES ('storage_engine' = 'iceberg')
-AS
-SELECT f.id, f.amount, d.label
+  ROW(1, 10, 100),
+  ROW(2, 20, 200);
+CREATE MATERIALIZED VIEW join_apply_mv_${uuid0} AS SELECT f.id, f.amount, d.label
 FROM fact_${uuid0} AS f
 JOIN dim_${uuid0} AS d ON f.dim_id = d.id
 WHERE f.amount >= 100;
@@ -88,9 +63,9 @@ UPDATE ice_mv_apply_${uuid0}.ns_${uuid0}.dim_${uuid0}
 SET label = 'new-b'
 WHERE id = 20;
 INSERT INTO ice_mv_apply_${uuid0}.ns_${uuid0}.dim_${uuid0} VALUES
-  (30, 'new-c');
+  ROW(30, 'new-c');
 INSERT INTO ice_mv_apply_${uuid0}.ns_${uuid0}.fact_${uuid0} VALUES
-  (3, 30, 300);
+  ROW(3, 30, 300);
 
 -- query 5
 -- @skip_result_check=true
@@ -156,7 +131,7 @@ ORDER BY id;
 -- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW join_apply_mv_${uuid0};
-DROP TABLE ice_mv_apply_${uuid0}.ns_${uuid0}.fact_${uuid0} FORCE;
-DROP TABLE ice_mv_apply_${uuid0}.ns_${uuid0}.dim_${uuid0} FORCE;
-DROP DATABASE ice_mv_apply_${uuid0}.ns_${uuid0};
+DROP TABLE ice_mv_apply_${uuid0}.ns_${uuid0}.fact_${uuid0} ;
+DROP TABLE ice_mv_apply_${uuid0}.ns_${uuid0}.dim_${uuid0} ;
+DROP SCHEMA ice_mv_apply_${uuid0}.ns_${uuid0};
 DROP CATALOG ice_mv_apply_${uuid0};

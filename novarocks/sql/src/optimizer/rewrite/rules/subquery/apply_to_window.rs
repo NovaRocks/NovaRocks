@@ -671,9 +671,9 @@ mod tests {
     fn eq_expr(left: TypedExpr, right: TypedExpr) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::BinaryOp {
-                left: Box::new(left),
+                left: novarocks_parser::ast::AstBox::new(left),
                 op: BinOp::Eq,
-                right: Box::new(right),
+                right: novarocks_parser::ast::AstBox::new(right),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
@@ -683,9 +683,9 @@ mod tests {
     fn lt_expr(left: TypedExpr, right: TypedExpr) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::BinaryOp {
-                left: Box::new(left),
+                left: novarocks_parser::ast::AstBox::new(left),
                 op: BinOp::Lt,
-                right: Box::new(right),
+                right: novarocks_parser::ast::AstBox::new(right),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
@@ -695,9 +695,9 @@ mod tests {
     fn and_expr(left: TypedExpr, right: TypedExpr) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::BinaryOp {
-                left: Box::new(left),
+                left: novarocks_parser::ast::AstBox::new(left),
                 op: BinOp::And,
-                right: Box::new(right),
+                right: novarocks_parser::ast::AstBox::new(right),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
@@ -707,9 +707,9 @@ mod tests {
     fn mul_expr(left: TypedExpr, right: TypedExpr) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::BinaryOp {
-                left: Box::new(left),
+                left: novarocks_parser::ast::AstBox::new(left),
                 op: BinOp::Mul,
-                right: Box::new(right),
+                right: novarocks_parser::ast::AstBox::new(right),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Float64, true),
@@ -1781,9 +1781,13 @@ mod tests {
         // Add a Filter below the aggregate input: l_quantity > 0
         let residual_pred = TypedExpr {
             kind: ExprKind::BinaryOp {
-                left: Box::new(col_ref(INNER_L_QUANTITY, "l_quantity", DataType::Float64)),
+                left: novarocks_parser::ast::AstBox::new(col_ref(
+                    INNER_L_QUANTITY,
+                    "l_quantity",
+                    DataType::Float64,
+                )),
                 op: BinOp::Gt,
-                right: Box::new(TypedExpr {
+                right: novarocks_parser::ast::AstBox::new(TypedExpr {
                     kind: ExprKind::Literal(LiteralValue::Int(0)),
                     value_type: novarocks_type_contract::FunctionValueType::new(
                         DataType::Float64,
@@ -1848,9 +1852,13 @@ mod tests {
         // Residual inside subquery: l_quantity < 999
         let inner_residual = TypedExpr {
             kind: ExprKind::BinaryOp {
-                left: Box::new(col_ref(INNER_L_QUANTITY, "l_quantity", DataType::Float64)),
+                left: novarocks_parser::ast::AstBox::new(col_ref(
+                    INNER_L_QUANTITY,
+                    "l_quantity",
+                    DataType::Float64,
+                )),
                 op: BinOp::Lt,
-                right: Box::new(TypedExpr {
+                right: novarocks_parser::ast::AstBox::new(TypedExpr {
                     kind: ExprKind::Literal(LiteralValue::Float(999.0)),
                     value_type: novarocks_type_contract::FunctionValueType::new(
                         DataType::Float64,
@@ -1941,9 +1949,13 @@ mod tests {
         // sub_residual = [inner l_quantity < 999].  Same count (1), but non-phys-eq → None.
         let outer_extra = TypedExpr {
             kind: ExprKind::BinaryOp {
-                left: Box::new(col_ref(L_ORDERKEY, "l_orderkey", DataType::Int64)),
+                left: novarocks_parser::ast::AstBox::new(col_ref(
+                    L_ORDERKEY,
+                    "l_orderkey",
+                    DataType::Int64,
+                )),
                 op: BinOp::Gt,
-                right: Box::new(TypedExpr {
+                right: novarocks_parser::ast::AstBox::new(TypedExpr {
                     kind: ExprKind::Literal(LiteralValue::Int(100)),
                     value_type: novarocks_type_contract::FunctionValueType::new(
                         DataType::Int64,
@@ -1988,9 +2000,13 @@ mod tests {
         // low  = APPLY_OUT - 1.0
         let low_expr = TypedExpr {
             kind: ExprKind::BinaryOp {
-                left: Box::new(col_ref_nullable(APPLY_OUT, "avg_subq", DataType::Float64)),
+                left: novarocks_parser::ast::AstBox::new(col_ref_nullable(
+                    APPLY_OUT,
+                    "avg_subq",
+                    DataType::Float64,
+                )),
                 op: BinOp::Sub,
-                right: Box::new(float_lit(1.0)),
+                right: novarocks_parser::ast::AstBox::new(float_lit(1.0)),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Float64, true),
@@ -1998,18 +2014,26 @@ mod tests {
         // high = APPLY_OUT + 1.0
         let high_expr = TypedExpr {
             kind: ExprKind::BinaryOp {
-                left: Box::new(col_ref_nullable(APPLY_OUT, "avg_subq", DataType::Float64)),
+                left: novarocks_parser::ast::AstBox::new(col_ref_nullable(
+                    APPLY_OUT,
+                    "avg_subq",
+                    DataType::Float64,
+                )),
                 op: BinOp::Add,
-                right: Box::new(float_lit(1.0)),
+                right: novarocks_parser::ast::AstBox::new(float_lit(1.0)),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Float64, true),
         };
         let between_conjunct = TypedExpr {
             kind: ExprKind::Between {
-                expr: Box::new(col_ref(L_QUANTITY, "l_quantity", DataType::Float64)),
-                low: Box::new(low_expr),
-                high: Box::new(high_expr),
+                expr: novarocks_parser::ast::AstBox::new(col_ref(
+                    L_QUANTITY,
+                    "l_quantity",
+                    DataType::Float64,
+                )),
+                low: novarocks_parser::ast::AstBox::new(low_expr),
+                high: novarocks_parser::ast::AstBox::new(high_expr),
                 negated: false,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),

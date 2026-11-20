@@ -31,47 +31,25 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE EXTERNAL CATALOG mv_agg2_${uuid0}
-PROPERTIES (
-  "type" = "iceberg",
-  "iceberg.catalog.type" = "rest",
-  "uri" = "${iceberg_rest_uri}",
-  "warehouse" = "${iceberg_rest_warehouse}",
-  "aws.s3.endpoint" = "${oss_endpoint}",
-  "credential.object-store-metadata.consumer-role" = "frontend",
-  "credential.object-store-metadata.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-metadata.name" = "${iceberg_object_store_metadata_credential_name}",
-  "credential.object-store-metadata.generation" = "${iceberg_object_store_credential_generation}",
-  "credential.object-store-data.consumer-role" = "backend",
-  "credential.object-store-data.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-data.name" = "${iceberg_object_store_data_credential_name}",
-  "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
-  "aws.s3.region" = "${oss_region}",
-  "aws.s3.enable_path_style_access" = "${oss_path_style}"
-);
-CREATE DATABASE mv_agg2_${uuid0}.ns_${uuid0};
+CREATE CATALOG mv_agg2_${uuid0} USING iceberg WITH ("iceberg.catalog.type" = 'rest', "uri" = '${iceberg_rest_uri}', "warehouse" = '${iceberg_rest_warehouse}', "aws.s3.endpoint" = '${oss_endpoint}', "credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-metadata.name" = '${iceberg_object_store_metadata_credential_name}', "credential.object-store-metadata.generation" = '${iceberg_object_store_credential_generation}', "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-data.name" = '${iceberg_object_store_data_credential_name}', "credential.object-store-data.generation" = '${iceberg_object_store_credential_generation}', "aws.s3.region" = '${oss_region}', "aws.s3.enable_path_style_access" = '${oss_path_style}');
+CREATE SCHEMA mv_agg2_${uuid0}.ns_${uuid0};
 CREATE TABLE mv_agg2_${uuid0}.ns_${uuid0}.measurements (
   k INT,
   v BIGINT,
   d DECIMAL(20, 4),
   s STRING,
   ts DATETIME
-)
-TBLPROPERTIES ("format-version" = "3",
-  "write.row-lineage" = "true");
+) WITH (format_version = 3);
 INSERT INTO mv_agg2_${uuid0}.ns_${uuid0}.measurements VALUES
-  (1, 10,   100.5000, 'apple',  '2024-01-01 00:00:00'),
-  (1, 20,   200.0000, 'banana', '2024-02-01 00:00:00'),
-  (1, NULL, NULL,     NULL,     NULL),
-  (2, 5,    50.2500,  'cherry', '2024-03-15 12:00:00');
+  ROW(1, 10,   100.5000, 'apple',  '2024-01-01 00:00:00'),
+  ROW(1, 20,   200.0000, 'banana', '2024-02-01 00:00:00'),
+  ROW(1, NULL, NULL,     NULL,     NULL),
+  ROW(2, 5,    50.2500,  'cherry', '2024-03-15 12:00:00');
 USE mv_agg2_${uuid0}.ns_${uuid0};
 
 -- query 2
 -- @skip_result_check=true
-CREATE MATERIALIZED VIEW measurements_mv
-DISTRIBUTED BY HASH(k) BUCKETS 2
-PROPERTIES ('storage_engine' = 'iceberg')
-AS SELECT
+CREATE MATERIALIZED VIEW measurements_mv AS SELECT
   k,
   COUNT(*)  AS c_all,
   SUM(v)    AS s_v,
@@ -98,8 +76,8 @@ ORDER BY k;
 -- query 5
 -- @skip_result_check=true
 INSERT INTO mv_agg2_${uuid0}.ns_${uuid0}.measurements VALUES
-  (1, 30,   300.7500, 'date', '2024-06-01 09:00:00'),
-  (3, 7,    70.0000,  'fig',  '2024-07-01 18:30:00');
+  ROW(1, 30,   300.7500, 'date', '2024-06-01 09:00:00'),
+  ROW(3, 7,    70.0000,  'fig',  '2024-07-01 18:30:00');
 
 -- query 6
 -- @skip_result_check=true
@@ -112,31 +90,22 @@ FROM measurements_mv
 ORDER BY k;
 
 -- query 8
--- @expect_error=Iceberg IMV refresh contract requires exactly one argument for aggregate function `avg`
-CREATE MATERIALIZED VIEW bad_avg_star
-DISTRIBUTED BY HASH(k) BUCKETS 2
-PROPERTIES ('storage_engine' = 'iceberg')
-AS SELECT k, AVG(*) AS invalid_avg FROM measurements GROUP BY k;
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR
+CREATE MATERIALIZED VIEW bad_avg_star AS SELECT k, AVG(*) AS invalid_avg FROM measurements GROUP BY k;
 
 -- query 9
 -- This expression has no declared name; name validation precedes aggregate admission.
 -- @expect_trino_error=MISSING_COLUMN_NAME,USER_ERROR
-CREATE MATERIALIZED VIEW bad_avg_string
-DISTRIBUTED BY HASH(k) BUCKETS 2
-PROPERTIES ('storage_engine' = 'iceberg')
-AS SELECT k, AVG(s) FROM measurements GROUP BY k;
+CREATE MATERIALIZED VIEW bad_avg_string AS SELECT k, AVG(s) FROM measurements GROUP BY k;
 
 -- query 10
--- @expect_error=Iceberg IMV refresh contract requires exactly one argument for aggregate function `min`
-CREATE MATERIALIZED VIEW bad_min_star
-DISTRIBUTED BY HASH(k) BUCKETS 2
-PROPERTIES ('storage_engine' = 'iceberg')
-AS SELECT k, MIN(*) AS invalid_min FROM measurements GROUP BY k;
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR
+CREATE MATERIALIZED VIEW bad_min_star AS SELECT k, MIN(*) AS invalid_min FROM measurements GROUP BY k;
 
 -- query 11
 -- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW measurements_mv;
-DROP TABLE mv_agg2_${uuid0}.ns_${uuid0}.measurements FORCE;
-DROP DATABASE mv_agg2_${uuid0}.ns_${uuid0};
+DROP TABLE mv_agg2_${uuid0}.ns_${uuid0}.measurements ;
+DROP SCHEMA mv_agg2_${uuid0}.ns_${uuid0};
 DROP CATALOG mv_agg2_${uuid0};

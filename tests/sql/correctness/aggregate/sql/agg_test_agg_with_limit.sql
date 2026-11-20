@@ -31,8 +31,7 @@ create table t0 (
     c1 STRING NOT NULL,
     c2 int,
     c3 int NOT NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 3
 -- @skip_result_check=true
@@ -57,8 +56,7 @@ create table t1 (
     c1 STRING,
     c2 int,
     c3 int
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 7
 -- @skip_result_check=true
@@ -68,8 +66,7 @@ create table t2 (
     c1 int,
     c2 string,
     c3 int
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 8
 -- @skip_result_check=true
@@ -79,8 +76,7 @@ create table t3 (
     c1 int NOT NULL,
     c2 string,
     c3 int
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 9
 -- @skip_result_check=true
@@ -99,67 +95,67 @@ insert into t3 select * from t0;
 
 -- query 12
 USE ${case_db};
-with cte0 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 limit 10), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count(*) from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3 <=> r.sc3 and l.c0 <=> r.c0) t ;
+with cte0 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 limit 10), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count(*) from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3  IS NOT DISTINCT FROM  r.sc3 and l.c0  IS NOT DISTINCT FROM  r.c0) t ;
 
 -- query 13
 USE ${case_db};
-with cte0 as (select avg(c3), sum(c3) sc3, c0 from t1 group by c0 limit 10), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count(*) from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3 <=> r.sc3 and l.c0 <=> r.c0) t ;
+with cte0 as (select avg(c3), sum(c3) sc3, c0 from t1 group by c0 limit 10), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count(*) from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3  IS NOT DISTINCT FROM  r.sc3 and l.c0  IS NOT DISTINCT FROM  r.c0) t ;
 
 -- query 14
 USE ${case_db};
-with cte0 as (select avg(c3), sum(c3) sc3, c0 from t2 group by c0 limit 10), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count(*) from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3 <=> r.sc3 and l.c0 <=> r.c0) t ;
+with cte0 as (select avg(c3), sum(c3) sc3, c0 from t2 group by c0 limit 10), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count(*) from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3  IS NOT DISTINCT FROM  r.sc3 and l.c0  IS NOT DISTINCT FROM  r.c0) t ;
 
 -- query 15
 USE ${case_db};
-with cte0 as (select avg(c3), sum(c3) sc3, c0 from t3 group by c0 limit 10), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count(*) from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3 <=> r.sc3 and l.c0 <=> r.c0) t ;
+with cte0 as (select avg(c3), sum(c3) sc3, c0 from t3 group by c0 limit 10), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count(*) from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3  IS NOT DISTINCT FROM  r.sc3 and l.c0  IS NOT DISTINCT FROM  r.c0) t ;
 
 -- query 16
 USE ${case_db};
-with cte0 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 limit 10000), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count(*) from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3 <=> r.sc3 and l.c0 <=> r.c0) t ;
+with cte0 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 limit 10000), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count(*) from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3  IS NOT DISTINCT FROM  r.sc3 and l.c0  IS NOT DISTINCT FROM  r.c0) t ;
 
 -- query 17
 USE ${case_db};
-with cte0 as (select avg(c3), sum(c3) sc3, c0 from t1 group by c0 limit 10000), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count(*) from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3 <=> r.sc3 and l.c0 <=> r.c0) t ;
+with cte0 as (select avg(c3), sum(c3) sc3, c0 from t1 group by c0 limit 10000), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count(*) from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3  IS NOT DISTINCT FROM  r.sc3 and l.c0  IS NOT DISTINCT FROM  r.c0) t ;
 
 -- query 18
 USE ${case_db};
-with cte0 as (select avg(c3), sum(c3) sc3, c0 from t2 group by c0 limit 10000), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count(*) from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3 <=> r.sc3 and l.c0 <=> r.c0) t ;
+with cte0 as (select avg(c3), sum(c3) sc3, c0 from t2 group by c0 limit 10000), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count(*) from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3  IS NOT DISTINCT FROM  r.sc3 and l.c0  IS NOT DISTINCT FROM  r.c0) t ;
 
 -- query 19
 USE ${case_db};
-with cte0 as (select avg(c3), sum(c3) sc3, c0 from t3 group by c0 limit 10000), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count(*) from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3 <=> r.sc3 and l.c0 <=> r.c0) t ;
+with cte0 as (select avg(c3), sum(c3) sc3, c0 from t3 group by c0 limit 10000), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count(*) from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3  IS NOT DISTINCT FROM  r.sc3 and l.c0  IS NOT DISTINCT FROM  r.c0) t ;
 
 -- query 20
 USE ${case_db};
-with cte0 as (select avg(c3), sum(c3) sc3, c1 from t0 group by c1 limit 10), cte1 as (select avg(c3), sum(c3) sc3, c1 from t0 group by c1 ) select count(*) from (select l.sc3, l.c1 from cte0 l join cte1 r on l.sc3 <=> r.sc3 and l.c1 <=> r.c1) t ;
+with cte0 as (select avg(c3), sum(c3) sc3, c1 from t0 group by c1 limit 10), cte1 as (select avg(c3), sum(c3) sc3, c1 from t0 group by c1 ) select count(*) from (select l.sc3, l.c1 from cte0 l join cte1 r on l.sc3  IS NOT DISTINCT FROM  r.sc3 and l.c1  IS NOT DISTINCT FROM  r.c1) t ;
 
 -- query 21
 USE ${case_db};
-with cte0 as (select avg(c3), sum(c3) sc3, c1 from t1 group by c1 limit 10), cte1 as (select avg(c3), sum(c3) sc3, c1 from t0 group by c1 ) select count(*) from (select l.sc3, l.c1 from cte0 l join cte1 r on l.sc3 <=> r.sc3 and l.c1 <=> r.c1) t ;
+with cte0 as (select avg(c3), sum(c3) sc3, c1 from t1 group by c1 limit 10), cte1 as (select avg(c3), sum(c3) sc3, c1 from t0 group by c1 ) select count(*) from (select l.sc3, l.c1 from cte0 l join cte1 r on l.sc3  IS NOT DISTINCT FROM  r.sc3 and l.c1  IS NOT DISTINCT FROM  r.c1) t ;
 
 -- query 22
 USE ${case_db};
-with cte0 as (select avg(c3), sum(c3) sc3, c1 from t2 group by c1 limit 10), cte1 as (select avg(c3), sum(c3) sc3, c1 from t0 group by c1 ) select count(*) from (select l.sc3, l.c1 from cte0 l join cte1 r on l.sc3 <=> r.sc3 and l.c1 <=> r.c1) t ;
+with cte0 as (select avg(c3), sum(c3) sc3, c1 from t2 group by c1 limit 10), cte1 as (select avg(c3), sum(c3) sc3, c1 from t0 group by c1 ) select count(*) from (select l.sc3, l.c1 from cte0 l join cte1 r on l.sc3  IS NOT DISTINCT FROM  r.sc3 and l.c1  IS NOT DISTINCT FROM  r.c1) t ;
 
 -- query 23
 USE ${case_db};
-with cte0 as (select avg(c3), sum(c3) sc3, c1 from t3 group by c1 limit 10), cte1 as (select avg(c3), sum(c3) sc3, c1 from t0 group by c1 ) select count(*) from (select l.sc3, l.c1 from cte0 l join cte1 r on l.sc3 <=> r.sc3 and l.c1 <=> r.c1) t ;
+with cte0 as (select avg(c3), sum(c3) sc3, c1 from t3 group by c1 limit 10), cte1 as (select avg(c3), sum(c3) sc3, c1 from t0 group by c1 ) select count(*) from (select l.sc3, l.c1 from cte0 l join cte1 r on l.sc3  IS NOT DISTINCT FROM  r.sc3 and l.c1  IS NOT DISTINCT FROM  r.c1) t ;
 
 -- query 24
 USE ${case_db};
-with cte0 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 limit 10000), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count(*) from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3 <=> r.sc3 and l.c0 <=> r.c0) t ;
+with cte0 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 limit 10000), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count(*) from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3  IS NOT DISTINCT FROM  r.sc3 and l.c0  IS NOT DISTINCT FROM  r.c0) t ;
 
 -- query 25
 USE ${case_db};
-with cte0 as (select avg(c3), sum(c3) sc3, c0 from t1 group by c0 limit 10000), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count(*) from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3 <=> r.sc3 and l.c0 <=> r.c0) t ;
+with cte0 as (select avg(c3), sum(c3) sc3, c0 from t1 group by c0 limit 10000), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count(*) from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3  IS NOT DISTINCT FROM  r.sc3 and l.c0  IS NOT DISTINCT FROM  r.c0) t ;
 
 -- query 26
 USE ${case_db};
-with cte0 as (select avg(c3), sum(c3) sc3, c0 from t2 group by c0 limit 10000), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count(*) from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3 <=> r.sc3 and l.c0 <=> r.c0) t ;
+with cte0 as (select avg(c3), sum(c3) sc3, c0 from t2 group by c0 limit 10000), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count(*) from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3  IS NOT DISTINCT FROM  r.sc3 and l.c0  IS NOT DISTINCT FROM  r.c0) t ;
 
 -- query 27
 USE ${case_db};
-with cte0 as (select avg(c3), sum(c3) sc3, c0 from t3 group by c0 limit 10000), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count(*) from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3 <=> r.sc3 and l.c0 <=> r.c0) t ;
+with cte0 as (select avg(c3), sum(c3) sc3, c0 from t3 group by c0 limit 10000), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count(*) from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3  IS NOT DISTINCT FROM  r.sc3 and l.c0  IS NOT DISTINCT FROM  r.c0) t ;
 
 -- query 28
 -- @skip_result_check=true
@@ -167,19 +163,19 @@ USE ${case_db};
 
 -- query 29
 USE ${case_db};
-with cte0 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 limit 10000), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count(*) from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3 <=> r.sc3 and l.c0 <=> r.c0) t ;
+with cte0 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 limit 10000), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count(*) from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3  IS NOT DISTINCT FROM  r.sc3 and l.c0  IS NOT DISTINCT FROM  r.c0) t ;
 
 -- query 30
 USE ${case_db};
-with cte0 as (select avg(c3), sum(c3) sc3, c0 from t1 group by c0 limit 10000), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count(*) from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3 <=> r.sc3 and l.c0 <=> r.c0) t ;
+with cte0 as (select avg(c3), sum(c3) sc3, c0 from t1 group by c0 limit 10000), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count(*) from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3  IS NOT DISTINCT FROM  r.sc3 and l.c0  IS NOT DISTINCT FROM  r.c0) t ;
 
 -- query 31
 USE ${case_db};
-with cte0 as (select avg(c3), sum(c3) sc3, c0 from t2 group by c0 limit 10000), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count(*) from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3 <=> r.sc3 and l.c0 <=> r.c0) t ;
+with cte0 as (select avg(c3), sum(c3) sc3, c0 from t2 group by c0 limit 10000), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count(*) from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3  IS NOT DISTINCT FROM  r.sc3 and l.c0  IS NOT DISTINCT FROM  r.c0) t ;
 
 -- query 32
 USE ${case_db};
-with cte0 as (select avg(c3), sum(c3) sc3, c0 from t3 group by c0 limit 10000), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count(*) from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3 <=> r.sc3 and l.c0 <=> r.c0) t ;
+with cte0 as (select avg(c3), sum(c3) sc3, c0 from t3 group by c0 limit 10000), cte1 as (select avg(c3), sum(c3) sc3, c0 from t0 group by c0 ) select count(*) from (select l.sc3, l.c0 from cte0 l join cte1 r on l.sc3  IS NOT DISTINCT FROM  r.sc3 and l.c0  IS NOT DISTINCT FROM  r.c0) t ;
 
 -- query 33
 -- @skip_result_check=true
@@ -189,8 +185,7 @@ create table t4 (
     c1 int,
     c2 string,
     c3 int
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 34
 -- @skip_result_check=true
@@ -210,8 +205,7 @@ create table t5 (
     c1 int,
     c2 string,
     c3 int
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 37
 -- @skip_result_check=true
@@ -258,8 +252,7 @@ create table t6 (
     c1 float,
     c2 string,
     c3 int
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 47
 -- @skip_result_check=true
@@ -286,8 +279,7 @@ create table tempty (
     c1 float,
     c2 string,
     c3 int
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 52
 USE ${case_db};
@@ -308,8 +300,7 @@ create table tarray (
     c0 int,
     c1 array<int>,
     c3 int
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 56
 -- @skip_result_check=true

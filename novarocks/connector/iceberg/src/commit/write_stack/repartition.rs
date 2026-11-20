@@ -25,15 +25,23 @@
 //! snapshot updates, plus the prospective metadata every writer and every
 //! staged artifact is then interpreted against.
 //!
-//! Nothing here carries a write-operation identity. The replacement is bound to
-//! the session that prepares it by the expected-prior-default observation
-//! check, which is an optimistic-concurrency fence against the live table.
+//! The prior partition observation is checked against the original table. When
+//! ordinary storage changes accompany the transition, the same provider
+//! preparation also freezes the storage projection used by the writers.
 
 use novarocks_spi::connector::{
     ConnectorCommittedPartitionField, ConnectorCommittedPartitioning, ConnectorError,
     ConnectorErrorKind, ConnectorManagedPartitionField, ConnectorManagedPartitionSpecObservation,
     ConnectorManagedPartitionSpecReplacement, ConnectorManagedPartitionTransform,
+    ConnectorOperationControl, ConnectorRequestContext,
 };
+
+use sha2::{Digest, Sha256};
+
+use crate::catalog::admission::{CatalogAdmissionRequest, CatalogOperation, connector_unsupported};
+use crate::commit::staging::PreparedChange;
+use crate::iceberg::TableUpdate;
+use crate::iceberg::spec::TableMetadata;
 
 use crate::commit::write_stack::domain::{corrupt, invalid};
 
@@ -44,7 +52,9 @@ pub(crate) struct IcebergPreparedRepartition {
     metadata_updates: Vec<crate::iceberg::TableUpdate>,
     prospective_metadata: crate::iceberg::spec::TableMetadata,
     metadata_requirements: Vec<crate::iceberg::TableRequirement>,
-    committed: novarocks_spi::connector::ConnectorCommittedPartitioning,
+    committed: ConnectorCommittedPartitioning,
+    storage_update_count: Option<usize>,
+    storage_projection_digest: Option<[u8; 32]>,
 }
 
 impl IcebergPreparedRepartition {
@@ -65,6 +75,15 @@ impl IcebergPreparedRepartition {
         }
     }
 
+    pub(crate) fn storage_updates(&self) -> Option<&[TableUpdate]> {
+        self.storage_update_count
+            .map(|count| &self.metadata_updates[..count])
+    }
+
+    pub(crate) const fn storage_projection_digest(&self) -> Option<[u8; 32]> {
+        self.storage_projection_digest
+    }
+
     pub(crate) fn prospective_metadata(&self) -> &crate::iceberg::spec::TableMetadata {
         &self.prospective_metadata
     }
@@ -74,19 +93,28 @@ impl IcebergPreparedRepartition {
     }
 }
 
-/// Prepare the atomic partition transition.
-///
-/// This is the read-only preview: it answers "which physical partitioning would
-/// this replacement establish"; its `metadata_updates` are `[AddSpec, SetDefaultSpec]`.
-pub(crate) fn preview_managed_repartition(
-    metadata: &crate::iceberg::spec::TableMetadata,
+pub(crate) fn admit_storage_alter(
+    catalog: &dyn crate::catalog::NovaRocksCatalog,
+    namespace: &str,
+    table: &str,
+    context: &ConnectorRequestContext,
+) -> Result<(), ConnectorError> {
+    catalog
+        .admit(&CatalogAdmissionRequest::new(
+            CatalogOperation::AlterProperties,
+            crate::catalog::CatalogTableName::new(namespace, table),
+            context.initiation(),
+        ))
+        .map(|_| ())
+        .map_err(connector_unsupported)
+}
+
+/// Prepare the atomic partition transition and the effective writer metadata.
+pub(crate) fn prepare_managed_repartition(
+    metadata: &TableMetadata,
     replacement: &ConnectorManagedPartitionSpecReplacement,
+    control: &dyn ConnectorOperationControl,
 ) -> Result<IcebergPreparedRepartition, ConnectorError> {
-    // The write session has no write-operation identity to compare the
-    // replacement against, so there is no id equality check here. The
-    // replacement is bound to this session by the expected-prior-default
-    // observation check immediately below: it is a real optimistic-concurrency
-    // fence against the live default spec, not a weaker substitute for an id.
     let current_fields = managed_partition_fields(metadata.default_partition_spec())?;
     let current_observation = ConnectorManagedPartitionSpecObservation::try_from_fields(
         metadata.default_partition_spec_id(),
@@ -96,6 +124,38 @@ pub(crate) fn preview_managed_repartition(
         return Err(invalid(
             "Iceberg default partition spec does not match the exact managed observation",
         ));
+    }
+
+    let mut builder_metadata = metadata.clone().into_builder(None);
+    let mut storage_update_count = None;
+    let mut metadata_updates = Vec::new();
+    let mut metadata_requirements = Vec::new();
+    if let Some(properties) = replacement.storage_properties() {
+        let PreparedChange {
+            updates,
+            requirements,
+        } = crate::catalog_control::catalog_mutation::prepare_set_table_property_entries(
+            metadata, properties, control,
+        )?;
+        for update in &updates {
+            control.check_active()?;
+            if !matches!(
+                update,
+                TableUpdate::SetProperties { .. }
+                    | TableUpdate::RemoveProperties { .. }
+                    | TableUpdate::UpgradeFormatVersion { .. }
+            ) {
+                return Err(corrupt(
+                    "Iceberg managed storage preparation returned a non-storage update",
+                ));
+            }
+            builder_metadata = update.clone().apply(builder_metadata).map_err(|error| {
+                invalid(format!("prepare Iceberg managed storage change: {error}"))
+            })?;
+        }
+        storage_update_count = Some(updates.len());
+        metadata_updates = updates;
+        metadata_requirements = requirements;
     }
 
     let schema = metadata.current_schema();
@@ -128,16 +188,15 @@ pub(crate) fn preview_managed_repartition(
             })?;
     }
     let requested_spec = builder.build();
-    let build =
-        crate::iceberg::spec::TableMetadataBuilder::new_from_metadata(metadata.clone(), None)
-            .add_default_partition_spec(requested_spec.clone())
-            .map_err(|error| invalid(format!("bind Iceberg replacement partition spec: {error}")))?
-            .build()
-            .map_err(|error| {
-                invalid(format!(
-                    "finalize Iceberg replacement partition spec: {error}"
-                ))
-            })?;
+    let build = builder_metadata
+        .add_default_partition_spec(requested_spec.clone())
+        .map_err(|error| invalid(format!("bind Iceberg replacement partition spec: {error}")))?
+        .build()
+        .map_err(|error| {
+            invalid(format!(
+                "finalize Iceberg replacement partition spec: {error}"
+            ))
+        })?;
     let spec_id = build.metadata.default_partition_spec_id();
     if spec_id == metadata.default_partition_spec_id() {
         return Err(invalid(
@@ -150,12 +209,12 @@ pub(crate) fn preview_managed_repartition(
         .ok_or_else(|| corrupt("Iceberg prospective default partition spec is missing"))?;
     // Declarative updates are normalized by the common staging engine. Reusing
     // a historical spec is valid even when the builder emits only a selector.
-    let metadata_updates = vec![
-        crate::iceberg::TableUpdate::AddSpec {
+    metadata_updates.extend([
+        TableUpdate::AddSpec {
             spec: requested_spec,
         },
-        crate::iceberg::TableUpdate::SetDefaultSpec { spec_id: -1 },
-    ];
+        TableUpdate::SetDefaultSpec { spec_id: -1 },
+    ]);
     let committed_fields = committed_spec
         .fields()
         .iter()
@@ -183,19 +242,60 @@ pub(crate) fn preview_managed_repartition(
         })
         .collect::<Result<Vec<_>, ConnectorError>>()?;
     let committed = ConnectorCommittedPartitioning::try_new(spec_id, committed_fields)?;
-    Ok(IcebergPreparedRepartition {
+    metadata_requirements.extend([
+        crate::iceberg::TableRequirement::DefaultSpecIdMatch {
+            default_spec_id: metadata.default_partition_spec_id(),
+        },
+        crate::iceberg::TableRequirement::LastAssignedPartitionIdMatch {
+            last_assigned_partition_id: metadata.last_partition_id(),
+        },
+    ]);
+    let mut prepared = IcebergPreparedRepartition {
         prospective_metadata: build.metadata,
         metadata_updates,
-        metadata_requirements: vec![
-            crate::iceberg::TableRequirement::DefaultSpecIdMatch {
-                default_spec_id: metadata.default_partition_spec_id(),
-            },
-            crate::iceberg::TableRequirement::LastAssignedPartitionIdMatch {
-                last_assigned_partition_id: metadata.last_partition_id(),
-            },
-        ],
+        metadata_requirements,
         committed,
-    })
+        storage_update_count,
+        storage_projection_digest: None,
+    };
+    if let Some(updates) = prepared.storage_updates() {
+        control.check_active()?;
+        let effective = prepared.prospective_metadata();
+        let base = (
+            metadata.uuid(),
+            metadata.location(),
+            metadata.format_version(),
+            metadata.current_schema().as_ref(),
+            metadata.current_snapshot_id(),
+            metadata.last_sequence_number(),
+            metadata.default_partition_spec_id(),
+            metadata.last_partition_id(),
+            metadata.properties(),
+        );
+        let writer = (
+            effective.format_version(),
+            effective.default_partition_spec().as_ref(),
+            effective.properties(),
+        );
+        // The prepared target and Begin can load different snapshot history.
+        // Use the original immutable base facts and the exact writer projection
+        // rather than serializing their full metadata envelopes.
+        let value = serde_json::to_value((
+            replacement.replacement_id().to_bytes(),
+            base,
+            updates,
+            writer,
+        ))
+        .map_err(|error| corrupt(format!("encode managed storage projection: {error}")))?;
+        let bytes = serde_json::to_vec(&crate::commit::model::canonical_json(value))
+            .map_err(|error| corrupt(format!("serialize managed storage projection: {error}")))?;
+        let mut digest = Sha256::new();
+        digest.update(b"novarocks.iceberg.managed-repartition-storage-projection.v1\0");
+        digest.update(bytes);
+        prepared.storage_projection_digest = Some(digest.finalize().into());
+        control.check_active()?;
+    }
+    Ok(prepared)
 }
 
 /// Observe a live partition spec as the neutral field vocabulary, so the prior
@@ -353,6 +453,157 @@ mod tests {
             fields,
         )
         .expect("replacement")
+    }
+
+    fn control() -> ConnectorRequestContext {
+        use std::time::{Duration, Instant};
+
+        ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(30),
+            novarocks_spi::connector::ConnectorStopOwner::new().view(),
+            1024 * 1024,
+            4 * 1024 * 1024,
+        )
+        .expect("request context")
+    }
+
+    fn preview_managed_repartition(
+        metadata: &TableMetadata,
+        replacement: &ConnectorManagedPartitionSpecReplacement,
+    ) -> Result<IcebergPreparedRepartition, ConnectorError> {
+        prepare_managed_repartition(metadata, replacement, &control())
+    }
+
+    #[test]
+    fn combined_storage_freezes_writer_settings_and_leaves_the_original_base() {
+        use novarocks_spi::connector::{DdlPropertyChange as Change, DdlPropertyValue as Value};
+        use std::collections::HashMap;
+
+        let original = unpartitioned_metadata()
+            .into_builder(None)
+            .set_properties(HashMap::from([
+                ("commit.retry.num-retries".to_string(), "4".to_string()),
+                ("read.split.target-size".to_string(), "1024".to_string()),
+            ]))
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        let replace = replacement(prior_observation(&original), identity_on_id())
+            .with_storage_properties(
+                Arc::from([
+                    (
+                        Arc::from("data_location"),
+                        Change::Set(Value::Varchar("s3://b/new-data".into())),
+                    ),
+                    (
+                        Arc::from("partitioning"),
+                        Change::Set(Value::ArrayVarchar(vec![Some("id".into())])),
+                    ),
+                    (
+                        Arc::from("parquet_writer_row_group_size"),
+                        Change::Set(Value::Varchar("1MB".into())),
+                    ),
+                    (
+                        Arc::from("statistics_collect_on_write"),
+                        Change::Set(Value::Boolean(false)),
+                    ),
+                    (Arc::from("max_commit_retry"), Change::Reset(Value::Null)),
+                ]),
+                1,
+            )
+            .unwrap();
+        let forecast = prepare_managed_repartition(&original, &replace, &control()).unwrap();
+        let effective = forecast.prospective_metadata();
+        assert_eq!(
+            super::super::control::iceberg_data_location(effective),
+            "s3://b/new-data"
+        );
+        assert_eq!(
+            crate::commit::data_writer::parquet_row_group_size_bytes(effective.properties())
+                .unwrap(),
+            Some(1_048_576)
+        );
+        let statistics = &effective.properties()[crate::stats_assembler::COLLECT_ON_WRITE_PROPERTY];
+        assert!(!super::super::control::collect_on_write_property_enabled(
+            statistics
+        ));
+        assert!(
+            !effective
+                .properties()
+                .contains_key("commit.retry.num-retries")
+        );
+        assert_eq!(effective.properties()["read.split.target-size"], "1024");
+        assert_eq!(original.properties()["commit.retry.num-retries"], "4");
+        assert_eq!(
+            super::super::control::iceberg_data_location(&original),
+            "s3://b/wh/db/t/data"
+        );
+        assert!(original.default_partition_spec().is_unpartitioned());
+        assert_eq!(original.uuid(), effective.uuid());
+        assert_eq!(
+            original.current_snapshot_id(),
+            effective.current_snapshot_id()
+        );
+        assert!(matches!(
+            forecast.storage_updates().unwrap(),
+            [
+                TableUpdate::SetProperties { .. },
+                TableUpdate::RemoveProperties { .. }
+            ]
+        ));
+        assert!(matches!(
+            &forecast.metadata_updates()[2..],
+            [
+                TableUpdate::AddSpec { .. },
+                TableUpdate::SetDefaultSpec { .. }
+            ]
+        ));
+        let digest = forecast.storage_projection_digest().unwrap();
+        let repeated =
+            prepare_managed_repartition(&original, &replace.clone(), &control()).unwrap();
+        assert_eq!(repeated.storage_projection_digest(), Some(digest));
+
+        let altered = original
+            .into_builder(None)
+            .set_properties(HashMap::from([(
+                "read.split.target-size".into(),
+                "2048".into(),
+            )]))
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        let later = prepare_managed_repartition(&altered, &replace, &control()).unwrap();
+        assert_eq!(later.committed(), forecast.committed());
+        assert_ne!(later.storage_projection_digest(), Some(digest));
+    }
+
+    #[test]
+    fn invalid_combined_storage_preserves_the_property_error() {
+        use novarocks_spi::connector::{
+            DdlPropertyChange as Change, DdlPropertyValue as Value, InvalidTableProperty,
+        };
+
+        let original = unpartitioned_metadata();
+        let replace = replacement(prior_observation(&original), identity_on_id())
+            .with_storage_properties(
+                Arc::from([
+                    (
+                        Arc::from("partitioning"),
+                        Change::Set(Value::ArrayVarchar(vec![Some("id".into())])),
+                    ),
+                    (
+                        Arc::from("parquet_writer_row_group_size"),
+                        Change::Set(Value::Varchar("bad".into())),
+                    ),
+                ]),
+                0,
+            )
+            .unwrap();
+        let error = prepare_managed_repartition(&original, &replace, &control()).unwrap_err();
+        assert!(InvalidTableProperty::from_connector_error(&error).is_some());
+        assert!(original.default_partition_spec().is_unpartitioned());
     }
 
     #[test]
@@ -528,6 +779,131 @@ mod tests {
                 .expect("observe the prospective default");
         assert_eq!(observed, identity_on_id());
     }
+    #[tokio::test]
+    async fn full_replacement_can_publish_an_unpartitioned_spec_with_its_new_snapshot() {
+        use crate::commit::fast_append::FastAppendPreparer;
+        use crate::commit::model::AddedContent;
+        use crate::commit::overwrite::{
+            OverwritePreparer,
+            preparer_tests::{Fixture, data, raw_entries},
+        };
+        use crate::commit::staging::{StagingBase, StagingEngine};
+        use crate::iceberg::{
+            TableRequirement, TableUpdate,
+            spec::{FormatVersion, Literal, ManifestStatus, Struct},
+        };
+
+        let fixture = Fixture::new();
+        let base = fixture.metadata(FormatVersion::V3);
+        let unpartitioned_spec_id = base.default_partition_spec_id();
+        let partitioned = preview_managed_repartition(
+            &base,
+            &replacement(prior_observation(&base), identity_on_id()),
+        )
+        .unwrap()
+        .prospective_metadata;
+        let original_spec_id = partitioned.default_partition_spec_id();
+        let old = "s3://b/partitioned.parquet";
+        let seed = fixture.intent(
+            &partitioned,
+            "main",
+            vec![
+                AddedContent::new_logical_data(
+                    data(old, 3, Struct::from_iter([Some(Literal::long(7))])),
+                    original_spec_id,
+                )
+                .unwrap(),
+            ],
+        );
+        let (partitioned, _) = fixture.stage(partitioned, &seed, &FastAppendPreparer).await;
+        let parent = partitioned.current_snapshot().unwrap().snapshot_id();
+        let clear = replacement(prior_observation(&partitioned), vec![]);
+        // The original exact prior fence also applies to an empty input.
+        let stale = preview_managed_repartition(&base, &clear).unwrap_err();
+        assert!(stale.message().contains("exact managed observation"));
+        let prepared = preview_managed_repartition(&partitioned, &clear).unwrap();
+        assert_eq!(prepared.committed().spec_id(), unpartitioned_spec_id);
+        assert!(prepared.committed().fields().is_empty());
+        assert!(
+            prepared
+                .prospective_metadata()
+                .default_partition_spec()
+                .is_unpartitioned()
+        );
+
+        let next = "s3://b/unpartitioned.parquet";
+        let intent = fixture.intent(
+            &partitioned,
+            "main",
+            vec![
+                AddedContent::new_logical_data(
+                    data(next, 2, Struct::empty()),
+                    prepared.committed().spec_id(),
+                )
+                .unwrap(),
+            ],
+        );
+        let attempt = fixture.operation.begin_attempt().unwrap();
+        let mut engine = StagingEngine::begin(
+            StagingBase::Existing {
+                metadata: partitioned.clone(),
+                metadata_location: "s3://b/partitioned.metadata.json".into(),
+            },
+            &intent,
+            &attempt,
+        )
+        .unwrap();
+        engine.stage_change(prepared.prepared_change()).unwrap();
+        engine.stage(&OverwritePreparer).await.unwrap();
+        let after = engine.metadata().clone();
+        let frozen = engine.freeze().unwrap();
+        assert_eq!(after.default_partition_spec_id(), unpartitioned_spec_id);
+        assert_eq!(
+            after.partition_spec_by_id(original_spec_id),
+            partitioned.partition_spec_by_id(original_spec_id),
+        );
+        assert_eq!(
+            after.current_snapshot().unwrap().parent_snapshot_id(),
+            Some(parent)
+        );
+        assert!(
+            frozen
+                .requirements()
+                .contains(&TableRequirement::DefaultSpecIdMatch {
+                    default_spec_id: original_spec_id,
+                })
+        );
+        assert!(frozen.updates().contains(&TableUpdate::SetDefaultSpec {
+            spec_id: unpartitioned_spec_id,
+        }));
+        assert!(
+            frozen
+                .updates()
+                .iter()
+                .any(|update| matches!(update, TableUpdate::AddSnapshot { .. }))
+        );
+        let entries = raw_entries(&after, "main", &attempt).await;
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.data_file().file_path() == old
+                    && entry.status == ManifestStatus::Deleted)
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.data_file().file_path() == next
+                    && entry.status == ManifestStatus::Added)
+        );
+        let no_op = replacement(prior_observation(&after), vec![]);
+        assert!(
+            preview_managed_repartition(&after, &no_op)
+                .unwrap_err()
+                .message()
+                .contains("identical to the current default spec")
+        );
+    }
+
     #[tokio::test]
     async fn repartition_staging_binds_new_ids_and_reuses_an_exact_historical_spec() {
         use crate::commit::model::{

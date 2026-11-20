@@ -472,6 +472,25 @@ pub trait ConnectorDocumentStorageObservation: Send + Sync {
             .into())
         })
     }
+    fn observe_keyed_document_definition<'a>(
+        &'a self,
+        _request: &'a super::KeyedDocumentDefinitionRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<super::KeyedDocumentDefinition, super::KeyedDocumentReadError>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async {
+            Err(ConnectorError::new(
+                crate::connector::ConnectorErrorKind::Unsupported,
+                "document observation capability has no keyed definition observation",
+            )
+            .into())
+        })
+    }
     fn observe_full_keyed_documents_async(
         &self,
         _request: super::KeyedDocumentObservationRequest,

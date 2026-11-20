@@ -299,15 +299,23 @@ def render_entry(context: dict[str, Any], staging_dir: Path) -> list[str]:
         if "rest-mv" in record["images"]:
             values.update(iceberg_rest_mv_uri=endpoint["rest_mv_uri"], iceberg_rest_mv_warehouse=warehouse["rest_mv_client"])
         text_file(staging, "sql-test.toml", '[cluster]\nhost = "127.0.0.1"\ntrino_port = ' + json_string(ports["trino"]) + '\nuser = "root"\n\n[env]\n' + ''.join(f'{key} = {json_string(value)}\n' for key, value in sorted(values.items())))
-        sql_values = {"type": "iceberg", "iceberg.catalog.type": "rest", "uri": endpoint["rest_uri"], "warehouse": rest,
+        sql_values = {"iceberg.catalog.type": "rest", "uri": endpoint["rest_uri"], "warehouse": rest,
                       "aws.s3.endpoint": store_endpoint,
                       "aws.s3.region": region, "aws.s3.enable_path_style_access": path_style}
         for purpose, role in (("metadata", "frontend"), ("data", "backend")):
             prefix = f"credential.object-store-{purpose}."
             sql_values.update({prefix + "consumer-role": role, prefix + "mode": mode,
                                prefix + "name": metadata_name if purpose == "metadata" else data_name, prefix + "generation": generation})
-        sql_quote = lambda value: "'" + str(value).replace("\\", "\\\\").replace("'", "''") + "'"
-        text_file(staging, "ice-rest-catalog.sql", "CREATE EXTERNAL CATALOG ice_rest PROPERTIES (\n" + ',\n'.join(f'  {sql_quote(k)} = {sql_quote(v)}' for k, v in sorted(sql_values.items())) + "\n);\n")
+        def sql_string(value):
+            return "'" + str(value).replace("'", "''") + "'"
+
+        properties = []
+        for key, value in sorted(sql_values.items()):
+            prop = '"' + key.replace('"', '""') + '"'
+            properties.append(f"  {prop} = {sql_string(value)}")
+        text_file(staging, "ice-rest-catalog.sql",
+                  "CREATE CATALOG ice_rest USING iceberg WITH (\n"
+                  + ",\n".join(properties) + "\n);\n")
         spark = {"spark.master": "local[*]", "spark.app.name": "NovaRocksIcebergSpark", "spark.ui.bindAddress": "0.0.0.0", "spark.driver.bindAddress": "0.0.0.0",
             "spark.sql.extensions": "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions", "spark.sql.catalog.ice_rest": "org.apache.iceberg.spark.SparkCatalog",
             "spark.sql.catalog.ice_rest.type": "rest", "spark.sql.catalog.ice_rest.uri": endpoint["container_rest_uri"], "spark.sql.catalog.ice_rest.warehouse": rest,

@@ -48,6 +48,7 @@ pub use type_syntax::{TypeSyntaxError, sql_type_syntax};
 pub(crate) mod optimizer;
 
 pub(crate) mod analyzer;
+pub use analyzer::TableNameView;
 pub(crate) mod explain;
 pub(crate) mod planner;
 

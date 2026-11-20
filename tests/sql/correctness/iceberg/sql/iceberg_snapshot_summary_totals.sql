@@ -22,20 +22,19 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE DATABASE iceberg_cat_${suite_uuid0}.iv32_db_${uuid0};
+CREATE SCHEMA iceberg_cat_${suite_uuid0}.iv32_db_${uuid0};
 
 -- query 2
 -- @skip_result_check=true
-CREATE TABLE iceberg_cat_${suite_uuid0}.iv32_db_${uuid0}.t_${uuid0} (id INT, v INT)
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE iceberg_cat_${suite_uuid0}.iv32_db_${uuid0}.t_${uuid0} (id INT, v INT) WITH (format_version = 3);
 
 -- query 3
 -- @skip_result_check=true
-INSERT INTO iceberg_cat_${suite_uuid0}.iv32_db_${uuid0}.t_${uuid0} VALUES (1, 10), (2, 20);
+INSERT INTO iceberg_cat_${suite_uuid0}.iv32_db_${uuid0}.t_${uuid0} VALUES ROW(1, 10), ROW(2, 20);
 
 -- query 4
 -- @skip_result_check=true
-INSERT INTO iceberg_cat_${suite_uuid0}.iv32_db_${uuid0}.t_${uuid0} VALUES (3, 30);
+INSERT INTO iceberg_cat_${suite_uuid0}.iv32_db_${uuid0}.t_${uuid0} VALUES ROW(3, 30);
 
 -- query 5
 -- Latest append summary carries exact total records/data-files + engine-name.
@@ -52,7 +51,7 @@ FROM (
     summary['total-records'] = '3'           AS total_records_is_3,
     summary['total-files-size'] IS NOT NULL  AS has_total_files_size,
     summary['engine-name'] IS NOT NULL       AS has_engine_name
-  FROM iceberg_cat_${suite_uuid0}.iv32_db_${uuid0}.t_${uuid0}$snapshots
+  FROM iceberg_cat_${suite_uuid0}.iv32_db_${uuid0}."t_${uuid0}$snapshots"
   ORDER BY committed_at DESC
   LIMIT 1
 ) t;
@@ -70,11 +69,11 @@ FROM (
     committed_at,
     summary['total-records'] = '3'          AS total_records_is_3,
     summary['engine-name'] IS NOT NULL      AS has_engine_name
-  FROM iceberg_cat_${suite_uuid0}.iv32_db_${uuid0}.t_${uuid0}$snapshots
+  FROM iceberg_cat_${suite_uuid0}.iv32_db_${uuid0}."t_${uuid0}$snapshots"
   ORDER BY committed_at DESC
   LIMIT 1
 ) t;
 
 -- query 8
 -- @skip_result_check=true
-DROP DATABASE iceberg_cat_${suite_uuid0}.iv32_db_${uuid0};
+DROP SCHEMA iceberg_cat_${suite_uuid0}.iv32_db_${uuid0};

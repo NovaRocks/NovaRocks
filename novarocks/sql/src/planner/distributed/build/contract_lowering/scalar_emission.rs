@@ -393,6 +393,7 @@ impl ScalarEmission<'_, '_> {
         result
     }
 
+    #[recursive::recursive]
     pub(super) fn lower_expression_inner(
         &mut self,
         expression: &TypedExpr,
@@ -478,9 +479,16 @@ impl ScalarEmission<'_, '_> {
             ExprKind::Cast {
                 expr,
                 decimal_overflow_policy,
+                array_failure_mode,
                 ..
             } => {
-                return self.lower_expression_as(expr, visible, &ty, *decimal_overflow_policy);
+                return self.lower_expression_as(
+                    expr,
+                    visible,
+                    &ty,
+                    *decimal_overflow_policy,
+                    *array_failure_mode,
+                );
             }
             ExprKind::IsNull { expr, negated } => ContractExprKind::IsNull {
                 expr: self.lower_expression(expr, visible)?,
@@ -592,6 +600,7 @@ impl ScalarEmission<'_, '_> {
                             visible,
                             &ty,
                             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                            None,
                         )?,
                     ));
                 }
@@ -601,6 +610,7 @@ impl ScalarEmission<'_, '_> {
                         visible,
                         &ty,
                         novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                        None,
                     )?),
                     None => None,
                 };
@@ -1238,8 +1248,10 @@ impl ScalarEmission<'_, '_> {
         visible: &BTreeMap<ColumnId, ValueId>,
         target: &ValueType,
         policy: novarocks_type_contract::DecimalOverflowPolicy,
+        array_failure_mode: Option<novarocks_type_contract::ArrayCastFailureMode>,
     ) -> Result<ExprId, ContractLoweringError> {
-        if let Some(source) = self.null_constant_type(expression)?
+        if array_failure_mode.is_none()
+            && let Some(source) = self.null_constant_type(expression)?
             && source != *target
         {
             let mut target = target.clone();
@@ -1260,9 +1272,9 @@ impl ScalarEmission<'_, '_> {
             target = target
                 .with_nullable(true)
                 .expect("validated root NULL contract");
-            self.convert_expression_to(lowered, &target, policy)
+            self.convert_expression_to(lowered, &target, policy, array_failure_mode)
         } else {
-            self.convert_expression_to(lowered, target, policy)
+            self.convert_expression_to(lowered, target, policy, array_failure_mode)
         }
     }
 
@@ -1278,8 +1290,10 @@ impl ScalarEmission<'_, '_> {
         expression: ExprId,
         target: &ValueType,
         policy: novarocks_type_contract::DecimalOverflowPolicy,
+        array_failure_mode: Option<novarocks_type_contract::ArrayCastFailureMode>,
     ) -> Result<ExprId, ContractLoweringError> {
-        let result = self.convert_expression_to_inner(expression, target, policy);
+        let result =
+            self.convert_expression_to_inner(expression, target, policy, array_failure_mode);
         if matches!(&result, Err(ContractLoweringError::Control(_))) {
             return result;
         }
@@ -1292,6 +1306,7 @@ impl ScalarEmission<'_, '_> {
         expression: ExprId,
         target: &ValueType,
         policy: novarocks_type_contract::DecimalOverflowPolicy,
+        array_failure_mode: Option<novarocks_type_contract::ArrayCastFailureMode>,
     ) -> Result<ExprId, ContractLoweringError> {
         let site = self.storage.source_site();
         let source = self.expression_value_type(expression)?;
@@ -1301,6 +1316,7 @@ impl ScalarEmission<'_, '_> {
             target,
             policy,
             self.root_allow_throw_exception,
+            array_failure_mode,
             self.control,
         )
         .map_err(|error| match error {
@@ -1413,6 +1429,7 @@ impl ScalarEmission<'_, '_> {
         self.add_scoped_expression(
             carrier.target().clone(),
             ContractExprKind::Cast {
+                array_failure_mode: carrier.array_failure_mode(),
                 allow_throw_exception,
                 expr: expression,
                 target: carrier.target().data_type().clone(),
@@ -1442,6 +1459,7 @@ impl ScalarEmission<'_, '_> {
             expr,
             &target,
             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            None,
         )
     }
 

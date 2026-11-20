@@ -39,7 +39,7 @@ under the License.
 
 ## ✅ CREATE TABLE 列默认值
 
-```sql
+``` sql
 CREATE TABLE orders (
   id        BIGINT,
   user_id   BIGINT,
@@ -48,8 +48,7 @@ CREATE TABLE orders (
   created   TIMESTAMP      DEFAULT '2026-01-01 00:00:00',
   is_active BOOLEAN        DEFAULT true,
   raw_blob  BINARY         DEFAULT X'cafebabe'
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 ```
 
 支持的字面量：
@@ -76,10 +75,9 @@ ALTER TABLE orders ADD COLUMN note STRING DEFAULT NULL;     -- 等价于不写 D
 
 ## ✅ V2 表硬拒非 NULL DEFAULT
 
-```sql
+``` sql
 -- v2 表：DEFAULT NULL 允许，非 NULL DEFAULT 报错
-CREATE TABLE t_v2 (id BIGINT, c STRING DEFAULT 'x')
-TBLPROPERTIES ("format-version" = "2");
+CREATE TABLE t_v2 (id BIGINT, c STRING DEFAULT 'x') WITH (format_version = 2);
 -- ERROR: non-NULL DEFAULT requires format-version >= 3
 ```
 
@@ -88,8 +86,8 @@ TBLPROPERTIES ("format-version" = "2");
 老 data file 不含某列（在该 file 写出之后才 ADD COLUMN），读端按 `initial-default` 回填：
 
 ```sql
--- 老文件 → 读出来的 region 都是 'CN'
-SELECT id, region FROM orders WHERE id < <某个老 snapshot 行的 id>;
+-- 将参数绑定到老 snapshot 中的行 ID；老文件读出的 region 为 'CN'
+SELECT id, region FROM orders WHERE id < ?;
 ```
 
 ## ✅ INSERT 显式列表写端 fill

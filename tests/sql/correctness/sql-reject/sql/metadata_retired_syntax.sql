@@ -36,3 +36,55 @@ SHOW BASIC STATS META;
 -- query 4
 -- @expect_trino_error=SYNTAX_ERROR,USER_ERROR
 SHOW HISTOGRAM STATS META;
+
+-- query 5
+-- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+SHOW CREATE SCHEMA reject_ice.reject_ns;
+
+-- query 6
+-- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+SHOW CREATE FUNCTION reject_ice.reject_ns.f;
+
+-- query 7
+-- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+SHOW TABLES FROM reject_ice.reject_ns;
+
+-- query 8
+-- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+SHOW SCHEMAS FROM reject_ice;
+
+-- query 9
+-- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+SHOW CATALOGS;
+
+-- query 10
+-- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+SHOW COLUMNS FROM reject_ice.reject_ns.t;
+
+-- query 11
+-- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+DESCRIBE reject_ice.reject_ns.t;
+
+-- query 12
+-- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+SHOW STATS FOR (SELECT 1 AS id);
+
+-- query 13
+-- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+SHOW CURRENT ROLES FROM reject_ice;
+
+-- query 14
+-- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+SHOW ROLE GRANTS FROM reject_ice;
+
+-- query 15
+-- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+SHOW FUNCTIONS;
+
+-- query 16
+-- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+SHOW SESSION;
+
+-- query 17
+-- @expect_trino_error=SYNTAX_ERROR,USER_ERROR
+SHOW PROCESSLIST;

@@ -181,7 +181,7 @@ pub(super) fn run(
         context.action(format!(
             "check logical row-level write contracts with requested DOP {dop}"
         ));
-        control.execute(format!("SET pipeline_dop = {dop}"))?;
+        control.execute(format!("SET SESSION pipeline_dop = {dop}"))?;
         mixed_actions(
             context,
             control,
@@ -246,9 +246,7 @@ fn mixed_actions(
     let table = format!("{catalog}.{database}.logical_mix_{dop}");
     let source = format!("{catalog}.{database}.logical_mix_source_{dop}");
     control.execute(format!(
-        "CREATE TABLE {table} (id BIGINT, v BIGINT) TBLPROPERTIES \
-         (\"format-version\"=\"3\", \"write.row-lineage\"=\"true\", \
-         \"novarocks.update.mode\"=\"merge-on-read\")"
+        "CREATE TABLE {table} (id BIGINT, v BIGINT) WITH (format_version = 3, extra_properties = MAP(ARRAY['write.row-lineage', 'novarocks.update.mode'], ARRAY['true', 'merge-on-read']))"
     ))?;
     control.execute(format!("CREATE TABLE {source} (id BIGINT, v BIGINT)"))?;
     control.execute(format!(
@@ -312,7 +310,8 @@ fn mixed_actions(
         "delete one more position from the same original file",
     )?;
     let deletes = writer_live_files(&control.execute(format!(
-        "SELECT content, file_path, file_format, record_count FROM {table}$files WHERE content=1"
+        "SELECT content, file_path, file_format, record_count FROM {metadata} WHERE content=1",
+        metadata = metadata_table(&table)
     ))?)?;
     anyhow::ensure!(
         deletes.len() == 1 && deletes[0].2 == "PUFFIN" && deletes[0].3 == 3,
@@ -414,9 +413,7 @@ fn selected_actions(
     let table = format!("{catalog}.{database}.selected_{label}_{dop}");
     let source = format!("{catalog}.{database}.selected_source_{label}_{dop}");
     control.execute(format!(
-        "CREATE TABLE {table} (id BIGINT, v BIGINT) TBLPROPERTIES \
-         (\"format-version\"=\"3\", \"write.row-lineage\"=\"true\", \
-         \"novarocks.update.mode\"=\"merge-on-read\")"
+        "CREATE TABLE {table} (id BIGINT, v BIGINT) WITH (format_version = 3, extra_properties = MAP(ARRAY['write.row-lineage', 'novarocks.update.mode'], ARRAY['true', 'merge-on-read']))"
     ))?;
     control.execute(format!(
         "INSERT INTO {table} VALUES (1,10),(2,20),(3,30),(4,40)"
@@ -545,9 +542,7 @@ fn unmatched_inserts(
     let table = format!("{catalog}.{database}.unmatched_target_{dop}");
     let source = format!("{catalog}.{database}.unmatched_source_{dop}");
     control.execute(format!(
-        "CREATE TABLE {table} (id BIGINT, v BIGINT) TBLPROPERTIES \
-         (\"format-version\"=\"3\", \"write.row-lineage\"=\"true\", \
-         \"novarocks.update.mode\"=\"merge-on-read\")"
+        "CREATE TABLE {table} (id BIGINT, v BIGINT) WITH (format_version = 3, extra_properties = MAP(ARRAY['write.row-lineage', 'novarocks.update.mode'], ARRAY['true', 'merge-on-read']))"
     ))?;
     control.execute(format!(
         "CREATE TABLE {source} (id BIGINT, v BIGINT, selected BOOLEAN)"
@@ -704,9 +699,7 @@ fn partition_movement(
 ) -> Result<()> {
     let table = format!("{catalog}.{database}.partition_move_{dop}");
     control.execute(format!(
-        "CREATE TABLE {table} (id BIGINT, v BIGINT, p BIGINT) PARTITION BY(p) TBLPROPERTIES \
-         (\"format-version\"=\"3\", \"write.row-lineage\"=\"true\", \
-         \"novarocks.update.mode\"=\"merge-on-read\")"
+        "CREATE TABLE {table} (id BIGINT, v BIGINT, p BIGINT) WITH (format_version = 3, partitioning = ARRAY['p'], extra_properties = MAP(ARRAY['write.row-lineage', 'novarocks.update.mode'], ARRAY['true', 'merge-on-read']))"
     ))?;
     control.execute(format!("INSERT INTO {table} VALUES(1,10,0),(2,20,0)"))?;
     let original: Vec<(i64, String, i64)> = writer_row_ids(
@@ -784,6 +777,13 @@ fn partition_movement(
     settle_diagnostic(context, diagnostic, observation, primary)
 }
 
+fn metadata_table(table: &str) -> String {
+    let (namespace, name) = table
+        .rsplit_once('.')
+        .expect("row-level table has a namespace");
+    format!("{namespace}.\"{name}$files\"")
+}
+
 fn partition_replacement_after_spec_evolution(
     control: &mut SqlSession,
     catalog: &str,
@@ -792,12 +792,11 @@ fn partition_replacement_after_spec_evolution(
 ) -> Result<()> {
     let table = format!("{catalog}.{database}.partition_replace_evolved_{dop}");
     control.execute(format!(
-            "CREATE TABLE {table} (id BIGINT,v BIGINT,p BIGINT) PARTITION BY(p) TBLPROPERTIES \
-             (\"format-version\"=\"3\",\"write.row-lineage\"=\"true\",\"novarocks.update.mode\"=\"merge-on-read\")"
+            "CREATE TABLE {table} (id BIGINT,v BIGINT,p BIGINT) WITH (format_version = 3, partitioning = ARRAY['p'], extra_properties = MAP(ARRAY['write.row-lineage', 'novarocks.update.mode'], ARRAY['true', 'merge-on-read']))"
         ))?;
     // Singleton applies only to this tiny fixture's seeding. Actual file
     // observations prove its shape; the tested mutation restores DOP below.
-    control.execute("SET pipeline_dop=1")?;
+    control.execute("SET SESSION pipeline_dop = 1")?;
     let seed_result = control.execute(format!(
         "INSERT INTO {table} SELECT generate_series,generate_series,0 \
              FROM TABLE(generate_series(1,3)) ORDER BY generate_series"
@@ -820,8 +819,9 @@ fn partition_replacement_after_spec_evolution(
     );
     let old_file = old_rows[0].1.clone();
     let old_files: Vec<(String, i32, i64)> = writer_file_partitions(&control.execute(format!(
-            "SELECT file_path,spec_id,record_count FROM {table}$files WHERE content=0 ORDER BY file_path"
-        ))?)?;
+        "SELECT file_path,spec_id,record_count FROM {metadata} WHERE content=0 ORDER BY file_path",
+        metadata = metadata_table(&table)
+    ))?)?;
     anyhow::ensure!(
         old_files.len() == 1 && old_files[0].0 == old_file && old_files[0].2 == 3,
         "merge-on-read: original manifest does not prove the seed file: {old_files:?}"
@@ -829,9 +829,11 @@ fn partition_replacement_after_spec_evolution(
     let old_spec = old_files[0].1;
     // Both operations use the maintained partition-evolution SQL surface.
     // The original data file keeps its old spec; new writes use bucket[8].
-    control.execute(format!("ALTER TABLE {table} DROP PARTITION COLUMN p"))?;
     control.execute(format!(
-        "ALTER TABLE {table} ADD PARTITION COLUMN bucket(p,8)"
+        "ALTER TABLE {table} SET PROPERTIES partitioning = ARRAY[]"
+    ))?;
+    control.execute(format!(
+        "ALTER TABLE {table} SET PROPERTIES partitioning = ARRAY['bucket(p, 8)']"
     ))?;
     let seed_result = control.execute(format!("INSERT INTO {table} VALUES(4,4,30)"))?;
     assert_affected(&seed_result, 1, "seed one row under the new default spec")?;
@@ -843,7 +845,8 @@ fn partition_replacement_after_spec_evolution(
         "merge-on-read: partition evolution changed original rows or lost the new row: {before:?}"
     );
     let evolved_files: Vec<(String, i32)> = writer_file_specs(&control.execute(format!(
-        "SELECT file_path,spec_id FROM {table}$files WHERE content=0 ORDER BY file_path"
+        "SELECT file_path,spec_id FROM {metadata} WHERE content=0 ORDER BY file_path",
+        metadata = metadata_table(&table)
     ))?)?;
     let current_spec = evolved_files
         .iter()
@@ -854,7 +857,7 @@ fn partition_replacement_after_spec_evolution(
         current_spec != old_spec,
         "merge-on-read: fixture did not establish different old/current partition specs: {evolved_files:?}"
     );
-    control.execute(format!("SET pipeline_dop={dop}"))?;
+    control.execute(format!("SET SESSION pipeline_dop={dop}"))?;
     // Iceberg bucket[8] for BIGINT 11 and 21 is respectively 7 and 1.
     // Both moved rows come from the same observed old file, while row 3
     // remains an untouched peer in that file and row 4 is outside it.
@@ -898,12 +901,14 @@ fn partition_replacement_after_spec_evolution(
         "merge-on-read: replacement lost original lineage, distinct destinations or the unrelated peer: before={before:?} after={after:?}"
     );
     let files: Vec<(i32, String, i32, i64)> = writer_file_spec_counts(&control.execute(format!(
-            "SELECT content,file_path,spec_id,record_count FROM {table}$files ORDER BY content,file_path"
-        ))?)?;
+            "SELECT content,file_path,spec_id,record_count FROM {metadata} ORDER BY content,file_path",
+        metadata = metadata_table(&table)
+))?)?;
     // Read the whole published partition ROW. Selecting its child in SQL
     // would need an unrelated struct-subfield function implementation.
     let rendered_partitions = writer_partition_values(&control.execute(format!(
-        "SELECT file_path,`partition` FROM {table}$files ORDER BY file_path"
+        "SELECT file_path,\"partition\" FROM {metadata} ORDER BY file_path",
+        metadata = metadata_table(&table)
     ))?)?;
     let mut partitions = std::collections::BTreeMap::new();
     for (path, partition) in rendered_partitions {
@@ -913,7 +918,7 @@ fn partition_replacement_after_spec_evolution(
         );
     }
     for (row, bucket) in [(&after[0], 7_i32), (&after[1], 1), (&after[3], 3)] {
-        let expected = serde_json::json!({"p":null,"p_bucket_8":bucket});
+        let expected = serde_json::json!({"p":null,"p_bucket":bucket});
         anyhow::ensure!(
             partitions.get(&row.1) == Some(&expected),
             "merge-on-read: physical current-spec partition differs from the independent bucket oracle: file={} expected={expected} actual={:?}",
@@ -943,7 +948,7 @@ fn partition_replacement_after_spec_evolution(
                 .any(|file| file.0 == 1 && file.2 == old_spec && file.3 == 2),
         "MOR must retain one old data file and exactly one old-spec DV for both moved rows: {files:?}"
     );
-    let expected = serde_json::json!({"p":0,"p_bucket_8":null});
+    let expected = serde_json::json!({"p":0,"p_bucket":null});
     let old_delete = files
         .iter()
         .find(|file| file.0 == 1)
@@ -954,7 +959,7 @@ fn partition_replacement_after_spec_evolution(
         "MOR old data and DV must retain the original physical partition: {partitions:?}"
     );
 
-    control.execute(format!("DROP TABLE {table} FORCE"))?;
+    control.execute(format!("DROP TABLE {table}"))?;
 
     Ok(())
 }

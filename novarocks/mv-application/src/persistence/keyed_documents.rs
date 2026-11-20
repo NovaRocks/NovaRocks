@@ -219,7 +219,7 @@ pub fn management_slot_name() -> Result<ConnectorSlotName, MvDocumentError> {
         MANAGEMENT_SLOT_NAME,
     )?)
 }
-fn configuration_slot(
+pub fn configuration_slot(
     value: &ConfigurationDocument,
 ) -> Result<ConnectorSlotValue, MvDocumentError> {
     Ok(ConnectorSlotValue {

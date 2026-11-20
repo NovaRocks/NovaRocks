@@ -19,13 +19,17 @@
 
 use std::{fmt, sync::Arc};
 
-use novarocks_spi::connector::{ConnectorInstanceId, ConnectorProviderId};
+use novarocks_spi::connector::{
+    ConnectorInstanceId, ConnectorProviderBindingKey, ConnectorProviderId,
+};
 use uuid::Uuid;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CatalogCreateCommand {
     pub instance_id: ConnectorInstanceId,
     pub display_name: String,
+    /// Exact USING connector. None exists until the legacy CREATE entry retires.
+    pub connector_name: Option<String>,
     pub properties: Vec<(String, String)>,
     pub if_not_exists: bool,
 }
@@ -53,6 +57,8 @@ pub struct CatalogConfigurationObservation {
     pub runtime: CatalogRuntimeObservation,
     pub control_runtime_id: novarocks_spi::connector::ConnectorControlRuntimeId,
     pub configuration: Arc<crate::CatalogLogicalConfig>,
+    /// The locally installed provider binding verified in this observation.
+    pub binding_key: ConnectorProviderBindingKey,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

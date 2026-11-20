@@ -73,9 +73,9 @@ paths = [
     "novarocks/sql/src/analyzer/declaration_widening.rs",
     "novarocks/frontend-application/src/query_execution/constant_eval.rs",
     "novarocks/frontend-application/src/query_execution/constant_eval/**",
-    "novarocks/frontend-application/src/coordinator/internal_result.rs",
-    "novarocks/frontend-application/src/coordinator/execution.rs",
-    "novarocks/frontend-application/src/coordinator/statement_native_attempt.rs",
+    "novarocks/frontend-application/src/query_execution/internal_consumer/write.rs",
+    "novarocks/frontend-application/src/query/statement_computation.rs",
+    "novarocks/query-application/src/coordination/executor/native.rs",
     "novarocks/frontend-application/src/query_execution/internal_result_cpu.rs",
 ]
 

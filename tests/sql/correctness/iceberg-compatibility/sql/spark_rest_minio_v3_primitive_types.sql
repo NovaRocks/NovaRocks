@@ -66,4 +66,4 @@ SELECT COUNT(*) AS rows_total,
 FROM iceberg_compat_${suite_uuid0}.${case_db}.spark_v3_types_${uuid0};
 
 -- query 3
-DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.spark_v3_types_${uuid0} FORCE;
+DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.spark_v3_types_${uuid0} ;

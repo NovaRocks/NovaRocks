@@ -30,28 +30,24 @@ DROP TABLE IF EXISTS ${case_db}.t3;
 DROP TABLE IF EXISTS ${case_db}.t4;
 
 CREATE TABLE ${case_db}.t1 (
-  c1 INT NULL,
-  c2 INT NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+  c1 INT ,
+  c2 INT
+) WITH (format_version = 3);
 
 CREATE TABLE ${case_db}.t2 (
-  c1 INT NULL,
-  c2 INT NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+  c1 INT ,
+  c2 INT
+) WITH (format_version = 3);
 
 CREATE TABLE ${case_db}.t3 (
-  c1 INT NULL,
-  c2 INT NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+  c1 INT ,
+  c2 INT
+) WITH (format_version = 3);
 
 CREATE TABLE ${case_db}.t4 (
-  c1 INT NULL,
-  c2 INT NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+  c1 INT ,
+  c2 INT
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t1
 SELECT generate_series, generate_series
@@ -97,8 +93,8 @@ FROM (
          COALESCE(SUM(t1.c2), 0),
          0
   FROM ${case_db}.t1
-  LEFT SEMI JOIN  ${case_db}.t2 ON t1.c1 > t2.c1
-  UNION ALL
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t2 WHERE t1.c1 > t2.c1)
+UNION ALL
   SELECT '04_left_anti',
          COUNT(*),
          COUNT(t1.c2),
@@ -106,8 +102,8 @@ FROM (
          COALESCE(SUM(t1.c2), 0),
          0
   FROM ${case_db}.t1
-  LEFT ANTI JOIN  ${case_db}.t2 ON t1.c1 > t2.c1
-  UNION ALL
+WHERE NOT EXISTS (SELECT 1 FROM ${case_db}.t2 WHERE t1.c1 > t2.c1)
+UNION ALL
   SELECT '05_right_outer',
          COUNT(*),
          COUNT(t1.c2),
@@ -132,17 +128,17 @@ FROM (
          COUNT(t3.c2),
          0,
          COALESCE(SUM(t3.c2), 0)
-  FROM ${case_db}.t1
-  RIGHT SEMI JOIN  ${case_db}.t3 ON t1.c1 > t3.c1
-  UNION ALL
+  FROM ${case_db}.t3
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 WHERE t1.c1 > t3.c1)
+UNION ALL
   SELECT '08_right_anti',
          COUNT(*),
          0,
          COUNT(t4.c2),
          0,
          COALESCE(SUM(t4.c2), 0)
-  FROM ${case_db}.t1
-  RIGHT ANTI JOIN  ${case_db}.t4 ON t1.c1 > t4.c1
+  FROM ${case_db}.t4
+WHERE NOT EXISTS (SELECT 1 FROM ${case_db}.t1 WHERE t1.c1 > t4.c1)
 ) s
 ORDER BY scenario;
 
@@ -175,8 +171,8 @@ FROM (
          COALESCE(SUM(t1.c2), 0),
          0
   FROM ${case_db}.t1
-  LEFT SEMI JOIN  (SELECT * FROM ${case_db}.t2 WHERE c1 < 1) t3 ON t1.c1 > t3.c1
-  UNION ALL
+WHERE EXISTS (SELECT 1 FROM (SELECT * FROM ${case_db}.t2 WHERE c1 < 1) t3 WHERE t1.c1 > t3.c1)
+UNION ALL
   SELECT '04_left_anti',
          COUNT(*),
          COUNT(t1.c2),
@@ -184,8 +180,8 @@ FROM (
          COALESCE(SUM(t1.c2), 0),
          0
   FROM ${case_db}.t1
-  LEFT ANTI JOIN  (SELECT * FROM ${case_db}.t2 WHERE c1 < 1) t3 ON t1.c1 > t3.c1
-  UNION ALL
+WHERE NOT EXISTS (SELECT 1 FROM (SELECT * FROM ${case_db}.t2 WHERE c1 < 1) t3 WHERE t1.c1 > t3.c1)
+UNION ALL
   SELECT '05_right_outer',
          COUNT(*),
          COUNT(t1.c2),
@@ -210,17 +206,17 @@ FROM (
          COUNT(t3.c2),
          0,
          COALESCE(SUM(t3.c2), 0)
-  FROM ${case_db}.t1
-  RIGHT SEMI JOIN  (SELECT * FROM ${case_db}.t2 WHERE c1 < 1) t3 ON t1.c1 > t3.c1
-  UNION ALL
+  FROM (SELECT * FROM ${case_db}.t2 WHERE c1 < 1) t3
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 WHERE t1.c1 > t3.c1)
+UNION ALL
   SELECT '08_right_anti',
          COUNT(*),
          0,
          COUNT(t3.c2),
          0,
          COALESCE(SUM(t3.c2), 0)
-  FROM ${case_db}.t1
-  RIGHT ANTI JOIN  (SELECT * FROM ${case_db}.t2 WHERE c1 < 1) t3 ON t1.c1 > t3.c1
+  FROM (SELECT * FROM ${case_db}.t2 WHERE c1 < 1) t3
+WHERE NOT EXISTS (SELECT 1 FROM ${case_db}.t1 WHERE t1.c1 > t3.c1)
 ) s
 ORDER BY scenario;
 
@@ -253,8 +249,8 @@ FROM (
          COALESCE(SUM(t3.c2), 0),
          0
   FROM (SELECT * FROM ${case_db}.t1 WHERE c1 < 1) t3
-  LEFT SEMI JOIN  ${case_db}.t2 ON t3.c1 > t2.c1
-  UNION ALL
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t2 WHERE t3.c1 > t2.c1)
+UNION ALL
   SELECT '04_left_anti',
          COUNT(*),
          COUNT(t3.c2),
@@ -262,8 +258,8 @@ FROM (
          COALESCE(SUM(t3.c2), 0),
          0
   FROM (SELECT * FROM ${case_db}.t1 WHERE c1 < 1) t3
-  LEFT ANTI JOIN  ${case_db}.t2 ON t3.c1 > t2.c1
-  UNION ALL
+WHERE NOT EXISTS (SELECT 1 FROM ${case_db}.t2 WHERE t3.c1 > t2.c1)
+UNION ALL
   SELECT '05_right_outer',
          COUNT(*),
          COUNT(t3.c2),
@@ -288,17 +284,17 @@ FROM (
          COUNT(t2.c2),
          0,
          COALESCE(SUM(t2.c2), 0)
-  FROM (SELECT * FROM ${case_db}.t1 WHERE c1 < 1) t3
-  RIGHT SEMI JOIN  ${case_db}.t2 ON t3.c1 > t2.c1
-  UNION ALL
+  FROM ${case_db}.t2
+WHERE EXISTS (SELECT 1 FROM (SELECT * FROM ${case_db}.t1 WHERE c1 < 1) t3 WHERE t3.c1 > t2.c1)
+UNION ALL
   SELECT '08_right_anti',
          COUNT(*),
          0,
          COUNT(t2.c2),
          0,
          COALESCE(SUM(t2.c2), 0)
-  FROM (SELECT * FROM ${case_db}.t1 WHERE c1 < 1) t3
-  RIGHT ANTI JOIN  ${case_db}.t2 ON t3.c1 > t2.c1
+  FROM ${case_db}.t2
+WHERE NOT EXISTS (SELECT 1 FROM (SELECT * FROM ${case_db}.t1 WHERE c1 < 1) t3 WHERE t3.c1 > t2.c1)
 ) s
 ORDER BY scenario;
 
@@ -526,8 +522,8 @@ r AS (
 dim AS (
   SELECT 5000 AS mx_lo_orderkey, 4999 AS mn_lo_orderkey
 )
-SELECT COUNT(*)
+SELECT COUNT()
 FROM l
 JOIN  r ON lk = rk
-JOIN dim
+CROSS JOIN dim
 WHERE rk >= mn_lo_orderkey AND rk <= mx_lo_orderkey;

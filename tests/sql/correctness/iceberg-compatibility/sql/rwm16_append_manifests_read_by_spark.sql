@@ -20,31 +20,25 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE DATABASE IF NOT EXISTS iceberg_compat_${suite_uuid0}.${case_db};
-CREATE TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm16_append_v1_${uuid0} (id BIGINT, part BIGINT)
-PARTITION BY (part)
-TBLPROPERTIES ("format-version" = "1", "commit.manifest.target-size-bytes" = "1024");
+CREATE SCHEMA IF NOT EXISTS iceberg_compat_${suite_uuid0}.${case_db};
+CREATE TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm16_append_v1_${uuid0} (id BIGINT, part BIGINT) WITH (partitioning = ARRAY['part'], format_version = 1, extra_properties = MAP(ARRAY['commit.manifest.target-size-bytes'], ARRAY['1024']));
 INSERT INTO iceberg_compat_${suite_uuid0}.${case_db}.rwm16_append_v1_${uuid0} VALUES
-  (1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6), (7, 7), (8, 8),
-  (9, 9), (10, 10), (11, 11), (12, 12), (13, 13), (14, 14), (15, 15), (16, 16),
-  (17, 17), (18, 18), (19, 19), (20, 20), (21, 21), (22, 22), (23, 23), (24, 24),
-  (25, 25), (26, 26), (27, 27), (28, 28), (29, 29), (30, 30), (31, 31), (32, 32);
-CREATE TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm16_append_v2_${uuid0} (id BIGINT, part BIGINT)
-PARTITION BY (part)
-TBLPROPERTIES ("format-version" = "2", "commit.manifest.target-size-bytes" = "1024");
+  ROW(1, 1), ROW(2, 2), ROW(3, 3), ROW(4, 4), ROW(5, 5), ROW(6, 6), ROW(7, 7), ROW(8, 8),
+  ROW(9, 9), ROW(10, 10), ROW(11, 11), ROW(12, 12), ROW(13, 13), ROW(14, 14), ROW(15, 15), ROW(16, 16),
+  ROW(17, 17), ROW(18, 18), ROW(19, 19), ROW(20, 20), ROW(21, 21), ROW(22, 22), ROW(23, 23), ROW(24, 24),
+  ROW(25, 25), ROW(26, 26), ROW(27, 27), ROW(28, 28), ROW(29, 29), ROW(30, 30), ROW(31, 31), ROW(32, 32);
+CREATE TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm16_append_v2_${uuid0} (id BIGINT, part BIGINT) WITH (partitioning = ARRAY['part'], format_version = 2, extra_properties = MAP(ARRAY['commit.manifest.target-size-bytes'], ARRAY['1024']));
 INSERT INTO iceberg_compat_${suite_uuid0}.${case_db}.rwm16_append_v2_${uuid0} VALUES
-  (1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6), (7, 7), (8, 8),
-  (9, 9), (10, 10), (11, 11), (12, 12), (13, 13), (14, 14), (15, 15), (16, 16),
-  (17, 17), (18, 18), (19, 19), (20, 20), (21, 21), (22, 22), (23, 23), (24, 24),
-  (25, 25), (26, 26), (27, 27), (28, 28), (29, 29), (30, 30), (31, 31), (32, 32);
-CREATE TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm16_append_v3_${uuid0} (id BIGINT, part BIGINT)
-PARTITION BY (part)
-TBLPROPERTIES ("format-version" = "3", "commit.manifest.target-size-bytes" = "1024");
+  ROW(1, 1), ROW(2, 2), ROW(3, 3), ROW(4, 4), ROW(5, 5), ROW(6, 6), ROW(7, 7), ROW(8, 8),
+  ROW(9, 9), ROW(10, 10), ROW(11, 11), ROW(12, 12), ROW(13, 13), ROW(14, 14), ROW(15, 15), ROW(16, 16),
+  ROW(17, 17), ROW(18, 18), ROW(19, 19), ROW(20, 20), ROW(21, 21), ROW(22, 22), ROW(23, 23), ROW(24, 24),
+  ROW(25, 25), ROW(26, 26), ROW(27, 27), ROW(28, 28), ROW(29, 29), ROW(30, 30), ROW(31, 31), ROW(32, 32);
+CREATE TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm16_append_v3_${uuid0} (id BIGINT, part BIGINT) WITH (partitioning = ARRAY['part'], format_version = 3, extra_properties = MAP(ARRAY['commit.manifest.target-size-bytes'], ARRAY['1024']));
 INSERT INTO iceberg_compat_${suite_uuid0}.${case_db}.rwm16_append_v3_${uuid0} VALUES
-  (1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6), (7, 7), (8, 8),
-  (9, 9), (10, 10), (11, 11), (12, 12), (13, 13), (14, 14), (15, 15), (16, 16),
-  (17, 17), (18, 18), (19, 19), (20, 20), (21, 21), (22, 22), (23, 23), (24, 24),
-  (25, 25), (26, 26), (27, 27), (28, 28), (29, 29), (30, 30), (31, 31), (32, 32);
+  ROW(1, 1), ROW(2, 2), ROW(3, 3), ROW(4, 4), ROW(5, 5), ROW(6, 6), ROW(7, 7), ROW(8, 8),
+  ROW(9, 9), ROW(10, 10), ROW(11, 11), ROW(12, 12), ROW(13, 13), ROW(14, 14), ROW(15, 15), ROW(16, 16),
+  ROW(17, 17), ROW(18, 18), ROW(19, 19), ROW(20, 20), ROW(21, 21), ROW(22, 22), ROW(23, 23), ROW(24, 24),
+  ROW(25, 25), ROW(26, 26), ROW(27, 27), ROW(28, 28), ROW(29, 29), ROW(30, 30), ROW(31, 31), ROW(32, 32);
 
 -- query 2
 SELECT count(*) = 32 AND count(DISTINCT part) = 32 AND sum(id) = 528 AS rows_match
@@ -86,6 +80,6 @@ printf '%s\n' "$spark_out" | tr '\r' '\n' | grep -Fx SPARK_RWM16_APPEND_OK
 -- query 6
 -- @cleanup=true
 -- @skip_result_check=true
-DROP TABLE IF EXISTS iceberg_compat_${suite_uuid0}.${case_db}.rwm16_append_v1_${uuid0} FORCE;
-DROP TABLE IF EXISTS iceberg_compat_${suite_uuid0}.${case_db}.rwm16_append_v2_${uuid0} FORCE;
-DROP TABLE IF EXISTS iceberg_compat_${suite_uuid0}.${case_db}.rwm16_append_v3_${uuid0} FORCE;
+DROP TABLE IF EXISTS iceberg_compat_${suite_uuid0}.${case_db}.rwm16_append_v1_${uuid0} ;
+DROP TABLE IF EXISTS iceberg_compat_${suite_uuid0}.${case_db}.rwm16_append_v2_${uuid0} ;
+DROP TABLE IF EXISTS iceberg_compat_${suite_uuid0}.${case_db}.rwm16_append_v3_${uuid0} ;

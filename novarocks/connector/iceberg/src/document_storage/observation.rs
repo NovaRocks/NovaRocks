@@ -19,7 +19,9 @@ use bytes::Bytes;
 use novarocks_spi::connector::{
     ConnectorCommittedVersion, ConnectorDocumentDiscoveryPage, ConnectorDocumentDiscoveryRequest,
     ConnectorDocumentStorageObservation, ConnectorError, ConnectorErrorKind,
-    ConnectorInstanceDescriptor, ConnectorTableObjectId, ProviderBindingEpoch,
+    ConnectorInstanceDescriptor, ConnectorTableObjectId, KeyedDocumentDefinition,
+    KeyedDocumentDefinitionRequest, KeyedDocumentObservationRequest, KeyedDocumentReadError,
+    ProviderBindingEpoch,
 };
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -117,6 +119,87 @@ impl ConnectorDocumentStorageObservation for super::create::IcebergDocumentStora
                 load_keyed_table_async(self, &request, crate::catalog::SnapshotLoading::Refs)
                     .await?;
             super::keyed::project_view(table.metadata(), &request, committed_version(&table)?)
+        })
+    }
+
+    fn observe_keyed_document_definition<'a>(
+        &'a self,
+        request: &'a KeyedDocumentDefinitionRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<KeyedDocumentDefinition, KeyedDocumentReadError>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            request.validate()?;
+            if request.owner.instance_id != self.descriptor().instance_id
+                || request.owner.incarnation != self.incarnation()
+            {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "keyed definition belongs to a different provider generation",
+                )
+                .into());
+            }
+            super::context::check_context(&request.context)?;
+            let runtime = self.runtime();
+            let table = match runtime
+                .observe_table_original_for_request_with_snapshots_async(
+                    &request.target.namespace,
+                    &request.target.table,
+                    &request.context,
+                    crate::catalog::SnapshotLoading::Refs,
+                )
+                .await
+            {
+                Ok(table) => table.into_table(),
+                Err(error) if error.kind() == ConnectorErrorKind::NotFound => {
+                    let name = crate::catalog::CatalogTableName::new(
+                        request.target.namespace.clone(),
+                        request.target.table.clone(),
+                    );
+                    let view = runtime
+                        .novarocks_catalog()
+                        .view_exists_for_request(name, request.context.clone())
+                        .await;
+                    return Err(match view {
+                        Ok(true) => ConnectorError::new(
+                            ConnectorErrorKind::Unsupported,
+                            format!(
+                                "Relation '{}.{}.{}' is a view, not a materialized view",
+                                request.target.instance_id.as_str(),
+                                request.target.namespace,
+                                request.target.table,
+                            ),
+                        ),
+                        Ok(false) => error,
+                        Err(probe) if probe.kind() == ConnectorErrorKind::Unsupported => error,
+                        Err(probe) => probe,
+                    }
+                    .into());
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let keyed_request = KeyedDocumentObservationRequest {
+                owner: request.owner.clone(),
+                catalog_handle: request.catalog_handle.clone(),
+                target: request.target.clone(),
+                object_id: table_object_id(table.metadata())?,
+                context: request.context.clone(),
+            };
+            let view = super::keyed::project_view(
+                table.metadata(),
+                &keyed_request,
+                committed_version(&table)?,
+            )?;
+            let properties = crate::table_properties::table_definition_properties(
+                table.metadata(),
+                &request.context,
+            )?;
+            Ok(KeyedDocumentDefinition { view, properties })
         })
     }
 
@@ -264,7 +347,8 @@ fn decode_keyed_slot_evidence(
     let payload =
         crate::reconcile_payload::decode_mutation_evidence(evidence.provider_payload())
             .map_err(|message| ConnectorError::new(ConnectorErrorKind::CorruptData, message))?;
-    let crate::reconcile_payload::IcebergMutationEvidenceTarget::KeyedSlotChange {
+    use crate::reconcile_payload::IcebergMutationEvidenceTarget;
+    let (
         namespace,
         table,
         table_uuid,
@@ -272,9 +356,50 @@ fn decode_keyed_slot_evidence(
         asserted_parent,
         preselected_snapshot,
         slots,
-    } = payload.target
-    else {
-        return Err(invalid("evidence does not describe a slot change"));
+        storage,
+    ) = match payload.target {
+        IcebergMutationEvidenceTarget::KeyedSlotChange {
+            namespace,
+            table,
+            table_uuid,
+            operation_id,
+            asserted_parent,
+            preselected_snapshot,
+            slots,
+        } => (
+            namespace,
+            table,
+            table_uuid,
+            operation_id,
+            asserted_parent,
+            preselected_snapshot,
+            slots,
+            None,
+        ),
+        IcebergMutationEvidenceTarget::KeyedSlotStorageChange {
+            namespace,
+            table,
+            table_uuid,
+            operation_id,
+            asserted_parent,
+            preselected_snapshot,
+            slots,
+            effect_digest,
+            request_fingerprint,
+        } => (
+            namespace,
+            table,
+            table_uuid,
+            operation_id,
+            asserted_parent,
+            preselected_snapshot,
+            slots,
+            Some(UnknownCommitIdentity::SlotStorageEffect {
+                effect_digest,
+                request_fingerprint,
+            }),
+        ),
+        _ => return Err(invalid("evidence does not describe a slot change")),
     };
     if namespace != request.target.namespace.as_ref()
         || table != request.target.table.as_ref()
@@ -296,9 +421,9 @@ fn decode_keyed_slot_evidence(
     Ok(UnknownCommitEvidence {
         asserted_parent,
         preselected_snapshot,
-        identity: UnknownCommitIdentity::SlotWriter {
+        identity: storage.unwrap_or_else(|| UnknownCommitIdentity::SlotWriter {
             slot: slots[0].clone(),
-        },
+        }),
     })
 }
 

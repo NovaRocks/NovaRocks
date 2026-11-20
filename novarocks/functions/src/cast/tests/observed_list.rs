@@ -116,6 +116,7 @@ fn recipe(
         &FunctionValueType::from_legacy_declared_projection(target.clone(), true),
         policy,
         allow,
+        None,
         &Control::default(),
     )
     .unwrap()
@@ -384,6 +385,7 @@ fn list_cast_recipe_no_new_row_error_and_explicit_unsupported_child_forms() {
                 &FunctionValueType::from_legacy_declared_projection(target, true),
                 DecimalOverflowPolicy::OutputNull,
                 false,
+                None,
                 &Control::default()
             ),
             Err(CastPrepareError::Unsupported)
@@ -397,6 +399,7 @@ fn list_cast_recipe_no_new_row_error_and_explicit_unsupported_child_forms() {
             &FunctionValueType::from_legacy_declared_projection(ty, false),
             DecimalOverflowPolicy::OutputNull,
             false,
+            None,
             &Control::default()
         ),
         Err(CastPrepareError::TypeMismatch)
@@ -473,6 +476,7 @@ fn list_cast_recipe_constant_null_root_broadcast_and_nested_logical_identity_gua
             &FunctionValueType::from_legacy_declared_projection(target, true),
             DecimalOverflowPolicy::OutputNull,
             false,
+            None,
             &Control::default()
         ),
         Err(CastPrepareError::Unsupported)
@@ -524,4 +528,333 @@ fn list_cast_core_keeps_the_exact_child_failure_and_has_no_observation_footer() 
     };
     assert!(Arc::ptr_eq(&actual, &message));
     assert_eq!(calls, 1);
+}
+
+fn null_list_json_types() -> (ArrayRef, FunctionValueType, FunctionValueType) {
+    use novarocks_type_contract::{ValueKind, ValueLayout, ValueTypeRef, ValueTypeStorageLifetime};
+    let source: ArrayRef = Arc::new(ListArray::new(
+        Arc::new(Field::new("item", DataType::Null, true)),
+        OffsetBuffer::new(ScalarBuffer::from(vec![0, 0, 1, 1, 3])),
+        Arc::new(NullArray::new(3)),
+        Some(NullBuffer::from(vec![true, true, false, true])),
+    ));
+    let source_type = FunctionValueType::new(source.data_type().clone(), true);
+    let storage = ValueTypeStorageLifetime::pure();
+    let json = ValueTypeRef::try_new(
+        ValueKind::Nominal(ValueLogicalType::Json),
+        true,
+        storage.clone(),
+    )
+    .unwrap();
+    let semantics = ValueTypeRef::try_new(ValueKind::List(json), true, storage.clone()).unwrap();
+    // The original layout author normalizes field annotations. Runtime output
+    // must retain that exact canonical Field, not interpret these annotations.
+    let layout = ValueLayout::try_new(
+        &DataType::List(Arc::new(
+            Field::new("source_annotation", DataType::Utf8, true).with_metadata(HashMap::from([(
+                "custom".into(),
+                "must not author a nominal identity".into(),
+            )])),
+        )),
+        storage,
+    )
+    .unwrap();
+    let target = FunctionValueType::try_from_value(semantics, layout).unwrap();
+    (source, source_type, target)
+}
+fn json_null_lists(target: &FunctionValueType, offsets: Vec<i32>, roots: Vec<bool>) -> ArrayRef {
+    let DataType::List(field) = target.data_type() else {
+        panic!("target List")
+    };
+    let elements = usize::try_from(*offsets.last().unwrap()).unwrap();
+    Arc::new(ListArray::new(
+        field.clone(),
+        OffsetBuffer::new(ScalarBuffer::from(offsets)),
+        Arc::new(StringArray::from(vec![None::<&str>; elements])),
+        Some(NullBuffer::from(roots)),
+    ))
+}
+
+#[test]
+fn null_list_to_json_or_utf8_keeps_actual_rows_and_nonzero_constant_ordinal() {
+    let (input, source, target) = null_list_json_types();
+    let physical = FunctionValueType::new(target.data_type().clone(), target.nullable());
+    assert_eq!(physical.data_type(), target.data_type());
+    assert_ne!(
+        physical, target,
+        "the identical UTF8 layout does not erase JSON identity"
+    );
+    for target in [target, physical] {
+        let domain = target.child_at(0).unwrap().logical_type();
+        assert_eq!(
+            novarocks_type_contract::is_null_list_to_json_cast(&source, &target),
+            domain == ValueLogicalType::Json
+        );
+        assert_eq!(
+            novarocks_type_contract::preserves_value_domains_observed::<std::convert::Infallible>(
+                source.value_type(),
+                target.value_type(),
+                |_| Ok(())
+            )
+            .unwrap(),
+            domain == ValueLogicalType::Physical
+        );
+        let recipe = PreparedCastRecipe::try_new(
+            CastOperation::Carrier,
+            &source,
+            &target,
+            DecimalOverflowPolicy::ReportError,
+            true,
+            None,
+            &Control::default(),
+        )
+        .unwrap();
+        assert!(recipe.is_collection());
+        assert_eq!(recipe.result_type(), &target);
+        assert_eq!(recipe.policy(), DecimalOverflowPolicy::ReportError);
+        assert!(recipe.allow_throw_exception());
+        let DataType::List(target_field) = target.data_type() else {
+            panic!("target List")
+        };
+        assert_eq!(target_field.name(), "item");
+        assert!(target_field.metadata().is_empty());
+        assert!(matches!(
+            domain,
+            ValueLogicalType::Json | ValueLogicalType::Physical
+        ));
+        for (rows, expected) in [
+            (
+                vec![0, 1, 2, 3],
+                json_null_lists(&target, vec![0, 0, 1, 1, 3], vec![true, true, false, true]),
+            ),
+            (
+                vec![0, 2, 3],
+                json_null_lists(&target, vec![0, 0, 0, 2], vec![true, false, true]),
+            ),
+            (vec![], json_null_lists(&target, vec![0], vec![])),
+        ] {
+            let selection = Selection::try_sparse(4, &rows).unwrap();
+            let out = recipe
+                .evaluate_collection(
+                    EvaluatedArgument::Column(&input),
+                    selection,
+                    &[],
+                    &Control::default(),
+                )
+                .unwrap();
+            same(out.values(), &expected);
+            assert!(out.errors().is_empty());
+            let DataType::List(actual_field) = out.values().data_type() else {
+                panic!("output List")
+            };
+            assert!(
+                Arc::ptr_eq(actual_field, target_field),
+                "the actual target Field remains the representation author"
+            );
+        }
+        let pool = ConstantPool::try_new(
+            Arc::new(source.try_to_field("original_null_list_pool").unwrap()),
+            source.clone(),
+            input.to_data(),
+            ConstantPolicy {
+                max_rows: 16,
+                max_array_nodes: 64,
+                max_logical_elements: 4096,
+                max_retained_buffer_bytes: 65536,
+                max_type_depth: 8,
+                max_type_nodes: 64,
+                max_dictionary_depth: 4,
+                max_metadata_bytes: 4096,
+                max_library_validation_work: 65536,
+                max_library_validation_bytes: 65536,
+            },
+            CompilePhase::Validate,
+            &Control::default(),
+        )
+        .unwrap();
+        let value = pool.value(1).unwrap();
+        assert_eq!(value.ordinal(), 1);
+        assert_eq!(value.pool().backing_identity(), pool.backing_identity());
+        let rows = [1, 4, 8];
+        let selection = Selection::try_sparse(9, &rows).unwrap();
+        let out = recipe
+            .evaluate_collection(
+                EvaluatedArgument::Constant(&value),
+                selection,
+                &[],
+                &Control::default(),
+            )
+            .unwrap();
+        same(
+            out.values(),
+            &json_null_lists(&target, vec![0, 1, 2, 3], vec![true, true, true]),
+        );
+        assert!(out.errors().is_empty());
+    }
+}
+
+#[test]
+fn null_list_to_json_or_utf8_keeps_exact_profile_journal_and_original_refusals() {
+    use novarocks_type_contract::{ValueKind, ValueLayout, ValueTypeRef, ValueTypeStorageLifetime};
+    let (input, source, target) = null_list_json_types();
+    let ordinary = FunctionValueType::new(
+        DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+        true,
+    );
+    assert!(!novarocks_type_contract::is_null_list_to_json_cast(
+        &source, &ordinary
+    ));
+    assert_eq!(
+        PreparedCastRecipe::try_new(
+            CastOperation::Carrier,
+            &source,
+            &ordinary,
+            DecimalOverflowPolicy::OutputNull,
+            false,
+            None,
+            &Control::default()
+        ),
+        Err(CastPrepareError::Unsupported)
+    );
+    let storage = ValueTypeStorageLifetime::pure();
+    let required = FunctionValueType::try_from_value(
+        ValueTypeRef::try_new(
+            ValueKind::List(
+                ValueTypeRef::try_new(
+                    ValueKind::Nominal(ValueLogicalType::Json),
+                    false,
+                    storage.clone(),
+                )
+                .unwrap(),
+            ),
+            true,
+            storage.clone(),
+        )
+        .unwrap(),
+        ValueLayout::try_new(
+            &DataType::List(Arc::new(Field::new("item", DataType::Utf8, false))),
+            storage,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let physical = FunctionValueType::new(target.data_type().clone(), true);
+    let required_physical = FunctionValueType::new(
+        DataType::List(Arc::new(Field::new("item", DataType::Utf8, false))),
+        true,
+    );
+    for wrong in [
+        required,
+        target.with_nullable(false).unwrap(),
+        required_physical,
+        physical.with_nullable(false).unwrap(),
+    ] {
+        assert!(!novarocks_type_contract::is_null_list_to_json_cast(
+            &source, &wrong
+        ));
+        assert!(
+            PreparedCastRecipe::try_new(
+                CastOperation::Carrier,
+                &source,
+                &wrong,
+                DecimalOverflowPolicy::OutputNull,
+                false,
+                None,
+                &Control::default()
+            )
+            .is_err()
+        );
+    }
+    for target in [target, physical] {
+        let recipe = PreparedCastRecipe::try_new(
+            CastOperation::Carrier,
+            &source,
+            &target,
+            DecimalOverflowPolicy::OutputNull,
+            false,
+            None,
+            &Control::default(),
+        )
+        .unwrap();
+        let rows = [0, 2, 3];
+        let selection = Selection::try_sparse(4, &rows).unwrap();
+        let compact =
+            arrow_select::take::take(input.as_ref(), &UInt64Array::from(vec![0u64, 2, 3]), None)
+                .unwrap();
+        let inherited = Box::new([RowDataError::new(1, "original selected child error")]);
+        let selected =
+            SelectedValues::try_new(selection, source.data_type(), compact, inherited).unwrap();
+        let out = recipe
+            .evaluate_collection(
+                EvaluatedArgument::SelectedColumn(&selected),
+                selection,
+                selected.errors(),
+                &Control::default(),
+            )
+            .unwrap();
+        assert_eq!(out.errors(), selected.errors());
+        same(
+            out.values(),
+            &json_null_lists(&target, vec![0, 0, 0, 2], vec![true, false, true]),
+        );
+        let wrong_rows = [0, 1, 3];
+        assert!(matches!(
+            recipe.evaluate_collection(
+                EvaluatedArgument::SelectedColumn(&selected),
+                Selection::try_sparse(4, &wrong_rows).unwrap(),
+                selected.errors(),
+                &Control::default()
+            ),
+            Err(KernelFailure::InvalidProgram(_))
+        ));
+        let list = input.as_any().downcast_ref::<ListArray>().unwrap();
+        let foreign: ArrayRef = Arc::new(ListArray::new(
+            Arc::new(
+                Field::new("item", DataType::Null, true).with_metadata(HashMap::from([(
+                    "custom".into(),
+                    "foreign actual input".into(),
+                )])),
+            ),
+            list.offsets().clone(),
+            list.values().clone(),
+            list.nulls().cloned(),
+        ));
+        assert!(matches!(
+            recipe.evaluate_collection(
+                EvaluatedArgument::Column(&foreign),
+                Selection::all(4),
+                &[],
+                &Control::default()
+            ),
+            Err(KernelFailure::InvalidProgram(_))
+        ));
+        let ok = Control::default();
+        recipe
+            .evaluate_collection(
+                EvaluatedArgument::Column(&input),
+                Selection::all(4),
+                &[],
+                &ok,
+            )
+            .unwrap();
+        let stop = ok.trace.lock().unwrap().len() / 2;
+        for cause in causes() {
+            let control = Control {
+                trace: Mutex::new(vec![]),
+                refusal: Some((stop, cause.clone())),
+            };
+            assert_eq!(
+                recipe
+                    .evaluate_collection(
+                        EvaluatedArgument::Column(&input),
+                        Selection::all(4),
+                        &[],
+                        &control
+                    )
+                    .unwrap_err(),
+                cause
+            );
+            assert_eq!(control.trace.lock().unwrap().len(), stop + 1);
+        }
+    }
 }

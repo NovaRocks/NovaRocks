@@ -28,14 +28,13 @@ DROP TABLE IF EXISTS ${case_db}.t_topn_rank_filter_tie_expand;
 CREATE TABLE ${case_db}.t_topn_rank_filter_tie_expand (
   id INT,
   score INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 INSERT INTO ${case_db}.t_topn_rank_filter_tie_expand VALUES
-  (1, 100),
-  (2, 95),
-  (3, 95),
-  (4, 90),
-  (5, 80);
+  ROW(1, 100),
+  ROW(2, 95),
+  ROW(3, 95),
+  ROW(4, 90),
+  ROW(5, 80);
 SELECT id, score, rk
 FROM (
   SELECT

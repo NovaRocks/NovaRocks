@@ -28,18 +28,16 @@ DROP TABLE IF EXISTS ${case_db}.t_join_cross_a;
 DROP TABLE IF EXISTS ${case_db}.t_join_cross_b;
 CREATE TABLE ${case_db}.t_join_cross_a (
   id INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 CREATE TABLE ${case_db}.t_join_cross_b (
   c STRING
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 INSERT INTO ${case_db}.t_join_cross_a VALUES
-  (1),
-  (2);
+  ROW(1),
+  ROW(2);
 INSERT INTO ${case_db}.t_join_cross_b VALUES
-  ('x'),
-  ('y');
+  ROW('x'),
+  ROW('y');
 SELECT a.id, b.c
 FROM ${case_db}.t_join_cross_a a
 CROSS JOIN ${case_db}.t_join_cross_b b

@@ -24,11 +24,11 @@ DROP TABLE IF EXISTS ${case_db}.t_optimizer_baseline_a;
 DROP TABLE IF EXISTS ${case_db}.t_optimizer_baseline_b;
 CREATE TABLE ${case_db}.t_optimizer_baseline_a (k INT, v INT);
 CREATE TABLE ${case_db}.t_optimizer_baseline_b (k INT, w INT);
-INSERT INTO ${case_db}.t_optimizer_baseline_a VALUES (1, 10), (2, 20);
-INSERT INTO ${case_db}.t_optimizer_baseline_b VALUES (1, 100), (2, 200);
-ANALYZE TABLE ${case_db}.t_optimizer_baseline_a;
-ANALYZE TABLE ${case_db}.t_optimizer_baseline_b;
-EXPLAIN VERBOSE
+INSERT INTO ${case_db}.t_optimizer_baseline_a VALUES ROW(1, 10), ROW(2, 20);
+INSERT INTO ${case_db}.t_optimizer_baseline_b VALUES ROW(1, 100), ROW(2, 200);
+ANALYZE ${case_db}.t_optimizer_baseline_a;
+ANALYZE ${case_db}.t_optimizer_baseline_b;
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
 SELECT a.k, a.v, b.w
 FROM ${case_db}.t_optimizer_baseline_a a
 INNER JOIN ${case_db}.t_optimizer_baseline_b b ON a.k = b.k;

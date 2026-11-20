@@ -41,11 +41,8 @@ row lineage 只由格式版本决定：所有 v3 表都提供这两列，不读�
 无属性或属性为 `false` 的 v3 表同样支持；带属性为 `true` 的 v2 表仍不具备 v3 能力。
 建表例子：
 
-```sql
-CREATE TABLE orders (id BIGINT, v INT)
-TBLPROPERTIES (
-  "format-version" = "3"
-);
+``` sql
+CREATE TABLE orders (id BIGINT, v INT) WITH (format_version = 3);
 ```
 
 v3 表中：

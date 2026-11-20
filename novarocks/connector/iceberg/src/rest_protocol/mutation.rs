@@ -693,7 +693,7 @@ mod tests {
                 "schema-id": 0,
                 "timestamp-ms": 1_600_000_000_000i64,
                 "summary": {},
-                "representations": [{"type": "sql", "sql": "select 0", "dialect": "starrocks"}],
+                "representations": [{"type": "sql", "sql": "select 0", "dialect": "trino"}],
                 "default-namespace": ["db"],
             }],
             "version-log": [{"version-id": 1, "timestamp-ms": 1_600_000_000_000i64}],
@@ -1106,7 +1106,7 @@ mod tests {
                 "schema-id": schema_id,
                 "timestamp-ms": 1_700_000_000_000i64,
                 "summary": {"engine-name": "novarocks", "novarocks.operation-id": "op"},
-                "representations": [{"type": "sql", "sql": "select 2", "dialect": "starrocks"}],
+                "representations": [{"type": "sql", "sql": "select 2", "dialect": "trino"}],
                 "default-catalog": "source",
                 "default-namespace": ["db"],
             })
@@ -1131,7 +1131,7 @@ mod tests {
                         serde_json::to_value(vec![ViewRepresentation::Sql(
                             SqlViewRepresentation {
                                 sql: "select 1".to_string(),
-                                dialect: "starrocks".to_string(),
+                                dialect: "trino".to_string(),
                             },
                         )])
                         .unwrap(),

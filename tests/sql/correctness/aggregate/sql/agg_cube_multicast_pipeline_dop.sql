@@ -24,7 +24,7 @@
 -- 1. Force pipeline parallel execution with pipeline_dop = 5.
 -- 2. Run a minimal CUBE query that triggers MULTI_CAST_DATA_STREAM_SINK and REPEAT paths.
 -- 3. Assert deterministic full result set with detail, subtotal, and grand-total rows.
-SET pipeline_dop = 5;
+SET SESSION pipeline_dop = 5;
 
 WITH t AS (
     SELECT 1 AS a, 'x' AS b
@@ -38,4 +38,4 @@ FROM t
 GROUP BY CUBE(a, b)
 ORDER BY a, b;
 
-SET pipeline_dop = 0;
+SET SESSION pipeline_dop = 0;

@@ -31,8 +31,7 @@ create table base_table (
     c1 int,
     c2 string,
     c3 int
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 3
 -- @skip_result_check=true
@@ -47,8 +46,7 @@ create table agg_with_limit_seq (
     c1 int,
     c2 string,
     c3 int
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 5
 -- @skip_result_check=true

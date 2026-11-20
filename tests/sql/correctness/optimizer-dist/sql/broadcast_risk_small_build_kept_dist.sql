@@ -16,7 +16,7 @@
 -- under the License.
 
 -- @tags=optimizer,bc1,distribution,dist-only
-CREATE DATABASE IF NOT EXISTS ${case_db};
+CREATE SCHEMA IF NOT EXISTS ${case_db};
 USE ${case_db};
 CREATE TABLE probe_1m (k INT, v BIGINT);
 CREATE TABLE build_1000 (k INT);
@@ -24,12 +24,12 @@ INSERT INTO probe_1m
     SELECT generate_series, generate_series FROM TABLE(generate_series(1, 1000000));
 INSERT INTO build_1000
     SELECT generate_series FROM TABLE(generate_series(1, 1000));
-ANALYZE TABLE probe_1m;
-ANALYZE TABLE build_1000;
-SET cbo_broadcast_node_mem_budget_bytes = 268435456;
+ANALYZE probe_1m;
+ANALYZE build_1000;
+SET SESSION cbo_broadcast_node_mem_budget_bytes = 268435456;
 -- @explain_contains=HASH JOIN (BROADCAST
 -- @explain_contains=bcast_verdict=feasible
-SELECT COUNT(*) AS cnt FROM probe_1m p JOIN build_1000 b ON p.k = b.k;
+SELECT COUNT() AS cnt FROM probe_1m p JOIN build_1000 b ON p.k = b.k;
 
 -- The build has ten i64 keys: 80 payload bytes; every backend receives it.
 -- @skip_result_check=true
@@ -41,7 +41,7 @@ SELECT COUNT(*) AS cnt FROM probe_1m p JOIN build_1000 b ON p.k = b.k;
 -- @result_contains=activation = BlockingSnapshot
 -- @result_not_contains=HASH JOIN (PARTITIONED
 -- @query_stats_contract={"tables":[],"broadcast":{"distribution":"BROADCAST","join_kind":"INNER","verdict":"feasible","forced":false,"backends":3,"risk_multiplier":2,"per_node_budget_bytes":268435456,"cluster_network_budget_bytes":268435456},"payload":{"kind":"exact","bytes":80},"hash_table":{"kind":"exact","build_rows":10,"load_factor":0.75,"per_row_overhead_bytes":16}}
-EXPLAIN COSTS
+EXPLAIN WITH SESSION explain_detail = 'COSTS'
 WITH p AS (
     SELECT generate_series AS k
     FROM TABLE(generate_series(1, 1000))
@@ -50,5 +50,5 @@ b AS (
     SELECT generate_series AS k
     FROM TABLE(generate_series(1, 10))
 )
-SELECT COUNT(*) AS cnt
+SELECT COUNT() AS cnt
 FROM p JOIN b ON p.k = b.k;

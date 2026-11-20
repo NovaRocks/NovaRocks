@@ -148,6 +148,7 @@ fn run_fencing_child(policy: Policy) {
             operation_id: ConnectorMutationOperationId::new(),
             target: target.clone(),
             operation: ConnectorCatalogMutationOperation::CreateNamespace {
+                properties: Vec::new(),
                 namespace: ConnectorNamespaceIdentity {
                     instance_id: target.instance_id.clone(),
                     namespace: namespace.clone().into(),
@@ -186,12 +187,23 @@ fn run_fencing_child(policy: Policy) {
                     name: "id".into(),
                     data_type: ConnectorDataType::BigInt,
                     nullable: false,
-                    aggregation: None,
                     default: None,
                 }],
-                key: None,
-                partitioning: Vec::new(),
-                properties: vec![("format-version".into(), "2".into())],
+                comment: None,
+                properties: vec![
+                    (
+                        "format".into(),
+                        novarocks_spi::connector::DdlPropertyValue::Varchar("PARQUET".into()),
+                    ),
+                    (
+                        "format_version".into(),
+                        novarocks_spi::connector::DdlPropertyValue::Integer(2),
+                    ),
+                    (
+                        "partitioning".into(),
+                        novarocks_spi::connector::DdlPropertyValue::ArrayVarchar(vec![]),
+                    ),
+                ],
                 policy: match policy {
                     Policy::Strict => CreatePolicy::FailIfExists,
                     Policy::NoOp => CreatePolicy::NoOpIfExists,

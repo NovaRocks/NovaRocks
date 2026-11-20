@@ -1398,8 +1398,8 @@ mod tests {
         };
         let predicate = TypedExpr {
             kind: ExprKind::InList {
-                expr: Box::new(child.clone()),
-                list: vec![child; 320],
+                expr: novarocks_parser::ast::AstBox::new(child.clone()),
+                list: (vec![child; 320]).into(),
                 negated: false,
             },
             value_type: FunctionValueType::new(DataType::Boolean, false),

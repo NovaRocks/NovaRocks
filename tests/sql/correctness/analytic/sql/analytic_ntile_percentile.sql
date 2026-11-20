@@ -27,14 +27,13 @@
 CREATE TABLE ${case_db}.t_analytic_ntile_percentile (
     grp VARCHAR(10),
     v INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t_analytic_ntile_percentile VALUES
-    ('A', 10),
-    ('A', 20),
-    ('A', 30),
-    ('A', 40);
+    ROW('A', 10),
+    ROW('A', 20),
+    ROW('A', 30),
+    ROW('A', 40);
 
 SELECT
     grp,

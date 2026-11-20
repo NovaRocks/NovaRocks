@@ -34,19 +34,17 @@
 DROP TABLE IF EXISTS ${case_db}.t_cte_0;
 DROP TABLE IF EXISTS ${case_db}.t_cte_1;
 CREATE TABLE ${case_db}.t_cte_0 (
-    v1 bigint NULL,
-    v2 bigint NULL,
-    v3 bigint NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+    v1 bigint ,
+    v2 bigint ,
+    v3 bigint
+) WITH (format_version = 3);
 CREATE TABLE ${case_db}.t_cte_1 (
-    v4 bigint NULL,
-    v5 bigint NULL,
-    v6 bigint NULL
-)
-TBLPROPERTIES ("format-version" = "3");
-INSERT INTO ${case_db}.t_cte_0 VALUES (1, 2, 3), (2, 3, 4), (3, 4, 5);
-INSERT INTO ${case_db}.t_cte_1 VALUES (1, 10, 100), (2, 20, 200), (4, 40, 400);
+    v4 bigint ,
+    v5 bigint ,
+    v6 bigint
+) WITH (format_version = 3);
+INSERT INTO ${case_db}.t_cte_0 VALUES ROW(1, 2, 3), ROW(2, 3, 4), ROW(3, 4, 5);
+INSERT INTO ${case_db}.t_cte_1 VALUES ROW(1, 10, 100), ROW(2, 20, 200), ROW(4, 40, 400);
 
 -- query 2
 -- @order_sensitive=true

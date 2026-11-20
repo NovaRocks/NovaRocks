@@ -63,24 +63,17 @@ impl SqlAggregateCalls {
         let ast::SetExpr::Select(select) = query.body.as_ref() else {
             return Err("extract_aggregate_sql_calls: expected a plain SELECT body".to_string());
         };
-        let group_by_exprs = match &select.group_by {
-            ast::GroupBy::Expressions { expressions, .. } if matches!(expressions.as_slice(), [ast::Expr::Identifier(ident)] if !ident.quoted && ident.value.eq_ignore_ascii_case("all")) =>
-            {
-                return Err("incremental aggregate MV requires an explicit non-empty GROUP BY; GROUP BY ALL is unsupported".to_string());
-            }
-            ast::GroupBy::Expressions { expressions, .. } if !expressions.is_empty() => expressions,
-            ast::GroupBy::Expressions { .. } | ast::GroupBy::None => {
-                return Err("incremental aggregate MV requires a non-empty GROUP BY".to_string());
-            }
-            ast::GroupBy::Rollup { .. }
-            | ast::GroupBy::Cube { .. }
-            | ast::GroupBy::GroupingSets { .. } => {
-                return Err("incremental aggregate MV requires an explicit non-empty GROUP BY; GROUP BY ALL is unsupported".to_string());
-            }
-        };
+        let group_by_exprs = crate::analyzer::simple_group_by_expressions(&select.group_by).ok_or_else(|| "incremental aggregate MV requires an explicit non-empty GROUP BY; GROUP BY ALL is unsupported".to_string())?;
+        if matches!(group_by_exprs.as_slice(), [ast::Expr::Identifier(ident)] if !ident.quoted && ident.value.eq_ignore_ascii_case("all"))
+        {
+            return Err("incremental aggregate MV requires an explicit non-empty GROUP BY; GROUP BY ALL is unsupported".to_string());
+        }
+        if group_by_exprs.is_empty() {
+            return Err("incremental aggregate MV requires a non-empty GROUP BY".to_string());
+        }
 
         let mut group_keys = group_by_exprs
-            .iter()
+            .into_iter()
             .cloned()
             .map(|expr| SqlAggregateGroupKey {
                 output_name: String::new(),
@@ -90,12 +83,19 @@ impl SqlAggregateCalls {
         let mut aggregates = Vec::new();
         let mut visible_outputs = Vec::with_capacity(select.projection.len());
         let mut projected_group_keys = vec![false; group_keys.len()];
+        let group_keys_sql = group_keys
+            .iter()
+            .map(|key| printer::print_expression(&key.expr))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
 
         for item in &select.projection {
             let (expr, output_name) = projection_expr_and_output_name(item)?;
-            if let Some(group_key_index) = group_keys.iter().position(|group_key| {
-                printer::print_expr(&group_key.expr) == printer::print_expr(expr)
-            }) {
+            let expression_sql =
+                printer::print_expression(expr).map_err(|error| error.to_string())?;
+            if let Some(group_key_index) =
+                group_keys_sql.iter().position(|key| *key == expression_sql)
+            {
                 if group_keys[group_key_index].output_name.is_empty() {
                     group_keys[group_key_index].output_name = output_name;
                 }
@@ -191,7 +191,6 @@ pub(crate) fn rewrite_select_sql_for_state(
                 projection.push(build::item(
                     key.expr.clone(),
                     Some(select_alias_ident(&key.output_name)),
-                    true,
                 ));
             }
             VisibleAggregateOutput::Aggregate(index) => {
@@ -207,15 +206,24 @@ pub(crate) fn rewrite_select_sql_for_state(
             SQL_MV_AGG_RETRACTION_COUNT_STATE_COLUMN,
         ));
     }
-    select.projection = projection;
+    select.projection = projection.into();
     Ok(query)
 }
 
 fn projection_expr_and_output_name(item: &ast::SelectItem) -> Result<(&ast::Expr, String), String> {
     match item {
-        ast::SelectItem::UnnamedExpr(expr) => Ok((expr, printer::print_expr(expr))),
-        ast::SelectItem::ExprWithAlias { expr, alias, .. } => Ok((expr, alias.value.clone())),
-        ast::SelectItem::QualifiedWildcard { .. } | ast::SelectItem::Wildcard { .. } => Err(
+        ast::SelectItem::SingleColumn(column) => Ok((
+            &column.expression,
+            column
+                .alias
+                .as_ref()
+                .map_or_else(
+                    || printer::print_expression(&column.expression),
+                    |alias| Ok(alias.value.clone()),
+                )
+                .map_err(|error| error.to_string())?,
+        )),
+        ast::SelectItem::AllColumns(_) => Err(
             "incremental aggregate MV projection can only contain expressions or aliases"
                 .to_string(),
         ),
@@ -234,70 +242,62 @@ fn classify_aggregate_call(
     };
     if function.name.parts.len() != 1
         || function.null_treatment.is_some()
-        || function.over.is_some()
+        || function.window.is_some()
+        || function.processing_mode.is_some()
+        || function
+            .arguments
+            .iter()
+            .any(|argument| argument.name.is_some())
         || function.filter.is_some()
-        || !function.order_by.is_empty()
+        || function.order_by.is_some()
     {
         return Err(aggregate_error());
     }
     let name = function.name.parts[0].value.to_ascii_lowercase();
-    let args = &function.arguments;
+    let argument_values = function
+        .arguments
+        .iter()
+        .map(|argument| &argument.value)
+        .collect::<Vec<_>>();
+    let args = argument_values.as_slice();
     let (function, input) = match name.as_str() {
-        "count" if matches!(function.quantifier, ast::FunctionQuantifier::Distinct) => (
+        "count" if function.distinct => (
             AggregateFunctionKind::CountDistinct,
             single_expression_input(args, "COUNT(DISTINCT)")?,
         ),
-        "count" if matches!(function.quantifier, ast::FunctionQuantifier::None) => {
-            count_input(args)?
-        }
-        "count_distinct" | "multi_distinct_count"
-            if matches!(function.quantifier, ast::FunctionQuantifier::None) =>
-        {
-            (
-                AggregateFunctionKind::CountDistinct,
-                single_expression_input(args, "COUNT(DISTINCT)")?,
-            )
-        }
-        "approx_count_distinct" | "ndv" | "hll_ndv"
-            if matches!(function.quantifier, ast::FunctionQuantifier::None) =>
-        {
-            (
-                AggregateFunctionKind::ApproxCountDistinct,
-                single_expression_input(args, "APPROX_COUNT_DISTINCT")?,
-            )
-        }
-        "sum" if matches!(function.quantifier, ast::FunctionQuantifier::None) => (
+        "count" if !function.distinct => count_input(args)?,
+        "count_distinct" | "multi_distinct_count" if !function.distinct => (
+            AggregateFunctionKind::CountDistinct,
+            single_expression_input(args, "COUNT(DISTINCT)")?,
+        ),
+        "approx_count_distinct" | "ndv" | "hll_ndv" if !function.distinct => (
+            AggregateFunctionKind::ApproxCountDistinct,
+            single_expression_input(args, "APPROX_COUNT_DISTINCT")?,
+        ),
+        "sum" if !function.distinct => (
             AggregateFunctionKind::Sum,
             single_expression_input(args, "SUM")?,
         ),
-        "avg" if matches!(function.quantifier, ast::FunctionQuantifier::None) => (
+        "avg" if !function.distinct => (
             AggregateFunctionKind::Avg,
             single_expression_input(args, "AVG")?,
         ),
-        "min" if matches!(function.quantifier, ast::FunctionQuantifier::None) => (
+        "min" if !function.distinct => (
             AggregateFunctionKind::Min,
             single_expression_input(args, "MIN/MAX")?,
         ),
-        "max" if matches!(function.quantifier, ast::FunctionQuantifier::None) => (
+        "max" if !function.distinct => (
             AggregateFunctionKind::Max,
             single_expression_input(args, "MIN/MAX")?,
         ),
-        "bool_or" | "boolor_agg"
-            if matches!(function.quantifier, ast::FunctionQuantifier::None) =>
-        {
-            (
-                AggregateFunctionKind::BoolOr,
-                single_expression_input(args, "BOOL_OR/BOOL_AND")?,
-            )
-        }
-        "bool_and" | "booland_agg"
-            if matches!(function.quantifier, ast::FunctionQuantifier::None) =>
-        {
-            (
-                AggregateFunctionKind::BoolAnd,
-                single_expression_input(args, "BOOL_OR/BOOL_AND")?,
-            )
-        }
+        "bool_or" | "boolor_agg" if !function.distinct => (
+            AggregateFunctionKind::BoolOr,
+            single_expression_input(args, "BOOL_OR/BOOL_AND")?,
+        ),
+        "bool_and" | "booland_agg" if !function.distinct => (
+            AggregateFunctionKind::BoolAnd,
+            single_expression_input(args, "BOOL_OR/BOOL_AND")?,
+        ),
         _ => return Err(aggregate_error()),
     };
     Ok(SqlAggregateCall {
@@ -307,7 +307,10 @@ fn classify_aggregate_call(
     })
 }
 
-fn count_input(args: &[ast::Expr]) -> Result<(AggregateFunctionKind, SqlAggregateInput), String> {
+fn count_input(args: &[&ast::Expr]) -> Result<(AggregateFunctionKind, SqlAggregateInput), String> {
+    if args.is_empty() {
+        return Ok((AggregateFunctionKind::Count, SqlAggregateInput::Star));
+    }
     let [arg] = args else {
         return Err(aggregate_error());
     };
@@ -317,19 +320,19 @@ fn count_input(args: &[ast::Expr]) -> Result<(AggregateFunctionKind, SqlAggregat
         }
         expr => Ok((
             AggregateFunctionKind::Count,
-            SqlAggregateInput::Expr(Box::new(expr.clone())),
+            SqlAggregateInput::Expr(Box::new((**expr).clone())),
         )),
     }
 }
 
-fn single_expression_input(args: &[ast::Expr], label: &str) -> Result<SqlAggregateInput, String> {
+fn single_expression_input(args: &[&ast::Expr], label: &str) -> Result<SqlAggregateInput, String> {
     let [arg] = args else {
         return Err(format!("{label} requires exactly one column expression"));
     };
     if matches!(arg, ast::Expr::Identifier(ident) if ident.value == "*") {
         return Err(format!("{label}(*) is not supported"));
     }
-    Ok(SqlAggregateInput::Expr(Box::new(arg.clone())))
+    Ok(SqlAggregateInput::Expr(Box::new((**arg).clone())))
 }
 
 fn aggregate_error() -> String {
@@ -407,9 +410,9 @@ fn select_alias_ident(alias: &str) -> ast::Ident {
         .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
         && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric());
     if plain {
-        build::ident(alias, None)
+        build::ident(alias, false)
     } else {
-        build::ident(alias, Some('`'))
+        build::ident(alias, true)
     }
 }
 
@@ -420,17 +423,16 @@ fn aggregate_select_item(
 ) -> Result<ast::SelectItem, String> {
     Ok(build::item(
         build::function(
-            build::object_name(vec![build::ident(function_name, None)])
+            build::object_name(vec![build::ident(function_name, false)])
                 .map_err(|error| error.to_string())?,
             vec![argument],
         ),
-        Some(build::ident(alias, None)),
-        true,
+        Some(build::ident(alias, false)),
     ))
 }
 
 fn count_star_select_item(alias: &str) -> ast::SelectItem {
-    build::item(build::count_star(), Some(build::ident(alias, None)), true)
+    build::item(build::count_star(), Some(build::ident(alias, false)))
 }
 
 #[cfg(test)]
@@ -438,10 +440,7 @@ mod tests {
     use super::*;
 
     fn parse(sql: &str) -> ast::Query {
-        let statements = novarocks_parser::parse(sql).unwrap();
-        let [ast::Statement::Query(query)] = statements.as_slice() else {
-            panic!("expected query");
-        };
+        let query = &novarocks_parser::parser::parse_query(sql).unwrap();
         query.clone()
     }
 
@@ -451,7 +450,8 @@ mod tests {
         let calls = SqlAggregateCalls::extract(&query).unwrap();
         assert_eq!(calls.aggregates.len(), 1);
         assert_eq!(state_column_name("total"), "__agg_state_total");
-        let sql = printer::print_query(&rewrite_select_sql_for_state(&query, &calls).unwrap());
+        let sql =
+            printer::print_query(&rewrite_select_sql_for_state(&query, &calls).unwrap()).unwrap();
         assert!(sql.contains("sum_state(v) AS __agg_state_total"), "{sql}");
         assert!(
             sql.contains("COUNT(*) AS __agg_state___ivm_row_count"),

@@ -36,10 +36,10 @@ use novarocks_spi::connector::write_stack::{
 };
 use novarocks_spi::connector::{
     ConnectorColumnDefinition, ConnectorControlPlanningPin, ConnectorError, ConnectorErrorKind,
-    ConnectorPartitionTransform, ConnectorRequestContext, ConnectorStagedCreateSession,
-    ConnectorStagedTableHandle, ConnectorStagedWritePlanningRequest, ConnectorStagedWriteProof,
-    ConnectorWriteAdmissionPurpose, ConnectorWriteInputRequest, ConnectorWriteIntent,
-    ConnectorWriteTargetRef, ExternalMutationFinalization,
+    ConnectorRequestContext, ConnectorStagedCreateSession, ConnectorStagedTableHandle,
+    ConnectorStagedWritePlanningRequest, ConnectorStagedWriteProof, ConnectorWriteAdmissionPurpose,
+    ConnectorWriteInputRequest, ConnectorWriteIntent, ConnectorWriteTargetRef, DdlPropertyValue,
+    ExternalMutationFinalization,
 };
 use std::{
     collections::BTreeMap,
@@ -68,6 +68,11 @@ pub(crate) enum CreatePublicationInput {
         context: ConnectorRequestContext,
     },
 }
+pub(crate) struct CreateStorageDeclarations {
+    pub(crate) visible_partition_sources: Vec<Arc<str>>,
+    pub(crate) properties: Arc<[(Arc<str>, DdlPropertyValue)]>,
+}
+
 #[expect(
     clippy::large_enum_variant,
     reason = "The complete CREATE output moves from the original Arc-backed activation Body into the existing stable CREATE Body; inline variants avoid an additional variant allocation."
@@ -75,8 +80,8 @@ pub(crate) enum CreatePublicationInput {
 pub(crate) enum CreatePublicationOutput {
     StageDeclarations {
         columns: Vec<ConnectorColumnDefinition>,
-        partitioning: Vec<ConnectorPartitionTransform>,
-        properties: BTreeMap<Arc<str>, Arc<str>>,
+        storage: CreateStorageDeclarations,
+        application_properties: BTreeMap<Arc<str>, Arc<str>>,
     },
     Publication {
         begin: ConnectorWriteBeginRequest,
@@ -95,13 +100,12 @@ impl CreatePublicationInput {
                     .map(crate::catalog_application::statement::connector_column)
                     .collect::<Result<_, _>>()
                     .map_err(invalid)?,
-                partitioning: plan
-                    .partition_fields
-                    .iter()
-                    .map(crate::catalog_application::statement::connector_partition_transform)
-                    .collect(),
-                properties: plan
-                    .target_properties
+                storage: CreateStorageDeclarations {
+                    visible_partition_sources: plan.storage.visible_partition_sources.clone(),
+                    properties: plan.storage.properties.clone(),
+                },
+                application_properties: plan
+                    .application_properties
                     .iter()
                     .map(|(key, value)| (Arc::from(key.as_str()), Arc::from(value.as_str())))
                     .collect(),

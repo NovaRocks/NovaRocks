@@ -19,22 +19,20 @@
 
 pub mod ast;
 pub mod build;
+pub mod keyword;
+pub mod lexer;
 pub mod parser;
 pub mod printer;
+pub mod recursion;
+pub mod token;
 
 mod error;
-mod keyword;
-mod lexer;
 mod messages;
 mod span;
-mod token;
 
-pub use ast::{validate_statement, validate_statements};
+pub use ast::validate_statement;
 pub use error::{
     ERROR_CODE_DESCRIPTORS, LexError, ParseError, ParserError, StructuralViolation, ValidateError,
 };
-pub use keyword::{KeywordClass, class as keyword_class};
-pub use lexer::lex;
-pub use parser::parse;
+pub use keyword::KeywordClass;
 pub use span::{LineCol, SYNTHETIC, Span};
-pub use token::{Keyword, Symbol, Token, TokenKind, TriviaKind};

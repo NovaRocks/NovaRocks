@@ -26,9 +26,9 @@ CREATE TABLE ${case_db}.t_datetime_insert_values (
   dt DATETIME
 );
 INSERT INTO ${case_db}.t_datetime_insert_values VALUES
-  (1, '2024-03-01 10:20:30');
+  ROW(1, '2024-03-01 10:20:30');
 INSERT INTO ${case_db}.t_datetime_insert_values
-SELECT 2, CAST('2024-12-31 23:59:59' AS DATETIME);
+SELECT 2, CAST('2024-12-31 23:59:59' AS TIMESTAMP);
 INSERT INTO ${case_db}.t_datetime_insert_values
 SELECT 3, NULL;
 SELECT id, dt, YEAR(dt) AS y

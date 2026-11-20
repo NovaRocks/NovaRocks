@@ -225,9 +225,9 @@ mod tests {
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
 
             kind: ExprKind::BinaryOp {
-                left: Box::new(a),
+                left: novarocks_parser::ast::AstBox::new(a),
                 op: BinOp::Eq,
-                right: Box::new(b),
+                right: novarocks_parser::ast::AstBox::new(b),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
         }
@@ -238,9 +238,9 @@ mod tests {
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
 
             kind: ExprKind::BinaryOp {
-                left: Box::new(a),
+                left: novarocks_parser::ast::AstBox::new(a),
                 op: BinOp::And,
-                right: Box::new(b),
+                right: novarocks_parser::ast::AstBox::new(b),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
         }
@@ -251,7 +251,7 @@ mod tests {
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
 
             kind: ExprKind::IsNull {
-                expr: Box::new(e),
+                expr: novarocks_parser::ast::AstBox::new(e),
                 negated: true,
             },
         }

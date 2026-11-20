@@ -21,9 +21,9 @@
 CREATE TABLE ${case_db}.dict_null_t (
   k INT,
   s STRING
-) TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 INSERT INTO ${case_db}.dict_null_t VALUES
-  (1, 'a'), (2, NULL), (3, 'a'), (4, NULL), (5, 'b');
+  ROW(1, 'a'), ROW(2, NULL), ROW(3, 'a'), ROW(4, NULL), ROW(5, 'b');
 SELECT s,
   CASE WHEN COUNT(s) = 0 THEN 'true' ELSE 'false' END AS is_null,
   COUNT(*) AS c

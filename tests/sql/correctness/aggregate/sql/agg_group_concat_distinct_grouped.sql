@@ -27,19 +27,22 @@
 CREATE TABLE ${case_db}.t_agg_group_concat_distinct_grouped (
     k INT,
     s STRING
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t_agg_group_concat_distinct_grouped VALUES
-    (1, 'b'),
-    (2, 'a'),
-    (3, 'b'),
-    (4, NULL),
-    (5, 'c');
+    ROW(1, 'b'),
+    ROW(2, 'a'),
+    ROW(3, 'b'),
+    ROW(4, NULL),
+    ROW(5, 'c');
 
 SELECT
     MOD(k, 2) AS g,
-    group_concat(DISTINCT s ORDER BY s SEPARATOR ',') AS gc
+    string_agg(DISTINCT s
+,
+ ','
+ORDER BY s
+) AS gc
 FROM ${case_db}.t_agg_group_concat_distinct_grouped
 GROUP BY g
 ORDER BY g;

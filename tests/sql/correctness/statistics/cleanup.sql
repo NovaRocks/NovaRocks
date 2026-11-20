@@ -15,5 +15,5 @@
 -- specific language governing permissions and limitations
 -- under the License.
 
-DROP CATALOG IF EXISTS `statistics_cat_${suite_uuid0}`;
-DROP CATALOG IF EXISTS `statistics_hadoop_${suite_uuid0}`;
+DROP CATALOG IF EXISTS "statistics_cat_${suite_uuid0}";
+DROP CATALOG IF EXISTS "statistics_hadoop_${suite_uuid0}";

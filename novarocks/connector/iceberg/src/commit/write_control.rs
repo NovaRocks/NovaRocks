@@ -113,6 +113,16 @@ impl ConnectorWriteControl for IcebergWriteControl {
         ConnectorPreReadyWritePlanningProof::try_issue(self.key.clone(), &request)
     }
 
+    fn parse_managed_partitioning_element(
+        &self,
+        field: Option<&str>,
+        index: usize,
+        control: &dyn novarocks_spi::connector::ConnectorOperationControl,
+    ) -> Result<novarocks_spi::connector::ConnectorPartitionTransform, ConnectorError> {
+        crate::table_properties::parse_optional_partitioning_element(field, index, control)
+            .map_err(novarocks_spi::connector::InvalidTableProperty::from_property_error)
+    }
+
     fn preview_managed_partition_spec(
         &self,
         request: ConnectorManagedPartitionSpecPreviewRequest,
@@ -124,6 +134,28 @@ impl ConnectorWriteControl for IcebergWriteControl {
             return Err(invalid(
                 "Iceberg metadata tables cannot be repartition targets",
             ));
+        }
+        if request.replacement().storage_properties().is_some() {
+            use crate::catalog::admission::{
+                CatalogAdmissionRequest, CatalogOperation, connector_unsupported,
+            };
+            let catalog = self.provider.runtime().novarocks_catalog().as_ref();
+            catalog
+                .admit(&CatalogAdmissionRequest::new(
+                    CatalogOperation::PublishDocuments,
+                    crate::catalog::CatalogTableName::new(
+                        table.namespace.as_str(),
+                        table.table.as_str(),
+                    ),
+                    request.context().initiation(),
+                ))
+                .map_err(connector_unsupported)?;
+            super::write_stack::repartition::admit_storage_alter(
+                catalog,
+                &table.namespace,
+                &table.table,
+                request.context(),
+            )?;
         }
         let table_info = table.table_info.ok_or_else(|| {
             corrupt("admitted Iceberg repartition target is missing its frozen table descriptor")
@@ -139,19 +171,24 @@ impl ConnectorWriteControl for IcebergWriteControl {
         // The same preview the write session runs when it prepares the real
         // transition, so an accepted preview and the transition that follows it
         // cannot disagree about the partitioning they establish.
-        let prepared = super::write_stack::repartition::preview_managed_repartition(
+        let prepared = super::write_stack::repartition::prepare_managed_repartition(
             &metadata,
             request.replacement(),
+            request.context(),
         )?;
         let (exact_partition_spec_version, exact_partition_fields) =
             exact_preview_partition_binding(&prepared, request.context())?;
-        ConnectorManagedPartitionSpecPreview::try_new(
+        let preview = ConnectorManagedPartitionSpecPreview::try_new(
             self.key.clone(),
             request.operation_id(),
             prepared.committed().clone(),
             exact_partition_spec_version,
             exact_partition_fields,
-        )
+        )?;
+        Ok(match prepared.storage_projection_digest() {
+            Some(digest) => preview.with_storage_projection_digest(digest),
+            None => preview,
+        })
     }
 }
 
@@ -331,6 +368,46 @@ mod tests {
     }
 
     #[test]
+    fn repartition_property_parsing_uses_the_admitted_write_control() {
+        use novarocks_spi::connector::{
+            ConnectorPartitionTransform, ConnectorWrite, InvalidTableProperty,
+        };
+
+        let (_executor, control) = control();
+        let owner = control.binding_key().clone();
+        let lease = ConnectorWrite::new(owner.clone(), Arc::new(control), || {}).expect("lease");
+        let table =
+            ConnectorTableHandle::try_new(owner.instance_id, Bytes::from_static(b"admitted-table"))
+                .expect("table handle");
+        let context = request_context();
+        assert_eq!(
+            lease
+                .parse_managed_partitioning_element(&table, Some("bucket(id, 16)"), 0, &context)
+                .expect("partitioning property"),
+            ConnectorPartitionTransform::Bucket {
+                column: "id".into(),
+                num_buckets: 16
+            },
+        );
+        let null = lease
+            .parse_managed_partitioning_element(&table, None, 2, &context)
+            .expect_err("NULL partitioning property");
+        assert!(InvalidTableProperty::from_connector_error(&null).is_some());
+        assert!(null.message().contains("index 2"));
+
+        let foreign_table = ConnectorTableHandle::try_new(
+            ConnectorInstanceId::parse("foreign").expect("instance"),
+            Bytes::from_static(b"admitted-table"),
+        )
+        .expect("foreign table handle");
+        let foreign = lease
+            .parse_managed_partitioning_element(&foreign_table, None, 2, &context)
+            .expect_err("foreign connector instance");
+        assert_eq!(foreign.kind(), ConnectorErrorKind::InvalidRequest);
+        assert!(InvalidTableProperty::from_connector_error(&foreign).is_none());
+    }
+
+    #[test]
     fn repartition_preview_uses_the_same_exact_binding_as_iceberg_observation() {
         let schema = crate::iceberg::spec::Schema::builder()
             .with_fields(vec![Arc::new(crate::iceberg::spec::NestedField::required(
@@ -371,9 +448,10 @@ mod tests {
             ],
         )
         .expect("replacement");
-        let prepared = super::super::write_stack::repartition::preview_managed_repartition(
+        let prepared = super::super::write_stack::repartition::prepare_managed_repartition(
             &metadata,
             &replacement,
+            &request_context(),
         )
         .expect("prepared repartition");
         let (spec_version, fields) = exact_preview_partition_binding(&prepared, &request_context())

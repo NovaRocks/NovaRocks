@@ -23,11 +23,10 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.dictionary_seed (id INT NOT NULL, label STRING)
-TBLPROPERTIES ("format-version" = "3");
-INSERT INTO ${case_db}.dictionary_seed VALUES (7,'a'),(19,'a'),(27,'b'),(35,NULL);
+CREATE TABLE ${case_db}.dictionary_seed (id INT NOT NULL, label STRING) WITH (format_version = 3);
+INSERT INTO ${case_db}.dictionary_seed VALUES ROW(7,'a'),ROW(19,'a'),ROW(27,'b'),ROW(35,NULL);
 
-SET cbo_broadcast_node_mem_budget_bytes = 0;
+SET SESSION cbo_broadcast_node_mem_budget_bytes = 0;
 
 -- query 2
 -- @order_sensitive=true
@@ -38,7 +37,7 @@ ORDER BY l.id;
 
 -- query 3
 -- @skip_result_check=true
-SET cbo_broadcast_node_mem_budget_bytes = 1073741824;
+SET SESSION cbo_broadcast_node_mem_budget_bytes = 1073741824;
 
 -- query 4
 -- @order_sensitive=true

@@ -27,8 +27,7 @@
 -- Setup: create table for column-based tests
 -- @skip_result_check=true
 USE ${case_db};
-CREATE TABLE t1 (id int, v1 bigint, v2 string, v3 array<int>)
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE t1 (id int, v1 bigint, v2 string, v3 array<int>) WITH (format_version = 3);
 
 -- query 2
 -- ENCODE_ROW_ID with constant NULL args
@@ -149,7 +148,7 @@ SELECT FROM_BINARY(ENCODE_SORT_KEY('', 9223372036854775806, CAST(465254298 AS IN
 -- Insert data for column-based tests
 -- @skip_result_check=true
 USE ${case_db};
-INSERT INTO t1 VALUES(1, 9223372036854775807, 'STARROCKS', [1, 2, 3]), (2, -9223372036854775807, 'STARROCKS', [1, 2, 3]), (3, 9223372036854775806, 'STARROCKS', [1, 2, 3]);
+INSERT INTO t1 VALUES ROW(1, 9223372036854775807, 'STARROCKS', [1, 2, 3]), ROW(2, -9223372036854775807, 'STARROCKS', [1, 2, 3]), ROW(3, 9223372036854775806, 'STARROCKS', [1, 2, 3]);
 
 -- query 31
 -- ENCODE_ROW_ID on table columns

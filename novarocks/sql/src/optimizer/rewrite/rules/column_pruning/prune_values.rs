@@ -311,6 +311,7 @@ mod tests {
         let b = literal(&mut arena, "b");
         let bad_cast = arena.intern(
             ScalarNode::Cast {
+                array_failure_mode: None,
                 child: a,
                 target: DataType::Int64,
                 decimal_overflow_policy:

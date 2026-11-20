@@ -31,49 +31,48 @@
 -- @skip_result_check=true
 DROP TABLE IF EXISTS ${case_db}.t0;
 CREATE TABLE ${case_db}.t0 (
-  `region` varchar(128) NOT NULL COMMENT "",
-  `order_date` date NOT NULL COMMENT "",
-  `income` decimal(7, 0) NOT NULL COMMENT "",
-  `ship_mode` int NOT NULL COMMENT "",
-  `ship_code` int)
-TBLPROPERTIES ("format-version" = "3");
+  "region" varchar(128) NOT NULL,
+  "order_date" date NOT NULL,
+  "income" decimal(7, 0) NOT NULL,
+  "ship_mode" int NOT NULL,
+  "ship_code" int) WITH (format_version = 3);
 
 -- query 2
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t0 (`region`, `order_date`, `income`, `ship_mode`, `ship_code`) VALUES
-('USA', '2022-01-01', 12345, 50, 1),
-('CHINA', '2022-01-02', 54321, 51, 4),
-('JAPAN', '2022-01-03', 67890, 610, 6),
-('UK', '2022-01-04', 98765, 75, 2),
-('AUS', '2022-01-01', 23456, 25, 18),
-('AFRICA', '2022-01-02', 87654, 125, 7),
-('USA', '2022-01-03', 54321, 75, null),
-('CHINA', '2022-01-04', 12345, 100, 3),
-('JAPAN', '2022-01-01', 67890, 64, 10),
-('UK', '2022-01-02', 54321, 25, 5),
-('AUS', '2022-01-03', 98765, 150, 15),
-('AFRICA', '2022-01-04', 23456, 75, null),
-('USA', '2022-01-01', 87654, 125, 2),
-('CHINA', '2022-01-02', 54321, 175, 12),
-('JAPAN', '2022-01-03', 12345, 100, 3),
-('UK', '2022-01-04', 67890, 50, 10),
-('AUS', '2022-01-01', 54321, 25, 5),
-('AFRICA', '2022-01-02', 98765, 150, 15),
-('USA', '2022-01-03', 23456, 75, 18),
-('CHINA', '2022-01-04', 87654, 125, 7),
-('JAPAN', '2022-01-01', 54321, 175, 12),
-('UK', '2022-01-02', 12345, 86, 3),
-('AUS', '2022-01-03', 67890, 50, 10),
-('AFRICA', '2022-01-04', 54321, 25, 95),
-('USA', '2022-01-01', 98765, 150, 55),
-('CHINA', '2022-01-02', 23456, 75, 88),
-('JAPAN', '2022-01-03', 87654, 125, 67),
-('UK', '2022-01-04', 54321, 82, 72),
-('AUS', '2022-01-01', 12345, 90, 35),
-('AFRICA', '2022-01-02', 67890, 50, 100),
-('USA', '2022-01-03', 54321, 25, 5),
-('CHINA', '2022-01-04', 98765, 150, 15),
-('JAPAN', '2022-01-01', 23456, 75, null);
+INSERT INTO ${case_db}.t0 ("region", "order_date", "income", "ship_mode", "ship_code") VALUES
+ROW('USA', '2022-01-01', 12345, 50, 1),
+ROW('CHINA', '2022-01-02', 54321, 51, 4),
+ROW('JAPAN', '2022-01-03', 67890, 610, 6),
+ROW('UK', '2022-01-04', 98765, 75, 2),
+ROW('AUS', '2022-01-01', 23456, 25, 18),
+ROW('AFRICA', '2022-01-02', 87654, 125, 7),
+ROW('USA', '2022-01-03', 54321, 75, null),
+ROW('CHINA', '2022-01-04', 12345, 100, 3),
+ROW('JAPAN', '2022-01-01', 67890, 64, 10),
+ROW('UK', '2022-01-02', 54321, 25, 5),
+ROW('AUS', '2022-01-03', 98765, 150, 15),
+ROW('AFRICA', '2022-01-04', 23456, 75, null),
+ROW('USA', '2022-01-01', 87654, 125, 2),
+ROW('CHINA', '2022-01-02', 54321, 175, 12),
+ROW('JAPAN', '2022-01-03', 12345, 100, 3),
+ROW('UK', '2022-01-04', 67890, 50, 10),
+ROW('AUS', '2022-01-01', 54321, 25, 5),
+ROW('AFRICA', '2022-01-02', 98765, 150, 15),
+ROW('USA', '2022-01-03', 23456, 75, 18),
+ROW('CHINA', '2022-01-04', 87654, 125, 7),
+ROW('JAPAN', '2022-01-01', 54321, 175, 12),
+ROW('UK', '2022-01-02', 12345, 86, 3),
+ROW('AUS', '2022-01-03', 67890, 50, 10),
+ROW('AFRICA', '2022-01-04', 54321, 25, 95),
+ROW('USA', '2022-01-01', 98765, 150, 55),
+ROW('CHINA', '2022-01-02', 23456, 75, 88),
+ROW('JAPAN', '2022-01-03', 87654, 125, 67),
+ROW('UK', '2022-01-04', 54321, 82, 72),
+ROW('AUS', '2022-01-01', 12345, 90, 35),
+ROW('AFRICA', '2022-01-02', 67890, 50, 100),
+ROW('USA', '2022-01-03', 54321, 25, 5),
+ROW('CHINA', '2022-01-04', 98765, 150, 15),
+ROW('JAPAN', '2022-01-01', 23456, 75, null);
 
 -- query 3
 -- @skip_result_check=true
@@ -282,7 +281,7 @@ select * from ${case_db}.t0 where
 -- CASE result <=> NULL: null-safe equal; returns rows where CASE result is NULL
 -- (with ELSE=3, no rows match)
 select * from ${case_db}.t0 where
-(case region when 'China' then 1 when 'Japan' then 2 else 3 end) <=> NULL order by 1,2,3,4,5;
+(case region when 'China' then 1 when 'Japan' then 2 else 3 end)  IS NOT DISTINCT FROM  NULL order by 1,2,3,4,5;
 
 -- query 33
 -- CASE result IN (1, NULL): rows where CASE result = 1 (NULL in list doesn't match via IN)
@@ -400,45 +399,44 @@ select * from ${case_db}.t0 where (case
 -- @skip_result_check=true
 DROP TABLE IF EXISTS ${case_db}.ads_opt;
 CREATE TABLE ${case_db}.ads_opt (
-  `region` varchar(128) NOT NULL COMMENT "",
-  `handed_dept_name` int NOT NULL COMMENT "")
-TBLPROPERTIES ("format-version" = "3");
+  "region" varchar(128) NOT NULL,
+  "handed_dept_name" int NOT NULL) WITH (format_version = 3);
 
 -- query 58
 -- Deeply nested CASE WHEN LIKE/REPLACE on empty table: result must be empty (0 rows)
 SELECT *,
        CASE
-         WHEN `handling_department_2` LIKE '%Ganzhou Transfer Yard%'
-           THEN REPLACE(`handling_department_2`, 'Ganzhou Transfer Yard', 'Ganzhou Transfer Yard Loading/Unloading Team 1')
-         WHEN `handling_department_2` LIKE '%Zhexi Hub Center%'
-           THEN REPLACE(`handling_department_2`, 'Zhexi Hub Center', 'Hangzhou Transfer Yard')
-         WHEN `handling_department_2` LIKE '%Shanghai Hub Center%'
-           THEN REPLACE(`handling_department_2`, 'Shanghai Hub Center', 'Shanghai Transfer Yard')
-         WHEN `handling_department_2` LIKE '%Changzhou Transfer Center%'
-           THEN REPLACE(`handling_department_2`, 'Changzhou Transfer Center', 'Changzhou Transfer Yard')
-         WHEN `handling_department_2` LIKE '%Nanjing Transfer Center%'
-           THEN REPLACE(`handling_department_2`, 'Nanjing Transfer Center', 'Nanjing Transfer Yard')
-         ELSE `handling_department_2`
-       END AS `handling_department_3`
+         WHEN "handling_department_2" LIKE '%Ganzhou Transfer Yard%'
+           THEN REPLACE("handling_department_2", 'Ganzhou Transfer Yard', 'Ganzhou Transfer Yard Loading/Unloading Team 1')
+         WHEN "handling_department_2" LIKE '%Zhexi Hub Center%'
+           THEN REPLACE("handling_department_2", 'Zhexi Hub Center', 'Hangzhou Transfer Yard')
+         WHEN "handling_department_2" LIKE '%Shanghai Hub Center%'
+           THEN REPLACE("handling_department_2", 'Shanghai Hub Center', 'Shanghai Transfer Yard')
+         WHEN "handling_department_2" LIKE '%Changzhou Transfer Center%'
+           THEN REPLACE("handling_department_2", 'Changzhou Transfer Center', 'Changzhou Transfer Yard')
+         WHEN "handling_department_2" LIKE '%Nanjing Transfer Center%'
+           THEN REPLACE("handling_department_2", 'Nanjing Transfer Center', 'Nanjing Transfer Yard')
+         ELSE "handling_department_2"
+       END AS "handling_department_3"
 FROM (
     SELECT *,
            CASE
-             WHEN `handling_department` LIKE '%Ganzhou Transfer Yard%'
-               THEN REPLACE(`handling_department`, 'Ganzhou Transfer Yard', 'Ganzhou Transfer Yard Loading/Unloading Team 1')
-             WHEN `handling_department` LIKE '%Zhexi Hub Center%'
-               THEN REPLACE(`handling_department`, 'Zhexi Hub Center', 'Hangzhou Transfer Yard')
-             WHEN `handling_department` LIKE '%Shanghai Hub Center%'
-               THEN REPLACE(`handling_department`, 'Shanghai Hub Center', 'Shanghai Transfer Yard')
-             WHEN `handling_department` LIKE '%Changzhou Transfer Center%'
-               THEN REPLACE(`handling_department`, 'Changzhou Transfer Center', 'Changzhou Transfer Yard')
-             WHEN `handling_department` LIKE '%Nanjing Transfer Center%'
-               THEN REPLACE(`handling_department`, 'Nanjing Transfer Center', 'Nanjing Transfer Yard')
-             ELSE `handling_department`
-           END AS `handling_department_2`
+             WHEN "handling_department" LIKE '%Ganzhou Transfer Yard%'
+               THEN REPLACE("handling_department", 'Ganzhou Transfer Yard', 'Ganzhou Transfer Yard Loading/Unloading Team 1')
+             WHEN "handling_department" LIKE '%Zhexi Hub Center%'
+               THEN REPLACE("handling_department", 'Zhexi Hub Center', 'Hangzhou Transfer Yard')
+             WHEN "handling_department" LIKE '%Shanghai Hub Center%'
+               THEN REPLACE("handling_department", 'Shanghai Hub Center', 'Shanghai Transfer Yard')
+             WHEN "handling_department" LIKE '%Changzhou Transfer Center%'
+               THEN REPLACE("handling_department", 'Changzhou Transfer Center', 'Changzhou Transfer Yard')
+             WHEN "handling_department" LIKE '%Nanjing Transfer Center%'
+               THEN REPLACE("handling_department", 'Nanjing Transfer Center', 'Nanjing Transfer Yard')
+             ELSE "handling_department"
+           END AS "handling_department_2"
     FROM (
-        SELECT CAST(`handling_department` AS STRING) AS `handling_department`
+        SELECT CAST("handling_department" AS STRING) AS "handling_department"
         FROM (
-            SELECT handed_dept_name AS `handling_department`
+            SELECT handed_dept_name AS "handling_department"
             FROM ${case_db}.ads_opt
         ) dataset_table
     ) table_1

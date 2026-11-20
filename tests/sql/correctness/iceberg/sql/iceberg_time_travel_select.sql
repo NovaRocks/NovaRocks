@@ -21,21 +21,21 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE DATABASE iceberg_cat_${suite_uuid0}.iceberg_tt_db_${uuid0};
+CREATE SCHEMA iceberg_cat_${suite_uuid0}.iceberg_tt_db_${uuid0};
 USE iceberg_cat_${suite_uuid0}.iceberg_tt_db_${uuid0};
 CREATE TABLE t_tt_${uuid0} (id INT, v INT);
 
 -- query 2
 -- @skip_result_check=true
-INSERT INTO t_tt_${uuid0} VALUES (1, 10), (2, 20);
+INSERT INTO t_tt_${uuid0} VALUES ROW(1, 10), ROW(2, 20);
 
 -- query 3
 -- @skip_result_check=true
-ALTER TABLE iceberg_cat_${suite_uuid0}.iceberg_tt_db_${uuid0}.t_tt_${uuid0} CREATE BRANCH backup;
+CREATE BRANCH backup IN TABLE iceberg_cat_${suite_uuid0}.iceberg_tt_db_${uuid0}.t_tt_${uuid0};
 
 -- query 4
 -- @skip_result_check=true
-INSERT INTO t_tt_${uuid0} VALUES (3, 30);
+INSERT INTO t_tt_${uuid0} VALUES ROW(3, 30);
 
 -- query 5 default SELECT sees the latest main (3 rows).
 SELECT id, v FROM t_tt_${uuid0} ORDER BY id;
@@ -58,6 +58,6 @@ SELECT
 
 -- query 9
 -- @skip_result_check=true
-ALTER TABLE iceberg_cat_${suite_uuid0}.iceberg_tt_db_${uuid0}.t_tt_${uuid0} DROP BRANCH backup;
+DROP BRANCH backup IN TABLE iceberg_cat_${suite_uuid0}.iceberg_tt_db_${uuid0}.t_tt_${uuid0};
 DROP TABLE iceberg_cat_${suite_uuid0}.iceberg_tt_db_${uuid0}.t_tt_${uuid0};
-DROP DATABASE iceberg_cat_${suite_uuid0}.iceberg_tt_db_${uuid0};
+DROP SCHEMA iceberg_cat_${suite_uuid0}.iceberg_tt_db_${uuid0};

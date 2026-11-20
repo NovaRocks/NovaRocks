@@ -30,7 +30,7 @@ CREATE TABLE ${case_db}.t0 (
   k1 INT,
   c1 INT
 );
-INSERT INTO ${case_db}.t0 VALUES (1, 1);
+INSERT INTO ${case_db}.t0 VALUES ROW(1, 1);
 
 -- query 2
 -- @order_sensitive=true

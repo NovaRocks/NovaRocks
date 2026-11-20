@@ -169,6 +169,7 @@ fn arithmetic_and_both_comparison_conversion_steps_share_selected_completion() {
         target: &float,
         decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
         allow_throw_exception: true,
+        array_failure_mode: None,
     };
     let output = array(
         evaluate_constant_node(
@@ -257,6 +258,7 @@ fn cast_overflow_is_a_row_error_and_capability_absence_declines() {
             target: &int,
             decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
             allow_throw_exception: true,
+            array_failure_mode: None,
         })),
         &[source],
         &int,
@@ -272,6 +274,7 @@ fn cast_overflow_is_a_row_error_and_capability_absence_declines() {
             target: &target,
             decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
             allow_throw_exception: true,
+            array_failure_mode: None,
         })),
         &[source],
         &target,

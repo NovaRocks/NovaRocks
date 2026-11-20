@@ -23,16 +23,14 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE DATABASE iceberg_rest_${suite_uuid0}.iceberg_rest_iw7_db_${uuid0};
+CREATE SCHEMA iceberg_rest_${suite_uuid0}.iceberg_rest_iw7_db_${uuid0};
 
 -- query 2
 -- @skip_result_check=true
 CREATE TABLE iceberg_rest_${suite_uuid0}.iceberg_rest_iw7_db_${uuid0}.t_iw7_${uuid0} (
   id INT,
   region STRING
-)
-PARTITION BY (region)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (partitioning = ARRAY['region'], format_version = 3);
 
 -- query 3
 -- @skip_result_check=true
@@ -42,7 +40,7 @@ ALTER TABLE iceberg_rest_${suite_uuid0}.iceberg_rest_iw7_db_${uuid0}.t_iw7_${uui
 -- query 4
 -- @skip_result_check=true
 INSERT INTO iceberg_rest_${suite_uuid0}.iceberg_rest_iw7_db_${uuid0}.t_iw7_${uuid0} (region, id)
-VALUES ('us', 1), ('eu', 2);
+VALUES ROW('us', 1), ROW('eu', 2);
 
 -- query 5
 -- Column-list VALUES append must reorder columns and materialize amount=7.
@@ -66,7 +64,7 @@ SELECT id, region, amount
 -- query 8
 -- @expect_error=expected 1 values for column list, got 2
 INSERT INTO iceberg_rest_${suite_uuid0}.iceberg_rest_iw7_db_${uuid0}.t_iw7_${uuid0} (id)
-VALUES (100, 'dropped');
+VALUES ROW(100, 'dropped');
 
 -- query 9
 -- The failed INSERT must not add a row.
@@ -79,4 +77,4 @@ DROP TABLE iceberg_rest_${suite_uuid0}.iceberg_rest_iw7_db_${uuid0}.t_iw7_${uuid
 
 -- query 11
 -- @skip_result_check=true
-DROP DATABASE iceberg_rest_${suite_uuid0}.iceberg_rest_iw7_db_${uuid0};
+DROP SCHEMA iceberg_rest_${suite_uuid0}.iceberg_rest_iw7_db_${uuid0};

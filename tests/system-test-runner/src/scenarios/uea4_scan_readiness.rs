@@ -165,19 +165,19 @@ impl Environment {
     fn iceberg_catalog_sql(&self, name: &str, s3_endpoint: &str) -> String {
         let (credential, generation) = self.paimon.credential();
         format!(
-            "CREATE EXTERNAL CATALOG {name} PROPERTIES(\"type\"=\"iceberg\",\
-             \"iceberg.catalog.type\"=\"rest\",\"uri\"=\"{}\",\
-             \"iceberg.catalog.warehouse\"=\"{}\",\
-             \"aws.s3.endpoint\"=\"{}\",\"aws.s3.region\"=\"{}\",\
-             \"aws.s3.enable_path_style_access\"=\"true\",\
-             \"credential.object-store-metadata.consumer-role\"=\"frontend\",\
-             \"credential.object-store-metadata.mode\"=\"static\",\
-             \"credential.object-store-metadata.name\"=\"{credential}\",\
-             \"credential.object-store-metadata.generation\"=\"{generation}\",\
-             \"credential.object-store-data.consumer-role\"=\"backend\",\
-             \"credential.object-store-data.mode\"=\"static\",\
-             \"credential.object-store-data.name\"=\"{credential}\",\
-             \"credential.object-store-data.generation\"=\"{generation}\")",
+            "CREATE CATALOG {name} USING iceberg WITH (\
+             \"iceberg.catalog.type\" = 'rest',\"uri\" = '{}',\
+             \"iceberg.catalog.warehouse\" = '{}',\
+             \"aws.s3.endpoint\" = '{}',\"aws.s3.region\" = '{}',\
+             \"aws.s3.enable_path_style_access\" = 'true',\
+             \"credential.object-store-metadata.consumer-role\" = 'frontend',\
+             \"credential.object-store-metadata.mode\" = 'static',\
+             \"credential.object-store-metadata.name\" = '{credential}',\
+             \"credential.object-store-metadata.generation\" = '{generation}',\
+             \"credential.object-store-data.consumer-role\" = 'backend',\
+             \"credential.object-store-data.mode\" = 'static',\
+             \"credential.object-store-data.name\" = '{credential}',\
+             \"credential.object-store-data.generation\" = '{generation}')",
             sql_string(&self.rest_uri),
             sql_string(&self.warehouse),
             sql_string(s3_endpoint),
@@ -215,7 +215,7 @@ impl Catalogs {
         }
         control
             .execute(format!(
-                "CREATE DATABASE IF NOT EXISTS {DIRECT_ICEBERG}.{DATABASE}"
+                "CREATE SCHEMA IF NOT EXISTS {DIRECT_ICEBERG}.{DATABASE}"
             ))
             .map(|_| ())
             .context("create the scenario's Iceberg namespace")?;
@@ -261,7 +261,7 @@ impl IcebergTable {
             .with_context(|| format!("write {qualified}"))?;
         let files: Vec<String> = control
             .execute(format!(
-                "SELECT file_path FROM {qualified}$files WHERE content = 0"
+                "SELECT file_path FROM {DIRECT_ICEBERG}.{DATABASE}.\"{name}$files\" WHERE content = 0"
             ))
             .and_then(file_paths)
             .with_context(|| format!("list {qualified} data files"))?;
@@ -328,7 +328,7 @@ fn connect(context: &ScenarioContext, operation: &str) -> Result<SqlSession> {
 }
 
 fn sql_string(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
+    value.replace('\'', "''")
 }
 
 /// Preserve actual type declarations, NULL and typed values. Catalog names are

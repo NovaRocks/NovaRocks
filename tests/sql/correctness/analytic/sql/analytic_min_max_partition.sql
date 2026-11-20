@@ -28,15 +28,14 @@ CREATE TABLE ${case_db}.t_analytic_min_max_partition (
     grp VARCHAR(10),
     id INT,
     v INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t_analytic_min_max_partition VALUES
-    ('A', 1, 9),
-    ('A', 2, 3),
-    ('A', 3, 7),
-    ('B', 4, NULL),
-    ('B', 5, 8);
+    ROW('A', 1, 9),
+    ROW('A', 2, 3),
+    ROW('A', 3, 7),
+    ROW('B', 4, NULL),
+    ROW('B', 5, 8);
 
 SELECT
     grp,

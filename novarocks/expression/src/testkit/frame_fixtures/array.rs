@@ -160,6 +160,7 @@ fn invocation_program_with(
                 None,
                 source_type.clone(),
                 ExprKind::Cast {
+                    array_failure_mode: None,
                     expr: data,
                     target: source_type.data_type().clone(),
                     decimal_overflow_policy:
@@ -212,6 +213,7 @@ fn invocation_program_with(
                 None,
                 bool_ty.clone(),
                 ExprKind::Cast {
+                    array_failure_mode: None,
                     expr: remainder,
                     target: DataType::Boolean,
                     decimal_overflow_policy:
@@ -262,6 +264,7 @@ fn invocation_program_with(
                     None,
                     flag_type.clone(),
                     ExprKind::Cast {
+                        array_failure_mode: None,
                         expr: tail,
                         target: DataType::Boolean,
                         decimal_overflow_policy:

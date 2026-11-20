@@ -357,6 +357,7 @@ fn physical_call_request_value_and_cast_stay_nonconstant_with_actual_nullable_so
     let cast = source(
         result.clone(),
         ExprKind::Cast {
+            array_failure_mode: None,
             expr: ExprId::new(0),
             target: DataType::Utf8,
             decimal_overflow_policy: DecimalOverflowPolicy::ReportError,

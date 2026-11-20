@@ -53,8 +53,8 @@ under the License.
 
 列出表的所有 snapshot 与基本元信息。
 
-```sql
-SELECT * FROM orders$snapshots;
+``` sql
+SELECT * FROM "orders$snapshots";
 ```
 
 | 列 | 类型 | 说明 |
@@ -70,8 +70,8 @@ SELECT * FROM orders$snapshots;
 
 列出"什么时候哪个 snapshot 变成 current"的时间线。
 
-```sql
-SELECT * FROM orders$history;
+``` sql
+SELECT * FROM "orders$history";
 ```
 
 | 列 | 类型 |
@@ -87,8 +87,8 @@ SELECT * FROM orders$history;
 
 列出表的所有 branch / tag。
 
-```sql
-SELECT * FROM orders$refs;
+``` sql
+SELECT * FROM "orders$refs";
 ```
 
 | 列 | 类型 |
@@ -104,8 +104,8 @@ SELECT * FROM orders$refs;
 
 `$files` 列出所选 snapshot 的有效文件，`content=0` 是数据文件，`content=1` 是 position-delete 文件，`content=2` 是 equality-delete 文件。需要删除文件统计时，按 `$files.content` 筛选并聚合。`$entries` 保留 manifest entry 的状态，可能包含已删除 entry；它与 `$files` 的有效文件集合不同。`$manifests` 列出该 snapshot 引用的 manifest。
 
-```sql
-SELECT content, COUNT(*) FROM orders$files GROUP BY content;
+``` sql
+SELECT content, COUNT(*) FROM "orders$files" GROUP BY content;
 ```
 
 `$files.partition` 与 `$entries.partition` 使用同一个统一 ROW 布局：
@@ -121,8 +121,8 @@ SELECT content, COUNT(*) FROM orders$files GROUP BY content;
 
 对同一次冻结解析所得的 `$files` 过滤 `content=0`，汇总数据文件；不统计 delete 文件，也不按已应用删除扣减文件声明的行数。
 
-```sql
-SELECT * FROM orders$partitions;
+``` sql
+SELECT * FROM "orders$partitions";
 ```
 
 | 列 | 类型 | 可空 | 说明 |
@@ -138,12 +138,9 @@ SELECT * FROM orders$partitions;
 
 ## 与 Spark / Trino 兼容性
 
-NovaRocks 的语法用 `<tbl>$<metatype>`（`$` 分隔），与 Spark 一致：
-
-- ✅ NovaRocks: `SELECT * FROM orders$snapshots`
-- ✅ Spark: `SELECT * FROM orders$snapshots` 或 `SELECT * FROM orders.snapshots`
-
-> Spark 也支持 `<tbl>.<metatype>` 形式（点号），NovaRocks 当前**只接受 `$` 形式**，因为点号会与 schema/database 限定名歧义。如果你从 Spark 搬 SQL，把 `.snapshots` 换成 `$snapshots` 即可。
+NovaRocks 与 Trino 使用双引号包住整个 metadata 表名，例如
+`SELECT * FROM "orders$snapshots"`。从 Spark 转写 `orders.snapshots` 时，用
+`"orders$snapshots"` 作表名。
 
 ---
 
@@ -161,12 +158,12 @@ NovaRocks 的语法用 `<tbl>$<metatype>`（`$` 分隔），与 Spark 一致：
 
 ## 时间旅行 + metadata table
 
-可以组合 time travel 与 metadata table 查"某个历史 snapshot 当时的状态"：
+时间旅行用于普通 Iceberg 表。下面的语句能通过解析，但 NovaRocks 分析阶段会拒绝对 metadata table 使用时间旅行。
 
 ```sql
--- 历史 partition 一览
-SELECT * FROM orders$partitions FOR VERSION AS OF 1234567890;
+-- 语法有效，但分析阶段拒绝对 metadata table 使用时间旅行
+SELECT * FROM "orders$partitions" FOR VERSION AS OF 1234567890;
 
--- 历史 ref 列表
-SELECT * FROM orders$refs FOR TIMESTAMP AS OF '2026-05-01 00:00:00';
+-- 按时间戳访问 metadata table 同样会被拒绝
+SELECT * FROM "orders$refs" FOR TIMESTAMP AS OF '2026-05-01 00:00:00';
 ```

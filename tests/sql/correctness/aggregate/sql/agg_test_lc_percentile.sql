@@ -26,46 +26,45 @@ USE ${case_db};
 -- query 2
 -- @skip_result_check=true
 USE ${case_db};
-CREATE TABLE `test_pc` (
-  `date` date NULL COMMENT "",
-  `datetime` datetime NULL COMMENT "",
-  `db` double NULL COMMENT "",
-  `id` int(11) NULL COMMENT "",
-  `name` varchar(255) NULL COMMENT "",
-  `subject` varchar(255) NULL COMMENT "",
-  `score` int(11) NULL COMMENT ""
-)
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE "test_pc" (
+  "date" date,
+  "datetime" datetime,
+  "db" double,
+  "id" int(11),
+  "name" varchar(255),
+  "subject" varchar(255),
+  "score" int(11)
+) WITH (format_version = 3);
 
 -- query 3
 -- @skip_result_check=true
 USE ${case_db};
-insert into test_pc values ("2018-01-01","2018-01-01 00:00:01",11.1,1,"Tom","English",90);
+insert into test_pc values ROW('2018-01-01','2018-01-01 00:00:01',11.1,1,'Tom','English',90);
 
 -- query 4
 -- @skip_result_check=true
 USE ${case_db};
-insert into test_pc values ("2019-01-01","2019-01-01 00:00:01",11.2,1,"Tom","English",91);
+insert into test_pc values ROW('2019-01-01','2019-01-01 00:00:01',11.2,1,'Tom','English',91);
 
 -- query 5
 -- @skip_result_check=true
 USE ${case_db};
-insert into test_pc values ("2020-01-01","2020-01-01 00:00:01",11.3,1,"Tom","English",92);
+insert into test_pc values ROW('2020-01-01','2020-01-01 00:00:01',11.3,1,'Tom','English',92);
 
 -- query 6
 -- @skip_result_check=true
 USE ${case_db};
-insert into test_pc values ("2021-01-01","2021-01-01 00:00:01",11.4,1,"Tom","English",93);
+insert into test_pc values ROW('2021-01-01','2021-01-01 00:00:01',11.4,1,'Tom','English',93);
 
 -- query 7
 -- @skip_result_check=true
 USE ${case_db};
-insert into test_pc values ("2022-01-01","2022-01-01 00:00:01",11.5,1,"Tom","English",94);
+insert into test_pc values ROW('2022-01-01','2022-01-01 00:00:01',11.5,1,'Tom','English',94);
 
 -- query 8
 -- @skip_result_check=true
 USE ${case_db};
-insert into test_pc values (NULL,NULL,NULL,NULL,"Tom","English",NULL);
+insert into test_pc values ROW(NULL,NULL,NULL,NULL,'Tom','English',NULL);
 
 -- query 9
 USE ${case_db};
@@ -157,7 +156,7 @@ USE ${case_db};
 
 -- query 31
 USE ${case_db};
-select `date`, percentile_disc_lc(score, 0) from test_pc group by `date` order by 1,2;
+select "date", percentile_disc_lc(score, 0) from test_pc group by "date" order by 1,2;
 
 -- query 32
 -- @skip_result_check=true
@@ -165,7 +164,7 @@ USE ${case_db};
 
 -- query 33
 USE ${case_db};
-select `date`, percentile_disc_lc(score, 0) from test_pc group by `date` order by 1,2;
+select "date", percentile_disc_lc(score, 0) from test_pc group by "date" order by 1,2;
 
 -- query 34
 -- @expect_error=between 0 and 1

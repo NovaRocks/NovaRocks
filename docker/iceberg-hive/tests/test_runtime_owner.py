@@ -4,6 +4,7 @@
 # information. Licensed under the Apache License, Version 2.0.
 import importlib.util
 import re
+import shlex
 import tomllib
 from pathlib import Path
 import sys
@@ -152,18 +153,96 @@ class HiveOwnerTest(unittest.TestCase):
     def test_repeated_up_preserves_bind_mount_inodes_and_secret_free_sql(self):
         record = self.hive.up(self.manifest(), 'local-hms')
         directory = self.hive.directory(self.identity)
-        names = ('compose.yml', 'compose.env', 'core-site.xml', 'ice-hms-catalog.sql', 'spark-hms-defaults.conf', 'env.sh')
-        before = {n: ((directory / n).stat().st_ino, (directory / n).read_bytes()) for n in names}
-        self.hive.up(self.manifest(), 'local-hms')
-        self.assertEqual(before, {n: ((directory / n).stat().st_ino, (directory / n).read_bytes()) for n in names})
-        sql = (directory / 'ice-hms-catalog.sql').read_text()
-        self.assertNotIn('= "secret"', sql)
-        self.assertNotIn('= "key"', sql)
-        self.assertIn('"credential.object-store-metadata.consumer-role" = "frontend"', sql)
-        self.assertIn('"credential.object-store-data.consumer-role" = "backend"', sql)
+        catalog_sql, env_file = self.assert_trino_presentation(record)
+        paths = [directory / name for name in ('compose.yml', 'compose.env', 'core-site.xml',
+                                               'spark-hms-defaults.conf')]
+        paths.extend((catalog_sql, env_file))
+        before = self.file_snapshot(paths)
+        self.assertEqual(self.hive.up(self.manifest(), 'local-hms'), record)
+        self.assertEqual(self.file_snapshot(paths), before)
+        sql = catalog_sql.read_text()
+        self.assertNotIn("= 'secret'", sql)
+        self.assertNotIn("= 'key'", sql)
+        self.assertIn("\"credential.object-store-metadata.consumer-role\" = 'frontend'", sql)
+        self.assertIn("\"credential.object-store-data.consumer-role\" = 'backend'", sql)
         record['minio']['secret_access_key'] = 'changed'
         with self.assertRaisesRegex(hive.runtime.RuntimeFailure, 'core-site.xml'):
             self.hive.render(record)
+
+    @staticmethod
+    def file_snapshot(paths):
+        return {path: (path.stat().st_ino, path.read_bytes()) for path in paths}
+
+    def assert_trino_presentation(self, record):
+        directory = self.hive.directory(self.identity)
+        catalog_sql = Path(record['hms']['catalog_sql'])
+        env_file = Path(record['env_file'])
+        self.assertEqual(catalog_sql.parent, directory / hive.SQL_PRESENTATION)
+        self.assertEqual(env_file, catalog_sql.parent / 'env.sh')
+        self.assertTrue(catalog_sql.read_text().startswith('CREATE CATALOG ice_hms USING iceberg WITH (\n'))
+        self.assertIn(f'export NOVAROCKS_ICE_HMS_CATALOG_SQL={shlex.quote(str(catalog_sql))}',
+                      env_file.read_text().splitlines())
+        self.assertIn(f'export NOVAROCKS_SPARK_EXTRA_DEFAULTS={shlex.quote(record["hms"]["spark_defaults"])}',
+                      env_file.read_text().splitlines())
+        return catalog_sql, env_file
+
+    def seed_earlier_publication(self, ready):
+        record = self.hive.prepare(self.manifest(), 'local-hms')
+        directory = self.hive.directory(self.identity)
+        old_sql = directory / 'ice-hms-catalog.sql'
+        old_env = directory / 'env.sh'
+        record['hms']['catalog_sql'] = str(old_sql)
+        self.hive.save(record)
+        old_sql.write_bytes(b'CREATE EXTERNAL CATALOG ice_hms\nPROPERTIES (\n  "type" = "iceberg"\n);\n')
+        old_env.write_bytes(f'export NOVAROCKS_ICE_HMS_CATALOG_SQL={shlex.quote(str(old_sql))}\n'.encode())
+        if ready:
+            with mock.patch.object(self.hive, 'publish_presentation', side_effect=lambda record: record):
+                record = self.hive.up(self.manifest(), 'local-hms')
+        frozen = [old_sql, old_env, directory / 'compose.yml', directory / 'core-site.xml',
+                  directory / 'spark-hms-defaults.conf']
+        return record, frozen
+
+    def test_ready_earlier_publication_reuses_runtime_and_frozen_bytes(self):
+        previous, frozen = self.seed_earlier_publication(ready=True)
+        directory = self.hive.directory(self.identity)
+        frozen.extend((directory / 'manifest.json', directory / 'compose.env'))
+        before = self.file_snapshot(frozen)
+        calls, events = list(self.backend.calls), list(self.backend.events)
+        record = self.hive.up(self.manifest(), 'different-recommendation')
+        self.assert_trino_presentation(record)
+        for field in ('machine_generation', 'project', 'network_id', 'volumes', 'container_id',
+                      'images', 'ports'):
+            self.assertEqual(record[field], previous[field])
+        self.assertEqual(self.file_snapshot(frozen), before)
+        self.assertEqual(self.backend.calls, calls)
+        self.assertEqual(self.backend.events, events)
+
+    def test_prepared_earlier_publication_can_start_before_republishing(self):
+        previous, frozen = self.seed_earlier_publication(ready=False)
+        before = self.file_snapshot(frozen)
+        record = self.hive.up(self.manifest(), 'local-hms')
+        self.assertEqual(record['state'], 'ready')
+        self.assert_trino_presentation(record)
+        self.assertEqual(record['volumes'], previous['volumes'])
+        self.assertEqual(record['network_id'], previous['network_id'])
+        self.assertEqual(self.file_snapshot(frozen), before)
+
+    def test_failed_env_write_leaves_version_unpublished_and_retryable(self):
+        atomic_bytes = hive.runtime.atomic_bytes
+
+        def fail_env(path, content):
+            if path.name == 'env.sh':
+                raise OSError('injected env write failure')
+            atomic_bytes(path, content)
+
+        with mock.patch.object(hive.runtime, 'atomic_bytes', side_effect=fail_env):
+            with self.assertRaisesRegex(OSError, 'injected env write failure'):
+                self.hive.up(self.manifest(), 'local-hms', prepare_only=True)
+        directory = self.hive.directory(self.identity)
+        self.assertFalse((directory / hive.SQL_PRESENTATION).exists())
+        self.assertEqual(list(directory.glob(f'.{hive.SQL_PRESENTATION}-*')), [])
+        self.assert_trino_presentation(self.hive.up(self.manifest(), 'local-hms', prepare_only=True))
+        self.assertEqual(self.backend.calls, [])
 
     def test_interrupted_attachment_keeps_original_target_for_manual_maintenance(self):
         self.owner.attach_consumer = mock.Mock(side_effect=hive.runtime.RuntimeFailure('MachineUnavailable', 'injected'))

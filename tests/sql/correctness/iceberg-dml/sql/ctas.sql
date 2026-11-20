@@ -23,23 +23,20 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.src (id INT, name VARCHAR(16))
-TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+CREATE TABLE ${case_db}.src (id INT, name VARCHAR(16)) WITH (format_version = 3);
 
 -- query 2
 -- @skip_result_check=true
-INSERT INTO ${case_db}.src VALUES (1, 'alice'), (2, 'bob');
+INSERT INTO ${case_db}.src VALUES ROW(1, 'alice'), ROW(2, 'bob');
 
 -- query 3
 -- @expect_error=staged
-CREATE TABLE ${case_db}.hadoop_dst AS
-  SELECT id, UPPER(name) AS uname FROM ${case_db}.src;
+CREATE TABLE ${case_db}.hadoop_dst AS SELECT id, UPPER(name) AS uname FROM ${case_db}.src;
 
 -- query 4
 -- @expect_error=staged
-CREATE TABLE IF NOT EXISTS ${case_db}.hadoop_dst_if_missing AS
-  SELECT id FROM ${case_db}.src;
+CREATE TABLE IF NOT EXISTS ${case_db}.hadoop_dst_if_missing AS SELECT id FROM ${case_db}.src;
 
 -- query 5
 -- @skip_result_check=true
-DROP TABLE ${case_db}.src FORCE;
+DROP TABLE ${case_db}.src ;

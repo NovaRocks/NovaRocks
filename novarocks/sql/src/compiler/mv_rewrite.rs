@@ -25,10 +25,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use novarocks_parser::ast::{
-    Expr, FunctionCall, GroupBy, Ident, JoinConstraint, Literal, LiteralKind, ObjectName, Query,
-    Select, SelectHintValue, SelectItem, SelectQuantifier, SetExpr, TableAlias, TableFactor,
-    TableWithJoins, TypeName, Visit, WildcardOptions, WindowSpec, walk_expr, walk_function_call,
-    walk_object_name, walk_query, walk_table_factor, walk_type_name,
+    Expr, FunctionCall, Ident, Literal, LiteralKind, ObjectName, Query, Select, SelectItem,
+    SetExpr, TypeName, Visit, WindowSpecification, walk_expr, walk_function_call, walk_object_name,
+    walk_query, walk_type_name,
 };
 use novarocks_spi::connector::{ConnectorExactSemanticRevision, ConnectorTableObjectId};
 
@@ -2760,111 +2759,98 @@ impl CompletionRetainedBytes {
     }
 
     fn add_query_containers(&mut self, query: &Query) {
-        self.add_vec_capacity::<novarocks_parser::ast::OrderByExpr>(query.order_by.capacity());
+        self.add_vec_capacity::<novarocks_parser::ast::FunctionSpecification>(
+            query.functions.capacity(),
+        );
+        self.add_vec_capacity::<novarocks_parser::ast::SessionProperty>(
+            query.session_properties.capacity(),
+        );
+        for property in &query.session_properties {
+            self.add_vec_capacity::<Ident>(property.name.parts.capacity());
+        }
+        self.add_order_by_containers(&query.modifiers.order_by);
         if let Some(with) = &query.with {
             self.add_vec_capacity::<novarocks_parser::ast::Cte>(with.ctes.capacity());
             for cte in &with.ctes {
-                self.add_vec_capacity::<Ident>(cte.columns.capacity());
+                if let Some(columns) = &cte.columns {
+                    self.add_vec_capacity::<Ident>(columns.capacity());
+                }
             }
         }
         self.add_set_expr_containers(&query.body);
     }
 
+    #[recursive::recursive]
     fn add_set_expr_containers(&mut self, set_expr: &SetExpr) {
         self.add(std::mem::size_of::<SetExpr>());
         match set_expr {
             SetExpr::Select(select) => self.add_select_containers(select),
             SetExpr::Values(values) => {
                 self.add(std::mem::size_of::<novarocks_parser::ast::Values>());
-                self.add_vec_capacity::<Vec<Expr>>(values.rows.capacity());
-                for row in &values.rows {
-                    self.add_vec_capacity::<Expr>(row.capacity());
-                }
+                self.add_vec_capacity::<Expr>(values.rows.capacity());
             }
-            SetExpr::Query(_) => {}
+            SetExpr::Query(_) | SetExpr::Table(_) => {}
             SetExpr::SetOperation(operation) => {
                 self.add(std::mem::size_of::<novarocks_parser::ast::SetOperation>());
-                self.add_set_expr_containers(&operation.left);
-                self.add_set_expr_containers(&operation.right);
+                self.add_vec_capacity::<SetExpr>(operation.inputs.capacity());
+                if let Some(corresponding) = &operation.corresponding {
+                    self.add_vec_capacity::<Ident>(corresponding.columns.capacity());
+                }
+                for input in &operation.inputs {
+                    self.add_set_expr_containers(input);
+                }
             }
         }
     }
 
     fn add_select_containers(&mut self, select: &Select) {
+        self.add_order_by_containers(&select.modifiers.order_by);
         self.add(std::mem::size_of::<Select>());
-        self.add_vec_capacity::<novarocks_parser::ast::SelectHint>(select.hints.capacity());
-        for hint in &select.hints {
-            if let SelectHintValue::Call { arguments } = &hint.value {
-                self.add_vec_capacity::<Expr>(arguments.capacity());
-            }
-        }
-        if let SelectQuantifier::Distinct { on, .. } = &select.quantifier {
-            self.add_vec_capacity::<Expr>(on.capacity());
-        }
         self.add_vec_capacity::<SelectItem>(select.projection.capacity());
         for item in &select.projection {
             match item {
-                SelectItem::Wildcard { options, .. } => self.add_wildcard_containers(options),
-                SelectItem::QualifiedWildcard {
-                    prefix, options, ..
-                } => {
-                    self.add_vec_capacity::<Ident>(prefix.capacity());
-                    self.add_wildcard_containers(options);
+                SelectItem::SingleColumn(_) => {
+                    self.add(std::mem::size_of::<novarocks_parser::ast::SingleColumn>())
                 }
-                SelectItem::UnnamedExpr(_) | SelectItem::ExprWithAlias { .. } => {}
-            }
-        }
-        self.add_vec_capacity::<TableWithJoins>(select.from.capacity());
-        for table in &select.from {
-            self.add_table_with_joins_containers(table);
-        }
-        match &select.group_by {
-            GroupBy::None => {}
-            GroupBy::Expressions { expressions, .. }
-            | GroupBy::Rollup { expressions, .. }
-            | GroupBy::Cube { expressions, .. } => {
-                self.add_vec_capacity::<Expr>(expressions.capacity());
-            }
-            GroupBy::GroupingSets { sets, .. } => {
-                self.add_vec_capacity::<Vec<Expr>>(sets.capacity());
-                for set in sets {
-                    self.add_vec_capacity::<Expr>(set.capacity());
+                SelectItem::AllColumns(columns) => {
+                    self.add(std::mem::size_of::<novarocks_parser::ast::AllColumns>());
+                    self.add_vec_capacity::<Ident>(columns.aliases.capacity());
                 }
             }
         }
-        self.add_vec_capacity::<novarocks_parser::ast::NamedWindow>(select.windows.capacity());
+        self.add_vec_capacity::<novarocks_parser::ast::WindowDefinition>(select.windows.capacity());
         for window in &select.windows {
             self.add_window_spec_containers(&window.specification);
         }
     }
 
-    fn add_wildcard_containers(&mut self, options: &WildcardOptions) {
-        self.add_vec_capacity::<Ident>(options.exclude.capacity());
-        self.add_vec_capacity::<novarocks_parser::ast::ReplaceSelectItem>(
-            options.replace.capacity(),
-        );
-    }
-
-    fn add_table_with_joins_containers(&mut self, table: &TableWithJoins) {
-        self.add(std::mem::size_of::<TableWithJoins>());
-        self.add_vec_capacity::<novarocks_parser::ast::Join>(table.joins.capacity());
-        for join in &table.joins {
-            if let JoinConstraint::Using { columns, .. } = &join.constraint {
-                self.add_vec_capacity::<Ident>(columns.capacity());
-            }
+    fn add_order_by_containers(&mut self, order_by: &Option<novarocks_parser::ast::OrderBy>) {
+        if let Some(order_by) = order_by {
+            self.add_vec_capacity::<novarocks_parser::ast::SortItem>(order_by.items.capacity());
         }
     }
 
-    fn add_alias_containers(&mut self, alias: &Option<TableAlias>) {
-        if let Some(alias) = alias {
-            self.add_vec_capacity::<Ident>(alias.columns.capacity());
-        }
-    }
-
-    fn add_window_spec_containers(&mut self, window: &WindowSpec) {
-        self.add(std::mem::size_of::<WindowSpec>());
+    fn add_window_spec_containers(&mut self, window: &WindowSpecification) {
         self.add_vec_capacity::<Expr>(window.partition_by.capacity());
-        self.add_vec_capacity::<novarocks_parser::ast::OrderByExpr>(window.order_by.capacity());
+        self.add_order_by_containers(&window.order_by);
+        if let Some(frame) = &window.window_frame {
+            self.add_vec_capacity::<novarocks_parser::ast::MeasureDefinition>(
+                frame.measures.capacity(),
+            );
+            self.add_vec_capacity::<novarocks_parser::ast::SubsetDefinition>(
+                frame.subsets.capacity(),
+            );
+            self.add_vec_capacity::<novarocks_parser::ast::VariableDefinition>(
+                frame.variable_definitions.capacity(),
+            );
+        }
+    }
+
+    fn add_window_containers(&mut self, window: &novarocks_parser::ast::Window) {
+        if let novarocks_parser::ast::Window::Specification(specification) = window {
+            self.add(std::mem::size_of::<WindowSpecification>());
+            self.add_window_spec_containers(specification);
+        }
     }
 
     fn finish(self) -> Result<u64, SqlCompileError> {
@@ -2878,60 +2864,317 @@ impl CompletionRetainedBytes {
 }
 
 impl Visit for CompletionRetainedBytes {
+    fn visit_subset_definition(&mut self, subset: &novarocks_parser::ast::SubsetDefinition) {
+        self.add_vec_capacity::<Ident>(subset.identifiers.capacity());
+        novarocks_parser::ast::walk_subset_definition(self, subset);
+    }
+
+    fn visit_pattern_integer(&mut self, value: &novarocks_parser::ast::PatternInteger) {
+        self.add(value.lexeme.capacity());
+        novarocks_parser::ast::walk_pattern_integer(self, value);
+    }
+
+    fn visit_row_pattern(&mut self, pattern: &novarocks_parser::ast::RowPattern) {
+        use novarocks_parser::ast::RowPattern;
+        match pattern {
+            RowPattern::Alternation { patterns, .. }
+            | RowPattern::Concatenation { patterns, .. }
+            | RowPattern::Permutation { patterns, .. } => {
+                self.add_vec_capacity::<RowPattern>(patterns.capacity())
+            }
+            RowPattern::Excluded { .. } | RowPattern::Quantified { .. } => {
+                self.add(std::mem::size_of::<RowPattern>())
+            }
+            RowPattern::Variable { .. } | RowPattern::Empty { .. } | RowPattern::Anchor { .. } => {}
+        }
+        novarocks_parser::ast::walk_row_pattern(self, pattern);
+    }
+
+    fn visit_function_specification(
+        &mut self,
+        function: &novarocks_parser::ast::FunctionSpecification,
+    ) {
+        self.add_vec_capacity::<novarocks_parser::ast::FunctionParameter>(
+            function.parameters.capacity(),
+        );
+        self.add_vec_capacity::<novarocks_parser::ast::RoutineCharacteristic>(
+            function.characteristics.capacity(),
+        );
+        novarocks_parser::ast::walk_function_specification(self, function);
+    }
+
+    fn visit_routine_characteristic(
+        &mut self,
+        characteristic: &novarocks_parser::ast::RoutineCharacteristic,
+    ) {
+        use novarocks_parser::ast::RoutineCharacteristic;
+        match characteristic {
+            RoutineCharacteristic::Comment { comment, .. } => self.add(comment.capacity()),
+            RoutineCharacteristic::Properties { properties, .. } => {
+                self.add_vec_capacity::<novarocks_parser::ast::RoutineProperty>(
+                    properties.capacity(),
+                );
+            }
+            _ => {}
+        }
+        novarocks_parser::ast::walk_routine_characteristic(self, characteristic);
+    }
+
+    fn visit_routine_body(&mut self, body: &novarocks_parser::ast::RoutineBody) {
+        if let novarocks_parser::ast::RoutineBody::External { definition, .. } = body {
+            self.add(definition.capacity());
+        }
+        novarocks_parser::ast::walk_routine_body(self, body);
+    }
+
+    fn visit_variable_declaration(
+        &mut self,
+        declaration: &novarocks_parser::ast::VariableDeclaration,
+    ) {
+        self.add_vec_capacity::<Ident>(declaration.names.capacity());
+        novarocks_parser::ast::walk_variable_declaration(self, declaration);
+    }
+
+    fn visit_else_clause(&mut self, clause: &novarocks_parser::ast::ElseClause) {
+        self.add_vec_capacity::<novarocks_parser::ast::ControlStatement>(
+            clause.statements.capacity(),
+        );
+        novarocks_parser::ast::walk_else_clause(self, clause);
+    }
+
+    fn visit_else_if_clause(&mut self, clause: &novarocks_parser::ast::ElseIfClause) {
+        self.add_vec_capacity::<novarocks_parser::ast::ControlStatement>(
+            clause.statements.capacity(),
+        );
+        novarocks_parser::ast::walk_else_if_clause(self, clause);
+    }
+
+    fn visit_case_statement_when_clause(
+        &mut self,
+        clause: &novarocks_parser::ast::CaseStatementWhenClause,
+    ) {
+        self.add_vec_capacity::<novarocks_parser::ast::ControlStatement>(
+            clause.statements.capacity(),
+        );
+        novarocks_parser::ast::walk_case_statement_when_clause(self, clause);
+    }
+
+    fn visit_control_statement(&mut self, statement: &novarocks_parser::ast::ControlStatement) {
+        use novarocks_parser::ast::{ControlStatement, VariableDeclaration};
+        let statements = match statement {
+            ControlStatement::Case(node) => {
+                self.add_vec_capacity::<novarocks_parser::ast::CaseStatementWhenClause>(
+                    node.when_clauses.capacity(),
+                );
+                None
+            }
+            ControlStatement::If(node) => {
+                self.add_vec_capacity::<novarocks_parser::ast::ElseIfClause>(
+                    node.else_if_clauses.capacity(),
+                );
+                Some(&node.statements)
+            }
+            ControlStatement::Compound(node) => {
+                self.add_vec_capacity::<VariableDeclaration>(node.variable_declarations.capacity());
+                Some(&node.statements)
+            }
+            ControlStatement::Loop(node) => Some(&node.statements),
+            ControlStatement::While(node) => Some(&node.statements),
+            ControlStatement::Repeat(node) => Some(&node.statements),
+            ControlStatement::Return(_)
+            | ControlStatement::Assignment(_)
+            | ControlStatement::Iterate(_)
+            | ControlStatement::Leave(_)
+            | ControlStatement::VariableDeclaration(_) => None,
+        };
+        if let Some(statements) = statements {
+            self.add_vec_capacity::<ControlStatement>(statements.capacity());
+        }
+        novarocks_parser::ast::walk_control_statement(self, statement);
+    }
+
+    fn visit_json_path_string(&mut self, path: &novarocks_parser::ast::JsonPathString) {
+        self.add(path.value.capacity());
+    }
+    fn visit_json_path_invocation(&mut self, node: &novarocks_parser::ast::JsonPathInvocation) {
+        self.add_vec_capacity::<novarocks_parser::ast::JsonPathParameter>(
+            node.path_parameters.capacity(),
+        );
+        novarocks_parser::ast::walk_json_path_invocation(self, node);
+    }
+    fn visit_json_object(&mut self, node: &novarocks_parser::ast::JsonObject) {
+        self.add_vec_capacity::<novarocks_parser::ast::JsonObjectMember>(node.members.capacity());
+        novarocks_parser::ast::walk_json_object(self, node);
+    }
+    fn visit_json_array(&mut self, node: &novarocks_parser::ast::JsonArray) {
+        self.add_vec_capacity::<novarocks_parser::ast::JsonArrayElement>(node.elements.capacity());
+        novarocks_parser::ast::walk_json_array(self, node);
+    }
+    fn visit_json_table(&mut self, node: &novarocks_parser::ast::JsonTable) {
+        self.add(std::mem::size_of::<novarocks_parser::ast::JsonTable>());
+        self.add_vec_capacity::<novarocks_parser::ast::JsonTableColumn>(node.columns.capacity());
+        novarocks_parser::ast::walk_json_table(self, node);
+    }
+    fn visit_json_table_nested_columns(
+        &mut self,
+        node: &novarocks_parser::ast::JsonTableNestedColumns,
+    ) {
+        self.add_vec_capacity::<novarocks_parser::ast::JsonTableColumn>(node.columns.capacity());
+        novarocks_parser::ast::walk_json_table_nested_columns(self, node);
+    }
+    fn visit_json_table_plan_siblings(
+        &mut self,
+        node: &novarocks_parser::ast::JsonTablePlanSiblings,
+    ) {
+        self.add_vec_capacity::<novarocks_parser::ast::JsonTableSpecificPlan>(
+            node.siblings.capacity(),
+        );
+        novarocks_parser::ast::walk_json_table_plan_siblings(self, node);
+    }
+
+    fn visit_json_table_plan_parent_child(
+        &mut self,
+        node: &novarocks_parser::ast::JsonTablePlanParentChild,
+    ) {
+        self.add(std::mem::size_of::<
+            novarocks_parser::ast::JsonTableSpecificPlan,
+        >());
+        novarocks_parser::ast::walk_json_table_plan_parent_child(self, node);
+    }
+
+    #[recursive::recursive]
     fn visit_query(&mut self, query: &Query) {
         self.add(std::mem::size_of::<Query>());
         self.add_query_containers(query);
         walk_query(self, query);
     }
 
+    #[recursive::recursive]
     fn visit_expr(&mut self, expression: &Expr) {
         self.add(std::mem::size_of::<Expr>());
         match expression {
-            Expr::CompoundIdentifier(identifier) => {
-                self.add_vec_capacity::<Ident>(identifier.parts.capacity());
+            Expr::JsonConstructor(_) => {
+                self.add(std::mem::size_of::<novarocks_parser::ast::JsonConstructor>())
+            }
+            Expr::JsonExists(_) => {
+                self.add(std::mem::size_of::<novarocks_parser::ast::JsonExists>())
+            }
+            Expr::JsonValue(_) => self.add(std::mem::size_of::<novarocks_parser::ast::JsonValue>()),
+            Expr::JsonQuery(_) => self.add(std::mem::size_of::<novarocks_parser::ast::JsonQuery>()),
+            Expr::JsonSerialize(_) => {
+                self.add(std::mem::size_of::<novarocks_parser::ast::JsonSerialize>())
+            }
+            Expr::JsonObject(_) => {
+                self.add(std::mem::size_of::<novarocks_parser::ast::JsonObject>())
+            }
+            Expr::JsonArray(_) => self.add(std::mem::size_of::<novarocks_parser::ast::JsonArray>()),
+
+            Expr::Dereference(_) => {
+                self.add(std::mem::size_of::<novarocks_parser::ast::DereferenceExpr>())
+            }
+            Expr::Subscript(_) => {
+                self.add(std::mem::size_of::<novarocks_parser::ast::SubscriptExpr>())
+            }
+            Expr::ArrayWildcardSubscript(_) => self.add(std::mem::size_of::<
+                novarocks_parser::ast::ArrayWildcardSubscriptExpr,
+            >()),
+            Expr::Logical(expression) => {
+                self.add_vec_capacity::<Expr>(expression.terms.capacity());
+            }
+            Expr::Predicated(_) => {
+                self.add(std::mem::size_of::<novarocks_parser::ast::PredicatedExpr>())
             }
             Expr::InList(expression) => {
-                self.add_vec_capacity::<Expr>(expression.list.capacity());
+                self.add(std::mem::size_of::<novarocks_parser::ast::InListExpr>());
+                self.add_vec_capacity::<Expr>(expression.values.capacity());
             }
-            Expr::Case(expression) => {
-                self.add_vec_capacity::<Expr>(expression.conditions.capacity());
-                self.add_vec_capacity::<Expr>(expression.results.capacity());
-            }
-            Expr::Tuple(expression) => {
-                self.add_vec_capacity::<Expr>(expression.expressions.capacity());
-            }
-            Expr::Array(expression) => {
-                self.add_vec_capacity::<Expr>(expression.elements.capacity());
-            }
-            Expr::Map(expression) => {
-                self.add_vec_capacity::<novarocks_parser::ast::MapEntry>(
-                    expression.entries.capacity(),
+            Expr::SearchedCase(expression) => {
+                self.add(std::mem::size_of::<novarocks_parser::ast::SearchedCaseExpr>());
+                self.add_vec_capacity::<novarocks_parser::ast::WhenClause>(
+                    expression.when_clauses.capacity(),
                 );
             }
-            Expr::Struct(expression) => {
-                self.add_vec_capacity::<novarocks_parser::ast::StructExprField>(
+            Expr::SimpleCase(expression) => {
+                self.add(std::mem::size_of::<novarocks_parser::ast::SimpleCaseExpr>());
+                self.add_vec_capacity::<novarocks_parser::ast::WhenClause>(
+                    expression.when_clauses.capacity(),
+                );
+            }
+            Expr::AtLocal(_) => self.add(std::mem::size_of::<novarocks_parser::ast::AtLocal>()),
+            Expr::AtTimeZone(_) => {
+                self.add(std::mem::size_of::<novarocks_parser::ast::AtTimeZone>())
+            }
+            Expr::Trim(_) => self.add(std::mem::size_of::<novarocks_parser::ast::Trim>()),
+            Expr::Overlay(_) => self.add(std::mem::size_of::<novarocks_parser::ast::Overlay>()),
+            Expr::IntervalValueExpression(_) => self.add(std::mem::size_of::<
+                novarocks_parser::ast::IntervalValueExpression,
+            >()),
+            Expr::GroupingOperation(node) => {
+                self.add(std::mem::size_of::<novarocks_parser::ast::GroupingOperation>());
+                self.add_vec_capacity::<Expr>(node.grouping_columns.capacity());
+            }
+            Expr::MethodCall(node) => {
+                self.add(std::mem::size_of::<novarocks_parser::ast::MethodCall>());
+                self.add_vec_capacity::<novarocks_parser::ast::CallArgument>(
+                    node.arguments.capacity(),
+                );
+            }
+            Expr::StaticMethodCall(node) => {
+                self.add(std::mem::size_of::<novarocks_parser::ast::StaticMethodCall>());
+                self.add_vec_capacity::<novarocks_parser::ast::CallArgument>(
+                    node.arguments.capacity(),
+                );
+            }
+            Expr::CurrentCatalog(_)
+            | Expr::CurrentDate(_)
+            | Expr::CurrentPath(_)
+            | Expr::CurrentSchema(_)
+            | Expr::CurrentUser(_)
+            | Expr::CurrentTime(_)
+            | Expr::CurrentTimestamp(_)
+            | Expr::LocalTime(_)
+            | Expr::LocalTimestamp(_) => {}
+            Expr::Extract(_) => self.add(std::mem::size_of::<novarocks_parser::ast::ExtractExpr>()),
+            Expr::If(_) => self.add(std::mem::size_of::<novarocks_parser::ast::IfExpr>()),
+            Expr::NullIf(_) => self.add(std::mem::size_of::<novarocks_parser::ast::NullIfExpr>()),
+            Expr::Coalesce(node) => {
+                self.add(std::mem::size_of::<novarocks_parser::ast::CoalesceExpr>());
+                self.add_vec_capacity::<Expr>(node.operands.capacity());
+            }
+            Expr::Try(_) => self.add(std::mem::size_of::<novarocks_parser::ast::TryExpr>()),
+            Expr::Format(node) => {
+                self.add(std::mem::size_of::<novarocks_parser::ast::FormatExpr>());
+                self.add_vec_capacity::<Expr>(node.arguments.capacity());
+            }
+            Expr::Cast(_) => self.add(std::mem::size_of::<novarocks_parser::ast::CastExpr>()),
+            Expr::Exists(_) => self.add(std::mem::size_of::<novarocks_parser::ast::ExistsExpr>()),
+            Expr::Unique(_) => self.add(std::mem::size_of::<novarocks_parser::ast::UniqueExpr>()),
+            Expr::WindowOperation(operation) => {
+                self.add(std::mem::size_of::<novarocks_parser::ast::WindowOperation>());
+                self.add_window_containers(&operation.window);
+            }
+            Expr::Array(expression) => {
+                self.add_vec_capacity::<Expr>(expression.values.capacity());
+            }
+            Expr::Row(expression) => {
+                self.add_vec_capacity::<novarocks_parser::ast::RowField>(
                     expression.fields.capacity(),
                 );
             }
             Expr::Lambda(expression) => {
-                self.add_vec_capacity::<Ident>(expression.parameters.capacity());
+                self.add(std::mem::size_of::<novarocks_parser::ast::LambdaExpr>());
+                self.add_vec_capacity::<novarocks_parser::ast::LambdaArgumentDeclaration>(
+                    expression.arguments.capacity(),
+                );
             }
-            Expr::Identifier(_)
+            Expr::AllRows(_)
+            | Expr::Parameter(_)
+            | Expr::Identifier(_)
             | Expr::Literal(_)
             | Expr::FunctionCall(_)
             | Expr::Unary(_)
             | Expr::Binary(_)
-            | Expr::Nested(_)
-            | Expr::Between(_)
-            | Expr::InSubquery(_)
-            | Expr::Exists(_)
-            | Expr::Like(_)
-            | Expr::IsPredicate(_)
-            | Expr::Cast(_)
-            | Expr::Interval(_)
-            | Expr::Subquery(_)
-            | Expr::Access(_)
-            | Expr::TypedString(_) => {}
+            | Expr::Subquery(_) => {}
         }
         walk_expr(self, expression);
     }
@@ -2949,57 +3192,193 @@ impl Visit for CompletionRetainedBytes {
 
     fn visit_type_name(&mut self, type_name: &TypeName) {
         self.add(std::mem::size_of::<TypeName>());
-        self.add_vec_capacity::<novarocks_parser::ast::TypeNameArgument>(
-            type_name.arguments.capacity(),
-        );
-        self.add_vec_capacity::<bool>(type_name.argument_separator_spaces.capacity());
         walk_type_name(self, type_name);
+    }
+
+    fn visit_generic_data_type(&mut self, node: &novarocks_parser::ast::GenericDataType) {
+        self.add_vec_capacity::<novarocks_parser::ast::DataTypeParameter>(
+            node.arguments.capacity(),
+        );
+        novarocks_parser::ast::walk_generic_data_type(self, node);
+    }
+    fn visit_row_data_type(&mut self, node: &novarocks_parser::ast::RowDataType) {
+        self.add_vec_capacity::<novarocks_parser::ast::RowDataTypeField>(node.fields.capacity());
+        novarocks_parser::ast::walk_row_data_type(self, node);
+    }
+    fn visit_date_time_data_type(&mut self, node: &novarocks_parser::ast::DateTimeDataType) {
+        if node.precision.is_some() {
+            self.add(std::mem::size_of::<novarocks_parser::ast::DataTypeParameter>());
+        }
+        novarocks_parser::ast::walk_date_time_data_type(self, node);
+    }
+    fn visit_numeric_parameter(&mut self, node: &novarocks_parser::ast::NumericParameter) {
+        self.add(node.spelling.capacity());
+    }
+    fn visit_array_length(&mut self, node: &novarocks_parser::ast::ArrayLength) {
+        self.add(node.spelling.capacity());
+    }
+    fn visit_simple_interval_qualifier(
+        &mut self,
+        node: &novarocks_parser::ast::SimpleIntervalQualifier,
+    ) {
+        if node.precision.is_some() {
+            self.add(std::mem::size_of::<novarocks_parser::ast::DataTypeParameter>());
+        }
+        novarocks_parser::ast::walk_simple_interval_qualifier(self, node);
+    }
+    fn visit_composite_interval_qualifier(
+        &mut self,
+        node: &novarocks_parser::ast::CompositeIntervalQualifier,
+    ) {
+        if node.precision.is_some() {
+            self.add(std::mem::size_of::<novarocks_parser::ast::DataTypeParameter>());
+        }
+        novarocks_parser::ast::walk_composite_interval_qualifier(self, node);
+    }
+    fn visit_interval_qualifier_field(
+        &mut self,
+        node: &novarocks_parser::ast::IntervalQualifierField,
+    ) {
+        if matches!(
+            node,
+            novarocks_parser::ast::IntervalQualifierField::Second {
+                fractional_precision: Some(_)
+            }
+        ) {
+            self.add(std::mem::size_of::<novarocks_parser::ast::DataTypeParameter>());
+        }
+        novarocks_parser::ast::walk_interval_qualifier_field(self, node);
     }
 
     fn visit_literal(&mut self, literal: &Literal) {
         self.add(std::mem::size_of::<Literal>());
         match &literal.kind {
-            LiteralKind::Number(value)
-            | LiteralKind::String(value)
-            | LiteralKind::HexString(value) => self.add(value.capacity()),
-            LiteralKind::Null | LiteralKind::Boolean(_) => {}
+            LiteralKind::Long {
+                spelling: value, ..
+            }
+            | LiteralKind::Decimal(value)
+            | LiteralKind::String(value) => self.add(value.capacity()),
+            LiteralKind::Binary(value) => self.add(value.capacity()),
+            LiteralKind::Generic(value) => {
+                self.add(value.type_name.capacity());
+                self.add(value.value.capacity());
+            }
+            LiteralKind::Interval(value) => self.add(value.value.capacity()),
+            LiteralKind::Null | LiteralKind::Boolean(_) | LiteralKind::Double(_) => {}
         }
+        novarocks_parser::ast::walk_literal(self, literal);
     }
 
     fn visit_function_call(&mut self, call: &FunctionCall) {
         self.add(std::mem::size_of::<FunctionCall>());
-        self.add_vec_capacity::<Expr>(call.arguments.capacity());
-        self.add_vec_capacity::<novarocks_parser::ast::FunctionOrderBy>(call.order_by.capacity());
-        if let Some(over) = &call.over {
-            self.add_window_spec_containers(over);
+        self.add_vec_capacity::<novarocks_parser::ast::CallArgument>(call.arguments.capacity());
+        self.add_order_by_containers(&call.order_by);
+        if let Some(window) = &call.window {
+            self.add_window_containers(window);
         }
         walk_function_call(self, call);
     }
 
-    fn visit_table_factor(&mut self, factor: &TableFactor) {
-        self.add(std::mem::size_of::<TableFactor>());
-        match factor {
-            TableFactor::Table { alias, .. }
-            | TableFactor::Derived { alias, .. }
-            | TableFactor::TableFunction { alias, .. } => {
-                self.add_alias_containers(alias);
+    #[recursive::recursive]
+    fn visit_relation(&mut self, relation: &novarocks_parser::ast::Relation) {
+        use novarocks_parser::ast;
+        self.add(std::mem::size_of::<ast::Relation>());
+        match relation {
+            ast::Relation::Table(_) | ast::Relation::TableSubquery(_) => {}
+            ast::Relation::Aliased(node) => {
+                self.add(std::mem::size_of::<ast::AliasedRelation>());
+                if let Some(columns) = &node.column_names {
+                    self.add_vec_capacity::<Ident>(columns.capacity());
+                }
             }
-            TableFactor::Unnest {
-                array_exprs, alias, ..
-            } => {
-                self.add_vec_capacity::<Expr>(array_exprs.capacity());
-                self.add_alias_containers(alias);
+            ast::Relation::Lateral(_) => self.add(std::mem::size_of::<ast::Lateral>()),
+            ast::Relation::Unnest(node) => {
+                self.add(std::mem::size_of::<ast::Unnest>());
+                self.add_vec_capacity::<Expr>(node.expressions.capacity());
             }
-            TableFactor::NestedJoin {
-                table_with_joins,
-                alias,
-                ..
-            } => {
-                self.add_table_with_joins_containers(table_with_joins);
-                self.add_alias_containers(alias);
+            ast::Relation::Join(node) => {
+                self.add(std::mem::size_of::<ast::Join>());
+                if let Some(ast::JoinCriteria::Using(using)) = &node.criteria {
+                    self.add_vec_capacity::<Ident>(using.columns.capacity());
+                }
+            }
+            ast::Relation::Sampled(_) => self.add(std::mem::size_of::<ast::SampledRelation>()),
+            ast::Relation::Pivot(node) => {
+                self.add(std::mem::size_of::<ast::Pivot>());
+                self.add_vec_capacity::<ast::PivotAggregation>(node.aggregations.capacity());
+                self.add_vec_capacity::<Expr>(node.pivot_columns.capacity());
+                self.add_vec_capacity::<ast::PivotValueGroup>(node.value_groups.capacity());
+            }
+            ast::Relation::Nearest(_) => self.add(std::mem::size_of::<ast::Nearest>()),
+            ast::Relation::TableFunction(node) => {
+                self.add(std::mem::size_of::<ast::TableFunctionInvocation>());
+                self.add_vec_capacity::<ast::TableFunctionArgument>(node.arguments.capacity());
+                self.add_vec_capacity::<Vec<ObjectName>>(node.copartitioning.capacity());
+                for group in &node.copartitioning {
+                    self.add_vec_capacity::<ObjectName>(group.capacity());
+                }
+            }
+            ast::Relation::JsonTable(_) => {}
+            ast::Relation::PatternRecognition(node) => {
+                self.add(std::mem::size_of::<ast::PatternRecognitionRelation>());
+                self.add_vec_capacity::<Expr>(node.partition_by.capacity());
+                self.add_order_by_containers(&node.order_by);
+                self.add_vec_capacity::<ast::MeasureDefinition>(node.measures.capacity());
+                self.add_vec_capacity::<ast::SubsetDefinition>(node.subsets.capacity());
+                self.add_vec_capacity::<ast::VariableDefinition>(
+                    node.variable_definitions.capacity(),
+                );
             }
         }
-        walk_table_factor(self, factor);
+        ast::walk_relation(self, relation);
+    }
+    fn visit_table(&mut self, table: &novarocks_parser::ast::Table) {
+        self.add(std::mem::size_of::<novarocks_parser::ast::Table>());
+        novarocks_parser::ast::walk_table(self, table);
+    }
+    fn visit_table_subquery(&mut self, node: &novarocks_parser::ast::TableSubquery) {
+        self.add(std::mem::size_of::<novarocks_parser::ast::TableSubquery>());
+        novarocks_parser::ast::walk_table_subquery(self, node);
+    }
+    fn visit_group_by(&mut self, group_by: &novarocks_parser::ast::GroupBy) {
+        self.add_vec_capacity::<novarocks_parser::ast::GroupingElement>(
+            group_by.elements.capacity(),
+        );
+        for element in &group_by.elements {
+            match element {
+                novarocks_parser::ast::GroupingElement::Simple(simple) => {
+                    self.add_vec_capacity::<Expr>(simple.columns.capacity())
+                }
+                novarocks_parser::ast::GroupingElement::Sets(sets) => {
+                    self.add_vec_capacity::<novarocks_parser::ast::AstVec<Expr>>(
+                        sets.sets.capacity(),
+                    );
+                    for group in &sets.sets {
+                        self.add_vec_capacity::<Expr>(group.capacity());
+                    }
+                }
+                novarocks_parser::ast::GroupingElement::Auto(_) => {}
+            }
+        }
+        novarocks_parser::ast::walk_group_by(self, group_by);
+    }
+    fn visit_pivot_value_group(&mut self, node: &novarocks_parser::ast::PivotValueGroup) {
+        self.add_vec_capacity::<Expr>(node.values.capacity());
+        novarocks_parser::ast::walk_pivot_value_group(self, node);
+    }
+    fn visit_table_function_table_argument(
+        &mut self,
+        node: &novarocks_parser::ast::TableFunctionTableArgument,
+    ) {
+        if let Some(partition) = &node.partition_by {
+            self.add_vec_capacity::<Expr>(partition.capacity());
+        }
+        self.add_order_by_containers(&node.order_by);
+        novarocks_parser::ast::walk_table_function_table_argument(self, node);
+    }
+    fn visit_descriptor(&mut self, node: &novarocks_parser::ast::Descriptor) {
+        self.add_vec_capacity::<novarocks_parser::ast::DescriptorField>(node.fields.capacity());
+        novarocks_parser::ast::walk_descriptor(self, node);
     }
 }
 
@@ -3416,7 +3795,7 @@ impl PlannerTableProvider for DefinitionResolutionCatalog<'_> {
         catalog: Option<&str>,
         database: &str,
         table: &str,
-        version: &novarocks_parser::ast::TableVersion,
+        version: &novarocks_parser::ast::QueryPeriod,
     ) -> Result<crate::catalog::ResolvedAnalyzerTable, crate::analyze_error::AnalyzeError> {
         self.inner.resolve_table_version_for_analysis(
             Some(catalog.unwrap_or(self.default_catalog)),
@@ -3453,6 +3832,19 @@ impl PlannerTableProvider for DefinitionResolutionCatalog<'_> {
             Some(catalog.unwrap_or(self.default_catalog)),
             database,
             table,
+        )
+    }
+
+    fn resolve_quoted_iceberg_metadata(
+        &self,
+        name: &novarocks_parser::ast::ObjectName,
+        catalog: Option<&str>,
+        database: &str,
+    ) -> Option<crate::catalog::QuotedMetadataTable> {
+        self.inner.resolve_quoted_iceberg_metadata(
+            name,
+            Some(catalog.unwrap_or(self.default_catalog)),
+            database,
         )
     }
 
@@ -3540,10 +3932,7 @@ mod tests {
     use super::*;
 
     fn test_query(sql: &str) -> Query {
-        let statements = novarocks_parser::parse(sql).expect("parse query");
-        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
-            panic!("fixture must be a query");
-        };
+        let query = &novarocks_parser::parser::parse_query(sql).expect("parse query");
         query.clone()
     }
 
@@ -3586,7 +3975,7 @@ mod tests {
         let resolutions_before = catalog.resolutions.load(Ordering::Acquire);
         let mut index = candidate_index();
         index.definitions[0].select_query =
-            test_query("SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ k FROM base");
+            test_query("WITH SESSION sql_mode = 'GROUP_CONCAT_LEGACY' SELECT k FROM base");
         let analysis = analyze_candidates(
             &index,
             &catalog,
@@ -3614,7 +4003,7 @@ mod tests {
         let resolutions_before = catalog.resolutions.load(Ordering::Acquire);
         let mut index = candidate_index();
         index.definitions[0].select_query =
-            test_query("SELECT /*+ SET_VAR(decimal_overflow_to_double=true) */ k FROM base");
+            test_query("WITH SESSION decimal_overflow_to_double = true SELECT k FROM base");
         let analysis = analyze_candidates(
             &index,
             &catalog,
@@ -3636,12 +4025,107 @@ mod tests {
     }
 
     #[test]
+    fn completion_accounting_grows_on_twenty_thousand_real_set_operations() {
+        use novarocks_parser::ast::{SetOperation, SetOperator, Values};
+        use novarocks_parser::{SYNTHETIC, build};
+        use std::mem::size_of;
+        fn values(row_capacity: usize, rows_capacity: usize) -> SetExpr {
+            let mut row = Vec::with_capacity(row_capacity);
+            let expression = build::boolean(true);
+            row.push(novarocks_parser::ast::RowField {
+                name: None,
+                span: expression.span(),
+                expression,
+            });
+            let mut rows = Vec::with_capacity(rows_capacity);
+            rows.push(Expr::Row(novarocks_parser::ast::RowExpr {
+                fields: row.into(),
+                span: SYNTHETIC,
+            }));
+            SetExpr::Values(Values {
+                rows: rows.into(),
+                span: SYNTHETIC,
+            })
+        }
+        let mut definition = SqlMvRewriteDefinitionFacts::try_new(
+            1,
+            [11; 32],
+            build::query(values(1, 1)),
+            test_resolution(),
+            "iceberg".to_string(),
+            None,
+            vec![test_source(SqlMvRewriteBaseTableFacts::unavailable(
+                "not published".to_string(),
+            ))],
+        )
+        .unwrap();
+        // Freeze the unchanged definition metadata and original leaf separately.
+        // Every newly owned buffer below is measured from its actual capacity.
+        let baseline = definition.completion_retained_bytes().unwrap();
+        let original_body = std::mem::replace(
+            &mut definition.select_query.body,
+            novarocks_parser::ast::AstBox::new(values(1, 1)),
+        );
+        let mut body = original_body.into_inner();
+        let mut added_buffer_bytes = 0_u64;
+        const DEPTH: usize = 20_000;
+        for index in 0..DEPTH {
+            let side = values(3 + index % 3, 2 + index % 2);
+            let SetExpr::Values(side_values) = &side else {
+                unreachable!()
+            };
+            let Expr::Row(row) = &side_values.rows[0] else {
+                unreachable!()
+            };
+            added_buffer_bytes += (side_values.rows.capacity() * size_of::<Expr>()
+                + row.fields.capacity() * size_of::<novarocks_parser::ast::RowField>())
+                as u64;
+            let mut inputs = Vec::with_capacity(5 + index % 3);
+            inputs.push(body);
+            inputs.push(side);
+            added_buffer_bytes += (inputs.capacity() * size_of::<SetExpr>()) as u64;
+            body = SetExpr::SetOperation(SetOperation {
+                inputs: inputs.into(),
+                operator: if index % 2 == 0 {
+                    SetOperator::Union
+                } else {
+                    SetOperator::Intersect
+                },
+                distinct: true,
+                corresponding: None,
+                span: SYNTHETIC,
+            });
+        }
+        definition.select_query.body = novarocks_parser::ast::AstBox::new(body);
+        // Each binary operation adds itself and one VALUES sibling. The sibling's
+        // boolean has no heap string and is visited once by the real AST walk.
+        let inline_per_layer = 2 * size_of::<SetExpr>()
+            + size_of::<SetOperation>()
+            + size_of::<Values>()
+            + 2 * size_of::<Expr>()
+            + size_of::<Literal>();
+        let expected = baseline + added_buffer_bytes + (DEPTH * inline_per_layer) as u64;
+        assert_eq!(definition.completion_retained_bytes().unwrap(), expected);
+        // Dropping the real graph also consumes the existing AstVec owning edge.
+        drop(definition);
+    }
+
+    #[test]
     fn completion_accounting_charges_spare_ast_vector_capacity() {
         const COMPLETION_LIMIT: usize = 32 * 1024 * 1024;
         let mut query = test_query("select 1");
-        let item_size = std::mem::size_of::<novarocks_parser::ast::OrderByExpr>();
+        let item_size = std::mem::size_of::<novarocks_parser::ast::SortItem>();
         let capacity = COMPLETION_LIMIT / item_size + 1;
-        query.order_by = Vec::with_capacity(capacity);
+        let SetExpr::Select(select) = query.body.as_mut() else {
+            panic!("SELECT")
+        };
+        let mut items = Vec::with_capacity(capacity);
+        items.push(novarocks_parser::build::sort_item(
+            novarocks_parser::build::number("1").unwrap(),
+            novarocks_parser::ast::SortOrdering::Ascending,
+            novarocks_parser::ast::NullOrdering::Undefined,
+        ));
+        select.modifiers.order_by = Some(novarocks_parser::build::order_by(items).unwrap());
         let definition = SqlMvRewriteDefinitionFacts::try_new(
             1,
             [11; 32],
@@ -3656,6 +4140,42 @@ mod tests {
         .unwrap();
 
         assert!(definition.completion_retained_bytes().unwrap() > COMPLETION_LIMIT as u64);
+    }
+
+    #[test]
+    fn completion_accounting_charges_json_member_capacity() {
+        const LIMIT: usize = 32 * 1024 * 1024;
+        let mut query = test_query("SELECT 1");
+        let SetExpr::Select(select) = query.body.as_mut() else {
+            panic!("SELECT")
+        };
+        let capacity = LIMIT / std::mem::size_of::<novarocks_parser::ast::JsonObjectMember>() + 1;
+        select.projection[0] = novarocks_parser::build::item(
+            Expr::JsonObject(novarocks_parser::ast::AstBox::new(
+                novarocks_parser::ast::JsonObject {
+                    members: Vec::with_capacity(capacity),
+                    null_on_null: true,
+                    unique_keys: false,
+                    returned_type: None,
+                    output_format: None,
+                    span: novarocks_parser::SYNTHETIC,
+                },
+            )),
+            None,
+        );
+        let definition = SqlMvRewriteDefinitionFacts::try_new(
+            1,
+            [11; 32],
+            query,
+            test_resolution(),
+            "iceberg".to_string(),
+            None,
+            vec![test_source(SqlMvRewriteBaseTableFacts::unavailable(
+                "not published".to_string(),
+            ))],
+        )
+        .unwrap();
+        assert!(definition.completion_retained_bytes().unwrap() > LIMIT as u64);
     }
 
     struct CandidateCatalog {

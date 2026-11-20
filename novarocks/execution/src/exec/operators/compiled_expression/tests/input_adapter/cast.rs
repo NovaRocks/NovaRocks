@@ -112,6 +112,7 @@ fn identity_cast_program(ty: FunctionValueType) -> Arc<LocalProgram> {
             None,
             ty.clone(),
             ExprKind::Cast {
+                array_failure_mode: None,
                 expr: child,
                 target: ty.data_type().clone(),
                 decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,

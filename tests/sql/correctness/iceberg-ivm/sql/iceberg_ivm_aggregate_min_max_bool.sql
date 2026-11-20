@@ -27,32 +27,13 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE EXTERNAL CATALOG ice_ivm_mmbool_db_${uuid0}
-PROPERTIES (
-  "type" = "iceberg",
-  "iceberg.catalog.type" = "rest",
-  "uri" = "${iceberg_rest_uri}",
-  "warehouse" = "${iceberg_rest_warehouse}",
-  "aws.s3.endpoint" = "${oss_endpoint}",
-  "credential.object-store-metadata.consumer-role" = "frontend",
-  "credential.object-store-metadata.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-metadata.name" = "${iceberg_object_store_metadata_credential_name}",
-  "credential.object-store-metadata.generation" = "${iceberg_object_store_credential_generation}",
-  "credential.object-store-data.consumer-role" = "backend",
-  "credential.object-store-data.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-data.name" = "${iceberg_object_store_data_credential_name}",
-  "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
-  "aws.s3.region" = "${oss_region}",
-  "aws.s3.enable_path_style_access" = "${oss_path_style}"
-);
-CREATE DATABASE ice_ivm_mmbool_db_${uuid0}.ns_${uuid0};
+CREATE CATALOG ice_ivm_mmbool_db_${uuid0} USING iceberg WITH ("iceberg.catalog.type" = 'rest', "uri" = '${iceberg_rest_uri}', "warehouse" = '${iceberg_rest_warehouse}', "aws.s3.endpoint" = '${oss_endpoint}', "credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-metadata.name" = '${iceberg_object_store_metadata_credential_name}', "credential.object-store-metadata.generation" = '${iceberg_object_store_credential_generation}', "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-data.name" = '${iceberg_object_store_data_credential_name}', "credential.object-store-data.generation" = '${iceberg_object_store_credential_generation}', "aws.s3.region" = '${oss_region}', "aws.s3.enable_path_style_access" = '${oss_path_style}');
+CREATE SCHEMA ice_ivm_mmbool_db_${uuid0}.ns_${uuid0};
 CREATE TABLE ice_ivm_mmbool_db_${uuid0}.ns_${uuid0}.events (
   id BIGINT,
   region STRING,
   flag BOOLEAN
-)
-TBLPROPERTIES ("format-version" = "3",
-  "write.row-lineage" = "true");
+) WITH (format_version = 3);
 USE ice_ivm_mmbool_db_${uuid0}.ns_${uuid0};
 
 -- query 2
@@ -60,17 +41,13 @@ USE ice_ivm_mmbool_db_${uuid0}.ns_${uuid0};
 -- Mix of true / false / NULL. NULL is skipped from MIN/MAX (standard SQL)
 -- but counted in COUNT(*).
 INSERT INTO ice_ivm_mmbool_db_${uuid0}.ns_${uuid0}.events VALUES
-  (1, 'east', false),
-  (2, 'east', true),
-  (3, 'east', true),
-  (4, 'east', NULL),
-  (5, 'west', true),
-  (6, 'west', true);
-CREATE MATERIALIZED VIEW mmbool_mv_${uuid0}
-DISTRIBUTED BY HASH(region) BUCKETS 1
-PROPERTIES ('storage_engine' = 'iceberg')
-AS
-SELECT region,
+  ROW(1, 'east', false),
+  ROW(2, 'east', true),
+  ROW(3, 'east', true),
+  ROW(4, 'east', NULL),
+  ROW(5, 'west', true),
+  ROW(6, 'west', true);
+CREATE MATERIALIZED VIEW mmbool_mv_${uuid0} AS SELECT region,
        MIN(flag) AS mn,
        MAX(flag) AS mx,
        COUNT(*) AS c
@@ -121,7 +98,7 @@ ORDER BY region;
 -- @skip_result_check=true
 -- Re-INSERT a false row into 'east'. MIN flips back to false.
 INSERT INTO ice_ivm_mmbool_db_${uuid0}.ns_${uuid0}.events VALUES
-  (7, 'east', false);
+  ROW(7, 'east', false);
 REFRESH MATERIALIZED VIEW mmbool_mv_${uuid0};
 
 -- query 9
@@ -156,6 +133,6 @@ ORDER BY region;
 -- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW mmbool_mv_${uuid0};
-DROP TABLE ice_ivm_mmbool_db_${uuid0}.ns_${uuid0}.events FORCE;
-DROP DATABASE ice_ivm_mmbool_db_${uuid0}.ns_${uuid0};
+DROP TABLE ice_ivm_mmbool_db_${uuid0}.ns_${uuid0}.events ;
+DROP SCHEMA ice_ivm_mmbool_db_${uuid0}.ns_${uuid0};
 DROP CATALOG ice_ivm_mmbool_db_${uuid0};

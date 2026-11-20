@@ -25,8 +25,7 @@
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t1 (
     k1 INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t1 SELECT generate_series FROM TABLE(generate_series(1, 65535));
 INSERT INTO ${case_db}.t1 SELECT k1 + 65535 FROM ${case_db}.t1;

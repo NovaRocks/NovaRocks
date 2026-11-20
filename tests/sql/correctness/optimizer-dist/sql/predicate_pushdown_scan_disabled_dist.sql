@@ -22,26 +22,26 @@
 DROP TABLE IF EXISTS ${case_db}.predicate_pushdown_scan_disabled_dist_t;
 CREATE TABLE ${case_db}.predicate_pushdown_scan_disabled_dist_t (k INT, payload INT);
 INSERT INTO ${case_db}.predicate_pushdown_scan_disabled_dist_t VALUES
-    (5, 50),
-    (20, 200),
-    (30, 300);
+    ROW(5, 50),
+    ROW(20, 200),
+    ROW(30, 300);
 
-SET disable_optimizer_rules = '';
+SET SESSION disable_optimizer_rules = '';
 
 -- @skip_result_check=true
 -- @result_not_contains=:FILTER
 -- @result_contains=predicates:
-EXPLAIN VERBOSE
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
 SELECT payload
 FROM ${case_db}.predicate_pushdown_scan_disabled_dist_t
 WHERE k > 10;
 
-SET disable_optimizer_rules = 'PushDownPredicateScan';
+SET SESSION disable_optimizer_rules = 'PushDownPredicateScan';
 
 -- @skip_result_check=true
 -- @result_contains=:FILTER
 -- @result_contains=predicate:
-EXPLAIN VERBOSE
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
 SELECT payload
 FROM ${case_db}.predicate_pushdown_scan_disabled_dist_t
 WHERE k > 10;
@@ -51,4 +51,4 @@ FROM ${case_db}.predicate_pushdown_scan_disabled_dist_t
 WHERE k > 10
 ORDER BY payload;
 
-SET disable_optimizer_rules = '';
+SET SESSION disable_optimizer_rules = '';

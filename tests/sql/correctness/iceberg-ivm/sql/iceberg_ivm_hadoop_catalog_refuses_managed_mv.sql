@@ -28,49 +28,28 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE EXTERNAL CATALOG ice_ivm_hadoop_${uuid0}
-PROPERTIES (
-  "type" = "iceberg",
-  "iceberg.catalog.type" = "hadoop",
-  "iceberg.catalog.warehouse" = "${iceberg_catalog_warehouse}/iceberg_hadoop_${uuid0}",
-  "aws.s3.endpoint" = "${oss_endpoint}",
-  "credential.object-store-metadata.consumer-role" = "frontend",
-  "credential.object-store-metadata.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-metadata.name" = "${iceberg_object_store_metadata_credential_name}",
-  "credential.object-store-metadata.generation" = "${iceberg_object_store_credential_generation}",
-  "credential.object-store-data.consumer-role" = "backend",
-  "credential.object-store-data.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-data.name" = "${iceberg_object_store_data_credential_name}",
-  "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
-  "aws.s3.enable_path_style_access" = "${oss_path_style}"
-);
-CREATE DATABASE ice_ivm_hadoop_${uuid0}.ns_${uuid0};
+CREATE CATALOG ice_ivm_hadoop_${uuid0} USING iceberg WITH ("iceberg.catalog.type" = 'hadoop', "iceberg.catalog.warehouse" = '${iceberg_catalog_warehouse}/iceberg_hadoop_${uuid0}', "aws.s3.endpoint" = '${oss_endpoint}', "credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-metadata.name" = '${iceberg_object_store_metadata_credential_name}', "credential.object-store-metadata.generation" = '${iceberg_object_store_credential_generation}', "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-data.name" = '${iceberg_object_store_data_credential_name}', "credential.object-store-data.generation" = '${iceberg_object_store_credential_generation}', "aws.s3.enable_path_style_access" = '${oss_path_style}');
+CREATE SCHEMA ice_ivm_hadoop_${uuid0}.ns_${uuid0};
 CREATE TABLE ice_ivm_hadoop_${uuid0}.ns_${uuid0}.orders (
   region STRING,
   amount BIGINT
-)
-TBLPROPERTIES ("format-version" = "3",
-  "write.row-lineage" = "true");
+) WITH (format_version = 3);
 
 -- Keep the source logically empty while giving lineage admission a real v3 snapshot.
-INSERT INTO ice_ivm_hadoop_${uuid0}.ns_${uuid0}.orders VALUES ('__rwm5_lineage_seed', 0);
+INSERT INTO ice_ivm_hadoop_${uuid0}.ns_${uuid0}.orders VALUES ROW('__rwm5_lineage_seed', 0);
 DELETE FROM ice_ivm_hadoop_${uuid0}.ns_${uuid0}.orders WHERE region = '__rwm5_lineage_seed';
 
 -- query 2
 -- @expect_error=application-document management requires an Iceberg REST catalog
 USE ice_ivm_hadoop_${uuid0}.ns_${uuid0};
-CREATE MATERIALIZED VIEW agg_mv_${uuid0}
-DISTRIBUTED BY HASH(region) BUCKETS 1
-PROPERTIES ('storage_engine' = 'iceberg')
-AS
-SELECT region, SUM(amount) AS s
+CREATE MATERIALIZED VIEW agg_mv_${uuid0} AS SELECT region, SUM(amount) AS s
 FROM ice_ivm_hadoop_${uuid0}.ns_${uuid0}.orders
 GROUP BY region;
 
 -- query 3
 -- The refusal is an admission decision, so the base table is untouched.
 -- @skip_result_check=true
-INSERT INTO ice_ivm_hadoop_${uuid0}.ns_${uuid0}.orders VALUES ('east', 10);
+INSERT INTO ice_ivm_hadoop_${uuid0}.ns_${uuid0}.orders VALUES ROW('east', 10);
 
 -- query 4
 SELECT region, amount FROM ice_ivm_hadoop_${uuid0}.ns_${uuid0}.orders ORDER BY region;
@@ -84,6 +63,6 @@ WHERE catalog_name = 'ice_ivm_hadoop_${uuid0}'
 -- query 6
 -- @cleanup=true
 -- @skip_result_check=true
-DROP TABLE ice_ivm_hadoop_${uuid0}.ns_${uuid0}.orders FORCE;
-DROP DATABASE ice_ivm_hadoop_${uuid0}.ns_${uuid0};
+DROP TABLE ice_ivm_hadoop_${uuid0}.ns_${uuid0}.orders ;
+DROP SCHEMA ice_ivm_hadoop_${uuid0}.ns_${uuid0};
 DROP CATALOG ice_ivm_hadoop_${uuid0};

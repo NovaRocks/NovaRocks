@@ -21,12 +21,11 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, Field, TimeUnit};
 
 use crate::catalog_application::query_bindings::QueryTableBindingStore;
-use crate::catalog_application::resolver::resolve_existing_table_target;
 use crate::query_execution::kernels::DmlExecutionKernel;
 use crate::query_execution::planning::write_sink::{
     admit_session_connector_write_target, dml_write_plan_input_for_admitted_target,
 };
-use novarocks_parser::ast::{AddEqualityDelete, Expr, LiteralKind, ObjectName, Query};
+use novarocks_parser::ast::{Expr, LiteralKind, Query};
 use novarocks_parser::{ast, build};
 use novarocks_query_application::admitted_query_context::QueryExecutionContext;
 use novarocks_spi::connector::{
@@ -36,21 +35,174 @@ use novarocks_spi::connector::{
 use novarocks_sql::literal::{parse_date_string_to_days, parse_datetime_string_to_micros};
 use novarocks_sql::planning::dml::DmlWriteSinkMode;
 use novarocks_sql::planning::query_execution::FrozenConnectorScanIdentity;
-use novarocks_sql::semantic::{Literal as SqlLiteral, ObjectName as SqlObjectName};
+use novarocks_sql::semantic::Literal as SqlLiteral;
 
 type Literal = SqlLiteral;
 
-pub(super) fn resolve_target(
-    state: &DmlExecutionKernel,
-    stmt: &AddEqualityDelete,
-    current_catalog: Option<&str>,
-    current_database: &str,
-) -> Result<
-    (crate::catalog_application::resolver::TargetBackend, String),
-    crate::catalog_application::resolver::TargetResolutionError,
-> {
-    let table = sql_object_name(&stmt.target);
-    let target = resolve_existing_table_target(state, &table, current_catalog, current_database)?;
+#[cfg(novarocks_dev_controls)]
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct PreparedEqualityDelete {
+    columns: Vec<String>,
+    statement: Arc<ast::TrinoTableExecute>,
+    rows_argument: usize,
+}
+
+#[cfg(novarocks_dev_controls)]
+impl PreparedEqualityDelete {
+    pub(crate) fn from_bound(
+        source: &str,
+        statement: &Arc<ast::TrinoTableExecute>,
+        bound: novarocks_query_application::sql::table_procedure::BoundTableProcedure<'_>,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Self, novarocks_query_application::session_error::QueryServiceError> {
+        use novarocks_query_application::{
+            session_error::{QueryServiceError, QueryServiceErrorKind},
+            sql::table_procedure::{
+                BoundProcedureArgument as Argument, BoundProcedureValue as Value,
+                TableProcedureKind, invalid_procedure_argument,
+            },
+        };
+        use novarocks_spi::connector::DdlPropertyValue;
+        use novarocks_type_contract::CompilePhase;
+
+        let invariant = || {
+            QueryServiceError::new(
+                QueryServiceErrorKind::Internal,
+                "Equality-delete input differs from its original procedure declaration",
+            )
+        };
+        if bound.declaration().kind() != TableProcedureKind::AddEqualityDelete {
+            return Err(invariant());
+        }
+        let mut arguments = bound.into_arguments();
+        let checkpoint = |units| {
+            control
+                .checkpoint(CompilePhase::Validate, units)
+                .map_err(QueryServiceError::from_compile_control)
+        };
+        let missing = |span, slot: &str| {
+            invalid_procedure_argument(
+                source,
+                span,
+                format!("Table procedure ADD_EQUALITY_DELETE argument '{slot}' is required"),
+            )
+        };
+        checkpoint(0)?;
+        let (columns, columns_span) = match arguments.next() {
+            Some((
+                _,
+                Argument::Present {
+                    value: Value::Value(DdlPropertyValue::ArrayVarchar(columns)),
+                    span,
+                },
+            )) => (columns, span.unwrap_or(statement.span)),
+            Some((_, Argument::Omitted)) => return Err(missing(statement.span, "columns")),
+            Some((_, Argument::ExplicitDefault(span))) => return Err(missing(span, "columns")),
+            _ => return Err(invariant()),
+        };
+        if columns.is_empty() {
+            return Err(invalid_procedure_argument(
+                source,
+                columns_span,
+                "ADD EQUALITY DELETE requires at least one equality column",
+            ));
+        }
+        let columns = columns
+            .into_iter()
+            .map(|value| {
+                checkpoint(1)?;
+                value.ok_or_else(|| {
+                    invalid_procedure_argument(
+                        source,
+                        columns_span,
+                        "ADD EQUALITY DELETE columns cannot contain NULL",
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let (rows, rows_span) = match arguments.next() {
+            Some((
+                _,
+                Argument::Present {
+                    value: Value::EqualityRows(rows),
+                    span,
+                },
+            )) => (rows, span.unwrap_or(statement.span)),
+            Some((_, Argument::Omitted)) => return Err(missing(statement.span, "rows")),
+            Some((_, Argument::ExplicitDefault(span))) => return Err(missing(span, "rows")),
+            _ => return Err(invariant()),
+        };
+        if arguments.next().is_some() {
+            return Err(invariant());
+        }
+        let rows_argument = statement
+            .arguments
+            .iter()
+            .position(|argument| std::ptr::eq(&argument.value, rows))
+            .ok_or_else(invariant)?;
+        let Expr::Array(array) = rows else {
+            return Err(invalid_procedure_argument(
+                source,
+                rows_span,
+                "ADD EQUALITY DELETE rows must be ARRAY[ROW(...), ...]",
+            ));
+        };
+        if array.values.is_empty() {
+            return Err(invalid_procedure_argument(
+                source,
+                rows_span,
+                "ADD EQUALITY DELETE requires at least one row",
+            ));
+        }
+        for row in &array.values {
+            checkpoint(1)?;
+            let novarocks_parser::ast::Expr::Row(row) = row else {
+                return Err(invalid_procedure_argument(
+                    source,
+                    row.span(),
+                    "ADD EQUALITY DELETE rows must be ROW constructors",
+                ));
+            };
+            for field in &row.fields {
+                checkpoint(1)?;
+                if field.name.is_some() {
+                    return Err(invalid_procedure_argument(
+                        source,
+                        field.span,
+                        "ADD EQUALITY DELETE rows must have unnamed fields",
+                    ));
+                }
+            }
+        }
+        checkpoint(0)?;
+        Ok(Self {
+            columns,
+            statement: Arc::clone(statement),
+            rows_argument,
+        })
+    }
+
+    fn row_cells(
+        &self,
+    ) -> impl ExactSizeIterator<Item = impl ExactSizeIterator<Item = &Expr>> + Clone {
+        // The bound slot points into this retained immutable AST. Its array,
+        // row boundaries and unnamed fields were checked by the constructor.
+        let Expr::Array(array) = &self.statement.arguments[self.rows_argument].value else {
+            unreachable!("admitted equality-delete row array")
+        };
+        array.values.iter().map(|row| {
+            let novarocks_parser::ast::Expr::Row(row) = row else {
+                unreachable!("admitted equality-delete row")
+            };
+            row.fields.iter().map(|field| &field.expression)
+        })
+    }
+}
+
+#[cfg(novarocks_dev_controls)]
+fn require_iceberg_target(
+    target: &crate::catalog_application::resolver::TargetBackend,
+) -> Result<(), crate::catalog_application::resolver::TargetResolutionError> {
     if target.provider_id.as_str() != "iceberg" {
         return Err((format!(
             "ADD EQUALITY DELETE only supports iceberg backends, got `{}`",
@@ -58,12 +210,13 @@ pub(super) fn resolve_target(
         ))
         .into());
     }
-    Ok((target, "main".to_string()))
+    Ok(())
 }
 
+#[cfg(novarocks_dev_controls)]
 pub(super) async fn prepare_equality_delete_statement_async(
     state: &DmlExecutionKernel,
-    stmt: &AddEqualityDelete,
+    statement: &PreparedEqualityDelete,
     target: &crate::catalog_application::resolver::TargetBackend,
     target_ref: &str,
     planning_pin: novarocks_spi::connector::ConnectorControlPlanningPin,
@@ -71,6 +224,10 @@ pub(super) async fn prepare_equality_delete_statement_async(
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     begin_receiving: Arc<crate::query_execution::write_session::WriteBeginReceiving>,
 ) -> Result<super::PreparedDeleteWrite, crate::dml::error::DmlExecutionError> {
+    require_iceberg_target(target)?;
+    if target_ref != "main" {
+        return Err("ADD EQUALITY DELETE procedure requires its admitted main target".into());
+    }
     // Preserve the original MV guard before metadata loading and admission.
     crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_planning_pin_and_context_async(
         state.mv_storage_observation().as_ref(),
@@ -82,21 +239,53 @@ pub(super) async fn prepare_equality_delete_statement_async(
     ).await?;
     let target_binding =
         super::load_delete_target_async(target, planning_pin, connector_context).await?;
-    let column_names = stmt
-        .columns
-        .iter()
-        .map(|column| column.value.clone())
-        .collect::<Vec<_>>();
-    let rows = stmt
-        .rows
-        .iter()
-        .map(|row| row.iter().map(lower_literal).collect())
+    let preparation = EqualityDeletePreparation {
+        state,
+        target,
+        target_ref,
+        target_binding,
+        execution,
+        connector_context,
+        begin_receiving,
+    };
+    prepare_equality_delete_rows(preparation, &statement.columns, statement.row_cells()).await
+}
+
+#[cfg(novarocks_dev_controls)]
+struct EqualityDeletePreparation<'a> {
+    state: &'a DmlExecutionKernel,
+    target: &'a crate::catalog_application::resolver::TargetBackend,
+    target_ref: &'a str,
+    target_binding: crate::connector::write_target::ConnectorWriteTargetBinding,
+    execution: QueryExecutionContext,
+    connector_context: &'a novarocks_spi::connector::ConnectorRequestContext,
+    begin_receiving: Arc<crate::query_execution::write_session::WriteBeginReceiving>,
+}
+
+#[cfg(novarocks_dev_controls)]
+async fn prepare_equality_delete_rows<'a>(
+    preparation: EqualityDeletePreparation<'_>,
+    column_names: &[String],
+    row_expressions: impl ExactSizeIterator<Item = impl ExactSizeIterator<Item = &'a Expr>> + Clone,
+) -> Result<super::PreparedDeleteWrite, crate::dml::error::DmlExecutionError> {
+    let EqualityDeletePreparation {
+        state,
+        target,
+        target_ref,
+        target_binding,
+        execution,
+        connector_context,
+        begin_receiving,
+    } = preparation;
+    let rows = row_expressions
+        .clone()
+        .map(|row| row.map(lower_literal).collect())
         .collect::<Result<Vec<Vec<_>>, _>>()?;
     let write_lease = target_binding
         .planning_pin()
         .derive_write_lease()
         .map_err(|error| format!("derive equality-delete write lease: {error}"))?;
-    let input = resolve_equality_delete_input(target_binding.metadata(), &column_names, &rows)?;
+    let input = resolve_equality_delete_input(target_binding.metadata(), column_names, &rows)?;
     // Keep RefHead observation on this exact generation before actual begin.
     crate::connector::metadata_read_reference_facts_with_planning_pin_async(
         target_binding.planning_pin().clone(),
@@ -126,7 +315,7 @@ pub(super) async fn prepare_equality_delete_statement_async(
     // Provider admission deliberately precedes literal carrier checks. A
     // rejection here leaves the accepted session in the original receiving.
     let delete_fields = input.validate(&rows)?;
-    let delete_query = build_equality_delete_sink_query(&delete_fields, &stmt.rows)?;
+    let delete_query = equality_delete_sink_query_ast(&delete_fields, row_expressions)?;
     let (sql_write_input, table_bindings) =
         bind_equality_delete_write(target, target_binding.planning_pin(), &write_session)?;
     Ok(super::PreparedDeleteWrite {
@@ -142,31 +331,23 @@ pub(super) async fn prepare_equality_delete_statement_async(
     })
 }
 
-fn sql_object_name(name: &ObjectName) -> SqlObjectName {
-    SqlObjectName {
-        parts: name.parts.iter().map(|part| part.value.clone()).collect(),
-    }
-}
-
 fn lower_literal(expression: &novarocks_parser::ast::Expr) -> Result<Literal, String> {
     let literal = match expression {
         novarocks_parser::ast::Expr::Literal(literal) => literal,
         novarocks_parser::ast::Expr::Unary(unary)
             if unary.operator == novarocks_parser::ast::UnaryOperator::Minus =>
         {
-            let novarocks_parser::ast::Expr::Literal(literal) = unary.expression.as_ref() else {
+            let novarocks_parser::ast::Expr::Literal(_) = unary.expression.as_ref() else {
                 return Err("ADD EQUALITY DELETE accepts literal values only".to_string());
             };
-            let LiteralKind::Number(value) = &literal.kind else {
-                return Err("ADD EQUALITY DELETE accepts numeric negation only".to_string());
+            return match lower_literal(&unary.expression)? {
+                Literal::Int(value) => value
+                    .checked_neg()
+                    .map(Literal::Int)
+                    .ok_or_else(|| "ADD EQUALITY DELETE numeric negation overflows i64".into()),
+                Literal::Float(value) => Ok(Literal::Float(-value)),
+                _ => Err("ADD EQUALITY DELETE accepts numeric negation only".into()),
             };
-            return value
-                .parse::<i64>()
-                .map(|value| Literal::Int(-value))
-                .or_else(|_| value.parse::<f64>().map(|value| Literal::Float(-value)))
-                .map_err(|_| {
-                    format!("unsupported ADD EQUALITY DELETE numeric literal `-{value}`")
-                });
         }
         _ => return Err("ADD EQUALITY DELETE accepts literal values only".to_string()),
     };
@@ -174,14 +355,17 @@ fn lower_literal(expression: &novarocks_parser::ast::Expr) -> Result<Literal, St
         LiteralKind::Null => Ok(Literal::Null),
         LiteralKind::Boolean(value) => Ok(Literal::Bool(*value)),
         LiteralKind::String(value) => Ok(Literal::String(value.clone())),
-        LiteralKind::Number(value) => value
+        LiteralKind::Long { parsed_value, .. } => Ok(Literal::Int(*parsed_value)),
+        LiteralKind::Double(value) => Ok(Literal::Float(value.get())),
+        LiteralKind::Decimal(value) => value
             .parse::<i64>()
             .map(Literal::Int)
             .or_else(|_| value.parse::<f64>().map(Literal::Float))
             .map_err(|_| format!("unsupported ADD EQUALITY DELETE numeric literal `{value}`")),
-        LiteralKind::HexString(value) => Err(format!(
-            "unsupported ADD EQUALITY DELETE hexadecimal literal `{value}`"
-        )),
+        LiteralKind::Binary(_) => Err("unsupported ADD EQUALITY DELETE binary literal".into()),
+        LiteralKind::Generic(_) | LiteralKind::Interval(_) => {
+            Err("unsupported ADD EQUALITY DELETE typed literal".into())
+        }
     }
 }
 
@@ -219,22 +403,22 @@ fn bind_equality_delete_write(
     Ok((sql_write_input, table_bindings))
 }
 
+#[cfg(test)]
 fn build_equality_delete_sink_query(
     delete_columns: &[ConnectorWriteFieldRequest],
     rows: &[Vec<Expr>],
 ) -> Result<Query, String> {
-    let query = equality_delete_sink_query_ast(delete_columns, rows)?;
-    Ok(query)
+    equality_delete_sink_query_ast(delete_columns, rows.iter().map(|row| row.iter()))
 }
 
-fn equality_delete_sink_query_ast(
+fn equality_delete_sink_query_ast<'a>(
     delete_columns: &[ConnectorWriteFieldRequest],
-    rows: &[Vec<Expr>],
+    rows: impl ExactSizeIterator<Item = impl ExactSizeIterator<Item = &'a Expr>>,
 ) -> Result<Query, String> {
     if delete_columns.is_empty() {
         return Err("ADD EQUALITY DELETE requires at least one equality column".to_string());
     }
-    if rows.is_empty() {
+    if rows.len() == 0 {
         return Err("ADD EQUALITY DELETE sink query requires at least one row".to_string());
     }
     let mut values = Vec::with_capacity(rows.len());
@@ -247,8 +431,7 @@ fn equality_delete_sink_query_ast(
             ));
         }
         values.push(
-            row.iter()
-                .zip(delete_columns)
+            row.zip(delete_columns)
                 .map(|(value, column)| {
                     equality_delete_literal_ast(value, column.field().data_type())
                 })
@@ -265,39 +448,31 @@ fn equality_delete_sink_query_ast(
             let column_name = column.field().name();
             Ok(build::item(
                 build::cast(
-                    build::column(
-                        build::ident(alias, Some('`')),
-                        build::ident(column_name, Some('`')),
-                    ),
+                    build::column(build::ident(alias, true), build::ident(column_name, true)),
                     novarocks_sql::sql_type_syntax(value_type)
                         .map_err(|error| error.to_string())?,
                 ),
-                Some(build::ident(column_name, Some('`'))),
-                true,
+                Some(build::ident(column_name, true)),
             ))
         })
         .collect::<Result<Vec<_>, String>>()?;
     let values = build::values(values)
         .map_err(|error| format!("internal equality-delete query construction failed: {error}"))?;
-    let source = build::derived(
-        build::query(values),
-        Some(build::alias(
-            build::ident(alias, Some('`')),
+    let source = build::alias(
+        build::derived(build::query(values)),
+        build::ident(alias, true),
+        Some(
             delete_columns
                 .iter()
-                .map(|column| build::ident(column.field().name(), Some('`')))
+                .map(|column| build::ident(column.field().name(), true))
                 .collect(),
-            true,
-        )),
+        ),
     );
-    let select = build::select(
-        projection,
-        vec![build::relation(source)],
-        None,
-        ast::GroupBy::None,
-    )
-    .map_err(|error| format!("internal equality-delete query construction failed: {error}"))?;
-    Ok(build::query(ast::SetExpr::Select(Box::new(select))))
+    let select = build::select(projection, Some(source), None, None)
+        .map_err(|error| format!("internal equality-delete query construction failed: {error}"))?;
+    Ok(build::query(ast::SetExpr::Select(
+        novarocks_parser::ast::AstBox::new(select),
+    )))
 }
 
 fn equality_delete_literal_ast(value: &Expr, data_type: &DataType) -> Result<Expr, String> {
@@ -310,7 +485,7 @@ fn equality_delete_literal_ast(value: &Expr, data_type: &DataType) -> Result<Exp
     {
         let bytes = novarocks_sql::literal::latin1_string_to_bytes(text)?;
         return Ok(Expr::Literal(ast::Literal {
-            kind: LiteralKind::HexString(hex::encode_upper(bytes)),
+            kind: LiteralKind::Binary(bytes),
             span: literal.span,
         }));
     }
@@ -355,7 +530,7 @@ fn equality_delete_input_fields(
 ///
 /// This used to build an Arrow `RecordBatch` from the same literals. Nothing
 /// consumed that batch: the values reach the writer as the `VALUES` syntax
-/// [`build_equality_delete_sink_query`] constructs, and the only thing the caller
+/// [`equality_delete_sink_query_ast`] constructs, and the only thing the caller
 /// read off the batch was `num_rows() == 0`. What the array builder did
 /// contribute was literal validation, so that is all this keeps.
 ///
@@ -750,7 +925,7 @@ fn parse_decimal_literal_to_i128(value: &str, scale: i8) -> Result<i128, String>
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::query_execution) mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -766,35 +941,57 @@ mod tests {
     use novarocks_sql::semantic::Literal;
 
     fn parsed_rows(sql: &str) -> Vec<Vec<novarocks_parser::ast::Expr>> {
-        let statements = novarocks_parser::parse(sql).unwrap();
-        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
-            panic!("query");
-        };
+        let query = novarocks_parser::parser::parse_query(sql).unwrap();
         let novarocks_parser::ast::SetExpr::Values(values) = query.body.as_ref() else {
             panic!("VALUES");
         };
-        values.rows.clone()
+        values
+            .rows
+            .iter()
+            .map(|row| {
+                let cells = novarocks_parser::ast::ValuesRowCells::new(row);
+                assert!(!cells.has_named_fields());
+                cells.iter().cloned().collect()
+            })
+            .collect()
+    }
+
+    fn assert_sink_rows(
+        query: &novarocks_parser::ast::Query,
+        expected: &[Vec<novarocks_parser::ast::Expr>],
+    ) {
+        let actual = sink_values(query);
+        assert_eq!(actual.rows.len(), expected.len());
+        for (row, expected) in actual.rows.iter().zip(expected) {
+            let cells = novarocks_parser::ast::ValuesRowCells::new(row);
+            assert!(!cells.has_named_fields());
+            assert_eq!(cells.len(), expected.len());
+            for (actual, expected) in cells.iter().zip(expected) {
+                assert_eq!(actual, expected);
+            }
+        }
     }
 
     fn sink_values(query: &novarocks_parser::ast::Query) -> &novarocks_parser::ast::Values {
         let novarocks_parser::ast::SetExpr::Select(select) = query.body.as_ref() else {
             panic!("SELECT");
         };
-        let novarocks_parser::ast::TableFactor::Derived {
-            subquery, alias, ..
-        } = &select.from[0].relation
-        else {
+        let Some(novarocks_parser::ast::Relation::Aliased(alias)) = &select.from else {
+            panic!("VALUES alias");
+        };
+        let novarocks_parser::ast::Relation::TableSubquery(node) = alias.relation.as_ref() else {
             panic!("derived VALUES");
         };
-        let alias = alias.as_ref().expect("VALUES columns");
-        assert_eq!(alias.name.value, "__nr_eqdel");
-        assert!(alias.explicit_as);
-        assert_eq!(alias.name.quote_style, Some('`'));
+        let subquery = &node.query;
+        assert_eq!(alias.alias.value, "__nr_eqdel");
+        assert!(alias.alias.quoted);
         assert!(
             alias
-                .columns
+                .column_names
+                .as_ref()
+                .expect("VALUES columns")
                 .iter()
-                .all(|column| column.quote_style == Some('`'))
+                .all(|column| column.quoted)
         );
         let novarocks_parser::ast::SetExpr::Values(values) = subquery.body.as_ref() else {
             panic!("VALUES");
@@ -1172,7 +1369,7 @@ mod tests {
         );
         let raw_rows = parsed_rows("VALUES (2, 'B'), (4, NULL)");
         let query = super::build_equality_delete_sink_query(&fields, &raw_rows).expect("query");
-        assert_eq!(sink_values(&query).rows, raw_rows);
+        assert_sink_rows(&query, &raw_rows);
         let novarocks_parser::ast::SetExpr::Select(select) = query.body.as_ref() else {
             panic!("SELECT");
         };
@@ -1183,20 +1380,86 @@ mod tests {
             .zip(["INT", "STRING"])
             .map(|((item, name), ty)| (item, name, ty))
         {
-            let novarocks_parser::ast::SelectItem::ExprWithAlias {
-                expr: novarocks_parser::ast::Expr::Cast(cast),
-                alias,
-                explicit_as,
-                ..
-            } = item
-            else {
+            let novarocks_parser::ast::SelectItem::SingleColumn(single_column) = item else {
                 panic!("typed equality-key projection");
             };
+            let Some(alias) = &single_column.alias else {
+                panic!("typed equality-key projection");
+            };
+            let novarocks_parser::ast::Expr::Cast(cast) = &single_column.expression else {
+                panic!("typed equality-key projection");
+            };
+
             assert_eq!(alias.value, name);
-            assert!(*explicit_as);
-            assert_eq!(cast.data_type.name.parts[0].value, ty);
+            assert!(
+                matches!(&cast.data_type.kind, novarocks_parser::ast::TypeKind::Generic(generic) if generic.name.value == ty)
+            );
         }
     }
+    #[cfg(novarocks_dev_controls)]
+    pub(in crate::query_execution) fn assert_prepared_equality_delete_sink(
+        sql: &str,
+        statement: &Arc<novarocks_parser::ast::TrinoTableExecute>,
+        prepared: &super::PreparedEqualityDelete,
+    ) {
+        use novarocks_parser::ast::{Expr, LiteralKind, SelectItem, SetExpr, SyntaxEq};
+        use novarocks_spi::connector::ConnectorWriteFieldRequest;
+        use novarocks_type_contract::FunctionValueType;
+
+        assert!(Arc::ptr_eq(&prepared.statement, statement));
+        assert_eq!(prepared.columns, ["key"]);
+        let rows_argument = &statement.arguments[1];
+        assert_eq!(rows_argument.name.as_ref().unwrap().value, "rows");
+        let Expr::Array(original_rows) = &rows_argument.value else {
+            panic!("original row carrier");
+        };
+        let original_spelling = ["9007199254740993.125", "-9007199254740993.125"];
+        let rows = prepared.row_cells();
+        assert_eq!(rows.len(), original_spelling.len());
+        assert_eq!(rows.len(), original_rows.values.len());
+        let expected_rows = rows
+            .zip(&original_rows.values)
+            .zip(original_spelling)
+            .map(|((mut actual, original), raw)| {
+                let Expr::Row(original) = original else {
+                    panic!("original row")
+                };
+                assert_eq!(actual.len(), 1);
+                let actual = actual.next().unwrap();
+                assert!(std::ptr::eq(actual, &original.fields[0].expression));
+                let Expr::Literal(literal) = actual else {
+                    panic!("original decimal literal")
+                };
+                assert!(matches!(&literal.kind, LiteralKind::Decimal(value) if value == raw));
+                let span = literal.span;
+                assert_eq!(&sql[span.start()..span.end()], raw);
+                vec![actual.clone()]
+            })
+            .collect::<Vec<_>>();
+        let data_type = DataType::Decimal128(38, 3);
+        let field = ConnectorWriteFieldRequest::try_new_typed(
+            Field::new("key", data_type.clone(), true),
+            FunctionValueType::new(data_type, true),
+        )
+        .unwrap();
+        let query = super::equality_delete_sink_query_ast(&[field], prepared.row_cells()).unwrap();
+        assert_sink_rows(&query, &expected_rows);
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("SELECT");
+        };
+        let [SelectItem::SingleColumn(column)] = select.projection.as_slice() else {
+            panic!("sole equality-key projection");
+        };
+        let alias = column.alias.as_ref().expect("equality key alias");
+        assert!(alias.quoted);
+        assert_eq!(alias.value, "key");
+        let expected_cast = novarocks_parser::parser::parse_expression(
+            r#"CAST("__nr_eqdel"."key" AS DECIMAL(38, 3))"#,
+        )
+        .unwrap();
+        assert!(column.expression.syntax_eq(&expected_cast));
+    }
+
     #[test]
     fn equality_delete_keeps_numeric_spelling_after_literal_admission() {
         for (source, scale) in [
@@ -1220,8 +1483,8 @@ mod tests {
                 )
                 .unwrap(),
             ];
-            let query = super::equality_delete_sink_query_ast(&fields, &rows).unwrap();
-            assert_eq!(sink_values(&query).rows, rows, "{source}");
+            let query = super::build_equality_delete_sink_query(&fields, &rows).unwrap();
+            assert_sink_rows(&query, &rows);
         }
     }
 
@@ -1241,12 +1504,16 @@ mod tests {
             .unwrap(),
         ];
         let query = super::build_equality_delete_sink_query(&fields, &[vec![value]]).unwrap();
-        let novarocks_parser::ast::Expr::Literal(literal) = &sink_values(&query).rows[0][0] else {
+        let novarocks_parser::ast::Expr::Literal(literal) =
+            novarocks_parser::ast::ValuesRowCells::new(&sink_values(&query).rows[0])
+                .get(0)
+                .unwrap()
+        else {
             panic!("hexadecimal binary value");
         };
         assert_eq!(
             literal.kind,
-            novarocks_parser::ast::LiteralKind::HexString("00FF5C27".into())
+            novarocks_parser::ast::LiteralKind::Binary(vec![0x00, 0xFF, 0x5C, 0x27])
         );
         assert_eq!(literal.span, span);
         let unsupported = novarocks_parser::build::string("雪");
@@ -1295,7 +1562,7 @@ mod tests {
         let raw_rows = parsed_rows("VALUES (7, NULL)");
         let query =
             super::build_equality_delete_sink_query(&after, &raw_rows).expect("same shape author");
-        assert_eq!(sink_values(&query).rows, raw_rows);
+        assert_sink_rows(&query, &raw_rows);
     }
 
     #[test]
@@ -1416,6 +1683,6 @@ mod tests {
         assert!(Arc::ptr_eq(&session, &original_session));
         let raw_rows = parsed_rows("VALUES (7)");
         let query = super::build_equality_delete_sink_query(&fields, &raw_rows).unwrap();
-        assert_eq!(sink_values(&query).rows, raw_rows);
+        assert_sink_rows(&query, &raw_rows);
     }
 }

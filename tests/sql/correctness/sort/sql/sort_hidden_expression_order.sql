@@ -29,14 +29,13 @@ CREATE TABLE ${case_db}.t_sort_hidden_expression_order (
   id INT,
   base INT,
   delta INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 INSERT INTO ${case_db}.t_sort_hidden_expression_order VALUES
-  (1, 10, 1),
-  (2, 8, NULL),
-  (3, 5, 5),
-  (4, NULL, 2),
-  (5, 7, 9);
+  ROW(1, 10, 1),
+  ROW(2, 8, NULL),
+  ROW(3, 5, 5),
+  ROW(4, NULL, 2),
+  ROW(5, 7, 9);
 SELECT id
 FROM ${case_db}.t_sort_hidden_expression_order
 ORDER BY ABS(COALESCE(base, 0) - COALESCE(delta, 0)) ASC, id DESC

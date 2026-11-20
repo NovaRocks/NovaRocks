@@ -44,7 +44,7 @@ printf 'SPARK_UPGRADE_READY\n'
 -- query 2
 -- @skip_result_check=true
 INSERT INTO iceberg_compat_${suite_uuid0}.${case_db}.up_unpartitioned_${uuid0} SELECT 99,'empty' WHERE FALSE;
-INSERT INTO iceberg_compat_${suite_uuid0}.${case_db}.up_partitioned_${uuid0} VALUES (5,'c');
+INSERT INTO iceberg_compat_${suite_uuid0}.${case_db}.up_partitioned_${uuid0} VALUES ROW(5,'c');
 
 -- query 3
 SELECT 'empty-append' AS first_write, COUNT(*) AS total_rows, COUNT(_row_id) AS assigned_rows, COUNT(DISTINCT _row_id) AS unique_rows
@@ -74,7 +74,7 @@ printf '%s\n' "$spark_out" | grep -Fx 'SPARK_HISTORICAL_ALLOCATION_OK'
 
 -- query 5
 -- @skip_result_check=true
-INSERT INTO iceberg_compat_${suite_uuid0}.${case_db}.up_unpartitioned_${uuid0} VALUES (5,'c');
+INSERT INTO iceberg_compat_${suite_uuid0}.${case_db}.up_unpartitioned_${uuid0} VALUES ROW(5,'c');
 
 -- query 6
 -- @result_contains=SPARK_HISTORICAL_ROW_IDS_OK
@@ -92,5 +92,5 @@ printf 'SPARK_HISTORICAL_ROW_IDS_OK\n'
 
 -- query 7
 -- @skip_result_check=true
-DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.up_unpartitioned_${uuid0} FORCE;
-DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.up_partitioned_${uuid0} FORCE;
+DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.up_unpartitioned_${uuid0} ;
+DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.up_partitioned_${uuid0} ;

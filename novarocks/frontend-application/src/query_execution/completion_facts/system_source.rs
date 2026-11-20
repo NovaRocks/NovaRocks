@@ -274,7 +274,7 @@ impl FrontendSystemTableFacts {
             io: Mutex::new(IoState::default()),
             store: Mutex::new(Some(OwnedStore::default())),
             store_foreign: std::sync::atomic::AtomicBool::new(false),
-            capture: CurrentMetadataCapture::new(),
+            capture: crate::mv::domain::staged_create::new_current_metadata_capture(),
             self_ref: this.clone(),
             resolving: tokio::sync::Mutex::const_new(()),
             unproven: StatementNativeHealthFailure::actual_exit_unproven(

@@ -23,6 +23,7 @@ use std::{sync::Arc, time::Instant};
 use crate::api::BackendTopologySnapshot;
 use crate::cancellation::QueryCancellationView;
 use crate::request_session::RequestSessionContext;
+use crate::sql::session::registry::SessionPropertyInputs;
 use novarocks_sql::compiler::{SessionOptimizerSettings, SqlFoldDependencyObserver};
 use novarocks_types::ClusterRole;
 use novarocks_workload_control::{ResultWindowAlias, ResultWindowClass, WorkError, WorkScope};
@@ -41,6 +42,7 @@ pub struct RequestAdmission {
     optimizer_settings: SessionOptimizerSettings,
     sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings,
     presentation: Option<novarocks_result_contract::ClientPresentationFamily>,
+    property_inputs: SessionPropertyInputs,
 }
 
 impl RequestAdmission {
@@ -65,7 +67,13 @@ impl RequestAdmission {
             optimizer_settings,
             sql_semantics,
             presentation,
+            property_inputs: SessionPropertyInputs::default(),
         }
+    }
+
+    pub fn with_session_property_inputs(mut self, inputs: SessionPropertyInputs) -> Self {
+        self.property_inputs = inputs;
+        self
     }
 }
 
@@ -160,7 +168,7 @@ impl StatementAdmissionContext {
     /// topology round.  Semantic session state, deadline, and cancellation
     /// identity remain those admitted for the original statement.
     pub fn for_topology(&self, topology: BackendTopologySnapshot) -> RequestContext {
-        let execution = QueryExecutionContext::new(
+        let mut execution = QueryExecutionContext::new(
             self.role,
             topology,
             self.deadline,
@@ -168,6 +176,7 @@ impl StatementAdmissionContext {
             self.session.optimizer_settings().clone(),
             self.session.sql_semantics().clone(),
         );
+        execution.session_properties = Arc::clone(self.session.property_inputs());
         let execution = match &self.fold_dependency_observer {
             Some(observer) => execution.with_fold_dependency_observer(Arc::clone(observer)),
             None => execution,
@@ -926,7 +935,7 @@ impl RequestContext {
     /// A settings value of `None` means "no budget", which leaves optimizer
     /// costing on its profile default.
     pub fn admit(admission: RequestAdmission) -> Self {
-        let statement = StatementAdmissionContext::new(
+        let mut statement = StatementAdmissionContext::new(
             admission.current_catalog,
             admission.current_database,
             admission.role,
@@ -936,6 +945,9 @@ impl RequestContext {
             admission.sql_semantics,
             admission.presentation,
         );
+        statement.session = statement
+            .session
+            .with_property_inputs(admission.property_inputs);
         statement.for_topology(admission.topology)
     }
 
@@ -1012,6 +1024,36 @@ mod tests {
             .unwrap();
         control.mark_ready().unwrap();
         (control, capacity)
+    }
+
+    #[test]
+    fn request_admission_shares_validated_overrides_with_execution() {
+        use crate::sql::session::registry::SessionPropertyRegistry;
+
+        let registry = SessionPropertyRegistry::new().unwrap();
+        let mut inputs = SessionPropertyInputs::default();
+        inputs.insert(registry.prepare_system_header("pipeline_dop", "2").unwrap());
+        let context = RequestContext::admit(
+            RequestAdmission::new(
+                None,
+                "db1".to_owned(),
+                ClusterRole::Fe,
+                topology(7, 3),
+                None,
+                QueryCancellationSource::new().view(),
+                SessionOptimizerSettings::default(),
+                novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+                None,
+            )
+            .with_session_property_inputs(inputs),
+        );
+
+        let execution_inputs = context.execution().session_property_inputs();
+        assert!(Arc::ptr_eq(
+            context.session().property_inputs(),
+            execution_inputs
+        ));
+        assert_eq!(execution_inputs.raw_system_value("pipeline_dop"), Some("2"));
     }
 
     #[test]

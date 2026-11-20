@@ -43,35 +43,46 @@ mod extract_binding_tests;
 mod full_value_type_tests;
 pub(crate) mod functions;
 mod helpers;
+mod json_syntax;
 #[cfg(test)]
 pub(crate) use helpers::sql_logical_projection;
+pub(crate) use json_syntax::{
+    is_plain_json_query, is_supported_json_array_profile, is_supported_json_object_profile,
+};
+#[cfg(test)]
+mod collection_expression_tests;
+#[cfg(test)]
+mod control_expression_tests;
 pub(crate) mod declaration_widening;
 mod literal_coercion;
 #[cfg(test)]
 mod load_op_column;
 mod logical_output;
+#[cfg(test)]
+mod predicate_tests;
 #[allow(
     dead_code,
     reason = "The T4 typed-query contract flip wires this staged pre-analysis module."
 )]
 pub(crate) mod query_prepass;
 mod resolve_expr;
+pub(crate) use resolve_expr::{
+    unsupported_call_facts, unsupported_control_expression_reason, unsupported_predicate_reason,
+};
+mod resolve_from;
 #[cfg(test)]
 mod scalar_rebind_contract_tests;
+#[cfg(test)]
+mod trino_capability_tests;
 mod value_conversion;
 mod view;
 #[cfg(test)]
 mod window_canonical_tests;
 mod write_assignment;
-/// The analyzer owns this bound and enforces it; it is named outside the
-/// analyzer only where a test has to build a chain that crosses it.
-#[cfg(test)]
-pub(crate) use resolve_expr::MAX_BOOLEAN_CHAIN_OPERANDS;
-mod resolve_from;
+pub use resolve_from::TableNameView;
 mod scope;
 mod subquery_rewrite;
 
-pub mod alter_iceberg_ref;
 pub mod iceberg_metadata;
 mod iceberg_partitions;
 pub mod iceberg_ref;
@@ -85,9 +96,9 @@ use crate::catalog::PlannerTableProvider;
 use crate::column_id::ColumnId;
 
 use crate::analysis::{
-    AnalyzedOutputField as OutputColumn, AnalyzedProjectItem as ProjectItem, ExprKind, JoinKind,
-    JoinRelation, QueryBody, Relation, ResolvedQuery, ResolvedSelect, ResolvedSetOp,
-    ResolvedValues, SetOpKind, SortItem, SubqueryInfo, TypedExpr,
+    AnalyzedOutputField as OutputColumn, AnalyzedProjectItem as ProjectItem, ExprKind, QueryBody,
+    Relation, ResolvedQuery, ResolvedSelect, ResolvedSetOp, ResolvedValues, SetOpKind, SortItem,
+    SubqueryInfo, TypedExpr,
 };
 
 use helpers::{expr_display_name, extract_limit, extract_offset};
@@ -99,9 +110,33 @@ pub(crate) fn display_expr_for_test(expr: &ast::Expr) -> String {
 }
 
 #[derive(Clone, Debug)]
-struct RepeatGroupBySpec {
-    grouping_sets: Vec<Vec<ast::Expr>>,
-    all_group_by_exprs: Vec<ast::Expr>,
+struct RepeatGroupBySpec<'s> {
+    grouping_sets: Vec<Vec<&'s ast::Expr>>,
+    all_group_by_exprs: Vec<&'s ast::Expr>,
+}
+
+/// Borrow the actual plain grouping keys in their authored element/column order.
+/// None as a return value denotes a profile owned by Repeat or unsupported syntax.
+pub(crate) fn simple_group_by_expressions(
+    group_by: &Option<ast::GroupBy>,
+) -> Option<Vec<&ast::Expr>> {
+    let Some(group_by) = group_by else {
+        return Some(Vec::new());
+    };
+    if group_by.distinct || group_by.elements.is_empty() {
+        return None;
+    }
+    let mut expressions = Vec::new();
+    for element in &group_by.elements {
+        let ast::GroupingElement::Simple(simple) = element else {
+            return None;
+        };
+        if simple.columns.is_empty() {
+            return None;
+        }
+        expressions.extend(simple.columns.iter());
+    }
+    Some(expressions)
 }
 
 // ---------------------------------------------------------------------------
@@ -158,6 +193,38 @@ pub(crate) fn analyze_with_function_catalog(
         function_catalog,
         constant_policy,
         control,
+    )
+}
+
+/// Analyze the defining query of a materialized view with its binding diagnostics.
+pub(crate) fn analyze_mv_definition(
+    query: &ast::Query,
+    catalog: &dyn PlannerTableProvider,
+    current_database: &str,
+    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
+    constant_policy: novarocks_functions::ConstantPolicy,
+    control: &crate::compiler::SqlCompileControl,
+) -> Result<
+    (
+        ResolvedQuery,
+        crate::analysis::cte::CTERegistry,
+        crate::column_id::ColumnRefFactory,
+    ),
+    AnalyzeError,
+> {
+    analyze_with_factory_and_function_catalog_and_assignments_inner(
+        query,
+        catalog,
+        current_database,
+        crate::column_id::ColumnRefFactory::new(),
+        function_catalog,
+        &crate::sql_mode::SqlSemanticSettings::default(),
+        constant_policy,
+        control,
+        None,
+        None,
+        false,
+        QueryAnalysisPurpose::MaterializedViewDefinition,
     )
 }
 
@@ -232,6 +299,7 @@ pub(crate) fn analyze_with_write_assignments_and_sql_semantics(
     control: &crate::compiler::SqlCompileControl,
     materialized: Option<&crate::compiler::materialized_values::MaterializedValues>,
     assignments: Option<&crate::compiler::SqlWriteAssignments>,
+    root_session_admitted: bool,
 ) -> Result<
     (
         ResolvedQuery,
@@ -251,6 +319,8 @@ pub(crate) fn analyze_with_write_assignments_and_sql_semantics(
         control,
         materialized,
         assignments,
+        root_session_admitted,
+        QueryAnalysisPurpose::Ordinary,
     )
 }
 
@@ -349,9 +419,15 @@ fn analyze_with_factory_and_function_catalog_inner(
         control,
         materialized,
         None,
+        false,
+        QueryAnalysisPurpose::Ordinary,
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Each argument is independently owned by the query analysis boundary"
+)]
 fn analyze_with_factory_and_function_catalog_and_assignments_inner(
     query: &ast::Query,
     catalog: &dyn PlannerTableProvider,
@@ -363,6 +439,8 @@ fn analyze_with_factory_and_function_catalog_and_assignments_inner(
     control: &crate::compiler::SqlCompileControl,
     materialized: Option<&crate::compiler::materialized_values::MaterializedValues>,
     assignments: Option<&crate::compiler::SqlWriteAssignments>,
+    root_session_admitted: bool,
+    purpose: QueryAnalysisPurpose,
 ) -> Result<
     (
         ResolvedQuery,
@@ -377,7 +455,15 @@ fn analyze_with_factory_and_function_catalog_and_assignments_inner(
         0,
     )
     .map_err(AnalyzeError::control)?;
-    let query = crate::sql_mode::normalize_concat_query(query.clone(), sql_semantics)?;
+    let query_semantics;
+    let sql_semantics = if root_session_admitted {
+        sql_semantics
+    } else {
+        query_semantics = crate::sql_mode::query_sql_semantics(sql_semantics, query)?;
+        &query_semantics
+    };
+    let query =
+        crate::sql_mode::normalize_concat_query_with_semantics(query.clone(), sql_semantics);
     let query = query_prepass::preanalyze_with_semantics(query, sql_semantics)?;
     let mut materialized_source = materialized
         .map(|source| source.loan(&query, control))
@@ -410,6 +496,7 @@ fn analyze_with_factory_and_function_catalog_and_assignments_inner(
     let factory = std::rc::Rc::new(std::cell::RefCell::new(factory));
     let ctx = AnalyzerContext {
         grouping_scope: std::cell::RefCell::new(None),
+        purpose,
         catalog,
         current_database,
         function_catalog,
@@ -458,14 +545,86 @@ struct GroupingAnalysis {
 
 #[derive(Clone)]
 struct GroupingCall {
-    syntax: ast::FunctionCall,
+    syntax: GroupingSyntax,
     name: String,
     columns: Vec<String>,
     typed_arguments: Vec<TypedExpr>,
     column_id: Option<ColumnId>,
 }
 
+#[derive(Clone)]
+enum GroupingSyntax {
+    Call(ast::AstBox<ast::FunctionCall>),
+    Operation(ast::GroupingOperation),
+}
+#[derive(Clone, Copy)]
+pub(super) enum GroupingSyntaxRef<'a> {
+    Call(&'a ast::FunctionCall),
+    Operation(&'a ast::GroupingOperation),
+}
+impl<'a> GroupingSyntaxRef<'a> {
+    fn len(self) -> usize {
+        match self {
+            Self::Call(call) => call.arguments.len(),
+            Self::Operation(node) => node.grouping_columns.len(),
+        }
+    }
+    fn span(self) -> novarocks_parser::Span {
+        match self {
+            Self::Call(call) => call.span,
+            Self::Operation(node) => node.span,
+        }
+    }
+    fn arguments(self) -> Vec<&'a ast::Expr> {
+        match self {
+            Self::Call(call) => call.arguments.iter().map(|arg| &arg.value).collect(),
+            Self::Operation(node) => node.grouping_columns.iter().collect(),
+        }
+    }
+    fn grouping(self) -> bool {
+        match self {
+            Self::Call(call) => call.name.parts[0].value.eq_ignore_ascii_case("grouping"),
+            Self::Operation(_) => true,
+        }
+    }
+    fn owned(self) -> GroupingSyntax {
+        match self {
+            Self::Call(call) => GroupingSyntax::Call(ast::AstBox::new(call.clone())),
+            Self::Operation(node) => GroupingSyntax::Operation(node.clone()),
+        }
+    }
+}
+impl GroupingSyntax {
+    fn as_ref(&self) -> GroupingSyntaxRef<'_> {
+        match self {
+            Self::Call(call) => GroupingSyntaxRef::Call(call),
+            Self::Operation(node) => GroupingSyntaxRef::Operation(node),
+        }
+    }
+    fn matches(&self, input: GroupingSyntaxRef<'_>) -> bool {
+        match (self, input) {
+            (Self::Call(a), GroupingSyntaxRef::Call(b)) => a.as_ref() == b,
+            (Self::Operation(a), GroupingSyntaxRef::Operation(b)) => a == b,
+            _ => false,
+        }
+    }
+    fn matches_expression(&self, expr: &ast::Expr) -> bool {
+        match expr {
+            ast::Expr::FunctionCall(call) => self.matches(GroupingSyntaxRef::Call(call)),
+            ast::Expr::GroupingOperation(node) => self.matches(GroupingSyntaxRef::Operation(node)),
+            _ => false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum QueryAnalysisPurpose {
+    Ordinary,
+    MaterializedViewDefinition,
+}
+
 pub(super) struct AnalyzerContext<'a> {
+    purpose: QueryAnalysisPurpose,
     grouping_scope: std::cell::RefCell<Option<std::rc::Rc<GroupingAnalysis>>>,
     view_stack: view::ViewAnalysisStack,
     pub(super) control: &'a crate::compiler::SqlCompileControl,
@@ -512,26 +671,33 @@ impl<'a> AnalyzerContext<'a> {
         select: Option<&ast::Select>,
         analyze: impl FnOnce(&Self) -> Result<T, AnalyzeError>,
     ) -> Result<T, AnalyzeError> {
-        let state = select.map(|select| {
-            let repeat = self.extract_repeat_from_group_by(select);
-            let keys = if let Some(spec) = &repeat {
-                spec.all_group_by_exprs.clone()
-            } else if let ast::GroupBy::Expressions { expressions, .. } = &select.group_by {
-                expressions.clone()
-            } else {
-                Vec::new()
-            };
-            std::rc::Rc::new(GroupingAnalysis {
-                select,
-                keys,
-                repeat: repeat.is_some(),
-                enabled: std::cell::Cell::new(false),
-                next_mask_index: std::cell::Cell::new(0),
-                from_scope: std::cell::RefCell::new(None),
-                resolved_keys: std::cell::RefCell::new(None),
-                calls: std::cell::RefCell::new(Vec::new()),
+        let state = select
+            .map(|select| -> Result<_, AnalyzeError> {
+                let repeat = self.extract_repeat_from_group_by(select)?;
+                let keys = if let Some(spec) = &repeat {
+                    spec.all_group_by_exprs
+                        .iter()
+                        .map(|expr| (*expr).clone())
+                        .collect()
+                } else {
+                    simple_group_by_expressions(&select.group_by)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .cloned()
+                        .collect()
+                };
+                Ok(std::rc::Rc::new(GroupingAnalysis {
+                    select,
+                    keys,
+                    repeat: repeat.is_some(),
+                    enabled: std::cell::Cell::new(false),
+                    next_mask_index: std::cell::Cell::new(0),
+                    from_scope: std::cell::RefCell::new(None),
+                    resolved_keys: std::cell::RefCell::new(None),
+                    calls: std::cell::RefCell::new(Vec::new()),
+                }))
             })
-        });
+            .transpose()?;
         let previous = self.grouping_scope.replace(state);
         let result = analyze(self);
         self.grouping_scope.replace(previous);
@@ -543,39 +709,45 @@ impl<'a> AnalyzerContext<'a> {
         function: &ast::FunctionCall,
         scope: &AnalyzerScope,
     ) -> Result<TypedExpr, AnalyzeError> {
+        self.analyze_grouping_input(GroupingSyntaxRef::Call(function), scope)
+    }
+    fn analyze_grouping_input(
+        &self,
+        input: GroupingSyntaxRef<'_>,
+        scope: &AnalyzerScope,
+    ) -> Result<TypedExpr, AnalyzeError> {
         use crate::analysis::LiteralValue;
         use novarocks_type_contract::FunctionValueType;
-        let grouping = function.name.parts[0]
-            .value
-            .eq_ignore_ascii_case("grouping");
-        let count = function.arguments.len();
+        let grouping = input.grouping();
+        let count = input.len();
         // Count occurrences, including duplicate arguments, before analyzing
         // an argument. This is Trino's GROUPING width/arity decision point.
         if grouping && count > 63 {
             return Err(AnalyzeError::too_many_arguments(
                 "GROUPING supports at most 63 arguments",
-                function.span,
+                input.span(),
             ));
         }
         if count == 0 {
             return Err(AnalyzeError::invalid_argument(
                 "GROUPING requires at least one argument",
-                function.span,
+                input.span(),
             ));
         }
         let state = self.grouping_scope.borrow().clone().ok_or_else(|| {
-            AnalyzeError::invalid_argument("GROUPING requires a GROUP BY clause", function.span)
+            AnalyzeError::invalid_argument("GROUPING requires a GROUP BY clause", input.span())
         })?;
         if !state.enabled.get() || state.keys.is_empty() {
             return Err(AnalyzeError::invalid_argument(
                 "GROUPING arguments must be grouping columns",
-                function.span,
+                input.span(),
             ));
         }
         let from_scope = state.from_scope.borrow().clone();
         let argument_scope = from_scope.as_ref().unwrap_or(scope);
+        let arguments = input.arguments();
         let mut typed_arguments = Vec::with_capacity(count);
-        for argument in &function.arguments {
+        for argument in &arguments {
             self.check_control()?;
             typed_arguments.push(self.analyze_expr(argument, argument_scope)?);
         }
@@ -590,7 +762,7 @@ impl<'a> AnalyzerContext<'a> {
             .calls
             .borrow()
             .iter()
-            .find(|call| call.syntax == *function)
+            .find(|call| call.syntax.matches(input))
             .cloned();
         let call = if let Some(call) = existing {
             call
@@ -606,7 +778,7 @@ impl<'a> AnalyzerContext<'a> {
                 )
             });
             let call = GroupingCall {
-                syntax: function.clone(),
+                syntax: input.owned(),
                 name,
                 columns: Vec::new(),
                 typed_arguments,
@@ -639,7 +811,7 @@ impl<'a> AnalyzerContext<'a> {
             FunctionValueType::new(public_type, true),
             self.control,
         )?;
-        self.cast_to_value_type(mask, target, function.span)
+        self.cast_to_value_type(mask, target, input.span())
     }
 
     /// Reuse the completed GROUP BY author's actual expressions, including
@@ -660,7 +832,11 @@ impl<'a> AnalyzerContext<'a> {
         let mut calls = state.calls.borrow().clone();
         for call in &mut calls {
             call.columns.clear();
-            for (argument, syntax) in call.typed_arguments.iter().zip(&call.syntax.arguments) {
+            for (argument, syntax) in call
+                .typed_arguments
+                .iter()
+                .zip(call.syntax.as_ref().arguments())
+            {
                 let mut matched = None;
                 for (index, key) in keys.iter().enumerate() {
                     self.check_control()?;
@@ -712,7 +888,7 @@ impl<'a> AnalyzerContext<'a> {
                 };
                 let canonical = state.keys.get(index).map(expr_syntax_key).ok_or_else(|| {
                     AnalyzeError::internal("GROUP BY key ordinal is missing its original syntax")
-                })?;
+                })??;
                 call.columns.push(canonical);
             }
         }
@@ -765,37 +941,6 @@ impl<'a> AnalyzerContext<'a> {
         let calls = state.calls.borrow().clone();
         let mut display = GroupingDisplayFolder { calls: &calls };
         expr_display_name(&ast::Fold::fold_expr(&mut display, expression.clone()))
-    }
-
-    fn with_sql_semantics_scope<T>(
-        &self,
-        settings: crate::sql_mode::SqlSemanticSettings,
-        analyze: impl FnOnce(&Self) -> Result<T, AnalyzeError>,
-    ) -> Result<T, AnalyzeError> {
-        if settings == self.sql_semantics {
-            return analyze(self);
-        }
-        let child = AnalyzerContext {
-            grouping_scope: std::cell::RefCell::new(self.grouping_scope.borrow().clone()),
-            control: self.control,
-            constant_policy: self.constant_policy,
-            materialized_values: self.materialized_values,
-            catalog: self.catalog,
-            current_database: self.current_database,
-            function_catalog: self.function_catalog,
-            sql_semantics: settings,
-            factory: self.factory.clone(),
-            view_stack: self.view_stack.clone(),
-            ctes: self.ctes.clone(),
-            pending_ctes: self.pending_ctes.clone(),
-            next_subquery_id: std::cell::Cell::new(self.next_subquery_id.get()),
-            next_lambda_slot_id: std::cell::Cell::new(self.next_lambda_slot_id.get()),
-            collected_subqueries: std::cell::RefCell::new(Vec::new()),
-            cte_registry: std::cell::RefCell::new(self.cte_registry.borrow().clone()),
-        };
-        let result = analyze(&child);
-        self.absorb_semantic_scope(&child);
-        result
     }
 
     fn absorb_semantic_scope(&self, child: &Self) {
@@ -855,6 +1000,7 @@ impl<'a> AnalyzerContext<'a> {
 
         let mut child_ctx = AnalyzerContext {
             grouping_scope: std::cell::RefCell::new(None),
+            purpose: self.purpose,
             control: self.control,
             constant_policy: self.constant_policy,
             materialized_values: self.materialized_values,
@@ -879,10 +1025,16 @@ impl<'a> AnalyzerContext<'a> {
             pending_ctes.remove(&name);
             child_ctx.pending_ctes = pending_ctes.clone();
 
+            if cte.columns.as_ref().is_some_and(Vec::is_empty) {
+                return Err(AnalyzeError::unsupported_query_shape(
+                    "empty CTE column aliases are not supported",
+                    cte.span,
+                ));
+            }
             let mut resolved_cte = child_ctx.analyze_query(&cte.query)?;
             crate::analysis::schema::apply_column_aliases(
                 &mut resolved_cte.output_columns,
-                &cte.columns,
+                cte.columns.as_deref().unwrap_or(&[]),
                 cte.span,
             )?;
 
@@ -903,14 +1055,14 @@ impl<'a> AnalyzerContext<'a> {
     /// Top-level query analysis.
     fn analyze_query(&self, query: &ast::Query) -> Result<ResolvedQuery, AnalyzeError> {
         self.check_control()?;
-        let settings = crate::sql_mode::query_sql_semantics(&self.sql_semantics, query)?;
-        self.with_sql_semantics_scope(settings, |ctx| ctx.analyze_query_in_semantic_scope(query))
+        self.analyze_query_in_semantic_scope(query)
     }
 
     fn analyze_query_in_semantic_scope(
         &self,
         query: &ast::Query,
     ) -> Result<ResolvedQuery, AnalyzeError> {
+        let modifiers = helpers::query_modifiers(query)?;
         let (maybe_child_ctx, local_cte_ids) = if let Some(ref with_clause) = query.with {
             let (child_ctx, local_cte_ids) = self.build_with_clause_context(with_clause)?;
             (Some(child_ctx), local_cte_ids)
@@ -918,24 +1070,44 @@ impl<'a> AnalyzerContext<'a> {
             (None, Vec::new())
         };
         let ctx = maybe_child_ctx.as_ref().unwrap_or(self);
-        let select = match query.body.as_ref() {
+        let result = ctx.analyze_query_body(&query.body, modifiers, query.span, local_cte_ids);
+        if let Some(child_ctx) = maybe_child_ctx {
+            self.absorb_semantic_scope(&child_ctx);
+        }
+        result
+    }
+
+    fn analyze_query_body(
+        &self,
+        set_expr: &ast::SetExpr,
+        modifiers: &ast::QueryModifiers,
+        span: novarocks_parser::Span,
+        local_cte_ids: Vec<crate::analysis::cte::CteId>,
+    ) -> Result<ResolvedQuery, AnalyzeError> {
+        let select = match set_expr {
             ast::SetExpr::Select(select) => Some(select.as_ref()),
             _ => None,
         };
-        let result = ctx.with_grouping_scope(select, |ctx| {
+        self.with_grouping_scope(select, |ctx| {
             // Analyze body (SELECT / SetOperation / VALUES)
-            let (mut body, body_output) = ctx.analyze_set_expr(query.body.as_ref())?;
+            let (mut body, body_output) = ctx.analyze_set_expr(set_expr)?;
 
             // Analyze ORDER BY
-            let order_by = ctx.analyze_order_by(query, &body_output, &body)?;
+            let order_by = ctx.analyze_order_by(
+                modifiers.order_by.as_ref(),
+                select,
+                span,
+                &body_output,
+                &body,
+            )?;
             if let QueryBody::Select(select) = &mut body {
                 ctx.validate_grouping_calls(&select.group_by)?;
                 ctx.append_grouping_calls(select);
             }
 
             // Extract LIMIT / OFFSET
-            let limit = extract_limit(query)?;
-            let offset = extract_offset(query)?;
+            let limit = extract_limit(modifiers)?;
+            let offset = extract_offset(modifiers)?;
 
             // Build output columns from the body
             let output_columns = body_output;
@@ -948,14 +1120,11 @@ impl<'a> AnalyzerContext<'a> {
                 output_columns,
                 local_cte_ids,
             })
-        });
-        if let Some(child_ctx) = maybe_child_ctx {
-            self.absorb_semantic_scope(&child_ctx);
-        }
-        result
+        })
     }
 
     /// Analyze a SetExpr and return (QueryBody, output_columns).
+    #[recursive::recursive]
     fn analyze_set_expr(
         &self,
         set_expr: &ast::SetExpr,
@@ -971,11 +1140,32 @@ impl<'a> AnalyzerContext<'a> {
                     return self.with_grouping_scope(Some(s), |ctx| ctx.analyze_set_expr(set_expr));
                 }
                 // Check if GROUP BY contains ROLLUP/CUBE/GROUPING SETS.
-                if let Some(repeat_spec) = self.extract_repeat_from_group_by(s) {
+                if let Some(repeat_spec) = self.extract_repeat_from_group_by(s)? {
                     return self.resolve_repeat_group_by(s, &repeat_spec);
                 }
                 let (sel, cols) = self.analyze_select(s)?;
                 Ok((QueryBody::Select(sel), cols))
+            }
+            ast::SetExpr::Table(table) => {
+                let (from, scope) = self.analyze_table_query(table)?;
+                let mut projection = Vec::new();
+                let mut columns = Vec::new();
+                self.append_wildcard_projection(&scope, &mut projection, &mut columns)?;
+                Ok((
+                    QueryBody::Select(ResolvedSelect {
+                        from: Some(from),
+                        filter: None,
+                        group_by: Vec::new(),
+                        having: None,
+                        projection,
+                        has_aggregation: false,
+                        distinct: false,
+                        repeat: None,
+                        apply_specs: (Vec::new()).into(),
+                        predicate_apply_specs: (Vec::new()).into(),
+                    }),
+                    columns,
+                ))
             }
             ast::SetExpr::SetOperation(_) => self.analyze_set_operation_chain(set_expr),
             ast::SetExpr::Values(values) => {
@@ -983,71 +1173,105 @@ impl<'a> AnalyzerContext<'a> {
                 Ok((QueryBody::Values(resolved_values), cols))
             }
             ast::SetExpr::Query(q) => {
-                let resolved = self.analyze_query(q)?;
+                let resolved = self.analyze_query(&q.query)?;
                 let cols = resolved.output_columns.clone();
-                Ok((resolved.body, cols))
+                if resolved.order_by.is_empty()
+                    && resolved.limit.is_none()
+                    && resolved.offset.is_none()
+                    && resolved.local_cte_ids.is_empty()
+                {
+                    return Ok((resolved.body, cols));
+                }
+                // A parenthesized query has its own suffix and CTE scope.
+                // Retain that query under an ordinary subquery relation;
+                // passthrough projection reuses its fields and ColumnIds.
+                let mut projection = Vec::with_capacity(cols.len());
+                for column in &cols {
+                    self.check_control()?;
+                    projection.push(crate::analysis::AnalyzedProjectItem {
+                        expr: TypedExpr {
+                            kind: ExprKind::ColumnRef {
+                                column_id: column.column_id,
+                                qualifier: None,
+                                column: column.name.clone(),
+                            },
+                            value_type: column.value_type.clone(),
+                        },
+                        output_name: column.name.clone(),
+                        field_name: column.field_name.clone(),
+                        output_column_id: column.column_id,
+                    });
+                }
+                Ok((
+                    QueryBody::Select(ResolvedSelect {
+                        from: Some(Relation::Subquery {
+                            query: novarocks_parser::ast::AstBox::new(resolved),
+                            alias: String::new(),
+                            output_columns: cols.clone(),
+                        }),
+                        filter: None,
+                        group_by: vec![],
+                        having: None,
+                        projection,
+                        has_aggregation: false,
+                        distinct: false,
+                        repeat: None,
+                        apply_specs: (vec![]).into(),
+                        predicate_apply_specs: (vec![]).into(),
+                    }),
+                    cols,
+                ))
             }
         }
     }
 
-    /// Resolve a set operation chain without using one Rust stack frame per
-    /// branch. A balanced UNION ALL syntax tree is folded in source order so
-    /// pairwise type widening and output names retain left association.
+    /// Lower ordered syntax inputs into the existing pairwise semantic IR.
+    /// The left spine is consumed iteratively, preserving widening and names.
     fn analyze_set_operation_chain(
         &self,
         set_expr: &ast::SetExpr,
     ) -> Result<(QueryBody, Vec<OutputColumn>), AnalyzeError> {
-        let (leftmost, operations): (_, Vec<_>) = if matches!(set_expr, ast::SetExpr::SetOperation(operation)
-                if operation.operator == ast::SetOperator::Union
-                    && operation.quantifier == ast::SetQuantifier::All)
-        {
-            let mut pending = vec![set_expr];
-            let mut operands = Vec::new();
-            while let Some(current) = pending.pop() {
-                self.check_control()?;
-                match current {
-                    ast::SetExpr::SetOperation(operation)
-                        if operation.operator == ast::SetOperator::Union
-                            && operation.quantifier == ast::SetQuantifier::All =>
-                    {
-                        pending.push(&operation.right);
-                        pending.push(&operation.left);
-                    }
-                    other => operands.push(other),
-                }
+        let mut operations = Vec::new();
+        let mut leftmost = set_expr;
+        while let ast::SetExpr::SetOperation(operation) = leftmost {
+            self.check_control()?;
+            if operation.corresponding.is_some() {
+                return Err(AnalyzeError::unsupported_expression(
+                    "CORRESPONDING set operations are not supported",
+                    operation.span,
+                ));
             }
-            let first = operands.remove(0);
-            let operations = operands
-                .into_iter()
-                .map(|right| {
-                    self.check_control()?;
-                    Ok((
-                        ast::SetOperator::Union,
-                        ast::SetQuantifier::All,
-                        right,
-                        set_expr.span(),
-                    ))
-                })
-                .collect::<Result<Vec<_>, AnalyzeError>>()?;
-            (first, operations)
-        } else {
-            let mut operations = Vec::new();
-            let mut leftmost = set_expr;
-            while let ast::SetExpr::SetOperation(operation) = leftmost {
+            let Some(first) = operation.inputs.first() else {
+                return Err(AnalyzeError::invalid_query_shape(
+                    "set operation has no input",
+                    operation.span,
+                ));
+            };
+            if operation.inputs.len() < 2
+                || (!(operation.operator == ast::SetOperator::Union
+                    && !operation.distinct
+                    && operation.corresponding.is_none())
+                    && operation.inputs.len() != 2)
+            {
+                return Err(AnalyzeError::invalid_query_shape(
+                    "invalid set operation input count",
+                    operation.span,
+                ));
+            }
+            for right in operation.inputs.iter().skip(1).rev() {
                 self.check_control()?;
                 operations.push((
                     operation.operator,
-                    operation.quantifier,
-                    operation.right.as_ref(),
+                    operation.distinct,
+                    right,
                     operation.span,
                 ));
-                leftmost = &operation.left;
             }
-            operations.reverse();
-            (leftmost, operations)
-        };
+            leftmost = first;
+        }
+        operations.reverse();
         let mut left_query = self.analyze_set_operand(leftmost)?;
-        for (operator, quantifier, right, span) in operations {
+        for (operator, distinct, right, span) in operations {
             self.check_control()?;
             let right_query = self.analyze_set_operand(right)?;
             let left_cols = &left_query.output_columns;
@@ -1084,13 +1308,13 @@ impl<'a> AnalyzerContext<'a> {
                 ast::SetOperator::Intersect => SetOpKind::Intersect,
                 ast::SetOperator::Except => SetOpKind::Except,
             };
-            let all = matches!(quantifier, ast::SetQuantifier::All);
+            let all = !distinct;
             left_query = ResolvedQuery {
                 body: QueryBody::SetOperation(ResolvedSetOp {
                     kind,
                     all,
-                    left: Box::new(left_query),
-                    right: Box::new(right_query),
+                    left: novarocks_parser::ast::AstBox::new(left_query),
+                    right: novarocks_parser::ast::AstBox::new(right_query),
                 }),
                 order_by: vec![],
                 limit: None,
@@ -1104,37 +1328,54 @@ impl<'a> AnalyzerContext<'a> {
 
     fn analyze_set_operand(&self, set_expr: &ast::SetExpr) -> Result<ResolvedQuery, AnalyzeError> {
         match set_expr {
-            ast::SetExpr::Query(q) => self.analyze_query(q),
+            ast::SetExpr::Query(q) => self.analyze_query(&q.query),
             _ => {
-                let (body, output_columns) = self.analyze_set_expr(set_expr)?;
-                Ok(ResolvedQuery {
-                    body,
-                    order_by: vec![],
-                    limit: None,
-                    offset: None,
-                    output_columns,
-                    local_cte_ids: vec![],
-                })
+                let empty = ast::QueryModifiers::default();
+                let modifiers = match set_expr {
+                    ast::SetExpr::Select(select) => &select.modifiers,
+                    _ => &empty,
+                };
+                self.analyze_query_body(set_expr, modifiers, set_expr.span(), vec![])
             }
         }
     }
 
-    /// Analyze syntax VALUES, retaining checked expression constants at their exact sites.
     fn analyze_values(
         &self,
         values: &ast::Values,
     ) -> Result<(ResolvedValues, Vec<OutputColumn>), AnalyzeError> {
         let scope = self.new_scope();
+        if values.rows.is_empty() {
+            return Err(AnalyzeError::unsupported_expression(
+                "empty VALUES rows are not supported",
+                values.span,
+            ));
+        }
         let row_count = values.rows.len();
         let mut resolved_rows = Vec::with_capacity(row_count);
         let mut column_types = Vec::new();
         for row_idx in 0..row_count {
             self.check_control()?;
-            let width = values.rows[row_idx].len();
-            let mut resolved_row = Vec::with_capacity(width);
-            for col_idx in 0..width {
+            let row = &values.rows[row_idx];
+            let cells = ast::ValuesRowCells::new(row);
+            if cells.is_empty() || cells.has_named_fields() {
+                return Err(AnalyzeError::unsupported_expression(
+                    "empty or named VALUES rows are not supported",
+                    row.span(),
+                ));
+            }
+            let mut resolved_row = Vec::with_capacity(cells.len());
+            for (col_idx, expression) in cells.iter().enumerate() {
                 self.check_control()?;
-                let typed = self.analyze_expr(&values.rows[row_idx][col_idx], &scope)?;
+                let typed = self.analyze_expr(expression, &scope)?;
+                if !matches!(row, ast::Expr::Row(_))
+                    && matches!(typed.value_type.data_type(), DataType::Struct(_))
+                {
+                    return Err(AnalyzeError::unsupported_expression(
+                        "generic row-valued VALUES expressions are not supported",
+                        row.span(),
+                    ));
+                }
                 if col_idx < column_types.len() {
                     column_types[col_idx] = helpers::assignment_common_value_type(
                         &column_types[col_idx],
@@ -1179,48 +1420,26 @@ impl<'a> AnalyzerContext<'a> {
         &self,
         select: &ast::Select,
     ) -> Result<(ResolvedSelect, Vec<OutputColumn>), AnalyzeError> {
-        let settings = crate::sql_mode::select_sql_semantics(&self.sql_semantics, select)?;
-        self.with_sql_semantics_scope(settings, |ctx| ctx.analyze_select_in_semantic_scope(select))
+        self.analyze_select_in_semantic_scope(select, None)
     }
 
     fn analyze_select_in_semantic_scope(
         &self,
         select: &ast::Select,
+        group_by_override: Option<&[&ast::Expr]>,
     ) -> Result<(ResolvedSelect, Vec<OutputColumn>), AnalyzeError> {
         // --- FROM clause ---
-        let (from, scope) = if select.from.is_empty() {
-            // SELECT without FROM (dual)
-            (None, self.new_scope())
-        } else if select.from.len() == 1 {
-            let (rel, scope) = self.analyze_from(&select.from[0])?;
-            (Some(rel), scope)
+        let (from, scope) = if let Some(relation) = &select.from {
+            let (relation, scope) = self.analyze_from(relation)?;
+            (Some(relation), scope)
         } else {
-            // Multiple comma-separated FROM items → implicit CROSS JOIN.
-            // Subsequent entries see the accumulated left-hand scope so
-            // table-valued functions (e.g. `unnest(t.arr)`) can reference
-            // earlier sibling columns (StarRocks implicit-lateral semantics).
-            let mut iter = select.from.iter();
-            let first = iter.next().unwrap();
-            let (mut current_rel, mut current_scope) = self.analyze_from(first)?;
-            for twj in iter {
-                let (right_rel, right_scope) =
-                    self.analyze_from_with_outer(twj, Some(&current_scope))?;
-                current_scope.merge(&right_scope);
-                current_rel = Relation::Join(Box::new(JoinRelation {
-                    naa_author: None,
-                    left: current_rel,
-                    right: right_rel,
-                    join_type: JoinKind::Cross,
-                    condition: None,
-                }));
-            }
-            (Some(current_rel), current_scope)
+            (None, self.new_scope())
         };
 
         // Finish FROM recursion before allocating the SELECT analysis frame.
         // Nested derived tables must not retain every outer projection,
         // grouping and subquery-rewrite temporary on the planning stack.
-        self.analyze_select_after_from(select, from, scope)
+        self.analyze_select_after_from(select, from, scope, group_by_override)
     }
 
     #[inline(never)]
@@ -1229,6 +1448,7 @@ impl<'a> AnalyzerContext<'a> {
         select: &ast::Select,
         from: Option<Relation>,
         scope: AnalyzerScope,
+        group_by_override: Option<&[&ast::Expr]>,
     ) -> Result<(ResolvedSelect, Vec<OutputColumn>), AnalyzeError> {
         // --- WHERE clause ---
         let filter = match &select.selection {
@@ -1250,25 +1470,25 @@ impl<'a> AnalyzerContext<'a> {
             state.enabled.set(false);
         }
         // --- GROUP BY (with SELECT alias fallback) ---
-        let group_by_exprs = match &select.group_by {
-            ast::GroupBy::None => Vec::new(),
-            ast::GroupBy::Expressions { expressions, .. } => expressions.clone(),
-            ast::GroupBy::Rollup { .. }
-            | ast::GroupBy::Cube { .. }
-            | ast::GroupBy::GroupingSets { .. } => {
-                return Err(AnalyzeError::internal(
+        let group_by_exprs = match group_by_override {
+            Some(expressions) => expressions.to_vec(),
+            None => simple_group_by_expressions(&select.group_by).ok_or_else(|| {
+                AnalyzeError::internal(
                     "internal error: repeat GROUP BY must be expanded before select analysis",
-                ));
-            }
+                )
+            })?,
         };
         let mut group_by = Vec::with_capacity(group_by_exprs.len());
-        for gb_expr in &group_by_exprs {
+        for gb_expr in group_by_exprs {
             if let ast::Expr::Literal(ast::Literal {
-                kind: ast::LiteralKind::Number(n),
+                kind:
+                    ast::LiteralKind::Long {
+                        parsed_value: n, ..
+                    },
                 ..
             }) = gb_expr
             {
-                let pos = n.parse::<usize>().map_err(|e| {
+                let pos = usize::try_from(*n).map_err(|e| {
                     AnalyzeError::invalid_literal(
                         format!("invalid GROUP BY position: {e}"),
                         gb_expr.span(),
@@ -1290,8 +1510,7 @@ impl<'a> AnalyzerContext<'a> {
                     )
                 })?;
                 let select_expr = match select_item {
-                    ast::SelectItem::UnnamedExpr(expr)
-                    | ast::SelectItem::ExprWithAlias { expr, .. } => expr,
+                    ast::SelectItem::SingleColumn(column) => &column.expression,
                     _ => {
                         return Err(AnalyzeError::invalid_argument(
                             format!("GROUP BY position {pos} must reference a select expression"),
@@ -1399,7 +1618,7 @@ impl<'a> AnalyzerContext<'a> {
         // --- DISTINCT ---
         self.validate_grouping_calls(&group_by)?;
 
-        let distinct = matches!(select.quantifier, ast::SelectQuantifier::Distinct { .. });
+        let distinct = select.distinct;
 
         let mut resolved_select = ResolvedSelect {
             from,
@@ -1410,8 +1629,8 @@ impl<'a> AnalyzerContext<'a> {
             has_aggregation,
             distinct,
             repeat: None,
-            apply_specs: Vec::new(),
-            predicate_apply_specs: Vec::new(),
+            apply_specs: (Vec::new()).into(),
+            predicate_apply_specs: (Vec::new()).into(),
         };
 
         // --- Subquery rewriting ---
@@ -1447,6 +1666,7 @@ impl<'a> AnalyzerContext<'a> {
         self.substitute_select_aliases_for_select_inner(expr, projection, from_scope, false)
     }
 
+    #[recursive::recursive]
     fn substitute_select_aliases_for_select_inner(
         &self,
         expr: TypedExpr,
@@ -1486,13 +1706,23 @@ impl<'a> AnalyzerContext<'a> {
                 value_type: expr.value_type.clone(),
 
                 kind: ExprKind::BinaryOp {
-                    left: Box::new(self.substitute_select_aliases_for_select_inner(
-                        *left, projection, from_scope, inside_agg,
-                    )),
+                    left: novarocks_parser::ast::AstBox::new(
+                        self.substitute_select_aliases_for_select_inner(
+                            left.into_inner(),
+                            projection,
+                            from_scope,
+                            inside_agg,
+                        ),
+                    ),
                     op,
-                    right: Box::new(self.substitute_select_aliases_for_select_inner(
-                        *right, projection, from_scope, inside_agg,
-                    )),
+                    right: novarocks_parser::ast::AstBox::new(
+                        self.substitute_select_aliases_for_select_inner(
+                            right.into_inner(),
+                            projection,
+                            from_scope,
+                            inside_agg,
+                        ),
+                    ),
                     decimal_overflow_policy,
                 },
             },
@@ -1501,9 +1731,14 @@ impl<'a> AnalyzerContext<'a> {
 
                 kind: ExprKind::UnaryOp {
                     op,
-                    expr: Box::new(self.substitute_select_aliases_for_select_inner(
-                        *inner, projection, from_scope, inside_agg,
-                    )),
+                    expr: novarocks_parser::ast::AstBox::new(
+                        self.substitute_select_aliases_for_select_inner(
+                            inner.into_inner(),
+                            projection,
+                            from_scope,
+                            inside_agg,
+                        ),
+                    ),
                 },
             },
             ExprKind::FunctionCall {
@@ -1542,9 +1777,14 @@ impl<'a> AnalyzerContext<'a> {
 
                 kind: ExprKind::LambdaFunction {
                     params,
-                    body: Box::new(self.substitute_select_aliases_for_select_inner(
-                        *body, projection, from_scope, inside_agg,
-                    )),
+                    body: novarocks_parser::ast::AstBox::new(
+                        self.substitute_select_aliases_for_select_inner(
+                            body.into_inner(),
+                            projection,
+                            from_scope,
+                            inside_agg,
+                        ),
+                    ),
                 },
             },
             ExprKind::AggregateCall {
@@ -1580,6 +1820,7 @@ impl<'a> AnalyzerContext<'a> {
                 },
             },
             ExprKind::Cast {
+                array_failure_mode,
                 expr: inner,
                 target,
                 decimal_overflow_policy,
@@ -1587,9 +1828,15 @@ impl<'a> AnalyzerContext<'a> {
                 value_type: expr.value_type.clone(),
 
                 kind: ExprKind::Cast {
-                    expr: Box::new(self.substitute_select_aliases_for_select_inner(
-                        *inner, projection, from_scope, inside_agg,
-                    )),
+                    array_failure_mode,
+                    expr: novarocks_parser::ast::AstBox::new(
+                        self.substitute_select_aliases_for_select_inner(
+                            inner.into_inner(),
+                            projection,
+                            from_scope,
+                            inside_agg,
+                        ),
+                    ),
                     target,
                     decimal_overflow_policy,
                 },
@@ -1597,9 +1844,14 @@ impl<'a> AnalyzerContext<'a> {
             ExprKind::Nested(inner) => TypedExpr {
                 value_type: expr.value_type.clone(),
 
-                kind: ExprKind::Nested(Box::new(self.substitute_select_aliases_for_select_inner(
-                    *inner, projection, from_scope, inside_agg,
-                ))),
+                kind: ExprKind::Nested(novarocks_parser::ast::AstBox::new(
+                    self.substitute_select_aliases_for_select_inner(
+                        inner.into_inner(),
+                        projection,
+                        from_scope,
+                        inside_agg,
+                    ),
+                )),
             },
             ExprKind::IsNull {
                 expr: inner,
@@ -1608,9 +1860,14 @@ impl<'a> AnalyzerContext<'a> {
                 value_type: expr.value_type.clone(),
 
                 kind: ExprKind::IsNull {
-                    expr: Box::new(self.substitute_select_aliases_for_select_inner(
-                        *inner, projection, from_scope, inside_agg,
-                    )),
+                    expr: novarocks_parser::ast::AstBox::new(
+                        self.substitute_select_aliases_for_select_inner(
+                            inner.into_inner(),
+                            projection,
+                            from_scope,
+                            inside_agg,
+                        ),
+                    ),
                     negated,
                 },
             },
@@ -1622,9 +1879,14 @@ impl<'a> AnalyzerContext<'a> {
                 value_type: expr.value_type.clone(),
 
                 kind: ExprKind::IsTruthValue {
-                    expr: Box::new(self.substitute_select_aliases_for_select_inner(
-                        *inner, projection, from_scope, inside_agg,
-                    )),
+                    expr: novarocks_parser::ast::AstBox::new(
+                        self.substitute_select_aliases_for_select_inner(
+                            inner.into_inner(),
+                            projection,
+                            from_scope,
+                            inside_agg,
+                        ),
+                    ),
                     value,
                     negated,
                 },
@@ -1638,9 +1900,14 @@ impl<'a> AnalyzerContext<'a> {
 
                 kind: ExprKind::Case {
                     operand: operand.map(|expr| {
-                        Box::new(self.substitute_select_aliases_for_select_inner(
-                            *expr, projection, from_scope, inside_agg,
-                        ))
+                        novarocks_parser::ast::AstBox::new(
+                            self.substitute_select_aliases_for_select_inner(
+                                expr.into_inner(),
+                                projection,
+                                from_scope,
+                                inside_agg,
+                            ),
+                        )
                     }),
                     when_then: when_then
                         .into_iter()
@@ -1656,9 +1923,14 @@ impl<'a> AnalyzerContext<'a> {
                         })
                         .collect(),
                     else_expr: else_expr.map(|expr| {
-                        Box::new(self.substitute_select_aliases_for_select_inner(
-                            *expr, projection, from_scope, inside_agg,
-                        ))
+                        novarocks_parser::ast::AstBox::new(
+                            self.substitute_select_aliases_for_select_inner(
+                                expr.into_inner(),
+                                projection,
+                                from_scope,
+                                inside_agg,
+                            ),
+                        )
                     }),
                 },
             },
@@ -1666,6 +1938,7 @@ impl<'a> AnalyzerContext<'a> {
         }
     }
 
+    #[recursive::recursive]
     fn substitute_select_aliases_inner(
         &self,
         expr: TypedExpr,
@@ -1700,12 +1973,18 @@ impl<'a> AnalyzerContext<'a> {
                 value_type: expr.value_type.clone(),
 
                 kind: ExprKind::BinaryOp {
-                    left: Box::new(
-                        self.substitute_select_aliases_inner(*left, projection, inside_agg),
-                    ),
+                    left: novarocks_parser::ast::AstBox::new(self.substitute_select_aliases_inner(
+                        left.into_inner(),
+                        projection,
+                        inside_agg,
+                    )),
                     op,
-                    right: Box::new(
-                        self.substitute_select_aliases_inner(*right, projection, inside_agg),
+                    right: novarocks_parser::ast::AstBox::new(
+                        self.substitute_select_aliases_inner(
+                            right.into_inner(),
+                            projection,
+                            inside_agg,
+                        ),
                     ),
                     decimal_overflow_policy,
                 },
@@ -1715,9 +1994,11 @@ impl<'a> AnalyzerContext<'a> {
 
                 kind: ExprKind::UnaryOp {
                     op,
-                    expr: Box::new(
-                        self.substitute_select_aliases_inner(*inner, projection, inside_agg),
-                    ),
+                    expr: novarocks_parser::ast::AstBox::new(self.substitute_select_aliases_inner(
+                        inner.into_inner(),
+                        projection,
+                        inside_agg,
+                    )),
                 },
             },
             ExprKind::FunctionCall {
@@ -1747,9 +2028,11 @@ impl<'a> AnalyzerContext<'a> {
 
                 kind: ExprKind::LambdaFunction {
                     params,
-                    body: Box::new(
-                        self.substitute_select_aliases_inner(*body, projection, inside_agg),
-                    ),
+                    body: novarocks_parser::ast::AstBox::new(self.substitute_select_aliases_inner(
+                        body.into_inner(),
+                        projection,
+                        inside_agg,
+                    )),
                 },
             },
             ExprKind::AggregateCall {
@@ -1779,6 +2062,7 @@ impl<'a> AnalyzerContext<'a> {
                 },
             },
             ExprKind::Cast {
+                array_failure_mode,
                 expr: inner,
                 target,
                 decimal_overflow_policy,
@@ -1786,9 +2070,12 @@ impl<'a> AnalyzerContext<'a> {
                 value_type: expr.value_type.clone(),
 
                 kind: ExprKind::Cast {
-                    expr: Box::new(
-                        self.substitute_select_aliases_inner(*inner, projection, inside_agg),
-                    ),
+                    array_failure_mode,
+                    expr: novarocks_parser::ast::AstBox::new(self.substitute_select_aliases_inner(
+                        inner.into_inner(),
+                        projection,
+                        inside_agg,
+                    )),
                     target,
                     decimal_overflow_policy,
                 },
@@ -1796,8 +2083,12 @@ impl<'a> AnalyzerContext<'a> {
             ExprKind::Nested(inner) => TypedExpr {
                 value_type: expr.value_type.clone(),
 
-                kind: ExprKind::Nested(Box::new(
-                    self.substitute_select_aliases_inner(*inner, projection, inside_agg),
+                kind: ExprKind::Nested(novarocks_parser::ast::AstBox::new(
+                    self.substitute_select_aliases_inner(
+                        inner.into_inner(),
+                        projection,
+                        inside_agg,
+                    ),
                 )),
             },
             ExprKind::IsNull {
@@ -1807,9 +2098,11 @@ impl<'a> AnalyzerContext<'a> {
                 value_type: expr.value_type.clone(),
 
                 kind: ExprKind::IsNull {
-                    expr: Box::new(
-                        self.substitute_select_aliases_inner(*inner, projection, inside_agg),
-                    ),
+                    expr: novarocks_parser::ast::AstBox::new(self.substitute_select_aliases_inner(
+                        inner.into_inner(),
+                        projection,
+                        inside_agg,
+                    )),
                     negated,
                 },
             },
@@ -1821,9 +2114,11 @@ impl<'a> AnalyzerContext<'a> {
                 value_type: expr.value_type.clone(),
 
                 kind: ExprKind::IsTruthValue {
-                    expr: Box::new(
-                        self.substitute_select_aliases_inner(*inner, projection, inside_agg),
-                    ),
+                    expr: novarocks_parser::ast::AstBox::new(self.substitute_select_aliases_inner(
+                        inner.into_inner(),
+                        projection,
+                        inside_agg,
+                    )),
                     value,
                     negated,
                 },
@@ -1837,9 +2132,11 @@ impl<'a> AnalyzerContext<'a> {
 
                 kind: ExprKind::Case {
                     operand: operand.map(|expr| {
-                        Box::new(
-                            self.substitute_select_aliases_inner(*expr, projection, inside_agg),
-                        )
+                        novarocks_parser::ast::AstBox::new(self.substitute_select_aliases_inner(
+                            expr.into_inner(),
+                            projection,
+                            inside_agg,
+                        ))
                     }),
                     when_then: when_then
                         .into_iter()
@@ -1851,9 +2148,11 @@ impl<'a> AnalyzerContext<'a> {
                         })
                         .collect(),
                     else_expr: else_expr.map(|expr| {
-                        Box::new(
-                            self.substitute_select_aliases_inner(*expr, projection, inside_agg),
-                        )
+                        novarocks_parser::ast::AstBox::new(self.substitute_select_aliases_inner(
+                            expr.into_inner(),
+                            projection,
+                            inside_agg,
+                        ))
                     }),
                 },
             },
@@ -1864,38 +2163,56 @@ impl<'a> AnalyzerContext<'a> {
 
     /// Check if a SELECT's GROUP BY clause contains ROLLUP/CUBE/GROUPING SETS.
     /// Returns the explicit grouping-set levels plus the full GROUP BY key list.
-    fn extract_repeat_from_group_by(&self, select: &ast::Select) -> Option<RepeatGroupBySpec> {
-        match &select.group_by {
-            ast::GroupBy::Rollup { expressions, .. } => {
-                let groups = expressions
-                    .iter()
-                    .cloned()
-                    .map(|expr| vec![expr])
-                    .collect::<Vec<_>>();
-                Some(RepeatGroupBySpec {
-                    grouping_sets: rollup_grouping_sets(&groups),
-                    all_group_by_exprs: flatten_grouping_groups(&groups),
-                })
-            }
-            ast::GroupBy::Cube { expressions, .. } => {
-                let groups = expressions
-                    .iter()
-                    .cloned()
-                    .map(|expr| vec![expr])
-                    .collect::<Vec<_>>();
-                Some(RepeatGroupBySpec {
-                    grouping_sets: cube_grouping_sets(&groups),
-                    all_group_by_exprs: flatten_grouping_groups(&groups),
-                })
-            }
-            ast::GroupBy::GroupingSets { sets, .. } => Some(RepeatGroupBySpec {
-                grouping_sets: sets.clone(),
-                all_group_by_exprs: unique_exprs_in_order(
-                    sets.iter().flat_map(|set| set.iter().cloned()),
-                ),
-            }),
-            ast::GroupBy::None | ast::GroupBy::Expressions { .. } => None,
+    fn extract_repeat_from_group_by<'s>(
+        &self,
+        select: &'s ast::Select,
+    ) -> Result<Option<RepeatGroupBySpec<'s>>, AnalyzeError> {
+        let Some(group_by) = &select.group_by else {
+            return Ok(None);
+        };
+        if group_by.distinct {
+            return Err(AnalyzeError::unsupported_expression(
+                "GROUP BY DISTINCT is not supported",
+                group_by.span,
+            ));
         }
+        if group_by.elements.is_empty() || group_by.elements.iter().any(|element| matches!(element, ast::GroupingElement::Simple(simple) if simple.columns.is_empty())) {
+            return Err(AnalyzeError::unsupported_expression("empty simple GROUP BY profiles are not supported", group_by.span));
+        }
+        if group_by
+            .elements
+            .iter()
+            .all(|element| matches!(element, ast::GroupingElement::Simple(_)))
+        {
+            return Ok(None);
+        }
+        let [ast::GroupingElement::Sets(sets)] = group_by.elements.as_slice() else {
+            return Err(AnalyzeError::unsupported_expression(
+                "mixed or AUTO GROUP BY elements are not supported",
+                group_by.span,
+            ));
+        };
+        let groups = sets
+            .sets
+            .iter()
+            .map(|group| group.as_slice())
+            .collect::<Vec<_>>();
+        let grouping_sets = match sets.kind {
+            ast::GroupingSetsKind::Explicit => {
+                groups.iter().map(|group| group.iter().collect()).collect()
+            }
+            ast::GroupingSetsKind::Rollup => rollup_grouping_sets(&groups),
+            ast::GroupingSetsKind::Cube => cube_grouping_sets(&groups),
+        };
+        let all_group_by_exprs = if sets.kind == ast::GroupingSetsKind::Explicit {
+            unique_exprs_in_order(groups.iter().flat_map(|group| group.iter()))?
+        } else {
+            flatten_grouping_groups(&groups)
+        };
+        Ok(Some(RepeatGroupBySpec {
+            grouping_sets,
+            all_group_by_exprs,
+        }))
     }
 
     /// Resolve `GROUP BY ROLLUP/CUBE/GROUPING SETS` into a single SELECT with
@@ -1907,15 +2224,15 @@ impl<'a> AnalyzerContext<'a> {
     fn resolve_repeat_group_by(
         &self,
         select: &ast::Select,
-        repeat_spec: &RepeatGroupBySpec,
+        repeat_spec: &RepeatGroupBySpec<'_>,
     ) -> Result<(QueryBody, Vec<OutputColumn>), AnalyzeError> {
         use crate::analysis::RepeatInfo;
 
         let all_rollup_columns: Vec<String> = repeat_spec
             .all_group_by_exprs
             .iter()
-            .map(expr_syntax_key)
-            .collect();
+            .map(|expr| expr_syntax_key(expr))
+            .collect::<Result<_, _>>()?;
 
         // StarRocks uses the last grouping argument as the least-significant
         // bit, so for GROUPING_ID(a, b) nulling b yields 0b01, not 0b10.
@@ -1925,7 +2242,10 @@ impl<'a> AnalyzerContext<'a> {
         let mut grouping_ids: Vec<u64> = Vec::with_capacity(repeat_spec.grouping_sets.len());
 
         for grouping_set in &repeat_spec.grouping_sets {
-            let non_null_cols: Vec<String> = grouping_set.iter().map(expr_syntax_key).collect();
+            let non_null_cols: Vec<String> = grouping_set
+                .iter()
+                .map(|expr| expr_syntax_key(expr))
+                .collect::<Result<_, _>>()?;
             let active_cols: std::collections::HashSet<String> =
                 non_null_cols.iter().cloned().collect();
             repeat_column_ref_list.push(non_null_cols);
@@ -1942,12 +2262,8 @@ impl<'a> AnalyzerContext<'a> {
 
         // Analyze the original expressions with real, query-local mask
         // references. Only the GROUP BY key union is expanded for Repeat.
-        let mut modified_select = select.clone();
-        modified_select.group_by = ast::GroupBy::Expressions {
-            expressions: repeat_spec.all_group_by_exprs.clone(),
-            span: select.span,
-        };
-        let (mut sel, mut cols) = self.analyze_select(&modified_select)?;
+        let (mut sel, mut cols) =
+            self.analyze_select_in_semantic_scope(select, Some(&repeat_spec.all_group_by_exprs))?;
         let state = self
             .grouping_scope
             .borrow()
@@ -2078,152 +2394,137 @@ impl<'a> AnalyzerContext<'a> {
         for item in items {
             self.check_control()?;
             match item {
-                ast::SelectItem::UnnamedExpr(expr) => {
-                    let typed = self.analyze_expr(expr, &effective_scope)?;
-                    let typed =
-                        self.substitute_select_aliases_for_select(typed, &projection, scope);
-                    let (name, column_id) = match &typed.kind {
-                        ExprKind::ColumnRef {
-                            column_id, column, ..
-                        } if !matches!(expr, ast::Expr::Cast(_)) && !is_grouping_call(expr) => {
-                            (column.clone(), *column_id)
-                        }
-                        _ => {
-                            let n = self.grouping_display_name(expr);
-                            let id =
-                                self.alloc_column_id(None, n.clone(), typed.value_type.clone());
-                            (n, id)
-                        }
-                    };
-                    // A direct reference keeps its original source record. New
-                    // occurrences retain the exact producer's complete witness
-                    // before planner symbol rewrites hand it to the root owner.
-                    // A same-carrier explicit CAST may simplify to a reference,
-                    // but still owns a separate output domain occurrence.
-                    if !matches!(&typed.kind, ExprKind::ColumnRef { .. })
-                        || matches!(expr, ast::Expr::Cast(_))
-                        || is_grouping_call(expr)
-                    {
-                        let logical =
-                            self.logical_output_type(Some(expr), &typed, &effective_scope)?;
-                        self.factory
-                            .borrow_mut()
-                            .set_logical_type(column_id, logical);
-                    }
-                    output_columns.push(OutputColumn {
-                        field_name: natural_field_name(expr),
-                        column_id,
-                        name: name.clone(),
-                        value_type: typed.value_type.clone(),
-
-                        is_internal: false,
-                    });
-                    projection.push(ProjectItem {
-                        field_name: natural_field_name(expr),
-                        expr: typed,
-                        output_name: name,
-                        output_column_id: column_id,
-                    });
-                }
-                ast::SelectItem::ExprWithAlias { expr, alias, .. } => {
-                    let typed = self.analyze_expr(expr, &effective_scope)?;
-                    let typed =
-                        self.substitute_select_aliases_for_select(typed, &projection, scope);
-                    let name = alias.value.clone();
-                    let column_id = match &typed.kind {
-                        ExprKind::ColumnRef { column_id, .. }
-                            if !matches!(expr, ast::Expr::Cast(_)) && !is_grouping_call(expr) =>
+                ast::SelectItem::SingleColumn(column) => {
+                    let expr = &column.expression;
+                    if let Some(alias) = &column.alias {
+                        let typed = self.analyze_expr(expr, &effective_scope)?;
+                        let typed =
+                            self.substitute_select_aliases_for_select(typed, &projection, scope);
+                        let name = alias.value.clone();
+                        let column_id = match &typed.kind {
+                            ExprKind::ColumnRef { column_id, .. }
+                                if !matches!(expr, ast::Expr::Cast(_))
+                                    && !is_grouping_call(expr) =>
+                            {
+                                *column_id
+                            }
+                            _ => self.alloc_column_id(None, name.clone(), typed.value_type.clone()),
+                        };
+                        // A direct reference keeps its original source record. New
+                        // occurrences retain the exact producer's complete witness
+                        // before planner symbol rewrites hand it to the root owner.
+                        // A same-carrier explicit CAST may simplify to a reference,
+                        // but still owns a separate output domain occurrence.
+                        if !matches!(&typed.kind, ExprKind::ColumnRef { .. })
+                            || matches!(expr, ast::Expr::Cast(_))
+                            || is_grouping_call(expr)
                         {
-                            *column_id
+                            let logical =
+                                self.logical_output_type(Some(expr), &typed, &effective_scope)?;
+                            self.factory
+                                .borrow_mut()
+                                .set_logical_type(column_id, logical);
                         }
-                        _ => self.alloc_column_id(None, name.clone(), typed.value_type.clone()),
-                    };
-                    // A direct reference keeps its original source record. New
-                    // occurrences retain the exact producer's complete witness
-                    // before planner symbol rewrites hand it to the root owner.
-                    // A same-carrier explicit CAST may simplify to a reference,
-                    // but still owns a separate output domain occurrence.
-                    if !matches!(&typed.kind, ExprKind::ColumnRef { .. })
-                        || matches!(expr, ast::Expr::Cast(_))
-                        || is_grouping_call(expr)
-                    {
-                        let logical =
-                            self.logical_output_type(Some(expr), &typed, &effective_scope)?;
-                        self.factory
-                            .borrow_mut()
-                            .set_logical_type(column_id, logical);
-                    }
-                    output_columns.push(OutputColumn {
-                        field_name: Some(name.clone()),
-                        column_id,
-                        name: name.clone(),
-                        value_type: typed.value_type.clone(),
-
-                        is_internal: false,
-                    });
-                    // Make the alias visible to later items in the same
-                    // projection list, but only if it does not already
-                    // collide with a column from the FROM scope; otherwise
-                    // the alias would shadow the underlying column and
-                    // future items would resolve to the alias expression
-                    // instead of the FROM column.
-                    if scope.resolve(None, &name).is_err() {
-                        effective_scope.add_column_with_id(
-                            None,
-                            &name,
+                        output_columns.push(OutputColumn {
+                            field_name: Some(name.clone()),
                             column_id,
-                            typed.value_type.clone(),
-                        );
-                    }
-                    projection.push(ProjectItem {
-                        field_name: Some(name.clone()),
-                        expr: typed,
-                        output_name: name,
-                        output_column_id: column_id,
-                    });
-                }
-                ast::SelectItem::Wildcard { .. } => {
-                    for (qualifier, col_name, col_id, value_type, field_name) in
-                        scope.iter_columns()
-                    {
-                        self.check_control()?;
-                        // FULL OUTER USING columns are exposed as a synthetic
-                        // `COALESCE(left.col, right.col)` expression. SELECT *
-                        // expansion must use that expression instead of the
-                        // raw left-side ColumnRef so right-only rows show
-                        // the right-side value.
-                        let typed = if let Some(expr) = field_name
-                            .as_deref()
-                            .and_then(|name| scope.computed_column_for(name))
-                        {
-                            expr.clone()
-                        } else {
-                            TypedExpr {
-                                kind: ExprKind::ColumnRef {
-                                    column_id: *col_id,
-                                    qualifier: qualifier.clone(),
-                                    column: col_name.clone(),
-                                },
-                                value_type: value_type.clone(),
+                            name: name.clone(),
+                            value_type: typed.value_type.clone(),
+
+                            is_internal: false,
+                        });
+                        // Make the alias visible to later items in the same
+                        // projection list, but only if it does not already
+                        // collide with a column from the FROM scope; otherwise
+                        // the alias would shadow the underlying column and
+                        // future items would resolve to the alias expression
+                        // instead of the FROM column.
+                        if scope.resolve(None, &name).is_err() {
+                            effective_scope.add_column_with_id(
+                                None,
+                                &name,
+                                column_id,
+                                typed.value_type.clone(),
+                            );
+                        }
+                        projection.push(ProjectItem {
+                            field_name: Some(name.clone()),
+                            expr: typed,
+                            output_name: name,
+                            output_column_id: column_id,
+                        });
+                    } else {
+                        let typed = self.analyze_expr(expr, &effective_scope)?;
+                        let typed =
+                            self.substitute_select_aliases_for_select(typed, &projection, scope);
+                        let (name, column_id) = match &typed.kind {
+                            ExprKind::ColumnRef {
+                                column_id, column, ..
+                            } if !matches!(expr, ast::Expr::Cast(_)) && !is_grouping_call(expr) => {
+                                (column.clone(), *column_id)
+                            }
+                            _ => {
+                                let n = self.grouping_display_name(expr);
+                                let id =
+                                    self.alloc_column_id(None, n.clone(), typed.value_type.clone());
+                                (n, id)
                             }
                         };
+                        // A direct reference keeps its original source record. New
+                        // occurrences retain the exact producer's complete witness
+                        // before planner symbol rewrites hand it to the root owner.
+                        // A same-carrier explicit CAST may simplify to a reference,
+                        // but still owns a separate output domain occurrence.
+                        if !matches!(&typed.kind, ExprKind::ColumnRef { .. })
+                            || matches!(expr, ast::Expr::Cast(_))
+                            || is_grouping_call(expr)
+                        {
+                            let logical =
+                                self.logical_output_type(Some(expr), &typed, &effective_scope)?;
+                            self.factory
+                                .borrow_mut()
+                                .set_logical_type(column_id, logical);
+                        }
                         output_columns.push(OutputColumn {
-                            field_name: field_name.clone(),
-                            column_id: *col_id,
-                            name: col_name.clone(),
-                            value_type: value_type.clone(),
+                            field_name: natural_field_name(expr),
+                            column_id,
+                            name: name.clone(),
+                            value_type: typed.value_type.clone(),
 
                             is_internal: false,
                         });
                         projection.push(ProjectItem {
-                            field_name: field_name.clone(),
+                            field_name: natural_field_name(expr),
                             expr: typed,
-                            output_name: col_name.clone(),
-                            output_column_id: *col_id,
+                            output_name: name,
+                            output_column_id: column_id,
                         });
                     }
                 }
-                ast::SelectItem::QualifiedWildcard { prefix, span, .. } => {
+                ast::SelectItem::AllColumns(columns) => {
+                    if !columns.aliases.is_empty() {
+                        return Err(AnalyzeError::unsupported_expression(
+                            "wildcard column aliases are not supported",
+                            columns.span,
+                        ));
+                    }
+                    let Some(target) = &columns.target else {
+                        self.append_wildcard_projection(
+                            scope,
+                            &mut projection,
+                            &mut output_columns,
+                        )?;
+                        continue;
+                    };
+                    let chain = ast::identifier_chain_observed(target, |_| self.check_control())?
+                        .ok_or_else(|| {
+                        AnalyzeError::unsupported_expression(
+                            "computed wildcard targets are not supported",
+                            columns.span,
+                        )
+                    })?;
+                    let mut prefix = chain.iter_rev().collect::<Vec<_>>();
+                    prefix.reverse();
                     let qualifier_str = prefix
                         .iter()
                         .map(|ident| ident.value.as_str())
@@ -2280,7 +2581,7 @@ impl<'a> AnalyzerContext<'a> {
                     if !found {
                         return Err(AnalyzeError::unknown_table(
                             format!("no columns found for qualifier `{qualifier_str}`"),
-                            *span,
+                            columns.span,
                         ));
                     }
                 }
@@ -2288,6 +2589,52 @@ impl<'a> AnalyzerContext<'a> {
         }
 
         Ok((projection, output_columns))
+    }
+
+    fn append_wildcard_projection(
+        &self,
+        scope: &AnalyzerScope,
+        projection: &mut Vec<ProjectItem>,
+        output_columns: &mut Vec<OutputColumn>,
+    ) -> Result<(), AnalyzeError> {
+        for (qualifier, col_name, col_id, value_type, field_name) in scope.iter_columns() {
+            self.check_control()?;
+            // FULL OUTER USING columns are exposed as a synthetic
+            // `COALESCE(left.col, right.col)` expression. SELECT *
+            // expansion must use that expression instead of the
+            // raw left-side ColumnRef so right-only rows show
+            // the right-side value.
+            let typed = if let Some(expr) = field_name
+                .as_deref()
+                .and_then(|name| scope.computed_column_for(name))
+            {
+                expr.clone()
+            } else {
+                TypedExpr {
+                    kind: ExprKind::ColumnRef {
+                        column_id: *col_id,
+                        qualifier: qualifier.clone(),
+                        column: col_name.clone(),
+                    },
+                    value_type: value_type.clone(),
+                }
+            };
+            output_columns.push(OutputColumn {
+                field_name: field_name.clone(),
+                column_id: *col_id,
+                name: col_name.clone(),
+                value_type: value_type.clone(),
+
+                is_internal: false,
+            });
+            projection.push(ProjectItem {
+                field_name: field_name.clone(),
+                expr: typed,
+                output_name: col_name.clone(),
+                output_column_id: *col_id,
+            });
+        }
+        Ok(())
     }
 
     /// Like `analyze_projection` but uses `wildcard_scope` for `SELECT *`
@@ -2306,7 +2653,13 @@ impl<'a> AnalyzerContext<'a> {
         for item in items {
             self.check_control()?;
             match item {
-                ast::SelectItem::Wildcard { .. } => {
+                ast::SelectItem::AllColumns(columns) if columns.target.is_none() => {
+                    if !columns.aliases.is_empty() {
+                        return Err(AnalyzeError::unsupported_expression(
+                            "wildcard column aliases are not supported",
+                            columns.span,
+                        ));
+                    }
                     for (qualifier, col_name, col_id, value_type, field_name) in
                         wildcard_scope.iter_columns()
                     {
@@ -2356,6 +2709,7 @@ impl<'a> AnalyzerContext<'a> {
         Ok(((), scope))
     }
 
+    #[recursive::recursive]
     fn collect_relation_scope(
         &self,
         relation: &Relation,
@@ -2505,14 +2859,22 @@ impl<'a> AnalyzerContext<'a> {
     /// Analyze ORDER BY clause.
     fn analyze_order_by(
         &self,
-        query: &ast::Query,
+        order_by: Option<&ast::OrderBy>,
+        ast_select: Option<&ast::Select>,
+        span: novarocks_parser::Span,
         body_output: &[OutputColumn],
         body: &QueryBody,
     ) -> Result<Vec<SortItem>, AnalyzeError> {
-        let order_by_exprs = &query.order_by;
-        if order_by_exprs.is_empty() {
+        let Some(order_by) = order_by else {
             return Ok(vec![]);
+        };
+        if order_by.items.is_empty() {
+            return Err(AnalyzeError::invalid_argument(
+                "ORDER BY requires a sort key",
+                order_by.span,
+            ));
         }
+        let order_by_exprs = &order_by.items;
 
         // Build a projection scope from body output columns for ORDER BY resolution.
         let mut projection_scope = self.new_scope();
@@ -2562,16 +2924,19 @@ impl<'a> AnalyzerContext<'a> {
         for ob in order_by_exprs {
             // Try resolving against the projection scope first, then fall back
             // to a numeric literal reference (ORDER BY 1, 2, ...)
-            let typed = match &ob.expr {
+            let typed = match &ob.sort_key {
                 ast::Expr::Literal(ast::Literal {
-                    kind: ast::LiteralKind::Number(n),
+                    kind:
+                        ast::LiteralKind::Long {
+                            parsed_value: n, ..
+                        },
                     ..
                 }) => {
                     // Positional reference: ORDER BY 1
-                    let pos: usize = n.parse::<usize>().map_err(|e| {
+                    let pos: usize = usize::try_from(*n).map_err(|e| {
                         AnalyzeError::invalid_literal(
                             format!("invalid ORDER BY position: {e}"),
-                            ob.expr.span(),
+                            ob.sort_key.span(),
                         )
                     })?;
                     if pos == 0 || pos > body_output.len() {
@@ -2580,7 +2945,7 @@ impl<'a> AnalyzerContext<'a> {
                                 "ORDER BY position {pos} is out of range (1..{})",
                                 body_output.len()
                             ),
-                            ob.expr.span(),
+                            ob.sort_key.span(),
                         ));
                     }
                     let col = &body_output[pos - 1];
@@ -2598,13 +2963,13 @@ impl<'a> AnalyzerContext<'a> {
                     // a SELECT list expression. If so, resolve as a reference to
                     // the output alias. This handles ORDER BY count(x) matching
                     // SELECT count(x) as alias.
-                    let ob_text = expr_syntax_key(&ob.expr);
+                    let ob_text = expr_syntax_key(&ob.sort_key)?;
                     let mut matched_alias = None;
                     // Match ORDER BY expression text against SELECT item
                     // expressions (not aliases). This handles ORDER BY
                     // count(distinct x) matching SELECT count(distinct x) as y.
                     if let QueryBody::Select(sel) = body
-                        && let ast::SetExpr::Select(ast_sel) = query.body.as_ref()
+                        && let Some(ast_sel) = ast_select
                     {
                         // Bare-identifier ORDER BY (`ORDER BY k1`) must prefer
                         // the projection's output alias over the SELECT item's
@@ -2617,7 +2982,7 @@ impl<'a> AnalyzerContext<'a> {
                         // for plain identifiers; AST-text matching is still
                         // useful for `ORDER BY a.c` echoing `SELECT a.c`,
                         // where preserving qualifiers matters.
-                        let ob_is_bare_ident = matches!(ob.expr, ast::Expr::Identifier(_));
+                        let ob_is_bare_ident = matches!(ob.sort_key, ast::Expr::Identifier(_));
                         for (ast_item, ir_item) in
                             ast_sel.projection.iter().zip(sel.projection.iter())
                         {
@@ -2643,8 +3008,9 @@ impl<'a> AnalyzerContext<'a> {
                                 break;
                             }
                             let ast_expr_text = match ast_item {
-                                ast::SelectItem::ExprWithAlias { expr, .. }
-                                | ast::SelectItem::UnnamedExpr(expr) => expr_syntax_key(expr),
+                                ast::SelectItem::SingleColumn(column) => {
+                                    expr_syntax_key(&column.expression)?
+                                }
                                 _ => continue,
                             };
                             // Exact AST match means the user wrote the
@@ -2691,7 +3057,7 @@ impl<'a> AnalyzerContext<'a> {
                         alias_ref
                     } else {
                         // Try projection scope first, then fall back to FROM scope
-                        match self.analyze_expr(&ob.expr, &projection_scope) {
+                        match self.analyze_expr(&ob.sort_key, &projection_scope) {
                             Ok(typed) => {
                                 if let QueryBody::Select(sel) = body {
                                     self.substitute_select_aliases(typed, &sel.projection)
@@ -2704,7 +3070,7 @@ impl<'a> AnalyzerContext<'a> {
                                 if let QueryBody::Select(sel) = body {
                                     if let Some(ref from_rel) = sel.from {
                                         let (_, from_scope) = self.rebuild_from_scope(from_rel)?;
-                                        match self.analyze_expr(&ob.expr, &from_scope) {
+                                        match self.analyze_expr(&ob.sort_key, &from_scope) {
                                             Ok(typed) => self
                                                 .substitute_select_aliases(typed, &sel.projection),
                                             Err(error) if error.control_error().is_some() => {
@@ -2727,7 +3093,8 @@ impl<'a> AnalyzerContext<'a> {
                                                         );
                                                     }
                                                 }
-                                                match self.analyze_expr(&ob.expr, &alias_scope) {
+                                                match self.analyze_expr(&ob.sort_key, &alias_scope)
+                                                {
                                                     Ok(typed) => self.substitute_select_aliases(
                                                         typed,
                                                         &sel.projection,
@@ -2770,8 +3137,7 @@ impl<'a> AnalyzerContext<'a> {
                 ));
             }
 
-            let asc = ob.asc.unwrap_or(true);
-            let nulls_first = ob.nulls_first.unwrap_or(asc);
+            let (asc, nulls_first) = helpers::sort_item_flags(ob);
 
             sort_items.push(SortItem {
                 expr: typed,
@@ -2812,7 +3178,7 @@ impl<'a> AnalyzerContext<'a> {
                     format!(
                         "BITMAP/HLL columns cannot appear in ORDER BY (column has type {logical:?})"
                     ),
-                    query.span,
+                    span,
                 ));
             }
         }
@@ -2829,6 +3195,7 @@ impl<'a> AnalyzerContext<'a> {
     /// Top-level references (`inside_agg == false`) are returned unchanged —
     /// they may legitimately point at projection outputs (for example a FULL
     /// OUTER USING coalesce column that is only valid above the Project).
+    #[recursive::recursive]
     fn rebind_order_by_agg_args(
         &self,
         expr: TypedExpr,
@@ -2891,14 +3258,26 @@ impl<'a> AnalyzerContext<'a> {
                 right,
                 decimal_overflow_policy,
             } => ExprKind::BinaryOp {
-                left: Box::new(self.rebind_order_by_agg_args(*left, from_scope, inside_agg)),
+                left: novarocks_parser::ast::AstBox::new(self.rebind_order_by_agg_args(
+                    left.into_inner(),
+                    from_scope,
+                    inside_agg,
+                )),
                 op,
-                right: Box::new(self.rebind_order_by_agg_args(*right, from_scope, inside_agg)),
+                right: novarocks_parser::ast::AstBox::new(self.rebind_order_by_agg_args(
+                    right.into_inner(),
+                    from_scope,
+                    inside_agg,
+                )),
                 decimal_overflow_policy,
             },
             ExprKind::UnaryOp { op, expr: inner } => ExprKind::UnaryOp {
                 op,
-                expr: Box::new(self.rebind_order_by_agg_args(*inner, from_scope, inside_agg)),
+                expr: novarocks_parser::ast::AstBox::new(self.rebind_order_by_agg_args(
+                    inner.into_inner(),
+                    from_scope,
+                    inside_agg,
+                )),
             },
             ExprKind::FunctionCall {
                 name,
@@ -2917,11 +3296,17 @@ impl<'a> AnalyzerContext<'a> {
                 volatility,
             },
             ExprKind::Cast {
+                array_failure_mode,
                 expr: inner,
                 target,
                 decimal_overflow_policy,
             } => ExprKind::Cast {
-                expr: Box::new(self.rebind_order_by_agg_args(*inner, from_scope, inside_agg)),
+                array_failure_mode,
+                expr: novarocks_parser::ast::AstBox::new(self.rebind_order_by_agg_args(
+                    inner.into_inner(),
+                    from_scope,
+                    inside_agg,
+                )),
                 target,
                 decimal_overflow_policy,
             },
@@ -2929,7 +3314,11 @@ impl<'a> AnalyzerContext<'a> {
                 expr: inner,
                 negated,
             } => ExprKind::IsNull {
-                expr: Box::new(self.rebind_order_by_agg_args(*inner, from_scope, inside_agg)),
+                expr: novarocks_parser::ast::AstBox::new(self.rebind_order_by_agg_args(
+                    inner.into_inner(),
+                    from_scope,
+                    inside_agg,
+                )),
                 negated,
             },
             ExprKind::IsTruthValue {
@@ -2937,19 +3326,27 @@ impl<'a> AnalyzerContext<'a> {
                 value,
                 negated,
             } => ExprKind::IsTruthValue {
-                expr: Box::new(self.rebind_order_by_agg_args(*inner, from_scope, inside_agg)),
+                expr: novarocks_parser::ast::AstBox::new(self.rebind_order_by_agg_args(
+                    inner.into_inner(),
+                    from_scope,
+                    inside_agg,
+                )),
                 value,
                 negated,
             },
-            ExprKind::Nested(inner) => ExprKind::Nested(Box::new(
-                self.rebind_order_by_agg_args(*inner, from_scope, inside_agg),
+            ExprKind::Nested(inner) => ExprKind::Nested(novarocks_parser::ast::AstBox::new(
+                self.rebind_order_by_agg_args(inner.into_inner(), from_scope, inside_agg),
             )),
             ExprKind::InList {
                 expr: inner,
                 list,
                 negated,
             } => ExprKind::InList {
-                expr: Box::new(self.rebind_order_by_agg_args(*inner, from_scope, inside_agg)),
+                expr: novarocks_parser::ast::AstBox::new(self.rebind_order_by_agg_args(
+                    inner.into_inner(),
+                    from_scope,
+                    inside_agg,
+                )),
                 list: list
                     .into_iter()
                     .map(|item| self.rebind_order_by_agg_args(item, from_scope, inside_agg))
@@ -2962,9 +3359,21 @@ impl<'a> AnalyzerContext<'a> {
                 high,
                 negated,
             } => ExprKind::Between {
-                expr: Box::new(self.rebind_order_by_agg_args(*inner, from_scope, inside_agg)),
-                low: Box::new(self.rebind_order_by_agg_args(*low, from_scope, inside_agg)),
-                high: Box::new(self.rebind_order_by_agg_args(*high, from_scope, inside_agg)),
+                expr: novarocks_parser::ast::AstBox::new(self.rebind_order_by_agg_args(
+                    inner.into_inner(),
+                    from_scope,
+                    inside_agg,
+                )),
+                low: novarocks_parser::ast::AstBox::new(self.rebind_order_by_agg_args(
+                    low.into_inner(),
+                    from_scope,
+                    inside_agg,
+                )),
+                high: novarocks_parser::ast::AstBox::new(self.rebind_order_by_agg_args(
+                    high.into_inner(),
+                    from_scope,
+                    inside_agg,
+                )),
                 negated,
             },
             ExprKind::Like {
@@ -2972,8 +3381,16 @@ impl<'a> AnalyzerContext<'a> {
                 pattern,
                 negated,
             } => ExprKind::Like {
-                expr: Box::new(self.rebind_order_by_agg_args(*inner, from_scope, inside_agg)),
-                pattern: Box::new(self.rebind_order_by_agg_args(*pattern, from_scope, inside_agg)),
+                expr: novarocks_parser::ast::AstBox::new(self.rebind_order_by_agg_args(
+                    inner.into_inner(),
+                    from_scope,
+                    inside_agg,
+                )),
+                pattern: novarocks_parser::ast::AstBox::new(self.rebind_order_by_agg_args(
+                    pattern.into_inner(),
+                    from_scope,
+                    inside_agg,
+                )),
                 negated,
             },
             ExprKind::Case {
@@ -2981,8 +3398,13 @@ impl<'a> AnalyzerContext<'a> {
                 when_then,
                 else_expr,
             } => ExprKind::Case {
-                operand: operand
-                    .map(|e| Box::new(self.rebind_order_by_agg_args(*e, from_scope, inside_agg))),
+                operand: operand.map(|e| {
+                    novarocks_parser::ast::AstBox::new(self.rebind_order_by_agg_args(
+                        e.into_inner(),
+                        from_scope,
+                        inside_agg,
+                    ))
+                }),
                 when_then: when_then
                     .into_iter()
                     .map(|(when, then)| {
@@ -2992,8 +3414,13 @@ impl<'a> AnalyzerContext<'a> {
                         )
                     })
                     .collect(),
-                else_expr: else_expr
-                    .map(|e| Box::new(self.rebind_order_by_agg_args(*e, from_scope, inside_agg))),
+                else_expr: else_expr.map(|e| {
+                    novarocks_parser::ast::AstBox::new(self.rebind_order_by_agg_args(
+                        e.into_inner(),
+                        from_scope,
+                        inside_agg,
+                    ))
+                }),
             },
             // Leaves and node kinds that cannot carry an aggregate argument
             // needing a base-column rebind (Literal, LambdaParamRef,
@@ -3005,6 +3432,7 @@ impl<'a> AnalyzerContext<'a> {
     }
 }
 
+#[recursive::recursive]
 fn contains_subquery_placeholder(expr: &TypedExpr) -> bool {
     match &expr.kind {
         ExprKind::SubqueryPlaceholder { .. } => true,
@@ -3092,13 +3520,16 @@ fn select_item_output_column_id(
 }
 
 fn is_grouping_call(expression: &ast::Expr) -> bool {
-    matches!(expression, ast::Expr::FunctionCall(function)
+    matches!(expression, ast::Expr::GroupingOperation(_))
+        || matches!(expression, ast::Expr::FunctionCall(function)
         if function.name.parts.len() == 1
         && matches!(function.name.parts[0].value.to_ascii_lowercase().as_str(), "grouping" | "grouping_id"))
 }
 
-fn expr_syntax_key(expr: &ast::Expr) -> String {
-    novarocks_parser::printer::print_expr(expr).to_lowercase()
+fn expr_syntax_key(expr: &ast::Expr) -> Result<String, AnalyzeError> {
+    novarocks_parser::printer::print_expression(expr)
+        .map(|sql| sql.to_lowercase())
+        .map_err(|error| AnalyzeError::unsupported_expression(error.to_string(), expr.span()))
 }
 
 /// Keep historical planner labels while all value/type binding uses the
@@ -3111,65 +3542,69 @@ impl ast::Fold for GroupingDisplayFolder<'_> {
         query
     }
     fn fold_expr(&mut self, expression: ast::Expr) -> ast::Expr {
-        if let ast::Expr::FunctionCall(function) = &expression
-            && let Some(index) = self.calls.iter().position(|call| call.syntax == *function)
+        if let Some(index) = self
+            .calls
+            .iter()
+            .position(|call| call.syntax.matches_expression(&expression))
         {
             return ast::Expr::Literal(ast::Literal {
-                kind: ast::LiteralKind::Number((-9000 - index as i64).to_string()),
-                span: function.span,
+                kind: ast::LiteralKind::Long {
+                    spelling: (-9000 - index as i64).to_string(),
+                    parsed_value: -9000 - index as i64,
+                },
+                span: expression.span(),
             });
         }
         ast::fold_expr(self, expression)
     }
 }
 
-fn flatten_grouping_groups(groups: &[Vec<ast::Expr>]) -> Vec<ast::Expr> {
-    groups
-        .iter()
-        .flat_map(|group| group.iter().cloned())
-        .collect()
+fn flatten_grouping_groups<'s>(groups: &[&'s [ast::Expr]]) -> Vec<&'s ast::Expr> {
+    groups.iter().flat_map(|group| group.iter()).collect()
 }
 
-fn unique_exprs_in_order<I>(exprs: I) -> Vec<ast::Expr>
+fn unique_exprs_in_order<'s, I>(exprs: I) -> Result<Vec<&'s ast::Expr>, AnalyzeError>
 where
-    I: IntoIterator<Item = ast::Expr>,
+    I: IntoIterator<Item = &'s ast::Expr>,
 {
     let mut seen = std::collections::HashSet::new();
     let mut result = Vec::new();
     for expr in exprs {
-        let key = expr_syntax_key(&expr);
+        let key = expr_syntax_key(expr)?;
         if seen.insert(key) {
             result.push(expr);
         }
     }
-    result
+    Ok(result)
 }
 
-fn rollup_grouping_sets(groups: &[Vec<ast::Expr>]) -> Vec<Vec<ast::Expr>> {
+fn rollup_grouping_sets<'s>(groups: &[&'s [ast::Expr]]) -> Vec<Vec<&'s ast::Expr>> {
     let mut grouping_sets = Vec::with_capacity(groups.len() + 1);
     for active_count in (0..=groups.len()).rev() {
-        let grouping_set = groups
-            .iter()
-            .take(active_count)
-            .flat_map(|group| group.iter().cloned())
-            .collect();
-        grouping_sets.push(grouping_set);
+        grouping_sets.push(
+            groups
+                .iter()
+                .take(active_count)
+                .flat_map(|group| group.iter())
+                .collect(),
+        );
     }
     grouping_sets
 }
 
-fn cube_grouping_sets(groups: &[Vec<ast::Expr>]) -> Vec<Vec<ast::Expr>> {
+fn cube_grouping_sets<'s>(groups: &[&'s [ast::Expr]]) -> Vec<Vec<&'s ast::Expr>> {
     let group_count = groups.len();
     let total = 1usize.checked_shl(group_count as u32).unwrap_or(0);
     let mut grouping_sets = Vec::with_capacity(total);
     for mask in (0..total).rev() {
-        let grouping_set = groups
-            .iter()
-            .enumerate()
-            .filter(|(idx, _)| mask & (1usize << idx) != 0)
-            .flat_map(|(_, group)| group.iter().cloned())
-            .collect();
-        grouping_sets.push(grouping_set);
+        grouping_sets.push(
+            groups
+                .iter()
+                .enumerate()
+                .filter(|(idx, _)| mask & (1usize << idx) != 0)
+                .flat_map(|(_, group)| group.iter())
+                .collect(),
+        );
     }
     grouping_sets
 }
@@ -3192,17 +3627,20 @@ fn sync_output_columns_from_projection(
 
 /// A computed-base dereference never acquires a SQL field name from its suffix.
 fn natural_field_name(expr: &ast::Expr) -> Option<String> {
-    match expr {
-        ast::Expr::Identifier(ident) => Some(ident.value.clone()),
-        ast::Expr::CompoundIdentifier(parts) => parts.parts.last().map(|ident| ident.value.clone()),
-        ast::Expr::Nested(nested) => natural_field_name(&nested.expression),
-        ast::Expr::Access(access) if natural_field_name(&access.expr).is_some() => {
-            match &access.kind {
-                ast::AccessKind::Field(field) => Some(field.value.clone()),
-                _ => None,
+    let mut current = expr;
+    let mut terminal = None;
+    loop {
+        match current {
+            ast::Expr::Identifier(ident) => {
+                return Some(terminal.unwrap_or(ident).value.clone());
             }
+            ast::Expr::Dereference(node) => {
+                let field = node.field.as_ref()?;
+                terminal.get_or_insert(field);
+                current = &node.base;
+            }
+            _ => return None,
         }
-        _ => None,
     }
 }
 
@@ -3222,7 +3660,473 @@ mod tests {
     use novarocks_types::schema::ColumnDef;
     use std::num::{NonZeroU32, NonZeroU64};
 
+    #[test]
+    fn projection_values_real_envelopes_and_direct_capability_boundaries() {
+        use crate::analyze_error::AnalyzeErrorKind;
+        use novarocks_parser::{SYNTHETIC, ast, build};
+        let catalog = crate::planning::catalog::PlannerMemoryCatalog::default();
+        for (sql, struct_width) in [("VALUES (1)", None), ("VALUES ROW(ROW(1, 2))", Some(2))] {
+            let query = parse_native_query(sql).unwrap();
+            let ast::SetExpr::Values(values) = query.body.as_ref() else {
+                panic!("VALUES")
+            };
+            assert_eq!(ast::ValuesRowCells::new(&values.rows[0]).len(), 1);
+            let (resolved, _, _) = super::analyze(&query, &catalog, "default").unwrap();
+            assert_eq!(resolved.output_columns.len(), 1);
+            if let Some(width) = struct_width {
+                let DataType::Struct(fields) = resolved.output_columns[0].value_type.data_type()
+                else {
+                    panic!("one Struct cell")
+                };
+                assert_eq!(fields.len(), width);
+            } else {
+                assert!(!matches!(
+                    resolved.output_columns[0].value_type.data_type(),
+                    DataType::Struct(_)
+                ));
+            }
+        }
+        let mut query = parse_native_query("VALUES (1)").unwrap();
+        for rows in [
+            ast::AstVec::new(),
+            vec![ast::Expr::Row(ast::RowExpr {
+                fields: ast::AstVec::new(),
+                span: SYNTHETIC,
+            })]
+            .into(),
+            vec![ast::Expr::Row(ast::RowExpr {
+                fields: vec![ast::RowField {
+                    name: Some(build::ident("named", false)),
+                    expression: build::identifier(build::ident("must_not_resolve", false)),
+                    span: SYNTHETIC,
+                }]
+                .into(),
+                span: SYNTHETIC,
+            })]
+            .into(),
+        ] {
+            let ast::SetExpr::Values(values) = query.body.as_mut() else {
+                panic!("VALUES")
+            };
+            values.rows = rows;
+            assert_eq!(
+                super::analyze(&query, &catalog, "default")
+                    .unwrap_err()
+                    .kind(),
+                AnalyzeErrorKind::UnsupportedExpression
+            );
+        }
+        let mut query = parse_native_query("SELECT *").unwrap();
+        for (target, aliases) in [
+            (Some(build::integer(7)), Vec::new()),
+            (None, vec![build::ident("renamed", false)]),
+        ] {
+            let ast::SetExpr::Select(select) = query.body.as_mut() else {
+                panic!("SELECT")
+            };
+            let ast::SelectItem::AllColumns(columns) = &mut select.projection[0] else {
+                panic!("wildcard")
+            };
+            columns.target = target;
+            columns.aliases = aliases;
+            assert_eq!(
+                super::analyze(&query, &catalog, "default")
+                    .unwrap_err()
+                    .kind(),
+                AnalyzeErrorKind::UnsupportedExpression
+            );
+        }
+    }
+
+    #[test]
+    fn dedicated_grouping_reuses_original_repeat_and_public_type_author() {
+        let query = parse_native_query(
+            "SELECT grouping(k), count(*) FROM (VALUES (1),(2)) t(k) GROUP BY ROLLUP(k)",
+        )
+        .unwrap();
+        let mut legacy = query.clone();
+        let ast::SetExpr::Select(select) = legacy.body.as_mut() else {
+            panic!("select")
+        };
+        let ast::SelectItem::SingleColumn(column) = &mut select.projection[0] else {
+            panic!("column")
+        };
+        let ast::Expr::GroupingOperation(node) = &column.expression else {
+            panic!("dedicated grouping")
+        };
+        let name = novarocks_parser::build::object_name(vec![novarocks_parser::build::ident(
+            "grouping", false,
+        )])
+        .unwrap();
+        column.expression = novarocks_parser::build::function(name, node.grouping_columns.to_vec());
+        let (original, _, _) = super::analyze(&legacy, &TestCatalog, "default").unwrap();
+        let (actual, _, _) = super::analyze(&query, &TestCatalog, "default").unwrap();
+        let QueryBody::Select(expected) = original.body else {
+            panic!("select")
+        };
+        let QueryBody::Select(actual) = actual.body else {
+            panic!("select")
+        };
+        assert_eq!(
+            actual.projection[0].expr.value_type,
+            expected.projection[0].expr.value_type
+        );
+        assert_eq!(
+            actual.projection[0].field_name,
+            expected.projection[0].field_name
+        );
+        let actual = actual.repeat.unwrap();
+        let expected = expected.repeat.unwrap();
+        assert_eq!(actual.grouping_ids, vec![0, 1]);
+        assert_eq!(actual.grouping_ids, expected.grouping_ids);
+        assert_eq!(actual.grouping_fn_args, expected.grouping_fn_args);
+        assert_eq!(actual.grouping_fn_arg_ids, expected.grouping_fn_arg_ids);
+        assert_eq!(actual.all_rollup_columns, vec!["k"]);
+        assert_eq!(
+            actual.repeat_column_ref_list,
+            vec![vec!["k".to_owned()], Vec::<String>::new()]
+        );
+        assert_eq!(actual.grouping_fn_args.len(), 1);
+        assert_eq!(actual.grouping_fn_args[0].1, vec!["k"]);
+        assert_eq!(actual.grouping_fn_ids, expected.grouping_fn_ids);
+        assert_eq!(
+            actual.repeat_column_ref_list,
+            expected.repeat_column_ref_list
+        );
+        assert_eq!(actual.repeat_column_ref_ids, expected.repeat_column_ref_ids);
+        assert_eq!(actual.all_rollup_columns, expected.all_rollup_columns);
+        assert_eq!(actual.all_rollup_column_ids, expected.all_rollup_column_ids);
+    }
+
+    #[test]
+    fn qualified_struct_base_keeps_its_column_when_an_alias_has_the_same_name() {
+        use arrow::datatypes::{DataType, Field};
+        use novarocks_type_contract::FunctionValueType;
+        use std::sync::Arc;
+
+        struct Catalog {
+            struct_type: DataType,
+        }
+        impl crate::catalog::PlannerTableProvider for Catalog {
+            fn resolve_table_for_analysis(
+                &self,
+                catalog: Option<&str>,
+                database: &str,
+                table: &str,
+            ) -> Result<crate::catalog::ResolvedAnalyzerTable, String> {
+                let column = match table {
+                    "row_source" => ColumnDef {
+                        name: "x".into(),
+                        data_type: self.struct_type.clone(),
+                        nullable: false,
+                        write_default: None,
+                        logical_type: None,
+                    },
+                    "qualified_source" => ColumnDef {
+                        name: "y".into(),
+                        data_type: DataType::Utf8,
+                        nullable: true,
+                        write_default: None,
+                        logical_type: None,
+                    },
+                    _ => return Err(format!("table not found: {table}")),
+                };
+                let planner = TableDef {
+                    name: table.into(),
+                    columns: vec![column],
+                    iceberg_row_lineage_metadata_columns: vec![],
+                    source: sql_test_scan_source(
+                        catalog.unwrap_or("default_catalog"),
+                        database,
+                        table,
+                        SqlScanKind::Data {
+                            version: SqlTableVersionSelector::Current,
+                        },
+                    ),
+                };
+                Ok(crate::catalog::ResolvedAnalyzerTable::from_planner(
+                    catalog, database, planner,
+                ))
+            }
+        }
+
+        let raw_field = Arc::new(Field::new("y", DataType::Int32, false).with_metadata(
+            std::collections::HashMap::from([("provider.fact".into(), "row-y".into())]),
+        ));
+        let catalog = Catalog {
+            struct_type: DataType::Struct(vec![raw_field.clone()].into()),
+        };
+        // The original physical declaration author removes nested annotations;
+        // provider raw facts and canonical function FVT remain separate checks.
+        let expected_source = FunctionValueType::new(catalog.struct_type.clone(), false);
+        // The original Functions subfield owner declares its result nullable.
+        let expected_field = FunctionValueType::new(DataType::Int32, true);
+        let expected_qualified = FunctionValueType::new(DataType::Utf8, true);
+
+        for (sql, struct_access) in [
+            (
+                "SELECT t.x.y FROM row_source t CROSS JOIN qualified_source x",
+                true,
+            ),
+            (
+                "SELECT x.y FROM row_source t CROSS JOIN qualified_source x",
+                false,
+            ),
+        ] {
+            let source = parse_native_query(sql).expect("original dereference SQL");
+            let (resolved, _, _) = super::analyze(&source, &catalog, "default")
+                .expect("original binding must succeed");
+            let QueryBody::Select(select) = &resolved.body else {
+                panic!("original SELECT")
+            };
+            let Some(Relation::Join(join)) = &select.from else {
+                panic!("actual CROSS JOIN")
+            };
+            assert!(matches!(join.join_type, crate::analysis::JoinKind::Cross));
+            let (Relation::Scan(left), Relation::Scan(right)) = (&join.left, &join.right) else {
+                panic!("two original table declarations")
+            };
+            assert_eq!(left.table.name, "row_source");
+            assert_eq!(left.alias.as_deref(), Some("t"));
+            assert_eq!(right.table.name, "qualified_source");
+            assert_eq!(right.alias.as_deref(), Some("x"));
+            assert_eq!(left.column_ids.len(), 1);
+            assert_eq!(right.column_ids.len(), 1);
+            assert_ne!(left.column_ids[0], right.column_ids[0]);
+            assert_eq!(left.table.columns[0].name, "x");
+            assert_eq!(left.table.columns[0].data_type, catalog.struct_type);
+            assert!(!left.table.columns[0].nullable);
+            let DataType::Struct(fields) = &left.table.columns[0].data_type else {
+                panic!("original provider STRUCT")
+            };
+            assert!(Arc::ptr_eq(&fields[0], &raw_field));
+            assert_eq!(
+                fields[0]
+                    .metadata()
+                    .get("provider.fact")
+                    .map(String::as_str),
+                Some("row-y")
+            );
+            assert_eq!(right.table.columns[0].name, "y");
+            assert_eq!(right.table.columns[0].data_type, DataType::Utf8);
+            assert!(right.table.columns[0].nullable);
+
+            let [projected] = select.projection.as_slice() else {
+                panic!("one original projection")
+            };
+            let [published] = resolved.output_columns.as_slice() else {
+                panic!("one original result field")
+            };
+            assert_eq!(published.column_id, projected.output_column_id);
+            assert_eq!(published.value_type, projected.expr.value_type);
+            if struct_access {
+                assert_eq!(projected.expr.value_type, expected_field);
+                let ExprKind::FunctionCall {
+                    name,
+                    args,
+                    binding,
+                    ..
+                } = &projected.expr.kind
+                else {
+                    panic!("qualified base must select original STRUCT-field owner")
+                };
+                assert_eq!(name, "__struct_subfield");
+                assert_eq!(args.len(), 2);
+                assert_eq!(args[0].value_type, expected_source);
+                assert_eq!(binding.logical_argument_count, 2);
+                assert!(
+                    matches!(&args[1].kind, ExprKind::Literal(LiteralValue::String(name)) if name == "y")
+                );
+                // Read the actual original base through its existing IR wrapper;
+                // success is decided by binding identity, not wrapper presence.
+                let mut base = &args[0];
+                while let ExprKind::Nested(inner) = &base.kind {
+                    assert_eq!(inner.value_type, expected_source);
+                    base = inner;
+                }
+                assert!(
+                    matches!(&base.kind, ExprKind::ColumnRef { column_id, qualifier: Some(qualifier), column }
+                    if *column_id == left.column_ids[0] && qualifier == "t" && column == "x")
+                );
+            } else {
+                assert_eq!(projected.expr.value_type, expected_qualified);
+                assert!(
+                    matches!(&projected.expr.kind, ExprKind::ColumnRef { column_id, qualifier: Some(qualifier), column }
+                    if *column_id == right.column_ids[0] && qualifier == "x" && column == "y")
+                );
+            }
+        }
+    }
+
     struct TestCatalog;
+
+    #[test]
+    fn count_nodes_keep_static_values_and_direct_capability_refusals() {
+        use novarocks_parser::{Span, ast, build};
+        let query = &mut novarocks_parser::parser::parse_query("SELECT 1").unwrap();
+        let ast::SetExpr::Select(select) = query.body.as_mut() else {
+            panic!("select");
+        };
+        select.modifiers.limit = Some(ast::QueryLimit::Limit(ast::Limit {
+            row_count: build::integer(7),
+            span: novarocks_parser::SYNTHETIC,
+        }));
+        select.modifiers.offset = Some(ast::Offset {
+            row_count: build::integer(2),
+            span: novarocks_parser::SYNTHETIC,
+        });
+        let catalog = crate::planning::catalog::PlannerMemoryCatalog::default();
+        let (resolved, _, _) = super::analyze(query, &catalog, "default").unwrap();
+        assert_eq!(resolved.limit, Some(7));
+        assert_eq!(resolved.offset, Some(2));
+        let ast::SetExpr::Select(select) = query.body.as_mut() else {
+            panic!("select");
+        };
+        select.modifiers.limit = Some(ast::QueryLimit::Limit(ast::Limit {
+            row_count: ast::Expr::AllRows(ast::AllRows {
+                span: Span::new(2, 5),
+            }),
+            span: Span::new(0, 5),
+        }));
+        let (resolved, _, _) = super::analyze(query, &catalog, "default").unwrap();
+        assert_eq!(resolved.limit, None);
+        assert_eq!(resolved.offset, Some(2));
+        for with_ties in [false, true] {
+            for row_count in [None, Some(build::integer(3))] {
+                let ast::SetExpr::Select(select) = query.body.as_mut() else {
+                    panic!("select");
+                };
+                select.modifiers.limit = Some(ast::QueryLimit::FetchFirst(ast::FetchFirst {
+                    row_count,
+                    with_ties,
+                    span: Span::new(10, 20),
+                }));
+                let error = super::analyze(query, &catalog, "default").unwrap_err();
+                assert_eq!(
+                    error.kind(),
+                    crate::analyze_error::AnalyzeErrorKind::UnsupportedExpression
+                );
+                assert_eq!(error.span(), Some(Span::new(10, 20)));
+            }
+        }
+        let limit_span = Span::new(21, 22);
+        let offset_span = Span::new(31, 32);
+        let ast::SetExpr::Select(select) = query.body.as_mut() else {
+            panic!("select");
+        };
+        select.modifiers.limit = Some(ast::QueryLimit::Limit(ast::Limit {
+            row_count: ast::Expr::Parameter(ast::Parameter {
+                position: 7,
+                span: limit_span,
+            }),
+            span: limit_span,
+        }));
+        select.modifiers.offset = Some(ast::Offset {
+            row_count: ast::Expr::Parameter(ast::Parameter {
+                position: 9,
+                span: offset_span,
+            }),
+            span: offset_span,
+        });
+        let error = super::analyze(query, &catalog, "default").unwrap_err();
+        assert_eq!(
+            error.kind(),
+            crate::analyze_error::AnalyzeErrorKind::UnsupportedExpression
+        );
+        assert_eq!(
+            error.span(),
+            Some(limit_span),
+            "LIMIT refusal precedes OFFSET"
+        );
+        let ast::SetExpr::Select(select) = query.body.as_mut() else {
+            panic!("select");
+        };
+        select.modifiers.limit = None;
+        select.modifiers.offset = Some(ast::Offset {
+            row_count: ast::Expr::AllRows(ast::AllRows { span: offset_span }),
+            span: offset_span,
+        });
+        let error = super::analyze(query, &catalog, "default").unwrap_err();
+        assert_eq!(
+            error.kind(),
+            crate::analyze_error::AnalyzeErrorKind::UnsupportedExpression
+        );
+        assert_eq!(error.span(), Some(offset_span));
+    }
+
+    #[test]
+    fn parenthesized_query_retains_each_suffix_and_original_output_identity() {
+        let query = parse_native_query(
+            "(SELECT k1 FROM t1 ORDER BY v1 OFFSET 3 LIMIT 5) ORDER BY k1 OFFSET 1 LIMIT 2",
+        )
+        .unwrap();
+        let (resolved, ctes, mut factory) = analyze(&query, &TestCatalog, "default").unwrap();
+        assert_eq!(resolved.limit, Some(2));
+        assert_eq!(resolved.offset, Some(1));
+        assert_eq!(resolved.order_by.len(), 1);
+        let QueryBody::Select(passthrough) = &resolved.body else {
+            panic!("query boundary")
+        };
+        let Some(Relation::Subquery {
+            query: inner,
+            output_columns,
+            ..
+        }) = &passthrough.from
+        else {
+            panic!("inner query must remain under the original subquery relation")
+        };
+        assert_eq!(inner.limit, Some(5));
+        assert_eq!(inner.offset, Some(3));
+        assert_eq!(inner.order_by.len(), 1);
+        let field = &inner.output_columns[0];
+        assert_eq!(resolved.output_columns[0].column_id, field.column_id);
+        assert_eq!(output_columns[0].column_id, field.column_id);
+        assert_eq!(passthrough.projection[0].output_column_id, field.column_id);
+        assert_eq!(resolved.output_columns[0].field_name, field.field_name);
+        assert_eq!(resolved.output_columns[0].value_type, field.value_type);
+        assert!(matches!(&resolved.order_by[0].expr.kind,
+            ExprKind::ColumnRef { column_id, .. } if *column_id == field.column_id));
+        crate::planner::plan_query(
+            resolved,
+            ctes,
+            &mut factory,
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap();
+
+        for sql in [
+            "(SELECT k1 FROM t1 LIMIT 5) ORDER BY v1",
+            "(SELECT k1 FROM t1 LIMIT 5) ORDER BY t1.k1",
+        ] {
+            let query = parse_native_query(sql).unwrap();
+            let error = analyze(&query, &TestCatalog, "default").unwrap_err();
+            assert_eq!(
+                error.kind(),
+                crate::analyze_error::AnalyzeErrorKind::UnknownColumn,
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn corresponding_set_operations_are_rejected_before_operand_analysis() {
+        for columns in [vec![], vec![novarocks_parser::build::ident("x", false)]] {
+            let mut query = parse_native_query("SELECT 1 AS x UNION ALL SELECT 2 AS x").unwrap();
+            let ast::SetExpr::SetOperation(operation) = query.body.as_mut() else {
+                panic!("UNION")
+            };
+            operation.corresponding = Some(ast::Corresponding {
+                columns,
+                span: operation.span,
+            });
+            let error = analyze(&query, &TestCatalog, "default").unwrap_err();
+            assert_eq!(
+                error.kind(),
+                crate::analyze_error::AnalyzeErrorKind::UnsupportedExpression
+            );
+            assert!(error.to_string().contains("CORRESPONDING"));
+        }
+    }
 
     #[test]
     fn table_column_lists_remain_relation_local_in_order_by_rebuild() {
@@ -3321,27 +4225,27 @@ mod tests {
     fn trino_struct_dereferences_keep_natural_and_computed_names() {
         for (sql, expected_name, expected_type) in [
             (
-                "SELECT s.a FROM (SELECT CAST(ROW(1) AS STRUCT<a integer>) AS s) AS t;",
+                "SELECT s.a FROM (SELECT CAST(ROW(1) AS ROW(a integer)) AS s) AS t",
                 Some("a"),
                 DataType::Int32,
             ),
             (
-                "SELECT a2[1].a FROM (VALUES ([CAST(ROW(1) AS STRUCT<a integer>)])) AS t (a2);",
+                "SELECT a2[1].a FROM (VALUES ([CAST(ROW(1) AS ROW(a integer))])) AS t (a2)",
                 None,
                 DataType::Int32,
             ),
             (
-                "SELECT (s).a FROM (SELECT CAST(ROW(1) AS STRUCT<a integer>) AS s) AS t;",
+                "SELECT (s).a FROM (SELECT CAST(ROW(1) AS ROW(a integer)) AS s) AS t",
                 Some("a"),
                 DataType::Int32,
             ),
             (
-                "SELECT (CAST(s AS STRUCT<a bigint>)).a FROM (SELECT CAST(ROW(1) AS STRUCT<a integer>) AS s) AS t;",
+                "SELECT (CAST(s AS ROW(a bigint))).a FROM (SELECT CAST(ROW(1) AS ROW(a integer)) AS s) AS t",
                 None,
                 DataType::Int64,
             ),
             (
-                "SELECT s.A FROM (SELECT CAST(ROW(1) AS STRUCT<a integer>) AS s) AS t;",
+                "SELECT s.A FROM (SELECT CAST(ROW(1) AS ROW(a integer)) AS s) AS t",
                 Some("A"),
                 DataType::Int32,
             ),
@@ -3360,7 +4264,7 @@ mod tests {
         for sql in [
             "SELECT _col0 FROM (SELECT 1) AS t",
             "SELECT column_0 FROM (VALUES (1)) AS t",
-            "SELECT t.`1` FROM (SELECT 1) AS t",
+            "SELECT t.\"1\" FROM (SELECT 1) AS t",
         ] {
             let query = parse_native_query(sql).unwrap();
             assert_eq!(
@@ -4090,6 +4994,15 @@ mod tests {
             ))
         }
 
+        fn resolve_quoted_iceberg_metadata(
+            &self,
+            name: &novarocks_parser::ast::ObjectName,
+            catalog: Option<&str>,
+            database: &str,
+        ) -> Option<crate::catalog::QuotedMetadataTable> {
+            crate::compiler::resolve_quoted_iceberg_metadata_for_test(name, catalog, database, self)
+        }
+
         fn iceberg_metadata_provider(&self) -> Option<&dyn IcebergMetadataTableProvider> {
             Some(self)
         }
@@ -4121,11 +5034,99 @@ mod tests {
     }
 
     fn parse_native_query(sql: &str) -> Result<ast::Query, String> {
-        let mut statements = novarocks_parser::parse(sql).map_err(|error| error.to_string())?;
-        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_mut_slice() else {
-            return Err("expected exactly one query".to_string());
-        };
+        let query =
+            &mut novarocks_parser::parser::parse_query(sql).map_err(|error| error.to_string())?;
         Ok(query.clone())
+    }
+
+    /// Deep legal scalar input preserves the original declaration and column
+    /// identity through analysis, then releases the actual returned IR.
+    #[test]
+    fn deep_scalar_calls_keep_declared_types_and_exit_after_analysis() {
+        const DEPTH: usize = 50_000;
+        let baseline_query =
+            parse_native_query("SELECT abs(x) AS result FROM (VALUES (CAST(1 AS DOUBLE))) AS t(x)")
+                .expect("baseline source");
+        let (baseline, baseline_registry, baseline_factory) =
+            analyze(&baseline_query, &TestCatalog, "default").expect("baseline analysis");
+        let expected = &select_body(&baseline).projection[0].expr;
+        assert_eq!(
+            expected.value_type.data_type(),
+            &arrow::datatypes::DataType::Float64
+        );
+        let ExprKind::FunctionCall { args, .. } = &expected.kind else {
+            panic!("baseline scalar call");
+        };
+        assert_eq!(args.len(), 1);
+        let ExprKind::ColumnRef {
+            column_id: expected_column,
+            ..
+        } = args[0].kind
+        else {
+            panic!("baseline source column");
+        };
+        let sql = format!(
+            "SELECT {}x{} AS result FROM (VALUES (CAST(1 AS DOUBLE))) AS t(x)",
+            "abs(".repeat(DEPTH),
+            ")".repeat(DEPTH),
+        );
+        let query = parse_native_query(&sql).expect("deep scalar source");
+        let (resolved, registry, factory) =
+            analyze(&query, &TestCatalog, "default").expect("deep scalar analysis");
+        assert_eq!(resolved.output_columns[0].name, "result");
+        assert_eq!(
+            resolved.output_columns[0].value_type,
+            baseline.output_columns[0].value_type
+        );
+        let copy = resolved.clone();
+        let mut expression = &select_body(&copy).projection[0].expr;
+        for _ in 0..DEPTH {
+            assert_eq!(expression.value_type, expected.value_type);
+            let ExprKind::FunctionCall { name, args, .. } = &expression.kind else {
+                panic!("expected every original scalar call");
+            };
+            assert_eq!(name, "abs");
+            assert_eq!(args.len(), 1);
+            expression = &args[0];
+        }
+        assert_eq!(expression.value_type, args[0].value_type);
+        assert!(
+            matches!(expression.kind, ExprKind::ColumnRef { column_id, .. } if column_id == expected_column)
+        );
+        drop(copy);
+        drop((resolved, registry, factory));
+        drop(query);
+        drop((baseline, baseline_registry, baseline_factory));
+        drop(baseline_query);
+    }
+
+    #[test]
+    fn trino_reference_nesting_sizes_pass_analysis_with_their_declared_types() {
+        use arrow::datatypes::DataType;
+
+        let parentheses = format!("SELECT {}1{}", "(".repeat(1_000), ")".repeat(1_000));
+        let subqueries = format!(
+            "{}SELECT * FROM (VALUES 1) AS t(a){}",
+            "SELECT * FROM (".repeat(200),
+            ") AS t".repeat(200),
+        );
+        let disjunction = format!("SELECT {}false", "false OR ".repeat(19_999));
+        for (shape, source, expected) in [
+            ("parentheses", parentheses, DataType::Int32),
+            ("derived tables", subqueries, DataType::Int32),
+            ("disjunction", disjunction, DataType::Boolean),
+        ] {
+            let query =
+                parse_native_query(&source).unwrap_or_else(|error| panic!("{shape}: {error}"));
+            let (resolved, registry, factory) = analyze(&query, &TestCatalog, "default")
+                .unwrap_or_else(|error| panic!("{shape}: {error}"));
+            let [field] = resolved.output_columns.as_slice() else {
+                panic!("{shape} must produce one column");
+            };
+            assert_eq!(field.value_type.data_type(), &expected, "{shape}");
+            drop((resolved, registry, factory));
+            drop(query);
+        }
     }
 
     fn parse_and_analyze(sql: &str) -> Result<ResolvedQuery, String> {
@@ -4149,6 +5150,31 @@ mod tests {
         let (resolved, _registry, _factory) =
             analyze(&query, &TestCatalog, "default").map_err(|error| error.to_string())?;
         Ok(resolved)
+    }
+
+    #[test]
+    fn using_requires_a_real_column_binding_on_both_sides() {
+        for sql in [
+            "SELECT 1 FROM (VALUES (1)) l(other) JOIN (VALUES (2)) r(key) USING (key)",
+            "SELECT 1 FROM (VALUES (1)) l(key) JOIN (VALUES (2)) r(other) USING (key)",
+            "SELECT 1 FROM (VALUES (1)) l(a) JOIN (VALUES (2)) r(b) USING (key)",
+        ] {
+            let query = parse_native_query(sql).unwrap();
+            let error = match analyze(&query, &TestCatalog, "default") {
+                Err(error) => error,
+                Ok(_) => panic!("a missing USING key must not receive a fabricated binding: {sql}"),
+            };
+            assert_eq!(
+                error.kind(),
+                crate::analyze_error::AnalyzeErrorKind::UnknownColumn
+            );
+            assert!(error.message().contains("Column 'key' cannot be resolved."));
+            let start = sql.rfind("key").unwrap();
+            assert_eq!(
+                error.span(),
+                Some(novarocks_parser::Span::new(start, start + 3))
+            );
+        }
     }
 
     #[test]
@@ -4993,6 +6019,81 @@ mod tests {
     }
 
     #[test]
+    fn table_metadata_name_view_keeps_actual_quoted_facts_and_authored_locations() {
+        let source = "SELECT * FROM ice.db.\"orders$future_metadata\"";
+        let query = parse_native_query(source).unwrap();
+        let ast::SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("SELECT");
+        };
+        let Some(ast::Relation::Table(table)) = &select.from else {
+            panic!("table");
+        };
+        let view = TableNameView::new(&table.name);
+        assert_eq!(
+            view.parts().collect::<Vec<_>>(),
+            ["ice", "db", "orders$future_metadata"]
+        );
+        assert!(view.metadata.is_none());
+        assert_eq!(
+            &source[view.base_span.start()..view.base_span.end()],
+            "ice.db.\"orders$future_metadata\""
+        );
+        let mut name = novarocks_parser::build::object_name(vec![novarocks_parser::build::ident(
+            "orders$files",
+            false,
+        )])
+        .unwrap();
+        let view = TableNameView::new(&name);
+        assert_eq!(view.parts().collect::<Vec<_>>(), vec!["orders"]);
+        assert_eq!(view.metadata.unwrap().span, novarocks_parser::SYNTHETIC);
+        name.span = novarocks_parser::Span::new(100, 100);
+        name.parts[0].span = novarocks_parser::Span::new(0, name.parts[0].value.len());
+        let view = TableNameView::new(&name);
+        assert_eq!(view.parts().collect::<Vec<_>>(), vec!["orders"]);
+        assert_eq!(view.base_span, name.span);
+        assert_eq!(view.metadata.unwrap().span, name.parts[0].span);
+        name.parts[0].quoted = true;
+        let view = TableNameView::new(&name);
+        assert!(view.metadata.is_none());
+        assert_eq!(view.parts().collect::<Vec<_>>(), vec!["orders$files"]);
+    }
+
+    #[test]
+    fn table_query_body_reuses_original_scan_fields_full_types_and_column_ids() {
+        let mut source = parse_native_query("SELECT * FROM t1").unwrap();
+        let (expected, _, _) = analyze(&source, &TestCatalog, "default").unwrap();
+        let ast::SetExpr::Select(select) = source.body.as_mut() else {
+            panic!("source SELECT");
+        };
+        let ast::Relation::Table(table) = select.from.take().expect("source table") else {
+            panic!("source table");
+        };
+        let table_query = novarocks_parser::build::query(ast::SetExpr::Table(table));
+        let (actual, _, _) = analyze(&table_query, &TestCatalog, "default").unwrap();
+        assert_eq!(actual.output_columns.len(), expected.output_columns.len());
+        for (actual, expected) in actual.output_columns.iter().zip(&expected.output_columns) {
+            assert_eq!(actual.field_name, expected.field_name);
+            assert_eq!(actual.column_id, expected.column_id);
+            assert_eq!(actual.name, expected.name);
+            assert_eq!(actual.value_type, expected.value_type);
+        }
+        let (QueryBody::Select(actual), QueryBody::Select(expected)) =
+            (&actual.body, &expected.body)
+        else {
+            panic!("same actual Select IR");
+        };
+        assert_eq!(actual.projection.len(), expected.projection.len());
+        for (actual, expected) in actual.projection.iter().zip(&expected.projection) {
+            assert_eq!(actual.field_name, expected.field_name);
+            assert_eq!(actual.output_column_id, expected.output_column_id);
+            assert_eq!(actual.expr.value_type, expected.expr.value_type);
+            assert!(
+                matches!((&actual.expr.kind, &expected.expr.kind), (ExprKind::ColumnRef { column_id: a, .. }, ExprKind::ColumnRef { column_id: b, .. }) if a == b)
+            );
+        }
+    }
+
+    #[test]
     fn test_table_alias_qualified_reference() {
         // Simplified q3 pattern: table alias with qualified reference
         let sql = "SELECT o.o_orderkey FROM orders o WHERE o.o_custkey > 100";
@@ -5259,7 +6360,7 @@ mod tests {
     #[test]
     fn test_percentile_approx_with_array_literal_returns_array_type() {
         let resolved = parse_raw_and_analyze(
-            "SELECT percentile_approx(o_totalprice, array<double>[0.25, 0.5]) FROM orders",
+            "SELECT percentile_approx(o_totalprice, CAST([0.25, 0.5] AS ARRAY<double>)) FROM orders",
         )
         .expect("analysis should succeed");
         assert_eq!(resolved.output_columns.len(), 1);
@@ -5321,7 +6422,7 @@ mod tests {
     #[test]
     fn test_group_concat_rejects_non_string_separator() {
         let err = parse_raw_and_analyze(
-            "SELECT group_concat(\"中国\" ORDER BY \"第一\" SEPARATOR 1) FROM orders",
+            "SELECT string_agg('中国' \n,\n 1\nORDER BY '第一' \n) FROM orders",
         )
         .expect_err("group_concat should reject non-string separator");
         assert!(
@@ -5420,10 +6521,9 @@ mod tests {
 
     #[test]
     fn test_time_slice_interval_literal_analyzes() {
-        let resolved = parse_raw_and_analyze(
-            "SELECT time_slice('9999-12-31 23:59:59', interval 5 year, ceil)",
-        )
-        .expect("time_slice interval literal should analyze");
+        let resolved =
+            parse_raw_and_analyze("SELECT time_slice('9999-12-31 23:59:59', 5, 'year', 'ceil')")
+                .expect("time_slice interval literal should analyze");
         assert_eq!(resolved.output_columns.len(), 1);
     }
 
@@ -5524,6 +6624,76 @@ mod tests {
             "projection still contains unresolved alias reference: {:?}",
             sel.projection[1].expr
         );
+    }
+
+    #[test]
+    fn empty_grouping_sets_keep_exact_repeat_multiplicity_and_count_binding() {
+        let count_type = novarocks_type_contract::FunctionValueType::new(DataType::Int64, false);
+        let mut canonical_binding = None;
+        for (group_by, repeats) in [
+            ("GROUPING SETS (())", 1),
+            ("ROLLUP(())", 2),
+            ("CUBE(())", 2),
+        ] {
+            let sql =
+                format!("SELECT count(*) AS cnt FROM (VALUES (1), (2)) t(v) GROUP BY {group_by}");
+            let query = parse_and_analyze(&sql).unwrap_or_else(|error| {
+                panic!("{group_by} must retain its original analysis: {error}")
+            });
+            let QueryBody::Select(select) = &query.body else {
+                panic!("{group_by} must produce the original Select with RepeatInfo");
+            };
+            let repeat = select.repeat.as_ref().expect("an actual Repeat expansion");
+            assert_eq!(
+                repeat.repeat_column_ref_list,
+                vec![Vec::<String>::new(); repeats]
+            );
+            // This analyzer stage leaves the per-group ColumnId mapping unpopulated.
+            assert!(repeat.repeat_column_ref_ids.is_empty());
+            assert_eq!(repeat.grouping_ids, vec![0; repeats]);
+            assert!(repeat.all_rollup_columns.is_empty());
+            assert!(repeat.all_rollup_column_ids.is_empty());
+            assert!(repeat.grouping_fn_args.is_empty());
+            assert!(repeat.grouping_fn_arg_ids.is_empty());
+            assert!(repeat.grouping_fn_ids.is_empty());
+            assert!(select.group_by.is_empty());
+            assert!(select.has_aggregation);
+            assert_eq!(select.projection.len(), 1);
+            assert_eq!(query.output_columns.len(), 1);
+            let projection = &select.projection[0];
+            let output = &query.output_columns[0];
+            assert_eq!(projection.output_name, "cnt");
+            assert_eq!(projection.field_name.as_deref(), Some("cnt"));
+            assert_eq!(output.field_name.as_deref(), Some("cnt"));
+            assert_eq!(projection.output_column_id, output.column_id);
+            assert_eq!(projection.expr.value_type, count_type);
+            assert_eq!(output.value_type, count_type);
+            assert!(!output.is_internal);
+            let ExprKind::AggregateCall {
+                name,
+                args,
+                distinct,
+                order_by,
+                resolved,
+            } = &projection.expr.kind
+            else {
+                panic!("{group_by} must keep the actual COUNT aggregate binding");
+            };
+            assert_eq!(name, "count");
+            assert!(args.is_empty());
+            assert!(!distinct);
+            assert!(order_by.is_empty());
+            assert!(resolved.selected.argument_types.is_empty());
+            assert_eq!(
+                resolved.selected.result_type,
+                novarocks_functions::FunctionResultType::Scalar(count_type.clone())
+            );
+            if let Some(expected) = &canonical_binding {
+                assert_eq!(resolved, expected, "{group_by}");
+            } else {
+                canonical_binding = Some(resolved.clone());
+            }
+        }
     }
 
     #[test]
@@ -6085,6 +7255,7 @@ mod tests {
         let control = crate::compiler::SqlCompileControl::unbounded();
         let ctx = AnalyzerContext {
             grouping_scope: Default::default(),
+            purpose: QueryAnalysisPurpose::Ordinary,
             view_stack: Default::default(),
             control: &control,
             constant_policy: crate::constant::test_constant_policy(),
@@ -6133,10 +7304,7 @@ mod tests {
         let catalog = crate::catalog::memory::PlannerMemoryCatalog::default();
         let args = vec!["missing"; 64].join(",");
         let sql = format!("SELECT grouping({args}) FROM (VALUES (1)) t(a) GROUP BY a");
-        let statements = novarocks_parser::parse(&sql).unwrap();
-        let ast::Statement::Query(query) = &statements[0] else {
-            panic!("query");
-        };
+        let query = &novarocks_parser::parser::parse_query(&sql).unwrap();
         let error = analyze(query, &catalog, "default").unwrap_err();
         assert_eq!(
             error.kind(),
@@ -6432,6 +7600,102 @@ mod tests {
     }
 
     #[test]
+    fn typed_grouping_profile_borrows_real_keys_and_preserves_repeat_facts() {
+        let mut query = parse_native_query(
+            "SELECT k, grouping(k), sum(v) FROM (VALUES (1,10),(2,20)) t(k,v) GROUP BY ROLLUP(k)",
+        )
+        .unwrap();
+        let control = crate::compiler::SqlCompileControl::unbounded();
+        let ctx = AnalyzerContext {
+            grouping_scope: Default::default(),
+            purpose: QueryAnalysisPurpose::Ordinary,
+            view_stack: Default::default(),
+            control: &control,
+            constant_policy: crate::constant::test_constant_policy(),
+            materialized_values: None,
+            catalog: &TestCatalog,
+            current_database: "default",
+            function_catalog: crate::functions::builtin_sql_function_catalog(),
+            sql_semantics: Default::default(),
+            factory: std::rc::Rc::new(std::cell::RefCell::new(
+                crate::column_id::ColumnRefFactory::new(),
+            )),
+            ctes: Default::default(),
+            pending_ctes: Default::default(),
+            next_subquery_id: Default::default(),
+            next_lambda_slot_id: Default::default(),
+            collected_subqueries: Default::default(),
+            cte_registry: std::cell::RefCell::new(crate::analysis::cte::CTERegistry::new()),
+        };
+        let ast::SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("SELECT");
+        };
+        let ast::GroupingElement::Sets(sets) = &select.group_by.as_ref().unwrap().elements[0]
+        else {
+            panic!("ROLLUP");
+        };
+        let original_key = &sets.sets[0][0];
+        let spec = ctx.extract_repeat_from_group_by(select).unwrap().unwrap();
+        assert_eq!(
+            spec.grouping_sets.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![1, 0]
+        );
+        assert!(std::ptr::eq(spec.all_group_by_exprs[0], original_key));
+        assert!(std::ptr::eq(spec.grouping_sets[0][0], original_key));
+        let (actual, _, _) = analyze(&query, &TestCatalog, "default").unwrap();
+        let QueryBody::Select(actual) = actual.body else {
+            panic!("resolved SELECT");
+        };
+        let repeat = actual.repeat.as_ref().unwrap();
+        assert_eq!(repeat.grouping_ids, vec![0, 1]);
+        assert_eq!(repeat.all_rollup_columns, vec!["k"]);
+        assert_eq!(
+            actual.projection[0].expr.value_type.data_type(),
+            &DataType::Int32
+        );
+        assert!(actual.projection[0].expr.value_type.nullable());
+
+        let ast::SetExpr::Select(select) = query.body.as_mut() else {
+            panic!("SELECT");
+        };
+        let group = select.group_by.as_mut().unwrap();
+        group.distinct = true;
+        assert_eq!(
+            ctx.extract_repeat_from_group_by(select).unwrap_err().kind(),
+            crate::analyze_error::AnalyzeErrorKind::UnsupportedExpression
+        );
+        let group = select.group_by.as_mut().unwrap();
+        group.distinct = false;
+        group
+            .elements
+            .push(ast::GroupingElement::Auto(ast::AutoGroupBy {
+                span: group.span,
+            }));
+        assert_eq!(
+            ctx.extract_repeat_from_group_by(select).unwrap_err().kind(),
+            crate::analyze_error::AnalyzeErrorKind::UnsupportedExpression
+        );
+        let group = select.group_by.as_mut().unwrap();
+        group.elements.clear();
+        assert_eq!(
+            ctx.extract_repeat_from_group_by(select).unwrap_err().kind(),
+            crate::analyze_error::AnalyzeErrorKind::UnsupportedExpression
+        );
+        let group = select.group_by.as_mut().unwrap();
+        group
+            .elements
+            .push(ast::GroupingElement::Simple(ast::SimpleGroupBy {
+                columns: ast::AstVec::new(),
+                span: group.span,
+            }));
+        assert_eq!(
+            ctx.extract_repeat_from_group_by(select).unwrap_err().kind(),
+            crate::analyze_error::AnalyzeErrorKind::UnsupportedExpression
+        );
+        assert!(ctx.collected_subqueries.borrow().is_empty());
+    }
+
+    #[test]
     fn test_group_by_grouping_sets_single_column_resolves() {
         // Reduced from tests/sql/correctness/aggregate/agg_grouping_sets_v1 query 5:
         //     GROUP BY GROUPING SETS((), (k1))
@@ -6625,8 +7889,8 @@ mod tests {
 
     #[test]
     fn left_casts_value_argument_but_preserves_length_type() {
-        let resolved = parse_and_analyze("select left(o_totalprice, 6) from orders")
-            .expect("left should analyze");
+        let resolved = parse_and_analyze("select strleft(o_totalprice, 6) from orders")
+            .expect("strleft should analyze");
         let QueryBody::Select(sel) = &resolved.body else {
             panic!("expected Select body");
         };
@@ -6636,7 +7900,7 @@ mod tests {
                 sel.projection[0].expr.kind
             );
         };
-        assert_eq!(name, "left");
+        assert_eq!(name, "strleft");
         let ExprKind::Cast { target, expr, .. } = &args[0].kind else {
             panic!("expected left value argument cast, got {:?}", args[0].kind);
         };
@@ -6876,6 +8140,17 @@ mod tests {
                 CatalogAwareTestCatalog.resolve_table_for_analysis(catalog, database, table)
             }
 
+            fn resolve_quoted_iceberg_metadata(
+                &self,
+                name: &novarocks_parser::ast::ObjectName,
+                catalog: Option<&str>,
+                database: &str,
+            ) -> Option<crate::catalog::QuotedMetadataTable> {
+                crate::compiler::resolve_quoted_iceberg_metadata_for_test(
+                    name, catalog, database, self,
+                )
+            }
+
             fn iceberg_metadata_provider(&self) -> Option<&dyn IcebergMetadataTableProvider> {
                 Some(self)
             }
@@ -6901,8 +8176,8 @@ mod tests {
         }
 
         let catalog = MetadataModeCatalog(std::cell::Cell::new(false));
-        let query =
-            parse_native_query("SELECT record_count FROM ice.db.orders$partitions").expect("parse");
+        let query = parse_native_query("SELECT record_count FROM ice.db.\"orders$partitions\"")
+            .expect("parse");
 
         let _ = analyze(&query, &catalog, "default").expect("analyze");
         assert!(
@@ -6922,6 +8197,17 @@ mod tests {
                 table: &str,
             ) -> Result<crate::catalog::ResolvedAnalyzerTable, String> {
                 CatalogAwareTestCatalog.resolve_table_for_analysis(catalog, database, table)
+            }
+
+            fn resolve_quoted_iceberg_metadata(
+                &self,
+                name: &novarocks_parser::ast::ObjectName,
+                catalog: Option<&str>,
+                database: &str,
+            ) -> Option<crate::catalog::QuotedMetadataTable> {
+                crate::compiler::resolve_quoted_iceberg_metadata_for_test(
+                    name, catalog, database, self,
+                )
             }
 
             fn iceberg_metadata_provider(&self) -> Option<&dyn IcebergMetadataTableProvider> {
@@ -6952,8 +8238,8 @@ mod tests {
         }
 
         let catalog = LowercaseMetadataModeCatalog(std::cell::Cell::new(false));
-        let query =
-            parse_native_query("SELECT record_count FROM ICE.DB.ORDERS$partitions").expect("parse");
+        let query = parse_native_query("SELECT record_count FROM ICE.DB.\"ORDERS$partitions\"")
+            .expect("parse");
 
         let _ = analyze(&query, &catalog, "default").expect("analyze");
         assert!(
@@ -6967,7 +8253,7 @@ mod tests {
         use crate::planner::table::SqlMetadataTableKind;
 
         // Metadata table syntax is carried by the typed table-factor metadata field.
-        let resolved = parse_raw_and_analyze("SELECT snapshot_id FROM orders$snapshots")
+        let resolved = parse_raw_and_analyze("SELECT snapshot_id FROM \"orders$snapshots\"")
             .expect("analyze should succeed");
         let QueryBody::Select(sel) = &resolved.body else {
             panic!("expected Select body");
@@ -6978,7 +8264,7 @@ mod tests {
                 assert_eq!(rel.metadata_table_type, SqlMetadataTableKind::Snapshots);
                 assert_eq!(rel.table.name, "orders");
                 assert_eq!(rel.database, "default");
-                assert!(rel.alias.is_none());
+                assert_eq!(rel.alias.as_deref(), Some("orders$snapshots"));
             }
             other => panic!("expected IcebergMetadataScan, got {other:?}"),
         }
@@ -6998,8 +8284,8 @@ mod tests {
     #[test]
     fn metadata_order_by_hidden_column_reuses_scan_column_id() {
         for sql in [
-            "SELECT snapshot_id FROM orders$snapshots ORDER BY committed_at LIMIT 1",
-            "SELECT snapshot_id FROM orders$snapshots AS s ORDER BY s.committed_at LIMIT 1",
+            "SELECT snapshot_id FROM \"orders$snapshots\" ORDER BY committed_at LIMIT 1",
+            "SELECT snapshot_id FROM \"orders$snapshots\" AS s ORDER BY s.committed_at LIMIT 1",
         ] {
             let resolved = parse_raw_and_analyze(sql).expect("analyze metadata ORDER BY");
             let QueryBody::Select(select) = &resolved.body else {
@@ -7029,8 +8315,8 @@ mod tests {
     #[test]
     fn metadata_order_by_hidden_column_survives_optimizer_id_binding() {
         for sql in [
-            "SELECT snapshot_id FROM orders$snapshots ORDER BY committed_at LIMIT 1",
-            "SELECT snapshot_id FROM orders$snapshots AS s ORDER BY s.committed_at LIMIT 1",
+            "SELECT snapshot_id FROM \"orders$snapshots\" ORDER BY committed_at LIMIT 1",
+            "SELECT snapshot_id FROM \"orders$snapshots\" AS s ORDER BY s.committed_at LIMIT 1",
         ] {
             let query = parse_native_query(sql).expect("parse metadata ORDER BY");
             let (resolved, registry, mut factory) =
@@ -7066,15 +8352,10 @@ mod tests {
     }
 
     #[test]
-    fn analyzer_rejects_branch_combined_with_metadata_suffix() {
-        // The typed metadata suffix leaves `branch_dev` as the base name,
-        // which is
-        // illegal in combination with a metadata-table suffix.
-        let err = parse_raw_and_analyze("SELECT * FROM orders.branch_dev$snapshots")
-            .expect_err("must fail");
+    fn parser_rejects_an_unquoted_branch_with_a_metadata_suffix() {
         assert!(
-            err.contains("cannot be combined with branch/tag suffix"),
-            "unexpected error: {err}"
+            novarocks_parser::parser::parse_query("SELECT * FROM orders.branch_dev$snapshots")
+                .is_err()
         );
     }
 
@@ -7085,7 +8366,7 @@ mod tests {
         // returns the same table for any database name, so we can pass any
         // catalog/namespace strings in the three-part identifier.
         let resolved = parse_raw_and_analyze(
-            "SELECT _row_id FROM __nr_ivm_delta('cat.ns.iv_orders', 100, 200) AS t",
+            "SELECT _row_id FROM TABLE(__nr_ivm_delta('cat.ns.iv_orders', 100, 200)) AS t",
         )
         .expect("analysis should succeed");
         let QueryBody::Select(sel) = &resolved.body else {
@@ -7161,18 +8442,20 @@ mod tests {
 
     #[test]
     fn analyzer_rejects_nr_ivm_delta_with_negative_snapshot() {
-        let err =
-            parse_raw_and_analyze("SELECT * FROM __nr_ivm_delta('cat.ns.iv_orders', -1, 200) AS t")
-                .expect_err("must fail");
+        let err = parse_raw_and_analyze(
+            "SELECT * FROM TABLE(__nr_ivm_delta('cat.ns.iv_orders', -1, 200)) AS t",
+        )
+        .expect_err("must fail");
         assert!(err.contains("non-negative"), "unexpected error: {err}");
     }
 
     #[test]
     fn analyzer_rejects_nr_ivm_delta_on_non_v3_table() {
         // `orders` is registered without row-lineage metadata columns.
-        let err =
-            parse_raw_and_analyze("SELECT * FROM __nr_ivm_delta('cat.ns.orders', 100, 200) AS t")
-                .expect_err("must fail");
+        let err = parse_raw_and_analyze(
+            "SELECT * FROM TABLE(__nr_ivm_delta('cat.ns.orders', 100, 200)) AS t",
+        )
+        .expect_err("must fail");
         assert!(
             err.contains("Iceberg v3") || err.contains("row-lineage metadata"),
             "expected row-lineage rebuild diagnostic, got: {err}"
@@ -7899,7 +9182,7 @@ mod tests {
 
     #[test]
     fn group_by_subquery_is_rejected_clearly() {
-        let err = parse_and_analyze("SELECT k1 FROM t1 GROUP BY (SELECT max(k2) FROM t2)")
+        let err = parse_and_analyze("SELECT k1 FROM t1 GROUP BY ((SELECT max(k2) FROM t2))")
             .expect_err("subquery in GROUP BY should be rejected");
         assert!(
             err.contains("subquery is not supported in GROUP BY"),

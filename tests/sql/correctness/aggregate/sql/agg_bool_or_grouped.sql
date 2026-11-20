@@ -27,15 +27,14 @@
 CREATE TABLE ${case_db}.t_agg_bool_or_grouped (
     g INT,
     v INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t_agg_bool_or_grouped VALUES
-    (1, 10),
-    (1, 20),
-    (2, NULL),
-    (2, 5),
-    (3, NULL);
+    ROW(1, 10),
+    ROW(1, 20),
+    ROW(2, NULL),
+    ROW(2, 5),
+    ROW(3, NULL);
 
 SELECT
     g,

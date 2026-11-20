@@ -20,14 +20,12 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE TABLE rwm13_base_${uuid0} (p BIGINT NOT NULL, id BIGINT)
-TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
-INSERT INTO rwm13_base_${uuid0} VALUES (1, 1), (2, 2), (3, 3);
-INSERT INTO rwm13_base_${uuid0} VALUES (1, 4), (2, 5), (3, 6);
-INSERT INTO rwm13_base_${uuid0} VALUES (1, 7), (2, 8), (3, 9);
+CREATE TABLE rwm13_base_${uuid0} (p BIGINT NOT NULL, id BIGINT) WITH (format_version = 3);
+INSERT INTO rwm13_base_${uuid0} VALUES ROW(1, 1), ROW(2, 2), ROW(3, 3);
+INSERT INTO rwm13_base_${uuid0} VALUES ROW(1, 4), ROW(2, 5), ROW(3, 6);
+INSERT INTO rwm13_base_${uuid0} VALUES ROW(1, 7), ROW(2, 8), ROW(3, 9);
 CREATE MATERIALIZED VIEW rwm13_mv_${uuid0}
-PARTITION BY p DISTRIBUTED BY HASH(p) BUCKETS 1
-PROPERTIES ('storage_engine' = 'iceberg')
+WITH (partitioning = ARRAY['p'])
 AS SELECT p, id FROM rwm13_base_${uuid0};
 REFRESH MATERIALIZED VIEW rwm13_mv_${uuid0};
 
@@ -36,13 +34,13 @@ SELECT p, count(*) AS n, sum(id) AS id_sum FROM rwm13_mv_${uuid0}
 GROUP BY p ORDER BY p;
 
 -- query 3
-SELECT count(*) AS data_files FROM rwm13_mv_${uuid0}$files WHERE content = 0;
+SELECT count(*) AS data_files FROM "rwm13_mv_${uuid0}$files" WHERE content = 0;
 
 -- query 4
-SELECT count(*) AS partitions FROM rwm13_mv_${uuid0}$partitions;
+SELECT count(*) AS partitions FROM "rwm13_mv_${uuid0}$partitions";
 
 -- query 5
 -- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW IF EXISTS rwm13_mv_${uuid0};
-DROP TABLE IF EXISTS rwm13_base_${uuid0} FORCE;
+DROP TABLE IF EXISTS rwm13_base_${uuid0} ;

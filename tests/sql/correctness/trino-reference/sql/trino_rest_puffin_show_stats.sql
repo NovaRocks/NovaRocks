@@ -27,15 +27,14 @@ shell: "${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/datasketches-tck/interop/trino/veri
 
 -- query 2
 -- @skip_result_check=true
-ALTER TABLE statistics_cat_${suite_uuid0}.${suite_uuid0}.trino_puffin_${uuid0}
-SET TBLPROPERTIES ('novarocks.statistics.collect-on-write' = 'true');
+ALTER TABLE statistics_cat_${suite_uuid0}.${suite_uuid0}.trino_puffin_${uuid0} SET PROPERTIES statistics_collect_on_write = true;
 
 -- query 3
 -- The duplicate parent value distinguishes a Theta union from row-counting:
 -- Trino measured {1,2}; Nova writes {2,3}; the current NDV must be 3.
 -- @skip_result_check=true
 INSERT INTO statistics_cat_${suite_uuid0}.${suite_uuid0}.trino_puffin_${uuid0}
-VALUES (2, 20), (3, 30);
+VALUES ROW(2, 20), ROW(3, 30);
 
 -- query 4
 -- This starts a new released Trino process. Besides SHOW STATS NDV=3, it reads
@@ -46,4 +45,4 @@ shell: "${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/datasketches-tck/interop/trino/veri
 
 -- query 5
 -- @skip_result_check=true
-DROP TABLE statistics_cat_${suite_uuid0}.${suite_uuid0}.trino_puffin_${uuid0} FORCE;
+DROP TABLE statistics_cat_${suite_uuid0}.${suite_uuid0}.trino_puffin_${uuid0} ;

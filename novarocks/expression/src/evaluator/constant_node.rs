@@ -51,6 +51,7 @@ pub struct ConstantCarrierStep<'a> {
     pub target: &'a FunctionValueType,
     pub decimal_overflow_policy: DecimalOverflowPolicy,
     pub allow_throw_exception: bool,
+    pub array_failure_mode: Option<novarocks_type_contract::ArrayCastFailureMode>,
 }
 pub enum ConstantConversion<'a> {
     Identity,

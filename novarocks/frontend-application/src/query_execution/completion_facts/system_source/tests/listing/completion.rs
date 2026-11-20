@@ -55,11 +55,7 @@ pub(super) fn request(
     intent: SqlCompileIntent,
     control: SqlCompileControl,
 ) -> SqlFinalPlanCompileRequest {
-    let [novarocks_parser::ast::Statement::Query(query)]: [_; 1] =
-        novarocks_parser::parse(sql).unwrap().try_into().unwrap()
-    else {
-        panic!("query")
-    };
+    let query = novarocks_parser::parser::parse_query(sql).unwrap();
     SqlFinalPlanCompileRequest::new(
         novarocks_physical_plan::PlanVersionId::try_new([53; 16]).unwrap(),
         SqlStatementInput::parsed_query(Box::new(query)),

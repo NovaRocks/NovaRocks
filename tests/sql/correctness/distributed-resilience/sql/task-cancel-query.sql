@@ -33,20 +33,19 @@
 CREATE TABLE ${case_db}.kill_query (
   id BIGINT,
   delay_s BIGINT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 2
 -- @skip_result_check=true
-INSERT INTO ${case_db}.kill_query VALUES (1, 10);
+INSERT INTO ${case_db}.kill_query VALUES ROW(1, 10);
 
 -- query 3
 -- @skip_result_check=true
-INSERT INTO ${case_db}.kill_query VALUES (2, 10);
+INSERT INTO ${case_db}.kill_query VALUES ROW(2, 10);
 
 -- query 4
 -- @skip_result_check=true
-INSERT INTO ${case_db}.kill_query VALUES (3, 10);
+INSERT INTO ${case_db}.kill_query VALUES ROW(3, 10);
 
 -- query 5
 -- @cancel_query_after_be_log_contains=NOVAROCKS_TASK_CREATE_APPLIED
@@ -70,7 +69,7 @@ SELECT COUNT(*) FROM ${case_db}.kill_query;
 -- @be_log_count_at_least=NOVAROCKS_CONNECTOR_UNIT_READER_CLOSE,1
 -- @be_log_be_count_at_least=NOVAROCKS_PARTICIPATION_ABORT_APPLIED,3
 SELECT COUNT(*)
-FROM ${case_db}.kill_query$files AS metadata
+FROM ${case_db}."kill_query$files" AS metadata
 JOIN ${case_db}.kill_query AS data ON TRUE
 WHERE sleep(data.delay_s);
 

@@ -765,6 +765,7 @@ pub(crate) fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFacto
                     target,
                     decimal_overflow_policy,
                     allow_throw_exception,
+                    array_failure_mode,
                 } => {
                     let child = *ids
                         .get(expr)
@@ -802,6 +803,7 @@ pub(crate) fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFacto
                         &node.ty,
                         *decimal_overflow_policy,
                         *allow,
+                        *array_failure_mode,
                         control,
                     )?;
                     StaticExprKind::PreparedCast {
@@ -809,6 +811,7 @@ pub(crate) fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFacto
                         child,
                         decimal_overflow_policy: *decimal_overflow_policy,
                         allow_throw_exception: *allow,
+                        array_failure_mode: *array_failure_mode,
                     }
                 }
                 ExprKind::Binary {
@@ -1705,12 +1708,14 @@ pub(crate) fn prepare_core<H, F: novarocks_type_contract::ValueSchemaCreationFac
                         target,
                         decimal_overflow_policy,
                         allow_throw_exception,
+                        array_failure_mode,
                     },
                     StaticExprKind::PreparedCast {
                         operation,
                         child,
                         decimal_overflow_policy: local_policy,
                         allow_throw_exception: local_allow,
+                        array_failure_mode: local_array_mode,
                     },
                 ) => {
                     let source_allow = environment
@@ -1719,6 +1724,7 @@ pub(crate) fn prepare_core<H, F: novarocks_type_contract::ValueSchemaCreationFac
                         .map_err(|_| ExprCompileError::Invalid("cast parameter source differs"))?;
                     if *operation != novarocks_functions::CastOperation::Carrier
                         || decimal_overflow_policy != local_policy
+                        || array_failure_mode != local_array_mode
                         || source_allow
                             != &novarocks_type_contract::SemanticParameterValue::AllowThrowException(
                                 *local_allow,
@@ -1756,6 +1762,7 @@ pub(crate) fn prepare_core<H, F: novarocks_type_contract::ValueSchemaCreationFac
                         &source.ty,
                         *local_policy,
                         *local_allow,
+                        *local_array_mode,
                         control,
                     )?;
                     recipe

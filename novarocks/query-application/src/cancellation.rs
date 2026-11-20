@@ -128,7 +128,7 @@ impl QueryCancellationView {
             QueryCancellationViewInner::Governed { view, timeout_ms }
                 if view.is_for_scope(scope) =>
             {
-                Ok(*timeout_ms)
+                Ok(governed_timeout_ms(view, *timeout_ms))
             }
             _ => Err(novarocks_workload_control::WorkError::Conflict),
         }
@@ -143,7 +143,7 @@ impl QueryCancellationView {
             QueryCancellationViewInner::Legacy(state) => state.reason.get().cloned(),
             QueryCancellationViewInner::Governed { view, timeout_ms } => view
                 .reason()
-                .map(|reason| governed_reason(reason, *timeout_ms)),
+                .map(|reason| governed_reason(reason, governed_timeout_ms(view, *timeout_ms))),
         }
     }
 
@@ -160,11 +160,21 @@ impl QueryCancellationView {
                 }
                 changed.await;
             },
-            QueryCancellationViewInner::Governed { view, timeout_ms } => {
-                governed_reason(view.cancelled().await, *timeout_ms)
-            }
+            QueryCancellationViewInner::Governed { view, timeout_ms } => governed_reason(
+                view.cancelled().await,
+                governed_timeout_ms(view, *timeout_ms),
+            ),
         }
     }
+}
+
+pub(crate) fn governed_timeout_ms(
+    view: &novarocks_workload_control::CancellationView,
+    fixed_timeout_ms: Option<u64>,
+) -> Option<u64> {
+    view.configured_timeout()
+        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+        .or(fixed_timeout_ms)
 }
 
 fn governed_reason(

@@ -30,7 +30,8 @@ PLAN FRAGMENT 2
   STREAM DATA SINK
     EXCHANGE ID: 4
     PARTITION: BROADCAST
-5:SCAN ${case_db}.t_dnn_ar (alias=r) stats={rows=2000}
-     TABLE: ${case_db}.t_dnn_ar
-     columns: k
-     min-max stats
+5:PROJECT [r.k] stats={rows=2000}
+  6:SCAN ${case_db}.t_dnn_ar (alias=r) stats={rows=2000}
+       TABLE: ${case_db}.t_dnn_ar
+       columns: k
+       min-max stats

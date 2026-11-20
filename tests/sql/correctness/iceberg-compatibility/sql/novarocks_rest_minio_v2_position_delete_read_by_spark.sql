@@ -20,24 +20,22 @@
 -- Validate Spark can read a NovaRocks-written v2 position-delete file.
 
 -- query 1
-CREATE DATABASE IF NOT EXISTS iceberg_compat_${suite_uuid0}.${case_db};
+CREATE SCHEMA IF NOT EXISTS iceberg_compat_${suite_uuid0}.${case_db};
 
 -- query 2
 CREATE TABLE iceberg_compat_${suite_uuid0}.${case_db}.nr_v2_pos_delete_${uuid0} (
   id BIGINT,
   region STRING,
   score INT
-)
-PARTITION BY (region)
-TBLPROPERTIES ("format-version" = "2");
+) WITH (partitioning = ARRAY['region'], format_version = 2);
 
 -- query 3
 INSERT INTO iceberg_compat_${suite_uuid0}.${case_db}.nr_v2_pos_delete_${uuid0}
 VALUES
-  (1, 'east', 10),
-  (2, 'east', 20),
-  (3, 'west', 30),
-  (4, 'west', 40);
+  ROW(1, 'east', 10),
+  ROW(2, 'east', 20),
+  ROW(3, 'west', 30),
+  ROW(4, 'west', 40);
 
 -- query 4
 DELETE FROM iceberg_compat_${suite_uuid0}.${case_db}.nr_v2_pos_delete_${uuid0}
@@ -73,4 +71,4 @@ printf '%s\n' "$spark_out" | grep -F "SPARK_POSITION_DELETE_OK" >/dev/null
 printf 'SPARK_POSITION_DELETE_OK\n'
 
 -- query 7
-DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.nr_v2_pos_delete_${uuid0} FORCE;
+DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.nr_v2_pos_delete_${uuid0} ;

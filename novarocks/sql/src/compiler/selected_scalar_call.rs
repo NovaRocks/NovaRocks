@@ -165,13 +165,35 @@ pub(crate) fn plan_conversion(
     target: &FunctionValueType,
     policy: DecimalOverflowPolicy,
     allow_throw_exception: bool,
+    array_failure_mode: Option<novarocks_type_contract::ArrayCastFailureMode>,
     control: &dyn PureCompileControl,
 ) -> Result<PlannedConversion, FunctionBindingError> {
+    if let Some(mode) = array_failure_mode {
+        control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 0)?;
+        if !novarocks_type_contract::array_cast_mode_types_valid_observed(
+            source,
+            target,
+            mode,
+            || control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 1),
+        )? {
+            return Err(FunctionBindingError::InvalidBinding(
+                "invalid explicit array CAST boundary".into(),
+            ));
+        }
+        return Ok(PlannedConversion::Carrier(CarrierStep {
+            target: target.clone(),
+            decimal_overflow_policy: policy,
+            allow_throw_exception,
+            array_failure_mode,
+        }));
+    }
     if source == target {
         return Ok(PlannedConversion::Identity);
     }
     control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 0)?;
-    let intermediate = if novarocks_type_contract::is_default_json_structure_cast(source, target) {
+    let intermediate = if novarocks_type_contract::is_default_json_structure_cast(source, target)
+        || novarocks_type_contract::is_null_list_to_json_cast(source, target)
+    {
         None
     } else {
         novarocks_functions::builtin::value_conversion::conversion_intermediate_type(source, target)
@@ -181,6 +203,7 @@ pub(crate) fn plan_conversion(
     };
     control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 0)?;
     let step = || CarrierStep {
+        array_failure_mode: None,
         target: target.clone(),
         decimal_overflow_policy: policy,
         allow_throw_exception,
@@ -649,6 +672,7 @@ pub(crate) fn freeze_conversion(
     policy: DecimalOverflowPolicy,
     allow: bool,
     constant_policy: novarocks_functions::ConstantPolicy,
+    array_failure_mode: Option<novarocks_type_contract::ArrayCastFailureMode>,
     control: &dyn PureCompileControl,
 ) -> Result<super::ConversionPlan, super::SqlCompileError> {
     use super::ConversionPlan;
@@ -658,6 +682,7 @@ pub(crate) fn freeze_conversion(
         target,
         policy,
         allow,
+        array_failure_mode,
         control,
     )
     .map_err(compile_binding_error)?
@@ -711,6 +736,62 @@ mod tests {
             .resolve_scalar_binding(name, &arguments, control())
             .unwrap();
         SqlFunctionBinding::new(resolved, DecimalOverflowPolicy::ReportError)
+    }
+
+    #[test]
+    fn explicit_array_modes_survive_identity_and_reject_foreign_type_boundaries() {
+        use arrow::datatypes::Field;
+        use novarocks_type_contract::ArrayCastFailureMode;
+        let catalog = crate::functions::builtin_sql_function_catalog();
+        let ty = FunctionValueType::new(
+            DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+            true,
+        );
+        assert!(matches!(
+            plan_conversion(
+                catalog,
+                &ty,
+                &ty,
+                DecimalOverflowPolicy::OutputNull,
+                false,
+                None,
+                control()
+            )
+            .unwrap(),
+            PlannedConversion::Identity
+        ));
+        for mode in [
+            ArrayCastFailureMode::ReportError,
+            ArrayCastFailureMode::OutputNull,
+        ] {
+            let PlannedConversion::Carrier(step) = plan_conversion(
+                catalog,
+                &ty,
+                &ty,
+                DecimalOverflowPolicy::OutputNull,
+                false,
+                Some(mode),
+                control(),
+            )
+            .unwrap() else {
+                panic!("explicit boundary must not become identity")
+            };
+            assert_eq!(step.target(), &ty);
+            assert_eq!(step.array_failure_mode(), Some(mode));
+            assert!(!step.allow_throw_exception());
+            assert!(matches!(
+                plan_conversion(
+                    catalog,
+                    &ty,
+                    &FunctionValueType::new(DataType::Int32, true),
+                    DecimalOverflowPolicy::OutputNull,
+                    false,
+                    Some(mode),
+                    control()
+                ),
+                Err(FunctionBindingError::InvalidBinding(_))
+            ));
+        }
     }
 
     #[test]
@@ -838,6 +919,7 @@ mod tests {
                     &target,
                     DecimalOverflowPolicy::OutputNull,
                     true,
+                    None,
                     control(),
                 )
                 .unwrap()

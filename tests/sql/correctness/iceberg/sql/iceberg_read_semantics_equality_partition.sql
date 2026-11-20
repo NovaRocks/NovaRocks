@@ -22,19 +22,16 @@
 
 -- query 1
 -- @skip_result_check=true
-DROP TABLE IF EXISTS ${case_db}.read_sem_eq_part FORCE;
+DROP TABLE IF EXISTS ${case_db}.read_sem_eq_part ;
 CREATE TABLE ${case_db}.read_sem_eq_part (
   id BIGINT NOT NULL,
   city STRING,
   amount BIGINT
-) TBLPROPERTIES (
-  "format-version" = "2"
-);
+) WITH (format_version = 2);
 INSERT INTO ${case_db}.read_sem_eq_part VALUES
-  (1, 'A', 10),
-  (2, 'B', 20);
-ALTER TABLE ${case_db}.read_sem_eq_part
-ADD EQUALITY DELETE (id) VALUES (2);
+  ROW(1, 'A', 10),
+  ROW(2, 'B', 20);
+ALTER TABLE ${case_db}.read_sem_eq_part EXECUTE add_equality_delete(columns => ARRAY['id'], rows => ARRAY[ROW(2)]);
 
 -- query 2
 SELECT id, city, amount
@@ -43,10 +40,10 @@ ORDER BY id;
 
 -- query 3
 -- @skip_result_check=true
-ALTER TABLE ${case_db}.read_sem_eq_part ADD PARTITION COLUMN city;
+ALTER TABLE ${case_db}.read_sem_eq_part SET PROPERTIES partitioning = ARRAY['city'];
 INSERT INTO ${case_db}.read_sem_eq_part VALUES
-  (2, 'B', 25),
-  (3, 'A', 30);
+  ROW(2, 'B', 25),
+  ROW(3, 'A', 30);
 
 -- query 4
 SELECT id, city, amount
@@ -55,4 +52,4 @@ ORDER BY id, amount;
 
 -- query 5
 -- @skip_result_check=true
-DROP TABLE ${case_db}.read_sem_eq_part FORCE;
+DROP TABLE ${case_db}.read_sem_eq_part ;

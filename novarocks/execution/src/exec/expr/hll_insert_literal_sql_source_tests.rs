@@ -20,8 +20,7 @@ use novarocks_sql::{
     semantic::Literal,
 };
 fn literal_source(source: &str) -> Result<Literal, novarocks_sql::literal::LiteralFailure> {
-    let tokens = novarocks_parser::lex(source).unwrap();
-    let expression = novarocks_parser::parser::parse_expression(source, &tokens).unwrap();
+    let expression = novarocks_parser::parser::parse_expression(source).unwrap();
     expr_to_literal(&expression)
 }
 fn insert_literal_bytes(source: &str) -> Vec<u8> {

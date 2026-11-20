@@ -38,28 +38,11 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE EXTERNAL CATALOG mvrw_${uuid0}
-PROPERTIES (
-  "type" = "iceberg",
-  "iceberg.catalog.type" = "rest",
-  "uri" = "${iceberg_rest_uri}",
-  "warehouse" = "${iceberg_rest_warehouse}",
-  "aws.s3.endpoint" = "${oss_endpoint}",
-  "credential.object-store-metadata.consumer-role" = "frontend",
-  "credential.object-store-metadata.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-metadata.name" = "${iceberg_object_store_metadata_credential_name}",
-  "credential.object-store-metadata.generation" = "${iceberg_object_store_credential_generation}",
-  "credential.object-store-data.consumer-role" = "backend",
-  "credential.object-store-data.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-data.name" = "${iceberg_object_store_data_credential_name}",
-  "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
-  "aws.s3.region" = "${oss_region}",
-  "aws.s3.enable_path_style_access" = "${oss_path_style}"
-);
+CREATE CATALOG mvrw_${uuid0} USING iceberg WITH ("iceberg.catalog.type" = 'rest', "uri" = '${iceberg_rest_uri}', "warehouse" = '${iceberg_rest_warehouse}', "aws.s3.endpoint" = '${oss_endpoint}', "credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-metadata.name" = '${iceberg_object_store_metadata_credential_name}', "credential.object-store-metadata.generation" = '${iceberg_object_store_credential_generation}', "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-data.name" = '${iceberg_object_store_data_credential_name}', "credential.object-store-data.generation" = '${iceberg_object_store_credential_generation}', "aws.s3.region" = '${oss_region}', "aws.s3.enable_path_style_access" = '${oss_path_style}');
 
 -- query 2
 -- @skip_result_check=true
-CREATE DATABASE mvrw_${uuid0}.ns_${uuid0};
+CREATE SCHEMA mvrw_${uuid0}.ns_${uuid0};
 
 -- query 3
 -- @skip_result_check=true
@@ -68,7 +51,7 @@ CREATE TABLE mvrw_${uuid0}.ns_${uuid0}.lineorder (
   lo_linenumber INT,
   lo_quantity INT,
   lo_revenue INT
-) TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+) WITH (format_version = 3);
 
 -- query 4
 -- @skip_result_check=true
@@ -93,16 +76,13 @@ USE mvrw_${uuid0}.ns_${uuid0};
 -- query 7
 -- SPJ MV with a top-level OR filter
 -- @skip_result_check=true
-CREATE MATERIALIZED VIEW or_mv
-DISTRIBUTED BY HASH(lo_orderkey) BUCKETS 1
-PROPERTIES ('storage_engine' = 'iceberg')
-AS SELECT lo_orderkey, lo_linenumber, lo_quantity, lo_revenue
+CREATE MATERIALIZED VIEW or_mv AS SELECT lo_orderkey, lo_linenumber, lo_quantity, lo_revenue
 FROM lineorder
 WHERE lo_orderkey > 10003 OR lo_linenumber < 2;
 
 -- query 8
 -- @skip_result_check=true
-REFRESH MATERIALIZED VIEW or_mv WITH SYNC MODE;
+REFRESH MATERIALIZED VIEW or_mv;
 
 -- query 9
 -- exact OR match
@@ -111,7 +91,7 @@ REFRESH MATERIALIZED VIEW or_mv WITH SYNC MODE;
 SELECT lo_orderkey, lo_linenumber, lo_quantity FROM lineorder WHERE lo_orderkey > 10003 OR lo_linenumber < 2;
 
 -- query 10
-SELECT lo_orderkey, lo_linenumber, COUNT(*) AS c
+SELECT lo_orderkey, lo_linenumber, COUNT() AS c
 FROM lineorder WHERE lo_orderkey > 10003 OR lo_linenumber < 2
 GROUP BY lo_orderkey, lo_linenumber ORDER BY lo_orderkey, lo_linenumber;
 
@@ -128,7 +108,7 @@ SELECT lo_orderkey, lo_linenumber FROM lineorder WHERE lo_linenumber < 2 OR lo_o
 SELECT lo_orderkey, lo_quantity FROM lineorder WHERE (lo_orderkey > 10003 OR lo_linenumber < 2) AND lo_quantity >= 30;
 
 -- query 13
-SELECT lo_orderkey, COUNT(*) AS c
+SELECT lo_orderkey, COUNT() AS c
 FROM lineorder WHERE (lo_orderkey > 10003 OR lo_linenumber < 2) AND lo_quantity >= 30
 GROUP BY lo_orderkey ORDER BY lo_orderkey;
 
@@ -139,7 +119,7 @@ GROUP BY lo_orderkey ORDER BY lo_orderkey;
 SELECT lo_orderkey FROM lineorder WHERE lo_orderkey > 10004;
 
 -- query 15
-SELECT lo_orderkey, COUNT(*) AS c FROM lineorder WHERE lo_orderkey > 10004 GROUP BY lo_orderkey ORDER BY lo_orderkey;
+SELECT lo_orderkey, COUNT() AS c FROM lineorder WHERE lo_orderkey > 10004 GROUP BY lo_orderkey ORDER BY lo_orderkey;
 
 -- query 16
 -- single-arm query (the other disjunct alone) is also only implied -> miss
@@ -155,16 +135,13 @@ DROP MATERIALIZED VIEW IF EXISTS or_mv;
 -- query 18
 -- AND-of-ORs MV
 -- @skip_result_check=true
-CREATE MATERIALIZED VIEW andor_mv
-DISTRIBUTED BY HASH(lo_orderkey) BUCKETS 1
-PROPERTIES ('storage_engine' = 'iceberg')
-AS SELECT lo_orderkey, lo_linenumber, lo_revenue
+CREATE MATERIALIZED VIEW andor_mv AS SELECT lo_orderkey, lo_linenumber, lo_revenue
 FROM lineorder
 WHERE (lo_orderkey > 10003 OR lo_linenumber > 2) AND (lo_orderkey < 10006 OR lo_linenumber < 1);
 
 -- query 19
 -- @skip_result_check=true
-REFRESH MATERIALIZED VIEW andor_mv WITH SYNC MODE;
+REFRESH MATERIALIZED VIEW andor_mv;
 
 -- query 20
 -- exact AND-of-ORs match
@@ -174,7 +151,7 @@ SELECT lo_orderkey, lo_linenumber FROM lineorder
 WHERE (lo_orderkey > 10003 OR lo_linenumber > 2) AND (lo_orderkey < 10006 OR lo_linenumber < 1);
 
 -- query 21
-SELECT lo_orderkey, lo_linenumber, COUNT(*) AS c FROM lineorder
+SELECT lo_orderkey, lo_linenumber, COUNT() AS c FROM lineorder
 WHERE (lo_orderkey > 10003 OR lo_linenumber > 2) AND (lo_orderkey < 10006 OR lo_linenumber < 1)
 GROUP BY lo_orderkey, lo_linenumber ORDER BY lo_orderkey, lo_linenumber;
 
@@ -192,17 +169,14 @@ DROP MATERIALIZED VIEW IF EXISTS andor_mv;
 -- query 24
 -- `!=` residual MV (from test_materialized_view_union_all_rewrite MV-A/B)
 -- @skip_result_check=true
-CREATE MATERIALIZED VIEW ne_mv
-DISTRIBUTED BY HASH(lo_orderkey) BUCKETS 1
-PROPERTIES ('storage_engine' = 'iceberg')
-AS SELECT lo_orderkey, lo_linenumber, SUM(lo_revenue) AS s1
+CREATE MATERIALIZED VIEW ne_mv AS SELECT lo_orderkey, lo_linenumber, SUM(lo_revenue) AS s1
 FROM lineorder
 WHERE lo_linenumber != 2
 GROUP BY lo_orderkey, lo_linenumber;
 
 -- query 25
 -- @skip_result_check=true
-REFRESH MATERIALIZED VIEW ne_mv WITH SYNC MODE;
+REFRESH MATERIALIZED VIEW ne_mv;
 
 -- query 26
 -- exact != residual match with strict-subset rollup
@@ -250,12 +224,12 @@ DROP MATERIALIZED VIEW IF EXISTS ne_mv;
 -- query 34
 -- @cleanup=true
 -- @skip_result_check=true
-DROP TABLE IF EXISTS mvrw_${uuid0}.ns_${uuid0}.lineorder FORCE;
+DROP TABLE IF EXISTS mvrw_${uuid0}.ns_${uuid0}.lineorder ;
 
 -- query 35
 -- @cleanup=true
 -- @skip_result_check=true
-DROP DATABASE IF EXISTS mvrw_${uuid0}.ns_${uuid0};
+DROP SCHEMA IF EXISTS mvrw_${uuid0}.ns_${uuid0};
 
 -- query 36
 -- @cleanup=true

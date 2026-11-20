@@ -23,19 +23,11 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE DATABASE lake_publication_${suite_uuid0}.ns_${uuid0};
+CREATE SCHEMA lake_publication_${suite_uuid0}.ns_${uuid0};
 CREATE TABLE lake_publication_${suite_uuid0}.ns_${uuid0}.append_rows (
   id BIGINT, writer VARCHAR(16)
-) PARTITION BY (id) TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true",
-  "commit.manifest.target-size-bytes" = "1024",
-  "commit.retry.num-retries" = "3",
-  "commit.retry.min-wait-ms" = "0",
-  "commit.retry.max-wait-ms" = "0",
-  "commit.retry.total-timeout-ms" = "60000"
-);
-INSERT INTO lake_publication_${suite_uuid0}.ns_${uuid0}.append_rows VALUES (1, 'seed');
+) WITH (partitioning = ARRAY['id'], format_version = 3, max_commit_retry = 3, extra_properties = MAP(ARRAY['commit.manifest.target-size-bytes', 'commit.retry.min-wait-ms', 'commit.retry.max-wait-ms', 'commit.retry.total-timeout-ms'], ARRAY['1024', '0', '0', '60000']));
+INSERT INTO lake_publication_${suite_uuid0}.ns_${uuid0}.append_rows VALUES ROW(1, 'seed');
 
 -- query 2
 -- @result_contains=IRU5_APPEND_TRAFFIC_BASELINE_OK
@@ -58,10 +50,10 @@ PYTHON
 -- @publication_catalog_concurrent_shell=set -eu; tmp_sql=$(mktemp "${TMPDIR:-/tmp}/iru5-append-companion-XXXXXX.sql"); trap 'rm -f "$tmp_sql"' EXIT; printf '%s\n' "INSERT INTO ice_rest.ns_${uuid0}.append_rows VALUES (2, 'spark');" > "$tmp_sql"; "${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-sql.sh" "$tmp_sql"
 -- @skip_result_check=true
 INSERT INTO lake_publication_${suite_uuid0}.ns_${uuid0}.append_rows VALUES
-  (3, 'nova'), (4, 'nova'), (5, 'nova'), (6, 'nova'), (7, 'nova'), (8, 'nova'), (9, 'nova'), (10, 'nova'),
-  (11, 'nova'), (12, 'nova'), (13, 'nova'), (14, 'nova'), (15, 'nova'), (16, 'nova'), (17, 'nova'), (18, 'nova'),
-  (19, 'nova'), (20, 'nova'), (21, 'nova'), (22, 'nova'), (23, 'nova'), (24, 'nova'), (25, 'nova'), (26, 'nova'),
-  (27, 'nova'), (28, 'nova'), (29, 'nova'), (30, 'nova'), (31, 'nova'), (32, 'nova'), (33, 'nova'), (34, 'nova');
+  ROW(3, 'nova'), ROW(4, 'nova'), ROW(5, 'nova'), ROW(6, 'nova'), ROW(7, 'nova'), ROW(8, 'nova'), ROW(9, 'nova'), ROW(10, 'nova'),
+  ROW(11, 'nova'), ROW(12, 'nova'), ROW(13, 'nova'), ROW(14, 'nova'), ROW(15, 'nova'), ROW(16, 'nova'), ROW(17, 'nova'), ROW(18, 'nova'),
+  ROW(19, 'nova'), ROW(20, 'nova'), ROW(21, 'nova'), ROW(22, 'nova'), ROW(23, 'nova'), ROW(24, 'nova'), ROW(25, 'nova'), ROW(26, 'nova'),
+  ROW(27, 'nova'), ROW(28, 'nova'), ROW(29, 'nova'), ROW(30, 'nova'), ROW(31, 'nova'), ROW(32, 'nova'), ROW(33, 'nova'), ROW(34, 'nova');
 
 -- query 4
 SELECT id, writer FROM lake_publication_${suite_uuid0}.ns_${uuid0}.append_rows ORDER BY id;
@@ -128,4 +120,4 @@ printf '%s\n' "$spark_out" | grep -F IRU5_APPEND_REPREPARE_OK
 
 -- query 6
 -- @skip_result_check=true
-DROP DATABASE lake_publication_${suite_uuid0}.ns_${uuid0} FORCE;
+DROP SCHEMA lake_publication_${suite_uuid0}.ns_${uuid0} CASCADE;

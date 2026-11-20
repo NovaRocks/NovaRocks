@@ -25,7 +25,7 @@ use novarocks_native_adapter::FrontendNativeTransport;
 use novarocks_native_trust::{
     DeploymentId, NativeCallerSubject, NativeTransportMode, NativeTrust, ValidatedSharedSecret,
 };
-use novarocks_parser::parse as parse_typed_statement;
+use novarocks_parser::parser::parse_statement;
 use novarocks_query_application::view::{
     CreateExternalViewRequest, ResolvedExternalView, ViewColumnDefinition, ViewEngine,
     ViewRequestContext, ViewService, ViewStatementResult, ViewTarget,
@@ -181,12 +181,15 @@ fn execute_view_statement(
     sql: &str,
     context: ViewRequestContext<'_>,
 ) -> Result<ViewStatementResult, String> {
-    let statements = parse_typed_statement(sql).map_err(|error| error.to_string())?;
-    let [novarocks_parser::ast::Statement::View(statement)] = statements.as_slice() else {
-        return Err("expected typed View statement".to_string());
+    let novarocks_parser::ast::TrinoStatement::CreateView(statement) =
+        parse_statement(sql).map_err(|error| error.to_string())?
+    else {
+        return Err("expected typed CREATE VIEW statement".to_string());
     };
+    let command = novarocks_query_application::view::ViewCommand::trino_create(sql, &statement)
+        .map_err(|error| error.to_string())?;
     service
-        .execute_statement(engine, statement, context)
+        .execute_command(engine, command, context)
         .map_err(|error| error.to_string())
 }
 

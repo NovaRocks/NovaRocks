@@ -17,8 +17,8 @@
 
 use super::mv_recovery::control_plan::{self, FeLaunchIntent};
 use super::mv_uea7::{
-    ManagedMvRestFixture, assert_rows, execute, property, require_property, require_three_backends,
-    select_catalog_and_namespace, status, wait_for_status_phase,
+    ManagedMvRestFixture, assert_rows, execute, full_refresh_orders, property, require_property,
+    require_three_backends, select_catalog_and_namespace, status, wait_for_status_phase,
 };
 use super::mv_uea7::{mv_properties, mv_public_error, mv_text_lines};
 use crate::actors::sql::SqlSession;
@@ -129,7 +129,7 @@ impl Scenario for MvStorageContract {
             context,
             &mut conn,
             "create managed MV namespace",
-            &format!("CREATE DATABASE {CATALOG}.{NAMESPACE}"),
+            &format!("CREATE SCHEMA {CATALOG}.{NAMESPACE}"),
         )?;
         execute(
             context,
@@ -137,7 +137,7 @@ impl Scenario for MvStorageContract {
             "create row-lineage source table",
             &format!(
                 "CREATE TABLE {CATALOG}.{NAMESPACE}.orders (k1 INT, v2 BIGINT) \
-                 TBLPROPERTIES (\"format-version\"=\"3\", \"write.row-lineage\"=\"true\")"
+                 WITH (format_version = 3)"
             ),
         )?;
         execute(
@@ -156,9 +156,7 @@ impl Scenario for MvStorageContract {
             context,
             &mut conn,
             "create document-managed Iceberg MV without publishing",
-            "CREATE MATERIALIZED VIEW orders_mv DISTRIBUTED BY HASH(k1) BUCKETS 1 \
-             REFRESH DEFERRED MANUAL PROPERTIES ('storage_engine' = 'iceberg') \
-             AS SELECT k1, SUM(v2) AS total FROM orders GROUP BY k1",
+            "CREATE MATERIALIZED VIEW orders_mv WITH (refresh_policy = 'MANUAL') AS SELECT k1, SUM(v2) AS total FROM orders GROUP BY k1",
         )?;
         context.action("verify CREATE wrote table-level D/L/C and no snapshot or P to REST");
         let created = load_graph(context, &rest_uri, 0)?;
@@ -167,7 +165,7 @@ impl Scenario for MvStorageContract {
             context,
             &mut conn,
             "publish the first exact MV output",
-            "REFRESH MATERIALIZED VIEW orders_mv WITH SYNC MODE",
+            "REFRESH MATERIALIZED VIEW orders_mv",
         )?;
         context.action("verify first P binds its exact snapshot and table-level D/L revisions");
         let first = load_graph(context, &rest_uri, 1)?;
@@ -233,7 +231,7 @@ impl Scenario for MvStorageContract {
         );
         select_catalog_and_namespace(context, &mut conn, CATALOG)?;
         context.action("verify refresh remains closed until an operator declaration");
-        let error = match conn.execute("REFRESH MATERIALIZED VIEW orders_mv WITH SYNC MODE") {
+        let error = match conn.execute("REFRESH MATERIALIZED VIEW orders_mv") {
             Err(error) => error,
             Ok(_) => bail!(
                 "restarted FE refreshed the MV before management readmission; {}",
@@ -268,11 +266,10 @@ impl Scenario for MvStorageContract {
             "insert source changes after management readmission",
             "INSERT INTO orders VALUES (1, 5), (2, 7)",
         )?;
-        execute(
+        full_refresh_orders(
             context,
             &mut conn,
             "publish a second exact MV output through FULL refresh",
-            "REFRESH MATERIALIZED VIEW orders_mv FULL WITH SYNC MODE",
         )?;
         assert_rows(
             context,

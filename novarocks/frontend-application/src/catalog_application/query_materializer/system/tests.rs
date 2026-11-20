@@ -47,10 +47,7 @@ impl QueryTableBindingLoader for NoTableLoader {
 }
 
 fn query(sql: &str) -> novarocks_parser::ast::Query {
-    let statements = novarocks_parser::parse(sql).unwrap();
-    let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
-        panic!("query fixture");
-    };
+    let query = novarocks_parser::parser::parse_query(sql).unwrap();
     query.clone()
 }
 fn preparation(sql: &str) -> SqlCapturedCatalogPreparation {

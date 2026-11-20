@@ -604,12 +604,13 @@ fn single_array_agg_original_nonzero_cv_and_order_keep_backing_field_and_policy(
 fn single_nested_and_elided_cast_constants_remain_original_none_requests() {
     for argument in [
         TypedExpr {
-            kind: ExprKind::Nested(Box::new(integer(7))),
+            kind: ExprKind::Nested(novarocks_parser::ast::AstBox::new(integer(7))),
             value_type: ValueType::new(DataType::Int64, false),
         },
         TypedExpr {
             kind: ExprKind::Cast {
-                expr: Box::new(integer(9)),
+                array_failure_mode: None,
+                expr: novarocks_parser::ast::AstBox::new(integer(9)),
                 target: DataType::Int64,
                 decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
             },

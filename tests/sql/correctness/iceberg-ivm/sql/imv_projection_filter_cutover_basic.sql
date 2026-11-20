@@ -45,54 +45,32 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE EXTERNAL CATALOG ice_pfcut_${uuid0}
-PROPERTIES (
-  "type" = "iceberg",
-  "iceberg.catalog.type" = "rest",
-  "uri" = "${iceberg_rest_uri}",
-  "warehouse" = "${iceberg_rest_warehouse}",
-  "aws.s3.endpoint" = "${oss_endpoint}",
-  "credential.object-store-metadata.consumer-role" = "frontend",
-  "credential.object-store-metadata.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-metadata.name" = "${iceberg_object_store_metadata_credential_name}",
-  "credential.object-store-metadata.generation" = "${iceberg_object_store_credential_generation}",
-  "credential.object-store-data.consumer-role" = "backend",
-  "credential.object-store-data.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-data.name" = "${iceberg_object_store_data_credential_name}",
-  "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
-  "aws.s3.region" = "${oss_region}",
-  "aws.s3.enable_path_style_access" = "${oss_path_style}"
-);
-CREATE DATABASE ice_pfcut_${uuid0}.ns_${uuid0};
+CREATE CATALOG ice_pfcut_${uuid0} USING iceberg WITH ("iceberg.catalog.type" = 'rest', "uri" = '${iceberg_rest_uri}', "warehouse" = '${iceberg_rest_warehouse}', "aws.s3.endpoint" = '${oss_endpoint}', "credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-metadata.name" = '${iceberg_object_store_metadata_credential_name}', "credential.object-store-metadata.generation" = '${iceberg_object_store_credential_generation}', "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-data.name" = '${iceberg_object_store_data_credential_name}', "credential.object-store-data.generation" = '${iceberg_object_store_credential_generation}', "aws.s3.region" = '${oss_region}', "aws.s3.enable_path_style_access" = '${oss_path_style}');
+CREATE SCHEMA ice_pfcut_${uuid0}.ns_${uuid0};
 CREATE TABLE ice_pfcut_${uuid0}.ns_${uuid0}.orders (
   k1 INT,
   v2 BIGINT
-)
-TBLPROPERTIES ("format-version" = "3",
-  "write.row-lineage" = "true");
+) WITH (format_version = 3);
 INSERT INTO ice_pfcut_${uuid0}.ns_${uuid0}.orders VALUES
-  (1, 10), (1, 20), (2, 40), (3, 0);
+  ROW(1, 10), ROW(1, 20), ROW(2, 40), ROW(3, 0);
 
 -- query 2
 -- @skip_result_check=true
 USE ice_pfcut_${uuid0}.ns_${uuid0};
 
-CREATE MATERIALIZED VIEW proj_mv
-DISTRIBUTED BY HASH(k1) BUCKETS 2
-PROPERTIES ('storage_engine' = 'iceberg')
-AS SELECT k1, v2 FROM orders WHERE v2 > 0;
+CREATE MATERIALIZED VIEW proj_mv AS SELECT k1, v2 FROM orders WHERE v2 > 0;
 
 -- query 3
 -- First (full) REFRESH.
 -- @skip_result_check=true
-REFRESH MATERIALIZED VIEW proj_mv WITH SYNC MODE;
+REFRESH MATERIALIZED VIEW proj_mv;
 
 -- query 4
 -- Delta + incremental REFRESH (the PF cutover path).
 -- @skip_result_check=true
 INSERT INTO ice_pfcut_${uuid0}.ns_${uuid0}.orders VALUES
-  (1, 70), (4, 5), (5, -1);
-REFRESH MATERIALIZED VIEW proj_mv WITH SYNC MODE;
+  ROW(1, 70), ROW(4, 5), ROW(5, -1);
+REFRESH MATERIALIZED VIEW proj_mv;
 
 -- query 5
 -- Correctness + internal-column hygiene. The PF cutover must yield
@@ -125,13 +103,13 @@ SELECT k1, v2 FROM orders LIMIT 1;
 -- Snapshot 0 is not a real revision of this table, so the request must fail
 -- closed rather than yielding a plan that looks executable.
 -- @expect_error=iceberg snapshot 0 does not exist
-EXPLAIN VERBOSE SELECT k1, v2 FROM __nr_ivm_delta('ice_pfcut_${uuid0}.ns_${uuid0}.orders', 0, 0) WHERE v2 > 0;
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'  SELECT k1, v2 FROM TABLE(__nr_ivm_delta('ice_pfcut_${uuid0}.ns_${uuid0}.orders', 0, 0)) WHERE v2 > 0;
 
 -- query 8
 -- @cleanup=true
 -- Cleanup.
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW proj_mv;
-DROP TABLE ice_pfcut_${uuid0}.ns_${uuid0}.orders FORCE;
-DROP DATABASE ice_pfcut_${uuid0}.ns_${uuid0};
+DROP TABLE ice_pfcut_${uuid0}.ns_${uuid0}.orders ;
+DROP SCHEMA ice_pfcut_${uuid0}.ns_${uuid0};
 DROP CATALOG ice_pfcut_${uuid0};

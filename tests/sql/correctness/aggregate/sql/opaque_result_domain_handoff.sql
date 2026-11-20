@@ -31,5 +31,4 @@ SELECT [to_bitmap(1), NULL] AS bitmap_values,
 
 -- query 4
 -- @expect_error=CTAS source contains an unsupported internal opaque value domain
-CREATE TABLE ${case_db}.private_percentile_state AS
-SELECT percentile_hash(CAST(1 AS DOUBLE)) AS state;
+CREATE TABLE ${case_db}.private_percentile_state AS SELECT percentile_hash(CAST(1 AS DOUBLE)) AS state;

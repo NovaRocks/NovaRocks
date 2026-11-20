@@ -27,22 +27,20 @@
 -- query 1
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t0 (
-  `c0` int(11) NULL COMMENT "",
-  `c1` varchar(20) NULL COMMENT "",
-  `c2` varchar(200) NULL COMMENT "",
-  `c3` int(11) NULL COMMENT ""
-)
-TBLPROPERTIES ("format-version" = "3");
+  "c0" int(11),
+  "c1" varchar(20),
+  "c2" varchar(200),
+  "c3" int(11)
+) WITH (format_version = 3);
 
 -- query 2
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t1 (
-  `c0` int(11) NULL COMMENT "",
-  `c1` varchar(20) NULL COMMENT "",
-  `c2` varchar(200) NULL COMMENT "",
-  `c3` int(11) NULL COMMENT ""
-)
-TBLPROPERTIES ("format-version" = "3");
+  "c0" int(11),
+  "c1" varchar(20),
+  "c2" varchar(200),
+  "c3" int(11)
+) WITH (format_version = 3);
 
 -- query 3
 -- @skip_result_check=true
@@ -50,7 +48,7 @@ INSERT INTO ${case_db}.t0 SELECT generate_series, generate_series, generate_seri
 
 -- query 4
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t0 VALUES (null, null, null, null);
+INSERT INTO ${case_db}.t0 VALUES ROW(null, null, null, null);
 
 -- query 5
 -- @skip_result_check=true

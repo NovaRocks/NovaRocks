@@ -29,22 +29,20 @@ DROP TABLE IF EXISTS ${case_db}.t_rf_anti_join_not_exists_r;
 CREATE TABLE ${case_db}.t_rf_anti_join_not_exists_l (
     id INT,
     k INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 CREATE TABLE ${case_db}.t_rf_anti_join_not_exists_r (
     k INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t_rf_anti_join_not_exists_l VALUES
-    (1, 10),
-    (2, 20),
-    (3, 30),
-    (4, NULL);
+    ROW(1, 10),
+    ROW(2, 20),
+    ROW(3, 30),
+    ROW(4, NULL);
 
 INSERT INTO ${case_db}.t_rf_anti_join_not_exists_r VALUES
-    (20),
-    (40);
+    ROW(20),
+    ROW(40);
 
 SELECT l.id, l.k
 FROM ${case_db}.t_rf_anti_join_not_exists_l l

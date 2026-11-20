@@ -39,8 +39,7 @@ fn syntax(
     sql: &str,
     target: RequiredConstantTarget,
 ) -> Result<PreparedRequiredConstant, SqlCompileError> {
-    let tokens = novarocks_parser::lex(sql).unwrap();
-    let expression = novarocks_parser::parser::parse_expression(sql, &tokens).unwrap();
+    let expression = novarocks_parser::parser::parse_expression(sql).unwrap();
     prepare(RequiredConstantRequest {
         input: RequiredConstantInput::Expression(&expression),
         target,
@@ -251,8 +250,8 @@ fn required_preparation_does_not_fold_and_preserves_original_publication_source(
         SqlCompileControl::unbounded().with_fold_dependency_observer(Arc::new(RejectPublication {
             cause: CompileControlError::Source(source.clone()),
         }));
-    let tokens = novarocks_parser::lex("1 + 2").unwrap();
-    let expression = novarocks_parser::parser::parse_expression("1 + 2", &tokens).unwrap();
+
+    let expression = novarocks_parser::parser::parse_expression("1 + 2").unwrap();
     let result = prepare(RequiredConstantRequest {
         input: RequiredConstantInput::Expression(&expression),
         target: RequiredConstantTarget::Integer,
@@ -321,6 +320,172 @@ fn required_implicit_coercion_uses_semantic_kind_not_encoded_layout() {
             validate_implicit_target(&source, RequiredConstantTarget::Double, Span::new(0, 0))
                 .is_ok()
         );
+    }
+}
+
+#[test]
+fn required_array_varchar_uses_the_whole_expression_author() {
+    for sql in [
+        "ARRAY['a', 'b']",
+        "ARRAY['a', NULL]",
+        "ARRAY[]",
+        "ARRAY[NULL]",
+        "NULL",
+        "IF(TRUE, ARRAY['a'], ARRAY['b'])",
+    ] {
+        let prepared = syntax(sql, RequiredConstantTarget::ArrayVarchar)
+            .unwrap_or_else(|error| panic!("{sql}: {error}"));
+        let ValueKind::List(child) = prepared.value_type().value_type().kind() else {
+            panic!("{sql}: a declared List result")
+        };
+        assert!(matches!(child.kind(), ValueKind::String), "{sql}");
+        assert!(child.nullable(), "{sql}");
+        let DataType::List(field) = prepared.value_type().data_type() else {
+            panic!()
+        };
+        assert_eq!(field.name(), "item");
+        assert_eq!(field.data_type(), &DataType::Utf8);
+        assert!(field.is_nullable());
+        assert_eq!(prepared.value_type().nullable(), sql == "NULL", "{sql}");
+        let source = prepared.source();
+        assert!(source.unit().ports().is_empty());
+        assert_eq!(source.unit().roots().len(), 1);
+        let root = source.unit().root(source.root()).unwrap();
+        assert_eq!(
+            root.scope,
+            novarocks_expression_contract::RootScope::AllPorts
+        );
+        assert_eq!(
+            root.demand,
+            novarocks_type_contract::EvaluationDemand::Value
+        );
+        assert_eq!(
+            &source.unit().definition(root.definition).unwrap().ty,
+            prepared.value_type()
+        );
+    }
+    for sql in [
+        "ARRAY[1]",
+        "ARRAY[TRUE]",
+        "ARRAY[JSON '1']",
+        "ARRAY[ARRAY['a']]",
+        "'not an array'",
+    ] {
+        assert!(
+            syntax(sql, RequiredConstantTarget::ArrayVarchar).is_err(),
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn required_array_varchar_identity_keeps_the_complete_original_binding() {
+    for root_nullable in [false, true] {
+        for child_nullable in [false, true] {
+            let original = FunctionValueType::new(
+                DataType::List(Arc::new(arrow::datatypes::Field::new(
+                    "item",
+                    DataType::Utf8,
+                    child_nullable,
+                ))),
+                root_nullable,
+            );
+            validate_implicit_target(
+                &original,
+                RequiredConstantTarget::ArrayVarchar,
+                Span::new(7, 17),
+            )
+            .unwrap();
+            let target = required_target_value_type(
+                &original,
+                RequiredConstantTarget::ArrayVarchar,
+                &SqlCompileControl::unbounded(),
+            )
+            .unwrap();
+            assert_eq!(target, original);
+            assert!(target.value_type().shares_storage(original.value_type()));
+            assert!(
+                target
+                    .typed_binding()
+                    .layout()
+                    .shares_storage(original.typed_binding().layout())
+            );
+            assert_eq!(target.child_at(0).unwrap().nullable(), child_nullable);
+            assert_eq!(target.nullable(), root_nullable);
+        }
+    }
+    assert_eq!(
+        RequiredConstantTarget::ArrayVarchar.scalar_data_type(),
+        None
+    );
+    assert_eq!(
+        RequiredConstantTarget::Varchar.scalar_data_type(),
+        Some(DataType::Utf8)
+    );
+}
+
+#[test]
+fn required_array_target_checks_semantic_children_before_carrier_casts() {
+    use novarocks_type_contract::{
+        ValueLayout, ValueLogicalType, ValueTypeRef, ValueTypeStorageLifetime,
+    };
+    for child_kind in [
+        ValueKind::Nominal(ValueLogicalType::Json),
+        ValueKind::Scalar(DataType::Int32),
+    ] {
+        let child_carrier = if matches!(&child_kind, ValueKind::Scalar(DataType::Int32)) {
+            DataType::Int32
+        } else {
+            DataType::Utf8
+        };
+        let storage = ValueTypeStorageLifetime::pure();
+        let child = ValueTypeRef::try_new(child_kind, true, storage.clone()).unwrap();
+        let value = ValueTypeRef::try_new(ValueKind::List(child), false, storage.clone()).unwrap();
+        let layout = ValueLayout::try_new(
+            &DataType::List(Arc::new(arrow::datatypes::Field::new(
+                "item",
+                child_carrier,
+                true,
+            ))),
+            storage,
+        )
+        .unwrap();
+        let original = FunctionValueType::try_from_value(value, layout).unwrap();
+        assert!(
+            validate_implicit_target(
+                &original,
+                RequiredConstantTarget::ArrayVarchar,
+                Span::new(7, 17),
+            )
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn required_array_unknown_declaration_preserves_original_control_cause() {
+    use novarocks_type_contract::CompileControlError;
+    struct Stop(CompileControlError);
+    impl PureCompileControl for Stop {
+        fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
+            Err(self.0.clone())
+        }
+    }
+    let original = FunctionValueType::new(DataType::Null, true);
+    for cause in [
+        CompileControlError::Cancelled,
+        CompileControlError::ResourceExhausted,
+        CompileControlError::Source(novarocks_failure_contract::SharedFailureCause::new(
+            novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic,
+        )),
+    ] {
+        let error = required_target_value_type(
+            &original,
+            RequiredConstantTarget::ArrayVarchar,
+            &Stop(cause.clone()),
+        )
+        .unwrap_err();
+        assert_eq!(error.control_error(), Some(cause));
     }
 }
 

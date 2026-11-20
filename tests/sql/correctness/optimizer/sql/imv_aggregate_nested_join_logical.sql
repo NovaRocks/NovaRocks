@@ -27,63 +27,33 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE EXTERNAL CATALOG imv_anj_cut_${uuid0}
-PROPERTIES (
-  "type" = "iceberg",
-  "iceberg.catalog.type" = "rest",
-  "uri" = "${iceberg_rest_uri}",
-  "warehouse" = "${iceberg_rest_warehouse}",
-  "aws.s3.endpoint" = "${oss_endpoint}",
-  "credential.object-store-metadata.consumer-role" = "frontend",
-  "credential.object-store-metadata.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-metadata.name" = "${iceberg_object_store_metadata_credential_name}",
-  "credential.object-store-metadata.generation" = "${iceberg_object_store_credential_generation}",
-  "credential.object-store-data.consumer-role" = "backend",
-  "credential.object-store-data.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-data.name" = "${iceberg_object_store_data_credential_name}",
-  "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
-  "aws.s3.region" = "${oss_region}",
-  "aws.s3.enable_path_style_access" = "${oss_path_style}"
-);
-CREATE DATABASE imv_anj_cut_${uuid0}.ns_${uuid0};
+CREATE CATALOG imv_anj_cut_${uuid0} USING iceberg WITH ("iceberg.catalog.type" = 'rest', "uri" = '${iceberg_rest_uri}', "warehouse" = '${iceberg_rest_warehouse}', "aws.s3.endpoint" = '${oss_endpoint}', "credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-metadata.name" = '${iceberg_object_store_metadata_credential_name}', "credential.object-store-metadata.generation" = '${iceberg_object_store_credential_generation}', "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-data.name" = '${iceberg_object_store_data_credential_name}', "credential.object-store-data.generation" = '${iceberg_object_store_credential_generation}', "aws.s3.region" = '${oss_region}', "aws.s3.enable_path_style_access" = '${oss_path_style}');
+CREATE SCHEMA imv_anj_cut_${uuid0}.ns_${uuid0};
 CREATE TABLE imv_anj_cut_${uuid0}.ns_${uuid0}.fact (
   id BIGINT NOT NULL,
   dim_id BIGINT,
   amount BIGINT
-) TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
-);
+) WITH (format_version = 3);
 CREATE TABLE imv_anj_cut_${uuid0}.ns_${uuid0}.dim (
   id BIGINT NOT NULL,
   region_id BIGINT
-) TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
-);
+) WITH (format_version = 3);
 CREATE TABLE imv_anj_cut_${uuid0}.ns_${uuid0}.dim2 (
   id BIGINT NOT NULL,
   region STRING
-) TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
-);
+) WITH (format_version = 3);
 INSERT INTO imv_anj_cut_${uuid0}.ns_${uuid0}.dim2 VALUES
-  (100, 'east'),
-  (200, 'west');
+  ROW(100, 'east'),
+  ROW(200, 'west');
 INSERT INTO imv_anj_cut_${uuid0}.ns_${uuid0}.dim VALUES
-  (10, 100),
-  (20, 200);
+  ROW(10, 100),
+  ROW(20, 200);
 INSERT INTO imv_anj_cut_${uuid0}.ns_${uuid0}.fact VALUES
-  (1, 10, 100),
-  (2, 10, 200),
-  (3, 20, 50);
+  ROW(1, 10, 100),
+  ROW(2, 10, 200),
+  ROW(3, 20, 50);
 USE imv_anj_cut_${uuid0}.ns_${uuid0};
-CREATE MATERIALIZED VIEW agg_nested_join_mv_${uuid0}
-DISTRIBUTED BY HASH(region) BUCKETS 1
-PROPERTIES ('storage_engine' = 'iceberg')
-AS
-SELECT d2.region, COUNT(*) AS c, SUM(f.amount) AS s
+CREATE MATERIALIZED VIEW agg_nested_join_mv_${uuid0} AS SELECT d2.region, COUNT(*) AS c, SUM(f.amount) AS s
 FROM fact AS f
 JOIN dim AS d ON f.dim_id = d.id
 JOIN dim2 AS d2 ON d.region_id = d2.id
@@ -99,12 +69,12 @@ REFRESH MATERIALIZED VIEW agg_nested_join_mv_${uuid0};
 -- and outer join-delta branches over pinned version scans.
 -- @skip_result_check=true
 INSERT INTO imv_anj_cut_${uuid0}.ns_${uuid0}.dim2 VALUES
-  (300, 'north');
+  ROW(300, 'north');
 INSERT INTO imv_anj_cut_${uuid0}.ns_${uuid0}.dim VALUES
-  (30, 300);
+  ROW(30, 300);
 INSERT INTO imv_anj_cut_${uuid0}.ns_${uuid0}.fact VALUES
-  (4, 20, 80),
-  (5, 30, 40);
+  ROW(4, 20, 80),
+  ROW(5, 30, 40);
 
 -- query 4
 -- @skip_result_check=true
@@ -120,8 +90,8 @@ EXPLAIN REFRESH MATERIALIZED VIEW agg_nested_join_mv_${uuid0};
 -- @skip_result_check=true
 USE imv_anj_cut_${uuid0}.ns_${uuid0};
 DROP MATERIALIZED VIEW IF EXISTS ns_${uuid0}.agg_nested_join_mv_${uuid0};
-DROP TABLE IF EXISTS imv_anj_cut_${uuid0}.ns_${uuid0}.fact FORCE;
-DROP TABLE IF EXISTS imv_anj_cut_${uuid0}.ns_${uuid0}.dim FORCE;
-DROP TABLE IF EXISTS imv_anj_cut_${uuid0}.ns_${uuid0}.dim2 FORCE;
-DROP DATABASE IF EXISTS imv_anj_cut_${uuid0}.ns_${uuid0};
+DROP TABLE IF EXISTS imv_anj_cut_${uuid0}.ns_${uuid0}.fact ;
+DROP TABLE IF EXISTS imv_anj_cut_${uuid0}.ns_${uuid0}.dim ;
+DROP TABLE IF EXISTS imv_anj_cut_${uuid0}.ns_${uuid0}.dim2 ;
+DROP SCHEMA IF EXISTS imv_anj_cut_${uuid0}.ns_${uuid0};
 DROP CATALOG IF EXISTS imv_anj_cut_${uuid0};

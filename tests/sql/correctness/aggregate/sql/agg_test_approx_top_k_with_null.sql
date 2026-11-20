@@ -27,9 +27,8 @@ USE ${case_db};
 -- @skip_result_check=true
 USE ${case_db};
 CREATE TABLE __row_util_base (
-  k1 bigint NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+  k1 bigint
+) WITH (format_version = 3);
 
 -- query 3
 -- @skip_result_check=true
@@ -44,9 +43,8 @@ insert into __row_util_base select * from __row_util_base; -- 4000
 insert into __row_util_base select * from __row_util_base; -- 8000
 insert into __row_util_base select * from __row_util_base; -- 16000
 CREATE TABLE __row_util (
-  idx bigint NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+  idx bigint
+) WITH (format_version = 3);
 
 -- query 5
 -- @skip_result_check=true
@@ -57,11 +55,10 @@ insert into __row_util select row_number() over() as idx from __row_util_base;
 -- @skip_result_check=true
 USE ${case_db};
 CREATE TABLE t1 (
-  k1 bigint NULL,
-  c1 bigint NULL,
-  c2 int NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+  k1 bigint ,
+  c1 bigint ,
+  c2 int
+) WITH (format_version = 3);
 
 -- query 7
 -- @skip_result_check=true
@@ -112,11 +109,10 @@ select c1, array_sortby((x) -> x.item, x) from w1 order by c1;
 -- @skip_result_check=true
 USE ${case_db};
 CREATE TABLE t2 (
-  k1 bigint NULL,
-  c1 bigint NULL,
-  c2 int NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+  k1 bigint ,
+  c1 bigint ,
+  c2 int
+) WITH (format_version = 3);
 
 -- query 17
 -- @skip_result_check=true

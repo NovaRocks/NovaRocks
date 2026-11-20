@@ -42,7 +42,7 @@ fn upper_call(argument: TypedExpr) -> TypedExpr {
     TypedExpr {
         kind: ExprKind::FunctionCall {
             name: "upper".into(),
-            args: vec![argument],
+            args: (vec![argument]).into(),
             distinct: false,
             binding: SqlFunctionBinding::new(resolved, DecimalOverflowPolicy::ReportError),
             volatility,
@@ -287,12 +287,13 @@ fn canonical_scalar_nested_upper_consumes_lower_actual_nullable_result_once() {
 fn canonical_scalar_original_none_survives_nested_and_identity_cast_constant_children() {
     for child in [
         TypedExpr {
-            kind: ExprKind::Nested(Box::new(text("ABC"))),
+            kind: ExprKind::Nested(novarocks_parser::ast::AstBox::new(text("ABC"))),
             value_type: ValueType::new(DataType::Utf8, false),
         },
         TypedExpr {
             kind: ExprKind::Cast {
-                expr: Box::new(text("ABC")),
+                array_failure_mode: None,
+                expr: novarocks_parser::ast::AstBox::new(text("ABC")),
                 target: DataType::Utf8,
                 decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
             },

@@ -17,9 +17,11 @@
 
 //! Exact submission data derived from already selected, resolved SQL inputs.
 use crate::parser::{MV_DOCUMENT_OBSERVATION_TAG, validate_test_capability_tags};
-use crate::session::split_sql_statements;
+use crate::session::split_trino_sql_statements;
+use crate::session::split_trino_step_sql;
 use anyhow::{Context, Result, bail, ensure};
-use novarocks_parser::ast::{LiteralKind, MaintenanceStatement, MaintenanceValue, Statement};
+use novarocks_parser::ast::{Expr, LiteralKind, TrinoStatement};
+use novarocks_parser::parser::parse_statement;
 use sha2::{Digest, Sha256};
 
 #[derive(Clone, Debug)]
@@ -43,6 +45,7 @@ impl PlannedSubmission {
 pub(crate) fn plan_submissions(
     prefix: &str,
     sql: &str,
+    expected_error: Option<&crate::types::TrinoErrorExpectation>,
     outer_attempts: usize,
 ) -> Result<Vec<PlannedSubmission>> {
     ensure!(
@@ -57,7 +60,7 @@ pub(crate) fn plan_submissions(
                 .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'),
         "invalid control target prefix"
     );
-    let statements = split_sql_statements(sql)?;
+    let statements = split_trino_step_sql(sql, expected_error)?;
     ensure!(
         !statements.is_empty(),
         "controlled SQL has no submitted statement"
@@ -113,14 +116,15 @@ pub(crate) fn tagged_mv_document_demands(
         return Ok(vec![]);
     }
     let mut demands = Vec::new();
-    for statement in novarocks_parser::parse(sql)
-        .map_err(|error| anyhow::anyhow!("decode explicitly tagged MV document CALL: {error}"))?
-    {
-        let Statement::Maintenance(MaintenanceStatement::Call(call)) = statement else {
+    for piece in split_trino_sql_statements(sql)? {
+        let statement = parse_statement(&piece).map_err(|error| {
+            anyhow::anyhow!("decode explicitly tagged MV document CALL: {error}")
+        })?;
+        let TrinoStatement::Call(call) = statement else {
             continue;
         };
         let names = call
-            .procedure
+            .name
             .parts
             .iter()
             .map(|part| part.value.as_str())
@@ -132,20 +136,25 @@ pub(crate) fn tagged_mv_document_demands(
             "MV document observation tag names an unsupported or unqualified procedure"
         );
         let mut arguments = std::collections::BTreeMap::new();
-        for argument in call.arguments {
+        for argument in &call.arguments {
             let name = argument
                 .name
+                .as_ref()
                 .context("MV document observation requires named literal arguments")?
                 .value
                 .to_ascii_lowercase();
-            let MaintenanceValue::Literal(value) = argument.value else {
+            let Expr::Literal(value) = &argument.value else {
                 bail!("MV document target argument is not a literal")
             };
-            let LiteralKind::String(value) = value.kind else {
+            ensure!(
+                argument.span.end() == value.span.end(),
+                "MV document target argument must be a direct string literal"
+            );
+            let LiteralKind::String(value) = &value.kind else {
                 bail!("MV document target argument is not a string")
             };
             ensure!(
-                arguments.insert(name, value).is_none(),
+                arguments.insert(name, value.as_str()).is_none(),
                 "MV document CALL repeats an argument"
             );
         }
@@ -160,7 +169,7 @@ pub(crate) fn tagged_mv_document_demands(
             .get("level")
             .context("MV document CALL omitted its level")?;
         ensure!(
-            matches!(level.as_str(), "baseline" | "package" | "provenance"),
+            matches!(*level, "baseline" | "package" | "provenance"),
             "MV document tag cannot authorize destructive or unknown rebuild levels"
         );
         let parts = table.split('.').collect::<Vec<_>>();
@@ -172,7 +181,7 @@ pub(crate) fn tagged_mv_document_demands(
             catalog: names[0].to_owned(),
             namespace: parts[0].to_owned(),
             mv: parts[1].to_owned(),
-            level: level.clone(),
+            level: (*level).to_owned(),
         });
     }
     ensure!(
@@ -188,8 +197,8 @@ mod tests {
     #[test]
     fn exact_submission_slots_distinguish_statement_and_retry_and_reject_changed_sql() {
         let sql = "SET @x=1; SELECT /*+ SET_VAR(query_timeout=9) */ ';' AS x";
-        let submitted = split_sql_statements(sql).unwrap();
-        let targets = plan_submissions("selected", sql, 2).unwrap();
+        let submitted = split_trino_step_sql(sql, None).unwrap();
+        let targets = plan_submissions("selected", sql, None, 2).unwrap();
         assert_eq!(targets.len(), 8);
         assert_eq!(
             targets
@@ -205,12 +214,12 @@ mod tests {
                 .unwrap();
             assert!(target.validate_sql("SELECT unrelated").is_err());
         }
-        assert!(plan_submissions("selected", sql, 0).is_err());
-        assert!(plan_submissions("selected", sql, usize::MAX).is_err());
+        assert!(plan_submissions("selected", sql, None, 0).is_err());
+        assert!(plan_submissions("selected", sql, None, usize::MAX).is_err());
     }
     #[test]
     fn explicit_mv_tag_resolves_only_literal_observation_targets_and_never_wipe() {
-        let sql = "USE c.n; CALL c.system.novarocks_imv_stateless_rebuild(table => 'n.m', level => 'package'); CALL c.system.novarocks_imv_stateless_rebuild(table => 'n.m', level => 'provenance')";
+        let sql = "USE c.n; CALL c.system.novarocks_imv_stateless_rebuild(\"table\" => 'n.m', level => 'package'); CALL c.system.novarocks_imv_stateless_rebuild(\"table\" => 'n.m', level => 'provenance')";
         assert!(
             tagged_mv_document_demands(&["regression".into()], sql)
                 .unwrap()
@@ -232,7 +241,7 @@ mod tests {
         assert!(
             tagged_mv_document_demands(
                 &tags,
-                "CALL c.system.novarocks_imv_stateless_rebuild(table => 'n.m', level => 'full')"
+                "CALL c.system.novarocks_imv_stateless_rebuild(\"table\" => 'n.m', level => 'full')"
             )
             .is_err()
         );
@@ -240,7 +249,7 @@ mod tests {
         assert!(
             tagged_mv_document_demands(
                 &tags,
-                "CALL system.novarocks_imv_stateless_rebuild(table => 'm', level => 'package')"
+                "CALL system.novarocks_imv_stateless_rebuild(\"table\" => 'm', level => 'package')"
             )
             .is_err()
         );

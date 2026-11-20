@@ -23,16 +23,16 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE DATABASE lake_publication_${suite_uuid0}.ns_${uuid0};
+CREATE SCHEMA lake_publication_${suite_uuid0}.ns_${uuid0};
 CREATE TABLE lake_publication_${suite_uuid0}.ns_${uuid0}.delete_rows (
   id BIGINT, value BIGINT
-) TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true", "commit.retry.num-retries" = "3", "commit.retry.min-wait-ms" = "0", "commit.retry.max-wait-ms" = "0");
+) WITH (format_version = 3, max_commit_retry = 3, extra_properties = MAP(ARRAY['commit.retry.min-wait-ms', 'commit.retry.max-wait-ms'], ARRAY['0', '0']));
 CREATE TABLE lake_publication_${suite_uuid0}.ns_${uuid0}.optimize_rows (
   id BIGINT, value BIGINT
-) TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true", "commit.retry.num-retries" = "3", "commit.retry.min-wait-ms" = "0", "commit.retry.max-wait-ms" = "0");
-INSERT INTO lake_publication_${suite_uuid0}.ns_${uuid0}.delete_rows VALUES (1, 10), (2, 20);
-INSERT INTO lake_publication_${suite_uuid0}.ns_${uuid0}.optimize_rows VALUES (1, 10);
-INSERT INTO lake_publication_${suite_uuid0}.ns_${uuid0}.optimize_rows VALUES (2, 20);
+) WITH (format_version = 3, max_commit_retry = 3, extra_properties = MAP(ARRAY['commit.retry.min-wait-ms', 'commit.retry.max-wait-ms'], ARRAY['0', '0']));
+INSERT INTO lake_publication_${suite_uuid0}.ns_${uuid0}.delete_rows VALUES ROW(1, 10), ROW(2, 20);
+INSERT INTO lake_publication_${suite_uuid0}.ns_${uuid0}.optimize_rows VALUES ROW(1, 10);
+INSERT INTO lake_publication_${suite_uuid0}.ns_${uuid0}.optimize_rows VALUES ROW(2, 20);
 
 -- query 2
 -- @result_contains=IRU5_READ_TRAFFIC_BASELINE_OK
@@ -63,7 +63,7 @@ SELECT id, value FROM lake_publication_${suite_uuid0}.ns_${uuid0}.delete_rows OR
 -- @publication_catalog_fault=table-commit,before-requirement-check-hold-for-concurrent-shell
 -- @publication_catalog_concurrent_shell=set -eu; tmp_sql=$(mktemp "${TMPDIR:-/tmp}/iru5-optimize-companion-XXXXXX.sql"); trap 'rm -f "$tmp_sql"' EXIT; printf '%s\n' "INSERT INTO ice_rest.ns_${uuid0}.optimize_rows VALUES (3, 30);" > "$tmp_sql"; "${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-sql.sh" "$tmp_sql"
 -- @expect_error=dependency: RefUnchanged
-ALTER TABLE lake_publication_${suite_uuid0}.ns_${uuid0}.optimize_rows OPTIMIZE;
+ALTER TABLE lake_publication_${suite_uuid0}.ns_${uuid0}.optimize_rows EXECUTE optimize;
 
 -- query 6
 SELECT id, value FROM lake_publication_${suite_uuid0}.ns_${uuid0}.optimize_rows ORDER BY id;
@@ -119,4 +119,4 @@ printf '%s\n' "$spark_out" | grep -F IRU5_READ_DEPENDENCY_CONFLICT_OK
 
 -- query 8
 -- @skip_result_check=true
-DROP DATABASE lake_publication_${suite_uuid0}.ns_${uuid0} FORCE;
+DROP SCHEMA lake_publication_${suite_uuid0}.ns_${uuid0} CASCADE;

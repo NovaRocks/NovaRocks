@@ -667,13 +667,29 @@ fn array_literal_and_sortby_preserve_complete_json_child_identity() {
     );
     assert!(!output(&literal).nullable());
     let mixed = [value(json()), value(physical(DataType::Utf8))];
-    let text_literal = resolve_with_materialized_assignments("__array_literal", &mixed);
+    let catalog = builtin_engine_function_catalog();
+    for arguments in [mixed.clone(), [mixed[1].clone(), mixed[0].clone()]] {
+        assert!(matches!(
+            catalog.resolve_bound_user(
+                "__array_literal",
+                FunctionKind::Scalar,
+                request(&arguments),
+                crate::binding_test_control()
+            ),
+            Err(FunctionBindingError::NoMatchingOverload)
+        ));
+    }
+    let strings = [
+        value(physical(DataType::Utf8)),
+        value(physical(DataType::Utf8)),
+    ];
+    let text_literal = resolve("__array_literal", FunctionKind::Scalar, &strings);
     assert_eq!(
-        output(&text_literal).data_type().clone(),
-        DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)))
+        output(&text_literal).data_type(),
+        &DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)))
     );
     assert_eq!(
-        output(&text_literal).logical_type(),
+        output(&text_literal).child_at(0).unwrap().logical_type(),
         ValueLogicalType::Physical
     );
     assert!(!output(&text_literal).nullable());
@@ -685,7 +701,7 @@ fn array_literal_and_sortby_preserve_complete_json_child_identity() {
             .all(|argument| argument == &FunctionArgumentType::Value(physical(DataType::Utf8)))
     );
     assert!(
-        builtin_engine_function_catalog()
+        catalog
             .validate_bound(
                 &text_literal,
                 request(&mixed),
@@ -716,51 +732,61 @@ fn array_literal_and_sortby_preserve_complete_json_child_identity() {
 }
 
 #[test]
-fn empty_array_instantiation_consumes_only_explicit_valid_list_constraint() {
+fn array_constructor_infers_independently_of_outer_expected_type_and_rejects_forged_selection() {
     let catalog = builtin_engine_function_catalog();
     let default = resolve("__array_literal", FunctionKind::Scalar, &[]);
     assert_eq!(
-        output(&default).data_type().clone(),
-        DataType::List(Arc::new(Field::new("item", DataType::Null, true)))
+        output(&default).data_type(),
+        &DataType::List(Arc::new(Field::new("item", DataType::Null, true)))
     );
+    assert!(!output(&default).nullable());
     let expected =
         FunctionValueType::from_legacy_declared_projection(DataType::List(json_item(false)), false);
-    let explicit = FunctionBindingRequest {
-        arguments: &[],
-        logical_argument_count: 0,
-        expected_result_type: Some(&expected),
-    };
-    let binding = catalog
-        .resolve_bound_user(
-            "__array_literal",
-            FunctionKind::Scalar,
-            explicit,
-            crate::binding_test_control(),
-        )
-        .unwrap();
-    assert_eq!(output(&binding), &expected);
-    catalog
-        .validate_bound(&binding, explicit, crate::binding_test_control())
-        .unwrap();
-    catalog
-        .validate_bound(&binding, request(&[]), crate::binding_test_control())
-        .unwrap();
     let conflicting = FunctionValueType::from_legacy_declared_projection(
         DataType::List(Arc::new(Field::new("item", DataType::Utf8, false))),
         false,
     );
-    assert!(
-        catalog
-            .validate_bound(
-                &binding,
-                FunctionBindingRequest {
-                    expected_result_type: Some(&conflicting),
-                    ..request(&[])
-                },
-                crate::binding_test_control()
+    for outer in [
+        expected.clone(),
+        conflicting,
+        physical(DataType::Utf8),
+        json(),
+    ] {
+        let context = FunctionBindingRequest {
+            expected_result_type: Some(&outer),
+            ..request(&[])
+        };
+        let binding = catalog
+            .resolve_bound_user(
+                "__array_literal",
+                FunctionKind::Scalar,
+                context,
+                crate::binding_test_control(),
             )
-            .is_err()
-    );
+            .unwrap();
+        assert_eq!(output(&binding), output(&default));
+        catalog
+            .validate_bound(&binding, context, crate::binding_test_control())
+            .unwrap();
+        catalog
+            .validate_bound(&binding, request(&[]), crate::binding_test_control())
+            .unwrap();
+        let mut forged = binding;
+        forged.selected.result_type = FunctionResultType::Scalar(outer);
+        for expected_result_type in [None, Some(&expected)] {
+            assert!(matches!(
+                catalog.validate_bound(
+                    &forged,
+                    FunctionBindingRequest {
+                        expected_result_type,
+                        ..request(&[])
+                    },
+                    crate::binding_test_control()
+                ),
+                Err(crate::FunctionBindingError::InvalidBinding(_))
+            ));
+        }
+    }
     assert!(
         FunctionValueType::try_from_legacy_declared_projection(
             DataType::List(Arc::new(
@@ -776,21 +802,6 @@ fn empty_array_instantiation_consumes_only_explicit_valid_list_constraint() {
         )
         .is_err()
     );
-    for wrong in [physical(DataType::Utf8), json()] {
-        assert!(
-            catalog
-                .resolve_bound_user(
-                    "__array_literal",
-                    FunctionKind::Scalar,
-                    FunctionBindingRequest {
-                        expected_result_type: Some(&wrong),
-                        ..request(&[])
-                    },
-                    crate::binding_test_control()
-                )
-                .is_err()
-        );
-    }
     let arguments = [value(physical(DataType::Int64))];
     let binding = catalog
         .resolve_bound_user(
@@ -803,7 +814,7 @@ fn empty_array_instantiation_consumes_only_explicit_valid_list_constraint() {
             crate::binding_test_control(),
         )
         .unwrap();
-    let DataType::List(item) = &output(&binding).data_type() else {
+    let DataType::List(item) = output(&binding).data_type() else {
         panic!("list result");
     };
     assert_eq!(item.data_type(), &DataType::Int64);

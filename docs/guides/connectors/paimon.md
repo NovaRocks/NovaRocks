@@ -21,24 +21,8 @@ schema、manifest 和统计文件，BE 注册 `object-store-data` 用于执行 a
 读取；两项绑定可以复用相同的名称和代次，但用途与消费角色必须分别声明。Catalog
 属性中不能放入访问密钥。
 
-```sql
-CREATE EXTERNAL CATALOG paimon_prod
-PROPERTIES (
-    "type" = "paimon",
-    "paimon.catalog.type" = "filesystem",
-    "warehouse" = "s3://company-lake/paimon",
-    "aws.s3.endpoint" = "https://s3.example.com",
-    "aws.s3.region" = "us-east-1",
-    "aws.s3.enable_path_style_access" = "true",
-    "credential.object-store-metadata.consumer-role" = "frontend",
-    "credential.object-store-metadata.mode" = "static",
-    "credential.object-store-metadata.name" = "paimon-prod-data",
-    "credential.object-store-metadata.generation" = "v1",
-    "credential.object-store-data.consumer-role" = "backend",
-    "credential.object-store-data.mode" = "static",
-    "credential.object-store-data.name" = "paimon-prod-data",
-    "credential.object-store-data.generation" = "v1"
-);
+``` sql
+CREATE CATALOG paimon_prod USING paimon WITH ("paimon.catalog.type" = 'filesystem', "warehouse" = 's3://company-lake/paimon', "aws.s3.endpoint" = 'https://s3.example.com', "aws.s3.region" = 'us-east-1', "aws.s3.enable_path_style_access" = 'true', "credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = 'static', "credential.object-store-metadata.name" = 'paimon-prod-data', "credential.object-store-metadata.generation" = 'v1', "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = 'static', "credential.object-store-data.name" = 'paimon-prod-data', "credential.object-store-data.generation" = 'v1');
 ```
 
 `paimon.catalog.type` 在 PAI-1 中必须为 `filesystem`，`warehouse` 必须存在。

@@ -119,15 +119,15 @@ fn declaration_syntax(declaration: &SqlType) -> Result<ast::TypeName, TypeSyntax
         SqlType::Array(item) => {
             return parameterized_type(
                 "ARRAY",
-                vec![ast::TypeNameArgument::Type(declaration_syntax(item)?)],
+                vec![build::type_parameter(declaration_syntax(item)?)],
             );
         }
         SqlType::Map(key, value) => {
             return parameterized_type(
                 "MAP",
                 vec![
-                    ast::TypeNameArgument::Type(declaration_syntax(key)?),
-                    ast::TypeNameArgument::Type(declaration_syntax(value)?),
+                    build::type_parameter(declaration_syntax(key)?),
+                    build::type_parameter(declaration_syntax(value)?),
                 ],
             );
         }
@@ -135,36 +135,31 @@ fn declaration_syntax(declaration: &SqlType) -> Result<ast::TypeName, TypeSyntax
             if fields.is_empty() {
                 return Err(TypeSyntaxError::EmptyStruct);
             }
-            let arguments = fields
+            let fields = fields
                 .iter()
                 .map(|(name, declaration)| {
-                    Ok(ast::TypeNameArgument::Field(ast::StructField {
-                        name: build::ident(name, Some('`')),
+                    Ok(ast::RowDataTypeField {
+                        name: Some(build::ident(name, true)),
                         data_type: declaration_syntax(declaration)?,
                         span: SYNTHETIC,
-                    }))
+                    })
                 })
                 .collect::<Result<Vec<_>, TypeSyntaxError>>()?;
-            return parameterized_type("STRUCT", arguments);
+            return Ok(build::row_type(fields));
         }
     };
     Ok(build::simple_type(scalar))
 }
 
-fn number_argument(value: u8) -> ast::TypeNameArgument {
-    ast::TypeNameArgument::Literal(ast::Literal {
-        kind: ast::LiteralKind::Number(value.to_string()),
-        span: SYNTHETIC,
-    })
+fn number_argument(value: u8) -> ast::DataTypeParameter {
+    build::numeric_parameter(i64::from(value))
 }
 
 fn parameterized_type(
     name: &str,
-    arguments: Vec<ast::TypeNameArgument>,
+    arguments: Vec<ast::DataTypeParameter>,
 ) -> Result<ast::TypeName, TypeSyntaxError> {
-    let separators = vec![true; arguments.len().saturating_sub(1)];
-    build::type_name(build::simple_type(name).name, arguments, separators)
-        .map_err(TypeSyntaxError::Construction)
+    Ok(build::type_name(build::ident(name, false), arguments))
 }
 
 #[cfg(test)]
@@ -181,15 +176,17 @@ mod tests {
         let constructed = sql_type_syntax(&value).unwrap();
         // The expected spelling is fixed independently of the syntax author.
         // Parser entry exists only in this unit-test oracle.
-        let statements =
-            novarocks_parser::parse(&format!("SELECT CAST(NULL AS {spelling})")).unwrap();
-        let [ast::Statement::Query(query)] = statements.as_slice() else {
-            panic!("query");
-        };
+        let query =
+            &novarocks_parser::parser::parse_query(&format!("SELECT CAST(NULL AS {spelling})"))
+                .unwrap();
         let ast::SetExpr::Select(select) = query.body.as_ref() else {
             panic!("SELECT");
         };
-        let ast::SelectItem::UnnamedExpr(ast::Expr::Cast(cast)) = &select.projection[0] else {
+        let ast::SelectItem::SingleColumn(projection_column) = &select.projection[0] else {
+            panic!("CAST");
+        };
+        assert!(projection_column.alias.is_none(), "anonymous projection");
+        let ast::Expr::Cast(cast) = &projection_column.expression else {
             panic!("CAST");
         };
         assert!(constructed.syntax_eq(&cast.data_type), "{spelling}");
@@ -228,9 +225,15 @@ mod tests {
             (DataType::BinaryView, "VARBINARY"),
             (DataType::FixedSizeBinary(7), "VARBINARY"),
             (DataType::Date32, "DATE"),
-            (DataType::Timestamp(TimeUnit::Second, None), "DATETIME"),
-            (DataType::Timestamp(TimeUnit::Millisecond, None), "DATETIME"),
-            (DataType::Timestamp(TimeUnit::Microsecond, None), "DATETIME"),
+            (DataType::Timestamp(TimeUnit::Second, None), "TIMESTAMP"),
+            (
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                "TIMESTAMP",
+            ),
+            (
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                "TIMESTAMP",
+            ),
             (
                 DataType::Timestamp(TimeUnit::Nanosecond, None),
                 "DATETIME_NS",
@@ -306,7 +309,7 @@ mod tests {
         );
         assert_spelling(
             FunctionValueType::new(structure, true),
-            "STRUCT<`a``b` INT, `space name` MAP<STRING, ARRAY<BOOLEAN>>>",
+            r#"ROW("a`b" INT, "space name" MAP<STRING, ARRAY<BOOLEAN>>)"#,
         );
     }
 
@@ -344,7 +347,7 @@ mod tests {
         );
         assert_spelling(
             declared(declaration, carrier),
-            "STRUCT<`documents` ARRAY<JSON>, `lookup` MAP<STRING, STRUCT<`value` VARIANT>>>",
+            r#"ROW("documents" ARRAY<JSON>, "lookup" MAP<STRING, ROW("value" VARIANT)>)"#,
         );
     }
 
@@ -400,8 +403,10 @@ mod tests {
                 }
             );
             assert!(
-                novarocks_parser::parse(&format!("SELECT CAST(NULL AS DECIMAL({precision}, -2))"))
-                    .is_err()
+                novarocks_parser::parser::parse_query(&format!(
+                    "SELECT CAST(NULL AS DECIMAL({precision}, -2))"
+                ))
+                .is_err()
             );
         }
         assert_eq!(
@@ -411,7 +416,7 @@ mod tests {
             )),
             Err(TypeSyntaxError::EmptyStruct)
         );
-        assert!(novarocks_parser::parse("SELECT CAST(NULL AS STRUCT<>)").is_err());
+        assert!(novarocks_parser::parser::parse_query("SELECT CAST(NULL AS STRUCT<>)").is_err());
     }
 
     #[test]

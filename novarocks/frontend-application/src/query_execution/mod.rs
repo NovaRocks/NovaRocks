@@ -29,6 +29,7 @@ pub(crate) mod connector_domain;
 pub mod constant_eval;
 pub mod contract;
 mod core_bindings;
+pub(crate) mod ddl_properties;
 #[cfg(test)]
 mod dependency_artifact_records;
 #[cfg(test)]
@@ -41,11 +42,13 @@ pub(crate) mod internal_result_cpu;
 pub mod kernels;
 pub(crate) mod lifecycle_diagnostics;
 pub mod lifecycle_plan;
+pub(crate) mod like_source_read;
 pub(crate) mod logical_binding;
 pub(crate) mod logical_execution;
 #[cfg(test)]
 pub(crate) mod logical_execution_test_profile;
 pub mod maintenance;
+pub(crate) mod metadata_capture;
 pub mod mv_assembly;
 pub mod mv_native_write;
 pub(crate) mod native_execution_adapter;
@@ -69,6 +72,7 @@ pub(crate) mod schedule;
 pub(crate) mod split_assignment;
 pub(crate) mod split_assignment_round;
 pub mod statistics;
+pub(crate) mod table_exists_source;
 pub(crate) mod write_result;
 pub(crate) mod write_session;
 

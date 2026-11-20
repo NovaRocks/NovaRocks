@@ -22,14 +22,14 @@ CREATE TABLE ${case_db}.dict_filter_fastpath_c1_t (
   id INT,
   status STRING,
   channel STRING
-) TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 INSERT INTO ${case_db}.dict_filter_fastpath_c1_t VALUES
-  (1, 'PAID', 'web'),
-  (2, 'PENDING', 'retail'),
-  (3, 'CLOSED', 'ops'),
-  (4, NULL, 'retail'),
-  (5, 'PAID', 'ops'),
-  (6, NULL, 'web');
+  ROW(1, 'PAID', 'web'),
+  ROW(2, 'PENDING', 'retail'),
+  ROW(3, 'CLOSED', 'ops'),
+  ROW(4, NULL, 'retail'),
+  ROW(5, 'PAID', 'ops'),
+  ROW(6, NULL, 'web');
 SELECT id, status, channel
 FROM ${case_db}.dict_filter_fastpath_c1_t
 WHERE status = 'PAID'

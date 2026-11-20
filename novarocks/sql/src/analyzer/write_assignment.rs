@@ -131,9 +131,6 @@ fn register_literal_assignments<'a>(
     control
         .checkpoint(CompilePhase::Validate, 1)
         .map_err(AnalyzeError::control)?;
-    if let ast::Expr::Nested(nested) = expression {
-        return register_literal_assignments(&nested.expression, assignment, source, control);
-    }
     // A carrier cannot authorize child semantics for a nominal domain.
     if assignment.input().logical_type() == ValueLogicalType::Physical {
         let child = |ordinal| -> Result<SqlWriteAssignmentSite, AnalyzeError> {
@@ -167,39 +164,31 @@ fn register_literal_assignments<'a>(
         };
         match expression {
             ast::Expr::Array(array)
-                if array.element_type.is_none()
-                    && matches!(
-                        assignment.input().data_type(),
-                        DataType::List(_) | DataType::LargeList(_)
-                    ) =>
+                if matches!(
+                    assignment.input().data_type(),
+                    DataType::List(_) | DataType::LargeList(_)
+                ) =>
             {
-                for value in &array.elements {
+                for value in &array.values {
                     visit(value, 0)?;
                 }
             }
-            ast::Expr::Map(map) if matches!(assignment.input().data_type(), DataType::Map(..)) => {
-                for entry in &map.entries {
-                    visit(&entry.key, 0)?;
-                    visit(&entry.value, 1)?;
-                }
-            }
-            ast::Expr::Tuple(tuple) if matches!(assignment.input().data_type(), DataType::Struct(fields) if fields.len() == tuple.expressions.len()) => {
-                for (ordinal, value) in tuple.expressions.iter().enumerate() {
-                    visit(value, ordinal)?;
-                }
-            }
-            ast::Expr::Struct(structure) if matches!(assignment.input().data_type(), DataType::Struct(fields) if fields.len() == structure.fields.len()) => {
+            ast::Expr::Row(structure) if matches!(assignment.input().data_type(), DataType::Struct(fields) if fields.len() == structure.fields.len()) => {
                 for (ordinal, field) in structure.fields.iter().enumerate() {
-                    visit(&field.value, ordinal)?;
+                    visit(&field.expression, ordinal)?;
                 }
             }
             ast::Expr::FunctionCall(function)
-                if matches!(function.quantifier, ast::FunctionQuantifier::None)
-                    && function.order_by.is_empty()
-                    && function.separator.is_none()
+                if !function.distinct
+                    && function.order_by.is_none()
                     && function.filter.is_none()
                     && function.null_treatment.is_none()
-                    && function.over.is_none() =>
+                    && function.window.is_none()
+                    && function.processing_mode.is_none()
+                    && function
+                        .arguments
+                        .iter()
+                        .all(|argument| argument.name.is_none()) =>
             {
                 // These are only the original INSERT literal syntax forms.
                 // Normal analysis still resolves or rejects the actual call.
@@ -211,14 +200,14 @@ fn register_literal_assignments<'a>(
                 ) {
                     ("array", DataType::List(_) | DataType::LargeList(_)) => {
                         for value in &function.arguments {
-                            visit(value, 0)?;
+                            visit(&value.value, 0)?;
                         }
                     }
                     ("row", DataType::Struct(fields))
                         if fields.len() == function.arguments.len() =>
                     {
                         for (ordinal, value) in function.arguments.iter().enumerate() {
-                            visit(value, ordinal)?;
+                            visit(&value.value, ordinal)?;
                         }
                     }
                     ("named_struct", DataType::Struct(fields))
@@ -227,13 +216,13 @@ fn register_literal_assignments<'a>(
                         for (ordinal, pair) in
                             function.arguments.as_chunks::<2>().0.iter().enumerate()
                         {
-                            visit(&pair[1], ordinal)?;
+                            visit(&pair[1].value, ordinal)?;
                         }
                     }
                     ("map", DataType::Map(..)) if function.arguments.len() % 2 == 0 => {
                         for pair in function.arguments.as_chunks::<2>().0 {
-                            visit(&pair[0], 0)?;
-                            visit(&pair[1], 1)?;
+                            visit(&pair[0].value, 0)?;
+                            visit(&pair[1].value, 1)?;
                         }
                     }
                     _ => {}
@@ -323,12 +312,15 @@ fn context_body<'a>(
             for site in assignments.sites() {
                 let mut only_holes = true;
                 for row in &values.rows {
-                    if let Some(expression) = row.get(site.output_ordinal()) {
+                    if let Some(expression) =
+                        ast::ValuesRowCells::new(row).get(site.output_ordinal())
+                    {
                         only_holes &= context_hole(expression, source, control)?;
                     }
                 }
                 for row in &values.rows {
-                    if let Some(expression) = row.get(site.output_ordinal())
+                    if let Some(expression) =
+                        ast::ValuesRowCells::new(row).get(site.output_ordinal())
                         && (only_holes || !context_hole(expression, source, control)?)
                     {
                         context_literal(expression, site.input(), source, policy, control)?;
@@ -339,12 +331,10 @@ fn context_body<'a>(
         ast::SetExpr::Select(select) => {
             // With a wildcard, AST item ordinal is not output ordinal. Exact
             // producer-authored paths may still supply a literal context.
-            let scalar_projection = select.projection.iter().all(|item| {
-                matches!(
-                    item,
-                    ast::SelectItem::UnnamedExpr(_) | ast::SelectItem::ExprWithAlias { .. }
-                )
-            });
+            let scalar_projection = select
+                .projection
+                .iter()
+                .all(|item| matches!(item, ast::SelectItem::SingleColumn(_)));
             if scalar_projection {
                 for site in assignments.sites() {
                     let expression =
@@ -352,8 +342,7 @@ fn context_body<'a>(
                             .projection
                             .get(site.output_ordinal())
                             .and_then(|item| match item {
-                                ast::SelectItem::UnnamedExpr(expr)
-                                | ast::SelectItem::ExprWithAlias { expr, .. } => Some(expr),
+                                ast::SelectItem::SingleColumn(column) => Some(&column.expression),
                                 _ => None,
                             });
                     if let Some(expression) = expression {
@@ -363,16 +352,57 @@ fn context_body<'a>(
             }
         }
         ast::SetExpr::Query(query) => {
-            context_body(&query.body, assignments, source, policy, control)?
+            context_body(&query.query.body, assignments, source, policy, control)?
         }
+        ast::SetExpr::Table(_) => {}
         ast::SetExpr::SetOperation(operation) => {
             // Only literal holes are contextualized here; actual ordinary
             // value conversions remain ABOVE the complete set operation.
-            context_body(&operation.left, assignments, source, policy, control)?;
-            context_body(&operation.right, assignments, source, policy, control)?;
+            for input in &operation.inputs {
+                context_body(input, assignments, source, policy, control)?;
+            }
         }
     }
     Ok(())
+}
+
+/// Borrow result/default occurrences only. Predicate/operand syntax is never
+/// assigned the sink's literal-hole context.
+fn case_results(
+    expression: &novarocks_parser::ast::Expr,
+) -> impl Iterator<Item = &novarocks_parser::ast::Expr> {
+    use novarocks_parser::ast::Expr;
+    let (clauses, default) = match expression {
+        Expr::SearchedCase(case) => (&case.when_clauses, &case.default_value),
+        Expr::SimpleCase(case) => (&case.when_clauses, &case.default_value),
+        _ => unreachable!("only CASE variants have branch results"),
+    };
+    clauses
+        .iter()
+        .map(|clause| &clause.result)
+        .chain(default.iter())
+}
+
+/// Only the original INSERT literal-context owner supplies this expectation.
+/// Ordinary SQL function analysis continues to infer each argument independently.
+fn plain_map_arguments(
+    call: &novarocks_parser::ast::FunctionCall,
+) -> Option<&[novarocks_parser::ast::CallArgument]> {
+    use novarocks_parser::printer;
+    (call.name.parts.len() == 1
+        && printer::print_object_name(&call.name).eq_ignore_ascii_case("map")
+        && !call.distinct
+        && call.order_by.is_none()
+        && call.filter.is_none()
+        && call.null_treatment.is_none()
+        && call.window.is_none()
+        && call.processing_mode.is_none()
+        && call.arguments.len().is_multiple_of(2)
+        && call
+            .arguments
+            .iter()
+            .all(|argument| argument.name.is_none()))
+    .then_some(call.arguments.as_slice())
 }
 
 fn context_hole(
@@ -388,16 +418,13 @@ fn context_hole(
         return Ok(false);
     }
     match expression {
-        ast::Expr::Nested(nested) => context_hole(&nested.expression, source, control),
         ast::Expr::Literal(literal) => Ok(matches!(literal.kind, ast::LiteralKind::Null)),
-        ast::Expr::Array(array) => Ok(array.element_type.is_none() && array.elements.is_empty()),
-        ast::Expr::Map(map) => Ok(map.entries.is_empty()),
-        ast::Expr::Case(case) => {
-            for value in case
-                .results
-                .iter()
-                .chain(case.else_result.iter().map(|value| value.as_ref()))
-            {
+        ast::Expr::Array(array) => Ok(array.values.is_empty()),
+        ast::Expr::FunctionCall(call) if plain_map_arguments(call).is_some() => {
+            Ok(call.arguments.is_empty())
+        }
+        ast::Expr::SearchedCase(_) | ast::Expr::SimpleCase(_) => {
+            for value in case_results(expression) {
                 if !context_hole(value, source, control)? {
                     return Ok(false);
                 }
@@ -424,9 +451,6 @@ fn context_literal<'a>(
         return Ok(());
     }
     let constant = match expression {
-        ast::Expr::Nested(nested) => {
-            return context_literal(&nested.expression, expected, source, policy, control);
-        }
         ast::Expr::Literal(literal) if matches!(literal.kind, ast::LiteralKind::Null) => {
             let ty = expected
                 .with_nullable(true)
@@ -447,52 +471,45 @@ fn context_literal<'a>(
                 .map_err(|error| original_analysis_error(error.into()))?,
             )
         }
-        ast::Expr::Case(case) => {
+        ast::Expr::SearchedCase(_) | ast::Expr::SimpleCase(_) => {
             // A real branch, such as a Fixed read column, authors common-type
             // inference. Giving its NULL peer W would normalize that branch
             // before selection. Context only an otherwise untyped whole CASE.
             let mut only_holes = true;
-            for result in case
-                .results
-                .iter()
-                .chain(case.else_result.iter().map(|value| value.as_ref()))
-            {
+            for result in case_results(expression) {
                 only_holes &= context_hole(result, source, control)?;
             }
-            for result in case
-                .results
-                .iter()
-                .chain(case.else_result.iter().map(|value| value.as_ref()))
-            {
+            for result in case_results(expression) {
                 if only_holes || !context_hole(result, source, control)? {
                     context_literal(result, expected, source, policy, control)?;
                 }
             }
             None
         }
-        ast::Expr::Array(array) if array.element_type.is_none() => {
+        ast::Expr::Array(array) => {
             if !matches!(
                 expected.data_type(),
                 arrow::datatypes::DataType::List(_) | arrow::datatypes::DataType::LargeList(_)
             ) {
                 return Ok(());
             }
-            if array.elements.is_empty() {
+            if array.values.is_empty() {
                 Some(empty_literal(expected, policy, control)?)
             } else {
                 let child: FunctionValueType = expected
                     .child_at(0)
                     .ok_or_else(|| AnalyzeError::internal("array literal context lost its item"))?;
-                for element in &array.elements {
+                for element in &array.values {
                     context_literal(element, &child, source, policy, control)?;
                 }
                 None
             }
         }
-        ast::Expr::Map(map)
-            if matches!(expected.data_type(), arrow::datatypes::DataType::Map(..)) =>
+        ast::Expr::FunctionCall(call)
+            if plain_map_arguments(call).is_some()
+                && matches!(expected.data_type(), arrow::datatypes::DataType::Map(..)) =>
         {
-            if map.entries.is_empty() {
+            if call.arguments.is_empty() {
                 Some(empty_literal(expected, policy, control)?)
             } else {
                 let key = expected
@@ -501,34 +518,24 @@ fn context_literal<'a>(
                 let value = expected
                     .child_at(1)
                     .ok_or_else(|| AnalyzeError::internal("map literal context lost its value"))?;
-                for entry in &map.entries {
-                    context_literal(&entry.key, &key, source, policy, control)?;
-                    context_literal(&entry.value, &value, source, policy, control)?;
+                for pair in call.arguments.as_chunks::<2>().0 {
+                    context_literal(&pair[0].value, &key, source, policy, control)?;
+                    context_literal(&pair[1].value, &value, source, policy, control)?;
                 }
                 None
             }
         }
-        ast::Expr::Tuple(tuple) if matches!(expected.data_type(), arrow::datatypes::DataType::Struct(fields) if fields.len() == tuple.expressions.len()) =>
-        {
-            for (index, value) in tuple.expressions.iter().enumerate() {
-                let child = expected.child_at(index).ok_or_else(|| {
-                    AnalyzeError::internal("tuple literal context lost its child")
-                })?;
-                context_literal(value, &child, source, policy, control)?;
-            }
-            None
-        }
-        ast::Expr::Struct(structure) if matches!(expected.data_type(), arrow::datatypes::DataType::Struct(fields) if fields.len() == structure.fields.len()) =>
+        ast::Expr::Row(structure) if matches!(expected.data_type(), arrow::datatypes::DataType::Struct(fields) if fields.len() == structure.fields.len()) =>
         {
             for (index, value) in structure.fields.iter().enumerate() {
                 let child = expected.child_at(index).ok_or_else(|| {
                     AnalyzeError::internal("struct literal context lost its child")
                 })?;
-                context_literal(&value.value, &child, source, policy, control)?;
+                context_literal(&value.expression, &child, source, policy, control)?;
             }
             None
         }
-        // Explicit CAST, explicitly typed ARRAY, functions and nonliteral
+        // Explicit CAST, other functions and nonliteral
         // expressions retain their original independent inference boundary.
         _ => None,
     };
@@ -642,7 +649,7 @@ impl super::AnalyzerContext<'_> {
         Ok(ResolvedQuery {
             body: QueryBody::Select(ResolvedSelect {
                 from: Some(Relation::Subquery {
-                    query: Box::new(query),
+                    query: novarocks_parser::ast::AstBox::new(query),
                     alias: alias.into(),
                     output_columns: original,
                 }),
@@ -653,8 +660,8 @@ impl super::AnalyzerContext<'_> {
                 has_aggregation: false,
                 distinct: false,
                 repeat: None,
-                apply_specs: Vec::new(),
-                predicate_apply_specs: Vec::new(),
+                apply_specs: (Vec::new()).into(),
+                predicate_apply_specs: (Vec::new()).into(),
             }),
             order_by: Vec::new(),
             limit: None,
@@ -703,4 +710,79 @@ fn assignment_allocation(cause: std::collections::TryReserveError) -> AnalyzeErr
             cause,
         ),
     )
+}
+
+#[cfg(test)]
+mod case_context_tests {
+    use super::*;
+    use crate::compiler::materialized_values::MaterializedSourceBorrow;
+    use novarocks_parser::ast;
+    use novarocks_type_contract::FunctionValueType;
+
+    #[test]
+    fn case_holes_borrow_only_results_and_preserve_mixed_real_source_branches() {
+        let control = crate::compiler::SqlCompileControl::unbounded();
+        let policy = crate::constant::test_constant_policy();
+        let expected = FunctionValueType::new(arrow::datatypes::DataType::Int64, false);
+        for (sql, only_holes) in [
+            ("SELECT CASE WHEN TRUE THEN NULL ELSE NULL END", true),
+            ("SELECT CASE 1 WHEN 2 THEN NULL ELSE NULL END", true),
+            (
+                "SELECT CASE WHEN TRUE THEN original_read ELSE NULL END",
+                false,
+            ),
+            (
+                "SELECT CASE 1 WHEN 2 THEN original_read ELSE NULL END",
+                false,
+            ),
+        ] {
+            let query = &novarocks_parser::parser::parse_query(sql).unwrap();
+            let ast::SetExpr::Select(select) = query.body.as_ref() else {
+                panic!("select")
+            };
+            let ast::SelectItem::SingleColumn(projection_column) = &select.projection[0] else {
+                panic!("CASE projection")
+            };
+            assert!(projection_column.alias.is_none(), "anonymous projection");
+            let expression = &projection_column.expression;
+            let mut source = MaterializedSourceBorrow::empty(query);
+            assert_eq!(
+                context_hole(expression, &source, &control).unwrap(),
+                only_holes
+            );
+            context_literal(expression, &expected, &mut source, policy, &control).unwrap();
+            for result in case_results(expression) {
+                if only_holes {
+                    let value = source
+                        .view()
+                        .constant_at(result)
+                        .expect("an actual NULL result receives context");
+                    assert_eq!(
+                        value.value_type(),
+                        &FunctionValueType::new(arrow::datatypes::DataType::Int64, true)
+                    );
+                    assert!(source.view().constant_at(&result.clone()).is_none());
+                } else {
+                    assert!(
+                        source.view().constant_at(result).is_none(),
+                        "a real read branch keeps common-type authority over its NULL peer"
+                    );
+                }
+            }
+            let (operand, clauses) = match expression {
+                ast::Expr::SimpleCase(case) => (Some(&case.operand), &case.when_clauses),
+                ast::Expr::SearchedCase(case) => (None, &case.when_clauses),
+                _ => panic!("CASE"),
+            };
+            if let Some(operand) = operand {
+                assert!(source.view().constant_at(operand).is_none());
+            }
+            for clause in clauses {
+                let ast::WhenMatch::Operand(condition) = &clause.match_value else {
+                    panic!("WHEN expression")
+                };
+                assert!(source.view().constant_at(condition).is_none());
+            }
+        }
+    }
 }

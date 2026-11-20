@@ -150,14 +150,15 @@ fn logical_capture_identity_cast_and_nested_keep_original_nonconstant_none() {
     let source = literal(LiteralValue::Int(17), ty(DataType::Int64, false));
     let cast = TypedExpr {
         kind: crate::analysis::ExprKind::Cast {
-            expr: Box::new(source.clone()),
+            array_failure_mode: None,
+            expr: novarocks_parser::ast::AstBox::new(source.clone()),
             target: DataType::Int64,
             decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
         },
         value_type: source.value_type.clone(),
     };
     let nested = TypedExpr {
-        kind: crate::analysis::ExprKind::Nested(Box::new(source.clone())),
+        kind: crate::analysis::ExprKind::Nested(novarocks_parser::ast::AstBox::new(source.clone())),
         value_type: source.value_type.clone(),
     };
     let args = [source, cast, nested];
@@ -196,7 +197,7 @@ fn logical_capture_typed_null_and_nested_full_type_are_distinct_original_channel
     );
     let null = literal(LiteralValue::Null, nested_type.clone());
     let nested = TypedExpr {
-        kind: crate::analysis::ExprKind::Nested(Box::new(null.clone())),
+        kind: crate::analysis::ExprKind::Nested(novarocks_parser::ast::AstBox::new(null.clone())),
         value_type: nested_type.clone(),
     };
     let args = [null, nested];
@@ -324,7 +325,7 @@ fn lambda(parameters: usize) -> TypedExpr {
                     value_type: parameter_type.clone(),
                 })
                 .collect(),
-            body: Box::new(column(result_type)),
+            body: novarocks_parser::ast::AstBox::new(column(result_type)),
         },
         value_type: ty(DataType::Null, true),
     }

@@ -36,9 +36,8 @@
 -- query 3
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.__row_util_base (
-  k1 bigint NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+  k1 bigint
+) WITH (format_version = 3);
 
 -- query 4
 -- @skip_result_check=true
@@ -55,9 +54,8 @@ insert into ${case_db}.__row_util_base select * from ${case_db}.__row_util_base;
 -- query 7
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.__row_util (
-  idx bigint NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+  idx bigint
+) WITH (format_version = 3);
 
 -- query 8
 -- @skip_result_check=true
@@ -66,12 +64,11 @@ insert into ${case_db}.__row_util select row_number() over() as idx from ${case_
 -- query 9
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t1 (
-    k1 bigint NULL,
-    c_int int NULL,
-    c_bigint bigint NULL,
+    k1 bigint ,
+    c_int int ,
+    c_bigint bigint ,
     c_string STRING
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 10
 -- @skip_result_check=true
@@ -151,65 +148,80 @@ select count(tt1.k1), count(tt2.k1) from ${case_db}.t1 tt1 join  w1 tt2 using(c_
 
 -- left semi join on c_int with expression key
 -- query 26
-select count(tt1.k1) from ${case_db}.t1 tt1 left semi join ${case_db}.t1 tt2 on tt1.c_int=tt2.c_int and tt1.c_int+1=tt2.c_int+1;
+select count(tt1.k1) from ${case_db}.t1 tt1
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 tt2 WHERE tt1.c_int=tt2.c_int and tt1.c_int+1=tt2.c_int+1);
 
 -- left semi join on c_int with expression key and filter
 -- query 27
-select count(tt1.k1) from ${case_db}.t1 tt1 left semi join ${case_db}.t1 tt2 on tt1.c_int=tt2.c_int and tt1.c_int+1=tt2.c_int+1 where tt1.k1 % 2 = 0;
+select count(tt1.k1) from ${case_db}.t1 tt1
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 tt2 WHERE tt1.c_int=tt2.c_int and tt1.c_int+1=tt2.c_int+1) AND (tt1.k1 % 2 = 0);
 
 -- left semi join on c_int + c_bigint
 -- query 28
-select count(tt1.k1) from ${case_db}.t1 tt1 left semi join ${case_db}.t1 tt2 on tt1.c_int=tt2.c_int and tt1.c_bigint=tt2.c_bigint;
+select count(tt1.k1) from ${case_db}.t1 tt1
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 tt2 WHERE tt1.c_int=tt2.c_int and tt1.c_bigint=tt2.c_bigint);
 
 -- left semi join using(c_int)
 -- query 29
-select count(tt1.k1) from ${case_db}.t1 tt1 left semi join ${case_db}.t1 tt2 using(c_int);
+select count(tt1.k1) from ${case_db}.t1 tt1
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 tt2 WHERE tt1.c_int = tt2.c_int);
 
 -- left semi join using(c_int) with filter % 2
 -- query 30
-select count(tt1.k1) from ${case_db}.t1 tt1 left semi join ${case_db}.t1 tt2 using(c_int) where tt1.k1 % 2 = 0;
+select count(tt1.k1) from ${case_db}.t1 tt1
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 tt2 WHERE tt1.c_int = tt2.c_int) AND (tt1.k1 % 2 = 0);
 
 -- left semi join using(c_int) with filter % 100
 -- query 31
-select count(tt1.k1) from ${case_db}.t1 tt1 left semi join ${case_db}.t1 tt2 using(c_int) where tt1.k1 % 100 = 0;
+select count(tt1.k1) from ${case_db}.t1 tt1
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 tt2 WHERE tt1.c_int = tt2.c_int) AND (tt1.k1 % 100 = 0);
 
 -- left semi join using(c_bigint)
 -- query 32
-select count(tt1.k1) from ${case_db}.t1 tt1 left semi join ${case_db}.t1 tt2 using(c_bigint);
+select count(tt1.k1) from ${case_db}.t1 tt1
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 tt2 WHERE tt1.c_bigint = tt2.c_bigint);
 
 -- left semi join using(c_bigint) with filter % 2
 -- query 33
-select count(tt1.k1) from ${case_db}.t1 tt1 left semi join ${case_db}.t1 tt2 using(c_bigint) where tt1.k1 % 2 = 0;
+select count(tt1.k1) from ${case_db}.t1 tt1
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 tt2 WHERE tt1.c_bigint = tt2.c_bigint) AND (tt1.k1 % 2 = 0);
 
 -- left semi join using(c_bigint) with filter % 100
 -- query 34
-select count(tt1.k1) from ${case_db}.t1 tt1 left semi join ${case_db}.t1 tt2 using(c_bigint) where tt1.k1 % 100 = 0;
+select count(tt1.k1) from ${case_db}.t1 tt1
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 tt2 WHERE tt1.c_bigint = tt2.c_bigint) AND (tt1.k1 % 100 = 0);
 
 -- left semi join using(c_string)
 -- query 35
-select count(tt1.c_string) from ${case_db}.t1 tt1 left semi join ${case_db}.t1 tt2 using(c_string);
+select count(tt1.c_string) from ${case_db}.t1 tt1
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 tt2 WHERE tt1.c_string = tt2.c_string);
 
 -- left semi join using(c_string) with filter % 2
 -- query 36
-select count(tt1.c_string) from ${case_db}.t1 tt1 left semi join ${case_db}.t1 tt2 using(c_string) where tt1.k1 % 2 = 0;
+select count(tt1.c_string) from ${case_db}.t1 tt1
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 tt2 WHERE tt1.c_string = tt2.c_string) AND (tt1.k1 % 2 = 0);
 
 -- left semi join using(c_string) with filter % 100
 -- query 37
-select count(tt1.c_string) from ${case_db}.t1 tt1 left semi join ${case_db}.t1 tt2 using(c_string) where tt1.k1 % 100 = 0;
+select count(tt1.c_string) from ${case_db}.t1 tt1
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 tt2 WHERE tt1.c_string = tt2.c_string) AND (tt1.k1 % 100 = 0);
 
 -- left semi join on all three keys
 -- query 38
-select count(tt1.k1) from ${case_db}.t1 tt1 left semi join ${case_db}.t1 tt2 on tt1.c_int=tt2.c_int and tt1.c_bigint=tt2.c_bigint and tt1.c_string=tt2.c_string;
+select count(tt1.k1) from ${case_db}.t1 tt1
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 tt2 WHERE tt1.c_int=tt2.c_int and tt1.c_bigint=tt2.c_bigint and tt1.c_string=tt2.c_string);
 
 -- left semi join on negated key (no match)
 -- query 39
-select count(tt1.k1) from ${case_db}.t1 tt1 left semi join ${case_db}.t1 tt2 on -tt1.c_int=tt2.c_int;
+select count(tt1.k1) from ${case_db}.t1 tt1
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 tt2 WHERE -tt1.c_int=tt2.c_int);
 
 -- left semi join with broadcast hint and CTE
 -- query 40
 with
     w1 as (select k1, c_int from ${case_db}.t1 union all select k1, c_int + 2560000 from ${case_db}.t1 union all select k1, c_int + 2560000 * 2 from ${case_db}.t1)
-select count(tt1.k1) from ${case_db}.t1 tt1 left semi join  w1 tt2 using(c_int);
+select count(tt1.k1) from ${case_db}.t1 tt1
+WHERE EXISTS (SELECT 1 FROM w1 tt2 WHERE tt1.c_int = tt2.c_int);
 
 -- Left outer join tests
 

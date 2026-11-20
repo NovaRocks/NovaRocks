@@ -41,14 +41,13 @@
 CREATE TABLE ${case_db}.resilience_series (
   id BIGINT,
   delay_s BIGINT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 INSERT INTO ${case_db}.resilience_series
-VALUES (1, 1);
+VALUES ROW(1, 1);
 INSERT INTO ${case_db}.resilience_series
-VALUES (2, 1);
+VALUES ROW(2, 1);
 INSERT INTO ${case_db}.resilience_series
-VALUES (3, 1);
+VALUES ROW(3, 1);
 
 -- query 2
 -- @kill_be_after_be_log_contains=1,NOVAROCKS_TASK_CREATE_APPLIED
@@ -69,7 +68,7 @@ WHERE sleep(delay_s);
 -- query 3
 -- @heartbeat_delay_ms=3000
 -- @result_contains=1000000
-SELECT COUNT(*) FROM TABLE(generate_series(1, 1000000));
+SELECT COUNT() FROM TABLE(generate_series(1, 1000000));
 
 -- query 4
 -- @cleanup=true

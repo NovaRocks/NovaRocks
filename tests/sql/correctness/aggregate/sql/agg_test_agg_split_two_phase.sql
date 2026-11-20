@@ -29,8 +29,7 @@ USE ${case_db};
 create table t0 (
     c0 STRING,
     c1 STRING
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 3
 -- @skip_result_check=true

@@ -26,57 +26,32 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE EXTERNAL CATALOG ice_ivm_fjoin_${uuid0}
-PROPERTIES (
-  "type" = "iceberg",
-  "iceberg.catalog.type" = "rest",
-  "uri" = "${iceberg_rest_uri}",
-  "warehouse" = "${iceberg_rest_warehouse}",
-  "aws.s3.endpoint" = "${oss_endpoint}",
-  "credential.object-store-metadata.consumer-role" = "frontend",
-  "credential.object-store-metadata.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-metadata.name" = "${iceberg_object_store_metadata_credential_name}",
-  "credential.object-store-metadata.generation" = "${iceberg_object_store_credential_generation}",
-  "credential.object-store-data.consumer-role" = "backend",
-  "credential.object-store-data.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-data.name" = "${iceberg_object_store_data_credential_name}",
-  "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
-  "aws.s3.region" = "${oss_region}",
-  "aws.s3.enable_path_style_access" = "${oss_path_style}"
-);
-CREATE DATABASE ice_ivm_fjoin_${uuid0}.ns_${uuid0};
+CREATE CATALOG ice_ivm_fjoin_${uuid0} USING iceberg WITH ("iceberg.catalog.type" = 'rest', "uri" = '${iceberg_rest_uri}', "warehouse" = '${iceberg_rest_warehouse}', "aws.s3.endpoint" = '${oss_endpoint}', "credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-metadata.name" = '${iceberg_object_store_metadata_credential_name}', "credential.object-store-metadata.generation" = '${iceberg_object_store_credential_generation}', "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-data.name" = '${iceberg_object_store_data_credential_name}', "credential.object-store-data.generation" = '${iceberg_object_store_credential_generation}', "aws.s3.region" = '${oss_region}', "aws.s3.enable_path_style_access" = '${oss_path_style}');
+CREATE SCHEMA ice_ivm_fjoin_${uuid0}.ns_${uuid0};
 CREATE TABLE ice_ivm_fjoin_${uuid0}.ns_${uuid0}.fact (
   id BIGINT NOT NULL,
   dim_id BIGINT,
   amount BIGINT
-)
-TBLPROPERTIES ("format-version" = "3",
-  "write.row-lineage" = "true");
+) WITH (format_version = 3);
 CREATE TABLE ice_ivm_fjoin_${uuid0}.ns_${uuid0}.dim (
   id BIGINT NOT NULL,
   region STRING
-)
-TBLPROPERTIES ("format-version" = "3",
-  "write.row-lineage" = "true");
+) WITH (format_version = 3);
 USE ice_ivm_fjoin_${uuid0}.ns_${uuid0};
 
 -- query 2
 -- @skip_result_check=true
 INSERT INTO ice_ivm_fjoin_${uuid0}.ns_${uuid0}.dim VALUES
-  (10, 'east'),
-  (20, 'west'),
-  (30, 'south');
+  ROW(10, 'east'),
+  ROW(20, 'west'),
+  ROW(30, 'south');
 INSERT INTO ice_ivm_fjoin_${uuid0}.ns_${uuid0}.fact VALUES
-  (1, 10, 100),
-  (2, 10, 200),
-  (3, 20, 50),
-  (4, 30, -5),
-  (5, 30, 70);
-CREATE MATERIALIZED VIEW fjoin_mv_${uuid0}
-DISTRIBUTED BY HASH(region) BUCKETS 1
-PROPERTIES ('storage_engine' = 'iceberg')
-AS
-SELECT d.region, COUNT(*) AS c, SUM(f.amount) AS s
+  ROW(1, 10, 100),
+  ROW(2, 10, 200),
+  ROW(3, 20, 50),
+  ROW(4, 30, -5),
+  ROW(5, 30, 70);
+CREATE MATERIALIZED VIEW fjoin_mv_${uuid0} AS SELECT d.region, COUNT(*) AS c, SUM(f.amount) AS s
 FROM ice_ivm_fjoin_${uuid0}.ns_${uuid0}.fact AS f
 JOIN ice_ivm_fjoin_${uuid0}.ns_${uuid0}.dim AS d ON f.dim_id = d.id
 WHERE f.amount > 0
@@ -99,11 +74,11 @@ ORDER BY region;
 -- query 5
 -- @skip_result_check=true
 INSERT INTO ice_ivm_fjoin_${uuid0}.ns_${uuid0}.dim VALUES
-  (40, 'north');
+  ROW(40, 'north');
 INSERT INTO ice_ivm_fjoin_${uuid0}.ns_${uuid0}.fact VALUES
-  (6, 20, 80),
-  (7, 40, 60),
-  (8, 10, -9);
+  ROW(6, 20, 80),
+  ROW(7, 40, 60),
+  ROW(8, 10, -9);
 
 -- query 6
 -- @skip_result_check=true
@@ -157,7 +132,7 @@ ORDER BY region;
 -- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW fjoin_mv_${uuid0};
-DROP TABLE ice_ivm_fjoin_${uuid0}.ns_${uuid0}.fact FORCE;
-DROP TABLE ice_ivm_fjoin_${uuid0}.ns_${uuid0}.dim FORCE;
-DROP DATABASE ice_ivm_fjoin_${uuid0}.ns_${uuid0};
+DROP TABLE ice_ivm_fjoin_${uuid0}.ns_${uuid0}.fact ;
+DROP TABLE ice_ivm_fjoin_${uuid0}.ns_${uuid0}.dim ;
+DROP SCHEMA ice_ivm_fjoin_${uuid0}.ns_${uuid0};
 DROP CATALOG ice_ivm_fjoin_${uuid0};

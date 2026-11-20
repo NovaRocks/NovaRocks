@@ -157,7 +157,7 @@ impl Scenario for IcebergDeleteWarmConcurrent {
         let mut control =
             SqlSession::new(context.sql_user(), context.trino_port(), context.deadline())?;
         control
-            .execute("SET enable_scan_datacache = true")
+            .execute("SET SESSION enable_scan_datacache = true")
             .map(|_| ())?;
         control
             .execute(create_catalog_sql_from_parts(
@@ -186,16 +186,22 @@ impl Scenario for IcebergDeleteWarmConcurrent {
         let table = format!("{CATALOG}.{namespace}.visible_rows");
         let private_operation = (|| -> Result<()> {
             control
-                .execute(format!("CREATE DATABASE {CATALOG}.{namespace}"))
+                .execute(format!("CREATE SCHEMA {CATALOG}.{namespace}"))
                 .map(|_| ())?;
-            control.execute(format!("CREATE TABLE {table} (id INT, p INT, value STRING) TBLPROPERTIES ('format-version'='3', 'write.row-lineage'='true')")).map(|_| ())?;
+            control
+                .execute(format!(
+                    "CREATE TABLE {table} (id INT, p INT, value VARCHAR) WITH (format_version = 3)"
+                ))
+                .map(|_| ())?;
             control
                 .execute(format!(
                     "INSERT INTO {table} VALUES (1,1,'one'),(2,1,'two'),(3,1,'three')"
                 ))
                 .map(|_| ())?;
             control
-                .execute(format!("ALTER TABLE {table} CREATE TAG before_delete"))
+                .execute(format!(
+                    "ALTER TABLE {table} EXECUTE create_tag(name => 'before_delete')"
+                ))
                 .map(|_| ())?;
             let old = format!("SELECT id,p,value FROM {table} FOR VERSION AS OF 'before_delete'");
             let latest = format!("SELECT id,p,value FROM {table}");
@@ -315,7 +321,7 @@ fn concurrent_row_bags(
         .map(|(sql, expected)| {
             Box::new(
                 move |connection: &mut SqlSession, statements: &ActorStatements| -> Result<()> {
-                    statements.run(connection, "SET enable_scan_datacache = true")??;
+                    statements.run(connection, "SET SESSION enable_scan_datacache = true")??;
                     verify_row_bag_result(statements.run(connection, &sql)??, &expected)
                 },
             ) as ProviderCheck

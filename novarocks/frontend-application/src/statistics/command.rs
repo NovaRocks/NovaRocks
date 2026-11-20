@@ -56,6 +56,32 @@ impl StatisticsCommandExecutor {
     pub fn new(application: Arc<dyn StatisticsApplicationPort>) -> Self {
         Self { application }
     }
+    pub(crate) fn prepare_trino_analyze(
+        &self,
+        properties: crate::query::analyze_property_computation::AnalyzeProperties,
+        admission: &novarocks_query_application::admitted_query_context::RequestContext,
+        context: &novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<
+        Box<dyn novarocks_query_application::session_control::GovernedStatementAction>,
+        novarocks_query_application::api::CommandError,
+    > {
+        let name =
+            novarocks_query_application::sql::lower_object_name(&properties.syntax.table_name);
+        let target = statistics_application_target(
+            &name.parts,
+            admission.session().current_catalog(),
+            admission.session().current_database(),
+        )?;
+        self.application
+            .prepare_analyze(
+                target,
+                super::attempt_executor::AnalyzeColumns::Declared(Box::new(properties)),
+                admission.execution(),
+                context,
+            )
+            .map_err(crate::statistics::application::StatisticsApplicationError::into_command_error)
+    }
+
     pub(crate) fn prepare_statement_action(
         &self,
         command: &StatisticsSqlCommand,
@@ -91,10 +117,9 @@ fn lower_application_command(
                     current_catalog,
                     current_database,
                 )?,
-                columns: if columns.is_empty() {
-                    StatisticsColumnIntent::AllColumns
-                } else {
-                    StatisticsColumnIntent::Explicit(columns.clone())
+                columns: match columns {
+                    None => StatisticsColumnIntent::AllColumns,
+                    Some(columns) => StatisticsColumnIntent::Explicit(columns.clone()),
                 },
             }
         }
@@ -109,13 +134,15 @@ mod tests {
     #[test]
     fn statistics_commands_keep_session_target_and_column_intent() {
         let statement = novarocks_query_application::sql::parse_single_statement(
-            "ANALYZE TABLE orders (order_id)",
+            "ANALYZE orders WITH (columns = ARRAY['order_id'])",
         )
         .unwrap();
-        let Some(novarocks_query_application::sql::ProductSqlCommand::Statistics(command)) =
-            novarocks_query_application::sql::lower_product_sql_command(&statement).unwrap()
-        else {
+        let novarocks_parser::ast::TrinoStatement::Analyze(statement) = statement else {
             panic!("statistics command")
+        };
+        let command = novarocks_sql::semantic::StatisticsSqlCommand::AnalyzeTable {
+            table: novarocks_query_application::sql::lower_object_name(&statement.table_name),
+            columns: Some(vec!["order_id".into()]),
         };
         assert_eq!(
             lower_application_command(&command, Some("ice"), "analytics").unwrap(),

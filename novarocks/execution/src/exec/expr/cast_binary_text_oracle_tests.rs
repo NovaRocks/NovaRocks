@@ -73,6 +73,7 @@ fn binary_text_oracle_exact_profile_source_nullability_policies_every_byte_slice
                     &FunctionValueType::new(DataType::Utf8, true),
                     policy,
                     allow,
+                    None,
                     &Control,
                 )
                 .unwrap();

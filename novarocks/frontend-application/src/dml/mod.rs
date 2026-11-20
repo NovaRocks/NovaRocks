@@ -27,5 +27,6 @@ pub(crate) mod observability;
 pub mod service;
 pub mod truncate;
 
+pub(crate) use delete::prepare_trino_delete_shape;
 pub(crate) use error::DmlError;
 pub(crate) use service::DmlService;

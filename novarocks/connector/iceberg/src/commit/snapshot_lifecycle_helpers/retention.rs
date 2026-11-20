@@ -314,8 +314,26 @@ impl RetentionPlan {
     }
 }
 
+pub(crate) fn parse_gc_enabled_property_value(value: &str) -> Result<bool> {
+    value.to_ascii_lowercase().parse::<bool>().map_err(|error| {
+        Error::new(
+            ErrorKind::DataInvalid,
+            format!(
+                "Invalid value for {}: {error}",
+                TableProperties::PROPERTY_GC_ENABLED
+            ),
+        )
+    })
+}
+
 pub(crate) fn require_gc(metadata: &TableMetadata) -> Result<()> {
-    if !TableProperties::new(metadata.properties()).gc_enabled()? {
+    let enabled = metadata
+        .properties()
+        .get(TableProperties::PROPERTY_GC_ENABLED)
+        .map(|value| parse_gc_enabled_property_value(value))
+        .transpose()?
+        .unwrap_or(TableProperties::PROPERTY_GC_ENABLED_DEFAULT);
+    if !enabled {
         return Err(Error::new(
             ErrorKind::FeatureUnsupported,
             "Snapshot expiration is disabled because gc.enabled is false",

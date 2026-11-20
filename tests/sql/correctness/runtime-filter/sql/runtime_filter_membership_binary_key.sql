@@ -24,19 +24,17 @@
 -- Probe IDs one and three carry the build key 0x01; ID two carries 0x02.
 DROP TABLE IF EXISTS ${case_db}.rf_membership_binary_probe;
 DROP TABLE IF EXISTS ${case_db}.rf_membership_binary_build;
-CREATE TABLE ${case_db}.rf_membership_binary_probe (id INT, k VARBINARY)
-TBLPROPERTIES ("format-version" = "3");
-CREATE TABLE ${case_db}.rf_membership_binary_build (id INT, k VARBINARY)
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.rf_membership_binary_probe (id INT, k VARBINARY) WITH (format_version = 3);
+CREATE TABLE ${case_db}.rf_membership_binary_build (id INT, k VARBINARY) WITH (format_version = 3);
 INSERT INTO ${case_db}.rf_membership_binary_probe VALUES
-    (1, x'01'), (2, x'02'), (3, x'01');
-INSERT INTO ${case_db}.rf_membership_binary_build VALUES (10, x'01');
+    ROW(1, X'01'), ROW(2, X'02'), ROW(3, X'01');
+INSERT INTO ${case_db}.rf_membership_binary_build VALUES ROW(10, X'01');
 
 -- Keep the small deterministic input eligible for ordinary RF placement gates.
-SET global_runtime_filter_build_min_size = 0;
-SET global_runtime_filter_probe_min_size = 0;
-SET global_runtime_filter_probe_min_selectivity = 0.0;
-SET enable_global_runtime_filter = true;
+SET SESSION global_runtime_filter_build_min_size = 0;
+SET SESSION global_runtime_filter_probe_min_size = 0;
+SET SESSION global_runtime_filter_probe_min_selectivity = 0.0;
+SET SESSION enable_global_runtime_filter = true;
 -- @explain_contains=HASH JOIN
 -- @explain_not_contains=RUNTIME FILTER GRAPH
 SELECT p.id
@@ -44,12 +42,12 @@ FROM ${case_db}.rf_membership_binary_probe p
 JOIN ${case_db}.rf_membership_binary_build b ON p.k = b.k
 ORDER BY p.id;
 
-SET enable_global_runtime_filter = false;
+SET SESSION enable_global_runtime_filter = false;
 SELECT p.id
 FROM ${case_db}.rf_membership_binary_probe p
 JOIN ${case_db}.rf_membership_binary_build b ON p.k = b.k
 ORDER BY p.id;
 
-SET enable_global_runtime_filter = true;
+SET SESSION enable_global_runtime_filter = true;
 DROP TABLE ${case_db}.rf_membership_binary_probe;
 DROP TABLE ${case_db}.rf_membership_binary_build;

@@ -51,76 +51,70 @@ DROP TABLE IF EXISTS ${case_db}.test_all_type_not_null;
 -- query 7
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t0 (
-  `v1` bigint NULL,
-  `v2` bigint NULL,
-  `v3` bigint NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+  "v1" bigint ,
+  "v2" bigint ,
+  "v3" bigint
+) WITH (format_version = 3);
 
 -- query 8
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t1 (
-  `v4` bigint NULL,
-  `v5` bigint NULL,
-  `v6` bigint NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+  "v4" bigint ,
+  "v5" bigint ,
+  "v6" bigint
+) WITH (format_version = 3);
 
 -- query 9
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t2 (
-  `v7` bigint NULL,
-  `v8` bigint NULL,
-  `v9` bigint NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+  "v7" bigint ,
+  "v8" bigint ,
+  "v9" bigint
+) WITH (format_version = 3);
 
 -- query 10
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t3 (
-  `v10` bigint NULL,
-  `v11` bigint NULL,
-  `v12` bigint NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+  "v10" bigint ,
+  "v11" bigint ,
+  "v12" bigint
+) WITH (format_version = 3);
 
 -- query 11
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.test_all_type (
-  `t1a` varchar(20) NULL,
-  `t1b` smallint(6) NULL,
-  `t1c` int(11) NULL,
-  `t1d` bigint(20) NULL,
-  `t1e` float NULL,
-  `t1f` double NULL,
-  `t1g` bigint(20) NULL,
-  `id_datetime` datetime NULL,
-  `id_date` date NULL,
-  `id_decimal` decimal(10,2) NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+  "t1a" varchar(20) ,
+  "t1b" smallint(6) ,
+  "t1c" int(11) ,
+  "t1d" bigint(20) ,
+  "t1e" float ,
+  "t1f" double ,
+  "t1g" bigint(20) ,
+  "id_datetime" datetime ,
+  "id_date" date ,
+  "id_decimal" decimal(10,2)
+) WITH (format_version = 3);
 
 -- query 12
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.test_all_type_not_null (
-  `t1a` varchar(20) NOT NULL,
-  `t1b` smallint(6) NOT NULL,
-  `t1c` int(11) NOT NULL,
-  `t1d` bigint(20) NOT NULL,
-  `t1e` float NOT NULL,
-  `t1f` double NOT NULL,
-  `t1g` bigint(20) NOT NULL,
-  `id_datetime` datetime NOT NULL,
-  `id_date` date NOT NULL,
-  `id_decimal` decimal(10,2) NOT NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+  "t1a" varchar(20) NOT NULL,
+  "t1b" smallint(6) NOT NULL,
+  "t1c" int(11) NOT NULL,
+  "t1d" bigint(20) NOT NULL,
+  "t1e" float NOT NULL,
+  "t1f" double NOT NULL,
+  "t1g" bigint(20) NOT NULL,
+  "id_datetime" datetime NOT NULL,
+  "id_date" date NOT NULL,
+  "id_decimal" decimal(10,2) NOT NULL
+) WITH (format_version = 3);
 
 -- query 13
 -- @skip_result_check=true
 INSERT INTO ${case_db}.t0 VALUES
-  (-10, -10, -10), (0, 0, 0), (1, 1, 1), (2, 2, 2),
-  (10, 10, 10), (20, 20, 20), (75, 75, 75), (511, 511, 511);
+  ROW(-10, -10, -10), ROW(0, 0, 0), ROW(1, 1, 1), ROW(2, 2, 2),
+  ROW(10, 10, 10), ROW(20, 20, 20), ROW(75, 75, 75), ROW(511, 511, 511);
 
 -- query 14
 -- @skip_result_check=true
@@ -149,32 +143,32 @@ INSERT INTO ${case_db}.t3 SELECT v1 * 2, v2 + 5, v3 * 3 FROM ${case_db}.t0 ORDER
 -- query 20
 -- @skip_result_check=true
 INSERT INTO ${case_db}.test_all_type VALUES
-  ('abc', 1, 1, 20, 1.1, 1.1, 1, '2021-01-01 00:00:00', '2021-01-01', 1.2),
-  ('中文', 1, 1, 20, 1.1, 1.1, 1, '2021-02-01 00:00:00', '2021-01-01', 1.2),
-  ('中文', 1, 1, 20, 1.1, 1.1, 1, '2021-02-04 00:00:00', '2021-02-04', 1.2),
-  ('中文', 1, 1, 1, 1.1, 1.1, 1, '2021-02-04 00:00:00', '2021-02-04', 1.2),
-  ('abcd', 2, 2, 2, 1.2, 1.2, 10, '2021-04-01 00:00:00', '2021-04-01', 1.25),
-  ('abcd', 2, 2, 2, 1.2, 1.2, 10, '2021-04-02 00:00:00', '2021-04-02', 1.25),
-  ('abcdefg', 20, 20, 20, 11.2, 11.2, 20, '2021-01-01 00:00:00', '2021-01-01', 2.25),
-  ('中文', 100, 100, 100, 100.01, 100.02, 1, '2021-01-01 00:00:00', '2021-01-01', 100.25),
-  (NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+  ROW('abc', 1, 1, 20, 1.1, 1.1, 1, '2021-01-01 00:00:00', '2021-01-01', 1.2),
+  ROW('中文', 1, 1, 20, 1.1, 1.1, 1, '2021-02-01 00:00:00', '2021-01-01', 1.2),
+  ROW('中文', 1, 1, 20, 1.1, 1.1, 1, '2021-02-04 00:00:00', '2021-02-04', 1.2),
+  ROW('中文', 1, 1, 1, 1.1, 1.1, 1, '2021-02-04 00:00:00', '2021-02-04', 1.2),
+  ROW('abcd', 2, 2, 2, 1.2, 1.2, 10, '2021-04-01 00:00:00', '2021-04-01', 1.25),
+  ROW('abcd', 2, 2, 2, 1.2, 1.2, 10, '2021-04-02 00:00:00', '2021-04-02', 1.25),
+  ROW('abcdefg', 20, 20, 20, 11.2, 11.2, 20, '2021-01-01 00:00:00', '2021-01-01', 2.25),
+  ROW('中文', 100, 100, 100, 100.01, 100.02, 1, '2021-01-01 00:00:00', '2021-01-01', 100.25),
+  ROW(NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
 
 -- query 21
 -- @skip_result_check=true
 INSERT INTO ${case_db}.test_all_type_not_null VALUES
-  ('ab', 1, -1, 18, 1.1, 1.1, 1, '2022-01-01 00:00:00', '2022-01-01', 1.2),
-  ('abc', 1, 1, 18, 1.1, 1.1, 1, '2021-01-01 00:00:00', '2021-01-01', 1.2),
-  ('中文', 1, 1, 20, 1.1, 1.1, 1, '2021-02-01 00:00:00', '2021-01-01', 1.2),
-  ('中文', 1, 1, 20, 1.1, 1.1, 1, '2021-02-04 00:00:00', '2021-02-04', 1.2),
-  ('中文', 1, 1, 21, 1.1, 1.1, 1, '2021-02-04 00:00:00', '2021-02-04', 1.2),
-  ('abc', 1, 1, 21, 1.1, 1.1, 1, '2021-02-04 00:00:00', '2021-02-04', 1.2),
-  ('中文', 21, 1, 21, 1.1, 1.1, 1, '2021-02-04 00:00:00', '2021-02-04', 1.2),
-  ('中文', 200, 1, 21, 1.1, 1.1, 1, '2021-02-04 00:00:00', '2021-02-04', 1.2),
-  ('中文', 1, 1, 1, 1.1, 1.1, 1, '2021-02-04 00:00:00', '2021-02-04', 1.2),
-  ('abcd', 2, 2, 2, 1.2, 1.2, 10, '2021-04-01 00:00:00', '2021-04-01', 1.25),
-  ('abcd', 2, 2, 1, 1.2, 1.2, 10, '2021-04-02 00:00:00', '2021-04-02', 1.25),
-  ('abcdefg', 20, 20, 20, 11.2, 11.2, 20, '2021-01-01 00:00:00', '2021-01-01', 2.25),
-  ('中文', 100, 100, 100, 100.01, 100.02, 1, '2021-01-01 00:00:00', '2021-01-01', 100.25);
+  ROW('ab', 1, -1, 18, 1.1, 1.1, 1, '2022-01-01 00:00:00', '2022-01-01', 1.2),
+  ROW('abc', 1, 1, 18, 1.1, 1.1, 1, '2021-01-01 00:00:00', '2021-01-01', 1.2),
+  ROW('中文', 1, 1, 20, 1.1, 1.1, 1, '2021-02-01 00:00:00', '2021-01-01', 1.2),
+  ROW('中文', 1, 1, 20, 1.1, 1.1, 1, '2021-02-04 00:00:00', '2021-02-04', 1.2),
+  ROW('中文', 1, 1, 21, 1.1, 1.1, 1, '2021-02-04 00:00:00', '2021-02-04', 1.2),
+  ROW('abc', 1, 1, 21, 1.1, 1.1, 1, '2021-02-04 00:00:00', '2021-02-04', 1.2),
+  ROW('中文', 21, 1, 21, 1.1, 1.1, 1, '2021-02-04 00:00:00', '2021-02-04', 1.2),
+  ROW('中文', 200, 1, 21, 1.1, 1.1, 1, '2021-02-04 00:00:00', '2021-02-04', 1.2),
+  ROW('中文', 1, 1, 1, 1.1, 1.1, 1, '2021-02-04 00:00:00', '2021-02-04', 1.2),
+  ROW('abcd', 2, 2, 2, 1.2, 1.2, 10, '2021-04-01 00:00:00', '2021-04-01', 1.25),
+  ROW('abcd', 2, 2, 1, 1.2, 1.2, 10, '2021-04-02 00:00:00', '2021-04-02', 1.25),
+  ROW('abcdefg', 20, 20, 20, 11.2, 11.2, 20, '2021-01-01 00:00:00', '2021-01-01', 2.25),
+  ROW('中文', 100, 100, 100, 100.01, 100.02, 1, '2021-01-01 00:00:00', '2021-01-01', 100.25);
 
 -- ============================================================
 -- Subquery inner join with multi-column predicate pushdown
@@ -375,7 +369,7 @@ on v4 = v7;
 -- @order_sensitive=false
 select * from (select * from ${case_db}.t0 where v1 < 10) t0
 inner join ${case_db}.t1 on v1 = v4
-join ${case_db}.t2
+CROSS join ${case_db}.t2
 inner join (select * from ${case_db}.t3 where v10 > 1) t3
 on v7 = v10 and v10 = v4;
 
@@ -384,7 +378,7 @@ on v7 = v10 and v10 = v4;
 -- @order_sensitive=false
 select * from (select * from ${case_db}.t0 where v1 < 10) t0
 left join ${case_db}.t1 on v1 = v4
-join ${case_db}.t2
+CROSS join ${case_db}.t2
 left join (select * from ${case_db}.t3 where v10 > 1) t3
 on v7 = v10 and v10 = v4;
 
@@ -393,7 +387,7 @@ on v7 = v10 and v10 = v4;
 -- @order_sensitive=false
 select * from (select * from ${case_db}.t0 where v1 < 10) t0
 right join ${case_db}.t1 on v1 = v4
-join ${case_db}.t2
+CROSS join ${case_db}.t2
 right join (select * from ${case_db}.t3 where v10 > 1) t3
 on v7 = v10 and v10 = v4;
 
@@ -402,7 +396,7 @@ on v7 = v10 and v10 = v4;
 -- @order_sensitive=false
 select * from (select * from ${case_db}.t0 where v1 < 10) t0
 inner join ${case_db}.t1 on v1 = v4
-join ${case_db}.t2
+CROSS join ${case_db}.t2
 left join (select * from ${case_db}.t3 where v10 > 1) t3
 on v7 = v10 and v10 = v4;
 
@@ -411,7 +405,7 @@ on v7 = v10 and v10 = v4;
 -- @order_sensitive=false
 select * from (select * from ${case_db}.t0 where v1 < 10) t0
 left join ${case_db}.t1 on v1 = v4
-join ${case_db}.t2
+CROSS join ${case_db}.t2
 inner join (select * from ${case_db}.t3 where v10 > 1) t3
 on v7 = v10 and v10 = v4;
 
@@ -420,7 +414,7 @@ on v7 = v10 and v10 = v4;
 -- @order_sensitive=false
 select * from (select * from ${case_db}.t0 where v1 < 10) t0
 left join ${case_db}.t1 on v1 = v4
-join ${case_db}.t2
+CROSS join ${case_db}.t2
 right join (select * from ${case_db}.t3 where v10 > 1) t3
 on v7 = v10 and v10 = v4;
 
@@ -429,7 +423,7 @@ on v7 = v10 and v10 = v4;
 -- @order_sensitive=false
 select * from (select * from ${case_db}.t0 where v1 < 10) t0
 right join ${case_db}.t1 on v1 = v4
-join ${case_db}.t2
+CROSS join ${case_db}.t2
 right join (select * from ${case_db}.t3 where v10 > 1) t3
 on v7 = v10 and v10 = v4;
 
@@ -442,7 +436,7 @@ on v7 = v10 and v10 = v4;
 -- @order_sensitive=false
 select * from (select * from ${case_db}.t0 where v1 < 10) t0
 inner join ${case_db}.t1 on v1 = v4 + abs(1)
-join ${case_db}.t2
+CROSS join ${case_db}.t2
 inner join (select * from ${case_db}.t3 where v10 > 1) t3
 on v7 > v10 and v10 > v4;
 
@@ -451,7 +445,7 @@ on v7 > v10 and v10 > v4;
 -- @order_sensitive=false
 select * from (select * from ${case_db}.t0 where v1 < 10) t0
 left join ${case_db}.t1 on v1 = v4 + abs(1)
-join ${case_db}.t2
+CROSS join ${case_db}.t2
 left join (select * from ${case_db}.t3 where v10 > 1) t3
 on v7 > v10 and v10 > v4;
 
@@ -460,7 +454,7 @@ on v7 > v10 and v10 > v4;
 -- @order_sensitive=false
 select * from (select * from ${case_db}.t0 where v1 < 10) t0
 right join ${case_db}.t1 on v1 = v4 + abs(1)
-join ${case_db}.t2
+CROSS join ${case_db}.t2
 right join (select * from ${case_db}.t3 where v10 > 1) t3
 on v7 > v10 and v10 > v4;
 
@@ -469,7 +463,7 @@ on v7 > v10 and v10 > v4;
 -- @order_sensitive=false
 select * from (select * from ${case_db}.t0 where v1 < 10) t0
 inner join ${case_db}.t1 on v1 = v4 + abs(1)
-join ${case_db}.t2
+CROSS join ${case_db}.t2
 left join (select * from ${case_db}.t3 where v10 > 1) t3
 on v7 > v10 and v10 > v4;
 
@@ -478,7 +472,7 @@ on v7 > v10 and v10 > v4;
 -- @order_sensitive=false
 select * from (select * from ${case_db}.t0 where v1 < 10) t0
 left join ${case_db}.t1 on v1 = v4 + abs(1)
-join ${case_db}.t2
+CROSS join ${case_db}.t2
 inner join (select * from ${case_db}.t3 where v10 > 1) t3
 on v7 > v10 and v10 > v4;
 
@@ -487,7 +481,7 @@ on v7 > v10 and v10 > v4;
 -- @order_sensitive=false
 select * from (select * from ${case_db}.t0 where v1 < 10) t0
 left join ${case_db}.t1 on v1 = v4 + abs(1)
-join ${case_db}.t2
+CROSS join ${case_db}.t2
 right join (select * from ${case_db}.t3 where v10 > 1) t3
 on v7 > v10 and v10 > v4;
 
@@ -496,7 +490,7 @@ on v7 > v10 and v10 > v4;
 -- @order_sensitive=false
 select * from (select * from ${case_db}.t0 where v1 < 10) t0
 right join ${case_db}.t1 on v1 = v4 + abs(1)
-join ${case_db}.t2
+CROSS join ${case_db}.t2
 right join (select * from ${case_db}.t3 where v10 > 1) t3
 on v7 > v10 and v10 > v4;
 

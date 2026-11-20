@@ -110,7 +110,7 @@ fn options() -> LocalCompileOptions {
 enum Shape {
     Binary(BinaryOperator),
     SimpleCase,
-    CarrierCast,
+    CarrierCast(Option<novarocks_type_contract::ArrayCastFailureMode>),
 }
 #[derive(Clone, Copy)]
 enum Mode {
@@ -354,7 +354,7 @@ fn fixture(
     let a = builder
         .fixture_definition(NodeId::new(0), left.clone(), ExprKind::Value(inputs[0].1))
         .unwrap();
-    let b = if matches!(shape, Shape::CarrierCast) {
+    let b = if matches!(shape, Shape::CarrierCast(_)) {
         a
     } else {
         builder
@@ -386,7 +386,7 @@ fn fixture(
                 vec![a, b],
             )
         }
-        Shape::CarrierCast => (
+        Shape::CarrierCast(array_failure_mode) => (
             ExprKind::Cast {
                 expr: a,
                 target: right.data_type().clone(),
@@ -396,6 +396,7 @@ fn fixture(
                     expected_key:
                         novarocks_type_contract::SemanticParameterKey::AllowThrowException,
                 },
+                array_failure_mode,
             },
             right.clone(),
             vec![a],
@@ -543,7 +544,7 @@ fn fixture(
         rand_request,
         rand_definitions,
         constant_policy: options().constants,
-        carrier_cast: matches!(shape, Shape::CarrierCast),
+        carrier_cast: matches!(shape, Shape::CarrierCast(_)),
     })
 }
 fn package(functions: &PureEngineFunctionCatalog, fixture: Fixture) -> Arc<FragmentPackage> {
@@ -1009,7 +1010,9 @@ fn nullable_null_domain_keeps_a_checked_recipe_instead_of_a_nonnullable_boolean_
         let occurrence = occurrence(&program);
         let sites = match shape {
             Shape::Binary(_) => vec![ProgramComparisonSite::Binary(occurrence)],
-            Shape::CarrierCast => unreachable!("this matrix only contains comparison nodes"),
+            Shape::CarrierCast(_) => {
+                unreachable!("this matrix only contains comparison nodes")
+            }
             Shape::SimpleCase => vec![
                 ProgramComparisonSite::CaseWhen { occurrence, arm: 0 },
                 ProgramComparisonSite::CaseWhen { occurrence, arm: 1 },
@@ -1095,7 +1098,7 @@ fn actual_fragment_compilation_preserves_primitive_capability_refusals() {
         &functions,
         fixture(
             &functions,
-            Shape::CarrierCast,
+            Shape::CarrierCast(None),
             Mode::Project,
             FunctionValueType::new(DataType::Date32, true),
             FunctionValueType::new(DataType::Int8, true),

@@ -15,4 +15,4 @@
 -- specific language governing permissions and limitations
 -- under the License.
 
-DROP CATALOG IF EXISTS `iceberg_rest_object_store_${suite_uuid0}`;
+DROP CATALOG IF EXISTS "iceberg_rest_object_store_${suite_uuid0}";

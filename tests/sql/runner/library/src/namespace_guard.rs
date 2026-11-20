@@ -21,20 +21,86 @@ use anyhow::{Context, Result, ensure};
 use novarocks_cluster_harness::fixture_run::{RunStorageScope, ScratchIdentity, canonical_s3};
 use novarocks_cluster_harness::isolated_iceberg_rest::{RestObjectStoreOwner, RestStorageBinding};
 use novarocks_parser::ast::{
-    CatalogStatement, DmlStatement, IcebergStatement, LiteralKind, MaintenanceStatement,
-    MaterializedViewStatement, ObjectName, SessionStatement, Statement, TableStatement,
-    ViewStatement,
+    Expr, LiteralKind, ObjectName, Relation, TrinoCreateCatalog, TrinoStatement,
 };
+use novarocks_parser::parser;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 #[derive(Clone, Debug)]
-enum Catalog {
+pub(crate) enum Catalog {
     Rest(String),
     Hadoop(String),
     Other,
 }
+#[derive(Debug)]
+pub(crate) enum PreparedTrinoNamespace {
+    None,
+    RejectedSyntax,
+    CatalogCreated(String, Catalog),
+    CatalogDropped(String),
+    VerifyObject {
+        base: String,
+        namespace: String,
+        object: String,
+        collection: &'static str,
+    },
+}
+
+fn fixture_catalog(value: &TrinoCreateCatalog) -> Result<Catalog> {
+    if !value.connector_name.value.eq_ignore_ascii_case("iceberg") {
+        return Ok(Catalog::Other);
+    }
+    let mut properties = BTreeMap::new();
+    for property in &value.properties {
+        let key = property.name.value.to_ascii_lowercase();
+        if !matches!(
+            key.as_str(),
+            "iceberg.catalog.type"
+                | "uri"
+                | "iceberg.catalog.uri"
+                | "warehouse"
+                | "iceberg.catalog.warehouse"
+        ) {
+            continue;
+        }
+        let Some(Expr::Literal(literal)) = &property.value else {
+            anyhow::bail!("fixture catalog ownership requires a literal {key}");
+        };
+        let LiteralKind::String(interpreted) = &literal.kind else {
+            anyhow::bail!("fixture catalog ownership requires a string {key}");
+        };
+        ensure!(
+            properties.insert(key, interpreted).is_none(),
+            "fixture catalog repeats an ownership property"
+        );
+    }
+    // The provider's two accepted aliases have ordered precedence.
+    match properties
+        .get("iceberg.catalog.type")
+        .map(|kind| kind.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("rest") => Ok(Catalog::Rest(
+            properties
+                .get("uri")
+                .or_else(|| properties.get("iceberg.catalog.uri"))
+                .context("REST catalog omitted exact URI")?
+                .trim_end_matches('/')
+                .to_owned(),
+        )),
+        None | Some("hadoop") => Ok(Catalog::Hadoop(
+            (*properties
+                .get("iceberg.catalog.warehouse")
+                .or_else(|| properties.get("warehouse"))
+                .context("Hadoop catalog omitted exact warehouse")?)
+            .clone(),
+        )),
+        _ => Ok(Catalog::Other),
+    }
+}
+
 #[derive(Clone, Default, Debug)]
 pub(crate) struct CatalogFacts(
     Arc<Mutex<BTreeMap<String, Catalog>>>,
@@ -137,6 +203,10 @@ impl NamespaceGuard {
             .iter()
             .map(|i| i.value.clone())
             .collect::<Vec<_>>();
+        ensure!(
+            (1..=if database { 2 } else { 3 }).contains(&parts.len()),
+            "unproven qualification for guarded SQL object"
+        );
         Ok(match (database, parts.as_slice()) {
             (true, [catalog, namespace]) => Some((catalog.clone(), namespace.clone(), None)),
             (true, [namespace]) => self
@@ -144,14 +214,6 @@ impl NamespaceGuard {
                 .clone()
                 .map(|catalog| (catalog, namespace.clone(), None)),
             (false, [catalog, namespace, table]) => {
-                Some((catalog.clone(), namespace.clone(), Some(table.clone())))
-            }
-            (false, [catalog, namespace, table, reference])
-                if reference
-                    .strip_prefix("branch_")
-                    .or_else(|| reference.strip_prefix("tag_"))
-                    .is_some_and(|name| !name.is_empty()) =>
-            {
                 Some((catalog.clone(), namespace.clone(), Some(table.clone())))
             }
             (false, [namespace, table]) => self
@@ -209,164 +271,173 @@ impl NamespaceGuard {
         }
         Ok(())
     }
-    pub fn before(&self, sql: &str) -> Result<()> {
+    pub(crate) fn prepare_trino(
+        &self,
+        sql: &str,
+        enrolled_syntax_negative: bool,
+    ) -> Result<PreparedTrinoNamespace> {
         ensure!(
             Instant::now() < self.deadline,
             "original SQL namespace clock expired"
         );
-        let Ok(statements) = novarocks_parser::parse(sql) else {
-            return Ok(());
+        let parsed = match parser::parse_statement(sql) {
+            Ok(parsed) => parsed,
+            Err(
+                novarocks_parser::ParserError::Lex(_) | novarocks_parser::ParserError::Parse(_),
+            ) if enrolled_syntax_negative => return Ok(PreparedTrinoNamespace::RejectedSyntax),
+            Err(error) => return Err(error).context("prove guarded SQL namespace ownership"),
         };
-        for statement in statements {
-            match statement {
-                Statement::Catalog(CatalogStatement::CreateDatabase(value)) => {
-                    self.ensure_write(&value.name, true)?
+        self.prepare_statement(&parsed)
+    }
+
+    fn prepare_statement(&self, parsed: &TrinoStatement) -> Result<PreparedTrinoNamespace> {
+        use TrinoStatement::*;
+        let (name, database) = match parsed {
+            CreateCatalog(value) => {
+                let name = novarocks_types::naming::normalize_identifier(&value.catalog_name.value)
+                    .map_err(anyhow::Error::msg)?;
+                // A conditional attachment cannot overwrite an already known effective fact.
+                if value.not_exists && self.catalog_fact(&name)?.is_some() {
+                    return Ok(PreparedTrinoNamespace::None);
                 }
-                Statement::Table(TableStatement::Create(value)) => {
-                    self.ensure_write(&value.name, false)?
+                return Ok(PreparedTrinoNamespace::CatalogCreated(
+                    name,
+                    fixture_catalog(value)?,
+                ));
+            }
+            DropCatalog(value) => {
+                return Ok(PreparedTrinoNamespace::CatalogDropped(
+                    value.catalog_name.value.to_ascii_lowercase(),
+                ));
+            }
+            CreateSchema(value) => (&value.schema_name, true),
+            DropSchema(value) => (&value.schema_name, true),
+            RenameSchema(value) => (&value.source, true),
+            CreateTable(value) => return self.prepare_verify(&value.name, "tables"),
+            CreateTableAsSelect(value) => return self.prepare_verify(&value.name, "tables"),
+            CreateView(value) => return self.prepare_verify(&value.name, "views"),
+            CreateMaterializedView(value) => return self.prepare_verify(&value.name, "tables"),
+            DropTable(value) => (&value.table_name, false),
+            DropView(value) => (&value.name, false),
+            DropMaterializedView(value) => (&value.name, false),
+            RefreshView(value) => (&value.name, false),
+            RefreshMaterializedView(value) => (&value.table.name, false),
+            MaterializedViewExecute(value) => (&value.table.name, false),
+            TruncateTable(value) => (&value.table_name, false),
+            Insert(value) => (&value.table.name, false),
+            Delete(value) => (&value.table.name, false),
+            Update(value) => (&value.table.name, false),
+            Merge(value) => {
+                let mut relation = &value.target;
+                while let Relation::Aliased(alias) = relation {
+                    relation = alias.relation.as_ref();
                 }
-                Statement::Catalog(CatalogStatement::DropDatabase(value)) => {
-                    self.ensure_write(&value.name, true)?
-                }
-                Statement::Catalog(CatalogStatement::DropTable(value)) => {
-                    self.ensure_write(&value.name, false)?
-                }
-                Statement::Catalog(CatalogStatement::TruncateTable(value)) => {
-                    self.ensure_write(&value.name, false)?
-                }
-                Statement::Dml(DmlStatement::Delete(value)) => {
-                    self.ensure_write(&value.target, false)?
-                }
-                Statement::Dml(DmlStatement::Update(value)) => {
-                    self.ensure_write(&value.target, false)?
-                }
-                Statement::Dml(DmlStatement::Merge(value)) => {
-                    self.ensure_write(&value.target, false)?
-                }
-                Statement::Dml(DmlStatement::AddEqualityDelete(value)) => {
-                    self.ensure_write(&value.target, false)?
-                }
-                Statement::Dml(DmlStatement::Insert(value)) => {
-                    self.ensure_write(&value.target, false)?
-                }
-                Statement::Dml(DmlStatement::CreateTableAsSelect(value)) => {
-                    let TableStatement::Create(table) = value.table;
-                    self.ensure_write(&table.name, false)?;
-                }
-                Statement::Iceberg(IcebergStatement::AlterTable(value)) => {
-                    self.ensure_write(&value.table, false)?
-                }
-                Statement::View(ViewStatement::Create(value)) => {
-                    self.ensure_write(&value.name, false)?
-                }
-                Statement::View(ViewStatement::Drop(value)) => {
-                    self.ensure_write(&value.name, false)?
-                }
-                Statement::MaterializedView(MaterializedViewStatement::Create(value)) => {
-                    self.ensure_write(&value.name, false)?
-                }
-                Statement::MaterializedView(MaterializedViewStatement::Drop(value)) => {
-                    self.ensure_write(&value.name, false)?
-                }
-                Statement::MaterializedView(MaterializedViewStatement::Alter(value)) => {
-                    self.ensure_write(&value.name, false)?
-                }
-                Statement::MaterializedView(MaterializedViewStatement::Refresh(value)) => {
-                    self.ensure_write(&value.name, false)?
-                }
-                Statement::Maintenance(MaintenanceStatement::Optimize(value)) => {
-                    self.ensure_write(&value.table, false)?
-                }
-                Statement::Maintenance(MaintenanceStatement::RewriteManifests(value)) => {
-                    self.ensure_write(&value.table, false)?
-                }
-                Statement::Maintenance(MaintenanceStatement::ExpireSnapshots(value)) => {
-                    self.ensure_write(&value.table, false)?
-                }
-                Statement::Maintenance(MaintenanceStatement::RemoveOrphanFiles(value)) => {
-                    self.ensure_write(&value.table, false)?
-                }
-                _ => {}
+                let Relation::Table(table) = relation else {
+                    anyhow::bail!("guarded MERGE target is not a table");
+                };
+                (&table.name, false)
+            }
+            TableExecute(value) => (&value.table.name, false),
+            RenameTable(value) => {
+                self.ensure_write(&value.target, false)?;
+                (&value.source, false)
+            }
+            RenameView(value) => {
+                self.ensure_write(&value.target, false)?;
+                (&value.source, false)
+            }
+            RenameMaterializedView(value) => {
+                self.ensure_write(&value.target, false)?;
+                (&value.source, false)
+            }
+            SetProperties(value) => (&value.name, false),
+            AddColumn(value) => (&value.name, false),
+            DropColumn(value) => (&value.table, false),
+            RenameColumn(value) => (&value.table, false),
+            SetDefaultValue(value) => (&value.table_name, false),
+            DropDefaultValue(value) => (&value.table_name, false),
+            SetColumnType(value) => (&value.table_name, false),
+            DropNotNullConstraint(value) => (&value.table, false),
+            CreateBranch(value) => (&value.table_name, false),
+            DropBranch(value) => (&value.table_name, false),
+            FastForwardBranch(value) => (&value.table_name, false),
+            ExplainAnalyze(value) => return self.prepare_statement(&value.statement),
+            // Role, query, session and procedure admission remain with the FE.
+            _ => return Ok(PreparedTrinoNamespace::None),
+        };
+        self.ensure_write(name, database)?;
+        Ok(PreparedTrinoNamespace::None)
+    }
+
+    fn prepare_verify(
+        &self,
+        name: &ObjectName,
+        collection: &'static str,
+    ) -> Result<PreparedTrinoNamespace> {
+        self.ensure_write(name, false)?;
+        if let Some((catalog, namespace, Some(object))) = self.target(name, false)?
+            && let Some(Catalog::Rest(base)) = self.catalog_fact(&catalog)?
+            && !self.facts.private_rest(&base)?
+        {
+            return Ok(PreparedTrinoNamespace::VerifyObject {
+                base,
+                namespace,
+                object,
+                collection,
+            });
+        }
+        Ok(PreparedTrinoNamespace::None)
+    }
+
+    pub(crate) fn complete_trino(&mut self, prepared: PreparedTrinoNamespace) -> Result<()> {
+        match prepared {
+            PreparedTrinoNamespace::None => {}
+            PreparedTrinoNamespace::RejectedSyntax => {
+                anyhow::bail!("guarded syntax-negative SQL unexpectedly succeeded")
+            }
+            PreparedTrinoNamespace::CatalogCreated(name, fact) => {
+                self.facts
+                    .0
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("SQL catalog facts lock poisoned"))?
+                    .insert(name, fact);
+            }
+            PreparedTrinoNamespace::CatalogDropped(name) => {
+                self.facts
+                    .0
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("SQL catalog facts lock poisoned"))?
+                    .remove(&name);
+            }
+            PreparedTrinoNamespace::VerifyObject {
+                base,
+                namespace,
+                object,
+                collection,
+            } => {
+                self.verify_object(&base, &namespace, &object, collection)?;
             }
         }
         Ok(())
     }
-    pub fn after(&mut self, sql: &str) -> Result<()> {
-        let Ok(statements) = novarocks_parser::parse(sql) else {
-            return Ok(());
-        };
-        for statement in statements {
-            match statement {
-                Statement::Catalog(CatalogStatement::CreateCatalog(value)) => {
-                    let properties = value
-                        .properties
-                        .iter()
-                        .filter_map(|p| match (&p.key.kind, &p.value.kind) {
-                            (LiteralKind::String(k), LiteralKind::String(v)) => {
-                                Some((k.to_ascii_lowercase(), v.clone()))
-                            }
-                            _ => None,
-                        })
-                        .collect::<BTreeMap<_, _>>();
-                    // Mirror the provider's accepted aliases and precedence. This runs
-                    // after successful SQL; it must project the same catalog facts.
-                    let kind = properties.get("iceberg.catalog.type");
-                    let provider = properties.get("type");
-                    let fact =
-                        if provider.is_some_and(|value| !value.eq_ignore_ascii_case("iceberg")) {
-                            Catalog::Other
-                        } else {
-                            match kind.map(|value| value.to_ascii_lowercase()).as_deref() {
-                                Some("rest") => Catalog::Rest(
-                                    properties
-                                        .get("uri")
-                                        .or_else(|| properties.get("iceberg.catalog.uri"))
-                                        .context("REST catalog omitted exact URI")?
-                                        .trim_end_matches('/')
-                                        .to_string(),
-                                ),
-                                None | Some("hadoop") => Catalog::Hadoop(
-                                    properties
-                                        .get("iceberg.catalog.warehouse")
-                                        .or_else(|| properties.get("warehouse"))
-                                        .context("Hadoop catalog omitted exact warehouse")?
-                                        .clone(),
-                                ),
-                                _ => Catalog::Other,
-                            }
-                        };
-                    self.facts
-                        .0
-                        .lock()
-                        .map_err(|_| anyhow::anyhow!("SQL catalog facts lock poisoned"))?
-                        .insert(value.name.value, fact);
-                }
-                Statement::Table(TableStatement::Create(value)) => {
-                    self.verify_object(&value.name, "tables")?
-                }
-                Statement::Dml(DmlStatement::CreateTableAsSelect(value)) => {
-                    let TableStatement::Create(table) = value.table;
-                    self.verify_object(&table.name, "tables")?;
-                }
-                Statement::View(ViewStatement::Create(value)) => {
-                    self.verify_object(&value.name, "views")?
-                }
-                Statement::MaterializedView(MaterializedViewStatement::Create(value)) => {
-                    // MVs are document-managed Iceberg tables published through
-                    // the existing staged-table provider path.
-                    self.verify_object(&value.name, "tables")?
-                }
-                Statement::Session(SessionStatement::Use(value)) => {
-                    if let Some(catalog) = value.catalog {
-                        self.catalog = Some(catalog.value);
-                    }
-                    self.namespace = Some(value.database.value);
-                }
-                _ => {}
-            }
+
+    #[cfg(test)]
+    fn before(&self, sql: &str) -> Result<()> {
+        for frame in crate::session::split_trino_sql_statements(sql)? {
+            self.prepare_trino(&frame, false)?;
         }
         Ok(())
     }
+
+    #[cfg(test)]
+    fn after(&mut self, sql: &str) -> Result<()> {
+        for frame in crate::session::split_trino_sql_statements(sql)? {
+            let effect = self.prepare_trino(&frame, false)?;
+            self.complete_trino(effect)?;
+        }
+        Ok(())
+    }
+
     fn remaining(&self) -> Result<std::time::Duration> {
         let left = self.deadline.saturating_duration_since(Instant::now());
         ensure!(!left.is_zero(), "original REST namespace deadline expired");
@@ -380,40 +451,38 @@ impl NamespaceGuard {
             .push(namespace);
         Ok(url)
     }
-    fn verify_object(&self, name: &ObjectName, collection: &str) -> Result<()> {
-        let Some((catalog, namespace, Some(table))) = self.target(name, false)? else {
-            return Ok(());
-        };
-        if let Some(Catalog::Rest(base)) = self.catalog_fact(&catalog)? {
-            if self.facts.private_rest(&base)? {
-                return Ok(());
-            }
-            ensure!(
-                self.owned(&namespace),
-                "REST table validation refused a foreign namespace"
-            );
-            let mut url = Self::namespace_url(&base, &namespace)?;
-            url.path_segments_mut()
-                .unwrap()
-                .push(collection)
-                .push(&table);
-            let response: serde_json::Value = reqwest::blocking::Client::new()
-                .get(url)
-                .timeout(self.remaining()?)
-                .send()?
-                .error_for_status()?
-                .json()?;
-            let location = response["metadata"]["location"]
-                .as_str()
-                .context("REST table metadata omitted actual location")?;
-            ensure!(
-                self.storage
-                    .as_ref()
-                    .context("shared REST verification omitted original storage projection")?
-                    .belongs(location)?,
-                "REST object actual location lies outside its admitted run storage scope"
-            );
-        }
+    fn verify_object(
+        &self,
+        base: &str,
+        namespace: &str,
+        object: &str,
+        collection: &str,
+    ) -> Result<()> {
+        ensure!(
+            self.owned(namespace),
+            "REST table validation refused a foreign namespace"
+        );
+        let mut url = Self::namespace_url(base, namespace)?;
+        url.path_segments_mut()
+            .unwrap()
+            .push(collection)
+            .push(object);
+        let response: serde_json::Value = reqwest::blocking::Client::new()
+            .get(url)
+            .timeout(self.remaining()?)
+            .send()?
+            .error_for_status()?
+            .json()?;
+        let location = response["metadata"]["location"]
+            .as_str()
+            .context("REST table metadata omitted actual location")?;
+        ensure!(
+            self.storage
+                .as_ref()
+                .context("shared REST verification omitted original storage projection")?
+                .belongs(location)?,
+            "REST object actual location lies outside its admitted run storage scope"
+        );
         Ok(())
     }
 }
@@ -514,9 +583,9 @@ mod tests {
             .facts
             .bind_origins(&[&base], RestObjectStoreOwner::PrivateObjectStore)
             .unwrap();
-        guard.after(&format!(r#"CREATE EXTERNAL CATALOG catalog PROPERTIES ("type"="iceberg", "iceberg.catalog.type"="rest", "uri"="{base}");"#)).unwrap();
+        guard.after(&format!(r#"CREATE CATALOG catalog USING iceberg WITH ("iceberg.catalog.type" = 'rest', "uri" = '{base}');"#)).unwrap();
         for sql in [
-            "CREATE DATABASE ordinary_private_namespace;",
+            "CREATE SCHEMA ordinary_private_namespace;",
             "CREATE TABLE ordinary_private_namespace.t (id INT);",
             "INSERT INTO ordinary_private_namespace.t VALUES (1);",
         ] {
@@ -529,10 +598,10 @@ mod tests {
         );
         // An independently declared catalog does not inherit the private owner
         // merely because it shares the invocation, loopback host or URI prefix.
-        guard.after(&format!(r#"CREATE EXTERNAL CATALOG unrelated PROPERTIES ("type"="iceberg", "iceberg.catalog.type"="rest", "uri"="{base}/unowned");"#)).unwrap();
+        guard.after(&format!(r#"CREATE CATALOG unrelated USING iceberg WITH ("iceberg.catalog.type" = 'rest', "uri" = '{base}/unowned');"#)).unwrap();
         assert!(
             guard
-                .before("CREATE DATABASE unrelated.foreign_namespace;")
+                .before("CREATE SCHEMA unrelated.foreign_namespace;")
                 .unwrap_err()
                 .to_string()
                 .contains("exact namespace")
@@ -579,12 +648,12 @@ mod tests {
         );
         let mut guard = guard();
         guard.facts = facts;
-        guard.after(r#"CREATE EXTERNAL CATALOG catalog PROPERTIES ("type"="iceberg", "iceberg.catalog.type"="rest", "uri"="http://127.0.0.1:38002");"#).unwrap();
+        guard.after(r#"CREATE CATALOG catalog USING iceberg WITH ("iceberg.catalog.type" = 'rest', "uri" = 'http://127.0.0.1:38002');"#).unwrap();
         guard
-            .before("CREATE DATABASE private_through_owned_proxy;")
+            .before("CREATE SCHEMA private_through_owned_proxy;")
             .unwrap();
         guard
-            .after("CREATE DATABASE private_through_owned_proxy;")
+            .after("CREATE SCHEMA private_through_owned_proxy;")
             .unwrap();
         guard
             .after("CREATE TABLE private_through_owned_proxy.t (id INT);")
@@ -608,8 +677,8 @@ mod tests {
             .facts
             .bind_origins(&[&base], RestObjectStoreOwner::MachineScratch)
             .unwrap();
-        guard.after(&format!(r#"CREATE EXTERNAL CATALOG catalog PROPERTIES ("type"="iceberg", "iceberg.catalog.type"="rest", "uri"="{base}");"#)).unwrap();
-        assert!(guard.before("CREATE DATABASE catalog.foreign;").is_err());
+        guard.after(&format!(r#"CREATE CATALOG catalog USING iceberg WITH ("iceberg.catalog.type" = 'rest', "uri" = '{base}');"#)).unwrap();
+        assert!(guard.before("CREATE SCHEMA catalog.foreign;").is_err());
         let error = guard
             .after(&format!("CREATE TABLE {namespace}.t (id INT);"))
             .unwrap_err();
@@ -626,18 +695,18 @@ mod tests {
                 RestObjectStoreOwner::PrivateObjectStore,
             )
             .unwrap();
-        guard.after(r#"CREATE EXTERNAL CATALOG catalog PROPERTIES ("type"="iceberg", "iceberg.catalog.type"="rest", "uri"="http://127.0.0.1:38001");"#).unwrap();
+        guard.after(r#"CREATE CATALOG catalog USING iceberg WITH ("iceberg.catalog.type" = 'rest', "uri" = 'http://127.0.0.1:38001');"#).unwrap();
         guard.deadline = Instant::now();
         assert!(
             guard
-                .before("CREATE DATABASE original_private_name;")
+                .before("CREATE SCHEMA original_private_name;")
                 .unwrap_err()
                 .to_string()
                 .contains("clock expired")
         );
         let cleanup = guard.for_cleanup(Instant::now() + Duration::from_secs(10));
         cleanup
-            .before("DROP DATABASE original_private_name;")
+            .before("DROP SCHEMA original_private_name;")
             .unwrap();
         assert!(
             cleanup
@@ -648,38 +717,38 @@ mod tests {
         let expired_cleanup = guard.for_cleanup(Instant::now());
         assert!(
             expired_cleanup
-                .before("DROP DATABASE original_private_name;")
+                .before("DROP SCHEMA original_private_name;")
                 .is_err()
         );
     }
     #[test]
     fn rest_catalog_aliases_follow_provider_uri_precedence() {
         for (properties, expected) in [
-            (r#""uri"="http://127.0.0.1:1/""#, "http://127.0.0.1:1"),
+            (r#""uri" = 'http://127.0.0.1:1/'"#, "http://127.0.0.1:1"),
             (
-                r#""iceberg.catalog.uri"="http://127.0.0.1:2""#,
+                r#""iceberg.catalog.uri" = 'http://127.0.0.1:2'"#,
                 "http://127.0.0.1:2",
             ),
             (
-                r#""uri"="http://127.0.0.1:3", "iceberg.catalog.uri"="http://127.0.0.1:4""#,
+                r#""uri" = 'http://127.0.0.1:3', "iceberg.catalog.uri" = 'http://127.0.0.1:4'"#,
                 "http://127.0.0.1:3",
             ),
         ] {
             let mut guard = guard();
             guard.after(&format!(
-                r#"CREATE EXTERNAL CATALOG catalog PROPERTIES ("type"="iceberg", "iceberg.catalog.type"="REST", {properties});"#
+                r#"CREATE CATALOG catalog USING iceberg WITH ("iceberg.catalog.type" = 'REST', {properties});"#
             )).unwrap();
             assert!(
                 matches!(guard.catalog_fact("catalog").unwrap(), Some(Catalog::Rest(uri)) if uri == expected)
             );
         }
         let mut guard = guard();
-        assert!(guard.after(r#"CREATE EXTERNAL CATALOG catalog PROPERTIES ("type"="iceberg", "iceberg.catalog.type"="rest");"#).is_err());
+        assert!(guard.after(r#"CREATE CATALOG catalog USING iceberg WITH ("iceberg.catalog.type" = 'rest');"#).is_err());
     }
     #[test]
     fn non_iceberg_catalog_does_not_acquire_a_hadoop_write_guard() {
         let mut guard = guard();
-        guard.after(r#"CREATE EXTERNAL CATALOG catalog PROPERTIES ("type"="paimon", "warehouse"="s3://novarocks/ready");"#).unwrap();
+        guard.after(r#"CREATE CATALOG catalog USING paimon WITH ("warehouse" = 's3://novarocks/ready');"#).unwrap();
         assert!(matches!(
             guard.catalog_fact("catalog").unwrap(),
             Some(Catalog::Other)
@@ -688,22 +757,26 @@ mod tests {
     #[test]
     fn hadoop_catalog_aliases_follow_provider_default_and_warehouse_precedence() {
         for (properties, expected) in [
-            (r#""warehouse"="s3://novarocks/a""#, "s3://novarocks/a"),
+            (r#""warehouse" = 's3://novarocks/a'"#, "s3://novarocks/a"),
             (
-                r#""iceberg.catalog.warehouse"="s3://novarocks/b""#,
+                r#""iceberg.catalog.warehouse" = 's3://novarocks/b'"#,
                 "s3://novarocks/b",
             ),
             (
-                r#""iceberg.catalog.type"="HADOOP", "warehouse"="s3://novarocks/c", "iceberg.catalog.warehouse"="s3://novarocks/d""#,
+                r#""iceberg.catalog.type" = 'HADOOP', "warehouse" = 's3://novarocks/c', "iceberg.catalog.warehouse" = 's3://novarocks/d'"#,
                 "s3://novarocks/d",
             ),
         ] {
             let mut guard = guard();
-            guard.after(&format!(r#"CREATE EXTERNAL CATALOG catalog PROPERTIES ("type"="iceberg", {properties});"#)).unwrap();
+            guard
+                .after(&format!(
+                    r#"CREATE CATALOG catalog USING iceberg WITH ({properties});"#
+                ))
+                .unwrap();
             assert!(
                 matches!(guard.catalog_fact("catalog").unwrap(), Some(Catalog::Hadoop(root)) if root == expected)
             );
-            assert!(guard.before("CREATE DATABASE catalog.foreign").is_err());
+            assert!(guard.before("CREATE SCHEMA catalog.foreign").is_err());
         }
     }
     #[test]
@@ -717,11 +790,9 @@ mod tests {
         );
         let namespace = guard.identity.resource_name("db").unwrap();
         guard
-            .before(&format!("CREATE DATABASE {namespace};"))
+            .before(&format!("CREATE SCHEMA {namespace};"))
             .unwrap();
-        guard
-            .after(&format!("CREATE DATABASE {namespace};"))
-            .unwrap();
+        guard.after(&format!("CREATE SCHEMA {namespace};")).unwrap();
         assert_eq!(
             listener.accept().unwrap_err().kind(),
             std::io::ErrorKind::WouldBlock
@@ -731,7 +802,7 @@ mod tests {
             &format!("{}_123", guard.identity.run_id),
             &format!("{}_a12345", guard.identity.run_id),
         ] {
-            assert!(guard.before(&format!("CREATE DATABASE {bad};")).is_err());
+            assert!(guard.before(&format!("CREATE SCHEMA {bad};")).is_err());
         }
     }
 
@@ -758,12 +829,15 @@ mod tests {
             let sql = match category {
                 "view" => format!("CREATE VIEW {namespace}.t AS SELECT 1"),
                 "mv" => format!(
-                    "CREATE MATERIALIZED VIEW {namespace}.t DISTRIBUTED BY HASH(id) BUCKETS 1 REFRESH MANUAL AS SELECT 1 AS id"
+                    "CREATE MATERIALIZED VIEW {namespace}.t WITH (refresh_policy = 'MANUAL') AS SELECT 1 AS id"
                 ),
                 "ctas" => format!("CREATE TABLE {namespace}.t AS SELECT 1"),
                 _ => format!("CREATE TABLE {namespace}.t (id INT)"),
             };
-            novarocks_parser::parse(&sql).expect("test SQL is admitted parser input");
+            let frames = crate::session::split_trino_sql_statements(&sql).unwrap();
+            for frame in frames {
+                parser::parse_statement(&frame).expect("test SQL is admitted parser input");
+            }
             guard.after(&sql).unwrap();
             let requests = thread.join().unwrap();
             assert_eq!(requests.len(), 1);
@@ -810,7 +884,7 @@ mod tests {
         for sql in [
             "CREATE TABLE ns.t (id INT)",
             "INSERT INTO ns.t SELECT 1",
-            "DROP DATABASE ns",
+            "DROP SCHEMA ns",
             "DELETE FROM ns.t",
         ] {
             assert!(guard.before(sql).is_err(), "{sql}");
@@ -821,7 +895,7 @@ mod tests {
             .lock()
             .unwrap()
             .insert("catalog".into(), Catalog::Rest("http://127.0.0.1:1".into()));
-        assert!(guard.before("CREATE DATABASE readonly_namespace").is_err());
+        assert!(guard.before("CREATE SCHEMA readonly_namespace").is_err());
         assert!(guard.before("SELECT * FROM readonly_namespace.t").is_ok());
     }
     #[test]
@@ -834,11 +908,11 @@ mod tests {
             .lock()
             .unwrap()
             .insert("catalog".into(), Catalog::Rest("http://127.0.0.1:1".into()));
-        for reference in ["branch_dev", "tag_release"] {
+        for reference in ["dev", "release"] {
             assert!(
                 guard
                     .before(&format!(
-                        "INSERT INTO catalog.foreign.t.{reference} VALUES (1)"
+                        "INSERT INTO catalog.foreign.t@{reference} VALUES (1)"
                     ))
                     .unwrap_err()
                     .to_string()
@@ -847,20 +921,19 @@ mod tests {
             assert!(
                 guard
                     .before(&format!(
-                        "INSERT INTO catalog.{namespace}.t.{reference} VALUES (1)"
+                        "INSERT INTO catalog.{namespace}.t@{reference} VALUES (1)"
                     ))
                     .is_ok()
             );
         }
         for reference in ["unknown", "branch_", "tag_"] {
-            let statements = novarocks_parser::parse(&format!(
-                "INSERT INTO catalog.foreign.t.{reference} VALUES (1)"
-            ))
-            .unwrap();
-            let Statement::Dml(DmlStatement::Insert(value)) = &statements[0] else {
-                panic!("expected INSERT");
-            };
-            assert!(guard.target(&value.target, false).unwrap().is_none());
+            assert!(
+                guard
+                    .before(&format!(
+                        "INSERT INTO catalog.foreign.t.{reference} VALUES (1)"
+                    ))
+                    .is_err()
+            );
         }
     }
     #[test]
@@ -874,11 +947,7 @@ mod tests {
             .unwrap()
             .insert("catalog".into(), Catalog::Rest("http://127.0.0.1:1".into()));
         guard.deadline = Instant::now();
-        assert!(
-            guard
-                .before(&format!("CREATE DATABASE {namespace}"))
-                .is_err()
-        );
+        assert!(guard.before(&format!("CREATE SCHEMA {namespace}")).is_err());
         assert!(
             guard
                 .remaining()

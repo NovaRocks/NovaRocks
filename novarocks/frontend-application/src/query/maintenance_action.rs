@@ -43,21 +43,6 @@ pub(super) fn prepare(
         )
     })?;
     if let Some(action) = executor
-        .prepare_optimize_action(
-            command,
-            context.session().current_catalog(),
-            context.session().current_database(),
-            context.execution(),
-            command_context.connector_context(),
-            family,
-            #[cfg(novarocks_dev_controls)]
-            observation.clone(),
-        )
-        .map_err(maintenance_command_error)?
-    {
-        return Ok(action);
-    }
-    if let Some(action) = executor
         .prepare_direct_rewrite_action(
             command,
             context.session().current_catalog(),
@@ -72,19 +57,94 @@ pub(super) fn prepare(
     {
         return Ok(action);
     }
-    if let Some(action) = executor
-        .prepare_cleanup_action(
+    if let Some(action) = executor.prepare_cleanup_action(
+        command,
+        context.session().current_catalog(),
+        context.session().current_database(),
+        context.execution(),
+        command_context.connector_context(),
+        family,
+    )? {
+        return Ok(action);
+    }
+    prepare_metadata_action(context, command_context, family, || {
+        executor.prepare_command(
             command,
             context.session().current_catalog(),
             context.session().current_database(),
             context.execution(),
             command_context.connector_context(),
-            family,
         )
-        .map_err(maintenance_command_error)?
-    {
-        return Ok(action);
-    }
+    })
+}
+
+pub(super) enum PreparedTrinoTableExecute {
+    Action(Box<dyn GovernedStatementAction>),
+    AddFiles(crate::query_execution::dml::add_files::ResolvedAddFiles),
+    Mutation(crate::query_execution::maintenance::command::PreparedTableProcedureMutation),
+    #[cfg(novarocks_dev_controls)]
+    EqualityDelete(crate::query_execution::dml::delete::OwnedDeleteStatement),
+}
+
+/// The caller schedules this on the original planning CPU and starts the
+/// returned Action (or original ADD FILES worker) on the same statement Root.
+pub(super) fn prepare_trino_table_execute(
+    executor: &MaintenanceCommandExecutor,
+    source: &str,
+    statement: &Arc<novarocks_parser::ast::TrinoTableExecute>,
+    context: &RequestContext,
+    command_context: &CommandContext,
+    statement_started_at: std::time::SystemTime,
+    constants: &mut dyn novarocks_query_application::sql::property_evaluation::DdlPropertyConstantPort,
+    #[cfg(novarocks_dev_controls)] observation: Option<
+        crate::preparation_diagnostics::StatementObservationHandle,
+    >,
+) -> Result<PreparedTrinoTableExecute, CommandError> {
+    use crate::query_execution::maintenance::{
+        MaintenanceRequestContext, command::PreparedTableExecute,
+    };
+
+    let family = context.session().presentation().copied().ok_or_else(|| {
+        CommandError::new(
+            CommandErrorKind::Rejected,
+            "maintenance client result requires an explicit presentation",
+        )
+    })?;
+    let prepared = executor.prepare_trino_table_execute(
+        source,
+        statement,
+        MaintenanceRequestContext {
+            current_catalog: context.session().current_catalog(),
+            current_database: context.session().current_database(),
+        },
+        context.execution(),
+        command_context.connector_context(),
+        statement_started_at,
+        constants,
+        family,
+        #[cfg(novarocks_dev_controls)]
+        observation,
+    )?;
+    Ok(match prepared {
+        PreparedTableExecute::Action(action) => PreparedTrinoTableExecute::Action(action),
+        PreparedTableExecute::Metadata(call) => PreparedTrinoTableExecute::Action(
+            prepare_metadata_action(context, command_context, family, || Ok(call))?,
+        ),
+        PreparedTableExecute::AddFiles(add_files) => PreparedTrinoTableExecute::AddFiles(add_files),
+        PreparedTableExecute::Mutation(mutation) => PreparedTrinoTableExecute::Mutation(mutation),
+        #[cfg(novarocks_dev_controls)]
+        PreparedTableExecute::EqualityDelete(statement) => {
+            PreparedTrinoTableExecute::EqualityDelete(statement)
+        }
+    })
+}
+
+fn prepare_metadata_action(
+    context: &RequestContext,
+    command_context: &CommandContext,
+    family: novarocks_result_contract::ClientPresentationFamily,
+    prepare_call: impl FnOnce() -> Result<MaintenanceCommandCall, CommandError>,
+) -> Result<Box<dyn GovernedStatementAction>, CommandError> {
     let capacity = context.execution().result_capacity().ok_or_else(|| {
         CommandError::new(
             CommandErrorKind::Rejected,
@@ -103,15 +163,7 @@ pub(super) fn prepare(
             "maintenance contexts belong to different original scopes",
         ));
     }
-    let call = executor
-        .prepare_command(
-            command,
-            context.session().current_catalog(),
-            context.session().current_database(),
-            context.execution(),
-            command_context.connector_context(),
-        )
-        .map_err(maintenance_command_error)?;
+    let call = prepare_call()?;
     Ok(Box::new(MetadataMaintenanceAction {
         family,
         call,

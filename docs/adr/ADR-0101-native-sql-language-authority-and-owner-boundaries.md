@@ -29,6 +29,8 @@ code-anchors:
 
 source SQL 只使用 `novarocks-parser` typed AST。parser 后且与 SQL planning 共享的无 span value 进入 `novarocks_sql::semantic`，literal/Arrow/default conversion 进入具名 `novarocks_sql::literal`，`SqlType` 保持 types owner。Frontend catalog command 与 MV request 分别归其 application owner；FE refresh request 显式投影为 SQL refresh semantic value。删除 generic `novarocks_sql::syntax`、legacy MV SQL carrier 与 `sqlparser` Cargo edge；不保留 alias、fallback、text reparse 或 shadow oracle。
 
+[ADR-0241](ADR-0241-sole-trino-sql-dialect-and-closed-syntax-extensions.md) 定义当前 SQL 文法、AST 对应、封闭扩展及能力错误。本 ADR 定义 parser、SQL semantic 与 application 的接口边界。
+
 ## 接受的妥协（诚实记录）
 
 这保留 parser AST、SQL semantic value 与 Frontend request 三类值，表面上不是“只有一种 DTO”。代价是每条跨域语义链必须有一次显式 lowering，并需要维护 conversion test；选择它是为了让 source provenance、SQL semantics 和 FE orchestration 各自有单一 owner，而不是为了减少类型数量。

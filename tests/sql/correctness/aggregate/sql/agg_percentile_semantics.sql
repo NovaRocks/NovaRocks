@@ -32,16 +32,15 @@ CREATE TABLE ${case_db}.t_agg_percentile_semantics (
     d DATE,
     dt DATETIME,
     dbl DOUBLE
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t_agg_percentile_semantics VALUES
-    (1, 10, 1, '2018-01-01', '2018-01-01 00:00:01', 11.1),
-    (2, 20, 1, '2019-01-01', '2019-01-01 00:00:01', 11.2),
-    (3, 30, 2, '2020-01-01', '2020-01-01 00:00:01', 11.3),
-    (4, 40, 1, '2021-01-01', '2021-01-01 00:00:01', 11.4),
-    (5, 50, 3, '2022-01-01', '2022-01-01 00:00:01', 11.5),
-    (6, NULL, NULL, NULL, NULL, NULL);
+    ROW(1, 10, 1, '2018-01-01', '2018-01-01 00:00:01', 11.1),
+    ROW(2, 20, 1, '2019-01-01', '2019-01-01 00:00:01', 11.2),
+    ROW(3, 30, 2, '2020-01-01', '2020-01-01 00:00:01', 11.3),
+    ROW(4, 40, 1, '2021-01-01', '2021-01-01 00:00:01', 11.4),
+    ROW(5, 50, 3, '2022-01-01', '2022-01-01 00:00:01', 11.5),
+    ROW(6, NULL, NULL, NULL, NULL, NULL);
 SELECT
     percentile_cont(v, 0) AS p0,
     percentile_cont(v, 0.5) AS p50,
@@ -61,14 +60,14 @@ FROM ${case_db}.t_agg_percentile_semantics;
 SELECT
     CAST(percentile_approx(v, 0.5) AS INT) AS approx50,
     CAST(percentile_approx(v, 0.9, 2048) AS INT) AS approx90,
-    percentile_approx(v, array<double>[0.25, 0.5, 0.75], 2048) AS approx_quartiles
+    percentile_approx(v, CAST([0.25, 0.5, 0.75] AS array<double>), 2048) AS approx_quartiles
 FROM ${case_db}.t_agg_percentile_semantics;
 
 -- query 4
 SELECT
     CAST(percentile_approx_weighted(v, w, 0.5, 2048) AS INT) AS weighted50,
     CAST(percentile_approx_weighted(v, w, 0.9, 2048) AS INT) AS weighted90,
-    percentile_approx_weighted(v, w, array<double>[0.25, 0.5, 0.75], 2048) AS weighted_quartiles
+    percentile_approx_weighted(v, w, CAST([0.25, 0.5, 0.75] AS array<double>), 2048) AS weighted_quartiles
 FROM ${case_db}.t_agg_percentile_semantics;
 
 -- query 5

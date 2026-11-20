@@ -58,11 +58,10 @@ DROP CATALOG system;
 
 -- query 9
 -- @expect_trino_error=ALREADY_EXISTS,USER_ERROR
-CREATE EXTERNAL CATALOG system
-PROPERTIES (
-    "type" = "iceberg",
-    "iceberg.catalog.type" = "hadoop",
-    "iceberg.catalog.warehouse" = "file:///trc_reserved_system"
+CREATE CATALOG system USING iceberg
+WITH (
+    "iceberg.catalog.type" = 'hadoop',
+    "iceberg.catalog.warehouse" = 'file:///trc_reserved_system'
 );
 
 -- query 10
@@ -70,8 +69,13 @@ SELECT name FROM system.metadata.materialized_views WHERE name = 'trc_no_such_vi
 
 -- query 11
 -- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
-ANALYZE TABLE system.metadata.materialized_views;
+ANALYZE system.metadata.materialized_views;
 
 -- query 12
 -- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
-ANALYZE TABLE trc_no_such_catalog.information_schema.tables;
+ANALYZE trc_no_such_catalog.information_schema.tables;
+
+-- query 13
+-- The reserved type key cannot override USING.
+-- @expect_trino_error=INVALID_CATALOG_PROPERTY,USER_ERROR
+CREATE CATALOG reject_scope USING trc5e_reject_connector WITH (type = 'hadoop');

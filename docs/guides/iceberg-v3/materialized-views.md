@@ -35,25 +35,23 @@ NovaRocks 的受管物化视图以 Iceberg 表保存结果。本文说明当前�
 USE ice_rest.analytics;
 
 CREATE MATERIALIZED VIEW orders_by_region
-DISTRIBUTED BY HASH(region) BUCKETS 1
-REFRESH DEFERRED MANUAL
-PROPERTIES ('storage_engine' = 'iceberg')
+WITH (refresh_policy = 'MANUAL')
 AS
 SELECT region, COUNT(*) AS order_count, SUM(amount) AS total_amount
 FROM ice_rest.analytics.orders
 GROUP BY region;
 
-REFRESH MATERIALIZED VIEW orders_by_region WITH SYNC MODE;
+REFRESH MATERIALIZED VIEW orders_by_region;
 SELECT region, order_count, total_amount FROM orders_by_region ORDER BY region;
 ```
 
 `CREATE` 只建立目标和定义、解释、配置文档；它不发布数据 snapshot。首次成功刷新创建结果 snapshot 及与它准确绑定的发布文档。后续刷新按已发布输入与 provider 的准确版本选择增量路径；结果为零行的增量也发布一个新 snapshot，以推进已处理输入的水位。刷新策略及暂停状态只更新配置文档，不制造数据 snapshot。
 
-显式 `REFRESH MATERIALIZED VIEW ... FULL` 从准确当前基表版本重算，并通过同一发布会话覆盖已发布目标；当前基表没有 snapshot 时会在准备阶段拒绝。已用原生 1 FE + 3 BE 验证投影 MV 在基表变化后及输入不变时重复 FULL 均不追加重复行，并验证聚合 MV 在重启和管理接续后再次 FULL。增量能力由定义形状、基表变更和精确字段绑定共同决定。已覆盖的投影、过滤、聚合、受限连接与 UNION 形状以 [`iceberg-ivm` 用例](../../../tests/sql/correctness/iceberg-ivm/sql/) 为准，不能推断任意 SQL 都能增量维护。基表引用列改名目前因缺少 occurrence-aware SQL 字段重绑定而拒绝；增量 CROSS JOIN 也未开放。
+在同一会话中临时设置 `SET SESSION ice_rest.incremental_refresh_enabled = false` 后，`REFRESH MATERIALIZED VIEW` 从准确当前基表版本重算，并通过同一发布会话覆盖已发布目标；当前基表没有 snapshot 时会在准备阶段拒绝。已用原生 1 FE + 3 BE 验证投影 MV 在基表变化后及输入不变时重复 FULL 均不追加重复行，并验证聚合 MV 在重启和管理接续后再次 FULL。需要恢复默认增量策略时，刷新后执行 `RESET SESSION ice_rest.incremental_refresh_enabled`。增量能力由定义形状、基表变更和精确字段绑定共同决定。已覆盖的投影、过滤、聚合、受限连接与 UNION 形状以 [`iceberg-ivm` 用例](../../../tests/sql/correctness/iceberg-ivm/sql/) 为准，不能推断任意 SQL 都能增量维护。基表引用列改名目前因缺少 occurrence-aware SQL 字段重绑定而拒绝；增量 CROSS JOIN 也未开放。
 
 ## 自动刷新与暂停
 
-创建时可以选择 `REFRESH ASYNC ON CHANGE` 或 `REFRESH ASYNC EVERY INTERVAL ...`；也可以通过 `ALTER MATERIALIZED VIEW ... SET REFRESH` 更新策略，通过 `PAUSE REFRESH` 与 `RESUME REFRESH` 控制调度。这些是受管配置写入，走 MV 管理入口并只更新配置文档。当前策略与暂停/恢复的原生回归见 [`iceberg-mv-scheduler` 用例](../../../tests/sql/correctness/iceberg-mv-scheduler/sql/)。
+创建时可在 `WITH` 属性中选择 `refresh_policy = 'ON_CHANGE'`，或同时指定 `refresh_policy = 'INTERVAL'` 和 `refresh_interval = '5m'`。通过 `ALTER MATERIALIZED VIEW ... SET PROPERTIES` 可更新策略，或设置 `refresh_paused = true` 暂停调度及 `false` 恢复调度。这些是受管配置写入，走 MV 管理入口并只更新配置文档。当前策略与暂停/恢复的原生回归见 [`iceberg-mv-scheduler` 用例](../../../tests/sql/correctness/iceberg-mv-scheduler/sql/)。
 
 FE 重启后，湖中已发布的 MV 仍可读；新进程默认不能立即接管旧进程的管理写入。运维应先查看 `novarocks_mv_management_status`，再按[物化视图管理接续指南](../deployment/mv-management-continuation.md)提供适用证据。读到目标不等于获得管理权。
 
@@ -63,8 +61,8 @@ FE 重启后，湖中已发布的 MV 仍可读；新进程默认不能立即接�
 
 查询改写只在候选 MV 的定义、输入与输出版本、列绑定和查询语义都能证明匹配时使用。可以在 session 中开启并用 `EXPLAIN` 检查是否命中：
 
-```sql
-SET enable_materialized_view_rewrite = true;
+``` sql
+SET SESSION enable_materialized_view_rewrite = true;
 EXPLAIN SELECT region, SUM(amount)
 FROM ice_rest.analytics.orders
 GROUP BY region;

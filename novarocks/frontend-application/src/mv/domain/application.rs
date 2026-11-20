@@ -17,182 +17,15 @@
 
 //! Materialized-view application and engine ports.
 
-use std::fmt;
+use std::{fmt, sync::Arc};
 
+use novarocks_mv_application::engine_properties::MvRefreshPropertyChanges;
 use novarocks_mv_application::persistence::definition::CreateMvDefinitionRequest;
 use novarocks_mv_application::persistence::dependency::CreateMvDependencyRequest;
 use novarocks_mv_application::repository::InitialMvRefreshConfiguration;
-use novarocks_parser::ast::{
-    LiteralKind, MaterializedViewPartitionArgument, MaterializedViewPartitionField, Query,
-};
-use novarocks_sql::semantic::IcebergPartitionFieldExpr;
+use novarocks_parser::ast::Query;
+use novarocks_spi::connector::{ConnectorProviderBindingKey, DdlPropertyChange, DdlPropertyValue};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum MvCreatePartitionField {
-    Identity { column: String },
-    Year { column: String },
-    Month { column: String },
-    Day { column: String },
-    Hour { column: String },
-    Bucket { column: String, num_buckets: u32 },
-    Truncate { column: String, width: u32 },
-    Void { column: String },
-}
-
-impl From<&IcebergPartitionFieldExpr> for MvCreatePartitionField {
-    fn from(value: &IcebergPartitionFieldExpr) -> Self {
-        match value {
-            IcebergPartitionFieldExpr::Identity { column } => Self::Identity {
-                column: column.clone(),
-            },
-            IcebergPartitionFieldExpr::Year { column } => Self::Year {
-                column: column.clone(),
-            },
-            IcebergPartitionFieldExpr::Month { column } => Self::Month {
-                column: column.clone(),
-            },
-            IcebergPartitionFieldExpr::Day { column } => Self::Day {
-                column: column.clone(),
-            },
-            IcebergPartitionFieldExpr::Hour { column } => Self::Hour {
-                column: column.clone(),
-            },
-            IcebergPartitionFieldExpr::Bucket {
-                column,
-                num_buckets,
-            } => Self::Bucket {
-                column: column.clone(),
-                num_buckets: *num_buckets,
-            },
-            IcebergPartitionFieldExpr::Truncate { column, width } => Self::Truncate {
-                column: column.clone(),
-                width: *width,
-            },
-            IcebergPartitionFieldExpr::Void { column } => Self::Void {
-                column: column.clone(),
-            },
-        }
-    }
-}
-
-impl From<&MaterializedViewPartitionField> for MvCreatePartitionField {
-    fn from(value: &MaterializedViewPartitionField) -> Self {
-        let (transform, arguments) = match value {
-            MaterializedViewPartitionField::Identity(column) => {
-                return Self::Identity {
-                    column: normalized_partition_identifier(&column.value),
-                };
-            }
-            MaterializedViewPartitionField::Transform {
-                name, arguments, ..
-            } => (name.value.to_ascii_lowercase(), arguments.as_slice()),
-        };
-        let column = partition_column_argument(arguments, &transform);
-        match transform.as_str() {
-            "identity" => Self::Identity { column },
-            "year" => Self::Year { column },
-            "month" => Self::Month { column },
-            "day" => Self::Day { column },
-            "hour" => Self::Hour { column },
-            "void" => Self::Void { column },
-            "bucket" => Self::Bucket {
-                column,
-                num_buckets: partition_u32_argument(arguments, "bucket"),
-            },
-            "truncate" => Self::Truncate {
-                column,
-                width: partition_u32_argument(arguments, "truncate"),
-            },
-            _ => unreachable!("MV partition transform was validated during SQL admission"),
-        }
-    }
-}
-
-impl From<&MvCreatePartitionField> for IcebergPartitionFieldExpr {
-    fn from(value: &MvCreatePartitionField) -> Self {
-        match value {
-            MvCreatePartitionField::Identity { column } => Self::Identity {
-                column: column.clone(),
-            },
-            MvCreatePartitionField::Year { column } => Self::Year {
-                column: column.clone(),
-            },
-            MvCreatePartitionField::Month { column } => Self::Month {
-                column: column.clone(),
-            },
-            MvCreatePartitionField::Day { column } => Self::Day {
-                column: column.clone(),
-            },
-            MvCreatePartitionField::Hour { column } => Self::Hour {
-                column: column.clone(),
-            },
-            MvCreatePartitionField::Bucket {
-                column,
-                num_buckets,
-            } => Self::Bucket {
-                column: column.clone(),
-                num_buckets: *num_buckets,
-            },
-            MvCreatePartitionField::Truncate { column, width } => Self::Truncate {
-                column: column.clone(),
-                width: *width,
-            },
-            MvCreatePartitionField::Void { column } => Self::Void {
-                column: column.clone(),
-            },
-        }
-    }
-}
-
-fn normalized_partition_identifier(value: &str) -> String {
-    novarocks_types::naming::normalize_identifier(value)
-        .expect("MV partition identifier was validated during SQL admission")
-}
-
-fn partition_column_argument(
-    arguments: &[MaterializedViewPartitionArgument],
-    transform: &str,
-) -> String {
-    let Some(MaterializedViewPartitionArgument::Ident(column)) = arguments.first() else {
-        unreachable!("MV {transform} partition transform was validated during SQL admission");
-    };
-    normalized_partition_identifier(&column.value)
-}
-
-fn partition_u32_argument(arguments: &[MaterializedViewPartitionArgument], transform: &str) -> u32 {
-    let Some(MaterializedViewPartitionArgument::Literal(value)) = arguments.get(1) else {
-        unreachable!("MV {transform} partition transform was validated during SQL admission");
-    };
-    let LiteralKind::Number(value) = &value.kind else {
-        unreachable!("MV {transform} partition transform was validated during SQL admission");
-    };
-    let value = value
-        .parse::<u32>()
-        .expect("MV partition numeric argument was validated during SQL admission");
-    assert!(
-        value > 0,
-        "MV partition numeric argument was validated during SQL admission"
-    );
-    value
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MvCreateDistribution {
-    pub hash_columns: Vec<String>,
-    pub bucket_count: Option<u32>,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub enum MvCreateRefreshPolicy {
-    #[default]
-    Manual,
-    AsyncOnChange,
-    AsyncInterval {
-        interval_ms: i64,
-    },
-}
-
-/// Frontend-owned request for dropping one admitted materialized view.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MvDropStatement {
     pub name_parts: Vec<String>,
@@ -200,17 +33,31 @@ pub struct MvDropStatement {
 }
 
 /// Frontend-owned admitted materialized-view alteration.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum MvAlterAction {
-    SetRefresh(MvCreateRefreshPolicy),
-    SetProperties(Vec<(String, String)>),
-    PauseRefresh,
-    ResumeRefresh,
-    Repartition(Vec<MvCreatePartitionField>),
+    Refresh(MvRefreshPropertyChanges),
+    RefreshAndStorage {
+        changes: MvRefreshPropertyChanges,
+        owner: ConnectorProviderBindingKey,
+        properties: Arc<[(Arc<str>, DdlPropertyChange)]>,
+    },
+    Storage {
+        owner: ConnectorProviderBindingKey,
+        properties: Arc<[(Arc<str>, DdlPropertyChange)]>,
+    },
+}
+
+/// Inputs to the managed replacement of the default spec and its data.
+#[derive(Clone, Debug)]
+pub(crate) struct MvRepartitionFields {
+    pub(crate) owner: ConnectorProviderBindingKey,
+    pub(crate) properties: Arc<[(Arc<str>, DdlPropertyChange)]>,
+    pub(crate) partitioning_index: usize,
+    pub(crate) configuration: Option<MvRefreshPropertyChanges>,
 }
 
 /// Frontend-owned request for altering one admitted materialized view.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct MvAlterStatement {
     pub name_parts: Vec<String>,
     pub action: MvAlterAction,
@@ -235,15 +82,19 @@ impl MvRefreshRequest {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct MvCreateStorage {
+    pub target: crate::mv::domain::refresh::target::IcebergMvTarget,
+    pub binding: ConnectorProviderBindingKey,
+    pub properties: Arc<[(Arc<str>, DdlPropertyValue)]>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct MvCreateStatement {
-    pub name_parts: Vec<String>,
     pub if_not_exists: bool,
-    pub partition_by: Option<Vec<MvCreatePartitionField>>,
-    pub distribution: Option<MvCreateDistribution>,
-    pub refresh_policy: MvCreateRefreshPolicy,
+    pub refresh: InitialMvRefreshConfiguration,
     pub select_sql: String,
     pub select_query: Query,
-    pub properties: Vec<(String, String)>,
+    pub storage: MvCreateStorage,
     pub primary_key: Option<Vec<String>>,
 }
 
