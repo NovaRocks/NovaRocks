@@ -188,7 +188,7 @@ struct OriginalRecoveryRun {
     output: Option<crate::query_execution::internal_consumer::profile::ProfileComputationOutput>,
     receiving: Option<ExecutionOutputObligation>,
     ready: Option<ReadyProfileComputation>,
-    held_establish: Option<Arc<crate::task_execution::host::transport::OriginalEstablishHandoff>>,
+    held_establish: Option<Arc<crate::task_execution::host::transport::OriginalSendHandoff>>,
     captured_history: Option<crate::fixtures::history::CapturedHistory>,
 }
 struct RetainOriginalRecovery(Option<Box<OriginalRecoveryRun>>);

@@ -1124,7 +1124,7 @@ impl DormantNativeAttemptOwner for RecipeDormant {
             let logical = self.logical.bound().unwrap();
             let link = logical.links.borrow(activation).unwrap();
             let split_observation = { self.observation.split.lock().unwrap().take() };
-            let mut split = match split_observation {
+            let mut split = match split_observation.as_ref() {
                 Some(observation) => Some(
                     split::original_plan(
                         actual.root(),
@@ -1133,7 +1133,7 @@ impl DormantNativeAttemptOwner for RecipeDormant {
                         &self.scope,
                         &self.window,
                         &self.data,
-                        observation,
+                        observation.clone(),
                     )
                     .await,
                 ),
@@ -1181,8 +1181,18 @@ impl DormantNativeAttemptOwner for RecipeDormant {
             let installed = Arc::new(
                 InstallAttemptHost {
                     fixture_observation_budget: self.fixture_observation_budget,
-                    #[cfg(novarocks_dev_controls)]
-                    fixture_establish_handoff: None,
+                    fixture_send_handoff: split_observation.as_ref().map(|observation| {
+                        use crate::task_execution::host::transport::{
+                            OriginalSendHandoffFixture, OriginalSendTarget,
+                        };
+                        let &[participation] = actual.participations() else {
+                            panic!("original split cancellation fixture has one participation")
+                        };
+                        OriginalSendHandoffFixture {
+                            target: OriginalSendTarget::AdmissionTicket(participation),
+                            observation: &observation.admission_handoff,
+                        }
+                    }),
                     initial_now: novarocks_coordination_contract::MonotonicClock::now(
                         self.clock.as_ref(),
                     ),
