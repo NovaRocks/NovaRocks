@@ -3669,7 +3669,11 @@ fn run_case_observed(
             }
         }
         let orphan_fixture = match step.meta.iceberg_orphan_fixture.as_deref() {
-            Some(table) => match iceberg_orphan_fixture::install(table) {
+            Some(table) => match iceberg_orphan_fixture::install(
+                table,
+                &ctx.namespace_guard(&case_target_conn, step.meta.cleanup),
+                step_deadline,
+            ) {
                 Ok(fixture) => {
                     let _ = writeln!(
                         log,

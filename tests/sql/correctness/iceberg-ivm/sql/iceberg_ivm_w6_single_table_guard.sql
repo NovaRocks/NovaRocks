@@ -89,7 +89,7 @@ CALL ice_w6_${uuid0}.system.rewrite_manifests("table" => 'ns_${uuid0}.target_mv'
 
 -- query 13
 -- @expect_error=materialized view
-ALTER TABLE target_mv EXECUTE remove_orphan_files(older_than => '2020-01-01 00:00:00');
+ALTER TABLE target_mv EXECUTE remove_orphan_files(retention_threshold => '7d');
 
 -- query 14
 -- @expect_error=materialized view

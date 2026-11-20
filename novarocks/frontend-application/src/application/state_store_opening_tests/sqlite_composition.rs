@@ -16,11 +16,14 @@
 // under the License.
 
 //! Actual SQLite composition through the production FA original receivers.
-//! This exercises the GC observation accelerator, not Iceberg provenance/CAS
-//! discovery or the TableMaintenanceProduct selection/session boundary.
+//! Drive an MV projection write and read through the same original SQLite owner.
 
 use super::*;
 use crate::query_execution::maintenance::io_admission::MetadataIoAdmission;
+use novarocks_mv_application::{
+    persistence::test_support::KeyedProjectionFixture, product::MvTarget,
+    state_store_repository::StateStoreMvRepository,
+};
 use novarocks_resource_contract::SharedDependency;
 use novarocks_state_store_api::StateStoreProviderFactory;
 use novarocks_state_store_runtime::{
@@ -28,9 +31,6 @@ use novarocks_state_store_runtime::{
 };
 use novarocks_state_store_sqlite::{
     SQLITE_STATE_STORE_PROVIDER_ID, SqliteStateStoreProviderFactory,
-};
-use novarocks_table_maintenance::gc_observation::{
-    GcOwnedRefObservation, GcOwnedRefObservationAccelerator, GcOwnedRefObservationDecision,
 };
 use novarocks_workload_control::{
     ControlStorageConfig, ResultCapacityConfig, RootWork, WorkClass, WorkOwner, WorkRequest,
@@ -152,7 +152,7 @@ async fn with_original_progress<F: Future>(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn actual_sqlite_original_observation_and_pinned_host_close_share_production_receivers() {
+async fn actual_sqlite_original_mv_projection_and_pinned_host_close_share_production_receivers() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("actual-original.sqlite");
     let mut workers = QueryBlockingExecutorOwner::try_new(QueryBlockingExecutorConfig::new(
@@ -195,50 +195,34 @@ async fn actual_sqlite_original_observation_and_pinned_host_close_share_producti
         }),
     )
     .await;
-    let observations = GcOwnedRefObservationAccelerator::open(store.clone(), policy)
+    let repository = StateStoreMvRepository::open(store.clone(), policy)
         .await
         .unwrap();
-    // These are accelerator input facts, not invented proof that Iceberg
-    // discovered a candidate or successfully changed a catalog ref.
-    let observation = GcOwnedRefObservation::try_new(
-        uuid::Uuid::from_u128(0x73716c697465),
-        "__novarocks_owned_ref_component".into(),
-        101,
-        2,
-        [7; 32],
-        1,
-    )
-    .unwrap();
-    let first = with_original_progress(
+    let target = MvTarget::from_parts(Some("ice"), "sales", "orders_mv");
+    let projection = KeyedProjectionFixture::new(target.clone(), Some(9))
+        .build()
+        .unwrap();
+    let original_repository = repository.in_execution(&context);
+    let written = with_original_progress(
         &original,
         &io,
         &root.owner,
         &mut driver,
-        observations.observe_in(&context, observation.clone(), 1_000, 500),
+        original_repository.install_keyed_projection(uuid::Uuid::now_v7(), projection, None),
     )
     .await
     .unwrap();
-    assert_eq!(
-        first,
-        GcOwnedRefObservationDecision::NotMature {
-            first_observed_at_ms: 1_000
-        }
-    );
-    let second = with_original_progress(
+    let observed = with_original_progress(
         &original,
         &io,
         &root.owner,
         &mut driver,
-        observations.observe_in(&context, observation, 1_501, 500),
+        original_repository.find_keyed_by_target(&target),
     )
     .await
+    .unwrap()
     .unwrap();
-    assert_eq!(
-        second,
-        GcOwnedRefObservationDecision::Mature {
-            first_observed_at_ms: 1_000
-        }
-    );
+    assert_eq!(observed.projection.mv_id, written.projection.mv_id);
     // Business completion does not retire serial transaction/evidence phases.
     tokio::time::timeout(
         Duration::from_secs(5),
@@ -275,7 +259,7 @@ async fn actual_sqlite_original_observation_and_pinned_host_close_share_producti
     assert_eq!(attempt.id().scope(), instance);
     attempt.cancel_before_dispatch().unwrap();
     drop(attempt);
-    drop(observations);
+    drop(repository);
     drop(store);
     let deadline = Instant::now() + Duration::from_secs(5);
     let held = tokio::time::timeout(

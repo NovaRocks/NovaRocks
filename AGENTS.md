@@ -804,7 +804,13 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
   catalog session 属性 `max_partitions_per_writer` 可在 1 到该值间覆盖。
   `iceberg.target-max-file-size` 接受正字节数或带单位的大小，默认 1 GiB，
   表属性 `write.target-file-size-bytes` 优先。表属性 `write.parquet.row-group-size-bytes` 默认 128 MiB。
-  这些属性经 catalog properties 与 FE 写会话冻结。示例见 `novarocks-catalogs.toml.example`。
+  这些属性经 catalog properties 与 FE 写会话冻结。
+
+- Iceberg catalog 维护属性
+  `iceberg.expire-snapshots.min-retention` 与 `iceberg.remove-orphan-files.min-retention` 各默认 7 天。
+  同 catalog 的会话属性 `expire_snapshots_min_retention` 与 `remove_orphan_files_min_retention`
+  分别覆盖下限，两个 EXECUTE 的缺省 `retention_threshold` 均为 `'7d'`。
+  示例见 `novarocks-catalogs.toml.example`。
 
 - `[standalone_server]`
   `trino_port`（默认 `8080`，`0` 由 OS 分配）、`trino_client_timeout_ms`（默认 `300000`）、
@@ -1351,7 +1357,10 @@ the guide differ.
   `commit/attempt/observation.rs`；CTAS 完整 CREATE 请求在 `catalog_control/staged_create/publication.rs`。
   读 [ADR-0171](docs/adr/ADR-0171-commit-operation-model.md)、[ADR-0179](docs/adr/ADR-0179-iceberg-publication-lifecycle-and-evidence.md) 与 [ADR-0198](docs/adr/ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md) 后再改身份、字段继承、派发或清理授权。
   BE seal 先不可回退撤销 writer 删除权；FE 收齐后做本地交接。缺产物清单不能报 cleanup Complete。
-  精确 operation-owned cleanup 与扫描 GC 分开；REST/Hadoop 扫描安全仍为 UNPROVEN，手动/自动入口共用缺证限制，不能以本地 deadline 或年龄授予删除权。
+  精确 operation-owned cleanup 与扫描 GC 各自使用原授权。显式 `EXECUTE remove_orphan_files`
+  由原 Iceberg Provider 核对准确表对象、固定截止时间、完整有效文件名与 Hadoop 发现根后逐批删除，
+  保留已确认的部分回执直至实际退出。自有 ref 成熟回收与首次观察状态族已经退役；无表锚 CTAS
+  与自动入口沿原准入。三项元数据维护的提交、删除与 SQL 结果契约见 [ADR-0243](docs/adr/ADR-0243-statement-authorized-iceberg-metadata-maintenance.md)。
   必要业务事实与原 receipt/cause 由同 canonical `ConnectorWriteNeededReady` Arc 保管；
   `query_execution/write_session/publication_call.rs` 保留同一 Provider F 到真实退出，安全 GC 由同 Call 的残留继续驱动。
   NeededReady、cleanup Pending/Observed、实际 F 退出及库存 Disposed 不可互换；封存必要 finalize 失败不能授权最终 CTAS publication。

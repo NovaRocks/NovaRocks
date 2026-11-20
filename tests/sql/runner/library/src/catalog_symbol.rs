@@ -319,6 +319,13 @@ impl CatalogSymbols {
         {
             *catalog = new.into();
         }
+        if let Some(target) = &mut meta.iceberg_orphan_fixture
+            && let Some((catalog, table)) = target.split_once('.')
+            && table.contains('.')
+            && let Some(mapped) = self.lookup(catalog)
+        {
+            *target = format!("{mapped}.{table}");
+        }
         // Expected errors and these metadata/plan displays own qualified object
         // identities. Ordinary query result literals never enter this adapter.
         if let Some(error) = &mut meta.expect_error {
@@ -1277,6 +1284,23 @@ SET SESSION external.owned = 'owned';"#
         assert_eq!(meta.result_rows_where[0].1, name);
         assert_eq!(meta.result_rows_expect[0].1, format!(r#"["{name}.ns.t"]"#));
         assert_eq!(meta.result_contains, vec!["owned.ns.literal".to_string()]);
+    }
+    #[test]
+    fn orphan_fixture_binds_only_a_qualified_catalog_symbol() {
+        let symbols = symbols();
+        let catalog = symbols.lookup("owned").unwrap();
+        for (target, expected) in [
+            ("owned.ns.t", format!("{catalog}.ns.t")),
+            ("owned.t", "owned.t".into()),
+            ("external.ns.t", "external.ns.t".into()),
+        ] {
+            let mut meta = crate::types::QueryMeta {
+                iceberg_orphan_fixture: Some(target.into()),
+                ..Default::default()
+            };
+            symbols.rewrite_meta(&mut meta, "").unwrap();
+            assert_eq!(meta.iceberg_orphan_fixture, Some(expected));
+        }
     }
     #[test]
     fn mv_state_relation_arrays_bind_only_their_projected_positions() {

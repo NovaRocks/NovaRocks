@@ -6,6 +6,9 @@ status: active
 supersedes: [ADR-0032, ADR-0035, ADR-0036, ADR-0037, ADR-0046, ADR-0054, ADR-0064, ADR-0068, ADR-0070]
 superseded-by: null
 partially-superseded-by:
+  - id: ADR-0243
+    scope: "Scan GC admission for explicit remove_orphan_files and cleanup of NovaRocks-owned refs. Target OCC, autocommit and crash-only publication remain active."
+    link: "ADR-0243-statement-authorized-iceberg-metadata-maintenance.md"
   - id: ADR-0198
     scope: "Deriving an external-effect lifetime bound from a local statement deadline and unconditional age-gated orphan, owned-ref or unanchored CTAS collection; target OCC, autocommit and the absence of durable takeover remain active"
     link: "ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md"

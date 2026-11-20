@@ -27,9 +27,8 @@ use novarocks_user_error::{
     ErrorCodeDescriptor, ErrorCodeId, ErrorCodeStatus, ErrorPhase, RetryClass, UserErrorLocation,
 };
 
-// Independent oracle transcribed from the semantic baseline's Trino StandardErrorCode.
-// Each emitted name must have exactly this number and error type.
-const TRINO_STANDARD_ERROR_CODES: &[(&str, i32, &str)] = &[
+// Independent wire oracle from Trino StandardErrorCode and IcebergErrorCode.
+const TRINO_ERROR_CODES: &[(&str, i32, &str)] = &[
     ("GENERIC_USER_ERROR", 0, "USER_ERROR"),
     ("SYNTAX_ERROR", 1, "USER_ERROR"),
     ("ABANDONED_QUERY", 2, "USER_ERROR"),
@@ -76,6 +75,9 @@ const TRINO_STANDARD_ERROR_CODES: &[(&str, i32, &str)] = &[
     ("VIEW_IS_RECURSIVE", 82, "USER_ERROR"),
     ("DUPLICATE_WINDOW_NAME", 92, "USER_ERROR"),
     ("MERGE_TARGET_ROW_MULTIPLE_MATCHES", 119, "USER_ERROR"),
+    ("ICEBERG_INVALID_METADATA", 0x0504_0001, "EXTERNAL"),
+    ("ICEBERG_FILESYSTEM_ERROR", 0x0504_0008, "EXTERNAL"),
+    ("ICEBERG_COMMIT_ERROR", 0x0504_000C, "EXTERNAL"),
     ("GENERIC_INTERNAL_ERROR", 65536, "INTERNAL_ERROR"),
     ("PAGE_TRANSPORT_ERROR", 65539, "INTERNAL_ERROR"),
     ("PAGE_TRANSPORT_TIMEOUT", 65540, "INTERNAL_ERROR"),
@@ -91,10 +93,10 @@ const TRINO_STANDARD_ERROR_CODES: &[(&str, i32, &str)] = &[
     ("EXCEEDED_TIME_LIMIT", 131075, "INSUFFICIENT_RESOURCES"),
 ];
 fn assert_wire(error: &TrinoQueryError, name: &str) {
-    let (_, number, kind) = TRINO_STANDARD_ERROR_CODES
+    let (_, number, kind) = TRINO_ERROR_CODES
         .iter()
         .find(|(candidate, _, _)| *candidate == name)
-        .unwrap_or_else(|| panic!("{name} is missing from the Trino StandardErrorCode oracle"));
+        .unwrap_or_else(|| panic!("{name} is missing from the Trino error code oracle"));
     assert_eq!(
         (error.error_name, error.error_code, error.error_type),
         (name, *number, *kind)
@@ -487,6 +489,94 @@ fn open_iceberg_partition_limit_projects_the_typed_counts() {
         projected.message,
         "Exceeded limit of 3 open writers for partitions: 4"
     );
+}
+
+#[test]
+fn iceberg_maintenance_errors_project_original_typed_details() {
+    use novarocks_failure_contract::SharedFailureCause;
+
+    #[derive(Debug)]
+    struct Origin(FailureFact, &'static str);
+
+    impl std::fmt::Display for Origin {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str(self.1)
+        }
+    }
+
+    impl std::error::Error for Origin {}
+
+    impl FailureProjection for Origin {
+        fn failure_fact(&self) -> FailureFact {
+            self.0
+        }
+    }
+
+    let sql = "ALTER TABLE ns.t EXECUTE expire_snapshots";
+    for (class, reason, name, detail) in [
+        (
+            FailureClass::Data,
+            ICEBERG_INVALID_METADATA,
+            "ICEBERG_INVALID_METADATA",
+            "Manifest file does not exist: s3://warehouse/snap.avro",
+        ),
+        (
+            FailureClass::Dependency,
+            ICEBERG_FILESYSTEM_ERROR,
+            "ICEBERG_FILESYSTEM_ERROR",
+            "Failed removing orphan files for table: ns.t",
+        ),
+        (
+            FailureClass::Dependency,
+            ICEBERG_COMMIT_ERROR,
+            "ICEBERG_COMMIT_ERROR",
+            "Failed to commit during expire_snapshots: the catalog rejected the commit",
+        ),
+    ] {
+        let fact = FailureFact::new(class, reason);
+        let error =
+            QueryServiceError::from_failure_cause(SharedFailureCause::new(Origin(fact, detail)));
+        let service = query_error(TrinoErrorSource::Service { error: &error, sql });
+        assert_wire(&service, name);
+        assert_eq!(service.message, detail);
+
+        let error = QueryExecutionError::from_execution(ExecutionFailureInput::new(
+            fact,
+            SafeDetail::truncating(detail),
+            ExecutionFailureSite::Coordinator,
+        ));
+        let execution = query_error(TrinoErrorSource::Execution { error: &error, sql });
+        assert_eq!(execution, service);
+
+        let control = ExecutionFailureInput::new(
+            FailureFact::stop_observation(reason),
+            SafeDetail::truncating(detail),
+            ExecutionFailureSite::Coordinator,
+        );
+        assert_ne!(execution_code(&control).fields().1, name);
+    }
+}
+
+#[test]
+fn iceberg_commit_error_retains_the_original_unknown_effect() {
+    let detail = "Failed to commit during optimize_manifests: [CommitUnknown] the catalog did not confirm the commit";
+    let error = QueryServiceError::from_execution_failure(ExecutionFailureInput::new(
+        FailureFact::new(FailureClass::Dependency, ICEBERG_COMMIT_ERROR),
+        SafeDetail::truncating(detail),
+        ExecutionFailureSite::Coordinator,
+    ))
+    .attach_external_effect_disposition(StatementExternalEffectDisposition::CommitUnknown);
+    let wire = query_error(TrinoErrorSource::Service {
+        error: &error,
+        sql: "ALTER TABLE ns.t EXECUTE optimize_manifests",
+    });
+    assert_wire(&wire, "ICEBERG_COMMIT_ERROR");
+    assert!(wire.message.starts_with(detail));
+    assert!(
+        wire.message
+            .contains("external effect disposition=CommitUnknown")
+    );
+    assert!(wire.message.contains("do_not_retry=true"));
 }
 
 #[test]

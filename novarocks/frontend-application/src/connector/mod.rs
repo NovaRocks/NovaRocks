@@ -16,7 +16,6 @@
 // under the License.
 
 pub mod backend;
-pub mod cleanup_maintenance;
 pub mod data_mutation;
 pub mod metadata_maintenance;
 pub mod mutation;

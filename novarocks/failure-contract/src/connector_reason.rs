@@ -23,3 +23,16 @@ use std::num::NonZeroU16;
 /// Iceberg exhausted the configured number of concurrently open partition writers.
 pub const ICEBERG_TOO_MANY_OPEN_PARTITIONS: FailureReason =
     FailureReason::new(domain::CONNECTOR, NonZeroU16::new(50).unwrap());
+
+// Reasons 51 through 53 are reserved for row-level commit outcomes.
+/// Iceberg metadata required by maintenance is missing or invalid.
+pub const ICEBERG_INVALID_METADATA: FailureReason =
+    FailureReason::new(domain::CONNECTOR, NonZeroU16::new(54).unwrap());
+
+/// An Iceberg maintenance filesystem operation failed.
+pub const ICEBERG_FILESYSTEM_ERROR: FailureReason =
+    FailureReason::new(domain::CONNECTOR, NonZeroU16::new(55).unwrap());
+
+/// An explicit Iceberg metadata maintenance procedure failed to commit.
+pub const ICEBERG_COMMIT_ERROR: FailureReason =
+    FailureReason::new(domain::CONNECTOR, NonZeroU16::new(56).unwrap());

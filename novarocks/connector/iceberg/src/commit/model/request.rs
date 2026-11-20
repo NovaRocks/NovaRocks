@@ -375,14 +375,16 @@ impl FrozenRequest {
     }
 }
 
-/// Ref maintenance carries no data/schema mutation or arbitrary table property.
+/// Ref maintenance may retire unused dictionary IDs and writes only its own marker.
 pub(crate) fn validate_ref_retention_update(update: &TableUpdate) -> Result<()> {
     match update {
         TableUpdate::SetSnapshotRef { .. }
         | TableUpdate::RemoveSnapshotRef { .. }
         | TableUpdate::RemoveSnapshots { .. }
         | TableUpdate::RemoveStatistics { .. }
-        | TableUpdate::RemovePartitionStatistics { .. } => Ok(()),
+        | TableUpdate::RemovePartitionStatistics { .. }
+        | TableUpdate::RemoveSchemas { .. }
+        | TableUpdate::RemovePartitionSpecs { .. } => Ok(()),
         TableUpdate::SetProperties { updates }
             if !updates.is_empty()
                 && updates.keys().all(|key| {

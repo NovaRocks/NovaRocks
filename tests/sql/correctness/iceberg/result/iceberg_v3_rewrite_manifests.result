@@ -3,6 +3,14 @@
 n
 5
 
+-- query 8
+-- types	varchar	bigint
+metric_name	metric_value
+rewritten_manifests_count	5
+added_manifests_count	1
+kept_manifests_count	0
+processed_manifest_entries_count	5
+
 -- query 9
 -- types	integer	varchar
 id	v
@@ -17,6 +25,10 @@ id	v
 n
 3
 
+-- query 13
+-- types	varchar	bigint
+metric_name	metric_value
+
 -- query 14
 -- types	bigint
 n
@@ -27,10 +39,22 @@ n
 n
 0
 
+-- query 17
+-- types	varchar	bigint
+metric_name	metric_value
+
 -- query 18
 -- types	bigint
 n
 0
+
+-- query 23
+-- types	varchar	bigint
+metric_name	metric_value
+rewritten_manifests_count	3
+added_manifests_count	1
+kept_manifests_count	0
+processed_manifest_entries_count	3
 
 -- query 24
 -- types	integer	varchar
@@ -45,6 +69,14 @@ id	_row_id
 10	0
 20	1
 30	2
+
+-- query 30
+-- types	varchar	bigint
+metric_name	metric_value
+rewritten_manifests_count	3
+added_manifests_count	1
+kept_manifests_count	0
+processed_manifest_entries_count	3
 
 -- query 31
 -- types	integer	bigint
@@ -61,7 +93,25 @@ id	v
 4	d
 5	e
 
+-- query 41
+-- types	bigint
+delete_manifests
+1
+
 -- query 42
+-- types	varchar	bigint
+metric_name	metric_value
+rewritten_manifests_count	2
+added_manifests_count	1
+kept_manifests_count	1
+processed_manifest_entries_count	2
+
+-- query 43
+-- types	bigint
+delete_manifests
+1
+
+-- query 44
 -- types	integer	varchar
 id	v
 1	a
@@ -70,6 +120,14 @@ id	v
 5	e
 
 -- query 49
+-- types	varchar	bigint
+metric_name	metric_value
+rewritten_manifests_count	3
+added_manifests_count	1
+kept_manifests_count	0
+processed_manifest_entries_count	3
+
+-- query 51
 -- types	integer	varchar
 id	v
 1	first
@@ -77,19 +135,31 @@ id	v
 3	third
 4	fourth
 
--- query 50
+-- query 52
 -- types	bigint
 n
 4
 
 -- query 57
+-- types	varchar	bigint
+metric_name	metric_value
+rewritten_manifests_count	3
+added_manifests_count	1
+kept_manifests_count	0
+processed_manifest_entries_count	3
+
+-- query 58
+-- types	varchar	bigint
+metric_name	metric_value
+
+-- query 59
 -- types	integer	varchar
 id	v
 1	one
 2	two
 3	three
 
--- query 58
+-- query 60
 -- types	bigint
 n
 3

@@ -821,7 +821,7 @@ fn parse_meta_with_name_binding(
 
             "iceberg_orphan_fixture" => {
                 if raw_value.is_empty() {
-                    bail!("@iceberg_orphan_fixture requires <namespace>.<table>");
+                    bail!("@iceberg_orphan_fixture requires [catalog.]namespace.table");
                 }
                 meta.iceberg_orphan_fixture = Some(raw_value);
             }
