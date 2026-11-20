@@ -202,7 +202,6 @@ pub(super) struct Case {
     right_nullable: bool,
     nested: bool,
     shared: bool,
-    kind: SetOperationKind,
 }
 impl Case {
     pub(super) fn ordinary() -> Self {
@@ -213,7 +212,6 @@ impl Case {
             right_nullable: false,
             nested: false,
             shared: false,
-            kind: SetOperationKind::UnionAll,
         }
     }
 }
@@ -380,7 +378,7 @@ pub(super) fn fixture(case: Case) -> Fixture {
             Distribution::Singleton,
             outputs.clone().into_boxed_slice(),
             novarocks_physical_plan::NodeKind::SetOp {
-                kind: case.kind,
+                kind: SetOperationKind::UnionAll,
                 input_mappings: mappings.into_boxed_slice(),
             },
         )
@@ -877,30 +875,6 @@ fn union_all_split_provenance_and_fresh_root_lexical_coverage_are_complete() {
                 bound.control_flow().uses()[&original_use].context
             );
         }
-    }
-}
-
-#[test]
-fn union_all_shared_input_and_other_set_operations_remain_explicitly_unsupported() {
-    for case in [
-        Case {
-            shared: true,
-            ..Case::ordinary()
-        },
-        Case {
-            kind: SetOperationKind::Intersect,
-            ..Case::ordinary()
-        },
-        Case {
-            kind: SetOperationKind::Except,
-            ..Case::ordinary()
-        },
-    ] {
-        let source = fixture(case);
-        assert!(matches!(
-            compile(&source, &functions(), &Control),
-            Err(FragmentCompileError::Unsupported { .. })
-        ));
     }
 }
 

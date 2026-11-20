@@ -402,6 +402,8 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
   从 `LocalProgram` 和本 Task 准确绑定的能力建立 pipeline；`builder.rs` 拥有共享图值。
   `binding.rs` 定义 `ExchangeBindings`、`ScanBindings`，writer bindings 在 `runtime/task`。
 
+- `novarocks/execution/src/exec/shared_stage/**` 提供共享阶段件，`novarocks/execution/src/exec/operators/setop/staged/**` 拥有 DISTINCT 集合运算的构建、探测与导出。见 [ADR-0243](docs/adr/ADR-0243-set-operation-shared-stages-and-exactly-once-placement.md)。
+
 - `novarocks/execution/src/exec/pipeline/executor.rs`
   生产入口 `prepare_compiled_program_with_sink_materializer` 先建立计算图，再按实际 root DOP
   绑定 sink。change-stream 的独立 summary pipeline 加入同一 DriverBatch/DriverGroupCompletion，

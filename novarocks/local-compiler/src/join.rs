@@ -67,10 +67,7 @@ use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, FunctionValueType, PureCompileControl,
 };
 use novarocks_types::SlotId;
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::Arc,
-};
+use std::{collections::BTreeMap, sync::Arc};
 
 /// The local join family and kind after orientation normalization.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -295,15 +292,16 @@ pub(crate) fn orient_join(node: &PhysicalNode) -> Result<JoinOrientation, Fragme
     }
 }
 
-/// The physical inputs that may arrive replicated: the build ExchangeSource
-/// of a broadcast-build hash join and the right ExchangeSource of a
-/// broadcast-right nested-loop join. Any other replicated placement is
-/// refused by the caller.
+/// Match the complete replicated build input of a broadcast join. Only
+/// nodes with a checked broadcast-equivalence proof and a transparent chain
+/// to a broadcast receiver can use their instance's copy. The caller's
+/// single-owner tree walk rejects shared use of any part of the chain.
 pub(crate) fn replicated_build_inputs(
     fragment: &Fragment,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<BTreeSet<NodeId>, FragmentCompileError> {
-    let mut inputs = BTreeSet::new();
+) -> Result<BTreeMap<NodeId, bool>, FragmentCompileError> {
+    let mut inputs = BTreeMap::new();
+    let mut region = Vec::new();
     for node in fragment.nodes().values() {
         work.step()?;
         let build = match &node.kind {
@@ -318,16 +316,47 @@ pub(crate) fn replicated_build_inputs(
             } => node.inputs.get(1),
             _ => None,
         };
-        let Some(&build) = build else {
+        let Some(&initial) = build else {
             continue;
         };
-        let receiver = fragment.nodes().get(&build).is_some_and(|input| {
-            matches!(input.kind, NodeKind::ExchangeSource { .. })
-                && input.output_properties.distribution == Distribution::Broadcast
-                && input.output_properties.row_multiplicity == RowMultiplicity::Replicated
-        });
-        if receiver {
-            inputs.insert(build);
+        let mut input_id = initial;
+        let complete = loop {
+            work.step()?;
+            if let Some(&complete) = inputs.get(&input_id) {
+                break complete;
+            }
+            let Some(input) = fragment.nodes().get(&input_id) else {
+                break false;
+            };
+            if input.output_properties.distribution != Distribution::Broadcast
+                || input.output_properties.row_multiplicity != RowMultiplicity::Replicated
+            {
+                break false;
+            }
+            if !matches!(
+                (&input.kind, input.inputs.as_ref()),
+                (NodeKind::ExchangeSource { .. }, [])
+                    | (
+                        NodeKind::Project { .. }
+                            | NodeKind::Filter { .. }
+                            | NodeKind::TableFunction { .. },
+                        [_],
+                    )
+            ) {
+                break false;
+            }
+            region
+                .try_reserve(1)
+                .map_err(|_| CompileControlError::ResourceExhausted)?;
+            region.push(input_id);
+            let Some(&parent) = input.inputs.first() else {
+                break true;
+            };
+            input_id = parent;
+        };
+        for input in region.drain(..) {
+            work.step()?;
+            inputs.insert(input, complete);
         }
     }
     Ok(inputs)

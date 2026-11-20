@@ -98,14 +98,14 @@ id	f
 2	0
 
 -- query 42
--- legacy
+-- types	integer	integer	varchar
 left_id	right_id	merged_key
 1	10	1
 NULL	20	1000
 NULL	30	NULL
 
 -- query 44
--- legacy
+-- types	integer	integer	varchar
 left_id	right_id	merged_key
 2	NULL	NULL
 NULL	30	NULL

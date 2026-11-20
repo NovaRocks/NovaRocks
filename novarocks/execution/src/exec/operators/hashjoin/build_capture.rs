@@ -24,7 +24,7 @@ use super::{
     build_pages::{
         B3RunId, BuildInputReceipt, BuildPageData, BuildPageProjection, InputCaptures,
         PageProjectionIds, PayloadRunPages, ProjectionRunSummary, RetainedNaaValues,
-        ValueNullFacts, capture_work, check, checkpoint, push_owned,
+        ValueNullFacts, capture_work, check, checkpoint,
     },
     build_state::{ProjectionDomains, build_contract},
     join_completion::{arithmetic, funded_shared, funded_vec},
@@ -40,6 +40,7 @@ use crate::{
             partition_keys::source_key_owner,
         },
         pipeline::operator::InputConstructionOwner,
+        shared_stage::push_owned,
     },
     runtime::task::{ExecutionFailure, ExecutionResult},
 };

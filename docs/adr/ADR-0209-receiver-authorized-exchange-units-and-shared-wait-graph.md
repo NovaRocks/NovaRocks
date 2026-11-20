@@ -5,6 +5,7 @@ domain: [pipeline-execution, runtime-filter]
 status: active
 supersedes: []
 superseded-by: null
+partially-superseded-by: [ADR-0243]
 partially-supersedes: [ADR-0027, ADR-0208]
 date: 2026-10-31
 provenance:

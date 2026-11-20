@@ -414,6 +414,7 @@ impl KeyIndex {
     }
     /// Translate a caller's dense state/output position without exposing an
     /// unchecked ID constructor or requiring a second O(D) identity vector.
+    #[cfg(test)]
     pub(crate) fn key_id_at(&self, index: usize) -> ExecutionResult<KeyId> {
         self.check()?;
         if self.purpose != IndexPurpose::KeyIds {
@@ -659,6 +660,7 @@ impl KeyIndex {
             control,
         )
     }
+    #[cfg(test)]
     pub(crate) fn export_keys(
         &self,
         ids: &[KeyId],
@@ -930,6 +932,7 @@ impl KeyIndex {
             }
         }
     }
+    #[cfg(test)]
     pub(crate) fn probe_batch(
         &self,
         input: &PreparedKeyBatch<'_>,

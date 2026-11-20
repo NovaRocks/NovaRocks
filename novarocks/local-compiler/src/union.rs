@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Normalize every proved UnionAll branch with the existing Project vocabulary.
+//! Normalize every proved set operation branch with the existing Project vocabulary.
 //! The sole channel and expression authors supply exact input occurrences and
 //! definitions. This leaf neither casts values nor creates runtime capabilities.
 //! Type/layout clones and opaque Arc construction remain caller admission work,
@@ -26,7 +26,7 @@ use novarocks_expression::MAX_STATIC_EXPRESSIONS;
 use novarocks_local_program::{
     DiagnosticSourceNodeId, MAX_PROGRAM_NODES, MAX_PROGRAM_TYPED_CHANNELS,
     ProgramChannelLayoutRole, ProgramChannelSite, ProgramNode, ProgramNodeId, ProgramNodeKind,
-    ProgramRootRef, StaticLayout,
+    ProgramRootRef, SetOpKind, StaticLayout,
 };
 use novarocks_physical_plan::{FragmentPackage, NodeKind, PhysicalNode, SetOperationKind};
 use novarocks_type_contract::{
@@ -35,12 +35,12 @@ use novarocks_type_contract::{
 use novarocks_types::SlotId;
 use std::alloc::Layout;
 
-/// Emit ordered subordinate normalizers followed by the actual UnionAll.
+/// Emit ordered subordinate normalizers followed by the set operation.
 /// `definitions` are already authored SlotId reads with each source's complete
 /// type; their arena, lexical bindings, total counts and identity allocation
 /// remain with the original compiler owners. Shared layouts preserve the
 /// published output types without changing the source expression definitions.
-pub(crate) fn lower_union_with_creation<H>(
+pub(crate) fn lower_set_operation_with_creation<H>(
     package: &FragmentPackage,
     node: &PhysicalNode,
     local: ProgramNodeId,
@@ -80,16 +80,16 @@ fn lower_core_with_creation<H>(
     work.step()?;
     if !same {
         return Err((FragmentCompileError::Invalid(
-            "UnionAll source is outside its original fragment",
+            "set operation source is outside its original fragment",
         ))
         .into());
     }
     let NodeKind::SetOp {
-        kind: SetOperationKind::UnionAll,
+        kind,
         input_mappings,
     } = &node.kind
     else {
-        return Err((FragmentCompileError::Invalid("UnionAll source kind differs")).into());
+        return Err((FragmentCompileError::Invalid("set operation source kind differs")).into());
     };
     let width = node.output.columns.len();
     let shape = node.inputs.len() >= 2
@@ -100,7 +100,7 @@ fn lower_core_with_creation<H>(
     work.step()?;
     if !shape {
         return Err((FragmentCompileError::Invalid(
-            "UnionAll branch or output occurrence shape differs",
+            "set operation branch or output occurrence shape differs",
         ))
         .into());
     }
@@ -141,12 +141,12 @@ fn lower_core_with_creation<H>(
         work.step()?;
         if !shape {
             return Err((FragmentCompileError::Invalid(
-                "UnionAll normalization branch shape differs",
+                "set operation normalization branch shape differs",
             ))
             .into());
         }
         let child = child.ok_or(FragmentCompileError::Invalid(
-            "UnionAll physical input is absent",
+            "set operation physical input is absent",
         ))?;
         for ((source, &mapped), &output) in
             branch.sources.iter().zip(mapping).zip(&node.output.columns)
@@ -166,22 +166,22 @@ fn lower_core_with_creation<H>(
             work.step()?;
             if !same {
                 return Err((FragmentCompileError::Invalid(
-                    "UnionAll mapping differs from its proved input occurrence",
+                    "set operation mapping differs from its proved input occurrence",
                 ))
                 .into());
             }
             let source_value = source_value.ok_or(FragmentCompileError::Invalid(
-                "UnionAll mapped value is absent",
+                "set operation mapped value is absent",
             ))?;
             let output_value = output_value.ok_or(FragmentCompileError::Invalid(
-                "UnionAll output value is absent",
+                "set operation output value is absent",
             ))?;
             exact_type(&source.ty, &source_value.ty, work)?;
             let widens = !source_value.ty.nullable() || output_value.ty.nullable();
             work.step()?;
             if !widens {
                 return Err((FragmentCompileError::Invalid(
-                    "UnionAll output narrows input nullability",
+                    "set operation output narrows input nullability",
                 ))
                 .into());
             }
@@ -194,7 +194,7 @@ fn lower_core_with_creation<H>(
                 )?
             {
                 return Err((FragmentCompileError::Invalid(
-                    "UnionAll complete value types differ",
+                    "set operation complete value types differ",
                 ))
                 .into());
             }
@@ -233,11 +233,21 @@ fn lower_core_with_creation<H>(
     }
     let sources = source_diagnostic(diagnostic, work)?;
     work.flush()?;
-    let union =
-        ProgramNode::new_local(local, sources, ProgramNodeKind::UnionAll { inputs }, layout);
+    let operation = match kind {
+        SetOperationKind::UnionAll => ProgramNodeKind::UnionAll { inputs },
+        SetOperationKind::Intersect => ProgramNodeKind::SetOp {
+            kind: SetOpKind::Intersect,
+            inputs,
+        },
+        SetOperationKind::Except => ProgramNodeKind::SetOp {
+            kind: SetOpKind::Except,
+            inputs,
+        },
+    };
+    let operation = ProgramNode::new_local(local, sources, operation, layout);
     work.step()?;
     work.flush()?;
-    nodes.push(union);
+    nodes.push(operation);
     work.step()?;
     Ok(nodes)
 }
@@ -254,7 +264,7 @@ fn exact_type(
     work.flush()?;
     if !same {
         return Err(FragmentCompileError::Invalid(
-            "UnionAll complete value types differ",
+            "set operation complete value types differ",
         ));
     }
     Ok(())
@@ -293,7 +303,7 @@ fn output_layout_with_creation<H>(
         let result_name = result_names.and_then(|result| result.fields.get(ordinal));
         work.step()?;
         let definition = definition.ok_or(FragmentCompileError::Invalid(
-            "UnionAll output value is absent",
+            "set operation output value is absent",
         ))?;
         let name = if let Some(field) = result_name {
             copy_name_with_creation(

@@ -80,8 +80,6 @@ enum Shape {
     RepeatedHash,
     /// Stream edge without a partitioning contract; consumer is a Noop sink.
     Unconstrained,
-    /// Unknown input placement reaches a Result sink; no Noop refusal masks it.
-    UnconstrainedResult,
     /// CTE multicast producer; consumer is a Noop sink.
     Multicast,
 }
@@ -282,7 +280,7 @@ fn packages(shape: Shape) -> BTreeMap<FragmentId, FragmentPackage> {
             (conditional([b, a], b), conditional([ib, ia], ib))
         }
         Shape::RoundRobin => (Distribution::RoundRobin, Distribution::RoundRobin),
-        Shape::Unconstrained | Shape::UnconstrainedResult | Shape::Multicast => {
+        Shape::Unconstrained | Shape::Multicast => {
             (Distribution::Unconstrained, Distribution::Unconstrained)
         }
     };
@@ -305,7 +303,6 @@ fn packages(shape: Shape) -> BTreeMap<FragmentId, FragmentPackage> {
             | Shape::Conditional
             | Shape::RepeatedConditional
             | Shape::RoundRobin
-            | Shape::UnconstrainedResult
     );
     let consumer_sink = if gather {
         FragmentSink::Result
@@ -911,15 +908,6 @@ fn repeated_conditional_imports_use_the_same_first_mask_and_hash_key_occurrence(
         }
     );
     assert_eq!(input.hash_partition_slots.as_ref(), &[slots[0], slots[1]]);
-}
-
-#[test]
-fn unconstrained_exchange_input_remains_unsupported_without_instance_placement() {
-    let mut packages = packages(Shape::UnconstrainedResult);
-    refused(
-        compile(packages.remove(&CONSUMER).unwrap(), Some(1)),
-        "unconstrained distribution without a runtime-split scan placement",
-    );
 }
 
 fn full_outer_exchange_input_packages(

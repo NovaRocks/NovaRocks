@@ -92,7 +92,7 @@ code-anchors:
 - ADR-0001 — runtime filter 等待环为何静态 strict-fail，而不是靠运行时 timeout 兜底（active）
 - ADR-0002 — multicast 反压为何保持消费者耦合（active）
 - ADR-0003 — RF consumer 为何默认 BlockingSnapshot、NonBlockingLive 只做定点降级（active）
-- [ADR-0209](ADR-0209-receiver-authorized-exchange-units-and-shared-wait-graph.md) — 接收授予与有序重放为何独立于严格消费和实际退出，结构等待为何共用纯算法而策略仍归 SQL（active；部分替代 ADR-0027/0208，其余规划与写入规则保留）
+- [ADR-0209](ADR-0209-receiver-authorized-exchange-units-and-shared-wait-graph.md) — 接收授予与有序重放为何独立于严格消费和实际退出，结构等待为何共用纯算法而策略仍归 SQL（active；部分替代 ADR-0027/0208，其余规划与写入规则保留）（集合运算的探测门由 ADR-0243 细化，共享等待图与耦合背压保留）
 - ADR-0027 — Runtime Filter 规划为何由 SQL 私有拥有、角色之间只交换封存 wire facts（active；等待图纯算法的物理归属由 ADR-0209 部分替代，SQL 策略与封存边界保留）
 - ADR-0043 — Runtime Filter row/scan evaluator 为何统一由 Execution 拥有、Backend 只提供 artifact query（active）
 - ADR-0044 — Runtime Filter participant 物理生命周期为何由 Backend 拥有、Execution 保留语义值与 evaluator（active）
@@ -119,12 +119,13 @@ code-anchors:
 
 - [ADR-0223](ADR-0223-result-content-identity-and-deterministic-fingerprints.md) — 内容身份为何逐列显式选择、NaN 规范化与首次接纳代表为何分开、确定指纹为何只作证据并由原 owner 判定适用资格（active；补充 ADR-0205，限当前准入支持面）
 - [ADR-0220](ADR-0220-canonical-json-membership-and-utc-variant-timestamps.md) — JSON membership为何共用规范键与哈希null-aware LeftMark、JSON与VARIANT为何分析期隔离、Variant时间戳为何纯UTC渲染（active；补充ADR-0212的mark输出，原join生命周期保留）
-- [ADR-0212](ADR-0212-shared-join-stages-and-exact-demand-retirement.md) — SharedBuild 为何分开 E/F/Q/T、原 K 工作、准确需求与 data-only 发布，并以增量候选和独立 tail 维持正常退休（active；部分替代 ADR-0004 的单 Chunk/整批选择向量/拒绝增量 cursor，补充 ADR-0205 的推进与 assignment 交接）
+- [ADR-0212](ADR-0212-shared-join-stages-and-exact-demand-retirement.md) — SharedBuild 为何分开 E/F/Q/T、原 K 工作、准确需求与 data-only 发布，并以增量候选和独立 tail 维持正常退休（active；部分替代 ADR-0004 的单 Chunk/整批选择向量/拒绝增量 cursor，补充 ADR-0205 的推进与 assignment 交接）（共享阶段件的归属与参数化由 ADR-0243 修订，原 join 需求和退休规则保留）
 - [ADR-0205](ADR-0205-shared-local-key-index-and-consumer-row-topology.md) — 实例内键相等类为何共用唯一索引、bulk 工作与完成协议为何分开，而 join 行关系与聚合状态仍归原消费者（active；部分替代 ADR-0004 的索引分家裁决；推进结果、调用方唤醒和范围 assignment 由 ADR-0212 补充，内容政策与指纹由 ADR-0223 补充）
 - ADR-0004 — hash join 执行核心为何保留专有行拓扑与 selection/gather，且不写显式 SIMD（active；索引分家与旧 method 前提由 ADR-0205 部分替代；单 Chunk、整批选择向量和拒绝增量 cursor 由 ADR-0212 部分替代，行拓扑与正确性要求保留）
 
 ### pipeline-execution
 
+- [ADR-0243](ADR-0243-set-operation-shared-stages-and-exactly-once-placement.md) — DISTINCT 集合运算为何共享阶段件、每个探测只等待构建，以及 Handoff 如何证明需求结束（active，部分修订 ADR-0209／0212）
 - [ADR-0242](ADR-0242-constant-folding-compiles-expression-units.md) — 常量折叠为何逐节点使用同一表达式单元、缓存结果并在规划期保留原失败语义，标量调用事实为何归表达式层（active；部分替代 ADR-0100、折叠 ADR-0191 与 ADR-0238，承接求值器 ADR-0239 的单节点入口退役条件）
 - [ADR-0239](ADR-0239-expression-evaluation-and-host-admission.md) — 表达式层为何共用编译与求值，如何由求值器撰写唯一调用协议并由宿主提供准入与保管（active；已接入生产路径，部分替代 ADR-0238 中求值器暂留 Execution 的安排；单节点折叠的退役条件由 ADR-0242 承接）
 - [ADR-0238](ADR-0238-self-contained-expression-units-and-explicit-environments.md) — 表达式为何按自包含单元携带端口、根与调用事实，并把共享环境、关系调用和纯编译留在准确 owner（active；节点、wire 27 和编译路径已接入，求值器暂留 Execution 由 ADR-0239 部分替代，标量调用撰写所有权由 ADR-0242 部分替代）
@@ -136,9 +137,9 @@ code-anchors:
 - [ADR-0218](ADR-0218-work-credentials-and-credentialed-entries.md) — 查询工作为何把原义务留在 join owner，由身份 owner 签发窄入口，并分开捕获析构、报告退休与真实收敛（active；补充 ADR-0211/0216/0194，第三方内部作业与监督覆盖边界另列）
 - [ADR-0221](ADR-0221-schema-free-online-units-and-prepared-layout-recipes.md) — 在线数据为何在准备期冻结完整布局、只传独立标准批次，并分开物理NULL、逻辑requiredness、原预算与真实线程退出（active；补充ADR-0209，普通root IPC保持）（COW 结果用途与编码由 ADR-0233 部分替代，共享 NRU1/BatchRecipe 与原 root IPC 保留）
 - [ADR-0211](ADR-0211-deterministic-control-runtime-and-task-ownership.md) — 控制面为何共用确定性运行时、同步资源准入与真实工作保管，Context为何热执行退出后仍由原核心保留（active；部分替代 ADR-0193 的同步实现与无角色结算登记、ADR-0161 的注册表与保留容量承载，既有身份、裁决与真实退出语义保留）
-- [ADR-0212](ADR-0212-shared-join-stages-and-exact-demand-retirement.md) — 本地 join 为何以实际 E/F/Q/T 与原 K 分区分别推进、仅 T>0 安装 Handoff，并分开正常退休与 Task 原因（active）
+- [ADR-0212](ADR-0212-shared-join-stages-and-exact-demand-retirement.md) — 本地 join 为何以实际 E/F/Q/T 与原 K 分区分别推进、仅 T>0 安装 Handoff，并分开正常退休与 Task 原因（active）（共享阶段件的归属与参数化由 ADR-0243 修订，原 join 需求和退休规则保留）
 - [ADR-0206](ADR-0206-frozen-write-placement-and-task-completion-assembly.md) — change-stream 写入为何从同一冻结图独立绑定放置、实际 driver、准确 summary 来源和 strict 成功尾部，再交原 FE publication（active；补充 ADR-0208 与 ADR-0198，不替代 Provider 或发布 owner）
-- [ADR-0209](ADR-0209-receiver-authorized-exchange-units-and-shared-wait-graph.md) — push exchange 为何先授予再接管、有序重放，消费与实际退出为何分开，等待图为何只有一个算法（active；部分替代 ADR-0027/0208，保留耦合 multicast 与原治理）
+- [ADR-0209](ADR-0209-receiver-authorized-exchange-units-and-shared-wait-graph.md) — push exchange 为何先授予再接管、有序重放，消费与实际退出为何分开，等待图为何只有一个算法（active；部分替代 ADR-0027/0208，保留耦合 multicast 与原治理）（集合运算的探测门由 ADR-0243 细化，共享等待图与耦合背压保留）
 - [ADR-0208](ADR-0208-logical-write-counts-and-strict-stream-delivery.md) — 逻辑写计数、物理分布与严格消费为何各守独立契约，summary与writer结果为何公平推进（active；当前装配由 ADR-0206 补充，不重放传输的阶段规则由 ADR-0209 部分替代，其余写入规则保留）
 
 - [ADR-0192](ADR-0192-provider-work-units-share-one-runtime-split-path.md) — Provider 工作单元为何统一走 runtime split，单例提示为何只影响放置，分布聚合与恢复为何各守原 owner（active）
@@ -317,6 +318,7 @@ code-anchors:
 - ADR-0135 — 分布式工作为何以 task 为单位创建、驱动与终结，而不是 query-wide participant 状态机（superseded → ADR-0146）
 ### sql-compiler
 
+- [ADR-0243](ADR-0243-set-operation-shared-stages-and-exactly-once-placement.md) — 集合运算为何先转换再分区，无 split 分支为何由 Singleton source 和单副本 exchange 建立行放置（active）
 - [ADR-0242](ADR-0242-constant-folding-compiles-expression-units.md) — 常量折叠为何逐节点使用同一表达式单元、缓存结果并在规划期保留原失败语义，标量调用事实为何归表达式层（active；部分替代 ADR-0100、折叠 ADR-0191 与 ADR-0238，承接求值器 ADR-0239 的单节点入口退役条件）
 - [ADR-0239](ADR-0239-expression-evaluation-and-host-admission.md) — 表达式层为何共用编译与求值，如何由求值器撰写唯一调用协议并由宿主提供准入与保管（active；已接入生产路径，部分替代 ADR-0238 中求值器暂留 Execution 的安排；单节点折叠的退役条件由 ADR-0242 承接）
 - [ADR-0238](ADR-0238-self-contained-expression-units-and-explicit-environments.md) — 表达式为何按自包含单元携带端口、根与调用事实，并把共享环境、关系调用和纯编译留在准确 owner（active；节点、wire 27 和编译路径已接入，求值器暂留 Execution 由 ADR-0239 部分替代，标量调用撰写所有权由 ADR-0242 部分替代）

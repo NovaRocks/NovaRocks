@@ -1918,7 +1918,8 @@ fn derive_node_output_properties_from(
                     .collect::<BTreeMap<_, _>>(),
                 _ => unreachable!(),
             };
-            let expected = crate::remap_properties_through_values(input, &value_mapping);
+            let mut expected = crate::remap_properties_through_values(input, &value_mapping);
+            expected.ordering = Box::default();
             if target.actual(node, &expected) != &expected {
                 errors.push(ValidationError::new(
                     path,
@@ -2214,7 +2215,10 @@ fn validate_assertion_properties_from(
         .first()
         .and_then(|input| children.get(fragment, input))?;
     let required = node.required_inputs.first()?;
-    let expected = input.clone();
+    let mut expected = input.clone();
+    if matches!(spec, crate::RowCountAssertionSpec::PerKeyAtMostOne { .. }) {
+        expected.ordering = Box::default();
+    }
     let actual = target.actual(node, &expected);
     let distribution_valid = match spec {
         crate::RowCountAssertionSpec::Global { .. } => {
@@ -2241,10 +2245,10 @@ fn validate_assertion_properties_from(
             "row-count assertion lacks its exact distribution contract",
         ));
     }
-    if *actual != *input {
+    if *actual != expected {
         errors.push(ValidationError::new(
             path,
-            "row-count assertion does not preserve its child properties",
+            "row-count assertion output properties differ from its assertion mode",
         ));
     }
     Some(expected)

@@ -19,6 +19,7 @@ explicit_only = false
 
 [impact]
 paths = [
+    "novarocks/local-compiler/src/lowering.rs",
     "novarocks/functions/src/arithmetic*.rs",
     "novarocks/functions/src/legacy_decimal.rs",
     "novarocks/functions/src/legacy_arithmetic.rs",

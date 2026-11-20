@@ -1090,6 +1090,8 @@ fn drop_distribution_key_project_plan(
     let edge = EdgeId::new(5);
     let producer_id = FragmentId::new(1);
     let consumer_id = FragmentId::new(2);
+    let result_id = FragmentId::new(3);
+    let gather = EdgeId::new(6);
 
     let mut producer =
         crate::exec::operators::family_fixture::constant_sources::FragmentBuilder::new(
@@ -1213,9 +1215,11 @@ fn drop_distribution_key_project_plan(
     let consumer = consumer
         .finish_definition(
             project,
-            FragmentSink::Result,
+            FragmentSink::Stream { edge: gather },
             dop(),
-            novarocks_physical_plan::StagePlacementPolicy::Singleton,
+            novarocks_physical_plan::StagePlacementPolicy::Spread {
+                max_instances: None,
+            },
         )
         .unwrap();
     assert_eq!(
@@ -1238,7 +1242,40 @@ fn drop_distribution_key_project_plan(
     } else {
         (Distribution::Unconstrained, Distribution::Unconstrained)
     };
-    let output = consumer.nodes()[&project].output.clone();
+
+    // Result placement is a separate Singleton anchor. The intermediate
+    // receiver under test has no such proof for its Unconstrained input.
+    let mut result =
+        super::family_fixture::constant_sources::FragmentBuilder::new(result_id, &fixture_sources);
+    let result_root = result.reserve_node_id().unwrap();
+    let b_result = result
+        .add_value(
+            int64(),
+            ValueOrigin::ExchangeImport {
+                edge: gather,
+                source_value: b_import,
+            },
+        )
+        .unwrap();
+    result
+        .add_exchange_source(
+            result_root,
+            gather,
+            Box::new([(b_import, b_result)]),
+            Box::new([b_result]),
+            Distribution::Singleton,
+            RowMultiplicity::SingleCopy,
+        )
+        .unwrap();
+    let result = result
+        .finish_definition(
+            result_root,
+            FragmentSink::Result,
+            dop(),
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
+        )
+        .unwrap();
+    let output = result.nodes()[&result_root].output.clone();
 
     let mut plan = crate::exec::operators::family_fixture::constant_sources::PlanBuilder::new(
         PlanVersionId::try_new([73; 16]).unwrap(),
@@ -1246,6 +1283,7 @@ fn drop_distribution_key_project_plan(
     );
     plan.add_fragment(producer).unwrap();
     plan.add_fragment(consumer).unwrap();
+    plan.add_fragment(result).unwrap();
     plan.add_edge(Edge {
         role: novarocks_physical_plan::OutputRole::Relational,
         delivery: novarocks_physical_plan::DeliveryRequirement::DemandDriven,
@@ -1270,15 +1308,39 @@ fn drop_distribution_key_project_plan(
         },
     })
     .unwrap();
+    plan.add_edge(Edge {
+        role: novarocks_physical_plan::OutputRole::Relational,
+        delivery: novarocks_physical_plan::DeliveryRequirement::DemandDriven,
+        id: gather,
+        kind: EdgeKind::Stream,
+        source: EdgeSource {
+            port: novarocks_physical_plan::FragmentOutputPort::Root,
+            fragment: consumer_id,
+            projection: Box::new([b_import]),
+        },
+        destination: EdgeDestination {
+            fragment: result_id,
+            node: result_root,
+            receive_mapping: Box::new([(b_import, b_result)]),
+        },
+        partitioning: EdgePartitioning {
+            source: Distribution::Singleton,
+            source_multiplicity: RowMultiplicity::SingleCopy,
+            destination: Distribution::Singleton,
+            destination_multiplicity: RowMultiplicity::SingleCopy,
+            routing_only: Box::default(),
+        },
+    })
+    .unwrap();
     plan.set_result_port(ResultPort {
         scalar_schema: None,
-        fragment: consumer_id,
+        fragment: result_id,
         output,
         fields: Box::from([ResultField {
             domain: crate::test_result_domain::result_value_domain(&int64()),
             name: "b".into(),
             alias: None,
-            value: b_import,
+            value: b_result,
             ty: int64(),
         }]),
     })

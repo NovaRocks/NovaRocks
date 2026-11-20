@@ -212,7 +212,7 @@ fn try_sql_source_with_explicit_fields(
         },
         DEFAULT_COMPLETION_LIMITS,
     );
-    let mut progress = SqlCompiler::start(request.try_into_completion().unwrap(), &control)?;
+    let mut progress = SqlCompiler::start(request.try_into_completion()?, &control)?;
     let mut bindings = SqlTableBindingAllocator::new_unique().unwrap();
     loop {
         let compilation = match progress {

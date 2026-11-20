@@ -22,7 +22,7 @@ paths = [
     "novarocks/sql/src/analysis/cte.rs",
     "novarocks/sql/src/optimizer/cte_rewrite.rs",
     "novarocks/sql/src/planner/distributed/build/contract_lowering.rs",
-    "novarocks/sql/src/planner/distributed/build/wait_graph.rs",
+    "novarocks/physical-plan/src/wait_graph.rs",
 ]
 
 [reuse]

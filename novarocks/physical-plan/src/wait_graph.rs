@@ -61,10 +61,6 @@ pub enum WaitNode {
     Backpressure(OperatorRef),
     SummaryCompletion(FragmentId, crate::SummaryKind),
     SummaryBackpressure(FragmentId, crate::SummaryKind),
-    InputPrefix {
-        operator: OperatorRef,
-        ordinal: usize,
-    },
     Input {
         operator: OperatorRef,
         ordinal: usize,
@@ -286,7 +282,12 @@ impl WaitGraph {
                     NodeKind::SetOp {
                         kind: SetOperationKind::Intersect | SetOperationKind::Except,
                         ..
-                    } => graph.add_ordered_prefix(&plan, operator, node.inputs.len(), work)?,
+                    } => {
+                        for ordinal in 1..node.inputs.len() {
+                            work.step()?;
+                            graph.add_input_gate(&plan, operator, ordinal, 0)?;
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -435,36 +436,6 @@ impl WaitGraph {
             WaitNode::Completion(prerequisite),
             WaitEdgeKind::DataWait,
         );
-        Ok(())
-    }
-
-    fn add_ordered_prefix(
-        &mut self,
-        plan: &PlanView<'_>,
-        operator: OperatorRef,
-        inputs: usize,
-        work: &mut CompileCheckpoints<'_>,
-    ) -> Result<(), WaitGraphError> {
-        let mut previous = None;
-        for ordinal in 0..inputs {
-            work.step()?;
-            let root = plan.input(operator, ordinal)?;
-            let prefix = WaitNode::InputPrefix { operator, ordinal };
-            self.add_edge(prefix, WaitNode::Completion(root), WaitEdgeKind::DataWait);
-            if let Some(previous) = previous {
-                self.add_edge(prefix, previous, WaitEdgeKind::DataWait);
-                let gate = WaitNode::Input { operator, ordinal };
-                // The target input's absorption property does not suppress
-                // its own stage-admission dependency.
-                self.add_edge(
-                    WaitNode::Backpressure(root),
-                    gate,
-                    WaitEdgeKind::Backpressure,
-                );
-                self.add_edge(gate, previous, WaitEdgeKind::DataWait);
-            }
-            previous = Some(prefix);
-        }
         Ok(())
     }
 
@@ -794,5 +765,4 @@ impl novarocks_type_contract::PureCompileControl for TestCompileControl {
 }
 
 #[cfg(test)]
-#[path = "wait_graph_tests.rs"]
 mod tests;

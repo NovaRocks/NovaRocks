@@ -37,11 +37,27 @@ pub(crate) enum ExecutionReason {
     SourceInputEdge = 16,
     SourceInputEos = 17,
     SourceRequestedInput = 18,
+    #[expect(
+        dead_code,
+        reason = "Stable Execution failure reason slot retained after its producer retired; never renumber or reuse."
+    )]
     SourceMissingRuntimeBinding = 19,
+    #[expect(
+        dead_code,
+        reason = "Stable Execution failure reason slot retained after its producer retired; never renumber or reuse."
+    )]
     SourceColumnCount = 20,
     ReceiverUnexpectedRootGrant = 21,
     FilterArrow = 24,
+    #[expect(
+        dead_code,
+        reason = "Stable Execution failure reason slot retained after its producer retired; never renumber or reuse."
+    )]
     SetInvalidStage = 25,
+    #[expect(
+        dead_code,
+        reason = "Stable Execution failure reason slot retained after its producer retired; never renumber or reuse."
+    )]
     SetDuplicateCompletion = 26,
     ReceiverInputAfterFinish = 27,
     #[expect(
@@ -505,13 +521,25 @@ pub(crate) enum ExecutionReason {
         reason = "Stable Execution failure reason retained after its producer retired; never renumber or reuse."
     )]
     NlJoinContract = 460,
+    #[expect(
+        dead_code,
+        reason = "Stable Execution failure reason slot retained after its producer retired; never renumber or reuse."
+    )]
     DistinctSetZeroColumns = 465,
     #[expect(
         dead_code,
         reason = "Stable Execution failure reason slot retained after its producer retired; never renumber or reuse."
     )]
     DistinctSetMissingRow = 466,
+    #[expect(
+        dead_code,
+        reason = "Stable Execution failure reason slot retained after its producer retired; never renumber or reuse."
+    )]
     DistinctSetGroupSequence = 467,
+    #[expect(
+        dead_code,
+        reason = "Stable Execution failure reason slot retained after its producer retired; never renumber or reuse."
+    )]
     DistinctSetGroupBounds = 468,
     #[expect(
         dead_code,
@@ -651,6 +679,7 @@ pub(crate) enum ExecutionReason {
     DriverStartControlDrop = 668,
     DriverActivationControlDrop = 669,
     DriverParkingControlDrop = 670,
+    SetOperationStageContract = 671,
 }
 impl ExecutionReason {
     pub(crate) const fn code(self) -> NonZeroU16 {

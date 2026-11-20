@@ -19,10 +19,16 @@ explicit_only = false
 
 [impact]
 paths = [
+    "novarocks/local-compiler/src/lowering.rs",
+    "novarocks/local-compiler/src/union.rs",
+    "novarocks/local-compiler/src/channels.rs",
+    "novarocks/execution/src/exec/pipeline/builder/compiled/set_op*",
+    "novarocks/execution/src/exec/shared_stage/**",
+    "novarocks/sql/src/analyzer/mod.rs",
     "novarocks/execution/src/exec/operators/setop/**",
     "novarocks/execution/src/exec/hash_table/**",
     "novarocks/sql/src/planner/distributed/build/contract_lowering.rs",
-    "novarocks/sql/src/planner/distributed/build/wait_graph.rs",
+    "novarocks/physical-plan/src/wait_graph.rs",
 ]
 
 [reuse]
