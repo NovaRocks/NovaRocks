@@ -3736,7 +3736,6 @@ impl FrozenRewriteLake {
 }
 
 mod baseline_contract_tests;
-#[path = "tests/baseline_contract_tests.rs"]
 mod row_mutation_begin;
 
 #[test]

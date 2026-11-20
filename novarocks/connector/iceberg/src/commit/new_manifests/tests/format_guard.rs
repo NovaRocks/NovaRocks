@@ -55,10 +55,12 @@ async fn v2_delete_manifest_is_rejected_after_upgrade_on_first_write_and_reuse()
         let entry =
             CompactEntry::from_arrival(&adapter, &mut fragments.into_iter().next(), 0, &author)
                 .unwrap();
-        let mut received = ReceivedCompactFiles::default();
-        received.counts = entry.counts;
+        let mut received = ReceivedCompactFiles {
+            counts: entry.counts,
+            author: Some(author),
+            ..Default::default()
+        };
         received.push(entry);
-        received.author = Some(author);
         fixture
             .operation
             .adopt_session_data(ObjectIdentity::new(path).unwrap())

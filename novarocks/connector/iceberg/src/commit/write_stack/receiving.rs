@@ -58,7 +58,7 @@ pub(crate) struct IcebergReceiving {
     queries: BTreeMap<ConnectorWriteQueryIdentity, QueryReceiving>,
     records: Vec<ReceivedRecord>,
     compact: Option<CompactReceiving>,
-    rewritten_target: Option<RewrittenTargetReceiving>,
+    rewritten_target: Option<Box<RewrittenTargetReceiving>>,
 }
 
 #[derive(Debug)]
@@ -239,14 +239,14 @@ impl IcebergReceiving {
                 "Iceberg rewritten target binding differs from the original write observation",
             ));
         }
-        self.rewritten_target = Some(RewrittenTargetReceiving {
+        self.rewritten_target = Some(Box::new(RewrittenTargetReceiving {
             owner,
             binding,
             metadata_digest: crate::read_snapshot::metadata_identity_digest(metadata)
                 .map_err(rewritten_target_error)?,
             collector: WrittenPartitionCollector::new(metadata),
             written: Some(WrittenPartitionDomain::default()),
-        });
+        }));
         Ok(())
     }
 

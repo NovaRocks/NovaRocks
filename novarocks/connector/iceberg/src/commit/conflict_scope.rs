@@ -1011,11 +1011,13 @@ fn unary_metrics_may_match(op: PredicateOperator, id: i32, file: &DataFile) -> b
     }
 }
 
+type MetricBounds<'a> = (Option<Cow<'a, Datum>>, Option<Cow<'a, Datum>>);
+
 fn metric_bounds<'a>(
     file: &'a DataFile,
     id: i32,
     primitive: &PrimitiveType,
-) -> Option<(Option<Cow<'a, Datum>>, Option<Cow<'a, Datum>>)> {
+) -> Option<MetricBounds<'a>> {
     if let Some(count) = file.value_counts().get(&id)
         && (file.null_value_counts().get(&id) == Some(count)
             || file.nan_value_counts().get(&id) == Some(count))
