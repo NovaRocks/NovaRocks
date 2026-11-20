@@ -330,8 +330,8 @@ impl FragmentBuilder {
 
     /// Adds a cardinality assertion over `input`.
     ///
-    /// The assertion counts rows, so it needs each logical row to exist once;
-    /// it constrains nothing else and changes nothing it passes on.
+    /// The assertion counts each logical row once. Per-key checks partition
+    /// their input among drivers and cannot promise its input order.
     pub fn add_assert_one_row(
         &mut self,
         node: NodeId,
@@ -346,7 +346,10 @@ impl FragmentBuilder {
             return Err(BuildError::AssertionOverReplicatedRows(node));
         }
         let columns = source.output.columns.clone();
-        let output_properties = source.output_properties.clone();
+        let mut output_properties = source.output_properties.clone();
+        if matches!(spec, crate::RowCountAssertionSpec::PerKeyAtMostOne { .. }) {
+            output_properties.ordering = Box::default();
+        }
         let required = crate::PhysicalProperties {
             distribution: output_properties.distribution.clone(),
             row_multiplicity: crate::RowMultiplicity::SingleCopy,
@@ -663,9 +666,8 @@ impl FragmentBuilder {
     ///
     /// Repeat re-emits each input row once per grouping set, so the values it
     /// passes through keep their identity and the values it rewrites do not.
-    /// The surviving layout and ordering follow from exactly that split, which
-    /// the builder computes from the input and output ports rather than taking
-    /// on trust.
+    /// The surviving distribution follows from the values that keep their
+    /// identity. Emitting each batch by grouping set can reorder the rows.
     pub fn add_repeat(
         &mut self,
         node: NodeId,
@@ -689,8 +691,9 @@ impl FragmentBuilder {
             .zip(output.iter().copied())
             .filter(|(input_value, output_value)| input_value == output_value)
             .collect::<BTreeMap<_, _>>();
-        let output_properties =
+        let mut output_properties =
             crate::remap_properties_through_values(&input_properties, &passthrough);
+        output_properties.ordering = Box::default();
         self.insert_node_unchecked(PhysicalNode {
             expressions: None,
             id: node,
@@ -901,10 +904,9 @@ impl FragmentBuilder {
     /// Adds an operator that rewrites the rows it reads, keeping the values in
     /// `passthrough` and replacing the rest.
     ///
-    /// Whatever layout or ordering the input had survives only for values that
-    /// survive, which is precisely what `passthrough` records, so the builder
-    /// remaps rather than taking the result on trust. Passing `None` states
-    /// that nothing survives.
+    /// Distribution can refer only to values in `passthrough`. Expansion
+    /// emits batches by mapping, so input ordering does not survive.
+    /// Passing `None` drops the input distribution.
     pub fn add_row_rewriting(
         &mut self,
         node: NodeId,
@@ -918,7 +920,7 @@ impl FragmentBuilder {
             .get(&input)
             .ok_or(BuildError::UndefinedInput { node, input })?;
         let input_properties = source.output_properties.clone();
-        let output_properties = match passthrough {
+        let mut output_properties = match passthrough {
             Some(passthrough) => {
                 crate::remap_properties_through_values(&input_properties, passthrough)
             }
@@ -928,6 +930,7 @@ impl FragmentBuilder {
                 ordering: Box::default(),
             },
         };
+        output_properties.ordering = Box::default();
         self.insert_node_unchecked(PhysicalNode {
             expressions: None,
             id: node,

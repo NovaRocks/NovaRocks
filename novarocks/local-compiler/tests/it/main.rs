@@ -18,5 +18,8 @@
 mod cast_lowering;
 mod fragment_fixture;
 mod node_units;
+mod ordering;
 mod output_layouts;
+mod placement;
+mod set_operations;
 mod unit_layouts;

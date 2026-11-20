@@ -24,13 +24,13 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+use crate::exec::shared_stage::{build_collection, tail_ranges};
+
 mod build_capture;
-mod build_collection;
 mod build_csr;
 mod build_finalize;
 #[cfg(test)]
 pub(crate) use build_finalize::BuildLookup;
-mod build_match_bitmap;
 mod build_pages;
 mod build_projection;
 mod build_requirements;
@@ -38,11 +38,9 @@ pub(crate) mod build_state;
 pub(crate) mod compiled_hash_join;
 mod csr_slots;
 mod join_completion;
-mod key_build_worker;
 mod naa_index;
 pub(crate) mod native_runtime_filter;
 mod payload_compaction;
-mod tail_ranges;
 mod typed_gather;
 
 pub(crate) use typed_gather::{
@@ -52,7 +50,10 @@ pub(crate) use typed_gather::{
 pub(crate) use join_completion::JoinParticipants;
 
 #[cfg(test)]
-pub(crate) use build_pages::tests::paged_fixture_rows;
+pub(crate) use build_pages::tests::{paged_fixture_rows, work as build_fixture_work};
+
+#[cfg(test)]
+pub(crate) use build_csr::tests::captured_graph;
 
 #[cfg(test)]
 pub(crate) use typed_gather::JoinGatherError;

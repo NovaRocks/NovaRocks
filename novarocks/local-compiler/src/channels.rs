@@ -216,13 +216,7 @@ fn resolve_core_with_creation<H>(
             ),
             _ => None,
         };
-        let additional = if matches!(
-            node.kind,
-            NodeKind::SetOp {
-                kind: novarocks_physical_plan::SetOperationKind::UnionAll,
-                ..
-            }
-        ) {
+        let additional = if matches!(node.kind, NodeKind::SetOp { .. }) {
             node.inputs.len()
         } else if matches!(
             node.kind,
@@ -352,13 +346,10 @@ fn resolve_core_with_creation<H>(
                 work.flush()?;
                 (slots, port)
             }
-            NodeKind::SetOp {
-                kind: novarocks_physical_plan::SetOperationKind::UnionAll,
-                input_mappings,
-            } => {
+            NodeKind::SetOp { input_mappings, .. } => {
                 if node.inputs.len() < 2 || input_mappings.len() != node.inputs.len() {
                     return Err((ChannelLoweringError::Invalid(
-                        "UnionAll input occurrence shape differs",
+                        "set operation input occurrence shape differs",
                     ))
                     .into());
                 }
@@ -375,7 +366,7 @@ fn resolve_core_with_creation<H>(
                             work.step()?;
                             if !same {
                                 return Err((ChannelLoweringError::Invalid(
-                                    "independent UnionAll mappings share one produced value",
+                                    "independent set operation mappings share one produced value",
                                 ))
                                 .into());
                             }
@@ -397,14 +388,14 @@ fn resolve_core_with_creation<H>(
                     node.inputs.iter().zip(input_mappings).enumerate()
                 {
                     let child_channels = nodes.get(&child).ok_or(ChannelLoweringError::Invalid(
-                        "UnionAll child has not been lowered",
+                        "set operation child has not been lowered",
                     ))?;
                     let child_port = ports.get(&child).ok_or(ChannelLoweringError::Invalid(
-                        "UnionAll child port is missing",
+                        "set operation child port is missing",
                     ))?;
                     if mapping.len() != node.output.columns.len() {
                         return Err((ChannelLoweringError::Invalid(
-                            "UnionAll mapping width differs",
+                            "set operation mapping width differs",
                         ))
                         .into());
                     }
@@ -417,19 +408,19 @@ fn resolve_core_with_creation<H>(
                             .values()
                             .get(&value)
                             .ok_or(ChannelLoweringError::Invalid(
-                                "UnionAll mapped value missing",
+                                "set operation mapped value missing",
                             ))?
                             .ty;
                         let target_ty = &fragment
                             .values()
                             .get(&output)
                             .ok_or(ChannelLoweringError::Invalid(
-                                "UnionAll output value missing",
+                                "set operation output value missing",
                             ))?
                             .ty;
                         if source_ty.nullable() && !target_ty.nullable() {
                             return Err((ChannelLoweringError::Invalid(
-                                "UnionAll narrows nullable input",
+                                "set operation narrows nullable input",
                             ))
                             .into());
                         }
@@ -439,7 +430,7 @@ fn resolve_core_with_creation<H>(
                             || work.step().map_err(ChannelLoweringError::from),
                         )? {
                             return Err((ChannelLoweringError::Invalid(
-                                "UnionAll complete value types differ",
+                                "set operation complete value types differ",
                             ))
                             .into());
                         }

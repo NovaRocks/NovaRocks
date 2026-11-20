@@ -72,7 +72,7 @@ mod result_sink;
 mod root_result_sink;
 pub(crate) mod runtime_filter;
 pub mod scan;
-mod setop;
+pub(crate) mod setop;
 mod sort;
 mod statistics_materializer;
 pub(crate) mod table_finish;
@@ -103,10 +103,7 @@ pub use result_buffer_sink::ResultBufferSinkFactory;
 pub(crate) use result_sink::{ResultSinkBuffer, ResultSinkFactory};
 pub use root_result_sink::RootResultSinkFactory;
 pub(crate) use setop::UnionAllSharedState;
-pub use setop::{
-    ExceptSinkFactory, ExceptSourceFactory, IntersectSinkFactory, IntersectSourceFactory,
-    UnionAllSinkFactory, UnionAllSourceFactory,
-};
+pub use setop::{UnionAllSinkFactory, UnionAllSourceFactory};
 pub(crate) use statistics_materializer::StatisticsMaterializerFactory;
 pub use table_finish::TableFinishOperatorFactory;
 pub use table_writer::TableWriterOperatorFactory;

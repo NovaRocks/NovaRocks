@@ -30,7 +30,6 @@ use crate::{
             BulkDomain, BulkInput, BulkWork, CaptureWork, CapturedPageId, CompleteInput,
             IndexPurpose, KeyInput, KeySpec, PreparedKeyBatch, SealedCapture,
         },
-        pipeline::operator::ConstructionFailure,
     },
     runtime::task::{ExecutionFailure, ExecutionResult},
 };
@@ -715,37 +714,6 @@ pub(super) fn checkpoint(index: usize, work: &BulkWork<'_>) -> ExecutionResult<(
     }
     Ok(())
 }
-pub(super) fn push_owned<T>(
-    values: &mut Vec<T>,
-    value: T,
-    storage: &mut ValueTypeStorageLifetime,
-    work: &BulkWork<'_>,
-) -> ExecutionResult<()> {
-    let growth =
-        novarocks_type_contract::owned_resources::vec::push_growth(values).map_err(|cause| {
-            match cause {
-                novarocks_type_contract::ControlResourceError::Control(cause) => {
-                    ConstructionFailure::Control(cause)
-                }
-                novarocks_type_contract::ControlResourceError::SourceModel(cause) => {
-                    ConstructionFailure::InvalidSource(cause.to_owned())
-                }
-            }
-        })?;
-    if let Some(layout) = growth.requested_backing {
-        work.owner.request(layout)?;
-        values.try_reserve(1).map_err(|source| {
-            ExecutionFailure::from_domain(novarocks_value_arrays::ValueError::Allocation {
-                requested: layout.size(),
-                source,
-            })
-        })?;
-        *storage = work.owner.storage_lifetime();
-    }
-    values.push(value);
-    Ok(())
-}
-
 #[cfg(test)]
 #[path = "build_pages_tests.rs"]
 pub(super) mod tests;

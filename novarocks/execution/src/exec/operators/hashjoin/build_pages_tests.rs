@@ -21,15 +21,18 @@ use super::super::{
     build_capture::{EvaluatedJoinKeyPage, EvaluatedKeyProjection, InputRunWriter},
     build_collection::{BeginClaim, BeginObligation, BuildCollection},
     join_completion::{
-        JoinCompletion, JoinParticipants,
+        JoinCompletion, JoinParticipants, new_join_completion,
         tests::{Control, fixture},
     },
 };
 use super::*;
 use crate::{
-    exec::hash_table::{
-        allocation::AggregateAllocator,
-        key_index::{KeySpec, NullPolicy},
+    exec::{
+        hash_table::{
+            allocation::AggregateAllocator,
+            key_index::{KeySpec, NullPolicy},
+        },
+        pipeline::operator::ConstructionFailure,
     },
     runtime::{
         mem_tracker::MemTracker, observable::Observable,
@@ -138,7 +141,7 @@ pub(crate) fn collect(
     CollectedInputs<BuildInputReceipt>,
     BeginObligation<BuildInputReceipt, NoArtifact>,
 ) {
-    let completion: Arc<JoinCompletion<NoArtifact>> = JoinCompletion::new(
+    let completion: Arc<JoinCompletion<NoArtifact>> = new_join_completion(
         JoinParticipants {
             inputs: receipts.len(),
             finalizers: NonZeroUsize::new(2).unwrap(),

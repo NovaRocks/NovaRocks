@@ -186,13 +186,6 @@ pub(super) fn append_positioned_pages<'a, P: Copy + Ord>(
 /// owner. Only row metadata is reindexed; values keep their original binding.
 /// Each moved page retains its real row-vector creator independently.
 /// The input batch stays alive until its emptied column/page directories drop.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Moves already funded typed loans for the frozen multipartition read/export API."
-    )
-)]
 pub(super) fn append_reindexed<'a>(
     mut source: OwnedKeyReadBatch<'a>,
     ordinals: &[usize],

@@ -24,12 +24,12 @@ use super::{
     build_state::build_contract,
     csr_slots::{SlotsObligation, SlotsProgress},
     join_completion::funded_shared,
-    key_build_worker::{KeyBuildWorker, KeyWorkerStep},
 };
 use crate::{
     exec::{
         hash_table::key_index::{BulkBuildGraph, BulkDomain, BulkWork, IndexPurpose, IndexView},
         pipeline::driver_step::TurnWork,
+        shared_stage::key_build_worker::{KeyBuildWorker, KeyWorkerStep},
     },
     runtime::{
         observable::Observable,
@@ -353,7 +353,7 @@ impl ProjectionWorker {
 
     pub(crate) fn new(work: &BulkWork<'_>) -> Self {
         Self {
-            keys: KeyBuildWorker::new(work),
+            keys: KeyBuildWorker::new(work, build_contract),
             csr: None,
         }
     }

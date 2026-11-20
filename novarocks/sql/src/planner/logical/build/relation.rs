@@ -503,6 +503,11 @@ pub(super) fn plan_set_operation_scoped(
                 all,
                 output_columns,
             }),
+            SetOpKind::Intersect | SetOpKind::Except if all => {
+                return Err(SqlCompileError::Compilation(format!(
+                    "{kind:?} ALL reached logical planning"
+                )));
+            }
             SetOpKind::Intersect => {
                 LogicalPlanKind::Intersect(LogicalIntersectNode { output_columns })
             }
