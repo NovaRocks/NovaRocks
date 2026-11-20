@@ -1342,16 +1342,6 @@
       "expires": "2026-12-15"
     },
     {
-      "unit": "sql-case:join/join_large_in_predicate",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Missing local lowering: sort mode without a local owner; owner B5, I5; remove after capability repair and native verification",
-      "owner": "B5, I5",
-      "expires": "2026-12-15"
-    },
-    {
       "unit": "sql-case:join/join_map_type",
       "failure": {
         "class": "error_code",
