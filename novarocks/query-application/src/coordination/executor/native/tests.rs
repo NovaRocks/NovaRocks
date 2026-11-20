@@ -3855,3 +3855,6 @@ async fn initial_and_successor_rows_stay_in_same_original_return_slot_after_dorm
 
 #[path = "tests/qualification_windows.rs"]
 mod qualification_windows;
+
+#[path = "tests/streamed_preparation.rs"]
+mod streamed_preparation;
