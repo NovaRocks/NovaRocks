@@ -547,7 +547,8 @@ fn legacy_trim_remains_on_the_sql_path() {
         &root.kind,
         ExprKind::FunctionCall { function, .. } if function.function_id.as_str() == "builtin.scalar/trim/v1"
     ));
-    assert_eq!(root.ty, FunctionValueType::new(DataType::Utf8, false));
+    // The original TRIM signature declares a conservatively nullable result.
+    assert_eq!(root.ty, FunctionValueType::new(DataType::Utf8, true));
     assert!(matches!(
         fixture.text(source, &columns),
         Err(TextError::NotTypedByLayer { construct, .. }) if construct == "trim"
