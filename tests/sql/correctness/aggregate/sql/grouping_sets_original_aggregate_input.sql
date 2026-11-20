@@ -64,3 +64,10 @@ ORDER BY g, k NULLS FIRST;
 -- query 7
 -- @skip_result_check=true
 DROP TABLE ${case_db}.t_grouping_input ;
+
+-- query 8
+WITH grouping_input(k) AS (SELECT 1 UNION ALL SELECT 2)
+SELECT GROUPING(k) AS g, -k AS negated
+FROM grouping_input
+GROUP BY GROUPING SETS ((k), ())
+ORDER BY g, negated;
