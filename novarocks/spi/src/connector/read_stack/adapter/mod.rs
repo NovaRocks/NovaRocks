@@ -36,7 +36,9 @@ use super::page_source::{
     ConnectorPreparedPageSource,
 };
 
-use super::page_stream::{ConnectorPageStream, ConnectorPollBudget, OwnedConnectorPageStream};
+use super::page_stream::{
+    ConnectorPageStream, ConnectorPollBudget, FileReaderFirstBatch, OwnedConnectorPageStream,
+};
 use super::runtime::{
     ConnectorAdmittedReadProviderFactory, ConnectorReadBinding, ConnectorReadChangeWindow,
     ConnectorReadColumnBinding, ConnectorReadColumnHandle, ConnectorReadConstraint,
@@ -1531,6 +1533,10 @@ impl<P: ProviderReadRuntime> Stream for CheckedPageStream<P> {
 impl<P: ProviderReadRuntime> ConnectorPageStream for CheckedPageStream<P> {
     fn metrics(&self) -> PageSourceMetrics {
         self.stream.metrics()
+    }
+
+    fn first_file_batch(&self) -> Option<FileReaderFirstBatch> {
+        self.stream.first_file_batch()
     }
 
     fn memory_usage_bytes(&self) -> u64 {
