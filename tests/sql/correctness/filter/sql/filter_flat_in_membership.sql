@@ -21,7 +21,7 @@
 -- query 1
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.membership_values (
-    id INTEGER, truth BOOLEAN, f FLOAT, d DOUBLE, n DECIMAL(12, 2),
+    id INTEGER, truth BOOLEAN, f DOUBLE, d DOUBLE, n DECIMAL(12, 2),
     day DATE, stamp TIMESTAMP, bytes VARBINARY, big LARGEINT
 ) WITH (format_version = 3);
 
@@ -37,7 +37,7 @@ INSERT INTO ${case_db}.membership_values VALUES
 -- query 3
 SELECT id,
     truth IN (TRUE, NULL) AS b,
-    f IN (CAST(1.25 AS REAL), NULL) AS f,
+    CAST(f AS REAL) IN (CAST(1.25 AS REAL), NULL) AS f,
     d IN (CAST(2.5 AS DOUBLE), NULL) AS d,
     n IN (DECIMAL '3.75', NULL) AS n,
     day IN (DATE '2024-11-20', NULL) AS day,
@@ -49,7 +49,7 @@ FROM ${case_db}.membership_values ORDER BY id;
 -- query 4
 SELECT id,
     truth NOT IN (TRUE, TRUE) AS b,
-    f NOT IN (CAST(1.25 AS REAL), CAST(8.25 AS REAL)) AS f,
+    CAST(f AS REAL) NOT IN (CAST(1.25 AS REAL), CAST(8.25 AS REAL)) AS f,
     d NOT IN (CAST(2.5 AS DOUBLE), CAST(9.5 AS DOUBLE)) AS d,
     n NOT IN (DECIMAL '3.75', DECIMAL '9.75') AS n,
     day NOT IN (DATE '2024-11-20', DATE '2024-11-22') AS day,
