@@ -1689,6 +1689,19 @@ async fn actor_send_delivers_native_receipt_and_waits_for_its_final_alias() {
 }
 
 #[tokio::test]
+async fn actor_identity_mismatch_retires_only_the_replying_channel_generation() {
+    for replace_pending_channel in [false, true] {
+        run_actor_send(
+            ActorSendMode::IdentityMismatch {
+                replace_pending_channel,
+            },
+            None,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
 async fn actor_send_failure_tracks_live_native_row_until_original_exit() {
     run_actor_send(
         ActorSendMode::Send,
@@ -1739,6 +1752,7 @@ async fn late_terminal_abort_withdraws_the_original_paid_native_replay() {
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum ActorSendMode {
     Send,
+    IdentityMismatch { replace_pending_channel: bool },
     Replay,
     CreateReplay,
     LateOwnerFailed,
@@ -1772,6 +1786,7 @@ async fn run_actor_send(
             abort::{AbortIngressRetirementProgress, AttemptAbortIngress},
             control::{ControlBinding, ControlPositions, SourcePublishedSlot},
             facts::AttemptFactBank,
+            local_exit::LocalExitInputObligation,
             requests::AttemptRequests,
             root_control::{RootControlBinding, RootControlRequests},
         },
@@ -1820,7 +1835,18 @@ async fn run_actor_send(
     let history = replay.then(|| novarocks_control_runtime::history::HistoryCapture::new(4096));
     let roles = Roles::with_history(history.clone());
     let fail_core = failure_verdict.is_some();
-    let sends = mode == ActorSendMode::Send || replay;
+    let identity_mismatch = match mode {
+        ActorSendMode::IdentityMismatch {
+            replace_pending_channel,
+        } => Some(replace_pending_channel),
+        _ => None,
+    };
+    let expected_receipt = if identity_mismatch.is_some() {
+        OperationOutcome::IdentityMismatch
+    } else {
+        OperationOutcome::Accepted
+    };
+    let sends = mode == ActorSendMode::Send || replay || identity_mismatch.is_some();
     let withdraw = mode == ActorSendMode::Withdraw;
     let release = mode == ActorSendMode::Release;
     let mut peer = if sends {
@@ -1848,6 +1874,25 @@ async fn run_actor_send(
     let mut wc = Governed::for_native_origin(peer_endpoint.as_ref());
     let handle = Handle::current();
     let mut runtime = FrontendDataRuntime::new(handle.clone());
+    let held_mismatch = if let Some(replace_pending_channel) = identity_mismatch {
+        let method = NativeRpcMethod::ApplyTaskControlOperations;
+        let client = Client::for_endpoint(
+            peer_endpoint.as_ref().unwrap().native_endpoint().clone(),
+            method.contract().endpoint,
+            backend,
+            runtime.clone(),
+        );
+        // The lifecycle lane has one slot, so the original actor send must
+        // borrow this exact warm generation.
+        let (_, original) = client.grpc_with_channel_identity(method).await.unwrap();
+        let release = Arc::new(tokio::sync::Notify::new());
+        peer.as_ref()
+            .unwrap()
+            .reject_identity_mismatch_after(release.clone());
+        Some((replace_pending_channel, client, method, original, release))
+    } else {
+        None
+    };
     let (parent, payer) = roles
         .scope
         .reserve_next(
@@ -1880,7 +1925,7 @@ async fn run_actor_send(
         }
         if let Some(seed) = creation_seed.as_ref() {
             peer.accept_create(seed.identity());
-        } else if !withdraw_replay {
+        } else if !withdraw_replay && identity_mismatch.is_none() {
             peer.accept_abort(participation);
         }
         match failure_verdict {
@@ -2036,7 +2081,18 @@ async fn run_actor_send(
     let admit = core_admit
         .map(AttemptEffectEnvelope::new)
         .unwrap_or_else(|| make_admit(reference));
-    let scripted_send_id = AttemptActionId::new(NonZeroU64::new(2).unwrap());
+    let prepare_local_convergence = release.then(|| {
+        (
+            AttemptEffectEnvelope::new(AttemptEffect {
+                id: AttemptActionId::new(NonZeroU64::new(2).unwrap()),
+                class: EffectClass::Cleanup,
+                body: EffectBody::PrepareLocalConvergence,
+            }),
+            None,
+        )
+    });
+    let scripted_send_id =
+        AttemptActionId::new(NonZeroU64::new(if release { 3 } else { 2 }).unwrap());
     let scripted_send = late_core
         .is_none()
         .then(|| make_send(scripted_send_id, reference));
@@ -2086,7 +2142,7 @@ async fn run_actor_send(
     });
     struct ScopeOwner {
         scope: ScopeHandle,
-        parent: WorkObligation,
+        parent: Arc<Mutex<WorkObligation>>,
         payer: ReservationObligation,
         closing: bool,
         exited: bool,
@@ -2174,8 +2230,9 @@ async fn run_actor_send(
             let mut units = 0;
             if self.closing && budget != 0 && self.release_parent.load(Ordering::Acquire) {
                 if !self.exited {
-                    self.parent.body_exited().unwrap();
-                    self.parent.captures_exited().unwrap();
+                    let mut parent = self.parent.lock().unwrap();
+                    parent.body_exited().unwrap();
+                    parent.captures_exited().unwrap();
                     self.exited = true;
                     units += 1;
                 }
@@ -2382,6 +2439,10 @@ async fn run_actor_send(
     // The final port fixture installs one additional original startup standing.
     // Causal call/result pairs retain both of their existing Lifecycle roles.
     mailbox[InputClass::Lifecycle.index()] += 1;
+    if release {
+        // The actual convergence command and the original local exit role.
+        mailbox[InputClass::Lifecycle.index()] += 2;
+    }
     if replay {
         mailbox[InputClass::Lifecycle.index()] += 2 + usize::from(withdraw_replay);
     }
@@ -2393,6 +2454,7 @@ async fn run_actor_send(
         &roles.scope,
         [(admit, None)]
             .into_iter()
+            .chain(prepare_local_convergence)
             .chain(scripted_send)
             .chain(
                 replay_commands
@@ -2405,7 +2467,7 @@ async fn run_actor_send(
         Some(failure_work.work()),
     );
     let admit_command = inbox.reserve_command(&parent);
-    let send_command = inbox.reserve_command(&parent);
+    let send_command = (!release).then(|| inbox.reserve_command(&parent));
     let replay_commands = replay.then(|| {
         [
             inbox.reserve_command(&parent),
@@ -2658,6 +2720,15 @@ async fn run_actor_send(
         handle.clone(),
         1,
     );
+    let local_exit = release.then(|| {
+        let position = actor_runtime
+            .reserve_admitted_input_for(inbox.registration(), actor, InputClass::Lifecycle, &parent)
+            .unwrap()
+            .into_standing_input()
+            .unwrap_or_else(|_| panic!("same original local convergence position"));
+        LocalExitInputObligation::new(inbox.registration().clone(), position)
+    });
+    let parent = Arc::new(Mutex::new(parent));
     let exit = host
         .register(HostBinding {
             scope: roles.scope.clone(),
@@ -2699,7 +2770,7 @@ async fn run_actor_send(
                 ),
                 Box::new(ScopeOwner {
                     scope: roles.scope.clone(),
-                    parent,
+                    parent: parent.clone(),
                     payer,
                     closing: false,
                     exited: false,
@@ -2716,8 +2787,7 @@ async fn run_actor_send(
             startup: None,
             capacity: None,
             membership: None,
-
-            local_exit: None,
+            local_exit,
             ordered_observations: None,
         })
         .unwrap_or_else(|_| panic!("same host registration"));
@@ -2828,7 +2898,7 @@ async fn run_actor_send(
                                 assert_eq!(observed.reply.dispatch_result(),
                                     novarocks_attempt_protocol::operation::OperationDispatchResult::TransportUnknown);
                             } else {
-                                assert_eq!(observed.reply.worker_outcome(), Some(OperationOutcome::Accepted));
+                                assert_eq!(observed.reply.worker_outcome(), Some(expected_receipt));
                             }
                             original_report = Some(fact);
                             break;
@@ -2862,6 +2932,28 @@ async fn run_actor_send(
         started.zip(original_report)
     };
     let (first_grant, first_grant_fact) = admit_original(&mut wc, admit_command, reference).await;
+    if release {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while actor_runtime.snapshot(actor).unwrap().inputs != 0 {
+                drive(&mut wc.driver);
+                advance_host();
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let input = submit(inbox.reserve_command(&parent.lock().unwrap()));
+        advance_host();
+        actor_runtime.retire_input(actor, input).unwrap();
+        actor_runtime
+            .notify_host_actor(inbox.registration())
+            .unwrap();
+        advance_host();
+        assert!(
+            inbox.try_commit_local_convergence_exit().is_none(),
+            "retiring the admission result leaves the original queue grant live"
+        );
+    }
     let (send_id, send_custody) = if let Some(core) = &mut late_core {
         let guard = make_queue();
         let custody = (guard.reservation_id(), guard.work_id());
@@ -2884,12 +2976,29 @@ async fn run_actor_send(
             novarocks_control_runtime::exit_work::Withdrawal::Withdrawn
         );
     }
-    let send_input = submit(send_command);
+    let send_input =
+        submit(send_command.unwrap_or_else(|| inbox.reserve_command(&parent.lock().unwrap())));
     let first_reports = if release {
         advance_host();
         // Handoff completes the effect. The original cleanup Join has its
         // own retirement path, and the Core receives no synthetic send fact.
         actor_runtime.retire_input(actor, send_input).unwrap();
+        actor_runtime
+            .notify_host_actor(inbox.registration())
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                drive(&mut wc.driver);
+                advance_host();
+                if inbox.try_commit_local_convergence_exit().is_some() {
+                    advance_host();
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
         assert!(inbox.try_commit_next().is_none());
         None
     } else {
@@ -2900,7 +3009,34 @@ async fn run_actor_send(
                 .0,
             reservation.unwrap()
         );
-        observe_send(
+        let mismatch_channels =
+            if let Some((replace_pending_channel, client, method, original, release)) =
+                held_mismatch
+            {
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    while peer.as_ref().unwrap().applied_requests().is_empty() {
+                        drive(&mut wc.driver);
+                        advance_host();
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("the original actor started the RPC on the warm generation");
+                assert!(!original.is_retired());
+                let replacement = if replace_pending_channel {
+                    assert!(client.invalidate_channel_if_current(method, &original));
+                    let (_, replacement) = client.grpc_with_channel_identity(method).await.unwrap();
+                    assert_eq!(original.slot(), replacement.slot());
+                    Some(replacement)
+                } else {
+                    None
+                };
+                release.notify_one();
+                Some((original, replacement))
+            } else {
+                None
+            };
+        let reports = observe_send(
             &mut wc,
             send_id,
             send_input,
@@ -2908,7 +3044,20 @@ async fn run_actor_send(
             replay,
             withdraw,
         )
-        .await
+        .await;
+        if let Some((original, replacement)) = mismatch_channels {
+            assert!(original.is_retired());
+            let current = runtime.cached_channel(original.slot());
+            if let Some(replacement) = replacement {
+                assert!(
+                    current.unwrap().same_generation_for_test(&replacement),
+                    "the original response leaves the replacement generation cached"
+                );
+            } else {
+                assert!(current.is_none(), "the replying generation is evicted");
+            }
+        }
+        reports
     };
     // Create reports its exact Task send through the Native receipt path.
     assert_eq!(starts.was_started(participation), sends && !create_replay);
@@ -3284,10 +3433,7 @@ async fn run_actor_send(
             "the original Native row still has a reply alias"
         );
         let original = receipt.lock().unwrap().take().unwrap();
-        assert_eq!(
-            original.worker_outcome(),
-            Some(novarocks_execution_contract::OperationOutcome::Accepted)
-        );
+        assert_eq!(original.worker_outcome(), Some(expected_receipt));
         drop(original);
     }
     if fail_core {

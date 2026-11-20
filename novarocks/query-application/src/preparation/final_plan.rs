@@ -655,7 +655,7 @@ mod tests {
     use novarocks_sql::compiler::{
         DEFAULT_COMPLETION_LIMITS, ExplainLevel, SessionOptimizerSettings, SqlCompileControl,
         SqlCompileIntent, SqlFinalPlanCompileRequest, SqlPlanningEnvironment, SqlSessionContext,
-        SqlStatementInput, builtin_sql_function_catalog, noop_constant_evaluator,
+        SqlStatementInput, builtin_sql_function_catalog,
     };
     use novarocks_workload_control::{
         ResourceConfig, WorkClass, WorkRequest, WorkloadConfig, WorkloadControl,
@@ -789,7 +789,7 @@ mod tests {
             },
             SqlPlanningEnvironment::Distributed,
             builtin_sql_function_catalog().snapshot(),
-            noop_constant_evaluator(),
+            novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
             crate::completed_plan_fixture::test_constant_policy(),
             control,
             PipelineDopDomain {

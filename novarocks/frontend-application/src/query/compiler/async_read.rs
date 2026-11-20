@@ -158,7 +158,7 @@ impl FrontendQueryCompiler {
                     },
                     SqlPlanningEnvironment::Distributed,
                     novarocks_sql::compiler::SqlFunctionCatalog::snapshot(self.functions.as_ref()),
-                    crate::query_execution::constant_eval::constant_evaluator(),
+                    self.sealed_functions(),
                     self.constant_policy(),
                     sql_compile_control_from_execution(execution),
                     Self::pipeline_dop_domain(query_options.as_ref())?,

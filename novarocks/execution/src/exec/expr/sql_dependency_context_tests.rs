@@ -4,11 +4,7 @@ use novarocks_query_application::{
     api::BackendTopologySnapshot,
     cancellation::QueryCancellationSource,
 };
-use novarocks_sql::compiler::{
-    SessionOptimizerSettings, SqlFoldDependencyInput, SqlFoldDependencyObserver,
-    SqlFoldEvaluationOutcome,
-};
-use novarocks_type_contract::{CompileControlError, PureCompileControl};
+use novarocks_sql::compiler::{SessionOptimizerSettings, SqlFoldDependencyObserver};
 use novarocks_types::ClusterRole;
 use std::sync::{
     Arc,
@@ -21,21 +17,7 @@ impl Drop for Observer {
         self.0.fetch_add(1, Ordering::Relaxed);
     }
 }
-impl SqlFoldDependencyObserver for Observer {
-    fn before_fold_dependency_observed(
-        &self,
-        _: SqlFoldDependencyInput<'_>,
-        _: &dyn PureCompileControl,
-    ) -> Result<(), CompileControlError> {
-        Ok(())
-    }
-    fn after_fold_dependency_observed(
-        &self,
-        _: SqlFoldDependencyInput<'_>,
-        _: SqlFoldEvaluationOutcome<'_>,
-    ) {
-    }
-}
+impl SqlFoldDependencyObserver for Observer {}
 fn observer() -> (Arc<dyn SqlFoldDependencyObserver>, Arc<AtomicUsize>) {
     let drops = Arc::new(AtomicUsize::new(0));
     (Arc::new(Observer(Arc::clone(&drops))), drops)

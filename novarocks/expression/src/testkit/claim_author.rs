@@ -19,30 +19,36 @@
 use super::register_constant;
 use novarocks_constant_contract::{ConstantPolicy, ConstantPools};
 use novarocks_expression_contract::{
-    BoundExprSet, BoundExprSetBuilder, BoundFunction, DefinitionControl, ExprId, ExprKind,
-    ExpressionCallClaim, LegacyBindingMetadata, PhysicalCallRequest, SealedUnit,
+    BoundExprSet, BoundExprSetBuilder, BoundFunction, ExprId, ExprKind, LegacyBindingMetadata,
+    PhysicalCallRequest, SealedUnit,
 };
 use novarocks_function_contract::FunctionArgument as StaticFunctionArgument;
 use novarocks_functions::{
-    CallArgumentUses, CallEffectInput, FunctionArgument, FunctionBindingRequest,
-    FunctionBindingSelection, FunctionKind, FunctionResultType, PureCallPreparation,
-    PureEngineFunctionCatalog, ResolvedFunctionBinding, ScopedExpressionEffects,
-    TemporalSourceChannel,
+    FunctionArgument, FunctionBindingRequest, FunctionBindingSelection, FunctionKind,
+    FunctionResultType, PureEngineFunctionCatalog, ResolvedFunctionBinding,
 };
 use novarocks_type_contract::{
-    ArgumentControl, CallProofScope, CompileCheckpoints, ControlShape, DecimalOverflowPolicy,
-    ExpressionInvocation, FunctionValueType, PureCompileControl, SemanticParameters,
+    ArgumentControl, CompileCheckpoints, ControlShape, DecimalOverflowPolicy, FunctionValueType,
+    PureCompileControl, SemanticParameters,
 };
 use std::{collections::BTreeMap, sync::Arc};
 
 /// The first resolver request and selected owner of a checked call definition.
 pub struct ClaimAuthor {
     function: BoundFunction,
+    #[expect(
+        dead_code,
+        reason = "the installed catalogue reconstructs this selection when authorship runs"
+    )]
     selected: Arc<FunctionBindingSelection>,
     arguments: Vec<FunctionArgument>,
     constant_policy: ConstantPolicy,
     decimal_policy: DecimalOverflowPolicy,
     expected_result_type: Option<FunctionValueType>,
+    #[expect(
+        dead_code,
+        reason = "declared fixture shapes are not the control author; the installed catalogue is"
+    )]
     shape: ControlShape,
 }
 
@@ -264,36 +270,23 @@ pub fn register_call_requests(
 
 pub fn declare_call_controls(
     draft: &mut BoundExprSetBuilder,
-    authors: &BTreeMap<ExprId, ClaimAuthor>,
+    functions: &PureEngineFunctionCatalog,
+    constants: &ConstantPools,
+    parameters: &SemanticParameters,
+    policy: ConstantPolicy,
     work: &mut CompileCheckpoints<'_>,
 ) {
-    for (&definition, owner) in authors {
-        let temporal_sources = if let ControlShape::TemporalSource(shape) = owner.shape {
-            let ExprKind::FunctionCall { args, .. } = &draft.definition(definition).unwrap().kind
-            else {
-                panic!("original temporal call definition")
-            };
-            Some(
-                novarocks_expression_contract::temporal_source_definitions_from_lookup_observed(
-                    shape.kind(),
-                    |id| draft.definition(id),
-                    args,
-                    work,
-                )
-                .unwrap(),
-            )
-        } else {
-            None
-        };
-        draft
-            .definition_control(
-                definition,
-                DefinitionControl {
-                    shape: owner.shape,
-                    temporal_sources,
-                },
-            )
-            .unwrap();
+    let inputs = crate::CallAuthorInputs {
+        environment: crate::EvaluationEnvironment {
+            constants,
+            parameters,
+        },
+        constant_policy: policy,
+        functions,
+        decimal_overflow: &BTreeMap::new(),
+    };
+    for (definition, control) in crate::author_call_controls(draft, &inputs, work).unwrap() {
+        draft.definition_control(definition, control).unwrap();
     }
 }
 
@@ -302,166 +295,40 @@ pub fn finish_unit(
     functions: &PureEngineFunctionCatalog,
     sealed: SealedUnit,
     authors: &BTreeMap<ExprId, ClaimAuthor>,
+    constants: &ConstantPools,
     parameters: &SemanticParameters,
+    policy: ConstantPolicy,
     work: &mut CompileCheckpoints<'_>,
-    mut primitive_effects: impl FnMut(
-        &SealedUnit,
-        &ExpressionInvocation<ExprId>,
-        ScopedExpressionEffects,
-    ) -> ScopedExpressionEffects,
 ) -> BoundExprSet {
-    let flow = sealed.control_flow();
-    let mut summaries = BTreeMap::new();
-    let mut claims = BTreeMap::new();
-    // Consume only the SDK's actual root/argument graph. Use IDs remain
-    // opaque and never determine dependency or preparation order.
-    let mut pending = sealed
-        .root_use_ids()
+    try_finish_unit(
+        functions, sealed, authors, constants, parameters, policy, work,
+    )
+    .expect("call author")
+}
+
+/// Same completion as [`finish_unit`], preserving a recipe refusal for the caller.
+pub fn try_finish_unit(
+    functions: &PureEngineFunctionCatalog,
+    sealed: SealedUnit,
+    authors: &BTreeMap<ExprId, ClaimAuthor>,
+    constants: &ConstantPools,
+    parameters: &SemanticParameters,
+    policy: ConstantPolicy,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<BoundExprSet, crate::CallAuthorError> {
+    let decimal_overflow = authors
         .iter()
-        .rev()
-        .map(|&id| (id, false))
-        .collect::<Vec<_>>();
-    let mut ordered = Vec::new();
-    while let Some((id, complete)) = pending.pop() {
-        if complete {
-            ordered.push(id);
-        } else {
-            pending.push((id, true));
-            for &child in sealed.uses()[&id].arguments.iter().rev() {
-                pending.push((child, false));
-            }
-        }
-        work.step().unwrap();
-    }
-    for id in ordered {
-        let invocation = &sealed.uses()[&id];
-        let context = invocation.context;
-        let mut children = ScopedExpressionEffects::pure_value(context);
-        for (ordinal, child) in invocation.arguments.iter().enumerate() {
-            children = children
-                .join_control_argument(summaries[child], flow, ordinal)
-                .unwrap();
-        }
-        let summary = if let Some(owner) = authors.get(&invocation.definition) {
-            let argument_uses = if owner.shape == ControlShape::NoArguments {
-                vec![None; owner.arguments.len()]
-            } else {
-                invocation
-                    .arguments
-                    .iter()
-                    .map(|id| Some(*id))
-                    .collect::<Vec<_>>()
-            };
-            let preparation = if matches!(
-                owner.shape,
-                ControlShape::If | ControlShape::Coalesce | ControlShape::TemporalSource(_)
-            ) {
-                PureCallPreparation::ControlIntrinsic {
-                    arguments: children,
-                }
-            } else {
-                PureCallPreparation::Scalar {
-                    arguments: children,
-                }
-            };
-            let source_plan = sealed.temporal_source(context.use_id).cloned();
-            let source_channels = source_plan
-                .as_ref()
-                .map(|source| {
-                    source
-                        .sources
-                        .iter()
-                        .map(|channel| TemporalSourceChannel {
-                            role: channel.role,
-                            context: flow.uses()[&channel.use_id].context,
-                            value_type: &sealed.definition(channel.definition).unwrap().ty,
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            let definition = sealed.definition(invocation.definition).unwrap();
-            let ExprKind::FunctionCall { args, .. } = &definition.kind else {
-                panic!("actual authored call")
-            };
-            let regexp_count_pattern_source =
-                if owner.function.function_id.as_str() == "builtin.scalar/regexp_count/v1" {
-                    Some(
-                        novarocks_expression_contract::regexp_count_pattern_source_observed(
-                            sealed.definitions(),
-                            args,
-                            work,
-                        )
-                        .unwrap(),
-                    )
-                } else {
-                    None
-                };
-            let to_base64_byte_source =
-                if owner.function.function_id.as_str() == "builtin.scalar/to_base64/v1" {
-                    Some(
-                        novarocks_expression_contract::to_base64_byte_source_observed(
-                            sealed.definitions(),
-                            args,
-                            work,
-                        )
-                        .unwrap(),
-                    )
-                } else {
-                    None
-                };
-            let token = functions
-                .prepare_fresh(
-                    CallEffectInput {
-                        context: context.into(),
-                        argument_uses: match &source_plan {
-                            Some(source) => CallArgumentUses::TemporalSources {
-                                facts: &source.facts,
-                                channels: &source_channels,
-                            },
-                            None => match regexp_count_pattern_source {
-                                Some(source) => CallArgumentUses::RegexpCountPattern {
-                                    source,
-                                    channels: &argument_uses,
-                                },
-                                None => match to_base64_byte_source {
-                                    Some(source) => CallArgumentUses::ToBase64Bytes {
-                                        source,
-                                        channels: &argument_uses,
-                                    },
-                                    None => CallArgumentUses::SelectedChannels(&argument_uses),
-                                },
-                            },
-                        },
-                        function_id: &owner.function.function_id,
-                        kind: FunctionKind::Scalar,
-                        selected: owner.selected.as_ref(),
-                        request: owner.request(),
-                        environment: &[],
-                        parameters,
-                        decimal_overflow_policy: owner.decimal_policy,
-                        proof_scope: CallProofScope::Region(context.region),
-                    },
-                    owner.selected.clone(),
-                    preparation,
-                    work.control(),
-                )
-                .unwrap();
-            claims.insert(
-                context.use_id,
-                ExpressionCallClaim {
-                    context,
-                    effects: token.call_contract().effects().clone(),
-                    decimal_overflow_policy: owner.decimal_policy,
-                    regexp_count_pattern_source,
-                    to_base64_byte_source,
-                    temporal_source: source_plan,
-                },
-            );
-            ScopedExpressionEffects::primitive(context, token.effects().for_use(context).unwrap())
-        } else {
-            primitive_effects(&sealed, invocation, children)
-        };
-        summaries.insert(context.use_id, summary);
-    }
-    sealed.finish(claims, work).unwrap()
+        .map(|(&definition, owner)| (definition, owner.decimal_policy))
+        .collect::<BTreeMap<_, _>>();
+    let inputs = crate::CallAuthorInputs {
+        environment: crate::EvaluationEnvironment {
+            constants,
+            parameters,
+        },
+        constant_policy: policy,
+        functions,
+        decimal_overflow: &decimal_overflow,
+    };
+    let authored = crate::author_unit_calls(&sealed, &inputs, work)?;
+    Ok(sealed.finish(authored.claims, work).unwrap())
 }

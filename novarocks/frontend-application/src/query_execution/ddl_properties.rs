@@ -65,6 +65,7 @@ impl DdlPropertyConstantEvaluator<'_> {
             catalog: self.catalog,
             current_database: self.current_database,
             functions: self.functions.clone(),
+            sealed_functions: self.interpreter.sealed_functions(),
             sql_semantics: self.sql_semantics,
             constant_policy: self.constant_policy,
             control: self.control,
@@ -152,7 +153,6 @@ pub(crate) fn evaluation_error(error: SqlConstantEvaluationError) -> DdlProperty
                 QueryServiceError::from_failure_cause(cause).into()
             }
         }
-        SqlConstantEvaluationError::Evaluation(message) => internal(message),
     }
 }
 

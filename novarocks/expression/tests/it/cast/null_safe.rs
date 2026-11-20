@@ -272,3 +272,37 @@ fn nullsafe_source_carrier_and_logical_metadata_are_checked_before_selected_null
 
 // Conservative retained-source invoice and independent projection ceilings for
 // these small fixtures only; this is not a production default or a MEM grant.
+
+#[test]
+fn null_safe_equality_never_turns_successful_null_into_a_row_error() {
+    use crate::zero_port;
+    use novarocks_expression_contract::{BinaryOperator, ExprKind};
+    use novarocks_type_contract::SemanticParameters;
+
+    let result = FunctionValueType::new(DataType::Boolean, false);
+    for (left, right, expected) in [
+        (None, None, true),
+        (Some(true), None, false),
+        (None, Some(false), false),
+        (Some(true), Some(true), true),
+    ] {
+        let inputs =
+            [left, right].map(|value| Arc::new(BooleanArray::from(vec![value])) as ArrayRef);
+        let unit = zero_port::primitive(
+            inputs,
+            result.clone(),
+            |children| ExprKind::Binary {
+                left: children[0],
+                op: BinaryOperator::EqForNull,
+                right: children[1],
+                decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
+                allow_throw_exception: None,
+            },
+            &SemanticParameters::default(),
+        )
+        .unwrap();
+        let output = zero_port::evaluate(unit);
+        assert!(output.errors().is_empty());
+        assert_eq!(boolean_values(&output), vec![Some(expected)]);
+    }
+}

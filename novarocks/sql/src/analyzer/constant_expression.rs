@@ -48,6 +48,7 @@ pub(crate) fn prepare(
         catalog,
         current_database,
         functions,
+        sealed_functions,
         sql_semantics,
         constant_policy,
         control,
@@ -115,6 +116,7 @@ pub(crate) fn prepare(
         lower_required_constant_unit(
             &expression,
             functions,
+            sealed_functions,
             sql_semantics.sql_mode().allow_throw_exception(),
             constant_policy,
             control,

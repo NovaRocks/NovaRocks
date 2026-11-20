@@ -195,6 +195,7 @@ impl ExchangeReceiverPort for TestPort {
     }
 
     fn cancel(&self, _: ExchangeReceiverKey) {}
+    fn cancel_failed(&self, _: ExchangeReceiverKey) {}
     fn remove(&self, _: ExchangeReceiverKey) {}
     fn cancel_task(&self, _: UniqueId) {}
     fn receiver_pin(

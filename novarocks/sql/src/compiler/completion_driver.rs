@@ -45,8 +45,8 @@ use super::completion_predicate::{ProviderPredicateColumn, lower_provider_predic
 use super::mv_rewrite::{MvRewriteDefinitionIndex, SqlMvRewriteDefinitionFacts};
 use super::{
     SqlAnalyzeOutput, SqlAnalyzeRequest, SqlAnalyzedQuery, SqlCompileControl, SqlCompileError,
-    SqlCompileIntent, SqlCompiler, SqlConstantEvaluator, SqlFunctionCatalog,
-    SqlPlannerTableSnapshot, SqlPlanningEnvironment, SqlSessionContext, SqlStatementInput,
+    SqlCompileIntent, SqlCompiler, SqlFunctionCatalog, SqlPlannerTableSnapshot,
+    SqlPlanningEnvironment, SqlSessionContext, SqlStatementInput,
 };
 use crate::binding::SqlTableBindingId;
 use crate::catalog::TableLookupMode;
@@ -67,7 +67,8 @@ pub struct SqlFinalPlanCompileRequest {
     session: SqlSessionContext,
     environment: SqlPlanningEnvironment,
     functions: Arc<dyn SqlFunctionCatalog>,
-    constant_evaluator: &'static dyn SqlConstantEvaluator,
+
+    sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     constant_policy: novarocks_functions::ConstantPolicy,
     control: SqlCompileControl,
     dop_domain: PipelineDopDomain,
@@ -104,7 +105,7 @@ impl SqlFinalPlanCompileRequest {
         session: SqlSessionContext,
         environment: SqlPlanningEnvironment,
         functions: Arc<dyn SqlFunctionCatalog>,
-        constant_evaluator: &'static dyn SqlConstantEvaluator,
+        sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
         constant_policy: novarocks_functions::ConstantPolicy,
         control: SqlCompileControl,
         dop_domain: PipelineDopDomain,
@@ -118,7 +119,8 @@ impl SqlFinalPlanCompileRequest {
             session,
             environment,
             functions: functions.snapshot(),
-            constant_evaluator,
+
+            sealed_functions,
             constant_policy,
             control,
             dop_domain,
@@ -160,7 +162,8 @@ impl SqlFinalPlanCompileRequest {
             session,
             environment,
             functions,
-            constant_evaluator,
+
+            sealed_functions,
             constant_policy,
             control,
             dop_domain,
@@ -202,7 +205,8 @@ impl SqlFinalPlanCompileRequest {
             session,
             environment,
             functions,
-            constant_evaluator,
+
+            sealed_functions,
             constant_policy,
             dop_domain,
             scan_read_budget,
@@ -317,7 +321,8 @@ struct FinalPlanCommon {
     session: SqlSessionContext,
     environment: SqlPlanningEnvironment,
     functions: Arc<dyn SqlFunctionCatalog>,
-    constant_evaluator: &'static dyn SqlConstantEvaluator,
+
+    sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     constant_policy: novarocks_functions::ConstantPolicy,
     dop_domain: PipelineDopDomain,
     scan_read_budget: ScanReadBudget,
@@ -616,7 +621,7 @@ fn analyze_with_catalog(
         common.environment,
         &catalog,
         common.functions.as_ref(),
-        common.constant_evaluator,
+        Arc::clone(&common.sealed_functions),
         mv_definitions,
         common.constant_policy,
         control.clone(),
@@ -828,7 +833,8 @@ fn optimize_to_physical(
         change_stream: _,
         mv_rewrite,
         function_catalog,
-        constant_evaluator,
+
+        sealed_functions,
         constant_policy,
     } = analyzed;
     control.check()?;
@@ -865,8 +871,8 @@ fn optimize_to_physical(
     };
     let environment = crate::optimizer::OptimizerEnvironment::new(
         &settings,
-        constant_evaluator,
         Arc::clone(&function_catalog),
+        Arc::clone(&sealed_functions),
         decimal_overflow_policy,
         root_allow_throw_exception,
         control,
@@ -968,6 +974,7 @@ fn provider_or_ready_step(
             None,
             root_semantics,
             common.functions,
+            Arc::clone(&common.sealed_functions),
             root_allow_throw_exception,
             common.constant_policy,
             control,
@@ -1373,6 +1380,7 @@ pub(super) fn resume_provider_read(
             Some(reads),
             state.root_semantics,
             state.common.functions,
+            Arc::clone(&state.common.sealed_functions),
             state.root_allow_throw_exception,
             state.common.constant_policy,
             control,
@@ -1412,7 +1420,7 @@ mod tests {
         ProviderReadColumnFact, ProviderReadFact, ProviderReadLimitFact, ProviderReadPredicateFact,
         ProviderReadProperties, ProviderReadRequestBinding, SessionOptimizerSettings,
         SqlCancellationObservation, SqlCompilation, SqlCompileProgress, SqlCompileProgressError,
-        SqlFactBatch, StatisticsFact, builtin_sql_function_catalog, noop_constant_evaluator,
+        SqlFactBatch, StatisticsFact, builtin_sql_function_catalog,
     };
     use crate::planner::table::{
         ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity, SqlTableVersionSelector,
@@ -1439,6 +1447,7 @@ mod tests {
     ) -> SqlFinalPlanCompileRequest {
         let optimizer_settings = SessionOptimizerSettings {
             enable_materialized_view_rewrite: Some(mv_enabled),
+            disabled_rules: vec!["FoldConstant".into()],
             ..SessionOptimizerSettings::default()
         };
         SqlFinalPlanCompileRequest::new(
@@ -1453,7 +1462,7 @@ mod tests {
             },
             SqlPlanningEnvironment::Distributed,
             builtin_sql_function_catalog().snapshot(),
-            noop_constant_evaluator(),
+            novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
             crate::constant::test_constant_policy(),
             control,
             PipelineDopDomain {
@@ -1499,7 +1508,7 @@ mod tests {
                 input.environment,
                 &snapshot,
                 input.functions.as_ref(),
-                input.constant_evaluator,
+                novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
                 None,
                 crate::constant::test_constant_policy(),
                 input.control.clone(),

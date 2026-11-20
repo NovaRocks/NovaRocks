@@ -31,6 +31,7 @@ doctest = false
 
 [dependencies]
 novarocks-expression-contract.workspace = true
+novarocks-expression.workspace = true
 arrow = { workspace = true, features = ["prettyprint", "ipc", "ipc_compression"] }
 base64.workspace = true
 bytes.workspace = true

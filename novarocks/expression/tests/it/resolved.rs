@@ -25,6 +25,7 @@ const TYPE_FUNCTION: &str = "fixture/local-resolved/type-function-v1";
 const HIGHER_FUNCTION: &str = "fixture/local-resolved/higher-function-v1";
 const CONTROL_FUNCTION: &str = "fixture/local-resolved/control-v1";
 const SCALAR: &str = "fixture/local-resolved/compare-v1";
+const STRICT: &str = "fixture/local-resolved/strict-compare-v1";
 const TYPE_ONLY: &str = "fixture/local-resolved/type-v1";
 const HIGHER: &str = "fixture/local-resolved/higher-v1";
 const IF: &str = "fixture/local-resolved/if-v1";
@@ -65,7 +66,15 @@ fn argument_types(overload: &FunctionOverloadId) -> Vec<FunctionArgument> {
         value_type: input_type(),
         constant: None,
     };
-    if *overload == oid(HIGHER) {
+    if *overload == oid(STRICT) {
+        vec![
+            FunctionArgument::Value {
+                value_type: input_type().with_nullable(true).unwrap(),
+                constant: None,
+            };
+            2
+        ]
+    } else if *overload == oid(HIGHER) {
         vec![
             value(),
             FunctionArgument::Lambda {
@@ -98,7 +107,7 @@ struct Owner {
 impl Owner {
     fn for_overload(overload: &str) -> Self {
         let (function, control, abi) = match overload {
-            SCALAR => (FUNCTION, ArgumentControl::Eager, PureKernelAbi::ScalarV1),
+            SCALAR | STRICT => (FUNCTION, ArgumentControl::Eager, PureKernelAbi::ScalarV1),
             TYPE_ONLY => (
                 TYPE_FUNCTION,
                 ArgumentControl::TypeOnly,
@@ -125,12 +134,16 @@ impl Owner {
                 fid(function),
                 FunctionKind::Scalar,
                 controls.iter().map(|(overload, control, _)| {
+                    let mut declared = effects(*control);
+                    if *overload == STRICT {
+                        declared.null_behavior = FunctionNullBehavior::Strict;
+                    }
                     FunctionOverloadDeclaration::from_effects(
                         oid(overload),
                         "fixture exact channels",
                         "BOOLEAN",
                         None,
-                        effects(*control),
+                        declared,
                     )
                 }),
             )
@@ -1215,4 +1228,100 @@ fn type_only_hidden_float_in_keeps_the_original_profile_refusal() {
 #[test]
 fn type_only_hidden_json_between_keeps_the_original_profile_refusal() {
     check_type_only_hidden_native_profile("between_json");
+}
+
+#[test]
+fn zero_port_strict_null_skips_kernel_creation() {
+    use crate::zero_port;
+    use novarocks_expression::testkit::{
+        ClaimAuthor, HarnessControl, add_call, compile_fixture_unit, declare_call_controls,
+        finish_unit, register_call_requests,
+    };
+
+    let owner = Arc::new(Owner::for_overload(STRICT));
+    let functions = catalog(owner.clone());
+    let nullable = input_type().with_nullable(true).unwrap();
+    let parameters = SemanticParameters::default();
+    assert_eq!(
+        owner
+            .declaration
+            .effect_declaration(&oid(STRICT))
+            .unwrap()
+            .null_behavior,
+        FunctionNullBehavior::Strict,
+    );
+    for (value, expected, created) in [(None, None, 0), (Some(23), Some(true), 1)] {
+        let mut draft = builder();
+        let mut constants = ConstantPools::empty();
+        let children = [value, Some(19)]
+            .map(|value| {
+                zero_port::add_constant(
+                    &mut draft,
+                    &mut constants,
+                    Arc::new(Int64Array::from(vec![value])),
+                    nullable.clone(),
+                )
+            })
+            .to_vec();
+        let claim = ClaimAuthor::with_exact_eager_binding(
+            &functions,
+            "unit_fixture",
+            owner.arguments(&oid(STRICT)),
+            policy(),
+            &HarnessControl,
+        );
+        let mut authors = BTreeMap::new();
+        let call = add_call(&mut draft, &mut authors, claim, children);
+        draft
+            .root(call, EvaluationDemand::Value, RootScope::AllPorts)
+            .unwrap();
+        register_call_requests(&mut draft, &authors, &mut constants);
+        let mut work =
+            CompileCheckpoints::try_new(&HarnessControl, CompilePhase::Validate).unwrap();
+        declare_call_controls(
+            &mut draft,
+            &functions,
+            &constants,
+            &parameters,
+            policy(),
+            &mut work,
+        );
+        let sealed = draft.seal(Vec::new(), &mut work).unwrap();
+        let unit = finish_unit(
+            &functions,
+            sealed,
+            &authors,
+            &constants,
+            &parameters,
+            policy(),
+            &mut work,
+        );
+        work.finish().unwrap();
+        let compiled = compile_fixture_unit(
+            &unit,
+            EvaluationEnvironment {
+                constants: &constants,
+                parameters: &parameters,
+            },
+            ScopeLayouts {
+                ports: &[],
+                all_ports: None,
+            },
+            policy(),
+            &functions,
+        );
+        let result = zero_port::evaluate(compiled);
+        assert!(result.errors().is_empty());
+        assert_eq!(
+            result
+                .values()
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .unwrap()
+                .iter()
+                .next(),
+            Some(expected),
+        );
+        assert_eq!(owner.instances.load(Ordering::SeqCst), created);
+    }
 }

@@ -208,6 +208,7 @@ fn canonical_conversion_raw_lambda_uses_original_lexical_scope_and_none_request(
         dop(),
         None,
         crate::functions::builtin_sql_function_catalog().snapshot(),
+        novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
         false,
         policy(),
         &control,

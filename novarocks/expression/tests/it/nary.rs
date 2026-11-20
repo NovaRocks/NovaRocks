@@ -113,3 +113,56 @@ fn every_nary_constructor_callback_preserves_all_seven_original_failure_categori
         }
     }
 }
+
+#[test]
+fn value_boolean_nodes_preserve_all_nine_three_valued_pairs() {
+    use crate::zero_port;
+    use arrow::{array::ArrayRef, datatypes::DataType};
+    use novarocks_expression_contract::ExprKind;
+    use novarocks_type_contract::{FunctionValueType, SemanticParameters};
+    use std::sync::Arc;
+
+    let result = FunctionValueType::new(DataType::Boolean, true);
+    for (left, right, and, or) in [
+        (Some(false), Some(false), Some(false), Some(false)),
+        (Some(false), Some(true), Some(false), Some(true)),
+        (Some(false), None, Some(false), None),
+        (Some(true), Some(false), Some(false), Some(true)),
+        (Some(true), Some(true), Some(true), Some(true)),
+        (Some(true), None, None, Some(true)),
+        (None, Some(false), Some(false), None),
+        (None, Some(true), None, Some(true)),
+        (None, None, None, None),
+    ] {
+        for (disjunction, expected) in [(false, and), (true, or)] {
+            let inputs =
+                [left, right].map(|value| Arc::new(BooleanArray::from(vec![value])) as ArrayRef);
+            let unit = zero_port::primitive(
+                inputs,
+                result.clone(),
+                |children| {
+                    let args = children.into_boxed_slice();
+                    if disjunction {
+                        ExprKind::Disjunction { args }
+                    } else {
+                        ExprKind::Conjunction { args }
+                    }
+                },
+                &SemanticParameters::default(),
+            )
+            .unwrap();
+            let output = zero_port::evaluate(unit);
+            assert!(output.errors().is_empty());
+            assert_eq!(
+                output
+                    .values()
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .unwrap()
+                    .iter()
+                    .next(),
+                Some(expected),
+            );
+        }
+    }
+}

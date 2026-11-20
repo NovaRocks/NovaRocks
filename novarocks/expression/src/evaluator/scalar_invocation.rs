@@ -226,8 +226,7 @@ pub(super) fn invoke<'a, R>(
     allocator: Option<&Arc<dyn AggregateStateAllocator>>,
     work: &mut super::Work<'_, '_, R>,
 ) -> Result<SelectedValues<'a>, ExprEvaluationFailure<R>> {
-    // Single-node constant evaluation has its own compile control and admits
-    // only the ordinary scalar lifecycle. Every root lends its actual host.
+    // Every evaluating root lends its actual host.
     match (instance, work.scalar_host.as_deref_mut()) {
         (CallInstance::Kernel(instance), Some(host)) => {
             call_scalar(host, instance, selection, arguments, work.control).map_err(Into::into)

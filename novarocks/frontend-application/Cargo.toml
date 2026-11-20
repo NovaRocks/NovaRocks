@@ -67,7 +67,6 @@ novarocks-types.workspace = true
 novarocks-user-error.workspace = true
 novarocks-workload-control.workspace = true
 prost.workspace = true
-regex.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sha2.workspace = true

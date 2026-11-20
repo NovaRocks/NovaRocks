@@ -124,7 +124,7 @@ fn timestamp_cast_nonnullable_contract_requires_only_five_successful_null_promis
                     TimeUnit::Microsecond | TimeUnit::Nanosecond
                 )
             );
-            let fixture = cast_fixture(
+            let authored = cast_fixture(
                 timestamp_type(source, false),
                 timestamp_type(target, false),
                 Source::Column,
@@ -132,10 +132,17 @@ fn timestamp_cast_nonnullable_contract_requires_only_five_successful_null_promis
                 DecimalOverflowPolicy::ReportError,
                 false,
             );
-            let result = fixture.compile(&Control);
             if safe_widen {
-                assert!(result.unwrap_err().to_string().contains("successful-NULL"));
-            } else {
+                let error = match authored {
+                    Err(error) => error.to_string(),
+                    Ok(fixture) => fixture.compile(&Control).unwrap_err().to_string(),
+                };
+                assert!(error.contains("successful-NULL"));
+                continue;
+            }
+            let fixture = authored.expect("timestamp cast admitted");
+            let result = fixture.compile(&Control);
+            {
                 let program = result.unwrap();
                 let batch =
                     timestamp_batch(&program, &[Some(i64::MAX), Some(-1)], &[Some(true); 2]);

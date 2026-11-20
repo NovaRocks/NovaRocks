@@ -33,6 +33,8 @@ mod standalone_scalar;
 pub(crate) use standalone_scalar::{StandaloneScalarEmission, lower_required_constant_unit};
 mod scalar_nullability;
 mod unit_authorship;
+#[cfg(test)]
+pub(super) use unit_authorship::package_author_error;
 
 #[cfg(test)]
 pub(super) mod original_emission_test_observer;
@@ -148,6 +150,7 @@ pub(crate) fn lower_final_physical_plan(
     version: PlanVersionId,
     dop_domain: PipelineDopDomain,
     functions: Arc<dyn crate::compiler::SqlFunctionCatalog>,
+    sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     root_allow_throw_exception: bool,
     constant_policy: novarocks_constant_contract::ConstantPolicy,
     control: &dyn PureCompileControl,
@@ -158,6 +161,7 @@ pub(crate) fn lower_final_physical_plan(
         dop_domain,
         None,
         functions,
+        sealed_functions,
         root_allow_throw_exception,
         constant_policy,
         control,
@@ -170,6 +174,7 @@ pub(crate) fn lower_final_physical_plan_with_provider_reads(
     dop_domain: PipelineDopDomain,
     reads: FinalizedProviderReadSet,
     functions: Arc<dyn crate::compiler::SqlFunctionCatalog>,
+    sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     root_allow_throw_exception: bool,
     constant_policy: novarocks_constant_contract::ConstantPolicy,
     control: &dyn PureCompileControl,
@@ -180,6 +185,7 @@ pub(crate) fn lower_final_physical_plan_with_provider_reads(
         dop_domain,
         Some(reads),
         functions,
+        sealed_functions,
         root_allow_throw_exception,
         constant_policy,
         control,
@@ -204,6 +210,7 @@ pub(crate) fn lower_final_physical_write_plan(
     dop_domain: PipelineDopDomain,
     input: FinalWriteLowering<'_>,
     functions: Arc<dyn crate::compiler::SqlFunctionCatalog>,
+    sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     root_allow_throw_exception: bool,
     constant_policy: novarocks_constant_contract::ConstantPolicy,
     control: &dyn PureCompileControl,
@@ -220,6 +227,7 @@ pub(crate) fn lower_final_physical_write_plan(
         dop_domain,
         reads,
         functions,
+        sealed_functions,
         root_allow_throw_exception,
         constant_policy,
         control,
@@ -292,6 +300,7 @@ pub(crate) fn lower_final_change_stream_write_plan(
     dop_domain: PipelineDopDomain,
     input: FinalChangeStreamWriteLowering<'_>,
     functions: Arc<dyn crate::compiler::SqlFunctionCatalog>,
+    sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     root_allow_throw_exception: bool,
     constant_policy: novarocks_constant_contract::ConstantPolicy,
     control: &dyn PureCompileControl,
@@ -307,6 +316,7 @@ pub(crate) fn lower_final_change_stream_write_plan(
         dop_domain,
         reads,
         functions,
+        sealed_functions,
         root_allow_throw_exception,
         constant_policy,
         control,
@@ -345,6 +355,7 @@ fn lower_final_physical_plan_inner(
     dop_domain: PipelineDopDomain,
     reads: Option<FinalizedProviderReadSet>,
     functions: Arc<dyn crate::compiler::SqlFunctionCatalog>,
+    sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     root_allow_throw_exception: bool,
     constant_policy: novarocks_constant_contract::ConstantPolicy,
     control: &dyn PureCompileControl,
@@ -356,6 +367,7 @@ fn lower_final_physical_plan_inner(
         reads,
         None,
         functions,
+        sealed_functions,
         root_allow_throw_exception,
         constant_policy,
         control,
@@ -369,6 +381,7 @@ pub(crate) fn lower_final_physical_plan_with_root_semantics(
     reads: Option<FinalizedProviderReadSet>,
     semantics: crate::compiler::root_output::RootOutputSemantics,
     functions: Arc<dyn crate::compiler::SqlFunctionCatalog>,
+    sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     root_allow_throw_exception: bool,
     constant_policy: novarocks_constant_contract::ConstantPolicy,
     control: &dyn PureCompileControl,
@@ -380,6 +393,7 @@ pub(crate) fn lower_final_physical_plan_with_root_semantics(
         reads,
         Some(semantics),
         functions,
+        sealed_functions,
         root_allow_throw_exception,
         constant_policy,
         control,
@@ -393,6 +407,7 @@ fn lower_final_physical_plan_inner_with_domains(
     reads: Option<FinalizedProviderReadSet>,
     semantics: Option<crate::compiler::root_output::RootOutputSemantics>,
     functions: Arc<dyn crate::compiler::SqlFunctionCatalog>,
+    sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     root_allow_throw_exception: bool,
     constant_policy: novarocks_constant_contract::ConstantPolicy,
     control: &dyn PureCompileControl,
@@ -407,6 +422,7 @@ fn lower_final_physical_plan_inner_with_domains(
         dop_domain,
         reads,
         functions,
+        sealed_functions,
         root_allow_throw_exception,
         constant_policy,
         control,
@@ -485,6 +501,7 @@ struct ContractLoweringVisitor<'a> {
     root_allow_throw_exception_used: bool,
     group_concat_parameters: BTreeMap<SemanticParameterId, SemanticParameterValue>,
     functions: Arc<dyn crate::compiler::SqlFunctionCatalog>,
+    sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     control: &'a dyn PureCompileControl,
     work: CompileCheckpoints<'a>,
     current_fragment: FragmentId,
@@ -1585,6 +1602,7 @@ impl<'a> ContractLoweringVisitor<'a> {
         dop_domain: PipelineDopDomain,
         provider_reads: Option<FinalizedProviderReadSet>,
         functions: Arc<dyn crate::compiler::SqlFunctionCatalog>,
+        sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
         root_allow_throw_exception: bool,
         constant_policy: novarocks_constant_contract::ConstantPolicy,
         control: &'a dyn PureCompileControl,
@@ -1598,6 +1616,7 @@ impl<'a> ContractLoweringVisitor<'a> {
             root_allow_throw_exception_used: false,
             group_concat_parameters: BTreeMap::new(),
             functions,
+            sealed_functions,
             control,
             work,
             current_fragment: ROOT_FRAGMENT_ID,
@@ -13993,6 +14012,7 @@ mod tests {
                         version(),
                         dop(),
                         catalog.snapshot(),
+                        novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
                         false,
                         policy,
                         control,
@@ -14009,6 +14029,7 @@ mod tests {
                     dop(),
                     None,
                     catalog.snapshot(),
+                    novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
                     false,
                     policy,
                     control,
@@ -14039,12 +14060,8 @@ mod tests {
             // Check the original error-carrier projection with the genuine
             // constructor refusal above. This component test does not claim
             // that checked-CV consumption invokes a constructor again.
-            let projected = super::super::package_semantics::PackageSemanticsError::from(
-                super::super::physical_fragment_effects::PhysicalFragmentEffectsError::Expressions(
-                    super::super::physical_expression_effects::PhysicalExpressionEffectsError::Argument(
-                        super::super::physical_call_arguments::PhysicalArgumentError::from(expected_source.clone())
-                    )
-                )
+            let projected = super::super::package_semantics::PackageSemanticsError::ConstantSource(
+                expected_source.clone(),
             );
             assert_eq!(projected.failure_fact(), expected);
             let trace = baseline.trace.lock().unwrap().clone();
@@ -14111,6 +14128,7 @@ mod tests {
                 version(),
                 dop(),
                 crate::functions::builtin_sql_function_catalog().snapshot(),
+                novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
                 false,
                 crate::constant::test_constant_policy(),
                 &control,
@@ -14169,6 +14187,7 @@ mod tests {
                     version(),
                     dop(),
                     crate::functions::builtin_sql_function_catalog().snapshot(),
+                    novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
                     false,
                     crate::constant::test_constant_policy(),
                     &control
@@ -14202,6 +14221,7 @@ mod tests {
                 version(),
                 dop(),
                 crate::functions::builtin_sql_function_catalog().snapshot(),
+                novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
                 false,
                 crate::constant::test_constant_policy(),
                 &control
@@ -14241,6 +14261,7 @@ mod tests {
             version(),
             dop(),
             crate::functions::builtin_sql_function_catalog().snapshot(),
+            novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
             false,
             crate::constant::test_constant_policy(),
             &control,
@@ -14715,6 +14736,7 @@ mod tests {
             version(),
             dop(),
             crate::functions::builtin_sql_function_catalog().snapshot(),
+            novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
             false,
             crate::constant::test_constant_policy(),
             &crate::compiler::SqlCompileControl::unbounded(),
@@ -14790,6 +14812,7 @@ mod tests {
                 targets,
             },
             crate::functions::builtin_sql_function_catalog().snapshot(),
+            novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
             false,
             crate::constant::test_constant_policy(),
             &control,
@@ -14854,6 +14877,7 @@ mod tests {
                 targets,
             },
             crate::functions::builtin_sql_function_catalog().snapshot(),
+            novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
             false,
             crate::constant::test_constant_policy(),
             &crate::compiler::SqlCompileControl::unbounded(),
@@ -14928,6 +14952,7 @@ mod tests {
                 targets: FinalizedWriteTargetSet::try_new([(ordinal, write_handle())]).unwrap(),
             },
             crate::functions::builtin_sql_function_catalog().snapshot(),
+            novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
             false,
             crate::constant::test_constant_policy(),
             &crate::compiler::SqlCompileControl::unbounded(),
@@ -15336,6 +15361,7 @@ mod tests {
                 targets,
             },
             crate::functions::builtin_sql_function_catalog().snapshot(),
+            novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
             false,
             crate::constant::test_constant_policy(),
             &control,
@@ -15530,6 +15556,7 @@ mod tests {
                     targets,
                 },
                 crate::functions::builtin_sql_function_catalog().snapshot(),
+                novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
                 false,
                 crate::constant::test_constant_policy(),
                 &crate::compiler::SqlCompileControl::unbounded(),
@@ -15800,6 +15827,7 @@ mod tests {
                 targets: FinalizedWriteTargetSet::try_new([(ordinal, write_handle())]).unwrap(),
             },
             crate::functions::builtin_sql_function_catalog().snapshot(),
+            novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
             false,
             crate::constant::test_constant_policy(),
             &crate::compiler::SqlCompileControl::unbounded(),
@@ -16599,6 +16627,7 @@ mod tests {
             dop(),
             None,
             crate::functions::builtin_sql_function_catalog().snapshot(),
+            novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
             false,
             crate::constant::test_constant_policy(),
             &control,
@@ -17452,6 +17481,7 @@ mod tests {
                 version(),
                 dop(),
                 crate::functions::builtin_sql_function_catalog().snapshot(),
+                novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
                 false,
                 crate::constant::test_constant_policy(),
                 &crate::compiler::SqlCompileControl::unbounded()
@@ -17483,6 +17513,7 @@ mod tests {
                 version(),
                 dop(),
                 crate::functions::builtin_sql_function_catalog().snapshot(),
+                novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
                 false,
                 crate::constant::test_constant_policy(),
                 &crate::compiler::SqlCompileControl::unbounded()
@@ -17518,6 +17549,7 @@ mod tests {
                 version(),
                 dop(),
                 crate::functions::builtin_sql_function_catalog().snapshot(),
+                novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
                 false,
                 crate::constant::test_constant_policy(),
                 &crate::compiler::SqlCompileControl::unbounded()
@@ -17556,6 +17588,7 @@ mod tests {
                 version(),
                 dop(),
                 crate::functions::builtin_sql_function_catalog().snapshot(),
+                novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
                 false,
                 crate::constant::test_constant_policy(),
                 &crate::compiler::SqlCompileControl::unbounded()
@@ -17584,6 +17617,7 @@ mod tests {
                 version(),
                 dop(),
                 crate::functions::builtin_sql_function_catalog().snapshot(),
+                novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
                 false,
                 crate::constant::test_constant_policy(),
                 &crate::compiler::SqlCompileControl::unbounded()
@@ -17611,6 +17645,7 @@ mod tests {
                 version(),
                 dop(),
                 crate::functions::builtin_sql_function_catalog().snapshot(),
+                novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
                 false,
                 crate::constant::test_constant_policy(),
                 &crate::compiler::SqlCompileControl::unbounded()
@@ -17643,6 +17678,7 @@ mod tests {
                 version(),
                 dop(),
                 crate::functions::builtin_sql_function_catalog().snapshot(),
+                novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
                 false,
                 crate::constant::test_constant_policy(),
                 &crate::compiler::SqlCompileControl::unbounded()
@@ -18565,6 +18601,7 @@ mod tests {
                 version(),
                 dop(),
                 crate::functions::builtin_sql_function_catalog().snapshot(),
+                novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
                 false,
                 crate::constant::test_constant_policy(),
                 &crate::compiler::SqlCompileControl::unbounded()
@@ -18734,6 +18771,7 @@ mod tests {
                 dop(),
                 None,
                 crate::functions::builtin_sql_function_catalog().snapshot(),
+                novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
                 false,
                 crate::constant::test_constant_policy(),
                 &control,
@@ -18789,6 +18827,7 @@ mod tests {
             dop(),
             None,
             crate::functions::builtin_sql_function_catalog().snapshot(),
+            novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
             false,
             crate::constant::test_constant_policy(),
             &control,
@@ -18826,6 +18865,7 @@ mod tests {
             dop(),
             None,
             crate::functions::builtin_sql_function_catalog().snapshot(),
+            novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
             false,
             crate::constant::test_constant_policy(),
             &control,
@@ -20159,6 +20199,7 @@ mod tests {
             version(),
             dop(),
             crate::functions::builtin_sql_function_catalog().snapshot(),
+            novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
             false,
             caps,
             &control,
@@ -20263,6 +20304,7 @@ mod tests {
                 version(),
                 dop(),
                 crate::functions::builtin_sql_function_catalog().snapshot(),
+                novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
                 false,
                 crate::constant::test_constant_policy(),
                 &control,
@@ -20679,6 +20721,3 @@ pub(super) fn node_effects_with_test_summaries(
     // facts to the original relation consumer. This is not a production issuer.
     NodeExpressionEffects { unit, summaries }
 }
-
-#[cfg(test)]
-pub(in crate::planner::distributed::build) use standalone_scalar::tests::sealed_standalone_source_for_effects;

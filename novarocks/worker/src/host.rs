@@ -930,6 +930,7 @@ pub trait TestTaskUpdateConsumptionReservation: Send {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TaskIngressRetirement {
     Remove,
+    PreserveFailureStop,
     PreserveNormalClose,
 }
 

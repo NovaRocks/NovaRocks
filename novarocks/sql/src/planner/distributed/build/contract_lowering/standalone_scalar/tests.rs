@@ -64,7 +64,14 @@ fn emit(
     expression: &TypedExpr,
     control: &dyn PureCompileControl,
 ) -> Result<StandaloneScalarEmission, ContractLoweringError> {
-    lower_required_constant_unit(expression, functions(), false, policy(), control)
+    lower_required_constant_unit(
+        expression,
+        functions(),
+        novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
+        false,
+        policy(),
+        control,
+    )
 }
 fn root(source: &StandaloneScalarEmission) -> &novarocks_expression_contract::ExprNode {
     source
@@ -271,8 +278,14 @@ fn standalone_selected_cv_and_nullability_keep_actual_sources_and_every_control_
     small.max_retained_buffer_bytes = 1;
     let expression = text("an actual over-limit source literal");
     let baseline_control = Control::default();
-    let result =
-        lower_required_constant_unit(&expression, functions(), false, small, &baseline_control);
+    let result = lower_required_constant_unit(
+        &expression,
+        functions(),
+        novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
+        false,
+        small,
+        &baseline_control,
+    );
     let (expected_debug, expected_fact) = match result {
         Err(ContractLoweringError::ConstantSource(source @ ConstantError::Limit(_))) => {
             (format!("{source:?}"), source.failure_fact())
@@ -285,7 +298,14 @@ fn standalone_selected_cv_and_nullability_keep_actual_sources_and_every_control_
             trace: Mutex::new(Vec::new()),
             refusal: Some((baseline.len(), cause.clone())),
         };
-        match lower_required_constant_unit(&expression, functions(), false, small, &control) {
+        match lower_required_constant_unit(
+            &expression,
+            functions(),
+            novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
+            false,
+            small,
+            &control,
+        ) {
             Err(ContractLoweringError::ConstantSource(source @ ConstantError::Limit(_))) => {
                 assert_eq!(format!("{source:?}"), expected_debug);
                 assert_eq!(source.failure_fact(), expected_fact);
@@ -299,98 +319,6 @@ fn standalone_selected_cv_and_nullability_keep_actual_sources_and_every_control_
 /// A real producer's checked intermediate, not a published source/claim token.
 /// Shared only inside cfg(test), so the FX owner's private core can reject
 /// foreign environment loans without widening any production API.
-pub(in crate::planner::distributed::build) struct SealedStandaloneSource {
-    pub(in crate::planner::distributed::build) brand: StandaloneSourceBrand,
-    pub(in crate::planner::distributed::build) sealed: novarocks_expression_contract::SealedUnit,
-    pub(in crate::planner::distributed::build) constants: novarocks_physical_plan::ConstantPools,
-    pub(in crate::planner::distributed::build) parameters: SemanticParameters,
-    pub(in crate::planner::distributed::build) journal: SqlLogicalSourceJournal,
-    pub(in crate::planner::distributed::build) functions:
-        Arc<dyn crate::compiler::SqlFunctionCatalog>,
-}
-impl SealedStandaloneSource {
-    pub(in crate::planner::distributed::build) fn loan(&self) -> SqlUnitSourceLoan<'_> {
-        SqlUnitSourceLoan {
-            site: ScalarSourceSite::Standalone(self.brand.clone()),
-            definitions: UnitDefinitions::from_sealed(
-                ScalarUnitOwner::Standalone(self.brand.clone()),
-                &self.sealed,
-            ),
-            constants: &self.constants,
-            parameters: &self.parameters,
-            journal: &self.journal,
-            functions: &self.functions,
-        }
-    }
-}
-pub(in crate::planner::distributed::build) fn sealed_standalone_source_for_effects()
--> SealedStandaloneSource {
-    let control = crate::compiler::SqlCompileControl::unbounded();
-    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
-    let mut source = StandaloneDraft::new(functions(), false, policy());
-    let definition = source
-        .emission(&control, &mut work)
-        .lower_expression(&text("actual standalone source"), &BTreeMap::new())
-        .unwrap();
-    source
-        .emission(&control, &mut work)
-        .root_definition(
-            definition,
-            novarocks_type_contract::EvaluationDemand::Value,
-            novarocks_expression_contract::RootScope::AllPorts,
-        )
-        .unwrap();
-    source.rebind_nullability(&control, &mut work).unwrap();
-    let parameters = scalar_emission::freeze_semantic_parameters(
-        source.root_used,
-        source.allow_throw_exception,
-        BTreeMap::new(),
-    )
-    .unwrap();
-    let loan = SqlUnitSourceLoan {
-        site: ScalarSourceSite::Standalone(source.brand.clone()),
-        definitions: UnitDefinitions::from_builder(
-            ScalarUnitOwner::Standalone(source.brand.clone()),
-            &source.draft,
-        ),
-        constants: source.constants.pools(),
-        parameters: &parameters,
-        journal: &source.journal,
-        functions: &source.functions,
-    };
-    let presence = source.functions.snapshot_for_scalar_presence();
-    unit_authorship::admit_scalar_unit_sources_observed(
-        &loan,
-        &source.draft,
-        presence.as_ref(),
-        &control,
-        &mut work,
-    )
-    .unwrap();
-    let controls =
-        super::super::super::expression_occurrences::author_original_unit_controls_observed(
-            &loan, &mut work,
-        )
-        .unwrap();
-    for (definition, control) in controls {
-        source
-            .draft
-            .definition_control(definition, control)
-            .unwrap();
-        work.step().unwrap();
-    }
-    let sealed = source.draft.seal(Vec::new(), &mut work).unwrap();
-    work.finish().unwrap();
-    SealedStandaloneSource {
-        brand: source.brand,
-        sealed,
-        constants: source.constants.into_pools(),
-        parameters,
-        journal: source.journal,
-        functions: source.functions,
-    }
-}
-
 #[test]
 fn standalone_runtime_dead_branch_still_admits_its_actual_static_call_source() {
     // A constant-false CASE branch is runtime-dead but remains reachable from

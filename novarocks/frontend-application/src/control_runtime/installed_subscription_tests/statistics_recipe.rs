@@ -819,11 +819,23 @@ impl ActualStatisticsRun {
         drop(self.custody.take());
         drop(self.binding.take());
         drop(self.cohort.take());
-        drive_typed(&mut self.typed.as_mut().unwrap().driver);
-        assert!(
-            self.typed.as_ref().unwrap().retired.is_reclaimed().unwrap(),
-            "the original stage retires independently of the retained domain output"
-        );
+        let typed = self.typed.as_mut().unwrap();
+        let retired = &typed.retired;
+        // An idle driver only observes the current queue. The host may still
+        // hold the final stage reference after publishing its exit receipt.
+        drive_until_with_original_clock(
+            &process,
+            &mut typed.driver,
+            async {
+                while !retired.is_reclaimed().unwrap() {
+                    tokio::task::yield_now().await;
+                }
+            },
+            exit_until,
+            None,
+        )
+        .await
+        .expect("the original stage retires independently of the retained domain output");
         if case.is_success() {
             assert_eq!(
                 self.artifact_body.as_ref().unwrap().as_ref(),

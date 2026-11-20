@@ -321,15 +321,23 @@ fn compile_project_unit_with_layout(
 ) -> Arc<CompiledExprSet> {
     register_call_requests(&mut draft, authors, &mut constants);
     let mut work = CompileCheckpoints::try_new(&HarnessControl, CompilePhase::Validate).unwrap();
-    declare_call_controls(&mut draft, authors, &mut work);
+    declare_call_controls(
+        &mut draft,
+        functions,
+        &constants,
+        parameters,
+        fixture_constant_policy(),
+        &mut work,
+    );
     let sealed = draft.seal(vec![port], &mut work).unwrap();
     let unit = finish_unit(
         functions,
         sealed,
         authors,
+        &constants,
         parameters,
+        fixture_constant_policy(),
         &mut work,
-        |_, _, children| children,
     );
     work.finish().unwrap();
     compile_fixture_unit(

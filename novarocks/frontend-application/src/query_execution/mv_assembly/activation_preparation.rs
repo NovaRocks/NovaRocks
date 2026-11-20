@@ -208,6 +208,7 @@ pub(crate) async fn prepare_analysis(
             let context = MvWriteAnalysisContext {
                 catalog,
                 functions: input.kernel.function_catalog().clone(),
+                sealed_functions: Arc::clone(input.kernel.sealed_functions()),
                 constant_policy: input.kernel.constant_policy(),
                 control,
                 current_catalog,
@@ -322,6 +323,7 @@ pub(crate) async fn prepare_analysis(
             let context = MvWriteAnalysisContext {
                 catalog: capture.catalog,
                 functions: input.kernel.function_catalog().clone(),
+                sealed_functions: Arc::clone(input.kernel.sealed_functions()),
                 constant_policy: input.kernel.constant_policy(),
                 control,
                 current_catalog: rewrite.current_catalog.clone(),

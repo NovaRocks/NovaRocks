@@ -133,15 +133,23 @@ fn fixture(name: &str, values: Vec<ArrayRef>) -> (Arc<CompiledExprSet>, RootOrdi
     let parameters = SemanticParameters::try_new([]).unwrap();
     register_call_requests(&mut draft, &authors, &mut constants);
     let mut work = CompileCheckpoints::try_new(&HarnessControl, CompilePhase::Validate).unwrap();
-    declare_call_controls(&mut draft, &authors, &mut work);
+    declare_call_controls(
+        &mut draft,
+        &functions,
+        &constants,
+        &parameters,
+        policy,
+        &mut work,
+    );
     let sealed = draft.seal(vec![port.clone()], &mut work).unwrap();
     let unit = finish_unit(
         &functions,
         sealed,
         &authors,
+        &constants,
         &parameters,
+        policy,
         &mut work,
-        |_, _, effects| effects,
     );
     work.finish().unwrap();
     let compiled = compile_fixture_unit(

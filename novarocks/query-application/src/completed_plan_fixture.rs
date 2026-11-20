@@ -42,7 +42,7 @@ use novarocks_physical_plan::{
 use novarocks_sql::compiler::{
     DEFAULT_COMPLETION_LIMITS, SessionOptimizerSettings, SqlCompileControl, SqlCompileIntent,
     SqlFactBatch, SqlFinalPlanCompileRequest, SqlNeedBatch, SqlPlanningEnvironment,
-    SqlSessionContext, SqlStatementInput, builtin_sql_function_catalog, noop_constant_evaluator,
+    SqlSessionContext, SqlStatementInput, builtin_sql_function_catalog,
 };
 use novarocks_workload_control::{
     ResourceConfig, RootWork, WorkClass, WorkRequest, WorkScope, WorkloadConfig, WorkloadControl,
@@ -288,7 +288,7 @@ fn literal_query_request(version: [u8; 16], sql: &str) -> SqlFinalPlanCompileReq
         },
         SqlPlanningEnvironment::Distributed,
         builtin_sql_function_catalog().snapshot(),
-        noop_constant_evaluator(),
+        novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
         test_constant_policy(),
         SqlCompileControl::unbounded(),
         PipelineDopDomain {

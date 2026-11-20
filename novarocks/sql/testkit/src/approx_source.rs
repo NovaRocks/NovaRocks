@@ -34,7 +34,7 @@ use novarocks_physical_plan::{PipelineDopDomain, PlanVersionId, ScanReadBudget};
 use novarocks_sql::compiler::{
     DEFAULT_COMPLETION_LIMITS, SessionOptimizerSettings, SqlCompileControl, SqlCompileIntent,
     SqlCompileProgress, SqlCompiler, SqlFinalPlanCompileRequest, SqlPlanningEnvironment,
-    SqlSessionContext, SqlStatementInput, builtin_sql_function_catalog, noop_constant_evaluator,
+    SqlSessionContext, SqlStatementInput, builtin_sql_function_catalog,
 };
 
 pub fn approx_sql_source(sql: &str) -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
@@ -54,6 +54,7 @@ fn approx_sql_source_with_semantics(
             current_catalog: None,
             current_database: "fixture".into(),
             optimizer_settings: SessionOptimizerSettings {
+                disabled_rules: vec!["FoldConstant".into()],
                 enable_materialized_view_rewrite: Some(false),
                 enable_common_subexpr_reuse: Some(false),
                 ..SessionOptimizerSettings::default()
@@ -61,7 +62,7 @@ fn approx_sql_source_with_semantics(
         },
         SqlPlanningEnvironment::Distributed,
         builtin_sql_function_catalog().snapshot(),
-        noop_constant_evaluator(),
+        novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
         // Explicit fixture admission; neither capacity grant nor defaults.
         ConstantPolicy {
             max_rows: 64,

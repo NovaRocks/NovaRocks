@@ -97,6 +97,7 @@ impl Fixture {
             catalog: &self.catalog,
             current_database: "db",
             functions,
+            sealed_functions: self.interpreter.sealed_functions(),
             sql_semantics: &novarocks_sql::sql_mode::SqlSemanticSettings::default(),
             constant_policy: crate::application::test_constant_policy(),
             control,
@@ -215,8 +216,8 @@ fn required_active_branch_error_preserves_original_data_and_ordinal() {
             .expect("original required row");
         assert_eq!(required.error().selected_ordinal(), 0);
         assert_eq!(required.batch_row(), 0);
-        // A producer with the same Data fact arriving through the external
-        // evaluator port remains Outer; classification alone cannot erase it.
+        // A producer with the same Data fact outside the selected row
+        // result remains Outer; classification alone cannot erase it.
         let outer = SqlConstantEvaluationError::outer_domain(cause.clone());
         assert!(matches!(&outer, SqlConstantEvaluationError::Outer(actual)
             if actual == &cause && actual.failure_fact().class() == FailureClass::Data));
@@ -300,6 +301,7 @@ fn required_unchanged_materialized_input_keeps_original_nonzero_selected_value()
         catalog: &fixture.catalog,
         current_database: "db",
         functions,
+        sealed_functions: fixture.interpreter.sealed_functions(),
         sql_semantics: &novarocks_sql::sql_mode::SqlSemanticSettings::default(),
         constant_policy: crate::application::test_constant_policy(),
         control: &control,
@@ -424,6 +426,7 @@ impl Fixture {
             catalog: &self.catalog,
             current_database: "db",
             functions,
+            sealed_functions: self.interpreter.sealed_functions(),
             sql_semantics: &novarocks_sql::sql_mode::SqlSemanticSettings::default(),
             constant_policy: crate::application::test_constant_policy(),
             control,
@@ -541,6 +544,7 @@ fn required_materialized_array_identity_keeps_full_field_type_pool_and_ordinal()
             catalog: &fixture.catalog,
             current_database: "db",
             functions,
+            sealed_functions: fixture.interpreter.sealed_functions(),
             sql_semantics: &novarocks_sql::sql_mode::SqlSemanticSettings::default(),
             constant_policy: crate::application::test_constant_policy(),
             control: &control,
@@ -675,6 +679,7 @@ fn required_unknown_array_conversion_keeps_input_source_without_retagging_its_po
         catalog: &fixture.catalog,
         current_database: "db",
         functions,
+        sealed_functions: fixture.interpreter.sealed_functions(),
         sql_semantics: &novarocks_sql::sql_mode::SqlSemanticSettings::default(),
         constant_policy: crate::application::test_constant_policy(),
         control: &control,

@@ -237,15 +237,23 @@ pub fn rng_unit(mode: SeedMode, twin: bool, dictionary: bool) -> Arc<CompiledExp
             .unwrap();
     }
     let mut work = CompileCheckpoints::try_new(&HarnessControl, CompilePhase::Validate).unwrap();
-    declare_call_controls(&mut draft, &authors, &mut work);
+    declare_call_controls(
+        &mut draft,
+        &functions,
+        &constants,
+        &parameters,
+        POLICY,
+        &mut work,
+    );
     let sealed = draft.seal(vec![port], &mut work).unwrap();
     let unit = finish_unit(
         &functions,
         sealed,
         &authors,
+        &constants,
         &parameters,
+        POLICY,
         &mut work,
-        |_, _, children| children,
     );
     work.finish().unwrap();
     compile_fixture_unit(

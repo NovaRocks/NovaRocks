@@ -14,9 +14,12 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+mod call_dependency_loans;
 mod call_sources;
 mod compile_control;
+mod constant_folding;
 mod fixtures;
+mod fold_observation;
 mod implementation_availability;
 mod numeric_negation;
 

@@ -1389,7 +1389,7 @@ mod tests {
                     SqlPlanningEnvironment::Distributed,
                     &EmptyCatalog,
                     builtin_sql_function_catalog(),
-                    novarocks_sql::compiler::noop_constant_evaluator(),
+                    novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
                     None,
                     crate::completed_plan_fixture::test_constant_policy(),
                     SqlCompileControl::unbounded(),

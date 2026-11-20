@@ -276,6 +276,7 @@ pub struct ExchangeStreamReceiverState {
     end: Option<ExchangeUnitSequence>,
     sender_stopped: bool,
     receiver_closed: Option<ExchangeUnitCloseDisposition>,
+    receiver_failed: bool,
     next_decode_generation: u64,
     position_limit: NonZeroUsize,
 }
@@ -291,6 +292,7 @@ impl ExchangeStreamReceiverState {
             end: None,
             sender_stopped: false,
             receiver_closed: None,
+            receiver_failed: false,
             next_decode_generation: 0,
             position_limit: NonZeroUsize::new(position_limit)
                 .ok_or(ExchangeReceiptError::InvalidPositionLimit)?,
@@ -330,7 +332,11 @@ impl ExchangeStreamReceiverState {
     }
 
     fn accepts_new_work(&self) -> bool {
-        !self.sender_stopped && self.receiver_closed.is_none()
+        !self.sender_stopped && !self.receiver_retired()
+    }
+
+    fn receiver_retired(&self) -> bool {
+        self.receiver_failed || self.receiver_closed.is_some()
     }
 
     pub fn register_demand(
@@ -525,7 +531,7 @@ impl ExchangeStreamReceiverState {
         token: ExchangeDecodeToken,
     ) -> Result<ExchangeDecodeCommit, ExchangeReceiptError> {
         self.validate_token(&token)?;
-        if self.receiver_closed.is_some() {
+        if self.receiver_retired() {
             self.units.remove(&token.sequence.get());
             return Ok(ExchangeDecodeCommit::Discarded);
         }
@@ -574,7 +580,7 @@ impl ExchangeStreamReceiverState {
         sequence: ExchangeUnitSequence,
     ) -> Result<ExchangeUnitDemand, ExchangeReceiptError> {
         let n = sequence.get();
-        if self.receiver_closed.is_some() || self.handed_off.checked_add(1) != Some(n) {
+        if self.receiver_retired() || self.handed_off.checked_add(1) != Some(n) {
             return Err(ExchangeReceiptError::HandoffGap);
         }
         if n > self.custody
@@ -594,14 +600,14 @@ impl ExchangeStreamReceiverState {
         let end = self.end.ok_or(ExchangeReceiptError::InputNotConsumed)?;
         // Several source drivers can independently observe the same exhausted
         // receiver. Re-observation preserves the first consumption fact.
-        if self.receiver_closed.is_none()
+        if !self.receiver_retired()
             && self.custody == end.get()
             && self.handed_off == end.get()
             && self.units.is_empty()
         {
             return Ok(());
         }
-        if self.receiver_closed.is_some()
+        if self.receiver_retired()
             || self.custody != end.get()
             || self.handed_off.checked_add(1) != Some(end.get())
             || !self.units.is_empty()
@@ -638,6 +644,9 @@ impl ExchangeStreamReceiverState {
         &mut self,
         disposition: ExchangeUnitCloseDisposition,
     ) -> Result<Vec<ExchangeUnitDemand>, ExchangeReceiptError> {
+        if self.receiver_failed {
+            return Err(ExchangeReceiptError::CloseConflict);
+        }
         if let Some(previous) = self.receiver_closed {
             return if previous == disposition {
                 Ok(Vec::new())
@@ -651,6 +660,17 @@ impl ExchangeStreamReceiverState {
             return Err(ExchangeReceiptError::InputNotConsumed);
         }
         self.receiver_closed = Some(disposition);
+        Ok(self.discard_receiver_queue())
+    }
+
+    /// Release unused work while retaining real decode leases and cumulative
+    /// facts. Failure retirement does not author a normal stream disposition.
+    pub fn fail_receiver(&mut self) -> Vec<ExchangeUnitDemand> {
+        self.receiver_failed = true;
+        self.discard_receiver_queue()
+    }
+
+    fn discard_receiver_queue(&mut self) -> Vec<ExchangeUnitDemand> {
         self.demand = None;
         let mut released = Vec::new();
         self.units.retain(|_, record| {
@@ -661,7 +681,7 @@ impl ExchangeStreamReceiverState {
                 false
             }
         });
-        Ok(released)
+        released
     }
 }
 

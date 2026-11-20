@@ -687,6 +687,15 @@ impl WithdrawalInbox {
         Some((input, fact))
     }
 
+    pub(crate) fn try_commit_local_convergence_exit(&self) -> Option<InputId> {
+        let (input, value) = self.try_commit_attempt_from(self.registration.actor())?;
+        assert!(matches!(
+            value,
+            AttemptInput::Executor(ExecutorFact::LocalConvergenceExited)
+        ));
+        Some(input)
+    }
+
     fn try_commit_attempt(&self) -> Option<(InputId, AttemptInput)> {
         self.try_commit_attempt_from(self.source)
     }

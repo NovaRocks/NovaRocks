@@ -71,6 +71,14 @@ pub fn rng_subset() -> PureEngineFunctionCatalog {
 // implementation identity or state-format record. An uncovered definition is
 // absent from the seal as in the actual candidate; required source calls still
 // fail explicitly during the real LocalCompiler path.
+pub fn shared_installed_builtin_owner_catalogue() -> std::sync::Arc<PureEngineFunctionCatalog> {
+    static SHARED: std::sync::OnceLock<std::sync::Arc<PureEngineFunctionCatalog>> =
+        std::sync::OnceLock::new();
+    std::sync::Arc::clone(
+        SHARED.get_or_init(|| std::sync::Arc::new(installed_builtin_owner_catalogue())),
+    )
+}
+
 pub fn installed_builtin_owner_catalogue() -> PureEngineFunctionCatalog {
     let metadata = crate::builtin::catalogue::builtin_engine_function_catalog();
     let control = FixtureCompileControl;

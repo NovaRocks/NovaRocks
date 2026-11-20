@@ -30,7 +30,7 @@ fn compile_captured_refresh_explain(
             environment: novarocks_sql::compiler::SqlPlanningEnvironment::NotApplicable,
             catalog,
             functions: ports.function_catalog().as_ref(),
-            constant_evaluator: crate::query_execution::constant_eval::constant_evaluator(),
+            sealed_functions: Arc::clone(ports.sealed_functions()),
             constant_policy: ports.constant_policy(),
             control: crate::query_execution::planning::sql_compile_control_from_connector_request(
                 connector_context,

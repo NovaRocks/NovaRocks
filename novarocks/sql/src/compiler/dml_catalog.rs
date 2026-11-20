@@ -20,10 +20,11 @@
 use super::{
     CatalogRelationFact, CatalogRelationNeed, ConstantPolicy, RootDistributionRequirement,
     SqlAnalyzeRequest, SqlAnalyzedQuery, SqlCompileControl, SqlCompileError, SqlCompileIntent,
-    SqlCompiler, SqlConstantEvaluator, SqlFunctionCatalog, SqlPlannerTableSnapshot,
-    SqlPlanningEnvironment, SqlSessionContext, SqlStatementInput, SqlStatementInputKind,
+    SqlCompiler, SqlFunctionCatalog, SqlPlannerTableSnapshot, SqlPlanningEnvironment,
+    SqlSessionContext, SqlStatementInput, SqlStatementInputKind,
     completion_catalog::CatalogCompletionState,
 };
+use std::sync::Arc;
 
 /// Owns the original prepared syntax while the application observes the exact
 /// catalog facts. No application catalog or provider callback crosses this boundary.
@@ -152,7 +153,7 @@ impl SqlDmlCatalogPreparation {
         self,
         facts: &[CatalogRelationFact],
         functions: &dyn SqlFunctionCatalog,
-        evaluator: &'static dyn SqlConstantEvaluator,
+        sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
         policy: ConstantPolicy,
     ) -> Result<SqlAnalyzedQuery, SqlCompileError> {
         self.control.check()?;
@@ -182,7 +183,7 @@ impl SqlDmlCatalogPreparation {
             SqlPlanningEnvironment::Distributed,
             &snapshot,
             functions,
-            evaluator,
+            sealed_functions,
             None,
             policy,
             self.control,
@@ -239,7 +240,7 @@ mod tests {
         source.analyze(
             facts,
             crate::functions::builtin_sql_function_catalog(),
-            super::super::noop_constant_evaluator(),
+            novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
             crate::constant::test_constant_policy(),
         )
     }

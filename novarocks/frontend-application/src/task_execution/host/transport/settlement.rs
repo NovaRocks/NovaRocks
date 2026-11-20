@@ -30,6 +30,7 @@ use crate::{
     },
 };
 use novarocks_coordination_contract::MonotonicClock;
+use novarocks_execution_contract::OperationOutcome;
 use novarocks_proto_models::novarocks as proto;
 use std::collections::VecDeque;
 
@@ -114,7 +115,11 @@ impl AcceptedReceipts {
             ));
         }
     }
-    pub(crate) fn response(&mut self, response: proto::ApplyTaskOperationsResponse) {
+    pub(super) fn response(
+        &mut self,
+        response: proto::ApplyTaskOperationsResponse,
+        on_identity_mismatch: impl FnOnce(),
+    ) {
         let ids = self
             .pending
             .iter()
@@ -128,6 +133,7 @@ impl AcceptedReceipts {
                 return;
             }
         };
+        let mut on_identity_mismatch = Some(on_identity_mismatch);
         for (header, receipt) in headers.iter().zip(response.receipts) {
             let item = self
                 .pending
@@ -136,6 +142,12 @@ impl AcceptedReceipts {
             let projection = wire::project_acknowledgement_owned(&item.sent, header, receipt);
             if let Some(detail) = projection.unreadable_ack.as_ref() {
                 tracing::warn!(detail=%detail,"task operation acknowledgement is unreadable");
+            }
+            if projection.acknowledgement.worker_outcome()
+                == Some(OperationOutcome::IdentityMismatch)
+                && let Some(retire) = on_identity_mismatch.take()
+            {
+                retire();
             }
             self.next(projection.acknowledgement);
         }

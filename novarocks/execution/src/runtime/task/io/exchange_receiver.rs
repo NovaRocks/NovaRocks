@@ -89,6 +89,8 @@ pub trait ExchangeReceiverPort: Send + Sync + 'static {
         Err(crate::runtime::exchange::ExchangeFailure::receiver_unavailable())
     }
     fn cancel(&self, key: ExchangeReceiverKey);
+    /// Retire a failed route without publishing a normal close disposition.
+    fn cancel_failed(&self, key: ExchangeReceiverKey);
     fn remove(&self, key: ExchangeReceiverKey);
     fn cancel_task(&self, task_key: UniqueId);
     fn receiver_pin(
@@ -275,6 +277,12 @@ impl ExchangeReceiverPort for ExecutionRuntimeExchangeReceiverPort {
             .cancel_exchange_key(Self::key(key));
     }
 
+    fn cancel_failed(&self, key: ExchangeReceiverKey) {
+        self.runtime
+            .exchange_registry()
+            .fail_exchange_key(Self::key(key));
+    }
+
     fn remove(&self, key: ExchangeReceiverKey) {
         self.runtime
             .exchange_registry()
@@ -391,6 +399,8 @@ impl ExchangeReceiverPort for UnavailableExchangeReceiverPort {
     }
 
     fn cancel(&self, _key: ExchangeReceiverKey) {}
+
+    fn cancel_failed(&self, _key: ExchangeReceiverKey) {}
 
     fn remove(&self, _key: ExchangeReceiverKey) {}
 

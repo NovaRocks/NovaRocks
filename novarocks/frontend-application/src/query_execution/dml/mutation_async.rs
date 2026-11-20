@@ -408,7 +408,7 @@ pub(crate) async fn compile_routed_mutation_write(
         .analyze(
             &[],
             state.function_catalog().as_ref(),
-            crate::query_execution::constant_eval::constant_evaluator(),
+            Arc::clone(state.sealed_functions()),
             state.constant_policy(),
         )
         .map_err(DmlError::from_compile)?;

@@ -69,6 +69,11 @@ impl RequiredConstantInterpreter {
         Self { functions, policy }
     }
 
+    /// The same sealed catalogue this interpreter evaluates with.
+    pub fn sealed_functions(&self) -> Arc<PureEngineFunctionCatalog> {
+        Arc::clone(&self.functions)
+    }
+
     pub fn evaluate(
         &self,
         prepared: PreparedRequiredConstant,
@@ -352,15 +357,16 @@ impl RequiredConstantInterpreter {
         if retains_source {
             // Bound the actual complete Arrow subtree before to_data creates
             // its metadata. Payload is already held by the original take.
-            let metadata = novarocks_functions::source_metadata_bytes_observed::<
-                SqlConstantEvaluationError,
-            >(array.as_ref(), &mut |boundary| {
-                if boundary {
-                    work.flush()?;
-                } else {
-                    work.step()?;
-                }
-                Ok(())
+            let metadata = novarocks_functions::source_metadata_bytes_observed(
+                array.as_ref(),
+                &mut |boundary| {
+                    if boundary { work.flush() } else { work.step() }
+                        .map_err(KernelFailure::CompileControl)
+                },
+            )
+            .map_err(|cause| match cause {
+                KernelFailure::CompileControl(control) => control.into(),
+                cause => SqlConstantEvaluationError::outer_domain(cause),
             })?;
             storage.observe_opaque_upper_bound(metadata)?;
         } else {

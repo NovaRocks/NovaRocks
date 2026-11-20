@@ -3805,7 +3805,7 @@ crate::constant::test_constant_policy(),
         .expect("join aggregate IMV pipeline must rewrite and validate");
 
         let pipeline = query_rewrite_pipeline();
-        let mut ctx = RewriteContext::for_query(Vec::<String>::new());
+        let mut ctx = RewriteContext::for_query(["FoldConstant".into()]);
         ctx.set_query_stats_input(
             crate::optimizer::stats_input::OptimizerStatsInput::from_test_table_statistics(
                 &HashMap::new(),

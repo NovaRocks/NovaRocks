@@ -319,7 +319,8 @@ fn float_identity_original_compile_and_runtime_refusals_keep_exact_prefix_and_fa
         Wrap::Coalesce,
         DecimalOverflowPolicy::ReportError,
         true,
-    );
+    )
+    .expect("nullable float cast is admitted");
     let recorder = CompileCallbacks::new(CompileControlError::Cancelled, usize::MAX);
     let program = fixture.compile(&recorder).unwrap();
     let compile_trace = recorder.trace();

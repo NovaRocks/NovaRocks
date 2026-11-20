@@ -399,6 +399,7 @@ impl SessionPropertyEvaluation<'_> {
                 catalog: &SqlPlannerTableSnapshot::new(&*catalog),
                 current_database: original.current_database(),
                 functions: Arc::clone(self.functions),
+                sealed_functions: self.interpreter.sealed_functions(),
                 sql_semantics: original.sql_semantics(),
                 constant_policy: self.policy,
                 control: self.control,
@@ -468,7 +469,6 @@ fn evaluation_error(error: SqlConstantEvaluationError, name: &str) -> QueryServi
                 QueryServiceError::from_failure_cause(cause)
             }
         }
-        SqlConstantEvaluationError::Evaluation(message) => super::internal_error(message),
     }
 }
 

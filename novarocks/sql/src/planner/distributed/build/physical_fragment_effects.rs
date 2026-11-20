@@ -43,7 +43,6 @@ use super::{
         author_physical_aggregate_update_request_from_journal_observed,
         author_physical_aggregate_update_request_observed,
     },
-    physical_expression_effects::PhysicalExpressionEffectsError,
     physical_table_occurrences::{
         PhysicalTableOccurrenceError, PhysicalTableOccurrenceInput,
         prepare_physical_table_occurrence_observed,
@@ -101,7 +100,6 @@ pub(crate) struct AuthoredPhysicalFragmentEffects {
 pub(crate) enum PhysicalFragmentEffectsError {
     Control(CompileControlError),
     Occurrence(ExpressionOccurrenceError),
-    Expressions(PhysicalExpressionEffectsError),
     AggregateRequest(PhysicalAggregateRequestError),
     Journal(SqlSourceJournalError),
     Aggregate(PhysicalAggregateOccurrenceError),
@@ -134,7 +132,6 @@ macro_rules! nested_error {
     };
 }
 nested_error!(ExpressionOccurrenceError, Occurrence);
-nested_error!(PhysicalExpressionEffectsError, Expressions);
 nested_error!(PhysicalAggregateRequestError, AggregateRequest);
 nested_error!(SqlSourceJournalError, Journal);
 nested_error!(PhysicalAggregateOccurrenceError, Aggregate);

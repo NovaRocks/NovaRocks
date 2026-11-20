@@ -14,9 +14,9 @@ use novarocks_sql::compiler::{
     DEFAULT_COMPLETION_LIMITS, RootDistributionRequirement, SessionOptimizerSettings,
     SqlAnalyzeRequest, SqlAuthoredPhysicalPlan, SqlCancellationObservation, SqlCompileControl,
     SqlCompileError, SqlCompileIntent, SqlCompileProgress, SqlCompileProgressError, SqlCompiler,
-    SqlFinalPlanCompileRequest, SqlFoldDependencyInput, SqlFoldDependencyObserver,
-    SqlFoldEvaluationOutcome, SqlOptimizeRequest, SqlPlannerTableSnapshot, SqlPlanningEnvironment,
-    SqlSessionContext, SqlStatementInput, builtin_sql_function_catalog, noop_constant_evaluator,
+    SqlFinalPlanCompileRequest, SqlFoldDependencyObserver, SqlOptimizeRequest,
+    SqlPlannerTableSnapshot, SqlPlanningEnvironment, SqlSessionContext, SqlStatementInput,
+    builtin_sql_function_catalog,
 };
 use novarocks_sql::planning::catalog::PlannerMemoryCatalog;
 use novarocks_sql::planning::dml::{
@@ -47,19 +47,6 @@ impl Probe {
     }
 }
 impl SqlFoldDependencyObserver for Probe {
-    fn before_fold_dependency_observed(
-        &self,
-        _: SqlFoldDependencyInput<'_>,
-        _: &dyn PureCompileControl,
-    ) -> Result<(), CompileControlError> {
-        Ok(())
-    }
-    fn after_fold_dependency_observed(
-        &self,
-        _: SqlFoldDependencyInput<'_>,
-        _: SqlFoldEvaluationOutcome<'_>,
-    ) {
-    }
     fn observe_published_source_observed(
         &self,
         source: &SqlAuthoredPhysicalPlan,
@@ -78,21 +65,7 @@ impl SqlFoldDependencyObserver for Probe {
     }
 }
 struct DefaultObserver;
-impl SqlFoldDependencyObserver for DefaultObserver {
-    fn before_fold_dependency_observed(
-        &self,
-        _: SqlFoldDependencyInput<'_>,
-        _: &dyn PureCompileControl,
-    ) -> Result<(), CompileControlError> {
-        Ok(())
-    }
-    fn after_fold_dependency_observed(
-        &self,
-        _: SqlFoldDependencyInput<'_>,
-        _: SqlFoldEvaluationOutcome<'_>,
-    ) {
-    }
-}
+impl SqlFoldDependencyObserver for DefaultObserver {}
 struct CountCancellation(AtomicUsize);
 impl SqlCancellationObservation for CountCancellation {
     fn is_cancelled(&self) -> bool {
@@ -121,14 +94,19 @@ fn query(
     sql: &str,
     control: SqlCompileControl,
 ) -> Result<SqlAuthoredPhysicalPlan, SqlCompileProgressError> {
+    let mut session = session();
+    session
+        .optimizer_settings
+        .disabled_rules
+        .push("FoldConstant".into());
     let request = SqlFinalPlanCompileRequest::new(
         PlanVersionId::try_new([97; 16]).unwrap(),
         SqlStatementInput::parsed_query(crate::exec::expr::test_support::parse_query(sql)),
         SqlCompileIntent::Query,
-        session(),
+        session,
         SqlPlanningEnvironment::Distributed,
         builtin_sql_function_catalog().snapshot(),
-        noop_constant_evaluator(),
+        novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
         super::test_support::constant_policy(),
         control.clone(),
         PipelineDopDomain {
@@ -165,7 +143,7 @@ fn dml(sql: &str, control: SqlCompileControl) -> Result<SqlAuthoredPhysicalPlan,
         SqlPlanningEnvironment::Distributed,
         &catalog,
         &functions,
-        noop_constant_evaluator(),
+        novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
         None,
         super::test_support::constant_policy(),
         control.clone(),

@@ -840,6 +840,7 @@ fn freeze_rewrite_cohort_recipe(
         crate::query_execution::provider_read_facts::FrozenProviderRead,
     >,
     function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
+    sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
     static_plan_carrier: &crate::query_execution::package_freeze::CompiledPackageCarrier,
     constant_policy: novarocks_functions::ConstantPolicy,
     control: &novarocks_sql::compiler::SqlCompileControl,
@@ -877,6 +878,7 @@ fn freeze_rewrite_cohort_recipe(
         write_target.ordinal(),
         write_target.statistics().requirements(),
         function_catalog.clone(),
+        sealed_functions,
         &optimizer_settings,
         novarocks_sql::planning::dml::DmlFinalWritePlanContext::new(
             novarocks_sql::planning::dml::DmlFinalPlanContext::new(

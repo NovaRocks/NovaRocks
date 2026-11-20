@@ -4016,7 +4016,7 @@ mod tests {
         SqlCompilation, SqlCompileControl, SqlCompileIntent, SqlCompileProgress,
         SqlCompileProgressError, SqlCompiler, SqlFactBatch, SqlFinalPlanCompileRequest,
         SqlPlanningEnvironment, SqlSessionContext, SqlStatementInput, StatisticsFact,
-        builtin_sql_function_catalog, noop_constant_evaluator,
+        builtin_sql_function_catalog,
     };
     use crate::planner::table::{
         ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity, SqlTableVersionSelector, TableDef,
@@ -4043,7 +4043,7 @@ mod tests {
             },
             SqlPlanningEnvironment::Distributed,
             builtin_sql_function_catalog().snapshot(),
-            noop_constant_evaluator(),
+            novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
             crate::constant::test_constant_policy(),
             SqlCompileControl::unbounded(),
             PipelineDopDomain {
@@ -5506,7 +5506,8 @@ mod tests {
 
     #[test]
     fn provider_guarantee_and_residual_facts_change_the_complete_explain() {
-        let sql = "select order_key from orders where order_key > 10";
+        // Use a BIGINT literal to isolate provider negotiation from cast folding.
+        let sql = "select order_key from orders where order_key > 2147483648";
         let exact = completed_external_sql(sql, 60, PredicateGuaranteeKind::Exact)
             .render_explain_lines()
             .expect("exact provider explain")

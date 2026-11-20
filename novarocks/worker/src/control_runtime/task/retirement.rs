@@ -88,7 +88,8 @@ impl TaskHostRecord {
         // A genuine strict-input cancellation withdraws rather than claims
         // consumption, even if another input already drained. Its original
         // conclusion remains Canceled while its receiver uses abort cleanup.
-        let strict_canceled = self.resources.port.current().state()
+        let status = self.resources.port.current();
+        let strict_canceled = status.state()
             == novarocks_execution_contract::TaskState::Canceled
             && owner.as_ref().is_some_and(|owner| {
                 owner.state.lock().expect("original retirement descriptor")
@@ -116,6 +117,9 @@ impl TaskHostRecord {
                 owner,
                 host,
                 ingress: match &ticket.effect {
+                    _ if status.installed() && status.state().is_failure() => {
+                        crate::TaskIngressRetirement::PreserveFailureStop
+                    }
                     WorkerAction::Participation(ParticipationEffect::FinalizeTaskExecution {
                         normally_stopped: true,
                         ..

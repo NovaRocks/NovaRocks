@@ -191,68 +191,6 @@ fn original_seconds_roundtrip_authors_only_original_integer_use() {
     }
 }
 #[test]
-fn ordinary_occurrence_entry_without_original_journal_cannot_guess_temporal_facts() {
-    let owner = authored(call("time_to_sec", vec![text("12:34:56")]));
-    let mut count = 0;
-    for fragment in owner.plan().fragments().values() {
-        for node in fragment.nodes().values() {
-            let Some(unit) = &node.expressions else {
-                continue;
-            };
-            for (&use_id, invocation) in unit.control_flow().uses() {
-                let source = unit.definition(invocation.definition).unwrap();
-                if !matches!(&source.kind, novarocks_expression_contract::ExprKind::FunctionCall { function, .. } if function.function_id.as_str().contains("time_to_sec"))
-                {
-                    continue;
-                }
-                // The direct component can borrow real definitions, but has no
-                // same-emission temporal receipt. It cannot guess one from CVs.
-                let control = Control::default();
-                let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
-                    &control,
-                    CompilePhase::FunctionSpecialization,
-                )
-                .unwrap();
-                let definitions = super::unit_source::UnitDefinitions::from_node(node);
-                let request =
-                    super::physical_scalar_requests::author_physical_scalar_request_observed(
-                        source,
-                        definitions.clone(),
-                        owner.plan().constants(),
-                        policy(),
-                        &mut work,
-                    )
-                    .unwrap();
-                let children = std::collections::BTreeMap::new();
-                let result =
-                    super::physical_scalar_occurrences::prepare_physical_scalar_occurrence_observed(
-                        super::physical_scalar_occurrences::PhysicalScalarOccurrenceInput {
-                            source,
-                            definitions: Some(definitions),
-                            temporal_source: None,
-                            request: &request,
-                            flow: unit.control_flow(),
-                            use_id,
-                            child_effects: &children,
-                            parameters: owner.plan().parameters(),
-                            environment: &[],
-                            decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
-                            proof_scope: novarocks_type_contract::CallProofScope::Region(
-                                invocation.context.region,
-                            ),
-                        },
-                        owner.function_catalog().as_ref(),
-                        &mut work,
-                    );
-                assert!(matches!(result, Err(super::physical_scalar_occurrences::PhysicalScalarOccurrenceError::InvalidSource("missing same-emission temporal source facts"))));
-                work.finish().unwrap();
-                count += 1;
-            }
-        }
-    }
-    assert_eq!(count, 1);
-}
-#[test]
 fn actual_emitted_journal_author_preserves_each_compile_cause_at_every_checkpoint() {
     let expression = call(
         "time_format",

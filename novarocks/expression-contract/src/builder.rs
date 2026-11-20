@@ -102,6 +102,11 @@ impl BoundExprSetBuilder {
             .get(id.get() as usize)
             .and_then(Option::as_ref)
     }
+    /// Original requests already admitted on the draft. Control authorship reads
+    /// logical argument counts from them and does not take the builder.
+    pub fn requests(&self) -> &BTreeMap<ExprId, PhysicalCallRequest> {
+        &self.requests
+    }
     pub fn definitions(&self) -> impl Iterator<Item = &ExprNode> {
         self.definitions.iter().filter_map(Option::as_ref)
     }

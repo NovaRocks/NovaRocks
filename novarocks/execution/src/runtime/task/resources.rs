@@ -298,11 +298,15 @@ impl ExchangeRegistration {
         self.cleanup_should_fail = false;
     }
 
-    fn finish_cancelled(&mut self) {
+    fn finish_cancelled(&mut self, failed: bool) {
         self.stop_construction(novarocks_functions::KernelFailure::Cancelled.into());
         if self.active {
             for key in self.keys.drain(..).rev() {
-                self.port.cancel(key);
+                if failed {
+                    self.port.cancel_failed(key);
+                } else {
+                    self.port.cancel(key);
+                }
             }
             self.active = false;
         }
@@ -335,6 +339,7 @@ pub struct ExchangeReceiverRetirement {
 #[derive(Clone, Copy)]
 enum ExchangeRetirementDisposition {
     Cancel,
+    Fail,
     Remove,
 }
 
@@ -367,10 +372,16 @@ impl ExchangeReceiverRetirement {
                 if self.registration.construction_stop.is_some() {
                     self.stop_construction(error.cause().clone());
                 }
-                ExchangeRetirementDisposition::Cancel
+                ExchangeRetirementDisposition::Fail
             }
             super::LocalTaskOutcome::Cancelled { .. } => ExchangeRetirementDisposition::Cancel,
         };
+    }
+
+    /// The application fenced the original exact route before taking this
+    /// ownership, including when a Participation abort stopped the Task.
+    pub fn record_failure_stop(&mut self) {
+        self.disposition = ExchangeRetirementDisposition::Fail;
     }
 
     /// Stop construction on a real failure or abort without retiring ingress.
@@ -398,7 +409,8 @@ impl Drop for ExchangeReceiverRetirement {
     fn drop(&mut self) {
         match self.disposition {
             ExchangeRetirementDisposition::Remove => self.registration.finish_success(),
-            ExchangeRetirementDisposition::Cancel => self.registration.finish_cancelled(),
+            ExchangeRetirementDisposition::Cancel => self.registration.finish_cancelled(false),
+            ExchangeRetirementDisposition::Fail => self.registration.finish_cancelled(true),
         }
     }
 }
@@ -836,6 +848,7 @@ impl RuntimeTaskResources {
                 key.hook(control, |(port, key)| {
                     match outcome {
                         LocalTaskOutcome::Succeeded => port.remove(*key),
+                        LocalTaskOutcome::Failed(_) => port.cancel_failed(*key),
                         _ => port.cancel(*key),
                     }
                     Ok(())

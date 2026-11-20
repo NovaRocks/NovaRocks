@@ -243,3 +243,94 @@ fn every_actual_round_null_rand_boundary_callback_keeps_all_seven_causes_and_no_
         }
     }
 }
+
+#[test]
+fn numeric_not_preserves_zero_nonzero_nan_and_null_in_the_original_successful_domain() {
+    use crate::zero_port;
+    use arrow::{
+        array::{ArrayRef, Float64Array, Int64Array},
+        datatypes::DataType,
+    };
+    use novarocks_expression_contract::{ExprKind, UnaryOperator};
+    use novarocks_type_contract::{FunctionValueType, SemanticParameters};
+    use std::sync::Arc;
+
+    let numeric: Vec<ArrayRef> = vec![
+        Arc::new(arrow::array::Int8Array::from(vec![Some(0), Some(-1), None])),
+        Arc::new(arrow::array::Int16Array::from(vec![
+            Some(0),
+            Some(-1),
+            None,
+        ])),
+        Arc::new(arrow::array::Int32Array::from(vec![
+            Some(0),
+            Some(-1),
+            None,
+        ])),
+        Arc::new(Int64Array::from(vec![Some(0), Some(-1), None])),
+        Arc::new(arrow::array::Float32Array::from(vec![
+            Some(-0.0),
+            Some(f32::NAN),
+            None,
+        ])),
+        Arc::new(Float64Array::from(vec![Some(-0.0), Some(f64::NAN), None])),
+        Arc::new(
+            arrow::array::Decimal128Array::from(vec![Some(0), Some(-1), None])
+                .with_precision_and_scale(18, 4)
+                .unwrap(),
+        ),
+    ];
+    let result = FunctionValueType::new(DataType::Boolean, true);
+    // SQL NOT is true exactly at numeric zero, false at every nonzero value
+    // (including NaN), and preserves SQL NULL; these are independent expectations.
+    for input in numeric {
+        for (row, expected) in [Some(true), Some(false), None].into_iter().enumerate() {
+            let unit = zero_port::primitive(
+                [input.slice(row, 1)],
+                result.clone(),
+                |children| ExprKind::Unary {
+                    op: UnaryOperator::Not,
+                    expr: children[0],
+                },
+                &SemanticParameters::default(),
+            )
+            .unwrap();
+            let output = zero_port::evaluate(unit);
+            assert!(output.errors().is_empty());
+            assert_eq!(booleans(&output), vec![expected]);
+        }
+    }
+}
+
+#[test]
+fn boolean_not_over_constant_uses_the_value_root_null_contract() {
+    use crate::zero_port;
+    use arrow::{
+        array::{ArrayRef, BooleanArray},
+        datatypes::DataType,
+    };
+    use novarocks_expression_contract::{ExprKind, UnaryOperator};
+    use novarocks_type_contract::{FunctionValueType, SemanticParameters};
+    use std::sync::Arc;
+
+    for (value, expected) in [
+        (Some(true), Some(false)),
+        (Some(false), Some(true)),
+        (None, None),
+    ] {
+        let array: ArrayRef = Arc::new(BooleanArray::from(vec![value]));
+        let unit = zero_port::primitive(
+            [array],
+            FunctionValueType::new(DataType::Boolean, true),
+            |children| ExprKind::Unary {
+                op: UnaryOperator::Not,
+                expr: children[0],
+            },
+            &SemanticParameters::default(),
+        )
+        .unwrap();
+        let output = zero_port::evaluate(unit);
+        assert!(output.errors().is_empty());
+        assert_eq!(booleans(&output), vec![expected]);
+    }
+}

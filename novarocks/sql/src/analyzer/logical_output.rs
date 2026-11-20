@@ -1449,7 +1449,7 @@ mod scalar_domain_tests {
             DEFAULT_COMPLETION_LIMITS, SessionOptimizerSettings, SqlCompileControl,
             SqlCompileIntent, SqlCompileProgress, SqlCompiler, SqlFinalPlanCompileRequest,
             SqlPlanningEnvironment, SqlSessionContext, SqlStatementInput,
-            builtin_sql_function_catalog, noop_constant_evaluator,
+            builtin_sql_function_catalog,
         };
         use novarocks_physical_plan::{
             MAX_SCAN_BATCH_BYTES, MAX_SCAN_BATCH_ROWS, PipelineDopDomain, PlanVersionId,
@@ -1520,7 +1520,7 @@ mod scalar_domain_tests {
                 },
                 SqlPlanningEnvironment::Distributed,
                 builtin_sql_function_catalog().snapshot(),
-                noop_constant_evaluator(),
+                novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
                 crate::constant::test_constant_policy(),
                 SqlCompileControl::unbounded(),
                 PipelineDopDomain {
@@ -2249,7 +2249,7 @@ mod scalar_domain_tests {
             DEFAULT_COMPLETION_LIMITS, SessionOptimizerSettings, SqlCompileControl,
             SqlCompileIntent, SqlCompileProgress, SqlCompiler, SqlFinalPlanCompileRequest,
             SqlPlanningEnvironment, SqlSessionContext, SqlStatementInput,
-            builtin_sql_function_catalog, noop_constant_evaluator,
+            builtin_sql_function_catalog,
         };
         use novarocks_physical_plan::{
             MAX_SCAN_BATCH_BYTES, MAX_SCAN_BATCH_ROWS, PipelineDopDomain, PlanVersionId,
@@ -2327,7 +2327,7 @@ mod scalar_domain_tests {
                 },
                 SqlPlanningEnvironment::Distributed,
                 builtin_sql_function_catalog().snapshot(),
-                noop_constant_evaluator(),
+                novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
                 crate::constant::test_constant_policy(),
                 SqlCompileControl::unbounded(),
                 PipelineDopDomain {

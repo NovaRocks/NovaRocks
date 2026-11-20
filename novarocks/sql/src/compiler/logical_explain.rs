@@ -19,8 +19,8 @@
 
 use super::{
     CatalogRelationFact, CatalogRelationNeed, ExplainLevel, SqlAnalyzeRequest, SqlCompileControl,
-    SqlCompileError, SqlCompileIntent, SqlCompiler, SqlConstantEvaluator, SqlFunctionCatalog,
-    SqlPlannerTableSnapshot, SqlPlanningEnvironment, SqlSessionContext, SqlStatementInput,
+    SqlCompileError, SqlCompileIntent, SqlCompiler, SqlFunctionCatalog, SqlPlannerTableSnapshot,
+    SqlPlanningEnvironment, SqlSessionContext, SqlStatementInput,
     completion_catalog::CatalogCompletionState,
 };
 
@@ -117,7 +117,7 @@ impl SqlLogicalExplainCatalog {
         self,
         facts: &[CatalogRelationFact],
         functions: &dyn SqlFunctionCatalog,
-        evaluator: &'static dyn SqlConstantEvaluator,
+        sealed_functions: std::sync::Arc<novarocks_functions::PureEngineFunctionCatalog>,
         policy: novarocks_functions::ConstantPolicy,
         environment: SqlPlanningEnvironment,
         level: ExplainLevel,
@@ -138,7 +138,7 @@ impl SqlLogicalExplainCatalog {
             environment,
             &snapshot,
             functions,
-            evaluator,
+            sealed_functions,
             None,
             policy,
             self.control.clone(),
@@ -178,7 +178,7 @@ mod tests {
             .finish(
                 &[],
                 functions,
-                super::super::noop_constant_evaluator(),
+                novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
                 crate::constant::test_constant_policy(),
                 SqlPlanningEnvironment::Distributed,
                 ExplainLevel::Normal,
@@ -193,7 +193,7 @@ mod tests {
             SqlPlanningEnvironment::Distributed,
             &snapshot,
             functions,
-            super::super::noop_constant_evaluator(),
+            novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
             None,
             crate::constant::test_constant_policy(),
             control.clone(),
@@ -226,7 +226,7 @@ mod tests {
             .finish(
                 &[],
                 crate::functions::builtin_sql_function_catalog(),
-                super::super::noop_constant_evaluator(),
+                novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
                 crate::constant::test_constant_policy(),
                 SqlPlanningEnvironment::Distributed,
                 ExplainLevel::Normal,
@@ -250,7 +250,7 @@ mod tests {
                 .finish(
                     &[],
                     functions,
-                    super::super::noop_constant_evaluator(),
+                    novarocks_functions::testkit::shared_installed_builtin_owner_catalogue(),
                     crate::constant::test_constant_policy(),
                     SqlPlanningEnvironment::Distributed,
                     ExplainLevel::Normal

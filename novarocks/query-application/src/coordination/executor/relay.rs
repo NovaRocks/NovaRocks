@@ -256,6 +256,9 @@ impl RelayExecutor {
         let root = binding.frontier.root();
         let carrier = self.consumer.carrier().map_err(report)?;
         validate_binding(&self.scope, &self.consumer, activation, &binding).map_err(report)?;
+        // Keep the original computation observation with this pump. Accepted
+        // Ready can retire preparation before the pump returns its cut.
+        let computation = self.native.streamed_computation_cut_handle().await;
         if self.consumer.is_internal() {
             let original = self
                 .consumer
@@ -358,7 +361,7 @@ impl RelayExecutor {
                 return Err(report(error));
             }
         }
-        if let Some(original) = self.native.streamed_computation_cut_handle().await {
+        if let Some(original) = computation {
             let cut = StreamedRowsComputedCut::new(original, activation, root);
             self.lock()
                 .attempts

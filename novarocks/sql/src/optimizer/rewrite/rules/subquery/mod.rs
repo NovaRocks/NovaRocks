@@ -97,7 +97,7 @@ mod tests {
     use crate::planner::payload::{PlanLimitNode, PlanValuesNode};
 
     fn ctx_with_arena() -> RewriteContext<'static> {
-        let mut ctx = RewriteContext::for_query(Vec::<String>::new());
+        let mut ctx = RewriteContext::for_query(["FoldConstant".into()]);
         ctx.set_function_catalog(crate::functions::test_function_catalog_snapshot());
         ctx.set_query_stats_input(OptimizerStatsInput::from_test_table_statistics(
             &HashMap::new(),
@@ -324,6 +324,7 @@ mod tests {
         // Disable rules that could eliminate this scalar Apply so it survives
         // to the backstop.
         let mut ctx = RewriteContext::for_query(vec![
+            "FoldConstant".into(),
             "ApplyException".to_string(),
             "ScalarApplyToJoin".to_string(),
             "PushDownApplyAggFilter".to_string(),

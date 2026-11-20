@@ -30,6 +30,14 @@ pub use novarocks_execution_contract::ordered_retained_stream::exchange::{
 
 use crate::runtime::endpoint::RuntimeEndpoint;
 
+/// Positive stop of an installed exact route. This fact is meaningful only
+/// inside a validated response to the original exchange request.
+pub const EXCHANGE_ROUTE_FAILURE_STOP: FailureFact =
+    FailureFact::stop_observation(novarocks_execution_contract::failure::FailureReason::new(
+        novarocks_execution_contract::failure::domain::EXCHANGE,
+        std::num::NonZeroU16::new(466).unwrap(),
+    ));
+
 #[derive(Clone, Debug)]
 pub struct ExchangeUnitFrame {
     pub destination: RuntimeEndpoint,

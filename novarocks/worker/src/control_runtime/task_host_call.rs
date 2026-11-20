@@ -886,8 +886,19 @@ impl TaskHostCallJob {
             Ok(()) => {
                 let port = ManuallyDrop::into_inner(port);
                 let result = catch_unwind(AssertUnwindSafe(|| match self.owner.0.kind {
-                    TaskHostCallKind::Stop => port.notify_stopped(),
-                    TaskHostCallKind::RetireBorrowing => port.retire_execution_port(),
+                    TaskHostCallKind::Stop => {
+                        port.notify_stopped();
+                        TaskHostCallOutcome::Completed
+                    }
+                    TaskHostCallKind::RetireBorrowing => {
+                        // Checked receiver retirement fences and drains admitted
+                        // deliveries. They can still report through this port.
+                        let cleanup = self.run_retirement_capture();
+                        if matches!(cleanup, TaskHostCallOutcome::Completed) {
+                            port.retire_execution_port();
+                        }
+                        cleanup
+                    }
                 }));
                 match result {
                     Err(payload) => {
@@ -902,8 +913,7 @@ impl TaskHostCallJob {
                         state.panic = Some(ManuallyDrop::new(payload));
                         (TaskHostCallOutcome::Panicked, false)
                     }
-                    Ok(()) => {
-                        let cleanup = self.run_retirement_capture();
+                    Ok(cleanup) => {
                         if matches!(cleanup, TaskHostCallOutcome::CleanupUnresolved) {
                             self.owner
                                 .0
