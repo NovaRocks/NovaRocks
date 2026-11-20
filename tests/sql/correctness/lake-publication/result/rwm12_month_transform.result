@@ -1,0 +1,6 @@
+-- query 4
+-- types	bigint	bigint	date
+id	value	part
+1	10	2024-01-01
+2	21	2024-01-02
+3	30	2024-01-03
