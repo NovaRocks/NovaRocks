@@ -1,0 +1,166 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+use crate::fixtures::expression_sources;
+use arrow::datatypes::{DataType, Field};
+use novarocks_expression_contract::{BinaryOperator, ExprKind, ExprNode, UnaryOperator};
+use novarocks_sql::{
+    analyze_error::AnalyzeErrorKind,
+    compiler::{
+        SqlAuthoredPhysicalPlan, SqlCompileControl, SqlCompileError, SqlCompileProgressError,
+    },
+};
+use novarocks_sql_testkit::{sql_source_with_single_field, try_sql_source_with_declared_fields};
+use novarocks_type_contract::{CompileCheckpoints, CompilePhase};
+
+fn boolean_constant(plan: &SqlAuthoredPhysicalPlan, node: &ExprNode) -> Option<bool> {
+    let ExprKind::Constant(reference) = node.kind else {
+        panic!("expected a Boolean constant: {node:?}");
+    };
+    let control = SqlCompileControl::unbounded();
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
+    let value = plan
+        .plan()
+        .constants()
+        .resolve_observed(reference, &node.ty, &mut work)
+        .unwrap();
+    work.finish().unwrap();
+    value.try_boolean().unwrap()
+}
+
+#[test]
+fn truth_tests_expand_to_existing_nonnullable_boolean_primitives() {
+    for (test, truth, negated) in [
+        ("IS TRUE", Some(true), false),
+        ("IS NOT TRUE", Some(true), true),
+        ("IS FALSE", Some(false), false),
+        ("IS NOT FALSE", Some(false), true),
+        ("IS UNKNOWN", None, false),
+        ("IS NOT UNKNOWN", None, true),
+    ] {
+        for input in ["k", "NULL"] {
+            let sql = format!("SELECT {input} {test} AS tested FROM fixture");
+            let plan = sql_source_with_single_field(&sql, Field::new("k", DataType::Boolean, true));
+            let [result] = plan.plan().result_port().unwrap().fields.as_ref() else {
+                panic!("expected one result: {sql}");
+            };
+            assert_eq!(result.ty.data_type(), &DataType::Boolean, "{sql}");
+            assert!(!result.ty.nullable(), "{sql}");
+            assert!(
+                !expression_sources(&plan)
+                    .any(|(_, _, node)| matches!(node.kind, ExprKind::IsTruthValue { .. })),
+                "{sql}"
+            );
+
+            let (unit, root) = plan
+                .plan()
+                .fragments()
+                .values()
+                .flat_map(|fragment| fragment.nodes().values())
+                .filter_map(|node| node.expressions.as_deref())
+                .flat_map(|unit| unit.roots().iter().map(move |root| (unit, root)))
+                .map(|(unit, root)| (unit, unit.definition(root.definition).unwrap()))
+                .find(|(_, node)| {
+                    matches!(
+                        node.kind,
+                        ExprKind::Binary {
+                            op: BinaryOperator::EqForNull,
+                            ..
+                        } | ExprKind::Unary {
+                            op: UnaryOperator::Not,
+                            ..
+                        } | ExprKind::IsNull { .. }
+                    )
+                })
+                .unwrap_or_else(|| panic!("missing expanded predicate: {sql}"));
+            assert!(!root.ty.nullable(), "{sql}");
+
+            // The expanded predicate has exactly one edge to the operand.
+            let operand = if let Some(expected) = truth {
+                let comparison = if negated {
+                    let ExprKind::Unary {
+                        op: UnaryOperator::Not,
+                        expr,
+                    } = root.kind
+                    else {
+                        panic!("expected NOT: {sql}");
+                    };
+                    unit.definition(expr).unwrap()
+                } else {
+                    root
+                };
+                let ExprKind::Binary {
+                    op: BinaryOperator::EqForNull,
+                    left,
+                    right,
+                    ..
+                } = comparison.kind
+                else {
+                    panic!("expected null-safe equality: {sql}");
+                };
+                assert!(!comparison.ty.nullable(), "{sql}");
+                assert_ne!(left, right, "{sql}");
+                assert_eq!(
+                    boolean_constant(&plan, unit.definition(right).unwrap()),
+                    Some(expected)
+                );
+                left
+            } else {
+                let ExprKind::IsNull {
+                    expr,
+                    negated: actual,
+                } = root.kind
+                else {
+                    panic!("expected a NULL test: {sql}");
+                };
+                assert_eq!(actual, negated, "{sql}");
+                expr
+            };
+
+            let operand = unit.definition(operand).unwrap();
+            assert_eq!(operand.ty.data_type(), &DataType::Boolean, "{sql}");
+            assert!(operand.ty.nullable(), "{sql}");
+            if input == "NULL" {
+                assert_eq!(boolean_constant(&plan, operand), None, "{sql}");
+            } else {
+                assert!(matches!(operand.kind, ExprKind::Value(_)), "{sql}");
+            }
+        }
+    }
+}
+
+#[test]
+fn truth_tests_reject_non_boolean_operands_during_analysis() {
+    for (test, data_type) in [
+        ("IS TRUE", DataType::Int32),
+        ("IS NOT UNKNOWN", DataType::Utf8),
+    ] {
+        let failure = try_sql_source_with_declared_fields(
+            &format!("SELECT k {test} AS tested FROM fixture"),
+            &[Field::new("k", data_type, false)],
+        )
+        .unwrap_err();
+        let SqlCompileProgressError::Compile(SqlCompileError::Analyze(error)) = failure else {
+            panic!("expected analysis type error: {failure:?}");
+        };
+        assert_eq!(error.kind(), AnalyzeErrorKind::TypeMismatch);
+        assert_eq!(
+            error.code(),
+            AnalyzeErrorKind::TypeMismatch.descriptor().code
+        );
+        assert!(error.span().is_some());
+    }
+}

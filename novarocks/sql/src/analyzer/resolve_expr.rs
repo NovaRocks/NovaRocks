@@ -66,9 +66,6 @@ fn scalar_function_is_unknown(
 
 pub(crate) fn unsupported_predicate_reason(node: &ast::PredicatedExpr) -> Option<&'static str> {
     match &node.predicate {
-        ast::Predicate::BooleanTest(p) if p.truth_value == ast::TruthValue::Unknown => {
-            Some("IS UNKNOWN predicates are not supported")
-        }
         ast::Predicate::Between(p) if p.symmetry.is_some() => {
             Some("explicit BETWEEN symmetry is not supported")
         }
@@ -1257,18 +1254,59 @@ impl<'a> super::AnalyzerContext<'a> {
                 })
             }
             ast::Predicate::BooleanTest(predicate) => {
+                use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
+
                 let inner = self.analyze_expr(value, scope)?;
-                Ok(TypedExpr {
-                    kind: ExprKind::IsTruthValue {
+                let inner = if is_strict_null_value_type(&inner.value_type) {
+                    self.cast_to_value_type(
+                        inner,
+                        FunctionValueType::new(DataType::Boolean, true),
+                        value.span(),
+                    )?
+                } else if inner.value_type.logical_type() == ValueLogicalType::Physical
+                    && inner.value_type.data_type() == &DataType::Boolean
+                {
+                    inner
+                } else {
+                    return Err(AnalyzeError::type_mismatch(
+                        "Boolean test operand must be BOOLEAN",
+                        value.span(),
+                    ));
+                };
+                let value_type = FunctionValueType::new(DataType::Boolean, false);
+                let kind = match predicate.truth_value {
+                    ast::TruthValue::Unknown => ExprKind::IsNull {
                         expr: novarocks_parser::ast::AstBox::new(inner),
-                        value: predicate.truth_value == ast::TruthValue::True,
                         negated: predicate.negated,
                     },
-                    value_type: novarocks_type_contract::FunctionValueType::new(
-                        DataType::Boolean,
-                        false,
-                    ),
-                })
+                    ast::TruthValue::True | ast::TruthValue::False => {
+                        let literal = TypedExpr {
+                            kind: ExprKind::Literal(LiteralValue::Bool(
+                                predicate.truth_value == ast::TruthValue::True,
+                            )),
+                            value_type: value_type.clone(),
+                        };
+                        let equal = ExprKind::BinaryOp {
+                            left: novarocks_parser::ast::AstBox::new(inner),
+                            op: BinOp::EqForNull,
+                            right: novarocks_parser::ast::AstBox::new(literal),
+                            decimal_overflow_policy:
+                                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                        };
+                        if predicate.negated {
+                            ExprKind::UnaryOp {
+                                op: UnOp::Not,
+                                expr: novarocks_parser::ast::AstBox::new(TypedExpr {
+                                    kind: equal,
+                                    value_type: value_type.clone(),
+                                }),
+                            }
+                        } else {
+                            equal
+                        }
+                    }
+                };
+                Ok(TypedExpr { kind, value_type })
             }
             ast::Predicate::Between(predicate) => {
                 self.analyze_between_predicate(value, predicate, span, scope)

@@ -22,5 +22,6 @@ mod fixtures;
 mod fold_observation;
 mod implementation_availability;
 mod numeric_negation;
+mod truth_test_analysis;
 
 mod installed_domains;
