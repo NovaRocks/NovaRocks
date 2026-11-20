@@ -19,13 +19,14 @@
 
 use arrow_array::builder::Float64Builder;
 use arrow_array::{
-    Array, ArrayRef, Decimal32Array, Decimal64Array, Decimal256Array, Float16Array, ListArray,
-    UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    Array, ArrayRef, BooleanArray, Decimal32Array, Decimal64Array, Decimal256Array, Float16Array,
+    ListArray, StringArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow_schema::DataType;
 use std::ops::Range;
 use std::sync::Arc;
 
+use super::round_cast_float_text::parse_f64;
 use crate::decimal_float_cast::decimal256_unscaled_to_f64;
 use crate::kernel_control::invalid;
 use crate::kernel_input::EvaluationCheckpoints;
@@ -62,6 +63,8 @@ impl Operation {
 }
 
 enum Elements<'a> {
+    Boolean(&'a BooleanArray),
+    Utf8(&'a StringArray),
     Numeric(NumericArrayView<'a>),
     UInt8(&'a UInt8Array),
     UInt16(&'a UInt16Array),
@@ -84,6 +87,8 @@ impl<'a> Elements<'a> {
         }
 
         Ok(match values.data_type() {
+            DataType::Boolean => Self::Boolean(as_array(values)?),
+            DataType::Utf8 => Self::Utf8(as_array(values)?),
             DataType::UInt8 => Self::UInt8(as_array(values)?),
             DataType::UInt16 => Self::UInt16(as_array(values)?),
             DataType::UInt32 => Self::UInt32(as_array(values)?),
@@ -114,8 +119,15 @@ impl<'a> Elements<'a> {
     }
 
     /// Callers checked the selected offsets and their reachable NULLs first.
-    fn value(&self, row: usize) -> Result<f64, KernelFailure> {
+    fn value(
+        &self,
+        row: usize,
+        work: &mut EvaluationCheckpoints<'_>,
+    ) -> Result<f64, KernelFailure> {
         Ok(match self {
+            Self::Boolean(values) => f64::from(u8::from(values.value(row))),
+            Self::Utf8(values) => parse_f64(values.value(row), work)?
+                .ok_or_else(|| invalid("vector text reader lost a valid numeric child"))?,
             Self::Numeric(values) => values
                 .value_f64(row)
                 .ok_or_else(|| invalid("vector numeric reader lost a non-null child"))?,
@@ -167,6 +179,18 @@ impl<'a> Vector<'a> {
             return Ok(Some(RowFailure::NonNumeric(side)));
         }
         if range.is_empty() {
+            return Ok(None);
+        }
+        if let Elements::Utf8(values) = &self.elements {
+            // Failed safe casts made the original vector NULL on this side.
+            // Check each side before checking dimensions. Reading again
+            // during arithmetic keeps only borrowed element backing.
+            for row in range {
+                work.step()?;
+                if values.is_null(row) || parse_f64(values.value(row), work)?.is_none() {
+                    return Ok(Some(RowFailure::Null(side)));
+                }
+            }
             return Ok(None);
         }
         let values = self.list.values();
@@ -246,8 +270,8 @@ fn evaluate_row(
     let mut target_norm = 0.0;
     for (left, right) in left.zip(right) {
         work.step()?;
-        let left = base.elements.value(left)?;
-        let right = target.elements.value(right)?;
+        let left = base.elements.value(left, work)?;
+        let right = target.elements.value(right, work)?;
         match operation {
             Operation::SquaredL2 => {
                 let diff = left - right;

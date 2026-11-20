@@ -16,7 +16,10 @@
 // under the License.
 
 use super::scalar_rows::{Control, prepare};
-use arrow_array::{Array, ArrayRef, Decimal128Array, Float64Array, ListArray, UInt32Array};
+use arrow_array::{
+    Array, ArrayRef, BooleanArray, Decimal128Array, Float64Array, ListArray, StringArray,
+    UInt32Array,
+};
 use arrow_buffer::{NullBuffer, OffsetBuffer};
 use arrow_schema::Field;
 use novarocks_functions::{EvaluatedArgument, FunctionArgument, RowDataError, Selection};
@@ -211,5 +214,35 @@ fn vector_reads_unsigned_and_scaled_decimal_children() {
         (decimal(vec![30i128, 40i128]), decimal(vec![0i128, 0i128])),
     ] {
         assert_values(pair("l2_distance", &base, &zero), &[Some(25.0)]);
+    }
+}
+
+#[test]
+fn vector_children_preserve_legacy_boolean_and_observed_text_conversion() {
+    let boolean = |values| list(Arc::new(BooleanArray::from(values)), vec![0, 2], None);
+    let base = boolean(vec![true, false]);
+    let zero = boolean(vec![false, false]);
+    assert_values(pair("l2_distance", &base, &zero), &[Some(1.0)]);
+
+    let text = |left, right| {
+        list(
+            Arc::new(StringArray::from(vec![left, right])),
+            vec![0, 2],
+            None,
+        )
+    };
+    let base = text("3", "4");
+    let zero = text("0", "0");
+    assert_values(pair("l2_distance", &base, &zero), &[Some(25.0)]);
+
+    let invalid = text("bad", "4");
+    for (left, right, message) in [
+        (&invalid, &zero, "base array has null value"),
+        (&zero, &invalid, "target array has null value"),
+    ] {
+        let (values, errors) = pair("l2_distance", left, right);
+        assert_eq!(values, [None]);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].message().contains(message), "{errors:?}");
     }
 }
