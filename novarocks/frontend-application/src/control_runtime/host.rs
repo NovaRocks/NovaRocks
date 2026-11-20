@@ -21,7 +21,7 @@
 //! executes an effect body, and never counts transport quota outside the ledger.
 
 #[cfg(test)]
-mod purpose_tests;
+pub(super) mod purpose_tests;
 
 use super::{
     actor::{FrontendActor, FrontendActorKind, FrontendEffect, FrontendLaneKey},
@@ -1487,11 +1487,13 @@ impl HostRegistry {
                 // original dependency/stop predicate currently blocks it.
                 *remaining -= 1;
                 budget -= 1;
-                let candidate = match machine.dispatch.peek_candidate_with_withdrawal(
+                let candidate = match machine.dispatch.peek_candidate_with_stop_observation(
                     &self.runtime,
                     turn,
-                    |metadata| match metadata {
-                        FrontendEffect::Attempt(effect) => effect.handoff().cloned(),
+                    |metadata, stopped_business| match metadata {
+                        FrontendEffect::Attempt(effect) => {
+                            effect.handoff_for_dispatch(stopped_business)
+                        }
                         _ => None,
                     },
                 ) {
