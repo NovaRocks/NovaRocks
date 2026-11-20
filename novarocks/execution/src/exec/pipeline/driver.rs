@@ -2501,9 +2501,6 @@ mod tests {
         }
     }
 
-    /// An asynchronous source can stop being pending between the driver's
-    /// first check and its terminal-state check. That transition cannot
-    /// complete the driver while the exchange sink still owes its EOS.
     #[test]
     fn actual_iceberg_dictionary_values_reuse_the_driver_conversion() {
         use arrow::array::{Array, ArrayRef, DictionaryArray, StringViewArray};
@@ -2518,7 +2515,11 @@ mod tests {
 
         use crate::connector::SourcePageConverter;
         use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
-        use crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory;
+        use crate::exec::pipeline::operator::{
+            hydrate_for_downstream_with_factory,
+            input_construction::try_runtime_input_construction_factory,
+        };
+        use crate::runtime::task::ExecutionFailure;
 
         struct PlainReceiver;
         impl InputEncodingPolicy for PlainReceiver {}
@@ -2610,6 +2611,9 @@ mod tests {
         io.block_on(stream.close()).unwrap();
     }
 
+    /// An asynchronous source can stop being pending between the driver's
+    /// first check and its terminal-state check. That transition cannot
+    /// complete the driver while the exchange sink still owes its EOS.
     #[test]
     fn clearing_pending_finish_does_not_skip_the_terminal_sink() {
         let checks = Arc::new(AtomicUsize::new(0));
