@@ -31,6 +31,7 @@ fn product_primary_survives_two_cleanup_errors_after_real_cell_exit() {
         poll_unproven: false,
         original: MaintenanceActionState::default(),
         io: Some(Arc::clone(&source)),
+        metadata_cpu: None,
     };
     call.project_saved_cleanup(source.cleanup_failure());
     let projected = call.result.as_ref().unwrap().as_ref().unwrap_err();
@@ -57,6 +58,7 @@ fn successful_product_keeps_success_and_the_original_cleanup_receipt() {
         poll_unproven: false,
         original: MaintenanceActionState::default(),
         io: Some(Arc::clone(&source)),
+        metadata_cpu: None,
     };
     call.project_saved_cleanup(source.cleanup_failure());
     let disposition = call.publication_disposition();
@@ -86,6 +88,7 @@ fn actual_product_finalization_failure_keeps_its_original_classification() {
         poll_unproven: false,
         original: MaintenanceActionState::default(),
         io: Some(Arc::clone(&source)),
+        metadata_cpu: None,
     };
     call.project_saved_cleanup(source.cleanup_failure());
     let error = call.result.as_ref().unwrap().as_ref().unwrap_err();

@@ -706,3 +706,440 @@ fn expire_conflict_reloads_policy_without_accumulating_old_candidates_or_changin
     );
     assert_eq!(loaded.metadata().snapshots().len(), 2);
 }
+
+fn explicit_expiry_request(
+    key: &ConnectorProviderBindingKey,
+    clean_expired_metadata: bool,
+) -> ConnectorMetadataMaintenancePlanningRequest {
+    use novarocks_spi::connector::{
+        ConnectorExpireSnapshotsExecute, ConnectorMaintenanceDuration,
+        ConnectorMaintenanceRetention,
+    };
+    let legacy = local_planning_request(key, true);
+    ConnectorMetadataMaintenancePlanningRequest::try_new(
+        legacy.operation_id(),
+        key.clone(),
+        ConnectorMetadataMaintenanceOperation::expire_snapshots(
+            legacy.operation().table().clone(),
+            i64::MAX,
+            None,
+            ConnectorExpireSnapshotsExecute {
+                retention: ConnectorMaintenanceRetention {
+                    requested: ConnectorMaintenanceDuration::parse("7d").unwrap(),
+                    session_minimum: None,
+                },
+                clean_expired_metadata,
+            },
+        )
+        .unwrap(),
+        context(),
+    )
+    .unwrap()
+}
+
+async fn publish_expiry_fixture_updates(
+    catalog: &IcebergMetadataMaintenanceAdapter,
+    ident: &crate::iceberg::TableIdent,
+    updates: Vec<crate::iceberg::TableUpdate>,
+) {
+    let table =
+        crate::catalog::admission_test_support::load_static_fixture_table(&catalog.runtime, ident)
+            .await;
+    let operation = OperationToken::from_mutation(ConnectorMutationOperationId::new());
+    let preparation = context();
+    let frozen = crate::commit::staging::freeze_existing_change(
+        ident.clone(),
+        "main",
+        table.metadata(),
+        table.metadata_location().unwrap(),
+        RequestShape::MetadataOnly,
+        AttemptToken::new(operation, 0),
+        PreparedChange {
+            requirements: vec![],
+            updates,
+        },
+        &preparation,
+    )
+    .unwrap();
+    let outcome = crate::catalog::admission_test_support::publish_frozen(
+        Arc::clone(catalog.runtime.novarocks_catalog()),
+        catalog.descriptor.clone(),
+        catalog.key.incarnation,
+        frozen,
+        CatalogOperation::AlterSchema,
+        preparation,
+        None,
+    )
+    .await;
+    assert!(
+        matches!(
+            outcome,
+            crate::catalog::error::CatalogOutcome::KnownCommitted { .. }
+        ),
+        "{outcome:?}"
+    );
+}
+
+async fn seed_expiry_dictionaries(
+    catalog: &IcebergMetadataMaintenanceAdapter,
+    ident: &crate::iceberg::TableIdent,
+) {
+    use crate::iceberg::TableUpdate;
+    use crate::iceberg::spec::{
+        NestedField, PrimitiveType, Schema, Transform, Type, UnboundPartitionSpec,
+    };
+    for (id, buckets) in [(1, 4), (2, 8)] {
+        let schema = Schema::builder()
+            .with_schema_id(id)
+            .with_fields(vec![
+                Arc::new(NestedField::required(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Long),
+                )),
+                Arc::new(NestedField::optional(
+                    2,
+                    format!("extra_{id}"),
+                    Type::Primitive(PrimitiveType::Long),
+                )),
+            ])
+            .build()
+            .unwrap();
+        let spec = UnboundPartitionSpec::builder()
+            .add_partition_field(1, format!("id_bucket_{id}"), Transform::Bucket(buckets))
+            .unwrap()
+            .build();
+        publish_expiry_fixture_updates(
+            catalog,
+            ident,
+            vec![
+                TableUpdate::AddSchema { schema },
+                TableUpdate::SetCurrentSchema { schema_id: -1 },
+                TableUpdate::AddSpec { spec },
+                TableUpdate::SetDefaultSpec { spec_id: -1 },
+                TableUpdate::SetProperties {
+                    updates: HashMap::from([(
+                        "history.expire.min-snapshots-to-keep".into(),
+                        "2".into(),
+                    )]),
+                },
+            ],
+        )
+        .await;
+    }
+}
+
+fn expiry_manifest_cpu(adapter: &IcebergMetadataMaintenanceAdapter) -> Arc<ObservationCpu> {
+    let (release, footer) = tokio::sync::oneshot::channel();
+    release.send(()).unwrap();
+    Arc::new(ObservationCpu {
+        descriptor: adapter.descriptor.clone(),
+        epoch: adapter.key.incarnation,
+        calls: std::sync::atomic::AtomicUsize::new(0),
+        first_receipt: Mutex::new(None),
+        footer: Mutex::new(footer),
+        closed: std::sync::atomic::AtomicBool::new(false),
+    })
+}
+
+#[test]
+fn clean_expired_metadata_replans_dictionary_only_commit_on_confirmed_conflict() {
+    use crate::iceberg::{TableRequirement, TableUpdate};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (executor, _warehouse, base, key) = adapter();
+    let table = create_local_table(&executor, &base);
+    append_local_file(&executor, &base, table.identifier(), "retained");
+    executor.block_on(seed_expiry_dictionaries(&base, table.identifier()));
+    let before = executor.block_on(
+        crate::catalog::admission_test_support::load_static_fixture_table(
+            &base.runtime,
+            table.identifier(),
+        ),
+    );
+    let head = before.metadata().current_snapshot_id();
+    assert_eq!(before.metadata().schemas_iter().len(), 3);
+    assert_eq!(before.metadata().partition_specs_iter().len(), 3);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = calls.clone();
+    let competitor = competing_adapter(&base);
+    let runtime = base.runtime.resources().catalog_runtime().clone();
+    let ident = table.identifier().clone();
+    let actual = recorded_adapter(
+        &base,
+        Arc::new(move |requirements, updates| {
+            let ordinal = count.fetch_add(1, Ordering::SeqCst);
+            let (current, removals) = match ordinal {
+                0 => (2, vec![1]),
+                1 => (1, vec![2]),
+                _ => panic!("unexpected expiry dispatch"),
+            };
+            assert!(
+                requirements.contains(&TableRequirement::CurrentSchemaIdMatch {
+                    current_schema_id: current
+                })
+            );
+            assert!(
+                requirements.contains(&TableRequirement::DefaultSpecIdMatch {
+                    default_spec_id: current
+                })
+            );
+            assert!(
+                requirements.contains(&TableRequirement::RefSnapshotIdMatch {
+                    r#ref: "main".to_owned(),
+                    snapshot_id: head
+                })
+            );
+            assert!(matches!(updates, [
+            TableUpdate::RemovePartitionSpecs { spec_ids },
+            TableUpdate::RemoveSchemas { schema_ids },
+            TableUpdate::SetProperties { updates: marker },
+        ] if spec_ids == &removals && schema_ids == &removals && marker.contains_key(MARKER_PROPERTY)));
+            if ordinal == 0 {
+                let competitor = competitor.clone();
+                let ident = ident.clone();
+                runtime
+                    .block_on(async move {
+                        publish_expiry_fixture_updates(
+                            &competitor,
+                            &ident,
+                            vec![
+                                TableUpdate::SetCurrentSchema { schema_id: 1 },
+                                TableUpdate::SetDefaultSpec { spec_id: 1 },
+                                TableUpdate::SetProperties {
+                                    updates: HashMap::from([(
+                                        "history.expire.min-snapshots-to-keep".into(),
+                                        "9".into(),
+                                    )]),
+                                },
+                            ],
+                        )
+                        .await;
+                    })
+                    .unwrap();
+            }
+        }),
+    );
+    let cpu = expiry_manifest_cpu(&actual);
+    let lease = real_maintenance_lease(actual);
+    let plan = executor
+        .block_on(lease.plan_maintenance(explicit_expiry_request(&key, true)))
+        .unwrap();
+    let payload: IcebergMetadataMaintenancePlanPayloadV1 =
+        decode_canonical_json(plan.provider_payload(), "explicit expiry plan").unwrap();
+    assert_eq!(payload.version, 3);
+    assert_eq!(payload.retain_last, Some(2));
+    let outcome = executor
+        .block_on(
+            lease.execute(
+                ConnectorMetadataMaintenanceExecuteRequest::try_new(
+                    plan,
+                    context().with_metadata_cpu(cpu.clone()),
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+    let ExternalMutationOutcome::KnownCommitted {
+        effect: ExternalMutationEffect::Applied,
+        receipt,
+        cleanup: ExternalMutationFinalization::Complete,
+        ..
+    } = outcome
+    else {
+        panic!("dictionary-only expiration must commit once")
+    };
+    assert_eq!(receipt.summary().affected_versions, 0);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(cpu.calls.load(Ordering::SeqCst), 2);
+    let after = executor.block_on(
+        crate::catalog::admission_test_support::load_static_fixture_table(
+            &base.runtime,
+            table.identifier(),
+        ),
+    );
+    assert_eq!(after.metadata().current_snapshot_id(), head);
+    assert_ne!(after.metadata_location(), before.metadata_location());
+    for id in [0, 1] {
+        assert!(after.metadata().schema_by_id(id).is_some());
+        assert!(after.metadata().partition_spec_by_id(id).is_some());
+    }
+    assert!(after.metadata().schema_by_id(2).is_none());
+    assert!(after.metadata().partition_spec_by_id(2).is_none());
+    assert_eq!(
+        after.metadata().properties()["history.expire.min-snapshots-to-keep"],
+        "9"
+    );
+}
+
+#[test]
+fn dictionary_only_expiration_unknown_requires_the_original_marker() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (executor, _warehouse, base, key) = adapter();
+    let table = create_local_table(&executor, &base);
+    append_local_file(&executor, &base, table.identifier(), "retained");
+    executor.block_on(seed_expiry_dictionaries(&base, table.identifier()));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counted = calls.clone();
+    let owner = crate::catalog::admission_test_support::all_admitted_recording_with_lost_reply(
+        Arc::clone(base.runtime.novarocks_catalog()),
+        Arc::new(move |_, _| {
+            counted.fetch_add(1, Ordering::SeqCst);
+        }),
+    );
+    let runtime = IcebergMetadataContext::with_catalog_for_test(
+        base.runtime.control_state().clone(),
+        base.runtime.resources().clone(),
+        owner,
+    );
+    let actual = IcebergMetadataMaintenanceAdapter::new(key.clone(), Arc::new(runtime)).unwrap();
+    let cpu = expiry_manifest_cpu(&actual);
+    let lease = real_maintenance_lease(actual);
+    let plan = executor
+        .block_on(lease.plan_maintenance(explicit_expiry_request(&key, true)))
+        .unwrap();
+    let request = || {
+        ConnectorMetadataMaintenanceExecuteRequest::try_new(
+            plan.clone(),
+            context().with_metadata_cpu(cpu.clone()),
+        )
+        .unwrap()
+    };
+    let ExternalMutationOutcome::CommitUnknown { evidence, failure } =
+        executor.block_on(lease.execute(request())).unwrap()
+    else {
+        panic!("a lost reply preserves the original dictionary-only Unknown")
+    };
+    assert!(
+        failure
+            .connector_source()
+            .unwrap()
+            .public_failure_detail()
+            .unwrap()
+            .starts_with("Failed to commit during expire_snapshots: [CommitUnknown]",)
+    );
+    let (journal, entry) = PublicationJournal::<MaintenancePublication>::from_evidence(&evidence)
+        .unwrap()
+        .unwrap();
+    let descriptor = journal.entry_descriptor(entry).unwrap();
+    let after = executor.block_on(
+        crate::catalog::admission_test_support::load_static_fixture_table(
+            &base.runtime,
+            table.identifier(),
+        ),
+    );
+    let mut raw = serde_json::to_value(after.metadata()).unwrap();
+    assert!(after.metadata().schema_by_id(1).is_none());
+    assert!(after.metadata().partition_spec_by_id(1).is_none());
+    raw["properties"]
+        .as_object_mut()
+        .unwrap()
+        .remove(MARKER_PROPERTY)
+        .unwrap();
+    let without_marker = serde_json::from_value(raw).unwrap();
+    assert!(
+        descriptor
+            .attribution
+            .observe_table_metadata(&without_marker)
+            .is_none()
+    );
+    let outcome = executor.block_on(lease.execute(request())).unwrap();
+    assert!(matches!(
+        outcome,
+        ExternalMutationOutcome::KnownCommitted {
+            effect: ExternalMutationEffect::Applied,
+            ..
+        }
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(cpu.calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn explicit_expiry_with_an_admitted_retention_still_respects_disabled_gc() {
+    let (executor, _warehouse, base, key) = adapter();
+    let table = create_local_table(&executor, &base);
+    foreign_properties(
+        base.runtime.resources().catalog_runtime().clone(),
+        competing_adapter(&base),
+        table.identifier().clone(),
+        HashMap::from([("gc.enabled".into(), "false".into())]),
+    );
+    let request = explicit_expiry_request(&key, false);
+    let plan = executor.block_on(base.plan_maintenance(request)).unwrap();
+    let execution = ConnectorMetadataMaintenanceExecuteRequest::try_new(plan, context()).unwrap();
+    let ExternalMutationOutcome::KnownUncommitted { failure, .. } =
+        executor.block_on(base.execute(execution)).unwrap()
+    else {
+        panic!("an allowed duration does not bypass GC admission")
+    };
+    assert_eq!(failure.kind(), ConnectorMutationFailureKind::Unsupported);
+    assert!(failure.message().contains("gc.enabled is false"));
+}
+
+#[test]
+fn explicit_expiry_freezes_default_keep_count_when_retry_observes_a_new_table_property() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (executor, _warehouse, base, key) = adapter();
+    let table = create_local_table(&executor, &base);
+    for name in ["old", "head"] {
+        append_local_file(&executor, &base, table.identifier(), name);
+    }
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = calls.clone();
+    let competing = competing_adapter(&base);
+    let runtime = base.runtime.resources().catalog_runtime().clone();
+    let ident = table.identifier().clone();
+    let actual = recorded_adapter(
+        &base,
+        Arc::new(move |_, updates| {
+            assert!(updates.iter().any(|update| matches!(update,
+            crate::iceberg::TableUpdate::RemoveSnapshots { snapshot_ids } if snapshot_ids.len() == 1
+        )));
+            if observed.fetch_add(1, Ordering::SeqCst) == 0 {
+                foreign_properties(
+                    runtime.clone(),
+                    competing.clone(),
+                    ident.clone(),
+                    HashMap::from([("history.expire.min-snapshots-to-keep".into(), "3".into())]),
+                );
+            }
+        }),
+    );
+    let lease = real_maintenance_lease(actual);
+    let plan = executor
+        .block_on(lease.plan_maintenance(explicit_expiry_request(&key, false)))
+        .unwrap();
+    let payload: IcebergMetadataMaintenancePlanPayloadV1 = decode_canonical_json(
+        plan.provider_payload(),
+        "explicit expiry plan default count",
+    )
+    .unwrap();
+    assert_eq!(payload.retain_last, Some(1));
+    let outcome =
+        executor
+            .block_on(lease.execute(
+                ConnectorMetadataMaintenanceExecuteRequest::try_new(plan, context()).unwrap(),
+            ))
+            .unwrap();
+    let ExternalMutationOutcome::KnownCommitted {
+        effect: ExternalMutationEffect::Applied,
+        receipt,
+        ..
+    } = outcome
+    else {
+        panic!("expired ancestor must be removed using the frozen count")
+    };
+    assert_eq!(receipt.summary().affected_versions, 1);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    let after = executor.block_on(
+        crate::catalog::admission_test_support::load_static_fixture_table(
+            &base.runtime,
+            table.identifier(),
+        ),
+    );
+    assert_eq!(after.metadata().snapshots().len(), 1);
+    assert_eq!(
+        after.metadata().properties()["history.expire.min-snapshots-to-keep"],
+        "3"
+    );
+}

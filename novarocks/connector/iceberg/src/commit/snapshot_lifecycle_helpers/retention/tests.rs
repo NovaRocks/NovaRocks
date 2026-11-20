@@ -224,3 +224,79 @@ fn branch_age_override_protects_ancestors_after_its_minimum_count_is_met() {
     assert_eq!(removed(&result), vec![1, 6]);
     assert_eq!(result.protected_snapshots, BTreeSet::from([2, 3, 4, 5]));
 }
+
+#[test]
+fn execute_keeps_branch_ancestry_out_of_global_fallback_after_prefix_stops() {
+    let metadata = graph(
+        HashMap::new(),
+        vec![
+            (
+                "main",
+                3,
+                SnapshotRetention::branch(Some(1), Some(7500), Some(1)),
+            ),
+            (
+                "stable_tag",
+                4,
+                SnapshotRetention::Tag {
+                    max_ref_age_ms: Some(9000),
+                },
+            ),
+            (
+                "expired_tag",
+                6,
+                SnapshotRetention::Tag {
+                    max_ref_age_ms: Some(3),
+                },
+            ),
+        ],
+    );
+    let plan = RetentionPlan::compute_execute(&metadata, 10000, 500, 1).unwrap();
+    assert_eq!(removed(&plan), vec![1, 2]);
+    assert_eq!(
+        plan.removed_refs,
+        BTreeSet::from(["expired_tag".to_owned()])
+    );
+    assert_eq!(plan.protected_snapshots, BTreeSet::from([3, 4, 5, 6]));
+}
+
+#[test]
+fn execute_branch_count_overrides_frozen_default() {
+    let metadata = graph(
+        HashMap::new(),
+        vec![
+            ("main", 4, branch()),
+            ("dev", 3, SnapshotRetention::branch(Some(3), Some(1), None)),
+        ],
+    );
+    let plan = RetentionPlan::compute_execute(&metadata, 10000, 9000, 1).unwrap();
+    assert_eq!(removed(&plan), vec![6]);
+    assert_eq!(plan.protected_snapshots, BTreeSet::from([1, 2, 3, 4, 5]));
+}
+
+#[test]
+fn execute_stops_at_first_expirable_ancestor_even_if_older_ancestor_timestamp_is_newer() {
+    let base = graph(
+        HashMap::new(),
+        vec![(
+            "main",
+            3,
+            SnapshotRetention::branch(Some(1), Some(7500), None),
+        )],
+    );
+    // Across external writers, ancestry sequence can remain valid even when
+    // clocks go backward between successive snapshots.
+    let mut raw = serde_json::to_value(base).unwrap();
+    let ancestor = raw["snapshots"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|item| item["snapshot-id"] == 1)
+        .unwrap();
+    ancestor["timestamp-ms"] = 2900.into();
+    let metadata = serde_json::from_value(raw).unwrap();
+    let explicit = RetentionPlan::compute_execute(&metadata, 10_000, 500, 1).unwrap();
+    assert_eq!(removed(&explicit), vec![1, 2]);
+    let legacy = RetentionPlan::compute(&metadata, 10_000, Some(500), Some(1)).unwrap();
+    assert_eq!(removed(&legacy), vec![2]);
+}

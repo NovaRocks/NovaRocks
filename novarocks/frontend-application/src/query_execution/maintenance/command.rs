@@ -213,9 +213,42 @@ impl MaintenanceCommandExecutor {
             provider_bytes,
         )
         .map_err(|e| format!("metadata source construction refused: {e:?}"))?;
-        let connector = connector_context.clone().with_io_admission(
+        let mut connector = connector_context.clone().with_io_admission(
             io.clone() as Arc<dyn novarocks_spi::connector::ConnectorIoAdmissionPort>
         );
+        let metadata_cpu = if let Some(retained) = &retained
+            && matches!(
+                retained.intent,
+                crate::connector::metadata_maintenance::MetadataMaintenanceIntent::TrinoExpireSnapshots {
+                    inputs: novarocks_spi::connector::ConnectorExpireSnapshotsExecute {
+                        clean_expired_metadata: true,
+                        ..
+                    },
+                    ..
+                }
+            )
+        {
+            let command_error = |error| {
+                crate::query::maintenance_command_error(TerminalError::from_original_cause(error))
+            };
+            let runtime = self.kernel.rewrite_runtime().map_err(command_error)?;
+            let wake = Arc::new(MetadataCpuWake::default());
+            // This authenticates the original control node. Submission still
+            // waits for the Call's actual I/O bootstrap on the same Root.
+            let port = runtime.execution.0.provider_creator_cpu().map_err(command_error)?
+                .planning_metadata_cpu_port(
+                    capacity.root_scope(),
+                    capacity.try_window_alias().map_err(command_error)?,
+                    &retained.planning,
+                    execution.cancellation().clone(),
+                    runtime.execution.0.runtime().clone(),
+                    wake.clone(),
+                ).map_err(command_error)?;
+            connector = connector.with_metadata_cpu(port.clone());
+            Some(MetadataCpu { port, wake, activated: false, close_failure: None })
+        } else {
+            None
+        };
         let mut engine = RequestScopedMaintenanceEngine::new(
             self.kernel.clone(),
             execution.clone(),
@@ -260,6 +293,7 @@ impl MaintenanceCommandExecutor {
             poll_unproven: false,
             original,
             io: Some(io),
+            metadata_cpu,
         })
     }
 
@@ -359,6 +393,43 @@ type MaintenanceStatementFuture = std::pin::Pin<
     >,
 >;
 
+#[derive(Default)]
+struct MetadataCpuWake(futures::task::AtomicWaker);
+
+impl std::fmt::Debug for MetadataCpuWake {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MetadataCpuWake")
+    }
+}
+
+impl crate::wake::StatusIntakeWake for MetadataCpuWake {
+    fn wake(&self) {
+        self.0.wake();
+    }
+}
+
+struct MetadataCpu {
+    port: Arc<dyn novarocks_spi::connector::ProviderMetadataCpuPort>,
+    wake: Arc<MetadataCpuWake>,
+    activated: bool,
+    close_failure: Option<novarocks_query_application::api::StatementNativeHealthFailure>,
+}
+
+impl MetadataCpu {
+    fn local_failure(
+        &self,
+    ) -> Option<novarocks_query_application::api::StatementNativeHealthFailure> {
+        self.close_failure.clone().or_else(|| {
+            self.port.local_failure().map(|cause| {
+            novarocks_query_application::api::StatementNativeHealthFailure::actual_exit_unproven(
+                "snapshot expiration metadata CPU exit is unproven",
+                cause,
+            )
+        })
+        })
+    }
+}
+
 /// Source-owned product future and its independent fixed row. Field order
 /// leaves the row alive if completed Product F Drop unwinds. It is not a grant.
 pub struct MaintenanceCommandCall {
@@ -369,6 +440,7 @@ pub struct MaintenanceCommandCall {
     poll_unproven: bool,
     original: MaintenanceActionState,
     io: Option<Arc<super::io_admission::MetadataIoAdmission>>,
+    metadata_cpu: Option<MetadataCpu>,
 }
 /// Only exact remaining object custody crosses the business completion cut.
 /// The Product F, origin/result window and execution context stay out of it.
@@ -455,7 +527,14 @@ impl MaintenanceCommandCall {
     pub fn local_health_failure(
         &self,
     ) -> Option<novarocks_query_application::api::StatementNativeHealthFailure> {
-        self.io.as_ref().and_then(|io| io.health_failure())
+        self.io
+            .as_ref()
+            .and_then(|io| io.health_failure())
+            .or_else(|| {
+                self.metadata_cpu
+                    .as_ref()
+                    .and_then(MetadataCpu::local_failure)
+            })
     }
 
     /// Only the original registered Source borrows its stable WorkOwner.
@@ -478,12 +557,24 @@ impl MaintenanceCommandCall {
                 ));
             }
         };
+        if let Some(cpu) = &self.metadata_cpu {
+            cpu.wake.0.register(cx.waker());
+        }
         match io.poll_progress(owner, cx) {
+            Err(_) if self.metadata_cpu.as_ref().is_some_and(|cpu| cpu.activated) => {
+                // Give the same Product and CPU phase their real exit even
+                // when ordinary I/O control has already failed.
+                let _ = io.poll_actual_progress_continuing(cx);
+            }
             Err(error) => return Poll::Ready(Err(io_terminal_error(error))),
             Ok(false) => return Poll::Pending,
-            Ok(true) => {}
+            Ok(true) => {
+                if let Some(cpu) = &mut self.metadata_cpu {
+                    cpu.activated = true;
+                }
+            }
         }
-        if io.health_failure().is_some() {
+        if self.local_health_failure().is_some() {
             // Only an actual panic/disposition failure is unproven. Ordinary
             // exited abort errors are received and projected below.
             return Poll::Pending;
@@ -495,6 +586,21 @@ impl MaintenanceCommandCall {
                     return Poll::Pending;
                 }
                 Poll::Ready(result) => self.result = Some(result),
+            }
+        }
+        if let Some(cpu) = &mut self.metadata_cpu {
+            match cpu.port.poll_closed(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(error)) => {
+                    cpu.close_failure = Some(
+                        novarocks_query_application::api::StatementNativeHealthFailure::actual_exit_unproven(
+                            "snapshot expiration metadata CPU close is unproven",
+                            Arc::new(error),
+                        ),
+                    );
+                    return Poll::Pending;
+                }
+                Poll::Ready(Ok(())) => {}
             }
         }
         // A Product result is not proof that its original response/stream or
@@ -651,6 +757,7 @@ mod original_producer_tests {
             poll_unproven: false,
             original: state,
             io: None,
+            metadata_cpu: None,
         };
         use futures::FutureExt;
         let mut wait = Box::pin(std::future::poll_fn(|cx| original.poll_product(cx)));
@@ -688,6 +795,7 @@ mod original_producer_tests {
             poll_unproven: false,
             original: MaintenanceActionState::default(),
             io: None,
+            metadata_cpu: None,
         };
         let waker = futures::task::noop_waker();
         let mut cx = Context::from_waker(&waker);

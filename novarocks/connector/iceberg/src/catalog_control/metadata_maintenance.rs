@@ -70,9 +70,13 @@ use crate::commit::snapshot_lifecycle_helpers::rewrite_manifests::{
 use crate::metadata::IcebergTablePayload;
 use crate::metadata_context::IcebergMetadataContext;
 
+#[path = "metadata_maintenance/expiry_metadata.rs"]
+pub(super) mod expiry_metadata;
+
 #[path = "metadata_maintenance/observation.rs"]
 pub(crate) mod observation;
 
+const PLAN_PAYLOAD_VERSION: u16 = 3;
 const PAYLOAD_VERSION: u16 = 2;
 const MARKER_VERSION: u16 = 2;
 const MARKER_PROPERTY: &str = "novarocks.connector.maintenance.v2";
@@ -254,16 +258,34 @@ impl MaintenanceEngine {
                         self.runtime.control_state().configuration().maintenance,
                     )?;
                 }
+                let retain_last = match (retain_last, sql_execute) {
+                    (None, Some(_)) => {
+                        let default =
+                            crate::iceberg::spec::TableProperties::new(metadata.properties())
+                                .min_snapshots_to_keep()
+                                .map_err(iceberg_error)?;
+                        let default = i32::try_from(default)
+                            .ok()
+                            .filter(|count| *count > 0)
+                            .ok_or_else(|| {
+                                invalid(
+                                    "Snapshot retention count must be positive and fit an integer",
+                                )
+                            })?;
+                        Some(default as u32)
+                    }
+                    (retain_last, _) => *retain_last,
+                };
                 (
                     *older_than_ms,
-                    *retain_last,
+                    retain_last,
                     sql_execute.is_some(),
                     sql_execute.is_some_and(|inputs| inputs.clean_expired_metadata),
                 )
             }
         };
         let payload = IcebergMetadataMaintenancePlanPayloadV1 {
-            version: PAYLOAD_VERSION,
+            version: PLAN_PAYLOAD_VERSION,
             namespace,
             table: table_name,
             table_uuid: metadata.uuid().to_string(),
@@ -580,29 +602,7 @@ impl MaintenanceEngine {
         .await;
         let outcome = public_outcome(journal.project(report));
         let outcome = if sql_execute {
-            match outcome {
-                ExternalMutationOutcome::KnownUncommitted { failure, cleanup } => {
-                    ExternalMutationOutcome::KnownUncommitted {
-                        failure: commit_failure(
-                            MaintenanceCommitProcedure::OptimizeManifests,
-                            CommitFailureDisposition::KnownUncommitted,
-                            failure,
-                        ),
-                        cleanup,
-                    }
-                }
-                ExternalMutationOutcome::CommitUnknown { failure, evidence } => {
-                    ExternalMutationOutcome::CommitUnknown {
-                        failure: commit_failure(
-                            MaintenanceCommitProcedure::OptimizeManifests,
-                            CommitFailureDisposition::Unknown,
-                            failure,
-                        ),
-                        evidence,
-                    }
-                }
-                committed => committed,
-            }
+            project_commit_failure(outcome, MaintenanceCommitProcedure::OptimizeManifests)
         } else {
             outcome
         };
@@ -647,22 +647,41 @@ impl MaintenanceEngine {
                         if metadata.uuid().to_string() != payload.table_uuid {
                             return Err(invalid("Iceberg expiration table UUID was replaced"));
                         }
-                        let decision = RetentionPlan::owned_decision_bytes(metadata).map_err(iceberg_error)?;
+                        let mut decision = RetentionPlan::owned_decision_bytes(metadata).map_err(iceberg_error)?;
+                        if payload.clean_expired_metadata {
+                            decision = decision.checked_add(expiry_metadata::dictionary_backing_bytes(&loaded.table)?)
+                                .ok_or_else(|| invalid("Retention dictionary backing overflow"))?;
+                        }
                         retained_decisions = retained_decisions.checked_add(decision).ok_or_else(||invalid("retention journal backing overflow"))?;
                         let initial = 2*(novarocks_spi::connector::MAX_CONNECTOR_METADATA_MAINTENANCE_PROVIDER_PAYLOAD_BYTES+novarocks_spi::connector::MAX_CONNECTOR_METADATA_MAINTENANCE_MARKER_BYTES) as u64;
                         let required = retained_decisions.checked_add(initial).and_then(std::num::NonZeroU64::new).ok_or_else(||invalid("retention journal backing overflow"))?;
                         // The source reserves old journal decisions plus the new
                         // decision before any owned retention clone is formed.
                         context.reserve_owned_metadata(required).await?;
-                        let retention = RetentionPlan::compute(
-                            metadata,
-                            payload.evaluation_time_ms,
-                            payload.older_than_ms,
-                            payload.retain_last,
-                        )
-                        .map_err(iceberg_error)?;
+                        let retention = if payload.sql_execute {
+                            let cutoff = payload.older_than_ms.ok_or_else(|| invalid("Explicit expiration has no frozen cutoff"))?;
+                            let keep = payload.retain_last.ok_or_else(|| invalid("Explicit expiration has no frozen retention count"))?;
+                            RetentionPlan::compute_execute(metadata, payload.evaluation_time_ms, cutoff, keep)
+                        } else {
+                            RetentionPlan::compute(
+                                metadata,
+                                payload.evaluation_time_ms,
+                                payload.older_than_ms,
+                                payload.retain_last,
+                            )
+                        }.map_err(iceberg_error)?;
                         let mut updates = retention.updates();
-                        if !retention.is_empty() {
+                        if payload.clean_expired_metadata {
+                            updates.extend(expiry_metadata::unused_dictionary_updates(
+                                &loaded.table,
+                                &retention,
+                                context,
+                                &self.descriptor,
+                                self.key.incarnation,
+                                required,
+                            ).await?);
+                        }
+                        if !updates.is_empty() {
                             updates.push(crate::iceberg::TableUpdate::SetProperties {
                                 updates: HashMap::from([(MARKER_PROPERTY.into(), marker.clone())]),
                             });
@@ -698,6 +717,7 @@ impl MaintenanceEngine {
                     "Maintenance retry budget expired after preparation",
                 )));
             }
+            let reclaims_files = !payload.sql_execute || !retention.removed_snapshots.is_empty();
             let receipt = ReceiptSeed {
                 descriptor: self.descriptor.clone(),
                 incarnation: self.key.incarnation,
@@ -715,7 +735,7 @@ impl MaintenanceEngine {
                     self.evidence(plan, payload)?,
                     MaintenancePublication {
                         receipt,
-                        retired: Some(Arc::new(retention.clone())),
+                        retired: reclaims_files.then(|| Arc::new(retention.clone())),
                         artifact_cleanup: None,
                         reclamation: Arc::new(Mutex::new(None)),
                     },
@@ -747,8 +767,8 @@ impl MaintenanceEngine {
                     .await
             }
             .await;
-            // The in-process table lock covers the fresh metadata decision and
-            // dispatch conclusion, never backoff, manifest scans, or deletion.
+            // The in-process table lock covers this round's fresh decision
+            // and dispatch conclusion. It never covers backoff or reclamation.
             drop(guard);
             let outcome = match published {
                 Ok(entry) => public_outcome(journal.catalog_entry_outcome(entry)),
@@ -760,7 +780,11 @@ impl MaintenanceEngine {
             {
                 let wait = policy.backoff(ordinal);
                 if wait >= policy.total_timeout().saturating_sub(started.elapsed()) {
-                    return Ok(outcome);
+                    return Ok(if payload.sql_execute {
+                        project_commit_failure(outcome, MaintenanceCommitProcedure::ExpireSnapshots)
+                    } else {
+                        outcome
+                    });
                 }
                 if let Err(error) = operation.pause(wait).await.map_err(iceberg_error) {
                     return Ok(rejected(error));
@@ -773,13 +797,15 @@ impl MaintenanceEngine {
                 .invalidate_table_cache(&payload.namespace, &payload.table);
             // Reclamation consumes only the exact Applied entry; it owns an
             // independent finite grant and cannot alter the publication fact.
-            if matches!(
-                outcome,
-                ExternalMutationOutcome::KnownCommitted {
-                    effect: ExternalMutationEffect::Applied,
-                    ..
-                }
-            ) {
+            if reclaims_files
+                && matches!(
+                    outcome,
+                    ExternalMutationOutcome::KnownCommitted {
+                        effect: ExternalMutationEffect::Applied,
+                        ..
+                    }
+                )
+            {
                 let entry = journal
                     .current_entry()
                     .expect("Applied expiration has an entry");
@@ -809,7 +835,11 @@ impl MaintenanceEngine {
                 record_reclamation_result(journal, entry, &report_slot, Ok(result));
                 return Ok(public_outcome(journal.catalog_entry_outcome(entry)));
             }
-            return Ok(outcome);
+            return Ok(if payload.sql_execute {
+                project_commit_failure(outcome, MaintenanceCommitProcedure::ExpireSnapshots)
+            } else {
+                outcome
+            });
         }
     }
 }
@@ -1091,6 +1121,31 @@ pub(crate) struct MaintenancePublication {
     )>,
     reclamation: Arc<Mutex<Option<ReclamationReport>>>,
 }
+fn project_commit_failure(
+    outcome: ExternalMutationOutcome<ConnectorMetadataMaintenanceReceipt>,
+    procedure: MaintenanceCommitProcedure,
+) -> ExternalMutationOutcome<ConnectorMetadataMaintenanceReceipt> {
+    match outcome {
+        ExternalMutationOutcome::KnownUncommitted { failure, cleanup } => {
+            ExternalMutationOutcome::KnownUncommitted {
+                failure: commit_failure(
+                    procedure,
+                    CommitFailureDisposition::KnownUncommitted,
+                    failure,
+                ),
+                cleanup,
+            }
+        }
+        ExternalMutationOutcome::CommitUnknown { failure, evidence } => {
+            ExternalMutationOutcome::CommitUnknown {
+                failure: commit_failure(procedure, CommitFailureDisposition::Unknown, failure),
+                evidence,
+            }
+        }
+        committed => committed,
+    }
+}
+
 fn public_outcome(
     outcome: ExternalMutationOutcome<MaintenancePublication>,
 ) -> ExternalMutationOutcome<ConnectorMetadataMaintenanceReceipt> {
@@ -1317,7 +1372,12 @@ fn validate_payload_for_plan(
     plan: &ConnectorMetadataMaintenancePlan,
     payload: &IcebergMetadataMaintenancePlanPayloadV1,
 ) -> Result<(), ConnectorError> {
-    if payload.version != PAYLOAD_VERSION
+    if payload.version != PLAN_PAYLOAD_VERSION
+        || (payload.clean_expired_metadata && !payload.sql_execute)
+        || (payload.operation_kind == novarocks_spi::connector::EXPIRE_TABLE_VERSIONS_KIND
+            && payload.sql_execute
+            && (payload.older_than_ms.is_none()
+                || !payload.retain_last.is_some_and(|count| count > 0)))
         || payload.operation_kind != plan.operation_kind()
         || payload.evaluation_time_ms <= 0
         || intent_digest(payload)? != plan.intent_digest()

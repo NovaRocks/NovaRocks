@@ -137,6 +137,37 @@ impl RetentionPlan {
         older_than_ms: Option<i64>,
         retain_last: Option<u32>,
     ) -> Result<Self> {
+        Self::compute_in(
+            metadata,
+            evaluation_time_ms,
+            older_than_ms,
+            retain_last,
+            false,
+        )
+    }
+
+    pub(crate) fn compute_execute(
+        metadata: &TableMetadata,
+        evaluation_time_ms: i64,
+        older_than_ms: i64,
+        retain_last: u32,
+    ) -> Result<Self> {
+        Self::compute_in(
+            metadata,
+            evaluation_time_ms,
+            Some(older_than_ms),
+            Some(retain_last),
+            true,
+        )
+    }
+
+    fn compute_in(
+        metadata: &TableMetadata,
+        evaluation_time_ms: i64,
+        older_than_ms: Option<i64>,
+        retain_last: Option<u32>,
+        prefix_only: bool,
+    ) -> Result<Self> {
         if evaluation_time_ms <= 0 || older_than_ms.is_some_and(|time| time < 0) {
             return Err(invalid(
                 "Snapshot expiration requires a valid fixed evaluation time",
@@ -226,6 +257,9 @@ impl RetentionPlan {
         for (head, keep, branch_cutoff) in branches {
             let mut next = Some(head);
             let mut ordinal = 0usize;
+            // The branch still owns every reachable ancestor after the
+            // retention prefix ends. Global age only applies outside that set.
+            let mut prefix_open = true;
             let mut seen = HashSet::new();
             while let Some(id) = next {
                 if !seen.insert(id) {
@@ -236,8 +270,10 @@ impl RetentionPlan {
                     break;
                 };
                 referenced.insert(id);
-                if ordinal < keep || snapshot.timestamp_ms() >= branch_cutoff {
+                if prefix_open && (ordinal < keep || snapshot.timestamp_ms() >= branch_cutoff) {
                     protected.insert(id);
+                } else if prefix_only {
+                    prefix_open = false;
                 }
                 ordinal += 1;
                 next = snapshot.parent_snapshot_id();
@@ -289,9 +325,16 @@ impl RetentionPlan {
             requirements,
         })
     }
+    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.removed_refs.is_empty() && self.removed_snapshots.is_empty()
     }
+    pub(crate) fn retains_snapshot(&self, id: i64) -> bool {
+        self.removed_snapshots
+            .binary_search_by_key(&id, Snapshot::snapshot_id)
+            .is_err()
+    }
+
     pub(crate) fn updates(&self) -> Vec<TableUpdate> {
         let mut updates = self
             .removed_refs

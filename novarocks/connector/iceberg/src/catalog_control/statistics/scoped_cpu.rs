@@ -46,6 +46,9 @@ enum CpuBody {
     CatalogCreate(Box<crate::catalog_control::catalog_mutation::create_cpu::Work>),
     ViewListing(Box<crate::catalog_control::views::async_listing::Work>),
     Compaction(crate::catalog_control::metadata_maintenance::observation::CompactionWork),
+    RetainedPartitionSpecs(
+        Box<crate::catalog_control::metadata_maintenance::expiry_metadata::Work>,
+    ),
     PreparedSource(Box<scoped_prepared_source::Work>),
     PreparedSplit(Box<scoped_prepared_split::Work>),
     ReadSnapshot(scoped_snapshot::SnapshotBody),
@@ -253,6 +256,28 @@ impl IcebergMetadataCpuOriginal {
         work.next()
     }
 
+    pub(in crate::catalog_control) fn retained_partition_specs(
+        descriptor: novarocks_spi::connector::ConnectorInstanceDescriptor,
+        incarnation: novarocks_spi::connector::ProviderBindingEpoch,
+        work: crate::catalog_control::metadata_maintenance::expiry_metadata::Work,
+    ) -> Arc<Self> {
+        Self::new(
+            descriptor,
+            incarnation,
+            CpuBody::RetainedPartitionSpecs(Box::new(work)),
+        )
+    }
+
+    pub(crate) fn take_retained_partition_specs(
+        &self,
+    ) -> Result<std::collections::BTreeSet<i32>, ConnectorError> {
+        let mut loan = BodyLoan::take(self);
+        let CpuBody::RetainedPartitionSpecs(work) = &mut loan.body.as_mut().unwrap().body else {
+            return Err(internal("Retained partition specs CPU source differs"));
+        };
+        work.take_output()
+    }
+
     fn new(
         descriptor: novarocks_spi::connector::ConnectorInstanceDescriptor,
         incarnation: novarocks_spi::connector::ProviderBindingEpoch,
@@ -388,6 +413,7 @@ impl IcebergMetadataCpuOriginal {
             CpuBody::CatalogCreate(work) => work.run(),
             CpuBody::ViewListing(work) => work.run(),
             CpuBody::Compaction(work) => work.run(),
+            CpuBody::RetainedPartitionSpecs(work) => work.run(),
             CpuBody::PreparedSource(body) => body.run(),
             CpuBody::PreparedSplit(body) => body.run(),
             CpuBody::Read(body) => body.run(),
@@ -734,6 +760,7 @@ impl novarocks_spi::connector::ProviderMetadataCpuSource for IcebergMetadataCpuO
                         | CpuBody::ReadSnapshot(_)
                         | CpuBody::Compaction(_)
                         | CpuBody::OrphanDecode(_)
+                        | CpuBody::RetainedPartitionSpecs(_)
                 ) || matches!(&body.as_ref().unwrap().body,CpuBody::Read(read) if read.phase<=1
                 ),
                 "metadata source cannot dispatch a Statistics product phase"
@@ -763,6 +790,9 @@ pub(crate) fn metadata_cpu_source_bytes() -> Result<usize, ConnectorError> {
         >())
         .max(std::mem::size_of::<scoped_prepared_source::Work>())
         .max(std::mem::size_of::<scoped_prepared_split::Work>())
+        .max(std::mem::size_of::<
+            crate::catalog_control::metadata_maintenance::expiry_metadata::Work,
+        >())
         .max(std::mem::size_of::<
             crate::catalog_control::views::async_listing::Work,
         >());
