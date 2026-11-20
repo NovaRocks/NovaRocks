@@ -90,5 +90,4 @@ pub(crate) fn update_type(kind: StatementKind) -> Option<&'static str> {
 }
 
 #[cfg(test)]
-#[path = "update_type_tests.rs"]
 mod tests;
