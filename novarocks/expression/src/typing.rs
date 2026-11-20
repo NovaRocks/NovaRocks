@@ -16,6 +16,7 @@
 
 //! Node-level typing for scalar expressions after syntax and name resolution.
 
+// Design: ADR-0245 (docs/adr/ADR-0245-scalar-typing-finalizes-the-original-overload.md)
 use std::fmt;
 
 use arrow::datatypes::DataType;

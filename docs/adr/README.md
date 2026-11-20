@@ -125,8 +125,11 @@ code-anchors:
 
 ### pipeline-execution
 
+- [ADR-0245](ADR-0245-scalar-typing-finalizes-the-original-overload.md) — 表达式层为何在转换后以原重载定稿，语句准入、实际端口和两套入口如何交接（active）
+- [ADR-0244](ADR-0244-operators-are-identified-catalogue-functions.md) — 隐藏目录函数为何按身份表示运算符，如何沿普通调用迁移、渲染和折叠（active；部分替代 ADR-0242 的取负范围）
+
 - [ADR-0243](ADR-0243-set-operation-shared-stages-and-exactly-once-placement.md) — DISTINCT 集合运算为何共享阶段件、每个探测只等待构建，以及 Handoff 如何证明需求结束（active，部分修订 ADR-0209／0212）
-- [ADR-0242](ADR-0242-constant-folding-compiles-expression-units.md) — 常量折叠为何逐节点使用同一表达式单元、缓存结果并在规划期保留原失败语义，标量调用事实为何归表达式层（active；部分替代 ADR-0100、折叠 ADR-0191 与 ADR-0238，承接求值器 ADR-0239 的单节点入口退役条件）
+- [ADR-0242](ADR-0242-constant-folding-compiles-expression-units.md) — 常量折叠为何逐节点使用同一表达式单元、缓存结果并在规划期保留原失败语义，标量调用事实为何归表达式层（active；部分替代 ADR-0100、折叠 ADR-0191 与 ADR-0238，承接求值器 ADR-0239 的单节点入口退役条件；取负按 ADR-0244 进入普通调用折叠范围）
 - [ADR-0239](ADR-0239-expression-evaluation-and-host-admission.md) — 表达式层为何共用编译与求值，如何由求值器撰写唯一调用协议并由宿主提供准入与保管（active；已接入生产路径，部分替代 ADR-0238 中求值器暂留 Execution 的安排；单节点折叠的退役条件由 ADR-0242 承接）
 - [ADR-0238](ADR-0238-self-contained-expression-units-and-explicit-environments.md) — 表达式为何按自包含单元携带端口、根与调用事实，并把共享环境、关系调用和纯编译留在准确 owner（active；节点、wire 27 和编译路径已接入，求值器暂留 Execution 由 ADR-0239 部分替代，标量调用撰写所有权由 ADR-0242 部分替代）
 
@@ -319,8 +322,11 @@ code-anchors:
 - ADR-0135 — 分布式工作为何以 task 为单位创建、驱动与终结，而不是 query-wide participant 状态机（superseded → ADR-0146）
 ### sql-compiler
 
+- [ADR-0245](ADR-0245-scalar-typing-finalizes-the-original-overload.md) — 表达式层为何在转换后以原重载定稿，语句准入、实际端口和两套入口如何交接（active）
+- [ADR-0244](ADR-0244-operators-are-identified-catalogue-functions.md) — 隐藏目录函数为何按身份表示运算符，如何沿普通调用迁移、渲染和折叠（active；部分替代 ADR-0242 的取负范围）
+
 - [ADR-0243](ADR-0243-set-operation-shared-stages-and-exactly-once-placement.md) — 集合运算为何先转换再分区，无 split 分支为何由 Singleton source 和单副本 exchange 建立行放置（active）
-- [ADR-0242](ADR-0242-constant-folding-compiles-expression-units.md) — 常量折叠为何逐节点使用同一表达式单元、缓存结果并在规划期保留原失败语义，标量调用事实为何归表达式层（active；部分替代 ADR-0100、折叠 ADR-0191 与 ADR-0238，承接求值器 ADR-0239 的单节点入口退役条件）
+- [ADR-0242](ADR-0242-constant-folding-compiles-expression-units.md) — 常量折叠为何逐节点使用同一表达式单元、缓存结果并在规划期保留原失败语义，标量调用事实为何归表达式层（active；部分替代 ADR-0100、折叠 ADR-0191 与 ADR-0238，承接求值器 ADR-0239 的单节点入口退役条件；取负按 ADR-0244 进入普通调用折叠范围）
 - [ADR-0239](ADR-0239-expression-evaluation-and-host-admission.md) — 表达式层为何共用编译与求值，如何由求值器撰写唯一调用协议并由宿主提供准入与保管（active；已接入生产路径，部分替代 ADR-0238 中求值器暂留 Execution 的安排；单节点折叠的退役条件由 ADR-0242 承接）
 - [ADR-0238](ADR-0238-self-contained-expression-units-and-explicit-environments.md) — 表达式为何按自包含单元携带端口、根与调用事实，并把共享环境、关系调用和纯编译留在准确 owner（active；节点、wire 27 和编译路径已接入，求值器暂留 Execution 由 ADR-0239 部分替代，标量调用撰写所有权由 ADR-0242 部分替代）
 
@@ -582,7 +588,7 @@ handles，不以 service locator、core callback、metadata fallback 或公共 S
 ### crate-boundary
 
 - [ADR-0237](ADR-0237-pure-logical-execution-and-original-host-custody.md) — 逻辑执行与 attempt 为何分别由纯核心决定、QA 为何只监督执行器并保管原注册/退出、FA 为何只承接原载体，以及共享运行时来源/失败交接和宿主一次性清理切点（active；部分替代 ADR-0198 的异步逻辑 actor 妥协及 ADR-0230 的桥，其余业务、协议与原传输规则保留）
-- [ADR-0242](ADR-0242-constant-folding-compiles-expression-units.md) — 常量折叠为何逐节点使用同一表达式单元、缓存结果并在规划期保留原失败语义，标量调用事实为何归表达式层（active；部分替代 ADR-0100、折叠 ADR-0191 与 ADR-0238，承接求值器 ADR-0239 的单节点入口退役条件）
+- [ADR-0242](ADR-0242-constant-folding-compiles-expression-units.md) — 常量折叠为何逐节点使用同一表达式单元、缓存结果并在规划期保留原失败语义，标量调用事实为何归表达式层（active；部分替代 ADR-0100、折叠 ADR-0191 与 ADR-0238，承接求值器 ADR-0239 的单节点入口退役条件；取负按 ADR-0244 进入普通调用折叠范围）
 - [ADR-0239](ADR-0239-expression-evaluation-and-host-admission.md) — 表达式层为何共用编译与求值，如何由求值器撰写唯一调用协议并由宿主提供准入与保管（active；已接入生产路径，部分替代 ADR-0238 中求值器暂留 Execution 的安排；单节点折叠的退役条件由 ADR-0242 承接）
 - [ADR-0238](ADR-0238-self-contained-expression-units-and-explicit-environments.md) — 表达式为何按自包含单元携带端口、根与调用事实，并把共享环境、关系调用和纯编译留在准确 owner（active；节点、wire 27 和编译路径已接入，求值器暂留 Execution 由 ADR-0239 部分替代，标量调用撰写所有权由 ADR-0242 部分替代）
 - [ADR-0229](ADR-0229-rust-test-placement-dependency-direction-and-fixture-ownership.md) — Rust 测试为何按断言 owner 放置、为何先找公开边界、测试依赖为何只向显式登记的输入契约生产者放宽、无生产边的组合为何进接缝测试 package、测试支持为何按性质暴露，以及 fixture、增长规则与存量随改动迁移（active；沿用 ADR-0056/0069/0140、测试控制 ADR-0175、ADR-0181/0190，不替代其中任何一条）

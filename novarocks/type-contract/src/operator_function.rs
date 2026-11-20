@@ -14,6 +14,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Design: ADR-0244 (docs/adr/ADR-0244-operators-are-identified-catalogue-functions.md)
 use crate::FunctionId;
 
 /// SQL operator identities backed by ordinary installed scalar functions.

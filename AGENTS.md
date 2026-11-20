@@ -293,7 +293,7 @@ SQL client
 
 - `novarocks/expression-contract/src/{unit,builder}.rs`
   `BoundExprSet` 已冻结有序端口、局部定义、根、控制流、调用声明与静态请求；
-  codec 用受检的中立 parts 构造单元。修订号 27 的 package 在 PhysicalNode 信封承载单元，
+  codec 用受检的中立 parts 构造单元。修订号 32 的 package 在 PhysicalNode 信封承载单元，
   类型、常量和函数绑定由 package 共享。节点字段的根与端口由 `physical-plan/src/node_roots.rs` 核对。
   见 [ADR-0238](docs/adr/ADR-0238-self-contained-expression-units-and-explicit-environments.md)。
 
@@ -340,6 +340,17 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
   依赖闭包止于 Functions、中立契约和 Arrow。`evaluator_view.rs` 为关系算子与本地程序提供编译单元的只读视图。
   求值器撰写叶子调用协议，宿主提供原控制、分配、准入和来源存储，见
   [ADR-0239](docs/adr/ADR-0239-expression-evaluation-and-host-admission.md)。
+
+- `novarocks/expression/src/typing.rs` 拥有节点级定型、转换和原重载定稿。
+  `novarocks/parser/src/syntax_call.rs` 投影特殊语法的原实参，SQL 使用原语句准入并发射已定型转换。
+  `rebind_unpublished_nullability` 沿实际端口保留来源、控制与同一重载。开发文本入口在
+  `novarocks/expression/src/testkit/expression_text.rs`，与 SQL 共用迁移判定并核对实际环境。
+  见 [ADR-0245](docs/adr/ADR-0245-scalar-typing-finalizes-the-original-overload.md)。
+
+- `novarocks/type-contract/src/operator_function.rs` 冻结已迁入运算符的函数身份，Functions 保管隐藏定义、
+  准确重载效应与整批 kernel。SQL 的 `common/negation.rs` 按身份读实参并保持渲染边界。
+  取负沿普通调用参与折叠，错误行保留原式。迁移规则见 [ADR-0244](docs/adr/ADR-0244-operators-are-identified-catalogue-functions.md)，
+  遗留面见 [表达式层遗留面](docs/guides/development/expression-layer-legacy.md)。
 
 - `novarocks/local-compiler/src/**`
   只消费已冻结的 package、pure function/provider facts，产生纯 `LocalProgram`；
