@@ -1243,8 +1243,16 @@ fn finish_read_from_opened(
         })?;
     let (enforced_predicate, unenforced_predicate, remaining_expression) =
         filter_responsibility(&offer, &negotiated.outcomes);
-    let (schema, named_columns) =
-        column_facts(need.columns(), &assignments, encoder.as_ref(), name)?;
+    let (schema, named_columns) = column_facts(
+        need.columns(),
+        &assignments,
+        encoder.as_ref(),
+        name,
+        public_schema
+            .as_ref()
+            .ok()
+            .and_then(ConnectorReadPublicSchema::execution_schema),
+    )?;
     let catalog_properties = planning_pin
         .binding()
         .catalog_properties()
@@ -1949,10 +1957,11 @@ fn column_facts(
     assignments: &[ConnectorReadAssignment],
     encoder: &dyn ConnectorReadWireEncoder,
     name: &str,
+    execution_schema: Option<&novarocks_connector_contract::ConnectorReadExecutionSchema>,
 ) -> Result<ProviderColumnFacts, ProviderReadError> {
     let mut facts = Vec::with_capacity(columns.len());
     let mut named = Vec::with_capacity(columns.len());
-    for (column, assignment) in columns.iter().zip(assignments.iter()) {
+    for (ordinal, (column, assignment)) in columns.iter().zip(assignments).enumerate() {
         let payload = encoder
             .encode_column_payload(assignment.column())
             .map_err(|error| {
@@ -1964,11 +1973,15 @@ fn column_facts(
         let reference = ProviderColumnReference {
             column_payload: payload,
         };
-        facts.push(ProviderReadColumnFact::new(
+        let mut fact = ProviderReadColumnFact::new(
             column.ordinal(),
             reference.clone(),
             column.engine_type().clone(),
-        ));
+        );
+        if let Some(execution_type) = execution_schema.and_then(|schema| schema.binding(ordinal)) {
+            fact = fact.with_execution_type(execution_type);
+        }
+        facts.push(fact);
         named.push((reference, column.clone()));
     }
     Ok((facts.into_boxed_slice(), named.into_boxed_slice()))

@@ -80,6 +80,44 @@ fn policies() -> [DecimalOverflowPolicy; 2] {
 }
 
 #[test]
+fn explicit_byte_view_projection_preserves_selected_values_and_nulls() {
+    use arrow_array::{BinaryViewArray, StringViewArray};
+
+    let strings = [Some("unselected"), None, Some("a retained long string")];
+    let bytes = [Some(&b"unused"[..]), None, Some(&b"payload \xff"[..])];
+    let fixtures: [(ArrayRef, ArrayRef); 2] = [
+        (
+            Arc::new(StringViewArray::from(strings.to_vec())),
+            Arc::new(StringArray::from(vec![None, strings[2]])),
+        ),
+        (
+            Arc::new(BinaryViewArray::from_iter(bytes)),
+            Arc::new(BinaryArray::from(vec![None, bytes[2]])),
+        ),
+    ];
+    for (input, expected) in fixtures {
+        let recipe = prepare(
+            input.data_type().clone(),
+            expected.data_type().clone(),
+            DecimalOverflowPolicy::OutputNull,
+            false,
+        );
+        let rows = [1, 2];
+        let selection = Selection::try_sparse(input.len(), &rows).unwrap();
+        let actual = recipe
+            .evaluate_selected(
+                EvaluatedArgument::Column(&input),
+                selection,
+                &[],
+                &Control::default(),
+            )
+            .unwrap();
+        same(&actual, &expected);
+        assert!(actual.errors().is_empty());
+    }
+}
+
+#[test]
 fn selected_scalar_result_author_keeps_independent_numeric_text_decimal_and_time_values() {
     let fixtures: Vec<(ArrayRef, ArrayRef)> = vec![
         (
