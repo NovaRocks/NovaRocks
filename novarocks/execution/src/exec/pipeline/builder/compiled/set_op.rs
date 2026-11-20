@@ -28,7 +28,7 @@ use crate::exec::{
 use novarocks_local_program::SetOpKind;
 use std::num::NonZeroUsize;
 
-// Design: ADR-0242 (docs/adr/ADR-0242-set-operation-shared-stages-and-exactly-once-placement.md)
+// Design: ADR-0243 (docs/adr/ADR-0243-set-operation-shared-stages-and-exactly-once-placement.md)
 pub(super) fn build_set_op(
     program: &Arc<LocalProgram>,
     id: ProgramNodeId,

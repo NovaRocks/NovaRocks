@@ -5,6 +5,7 @@ domain: [join-execution, pipeline-execution]
 status: active
 supersedes: []
 superseded-by: null
+partially-superseded-by: [ADR-0243]
 partially-supersedes:
   - id: ADR-0004
     scope: "A single contiguous build Chunk, whole-batch pair materialization, rejection of incremental probe cursors and the legacy expression-arena premise; consumer-owned row topology and semantic correctness remain active"
