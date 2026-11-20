@@ -63,6 +63,16 @@ pub(super) const OPAQUE_BINARY: &str =
     "builtin.scalar/value_domain_conversion/opaque_to_binary_same_structure/v1";
 pub(super) const SIGNED_LARGEINT: &str =
     "builtin.scalar/value_domain_conversion/signed_to_largeint/v1";
+pub(super) const BOOLEAN_LARGEINT: &str =
+    "builtin.scalar/value_domain_conversion/boolean_to_largeint/v1";
+pub(super) const DECIMAL128_LARGEINT: &str =
+    "builtin.scalar/value_domain_conversion/decimal128_to_largeint/v1";
+pub(super) const DECIMAL256_LARGEINT: &str =
+    "builtin.scalar/value_domain_conversion/decimal256_to_largeint/v1";
+pub(super) const FLOAT32_LARGEINT: &str =
+    "builtin.scalar/value_domain_conversion/float32_to_largeint_null_invalid/v1";
+pub(super) const FLOAT64_LARGEINT: &str =
+    "builtin.scalar/value_domain_conversion/float64_to_largeint_null_invalid/v1";
 pub(super) const LARGEINT_SIGNED: &str =
     "builtin.scalar/value_domain_conversion/largeint_to_signed_null_overflow/v1";
 pub(super) const LARGEINT_DECIMAL: &str =
@@ -76,7 +86,24 @@ pub(super) const UTF8_LARGEINT: &str =
 pub(super) const NULL_LIFT: &str =
     "builtin.scalar/value_domain_conversion/null_to_typed_nullable/v1";
 
-/// Full effects shared by these total value conversions. Overflow NULL is a
+const AUTOMATIC_OVERLOADS: &[&str] = &[
+    JSON_TEXT,
+    OPAQUE_BINARY,
+    SIGNED_LARGEINT,
+    BOOLEAN_LARGEINT,
+    DECIMAL128_LARGEINT,
+    DECIMAL256_LARGEINT,
+    FLOAT32_LARGEINT,
+    FLOAT64_LARGEINT,
+    LARGEINT_SIGNED,
+    LARGEINT_DECIMAL,
+    LARGEINT_FLOAT,
+    LARGEINT_TEXT,
+    UTF8_LARGEINT,
+    NULL_LIFT,
+];
+
+/// Base effects of the hidden value conversions. Overflow NULL is a
 /// result of the signed narrowing overload, not suppression of a child,
 /// control, resource, contract or lifecycle failure. JSON bytes are preserved;
 /// signed integers extend exactly; floats use the existing i128 `as` rounding;
@@ -99,7 +126,10 @@ pub(super) fn effects() -> FunctionEffectDeclaration {
 /// its dedicated preparation never accepts that policy as a semantic switch.
 pub(super) fn overload_effects(id: &str) -> FunctionEffectDeclaration {
     let mut effects = effects();
-    if matches!(id, LARGEINT_DECIMAL | ARRAY_COMMON_COERCION) {
+    if matches!(
+        id,
+        LARGEINT_DECIMAL | DECIMAL128_LARGEINT | DECIMAL256_LARGEINT | ARRAY_COMMON_COERCION
+    ) {
         effects.own_row_error = FunctionIntrinsicRowError::MayRaise;
     }
     effects
@@ -123,6 +153,11 @@ pub(super) fn definition_parts()
         (JSON_TEXT, "Json->PhysicalUtf8, or identical List/LargeList/FixedSizeList/Struct/Map shape with Json fields->PhysicalUtf8; preserve all other field facts", "explicit exact target; NULL preserved; JSON bytes unchanged"),
         (OPAQUE_BINARY, "Hll/Bitmap/Object/Percentile/Variant->PhysicalBinary, or identical container shape with those opaque children->PhysicalBinary", "explicit exact target; original bytes and NULL preserved; no inverse domain establishment"),
         (SIGNED_LARGEINT, "Physical(Int8|Int16|Int32|Int64)->LargeInt(FixedSizeBinary16)", "explicit exact LargeInt target; signed i128 extension; NULL preserved"),
+        (BOOLEAN_LARGEINT, "Physical Boolean->LargeInt(FixedSizeBinary16)", "explicit exact target; false is zero, true is one; NULL preserved"),
+        (DECIMAL128_LARGEINT, "Physical Decimal128->LargeInt(FixedSizeBinary16)", "explicit exact target; truncate toward zero; frozen decimal overflow policy; NULL preserved"),
+        (DECIMAL256_LARGEINT, "Physical Decimal256->LargeInt(FixedSizeBinary16)", "explicit exact target; truncate toward zero; frozen decimal overflow policy; NULL preserved"),
+        (FLOAT32_LARGEINT, "Physical Float32->LargeInt(FixedSizeBinary16)", "explicit nullable exact target; truncate toward zero; non-finite or out-of-range values return NULL"),
+        (FLOAT64_LARGEINT, "Physical Float64->LargeInt(FixedSizeBinary16)", "explicit nullable exact target; truncate toward zero; non-finite or out-of-range values return NULL"),
         (LARGEINT_SIGNED, "LargeInt(FixedSizeBinary16)->Physical(Int8|Int16|Int32|Int64)", "explicit nullable exact target; out-of-range value returns NULL; NULL preserved"),
         (LARGEINT_DECIMAL, "LargeInt(FixedSizeBinary16)->Physical(Decimal128|Decimal256)", "explicit exact decimal target; checked integer scaling; negative scale truncates toward zero; frozen decimal overflow policy; NULL preserved"),
         (LARGEINT_FLOAT, "LargeInt(FixedSizeBinary16)->Physical(Float32|Float64)", "explicit exact target; existing i128 as float rounding; NULL preserved"),
@@ -237,21 +272,11 @@ pub(super) fn recipe_family(
         logical_argument_count: 1,
         expected_result_type: Some(target),
     })?;
-    let id = [
-        JSON_TEXT,
-        OPAQUE_BINARY,
-        SIGNED_LARGEINT,
-        LARGEINT_SIGNED,
-        LARGEINT_DECIMAL,
-        LARGEINT_FLOAT,
-        LARGEINT_TEXT,
-        UTF8_LARGEINT,
-        NULL_LIFT,
-    ]
-    .into_iter()
-    .find(|id| pair_matches(id, source, target))
-    .ok_or(FunctionBindingError::NoMatchingOverload)?;
-    Ok(id)
+    AUTOMATIC_OVERLOADS
+        .iter()
+        .copied()
+        .find(|id| pair_matches(id, source, target))
+        .ok_or(FunctionBindingError::NoMatchingOverload)
 }
 
 fn selection(
@@ -431,6 +456,16 @@ fn signed(data_type: &DataType) -> bool {
     )
 }
 
+pub(super) fn decimal_to_largeint_can_overflow(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Decimal128(precision, scale) | DataType::Decimal256(precision, scale) => {
+            // The complete signed range contains every coefficient with at most 38 digits.
+            i16::from(*precision) - i16::from(*scale) > 38
+        }
+        _ => true,
+    }
+}
+
 /// Match the exact selected family directly. No resolution replay is used by
 /// frozen validation. In particular FixedSizeBinary16 is not a numeric source.
 fn pair_matches(id: &str, source: &FunctionValueType, target: &FunctionValueType) -> bool {
@@ -453,6 +488,22 @@ fn pair_matches(id: &str, source: &FunctionValueType, target: &FunctionValueType
                 && signed(source.data_type())
                 && target.logical_type() == ValueLogicalType::LargeInt
                 && target.data_type() == &DataType::FixedSizeBinary(16)
+        }
+        BOOLEAN_LARGEINT | DECIMAL128_LARGEINT | DECIMAL256_LARGEINT | FLOAT32_LARGEINT
+        | FLOAT64_LARGEINT => {
+            source.logical_type() == ValueLogicalType::Physical
+                && target.logical_type() == ValueLogicalType::LargeInt
+                && target.data_type() == &DataType::FixedSizeBinary(16)
+                && match (id, source.data_type()) {
+                    (BOOLEAN_LARGEINT, DataType::Boolean) => true,
+                    (DECIMAL128_LARGEINT, DataType::Decimal128(..))
+                    | (DECIMAL256_LARGEINT, DataType::Decimal256(..)) => {
+                        target.nullable() || !decimal_to_largeint_can_overflow(source.data_type())
+                    }
+                    (FLOAT32_LARGEINT, DataType::Float32)
+                    | (FLOAT64_LARGEINT, DataType::Float64) => target.nullable(),
+                    _ => false,
+                }
         }
         LARGEINT_SIGNED => {
             source.logical_type() == ValueLogicalType::LargeInt
@@ -538,17 +589,7 @@ impl FunctionBindingResolver for ValueConversionResolver {
         binding_control::scope(control, |work| {
             binding_control::request_types(request, work)?;
             let (source, target) = input_shape(request)?;
-            for id in [
-                JSON_TEXT,
-                OPAQUE_BINARY,
-                SIGNED_LARGEINT,
-                LARGEINT_SIGNED,
-                LARGEINT_DECIMAL,
-                LARGEINT_FLOAT,
-                LARGEINT_TEXT,
-                UTF8_LARGEINT,
-                NULL_LIFT,
-            ] {
+            for &id in AUTOMATIC_OVERLOADS {
                 work.step()?;
                 if pair_matches_observed(id, source, target, work)? {
                     return selection(id, source, target);

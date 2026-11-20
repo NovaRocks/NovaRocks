@@ -152,7 +152,7 @@ fn pairs(nullable: bool) -> [(FunctionValueType, FunctionValueType, &'static str
 }
 
 #[test]
-fn whole_builtin_catalogue_attaches_one_hidden_owner_and_exact_ten_implementation_records() {
+fn whole_builtin_catalogue_attaches_one_hidden_owner_and_exact_implementation_records() {
     let owner = owner();
     let catalog = super::super::catalogue::build_builtin_engine_function_catalog().unwrap();
     let actual = catalog
@@ -176,6 +176,26 @@ fn whole_builtin_catalogue_attaches_one_hidden_owner_and_exact_ten_implementatio
         (
             value_conversion::SIGNED_LARGEINT,
             "builtin.scalar/value_domain_conversion/signed_to_largeint/selected-v1",
+        ),
+        (
+            value_conversion::BOOLEAN_LARGEINT,
+            "builtin.scalar/value_domain_conversion/boolean_to_largeint/selected-v1",
+        ),
+        (
+            value_conversion::DECIMAL128_LARGEINT,
+            "builtin.scalar/value_domain_conversion/decimal128_to_largeint/selected-v1",
+        ),
+        (
+            value_conversion::DECIMAL256_LARGEINT,
+            "builtin.scalar/value_domain_conversion/decimal256_to_largeint/selected-v1",
+        ),
+        (
+            value_conversion::FLOAT32_LARGEINT,
+            "builtin.scalar/value_domain_conversion/float32_to_largeint_null_invalid/selected-v1",
+        ),
+        (
+            value_conversion::FLOAT64_LARGEINT,
+            "builtin.scalar/value_domain_conversion/float64_to_largeint_null_invalid/selected-v1",
         ),
         (
             value_conversion::LARGEINT_SIGNED,

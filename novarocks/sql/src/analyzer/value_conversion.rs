@@ -243,27 +243,7 @@ pub(super) fn convert_value_domain_with_catalog(
             &source.value_type,
             &target,
         )
-        .map_err(|error| match error {
-            novarocks_functions::FunctionBindingError::NoMatchingOverload
-                if source.value_type.logical_type()
-                    == novarocks_type_contract::ValueLogicalType::Physical
-                    && matches!(
-                        source.value_type.data_type(),
-                        arrow::datatypes::DataType::Decimal128(_, _)
-                            | arrow::datatypes::DataType::Decimal256(_, _)
-                    )
-                    && target.logical_type()
-                        == novarocks_type_contract::ValueLogicalType::LargeInt
-                    && target.data_type() == &arrow::datatypes::DataType::FixedSizeBinary(16)
-                    && target.nullable() =>
-            {
-                AnalyzeError::unsupported_expression_without_span(format!(
-                    "CAST from {:?} to nominal LARGEINT is not implemented",
-                    source.value_type.data_type(),
-                ))
-            }
-            error => AnalyzeError::internal(error.to_string()),
-        })?
+        .map_err(|error| AnalyzeError::internal(error.to_string()))?
         .ok_or_else(|| {
             AnalyzeError::internal(
                 "a logical-domain conversion requires an exact admitted implementation",
