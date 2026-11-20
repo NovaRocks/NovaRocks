@@ -74,7 +74,7 @@ impl DmlService {
                 resolved.target.namespace.clone(),
                 resolved.target.table.clone(),
             ],
-            location: resolved.location,
+            arguments: resolved.arguments,
         };
         self.prepare_add_files_request(
             engine,
@@ -96,11 +96,6 @@ impl DmlService {
         context: &RequestContext,
         query_options: Option<&QueryOptions>,
     ) -> Result<PreparedAddFilesAttempt, DmlError> {
-        if !is_secret_free_source_location(&command.location) {
-            return Err(DmlError::executor(
-                "ADD FILES source location must not contain credentials or query parameters",
-            ));
-        }
         let publication_id = LakePublicationId::new_v7();
         let prepared = engine
             .plan_add_files(PlanAddFilesRequest {
@@ -283,10 +278,6 @@ fn plan_error(error: AddFilesPlanError) -> DmlError {
                 .with_compile_control(failure.compile_control_error())
         }
     }
-}
-
-fn is_secret_free_source_location(location: &str) -> bool {
-    !location.contains('@') && !location.contains('?')
 }
 
 #[cfg(test)]

@@ -21,7 +21,6 @@
 pub enum Dependency {
     RefUnchanged,
     NoRead,
-    RegisteredFilesNotLive(Vec<String>),
     /// Preparation-time check only; metadata publication has no atomic snapshot-existence requirement.
     MeasuredSnapshotExists(i64),
 }

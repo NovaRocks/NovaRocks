@@ -471,3 +471,37 @@ fn rejects_unsupported_hive_authentication() {
 
     assert!(error.contains("plaintext thrift"));
 }
+
+#[test]
+fn registration_switch_is_strict_and_defaults_off_in_each_catalog_parser() {
+    for (kind, endpoint) in [
+        (
+            "hadoop",
+            ("iceberg.catalog.warehouse", "/tmp/iceberg-add-files"),
+        ),
+        ("rest", ("uri", "http://rest:8181")),
+        ("hive", ("hive.metastore.uris", "thrift://localhost:9083")),
+    ] {
+        let mut properties = vec![
+            ("iceberg.catalog.type".to_owned(), kind.to_owned()),
+            (endpoint.0.to_owned(), endpoint.1.to_owned()),
+        ];
+        assert!(
+            !parse_catalog_configuration("ice", &properties)
+                .unwrap()
+                .add_files_enabled
+        );
+        properties.push((ADD_FILES_ENABLED.to_owned(), "true".to_owned()));
+        assert!(
+            parse_catalog_configuration("ice", &properties)
+                .unwrap()
+                .add_files_enabled
+        );
+        properties.last_mut().unwrap().1 = "yes".into();
+        assert!(
+            parse_catalog_configuration("ice", &properties)
+                .unwrap_err()
+                .contains(ADD_FILES_ENABLED)
+        );
+    }
+}

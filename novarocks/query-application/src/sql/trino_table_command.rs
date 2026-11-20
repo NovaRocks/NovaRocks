@@ -37,8 +37,8 @@ use super::property_evaluation::{
     evaluate_ddl_properties, statement_property_assignments,
 };
 use super::table_procedure::{
-    BoundTableProcedure, TableProcedureAbsoluteTimePort, TableProcedureInputArgument,
-    bind_arguments, resolve_table_procedure,
+    BoundTableProcedure, TableProcedureAbsoluteTimePort, TableProcedureBindingSource,
+    TableProcedureInputArgument, bind_arguments, resolve_table_procedure,
 };
 use super::trino_admission::unsupported_statement;
 use super::{lower_command_literal, lower_object_name, lower_sql_type};
@@ -382,6 +382,7 @@ pub fn bind_trino_table_execute<'a>(
     source: &str,
     statement: &'a ast::TrinoTableExecute,
     provider: &ConnectorProviderId,
+    catalog: &str,
     constants: &mut dyn DdlPropertyConstantPort,
     absolute_time: &mut dyn TableProcedureAbsoluteTimePort,
     control: &dyn PureCompileControl,
@@ -416,8 +417,11 @@ pub fn bind_trino_table_execute<'a>(
     bind_arguments(
         procedure,
         &arguments,
-        source,
-        statement.span,
+        TableProcedureBindingSource {
+            sql: source,
+            catalog,
+            statement_span: statement.span,
+        },
         constants,
         absolute_time,
         control,

@@ -101,8 +101,6 @@ impl IcebergDataMutationBackend for FakeBackend {
                     schema_id: source.current_schema_id(),
                     default_spec_id: source.default_partition_spec_id(),
                     metadata_version_digest_hex: "aa".repeat(32),
-                    source_location: None,
-                    name_mapping_digest_hex: None,
                 },
                 source_metadata: source,
             },
@@ -126,7 +124,8 @@ impl IcebergDataMutationBackend for FakeBackend {
             publication_descriptor::AttributionPlan,
         };
         let marker_value = String::from_utf8(canonical_json(marker, "marker")?.to_vec()).unwrap();
-        let table_uuid = planned.source_metadata().uuid();
+        let (payload, source_metadata) = planned.truncate_parts().expect("fake truncate plan");
+        let table_uuid = source_metadata.uuid();
         *self.observed_marker.lock().unwrap() = Some((table_uuid, marker_value.clone()));
         let journal =
             PublicationJournal::new(OperationToken::from_mutation(recovery.plan.operation_id()));
@@ -134,11 +133,7 @@ impl IcebergDataMutationBackend for FakeBackend {
             .prepare_catalog(
                 recovery.evidence(RecoveryPublication::MarkerOnly {})?,
                 recovery.publication_receipt(42)?,
-                vec![format!(
-                    "{}.{}",
-                    planned.payload().namespace,
-                    planned.payload().table
-                )],
+                vec![format!("{}.{}", payload.namespace, payload.table)],
                 b"independent fake mutation dispatch".to_vec(),
                 AttributionPlan::Snapshot {
                     table_uuid,
@@ -348,58 +343,6 @@ pub(super) fn exact_provider_with_empty_table() -> (
     (executor, warehouse, provider)
 }
 
-#[test]
-fn add_files_duplicate_precheck_preserves_request_cancellation() {
-    let (_executor, _warehouse, provider) = exact_provider_with_empty_table();
-    let runtime = provider.runtime();
-    let table = runtime
-        .load_table_for_request("db", "t", &table_context())
-        .expect("table")
-        .into_table();
-    let manifest = AddFilesManifest {
-        source_scope:
-            novarocks_spi::connector::ConnectorDataMutationSourceScope::try_new_directory([1; 32])
-                .expect("scope"),
-        records: Vec::new(),
-        digest: [2; 32],
-        total_bytes: 0,
-        total_rows: 0,
-        total_footer_bytes: 0,
-        schema_identity_mode: super::super::add_files::AddFilesSchemaIdentityMode::EmbeddedFieldIds,
-        canonical_name_mapping: None,
-    };
-    let cancelled = ConnectorRequestContext::try_new(
-        Instant::now() + Duration::from_secs(30),
-        {
-            let stop = novarocks_spi::connector::ConnectorStopOwner::new();
-            stop.request_stop();
-            stop.view()
-        },
-        1024,
-        4096,
-    )
-    .expect("cancelled context");
-    let operation = crate::commit::operation::IcebergCommitOperation::new(
-        OperationToken::from_mutation(ConnectorMutationOperationId::new()),
-        table.metadata().location(),
-        runtime.resources().planning_binding().clone(),
-        cancelled,
-        runtime.resources().catalog_runtime().clone(),
-        crate::commit::operation::OperationLimits::default(),
-    )
-    .expect("operation");
-    let error = match operation.begin_attempt() {
-        Ok(_) => panic!("cancelled duplicate validation must stop before I/O"),
-        Err(error) => error,
-    };
-    assert_eq!(
-        crate::commit::attempt::before_dispatch_failure(&error).kind(),
-        ConnectorMutationFailureKind::Cancelled
-    );
-    assert!(operation.artifacts().expect("ledger").is_empty());
-    assert!(manifest.records.is_empty());
-}
-
 fn test_adapter(
     backend: Arc<FakeBackend>,
 ) -> (
@@ -501,123 +444,6 @@ pub(super) fn write_external_parquet(
     path
 }
 
-pub(super) fn register_plan(
-    adapter: &IcebergDataMutationAdapter,
-    provider: &IcebergMetadata,
-    directory: &std::path::Path,
-) -> ConnectorDataMutationPlan {
-    let metadata = provider
-        .load_table(
-            ConnectorTableRequest {
-                table: ConnectorTableIdentity {
-                    instance_id: provider.descriptor().instance_id.clone(),
-                    namespace: Arc::from("db"),
-                    table: Arc::from("t"),
-                },
-                resolution: ConnectorTableResolution::StrictBaseTable,
-                context: table_context(),
-            },
-            &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation::new(
-                novarocks_type_contract::ValueTypeStorageLifetime::pure(),
-                &mut |_| Ok(()),
-                &mut |_| Ok(()),
-            ),
-        )
-        .unwrap();
-    adapter
-        .plan_mutation(
-            ConnectorDataMutationPlanningRequest::try_new(
-                ConnectorMutationOperationId::new(),
-                adapter.binding_key().clone(),
-                ConnectorDataMutationOperation::register_existing_files(
-                    metadata.table,
-                    format!("file://{}", directory.display()),
-                )
-                .unwrap(),
-                table_context(),
-            )
-            .unwrap(),
-        )
-        .unwrap()
-}
-
-#[test]
-fn add_files_duplicate_on_refreshed_parent_preserves_external_parquet() {
-    let (_executor, _warehouse, provider) = exact_provider_with_empty_table();
-    let source = tempfile::tempdir().unwrap();
-    let file = write_external_parquet(source.path(), vec![1, 2, 3]);
-    let bytes = std::fs::read(&file).unwrap();
-    let adapter = IcebergDataMutationAdapter::try_new(provider.clone()).unwrap();
-    let first = register_plan(&adapter, &provider, source.path());
-    let concurrent = register_plan(&adapter, &provider, source.path());
-    assert!(matches!(
-        adapter
-            .execute(ConnectorDataMutationExecuteRequest::try_new(first, table_context()).unwrap())
-            .unwrap(),
-        ExternalMutationOutcome::KnownCommitted {
-            effect: ExternalMutationEffect::Applied,
-            finalization: ExternalMutationFinalization::Complete,
-            ..
-        }
-    ));
-    let refusal = adapter
-        .execute(ConnectorDataMutationExecuteRequest::try_new(concurrent, table_context()).unwrap())
-        .unwrap();
-    assert!(
-        matches!(refusal, ExternalMutationOutcome::KnownUncommitted { failure, cleanup: ExternalMutationFinalization::Complete }
-        if failure.kind() == ConnectorMutationFailureKind::Conflict)
-    );
-    assert_eq!(std::fs::read(&file).unwrap(), bytes);
-    let table = provider
-        .runtime()
-        .load_table_for_request("db", "t", &table_context())
-        .unwrap()
-        .into_table();
-    let active = provider
-        .runtime()
-        .resources()
-        .catalog_runtime()
-        .block_on(async move {
-            crate::manifest::extract_data_files_with_stats_with_control(&table, None).await
-        })
-        .unwrap()
-        .unwrap();
-    assert_eq!(active.len(), 1);
-    assert_eq!(active[0].record_count, Some(3));
-}
-
-#[test]
-fn add_files_changed_frozen_source_is_rejected_without_deleting_it() {
-    let (_executor, _warehouse, provider) = exact_provider_with_empty_table();
-    let source = tempfile::tempdir().unwrap();
-    write_external_parquet(source.path(), vec![1]);
-    let adapter = IcebergDataMutationAdapter::try_new(provider.clone()).unwrap();
-    let plan = register_plan(&adapter, &provider, source.path());
-    let file = write_external_parquet(source.path(), vec![1, 2]);
-    let changed_bytes = std::fs::read(&file).unwrap();
-    let outcome = adapter
-        .execute(ConnectorDataMutationExecuteRequest::try_new(plan, table_context()).unwrap())
-        .unwrap();
-    assert!(matches!(
-        outcome,
-        ExternalMutationOutcome::KnownUncommitted {
-            cleanup: ExternalMutationFinalization::Complete,
-            ..
-        }
-    ));
-    assert_eq!(std::fs::read(file).unwrap(), changed_bytes);
-    assert!(
-        provider
-            .runtime()
-            .load_table_for_request("db", "t", &table_context())
-            .unwrap()
-            .table
-            .metadata()
-            .current_snapshot_id()
-            .is_none()
-    );
-}
-
 #[test]
 fn mutation_recovery_rejects_changed_source_sequence_and_nested_unknown_fields() {
     let backend = Arc::new(FakeBackend::new());
@@ -637,7 +463,12 @@ fn mutation_recovery_rejects_changed_source_sequence_and_nested_unknown_fields()
         .get(&plan.operation_id())
         .unwrap()
         .clone();
-    let evidence = adapter.evidence(&plan, cached.private.payload()).unwrap();
+    let evidence = adapter
+        .evidence(
+            &plan,
+            cached.private.truncate_parts().expect("truncate plan").0,
+        )
+        .unwrap();
     let mut decoded: IcebergDataMutationEvidenceV3 =
         decode_canonical_json(evidence.provider_payload(), "recovery").unwrap();
     decoded.base_sequence_number = Some(5);
@@ -715,8 +546,6 @@ fn truncate_state_digest_binds_ref_and_base() {
         schema_id: 1,
         default_spec_id: 0,
         metadata_version_digest_hex: "aa".repeat(32),
-        source_location: None,
-        name_mapping_digest_hex: None,
     };
     let first = truncate_state_digest(&payload);
     payload.target_ref = "dev".to_string();
@@ -735,7 +564,10 @@ fn truncate_evidence_wire_fits_exact_durable_hex_boundary_and_rejects_one_over()
         let plans = adapter.plans.lock().expect("plans");
         let cached = plans.get(&plan.operation_id()).expect("cached plan");
         adapter
-            .evidence(plan, cached.private.payload())
+            .evidence(
+                plan,
+                cached.private.truncate_parts().expect("truncate plan").0,
+            )
             .expect("evidence")
             .try_to_wire_v1()
             .expect("wire")
@@ -1020,6 +852,7 @@ fn reconcile_marker_matrix_is_typed_and_never_reexecutes() {
 
 fn admission_runtime(
     catalog_type: &str,
+    add_files_enabled: bool,
 ) -> (
     tokio::runtime::Runtime,
     tempfile::TempDir,
@@ -1037,6 +870,10 @@ fn admission_runtime(
             warehouse.path().display().to_string(),
         ),
     ];
+    properties.push((
+        "iceberg.add-files-procedure.enabled".into(),
+        add_files_enabled.to_string(),
+    ));
     if catalog_type == "hive" {
         properties.push((
             "hive.metastore.uris".to_string(),
@@ -1106,7 +943,7 @@ fn assert_admission_left_no_io(warehouse: &tempfile::TempDir, listener: &std::ne
 #[test]
 fn planning_refuses_hms_and_background_hadoop_before_backend_io() {
     for catalog_type in ["hive", "hadoop"] {
-        let (_executor, warehouse, runtime, listener) = admission_runtime(catalog_type);
+        let (_executor, warehouse, runtime, listener) = admission_runtime(catalog_type, false);
         let descriptor = ConnectorInstanceDescriptor {
             provider_id: ConnectorProviderId::parse("iceberg").expect("provider"),
             instance_id: ConnectorInstanceId::parse("ice").expect("instance"),
@@ -1125,9 +962,10 @@ fn planning_refuses_hms_and_background_hadoop_before_backend_io() {
             .expect("truncate"),
             ConnectorDataMutationOperation::register_existing_files(
                 admission_table(adapter.key.instance_id.clone()),
-                warehouse.path().join("source").display().to_string(),
-            )
-            .expect("register files"),
+                Some(warehouse.path().join("source").display().to_string().into()),
+                Some(ConnectorAddFilesFormat::Parquet),
+                ConnectorAddFilesRecursion::Fail,
+            ),
         ] {
             let request = ConnectorDataMutationPlanningRequest::try_new(
                 ConnectorMutationOperationId::new(),
@@ -1192,4 +1030,83 @@ fn cached_plan_cannot_bypass_background_hadoop_admission() {
     assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
     assert!(error.to_string().contains("background"));
     assert_eq!(adapter.plans.lock().expect("plans").len(), 1);
+}
+
+#[test]
+fn registration_version_precedes_readable_format_admission() {
+    use crate::iceberg::spec::FormatVersion;
+    use ConnectorAddFilesFormat::{Avro, Orc, Parquet};
+
+    for version in [FormatVersion::V1, FormatVersion::V2] {
+        validate_registration_target("db", "t", version, Parquet).unwrap();
+        for format in [Orc, Avro] {
+            let error = validate_registration_target("db", "t", version, format).unwrap_err();
+            assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+            assert_eq!(
+                error.message(),
+                "NovaRocks ADD FILES only reads Parquet data files"
+            );
+        }
+    }
+    let error = validate_registration_target("db", "t", FormatVersion::V3, Orc).unwrap_err();
+    assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+    assert_eq!(
+        error.message(),
+        "ADD_FILES is not supported for Iceberg table format version > 2. Table \"db\".\"t\" format version is 3.",
+    );
+}
+
+#[test]
+fn registration_switch_and_required_arguments_are_admitted_in_order_without_io() {
+    use novarocks_failure_contract::FailureProjection;
+
+    for (enabled, location, message, reason) in [
+        (
+            false,
+            None,
+            "add_files procedure is disabled",
+            connector_reason::ADD_FILES_DISABLED,
+        ),
+        (
+            true,
+            None,
+            "Required procedure argument 'location' is missing",
+            connector_reason::PROCEDURE_ARGUMENT_INVALID,
+        ),
+        (
+            true,
+            Some("s3://bucket/source"),
+            "Required procedure argument 'format' is missing",
+            connector_reason::PROCEDURE_ARGUMENT_INVALID,
+        ),
+    ] {
+        let (_executor, warehouse, runtime, listener) = admission_runtime("hadoop", enabled);
+        let descriptor = ConnectorInstanceDescriptor {
+            provider_id: ConnectorProviderId::parse("iceberg").unwrap(),
+            instance_id: ConnectorInstanceId::parse("ice").unwrap(),
+        };
+        let provider = Arc::new(IcebergMetadata::new(
+            descriptor,
+            ProviderBindingEpoch::from_bytes([8; 16]),
+            runtime,
+        ));
+        let adapter = IcebergDataMutationAdapter::try_new(provider).unwrap();
+        let request = ConnectorDataMutationPlanningRequest::try_new(
+            ConnectorMutationOperationId::new(),
+            adapter.key.clone(),
+            ConnectorDataMutationOperation::register_existing_files(
+                admission_table(adapter.key.instance_id.clone()),
+                location.map(Arc::from),
+                None,
+                ConnectorAddFilesRecursion::Fail,
+            ),
+            admission_context("hadoop")
+                .with_initiation(novarocks_spi::connector::ConnectorRequestInitiation::Statement),
+        )
+        .unwrap();
+        let error = adapter.plan_mutation(request).unwrap_err();
+        assert_eq!(error.message(), message);
+        assert_eq!(error.failure_fact().reason(), reason);
+        assert_admission_left_no_io(&warehouse, &listener);
+    }
 }

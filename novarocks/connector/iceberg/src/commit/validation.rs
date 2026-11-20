@@ -31,25 +31,15 @@ pub(crate) fn deny_unwritable_data_files(
     schema: &crate::iceberg::spec::Schema,
     table: &str,
 ) -> Result<(), ConnectorError> {
-    deny_schema_types(schema, table, true)
-}
-
-/// File registration does not encode uuid values. Variant statistics remain
-/// unsupported, so ADD FILES must reject Variant before reading source files.
-pub(crate) fn deny_variant_registration(
-    schema: &crate::iceberg::spec::Schema,
-    table: &str,
-) -> Result<(), ConnectorError> {
-    deny_schema_types(schema, table, false)
+    deny_schema_types(schema, table)
 }
 
 fn deny_schema_types(
     schema: &crate::iceberg::spec::Schema,
     table: &str,
-    reject_uuid: bool,
 ) -> Result<(), ConnectorError> {
     for field in schema.as_struct().fields() {
-        deny_type(&field.field_type, &field.name, table, reject_uuid)?;
+        deny_type(&field.field_type, &field.name, table)?;
     }
     Ok(())
 }
@@ -58,22 +48,16 @@ fn deny_type(
     data_type: &crate::iceberg::spec::Type,
     path: &str,
     table: &str,
-    reject_uuid: bool,
 ) -> Result<(), ConnectorError> {
     use crate::iceberg::spec::{PrimitiveType, Type};
     match data_type {
         Type::Variant(_) => return Err(unwritable_error("Variant", table, path)),
-        Type::Primitive(PrimitiveType::Uuid) if reject_uuid => {
+        Type::Primitive(PrimitiveType::Uuid) => {
             return Err(unwritable_error("uuid", table, path));
         }
         Type::Struct(fields) => {
             for field in fields.fields() {
-                deny_type(
-                    &field.field_type,
-                    &format!("{path}.{}", field.name),
-                    table,
-                    reject_uuid,
-                )?;
+                deny_type(&field.field_type, &format!("{path}.{}", field.name), table)?;
             }
         }
         Type::List(list) => {
@@ -81,22 +65,11 @@ fn deny_type(
                 &list.element_field.field_type,
                 &format!("{path}.element"),
                 table,
-                reject_uuid,
             )?;
         }
         Type::Map(map) => {
-            deny_type(
-                &map.key_field.field_type,
-                &format!("{path}.key"),
-                table,
-                reject_uuid,
-            )?;
-            deny_type(
-                &map.value_field.field_type,
-                &format!("{path}.value"),
-                table,
-                reject_uuid,
-            )?;
+            deny_type(&map.key_field.field_type, &format!("{path}.key"), table)?;
+            deny_type(&map.value_field.field_type, &format!("{path}.value"), table)?;
         }
         Type::Primitive(_) => {}
     }
@@ -729,17 +702,6 @@ mod tests {
                 )
             );
             assert_eq!(error.public_failure_detail(), Some(error.message()));
-            if kind == "uuid" {
-                deny_variant_registration(&schema, "ice.db.t")
-                    .expect("uuid ADD FILES does not encode values");
-            } else {
-                assert_eq!(
-                    deny_variant_registration(&schema, "ice.db.t")
-                        .unwrap_err()
-                        .kind(),
-                    ConnectorErrorKind::Unsupported
-                );
-            }
         }
     }
 

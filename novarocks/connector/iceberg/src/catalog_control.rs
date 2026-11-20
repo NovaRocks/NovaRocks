@@ -225,6 +225,7 @@ mod tests {
             object_store_config: None,
             warehouse_path: PathBuf::from("/tmp/warehouse"),
             write: Default::default(),
+            add_files_enabled: false,
         });
 
         assert!(!state.is_s3());
@@ -249,6 +250,7 @@ mod tests {
                 object_store_config: None,
                 warehouse_path: PathBuf::from("/tmp/warehouse"),
                 write: Default::default(),
+                add_files_enabled: false,
             })
         };
         registry

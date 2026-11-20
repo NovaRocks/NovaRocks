@@ -52,6 +52,7 @@ the catalog's CatalogControl or DataCredentialVending credential binding";
 pub(crate) const MAX_PARTITIONS_PER_WRITER: &str = "iceberg.max-partitions-per-writer";
 pub const MAX_PARTITIONS_PER_WRITER_SESSION_PROPERTY: &str = "max_partitions_per_writer";
 const TARGET_MAX_FILE_SIZE: &str = "iceberg.target-max-file-size";
+const ADD_FILES_ENABLED: &str = "iceberg.add-files-procedure.enabled";
 pub(crate) const DEFAULT_MAX_PARTITIONS_PER_WRITER: u32 = 100;
 pub(crate) const DEFAULT_TARGET_FILE_SIZE_BYTES: u64 = 1 << 30;
 
@@ -175,6 +176,7 @@ pub struct IcebergCatalogConfiguration {
     pub object_store_config: Option<ObjectStoreConfig>,
     pub warehouse_path: PathBuf,
     pub write: IcebergCatalogWriteConfig,
+    pub add_files_enabled: bool,
 }
 
 impl IcebergCatalogConfiguration {
@@ -362,6 +364,7 @@ impl Debug for IcebergCatalogConfiguration {
             .field("object_store_config", &self.object_store_config)
             .field("warehouse_path", &self.warehouse_path)
             .field("write", &self.write)
+            .field("add_files_enabled", &self.add_files_enabled)
             .finish()
     }
 }
@@ -452,6 +455,16 @@ fn parse_catalog_configuration_with_binding_facts(
     }
 }
 
+fn parse_add_files_enabled(properties: &HashMap<String, String>) -> Result<bool, String> {
+    properties
+        .get(ADD_FILES_ENABLED)
+        .map_or(Ok(false), |value| {
+            value.parse::<bool>().map_err(|_| {
+                format!("Iceberg catalog property {ADD_FILES_ENABLED} requires true or false")
+            })
+        })
+}
+
 fn parse_hadoop_configuration(
     catalog_name: &str,
     mut properties: HashMap<String, String>,
@@ -459,6 +472,7 @@ fn parse_hadoop_configuration(
     endpoint_binding: Option<&ObjectStoreEndpointConfig>,
 ) -> Result<IcebergCatalogConfiguration, String> {
     let write = IcebergCatalogWriteConfig::parse(&properties)?;
+    let add_files_enabled = parse_add_files_enabled(&properties)?;
     let raw_warehouse = properties
         .get("iceberg.catalog.warehouse")
         .or_else(|| properties.get("warehouse"))
@@ -513,6 +527,7 @@ fn parse_hadoop_configuration(
     );
     Ok(IcebergCatalogConfiguration {
         write,
+        add_files_enabled,
         kind: IcebergCatalogKind::Hadoop,
         warehouse_uri,
         rest_uri: None,
@@ -529,6 +544,7 @@ fn parse_rest_configuration(
     endpoint_binding: Option<&ObjectStoreEndpointConfig>,
 ) -> Result<IcebergCatalogConfiguration, String> {
     let write = IcebergCatalogWriteConfig::parse(&properties)?;
+    let add_files_enabled = parse_add_files_enabled(&properties)?;
     // Every REST configuration passes here, so a definition that would let a
     // property override the role's authentication never yields a
     // configuration a generation could be built from.
@@ -565,6 +581,7 @@ fn parse_rest_configuration(
     }
     Ok(IcebergCatalogConfiguration {
         write,
+        add_files_enabled,
         kind: IcebergCatalogKind::Rest,
         warehouse_uri,
         rest_uri: Some(uri),
@@ -581,6 +598,7 @@ fn parse_hive_configuration(
     endpoint_binding: Option<&ObjectStoreEndpointConfig>,
 ) -> Result<IcebergCatalogConfiguration, String> {
     let write = IcebergCatalogWriteConfig::parse(&properties)?;
+    let add_files_enabled = parse_add_files_enabled(&properties)?;
     for key in properties.keys() {
         let normalized = key.to_ascii_lowercase();
         if normalized.contains("kerberos")
@@ -633,6 +651,7 @@ fn parse_hive_configuration(
     }
     Ok(IcebergCatalogConfiguration {
         write,
+        add_files_enabled,
         kind: IcebergCatalogKind::Hive,
         warehouse_uri,
         rest_uri: None,

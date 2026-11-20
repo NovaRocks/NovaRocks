@@ -27,7 +27,10 @@ use novarocks_parser::{
     Span,
     ast::{CallArgument, Expr, Ident, LiteralKind},
 };
-use novarocks_spi::connector::{ConnectorProviderId, DdlPropertyType, DdlPropertyValue};
+use novarocks_spi::connector::{
+    ConnectorAddFilesFormat, ConnectorAddFilesRecursion, ConnectorProviderId, DdlPropertyType,
+    DdlPropertyValue,
+};
 use novarocks_sql::compiler::RequiredConstantTarget;
 use novarocks_type_contract::{CompilePhase, PureCompileControl, ValueKind, ValueLogicalType};
 use novarocks_user_error::{
@@ -80,8 +83,15 @@ pub enum TableProcedureKind {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProcedureArgumentType {
     Value(DdlPropertyType),
+    Enum(ProcedureArgumentEnum),
     AbsoluteTime,
     EqualityRows,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProcedureArgumentEnum {
+    AddFilesFormat,
+    AddFilesRecursion,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -215,12 +225,15 @@ const ICEBERG: &[TableProcedure] = &[
         "ADD_FILES",
         &[
             argument("location", Value(Type::Varchar)),
-            argument("format", Value(Type::Varchar)),
-            unsupported(with_default(
+            argument(
+                "format",
+                ProcedureArgumentType::Enum(ProcedureArgumentEnum::AddFilesFormat),
+            ),
+            with_default(
                 "recursive_directory",
-                Value(Type::Varchar),
+                ProcedureArgumentType::Enum(ProcedureArgumentEnum::AddFilesRecursion),
                 DefaultValue::Varchar("FAIL"),
-            )),
+            ),
         ],
     ),
     procedure(
@@ -377,6 +390,8 @@ pub trait TableProcedureAbsoluteTimePort {
 #[derive(Debug, PartialEq)]
 pub enum BoundProcedureValue<'a> {
     Value(DdlPropertyValue),
+    AddFilesFormat(ConnectorAddFilesFormat),
+    AddFilesRecursion(ConnectorAddFilesRecursion),
     RetentionDuration(ProcedureRetentionDuration),
     EqualityRows(&'a Expr),
 }
@@ -417,11 +432,16 @@ impl<'a> BoundTableProcedure<'a> {
     }
 }
 
+pub struct TableProcedureBindingSource<'a> {
+    pub sql: &'a str,
+    pub catalog: &'a str,
+    pub statement_span: Span,
+}
+
 pub fn bind_arguments<'a>(
     procedure: &'static TableProcedure,
     arguments: &[TableProcedureInputArgument<'a>],
-    source: &str,
-    statement_span: Span,
+    source: TableProcedureBindingSource<'_>,
     constants: &mut dyn DdlPropertyConstantPort,
     absolute_time: &mut dyn TableProcedureAbsoluteTimePort,
     control: &dyn PureCompileControl,
@@ -437,8 +457,8 @@ pub fn bind_arguments<'a>(
     bind_slots(
         procedure,
         &arguments,
-        Some(source),
-        Some((source, statement_span)),
+        Some(source.sql),
+        Some((source.sql, source.statement_span)),
         control,
         |slot, argument| {
             let span = argument.span.expect("original SQL argument span");
@@ -450,8 +470,12 @@ pub fn bind_arguments<'a>(
                     value: bind_value(
                         slot,
                         input,
-                        source,
-                        span,
+                        EnumArgumentContext {
+                            sql: source.sql,
+                            catalog: source.catalog,
+                            procedure: procedure.name,
+                            span,
+                        },
                         constants,
                         absolute_time,
                         control,
@@ -576,11 +600,18 @@ fn bind_slots<'a, A: Copy>(
     })
 }
 
+#[derive(Clone, Copy)]
+struct EnumArgumentContext<'a> {
+    sql: &'a str,
+    catalog: &'a str,
+    procedure: &'static str,
+    span: Span,
+}
+
 fn bind_value<'a>(
     slot: &TableProcedureArgument,
     input: ProcedureInput<'a>,
-    source: &str,
-    span: Span,
+    binding: EnumArgumentContext<'_>,
     constants: &mut dyn DdlPropertyConstantPort,
     absolute_time: &mut dyn TableProcedureAbsoluteTimePort,
     control: &dyn PureCompileControl,
@@ -590,6 +621,9 @@ fn bind_value<'a>(
     {
         return Ok(BoundProcedureValue::EqualityRows(expression));
     }
+    let EnumArgumentContext {
+        sql: source, span, ..
+    } = binding;
     let location = Some((source, span));
     let evaluate = |expression, ty, constants: &mut dyn DdlPropertyConstantPort| {
         evaluate_required_property_value(expression, ty, constants, control, |message, cause| {
@@ -598,6 +632,17 @@ fn bind_value<'a>(
     };
     let value = match (slot.value_type, input) {
         (Value(ty), ProcedureInput::Expression(expression)) => evaluate(expression, ty, constants)?,
+        (ProcedureArgumentType::Enum(values), ProcedureInput::Expression(expression)) => {
+            let value = evaluate(expression, Type::Varchar, constants)?;
+            validate_supplied_value(slot, &value, location)?;
+            let DdlPropertyValue::Varchar(value) = value else {
+                return Err(invariant(
+                    "Table procedure enum received a different declared type",
+                ));
+            };
+            return bind_procedure_enum(values, slot.name, expression, &value, binding);
+        }
+
         (ProcedureArgumentType::AbsoluteTime, ProcedureInput::Expression(expression)) => {
             let literal = match expression {
                 Expr::Literal(literal) => match &literal.kind {
@@ -641,6 +686,90 @@ fn bind_value<'a>(
             .map(BoundProcedureValue::RetentionDuration);
     }
     Ok(BoundProcedureValue::Value(value))
+}
+
+fn bind_procedure_enum<'a>(
+    declaration: ProcedureArgumentEnum,
+    name: &str,
+    expression: &Expr,
+    input: &str,
+    context: EnumArgumentContext<'_>,
+) -> Result<BoundProcedureValue<'a>, QueryServiceError> {
+    const STORAGE_FORMATS: &[&str] = &[
+        "ORC",
+        "PARQUET",
+        "AVRO",
+        "RCBINARY",
+        "RCTEXT",
+        "SEQUENCEFILE",
+        "SEQUENCEFILE_PROTOBUF",
+        "JSON",
+        "OPENX_JSON",
+        "TEXTFILE",
+        "CSV",
+        "REGEX",
+        "ESRI",
+        "ESRI_GEO_JSON",
+    ];
+    const RECURSION_VALUES: &[&str] = &["TRUE", "FALSE", "FAIL"];
+
+    let canonical = input.to_ascii_uppercase();
+    let problem = match (declaration, canonical.as_str()) {
+        (ProcedureArgumentEnum::AddFilesFormat, "ORC") => {
+            return Ok(BoundProcedureValue::AddFilesFormat(
+                ConnectorAddFilesFormat::Orc,
+            ));
+        }
+        (ProcedureArgumentEnum::AddFilesFormat, "PARQUET") => {
+            return Ok(BoundProcedureValue::AddFilesFormat(
+                ConnectorAddFilesFormat::Parquet,
+            ));
+        }
+        (ProcedureArgumentEnum::AddFilesFormat, "AVRO") => {
+            return Ok(BoundProcedureValue::AddFilesFormat(
+                ConnectorAddFilesFormat::Avro,
+            ));
+        }
+        (ProcedureArgumentEnum::AddFilesRecursion, "TRUE") => {
+            return Ok(BoundProcedureValue::AddFilesRecursion(
+                ConnectorAddFilesRecursion::Include,
+            ));
+        }
+        (ProcedureArgumentEnum::AddFilesRecursion, "FALSE") => {
+            return Ok(BoundProcedureValue::AddFilesRecursion(
+                ConnectorAddFilesRecursion::Skip,
+            ));
+        }
+        (ProcedureArgumentEnum::AddFilesRecursion, "FAIL") => {
+            return Ok(BoundProcedureValue::AddFilesRecursion(
+                ConnectorAddFilesRecursion::Fail,
+            ));
+        }
+        (ProcedureArgumentEnum::AddFilesFormat, format) if STORAGE_FORMATS.contains(&format) => {
+            format!("The procedure does not support storage format: {format}")
+        }
+        (declaration, _) => {
+            let values = match declaration {
+                ProcedureArgumentEnum::AddFilesFormat => STORAGE_FORMATS,
+                ProcedureArgumentEnum::AddFilesRecursion => RECURSION_VALUES,
+            };
+            format!(
+                "Invalid value [{input}]. Valid values: [{}]",
+                values.join(", ")
+            )
+        }
+    };
+    let expression_sql = novarocks_parser::printer::print_expression(expression)
+        .map_err(|_| invariant("Table procedure argument could not be printed"))?;
+    Err(error(
+        INVALID_ARGUMENT,
+        Some((context.sql, expression.span())),
+        format!(
+            "Unable to set catalog '{}' table procedure '{}' property '{}' to [{}]: {}",
+            context.catalog, context.procedure, name, expression_sql, problem,
+        ),
+        None,
+    ))
 }
 
 fn evaluate_timestamp(
@@ -729,19 +858,13 @@ fn validate_supplied_value(
             None,
         ));
     }
-    if slot.name == "format"
-        && matches!(value, DdlPropertyValue::Varchar(format) if !format.eq_ignore_ascii_case("PARQUET"))
-    {
-        return Err(not_supported(
-            "Table procedure ADD_FILES only supports PARQUET",
-        ));
-    }
     Ok(())
 }
 
 fn matches_type(expected: ProcedureArgumentType, value: &DdlPropertyValue) -> bool {
     match expected {
         Value(ty) => value.value_type() == Some(ty),
+        ProcedureArgumentType::Enum(_) => value.value_type() == Some(Type::Varchar),
         ProcedureArgumentType::AbsoluteTime => matches!(
             value,
             DdlPropertyValue::Varchar(_) | DdlPropertyValue::Bigint(_)
@@ -863,8 +986,11 @@ mod tests {
             let error = bind_arguments(
                 procedure,
                 &args,
-                sql,
-                call.span,
+                TableProcedureBindingSource {
+                    sql,
+                    catalog: "ice",
+                    statement_span: call.span,
+                },
                 &mut UnreachedEvaluation,
                 &mut UnreachedEvaluation,
                 &SqlCompileControl::unbounded(),

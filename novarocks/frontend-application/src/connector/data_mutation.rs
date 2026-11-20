@@ -22,14 +22,14 @@ use std::fmt;
 use std::sync::Arc;
 
 use novarocks_spi::connector::{
-    ConnectorDataMutationExecuteRequest, ConnectorDataMutationOperation,
-    ConnectorDataMutationReceipt, ConnectorDataMutationReconcileRequest,
-    ConnectorDataMutationResolver, ConnectorDataMutationSession, ConnectorError,
-    ConnectorErrorKind, ConnectorInstanceId, ConnectorMutationFailure,
-    ConnectorMutationFailureKind, ConnectorMutationOperationId, ConnectorRequestContext,
-    ConnectorTableIdentity, ConnectorTableRequest, ConnectorTableResolution,
-    ExternalMutationEffect, ExternalMutationEvidence, ExternalMutationFinalization,
-    ExternalMutationOutcome,
+    ConnectorAddFilesFormat, ConnectorAddFilesRecursion, ConnectorDataMutationExecuteRequest,
+    ConnectorDataMutationOperation, ConnectorDataMutationReceipt,
+    ConnectorDataMutationReconcileRequest, ConnectorDataMutationResolver,
+    ConnectorDataMutationSession, ConnectorError, ConnectorErrorKind, ConnectorInstanceId,
+    ConnectorMutationFailure, ConnectorMutationFailureKind, ConnectorMutationOperationId,
+    ConnectorRequestContext, ConnectorTableIdentity, ConnectorTableRequest,
+    ConnectorTableResolution, ExternalMutationEffect, ExternalMutationEvidence,
+    ExternalMutationFinalization, ExternalMutationOutcome,
 };
 
 #[cfg(test)]
@@ -39,14 +39,26 @@ use novarocks_query_application::engine_error::EngineError;
 /// loaded through the exact-generation metadata capability.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataMutationIntent {
-    RegisterExistingFiles { source_location: Arc<str> },
-    Truncate { target_ref: Arc<str> },
+    RegisterExistingFiles {
+        location: Option<Arc<str>>,
+        format: Option<ConnectorAddFilesFormat>,
+        recursion: ConnectorAddFilesRecursion,
+    },
+    Truncate {
+        target_ref: Arc<str>,
+    },
 }
 
 impl DataMutationIntent {
-    pub fn register_existing_files(source_location: impl Into<Arc<str>>) -> Self {
+    pub fn register_existing_files(
+        location: Option<Arc<str>>,
+        format: Option<ConnectorAddFilesFormat>,
+        recursion: ConnectorAddFilesRecursion,
+    ) -> Self {
         Self::RegisterExistingFiles {
-            source_location: source_location.into(),
+            location,
+            format,
+            recursion,
         }
     }
 
@@ -61,9 +73,13 @@ impl DataMutationIntent {
         table: novarocks_spi::connector::ConnectorTableHandle,
     ) -> Result<ConnectorDataMutationOperation, ConnectorError> {
         match self {
-            Self::RegisterExistingFiles { source_location } => {
-                ConnectorDataMutationOperation::register_existing_files(table, source_location)
-            }
+            Self::RegisterExistingFiles {
+                location,
+                format,
+                recursion,
+            } => Ok(ConnectorDataMutationOperation::register_existing_files(
+                table, location, format, recursion,
+            )),
             Self::Truncate { target_ref } => {
                 ConnectorDataMutationOperation::truncate(table, target_ref)
             }
@@ -726,23 +742,7 @@ mod tests {
             ConnectorDataMutationPlan::try_new(
                 &request,
                 [3; 32],
-                ConnectorDataMutationPlanSummary::try_new(1, 2, 3)?,
-                match request.operation() {
-                    ConnectorDataMutationOperation::RegisterExistingFiles { .. } => Some(
-                        novarocks_spi::connector::ConnectorDataMutationSourceScope::try_new_directory(
-                            [4; 32],
-                        )?,
-                    ),
-                    ConnectorDataMutationOperation::Truncate { .. } => None,
-                },
-                match request.operation() {
-                    ConnectorDataMutationOperation::RegisterExistingFiles { .. } => Some(
-                        novarocks_spi::connector::ConnectorDataMutationAddFilesDomain::try_new_caller_managed_stable(
-                            [5; 32],
-                        )?,
-                    ),
-                    ConnectorDataMutationOperation::Truncate { .. } => None,
-                },
+                ConnectorDataMutationPlanSummary::new(1, 2, 3),
                 Bytes::from_static(b"plan"),
             )
         }
@@ -842,7 +842,7 @@ mod tests {
                     request.request_digest,
                     request.plan_digest,
                     request.state_digest,
-                    ConnectorDataMutationPlanSummary::try_new(1, 2, 3)?,
+                    ConnectorDataMutationPlanSummary::new(1, 2, 3),
                     Bytes::new(),
                 )?,
                 finalization: ExternalMutationFinalization::Complete,
@@ -1019,7 +1019,11 @@ mod tests {
             &provider.descriptor.instance_id,
             operation_id,
             table(&provider.descriptor.instance_id),
-            DataMutationIntent::register_existing_files("s3://bucket/import"),
+            DataMutationIntent::register_existing_files(
+                Some("s3://bucket/import".into()),
+                Some(ConnectorAddFilesFormat::Parquet),
+                ConnectorAddFilesRecursion::Fail,
+            ),
             context(),
         )
         .expect("planned session");

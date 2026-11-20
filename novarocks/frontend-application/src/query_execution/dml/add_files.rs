@@ -27,9 +27,9 @@ use std::any::Any;
 use std::sync::{Arc, Mutex};
 
 use novarocks_spi::connector::{
-    ConnectorDataMutationSourceScope, ConnectorError, ConnectorErrorKind, ConnectorMutationFailure,
-    ConnectorMutationFailureKind, ConnectorMutationOperationId, ExternalMutationEffect,
-    ExternalMutationEvidence, ExternalMutationFinalization,
+    ConnectorAddFilesFormat, ConnectorAddFilesRecursion, ConnectorError, ConnectorErrorKind,
+    ConnectorMutationFailure, ConnectorMutationFailureKind, ConnectorMutationOperationId,
+    ExternalMutationEffect, ExternalMutationEvidence, ExternalMutationFinalization,
 };
 
 use crate::connector::data_mutation::{
@@ -40,6 +40,13 @@ use crate::query_execution::kernels::DmlExecutionKernel;
 use novarocks_proto_codec::lifecycle::QueryOptions;
 use novarocks_query_application::admitted_query_context::QueryExecutionContext;
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AddFilesArguments {
+    pub location: Option<Arc<str>>,
+    pub format: Option<ConnectorAddFilesFormat>,
+    pub recursion: ConnectorAddFilesRecursion,
+}
+
 /// Lowered table and source location from TABLE EXECUTE argument binding.
 ///
 /// Table resolution remains a frontend concern; this command deliberately
@@ -47,13 +54,13 @@ use novarocks_query_application::admitted_query_context::QueryExecutionContext;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AddFilesCommand {
     pub table_parts: Vec<String>,
-    pub location: String,
+    pub arguments: AddFilesArguments,
 }
 
 pub(crate) struct ResolvedAddFiles {
     pub(crate) target: crate::catalog_application::resolver::TargetBackend,
     pub(crate) planning: novarocks_spi::connector::ConnectorControlPlanningPin,
-    pub(crate) location: String,
+    pub(crate) arguments: AddFilesArguments,
 }
 
 pub struct PlanAddFilesRequest {
@@ -134,7 +141,6 @@ pub struct AddFilesPlanFacts {
     pub catalog: String,
     pub namespace: String,
     pub table: String,
-    pub source_location: String,
     pub provider_id: String,
     pub instance_id: String,
     pub incarnation: [u8; 16],
@@ -142,8 +148,6 @@ pub struct AddFilesPlanFacts {
     pub request_digest: [u8; 32],
     pub plan_digest: [u8; 32],
     pub state_digest: [u8; 32],
-    pub summary: AddFilesPlanSummary,
-    pub source_scope: ConnectorDataMutationSourceScope,
     pub public_plan_wire: Vec<u8>,
 }
 
@@ -287,7 +291,12 @@ impl AddFilesEngine for DmlExecutionKernel {
             table: target.table.clone().into(),
         };
         let operation = ConnectorMutationOperationId::from_bytes(request.mutation_operation_id);
-        let intent = DataMutationIntent::register_existing_files(request.command.location.clone());
+        let arguments = request.command.arguments;
+        let intent = DataMutationIntent::register_existing_files(
+            arguments.location,
+            arguments.format,
+            arguments.recursion,
+        );
         let lease = self
             .connector_control()
             .acquire_exact_data_mutation(planning.control_runtime_id())
@@ -302,28 +311,16 @@ impl AddFilesEngine for DmlExecutionKernel {
         .map_err(project_plan_error)?;
         let descriptor = session.descriptor_ref();
         let plan = session.plan_ref();
-        let source_scope =
-            plan.source_scope()
-                .ok_or_else(|| AddFilesPlanError::ContractFailure {
-                    failure: AddFilesFailure {
-                        kind: AddFilesFailureKind::CorruptData,
-                        message: "ADD FILES plan did not contain a source ownership scope"
-                            .to_string(),
-                    },
-                    dispatch: AddFilesDispatchState::ConfirmedNotDispatched,
-                })?;
         let public_plan_wire =
             plan.try_to_wire_v1()
                 .map_err(|error| AddFilesPlanError::ContractFailure {
                     failure: project_connector_error(error),
                     dispatch: AddFilesDispatchState::ConfirmedNotDispatched,
                 })?;
-        let summary = plan.summary();
         let facts = AddFilesPlanFacts {
             catalog: target.catalog,
             namespace: target.namespace,
             table: target.table,
-            source_location: request.command.location,
             provider_id: descriptor.provider_id.as_str().to_string(),
             instance_id: descriptor.instance_id.as_str().to_string(),
             incarnation: plan.owner().incarnation.to_bytes(),
@@ -331,12 +328,6 @@ impl AddFilesEngine for DmlExecutionKernel {
             request_digest: plan.request_digest(),
             plan_digest: plan.plan_digest(),
             state_digest: plan.state_digest(),
-            summary: AddFilesPlanSummary {
-                file_count: summary.file_count(),
-                row_count: summary.row_count(),
-                total_bytes: summary.total_bytes(),
-            },
-            source_scope,
             public_plan_wire: public_plan_wire.to_vec(),
         };
         Ok(PreparedAddFiles {
@@ -645,11 +636,11 @@ mod tests {
     }
 
     #[test]
-    fn missing_source_scope_is_pre_dispatch_contract_failure() {
+    fn failed_plan_wire_is_pre_dispatch_contract_failure() {
         let error = project_plan_error(ResolvedDataMutation::ContractFailure {
             error: ConnectorError::new(
                 ConnectorErrorKind::CorruptData,
-                "ADD FILES plan did not contain a source ownership scope",
+                "ADD FILES plan could not be encoded",
             ),
             dispatch: DataMutationDispatchState::ConfirmedNotDispatched,
         });
@@ -675,7 +666,7 @@ mod tests {
             [3; 32],
             [4; 32],
             [5; 32],
-            ConnectorDataMutationPlanSummary::try_new(7, 11, 13).expect("summary"),
+            ConnectorDataMutationPlanSummary::new(7, 11, 13),
             Bytes::from_static(b"provider-receipt"),
         )
         .expect("receipt");

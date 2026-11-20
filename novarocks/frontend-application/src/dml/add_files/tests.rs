@@ -22,12 +22,12 @@ use std::time::{Duration, Instant};
 
 use super::*;
 use crate::query_execution::dml::add_files::{
-    AddFilesEvidence, AddFilesPlanSummary, AddFilesPrepared,
+    AddFilesArguments, AddFilesEvidence, AddFilesPrepared,
 };
 use novarocks_query_application::admitted_query_context::{RequestAdmission, RequestContext};
 use novarocks_query_application::api::BackendTopologySnapshot;
 use novarocks_query_application::cancellation::QueryCancellationSource;
-use novarocks_spi::connector::ConnectorDataMutationSourceScope;
+use novarocks_spi::connector::{ConnectorAddFilesFormat, ConnectorAddFilesRecursion};
 use novarocks_types::ClusterRole;
 
 struct TestPrepared;
@@ -55,7 +55,6 @@ impl AddFilesEngine for RecordingAddFilesEngine {
                 catalog: "ice".to_string(),
                 namespace: "db".to_string(),
                 table: "orders".to_string(),
-                source_location: request.command.location,
                 provider_id: "iceberg".to_string(),
                 instance_id: "ice".to_string(),
                 incarnation: [1; 16],
@@ -63,13 +62,6 @@ impl AddFilesEngine for RecordingAddFilesEngine {
                 request_digest: [2; 32],
                 plan_digest: [3; 32],
                 state_digest: [4; 32],
-                summary: AddFilesPlanSummary {
-                    file_count: 1,
-                    row_count: 2,
-                    total_bytes: 3,
-                },
-                source_scope: ConnectorDataMutationSourceScope::try_new_directory([5; 32])
-                    .expect("valid source scope"),
                 public_plan_wire: vec![6],
             },
             handle: Arc::new(TestPrepared),
@@ -114,19 +106,6 @@ fn context() -> RequestContext {
 }
 
 #[test]
-fn caller_source_validation_does_not_treat_path_spelling_as_credentials() {
-    assert!(is_secret_free_source_location(
-        "s3://bucket/secret-data/files"
-    ));
-    assert!(!is_secret_free_source_location(
-        "s3://key:secret@bucket/files"
-    ));
-    assert!(!is_secret_free_source_location(
-        "s3://bucket/files?token=secret"
-    ));
-}
-
-#[test]
 fn planned_add_files_does_not_dispatch_until_the_second_edge() {
     let engine = RecordingAddFilesEngine::default();
     let prepared = DmlService::new()
@@ -134,7 +113,11 @@ fn planned_add_files_does_not_dispatch_until_the_second_edge() {
             &engine,
             AddFilesCommand {
                 table_parts: vec!["ice".to_string(), "db".to_string(), "orders".to_string()],
-                location: "s3://bucket/source".to_string(),
+                arguments: AddFilesArguments {
+                    location: Some("s3://bucket/source".into()),
+                    format: Some(ConnectorAddFilesFormat::Parquet),
+                    recursion: ConnectorAddFilesRecursion::Fail,
+                },
             },
             &context(),
             None,

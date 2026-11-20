@@ -166,7 +166,7 @@ fn ensure_canonical_json<T: Serialize>(
 fn base64_encode(value: impl AsRef<[u8]>) -> String {
     base64::engine::general_purpose::STANDARD.encode(value)
 }
-fn validate_secret_free_text(subject: &str, value: &str) -> Result<(), String> {
+pub(crate) fn validate_secret_free_text(subject: &str, value: &str) -> Result<(), String> {
     if value.contains('\0') {
         return Err(format!("Iceberg {subject} contains a NUL byte"));
     }

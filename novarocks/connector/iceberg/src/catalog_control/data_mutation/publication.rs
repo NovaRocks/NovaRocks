@@ -19,7 +19,7 @@
 
 use super::*;
 #[cfg(test)]
-use crate::catalog::error::{CatalogCommitEvidence, CatalogOutcome};
+use crate::catalog::error::CatalogOutcome;
 use crate::catalog::publication::CatalogEvidencePolicy;
 use crate::catalog::publication_dispatch::{PreparationResult, PreparedPublication};
 #[cfg(test)]
@@ -30,12 +30,12 @@ use crate::commit::attempt::observation::PublicationJournal;
 use crate::commit::attempt::prepared::{CatalogPublisher, PublicationPreparer};
 use crate::commit::attempt::{self, RetryPolicy};
 use crate::commit::model::{
-    AddedContent, ArtifactWriter, Dependency, FileChanges, FrozenRequest, IsolationLevel,
-    OperationIntent, OperationIntentParts, RequestShape, TableTarget,
+    ArtifactWriter, Dependency, FileChanges, FrozenRequest, IsolationLevel, OperationIntent,
+    OperationIntentParts, RequestShape, TableTarget,
 };
 use crate::commit::operation::{IcebergCommitAttempt, IcebergCommitOperation, OperationLimits};
 use crate::commit::publication_descriptor::PublicationDescriptor;
-use crate::commit::staging::{PreparedChange, Preparer, StagingBase};
+use crate::commit::staging::{PreparedChange, StagingBase};
 use async_trait::async_trait;
 use novarocks_spi::connector::ProviderBindingEpoch;
 
@@ -46,9 +46,8 @@ pub(super) fn format_error(error: ConnectorError) -> crate::iceberg::Error {
 
 struct MutationPublisher {
     inner: Arc<CatalogPublisher>,
-    planned: PlannedIcebergMutation,
+    payload: IcebergDataMutationPlanPayloadV2,
     runtime: Arc<IcebergMetadataContext>,
-    context: ConnectorRequestContext,
 }
 
 #[async_trait]
@@ -80,37 +79,7 @@ impl PublicationPreparer for MutationPublisher {
             .metadata_location(metadata_location.clone())
             .file_io(attempt.file_io().clone())
             .build()?;
-        match &self.planned {
-            PlannedIcebergMutation::Truncate { payload, .. } => {
-                validate_frozen_table(&table, payload).map_err(format_error)?
-            }
-            PlannedIcebergMutation::RegisterExistingFiles {
-                payload, manifest, ..
-            } => {
-                validate_add_files_target_shape(&table, payload).map_err(format_error)?;
-                ConnectorOperationControl::check_active(&self.context).map_err(format_error)?;
-                let source = payload
-                    .source_location
-                    .as_deref()
-                    .ok_or_else(|| format_error(corrupt("ADD FILES source location is absent")))?;
-                // This helper bridges through the injected catalog runtime. The
-                // same authoritative M is validated and returned to staging.
-                let revalidated = revalidate_manifest_for_table(
-                    &table,
-                    source,
-                    &self
-                        .runtime
-                        .resources()
-                        .planning_binding()
-                        .for_request(self.context.clone()),
-                    manifest,
-                    self.runtime.resources().catalog_runtime(),
-                    self.runtime.novarocks_catalog().listing_admission(),
-                );
-                ConnectorOperationControl::check_active(&self.context).map_err(format_error)?;
-                revalidated.map_err(|error| format_error(map_provider_error(error)))?;
-            }
-        }
+        validate_frozen_table(&table, &self.payload).map_err(format_error)?;
         attempt.check_active()?;
         Ok(base)
     }
@@ -144,8 +113,9 @@ fn freeze_intent(
     operation: &IcebergCommitOperation,
     marker: &IcebergDataMutationMarkerV1,
 ) -> crate::iceberg::Result<OperationIntent> {
-    let payload = planned.payload();
-    let source = planned.source_metadata();
+    let (payload, source) = planned
+        .truncate_parts()
+        .ok_or_else(|| format_error(invalid("TRUNCATE publication requires a truncate plan")))?;
     let start = source_snapshot(source, &payload.target_ref).map_err(format_error)?;
     if source.uuid().to_string() != payload.table_uuid
         || start.map(|s| s.snapshot_id) != payload.base_snapshot_id
@@ -157,24 +127,6 @@ fn freeze_intent(
             "Data mutation lost its exact admitted source metadata",
         )));
     }
-    let (added, dependencies) = match planned {
-        PlannedIcebergMutation::RegisterExistingFiles { manifest, .. } => (
-            manifest
-                .to_data_files()
-                .map_err(|error| format_error(map_provider_error(error)))?
-                .into_iter()
-                .map(|file| AddedContent::new_logical_data(file, payload.default_spec_id))
-                .collect::<crate::iceberg::Result<Vec<_>>>()?,
-            vec![Dependency::RegisteredFilesNotLive(
-                manifest
-                    .records
-                    .iter()
-                    .map(|record| record.location.clone())
-                    .collect(),
-            )],
-        ),
-        PlannedIcebergMutation::Truncate { .. } => (vec![], vec![Dependency::RefUnchanged]),
-    };
     let marker_value =
         canonical_json(marker, "Iceberg data mutation marker").map_err(format_error)?;
     let summary = BTreeMap::from([(
@@ -193,15 +145,25 @@ fn freeze_intent(
         target_ref: payload.target_ref.clone(),
         start,
         changes: FileChanges {
-            added,
+            added: vec![],
             removed: vec![],
         },
-        dependencies,
+        dependencies: vec![Dependency::RefUnchanged],
         isolation: IsolationLevel::Serializable,
         shape: RequestShape::SnapshotProducing,
         summary,
         token: operation.token(),
     })
+}
+
+pub(super) fn registration_pending() -> ExternalMutationOutcome<ConnectorDataMutationReceipt> {
+    ExternalMutationOutcome::KnownUncommitted {
+        failure: failure(
+            ConnectorMutationFailureKind::Unsupported,
+            "Iceberg ADD FILES execution is being wired",
+        ),
+        cleanup: ExternalMutationFinalization::Complete,
+    }
 }
 
 impl RegisteredIcebergDataMutationBackend {
@@ -212,9 +174,12 @@ impl RegisteredIcebergDataMutationBackend {
         recovery: &MutationRecoveryTemplate,
         context: &ConnectorRequestContext,
     ) -> Result<ExternalMutationOutcome<ConnectorDataMutationReceipt>, ConnectorError> {
+        let Some((payload, source)) = planned.truncate_parts() else {
+            return Ok(registration_pending());
+        };
         let operation = match IcebergCommitOperation::new(
             OperationToken::from_mutation(recovery.plan.operation_id()),
-            planned.source_metadata().location(),
+            source.location(),
             self.runtime.resources().planning_binding().clone(),
             context.clone(),
             self.runtime.resources().catalog_runtime().clone(),
@@ -239,25 +204,13 @@ impl RegisteredIcebergDataMutationBackend {
             .catalog_runtime()
             .observe_preparation(
                 || {
-                    let table = self.reload_table(
-                        &planned.payload().namespace,
-                        &planned.payload().table,
-                        context,
-                    )?;
-                    match planned {
-                        PlannedIcebergMutation::Truncate { payload, .. } => {
-                            validate_frozen_table(&table, payload)?
-                        }
-                        PlannedIcebergMutation::RegisterExistingFiles { payload, .. } => {
-                            validate_add_files_target_shape(&table, payload)?
-                        }
-                    }
+                    let table = self.reload_table(&payload.namespace, &payload.table, context)?;
+                    validate_frozen_table(&table, payload)?;
                     anchor_committed_write(&self.runtime, &table)?;
                     let intent = freeze_intent(planned, &operation, marker)
                         .map_err(|error| corrupt(error.to_string()))?;
-                    let policy =
-                        RetryPolicy::from_properties(planned.source_metadata().properties())
-                            .map_err(|error| invalid(error.to_string()))?;
+                    let policy = RetryPolicy::from_properties(source.properties())
+                        .map_err(|error| invalid(error.to_string()))?;
                     Ok::<_, ConnectorError>((intent, policy))
                 },
                 |error| attempt::before_dispatch_failure(&format_error(error.clone())),
@@ -300,14 +253,7 @@ impl RegisteredIcebergDataMutationBackend {
         );
         let direct = Arc::new(CatalogPublisher {
             expected_table_uuid: None,
-            catalog_operation: match planned {
-                PlannedIcebergMutation::Truncate { .. } => {
-                    crate::catalog::admission::CatalogOperation::Truncate
-                }
-                PlannedIcebergMutation::RegisterExistingFiles { .. } => {
-                    crate::catalog::admission::CatalogOperation::RegisterFiles
-                }
-            },
+            catalog_operation: crate::catalog::admission::CatalogOperation::Truncate,
             catalog: Arc::clone(self.runtime.novarocks_catalog()),
             ident: intent.target().ident.clone(),
             target_ref: intent.target_ref().into(),
@@ -316,36 +262,28 @@ impl RegisteredIcebergDataMutationBackend {
         });
         let publisher = journal.observe_prepared(Arc::new(MutationPublisher {
             inner: direct,
-            planned: planned.clone(),
+            payload: payload.clone(),
             runtime: Arc::clone(&self.runtime),
-            context: context.clone(),
         }));
         let prefix = PreparedChange {
             updates: vec![],
             requirements: vec![
                 crate::iceberg::TableRequirement::CurrentSchemaIdMatch {
-                    current_schema_id: planned.payload().schema_id,
+                    current_schema_id: payload.schema_id,
                 },
                 crate::iceberg::TableRequirement::DefaultSpecIdMatch {
-                    default_spec_id: planned.payload().default_spec_id,
+                    default_spec_id: payload.default_spec_id,
                 },
             ],
         };
-        let preparer: Box<dyn Preparer> = match planned {
-            PlannedIcebergMutation::RegisterExistingFiles { .. } => {
-                Box::new(crate::commit::fast_append::FastAppendPreparer)
-            }
-            PlannedIcebergMutation::Truncate { .. } => {
-                Box::new(crate::commit::truncate::TruncatePreparer)
-            }
-        };
+        let preparer = crate::commit::truncate::TruncatePreparer;
         let running_operation = operation.clone();
         let report = operation.runtime().block_on(async move {
             attempt::run(
                 &running_operation,
                 &intent,
                 &prefix,
-                &[preparer.as_ref()],
+                &[&preparer],
                 &publisher,
                 policy,
             )
@@ -418,17 +356,14 @@ impl RegisteredIcebergDataMutationBackend {
         planned: &PlannedIcebergMutation,
         context: &ConnectorRequestContext,
     ) -> Result<(), ConnectorError> {
-        let payload = planned.payload();
+        let (payload, _) = planned
+            .truncate_parts()
+            .ok_or_else(|| invalid("TRUNCATE finalization requires a truncate plan"))?;
         self.finalize_publication_facts(
             &DataFinalizationFacts {
                 namespace: payload.namespace.clone(),
                 table: payload.table.clone(),
                 table_uuid: payload.table_uuid.clone(),
-                name_mapping_digest: matches!(
-                    planned,
-                    PlannedIcebergMutation::RegisterExistingFiles { .. }
-                )
-                .then(|| payload.name_mapping_digest_hex.clone()),
             },
             context,
         )
@@ -452,24 +387,6 @@ impl RegisteredIcebergDataMutationBackend {
             return Err(corrupt(
                 "Committed data mutation target changed identity before finalization",
             ));
-        }
-        if let Some(expected) = &facts.name_mapping_digest {
-            let mapping = loaded
-                .table
-                .metadata()
-                .properties()
-                .get(crate::iceberg::spec::TableProperties::PROPERTY_DEFAULT_NAME_MAPPING)
-                .map(|value| crate::schema_mapping::canonical_name_mapping(value))
-                .transpose()
-                .map_err(map_provider_error)?;
-            let digest = mapping
-                .as_deref()
-                .map(|value| hex_encode(Sha256::digest(value.as_bytes())));
-            if &digest != expected {
-                return Err(corrupt(
-                    "schema.name-mapping.default changed after ADD FILES commit",
-                ));
-            }
         }
         Ok(())
     }

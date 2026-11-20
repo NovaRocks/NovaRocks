@@ -1005,6 +1005,7 @@ fn table_procedure_timestamp_uses_the_original_required_constant_interpreter() {
             &source,
             &statement,
             &provider,
+            "ice",
             &mut port,
             &mut NoLegacyTimestamp,
             &control,

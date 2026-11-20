@@ -20,7 +20,7 @@
 mod builtin;
 #[allow(
     dead_code,
-    reason = "RWM-12 and RWM-17 consume the history facts after switching their policies."
+    reason = "RWM-12 consumes the exact ancestor window for row-level validation."
 )]
 pub(crate) mod history;
 mod inputs;
@@ -33,7 +33,7 @@ pub use history::{HistoryGap, HistoryWindow, history_window};
 pub use inputs::LiveSet;
 pub use inputs::ValidationInputs;
 
-use super::model::{Dependency, EntryIdentity};
+use super::model::Dependency;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Culprit {
@@ -42,10 +42,6 @@ pub enum Culprit {
         actual: Option<i64>,
     },
     Snapshot(i64),
-    Entry {
-        snapshot: i64,
-        identity: EntryIdentity,
-    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

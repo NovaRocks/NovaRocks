@@ -32,20 +32,17 @@ use sha2::{Digest, Sha256};
 #[cfg(test)]
 use novarocks_spi::connector::ExternalMutationEffect;
 use novarocks_spi::connector::{
-    ConnectorDataMutation, ConnectorDataMutationExecuteRequest, ConnectorDataMutationOperation,
-    ConnectorDataMutationPlan, ConnectorDataMutationPlanSummary,
-    ConnectorDataMutationPlanningRequest, ConnectorDataMutationReceipt,
-    ConnectorDataMutationReconcileRequest, ConnectorError, ConnectorErrorKind,
-    ConnectorInstanceDescriptor, ConnectorMutationFailure, ConnectorMutationFailureKind,
-    ConnectorMutationOperationId, ConnectorOperationControl, ConnectorProviderBindingKey,
-    ConnectorRequestContext, ExternalMutationEvidence, ExternalMutationFinalization,
-    ExternalMutationOutcome,
+    ConnectorAddFilesFormat, ConnectorAddFilesRecursion, ConnectorDataMutation,
+    ConnectorDataMutationExecuteRequest, ConnectorDataMutationOperation, ConnectorDataMutationPlan,
+    ConnectorDataMutationPlanSummary, ConnectorDataMutationPlanningRequest,
+    ConnectorDataMutationReceipt, ConnectorDataMutationReconcileRequest, ConnectorError,
+    ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorMutationFailure,
+    ConnectorMutationFailureKind, ConnectorMutationOperationId, ConnectorOperationControl,
+    ConnectorProviderBindingKey, ConnectorRequestContext, ExternalMutationEvidence,
+    ExternalMutationFinalization, ExternalMutationOutcome,
 };
 
-use super::add_files::{
-    AddFilesManifest, plan_manifest_for_table, preflight_caller_managed_source_domain,
-    revalidate_manifest_for_table,
-};
+use super::add_files::procedure_error;
 use crate::catalog::CatalogTableName;
 use crate::catalog::admission::{CatalogAdmissionRequest, CatalogOperation, connector_unsupported};
 use crate::commit::model::{OperationToken, StartSnapshot};
@@ -53,6 +50,7 @@ use crate::commit::recovery::FrozenPublicationFacts;
 use crate::iceberg::spec::TableMetadata;
 use crate::metadata::IcebergMetadata;
 use crate::metadata_context::IcebergMetadataContext;
+use novarocks_failure_contract::{FailureClass, connector_reason};
 
 mod publication;
 
@@ -84,8 +82,6 @@ struct IcebergDataMutationPlanPayloadV2 {
     schema_id: i32,
     default_spec_id: i32,
     metadata_version_digest_hex: String,
-    source_location: Option<String>,
-    name_mapping_digest_hex: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -142,13 +138,30 @@ struct IcebergDataMutationMarkerV1 {
     total_bytes: u64,
 }
 
+#[derive(Clone, Debug, Serialize)]
+struct RegistrationPlanPayload {
+    version: u16,
+    namespace: String,
+    table: String,
+    table_uuid: String,
+    format: &'static str,
+    recursive_directory: &'static str,
+}
+
 #[derive(Clone)]
 enum PlannedIcebergMutation {
     RegisterExistingFiles {
-        payload: IcebergDataMutationPlanPayloadV2,
-        source_metadata: TableMetadata,
-        manifest: AddFilesManifest,
-        domain: novarocks_spi::connector::ConnectorDataMutationAddFilesDomain,
+        payload: RegistrationPlanPayload,
+        #[expect(
+            dead_code,
+            reason = "registration execution consumes the source location in P08"
+        )]
+        location: Arc<str>,
+        #[expect(
+            dead_code,
+            reason = "registration execution consumes the recursion mode in P08"
+        )]
+        recursion: ConnectorAddFilesRecursion,
     },
     Truncate {
         payload: IcebergDataMutationPlanPayloadV2,
@@ -157,22 +170,59 @@ enum PlannedIcebergMutation {
 }
 
 impl PlannedIcebergMutation {
-    fn payload(&self) -> &IcebergDataMutationPlanPayloadV2 {
+    fn provider_payload(&self) -> Result<Bytes, ConnectorError> {
         match self {
-            Self::RegisterExistingFiles { payload, .. } | Self::Truncate { payload, .. } => payload,
+            Self::RegisterExistingFiles { payload, .. } => {
+                canonical_json(payload, "Iceberg registration plan")
+            }
+            Self::Truncate { payload, .. } => canonical_json(payload, "Iceberg truncate plan"),
         }
     }
 
-    fn source_metadata(&self) -> &TableMetadata {
+    fn truncate_parts(&self) -> Option<(&IcebergDataMutationPlanPayloadV2, &TableMetadata)> {
         match self {
-            Self::RegisterExistingFiles {
-                source_metadata, ..
-            }
-            | Self::Truncate {
-                source_metadata, ..
-            } => source_metadata,
+            Self::Truncate {
+                payload,
+                source_metadata,
+            } => Some((payload, source_metadata)),
+            Self::RegisterExistingFiles { .. } => None,
         }
     }
+}
+
+fn missing_registration_argument(name: &str) -> ConnectorError {
+    procedure_error(
+        ConnectorErrorKind::InvalidRequest,
+        FailureClass::Data,
+        connector_reason::PROCEDURE_ARGUMENT_INVALID,
+        format!("Required procedure argument '{name}' is missing"),
+    )
+}
+
+fn validate_registration_target(
+    namespace: &str,
+    table: &str,
+    version: crate::iceberg::spec::FormatVersion,
+    format: ConnectorAddFilesFormat,
+) -> Result<(), ConnectorError> {
+    if version > crate::iceberg::spec::FormatVersion::V2 {
+        let namespace = namespace.replace('"', "\"\"");
+        let table = table.replace('"', "\"\"");
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            format!(
+                "ADD_FILES is not supported for Iceberg table format version > 2. Table \"{namespace}\".\"{table}\" format version is {}.",
+                version as u8,
+            ),
+        ));
+    }
+    if format != ConnectorAddFilesFormat::Parquet {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "NovaRocks ADD FILES only reads Parquet data files",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -180,8 +230,6 @@ struct DataFinalizationFacts {
     namespace: String,
     table: String,
     table_uuid: String,
-    // Outer None is TRUNCATE; inner None is ADD FILES without a name mapping.
-    name_mapping_digest: Option<Option<String>>,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct DataPublication {
@@ -246,9 +294,6 @@ impl MutationRecoveryTemplate {
                 namespace: self.payload.namespace.clone(),
                 table: self.payload.table.clone(),
                 table_uuid: self.payload.table_uuid.clone(),
-                name_mapping_digest: (self.plan.operation_kind()
-                    == novarocks_spi::connector::REGISTER_EXISTING_FILES_KIND)
-                    .then(|| self.payload.name_mapping_digest_hex.clone()),
             },
         })
     }
@@ -450,6 +495,30 @@ impl IcebergDataMutationBackend for RegisteredIcebergDataMutationBackend {
                 request.context.initiation(),
             ))
             .map_err(connector_unsupported)?;
+        if let ConnectorDataMutationOperation::RegisterExistingFiles {
+            location, format, ..
+        } = request.operation()
+        {
+            if !self
+                .runtime
+                .control_state()
+                .configuration()
+                .add_files_enabled
+            {
+                return Err(procedure_error(
+                    ConnectorErrorKind::PermissionDenied,
+                    FailureClass::Data,
+                    connector_reason::ADD_FILES_DISABLED,
+                    "add_files procedure is disabled",
+                ));
+            }
+            if location.is_none() {
+                return Err(missing_registration_argument("location"));
+            }
+            if format.is_none() {
+                return Err(missing_registration_argument("format"));
+            }
+        }
         Ok(())
     }
 
@@ -473,11 +542,6 @@ impl IcebergDataMutationBackend for RegisteredIcebergDataMutationBackend {
         let namespace = table_payload.namespace;
         let table_name = table_payload.table;
         let table = self.reload_table(&namespace, &table_name, &request.context)?;
-        let binding = self
-            .runtime
-            .resources()
-            .planning_binding()
-            .for_request(request.context.clone());
         let metadata = table.metadata();
         let table_uuid = metadata.uuid().to_string();
         let schema_id = metadata.current_schema_id();
@@ -486,60 +550,44 @@ impl IcebergDataMutationBackend for RegisteredIcebergDataMutationBackend {
 
         match request.operation() {
             ConnectorDataMutationOperation::RegisterExistingFiles {
-                source_location, ..
+                location,
+                format,
+                recursion,
+                ..
             } => {
-                let domain = preflight_caller_managed_source_domain(
-                    source_location,
-                    &self.runtime.control_state().configuration().warehouse_uri,
-                    table.metadata().location(),
-                    &binding,
-                )
-                .map_err(|error| ConnectorError::new(ConnectorErrorKind::Unsupported, error))?;
-                let manifest = plan_manifest_for_table(
-                    &table,
-                    source_location,
-                    &binding,
-                    self.runtime.resources().catalog_runtime(),
-                    self.runtime.novarocks_catalog().listing_admission(),
+                let location = location
+                    .as_ref()
+                    .ok_or_else(|| missing_registration_argument("location"))?;
+                let format = format.ok_or_else(|| missing_registration_argument("format"))?;
+                validate_registration_target(
+                    &namespace,
+                    &table_name,
+                    metadata.format_version(),
+                    format,
                 )?;
-                let mapping_digest = manifest
-                    .canonical_name_mapping
-                    .as_deref()
-                    .map(|mapping| hex_encode(Sha256::digest(mapping.as_bytes())));
-                let payload = IcebergDataMutationPlanPayloadV2 {
-                    version: PLAN_PAYLOAD_VERSION,
+                let payload = RegistrationPlanPayload {
+                    version: 1,
                     namespace,
                     table: table_name,
                     table_uuid,
-                    target_ref: "main".to_string(),
-                    base_snapshot_id: target_snapshot_id(metadata, "main")?,
-                    base_sequence_number: source_snapshot(metadata, "main")?
-                        .map(|s| s.sequence_number),
-                    schema_id,
-                    default_spec_id,
-                    metadata_version_digest_hex: hex_encode(metadata_version_digest),
-                    source_location: Some(source_location.to_string()),
-                    name_mapping_digest_hex: mapping_digest,
+                    format: "PARQUET",
+                    recursive_directory: match recursion {
+                        ConnectorAddFilesRecursion::Include => "TRUE",
+                        ConnectorAddFilesRecursion::Skip => "FALSE",
+                        ConnectorAddFilesRecursion::Fail => "FAIL",
+                    },
                 };
-                let summary = ConnectorDataMutationPlanSummary::try_new(
-                    u32::try_from(manifest.records.len()).map_err(|_| {
-                        ConnectorError::new(
-                            ConnectorErrorKind::ResourceExhausted,
-                            "ADD FILES manifest count exceeds u32",
-                        )
-                    })?,
-                    manifest.total_rows,
-                    manifest.total_bytes,
-                )?;
+                let mut state = Sha256::new();
+                state.update(b"novarocks.iceberg.data-mutation.registration-state.v1\0");
+                digest_bytes(&mut state, metadata.uuid().as_bytes());
                 Ok((
                     PlannedIcebergMutation::RegisterExistingFiles {
                         payload,
-                        source_metadata: metadata.clone(),
-                        manifest: manifest.clone(),
-                        domain,
+                        location: Arc::clone(location),
+                        recursion: *recursion,
                     },
-                    manifest.digest,
-                    summary,
+                    state.finalize().into(),
+                    ConnectorDataMutationPlanSummary::default(),
                 ))
             }
             ConnectorDataMutationOperation::Truncate { target_ref, .. } => {
@@ -563,8 +611,6 @@ impl IcebergDataMutationBackend for RegisteredIcebergDataMutationBackend {
                     schema_id,
                     default_spec_id,
                     metadata_version_digest_hex: hex_encode(metadata_version_digest),
-                    source_location: None,
-                    name_mapping_digest_hex: None,
                 };
                 let state_digest = truncate_state_digest(&payload);
                 Ok((
@@ -776,26 +822,12 @@ impl ConnectorDataMutation for IcebergDataMutationAdapter {
             ));
         }
         let (private, state_digest, summary) = self.backend.plan(&request)?;
-        let provider_payload = canonical_json(private.payload(), "Iceberg data mutation plan")?;
-        let source_scope = match &private {
-            PlannedIcebergMutation::RegisterExistingFiles { manifest, .. } => {
-                Some(manifest.source_scope)
-            }
-            PlannedIcebergMutation::Truncate { .. } => None,
-        };
-        let add_files_domain = match &private {
-            PlannedIcebergMutation::RegisterExistingFiles { domain, .. } => Some(*domain),
-            PlannedIcebergMutation::Truncate { .. } => None,
-        };
-        let plan = ConnectorDataMutationPlan::try_new(
-            &request,
-            state_digest,
-            summary,
-            source_scope,
-            add_files_domain,
-            provider_payload,
-        )?;
-        self.preflight_durable_truncate_evidence(&plan, private.payload())?;
+        let provider_payload = private.provider_payload()?;
+        let plan =
+            ConnectorDataMutationPlan::try_new(&request, state_digest, summary, provider_payload)?;
+        if let Some((payload, _)) = private.truncate_parts() {
+            self.preflight_durable_truncate_evidence(&plan, payload)?;
+        }
         plans.insert(
             request.operation_id(),
             CachedPlan {
@@ -847,10 +879,13 @@ impl ConnectorDataMutation for IcebergDataMutationAdapter {
                 "Iceberg data mutation execute request conflicts with the planned operation",
             ));
         }
-        let marker = self.marker(&request.plan, cached.private.payload());
+        let Some((payload, _)) = cached.private.truncate_parts() else {
+            return Ok(publication::registration_pending());
+        };
+        let marker = self.marker(&request.plan, payload);
         let outcome = match self.backend.lookup_marker(
-            &marker_target(&cached.private).0,
-            &marker_target(&cached.private).1,
+            &payload.namespace,
+            &payload.table,
             &marker.target_ref,
             &marker.operation_id_hex,
             &marker.identity_digest_hex,
@@ -861,14 +896,14 @@ impl ConnectorDataMutation for IcebergDataMutationAdapter {
                     ConnectorMutationFailureKind::Unavailable,
                     "An existing data mutation marker has no original local dispatch journal",
                 ),
-                evidence: self.evidence(&request.plan, cached.private.payload())?,
+                evidence: self.evidence(&request.plan, payload)?,
             },
             Ok(MarkerLookup::Conflicting) => ExternalMutationOutcome::CommitUnknown {
                 failure: failure(
                     ConnectorMutationFailureKind::Conflict,
                     "Iceberg data mutation marker conflicts with this operation",
                 ),
-                evidence: self.evidence(&request.plan, cached.private.payload())?,
+                evidence: self.evidence(&request.plan, payload)?,
             },
             Ok(MarkerLookup::Missing) => self.backend.execute(
                 &cached.private,
@@ -877,7 +912,7 @@ impl ConnectorDataMutation for IcebergDataMutationAdapter {
                     self.descriptor.clone(),
                     self.key.clone(),
                     request.plan.clone(),
-                    cached.private.payload().clone(),
+                    payload.clone(),
                 ),
                 &request.context,
             )?,
@@ -1019,11 +1054,6 @@ fn durable_receipt_payload(snapshot_id: i64) -> Result<Bytes, ConnectorError> {
     Ok(payload)
 }
 
-fn marker_target(planned: &PlannedIcebergMutation) -> (String, String) {
-    let payload = planned.payload();
-    (payload.namespace.clone(), payload.table.clone())
-}
-
 fn validate_evidence_request(
     descriptor: &ConnectorInstanceDescriptor,
     key: &ConnectorProviderBindingKey,
@@ -1080,25 +1110,6 @@ fn validate_frozen_table(
     {
         return Err(conflict(
             "Iceberg data mutation table state advanced after planning",
-        ));
-    }
-    Ok(())
-}
-
-/// ADD FILES intentionally permits a data-ref OCC refresh. Its immutable
-/// contract is table identity/schema/spec plus the complete frozen manifest;
-/// the attempt guard re-runs the latter on every refreshed base.
-fn validate_add_files_target_shape(
-    table: &crate::iceberg::table::Table,
-    payload: &IcebergDataMutationPlanPayloadV2,
-) -> Result<(), ConnectorError> {
-    let metadata = table.metadata();
-    if metadata.uuid().to_string() != payload.table_uuid
-        || metadata.current_schema_id() != payload.schema_id
-        || metadata.default_partition_spec_id() != payload.default_spec_id
-    {
-        return Err(conflict(
-            "Iceberg ADD FILES target identity, schema, or partition spec changed after planning",
         ));
     }
     Ok(())

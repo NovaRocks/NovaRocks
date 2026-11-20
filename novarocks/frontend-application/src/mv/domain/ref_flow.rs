@@ -567,6 +567,7 @@ mod tests {
             source,
             &statement,
             &ConnectorProviderId::parse("iceberg").unwrap(),
+            "ice",
             &mut LiteralConstants,
             &mut NoTimestampArguments,
             &novarocks_sql::compiler::SqlCompileControl::unbounded(),
