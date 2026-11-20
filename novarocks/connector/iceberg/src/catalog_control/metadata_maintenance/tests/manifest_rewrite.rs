@@ -15,6 +15,68 @@
 // specific language governing permissions and limitations
 // under the License.
 
+fn execute_rewrite_plan(
+    key: &ConnectorProviderBindingKey,
+    sql_execute: bool,
+) -> ConnectorMetadataMaintenancePlanningRequest {
+    let legacy = local_planning_request(key, false);
+    if !sql_execute {
+        return legacy;
+    }
+    ConnectorMetadataMaintenancePlanningRequest::try_new(
+        ConnectorMutationOperationId::new(),
+        key.clone(),
+        ConnectorMetadataMaintenanceOperation::optimize_manifests(
+            legacy.operation().table().clone(),
+        ),
+        context(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn execute_rewrite_skips_empty_table_and_one_small_data_manifest() {
+    let (executor, _warehouse, adapter, key) = adapter();
+    let table = create_local_table(&executor, &adapter);
+    for file in [None, Some("single")] {
+        if let Some(file) = file {
+            append_local_file(&executor, &adapter, table.identifier(), file);
+        }
+        let load = || {
+            executor.block_on(
+                crate::catalog::admission_test_support::load_static_fixture_table(
+                    &adapter.runtime,
+                    table.identifier(),
+                ),
+            )
+        };
+        let before = load();
+        let plan = executor
+            .block_on(adapter.plan_maintenance(execute_rewrite_plan(&key, true)))
+            .unwrap();
+        let request = ConnectorMetadataMaintenanceExecuteRequest::try_new(plan, context()).unwrap();
+        let result = executor.block_on(adapter.execute(request)).unwrap();
+        let ExternalMutationOutcome::KnownCommitted {
+            effect: ExternalMutationEffect::NoOp,
+            receipt,
+            ..
+        } = result
+        else {
+            panic!("EXECUTE rewrite must skip empty or single-small-manifest tables");
+        };
+        assert_eq!(
+            receipt.summary(),
+            ConnectorMetadataMaintenanceReceiptSummary::default()
+        );
+        let after = load();
+        assert_eq!(after.metadata_location(), before.metadata_location());
+        assert_eq!(
+            after.metadata().current_snapshot_id(),
+            before.metadata().current_snapshot_id()
+        );
+    }
+}
+
 #[test]
 fn rewrite_plan_and_commit_use_refs_while_expiry_uses_all() {
     for expire in [false, true] {
@@ -211,6 +273,15 @@ fn original_compaction_scalar_retains_real_manifest_source_until_footer() {
 }
 #[test]
 fn rewrite_append_conflict_reuses_operation_manifest_and_rebuilds_parent_and_exact_receipt() {
+    run_rewrite_append_conflict(false);
+}
+
+#[test]
+fn execute_rewrite_append_conflict_reuses_outputs_and_counts_concurrent_manifest_as_kept() {
+    run_rewrite_append_conflict(true);
+}
+
+fn run_rewrite_append_conflict(sql_execute: bool) {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let (executor, _warehouse, base, key) = adapter();
     let table = create_local_table(&executor, &base);
@@ -257,7 +328,7 @@ fn rewrite_append_conflict_reuses_operation_manifest_and_rebuilds_parent_and_exa
     );
     let lease = real_maintenance_lease(adapter);
     let plan = executor
-        .block_on(lease.plan_maintenance(local_planning_request(&key, false)))
+        .block_on(lease.plan_maintenance(execute_rewrite_plan(&key, sql_execute)))
         .unwrap();
     let operation = OperationToken::from_mutation(plan.operation_id()).path_component();
     let outcome = executor
@@ -275,6 +346,15 @@ fn rewrite_append_conflict_reuses_operation_manifest_and_rebuilds_parent_and_exa
         panic!("rewrite should commit after the bounded append conflict")
     };
     assert_eq!(finalization, ExternalMutationFinalization::Complete);
+    assert_eq!(
+        receipt.summary().manifest_rewrite_metrics,
+        sql_execute.then_some(novarocks_spi::connector::ConnectorManifestRewriteMetrics {
+            rewritten: 2,
+            added: 1,
+            kept: 1,
+            processed_entries: 2
+        })
+    );
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     let observations = captured.lock().unwrap();
     let parent = |updates: &[crate::iceberg::TableUpdate]| {
@@ -357,6 +437,15 @@ fn rewrite_append_conflict_reuses_operation_manifest_and_rebuilds_parent_and_exa
 }
 #[test]
 fn rewrite_selected_manifest_replacement_replans_to_noop_and_cleans_unadopted_operation_roots() {
+    run_rewrite_source_replacement(false);
+}
+
+#[test]
+fn execute_rewrite_source_replacement_discards_outputs_and_rechecks_the_skip_rule() {
+    run_rewrite_source_replacement(true);
+}
+
+fn run_rewrite_source_replacement(sql_execute: bool) {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let (executor, _warehouse, base, key) = adapter();
     let table = create_local_table(&executor, &base);
@@ -423,7 +512,7 @@ fn rewrite_selected_manifest_replacement_replans_to_noop_and_cleans_unadopted_op
     );
     let lease = real_maintenance_lease(adapter);
     let plan = executor
-        .block_on(lease.plan_maintenance(local_planning_request(&key, false)))
+        .block_on(lease.plan_maintenance(execute_rewrite_plan(&key, sql_execute)))
         .unwrap();
     let payload = plan.provider_payload().clone();
     let intent = plan.intent_digest();

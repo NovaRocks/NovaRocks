@@ -59,9 +59,14 @@ use novarocks_spi::connector::{
 };
 
 use super::maintenance_admission::{RetentionProcedure, validate_retention_procedure};
+use super::maintenance_error::{
+    CommitFailureDisposition, MaintenanceCommitProcedure, commit_failure,
+};
 use crate::catalog::admission::{CatalogAdmissionRequest, CatalogOperation, connector_unsupported};
 use crate::catalog::{CatalogTableName, SnapshotLoading};
-use crate::commit::snapshot_lifecycle_helpers::rewrite_manifests::RewriteManifestsPreparer;
+use crate::commit::snapshot_lifecycle_helpers::rewrite_manifests::{
+    RewriteManifestsPreparer, execute_metrics,
+};
 use crate::metadata::IcebergTablePayload;
 use crate::metadata_context::IcebergMetadataContext;
 
@@ -536,6 +541,7 @@ impl MaintenanceEngine {
             plan: plan.clone(),
         };
         let preflight_journal = journal.clone();
+        let sql_execute = payload.sql_execute;
         let publisher = journal.observe_prepared(Arc::new(CatalogPublisher {
             expected_table_uuid: None,
             catalog_operation: CatalogOperation::RewriteManifests,
@@ -545,7 +551,7 @@ impl MaintenanceEngine {
             operation: token,
             recovery_preflight: Arc::new(move |request, operation| {
                 let receipt = seed
-                    .for_request(request, rewrite_summary(request))
+                    .for_request(request, rewrite_summary(request, sql_execute)?)
                     .map_err(as_iceberg_error)?;
                 preflight_journal.record(
                     evidence.clone(),
@@ -562,7 +568,7 @@ impl MaintenanceEngine {
                 )
             }),
         }));
-        let preparer = RewriteManifestsPreparer::for_request(context.clone());
+        let preparer = RewriteManifestsPreparer::for_request(context.clone(), sql_execute);
         let report = attempt::run(
             &operation,
             &intent,
@@ -573,6 +579,33 @@ impl MaintenanceEngine {
         )
         .await;
         let outcome = public_outcome(journal.project(report));
+        let outcome = if sql_execute {
+            match outcome {
+                ExternalMutationOutcome::KnownUncommitted { failure, cleanup } => {
+                    ExternalMutationOutcome::KnownUncommitted {
+                        failure: commit_failure(
+                            MaintenanceCommitProcedure::OptimizeManifests,
+                            CommitFailureDisposition::KnownUncommitted,
+                            failure,
+                        ),
+                        cleanup,
+                    }
+                }
+                ExternalMutationOutcome::CommitUnknown { failure, evidence } => {
+                    ExternalMutationOutcome::CommitUnknown {
+                        failure: commit_failure(
+                            MaintenanceCommitProcedure::OptimizeManifests,
+                            CommitFailureDisposition::Unknown,
+                            failure,
+                        ),
+                        evidence,
+                    }
+                }
+                committed => committed,
+            }
+        } else {
+            outcome
+        };
         self.runtime
             .control_state()
             .invalidate_table_cache(&payload.namespace, &payload.table);
@@ -1200,11 +1233,21 @@ fn maintenance_snapshot_loading(operation_kind: &str) -> SnapshotLoading {
     }
 }
 
-fn rewrite_summary(request: &FrozenRequest) -> ConnectorMetadataMaintenanceReceiptSummary {
+fn rewrite_summary(
+    request: &FrozenRequest,
+    sql_execute: bool,
+) -> crate::iceberg::Result<ConnectorMetadataMaintenanceReceiptSummary> {
     let mut summary = ConnectorMetadataMaintenanceReceiptSummary::default();
     for update in request.updates() {
         if let crate::iceberg::TableUpdate::AddSnapshot { snapshot } = update {
             let properties = &snapshot.summary().additional_properties;
+            if sql_execute {
+                let metrics = execute_metrics(properties)?;
+                summary.rewritten_items = metrics.rewritten;
+                summary.added_items = metrics.added;
+                summary.manifest_rewrite_metrics = Some(metrics);
+                continue;
+            }
             summary.rewritten_items = properties
                 .get("replaced-manifests-count")
                 .and_then(|s| s.parse().ok())
@@ -1215,7 +1258,7 @@ fn rewrite_summary(request: &FrozenRequest) -> ConnectorMetadataMaintenanceRecei
                 .unwrap_or(0);
         }
     }
-    summary
+    Ok(summary)
 }
 fn connector_failure(error: &ConnectorError) -> ConnectorMutationFailure {
     attempt::before_dispatch_failure(&as_iceberg_error(error.clone()))
