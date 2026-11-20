@@ -17,6 +17,8 @@
 
 //! Inclusive conflict predicates for row-delta publication.
 
+// Design: ADR-0244 (docs/adr/ADR-0244-iceberg-row-dml-conflict-validation.md)
+
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt;

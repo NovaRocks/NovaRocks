@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+// Design: ADR-0244 (docs/adr/ADR-0244-iceberg-row-dml-conflict-validation.md)
+
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;

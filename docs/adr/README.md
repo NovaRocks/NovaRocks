@@ -159,6 +159,7 @@ code-anchors:
 
 领域哲学：SPI 只承载 NovaRocks 产品架构明确支持的可替换 provider 契约，不吸收所有跨 crate API。系统定义契约语义，provider 与 consumer 共同依赖统一 SPI，host 负责选择、装配与生命周期；domain API、consumer port、transport 和实现策略保持各自 owner。稳定性由原子演进、conformance 与真实分布式验证保证，不靠兼容 bridge 或 service locator。
 
+- [ADR-0244](ADR-0244-iceberg-row-dml-conflict-validation.md) — 普通 Iceberg 行级 DML 为何共享准入观察，按隔离级别核对每轮连续快照窗口，并保留 Catalog 三态结果（active，部分替代 ADR-0171 与 ADR-0239 的行级冲突政策）
 - [ADR-0239](ADR-0239-iceberg-compact-receiving-and-rolling-manifests.md) — Iceberg 为何在同一窗口内紧凑接收，由 operation 在发布期顺序滚动写出新增 manifest，并按条目核对覆盖（active。部分替代 ADR-0171 的紧凑新增文件表示与 ADR-0234 的紧凑新增 manifest 沿用和覆盖，完整接收屏障与原物理对象责任继续有效）
 - [ADR-0235](ADR-0235-iceberg-write-layout-and-data-plane-capacity.md) — Iceberg 写入为何由 Provider 签发分区亲和、Execution 扩散热点，并以冻结文件政策和真实容量作者承接数据面（active。部分替代 ADR-0023/0030/0133 的固定片段与写集额度。单 root、原提交/清理所有权与根结果分帧保留）
 - [ADR-0234](ADR-0234-operation-owned-artifacts-and-bounded-publication-facts.md) — Iceberg 产物为何由同一 operation 保管到终态、按依据复用，以构造时覆盖断言决定发布引用，并让证据和回执只承载有界事实（active；部分替代 ADR-0171 的产物类别、每轮清理、完整账本证据与对象数预算；ADR-0179 的 journal 结论与 ADR-0198 的原责任/退出不变；代码接线已完成，定向验证与最终验收范围另核。紧凑新增 manifest 的沿用及覆盖由 [ADR-0239](ADR-0239-iceberg-compact-receiving-and-rolling-manifests.md) 部分替代，物理账本、退休、原结论与终态清理保留）
