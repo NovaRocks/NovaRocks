@@ -36,28 +36,12 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE EXTERNAL CATALOG opt_rl_${uuid0}
-PROPERTIES (
-  "type" = "iceberg",
-  "iceberg.catalog.type" = "hadoop",
-  "iceberg.catalog.warehouse" = "${iceberg_test_warehouse}/opt_rl_${uuid0}",
-  "aws.s3.endpoint" = "${oss_endpoint}",
-  "credential.object-store-metadata.consumer-role" = "frontend",
-  "credential.object-store-metadata.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-metadata.name" = "${iceberg_object_store_metadata_credential_name}",
-  "credential.object-store-metadata.generation" = "${iceberg_object_store_credential_generation}",
-  "credential.object-store-data.consumer-role" = "backend",
-  "credential.object-store-data.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-data.name" = "${iceberg_object_store_data_credential_name}",
-  "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
-  "aws.s3.enable_path_style_access" = "${oss_path_style}"
-);
-CREATE DATABASE opt_rl_${uuid0}.ns_${uuid0};
-CREATE TABLE opt_rl_${uuid0}.ns_${uuid0}.olineage (id INT, v INT)
-TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
-INSERT INTO opt_rl_${uuid0}.ns_${uuid0}.olineage VALUES (1, 10), (2, 20);
-INSERT INTO opt_rl_${uuid0}.ns_${uuid0}.olineage VALUES (3, 30), (4, 40);
-INSERT INTO opt_rl_${uuid0}.ns_${uuid0}.olineage VALUES (5, 50), (6, 60);
+CREATE CATALOG opt_rl_${uuid0} USING iceberg WITH ("iceberg.catalog.type" = 'hadoop', "iceberg.catalog.warehouse" = '${iceberg_test_warehouse}/opt_rl_${uuid0}', "aws.s3.endpoint" = '${oss_endpoint}', "credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-metadata.name" = '${iceberg_object_store_metadata_credential_name}', "credential.object-store-metadata.generation" = '${iceberg_object_store_credential_generation}', "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-data.name" = '${iceberg_object_store_data_credential_name}', "credential.object-store-data.generation" = '${iceberg_object_store_credential_generation}', "aws.s3.enable_path_style_access" = '${oss_path_style}');
+CREATE SCHEMA opt_rl_${uuid0}.ns_${uuid0};
+CREATE TABLE opt_rl_${uuid0}.ns_${uuid0}.olineage (id INT, v INT) WITH (format_version = 3);
+INSERT INTO opt_rl_${uuid0}.ns_${uuid0}.olineage VALUES ROW(1, 10), ROW(2, 20);
+INSERT INTO opt_rl_${uuid0}.ns_${uuid0}.olineage VALUES ROW(3, 30), ROW(4, 40);
+INSERT INTO opt_rl_${uuid0}.ns_${uuid0}.olineage VALUES ROW(5, 50), ROW(6, 60);
 UPDATE opt_rl_${uuid0}.ns_${uuid0}.olineage SET v = 99 WHERE id = 2;
 DELETE FROM opt_rl_${uuid0}.ns_${uuid0}.olineage WHERE id = 4;
 
@@ -65,12 +49,12 @@ DELETE FROM opt_rl_${uuid0}.ns_${uuid0}.olineage WHERE id = 4;
 -- @skip_result_check=true
 -- Tag the pre-OPTIMIZE state so we can compare row values and lineage after
 -- the rewrite via FOR VERSION AS OF.
-ALTER TABLE opt_rl_${uuid0}.ns_${uuid0}.olineage CREATE TAG pre_opt;
+ALTER TABLE opt_rl_${uuid0}.ns_${uuid0}.olineage EXECUTE create_tag(name => 'pre_opt', replace => false, if_not_exists => false);
 
 -- query 3
 -- BEFORE OPTIMIZE: 5 surviving rows, each with a unique `_row_id`.
 -- @db=opt_rl_${uuid0}.ns_${uuid0}
-SELECT count(*) AS n_rows, count(DISTINCT _row_id) AS n_unique_row_ids
+SELECT count() AS n_rows, count(DISTINCT _row_id) AS n_unique_row_ids
   FROM olineage;
 
 -- query 4
@@ -85,25 +69,25 @@ SELECT id, v FROM olineage ORDER BY id;
 SELECT
   sum(CASE WHEN content = 0 THEN 1 ELSE 0 END) > 1 AS multiple_data_files,
   sum(CASE WHEN content <> 0 THEN 1 ELSE 0 END) > 0 AS has_active_delete_files
-  FROM olineage$files;
+  FROM "olineage$files";
 
 -- query 6
 -- The saved tag is the current baseline immediately before OPTIMIZE.
 -- @db=opt_rl_${uuid0}.ns_${uuid0}
-SELECT count(*) AS main_matches_pre_opt
-  FROM olineage$refs AS current_ref
-  JOIN olineage$refs AS baseline_ref
+SELECT count() AS main_matches_pre_opt
+  FROM "olineage$refs" AS current_ref
+  JOIN "olineage$refs" AS baseline_ref
     ON current_ref.snapshot_id = baseline_ref.snapshot_id
   WHERE current_ref.name = 'main' AND baseline_ref.name = 'pre_opt';
 
 -- query 7
 -- @db=opt_rl_${uuid0}.ns_${uuid0}
-ALTER TABLE olineage OPTIMIZE;
+ALTER TABLE olineage EXECUTE optimize;
 
 -- query 8
 -- AFTER OPTIMIZE: same row count, same number of unique row-ids.
 -- @db=opt_rl_${uuid0}.ns_${uuid0}
-SELECT count(*) AS n_rows, count(DISTINCT _row_id) AS n_unique_row_ids
+SELECT count() AS n_rows, count(DISTINCT _row_id) AS n_unique_row_ids
   FROM olineage;
 
 -- query 9
@@ -136,19 +120,19 @@ SELECT count(*) AS baseline_rows_missing_after_optimize
 -- query 12
 -- This private table has no replace snapshot before this deterministic rewrite.
 -- @db=opt_rl_${uuid0}.ns_${uuid0}
-SELECT count(*) AS n_replace_snapshots
-  FROM olineage$snapshots
+SELECT count() AS n_replace_snapshots
+  FROM "olineage$snapshots"
   WHERE operation = 'replace';
 
 -- query 13
 -- Resolve the new current snapshot through refs instead of timestamps. Its
 -- parent must be the exact pre-OPTIMIZE snapshot, proving this publication.
 -- @db=opt_rl_${uuid0}.ns_${uuid0}
-SELECT count(*) AS current_replace_child_of_pre_opt
-  FROM olineage$snapshots AS rewritten
-  JOIN olineage$refs AS current_ref
+SELECT count() AS current_replace_child_of_pre_opt
+  FROM "olineage$snapshots" AS rewritten
+  JOIN "olineage$refs" AS current_ref
     ON rewritten.snapshot_id = current_ref.snapshot_id
-  JOIN olineage$refs AS baseline_ref
+  JOIN "olineage$refs" AS baseline_ref
     ON rewritten.parent_id = baseline_ref.snapshot_id
   WHERE current_ref.name = 'main' AND baseline_ref.name = 'pre_opt'
     AND rewritten.operation = 'replace'
@@ -158,14 +142,14 @@ SELECT count(*) AS current_replace_child_of_pre_opt
 -- All active delete inputs belonged to this table's complete rewrite group.
 -- This does not require OPTIMIZE to clear deletes outside a selected rewrite.
 -- @db=opt_rl_${uuid0}.ns_${uuid0}
-SELECT count(*) AS active_delete_files_after_optimize
-  FROM olineage$files
+SELECT count() AS active_delete_files_after_optimize
+  FROM "olineage$files"
   WHERE content <> 0;
 
 -- query 15
 -- @cleanup=true
 -- @skip_result_check=true
-ALTER TABLE opt_rl_${uuid0}.ns_${uuid0}.olineage DROP TAG pre_opt;
-DROP TABLE opt_rl_${uuid0}.ns_${uuid0}.olineage FORCE;
-DROP DATABASE opt_rl_${uuid0}.ns_${uuid0};
+ALTER TABLE opt_rl_${uuid0}.ns_${uuid0}.olineage EXECUTE drop_tag(name => 'pre_opt', if_exists => false);
+DROP TABLE opt_rl_${uuid0}.ns_${uuid0}.olineage ;
+DROP SCHEMA opt_rl_${uuid0}.ns_${uuid0};
 DROP CATALOG opt_rl_${uuid0};

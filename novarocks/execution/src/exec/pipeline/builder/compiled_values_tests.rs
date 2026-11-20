@@ -187,6 +187,7 @@ fn values_program_with_sources(
                             None,
                             ty,
                             ExprKind::Cast {
+                                array_failure_mode: None,
                                 expr: constant,
                                 target: types[column].data_type().clone(),
                                 decimal_overflow_policy: DecimalOverflowPolicy::ReportError,

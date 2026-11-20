@@ -37,9 +37,9 @@ CREATE TABLE ${case_db}.t_null_insert_sink (
   c_dt DATETIME
 );
 INSERT INTO ${case_db}.t_null_insert_src VALUES
-  (1, NULL, NULL, NULL, NULL),
-  (2, 20, 'ok', 12.30, '2024-01-02 03:04:05'),
-  (3, NULL, 'tail', NULL, '2024-06-01 00:00:00');
+  ROW(1, NULL, NULL, NULL, NULL),
+  ROW(2, 20, 'ok', 12.30, '2024-01-02 03:04:05'),
+  ROW(3, NULL, 'tail', NULL, '2024-06-01 00:00:00');
 INSERT INTO ${case_db}.t_null_insert_sink
 SELECT id, c_int, c_str, c_dec, c_dt
 FROM ${case_db}.t_null_insert_src;

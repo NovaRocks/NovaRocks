@@ -382,17 +382,26 @@ fn summary_u64(summary: &HashMap<String, String>, key: &str) -> Option<u64> {
         .and_then(|value| value.trim().parse::<u64>().ok())
 }
 
+pub(crate) fn maintenance_property_enabled(value: &str) -> bool {
+    !value.trim().eq_ignore_ascii_case("false")
+}
+pub(crate) fn target_file_size_property_value(value: &str) -> Option<i64> {
+    value.trim().parse::<i64>().ok()
+}
+
 fn maintenance_policy(properties: &HashMap<String, String>) -> IcebergStorageMaintenancePolicy {
     IcebergStorageMaintenancePolicy {
         maintenance_enabled: properties
             .get(MAINTENANCE_ENABLED_PROPERTY)
-            .map(|value| !value.trim().eq_ignore_ascii_case("false")),
+            .map(|value| maintenance_property_enabled(value)),
         expire_max_snapshot_age_ms: parsed_property(properties, EXPIRE_MAX_SNAPSHOT_AGE_PROPERTY),
         expire_min_snapshots_to_keep: parsed_property(
             properties,
             EXPIRE_MIN_SNAPSHOTS_TO_KEEP_PROPERTY,
         ),
-        target_file_size_bytes: parsed_property(properties, TARGET_FILE_SIZE_PROPERTY),
+        target_file_size_bytes: properties
+            .get(TARGET_FILE_SIZE_PROPERTY)
+            .and_then(|value| target_file_size_property_value(value)),
     }
 }
 

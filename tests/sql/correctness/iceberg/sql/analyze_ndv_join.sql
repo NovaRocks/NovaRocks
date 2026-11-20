@@ -23,7 +23,7 @@
 -- collected distinct counts rather than from that default.
 
 -- @skip_result_check=true
-CREATE DATABASE iceberg_cat_${suite_uuid0}.ndv_db_${uuid0};
+CREATE SCHEMA iceberg_cat_${suite_uuid0}.ndv_db_${uuid0};
 
 -- @skip_result_check=true
 CREATE TABLE iceberg_cat_${suite_uuid0}.ndv_db_${uuid0}.l_${uuid0} (k INT, payload INT);
@@ -41,18 +41,18 @@ INSERT INTO iceberg_cat_${suite_uuid0}.ndv_db_${uuid0}.r_${uuid0}
   SELECT generate_series % 80, generate_series % 2 FROM TABLE(generate_series(1, 800));
 
 -- @skip_result_check=true
-ANALYZE TABLE iceberg_cat_${suite_uuid0}.ndv_db_${uuid0}.l_${uuid0};
+ANALYZE iceberg_cat_${suite_uuid0}.ndv_db_${uuid0}.l_${uuid0};
 
 -- @skip_result_check=true
-ANALYZE TABLE iceberg_cat_${suite_uuid0}.ndv_db_${uuid0}.r_${uuid0};
+ANALYZE iceberg_cat_${suite_uuid0}.ndv_db_${uuid0}.r_${uuid0};
 
 -- ANALYZE publishes the measured approximate NDV as an Estimated statistic,
 -- so the join uses |l|*|r|/max(ndv_l, ndv_r) = 6480.
 -- @explain_contains=HASH JOIN
 -- @explain_contains=stats={rows=6480}
-EXPLAIN VERBOSE SELECT l.k
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'  SELECT l.k
 FROM iceberg_cat_${suite_uuid0}.ndv_db_${uuid0}.l_${uuid0} l
 JOIN iceberg_cat_${suite_uuid0}.ndv_db_${uuid0}.r_${uuid0} r ON l.k = r.k;
 
 -- @skip_result_check=true
-DROP DATABASE iceberg_cat_${suite_uuid0}.ndv_db_${uuid0};
+DROP SCHEMA iceberg_cat_${suite_uuid0}.ndv_db_${uuid0};

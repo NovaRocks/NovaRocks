@@ -36,7 +36,7 @@ use crate::mv::domain::application::MvApplicationError;
 use crate::mv::domain::iceberg_refresh::IcebergMvCorePorts;
 use novarocks_spi::connector::ConnectorRequestContext;
 use novarocks_sql::compiler::{
-    SqlCapturedCatalog, SqlCapturedCatalogPreparation, SqlCompileControl,
+    SqlCapturedCatalog, SqlCapturedCatalogPreparation, SqlCompileControl, quoted_metadata_catalogs,
 };
 use novarocks_sql::planning::mv::first_refresh::SqlMvFirstRefreshArtifact;
 
@@ -331,17 +331,36 @@ pub(crate) async fn capture_catalog(
     input: MvCatalogCaptureInput,
     io: &MvRefreshPreparationIo,
 ) -> Result<MvCatalogCaptureOutput, MvApplicationError> {
+    let current_catalog = input.current_catalog.as_deref();
+    let current_database = &input.current_database;
+    let candidates = match &input.query {
+        MvCatalogCaptureQuery::Query(query) => {
+            quoted_metadata_catalogs(query, current_catalog, current_database, &input.control)
+        }
+        MvCatalogCaptureQuery::FirstSql(source) => {
+            source.quoted_metadata_catalogs(current_catalog, current_database, &input.control)
+        }
+    }
+    .map_err(MvApplicationError::from_compile)?;
+    let qualifications = input
+        .bindings
+        .observe_catalog_qualifications(&candidates, input.ports.catalog_application())
+        .map_err(MvApplicationError::from_compile)?;
     let mut preparation = match &input.query {
-        MvCatalogCaptureQuery::Query(query) => SqlCapturedCatalogPreparation::try_new(
-            query.as_ref().clone(),
-            input.current_catalog.as_deref(),
-            &input.current_database,
-            input.control.clone(),
-        ),
+        MvCatalogCaptureQuery::Query(query) => {
+            SqlCapturedCatalogPreparation::try_new_with_qualifications(
+                query.as_ref().clone(),
+                current_catalog,
+                current_database,
+                input.control.clone(),
+                qualifications,
+            )
+        }
         MvCatalogCaptureQuery::FirstSql(source) => source.catalog_preparation(
-            input.current_catalog.as_deref(),
-            &input.current_database,
+            current_catalog,
+            current_database,
             input.control.clone(),
+            qualifications,
         ),
     }
     .map_err(MvApplicationError::from_compile)?;

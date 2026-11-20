@@ -29,17 +29,16 @@ CREATE TABLE ${case_db}.t_topn_rank_partition_filter_tie_expand (
   id INT,
   grp INT,
   score INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 INSERT INTO ${case_db}.t_topn_rank_partition_filter_tie_expand VALUES
-  (1, 1, 100),
-  (2, 1, 95),
-  (3, 1, 95),
-  (4, 1, 90),
-  (5, 2, 88),
-  (6, 2, 88),
-  (7, 2, 70),
-  (8, 2, 60);
+  ROW(1, 1, 100),
+  ROW(2, 1, 95),
+  ROW(3, 1, 95),
+  ROW(4, 1, 90),
+  ROW(5, 2, 88),
+  ROW(6, 2, 88),
+  ROW(7, 2, 70),
+  ROW(8, 2, 60);
 SELECT id, grp, score, rk
 FROM (
   SELECT

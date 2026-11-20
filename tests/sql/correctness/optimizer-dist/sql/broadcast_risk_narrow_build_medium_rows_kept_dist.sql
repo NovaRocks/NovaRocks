@@ -16,7 +16,7 @@
 -- under the License.
 
 -- @tags=optimizer,bc1,distribution,dist-only
-CREATE DATABASE IF NOT EXISTS ${case_db};
+CREATE SCHEMA IF NOT EXISTS ${case_db};
 USE ${case_db};
 CREATE TABLE probe_5m_wide (k INT, pad1 VARCHAR(100), pad2 VARCHAR(100));
 CREATE TABLE build_500k (k INT);
@@ -25,9 +25,9 @@ INSERT INTO probe_5m_wide
     FROM TABLE(generate_series(1, 5000000));
 INSERT INTO build_500k
     SELECT generate_series FROM TABLE(generate_series(1, 500000));
-ANALYZE TABLE build_500k;
+ANALYZE build_500k;
 -- ANALYZE publishes before the following query is admitted.
-SET cbo_broadcast_node_mem_budget_bytes = 268435456;
+SET SESSION cbo_broadcast_node_mem_budget_bytes = 268435456;
 -- @explain_contains=HASH JOIN (BROADCAST
 -- @explain_contains=bcast_verdict=feasible
 -- @explain_not_contains=PARTITIONED, INNER
@@ -42,6 +42,6 @@ FROM probe_5m_wide p JOIN build_500k b ON p.k = b.k;
 -- @result_contains=PARTITION: BROADCAST
 -- @result_not_contains=HASH JOIN (PARTITIONED
 -- @skip_result_check=true
-EXPLAIN COSTS
+EXPLAIN WITH SESSION explain_detail = 'COSTS'
 SELECT COUNT(p.pad1) AS cnt
 FROM probe_5m_wide p JOIN build_500k b ON p.k = b.k;

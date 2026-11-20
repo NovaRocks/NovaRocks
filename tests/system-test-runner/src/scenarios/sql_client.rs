@@ -105,14 +105,14 @@ impl Scenario for SharedSqlClient {
                 sql::single_integer(&client.execute("SELECT 1")?)? == 1,
                 "initial query changed"
             );
-            let warehouse = path.to_string_lossy().replace('"', "\\\"");
-            let created = client.execute(format!("CREATE EXTERNAL CATALOG trc3_client PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"hadoop\",\"iceberg.catalog.warehouse\"=\"{warehouse}\")"))?;
+            let warehouse = path.to_string_lossy().replace('\'', "''");
+            let created = client.execute(format!("CREATE CATALOG trc3_client USING iceberg WITH (\"iceberg.catalog.type\" = 'hadoop', \"iceberg.catalog.warehouse\" = '{warehouse}')"))?;
             ensure!(
                 created.columns.is_empty() && created.update_count.is_none(),
                 "CREATE CATALOG has no count or columns"
             );
-            client.execute("CREATE DATABASE trc3_client.ns")?;
-            client.execute("SET query_timeout = 30")?;
+            client.execute("CREATE SCHEMA trc3_client.ns")?;
+            client.execute("SET SESSION query_timeout = 30")?;
             client.execute("USE trc3_client.ns")?;
             ensure!(
                 client.session().catalog.as_deref() == Some("trc3_client")
@@ -126,9 +126,8 @@ impl Scenario for SharedSqlClient {
                 "successful session effects were not applied: {:?}",
                 client.session()
             );
-            let created = client.execute(
-                "CREATE TABLE items (id INT, v INT) TBLPROPERTIES (\"format-version\"=\"3\", \"write.row-lineage\"=\"true\")",
-            )?;
+            let created =
+                client.execute("CREATE TABLE items (id INT, v INT) WITH (format_version = 3)")?;
             ensure!(
                 created.columns.is_empty() && created.update_count.is_none(),
                 "CREATE TABLE has no count or columns"

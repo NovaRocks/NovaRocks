@@ -595,7 +595,7 @@ mod tests {
         // bitmap_to_string independently crosses from that domain to Physical.
         use novarocks_type_contract::ValueLogicalType as T;
         for (sql, domain) in [
-            ("select json_object('k', 1) as value", T::Json),
+            ("select json_object('k': 1) as value", T::Json),
             ("select bitmap_agg(1) as value", T::Bitmap),
             ("select hll_hash(cast(1 as bigint)) as value", T::Hll),
             (
@@ -607,7 +607,7 @@ mod tests {
                 T::Physical,
             ),
             (
-                "select cast(json_object('k', 1) as varchar) as value",
+                "select cast(json_object('k': 1) as varchar) as value",
                 T::Physical,
             ),
         ] {
@@ -804,6 +804,7 @@ mod tests {
                     None,
                     ty.clone(),
                     ExprKind::Cast {
+                        array_failure_mode: None,
                         expr: literal,
                         target: DataType::Int64,
                         decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,

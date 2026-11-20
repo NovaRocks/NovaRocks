@@ -208,6 +208,18 @@ pub(crate) struct RetryPolicy {
     total_timeout: Duration,
 }
 
+pub(crate) fn parse_retry_count_property_value(value: &str) -> Result<u32> {
+    value.parse().map_err(|_| {
+        Error::new(
+            ErrorKind::DataInvalid,
+            format!(
+                "Invalid value for {}: {value}",
+                TableProperties::PROPERTY_COMMIT_NUM_RETRIES
+            ),
+        )
+    })
+}
+
 impl RetryPolicy {
     /// Do not parse unrelated table properties: e.g. file-format options do not own retry.
     pub(crate) fn from_properties(properties: &HashMap<String, String>) -> Result<Self> {
@@ -225,11 +237,11 @@ impl RetryPolicy {
                 })
             })
         }
-        let retries = parse(
-            properties,
-            TableProperties::PROPERTY_COMMIT_NUM_RETRIES,
-            TableProperties::PROPERTY_COMMIT_NUM_RETRIES_DEFAULT as u32,
-        )?;
+        let retries = properties
+            .get(TableProperties::PROPERTY_COMMIT_NUM_RETRIES)
+            .map(|value| parse_retry_count_property_value(value))
+            .transpose()?
+            .unwrap_or(TableProperties::PROPERTY_COMMIT_NUM_RETRIES_DEFAULT as u32);
         let min_wait = Duration::from_millis(parse(
             properties,
             TableProperties::PROPERTY_COMMIT_MIN_RETRY_WAIT_MS,

@@ -161,6 +161,18 @@ impl CatalogResolutionError {
     }
 }
 
+pub(super) fn catalog_application_resolution_error(
+    error: novarocks_catalog_application::CatalogApplicationError,
+) -> CatalogResolutionError {
+    let cause = error
+        .source_failure()
+        .cloned()
+        .unwrap_or_else(|| novarocks_failure_contract::SharedFailureCause::new(error));
+    CatalogResolutionError::from(novarocks_sql::compiler::SqlCompileError::CompilationSource(
+        cause,
+    ))
+}
+
 impl From<novarocks_sql::compiler::SqlCompileError> for CatalogResolutionError {
     fn from(error: novarocks_sql::compiler::SqlCompileError) -> Self {
         Self::Failed {
@@ -268,15 +280,24 @@ pub(crate) fn load_connector_table_materialization_with_resolution_typed(
     table: &str,
     resolution: novarocks_spi::connector::ConnectorTableResolution,
 ) -> CatalogResolutionResult<ConnectorQueryTableMaterialization> {
-    use novarocks_spi::connector::{
-        ConnectorInstanceId, ConnectorTableIdentity, ConnectorTableRequest,
-    };
-
-    let instance_id = ConnectorInstanceId::parse(catalog)
+    let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(catalog)
         .map_err(|error| CatalogResolutionError::failed(error.to_string()))?;
     let planning_pin = controls
         .acquire_current(&instance_id)
         .map_err(CatalogResolutionError::from_connector)?;
+    load_connector_table_materialization_at_pin(planning_pin, context, namespace, table, resolution)
+}
+
+pub(super) fn load_connector_table_materialization_at_pin(
+    planning_pin: novarocks_spi::connector::ConnectorControlPlanningPin,
+    context: novarocks_spi::connector::ConnectorRequestContext,
+    namespace: &str,
+    table: &str,
+    resolution: novarocks_spi::connector::ConnectorTableResolution,
+) -> CatalogResolutionResult<ConnectorQueryTableMaterialization> {
+    use novarocks_spi::connector::{ConnectorTableIdentity, ConnectorTableRequest};
+
+    let instance_id = planning_pin.binding().descriptor().instance_id.clone();
     // The query-wide collector is attached at admitted query preparation, but
     // only this exact planning pin knows which durable catalog generation a
     // metadata response belongs to. Decorate this one request after acquiring
@@ -322,15 +343,31 @@ pub(crate) async fn load_connector_table_materialization_with_resolution_async(
     table: &str,
     resolution: novarocks_spi::connector::ConnectorTableResolution,
 ) -> CatalogResolutionResult<ConnectorQueryTableMaterialization> {
-    use novarocks_spi::connector::{
-        ConnectorInstanceId, ConnectorTableIdentity, ConnectorTableRequest,
-    };
-
-    let instance_id = ConnectorInstanceId::parse(catalog)
+    let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(catalog)
         .map_err(|error| CatalogResolutionError::failed(error.to_string()))?;
     let planning_pin = controls
         .acquire_current(&instance_id)
         .map_err(CatalogResolutionError::from_connector)?;
+    load_connector_table_materialization_at_pin_async(
+        planning_pin,
+        context,
+        namespace,
+        table,
+        resolution,
+    )
+    .await
+}
+
+pub(super) async fn load_connector_table_materialization_at_pin_async(
+    planning_pin: novarocks_spi::connector::ConnectorControlPlanningPin,
+    context: novarocks_spi::connector::ConnectorRequestContext,
+    namespace: &str,
+    table: &str,
+    resolution: novarocks_spi::connector::ConnectorTableResolution,
+) -> CatalogResolutionResult<ConnectorQueryTableMaterialization> {
+    use novarocks_spi::connector::{ConnectorTableIdentity, ConnectorTableRequest};
+
+    let instance_id = planning_pin.binding().descriptor().instance_id.clone();
     // The query-wide collector is attached at admitted query preparation, but
     // only this exact planning pin knows which durable catalog generation a
     // metadata response belongs to. Decorate this one request after acquiring

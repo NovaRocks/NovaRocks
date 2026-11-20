@@ -34,7 +34,7 @@ use crate::dml::error::DmlError;
 use crate::dml::service::DmlService;
 use crate::query_execution::dml::add_files::{
     AddFilesCommand, AddFilesEngine, AddFilesFailure, AddFilesFinalization, AddFilesOutcome,
-    AddFilesPlanError, AddFilesPlanFacts, PlanAddFilesRequest, PreparedAddFiles,
+    AddFilesPlanError, AddFilesPlanFacts, PlanAddFilesRequest, PreparedAddFiles, ResolvedAddFiles,
 };
 use novarocks_query_application::admitted_query_context::RequestContext;
 
@@ -49,11 +49,50 @@ pub(crate) struct PreparedAddFilesAttempt {
 }
 
 impl DmlService {
-    /// Plans an admitted ADD FILES statement without beginning dispatch.
-    pub(crate) fn prepare_add_files(
+    #[cfg(test)]
+    fn prepare_add_files(
         &self,
         engine: &dyn AddFilesEngine,
         command: AddFilesCommand,
+        context: &RequestContext,
+        query_options: Option<&QueryOptions>,
+    ) -> Result<PreparedAddFilesAttempt, DmlError> {
+        self.prepare_add_files_request(engine, command, None, context, query_options)
+    }
+
+    /// Use the exact target retained during TABLE EXECUTE argument binding.
+    pub(crate) fn prepare_resolved_add_files(
+        &self,
+        engine: &dyn AddFilesEngine,
+        resolved: ResolvedAddFiles,
+        context: &RequestContext,
+        query_options: Option<&QueryOptions>,
+    ) -> Result<PreparedAddFilesAttempt, DmlError> {
+        let command = AddFilesCommand {
+            table_parts: vec![
+                resolved.target.catalog.clone(),
+                resolved.target.namespace.clone(),
+                resolved.target.table.clone(),
+            ],
+            location: resolved.location,
+        };
+        self.prepare_add_files_request(
+            engine,
+            command,
+            Some((resolved.target, resolved.planning)),
+            context,
+            query_options,
+        )
+    }
+
+    fn prepare_add_files_request(
+        &self,
+        engine: &dyn AddFilesEngine,
+        command: AddFilesCommand,
+        retained: Option<(
+            crate::catalog_application::resolver::TargetBackend,
+            novarocks_spi::connector::ConnectorControlPlanningPin,
+        )>,
         context: &RequestContext,
         query_options: Option<&QueryOptions>,
     ) -> Result<PreparedAddFilesAttempt, DmlError> {
@@ -63,12 +102,10 @@ impl DmlService {
             ));
         }
         let publication_id = LakePublicationId::new_v7();
-        let session = context.session();
         let prepared = engine
             .plan_add_files(PlanAddFilesRequest {
                 command,
-                current_catalog: session.current_catalog().map(ToOwned::to_owned),
-                current_database: session.current_database().to_string(),
+                retained,
                 mutation_operation_id: publication_id.to_bytes(),
                 query_options: query_options.cloned(),
                 execution: context.execution().clone(),

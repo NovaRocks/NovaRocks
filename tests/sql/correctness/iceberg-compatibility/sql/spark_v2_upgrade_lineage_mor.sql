@@ -62,10 +62,7 @@ FROM ${case_db}.upgrade_lineage_${uuid0} ORDER BY id;
 -- @expect_sql_code=query.execution.invalid_data
 -- @expect_sql_phase=Execution
 -- @expect_error=has no row lineage (no row range)
-CREATE MATERIALIZED VIEW ${case_db}.upgrade_lineage_mv_${uuid0}
-DISTRIBUTED BY HASH(id) BUCKETS 1
-PROPERTIES ('storage_engine'='iceberg')
-AS SELECT id,v FROM ${case_db}.upgrade_lineage_${uuid0};
+CREATE MATERIALIZED VIEW ${case_db}.upgrade_lineage_mv_${uuid0} AS SELECT id,v FROM ${case_db}.upgrade_lineage_${uuid0};
 
 -- query 4
 -- @expect_error_tier=drift
@@ -114,10 +111,7 @@ printf '%s\n' "$spark_out" | tr '\r' '\n' | grep -Fx 'SPARK_UPGRADE_MOR_LINEAGE_
 
 -- query 8
 -- @skip_result_check=true
-CREATE MATERIALIZED VIEW ${case_db}.upgrade_lineage_mv_${uuid0}
-DISTRIBUTED BY HASH(id) BUCKETS 1
-PROPERTIES ('storage_engine'='iceberg')
-AS SELECT id,v FROM ${case_db}.upgrade_lineage_${uuid0};
+CREATE MATERIALIZED VIEW ${case_db}.upgrade_lineage_mv_${uuid0} AS SELECT id,v FROM ${case_db}.upgrade_lineage_${uuid0};
 REFRESH MATERIALIZED VIEW ${case_db}.upgrade_lineage_mv_${uuid0};
 
 -- query 9
@@ -127,4 +121,4 @@ SELECT id,v FROM ${case_db}.upgrade_lineage_mv_${uuid0} ORDER BY id;
 -- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW IF EXISTS ${case_db}.upgrade_lineage_mv_${uuid0};
-DROP TABLE IF EXISTS ${case_db}.upgrade_lineage_${uuid0} FORCE;
+DROP TABLE IF EXISTS ${case_db}.upgrade_lineage_${uuid0} ;

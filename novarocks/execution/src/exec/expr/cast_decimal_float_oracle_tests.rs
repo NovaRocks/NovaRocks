@@ -2193,6 +2193,7 @@ fn r(
         &FunctionValueType::new(DataType::Float64, nullable),
         policy,
         allow,
+        None,
         &Control,
     )
     .unwrap()
@@ -2306,6 +2307,7 @@ fn complete(wide: bool) {
                 &FunctionValueType::new(DataType::Float64, true),
                 policy,
                 allow,
+                None,
                 &Control,
             )
             .unwrap();

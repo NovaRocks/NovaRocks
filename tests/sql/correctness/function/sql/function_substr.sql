@@ -55,13 +55,12 @@ select SUBSTRING('', 9223372036854775806, 465254298) ;
 
 -- query 9
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.t1 (id int, v bigint)
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.t1 (id int, v bigint) WITH (format_version = 3);
 
 -- query 10
 -- @skip_result_check=true
 USE ${case_db};
-insert into t1 values(1, 9223372036854775807), (2, -9223372036854775807), (3, 9223372036854775806);
+insert into t1 values ROW(1, 9223372036854775807), ROW(2, -9223372036854775807), ROW(3, 9223372036854775806);
 
 -- query 11
 USE ${case_db};

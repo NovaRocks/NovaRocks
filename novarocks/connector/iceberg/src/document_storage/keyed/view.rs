@@ -283,6 +283,12 @@ pub(crate) fn project_full_view(
             snapshot_id: snapshot.snapshot_id(),
             parent: snapshot.parent_snapshot_id(),
             records: snapshot_records,
+            slot_storage_effect_digest: snapshot
+                .summary()
+                .additional_properties
+                .get(crate::commit::slot_change::SLOT_STORAGE_EFFECT_SUMMARY_KEY)
+                .and_then(|value| DocumentIdentity::parse_hex(value).ok())
+                .map(DocumentIdentity::to_bytes),
         });
     }
     snapshots.sort_by_key(|s| s.snapshot_id);

@@ -1135,6 +1135,11 @@ impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
                 table_uuid,
                 snapshot_id,
                 ..
+            }
+            | PositiveAttributionObservation::ManagedRepartitionSnapshot {
+                table_uuid,
+                snapshot_id,
+                ..
             } => CommitProof::applied(Some(snapshot_id)).with_table_uuid(table_uuid.to_string()),
             PositiveAttributionObservation::PropertyMarker { table_uuid, .. } => {
                 CommitProof::applied(None).with_table_uuid(table_uuid.to_string())

@@ -831,9 +831,9 @@ mod tests {
                 join_type: JoinKind::Inner,
                 condition: Some(TypedExpr {
                     kind: ExprKind::BinaryOp {
-                        left: Box::new(col_expr(20, "k")),
+                        left: novarocks_parser::ast::AstBox::new(col_expr(20, "k")),
                         op: BinOp::Eq,
-                        right: Box::new(col_expr(30, "k")),
+                        right: novarocks_parser::ast::AstBox::new(col_expr(30, "k")),
                         decimal_overflow_policy:
                             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     },
@@ -853,9 +853,9 @@ mod tests {
             LogicalPlanKind::Filter(PlanFilterNode {
                 predicate: TypedExpr {
                     kind: ExprKind::BinaryOp {
-                        left: Box::new(col_expr(column_id, column)),
+                        left: novarocks_parser::ast::AstBox::new(col_expr(column_id, column)),
                         op: BinOp::Ge,
-                        right: Box::new(TypedExpr {
+                        right: novarocks_parser::ast::AstBox::new(TypedExpr {
                             kind: ExprKind::Literal(LiteralValue::Int(0)),
                             value_type: novarocks_type_contract::FunctionValueType::new(
                                 DataType::Int32,

@@ -277,6 +277,7 @@ fn temporal_input() -> (BoundExprSetBuilder, Vec<ExprPort>) {
                 None,
                 integer(false),
                 ExprKind::Cast {
+                    array_failure_mode: None,
                     expr: normal,
                     target: DataType::Int64,
                     decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,

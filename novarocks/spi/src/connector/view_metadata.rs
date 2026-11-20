@@ -334,7 +334,7 @@ mod tests {
 
     pub(super) fn definition() -> ConnectorViewDefinition {
         ConnectorViewDefinition {
-            dialect: ConnectorViewDialect::StarRocks,
+            dialect: ConnectorViewDialect::Trino,
             raw_sql: Arc::from("SELECT 1 AS c"),
             default_catalog: Some(Arc::from("catalog")),
             default_namespace: Arc::from("db"),

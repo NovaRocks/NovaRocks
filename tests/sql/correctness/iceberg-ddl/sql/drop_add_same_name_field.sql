@@ -26,7 +26,7 @@
 DROP TABLE IF EXISTS ${case_db}.t;
 CREATE TABLE ${case_db}.t (
   c1 INT,
-  c2 STRUCT<v2_1 INT>
+  c2 ROW(v2_1 INT)
 );
 
 -- query 2

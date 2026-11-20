@@ -29,14 +29,13 @@ CREATE TABLE ${case_db}.t_filter_in_between_like (
   id INT,
   name STRING,
   score INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 INSERT INTO ${case_db}.t_filter_in_between_like VALUES
-  (1, 'apple', 12),
-  (2, 'apricot', 20),
-  (3, 'banana', 15),
-  (4, 'azure', 9),
-  (5, 'avocado', 21);
+  ROW(1, 'apple', 12),
+  ROW(2, 'apricot', 20),
+  ROW(3, 'banana', 15),
+  ROW(4, 'azure', 9),
+  ROW(5, 'avocado', 21);
 SELECT id, name, score
 FROM ${case_db}.t_filter_in_between_like
 WHERE name LIKE 'a%' AND score BETWEEN 10 AND 20

@@ -22,7 +22,7 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE DATABASE iceberg_rest_${suite_uuid0}.iceberg_rest_tt_db_${uuid0};
+CREATE SCHEMA iceberg_rest_${suite_uuid0}.iceberg_rest_tt_db_${uuid0};
 
 -- query 2
 -- @skip_result_check=true
@@ -30,17 +30,17 @@ CREATE TABLE iceberg_rest_${suite_uuid0}.iceberg_rest_tt_db_${uuid0}.t_tt_${uuid
 
 -- query 3
 -- @skip_result_check=true
-INSERT INTO iceberg_rest_${suite_uuid0}.iceberg_rest_tt_db_${uuid0}.t_tt_${uuid0} VALUES (1, 10), (2, 20);
+INSERT INTO iceberg_rest_${suite_uuid0}.iceberg_rest_tt_db_${uuid0}.t_tt_${uuid0} VALUES ROW(1, 10), ROW(2, 20);
 
 -- query 4
 -- @skip_result_check=true
 -- Pin the current state under a backup branch.
-ALTER TABLE iceberg_rest_${suite_uuid0}.iceberg_rest_tt_db_${uuid0}.t_tt_${uuid0} CREATE BRANCH backup;
+CREATE BRANCH backup IN TABLE iceberg_rest_${suite_uuid0}.iceberg_rest_tt_db_${uuid0}.t_tt_${uuid0};
 
 -- query 5
 -- @skip_result_check=true
 -- Advance main with a third row.
-INSERT INTO iceberg_rest_${suite_uuid0}.iceberg_rest_tt_db_${uuid0}.t_tt_${uuid0} VALUES (3, 30);
+INSERT INTO iceberg_rest_${suite_uuid0}.iceberg_rest_tt_db_${uuid0}.t_tt_${uuid0} VALUES ROW(3, 30);
 
 -- query 6
 -- Default SELECT sees latest main: 3 rows.
@@ -74,7 +74,7 @@ SELECT
 
 -- query 10
 -- @skip_result_check=true
-ALTER TABLE iceberg_rest_${suite_uuid0}.iceberg_rest_tt_db_${uuid0}.t_tt_${uuid0} DROP BRANCH backup;
+DROP BRANCH backup IN TABLE iceberg_rest_${suite_uuid0}.iceberg_rest_tt_db_${uuid0}.t_tt_${uuid0};
 
 -- query 11
 -- @skip_result_check=true
@@ -82,4 +82,4 @@ DROP TABLE iceberg_rest_${suite_uuid0}.iceberg_rest_tt_db_${uuid0}.t_tt_${uuid0}
 
 -- query 12
 -- @skip_result_check=true
-DROP DATABASE iceberg_rest_${suite_uuid0}.iceberg_rest_tt_db_${uuid0};
+DROP SCHEMA iceberg_rest_${suite_uuid0}.iceberg_rest_tt_db_${uuid0};

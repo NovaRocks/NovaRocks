@@ -23,14 +23,13 @@
 -- COUNT(a) keeps the array in the scan output; the two smallest groups contain
 -- two and one non-null arrays respectively. The suite owns table cleanup.
 DROP TABLE IF EXISTS ${case_db}.rf_ordered_nested_payload;
-CREATE TABLE ${case_db}.rf_ordered_nested_payload (k INT, a ARRAY<INT>)
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.rf_ordered_nested_payload (k INT, a ARRAY<INT>) WITH (format_version = 3);
 INSERT INTO ${case_db}.rf_ordered_nested_payload VALUES
-    (1, [10]), (1, [20]), (2, [30]), (3, [40]);
+    ROW(1, [10]), ROW(1, [20]), ROW(2, [30]), ROW(3, [40]);
 
 -- Keep the complete-group ordered-filter candidate instead of preagg pruning.
-SET disable_optimizer_rules = 'PushDownTopNToPreAgg';
-SET enable_global_runtime_filter = true;
+SET SESSION disable_optimizer_rules = 'PushDownTopNToPreAgg';
+SET SESSION enable_global_runtime_filter = true;
 -- @explain_contains=LOCAL TOP-N (limit=2, offset=0)
 -- @explain_contains=HASH AGGREGATE (GLOBAL, group by: [k])
 -- @explain_contains=columns: k, a
@@ -39,11 +38,11 @@ SELECT k, COUNT(a) AS array_count
 FROM ${case_db}.rf_ordered_nested_payload
 GROUP BY k ORDER BY k LIMIT 2;
 
-SET enable_global_runtime_filter = false;
+SET SESSION enable_global_runtime_filter = false;
 SELECT k, COUNT(a) AS array_count
 FROM ${case_db}.rf_ordered_nested_payload
 GROUP BY k ORDER BY k LIMIT 2;
 
-SET enable_global_runtime_filter = true;
-SET disable_optimizer_rules = '';
+SET SESSION enable_global_runtime_filter = true;
+SET SESSION disable_optimizer_rules = '';
 DROP TABLE ${case_db}.rf_ordered_nested_payload;

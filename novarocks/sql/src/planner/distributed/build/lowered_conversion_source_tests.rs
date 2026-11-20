@@ -83,7 +83,8 @@ fn selected_json() -> TypedExpr {
 fn cast(input: TypedExpr, target: ValueType, decimal: DecimalOverflowPolicy) -> TypedExpr {
     TypedExpr {
         kind: ExprKind::Cast {
-            expr: Box::new(input),
+            array_failure_mode: None,
+            expr: novarocks_parser::ast::AstBox::new(input),
             target: target.data_type().clone(),
             decimal_overflow_policy: decimal,
         },
@@ -397,7 +398,7 @@ fn conversion_journal_lambda_scope_matches_the_actual_intermediate_emission() {
                 slot_id: 11,
                 value_type: json(false),
             }],
-            body: Box::new(cast(
+            body: novarocks_parser::ast::AstBox::new(cast(
                 parameter,
                 ValueType::new(DataType::Utf8, false),
                 DecimalOverflowPolicy::ReportError,

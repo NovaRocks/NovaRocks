@@ -144,58 +144,99 @@ fn sql_call_dependency_loan_real_upper_keeps_original_unconstrained_and_constant
     work.finish().unwrap();
 }
 #[test]
-fn sql_call_dependency_loan_real_typed_empty_array_has_original_constraint() {
-    let owner = exact("SELECT ARRAY<JSON>[] AS source_array");
-    let (fragment, node, expression) = function_site(&owner);
-    let control = SqlCompileControl::unbounded();
-    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
-    let loan = owner
-        .borrow_call_dependency_observed(
-            SqlCallDependencySite::Expression {
-                fragment,
-                node,
-                source: expression,
-            },
-            &mut work,
-        )
-        .unwrap();
-    assert_eq!(
-        loan.original_binding().result_constraint_origin(),
-        &SqlResultConstraintOrigin::EmptyArrayLiteral
-    );
-    let original = loan
-        .original_binding()
-        .result_constraint()
-        .expect("actual syntax authored result target");
-    assert_eq!(original, &expression.ty);
-    assert!(!original.nullable());
-    assert_eq!(original.logical_type(), ValueLogicalType::Physical);
-    let DataType::List(item) = &original.data_type() else {
-        panic!("original typed array target")
-    };
-    assert_eq!(item.name(), "item");
-    assert_eq!(item.data_type(), &DataType::Utf8);
-    let original_child = original
-        .child_at(0)
-        .expect("complete syntax-authored list child");
-    assert_eq!(original_child.logical_type(), ValueLogicalType::Json);
-    assert!(matches!(
-        original_child.value_type().kind(),
-        novarocks_type_contract::ValueKind::Nominal(ValueLogicalType::Json)
-    ));
-    assert_eq!(original_child.data_type(), item.data_type());
-    assert_eq!(original_child.nullable(), item.is_nullable());
-    assert!(item.metadata().as_arc().is_none());
-    assert!(loan.original_arguments().is_empty());
-    assert_eq!(loan.original_logical_argument_count(), 0);
-    let canonical = loan.canonical().unwrap();
-    assert_eq!(canonical.request().expected_result_type, Some(original));
-    assert_eq!(
-        canonical.selected().result_type,
-        FunctionResultType::Scalar(original.clone())
-    );
-    work.finish().unwrap();
+fn sql_call_dependency_loan_empty_array_keeps_unknown_source_and_outer_json_target() {
+    for sql in [
+        "SELECT CAST(ARRAY[] AS ARRAY(JSON)) AS source_array",
+        "SELECT CAST([] AS ARRAY<JSON>) AS source_array",
+    ] {
+        let owner = exact(sql);
+        let (fragment, node, expression) = function_site(&owner);
+        let control = SqlCompileControl::unbounded();
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
+        let loan = owner
+            .borrow_call_dependency_observed(
+                SqlCallDependencySite::Expression {
+                    fragment,
+                    node,
+                    source: expression,
+                },
+                &mut work,
+            )
+            .unwrap();
+        assert_eq!(
+            loan.original_binding().result_constraint_origin(),
+            &SqlResultConstraintOrigin::Unconstrained
+        );
+        assert!(loan.original_binding().result_constraint().is_none());
+        assert!(!expression.ty.nullable());
+        let DataType::List(source_item) = expression.ty.data_type() else {
+            panic!("original independent ARRAY source")
+        };
+        assert_eq!(source_item.data_type(), &DataType::Null);
+        assert!(source_item.is_nullable());
+        assert_eq!(
+            expression.ty.child_at(0).unwrap().logical_type(),
+            ValueLogicalType::Physical
+        );
+        assert!(loan.original_arguments().is_empty());
+        assert_eq!(loan.original_logical_argument_count(), 0);
+        let canonical = loan.canonical().unwrap();
+        assert!(canonical.request().expected_result_type.is_none());
+        assert_eq!(
+            canonical.selected().result_type,
+            FunctionResultType::Scalar(expression.ty.clone())
+        );
+        let unit = node
+            .expressions
+            .iter()
+            .find(|unit| {
+                unit.definition(expression.id)
+                    .is_some_and(|source| std::ptr::eq(source, expression))
+            })
+            .expect("the original ARRAY definition belongs to this node's expression unit");
+        let casts = unit
+            .definitions()
+            .iter()
+            .filter(|definition| {
+                matches!(&definition.kind, ExprKind::Cast { expr, .. } if *expr == expression.id)
+            })
+            .collect::<Vec<_>>();
+        let [cast] = casts.as_slice() else {
+            panic!("one actual outer CAST of the original constructor")
+        };
+        let ExprKind::Cast {
+            target,
+            array_failure_mode,
+            ..
+        } = &cast.kind
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            *array_failure_mode,
+            Some(novarocks_type_contract::ArrayCastFailureMode::ReportError)
+        );
+        assert_eq!(target, cast.ty.data_type());
+        let DataType::List(item) = cast.ty.data_type() else {
+            panic!("outer complete JSON target")
+        };
+        assert_eq!(item.name(), "item");
+        assert_eq!(item.data_type(), &DataType::Utf8);
+        assert!(item.is_nullable());
+        let child = cast.ty.child_at(0).unwrap();
+        assert_eq!(child.logical_type(), ValueLogicalType::Json);
+        assert!(matches!(
+            child.value_type().kind(),
+            novarocks_type_contract::ValueKind::Nominal(ValueLogicalType::Json)
+        ));
+        assert_eq!(child.data_type(), item.data_type());
+        assert_eq!(child.nullable(), item.is_nullable());
+        assert!(item.metadata().as_arc().is_none());
+        assert_eq!(owner.plan().result_port().unwrap().fields[0].ty, cast.ty);
+        work.finish().unwrap();
+    }
 }
+
 #[test]
 fn sql_call_dependency_loan_original_foreign_and_missing_source_refusals_stay_typed() {
     let owner = exact("SELECT upper('kept')");
@@ -317,7 +358,7 @@ fn sql_call_dependency_loan_does_not_add_scope_step_or_success_footer_and_latche
 #[test]
 fn sql_call_dependency_loan_real_table_unnest_retains_relation_and_channels() {
     let owner =
-        exact("SELECT u.* FROM (SELECT [1, 2] AS a) q CROSS JOIN LATERAL UNNEST(q.a) AS u(value)");
+        exact("SELECT u.* FROM (SELECT ARRAY[1, 2] AS a) q CROSS JOIN UNNEST(q.a) AS u(value)");
     let control = SqlCompileControl::unbounded();
     let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
     let mut count = 0;

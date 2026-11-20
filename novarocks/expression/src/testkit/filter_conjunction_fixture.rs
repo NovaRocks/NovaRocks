@@ -123,6 +123,7 @@ fn cast(draft: &mut BoundExprSetBuilder, expr: ExprId, ty: FunctionValueType) ->
             None,
             ty.clone(),
             ExprKind::Cast {
+                array_failure_mode: None,
                 expr,
                 target: ty.data_type().clone(),
                 decimal_overflow_policy: OUTPUT_NULL,

@@ -38,5 +38,6 @@ pub use observation::{
 pub use operation::{
     ConnectorDocumentManagementAdmission, ConnectorDocumentManagementAdmissionRequest,
     ConnectorDocumentManagementOperation, ConnectorDocumentPublicationDeclaration,
-    ConnectorDocumentStorage, ConnectorDocumentStorageBinding, ConnectorDocumentStorageManagement,
+    ConnectorDocumentPublicationSlotUpdate, ConnectorDocumentStorage,
+    ConnectorDocumentStorageBinding, ConnectorDocumentStorageManagement,
 };

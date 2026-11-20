@@ -27,16 +27,15 @@
 CREATE TABLE ${case_db}.t_agg_sum_distinct (
     g INT,
     v INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t_agg_sum_distinct VALUES
-    (1, 10),
-    (1, 10),
-    (1, 20),
-    (2, 5),
-    (2, 5),
-    (2, NULL);
+    ROW(1, 10),
+    ROW(1, 10),
+    ROW(1, 20),
+    ROW(2, 5),
+    ROW(2, 5),
+    ROW(2, NULL);
 
 SELECT
     g,

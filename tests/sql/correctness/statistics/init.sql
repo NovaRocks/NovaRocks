@@ -16,37 +16,6 @@
 -- under the License.
 
 -- @catalog=statistics_cat_${suite_uuid0}
-CREATE EXTERNAL CATALOG IF NOT EXISTS `statistics_cat_${suite_uuid0}`
-PROPERTIES (
-    "type"="iceberg",
-    "iceberg.catalog.type"="rest",
-    "uri"="${iceberg_rest_uri}",
-    "warehouse"="${iceberg_rest_warehouse}",
-    "credential.object-store-metadata.consumer-role" = "frontend",
-    "credential.object-store-metadata.mode" = "${iceberg_object_store_credential_mode}",
-    "credential.object-store-metadata.name" = "${iceberg_object_store_metadata_credential_name}",
-    "credential.object-store-metadata.generation" = "${iceberg_object_store_credential_generation}",
-    "credential.object-store-data.consumer-role" = "backend",
-    "credential.object-store-data.mode" = "${iceberg_object_store_credential_mode}",
-    "credential.object-store-data.name" = "${iceberg_object_store_data_credential_name}",
-    "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
-    "aws.s3.endpoint"="${oss_endpoint}",
-    "aws.s3.enable_path_style_access"="${oss_path_style}"
-);
+CREATE CATALOG IF NOT EXISTS "statistics_cat_${suite_uuid0}" USING iceberg WITH ("iceberg.catalog.type" = 'rest', "uri" = '${iceberg_rest_uri}', "warehouse" = '${iceberg_rest_warehouse}', "credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-metadata.name" = '${iceberg_object_store_metadata_credential_name}', "credential.object-store-metadata.generation" = '${iceberg_object_store_credential_generation}', "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-data.name" = '${iceberg_object_store_data_credential_name}', "credential.object-store-data.generation" = '${iceberg_object_store_credential_generation}', "aws.s3.endpoint" = '${oss_endpoint}', "aws.s3.enable_path_style_access" = '${oss_path_style}');
 
-CREATE EXTERNAL CATALOG IF NOT EXISTS `statistics_hadoop_${suite_uuid0}`
-PROPERTIES (
-    "type"="iceberg",
-    "iceberg.catalog.type"="hadoop",
-    "iceberg.catalog.warehouse"="${iceberg_catalog_warehouse}/statistics-${suite_uuid0}",
-    "credential.object-store-metadata.consumer-role" = "frontend",
-    "credential.object-store-metadata.mode" = "${iceberg_object_store_credential_mode}",
-    "credential.object-store-metadata.name" = "${iceberg_object_store_metadata_credential_name}",
-    "credential.object-store-metadata.generation" = "${iceberg_object_store_credential_generation}",
-    "credential.object-store-data.consumer-role" = "backend",
-    "credential.object-store-data.mode" = "${iceberg_object_store_credential_mode}",
-    "credential.object-store-data.name" = "${iceberg_object_store_data_credential_name}",
-    "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
-    "aws.s3.endpoint"="${oss_endpoint}",
-    "aws.s3.enable_path_style_access"="${oss_path_style}"
-);
+CREATE CATALOG IF NOT EXISTS "statistics_hadoop_${suite_uuid0}" USING iceberg WITH ("iceberg.catalog.type" = 'hadoop', "iceberg.catalog.warehouse" = '${iceberg_catalog_warehouse}/statistics-${suite_uuid0}', "credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-metadata.name" = '${iceberg_object_store_metadata_credential_name}', "credential.object-store-metadata.generation" = '${iceberg_object_store_credential_generation}', "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-data.name" = '${iceberg_object_store_data_credential_name}', "credential.object-store-data.generation" = '${iceberg_object_store_credential_generation}', "aws.s3.endpoint" = '${oss_endpoint}', "aws.s3.enable_path_style_access" = '${oss_path_style}');

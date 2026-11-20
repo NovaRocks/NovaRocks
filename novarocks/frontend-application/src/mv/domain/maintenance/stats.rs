@@ -156,7 +156,7 @@ impl OriginalMaintenanceFacts {
         })?;
         let planning_pin = ConnectorControlResolver::acquire_current(controls, &instance)?;
         Ok(Self {
-            capture: super::super::staged_create::CurrentMetadataCapture::new(),
+            capture: crate::mv::domain::staged_create::new_current_metadata_capture(),
             planning_pin,
             table: ConnectorTableIdentity {
                 instance_id: instance,

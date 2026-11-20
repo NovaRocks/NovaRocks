@@ -28,15 +28,14 @@ CREATE TABLE ${case_db}.t_analytic_lag_lead_default (
     grp VARCHAR(10),
     ts INT,
     v INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t_analytic_lag_lead_default VALUES
-    ('A', 1, 10),
-    ('A', 2, 20),
-    ('A', 3, 30),
-    ('B', 1, 7),
-    ('B', 2, NULL);
+    ROW('A', 1, 10),
+    ROW('A', 2, 20),
+    ROW('A', 3, 30),
+    ROW('B', 1, 7),
+    ROW('B', 2, NULL);
 
 SELECT
     grp,

@@ -667,6 +667,7 @@ fn base64_program(shape: Shape) -> Program {
                         None,
                         ty.clone(),
                         ExprKind::Cast {
+                            array_failure_mode: None,
                             expr: child,
                             target: DataType::Utf8,
                             decimal_overflow_policy: DecimalOverflowPolicy::ReportError,

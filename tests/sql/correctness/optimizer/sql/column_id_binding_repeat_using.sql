@@ -39,24 +39,24 @@ CREATE TABLE ${case_db}.cid_repeat_using_r (a INT, c INT, w VARCHAR(8));
 -- query 5
 -- @skip_result_check=true
 INSERT INTO ${case_db}.cid_repeat_using_l VALUES
-    (1, 10, 'l1'),
-    (2, 20, 'l2'),
-    (3, 30, 'l3');
+    ROW(1, 10, 'l1'),
+    ROW(2, 20, 'l2'),
+    ROW(3, 30, 'l3');
 
 -- query 6
 -- @skip_result_check=true
 INSERT INTO ${case_db}.cid_repeat_using_r VALUES
-    (2, 200, 'r2'),
-    (3, 300, 'r3'),
-    (4, 400, 'r4');
-ANALYZE TABLE ${case_db}.cid_repeat_using_l;
-ANALYZE TABLE ${case_db}.cid_repeat_using_r;
+    ROW(2, 200, 'r2'),
+    ROW(3, 300, 'r3'),
+    ROW(4, 400, 'r4');
+ANALYZE ${case_db}.cid_repeat_using_l;
+ANALYZE ${case_db}.cid_repeat_using_r;
 
 -- query 7
 -- @order_sensitive=true
-SELECT grouping(a + 1) AS g, a + 1 AS k, count(*) AS cnt
-FROM ${case_db}.cid_repeat_using_l
-GROUP BY ROLLUP(a + 1)
+SELECT grouping(k) AS g, k AS k, count() AS cnt
+FROM (SELECT a + 1 AS k FROM ${case_db}.cid_repeat_using_l) AS rollup_input
+GROUP BY ROLLUP(k)
 ORDER BY g, k;
 
 -- query 8

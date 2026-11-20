@@ -22,42 +22,39 @@
 -- query 1
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.rf_bitset_decimal_probe (
-  id INT NULL,
-  d32 DECIMAL(9,0) NULL,
-  d64 DECIMAL(18,0) NULL,
-  d128 DECIMAL(19,0) NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+  id INT ,
+  d32 DECIMAL(9,0) ,
+  d64 DECIMAL(18,0) ,
+  d128 DECIMAL(19,0)
+) WITH (format_version = 3);
 
 CREATE TABLE ${case_db}.rf_bitset_decimal_build (
-  id INT NULL,
-  d32 DECIMAL(9,0) NULL,
-  d64 DECIMAL(18,0) NULL,
-  d128 DECIMAL(19,0) NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+  id INT ,
+  d32 DECIMAL(9,0) ,
+  d64 DECIMAL(18,0) ,
+  d128 DECIMAL(19,0)
+) WITH (format_version = 3);
 
 CREATE TABLE ${case_db}.rf_bitset_decimal_wide_build (
-  id INT NULL,
-  d64 DECIMAL(18,0) NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+  id INT ,
+  d64 DECIMAL(18,0)
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.rf_bitset_decimal_probe VALUES
-  (1, 1, 1, 1),
-  (2, 2, 2, 2),
-  (3, 3, 3, 3),
-  (4, 4, 4, 4),
-  (5, NULL, NULL, NULL);
+  ROW(1, 1, 1, 1),
+  ROW(2, 2, 2, 2),
+  ROW(3, 3, 3, 3),
+  ROW(4, 4, 4, 4),
+  ROW(5, NULL, NULL, NULL);
 
 INSERT INTO ${case_db}.rf_bitset_decimal_build VALUES
-  (2, 2, 2, 2),
-  (4, 4, 4, 4),
-  (5, NULL, NULL, NULL);
+  ROW(2, 2, 2, 2),
+  ROW(4, 4, 4, 4),
+  ROW(5, NULL, NULL, NULL);
 
 INSERT INTO ${case_db}.rf_bitset_decimal_wide_build VALUES
-  (1, 1),
-  (6, 1000000000000);
+  ROW(1, 1),
+  ROW(6, 1000000000000);
 
 -- query 2
 SELECT count(1)
@@ -77,7 +74,7 @@ JOIN  ${case_db}.rf_bitset_decimal_build b USING(d128);
 -- query 5
 SELECT count(1)
 FROM ${case_db}.rf_bitset_decimal_probe p
-JOIN  ${case_db}.rf_bitset_decimal_build b ON p.d64 <=> b.d64;
+JOIN  ${case_db}.rf_bitset_decimal_build b ON p.d64  IS NOT DISTINCT FROM  b.d64;
 
 -- query 6
 SELECT count(1)

@@ -22,17 +22,19 @@ use super::async_original::{MvCatalogCaptureInput, MvCatalogCaptureQuery, captur
 use super::io_gate::MvRefreshPreparationIo;
 use super::*;
 use crate::catalog_application::query_bindings::QueryTableBindingStore;
-use crate::mv::domain::application::MvApplicationError;
+use crate::mv::domain::application::{MvApplicationError, MvRepartitionFields};
 use crate::mv::domain::refresh::target_binding::MvTargetBinding;
 use crate::mv::domain::rewrite::context::IcebergMvRewriteContext;
 
 pub(crate) struct MvRefreshPreparationInput {
     pub(crate) source: IcebergMvCorePorts,
+    pub(crate) session_properties:
+        Option<Arc<novarocks_query_application::sql::session::registry::SessionPropertyInputs>>,
     pub(crate) current_catalog: Option<String>,
     pub(crate) current_database: String,
     pub(crate) statement: MvRefreshRequest,
     pub(crate) connector_context: novarocks_spi::connector::ConnectorRequestContext,
-    pub(crate) repartition_fields: Option<Vec<IcebergPartitionFieldExpr>>,
+    pub(crate) repartition_fields: Option<MvRepartitionFields>,
     pub(crate) request: MvRefreshPreparationRequest,
 }
 
@@ -66,7 +68,7 @@ async fn prepare_refresh_inner(
     let current_database = input.current_database.as_str();
     let statement = &input.statement;
     let connector_context = &input.connector_context;
-    let repartition_fields = input.repartition_fields.as_deref();
+    let repartition_fields = input.repartition_fields.as_ref();
     let request = input.request.clone();
     let mut captured = CapturedPreparation::default();
 
@@ -76,7 +78,7 @@ async fn prepare_refresh_inner(
             "MV refresh preparation statement does not match the admitted SQL request",
         ));
     }
-    let mut plan = crate::mv::domain::iceberg_refresh::async_preparation::plan_iceberg_mv_refresh_with_connector_context(
+    let refresh = crate::mv::domain::iceberg_refresh::async_preparation::plan_iceberg_mv_refresh_with_connector_context(
             io,
             source,
             current_catalog,
@@ -84,8 +86,10 @@ async fn prepare_refresh_inner(
             statement,
             request.target.clone(),
             repartition_fields.is_some(),
+            input.session_properties.as_deref(),
             connector_context,
         ).await?;
+    let mut plan = refresh.plan;
     let retained_repartition_target = if repartition_fields.is_some() {
         Some(retain_exact_repartition_target(io, source, &plan.contract, connector_context).await?)
     } else {
@@ -128,6 +132,12 @@ async fn prepare_refresh_inner(
             .observe_current_binding(&instance_id)
             .map_err(PreparationError::from)?,
     };
+    if input.session_properties.is_some() && observed_binding != refresh.target_binding {
+        return Err(PreparationError(MvApplicationError::new(
+            crate::mv::domain::application::MvApplicationErrorKind::BindingInvalidated,
+            "MV refresh target binding changed after session settings were resolved",
+        )));
+    }
     let mut base_table_object_ids = BTreeMap::new();
     for base in &plan.contract.base_refs {
         let observed = io.schema(source, &base.table, connector_context).await?;
@@ -143,7 +153,7 @@ async fn prepare_refresh_inner(
             target_table_uuid, ..
         } => target_table_uuid.clone(),
     };
-    let full_overwrite = statement.full;
+    let full_overwrite = refresh.full_overwrite;
     let work = match plan.contract.decision {
         ExecutableRefreshDecision::SkipEmpty => PreparedMvRefreshWork::NoOp,
         ExecutableRefreshDecision::MetadataOnly => {
@@ -371,7 +381,7 @@ async fn prepare_managed_repartition_transition(
     source: &IcebergMvCorePorts,
     current_catalog: Option<&str>,
     current_database: &str,
-    fields: &[IcebergPartitionFieldExpr],
+    fields: &MvRepartitionFields,
     contract: &RefreshPlanContract,
     operation_id: novarocks_spi::connector::ConnectorWriteOperationId,
     retained_target: &RetainedRepartitionTarget,
@@ -387,6 +397,13 @@ async fn prepare_managed_repartition_transition(
         table: contract.target.name.clone(),
     };
     validate_retained_target_identity(&target, retained_target.binding.identity())?;
+    if fields.owner != execution_binding_key_for_target(retained_target.binding.planning_pin()) {
+        return Err(MvApplicationError::new(
+            crate::mv::domain::application::MvApplicationErrorKind::BindingInvalidated,
+            "MV partition property scope belongs to a different connector generation",
+        )
+        .into());
+    }
     let projection = io.definition(source, &target).await?;
     let interpretation = projection.facts.interpretation();
     if !interpretation.branches.is_empty() && !interpretation.aggregates.is_empty() {
@@ -456,7 +473,6 @@ async fn prepare_managed_repartition_transition(
         source.constant_policy(),
         completion_control.clone(),
     )?;
-    validate_mv_partition_columns(Some(fields), &analysis.output_columns)?;
     if derive_fragment_property(&analysis, &completion_control)?
         .is_composed_aggregate_schema_contract_fallback()
     {
@@ -490,40 +506,59 @@ async fn prepare_managed_repartition_transition(
         )
         .map_err(|error| error.to_string())?;
     let target_field_id_by_name = retained_target_field_id_by_name(retained_target)?;
-    let replacement_fields = fields
-        .iter()
-        .enumerate()
-        .map(|(position, field)| {
-            let (column, transform) = managed_repartition_field(field);
-            let source_field_id = target_field_id_by_name
-                .iter()
-                .find(|(name, _)| name.eq_ignore_ascii_case(column))
-                .map(|(_, field_id)| *field_id)
-                .ok_or_else(|| {
-                    format!(
-                        "MV repartition source column `{column}` is missing from the exact target observation"
-                    )
-                })?;
-            novarocks_spi::connector::ConnectorManagedPartitionField::try_new(
-                source_field_id,
-                u32::try_from(position)
-                    .map_err(|_| "MV repartition field count exceeds u32".to_string())?,
-                transform,
+    let MvRepartitionFields {
+        properties,
+        partitioning_index,
+        configuration,
+        ..
+    } = fields;
+    use novarocks_spi::connector::{DdlPropertyChange, DdlPropertyValue};
+    let (_, change) = properties.get(*partitioning_index).ok_or_else(|| {
+        PreparationError::user("MV repartition lost its evaluated partition property")
+    })?;
+    let value = match change {
+        DdlPropertyChange::Set(value) | DdlPropertyChange::Reset(value) => value,
+    };
+    let DdlPropertyValue::ArrayVarchar(fields) = value else {
+        return Err(PreparationError::user(
+            "MV repartition requires array(varchar)",
+        ));
+    };
+    let mut visible_sources = std::collections::HashSet::new();
+    for column in &analysis.output_columns {
+        novarocks_spi::connector::ConnectorOperationControl::check_active(connector_context)?;
+        visible_sources.insert(novarocks_types::naming::normalize_identifier(&column.name)?);
+    }
+    let write_lease = retained_target
+        .binding
+        .planning_pin()
+        .derive_write_lease()
+        .map_err(PreparationError::from)?;
+    let replacement_fields = bind_property_repartition_fields(
+        fields,
+        &visible_sources,
+        &target_field_id_by_name,
+        connector_context,
+        |field, index| {
+            write_lease.parse_managed_partitioning_element(
+                retained_target.binding.handle(),
+                field,
+                index,
+                connector_context,
             )
-            .map_err(|error| error.to_string())
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+        },
+    )?;
     let replacement = novarocks_spi::connector::ConnectorManagedPartitionSpecReplacement::try_new(
         operation_id,
         expected_prior,
         replacement_fields,
     )
     .map_err(|error| error.to_string())?;
-    let write_lease = retained_target
-        .binding
-        .planning_pin()
-        .derive_write_lease()
-        .map_err(PreparationError::from)?;
+    let replacement = if properties.len() > 1 {
+        replacement.with_storage_properties(Arc::clone(properties), *partitioning_index)?
+    } else {
+        replacement
+    };
     let preview = write_lease
         .preview_managed_partition_spec(ConnectorManagedPartitionSpecPreviewRequest::new(
             operation_id,
@@ -535,7 +570,82 @@ async fn prepare_managed_repartition_transition(
     Ok(PreparedManagedRepartitionTransition {
         replacement,
         preview,
+        configuration: configuration.clone(),
     })
+}
+
+/// Bind each typed partition field to the retained physical target before
+/// interpreting the next entry. The resulting IDs go to the original preview.
+fn bind_property_repartition_fields(
+    fields: &[Option<String>],
+    visible_sources: &std::collections::HashSet<String>,
+    physical_fields: &[(String, i32)],
+    control: &dyn novarocks_spi::connector::ConnectorOperationControl,
+    mut parse: impl FnMut(
+        Option<&str>,
+        usize,
+    ) -> Result<
+        novarocks_spi::connector::ConnectorPartitionTransform,
+        novarocks_spi::connector::ConnectorError,
+    >,
+) -> Result<Vec<novarocks_spi::connector::ConnectorManagedPartitionField>, PreparationError> {
+    use novarocks_spi::connector::{
+        ConnectorError, ConnectorErrorKind, ConnectorManagedPartitionField,
+        ConnectorManagedPartitionTransform as Managed, ConnectorPartitionTransform as Input,
+        InvalidTableProperty,
+    };
+
+    let property_error = |message: String| {
+        InvalidTableProperty::from_property_error(ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            message,
+        ))
+    };
+    let mut result = Vec::with_capacity(fields.len());
+    for (position, field) in fields.iter().enumerate() {
+        control.check_active()?;
+        let field = parse(field.as_deref(), position)?;
+        let (column, transform) = match field {
+            Input::Identity { column } => (column, Managed::Identity),
+            Input::Year { column } => (column, Managed::Year),
+            Input::Month { column } => (column, Managed::Month),
+            Input::Day { column } => (column, Managed::Day),
+            Input::Hour { column } => (column, Managed::Hour),
+            Input::Bucket {
+                column,
+                num_buckets,
+            } => (
+                column,
+                Managed::Bucket {
+                    buckets: num_buckets,
+                },
+            ),
+            Input::Truncate { column, width } => (column, Managed::Truncate { width }),
+            Input::Void { column } => (column, Managed::Void),
+        };
+        let Some((_, source_field_id)) = physical_fields
+            .iter()
+            .find(|(name, _)| name.as_str() == column.as_ref())
+        else {
+            return Err(property_error(format!(
+                "MV repartition source column `{column}` is missing from the exact target observation"
+            )).into());
+        };
+        if !visible_sources.contains(column.as_ref()) {
+            return Err(property_error(format!(
+                "materialized view partition source column `{column}` must be an output column"
+            ))
+            .into());
+        }
+        result.push(ConnectorManagedPartitionField::try_new(
+            *source_field_id,
+            u32::try_from(position)
+                .map_err(|_| "MV repartition field count exceeds u32".to_string())?,
+            transform,
+        )?);
+    }
+    control.check_active()?;
+    Ok(result)
 }
 
 struct FirstRefreshTargetFacts<'contract, 'objects, 'transition, 'retained> {
@@ -606,6 +716,7 @@ async fn prepare_frontend_first_refresh_write(
             &planning_pin,
             &projection,
             attempt.publication_id,
+            repartition_transition.and_then(|transition| transition.configuration.as_ref()),
             &connector_context,
         )
         .await?;
@@ -636,6 +747,8 @@ async fn prepare_frontend_first_refresh_write(
         publication_intent = publication_intent.with_partition_spec_replacement(
             transition.replacement.clone(),
             transition.preview.committed_partitioning().clone(),
+            transition.preview.storage_projection_digest(),
+            admitted_publication.configuration_slot_update().cloned(),
         );
     }
     let loaded_target_binding;
@@ -1025,6 +1138,7 @@ async fn prepare_metadata_only_publication(
             &planning_pin,
             &projection,
             attempt.publication_id,
+            None,
             connector_context,
         )
         .await?;
@@ -1401,6 +1515,7 @@ async fn prepare_frontend_incremental_write(
                 target_binding.planning_pin(),
                 rewrite.mv_definition.as_ref(),
                 attempt.publication_id,
+                None,
                 &connector_context,
             )
             .await?;
@@ -1578,6 +1693,7 @@ async fn prepare_frontend_incremental_write(
             target_binding.planning_pin(),
             rewrite.mv_definition.as_ref(),
             attempt.publication_id,
+            None,
             &connector_context,
         )
         .await?;
@@ -1627,4 +1743,54 @@ async fn prepare_frontend_incremental_write(
     )
     .map(|write| PreparedIncrementalRefreshWork::ChangeStream(write, admitted_publication))
     .map_err(PreparationError::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use novarocks_spi::connector::{
+        ConnectorError, ConnectorManagedPartitionTransform, ConnectorOperationControl,
+    };
+
+    struct Active;
+    impl ConnectorOperationControl for Active {
+        fn check_active(&self) -> Result<(), ConnectorError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn typed_repartition_binds_a_visible_physical_field_before_advancing() {
+        let visible = ["id".into()].into_iter().collect();
+        let physical = [("id".into(), 8), ("hidden_key".into(), 2)];
+        let parse = |field: Option<&str>, _index| {
+            novarocks_connector_iceberg::table_properties::parse_table_partitioning_element(
+                field.expect("non-NULL fixture field"),
+                &Active,
+            )
+        };
+        let fields = bind_property_repartition_fields(
+            &[Some("bucket(id, 16)".into())],
+            &visible,
+            &physical,
+            &Active,
+            parse,
+        )
+        .unwrap();
+        assert_eq!(fields[0].source_field_id(), 8);
+        assert_eq!(fields[0].position(), 0);
+        assert_eq!(
+            fields[0].transform(),
+            ConnectorManagedPartitionTransform::Bucket { buckets: 16 },
+        );
+        let error = bind_property_repartition_fields(
+            &[Some("hidden_key".into()), Some("?".into())],
+            &visible,
+            &physical,
+            &Active,
+            parse,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("must be an output column"));
+    }
 }

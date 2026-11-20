@@ -15,38 +15,6 @@
 -- specific language governing permissions and limitations
 -- under the License.
 
-CREATE EXTERNAL CATALOG IF NOT EXISTS `paimon_${suite_uuid0}`
-PROPERTIES (
-    "type"="paimon",
-    "paimon.catalog.type"="filesystem",
-    "warehouse"="${paimon_warehouse}",
-    "credential.object-store-metadata.consumer-role"="frontend",
-    "credential.object-store-metadata.mode"="static",
-    "credential.object-store-metadata.name"="${paimon_object_store_credential_name}",
-    "credential.object-store-metadata.generation"="${paimon_object_store_credential_generation}",
-    "credential.object-store-data.consumer-role"="backend",
-    "credential.object-store-data.mode"="static",
-    "credential.object-store-data.name"="${paimon_object_store_credential_name}",
-    "credential.object-store-data.generation"="${paimon_object_store_credential_generation}",
-    "aws.s3.endpoint"="${oss_endpoint}",
-    "aws.s3.region"="us-east-1",
-    "aws.s3.enable_path_style_access"="true"
-);
+CREATE CATALOG IF NOT EXISTS "paimon_${suite_uuid0}" USING paimon WITH ("paimon.catalog.type" = 'filesystem', "warehouse" = '${paimon_warehouse}', "credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = 'static', "credential.object-store-metadata.name" = '${paimon_object_store_credential_name}', "credential.object-store-metadata.generation" = '${paimon_object_store_credential_generation}', "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = 'static', "credential.object-store-data.name" = '${paimon_object_store_credential_name}', "credential.object-store-data.generation" = '${paimon_object_store_credential_generation}', "aws.s3.endpoint" = '${oss_endpoint}', "aws.s3.region" = 'us-east-1', "aws.s3.enable_path_style_access" = 'true');
 
-CREATE EXTERNAL CATALOG IF NOT EXISTS `iceberg_paimon_${suite_uuid0}`
-PROPERTIES (
-    "type"="iceberg",
-    "iceberg.catalog.type"="hadoop",
-    "warehouse"="${iceberg_test_warehouse}",
-    "credential.object-store-metadata.consumer-role"="frontend",
-    "credential.object-store-metadata.mode"="${iceberg_object_store_credential_mode}",
-    "credential.object-store-metadata.name"="${iceberg_object_store_metadata_credential_name}",
-    "credential.object-store-metadata.generation"="${iceberg_object_store_credential_generation}",
-    "credential.object-store-data.consumer-role"="backend",
-    "credential.object-store-data.mode"="${iceberg_object_store_credential_mode}",
-    "credential.object-store-data.name"="${iceberg_object_store_data_credential_name}",
-    "credential.object-store-data.generation"="${iceberg_object_store_credential_generation}",
-    "aws.s3.endpoint"="${oss_endpoint}",
-    "aws.s3.region"="${oss_region}",
-    "aws.s3.enable_path_style_access"="${oss_path_style}"
-);
+CREATE CATALOG IF NOT EXISTS "iceberg_paimon_${suite_uuid0}" USING iceberg WITH ("iceberg.catalog.type" = 'hadoop', "warehouse" = '${iceberg_test_warehouse}', "credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-metadata.name" = '${iceberg_object_store_metadata_credential_name}', "credential.object-store-metadata.generation" = '${iceberg_object_store_credential_generation}', "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-data.name" = '${iceberg_object_store_data_credential_name}', "credential.object-store-data.generation" = '${iceberg_object_store_credential_generation}', "aws.s3.endpoint" = '${oss_endpoint}', "aws.s3.region" = '${oss_region}', "aws.s3.enable_path_style_access" = '${oss_path_style}');

@@ -67,6 +67,7 @@ fn largeint_datetime_intermediate_is_only_exact_nullable_i64_and_existing_frozen
             &target,
             novarocks_type_contract::DecimalOverflowPolicy::ReportError,
             true,
+            None,
             crate::binding_test_control(),
         )
         .unwrap();
@@ -204,6 +205,7 @@ fn physical_fixed16_calendar_cast_keeps_numeric_grammar_and_nominal_rejections()
         &timestamp,
         novarocks_type_contract::DecimalOverflowPolicy::ReportError,
         true,
+        None,
         crate::binding_test_control(),
     )
     .unwrap();
@@ -249,6 +251,7 @@ fn physical_fixed16_calendar_cast_keeps_numeric_grammar_and_nominal_rejections()
                 &timestamp,
                 novarocks_type_contract::DecimalOverflowPolicy::ReportError,
                 true,
+                None,
                 crate::binding_test_control(),
             ),
             Err(crate::CastPrepareError::Unsupported)

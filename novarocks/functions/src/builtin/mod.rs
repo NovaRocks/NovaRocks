@@ -140,6 +140,7 @@ mod json_canonical_owner;
 mod json_canonical_selected;
 mod json_object_owner;
 mod json_object_selected;
+mod like_escape_owner;
 mod makedate;
 mod makedate_owner;
 pub mod map_entries_core;
@@ -307,6 +308,7 @@ mod calendar_slice_owner;
 pub mod array_append_core;
 mod array_append_owner;
 mod array_append_selected;
+mod array_concat;
 
 pub mod regexp_count;
 pub(crate) mod regexp_count_owner;

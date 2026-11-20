@@ -33,27 +33,10 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE EXTERNAL CATALOG futuresource_${uuid0}
-PROPERTIES (
-  "type" = "iceberg",
-  "iceberg.catalog.type" = "rest",
-  "uri" = "${iceberg_rest_uri}",
-  "warehouse" = "${iceberg_rest_warehouse}",
-  "aws.s3.endpoint" = "${oss_endpoint}",
-  "credential.object-store-metadata.consumer-role" = "frontend",
-  "credential.object-store-metadata.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-metadata.name" = "${iceberg_object_store_metadata_credential_name}",
-  "credential.object-store-metadata.generation" = "${iceberg_object_store_credential_generation}",
-  "credential.object-store-data.consumer-role" = "backend",
-  "credential.object-store-data.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-data.name" = "${iceberg_object_store_data_credential_name}",
-  "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
-  "aws.s3.region" = "${oss_region}",
-  "aws.s3.enable_path_style_access" = "${oss_path_style}"
-);
-CREATE DATABASE futuresource_${uuid0}.${case_db};
+CREATE CATALOG futuresource_${uuid0} USING iceberg WITH ("iceberg.catalog.type" = 'rest', "uri" = '${iceberg_rest_uri}', "warehouse" = '${iceberg_rest_warehouse}', "aws.s3.endpoint" = '${oss_endpoint}', "credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-metadata.name" = '${iceberg_object_store_metadata_credential_name}', "credential.object-store-metadata.generation" = '${iceberg_object_store_credential_generation}', "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-data.name" = '${iceberg_object_store_data_credential_name}', "credential.object-store-data.generation" = '${iceberg_object_store_credential_generation}', "aws.s3.region" = '${oss_region}', "aws.s3.enable_path_style_access" = '${oss_path_style}');
+CREATE SCHEMA futuresource_${uuid0}.${case_db};
 USE futuresource_${uuid0}.${case_db};
-SET enable_materialized_view_rewrite = false;
+SET SESSION enable_materialized_view_rewrite = false;
 
 -- query 2
 -- @skip_result_check=true
@@ -86,14 +69,14 @@ SELECT id, typeof(id) AS id_type FROM future_partition_source FOR VERSION AS OF 
 
 -- query 5
 -- Snapshot-log resolution of the same SnapshotId(S0) selector.
-SELECT * FROM future_partition_source FOR SYSTEM_TIME AS OF '2999-12-31 00:00:00';
+SELECT * FROM future_partition_source FOR TIMESTAMP AS OF '2999-12-31 00:00:00';
 
 -- query 6
 -- The Current relation reads S0 through the current schema.
 SELECT id, future FROM future_partition_source ORDER BY id;
 
 -- query 7
-SELECT count(*) AS snapshot_count FROM future_partition_source$snapshots;
+SELECT count() AS snapshot_count FROM "future_partition_source$snapshots";
 
 -- query 8
 -- @skip_result_check=true
@@ -107,7 +90,7 @@ ON t.id = s.id
 WHEN MATCHED THEN UPDATE SET future = s.future;
 
 -- query 10
-SELECT count(*) AS snapshot_count FROM future_partition_source$snapshots;
+SELECT count() AS snapshot_count FROM "future_partition_source$snapshots";
 
 -- query 11
 SELECT id, future FROM future_partition_source ORDER BY id;
@@ -155,6 +138,6 @@ printf 'FUTURE_PARTITION_SOURCE_CURRENT\n'
 -- query 14
 -- @cleanup=true
 -- @skip_result_check=true
-DROP TABLE IF EXISTS futuresource_${uuid0}.${case_db}.future_partition_source FORCE;
-DROP DATABASE futuresource_${uuid0}.${case_db};
+DROP TABLE IF EXISTS futuresource_${uuid0}.${case_db}.future_partition_source ;
+DROP SCHEMA futuresource_${uuid0}.${case_db};
 DROP CATALOG futuresource_${uuid0};

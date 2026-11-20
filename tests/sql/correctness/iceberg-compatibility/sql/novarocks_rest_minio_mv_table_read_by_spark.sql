@@ -27,31 +27,25 @@
 -- narrative walkthrough of this contract.
 
 -- query 1
-CREATE DATABASE IF NOT EXISTS iceberg_compat_${suite_uuid0}.${case_db};
+CREATE SCHEMA IF NOT EXISTS iceberg_compat_${suite_uuid0}.${case_db};
 
 -- query 2
 CREATE TABLE iceberg_compat_${suite_uuid0}.${case_db}.mv_interop_base_${uuid0} (
   id BIGINT,
   amount INT
-) TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
-);
+) WITH (format_version = 3);
 
 -- query 3
 INSERT INTO iceberg_compat_${suite_uuid0}.${case_db}.mv_interop_base_${uuid0}
 VALUES
-  (1, 10),
-  (2, 20),
-  (3, 30);
+  ROW(1, 10),
+  ROW(2, 20),
+  ROW(3, 30);
 
 -- query 4
 -- @skip_result_check=true
 USE iceberg_compat_${suite_uuid0}.${case_db};
-CREATE MATERIALIZED VIEW mv_nr_interop_${uuid0}
-DISTRIBUTED BY HASH(id) BUCKETS 1
-PROPERTIES('storage_engine' = 'iceberg')
-AS SELECT id, amount
+CREATE MATERIALIZED VIEW mv_nr_interop_${uuid0} AS SELECT id, amount
 FROM mv_interop_base_${uuid0}
 WHERE amount >= 20;
 
@@ -108,4 +102,4 @@ printf 'SPARK_MV_SCHEMA_OK\n'
 -- @skip_result_check=true
 USE iceberg_compat_${suite_uuid0}.${case_db};
 DROP MATERIALIZED VIEW IF EXISTS ${case_db}.mv_nr_interop_${uuid0};
-DROP TABLE IF EXISTS iceberg_compat_${suite_uuid0}.${case_db}.mv_interop_base_${uuid0} FORCE;
+DROP TABLE IF EXISTS iceberg_compat_${suite_uuid0}.${case_db}.mv_interop_base_${uuid0} ;

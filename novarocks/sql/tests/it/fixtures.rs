@@ -454,7 +454,7 @@ pub(super) mod table_parent {
         probe: &Arc<FoldProbe>,
     ) -> Result<(), SqlCompileError> {
         optimize_table_free(
-            "SELECT u.value FROM (SELECT 1 AS seed) q CROSS JOIN LATERAL UNNEST([REVERSE('abc')]) AS u(value)",
+            "SELECT u.value FROM (SELECT 1 AS seed) q CROSS JOIN UNNEST(ARRAY[REVERSE('abc')]) AS u(value)",
             session(Default::default(), true),
             catalog,
             &probe.control(),

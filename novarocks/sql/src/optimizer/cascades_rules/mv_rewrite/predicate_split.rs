@@ -423,9 +423,9 @@ mod tests {
     fn bin(left: TypedExpr, op: BinOp, right: TypedExpr) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::BinaryOp {
-                left: Box::new(left),
+                left: novarocks_parser::ast::AstBox::new(left),
                 op,
-                right: Box::new(right),
+                right: novarocks_parser::ast::AstBox::new(right),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
@@ -461,8 +461,8 @@ mod tests {
     fn like_a(pat: &str) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::Like {
-                expr: Box::new(col_ref(&a())),
-                pattern: Box::new(string_lit(pat)),
+                expr: novarocks_parser::ast::AstBox::new(col_ref(&a())),
+                pattern: novarocks_parser::ast::AstBox::new(string_lit(pat)),
                 negated: false,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
@@ -473,9 +473,9 @@ mod tests {
     fn between_a(lo: i64, hi: i64) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::Between {
-                expr: Box::new(col_ref(&a())),
-                low: Box::new(int_lit(lo)),
-                high: Box::new(int_lit(hi)),
+                expr: novarocks_parser::ast::AstBox::new(col_ref(&a())),
+                low: novarocks_parser::ast::AstBox::new(int_lit(lo)),
+                high: novarocks_parser::ast::AstBox::new(int_lit(hi)),
                 negated: false,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),

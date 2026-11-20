@@ -188,10 +188,7 @@ mod scalar_domain_tests {
         }
     }
     fn query(sql: &str) -> ast::Query {
-        let mut statements = novarocks_parser::parse(sql).unwrap();
-        let [ast::Statement::Query(query)] = statements.as_mut_slice() else {
-            panic!("expected query")
-        };
+        let query = &mut novarocks_parser::parser::parse_query(sql).unwrap();
         query.clone()
     }
     fn output_domains(sql: &str) -> Vec<Option<SqlType>> {
@@ -215,6 +212,7 @@ mod scalar_domain_tests {
         control: &'a crate::compiler::SqlCompileControl,
     ) -> AnalyzerContext<'a> {
         AnalyzerContext {
+            purpose: crate::analyzer::QueryAnalysisPurpose::Ordinary,
             grouping_scope: std::cell::RefCell::new(None),
             materialized_values: None,
             constant_policy: crate::constant::test_constant_policy(),
@@ -237,53 +235,115 @@ mod scalar_domain_tests {
     #[test]
     fn m07_json_list_explicit_literal_target_keeps_its_source_decision() {
         assert_eq!(
-            output_domains("select array<json>[],array<json>[null]"),
+            output_domains("select CAST([] AS ARRAY<json>),CAST([null] AS ARRAY<json>)"),
             vec![Some(SqlType::Array(Box::new(SqlType::Json))); 2],
         );
         assert_eq!(
             output_domains(
-                "with q as (select array<json>[] as j) select array_sortby(j,[1]) from q"
+                "with q as (select CAST([] AS ARRAY<json>) as j) select array_sortby(j,[1]) from q"
             ),
             vec![Some(SqlType::Array(Box::new(SqlType::Json)))],
         );
         assert_eq!(
-            output_domains("select array<varchar>[json_object('k',1)],array<json>['plain']"),
+            output_domains(
+                "select CAST([json_object('k':1)] AS ARRAY<varchar>),CAST(['plain'] AS ARRAY<json>)"
+            ),
             vec![
                 Some(SqlType::Array(Box::new(SqlType::String))),
-                Some(SqlType::Array(Box::new(SqlType::String)))
+                Some(SqlType::Array(Box::new(SqlType::Json)))
             ],
         );
         assert_eq!(
             output_domains("select cast(['plain'] as array<json>)"),
-            vec![Some(SqlType::Array(Box::new(SqlType::String)))],
+            vec![Some(SqlType::Array(Box::new(SqlType::Json)))],
         );
-        let sql = "select array<json>['{}'],array<json>[parse_json('{}')]";
-        assert_eq!(
-            output_domains(sql),
-            vec![
-                Some(SqlType::Array(Box::new(SqlType::String))),
-                Some(SqlType::Array(Box::new(SqlType::Json)))
-            ]
-        );
-        let expressions = output_expressions(sql);
-        assert_eq!(domain_at(&expressions[0], &[0]), None);
-        assert_eq!(
-            domain_at(&expressions[1], &[0]),
-            Some(novarocks_type_contract::ValueLogicalType::Json)
-        );
-        for expression in expressions {
-            let ExprKind::FunctionCall { binding, .. } = &expression.kind else {
-                panic!("literal owner");
+        for (sql, mode) in [
+            (
+                "select cast(['plain'] as array<json>)",
+                novarocks_type_contract::ArrayCastFailureMode::ReportError,
+            ),
+            (
+                "select try_cast(['plain'] as array<json>)",
+                novarocks_type_contract::ArrayCastFailureMode::OutputNull,
+            ),
+        ] {
+            let expressions = output_expressions(sql);
+            let expression = &expressions[0];
+            assert_eq!(
+                expression.value_type,
+                crate::test_value_types::string_list(true, true, true)
+            );
+            let ExprKind::Cast {
+                expr,
+                array_failure_mode,
+                ..
+            } = &expression.kind
+            else {
+                panic!("explicit array CAST");
             };
+            assert_eq!(*array_failure_mode, Some(mode));
+            assert_eq!(domain_at(expr, &[0]), None);
+            let ExprKind::FunctionCall { binding, args, .. } = &expr.kind else {
+                panic!("original array literal owner");
+            };
+            assert_eq!(
+                binding.function_id.as_str(),
+                "builtin.scalar/__array_literal/v1"
+            );
+            assert_eq!(args.len(), 1);
+            assert_eq!(
+                args[0].value_type.logical_type(),
+                novarocks_type_contract::ValueLogicalType::Physical
+            );
             let novarocks_functions::FunctionResultType::Scalar(result) =
                 &binding.selected.result_type
             else {
                 panic!("scalar");
             };
-            assert_eq!(result, &expression.value_type);
-            let DataType::List(item) = expression.value_type.data_type() else {
-                panic!("list");
+            assert_eq!(result, &expr.value_type);
+        }
+        // Both declarations belong to the ordinary outer CAST. Their source
+        // constructors retain the original text and JSON domains separately.
+        let sql = "select CAST(['{}'] AS ARRAY<json>),CAST([parse_json('{}')] AS ARRAY<json>)";
+        assert_eq!(
+            output_domains(sql),
+            vec![Some(SqlType::Array(Box::new(SqlType::Json))); 2]
+        );
+        let expressions = output_expressions(sql);
+        for (expression, source_domain) in expressions
+            .into_iter()
+            .zip([None, Some(novarocks_type_contract::ValueLogicalType::Json)])
+        {
+            assert_eq!(
+                domain_at(&expression, &[0]),
+                Some(novarocks_type_contract::ValueLogicalType::Json)
+            );
+            let ExprKind::Cast {
+                expr,
+                array_failure_mode,
+                ..
+            } = &expression.kind
+            else {
+                panic!("ordinary outer array CAST");
             };
+            assert_eq!(
+                *array_failure_mode,
+                Some(novarocks_type_contract::ArrayCastFailureMode::ReportError)
+            );
+            assert_eq!(domain_at(expr, &[0]), source_domain);
+            let ExprKind::FunctionCall { binding, .. } = &expr.kind else {
+                panic!("original independent constructor");
+            };
+            let novarocks_functions::FunctionResultType::Scalar(result) =
+                &binding.selected.result_type
+            else {
+                panic!("scalar")
+            };
+            assert_eq!(result, &expr.value_type);
+            let DataType::List(item) = expression.value_type.data_type() else {
+                panic!("list")
+            };
+            assert_eq!(item.data_type(), &DataType::Utf8);
             assert!(item.metadata().as_arc().is_none());
         }
     }
@@ -481,7 +541,7 @@ mod scalar_domain_tests {
         );
         assert_eq!(
             output_domains(
-                "select coalesce(null,parse_json('null')),if(false,null,json_object('k',1)),case when true then null else parse_json('null') end"
+                "select coalesce(null,parse_json('null')),if(false,null,json_object('k':1)),case when true then null else parse_json('null') end"
             ),
             vec![Some(SqlType::Json); 3]
         );
@@ -1253,7 +1313,8 @@ mod scalar_domain_tests {
         let target = crate::test_value_types::string_list(false, false, false);
         let coerced = TypedExpr {
             kind: ExprKind::Cast {
-                expr: Box::new(original),
+                array_failure_mode: None,
+                expr: novarocks_parser::ast::AstBox::new(original),
                 target: target.data_type().clone(),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
@@ -1340,7 +1401,8 @@ mod scalar_domain_tests {
         assert_eq!(result, &original.value_type);
         let value = TypedExpr {
             kind: ExprKind::Cast {
-                expr: Box::new(original.clone()),
+                array_failure_mode: None,
+                expr: novarocks_parser::ast::AstBox::new(original.clone()),
                 target: original.value_type.data_type().clone(),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
@@ -1710,9 +1772,15 @@ mod scalar_domain_tests {
             error.to_string().contains("no matching declared overload"),
             "{error}"
         );
+        let mixed_error = super::super::analyze(
+            &query("select element_at([parse_json('{}'),'plain'],1)"),
+            &Catalog,
+            "db",
+        )
+        .unwrap_err();
         assert_eq!(
-            output_domains("select element_at([parse_json('{}'),'plain'],1)"),
-            vec![Some(SqlType::String)]
+            mixed_error.kind(),
+            crate::analyze_error::AnalyzeErrorKind::TypeMismatch
         );
         // The catalog's explicit recursive declaration is the author even when
         // its external Arrow fields carry no execution-domain annotations.
@@ -2224,7 +2292,7 @@ mod scalar_domain_tests {
                 V::Variant,
             ),
             (
-                "select [cast(null as struct<col1 bitmap,col2 json>)]",
+                "select [cast(null as ROW(col1 bitmap,col2 json))]",
                 D::Plain,
                 V::List(Box::new(F {
                     nullable: true,

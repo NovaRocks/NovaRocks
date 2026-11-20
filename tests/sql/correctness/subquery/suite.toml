@@ -30,7 +30,7 @@ paths = [
     "novarocks/functions/src/native_inlist*.rs",
     "novarocks/functions/src/json_canonical*.rs",
     "novarocks/functions/src/builtin/json_canonical*.rs",
-    "novarocks/parser/src/parser/pratt.rs",
+    "novarocks/parser/src/parser/expression.rs",
     "novarocks/execution/src/exec/hash_table/**",
     "novarocks/execution/src/exec/operators/assert_num_rows_processor.rs",
 ]

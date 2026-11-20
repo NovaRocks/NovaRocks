@@ -21,13 +21,10 @@
 //! It must never rebuild SQL text or invoke a parser.  T4 wires
 //! [`preanalyze`] into the production typed-query admission path.
 
+use novarocks_parser::ast;
 use novarocks_parser::{
     Span,
-    ast::{
-        BinaryOperator, Expr, Fold, GroupBy, Ident, JoinConstraint, JoinOperator, LiteralKind,
-        Query, Select, SelectHintValue, SelectItem, SetExpr, SetOperation, SetOperator,
-        SetQuantifier, TableAlias, TableFactor, TableWithJoins, Visit,
-    },
+    ast::{Expr, Fold, Ident, LiteralKind, Query, Select, SelectItem, SetExpr, SetOperator, Visit},
 };
 
 use crate::analyze_error::AnalyzeError;
@@ -48,12 +45,13 @@ pub(crate) fn preanalyze(query: Query) -> Result<Query, AnalyzeError> {
     preanalyze_with_semantics(query, &crate::sql_mode::SqlSemanticSettings::default())
 }
 
-/// Unrolls with the statement hint, then the frozen session override, then the
+/// Unrolls with the statement session property, then the frozen session override, then the
 /// original default. The selected depth still uses the existing finite unroller.
 pub(crate) fn preanalyze_with_semantics(
     mut query: Query,
     semantics: &crate::sql_mode::SqlSemanticSettings,
 ) -> Result<Query, AnalyzeError> {
+    reject_unimplemented_query_syntax(&query)?;
     let max_depth = recursive_cte_max_depth(&query)
         .or_else(|| {
             semantics
@@ -62,57 +60,226 @@ pub(crate) fn preanalyze_with_semantics(
         })
         .unwrap_or(crate::sql_mode::DEFAULT_RECURSIVE_CTE_MAX_DEPTH as usize);
     rewrite_nested_queries(&mut query, max_depth.max(1))?;
-    normalize_cross_joins(&mut query);
 
     remove_bare_top_level_dual(&mut query);
     Ok(query)
 }
 
+/// Capability rejection precedes catalog discovery and global function lookup.
+/// Inline definitions cannot be ignored and rebound as unrelated global calls.
+fn reject_unimplemented_query_syntax(query: &Query) -> Result<(), AnalyzeError> {
+    #[derive(Default)]
+    struct UnsupportedSyntax(Option<(&'static str, Span)>);
+    impl Visit for UnsupportedSyntax {
+        fn visit_query(&mut self, query: &Query) {
+            if self.0.is_some() {
+                return;
+            }
+            if let Some(function) = query.functions.first() {
+                self.0 = Some(("Inline functions are not supported", function.span));
+            } else {
+                novarocks_parser::ast::walk_query(self, query);
+            }
+        }
+        fn visit_window_frame(&mut self, frame: &novarocks_parser::ast::WindowFrame) {
+            if self.0.is_some() {
+                return;
+            }
+            if let Some(reason) = super::resolve_expr::unsupported_window_frame_reason(frame) {
+                self.0 = Some((reason, frame.span));
+                return;
+            }
+            novarocks_parser::ast::walk_window_frame(self, frame);
+        }
+        fn visit_expr(&mut self, expression: &Expr) {
+            if self.0.is_some() {
+                return;
+            }
+            if let Some(reason) = super::unsupported_control_expression_reason(expression) {
+                self.0 = Some((reason, expression.span()));
+                return;
+            }
+            match expression {
+                Expr::Predicated(node) => {
+                    if let Some(reason) = super::unsupported_predicate_reason(node) {
+                        self.0 = Some((reason, node.span));
+                        return;
+                    }
+                    self.visit_expr(&node.value);
+                    if let novarocks_parser::ast::Predicate::In(predicate) = &node.predicate
+                        && let Expr::InList(list) = &predicate.value_list
+                    {
+                        for value in &list.values {
+                            self.visit_expr(value);
+                        }
+                    } else {
+                        novarocks_parser::ast::walk_predicate(self, &node.predicate);
+                    }
+                }
+                Expr::InList(list) => {
+                    self.0 = Some((
+                        "IN lists are only supported as an IN predicate value list",
+                        list.span,
+                    ));
+                }
+                Expr::JsonConstructor(_) => {
+                    self.0 = Some(("SQL/JSON constructor is not supported", expression.span()));
+                }
+                Expr::JsonExists(_) => {
+                    self.0 = Some(("JSON_EXISTS is not supported", expression.span()))
+                }
+                Expr::JsonValue(_) => {
+                    self.0 = Some(("JSON_VALUE is not supported", expression.span()))
+                }
+                Expr::JsonSerialize(_) => {
+                    self.0 = Some(("JSON_SERIALIZE is not supported", expression.span()))
+                }
+                Expr::IntervalValueExpression(_) => {
+                    self.0 = Some((
+                        "INTERVAL value expressions are not supported",
+                        expression.span(),
+                    ));
+                }
+                Expr::JsonObject(node) if !super::is_supported_json_object_profile(node) => {
+                    self.0 = Some((
+                        "JSON_OBJECT clauses are not supported by the existing function",
+                        node.span,
+                    ));
+                }
+                Expr::JsonArray(node) if !super::is_supported_json_array_profile(node) => {
+                    self.0 = Some((
+                        "JSON_ARRAY clauses are not supported by the existing function",
+                        node.span,
+                    ));
+                }
+                Expr::JsonQuery(node) if !super::is_plain_json_query(node) => {
+                    self.0 = Some((
+                        "JSON_QUERY only supports its plain two-argument profile",
+                        node.span,
+                    ));
+                }
+                _ => novarocks_parser::ast::walk_expr(self, expression),
+            }
+        }
+        fn visit_type_name(&mut self, data_type: &novarocks_parser::ast::TypeName) {
+            if self.0.is_some() {
+                return;
+            }
+            use novarocks_parser::ast::{DataTypeParameter, TypeKind};
+            match &data_type.kind {
+                TypeKind::ExplicitArray(_) => self.0 = Some(("explicit ARRAY lengths are not supported", data_type.span)),
+                TypeKind::Interval(_) => self.0 = Some(("INTERVAL data types are not supported", data_type.span)),
+                TypeKind::DateTime(value) if value.with_time_zone || value.precision.as_deref().is_some_and(|parameter| !matches!(parameter, DataTypeParameter::Numeric(number) if number.parsed_value == 6)) => self.0 = Some(("TIME/TIMESTAMP only support microsecond precision without time zone", data_type.span)),
+                _ => novarocks_parser::ast::walk_type_name(self, data_type),
+            }
+        }
+        fn visit_literal(&mut self, literal: &novarocks_parser::ast::Literal) {
+            if self.0.is_some() {
+                return;
+            }
+            match &literal.kind {
+                LiteralKind::Interval(_) => {
+                    self.0 = Some(("INTERVAL literals are not supported", literal.span))
+                }
+                LiteralKind::Generic(value)
+                    if !crate::literal::is_supported_generic_literal(value) =>
+                {
+                    self.0 = Some(("generic literal type is not supported", literal.span))
+                }
+                _ => novarocks_parser::ast::walk_literal(self, literal),
+            }
+        }
+        fn visit_query_period(&mut self, period: &ast::QueryPeriod) {
+            if self.0.is_some() {
+                return;
+            }
+            if period.start.is_some() || period.end.is_none() {
+                self.0 = Some(("query period requires only an end expression", period.span));
+            } else {
+                ast::walk_query_period(self, period);
+            }
+        }
+        fn visit_relation(&mut self, relation: &ast::Relation) {
+            if self.0.is_some() {
+                return;
+            }
+            match relation {
+                ast::Relation::Aliased(node)
+                    if node.column_names.as_ref().is_some_and(Vec::is_empty) =>
+                {
+                    self.0 = Some(("empty relation column aliases are not supported", node.span))
+                }
+                ast::Relation::Table(node) if node.branch.is_some() => {
+                    self.0 = Some(("table branches in FROM are not supported", node.span))
+                }
+                ast::Relation::JsonTable(_) => {
+                    self.0 = Some(("JSON_TABLE is not supported", relation.span()))
+                }
+                ast::Relation::Sampled(_) => {
+                    self.0 = Some(("TABLESAMPLE is not supported", relation.span()))
+                }
+                ast::Relation::Pivot(_) => {
+                    self.0 = Some(("PIVOT is not supported", relation.span()))
+                }
+                ast::Relation::Nearest(_) => {
+                    self.0 = Some(("NEAREST is not supported", relation.span()))
+                }
+                ast::Relation::PatternRecognition(_) => {
+                    self.0 = Some(("MATCH_RECOGNIZE is not supported", relation.span()))
+                }
+                ast::Relation::TableFunction(node)
+                    if !node.copartitioning.is_empty()
+                        || node.arguments.iter().any(|argument| {
+                            !matches!(
+                                argument.value,
+                                ast::TableFunctionArgumentValue::Expression(_)
+                            )
+                        }) =>
+                {
+                    self.0 = Some((
+                        "table function argument profile is not supported",
+                        node.span,
+                    ))
+                }
+                _ => ast::walk_relation(self, relation),
+            }
+        }
+    }
+    let mut visitor = UnsupportedSyntax::default();
+    visitor.visit_query(query);
+    match visitor.0 {
+        Some((message, span)) => Err(AnalyzeError::unsupported_expression(message, span)),
+        None => Ok(()),
+    }
+}
+
 fn recursive_cte_max_depth(query: &Query) -> Option<usize> {
-    let select = root_select(query.body.as_ref())?;
-    select.hints.iter().find_map(|hint| {
-        let value = if hint
-            .name
-            .value
-            .eq_ignore_ascii_case("recursive_cte_max_depth")
-        {
-            let SelectHintValue::Assignment { value } = &hint.value else {
-                return None;
-            };
-            value
-        } else if hint.name.value.eq_ignore_ascii_case("set_var") {
-            let SelectHintValue::Call { arguments } = &hint.value else {
-                return None;
-            };
-            arguments.iter().find_map(|argument| {
-                let Expr::Binary(binary) = argument else {
-                    return None;
-                };
-                let Expr::Identifier(name) = binary.left.as_ref() else {
-                    return None;
-                };
-                (binary.operator == BinaryOperator::Equal
-                    && name.value.eq_ignore_ascii_case("recursive_cte_max_depth"))
-                .then_some(binary.right.as_ref())
-            })?
-        } else {
+    query.session_properties.iter().find_map(|property| {
+        let [name] = property.name.parts.as_slice() else {
             return None;
         };
-        let Expr::Literal(value) = value else {
+        if !name.value.eq_ignore_ascii_case("recursive_cte_max_depth") {
+            return None;
+        }
+        let Expr::Literal(value) = &property.value else {
             return None;
         };
-        let LiteralKind::Number(value) = &value.kind else {
+        let LiteralKind::Long {
+            parsed_value: value,
+            ..
+        } = &value.kind
+        else {
             return None;
         };
-        value.parse::<usize>().ok().map(|depth| depth.max(1))
+        usize::try_from(*value).ok().map(|depth| depth.max(1))
     })
 }
 
 fn root_select(body: &SetExpr) -> Option<&Select> {
     match body {
         SetExpr::Select(select) => Some(select),
-        SetExpr::Query(query) => root_select(query.body.as_ref()),
-        SetExpr::Values(_) | SetExpr::SetOperation(_) => None,
+        SetExpr::Query(query) => root_select(query.query.body.as_ref()),
+        SetExpr::Values(_) | SetExpr::Table(_) | SetExpr::SetOperation(_) => None,
     }
 }
 
@@ -164,7 +331,7 @@ fn unroll_with_clause(
             rewritten.push(cte);
         }
     }
-    with.ctes = rewritten;
+    with.ctes = rewritten.into();
     Ok(())
 }
 
@@ -184,7 +351,7 @@ fn try_unroll_cte(
             cte.span,
         ));
     }
-    let Some(Ok((quantifier, operands))) = union_chain else {
+    let Some(Ok((distinct, operands))) = union_chain else {
         return Ok(None);
     };
     let anchor = &operands[0];
@@ -219,7 +386,7 @@ fn try_unroll_cte(
         }
         iterations.push(query_with_body(
             cte.query.as_ref(),
-            build_set_operation_chain(quantifier, &parts),
+            build_set_operation_chain(distinct, &parts),
         ));
     }
 
@@ -229,47 +396,48 @@ fn try_unroll_cte(
         .map(|(index, query)| inline_iteration(query, &name, index, &aliases, cte.span))
         .collect::<Vec<_>>();
     let mut rewritten = cte.clone();
-    rewritten.query = Box::new(query_with_body(
+    rewritten.query = ast::AstBox::new(query_with_body(
         cte.query.as_ref(),
-        build_set_operation_chain(SetQuantifier::All, &branches),
+        build_set_operation_chain(false, &branches),
     ));
     Ok(Some(rewritten))
 }
 
-fn extract_union_chain(expr: &SetExpr) -> Option<Result<(SetQuantifier, Vec<SetExpr>), ()>> {
+fn extract_union_chain(expr: &SetExpr) -> Option<Result<(bool, Vec<SetExpr>), ()>> {
     fn visit(
         expr: &SetExpr,
-        quantifier: &mut Option<SetQuantifier>,
+        distinct: &mut Option<bool>,
         parts: &mut Vec<SetExpr>,
         mixed: &mut bool,
     ) {
         if let SetExpr::SetOperation(operation) = expr {
-            if operation.operator != SetOperator::Union {
+            if operation.operator != SetOperator::Union || operation.corresponding.is_some() {
                 parts.push(expr.clone());
                 return;
             }
-            match quantifier {
-                Some(existing) if *existing != operation.quantifier => *mixed = true,
+            match distinct {
+                Some(existing) if *existing != operation.distinct => *mixed = true,
                 Some(_) => {}
-                None => *quantifier = Some(operation.quantifier),
+                None => *distinct = Some(operation.distinct),
             }
-            visit(operation.left.as_ref(), quantifier, parts, mixed);
-            visit(operation.right.as_ref(), quantifier, parts, mixed);
+            for input in &operation.inputs {
+                visit(input, distinct, parts, mixed);
+            }
         } else {
             parts.push(expr.clone());
         }
     }
 
-    let mut quantifier = None;
+    let mut distinct = None;
     let mut parts = Vec::new();
     let mut mixed = false;
-    visit(expr, &mut quantifier, &mut parts, &mut mixed);
+    visit(expr, &mut distinct, &mut parts, &mut mixed);
     if parts.len() < 2 {
         None
     } else if mixed {
         Some(Err(()))
     } else {
-        quantifier.map(|quantifier| Ok((quantifier, parts)))
+        distinct.map(|distinct| Ok((distinct, parts)))
     }
 }
 
@@ -277,8 +445,14 @@ fn derive_column_aliases(
     cte: &novarocks_parser::ast::Cte,
     anchor: &SetExpr,
 ) -> Result<Vec<Ident>, AnalyzeError> {
-    if !cte.columns.is_empty() {
-        return Ok(cte.columns.clone());
+    if let Some(columns) = &cte.columns {
+        if columns.is_empty() {
+            return Err(AnalyzeError::unsupported_query_shape(
+                "empty CTE column aliases are not supported",
+                cte.span,
+            ));
+        }
+        return Ok(columns.clone());
     }
     let Some(select) = root_select(anchor) else {
         return Err(AnalyzeError::invalid_query_shape(
@@ -298,76 +472,61 @@ fn derive_column_aliases(
 }
 
 fn projection_alias(item: &SelectItem) -> Option<Ident> {
-    match item {
-        SelectItem::ExprWithAlias { alias, .. } => Some(alias.clone()),
-        SelectItem::UnnamedExpr(Expr::Identifier(ident)) => Some(ident.clone()),
-        SelectItem::UnnamedExpr(Expr::CompoundIdentifier(ident)) => ident.parts.last().cloned(),
-        SelectItem::UnnamedExpr(_)
-        | SelectItem::Wildcard { .. }
-        | SelectItem::QualifiedWildcard { .. } => None,
-    }
+    let SelectItem::SingleColumn(column) = item else {
+        return None;
+    };
+    column.alias.clone().or_else(|| {
+        ast::identifier_chain_observed(&column.expression, |_| {
+            Ok::<(), std::convert::Infallible>(())
+        })
+        .unwrap_or_else(|never| match never {})
+        .map(|chain| chain.last().clone())
+    })
 }
 
 fn pin_projection_aliases(expr: &mut SetExpr, aliases: &[Ident]) {
     match expr {
         SetExpr::Select(select) => {
             for (item, alias) in select.projection.iter_mut().zip(aliases) {
-                let replacement = match std::mem::replace(
-                    item,
-                    SelectItem::Wildcard {
-                        options: Default::default(),
-                        span: alias.span,
-                    },
-                ) {
-                    SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
-                        SelectItem::ExprWithAlias {
-                            expr,
-                            alias: alias.clone(),
-                            explicit_as: true,
-                            span: alias.span,
-                        }
-                    }
-                    other => other,
-                };
-                *item = replacement;
+                if let SelectItem::SingleColumn(column) = item {
+                    column.alias = Some(alias.clone());
+                    column.span = alias.span;
+                }
             }
         }
-        SetExpr::Query(query) => pin_projection_aliases(query.body.as_mut(), aliases),
+        SetExpr::Query(query) => pin_projection_aliases(query.query.body.as_mut(), aliases),
         SetExpr::SetOperation(operation) => {
-            pin_projection_aliases(operation.left.as_mut(), aliases);
-            pin_projection_aliases(operation.right.as_mut(), aliases);
+            for input in &mut operation.inputs {
+                pin_projection_aliases(input, aliases);
+            }
         }
-        SetExpr::Values(_) => {}
+        SetExpr::Values(_) | SetExpr::Table(_) => {}
     }
 }
 
 fn query_with_body(template: &Query, body: SetExpr) -> Query {
     Query {
+        session_properties: Vec::new().into(),
+        functions: Vec::new().into(),
         with: None,
-        body: Box::new(body),
-        order_by: Vec::new(),
-        limit: None,
-        offset: None,
-        limit_comma_offset: false,
-        fetch: None,
+        body: ast::AstBox::new(body),
+        modifiers: Default::default(),
         span: template.span,
     }
 }
 
-fn build_set_operation_chain(quantifier: SetQuantifier, parts: &[SetExpr]) -> SetExpr {
+fn build_set_operation_chain(distinct: bool, parts: &[SetExpr]) -> SetExpr {
     let mut parts = parts.iter();
-    let mut combined = parts.next().expect("recursive CTE has an anchor").clone();
-    for part in parts {
-        let span = Span::new(combined.span().start(), part.span().end());
-        combined = SetExpr::SetOperation(SetOperation {
-            left: Box::new(combined),
-            operator: SetOperator::Union,
-            quantifier,
-            right: Box::new(part.clone()),
-            span,
-        });
-    }
-    combined
+    let first = parts.next().expect("recursive CTE has an anchor").clone();
+    parts.fold(first, |left, right| {
+        novarocks_parser::build::set_operation(
+            left,
+            SetOperator::Union,
+            distinct,
+            right.clone(),
+            None,
+        )
+    })
 }
 
 fn inline_iteration(
@@ -377,34 +536,28 @@ fn inline_iteration(
     aliases: &[Ident],
     span: Span,
 ) -> SetExpr {
-    let relation = TableFactor::Derived {
-        lateral: false,
-        subquery: Box::new(query),
-        alias: Some(TableAlias {
-            name: synthetic_ident(format!("__nr_rec_{cte_name}_{index}"), span),
-            columns: aliases.to_vec(),
-            explicit_as: false,
+    let mut relation = novarocks_parser::build::alias(
+        novarocks_parser::build::derived(query),
+        synthetic_ident(format!("__nr_rec_{cte_name}_{index}"), span),
+        Some(aliases.to_vec()),
+    );
+    if let ast::Relation::Aliased(node) = &mut relation {
+        node.span = span;
+    }
+    SetExpr::Select(ast::AstBox::new(Select {
+        distinct: false,
+        projection: vec![SelectItem::AllColumns(ast::AstBox::new(ast::AllColumns {
+            target: None,
+            aliases: Vec::new(),
             span,
-        }),
-        span,
-    };
-    SetExpr::Select(Box::new(Select {
-        hints: Vec::new(),
-        quantifier: novarocks_parser::ast::SelectQuantifier::None,
-        projection: vec![SelectItem::Wildcard {
-            options: Default::default(),
-            span,
-        }],
-        from: vec![TableWithJoins {
-            relation,
-            joins: Vec::new(),
-            span,
-        }],
+        }))]
+        .into(),
+        from: Some(relation),
         selection: None,
-        group_by: novarocks_parser::ast::GroupBy::None,
+        group_by: None,
         having: None,
-        qualify: None,
-        windows: Vec::new(),
+        windows: ast::AstVec::new(),
+        modifiers: Default::default(),
         span,
     }))
 }
@@ -413,7 +566,6 @@ fn synthetic_ident(value: String, span: Span) -> Ident {
     Ident {
         value,
         quoted: false,
-        quote_style: None,
         span,
     }
 }
@@ -428,14 +580,12 @@ impl Visit for TableReferenceVisitor<'_> {
         scan_query_for_table_reference(self, query);
     }
 
-    fn visit_table_factor(&mut self, factor: &TableFactor) {
-        if let TableFactor::Table { name, .. } = factor
-            && name.parts.len() == 1
-            && name.parts[0].value.eq_ignore_ascii_case(self.target)
-        {
+    fn visit_table(&mut self, table: &ast::Table) {
+        let name = &table.name;
+        if name.parts.len() == 1 && name.parts[0].value.eq_ignore_ascii_case(self.target) {
             self.found = true;
         }
-        novarocks_parser::ast::walk_table_factor(self, factor);
+        novarocks_parser::ast::walk_table(self, table);
     }
 }
 
@@ -449,6 +599,9 @@ fn set_expr_references_table(expr: &SetExpr, target: &str) -> bool {
 }
 
 fn scan_query_for_table_reference(visitor: &mut TableReferenceVisitor<'_>, query: &Query) {
+    for property in &query.session_properties {
+        visitor.visit_expr(&property.value);
+    }
     let mut outer_target_visible = true;
     if let Some(with) = &query.with {
         for cte in &with.ctes {
@@ -468,94 +621,45 @@ fn scan_query_for_table_reference(visitor: &mut TableReferenceVisitor<'_>, query
         return;
     }
     scan_set_expr_for_table_reference(visitor, query.body.as_ref());
-    for order in &query.order_by {
-        visitor.visit_expr(&order.expr);
-    }
-    if let Some(limit) = &query.limit {
-        visitor.visit_expr(limit);
-    }
-    if let Some(offset) = &query.offset {
-        visitor.visit_expr(&offset.value);
-    }
-    if let Some(fetch) = &query.fetch
-        && let Some(quantity) = &fetch.quantity
-    {
-        visitor.visit_expr(quantity);
-    }
+    novarocks_parser::ast::walk_query_modifiers(visitor, &query.modifiers);
 }
 
 fn scan_set_expr_for_table_reference(visitor: &mut TableReferenceVisitor<'_>, expr: &SetExpr) {
     match expr {
         SetExpr::Select(select) => {
-            for hint in &select.hints {
-                match &hint.value {
-                    SelectHintValue::Bare => {}
-                    SelectHintValue::Call { arguments } => {
-                        for argument in arguments {
-                            visitor.visit_expr(argument);
-                        }
-                    }
-                    SelectHintValue::Assignment { value } => visitor.visit_expr(value),
-                }
-            }
-            if let novarocks_parser::ast::SelectQuantifier::Distinct { on, .. } = &select.quantifier
-            {
-                for expression in on {
-                    visitor.visit_expr(expression);
-                }
-            }
             for item in &select.projection {
                 match item {
-                    SelectItem::UnnamedExpr(expression)
-                    | SelectItem::ExprWithAlias {
-                        expr: expression, ..
-                    } => visitor.visit_expr(expression),
-                    SelectItem::Wildcard { options, .. }
-                    | SelectItem::QualifiedWildcard { options, .. } => {
-                        for replacement in &options.replace {
-                            visitor.visit_expr(&replacement.expr);
+                    SelectItem::SingleColumn(column) => visitor.visit_expr(&column.expression),
+                    SelectItem::AllColumns(columns) => {
+                        if let Some(target) = &columns.target {
+                            visitor.visit_expr(target);
                         }
                     }
                 }
             }
-            for table in &select.from {
-                visitor.visit_table_factor(&table.relation);
-                for join in &table.joins {
-                    visitor.visit_table_factor(&join.relation);
-                    if let JoinConstraint::On(expression) = &join.constraint {
-                        visitor.visit_expr(expression);
-                    }
-                }
+            if let Some(relation) = &select.from {
+                visitor.visit_relation(relation);
             }
             if let Some(selection) = &select.selection {
                 visitor.visit_expr(selection);
             }
-            match &select.group_by {
-                GroupBy::None => {}
-                GroupBy::Expressions { expressions, .. }
-                | GroupBy::Rollup { expressions, .. }
-                | GroupBy::Cube { expressions, .. } => {
-                    for expression in expressions {
-                        visitor.visit_expr(expression);
-                    }
-                }
-                GroupBy::GroupingSets { sets, .. } => {
-                    for set in sets {
-                        for expression in set {
-                            visitor.visit_expr(expression);
-                        }
-                    }
-                }
+            if let Some(group_by) = &select.group_by {
+                visitor.visit_group_by(group_by);
             }
-            for expression in [&select.having, &select.qualify].into_iter().flatten() {
-                visitor.visit_expr(expression);
+            if let Some(having) = &select.having {
+                visitor.visit_expr(having);
             }
             for window in &select.windows {
                 for expression in &window.specification.partition_by {
                     visitor.visit_expr(expression);
                 }
-                for order in &window.specification.order_by {
-                    visitor.visit_expr(&order.expr);
+                for order in window
+                    .specification
+                    .order_by
+                    .iter()
+                    .flat_map(|order| &order.items)
+                {
+                    visitor.visit_expr(&order.sort_key);
                 }
                 if let Some(frame) = &window.specification.window_frame {
                     scan_window_frame_bound_for_table_reference(visitor, &frame.start_bound);
@@ -564,18 +668,19 @@ fn scan_set_expr_for_table_reference(visitor: &mut TableReferenceVisitor<'_>, ex
                     }
                 }
             }
+            novarocks_parser::ast::walk_query_modifiers(visitor, &select.modifiers);
         }
         SetExpr::Values(values) => {
             for row in &values.rows {
-                for expression in row {
-                    visitor.visit_expr(expression);
-                }
+                visitor.visit_expr(row);
             }
         }
-        SetExpr::Query(query) => scan_query_for_table_reference(visitor, query),
+        SetExpr::Query(query) => scan_query_for_table_reference(visitor, &query.query),
+        SetExpr::Table(table) => visitor.visit_table(table),
         SetExpr::SetOperation(operation) => {
-            scan_set_expr_for_table_reference(visitor, operation.left.as_ref());
-            scan_set_expr_for_table_reference(visitor, operation.right.as_ref());
+            for input in &operation.inputs {
+                scan_set_expr_for_table_reference(visitor, input);
+            }
         }
     }
 }
@@ -616,52 +721,47 @@ fn substitute_table_with_derived(
                         // the query body resolve the same name locally.
                         return query;
                     }
-                    *cte.query = self.fold_query(*cte.query.clone());
+                    cte.query = ast::AstBox::new(self.fold_query(cte.query.clone().into_inner()));
                 }
             }
             novarocks_parser::ast::fold_query(self, query)
         }
 
-        fn fold_table_factor(&mut self, factor: TableFactor) -> TableFactor {
-            let factor = novarocks_parser::ast::fold_table_factor(self, factor);
-            let is_target = matches!(
-                &factor,
-                TableFactor::Table { name, .. }
-                    if name.parts.len() == 1
-                        && name.parts[0].value.eq_ignore_ascii_case(self.target)
-            );
-            if !is_target {
-                return factor;
-            }
-            let TableFactor::Table { alias, span, .. } = factor else {
-                unreachable!("target factor must be a table");
+        fn fold_relation(&mut self, relation: ast::Relation) -> ast::Relation {
+            let target = |table: &ast::Table| {
+                table.name.parts.len() == 1
+                    && table.name.parts[0].value.eq_ignore_ascii_case(self.target)
             };
-            let alias = alias
-                .as_ref()
-                .map(|alias| alias.name.clone())
-                .unwrap_or_else(|| synthetic_ident(self.target.to_owned(), span));
-            TableFactor::Derived {
-                lateral: false,
-                subquery: Box::new(self.replacement.clone()),
-                alias: Some(TableAlias {
-                    name: alias,
-                    columns: self.aliases.to_vec(),
-                    explicit_as: false,
-                    span,
-                }),
-                span,
+            let (alias, span) = match relation {
+                ast::Relation::Aliased(node) if matches!(node.relation.as_ref(), ast::Relation::Table(table) if target(table)) =>
+                {
+                    let node = node.into_inner();
+                    (node.alias, node.span)
+                }
+                ast::Relation::Table(table) if target(&table) => (
+                    synthetic_ident(self.target.to_owned(), table.span),
+                    table.span,
+                ),
+                other => return ast::fold_relation(self, other),
+            };
+            let mut result = novarocks_parser::build::alias(
+                novarocks_parser::build::derived(self.replacement.clone()),
+                alias,
+                Some(self.aliases.to_vec()),
+            );
+            if let ast::Relation::Aliased(node) = &mut result {
+                node.span = span;
             }
+            result
         }
     }
 
     let template = Query {
+        session_properties: Vec::new().into(),
+        functions: Vec::new().into(),
         with: None,
-        body: Box::new(expr.clone()),
-        order_by: Vec::new(),
-        limit: None,
-        offset: None,
-        limit_comma_offset: false,
-        fetch: None,
+        body: ast::AstBox::new(expr.clone()),
+        modifiers: Default::default(),
         span: expr.span(),
     };
     let mut substituter = RecursiveTableSubstituter {
@@ -669,117 +769,100 @@ fn substitute_table_with_derived(
         replacement,
         aliases,
     };
-    *expr = *substituter.fold_query(template).body;
-}
-
-fn normalize_cross_joins(query: &mut Query) {
-    normalize_cross_set_expr(query.body.as_mut());
-    if let Some(with) = query.with.as_mut() {
-        for cte in &mut with.ctes {
-            normalize_cross_joins(cte.query.as_mut());
-        }
-    }
-}
-
-fn normalize_cross_set_expr(expr: &mut SetExpr) {
-    match expr {
-        SetExpr::Select(select) => {
-            for table in &mut select.from {
-                for join in &mut table.joins {
-                    if join.operator == JoinOperator::Cross
-                        && !matches!(join.constraint, JoinConstraint::None)
-                    {
-                        join.operator = JoinOperator::InnerExplicit;
-                    }
-                    normalize_cross_factor(&mut join.relation);
-                }
-                normalize_cross_factor(&mut table.relation);
-            }
-        }
-        SetExpr::Query(query) => normalize_cross_joins(query),
-        SetExpr::SetOperation(operation) => {
-            normalize_cross_set_expr(operation.left.as_mut());
-            normalize_cross_set_expr(operation.right.as_mut());
-        }
-        SetExpr::Values(_) => {}
-    }
-}
-
-fn normalize_cross_factor(factor: &mut TableFactor) {
-    match factor {
-        TableFactor::Derived { subquery, .. } => normalize_cross_joins(subquery),
-        TableFactor::NestedJoin {
-            table_with_joins, ..
-        } => {
-            for join in &mut table_with_joins.joins {
-                if join.operator == JoinOperator::Cross
-                    && !matches!(join.constraint, JoinConstraint::None)
-                {
-                    join.operator = JoinOperator::InnerExplicit;
-                }
-                normalize_cross_factor(&mut join.relation);
-            }
-            normalize_cross_factor(&mut table_with_joins.relation);
-        }
-        TableFactor::Table { .. }
-        | TableFactor::TableFunction { .. }
-        | TableFactor::Unnest { .. } => {}
-    }
+    *expr = substituter.fold_query(template).body.into_inner();
 }
 
 fn remove_bare_top_level_dual(query: &mut Query) {
     let SetExpr::Select(select) = query.body.as_mut() else {
         return;
     };
-    if select.from.len() != 1 {
-        return;
-    }
     if select.selection.is_some()
-        || !matches!(select.group_by, GroupBy::None)
+        || select.group_by.is_some()
         || select.having.is_some()
-        || select.qualify.is_some()
         || !select.windows.is_empty()
-        || !query.order_by.is_empty()
-        || query.limit.is_some()
-        || query.offset.is_some()
-        || query.fetch.is_some()
+        || !select.modifiers.is_empty()
+        || query.modifiers.order_by.is_some()
+        || query.modifiers.limit.is_some()
+        || query.modifiers.offset.is_some()
     {
         return;
     }
-    let table = &select.from[0];
-    if !table.joins.is_empty() {
-        return;
-    }
-    let TableFactor::Table {
-        name,
-        alias,
-        version,
-        ..
-    } = &table.relation
-    else {
+    let Some(ast::Relation::Table(table)) = &select.from else {
         return;
     };
+    let name = &table.name;
     if name.parts.len() == 1
         && name.parts[0].value.eq_ignore_ascii_case("dual")
         && !name.parts[0].quoted
-        && alias.is_none()
-        && version.is_none()
+        && table.query_period.is_none()
+        && table.branch.is_none()
     {
-        select.from.clear();
+        select.from = None;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use novarocks_parser::ast::{Statement, SyntaxEq};
+    use novarocks_parser::ast::SyntaxEq;
 
     fn parse_query(sql: &str) -> Query {
-        let mut statements = novarocks_parser::parse(sql).expect("typed query should parse");
-        match statements.remove(0) {
-            Statement::Query(query) => query,
-            other => panic!("expected query, got {other:?}"),
+        novarocks_parser::parser::parse_query(sql).expect("typed query should parse")
+    }
+
+    fn inline_function() -> novarocks_parser::ast::FunctionSpecification {
+        use novarocks_parser::{SYNTHETIC, ast, build};
+        ast::FunctionSpecification {
+            name: build::object_name(vec![build::ident("f", false)]).unwrap(),
+            parameters: vec![],
+            returns: build::simple_type("bigint"),
+            characteristics: vec![],
+            body: ast::RoutineBody::Sql(ast::ControlStatement::Return(ast::ReturnStatement {
+                value: build::integer(1),
+                span: SYNTHETIC,
+            })),
+            span: Span::new(4, 18),
         }
+    }
+
+    #[test]
+    fn inline_functions_are_rejected_in_every_query_scope_before_catalog_discovery() {
+        struct AddFunction;
+        impl Fold for AddFunction {
+            fn fold_query(&mut self, mut query: Query) -> Query {
+                query.functions.push(inline_function());
+                query
+            }
+        }
+
+        // The outer Fold only enters child queries; the root is tested
+        // separately. Unknown calls and relations must never win this error.
+        for sql in [
+            "WITH x AS (SELECT missing_function() FROM missing_table) SELECT * FROM x",
+            "SELECT * FROM (SELECT missing_function() FROM missing_table) AS x",
+            "SELECT (SELECT missing_function() FROM missing_table)",
+            "(SELECT missing_function() FROM missing_table) UNION ALL SELECT 2",
+        ] {
+            let query = novarocks_parser::ast::fold_query(&mut AddFunction, parse_query(sql));
+            assert!(query.functions.is_empty());
+            let error = preanalyze(query).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                crate::analyze_error::AnalyzeErrorKind::UnsupportedExpression
+            );
+            assert!(
+                error.to_string().contains("Inline functions"),
+                "{sql}: {error}"
+            );
+        }
+        let mut query = parse_query("SELECT missing_function() FROM missing_table");
+        query.functions.push(inline_function());
+        let error = preanalyze(query).unwrap_err();
+        assert_eq!(
+            error.kind(),
+            crate::analyze_error::AnalyzeErrorKind::UnsupportedExpression
+        );
+        assert!(error.to_string().contains("Inline functions"));
     }
 
     #[test]
@@ -797,15 +880,15 @@ mod tests {
     }
 
     #[test]
-    fn recursive_depth_uses_hint_then_session_then_original_default() {
+    fn recursive_depth_uses_root_property_then_session_then_default() {
         let sql =
             "WITH RECURSIVE n AS (SELECT 1 AS x UNION ALL SELECT x + 1 FROM n) SELECT x FROM n";
-        let hinted_sql = "WITH RECURSIVE n AS (SELECT 1 AS x UNION ALL SELECT x + 1 FROM n) SELECT /*+ SET_VAR(recursive_cte_max_depth = 4) */ x FROM n";
+        let overridden_sql = "WITH SESSION recursive_cte_max_depth = 4 WITH RECURSIVE n AS (SELECT 1 AS x UNION ALL SELECT x + 1 FROM n) SELECT x FROM n";
         let session =
             crate::sql_mode::SqlSemanticSettings::default().with_recursive_cte_max_depth(2);
         for (source, semantics, expected_branches) in [
             (sql, session.clone(), 2),
-            (hinted_sql, session, 4),
+            (overridden_sql, session, 4),
             (sql, crate::sql_mode::SqlSemanticSettings::default(), 5),
         ] {
             let rewritten = preanalyze_with_semantics(parse_query(source), &semantics)
@@ -905,10 +988,21 @@ mod tests {
         let SetExpr::Select(select) = query.body.as_ref() else {
             panic!("expected select");
         };
-        let SelectItem::UnnamedExpr(Expr::Exists(exists)) = &select.projection[0] else {
+        let SelectItem::SingleColumn(projection_column) = &select.projection[0] else {
             panic!("expected EXISTS predicate");
         };
-        let with = exists.query.with.as_ref().expect("nested WITH must remain");
+        assert!(projection_column.alias.is_none(), "anonymous projection");
+        let Expr::Exists(exists) = &projection_column.expression else {
+            panic!("expected EXISTS predicate");
+        };
+        let Expr::Subquery(subquery) = &exists.subquery else {
+            panic!("EXISTS query wrapper")
+        };
+        let with = subquery
+            .query
+            .with
+            .as_ref()
+            .expect("nested WITH must remain");
         assert!(!set_expr_references_table(
             with.ctes[0].query.body.as_ref(),
             "n"
@@ -921,25 +1015,27 @@ mod tests {
         let SetExpr::Select(select) = query.body.as_ref() else {
             panic!("expected select");
         };
-        assert!(select.from.is_empty());
+        assert!(select.from.is_none());
 
         let query = preanalyze(parse_query("SELECT 1 FROM dual WHERE 1 = 1")).expect("prepass");
         let SetExpr::Select(select) = query.body.as_ref() else {
             panic!("expected select");
         };
-        assert_eq!(select.from.len(), 1);
+        assert!(select.from.is_some());
     }
 
     #[test]
-    fn cross_join_with_constraint_becomes_inner_join() {
-        let query = preanalyze(parse_query("SELECT * FROM a CROSS JOIN b ON a.id = b.id"))
-            .expect("prepass");
+    fn inner_join_keeps_constraint_during_prepass() {
+        let query = novarocks_parser::parser::parse_query("SELECT * FROM a JOIN b ON a.id = b.id")
+            .expect("parse an inner join");
+        let query = preanalyze(query).expect("prepass");
         let SetExpr::Select(select) = query.body.as_ref() else {
             panic!("expected select");
         };
-        assert_eq!(
-            select.from[0].joins[0].operator,
-            JoinOperator::InnerExplicit
-        );
+        let Some(ast::Relation::Join(join)) = &select.from else {
+            panic!("expected join");
+        };
+        assert_eq!(join.kind, ast::JoinType::Inner);
+        assert!(matches!(join.criteria, Some(ast::JoinCriteria::On(_))));
     }
 }

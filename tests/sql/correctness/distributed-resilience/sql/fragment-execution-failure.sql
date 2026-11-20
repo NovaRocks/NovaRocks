@@ -52,20 +52,19 @@
 CREATE TABLE ${case_db}.fragment_execution_failure (
   id BIGINT,
   delay_s BIGINT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 2
 -- @skip_result_check=true
-INSERT INTO ${case_db}.fragment_execution_failure VALUES (1, 5);
+INSERT INTO ${case_db}.fragment_execution_failure VALUES ROW(1, 5);
 
 -- query 3
 -- @skip_result_check=true
-INSERT INTO ${case_db}.fragment_execution_failure VALUES (2, 5);
+INSERT INTO ${case_db}.fragment_execution_failure VALUES ROW(2, 5);
 
 -- query 4
 -- @skip_result_check=true
-INSERT INTO ${case_db}.fragment_execution_failure VALUES (3, 5);
+INSERT INTO ${case_db}.fragment_execution_failure VALUES ROW(3, 5);
 
 -- query 5
 -- @query_lifecycle_fault=task-execution-failure,1

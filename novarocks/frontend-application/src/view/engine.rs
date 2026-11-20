@@ -34,7 +34,9 @@ use novarocks_query_application::view::{
     ViewDefinitionAnalysisRequest, ViewEngine, ViewTarget,
 };
 #[cfg(test)]
-use novarocks_query_application::view::{ViewRequestContext, ViewService, ViewStatementResult};
+use novarocks_query_application::view::{
+    ViewCommand, ViewRequestContext, ViewService, ViewStatementResult,
+};
 use novarocks_spi::connector::{
     ConnectorCatalogMutationOperation, ConnectorError, ConnectorErrorKind, ConnectorInstanceId,
     ConnectorRequestContext, ConnectorViewDefinition, ConnectorViewDialect, ConnectorViewIdentity,
@@ -55,10 +57,10 @@ impl ViewService for EmptyViewService {
         novarocks_query_application::view::QueryViewService::new().catalog_snapshot()
     }
 
-    fn execute_statement(
+    fn execute_command(
         &self,
         _engine: &dyn ViewEngine,
-        _statement: &novarocks_parser::ast::ViewStatement,
+        _command: ViewCommand<'_>,
         _context: ViewRequestContext<'_>,
     ) -> Result<ViewStatementResult, novarocks_query_application::api::CommandError> {
         Err("view service is not injected".to_string().into())
@@ -148,7 +150,7 @@ impl ViewEngine for FrontendViewEngine {
                     view: Arc::from(request.target.view),
                 },
                 definition: ConnectorViewDefinition {
-                    dialect: ConnectorViewDialect::StarRocks,
+                    dialect: ConnectorViewDialect::Trino,
                     raw_sql: Arc::from(request.definition.raw_query_source),
                     default_catalog: Some(Arc::from(request.definition.resolution.default_catalog)),
                     default_namespace: Arc::from(request.definition.resolution.default_database),
@@ -261,8 +263,15 @@ impl ViewEngine for FrontendViewEngine {
         let provider = provider
             .with_local_views(request.local_views.clone())
             .with_system_relations(self.kernel.system_relations().clone());
+        let candidates = novarocks_sql::compiler::quoted_metadata_catalogs(
+            request.query,
+            Some(request.catalog),
+            request.database,
+            &control,
+        )?;
+        let qualifications = provider.observe_catalog_qualifications(&candidates)?;
         let mut preparation =
-            novarocks_sql::compiler::SqlCapturedCatalogPreparation::try_new_definition(
+            novarocks_sql::compiler::SqlCapturedCatalogPreparation::try_new_definition_with_qualifications(
                 request.query.clone(),
                 request.catalog,
                 request.database,
@@ -272,6 +281,7 @@ impl ViewEngine for FrontendViewEngine {
                     table: request.target.view.clone(),
                 }),
                 control.clone(),
+                qualifications,
             )?;
         while !preparation.needs().is_empty() {
             let facts = preparation
@@ -299,7 +309,7 @@ fn resolved_external_view(
     let definition = PersistedQueryDefinition::new(
         view.definition.raw_sql.to_string(),
         match view.definition.dialect {
-            ConnectorViewDialect::StarRocks => PersistedQueryDialect::StarRocks,
+            ConnectorViewDialect::Trino => PersistedQueryDialect::Trino,
         },
         default_catalog,
         &view.definition.default_namespace,
@@ -378,7 +388,7 @@ mod tests {
             }],
             definition: PersistedQueryDefinition::new(
                 "SELECT COUNT(*) AS sale_count FROM sales",
-                PersistedQueryDialect::StarRocks,
+                PersistedQueryDialect::Trino,
                 "rest",
                 "analytics",
             )
@@ -413,13 +423,17 @@ mod tests {
             current_database: "db",
             connector_context: None,
         };
-        let statements = novarocks_parser::parse("CREATE VIEW v AS SELECT 1").expect("parse");
-        let [novarocks_parser::ast::Statement::View(statement)] = statements.as_slice() else {
+        let sql = "CREATE VIEW v AS SELECT 1";
+        let novarocks_parser::ast::TrinoStatement::CreateView(statement) =
+            novarocks_parser::parser::parse_statement(sql).expect("parse")
+        else {
             panic!("expected view statement");
         };
+        let command =
+            novarocks_query_application::view::ViewCommand::trino_create(sql, &statement).unwrap();
         assert!(
             service
-                .execute_statement(&engine, statement, ctx)
+                .execute_command(&engine, command, ctx)
                 .unwrap_err()
                 .to_string()
                 .contains("view service is not injected")

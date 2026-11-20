@@ -20,7 +20,7 @@
 -- Compare UPDATE assignment conversion with the same SELECT CAST value author.
 -- query 1
 -- @skip_result_check=true
-DROP TABLE IF EXISTS ${case_db}.t_update_assignment_conversion FORCE;
+DROP TABLE IF EXISTS ${case_db}.t_update_assignment_conversion ;
 CREATE TABLE ${case_db}.t_update_assignment_conversion (
   id INT,
   d DECIMAL(8,2),
@@ -29,20 +29,13 @@ CREATE TABLE ${case_db}.t_update_assignment_conversion (
   n INT,
   nullable_text STRING,
   required_text STRING NOT NULL
-) TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
-);
+) WITH (format_version = 3);
 INSERT INTO ${case_db}.t_update_assignment_conversion VALUES
-  (1, 0, '2020-01-01', '2020-01-01 00:00:00', 0, 'before', 'required'),
-  (2, 0, '2020-01-01', '2020-01-01 00:00:00', 0, 'before', 'required');
+  ROW(1, 0, '2020-01-01', '2020-01-01 00:00:00', 0, 'before', 'required'),
+  ROW(2, 0, '2020-01-01', '2020-01-01 00:00:00', 0, 'before', 'required');
 
 -- query 2
-SELECT CAST(CAST(12.345 AS DECIMAL(8,3)) AS DECIMAL(8,2)) AS d,
-       CAST('2024-02-29' AS DATE) AS dt,
-       CAST('2024-02-29 12:34:56.123456' AS DATETIME) AS ts,
-       CAST('123' AS INT) AS n,
-       CAST(NULL AS STRING) AS nullable_text;
+SELECT CAST(CAST(DECIMAL '12.345' AS DECIMAL(8, 3)) AS DECIMAL(8, 2)) AS d, CAST('2024-02-29' AS DATE) AS dt, CAST('2024-02-29 12:34:56.123456' AS DATETIME) AS ts, CAST('123' AS INT) AS n, CAST(NULL AS STRING) AS nullable_text;
 -- query 3
 -- @skip_result_check=true
 UPDATE ${case_db}.t_update_assignment_conversion
@@ -57,12 +50,11 @@ SELECT d, dt, ts, n, nullable_text
 FROM ${case_db}.t_update_assignment_conversion WHERE id = 1;
 
 -- query 5
-SELECT CAST(CAST(-12.345 AS DECIMAL(8,3)) AS DECIMAL(8,2)) AS d,
-       CAST(CAST(2147483648 AS BIGINT) AS INT) AS n;
+SELECT CAST(CAST((- (DECIMAL '12.345')) AS DECIMAL(8, 3)) AS DECIMAL(8, 2)) AS d, CAST(CAST(2147483648 AS BIGINT) AS INT) AS n;
 -- query 6
 -- @skip_result_check=true
 UPDATE ${case_db}.t_update_assignment_conversion
-SET d = CAST(-12.345 AS DECIMAL(8,3)), n = CAST(2147483648 AS BIGINT)
+SET d = CAST((- (DECIMAL '12.345')) AS DECIMAL(8, 3)), n = CAST(2147483648 AS BIGINT)
 WHERE id = 2;
 -- query 7
 SELECT d, n FROM ${case_db}.t_update_assignment_conversion WHERE id = 2;
@@ -76,14 +68,14 @@ UPDATE ${case_db}.t_update_assignment_conversion SET required_text = NULL WHERE 
 SELECT id, required_text FROM ${case_db}.t_update_assignment_conversion ORDER BY id;
 -- query 11
 -- @skip_result_check=true
-DROP TABLE ${case_db}.t_update_assignment_conversion FORCE;
+DROP TABLE ${case_db}.t_update_assignment_conversion ;
 
 
 -- STRING parsing uses the same ordinary CAST author for UPDATE assignment.
 -- Raw floating-point NaN identity is outside this text conversion case.
 -- query 12
 -- @skip_result_check=true
-DROP TABLE IF EXISTS ${case_db}.t_update_assignment_nonfinite FORCE;
+DROP TABLE IF EXISTS ${case_db}.t_update_assignment_nonfinite ;
 CREATE TABLE ${case_db}.t_update_assignment_nonfinite (
   id INT,
   token STRING,
@@ -91,16 +83,13 @@ CREATE TABLE ${case_db}.t_update_assignment_nonfinite (
   nullable_double DOUBLE,
   required_float FLOAT NOT NULL,
   required_double DOUBLE NOT NULL
-) TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
-);
+) WITH (format_version = 3);
 INSERT INTO ${case_db}.t_update_assignment_nonfinite VALUES
-  (1, 'NaN', 21, 22, 11, 12),
-  (2, 'inf', 21, 22, 11, 12),
-  (3, '-inf', 21, 22, 11, 12),
-  (4, '1e1000', 21, 22, 11, 12),
-  (5, '2.5', 21, 22, 11, 12);
+  ROW(1, 'NaN', 21, 22, 11, 12),
+  ROW(2, 'inf', 21, 22, 11, 12),
+  ROW(3, '-inf', 21, 22, 11, 12),
+  ROW(4, '1e1000', 21, 22, 11, 12),
+  ROW(5, '2.5', 21, 22, 11, 12);
 
 -- query 13
 -- @skip_result_check=true
@@ -148,4 +137,4 @@ SELECT id,
 FROM ${case_db}.t_update_assignment_nonfinite WHERE id = 5;
 -- query 21
 -- @skip_result_check=true
-DROP TABLE ${case_db}.t_update_assignment_nonfinite FORCE;
+DROP TABLE ${case_db}.t_update_assignment_nonfinite ;

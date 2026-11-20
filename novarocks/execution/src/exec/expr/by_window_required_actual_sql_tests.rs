@@ -94,8 +94,8 @@ fn compile(sql: &str, fields: &[Field]) {
 }
 
 const RUNNING: &str = "SELECT seq,\n       max_by(v,k) OVER (ORDER BY seq ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS max_v,\n       min_by(v,k) OVER (ORDER BY seq ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS min_v\nFROM fixture.max_min_by_null_value ORDER BY seq;";
-const TEXT_KEY: &str = "select /*+ SET_VAR(new_planner_agg_stage='1') */\n  (sum(murmur_hash3_32(ifnull(c0,0)) + murmur_hash3_32(ifnull(a,0)) + murmur_hash3_32(ifnull(b,0)))) as fingerprint\nfrom (select c0, max_by(c2, concat(coalesce(c2,'NULL'), c3)) over(partition by c1) a, min_by(c2, concat(coalesce(c2,'NULL'), c3)) over(partition by c1) b from t0) as t;";
-const NONNULL_INT: &str = "select /*+ SET_VAR(new_planner_agg_stage='1') */\n  (sum(murmur_hash3_32(ifnull(c2,0)) + murmur_hash3_32(ifnull(a,0)) + murmur_hash3_32(ifnull(b,0)))) as fingerprint\nfrom (select c2, max_by(c0, coalesce(c0,0) * 1000 + c1) over(partition by c2) a, min_by(c0, coalesce(c0,0) * 1000 + c1) over(partition by c2) b from t0) as t;";
+const TEXT_KEY: &str = "WITH SESSION new_planner_agg_stage = '1' select /*+ SET_VAR(new_planner_agg_stage='1') */\n  (sum(murmur_hash3_32(ifnull(c0,0)) + murmur_hash3_32(ifnull(a,0)) + murmur_hash3_32(ifnull(b,0)))) as fingerprint\nfrom (select c0, max_by(c2, concat(coalesce(c2,'NULL'), c3)) over(partition by c1) a, min_by(c2, concat(coalesce(c2,'NULL'), c3)) over(partition by c1) b from t0) as t;";
+const NONNULL_INT: &str = "WITH SESSION new_planner_agg_stage = '1' select /*+ SET_VAR(new_planner_agg_stage='1') */\n  (sum(murmur_hash3_32(ifnull(c2,0)) + murmur_hash3_32(ifnull(a,0)) + murmur_hash3_32(ifnull(b,0)))) as fingerprint\nfrom (select c2, max_by(c0, coalesce(c0,0) * 1000 + c1) over(partition by c2) a, min_by(c0, coalesce(c0,0) * 1000 + c1) over(partition by c2) b from t0) as t;";
 
 #[test]
 fn by_window_sql_source_required_three_case_full_binding_receipts() {

@@ -291,11 +291,17 @@ fn node_fields<'a>(
             f.binding(resolved)?;
         }
         ScalarNode::Cast {
+            array_failure_mode,
             child,
             target,
             decimal_overflow_policy,
         } => {
             f.number(8)?;
+            f.number(match array_failure_mode {
+                None => 0,
+                Some(novarocks_type_contract::ArrayCastFailureMode::ReportError) => 1,
+                Some(novarocks_type_contract::ArrayCastFailureMode::OutputNull) => 2,
+            })?;
             f.id(*child)?;
             f.push(Token::Type(target))?;
             f.number(*decimal_overflow_policy as u128)?;

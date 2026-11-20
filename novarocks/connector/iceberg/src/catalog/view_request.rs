@@ -43,7 +43,7 @@ use crate::iceberg::{NamespaceIdent, TableIdent};
 use crate::rest_protocol::mutation::{SqlRepresentationWire, ViewVersionWire};
 
 /// The only dialect NovaRocks writes.
-pub(crate) const VIEW_DIALECT_STARROCKS: &str = "starrocks";
+pub(crate) const VIEW_DIALECT_TRINO: &str = "trino";
 /// The summary key of a replacement's operation identity.
 pub(crate) const OPERATION_ID_SUMMARY_KEY: &str = "novarocks.operation-id";
 const REPLACE_DROP_DIALECT_ALLOWED: &str = "replace.drop-dialect.allowed";
@@ -70,7 +70,7 @@ impl ViewDefinition {
             summary: self.summary,
             representations: vec![SqlRepresentationWire {
                 sql: self.sql,
-                dialect: VIEW_DIALECT_STARROCKS.to_string(),
+                dialect: VIEW_DIALECT_TRINO.to_string(),
             }],
             default_catalog: self.default_catalog,
             default_namespace: self.default_namespace,
@@ -167,7 +167,7 @@ impl ValidatedViewReplace {
                     sql.dialect.to_ascii_lowercase()
                 })
                 .collect::<BTreeSet<_>>();
-            let new_dialects = BTreeSet::from([VIEW_DIALECT_STARROCKS.to_string()]);
+            let new_dialects = BTreeSet::from([VIEW_DIALECT_TRINO.to_string()]);
             let dropped = current_dialects
                 .difference(&new_dialects)
                 .cloned()
@@ -336,7 +336,7 @@ mod tests {
             "location": "s3://warehouse/db/v",
             "current-version-id": versions,
             "versions": (1..=versions)
-                .map(|id| version(id, if id == versions { dialects } else { &["starrocks"] }))
+                .map(|id| version(id, if id == versions { dialects } else { &["trino"] }))
                 .collect::<Vec<_>>(),
             "version-log": (1..=versions).map(|id| serde_json::json!({
                 "version-id": id, "timestamp-ms": 1_600_000_000_000i64 + id as i64
@@ -369,7 +369,7 @@ mod tests {
 
     #[test]
     fn an_unchanged_schema_is_referenced_by_its_id() {
-        let current = metadata(3, &["starrocks"], serde_json::json!({}));
+        let current = metadata(3, &["trino"], serde_json::json!({}));
         let replace = replace(&current, columns(&["a", "b"]), &[]).unwrap();
         assert_eq!(replace.schema(), &ViewSchema::Existing(0));
         assert_eq!(replace.version().schema_id, 0);
@@ -378,7 +378,7 @@ mod tests {
 
     #[test]
     fn a_changed_schema_is_added_and_selected_by_the_commit() {
-        let current = metadata(1, &["starrocks"], serde_json::json!({}));
+        let current = metadata(1, &["trino"], serde_json::json!({}));
         let replace = replace(&current, columns(&["a", "c"]), &[]).unwrap();
         let ViewSchema::New(schema) = replace.schema() else {
             panic!("a changed schema must be added");
@@ -390,7 +390,7 @@ mod tests {
     #[test]
     fn identifier_fields_take_part_in_schema_equality() {
         let mut json =
-            serde_json::to_value(metadata(1, &["starrocks"], serde_json::json!({}))).unwrap();
+            serde_json::to_value(metadata(1, &["trino"], serde_json::json!({}))).unwrap();
         json["schemas"][0]["fields"][0]["required"] = true.into();
         let current: ViewMetadata = serde_json::from_value(json).unwrap();
         let fields = || {
@@ -425,7 +425,7 @@ mod tests {
 
     #[test]
     fn every_replacement_adds_a_version_with_a_fresh_operation_identity() {
-        let current = metadata(4, &["starrocks"], serde_json::json!({}));
+        let current = metadata(4, &["trino"], serde_json::json!({}));
         let first = replace(&current, columns(&["a", "b"]), &[]).unwrap();
         let second = replace(&current, columns(&["a", "b"]), &[]).unwrap();
         assert_eq!(first.version().version_id, 5);
@@ -450,17 +450,17 @@ mod tests {
             first.version().representations,
             vec![SqlRepresentationWire {
                 sql: "select a, b from t2".to_string(),
-                dialect: VIEW_DIALECT_STARROCKS.to_string(),
+                dialect: VIEW_DIALECT_TRINO.to_string(),
             }]
         );
     }
 
     #[test]
     fn dropping_a_dialect_is_refused_unless_allowed() {
-        let current = metadata(2, &["starrocks", "Spark"], serde_json::json!({}));
+        let current = metadata(2, &["trino", "Spark"], serde_json::json!({}));
         let error = replace(&current, columns(&["a", "b"]), &[]).unwrap_err();
         assert!(error.contains("[\"spark\"]"), "{error}");
-        assert!(error.contains("[\"spark\", \"starrocks\"]"), "{error}");
+        assert!(error.contains("[\"spark\", \"trino\"]"), "{error}");
         assert!(error.contains(REPLACE_DROP_DIALECT_ALLOWED), "{error}");
 
         for allowed in ["true", "TRUE", "True"] {
@@ -489,18 +489,24 @@ mod tests {
         // An existing property counts as well as one set by this statement.
         let allowing = metadata(
             2,
-            &["starrocks", "spark"],
+            &["trino", "spark"],
             serde_json::json!({REPLACE_DROP_DIALECT_ALLOWED: "true"}),
         );
         assert!(replace(&allowing, columns(&["a", "b"]), &[]).is_ok());
         // Retaining every dialect needs no permission.
-        let starrocks_only = metadata(2, &["StarRocks"], serde_json::json!({}));
-        assert!(replace(&starrocks_only, columns(&["a", "b"]), &[]).is_ok());
+        let trino_only = metadata(2, &["TrInO"], serde_json::json!({}));
+        assert!(replace(&trino_only, columns(&["a", "b"]), &[]).is_ok());
+        let retired_only = metadata(2, &["starrocks"], serde_json::json!({}));
+        let error = replace(&retired_only, columns(&["a", "b"]), &[]).unwrap_err();
+        assert!(
+            error.contains("would drop SQL dialects [\"starrocks\"]"),
+            "{error}"
+        );
     }
 
     #[test]
     fn version_history_entries_must_be_a_positive_32_bit_integer() {
-        let current = metadata(1, &["starrocks"], serde_json::json!({}));
+        let current = metadata(1, &["trino"], serde_json::json!({}));
         for invalid in ["0", "-1", "abc", "", "+3", "2147483648", "1.5", "٣"] {
             assert!(
                 replace(
@@ -534,7 +540,7 @@ mod tests {
         // An invalid value already on the view is refused as well.
         let invalid_on_view = metadata(
             1,
-            &["starrocks"],
+            &["trino"],
             serde_json::json!({VERSION_HISTORY_NUM_ENTRIES: "0"}),
         );
         assert!(replace(&invalid_on_view, columns(&["a", "b"]), &[]).is_err());

@@ -29,29 +29,25 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.t0(c0 BIGINT NOT NULL, c1 BIGINT NOT NULL, c2 BIGINT NOT NULL)
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.t0(c0 BIGINT NOT NULL, c1 BIGINT NOT NULL, c2 BIGINT NOT NULL) WITH (format_version = 3);
 
 -- query 2
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.t1(c0 BIGINT NOT NULL, c1 BIGINT NOT NULL, c2 BIGINT NOT NULL)
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.t1(c0 BIGINT NOT NULL, c1 BIGINT NOT NULL, c2 BIGINT NOT NULL) WITH (format_version = 3);
 
 -- query 3
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.t2(c0 BIGINT NOT NULL, c1 BIGINT NOT NULL, c2 BIGINT NOT NULL)
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.t2(c0 BIGINT NOT NULL, c1 BIGINT NOT NULL, c2 BIGINT NOT NULL) WITH (format_version = 3);
 
 -- query 4
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.r(fp BIGINT NULL)
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.r(fp BIGINT ) WITH (format_version = 3);
 
 -- query 5
 -- @skip_result_check=true
 INSERT INTO ${case_db}.t0 (c0,c1,c2) VALUES
-  (0,0,0),(1,1,1),(2,2,2),(3,3,3),(4,4,4),
-  (5,5,5),(6,6,6),(7,7,7),(8,8,8),(9,9,9);
+  ROW(0,0,0),ROW(1,1,1),ROW(2,2,2),ROW(3,3,3),ROW(4,4,4),
+  ROW(5,5,5),ROW(6,6,6),ROW(7,7,7),ROW(8,8,8),ROW(9,9,9);
 
 -- query 6
 -- @skip_result_check=true

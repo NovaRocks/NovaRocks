@@ -154,20 +154,102 @@ fn canonical_constraint_actual_json_text_and_nested_conversion_keep_explicit_tar
     // with a real table added for this catalog/statistics/provider driver.
     for (sql, nested) in [
         (
-            "SELECT array_agg(json_object('2:3')) AS j, array_agg(CAST(json_object('2:3') AS VARCHAR)) AS s FROM orders",
+            "SELECT array_agg(JSON_OBJECT('2': 3)) AS j, array_agg(CAST(JSON_OBJECT('2': 3) AS VARCHAR)) AS s FROM orders",
             false,
         ),
         (
-            "SELECT CAST(array_sortby([json_object('k',1), json_object('k',2)], [2,1]) AS ARRAY<VARCHAR>) AS s FROM orders",
+            "SELECT CAST(array_sortby([json_object('k':1), json_object('k':2)], [2,1]) AS ARRAY<VARCHAR>) AS s FROM orders",
             true,
         ),
     ] {
         let owner = crate::compiler::compile_authored_aggregate_for_test(sql);
         let conversions = calls(&owner, CONVERSION);
-        assert!(
-            !conversions.is_empty(),
-            "actual logical-domain conversion must survive"
-        );
+        if nested {
+            // Explicit array CAST owns JSON conversion; the scalar None-mode
+            // byte conversion must not consume or retag its source first.
+            assert!(conversions.is_empty());
+            let mut cast_count = 0;
+            for (fragment, unit_node, unit) in
+                owner.plan().fragments().values().flat_map(|fragment| {
+                    fragment.nodes().values().filter_map(move |node| {
+                        node.expressions.as_ref().map(|unit| (fragment, node, unit))
+                    })
+                })
+            {
+                for expression in unit.definitions() {
+                    if let ContractExprKind::Cast {
+                        expr,
+                        array_failure_mode: Some(mode),
+                        target,
+                        ..
+                    } = &expression.kind
+                    {
+                        cast_count += 1;
+                        assert_eq!(
+                            *mode,
+                            novarocks_type_contract::ArrayCastFailureMode::ReportError
+                        );
+                        assert_eq!(target, expression.ty.data_type());
+                        let source = unit.definition(*expr).unwrap();
+                        assert_eq!(
+                            source.ty.child_at(0).unwrap().logical_type(),
+                            ValueLogicalType::Json
+                        );
+                        assert_eq!(
+                            expression.ty.child_at(0).unwrap().logical_type(),
+                            ValueLogicalType::Physical
+                        );
+                        assert_ne!(source.ty, expression.ty);
+                        let ContractExprKind::FunctionCall { function, .. } = &source.kind else {
+                            panic!("original array_sortby source");
+                        };
+                        assert_eq!(
+                            function.function_id.as_str(),
+                            "builtin.scalar/array_sortby/v1"
+                        );
+                        assert_eq!(function.result_type, source.ty);
+                        let receipt =
+                            loan(&owner, fragment, unit_node, source, &Control::default()).unwrap();
+                        assert_eq!(
+                            receipt.canonical_selection().unwrap().result_type,
+                            FunctionResultType::Scalar(source.ty.clone())
+                        );
+                        assert_loan_prefixes(&owner, fragment, unit_node, source);
+                    }
+                }
+            }
+            assert!(cast_count >= 1);
+            let arrays = calls(&owner, ARRAY_LITERAL);
+            assert!(!arrays.is_empty());
+            let mut json_values = 0;
+            let mut sort_keys = 0;
+            for (fragment, unit_node, source) in arrays {
+                let receipt =
+                    loan(&owner, fragment, unit_node, source, &Control::default()).unwrap();
+                assert_eq!(
+                    receipt.canonical_selection().unwrap().result_type,
+                    FunctionResultType::Scalar(source.ty.clone())
+                );
+                let DataType::List(item) = source.ty.data_type() else {
+                    panic!("original array source");
+                };
+                let domain = source.ty.child_at(0).unwrap().logical_type();
+                match (item.data_type(), domain) {
+                    (DataType::Utf8, ValueLogicalType::Json) => json_values += 1,
+                    (DataType::Int32, ValueLogicalType::Physical) => sort_keys += 1,
+                    actual => panic!("unexpected array source {actual:?}"),
+                }
+                assert_eq!(receipt.captured().request().logical_argument_count, 2);
+                assert_loan_prefixes(&owner, fragment, unit_node, source);
+            }
+            assert!(json_values >= 1, "original JSON values source retained");
+            assert!(sort_keys >= 1, "original Int32 sort key source retained");
+        } else {
+            assert!(
+                !conversions.is_empty(),
+                "actual scalar logical-domain conversion must survive"
+            );
+        }
         for (fragment, unit_node, source) in conversions {
             let receipt = assert_constraint(&owner, fragment, unit_node, source);
             let original = receipt.captured().request();
@@ -181,31 +263,8 @@ fn canonical_constraint_actual_json_text_and_nested_conversion_keep_explicit_tar
             };
             let target = receipt.captured().binding().result_constraint().unwrap();
             assert_eq!(target.logical_type(), ValueLogicalType::Physical);
-            if nested {
-                let DataType::List(before) = &value_type.data_type() else {
-                    panic!("JSON list input");
-                };
-                let DataType::List(after) = &target.data_type() else {
-                    panic!("text list target");
-                };
-                assert_eq!(
-                    value_type.child_at(0).unwrap().logical_type(),
-                    ValueLogicalType::Json
-                );
-                assert_eq!(
-                    target.child_at(0).unwrap().logical_type(),
-                    ValueLogicalType::Physical
-                );
-                assert_eq!(before.name(), after.name());
-                assert_eq!(before.is_nullable(), after.is_nullable());
-                assert_eq!(before.data_type(), &DataType::Utf8);
-                assert_eq!(after.data_type(), &DataType::Utf8);
-                assert!(before.metadata().is_empty());
-                assert!(after.metadata().is_empty());
-            } else {
-                assert_eq!(value_type.logical_type(), ValueLogicalType::Json);
-                assert_eq!(target.data_type().clone(), DataType::Utf8);
-            }
+            assert_eq!(value_type.logical_type(), ValueLogicalType::Json);
+            assert_eq!(target.data_type().clone(), DataType::Utf8);
             let operational = operational_arguments(&owner, &receipt, &Control::default()).unwrap();
             assert!(constant(&operational[0]).is_none());
             assert_loan_prefixes(&owner, fragment, unit_node, source);
@@ -245,43 +304,66 @@ fn canonical_constraint_actual_json_text_and_nested_conversion_keep_explicit_tar
 }
 
 #[test]
-fn canonical_constraint_actual_typed_empty_array_retains_full_json_item_target() {
-    // ARRAY<JSON>[] is the parser's explicit typed-array vocabulary, not a
-    // CAST([]) shortcut or a manually synthesized checked journal token.
-    let owner = crate::compiler::compile_authored_aggregate_for_test(
-        "SELECT ARRAY<JSON>[] AS a FROM orders",
-    );
-    let arrays = calls(&owner, ARRAY_LITERAL);
-    assert_eq!(arrays.len(), 1);
-    let (fragment, unit_node, source) = arrays[0];
-    let receipt = assert_constraint(&owner, fragment, unit_node, source);
-    assert!(receipt.arguments().is_empty());
-    assert!(receipt.captured().request().arguments.is_empty());
-    assert_eq!(receipt.captured().request().logical_argument_count, 0);
-    let target = receipt.captured().binding().result_constraint().unwrap();
-    assert!(!target.nullable());
-    assert_eq!(target.logical_type(), ValueLogicalType::Physical);
-    let DataType::List(item) = &target.data_type() else {
-        panic!("typed ARRAY target");
-    };
-    assert_eq!(item.name(), "item");
-    assert_eq!(item.data_type(), &DataType::Utf8);
-    assert_eq!(
-        target.child_at(0).unwrap().logical_type(),
-        ValueLogicalType::Json
-    );
-    assert!(item.metadata().is_empty());
-    let FunctionResultType::Scalar(selected) = &receipt.canonical_selection().unwrap().result_type
-    else {
-        panic!("array scalar selection");
-    };
-    let DataType::List(selected_item) = &selected.data_type() else {
-        unreachable!();
-    };
-    assert!(Arc::ptr_eq(item, selected_item));
-    assert_public_result_fields(&owner);
-    let result = owner.plan().result_port().unwrap();
-    assert_eq!(result.fields.len(), 1);
-    assert_eq!(&result.fields[0].ty, target);
-    assert_loan_prefixes(&owner, fragment, unit_node, source);
+fn typed_empty_array_retains_independent_unknown_owner_and_outer_json_cast() {
+    {
+        let owner = crate::compiler::compile_authored_aggregate_for_test(
+            "SELECT CAST(ARRAY[] AS ARRAY(JSON)) AS a FROM orders",
+        );
+        let arrays = calls(&owner, ARRAY_LITERAL);
+        assert_eq!(arrays.len(), 1);
+        let (fragment, unit_node, source) = arrays[0];
+        let receipt = loan(&owner, fragment, unit_node, source, &Control::default()).unwrap();
+        assert!(receipt.arguments().is_empty());
+        assert!(receipt.captured().request().arguments.is_empty());
+        assert_eq!(receipt.captured().request().logical_argument_count, 0);
+        assert!(receipt.captured().binding().result_constraint().is_none());
+        let selected = receipt.canonical_selection().unwrap();
+        assert_eq!(
+            selected.result_type,
+            FunctionResultType::Scalar(source.ty.clone())
+        );
+        assert_eq!(source.ty.child_at(0).unwrap().data_type(), &DataType::Null);
+        assert_eq!(
+            source.ty.child_at(0).unwrap().logical_type(),
+            ValueLogicalType::Physical
+        );
+        let mut json_casts = 0;
+        let unit = unit_node.expressions.as_ref().unwrap();
+        for expression in unit.definitions() {
+            if let ContractExprKind::Cast {
+                expr,
+                target,
+                array_failure_mode: Some(mode),
+                ..
+            } = &expression.kind
+            {
+                if unit.definition(*expr).unwrap().id != source.id {
+                    continue;
+                }
+                json_casts += 1;
+                assert_eq!(
+                    *mode,
+                    novarocks_type_contract::ArrayCastFailureMode::ReportError
+                );
+                assert_eq!(target, expression.ty.data_type());
+                let DataType::List(item) = expression.ty.data_type() else {
+                    panic!("outer JSON list target");
+                };
+                assert_eq!(item.name(), "item");
+                assert_eq!(item.data_type(), &DataType::Utf8);
+                assert!(item.is_nullable());
+                assert!(item.metadata().is_empty());
+                assert_eq!(
+                    expression.ty.child_at(0).unwrap().logical_type(),
+                    ValueLogicalType::Json
+                );
+                assert_public_result_fields(&owner);
+                let result = owner.plan().result_port().unwrap();
+                assert_eq!(result.fields.len(), 1);
+                assert_eq!(&result.fields[0].ty, &expression.ty);
+            }
+        }
+        assert_eq!(json_casts, 1);
+        assert_loan_prefixes(&owner, fragment, unit_node, source);
+    }
 }

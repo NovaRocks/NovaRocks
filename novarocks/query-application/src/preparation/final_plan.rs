@@ -588,6 +588,12 @@ impl std::error::Error for FinalPlanCompletionError {
     }
 }
 
+impl From<novarocks_sql::compiler::SqlCompileError> for FinalPlanCompletionError {
+    fn from(error: novarocks_sql::compiler::SqlCompileError) -> Self {
+        compiler_error(error)
+    }
+}
+
 fn access_error(error: FinalPlanAccessError) -> FinalPlanCompletionError {
     FinalPlanCompletionError::AccessCoverage {
         message: Arc::from(error.to_string()),

@@ -71,6 +71,7 @@ mod metadata_read_tests;
 pub(crate) mod publication;
 pub(crate) mod publication_dispatch;
 pub(crate) mod rest;
+pub(crate) mod staged_metadata_path;
 pub(crate) mod table_coordination;
 pub(crate) mod view_request;
 
@@ -260,12 +261,15 @@ pub(crate) struct StagedCreateMaterial {
 
 /// What the final publication of a staged create must show to be attributed
 /// to this operation (spec 5.7 items 4-6).
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct StagedPublicationExpectation {
     /// The UUID the stage froze.
     pub(crate) staged_table_uuid: uuid::Uuid,
     /// The snapshot this publication adds to `main`, if it writes data.
     pub(crate) snapshot_id: Option<i64>,
+    /// Expected table root for an explicitly relocated empty managed create.
+    pub(crate) final_table_location: Option<Arc<str>>,
+    pub(crate) final_metadata_path: Option<staged_metadata_path::StagedMetadataPath>,
     /// Properties NovaRocks itself names: the operation marker and any
     /// document properties.
     pub(crate) properties: Vec<(String, String)>,

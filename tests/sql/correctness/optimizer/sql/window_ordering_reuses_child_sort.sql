@@ -20,7 +20,7 @@
 -- 1. Lock in physical ordering reuse for standalone window planning.
 -- 2. A child Sort that already provides the required ORDER BY for a
 --    non-partitioned window must not be wrapped in another equivalent Sort.
-EXPLAIN VERBOSE
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
 SELECT SUM(v) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_sum
 FROM (
     SELECT id, v

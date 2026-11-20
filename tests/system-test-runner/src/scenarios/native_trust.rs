@@ -539,9 +539,12 @@ token = "${{ENV:{environment_name}}}"
         let mut connection =
             sql::SqlSession::new(context.sql_user(), context.trino_port(), context.deadline())?;
         const CATALOG: &str = "vended_parity";
+        let sql_proxy_uri = proxy_uri.replace('\'', "''");
+        let sql_warehouse = warehouse.replace('\'', "''");
+        let sql_minio_endpoint = minio_endpoint.replace('\'', "''");
         connection
             .execute(format!(
-                "CREATE EXTERNAL CATALOG {CATALOG} PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"rest\",\"uri\"=\"{proxy_uri}\",\"iceberg.catalog.warehouse\"=\"{warehouse}\",\"aws.s3.endpoint\"=\"{minio_endpoint}\",\"aws.s3.region\"=\"us-east-1\",\"aws.s3.enable_path_style_access\"=\"true\",\"credential.object-store-metadata.consumer-role\"=\"frontend\",\"credential.object-store-metadata.mode\"=\"static\",\"credential.object-store-metadata.name\"=\"{VENDED_METADATA_CREDENTIAL_NAME}\",\"credential.object-store-metadata.generation\"=\"{VENDED_METADATA_CREDENTIAL_GENERATION}\",\"credential.object-store-data.consumer-role\"=\"backend\",\"credential.object-store-data.mode\"=\"vended\",\"credential.data-credential-vending.consumer-role\"=\"backend\",\"credential.data-credential-vending.mode\"=\"static\",\"credential.data-credential-vending.name\"=\"{VENDED_EXECUTION_CREDENTIAL_NAME}\",\"credential.data-credential-vending.generation\"=\"{VENDED_EXECUTION_CREDENTIAL_GENERATION}\")"
+                "CREATE CATALOG {CATALOG} USING iceberg WITH (\"iceberg.catalog.type\" = 'rest',\"uri\" = '{sql_proxy_uri}',\"iceberg.catalog.warehouse\" = '{sql_warehouse}',\"aws.s3.endpoint\" = '{sql_minio_endpoint}',\"aws.s3.region\" = 'us-east-1',\"aws.s3.enable_path_style_access\" = 'true',\"credential.object-store-metadata.consumer-role\" = 'frontend',\"credential.object-store-metadata.mode\" = 'static',\"credential.object-store-metadata.name\" = '{VENDED_METADATA_CREDENTIAL_NAME}',\"credential.object-store-metadata.generation\" = '{VENDED_METADATA_CREDENTIAL_GENERATION}',\"credential.object-store-data.consumer-role\" = 'backend',\"credential.object-store-data.mode\" = 'vended',\"credential.data-credential-vending.consumer-role\" = 'backend',\"credential.data-credential-vending.mode\" = 'static',\"credential.data-credential-vending.name\" = '{VENDED_EXECUTION_CREDENTIAL_NAME}',\"credential.data-credential-vending.generation\" = '{VENDED_EXECUTION_CREDENTIAL_GENERATION}')"
             ))
             .context("create real REST-vended catalog for Native transport parity")?;
 

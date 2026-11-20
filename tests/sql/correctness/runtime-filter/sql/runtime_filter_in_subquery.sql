@@ -29,25 +29,23 @@ DROP TABLE IF EXISTS ${case_db}.t_rf_in_subquery_r;
 CREATE TABLE ${case_db}.t_rf_in_subquery_l (
     id INT,
     k INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 CREATE TABLE ${case_db}.t_rf_in_subquery_r (
     k INT,
     keep_flag INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t_rf_in_subquery_l VALUES
-    (1, 10),
-    (2, 20),
-    (3, 30),
-    (4, 40);
+    ROW(1, 10),
+    ROW(2, 20),
+    ROW(3, 30),
+    ROW(4, 40);
 
 INSERT INTO ${case_db}.t_rf_in_subquery_r VALUES
-    (20, 1),
-    (30, 1),
-    (50, 1),
-    (10, 0);
+    ROW(20, 1),
+    ROW(30, 1),
+    ROW(50, 1),
+    ROW(10, 0);
 
 SELECT id, k
 FROM ${case_db}.t_rf_in_subquery_l

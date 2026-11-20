@@ -562,14 +562,14 @@ fn call_author_preserves_first_control_and_actual_wide_edge_order() {
 #[test]
 fn primitive_cast_summaries_preserve_null_and_error_semantics_and_typed_refusals() {
     use arrow::{
-        array::{TimestampMicrosecondArray, TimestampSecondArray},
-        datatypes::TimeUnit,
+        array::{ListBuilder, StringBuilder, TimestampMicrosecondArray, TimestampSecondArray},
+        datatypes::{Field, TimeUnit},
     };
     use novarocks_expression::{CallAuthorError, CapabilityRefusal};
     use novarocks_functions::CastPrepareError;
     use novarocks_type_contract::{
-        ExpressionEffects, SemanticParameterId, SemanticParameterKey, SemanticParameterRef,
-        SemanticParameterValue,
+        ArrayCastFailureMode, ExpressionEffects, SemanticParameterId, SemanticParameterKey,
+        SemanticParameterRef, SemanticParameterValue,
     };
     use std::sync::Arc;
 
@@ -610,6 +610,34 @@ fn primitive_cast_summaries_preserve_null_and_error_semantics_and_typed_refusals
                 target,
                 decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
                 allow_throw_exception: allow,
+                array_failure_mode: None,
+            },
+        );
+        fixture.root(cast, EvaluationDemand::Value);
+    }
+    let mut strings = ListBuilder::new(StringBuilder::new());
+    strings.values().append_value("invalid integer");
+    strings.append(true);
+    let input = fixture.constant(
+        Arc::new(strings.finish()),
+        FunctionValueType::new(
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+            false,
+        ),
+    );
+    let target = DataType::List(Arc::new(Field::new("item", DataType::Int32, true)));
+    for mode in [
+        ArrayCastFailureMode::ReportError,
+        ArrayCastFailureMode::OutputNull,
+    ] {
+        let cast = fixture.add(
+            FunctionValueType::new(target.clone(), true),
+            ExprKind::Cast {
+                expr: input,
+                target: target.clone(),
+                decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
+                allow_throw_exception: allow,
+                array_failure_mode: Some(mode),
             },
         );
         fixture.root(cast, EvaluationDemand::Value);
@@ -630,6 +658,12 @@ fn primitive_cast_summaries_preserve_null_and_error_semantics_and_typed_refusals
         .for_use(contexts[&root].context)
         .unwrap();
     assert!(summary.may_raise_row_error);
+    for (root, may_raise_row_error) in sealed.root_use_ids()[2..].iter().zip([true, false]) {
+        let summary = authored.summaries[root]
+            .for_use(contexts[root].context)
+            .unwrap();
+        assert_eq!(summary.may_raise_row_error, may_raise_row_error);
+    }
 
     for invalid in [
         SemanticParameters::default(),
@@ -661,6 +695,7 @@ fn primitive_cast_summaries_preserve_null_and_error_semantics_and_typed_refusals
             target,
             decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
             allow_throw_exception: allow,
+            array_failure_mode: None,
         },
     );
     fixture.root(cast, EvaluationDemand::Value);

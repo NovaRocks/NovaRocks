@@ -21,15 +21,15 @@ DROP TABLE IF EXISTS ${case_db}.union_distinct_dist_r;
 CREATE TABLE ${case_db}.union_distinct_dist_l (k INT, s VARCHAR);
 CREATE TABLE ${case_db}.union_distinct_dist_r (k INT, s VARCHAR);
 INSERT INTO ${case_db}.union_distinct_dist_l VALUES
-    (1, 'a'),
-    (1, 'a'),
-    (2, NULL);
+    ROW(1, 'a'),
+    ROW(1, 'a'),
+    ROW(2, NULL);
 INSERT INTO ${case_db}.union_distinct_dist_r VALUES
-    (1, 'a'),
-    (3, 'c'),
-    (NULL, 'n');
-ANALYZE TABLE ${case_db}.union_distinct_dist_l;
-ANALYZE TABLE ${case_db}.union_distinct_dist_r;
+    ROW(1, 'a'),
+    ROW(3, 'c'),
+    ROW(NULL, 'n');
+ANALYZE ${case_db}.union_distinct_dist_l;
+ANALYZE ${case_db}.union_distinct_dist_r;
 
 -- @explain_contains=HASH AGGREGATE (LOCAL,
 -- @explain_contains=HASH AGGREGATE (DISTINCT_GLOBAL, group by: [k, s])

@@ -27,16 +27,15 @@
 CREATE TABLE ${case_db}.t_agg_count_distinct_single (
     g INT,
     s VARCHAR(20)
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t_agg_count_distinct_single VALUES
-    (1, 'a'),
-    (1, 'a'),
-    (1, 'b'),
-    (2, 'a'),
-    (2, NULL),
-    (2, 'c');
+    ROW(1, 'a'),
+    ROW(1, 'a'),
+    ROW(1, 'b'),
+    ROW(2, 'a'),
+    ROW(2, NULL),
+    ROW(2, 'c');
 
 SELECT
     g,

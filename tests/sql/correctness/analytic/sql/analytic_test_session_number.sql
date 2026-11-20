@@ -27,8 +27,7 @@
 CREATE TABLE ${case_db}.t0 (
     c0 INT,
     c1 BIGINT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 INSERT INTO ${case_db}.t0 SELECT generate_series, 4096 - generate_series FROM TABLE(generate_series(1, 4096, 3));
 INSERT INTO ${case_db}.t0 SELECT generate_series, generate_series FROM TABLE(generate_series(1, 4096, 2));
 
@@ -58,7 +57,7 @@ SELECT sum(session), count(session) FROM (SELECT c0, c1, session_number(c0, 2) O
 
 -- query 8
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.empty_tbl LIKE ${case_db}.t0;
+CREATE TABLE ${case_db}.empty_tbl (LIKE ${case_db}.t0);
 
 -- query 9
 -- @order_sensitive=true

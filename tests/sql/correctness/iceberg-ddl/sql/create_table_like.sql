@@ -29,17 +29,19 @@ CREATE TABLE ${case_db}.src (
   name STRING,
   v BIGINT
 ) COMMENT 'source-table';
-CREATE TABLE ${case_db}.dst LIKE ${case_db}.src;
+CREATE TABLE ${case_db}.dst (LIKE ${case_db}.src);
 
 -- query 2
--- @result_contains=`id`
--- @result_contains=`name`
--- @result_contains=`v`
+-- @result_contains=id integer
+-- @result_contains=name varchar
+-- @result_contains=v bigint
+-- @result_contains=format = 'PARQUET'
+-- @result_contains=format_version = 2
 SHOW CREATE TABLE ${case_db}.dst;
 
 -- query 3
 -- @skip_result_check=true
-INSERT INTO ${case_db}.dst VALUES (1, 'alice', 100), (2, 'bob', 200);
+INSERT INTO ${case_db}.dst VALUES ROW(1, 'alice', 100), ROW(2, 'bob', 200);
 
 -- query 4
 SELECT count(1) AS n FROM ${case_db}.dst;

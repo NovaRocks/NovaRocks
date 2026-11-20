@@ -33,28 +33,11 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE EXTERNAL CATALOG mvrw_${uuid0}
-PROPERTIES (
-  "type" = "iceberg",
-  "iceberg.catalog.type" = "rest",
-  "uri" = "${iceberg_rest_uri}",
-  "warehouse" = "${iceberg_rest_warehouse}",
-  "aws.s3.endpoint" = "${oss_endpoint}",
-  "credential.object-store-metadata.consumer-role" = "frontend",
-  "credential.object-store-metadata.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-metadata.name" = "${iceberg_object_store_metadata_credential_name}",
-  "credential.object-store-metadata.generation" = "${iceberg_object_store_credential_generation}",
-  "credential.object-store-data.consumer-role" = "backend",
-  "credential.object-store-data.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-data.name" = "${iceberg_object_store_data_credential_name}",
-  "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
-  "aws.s3.region" = "${oss_region}",
-  "aws.s3.enable_path_style_access" = "${oss_path_style}"
-);
+CREATE CATALOG mvrw_${uuid0} USING iceberg WITH ("iceberg.catalog.type" = 'rest', "uri" = '${iceberg_rest_uri}', "warehouse" = '${iceberg_rest_warehouse}', "aws.s3.endpoint" = '${oss_endpoint}', "credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-metadata.name" = '${iceberg_object_store_metadata_credential_name}', "credential.object-store-metadata.generation" = '${iceberg_object_store_credential_generation}', "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-data.name" = '${iceberg_object_store_data_credential_name}', "credential.object-store-data.generation" = '${iceberg_object_store_credential_generation}', "aws.s3.region" = '${oss_region}', "aws.s3.enable_path_style_access" = '${oss_path_style}');
 
 -- query 2
 -- @skip_result_check=true
-CREATE DATABASE mvrw_${uuid0}.ns_${uuid0};
+CREATE SCHEMA mvrw_${uuid0}.ns_${uuid0};
 
 -- query 3
 -- @skip_result_check=true
@@ -63,7 +46,7 @@ CREATE TABLE mvrw_${uuid0}.ns_${uuid0}.orders (
   region STRING,
   day STRING,
   amount BIGINT
-) TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+) WITH (format_version = 3);
 
 -- query 4
 -- @skip_result_check=true
@@ -84,15 +67,12 @@ USE mvrw_${uuid0}.ns_${uuid0};
 
 -- query 7
 -- @skip_result_check=true
-CREATE MATERIALIZED VIEW agg_mv
-DISTRIBUTED BY HASH(region) BUCKETS 1
-PROPERTIES ('storage_engine' = 'iceberg')
-AS SELECT region, day, COUNT(*) AS c, SUM(amount) AS s
+CREATE MATERIALIZED VIEW agg_mv AS SELECT region, day, COUNT(*) AS c, SUM(amount) AS s
 FROM orders GROUP BY region, day;
 
 -- query 8
 -- @skip_result_check=true
-REFRESH MATERIALIZED VIEW agg_mv WITH SYNC MODE;
+REFRESH MATERIALIZED VIEW agg_mv;
 
 -- query 9
 -- AVG rollup is not supported -> no rewrite
@@ -120,15 +100,12 @@ SELECT region, SUM(amount) FROM orders WHERE amount > 5 GROUP BY region;
 
 -- query 13
 -- @skip_result_check=true
-CREATE MATERIALIZED VIEW agg_mv_d1
-DISTRIBUTED BY HASH(region) BUCKETS 1
-PROPERTIES ('storage_engine' = 'iceberg')
-AS SELECT region, day, COUNT(*) AS c, SUM(amount) AS s
+CREATE MATERIALIZED VIEW agg_mv_d1 AS SELECT region, day, COUNT(*) AS c, SUM(amount) AS s
 FROM orders WHERE day = 'd1' GROUP BY region, day;
 
 -- query 14
 -- @skip_result_check=true
-REFRESH MATERIALIZED VIEW agg_mv_d1 WITH SYNC MODE;
+REFRESH MATERIALIZED VIEW agg_mv_d1;
 
 -- query 15
 -- the WHERE-scoped MV (day='d1') does not contain the unfiltered query range;
@@ -153,12 +130,12 @@ DROP MATERIALIZED VIEW IF EXISTS ns_${uuid0}.agg_mv;
 -- query 18
 -- @cleanup=true
 -- @skip_result_check=true
-DROP TABLE IF EXISTS mvrw_${uuid0}.ns_${uuid0}.orders FORCE;
+DROP TABLE IF EXISTS mvrw_${uuid0}.ns_${uuid0}.orders ;
 
 -- query 19
 -- @cleanup=true
 -- @skip_result_check=true
-DROP DATABASE IF EXISTS mvrw_${uuid0}.ns_${uuid0};
+DROP SCHEMA IF EXISTS mvrw_${uuid0}.ns_${uuid0};
 
 -- query 20
 -- @cleanup=true

@@ -226,11 +226,18 @@ pub fn resolve_existing_table_target(
     })
 }
 
-pub fn resolve_namespace_target(
+#[derive(Debug)]
+pub(crate) struct NamespaceTarget {
+    pub(crate) provider_id: ConnectorProviderId,
+    pub(crate) catalog: String,
+    pub(crate) namespace: String,
+}
+
+pub(crate) fn resolve_namespace_target(
     admission: &impl CatalogAdmission,
     name: &ObjectName,
     current_catalog: Option<&str>,
-) -> Result<TargetBackend, TargetResolutionError> {
+) -> Result<NamespaceTarget, TargetResolutionError> {
     let resolved = resolve_catalog_namespace_name(
         name.parts.as_slice(),
         Some(current_catalog.unwrap_or(DEFAULT_CATALOG_NAME)),
@@ -242,11 +249,10 @@ pub fn resolve_namespace_target(
     }
 
     let provider_id = require_catalog_admission(admission, &resolved.catalog)?;
-    Ok(TargetBackend {
+    Ok(NamespaceTarget {
         provider_id,
         catalog: resolved.catalog,
         namespace: resolved.namespace,
-        table: String::new(),
     })
 }
 

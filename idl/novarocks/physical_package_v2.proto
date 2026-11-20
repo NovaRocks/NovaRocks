@@ -433,6 +433,11 @@ message LambdaExpression {
   repeated uint32 parameter_value_type_ids = 1;
   optional uint32 body_expr_id = 2;
 }
+enum ArrayCastFailureMode {
+  ARRAY_CAST_FAILURE_MODE_UNSPECIFIED = 0;
+  REPORT_ERROR = 1;
+  OUTPUT_NULL = 2;
+}
 message CastExpression {
   optional uint32 expr_id = 1;
   optional uint32 target_carrier_type_id = 2;
@@ -440,6 +445,9 @@ message CastExpression {
   // Required: absence is not false. The reference retains the original scope,
   // independently of the frozen DecimalOverflowPolicy enum above.
   novarocks.physical_semantics_v2.SemanticParameterRef allow_throw_exception = 4;
+  // Absent retains the existing scalar/implicit conversion policy. Present
+  // values identify the explicit array conversion and its own data failures.
+  optional ArrayCastFailureMode array_failure_mode = 5;
 }
 message IsNullExpression {
   optional uint32 expr_id = 1;

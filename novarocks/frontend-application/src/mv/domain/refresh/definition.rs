@@ -43,23 +43,14 @@ pub fn read_stored_mv_query(
     target: &novarocks_types::naming::TableIdentity,
 ) -> Result<novarocks_parser::ast::Query, novarocks_sql::analyze_error::AnalyzeError> {
     use novarocks_sql::analyze_error::{AnalyzeError, StoredDefinition};
-    let statements = novarocks_parser::parse(sql).map_err(|error| {
+    novarocks_parser::parser::parse_query(sql).map_err(|error| {
         AnalyzeError::stored_definition_parse_failure(
             StoredDefinition::materialized_view(target.fqn()),
             std::sync::Arc::from(sql),
             error,
             None,
         )
-    })?;
-    let mut statements = statements.into_iter();
-    match (statements.next(), statements.next()) {
-        (Some(novarocks_parser::ast::Statement::Query(query)), None) => Ok(query),
-        _ => Err(AnalyzeError::stored_definition_not_query(
-            StoredDefinition::materialized_view(target.fqn()),
-            std::sync::Arc::from(sql),
-            None,
-        )),
-    }
+    })
 }
 
 #[cfg(test)]
@@ -79,16 +70,42 @@ mod tests {
     }
 
     #[test]
-    fn parse_stored_select_rejects_non_query_statement() {
+    fn stored_mv_query_accepts_trino_delimited_names_without_rewriting() {
+        use novarocks_parser::ast::{SelectItem, SetExpr};
         let target = novarocks_types::naming::TableIdentity::new("ice", "db", "mv");
-        let error = read_stored_mv_query("DELETE FROM ice.db.t", &target).unwrap_err();
-        assert_eq!(error.code().as_str(), "sql.analyze.invalid_view");
-        assert_eq!(error.stored_definition().unwrap().name(), "ice.db.mv");
-        assert_eq!(
-            error.stored_view_definition_source(),
-            Some("DELETE FROM ice.db.t")
-        );
-        assert!(std::error::Error::source(&error).is_none());
+        let sql = "SELECT /* preserve */  1 AS \"MiXeD\"";
+        let query = read_stored_mv_query(sql, &target).unwrap();
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("expected SELECT");
+        };
+        let SelectItem::SingleColumn(column) = &select.projection[0] else {
+            panic!("expected ordinary projection");
+        };
+        let alias = column.alias.as_ref().unwrap();
+        assert_eq!(alias.value, "MiXeD");
+        assert!(alias.quoted);
+        assert_eq!(&sql[alias.span.start()..alias.span.end()], "\"MiXeD\"");
+    }
+
+    #[test]
+    fn parse_stored_select_rejects_non_query_and_legacy_sql() {
+        let target = novarocks_types::naming::TableIdentity::new("ice", "db", "mv");
+        for sql in [
+            "DELETE FROM ice.db.t",
+            "SELECT 1; SELECT 2",
+            "SELECT `a` FROM t",
+        ] {
+            let original = novarocks_parser::parser::parse_query(sql).unwrap_err();
+            let error = read_stored_mv_query(sql, &target).unwrap_err();
+            assert_eq!(error.code().as_str(), "sql.analyze.invalid_view");
+            assert_eq!(error.stored_definition().unwrap().name(), "ice.db.mv");
+            assert_eq!(error.stored_view_definition_source(), Some(sql));
+            assert_eq!(
+                std::error::Error::source(&error)
+                    .and_then(|cause| cause.downcast_ref::<novarocks_parser::ParserError>()),
+                Some(&original)
+            );
+        }
     }
 
     #[test]
@@ -96,7 +113,7 @@ mod tests {
         use novarocks_sql::analyze_error::StoredDefinitionKind;
         let target = novarocks_types::naming::TableIdentity::new("ice", "db", "mv");
         let sql = "SELECT\n (";
-        let parser_error = novarocks_parser::parse(sql).unwrap_err();
+        let parser_error = novarocks_parser::parser::parse_query(sql).unwrap_err();
         let parser_public = parser_error.to_user_error(sql);
         let error = read_stored_mv_query(sql, &target).unwrap_err();
         assert_eq!(error.code().as_str(), "sql.analyze.invalid_view");

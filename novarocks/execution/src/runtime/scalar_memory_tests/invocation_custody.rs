@@ -172,9 +172,9 @@ fn runtime_invocation_memory_actual_sql_compiler_project_common_helper_and_lossl
     {
         for data in [false, true] {
             let sql = if data {
-                "SELECT json_object([n], v) AS j FROM t"
+                "SELECT json_object([n]: v) AS j FROM t"
             } else {
-                "SELECT json_object(k, v) AS j FROM t"
+                "SELECT json_object(k: v) AS j FROM t"
             };
             let (program, site, input) = project(sql);
             let binding = binding();
@@ -284,7 +284,7 @@ fn runtime_invocation_memory_actual_sql_compiler_project_common_helper_and_lossl
 
 #[test]
 fn runtime_invocation_memory_actual_sql_frame_cached_host_rebind_and_missing_latch_before_body() {
-    let (program, site, input) = project("SELECT json_object(k, v) AS j FROM t");
+    let (program, site, input) = project("SELECT json_object(k: v) AS j FROM t");
     for rebind in [false, true] {
         let binding = binding();
         let mut control = runtime_control(rebind.then_some(&binding));
@@ -347,7 +347,7 @@ fn runtime_invocation_memory_actual_sql_frame_cached_host_rebind_and_missing_lat
 fn runtime_invocation_memory_actual_sql_ordered_filter_or_scan_suppresses_and_maps_selected_data() {
     {
         let mut selected = None;
-        for program in programs("SELECT n FROM t WHERE flag AND json_object([n], v) IS NULL") {
+        for program in programs("SELECT n FROM t WHERE flag AND json_object([n]: v) IS NULL") {
             for node in program.graph().nodes() {
                 let predicates = match node.kind() {
                     ProgramNodeKind::Filter { predicates, .. } => predicates.as_ref(),

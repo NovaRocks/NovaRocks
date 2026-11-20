@@ -24,15 +24,13 @@
 -- unit tests in `connector::iceberg::catalog::schema_update`.
 
 -- query 1
-CREATE DATABASE iceberg_ddl_cat_${suite_uuid0}.schema_nested_${uuid0};
+CREATE SCHEMA iceberg_ddl_cat_${suite_uuid0}.schema_nested_${uuid0};
 USE iceberg_ddl_cat_${suite_uuid0}.schema_nested_${uuid0};
 DROP TABLE IF EXISTS people;
 CREATE TABLE people (
   id INT,
-  address STRUCT<street STRING, city STRING>
-) TBLPROPERTIES (
-  "format-version" = "2"
-);
+  address ROW(street STRING, city STRING)
+) WITH (format_version = 2);
 
 -- query 2
 ALTER TABLE people ADD COLUMN address.zip INT;
@@ -41,7 +39,7 @@ ALTER TABLE people ADD COLUMN address.zip INT;
 ALTER TABLE people RENAME COLUMN address.zip TO postal_code;
 
 -- query 4
-ALTER TABLE people MODIFY COLUMN address.postal_code BIGINT;
+ALTER TABLE people ALTER COLUMN address.postal_code SET DATA TYPE BIGINT;
 
 -- query 5
 ALTER TABLE people DROP COLUMN address.city;
@@ -56,4 +54,4 @@ ALTER TABLE people DROP COLUMN address.bogus;
 
 -- query 8
 DROP TABLE people;
-DROP DATABASE iceberg_ddl_cat_${suite_uuid0}.schema_nested_${uuid0};
+DROP SCHEMA iceberg_ddl_cat_${suite_uuid0}.schema_nested_${uuid0};

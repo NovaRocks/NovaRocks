@@ -118,6 +118,7 @@ fn assert_attempt_at_provider(
 
 fn property_inputs(
     runtime: spi::ConnectorControlRuntimeId,
+    binding: &spi::ConnectorProviderBindingKey,
 ) -> Arc<novarocks_query_application::sql::session::registry::SessionPropertyInputs> {
     use novarocks_query_application::sql::session::registry::*;
     struct Factory(spi::ConnectorProviderId);
@@ -153,6 +154,7 @@ fn property_inputs(
             CatalogPropertyIdentity {
                 attachment_id: uuid::Uuid::nil(),
                 control_runtime_id: runtime,
+                binding_key: binding.clone(),
                 instance_id,
                 provider_id,
                 generation: 1,
@@ -176,7 +178,7 @@ fn ordinary_and_pending_begin_bind_exact_catalog_to_original_attempt() {
         let original_session = Arc::new(Mutex::new(None));
         let receiving = WriteBeginReceiving::for_statement(
             Arc::clone(&original_session),
-            property_inputs(lease.control_runtime_id()),
+            property_inputs(lease.control_runtime_id(), lease.session().binding_key()),
         );
         let stop = spi::ConnectorStopOwner::new();
         let (context, sink) = attempt_context(&stop);

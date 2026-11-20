@@ -29,29 +29,26 @@ DROP TABLE IF EXISTS ${case_db}.t_join_right_semi_residual_r;
 CREATE TABLE ${case_db}.t_join_right_semi_residual_l (
   id INT,
   score INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 CREATE TABLE ${case_db}.t_join_right_semi_residual_r (
   id INT,
   threshold INT,
   tag STRING
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 INSERT INTO ${case_db}.t_join_right_semi_residual_l VALUES
-  (1, 10),
-  (1, 1),
-  (2, 5),
-  (3, 7),
-  (NULL, 100);
+  ROW(1, 10),
+  ROW(1, 1),
+  ROW(2, 5),
+  ROW(3, 7),
+  ROW(NULL, 100);
 INSERT INTO ${case_db}.t_join_right_semi_residual_r VALUES
-  (1, 5, 'r1_pass'),
-  (1, 20, 'r1_fail'),
-  (2, 3, 'r2_pass'),
-  (3, 9, 'r3_fail'),
-  (4, 1, 'r4_nomatch'),
-  (NULL, 1, 'rnull');
+  ROW(1, 5, 'r1_pass'),
+  ROW(1, 20, 'r1_fail'),
+  ROW(2, 3, 'r2_pass'),
+  ROW(3, 9, 'r3_fail'),
+  ROW(4, 1, 'r4_nomatch'),
+  ROW(NULL, 1, 'rnull');
 SELECT r.id, r.threshold, r.tag
-FROM ${case_db}.t_join_right_semi_residual_l l
-RIGHT SEMI JOIN ${case_db}.t_join_right_semi_residual_r r
-  ON l.id = r.id AND l.score > r.threshold
+FROM ${case_db}.t_join_right_semi_residual_r r
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t_join_right_semi_residual_l l WHERE l.id = r.id AND l.score > r.threshold)
 ORDER BY r.id, r.threshold;

@@ -34,9 +34,10 @@ use novarocks_mv_application::management::{
     MvResumeDeclaration, ProcessIncarnation, ReadmissionChallenge, ReadmissionMode,
     ReadmissionPermit,
 };
-use novarocks_parser::ast::{CallStatement, LiteralKind, MaintenanceValue, ProcedureArgumentMode};
+use novarocks_parser::ast::LiteralKind;
 use novarocks_query_application::api::{QueryResult, build_utf8_table_query_result};
 use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
+use novarocks_query_application::sql::PreparedMaintenanceCall;
 use novarocks_spi::connector::{ConnectorInstanceId, ConnectorTableIdentity};
 
 use crate::mv::domain::management_handover::MvOwnerHandoverOutcome;
@@ -108,7 +109,7 @@ impl ManagementCall {
     /// A procedure this module owns but cannot decode is an error, never a
     /// route miss: silently falling through would let a mistyped management
     /// statement be reported as an unknown procedure.
-    pub(crate) fn try_decode(statement: &CallStatement) -> Result<Option<Self>, String> {
+    pub(crate) fn try_decode(statement: &PreparedMaintenanceCall) -> Result<Option<Self>, String> {
         let [part] = statement.procedure.parts.as_slice() else {
             return Ok(None);
         };
@@ -149,7 +150,7 @@ pub(crate) fn try_execute_management_call(
     audit: Option<&Arc<dyn ManagementAuditSink>>,
     operations: &dyn MvManagementOperations,
     session_principal: &str,
-    statement: &CallStatement,
+    statement: &PreparedMaintenanceCall,
 ) -> Result<Option<StatementResult>, String> {
     let Some(call) = ManagementCall::try_decode(statement)? else {
         return Ok(None);
@@ -523,11 +524,12 @@ fn new_challenge() -> ReadmissionChallenge {
 }
 
 fn positional_text_arguments(
-    statement: &CallStatement,
+    statement: &PreparedMaintenanceCall,
     procedure: &str,
     arity: usize,
 ) -> Result<Vec<String>, String> {
-    if statement.argument_mode == ProcedureArgumentMode::Named {
+    if statement.argument_mode == novarocks_sql::semantic::command::ProcedureArgumentModeSql::Named
+    {
         return Err(format!(
             "{procedure} takes positional arguments; named arguments are not accepted"
         ));
@@ -549,7 +551,7 @@ fn positional_text_arguments(
                     index + 1
                 ));
             }
-            let MaintenanceValue::Literal(literal) = &argument.value else {
+            let Some(literal) = argument.value.literal() else {
                 return Err(format!(
                     "{procedure} argument {} must be a string literal",
                     index + 1
@@ -581,16 +583,14 @@ fn positional_text_arguments(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use novarocks_parser::ast::{MaintenanceStatement, Statement};
-    use novarocks_parser::parse;
+    use novarocks_parser::{ast::TrinoStatement, parser::parse_statement};
 
-    fn call(source: &str) -> CallStatement {
-        let statements = parse(source).expect("CALL should parse");
-        let [Statement::Maintenance(MaintenanceStatement::Call(statement))] = statements.as_slice()
+    fn call(source: &str) -> PreparedMaintenanceCall {
+        let TrinoStatement::Call(statement) = parse_statement(source).expect("CALL should parse")
         else {
             panic!("expected one CALL statement for {source}");
         };
-        statement.clone()
+        PreparedMaintenanceCall::from_trino(&statement).unwrap()
     }
 
     fn decode(source: &str) -> Result<Option<ManagementCall>, String> {
@@ -598,9 +598,44 @@ mod tests {
     }
 
     #[test]
+    fn trino_call_retains_the_management_target_and_original_authority_gate() {
+        use novarocks_parser::{ast::TrinoStatement, parser};
+
+        let sql = "CALL novarocks_mv_management_status('ice', 'db.with.dots', 'orders.mv')";
+        let TrinoStatement::Call(parsed) = parser::parse_statement(sql).unwrap() else {
+            panic!("expected CALL");
+        };
+        let modern = PreparedMaintenanceCall::from_trino(&parsed).unwrap();
+        let expected = ManagementCall::Status {
+            target: ManagementCallTarget {
+                catalog: "ice".into(),
+                database: "db.with.dots".into(),
+                name: "orders.mv".into(),
+            },
+        };
+        assert_eq!(
+            ManagementCall::try_decode(&modern).unwrap(),
+            Some(expected.clone())
+        );
+        assert_eq!(
+            ManagementCall::try_decode(&call(sql)).unwrap(),
+            Some(expected)
+        );
+        let result =
+            try_execute_management_call(None, None, &UnreachableOperations, "root", &modern);
+        let Err(error) = result else {
+            panic!("expected missing management authority");
+        };
+        assert_eq!(
+            error,
+            "MV management procedures require the serving product's management authority"
+        );
+    }
+
+    #[test]
     fn another_procedure_is_a_route_miss_not_an_error() {
         assert_eq!(
-            decode("CALL ice.system.novarocks_imv_stateless_rebuild(table => 'db.mv')")
+            decode("CALL ice.system.novarocks_imv_stateless_rebuild(\"table\" => 'db.mv')")
                 .expect("another procedure decodes as a miss"),
             None
         );
@@ -745,7 +780,7 @@ mod tests {
         )
     }
 
-    fn set_owner_call(new_deployment: &str, challenge: &str) -> CallStatement {
+    fn set_owner_call(new_deployment: &str, challenge: &str) -> PreparedMaintenanceCall {
         call(&format!(
             "CALL novarocks_mv_set_owner('ice', 'db', 'mv', '{challenge}', '{new_deployment}')"
         ))

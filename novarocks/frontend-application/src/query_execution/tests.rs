@@ -89,11 +89,7 @@ pub(super) fn complete_dependency_fixture(
         SqlStatementInput, builtin_sql_function_catalog,
     };
 
-    let mut statements = novarocks_parser::parse(sql).unwrap();
-    assert_eq!(statements.len(), 1);
-    let novarocks_parser::ast::Statement::Query(query) = statements.pop().unwrap() else {
-        panic!("expected one query");
-    };
+    let query = novarocks_parser::parser::parse_query(sql).unwrap();
     let control = SqlCompileControl::unbounded();
     let request = SqlFinalPlanCompileRequest::new(
         PlanVersionId::try_new([83; 16]).unwrap(),

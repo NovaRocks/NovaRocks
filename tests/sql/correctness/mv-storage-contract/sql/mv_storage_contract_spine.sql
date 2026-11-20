@@ -35,28 +35,11 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE EXTERNAL CATALOG mvsc_${uuid0}
-PROPERTIES (
-  "type" = "iceberg",
-  "iceberg.catalog.type" = "rest",
-  "uri" = "${iceberg_rest_uri}",
-  "warehouse" = "${iceberg_rest_warehouse}",
-  "credential.object-store-metadata.consumer-role" = "frontend",
-  "credential.object-store-metadata.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-metadata.name" = "${iceberg_object_store_metadata_credential_name}",
-  "credential.object-store-metadata.generation" = "${iceberg_object_store_credential_generation}",
-  "credential.object-store-data.consumer-role" = "backend",
-  "credential.object-store-data.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-data.name" = "${iceberg_object_store_data_credential_name}",
-  "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
-  "aws.s3.endpoint" = "${oss_endpoint}",
-  "aws.s3.region" = "${oss_region}",
-  "aws.s3.enable_path_style_access" = "${oss_path_style}"
-);
+CREATE CATALOG mvsc_${uuid0} USING iceberg WITH ("iceberg.catalog.type" = 'rest', "uri" = '${iceberg_rest_uri}', "warehouse" = '${iceberg_rest_warehouse}', "credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-metadata.name" = '${iceberg_object_store_metadata_credential_name}', "credential.object-store-metadata.generation" = '${iceberg_object_store_credential_generation}', "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-data.name" = '${iceberg_object_store_data_credential_name}', "credential.object-store-data.generation" = '${iceberg_object_store_credential_generation}', "aws.s3.endpoint" = '${oss_endpoint}', "aws.s3.region" = '${oss_region}', "aws.s3.enable_path_style_access" = '${oss_path_style}');
 
 -- query 2
 -- @skip_result_check=true
-CREATE DATABASE mvsc_${uuid0}.ns_${uuid0};
+CREATE SCHEMA mvsc_${uuid0}.ns_${uuid0};
 
 -- query 3
 -- @skip_result_check=true
@@ -64,7 +47,7 @@ CREATE TABLE mvsc_${uuid0}.ns_${uuid0}.orders (
   region STRING,
   channel STRING,
   amount BIGINT
-) TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+) WITH (format_version = 3);
 
 -- query 4
 -- Four groups over a few thousand rows, so the aggregate view is a decisive
@@ -86,11 +69,7 @@ USE mvsc_${uuid0}.ns_${uuid0};
 
 -- query 7
 -- @skip_result_check=true
-CREATE MATERIALIZED VIEW orders_rollup
-DISTRIBUTED BY HASH(region) BUCKETS 1
-REFRESH DEFERRED MANUAL
-PROPERTIES ('storage_engine' = 'iceberg')
-AS SELECT region, channel, SUM(amount) AS total, COUNT(*) AS rows_in
+CREATE MATERIALIZED VIEW orders_rollup WITH (refresh_policy = 'MANUAL') AS SELECT region, channel, SUM(amount) AS total, COUNT(*) AS rows_in
 FROM orders
 GROUP BY region, channel;
 
@@ -118,7 +97,7 @@ SELECT definition FROM system.metadata.materialized_views WHERE catalog_name = '
 
 -- query 10
 -- @skip_result_check=true
-REFRESH MATERIALIZED VIEW orders_rollup WITH SYNC MODE;
+REFRESH MATERIALIZED VIEW orders_rollup;
 
 -- query 11
 SELECT region, channel, total, rows_in FROM orders_rollup ORDER BY region, channel;
@@ -177,7 +156,7 @@ SELECT * FROM system.runtime.materialized_view_states WHERE catalog_name = 'mvsc
 -- @expect_error_tier=drift
 -- @expect_error=MV target requires a successful fresh Current observation
 USE mvsc_${uuid0}.ns_${uuid0};
-REFRESH MATERIALIZED VIEW orders_rollup WITH SYNC MODE;
+REFRESH MATERIALIZED VIEW orders_rollup;
 
 -- query 19
 -- The operator declares the previous process isolated. The directive reads the
@@ -195,13 +174,15 @@ SELECT * FROM system.runtime.materialized_view_states WHERE catalog_name = 'mvsc
 
 -- query 21
 -- @skip_result_check=true
-INSERT INTO mvsc_${uuid0}.ns_${uuid0}.orders VALUES ('east', 'online', 1000), ('west', 'store', 2000);
+INSERT INTO mvsc_${uuid0}.ns_${uuid0}.orders VALUES ROW('east', 'online', 1000), ROW('west', 'store', 2000);
 
 -- query 22
 -- @skip_result_check=true
 -- @mv_rest_document_graph=ns_${uuid0}.orders_rollup,publications=2,slot-changes=1,table-commits=4,full-overwrite-last=true
 USE mvsc_${uuid0}.ns_${uuid0};
-REFRESH MATERIALIZED VIEW orders_rollup FULL WITH SYNC MODE;
+SET SESSION "mvsc_${uuid0}".incremental_refresh_enabled = false;
+REFRESH MATERIALIZED VIEW orders_rollup;
+RESET SESSION "mvsc_${uuid0}".incremental_refresh_enabled;
 
 -- query 23
 SELECT region, channel, total, rows_in FROM orders_rollup ORDER BY region, channel;
@@ -210,8 +191,8 @@ SELECT region, channel, total, rows_in FROM orders_rollup ORDER BY region, chann
 -- @skip_result_check=true
 USE mvsc_${uuid0}.ns_${uuid0};
 DROP MATERIALIZED VIEW orders_rollup;
-DROP TABLE mvsc_${uuid0}.ns_${uuid0}.orders FORCE;
-DROP DATABASE mvsc_${uuid0}.ns_${uuid0};
+DROP TABLE mvsc_${uuid0}.ns_${uuid0}.orders ;
+DROP SCHEMA mvsc_${uuid0}.ns_${uuid0};
 -- Dropping the attachment matters: two attachments onto one warehouse make the
 -- same physical MV discoverable under two catalog names, and its management
 -- binds to whichever attachment discovered it first -- so the next case's

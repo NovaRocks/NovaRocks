@@ -224,12 +224,18 @@ impl PreparedMutationFacts {
         };
         let from = mutation_match_select(&mut query)?;
         let (target_factor, preparations) = match self.as_ref() {
-            Self::Update(p) => (&mut from.relation, p.mor_preparations.as_ref()),
+            Self::Update(p) => {
+                let target = match from {
+                    novarocks_parser::ast::Relation::Join(join) => join.left.as_mut(),
+                    relation => relation,
+                };
+                (target, p.mor_preparations.as_ref())
+            }
             Self::Merge(p) => {
-                let [join] = from.joins.as_mut_slice() else {
+                let novarocks_parser::ast::Relation::Join(join) = from else {
                     return Err("generated MERGE lost its match target join".into());
                 };
-                (&mut join.relation, p.mor_preparations.as_ref())
+                (join.right.as_mut(), p.mor_preparations.as_ref())
             }
         };
         let preparations = preparations.ok_or("MOR lost its original match preparation")?;
@@ -359,20 +365,31 @@ pub(crate) async fn compile_routed_mutation_write(
     let control = crate::query_execution::planning::sql_compile_control_from_execution(execution);
     let assignments = mutation_write_assignments(&query, &kind, &routes, &control)
         .map_err(DmlError::from_compile)?;
-    let mut preparation = novarocks_sql::compiler::SqlDmlCatalogPreparation::try_new_for_intent(
-        novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(query)),
-        novarocks_sql::compiler::SqlSessionContext {
-            sql_semantics: execution.sql_semantics().clone(),
-            // The old analyzer materializer supplied this effective catalog
-            // for unqualified mutation sources; freeze that same fact here.
-            current_catalog: Some(target.catalog.clone()),
-            current_database: target.namespace.clone(),
-            optimizer_settings: dml_change_stream_optimizer_settings(),
-        },
-        control.clone(),
-        novarocks_sql::compiler::SqlCompileIntent::ChangeStreamWrite,
+    let qualifications = crate::query_execution::compiler::observe_dml_catalog_qualifications(
+        &query,
+        Some(target.catalog.as_str()),
+        &target.namespace,
+        &control,
+        bindings.as_ref(),
+        state.catalog_application().map(Arc::as_ref),
     )
     .map_err(DmlError::from_compile)?;
+    let mut preparation =
+        novarocks_sql::compiler::SqlDmlCatalogPreparation::try_new_for_intent_with_qualifications(
+            novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(query)),
+            novarocks_sql::compiler::SqlSessionContext {
+                sql_semantics: execution.sql_semantics().clone(),
+                // The old analyzer materializer supplied this effective catalog
+                // for unqualified mutation sources; freeze that same fact here.
+                current_catalog: Some(target.catalog.clone()),
+                current_database: target.namespace.clone(),
+                optimizer_settings: dml_change_stream_optimizer_settings(),
+            },
+            control.clone(),
+            novarocks_sql::compiler::SqlCompileIntent::ChangeStreamWrite,
+            qualifications,
+        )
+        .map_err(DmlError::from_compile)?;
     if let Some(assignments) = assignments {
         preparation = preparation
             .with_write_assignments(assignments)
@@ -584,20 +601,38 @@ fn mutation_write_assignments(
     } else {
         old_start + columns.len()
     };
-    if wildcard
-        && !matches!(
-            select.projection.get(6),
-            Some(ast::SelectItem::QualifiedWildcard { .. })
-        )
-    {
-        return Err(invalid(
-            "generated UPDATE lost its target wildcard occurrence",
-        ));
+    if wildcard {
+        let valid = if let Some(ast::SelectItem::AllColumns(columns)) = select.projection.get(6) {
+            if columns.aliases.is_empty() {
+                if let Some(target) = &columns.target {
+                    ast::identifier_chain_observed(target, |_| {
+                        control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 1)
+                    })?
+                    .is_some()
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if !valid {
+            return Err(invalid(
+                "generated UPDATE lost its target wildcard occurrence",
+            ));
+        }
     }
     for (index, item) in select.projection.iter().enumerate().skip(first_assignment) {
-        let ast::SelectItem::ExprWithAlias { alias, expr, .. } = item else {
+        let ast::SelectItem::SingleColumn(single_column) = item else {
             return Err(invalid("mutation assignment lost its exact output alias"));
         };
+        let Some(alias) = &single_column.alias else {
+            return Err(invalid("mutation assignment lost its exact output alias"));
+        };
+        let expr = &single_column.expression;
+
         let name = alias
             .value
             .strip_prefix("__nr_new_")
@@ -690,10 +725,7 @@ mod typed_assignment_tests {
         }
     }
     fn query(sql: &str) -> ast::Query {
-        let statements = novarocks_parser::parse(sql).unwrap();
-        let [ast::Statement::Query(query)] = statements.as_slice() else {
-            panic!("query");
-        };
+        let query = novarocks_parser::parser::parse_query(sql).unwrap();
         query.clone()
     }
     fn source_columns() -> Vec<novarocks_types::schema::ColumnDef> {
@@ -739,9 +771,14 @@ mod typed_assignment_tests {
         let ast::SetExpr::Select(select) = query.body.as_ref() else {
             panic!("SELECT");
         };
-        let ast::SelectItem::ExprWithAlias { expr, .. } = &select.projection[7] else {
+        let ast::SelectItem::SingleColumn(single_column) = &select.projection[7] else {
             panic!("assignment");
         };
+        let Some(_) = &single_column.alias else {
+            panic!("assignment");
+        };
+        let expr = &single_column.expression;
+
         assert_eq!(assignments.sites()[1].source_span(), Some(expr.span()));
     }
     #[test]

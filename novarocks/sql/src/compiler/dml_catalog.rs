@@ -59,6 +59,22 @@ impl SqlDmlCatalogPreparation {
         control: SqlCompileControl,
         intent: SqlCompileIntent,
     ) -> Result<Self, SqlCompileError> {
+        Self::try_new_for_intent_with_qualifications(
+            statement,
+            session,
+            control,
+            intent,
+            super::CatalogQualifications::default(),
+        )
+    }
+
+    pub fn try_new_for_intent_with_qualifications(
+        statement: SqlStatementInput,
+        session: SqlSessionContext,
+        control: SqlCompileControl,
+        intent: SqlCompileIntent,
+        qualifications: super::CatalogQualifications,
+    ) -> Result<Self, SqlCompileError> {
         if !matches!(
             &intent,
             SqlCompileIntent::IcebergWrite { .. } | SqlCompileIntent::ChangeStreamWrite
@@ -79,13 +95,16 @@ impl SqlDmlCatalogPreparation {
         };
         let query = crate::sql_mode::normalize_concat_query(query, &session.sql_semantics)
             .map_err(SqlCompileError::from)?;
-        let catalog = CatalogCompletionState::try_new_with_semantics(
+        let catalog = CatalogCompletionState::try_new_with_qualifications(
             query,
+            &[],
+            &[],
             session.current_catalog.as_deref(),
             &session.current_database,
             crate::catalog::TableLookupMode::SchemaOnly,
             0,
             &session.sql_semantics,
+            qualifications,
         )?
         .with_exchange_budget(super::DEFAULT_COMPLETION_LIMITS)?;
         // Validate the producer's structural sites against the actual query
@@ -191,10 +210,7 @@ mod tests {
     use std::sync::Arc;
 
     fn query(sql: &str) -> novarocks_parser::ast::Query {
-        let parsed = novarocks_parser::parse(sql).unwrap();
-        let [novarocks_parser::ast::Statement::Query(query)] = parsed.as_slice() else {
-            panic!("query fixture")
-        };
+        let query = &novarocks_parser::parser::parse_query(sql).unwrap();
         query.clone()
     }
 
@@ -479,14 +495,18 @@ mod tests {
     fn constant_union_branches_are_typed_before_their_common_type() {
         use super::super::{SqlConstantExpressionSite::SelectProjection, SqlConstantQueryStep};
         use arrow::datatypes::DataType;
-        let text = "SELECT 123456789.123456789 UNION ALL SELECT 1e0";
+        let text = "SELECT 123456789.123456789 UNION ALL SELECT 1e0 UNION ALL SELECT 2e0";
         let assignments = numeric_source_assignments(vec![
             (
-                vec![SqlConstantQueryStep::UnionLeft],
+                vec![SqlConstantQueryStep::SetOperand { index: 0 }],
                 SelectProjection { column: 0 },
             ),
             (
-                vec![SqlConstantQueryStep::UnionRight],
+                vec![SqlConstantQueryStep::SetOperand { index: 1 }],
+                SelectProjection { column: 0 },
+            ),
+            (
+                vec![SqlConstantQueryStep::SetOperand { index: 2 }],
                 SelectProjection { column: 0 },
             ),
         ]);
@@ -660,7 +680,7 @@ mod tests {
             (FunctionValueType::new(map.clone(), false), None),
         ]);
         let source = prepare(SqlStatementInput::parsed_query(Box::new(query(
-            "VALUES (NULL, [], MAP{})",
+            "VALUES (NULL, [], map())",
         ))))
         .with_write_assignments(assignments.clone())
         .unwrap();
@@ -769,7 +789,9 @@ mod tests {
             ("VALUES (NULL), (NULL)", Vec::new()),
             (
                 "SELECT CASE WHEN TRUE THEN x ELSE NULL END FROM (VALUES (NULL)) s(x)",
-                vec![super::super::SqlConstantQueryStep::SelectFromDerived { from: 0 }],
+                vec![super::super::SqlConstantQueryStep::SelectFromDerived {
+                    relation_path: vec![super::super::SqlRelationStep::Aliased],
+                }],
             ),
         ] {
             let statement = SqlStatementInput::query_with_expression_constants(
@@ -837,7 +859,9 @@ mod tests {
                 .unwrap()
                 .with_literal_contexts(
                     vec![super::super::SqlWriteLiteralContext::new(
-                        vec![super::super::SqlConstantQueryStep::SelectFromDerived { from: 0 }],
+                        vec![super::super::SqlConstantQueryStep::SelectFromDerived {
+                            relation_path: vec![super::super::SqlRelationStep::Aliased],
+                        }],
                         super::super::SqlConstantExpressionSite::SelectProjection { column: 0 },
                         0,
                     )]

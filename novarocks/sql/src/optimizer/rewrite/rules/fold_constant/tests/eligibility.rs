@@ -417,6 +417,7 @@ fn preserves_sec_to_time_provenance_but_folds_its_numeric_argument() {
     );
     let cast_source = fixture.intern(
         ScalarNode::Cast {
+            array_failure_mode: None,
             child: source,
             target: DataType::Utf8,
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,

@@ -28,14 +28,13 @@ CREATE TABLE ${case_db}.t_analytic_range_unbounded_following_full_partition (
     grp VARCHAR(10),
     ord_key INT,
     v INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t_analytic_range_unbounded_following_full_partition VALUES
-    ('A', 1, 10),
-    ('A', 2, 20),
-    ('A', 2, 30),
-    ('A', 3, NULL);
+    ROW('A', 1, 10),
+    ROW('A', 2, 20),
+    ROW('A', 2, 30),
+    ROW('A', 3, NULL);
 
 SELECT
     grp,

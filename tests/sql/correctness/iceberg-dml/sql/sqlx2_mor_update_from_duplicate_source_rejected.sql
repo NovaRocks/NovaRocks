@@ -21,33 +21,26 @@
 
 -- query 1
 -- @skip_result_check=true
-DROP TABLE IF EXISTS ${case_db}.sqlx2_mor_update_target FORCE;
-DROP TABLE IF EXISTS ${case_db}.sqlx2_mor_update_source FORCE;
+DROP TABLE IF EXISTS ${case_db}.sqlx2_mor_update_target ;
+DROP TABLE IF EXISTS ${case_db}.sqlx2_mor_update_source ;
 CREATE TABLE ${case_db}.sqlx2_mor_update_target (
   id BIGINT,
   v STRING
-) TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true",
-  "novarocks.update.mode" = "merge-on-read"
-);
+) WITH (format_version = 3, extra_properties = MAP(ARRAY['novarocks.update.mode'], ARRAY['merge-on-read']));
 CREATE TABLE ${case_db}.sqlx2_mor_update_source (
   id BIGINT,
   new_v STRING
-) TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
-);
-INSERT INTO ${case_db}.sqlx2_mor_update_target VALUES (1, 'a');
-INSERT INTO ${case_db}.sqlx2_mor_update_source VALUES (1, 'x'), (1, 'y');
+) WITH (format_version = 3);
+INSERT INTO ${case_db}.sqlx2_mor_update_target VALUES ROW(1, 'a');
+INSERT INTO ${case_db}.sqlx2_mor_update_source VALUES ROW(1, 'x'), ROW(1, 'y');
 
 -- query 2
 -- @expect_error_tier=drift
--- @expect_error=TrinoError { name=MERGE_TARGET_ROW_MULTIPLE_MATCHES type=USER_ERROR code=119 }: One UPDATE target table row matched more than one source row
-UPDATE ${case_db}.sqlx2_mor_update_target AS t
-SET v = s.new_v
-FROM ${case_db}.sqlx2_mor_update_source AS s
-WHERE t.id = s.id;
+-- @expect_error=TrinoError { name=MERGE_TARGET_ROW_MULTIPLE_MATCHES type=USER_ERROR code=119 }: One MERGE target table row matched more than one source row
+MERGE INTO ${case_db}.sqlx2_mor_update_target AS t
+USING ${case_db}.sqlx2_mor_update_source AS s
+ON t.id = s.id
+WHEN MATCHED THEN UPDATE SET v = s.new_v;
 
 -- query 3
 SELECT id, v
@@ -56,5 +49,5 @@ ORDER BY id;
 
 -- query 4
 -- @skip_result_check=true
-DROP TABLE ${case_db}.sqlx2_mor_update_target FORCE;
-DROP TABLE ${case_db}.sqlx2_mor_update_source FORCE;
+DROP TABLE ${case_db}.sqlx2_mor_update_target ;
+DROP TABLE ${case_db}.sqlx2_mor_update_source ;

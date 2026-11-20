@@ -27,18 +27,17 @@
 CREATE TABLE ${case_db}.t_agg_region_distribution (
     c_custkey INT,
     c_region VARCHAR(32)
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t_agg_region_distribution VALUES
-    (1, 'AFRICA'),
-    (2, 'ASIA'),
-    (3, 'ASIA'),
-    (4, 'EUROPE'),
-    (5, 'AMERICA'),
-    (6, 'MIDDLE EAST'),
-    (7, 'AMERICA'),
-    (8, 'AFRICA');
+    ROW(1, 'AFRICA'),
+    ROW(2, 'ASIA'),
+    ROW(3, 'ASIA'),
+    ROW(4, 'EUROPE'),
+    ROW(5, 'AMERICA'),
+    ROW(6, 'MIDDLE EAST'),
+    ROW(7, 'AMERICA'),
+    ROW(8, 'AFRICA');
 
 SELECT c_region, COUNT(*) AS customer_count
 FROM ${case_db}.t_agg_region_distribution

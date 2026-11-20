@@ -481,7 +481,7 @@ pub(super) fn specs(name: &str) -> Result<(Vec<Spec>, bool, Vec<usize>)> {
             statements.extend([
                 Spec::observed(summary_sql(catalog, database, table), &[READER, MATERIAL]),
                 Spec::observed(
-                    format!("INSERT INTO {catalog}.{database}.{table} VALUES (1001)"),
+                    format!("INSERT INTO {catalog}.{database}.{table} VALUES ROW(1001)"),
                     &[],
                 )
                 .on_backend(0, MATERIAL)
@@ -543,7 +543,7 @@ pub(super) fn observed_fixture(
     warehouse: &Path,
 ) -> Result<()> {
     super::create_catalog(control, catalog, warehouse)?;
-    control.execute(format!("CREATE DATABASE {catalog}.{database}"))?;
+    control.execute(format!("CREATE SCHEMA {catalog}.{database}"))?;
     control.execute(format!(
         "CREATE TABLE {catalog}.{database}.{table} (v BIGINT)"
     ))?;
@@ -690,7 +690,7 @@ impl Reader {
         let deadline = context.deadline();
         let mut conn = SqlSession::new(user, port, deadline)?;
         if let Some(dop) = dop {
-            conn.execute(format!("SET pipeline_dop = {}", dop.get()))?;
+            conn.execute(format!("SET SESSION pipeline_dop = {}", dop.get()))?;
         }
         let pending = conn.submit(&selected.statement.sql)?;
         let id = pending.query_id.clone();

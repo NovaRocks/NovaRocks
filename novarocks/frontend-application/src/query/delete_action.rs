@@ -75,7 +75,8 @@ impl WriteStatementFamily for DeleteFamily {
 fn completion_for_statement(statement: &OwnedDeleteStatement) -> WriteCompletion {
     match statement {
         OwnedDeleteStatement::Predicate(_) => WriteCompletion::Counted,
-        OwnedDeleteStatement::Equality(_) => WriteCompletion::Empty,
+        #[cfg(novarocks_dev_controls)]
+        OwnedDeleteStatement::TrinoEquality { .. } => WriteCompletion::Empty,
     }
 }
 
@@ -103,16 +104,27 @@ pub(crate) fn prepare(
         .result_capacity()
         .ok_or_else(|| "DELETE has no original Root result capacity".to_owned())?;
     let root = root_capacity.root_scope().clone();
-    let (target, reference) = delete::resolve_target(
-        &kernel,
-        &input.statement,
-        input.context.session().current_catalog(),
-        input.context.session().current_database(),
-    )?;
-    let planning_pin = crate::connector::acquire_metadata_planning_pin(
-        kernel.connector_control().as_ref(),
-        &target.catalog,
-    )?;
+    let (target, reference, planning_pin) = match &input.statement {
+        #[cfg(novarocks_dev_controls)]
+        OwnedDeleteStatement::TrinoEquality { resolved, .. } => (
+            resolved.target.clone(),
+            "main".to_owned(),
+            resolved.planning.clone(),
+        ),
+        original => {
+            let (target, reference) = delete::resolve_target(
+                &kernel,
+                original,
+                input.context.session().current_catalog(),
+                input.context.session().current_database(),
+            )?;
+            let planning = crate::connector::acquire_metadata_planning_pin(
+                kernel.connector_control().as_ref(),
+                &target.catalog,
+            )?;
+            (target, reference, planning)
+        }
+    };
     let stack = kernel
         .typed_connector_control()
         .acquire_exact_write_stack(planning_pin.control_runtime_id())
@@ -195,26 +207,13 @@ pub(crate) fn prepare(
 mod completion_tests {
     use super::*;
     #[test]
-    fn original_typed_delete_variant_selects_control_or_counted_completion() {
-        for (sql, expected) in [
-            ("DELETE FROM t WHERE id = 2", WriteCompletion::Counted),
-            (
-                "ALTER TABLE t ADD EQUALITY DELETE (id) VALUES (2)",
-                WriteCompletion::Empty,
-            ),
-        ] {
-            let mut parsed = novarocks_parser::parse(sql).unwrap();
-            assert_eq!(parsed.len(), 1);
-            let owned = match parsed.remove(0) {
-                novarocks_parser::ast::Statement::Dml(
-                    novarocks_parser::ast::DmlStatement::Delete(statement),
-                ) => OwnedDeleteStatement::Predicate(statement),
-                novarocks_parser::ast::Statement::Dml(
-                    novarocks_parser::ast::DmlStatement::AddEqualityDelete(statement),
-                ) => OwnedDeleteStatement::Equality(statement),
-                _ => panic!("expected the original typed DELETE variant"),
-            };
-            assert_eq!(completion_for_statement(&owned), expected);
-        }
+    fn predicate_delete_selects_counted_completion() {
+        use novarocks_parser::{ast::TrinoStatement, parser};
+        let sql = "DELETE FROM t WHERE id = 2";
+        let TrinoStatement::Delete(statement) = parser::parse_statement(sql).unwrap() else {
+            panic!("expected DELETE");
+        };
+        let owned = crate::dml::prepare_trino_delete_shape(statement, sql).unwrap();
+        assert_eq!(completion_for_statement(&owned), WriteCompletion::Counted);
     }
 }

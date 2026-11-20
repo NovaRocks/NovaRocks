@@ -135,14 +135,10 @@ async fn original_insert_and_ctas_completion_install_system_snapshots_before_wri
         };
         let semantics = novarocks_sql::sql_mode::SqlSemanticSettings::default();
         let decimal = semantics.sql_mode().decimal_overflow_policy();
-        let [novarocks_parser::ast::Statement::Query(query)]: [_; 1] = novarocks_parser::parse(
+        let query = novarocks_parser::parser::parse_query(
             "SELECT table_name, table_type FROM system.information_schema.tables",
         )
-        .unwrap()
-        .try_into()
-        .unwrap() else {
-            panic!("producer query")
-        };
+        .unwrap();
         let mut preparation = SqlDmlCatalogPreparation::try_new(
             SqlStatementInput::parsed_query(Box::new(query)),
             SqlSessionContext {
@@ -293,11 +289,7 @@ async fn mutation_purpose_refuses_direct_and_cte_system_sources_in_the_catalog_r
             .clone()
             .with_system_table_source_policy(SystemTableSourcePolicy::Mutation);
         let catalog = FrontendCatalogFacts::new(source.owners.clone(), scope);
-        let [novarocks_parser::ast::Statement::Query(query)]: [_; 1] =
-            novarocks_parser::parse(sql).unwrap().try_into().unwrap()
-        else {
-            panic!("producer query")
-        };
+        let query = novarocks_parser::parser::parse_query(sql).unwrap();
         let preparation = SqlDmlCatalogPreparation::try_new(
             SqlStatementInput::parsed_query(Box::new(query)),
             SqlSessionContext {

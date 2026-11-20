@@ -20,12 +20,11 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE DATABASE IF NOT EXISTS iceberg_compat_${suite_uuid0}.${case_db};
+CREATE SCHEMA IF NOT EXISTS iceberg_compat_${suite_uuid0}.${case_db};
 CREATE TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm13_affine_${uuid0}
-  (id BIGINT, region VARCHAR)
-PARTITION BY (region);
+  (id BIGINT, region VARCHAR) WITH (partitioning = ARRAY['region']);
 INSERT INTO iceberg_compat_${suite_uuid0}.${case_db}.rwm13_affine_${uuid0}
-VALUES (1, 'east'), (2, 'east'), (3, 'west'), (4, 'west');
+VALUES ROW(1, 'east'), ROW(2, 'east'), ROW(3, 'west'), ROW(4, 'west');
 
 -- query 2
 -- @result_contains=SPARK_AFFINE_WRITE_OK
@@ -62,4 +61,4 @@ printf 'SPARK_AFFINE_WRITE_OK\n'
 -- query 3
 -- @cleanup=true
 -- @skip_result_check=true
-DROP TABLE IF EXISTS iceberg_compat_${suite_uuid0}.${case_db}.rwm13_affine_${uuid0} FORCE;
+DROP TABLE IF EXISTS iceberg_compat_${suite_uuid0}.${case_db}.rwm13_affine_${uuid0} ;

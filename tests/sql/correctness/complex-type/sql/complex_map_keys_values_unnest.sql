@@ -30,5 +30,5 @@ FROM (
         MAP_KEYS(MAP('a', 1, 'b', 2)) AS ks,
         MAP_VALUES(MAP('a', 1, 'b', 2)) AS vs
 ) t
-CROSS JOIN LATERAL UNNEST(t.ks, t.vs) AS u(k, v)
+CROSS JOIN  UNNEST(t.ks, t.vs) AS u(k, v)
 ORDER BY k;

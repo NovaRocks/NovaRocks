@@ -32,16 +32,15 @@ CREATE TABLE ${case_db}.t_self_join_nl (
   k1 BIGINT,
   v1 INT,
   v2 VARCHAR(20)
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 3
 -- @skip_result_check=true
 INSERT INTO ${case_db}.t_self_join_nl VALUES
-  (1, 10, 'a'),
-  (2, 20, 'b'),
-  (3, 30, 'c'),
-  (NULL, 40, 'd');
+  ROW(1, 10, 'a'),
+  ROW(2, 20, 'b'),
+  ROW(3, 30, 'c'),
+  ROW(NULL, 40, 'd');
 
 -- query 4
 -- CROSS JOIN self
@@ -81,12 +80,10 @@ FULL OUTER JOIN ${case_db}.t_self_join_nl b
 -- LEFT SEMI JOIN self ON non-equality
 SELECT count(*), count(a.v1)
 FROM ${case_db}.t_self_join_nl a
-LEFT SEMI JOIN ${case_db}.t_self_join_nl b
-  ON a.k1 > b.k1;
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t_self_join_nl b WHERE a.k1 > b.k1);
 
 -- query 10
 -- LEFT ANTI JOIN self ON non-equality
 SELECT count(*), count(a.v1)
 FROM ${case_db}.t_self_join_nl a
-LEFT ANTI JOIN ${case_db}.t_self_join_nl b
-  ON a.k1 > b.k1;
+WHERE NOT EXISTS (SELECT 1 FROM ${case_db}.t_self_join_nl b WHERE a.k1 > b.k1);

@@ -22,8 +22,8 @@
 DROP TABLE IF EXISTS ${case_db}.oq1w_sales;
 CREATE TABLE ${case_db}.oq1w_sales (region VARCHAR(20), amount INT);
 INSERT INTO ${case_db}.oq1w_sales VALUES
-    ('A', 10), ('A', 20), ('B', 15), ('B', 30);
-ANALYZE TABLE ${case_db}.oq1w_sales;
+    ROW('A', 10), ROW('A', 20), ROW('B', 15), ROW('B', 30);
+ANALYZE ${case_db}.oq1w_sales;
 
 -- The outer query reads rn but never reads rk, so rank() must be pruned.
 -- @explain_contains=WINDOW [row_number

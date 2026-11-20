@@ -52,25 +52,25 @@ printf 'SPARK_SQL_OK\n'
 
 -- query 2
 SELECT COUNT(*) AS snapshot_count
-FROM iceberg_compat_${suite_uuid0}.${case_db}.spark_v3_meta_${uuid0}$snapshots;
+FROM iceberg_compat_${suite_uuid0}.${case_db}."spark_v3_meta_${uuid0}$snapshots";
 
 -- query 3
 SELECT COUNT(*) AS history_count
-FROM iceberg_compat_${suite_uuid0}.${case_db}.spark_v3_meta_${uuid0}$history;
+FROM iceberg_compat_${suite_uuid0}.${case_db}."spark_v3_meta_${uuid0}$history";
 
 -- query 4
 SELECT count(*) AS n_data_files
-FROM iceberg_compat_${suite_uuid0}.${case_db}.spark_v3_meta_${uuid0}$files
+FROM iceberg_compat_${suite_uuid0}.${case_db}."spark_v3_meta_${uuid0}$files"
 WHERE content = 0;
 
 -- query 5
 SELECT count(*) > 0 AS has_manifests
-FROM iceberg_compat_${suite_uuid0}.${case_db}.spark_v3_meta_${uuid0}$manifests;
+FROM iceberg_compat_${suite_uuid0}.${case_db}."spark_v3_meta_${uuid0}$manifests";
 
 -- query 6
 SELECT count(*) > 0 AS has_added_entries
-FROM iceberg_compat_${suite_uuid0}.${case_db}.spark_v3_meta_${uuid0}$entries
+FROM iceberg_compat_${suite_uuid0}.${case_db}."spark_v3_meta_${uuid0}$entries"
 WHERE status = 1 AND sequence_number IS NOT NULL;
 
 -- query 7
-DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.spark_v3_meta_${uuid0} FORCE;
+DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.spark_v3_meta_${uuid0} ;

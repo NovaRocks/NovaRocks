@@ -22,15 +22,15 @@ CREATE TABLE ${case_db}.dict_observability_orders (
   order_id BIGINT,
   status STRING,
   amount INT
-) TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.dict_observability_orders VALUES
-  (1, 'NEW', 10),
-  (2, 'PAID', 20),
-  (3, 'PAID', 30),
-  (4, 'CANCELLED', 40),
-  (5, 'SHIPPED', 50),
-  (6, NULL, 60);
+  ROW(1, 'NEW', 10),
+  ROW(2, 'PAID', 20),
+  ROW(3, 'PAID', 30),
+  ROW(4, 'CANCELLED', 40),
+  ROW(5, 'SHIPPED', 50),
+  ROW(6, NULL, 60);
 
 -- @normalize_explain_timing=true
 -- @result_contains=dict={in_rows=

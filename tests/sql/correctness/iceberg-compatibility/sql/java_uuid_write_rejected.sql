@@ -32,7 +32,7 @@ SELECT id,k IS NULL AS key_is_null FROM iceberg_compat_${suite_uuid0}.${case_db}
 
 -- query 3
 -- @expect_error=Iceberg uuid writes are not supported
-INSERT INTO iceberg_compat_${suite_uuid0}.${case_db}.java_uuid_rejected_${uuid0} VALUES (3,NULL);
+INSERT INTO iceberg_compat_${suite_uuid0}.${case_db}.java_uuid_rejected_${uuid0} VALUES ROW(3,NULL);
 
 -- query 4
 -- @expect_error=Iceberg uuid writes are not supported
@@ -40,7 +40,7 @@ UPDATE iceberg_compat_${suite_uuid0}.${case_db}.java_uuid_rejected_${uuid0} SET 
 
 -- query 5
 -- @expect_error=uuid
-ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_uuid_rejected_${uuid0} ADD EQUALITY DELETE (k) VALUES (NULL);
+ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_uuid_rejected_${uuid0} EXECUTE add_equality_delete(columns => ARRAY['k'], rows => ARRAY[ROW(NULL)]);
 
 -- query 6
 -- @result_contains=IRU9_UNCHANGED_OK
@@ -53,11 +53,11 @@ receipt_dir="$(mktemp -d "$receipt_parent/$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")"
 -- query 7
 -- @skip_result_check=true
 DELETE FROM iceberg_compat_${suite_uuid0}.${case_db}.java_uuid_rejected_${uuid0} WHERE id=1;
-ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_uuid_rejected_${uuid0} ADD EQUALITY DELETE (id) VALUES (2);
+ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_uuid_rejected_${uuid0} EXECUTE add_equality_delete(columns => ARRAY['id'], rows => ARRAY[ROW(2)]);
 
 -- query 8
 SELECT COUNT(*) AS remaining_rows FROM iceberg_compat_${suite_uuid0}.${case_db}.java_uuid_rejected_${uuid0};
 
 -- query 9
 -- @skip_result_check=true
-DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_uuid_rejected_${uuid0} FORCE;
+DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_uuid_rejected_${uuid0} ;

@@ -1640,4 +1640,4 @@ pub(super) mod tests {
 }
 
 mod statement;
-pub(crate) use statement::StatisticsStatementExecutor;
+pub(crate) use statement::{AnalyzeColumns, StatisticsStatementExecutor};

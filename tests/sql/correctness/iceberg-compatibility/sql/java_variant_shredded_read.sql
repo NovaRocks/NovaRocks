@@ -36,4 +36,4 @@ SELECT id FROM iceberg_compat_${suite_uuid0}.${case_db}.java_variant_shredded_${
 
 -- query 4
 -- @skip_result_check=true
-DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_variant_shredded_${uuid0} FORCE;
+DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_variant_shredded_${uuid0} ;

@@ -78,7 +78,7 @@ with  cross_items as
  from(
        select 'store' channel, i_brand_id,i_class_id
              ,i_category_id,sum(ss_quantity*ss_list_price) sales
-             , count(*) number_sales
+             , count() number_sales
        from store_sales
            ,item
            ,date_dim
@@ -90,7 +90,7 @@ with  cross_items as
        group by i_brand_id,i_class_id,i_category_id
        having sum(ss_quantity*ss_list_price) > (select average_sales from avg_sales)
        union all
-       select 'catalog' channel, i_brand_id,i_class_id,i_category_id, sum(cs_quantity*cs_list_price) sales, count(*) number_sales
+       select 'catalog' channel, i_brand_id,i_class_id,i_category_id, sum(cs_quantity*cs_list_price) sales, count() number_sales
        from catalog_sales
            ,item
            ,date_dim
@@ -102,7 +102,7 @@ with  cross_items as
        group by i_brand_id,i_class_id,i_category_id
        having sum(cs_quantity*cs_list_price) > (select average_sales from avg_sales)
        union all
-       select 'web' channel, i_brand_id,i_class_id,i_category_id, sum(ws_quantity*ws_list_price) sales , count(*) number_sales
+       select 'web' channel, i_brand_id,i_class_id,i_category_id, sum(ws_quantity*ws_list_price) sales , count() number_sales
        from web_sales
            ,item
            ,date_dim
@@ -190,7 +190,7 @@ with  cross_items as
                            ,last_year.number_sales ly_number_sales 
  from
  (select 'store' channel, i_brand_id,i_class_id,i_category_id
-        ,sum(ss_quantity*ss_list_price) sales, count(*) number_sales
+        ,sum(ss_quantity*ss_list_price) sales, count() number_sales
  from store_sales 
      ,item
      ,date_dim
@@ -205,7 +205,7 @@ with  cross_items as
  group by i_brand_id,i_class_id,i_category_id
  having sum(ss_quantity*ss_list_price) > (select average_sales from avg_sales)) this_year,
  (select 'store' channel, i_brand_id,i_class_id
-        ,i_category_id, sum(ss_quantity*ss_list_price) sales, count(*) number_sales
+        ,i_category_id, sum(ss_quantity*ss_list_price) sales, count() number_sales
  from store_sales
      ,item
      ,date_dim

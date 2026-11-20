@@ -26,17 +26,16 @@ USE ${case_db};
 -- query 2
 -- @skip_result_check=true
 USE ${case_db};
-set pipeline_dop=1;
+SET SESSION pipeline_dop = 1;
 
 -- query 3
 -- @skip_result_check=true
 USE ${case_db};
-CREATE TABLE `t0` (
-  `c0` bigint DEFAULT NULL,
-  `c1` bigint DEFAULT NULL,
-  `c2` bigint DEFAULT NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE "t0" (
+  "c0" bigint DEFAULT NULL,
+  "c1" bigint DEFAULT NULL,
+  "c2" bigint DEFAULT NULL
+) WITH (format_version = 3);
 
 -- query 4
 -- @skip_result_check=true
@@ -131,12 +130,11 @@ select count(*) from (select distinct c0 from t0 limit 100) tb;
 -- query 26
 -- @skip_result_check=true
 USE ${case_db};
-CREATE TABLE `t1` (
-  `c0` string DEFAULT NULL,
-  `c1` bigint DEFAULT NULL,
-  `c2` bigint DEFAULT NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE "t1" (
+  "c0" string DEFAULT NULL,
+  "c1" bigint DEFAULT NULL,
+  "c2" bigint DEFAULT NULL
+) WITH (format_version = 3);
 
 -- query 27
 -- @skip_result_check=true
@@ -163,12 +161,11 @@ select count(*) from (select distinct c0 from t1 limit 100) tb;
 -- query 32
 -- @skip_result_check=true
 USE ${case_db};
-CREATE TABLE `t2` (
-  `c0` string DEFAULT NULL,
-  `c1` bigint DEFAULT NULL,
-  `c2` bigint DEFAULT NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE "t2" (
+  "c0" string DEFAULT NULL,
+  "c1" bigint DEFAULT NULL,
+  "c2" bigint DEFAULT NULL
+) WITH (format_version = 3);
 
 -- query 33
 -- @skip_result_check=true

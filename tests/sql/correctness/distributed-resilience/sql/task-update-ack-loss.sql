@@ -19,47 +19,46 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.task_update_ack_loss (id BIGINT)
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.task_update_ack_loss (id BIGINT) WITH (format_version = 3);
 
 -- Independent writes intentionally leave several Iceberg data files. The
 -- cross-process scanner therefore sends nonempty terminal assignments to all
 -- three admitted read tasks rather than exercising an empty terminal marker.
 -- query 2
 -- @skip_result_check=true
-INSERT INTO ${case_db}.task_update_ack_loss VALUES (1);
+INSERT INTO ${case_db}.task_update_ack_loss VALUES ROW(1);
 
 -- query 3
 -- @skip_result_check=true
-INSERT INTO ${case_db}.task_update_ack_loss VALUES (2);
+INSERT INTO ${case_db}.task_update_ack_loss VALUES ROW(2);
 
 -- query 4
 -- @skip_result_check=true
-INSERT INTO ${case_db}.task_update_ack_loss VALUES (3);
+INSERT INTO ${case_db}.task_update_ack_loss VALUES ROW(3);
 
 -- query 5
 -- @skip_result_check=true
-INSERT INTO ${case_db}.task_update_ack_loss VALUES (4);
+INSERT INTO ${case_db}.task_update_ack_loss VALUES ROW(4);
 
 -- query 6
 -- @skip_result_check=true
-INSERT INTO ${case_db}.task_update_ack_loss VALUES (5);
+INSERT INTO ${case_db}.task_update_ack_loss VALUES ROW(5);
 
 -- query 7
 -- @skip_result_check=true
-INSERT INTO ${case_db}.task_update_ack_loss VALUES (6);
+INSERT INTO ${case_db}.task_update_ack_loss VALUES ROW(6);
 
 -- query 8
 -- @skip_result_check=true
-INSERT INTO ${case_db}.task_update_ack_loss VALUES (7);
+INSERT INTO ${case_db}.task_update_ack_loss VALUES ROW(7);
 
 -- query 9
 -- @skip_result_check=true
-INSERT INTO ${case_db}.task_update_ack_loss VALUES (8);
+INSERT INTO ${case_db}.task_update_ack_loss VALUES ROW(8);
 
 -- query 10
 -- @skip_result_check=true
-INSERT INTO ${case_db}.task_update_ack_loss VALUES (9);
+INSERT INTO ${case_db}.task_update_ack_loss VALUES ROW(9);
 
 -- query 11
 -- Baseline: each backend receives a real remote split assignment before the

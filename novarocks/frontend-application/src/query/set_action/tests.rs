@@ -16,10 +16,19 @@
 // under the License.
 
 //! Real planning-CPU ownership, cancellation and whole-SET refusal probes.
+use super::super::{
+    SessionNamespace, TrinoSessionWork, lower_trino_session_action, resolve_database_context,
+};
 use super::*;
 use crate::task_execution::blocking_io::tests::OriginalExecutorsFixture;
 use novarocks_failure_contract::{FailureClass, FailureProjection};
-use novarocks_query_application::sql::session::registry::SessionPropertyValue;
+use novarocks_query_application::sql::session::registry::{
+    SessionCatalogPropertyAdmission, SessionCatalogPropertyPort, SessionPropertyValue,
+};
+use novarocks_query_application::sql::trino_admission::{
+    TrinoStatementAction, admit_trino_statement,
+};
+use novarocks_query_application::statement_kind::StatementKind;
 use novarocks_sql::compiler::{SqlCancellationObservation, SqlFunctionCatalog};
 use novarocks_workload_control::{
     ResultCapacityConfig, ResultWindowAlias, ResultWindowClass, RootWork, WorkClass, WorkRequest,
@@ -30,6 +39,16 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::time::Duration;
+
+struct SystemOnly;
+impl SessionCatalogPropertyPort for SystemOnly {
+    fn session_property_catalog(
+        &self,
+        _: &str,
+    ) -> Result<SessionCatalogPropertyAdmission, QueryServiceError> {
+        panic!("a system property has no catalog scope")
+    }
+}
 
 struct CheckpointGate {
     armed: AtomicBool,
@@ -133,24 +152,33 @@ impl Fixture {
     }
     fn input(&self, sql: &str, control: SqlCompileControl) -> SessionPropertyCpuInput {
         let source: Arc<str> = Arc::from(sql);
-        let mut statements = novarocks_parser::parse(sql).unwrap();
-        assert_eq!(statements.len(), 1);
-        let ast::Statement::Session(ast::SessionStatement::Set(set)) = statements.pop().unwrap()
-        else {
-            panic!("one original SET")
+        let (_, TrinoSessionWork::Mutation(mutation)) = parse_session_action(sql) else {
+            panic!("one original SET SESSION");
         };
+        self.mutation_input(
+            source,
+            SessionPropertyMutation {
+                mutation: Box::new(mutation),
+                catalogs: Arc::new(SystemOnly),
+            },
+            control,
+        )
+    }
+    fn mutation_input(
+        &self,
+        source: Arc<str>,
+        mutation: SessionPropertyMutation,
+        control: SqlCompileControl,
+    ) -> SessionPropertyCpuInput {
         let functions: Arc<dyn SqlFunctionCatalog> = Arc::new(
             novarocks_functions::builtin::catalogue::build_builtin_engine_function_catalog()
                 .unwrap(),
         );
         SessionPropertyCpuInput {
             source,
-            set,
+            mutation,
             staged: self.live.clone(),
             registry: Arc::clone(&self.registry),
-            catalog_properties: Arc::new(
-                crate::query::session_property_computation::NoCatalogProperties,
-            ),
             interpreter: Arc::new(
                 crate::query_execution::required_constant_eval::test_required_constant_interpreter(
                 ),
@@ -307,13 +335,13 @@ async fn set_whole_cpu_business_failure_is_atomic_and_resource_source_is_not_pro
         let fixture = Fixture::new(capacity);
         let mut tail = fixture.tail();
         tail.start(fixture.input(
-            "SET SESSION pipeline_dop = 2 + 0, query_timeout = 1 / 0",
+            "SET SESSION query_timeout = 2 + 1 / 0",
             SqlCompileControl::unbounded(),
         ));
         closed(&mut tail).await;
         let error = match tail.prepared.take().unwrap() {
             Err(error) => error,
-            Ok(_) => panic!("the complete batch must reject"),
+            Ok(_) => panic!("the assignment must reject"),
         };
         assert_old_live(&fixture);
         if resource_refusal {
@@ -336,7 +364,7 @@ async fn set_whole_cpu_business_failure_is_atomic_and_resource_source_is_not_pro
             );
             assert!(
                 error.message().contains("query_timeout"),
-                "the later assignment authored the actual Data refusal"
+                "the assignment authored the actual Data refusal"
             );
             assert_eq!(
                 error.failure_cause().unwrap().failure_fact().class(),
@@ -346,6 +374,322 @@ async fn set_whole_cpu_business_failure_is_atomic_and_resource_source_is_not_pro
         drop(error);
         fixture.close(tail).await;
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn scoped_set_and_reset_use_the_same_catalog_key_and_original_cpu() {
+    use novarocks_mv_application::session_properties::{
+        INCREMENTAL_REFRESH_ENABLED, incremental_refresh_enabled_declaration,
+    };
+    use novarocks_query_application::sql::session::registry::{
+        CatalogPropertyDeclarationFactory, CatalogPropertyIdentity, CatalogPropertyMetadata,
+        PropertyDeclaration, SessionPropertyError,
+    };
+    use novarocks_spi::connector::{
+        ConnectorInstanceId, ConnectorProviderBindingKey, ConnectorProviderId, ProviderBindingEpoch,
+    };
+
+    struct IcebergDeclarations(ConnectorProviderId);
+    impl CatalogPropertyDeclarationFactory for IcebergDeclarations {
+        fn provider_id(&self) -> &ConnectorProviderId {
+            &self.0
+        }
+        fn declarations(
+            &self,
+            _: &CatalogPropertyIdentity,
+            _: &[(String, String)],
+        ) -> Result<Vec<PropertyDeclaration>, SessionPropertyError> {
+            Ok(vec![incremental_refresh_enabled_declaration()?])
+        }
+    }
+
+    struct ObservedCatalog(Arc<CatalogPropertyMetadata>);
+    impl SessionCatalogPropertyPort for ObservedCatalog {
+        fn session_property_catalog(
+            &self,
+            name: &str,
+        ) -> Result<SessionCatalogPropertyAdmission, QueryServiceError> {
+            assert_eq!(name, "lake");
+            Ok(SessionCatalogPropertyAdmission::Ready(Arc::clone(&self.0)))
+        }
+    }
+
+    let provider_id = ConnectorProviderId::parse("iceberg").unwrap();
+    let registry = Arc::new(
+        SessionPropertyRegistry::with_catalog_factories(vec![Arc::new(IcebergDeclarations(
+            provider_id.clone(),
+        ))])
+        .unwrap(),
+    );
+    let instance_id = ConnectorInstanceId::parse("lake").unwrap();
+    let binding_key = ConnectorProviderBindingKey {
+        instance_id: instance_id.clone(),
+        incarnation: ProviderBindingEpoch::from_bytes([1; 16]),
+    };
+    let identity = CatalogPropertyIdentity {
+        attachment_id: uuid::Uuid::from_u128(1),
+        control_runtime_id: novarocks_spi::connector::ConnectorControlRuntimeId::from_bytes(
+            [1; 16],
+        ),
+        instance_id,
+        provider_id,
+        generation: 1,
+        binding_key: binding_key.clone(),
+    };
+    let metadata = Arc::new(registry.bind_catalog("lake", identity, &[]).unwrap());
+    for (source, expected_kind) in [
+        (
+            r#"SET SESSION "LAKE"."INCREMENTAL_REFRESH_ENABLED" = false OR false"#,
+            StatementKind::SetSession,
+        ),
+        (
+            r#"RESET SESSION "LAKE"."INCREMENTAL_REFRESH_ENABLED""#,
+            StatementKind::ResetSession,
+        ),
+    ] {
+        let reset = expected_kind == StatementKind::ResetSession;
+        let mut capacity = ResultCapacityConfig::V1;
+        if reset {
+            // A value evaluation could not allocate even its first backing.
+            capacity.all_objects_bytes[1] = 1;
+        }
+        let mut fixture = Fixture::new(capacity);
+        fixture.registry = Arc::clone(&registry);
+        if reset {
+            let value = metadata
+                .prepare_header("lake", INCREMENTAL_REFRESH_ENABLED, "false")
+                .unwrap();
+            fixture
+                .live
+                .apply_effects(
+                    &novarocks_query_application::session_effects::SessionEffects::property(value),
+                )
+                .unwrap();
+        }
+        let (kind, TrinoSessionWork::Mutation(mutation)) = parse_session_action(source) else {
+            panic!("expected a scoped mutation");
+        };
+        assert_eq!(kind, expected_kind);
+        let mut tail = fixture.tail();
+        tail.start(fixture.mutation_input(
+            Arc::from(source),
+            SessionPropertyMutation {
+                mutation: Box::new(mutation),
+                catalogs: Arc::new(ObservedCatalog(Arc::clone(&metadata))),
+            },
+            SqlCompileControl::unbounded(),
+        ));
+        closed(&mut tail).await;
+        let PreparedSessionProperties { staged, effects } = tail.prepared.take().unwrap().unwrap();
+        let existing = SessionPropertyValue::Boolean(false);
+        let get = |state: &SessionSqlState| {
+            state
+                .property_inputs()
+                .read_catalog_override_for_binding(&binding_key, INCREMENTAL_REFRESH_ENABLED)
+                .cloned()
+        };
+        assert_eq!(get(&fixture.live), reset.then_some(existing.clone()));
+        assert_eq!(get(&staged), (!reset).then_some(existing));
+        assert_old_live(&fixture);
+        assert_eq!(staged.execution_settings().pipeline_dop(), Some(7));
+        let canonical = format!("lake.{INCREMENTAL_REFRESH_ENABLED}");
+        if reset {
+            assert_eq!(effects.reset_properties().collect::<Vec<_>>(), [canonical]);
+            assert_eq!(effects.set_properties().count(), 0);
+            assert_eq!(fixture.window.retained_payload_bytes(), 0);
+            assert_eq!(
+                staged
+                    .property_inputs()
+                    .raw_catalog_value("lake", INCREMENTAL_REFRESH_ENABLED),
+                None
+            );
+        } else {
+            assert_eq!(
+                effects.set_properties().collect::<Vec<_>>(),
+                [(canonical, "false".into())]
+            );
+            assert!(effects.reset_properties().next().is_none());
+            assert!(fixture.window.retained_payload_bytes() > 0);
+        }
+        drop(staged);
+        drop(effects);
+        fixture.close(tail).await;
+    }
+}
+
+fn parse_session_action(source: &str) -> (StatementKind, TrinoSessionWork) {
+    let statement = novarocks_parser::parser::parse_statement(source).unwrap();
+    let TrinoStatementAction::Session(action) = admit_trino_statement(source, statement).unwrap()
+    else {
+        panic!("expected an admitted session action");
+    };
+    lower_trino_session_action(action)
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn trino_system_set_and_reset_do_not_consult_the_catalog() {
+    for (source, expected_kind, expected_dop) in [
+        (
+            r#"SET SESSION "PIPELINE_DOP" = 1 + 2"#,
+            StatementKind::SetSession,
+            Some(3),
+        ),
+        (
+            r#"RESET SESSION "PIPELINE_DOP""#,
+            StatementKind::ResetSession,
+            None,
+        ),
+    ] {
+        let fixture = Fixture::new(ResultCapacityConfig::V1);
+        let (kind, TrinoSessionWork::Mutation(mutation)) = parse_session_action(source) else {
+            panic!("expected a scoped mutation");
+        };
+        assert_eq!(kind, expected_kind);
+        let mut tail = fixture.tail();
+        tail.start(fixture.mutation_input(
+            Arc::from(source),
+            SessionPropertyMutation {
+                mutation: Box::new(mutation),
+                catalogs: Arc::new(SystemOnly),
+            },
+            SqlCompileControl::unbounded(),
+        ));
+        closed(&mut tail).await;
+        let PreparedSessionProperties { staged, effects } = tail.prepared.take().unwrap().unwrap();
+        assert_old_live(&fixture);
+        assert_eq!(staged.execution_settings().pipeline_dop(), expected_dop);
+        if expected_kind == StatementKind::ResetSession {
+            assert_eq!(effects.set_properties().count(), 0);
+            assert_eq!(
+                effects.reset_properties().collect::<Vec<_>>(),
+                ["pipeline_dop"]
+            );
+        } else {
+            assert_eq!(effects.reset_properties().count(), 0);
+            assert_eq!(
+                effects.set_properties().collect::<Vec<_>>(),
+                [(String::from("pipeline_dop"), String::from("3"))]
+            );
+        }
+        drop(staged);
+        drop(effects);
+        fixture.close(tail).await;
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn trino_use_preserves_identifiers_and_resolves_the_actual_namespace() {
+    use novarocks_query_application::admitted_query_context::QueryResultCapacityBinding;
+    use novarocks_query_application::sql::catalog::{SessionCatalogPort, SessionCatalogService};
+    use novarocks_spi::connector::{ConnectorRequestContext, ConnectorStopOwner};
+
+    #[derive(Default)]
+    struct NamespaceCatalog(Mutex<Vec<String>>);
+    impl SessionCatalogPropertyPort for NamespaceCatalog {
+        fn session_property_catalog(
+            &self,
+            _: &str,
+        ) -> Result<SessionCatalogPropertyAdmission, QueryServiceError> {
+            panic!("USE does not evaluate a catalog property")
+        }
+    }
+    #[async_trait::async_trait]
+    impl SessionCatalogPort for NamespaceCatalog {
+        fn database_exists(&self, database: &str) -> Result<bool, QueryServiceError> {
+            self.0.lock().unwrap().push(format!("local:{database}"));
+            Ok(true)
+        }
+
+        fn require_external_catalog_ready(&self, catalog: &str) -> Result<(), QueryServiceError> {
+            self.0.lock().unwrap().push(format!("ready:{catalog}"));
+            Ok(())
+        }
+
+        async fn external_namespace_exists(
+            &self,
+            _: ConnectorRequestContext,
+            _: &QueryResultCapacityBinding,
+            catalog: &str,
+            database: &str,
+        ) -> Result<bool, QueryServiceError> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("external:{catalog}.{database}"));
+            Ok(true)
+        }
+    }
+
+    let observations = Arc::new(NamespaceCatalog::default());
+    let resolver: SessionCatalogService = observations.clone();
+    let fixture = Fixture::new(ResultCapacityConfig::V1);
+    let capacity =
+        QueryResultCapacityBinding::try_new(&fixture.root.owner.scope(), fixture.window.clone())
+            .unwrap();
+    let stop = ConnectorStopOwner::new();
+    for (source, current, expected, calls) in [
+        (
+            r#"USE "LAKE"."MiXeD""#,
+            None,
+            Some((Some("lake"), "mixed")),
+            &["ready:lake", "external:lake.mixed"][..],
+        ),
+        (
+            "USE db",
+            Some("lake"),
+            Some((Some("lake"), "db")),
+            &["external:lake.db"][..],
+        ),
+        (
+            "USE default_catalog.db",
+            Some("lake"),
+            Some((None, "db")),
+            &["local:db"][..],
+        ),
+        (r#"USE "lake.other".db"#, None, None, &[][..]),
+        (r#"USE "lake.db""#, None, None, &[][..]),
+        (r#"USE " db ""#, None, None, &[][..]),
+    ] {
+        let (kind, TrinoSessionWork::Use { catalog, schema }) = parse_session_action(source) else {
+            panic!("expected an admitted USE");
+        };
+        assert_eq!(kind, StatementKind::Use);
+        let result = resolve_database_context(
+            &resolver,
+            current,
+            SessionNamespace {
+                catalog: catalog.as_ref(),
+                schema: &schema,
+                source,
+            },
+            ConnectorRequestContext::try_new(
+                Instant::now() + Duration::from_secs(30),
+                stop.view(),
+                1024,
+                2048,
+            )
+            .unwrap(),
+            &capacity,
+        )
+        .await;
+        if let Some((catalog, database)) = expected {
+            let context = result.unwrap();
+            assert_eq!(context.catalog.as_deref(), catalog);
+            assert_eq!(context.database, database);
+        } else {
+            assert_eq!(
+                result.unwrap_err().kind(),
+                novarocks_query_application::session_error::QueryServiceErrorKind::BadDatabase
+            );
+        }
+        assert_eq!(
+            observations.0.lock().unwrap().drain(..).collect::<Vec<_>>(),
+            calls
+        );
+    }
+    drop(capacity);
+    let tail = fixture.tail();
+    fixture.close(tail).await;
 }
 
 struct OriginalSetCpuPanic;

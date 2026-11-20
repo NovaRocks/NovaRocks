@@ -27,9 +27,9 @@ INSERT INTO ${case_db}.oq8_probe_big
     SELECT generate_series, generate_series FROM TABLE(generate_series(1, 1000));
 INSERT INTO ${case_db}.oq8_build_big
     SELECT generate_series, generate_series FROM TABLE(generate_series(1, 1000));
-ANALYZE TABLE ${case_db}.oq8_probe_big;
-ANALYZE TABLE ${case_db}.oq8_build_big;
-SET cbo_broadcast_backend_count = 7;
+ANALYZE ${case_db}.oq8_probe_big;
+ANALYZE ${case_db}.oq8_build_big;
+SET SESSION cbo_broadcast_backend_count = 7;
 -- @explain_contains=bcast_verdict=feasible
 -- @explain_contains=HASH JOIN (BROADCAST
 SELECT COUNT(*) AS cnt
@@ -40,12 +40,12 @@ INNER JOIN ${case_db}.oq8_build_big b ON p.k = b.k;
 -- broadcast assertions above, but do not freeze alias ordering in a full
 -- Verbose EXPLAIN golden.
 -- @skip_result_check=true
-EXPLAIN VERBOSE
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
 SELECT COUNT(*) AS cnt
 FROM ${case_db}.oq8_probe_big p
 INNER JOIN ${case_db}.oq8_build_big b ON p.k = b.k;
 
-SET cbo_broadcast_backend_count = 3;
+SET SESSION cbo_broadcast_backend_count = 3;
 -- @explain_contains=bcast_verdict=feasible
 -- @explain_contains=HASH JOIN (BROADCAST
 SELECT COUNT(*) AS cnt
@@ -53,7 +53,7 @@ FROM ${case_db}.oq8_probe_big p
 INNER JOIN ${case_db}.oq8_build_big b ON p.k = b.k;
 
 -- @skip_result_check=true
-EXPLAIN VERBOSE
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
 SELECT COUNT(*) AS cnt
 FROM ${case_db}.oq8_probe_big p
 INNER JOIN ${case_db}.oq8_build_big b ON p.k = b.k;

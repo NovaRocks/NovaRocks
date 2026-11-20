@@ -21,9 +21,9 @@
 -- query 1
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t_avg_distinct (g VARCHAR(8), x BIGINT, d DECIMAL(10,2));
-INSERT INTO ${case_db}.t_avg_distinct VALUES ('a',1,1.01),('a',3,1.01);
-INSERT INTO ${case_db}.t_avg_distinct VALUES ('a',1,1.01),('a',8,2.02);
-INSERT INTO ${case_db}.t_avg_distinct VALUES ('a',3,NULL),('a',NULL,NULL),('b',NULL,NULL);
+INSERT INTO ${case_db}.t_avg_distinct VALUES ROW('a',1,1.01),ROW('a',3,1.01);
+INSERT INTO ${case_db}.t_avg_distinct VALUES ROW('a',1,1.01),ROW('a',8,2.02);
+INSERT INTO ${case_db}.t_avg_distinct VALUES ROW('a',3,NULL),ROW('a',NULL,NULL),ROW('b',NULL,NULL);
 
 -- query 2
 SELECT g, count(DISTINCT x) AS n, sum(DISTINCT x) AS total,
@@ -46,14 +46,14 @@ FROM ${case_db}.t_avg_distinct WHERE FALSE;
 SELECT avg(DISTINCT positive) AS rounded_positive,
        avg(DISTINCT negative) AS rounded_negative
 FROM (VALUES
-    (CAST(0.0000000000001 AS DECIMAL(38,13)),CAST(-0.0000000000001 AS DECIMAL(38,13))),
-    (CAST(0.0000000000002 AS DECIMAL(38,13)),CAST(-0.0000000000002 AS DECIMAL(38,13))),
-    (CAST(0.0000000000002 AS DECIMAL(38,13)),CAST(-0.0000000000002 AS DECIMAL(38,13)))
+    ROW(CAST(0.0000000000001 AS DECIMAL(38,13)),CAST(-DECIMAL '0.0000000000001' AS DECIMAL(38,13))),
+    ROW(CAST(0.0000000000002 AS DECIMAL(38,13)),CAST(-DECIMAL '0.0000000000002' AS DECIMAL(38,13))),
+    ROW(CAST(0.0000000000002 AS DECIMAL(38,13)),CAST(-DECIMAL '0.0000000000002' AS DECIMAL(38,13)))
 ) AS source(positive, negative);
 
 -- query 7
 SELECT avg(DISTINCT x) AS signed_zero_avg
-FROM (VALUES (CAST(0.0 AS DOUBLE)),(CAST(-0.0 AS DOUBLE)),(CAST(4.0 AS DOUBLE)),(CAST(4.0 AS DOUBLE))) AS source(x);
+FROM (VALUES ROW(CAST(0.0 AS DOUBLE)),ROW(CAST(-DECIMAL '0.0' AS DOUBLE)),ROW(CAST(4.0 AS DOUBLE)),ROW(CAST(4.0 AS DOUBLE))) AS source(x);
 
 -- query 8
 -- @skip_result_check=true

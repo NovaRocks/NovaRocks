@@ -118,7 +118,7 @@ impl Scenario for MvStateStoreRestart {
             context,
             &mut conn,
             "create StateStore-backed materialized view",
-            "CREATE MATERIALIZED VIEW orders_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH DEFERRED MANUAL PROPERTIES ('storage_engine' = 'iceberg') AS SELECT k1, v2 FROM orders",
+            "CREATE MATERIALIZED VIEW orders_mv WITH (refresh_policy = 'MANUAL') AS SELECT k1, v2 FROM orders",
         )?;
         refresh(context, &mut conn, "orders_mv")?;
         assert_rows(
@@ -167,7 +167,7 @@ impl Scenario for MvStateStoreRestart {
             context,
             &mut conn,
             "create a second MV after StateStore recovery",
-            "CREATE MATERIALIZED VIEW orders_mv_2 DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH DEFERRED MANUAL PROPERTIES ('storage_engine' = 'iceberg') AS SELECT k1, v2 FROM orders",
+            "CREATE MATERIALIZED VIEW orders_mv_2 WITH (refresh_policy = 'MANUAL') AS SELECT k1, v2 FROM orders",
         )?;
         let views = query(
             context,
@@ -369,13 +369,13 @@ mv_refresh_scheduler_max_failure_backoff_ms = 1000
             context,
             &mut conn,
             "create first asynchronous scheduler MV",
-            "CREATE MATERIALIZED VIEW orders_mv_a DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH ASYNC EVERY INTERVAL 1 SECOND PROPERTIES ('storage_engine' = 'iceberg') AS SELECT k1, v2 FROM orders",
+            "CREATE MATERIALIZED VIEW orders_mv_a WITH (refresh_policy = 'INTERVAL', refresh_interval = '1s') AS SELECT k1, v2 FROM orders",
         )?;
         execute(
             context,
             &mut conn,
             "create second asynchronous scheduler MV",
-            "CREATE MATERIALIZED VIEW orders_mv_b DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH ASYNC EVERY INTERVAL 1 SECOND PROPERTIES ('storage_engine' = 'iceberg') AS SELECT k1, v2 FROM orders",
+            "CREATE MATERIALIZED VIEW orders_mv_b WITH (refresh_policy = 'INTERVAL', refresh_interval = '1s') AS SELECT k1, v2 FROM orders",
         )?;
         wait_for_marker_count(
             context,
@@ -453,13 +453,13 @@ mv_refresh_scheduler_max_failure_backoff_ms = 1000
             context,
             &mut conn,
             "pause first scheduler MV before recovery fault",
-            "ALTER MATERIALIZED VIEW orders_mv_a PAUSE REFRESH",
+            "ALTER MATERIALIZED VIEW orders_mv_a SET PROPERTIES refresh_paused = true",
         )?;
         execute(
             context,
             &mut conn,
             "pause second scheduler MV before recovery fault",
-            "ALTER MATERIALIZED VIEW orders_mv_b PAUSE REFRESH",
+            "ALTER MATERIALIZED VIEW orders_mv_b SET PROPERTIES refresh_paused = true",
         )?;
 
         clear_scheduler_markers(&barrier_dir)?;
@@ -468,7 +468,7 @@ mv_refresh_scheduler_max_failure_backoff_ms = 1000
             context,
             &mut conn,
             "create a scheduler MV for FE recovery",
-            "CREATE MATERIALIZED VIEW orders_mv_recovery DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH ASYNC EVERY INTERVAL 1 SECOND PROPERTIES ('storage_engine' = 'iceberg') AS SELECT k1, v2 FROM orders",
+            "CREATE MATERIALIZED VIEW orders_mv_recovery WITH (refresh_policy = 'INTERVAL', refresh_interval = '1s') AS SELECT k1, v2 FROM orders",
         )?;
         wait_for_file(
             context,
@@ -632,7 +632,7 @@ impl Scenario for MvRewriteBindingBarrier {
             context,
             &mut conn,
             "create aggregate MV for strict target binding",
-            "CREATE MATERIALIZED VIEW orders_agg_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH DEFERRED MANUAL PROPERTIES ('storage_engine' = 'iceberg') AS SELECT k1, SUM(v2) AS total_v2 FROM orders GROUP BY k1",
+            "CREATE MATERIALIZED VIEW orders_agg_mv WITH (refresh_policy = 'MANUAL') AS SELECT k1, SUM(v2) AS total_v2 FROM orders GROUP BY k1",
         )?;
         refresh(context, &mut conn, "orders_agg_mv")?;
 
@@ -804,7 +804,7 @@ impl Scenario for MvRefreshConfigurationInterleaving {
             context,
             &mut conn,
             "create MV for concurrent configuration and refresh",
-            "CREATE MATERIALIZED VIEW orders_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH DEFERRED MANUAL PROPERTIES ('storage_engine' = 'iceberg') AS SELECT k1, v2 FROM orders",
+            "CREATE MATERIALIZED VIEW orders_mv WITH (refresh_policy = 'MANUAL') AS SELECT k1, v2 FROM orders",
         )?;
         refresh(context, &mut conn, "orders_mv")?;
         let initial_configuration =
@@ -813,7 +813,7 @@ impl Scenario for MvRefreshConfigurationInterleaving {
             context,
             &mut conn,
             "create another independently managed MV",
-            "CREATE MATERIALIZED VIEW parallel_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH DEFERRED MANUAL PROPERTIES ('storage_engine' = 'iceberg') AS SELECT k1, v2 FROM orders",
+            "CREATE MATERIALIZED VIEW parallel_mv WITH (refresh_policy = 'MANUAL') AS SELECT k1, v2 FROM orders",
         )?;
         let initial_parallel_configuration =
             rest_configuration_revision(context, &rest_uri, "ns", "parallel_mv")?;
@@ -849,7 +849,7 @@ impl Scenario for MvRefreshConfigurationInterleaving {
             context,
             &mut conn,
             "pause another MV while orders_mv refresh remains held",
-            "ALTER MATERIALIZED VIEW parallel_mv PAUSE REFRESH",
+            "ALTER MATERIALIZED VIEW parallel_mv SET PROPERTIES refresh_paused = true",
         )?;
         let final_parallel_configuration =
             rest_configuration_revision(context, &rest_uri, "ns", "parallel_mv")?;
@@ -871,7 +871,7 @@ impl Scenario for MvRefreshConfigurationInterleaving {
                 .context("signal configuration writer readiness")?;
             run_original_mv_statement(
                 &mut writer,
-                "ALTER MATERIALIZED VIEW orders_mv PAUSE REFRESH",
+                "ALTER MATERIALIZED VIEW orders_mv SET PROPERTIES refresh_paused = true",
                 deadline,
                 &cancellation,
             )?;
@@ -1109,7 +1109,7 @@ fn source_window_interleavings(
                 context,
                 conn,
                 "create independently owned replacement source",
-                "CREATE TABLE window_uuid_replacement (k1 INT,v2 BIGINT) TBLPROPERTIES ('format-version'='3','write.row-lineage'='true')",
+                "CREATE TABLE window_uuid_replacement (k1 INT,v2 BIGINT) WITH (format_version = 3)",
             )?;
             execute(
                 context,
@@ -1207,9 +1207,7 @@ fn create_window_fixture(
         context,
         conn,
         "create isolated source-window table",
-        &format!(
-            "CREATE TABLE {source} (k1 INT,v2 BIGINT) TBLPROPERTIES ('format-version'='3','write.row-lineage'='true')"
-        ),
+        &format!("CREATE TABLE {source} (k1 INT,v2 BIGINT) WITH (format_version = 3)"),
     )?;
     execute(
         context,
@@ -1222,7 +1220,7 @@ fn create_window_fixture(
         conn,
         "create isolated source-window MV",
         &format!(
-            "CREATE MATERIALIZED VIEW {mv} DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH DEFERRED MANUAL PROPERTIES ('storage_engine'='iceberg') AS SELECT k1,v2 FROM {source}"
+            "CREATE MATERIALIZED VIEW {mv} WITH (refresh_policy = 'MANUAL') AS SELECT k1,v2 FROM {source}"
         ),
     )
 }
@@ -1244,14 +1242,18 @@ fn hold_source_refresh(
     let port = context.trino_port();
     let deadline = context.deadline();
     let catalog = catalog.to_string();
-    let sql = format!(
-        "REFRESH MATERIALIZED VIEW {mv}{} WITH SYNC MODE",
-        if full { " FULL" } else { "" }
-    );
+    let sql = format!("REFRESH MATERIALIZED VIEW {mv}");
     let held = spawn_cancellable_sql_actor(move |cancellation| {
         let mut conn = SqlSession::new(&user, port, deadline)?;
 
         conn.execute(format!("USE {catalog}.ns"))?;
+        if full {
+            let qualified = format!(
+                "\"{}\".incremental_refresh_enabled",
+                catalog.replace('"', "\"\"")
+            );
+            conn.execute(format!("SET SESSION {qualified} = false"))?;
+        }
         run_original_mv_statement(&mut conn, &sql, deadline, &cancellation)?;
         Ok(())
     });
@@ -1602,7 +1604,7 @@ impl Scenario for MvCurrentDependencyRecheck {
             context,
             &mut conn,
             "create MV for Current dependency recheck",
-            "CREATE MATERIALIZED VIEW orders_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH DEFERRED MANUAL PROPERTIES ('storage_engine' = 'iceberg') AS SELECT k1, v2 FROM orders",
+            "CREATE MATERIALIZED VIEW orders_mv WITH (refresh_policy = 'MANUAL') AS SELECT k1, v2 FROM orders",
         )?;
         refresh(context, &mut conn, "orders_mv")?;
         execute(
@@ -1739,7 +1741,7 @@ impl Scenario for MvLegacyInterpretationRebuild {
         };
         let mut conn = connect(context)?;
         setup_orders_fixture_rest(context, &mut conn, catalog, &create_catalog_sql, true)?;
-        let create = "CREATE MATERIALIZED VIEW orders_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH DEFERRED MANUAL PROPERTIES ('storage_engine' = 'iceberg') AS SELECT k1, v2 FROM orders";
+        let create = "CREATE MATERIALIZED VIEW orders_mv WITH (refresh_policy = 'MANUAL') AS SELECT k1, v2 FROM orders";
         execute(context, &mut conn, "create an unpublished MV", create)?;
         externally_persist_old_endian_interpretation(context, &rest_uri, "ns", "orders_mv")?;
         drop(conn);
@@ -1927,7 +1929,7 @@ impl Scenario for MvStagedPublishedRecovery {
             context,
             &mut conn,
             "create MV for staged and published recovery",
-            "CREATE MATERIALIZED VIEW orders_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH DEFERRED MANUAL PROPERTIES ('storage_engine' = 'iceberg') AS SELECT k1, v2 FROM orders",
+            "CREATE MATERIALIZED VIEW orders_mv WITH (refresh_policy = 'MANUAL') AS SELECT k1, v2 FROM orders",
         )?;
 
         // A canonical publication is one commit: the rows and the publication
@@ -2113,7 +2115,7 @@ impl Scenario for MvFirstRefreshStaging {
             context,
             &mut conn,
             "create first-refresh projection MV",
-            "CREATE MATERIALIZED VIEW orders_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH DEFERRED MANUAL PROPERTIES ('storage_engine' = 'iceberg') AS SELECT k1, v2 FROM orders",
+            "CREATE MATERIALIZED VIEW orders_mv WITH (refresh_policy = 'MANUAL') AS SELECT k1, v2 FROM orders",
         )?;
         refresh(context, &mut conn, "orders_mv")?;
         assert_rows(
@@ -2128,7 +2130,7 @@ impl Scenario for MvFirstRefreshStaging {
             context,
             &mut conn,
             "create first-refresh aggregate MV",
-            "CREATE MATERIALIZED VIEW orders_agg_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH DEFERRED MANUAL PROPERTIES ('storage_engine' = 'iceberg') AS SELECT k1, SUM(v2) AS total_v2 FROM orders GROUP BY k1",
+            "CREATE MATERIALIZED VIEW orders_agg_mv WITH (refresh_policy = 'MANUAL') AS SELECT k1, SUM(v2) AS total_v2 FROM orders GROUP BY k1",
         )?;
         refresh(context, &mut conn, "orders_agg_mv")?;
         assert_rows(
@@ -2143,7 +2145,7 @@ impl Scenario for MvFirstRefreshStaging {
             context,
             &mut conn,
             "create MV used to prove failed first refresh is not published",
-            "CREATE MATERIALIZED VIEW orders_start_fault_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH DEFERRED MANUAL PROPERTIES ('storage_engine' = 'iceberg') AS SELECT k1, v2 FROM orders",
+            "CREATE MATERIALIZED VIEW orders_start_fault_mv WITH (refresh_policy = 'MANUAL') AS SELECT k1, v2 FROM orders",
         )?;
         // The refresh has to fail from inside a task that was really admitted
         // and really started, because that is what leaves a staged main
@@ -2323,7 +2325,7 @@ impl Scenario for MvBaseIdentityReplacement {
             context,
             &mut conn,
             "create MV with a durable base-object binding",
-            "CREATE MATERIALIZED VIEW orders_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH DEFERRED MANUAL PROPERTIES ('storage_engine' = 'iceberg') AS SELECT k1, v2 FROM orders",
+            "CREATE MATERIALIZED VIEW orders_mv WITH (refresh_policy = 'MANUAL') AS SELECT k1, v2 FROM orders",
         )?;
         refresh(context, &mut conn, "orders_mv")?;
         assert_rows(
@@ -2342,7 +2344,7 @@ impl Scenario for MvBaseIdentityReplacement {
             context,
             &mut conn,
             "recreate base table under the same logical name",
-            "CREATE TABLE orders (k1 INT, v2 BIGINT) TBLPROPERTIES (\"format-version\"=\"3\", \"write.row-lineage\"=\"true\")",
+            "CREATE TABLE orders (k1 INT, v2 BIGINT) WITH (format_version = 3)",
         )?;
         execute(
             context,
@@ -2454,7 +2456,7 @@ impl Scenario for MvLakePublicationRestartRebuild {
             context,
             &mut conn,
             "create MV with canonical lake documents",
-            "CREATE MATERIALIZED VIEW orders_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH DEFERRED MANUAL PROPERTIES ('storage_engine' = 'iceberg') AS SELECT k1, v2 FROM orders",
+            "CREATE MATERIALIZED VIEW orders_mv WITH (refresh_policy = 'MANUAL') AS SELECT k1, v2 FROM orders",
         )?;
         refresh(context, &mut conn, "orders_mv")?;
         assert_rows(
@@ -2468,7 +2470,7 @@ impl Scenario for MvLakePublicationRestartRebuild {
             context,
             &mut conn,
             &format!(
-                "CALL {catalog}.system.novarocks_imv_stateless_rebuild(table => 'ns.orders_mv', level => 'provenance')"
+                "CALL {catalog}.system.novarocks_imv_stateless_rebuild(\"table\" => 'ns.orders_mv', level => 'provenance')"
             ),
             "confirm the published MV has exact lake documents",
         )?;
@@ -2488,7 +2490,7 @@ impl Scenario for MvLakePublicationRestartRebuild {
             context,
             &mut conn,
             &format!(
-                "CALL {catalog}.system.novarocks_imv_stateless_rebuild(table => 'ns.orders_mv', level => 'wipe')"
+                "CALL {catalog}.system.novarocks_imv_stateless_rebuild(\"table\" => 'ns.orders_mv', level => 'wipe')"
             ),
             "wipe only the MV Accelerator after proving lake documents",
         )?;
@@ -2584,14 +2586,14 @@ fn setup_orders_fixture_rest(
         context,
         conn,
         "create MV fixture namespace",
-        &format!("CREATE DATABASE {catalog}.ns"),
+        &format!("CREATE SCHEMA {catalog}.ns"),
     )?;
     select_catalog_and_database(context, conn, catalog)?;
     execute(
         context,
         conn,
         "create MV source table",
-        "CREATE TABLE orders (k1 INT, v2 BIGINT) TBLPROPERTIES (\"format-version\"=\"3\", \"write.row-lineage\"=\"true\")",
+        "CREATE TABLE orders (k1 INT, v2 BIGINT) WITH (format_version = 3)",
     )?;
     if seed_rows {
         execute(

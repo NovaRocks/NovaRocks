@@ -20,7 +20,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
-const OPTIMIZE_SQL: &str = "ALTER TABLE orders OPTIMIZE";
+const OPTIMIZE_SQL: &str = "ALTER TABLE orders EXECUTE optimize";
 const CATALOG: &str = "system_stat2f_maintenance";
 
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
@@ -167,13 +167,13 @@ impl Scenario for OptimizeTargetReplacement {
                         context,
                         conn,
                         "drop original optimize target incarnation",
-                        "DROP TABLE orders FORCE",
+                        "DROP TABLE orders ",
                     )?;
                     execute(
                         context,
                         conn,
                         "recreate optimize target under the same logical name",
-                        "CREATE TABLE orders (k1 INT, v2 BIGINT) TBLPROPERTIES (\"format-version\"=\"3\", \"write.row-lineage\"=\"true\")",
+                        "CREATE TABLE orders (k1 INT, v2 BIGINT) WITH (format_version = 3)",
                     )?;
                     execute(
                         context,
@@ -399,14 +399,14 @@ fn setup_orders_fixture(
         context,
         conn,
         "create maintenance fixture namespace",
-        &format!("CREATE DATABASE {catalog}.ns"),
+        &format!("CREATE SCHEMA {catalog}.ns"),
     )?;
     select_catalog_and_database(context, conn, catalog)?;
     execute(
         context,
         conn,
         "create maintenance target table",
-        "CREATE TABLE orders (k1 INT, v2 BIGINT) TBLPROPERTIES (\"format-version\"=\"3\", \"write.row-lineage\"=\"true\")",
+        "CREATE TABLE orders (k1 INT, v2 BIGINT) WITH (format_version = 3)",
     )?;
     execute(
         context,

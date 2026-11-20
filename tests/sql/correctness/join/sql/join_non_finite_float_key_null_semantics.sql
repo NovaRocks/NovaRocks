@@ -28,16 +28,16 @@ WITH
 left_keys AS (
   SELECT CAST('NaN' AS DOUBLE) AS k
   UNION ALL SELECT CAST('Infinity' AS DOUBLE)
-  UNION ALL SELECT SQRT(-1.0)
+  UNION ALL SELECT SQRT(-DECIMAL '1.0')
   UNION ALL SELECT 1.5
 ),
 right_keys AS (
   SELECT CAST('NaN' AS DOUBLE) AS k
-  UNION ALL SELECT LOG(-1.0)
+  UNION ALL SELECT LOG(-DECIMAL '1.0')
   UNION ALL SELECT ACOS(2.0)
   UNION ALL SELECT 1.5
 )
 SELECT
-  (SELECT COUNT(*) FROM left_keys WHERE k IS NULL) AS left_null_keys,
-  (SELECT COUNT(*) FROM right_keys WHERE k IS NULL) AS right_null_keys,
-  (SELECT COUNT(*) FROM left_keys l INNER JOIN right_keys r ON l.k = r.k) AS join_matches;
+  (SELECT COUNT() FROM left_keys WHERE k IS NULL) AS left_null_keys,
+  (SELECT COUNT() FROM right_keys WHERE k IS NULL) AS right_null_keys,
+  (SELECT COUNT() FROM left_keys l INNER JOIN right_keys r ON l.k = r.k) AS join_matches;

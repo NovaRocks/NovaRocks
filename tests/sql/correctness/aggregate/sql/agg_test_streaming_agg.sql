@@ -29,18 +29,17 @@ USE ${case_db};
 create table t0(
     c0 INT,
     c1 BIGINT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 3
 -- @skip_result_check=true
 USE ${case_db};
-insert into t0 values (1,1),(2,2),(3,3),(4,4),(5,5);
+insert into t0 values ROW(1,1),ROW(2,2),ROW(3,3),ROW(4,4),ROW(5,5);
 
 -- query 4
 -- @skip_result_check=true
 USE ${case_db};
-set pipeline_dop=1;
+SET SESSION pipeline_dop = 1;
 
 -- query 5
 -- @skip_result_check=true
@@ -68,8 +67,7 @@ USE ${case_db};
 create table t1 (
     c0 INT,
     c1 BIGINT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 11
 -- @skip_result_check=true

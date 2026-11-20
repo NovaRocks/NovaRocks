@@ -24,7 +24,7 @@ use novarocks_cluster_harness::test_sessions::{
     ClusterTestSessionPlan, RoleLaunchReference, RoleSlot,
 };
 use novarocks_failpoint::session::DomainGrant;
-use novarocks_parser::ast::{MaterializedViewStatement, SessionStatement, Statement};
+use novarocks_parser::{ast::TrinoStatement, parser::parse_statement};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -131,7 +131,7 @@ fn budget(
                 &mut total,
                 mul(
                     query,
-                    crate::session::split_sql_statements(&hook.sql)?
+                    crate::session::split_trino_step_sql(&hook.sql, None)?
                         .len()
                         .checked_mul(2)
                         .context("hook count overflow")?,
@@ -156,7 +156,11 @@ fn budget(
                 let statements = if crate::shell::is_shell_step(&step.sql) {
                     1
                 } else {
-                    crate::session::split_sql_statements(&step.sql)?.len()
+                    crate::session::split_trino_step_sql(
+                        &step.sql,
+                        step.meta.expect_trino_error.as_ref(),
+                    )?
+                    .len()
                 };
                 // Session context and query_timeout travel in the statement headers.
                 let operations = statements
@@ -212,21 +216,29 @@ struct SqlContext {
 }
 impl SqlContext {
     fn apply(&mut self, sql: &str) {
-        let Ok(statements) = novarocks_parser::parse(sql) else {
+        let Ok(statements) = crate::session::split_trino_sql_statements(sql).and_then(|pieces| {
+            pieces
+                .iter()
+                .map(|piece| parse_statement(piece).map_err(Into::into))
+                .collect::<Result<Vec<_>>>()
+        }) else {
             return;
         };
         for statement in statements {
-            if let Statement::Session(SessionStatement::Use(value)) = statement {
+            if let TrinoStatement::Use(value) = statement {
                 if let Some(catalog) = value.catalog {
                     self.catalog = Some(catalog.value);
                 }
-                self.namespace = Some(value.database.value);
+                self.namespace = Some(value.schema.value);
             }
         }
     }
     fn target(&self, name: &str, catalog: Option<&str>) -> Result<MvDocumentDemand> {
         let parts = name.split('.').collect::<Vec<_>>();
-        let (catalog, namespace, mv) = match parts.as_slice() {
+        self.target_parts(&parts, catalog)
+    }
+    fn target_parts(&self, parts: &[&str], catalog: Option<&str>) -> Result<MvDocumentDemand> {
+        let (catalog, namespace, mv) = match parts {
             [mv] => (
                 catalog
                     .or(self.catalog.as_deref())
@@ -264,25 +276,23 @@ impl SqlContext {
         })
     }
     fn refresh_target(&self, sql: &str) -> Result<MvDocumentDemand> {
-        let statements = novarocks_parser::parse(sql)
-            .map_err(|error| anyhow::anyhow!("decode controlled REFRESH: {error}"))?;
         let mut target = None;
-        for statement in statements {
-            if let Statement::MaterializedView(MaterializedViewStatement::Refresh(refresh)) =
-                statement
-            {
+        for piece in crate::session::split_trino_sql_statements(sql)? {
+            let statement = parse_statement(&piece)
+                .map_err(|error| anyhow::anyhow!("decode controlled REFRESH: {error}"))?;
+            if let TrinoStatement::RefreshMaterializedView(refresh) = statement {
                 ensure!(
                     target.is_none(),
                     "controlled step contains more than one REFRESH target"
                 );
-                let name = refresh
+                let parts = refresh
+                    .table
                     .name
                     .parts
                     .iter()
                     .map(|part| part.value.as_str())
-                    .collect::<Vec<_>>()
-                    .join(".");
-                target = Some(self.target(&name, None)?);
+                    .collect::<Vec<_>>();
+                target = Some(self.target_parts(&parts, None)?);
             }
         }
         target.context("known-committed control requires a literal REFRESH target")
@@ -359,9 +369,11 @@ fn native_observation_grants(
     (bind, observe)
 }
 
-fn ensure_single_submitted_statement(sql: &str) -> Result<()> {
+fn ensure_single_submitted_statement(step: &SqlStep) -> Result<()> {
     ensure!(
-        crate::session::split_sql_statements(sql)?.len() == 1,
+        crate::session::split_trino_step_sql(&step.sql, step.meta.expect_trino_error.as_ref())?
+            .len()
+            == 1,
         "selected Native fault or client cancellation requires one exact submitted SQL statement"
     );
     Ok(())
@@ -417,7 +429,7 @@ pub(crate) fn build(
             !crate::shell::is_shell_step(&step.sql),
             "client query cancellation requires a SQL step"
         );
-        ensure_single_submitted_statement(&step.sql)?;
+        ensure_single_submitted_statement(step)?;
     }
     let needs = required(inputs);
     if !needs {
@@ -620,10 +632,11 @@ pub(crate) fn build(
                     let submissions = statement_controls::plan_submissions(
                         &format!("sql-{sequence}"),
                         &step.sql,
+                        meta.expect_trino_error.as_ref(),
                         crate::results::step_retry_count(step),
                     )?;
                     if !faults.is_empty() {
-                        ensure_single_submitted_statement(&step.sql)?;
+                        ensure_single_submitted_statement(step)?;
                     }
                     let fe = refs.get_mut(&fe_key).unwrap();
                     if !fe
@@ -827,7 +840,7 @@ mod tests {
         let file = tempfile::NamedTempFile::new().unwrap();
         let input = inputs(vec![step(
             1,
-            "CALL ice.system.novarocks_imv_stateless_rebuild(table => 'db.mv', level => 'package')",
+            "CALL ice.system.novarocks_imv_stateless_rebuild(\"table\" => 'db.mv', level => 'package')",
             QueryMeta {
                 tags: vec![crate::parser::MV_DOCUMENT_OBSERVATION_TAG.into()],
                 retry_count: Some(2),
@@ -1085,7 +1098,7 @@ mod tests {
         let file = tempfile::NamedTempFile::new().unwrap();
         let input = inputs(vec![step(
             1,
-            "CALL ice.system.novarocks_imv_stateless_rebuild(table => 'db.mv', level => 'wipe')",
+            "CALL ice.system.novarocks_imv_stateless_rebuild(\"table\" => 'db.mv', level => 'wipe')",
             Default::default(),
         )]);
         assert!(!required(&input));
@@ -1223,7 +1236,7 @@ mod tests {
                 .iter()
                 .find(|step| &step.query_number == query)
                 .unwrap();
-            let statements = crate::session::split_sql_statements(&source.sql).unwrap();
+            let statements = crate::session::split_trino_sql_statements(&source.sql).unwrap();
             let expected = (0..crate::results::step_retry_count(source))
                 .flat_map(|outer| {
                     (0..2).flat_map({
@@ -1526,7 +1539,7 @@ mod tests {
         let file = tempfile::NamedTempFile::new().unwrap();
         let mut input = inputs(vec![step(
             4,
-            "CALL ice.system.novarocks_imv_stateless_rebuild(table => 'db.mv', level => 'package')",
+            "CALL ice.system.novarocks_imv_stateless_rebuild(\"table\" => 'db.mv', level => 'package')",
             QueryMeta {
                 tags: vec![crate::parser::MV_DOCUMENT_OBSERVATION_TAG.into()],
                 restart_fe_after_step: true,

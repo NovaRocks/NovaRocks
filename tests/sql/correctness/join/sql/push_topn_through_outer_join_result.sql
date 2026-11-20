@@ -31,11 +31,11 @@ INSERT INTO ${case_db}.topn_outer_result_right
     SELECT generate_series, generate_series * 10
     FROM TABLE(generate_series(1, 990));
 INSERT INTO ${case_db}.topn_outer_result_right VALUES
-    (99999, 1999990), (99997, 1999970), (100001, 2000000);
-ANALYZE TABLE ${case_db}.topn_outer_result_left;
-ANALYZE TABLE ${case_db}.topn_outer_result_right;
+    ROW(99999, 1999990), ROW(99997, 1999970), ROW(100001, 2000000);
+ANALYZE ${case_db}.topn_outer_result_left;
+ANALYZE ${case_db}.topn_outer_result_right;
 
-SET disable_optimizer_rules = '';
+SET SESSION disable_optimizer_rules = '';
 
 -- PushTopNThroughJoin caps the preserved-side input before the LEFT JOIN, so
 -- the join cardinality estimate is bounded by the pushed TopN limit.
@@ -46,7 +46,7 @@ LEFT JOIN ${case_db}.topn_outer_result_right r ON l.id = r.id
 ORDER BY l.score ASC, l.id ASC
 LIMIT 4;
 
-SET disable_optimizer_rules = 'PushTopNThroughJoin';
+SET SESSION disable_optimizer_rules = 'PushTopNThroughJoin';
 
 SELECT l.id, l.score, r.payload
 FROM ${case_db}.topn_outer_result_left l
@@ -54,7 +54,7 @@ LEFT JOIN ${case_db}.topn_outer_result_right r ON l.id = r.id
 ORDER BY l.score ASC, l.id ASC
 LIMIT 4;
 
-SET disable_optimizer_rules = '';
+SET SESSION disable_optimizer_rules = '';
 
 -- RIGHT preserved-side pushdown remains disabled. Equivalent plans may use
 -- either LEFT or RIGHT physical orientation. These checks protect the outer
@@ -68,7 +68,7 @@ RIGHT JOIN ${case_db}.topn_outer_result_right r ON l.id = r.id
 ORDER BY r.payload DESC, r.id ASC
 LIMIT 4;
 
-SET disable_optimizer_rules = 'PushTopNThroughJoin';
+SET SESSION disable_optimizer_rules = 'PushTopNThroughJoin';
 
 SELECT l.id, l.score, r.payload
 FROM ${case_db}.topn_outer_result_left l
@@ -76,4 +76,4 @@ RIGHT JOIN ${case_db}.topn_outer_result_right r ON l.id = r.id
 ORDER BY r.payload DESC, r.id ASC
 LIMIT 4;
 
-SET disable_optimizer_rules = '';
+SET SESSION disable_optimizer_rules = '';

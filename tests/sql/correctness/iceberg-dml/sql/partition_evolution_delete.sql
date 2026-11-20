@@ -22,24 +22,22 @@
 
 -- query 1
 -- @skip_result_check=true
-DROP TABLE IF EXISTS ${case_db}.t_partition_evolution_delete FORCE;
+DROP TABLE IF EXISTS ${case_db}.t_partition_evolution_delete ;
 CREATE TABLE ${case_db}.t_partition_evolution_delete (
   id BIGINT,
   user_id BIGINT,
   score INT
-)
-PARTITION BY bucket(user_id, 4)
-TBLPROPERTIES ("format-version" = "2");
+) WITH (partitioning = ARRAY['bucket(user_id, 4)'], format_version = 2);
 INSERT INTO ${case_db}.t_partition_evolution_delete VALUES
-  (1, 10, 100),
-  (2, 20, 200),
-  (3, 30, 300);
-ALTER TABLE ${case_db}.t_partition_evolution_delete DROP PARTITION COLUMN bucket(user_id, 4);
-ALTER TABLE ${case_db}.t_partition_evolution_delete ADD PARTITION COLUMN bucket(user_id, 8);
+  ROW(1, 10, 100),
+  ROW(2, 20, 200),
+  ROW(3, 30, 300);
+ALTER TABLE ${case_db}.t_partition_evolution_delete SET PROPERTIES partitioning = ARRAY[];
+ALTER TABLE ${case_db}.t_partition_evolution_delete SET PROPERTIES partitioning = ARRAY['bucket(user_id, 8)'];
 INSERT INTO ${case_db}.t_partition_evolution_delete VALUES
-  (4, 40, 400),
-  (5, 50, 500),
-  (6, 60, 600);
+  ROW(4, 40, 400),
+  ROW(5, 50, 500),
+  ROW(6, 60, 600);
 DELETE FROM ${case_db}.t_partition_evolution_delete WHERE id IN (2, 5);
 
 -- query 2
@@ -53,4 +51,4 @@ ORDER BY id;
 
 -- query 4
 -- @skip_result_check=true
-DROP TABLE ${case_db}.t_partition_evolution_delete FORCE;
+DROP TABLE ${case_db}.t_partition_evolution_delete ;

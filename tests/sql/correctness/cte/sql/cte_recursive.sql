@@ -40,53 +40,52 @@
 -- @skip_result_check=true
 DROP TABLE IF EXISTS ${case_db}.employees;
 CREATE TABLE ${case_db}.employees (
-  `employee_id` int(11) NULL COMMENT "",
-  `name` varchar(100) NULL COMMENT "",
-  `manager_id` int(11) NULL COMMENT "",
-  `title` varchar(50) NULL COMMENT ""
-)
-TBLPROPERTIES ("format-version" = "3");
+  "employee_id" int(11),
+  "name" varchar(100),
+  "manager_id" int(11),
+  "title" varchar(50)
+) WITH (format_version = 3);
 INSERT INTO ${case_db}.employees VALUES
-(1, 'Alicia', NULL, 'CEO'),
-(2, 'Bob', 1, 'CTO'),
-(3, 'Carol', 1, 'CFO'),
-(4, 'David', 2, 'VP of Engineering'),
-(5, 'Eve', 2, 'VP of Research'),
-(6, 'Frank', 3, 'VP of Finance'),
-(7, 'Grace', 4, 'Engineering Manager'),
-(8, 'Heidi', 4, 'Tech Lead'),
-(9, 'Ivan', 5, 'Research Manager'),
-(10, 'Judy', 7, 'Senior Engineer'),
-(11, 'Kevin', 6, 'Finance Manager'),
-(12, 'Laura', 6, 'Accountant'),
-(13, 'Mike', 8, 'Senior Engineer'),
-(14, 'Nancy', 8, 'Engineer'),
-(15, 'Oscar', 7, 'Software Engineer'),
-(16, 'Peter', 7, 'QA Engineer'),
-(17, 'Quinn', 9, 'Research Scientist'),
-(18, 'Rachel', 9, 'Data Scientist'),
-(19, 'Steve', 11, 'Financial Analyst'),
-(20, 'Tina', 13, 'Engineer'),
-(21, 'Uma', 13, 'Junior Engineer'),
-(22, 'Victor', 15, 'Junior Developer'),
-(23, 'Wendy', 17, 'Research Associate'),
-(24, 'Xavier', 18, 'ML Engineer'),
-(25, 'Yolanda', 14, 'Junior Engineer');
+ROW(1, 'Alicia', NULL, 'CEO'),
+ROW(2, 'Bob', 1, 'CTO'),
+ROW(3, 'Carol', 1, 'CFO'),
+ROW(4, 'David', 2, 'VP of Engineering'),
+ROW(5, 'Eve', 2, 'VP of Research'),
+ROW(6, 'Frank', 3, 'VP of Finance'),
+ROW(7, 'Grace', 4, 'Engineering Manager'),
+ROW(8, 'Heidi', 4, 'Tech Lead'),
+ROW(9, 'Ivan', 5, 'Research Manager'),
+ROW(10, 'Judy', 7, 'Senior Engineer'),
+ROW(11, 'Kevin', 6, 'Finance Manager'),
+ROW(12, 'Laura', 6, 'Accountant'),
+ROW(13, 'Mike', 8, 'Senior Engineer'),
+ROW(14, 'Nancy', 8, 'Engineer'),
+ROW(15, 'Oscar', 7, 'Software Engineer'),
+ROW(16, 'Peter', 7, 'QA Engineer'),
+ROW(17, 'Quinn', 9, 'Research Scientist'),
+ROW(18, 'Rachel', 9, 'Data Scientist'),
+ROW(19, 'Steve', 11, 'Financial Analyst'),
+ROW(20, 'Tina', 13, 'Engineer'),
+ROW(21, 'Uma', 13, 'Junior Engineer'),
+ROW(22, 'Victor', 15, 'Junior Developer'),
+ROW(23, 'Wendy', 17, 'Research Associate'),
+ROW(24, 'Xavier', 18, 'ML Engineer'),
+ROW(25, 'Yolanda', 14, 'Junior Engineer');
 
 -- query 2
 -- @order_sensitive=true
 -- Basic recursive CTE: org hierarchy with path, ordered by employee_id
 -- Default max_depth=5 means level-6 employees (20-25) are not returned
 WITH RECURSIVE org_hierarchy AS (
-    SELECT employee_id, name, manager_id, title, cast(1 as bigint) AS `level`, name AS path
+    SELECT employee_id, name, manager_id, title, cast(1 as bigint) AS "level", name AS path
     FROM ${case_db}.employees
     WHERE manager_id IS NULL
     UNION ALL
-    SELECT e.employee_id, e.name, e.manager_id, e.title, oh.`level` + 1, CONCAT(oh.path, ' -> ', e.name)
+    SELECT e.employee_id, e.name, e.manager_id, e.title, oh."level" + 1, CONCAT(oh.path, ' -> ', e.name)
     FROM ${case_db}.employees e
     INNER JOIN org_hierarchy oh ON e.manager_id = oh.employee_id
 )
-SELECT  employee_id, name, title, `level`, path
+SELECT  employee_id, name, title, "level", path
 FROM org_hierarchy
 ORDER BY employee_id;
 
@@ -160,33 +159,33 @@ ORDER BY s.employee_id;
 -- @order_sensitive=true
 -- Aggregation over recursive CTE: employee count per org level
 WITH RECURSIVE org_hierarchy AS (
-    SELECT employee_id, name, manager_id, title, cast(1 as bigint) AS `level`
+    SELECT employee_id, name, manager_id, title, cast(1 as bigint) AS "level"
     FROM ${case_db}.employees
     WHERE manager_id IS NULL
     UNION ALL
-    SELECT e.employee_id, e.name, e.manager_id, e.title, oh.`level` + 1
+    SELECT e.employee_id, e.name, e.manager_id, e.title, oh."level" + 1
     FROM ${case_db}.employees e
     INNER JOIN org_hierarchy oh ON e.manager_id = oh.employee_id
 )
-SELECT  `level`, COUNT(*) AS employee_count
+SELECT  "level", COUNT(*) AS employee_count
 FROM org_hierarchy
-GROUP BY `level`
-ORDER BY `level`;
+GROUP BY "level"
+ORDER BY "level";
 
 -- query 8
 -- @order_sensitive=true
 -- Recursive CTE with WHERE in recursive part limiting depth to 3
 WITH RECURSIVE parent_cte AS (
-    SELECT employee_id, name, manager_id, cast(1 as bigint) AS `level`
+    SELECT employee_id, name, manager_id, cast(1 as bigint) AS "level"
     FROM ${case_db}.employees
     WHERE manager_id IS NULL
     UNION ALL
-    SELECT e.employee_id, e.name, e.manager_id, p.`level` + 1
+    SELECT e.employee_id, e.name, e.manager_id, p."level" + 1
     FROM ${case_db}.employees e
     INNER JOIN parent_cte p ON e.manager_id = p.employee_id
-    WHERE p.`level` < 3
+    WHERE p."level" < 3
 )
-SELECT  employee_id, name, `level`
+SELECT  employee_id, name, "level"
 FROM parent_cte
 ORDER BY employee_id;
 
@@ -237,7 +236,7 @@ ORDER BY n;
 -- query 12
 -- @order_sensitive=true
 -- Fibonacci WITH recursive_cte_max_depth=10 → correct 10-row Fibonacci sequence
-WITH RECURSIVE fibonacci(n, fib_n, fib_n_plus_1) AS (
+WITH SESSION recursive_cte_max_depth = 10 WITH RECURSIVE fibonacci(n, fib_n, fib_n_plus_1) AS (
     SELECT cast(1 as bigint), cast(0 as bigint), cast(1 as bigint)
     UNION ALL
     SELECT n + 1, fib_n_plus_1, fib_n + fib_n_plus_1

@@ -178,6 +178,7 @@ fn recipe(
         &FunctionValueType::new(DataType::Decimal128(p, s), true),
         policy,
         allow,
+        None,
         &Control,
     )
     .unwrap()

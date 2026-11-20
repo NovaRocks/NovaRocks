@@ -32,9 +32,8 @@ DROP TABLE IF EXISTS ${case_db}.__row_util_base;
 -- query 2
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.__row_util_base (
-  k1 bigint NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+  k1 bigint
+) WITH (format_version = 3);
 
 -- query 3
 -- @skip_result_check=true
@@ -55,9 +54,8 @@ DROP TABLE IF EXISTS ${case_db}.__row_util;
 -- query 7
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.__row_util (
-  idx bigint NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+  idx bigint
+) WITH (format_version = 3);
 
 -- query 8
 -- @skip_result_check=true
@@ -70,27 +68,26 @@ DROP TABLE IF EXISTS ${case_db}.t1;
 -- query 10
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t1 (
-    k1 bigint NULL,
+    k1 bigint ,
     c_bool boolean,
-    c_bool_null boolean NULL,
+    c_bool_null boolean ,
     c_tinyint tinyint,
-    c_tinyint_null tinyint NULL,
+    c_tinyint_null tinyint ,
     c_smallint smallint,
-    c_smallint_null smallint NULL,
+    c_smallint_null smallint ,
     c_int int,
-    c_int_null int NULL,
+    c_int_null int ,
     c_bigint bigint,
-    c_bigint_null bigint NULL,
+    c_bigint_null bigint ,
     c_float float,
-    c_float_null float NULL,
+    c_float_null float ,
     c_double double,
-    c_double_null double NULL,
+    c_double_null double ,
     c_date date,
-    c_date_null date NULL,
+    c_date_null date ,
     c_datetime datetime,
-    c_datetime_null datetime NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+    c_datetime_null datetime
+) WITH (format_version = 3);
 
 -- query 11
 -- @skip_result_check=true
@@ -132,12 +129,14 @@ FROM ${case_db}.t1 t1 LEFT OUTER JOIN w1 t2 ON t1.c_bool_null = t2.c_bool_null;
 -- query 14
 WITH w1 AS (SELECT * FROM ${case_db}.t1 WHERE k1 < 100)
 SELECT count(1), count(t1.c_bool_null)
-FROM ${case_db}.t1 t1 LEFT SEMI JOIN w1 t2 ON t1.c_bool_null = t2.c_bool_null;
+FROM ${case_db}.t1 t1
+WHERE EXISTS (SELECT 1 FROM w1 t2 WHERE t1.c_bool_null = t2.c_bool_null);
 
 -- query 15
 WITH w1 AS (SELECT * FROM ${case_db}.t1 WHERE k1 < 100)
 SELECT count(1), count(t1.c_bool_null)
-FROM ${case_db}.t1 t1 LEFT ANTI JOIN w1 t2 ON t1.c_bool_null = t2.c_bool_null;
+FROM ${case_db}.t1 t1
+WHERE NOT EXISTS (SELECT 1 FROM w1 t2 WHERE t1.c_bool_null = t2.c_bool_null);
 
 -- query 16
 WITH w1 AS (SELECT * FROM ${case_db}.t1 WHERE k1 < 100)
@@ -147,12 +146,14 @@ FROM ${case_db}.t1 t1 RIGHT OUTER JOIN w1 t2 ON t1.c_bool_null = t2.c_bool_null;
 -- query 17
 WITH w1 AS (SELECT * FROM ${case_db}.t1 WHERE k1 < 100)
 SELECT count(1), count(t2.c_bool_null)
-FROM ${case_db}.t1 t1 RIGHT SEMI JOIN w1 t2 ON t1.c_bool_null = t2.c_bool_null;
+FROM w1 t2
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 t1 WHERE t1.c_bool_null = t2.c_bool_null);
 
 -- query 18
 WITH w1 AS (SELECT * FROM ${case_db}.t1 WHERE k1 < 100)
 SELECT count(1), count(t2.c_bool_null)
-FROM ${case_db}.t1 t1 RIGHT ANTI JOIN w1 t2 ON t1.c_bool_null = t2.c_bool_null;
+FROM w1 t2
+WHERE NOT EXISTS (SELECT 1 FROM ${case_db}.t1 t1 WHERE t1.c_bool_null = t2.c_bool_null);
 
 -- query 19
 WITH w1 AS (SELECT * FROM ${case_db}.t1 WHERE k1 < 100)
@@ -174,12 +175,14 @@ FROM ${case_db}.t1 t1 LEFT OUTER JOIN w1 t2 ON t1.c_bool_null = t2.c_bool_null;
 -- query 22
 WITH w1 AS (SELECT * FROM ${case_db}.t1 WHERE k1 < 100 AND c_bool_null = true)
 SELECT count(1), count(t1.c_bool_null)
-FROM ${case_db}.t1 t1 LEFT SEMI JOIN w1 t2 ON t1.c_bool_null = t2.c_bool_null;
+FROM ${case_db}.t1 t1
+WHERE EXISTS (SELECT 1 FROM w1 t2 WHERE t1.c_bool_null = t2.c_bool_null);
 
 -- query 23
 WITH w1 AS (SELECT * FROM ${case_db}.t1 WHERE k1 < 100 AND c_bool_null = true)
 SELECT count(1), count(t1.c_bool_null)
-FROM ${case_db}.t1 t1 LEFT ANTI JOIN w1 t2 ON t1.c_bool_null = t2.c_bool_null;
+FROM ${case_db}.t1 t1
+WHERE NOT EXISTS (SELECT 1 FROM w1 t2 WHERE t1.c_bool_null = t2.c_bool_null);
 
 -- query 24
 WITH w1 AS (SELECT * FROM ${case_db}.t1 WHERE k1 < 100 AND c_bool_null = true)
@@ -189,12 +192,14 @@ FROM ${case_db}.t1 t1 RIGHT OUTER JOIN w1 t2 ON t1.c_bool_null = t2.c_bool_null;
 -- query 25
 WITH w1 AS (SELECT * FROM ${case_db}.t1 WHERE k1 < 100 AND c_bool_null = true)
 SELECT count(1), count(t2.c_bool_null)
-FROM ${case_db}.t1 t1 RIGHT SEMI JOIN w1 t2 ON t1.c_bool_null = t2.c_bool_null;
+FROM w1 t2
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 t1 WHERE t1.c_bool_null = t2.c_bool_null);
 
 -- query 26
 WITH w1 AS (SELECT * FROM ${case_db}.t1 WHERE k1 < 100 AND c_bool_null = true)
 SELECT count(1), count(t2.c_bool_null)
-FROM ${case_db}.t1 t1 RIGHT ANTI JOIN w1 t2 ON t1.c_bool_null = t2.c_bool_null;
+FROM w1 t2
+WHERE NOT EXISTS (SELECT 1 FROM ${case_db}.t1 t1 WHERE t1.c_bool_null = t2.c_bool_null);
 
 -- query 27
 WITH w1 AS (SELECT * FROM ${case_db}.t1 WHERE k1 < 100 AND c_bool_null = true)
@@ -216,12 +221,14 @@ FROM ${case_db}.t1 t1 LEFT OUTER JOIN w1 t2 ON t1.c_bool_null = t2.c_bool_null;
 -- query 30
 WITH w1 AS (SELECT * FROM ${case_db}.t1 WHERE k1 < 100 AND c_bool_null IS NULL AND c_bool_null = true)
 SELECT count(1), count(t1.c_bool_null)
-FROM ${case_db}.t1 t1 LEFT SEMI JOIN w1 t2 ON t1.c_bool_null = t2.c_bool_null;
+FROM ${case_db}.t1 t1
+WHERE EXISTS (SELECT 1 FROM w1 t2 WHERE t1.c_bool_null = t2.c_bool_null);
 
 -- query 31
 WITH w1 AS (SELECT * FROM ${case_db}.t1 WHERE k1 < 100 AND c_bool_null IS NULL AND c_bool_null = true)
 SELECT count(1), count(t1.c_bool_null)
-FROM ${case_db}.t1 t1 LEFT ANTI JOIN w1 t2 ON t1.c_bool_null = t2.c_bool_null;
+FROM ${case_db}.t1 t1
+WHERE NOT EXISTS (SELECT 1 FROM w1 t2 WHERE t1.c_bool_null = t2.c_bool_null);
 
 -- query 32
 WITH w1 AS (SELECT * FROM ${case_db}.t1 WHERE k1 < 100 AND c_bool_null IS NULL AND c_bool_null = true)
@@ -231,12 +238,14 @@ FROM ${case_db}.t1 t1 RIGHT OUTER JOIN w1 t2 ON t1.c_bool_null = t2.c_bool_null;
 -- query 33
 WITH w1 AS (SELECT * FROM ${case_db}.t1 WHERE k1 < 100 AND c_bool_null IS NULL AND c_bool_null = true)
 SELECT count(1), count(t2.c_bool_null)
-FROM ${case_db}.t1 t1 RIGHT SEMI JOIN w1 t2 ON t1.c_bool_null = t2.c_bool_null;
+FROM w1 t2
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 t1 WHERE t1.c_bool_null = t2.c_bool_null);
 
 -- query 34
 WITH w1 AS (SELECT * FROM ${case_db}.t1 WHERE k1 < 100 AND c_bool_null IS NULL AND c_bool_null = true)
 SELECT count(1), count(t2.c_bool_null)
-FROM ${case_db}.t1 t1 RIGHT ANTI JOIN w1 t2 ON t1.c_bool_null = t2.c_bool_null;
+FROM w1 t2
+WHERE NOT EXISTS (SELECT 1 FROM ${case_db}.t1 t1 WHERE t1.c_bool_null = t2.c_bool_null);
 
 -- query 35
 WITH w1 AS (SELECT * FROM ${case_db}.t1 WHERE k1 < 100 AND c_bool_null IS NULL AND c_bool_null = true)
@@ -258,12 +267,14 @@ FROM ${case_db}.t1 t1 LEFT OUTER JOIN w1 t2 ON t1.c_bool_null = t2.c_bool_null W
 -- query 38
 WITH w1 AS (SELECT * FROM ${case_db}.t1 WHERE k1 < 10)
 SELECT count(1), count(t1.c_bool_null)
-FROM ${case_db}.t1 t1 LEFT SEMI JOIN w1 t2 ON t1.c_bool_null = t2.c_bool_null AND (t1.k1 + t2.k1) % 7 = 0;
+FROM ${case_db}.t1 t1
+WHERE EXISTS (SELECT 1 FROM w1 t2 WHERE t1.c_bool_null = t2.c_bool_null AND (t1.k1 + t2.k1) % 7 = 0);
 
 -- query 39
 WITH w1 AS (SELECT * FROM ${case_db}.t1 WHERE k1 < 10)
 SELECT count(1), count(t1.c_bool_null)
-FROM ${case_db}.t1 t1 LEFT ANTI JOIN w1 t2 ON t1.c_bool_null = t2.c_bool_null AND (t1.k1 + t2.k1) % 7 = 0;
+FROM ${case_db}.t1 t1
+WHERE NOT EXISTS (SELECT 1 FROM w1 t2 WHERE t1.c_bool_null = t2.c_bool_null AND (t1.k1 + t2.k1) % 7 = 0);
 
 -- query 40
 WITH w1 AS (SELECT * FROM ${case_db}.t1 WHERE k1 < 10)
@@ -273,12 +284,14 @@ FROM ${case_db}.t1 t1 RIGHT OUTER JOIN w1 t2 ON t1.c_bool_null = t2.c_bool_null 
 -- query 41
 WITH w1 AS (SELECT * FROM ${case_db}.t1 WHERE k1 < 10)
 SELECT count(1), count(t2.c_bool_null)
-FROM ${case_db}.t1 t1 RIGHT SEMI JOIN w1 t2 ON t1.c_bool_null = t2.c_bool_null AND (t1.k1 + t2.k1) % 7 = 0;
+FROM w1 t2
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 t1 WHERE t1.c_bool_null = t2.c_bool_null AND (t1.k1 + t2.k1) % 7 = 0);
 
 -- query 42
 WITH w1 AS (SELECT * FROM ${case_db}.t1 WHERE k1 < 10)
 SELECT count(1), count(t2.c_bool_null)
-FROM ${case_db}.t1 t1 RIGHT ANTI JOIN w1 t2 ON t1.c_bool_null = t2.c_bool_null AND (t1.k1 + t2.k1) % 7 = 0;
+FROM w1 t2
+WHERE NOT EXISTS (SELECT 1 FROM ${case_db}.t1 t1 WHERE t1.c_bool_null = t2.c_bool_null AND (t1.k1 + t2.k1) % 7 = 0);
 
 -- query 43
 WITH w1 AS (SELECT * FROM ${case_db}.t1 WHERE k1 < 10)
@@ -300,12 +313,14 @@ FROM ${case_db}.t1 t1 LEFT OUTER JOIN w1 t2 ON t1.c_tinyint_null = t2.c_tinyint_
 -- query 46
 WITH w1 AS (SELECT * FROM ${case_db}.t1 WHERE k1 < 300 AND c_tinyint_null % 2 = 0)
 SELECT count(1), count(t1.c_tinyint_null)
-FROM ${case_db}.t1 t1 LEFT SEMI JOIN w1 t2 ON t1.c_tinyint_null = t2.c_tinyint_null;
+FROM ${case_db}.t1 t1
+WHERE EXISTS (SELECT 1 FROM w1 t2 WHERE t1.c_tinyint_null = t2.c_tinyint_null);
 
 -- query 47
 WITH w1 AS (SELECT * FROM ${case_db}.t1 WHERE k1 < 300 AND c_tinyint_null % 2 = 0)
 SELECT count(1), count(t1.c_tinyint_null)
-FROM ${case_db}.t1 t1 LEFT ANTI JOIN w1 t2 ON t1.c_tinyint_null = t2.c_tinyint_null;
+FROM ${case_db}.t1 t1
+WHERE NOT EXISTS (SELECT 1 FROM w1 t2 WHERE t1.c_tinyint_null = t2.c_tinyint_null);
 
 -- query 48
 WITH w1 AS (SELECT * FROM ${case_db}.t1 WHERE k1 < 300 AND c_tinyint_null % 2 = 0)
@@ -315,12 +330,14 @@ FROM ${case_db}.t1 t1 RIGHT OUTER JOIN w1 t2 ON t1.c_tinyint_null = t2.c_tinyint
 -- query 49
 WITH w1 AS (SELECT * FROM ${case_db}.t1 WHERE k1 < 300 AND c_tinyint_null % 2 = 0)
 SELECT count(1), count(t2.c_tinyint_null)
-FROM ${case_db}.t1 t1 RIGHT SEMI JOIN w1 t2 ON t1.c_tinyint_null = t2.c_tinyint_null;
+FROM w1 t2
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 t1 WHERE t1.c_tinyint_null = t2.c_tinyint_null);
 
 -- query 50
 WITH w1 AS (SELECT * FROM ${case_db}.t1 WHERE k1 < 300 AND c_tinyint_null % 2 = 0)
 SELECT count(1), count(t2.c_tinyint_null)
-FROM ${case_db}.t1 t1 RIGHT ANTI JOIN w1 t2 ON t1.c_tinyint_null = t2.c_tinyint_null;
+FROM w1 t2
+WHERE NOT EXISTS (SELECT 1 FROM ${case_db}.t1 t1 WHERE t1.c_tinyint_null = t2.c_tinyint_null);
 
 -- query 51
 WITH w1 AS (SELECT * FROM ${case_db}.t1 WHERE k1 < 300 AND c_tinyint_null % 2 = 0)
@@ -342,12 +359,14 @@ FROM ${case_db}.t1 t1 LEFT OUTER JOIN w1 t2 ON t1.c_tinyint_null = t2.c_tinyint_
 -- query 54
 WITH w1 AS (SELECT * FROM ${case_db}.t1 WHERE k1 < 300 AND c_tinyint_null % 2 = 0 AND c_tinyint_null IS NULL)
 SELECT count(1), count(t1.c_tinyint_null)
-FROM ${case_db}.t1 t1 LEFT SEMI JOIN w1 t2 ON t1.c_tinyint_null = t2.c_tinyint_null;
+FROM ${case_db}.t1 t1
+WHERE EXISTS (SELECT 1 FROM w1 t2 WHERE t1.c_tinyint_null = t2.c_tinyint_null);
 
 -- query 55
 WITH w1 AS (SELECT * FROM ${case_db}.t1 WHERE k1 < 300 AND c_tinyint_null % 2 = 0 AND c_tinyint_null IS NULL)
 SELECT count(1), count(t1.c_tinyint_null)
-FROM ${case_db}.t1 t1 LEFT ANTI JOIN w1 t2 ON t1.c_tinyint_null = t2.c_tinyint_null;
+FROM ${case_db}.t1 t1
+WHERE NOT EXISTS (SELECT 1 FROM w1 t2 WHERE t1.c_tinyint_null = t2.c_tinyint_null);
 
 -- query 56
 WITH w1 AS (SELECT * FROM ${case_db}.t1 WHERE k1 < 300 AND c_tinyint_null % 2 = 0 AND c_tinyint_null IS NULL)
@@ -357,12 +376,14 @@ FROM ${case_db}.t1 t1 RIGHT OUTER JOIN w1 t2 ON t1.c_tinyint_null = t2.c_tinyint
 -- query 57
 WITH w1 AS (SELECT * FROM ${case_db}.t1 WHERE k1 < 300 AND c_tinyint_null % 2 = 0 AND c_tinyint_null IS NULL)
 SELECT count(1), count(t2.c_tinyint_null)
-FROM ${case_db}.t1 t1 RIGHT SEMI JOIN w1 t2 ON t1.c_tinyint_null = t2.c_tinyint_null;
+FROM w1 t2
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 t1 WHERE t1.c_tinyint_null = t2.c_tinyint_null);
 
 -- query 58
 WITH w1 AS (SELECT * FROM ${case_db}.t1 WHERE k1 < 300 AND c_tinyint_null % 2 = 0 AND c_tinyint_null IS NULL)
 SELECT count(1), count(t2.c_tinyint_null)
-FROM ${case_db}.t1 t1 RIGHT ANTI JOIN w1 t2 ON t1.c_tinyint_null = t2.c_tinyint_null;
+FROM w1 t2
+WHERE NOT EXISTS (SELECT 1 FROM ${case_db}.t1 t1 WHERE t1.c_tinyint_null = t2.c_tinyint_null);
 
 -- query 59
 WITH w1 AS (SELECT * FROM ${case_db}.t1 WHERE k1 < 300 AND c_tinyint_null % 2 = 0 AND c_tinyint_null IS NULL)
@@ -384,12 +405,14 @@ FROM ${case_db}.t1 t1 LEFT OUTER JOIN w1 t2 ON t1.c_tinyint_null = t2.c_tinyint_
 -- query 62
 WITH w1 AS (SELECT * FROM ${case_db}.t1 WHERE k1 < 10)
 SELECT count(1), count(t1.c_tinyint_null)
-FROM ${case_db}.t1 t1 LEFT SEMI JOIN w1 t2 ON t1.c_tinyint_null = t2.c_tinyint_null AND (t1.k1 + t2.k1) % 7 = 0;
+FROM ${case_db}.t1 t1
+WHERE EXISTS (SELECT 1 FROM w1 t2 WHERE t1.c_tinyint_null = t2.c_tinyint_null AND (t1.k1 + t2.k1) % 7 = 0);
 
 -- query 63
 WITH w1 AS (SELECT * FROM ${case_db}.t1 WHERE k1 < 10)
 SELECT count(1), count(t1.c_tinyint_null)
-FROM ${case_db}.t1 t1 LEFT ANTI JOIN w1 t2 ON t1.c_tinyint_null = t2.c_tinyint_null AND (t1.k1 + t2.k1) % 7 = 0;
+FROM ${case_db}.t1 t1
+WHERE NOT EXISTS (SELECT 1 FROM w1 t2 WHERE t1.c_tinyint_null = t2.c_tinyint_null AND (t1.k1 + t2.k1) % 7 = 0);
 
 -- query 64
 WITH w1 AS (SELECT * FROM ${case_db}.t1 WHERE k1 < 10)
@@ -399,12 +422,14 @@ FROM ${case_db}.t1 t1 RIGHT OUTER JOIN w1 t2 ON t1.c_tinyint_null = t2.c_tinyint
 -- query 65
 WITH w1 AS (SELECT * FROM ${case_db}.t1 WHERE k1 < 10)
 SELECT count(1), count(t2.c_tinyint_null)
-FROM ${case_db}.t1 t1 RIGHT SEMI JOIN w1 t2 ON t1.c_tinyint_null = t2.c_tinyint_null AND (t1.k1 + t2.k1) % 7 = 0;
+FROM w1 t2
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 t1 WHERE t1.c_tinyint_null = t2.c_tinyint_null AND (t1.k1 + t2.k1) % 7 = 0);
 
 -- query 66
 WITH w1 AS (SELECT * FROM ${case_db}.t1 WHERE k1 < 10)
 SELECT count(1), count(t2.c_tinyint_null)
-FROM ${case_db}.t1 t1 RIGHT ANTI JOIN w1 t2 ON t1.c_tinyint_null = t2.c_tinyint_null AND (t1.k1 + t2.k1) % 7 = 0;
+FROM w1 t2
+WHERE NOT EXISTS (SELECT 1 FROM ${case_db}.t1 t1 WHERE t1.c_tinyint_null = t2.c_tinyint_null AND (t1.k1 + t2.k1) % 7 = 0);
 
 -- query 67
 WITH w1 AS (SELECT * FROM ${case_db}.t1 WHERE k1 < 10)
@@ -426,12 +451,14 @@ FROM ${case_db}.t1 t1 LEFT OUTER JOIN w1 t2 ON t1.c_smallint_null = t2.c_smallin
 -- query 70
 WITH w1 AS (SELECT * FROM ${case_db}.t1 WHERE k1 < 300 AND c_smallint_null % 2 = 0)
 SELECT count(1), count(t1.c_smallint_null)
-FROM ${case_db}.t1 t1 LEFT SEMI JOIN w1 t2 ON t1.c_smallint_null = t2.c_smallint_null;
+FROM ${case_db}.t1 t1
+WHERE EXISTS (SELECT 1 FROM w1 t2 WHERE t1.c_smallint_null = t2.c_smallint_null);
 
 -- query 71
 WITH w1 AS (SELECT * FROM ${case_db}.t1 WHERE k1 < 300 AND c_smallint_null % 2 = 0)
 SELECT count(1), count(t1.c_smallint_null)
-FROM ${case_db}.t1 t1 LEFT ANTI JOIN w1 t2 ON t1.c_smallint_null = t2.c_smallint_null;
+FROM ${case_db}.t1 t1
+WHERE NOT EXISTS (SELECT 1 FROM w1 t2 WHERE t1.c_smallint_null = t2.c_smallint_null);
 
 -- query 72
 WITH w1 AS (SELECT * FROM ${case_db}.t1 WHERE k1 < 300 AND c_smallint_null % 2 = 0)
@@ -441,12 +468,14 @@ FROM ${case_db}.t1 t1 RIGHT OUTER JOIN w1 t2 ON t1.c_smallint_null = t2.c_smalli
 -- query 73
 WITH w1 AS (SELECT * FROM ${case_db}.t1 WHERE k1 < 300 AND c_smallint_null % 2 = 0)
 SELECT count(1), count(t2.c_smallint_null)
-FROM ${case_db}.t1 t1 RIGHT SEMI JOIN w1 t2 ON t1.c_smallint_null = t2.c_smallint_null;
+FROM w1 t2
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 t1 WHERE t1.c_smallint_null = t2.c_smallint_null);
 
 -- query 74
 WITH w1 AS (SELECT * FROM ${case_db}.t1 WHERE k1 < 300 AND c_smallint_null % 2 = 0)
 SELECT count(1), count(t2.c_smallint_null)
-FROM ${case_db}.t1 t1 RIGHT ANTI JOIN w1 t2 ON t1.c_smallint_null = t2.c_smallint_null;
+FROM w1 t2
+WHERE NOT EXISTS (SELECT 1 FROM ${case_db}.t1 t1 WHERE t1.c_smallint_null = t2.c_smallint_null);
 
 -- query 75
 WITH w1 AS (SELECT * FROM ${case_db}.t1 WHERE k1 < 300 AND c_smallint_null % 2 = 0)
@@ -468,12 +497,14 @@ FROM ${case_db}.t1 t1 LEFT OUTER JOIN w1 t2 ON t1.c_smallint_null = t2.c_smallin
 -- query 78
 WITH w1 AS (SELECT * FROM ${case_db}.t1 WHERE k1 < 300 AND c_smallint_null % 2 = 0 AND c_smallint_null IS NULL)
 SELECT count(1), count(t1.c_smallint_null)
-FROM ${case_db}.t1 t1 LEFT SEMI JOIN w1 t2 ON t1.c_smallint_null = t2.c_smallint_null;
+FROM ${case_db}.t1 t1
+WHERE EXISTS (SELECT 1 FROM w1 t2 WHERE t1.c_smallint_null = t2.c_smallint_null);
 
 -- query 79
 WITH w1 AS (SELECT * FROM ${case_db}.t1 WHERE k1 < 300 AND c_smallint_null % 2 = 0 AND c_smallint_null IS NULL)
 SELECT count(1), count(t1.c_smallint_null)
-FROM ${case_db}.t1 t1 LEFT ANTI JOIN w1 t2 ON t1.c_smallint_null = t2.c_smallint_null;
+FROM ${case_db}.t1 t1
+WHERE NOT EXISTS (SELECT 1 FROM w1 t2 WHERE t1.c_smallint_null = t2.c_smallint_null);
 
 -- query 80
 WITH w1 AS (SELECT * FROM ${case_db}.t1 WHERE k1 < 300 AND c_smallint_null % 2 = 0 AND c_smallint_null IS NULL)
@@ -483,12 +514,14 @@ FROM ${case_db}.t1 t1 RIGHT OUTER JOIN w1 t2 ON t1.c_smallint_null = t2.c_smalli
 -- query 81
 WITH w1 AS (SELECT * FROM ${case_db}.t1 WHERE k1 < 300 AND c_smallint_null % 2 = 0 AND c_smallint_null IS NULL)
 SELECT count(1), count(t2.c_smallint_null)
-FROM ${case_db}.t1 t1 RIGHT SEMI JOIN w1 t2 ON t1.c_smallint_null = t2.c_smallint_null;
+FROM w1 t2
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 t1 WHERE t1.c_smallint_null = t2.c_smallint_null);
 
 -- query 82
 WITH w1 AS (SELECT * FROM ${case_db}.t1 WHERE k1 < 300 AND c_smallint_null % 2 = 0 AND c_smallint_null IS NULL)
 SELECT count(1), count(t2.c_smallint_null)
-FROM ${case_db}.t1 t1 RIGHT ANTI JOIN w1 t2 ON t1.c_smallint_null = t2.c_smallint_null;
+FROM w1 t2
+WHERE NOT EXISTS (SELECT 1 FROM ${case_db}.t1 t1 WHERE t1.c_smallint_null = t2.c_smallint_null);
 
 -- query 83
 WITH w1 AS (SELECT * FROM ${case_db}.t1 WHERE k1 < 300 AND c_smallint_null % 2 = 0 AND c_smallint_null IS NULL)
@@ -510,12 +543,14 @@ FROM ${case_db}.t1 t1 LEFT OUTER JOIN w1 t2 ON t1.c_smallint_null = t2.c_smallin
 -- query 86
 WITH w1 AS (SELECT * FROM ${case_db}.t1 WHERE k1 < 10)
 SELECT count(1), count(t1.c_smallint_null)
-FROM ${case_db}.t1 t1 LEFT SEMI JOIN w1 t2 ON t1.c_smallint_null = t2.c_smallint_null AND (t1.k1 + t2.k1) % 7 = 0;
+FROM ${case_db}.t1 t1
+WHERE EXISTS (SELECT 1 FROM w1 t2 WHERE t1.c_smallint_null = t2.c_smallint_null AND (t1.k1 + t2.k1) % 7 = 0);
 
 -- query 87
 WITH w1 AS (SELECT * FROM ${case_db}.t1 WHERE k1 < 10)
 SELECT count(1), count(t1.c_smallint_null)
-FROM ${case_db}.t1 t1 LEFT ANTI JOIN w1 t2 ON t1.c_smallint_null = t2.c_smallint_null AND (t1.k1 + t2.k1) % 7 = 0;
+FROM ${case_db}.t1 t1
+WHERE NOT EXISTS (SELECT 1 FROM w1 t2 WHERE t1.c_smallint_null = t2.c_smallint_null AND (t1.k1 + t2.k1) % 7 = 0);
 
 -- query 88
 WITH w1 AS (SELECT * FROM ${case_db}.t1 WHERE k1 < 10)
@@ -525,12 +560,14 @@ FROM ${case_db}.t1 t1 RIGHT OUTER JOIN w1 t2 ON t1.c_smallint_null = t2.c_smalli
 -- query 89
 WITH w1 AS (SELECT * FROM ${case_db}.t1 WHERE k1 < 10)
 SELECT count(1), count(t2.c_smallint_null)
-FROM ${case_db}.t1 t1 RIGHT SEMI JOIN w1 t2 ON t1.c_smallint_null = t2.c_smallint_null AND (t1.k1 + t2.k1) % 7 = 0;
+FROM w1 t2
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 t1 WHERE t1.c_smallint_null = t2.c_smallint_null AND (t1.k1 + t2.k1) % 7 = 0);
 
 -- query 90
 WITH w1 AS (SELECT * FROM ${case_db}.t1 WHERE k1 < 10)
 SELECT count(1), count(t2.c_smallint_null)
-FROM ${case_db}.t1 t1 RIGHT ANTI JOIN w1 t2 ON t1.c_smallint_null = t2.c_smallint_null AND (t1.k1 + t2.k1) % 7 = 0;
+FROM w1 t2
+WHERE NOT EXISTS (SELECT 1 FROM ${case_db}.t1 t1 WHERE t1.c_smallint_null = t2.c_smallint_null AND (t1.k1 + t2.k1) % 7 = 0);
 
 -- query 91
 WITH w1 AS (SELECT * FROM ${case_db}.t1 WHERE k1 < 10)

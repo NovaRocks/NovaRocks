@@ -185,7 +185,6 @@ fn control_values_indexed_rejects_dedicated_carriers_without_fallback() {
     assert!(fixed.is_null(1));
     assert!(fixed.is_null(2));
     for ty in [
-        DataType::Null,
         DataType::FixedSizeBinary(0),
         DataType::Map(
             Arc::new(Field::new(
@@ -288,6 +287,56 @@ fn control_values_every_control_refusal_is_primary_in_both_representations() {
             assert_eq!(control.calls.load(Ordering::Relaxed), refuse);
         }
     }
+}
+
+#[test]
+fn control_values_indexed_root_null_checks_actual_choices_and_control() {
+    let source: ArrayRef = Arc::new(arrow_array::NullArray::new(2));
+    let call = |control: &dyn KernelEvaluationControl| {
+        assemble_values(
+            AssemblyPlan::Indexed {
+                result_type: &DataType::Null,
+                sources: &[Some(&source)],
+                choices: &[Some((0, 1)), None, Some((0, 0))],
+            },
+            control,
+        )
+    };
+    let control = RefusingControl {
+        calls: AtomicUsize::new(0),
+        refuse: usize::MAX,
+    };
+    let result = call(&control).unwrap();
+    assert_eq!(result.data_type(), &DataType::Null);
+    assert_eq!(result.logical_null_count(), 3);
+    assert!(result.to_data().buffers().is_empty());
+    let calls = control.calls.load(Ordering::Relaxed);
+    assert!(calls > 4);
+    for refuse in 1..=calls {
+        let control = RefusingControl {
+            calls: AtomicUsize::new(0),
+            refuse,
+        };
+        assert_eq!(
+            call(&control).unwrap_err().into_kernel(),
+            invalid("original assembly control refusal")
+        );
+        assert_eq!(control.calls.load(Ordering::Relaxed), refuse);
+    }
+
+    let error = assemble_values(
+        AssemblyPlan::Indexed {
+            result_type: &DataType::Null,
+            sources: &[Some(&source)],
+            choices: &[Some((0, 2))],
+        },
+        &LegacyControl,
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "interleave choice has an invalid source or row"
+    );
 }
 
 #[test]

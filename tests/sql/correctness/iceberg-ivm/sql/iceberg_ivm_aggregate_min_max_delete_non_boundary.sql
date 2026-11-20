@@ -29,46 +29,23 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE EXTERNAL CATALOG ice_ivm_minmax_dnb_${uuid0}
-PROPERTIES (
-  "type" = "iceberg",
-  "iceberg.catalog.type" = "rest",
-  "uri" = "${iceberg_rest_uri}",
-  "warehouse" = "${iceberg_rest_warehouse}",
-  "aws.s3.endpoint" = "${oss_endpoint}",
-  "credential.object-store-metadata.consumer-role" = "frontend",
-  "credential.object-store-metadata.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-metadata.name" = "${iceberg_object_store_metadata_credential_name}",
-  "credential.object-store-metadata.generation" = "${iceberg_object_store_credential_generation}",
-  "credential.object-store-data.consumer-role" = "backend",
-  "credential.object-store-data.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-data.name" = "${iceberg_object_store_data_credential_name}",
-  "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
-  "aws.s3.region" = "${oss_region}",
-  "aws.s3.enable_path_style_access" = "${oss_path_style}"
-);
-CREATE DATABASE ice_ivm_minmax_dnb_${uuid0}.ns_${uuid0};
+CREATE CATALOG ice_ivm_minmax_dnb_${uuid0} USING iceberg WITH ("iceberg.catalog.type" = 'rest', "uri" = '${iceberg_rest_uri}', "warehouse" = '${iceberg_rest_warehouse}', "aws.s3.endpoint" = '${oss_endpoint}', "credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-metadata.name" = '${iceberg_object_store_metadata_credential_name}', "credential.object-store-metadata.generation" = '${iceberg_object_store_credential_generation}', "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-data.name" = '${iceberg_object_store_data_credential_name}', "credential.object-store-data.generation" = '${iceberg_object_store_credential_generation}', "aws.s3.region" = '${oss_region}', "aws.s3.enable_path_style_access" = '${oss_path_style}');
+CREATE SCHEMA ice_ivm_minmax_dnb_${uuid0}.ns_${uuid0};
 CREATE TABLE ice_ivm_minmax_dnb_${uuid0}.ns_${uuid0}.orders (
   region STRING,
   amount BIGINT
-)
-TBLPROPERTIES ("format-version" = "3",
-  "write.row-lineage" = "true");
+) WITH (format_version = 3);
 USE ice_ivm_minmax_dnb_${uuid0}.ns_${uuid0};
 
 -- query 2
 -- @skip_result_check=true
 INSERT INTO ice_ivm_minmax_dnb_${uuid0}.ns_${uuid0}.orders VALUES
-  ('east', 10),
-  ('east', 20),
-  ('east', 30),
-  ('east', 40),
-  ('east', 50);
-CREATE MATERIALIZED VIEW minmax_dnb_mv_${uuid0}
-DISTRIBUTED BY HASH(region) BUCKETS 1
-PROPERTIES ('storage_engine' = 'iceberg')
-AS
-SELECT region,
+  ROW('east', 10),
+  ROW('east', 20),
+  ROW('east', 30),
+  ROW('east', 40),
+  ROW('east', 50);
+CREATE MATERIALIZED VIEW minmax_dnb_mv_${uuid0} AS SELECT region,
        MIN(amount) AS mn,
        MAX(amount) AS mx,
        COUNT(*) AS c
@@ -104,6 +81,6 @@ ORDER BY region;
 -- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW minmax_dnb_mv_${uuid0};
-DROP TABLE ice_ivm_minmax_dnb_${uuid0}.ns_${uuid0}.orders FORCE;
-DROP DATABASE ice_ivm_minmax_dnb_${uuid0}.ns_${uuid0};
+DROP TABLE ice_ivm_minmax_dnb_${uuid0}.ns_${uuid0}.orders ;
+DROP SCHEMA ice_ivm_minmax_dnb_${uuid0}.ns_${uuid0};
 DROP CATALOG ice_ivm_minmax_dnb_${uuid0};

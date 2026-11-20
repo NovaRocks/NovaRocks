@@ -26,16 +26,15 @@ USE ${case_db};
 -- query 2
 -- @skip_result_check=true
 USE ${case_db};
-CREATE TABLE `t1` (
-  `tinyint_col_1` tinyint NOT NULL,
-  `tinyint_col_2` tinyint
-)
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE "t1" (
+  "tinyint_col_1" tinyint NOT NULL,
+  "tinyint_col_2" tinyint
+) WITH (format_version = 3);
 
 -- query 3
 -- @skip_result_check=true
 USE ${case_db};
-insert into t1 values (1, 1), (1, 2), (1,3), (1,4), (2, null), (3, null), (4, null);
+insert into t1 values ROW(1, 1), ROW(1, 2), ROW(1,3), ROW(1,4), ROW(2, null), ROW(3, null), ROW(4, null);
 
 -- query 4
 USE ${case_db};

@@ -122,6 +122,37 @@ pub fn is_default_json_structure_cast(
         && default_json_structure_carrier_cast_supported(source.data_type(), target.data_type())
 }
 
+/// Describe the explicit lifting of a physical NULL element into a nullable
+/// JSON list element. This does not preserve a value domain, prepare a runtime
+/// cast, or infer nominal identity from the UTF8 carrier.
+pub fn is_null_list_to_json_cast(source: &FunctionValueType, target: &FunctionValueType) -> bool {
+    if source.logical_type() != ValueLogicalType::Physical
+        || target.logical_type() != ValueLogicalType::Physical
+        || (source.nullable() && !target.nullable())
+    {
+        return false;
+    }
+    let (ValueKind::List(source_item), ValueKind::List(target_item)) =
+        (source.value_type().kind(), target.value_type().kind())
+    else {
+        return false;
+    };
+    let (DataType::List(source_field), DataType::List(target_field)) =
+        (source.data_type(), target.data_type())
+    else {
+        return false;
+    };
+    matches!(source_item.kind(), ValueKind::Scalar(DataType::Null))
+        && source_field.data_type() == &DataType::Null
+        && matches!(
+            target_item.kind(),
+            ValueKind::Nominal(ValueLogicalType::Json)
+        )
+        && target_item.nullable()
+        && target_field.is_nullable()
+        && target_field.data_type() == &DataType::Utf8
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -165,5 +196,68 @@ mod tests {
             assert_eq!(result, Err(stop));
             assert_eq!(seen, stop);
         }
+    }
+    fn list(item: ValueTypeRef, carrier: DataType, nullable: bool) -> FunctionValueType {
+        let storage = ValueTypeStorageLifetime::pure();
+        let layout = crate::ValueLayout::try_new(
+            &DataType::List(std::sync::Arc::new(arrow_schema::Field::new(
+                "item",
+                carrier,
+                item.nullable(),
+            ))),
+            storage.clone(),
+        )
+        .unwrap();
+        FunctionValueType::try_from_value(
+            ValueTypeRef::try_new(ValueKind::List(item), nullable, storage).unwrap(),
+            layout,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn null_list_to_json_requires_the_exact_nominal_child_and_nullability_shape() {
+        let source = list(
+            value(ValueKind::Scalar(DataType::Null)),
+            DataType::Null,
+            true,
+        );
+        let json = value(ValueKind::Nominal(ValueLogicalType::Json));
+        let target = list(json.clone(), DataType::Utf8, true);
+        assert!(is_null_list_to_json_cast(&source, &target));
+        assert!(
+            !check(source.value_type(), target.value_type()),
+            "NULL lifting must not become domain preservation"
+        );
+        let required_root = target.with_nullable(false).unwrap();
+        assert!(!is_null_list_to_json_cast(&source, &required_root));
+        assert!(is_null_list_to_json_cast(
+            &source.with_nullable(false).unwrap(),
+            &required_root
+        ));
+        let required_json = json
+            .with_nullable(false, ValueTypeStorageLifetime::pure())
+            .unwrap();
+        assert!(!is_null_list_to_json_cast(
+            &source,
+            &list(required_json, DataType::Utf8, true)
+        ));
+        for ordinary in [
+            list(value(ValueKind::String), DataType::Utf8, true),
+            list(
+                value(ValueKind::Scalar(DataType::Int32)),
+                DataType::Int32,
+                true,
+            ),
+        ] {
+            assert!(!is_null_list_to_json_cast(&source, &ordinary));
+        }
+        let text_source = list(value(ValueKind::String), DataType::Utf8, true);
+        assert!(!is_null_list_to_json_cast(&text_source, &target));
+        assert!(!is_null_list_to_json_cast(
+            &source,
+            &FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
+                .unwrap()
+        ));
     }
 }

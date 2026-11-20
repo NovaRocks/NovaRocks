@@ -46,6 +46,7 @@ unimplemented = "deny"
 result_large_err = "allow"
 
 [workspace.dependencies]
+recursive = "=0.1.1"
 novarocks-expression-contract = { path = "novarocks/expression-contract", version = "0.1.0" }
 novarocks-expression = { path = "novarocks/expression", version = "0.1.0" }
 novarocks-logical-execution-protocol = { path = "novarocks/logical-execution-protocol", version = "0.1.0" }

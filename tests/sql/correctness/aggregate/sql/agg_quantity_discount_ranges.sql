@@ -27,15 +27,14 @@
 CREATE TABLE ${case_db}.t_agg_quantity_discount_ranges (
     lo_quantity INT,
     lo_discount INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t_agg_quantity_discount_ranges VALUES
-    (1, 0),
-    (50, 10),
-    (20, 3),
-    (7, 5),
-    (42, 2);
+    ROW(1, 0),
+    ROW(50, 10),
+    ROW(20, 3),
+    ROW(7, 5),
+    ROW(42, 2);
 
 SELECT
     MIN(lo_quantity) AS min_qty,

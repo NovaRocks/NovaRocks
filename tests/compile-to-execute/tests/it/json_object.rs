@@ -73,10 +73,10 @@ fn c16_p1_json_object_real_sql_package_local_compiler_and_frame_keep_whole_call_
                 fields.push(Field::new("id", DataType::Int32, true));
             }
             let sql = match scenario {
-                0 => "SELECT json_object(k, v) AS j FROM t",
-                1 => "SELECT json_object([n], v) AS j FROM t",
-                2 => "SELECT json_object(NULL, json_object([n], v)) AS j FROM t",
-                3 | 4 => "SELECT json_object([[id, n]][IF(id = 2, NULL, 1)], v) AS j FROM t",
+                0 => "SELECT json_object(k: v) AS j FROM t",
+                1 => "SELECT json_object([n]: v) AS j FROM t",
+                2 => "SELECT json_object(NULL: json_object([n]: v)) AS j FROM t",
+                3 | 4 => "SELECT json_object([[id, n]][IF(id = 2, NULL, 1)]: v) AS j FROM t",
                 _ => unreachable!(),
             };
             let source = sql_source_with_declared_fields(sql, &fields);

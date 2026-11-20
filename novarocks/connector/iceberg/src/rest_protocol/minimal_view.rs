@@ -159,6 +159,7 @@ impl std::error::Error for ViewRequestError {}
 /// What a table-response scan retains besides location and UUID.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct TableViewRequest {
+    include_table_location: bool,
     snapshot: Option<i64>,
     target_ref: Option<String>,
     property_keys: Vec<String>,
@@ -196,6 +197,7 @@ impl TableViewRequest {
         }
         let (property_keys, property_value_lengths) = properties.into_iter().unzip();
         Ok(Self {
+            include_table_location: false,
             snapshot,
             target_ref,
             property_keys,
@@ -203,6 +205,11 @@ impl TableViewRequest {
             removed_snapshots: Vec::new(),
             retention_refs: Vec::new(),
         })
+    }
+
+    pub(crate) fn with_table_location(mut self) -> Self {
+        self.include_table_location = true;
+        self
     }
 
     pub(crate) fn with_retention(
@@ -284,6 +291,7 @@ impl fmt::Debug for PropertyValue {
 #[derive(Clone, Eq, PartialEq)]
 pub(crate) struct TableResponseView {
     pub(crate) metadata_location: LocationField,
+    pub(crate) table_location: Option<String>,
     pub(crate) metadata_predecessor: crate::catalog::transaction::MetadataPredecessorObservation,
     pub(crate) table_uuid: Option<String>,
     /// `Some` exactly when the request named a snapshot.
@@ -313,6 +321,7 @@ pub(crate) enum TableNode {
     Root,
     MetadataLocation,
     Metadata,
+    TableLocation,
     TableUuid,
     Snapshots,
     Snapshot,
@@ -334,6 +343,7 @@ pub(crate) enum TableNode {
 pub(crate) struct TableResponseSink {
     request: TableViewRequest,
     seen_location: bool,
+    seen_table_location: bool,
     seen_metadata: bool,
     seen_uuid: bool,
     seen_snapshots: bool,
@@ -344,6 +354,7 @@ pub(crate) struct TableResponseSink {
     seen_element_snapshot_id: bool,
     seen_property: Vec<bool>,
     metadata_location: LocationField,
+    table_location: Option<String>,
     table_uuid: Option<String>,
     snapshot_present: bool,
     retention_snapshots_present: Vec<bool>,
@@ -369,6 +380,7 @@ impl TableResponseSink {
         Self {
             request,
             seen_location: false,
+            seen_table_location: false,
             seen_metadata: false,
             seen_uuid: false,
             seen_snapshots: false,
@@ -379,6 +391,7 @@ impl TableResponseSink {
             seen_element_snapshot_id: false,
             seen_property: vec![false; keys],
             metadata_location: LocationField::Absent,
+            table_location: None,
             table_uuid: None,
             snapshot_present: false,
             retention_snapshots_present: vec![false; removed],
@@ -425,6 +438,10 @@ impl ViewSink for TableResponseSink {
                 return Ok(METADATA_LOCATION_LIMIT);
             }
             TableNode::Metadata => expect_kind(kind, &[Object], "metadata")?,
+            TableNode::TableLocation => {
+                expect_kind(kind, &[String], "metadata.location")?;
+                return Ok(METADATA_LOCATION_LIMIT);
+            }
             TableNode::TableUuid => {
                 expect_kind(kind, &[String], "metadata.table-uuid")?;
                 return Ok(UUID_TEXT_LIMIT);
@@ -496,6 +513,10 @@ impl ViewSink for TableResponseSink {
             (TableNode::Root, "metadata") => {
                 first(&mut self.seen_metadata, "metadata")?;
                 Some(TableNode::Metadata)
+            }
+            (TableNode::Metadata, "location") if self.request.include_table_location => {
+                first(&mut self.seen_table_location, "metadata.location")?;
+                Some(TableNode::TableLocation)
             }
             (TableNode::Metadata, "table-uuid") => {
                 first(&mut self.seen_uuid, "metadata.table-uuid")?;
@@ -614,6 +635,9 @@ impl ViewSink for TableResponseSink {
                     None => LocationField::Null,
                 };
             }
+            TableNode::TableLocation => {
+                self.table_location = retained_string(value, "metadata.location")?;
+            }
             TableNode::TableUuid => {
                 self.table_uuid = retained_string(value, "metadata.table-uuid")?;
             }
@@ -731,6 +755,7 @@ impl ViewSink for TableResponseSink {
             .collect();
         Ok(TableResponseView {
             metadata_location: self.metadata_location,
+            table_location: self.table_location,
             metadata_predecessor: if self.metadata_log_invalid {
                 crate::catalog::transaction::MetadataPredecessorObservation::Unusable
             } else {

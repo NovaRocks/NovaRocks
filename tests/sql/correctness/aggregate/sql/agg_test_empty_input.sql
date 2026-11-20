@@ -26,13 +26,12 @@ USE ${case_db};
 -- query 2
 -- @skip_result_check=true
 USE ${case_db};
-CREATE TABLE `t0` (
-  `v1` bigint(20) COMMENT "",
-  `v2` bigint(20) COMMENT "",
-  `v3` bigint(20) COMMENT "",
-  `v4` varchar COMMENT ""
-)
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE "t0" (
+  "v1" bigint(20),
+  "v2" bigint(20),
+  "v3" bigint(20),
+  "v4" varchar
+) WITH (format_version = 3);
 
 -- query 3
 USE ${case_db};
@@ -70,18 +69,17 @@ select count(distinct v1) from t0;
 -- query 11
 -- @skip_result_check=true
 USE ${case_db};
-CREATE TABLE `tt0` (
-  `c0` int(11) NULL COMMENT "",
-  `c1` varchar(20) not NULL COMMENT "",
-  `c2` varchar(200) not NULL COMMENT "",
-  `c3` int(11) NULL COMMENT ""
-)
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE "tt0" (
+  "c0" int(11),
+  "c1" varchar(20) not NULL,
+  "c2" varchar(200) not NULL,
+  "c3" int(11)
+) WITH (format_version = 3);
 
 -- query 12
 -- @skip_result_check=true
 USE ${case_db};
-insert into tt0 values (1,"test","test",1);
+insert into tt0 values ROW(1,'test','test',1);
 
 -- query 13
 USE ${case_db};

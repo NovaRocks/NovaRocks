@@ -22,8 +22,8 @@ DROP TABLE IF EXISTS ${case_db}.explain_analyze_actuals_l;
 DROP TABLE IF EXISTS ${case_db}.explain_analyze_actuals_r;
 CREATE TABLE ${case_db}.explain_analyze_actuals_l (k INT, v INT);
 CREATE TABLE ${case_db}.explain_analyze_actuals_r (k INT, v INT);
-INSERT INTO ${case_db}.explain_analyze_actuals_l VALUES (1, 10), (2, 20), (3, 30);
-INSERT INTO ${case_db}.explain_analyze_actuals_r VALUES (1, 100), (2, 200), (4, 400);
+INSERT INTO ${case_db}.explain_analyze_actuals_l VALUES ROW(1, 10), ROW(2, 20), ROW(3, 30);
+INSERT INTO ${case_db}.explain_analyze_actuals_r VALUES ROW(1, 100), ROW(2, 200), ROW(4, 400);
 
 -- @skip_result_check=true
 -- @result_contains=Planning:

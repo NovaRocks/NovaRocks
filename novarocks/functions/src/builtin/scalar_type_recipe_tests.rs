@@ -696,7 +696,7 @@ fn round_created_validation_uses_actual_literal_scale_and_real_wrapper_loan() {
     }
 }
 #[test]
-fn dynamic_created_empty_array_keeps_explicit_constraint_and_no_empty_collection_arc() {
+fn dynamic_created_empty_array_keeps_independent_unknown_declaration_and_real_creator() {
     let catalog = build_builtin_engine_function_catalog().unwrap();
     let item =
         FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
@@ -721,16 +721,21 @@ fn dynamic_created_empty_array_keeps_explicit_constraint_and_no_empty_collection
             &Control,
         )
         .unwrap();
-    // The existing empty-array rule borrows the explicitly selected result;
-    // child projection is a real temporary but no empty guarded Arc is made.
+    // The constructor authors its unknown child independently. An outer
+    // expected JSON result cannot supply the constructor's semantic domain.
     let FunctionResultType::Scalar(result) = &bound.selected.result_type else {
         panic!("scalar result")
     };
-    assert_eq!(result, &expected);
+    assert_eq!(result.child_at(0).unwrap().data_type(), &DataType::Null);
+    assert_eq!(
+        result.child_at(0).unwrap().logical_type(),
+        ValueLogicalType::Physical
+    );
+    assert!(!result.nullable());
     assert!(bound.selected.argument_types.is_empty());
     let wrong = declared_list(&FunctionValueType::new(DataType::Utf8, true), false).unwrap();
-    assert!(matches!(
-        catalog.validate_frozen_selection_with_creator_in(
+    catalog
+        .validate_frozen_selection_with_creator_in(
             &bound.function_id,
             bound.kind,
             &bound.selected,
@@ -738,6 +743,18 @@ fn dynamic_created_empty_array_keeps_explicit_constraint_and_no_empty_collection
                 expected_result_type: Some(&wrong),
                 ..request
             },
+            &mut scope,
+            &Control,
+        )
+        .unwrap();
+    let mut forged = bound.selected.clone();
+    forged.result_type = FunctionResultType::Scalar(expected.clone());
+    assert!(matches!(
+        catalog.validate_frozen_selection_with_creator_in(
+            &bound.function_id,
+            bound.kind,
+            &forged,
+            request,
             &mut scope,
             &Control
         ),

@@ -730,6 +730,7 @@ fn own_effects(
             target,
             decimal_overflow_policy,
             allow_throw_exception,
+            array_failure_mode,
         } => {
             if !arrow_data_types_exact_with_profile_observed::<CallAuthorError>(
                 target,
@@ -749,6 +750,7 @@ fn own_effects(
                 &source.ty,
                 *decimal_overflow_policy,
                 allow,
+                *array_failure_mode,
                 work.control(),
             )
             .map_err(|error| {

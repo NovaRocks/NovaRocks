@@ -22,14 +22,11 @@
 
 -- query 1
 -- @skip_result_check=true
-DROP TABLE IF EXISTS ${case_db}.t_v3_default_addcol FORCE;
+DROP TABLE IF EXISTS ${case_db}.t_v3_default_addcol ;
 CREATE TABLE ${case_db}.t_v3_default_addcol (
   a INT
-)
-TBLPROPERTIES (
-  "format-version" = "3"
-);
-INSERT INTO ${case_db}.t_v3_default_addcol VALUES (1), (2);
+) WITH (format_version = 3);
+INSERT INTO ${case_db}.t_v3_default_addcol VALUES ROW(1), ROW(2);
 ALTER TABLE ${case_db}.t_v3_default_addcol ADD COLUMN b INT DEFAULT 9;
 
 -- query 2
@@ -38,9 +35,9 @@ SELECT a, b FROM ${case_db}.t_v3_default_addcol ORDER BY a;
 
 -- query 3
 -- New INSERT (col list omits b) must materialize write-default = 9.
-INSERT INTO ${case_db}.t_v3_default_addcol (a) VALUES (3);
+INSERT INTO ${case_db}.t_v3_default_addcol (a) VALUES ROW(3);
 SELECT a, b FROM ${case_db}.t_v3_default_addcol ORDER BY a;
 
 -- query 4
 -- @skip_result_check=true
-DROP TABLE ${case_db}.t_v3_default_addcol FORCE;
+DROP TABLE ${case_db}.t_v3_default_addcol ;

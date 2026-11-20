@@ -34,8 +34,8 @@ fn compile_selected_action(
     let query = merge_query_fixture(
         "(SELECT CAST(2 AS BIGINT) AS id, CAST(20 AS BIGINT) AS _row_id, \
          'fixture.parquet' AS _file, CAST(0 AS BIGINT) AS _pos, \
-         CAST(1 AS BIGINT) AS _last_updated_sequence_number, CAST(0 AS INT) AS _spec_id, \
-         CAST(NULL AS STRUCT<bucket INT>) AS _partition) AS t",
+         CAST(1 AS BIGINT) AS _last_updated_sequence_number, CAST(0 AS INTEGER) AS _spec_id, \
+         CAST(NULL AS ROW(bucket INTEGER)) AS _partition) AS t",
         "t",
         "(SELECT CAST(2 AS BIGINT) AS id UNION ALL SELECT CAST(99 AS BIGINT)) AS s",
         "t.id = s.id",
@@ -47,7 +47,7 @@ fn compile_selected_action(
         matched_action,
         insert,
     );
-    let sql = novarocks_parser::printer::print_query(&query);
+    let sql = novarocks_parser::printer::print_query(&query).unwrap();
     let control = SqlCompileControl::unbounded();
     let request = SqlFinalPlanCompileRequest::new(
         PlanVersionId::try_new([61; 16]).unwrap(),

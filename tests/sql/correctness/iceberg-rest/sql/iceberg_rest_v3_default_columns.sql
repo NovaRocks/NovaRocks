@@ -22,16 +22,15 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE DATABASE iceberg_rest_${suite_uuid0}.iceberg_rest_def_db_${uuid0};
+CREATE SCHEMA iceberg_rest_${suite_uuid0}.iceberg_rest_def_db_${uuid0};
 
 -- query 2
 -- @skip_result_check=true
-CREATE TABLE iceberg_rest_${suite_uuid0}.iceberg_rest_def_db_${uuid0}.t_def_${uuid0} (a INT)
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE iceberg_rest_${suite_uuid0}.iceberg_rest_def_db_${uuid0}.t_def_${uuid0} (a INT) WITH (format_version = 3);
 
 -- query 3
 -- @skip_result_check=true
-INSERT INTO iceberg_rest_${suite_uuid0}.iceberg_rest_def_db_${uuid0}.t_def_${uuid0} VALUES (1), (2);
+INSERT INTO iceberg_rest_${suite_uuid0}.iceberg_rest_def_db_${uuid0}.t_def_${uuid0} VALUES ROW(1), ROW(2);
 
 -- query 4
 -- @skip_result_check=true
@@ -47,7 +46,7 @@ SELECT a, b
 -- query 6
 -- @skip_result_check=true
 -- INSERT omitting b must materialize write-default 9.
-INSERT INTO iceberg_rest_${suite_uuid0}.iceberg_rest_def_db_${uuid0}.t_def_${uuid0} (a) VALUES (3);
+INSERT INTO iceberg_rest_${suite_uuid0}.iceberg_rest_def_db_${uuid0}.t_def_${uuid0} (a) VALUES ROW(3);
 
 -- query 7
 -- All 3 rows must read b=9.
@@ -75,4 +74,4 @@ DROP TABLE iceberg_rest_${suite_uuid0}.iceberg_rest_def_db_${uuid0}.t_def_v2_${u
 
 -- query 12
 -- @skip_result_check=true
-DROP DATABASE iceberg_rest_${suite_uuid0}.iceberg_rest_def_db_${uuid0};
+DROP SCHEMA iceberg_rest_${suite_uuid0}.iceberg_rest_def_db_${uuid0};

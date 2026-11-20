@@ -27,54 +27,29 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE EXTERNAL CATALOG ice_ivm_bunion_${uuid0}
-PROPERTIES (
-  "type" = "iceberg",
-  "iceberg.catalog.type" = "rest",
-  "uri" = "${iceberg_rest_uri}",
-  "warehouse" = "${iceberg_rest_warehouse}",
-  "aws.s3.endpoint" = "${oss_endpoint}",
-  "credential.object-store-metadata.consumer-role" = "frontend",
-  "credential.object-store-metadata.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-metadata.name" = "${iceberg_object_store_metadata_credential_name}",
-  "credential.object-store-metadata.generation" = "${iceberg_object_store_credential_generation}",
-  "credential.object-store-data.consumer-role" = "backend",
-  "credential.object-store-data.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-data.name" = "${iceberg_object_store_data_credential_name}",
-  "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
-  "aws.s3.region" = "${oss_region}",
-  "aws.s3.enable_path_style_access" = "${oss_path_style}"
-);
-CREATE DATABASE ice_ivm_bunion_${uuid0}.ns_${uuid0};
+CREATE CATALOG ice_ivm_bunion_${uuid0} USING iceberg WITH ("iceberg.catalog.type" = 'rest', "uri" = '${iceberg_rest_uri}', "warehouse" = '${iceberg_rest_warehouse}', "aws.s3.endpoint" = '${oss_endpoint}', "credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-metadata.name" = '${iceberg_object_store_metadata_credential_name}', "credential.object-store-metadata.generation" = '${iceberg_object_store_credential_generation}', "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-data.name" = '${iceberg_object_store_data_credential_name}', "credential.object-store-data.generation" = '${iceberg_object_store_credential_generation}', "aws.s3.region" = '${oss_region}', "aws.s3.enable_path_style_access" = '${oss_path_style}');
+CREATE SCHEMA ice_ivm_bunion_${uuid0}.ns_${uuid0};
 CREATE TABLE ice_ivm_bunion_${uuid0}.ns_${uuid0}.t1 (
   id BIGINT NOT NULL,
   region STRING,
   amount BIGINT
-)
-TBLPROPERTIES ("format-version" = "3",
-  "write.row-lineage" = "true");
+) WITH (format_version = 3);
 CREATE TABLE ice_ivm_bunion_${uuid0}.ns_${uuid0}.t2 (
   id BIGINT NOT NULL,
   region STRING,
   amount BIGINT
-)
-TBLPROPERTIES ("format-version" = "3",
-  "write.row-lineage" = "true");
+) WITH (format_version = 3);
 USE ice_ivm_bunion_${uuid0}.ns_${uuid0};
 
 -- query 2
 -- @skip_result_check=true
 INSERT INTO ice_ivm_bunion_${uuid0}.ns_${uuid0}.t1 VALUES
-  (1, 'k1', 10),
-  (2, 'k2', 5);
+  ROW(1, 'k1', 10),
+  ROW(2, 'k2', 5);
 INSERT INTO ice_ivm_bunion_${uuid0}.ns_${uuid0}.t2 VALUES
-  (3, 'k1', 100),
-  (4, 'k3', 7);
-CREATE MATERIALIZED VIEW branch_union_mv_${uuid0}
-DISTRIBUTED BY HASH(region) BUCKETS 1
-PROPERTIES ('storage_engine' = 'iceberg')
-AS
-SELECT region, COUNT(*) AS c, SUM(amount) AS s
+  ROW(3, 'k1', 100),
+  ROW(4, 'k3', 7);
+CREATE MATERIALIZED VIEW branch_union_mv_${uuid0} AS SELECT region, COUNT(*) AS c, SUM(amount) AS s
 FROM ice_ivm_bunion_${uuid0}.ns_${uuid0}.t1
 GROUP BY region
 UNION ALL
@@ -106,7 +81,7 @@ ORDER BY region, s;
 -- query 7
 -- @skip_result_check=true
 INSERT INTO ice_ivm_bunion_${uuid0}.ns_${uuid0}.t1 VALUES
-  (5, 'k1', 50);
+  ROW(5, 'k1', 50);
 
 -- query 8
 -- @skip_result_check=true
@@ -127,7 +102,7 @@ SELECT __agg_state_c FROM branch_union_mv_${uuid0};
 -- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW branch_union_mv_${uuid0};
-DROP TABLE ice_ivm_bunion_${uuid0}.ns_${uuid0}.t1 FORCE;
-DROP TABLE ice_ivm_bunion_${uuid0}.ns_${uuid0}.t2 FORCE;
-DROP DATABASE ice_ivm_bunion_${uuid0}.ns_${uuid0};
+DROP TABLE ice_ivm_bunion_${uuid0}.ns_${uuid0}.t1 ;
+DROP TABLE ice_ivm_bunion_${uuid0}.ns_${uuid0}.t2 ;
+DROP SCHEMA ice_ivm_bunion_${uuid0}.ns_${uuid0};
 DROP CATALOG ice_ivm_bunion_${uuid0};

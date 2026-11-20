@@ -935,7 +935,7 @@ async fn drop_column_guard_keeps_readable_ready_mv_dependencies() {
 async fn drop_column_guard_refuses_unreadable_ready_mv_definition_without_explicit_leaf_reference()
 {
     let source = "SELECT\n (";
-    let parser_error = novarocks_parser::parse(source)
+    let parser_error = novarocks_parser::parser::parse_query(source)
         .unwrap_err()
         .to_user_error(source);
     let (_product, readiness) = drop_column_dependency_readiness(Some(source)).await;

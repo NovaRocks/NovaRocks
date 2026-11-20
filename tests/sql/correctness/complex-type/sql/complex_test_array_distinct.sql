@@ -29,8 +29,7 @@ USE ${case_db};
 CREATE TABLE t1 (
     c1 INT,
     c2 ARRAY<BIGINT>
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 3
 -- @skip_result_check=true
@@ -38,8 +37,7 @@ USE ${case_db};
 CREATE TABLE t2 (
     c1 INT,
     c2 ARRAY<ARRAY<BIGINT>>
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 4
 -- @skip_result_check=true

@@ -1496,10 +1496,7 @@ fn analyze_window_admission_sql(sql: &str) -> Result<(), crate::analyze_error::A
         .unwrap()
         .snapshot_for_scalar_presence();
     let tables = crate::catalog::memory::PlannerMemoryCatalog::default();
-    let statements = novarocks_parser::parse(sql).unwrap();
-    let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
-        panic!("an authored SQL query");
-    };
+    let query = &novarocks_parser::parser::parse_query(sql).unwrap();
     crate::analyzer::analyze_with_function_catalog(
         query,
         &tables,

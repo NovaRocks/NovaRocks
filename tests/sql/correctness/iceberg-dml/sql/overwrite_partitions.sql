@@ -36,14 +36,12 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.t_id (id INT, region VARCHAR(8))
-PARTITION BY (region)
-TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+CREATE TABLE ${case_db}.t_id (id INT, region VARCHAR(8)) WITH (partitioning = ARRAY['region'], format_version = 3);
 
 -- query 2
 -- @skip_result_check=true
 INSERT INTO ${case_db}.t_id VALUES
-  (1, 'us'), (2, 'us'), (3, 'eu'), (4, 'eu');
+  ROW(1, 'us'), ROW(2, 'us'), ROW(3, 'eu'), ROW(4, 'eu');
 
 -- query 3
 -- Pre-OVERWRITE: 4 rows across two partitions.
@@ -52,7 +50,7 @@ SELECT region, COUNT(*) AS n FROM ${case_db}.t_id GROUP BY region ORDER BY regio
 -- query 4
 -- @skip_result_check=true
 -- Replace just the `us` partition with a single new row.
-INSERT OVERWRITE PARTITIONS ${case_db}.t_id VALUES (99, 'us');
+INSERT OVERWRITE PARTITIONS ${case_db}.t_id VALUES ROW(99, 'us');
 
 -- query 5
 -- Post-OVERWRITE: us has 1 row (the new one), eu still has 2 rows.
@@ -68,13 +66,11 @@ SELECT id, region FROM ${case_db}.t_id WHERE region = 'us' ORDER BY id;
 
 -- query 7
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.t_empty_sel (id INT, region VARCHAR(8))
-PARTITION BY (region)
-TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+CREATE TABLE ${case_db}.t_empty_sel (id INT, region VARCHAR(8)) WITH (partitioning = ARRAY['region'], format_version = 3);
 
 -- query 8
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t_empty_sel VALUES (1, 'us'), (2, 'eu');
+INSERT INTO ${case_db}.t_empty_sel VALUES ROW(1, 'us'), ROW(2, 'eu');
 
 -- query 9
 -- @skip_result_check=true
@@ -97,14 +93,12 @@ SELECT region, COUNT(*) AS n FROM ${case_db}.t_empty_sel GROUP BY region ORDER B
 
 -- query 11
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.t_dv (id INT, region VARCHAR(8))
-PARTITION BY (region)
-TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+CREATE TABLE ${case_db}.t_dv (id INT, region VARCHAR(8)) WITH (partitioning = ARRAY['region'], format_version = 3);
 
 -- query 12
 -- @skip_result_check=true
 INSERT INTO ${case_db}.t_dv VALUES
-  (1, 'us'), (2, 'us'), (3, 'us'), (4, 'eu');
+  ROW(1, 'us'), ROW(2, 'us'), ROW(3, 'us'), ROW(4, 'eu');
 
 -- query 13
 -- @skip_result_check=true
@@ -119,7 +113,7 @@ SELECT region, COUNT(*) AS n FROM ${case_db}.t_dv GROUP BY region ORDER BY regio
 -- @skip_result_check=true
 -- OVERWRITE PARTITIONS for us must mark BOTH the data files AND the DV in
 -- the us partition as DELETED, so the new us row is the only us row.
-INSERT OVERWRITE PARTITIONS ${case_db}.t_dv VALUES (99, 'us');
+INSERT OVERWRITE PARTITIONS ${case_db}.t_dv VALUES ROW(99, 'us');
 
 -- query 16
 -- Post-OVERWRITE: us has 1 row (id=99), eu untouched.
@@ -131,28 +125,26 @@ SELECT id, region FROM ${case_db}.t_dv ORDER BY id;
 
 -- query 17
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.t_branch (id INT, region VARCHAR(8))
-PARTITION BY (region)
-TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+CREATE TABLE ${case_db}.t_branch (id INT, region VARCHAR(8)) WITH (partitioning = ARRAY['region'], format_version = 3);
 
 -- query 18
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t_branch VALUES (1, 'us'), (2, 'eu');
+INSERT INTO ${case_db}.t_branch VALUES ROW(1, 'us'), ROW(2, 'eu');
 
 -- query 19
 -- @skip_result_check=true
 -- ALTER TABLE for branch DDL requires 3-part name (catalog.db.table); see
 -- src/engine/iceberg_ref_flow.rs::resolve_table_parts.
-ALTER TABLE iceberg_dml_cat_${suite_uuid0}.${case_db}.t_branch CREATE BRANCH dev;
+CREATE BRANCH dev IN TABLE iceberg_dml_cat_${suite_uuid0}.${case_db}.t_branch;
 
 -- query 20
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t_branch.branch_dev VALUES (3, 'us');
+INSERT INTO ${case_db}.t_branch @dev VALUES (3, 'us');
 
 -- query 21
 -- @skip_result_check=true
 -- Replace `us` only on the dev branch.
-INSERT OVERWRITE PARTITIONS ${case_db}.t_branch.branch_dev VALUES (99, 'us');
+INSERT OVERWRITE PARTITIONS ${case_db}.t_branch @dev VALUES ROW(99, 'us');
 
 -- query 22
 -- dev branch: us=1 (the overwrite), eu still has the inherited row.
@@ -164,7 +156,7 @@ SELECT id, region FROM ${case_db}.t_branch ORDER BY id;
 
 -- query 24
 -- @skip_result_check=true
-ALTER TABLE iceberg_dml_cat_${suite_uuid0}.${case_db}.t_branch DROP BRANCH IF EXISTS dev;
+DROP BRANCH IF EXISTS dev IN TABLE iceberg_dml_cat_${suite_uuid0}.${case_db}.t_branch;
 
 -- ---------------------------------------------------------------------------
 -- Case 5: parser-level rejection — unpartitioned table
@@ -172,13 +164,12 @@ ALTER TABLE iceberg_dml_cat_${suite_uuid0}.${case_db}.t_branch DROP BRANCH IF EX
 
 -- query 25
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.t_no_part (id INT, v VARCHAR(8))
-TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+CREATE TABLE ${case_db}.t_no_part (id INT, v VARCHAR(8)) WITH (format_version = 3);
 
 -- query 26
 -- @expect_error=PARTITIONS
 -- Engine fail-fast: OVERWRITE PARTITIONS demands a partitioned table.
-INSERT OVERWRITE PARTITIONS ${case_db}.t_no_part VALUES (1, 'a');
+INSERT OVERWRITE PARTITIONS ${case_db}.t_no_part VALUES ROW(1, 'a');
 
 -- ---------------------------------------------------------------------------
 -- Case 6: parser-level rejection — v2 table without row-lineage
@@ -186,15 +177,13 @@ INSERT OVERWRITE PARTITIONS ${case_db}.t_no_part VALUES (1, 'a');
 
 -- query 27
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.t_v2 (id INT, region VARCHAR(8))
-PARTITION BY (region)
-TBLPROPERTIES ("format-version" = "2");
+CREATE TABLE ${case_db}.t_v2 (id INT, region VARCHAR(8)) WITH (partitioning = ARRAY['region'], format_version = 2);
 
 -- query 28
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t_v2 VALUES (1, 'us');
+INSERT INTO ${case_db}.t_v2 VALUES ROW(1, 'us');
 
 -- query 29
 -- @expect_error=row-lineage
 -- OverwritePartitionsCommit requires a v3 row-lineage table.
-INSERT OVERWRITE PARTITIONS ${case_db}.t_v2 VALUES (99, 'us');
+INSERT OVERWRITE PARTITIONS ${case_db}.t_v2 VALUES ROW(99, 'us');

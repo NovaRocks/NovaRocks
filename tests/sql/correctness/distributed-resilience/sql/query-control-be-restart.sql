@@ -40,20 +40,19 @@
 CREATE TABLE ${case_db}.be_restart (
   id BIGINT,
   delay_s BIGINT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 2
 -- @skip_result_check=true
-INSERT INTO ${case_db}.be_restart VALUES (1, 3);
+INSERT INTO ${case_db}.be_restart VALUES ROW(1, 3);
 
 -- query 3
 -- @skip_result_check=true
-INSERT INTO ${case_db}.be_restart VALUES (2, 3);
+INSERT INTO ${case_db}.be_restart VALUES ROW(2, 3);
 
 -- query 4
 -- @skip_result_check=true
-INSERT INTO ${case_db}.be_restart VALUES (3, 3);
+INSERT INTO ${case_db}.be_restart VALUES ROW(3, 3);
 
 -- query 5
 -- @restart_be_after_establish_participation_index=1

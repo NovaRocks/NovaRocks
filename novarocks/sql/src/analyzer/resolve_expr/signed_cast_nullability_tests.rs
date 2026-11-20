@@ -61,6 +61,7 @@ fn implicit_signed_cast_nullability_preserves_complete_source_and_policy() {
                         assert_eq!(format!("{output:?}"), format!("{input:?}"));
                     } else {
                         let ExprKind::Cast {
+                            array_failure_mode: None,
                             expr,
                             target: actual_target,
                             decimal_overflow_policy,
@@ -177,6 +178,7 @@ fn implicit_decimal_function_coercion_uses_the_original_cast_null_contract() {
                 policy == DecimalOverflowPolicy::OutputNull
             );
             let ExprKind::Cast {
+                array_failure_mode: None,
                 expr,
                 target: actual_target,
                 decimal_overflow_policy,
@@ -193,6 +195,7 @@ fn implicit_decimal_function_coercion_uses_the_original_cast_null_contract() {
                 &output.value_type,
                 policy,
                 false,
+                None,
                 &control,
             )
             .expect("actual prepared CAST accepts its producer's complete declaration");
@@ -223,6 +226,7 @@ fn implicit_temporal_comparison_coercion_preserves_possible_null_and_real_source
             FunctionValueType::new(target.clone(), true)
         );
         let ExprKind::Cast {
+            array_failure_mode: None,
             expr,
             target: actual_target,
             decimal_overflow_policy,
@@ -240,6 +244,7 @@ fn implicit_temporal_comparison_coercion_preserves_possible_null_and_real_source
                 &output.value_type,
                 DecimalOverflowPolicy::OutputNull,
                 allow,
+                None,
                 &control,
             )
             .expect("implicit temporal declaration remains valid under the actual ALLOW fact");

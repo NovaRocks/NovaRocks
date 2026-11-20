@@ -432,9 +432,10 @@ fn canonical_window_cv_order_and_frame_remain_independent_ordered_channels() {
 #[test]
 fn canonical_window_table_none_and_null_keep_original_operational_presence() {
     for kind in [
-        ExprKind::Nested(Box::new(integer(7))),
+        ExprKind::Nested(novarocks_parser::ast::AstBox::new(integer(7))),
         ExprKind::Cast {
-            expr: Box::new(integer(7)),
+            array_failure_mode: None,
+            expr: novarocks_parser::ast::AstBox::new(integer(7)),
             target: DataType::Int64,
             decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
         },
@@ -483,7 +484,7 @@ fn canonical_window_table_none_and_null_keep_original_operational_presence() {
         syntax_null(),
         TypedExpr {
             value_type: list_value(1).value_type,
-            kind: ExprKind::Nested(Box::new(list_value(1))),
+            kind: ExprKind::Nested(novarocks_parser::ast::AstBox::new(list_value(1))),
         },
     ] {
         let none = matches!(input.kind, ExprKind::Nested(_));

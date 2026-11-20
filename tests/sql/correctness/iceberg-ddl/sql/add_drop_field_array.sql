@@ -28,7 +28,7 @@
 DROP TABLE IF EXISTS ${case_db}.tab1;
 CREATE TABLE ${case_db}.tab1 (
   c0 INT,
-  c1 ARRAY<STRUCT<v1 INT, v2 INT>>
+  c1 ARRAY<ROW(v1 INT, v2 INT)>
 );
 
 -- query 2

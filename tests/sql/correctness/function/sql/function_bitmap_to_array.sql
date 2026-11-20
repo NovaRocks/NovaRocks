@@ -26,10 +26,9 @@
 -- query 1
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t_bm_arr (
-  `c1` int(11) NULL COMMENT "",
-  `c2` bitmap NULL COMMENT ""
-)
-TBLPROPERTIES ("format-version" = "3");
+  "c1" int(11),
+  "c2" bitmap
+) WITH (format_version = 3);
 
 -- query 2
 -- @skip_result_check=true

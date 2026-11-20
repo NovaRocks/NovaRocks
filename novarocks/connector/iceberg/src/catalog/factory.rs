@@ -456,7 +456,6 @@ mod tests {
             AnchorWrittenMetadata,
             AlterSchema,
             AlterProperties,
-            AlterPartitionSpec,
             CreateBranch,
             DropBranch,
             CreateTag,

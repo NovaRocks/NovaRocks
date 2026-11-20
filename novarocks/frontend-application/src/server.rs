@@ -584,7 +584,7 @@ async fn build_frontend_role_products(
 fn build_frontend_query_session_factory_from_role_products(
     host: &FrontendApplicationHost,
     products: &FrontendRoleProducts,
-) -> Result<Arc<dyn QuerySessionFactory>, FrontendApplicationError> {
+) -> Result<Arc<crate::query::FrontendQueryService>, FrontendApplicationError> {
     let catalog_service = Arc::clone(&products.catalog_service);
     let unified_statistics = Arc::clone(&products.unified_statistics);
     let catalog_application = Arc::clone(&products.catalog_application);
@@ -678,25 +678,24 @@ fn build_frontend_query_session_factory_from_role_products(
             host.required_constant_interpreter().sealed_functions(),
         ))
         .with_execution_services(products.mv_execution_services.clone());
-    let mv_command_consumer: Arc<
-        dyn novarocks_query_application::api::MaterializedViewCommandConsumer,
-    > = Arc::new(crate::mv::command::FrontendMvCommandConsumer::new(
-        mv_command_executor.clone(),
-    ));
     let maintenance_command_executor =
         core_capabilities::maintenance_command_executor(maintenance_ports);
     let product_command_router = crate::query::product_command_router(
         catalog_command_executor,
         view_command_executor.clone(),
         iceberg_ref_command_executor.clone(),
-        statistics_command_executor,
-        maintenance_command_executor,
+        statistics_command_executor.clone(),
+        maintenance_command_executor.clone(),
         host.query_blocking_executor(),
         host.state_store_original_binding(),
         #[cfg(novarocks_dev_controls)]
         host.test_session
             .as_ref()
             .and_then(|session| session.statement.clone()),
+    );
+    let alter_mv_guard = crate::query::table_mutation_action::AlterTableMvGuard::new(
+        Arc::clone(&mv_storage_observation),
+        Arc::clone(&mv_readiness),
     );
     let dml_engines = core_capabilities::dml_engines(
         core_capabilities::DmlEnginePorts::new(
@@ -728,8 +727,11 @@ fn build_frontend_query_session_factory_from_role_products(
         host.required_constant_interpreter(),
         query_compiler,
         product_command_router,
+        alter_mv_guard,
+        statistics_command_executor,
+        iceberg_ref_command_executor,
+        maintenance_command_executor,
         view_command_executor,
-        mv_command_consumer,
         mv_command_executor,
         products.query_control.clone(),
         Arc::clone(&products.logical_execution_launcher),
@@ -772,7 +774,13 @@ async fn build_frontend_query_session_factory(
     system_catalog: Arc<novarocks_query_application::system_tables::SystemTableRegistry>,
     exchange_port: u16,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
-) -> Result<(Arc<dyn QuerySessionFactory>, FrontendRoleProducts), FrontendApplicationError> {
+) -> Result<
+    (
+        Arc<crate::query::FrontendQueryService>,
+        FrontendRoleProducts,
+    ),
+    FrontendApplicationError,
+> {
     let products =
         build_frontend_role_products(host, exchange_port, mv_storage_observation, system_catalog)
             .await?;
@@ -1412,7 +1420,9 @@ mod tests {
     use novarocks_catalog_application::{CatalogAdmission, CatalogDesiredStateSourceInput};
     use novarocks_native_adapter::FrontendNativeTransport;
     use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
-    use novarocks_query_application::session::{QuerySessionStatement, StatementSessionRequest};
+    use novarocks_query_application::session::{
+        QuerySession, QuerySessionFactory, QuerySessionStatement, StatementSessionRequest,
+    };
     use novarocks_query_application::session_error::QueryServiceErrorKind;
 
     fn test_statement_request(
@@ -1648,7 +1658,7 @@ mod tests {
             novarocks_spi::connector::ConnectorInstanceId::parse("warehouse").expect("instance ID");
 
         let result = session
-            .execute_statement(r#"CREATE EXTERNAL CATALOG warehouse PROPERTIES("type"="iceberg")"#)
+            .execute_statement(r#"CREATE CATALOG warehouse USING iceberg"#)
             .await
             .expect("CREATE CATALOG commits a durable StateStore attachment");
         settle_governed_completion(result);
@@ -1743,6 +1753,57 @@ mod tests {
                 .as_str(),
             "sql.admit.session_catalog_not_found"
         );
+
+        // The staged Trino entrance uses the same registered frontend session
+        // and the same publication owner as the still-active legacy entrance.
+        let typed_request = || test_statement_request(&products.query_control, "cp2-cutover");
+        let session = session_factory
+            .open_frontend_statement_session(typed_request())
+            .expect("open typed statement session");
+        let rejected = session
+            .execute_trino_one_statement(Arc::from(
+                "CREATE CATALOG warehouse USING iceberg; SELECT 1",
+            ))
+            .await;
+        let Err(error) = rejected else {
+            panic!("syntax rejection must precede catalog publication");
+        };
+        assert_eq!(
+            error.user_error().unwrap().code().as_str(),
+            "sql.parse.unexpected_token",
+        );
+        assert!(attachments.get(&instance_id).await.unwrap().is_none());
+        session.close();
+        drop(session);
+
+        let session = session_factory
+            .open_frontend_statement_session(typed_request())
+            .expect("open typed statement session");
+        let created = session
+            .execute_trino_one_statement(Arc::from("CREATE CATALOG warehouse USING iceberg"))
+            .await
+            .expect("typed CREATE CATALOG admission");
+        settle_governed_completion(created);
+        let attachment = attachments
+            .get(&instance_id)
+            .await
+            .unwrap()
+            .expect("typed CREATE CATALOG published the original attachment");
+        assert_eq!(attachment.attachment.provider_id.as_str(), "iceberg");
+        session.close();
+        drop(session);
+
+        let session = session_factory
+            .open_frontend_statement_session(typed_request())
+            .expect("open typed statement session");
+        let dropped = session
+            .execute_trino_one_statement(Arc::from("DROP CATALOG warehouse"))
+            .await
+            .expect("typed DROP CATALOG admission");
+        settle_governed_completion(dropped);
+        assert!(attachments.get(&instance_id).await.unwrap().is_none());
+        session.close();
+        drop(session);
 
         // The ready session factory and this test's probe both hold StateStore references; the
         // host owns closing the deployment lock, so release them first.
@@ -1847,7 +1908,7 @@ mod tests {
             ))
             .expect("open frontend query session");
         let result = session
-            .execute_statement("ANALYZE TABLE system.metadata.materialized_views")
+            .execute_statement("ANALYZE system.metadata.materialized_views")
             .await
             .expect("configured statistics application selects the system-relation refusal");
         let (output, terminal) = result.into_parts();

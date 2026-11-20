@@ -119,14 +119,15 @@ fn operational_channels_none_does_not_demand_a_pool_for_cast_or_nested_constants
     for argument in [
         TypedExpr {
             kind: ExprKind::Cast {
-                expr: Box::new(text("MiXeD")),
+                array_failure_mode: None,
+                expr: novarocks_parser::ast::AstBox::new(text("MiXeD")),
                 target: DataType::Utf8,
                 decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
             },
             value_type: ValueType::new(DataType::Utf8, false),
         },
         TypedExpr {
-            kind: ExprKind::Nested(Box::new(text("MiXeD"))),
+            kind: ExprKind::Nested(novarocks_parser::ast::AstBox::new(text("MiXeD"))),
             value_type: ValueType::new(DataType::Utf8, false),
         },
     ] {
@@ -358,7 +359,8 @@ fn original_emission_retains_operational_request_and_selected_constant_backing_t
 fn original_emission_retained_none_is_not_reconstructed_from_physical_constant() {
     let argument = TypedExpr {
         kind: ExprKind::Cast {
-            expr: Box::new(text("MiXeD")),
+            array_failure_mode: None,
+            expr: novarocks_parser::ast::AstBox::new(text("MiXeD")),
             target: DataType::Utf8,
             decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
         },

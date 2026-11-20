@@ -86,13 +86,14 @@ impl TrinoCaseSession {
     // Runner database controls have the same syntax as USE. The two names
     // belong in separate Trino headers, never in one schema header.
     fn set_database_context(state: &mut ClientSession, database: &str) -> Result<()> {
-        use novarocks_parser::ast::{SessionStatement, Statement};
-        let statements = novarocks_parser::parse(&format!("USE {database}"))
+        use novarocks_parser::ast::TrinoStatement;
+
+        let statement = novarocks_parser::parser::parse_statement(&format!("USE {database}"))
             .map_err(|error| anyhow::anyhow!("invalid runner database context: {error:?}"))?;
-        let [Statement::Session(SessionStatement::Use(context))] = statements.as_slice() else {
+        let TrinoStatement::Use(context) = statement else {
             bail!("runner database context must be exactly one USE namespace");
         };
-        let schema = novarocks_types::naming::normalize_identifier(&context.database.value)
+        let schema = novarocks_types::naming::normalize_identifier(&context.schema.value)
             .map_err(anyhow::Error::msg)?;
         let catalog = context
             .catalog
@@ -156,8 +157,35 @@ impl TrinoCaseSession {
         sql: &str,
         db: Option<&str>,
     ) -> SqlExecutionOutcome {
-        self.execute_query_with_before_execute(query_timeout, sql, db, true, |_, _, _, _, _| Ok(()))
+        self.execute_query_with_before_execute(
+            query_timeout,
+            sql,
+            db,
+            None,
+            true,
+            |_, _, _, _, _| Ok(()),
+        )
     }
+    pub(crate) fn execute_verbose_explain(
+        &mut self,
+        query_timeout: u64,
+        sql: &str,
+    ) -> SqlExecutionOutcome {
+        let previous = self
+            .state
+            .properties
+            .insert("explain_detail".into(), "VERBOSE".into());
+        let result = self.execute_query(query_timeout, sql, None);
+        if let Some(previous) = previous {
+            self.state
+                .properties
+                .insert("explain_detail".into(), previous);
+        } else {
+            self.state.properties.remove("explain_detail");
+        }
+        result
+    }
+
     /// POST obtains the query identity before controls are armed. The first GET
     /// starts the statement only after the caller has frozen its observation.
     pub(crate) fn execute_query_with_before_execute(
@@ -165,15 +193,35 @@ impl TrinoCaseSession {
         query_timeout: u64,
         sql: &str,
         db: Option<&str>,
+        expected_error: Option<&TrinoErrorExpectation>,
         allow_transient_commit_retries: bool,
         mut before: impl FnMut(usize, usize, &str, &str, CancelHandle) -> Result<()>,
     ) -> SqlExecutionOutcome {
+        let statements = match split_trino_step_sql(sql, expected_error) {
+            Ok(statements) => statements,
+            Err(error) => {
+                let message = format!("{error:#}");
+                return SqlExecutionOutcome::from_attempt(SqlExecutionAttempt {
+                    ordinal: 0,
+                    statement_count: 0,
+                    statements: Vec::new(),
+                    local_failures: vec![message.clone()],
+                    execution: None,
+                    message: format!("ERROR (0.00s): {message}"),
+                    succeeded: false,
+                });
+            }
+        };
+        let syntax_refusal = expected_error
+            .filter(|error| error.name == "SYNTAX_ERROR" && error.error_type == "USER_ERROR")
+            .map(|error| error.statement_count() - 1);
         let mut attempts = Vec::new();
         for ordinal in 0..2 {
             let attempt = self.execute_query_once(
                 ordinal,
                 query_timeout,
-                sql,
+                &statements,
+                syntax_refusal,
                 db,
                 |index, query_id, submitted, cancel| {
                     before(ordinal, index, query_id, submitted, cancel)
@@ -218,29 +266,21 @@ impl TrinoCaseSession {
         &mut self,
         ordinal: usize,
         query_timeout: u64,
-        sql: &str,
+        statements: &[String],
+        syntax_refusal: Option<usize>,
         db: Option<&str>,
         mut before: impl FnMut(usize, &str, &str, CancelHandle) -> Result<()>,
     ) -> SqlExecutionAttempt {
         let started = Instant::now();
         let mut attempt = SqlExecutionAttempt {
             ordinal,
-            statement_count: 0,
+            statement_count: statements.len(),
             statements: Vec::new(),
             local_failures: Vec::new(),
             execution: None,
             message: String::new(),
             succeeded: false,
         };
-        let statements = match split_sql_statements(sql) {
-            Ok(statements) => statements,
-            Err(error) => {
-                attempt.message = format!("ERROR (0.00s): {error:#}");
-                attempt.local_failures.push(format!("{error:#}"));
-                return attempt;
-            }
-        };
-        attempt.statement_count = statements.len();
         if let Some(db) = db.filter(|value| !value.is_empty())
             && let Err(error) = Self::set_database_context(&mut self.state, db)
         {
@@ -268,9 +308,11 @@ impl TrinoCaseSession {
             let mut client_error = None;
             let outcome = (|| -> Result<StatementResult> {
                 self.before_operation()?;
-                if let Some(guard) = &self.namespace_guard {
-                    guard.before(statement)?;
-                }
+                let prepared_namespace = self
+                    .namespace_guard
+                    .as_ref()
+                    .map(|guard| guard.prepare_trino(statement, syntax_refusal == Some(index)))
+                    .transpose()?;
                 let deadline = match self
                     .deadline
                     .into_iter()
@@ -333,8 +375,10 @@ impl TrinoCaseSession {
                 let (result, effects) = outcome?;
                 self.state.apply(&effects);
                 self.sync_guard();
-                if let Some(guard) = &mut self.namespace_guard {
-                    guard.after(statement)?;
+                if let (Some(guard), Some(prepared)) =
+                    (&mut self.namespace_guard, prepared_namespace)
+                {
+                    guard.complete_trino(prepared)?;
                 }
                 Ok(result)
             })();
@@ -471,165 +515,45 @@ fn format_statement_failure(
     )
 }
 
-pub(crate) fn split_sql_statements(sql: &str) -> Result<Vec<String>> {
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    enum State {
-        Normal,
-        SingleQuote,
-        DoubleQuote,
-        Backtick,
-        LineComment,
-        BlockComment,
-        // MySQL optimizer hint `/*+ ... */` looks like a block comment but is
-        // semantically part of the statement (parsed by the server). Preserve
-        // its full text — stripping it would silently drop SET_VAR hints like
-        // `recursive_cte_max_depth=N` and change query behavior.
-        OptimizerHint,
-    }
-
-    let mut statements = Vec::new();
-    let mut buffer = String::new();
-    let mut state = State::Normal;
-    let bytes = sql.as_bytes();
-    let mut i = 0usize;
-
-    while i < sql.len() {
-        // Safe: we only advance `i` on character boundaries (we never
-        // step inside a multi-byte char body; the state-transition
-        // cases below use sql[i..].chars().next() or byte peeks that
-        // are valid at i because we got here via char_indices logic.)
-        let ch = match sql[i..].chars().next() {
-            Some(c) => c,
-            None => break,
-        };
-        let char_len = ch.len_utf8();
-
-        match state {
-            State::Normal => match ch {
-                '\'' => {
-                    state = State::SingleQuote;
-                    buffer.push(ch);
-                }
-                '"' => {
-                    state = State::DoubleQuote;
-                    buffer.push(ch);
-                }
-                '`' => {
-                    state = State::Backtick;
-                    buffer.push(ch);
-                }
-                '-' if i + 1 < sql.len() && bytes[i + 1] == b'-' => {
-                    // MySQL rule: `--` is a comment only when followed by
-                    // whitespace, a control character, or end of line.
-                    let after = i + 2;
-                    let next_is_ws_or_eol = after >= sql.len()
-                        || matches!(bytes[after], b' ' | b'\t' | b'\n' | b'\r')
-                        || bytes[after] < 0x20;
-                    if next_is_ws_or_eol {
-                        state = State::LineComment;
-                        i += 2;
-                        continue;
-                    }
-                    buffer.push(ch);
-                }
-                '/' if i + 1 < sql.len() && bytes[i + 1] == b'*' => {
-                    if i + 2 < sql.len() && bytes[i + 2] == b'+' {
-                        buffer.push_str("/*+");
-                        state = State::OptimizerHint;
-                        i += 3;
-                        continue;
-                    }
-                    state = State::BlockComment;
-                    i += 2;
-                    continue;
-                }
-                ';' => {
-                    if let Some(statement) = normalize_statement_fragment(&buffer) {
-                        statements.push(statement);
-                    }
-                    buffer.clear();
-                }
-                _ => buffer.push(ch),
-            },
-            State::SingleQuote => {
-                buffer.push(ch);
-                if ch == '\'' {
-                    state = State::Normal;
-                }
-            }
-            State::DoubleQuote => {
-                buffer.push(ch);
-                if ch == '"' {
-                    state = State::Normal;
-                }
-            }
-            State::Backtick => {
-                buffer.push(ch);
-                if ch == '`' {
-                    state = State::Normal;
-                }
-            }
-            State::LineComment => {
-                if ch == '\n' {
-                    state = State::Normal;
-                    buffer.push(ch);
-                }
-            }
-            State::BlockComment => {
-                if ch == '*' && i + 1 < sql.len() && bytes[i + 1] == b'/' {
-                    state = State::Normal;
-                    i += 2;
-                    continue;
-                }
-            }
-            State::OptimizerHint => {
-                if ch == '*' && i + 1 < sql.len() && bytes[i + 1] == b'/' {
-                    buffer.push_str("*/");
-                    state = State::Normal;
-                    i += 2;
-                    continue;
-                }
-                buffer.push(ch);
-            }
-        }
-        i += char_len;
-    }
-
-    match state {
-        State::SingleQuote | State::DoubleQuote | State::Backtick => {
-            bail!("unterminated quoted string in SQL batch");
-        }
-        State::BlockComment => bail!("unterminated /* */ block comment in SQL batch"),
-        State::OptimizerHint => bail!("unterminated /*+ */ optimizer hint in SQL batch"),
-        _ => {}
-    }
-
-    if let Some(trailing) = normalize_statement_fragment(&buffer) {
-        statements.push(trailing);
-    }
-    Ok(statements)
+/// Splits a script using the Trino lexer and its real routine grammar.
+pub fn split_trino_sql_statements(sql: &str) -> Result<Vec<String>> {
+    split_trino_step_sql(sql, None)
 }
 
-fn normalize_statement_fragment(fragment: &str) -> Option<String> {
-    let mut lines = Vec::new();
-    let mut started = false;
-    for line in fragment.lines() {
-        let trimmed = line.trim();
-        if !started && (trimmed.is_empty() || trimmed.starts_with("--") || trimmed.starts_with('#'))
-        {
-            continue;
-        }
-        if !trimmed.is_empty() {
-            started = true;
-        }
-        lines.push(line.trim_end());
+/// Prepares exactly the same bytes for validation, control hashes, and POST.
+/// A declared syntax-error probe may submit the selected completely framed
+/// rejected statement. The FE produces its own error from the original bytes.
+pub(crate) fn split_trino_step_sql(
+    sql: &str,
+    expected_error: Option<&TrinoErrorExpectation>,
+) -> Result<Vec<String>> {
+    let frames =
+        novarocks_parser::parser::frame_statements(sql).context("framing Trino SQL batch")?;
+    if let Some(error) = expected_error {
+        error.validate_statement_count(frames.len())?;
     }
-    let normalized = lines.join("\n").trim().to_string();
-    if normalized.is_empty() {
-        None
-    } else {
-        Some(normalized)
-    }
+    let lexical_refusal_index = expected_error
+        .filter(|error| error.name == "SYNTAX_ERROR" && error.error_type == "USER_ERROR")
+        .map(|error| error.statement_count() - 1);
+    frames
+        .into_iter()
+        .enumerate()
+        .map(|(index, frame)| {
+            let raw = &sql[frame.source.start()..frame.source.end()];
+            if let Some(error) = frame.lexical_failure {
+                if lexical_refusal_index == Some(index) {
+                    return Ok(raw.to_owned());
+                }
+                return Err(anyhow::Error::new(error).context("tokenizing Trino SQL batch"));
+            }
+            Ok(raw.trim().to_owned())
+        })
+        .collect()
+}
+
+#[cfg(test)]
+fn split_sql_statements(sql: &str) -> Result<Vec<String>> {
+    split_trino_sql_statements(sql)
 }
 
 pub(crate) fn run_trino_sql_until(
@@ -665,33 +589,43 @@ pub(crate) fn run_trino_sql_scoped_until(
     Ok(execution.map_or_else(String::new, |execution| execution.text_output))
 }
 
+fn quote_identifier(value: &str) -> String {
+    format!(r#""{}""#, value.replace('"', r#""""#))
+}
+
 fn case_table_names_sql(catalog: &str, db_name: &str) -> String {
     // Views remain owned by each case's explicit cleanup statements.
+    let catalog = quote_identifier(catalog);
+    let namespace = db_name.replace('\'', "''");
     format!(
-        "SELECT table_name FROM `{catalog}`.information_schema.tables WHERE table_schema = '{db_name}' AND table_type = 'BASE TABLE';"
+        "SELECT table_name FROM {catalog}.information_schema.tables WHERE table_schema = '{namespace}' AND table_type = 'BASE TABLE';"
     )
 }
 
-/// Names of the tables a case database currently holds.
-///
-/// `DROP DATABASE ... FORCE` expands into a listing of the namespace's
-/// children, so a catalog that cannot enumerate one kind of child refuses it.
-/// The harness therefore enumerates and drops explicitly, which works on every
-/// catalog.
-///
-/// The catalog qualifier is required: a two-part `information_schema` name
-/// binds to the session catalog. A case database in another catalog must use
-/// that catalog's exact qualifier.
+/// Enumerate the exact namespace in the catalog bound to the actual session.
 fn case_table_names(
     conn: &ConnectionConfig,
     query_timeout: u64,
     db_name: &str,
     deadline: Option<Instant>,
 ) -> Result<Vec<String>> {
-    let Some(catalog) = conn.catalog.as_deref() else {
-        return Ok(Vec::new());
+    let catalog = match conn.catalog.as_deref() {
+        Some(catalog) => catalog.to_owned(),
+        None => {
+            let result =
+                run_trino_sql_until(conn, query_timeout, "SELECT current_catalog", deadline)?;
+            let catalogs: Vec<_> = result.lines().skip(1).map(str::trim).collect();
+            let [catalog] = catalogs.as_slice() else {
+                bail!("case cleanup has no exact catalog from its original session");
+            };
+            ensure!(
+                !catalog.is_empty() && *catalog != "NULL",
+                "case cleanup has no session catalog"
+            );
+            (*catalog).to_owned()
+        }
     };
-    let sql = case_table_names_sql(catalog, db_name);
+    let sql = case_table_names_sql(&catalog, db_name);
     let output = match run_trino_sql_until(conn, query_timeout, &sql, deadline) {
         Ok(output) => output,
         Err(error) => {
@@ -719,7 +653,7 @@ pub(crate) fn reset_case_database_scoped_until(
     run_trino_sql_scoped_until(
         conn,
         query_timeout,
-        &format!("CREATE DATABASE `{db_name}`;"),
+        &format!("CREATE SCHEMA {};", quote_identifier(db_name)),
         deadline,
         guard,
     )
@@ -734,21 +668,13 @@ pub(crate) fn drop_case_database_until(
     label: &str,
     deadline: Option<Instant>,
 ) -> Result<()> {
-    // Without a catalog there is nothing to enumerate against, so the explicit
-    // path cannot see the children it would need to drop first. Fall back to
-    // FORCE, which is what the local catalog still supports and what this did
-    // everywhere before enumeration existed.
-    if conn.catalog.is_none() {
-        let sql = format!("DROP DATABASE IF EXISTS `{db_name}` FORCE;");
-        run_trino_sql_until(conn, query_timeout, &sql, deadline)
-            .with_context(|| format!("{} case database cleanup failed: {}", label, db_name))?;
-        return Ok(());
-    }
     let mut sql = String::new();
+    let namespace = quote_identifier(db_name);
     for table in case_table_names(conn, query_timeout, db_name, deadline)? {
-        sql.push_str(&format!("DROP TABLE IF EXISTS `{db_name}`.`{table}`;\n"));
+        let table = quote_identifier(&table);
+        sql.push_str(&format!("DROP TABLE IF EXISTS {namespace}.{table};\n"));
     }
-    sql.push_str(&format!("DROP DATABASE IF EXISTS `{db_name}`;"));
+    sql.push_str(&format!("DROP SCHEMA IF EXISTS {namespace};"));
     run_trino_sql_until(conn, query_timeout, &sql, deadline)
         .with_context(|| format!("{} case database cleanup failed: {}", label, db_name))?;
     Ok(())
@@ -756,14 +682,189 @@ pub(crate) fn drop_case_database_until(
 
 #[cfg(test)]
 mod splitter_tests {
-    use super::{format_statement_failure, split_sql_statements, statement_sha256};
+    use super::{
+        format_statement_failure, split_sql_statements, split_trino_sql_statements,
+        statement_sha256,
+    };
     use std::time::Duration;
+
+    #[test]
+    fn indexed_trino_error_expectation_allows_a_lexical_refusal_only_at_its_ordinal() {
+        let expectation = super::TrinoErrorExpectation {
+            name: "SYNTAX_ERROR".into(),
+            error_type: "USER_ERROR".into(),
+            statement_ordinal: std::num::NonZeroUsize::new(2),
+        };
+        assert_eq!(
+            super::split_trino_step_sql("USE fixture;SELECT #;", Some(&expectation)).unwrap(),
+            ["USE fixture", "SELECT #"]
+        );
+        assert!(super::split_trino_step_sql("SELECT #;SELECT 1;", Some(&expectation)).is_err());
+        assert!(
+            super::split_trino_step_sql("USE fixture;SELECT #;SELECT 3;", Some(&expectation))
+                .is_err()
+        );
+    }
+
+    // The runner owns source framing. Expected fragments are hand-written
+    // source slices; lexical rules come from the production parser dependency.
+    #[test]
+    fn trino_split_preserves_semicolons_and_doubled_quotes_inside_literals() {
+        let sql = r#"SELECT 'a'';b', "a"";b"; SELECT 2;"#;
+        assert_eq!(
+            split_trino_sql_statements(sql).expect("split"),
+            [r#"SELECT 'a'';b', "a"";b""#, "SELECT 2"]
+        );
+    }
+
+    #[test]
+    fn trino_split_backslash_does_not_escape_a_closing_quote() {
+        let sql = r"SELECT 'a\'; SELECT 2;";
+        assert_eq!(
+            split_trino_sql_statements(sql).expect("split"),
+            [r"SELECT 'a\'", "SELECT 2"]
+        );
+    }
+
+    #[test]
+    fn trino_split_keeps_unicode_binary_and_dollar_literal_boundaries() {
+        let sql = "SELECT U&'a;b', X'AA;BB', $$BEGIN; RETURN 1; END$$; SELECT 2;";
+        assert_eq!(
+            split_trino_sql_statements(sql).expect("split"),
+            [
+                "SELECT U&'a;b', X'AA;BB', $$BEGIN; RETURN 1; END$$",
+                "SELECT 2",
+            ]
+        );
+    }
+
+    #[test]
+    fn trino_split_preserves_comments_with_unconditional_double_dash() {
+        let sql = "SELECT 1--not whitespace; stays comment\r\n; /* note; */ SELECT 2;";
+        assert_eq!(
+            split_trino_sql_statements(sql).expect("split"),
+            [
+                "SELECT 1--not whitespace; stays comment",
+                "/* note; */ SELECT 2",
+            ]
+        );
+    }
+
+    #[test]
+    fn trino_split_block_comment_ends_at_first_close() {
+        let sql = "/* outer /* inner */ SELECT 1; SELECT 2;";
+        assert_eq!(
+            split_trino_sql_statements(sql).expect("split"),
+            ["/* outer /* inner */ SELECT 1", "SELECT 2"]
+        );
+    }
+
+    #[test]
+    fn trino_split_plus_comment_has_no_hint_semantics() {
+        let sql = "/*+ FUNCTION ; */ SELECT 1; SELECT 2;";
+        assert_eq!(
+            split_trino_sql_statements(sql).expect("split"),
+            ["/*+ FUNCTION ; */ SELECT 1", "SELECT 2"]
+        );
+    }
+
+    #[test]
+    fn trino_split_preserves_query_markers_and_directives() {
+        let sql = "-- query 1\n-- @skip_result_check=true\nSELECT 1;\n-- query 2\n-- @expect_error=expected\nSELECT 2;";
+        assert_eq!(
+            split_trino_sql_statements(sql).expect("split"),
+            [
+                "-- query 1\n-- @skip_result_check=true\nSELECT 1",
+                "-- query 2\n-- @expect_error=expected\nSELECT 2",
+            ]
+        );
+    }
+
+    #[test]
+    fn trino_split_keeps_rewritten_statements_within_the_original_step() {
+        let sql = "-- query 1\nSET SESSION explain_detail = 'VERBOSE'; SELECT 1; RESET SESSION explain_detail;\n-- query 2\nSELECT 2;";
+        let marker = regex::Regex::new(r"^--\s*query\s+(\d+)(?:\s+.*)?$").expect("regex");
+        let framed = crate::parser::frame_case_source(sql, &marker).expect("case frames");
+        assert_eq!(framed.sections.len(), 2);
+        let (first_number, first_range) = &framed.sections[0];
+        let (second_number, second_range) = &framed.sections[1];
+        assert_eq!((*first_number, *second_number), (1, 2));
+        assert_eq!(
+            split_trino_sql_statements(&sql[first_range.clone()]).expect("first step"),
+            [
+                "-- query 1\nSET SESSION explain_detail = 'VERBOSE'",
+                "SELECT 1",
+                "RESET SESSION explain_detail",
+            ]
+        );
+        assert_eq!(
+            split_trino_sql_statements(&sql[second_range.clone()]).expect("second step"),
+            ["-- query 2\nSELECT 2"]
+        );
+    }
+
+    #[test]
+    fn trino_split_preserves_utf8_and_internal_crlf() {
+        let sql = "-- 中文;\r\nSELECT '值;值', \"列;名\"\r\nFROM t; SELECT '尾';";
+        assert_eq!(
+            split_trino_sql_statements(sql).expect("split"),
+            [
+                "-- 中文;\r\nSELECT '值;值', \"列;名\"\r\nFROM t",
+                "SELECT '尾'"
+            ]
+        );
+    }
+
+    #[test]
+    fn trino_split_ignores_empty_and_trivia_only_fragments() {
+        assert!(
+            split_trino_sql_statements("; -- comment;\n; /* block; */ ;")
+                .expect("split")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn trino_split_propagates_lexical_failures_without_legacy_recovery() {
+        for sql in [
+            "SELECT # not a comment",
+            "SELECT `a;b`",
+            "SELECT 'open",
+            "SELECT \"open",
+            "SELECT 1 /* open",
+        ] {
+            assert!(split_trino_sql_statements(sql).is_err(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn trino_split_follows_actual_routine_grammar_and_ordinary_function_identifiers() {
+        let create = "CREATE FUNCTION f() RETURNS BIGINT BEGIN RETURN 1; END";
+        let inline = "WITH FUNCTION n() RETURNS BIGINT BEGIN RETURN 2; END SELECT n()";
+        let identifier = "SELECT function FROM t";
+        assert_eq!(
+            split_trino_sql_statements(&format!("{create}; {inline}; {identifier};"))
+                .expect("grammar-owned routine boundaries"),
+            [create, inline, identifier]
+        );
+        assert!(
+            split_trino_sql_statements(
+                "CREATE FUNCTION f() RETURNS BIGINT BEGIN RETURN 1; SELECT 2;"
+            )
+            .is_err()
+        );
+        assert_eq!(
+            split_trino_sql_statements("SELECT 'FUNCTION', \"function\";")
+                .expect("literal and identifier"),
+            ["SELECT 'FUNCTION', \"function\""]
+        );
+    }
 
     #[test]
     fn case_cleanup_enumerates_only_base_tables_in_the_exact_catalog_namespace() {
         assert_eq!(
             super::case_table_names_sql("external", "owned_db"),
-            "SELECT table_name FROM `external`.information_schema.tables WHERE table_schema = 'owned_db' AND table_type = 'BASE TABLE';"
+            r#"SELECT table_name FROM "external".information_schema.tables WHERE table_schema = 'owned_db' AND table_type = 'BASE TABLE';"#
         );
     }
     #[test]
@@ -798,7 +899,10 @@ DELETE FROM t WHERE c = '2020-01-01 00:00:00.0';";
         let parts = split_sql_statements(sql).expect("split");
         assert_eq!(parts.len(), 2, "expected 2 statements, got {:?}", parts);
         assert!(parts[0].starts_with("DELETE FROM t WHERE c = '2020-01-01 00:00:00'"));
-        assert!(parts[1].starts_with("DELETE FROM t WHERE c = '2020-01-01 00:00:00.0'"));
+        assert_eq!(
+            parts[1],
+            "-- '00:00:00.0' is same as '00:00:00'; rows already gone\nDELETE FROM t WHERE c = '2020-01-01 00:00:00.0'"
+        );
     }
 
     #[test]
@@ -807,17 +911,15 @@ DELETE FROM t WHERE c = '2020-01-01 00:00:00.0';";
         let parts = split_sql_statements(sql).expect("split");
         assert_eq!(parts.len(), 2);
         assert_eq!(parts[0], "SELECT 1");
-        assert_eq!(parts[1], "SELECT 2");
+        assert_eq!(parts[1], "/* note; with ; semicolons */ SELECT 2");
     }
 
     #[test]
-    fn double_dash_without_trailing_whitespace_is_not_a_comment() {
-        // MySQL rule: `--` is a comment only when followed by whitespace,
-        // a control character, or end of line.
+    fn double_dash_without_trailing_whitespace_is_a_line_comment() {
         let sql = "SELECT a--b FROM t;";
         let parts = split_sql_statements(sql).expect("split");
         assert_eq!(parts.len(), 1);
-        assert_eq!(parts[0], "SELECT a--b FROM t");
+        assert_eq!(parts[0], "SELECT a--b FROM t;");
     }
 
     #[test]
@@ -830,24 +932,19 @@ DELETE FROM t WHERE c = '2020-01-01 00:00:00.0';";
     }
 
     #[test]
-    fn optimizer_hint_is_preserved() {
-        // MySQL `/*+ ... */` optimizer hints are part of the statement (the
-        // server parses them) — stripping them would silently drop SET_VAR
-        // values such as `recursive_cte_max_depth`.
-        let sql = "SELECT /*+ SET_VAR(recursive_cte_max_depth=10) */ n FROM fib; SELECT 2;";
+    fn inline_block_comment_is_retained() {
+        let sql = "SELECT /* query input; not a separator */ n FROM fib; SELECT 2;";
         let parts = split_sql_statements(sql).expect("split");
         assert_eq!(parts.len(), 2);
         assert_eq!(
             parts[0],
-            "SELECT /*+ SET_VAR(recursive_cte_max_depth=10) */ n FROM fib"
+            "SELECT /* query input; not a separator */ n FROM fib"
         );
         assert_eq!(parts[1], "SELECT 2");
     }
 
     #[test]
     fn nested_block_comment_is_not_supported() {
-        // MySQL treats /* ... /* ... */ as ending at the first */, leaving
-        // the trailing `... */` outside the comment. We match that.
         let sql = "SELECT 1; /* outer /* inner */ tail */; SELECT 2;";
         let parts = split_sql_statements(sql).expect("split");
         // After first */ at offset of "inner */", `tail */` is outside.
@@ -1120,7 +1217,7 @@ mod session_tests {
         let peer = Peer::start(boundary_success_replies(1));
         let mut config = peer.config();
         config.catalog = Some("initial".into());
-        config.db = Some("`selected`.`first_namespace`".into());
+        config.db = Some(r#""selected"."first_namespace""#.into());
         let mut session = TrinoCaseSession::new_with_deadline(&config, None).unwrap();
         let outcome = session.execute_query(2, "SELECT 7", None);
         let (ok, _, message) = outcome.summary();
@@ -1132,7 +1229,10 @@ mod session_tests {
 
     #[test]
     fn database_override_preserves_qualified_and_unqualified_use_context() {
-        for database in ["selected.first_namespace", "`selected`.`first_namespace`"] {
+        for database in [
+            "selected.first_namespace",
+            r#""selected"."first_namespace""#,
+        ] {
             let peer = Peer::start(boundary_success_replies(2));
             let mut session = peer.session();
             session.state.catalog = Some("initial".into());
@@ -1153,7 +1253,7 @@ mod session_tests {
     #[test]
     fn invalid_initial_database_context_never_sends_a_request() {
         let peer = Peer::start(vec![]);
-        for database in ["a.b.c", "a; SELECT 1", "a; USE b", "`a.b`"] {
+        for database in ["a.b.c", "a; SELECT 1", "a; USE b", r#""a.b""#] {
             let mut config = peer.config();
             config.db = Some(database.into());
             assert!(TrinoCaseSession::new_with_deadline(&config, None).is_err());
@@ -1168,7 +1268,7 @@ mod session_tests {
         session.state.catalog = Some("original_catalog".into());
         session.state.schema = Some("original_namespace".into());
         let properties = session.state.properties.clone();
-        for database in ["a.b.c", "a; SELECT 1", "a; USE b", "`a.b`"] {
+        for database in ["a.b.c", "a; SELECT 1", "a; USE b", r#""a.b""#] {
             let outcome = session.execute_query(2, "SELECT 7", Some(database));
             let (ok, execution, message) = outcome.summary();
             assert!(!ok, "{database}: {message}");
@@ -1197,7 +1297,7 @@ mod session_tests {
             ),
         ]);
         let mut session = peer.session();
-        let outcome = session.execute_query(9, "ALTER TABLE t OPTIMIZE", None);
+        let outcome = session.execute_query(9, "ALTER TABLE t EXECUTE optimize", None);
         let (ok, execution, message) = outcome.summary();
         assert!(ok, "{message}");
         let execution = execution.unwrap();
@@ -1224,6 +1324,7 @@ mod session_tests {
         );
         let requests = peer.finish();
         assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0].body, "ALTER TABLE t EXECUTE optimize");
         assert_eq!(requests[2].path, "/end");
     }
 
@@ -1239,12 +1340,14 @@ mod session_tests {
             Reply::json("GET", "/select", &integer_result("v", 42)),
         ]);
         let mut session = peer.session();
-        let outcome = session.execute_query(9, "SET pipeline_dop = 4; SELECT 42 AS v;", None);
+        let outcome =
+            session.execute_query(9, "SET SESSION pipeline_dop = 4; SELECT 42 AS v;", None);
         let (ok, execution, message) = outcome.summary();
         assert!(ok, "{message}");
         assert_eq!(execution.unwrap().typed_results.len(), 1);
         assert_eq!(session.state.properties["pipeline_dop"], "4");
         let requests = peer.finish();
+        assert_eq!(requests[0].body, "SET SESSION pipeline_dop = 4");
         assert_eq!(requests[2].body, "SELECT 42 AS v");
         assert_eq!(requests[2].headers["x-trino-catalog"], "cat");
         assert_eq!(requests[2].headers["x-trino-schema"], "db");
@@ -1289,6 +1392,7 @@ mod session_tests {
             9,
             "SELECT 1",
             None,
+            None,
             true,
             |attempt, index, query_id, sql, _| {
                 assert_eq!((attempt, index), (0, 0));
@@ -1314,6 +1418,7 @@ mod session_tests {
         let outcome = peer.session().execute_query_with_before_execute(
             9,
             "SELECT 1",
+            None,
             None,
             true,
             |_, _, _, _, _| bail!("observation denied"),
@@ -1384,7 +1489,7 @@ mod session_tests {
             &defaults,
         )
         .unwrap();
-        let outcome = session.execute_query(9, "SET pipeline_dop = 4", None);
+        let outcome = session.execute_query(9, "SET SESSION pipeline_dop = 4", None);
         let (ok, _, message) = outcome.summary();
         assert!(ok, "{message}");
         assert_eq!(session.state.properties["pipeline_dop"], "4");
@@ -1402,7 +1507,7 @@ mod session_tests {
             .filter(|request| request.method == "POST")
             .map(|request| request.body.as_str())
             .collect();
-        assert_eq!(submitted, vec!["SET pipeline_dop = 4", "SELECT 2"]);
+        assert_eq!(submitted, vec!["SET SESSION pipeline_dop = 4", "SELECT 2"]);
     }
 
     #[test]
@@ -1503,6 +1608,7 @@ mod session_tests {
             expect_trino_error: Some(TrinoErrorExpectation {
                 name: "GENERIC_USER_ERROR".into(),
                 error_type: "USER_ERROR".into(),
+                statement_ordinal: None,
             }),
             ..Default::default()
         }
@@ -1541,6 +1647,61 @@ mod session_tests {
                 .is_err()
         );
         assert_eq!(peer.finish().len(), 4);
+    }
+
+    #[test]
+    fn indexed_trino_error_expectation_requires_the_prefix_use_to_succeed() {
+        for use_succeeds in [true, false] {
+            let mut replies = if use_succeeds {
+                vec![
+                    Reply::queued("/v1/statement", "/use"),
+                    Reply::json("GET", "/use", r#"{"id":"q","updateType":"USE"}"#)
+                        .header("X-Trino-Set-Schema", "fixture"),
+                ]
+            } else {
+                Vec::new()
+            };
+            replies.extend([
+                Reply::queued("/v1/statement", "/bad"),
+                Reply::json("GET", "/bad", &trino_error("same typed error")),
+            ]);
+            let mut meta = generic_user_expectation();
+            meta.expect_trino_error.as_mut().unwrap().statement_ordinal =
+                std::num::NonZeroUsize::new(2);
+            let peer = Peer::start(replies);
+            let temp = tempfile::TempDir::new().unwrap();
+            let (case, evidence, _) = run_boundary_steps(
+                &peer,
+                &temp,
+                crate::Mode::Verify,
+                false,
+                vec![boundary_step(1, "USE fixture; SELECT malformed", meta)],
+                None,
+                Box::new(BoundaryServer),
+            );
+            assert_eq!(
+                matches!(case.status, crate::CaseStatus::Pass),
+                use_succeeds,
+                "{}",
+                case.log
+            );
+            assert!(oracle_recorded(
+                &evidence,
+                1,
+                "expected_error",
+                if use_succeeds { "pass" } else { "fail" }
+            ));
+            let requests = peer.finish();
+            if use_succeeds {
+                assert_eq!(
+                    posted_requests(&requests),
+                    ["USE fixture", "SELECT malformed"]
+                );
+                assert_eq!(requests[2].headers["x-trino-schema"], "fixture");
+            } else {
+                assert_eq!(posted_requests(&requests), ["USE fixture"]);
+            }
+        }
     }
 
     #[test]
@@ -1757,6 +1918,7 @@ mod session_tests {
             9,
             "INSERT INTO t VALUES (1)",
             None,
+            None,
             false,
             |attempt, statement, _, _, _| {
                 observations.push((attempt, statement));
@@ -1809,6 +1971,7 @@ mod session_tests {
         let outcome = session.execute_query_with_before_execute(
             9,
             "SELECT 1; SELECT 7",
+            None,
             None,
             true,
             |_, _, _, _, _| {
@@ -2163,7 +2326,7 @@ mod session_tests {
 
     #[test]
     fn outer_verify_and_conversion_local_control_cannot_match_sql_expected_error() {
-        let setup = r#"CREATE EXTERNAL CATALOG boundary_catalog PROPERTIES ("type"="iceberg", "iceberg.catalog.type"="rest", "uri"="http://127.0.0.1:38001")"#;
+        let setup = r#"CREATE CATALOG boundary_catalog USING iceberg WITH ("iceberg.catalog.type"='rest', "uri"='http://127.0.0.1:38001')"#;
         for (mode, convert) in [(crate::Mode::Verify, false), (crate::Mode::Record, true)] {
             // The setup publishes only local catalog facts through the real
             // session guard. The next namespace write is rejected locally,
@@ -2173,7 +2336,7 @@ mod session_tests {
                 mode,
                 convert,
                 Some(setup),
-                "CREATE DATABASE boundary_catalog.foreign",
+                "CREATE SCHEMA boundary_catalog.foreign",
                 "shared REST write requires an exact namespace",
                 false,
             );
@@ -2659,7 +2822,7 @@ mod session_tests {
 
     #[test]
     fn outer_conversion_proves_select_before_set_or_drop_as_a_complete_result() {
-        for suffix in ["SET pipeline_dop = 5", "DROP TABLE boundary_table"] {
+        for suffix in ["SET SESSION pipeline_dop = 5", "DROP TABLE boundary_table"] {
             let mut replies = boundary_success_replies(1);
             replies.extend([
                 Reply::queued("/v1/statement", "/boundary-update"),
@@ -3040,7 +3203,7 @@ mod session_tests {
             let steps = vec![
                 boundary_step(
                     1,
-                    "CALL maintenance",
+                    "CALL maintenance()",
                     QueryMeta {
                         expect_error: Some("durable cleanup response lost".into()),
                         restart_fe_after_step: true,
@@ -3117,7 +3280,7 @@ mod session_tests {
             }
             assert_eq!(
                 posted_requests(&peer.finish()),
-                ["CALL maintenance", "SELECT 7", "SELECT 99"]
+                ["CALL maintenance()", "SELECT 7", "SELECT 99"]
             );
             assert_eq!(target.finish().len(), 1);
             proxy.shutdown().unwrap();
@@ -3159,7 +3322,7 @@ mod session_tests {
             let steps = vec![
                 boundary_step(
                     1,
-                    "CALL maintenance",
+                    "CALL maintenance()",
                     QueryMeta {
                         expect_error: Some("durable cleanup response lost".into()),
                         restart_fe_after_step: true,
@@ -3209,7 +3372,7 @@ mod session_tests {
             assert_eq!(std::fs::read_to_string(golden).unwrap(), initial);
             assert_eq!(
                 posted_requests(&peer.finish()),
-                ["CALL maintenance", "SELECT 99"]
+                ["CALL maintenance()", "SELECT 99"]
             );
             target.finish();
             proxy.shutdown().unwrap();
@@ -3485,7 +3648,7 @@ mod session_tests {
             [
                 "SELECT 7",
                 "SELECT * FROM target_mv",
-                "CALL ice.system.novarocks_imv_stateless_rebuild(table => 'target_mv', level => 'provenance')",
+                "CALL ice.system.novarocks_imv_stateless_rebuild(\"table\" => 'target_mv', level => 'provenance')",
                 "SELECT 7",
                 "SELECT 99"
             ]
@@ -3667,7 +3830,7 @@ mod session_tests {
         let steps = vec![
             boundary_step(
                 1,
-                "CALL negative",
+                "CALL negative()",
                 crate::types::QueryMeta {
                     expect_error: Some("expected statement rejection".into()),
                     restart_fe_after_step: true,
@@ -3708,7 +3871,7 @@ mod session_tests {
         );
         assert_eq!(
             posted_requests(&peer.finish()),
-            ["CALL negative", "SELECT 7", "SELECT 99"]
+            ["CALL negative()", "SELECT 7", "SELECT 99"]
         );
     }
     #[test]
@@ -3994,7 +4157,7 @@ mod session_tests {
             assert_eq!(response.status().as_u16(), 503);
         });
         let sql = if reply == PublicationKillReply::MixedStatementThenTransport {
-            "CALL failed; SELECT 11; SELECT held"
+            "CALL failed(); SELECT 11; SELECT held"
         } else {
             "SELECT 11; SELECT held"
         };
@@ -4304,7 +4467,7 @@ mod session_tests {
         assert_eq!(calls, [1, 1]);
         assert_eq!(
             posted_requests(&requests),
-            ["CALL failed", "SELECT 11", "SELECT held", "SELECT 99"]
+            ["CALL failed()", "SELECT 11", "SELECT held", "SELECT 99"]
         );
     }
 
@@ -4329,6 +4492,7 @@ mod session_tests {
         let raw = session.execute_query_with_before_execute(
             2,
             "SELECT local",
+            None,
             None,
             true,
             |_, _, _, _, _| anyhow::bail!("original before-operation refusal"),
@@ -4525,7 +4689,7 @@ mod session_tests {
         let steps = vec![
             boundary_step(
                 1,
-                "CALL failed; SELECT transport",
+                "CALL failed(); SELECT transport",
                 crate::types::QueryMeta {
                     kill_fe_after_be_log_contains: Some("BOUNDARY_QUERY_ACTIVE".into()),
                     expect_error: Some("Trino transport failure".into()),
@@ -4563,7 +4727,7 @@ mod session_tests {
         assert_eq!(*calls.lock().unwrap(), [1, 2, 1]);
         assert_eq!(
             posted_requests(&peer.finish()),
-            ["CALL failed", "SELECT transport", "SELECT 99"]
+            ["CALL failed()", "SELECT transport", "SELECT 99"]
         );
     }
 
@@ -4780,7 +4944,7 @@ mod session_tests {
             }
             assert_eq!(
                 posted_requests(&peer.finish()),
-                ["SELECT 7", "EXPLAIN VERBOSE SELECT 7", "SELECT 99"]
+                ["SELECT 7", "EXPLAIN SELECT 7", "SELECT 99"]
             );
         }
     }
@@ -4861,7 +5025,7 @@ mod session_tests {
                 }
                 assert_eq!(
                     posted_requests(&peer.finish()),
-                    ["SELECT 7", "EXPLAIN VERBOSE SELECT 7", "SELECT 99"]
+                    ["SELECT 7", "EXPLAIN SELECT 7", "SELECT 99"]
                 );
             }
         }

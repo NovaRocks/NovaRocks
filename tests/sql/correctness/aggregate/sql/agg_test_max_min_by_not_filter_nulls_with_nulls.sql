@@ -25,25 +25,24 @@
 USE ${case_db};
 CREATE TABLE IF NOT EXISTS t0
 (
-  c0 INT NULL,
-  c1 INT NULL,
-  c2 DECIMAL128(7, 2) NULL,
-  c3 VARCHAR(10) NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+  c0 INT ,
+  c1 INT ,
+  c2 DECIMAL128(7, 2) ,
+  c3 VARCHAR(10)
+) WITH (format_version = 3);
 INSERT INTO t0
 (c0, c1, c2, c3)
 VALUES
-('4', '8', NULL, NULL),
-(NULL, NULL, '55157.78', NULL),
-('9', '6', NULL, 'foo'),
-('8', NULL, '8.20', 'foobar'),
-('7', NULL, NULL, NULL),
-('2', NULL, '55157.78', NULL),
-('6', NULL, '29660.05', 'foo'),
-('4', NULL, NULL, NULL),
-(NULL, NULL, NULL, 'foobar'),
-(NULL, '6', NULL, NULL);
+ROW('4', '8', NULL, NULL),
+ROW(NULL, NULL, '55157.78', NULL),
+ROW('9', '6', NULL, 'foo'),
+ROW('8', NULL, '8.20', 'foobar'),
+ROW('7', NULL, NULL, NULL),
+ROW('2', NULL, '55157.78', NULL),
+ROW('6', NULL, '29660.05', 'foo'),
+ROW('4', NULL, NULL, NULL),
+ROW(NULL, NULL, NULL, 'foobar'),
+ROW(NULL, '6', NULL, NULL);
 
 -- query 2
 USE ${case_db};

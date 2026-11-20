@@ -29,12 +29,11 @@ CREATE TABLE ${case_db}.t_project_arithmetic_cast (
   id INT,
   a INT,
   b INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 INSERT INTO ${case_db}.t_project_arithmetic_cast VALUES
-  (1, 2, 3),
-  (2, 5, NULL),
-  (3, -4, 10);
+  ROW(1, 2, 3),
+  ROW(2, 5, NULL),
+  ROW(3, -4, 10);
 SELECT
   id,
   a + IFNULL(b, 0) AS sum_ab,

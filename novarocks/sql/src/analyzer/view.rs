@@ -23,7 +23,9 @@ use crate::analysis::{
     ResolvedSelect, TypedExpr,
 };
 use crate::analyze_error::{AnalyzeError, AnalyzeErrorKind};
-use crate::catalog::{PlannerTableProvider, ResolvedAnalyzerTable, SqlViewDefinition};
+use crate::catalog::{
+    PlannerTableProvider, QuotedMetadataTable, ResolvedAnalyzerTable, SqlViewDefinition,
+};
 use arrow::datatypes::DataType as D;
 use novarocks_parser::{Span, ast};
 use novarocks_type_contract::{CompileCheckpoints, CompilePhase, ValueKind as K, ValueTypeRef};
@@ -36,7 +38,7 @@ impl AnalyzerContext<'_> {
     pub(super) fn analyze_view_relation(
         &self,
         view: &SqlViewDefinition,
-        alias: Option<&ast::TableAlias>,
+        alias: Option<super::resolve_from::RelationAlias<'_>>,
         relation_name: &str,
         span: Span,
     ) -> Result<(Relation, AnalyzerScope), AnalyzeError> {
@@ -54,7 +56,7 @@ impl AnalyzerContext<'_> {
                 span,
             ));
         }
-        let statements = novarocks_parser::parse(&view.raw_sql).map_err(|error| {
+        let query = novarocks_parser::parser::parse_query(&view.raw_sql).map_err(|error| {
             AnalyzeError::stored_definition_parse_failure(
                 crate::analyze_error::StoredDefinition::view(view.identity.fqn()),
                 view.raw_sql.clone(),
@@ -62,16 +64,9 @@ impl AnalyzerContext<'_> {
                 Some(span),
             )
         })?;
-        let [ast::Statement::Query(query)] = statements.as_slice() else {
-            return Err(AnalyzeError::stored_definition_not_query(
-                crate::analyze_error::StoredDefinition::view(view.identity.fqn()),
-                view.raw_sql.clone(),
-                Some(span),
-            ));
-        };
-        crate::sql_mode::validate_persisted_query_semantics_typed(query, &self.sql_semantics)
+        crate::sql_mode::validate_persisted_query_semantics_typed(&query, &self.sql_semantics)
             .map_err(|error| stored_body_error(view, error, span))?;
-        let query = crate::sql_mode::normalize_concat_query(query.clone(), &self.sql_semantics)
+        let query = crate::sql_mode::normalize_concat_query(query, &self.sql_semantics)
             .and_then(super::query_prepass::preanalyze)
             .map_err(|error| stored_body_error(view, error, span))?;
         let catalog = SavedViewCatalog {
@@ -79,6 +74,7 @@ impl AnalyzerContext<'_> {
             catalog: &view.default_catalog,
         };
         let child = AnalyzerContext {
+            purpose: crate::analyzer::QueryAnalysisPurpose::Ordinary,
             grouping_scope: std::cell::RefCell::new(None),
             control: self.control,
             constant_policy: self.constant_policy,
@@ -235,6 +231,7 @@ impl AnalyzerContext<'_> {
                         &target,
                         mode.decimal_overflow_policy(),
                         mode.allow_throw_exception(),
+                        None,
                         self.control,
                     )
                     .map_err(AnalyzeError::view_cast_preparation)?;
@@ -269,7 +266,7 @@ impl AnalyzerContext<'_> {
             resolved = ResolvedQuery {
                 body: QueryBody::Select(ResolvedSelect {
                     from: Some(Relation::Subquery {
-                        query: Box::new(resolved),
+                        query: novarocks_parser::ast::AstBox::new(resolved),
                         alias: inner_alias,
                         output_columns: input_columns,
                     }),
@@ -280,8 +277,8 @@ impl AnalyzerContext<'_> {
                     has_aggregation: false,
                     distinct: false,
                     repeat: None,
-                    apply_specs: Vec::new(),
-                    predicate_apply_specs: Vec::new(),
+                    apply_specs: (Vec::new()).into(),
+                    predicate_apply_specs: (Vec::new()).into(),
                 }),
                 order_by: Vec::new(),
                 limit: None,
@@ -295,7 +292,7 @@ impl AnalyzerContext<'_> {
             .to_string();
         let mut fields = resolved.output_columns.clone();
         if let Some(alias) = alias {
-            crate::analysis::schema::apply_column_aliases(&mut fields, &alias.columns, alias.span)?;
+            crate::analysis::schema::apply_column_aliases(&mut fields, alias.columns, alias.span)?;
         }
         let mut scope = self.new_scope();
         for field in &fields {
@@ -303,7 +300,7 @@ impl AnalyzerContext<'_> {
         }
         Ok((
             Relation::Subquery {
-                query: Box::new(resolved),
+                query: novarocks_parser::ast::AstBox::new(resolved),
                 alias: qualifier,
                 output_columns: fields,
             },
@@ -371,7 +368,7 @@ impl PlannerTableProvider for SavedViewCatalog<'_> {
         catalog: Option<&str>,
         database: &str,
         table: &str,
-        version: &ast::TableVersion,
+        version: &ast::QueryPeriod,
     ) -> Result<ResolvedAnalyzerTable, AnalyzeError> {
         self.inner.resolve_definition_table_version_for_analysis(
             Some(catalog.unwrap_or(self.catalog)),
@@ -409,7 +406,7 @@ impl PlannerTableProvider for SavedViewCatalog<'_> {
         catalog: Option<&str>,
         database: &str,
         table: &str,
-        version: Option<&novarocks_parser::ast::TableVersion>,
+        version: Option<&novarocks_parser::ast::QueryPeriod>,
     ) -> Result<Option<&std::sync::Arc<crate::system_table::SystemTableDeclaration>>, AnalyzeError>
     {
         self.inner.resolve_definition_system_table_for_analysis(
@@ -423,6 +420,19 @@ impl PlannerTableProvider for SavedViewCatalog<'_> {
     fn view_definition_target(&self) -> Option<&novarocks_types::naming::TableIdentity> {
         self.inner.view_definition_target()
     }
+    fn resolve_quoted_iceberg_metadata(
+        &self,
+        name: &ast::ObjectName,
+        catalog: Option<&str>,
+        database: &str,
+    ) -> Option<QuotedMetadataTable> {
+        self.inner.resolve_quoted_iceberg_metadata(
+            name,
+            Some(catalog.unwrap_or(self.catalog)),
+            database,
+        )
+    }
+
     fn iceberg_metadata_provider(
         &self,
     ) -> Option<&dyn crate::catalog::IcebergMetadataTableProvider> {
@@ -582,6 +592,10 @@ fn name_reordering_cast(
 mod tests {
     use super::*;
     use crate::catalog::SqlViewColumn;
+    use crate::planner::table::{
+        ScanSource, SqlMetadataTableKind, SqlScanKind, SqlScanSource, SqlTableIdentity,
+        SqlTableVersionSelector, TableDef,
+    };
     use novarocks_type_contract::{FunctionValueType, PureCompileControl};
     use novarocks_types::{naming::TableIdentity, schema::ColumnDef};
     use std::{cell::RefCell, collections::HashMap, sync::Arc};
@@ -593,6 +607,7 @@ mod tests {
         target: Option<TableIdentity>,
         lookup_error: Option<AnalyzeError>,
         table_lookups: RefCell<Vec<(String, String, String)>>,
+        quoted_metadata_lookups: RefCell<Vec<(String, String, String)>>,
     }
     impl PlannerTableProvider for Catalog {
         fn resolve_view_for_analysis(
@@ -633,6 +648,58 @@ mod tests {
             self.tables
                 .resolve_table_for_analysis(catalog, database, table)
         }
+        fn resolve_quoted_iceberg_metadata(
+            &self,
+            name: &ast::ObjectName,
+            catalog: Option<&str>,
+            database: &str,
+        ) -> Option<QuotedMetadataTable> {
+            let authored = name.parts.last()?;
+            assert!(authored.quoted);
+            self.quoted_metadata_lookups.borrow_mut().push((
+                catalog.unwrap_or("caller").into(),
+                database.into(),
+                authored.value.clone(),
+            ));
+            if catalog != Some("ice") || database != "saved" {
+                return None;
+            }
+            let base = authored.value.strip_suffix("$files")?;
+            let kind = SqlMetadataTableKind::Files;
+            let resolved = if base == "missing" {
+                Err("captured metadata table is missing".into())
+            } else {
+                Ok(ResolvedAnalyzerTable::from_planner(
+                    catalog,
+                    database,
+                    TableDef {
+                        name: base.into(),
+                        columns: vec![ColumnDef {
+                            name: "a".into(),
+                            data_type: D::Int64,
+                            nullable: false,
+                            write_default: None,
+                            logical_type: None,
+                        }],
+                        iceberg_row_lineage_metadata_columns: vec![],
+                        source: ScanSource::Sql(SqlScanSource::new(
+                            crate::binding::SqlTableBindingId::new_for_test(61),
+                            SqlTableIdentity::try_new("ice".into(), database.into(), base.into())
+                                .unwrap(),
+                            SqlScanKind::Metadata {
+                                kind,
+                                version: SqlTableVersionSelector::Current,
+                            },
+                        )),
+                    },
+                ))
+            };
+            Some(QuotedMetadataTable {
+                relation: TableIdentity::new("ice", database, base),
+                kind,
+                resolved,
+            })
+        }
     }
     fn declaration(sql: &str, published: &str, ty: FunctionValueType) -> SqlViewDefinition {
         SqlViewDefinition {
@@ -658,10 +725,14 @@ mod tests {
         catalog
     }
     fn analyze(sql: &str, catalog: &Catalog) -> Result<ResolvedQuery, AnalyzeError> {
-        let statements = novarocks_parser::parse(sql).unwrap();
-        let [ast::Statement::Query(query)] = statements.as_slice() else {
-            panic!("query fixture");
-        };
+        let query = novarocks_parser::parser::parse_query(sql).unwrap();
+        analyze_and_plan(&query, catalog)
+    }
+
+    fn analyze_and_plan(
+        query: &ast::Query,
+        catalog: &Catalog,
+    ) -> Result<ResolvedQuery, AnalyzeError> {
         let (resolved, ctes, mut factory) = crate::analyzer::analyze(query, catalog, "db")?;
         // Check the actual logical construction, including CTE and wrapper IDs.
         let logical = crate::planner::plan_query(
@@ -682,6 +753,101 @@ mod tests {
     }
 
     #[test]
+    fn quoted_metadata_uses_the_authored_qualifier_or_explicit_alias() {
+        let catalog = Catalog::default();
+        for (sql, qualifier) in [
+            (r#"SELECT "t$files".a FROM ice.saved."t$files""#, "t$files"),
+            (
+                r#"SELECT saved."t$files".a FROM ice.saved."t$files""#,
+                "t$files",
+            ),
+            (r#"SELECT m.a FROM ice.saved."t$files" AS m"#, "m"),
+        ] {
+            let query = novarocks_parser::parser::parse_query(sql).unwrap();
+            let resolved = analyze_and_plan(&query, &catalog).unwrap();
+            let QueryBody::Select(select) = resolved.body else {
+                panic!("select query");
+            };
+            let Some(Relation::IcebergMetadataScan(scan)) = select.from else {
+                panic!("captured metadata scan");
+            };
+            assert_eq!(scan.alias.as_deref(), Some(qualifier));
+            assert_eq!(scan.database, "saved");
+            assert_eq!(scan.table.name, "t");
+            let [project] = select.projection.as_slice() else {
+                panic!("one selected column");
+            };
+            let ExprKind::ColumnRef { column_id, .. } = &project.expr.kind else {
+                panic!("resolved column reference");
+            };
+            assert_eq!(scan.column_ids, [*column_id]);
+        }
+        let error = analyze(r#"SELECT t.a FROM ice.saved."t$files""#, &catalog).unwrap_err();
+        assert_eq!(error.kind(), AnalyzeErrorKind::UnknownColumn);
+        assert!(catalog.table_lookups.borrow().is_empty());
+    }
+
+    #[test]
+    fn quoted_metadata_keeps_cte_version_and_missing_precedence() {
+        let catalog = Catalog::default();
+        analyze(
+            r#"WITH "t$files" AS (SELECT 1 AS a) SELECT a FROM "t$files""#,
+            &catalog,
+        )
+        .unwrap();
+        assert!(catalog.quoted_metadata_lookups.borrow().is_empty());
+        let error = analyze(
+            r#"SELECT a FROM ice.saved."missing$files" FOR VERSION AS OF 1"#,
+            &catalog,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), AnalyzeErrorKind::UnsupportedQueryShape);
+        assert!(
+            error
+                .message()
+                .contains("time travel is not supported on metadata relations")
+        );
+        let error = analyze(r#"SELECT a FROM ice.saved."missing$files""#, &catalog).unwrap_err();
+        assert_eq!(error.kind(), AnalyzeErrorKind::UnknownTable);
+        assert_eq!(error.message(), "captured metadata table is missing");
+        assert!(catalog.table_lookups.borrow().is_empty());
+
+        let error = analyze(r#"SELECT a FROM "t$files""#, &catalog).unwrap_err();
+        assert_eq!(error.kind(), AnalyzeErrorKind::UnknownTable);
+        assert_eq!(
+            catalog.table_lookups.borrow().as_slice(),
+            &[("caller".into(), "db".into(), "t$files".into())],
+        );
+    }
+
+    #[test]
+    fn quoted_metadata_saved_body_uses_the_saved_catalog_and_database() {
+        let mut view = declaration(
+            r#"SELECT a AS x FROM "t$files""#,
+            "x",
+            FunctionValueType::new(D::Int64, false),
+        );
+        view.default_catalog = "ice".into();
+        view.default_database = "saved".into();
+        let mut catalog = catalog(view);
+        analyze("SELECT x FROM v", &catalog).unwrap();
+        assert_eq!(
+            catalog.quoted_metadata_lookups.borrow().as_slice(),
+            &[("ice".into(), "saved".into(), "t$files".into())],
+        );
+        catalog.views.get_mut("caller.db.v").unwrap().raw_sql =
+            r#"SELECT a AS x FROM "missing$files""#.into();
+        let error = analyze("SELECT x FROM v", &catalog).unwrap_err();
+        assert_eq!(error.kind(), AnalyzeErrorKind::InvalidView);
+        let source = std::error::Error::source(&error)
+            .unwrap()
+            .downcast_ref::<AnalyzeError>()
+            .unwrap();
+        assert_eq!(source.kind(), AnalyzeErrorKind::UnknownTable);
+        assert!(catalog.table_lookups.borrow().is_empty());
+    }
+
+    #[test]
     fn stored_replay_keeps_the_existing_uncaptured_semantics_refusals() {
         for (hint, feature) in [
             ("sql_mode='GROUP_CONCAT_LEGACY'", "GROUP_CONCAT_LEGACY"),
@@ -692,7 +858,7 @@ mod tests {
             ("sql_mode='ERROR_IF_OVERFLOW'", "ERROR_IF_OVERFLOW"),
         ] {
             let catalog = catalog(declaration(
-                &format!("SELECT /*+ SET_VAR({hint}) */ 1 AS x"),
+                &format!("WITH SESSION {hint} SELECT 1 AS x"),
                 "x",
                 FunctionValueType::new(D::Int64, false),
             ));
@@ -912,13 +1078,11 @@ mod tests {
 
     #[test]
     fn mixed_view_projection_keeps_exact_sibling_origins_and_authors_converted_metadata() {
-        let body = "SELECT parse_json('{}') AS j, array<json>[] AS a, CAST(1 AS INT) AS n";
-        let statements = novarocks_parser::parse(body).unwrap();
-        let [ast::Statement::Query(query)] = statements.as_slice() else {
-            panic!("query fixture");
-        };
+        let body =
+            "SELECT parse_json('{}') AS j, CAST(ARRAY[] AS ARRAY(JSON)) AS a, CAST(1 AS INT) AS n";
+        let query = novarocks_parser::parser::parse_query(body).unwrap();
         let empty = Catalog::default();
-        let (original, _, _) = crate::analyzer::analyze(query, &empty, "db").unwrap();
+        let (original, _, _) = crate::analyzer::analyze(&query, &empty, "db").unwrap();
         let mut view = declaration(body, "j", original.output_columns[0].value_type.clone());
         view.columns = original
             .output_columns
@@ -939,11 +1103,8 @@ mod tests {
             .collect::<Vec<_>>()
             .into();
         let catalog = catalog(view);
-        let statements = novarocks_parser::parse("SELECT * FROM v").unwrap();
-        let [ast::Statement::Query(query)] = statements.as_slice() else {
-            panic!("query fixture");
-        };
-        let (resolved, _, factory) = crate::analyzer::analyze(query, &catalog, "db").unwrap();
+        let query = novarocks_parser::parser::parse_query("SELECT * FROM v").unwrap();
+        let (resolved, _, factory) = crate::analyzer::analyze(&query, &catalog, "db").unwrap();
         let QueryBody::Select(outer) = &resolved.body else {
             panic!("outer select");
         };
@@ -1067,12 +1228,9 @@ mod tests {
             let mut view = declaration(body, "m", original.output_columns[0].value_type.clone());
             view.columns = columns.into();
             catalog.views.insert(view.identity.fqn(), view);
-            let statements = novarocks_parser::parse("SELECT * FROM v").unwrap();
-            let [ast::Statement::Query(query)] = statements.as_slice() else {
-                panic!("query")
-            };
+            let query = novarocks_parser::parser::parse_query("SELECT * FROM v").unwrap();
             let (resolved, ctes, mut factory) =
-                crate::analyzer::analyze(query, &catalog, "db").unwrap();
+                crate::analyzer::analyze(&query, &catalog, "db").unwrap();
             let QueryBody::Select(outer) = &resolved.body else {
                 panic!("outer select")
             };
@@ -1154,11 +1312,17 @@ mod tests {
     #[test]
     fn header_case_folding_uses_the_same_unicode_names_as_scope() {
         let catalog = catalog(declaration(
-            "SELECT 1 AS ä",
+            r#"SELECT 1 AS "ä""#,
             "Ä",
             FunctionValueType::new(D::Int64, false),
         ));
-        analyze("SELECT Ä FROM v", &catalog).unwrap();
+        let query = novarocks_parser::parser::parse_query(r#"SELECT "Ä" FROM v"#).unwrap();
+        let resolved = analyze_and_plan(&query, &catalog).unwrap();
+        let [column] = resolved.output_columns.as_slice() else {
+            panic!("expected one bound view column");
+        };
+        assert_eq!(column.name, "ä");
+        assert_eq!(column.value_type.data_type(), &D::Int64);
     }
 
     #[test]
@@ -1173,18 +1337,15 @@ mod tests {
             analyze("SELECT * FROM v", &catalog).unwrap_err().kind(),
             AnalyzeErrorKind::ViewIsRecursive
         );
-        let mut synthetic = novarocks_parser::parse("SELECT * FROM v").unwrap();
-        let [ast::Statement::Query(query)] = synthetic.as_mut_slice() else {
-            panic!("query fixture");
-        };
+        let mut query = novarocks_parser::parser::parse_query("SELECT * FROM v").unwrap();
         let ast::SetExpr::Select(select) = query.body.as_mut() else {
             panic!("select fixture");
         };
-        let ast::TableFactor::Table { name, .. } = &mut select.from[0].relation else {
+        let Some(ast::Relation::Table(table)) = &mut select.from else {
             panic!("view fixture");
         };
-        name.span = Span::new(0, 0);
-        let error = crate::analyzer::analyze(query, &catalog, "db").unwrap_err();
+        table.name.span = Span::new(0, 0);
+        let error = crate::analyzer::analyze(&query, &catalog, "db").unwrap_err();
         assert_eq!(error.kind(), AnalyzeErrorKind::ViewIsRecursive);
         assert_eq!(
             error.to_user_error(Some("SELECT * FROM v")).location(),
@@ -1341,7 +1502,7 @@ mod tests {
         use crate::analyze_error::StoredDefinitionKind;
 
         let saved = "SELECT\n (";
-        let parser_error = novarocks_parser::parse(saved).unwrap_err();
+        let parser_error = novarocks_parser::parser::parse_query(saved).unwrap_err();
         let parser_public = parser_error.to_user_error(saved);
         let mut catalog = catalog(declaration(
             saved,
@@ -1413,10 +1574,16 @@ mod tests {
     }
 
     #[test]
-    fn stored_non_query_source_preserves_definition_identity_without_inventing_a_parser_failure() {
+    fn stored_non_query_source_preserves_definition_identity_and_exact_query_parser_failure() {
         use crate::analyze_error::StoredDefinitionKind;
 
-        for saved in ["DELETE FROM t", "SELECT 1 AS x; SELECT 2 AS x"] {
+        for saved in [
+            "DELETE FROM t",
+            "SELECT 1 AS x; SELECT 2 AS x",
+            "SELECT 1 AS `x`",
+        ] {
+            let parser_error = novarocks_parser::parser::parse_query(saved).unwrap_err();
+            let parser_public = parser_error.to_user_error(saved);
             let catalog = catalog(declaration(
                 saved,
                 "x",
@@ -1431,11 +1598,15 @@ mod tests {
             );
             assert_eq!(error.stored_definition().unwrap().name(), "caller.db.v");
             assert_eq!(error.stored_view_definition_source(), Some(saved));
-            assert!(std::error::Error::source(&error).is_none());
+            assert_eq!(
+                std::error::Error::source(&error)
+                    .and_then(|cause| cause.downcast_ref::<novarocks_parser::ParserError>()),
+                Some(&parser_error)
+            );
             let public = error.to_user_error(Some(caller));
             assert_eq!(public.code().as_str(), "sql.analyze.invalid_view");
             assert!(public.message().contains("caller.db.v"));
-            assert!(public.message().contains("exactly one query"));
+            assert!(public.message().contains(parser_public.code().as_str()));
             let location = public.location().unwrap();
             assert_eq!(location.line(), 2);
             assert_eq!(location.column(), 6);

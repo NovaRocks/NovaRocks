@@ -31,8 +31,8 @@ INSERT INTO ${case_db}.t_agg_pd_dis_a
     SELECT generate_series % 100, generate_series FROM TABLE(generate_series(1, 20000));
 INSERT INTO ${case_db}.t_agg_pd_dis_b
     SELECT DISTINCT generate_series % 100 FROM TABLE(generate_series(1, 20000));
-ANALYZE TABLE ${case_db}.t_agg_pd_dis_a;
-ANALYZE TABLE ${case_db}.t_agg_pd_dis_b;
+ANALYZE ${case_db}.t_agg_pd_dis_a;
+ANALYZE ${case_db}.t_agg_pd_dis_b;
 
 -- Baseline (AggregatePushdown enabled): expect partial AGGREGATE under join.
 -- @skip_result_check=true
@@ -42,13 +42,13 @@ ANALYZE TABLE ${case_db}.t_agg_pd_dis_b;
 -- @result_contains=INNER, eq:
 -- @result_contains=HASH AGGREGATE (GLOBAL, group by: [a.k])
 -- @result_contains=HASH AGGREGATE (LOCAL, group by: [a.k])
-EXPLAIN VERBOSE
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
 SELECT a.k, SUM(a.v)
 FROM ${case_db}.t_agg_pd_dis_a a
 INNER JOIN ${case_db}.t_agg_pd_dis_b b ON a.k = b.k
 GROUP BY a.k;
 
-SET disable_optimizer_rules = 'AggregatePushdown';
+SET SESSION disable_optimizer_rules = 'AggregatePushdown';
 
 -- With AggregatePushdown disabled: top aggregate only, no partial below join.
 -- @skip_result_check=true
@@ -56,10 +56,10 @@ SET disable_optimizer_rules = 'AggregatePushdown';
 -- @result_contains=INNER, eq:
 -- @result_contains=HASH AGGREGATE (GLOBAL, group by: [a.k])
 -- @result_not_contains=sum(sum(a.v))
-EXPLAIN VERBOSE
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
 SELECT a.k, SUM(a.v)
 FROM ${case_db}.t_agg_pd_dis_a a
 INNER JOIN ${case_db}.t_agg_pd_dis_b b ON a.k = b.k
 GROUP BY a.k;
 
-SET disable_optimizer_rules = '';
+SET SESSION disable_optimizer_rules = '';

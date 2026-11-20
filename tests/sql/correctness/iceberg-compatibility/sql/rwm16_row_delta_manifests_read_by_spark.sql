@@ -20,31 +20,27 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE DATABASE IF NOT EXISTS iceberg_compat_${suite_uuid0}.${case_db};
-CREATE TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm16_dml_v2_${uuid0} (id BIGINT, part BIGINT, keep BOOLEAN)
-PARTITION BY (part)
-TBLPROPERTIES ("format-version" = "2", "commit.manifest.target-size-bytes" = "1024");
+CREATE SCHEMA IF NOT EXISTS iceberg_compat_${suite_uuid0}.${case_db};
+CREATE TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm16_dml_v2_${uuid0} (id BIGINT, part BIGINT, keep BOOLEAN) WITH (partitioning = ARRAY['part'], format_version = 2, extra_properties = MAP(ARRAY['commit.manifest.target-size-bytes'], ARRAY['1024']));
 INSERT INTO iceberg_compat_${suite_uuid0}.${case_db}.rwm16_dml_v2_${uuid0} VALUES
-  (1, 1, true), (2, 1, false), (3, 2, true), (4, 2, false), (5, 3, true), (6, 3, false),
-  (7, 4, true), (8, 4, false), (9, 5, true), (10, 5, false), (11, 6, true), (12, 6, false),
-  (13, 7, true), (14, 7, false), (15, 8, true), (16, 8, false), (17, 9, true), (18, 9, false),
-  (19, 10, true), (20, 10, false), (21, 11, true), (22, 11, false), (23, 12, true), (24, 12, false),
-  (25, 13, true), (26, 13, false), (27, 14, true), (28, 14, false), (29, 15, true), (30, 15, false),
-  (31, 16, true), (32, 16, false), (33, 17, true), (34, 17, false), (35, 18, true), (36, 18, false),
-  (37, 19, true), (38, 19, false), (39, 20, true), (40, 20, false), (41, 21, true), (42, 21, false),
-  (43, 22, true), (44, 22, false), (45, 23, true), (46, 23, false), (47, 24, true), (48, 24, false);
-CREATE TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm16_dml_v3_${uuid0} (id BIGINT, part BIGINT, keep BOOLEAN)
-PARTITION BY (part)
-TBLPROPERTIES ("format-version" = "3", "commit.manifest.target-size-bytes" = "1024", "write.row-lineage" = "true");
+  ROW(1, 1, true), ROW(2, 1, false), ROW(3, 2, true), ROW(4, 2, false), ROW(5, 3, true), ROW(6, 3, false),
+  ROW(7, 4, true), ROW(8, 4, false), ROW(9, 5, true), ROW(10, 5, false), ROW(11, 6, true), ROW(12, 6, false),
+  ROW(13, 7, true), ROW(14, 7, false), ROW(15, 8, true), ROW(16, 8, false), ROW(17, 9, true), ROW(18, 9, false),
+  ROW(19, 10, true), ROW(20, 10, false), ROW(21, 11, true), ROW(22, 11, false), ROW(23, 12, true), ROW(24, 12, false),
+  ROW(25, 13, true), ROW(26, 13, false), ROW(27, 14, true), ROW(28, 14, false), ROW(29, 15, true), ROW(30, 15, false),
+  ROW(31, 16, true), ROW(32, 16, false), ROW(33, 17, true), ROW(34, 17, false), ROW(35, 18, true), ROW(36, 18, false),
+  ROW(37, 19, true), ROW(38, 19, false), ROW(39, 20, true), ROW(40, 20, false), ROW(41, 21, true), ROW(42, 21, false),
+  ROW(43, 22, true), ROW(44, 22, false), ROW(45, 23, true), ROW(46, 23, false), ROW(47, 24, true), ROW(48, 24, false);
+CREATE TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm16_dml_v3_${uuid0} (id BIGINT, part BIGINT, keep BOOLEAN) WITH (partitioning = ARRAY['part'], format_version = 3, extra_properties = MAP(ARRAY['commit.manifest.target-size-bytes'], ARRAY['1024']));
 INSERT INTO iceberg_compat_${suite_uuid0}.${case_db}.rwm16_dml_v3_${uuid0} VALUES
-  (1, 1, true), (2, 1, false), (3, 2, true), (4, 2, false), (5, 3, true), (6, 3, false),
-  (7, 4, true), (8, 4, false), (9, 5, true), (10, 5, false), (11, 6, true), (12, 6, false),
-  (13, 7, true), (14, 7, false), (15, 8, true), (16, 8, false), (17, 9, true), (18, 9, false),
-  (19, 10, true), (20, 10, false), (21, 11, true), (22, 11, false), (23, 12, true), (24, 12, false),
-  (25, 13, true), (26, 13, false), (27, 14, true), (28, 14, false), (29, 15, true), (30, 15, false),
-  (31, 16, true), (32, 16, false), (33, 17, true), (34, 17, false), (35, 18, true), (36, 18, false),
-  (37, 19, true), (38, 19, false), (39, 20, true), (40, 20, false), (41, 21, true), (42, 21, false),
-  (43, 22, true), (44, 22, false), (45, 23, true), (46, 23, false), (47, 24, true), (48, 24, false);
+  ROW(1, 1, true), ROW(2, 1, false), ROW(3, 2, true), ROW(4, 2, false), ROW(5, 3, true), ROW(6, 3, false),
+  ROW(7, 4, true), ROW(8, 4, false), ROW(9, 5, true), ROW(10, 5, false), ROW(11, 6, true), ROW(12, 6, false),
+  ROW(13, 7, true), ROW(14, 7, false), ROW(15, 8, true), ROW(16, 8, false), ROW(17, 9, true), ROW(18, 9, false),
+  ROW(19, 10, true), ROW(20, 10, false), ROW(21, 11, true), ROW(22, 11, false), ROW(23, 12, true), ROW(24, 12, false),
+  ROW(25, 13, true), ROW(26, 13, false), ROW(27, 14, true), ROW(28, 14, false), ROW(29, 15, true), ROW(30, 15, false),
+  ROW(31, 16, true), ROW(32, 16, false), ROW(33, 17, true), ROW(34, 17, false), ROW(35, 18, true), ROW(36, 18, false),
+  ROW(37, 19, true), ROW(38, 19, false), ROW(39, 20, true), ROW(40, 20, false), ROW(41, 21, true), ROW(42, 21, false),
+  ROW(43, 22, true), ROW(44, 22, false), ROW(45, 23, true), ROW(46, 23, false), ROW(47, 24, true), ROW(48, 24, false);
 
 -- query 2
 -- @skip_result_check=true
@@ -104,5 +100,5 @@ printf '%s\n' "$spark_out" | tr '\r' '\n' | grep -Fx SPARK_RWM16_ROW_DELTA_OK
 -- query 8
 -- @cleanup=true
 -- @skip_result_check=true
-DROP TABLE IF EXISTS iceberg_compat_${suite_uuid0}.${case_db}.rwm16_dml_v2_${uuid0} FORCE;
-DROP TABLE IF EXISTS iceberg_compat_${suite_uuid0}.${case_db}.rwm16_dml_v3_${uuid0} FORCE;
+DROP TABLE IF EXISTS iceberg_compat_${suite_uuid0}.${case_db}.rwm16_dml_v2_${uuid0} ;
+DROP TABLE IF EXISTS iceberg_compat_${suite_uuid0}.${case_db}.rwm16_dml_v3_${uuid0} ;

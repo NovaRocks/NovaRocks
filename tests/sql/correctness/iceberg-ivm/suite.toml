@@ -20,7 +20,7 @@ explicit_only = false
 [impact]
 paths = ["novarocks/table-maintenance/**", "novarocks/frontend-application/src/query_execution/maintenance/**", "novarocks/frontend-application/src/table_maintenance/**",
     "novarocks/mv-application/**",
-    "novarocks/execution/src/exec/mv/**",
+    "novarocks/frontend-application/src/mv/domain/**",
     "docker/iceberg-rest/spark-sql.sh",
     "docker/iceberg-rest/spark-shell.sh",
     "tests/sql/fixtures/iceberg-delete-applicability/generate.scala",
@@ -36,7 +36,7 @@ paths = ["novarocks/table-maintenance/**", "novarocks/frontend-application/src/q
     "novarocks/frontend-application/src/query_execution/write_result.rs",
     "novarocks/frontend-application/src/task_execution/completion.rs",
     "novarocks/frontend-application/src/task_execution/protocol_facts.rs",
-    "novarocks/frontend-application/src/task_execution/manifest_round.rs",
+    "novarocks/frontend-application/src/task_execution/manifest_projection.rs",
 ]
 
 [reuse]

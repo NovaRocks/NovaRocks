@@ -9,47 +9,25 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE EXTERNAL CATALOG mvrows_${uuid0}
-PROPERTIES (
-  "type" = "iceberg",
-  "iceberg.catalog.type" = "rest",
-  "uri" = "${iceberg_rest_uri}",
-  "warehouse" = "${iceberg_rest_warehouse}",
-  "credential.object-store-metadata.consumer-role" = "frontend",
-  "credential.object-store-metadata.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-metadata.name" = "${iceberg_object_store_metadata_credential_name}",
-  "credential.object-store-metadata.generation" = "${iceberg_object_store_credential_generation}",
-  "credential.object-store-data.consumer-role" = "backend",
-  "credential.object-store-data.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-data.name" = "${iceberg_object_store_data_credential_name}",
-  "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
-  "aws.s3.endpoint" = "${oss_endpoint}",
-  "aws.s3.region" = "${oss_region}",
-  "aws.s3.enable_path_style_access" = "${oss_path_style}"
-);
+CREATE CATALOG mvrows_${uuid0} USING iceberg WITH ("iceberg.catalog.type" = 'rest', "uri" = '${iceberg_rest_uri}', "warehouse" = '${iceberg_rest_warehouse}', "credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-metadata.name" = '${iceberg_object_store_metadata_credential_name}', "credential.object-store-metadata.generation" = '${iceberg_object_store_credential_generation}', "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-data.name" = '${iceberg_object_store_data_credential_name}', "credential.object-store-data.generation" = '${iceberg_object_store_credential_generation}', "aws.s3.endpoint" = '${oss_endpoint}', "aws.s3.region" = '${oss_region}', "aws.s3.enable_path_style_access" = '${oss_path_style}');
 
 -- query 2
 -- @skip_result_check=true
-CREATE DATABASE mvrows_${uuid0}.ns_${uuid0};
+CREATE SCHEMA mvrows_${uuid0}.ns_${uuid0};
 
 -- query 3
 -- @skip_result_check=true
-CREATE TABLE mvrows_${uuid0}.ns_${uuid0}.fact (k STRING, v BIGINT)
-TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+CREATE TABLE mvrows_${uuid0}.ns_${uuid0}.fact (k STRING, v BIGINT) WITH (format_version = 3);
 
 -- query 4
 -- @skip_result_check=true
-INSERT INTO mvrows_${uuid0}.ns_${uuid0}.fact VALUES ('east', 10), ('west', 20);
+INSERT INTO mvrows_${uuid0}.ns_${uuid0}.fact VALUES ROW('east', 10), ROW('west', 20);
 
 -- query 5
 -- @skip_result_check=true
 USE mvrows_${uuid0}.ns_${uuid0};
-CREATE MATERIALIZED VIEW rows_mv
-DISTRIBUTED BY HASH(k) BUCKETS 1
-REFRESH DEFERRED MANUAL
-PROPERTIES ('storage_engine' = 'iceberg')
-AS SELECT k, v FROM fact;
-REFRESH MATERIALIZED VIEW rows_mv WITH SYNC MODE;
+CREATE MATERIALIZED VIEW rows_mv WITH (refresh_policy = 'MANUAL') AS SELECT k, v FROM fact;
+REFRESH MATERIALIZED VIEW rows_mv;
 
 -- query 6
 -- @skip_result_check=true
@@ -60,7 +38,7 @@ DELETE FROM fact WHERE k = 'east';
 -- visible row for either legal file layout. Query 21 checks the actual files.
 -- @skip_result_check=true
 -- @mv_rest_document_graph=ns_${uuid0}.rows_mv,publications=2,slot-changes=0,logical-rows=1
-REFRESH MATERIALIZED VIEW rows_mv WITH SYNC MODE;
+REFRESH MATERIALIZED VIEW rows_mv;
 
 -- query 8
 -- @skip_result_check=true
@@ -74,13 +52,13 @@ SELECT k, v FROM rows_mv ORDER BY k;
 
 -- query 10
 -- @skip_result_check=true
-INSERT INTO mvrows_${uuid0}.ns_${uuid0}.fact VALUES ('north', 30);
+INSERT INTO mvrows_${uuid0}.ns_${uuid0}.fact VALUES ROW('north', 30);
 
 -- query 11
 -- This refresh accepts one new row, while the complete target contains two.
 -- @skip_result_check=true
 -- @mv_rest_document_graph=ns_${uuid0}.rows_mv,publications=3,slot-changes=0,logical-rows=2
-REFRESH MATERIALIZED VIEW rows_mv WITH SYNC MODE;
+REFRESH MATERIALIZED VIEW rows_mv;
 
 -- query 12
 -- @skip_result_check=true
@@ -97,7 +75,7 @@ SELECT k, v FROM rows_mv ORDER BY k;
 -- rows must preserve the complete target's logical row count and physical files.
 -- @skip_result_check=true
 -- @mv_rest_document_graph=ns_${uuid0}.rows_mv,publications=4,slot-changes=0,logical-rows=2,metadata-only-last=true
-REFRESH MATERIALIZED VIEW rows_mv WITH SYNC MODE;
+REFRESH MATERIALIZED VIEW rows_mv;
 
 -- query 15
 -- @skip_result_check=true
@@ -117,7 +95,7 @@ DELETE FROM fact WHERE k IN ('west', 'north');
 -- Deleting both remaining rows accepts two changes, but leaves zero target rows.
 -- @skip_result_check=true
 -- @mv_rest_document_graph=ns_${uuid0}.rows_mv,publications=5,slot-changes=0,logical-rows=0
-REFRESH MATERIALIZED VIEW rows_mv WITH SYNC MODE;
+REFRESH MATERIALIZED VIEW rows_mv;
 
 -- query 19
 -- @skip_result_check=true
@@ -127,7 +105,7 @@ REFRESH MATERIALIZED VIEW rows_mv WITH SYNC MODE;
 SELECT * FROM system.runtime.materialized_view_states WHERE catalog_name = 'mvrows_${uuid0}';
 
 -- query 20
-SELECT COUNT(*) AS row_count FROM rows_mv;
+SELECT COUNT() AS row_count FROM rows_mv;
 
 -- query 21
 -- @result_contains=MV_RESULT_ROWS_FILE_CENSUS_OK
@@ -202,6 +180,6 @@ SPARK_SCALA
 -- @skip_result_check=true
 USE mvrows_${uuid0}.ns_${uuid0};
 DROP MATERIALIZED VIEW IF EXISTS rows_mv;
-DROP TABLE mvrows_${uuid0}.ns_${uuid0}.fact FORCE;
-DROP DATABASE mvrows_${uuid0}.ns_${uuid0};
+DROP TABLE mvrows_${uuid0}.ns_${uuid0}.fact ;
+DROP SCHEMA mvrows_${uuid0}.ns_${uuid0};
 DROP CATALOG mvrows_${uuid0};

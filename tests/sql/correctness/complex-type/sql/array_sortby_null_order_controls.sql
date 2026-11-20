@@ -52,7 +52,7 @@ WITH inputs AS (
         array_map(source, x -> CASE WHEN id % 13 = 0 THEN NULL ELSE x % 3 END)) AS value
     FROM inputs
 )
-SELECT count(*) AS row_count,
+SELECT count() AS row_count,
     sum(CASE WHEN id % 13 = 0 THEN 1 ELSE 0 END) AS null_key_rows,
     sum(murmur_hash3_32(array_join(value,'-'))) AS fingerprint
 FROM sorted;

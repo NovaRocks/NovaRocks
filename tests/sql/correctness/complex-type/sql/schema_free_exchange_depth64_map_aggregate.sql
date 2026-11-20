@@ -25,11 +25,10 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.deep_seed (id INT NOT NULL)
-TBLPROPERTIES ("format-version" = "3");
-INSERT INTO ${case_db}.deep_seed VALUES (7), (19);
+CREATE TABLE ${case_db}.deep_seed (id INT NOT NULL) WITH (format_version = 3);
+INSERT INTO ${case_db}.deep_seed VALUES ROW(7), ROW(19);
 
-SET cbo_broadcast_node_mem_budget_bytes = 0;
+SET SESSION cbo_broadcast_node_mem_budget_bytes = 0;
 
 -- query 2
 -- @order_sensitive=true
@@ -40,7 +39,7 @@ ORDER BY l.id;
 
 -- query 3
 -- @skip_result_check=true
-SET cbo_broadcast_node_mem_budget_bytes = 1073741824;
+SET SESSION cbo_broadcast_node_mem_budget_bytes = 1073741824;
 
 -- query 4
 -- @order_sensitive=true

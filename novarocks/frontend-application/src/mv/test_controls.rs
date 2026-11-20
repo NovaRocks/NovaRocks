@@ -20,7 +20,7 @@
 use novarocks_failpoint::scope::{ActionClaim, GrantHandle, ProcessBinding};
 use novarocks_failpoint::target_binding::{StatementInputNomination, StatementWorkNomination};
 use novarocks_mv_application::state_family::MV_ACCELERATOR_STATE_FAMILY;
-use novarocks_parser::ast::{Query, Statement};
+use novarocks_parser::ast::Query;
 use novarocks_query_application::api::ExecutionFailurePresentation;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -1071,15 +1071,12 @@ fn parse_action(value: &serde_json::Value) -> Result<Action, String> {
         Ok(path)
     };
     if action == "rewrite-hold" {
-        let statements = novarocks_parser::parse(text("sql")?)
+        let query = novarocks_parser::parser::parse_query(text("sql")?)
             .map_err(|error| format!("parse exact MV rewrite target: {error}"))?;
-        let [Statement::Query(query)] = statements.as_slice() else {
-            return Err("MV rewrite target must be one query".into());
-        };
         return Ok(Action::Rewrite {
             catalog: text("catalog")?.into(),
             namespace: text("namespace")?.into(),
-            query: Box::new(query.clone()),
+            query: Box::new(query),
             statement_run_token: text("statement_run_token")?.into(),
             directory: directory()?,
         });
@@ -1790,10 +1787,7 @@ pub(crate) mod tests {
             2,
         );
         let target = MvRewriteStatementTarget::new(statement, statement, "wrong".into()).unwrap();
-        let statements = novarocks_parser::parse("SELECT 1").unwrap();
-        let [Statement::Query(query)] = statements.as_slice() else {
-            panic!("query")
-        };
+        let query = &novarocks_parser::parser::parse_query("SELECT 1").unwrap();
         let cancellation =
             novarocks_query_application::cancellation::QueryCancellationSource::new();
         controls
@@ -2071,10 +2065,7 @@ pub(crate) mod tests {
         controls
             .nominate_statement(&input(&session, &original), &original)
             .unwrap();
-        let statements = novarocks_parser::parse("SELECT 1").unwrap();
-        let [Statement::Query(query)] = statements.as_slice() else {
-            panic!("query")
-        };
+        let query = &novarocks_parser::parser::parse_query("SELECT 1").unwrap();
         let cancellation =
             novarocks_query_application::cancellation::QueryCancellationSource::new();
         let a_target = MvRewriteStatementTarget::new(a, a, "frozen-run".into()).unwrap();
@@ -2678,14 +2669,8 @@ pub(crate) mod tests {
             )
             .unwrap();
         let target = MvRewriteStatementTarget::new(actual, actual, "exact".into()).unwrap();
-        let statements = novarocks_parser::parse("SELECT 1").unwrap();
-        let [Statement::Query(query)] = statements.as_slice() else {
-            panic!("query");
-        };
-        let other_statements = novarocks_parser::parse("SELECT 2").unwrap();
-        let [Statement::Query(other_query)] = other_statements.as_slice() else {
-            panic!("query");
-        };
+        let query = &novarocks_parser::parser::parse_query("SELECT 1").unwrap();
+        let other_query = &novarocks_parser::parser::parse_query("SELECT 2").unwrap();
         let cancellation =
             novarocks_query_application::cancellation::QueryCancellationSource::new();
         for (catalog, namespace, submitted, selected) in [

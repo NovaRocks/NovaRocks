@@ -983,11 +983,7 @@ mod original_request_tests {
             SqlStatementInput, builtin_sql_function_catalog,
         };
         let control = SqlCompileControl::unbounded();
-        let mut statements = novarocks_parser::parse("select order_key from orders").unwrap();
-        assert_eq!(statements.len(), 1);
-        let novarocks_parser::ast::Statement::Query(query) = statements.pop().unwrap() else {
-            panic!("expected one query");
-        };
+        let query = novarocks_parser::parser::parse_query("select order_key from orders").unwrap();
         let request = SqlFinalPlanCompileRequest::new(
             novarocks_physical_plan::PlanVersionId::try_new([17; 16]).unwrap(),
             SqlStatementInput::parsed_query(Box::new(query)),

@@ -48,7 +48,7 @@ with year_total as (
        ,c_login customer_login
        ,c_email_address customer_email_address
        ,d_year dyear
-       ,sum((((cs_ext_list_price-cs_ext_wholesale_cost-cs_ext_discount_amt)+cs_ext_sales_price)/2) ) year_total
+       ,sum(((cs_ext_list_price-cs_ext_wholesale_cost-cs_ext_discount_amt)+cs_ext_sales_price)/2 ) year_total
        ,'c' sale_type
  from customer
      ,catalog_sales
@@ -72,7 +72,7 @@ union all
        ,c_login customer_login
        ,c_email_address customer_email_address
        ,d_year dyear
-       ,sum((((ws_ext_list_price-ws_ext_wholesale_cost-ws_ext_discount_amt)+ws_ext_sales_price)/2) ) year_total
+       ,sum(((ws_ext_list_price-ws_ext_wholesale_cost-ws_ext_discount_amt)+ws_ext_sales_price)/2 ) year_total
        ,'w' sale_type
  from customer
      ,web_sales

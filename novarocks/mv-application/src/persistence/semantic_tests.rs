@@ -84,7 +84,7 @@ fn sample_semantics() -> MvDesiredSemantics {
         "analytics.mv_orders".into(),
         PersistedQueryDefinition::new(
             "SELECT id FROM ice.sales.orders",
-            PersistedQueryDialect::StarRocks,
+            PersistedQueryDialect::Trino,
             "ice",
             "sales",
         )

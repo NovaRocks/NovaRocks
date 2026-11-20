@@ -61,7 +61,7 @@ impl TierClient {
     pub(super) async fn prepare(&mut self, seconds: u64) -> Result<()> {
         let effect = format!("query_timeout={seconds}");
         let page = self
-            .statement(&format!("SET query_timeout = {seconds}"), None)
+            .statement(&format!("SET SESSION query_timeout = {seconds}"), None)
             .await?;
         let result = page.assert_success()?;
         ensure!(

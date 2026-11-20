@@ -45,9 +45,10 @@ pub(crate) struct PreparedAsyncProfile {
 }
 
 impl FrontendQueryCompiler {
-    pub(crate) async fn prepare_explain_async(
+    pub(in crate::query) async fn prepare_explain_async(
         &self,
-        explain: &ExplainQuery,
+        explain: ExplainInput,
+        detail: novarocks_query_application::sql::session::ExplainDetail,
         context: &RequestContext,
         query_options: Option<QueryOptions>,
         scope: &novarocks_workload_control::WorkScope,
@@ -60,31 +61,19 @@ impl FrontendQueryCompiler {
         let execution = context.execution();
         let current_catalog = context.session().current_catalog();
         let current_database = context.session().current_database();
-        let metadata: Result<_, FrontendQueryCompilerError> = async {
-            let connector_planning_context = connector_planning_context_for_query_on_runtime(
-                self.connector_blocking_io.runtime(),
-                query_options.as_ref(),
-                context.execution().cancellation().clone(),
-            )?;
-            let connector_planning_context =
-                novarocks_spi::connector::ConnectorPlanningContext::try_from_request(
-                    connector_planning_context
-                        .request()
-                        .clone()
-                        .with_io_admission(Arc::clone(&ports.io)),
-                )
-                .map_err(|error| FrontendQueryCompilerError::Engine(error.to_string()))?;
-            let query = explain.query.as_ref().clone();
-            Ok((connector_planning_context, query))
-        }
-        .await;
-        let (connector_planning_context, query) = match metadata {
+        let connector_planning_context = match self.connector_planning_context(
+            execution,
+            query_options.as_ref(),
+            Arc::clone(&ports.io),
+        ) {
             Ok(value) => value,
             Err(error) => return Ok(Err(error)),
         };
         let connector_context = connector_planning_context.request();
-        let (level, logical_only) = explain_mode(explain);
-        if explain.format == ExplainFormat::Analyze {
+        let analyze = explain.is_analyze();
+        let (level, logical_only) = explain.display(detail);
+        let query = *explain.query;
+        if analyze {
             return self
                 .complete_async_profile(
                     &query,
@@ -100,9 +89,17 @@ impl FrontendQueryCompiler {
         if logical_only {
             use novarocks_query_application::preparation::CatalogFactPort;
             let control = sql_compile_control_from_execution(execution);
+            let bindings = match QueryTableBindingStore::try_new() {
+                Ok(bindings) => Arc::new(bindings),
+                Err(error) => return Ok(Err(FrontendQueryCompilerError::Engine(error))),
+            };
+            planning_cpu.install_catalog_qualification_source(
+                Arc::clone(&bindings),
+                self.query.catalog_application().cloned(),
+            );
             let mut logical = match planning_cpu
-                .logical_catalog(
-                    query,
+                .logical_catalog_for_input(
+                    SqlStatementInput::query_with_admitted_session(Box::new(query)),
                     SqlSessionContext {
                         sql_semantics: execution.sql_semantics().clone(),
                         current_catalog: current_catalog.map(str::to_owned),
@@ -117,10 +114,6 @@ impl FrontendQueryCompiler {
                 Err(error) => return Ok(Err(FrontendQueryCompilerError::from_compile(error))),
             };
             let catalog: Result<_, FrontendQueryCompilerError> = async {
-                let bindings = Arc::new(
-                    QueryTableBindingStore::try_new()
-                        .map_err(FrontendQueryCompilerError::Engine)?,
-                );
                 let scope =
                     crate::query_execution::completion_facts::StatementFactScope::governed_read_io_in(
                         bindings,
@@ -209,15 +202,15 @@ impl FrontendQueryCompiler {
             state_store,
             ..
         } = ports;
+        let bindings = match QueryTableBindingStore::try_new() {
+            Ok(bindings) => Arc::new(bindings),
+            Err(error) => return Ok(Err(FrontendQueryCompilerError::Engine(error))),
+        };
         let request: Result<
             novarocks_sql::compiler::SqlFinalPlanCompileRequest,
             FrontendQueryCompilerError,
         > = (|| {
             let connector_context = connector_planning_context.request();
-            let bindings = Arc::new(
-                crate::catalog_application::query_bindings::QueryTableBindingStore::try_new()
-                    .expect("query table binding scope allocation must not fail"),
-            );
             crate::query_execution::completion_facts::install_frontend_fact_source(
                 provider_source,
                 self.completion_fact_owners(),
@@ -246,7 +239,7 @@ impl FrontendQueryCompiler {
             .map_err(FrontendQueryCompilerError::Engine)?;
             Ok(novarocks_sql::compiler::SqlFinalPlanCompileRequest::new(
                 crate::query_execution::physical_encoding::mint_plan_version(),
-                SqlStatementInput::parsed_query(Box::new(query.clone())),
+                SqlStatementInput::query_with_admitted_session(Box::new(query.clone())),
                 SqlCompileIntent::Explain {
                     level,
                     analyze: false,
@@ -272,6 +265,10 @@ impl FrontendQueryCompiler {
             Err(error) => return Ok(Err(error)),
         };
         let control = request.control().clone();
+        planning_cpu.install_catalog_qualification_source(
+            bindings,
+            self.query.catalog_application().cloned(),
+        );
         provider_source
             .complete_in(request, scope, planning_cpu.as_ref())
             .await?;
@@ -317,6 +314,10 @@ impl FrontendQueryCompiler {
             state_store,
             ..
         } = ports;
+        let bindings = match QueryTableBindingStore::try_new() {
+            Ok(bindings) => Arc::new(bindings),
+            Err(error) => return Ok(Err(FrontendQueryCompilerError::Engine(error))),
+        };
         let request: Result<
             (
                 novarocks_sql::compiler::SqlFinalPlanCompileRequest,
@@ -324,10 +325,6 @@ impl FrontendQueryCompiler {
             ),
             FrontendQueryCompilerError,
         > = (|| {
-            let bindings = Arc::new(
-                QueryTableBindingStore::try_new()
-                    .expect("query table binding scope allocation must not fail"),
-            );
             crate::query_execution::completion_facts::install_frontend_fact_source(
                 provider_source,
                 self.completion_fact_owners(),
@@ -358,7 +355,7 @@ impl FrontendQueryCompiler {
             Ok((
                 novarocks_sql::compiler::SqlFinalPlanCompileRequest::new(
                     version,
-                    SqlStatementInput::parsed_query(Box::new(query.clone())),
+                    SqlStatementInput::query_with_admitted_session(Box::new(query.clone())),
                     SqlCompileIntent::Explain {
                         level: ExplainLevel::Analyze,
                         analyze: true,
@@ -386,6 +383,10 @@ impl FrontendQueryCompiler {
             Err(error) => return Ok(Err(error)),
         };
         let encoding_control = request.control().clone();
+        planning_cpu.install_catalog_qualification_source(
+            bindings,
+            self.query.catalog_application().cloned(),
+        );
         provider_source
             .complete_in(request, scope, planning_cpu.as_ref())
             .await?;

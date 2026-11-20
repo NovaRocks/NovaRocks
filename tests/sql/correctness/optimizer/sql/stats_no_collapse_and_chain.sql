@@ -38,11 +38,11 @@ INSERT INTO ${case_db}.oq12_stats_and_chain
         generate_series % 50,
         generate_series
     FROM TABLE(generate_series(1, 10000));
-ANALYZE TABLE ${case_db}.oq12_stats_and_chain;
+ANALYZE ${case_db}.oq12_stats_and_chain;
 
 -- @explain_contains=oq12_stats_and_chain
 -- @explain_not_contains=stats={rows=1}
-EXPLAIN VERBOSE SELECT payload
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'  SELECT payload
 FROM ${case_db}.oq12_stats_and_chain
 WHERE c1 BETWEEN 0 AND 80
   AND c2 BETWEEN 0 AND 75

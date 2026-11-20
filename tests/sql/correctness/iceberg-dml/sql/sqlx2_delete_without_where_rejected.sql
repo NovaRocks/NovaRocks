@@ -21,15 +21,12 @@
 
 -- query 1
 -- @skip_result_check=true
-DROP TABLE IF EXISTS ${case_db}.sqlx2_delete_without_where FORCE;
+DROP TABLE IF EXISTS ${case_db}.sqlx2_delete_without_where ;
 CREATE TABLE ${case_db}.sqlx2_delete_without_where (
   id BIGINT,
   v STRING
-) TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
-);
-INSERT INTO ${case_db}.sqlx2_delete_without_where VALUES (1, 'a');
+) WITH (format_version = 3);
+INSERT INTO ${case_db}.sqlx2_delete_without_where VALUES ROW(1, 'a');
 
 -- query 2
 -- @expect_error=DELETE requires a WHERE clause
@@ -42,4 +39,4 @@ ORDER BY id;
 
 -- query 4
 -- @skip_result_check=true
-DROP TABLE ${case_db}.sqlx2_delete_without_where FORCE;
+DROP TABLE ${case_db}.sqlx2_delete_without_where ;

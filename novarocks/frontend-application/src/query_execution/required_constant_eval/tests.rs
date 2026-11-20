@@ -48,10 +48,7 @@ impl Fixture {
     fn with_capacity(config: ResultCapacityConfig) -> Self {
         let compile = SqlCompileControl::unbounded();
         let (interpreter, metadata) = super::test_support::test_product();
-        let statements = novarocks_parser::parse("SELECT 1").unwrap();
-        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
-            panic!("empty captured catalogue fixture");
-        };
+        let query = novarocks_parser::parser::parse_query("SELECT 1").unwrap();
         let catalog =
             SqlCapturedCatalogPreparation::try_new(query.clone(), None, "db", compile.clone())
                 .unwrap()
@@ -92,8 +89,7 @@ impl Fixture {
         target: RequiredConstantTarget,
         control: &SqlCompileControl,
     ) -> PreparedRequiredConstant {
-        let tokens = novarocks_parser::lex(sql).unwrap();
-        let expr = novarocks_parser::parser::parse_expression(sql, &tokens).unwrap();
+        let expr = novarocks_parser::parser::parse_expression(sql).unwrap();
         let functions: Arc<dyn SqlFunctionCatalog> = self.metadata.clone();
         prepare_required_constant(RequiredConstantRequest {
             input: RequiredConstantInput::Expression(&expr),
@@ -376,6 +372,7 @@ fn required_real_primitive_capability_refusal_is_not_constant_eligibility() {
         &target_type,
         novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         false,
+        None,
         &control,
     )
     .unwrap_err();
@@ -413,4 +410,656 @@ fn required_real_primitive_capability_refusal_is_not_constant_eligibility() {
     assert!(
         matches!(SqlConstantEvaluationError::from_domain(eligibility), SqlConstantEvaluationError::Source(source) if source.downcast_ref::<RequiredConstantEligibilityFailure>().is_some())
     );
+}
+
+impl Fixture {
+    fn prepare_core_array(
+        &self,
+        sql: &str,
+        control: &SqlCompileControl,
+    ) -> PreparedRequiredConstant {
+        let expression = novarocks_parser::parser::parse_expression(sql).unwrap();
+        let functions: Arc<dyn SqlFunctionCatalog> = self.metadata.clone();
+        prepare_required_constant(RequiredConstantRequest {
+            input: RequiredConstantInput::Expression(&expression),
+            target: RequiredConstantTarget::ArrayVarchar,
+            catalog: &self.catalog,
+            current_database: "db",
+            functions,
+            sealed_functions: self.interpreter.sealed_functions(),
+            sql_semantics: &novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+            constant_policy: crate::application::test_constant_policy(),
+            control,
+        })
+        .unwrap_or_else(|cause| panic!("{sql}: {cause}"))
+    }
+}
+
+#[test]
+fn required_array_constants_use_core_syntax_and_the_original_interpreter() {
+    use novarocks_type_contract::ValueKind;
+    let fixture = Fixture::new();
+    let control = SqlCompileControl::unbounded();
+    for (sql, expected) in [
+        ("ARRAY['a',NULL]", Some(vec![Some("a"), None])),
+        ("ARRAY[]", Some(vec![])),
+        ("ARRAY[NULL]", Some(vec![None])),
+        ("NULL", None),
+        ("IF(TRUE,ARRAY['a'],ARRAY['b'])", Some(vec![Some("a")])),
+    ] {
+        let prepared = fixture.prepare_core_array(sql, &control);
+        // This is the independent declared SQL target, including both NULL
+        // layers; no expected type is copied from the evaluated Arrow carrier.
+        let expected_type = FunctionValueType::new(
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+            expected.is_none(),
+        );
+        assert_eq!(prepared.value_type(), &expected_type, "{sql}");
+        let value = fixture
+            .interpreter
+            .evaluate(prepared, &fixture.root.owner.scope(), &fixture.window)
+            .unwrap_or_else(|cause| panic!("{sql}: {cause}"));
+        assert_eq!(value.value_type(), &expected_type, "{sql}");
+        // Semantic admission precedes the borrowed carrier accessor. A List
+        // of nominal JSON can have the same Utf8 storage and is not String.
+        let ValueKind::List(child) = value.value_type().value_type().kind() else {
+            panic!("{sql}: expected a semantic List")
+        };
+        assert!(matches!(child.kind(), ValueKind::String), "{sql}");
+        assert!(child.nullable(), "{sql}");
+        let actual = value
+            .utf8_list_observed(CompilePhase::Validate, &control)
+            .unwrap();
+        match (expected.as_ref(), actual) {
+            (None, None) => {}
+            (Some(expected), Some(actual)) => {
+                assert!(std::ptr::eq(actual.source(), &value));
+                assert_eq!(actual.len(), expected.len(), "{sql}");
+                for (index, expected) in expected.iter().enumerate() {
+                    assert_eq!(
+                        actual
+                            .item(index, CompilePhase::Validate, &control)
+                            .unwrap(),
+                        *expected,
+                        "{sql}: item {index}",
+                    );
+                }
+            }
+            _ => panic!("{sql}: root NULL differs from an empty or non-NULL array"),
+        }
+        drop(value);
+        assert_eq!(fixture.window.retained_payload_bytes(), 0, "{sql}");
+    }
+    fixture.close();
+}
+
+#[test]
+fn required_materialized_array_identity_keeps_full_field_type_pool_and_ordinal() {
+    use arrow::{
+        array::{ListArray, StringArray},
+        buffer::OffsetBuffer,
+    };
+    use novarocks_type_contract::ValueKind;
+    use std::collections::HashMap;
+    let fixture = Fixture::new();
+    let control = SqlCompileControl::unbounded();
+    for nullable in [false, true] {
+        let child_field = Arc::new(
+            Field::new("authored_items", DataType::Utf8, nullable)
+                .with_metadata(HashMap::from([("child-owned".into(), "original".into())])),
+        );
+        let children = if nullable {
+            StringArray::from(vec![Some("prefix"), Some("selected"), None])
+        } else {
+            StringArray::from(vec![Some("prefix"), Some("selected")])
+        };
+        let end = if nullable { 3 } else { 2 };
+        let array = ListArray::try_new(
+            child_field.clone(),
+            OffsetBuffer::new(vec![0_i32, 1, end].into()),
+            Arc::new(children),
+            None,
+        )
+        .unwrap();
+        let field = Arc::new(
+            Field::new("authored_array", array.data_type().clone(), nullable)
+                .with_metadata(HashMap::from([("source-owned".into(), "original".into())])),
+        );
+        let value_type = FunctionValueType::try_from_field(&field).unwrap();
+        let pool = ConstantPool::try_new(
+            field.clone(),
+            value_type.clone(),
+            array.to_data(),
+            crate::application::test_constant_policy(),
+            CompilePhase::FunctionSpecialization,
+            &control,
+        )
+        .unwrap();
+        let original = pool.value(1).unwrap();
+        let backing = pool.backing_identity();
+        let functions: Arc<dyn SqlFunctionCatalog> = fixture.metadata.clone();
+        let prepared = prepare_required_constant(RequiredConstantRequest {
+            input: RequiredConstantInput::Materialized(original.clone()),
+            target: RequiredConstantTarget::ArrayVarchar,
+            catalog: &fixture.catalog,
+            current_database: "db",
+            functions,
+            sealed_functions: fixture.interpreter.sealed_functions(),
+            sql_semantics: &novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+            constant_policy: crate::application::test_constant_policy(),
+            control: &control,
+        })
+        .unwrap();
+        assert_eq!(prepared.value_type(), &value_type);
+        let retained = prepared.original_value().expect("unchanged admitted array");
+        assert_eq!(retained.ordinal(), 1);
+        assert_eq!(retained.pool().backing_identity(), backing);
+        assert!(Arc::ptr_eq(retained.pool().field_ref(), &field));
+        let value = fixture
+            .interpreter
+            .evaluate(prepared, &fixture.root.owner.scope(), &fixture.window)
+            .unwrap();
+        assert_eq!(value.pool().backing_identity(), backing);
+        assert_eq!(value.ordinal(), 1);
+        assert!(Arc::ptr_eq(value.pool().field_ref(), &field));
+        assert_eq!(value.value_type(), &value_type);
+        assert!(
+            value
+                .value_type()
+                .value_type()
+                .shares_storage(value_type.value_type())
+        );
+        assert!(
+            value
+                .value_type()
+                .typed_binding()
+                .layout()
+                .shares_storage(value_type.typed_binding().layout())
+        );
+        assert_eq!(value.value_type().nullable(), nullable);
+        let ValueKind::List(child) = value.value_type().value_type().kind() else {
+            panic!()
+        };
+        assert!(matches!(child.kind(), ValueKind::String));
+        assert_eq!(child.nullable(), nullable);
+        assert_eq!(value.field().metadata()["source-owned"], "original");
+        let DataType::List(actual_child) = value.field().data_type() else {
+            panic!()
+        };
+        assert!(Arc::ptr_eq(actual_child, &child_field));
+        assert_eq!(actual_child.metadata()["child-owned"], "original");
+        {
+            let view = value
+                .utf8_list_observed(CompilePhase::Validate, &control)
+                .unwrap()
+                .unwrap();
+            assert!(std::ptr::eq(view.source(), &value));
+            assert_eq!(view.len(), if nullable { 2 } else { 1 });
+            assert_eq!(
+                view.item(0, CompilePhase::Validate, &control).unwrap(),
+                Some("selected")
+            );
+            if nullable {
+                assert_eq!(
+                    view.item(1, CompilePhase::Validate, &control).unwrap(),
+                    None
+                );
+            }
+            let first = pool.value(0).unwrap();
+            let first_view = first
+                .utf8_list_observed(CompilePhase::Validate, &control)
+                .unwrap()
+                .unwrap();
+            assert_eq!(first_view.len(), 1);
+            assert_eq!(
+                first_view
+                    .item(0, CompilePhase::Validate, &control)
+                    .unwrap(),
+                Some("prefix")
+            );
+        }
+        assert_eq!(original.ordinal(), 1);
+        assert_eq!(original.pool().backing_identity(), backing);
+        assert_eq!(original.value_type(), &value_type);
+        assert!(Arc::ptr_eq(original.pool().field_ref(), &field));
+        drop(value);
+        drop(original);
+        drop(pool);
+        assert_eq!(fixture.window.retained_payload_bytes(), 0);
+    }
+    fixture.close();
+}
+
+#[test]
+fn required_unknown_array_conversion_keeps_input_source_without_retagging_its_pool() {
+    use arrow::{
+        array::{ListArray, NullArray},
+        buffer::OffsetBuffer,
+    };
+    use novarocks_type_contract::ValueKind;
+    use std::collections::HashMap;
+    let fixture = Fixture::new();
+    let control = SqlCompileControl::unbounded();
+    let child_field = Arc::new(
+        Field::new("unknown_items", DataType::Null, true).with_metadata(HashMap::from([(
+            "child-owned".into(),
+            "unknown-source".into(),
+        )])),
+    );
+    // Distinct original rows: [] and [NULL]. Selecting ordinal 1 must retain
+    // the second row while its actual conversion creates a String child type.
+    let array = ListArray::try_new(
+        child_field.clone(),
+        OffsetBuffer::new(vec![0_i32, 0, 1].into()),
+        Arc::new(NullArray::new(1)),
+        None,
+    )
+    .unwrap();
+    let field = Arc::new(
+        Field::new("unknown_array", array.data_type().clone(), false).with_metadata(HashMap::from(
+            [("source-owned".into(), "unknown-source".into())],
+        )),
+    );
+    let source_type = FunctionValueType::try_from_field(&field).unwrap();
+    let pool = ConstantPool::try_new(
+        field.clone(),
+        source_type.clone(),
+        array.to_data(),
+        crate::application::test_constant_policy(),
+        CompilePhase::FunctionSpecialization,
+        &control,
+    )
+    .unwrap();
+    let original = pool.value(1).unwrap();
+    let backing = pool.backing_identity();
+    let functions: Arc<dyn SqlFunctionCatalog> = fixture.metadata.clone();
+    let prepared = prepare_required_constant(RequiredConstantRequest {
+        input: RequiredConstantInput::Materialized(original.clone()),
+        target: RequiredConstantTarget::ArrayVarchar,
+        catalog: &fixture.catalog,
+        current_database: "db",
+        functions,
+        sealed_functions: fixture.interpreter.sealed_functions(),
+        sql_semantics: &novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+        constant_policy: crate::application::test_constant_policy(),
+        control: &control,
+    })
+    .unwrap();
+    assert!(
+        prepared.original_value().is_none(),
+        "conversion is not an identity CV"
+    );
+    let expected_type = FunctionValueType::new(
+        DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+        false,
+    );
+    assert_eq!(prepared.value_type(), &expected_type);
+    let value = fixture
+        .interpreter
+        .evaluate(prepared, &fixture.root.owner.scope(), &fixture.window)
+        .unwrap();
+    assert_eq!(value.value_type(), &expected_type);
+    assert_ne!(value.pool().backing_identity(), backing);
+    let ValueKind::List(child) = value.value_type().value_type().kind() else {
+        panic!()
+    };
+    assert!(matches!(child.kind(), ValueKind::String));
+    {
+        let view = value
+            .utf8_list_observed(CompilePhase::Validate, &control)
+            .unwrap()
+            .unwrap();
+        assert_eq!(view.len(), 1);
+        assert_eq!(
+            view.item(0, CompilePhase::Validate, &control).unwrap(),
+            None
+        );
+    }
+    // Only the original input owns its old Field/metadata and selected ordinal.
+    // The output's new Field is authored by the actual compiled conversion.
+    assert_eq!(original.ordinal(), 1);
+    assert_eq!(original.pool().backing_identity(), backing);
+    assert_eq!(original.value_type(), &source_type);
+    assert!(Arc::ptr_eq(original.pool().field_ref(), &field));
+    assert_eq!(
+        original.field().metadata()["source-owned"],
+        "unknown-source"
+    );
+    let DataType::List(original_child) = original.field().data_type() else {
+        panic!()
+    };
+    assert!(Arc::ptr_eq(original_child, &child_field));
+    assert_eq!(original_child.metadata()["child-owned"], "unknown-source");
+    assert!(
+        matches!(original.value_type().value_type().kind(), ValueKind::List(child) if matches!(child.kind(), ValueKind::Scalar(DataType::Null)))
+    );
+    drop(value);
+    drop(original);
+    drop(pool);
+    fixture.close();
+}
+
+impl Fixture {
+    fn evaluate_ddl_property(
+        &self,
+        source: &str,
+        value_type: novarocks_spi::connector::DdlPropertyType,
+        control: &SqlCompileControl,
+    ) -> Result<
+        novarocks_query_application::sql::property_evaluation::EvaluatedDdlProperties,
+        novarocks_query_application::session_error::QueryServiceError,
+    > {
+        use novarocks_query_application::sql::{
+            property_admit::DdlPropertyScope,
+            property_evaluation::{
+                DdlPropertyAssignment, DdlPropertyAssignmentValue, DdlPropertyEvaluationMode,
+                evaluate_ddl_properties,
+            },
+        };
+        use novarocks_spi::connector::{DdlPropertyDeclaration, DdlPropertyValue};
+        let expression = novarocks_parser::parser::parse_expression(source).unwrap();
+        let declaration =
+            DdlPropertyDeclaration::new("value", value_type, DdlPropertyValue::Null, false)
+                .unwrap();
+        let assignments = [DdlPropertyAssignment {
+            name: "value",
+            name_span: expression.span(),
+            span: expression.span(),
+            value: DdlPropertyAssignmentValue::Expression(&expression),
+        }];
+        let semantics = novarocks_sql::sql_mode::SqlSemanticSettings::default();
+        let scope = self.root.owner.scope();
+        let mut port = crate::query_execution::ddl_properties::DdlPropertyConstantEvaluator {
+            catalog: &self.catalog,
+            current_database: "db",
+            functions: self.metadata.clone(),
+            sql_semantics: &semantics,
+            constant_policy: crate::application::test_constant_policy(),
+            control,
+            interpreter: &self.interpreter,
+            scope: &scope,
+            window: &self.window,
+        };
+        evaluate_ddl_properties(
+            DdlPropertyScope::Table,
+            DdlPropertyEvaluationMode::Create,
+            source,
+            &[declaration],
+            &assignments,
+            &mut port,
+            control,
+        )
+    }
+}
+
+#[test]
+fn required_ddl_property_port_runs_real_scalar_array_and_structural_map_inputs() {
+    use novarocks_query_application::sql::property_evaluation::DdlPropertyChange;
+    use novarocks_spi::connector::{DdlPropertyType as T, DdlPropertyValue as V};
+    let fixture = Fixture::new();
+    let control = SqlCompileControl::unbounded();
+    for (source, target, expected) in [
+        ("1 + 2", T::Integer, V::Integer(3)),
+        ("false AND (1 / 0 = 1)", T::Boolean, V::Boolean(false)),
+        ("CAST(1 AS BIGINT) + 2", T::Bigint, V::Bigint(3)),
+        ("CAST(3 AS DOUBLE) / 2", T::Double, V::Double(1.5)),
+        (
+            "IF(TRUE, 'selected', 'other')",
+            T::Varchar,
+            V::Varchar("selected".into()),
+        ),
+        (
+            "IF(TRUE, ARRAY['selected',NULL], ARRAY['other'])",
+            T::ArrayVarchar,
+            V::ArrayVarchar(vec![Some("selected".into()), None]),
+        ),
+        (
+            "MAP(ARRAY['first','second'],ARRAY['value',NULL])",
+            T::MapVarcharVarchar,
+            V::MapVarcharVarchar(vec![
+                ("first".into(), Some("value".into())),
+                ("second".into(), None),
+            ]),
+        ),
+    ] {
+        let properties = fixture
+            .evaluate_ddl_property(source, target, &control)
+            .unwrap_or_else(|error| panic!("{source}: {error}"));
+        let [property] = properties.properties() else {
+            panic!("one evaluated property: {source}")
+        };
+        assert_eq!(property.name, "value");
+        assert_eq!(
+            property.change,
+            DdlPropertyChange::Set(expected),
+            "{source}"
+        );
+        drop(properties);
+        assert_eq!(fixture.window.retained_payload_bytes(), 0, "{source}");
+    }
+    fixture.close();
+}
+
+#[test]
+fn required_ddl_property_port_projects_real_input_errors_and_retains_control_resource() {
+    use novarocks_spi::connector::DdlPropertyType;
+    let fixture = Fixture::new();
+    let control = SqlCompileControl::unbounded();
+    for source in ["NULL", "missing_column", "(SELECT 1)", "1 / 0", "1.5"] {
+        let error = fixture
+            .evaluate_ddl_property(source, DdlPropertyType::Integer, &control)
+            .unwrap_err();
+        let user = error
+            .user_error()
+            .unwrap_or_else(|| panic!("{source}: {error}"));
+        assert_eq!(
+            user.code().as_str(),
+            "sql.admit.invalid_table_property",
+            "{source}"
+        );
+        assert!(user.location().is_some(), "{source}");
+        drop(error);
+    }
+    struct Stop;
+    impl novarocks_sql::compiler::SqlCancellationObservation for Stop {
+        fn is_cancelled(&self) -> bool {
+            true
+        }
+    }
+    let cancelled = SqlCompileControl::new(None, Arc::new(Stop));
+    let error = fixture
+        .evaluate_ddl_property("1 + 2", DdlPropertyType::Integer, &cancelled)
+        .unwrap_err();
+    assert_eq!(
+        error.compile_control_error(),
+        Some(CompileControlError::Cancelled)
+    );
+    drop(error);
+    fixture.close();
+
+    let mut capacity = ResultCapacityConfig::V1;
+    capacity.all_objects_bytes[1] = 1;
+    let fixture = Fixture::with_capacity(capacity);
+    let error = fixture
+        .evaluate_ddl_property("1 + 2", DdlPropertyType::Integer, &control)
+        .unwrap_err();
+    let Some(CompileControlError::Source(source)) = error.compile_control_error() else {
+        panic!("original result capacity failure")
+    };
+    assert_eq!(source.failure_fact().class(), FailureClass::Resource);
+    assert!(
+        source
+            .downcast_ref::<novarocks_workload_control::WorkError>()
+            .is_some()
+    );
+    assert!(
+        error
+            .user_error()
+            .is_none_or(|user| user.code().as_str() != "sql.admit.invalid_table_property")
+    );
+    drop(error);
+    drop(source);
+    fixture.close();
+}
+
+#[test]
+fn required_array_child_buffers_keep_original_result_custody_until_last_alias_exits() {
+    use arrow::array::{ListArray, StringArray};
+    let fixture = Fixture::new();
+    let prepared = fixture.prepare_core_array(
+        "ARRAY['selected child', NULL]",
+        &SqlCompileControl::unbounded(),
+    );
+    let value = fixture
+        .interpreter
+        .evaluate(prepared, &fixture.root.owner.scope(), &fixture.window)
+        .unwrap();
+    let alias = value.pool().array().clone();
+    drop(value);
+    assert!(
+        fixture.window.retained_payload_bytes() > 0,
+        "the real Array alias still owns its original result custody"
+    );
+    {
+        let array = alias.as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(array.value_offsets(), &[0, 2]);
+        let items = array
+            .values()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(items.value(0), "selected child");
+        assert!(items.is_null(1));
+    }
+    drop(alias);
+    assert_eq!(fixture.window.retained_payload_bytes(), 0);
+    fixture.close();
+}
+
+#[test]
+fn table_procedure_timestamp_uses_the_original_required_constant_interpreter() {
+    use novarocks_parser::{Span, ast::TrinoStatement, parser::parse_statement};
+    use novarocks_query_application::{
+        session_error::QueryServiceError,
+        sql::{
+            table_procedure::{
+                BoundProcedureArgument, BoundProcedureValue, TableProcedureAbsoluteTimePort,
+            },
+            trino_table_command::bind_trino_table_execute,
+        },
+    };
+    use novarocks_spi::connector::{ConnectorProviderId, DdlPropertyValue};
+
+    struct NoLegacyTimestamp;
+    impl TableProcedureAbsoluteTimePort for NoLegacyTimestamp {
+        fn legacy_timestamp_literal_millis(
+            &mut self,
+            _: &str,
+            _: Span,
+        ) -> Result<i64, QueryServiceError> {
+            panic!("ordinary expressions cannot use the legacy literal parser")
+        }
+    }
+
+    let fixture = Fixture::new();
+    let control = SqlCompileControl::unbounded();
+    let semantics = novarocks_sql::sql_mode::SqlSemanticSettings::default();
+    let scope = fixture.root.owner.scope();
+    let provider = ConnectorProviderId::parse("iceberg").unwrap();
+    let mut port = crate::query_execution::ddl_properties::DdlPropertyConstantEvaluator {
+        catalog: &fixture.catalog,
+        current_database: "db",
+        functions: fixture.metadata.clone(),
+        sql_semantics: &semantics,
+        constant_policy: crate::application::test_constant_policy(),
+        control: &control,
+        interpreter: &fixture.interpreter,
+        scope: &scope,
+        window: &fixture.window,
+    };
+    for (input, expected) in [
+        (
+            "CASE WHEN TRUE THEN CAST('1970-01-01 00:00:07.123456' AS TIMESTAMP(6)) ELSE CAST(NULL AS TIMESTAMP(6)) END",
+            Some(7123),
+        ),
+        (
+            "CAST('1969-12-31 23:59:59.999999' AS TIMESTAMP(6))",
+            Some(-1),
+        ),
+        ("CAST(NULL AS TIMESTAMP(6))", None),
+        (
+            "CASE WHEN TRUE THEN CAST(NULL AS TIMESTAMP(6)) ELSE CAST('1970-01-01 00:00:07.123456' AS TIMESTAMP(6)) END",
+            None,
+        ),
+        ("IF(TRUE, NULL, NULL)", None),
+        ("COALESCE(NULL, NULL)", None),
+        ("1 + 2", None),
+        ("DATE '1970-01-01'", None),
+    ] {
+        let source =
+            format!("ALTER TABLE lake.ns.t EXECUTE expire_snapshots(older_than => {input})");
+        let TrinoStatement::TableExecute(statement) = parse_statement(&source).unwrap() else {
+            panic!("expected ALTER TABLE EXECUTE");
+        };
+        let result = bind_trino_table_execute(
+            &source,
+            &statement,
+            &provider,
+            &mut port,
+            &mut NoLegacyTimestamp,
+            &control,
+        );
+        match expected {
+            Some(millis) => {
+                let bound = result.unwrap_or_else(|cause| panic!("{input}: {cause}"));
+                let (_, value) = bound
+                    .arguments()
+                    .find(|(slot, _)| slot.name == "older_than")
+                    .unwrap();
+                assert!(matches!(value, BoundProcedureArgument::Present {
+                    value: BoundProcedureValue::Value(DdlPropertyValue::Bigint(actual)), ..
+                } if *actual == millis));
+            }
+            None => {
+                let error = result.unwrap_err();
+                assert_eq!(
+                    error.user_error().unwrap().code().as_str(),
+                    "sql.admit.invalid_table_procedure_argument",
+                    "{input}: {error}",
+                );
+            }
+        }
+    }
+    drop(port);
+    let selected_error = fixture
+        .evaluate(
+            "IF(1 / 0 = 1, NULL, NULL)",
+            RequiredConstantTarget::Timestamp,
+        )
+        .unwrap_err();
+    let SqlConstantEvaluationError::Source(cause) = selected_error else {
+        panic!("expected the actual selected row error: {selected_error}");
+    };
+    assert_eq!(cause.failure_fact().class(), FailureClass::Data);
+    let selected = cause
+        .downcast_ref::<RequiredExpressionRowError>()
+        .expect("original required row");
+    assert_eq!(selected.error().selected_ordinal(), 0);
+    assert_eq!(selected.batch_row(), 0);
+    drop(cause);
+
+    let inactive = fixture
+        .evaluate(
+            "IF(FALSE AND (1 / 0 = 1), NULL, NULL)",
+            RequiredConstantTarget::Timestamp,
+        )
+        .unwrap();
+    assert_eq!(inactive.value_type().data_type(), &DataType::Null);
+    assert!(
+        inactive
+            .is_null_observed(CompilePhase::Validate, &control)
+            .unwrap()
+    );
+    drop(inactive);
+    fixture.close();
 }

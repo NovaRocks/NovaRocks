@@ -26,10 +26,13 @@ use arrow::datatypes::DataType;
 use novarocks_constant_contract::ConstantPools;
 use novarocks_expression_contract::{BoundExprSetBuilder, ExprId, ExprKind, RootScope, ValueId};
 use novarocks_functions::{
-    EngineFunctionCatalogBuilder, FunctionId, FunctionKind, FunctionOverloadId,
-    InstalledPureKernel, PureEngineFunctionCatalog, PureImplementationDeclaration,
-    PureImplementationId, PureKernelAbi,
-    builtin::value_conversion::{VALUE_CONVERSION_NAME, value_conversion_definition},
+    EngineFunctionCatalogBuilder, FunctionBindingError, FunctionBindingRequest, FunctionId,
+    FunctionKind, FunctionOverloadId, FunctionResultType, InstalledPureKernel,
+    PureEngineFunctionCatalog, PureImplementationDeclaration, PureImplementationId, PureKernelAbi,
+    builtin::value_conversion::{
+        ARRAY_COMMON_COERCION, VALUE_CONVERSION_NAME, resolve_array_common_coercion_binding,
+        value_conversion_definition,
+    },
 };
 use novarocks_type_contract::{
     ControlShape, EvaluationDemand, FunctionValueType, ValueLogicalType,
@@ -84,9 +87,10 @@ fn conversion_catalogue() -> PureEngineFunctionCatalog {
     builder
         .register(value_conversion_definition().unwrap())
         .unwrap();
-    // This independent installed manifest covers all nine real implementations
+    // This independent installed manifest covers all ten real implementations
     // of the original hidden definition, without claiming a Server catalogue.
     for stem in [
+        "array_common_coercion",
         "json_text_same_structure",
         "opaque_to_binary_same_structure",
         "signed_to_largeint",
@@ -212,5 +216,51 @@ pub fn direct_program(source: FunctionValueType, target: FunctionValueType) -> F
                 target,
             )
         },
+    )
+}
+
+/// Freeze an explicitly selected ARRAY common coercion in the real fixture unit.
+pub fn array_common_coerced(
+    functions: &PureEngineFunctionCatalog,
+    builder: &mut BoundExprSetBuilder,
+    authors: &mut BTreeMap<ExprId, ClaimAuthor>,
+    value: ExprId,
+    source: FunctionValueType,
+    target: FunctionValueType,
+) -> ExprId {
+    let arguments = vec![argument(source, None)];
+    let metadata = functions.metadata();
+    assert!(matches!(
+        metadata.resolve_bound_trusted(
+            VALUE_CONVERSION_NAME,
+            FunctionKind::Scalar,
+            FunctionBindingRequest {
+                arguments: &arguments,
+                logical_argument_count: 1,
+                expected_result_type: Some(&target),
+            },
+            &HarnessControl,
+        ),
+        Err(FunctionBindingError::NoMatchingOverload)
+    ));
+    let bound =
+        resolve_array_common_coercion_binding(metadata, &arguments[0], &target, &HarnessControl)
+            .unwrap();
+    assert_eq!(bound.selected.overload.as_str(), ARRAY_COMMON_COERCION);
+    assert_eq!(
+        bound.selected.result_type,
+        FunctionResultType::Scalar(target.clone())
+    );
+    add_call(
+        builder,
+        authors,
+        ClaimAuthor::from_resolved_legacy_binding(
+            bound,
+            arguments,
+            ControlShape::Eager,
+            Some(target),
+            fixture_constant_policy(),
+        ),
+        vec![value],
     )
 }

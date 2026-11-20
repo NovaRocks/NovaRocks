@@ -413,7 +413,12 @@ fn constant_entry_every_family_matches_real_noop_sql_constant_root() {
         ("20 + 22", Family::Arithmetic, true, int(Some(42))),
         ("1e0 * 1e0", Family::Arithmetic, true, float(1.0)),
         ("20 < 22", Family::Comparison, false, boolean(Some(true))),
-        ("1 <=> 1", Family::NullSafe, false, boolean(Some(true))),
+        (
+            "1 IS NOT DISTINCT FROM 1",
+            Family::NullSafe,
+            false,
+            boolean(Some(true)),
+        ),
         ("FALSE AND TRUE", Family::And, false, boolean(Some(false))),
         ("TRUE OR FALSE", Family::Or, false, boolean(Some(true))),
         ("NOT TRUE", Family::Not, false, boolean(Some(false))),
@@ -457,16 +462,23 @@ fn constant_entry_every_family_matches_real_noop_sql_constant_root() {
         }
         fixture.assert_both(&functions, FoldOutcome::Folded, Expected::Value(expected));
     }
-    // Native unary minus is zero subtraction: +0 - +0 is +0. An explicit
-    // text CAST authors the separate -0 bit pattern. Preserve both real child
-    // subexpressions, plus typed NULL, without replacing the depth-one cases.
+    // Subtracting two positive zeros authors positive zero. Unary minus and
+    // a text CAST each author negative zero. Preserve the real subexpressions
+    // and typed NULL alongside the depth-one cases.
     for (expression, family, nullable, outcome, expected) in [
+        (
+            "(0e0 - 0e0) * 1e0",
+            Family::Arithmetic,
+            true,
+            FoldOutcome::Folded,
+            float(0.0),
+        ),
         (
             "-0e0 * 1e0",
             Family::Arithmetic,
             true,
             FoldOutcome::Kept,
-            float(0.0),
+            float(-0.0),
         ),
         (
             "CAST('-0' AS DOUBLE) * 1e0",
@@ -497,7 +509,7 @@ fn constant_entry_every_family_matches_real_noop_sql_constant_root() {
             bigint(None),
         ),
         (
-            "CAST(NULL AS BIGINT) <=> CAST(NULL AS BIGINT)",
+            "CAST(NULL AS BIGINT) IS NOT DISTINCT FROM CAST(NULL AS BIGINT)",
             Family::NullSafe,
             false,
             FoldOutcome::Folded,

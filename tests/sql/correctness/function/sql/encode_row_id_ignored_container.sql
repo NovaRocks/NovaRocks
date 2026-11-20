@@ -18,13 +18,12 @@
 -- query 1
 -- @skip_result_check=true
 USE ${case_db};
-CREATE TABLE encode_ignored (id INT, v1 BIGINT, v2 STRING, v3 ARRAY<INT>)
-TBLPROPERTIES ("format-version"="3");
+CREATE TABLE encode_ignored (id INT, v1 BIGINT, v2 STRING, v3 ARRAY<INT>) WITH (format_version = 3);
 
 -- query 2
 -- @skip_result_check=true
 USE ${case_db};
-INSERT INTO encode_ignored VALUES (1,7,'x',[1,2]), (2,NULL,NULL,NULL);
+INSERT INTO encode_ignored VALUES ROW(1,7,'x',[1,2]), ROW(2,NULL,NULL,NULL);
 
 -- query 3
 USE ${case_db};

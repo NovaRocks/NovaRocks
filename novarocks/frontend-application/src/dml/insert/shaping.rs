@@ -129,11 +129,11 @@ fn shape_insert_source_in(
     String,
 > {
     let uncontrolled_values = matches!(source.body.as_ref(), ast::SetExpr::Values(_))
+        && source.functions.is_empty()
         && source.with.is_none()
-        && source.order_by.is_empty()
-        && source.limit.is_none()
-        && source.offset.is_none()
-        && source.fetch.is_none();
+        && source.modifiers.order_by.is_none()
+        && source.modifiers.limit.is_none()
+        && source.modifiers.offset.is_none();
     if (typed_write && !uncontrolled_values) || (!uncontrolled_values && !literal_query(source)) {
         return Ok(None);
     }
@@ -168,11 +168,14 @@ fn body_has_distinct_set(body: &ast::SetExpr) -> bool {
     match body {
         ast::SetExpr::SetOperation(operation) => {
             !matches!(operation.operator, ast::SetOperator::Union)
-                || !matches!(operation.quantifier, ast::SetQuantifier::All)
-                || body_has_distinct_set(&operation.left)
-                || body_has_distinct_set(&operation.right)
+                || operation.distinct
+                || operation.corresponding.is_some()
+                || operation.inputs.iter().any(body_has_distinct_set)
         }
-        ast::SetExpr::Query(query) => body_has_distinct_set(&query.body),
+        ast::SetExpr::Query(subquery) => {
+            let query = &subquery.query;
+            body_has_distinct_set(&query.body)
+        }
         _ => false,
     }
 }
@@ -218,17 +221,28 @@ fn shape_body(
     constants: &mut ConstantSource<'_>,
 ) -> Result<(), String> {
     match body {
+        ast::SetExpr::Table(_) => {
+            return Err("INSERT literal source does not support TABLE query bodies".to_string());
+        }
         ast::SetExpr::Values(values) => {
             for (row_index, row) in values.rows.iter_mut().enumerate() {
+                let cells = ast::ValuesRowCells::new(row);
+                if cells.has_named_fields() {
+                    return Err(
+                        "INSERT literal VALUES source does not support named row fields".into(),
+                    );
+                }
+                let row_span = row.span();
                 let (syntax, authored) = shape_row_in(
-                    row,
+                    cells.len(),
+                    |index| cells.get(index),
                     mapping,
                     width,
                     columns,
                     constants.capture,
                     constants.typed_write,
                 )?;
-                *row = syntax;
+                *row = values_row(syntax, row_span);
                 constants.publish(authored, |column| {
                     novarocks_sql::compiler::SqlConstantExpressionSite::ValuesCell {
                         row: row_index,
@@ -238,17 +252,19 @@ fn shape_body(
             }
         }
         ast::SetExpr::Select(select) => {
-            let row = select
+            if !select
                 .projection
                 .iter()
-                .map(|item| match item {
-                    ast::SelectItem::UnnamedExpr(expr)
-                    | ast::SelectItem::ExprWithAlias { expr, .. } => Ok(expr.clone()),
-                    _ => Err("INSERT literal SELECT source only supports expressions".to_string()),
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+                .all(|item| matches!(item, ast::SelectItem::SingleColumn(_)))
+            {
+                return Err("INSERT literal SELECT source only supports expressions".to_string());
+            }
             let (expressions, authored) = shape_row_in(
-                &row,
+                select.projection.len(),
+                |index| match select.projection.get(index) {
+                    Some(ast::SelectItem::SingleColumn(column)) => Some(&column.expression),
+                    _ => None,
+                },
                 mapping,
                 width,
                 columns,
@@ -259,41 +275,58 @@ fn shape_body(
             // the original SELECT as the row-producing relation so HAVING aliases,
             // filters and DISTINCT observe source types before sink conversion.
             // Each leaf's target projection still precedes UNION common typing.
-            let expressions = expressions
-                .into_iter()
-                .map(canonical_insert_wrapper_expression)
-                .collect::<Result<Vec<_>, _>>()?;
             let inner = build::query(ast::SetExpr::Select(select.clone()));
-            let query = build::query(ast::SetExpr::Select(Box::new(
+            let query = build::query(ast::SetExpr::Select(novarocks_parser::ast::AstBox::new(
                 build::select(
                     expressions
                         .into_iter()
-                        .map(|expr| build::item(expr, None, false))
+                        .map(|expr| build::item(expr, None))
                         .collect(),
-                    vec![build::relation(build::derived(
-                        inner,
-                        Some(build::alias(
-                            build::ident("__nr_insert_literal_src", None),
-                            Vec::new(),
-                            true,
-                        )),
-                    ))],
+                    Some(build::alias(
+                        build::derived(inner),
+                        build::ident("__nr_insert_literal_src", false),
+                        None,
+                    )),
                     None,
-                    ast::GroupBy::None,
+                    None,
                 )
                 .map_err(|error| error.to_string())?,
             )));
-            *body = ast::SetExpr::Query(Box::new(query));
+            *body = ast::SetExpr::Query(ast::AstBox::new(ast::TableSubquery {
+                span: query.span,
+                query: ast::AstBox::new(query),
+            }));
             // Bind constants in the final target wrapper. Its original inner
             // SELECT and the published path remain attached to the same tree.
             constants.push(novarocks_sql::compiler::SqlConstantQueryStep::NestedQuery);
             if let Some(authored) = authored.as_ref() {
+                let ast::SetExpr::Query(wrapper) = body else {
+                    unreachable!("published target wrapper")
+                };
+                let ast::SetExpr::Select(wrapper) = wrapper.query.body.as_ref() else {
+                    unreachable!("published target SELECT")
+                };
+                let (original, relation_path) = wrapper
+                    .from
+                    .as_ref()
+                    .and_then(derived_source)
+                    .map(|(query, _, path)| (query, path))
+                    .ok_or_else(|| {
+                        "INSERT literal source lost its actual derived wrapper".to_string()
+                    })?;
                 for (column, value) in authored.iter().enumerate() {
                     let (Some(value), Some(source_column)) = (value, mapping[column]) else {
                         continue;
                     };
-                    let Some(expression_path) = explicit_variant_source_path(&row[source_column])
+                    let ast::SetExpr::Select(original) = original.body.as_ref() else {
+                        return Err("INSERT literal source lost its original SELECT".into());
+                    };
+                    let Some(ast::SelectItem::SingleColumn(column)) =
+                        original.projection.get(source_column)
                     else {
+                        return Err("INSERT literal source lost its original projection".into());
+                    };
+                    if !is_explicit_variant_cast(&column.expression) {
                         continue;
                     };
                     // This original source cast and the outer target are two
@@ -302,19 +335,18 @@ fn shape_body(
                     let mut path = constants.path.clone();
                     path.push(
                         novarocks_sql::compiler::SqlConstantQueryStep::SelectFromDerived {
-                            from: 0,
+                            relation_path: relation_path.clone(),
                         },
                     );
-                    constants.constants.push(
-                        novarocks_sql::compiler::SqlExpressionConstant::new(
+                    constants
+                        .constants
+                        .push(novarocks_sql::compiler::SqlExpressionConstant::new(
                             path,
                             novarocks_sql::compiler::SqlConstantExpressionSite::SelectProjection {
                                 column: source_column,
                             },
                             value.clone(),
-                        )
-                        .with_expression_path(expression_path),
-                    );
+                        ));
                 }
             }
             constants.publish(authored, |column| {
@@ -322,26 +354,43 @@ fn shape_body(
             });
             constants.pop();
         }
-        ast::SetExpr::Query(query) => {
+        ast::SetExpr::Query(subquery) => {
+            let query = &mut subquery.query;
             constants.push(novarocks_sql::compiler::SqlConstantQueryStep::NestedQuery);
             shape_body(&mut query.body, mapping, width, columns, constants)?;
             constants.pop();
         }
         ast::SetExpr::SetOperation(operation) => {
             if !matches!(operation.operator, ast::SetOperator::Union)
-                || !matches!(operation.quantifier, ast::SetQuantifier::All)
+                || operation.distinct
+                || operation.corresponding.is_some()
             {
-                return Err("INSERT literal source requires UNION ALL".to_string());
+                return Err(
+                    "INSERT literal source requires UNION ALL without CORRESPONDING".to_string(),
+                );
             }
-            constants.push(novarocks_sql::compiler::SqlConstantQueryStep::UnionLeft);
-            shape_body(&mut operation.left, mapping, width, columns, constants)?;
-            constants.pop();
-            constants.push(novarocks_sql::compiler::SqlConstantQueryStep::UnionRight);
-            shape_body(&mut operation.right, mapping, width, columns, constants)?;
-            constants.pop();
+            for (index, input) in operation.inputs.iter_mut().enumerate() {
+                constants.push(novarocks_sql::compiler::SqlConstantQueryStep::SetOperand { index });
+                shape_body(input, mapping, width, columns, constants)?;
+                constants.pop();
+            }
         }
     }
     Ok(())
+}
+
+fn values_row(cells: Vec<ast::Expr>, span: Span) -> ast::Expr {
+    ast::Expr::Row(ast::RowExpr {
+        fields: cells
+            .into_iter()
+            .map(|expression| ast::RowField {
+                span: expression.span(),
+                name: None,
+                expression,
+            })
+            .collect(),
+        span,
+    })
 }
 
 type ShapedInsertRow = (
@@ -349,8 +398,9 @@ type ShapedInsertRow = (
     Option<Vec<Option<novarocks_functions::ConstantValue>>>,
 );
 
-fn shape_row_in(
-    row: &[ast::Expr],
+fn shape_row_in<'a>(
+    row_len: usize,
+    cell: impl Fn(usize) -> Option<&'a ast::Expr>,
     mapping: &[Option<usize>],
     width: usize,
     columns: &[ColumnDef],
@@ -360,10 +410,10 @@ fn shape_row_in(
     )>,
     typed_write: bool,
 ) -> Result<ShapedInsertRow, String> {
-    if row.len() != width {
+    if row_len != width {
         return Err(format!(
             "insert column count mismatch: expected {width} values for column list, got {}",
-            row.len()
+            row_len
         ));
     }
     let mut constants = capture.map(|_| Vec::with_capacity(columns.len()));
@@ -372,7 +422,9 @@ fn shape_row_in(
         .zip(columns)
         .map(|(index, column)| {
             let expr = match index {
-                Some(index) => row[*index].clone(),
+                Some(index) => cell(*index)
+                    .ok_or_else(|| "INSERT source lost its original cell ordinal".to_string())?
+                    .clone(),
                 None => omitted_insert_expr(column)?,
             };
             let target = column
@@ -451,17 +503,10 @@ pub(crate) fn omitted_insert_expr(column: &ColumnDef) -> Result<ast::Expr, Strin
 }
 
 fn is_variant_cast(cast: &ast::CastExpr) -> bool {
-    printer::print_object_name(&cast.data_type.name).eq_ignore_ascii_case("variant")
+    matches!(&cast.data_type.kind, ast::TypeKind::Generic(generic) if generic.name.value.eq_ignore_ascii_case("variant"))
 }
-fn explicit_variant_source_path(
-    mut expr: &ast::Expr,
-) -> Option<Vec<novarocks_sql::compiler::SqlConstantExpressionStep>> {
-    let mut path = Vec::new();
-    while let ast::Expr::Nested(nested) = expr {
-        path.push(novarocks_sql::compiler::SqlConstantExpressionStep::Nested);
-        expr = &nested.expression;
-    }
-    matches!(expr, ast::Expr::Cast(cast) if is_variant_cast(cast)).then_some(path)
+fn is_explicit_variant_cast(expr: &ast::Expr) -> bool {
+    matches!(expr, ast::Expr::Cast(cast) if is_variant_cast(cast))
 }
 
 fn constrain_literal(expr: ast::Expr, target: &FunctionValueType) -> Result<ast::Expr, String> {
@@ -477,58 +522,34 @@ fn constrain_literal_in(
         // authorizes the existing constant JSON representation conversion.
         ast::Expr::Cast(cast) => {
             if is_variant_cast(cast)
-                && let Some(syntax) = constant_variant_in(&cast.expr, encoded.as_deref_mut())?
+                && let Some(syntax) = constant_variant_in(&cast.expression, encoded.as_deref_mut())?
             {
-                *cast.expr = syntax;
+                cast.expression = syntax;
             }
-        }
-        ast::Expr::Nested(nested) => {
-            *nested.expression =
-                constrain_literal_in((*nested.expression).clone(), target, encoded.as_deref_mut())?;
         }
         ast::Expr::Literal(value) => {
             if matches!(target.data_type(), DataType::Binary | DataType::LargeBinary)
                 && let ast::LiteralKind::String(text) = &value.kind
             {
-                value.kind = ast::LiteralKind::HexString(hex::encode_upper(
-                    novarocks_sql::literal::latin1_string_to_bytes(text)?,
-                ));
+                value.kind =
+                    ast::LiteralKind::Binary(novarocks_sql::literal::latin1_string_to_bytes(text)?);
             }
         }
-        ast::Expr::Array(array) if array.element_type.is_none() => {
+        ast::Expr::Array(array) => {
             if matches!(target.data_type(), DataType::List(_)) {
                 let item = target_child(target, 0)?;
-                for element in &mut array.elements {
+                for element in &mut array.values {
                     *element = constrain_literal(element.clone(), &item)?;
                 }
             }
         }
-        ast::Expr::Map(map) => {
-            if map_types(target.data_type()).is_some() {
-                let key = target_child(target, 0)?;
-                let value = target_child(target, 1)?;
-                for entry in &mut map.entries {
-                    entry.key = constrain_literal(entry.key.clone(), &key)?;
-                    entry.value = constrain_literal(entry.value.clone(), &value)?;
-                }
-            }
-        }
-        ast::Expr::Tuple(tuple) => {
-            if let DataType::Struct(fields) = target.data_type()
-                && fields.len() == tuple.expressions.len()
-            {
-                for (index, value) in tuple.expressions.iter_mut().enumerate() {
-                    *value = constrain_literal(value.clone(), &target_child(target, index)?)?;
-                }
-            }
-        }
-        ast::Expr::Struct(structure) => {
+        ast::Expr::Row(structure) => {
             if let DataType::Struct(fields) = target.data_type()
                 && fields.len() == structure.fields.len()
             {
                 for (index, value) in structure.fields.iter_mut().enumerate() {
-                    value.value =
-                        constrain_literal(value.value.clone(), &target_child(target, index)?)?;
+                    value.expression =
+                        constrain_literal(value.expression.clone(), &target_child(target, index)?)?;
                 }
             }
         }
@@ -538,12 +559,13 @@ fn constrain_literal_in(
                 ("array", DataType::List(_)) => {
                     let item = target_child(target, 0)?;
                     for value in &mut function.arguments {
-                        *value = constrain_literal(value.clone(), &item)?;
+                        value.value = constrain_literal(value.value.clone(), &item)?;
                     }
                 }
                 ("row", DataType::Struct(fields)) if fields.len() == function.arguments.len() => {
                     for (index, value) in function.arguments.iter_mut().enumerate() {
-                        *value = constrain_literal(value.clone(), &target_child(target, index)?)?;
+                        value.value =
+                            constrain_literal(value.value.clone(), &target_child(target, index)?)?;
                     }
                 }
                 ("named_struct", DataType::Struct(fields))
@@ -556,8 +578,10 @@ fn constrain_literal_in(
                         .iter_mut()
                         .enumerate()
                     {
-                        pair[1] =
-                            constrain_literal(pair[1].clone(), &target_child(target, index)?)?;
+                        pair[1].value = constrain_literal(
+                            pair[1].value.clone(),
+                            &target_child(target, index)?,
+                        )?;
                     }
                 }
                 ("map", DataType::Map(..)) => {
@@ -565,8 +589,8 @@ fn constrain_literal_in(
                         let key = target_child(target, 0)?;
                         let value = target_child(target, 1)?;
                         for pair in function.arguments.as_chunks_mut::<2>().0 {
-                            pair[0] = constrain_literal(pair[0].clone(), &key)?;
-                            pair[1] = constrain_literal(pair[1].clone(), &value)?;
+                            pair[0].value = constrain_literal(pair[0].value.clone(), &key)?;
+                            pair[1].value = constrain_literal(pair[1].value.clone(), &value)?;
                         }
                     }
                 }
@@ -617,14 +641,11 @@ fn constant_variant_in(
 }
 fn variant_bytes_expr(bytes: &[u8], span: Span) -> ast::Expr {
     ast::Expr::Literal(ast::Literal {
-        kind: ast::LiteralKind::HexString(hex::encode_upper(bytes)),
+        kind: ast::LiteralKind::Binary(bytes.to_vec()),
         span,
     })
 }
 fn constant_variant_bytes(expr: &ast::Expr) -> Result<Option<Vec<u8>>, String> {
-    if let ast::Expr::Nested(nested) = expr {
-        return constant_variant_bytes(&nested.expression);
-    }
     let ast::Expr::FunctionCall(function) = expr else {
         return Ok(None);
     };
@@ -640,21 +661,22 @@ fn constant_variant_bytes(expr: &ast::Expr) -> Result<Option<Vec<u8>>, String> {
                 kind: ast::LiteralKind::String(text),
                 ..
             }) => Some(text),
-            ast::Expr::Nested(nested) => string_literal(&nested.expression),
             ast::Expr::Cast(cast)
                 if matches!(
-                    printer::print_object_name(&cast.data_type.name)
-                        .to_ascii_lowercase()
-                        .as_str(),
+                    match &cast.data_type.kind {
+                        ast::TypeKind::Generic(value) => value.name.value.to_ascii_lowercase(),
+                        _ => String::new(),
+                    }
+                    .as_str(),
                     "varchar" | "string" | "text"
-                ) && cast.format.is_none() =>
+                ) =>
             {
-                string_literal(&cast.expr)
+                string_literal(&cast.expression)
             }
             _ => None,
         }
     }
-    let Some(text) = string_literal(&function.arguments[0]) else {
+    let Some(text) = string_literal(&function.arguments[0].value) else {
         return Ok(None);
     };
     let bytes = novarocks_types::value::variant_encode::encode_json_text_to_variant_bytes(text)
@@ -673,16 +695,11 @@ fn literal(kind: ast::LiteralKind) -> ast::Expr {
 fn null_expr() -> ast::Expr {
     build::null()
 }
-fn number(value: String) -> ast::Expr {
-    // Typed defaults retain their exact coefficient, including values that are
-    // not source-language i64 literals. This is not a parser rejection fallback.
-    build::literal(ast::LiteralKind::Number(value))
-}
 fn string(value: String) -> ast::Expr {
     build::string(value)
 }
 fn binary(value: &[u8]) -> ast::Expr {
-    build::hex_string(hex::encode_upper(value))
+    build::binary_literal(value.to_vec())
 }
 fn array(elements: Vec<ast::Expr>) -> ast::Expr {
     build::array(elements)
@@ -694,79 +711,6 @@ fn map(entries: Vec<(ast::Expr, ast::Expr)>) -> ast::Expr {
     build::map(entries)
 }
 
-/// Normalize only the expressions whose original INSERT wrapper crossed the
-/// printer/parser boundary. VALUES retains its existing typed-value syntax.
-/// Source positions and the shape of every already-admitted user subtree stay
-/// attached to that subtree; no tree is returned after construction fails.
-pub(crate) fn canonical_insert_wrapper_expression(expr: ast::Expr) -> Result<ast::Expr, String> {
-    use ast::Fold;
-    #[derive(Default)]
-    struct WrapperSyntax {
-        error: Option<String>,
-    }
-    impl ast::Fold for WrapperSyntax {
-        fn fold_expr(&mut self, expression: ast::Expr) -> ast::Expr {
-            if self.error.is_some() {
-                return expression;
-            }
-            match expression {
-                ast::Expr::Literal(original) => {
-                    let ast::LiteralKind::Number(value) = &original.kind else {
-                        return ast::Expr::Literal(original);
-                    };
-                    match build::number(value.clone()) {
-                        Ok(mut canonical) => {
-                            match &mut canonical {
-                                ast::Expr::Literal(literal) => literal.span = original.span,
-                                ast::Expr::Unary(unary) => {
-                                    unary.span = original.span;
-                                    if let ast::Expr::Literal(literal) = unary.expression.as_mut() {
-                                        literal.span = original.span;
-                                    }
-                                }
-                                _ => unreachable!("numeric constructor returns literal or unary"),
-                            }
-                            canonical
-                        }
-                        Err(error) => {
-                            self.error = Some(error.to_string());
-                            ast::Expr::Literal(original)
-                        }
-                    }
-                }
-                ast::Expr::Tuple(tuple) => {
-                    let expressions = tuple
-                        .expressions
-                        .into_iter()
-                        .map(|expr| self.fold_expr(expr))
-                        .collect();
-                    match build::tuple(expressions) {
-                        Ok(mut canonical) => {
-                            match &mut canonical {
-                                ast::Expr::Tuple(value) => value.span = tuple.span,
-                                ast::Expr::Nested(value) => value.span = tuple.span,
-                                _ => unreachable!("tuple constructor returns tuple or parentheses"),
-                            }
-                            canonical
-                        }
-                        Err(error) => {
-                            self.error = Some(error.to_string());
-                            build::null()
-                        }
-                    }
-                }
-                expression => ast::fold_expr(self, expression),
-            }
-        }
-    }
-    let mut syntax = WrapperSyntax::default();
-    let expression = syntax.fold_expr(expr);
-    match syntax.error {
-        Some(error) => Err(error),
-        None => Ok(expression),
-    }
-}
-
 fn default_to_expr(default: &ColumnDefault, data_type: &DataType) -> Result<ast::Expr, String> {
     Ok(match (default, data_type) {
         (ColumnDefault::Boolean(value), DataType::Boolean) => {
@@ -775,14 +719,14 @@ fn default_to_expr(default: &ColumnDefault, data_type: &DataType) -> Result<ast:
         (
             ColumnDefault::Int32(value),
             DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64,
-        ) => number(value.to_string()),
-        (ColumnDefault::Int64(value), DataType::Int64) => number(value.to_string()),
-        (ColumnDefault::Float32 { bits }, DataType::Float32) => {
-            number(f32::from_bits(*bits).to_string())
-        }
-        (ColumnDefault::Float64 { bits }, DataType::Float64) => {
-            number(f64::from_bits(*bits).to_string())
-        }
+        ) => build::integer(i64::from(*value)),
+        (ColumnDefault::Int64(value), DataType::Int64) => build::integer(*value),
+        (ColumnDefault::Float32 { bits }, DataType::Float32) => literal(ast::LiteralKind::Double(
+            ast::DoubleValue::from_f64(f64::from(f32::from_bits(*bits))),
+        )),
+        (ColumnDefault::Float64 { bits }, DataType::Float64) => literal(ast::LiteralKind::Double(
+            ast::DoubleValue::from_f64(f64::from_bits(*bits)),
+        )),
         (
             ColumnDefault::Decimal {
                 unscaled,
@@ -790,9 +734,9 @@ fn default_to_expr(default: &ColumnDefault, data_type: &DataType) -> Result<ast:
                 scale,
             },
             DataType::Decimal128(target_precision, target_scale),
-        ) if precision == target_precision && scale == target_scale => {
-            number(format_decimal(*unscaled, *scale)?)
-        }
+        ) if precision == target_precision && scale == target_scale => literal(
+            ast::LiteralKind::Decimal(format_decimal(*unscaled, *scale)?),
+        ),
         (ColumnDefault::String(value), DataType::Utf8 | DataType::LargeUtf8) => {
             string(value.clone())
         }
@@ -956,16 +900,12 @@ fn typed_write_literal_source(
     encoded: Option<&mut Option<Vec<u8>>>,
 ) -> Result<ast::Expr, String> {
     match &mut expression {
-        ast::Expr::Nested(nested) => {
-            *nested.expression =
-                typed_write_literal_source((*nested.expression).clone(), target, encoded)?;
-        }
         ast::Expr::Cast(cast)
             if is_variant_cast(cast)
                 && target.logical_type() == novarocks_type_contract::ValueLogicalType::Variant =>
         {
-            if let Some(syntax) = constant_variant_in(&cast.expr, encoded)? {
-                *cast.expr = syntax;
+            if let Some(syntax) = constant_variant_in(&cast.expression, encoded)? {
+                cast.expression = syntax;
             }
         }
         _ => {}
@@ -1010,12 +950,11 @@ pub(crate) fn attach_write_literal_contexts(
     let ast::SetExpr::Select(select) = query.body.as_ref() else {
         return Ok(assignments);
     };
-    let assignments = if select.projection.iter().all(|item| {
-        matches!(
-            item,
-            ast::SelectItem::UnnamedExpr(_) | ast::SelectItem::ExprWithAlias { .. }
-        )
-    }) {
+    let assignments = if select
+        .projection
+        .iter()
+        .all(|item| matches!(item, ast::SelectItem::SingleColumn(_)))
+    {
         let mut sites = Vec::new();
         sites
             .try_reserve_exact(assignments.sites().len())
@@ -1032,10 +971,9 @@ pub(crate) fn attach_write_literal_contexts(
         for site in assignments.sites() {
             control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 1)?;
             let site = match select.projection.get(site.output_ordinal()) {
-                Some(
-                    ast::SelectItem::UnnamedExpr(expr)
-                    | ast::SelectItem::ExprWithAlias { expr, .. },
-                ) => site.clone().with_source_span(expr.span()),
+                Some(ast::SelectItem::SingleColumn(column)) => {
+                    site.clone().with_source_span(column.expression.span())
+                }
                 _ => site.clone(),
             };
             sites.push(site);
@@ -1048,42 +986,40 @@ pub(crate) fn attach_write_literal_contexts(
         assignments
     };
 
-    let [from] = select.from.as_slice() else {
-        return Ok(assignments);
-    };
-    if !from.joins.is_empty() {
-        return Ok(assignments);
-    }
-    let ast::TableFactor::Derived {
-        subquery,
-        alias: Some(alias),
-        ..
-    } = &from.relation
+    let Some((subquery, alias, relation_path)) = select.from.as_ref().and_then(derived_source)
     else {
         return Ok(assignments);
     };
-    if alias.name.value != "__nr_insert_src" {
+    if alias.alias.value != "__nr_insert_src" {
         return Ok(assignments);
     }
     let mut contexts = Vec::new();
     for site in assignments.sites() {
         control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 1)?;
-        let Some(ast::SelectItem::ExprWithAlias { expr, .. } | ast::SelectItem::UnnamedExpr(expr)) =
+        let Some(ast::SelectItem::SingleColumn(column)) =
             select.projection.get(site.output_ordinal())
         else {
             continue;
         };
-        let ast::Expr::CompoundIdentifier(parts) = expr else {
+        let expr = &column.expression;
+        let Some(chain) = ast::identifier_chain_observed(expr, |_| {
+            control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 1)
+        })?
+        else {
             continue;
         };
-        let [qualifier, name] = parts.parts.as_slice() else {
+        if chain.len() != 2 {
             continue;
-        };
-        if qualifier.value != alias.name.value {
+        }
+        let qualifier = chain.first();
+        let name = chain.last();
+        if qualifier.value != alias.alias.value {
             continue;
         }
         let ordinal = alias
-            .columns
+            .column_names
+            .as_deref()
+            .unwrap_or(&[])
             .iter()
             .position(|column| column.value == name.value)
             .ok_or_else(|| {
@@ -1091,7 +1027,9 @@ pub(crate) fn attach_write_literal_contexts(
                     "INSERT source reference lost its original alias ordinal".into(),
                 )
             })?;
-        let mut path = vec![SqlConstantQueryStep::SelectFromDerived { from: 0 }];
+        let mut path = vec![SqlConstantQueryStep::SelectFromDerived {
+            relation_path: relation_path.clone(),
+        }];
         append_write_literal_sites(
             &subquery.body,
             ordinal,
@@ -1116,40 +1054,66 @@ pub(crate) fn attach_write_literal_contexts(
 }
 /// Keep early assignment within the original literal INSERT sources. Source
 /// controls retain their independent inference above this boundary.
+/// Observe only the original single derived-source profile and its actual wrapper path.
+fn derived_source(
+    relation: &ast::Relation,
+) -> Option<(
+    &ast::Query,
+    &ast::AliasedRelation,
+    Vec<novarocks_sql::compiler::SqlRelationStep>,
+)> {
+    let ast::Relation::Aliased(alias) = relation else {
+        return None;
+    };
+    let query = match alias.relation.as_ref() {
+        ast::Relation::TableSubquery(node) => &node.query,
+        ast::Relation::Lateral(node) => &node.query,
+        _ => return None,
+    };
+    Some((
+        query,
+        alias,
+        vec![novarocks_sql::compiler::SqlRelationStep::Aliased],
+    ))
+}
+
 fn source_assignment_before_common_type(query: &ast::Query) -> bool {
-    if query.with.is_some()
-        || !query.order_by.is_empty()
-        || query.limit.is_some()
-        || query.offset.is_some()
-        || query.fetch.is_some()
+    if !query.functions.is_empty()
+        || query.with.is_some()
+        || query.modifiers.order_by.is_some()
+        || query.modifiers.limit.is_some()
+        || query.modifiers.offset.is_some()
     {
         return false;
     }
     fn eligible(body: &ast::SetExpr) -> bool {
         match body {
+            ast::SetExpr::Table(_) => false,
             ast::SetExpr::Values(_) => true,
             ast::SetExpr::Select(select) => {
-                select.from.is_empty()
-                    && !matches!(select.quantifier, ast::SelectQuantifier::Distinct { .. })
+                select.modifiers.is_empty()
+                    && select.from.is_none()
+                    && !select.distinct
                     && select.selection.is_none()
-                    && matches!(select.group_by, ast::GroupBy::None)
+                    && select.group_by.is_none()
                     && select.having.is_none()
-                    && select.qualify.is_none()
                     && select.windows.is_empty()
                     && select.projection.iter().all(|item| match item {
-                        ast::SelectItem::UnnamedExpr(expr)
-                        | ast::SelectItem::ExprWithAlias { expr, .. } => {
-                            super::command::is_literal_expr(expr)
+                        ast::SelectItem::SingleColumn(column) => {
+                            super::command::is_literal_expr(&column.expression)
                         }
                         _ => false,
                     })
             }
-            ast::SetExpr::Query(query) => source_assignment_before_common_type(query),
+            ast::SetExpr::Query(subquery) => {
+                let query = &subquery.query;
+                source_assignment_before_common_type(query)
+            }
             ast::SetExpr::SetOperation(operation) => {
                 matches!(operation.operator, ast::SetOperator::Union)
-                    && operation.quantifier == ast::SetQuantifier::All
-                    && eligible(&operation.left)
-                    && eligible(&operation.right)
+                    && !operation.distinct
+                    && operation.corresponding.is_none()
+                    && operation.inputs.iter().all(eligible)
             }
         }
     }
@@ -1171,9 +1135,20 @@ fn append_write_literal_sites(
     use novarocks_type_contract::PureCompileControl;
     control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 1)?;
     match body {
+        ast::SetExpr::Table(_) => {
+            return Err(novarocks_sql::compiler::SqlCompileError::InvalidRequest(
+                "TABLE query bodies are not literal write sources".into(),
+            ));
+        }
         ast::SetExpr::Values(values) => {
-            for (row, values) in values.rows.iter().enumerate() {
-                if source_ordinal >= values.len() {
+            for (row, value) in values.rows.iter().enumerate() {
+                let cells = ast::ValuesRowCells::new(value);
+                if cells.has_named_fields() {
+                    return Err(novarocks_sql::compiler::SqlCompileError::InvalidRequest(
+                        "VALUES write context does not support named row fields".into(),
+                    ));
+                }
+                if source_ordinal >= cells.len() {
                     continue;
                 }
                 let context = SqlWriteLiteralContext::new(
@@ -1192,12 +1167,11 @@ fn append_write_literal_sites(
             }
         }
         ast::SetExpr::Select(select) => {
-            if select.projection.iter().all(|item| {
-                matches!(
-                    item,
-                    ast::SelectItem::UnnamedExpr(_) | ast::SelectItem::ExprWithAlias { .. }
-                )
-            }) && source_ordinal < select.projection.len()
+            if select
+                .projection
+                .iter()
+                .all(|item| matches!(item, ast::SelectItem::SingleColumn(_)))
+                && source_ordinal < select.projection.len()
             {
                 let context = SqlWriteLiteralContext::new(
                     path.clone(),
@@ -1213,7 +1187,8 @@ fn append_write_literal_sites(
                 });
             }
         }
-        ast::SetExpr::Query(query) => {
+        ast::SetExpr::Query(subquery) => {
+            let query = &subquery.query;
             path.push(Step::NestedQuery);
             append_write_literal_sites(
                 &query.body,
@@ -1227,11 +1202,8 @@ fn append_write_literal_sites(
             path.pop();
         }
         ast::SetExpr::SetOperation(operation) => {
-            for (step, child) in [
-                (Step::UnionLeft, &operation.left),
-                (Step::UnionRight, &operation.right),
-            ] {
-                path.push(step);
+            for (index, child) in operation.inputs.iter().enumerate() {
+                path.push(Step::SetOperand { index });
                 append_write_literal_sites(
                     child,
                     source_ordinal,
@@ -1267,22 +1239,43 @@ pub(crate) fn capture_typed_write_constants(
         path: Vec::new(),
         constants: Vec::new(),
     };
+    let mut captured_derived = false;
     if let ast::SetExpr::Select(select) = query.body.as_mut()
-        && select.from.len() == 1
-        && let ast::TableFactor::Derived {
-            subquery,
-            alias: Some(alias),
-            ..
-        } = &mut select.from[0].relation
-        && alias.name.value == "__nr_insert_src"
+        && let Some(ast::Relation::Aliased(alias)) = select.from.as_mut()
+        && alias.alias.value == "__nr_insert_src"
     {
-        source.path.push(Step::SelectFromDerived { from: 0 });
-        capture_typed_write_body(&mut subquery.body, &mapping, write_columns, &mut source)?;
-    } else {
+        let subquery = match alias.relation.as_mut() {
+            ast::Relation::TableSubquery(node) => Some(&mut node.query),
+            ast::Relation::Lateral(node) => Some(&mut node.query),
+            _ => None,
+        };
+        if let Some(subquery) = subquery {
+            source.path.push(Step::SelectFromDerived {
+                relation_path: vec![novarocks_sql::compiler::SqlRelationStep::Aliased],
+            });
+            capture_typed_write_body(&mut subquery.body, &mapping, write_columns, &mut source)?;
+            source.pop();
+            captured_derived = true;
+        }
+    }
+    if !captured_derived {
         capture_typed_write_body(&mut query.body, &mapping, write_columns, &mut source)?;
     }
     Ok((!source.constants.is_empty()).then(|| source.constants.into()))
 }
+fn values_cell_mut(row: &mut ast::Expr, index: usize) -> Result<Option<&mut ast::Expr>, String> {
+    match row {
+        ast::Expr::Row(row) => {
+            if row.fields.iter().any(|field| field.name.is_some()) {
+                return Err("VALUES write constants do not support named row fields".into());
+            }
+            Ok(row.fields.get_mut(index).map(|field| &mut field.expression))
+        }
+        expression if index == 0 => Ok(Some(expression)),
+        _ => Ok(None),
+    }
+}
+
 fn capture_typed_write_body(
     body: &mut ast::SetExpr,
     mapping: &[Option<usize>],
@@ -1304,7 +1297,7 @@ fn capture_typed_write_body(
                 .declared_value_type()
                 .map_err(|error| error.to_string())?;
             if target.logical_type() != novarocks_type_contract::ValueLogicalType::Variant
-                || explicit_variant_source_path(expression).is_none()
+                || !is_explicit_variant_cast(expression)
             {
                 return Ok(());
             }
@@ -1321,11 +1314,12 @@ fn capture_typed_write_body(
             Ok(())
         };
     match body {
+        ast::SetExpr::Table(_) => {}
         ast::SetExpr::Values(values) => {
             for (row_index, row) in values.rows.iter_mut().enumerate() {
                 for (target, source_index) in columns.iter().zip(mapping) {
                     if let Some(index) = source_index
-                        && let Some(expression) = row.get_mut(*index)
+                        && let Some(expression) = values_cell_mut(row, *index)?
                     {
                         capture(
                             expression,
@@ -1340,23 +1334,19 @@ fn capture_typed_write_body(
             }
         }
         ast::SetExpr::Select(select) => {
-            if select.projection.iter().any(|item| {
-                !matches!(
-                    item,
-                    ast::SelectItem::UnnamedExpr(_) | ast::SelectItem::ExprWithAlias { .. }
-                )
-            }) {
+            if select
+                .projection
+                .iter()
+                .any(|item| !matches!(item, ast::SelectItem::SingleColumn(_)))
+            {
                 return Ok(());
             }
             for (target, source_index) in columns.iter().zip(mapping) {
                 if let Some(index) = source_index
-                    && let Some(
-                        ast::SelectItem::UnnamedExpr(expression)
-                        | ast::SelectItem::ExprWithAlias {
-                            expr: expression, ..
-                        },
-                    ) = select.projection.get_mut(*index)
+                    && let Some(ast::SelectItem::SingleColumn(column)) =
+                        select.projection.get_mut(*index)
                 {
+                    let expression = &mut column.expression;
                     capture(
                         expression,
                         Site::SelectProjection { column: *index },
@@ -1365,21 +1355,22 @@ fn capture_typed_write_body(
                 }
             }
         }
-        ast::SetExpr::Query(query) => {
+        ast::SetExpr::Query(subquery) => {
+            let query = &mut subquery.query;
             source.push(Step::NestedQuery);
             capture_typed_write_body(&mut query.body, mapping, columns, source)?;
             source.pop();
         }
         ast::SetExpr::SetOperation(operation)
             if matches!(operation.operator, ast::SetOperator::Union)
-                && matches!(operation.quantifier, ast::SetQuantifier::All) =>
+                && !operation.distinct
+                && operation.corresponding.is_none() =>
         {
-            source.push(Step::UnionLeft);
-            capture_typed_write_body(&mut operation.left, mapping, columns, source)?;
-            source.pop();
-            source.push(Step::UnionRight);
-            capture_typed_write_body(&mut operation.right, mapping, columns, source)?;
-            source.pop();
+            for (index, input) in operation.inputs.iter_mut().enumerate() {
+                source.push(Step::SetOperand { index });
+                capture_typed_write_body(input, mapping, columns, source)?;
+                source.pop();
+            }
         }
         // The existing constant holder never admitted DISTINCT set paths.
         ast::SetExpr::SetOperation(_) => {}
@@ -1391,10 +1382,7 @@ fn capture_typed_write_body(
 mod typed_write_source_tests {
     use super::*;
     fn query(sql: &str) -> ast::Query {
-        let statements = novarocks_parser::parse(sql).unwrap();
-        let [ast::Statement::Query(query)] = statements.as_slice() else {
-            panic!("query");
-        };
+        let query = novarocks_parser::parser::parse_query(sql).unwrap();
         query.clone()
     }
     fn column(name: &str, ty: DataType) -> ColumnDef {
@@ -1421,21 +1409,33 @@ mod typed_write_source_tests {
             panic!("VALUES");
         };
         assert!(
-            matches!(&values.rows[0][0], ast::Expr::Literal(ast::Literal { kind: ast::LiteralKind::String(bytes), .. }) if bytes == "abc")
+            matches!(ast::ValuesRowCells::new(&values.rows[0]).get(0).unwrap(), ast::Expr::Literal(ast::Literal { kind: ast::LiteralKind::String(bytes), .. }) if bytes == "abc")
         );
-        assert!(
-            matches!(&values.rows[0][1], ast::Expr::Literal(ast::Literal { kind: ast::LiteralKind::Number(coefficient), .. }) if coefficient == "9007199254740993")
-        );
+        assert!(matches!(
+            ast::ValuesRowCells::new(&values.rows[0]).get(1).unwrap(),
+            ast::Expr::Literal(ast::Literal {
+                kind: ast::LiteralKind::Long {
+                    parsed_value: 9007199254740993,
+                    ..
+                },
+                ..
+            })
+        ));
     }
     #[test]
     fn write_source_general_distinct_union_limit_keeps_its_complete_semantics() {
         use ast::SyntaxEq;
         let columns = vec![column("p", DataType::Int64)];
         for sql in [
+            "SELECT '1' AS p LIMIT 0",
+            "SELECT '1' AS p OFFSET 1",
+            "SELECT '1' AS p ORDER BY p",
+            "SELECT '1' AS p FETCH FIRST 1 ROW ONLY",
             "SELECT DISTINCT '1' AS p ORDER BY p LIMIT 1",
             "SELECT '1' AS p UNION SELECT '01' AS p",
         ] {
             let source = query(sql);
+            assert!(!source_assignment_before_common_type(&source), "{sql}");
             assert!(
                 shape_typed_write_source(&source, &[], &columns, &columns, None)
                     .unwrap()
@@ -1444,6 +1444,26 @@ mod typed_write_source_tests {
             assert!(source.syntax_eq(&query(sql)));
         }
     }
+    #[test]
+    fn corresponding_union_does_not_enter_positional_literal_assignment() {
+        let columns = vec![column("p", DataType::Int64)];
+        let mut source = query("SELECT 1 AS p UNION ALL SELECT 2 AS p UNION ALL SELECT 3 AS p");
+        let ast::SetExpr::SetOperation(operation) = source.body.as_mut() else {
+            panic!("set operation");
+        };
+        operation.corresponding = Some(ast::Corresponding {
+            columns: Vec::new(),
+            span: operation.span,
+        });
+        assert!(!source_assignment_before_common_type(&source));
+        assert!(body_has_distinct_set(&source.body));
+        assert!(
+            shape_typed_write_source(&source, &[], &columns, &columns, None)
+                .unwrap()
+                .is_none()
+        );
+    }
+
     #[test]
     fn explicit_variant_capture_keeps_source_domain_and_constant_holder() {
         use novarocks_sql::compiler::SqlCompileControl;
@@ -1474,18 +1494,21 @@ mod typed_write_source_tests {
         let ast::SetExpr::Select(select) = source.body.as_ref() else {
             panic!("SELECT");
         };
-        let ast::SelectItem::ExprWithAlias {
-            expr: ast::Expr::Cast(cast),
-            ..
-        } = &select.projection[0]
-        else {
+        let ast::SelectItem::SingleColumn(single_column) = &select.projection[0] else {
             panic!("original explicit CAST");
         };
+        let Some(_) = &single_column.alias else {
+            panic!("original explicit CAST");
+        };
+        let ast::Expr::Cast(cast) = &single_column.expression else {
+            panic!("original explicit CAST");
+        };
+
         assert!(is_variant_cast(cast));
         assert!(matches!(
-            cast.expr.as_ref(),
+            &cast.expression,
             ast::Expr::Literal(ast::Literal {
-                kind: ast::LiteralKind::HexString(_),
+                kind: ast::LiteralKind::Binary(_),
                 ..
             })
         ));

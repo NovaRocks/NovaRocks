@@ -19,16 +19,14 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE DATABASE iceberg_rest_${suite_uuid0}.rwm13_roll_${uuid0};
-CREATE TABLE iceberg_rest_${suite_uuid0}.rwm13_roll_${uuid0}.t (p BIGINT, id BIGINT)
-PARTITION BY (p)
-TBLPROPERTIES ("write.target-file-size-bytes" = "1024", "write.parquet.row-group-size-bytes" = "512");
+CREATE SCHEMA iceberg_rest_${suite_uuid0}.rwm13_roll_${uuid0};
+CREATE TABLE iceberg_rest_${suite_uuid0}.rwm13_roll_${uuid0}.t (p BIGINT, id BIGINT) WITH (partitioning = ARRAY['p'], target_max_file_size = '1024B', parquet_writer_row_group_size = '512B');
 INSERT INTO iceberg_rest_${suite_uuid0}.rwm13_roll_${uuid0}.t
 SELECT CAST(1 AS BIGINT), generate_series FROM TABLE(generate_series(1, 20000));
 
 -- query 2
 SELECT count(*) > 1 AS rolled, sum(record_count) AS rows_in_files
-FROM iceberg_rest_${suite_uuid0}.rwm13_roll_${uuid0}.t$files WHERE content = 0;
+FROM iceberg_rest_${suite_uuid0}.rwm13_roll_${uuid0}."t$files" WHERE content = 0;
 
 -- query 3
 SELECT count(*) AS n, sum(id) AS id_sum FROM iceberg_rest_${suite_uuid0}.rwm13_roll_${uuid0}.t;
@@ -36,5 +34,5 @@ SELECT count(*) AS n, sum(id) AS id_sum FROM iceberg_rest_${suite_uuid0}.rwm13_r
 -- query 4
 -- @cleanup=true
 -- @skip_result_check=true
-DROP TABLE IF EXISTS iceberg_rest_${suite_uuid0}.rwm13_roll_${uuid0}.t FORCE;
-DROP DATABASE IF EXISTS iceberg_rest_${suite_uuid0}.rwm13_roll_${uuid0};
+DROP TABLE IF EXISTS iceberg_rest_${suite_uuid0}.rwm13_roll_${uuid0}.t ;
+DROP SCHEMA IF EXISTS iceberg_rest_${suite_uuid0}.rwm13_roll_${uuid0};

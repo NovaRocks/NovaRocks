@@ -62,9 +62,9 @@ SELECT JSON '1.0' IN (JSON '1.00') AS included;
 -- json_inlist_object: True
 SELECT JSON '{"b":1,"a":2}' IN (JSON '{"a":2,"b":1}') AS included;
 -- isolated_surrogate: True
-SELECT JSON '"\\ud800"' IN (SELECT JSON '"\\uD800"') AS included;
+SELECT JSON '"\ud800"' IN (SELECT JSON '"\uD800"') AS included;
 -- unicode_keys: True
-SELECT JSON '{"\\uffff":1,"\\ud800\\udc00":2,"z":3,"é":4}' IN (SELECT JSON '{"é":4,"z":3,"𐀀":2,"￿":1}') AS included;
+SELECT JSON '{"\uffff":1,"\ud800\udc00":2,"z":3,"é":4}' IN (SELECT JSON '{"é":4,"z":3,"𐀀":2,"￿":1}') AS included;
 -- Invalid logically JSON values fail as Data, including equal raw text.
 -- @expect_error=[query.execution.invalid_data]
 SELECT JSON 'not JSON' IN (SELECT JSON 'not JSON') AS included;

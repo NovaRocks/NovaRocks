@@ -31,54 +31,31 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE EXTERNAL CATALOG mv_read_sem_part_v3_${uuid0}
-PROPERTIES (
-  "type" = "iceberg",
-  "iceberg.catalog.type" = "rest",
-  "uri" = "${iceberg_rest_uri}",
-  "warehouse" = "${iceberg_rest_warehouse}",
-  "aws.s3.endpoint" = "${oss_endpoint}",
-  "credential.object-store-metadata.consumer-role" = "frontend",
-  "credential.object-store-metadata.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-metadata.name" = "${iceberg_object_store_metadata_credential_name}",
-  "credential.object-store-metadata.generation" = "${iceberg_object_store_credential_generation}",
-  "credential.object-store-data.consumer-role" = "backend",
-  "credential.object-store-data.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-data.name" = "${iceberg_object_store_data_credential_name}",
-  "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
-  "aws.s3.region" = "${oss_region}",
-  "aws.s3.enable_path_style_access" = "${oss_path_style}"
-);
-CREATE DATABASE mv_read_sem_part_v3_${uuid0}.ns_${uuid0};
+CREATE CATALOG mv_read_sem_part_v3_${uuid0} USING iceberg WITH ("iceberg.catalog.type" = 'rest', "uri" = '${iceberg_rest_uri}', "warehouse" = '${iceberg_rest_warehouse}', "aws.s3.endpoint" = '${oss_endpoint}', "credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-metadata.name" = '${iceberg_object_store_metadata_credential_name}', "credential.object-store-metadata.generation" = '${iceberg_object_store_credential_generation}', "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-data.name" = '${iceberg_object_store_data_credential_name}', "credential.object-store-data.generation" = '${iceberg_object_store_credential_generation}', "aws.s3.region" = '${oss_region}', "aws.s3.enable_path_style_access" = '${oss_path_style}');
+CREATE SCHEMA mv_read_sem_part_v3_${uuid0}.ns_${uuid0};
 CREATE TABLE mv_read_sem_part_v3_${uuid0}.ns_${uuid0}.orders (
   id BIGINT NOT NULL,
   customer STRING,
   amount BIGINT
-)
-PARTITION BY (customer)
-TBLPROPERTIES ("format-version" = "3",
-  "write.row-lineage" = "true");
+) WITH (partitioning = ARRAY['customer'], format_version = 3);
 INSERT INTO mv_read_sem_part_v3_${uuid0}.ns_${uuid0}.orders VALUES
-  (1, 'A', 10),
-  (2, 'A', 20);
+  ROW(1, 'A', 10),
+  ROW(2, 'A', 20);
 
 -- query 2
 -- @skip_result_check=true
-ALTER TABLE mv_read_sem_part_v3_${uuid0}.ns_${uuid0}.orders DROP PARTITION COLUMN customer;
+ALTER TABLE mv_read_sem_part_v3_${uuid0}.ns_${uuid0}.orders SET PROPERTIES partitioning = CAST(ARRAY[] AS ARRAY(VARCHAR));
 
 -- query 3
 -- @skip_result_check=true
 INSERT INTO mv_read_sem_part_v3_${uuid0}.ns_${uuid0}.orders VALUES
-  (3, 'B', 30),
-  (4, 'B', 40);
+  ROW(3, 'B', 30),
+  ROW(4, 'B', 40);
 
 -- query 4
 -- @skip_result_check=true
 USE mv_read_sem_part_v3_${uuid0}.ns_${uuid0};
-CREATE MATERIALIZED VIEW mv_read_sem_part_v3_orders
-DISTRIBUTED BY HASH(id) BUCKETS 2
-PROPERTIES ('storage_engine' = 'iceberg')
-AS SELECT id, customer, amount
+CREATE MATERIALIZED VIEW mv_read_sem_part_v3_orders AS SELECT id, customer, amount
 FROM orders
 WHERE amount >= 10;
 
@@ -113,6 +90,6 @@ ORDER BY id;
 -- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW mv_read_sem_part_v3_orders;
-DROP TABLE mv_read_sem_part_v3_${uuid0}.ns_${uuid0}.orders FORCE;
-DROP DATABASE mv_read_sem_part_v3_${uuid0}.ns_${uuid0};
+DROP TABLE mv_read_sem_part_v3_${uuid0}.ns_${uuid0}.orders ;
+DROP SCHEMA mv_read_sem_part_v3_${uuid0}.ns_${uuid0};
 DROP CATALOG mv_read_sem_part_v3_${uuid0};

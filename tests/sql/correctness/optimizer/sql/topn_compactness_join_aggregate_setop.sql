@@ -25,10 +25,8 @@ DROP TABLE IF EXISTS ${case_db}.topn_compactness_left_src;
 DROP TABLE IF EXISTS ${case_db}.topn_compactness_right_src;
 -- Keep the historical no-column-statistics cost premise: this case tests TopN
 -- compactness guards, not whether write-time NDV selects a single aggregate.
-CREATE TABLE ${case_db}.topn_compactness_left_src (id INT, score INT)
-TBLPROPERTIES ('novarocks.statistics.collect-on-write' = 'false');
-CREATE TABLE ${case_db}.topn_compactness_right_src (id INT, score INT)
-TBLPROPERTIES ('novarocks.statistics.collect-on-write' = 'false');
+CREATE TABLE ${case_db}.topn_compactness_left_src (id INT, score INT) WITH (statistics_collect_on_write = false);
+CREATE TABLE ${case_db}.topn_compactness_right_src (id INT, score INT) WITH (statistics_collect_on_write = false);
 INSERT INTO ${case_db}.topn_compactness_left_src
     SELECT generate_series, generate_series
     FROM TABLE(generate_series(1, 100000));
@@ -44,7 +42,7 @@ INSERT INTO ${case_db}.topn_compactness_right_src
 -- @result_contains=id ASC
 -- @result_contains=topn_compactness_left_src
 -- @result_contains=topn_compactness_right_src
-EXPLAIN VERBOSE
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
 SELECT id, score
 FROM (
     SELECT id, score
@@ -63,7 +61,7 @@ LIMIT 2;
 -- @result_contains=LOCAL TOP-N (limit=1, offset=0)
 -- @result_contains=sum(score) DESC
 -- @result_not_contains=LOCAL TOP-N (limit=2, offset=0)
-EXPLAIN VERBOSE
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
 SELECT id, SUM(score) AS total_score
 FROM (
     SELECT id, score
@@ -81,7 +79,7 @@ LIMIT 1;
 -- @result_contains=LOCAL TOP-N (limit=1, offset=0)
 -- @result_contains=HASH JOIN (
 -- @result_contains=INNER, eq:
-EXPLAIN VERBOSE
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
 SELECT l.id, l.score, r.score AS rhs_score
 FROM ${case_db}.topn_compactness_left_src l
 INNER JOIN ${case_db}.topn_compactness_right_src r ON l.id = r.id

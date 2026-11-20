@@ -31,19 +31,12 @@ CREATE TABLE ${case_db}.t_datetime_literal_sink (
   dt DATETIME
 );
 INSERT INTO ${case_db}.t_datetime_literal_src VALUES
-  (1, '2024-02-29 12:34:56'),
-  (2, '2024-02-30 00:00:00'),
-  (3, 'not-a-datetime'),
-  (4, NULL);
+  ROW(1, '2024-02-29 12:34:56'),
+  ROW(2, '2024-02-30 00:00:00'),
+  ROW(3, 'not-a-datetime'),
+  ROW(4, NULL);
 INSERT INTO ${case_db}.t_datetime_literal_sink
-SELECT
-  id,
-  CASE
-    WHEN raw_dt IS NULL THEN NULL
-    WHEN raw_dt = '2024-02-29 12:34:56' THEN CAST('2024-02-29 12:34:56' AS DATETIME)
-    ELSE NULL
-  END AS dt
-FROM ${case_db}.t_datetime_literal_src;
+SELECT id, CASE WHEN (raw_dt IS NULL) THEN NULL WHEN (raw_dt = '2024-02-29 12:34:56') THEN CAST('2024-02-29 12:34:56' AS TIMESTAMP) ELSE NULL END AS dt FROM ${case_db}.t_datetime_literal_src;
 SELECT
   id,
   dt,

@@ -520,8 +520,8 @@ mod typed_legacy {
                 right,
                 ..
             } => {
-                split_and_inner(*left, out);
-                split_and_inner(*right, out);
+                split_and_inner(left.into_inner(), out);
+                split_and_inner(right.into_inner(), out);
             }
             _ => out.push(expr),
         }
@@ -538,9 +538,9 @@ mod typed_legacy {
                 ),
 
                 kind: ExprKind::BinaryOp {
-                    left: Box::new(left),
+                    left: novarocks_parser::ast::AstBox::new(left),
                     op: BinOp::And,
-                    right: Box::new(result),
+                    right: novarocks_parser::ast::AstBox::new(result),
                     decimal_overflow_policy:
                         novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 },
@@ -923,9 +923,9 @@ mod column_id_helper_tests {
         let id_right = ColumnId::new_for_test(2);
         let expr = TypedExpr {
             kind: ExprKind::BinaryOp {
-                left: Box::new(col_ref_expr(id_left)),
+                left: novarocks_parser::ast::AstBox::new(col_ref_expr(id_left)),
                 op: crate::analysis::BinOp::Eq,
-                right: Box::new(col_ref_expr(id_right)),
+                right: novarocks_parser::ast::AstBox::new(col_ref_expr(id_right)),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
@@ -1116,9 +1116,11 @@ mod column_id_helper_tests {
         let computed_item = ProjectItem {
             expr: TypedExpr {
                 kind: crate::analysis::ExprKind::BinaryOp {
-                    left: Box::new(col_ref_expr(pass_id)),
+                    left: novarocks_parser::ast::AstBox::new(col_ref_expr(pass_id)),
                     op: BinOp::Add,
-                    right: Box::new(col_ref_expr(ColumnId::new_for_test(11))),
+                    right: novarocks_parser::ast::AstBox::new(col_ref_expr(
+                        ColumnId::new_for_test(11),
+                    )),
                     decimal_overflow_policy:
                         novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 },
@@ -1273,9 +1275,9 @@ mod column_id_helper_tests {
     fn eq_expr(left: TypedExpr, right: TypedExpr) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::BinaryOp {
-                left: Box::new(left),
+                left: novarocks_parser::ast::AstBox::new(left),
                 op: crate::analysis::BinOp::Eq,
-                right: Box::new(right),
+                right: novarocks_parser::ast::AstBox::new(right),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
@@ -1285,9 +1287,9 @@ mod column_id_helper_tests {
     fn and_expr(left: TypedExpr, right: TypedExpr) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::BinaryOp {
-                left: Box::new(left),
+                left: novarocks_parser::ast::AstBox::new(left),
                 op: crate::analysis::BinOp::And,
-                right: Box::new(right),
+                right: novarocks_parser::ast::AstBox::new(right),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
@@ -1375,9 +1377,9 @@ mod column_id_helper_tests {
         assert!(test_join_equi_keys(&two_table_join(None)).is_empty());
         let gt = TypedExpr {
             kind: ExprKind::BinaryOp {
-                left: Box::new(qcol("l", "a", 1)),
+                left: novarocks_parser::ast::AstBox::new(qcol("l", "a", 1)),
                 op: crate::analysis::BinOp::Gt,
-                right: Box::new(qcol("r", "b", 2)),
+                right: novarocks_parser::ast::AstBox::new(qcol("r", "b", 2)),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
@@ -1389,7 +1391,8 @@ mod column_id_helper_tests {
     fn join_equi_keys_peels_cast_wrapper() {
         let cast_col = TypedExpr {
             kind: ExprKind::Cast {
-                expr: Box::new(qcol("l", "a", 1)),
+                array_failure_mode: None,
+                expr: novarocks_parser::ast::AstBox::new(qcol("l", "a", 1)),
                 target: DataType::Int64,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
@@ -1405,9 +1408,9 @@ mod column_id_helper_tests {
     fn join_equi_keys_excludes_null_safe_eq() {
         let cond = TypedExpr {
             kind: ExprKind::BinaryOp {
-                left: Box::new(qcol("l", "a", 1)),
+                left: novarocks_parser::ast::AstBox::new(qcol("l", "a", 1)),
                 op: crate::analysis::BinOp::EqForNull,
-                right: Box::new(qcol("r", "b", 2)),
+                right: novarocks_parser::ast::AstBox::new(qcol("r", "b", 2)),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
@@ -1419,9 +1422,9 @@ mod column_id_helper_tests {
     fn join_equi_keys_opt_excludes_null_safe_eq() {
         let cond = TypedExpr {
             kind: ExprKind::BinaryOp {
-                left: Box::new(qcol("l", "a", 1)),
+                left: novarocks_parser::ast::AstBox::new(qcol("l", "a", 1)),
                 op: crate::analysis::BinOp::EqForNull,
-                right: Box::new(qcol("r", "b", 2)),
+                right: novarocks_parser::ast::AstBox::new(qcol("r", "b", 2)),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),

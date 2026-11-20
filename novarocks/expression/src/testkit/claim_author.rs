@@ -70,6 +70,22 @@ impl ClaimAuthor {
             expected_result_type.as_ref(),
             control,
         );
+        Self::from_resolved_legacy_binding(
+            bound,
+            arguments,
+            shape,
+            expected_result_type,
+            constant_policy,
+        )
+    }
+
+    pub(super) fn from_resolved_legacy_binding(
+        bound: ResolvedFunctionBinding,
+        arguments: Vec<FunctionArgument>,
+        shape: ControlShape,
+        expected_result_type: Option<FunctionValueType>,
+        constant_policy: ConstantPolicy,
+    ) -> Self {
         let selected = Arc::new(bound.selected);
         let FunctionResultType::Scalar(result) = &selected.result_type else {
             panic!("scalar owner")

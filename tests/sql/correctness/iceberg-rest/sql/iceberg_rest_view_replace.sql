@@ -24,7 +24,7 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE DATABASE iceberg_rest_${suite_uuid0}.iceberg_rest_vr_db_${uuid0};
+CREATE SCHEMA iceberg_rest_${suite_uuid0}.iceberg_rest_vr_db_${uuid0};
 
 -- query 2
 -- @skip_result_check=true
@@ -32,7 +32,7 @@ CREATE TABLE iceberg_rest_${suite_uuid0}.iceberg_rest_vr_db_${uuid0}.t_vr_${uuid
 
 -- query 3
 -- @skip_result_check=true
-INSERT INTO iceberg_rest_${suite_uuid0}.iceberg_rest_vr_db_${uuid0}.t_vr_${uuid0} VALUES (1, 'a'), (2, 'b');
+INSERT INTO iceberg_rest_${suite_uuid0}.iceberg_rest_vr_db_${uuid0}.t_vr_${uuid0} VALUES ROW(1, 'a'), ROW(2, 'b');
 
 -- query 4
 -- @skip_result_check=true
@@ -81,4 +81,4 @@ DROP TABLE iceberg_rest_${suite_uuid0}.iceberg_rest_vr_db_${uuid0}.t_vr_${uuid0}
 
 -- query 14
 -- @skip_result_check=true
-DROP DATABASE iceberg_rest_${suite_uuid0}.iceberg_rest_vr_db_${uuid0};
+DROP SCHEMA iceberg_rest_${suite_uuid0}.iceberg_rest_vr_db_${uuid0};

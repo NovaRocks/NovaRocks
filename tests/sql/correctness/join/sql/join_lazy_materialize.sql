@@ -30,7 +30,7 @@
 
 -- query 1
 -- @skip_result_check=true
-SET pipeline_dop = 1;
+SET SESSION pipeline_dop = 1;
 
 -- query 2
 -- @skip_result_check=true
@@ -59,8 +59,7 @@ CREATE TABLE ${case_db}.lm_t1 (
     t1_c3 INT NOT NULL,
     t1_c4 INT NOT NULL,
     t1_c5 INT NOT NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 8
 -- @skip_result_check=true
@@ -70,8 +69,7 @@ CREATE TABLE ${case_db}.lm_t2 (
     t2_c3 INT NOT NULL,
     t2_c4 INT NOT NULL,
     t2_c5 INT NOT NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 9
 -- @skip_result_check=true
@@ -81,8 +79,7 @@ CREATE TABLE ${case_db}.lm_nullable_t1 (
     t1_c3 INT,
     t1_c4 INT,
     t1_c5 INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 10
 -- @skip_result_check=true
@@ -92,44 +89,43 @@ CREATE TABLE ${case_db}.lm_nullable_t2 (
     t2_c3 INT,
     t2_c4 INT,
     t2_c5 INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 11
 -- @skip_result_check=true
 INSERT INTO ${case_db}.lm_t1 VALUES
-(1, 11, 111, 1111, 11111),
-(2, 22, 222, 2222, 22222),
-(3, 33, 333, 3333, 33333),
-(4, 44, 444, 4444, 44444),
-(5, 55, 555, 5555, 55555);
+ROW(1, 11, 111, 1111, 11111),
+ROW(2, 22, 222, 2222, 22222),
+ROW(3, 33, 333, 3333, 33333),
+ROW(4, 44, 444, 4444, 44444),
+ROW(5, 55, 555, 5555, 55555);
 
 -- query 12
 -- @skip_result_check=true
 INSERT INTO ${case_db}.lm_t2 VALUES
-(3, 44, 444, 444, 44444),
-(4, 33, 333, 333, 33333),
-(5, 55, 555, 5555, 55555),
-(6, 77, 777, 7777, 77777),
-(7, 66, 666, 6666, 66666);
+ROW(3, 44, 444, 444, 44444),
+ROW(4, 33, 333, 333, 33333),
+ROW(5, 55, 555, 5555, 55555),
+ROW(6, 77, 777, 7777, 77777),
+ROW(7, 66, 666, 6666, 66666);
 
 -- query 13
 -- @skip_result_check=true
 INSERT INTO ${case_db}.lm_nullable_t1 VALUES
-(1, 11, 111, 1111, 11111),
-(2, 22, 222, 2222, 22222),
-(3, 33, NULL, 3333, 33333),
-(4, 44, 444, 4444, 44444),
-(5, 55, 555, 5555, 55555);
+ROW(1, 11, 111, 1111, 11111),
+ROW(2, 22, 222, 2222, 22222),
+ROW(3, 33, NULL, 3333, 33333),
+ROW(4, 44, 444, 4444, 44444),
+ROW(5, 55, 555, 5555, 55555);
 
 -- query 14
 -- @skip_result_check=true
 INSERT INTO ${case_db}.lm_nullable_t2 VALUES
-(3, 44, 444, 4444, 44444),
-(4, 33, 333, 3333, 33333),
-(5, 55, 555, 5555, 55555),
-(6, 77, 777, NULL, 77777),
-(7, 77, 666, 6666, 66666);
+ROW(3, 44, 444, 4444, 44444),
+ROW(4, 33, 333, 3333, 33333),
+ROW(5, 55, 555, 5555, 55555),
+ROW(6, 77, 777, NULL, 77777),
+ROW(7, 77, 666, 6666, 66666);
 
 -- query 15
 -- @order_sensitive=true
@@ -225,7 +221,7 @@ SELECT t1_c3, t1_c4, t2_c3, t2_c4 FROM ${case_db}.lm_nullable_t1 LEFT OUTER JOIN
 
 -- query 31
 -- @skip_result_check=true
-SET pipeline_dop = 0;
+SET SESSION pipeline_dop = 0;
 
 -- query 32
 -- @skip_result_check=true

@@ -1864,7 +1864,7 @@ mod lifecycle_tests {
                         "--trino-port",
                         &port,
                         "--target-session-sql",
-                        "SET pipeline_dop = 2",
+                        "SET SESSION pipeline_dop = 2",
                         "--float-epsilon",
                         epsilon,
                         "--failure-artifact-dir",
@@ -1877,7 +1877,7 @@ mod lifecycle_tests {
                     assert!(
                         peer.finish()
                             .iter()
-                            .any(|query| query == "SET pipeline_dop = 2")
+                            .any(|query| query == "SET SESSION pipeline_dop = 2")
                     );
                     let records = fs::read_to_string(path)
                         .unwrap()

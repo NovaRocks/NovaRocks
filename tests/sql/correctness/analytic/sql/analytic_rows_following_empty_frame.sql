@@ -28,14 +28,13 @@ CREATE TABLE ${case_db}.t_analytic_rows_following_empty_frame (
     grp VARCHAR(10),
     ts INT,
     v INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t_analytic_rows_following_empty_frame VALUES
-    ('A', 1, 10),
-    ('A', 2, 20),
-    ('A', 3, NULL),
-    ('A', 4, 40);
+    ROW('A', 1, 10),
+    ROW('A', 2, 20),
+    ROW('A', 3, NULL),
+    ROW('A', 4, 40);
 
 SELECT
     grp,

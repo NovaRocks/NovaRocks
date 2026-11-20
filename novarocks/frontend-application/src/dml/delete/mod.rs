@@ -18,29 +18,41 @@
 //! Frontend-owned DELETE statement recognition and application routing.
 
 use crate::dml::error::DmlError;
-use crate::dml::service::DmlService;
-use crate::query_execution::dml::delete::DeleteStatement;
+use crate::query_execution::dml::delete::{OwnedDeleteStatement, PreparedPredicateDelete};
+use crate::query_execution::dml::mutation::RowMutationTarget;
 use novarocks_query_application::sql::dml_admission::DmlAdmissionError;
 
-impl DmlService {
-    /// Validate the parser-owned shape before forming a governed write action.
-    pub(crate) fn admit_delete_shape(
-        &self,
-        statement: DeleteStatement<'_>,
-        source: &str,
-    ) -> Result<(), DmlError> {
-        if let DeleteStatement::Predicate(delete) = statement
-            && delete.selection.is_none()
-        {
-            return Err(DmlError::admit(DmlAdmissionError::DeleteRequiresWhere.to_user_error(
+pub(crate) fn prepare_trino_delete_shape(
+    statement: novarocks_parser::ast::TrinoDelete,
+    source: &str,
+) -> Result<OwnedDeleteStatement, DmlError> {
+    if statement.table.query_period.is_some() {
+        return Err(DmlError::admit(
+            DmlAdmissionError::DeleteUnsupportedForm.to_user_error(
                 source,
-                delete.span,
-                "DELETE requires a WHERE clause; for full table replacement use INSERT OVERWRITE t SELECT * FROM t WHERE FALSE",
-            )));
-        }
-
-        Ok(())
+                statement.table.span,
+                "DELETE target cannot select a historical table snapshot",
+            ),
+        ));
     }
+    let delete = PreparedPredicateDelete {
+        target: RowMutationTarget::from_trino(statement.table.name, statement.table.branch),
+        selection: statement.predicate,
+        span: statement.span,
+    };
+    admit_predicate_delete(&delete, source)?;
+    Ok(OwnedDeleteStatement::Predicate(delete))
+}
+
+fn admit_predicate_delete(delete: &PreparedPredicateDelete, source: &str) -> Result<(), DmlError> {
+    if delete.selection.is_none() {
+        return Err(DmlError::admit(DmlAdmissionError::DeleteRequiresWhere.to_user_error(
+            source,
+            delete.span,
+            "DELETE requires a WHERE clause; for full table replacement use INSERT OVERWRITE t SELECT * FROM t WHERE FALSE",
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -69,5 +81,43 @@ mod execution_error_tests {
                 ),
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod trino_tests {
+    use super::*;
+    use novarocks_parser::{ast::TrinoStatement, parser};
+
+    #[test]
+    fn trino_delete_keeps_its_predicate_span_and_existing_where_admission() {
+        let sql = "DELETE FROM c.s.branch_named@dev WHERE id = 9";
+        let TrinoStatement::Delete(delete) = parser::parse_statement(sql).unwrap() else {
+            panic!("expected DELETE");
+        };
+        let OwnedDeleteStatement::Predicate(delete) =
+            prepare_trino_delete_shape(delete, sql).unwrap()
+        else {
+            panic!("expected predicate DELETE");
+        };
+        let (name, reference) = delete.target.table_and_reference().unwrap();
+        assert_eq!(name.parts, ["c", "s", "branch_named"]);
+        assert_eq!(reference, "dev");
+        let span = delete.selection.unwrap().span();
+        assert_eq!(&sql[span.start()..span.end()], "id = 9");
+
+        let sql = "DELETE FROM c.s.branch_named@dev";
+        let TrinoStatement::Delete(delete) = parser::parse_statement(sql).unwrap() else {
+            panic!("expected DELETE");
+        };
+        let error = prepare_trino_delete_shape(delete, sql).unwrap_err();
+        let error = error.user_error().unwrap();
+        assert_eq!(error.code().as_str(), "sql.admit.delete_requires_where");
+        assert!(
+            error
+                .message()
+                .starts_with("DELETE requires a WHERE clause")
+        );
+        assert_eq!(error.location().unwrap().column(), 1);
     }
 }

@@ -39,9 +39,8 @@ Spec 关键能力：
 
 NovaRocks 实现：读、写、INSERT / OVERWRITE / DELETE / UPDATE 全套都覆盖。
 
-```sql
-CREATE TABLE t (id BIGINT, v INT)
-TBLPROPERTIES ("format-version" = "2");
+``` sql
+CREATE TABLE t (id BIGINT, v INT) WITH (format_version = 2);
 ```
 
 ## ✅ V3
@@ -63,11 +62,8 @@ Spec 新增能力：
 | Partition stats puffin（`partition-stats-blob`） | ❌ | [deletion-vectors](deletion-vectors.md#puffin-blob-类型) |
 | `content-checksum` on manifest entries | ❌ | [storage-and-fileio](storage-and-fileio.md) |
 
-```sql
-CREATE TABLE t (id BIGINT, v INT)
-TBLPROPERTIES (
-  "format-version" = "3"
-);
+``` sql
+CREATE TABLE t (id BIGINT, v INT) WITH (format_version = 3);
 ```
 
 > NovaRocks 中写指定 branch、UPDATE / MERGE 要求 v3；row lineage 随格式版本提供，无需额外开关。
@@ -84,8 +80,8 @@ Spec：V1 不支持 row-level delete，仅 append + overwrite。
 
 PR #89 落地的 [SET / UNSET TBLPROPERTIES](schema-evolution.md#-set--unset-tblproperties) 显式把 `format-version` 列入 denylist：
 
-```sql
-ALTER TABLE t SET TBLPROPERTIES ('format-version' = '3');
+``` sql
+ALTER TABLE t SET PROPERTIES format_version = 3;
 -- ERROR: format-version is reserved; use UPGRADE TABLE syntax (not yet implemented in NovaRocks)
 ```
 

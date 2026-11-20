@@ -24,56 +24,31 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE EXTERNAL CATALOG ice_ivm_join_${uuid0}
-PROPERTIES (
-  "type" = "iceberg",
-  "iceberg.catalog.type" = "rest",
-  "uri" = "${iceberg_rest_uri}",
-  "warehouse" = "${iceberg_rest_warehouse}",
-  "aws.s3.endpoint" = "${oss_endpoint}",
-  "credential.object-store-metadata.consumer-role" = "frontend",
-  "credential.object-store-metadata.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-metadata.name" = "${iceberg_object_store_metadata_credential_name}",
-  "credential.object-store-metadata.generation" = "${iceberg_object_store_credential_generation}",
-  "credential.object-store-data.consumer-role" = "backend",
-  "credential.object-store-data.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-data.name" = "${iceberg_object_store_data_credential_name}",
-  "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
-  "aws.s3.region" = "${oss_region}",
-  "aws.s3.enable_path_style_access" = "${oss_path_style}"
-);
-CREATE DATABASE ice_ivm_join_${uuid0}.ns_${uuid0};
+CREATE CATALOG ice_ivm_join_${uuid0} USING iceberg WITH ("iceberg.catalog.type" = 'rest', "uri" = '${iceberg_rest_uri}', "warehouse" = '${iceberg_rest_warehouse}', "aws.s3.endpoint" = '${oss_endpoint}', "credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-metadata.name" = '${iceberg_object_store_metadata_credential_name}', "credential.object-store-metadata.generation" = '${iceberg_object_store_credential_generation}', "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-data.name" = '${iceberg_object_store_data_credential_name}', "credential.object-store-data.generation" = '${iceberg_object_store_credential_generation}', "aws.s3.region" = '${oss_region}', "aws.s3.enable_path_style_access" = '${oss_path_style}');
+CREATE SCHEMA ice_ivm_join_${uuid0}.ns_${uuid0};
 CREATE TABLE ice_ivm_join_${uuid0}.ns_${uuid0}.join_left_${uuid0} (
   id BIGINT NOT NULL,
   rid BIGINT,
   amount INT
-)
-TBLPROPERTIES ("format-version" = "3",
-  "write.row-lineage" = "true");
+) WITH (format_version = 3);
 CREATE TABLE ice_ivm_join_${uuid0}.ns_${uuid0}.join_right_${uuid0} (
   rid BIGINT NOT NULL,
   label STRING
-)
-TBLPROPERTIES ("format-version" = "3",
-  "write.row-lineage" = "true");
+) WITH (format_version = 3);
 USE ice_ivm_join_${uuid0}.ns_${uuid0};
 
 -- query 2
 -- @skip_result_check=true
 INSERT INTO ice_ivm_join_${uuid0}.ns_${uuid0}.join_left_${uuid0} VALUES
-  (1, 10, 100),
-  (2, 20, 200);
+  ROW(1, 10, 100),
+  ROW(2, 20, 200);
 INSERT INTO ice_ivm_join_${uuid0}.ns_${uuid0}.join_right_${uuid0} VALUES
-  (10, 'old-a'),
-  (20, 'old-b');
+  ROW(10, 'old-a'),
+  ROW(20, 'old-b');
 
 -- query 3
 -- @skip_result_check=true
-CREATE MATERIALIZED VIEW join_mv_${uuid0}
-DISTRIBUTED BY HASH(id) BUCKETS 1
-PROPERTIES ('storage_engine' = 'iceberg')
-AS
-SELECT l.id, l.amount, r.label
+CREATE MATERIALIZED VIEW join_mv_${uuid0} AS SELECT l.id, l.amount, r.label
 FROM ice_ivm_join_${uuid0}.ns_${uuid0}.join_left_${uuid0} AS l
 JOIN ice_ivm_join_${uuid0}.ns_${uuid0}.join_right_${uuid0} AS r ON l.rid = r.rid
 WHERE l.amount >= 100;
@@ -86,8 +61,8 @@ ORDER BY id, label;
 
 -- query 5
 -- @skip_result_check=true
-INSERT INTO ice_ivm_join_${uuid0}.ns_${uuid0}.join_left_${uuid0} VALUES (3, 30, 300);
-INSERT INTO ice_ivm_join_${uuid0}.ns_${uuid0}.join_right_${uuid0} VALUES (30, 'new-c');
+INSERT INTO ice_ivm_join_${uuid0}.ns_${uuid0}.join_left_${uuid0} VALUES ROW(3, 30, 300);
+INSERT INTO ice_ivm_join_${uuid0}.ns_${uuid0}.join_right_${uuid0} VALUES ROW(30, 'new-c');
 DELETE FROM ice_ivm_join_${uuid0}.ns_${uuid0}.join_left_${uuid0} WHERE id = 1;
 UPDATE ice_ivm_join_${uuid0}.ns_${uuid0}.join_right_${uuid0}
 SET label = 'new-b'
@@ -113,7 +88,7 @@ ORDER BY l.id, r.label;
 -- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW join_mv_${uuid0};
-DROP TABLE ice_ivm_join_${uuid0}.ns_${uuid0}.join_left_${uuid0} FORCE;
-DROP TABLE ice_ivm_join_${uuid0}.ns_${uuid0}.join_right_${uuid0} FORCE;
-DROP DATABASE ice_ivm_join_${uuid0}.ns_${uuid0};
+DROP TABLE ice_ivm_join_${uuid0}.ns_${uuid0}.join_left_${uuid0} ;
+DROP TABLE ice_ivm_join_${uuid0}.ns_${uuid0}.join_right_${uuid0} ;
+DROP SCHEMA ice_ivm_join_${uuid0}.ns_${uuid0};
 DROP CATALOG ice_ivm_join_${uuid0};

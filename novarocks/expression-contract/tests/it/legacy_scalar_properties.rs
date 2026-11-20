@@ -126,6 +126,7 @@ fn physical_nested_decimal_cast_requires_a_supported_frozen_policy() {
                 None,
                 ValueType::new(result_type.clone(), true),
                 ExprKind::Cast {
+                    array_failure_mode: None,
                     allow_throw_exception: SemanticParameterRef {
                         id: SemanticParameterId::new(0),
                         expected_key: SemanticParameterKey::AllowThrowException,
@@ -284,6 +285,7 @@ fn original_257_cast_semantic_depth_is_a_resource_refusal_before_control_expansi
                 None,
                 integer(false),
                 ExprKind::Cast {
+                    array_failure_mode: None,
                     allow_throw_exception: SemanticParameterRef {
                         id: SemanticParameterId::new(0),
                         expected_key: SemanticParameterKey::AllowThrowException,

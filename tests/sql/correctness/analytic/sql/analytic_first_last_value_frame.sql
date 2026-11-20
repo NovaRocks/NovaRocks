@@ -28,15 +28,14 @@ CREATE TABLE ${case_db}.t_analytic_first_last_value_frame (
     grp VARCHAR(10),
     ts INT,
     v INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t_analytic_first_last_value_frame VALUES
-    ('A', 1, 5),
-    ('A', 2, 6),
-    ('A', 3, 7),
-    ('B', 1, NULL),
-    ('B', 2, 9);
+    ROW('A', 1, 5),
+    ROW('A', 2, 6),
+    ROW('A', 3, 7),
+    ROW('B', 1, NULL),
+    ROW('B', 2, 9);
 
 SELECT
     grp,

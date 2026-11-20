@@ -35,29 +35,29 @@ CREATE TABLE ${case_db}.date_dim (d_datekey INT, d_year INT);
 INSERT INTO ${case_db}.lineorder
     SELECT generate_series, 19980101 + (generate_series % 2), generate_series * 10
     FROM TABLE(generate_series(1, 20000));
-INSERT INTO ${case_db}.date_dim VALUES (19980101, 1998), (19980102, 1998);
-ANALYZE TABLE ${case_db}.lineorder;
-ANALYZE TABLE ${case_db}.date_dim;
+INSERT INTO ${case_db}.date_dim VALUES ROW(19980101, 1998), ROW(19980102, 1998);
+ANALYZE ${case_db}.lineorder;
+ANALYZE ${case_db}.date_dim;
 
 -- Baseline: keep query-rewrite join reorder off, but allow Cascades
 -- JoinCommutativity.
-SET disable_optimizer_rules = 'JoinReorder';
+SET SESSION disable_optimizer_rules = 'JoinReorder';
 
 -- Expected: CBO swaps to lineorder LEFT + date_dim RIGHT (BROADCAST, INNER).
-EXPLAIN VERBOSE
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
 SELECT lo.lo_orderkey, d.d_year
 FROM ${case_db}.date_dim d
 INNER JOIN ${case_db}.lineorder lo ON d.d_datekey = lo.lo_datekey;
 
 -- Disable JoinCommutativity for the next query.
-SET disable_optimizer_rules = 'JoinReorder,JoinCommutativity';
+SET SESSION disable_optimizer_rules = 'JoinReorder,JoinCommutativity';
 
 -- Without commutativity: cannot swap, date_dim stays LEFT and lineorder
 -- remains on the original right side.
-EXPLAIN VERBOSE
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
 SELECT lo.lo_orderkey, d.d_year
 FROM ${case_db}.date_dim d
 INNER JOIN ${case_db}.lineorder lo ON d.d_datekey = lo.lo_datekey;
 
 -- Restore.
-SET disable_optimizer_rules = '';
+SET SESSION disable_optimizer_rules = '';

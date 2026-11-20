@@ -225,6 +225,28 @@ impl CatalogServiceMaterializer<'_> {
             .map_err(SqlCompileError::Compilation)
     }
 
+    fn view_fact(
+        &self,
+        need: &CatalogRelationNeed,
+        definition: Arc<novarocks_sql::planning::catalog::SqlViewDefinition>,
+    ) -> Result<CatalogRelationFact, SqlCompileError> {
+        let fact = CatalogRelationFact::view(need, definition.clone()).map_err(fact_error)?;
+        let Some((_, context)) = self.loader.connector_read_context() else {
+            return Ok(fact);
+        };
+        let control =
+            crate::query_execution::planning::sql_compile_control_from_connector_request(context);
+        let candidates =
+            novarocks_sql::compiler::quoted_metadata_catalogs_for_view(&definition, &control)?;
+        if candidates.is_empty() {
+            return Ok(fact);
+        }
+        let facts = self
+            .bindings
+            .observe_catalog_qualifications(&candidates, self.catalog_application)?;
+        fact.with_view_qualifications(facts).map_err(fact_error)
+    }
+
     fn memoized_relation_fact(
         &self,
         need: &CatalogRelationNeed,
@@ -258,7 +280,7 @@ impl CatalogServiceMaterializer<'_> {
                         "view memo and its retained generation name another catalog".into(),
                     ));
                 }
-                CatalogRelationFact::view(need, view.definition).map_err(fact_error)
+                self.view_fact(need, view.definition)
             }
             MemoizedQueryRelation::SelectionRefused(fact) => {
                 fact.selection_refusal_for(need).map_err(fact_error)
@@ -454,7 +476,7 @@ impl CatalogServiceMaterializer<'_> {
         );
         snapshot
             .get(&local)
-            .map(|view| CatalogRelationFact::view(need, view.clone()).map_err(fact_error))
+            .map(|view| self.view_fact(need, view.clone()))
     }
 
     fn local_relation_fact(
@@ -532,11 +554,12 @@ impl CatalogServiceMaterializer<'_> {
         if let CatalogLookupTarget::IcebergMetadata { kind } = need.target() {
             return crate::query_execution::completion_facts::catalog_fact_from(
                 need,
-                self.resolve_metadata_table_typed(
+                self.metadata_table_def(
                     Some(&relation.catalog),
                     &relation.namespace,
                     &relation.table,
                     kind,
+                    need.quoted_metadata_binding(),
                 ),
             );
         }
@@ -591,6 +614,7 @@ impl CatalogServiceMaterializer<'_> {
                     &relation.namespace,
                     &relation.table,
                     kind,
+                    need.quoted_metadata_binding(),
                 )
                 .await,
             );
@@ -732,10 +756,7 @@ mod tests {
         novarocks_parser::ast::Query,
         novarocks_sql::compiler::SqlCapturedCatalogPreparation,
     ) {
-        let statements = novarocks_parser::parse(sql).unwrap();
-        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
-            panic!("query")
-        };
+        let query = novarocks_parser::parser::parse_query(sql).unwrap();
         let source = novarocks_sql::compiler::SqlCapturedCatalogPreparation::try_new(
             query.clone(),
             catalog,
@@ -973,10 +994,7 @@ mod tests {
     }
 
     fn orders_need(sql: &str) -> CatalogRelationNeed {
-        let statements = novarocks_parser::parse(sql).unwrap();
-        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
-            panic!("query")
-        };
+        let query = novarocks_parser::parser::parse_query(sql).unwrap();
         let source = novarocks_sql::compiler::SqlCapturedCatalogPreparation::try_new(
             query.clone(),
             Some("ice"),

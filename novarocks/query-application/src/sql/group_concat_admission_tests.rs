@@ -22,7 +22,7 @@ fn group_concat_admission_preserves_raw_limit_and_owned_snapshot() {
     for raw in [-1, 0, 3, 4, 1024, i64::MAX] {
         let mut connection = SessionSqlState::default();
         connection.execution_settings.set_group_concat_max_len(raw);
-        let (.., frozen) = connection.clone().into_query_attempt_inputs();
+        let (.., frozen, _) = connection.clone().into_query_attempt_inputs();
         assert_eq!(frozen.group_concat_max_len(), Some(raw));
         connection.execution_settings.set_group_concat_max_len(4096);
         assert_eq!(frozen.group_concat_max_len(), Some(raw));

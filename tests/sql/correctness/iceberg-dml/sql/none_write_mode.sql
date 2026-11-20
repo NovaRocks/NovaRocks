@@ -18,11 +18,11 @@
 -- @order_sensitive=true
 -- Validate Iceberg writes when write.metadata.metrics.default is set to none.
 -- query 1
-CREATE DATABASE iceberg_dml_cat_${suite_uuid0}.iceberg_none_db_${uuid0};
+CREATE SCHEMA iceberg_dml_cat_${suite_uuid0}.iceberg_none_db_${uuid0};
 -- query 2
 CREATE TABLE iceberg_dml_cat_${suite_uuid0}.iceberg_none_db_${uuid0}.iceberg_none_tbl_${uuid0} (
   k1 INT
-) PROPERTIES ("write.metadata.metrics.default" = "none");
+) WITH (extra_properties = MAP(ARRAY['write.metadata.metrics.default'], ARRAY['none']));
 -- query 3
 INSERT INTO iceberg_dml_cat_${suite_uuid0}.iceberg_none_db_${uuid0}.iceberg_none_tbl_${uuid0}
 SELECT 1;
@@ -31,6 +31,6 @@ SELECT k1
 FROM iceberg_dml_cat_${suite_uuid0}.iceberg_none_db_${uuid0}.iceberg_none_tbl_${uuid0};
 -- query 5
 -- query 6
-DROP TABLE iceberg_dml_cat_${suite_uuid0}.iceberg_none_db_${uuid0}.iceberg_none_tbl_${uuid0} FORCE;
+DROP TABLE iceberg_dml_cat_${suite_uuid0}.iceberg_none_db_${uuid0}.iceberg_none_tbl_${uuid0} ;
 -- query 7
-DROP DATABASE iceberg_dml_cat_${suite_uuid0}.iceberg_none_db_${uuid0};
+DROP SCHEMA iceberg_dml_cat_${suite_uuid0}.iceberg_none_db_${uuid0};

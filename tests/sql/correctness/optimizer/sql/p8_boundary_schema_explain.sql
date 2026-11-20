@@ -16,7 +16,7 @@
 -- under the License.
 
 -- @tags=optimizer,p8,distributed_ir_explain
-EXPLAIN VERBOSE
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
 SELECT k, SUM(v) AS total_v
 FROM (
     SELECT 1 AS k, 10 AS v

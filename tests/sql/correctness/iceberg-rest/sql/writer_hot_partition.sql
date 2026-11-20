@@ -21,16 +21,15 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE DATABASE iceberg_rest_${suite_uuid0}.rwm13_hot_${uuid0};
-CREATE TABLE iceberg_rest_${suite_uuid0}.rwm13_hot_${uuid0}.t (p BIGINT, id BIGINT, payload VARCHAR)
-PARTITION BY (p);
+CREATE SCHEMA iceberg_rest_${suite_uuid0}.rwm13_hot_${uuid0};
+CREATE TABLE iceberg_rest_${suite_uuid0}.rwm13_hot_${uuid0}.t (p BIGINT, id BIGINT, payload VARCHAR) WITH (partitioning = ARRAY['p']);
 INSERT INTO iceberg_rest_${suite_uuid0}.rwm13_hot_${uuid0}.t
 SELECT CAST(11 AS BIGINT), generate_series, repeat('x', 2048)
 FROM TABLE(generate_series(1, 240000));
 
 -- query 2
 SELECT count(*) > 1 AS spread, sum(record_count) AS rows_in_files
-FROM iceberg_rest_${suite_uuid0}.rwm13_hot_${uuid0}.t$files WHERE content = 0;
+FROM iceberg_rest_${suite_uuid0}.rwm13_hot_${uuid0}."t$files" WHERE content = 0;
 
 -- query 3
 SELECT count(*) AS n, sum(id) AS id_sum, sum(length(payload)) AS payload_chars
@@ -39,5 +38,5 @@ FROM iceberg_rest_${suite_uuid0}.rwm13_hot_${uuid0}.t;
 -- query 4
 -- @cleanup=true
 -- @skip_result_check=true
-DROP TABLE IF EXISTS iceberg_rest_${suite_uuid0}.rwm13_hot_${uuid0}.t FORCE;
-DROP DATABASE IF EXISTS iceberg_rest_${suite_uuid0}.rwm13_hot_${uuid0};
+DROP TABLE IF EXISTS iceberg_rest_${suite_uuid0}.rwm13_hot_${uuid0}.t ;
+DROP SCHEMA IF EXISTS iceberg_rest_${suite_uuid0}.rwm13_hot_${uuid0};

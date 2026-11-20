@@ -40,28 +40,27 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.t1 (id INT, v VARCHAR(16))
-TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+CREATE TABLE ${case_db}.t1 (id INT, v VARCHAR(16)) WITH (format_version = 3);
 
 -- query 2
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t1 VALUES (1, 'a');
+INSERT INTO ${case_db}.t1 VALUES ROW(1, 'a');
 
 -- query 3
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t1 VALUES (2, 'b');
+INSERT INTO ${case_db}.t1 VALUES ROW(2, 'b');
 
 -- query 4
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t1 VALUES (3, 'c');
+INSERT INTO ${case_db}.t1 VALUES ROW(3, 'c');
 
 -- query 5
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t1 VALUES (4, 'd');
+INSERT INTO ${case_db}.t1 VALUES ROW(4, 'd');
 
 -- query 6
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t1 VALUES (5, 'e');
+INSERT INTO ${case_db}.t1 VALUES ROW(5, 'e');
 
 -- query 7
 -- Sanity check: 5 rows present before REWRITE.
@@ -70,7 +69,7 @@ SELECT COUNT(*) AS n FROM ${case_db}.t1;
 -- query 8
 -- @skip_result_check=true
 -- REWRITE MANIFESTS merges 5 per-INSERT manifests into one.
-ALTER TABLE ${case_db}.t1 REWRITE MANIFESTS;
+ALTER TABLE ${case_db}.t1 EXECUTE optimize_manifests;
 
 -- query 9
 -- All 5 rows must remain visible after the manifest rewrite.
@@ -83,12 +82,11 @@ SELECT id, v FROM ${case_db}.t1 ORDER BY id;
 
 -- query 10
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.t2 (id INT, v VARCHAR(16))
-TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+CREATE TABLE ${case_db}.t2 (id INT, v VARCHAR(16)) WITH (format_version = 3);
 
 -- query 11
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t2 VALUES (1, 'x'), (2, 'y'), (3, 'z');
+INSERT INTO ${case_db}.t2 VALUES ROW(1, 'x'), ROW(2, 'y'), ROW(3, 'z');
 
 -- query 12
 -- Baseline: 3 rows before noop REWRITE.
@@ -97,7 +95,7 @@ SELECT COUNT(*) AS n FROM ${case_db}.t2;
 -- query 13
 -- @skip_result_check=true
 -- Single manifest → noop (returns Ok immediately without emitting a snapshot).
-ALTER TABLE ${case_db}.t2 REWRITE MANIFESTS;
+ALTER TABLE ${case_db}.t2 EXECUTE optimize_manifests;
 
 -- query 14
 -- After noop REWRITE: all 3 rows still present.
@@ -110,8 +108,7 @@ SELECT COUNT(*) AS n FROM ${case_db}.t2;
 
 -- query 15
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.t3 (id INT, v VARCHAR(16))
-TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+CREATE TABLE ${case_db}.t3 (id INT, v VARCHAR(16)) WITH (format_version = 3);
 
 -- query 16
 -- Table is empty before REWRITE.
@@ -120,7 +117,7 @@ SELECT COUNT(*) AS n FROM ${case_db}.t3;
 -- query 17
 -- @skip_result_check=true
 -- Empty table has no current snapshot, REWRITE is a noop and succeeds without error.
-ALTER TABLE ${case_db}.t3 REWRITE MANIFESTS;
+ALTER TABLE ${case_db}.t3 EXECUTE optimize_manifests;
 
 -- query 18
 -- Still empty after REWRITE.
@@ -133,25 +130,24 @@ SELECT COUNT(*) AS n FROM ${case_db}.t3;
 
 -- query 19
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.t4 (id INT, v VARCHAR(16))
-TBLPROPERTIES ("format-version" = "2");
+CREATE TABLE ${case_db}.t4 (id INT, v VARCHAR(16)) WITH (format_version = 2);
 
 -- query 20
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t4 VALUES (1, 'p');
+INSERT INTO ${case_db}.t4 VALUES ROW(1, 'p');
 
 -- query 21
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t4 VALUES (2, 'q');
+INSERT INTO ${case_db}.t4 VALUES ROW(2, 'q');
 
 -- query 22
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t4 VALUES (3, 'r');
+INSERT INTO ${case_db}.t4 VALUES ROW(3, 'r');
 
 -- query 23
 -- @skip_result_check=true
 -- REWRITE merges 3 per-INSERT manifests on the v2 table.
-ALTER TABLE ${case_db}.t4 REWRITE MANIFESTS;
+ALTER TABLE ${case_db}.t4 EXECUTE optimize_manifests;
 
 -- query 24
 -- All 3 rows visible after REWRITE on a v2 table.
@@ -165,20 +161,19 @@ SELECT id, v FROM ${case_db}.t4 ORDER BY id;
 
 -- query 25
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.t5 (id INT, v VARCHAR(16))
-TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+CREATE TABLE ${case_db}.t5 (id INT, v VARCHAR(16)) WITH (format_version = 3);
 
 -- query 26
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t5 VALUES (10, 'alpha');
+INSERT INTO ${case_db}.t5 VALUES ROW(10, 'alpha');
 
 -- query 27
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t5 VALUES (20, 'beta');
+INSERT INTO ${case_db}.t5 VALUES ROW(20, 'beta');
 
 -- query 28
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t5 VALUES (30, 'gamma');
+INSERT INTO ${case_db}.t5 VALUES ROW(30, 'gamma');
 
 -- query 29
 -- Capture (id, _row_id) before REWRITE — establishes the baseline.
@@ -188,7 +183,7 @@ SELECT id, _row_id FROM ${case_db}.t5 ORDER BY id;
 
 -- query 30
 -- @skip_result_check=true
-ALTER TABLE ${case_db}.t5 REWRITE MANIFESTS;
+ALTER TABLE ${case_db}.t5 EXECUTE optimize_manifests;
 
 -- query 31
 -- After REWRITE: (id, _row_id) must match the pre-REWRITE baseline exactly.
@@ -197,17 +192,16 @@ SELECT id, _row_id FROM ${case_db}.t5 ORDER BY id;
 
 -- ---------------------------------------------------------------------------
 -- Case 6: Branch suffix → reject
--- Verifies: parser rejects `ALTER TABLE t.branch_dev REWRITE MANIFESTS`.
+-- Verifies: ALTER TABLE EXECUTE does not admit a branch-qualified table.
 -- ---------------------------------------------------------------------------
 
 -- query 32
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.t6 (id INT, v VARCHAR(16))
-TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+CREATE TABLE ${case_db}.t6 (id INT, v VARCHAR(16)) WITH (format_version = 3);
 
 -- query 33
--- @expect_error=does not support branch
-ALTER TABLE ${case_db}.t6.branch_dev REWRITE MANIFESTS;
+-- @expect_trino_error=SYNTAX_ERROR,USER_ERROR
+ALTER TABLE ${case_db}.t6@dev EXECUTE optimize_manifests;
 
 -- ---------------------------------------------------------------------------
 -- Case 7: Trailing tokens → reject
@@ -216,11 +210,10 @@ ALTER TABLE ${case_db}.t6.branch_dev REWRITE MANIFESTS;
 
 -- query 34
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.t7 (id INT, v VARCHAR(16))
-TBLPROPERTIES ("format-version" = "2");
+CREATE TABLE ${case_db}.t7 (id INT, v VARCHAR(16)) WITH (format_version = 2);
 
 -- query 35
--- @expect_error=unsupported trailing
+-- @expect_trino_error=SYNTAX_ERROR,USER_ERROR
 ALTER TABLE ${case_db}.t7 REWRITE MANIFESTS WHERE size_in_bytes < 100;
 
 -- ---------------------------------------------------------------------------
@@ -232,16 +225,15 @@ ALTER TABLE ${case_db}.t7 REWRITE MANIFESTS WHERE size_in_bytes < 100;
 
 -- query 36
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.t8 (id INT, v VARCHAR(16))
-TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+CREATE TABLE ${case_db}.t8 (id INT, v VARCHAR(16)) WITH (format_version = 3);
 
 -- query 37
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t8 VALUES (1, 'a'), (2, 'b'), (3, 'c');
+INSERT INTO ${case_db}.t8 VALUES ROW(1, 'a'), ROW(2, 'b'), ROW(3, 'c');
 
 -- query 38
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t8 VALUES (4, 'd'), (5, 'e');
+INSERT INTO ${case_db}.t8 VALUES ROW(4, 'd'), ROW(5, 'e');
 
 -- query 39
 -- @skip_result_check=true
@@ -255,7 +247,7 @@ SELECT id, v FROM ${case_db}.t8 ORDER BY id;
 -- query 41
 -- @skip_result_check=true
 -- REWRITE consolidates data and delete-content manifests.
-ALTER TABLE ${case_db}.t8 REWRITE MANIFESTS;
+ALTER TABLE ${case_db}.t8 EXECUTE optimize_manifests;
 
 -- query 42
 -- After REWRITE: exact same rows visible — DELETE effect preserved.
@@ -268,29 +260,28 @@ SELECT id, v FROM ${case_db}.t8 ORDER BY id;
 
 -- query 43
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.t9 (id INT, v VARCHAR(16))
-TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+CREATE TABLE ${case_db}.t9 (id INT, v VARCHAR(16)) WITH (format_version = 3);
 
 -- query 44
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t9 VALUES (1, 'first');
+INSERT INTO ${case_db}.t9 VALUES ROW(1, 'first');
 
 -- query 45
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t9 VALUES (2, 'second');
+INSERT INTO ${case_db}.t9 VALUES ROW(2, 'second');
 
 -- query 46
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t9 VALUES (3, 'third');
+INSERT INTO ${case_db}.t9 VALUES ROW(3, 'third');
 
 -- query 47
 -- @skip_result_check=true
-ALTER TABLE ${case_db}.t9 REWRITE MANIFESTS;
+ALTER TABLE ${case_db}.t9 EXECUTE optimize_manifests;
 
 -- query 48
 -- @skip_result_check=true
 -- INSERT after REWRITE — proves the snapshot parent chain is healthy.
-INSERT INTO ${case_db}.t9 VALUES (4, 'fourth');
+INSERT INTO ${case_db}.t9 VALUES ROW(4, 'fourth');
 
 -- query 49
 -- All 4 rows visible: pre-REWRITE rows plus the post-REWRITE INSERT.
@@ -309,30 +300,29 @@ SELECT COUNT(*) AS n FROM ${case_db}.t9;
 
 -- query 51
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.t10 (id INT, v VARCHAR(16))
-TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+CREATE TABLE ${case_db}.t10 (id INT, v VARCHAR(16)) WITH (format_version = 3);
 
 -- query 52
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t10 VALUES (1, 'one');
+INSERT INTO ${case_db}.t10 VALUES ROW(1, 'one');
 
 -- query 53
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t10 VALUES (2, 'two');
+INSERT INTO ${case_db}.t10 VALUES ROW(2, 'two');
 
 -- query 54
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t10 VALUES (3, 'three');
+INSERT INTO ${case_db}.t10 VALUES ROW(3, 'three');
 
 -- query 55
 -- @skip_result_check=true
 -- First REWRITE: merges 3 manifests into 1 and adds a replace snapshot.
-ALTER TABLE ${case_db}.t10 REWRITE MANIFESTS;
+ALTER TABLE ${case_db}.t10 EXECUTE optimize_manifests;
 
 -- query 56
 -- @skip_result_check=true
 -- Second REWRITE: 1 manifest remains after first rewrite, is a noop.
-ALTER TABLE ${case_db}.t10 REWRITE MANIFESTS;
+ALTER TABLE ${case_db}.t10 EXECUTE optimize_manifests;
 
 -- query 57
 -- Data intact after two REWRITEs: all 3 rows visible.

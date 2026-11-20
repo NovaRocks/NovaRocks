@@ -26,53 +26,52 @@ USE ${case_db};
 -- query 2
 -- @skip_result_check=true
 USE ${case_db};
-CREATE TABLE `test_count_if` (
-  `v1` varchar(65533) NULL COMMENT "",
-  `v2` varchar(65533) NULL COMMENT "",
-  `v3` datetime NULL COMMENT "",
-  `v4` int null
-)
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE "test_count_if" (
+  "v1" varchar(65533),
+  "v2" varchar(65533),
+  "v3" datetime,
+  "v4" int
+) WITH (format_version = 3);
 
 -- query 3
 -- @skip_result_check=true
 USE ${case_db};
-insert into test_count_if values('a','a', '2022-04-18 01:01:00', 1);
+insert into test_count_if values ROW('a','a', '2022-04-18 01:01:00', 1);
 
 -- query 4
 -- @skip_result_check=true
 USE ${case_db};
-insert into test_count_if values('a','b', '2022-04-18 02:01:00', NULL);
+insert into test_count_if values ROW('a','b', '2022-04-18 02:01:00', NULL);
 
 -- query 5
 -- @skip_result_check=true
 USE ${case_db};
-insert into test_count_if values('a',NULL, '2022-04-18 02:05:00', 1);
+insert into test_count_if values ROW('a',NULL, '2022-04-18 02:05:00', 1);
 
 -- query 6
 -- @skip_result_check=true
 USE ${case_db};
-insert into test_count_if values('a','b', '2022-04-18 02:15:00', 3);
+insert into test_count_if values ROW('a','b', '2022-04-18 02:15:00', 3);
 
 -- query 7
 -- @skip_result_check=true
 USE ${case_db};
-insert into test_count_if values('a','b', '2022-04-18 03:15:00', 7);
+insert into test_count_if values ROW('a','b', '2022-04-18 03:15:00', 7);
 
 -- query 8
 -- @skip_result_check=true
 USE ${case_db};
-insert into test_count_if values('c',NULL, '2022-04-18 03:45:00', NULL);
+insert into test_count_if values ROW('c',NULL, '2022-04-18 03:45:00', NULL);
 
 -- query 9
 -- @skip_result_check=true
 USE ${case_db};
-insert into test_count_if values('c',NULL, '2022-04-18 03:25:00', 2);
+insert into test_count_if values ROW('c',NULL, '2022-04-18 03:25:00', 2);
 
 -- query 10
 -- @skip_result_check=true
 USE ${case_db};
-insert into test_count_if values('c','a', '2022-04-18 03:27:00', 3);
+insert into test_count_if values ROW('c','a', '2022-04-18 03:27:00', 3);
 
 -- query 11
 USE ${case_db};

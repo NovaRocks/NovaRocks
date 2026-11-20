@@ -27,28 +27,26 @@ DROP TABLE IF EXISTS ${case_db}.rf_co_customers;
 CREATE TABLE ${case_db}.rf_co_customers (
     id INT,
     name STRING
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 CREATE TABLE ${case_db}.rf_co_orders (
     oid INT,
     customer_id INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.rf_co_customers VALUES
-    (2, 'b'),
-    (4, 'd'),
-    (8, 'h');
+    ROW(2, 'b'),
+    ROW(4, 'd'),
+    ROW(8, 'h');
 
 INSERT INTO ${case_db}.rf_co_orders VALUES
-    (1, 2),
-    (2, 4),
-    (3, 8),
-    (4, 5),
-    (5, 4);
+    ROW(1, 2),
+    ROW(2, 4),
+    ROW(3, 8),
+    ROW(4, 5),
+    ROW(5, 4);
 
-SET disable_optimizer_rules = '';
+SET SESSION disable_optimizer_rules = '';
 -- @explain_contains=HASH JOIN (
 -- @explain_contains=producer binding
 -- @explain_contains=consumer binding
@@ -57,10 +55,10 @@ FROM ${case_db}.rf_co_orders o
 JOIN ${case_db}.rf_co_customers c ON o.customer_id = c.id
 ORDER BY o.oid;
 
-SET disable_optimizer_rules = 'RuntimeFilterPushDown';
+SET SESSION disable_optimizer_rules = 'RuntimeFilterPushDown';
 SELECT o.oid, o.customer_id
 FROM ${case_db}.rf_co_orders o
 JOIN ${case_db}.rf_co_customers c ON o.customer_id = c.id
 ORDER BY o.oid;
 
-SET disable_optimizer_rules = '';
+SET SESSION disable_optimizer_rules = '';

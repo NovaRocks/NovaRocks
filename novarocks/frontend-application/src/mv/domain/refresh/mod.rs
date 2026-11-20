@@ -33,5 +33,3 @@ pub mod snapshot;
 pub mod target;
 pub(crate) mod target_apply;
 pub mod target_binding;
-
-pub use target::resolve_refresh_mv_target;

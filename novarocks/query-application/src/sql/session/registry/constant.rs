@@ -41,18 +41,26 @@ impl SqlPropertyDeclaration {
         control: &dyn PureCompileControl,
     ) -> Result<ValidatedSessionProperty, SessionPropertyError> {
         self.declaration
-            .validate_scoped_sql_value(constant, control, self.scope)
+            .validate_scoped_sql_value(constant, self.scope, control)
     }
 }
 
 impl PropertyDeclaration {
-    /// SQL has already performed conversion and evaluation. Keep the selected
-    /// source binding through the handoff to the session owner.
-    fn validate_scoped_sql_value(
+    /// SQL has already performed the permitted conversion and evaluation.
+    /// Keep the complete source binding and selected ordinal through handoff.
+    pub fn validate_sql_value(
         self: &Arc<Self>,
         constant: &ConstantValue,
         control: &dyn PureCompileControl,
+    ) -> Result<ValidatedSessionProperty, SessionPropertyError> {
+        self.validate_scoped_sql_value(constant, SessionPropertyScope::System, control)
+    }
+
+    pub(super) fn validate_scoped_sql_value(
+        self: &Arc<Self>,
+        constant: &ConstantValue,
         scope: SessionPropertyScope,
+        control: &dyn PureCompileControl,
     ) -> Result<ValidatedSessionProperty, SessionPropertyError> {
         let phase = CompilePhase::Validate;
         control

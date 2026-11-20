@@ -69,13 +69,13 @@ fn credential_overlay(purpose: &str) -> String {
 }
 
 fn sql_string(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
+    value.replace('\'', "''")
 }
 
 fn catalog_sql(rest: &IsolatedIcebergRestFixture, endpoint: &str) -> String {
     let rest = rest.endpoints();
     format!(
-        "CREATE EXTERNAL CATALOG {CATALOG} PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"rest\",\"uri\"=\"{}\",\"iceberg.catalog.warehouse\"=\"{}\",\"aws.s3.endpoint\"=\"{}\",\"aws.s3.region\"=\"us-east-1\",\"aws.s3.enable_path_style_access\"=\"true\",\"credential.object-store-metadata.consumer-role\"=\"frontend\",\"credential.object-store-metadata.mode\"=\"static\",\"credential.object-store-metadata.name\"=\"{CREDENTIAL_NAME}\",\"credential.object-store-metadata.generation\"=\"{CREDENTIAL_GENERATION}\",\"credential.object-store-data.consumer-role\"=\"backend\",\"credential.object-store-data.mode\"=\"static\",\"credential.object-store-data.name\"=\"{CREDENTIAL_NAME}\",\"credential.object-store-data.generation\"=\"{CREDENTIAL_GENERATION}\")",
+        "CREATE CATALOG {CATALOG} USING iceberg WITH (\"iceberg.catalog.type\" = 'rest',\"uri\" = '{}',\"iceberg.catalog.warehouse\" = '{}',\"aws.s3.endpoint\" = '{}',\"aws.s3.region\" = 'us-east-1',\"aws.s3.enable_path_style_access\" = 'true',\"credential.object-store-metadata.consumer-role\" = 'frontend',\"credential.object-store-metadata.mode\" = 'static',\"credential.object-store-metadata.name\" = '{CREDENTIAL_NAME}',\"credential.object-store-metadata.generation\" = '{CREDENTIAL_GENERATION}',\"credential.object-store-data.consumer-role\" = 'backend',\"credential.object-store-data.mode\" = 'static',\"credential.object-store-data.name\" = '{CREDENTIAL_NAME}',\"credential.object-store-data.generation\" = '{CREDENTIAL_GENERATION}')",
         sql_string(&rest.rest_uri),
         sql_string(&rest.rest_warehouse),
         sql_string(endpoint),

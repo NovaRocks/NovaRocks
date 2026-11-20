@@ -1,0 +1,61 @@
+-- query 1
+-- types	array(integer)
+widened
+[1,2]
+
+-- query 2
+-- types	array(real)
+real_values
+[1.5,2.0]
+
+-- query 3
+-- types	array(decimal(3, 1))
+decimal_values
+["12.0","1.5"]
+
+-- query 4
+-- types	array(decimal(38, 38))
+capped_zero
+["0.00000000000000000000000000000000000000","0.00000000000000000000000000000000000000"]
+
+-- query 7
+-- types	array(array(integer))
+nested_values
+[[1],[2,null]]
+
+-- query 8
+-- types	array(array(unknown))
+nested_unknown
+[[null],null]
+
+-- query 9
+-- types	array(integer)
+nullable_values
+[null,2]
+
+-- query 10
+-- types	array(array(smallint))
+empty_then_value
+[[],[1]]
+
+-- query 11
+-- types	array(unknown)	array(unknown)
+empty_values	null_values
+[]	[null]
+
+-- query 12
+-- types	array(json)
+json_values
+["1",null]
+
+-- query 19
+-- types	integer	array(integer)
+ordinal	widened
+1	[1,2]
+2	[null,3]
+
+-- query 20
+-- types	integer	array(double)
+ordinal	rounded
+1	[9.007199254740992E15,1.0]
+2	[4.503599627370496E15,2.0]

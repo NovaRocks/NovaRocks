@@ -26,85 +26,84 @@ USE ${case_db};
 -- query 2
 -- @skip_result_check=true
 USE ${case_db};
-CREATE TABLE `ss` (
-  `id` int(11) NULL COMMENT "",
-  `name` varchar(255) NULL COMMENT "",
-  `subject` varchar(255) NULL COMMENT "",
-  `score` int(11) NULL COMMENT "",
+CREATE TABLE "ss" (
+  "id" int(11),
+  "name" varchar(255),
+  "subject" varchar(255),
+  "score" int(11),
    arr array<int>,
    mmap map<int,varchar(20)>
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 3
 -- @skip_result_check=true
 USE ${case_db};
-insert into ss values (1,"Tom","English",90, [1,2],map{2:'name'});
+insert into ss values ROW(1,'Tom','English',90, [1,2],map(2,'name'));
 
 -- query 4
 -- @skip_result_check=true
 USE ${case_db};
-insert into ss values (1,"Tom","Math",80, [1,2], map{2:'name'});
+insert into ss values ROW(1,'Tom','Math',80, [1,2], map(2,'name'));
 
 -- query 5
 -- @skip_result_check=true
 USE ${case_db};
-insert into ss values (2,"Tom","English",NULL,[], map{});
+insert into ss values ROW(2,'Tom','English',NULL,[], map());
 
 -- query 6
 -- @skip_result_check=true
 USE ${case_db};
-insert into ss values (2,"Tom",NULL,NULL,null,null);
+insert into ss values ROW(2,'Tom',NULL,NULL,null,null);
 
 -- query 7
 -- @skip_result_check=true
 USE ${case_db};
-insert into ss values (3,"May",NULL,NULL,[2],map{3:'3',4:'4'});
+insert into ss values ROW(3,'May',NULL,NULL,[2],map(3,'3',4,'4'));
 
 -- query 8
 -- @skip_result_check=true
 USE ${case_db};
-insert into ss values (3,"Ti","English",98, [null],map{5:null});
+insert into ss values ROW(3,'Ti','English',98, [null],map(5,null));
 
 -- query 9
 -- @skip_result_check=true
 USE ${case_db};
-insert into ss values (4,NULL,NULL,NULL,null,null);
+insert into ss values ROW(4,NULL,NULL,NULL,null,null);
 
 -- query 10
 -- @skip_result_check=true
 USE ${case_db};
-insert into ss values (NULL,NULL,NULL,NULL,null,null);
+insert into ss values ROW(NULL,NULL,NULL,NULL,null,null);
 
 -- query 11
 -- @skip_result_check=true
 USE ${case_db};
-insert into ss values (NULL,"Ti","物理Phy",99,[3,4],map{9:''});
+insert into ss values ROW(NULL,'Ti','物理Phy',99,[3,4],map(9,''));
 
 -- query 12
 -- @skip_result_check=true
 USE ${case_db};
-insert into ss values (11,"张三此地无银三百两","英文English",98,[0,2], map{});
+insert into ss values ROW(11,'张三此地无银三百两','英文English',98,[0,2], map());
 
 -- query 13
 -- @skip_result_check=true
 USE ${case_db};
-insert into ss values (11,"张三掩耳盗铃","Math数学欧拉方程",78,[],map{7:'y'});
+insert into ss values ROW(11,'张三掩耳盗铃','Math数学欧拉方程',78,[],map(7,'y'));
 
 -- query 14
 -- @skip_result_check=true
 USE ${case_db};
-insert into ss values (12,"李四大闹天空","英语外语美誉",NULL,[89], map{6:'6'});
+insert into ss values ROW(12,'李四大闹天空','英语外语美誉',NULL,[89], map(6,'6'));
 
 -- query 15
 -- @skip_result_check=true
 USE ${case_db};
-insert into ss values (2,"王武程咬金","语文北京上海",22,[23],map{8:''});
+insert into ss values ROW(2,'王武程咬金','语文北京上海',22,[23],map(8,''));
 
 -- query 16
 -- @skip_result_check=true
 USE ${case_db};
-insert into ss values (3,"欧阳诸葛方程","数学大不列颠",NULL,[],null);
+insert into ss values ROW(3,'欧阳诸葛方程','数学大不列颠',NULL,[],null);
 
 -- query 17
 USE ${case_db};
@@ -1152,17 +1151,17 @@ select array_agg(',');
 
 -- query 275
 USE ${case_db};
-select array_agg("中国" order by 1, id) from ss;
+select array_agg('中国' order by 1, id) from ss;
 
 -- query 276
--- @expect_error=Unexpected input 'separator', the most similar input is {',', ')'}.
+-- @expect_trino_error=SYNTAX_ERROR,USER_ERROR,2
 USE ${case_db};
-select array_agg("中国" order by 2, id separator NULL) from ss;
+select array_agg('中国' order by 2, id separator NULL) from ss;
 
 -- query 277
 -- @expect_error=Unexpected input 'order', the most similar input is {',', ')'}.
 USE ${case_db};
-select array_agg("中国",name order by 2, "第一", id) from ss;
+select array_agg('中国',name order by 2, '第一', id) from ss;
 
 -- query 278
 -- @expect_error=Unexpected input '(', the most similar input is {<EOF>, ';'}.
@@ -1170,7 +1169,7 @@ USE ${case_db};
 select array_agg(  order by score) from ss order by 1;
 
 -- query 279
--- @expect_error=Unexpected input 'order', the most similar input is {a legal identifier}.
+-- @expect_trino_error=SYNTAX_ERROR,USER_ERROR,2
 USE ${case_db};
 select array_agg(distinct  order by score) from ss order by 1;
 
@@ -1180,17 +1179,21 @@ select array_agg([1,2]) from ss;
 
 -- query 281
 USE ${case_db};
-select array_agg(json_object("2:3")) from ss;
+select array_agg(JSON_OBJECT('2:3': NULL)) from ss;
 
 -- query 282
--- @expect_error=array_agg(DISTINCT json_object('2:3')) can't rewrite distinct to group by on (json).
+-- @expect_error=can't rewrite distinct to group by on (json).
+-- @expect_sql_code=sql.analyze.invalid_argument
+-- @expect_sql_phase=Analyze
 USE ${case_db};
-select array_agg(distinct json_object("2:3")) from ss;
+select array_agg(distinct JSON_OBJECT('2:3': NULL)) from ss;
 
 -- query 283
--- @expect_error=array_agg(DISTINCT [json_object('2:3')]) can't rewrite distinct to group by on (array<json>).
+-- @expect_error=can't rewrite distinct to group by on (array<json>).
+-- @expect_sql_code=sql.analyze.invalid_argument
+-- @expect_sql_phase=Analyze
 USE ${case_db};
-select array_agg(distinct [json_object("2:3")]) from ss;
+select array_agg(distinct [JSON_OBJECT('2:3': NULL)]) from ss;
 
 -- query 284
 USE ${case_db};
@@ -1206,12 +1209,12 @@ USE ${case_db};
 select array_agg(null);
 
 -- query 287
--- @expect_error=Unexpected input '(', the most similar input is {<EOF>, ';'}.
+-- @expect_trino_error=SYNTAX_ERROR,USER_ERROR,2
 USE ${case_db};
 select array_agg(order by 1 separator '');
 
 -- query 288
--- @expect_error=No viable statement for input 'array_agg(separator NULL'.
+-- @expect_trino_error=SYNTAX_ERROR,USER_ERROR,2
 USE ${case_db};
 select array_agg(separator NULL);
 
@@ -1247,21 +1250,20 @@ create table test_array_agg (
     col_date DATE,
     col_array ARRAY<INT>,
     col_map MAP<STRING, INT>,
-    col_struct STRUCT<f1 INT, f2 STRING>
-)
-TBLPROPERTIES ("format-version" = "3");
+    col_struct ROW(f1 INT, f2 STRING)
+) WITH (format_version = 3);
 
 -- query 293
 -- @skip_result_check=true
 USE ${case_db};
 insert into test_array_agg values
-(1, true, 10, 100, 1000, 10000, 100000, 1.1, 2.2, 'hello', 'char_test', '2024-01-01 12:00:00', '2024-01-01', [1,2,3], map{"key1": 1, "key2": 2}, row(1, "test1")),
-(2, false, 20, 200, 2000, 20000, 200000, 3.3, 4.4, 'world', 'char_test2', '2024-02-02 13:00:00', '2024-02-02', [4,5,6], map{"key3": 3, "key4": 4}, row(2, "test2")),
-(3, null, 30, 300, 3000, 30000, 300000, 5.5, 6.6, null, null, null, null, null, null, null),
-(4, true, 10, 100, 1000, 10000, 100000, 1.1, 2.2, 'hello', 'char_test', '2024-01-01 12:00:00', '2024-01-01', [1,2,3], map{"key1": 1, "key2": 2}, row(1, "test1")),
-(5, false, 20, 200, 2000, 20000, 200000, 3.3, 4.4, 'world', 'char_test2', '2024-02-02 13:00:00', '2024-02-02', [4,5,6], map{"key3": 3, "key4": 4}, row(2, "test2")),
-(1, true, 10, 100, 1000, 10000, 100000, 1.1, 2.2, 'hello', 'char_test', '2024-01-01 12:00:00', '2024-01-01', [1,2,3], map{"key1": 1, "key2": 2}, row(1, "test1")),
-(2, false, 20, 200, 2000, 20000, 200000, 3.3, 4.4, 'world', 'char_test2', '2024-02-02 13:00:00', '2024-02-02', [4,5,6], map{"key3": 3, "key4": 4}, row(2, "test2"));
+ROW(1, true, 10, 100, 1000, 10000, 100000, 1.1, 2.2, 'hello', 'char_test', '2024-01-01 12:00:00', '2024-01-01', [1,2,3], map('key1', 1, 'key2', 2), row(1, 'test1')),
+ROW(2, false, 20, 200, 2000, 20000, 200000, 3.3, 4.4, 'world', 'char_test2', '2024-02-02 13:00:00', '2024-02-02', [4,5,6], map('key3', 3, 'key4', 4), row(2, 'test2')),
+ROW(3, null, 30, 300, 3000, 30000, 300000, 5.5, 6.6, null, null, null, null, null, null, null),
+ROW(4, true, 10, 100, 1000, 10000, 100000, 1.1, 2.2, 'hello', 'char_test', '2024-01-01 12:00:00', '2024-01-01', [1,2,3], map('key1', 1, 'key2', 2), row(1, 'test1')),
+ROW(5, false, 20, 200, 2000, 20000, 200000, 3.3, 4.4, 'world', 'char_test2', '2024-02-02 13:00:00', '2024-02-02', [4,5,6], map('key3', 3, 'key4', 4), row(2, 'test2')),
+ROW(1, true, 10, 100, 1000, 10000, 100000, 1.1, 2.2, 'hello', 'char_test', '2024-01-01 12:00:00', '2024-01-01', [1,2,3], map('key1', 1, 'key2', 2), row(1, 'test1')),
+ROW(2, false, 20, 200, 2000, 20000, 200000, 3.3, 4.4, 'world', 'char_test2', '2024-02-02 13:00:00', '2024-02-02', [4,5,6], map('key3', 3, 'key4', 4), row(2, 'test2'));
 
 -- query 294
 -- @skip_result_check=true

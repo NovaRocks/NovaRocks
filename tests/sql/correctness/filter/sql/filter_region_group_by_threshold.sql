@@ -28,19 +28,18 @@ DROP TABLE IF EXISTS ${case_db}.t_filter_group_by_customer;
 CREATE TABLE ${case_db}.t_filter_group_by_customer (
     c_custkey INT,
     c_region VARCHAR(32)
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t_filter_group_by_customer VALUES
-    (10000, 'AFRICA'),
-    (15001, 'AFRICA'),
-    (15002, 'AMERICA'),
-    (15003, 'AMERICA'),
-    (14999, 'ASIA'),
-    (17000, 'ASIA'),
-    (18000, 'EUROPE'),
-    (13000, 'MIDDLE EAST'),
-    (19000, 'MIDDLE EAST');
+    ROW(10000, 'AFRICA'),
+    ROW(15001, 'AFRICA'),
+    ROW(15002, 'AMERICA'),
+    ROW(15003, 'AMERICA'),
+    ROW(14999, 'ASIA'),
+    ROW(17000, 'ASIA'),
+    ROW(18000, 'EUROPE'),
+    ROW(13000, 'MIDDLE EAST'),
+    ROW(19000, 'MIDDLE EAST');
 
 SELECT c_region, COUNT(*) AS customer_count
 FROM ${case_db}.t_filter_group_by_customer

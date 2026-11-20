@@ -38,13 +38,13 @@ publication=$(docker/iceberg-rest/up.sh | python3 -c 'import json,sys; print(jso
 export NOVA_ENV_REST_ENV_FILE="$publication/env.sh"
 source "$NOVA_ENV_REST_ENV_FILE"
 hms_manifest=$(docker/iceberg-hive/up.sh)
-hms_dir=$(printf '%s' "$hms_manifest" | python3 -c 'import json,sys,pathlib; print(pathlib.Path(json.load(sys.stdin)["compose_env"]).parent)')
-source "$hms_dir/env.sh"
+hms_env=$(printf '%s' "$hms_manifest" | python3 -c 'import json,sys; print(json.load(sys.stdin)["env_file"])')
+source "$hms_env"
 ```
 
 HMS拥有自己的项目和Derby卷，只连接准确machine外部网络，不归REST核心栈计数。它使用机器配置的HMS端口（默认28005）；不再按旧catalog版本分配或扫描端口。普通 up 复用已有记录，只有缺失的镜像才按统一配方构建。实际 HMS listener 的启动/退出仍由其原 owner 负责，不扩展成全机器环境检查。`--prepare-only`只按已固定的ready publication生成文件，不调用Docker；REST未绑定时不能猜依赖。
 
-保存目录为 `<machine-control-root>/<machine-id>/hms/<machine-id>/`，包含manifest、env、Compose、core-site、catalog SQL和Spark defaults。机器version/generation、网络ID及准确HMS容器共同约束连接。换activation前须通过HMS自身入口退出旧记录，不能由REST owner删除其Derby卷。
+保存目录为 `<machine-control-root>/<machine-id>/hms/<machine-id>/`。Compose、core-site 和 Spark defaults 由同一个 HMS 运行记录保管。运行 `up.sh` 取得当前发布的 `env_file` 和 `hms.catalog_sql`，两者位于 `sql-trino-v1/`。已有 HMS 可直接重新发布，原根目录下发布过的 `env.sh` 和 catalog SQL 保留原字节。此前从 `compose_env` 推导 env 路径的脚本需改为读取 `env_file`。机器 version/generation、网络 ID 及准确 HMS 容器共同约束连接。换 activation 前须通过 HMS 自身入口退出旧记录，REST owner 无权删除其 Derby 卷。
 
 ```bash
 cargo run --manifest-path tests/sql/runner/Cargo.toml -- \

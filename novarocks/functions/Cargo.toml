@@ -38,6 +38,8 @@ url.workspace = true
 arrow-arith = "60.1.0"
 arrow-ord = "60.1.0"
 regex.workspace = true
+# Reuse the locked Unicode property author for Trino's BMP decimal digits.
+icu_properties = "=2.1.2"
 roaring.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true

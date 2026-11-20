@@ -151,13 +151,42 @@ pub(crate) struct LogicalFinishInput {
     pub(crate) environment: SqlPlanningEnvironment,
     pub(crate) level: ExplainLevel,
 }
+struct CatalogQualificationSource {
+    bindings: Arc<crate::catalog_application::query_bindings::QueryTableBindingStore>,
+    application: Arc<dyn novarocks_catalog_application::CatalogApplicationPort>,
+}
+
+impl CatalogQualificationSource {
+    fn observe(
+        &self,
+        candidates: &[novarocks_spi::connector::ConnectorInstanceId],
+    ) -> Result<novarocks_sql::compiler::CatalogQualifications, SqlCompileError> {
+        self.bindings
+            .observe_catalog_qualifications(candidates, Some(self.application.as_ref()))
+    }
+}
+
 struct LogicalCatalogInput {
-    query: novarocks_parser::ast::Query,
+    input: novarocks_sql::compiler::SqlStatementInput,
     session: SqlSessionContext,
     control: SqlCompileControl,
 }
 enum PlanningCpuInput {
     SessionProperties(Box<crate::query::session_property_computation::SessionPropertyCpuInput>),
+    QuerySessionProperties(
+        Box<crate::query::session_property_computation::QuerySessionPropertyCpuInput>,
+    ),
+    AnalyzeProperties(Box<crate::query::analyze_property_computation::AnalyzePropertyCpuInput>),
+    MvProperties(Box<crate::query::mv_property_action::MvPropertyCpuInput>),
+    CatalogProperties(Box<crate::query::catalog_property_computation::CatalogPropertyCpuInput>),
+    TrinoTableProperties(Box<crate::query::table_property_computation::TrinoTablePropertyCpuInput>),
+    FinishTrinoTableLike {
+        table: Box<crate::query::table_property_computation::PreparedTrinoTableLike>,
+        columns: Vec<novarocks_sql::semantic::TableColumnDef>,
+    },
+    SchemaProperties(Box<crate::query::schema_create_action::SchemaPropertyInput>),
+    CtasProperties(Box<crate::query::ctas_action::trino::TrinoCtasPropertyInput>),
+    LikeColumns(Box<crate::query::table_property_computation::LikeColumnsCpuInput>),
     SystemTableBatch,
     SystemTableFinish,
     Start(Box<SqlFinalPlanCompileRequest>),
@@ -179,6 +208,76 @@ enum PlanningCpuInput {
     LogicalFinish(Box<LogicalFinishInput>),
 }
 enum PlanningCpuOutput {
+    AnalyzeColumns(
+        Result<
+            crate::statistics::application::StatisticsColumnIntent,
+            novarocks_query_application::session_error::QueryServiceError,
+        >,
+    ),
+    QuerySessionProperties(
+        Box<
+            Result<
+                crate::query::session_property_computation::PreparedQuerySession,
+                novarocks_query_application::session_error::QueryServiceError,
+            >,
+        >,
+    ),
+    TrinoTableProperties(
+        Box<
+            Result<
+                crate::query::table_property_computation::TrinoTablePropertyOutput,
+                novarocks_query_application::session_error::QueryServiceError,
+            >,
+        >,
+    ),
+    SchemaProperties(
+        Box<
+            Result<
+                crate::query::table_mutation_action::PreparedTableMutationInput,
+                novarocks_query_application::session_error::QueryServiceError,
+            >,
+        >,
+    ),
+    TableProperties(
+        Box<
+            Result<
+                crate::query::table_mutation_action::PreparedTableMutationInput,
+                novarocks_query_application::session_error::QueryServiceError,
+            >,
+        >,
+    ),
+    CtasProperties(
+        Box<
+            Result<
+                crate::query_execution::dml::ctas::CtasCommand,
+                novarocks_query_application::session_error::QueryServiceError,
+            >,
+        >,
+    ),
+    LikeColumns(
+        Box<
+            Result<
+                Vec<novarocks_sql::semantic::TableColumnDef>,
+                novarocks_query_application::session_error::QueryServiceError,
+            >,
+        >,
+    ),
+    CatalogProperties(
+        Box<
+            Result<
+                novarocks_sql::semantic::command::CatalogCreateCommand,
+                novarocks_query_application::session_error::QueryServiceError,
+            >,
+        >,
+    ),
+    MvProperties(
+        Box<
+            Result<
+                crate::query::mv_property_action::PreparedMvProperties,
+                novarocks_query_application::session_error::QueryServiceError,
+            >,
+        >,
+    ),
     SessionProperties(
         Box<
             Result<
@@ -203,6 +302,7 @@ enum PlanningCpuOutput {
 }
 struct PlanningCpuBody {
     system_snapshot: Option<crate::system_tables::SystemTableCpuStaging>,
+    catalog_qualification_source: Option<CatalogQualificationSource>,
     input: Option<PlanningCpuInput>,
     output: Option<PlanningCpuOutput>,
     candidate: Option<CompletedPhysicalPlanCandidate>,
@@ -258,8 +358,35 @@ impl PlanningCpuOriginal {
         body.started = true;
         let input = body.input.take().expect("original planning input");
         let output = match input {
+            PlanningCpuInput::AnalyzeProperties(input) => {
+                PlanningCpuOutput::AnalyzeColumns(input.run())
+            }
+            PlanningCpuInput::QuerySessionProperties(input) => {
+                PlanningCpuOutput::QuerySessionProperties(Box::new(input.run()))
+            }
             PlanningCpuInput::SessionProperties(input) => {
                 PlanningCpuOutput::SessionProperties(Box::new(input.run()))
+            }
+            PlanningCpuInput::CatalogProperties(input) => {
+                PlanningCpuOutput::CatalogProperties(Box::new(input.run()))
+            }
+            PlanningCpuInput::MvProperties(input) => {
+                PlanningCpuOutput::MvProperties(Box::new(input.run()))
+            }
+            PlanningCpuInput::TrinoTableProperties(input) => {
+                PlanningCpuOutput::TrinoTableProperties(Box::new(input.run()))
+            }
+            PlanningCpuInput::FinishTrinoTableLike { table, columns } => {
+                PlanningCpuOutput::TableProperties(Box::new(table.finish(columns)))
+            }
+            PlanningCpuInput::SchemaProperties(input) => {
+                PlanningCpuOutput::SchemaProperties(Box::new(input.run()))
+            }
+            PlanningCpuInput::CtasProperties(input) => {
+                PlanningCpuOutput::CtasProperties(Box::new(input.run()))
+            }
+            PlanningCpuInput::LikeColumns(input) => {
+                PlanningCpuOutput::LikeColumns(Box::new(input.run()))
             }
             PlanningCpuInput::SystemTableBatch => PlanningCpuOutput::SystemTableBatch(
                 body.system_snapshot
@@ -274,7 +401,21 @@ impl PlanningCpuOriginal {
                     .finish(),
             ),
             PlanningCpuInput::Start(request) => {
-                PlanningCpuOutput::Progress(SqlCompletionPureSteps::start(*request))
+                let request = *request;
+                let result = if let Some(source) = body.catalog_qualification_source.take() {
+                    request
+                        .quoted_metadata_catalogs()
+                        .and_then(|candidates| source.observe(&candidates))
+                        .map_err(FinalPlanCompletionError::from)
+                        .and_then(|qualifications| {
+                            SqlCompletionPureSteps::start(
+                                request.with_catalog_qualifications(qualifications),
+                            )
+                        })
+                } else {
+                    SqlCompletionPureSteps::start(request)
+                };
+                PlanningCpuOutput::Progress(result)
             }
             PlanningCpuInput::Finish {
                 compilation,
@@ -302,12 +443,25 @@ impl PlanningCpuOriginal {
             ),
             PlanningCpuInput::LogicalCatalog(input) => {
                 let LogicalCatalogInput {
-                    query,
+                    input,
                     session,
                     control,
                 } = *input;
-                PlanningCpuOutput::LogicalCatalog(Box::new(SqlLogicalExplainCatalog::try_new(
-                    query, session, control,
+                let qualifications = match body.catalog_qualification_source.take() {
+                    Some(source) => input
+                        .quoted_metadata_catalogs(&session, &control)
+                        .and_then(|candidates| source.observe(&candidates)),
+                    None => Ok(novarocks_sql::compiler::CatalogQualifications::default()),
+                };
+                PlanningCpuOutput::LogicalCatalog(Box::new(qualifications.and_then(
+                    |qualifications| {
+                        SqlLogicalExplainCatalog::try_new_for_input_with_qualifications(
+                            input,
+                            session,
+                            control,
+                            qualifications,
+                        )
+                    },
                 )))
             }
             PlanningCpuInput::LogicalContinue { logical, facts } => {
@@ -478,6 +632,7 @@ impl FrontendPlanningCpuSource {
             original: Arc::new(PlanningCpuOriginal {
                 body: Mutex::new(Some(PlanningCpuBody {
                     system_snapshot: None,
+                    catalog_qualification_source: None,
                     input: None,
                     output: None,
                     candidate: None,
@@ -511,6 +666,26 @@ impl FrontendPlanningCpuSource {
             .as_ref()
             .and_then(|s| s.health.clone())
     }
+    pub(crate) fn install_catalog_qualification_source(
+        &self,
+        bindings: Arc<crate::catalog_application::query_bindings::QueryTableBindingStore>,
+        application: Option<Arc<dyn novarocks_catalog_application::CatalogApplicationPort>>,
+    ) {
+        let Some(application) = application else {
+            return;
+        };
+        let mut loan = self.original.loan();
+        let body = loan.body.as_mut().expect("original planning body");
+        assert!(
+            body.input.is_none() && body.catalog_qualification_source.is_none(),
+            "catalog observation belongs to one original compiler start",
+        );
+        body.catalog_qualification_source = Some(CatalogQualificationSource {
+            bindings,
+            application,
+        });
+    }
+
     fn install(&self, input: PlanningCpuInput) {
         let mut driver_loan = self.driver_loan();
         let driver = driver_loan.body.as_mut().expect("original planning driver");
@@ -944,6 +1119,154 @@ impl FrontendPlanningCpuSource {
         };
         Ok(result)
     }
+    pub(crate) async fn analyze_properties(
+        &self,
+        input: crate::query::analyze_property_computation::AnalyzePropertyCpuInput,
+    ) -> Result<
+        Result<
+            crate::statistics::application::StatisticsColumnIntent,
+            novarocks_query_application::session_error::QueryServiceError,
+        >,
+        StatementNativeHealthFailure,
+    > {
+        self.install(PlanningCpuInput::AnalyzeProperties(Box::new(input)));
+        let PlanningCpuOutput::AnalyzeColumns(result) = self.receive().await? else {
+            panic!("ANALYZE properties returned another CPU phase");
+        };
+        Ok(result)
+    }
+
+    pub(crate) async fn catalog_properties(
+        &self,
+        input: crate::query::catalog_property_computation::CatalogPropertyCpuInput,
+    ) -> Result<
+        Result<
+            novarocks_sql::semantic::command::CatalogCreateCommand,
+            novarocks_query_application::session_error::QueryServiceError,
+        >,
+        StatementNativeHealthFailure,
+    > {
+        self.install(PlanningCpuInput::CatalogProperties(Box::new(input)));
+        let PlanningCpuOutput::CatalogProperties(result) = self.receive().await? else {
+            panic!("catalog properties returned another CPU phase")
+        };
+        Ok(*result)
+    }
+    pub(crate) async fn trino_table_properties(
+        &self,
+        input: crate::query::table_property_computation::TrinoTablePropertyCpuInput,
+    ) -> Result<
+        Result<
+            crate::query::table_property_computation::TrinoTablePropertyOutput,
+            novarocks_query_application::session_error::QueryServiceError,
+        >,
+        StatementNativeHealthFailure,
+    > {
+        self.install(PlanningCpuInput::TrinoTableProperties(Box::new(input)));
+        let PlanningCpuOutput::TrinoTableProperties(result) = self.receive().await? else {
+            panic!("typed table properties returned another CPU phase");
+        };
+        Ok(*result)
+    }
+
+    pub(crate) async fn finish_trino_table_like(
+        &self,
+        table: Box<crate::query::table_property_computation::PreparedTrinoTableLike>,
+        columns: Vec<novarocks_sql::semantic::TableColumnDef>,
+    ) -> Result<
+        Result<
+            crate::query::table_mutation_action::PreparedTableMutationInput,
+            novarocks_query_application::session_error::QueryServiceError,
+        >,
+        StatementNativeHealthFailure,
+    > {
+        self.install(PlanningCpuInput::FinishTrinoTableLike { table, columns });
+        let PlanningCpuOutput::TableProperties(result) = self.receive().await? else {
+            panic!("typed table LIKE returned another CPU phase");
+        };
+        Ok(*result)
+    }
+
+    pub(crate) async fn schema_properties(
+        &self,
+        input: crate::query::schema_create_action::SchemaPropertyInput,
+    ) -> Result<
+        Result<
+            crate::query::table_mutation_action::PreparedTableMutationInput,
+            novarocks_query_application::session_error::QueryServiceError,
+        >,
+        StatementNativeHealthFailure,
+    > {
+        self.install(PlanningCpuInput::SchemaProperties(Box::new(input)));
+        let PlanningCpuOutput::SchemaProperties(result) = self.receive().await? else {
+            panic!("schema properties returned another CPU phase");
+        };
+        Ok(*result)
+    }
+    pub(crate) async fn mv_properties(
+        &self,
+        input: crate::query::mv_property_action::MvPropertyCpuInput,
+    ) -> Result<
+        Result<
+            crate::query::mv_property_action::PreparedMvProperties,
+            novarocks_query_application::session_error::QueryServiceError,
+        >,
+        StatementNativeHealthFailure,
+    > {
+        self.install(PlanningCpuInput::MvProperties(Box::new(input)));
+        let PlanningCpuOutput::MvProperties(result) = self.receive().await? else {
+            panic!("MV properties returned another CPU phase");
+        };
+        Ok(*result)
+    }
+    pub(crate) async fn ctas_properties(
+        &self,
+        input: crate::query::ctas_action::trino::TrinoCtasPropertyInput,
+    ) -> Result<
+        Result<
+            crate::query_execution::dml::ctas::CtasCommand,
+            novarocks_query_application::session_error::QueryServiceError,
+        >,
+        StatementNativeHealthFailure,
+    > {
+        self.install(PlanningCpuInput::CtasProperties(Box::new(input)));
+        let PlanningCpuOutput::CtasProperties(result) = self.receive().await? else {
+            panic!("CTAS properties returned another CPU phase");
+        };
+        Ok(*result)
+    }
+    pub(crate) async fn like_columns(
+        &self,
+        input: crate::query::table_property_computation::LikeColumnsCpuInput,
+    ) -> Result<
+        Result<
+            Vec<novarocks_sql::semantic::TableColumnDef>,
+            novarocks_query_application::session_error::QueryServiceError,
+        >,
+        StatementNativeHealthFailure,
+    > {
+        self.install(PlanningCpuInput::LikeColumns(Box::new(input)));
+        let PlanningCpuOutput::LikeColumns(result) = self.receive().await? else {
+            panic!("LIKE columns returned another CPU phase");
+        };
+        Ok(*result)
+    }
+    pub(crate) async fn query_session_properties(
+        &self,
+        input: crate::query::session_property_computation::QuerySessionPropertyCpuInput,
+    ) -> Result<
+        Result<
+            crate::query::session_property_computation::PreparedQuerySession,
+            novarocks_query_application::session_error::QueryServiceError,
+        >,
+        StatementNativeHealthFailure,
+    > {
+        self.install(PlanningCpuInput::QuerySessionProperties(Box::new(input)));
+        let PlanningCpuOutput::QuerySessionProperties(result) = self.receive().await? else {
+            panic!("query session properties returned another CPU phase");
+        };
+        Ok(*result)
+    }
     pub(crate) async fn session_properties(
         &self,
         input: crate::query::session_property_computation::SessionPropertyCpuInput,
@@ -960,16 +1283,16 @@ impl FrontendPlanningCpuSource {
         };
         Ok(*result)
     }
-    pub(crate) async fn logical_catalog(
+    pub(crate) async fn logical_catalog_for_input(
         &self,
-        query: novarocks_parser::ast::Query,
+        input: novarocks_sql::compiler::SqlStatementInput,
         session: SqlSessionContext,
         control: SqlCompileControl,
     ) -> Result<Result<SqlLogicalExplainCatalog, SqlCompileError>, StatementNativeHealthFailure>
     {
         self.install(PlanningCpuInput::LogicalCatalog(Box::new(
             LogicalCatalogInput {
-                query,
+                input,
                 session,
                 control,
             },
@@ -1189,11 +1512,7 @@ mod map64_planning_worker_tests {
         for level in 0..63 {
             sql = format!("SELECT map_agg(1, m) AS m FROM ({sql}) q{level}");
         }
-        let mut statements = novarocks_parser::parse(&sql).unwrap();
-        assert_eq!(statements.len(), 1);
-        let novarocks_parser::ast::Statement::Query(query) = statements.pop().unwrap() else {
-            panic!("expected one query");
-        };
+        let query = novarocks_parser::parser::parse_query(&sql).unwrap();
         SqlFinalPlanCompileRequest::new(
             PlanVersionId::try_new([43; 16]).unwrap(),
             SqlStatementInput::parsed_query(Box::new(query)),

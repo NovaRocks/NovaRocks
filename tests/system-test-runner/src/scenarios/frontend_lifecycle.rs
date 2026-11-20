@@ -112,7 +112,7 @@ impl Scenario for CatalogPartialReadiness {
         };
         let namespace = format!("lnp8ns_{}", context.trino_port());
         connection
-            .execute(format!("CREATE DATABASE lnp8_healthy.{namespace}"))
+            .execute(format!("CREATE SCHEMA lnp8_healthy.{namespace}"))
             .context("create healthy partial catalog namespace")?;
         let phase = (|| -> Result<()> {
             connection
@@ -147,7 +147,7 @@ impl Scenario for CatalogPartialReadiness {
             Ok(())
         })();
         let cleanup = connection
-            .execute(format!("DROP DATABASE lnp8_healthy.{namespace}"))
+            .execute(format!("DROP SCHEMA lnp8_healthy.{namespace}"))
             .map(|_| ())
             .context("drop healthy partial catalog namespace");
         finish_namespace_cleanup(phase, cleanup)
@@ -212,7 +212,7 @@ impl Scenario for StaticFileDisposableCarrier {
         };
         let namespace = format!("lnp8ns_{}", context.trino_port());
         connection
-            .execute(format!("CREATE DATABASE lnp8_static.{namespace}"))
+            .execute(format!("CREATE SCHEMA lnp8_static.{namespace}"))
             .context("create StaticFile catalog namespace")?;
         connection
             .execute(format!("USE lnp8_static.{namespace}"))
@@ -653,7 +653,7 @@ fn run_blue_green_cutover(
         SqlSession::new(context.sql_user(), context.trino_port(), context.deadline())?;
     let namespace = format!("lnp8ns_{}", context.trino_port());
     blue_idle
-        .execute(format!("CREATE DATABASE lnp8_blue.{namespace}"))
+        .execute(format!("CREATE SCHEMA lnp8_blue.{namespace}"))
         .context("create shared blue-green namespace")?;
     let result = (|| -> Result<()> {
         blue_idle
@@ -724,7 +724,7 @@ fn run_blue_green_cutover(
             context.deadline(),
         )?;
         connection
-            .execute(format!("DROP DATABASE lnp8_green.{namespace}"))
+            .execute(format!("DROP SCHEMA lnp8_green.{namespace}"))
             .context("drop shared blue-green namespace")?;
         Ok(())
     })();

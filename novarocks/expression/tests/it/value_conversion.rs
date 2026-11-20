@@ -32,7 +32,8 @@ use novarocks_expression::{
         guarded_fixtures::{
             Fixture, GUARDED_CONTROL as Control, argument, author, causes, round_value,
             value_conversion::{
-                conversion_program, converted, direct_program, largeint_type, nominal,
+                array_common_coerced, conversion_program, converted, direct_program, largeint_type,
+                nominal,
             },
         },
     },
@@ -915,4 +916,116 @@ fn nominal_largeint_text_actual_compiler_matches_v1_sparse_min_max_null_slice_em
         output.values().to_data(),
         StringArray::from(Vec::<Option<&str>>::new()).to_data()
     );
+}
+
+fn array_common_round_frame_program(convert: bool) -> Fixture {
+    let decimal = FunctionValueType::new(DataType::Decimal128(38, 0), true);
+    conversion_program(
+        std::slice::from_ref(&decimal),
+        |functions, builder, authors, leaves, source_pools| {
+            let rounded = round_value(builder, authors, functions, leaves[0], source_pools);
+            if !convert {
+                return rounded;
+            }
+            array_common_coerced(
+                functions,
+                builder,
+                authors,
+                rounded,
+                decimal.clone(),
+                FunctionValueType::new(DataType::Float64, true),
+            )
+        },
+    )
+}
+
+#[test]
+fn actual_compiled_array_common_frame_keeps_upstream_round_data_and_original_sparse_rows() {
+    let source_program = array_common_round_frame_program(false);
+    let common_program = array_common_round_frame_program(true);
+    assert_eq!(
+        result_type(&source_program),
+        FunctionValueType::new(DataType::Decimal128(38, 0), true)
+    );
+    assert_eq!(
+        result_type(&common_program),
+        FunctionValueType::new(DataType::Float64, true)
+    );
+    // Row0 is a real overflow outside the selected domain. Row2 is the only
+    // demanded source error; row3 is an original SQL NULL, not a row error.
+    let max38 = 10_i128.pow(38) - 1;
+    let values: ArrayRef = Arc::new(
+        Decimal128Array::from(vec![Some(max38), Some(25), Some(max38), None, Some(35)])
+            .with_precision_and_scale(38, 0)
+            .unwrap(),
+    );
+    let original = Arc::clone(&values);
+    let source_batch = input_batch(&source_program, vec![Arc::clone(&values)]);
+    let common_batch = input_batch(&common_program, vec![Arc::clone(&values)]);
+    let rows = [1_usize, 2, 3, 4];
+    let selection = Selection::try_sparse(5, &rows).unwrap();
+    let source_output = source_program
+        .instance(&Control)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &source_batch,
+                source: None,
+            },
+            ScalarInvocationScope::new(selection, selection),
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
+        )
+        .unwrap();
+    let common_output = common_program
+        .instance(&Control)
+        .evaluate(
+            EvaluationInput::Batch {
+                batch: &common_batch,
+                source: None,
+            },
+            ScalarInvocationScope::new(selection, selection),
+            ScalarInvocationActivation::Activated,
+            &Control,
+            &mut PassThroughCallHost,
+        )
+        .unwrap();
+    assert!(Arc::ptr_eq(&values, &original));
+    assert_eq!(source_output.selection().iter().collect::<Vec<_>>(), rows);
+    assert_eq!(common_output.selection().iter().collect::<Vec<_>>(), rows);
+    assert_eq!(source_output.errors().len(), 1);
+    assert_eq!(source_output.errors()[0].selected_ordinal(), 1);
+    assert_eq!(
+        source_output.errors()[0].reason(),
+        novarocks_functions::DataFailureReason::NumericOutOfRange
+    );
+    assert_eq!(common_output.errors(), source_output.errors());
+    let before = source_output
+        .values()
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .unwrap();
+    let after = common_output
+        .values()
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    assert_eq!(before.value(0), 30);
+    assert_eq!(before.value(3), 40);
+    assert!(before.is_null(1));
+    assert!(before.is_null(2));
+    assert_eq!(after.value(0).to_bits(), 30.0_f64.to_bits());
+    assert_eq!(after.value(3).to_bits(), 40.0_f64.to_bits());
+    assert!(after.is_null(1));
+    assert!(after.is_null(2));
+    // ROUND's existing producer uses a bounded diagnostic, not a domain Error
+    // object. Compare the complete real journal fact; do not invent cross-run
+    // pointer identity for causes that do not carry a source object.
+    assert!(std::error::Error::source(&source_output.errors()[0]).is_none());
+    assert!(std::error::Error::source(&common_output.errors()[0]).is_none());
+    // Decimal38 -> Double cannot create this overflow itself. Success here
+    // requires Execution's real eager Frame to exclude the source-error row,
+    // pass a clean argument to the new family, then restore the original row
+    // ordinal/cause. ScalarEvaluationInstance alone must keep rejecting such
+    // unresolved input journals with ArgumentRowErrors (KERNEL64).
 }

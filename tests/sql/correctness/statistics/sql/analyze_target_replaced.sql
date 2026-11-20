@@ -24,22 +24,22 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE DATABASE IF NOT EXISTS statistics_cat_${suite_uuid0}.nr_replaced_${suite_uuid0};
+CREATE SCHEMA IF NOT EXISTS statistics_cat_${suite_uuid0}.nr_replaced_${suite_uuid0};
 
 -- query 2
 -- @skip_result_check=true
 CREATE TABLE statistics_cat_${suite_uuid0}.nr_replaced_${suite_uuid0}.same_name_${uuid0} (
     k BIGINT NOT NULL
-) TBLPROPERTIES ('novarocks.statistics.collect-on-write' = 'false');
+) WITH (statistics_collect_on_write = false);
 
 -- query 3
 -- @skip_result_check=true
 INSERT INTO statistics_cat_${suite_uuid0}.nr_replaced_${suite_uuid0}.same_name_${uuid0} VALUES
-    (37);
+    ROW(37);
 
 -- query 4
 -- @skip_result_check=true
-ANALYZE TABLE statistics_cat_${suite_uuid0}.nr_replaced_${suite_uuid0}.same_name_${uuid0} (k);
+ANALYZE statistics_cat_${suite_uuid0}.nr_replaced_${suite_uuid0}.same_name_${uuid0} WITH (columns = ARRAY['k']);
 
 -- query 5
 -- The REST ANALYZE has published before the next statement can read NDV.
@@ -53,18 +53,18 @@ SHOW STATS FOR statistics_cat_${suite_uuid0}.nr_replaced_${suite_uuid0}.same_nam
 
 -- query 6
 -- @skip_result_check=true
-DROP TABLE statistics_cat_${suite_uuid0}.nr_replaced_${suite_uuid0}.same_name_${uuid0} FORCE;
+DROP TABLE statistics_cat_${suite_uuid0}.nr_replaced_${suite_uuid0}.same_name_${uuid0} ;
 
 -- query 7
 -- @skip_result_check=true
 CREATE TABLE statistics_cat_${suite_uuid0}.nr_replaced_${suite_uuid0}.same_name_${uuid0} (
     k BIGINT NOT NULL
-) TBLPROPERTIES ('novarocks.statistics.collect-on-write' = 'false');
+) WITH (statistics_collect_on_write = false);
 
 -- query 8
 -- @skip_result_check=true
 INSERT INTO statistics_cat_${suite_uuid0}.nr_replaced_${suite_uuid0}.same_name_${uuid0} VALUES
-    (99);
+    ROW(99);
 
 -- query 9
 -- The current table has a new physical identity. It must not inherit the

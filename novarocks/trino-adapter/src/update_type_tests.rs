@@ -29,6 +29,7 @@ fn row_statements_and_empty_input_do_not_publish_an_update_type() {
         ShowCreateTable,
         ExplainMaterializedViewRefresh,
         ShowCreateView,
+        ShowCreateMaterializedView,
     ] {
         assert_eq!(update_type(kind), None, "{kind:?}");
     }
@@ -69,6 +70,7 @@ fn task_names_match_trino_and_novarocks_extensions() {
         (Update, "UPDATE"),
         (Merge, "MERGE"),
         (SetSession, "SET SESSION"),
+        (ResetSession, "RESET SESSION"),
         (Use, "USE"),
         (BeginTransaction, "START TRANSACTION"),
         (Commit, "COMMIT"),

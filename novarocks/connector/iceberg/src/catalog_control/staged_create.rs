@@ -21,7 +21,7 @@
 //! ordinary metadata. Staging therefore neither rebuilds a client nor
 //! downcasts the generic catalog surface.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -29,10 +29,9 @@ use bytes::Bytes;
 use novarocks_spi::connector::{
     ConnectorColumnDefinition, ConnectorCtasUnanchoredProvenance, ConnectorError,
     ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorMutationFailure,
-    ConnectorMutationFailureKind, ConnectorPartitionTransform,
-    ConnectorPreparedCreateDocumentTarget, ConnectorPreparedCreateFieldBinding,
-    ConnectorProviderBindingKey, ConnectorRequestContext, ConnectorStagedCreate,
-    ConnectorStagedCreateAbortOutcome, ConnectorStagedCreateAbortRequest,
+    ConnectorMutationFailureKind, ConnectorOperationControl, ConnectorPreparedCreateDocumentTarget,
+    ConnectorPreparedCreateFieldBinding, ConnectorProviderBindingKey, ConnectorRequestContext,
+    ConnectorStagedCreate, ConnectorStagedCreateAbortOutcome, ConnectorStagedCreateAbortRequest,
     ConnectorStagedCreateMode, ConnectorStagedCreateOperationId,
     ConnectorStagedCreatePrepareOutcome, ConnectorStagedCreatePrepareRequest,
     ConnectorStagedCreatePublicationAdjudicationOutcome,
@@ -46,8 +45,12 @@ use novarocks_spi::connector::{
 };
 use novarocks_types::naming::normalize_identifier;
 
+use crate::catalog::staged_metadata_path::{StagedMetadataPath, WRITE_METADATA_PATH};
 use crate::commit::WrittenFile;
-use crate::iceberg::{TableCreation, TableUpdate};
+use crate::iceberg::{
+    TableCreation, TableUpdate,
+    spec::{FormatVersion, Schema, UnboundPartitionSpec},
+};
 
 #[path = "staged_create/publication.rs"]
 mod publication;
@@ -87,6 +90,9 @@ pub(crate) struct RestStagedTableCreate {
     pub(crate) initialization_updates: Vec<TableUpdate>,
     /// Changes layered over the exact REST initialization by canonical staging.
     publication_updates: Vec<TableUpdate>,
+    /// Final table root, separately from the warehouse-rooted staged metadata.
+    final_table_location: Option<Arc<str>>,
+    final_metadata_path: Option<StagedMetadataPath>,
 }
 
 /// One request journal survives both initial staging and final publication.
@@ -158,7 +164,173 @@ impl From<ConnectorError> for RestStagedPrepareFailure {
     }
 }
 
-pub(crate) fn prepare_rest_staged_table(
+struct PreparedStagedTable {
+    final_table_location: Option<Arc<str>>,
+    final_metadata_path: Option<StagedMetadataPath>,
+    format_version: FormatVersion,
+    properties: BTreeMap<String, String>,
+    schema: Schema,
+    partition_spec: Option<UnboundPartitionSpec>,
+}
+
+fn build_staged_schema(columns: &[ConnectorColumnDefinition]) -> Result<Schema, String> {
+    Schema::builder()
+        .with_fields(super::type_mapping::schema_fields(columns)?)
+        .build()
+        .map_err(|error| format!("build staged Iceberg schema: {error}"))
+}
+
+fn prepare_typed_staged_table(
+    request: &ConnectorStagedCreatePrepareRequest,
+    warehouse: &str,
+) -> Result<PreparedStagedTable, ConnectorError> {
+    let Some(storage) = request.ordinary_typed_properties()? else {
+        return prepare_mv_staged_table(request, warehouse);
+    };
+    let control = &request.context;
+    let storage = crate::table_properties::prepare_ctas_storage(
+        storage.properties(),
+        storage.comment(),
+        control,
+    )?;
+    validate_typed_staged_columns(request)?;
+    bind_typed_staged_table(request, storage, None, None)
+}
+
+fn validate_typed_staged_columns(
+    request: &ConnectorStagedCreatePrepareRequest,
+) -> Result<(), ConnectorError> {
+    crate::commit::validation::deny_variant_column_definitions(
+        &request.columns,
+        &format!("{}.{}", request.table.namespace, request.table.table),
+    )?;
+    super::catalog_mutation::validate_create_column_names(&request.columns)
+}
+
+fn prepare_mv_staged_table(
+    request: &ConnectorStagedCreatePrepareRequest,
+    warehouse: &str,
+) -> Result<PreparedStagedTable, ConnectorError> {
+    let ConnectorStagedCreateMode::ApplicationDocumentManaged { storage, .. } = &request.mode
+    else {
+        return Err(internal(
+            "MV staged storage requires document-managed creation",
+        ));
+    };
+    let control = &request.context;
+    let (mut storage_facts, requested_metadata_path) =
+        crate::table_properties::prepare_mv_staged_storage(storage.properties(), control)?;
+    let final_metadata_path = requested_metadata_path
+        .map(|path| StagedMetadataPath::under_warehouse(&path, warehouse, CTAS_STAGING_NAMESPACE))
+        .transpose()
+        .map_err(novarocks_spi::connector::InvalidTableProperty::from_property_error)?;
+    validate_typed_staged_columns(request)?;
+    for (key, value) in storage.application_properties() {
+        control.check_active()?;
+        super::catalog_mutation::validate_staged_application_property_key(key)?;
+        super::catalog_mutation::reject_variant_shredding_property(key)?;
+        if key.eq_ignore_ascii_case(WRITE_METADATA_PATH) {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "A custom write.metadata.path is unsupported for staged materialized-view storage",
+            ));
+        }
+        if key.eq_ignore_ascii_case("format-version")
+            || key.eq_ignore_ascii_case("format_version")
+            || [
+                CTAS_OPERATION_MARKER,
+                CTAS_PROVENANCE_VERSION,
+                CTAS_PROVENANCE_TARGET,
+                CTAS_PROVENANCE_EXPECTED_ABSENT,
+                CTAS_PROVENANCE_TABLE_UUID,
+            ]
+            .iter()
+            .any(|marker| key.eq_ignore_ascii_case(marker))
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::Internal,
+                "Typed staged MV application properties contain a provider-owned key",
+            ));
+        }
+        if storage_facts.raw_properties.contains_key(key.as_ref()) {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::Internal,
+                "Typed staged MV application keys collide with storage properties",
+            ));
+        }
+        for _ in key
+            .as_bytes()
+            .chunks(256)
+            .chain(value.as_bytes().chunks(256))
+        {
+            control.check_active()?;
+        }
+        storage_facts
+            .raw_properties
+            .insert(key.to_string(), value.to_string());
+    }
+    let mut visible_sources = HashSet::new();
+    for name in storage.visible_partition_sources() {
+        for _ in name.as_bytes().chunks(256) {
+            control.check_active()?;
+        }
+        visible_sources.insert(normalize_identifier(name).map_err(invalid)?);
+    }
+    bind_typed_staged_table(
+        request,
+        storage_facts,
+        Some(&visible_sources),
+        final_metadata_path,
+    )
+}
+
+fn bind_typed_staged_table(
+    request: &ConnectorStagedCreatePrepareRequest,
+    storage_facts: crate::table_properties::PreparedCreateTableProperties,
+    visible_sources: Option<&HashSet<String>>,
+    final_metadata_path: Option<StagedMetadataPath>,
+) -> Result<PreparedStagedTable, ConnectorError> {
+    let control = &request.context;
+    let schema = Arc::new(build_staged_schema(&request.columns).map_err(invalid)?);
+    crate::schema_capability::admit_schema(&schema)?;
+    let spec = if let Some(visible_sources) = visible_sources {
+        crate::table_properties::bind_mv_create_table_partitioning(
+            Arc::clone(&schema),
+            &storage_facts.partitioning,
+            visible_sources,
+            control,
+        )?
+    } else {
+        crate::table_properties::bind_create_table_partitioning(
+            Arc::clone(&schema),
+            &storage_facts.partitioning,
+            control,
+        )?
+    };
+    let schema = Arc::try_unwrap(schema).map_err(|_| {
+        internal(if visible_sources.is_some() {
+            "MV CREATE partition binding retained an unexpected schema alias"
+        } else {
+            "CTAS partition binding retained an unexpected schema alias"
+        })
+    })?;
+    let partition_spec = if storage_facts.partitioning.is_empty() {
+        None
+    } else {
+        Some(spec.into_unbound())
+    };
+    control.check_active()?;
+    Ok(PreparedStagedTable {
+        final_table_location: storage_facts.location.map(Arc::from),
+        final_metadata_path,
+        format_version: storage_facts.format_version,
+        properties: storage_facts.raw_properties,
+        schema,
+        partition_spec,
+    })
+}
+
+fn prepare_rest_staged_table(
     runtime: &IcebergMetadataContext,
     request_context: Option<&novarocks_spi::connector::ConnectorRequestContext>,
     stage_publication: Option<&StagePublication>,
@@ -166,9 +338,7 @@ pub(crate) fn prepare_rest_staged_table(
     publication_id: novarocks_spi::connector::LakePublicationId,
     namespace_name: &str,
     table_name: &str,
-    columns: &[ConnectorColumnDefinition],
-    partitioning: &[ConnectorPartitionTransform],
-    properties: &[(Arc<str>, Arc<str>)],
+    table: PreparedStagedTable,
 ) -> Result<RestStagedTableCreate, RestStagedPrepareFailure> {
     // The generation-level twin of the operation-shaped CTAS admission. Both
     // gates decide the same thing from the same generation, and both must
@@ -190,12 +360,6 @@ pub(crate) fn prepare_rest_staged_table(
             reason.message().to_string(),
         ));
     }
-    crate::commit::validation::deny_variant_column_definitions(
-        columns,
-        &format!("{namespace_name}.{table_name}"),
-    )
-    .and_then(|()| super::catalog_mutation::reject_variant_shredding_properties(properties))
-    .map_err(|error| RestStagedPrepareFailure::Unsupported(error.message().to_owned()))?;
     let namespace_name = normalize_identifier(namespace_name)?;
     let table_name = normalize_identifier(table_name)?;
     let location = ctas_staging_location(
@@ -207,31 +371,14 @@ pub(crate) fn prepare_rest_staged_table(
             "REST staged create has no admitted request context".into(),
         )
     })?;
-    let (format_version, mut properties) =
-        super::catalog_mutation::table_properties(columns, None, properties)?;
-    if format_version != crate::iceberg::spec::FormatVersion::V3
-        && columns.iter().any(|column| {
-            column.default.as_ref().is_some_and(|value| {
-                !matches!(value, novarocks_spi::connector::ConnectorDefaultValue::Null)
-            })
-        })
-    {
-        return Err(RestStagedPrepareFailure::KnownUncommitted(
-            "Iceberg column defaults require format-version 3".to_string(),
-        ));
-    }
-    let schema = crate::iceberg::spec::Schema::builder()
-        .with_fields(super::type_mapping::schema_fields(columns)?)
-        .build()
-        .map_err(|error| format!("build staged Iceberg schema: {error}"))?;
-    crate::schema_capability::admit_schema(&schema).map_err(|error| {
-        if error.kind() == ConnectorErrorKind::Unsupported {
-            RestStagedPrepareFailure::Unsupported(error.message().to_owned())
-        } else {
-            RestStagedPrepareFailure::from(error)
-        }
-    })?;
-    let partition_spec = super::catalog_mutation::initial_partition_spec(&schema, partitioning)?;
+    let PreparedStagedTable {
+        final_table_location,
+        final_metadata_path,
+        format_version,
+        mut properties,
+        schema,
+        partition_spec,
+    } = table;
     properties.insert(
         "format-version".to_string(),
         (format_version as u8).to_string(),
@@ -469,6 +616,16 @@ pub(crate) fn prepare_rest_staged_table(
         CTAS_PROVENANCE_TABLE_UUID.to_string(),
         table.metadata().uuid().to_string(),
     );
+    if final_metadata_path.is_some()
+        && table
+            .metadata()
+            .properties()
+            .contains_key(WRITE_METADATA_PATH)
+    {
+        return Err(RestStagedPrepareFailure::AppliedButUnusable(
+            "REST stage returned write.metadata.path before the final MV publication".into(),
+        ));
+    }
     let mut publication_updates = vec![TableUpdate::SetProperties {
         updates: response_provenance,
     }];
@@ -483,6 +640,8 @@ pub(crate) fn prepare_rest_staged_table(
         table,
         initialization_updates,
         publication_updates,
+        final_table_location,
+        final_metadata_path,
     })
 }
 
@@ -675,6 +834,10 @@ struct PublishEvidenceV2 {
     operation_marker: String,
     table_uuid: String,
     expected_snapshot_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    final_table_location: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    final_metadata_path: Option<String>,
     handle_digest: [u8; 32],
     namespace: String,
     table: String,
@@ -1051,7 +1214,7 @@ impl IcebergStagedCreateAdapter {
     }
 }
 
-pub(crate) async fn prepare_rest_staged_table_async(
+async fn prepare_rest_staged_table_async(
     runtime: &IcebergMetadataContext,
     request_context: Option<&novarocks_spi::connector::ConnectorRequestContext>,
     stage_publication: Option<&StagePublication>,
@@ -1059,9 +1222,7 @@ pub(crate) async fn prepare_rest_staged_table_async(
     publication_id: novarocks_spi::connector::LakePublicationId,
     namespace_name: &str,
     table_name: &str,
-    columns: &[ConnectorColumnDefinition],
-    partitioning: &[ConnectorPartitionTransform],
-    properties: &[(Arc<str>, Arc<str>)],
+    table: PreparedStagedTable,
 ) -> Result<RestStagedTableCreate, RestStagedPrepareFailure> {
     // The generation-level twin of the operation-shaped CTAS admission. Both
     // gates decide the same thing from the same generation, and both must
@@ -1083,12 +1244,6 @@ pub(crate) async fn prepare_rest_staged_table_async(
             reason.message().to_string(),
         ));
     }
-    crate::commit::validation::deny_variant_column_definitions(
-        columns,
-        &format!("{namespace_name}.{table_name}"),
-    )
-    .and_then(|()| super::catalog_mutation::reject_variant_shredding_properties(properties))
-    .map_err(|error| RestStagedPrepareFailure::Unsupported(error.message().to_owned()))?;
     let namespace_name = normalize_identifier(namespace_name)?;
     let table_name = normalize_identifier(table_name)?;
     let location = ctas_staging_location(
@@ -1100,31 +1255,14 @@ pub(crate) async fn prepare_rest_staged_table_async(
             "REST staged create has no admitted request context".into(),
         )
     })?;
-    let (format_version, mut properties) =
-        super::catalog_mutation::table_properties(columns, None, properties)?;
-    if format_version != crate::iceberg::spec::FormatVersion::V3
-        && columns.iter().any(|column| {
-            column.default.as_ref().is_some_and(|value| {
-                !matches!(value, novarocks_spi::connector::ConnectorDefaultValue::Null)
-            })
-        })
-    {
-        return Err(RestStagedPrepareFailure::KnownUncommitted(
-            "Iceberg column defaults require format-version 3".to_string(),
-        ));
-    }
-    let schema = crate::iceberg::spec::Schema::builder()
-        .with_fields(super::type_mapping::schema_fields(columns)?)
-        .build()
-        .map_err(|error| format!("build staged Iceberg schema: {error}"))?;
-    crate::schema_capability::admit_schema(&schema).map_err(|error| {
-        if error.kind() == ConnectorErrorKind::Unsupported {
-            RestStagedPrepareFailure::Unsupported(error.message().to_owned())
-        } else {
-            RestStagedPrepareFailure::from(error)
-        }
-    })?;
-    let partition_spec = super::catalog_mutation::initial_partition_spec(&schema, partitioning)?;
+    let PreparedStagedTable {
+        final_table_location,
+        final_metadata_path,
+        format_version,
+        mut properties,
+        schema,
+        partition_spec,
+    } = table;
     properties.insert(
         "format-version".to_string(),
         (format_version as u8).to_string(),
@@ -1359,6 +1497,16 @@ pub(crate) async fn prepare_rest_staged_table_async(
         CTAS_PROVENANCE_TABLE_UUID.to_string(),
         table.metadata().uuid().to_string(),
     );
+    if final_metadata_path.is_some()
+        && table
+            .metadata()
+            .properties()
+            .contains_key(WRITE_METADATA_PATH)
+    {
+        return Err(RestStagedPrepareFailure::AppliedButUnusable(
+            "REST stage returned write.metadata.path before the final MV publication".into(),
+        ));
+    }
     let mut publication_updates = vec![TableUpdate::SetProperties {
         updates: response_provenance,
     }];
@@ -1373,6 +1521,8 @@ pub(crate) async fn prepare_rest_staged_table_async(
         table,
         initialization_updates,
         publication_updates,
+        final_table_location,
+        final_metadata_path,
     })
 }
 
@@ -1427,8 +1577,8 @@ impl IcebergStagedCreateAdapter {
             ));
         }
         let document_admission = match &request.mode {
-            ConnectorStagedCreateMode::Ordinary => None,
-            ConnectorStagedCreateMode::ApplicationDocumentManaged { admission } => {
+            ConnectorStagedCreateMode::OrdinaryTyped { .. } => None,
+            ConnectorStagedCreateMode::ApplicationDocumentManaged { admission, .. } => {
                 Some(admission.clone())
             }
         };
@@ -1461,9 +1611,17 @@ impl IcebergStagedCreateAdapter {
                 ),
             });
         }
-        for key in request.properties.keys() {
-            crate::document_storage::keyed::write::reject_reserved_property(key)?;
-        }
+        let typed = match prepare_typed_staged_table(
+            &request,
+            &self.runtime.control_state().configuration().warehouse_uri,
+        ) {
+            Ok(typed) => typed,
+            Err(error) => {
+                return Ok(ConnectorStagedCreatePrepareOutcome::KnownUncommitted {
+                    failure: failure_from_connector(error),
+                });
+            }
+        };
         let stage_publication = StagePublication {
             journal: crate::commit::attempt::observation::PublicationJournal::for_runtime(
                 crate::commit::model::OperationToken::from_mutation(request.operation_id),
@@ -1495,13 +1653,6 @@ impl IcebergStagedCreateAdapter {
             operations.insert(request.operation_id, OperationState::Preparing);
         }
 
-        let mut properties = request.properties;
-        properties.retain(|key, _| !key.eq_ignore_ascii_case(CTAS_OPERATION_MARKER));
-        properties.insert(
-            Arc::from(CTAS_OPERATION_MARKER),
-            Arc::from(publication_marker(request.publication_id)),
-        );
-        let properties = properties.into_iter().collect::<Vec<_>>();
         let result = prepare_rest_staged_table_async(
             &self.runtime,
             Some(&request.context),
@@ -1510,9 +1661,7 @@ impl IcebergStagedCreateAdapter {
             request.publication_id,
             &request.table.namespace,
             &request.table.table,
-            &request.columns,
-            &request.partitioning,
-            &properties,
+            typed,
         )
         .await;
         match result {
@@ -2118,6 +2267,33 @@ async fn adjudicate_publication_entry(
 }
 
 impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
+    fn ctas_property_declarations(
+        &self,
+    ) -> Result<Vec<novarocks_spi::connector::DdlPropertyDeclaration>, ConnectorError> {
+        crate::table_properties::ctas_property_declarations()
+            .map_err(|error| internal(format!("declare Iceberg CTAS properties: {error}")))
+    }
+
+    fn check_ctas_property_name(&self, canonical: &str) -> Result<(), ConnectorError> {
+        crate::table_properties::check_table_property_name(canonical)
+    }
+
+    fn validate_ctas_properties(
+        &self,
+        properties: &[(Arc<str>, novarocks_spi::connector::DdlPropertyValue)],
+        comment: Option<&str>,
+        control: &dyn ConnectorOperationControl,
+    ) -> Result<(), ConnectorError> {
+        crate::table_properties::prepare_ctas_storage(properties, comment, control).map(|_| ())
+    }
+
+    fn mv_storage_property_declarations(
+        &self,
+    ) -> Result<Vec<novarocks_spi::connector::DdlPropertyDeclaration>, ConnectorError> {
+        crate::table_properties::mv_storage_property_declarations()
+            .map_err(|error| internal(format!("declare Iceberg MV storage properties: {error}")))
+    }
+
     fn begin_publish_original(
         &self,
         request: ConnectorStagedCreatePublishRequest,
@@ -2237,8 +2413,8 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
             ));
         }
         let document_admission = match &request.mode {
-            ConnectorStagedCreateMode::Ordinary => None,
-            ConnectorStagedCreateMode::ApplicationDocumentManaged { admission } => {
+            ConnectorStagedCreateMode::OrdinaryTyped { .. } => None,
+            ConnectorStagedCreateMode::ApplicationDocumentManaged { admission, .. } => {
                 Some(admission.clone())
             }
         };
@@ -2271,9 +2447,17 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
                 ),
             });
         }
-        for key in request.properties.keys() {
-            crate::document_storage::keyed::write::reject_reserved_property(key)?;
-        }
+        let typed = match prepare_typed_staged_table(
+            &request,
+            &self.runtime.control_state().configuration().warehouse_uri,
+        ) {
+            Ok(typed) => typed,
+            Err(error) => {
+                return Ok(ConnectorStagedCreatePrepareOutcome::KnownUncommitted {
+                    failure: failure_from_connector(error),
+                });
+            }
+        };
         let stage_publication = StagePublication {
             journal: crate::commit::attempt::observation::PublicationJournal::for_runtime(
                 crate::commit::model::OperationToken::from_mutation(request.operation_id),
@@ -2305,13 +2489,6 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
             operations.insert(request.operation_id, OperationState::Preparing);
         }
 
-        let mut properties = request.properties;
-        properties.retain(|key, _| !key.eq_ignore_ascii_case(CTAS_OPERATION_MARKER));
-        properties.insert(
-            Arc::from(CTAS_OPERATION_MARKER),
-            Arc::from(publication_marker(request.publication_id)),
-        );
-        let properties = properties.into_iter().collect::<Vec<_>>();
         let result = prepare_rest_staged_table(
             &self.runtime,
             Some(&request.context),
@@ -2320,9 +2497,7 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
             request.publication_id,
             &request.table.namespace,
             &request.table.table,
-            &request.columns,
-            &request.partitioning,
-            &properties,
+            typed,
         );
         match result {
             Ok(staged) => {
@@ -3021,6 +3196,14 @@ fn validate_publish_evidence(
     if evidence.version != EVIDENCE_VERSION
         || evidence.operation_marker != publication_marker(prepared.publication_id)
         || evidence.handle_digest != prepared.handle_digest
+        || evidence.final_table_location.as_deref()
+            != prepared.staged.final_table_location.as_deref()
+        || evidence.final_metadata_path.as_deref()
+            != prepared
+                .staged
+                .final_metadata_path
+                .as_ref()
+                .map(StagedMetadataPath::as_str)
         || evidence.table_uuid != prepared.staged.table.metadata().uuid().to_string()
         || evidence.namespace != ident.namespace.to_url_string()
         || evidence.table != ident.name
@@ -3051,9 +3234,14 @@ fn publication_expectation(
         document.sort();
         properties.extend(document);
     }
+    if let Some(path) = &prepared.staged.final_metadata_path {
+        properties.push((WRITE_METADATA_PATH.to_string(), path.as_str().to_string()));
+    }
     crate::catalog::StagedPublicationExpectation {
         staged_table_uuid: prepared.staged.table.metadata().uuid(),
         snapshot_id: expected_snapshot_id,
+        final_table_location: prepared.staged.final_table_location.clone(),
+        final_metadata_path: prepared.staged.final_metadata_path.clone(),
         properties,
     }
 }
@@ -3066,6 +3254,25 @@ fn publication_matches(
 ) -> bool {
     let metadata = table.metadata();
     metadata.uuid() == prepared.staged.table.metadata().uuid()
+        && prepared
+            .staged
+            .final_table_location
+            .as_deref()
+            .is_none_or(|expected| metadata.location() == expected)
+        && prepared
+            .staged
+            .final_metadata_path
+            .as_ref()
+            .is_none_or(|expected| {
+                metadata
+                    .properties()
+                    .get(WRITE_METADATA_PATH)
+                    .map(String::as_str)
+                    == Some(expected.as_str())
+                    && table
+                        .metadata_location()
+                        .is_some_and(|uri| expected.contains_metadata_file(uri))
+            })
         && metadata
             .properties()
             .get(CTAS_OPERATION_MARKER)
@@ -3322,27 +3529,7 @@ mod tests {
         ConnectorStagedCreatePrepareRequest,
     ) {
         let adapter = adapter_for(Arc::new(rest_runtime()));
-        let owner = adapter.owner();
-        let operation_id = ConnectorMutationOperationId::new();
-        let request = ConnectorStagedCreatePrepareRequest {
-            table: ConnectorTableIdentity {
-                instance_id: owner.instance_id.clone(),
-                namespace: Arc::from("db"),
-                table: Arc::from("t"),
-            },
-            owner,
-            publication_id: novarocks_spi::connector::LakePublicationId::try_from_bytes(
-                operation_id.to_bytes(),
-            )
-            .expect("publication id from operation id"),
-            operation_id,
-            columns: Vec::new(),
-            partitioning: Vec::new(),
-            properties: BTreeMap::new(),
-            policy: CreatePolicy::FailIfExists,
-            mode: ConnectorStagedCreateMode::Ordinary,
-            context: context(),
-        };
+        let request = stage_http_request(&adapter, context());
         (adapter, request)
     }
 
@@ -3440,6 +3627,8 @@ mod tests {
                 table,
                 initialization_updates: Vec::new(),
                 publication_updates: Vec::new(),
+                final_table_location: None,
+                final_metadata_path: None,
             },
             policy: CreatePolicy::FailIfExists,
             planning: None,
@@ -3672,41 +3861,23 @@ mod tests {
             name: "deep".into(),
             data_type,
             nullable: true,
-            aggregation: None,
             default: None,
         }];
-        let original = context();
-        let sync = prepare_rest_staged_table(
-            &adapter.runtime,
-            Some(&original),
-            None,
-            ConnectorMutationOperationId::new(),
-            novarocks_spi::connector::LakePublicationId::new_v7(),
-            "db",
-            "t",
-            &columns,
-            &[],
-            &[],
-        );
-        let asynchronous = executor.block_on(prepare_rest_staged_table_async(
-            &adapter.runtime,
-            Some(&original),
-            None,
-            ConnectorMutationOperationId::new(),
-            novarocks_spi::connector::LakePublicationId::new_v7(),
-            "db",
-            "t",
-            &columns,
-            &[],
-            &[],
-        ));
+        let mut request = stage_http_request(&adapter, context());
+        request.columns = columns;
+        let sync = adapter.prepare(request.clone()).unwrap();
+        let asynchronous = executor.block_on(adapter.prepare_async(request)).unwrap();
         for result in [sync, asynchronous] {
             match result {
-                Err(RestStagedPrepareFailure::Unsupported(message)) => {
-                    assert!(message.contains("Iceberg schema JSON exceeds 127 container levels"));
+                ConnectorStagedCreatePrepareOutcome::KnownUncommitted { failure } => {
+                    assert_eq!(failure.kind(), ConnectorMutationFailureKind::Unsupported);
+                    assert!(
+                        failure
+                            .message()
+                            .contains("Iceberg schema JSON exceeds 127 container levels")
+                    );
                 }
-                Err(other) => panic!("schema nesting must retain Unsupported: {other:?}"),
-                Ok(_) => panic!("unsupported schema must not stage a target"),
+                other => panic!("unsupported schema must not stage a target: {other:?}"),
             }
         }
         assert!(server.requests().is_empty());
@@ -3746,6 +3917,7 @@ mod tests {
             data_type: ConnectorDataType::Array(Box::new(ConnectorDataType::Variant)),
             nullable: true,
         }]);
+        let adapter = adapter_for(Arc::new(runtime));
         for (data_type, properties, diagnostic) in [
             (ConnectorDataType::Variant, Vec::new(), "column payload"),
             (nested, Vec::new(), "column payload.leaf.element"),
@@ -3758,31 +3930,44 @@ mod tests {
                 "write.parquet.variant-shredding.",
             ),
         ] {
-            let failure = match prepare_rest_staged_table(
-                &runtime,
-                Some(&context()),
-                None,
-                ConnectorMutationOperationId::new(),
-                novarocks_spi::connector::LakePublicationId::new_v7(),
-                "db",
-                "t",
-                &[ConnectorColumnDefinition {
-                    name: Arc::from("payload"),
-                    data_type,
-                    nullable: true,
-                    aggregation: None,
-                    default: None,
-                }],
-                &[],
-                &properties,
-            ) {
-                Err(failure) => failure,
-                Ok(_) => panic!("unsupported CTAS must be refused"),
-            };
-            assert!(
-                matches!(failure, RestStagedPrepareFailure::Unsupported(ref message) if message.contains(diagnostic)),
-                "{failure:?}"
-            );
+            let mut request = stage_http_request(&adapter, context());
+            request.columns = vec![ConnectorColumnDefinition {
+                name: Arc::from("payload"),
+                data_type,
+                nullable: true,
+                default: None,
+            }];
+            if properties.is_empty() {
+                let outcome = adapter.prepare(request).unwrap();
+                assert!(
+                    matches!(outcome,
+                    ConnectorStagedCreatePrepareOutcome::KnownUncommitted { ref failure }
+                        if failure.kind() == ConnectorMutationFailureKind::Unsupported
+                            && failure.message().contains(diagnostic)),
+                    "{outcome:?}"
+                );
+            } else {
+                let lease = ordinary_ctas_lease(&adapter);
+                let mut typed = ctas_defaults(&lease);
+                typed.push((
+                    "extra_properties".into(),
+                    novarocks_spi::connector::DdlPropertyValue::MapVarcharVarchar(
+                        properties
+                            .into_iter()
+                            .map(|(key, value): (Arc<str>, Arc<str>)| {
+                                (key.to_string(), Some(value.to_string()))
+                            })
+                            .collect(),
+                    ),
+                ));
+                let error =
+                    match lease.prepare_ctas_properties(typed.into(), None, &request.context) {
+                        Ok(_) => panic!("unsupported CTAS property admitted"),
+                        Err(error) => error,
+                    };
+                assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+                assert!(error.message().contains(diagnostic), "{error}");
+            }
             assert!(
                 server.requests().is_empty(),
                 "admission must not contact namespace or stage-create endpoints"
@@ -3820,36 +4005,38 @@ mod tests {
         );
         (executor, adapter_for(runtime))
     }
-    fn stage_http_request(
+    pub(super) fn stage_http_request(
         adapter: &IcebergStagedCreateAdapter,
         request_context: ConnectorRequestContext,
     ) -> ConnectorStagedCreatePrepareRequest {
         let operation_id = ConnectorMutationOperationId::new();
-        ConnectorStagedCreatePrepareRequest {
-            owner: adapter.owner(),
-            publication_id: novarocks_spi::connector::LakePublicationId::try_from_bytes(
-                operation_id.to_bytes(),
+        let lease = ordinary_ctas_lease(adapter);
+        let storage = lease
+            .prepare_ctas_properties(ctas_defaults(&lease).into(), None, &context())
+            .unwrap();
+        lease
+            .prepare_typed_request(
+                novarocks_spi::connector::LakePublicationId::try_from_bytes(
+                    operation_id.to_bytes(),
+                )
+                .unwrap(),
+                operation_id,
+                ConnectorTableIdentity {
+                    instance_id: adapter.descriptor.instance_id.clone(),
+                    namespace: Arc::from("db"),
+                    table: Arc::from("t"),
+                },
+                vec![ConnectorColumnDefinition {
+                    name: Arc::from("id"),
+                    data_type: novarocks_spi::connector::ConnectorDataType::BigInt,
+                    nullable: false,
+                    default: None,
+                }],
+                storage,
+                CreatePolicy::FailIfExists,
+                request_context,
             )
-            .unwrap(),
-            operation_id,
-            table: ConnectorTableIdentity {
-                instance_id: adapter.descriptor.instance_id.clone(),
-                namespace: Arc::from("db"),
-                table: Arc::from("t"),
-            },
-            columns: vec![ConnectorColumnDefinition {
-                name: Arc::from("id"),
-                data_type: novarocks_spi::connector::ConnectorDataType::BigInt,
-                nullable: false,
-                aggregation: None,
-                default: None,
-            }],
-            partitioning: vec![],
-            properties: BTreeMap::new(),
-            policy: CreatePolicy::FailIfExists,
-            mode: ConnectorStagedCreateMode::Ordinary,
-            context: request_context,
-        }
+            .unwrap()
     }
 
     #[test]
@@ -4114,27 +4301,8 @@ mod tests {
         );
 
         let adapter = adapter_for(Arc::new(runtime));
-        let operation_id = ConnectorMutationOperationId::new();
         let outcome = adapter
-            .prepare(ConnectorStagedCreatePrepareRequest {
-                owner: adapter.owner(),
-                publication_id: novarocks_spi::connector::LakePublicationId::try_from_bytes(
-                    operation_id.to_bytes(),
-                )
-                .unwrap(),
-                operation_id,
-                table: ConnectorTableIdentity {
-                    instance_id: adapter.descriptor.instance_id.clone(),
-                    namespace: Arc::from("db"),
-                    table: Arc::from("t"),
-                },
-                columns: vec![],
-                partitioning: vec![],
-                properties: BTreeMap::new(),
-                policy: CreatePolicy::FailIfExists,
-                mode: ConnectorStagedCreateMode::Ordinary,
-                context: context(),
-            })
+            .prepare(stage_http_request(&adapter, context()))
             .unwrap();
         assert!(
             matches!(&outcome,
@@ -4155,10 +4323,13 @@ mod tests {
 
     #[test]
     fn hadoop_generation_fails_closed_without_constructing_a_rest_client() {
-        let runtime = hadoop_runtime();
+        let runtime = Arc::new(hadoop_runtime());
         // The catalog owner answers this now; there is no concrete-client slot
         // left to inspect.
         assert_eq!(runtime.novarocks_catalog().implementation_name(), "hadoop");
+        let adapter = adapter_for(Arc::clone(&runtime));
+        let request = stage_http_request(&adapter, context());
+        let table = prepare_typed_staged_table(&request, "s3://warehouse").unwrap();
         let failure = match prepare_rest_staged_table(
             &runtime,
             Some(&context()),
@@ -4167,9 +4338,7 @@ mod tests {
             novarocks_spi::connector::LakePublicationId::new_v7(),
             "db",
             "t",
-            &[],
-            &[],
-            &[],
+            table,
         ) {
             Ok(_) => panic!("Hadoop must not expose a REST staged-create surface"),
             Err(failure) => failure,
@@ -4194,7 +4363,7 @@ mod tests {
     /// to disagree about whether CTAS is possible at all.
     #[test]
     fn rest_generation_without_a_warehouse_refuses_staged_create_as_unsupported() {
-        let runtime = rest_runtime();
+        let runtime = Arc::new(rest_runtime());
         assert_eq!(
             runtime.novarocks_catalog().implementation_name(),
             "rest",
@@ -4211,6 +4380,9 @@ mod tests {
                 ),
             )
             .expect_err("admission refuses CTAS without an enumerable staging root");
+        let adapter = adapter_for(Arc::clone(&runtime));
+        let request = stage_http_request(&adapter, context());
+        let table = prepare_typed_staged_table(&request, "s3://warehouse").unwrap();
         let failure = match prepare_rest_staged_table(
             &runtime,
             Some(&context()),
@@ -4219,9 +4391,7 @@ mod tests {
             novarocks_spi::connector::LakePublicationId::new_v7(),
             "db",
             "t",
-            &[],
-            &[],
-            &[],
+            table,
         ) {
             Ok(_) => panic!("a warehouse-less REST generation cannot stage a CTAS target"),
             Err(failure) => failure,
@@ -4234,6 +4404,428 @@ mod tests {
             RestStagedPrepareFailure::Unsupported(message)
                 if message.contains("no explicit warehouse")
         ));
+    }
+
+    fn ordinary_ctas_lease(
+        adapter: &IcebergStagedCreateAdapter,
+    ) -> novarocks_spi::connector::ConnectorStagedCreateSession {
+        use novarocks_spi::connector::{ConnectorControlBinding, ConnectorControlPlanningPin};
+
+        let descriptor = adapter.descriptor.clone();
+        let incarnation = adapter.owner().incarnation;
+        let provider = Arc::clone(&adapter.provider);
+        let distribution = Arc::new(crate::provider_binding::IcebergInstanceDistribution::new(
+            descriptor.clone(),
+            incarnation,
+        ));
+        let control = ConnectorControlBinding::try_new_with_all_capabilities_and_staged_create(
+            descriptor,
+            incarnation,
+            provider.clone(),
+            provider,
+            distribution,
+            None,
+            None,
+            None,
+            Some(Arc::new(adapter.clone())),
+            None,
+            None,
+        )
+        .unwrap();
+        ConnectorControlPlanningPin::new(Arc::new(control), || {})
+            .derive_staged_create_lease()
+            .unwrap()
+    }
+
+    fn ctas_defaults(
+        lease: &novarocks_spi::connector::ConnectorStagedCreateSession,
+    ) -> Vec<(Arc<str>, novarocks_spi::connector::DdlPropertyValue)> {
+        use novarocks_spi::connector::DdlPropertyValue;
+
+        lease
+            .ctas_property_declarations()
+            .unwrap()
+            .into_iter()
+            .filter(|property| property.default_value() != &DdlPropertyValue::Null)
+            .map(|property| (property.name().into(), property.default_value().clone()))
+            .collect()
+    }
+
+    #[test]
+    fn ordinary_typed_ctas_retains_evaluated_values_and_real_output_partition_ids() {
+        use crate::rest_protocol::test_server::{Script, TestServer};
+        use novarocks_spi::connector::DdlPropertyValue;
+
+        let server = TestServer::start(Script::new());
+        let (_executor, adapter) = stage_http_adapter(&server);
+        let lease = ordinary_ctas_lease(&adapter);
+        let mut values = ctas_defaults(&lease);
+        assert_eq!(
+            values
+                .iter()
+                .find(|(name, _)| name.as_ref() == "format_version")
+                .unwrap()
+                .1,
+            DdlPropertyValue::Integer(3),
+        );
+        assert_eq!(
+            lease
+                .check_ctas_property_name("sorted_by")
+                .unwrap_err()
+                .kind(),
+            ConnectorErrorKind::Unsupported
+        );
+        values
+            .iter_mut()
+            .find(|(name, _)| name.as_ref() == "partitioning")
+            .unwrap()
+            .1 = DdlPropertyValue::ArrayVarchar(vec![Some("bucket(id, 16)".into())]);
+        values.push(("gc_enabled".into(), DdlPropertyValue::Boolean(false)));
+        values.push((
+            "extra_properties".into(),
+            DdlPropertyValue::MapVarcharVarchar(vec![(
+                "write.metadata.path".into(),
+                Some("s3://warehouse/custom-metadata".into()),
+            )]),
+        ));
+        let values: Arc<[(Arc<str>, DdlPropertyValue)]> = values.into();
+        let original = stage_http_request(&adapter, context());
+        let storage = lease
+            .prepare_ctas_properties(
+                Arc::clone(&values),
+                Some("actual CTAS comment".into()),
+                &original.context,
+            )
+            .unwrap();
+        let request = lease
+            .prepare_typed_request(
+                original.publication_id,
+                original.operation_id,
+                original.table,
+                original.columns,
+                Arc::clone(&storage),
+                original.policy,
+                original.context,
+            )
+            .unwrap();
+        let alias = request.clone();
+        let actual = alias.ordinary_typed_properties().unwrap().unwrap();
+        assert!(std::ptr::eq(storage.as_ref(), actual));
+        assert!(std::ptr::eq(values.as_ref(), actual.properties()));
+
+        let prepared = prepare_typed_staged_table(&request, "s3://warehouse/base").unwrap();
+        assert_eq!(prepared.format_version, FormatVersion::V3);
+        assert!(prepared.final_table_location.is_none());
+        assert_eq!(prepared.properties["write.format.default"], "parquet");
+        assert_eq!(prepared.properties["gc.enabled"], "false");
+        assert_eq!(prepared.properties["comment"], "actual CTAS comment");
+        assert_eq!(
+            prepared.properties["write.metadata.path"],
+            "s3://warehouse/custom-metadata"
+        );
+        let spec = prepared.partition_spec.unwrap();
+        let field = &spec.fields()[0];
+        assert_eq!(
+            field.source_id,
+            prepared.schema.field_by_name("id").unwrap().id
+        );
+        assert_eq!(field.transform, crate::iceberg::spec::Transform::Bucket(16));
+
+        let mut foreign = request.clone();
+        foreign.owner.incarnation = ProviderBindingEpoch::new();
+        let error = foreign.ordinary_typed_properties().err().unwrap();
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        assert!(error.message().contains("foreign generation"));
+
+        assert!(server.requests().is_empty());
+    }
+
+    #[test]
+    fn ordinary_typed_ctas_preserves_pre_source_and_bound_schema_failures() {
+        use crate::rest_protocol::test_server::{Script, TestServer};
+        use novarocks_spi::connector::{DdlPropertyValue, InvalidTableProperty};
+
+        let server = TestServer::start(Script::new());
+        let (executor, adapter) = stage_http_adapter(&server);
+        let lease = ordinary_ctas_lease(&adapter);
+        for (version, kind, property_failure) in [
+            (2, ConnectorErrorKind::Unsupported, false),
+            (4, ConnectorErrorKind::InvalidRequest, true),
+        ] {
+            let mut values = ctas_defaults(&lease);
+            values
+                .iter_mut()
+                .find(|(name, _)| name.as_ref() == "format_version")
+                .unwrap()
+                .1 = DdlPropertyValue::Integer(version);
+            let error = lease
+                .prepare_ctas_properties(values.into(), None, &context())
+                .err()
+                .unwrap();
+            assert_eq!(error.kind(), kind);
+            assert_eq!(
+                InvalidTableProperty::from_connector_error(&error).is_some(),
+                property_failure
+            );
+        }
+        let mut values = ctas_defaults(&lease);
+        values.push((
+            "location".into(),
+            DdlPropertyValue::Varchar("s3://warehouse/relocated".into()),
+        ));
+        let error = lease
+            .prepare_ctas_properties(values.into(), None, &context())
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+        assert!(error.message().contains("explicit table location"));
+
+        for asynchronous in [false, true] {
+            let mut values = ctas_defaults(&lease);
+            values
+                .iter_mut()
+                .find(|(name, _)| name.as_ref() == "partitioning")
+                .unwrap()
+                .1 = DdlPropertyValue::ArrayVarchar(vec![Some("bucket(missing, 16)".into())]);
+            let original = stage_http_request(&adapter, context());
+            let operation = original.operation_id;
+            let storage = lease
+                .prepare_ctas_properties(values.into(), None, &original.context)
+                .unwrap();
+            let request = lease
+                .prepare_typed_request(
+                    original.publication_id,
+                    operation,
+                    original.table,
+                    original.columns,
+                    storage,
+                    original.policy,
+                    original.context,
+                )
+                .unwrap();
+            let outcome = if asynchronous {
+                let receiving = Mutex::new(None);
+                executor.block_on(lease.prepare_async(request, &receiving))
+            } else {
+                lease.prepare(request)
+            }
+            .unwrap();
+            let ConnectorStagedCreatePrepareOutcome::KnownUncommitted { failure } = outcome else {
+                panic!("missing real output source cannot dispatch a stage");
+            };
+            let marker =
+                InvalidTableProperty::from_connector_error(failure.connector_source().unwrap())
+                    .unwrap();
+            assert!(
+                marker
+                    .source_error()
+                    .message()
+                    .contains("partition source column")
+            );
+            assert!(!adapter.operations.lock().unwrap().contains_key(&operation));
+        }
+        assert!(server.requests().is_empty());
+    }
+
+    #[test]
+    fn typed_mv_staged_preflight_binds_visible_partition_and_refuses_hidden_partition() {
+        use crate::rest_protocol::test_server::{Script, TestServer};
+        use novarocks_spi::connector::{
+            CatalogHandle, CatalogProperties, CatalogVersion, ConnectorControlBinding,
+            ConnectorControlPlanningPin, ConnectorDocumentManagementAdmissionRequest,
+            ConnectorDocumentManagementOperation, ConnectorDocumentStorageBinding,
+            DdlPropertyValue, InvalidTableProperty,
+        };
+
+        let server = TestServer::start(Script::new());
+        let (executor, adapter) = stage_http_adapter(&server);
+        let provider = Arc::clone(&adapter.provider);
+        let descriptor = adapter.descriptor.clone();
+        let owner = adapter.owner();
+        let catalog = CatalogHandle::new(
+            owner.instance_id.clone(),
+            CatalogVersion::from_bytes([17; 32]),
+        );
+        let storage = Arc::new(crate::document_storage::IcebergDocumentStorage::new(
+            descriptor.clone(),
+            owner.incarnation,
+            Arc::clone(&adapter.runtime),
+        ));
+        let documents = ConnectorDocumentStorageBinding::try_new(
+            descriptor.clone(),
+            owner.incarnation,
+            None,
+            Some(storage),
+        )
+        .unwrap();
+        let distribution = Arc::new(crate::provider_binding::IcebergInstanceDistribution::new(
+            descriptor.clone(),
+            owner.incarnation,
+        ));
+        let control_binding =
+            ConnectorControlBinding::try_new_with_all_capabilities_and_staged_create(
+                descriptor.clone(),
+                owner.incarnation,
+                provider.clone(),
+                provider,
+                distribution,
+                None,
+                None,
+                None,
+                Some(Arc::new(adapter.clone())),
+                None,
+                None,
+            )
+            .and_then(|binding| {
+                binding.with_catalog_properties(
+                    CatalogProperties::new(
+                        catalog.clone(),
+                        descriptor.provider_id,
+                        1,
+                        vec![],
+                        vec![],
+                    )
+                    .unwrap(),
+                )
+            })
+            .and_then(|binding| binding.try_with_document_storage(Some(documents)))
+            .unwrap();
+        let pin = ConnectorControlPlanningPin::new(Arc::new(control_binding), || {});
+        let lease = pin.derive_staged_create_lease().unwrap();
+        let document_lease = pin.derive_document_storage_lease().unwrap();
+        let request = |partition: &str, include_metadata_path: bool| {
+            let original = stage_http_request(&adapter, context());
+            let admission = document_lease
+                .admit_management(
+                    ConnectorDocumentManagementAdmissionRequest::try_new(
+                        owner.clone(),
+                        catalog.clone(),
+                        original.operation_id,
+                        original.table.clone(),
+                        None,
+                        ConnectorDocumentManagementOperation::Create,
+                        original.context.clone(),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            let mut columns = original.columns;
+            let mut hidden = columns[0].clone();
+            hidden.name = "hidden_key".into();
+            columns.push(hidden);
+            let mut properties: Vec<(Arc<str>, DdlPropertyValue)> = lease
+                .mv_storage_property_declarations()
+                .unwrap()
+                .into_iter()
+                .filter(|declaration| declaration.default_value() != &DdlPropertyValue::Null)
+                .map(|declaration| {
+                    (
+                        Arc::from(declaration.name()),
+                        declaration.default_value().clone(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            properties
+                .iter_mut()
+                .find(|(name, _)| &**name == "partitioning")
+                .unwrap()
+                .1 = DdlPropertyValue::ArrayVarchar(vec![Some(format!("bucket({partition}, 16)"))]);
+            properties.push((
+                "data_location".into(),
+                DdlPropertyValue::Varchar("s3://user/data".into()),
+            ));
+            if include_metadata_path {
+                properties.push((
+                    "extra_properties".into(),
+                    DdlPropertyValue::MapVarcharVarchar(vec![(
+                        "WRITE.METADATA.PATH".into(),
+                        Some("s3://warehouse/base/metadata/managed".into()),
+                    )]),
+                ));
+            }
+            lease
+                .prepare_document_managed_typed_request(
+                    original.publication_id,
+                    original.operation_id,
+                    original.table,
+                    columns,
+                    vec!["id".into()],
+                    properties.into(),
+                    BTreeMap::from([(
+                        Arc::from(novarocks_spi::connector::CONNECTOR_MV_APPLY_KEY_COLUMN_PROPERTY),
+                        Arc::from("hidden_key"),
+                    )]),
+                    original.policy,
+                    admission,
+                    original.context,
+                )
+                .unwrap()
+        };
+        let path = "s3://warehouse/base/metadata/managed";
+        let valid = request("id", true);
+        let alias = valid.clone();
+        let (
+            ConnectorStagedCreateMode::ApplicationDocumentManaged {
+                storage: original, ..
+            },
+            ConnectorStagedCreateMode::ApplicationDocumentManaged { storage: alias, .. },
+        ) = (&valid.mode, &alias.mode)
+        else {
+            panic!("Typed request must retain its original evaluated storage");
+        };
+        assert!(Arc::ptr_eq(original, alias));
+        let prepared = prepare_mv_staged_table(&valid, "s3://warehouse/base").unwrap();
+        assert_eq!(
+            prepared
+                .final_metadata_path
+                .as_ref()
+                .map(StagedMetadataPath::as_str),
+            Some(path)
+        );
+        assert!(!prepared.properties.contains_key(WRITE_METADATA_PATH));
+        assert_eq!(
+            prepare_mv_staged_table(&valid, "s3://foreign/base")
+                .err()
+                .unwrap()
+                .kind(),
+            ConnectorErrorKind::Unsupported,
+        );
+        assert_eq!(prepared.format_version, FormatVersion::V3);
+        assert_eq!(prepared.schema.field_by_name("hidden_key").unwrap().id, 2);
+        let spec = prepared.partition_spec.unwrap();
+        assert_eq!(spec.fields()[0].source_id, 1);
+        assert_eq!(
+            spec.fields()[0].transform,
+            crate::iceberg::spec::Transform::Bucket(16)
+        );
+        assert_eq!(prepared.properties["write.data.path"], "s3://user/data");
+        assert_eq!(prepared.properties["write.format.default"], "parquet");
+
+        for asynchronous in [false, true] {
+            let invalid = request("hidden_key", false);
+            let operation = invalid.operation_id;
+            let outcome = if asynchronous {
+                let receiving = Mutex::new(None);
+                executor.block_on(lease.prepare_async(invalid, &receiving))
+            } else {
+                lease.prepare(invalid)
+            }
+            .unwrap();
+            let ConnectorStagedCreatePrepareOutcome::KnownUncommitted { failure } = outcome else {
+                panic!("An invisible partition field must fail before dispatch");
+            };
+            let property =
+                InvalidTableProperty::from_connector_error(failure.connector_source().unwrap())
+                    .unwrap();
+            assert!(
+                property
+                    .source_error()
+                    .message()
+                    .contains("must be an output column")
+            );
+            assert!(!adapter.operations.lock().unwrap().contains_key(&operation));
+        }
+        assert!(server.requests().is_empty());
     }
 
     /// How an `Unsupported` refusal crosses the SPI boundary.

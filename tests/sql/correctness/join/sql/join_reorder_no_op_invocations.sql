@@ -36,25 +36,22 @@ DROP TABLE IF EXISTS ${case_db}.t_jr_left;
 DROP TABLE IF EXISTS ${case_db}.t_jr_right;
 DROP TABLE IF EXISTS ${case_db}.t_jr_dim;
 CREATE TABLE ${case_db}.t_jr_left (
-    k BIGINT NULL,
-    v BIGINT NULL,
-    d BIGINT NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+    k BIGINT ,
+    v BIGINT ,
+    d BIGINT
+) WITH (format_version = 3);
 CREATE TABLE ${case_db}.t_jr_right (
-    k BIGINT NULL,
-    v BIGINT NULL,
-    d BIGINT NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+    k BIGINT ,
+    v BIGINT ,
+    d BIGINT
+) WITH (format_version = 3);
 CREATE TABLE ${case_db}.t_jr_dim (
-    d BIGINT NULL,
-    label BIGINT NULL
-)
-TBLPROPERTIES ("format-version" = "3");
-INSERT INTO ${case_db}.t_jr_left  VALUES (1, 10, 100), (2, 20, 200), (3, 30, 100);
-INSERT INTO ${case_db}.t_jr_right VALUES (1, 11, 100), (2, 22, 200), (3, 33, 200);
-INSERT INTO ${case_db}.t_jr_dim   VALUES (100, 1), (200, 2), (300, 3);
+    d BIGINT ,
+    label BIGINT
+) WITH (format_version = 3);
+INSERT INTO ${case_db}.t_jr_left  VALUES ROW(1, 10, 100), ROW(2, 20, 200), ROW(3, 30, 100);
+INSERT INTO ${case_db}.t_jr_right VALUES ROW(1, 11, 100), ROW(2, 22, 200), ROW(3, 33, 200);
+INSERT INTO ${case_db}.t_jr_dim   VALUES ROW(100, 1), ROW(200, 2), ROW(300, 3);
 
 -- query 2
 -- @order_sensitive=true

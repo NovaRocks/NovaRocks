@@ -159,7 +159,7 @@ pub(super) fn delete_launch_config(
 }
 
 fn escaped(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
+    value.replace('\'', "''")
 }
 pub(super) fn table_name(raw: &str) -> Result<String> {
     let parts: Vec<_> = raw.split('.').collect();
@@ -189,11 +189,11 @@ pub(super) fn create_catalog_sql_from_parts(
     s3_endpoint: &str,
 ) -> String {
     format!(
-        r#"CREATE EXTERNAL CATALOG {CATALOG} PROPERTIES(
-"type"="iceberg", "iceberg.catalog.type"="rest", "uri"="{}", "warehouse"="{}",
-"aws.s3.endpoint"="{}", "aws.s3.region"="us-east-1", "aws.s3.enable_path_style_access"="true",
-"credential.object-store-metadata.consumer-role"="frontend", "credential.object-store-metadata.mode"="static", "credential.object-store-metadata.name"="uea4g-fixture", "credential.object-store-metadata.generation"="v1",
-"credential.object-store-data.consumer-role"="backend", "credential.object-store-data.mode"="static", "credential.object-store-data.name"="uea4g-fixture", "credential.object-store-data.generation"="v1")"#,
+        r#"CREATE CATALOG {CATALOG} USING iceberg WITH (
+"iceberg.catalog.type" = 'rest', "uri" = '{}', "warehouse" = '{}',
+"aws.s3.endpoint" = '{}', "aws.s3.region" = 'us-east-1', "aws.s3.enable_path_style_access" = 'true',
+"credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = 'static', "credential.object-store-metadata.name" = 'uea4g-fixture', "credential.object-store-metadata.generation" = 'v1',
+"credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = 'static', "credential.object-store-data.name" = 'uea4g-fixture', "credential.object-store-data.generation" = 'v1')"#,
         escaped(rest_uri),
         escaped(warehouse),
         escaped(s3_endpoint)
@@ -400,7 +400,7 @@ impl Scenario for IcebergDeleteApplicability {
             &endpoints.rest_warehouse,
             input.proxy.endpoint(),
         ))?;
-        connection.execute("SET enable_scan_datacache = false")?;
+        connection.execute("SET SESSION enable_scan_datacache = false")?;
         let mut observations = Vec::new();
         for case in input.corpus.value["cases"]
             .as_array()

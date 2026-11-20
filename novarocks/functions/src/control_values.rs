@@ -219,9 +219,10 @@ fn supports_flat_indexed_result(ty: &DataType) -> bool {
     ) || ty.primitive_width().is_some()
 }
 /// Closed carriers handled by the same actual Arrow indexed interleave.
+/// Physical Null is a root result without a payload or validity buffer.
 /// Nested fields retain their complete names, metadata and NULL semantics.
 pub fn supports_indexed_result(ty: &DataType) -> bool {
-    crate::selected_copy::supports_guarded_result(ty)
+    *ty == DataType::Null || crate::selected_copy::supports_guarded_result(ty)
 }
 fn reserve<T>(len: usize, work: &mut EvaluationCheckpoints<'_>) -> Result<Vec<T>, KernelFailure> {
     Layout::array::<T>(len).map_err(|_| KernelFailure::ResourceExhausted)?;

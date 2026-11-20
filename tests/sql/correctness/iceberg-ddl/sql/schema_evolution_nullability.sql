@@ -24,16 +24,14 @@
 -- table is populated with non-NULL rows before SET NOT NULL is applied.
 
 -- query 1
-CREATE DATABASE iceberg_ddl_cat_${suite_uuid0}.schema_nullable_${uuid0};
+CREATE SCHEMA iceberg_ddl_cat_${suite_uuid0}.schema_nullable_${uuid0};
 USE iceberg_ddl_cat_${suite_uuid0}.schema_nullable_${uuid0};
 DROP TABLE IF EXISTS members;
 CREATE TABLE members (
   id INT,
   email STRING
-) TBLPROPERTIES (
-  "format-version" = "2"
-);
-INSERT INTO members VALUES (1, 'a@x.com'), (2, 'b@x.com');
+) WITH (format_version = 2);
+INSERT INTO members VALUES ROW(1, 'a@x.com'), ROW(2, 'b@x.com');
 
 -- query 2
 SELECT id, email FROM members ORDER BY id;
@@ -48,7 +46,7 @@ SELECT id, email FROM members ORDER BY id;
 -- query 5
 -- SET NOT NULL on currently-nullable column: succeeds without scanning;
 -- attestation property novarocks.nullability.attested.email is recorded.
-ALTER TABLE members ALTER COLUMN email SET NOT NULL;
+ALTER TABLE members EXECUTE set_column_not_null(column => 'email');
 
 -- query 6
 SELECT id, email FROM members ORDER BY id;
@@ -62,4 +60,4 @@ SELECT id, email FROM members ORDER BY id;
 
 -- query 9
 DROP TABLE members;
-DROP DATABASE iceberg_ddl_cat_${suite_uuid0}.schema_nullable_${uuid0};
+DROP SCHEMA iceberg_ddl_cat_${suite_uuid0}.schema_nullable_${uuid0};

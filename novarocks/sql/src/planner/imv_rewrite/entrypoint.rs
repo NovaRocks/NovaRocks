@@ -1021,9 +1021,14 @@ pub(crate) mod tests {
                 LogicalPlanKind::Filter(PlanFilterNode {
                     predicate: TypedExpr {
                         kind: ExprKind::BinaryOp {
-                            left: Box::new(column_ref(first_id, "k", DataType::Int64, false)),
+                            left: novarocks_parser::ast::AstBox::new(column_ref(
+                                first_id,
+                                "k",
+                                DataType::Int64,
+                                false,
+                            )),
                             op: BinOp::Ge,
-                            right: Box::new(TypedExpr {
+                            right: novarocks_parser::ast::AstBox::new(TypedExpr {
                                 kind: ExprKind::Literal(LiteralValue::Int(0)),
                                 value_type: novarocks_type_contract::FunctionValueType::new(
                                     DataType::Int32,
@@ -1905,9 +1910,9 @@ pub(crate) mod tests {
                     join_type: JoinKind::Inner,
                     condition: Some(TypedExpr {
                         kind: ExprKind::BinaryOp {
-                            left: Box::new(column_expr(1, "k", false)),
+                            left: novarocks_parser::ast::AstBox::new(column_expr(1, "k", false)),
                             op: BinOp::Eq,
-                            right: Box::new(column_expr(10, "k", false)),
+                            right: novarocks_parser::ast::AstBox::new(column_expr(10, "k", false)),
                             decimal_overflow_policy:
                                 novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                         },
@@ -1933,9 +1938,9 @@ pub(crate) mod tests {
                 join_type: JoinKind::Inner,
                 condition: Some(TypedExpr {
                     kind: ExprKind::BinaryOp {
-                        left: Box::new(column_expr(1, "k", false)),
+                        left: novarocks_parser::ast::AstBox::new(column_expr(1, "k", false)),
                         op: BinOp::Eq,
-                        right: Box::new(column_expr(10, "k", false)),
+                        right: novarocks_parser::ast::AstBox::new(column_expr(10, "k", false)),
                         decimal_overflow_policy:
                             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     },
@@ -1985,9 +1990,9 @@ pub(crate) mod tests {
                 join_type: JoinKind::Inner,
                 condition: Some(TypedExpr {
                     kind: ExprKind::BinaryOp {
-                        left: Box::new(column_expr(1, "k", false)),
+                        left: novarocks_parser::ast::AstBox::new(column_expr(1, "k", false)),
                         op: BinOp::Eq,
-                        right: Box::new(column_expr(10, "k", false)),
+                        right: novarocks_parser::ast::AstBox::new(column_expr(10, "k", false)),
                         decimal_overflow_policy:
                             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     },
@@ -2004,9 +2009,9 @@ pub(crate) mod tests {
             LogicalPlanKind::Filter(PlanFilterNode {
                 predicate: TypedExpr {
                     kind: ExprKind::BinaryOp {
-                        left: Box::new(column_expr(1, "k", false)),
+                        left: novarocks_parser::ast::AstBox::new(column_expr(1, "k", false)),
                         op: BinOp::Gt,
-                        right: Box::new(TypedExpr {
+                        right: novarocks_parser::ast::AstBox::new(TypedExpr {
                             kind: ExprKind::Literal(LiteralValue::Int(0)),
                             value_type: novarocks_type_contract::FunctionValueType::new(
                                 DataType::Int64,
@@ -2041,9 +2046,9 @@ pub(crate) mod tests {
             LogicalPlanKind::Filter(PlanFilterNode {
                 predicate: TypedExpr {
                     kind: ExprKind::BinaryOp {
-                        left: Box::new(column_expr(1, "k", false)),
+                        left: novarocks_parser::ast::AstBox::new(column_expr(1, "k", false)),
                         op: BinOp::Gt,
-                        right: Box::new(TypedExpr {
+                        right: novarocks_parser::ast::AstBox::new(TypedExpr {
                             kind: ExprKind::Literal(LiteralValue::Int(0)),
                             value_type: novarocks_type_contract::FunctionValueType::new(
                                 DataType::Int64,
@@ -2070,9 +2075,9 @@ pub(crate) mod tests {
                 join_type: JoinKind::Inner,
                 condition: Some(TypedExpr {
                     kind: ExprKind::BinaryOp {
-                        left: Box::new(column_expr(1, "k", false)),
+                        left: novarocks_parser::ast::AstBox::new(column_expr(1, "k", false)),
                         op: BinOp::Eq,
-                        right: Box::new(column_expr(10, "k", false)),
+                        right: novarocks_parser::ast::AstBox::new(column_expr(10, "k", false)),
                         decimal_overflow_policy:
                             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     },

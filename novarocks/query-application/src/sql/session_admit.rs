@@ -25,12 +25,12 @@ use novarocks_user_error::{
 const ADMIT_SESSION_GLOBAL_SCOPE_UNSUPPORTED: ErrorCodeDescriptor = ErrorCodeDescriptor {
     code: ErrorCodeId::new("sql.admit.session_global_scope_unsupported"),
     phase: ErrorPhase::Admit,
-    status: ErrorCodeStatus::Active,
+    status: ErrorCodeStatus::Deprecated,
 };
 const ADMIT_SESSION_TRANSACTION_UNSUPPORTED: ErrorCodeDescriptor = ErrorCodeDescriptor {
     code: ErrorCodeId::new("sql.admit.session_transaction_unsupported"),
     phase: ErrorPhase::Admit,
-    status: ErrorCodeStatus::Active,
+    status: ErrorCodeStatus::Deprecated,
 };
 const ADMIT_KILL_CONNECTION_UNSUPPORTED: ErrorCodeDescriptor = ErrorCodeDescriptor {
     code: ErrorCodeId::new("sql.admit.kill_connection_unsupported"),
@@ -40,7 +40,7 @@ const ADMIT_KILL_CONNECTION_UNSUPPORTED: ErrorCodeDescriptor = ErrorCodeDescript
 const ADMIT_KILL_DENIED: ErrorCodeDescriptor = ErrorCodeDescriptor {
     code: ErrorCodeId::new("sql.admit.kill_denied"),
     phase: ErrorPhase::Admit,
-    status: ErrorCodeStatus::Active,
+    status: ErrorCodeStatus::Deprecated,
 };
 
 const ADMIT_PERSISTED_DEFINITION_SEMANTICS_UNSUPPORTED: ErrorCodeDescriptor = ErrorCodeDescriptor {
@@ -93,9 +93,6 @@ pub const SESSION_ERROR_CODE_DESCRIPTORS: &[ErrorCodeDescriptor] = &[
 pub enum SessionAdmitError {
     InvalidSessionProperty,
     CatalogNotFound,
-    GlobalScopeUnsupported,
-    TransactionUnsupported,
-    KillDenied,
     PersistedDefinitionSemanticsUnsupported,
 }
 
@@ -104,9 +101,6 @@ impl SessionAdmitError {
         match self {
             Self::InvalidSessionProperty => ADMIT_INVALID_SESSION_PROPERTY,
             Self::CatalogNotFound => ADMIT_SESSION_CATALOG_NOT_FOUND,
-            Self::GlobalScopeUnsupported => ADMIT_SESSION_GLOBAL_SCOPE_UNSUPPORTED,
-            Self::TransactionUnsupported => ADMIT_SESSION_TRANSACTION_UNSUPPORTED,
-            Self::KillDenied => ADMIT_KILL_DENIED,
             Self::PersistedDefinitionSemanticsUnsupported => {
                 ADMIT_PERSISTED_DEFINITION_SEMANTICS_UNSUPPORTED
             }
@@ -146,44 +140,42 @@ mod tests {
                 .iter()
                 .all(|descriptor| descriptor.phase == ErrorPhase::Admit)
         );
-        assert_eq!(
-            SESSION_ERROR_CODE_DESCRIPTORS
-                .iter()
-                .find(|descriptor| descriptor.code.as_str()
-                    == "sql.admit.kill_connection_unsupported")
-                .expect("published tombstone")
-                .status,
-            ErrorCodeStatus::Deprecated
-        );
-        assert_eq!(
-            SESSION_ERROR_CODE_DESCRIPTORS
-                .iter()
-                .find(|descriptor| descriptor.code.as_str() == "sql.admit.kill_denied")
-                .expect("active KILL denial")
-                .status,
-            ErrorCodeStatus::Active
-        );
+        for code in [
+            "sql.admit.kill_connection_unsupported",
+            "sql.admit.kill_denied",
+            "sql.admit.session_global_scope_unsupported",
+            "sql.admit.session_transaction_unsupported",
+        ] {
+            assert_eq!(
+                SESSION_ERROR_CODE_DESCRIPTORS
+                    .iter()
+                    .find(|descriptor| descriptor.code.as_str() == code)
+                    .expect("published tombstone")
+                    .status,
+                ErrorCodeStatus::Deprecated,
+                "{code}"
+            );
+        }
     }
 
     #[test]
     fn session_admit_errors_preserve_code_phase_and_location() {
         for (kind, code) in [
             (
-                SessionAdmitError::GlobalScopeUnsupported,
-                "sql.admit.session_global_scope_unsupported",
+                SessionAdmitError::InvalidSessionProperty,
+                "sql.admit.invalid_session_property",
             ),
             (
-                SessionAdmitError::TransactionUnsupported,
-                "sql.admit.session_transaction_unsupported",
+                SessionAdmitError::CatalogNotFound,
+                "sql.admit.session_catalog_not_found",
             ),
-            (SessionAdmitError::KillDenied, "sql.admit.kill_denied"),
             (
                 SessionAdmitError::PersistedDefinitionSemanticsUnsupported,
                 "sql.admit.persisted_definition_semantics_unsupported",
             ),
         ] {
             let error = kind.to_user_error(
-                "SET GLOBAL query_timeout = 1",
+                "SET SESSION query_timeout = 1",
                 Span::new(4, 10),
                 "session capability is not supported",
             );

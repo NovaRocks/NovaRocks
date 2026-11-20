@@ -40,10 +40,10 @@ FROM iceberg_compat_${suite_uuid0}.${case_db}.g02_${uuid0}_same_commit_dv
 ORDER BY id, value;
 
 -- query 5
-DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.g02_${uuid0}_same_commit_position FORCE;
+DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.g02_${uuid0}_same_commit_position ;
 
 -- query 6
-DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.g02_${uuid0}_same_commit_equality FORCE;
+DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.g02_${uuid0}_same_commit_equality ;
 
 -- query 7
-DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.g02_${uuid0}_same_commit_dv FORCE;
+DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.g02_${uuid0}_same_commit_dv ;

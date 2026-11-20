@@ -26,7 +26,7 @@ select  a.ca_state state, count(*) cnt
  	and s.ss_sold_date_sk = d.d_date_sk
  	and s.ss_item_sk = i.i_item_sk
  	and d.d_month_seq = 
- 	     (select distinct (d_month_seq)
+	     (select distinct (d_month_seq)
  	      from date_dim
                where d_year = 2001
  	        and d_moy = 1 )

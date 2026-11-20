@@ -27,54 +27,29 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE EXTERNAL CATALOG ice_ivm_union_pf_${uuid0}
-PROPERTIES (
-  "type" = "iceberg",
-  "iceberg.catalog.type" = "rest",
-  "uri" = "${iceberg_rest_uri}",
-  "warehouse" = "${iceberg_rest_warehouse}",
-  "aws.s3.endpoint" = "${oss_endpoint}",
-  "credential.object-store-metadata.consumer-role" = "frontend",
-  "credential.object-store-metadata.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-metadata.name" = "${iceberg_object_store_metadata_credential_name}",
-  "credential.object-store-metadata.generation" = "${iceberg_object_store_credential_generation}",
-  "credential.object-store-data.consumer-role" = "backend",
-  "credential.object-store-data.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-data.name" = "${iceberg_object_store_data_credential_name}",
-  "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
-  "aws.s3.region" = "${oss_region}",
-  "aws.s3.enable_path_style_access" = "${oss_path_style}"
-);
-CREATE DATABASE ice_ivm_union_pf_${uuid0}.ns_${uuid0};
+CREATE CATALOG ice_ivm_union_pf_${uuid0} USING iceberg WITH ("iceberg.catalog.type" = 'rest', "uri" = '${iceberg_rest_uri}', "warehouse" = '${iceberg_rest_warehouse}', "aws.s3.endpoint" = '${oss_endpoint}', "credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-metadata.name" = '${iceberg_object_store_metadata_credential_name}', "credential.object-store-metadata.generation" = '${iceberg_object_store_credential_generation}', "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-data.name" = '${iceberg_object_store_data_credential_name}', "credential.object-store-data.generation" = '${iceberg_object_store_credential_generation}', "aws.s3.region" = '${oss_region}', "aws.s3.enable_path_style_access" = '${oss_path_style}');
+CREATE SCHEMA ice_ivm_union_pf_${uuid0}.ns_${uuid0};
 CREATE TABLE ice_ivm_union_pf_${uuid0}.ns_${uuid0}.orders_live (
   id INT NOT NULL,
   name STRING,
   amount INT
-)
-TBLPROPERTIES ("format-version" = "3",
-  "write.row-lineage" = "true");
+) WITH (format_version = 3);
 CREATE TABLE ice_ivm_union_pf_${uuid0}.ns_${uuid0}.orders_archive (
   id INT NOT NULL,
   name STRING,
   amount INT
-)
-TBLPROPERTIES ("format-version" = "3",
-  "write.row-lineage" = "true");
+) WITH (format_version = 3);
 USE ice_ivm_union_pf_${uuid0}.ns_${uuid0};
 
 -- query 2
 -- @skip_result_check=true
 INSERT INTO ice_ivm_union_pf_${uuid0}.ns_${uuid0}.orders_live VALUES
-  (10, 'same', 11),
-  (20, 'live-only', 20);
+  ROW(10, 'same', 11),
+  ROW(20, 'live-only', 20);
 INSERT INTO ice_ivm_union_pf_${uuid0}.ns_${uuid0}.orders_archive VALUES
-  (10, 'same', 99),
-  (30, 'archive-only', 30);
-CREATE MATERIALIZED VIEW union_pf_mv_${uuid0}
-DISTRIBUTED BY HASH(id) BUCKETS 1
-PROPERTIES ('storage_engine' = 'iceberg')
-AS
-SELECT id, name, amount
+  ROW(10, 'same', 99),
+  ROW(30, 'archive-only', 30);
+CREATE MATERIALIZED VIEW union_pf_mv_${uuid0} AS SELECT id, name, amount
 FROM ice_ivm_union_pf_${uuid0}.ns_${uuid0}.orders_live
 WHERE amount >= 0
 UNION ALL
@@ -104,7 +79,7 @@ ORDER BY id, amount;
 -- query 7
 -- @skip_result_check=true
 INSERT INTO ice_ivm_union_pf_${uuid0}.ns_${uuid0}.orders_live VALUES
-  (10, 'live-new', 15);
+  ROW(10, 'live-new', 15);
 UPDATE ice_ivm_union_pf_${uuid0}.ns_${uuid0}.orders_archive
 SET amount = 120
 WHERE id = 10;
@@ -120,7 +95,9 @@ ORDER BY id, amount;
 
 -- query 10
 -- @skip_result_check=true
-REFRESH MATERIALIZED VIEW union_pf_mv_${uuid0} FULL;
+SET SESSION "ice_ivm_union_pf_${uuid0}".incremental_refresh_enabled = false;
+REFRESH MATERIALIZED VIEW union_pf_mv_${uuid0};
+RESET SESSION "ice_ivm_union_pf_${uuid0}".incremental_refresh_enabled;
 
 -- query 11
 SELECT id, name, amount
@@ -131,7 +108,7 @@ ORDER BY id, amount;
 -- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW union_pf_mv_${uuid0};
-DROP TABLE ice_ivm_union_pf_${uuid0}.ns_${uuid0}.orders_live FORCE;
-DROP TABLE ice_ivm_union_pf_${uuid0}.ns_${uuid0}.orders_archive FORCE;
-DROP DATABASE ice_ivm_union_pf_${uuid0}.ns_${uuid0};
+DROP TABLE ice_ivm_union_pf_${uuid0}.ns_${uuid0}.orders_live ;
+DROP TABLE ice_ivm_union_pf_${uuid0}.ns_${uuid0}.orders_archive ;
+DROP SCHEMA ice_ivm_union_pf_${uuid0}.ns_${uuid0};
 DROP CATALOG ice_ivm_union_pf_${uuid0};

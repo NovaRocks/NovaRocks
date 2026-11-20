@@ -30,14 +30,9 @@ SELECT * FROM system.metadata.materialized_views WHERE false;
 
 -- query 2
 -- @skip_result_check=true
-CREATE TABLE system_base (k1 INT NOT NULL, v2 BIGINT)
-TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
-INSERT INTO system_base VALUES (1, 10);
-CREATE MATERIALIZED VIEW system_mv
-DISTRIBUTED BY HASH(k1) BUCKETS 1
-REFRESH DEFERRED MANUAL
-PROPERTIES ('storage_engine' = 'iceberg')
-AS SELECT k1, v2 FROM system_base;
+CREATE TABLE system_base (k1 INT NOT NULL, v2 BIGINT) WITH (format_version = 3);
+INSERT INTO system_base VALUES ROW(1, 10);
+CREATE MATERIALIZED VIEW system_mv WITH (refresh_policy = 'MANUAL') AS SELECT k1, v2 FROM system_base;
 
 -- query 3
 SELECT name, freshness, last_fresh_time, comment, storage_table
@@ -57,7 +52,7 @@ WHERE catalog_name = 'materialized_view_cat_${suite_uuid0}'
 
 -- query 6
 -- @skip_result_check=true
-INSERT INTO system_base VALUES (2, 20);
+INSERT INTO system_base VALUES ROW(2, 20);
 
 -- query 7
 SELECT name, freshness, last_fresh_time
@@ -87,7 +82,7 @@ WHERE table_schema = 'metadata' AND table_name = 'materialized_views';
 USE system.metadata;
 
 -- query 12
-SELECT count(*) AS mv_count FROM materialized_views
+SELECT count() AS mv_count FROM materialized_views
 WHERE schema_name = '${case_db}' AND name = 'system_mv';
 
 -- query 13
@@ -128,4 +123,4 @@ SELECT k1, v2 FROM materialized_view_cat_${suite_uuid0}.${case_db}.system_base O
 -- @skip_result_check=true
 USE materialized_view_cat_${suite_uuid0}.${case_db};
 DROP MATERIALIZED VIEW IF EXISTS system_mv;
-DROP TABLE IF EXISTS system_base FORCE;
+DROP TABLE IF EXISTS system_base ;

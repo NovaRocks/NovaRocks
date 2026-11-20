@@ -29,10 +29,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use self::async_facts::PreparationError;
+use crate::mv::domain::analysis::canonicalize_iceberg_mv_select_query;
 use crate::mv::domain::analysis::refresh_property::derive_fragment_property;
-use crate::mv::domain::analysis::{
-    canonicalize_iceberg_mv_select_query, validate_mv_partition_columns,
-};
 use crate::mv::domain::application::MvRefreshRequest;
 use crate::mv::domain::iceberg_refresh::{IcebergMvCorePorts, join_base_refs_for_definition};
 use crate::mv::domain::refresh::capabilities::RefreshCapabilities;
@@ -80,7 +78,6 @@ use novarocks_spi::connector::{
 use novarocks_sql::compiler::SqlMvRelationOccurrenceId;
 use novarocks_sql::planning::mv::MvRefreshFinalizeFacts;
 use novarocks_sql::planning::mv::{SqlMvAggregateLayoutScope, extract_aggregate_sql_calls};
-use novarocks_sql::semantic::IcebergPartitionFieldExpr;
 /// One repartition target observation retained across transition and write
 /// preparation. Both payloads were produced from the same exact lease and
 /// metadata value; no downstream repartition step may resolve `latest` again.
@@ -92,6 +89,7 @@ struct RetainedRepartitionTarget {
 struct PreparedManagedRepartitionTransition {
     replacement: novarocks_spi::connector::ConnectorManagedPartitionSpecReplacement,
     preview: novarocks_spi::connector::ConnectorManagedPartitionSpecPreview,
+    configuration: Option<novarocks_mv_application::engine_properties::MvRefreshPropertyChanges>,
 }
 
 pub(crate) fn validate_retained_target_identity(
@@ -118,35 +116,6 @@ fn execution_binding_key_for_target(
     ConnectorProviderBindingKey {
         instance_id: lease.binding().descriptor().instance_id.clone(),
         incarnation: lease.binding().incarnation(),
-    }
-}
-
-fn managed_repartition_field(
-    field: &IcebergPartitionFieldExpr,
-) -> (
-    &str,
-    novarocks_spi::connector::ConnectorManagedPartitionTransform,
-) {
-    use novarocks_spi::connector::ConnectorManagedPartitionTransform as Transform;
-    match field {
-        IcebergPartitionFieldExpr::Identity { column } => (column, Transform::Identity),
-        IcebergPartitionFieldExpr::Year { column } => (column, Transform::Year),
-        IcebergPartitionFieldExpr::Month { column } => (column, Transform::Month),
-        IcebergPartitionFieldExpr::Day { column } => (column, Transform::Day),
-        IcebergPartitionFieldExpr::Hour { column } => (column, Transform::Hour),
-        IcebergPartitionFieldExpr::Bucket {
-            column,
-            num_buckets,
-        } => (
-            column,
-            Transform::Bucket {
-                buckets: *num_buckets,
-            },
-        ),
-        IcebergPartitionFieldExpr::Truncate { column, width } => {
-            (column, Transform::Truncate { width: *width })
-        }
-        IcebergPartitionFieldExpr::Void { column } => (column, Transform::Void),
     }
 }
 

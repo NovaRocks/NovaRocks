@@ -22,7 +22,7 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE DATABASE IF NOT EXISTS statistics_cat_${suite_uuid0}.nr_synchronous_${suite_uuid0};
+CREATE SCHEMA IF NOT EXISTS statistics_cat_${suite_uuid0}.nr_synchronous_${suite_uuid0};
 
 -- query 2
 -- @skip_result_check=true
@@ -33,11 +33,11 @@ CREATE TABLE statistics_cat_${suite_uuid0}.nr_synchronous_${suite_uuid0}.termina
 -- query 3
 -- @skip_result_check=true
 INSERT INTO statistics_cat_${suite_uuid0}.nr_synchronous_${suite_uuid0}.terminal_${uuid0} VALUES
-    (1), (2), (3);
+    ROW(1), ROW(2), ROW(3);
 
 -- query 4
 -- @skip_result_check=true
-ANALYZE TABLE statistics_cat_${suite_uuid0}.nr_synchronous_${suite_uuid0}.terminal_${uuid0} (k);
+ANALYZE statistics_cat_${suite_uuid0}.nr_synchronous_${suite_uuid0}.terminal_${uuid0} WITH (columns = ARRAY['k']);
 
 -- query 5
 SHOW STATS FOR statistics_cat_${suite_uuid0}.nr_synchronous_${suite_uuid0}.terminal_${uuid0};

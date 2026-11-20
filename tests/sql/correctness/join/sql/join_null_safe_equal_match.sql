@@ -29,24 +29,22 @@ DROP TABLE IF EXISTS ${case_db}.t_join_null_safe_equal_r;
 CREATE TABLE ${case_db}.t_join_null_safe_equal_l (
   k INT,
   v STRING
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 CREATE TABLE ${case_db}.t_join_null_safe_equal_r (
   k INT,
   v STRING
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 INSERT INTO ${case_db}.t_join_null_safe_equal_l VALUES
-  (1, 'l1'),
-  (NULL, 'ln1'),
-  (NULL, 'ln2');
+  ROW(1, 'l1'),
+  ROW(NULL, 'ln1'),
+  ROW(NULL, 'ln2');
 INSERT INTO ${case_db}.t_join_null_safe_equal_r VALUES
-  (NULL, 'rn1'),
-  (NULL, 'rn2'),
-  (1, 'r1'),
-  (2, 'r2');
+  ROW(NULL, 'rn1'),
+  ROW(NULL, 'rn2'),
+  ROW(1, 'r1'),
+  ROW(2, 'r2');
 SELECT l.v AS lv, r.v AS rv
 FROM ${case_db}.t_join_null_safe_equal_l l
 INNER JOIN ${case_db}.t_join_null_safe_equal_r r
-  ON l.k <=> r.k
+  ON l.k  IS NOT DISTINCT FROM  r.k
 ORDER BY lv, rv;

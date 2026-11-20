@@ -41,4 +41,4 @@ SELECT id FROM iceberg_compat_${suite_uuid0}.${case_db}.java_variant_bounds_${uu
 -- query 3
 -- @cleanup=true
 -- @skip_result_check=true
-DROP TABLE IF EXISTS iceberg_compat_${suite_uuid0}.${case_db}.java_variant_bounds_${uuid0} FORCE;
+DROP TABLE IF EXISTS iceberg_compat_${suite_uuid0}.${case_db}.java_variant_bounds_${uuid0} ;

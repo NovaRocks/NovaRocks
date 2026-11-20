@@ -281,6 +281,7 @@ fn remap_scalar(
             )?)
         }
         ScalarNode::Cast {
+            array_failure_mode,
             child,
             target,
             decimal_overflow_policy,
@@ -288,6 +289,7 @@ fn remap_scalar(
             let child = candidate_or_none!(remap_scalar(arena, child, bindings, control)?);
             Some(arena.intern_observed(
                 ScalarNode::Cast {
+                    array_failure_mode,
                     child,
                     target,
                     decimal_overflow_policy,
@@ -565,7 +567,7 @@ mod tests {
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
 
             kind: ExprKind::IsNull {
-                expr: Box::new(expr),
+                expr: novarocks_parser::ast::AstBox::new(expr),
                 negated: true,
             },
         }
@@ -576,9 +578,9 @@ mod tests {
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
 
             kind: ExprKind::BinaryOp {
-                left: Box::new(a),
+                left: novarocks_parser::ast::AstBox::new(a),
                 op: BinOp::Eq,
-                right: Box::new(b),
+                right: novarocks_parser::ast::AstBox::new(b),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
         }
@@ -589,9 +591,9 @@ mod tests {
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
 
             kind: ExprKind::BinaryOp {
-                left: Box::new(a),
+                left: novarocks_parser::ast::AstBox::new(a),
                 op: BinOp::And,
-                right: Box::new(b),
+                right: novarocks_parser::ast::AstBox::new(b),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
         }
@@ -804,9 +806,9 @@ mod tests {
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
 
             kind: ExprKind::BinaryOp {
-                left: Box::new(col_ref("a", a_id)),
+                left: novarocks_parser::ast::AstBox::new(col_ref("a", a_id)),
                 op: BinOp::Add,
-                right: Box::new(int_lit(1)),
+                right: novarocks_parser::ast::AstBox::new(int_lit(1)),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
         };
@@ -882,9 +884,9 @@ mod tests {
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
 
             kind: ExprKind::BinaryOp {
-                left: Box::new(col_ref("a", a_id)),
+                left: novarocks_parser::ast::AstBox::new(col_ref("a", a_id)),
                 op: BinOp::Add,
-                right: Box::new(int_lit(1)),
+                right: novarocks_parser::ast::AstBox::new(int_lit(1)),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
         };

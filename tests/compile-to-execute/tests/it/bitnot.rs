@@ -23,12 +23,13 @@ use novarocks_expression::CompiledExpressionInstance;
 use novarocks_expression::EvaluationInput;
 use novarocks_expression::testkit::PassThroughCallHost;
 use novarocks_functions::{
-    KernelEvaluationControl, KernelFailure, ScalarInvocationActivation, ScalarInvocationScope,
-    Selection,
+    FunctionArgumentType, FunctionResultType, FunctionValueType, KernelEvaluationControl,
+    KernelFailure, ScalarInvocationActivation, ScalarInvocationScope, Selection,
 };
 use novarocks_local_program::{ProgramNodeKind, ProgramRootRef, ProgramUnitId};
 use novarocks_sql_testkit::sql_source;
 use novarocks_test_compile_to_execute::programs::{batch, programs_with_catalogue};
+use novarocks_type_contract::ValueLogicalType;
 
 use novarocks_expression_contract::RootOrdinal;
 use std::sync::Arc;
@@ -64,20 +65,38 @@ fn programs(
     let functions = novarocks_functions::testkit::installed_builtin_owner_catalogue();
     programs_with_catalogue(source, &functions)
 }
-fn producer_root(
+fn bitnot_call_root(
     plans: &std::collections::BTreeMap<
         novarocks_physical_plan::FragmentId,
         Arc<novarocks_local_program::LocalProgram>,
     >,
+    argument: &FunctionValueType,
+    result: &FunctionValueType,
 ) -> (Arc<novarocks_local_program::LocalProgram>, ProgramRootRef) {
     let mut found = None;
     for program in plans.values() {
         for (unit_ordinal, unit) in program.units().iter().enumerate() {
             for (root_ordinal, root) in unit.roots().iter().enumerate() {
-                if unit.recipes().native_bitnot(root.use_id).is_some() {
-                    assert!(
-                        found.is_none(),
-                        "this actual SQL source declares exactly one BitwiseNot output root"
+                if let Some(call) = unit.calls().get(&root.use_id)
+                    && call.call_contract().function_id().as_str() == "builtin.scalar/bitnot/v1"
+                {
+                    assert!(found.is_none(), "the SQL has exactly one named bitnot root");
+                    let contract = call.call_contract();
+                    assert_eq!(contract.logical_argument_count(), 1);
+                    assert_eq!(
+                        contract.selected().argument_types.as_slice(),
+                        &[FunctionArgumentType::Value(argument.clone())]
+                    );
+                    assert_eq!(
+                        contract.selected().result_type,
+                        FunctionResultType::Scalar(result.clone())
+                    );
+                    assert_eq!(
+                        unit.definitions()
+                            .node(root.definition)
+                            .unwrap()
+                            .value_type(),
+                        Some(result)
                     );
                     found = Some((
                         program.clone(),
@@ -90,10 +109,10 @@ fn producer_root(
             }
         }
     }
-    found.expect("the actual published root binding retains its owned BitwiseNot recipe")
+    found.expect("the actual SQL output retains the bound bitnot call")
 }
 #[test]
-fn native_bitnot_intrinsic_actual_sql_signed_four_widths_frame_matches_original_and_full_fvt() {
+fn named_bitnot_actual_sql_signed_four_widths_preserve_full_fvt_and_frame_results() {
     // For a fixed signed two's-complement width, complement swaps MIN/MAX,
     // maps -1 to zero, zero to -1, and one to -2. These are independent inputs
     // and fixed expected arrays, not an evaluator over the supplied input.
@@ -117,7 +136,7 @@ fn native_bitnot_intrinsic_actual_sql_signed_four_widths_frame_matches_original_
     ];
     for (input, expected) in cases {
         let source = sql_source(
-            "SELECT ~k AS original_inverted FROM fixture.source",
+            "SELECT bitnot(k) AS original_inverted FROM fixture.source",
             input.data_type().clone(),
         );
         let public = source
@@ -126,9 +145,11 @@ fn native_bitnot_intrinsic_actual_sql_signed_four_widths_frame_matches_original_
             .unwrap();
         let computed = source.plan().result_port().unwrap();
         assert_eq!(public.original_port(), computed);
-        assert!(!public.fields()[0].ty.nullable());
+        let argument = FunctionValueType::new(input.data_type().clone(), false);
+        let result = FunctionValueType::new(input.data_type().clone(), true);
+        assert_eq!(public.fields()[0].ty, result);
         let plans = programs(&source);
-        let (program, root) = producer_root(&plans);
+        let (program, root) = bitnot_call_root(&plans, &argument, &result);
         let data = batch(&program, root, input.clone());
         let mut frame = CompiledExpressionInstance::try_new(
             program.unit(root.unit).unwrap().clone(),
@@ -217,13 +238,19 @@ fn native_bitnot_intrinsic_actual_sql_signed_four_widths_frame_matches_original_
     }
 }
 #[test]
-fn native_bitnot_intrinsic_actual_sql_largeint_cast_uses_exact_logical_recipe() {
+fn named_bitnot_actual_sql_largeint_cast_preserves_the_nominal_call_and_result() {
     let source = sql_source(
-        "SELECT ~CAST(k AS LARGEINT) AS original_inverted FROM fixture.source",
+        "SELECT bitnot(CAST(k AS LARGEINT)) AS original_inverted FROM fixture.source",
         DataType::Int64,
     );
+    let result = FunctionValueType::try_with_logical_type(
+        DataType::FixedSizeBinary(16),
+        true,
+        ValueLogicalType::LargeInt,
+    )
+    .unwrap();
     let plans = programs(&source);
-    let (program, root) = producer_root(&plans);
+    let (program, root) = bitnot_call_root(&plans, &result, &result);
     let data = batch(
         &program,
         root,
@@ -258,21 +285,17 @@ fn native_bitnot_intrinsic_actual_sql_largeint_cast_uses_exact_logical_recipe() 
     .unwrap();
     assert!(out.errors().is_empty());
     assert_eq!(out.values().to_data(), expected.to_data());
-    assert_eq!(
-        source.plan().result_port().unwrap().fields[0]
-            .ty
-            .logical_type(),
-        novarocks_type_contract::ValueLogicalType::LargeInt
-    );
+    assert_eq!(source.plan().result_port().unwrap().fields[0].ty, result);
 }
 #[test]
-fn native_bitnot_intrinsic_actual_sql_nullable_values_current_domain_matches_original() {
+fn named_bitnot_actual_sql_nullable_values_preserve_nulls_and_sparse_results() {
     let source = sql_source(
-        "SELECT ~i AS original_inverted FROM (VALUES (CAST(1 AS BIGINT)),(CAST(NULL AS BIGINT)),(CAST(-2 AS BIGINT))) AS source(i)",
+        "SELECT bitnot(i) AS original_inverted FROM (VALUES (CAST(1 AS BIGINT)),(CAST(NULL AS BIGINT)),(CAST(-2 AS BIGINT))) AS source(i)",
         DataType::Int64,
     );
+    let nullable_bigint = FunctionValueType::new(DataType::Int64, true);
     let plans = programs(&source);
-    let (program, root) = producer_root(&plans);
+    let (program, root) = bitnot_call_root(&plans, &nullable_bigint, &nullable_bigint);
     let input: ArrayRef = Arc::new(Int64Array::from(vec![Some(1), None, Some(-2)]));
     let data = batch(&program, root, input.clone());
     let mut frame = CompiledExpressionInstance::try_new(
@@ -319,7 +342,10 @@ fn native_bitnot_intrinsic_actual_sql_nullable_values_current_domain_matches_ori
         sparse.values().to_data(),
         Int64Array::from(vec![-2, 1]).to_data()
     );
-    assert!(source.plan().result_port().unwrap().fields[0].ty.nullable());
+    assert_eq!(
+        source.plan().result_port().unwrap().fields[0].ty,
+        nullable_bigint
+    );
 }
 fn constant_outputs(sql: &str) -> Vec<ArrayRef> {
     let source = sql_source(sql, DataType::Int64);
@@ -399,7 +425,7 @@ fn native_bitnot_intrinsic_actual_sql_largeint_full128_and_nullable_constant_sou
             Some(value) => format!("CAST('{value}' AS LARGEINT)"),
             None => "CAST(NULL AS LARGEINT)".to_owned(),
         };
-        let outputs = constant_outputs(&format!("SELECT ~{operand} AS original_inverted"));
+        let outputs = constant_outputs(&format!("SELECT bitnot({operand}) AS original_inverted"));
         assert_eq!(outputs.len(), 1);
         let expected = novarocks_types::largeint::array_from_i128(&[expected]).unwrap();
         assert_eq!(outputs[0].to_data(), expected.to_data());
@@ -415,7 +441,7 @@ fn native_bitnot_intrinsic_original_and_exact_utf8_largeint_source_keeps_convers
     use novarocks_functions::{FunctionArgumentType, FunctionValueType};
     use novarocks_type_contract::ValueLogicalType;
 
-    let sql = "SELECT ~CAST('-170141183460469231731687303715884105728' AS LARGEINT)";
+    let sql = "SELECT bitnot(CAST('-170141183460469231731687303715884105728' AS LARGEINT))";
     let expected_type = FunctionValueType::try_with_logical_type(
         DataType::FixedSizeBinary(16),
         true,

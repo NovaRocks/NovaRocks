@@ -65,7 +65,7 @@ paths = [
     "novarocks/sql/src/analyzer/resolve_expr.rs",
     "novarocks/sql/src/analyzer/mod.rs",
     "novarocks/parser/src/parser/mod.rs",
-    "novarocks/parser/src/parser/pratt.rs",
+    "novarocks/parser/src/parser/expression.rs",
     "novarocks/functions/src/comparison.rs",
     "novarocks/functions/src/array_projection.rs",
     "novarocks/functions/src/selected_copy/guarded_nested.rs",

@@ -53,20 +53,17 @@
 CREATE TABLE ${case_db}.rf_dist_bi_t1 (
     k INT NOT NULL,
     v INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 CREATE TABLE ${case_db}.rf_dist_bi_t2 (
     k INT NOT NULL,
     v INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 CREATE TABLE ${case_db}.rf_dist_bi_t3 (
     k INT NOT NULL,
     v INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- 300 rows per key-aligned table, key space 0..99 (3 rows per key on each
 -- side), so the join is non-trivial (t1 join t2 join t3 fans out per key).
@@ -85,9 +82,9 @@ INSERT INTO ${case_db}.rf_dist_bi_t3
 SELECT generate_series % 100 AS k, generate_series AS v
 FROM TABLE(generate_series(1, 300));
 
-ANALYZE TABLE ${case_db}.rf_dist_bi_t1;
-ANALYZE TABLE ${case_db}.rf_dist_bi_t2;
-ANALYZE TABLE ${case_db}.rf_dist_bi_t3;
+ANALYZE ${case_db}.rf_dist_bi_t1;
+ANALYZE ${case_db}.rf_dist_bi_t2;
+ANALYZE ${case_db}.rf_dist_bi_t3;
 
 -- Force Shuffle (PARTITIONED) hash joins on both levels and relax the RF
 -- build-size/selectivity gates so the M3 bilateral placement is exercised
@@ -95,13 +92,13 @@ ANALYZE TABLE ${case_db}.rf_dist_bi_t3;
 -- tests/sql/correctness/optimizer/sql/runtime_filter_cross_fragment_shuffle.sql for the
 -- single-join case). JoinAssociativity/JoinCommutativity are disabled below
 -- (both legs) to pin the join order to the literal left-deep chain written.
-SET global_runtime_filter_build_max_size = 10737418240;
-SET global_runtime_filter_probe_min_selectivity = 0.0;
-SET cbo_broadcast_node_mem_budget_bytes = 0;
-SET cbo_enable_dp_join_reorder = false;
-SET cbo_enable_greedy_join_reorder = false;
+SET SESSION global_runtime_filter_build_max_size = 10737418240;
+SET SESSION global_runtime_filter_probe_min_selectivity = 0.0;
+SET SESSION cbo_broadcast_node_mem_budget_bytes = 0;
+SET SESSION cbo_enable_dp_join_reorder = false;
+SET SESSION cbo_enable_greedy_join_reorder = false;
 
-SET disable_optimizer_rules = 'RuntimeFilterPushDown,JoinAssociativity,JoinCommutativity';
+SET SESSION disable_optimizer_rules = 'RuntimeFilterPushDown,JoinAssociativity,JoinCommutativity';
 SELECT 'bilateral_probe' AS scenario, COUNT(*) AS row_count,
        COALESCE(SUM(t1.v), 0) AS t1_sum, COALESCE(SUM(t2.v), 0) AS t2_sum
 FROM ${case_db}.rf_dist_bi_t1 t1
@@ -109,7 +106,7 @@ JOIN ${case_db}.rf_dist_bi_t2 t2 ON t1.k = t2.k
 JOIN ${case_db}.rf_dist_bi_t3 t3 ON t2.k = t3.k
 WHERE t3.v <= 150;
 
-SET disable_optimizer_rules = 'JoinAssociativity,JoinCommutativity';
+SET SESSION disable_optimizer_rules = 'JoinAssociativity,JoinCommutativity';
 -- The transitive filter is the one BUILT on t3.k (the top join's build side).
 -- Proving IT (not J_ab's own local t1.k=t2.k filter) lands on TWO scans is
 -- the bilateral/transitive M3 claim: the filter built on t3.k must appear as
@@ -138,7 +135,7 @@ WHERE t3.v <= 150;
 -- The preceding @explain_contains directives already assert both channels and
 -- bilateral probe placement. Do not golden query-local allocator identities.
 -- @skip_result_check=true
-EXPLAIN VERBOSE
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
 SELECT 'bilateral_probe' AS scenario, COUNT(*) AS row_count,
        COALESCE(SUM(t1.v), 0) AS t1_sum, COALESCE(SUM(t2.v), 0) AS t2_sum
 FROM ${case_db}.rf_dist_bi_t1 t1

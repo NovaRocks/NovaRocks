@@ -26,23 +26,22 @@ USE ${case_db};
 -- query 2
 -- @skip_result_check=true
 USE ${case_db};
-CREATE TABLE `test_dict_merge` (
-  `id` int NULL COMMENT "",
-  `city` string NOT NULL COMMENT "",
-  `city_null` string NULL COMMENT "",
-  `city_array` array<string> NOT NULL COMMENT "",
-  `city_array_null` array<string> NULL COMMENT ""
-)
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE "test_dict_merge" (
+  "id" int,
+  "city" string NOT NULL,
+  "city_null" string,
+  "city_array" array<string> NOT NULL,
+  "city_array_null" array<string>
+) WITH (format_version = 3);
 
 -- query 3
 -- @skip_result_check=true
 USE ${case_db};
 insert into test_dict_merge values
-(1, "beijing", "beijing", ["beijing", "shanghai"], NULL),
-(1, "beijing", NULL, ["shenzhen", "shanghai"], ["shenzhen", "shanghai"]),
-(1, "shanghai", "shanghai", ["shenzhen", NULL], ["shenzhen", NULL]),
-(1, "shanghai", NULL, ["beijing", NULL, "shanghai"], NULL);
+ROW(1, 'beijing', 'beijing', ['beijing', 'shanghai'], NULL),
+ROW(1, 'beijing', NULL, ['shenzhen', 'shanghai'], ['shenzhen', 'shanghai']),
+ROW(1, 'shanghai', 'shanghai', ['shenzhen', NULL], ['shenzhen', NULL]),
+ROW(1, 'shanghai', NULL, ['beijing', NULL, 'shanghai'], NULL);
 
 -- query 4
 USE ${case_db};
@@ -66,8 +65,7 @@ USE ${case_db};
 CREATE TABLE t1 (
     c1 int,
     c2 string
-    )
-TBLPROPERTIES ("format-version" = "3");
+    ) WITH (format_version = 3);
 
 -- query 9
 -- @skip_result_check=true

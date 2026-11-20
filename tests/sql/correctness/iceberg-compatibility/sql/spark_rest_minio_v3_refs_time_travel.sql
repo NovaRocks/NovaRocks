@@ -64,5 +64,5 @@ FROM (
 ORDER BY ref_name;
 
 -- query 3
-ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.spark_v3_refs_${uuid0} DROP BRANCH backup;
-DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.spark_v3_refs_${uuid0} FORCE;
+DROP BRANCH backup IN TABLE iceberg_compat_${suite_uuid0}.${case_db}.spark_v3_refs_${uuid0};
+DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.spark_v3_refs_${uuid0} ;

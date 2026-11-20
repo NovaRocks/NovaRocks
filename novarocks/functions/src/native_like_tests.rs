@@ -87,7 +87,7 @@ fn causes() -> [KernelFailure; 7] {
     ]
 }
 #[test]
-fn like_core_original_unicode_nul_recursion_backslash_and_full_errors() {
+fn like_core_unicode_nul_literal_backslash_and_full_errors() {
     for (text, pattern, expected) in [
         ("", "%", true),
         ("é中", "__", true),
@@ -95,8 +95,9 @@ fn like_core_original_unicode_nul_recursion_backslash_and_full_errors() {
         ("a\0b", "a_b", true),
         ("abc", "%b%", true),
         ("abc", "%d%", false),
-        ("a%b", r"a\%b", true),
-        ("a_b", r"a\_b", true),
+        ("a%b", r"a\%b", false),
+        ("a_b", r"a\_b", false),
+        (r"a\xb", r"a\_b", true),
         (r"a\", r"a\", true),
         ("a!b", "a!%", true),
         ("apple", "a!%", false),
@@ -125,6 +126,31 @@ fn like_core_original_unicode_nul_recursion_backslash_and_full_errors() {
             evaluate_required(&valid, &wide).unwrap_err().to_string(),
             "like: second argument must be a string array"
         );
+    }
+}
+
+#[test]
+fn like_explicit_escape_parses_every_token_and_requires_one_bmp_character() {
+    let evaluate = |text, pattern, escape| {
+        like_with_escape_observed(text, pattern, escape, &mut |_| Ok::<_, Infallible>(()))
+    };
+    assert!(evaluate("a_b", r"a\_b", r"\").unwrap());
+    assert!(evaluate("a%b", "a界%b", "界").unwrap());
+    assert!(evaluate("a!b", "a!!b", "!").unwrap());
+    assert!(evaluate("a%", "a%%", "%").unwrap());
+    assert!(matches!(
+        evaluate("mismatch", "a!x", "!"),
+        Err(LikeError::Pattern(LikePatternError::InvalidEscape))
+    ));
+    assert!(matches!(
+        evaluate("mismatch", "a!", "!"),
+        Err(LikeError::Pattern(LikePatternError::InvalidEscape))
+    ));
+    for escape in ["", "ab", "😀"] {
+        assert!(matches!(
+            evaluate("value", "%", escape),
+            Err(LikeError::Pattern(LikePatternError::EscapeLength))
+        ));
     }
 }
 #[test]

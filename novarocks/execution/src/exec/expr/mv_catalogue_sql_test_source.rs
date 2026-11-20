@@ -595,13 +595,10 @@ pub(super) fn run_with_denied_loan(
         deny_loans,
     };
     let tables = SqlPlannerTableSnapshot::new(&tables);
-    let parsed = novarocks_parser::parse(
+    let query = novarocks_parser::parser::parse_query(
         "SELECT l.k, r.v AS s FROM ice.db.l AS l JOIN ice.db.r AS r ON l.k = r.k",
     )
     .unwrap();
-    let [novarocks_parser::ast::Statement::Query(query)] = parsed.as_slice() else {
-        panic!("query source")
-    };
     let result = if incremental {
         analyze_join_incremental_refresh_change_stream(SqlMvJoinIncrementalRefreshAnalyzeContext {
             canonical_query: Box::new(query.clone()),

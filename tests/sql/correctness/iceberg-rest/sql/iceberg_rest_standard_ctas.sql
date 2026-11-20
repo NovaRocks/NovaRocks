@@ -21,7 +21,7 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE DATABASE iceberg_rest_${suite_uuid0}.ctas_db_${uuid0};
+CREATE SCHEMA iceberg_rest_${suite_uuid0}.ctas_db_${uuid0};
 
 -- query 2
 -- @skip_result_check=true
@@ -33,12 +33,11 @@ CREATE TABLE iceberg_rest_${suite_uuid0}.ctas_db_${uuid0}.src_${uuid0} (
 -- query 3
 -- @skip_result_check=true
 INSERT INTO iceberg_rest_${suite_uuid0}.ctas_db_${uuid0}.src_${uuid0}
-VALUES (1, 'alice'), (2, 'bob');
+VALUES ROW(1, 'alice'), ROW(2, 'bob');
 
 -- query 4
 -- @skip_result_check=true
-CREATE TABLE iceberg_rest_${suite_uuid0}.ctas_db_${uuid0}.dst_${uuid0} AS
-SELECT id, UPPER(name) AS uname
+CREATE TABLE iceberg_rest_${suite_uuid0}.ctas_db_${uuid0}.dst_${uuid0} AS SELECT id, UPPER(name) AS uname
 FROM iceberg_rest_${suite_uuid0}.ctas_db_${uuid0}.src_${uuid0};
 
 -- query 5
@@ -56,4 +55,4 @@ DROP TABLE iceberg_rest_${suite_uuid0}.ctas_db_${uuid0}.src_${uuid0};
 
 -- query 8
 -- @skip_result_check=true
-DROP DATABASE iceberg_rest_${suite_uuid0}.ctas_db_${uuid0};
+DROP SCHEMA iceberg_rest_${suite_uuid0}.ctas_db_${uuid0};

@@ -25,6 +25,16 @@ mod failure_projection;
 mod between;
 pub use between::*;
 mod arithmetic;
+mod array_cast;
+mod array_common;
+pub use array_cast::{
+    ArrayCastFailureMode, array_cast_mode_types_valid, array_cast_mode_types_valid_observed,
+};
+pub use array_common::{
+    ArrayCommonRuleFailure, ArrayCommonTypeFailure, array_common_coercion_types_valid_observed,
+    array_common_numeric_coercion, array_constructor_result_with_construction,
+    list_value_type_with_construction,
+};
 mod array_generate;
 mod call_context;
 mod carrier_parameters;
@@ -185,7 +195,7 @@ pub use owned_resources::metadata_request::{CompleteMetadataRequestFacts, Metada
 mod value_domain_cast;
 pub use value_domain_cast::{
     default_json_structure_carrier_cast_supported, is_default_json_structure_cast,
-    preserves_value_domains_observed,
+    is_null_list_to_json_cast, preserves_value_domains_observed,
 };
 mod client_input;
 pub use client_input::{ClientInputTypeBindings, ValidatedClientInputTypes};

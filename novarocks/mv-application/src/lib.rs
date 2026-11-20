@@ -37,6 +37,7 @@ pub mod activity;
 pub mod candidate;
 pub mod dependency;
 mod dependency_validation;
+pub mod engine_properties;
 pub mod freshness;
 pub mod maintenance;
 pub mod management;
@@ -51,6 +52,7 @@ mod repository_metrics;
 pub mod scheduler;
 pub mod scheduler_runtime;
 pub mod service;
+pub mod session_properties;
 pub mod state_family;
 pub mod state_store_repository;
 #[cfg(test)]

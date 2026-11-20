@@ -29,19 +29,17 @@ DROP TABLE IF EXISTS ${case_db}.t_join_duplicate_key_r;
 CREATE TABLE ${case_db}.t_join_duplicate_key_l (
   id INT,
   ltag STRING
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 CREATE TABLE ${case_db}.t_join_duplicate_key_r (
   id INT,
   rtag STRING
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 INSERT INTO ${case_db}.t_join_duplicate_key_l VALUES
-  (1, 'L1a'),
-  (1, 'L1b');
+  ROW(1, 'L1a'),
+  ROW(1, 'L1b');
 INSERT INTO ${case_db}.t_join_duplicate_key_r VALUES
-  (1, 'R1a'),
-  (1, 'R1b');
+  ROW(1, 'R1a'),
+  ROW(1, 'R1b');
 SELECT l.ltag, r.rtag
 FROM ${case_db}.t_join_duplicate_key_l l
 INNER JOIN ${case_db}.t_join_duplicate_key_r r

@@ -113,6 +113,7 @@ fn throwing_fold_request_retains_original_node_and_policy_and_nullable_sibling_f
         let node = |decimal_overflow_policy| {
             if cast {
                 ScalarNode::Cast {
+                    array_failure_mode: None,
                     child,
                     target: narrow.clone(),
                     decimal_overflow_policy,
@@ -205,6 +206,7 @@ fn real_fold_author_preserves_root_domains_and_nested_field_identity() {
     );
     let identity = fixture.intern(
         ScalarNode::Cast {
+            array_failure_mode: None,
             child: literal,
             target: ty.data_type().clone(),
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,

@@ -25,7 +25,7 @@ mod intent;
 mod outcome;
 mod request;
 mod reuse;
-pub(crate) use request::validate_document_expiry_update;
+pub(crate) use request::{canonical_json, validate_document_expiry_update};
 pub use reuse::{
     AddedManifestAuthor, ManifestReuseBasis, ManifestReuseIndex, ManifestRewriteReuse,
 };

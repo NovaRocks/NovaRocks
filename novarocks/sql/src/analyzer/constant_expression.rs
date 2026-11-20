@@ -56,6 +56,7 @@ pub(crate) fn prepare(
     control.check()?;
     let factory = Rc::new(RefCell::new(crate::column_id::ColumnRefFactory::new()));
     let context = super::AnalyzerContext {
+        purpose: crate::analyzer::QueryAnalysisPurpose::Ordinary,
         grouping_scope: RefCell::new(None),
         view_stack: Default::default(),
         control,
@@ -96,14 +97,7 @@ pub(crate) fn prepare(
     validate_implicit_target(&expression.value_type, target, span)?;
     // The target admits NULL until the application checks the actual result.
     // This does not erase a possible NULL produced by an ordinary CAST.
-    let result_type = FunctionValueType::new(
-        target.data_type(),
-        expression.value_type.nullable()
-            || matches!(
-                expression.value_type.value_type().kind(),
-                ValueKind::Scalar(DataType::Null)
-            ),
-    );
+    let result_type = required_target_value_type(&expression.value_type, target, control)?;
     let expression = super::value_conversion::cast_to_value_type(
         expression,
         result_type,
@@ -229,10 +223,7 @@ fn reject_subqueries(
                 self.error = Some(AnalyzeError::control(cause));
                 return;
             }
-            if matches!(
-                expression,
-                ast::Expr::Subquery(_) | ast::Expr::InSubquery(_) | ast::Expr::Exists(_)
-            ) {
+            if matches!(expression, ast::Expr::Subquery(_) | ast::Expr::Exists(_)) {
                 self.error = Some(AnalyzeError::unsupported_expression(
                     "required constants cannot contain subqueries",
                     expression.span(),
@@ -258,35 +249,189 @@ fn validate_implicit_target(
     use DataType::*;
     // The semantic value kind owns this decision. A dictionary layout, a
     // nominal Utf8 value, and a physical SQL string are not interchangeable.
-    let allowed = match source.value_type().kind() {
-        ValueKind::String => target == RequiredConstantTarget::Varchar,
-        ValueKind::Scalar(data_type) => match data_type {
-            Null => true,
-            Boolean => target == RequiredConstantTarget::Boolean,
-            Int8 | Int16 | Int32 => matches!(
-                target,
-                RequiredConstantTarget::Integer
-                    | RequiredConstantTarget::Bigint
-                    | RequiredConstantTarget::Double
-            ),
-            Int64 => matches!(
-                target,
-                RequiredConstantTarget::Bigint | RequiredConstantTarget::Double
-            ),
-            Float32 | Float64 | Decimal32(..) | Decimal64(..) | Decimal128(..) | Decimal256(..) => {
-                target == RequiredConstantTarget::Double
+    let allowed = if target == RequiredConstantTarget::Timestamp {
+        source.logical_type() == novarocks_type_contract::ValueLogicalType::Physical
+            && match source.value_type().kind() {
+                ValueKind::Scalar(ty @ Timestamp(..)) => source.data_type() == ty,
+                ValueKind::Scalar(Null) => source.nullable() && source.data_type() == &Null,
+                _ => false,
             }
+    } else if target == RequiredConstantTarget::ArrayVarchar {
+        match source.value_type().kind() {
+            ValueKind::Scalar(Null) => source.nullable(),
+            ValueKind::List(child) => match child.kind() {
+                ValueKind::String => true,
+                ValueKind::Scalar(Null) => child.nullable(),
+                _ => false,
+            },
             _ => false,
-        },
-        _ => false,
+        }
+    } else {
+        match source.value_type().kind() {
+            ValueKind::String => target == RequiredConstantTarget::Varchar,
+            ValueKind::Scalar(data_type) => match data_type {
+                Null => true,
+                Boolean => target == RequiredConstantTarget::Boolean,
+                Int8 | Int16 | Int32 => matches!(
+                    target,
+                    RequiredConstantTarget::Integer
+                        | RequiredConstantTarget::Bigint
+                        | RequiredConstantTarget::Double
+                ),
+                Int64 => matches!(
+                    target,
+                    RequiredConstantTarget::Bigint | RequiredConstantTarget::Double
+                ),
+                Float32 | Float64 | Decimal32(..) | Decimal64(..) | Decimal128(..)
+                | Decimal256(..) => target == RequiredConstantTarget::Double,
+                _ => false,
+            },
+            _ => false,
+        }
     };
     if allowed {
         Ok(())
     } else {
-        Err(AnalyzeError::unsupported_expression(
-            "required constant cannot be implicitly converted to the declared property type",
-            span,
-        ))
+        let message = if target == RequiredConstantTarget::Timestamp {
+            "required constant for an absolute time must have a Physical TIMESTAMP type"
+        } else {
+            "required constant cannot be implicitly converted to the declared property type"
+        };
+        Err(AnalyzeError::unsupported_expression(message, span))
+    }
+}
+
+fn required_target_value_type(
+    source: &FunctionValueType,
+    target: RequiredConstantTarget,
+    control: &dyn PureCompileControl,
+) -> Result<FunctionValueType, AnalyzeError> {
+    use novarocks_type_contract::{
+        ArrayCommonTypeFailure, ValueConstructionRequest, ValueLogicalType,
+        ValueTypeStorageLifetime,
+    };
+    match target {
+        RequiredConstantTarget::Boolean
+        | RequiredConstantTarget::Integer
+        | RequiredConstantTarget::Bigint
+        | RequiredConstantTarget::Double
+        | RequiredConstantTarget::Varchar => {
+            let data_type = target.scalar_data_type().ok_or_else(|| {
+                AnalyzeError::internal("scalar required target has no scalar declaration")
+            })?;
+            Ok(FunctionValueType::new(
+                data_type,
+                source.nullable()
+                    || matches!(
+                        source.value_type().kind(),
+                        ValueKind::Scalar(DataType::Null)
+                    ),
+            ))
+        }
+        RequiredConstantTarget::Timestamp => source
+            .clone_observed(|| control.checkpoint(CompilePhase::Validate, 1))
+            .map_err(AnalyzeError::control),
+        RequiredConstantTarget::ArrayVarchar => {
+            if matches!(source.value_type().kind(), ValueKind::List(child) if matches!(child.kind(), ValueKind::String))
+            {
+                // Exact identity keeps the original complete semantic/layout
+                // binding and allows the admitted CV's pool/ordinal to survive.
+                return source
+                    .clone_observed(|| control.checkpoint(CompilePhase::Validate, 1))
+                    .map_err(AnalyzeError::control);
+            }
+            let unknown = matches!(source.value_type().kind(), ValueKind::Scalar(DataType::Null) if source.nullable())
+                || matches!(source.value_type().kind(), ValueKind::List(child) if child.nullable() && matches!(child.kind(), ValueKind::Scalar(DataType::Null)));
+            if !unknown {
+                return Err(AnalyzeError::internal(
+                    "required ArrayVarchar declaration received an unadmitted source",
+                ));
+            }
+            let unknown_source = match source.value_type().kind() {
+                ValueKind::Scalar(DataType::Null) => source.nullable(),
+                ValueKind::List(child) => {
+                    child.nullable() && matches!(child.kind(), ValueKind::Scalar(DataType::Null))
+                }
+                _ => false,
+            };
+            if !unknown_source {
+                return Err(AnalyzeError::internal(
+                    "required ArrayVarchar declaration lacks its validated UNKNOWN source",
+                ));
+            }
+            // These are pure declaration-construction observations, not a
+            // runtime storage grant. Exact/opaque events still check control.
+            let mut observe = |request| {
+                let mut remaining = match request {
+                    ValueConstructionRequest::Work(units) => units,
+                    ValueConstructionRequest::Exact(_)
+                    | ValueConstructionRequest::OpaqueUpper(_) => 0,
+                };
+                while remaining > u32::MAX as usize {
+                    control.checkpoint(CompilePhase::Validate, u32::MAX)?;
+                    remaining -= u32::MAX as usize;
+                }
+                control.checkpoint(CompilePhase::Validate, remaining as u32)
+            };
+            let storage = ValueTypeStorageLifetime::pure();
+            let child = FunctionValueType::try_with_logical_type_with_construction(
+                DataType::Utf8,
+                true,
+                ValueLogicalType::Physical,
+                storage.clone(),
+                Some(&mut observe),
+            )
+            .map_err(|cause| {
+                required_array_type_failure(ArrayCommonTypeFailure::Construction(cause))
+            })?;
+            novarocks_type_contract::list_value_type_with_construction(
+                &child,
+                source.nullable()
+                    || matches!(
+                        source.value_type().kind(),
+                        ValueKind::Scalar(DataType::Null)
+                    ),
+                storage,
+                Some(&mut observe),
+            )
+            .map_err(required_array_type_failure)
+        }
+    }
+}
+
+fn required_array_type_failure(
+    failure: novarocks_type_contract::ArrayCommonTypeFailure<
+        novarocks_type_contract::CompileControlError,
+    >,
+) -> AnalyzeError {
+    use novarocks_failure_contract::SharedFailureCause;
+    use novarocks_type_contract::{ArrayCommonTypeFailure, ValueConstructionFailure};
+    match failure {
+        ArrayCommonTypeFailure::Construction(cause) => match cause {
+            ValueConstructionFailure::Observer(cause) => AnalyzeError::control(cause),
+            ValueConstructionFailure::ValueType(cause) => {
+                AnalyzeError::shared_domain_source(SharedFailureCause::new(cause))
+            }
+            ValueConstructionFailure::Layout(cause) => {
+                AnalyzeError::shared_domain_source(SharedFailureCause::new(cause))
+            }
+            ValueConstructionFailure::Vec(
+                novarocks_type_contract::ControlResourceError::Control(cause),
+            ) => AnalyzeError::control(cause),
+            ValueConstructionFailure::Vec(cause) => {
+                AnalyzeError::shared_domain_source(SharedFailureCause::new(cause))
+            }
+            ValueConstructionFailure::HashMap(cause) => {
+                AnalyzeError::shared_domain_source(SharedFailureCause::new(cause))
+            }
+            ValueConstructionFailure::BTree(cause) => {
+                AnalyzeError::shared_domain_source(SharedFailureCause::new(cause))
+            }
+            ValueConstructionFailure::Rule(detail) => AnalyzeError::internal(detail),
+        },
+        ArrayCommonTypeFailure::Rule(reason) => AnalyzeError::internal(format!(
+            "required List declaration unexpectedly applied ARRAY common rules: {reason:?}"
+        )),
     }
 }
 

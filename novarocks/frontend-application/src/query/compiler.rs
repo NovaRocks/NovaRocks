@@ -20,7 +20,7 @@
 use std::sync::Arc;
 
 use crate::catalog_application::query_bindings::QueryTableBindingStore;
-use crate::connector::connector_planning_context_for_query_on_runtime;
+use crate::connector::connector_request_context_for_execution_on_runtime;
 use crate::mv::domain::readiness::{MvCandidateReader, MvReadinessPort};
 use crate::query_execution::compiler::query_catalog_service_snapshot;
 use crate::query_execution::completion::PreparedQueryOperation;
@@ -28,13 +28,15 @@ use crate::query_execution::kernels::{
     QueryPreparationKernel, SystemTableQueryKernel, ViewExecutionKernel,
 };
 use crate::query_execution::planning::sql_compile_control_from_execution;
-use novarocks_parser::ast::{ExplainFormat, ExplainQuery, Query, Statement};
+use novarocks_parser::ast::Query;
 use novarocks_physical_plan::{
     MAX_SCAN_BATCH_BYTES, MAX_SCAN_BATCH_ROWS, PipelineDopDomain, ScanReadBudget,
 };
 use novarocks_proto_codec::lifecycle::QueryOptions;
 use novarocks_query_application::admitted_query_context::{QueryExecutionContext, RequestContext};
-use novarocks_spi::connector::MvStorageObservationPort;
+use novarocks_spi::connector::{
+    ConnectorIoAdmissionPort, ConnectorPlanningContext, MvStorageObservationPort,
+};
 use novarocks_sql::analyze_error::AnalyzeError;
 use novarocks_sql::compiler::{
     ExplainLevel, SqlCompileError, SqlCompileIntent, SqlPlanningEnvironment, SqlSessionContext,
@@ -46,26 +48,6 @@ use novarocks_sql::compiler::{
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FrontendQueryPurpose {
     ClientRows,
-}
-
-impl FrontendQueryPurpose {
-    pub(crate) fn window_class(self) -> novarocks_workload_control::ResultWindowClass {
-        use novarocks_workload_control::ResultWindowClass;
-        match self {
-            Self::ClientRows => ResultWindowClass::Client,
-        }
-    }
-
-    fn validate(self, statement: &Statement) -> Result<(), FrontendQueryCompilerError> {
-        let valid = matches!((self, statement), (Self::ClientRows, Statement::Query(_)));
-        if valid {
-            Ok(())
-        } else {
-            Err(FrontendQueryCompilerError::Engine(
-                "query preparation purpose does not match the admitted statement".to_owned(),
-            ))
-        }
-    }
 }
 
 /// Preserves SQL analyze-domain facts until the session still has the original
@@ -167,6 +149,15 @@ impl FrontendQueryCompiler {
         self.connector_blocking_io.runtime()
     }
 
+    pub(crate) fn table_metadata_cpu(
+        &self,
+    ) -> Result<
+        crate::query_execution::internal_result_cpu::InternalResultCpu,
+        novarocks_workload_control::WorkError,
+    > {
+        self.connector_blocking_io.provider_creator_cpu()
+    }
+
     pub(crate) fn new(
         functions: Arc<novarocks_functions::EngineFunctionCatalog>,
         query: QueryPreparationKernel,
@@ -204,10 +195,9 @@ impl FrontendQueryCompiler {
     pub(crate) fn session_property_input(
         &self,
         source: Arc<str>,
-        set: novarocks_parser::ast::SetStatement,
+        mutation: super::session_property_computation::SessionPropertyMutation,
         staged: novarocks_query_application::sql::session::SessionSqlState,
         registry: Arc<novarocks_query_application::sql::session::registry::SessionPropertyRegistry>,
-        catalog_properties: novarocks_query_application::sql::catalog::SessionCatalogService,
         interpreter: Arc<crate::RequiredConstantInterpreter>,
         control: novarocks_sql::compiler::SqlCompileControl,
         scope: novarocks_workload_control::WorkScope,
@@ -215,10 +205,9 @@ impl FrontendQueryCompiler {
     ) -> super::session_property_computation::SessionPropertyCpuInput {
         super::session_property_computation::SessionPropertyCpuInput {
             source,
-            set,
+            mutation,
             staged,
             registry,
-            catalog_properties,
             interpreter,
             control,
             scope,
@@ -227,6 +216,67 @@ impl FrontendQueryCompiler {
             functions: self.functions.clone(),
             policy: self.constant_policy,
         }
+    }
+
+    pub(crate) fn catalog_property_input(
+        &self,
+        source: Arc<str>,
+        statement: novarocks_parser::ast::TrinoCreateCatalog,
+        current_database: String,
+        sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings,
+        interpreter: Arc<crate::RequiredConstantInterpreter>,
+        control: novarocks_sql::compiler::SqlCompileControl,
+        scope: novarocks_workload_control::WorkScope,
+        window: novarocks_workload_control::ResultWindowAlias,
+    ) -> super::catalog_property_computation::CatalogPropertyCpuInput {
+        super::catalog_property_computation::CatalogPropertyCpuInput {
+            source,
+            statement,
+            context: self.property_cpu_context(
+                current_database,
+                sql_semantics,
+                interpreter,
+                control,
+                scope,
+                window,
+            ),
+        }
+    }
+    pub(crate) fn property_cpu_context(
+        &self,
+        current_database: String,
+        sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings,
+        interpreter: Arc<crate::RequiredConstantInterpreter>,
+        control: novarocks_sql::compiler::SqlCompileControl,
+        scope: novarocks_workload_control::WorkScope,
+        window: novarocks_workload_control::ResultWindowAlias,
+    ) -> super::property_cpu_context::PropertyCpuContext {
+        super::property_cpu_context::PropertyCpuContext {
+            current_database,
+            sql_semantics,
+            interpreter,
+            control,
+            scope,
+            window,
+            catalog: Arc::clone(self.query.catalog_service().local()),
+            functions: self.functions.clone(),
+            policy: self.constant_policy,
+        }
+    }
+
+    fn connector_planning_context(
+        &self,
+        execution: &QueryExecutionContext,
+        options: Option<&QueryOptions>,
+        io: Arc<dyn ConnectorIoAdmissionPort>,
+    ) -> Result<ConnectorPlanningContext, FrontendQueryCompilerError> {
+        let request = connector_request_context_for_execution_on_runtime(
+            options,
+            execution,
+            self.connector_blocking_io.runtime(),
+        )?;
+        ConnectorPlanningContext::try_from_request(request.with_io_admission(io))
+            .map_err(|error| FrontendQueryCompilerError::Engine(error.to_string()))
     }
 
     /// The owners in this process that can answer what completing a statement
@@ -285,19 +335,59 @@ fn query_options_for_explain_analyze(query_options: Option<QueryOptions>) -> Que
     QueryOptions::from_proto(raw)
 }
 
-pub(crate) fn explain_mode(explain: &ExplainQuery) -> (ExplainLevel, bool) {
-    let level = match explain.format {
-        ExplainFormat::Default => ExplainLevel::Normal,
-        ExplainFormat::Verbose => ExplainLevel::Verbose,
-        ExplainFormat::Costs => ExplainLevel::Costs,
-        ExplainFormat::Logical => ExplainLevel::Normal,
-        ExplainFormat::Analyze => ExplainLevel::Analyze,
-        ExplainFormat::Contract => ExplainLevel::Contract,
-    };
-    (
-        level,
-        explain.logical || matches!(explain.format, ExplainFormat::Logical),
-    )
+pub(crate) fn explain_detail_mode(
+    detail: novarocks_query_application::sql::session::ExplainDetail,
+) -> (ExplainLevel, bool) {
+    use novarocks_query_application::sql::session::ExplainDetail;
+    match detail {
+        ExplainDetail::Normal => (ExplainLevel::Normal, false),
+        ExplainDetail::Verbose => (ExplainLevel::Verbose, false),
+        ExplainDetail::Costs => (ExplainLevel::Costs, false),
+        ExplainDetail::Contract => (ExplainLevel::Contract, false),
+        ExplainDetail::Logical => (ExplainLevel::Normal, true),
+        ExplainDetail::LogicalVerbose => (ExplainLevel::Verbose, true),
+        ExplainDetail::LogicalCosts => (ExplainLevel::Costs, true),
+    }
+}
+
+pub(super) struct ExplainInput {
+    pub(super) query: Box<Query>,
+    mode: ExplainInputMode,
+}
+
+enum ExplainInputMode {
+    SessionDetail,
+    Analyze,
+}
+
+impl ExplainInput {
+    pub(super) fn plan(query: Box<Query>) -> Self {
+        Self {
+            query,
+            mode: ExplainInputMode::SessionDetail,
+        }
+    }
+
+    pub(super) fn analyze(query: Box<Query>) -> Self {
+        Self {
+            query,
+            mode: ExplainInputMode::Analyze,
+        }
+    }
+
+    pub(super) fn is_analyze(&self) -> bool {
+        matches!(self.mode, ExplainInputMode::Analyze)
+    }
+
+    fn display(
+        &self,
+        detail: novarocks_query_application::sql::session::ExplainDetail,
+    ) -> (ExplainLevel, bool) {
+        match self.mode {
+            ExplainInputMode::SessionDetail => explain_detail_mode(detail),
+            ExplainInputMode::Analyze => (ExplainLevel::Analyze, false),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -676,28 +766,6 @@ mod compile_control_tests {
             assert_eq!(
                 service.compile_control_error(),
                 Some(CompileControlError::Source(retained))
-            );
-        }
-    }
-}
-
-#[cfg(test)]
-mod purpose_tests {
-    use super::*;
-
-    fn statement(sql: &str) -> Statement {
-        novarocks_query_application::sql::parse_single_statement(sql).unwrap()
-    }
-
-    #[test]
-    fn synchronous_read_purposes_reject_explain_and_do_not_infer_scalar_output() {
-        let select = statement("SELECT 1");
-        assert!(FrontendQueryPurpose::ClientRows.validate(&select).is_ok());
-        for sql in ["EXPLAIN SELECT 1", "EXPLAIN ANALYZE SELECT 1"] {
-            let explain = statement(sql);
-            assert!(
-                FrontendQueryPurpose::ClientRows.validate(&explain).is_err(),
-                "{sql}"
             );
         }
     }

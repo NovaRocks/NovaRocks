@@ -29,17 +29,16 @@
 -- query 1
 -- Setup: create table ts for regexp_replace tests
 USE ${case_db};
-CREATE TABLE `ts` (
-  `str` varchar(65533) NULL COMMENT "",
-  `regex` varchar(65533) NULL COMMENT "",
-  `replaced` varchar(65533) NULL COMMENT ""
-)
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE "ts" (
+  "str" varchar(65533),
+  "regex" varchar(65533),
+  "replaced" varchar(65533)
+) WITH (format_version = 3);
 
-insert into ts values ('abcd', '.*', 'xx'), ('abcd', 'a.*', 'xx'), ('abcd', '.*abc.*', 'xx'), ('abcd', '.*cd', 'xx'), ('abcd', 'bc', 'xx'), ('', '', 'xx'), (NULL, '', 'xx'), ('abc中文def', '[\\p{Han}]+', 'xx');
-insert into ts values ('a b c', " ", "-"), ('           XXXX', '       ', '');
-insert into ts values ('xxxx', "x", "-"), ('xxxx', "xx", "-"), ('xxxx', "xxx", "-"), ('xxxx', "xxxx", "-");
-insert into ts values ('xxxx', "not", "xxxxxxxx"), ('xxaxx', 'xx', 'aaa'), ('xaxaxax', 'xax', '-');
+insert into ts values ROW('abcd', '.*', 'xx'), ROW('abcd', 'a.*', 'xx'), ROW('abcd', '.*abc.*', 'xx'), ROW('abcd', '.*cd', 'xx'), ROW('abcd', 'bc', 'xx'), ROW('', '', 'xx'), ROW(NULL, '', 'xx'), ROW('abc中文def', '[\p{Han}]+', 'xx');
+insert into ts values ROW('a b c', ' ', '-'), ROW('           XXXX', '       ', '');
+insert into ts values ROW('xxxx', 'x', '-'), ROW('xxxx', 'xx', '-'), ROW('xxxx', 'xxx', '-'), ROW('xxxx', 'xxxx', '-');
+insert into ts values ROW('xxxx', 'not', 'xxxxxxxx'), ROW('xxaxx', 'xx', 'aaa'), ROW('xaxaxax', 'xax', '-');
 
 select regexp_replace('abcd', '.*', 'xx');
 
@@ -73,11 +72,11 @@ select regexp_replace('abc中文def', '中文', 'xx');
 
 -- query 9
 USE ${case_db};
-select regexp_replace('abc中文def', '[\\p{Han}]+', 'xx');
+select regexp_replace('abc中文def', '[\p{Han}]+', 'xx');
 
 -- query 10
 USE ${case_db};
-select regexp_replace('a b c', " ", "-");
+select regexp_replace('a b c', ' ', '-');
 
 -- query 11
 USE ${case_db};
@@ -85,23 +84,23 @@ select regexp_replace('           XXXX', '       ', '');
 
 -- query 12
 USE ${case_db};
-select regexp_replace('xxxx', "x", "-");
+select regexp_replace('xxxx', 'x', '-');
 
 -- query 13
 USE ${case_db};
-select regexp_replace('xxxx', "xx", "-");
+select regexp_replace('xxxx', 'xx', '-');
 
 -- query 14
 USE ${case_db};
-select regexp_replace('xxxx', "xxx", "-");
+select regexp_replace('xxxx', 'xxx', '-');
 
 -- query 15
 USE ${case_db};
-select regexp_replace('xxxx', "xxxx", "-");
+select regexp_replace('xxxx', 'xxxx', '-');
 
 -- query 16
 USE ${case_db};
-select regexp_replace('xxxx', "not", "xxxxxxxx");
+select regexp_replace('xxxx', 'not', 'xxxxxxxx');
 
 -- query 17
 USE ${case_db};
@@ -119,20 +118,19 @@ select str, regex, replaced, regexp_replace(str, regex, replaced) from ts order 
 -- query 20
 -- Setup: create table tsr for regexp_extract_all tests
 USE ${case_db};
-CREATE TABLE `tsr` (
-  `str` varchar(65533) NULL COMMENT "",
-  `regex` varchar(65533) NULL COMMENT "",
-  `pos` int NULL COMMENT ""
-)
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE "tsr" (
+  "str" varchar(65533),
+  "regex" varchar(65533),
+  "pos" int
+) WITH (format_version = 3);
 
-insert into tsr values ("AbCdExCeF", "([[:lower:]]+)C([[:lower:]]+)", 3), ("AbCdExCeF", "([[:lower:]]+)C([[:lower:]]+)", 0);
+insert into tsr values ROW('AbCdExCeF', '([[:lower:]]+)C([[:lower:]]+)', 3), ROW('AbCdExCeF', '([[:lower:]]+)C([[:lower:]]+)', 0);
 
-SELECT regexp_extract_all("AbCdExCeF", "([[:lower:]]+)C([[:lower:]]+)", 0);
+SELECT regexp_extract_all('AbCdExCeF', '([[:lower:]]+)C([[:lower:]]+)', 0);
 
 -- query 21
 USE ${case_db};
-SELECT regexp_extract_all(str, "([[:lower:]]+)C([[:lower:]]+)", 0) from tsr;
+SELECT regexp_extract_all(str, '([[:lower:]]+)C([[:lower:]]+)', 0) from tsr;
 
 -- query 22
 USE ${case_db};
@@ -144,27 +142,27 @@ SELECT regexp_extract_all(str, regex, pos) from tsr;
 
 -- query 24
 USE ${case_db};
-SELECT regexp_extract_all(str, "([[:lower:]]+)C([[:lower:]]+)", pos) from tsr;
+SELECT regexp_extract_all(str, '([[:lower:]]+)C([[:lower:]]+)', pos) from tsr;
 
 -- query 25
 USE ${case_db};
-SELECT regexp_extract_all("AbCdExCeF", "([[:lower:]]+)C([[:lower:]]+)", pos) from tsr;
+SELECT regexp_extract_all('AbCdExCeF', '([[:lower:]]+)C([[:lower:]]+)', pos) from tsr;
 
 -- query 26
 USE ${case_db};
-SELECT regexp_extract_all("AbCdExCeF", regex, pos) from tsr;
+SELECT regexp_extract_all('AbCdExCeF', regex, pos) from tsr;
 
 -- query 27
 USE ${case_db};
-SELECT regexp_extract_all(str, "([[:lower:]]+)C([[:lower:]]+)", pos) from tsr;
+SELECT regexp_extract_all(str, '([[:lower:]]+)C([[:lower:]]+)', pos) from tsr;
 
 -- query 28
 USE ${case_db};
-SELECT regexp_extract_all("AbCdExCeF", "([[:lower:]]+)C([[:lower:]]+)", 3);
+SELECT regexp_extract_all('AbCdExCeF', '([[:lower:]]+)C([[:lower:]]+)', 3);
 
 -- query 29
 USE ${case_db};
-SELECT regexp_extract_all(str, "([[:lower:]]+)C([[:lower:]]+)", 3) from tsr;
+SELECT regexp_extract_all(str, '([[:lower:]]+)C([[:lower:]]+)', 3) from tsr;
 
 -- query 30
 USE ${case_db};
@@ -177,7 +175,7 @@ SELECT regexp_position('a.b:c;d', '[.]');
 
 -- query 32
 USE ${case_db};
-SELECT regexp_position('a.b:c;d', '[\\.:;]', 2);
+SELECT regexp_position('a.b:c;d', '[\.:;]', 2);
 
 -- query 33
 USE ${case_db};
@@ -294,23 +292,23 @@ SELECT regexp_position('行成于思str而毁123于随', '',  3, 2);
 -- query 60
 -- VALUES clause inputs
 USE ${case_db};
-SELECT regexp_position(column_0, 'T') FROM (VALUES ('2024-01-01T01:61:00')) AS tmp(column_0);
+SELECT regexp_position(column_0, 'T') FROM (VALUES ROW('2024-01-01T01:61:00')) AS tmp(column_0);
 
 -- query 61
 USE ${case_db};
-SELECT regexp_position(column_0, '61') FROM (VALUES ('2024-01-01T01:61:00')) AS tmp(column_0);
+SELECT regexp_position(column_0, '61') FROM (VALUES ROW('2024-01-01T01:61:00')) AS tmp(column_0);
 
 -- query 62
 USE ${case_db};
-SELECT regexp_position(column_0, '0', 1, 3) FROM (VALUES ('2024-01-01T01:61:00')) AS tmp(column_0);
+SELECT regexp_position(column_0, '0', 1, 3) FROM (VALUES ROW('2024-01-01T01:61:00')) AS tmp(column_0);
 
 -- query 63
 USE ${case_db};
-SELECT regexp_position(column_0, 'Z', 20) FROM (VALUES ('2024-01-01T01:61:00')) AS tmp(column_0);
+SELECT regexp_position(column_0, 'Z', 20) FROM (VALUES ROW('2024-01-01T01:61:00')) AS tmp(column_0);
 
 -- query 64
 USE ${case_db};
-SELECT regexp_position(column_0, '01', 12, 2) FROM (VALUES ('2024-01-01T01:61:00')) AS tmp(column_0);
+SELECT regexp_position(column_0, '01', 12, 2) FROM (VALUES ROW('2024-01-01T01:61:00')) AS tmp(column_0);
 
 -- query 65
 -- @expect_error_tier=target
@@ -318,35 +316,34 @@ SELECT regexp_position(column_0, '01', 12, 2) FROM (VALUES ('2024-01-01T01:61:00
 -- @expect_sql_phase=Execution
 -- @expect_error=[query.execution.invalid_data]
 USE ${case_db};
-SELECT regexp_position(column_0, '(unclosed') FROM (VALUES ('oops')) AS tmp(column_0);
+SELECT regexp_position(column_0, '(unclosed') FROM (VALUES ROW('oops')) AS tmp(column_0);
 
 -- query 66
 -- NULL input through VALUES
 USE ${case_db};
-SELECT regexp_position(column_0, 'x') FROM (VALUES (NULL)) AS tmp(column_0);
+SELECT regexp_position(column_0, 'x') FROM (VALUES ROW(NULL)) AS tmp(column_0);
 
 -- query 67
 -- Setup: create table tsp_general for general-path regexp_position tests
 USE ${case_db};
-CREATE TABLE `tsp_general` (
-  `str` varchar(65533) NULL COMMENT "",
-  `pattern` varchar(65533) NULL COMMENT "",
-  `start_pos` int NULL COMMENT "",
-  `occurrence` int NULL COMMENT ""
-)
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE "tsp_general" (
+  "str" varchar(65533),
+  "pattern" varchar(65533),
+  "start_pos" int,
+  "occurrence" int
+) WITH (format_version = 3);
 
 insert into tsp_general values
-('abcdef123ghi', '[0-9]+', 1, 1),
-('abc def ghi', '\\s+', 1, 1),
-('test@email.com', '@[a-zA-Z]+', 1, 1),
-('hello world hello universe', 'hello', 1, 2),
-('complex(pattern)test', '\\([^)]*\\)', 1, 1),
-('abc123def456ghi', '[0-9]{2,}', 1, 2),
-('', '.', 1, 1),
-(NULL, '[0-9]', 1, 1),
-('test string', NULL, 1, 1),
-(NULL, NULL, 1, 1);
+ROW('abcdef123ghi', '[0-9]+', 1, 1),
+ROW('abc def ghi', '\s+', 1, 1),
+ROW('test@email.com', '@[a-zA-Z]+', 1, 1),
+ROW('hello world hello universe', 'hello', 1, 2),
+ROW('complex(pattern)test', '\([^)]*\)', 1, 1),
+ROW('abc123def456ghi', '[0-9]{2,}', 1, 2),
+ROW('', '.', 1, 1),
+ROW(NULL, '[0-9]', 1, 1),
+ROW('test string', NULL, 1, 1),
+ROW(NULL, NULL, 1, 1);
 
 SELECT str, pattern, regexp_position(str, pattern) from tsp_general order by str, pattern;
 
@@ -446,7 +443,7 @@ SELECT regexp_position('test string', '+invalid');
 -- @expect_sql_phase=Execution
 -- @expect_error=[query.execution.invalid_data]
 USE ${case_db};
-SELECT regexp_position('test string', '\\');
+SELECT regexp_position('test string', '\');
 
 -- query 86
 -- Edge cases with invalid start/occurrence parameters
@@ -468,23 +465,22 @@ SELECT regexp_position('test', '[0-9]', 1, -1);
 -- query 90
 -- Setup: create table tsc for regexp_count tests
 USE ${case_db};
-CREATE TABLE `tsc` (
-  `str` varchar(65533) NULL COMMENT "",
-  `regex` varchar(65533) NULL COMMENT ""
-)
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE "tsc" (
+  "str" varchar(65533),
+  "regex" varchar(65533)
+) WITH (format_version = 3);
 
-insert into tsc values ('abc123def456', '[0-9]'), ('test.com test.net test.org', '\\.'), ('a b  c   d', '\\s+'), ('ababababab', 'ab'), ('', '.'), (NULL, '.');
+insert into tsc values ROW('abc123def456', '[0-9]'), ROW('test.com test.net test.org', '\.'), ROW('a b  c   d', '\s+'), ROW('ababababab', 'ab'), ROW('', '.'), ROW(NULL, '.');
 
 select regexp_count('abc123def456', '[0-9]');
 
 -- query 91
 USE ${case_db};
-select regexp_count('test.com test.net test.org', '\\.');
+select regexp_count('test.com test.net test.org', '\.');
 
 -- query 92
 USE ${case_db};
-select regexp_count('a b  c   d', '\\s+');
+select regexp_count('a b  c   d', '\s+');
 
 -- query 93
 USE ${case_db};
@@ -504,7 +500,7 @@ select regexp_count('abc', NULL);
 
 -- query 97
 USE ${case_db};
-select regexp_count('abc中文def', '[\\p{Han}]+');
+select regexp_count('abc中文def', '[\p{Han}]+');
 
 -- query 98
 USE ${case_db};
@@ -512,7 +508,7 @@ select regexp_count('AbCdExCeF', 'C');
 
 -- query 99
 USE ${case_db};
-select regexp_count('1a 2b 14m', '\\d+');
+select regexp_count('1a 2b 14m', '\d+');
 
 -- query 100
 -- Table-based regexp_count
@@ -522,17 +518,16 @@ select str, regex, regexp_count(str, regex) from tsc order by str, regex;
 -- query 101
 -- Setup: create table tsc_invalid with invalid regex patterns
 USE ${case_db};
-CREATE TABLE `tsc_invalid` (
-  `str` varchar(65533) NULL COMMENT "",
-  `regex` varchar(65533) NULL COMMENT ""
-)
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE "tsc_invalid" (
+  "str" varchar(65533),
+  "regex" varchar(65533)
+) WITH (format_version = 3);
 
 insert into tsc_invalid values
-('abc123def456', '[0-9'),
-('test string', '(unclosed'),
-('repetition test', '?invalid'),
-('valid test', 'valid');
+ROW('abc123def456', '[0-9'),
+ROW('test string', '(unclosed'),
+ROW('repetition test', '?invalid'),
+ROW('valid test', 'valid');
 
 select str, regex, regexp_count(str, regex) from tsc_invalid order by str, regex;
 
@@ -584,22 +579,21 @@ select regexp_count('test', NULL);
 -- query 109
 -- Setup: create table for multi-row regexp_replace correctness test (issue #65936)
 USE ${case_db};
-CREATE TABLE `test_regexp_replace_multirow` (
-  `column_value` varchar(100) NULL COMMENT ""
-)
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE "test_regexp_replace_multirow" (
+  "column_value" varchar(100)
+) WITH (format_version = 3);
 
 insert into test_regexp_replace_multirow values
-('activity_60_package_2'),
-('activity_50_package_7'),
-('activity_70_package_1'),
-('nomatch_value'),
-('test_package_suffix');
+ROW('activity_60_package_2'),
+ROW('activity_50_package_7'),
+ROW('activity_70_package_1'),
+ROW('nomatch_value'),
+ROW('test_package_suffix');
 
 SELECT regexp_replace(column_value, '_package_.*', '')
 FROM (VALUES
-    ('activity_60_package_2'),
-    ('activity_50_package_7')
+    ROW('activity_60_package_2'),
+    ROW('activity_50_package_7')
 ) AS t(column_value);
 
 -- query 110

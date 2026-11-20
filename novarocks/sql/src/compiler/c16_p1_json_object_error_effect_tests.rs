@@ -159,7 +159,7 @@ fn c16_p1_json_object_real_sql_pruning_and_filter_rules_preserve_whole_data_for_
                 "ORDER BY id"
             };
             let sql = format!(
-                "SELECT id FROM (SELECT id, json_object(IF(id = 2, NULL, [id, n]), n) AS unused_error FROM t) s {suffix}"
+                "SELECT id FROM (SELECT id, JSON_OBJECT(KEY IF(id = 2, NULL, ARRAY[id, n]) VALUE n) AS unused_error FROM t) s {suffix}"
             );
             let output = compile(&sql);
             assert!(
@@ -246,7 +246,7 @@ fn c16_p1_json_object_native_nested_index_keeps_accurate_types_and_whole_data_fo
                 "ORDER BY id"
             };
             let sql = format!(
-                "SELECT id FROM (SELECT id, json_object([[id, n]][IF(id = 2, NULL, 1)], n) AS unused_error FROM t) s {suffix}"
+                "SELECT id FROM (SELECT id, JSON_OBJECT(KEY ARRAY[ARRAY[id, n]][IF(id = 2, NULL, 1)] VALUE n) AS unused_error FROM t) s {suffix}"
             );
             let output = compile_with_id_type(&sql, DataType::Int32);
             assert_eq!(check(&output.optimized_tree), 1);

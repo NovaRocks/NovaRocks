@@ -219,6 +219,7 @@ pub enum ExprKind {
         target: DataType,
         decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
         allow_throw_exception: SemanticParameterRef,
+        array_failure_mode: Option<novarocks_type_contract::ArrayCastFailureMode>,
     },
     IsNull {
         expr: ExprId,

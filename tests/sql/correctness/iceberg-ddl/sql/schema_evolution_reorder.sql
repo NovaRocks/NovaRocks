@@ -19,27 +19,27 @@
 -- ALTER COLUMN reorder (FIRST / AFTER / BEFORE) on top-level and nested.
 
 -- query 1
-CREATE DATABASE iceberg_ddl_cat_${suite_uuid0}.schema_reorder_${uuid0};
+CREATE SCHEMA iceberg_ddl_cat_${suite_uuid0}.schema_reorder_${uuid0};
 USE iceberg_ddl_cat_${suite_uuid0}.schema_reorder_${uuid0};
 DROP TABLE IF EXISTS reorder_top;
 CREATE TABLE reorder_top (
   a INT,
   b INT,
   c INT
-) TBLPROPERTIES ("format-version" = "2");
-INSERT INTO reorder_top VALUES (1, 2, 3);
+) WITH (format_version = 2);
+INSERT INTO reorder_top VALUES ROW(1, 2, 3);
 
 -- query 2
 SELECT a, b, c FROM reorder_top ORDER BY a;
 
 -- query 3
-ALTER TABLE reorder_top ALTER COLUMN c FIRST;
+ALTER TABLE reorder_top EXECUTE move_column(column => 'c', position => 'FIRST');
 
 -- query 4
 SELECT a, b, c FROM reorder_top ORDER BY a;
 
 -- query 5
-ALTER TABLE reorder_top ALTER COLUMN a AFTER b;
+ALTER TABLE reorder_top EXECUTE move_column(column => 'a', position => 'AFTER', reference => 'b');
 
 -- query 6
 SELECT a, b, c FROM reorder_top ORDER BY a;
@@ -51,18 +51,18 @@ SELECT a, b, c FROM reorder_top ORDER BY a;
 DROP TABLE IF EXISTS reorder_nested;
 CREATE TABLE reorder_nested (
   id INT,
-  address STRUCT<street STRING, city STRING, zip INT>
-) TBLPROPERTIES ("format-version" = "2");
+  address ROW(street STRING, city STRING, zip INT)
+) WITH (format_version = 2);
 
 -- query 8
-ALTER TABLE reorder_nested ALTER COLUMN address.zip BEFORE address.street;
+ALTER TABLE reorder_nested EXECUTE move_column(column => 'address.zip', position => 'BEFORE', reference => 'address.street');
 
 -- query 9
 -- Cross-parent reference must be rejected.
 -- @expect_error=Iceberg column `id` does not exist
-ALTER TABLE reorder_nested ALTER COLUMN address.street AFTER id;
+ALTER TABLE reorder_nested EXECUTE move_column(column => 'address.street', position => 'AFTER', reference => 'id');
 
 -- query 10
 DROP TABLE reorder_top;
 DROP TABLE reorder_nested;
-DROP DATABASE iceberg_ddl_cat_${suite_uuid0}.schema_reorder_${uuid0};
+DROP SCHEMA iceberg_ddl_cat_${suite_uuid0}.schema_reorder_${uuid0};

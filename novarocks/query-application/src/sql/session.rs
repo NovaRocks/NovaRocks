@@ -16,11 +16,9 @@
 // under the License.
 
 //! Query-application session state and admitted property projections.
-use super::session_admit::SessionAdmitError;
 use crate::session_effects::SessionEffects;
 use crate::session_error::QueryServiceError;
 use crate::session_value::{SessionTimeZone, SessionValue, StatementSessionError};
-use novarocks_parser::ast;
 use novarocks_result_contract::ClientPresentationFamily;
 use novarocks_sql::compiler::SessionOptimizerSettings;
 use novarocks_types::naming::DEFAULT_DATABASE;
@@ -131,6 +129,11 @@ impl SessionSqlState {
     }
     /// Prepare on the caller's CPU owner, then publish this whole state once.
     pub fn apply_effects(&mut self, effects: &SessionEffects) -> Result<(), QueryServiceError> {
+        *self = self.stage_effects(effects)?;
+        Ok(())
+    }
+
+    fn stage_effects(&self, effects: &SessionEffects) -> Result<Self, QueryServiceError> {
         let mut staged = self.clone();
         if let Some(names) = &effects.catalog_schema {
             staged.assign_session_names(names.catalog.clone(), names.schema.clone());
@@ -141,8 +144,25 @@ impl SessionSqlState {
                 .map_err(session_property_error)?;
             staged.property_inputs.insert(property.clone());
         }
-        *self = staged;
-        Ok(())
+        let mut rebuild_system_settings = false;
+        for property in &effects.reset_properties {
+            rebuild_system_settings |= staged.property_inputs.remove_sql_override(property);
+        }
+        if rebuild_system_settings {
+            // Rebuild only the execution projection from the original unset
+            // defaults and the retained validated inputs. This keeps optional
+            // settings absent and never publishes defaults as explicit values.
+            let defaults = Self::default();
+            staged.execution_settings = defaults.execution_settings;
+            staged.optimizer_settings = defaults.optimizer_settings;
+            staged.sql_semantics = defaults.sql_semantics;
+            let inputs = std::mem::take(&mut staged.property_inputs);
+            inputs
+                .project_into(&mut staged)
+                .map_err(session_property_error)?;
+            staged.property_inputs = inputs;
+        }
+        Ok(staged)
     }
     pub fn into_query_attempt_inputs(
         self,
@@ -152,6 +172,7 @@ impl SessionSqlState {
         SessionExecutionSettings,
         SessionOptimizerSettings,
         novarocks_sql::sql_mode::SqlSemanticSettings,
+        SessionPropertyInputs,
     ) {
         let group_concat_max_len = self.execution_settings.group_concat_max_len();
         (
@@ -161,25 +182,50 @@ impl SessionSqlState {
             self.optimizer_settings,
             self.sql_semantics
                 .with_group_concat_max_len(group_concat_max_len),
+            self.property_inputs,
         )
     }
 }
 
-/// GLOBAL is refused before lookup, including unknown property names.
-pub fn admit_session_set_assignment(
-    source: &str,
-    assignment: &ast::SetAssignment,
-) -> Result<(), QueryServiceError> {
-    if matches!(assignment.scope, ast::SetScope::Global) {
-        return Err(QueryServiceError::from_user_error(
-            SessionAdmitError::GlobalScopeUnsupported.to_user_error(
-                source,
-                assignment.span,
-                format!("SET GLOBAL {} is not supported", assignment.name.value),
-            ),
-        ));
+/// The plan detail requested by the session. Execution profiling is a
+/// separate admitted statement operation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ExplainDetail {
+    #[default]
+    Normal,
+    Verbose,
+    Costs,
+    Contract,
+    Logical,
+    LogicalVerbose,
+    LogicalCosts,
+}
+impl ExplainDetail {
+    fn from_sql_value(value: &str) -> Option<Self> {
+        [
+            Self::Normal,
+            Self::Verbose,
+            Self::Costs,
+            Self::Contract,
+            Self::Logical,
+            Self::LogicalVerbose,
+            Self::LogicalCosts,
+        ]
+        .into_iter()
+        .find(|detail| detail.sql_value() == value)
     }
-    Ok(())
+
+    pub const fn sql_value(self) -> &'static str {
+        match self {
+            Self::Normal => "NORMAL",
+            Self::Verbose => "VERBOSE",
+            Self::Costs => "COSTS",
+            Self::Contract => "CONTRACT",
+            Self::Logical => "LOGICAL",
+            Self::LogicalVerbose => "LOGICAL_VERBOSE",
+            Self::LogicalCosts => "LOGICAL_COSTS",
+        }
+    }
 }
 
 /// Connection-local settings that SQL admission has validated.
@@ -188,6 +234,7 @@ pub fn admit_session_set_assignment(
 /// adapters project this state into their own validated wire contracts.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionExecutionSettings {
+    explain_detail: ExplainDetail,
     query_timeout_secs: Option<u64>,
     query_mem_limit_bytes: Option<i64>,
     group_concat_max_len: i64,
@@ -202,6 +249,7 @@ pub struct SessionExecutionSettings {
 impl Default for SessionExecutionSettings {
     fn default() -> Self {
         Self {
+            explain_detail: ExplainDetail::default(),
             query_timeout_secs: None,
             query_mem_limit_bytes: None,
             group_concat_max_len: 1024,
@@ -216,6 +264,10 @@ impl Default for SessionExecutionSettings {
 }
 
 impl SessionExecutionSettings {
+    pub const fn explain_detail(&self) -> ExplainDetail {
+        self.explain_detail
+    }
+
     pub const fn query_mem_limit_bytes(&self) -> Option<i64> {
         self.query_mem_limit_bytes
     }

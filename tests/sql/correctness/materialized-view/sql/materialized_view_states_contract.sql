@@ -24,15 +24,10 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE TABLE state_base (k BIGINT NOT NULL, v BIGINT)
-TBLPROPERTIES ('format-version' = '3', 'write.row-lineage' = 'true');
-INSERT INTO state_base VALUES (1, 10), (2, 20);
-CREATE MATERIALIZED VIEW state_manual DISTRIBUTED BY HASH(k) BUCKETS 1
-REFRESH DEFERRED MANUAL PROPERTIES ('storage_engine' = 'iceberg')
-AS SELECT k, v FROM state_base;
-CREATE MATERIALIZED VIEW state_interval DISTRIBUTED BY HASH(k) BUCKETS 1
-REFRESH ASYNC EVERY INTERVAL 5 MINUTE PROPERTIES ('storage_engine' = 'iceberg')
-AS SELECT k, v FROM state_base;
+CREATE TABLE state_base (k BIGINT NOT NULL, v BIGINT) WITH (format_version = 3);
+INSERT INTO state_base VALUES ROW(1, 10), ROW(2, 20);
+CREATE MATERIALIZED VIEW state_manual WITH (refresh_policy = 'MANUAL') AS SELECT k, v FROM state_base;
+CREATE MATERIALIZED VIEW state_interval WITH (refresh_policy = 'INTERVAL', refresh_interval = '5m') AS SELECT k, v FROM state_base;
 
 -- query 2
 SELECT name, refresh_policy, refresh_interval_ms, refresh_paused,
@@ -45,7 +40,7 @@ ORDER BY name;
 
 -- query 3
 -- @skip_result_check=true
-ALTER MATERIALIZED VIEW state_interval PAUSE REFRESH;
+ALTER MATERIALIZED VIEW state_interval SET PROPERTIES refresh_paused = true;
 
 -- query 4
 SELECT name, refresh_policy, refresh_interval_ms, refresh_paused
@@ -70,4 +65,4 @@ WHERE table_schema = 'runtime' AND table_name = 'materialized_view_states';
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW IF EXISTS state_manual;
 DROP MATERIALIZED VIEW IF EXISTS state_interval;
-DROP TABLE IF EXISTS state_base FORCE;
+DROP TABLE IF EXISTS state_base ;

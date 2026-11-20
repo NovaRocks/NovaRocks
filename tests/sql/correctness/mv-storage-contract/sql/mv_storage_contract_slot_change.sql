@@ -9,49 +9,29 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE EXTERNAL CATALOG mvslot_${uuid0}
-PROPERTIES (
-  "type" = "iceberg",
-  "iceberg.catalog.type" = "rest",
-  "uri" = "${iceberg_rest_uri}",
-  "warehouse" = "${iceberg_rest_warehouse}",
-  "credential.object-store-metadata.consumer-role" = "frontend",
-  "credential.object-store-metadata.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-metadata.name" = "${iceberg_object_store_metadata_credential_name}",
-  "credential.object-store-metadata.generation" = "${iceberg_object_store_credential_generation}",
-  "credential.object-store-data.consumer-role" = "backend",
-  "credential.object-store-data.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-data.name" = "${iceberg_object_store_data_credential_name}",
-  "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
-  "aws.s3.endpoint" = "${oss_endpoint}",
-  "aws.s3.region" = "${oss_region}",
-  "aws.s3.enable_path_style_access" = "${oss_path_style}"
-);
+CREATE CATALOG mvslot_${uuid0} USING iceberg WITH ("iceberg.catalog.type" = 'rest', "uri" = '${iceberg_rest_uri}', "warehouse" = '${iceberg_rest_warehouse}', "credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-metadata.name" = '${iceberg_object_store_metadata_credential_name}', "credential.object-store-metadata.generation" = '${iceberg_object_store_credential_generation}', "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-data.name" = '${iceberg_object_store_data_credential_name}', "credential.object-store-data.generation" = '${iceberg_object_store_credential_generation}', "aws.s3.endpoint" = '${oss_endpoint}', "aws.s3.region" = '${oss_region}', "aws.s3.enable_path_style_access" = '${oss_path_style}');
 
 -- query 2
 -- @skip_result_check=true
-CREATE DATABASE mvslot_${uuid0}.ns_${uuid0};
+CREATE SCHEMA mvslot_${uuid0}.ns_${uuid0};
 
 -- query 3
 -- @skip_result_check=true
-CREATE TABLE mvslot_${uuid0}.ns_${uuid0}.fact (k STRING, v BIGINT)
-TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+CREATE TABLE mvslot_${uuid0}.ns_${uuid0}.fact (k STRING, v BIGINT) WITH (format_version = 3);
 
 -- query 4
 -- @skip_result_check=true
-INSERT INTO mvslot_${uuid0}.ns_${uuid0}.fact VALUES ('east', 10);
+INSERT INTO mvslot_${uuid0}.ns_${uuid0}.fact VALUES ROW('east', 10);
 
 -- query 5
 -- @skip_result_check=true
 USE mvslot_${uuid0}.ns_${uuid0};
-CREATE MATERIALIZED VIEW first_slot_mv
-DISTRIBUTED BY HASH(k) BUCKETS 1 REFRESH DEFERRED MANUAL
-PROPERTIES ('storage_engine' = 'iceberg') AS SELECT k, v FROM fact;
+CREATE MATERIALIZED VIEW first_slot_mv WITH (refresh_policy = 'MANUAL') AS SELECT k, v FROM fact;
 
 -- query 6
 -- @skip_result_check=true
 -- @mv_rest_document_graph=ns_${uuid0}.first_slot_mv,publications=0,slot-changes=1
-ALTER MATERIALIZED VIEW first_slot_mv PAUSE REFRESH;
+ALTER MATERIALIZED VIEW first_slot_mv SET PROPERTIES refresh_paused = true;
 
 -- query 7
 -- @result_contains=SAME_VALUE_SLOT_BASELINE
@@ -63,7 +43,7 @@ curl --silent --show-error --fail '${iceberg_rest_uri}/v1/namespaces/ns_${uuid0}
 -- Same-value PAUSE still advances main and the configuration writer.
 -- @skip_result_check=true
 -- @mv_rest_document_graph=ns_${uuid0}.first_slot_mv,publications=0,slot-changes=2
-ALTER MATERIALIZED VIEW first_slot_mv PAUSE REFRESH;
+ALTER MATERIALIZED VIEW first_slot_mv SET PROPERTIES refresh_paused = true;
 
 -- query 9
 -- @result_contains=SAME_VALUE_SLOT_ADVANCED
@@ -75,19 +55,17 @@ rm -f "${TMPDIR:-/tmp}/novarocks-slot-same-${uuid0}.json"
 -- query 10
 -- @skip_result_check=true
 -- @mv_rest_document_graph=ns_${uuid0}.first_slot_mv,publications=0,slot-changes=3
-ALTER MATERIALIZED VIEW first_slot_mv RESUME REFRESH;
+ALTER MATERIALIZED VIEW first_slot_mv SET PROPERTIES refresh_paused = false;
 
 -- query 11
 -- @skip_result_check=true
 -- @mv_rest_document_graph=ns_${uuid0}.first_slot_mv,publications=1,slot-changes=3
-REFRESH MATERIALIZED VIEW first_slot_mv WITH SYNC MODE;
+REFRESH MATERIALIZED VIEW first_slot_mv;
 
 -- query 12
 -- @skip_result_check=true
-CREATE MATERIALIZED VIEW conflict_slot_mv
-DISTRIBUTED BY HASH(k) BUCKETS 1 REFRESH DEFERRED MANUAL
-PROPERTIES ('storage_engine' = 'iceberg') AS SELECT k, v FROM fact;
-REFRESH MATERIALIZED VIEW conflict_slot_mv WITH SYNC MODE;
+CREATE MATERIALIZED VIEW conflict_slot_mv WITH (refresh_policy = 'MANUAL') AS SELECT k, v FROM fact;
+REFRESH MATERIALIZED VIEW conflict_slot_mv;
 
 -- query 13
 -- Freeze the exact prior C bytes before holding ALTER. The concurrent Spark
@@ -101,7 +79,7 @@ curl --silent --show-error --fail '${iceberg_rest_uri}/v1/namespaces/ns_${uuid0}
 -- @publication_catalog_concurrent_shell=tmp_sql=$(mktemp "${TMPDIR:-/tmp}/novarocks-slot-conflict-XXXXXX.sql"); trap 'rm -f "$tmp_sql"' EXIT; printf '%s\n' "INSERT INTO ice_rest.ns_${uuid0}.conflict_slot_mv SELECT * FROM ice_rest.ns_${uuid0}.conflict_slot_mv LIMIT 1;" > "$tmp_sql"; "${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-sql.sh" "$tmp_sql"
 -- @expect_error=disposition=KnownUncommitted
 USE mvslot_${uuid0}.ns_${uuid0};
-ALTER MATERIALIZED VIEW conflict_slot_mv PAUSE REFRESH;
+ALTER MATERIALIZED VIEW conflict_slot_mv SET PROPERTIES refresh_paused = true;
 
 -- query 15
 -- @result_contains=SLOT_CONFLICT_UNCHANGED
@@ -112,22 +90,20 @@ rm -f "${TMPDIR:-/tmp}/novarocks-slot-before-${uuid0}.json"
 -- query 16
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW conflict_slot_mv;
-CREATE MATERIALIZED VIEW unknown_slot_mv
-DISTRIBUTED BY HASH(k) BUCKETS 1 REFRESH DEFERRED MANUAL
-PROPERTIES ('storage_engine' = 'iceberg') AS SELECT k, v FROM fact;
-REFRESH MATERIALIZED VIEW unknown_slot_mv WITH SYNC MODE;
+CREATE MATERIALIZED VIEW unknown_slot_mv WITH (refresh_policy = 'MANUAL') AS SELECT k, v FROM fact;
+REFRESH MATERIALIZED VIEW unknown_slot_mv;
 
 -- query 17
 -- A same-value configuration write stays MANUAL and unpaused. Losing its
 -- response must not freeze the subsequent refresh.
 -- @publication_catalog_fault=table-commit,after-commit-before-response
 -- @expect_error=unknown
-ALTER MATERIALIZED VIEW unknown_slot_mv SET REFRESH DEFERRED MANUAL;
+ALTER MATERIALIZED VIEW unknown_slot_mv SET PROPERTIES refresh_policy = 'MANUAL';
 
 -- query 18
 -- @skip_result_check=true
 -- @mv_rest_document_graph=ns_${uuid0}.unknown_slot_mv,publications=2,slot-changes=1,table-commits=4
-REFRESH MATERIALIZED VIEW unknown_slot_mv WITH SYNC MODE;
+REFRESH MATERIALIZED VIEW unknown_slot_mv;
 
 -- query 19
 -- @skip_result_check=true
@@ -150,8 +126,8 @@ USE mvslot_${uuid0}.ns_${uuid0};
 DROP MATERIALIZED VIEW IF EXISTS first_slot_mv;
 DROP MATERIALIZED VIEW IF EXISTS conflict_slot_mv;
 DROP MATERIALIZED VIEW IF EXISTS unknown_slot_mv;
-DROP TABLE mvslot_${uuid0}.ns_${uuid0}.fact FORCE;
-DROP DATABASE mvslot_${uuid0}.ns_${uuid0};
+DROP TABLE mvslot_${uuid0}.ns_${uuid0}.fact ;
+DROP SCHEMA mvslot_${uuid0}.ns_${uuid0};
 
 -- query 22
 -- @cleanup=true

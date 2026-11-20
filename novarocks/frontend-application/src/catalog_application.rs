@@ -38,10 +38,10 @@ use uuid::Uuid;
 pub mod command;
 pub mod create_table_ddl;
 pub mod iceberg_ref_command;
-pub mod model;
 pub mod query_bindings;
 pub mod query_catalog;
 pub mod query_materializer;
+mod quoted_metadata_qualification;
 pub mod resolver;
 pub mod statement;
 pub(crate) mod statement_action;
@@ -584,6 +584,10 @@ mod tests {
             runtime: current.clone(),
             control_runtime_id: novarocks_spi::connector::ConnectorControlRuntimeId::new(),
             configuration: Arc::clone(&configuration),
+            binding_key: novarocks_spi::connector::ConnectorProviderBindingKey {
+                instance_id: current.instance_id.clone(),
+                incarnation: novarocks_spi::connector::ProviderBindingEpoch::from_bytes([7; 16]),
+            },
         };
         let application = Arc::new(FixedApplication {
             admission: Mutex::new(CatalogAdmission::Ready(current.clone())),
@@ -602,6 +606,7 @@ mod tests {
             .require_ready(&current.instance_id)
             .expect("forward the exact published configuration");
         assert_eq!(observed.runtime, current);
+        assert_eq!(observed.binding_key, facts.binding_key);
         assert!(Arc::ptr_eq(&observed.configuration, &configuration));
 
         let mut another_generation = facts.clone();

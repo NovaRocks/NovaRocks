@@ -1088,6 +1088,7 @@ mod tests {
         );
         let cast = memo.scalars.intern(
             ScalarNode::Cast {
+                array_failure_mode: None,
                 child: source,
                 target: DataType::Decimal128(2, 0),
                 decimal_overflow_policy: policy,

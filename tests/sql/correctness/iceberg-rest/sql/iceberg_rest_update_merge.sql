@@ -22,35 +22,26 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE DATABASE iceberg_rest_${suite_uuid0}.iceberg_rest_update_merge_db_${uuid0};
+CREATE SCHEMA iceberg_rest_${suite_uuid0}.iceberg_rest_update_merge_db_${uuid0};
 
 -- query 2
 -- @skip_result_check=true
 CREATE TABLE iceberg_rest_${suite_uuid0}.iceberg_rest_update_merge_db_${uuid0}.t_update_merge_${uuid0} (
   id BIGINT,
   v STRING
-)
-TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true",
-  "novarocks.update.mode" = "merge-on-read"
-);
+) WITH (format_version = 3, extra_properties = MAP(ARRAY['novarocks.update.mode'], ARRAY['merge-on-read']));
 
 -- query 3
 -- @skip_result_check=true
 CREATE TABLE iceberg_rest_${suite_uuid0}.iceberg_rest_update_merge_db_${uuid0}.s_update_merge_${uuid0} (
   id BIGINT,
   v STRING
-)
-TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
-);
+) WITH (format_version = 3);
 
 -- query 4
 -- @skip_result_check=true
 INSERT INTO iceberg_rest_${suite_uuid0}.iceberg_rest_update_merge_db_${uuid0}.t_update_merge_${uuid0}
-VALUES (1, 'a'), (2, 'b');
+VALUES ROW(1, 'a'), ROW(2, 'b');
 
 -- query 5
 -- @skip_result_check=true
@@ -66,12 +57,12 @@ SELECT id, v
 -- query 7
 -- @skip_result_check=true
 INSERT INTO iceberg_rest_${suite_uuid0}.iceberg_rest_update_merge_db_${uuid0}.s_update_merge_${uuid0}
-VALUES (2, 'bb'), (3, 'c');
+VALUES ROW(2, 'bb'), ROW(3, 'c');
 
 -- query 8
 -- Capture the snapshot count after UPDATE and immediately before MERGE.
 SELECT count(*) AS snaps_before_merge
-  FROM iceberg_rest_${suite_uuid0}.iceberg_rest_update_merge_db_${uuid0}.t_update_merge_${uuid0}$snapshots;
+  FROM iceberg_rest_${suite_uuid0}.iceberg_rest_update_merge_db_${uuid0}."t_update_merge_${uuid0}$snapshots";
 
 -- query 9
 -- @skip_result_check=true
@@ -85,7 +76,7 @@ WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v);
 -- MATCHED UPDATE plus NOT MATCHED INSERT are one aggregate commit, so this
 -- count must be exactly one greater than snaps_before_merge.
 SELECT count(*) AS snaps_after_merge
-  FROM iceberg_rest_${suite_uuid0}.iceberg_rest_update_merge_db_${uuid0}.t_update_merge_${uuid0}$snapshots;
+  FROM iceberg_rest_${suite_uuid0}.iceberg_rest_update_merge_db_${uuid0}."t_update_merge_${uuid0}$snapshots";
 
 -- query 11
 SELECT id, v
@@ -96,4 +87,4 @@ SELECT id, v
 -- @skip_result_check=true
 DROP TABLE iceberg_rest_${suite_uuid0}.iceberg_rest_update_merge_db_${uuid0}.s_update_merge_${uuid0};
 DROP TABLE iceberg_rest_${suite_uuid0}.iceberg_rest_update_merge_db_${uuid0}.t_update_merge_${uuid0};
-DROP DATABASE iceberg_rest_${suite_uuid0}.iceberg_rest_update_merge_db_${uuid0};
+DROP SCHEMA iceberg_rest_${suite_uuid0}.iceberg_rest_update_merge_db_${uuid0};

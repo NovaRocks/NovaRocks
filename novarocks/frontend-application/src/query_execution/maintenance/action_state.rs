@@ -143,6 +143,16 @@ impl MaintenanceActionState {
         }
         Ok(())
     }
+    pub(super) fn install_call(&self, call: MetadataMaintenanceCall) -> Result<(), String> {
+        let mut loan = self.loan()?;
+        let body = loan.body.as_mut().unwrap();
+        if body.call.is_some() {
+            return Err("metadata maintenance call is already installed".into());
+        }
+        body.call = Some(call);
+        Ok(())
+    }
+
     pub(super) async fn execute(
         &self,
         request: MaintenanceActionRequest,

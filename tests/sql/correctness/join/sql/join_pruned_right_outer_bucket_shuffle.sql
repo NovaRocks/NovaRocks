@@ -29,10 +29,9 @@
 -- query 1
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t1 (
-  k1 bigint NULL,
+  k1 bigint ,
   c1 bigint
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 2
 -- @skip_result_check=true

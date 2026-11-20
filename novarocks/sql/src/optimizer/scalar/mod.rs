@@ -125,6 +125,7 @@ pub(crate) enum ScalarNode {
         resolved: crate::binding::SqlFunctionBinding,
     },
     Cast {
+        array_failure_mode: Option<novarocks_type_contract::ArrayCastFailureMode>,
         child: ScalarId,
         /// Carrier projection of the CAST target. The arena's complete result
         /// value type retains its logical identity and nullability.
@@ -905,9 +906,9 @@ mod bridge_tests {
     fn eq(l: TypedExpr, r: TypedExpr) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::BinaryOp {
-                left: Box::new(l),
+                left: novarocks_parser::ast::AstBox::new(l),
                 op: BinOp::Eq,
-                right: Box::new(r),
+                right: novarocks_parser::ast::AstBox::new(r),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
@@ -1403,11 +1404,11 @@ mod bridge_tests {
         let lambda_function = typed(
             ExprKind::LambdaFunction {
                 params: vec![lambda_param],
-                body: Box::new(typed(
+                body: novarocks_parser::ast::AstBox::new(typed(
                     ExprKind::BinaryOp {
-                        left: Box::new(lambda_param_ref.clone()),
+                        left: novarocks_parser::ast::AstBox::new(lambda_param_ref.clone()),
                         op: BinOp::Add,
-                        right: Box::new(lit_int(1)),
+                        right: novarocks_parser::ast::AstBox::new(lit_int(1)),
                         decimal_overflow_policy:
                             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     },
@@ -1421,10 +1422,10 @@ mod bridge_tests {
         let lambda = typed(
             ExprKind::Lambda {
                 params: vec!["y".to_string()],
-                body: Box::new(typed(
+                body: novarocks_parser::ast::AstBox::new(typed(
                     ExprKind::UnaryOp {
                         op: UnOp::Negate,
-                        expr: Box::new(typed(
+                        expr: novarocks_parser::ast::AstBox::new(typed(
                             ExprKind::LambdaParamRef {
                                 name: "y".to_string(),
                                 slot_id: 11,
@@ -1444,7 +1445,8 @@ mod bridge_tests {
         let function_args = vec![
             typed(
                 ExprKind::Cast {
-                    expr: Box::new(col(1, DataType::Int64)),
+                    array_failure_mode: None,
+                    expr: novarocks_parser::ast::AstBox::new(col(1, DataType::Int64)),
                     target: DataType::Utf8,
                     decimal_overflow_policy:
                         novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
@@ -1454,7 +1456,7 @@ mod bridge_tests {
             ),
             typed(
                 ExprKind::IsNull {
-                    expr: Box::new(col(2, DataType::Utf8)),
+                    expr: novarocks_parser::ast::AstBox::new(col(2, DataType::Utf8)),
                     negated: true,
                 },
                 DataType::Boolean,
@@ -1462,8 +1464,8 @@ mod bridge_tests {
             ),
             typed(
                 ExprKind::InList {
-                    expr: Box::new(col(3, DataType::Int64)),
-                    list: vec![lit_int(7), lit_int(8)],
+                    expr: novarocks_parser::ast::AstBox::new(col(3, DataType::Int64)),
+                    list: (vec![lit_int(7), lit_int(8)]).into(),
                     negated: true,
                 },
                 DataType::Boolean,
@@ -1471,12 +1473,13 @@ mod bridge_tests {
             ),
             typed(
                 ExprKind::Case {
-                    operand: Some(Box::new(col(4, DataType::Int64))),
-                    when_then: vec![
+                    operand: Some(novarocks_parser::ast::AstBox::new(col(4, DataType::Int64))),
+                    when_then: (vec![
                         (lit_int(1), lit_string("one")),
                         (lit_int(2), lit_string("two")),
-                    ],
-                    else_expr: Some(Box::new(lit_string("other"))),
+                    ])
+                    .into(),
+                    else_expr: Some(novarocks_parser::ast::AstBox::new(lit_string("other"))),
                 },
                 DataType::Utf8,
                 true,
@@ -1484,9 +1487,9 @@ mod bridge_tests {
             typed(
                 ExprKind::AggregateCall {
                     name: "sum".to_string(),
-                    args: vec![col(5, DataType::Int64)],
+                    args: (vec![col(5, DataType::Int64)]).into(),
                     distinct: true,
-                    order_by: vec![sort(col(6, DataType::Int64), false, true)],
+                    order_by: (vec![sort(col(6, DataType::Int64), false, true)]).into(),
                     resolved: crate::functions::test_resolved_aggregate(
                         "sum",
                         &[DataType::Int64],
@@ -1497,10 +1500,10 @@ mod bridge_tests {
                 true,
             ),
             typed(
-                ExprKind::Nested(Box::new(typed(
+                ExprKind::Nested(novarocks_parser::ast::AstBox::new(typed(
                     ExprKind::UnaryOp {
                         op: UnOp::Not,
-                        expr: Box::new(lit_bool(false)),
+                        expr: novarocks_parser::ast::AstBox::new(lit_bool(false)),
                     },
                     DataType::Boolean,
                     false,
@@ -1510,9 +1513,9 @@ mod bridge_tests {
             ),
             typed(
                 ExprKind::Between {
-                    expr: Box::new(col(7, DataType::Int64)),
-                    low: Box::new(lit_int(3)),
-                    high: Box::new(lit_int(9)),
+                    expr: novarocks_parser::ast::AstBox::new(col(7, DataType::Int64)),
+                    low: novarocks_parser::ast::AstBox::new(lit_int(3)),
+                    high: novarocks_parser::ast::AstBox::new(lit_int(9)),
                     negated: false,
                 },
                 DataType::Boolean,
@@ -1520,8 +1523,8 @@ mod bridge_tests {
             ),
             typed(
                 ExprKind::Like {
-                    expr: Box::new(col(8, DataType::Utf8)),
-                    pattern: Box::new(lit_string("ab%")),
+                    expr: novarocks_parser::ast::AstBox::new(col(8, DataType::Utf8)),
+                    pattern: novarocks_parser::ast::AstBox::new(lit_string("ab%")),
                     negated: true,
                 },
                 DataType::Boolean,
@@ -1529,7 +1532,7 @@ mod bridge_tests {
             ),
             typed(
                 ExprKind::IsTruthValue {
-                    expr: Box::new(lit_bool(true)),
+                    expr: novarocks_parser::ast::AstBox::new(lit_bool(true)),
                     value: true,
                     negated: true,
                 },
@@ -1542,7 +1545,7 @@ mod bridge_tests {
             typed(
                 ExprKind::WindowCall {
                     name: "first_value".to_string(),
-                    args: vec![col(9, DataType::Int64)],
+                    args: (vec![col(9, DataType::Int64)]).into(),
                     distinct: false,
                     binding: crate::analysis::test_window_binding(
                         "first_value",
@@ -1550,10 +1553,10 @@ mod bridge_tests {
                         DataType::Int64,
                         true,
                     ),
-                    function_order_by: vec![],
+                    function_order_by: (vec![]).into(),
                     aggregate_binding: None,
-                    partition_by: vec![col(10, DataType::Utf8)],
-                    order_by: vec![sort(col(11, DataType::Int64), true, false)],
+                    partition_by: (vec![col(10, DataType::Utf8)]).into(),
+                    order_by: (vec![sort(col(11, DataType::Int64), true, false)]).into(),
                     window_frame: Some(WindowFrame {
                         frame_type: WindowFrameType::Rows,
                         start: WindowBound::Preceding(1),
@@ -1575,7 +1578,7 @@ mod bridge_tests {
                     crate::functions::FunctionVolatility::Immutable,
                 ),
                 name: "combo".to_string(),
-                args: function_args,
+                args: (function_args).into(),
                 distinct: true,
                 volatility: crate::functions::FunctionVolatility::Immutable,
             },
@@ -1621,6 +1624,7 @@ mod overflow_policy_tests {
             ));
             ids.push(arena.intern(
                 ScalarNode::Cast {
+                    array_failure_mode: None,
                     child,
                     target: DataType::Decimal128(9, 0),
                     decimal_overflow_policy: policy,

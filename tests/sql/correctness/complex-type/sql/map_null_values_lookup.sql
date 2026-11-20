@@ -19,13 +19,13 @@
 -- @order_sensitive=true
 
 -- query 1
-SELECT map{1:NULL}[1] AS found_value, map{1:NULL}[2] AS missing_value,
-       element_at(map{1:NULL}, 1) AS explicit_call;
+SELECT map(1,NULL)[1] AS found_value, map(1,NULL)[2] AS missing_value,
+       element_at(map(1,NULL), 1) AS explicit_call;
 
 -- query 2
 WITH input_values AS (
-    SELECT 1 AS id, map{1:NULL} AS m
-    UNION ALL SELECT 2, map{2:NULL}
+    SELECT 1 AS id, map(1,NULL) AS m
+    UNION ALL SELECT 2, map(2,NULL)
     UNION ALL SELECT 3, NULL
 )
 SELECT id, m[1] AS found_value, m[99] AS missing_value

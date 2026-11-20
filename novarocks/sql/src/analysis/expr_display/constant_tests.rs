@@ -87,7 +87,7 @@ fn column(name: &str) -> TypedExpr {
 fn nested(value: TypedExpr) -> TypedExpr {
     TypedExpr {
         value_type: value.value_type.clone(),
-        kind: ExprKind::Nested(Box::new(value)),
+        kind: ExprKind::Nested(novarocks_parser::ast::AstBox::new(value)),
     }
 }
 fn case(value: TypedExpr) -> TypedExpr {
@@ -95,13 +95,14 @@ fn case(value: TypedExpr) -> TypedExpr {
         value_type: value.value_type.clone(),
         kind: ExprKind::Case {
             operand: None,
-            when_then: vec![(
+            when_then: (vec![(
                 TypedExpr {
                     value_type: FunctionValueType::new(DataType::Boolean, false),
                     kind: ExprKind::Literal(query_ir::LiteralValue::Bool(true)),
                 },
                 nested(value),
-            )],
+            )])
+            .into(),
             else_expr: None,
         },
     }
@@ -149,7 +150,7 @@ fn selected_field_path_and_aggregate_labels_preserve_existing_source_spelling() 
                 crate::functions::FunctionVolatility::Immutable,
             ),
             name: "__struct_subfield".into(),
-            args,
+            args: (args).into(),
             distinct: false,
             volatility: crate::functions::FunctionVolatility::Immutable,
         },

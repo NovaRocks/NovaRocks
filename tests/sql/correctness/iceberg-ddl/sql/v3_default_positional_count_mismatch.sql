@@ -22,19 +22,16 @@
 
 -- query 1
 -- @skip_result_check=true
-DROP TABLE IF EXISTS ${case_db}.t_v3_default_positional FORCE;
+DROP TABLE IF EXISTS ${case_db}.t_v3_default_positional ;
 CREATE TABLE ${case_db}.t_v3_default_positional (
   a INT,
   b INT DEFAULT 5
-)
-TBLPROPERTIES (
-  "format-version" = "3"
-);
+) WITH (format_version = 3);
 
 -- query 2
 -- @expect_error=mismatch
-INSERT INTO ${case_db}.t_v3_default_positional VALUES (1);
+INSERT INTO ${case_db}.t_v3_default_positional VALUES ROW(1);
 
 -- query 3
 -- @skip_result_check=true
-DROP TABLE ${case_db}.t_v3_default_positional FORCE;
+DROP TABLE ${case_db}.t_v3_default_positional ;

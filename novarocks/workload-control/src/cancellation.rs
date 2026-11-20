@@ -23,7 +23,10 @@ mod fixed_children_tests;
 use crate::WorkId;
 use children::{Children, SharedChildIndex};
 pub(crate) use children::{new_shared_child_index, shared_child_index_backing_bytes};
-use std::sync::{Arc, Mutex, Weak};
+use std::{
+    sync::{Arc, Mutex, OnceLock, Weak},
+    time::Duration,
+};
 use tokio::{sync::Notify, time::Instant};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -70,10 +73,53 @@ pub(crate) enum CancellationSuccessSealOutcome {
     Cancelled(CancellationReason),
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum DeadlineBinding {
+    Fixed(Option<Instant>),
+    Deferred,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct WorkDeadline {
+    instant: Instant,
+    configured_timeout: Option<Duration>,
+}
+
+impl WorkDeadline {
+    pub(crate) fn from_configured_timeout(
+        started: Instant,
+        timeout: Option<Duration>,
+    ) -> Result<Option<Self>, crate::WorkError> {
+        timeout
+            .map(|duration| {
+                let instant = started
+                    .checked_add(duration)
+                    .ok_or(crate::WorkError::ArithmeticOverflow)?;
+                Ok(Self {
+                    instant,
+                    configured_timeout: Some(duration),
+                })
+            })
+            .transpose()
+    }
+}
+
+impl DeadlineBinding {
+    fn slot(self) -> OnceLock<Option<WorkDeadline>> {
+        match self {
+            Self::Fixed(deadline) => OnceLock::from(deadline.map(|instant| WorkDeadline {
+                instant,
+                configured_timeout: None,
+            })),
+            Self::Deferred => OnceLock::new(),
+        }
+    }
+}
+
 pub(crate) struct Cancellation {
     state: Mutex<State>,
     changed: Notify,
-    deadline: Option<Instant>,
+    deadline: OnceLock<Option<WorkDeadline>>,
     parent: Option<ParentLink>,
     #[cfg(test)]
     fixture_next_sequence: std::sync::atomic::AtomicU64,
@@ -109,7 +155,7 @@ impl Cancellation {
         self.state.lock().unwrap().children.release_fixed(count);
     }
 
-    pub(crate) fn reuse_root(&mut self, deadline: Option<Instant>) {
+    pub(crate) fn reuse_root(&mut self, deadline: DeadlineBinding) {
         assert!(self.parent.is_none(), "Free cell has no previous parent");
         let state = self.state.get_mut().unwrap();
         assert!(
@@ -117,7 +163,7 @@ impl Cancellation {
             "Free cell was exclusively reset"
         );
         state.children.assert_empty_for_reuse();
-        self.deadline = deadline;
+        self.deadline = deadline.slot();
     }
 
     pub(crate) fn reuse_child(
@@ -127,7 +173,12 @@ impl Cancellation {
         sequence: WorkId,
     ) -> Result<(), crate::WorkError> {
         let inherited = parent.check_reason();
-        let deadline = match (parent.deadline, deadline) {
+        let parent_deadline = parent
+            .deadline
+            .get()
+            .copied()
+            .ok_or(crate::WorkError::NotReady)?;
+        let deadline = match (parent_deadline.map(|deadline| deadline.instant), deadline) {
             (Some(parent), Some(child)) => Some(parent.min(child)),
             (parent, child) => parent.or(child),
         };
@@ -137,7 +188,7 @@ impl Cancellation {
         };
         let child = Arc::get_mut(cell).ok_or(crate::WorkError::Conflict)?;
         children.preflight(&child.state.get_mut().unwrap().children, sequence)?;
-        child.reuse_root(deadline);
+        child.reuse_root(DeadlineBinding::Fixed(deadline));
         child.parent = Some(ParentLink {
             parent: Arc::clone(parent),
             sequence,
@@ -155,7 +206,7 @@ impl Cancellation {
         state.reason = None;
         state.success_sealed = false;
         state.children.reset(); // Retain the same original shared index and logical limit.
-        self.deadline = None;
+        self.deadline = DeadlineBinding::Fixed(None).slot();
         // Only notify_waiters is used here. With no old Notified borrower,
         // the existing Notify can be retained together with its paid mutex.
         CancellationReset {
@@ -164,10 +215,14 @@ impl Cancellation {
     }
 
     pub(crate) fn root(deadline: Option<Instant>) -> Arc<Self> {
+        Self::root_with_deadline(DeadlineBinding::Fixed(deadline))
+    }
+
+    pub(crate) fn root_with_deadline(deadline: DeadlineBinding) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(State::default()),
             changed: Notify::new(),
-            deadline,
+            deadline: deadline.slot(),
             parent: None,
             #[cfg(test)]
             fixture_next_sequence: std::sync::atomic::AtomicU64::new(1),
@@ -185,14 +240,14 @@ impl Cancellation {
             "fixed children require the original prepaid child slot"
         );
         let inherited = self.check_reason();
-        let deadline = match (self.deadline, deadline) {
+        let deadline = match (self.deadline(), deadline) {
             (Some(parent), Some(child)) => Some(parent.min(child)),
             (parent, child) => parent.or(child),
         };
         let child = Arc::new(Self {
             state: Mutex::new(State::default()),
             changed: Notify::new(),
-            deadline,
+            deadline: DeadlineBinding::Fixed(deadline).slot(),
             parent: Some(ParentLink {
                 parent: Arc::clone(self),
                 sequence,
@@ -358,7 +413,7 @@ impl Cancellation {
                 return CancellationSuccessSealOutcome::Cancelled(reason);
             }
             let deadline_reason = self
-                .deadline
+                .deadline()
                 .filter(|deadline| Instant::now() >= *deadline)
                 .map(|_| CancellationReason::DeadlineExceeded);
             if let Some(reason) = inherited.or(deadline_reason) {
@@ -415,7 +470,7 @@ impl Cancellation {
     pub(crate) fn check_reason(&self) -> Option<CancellationReason> {
         let local = self.state.lock().unwrap().reason.clone();
         local.or_else(|| self.ancestor_reason()).or_else(|| {
-            self.deadline
+            self.deadline()
                 .filter(|deadline| Instant::now() >= *deadline)
                 .map(|_| CancellationReason::DeadlineExceeded)
         })
@@ -434,6 +489,36 @@ impl Cancellation {
 
     pub(crate) fn deadline(&self) -> Option<Instant> {
         self.deadline
+            .get()
+            .copied()
+            .flatten()
+            .map(|deadline| deadline.instant)
+    }
+
+    pub(crate) fn deadline_is_deferred(&self) -> bool {
+        self.deadline.get().is_none()
+    }
+
+    /// The original Work owner calls this while the original State still has
+    /// custody of the cell. Wake observers only after those locks are released.
+    pub(crate) fn bind_root_deadline(
+        &self,
+        deadline: Option<WorkDeadline>,
+    ) -> Result<(), crate::WorkError> {
+        let state = self.state.lock().unwrap();
+        if self.parent.is_some() || state.success_sealed {
+            return Err(crate::WorkError::Conflict);
+        }
+        if let Some(reason) = &state.reason {
+            return Err(crate::WorkError::Cancelled(reason.clone()));
+        }
+        self.deadline
+            .set(deadline)
+            .map_err(|_| crate::WorkError::Conflict)
+    }
+
+    pub(crate) fn wake_deadline_observers(&self) {
+        self.changed.notify_waiters();
     }
 
     /// Production views always notify their original process authority on exit.
@@ -527,6 +612,17 @@ impl CancellationView {
     }
     pub fn deadline(&self) -> Option<Instant> {
         self.cancellation().deadline()
+    }
+
+    /// Original relative duration if this view's Root was armed from a
+    /// deferred timeout. Fixed-at-admission roots carry only their instant.
+    pub fn configured_timeout(&self) -> Option<Duration> {
+        self.cancellation()
+            .deadline
+            .get()
+            .copied()
+            .flatten()?
+            .configured_timeout
     }
 
     pub async fn cancelled(&self) -> CancellationReason {

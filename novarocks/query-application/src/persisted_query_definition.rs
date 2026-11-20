@@ -91,8 +91,8 @@ impl FrozenQueryResolutionContext {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PersistedQueryDialect {
     #[default]
-    #[serde(rename = "starrocks")]
-    StarRocks,
+    #[serde(rename = "trino")]
+    Trino,
 }
 
 fn validate_normalized_identifier(label: &str, value: &str) -> Result<(), String> {
@@ -115,10 +115,10 @@ mod tests {
 
     #[test]
     fn preserves_raw_source_and_freezes_normalized_resolution_context() {
-        let raw = "/* hint */\nSELECT `MiXeD`  FROM t -- keep\n";
+        let raw = "/* hint */\nSELECT \"MiXeD\"  FROM t -- keep\n";
         let definition = PersistedQueryDefinition::new(
             raw,
-            PersistedQueryDialect::StarRocks,
+            PersistedQueryDialect::Trino,
             "  `Catalog_One` ",
             "  Db_One ",
         )
@@ -134,7 +134,7 @@ mod tests {
         assert!(
             PersistedQueryDefinition::new(
                 " \n\t ",
-                PersistedQueryDialect::StarRocks,
+                PersistedQueryDialect::Trino,
                 "catalog",
                 "database",
             )
@@ -144,7 +144,7 @@ mod tests {
         let unknown_version = PersistedQueryDefinition {
             format_version: PERSISTED_QUERY_DEFINITION_FORMAT_VERSION + 1,
             raw_query_source: "SELECT 1".to_string(),
-            dialect: PersistedQueryDialect::StarRocks,
+            dialect: PersistedQueryDialect::Trino,
             resolution: FrozenQueryResolutionContext {
                 default_catalog: "catalog".to_string(),
                 default_database: "database".to_string(),
@@ -163,7 +163,7 @@ mod tests {
     fn serde_uses_the_stable_dialect_value() {
         let definition = PersistedQueryDefinition::new(
             "SELECT 1",
-            PersistedQueryDialect::StarRocks,
+            PersistedQueryDialect::Trino,
             "catalog",
             "database",
         )
@@ -172,11 +172,22 @@ mod tests {
         let encoded = serde_json::to_string(&definition).expect("serialize");
         assert_eq!(
             encoded,
-            r#"{"format_version":1,"raw_query_source":"SELECT 1","dialect":"starrocks","resolution":{"default_catalog":"catalog","default_database":"database"}}"#
+            r#"{"format_version":1,"raw_query_source":"SELECT 1","dialect":"trino","resolution":{"default_catalog":"catalog","default_database":"database"}}"#
         );
         let decoded: PersistedQueryDefinition =
             serde_json::from_str(&encoded).expect("deserialize");
         decoded.validate().expect("validated decoded definition");
         assert_eq!(decoded, definition);
+    }
+
+    #[test]
+    fn serde_rejects_old_starrocks_definitions_without_relabeling() {
+        let source = r#"{"format_version":1,"raw_query_source":"SELECT 1","dialect":"starrocks","resolution":{"default_catalog":"catalog","default_database":"database"}}"#;
+        let error = serde_json::from_str::<PersistedQueryDefinition>(source).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unknown variant `starrocks`, expected `trino`")
+        );
     }
 }

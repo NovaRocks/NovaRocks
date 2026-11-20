@@ -28,17 +28,16 @@ CREATE TABLE ${case_db}.t_agg_count_if_nullable_composite (
     g INT,
     x INT,
     y INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t_agg_count_if_nullable_composite VALUES
-    (1, 3, 1),
-    (1, 3, 0),
-    (1, NULL, 2),
-    (1, 5, NULL),
-    (2, 2, 1),
-    (2, 1, 5),
-    (2, NULL, NULL);
+    ROW(1, 3, 1),
+    ROW(1, 3, 0),
+    ROW(1, NULL, 2),
+    ROW(1, 5, NULL),
+    ROW(2, 2, 1),
+    ROW(2, 1, 5),
+    ROW(2, NULL, NULL);
 
 SELECT
     g,

@@ -99,6 +99,7 @@ fn recipe(
         &FunctionValueType::new(DataType::Date32, result_nullable),
         policy,
         allow,
+        None,
         &Control::default(),
     )
     .unwrap()
@@ -137,6 +138,7 @@ fn float_date_exact_nullability_successful_null_effect_and_all_policy_profiles()
                             &FunctionValueType::new(DataType::Date32, result_nullable),
                             policy,
                             allow,
+                            None,
                             &Control::default(),
                         );
                         if source_nullable && !result_nullable {

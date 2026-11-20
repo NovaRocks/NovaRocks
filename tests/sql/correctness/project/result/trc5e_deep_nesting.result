@@ -1,0 +1,64 @@
+-- query 1
+-- types	integer
+fe_alive
+1
+
+-- query 2
+-- types	integer
+_col0
+1
+
+-- query 3
+-- types	integer
+fe_alive
+1
+
+-- query 4
+-- types	integer
+fe_alive
+1
+
+-- query 6
+-- types	integer
+fe_alive
+1
+
+-- query 7
+-- types	integer
+fe_alive
+1
+
+-- query 8
+-- types	boolean
+_col0
+false
+
+-- query 9
+-- types	integer
+fe_alive
+1
+
+-- query 10
+-- types	integer
+fe_alive
+1
+
+-- query 11
+-- types	integer
+_col0
+1
+
+-- query 12
+-- types	integer
+fe_alive
+1
+
+-- query 13
+-- types	integer
+fe_alive
+1
+
+-- query 15
+-- types	integer
+fe_alive
+1

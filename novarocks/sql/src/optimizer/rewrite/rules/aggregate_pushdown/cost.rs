@@ -316,9 +316,9 @@ mod tests {
         };
         let predicate = crate::analysis::TypedExpr {
             kind: ExprKind::BinaryOp {
-                left: Box::new(col_ref_typed("k")),
+                left: novarocks_parser::ast::AstBox::new(col_ref_typed("k")),
                 op: BinOp::Eq,
-                right: Box::new(crate::analysis::TypedExpr {
+                right: novarocks_parser::ast::AstBox::new(crate::analysis::TypedExpr {
                     kind: ExprKind::Literal(LiteralValue::Int(7)),
                     value_type: novarocks_type_contract::FunctionValueType::new(
                         DataType::Int64,

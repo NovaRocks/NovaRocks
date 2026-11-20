@@ -43,6 +43,7 @@ fn compose(
         &target,
         DecimalOverflowPolicy::ReportError,
         true,
+        None,
         &CompileControl::default(),
     )
     .unwrap();

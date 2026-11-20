@@ -19,52 +19,52 @@
 -- Denylist coverage: each reserved category errors clearly.
 
 -- query 1
-CREATE DATABASE iceberg_ddl_cat_${suite_uuid0}.tblprops_reject_${uuid0};
+CREATE SCHEMA iceberg_ddl_cat_${suite_uuid0}.tblprops_reject_${uuid0};
 USE iceberg_ddl_cat_${suite_uuid0}.tblprops_reject_${uuid0};
 DROP TABLE IF EXISTS p;
-CREATE TABLE p (id INT) TBLPROPERTIES ("format-version" = "2");
+CREATE TABLE p (id INT) WITH (format_version = 2);
 
 -- query 2
 -- @expect_error=Iceberg table property `format-version` is reserved
-ALTER TABLE p SET TBLPROPERTIES ('format-version' = '3');
+ALTER TABLE p SET PROPERTIES extra_properties = MAP(ARRAY['format-version'], ARRAY['3']);
 
 -- query 3
 -- @expect_error=Iceberg internal metadata key
-ALTER TABLE p SET TBLPROPERTIES ('identifier-field-ids' = '[1]');
+ALTER TABLE p SET PROPERTIES extra_properties = MAP(ARRAY['identifier-field-ids'], ARRAY['[1]']);
 
 -- query 4
 -- @expect_error=Iceberg internal metadata key
-ALTER TABLE p SET TBLPROPERTIES ('current-schema-id' = '5');
+ALTER TABLE p SET PROPERTIES extra_properties = MAP(ARRAY['current-schema-id'], ARRAY['5']);
 
 -- query 5
 -- ADR-0182: this ordinary property does not author any type domain.
-ALTER TABLE p SET TBLPROPERTIES ('novarocks.logical_type.foo' = 'TINYINT');
-ALTER TABLE p UNSET TBLPROPERTIES ('novarocks.logical_type.foo');
+ALTER TABLE p SET PROPERTIES extra_properties = MAP(ARRAY['novarocks.logical_type.foo'], ARRAY['TINYINT']);
+ALTER TABLE p EXECUTE unset_extra_properties(keys => ARRAY['novarocks.logical_type.foo'], if_exists => false);
 
 -- query 6
 -- @expect_error=novarocks.* namespace is reserved
-ALTER TABLE p SET TBLPROPERTIES ('novarocks.future' = 'whatever');
+ALTER TABLE p SET PROPERTIES extra_properties = MAP(ARRAY['novarocks.future'], ARRAY['whatever']);
 
 -- query 7
 -- UNSET path covered too.
 -- @expect_error=Iceberg internal metadata key
-ALTER TABLE p UNSET TBLPROPERTIES ('last-column-id');
+ALTER TABLE p EXECUTE unset_extra_properties(keys => ARRAY['last-column-id'], if_exists => false);
 
 -- query 8
 -- @expect_error_tier=drift
 -- @expect_error=write.parquet.variant-shredding.
-ALTER TABLE p SET TBLPROPERTIES ('write.parquet.variant-shredding.payload' = 'a:int');
+ALTER TABLE p SET PROPERTIES extra_properties = MAP(ARRAY['write.parquet.variant-shredding.payload'], ARRAY['a:int']);
 
 -- query 9
 -- @expect_error_tier=drift
 -- @expect_error=write.parquet.variant-shredding.
-CREATE TABLE shredding_create (id INT) TBLPROPERTIES ('write.parquet.variant-shredding.payload' = 'a:int');
+CREATE TABLE shredding_create (id INT) WITH (extra_properties = MAP(ARRAY['write.parquet.variant-shredding.payload'], ARRAY['a:int']));
 
 -- query 10
 -- Only the current nominal document namespace authors these type facts.
 -- @expect_error=Iceberg nominal declarations are owned by schema mutations
-ALTER TABLE p SET TBLPROPERTIES ('novarocks.nominal-types.v1' = '{"version":1,"fields":[]}');
+ALTER TABLE p SET PROPERTIES extra_properties = MAP(ARRAY['novarocks.nominal-types.v1'], ARRAY['{"version":1,"fields":[]}']);
 
 -- query 11
 DROP TABLE p;
-DROP DATABASE iceberg_ddl_cat_${suite_uuid0}.tblprops_reject_${uuid0};
+DROP SCHEMA iceberg_ddl_cat_${suite_uuid0}.tblprops_reject_${uuid0};

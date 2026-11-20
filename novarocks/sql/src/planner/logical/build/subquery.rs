@@ -69,7 +69,7 @@ fn project_mark_key(
                 name: novarocks_functions::json_canonical::FUNCTION_NAME.into(),
                 volatility: binding.semantics.volatility,
                 binding,
-                args: vec![source],
+                args: (vec![source]).into(),
                 distinct: false,
             },
         },
@@ -194,9 +194,9 @@ pub(super) fn wrap_scalar_applies(
             )?;
             let predicate = TypedExpr {
                 kind: ExprKind::BinaryOp {
-                    left: Box::new(probe_key),
+                    left: novarocks_parser::ast::AstBox::new(probe_key),
                     op: BinOp::Eq,
-                    right: Box::new(build_key),
+                    right: novarocks_parser::ast::AstBox::new(build_key),
                     decimal_overflow_policy,
                 },
                 value_type: novarocks_type_contract::FunctionValueType::new(

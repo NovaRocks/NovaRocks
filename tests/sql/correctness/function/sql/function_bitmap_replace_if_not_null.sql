@@ -24,14 +24,13 @@
 -- query 1
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t_bm_rin (
-  `c1` int(11) NULL COMMENT "",
-  `c2` bitmap NULL COMMENT ""
-)
-TBLPROPERTIES ("format-version" = "3");
+  "c1" int(11),
+  "c2" bitmap
+) WITH (format_version = 3);
 
 -- query 2
 -- @skip_result_check=true
-insert into ${case_db}.t_bm_rin values (1, bitmap_from_string("1,2,3")), (2, bitmap_from_string("4,5,6"));
+insert into ${case_db}.t_bm_rin values ROW(1, bitmap_from_string('1,2,3')), ROW(2, bitmap_from_string('4,5,6'));
 
 -- query 3
 -- @order_sensitive=true
@@ -42,7 +41,7 @@ select c1, bitmap_to_string(c2) from ${case_db}.t_bm_rin order by c1;
 -- @skip_result_check=true
 -- Recreate the unchanged state explicitly; append tables do not apply aggregate-column replacement.
 TRUNCATE TABLE ${case_db}.t_bm_rin;
-insert into ${case_db}.t_bm_rin values (1, bitmap_from_string("1,2,3")), (2, bitmap_from_string("4,5,6"));
+insert into ${case_db}.t_bm_rin values ROW(1, bitmap_from_string('1,2,3')), ROW(2, bitmap_from_string('4,5,6'));
 
 -- query 5
 -- @order_sensitive=true
@@ -53,7 +52,7 @@ select c1, bitmap_to_string(c2) from ${case_db}.t_bm_rin order by c1;
 -- @skip_result_check=true
 -- Recreate the replacement state explicitly.
 TRUNCATE TABLE ${case_db}.t_bm_rin;
-insert into ${case_db}.t_bm_rin values (1, bitmap_from_string("7,8,9")), (2, bitmap_from_string("4,5,6"));
+insert into ${case_db}.t_bm_rin values ROW(1, bitmap_from_string('7,8,9')), ROW(2, bitmap_from_string('4,5,6'));
 
 -- query 7
 -- @order_sensitive=true

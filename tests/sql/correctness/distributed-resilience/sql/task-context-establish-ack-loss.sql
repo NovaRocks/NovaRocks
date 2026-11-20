@@ -34,20 +34,19 @@
 CREATE TABLE ${case_db}.ack_loss (
   id BIGINT,
   payload BIGINT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 2
 -- @skip_result_check=true
-INSERT INTO ${case_db}.ack_loss VALUES (1, 10);
+INSERT INTO ${case_db}.ack_loss VALUES ROW(1, 10);
 
 -- query 3
 -- @skip_result_check=true
-INSERT INTO ${case_db}.ack_loss VALUES (2, 20);
+INSERT INTO ${case_db}.ack_loss VALUES ROW(2, 20);
 
 -- query 4
 -- @skip_result_check=true
-INSERT INTO ${case_db}.ack_loss VALUES (3, 30);
+INSERT INTO ${case_db}.ack_loss VALUES ROW(3, 30);
 
 -- query 5
 -- @query_lifecycle_fault=establish-participation-ack-drop,1

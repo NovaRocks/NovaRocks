@@ -17,7 +17,7 @@
 
 -- Independent legacy mode and catching controls; no recorded outputs.
 -- query 1
-SET sql_mode='0';
+SET SESSION sql_mode = '0';
 SELECT CAST(CAST(2147483648 AS DOUBLE) AS INT) IS NULL AS caught_range;
 
 -- query 2
@@ -25,10 +25,10 @@ SELECT CAST(CAST(2147483648 AS DOUBLE) AS INT) IS NULL AS caught_range;
 -- @expect_sql_code=query.execution.numeric_out_of_range
 -- @expect_sql_phase=Execution
 -- @expect_error=[query.execution.numeric_out_of_range]
-SELECT /*+ SET_VAR(sql_mode='ALLOW_THROW_EXCEPTION') */ CAST(CAST(2147483648 AS DOUBLE) AS INT) AS narrowed;
+WITH SESSION sql_mode = 'ALLOW_THROW_EXCEPTION' SELECT /*+ SET_VAR(sql_mode='ALLOW_THROW_EXCEPTION') */ CAST(CAST(2147483648 AS DOUBLE) AS INT) AS narrowed;
 
 -- query 3
-SELECT /*+ SET_VAR(sql_mode='ALLOW_THROW_EXCEPTION') */ CAST(CAST(127 AS DOUBLE) AS TINYINT) AS narrowed;
+WITH SESSION sql_mode = 'ALLOW_THROW_EXCEPTION' SELECT /*+ SET_VAR(sql_mode='ALLOW_THROW_EXCEPTION') */ CAST(CAST(127 AS DOUBLE) AS TINYINT) AS narrowed;
 
 -- query 4
 SELECT CAST(unhex('FF') AS VARCHAR) IS NULL AS caught_utf8;

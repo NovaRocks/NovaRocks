@@ -226,11 +226,11 @@ fn parse_definition_publication_catalog_fault_target(
         // Already quoted identifiers retain their original SQL grammar. Quote
         // an unquoted identifier template only as a literal definition name,
         // never by replacing a placeholder with a fabricated concrete value.
-        let value = if value.contains("${") && !value.starts_with('`') {
+        let value = if value.contains("${") && !value.starts_with('"') {
             if !template.is_match(value) {
                 bail!("invalid publication_catalog_fault_target identifier template");
             }
-            format!("`{value}`")
+            format!(r#""{value}""#)
         } else {
             value.to_string()
         };
@@ -260,23 +260,17 @@ fn parse_publication_catalog_fault_target(raw: &str) -> Result<PublicationCatalo
     let table = table.context("publication_catalog_fault_target requires table")?;
     // Reuse the SQL object-name grammar, never a wildcard or inferred session scope.
     let command = format!("DROP TABLE {namespace}.{table}");
-    let statements = novarocks_parser::parse(&command)
+    let statement = novarocks_parser::parser::parse_statement(&command)
         .map_err(|_| anyhow::anyhow!("invalid publication_catalog_fault_target SQL names"))?;
-    let [
-        novarocks_parser::ast::Statement::Catalog(
-            novarocks_parser::ast::CatalogStatement::DropTable(drop),
-        ),
-    ] = statements.as_slice()
-    else {
+    let novarocks_parser::ast::TrinoStatement::DropTable(drop) = statement else {
         bail!("publication_catalog_fault_target must name exactly one namespace.table");
     };
-    let [namespace, table] = drop.name.parts.as_slice() else {
+    let [namespace, table] = drop.table_name.parts.as_slice() else {
         bail!("publication_catalog_fault_target must name exactly one namespace.table");
     };
-    if drop.if_exists
-        || drop.force
-        || drop.name.span.start() != "DROP TABLE ".len()
-        || drop.name.span.end() != command.len()
+    if drop.exists
+        || drop.table_name.span.start() != "DROP TABLE ".len()
+        || drop.table_name.span.end() != command.len()
         || [namespace, table]
             .iter()
             .any(|part| part.value.is_empty() || part.value.contains('/'))
@@ -521,16 +515,25 @@ fn parse_meta_with_name_binding(
                 meta.db = Some(raw_value);
             }
             "expect_trino_error" => {
-                let parts = raw_value.split(',').map(str::trim).collect::<Vec<_>>();
-                let [name, error_type] = parts.as_slice() else {
-                    bail!("@expect_trino_error requires exactly <errorName>,<errorType>");
-                };
+                let mut parts = raw_value.split(',').map(str::trim);
+                let name = parts.next().unwrap_or_default();
+                let error_type = parts.next().unwrap_or_default();
                 if name.is_empty() || error_type.is_empty() {
                     bail!("@expect_trino_error requires nonempty errorName and errorType");
                 }
+                let statement_ordinal = parts
+                    .next()
+                    .map(str::parse)
+                    .transpose()
+                    .context("@expect_trino_error expects a positive statement ordinal")?;
+                ensure!(
+                    parts.next().is_none(),
+                    "@expect_trino_error requires <errorName>,<errorType>[,<statementOrdinal>]"
+                );
                 meta.expect_trino_error = Some(TrinoErrorExpectation {
-                    name: (*name).to_string(),
-                    error_type: (*error_type).to_string(),
+                    name: name.to_string(),
+                    error_type: error_type.to_string(),
+                    statement_ordinal,
                 });
             }
             "expect_error" => {
@@ -987,9 +990,9 @@ fn validate_result_rows_assertion(meta: &QueryMeta) -> Result<()> {
 }
 
 pub(crate) fn validate_trino_error_expectation(meta: &QueryMeta, sql: Option<&str>) -> Result<()> {
-    if meta.expect_trino_error.is_none() {
+    let Some(expected) = &meta.expect_trino_error else {
         return Ok(());
-    }
+    };
     ensure!(
         meta.expect_error.is_none()
             && meta.expect_error_code.is_none()
@@ -1000,12 +1003,9 @@ pub(crate) fn validate_trino_error_expectation(meta: &QueryMeta, sql: Option<&st
     if let Some(sql) = sql {
         ensure!(
             !crate::shell::is_shell_step(sql),
-            "@expect_trino_error requires one SQL statement, not shell"
+            "@expect_trino_error requires SQL statements, not shell"
         );
-        ensure!(
-            crate::session::split_sql_statements(sql)?.len() == 1,
-            "@expect_trino_error requires exactly one executable SQL statement"
-        );
+        crate::session::split_trino_step_sql(sql, Some(expected))?;
     }
     Ok(())
 }
@@ -1407,6 +1407,71 @@ pub(crate) fn frame_case_source(source: &str, marker_re: &Regex) -> Result<CaseS
     })
 }
 
+/// Source fields from the native case definition, before runtime name preparation.
+#[derive(Debug, Clone)]
+pub struct CaseSourceDefinition {
+    pub file_preface: std::ops::Range<usize>,
+    pub file_meta: QueryMeta,
+    pub steps: Vec<CaseSourceStep>,
+}
+
+/// One native section, including metadata-only and shell sections.
+#[derive(Debug, Clone)]
+pub struct CaseSourceStep {
+    pub query_number: usize,
+    pub source_range: std::ops::Range<usize>,
+    pub native_sql: String,
+    pub meta: QueryMeta,
+}
+
+/// Extract the original framing and metadata without substituting variables.
+///
+/// Ranges refer to `source`. `native_sql` uses the same preface and line-ending
+/// handling as the native loader; it is not a contiguous source range or a
+/// guarantee that the SQL parses. Callers retain the original source and own
+/// any subsequent preparation receipts. Parsed metadata grants no runtime
+/// control authority. The regular expressions are the native caller's existing
+/// metadata and query-marker inputs, as for `load_sql_case_from_file`.
+pub fn extract_case_source_definition(
+    source: &str,
+    meta_re: &Regex,
+    marker_re: &Regex,
+) -> Result<CaseSourceDefinition> {
+    let frames = frame_case_source(source, marker_re)?;
+    let file_meta_lines = source[frames.file_preface.clone()]
+        .lines()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let (file_meta, _) = extract_meta_and_sql_with_name_binding(
+        &file_meta_lines,
+        meta_re,
+        MetadataNameBinding::LiteralDefinition,
+    )?;
+    let mut steps = Vec::with_capacity(frames.sections.len());
+    for (query_number, source_range) in frames.sections {
+        let section = source[source_range.clone()]
+            .lines()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let (section_meta, native_sql) = extract_meta_and_sql_with_name_binding(
+            &section,
+            meta_re,
+            MetadataNameBinding::LiteralDefinition,
+        )?;
+        steps.push(CaseSourceStep {
+            query_number,
+            source_range,
+            native_sql,
+            meta: merge_meta(&file_meta, &section_meta),
+        });
+    }
+    Ok(CaseSourceDefinition {
+        file_preface: frames.file_preface,
+        file_meta,
+        steps,
+    })
+}
+
 pub fn load_sql_case_from_file(
     sql_path: &Path,
     meta_re: &Regex,
@@ -1454,23 +1519,46 @@ fn load_sql_case_from_file_with_variables(
     case_variables: &HashMap<String, String>,
     name_binding: MetadataNameBinding,
 ) -> Result<Option<SqlCase>> {
+    let content = fs::read_to_string(sql_path)
+        .with_context(|| format!("read SQL case {}", sql_path.display()))?;
+    prepare_sql_case(
+        sql_path,
+        &content,
+        meta_re,
+        marker_re,
+        case_variables,
+        name_binding,
+    )
+}
+
+fn prepare_sql_case(
+    sql_path: &Path,
+    content: &str,
+    meta_re: &Regex,
+    marker_re: &Regex,
+    case_variables: &HashMap<String, String>,
+    name_binding: MetadataNameBinding,
+) -> Result<Option<SqlCase>> {
     let base_name = sql_path
         .file_stem()
         .and_then(|s| s.to_str())
         .ok_or_else(|| anyhow::anyhow!("invalid SQL file name: {}", sql_path.display()))?
         .to_string();
-    let content = fs::read_to_string(sql_path)
-        .with_context(|| format!("read SQL case {}", sql_path.display()))?;
-    let case_dbs = detect_case_dbs(&content, case_variables);
+    let case_dbs = detect_case_dbs(content, case_variables);
     let content = substitute_placeholders(
-        &content,
+        content,
         case_variables,
         &format!("{}: placeholder substitution", sql_path.display()),
     )?;
-    let namespace_rewrites = crate::fixture_context::namespace_mapping(&content, case_variables)?;
-    let content = crate::fixture_context::rewrite_namespaces(&content, case_variables)?;
     let catalogs = crate::catalog_symbol::CatalogSymbols::from_variables(case_variables)?;
-    let content = catalogs.rewrite_source(&content)?;
+    let (content, namespace_rewrites) = match name_binding {
+        MetadataNameBinding::LiteralDefinition => (content, Default::default()),
+        MetadataNameBinding::Bound => {
+            let (namespaced, mapping) =
+                crate::fixture_context::prepare_trino_namespaces(&content, case_variables)?;
+            (catalogs.rewrite_source(&namespaced)?, mapping)
+        }
+    };
 
     let lines: Vec<String> = content.lines().map(ToString::to_string).collect();
     let frames = frame_case_source(&content, marker_re)
@@ -1489,7 +1577,8 @@ fn load_sql_case_from_file_with_variables(
 
     let mut steps = Vec::new();
     for (query_number, range) in frames.sections {
-        let section: Vec<_> = content[range].lines().map(ToString::to_string).collect();
+        let prepared_section = &content[range.clone()];
+        let section: Vec<_> = prepared_section.lines().map(ToString::to_string).collect();
         let section_id = if query_number == 1 {
             base_name.as_str().to_string()
         } else {
@@ -1549,11 +1638,12 @@ fn load_sql_case_from_file_with_variables(
                 section_id
             )
         })?;
-        steps.push(SqlStep {
+        let step = SqlStep {
             query_number,
             sql,
             meta: merged_meta,
-        });
+        };
+        steps.push(step);
     }
 
     if steps.is_empty() {
@@ -1635,11 +1725,19 @@ pub fn load_suite_hook(
     if !path.exists() {
         return Ok(None);
     }
-
-    let content =
+    let source =
         fs::read_to_string(path).with_context(|| format!("read failed: {}", path.display()))?;
+    prepare_suite_hook(path, &source, meta_re, variables)
+}
+
+fn prepare_suite_hook(
+    path: &Path,
+    content: &str,
+    meta_re: &Regex,
+    variables: &HashMap<String, String>,
+) -> Result<Option<SuiteHook>> {
     let content = substitute_placeholders(
-        &content,
+        content,
         variables,
         &format!("{}: placeholder substitution", path.display()),
     )?;
@@ -1669,6 +1767,65 @@ pub fn load_suite_hook(
 mod opt5_directive_tests {
     use super::*;
     use regex::Regex;
+
+    #[test]
+    fn case_source_definition_keeps_original_ranges_and_native_metadata() {
+        let marker = Regex::new(r"(?i)^--\s*query\s+(\d+)(?:\s+.*)?$").unwrap();
+        let meta = Regex::new(r"^--\s*@([a-zA-Z0-9_]+)\s*=\s*(.+?)\s*$").unwrap();
+        let source = "-- café\r\n-- @order_sensitive=true\r\n-- query 1 local note\r\n-- @expect_trino_error=SYNTAX_ERROR,USER_ERROR\r\nSELECT @bad;  \r\n-- query 2\r\n-- metadata only\r\n-- query 3\nSELECT 1;\n";
+        let fields = extract_case_source_definition(source, &meta, &marker).unwrap();
+        assert_eq!(
+            &source[fields.file_preface],
+            "-- café\r\n-- @order_sensitive=true\r\n"
+        );
+        assert_eq!(fields.file_meta.order_sensitive, Some(true));
+        assert_eq!(fields.steps.len(), 3);
+        let first = &fields.steps[0];
+        assert_eq!(
+            &source[first.source_range.clone()],
+            "-- query 1 local note\r\n-- @expect_trino_error=SYNTAX_ERROR,USER_ERROR\r\nSELECT @bad;  \r\n"
+        );
+        assert_eq!(first.query_number, 1);
+        assert_eq!(first.native_sql, "SELECT @bad;");
+        assert_eq!(first.meta.order_sensitive, Some(true));
+        let expected = first.meta.expect_trino_error.as_ref().unwrap();
+        assert_eq!(expected.name, "SYNTAX_ERROR");
+        assert_eq!(expected.error_type, "USER_ERROR");
+        assert_eq!(fields.steps[1].native_sql, "");
+        assert!(fields.steps[1].meta.expect_trino_error.is_none());
+        assert_eq!(fields.steps[2].native_sql, "SELECT 1;");
+        assert_eq!(fields.steps[2].meta.order_sensitive, Some(true));
+        assert!(
+            extract_case_source_definition(
+                "-- query 1\nSELECT 1;\n-- query 3\nSELECT 2;",
+                &meta,
+                &marker
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn case_source_definition_does_not_prepare_names_or_execute_shells() {
+        let marker = Regex::new(r"(?i)^--\s*query\s+(\d+)(?:\s+.*)?$").unwrap();
+        let meta = Regex::new(r"^--\s*@([a-zA-Z0-9_]+)\s*=\s*(.+?)\s*$").unwrap();
+        let source = "-- query 1\nSELECT '${case_db}', default_catalog.${case_db}.t;\n-- query 2\nshell: echo '${case_db}'\n";
+        let fields = extract_case_source_definition(source, &meta, &marker).unwrap();
+        assert_eq!(
+            fields.steps[0].native_sql,
+            "SELECT '${case_db}', default_catalog.${case_db}.t;"
+        );
+        assert_eq!(fields.steps[1].native_sql, "shell: echo '${case_db}'");
+        assert_eq!(
+            &source[fields.steps[1].source_range.clone()],
+            "-- query 2\nshell: echo '${case_db}'\n"
+        );
+        let decorative = "-- query 14\nSELECT 1; SELECT 2;\n";
+        let fields = extract_case_source_definition(decorative, &meta, &marker).unwrap();
+        assert_eq!(fields.steps.len(), 1);
+        assert_eq!(fields.steps[0].query_number, 1);
+        assert_eq!(fields.steps[0].native_sql, "SELECT 1; SELECT 2;");
+    }
 
     #[test]
     fn native_source_frames_preserve_marked_byte_ranges_and_empty_steps() {
@@ -1743,7 +1900,7 @@ mod opt5_directive_tests {
     // Runner correctness belongs at the parser/returned HTTP outcome boundary;
     // these pure tests need no native cluster and run with the regular owner.
     #[test]
-    fn trino_error_expectation_requires_two_exact_fields_and_rejects_conflicts() {
+    fn trino_error_expectation_checks_protocol_fields_and_optional_ordinal() {
         let re = meta_re();
         let meta = parse_meta(
             &["-- @expect_trino_error= MISSING_COLUMN_NAME , USER_ERROR ".into()],
@@ -1755,6 +1912,7 @@ mod opt5_directive_tests {
             Some(TrinoErrorExpectation {
                 name: "MISSING_COLUMN_NAME".into(),
                 error_type: "USER_ERROR".into(),
+                statement_ordinal: None,
             })
         );
         for value in [
@@ -1763,6 +1921,8 @@ mod opt5_directive_tests {
             ",USER_ERROR",
             "MISSING_COLUMN_NAME,",
             "A,B,C",
+            "A,B,0",
+            "A,B,2,3",
         ] {
             assert!(
                 parse_meta(&[format!("-- @expect_trino_error={value}")], &re).is_err(),
@@ -1798,6 +1958,18 @@ mod opt5_directive_tests {
             );
         }
         assert!(meta.has_error_expectation());
+
+        let indexed = parse_meta(
+            &["-- @expect_trino_error=SYNTAX_ERROR,USER_ERROR,2".into()],
+            &re,
+        )
+        .unwrap();
+        validate_trino_error_expectation(&indexed, Some("USE fixture; SELECT idSELECT id"))
+            .unwrap();
+        for sql in ["SELECT 1", "USE fixture; SELECT idSELECT id; SELECT 3"] {
+            assert!(validate_trino_error_expectation(&indexed, Some(sql)).is_err());
+        }
+        assert!(validate_trino_error_expectation(&merge_meta(&legacy, &indexed), None).is_err());
     }
 
     #[test]
@@ -1901,7 +2073,7 @@ mod opt5_directive_tests {
                 table: "a_mv".into(),
             })
         );
-        for (raw, logical) in [("`a b`", "a b"), ("`a%20b`", "a%20b")] {
+        for (raw, logical) in [(r#""a b""#, "a b"), (r#""a%20b""#, "a%20b")] {
             let parsed =
                 parse_publication_catalog_fault_target(&format!("namespace=ns,table={raw}"))
                     .unwrap();
@@ -2013,7 +2185,7 @@ mod opt5_directive_tests {
     #[test]
     fn publication_fault_target_uses_the_real_case_namespace_rewrite_before_parsing() {
         let dir = tempfile::tempdir().unwrap();
-        let raw = "-- @sequential=true\n-- query 1\nCREATE DATABASE c.ns_${uuid0};\n-- query 2\n-- @publication_catalog_fault=table-load,corrupt-package\n-- @publication_catalog_fault_target=namespace=ns_${uuid0},table=a_mv\nSELECT 1;\n";
+        let raw = "-- @sequential=true\n-- query 1\nCREATE SCHEMA c.ns_${uuid0};\n-- query 2\n-- @publication_catalog_fault=table-load,corrupt-package\n-- @publication_catalog_fault_target=namespace=ns_${uuid0},table=a_mv\nSELECT 1;\n";
         let marker = Regex::new(r"^--\s*query\s+(\d+)\s*$").unwrap();
         let variables = crate::fixture_context::test_variables(&["left", "right"]);
         let mut targets = Vec::new();
@@ -3233,7 +3405,7 @@ mod opt5_directive_tests {
         let dir = tempfile::tempdir().unwrap();
         let json = r#"{"tables":[{"table_suffix":".${case_db}.build","rows":10,"confidence":"Exact","source":"IcebergManifest"}],"broadcast":{"distribution":"BROADCAST","join_kind":"INNER","verdict":"feasible","forced":false,"backends":3,"risk_multiplier":2,"per_node_budget_bytes":268435456,"cluster_network_budget_bytes":268435456},"payload":{"kind":"exact","bytes":80},"hash_table":{"kind":"exact","build_rows":10,"load_factor":0.75,"per_row_overhead_bytes":16}}"#;
         let raw = format!(
-            "-- @query_stats_contract={json}\nEXPLAIN COSTS SELECT * FROM ice.${{case_db}}.build;\n"
+            "-- @query_stats_contract={json}\nEXPLAIN WITH SESSION explain_detail='COSTS' SELECT * FROM ice.${{case_db}}.build;\n"
         );
         let marker = Regex::new(r"^--\s*query\s+(\d+)\s*$").unwrap();
         let variables = crate::fixture_context::test_variables(&["left", "right"]);
@@ -3303,7 +3475,7 @@ mod opt5_directive_tests {
             "expect_sql_code=sql.parse.unsupported_statement",
         ] {
             let raw = format!(
-                "-- @query_stats_contract={json}\n-- @{error}\nEXPLAIN COSTS SELECT missing_function();\n"
+                "-- @query_stats_contract={json}\n-- @{error}\nEXPLAIN WITH SESSION explain_detail='COSTS' SELECT missing_function();\n"
             );
             let failure = load_query_stats_test_case(&raw).unwrap_err();
             assert!(
@@ -3321,8 +3493,8 @@ mod opt5_directive_tests {
             "INSERT INTO forbidden VALUES (1)",
             "DROP TABLE forbidden",
             "SELECT 1",
-            "EXPLAIN VERBOSE SELECT 1",
-            "EXPLAIN LOGICAL SELECT 1",
+            "EXPLAIN WITH SESSION explain_detail='VERBOSE' SELECT 1",
+            "EXPLAIN (TYPE LOGICAL) SELECT 1",
         ] {
             let raw = format!("-- @query_stats_contract={json}\n{sql};\n");
             let failure = load_query_stats_test_case(&raw).unwrap_err();
@@ -3334,7 +3506,7 @@ mod opt5_directive_tests {
         // Markers keep both statements in one step: a valid first statement
         // cannot authorize the following side effect.
         let raw = format!(
-            "-- @query_stats_contract={json}\n-- query 1\nEXPLAIN COSTS SELECT 1;\nINSERT INTO forbidden VALUES (1);\n-- query 2\nEXPLAIN COSTS SELECT 2;\n"
+            "-- @query_stats_contract={json}\n-- query 1\nEXPLAIN WITH SESSION explain_detail='COSTS' SELECT 1;\nINSERT INTO forbidden VALUES (1);\n-- query 2\nEXPLAIN WITH SESSION explain_detail='COSTS' SELECT 2;\n"
         );
         assert!(load_query_stats_test_case(&raw).is_err());
     }
@@ -3344,14 +3516,14 @@ mod opt5_directive_tests {
         let json = query_stats_loader_json();
         for override_meta in [String::new(), format!("-- @query_stats_contract={json}\n")] {
             let raw = format!(
-                "-- @query_stats_contract={json}\n-- query 1\nEXPLAIN COSTS SELECT 1;\n-- query 2\n{override_meta}INSERT INTO forbidden VALUES (1);\n"
+                "-- @query_stats_contract={json}\n-- query 1\nEXPLAIN WITH SESSION explain_detail='COSTS' SELECT 1;\n-- query 2\n{override_meta}INSERT INTO forbidden VALUES (1);\n"
             );
             let failure = load_query_stats_test_case(&raw).unwrap_err();
             assert!(format!("{failure:#}").contains("contract-2"), "{failure:#}");
             assert!(format!("{failure:#}").contains("invalid @query_stats_contract SQL"));
         }
         let raw = format!(
-            "-- @query_stats_contract={json}\n-- query 1\nEXPLAIN COSTS SELECT 1;\n-- query 2\n-- @query_stats_contract={json}\n-- @skip_result_check=true\nEXPLAIN COSTS SELECT 2;\n"
+            "-- @query_stats_contract={json}\n-- query 1\nEXPLAIN WITH SESSION explain_detail='COSTS' SELECT 1;\n-- query 2\n-- @query_stats_contract={json}\n-- @skip_result_check=true\nEXPLAIN WITH SESSION explain_detail='COSTS' SELECT 2;\n"
         );
         let case = load_query_stats_test_case(&raw).unwrap();
         assert_eq!(case.steps.len(), 2);
@@ -3570,3 +3742,7 @@ mod opt5_directive_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "parser_corpus_tests.rs"]
+mod corpus_tests;

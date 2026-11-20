@@ -301,8 +301,8 @@ impl ServerProviderManifest {
             .collect()
     }
 
-    /// Compose each provider's property factory. Instance defaults are bound
-    /// from its exact admitted configuration.
+    /// Compose the FE registry from sealed provider factories and application owners.
+    /// Instance defaults come from the exact admitted provider configuration.
     pub fn compose_session_property_registry(
         &self,
     ) -> anyhow::Result<novarocks_query_application::sql::session::registry::SessionPropertyRegistry>
@@ -326,8 +326,21 @@ impl ServerProviderManifest {
                 factory
             })
             .collect();
-        SessionPropertyRegistry::with_catalog_factories(factories)
-            .context("compose sealed provider session property declarations")
+        let mut registry = SessionPropertyRegistry::with_catalog_factories(factories)
+            .context("compose sealed provider session property declarations")?;
+        if let Some(iceberg) = self
+            .builders
+            .iter()
+            .find(|builder| builder.provider_id.as_str() == "iceberg")
+        {
+            let declaration =
+                novarocks_mv_application::session_properties::incremental_refresh_enabled_declaration()
+                    .context("declare the MV refresh session property")?;
+            registry = registry
+                .with_catalog_application_declarations([(iceberg.provider_id.clone(), declaration)])
+                .context("compose MV session property declarations for Iceberg")?;
+        }
+        Ok(registry)
     }
 
     /// Composes the installed pure provider program catalogue.
@@ -507,6 +520,60 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn sealed_fe_catalog_registry_installs_the_mv_property_only_for_iceberg() {
+        use novarocks_mv_application::session_properties::INCREMENTAL_REFRESH_ENABLED;
+        use novarocks_query_application::sql::session::registry::{
+            CatalogPropertyIdentity, SessionPropertyError, SessionPropertyType,
+            SessionPropertyValue,
+        };
+        use novarocks_spi::connector::{
+            ConnectorControlRuntimeId, ConnectorInstanceId, ConnectorProviderBindingKey,
+            ProviderBindingEpoch,
+        };
+
+        let registry = ServerProviderManifest::seal()
+            .unwrap()
+            .compose_session_property_registry()
+            .unwrap();
+        let identity = |catalog, provider| {
+            let instance_id = ConnectorInstanceId::parse(catalog).unwrap();
+            CatalogPropertyIdentity {
+                attachment_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+                control_runtime_id: ConnectorControlRuntimeId::new(),
+                binding_key: ConnectorProviderBindingKey {
+                    instance_id: instance_id.clone(),
+                    incarnation: ProviderBindingEpoch::from_bytes([1; 16]),
+                },
+                instance_id,
+                provider_id: ConnectorProviderId::parse(provider).unwrap(),
+                generation: 1,
+            }
+        };
+        let iceberg = registry
+            .bind_catalog("lake", identity("lake", "iceberg"), &[])
+            .unwrap();
+        let property = iceberg.lookup(INCREMENTAL_REFRESH_ENABLED).unwrap();
+        assert_eq!(property.value_type(), SessionPropertyType::Boolean);
+        assert_eq!(
+            property.default_value(),
+            Some(&SessionPropertyValue::Boolean(true))
+        );
+        assert!(!property.hidden());
+        let header = iceberg
+            .prepare_header("lake", INCREMENTAL_REFRESH_ENABLED, "false")
+            .unwrap();
+        assert_eq!(header.value(), &SessionPropertyValue::Boolean(false));
+
+        let paimon = registry
+            .bind_catalog("other", identity("other", "paimon"), &[])
+            .unwrap();
+        assert!(matches!(
+            paimon.lookup(INCREMENTAL_REFRESH_ENABLED),
+            Err(SessionPropertyError::UnknownProperty { name }) if name == "other.incremental_refresh_enabled"
+        ));
+    }
 
     static CONTROL_BUILDS: AtomicUsize = AtomicUsize::new(0);
     static EXECUTION_BUILDS: AtomicUsize = AtomicUsize::new(0);
@@ -1002,7 +1069,8 @@ mod iceberg_session_properties_tests {
         CatalogPropertyIdentity, SessionPropertyRegistry, SessionPropertyValue,
     };
     use novarocks_spi::connector::{
-        ConnectorControlRuntimeId, ConnectorInstanceId, ConnectorProviderId,
+        ConnectorControlRuntimeId, ConnectorInstanceId, ConnectorProviderBindingKey,
+        ConnectorProviderId, ProviderBindingEpoch,
     };
 
     #[test]
@@ -1019,6 +1087,10 @@ mod iceberg_session_properties_tests {
                     attachment_id: Default::default(),
                     control_runtime_id: ConnectorControlRuntimeId::new(),
                     instance_id: ConnectorInstanceId::parse("lake").unwrap(),
+                    binding_key: ConnectorProviderBindingKey {
+                        instance_id: ConnectorInstanceId::parse("lake").unwrap(),
+                        incarnation: ProviderBindingEpoch::from_bytes([1; 16]),
+                    },
                     provider_id: provider,
                     generation: 1,
                 },

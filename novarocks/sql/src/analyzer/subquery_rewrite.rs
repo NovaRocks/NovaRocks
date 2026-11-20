@@ -30,7 +30,6 @@
 
 use arrow::datatypes::DataType;
 use novarocks_parser::ast;
-use novarocks_parser::printer;
 
 use crate::analysis::*;
 use crate::analysis::{AnalyzedOutputField as OutputColumn, AnalyzedProjectItem as ProjectItem};
@@ -93,7 +92,7 @@ fn is_null_expr(expr: TypedExpr, negated: bool) -> TypedExpr {
         value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
 
         kind: ExprKind::IsNull {
-            expr: Box::new(expr),
+            expr: novarocks_parser::ast::AstBox::new(expr),
             negated,
         },
     }
@@ -120,7 +119,7 @@ fn value_form_marker_query(
     ResolvedQuery {
         body: QueryBody::Select(ResolvedSelect {
             from: Some(Relation::Subquery {
-                query: Box::new(source),
+                query: novarocks_parser::ast::AstBox::new(source),
                 alias: source_alias,
                 output_columns: source_outputs,
             }),
@@ -132,15 +131,16 @@ fn value_form_marker_query(
                 expr: TypedExpr {
                     kind: ExprKind::AggregateCall {
                         name: "max".to_string(),
-                        args: vec![TypedExpr {
+                        args: (vec![TypedExpr {
                             kind: ExprKind::Literal(LiteralValue::Int(1)),
                             value_type: novarocks_type_contract::FunctionValueType::new(
                                 marker_dtype.clone(),
                                 false,
                             ),
-                        }],
+                        }])
+                        .into(),
                         distinct: false,
-                        order_by: vec![],
+                        order_by: (vec![]).into(),
                         resolved,
                     },
                     value_type: novarocks_type_contract::FunctionValueType::new(
@@ -154,8 +154,8 @@ fn value_form_marker_query(
             has_aggregation: true,
             distinct: false,
             repeat: None,
-            apply_specs: Vec::new(),
-            predicate_apply_specs: Vec::new(),
+            apply_specs: (Vec::new()).into(),
+            predicate_apply_specs: (Vec::new()).into(),
         }),
         order_by: Vec::new(),
         limit: None,
@@ -297,7 +297,7 @@ impl<'a> AnalyzerContext<'a> {
             return Err(AnalyzeError::unsupported_query_shape(
                 format!(
                     "subquery shape is not supported by Apply rewrite: {}",
-                    novarocks_parser::printer::print_query(&sq_info.subquery)
+                    crate::parser::query_for_diagnostic(&sq_info.subquery)
                 ),
                 sq_info.subquery.span,
             ));
@@ -405,7 +405,7 @@ impl<'a> AnalyzerContext<'a> {
             inner: resolved_sub,
             correlation_column_ids: corr_ids,
             need_check_max_rows: true,
-            subquery_text: printer::print_query(&sq_info.subquery),
+            subquery_text: crate::parser::query_for_diagnostic(&sq_info.subquery),
         });
         Ok(true)
     }
@@ -460,13 +460,8 @@ impl<'a> AnalyzerContext<'a> {
                     .in_expr
                     .as_ref()
                     .ok_or_else(|| AnalyzeError::internal("IN subquery missing LHS expression"))?;
-                if matches!(in_expr.as_ref(), ast::Expr::Tuple(_))
-                    || matches!(
-                        in_expr.as_ref(),
-                        ast::Expr::Nested(ast::NestedExpr { expression, .. })
-                            if matches!(expression.as_ref(), ast::Expr::Tuple(_))
-                    )
-                {
+                let positional_lhs = in_expr.as_ref();
+                if self.anonymous_row(positional_lhs)?.is_some() {
                     let SubqueryKind::InSubquery { negated } = &sq_info.kind else {
                         unreachable!("tuple LHS only exists for IN subqueries");
                     };
@@ -567,7 +562,7 @@ impl<'a> AnalyzerContext<'a> {
             correlation_column_ids: corr_ids,
             in_lhs,
             use_semi_anti: true,
-            subquery_text: printer::print_query(&sq_info.subquery),
+            subquery_text: crate::parser::query_for_diagnostic(&sq_info.subquery),
         });
         Ok(true)
     }
@@ -634,7 +629,7 @@ impl<'a> AnalyzerContext<'a> {
             true,
         );
         let relation = Relation::Subquery {
-            query: Box::new(marker_query),
+            query: novarocks_parser::ast::AstBox::new(marker_query),
             alias: relation_alias,
             output_columns: vec![OutputColumn {
                 field_name: Some(marker_col_name.clone()),
@@ -827,9 +822,9 @@ impl<'a> AnalyzerContext<'a> {
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
 
             kind: ExprKind::BinaryOp {
-                left: Box::new(lhs_typed.clone()),
+                left: novarocks_parser::ast::AstBox::new(lhs_typed.clone()),
                 op: BinOp::Eq,
-                right: Box::new(TypedExpr {
+                right: novarocks_parser::ast::AstBox::new(TypedExpr {
                     kind: ExprKind::ColumnRef {
                         column_id: sub_first_col.column_id,
                         qualifier: None,
@@ -848,9 +843,9 @@ impl<'a> AnalyzerContext<'a> {
                 ),
 
                 kind: ExprKind::BinaryOp {
-                    left: Box::new(eq_cond),
+                    left: novarocks_parser::ast::AstBox::new(eq_cond),
                     op: BinOp::And,
-                    right: Box::new(f),
+                    right: novarocks_parser::ast::AstBox::new(f),
                     decimal_overflow_policy:
                         novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 },
@@ -873,7 +868,7 @@ impl<'a> AnalyzerContext<'a> {
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
 
             kind: ExprKind::IsNull {
-                expr: Box::new(TypedExpr {
+                expr: novarocks_parser::ast::AstBox::new(TypedExpr {
                     kind: ExprKind::ColumnRef {
                         column_id: sub_first_col.column_id,
                         qualifier: None,
@@ -959,7 +954,7 @@ impl<'a> AnalyzerContext<'a> {
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
 
             kind: ExprKind::IsNull {
-                expr: Box::new(TypedExpr {
+                expr: novarocks_parser::ast::AstBox::new(TypedExpr {
                     kind: ExprKind::ColumnRef {
                         column_id: indicator.column_id,
                         qualifier: None,
@@ -1045,7 +1040,7 @@ impl<'a> AnalyzerContext<'a> {
         let scalar_output = modified_sub.output_columns[0].clone();
         let output_columns = modified_sub.output_columns.clone();
         let sub_rel = Relation::Subquery {
-            query: Box::new(modified_sub),
+            query: novarocks_parser::ast::AstBox::new(modified_sub),
             alias: sq_alias.clone(),
             output_columns,
         };
@@ -1146,7 +1141,7 @@ impl<'a> AnalyzerContext<'a> {
         });
         let output_columns = modified_sub.output_columns.clone();
         let sub_rel = Relation::Subquery {
-            query: Box::new(modified_sub),
+            query: novarocks_parser::ast::AstBox::new(modified_sub),
             alias: sq_alias.clone(),
             output_columns,
         };
@@ -1194,9 +1189,9 @@ impl<'a> AnalyzerContext<'a> {
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
 
             kind: ExprKind::BinaryOp {
-                left: Box::new(lhs_typed.clone()),
+                left: novarocks_parser::ast::AstBox::new(lhs_typed.clone()),
                 op: BinOp::Eq,
-                right: Box::new(TypedExpr {
+                right: novarocks_parser::ast::AstBox::new(TypedExpr {
                     kind: ExprKind::ColumnRef {
                         column_id: sub_col.column_id,
                         qualifier: Some(sq_alias.clone()),
@@ -1246,9 +1241,12 @@ impl<'a> AnalyzerContext<'a> {
                     ),
 
                     kind: ExprKind::BinaryOp {
-                        left: Box::new(is_null_expr(lhs_typed.clone(), false)),
+                        left: novarocks_parser::ast::AstBox::new(is_null_expr(
+                            lhs_typed.clone(),
+                            false,
+                        )),
                         op: BinOp::And,
-                        right: Box::new(any_exists),
+                        right: novarocks_parser::ast::AstBox::new(any_exists),
                         decimal_overflow_policy:
                             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     },
@@ -1268,8 +1266,8 @@ impl<'a> AnalyzerContext<'a> {
 
             kind: ExprKind::Case {
                 operand: None,
-                when_then,
-                else_expr: Some(Box::new(bool_literal(negated))),
+                when_then: (when_then).into(),
+                else_expr: Some(novarocks_parser::ast::AstBox::new(bool_literal(negated))),
             },
         };
         if let Some(cond) = join.condition.as_ref() {
@@ -1328,7 +1326,7 @@ impl<'a> AnalyzerContext<'a> {
         modified_sub.limit = Some(1);
         let output_columns = modified_sub.output_columns.clone();
         let sub_rel = Relation::Subquery {
-            query: Box::new(modified_sub),
+            query: novarocks_parser::ast::AstBox::new(modified_sub),
             alias: sq_alias.clone(),
             output_columns,
         };
@@ -1341,7 +1339,7 @@ impl<'a> AnalyzerContext<'a> {
         );
 
         let placeholder = std::mem::replace(&mut join.left, dummy_relation());
-        join.left = Relation::Join(Box::new(JoinRelation {
+        join.left = Relation::Join(novarocks_parser::ast::AstBox::new(JoinRelation {
             naa_author: None,
             left: placeholder,
             right: sub_rel,
@@ -1359,7 +1357,7 @@ impl<'a> AnalyzerContext<'a> {
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
 
             kind: ExprKind::IsNull {
-                expr: Box::new(TypedExpr {
+                expr: novarocks_parser::ast::AstBox::new(TypedExpr {
                     kind: ExprKind::ColumnRef {
                         column_id: exists_col_id,
                         qualifier: Some(sq_alias),
@@ -1399,7 +1397,7 @@ impl<'a> AnalyzerContext<'a> {
         let scalar_col = resolved_sub.output_columns[0].clone();
         let output_columns = resolved_sub.output_columns.clone();
         let sub_rel = Relation::Subquery {
-            query: Box::new(resolved_sub),
+            query: novarocks_parser::ast::AstBox::new(resolved_sub),
             alias: sq_alias.clone(),
             output_columns,
         };
@@ -1411,7 +1409,7 @@ impl<'a> AnalyzerContext<'a> {
         );
 
         let placeholder = std::mem::replace(&mut join.left, dummy_relation());
-        join.left = Relation::Join(Box::new(JoinRelation {
+        join.left = Relation::Join(novarocks_parser::ast::AstBox::new(JoinRelation {
             naa_author: None,
             left: placeholder,
             right: sub_rel,
@@ -1622,7 +1620,8 @@ impl<'a> AnalyzerContext<'a> {
                                 .expect("valid value root nullability transform"),
 
                             kind: ExprKind::Cast {
-                                expr: Box::new(outer_expr),
+                                array_failure_mode: None,
+                                expr: novarocks_parser::ast::AstBox::new(outer_expr),
                                 target: pred.inner_col.value_type.data_type().clone(),
                                 decimal_overflow_policy:
                                     novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
@@ -1633,9 +1632,12 @@ impl<'a> AnalyzerContext<'a> {
                         value_type: pred.full_expr.value_type.clone(),
 
                         kind: ExprKind::BinaryOp {
-                            left: Box::new(outer_expr),
+                            left: novarocks_parser::ast::AstBox::new(outer_expr),
                             op: pred.op,
-                            right: Box::new(maybe_unqualify_col(&pred.inner_col, same_bare_name)),
+                            right: novarocks_parser::ast::AstBox::new(maybe_unqualify_col(
+                                &pred.inner_col,
+                                same_bare_name,
+                            )),
                             decimal_overflow_policy:
                                 novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                         },
@@ -1652,9 +1654,9 @@ impl<'a> AnalyzerContext<'a> {
                             ),
 
                             kind: ExprKind::BinaryOp {
-                                left: Box::new(c),
+                                left: novarocks_parser::ast::AstBox::new(c),
                                 op: BinOp::And,
-                                right: Box::new(build_corr_cond(pred)),
+                                right: novarocks_parser::ast::AstBox::new(build_corr_cond(pred)),
                                 decimal_overflow_policy:
                                     novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                             },
@@ -1674,9 +1676,9 @@ impl<'a> AnalyzerContext<'a> {
                         ),
 
                         kind: ExprKind::BinaryOp {
-                            left: Box::new(corr_cond),
+                            left: novarocks_parser::ast::AstBox::new(corr_cond),
                             op: BinOp::And,
-                            right: Box::new(rem),
+                            right: novarocks_parser::ast::AstBox::new(rem),
                             decimal_overflow_policy:
                                 novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                         },
@@ -1690,13 +1692,15 @@ impl<'a> AnalyzerContext<'a> {
 
         let current_from = take_from_or_synthesize_single_row(&mut select.from, scope);
 
-        select.from = Some(Relation::Join(Box::new(JoinRelation {
-            naa_author: None,
-            left: current_from,
-            right: sub_rel,
-            join_type,
-            condition: join_condition,
-        })));
+        select.from = Some(Relation::Join(novarocks_parser::ast::AstBox::new(
+            JoinRelation {
+                naa_author: None,
+                left: current_from,
+                right: sub_rel,
+                join_type,
+                condition: join_condition,
+            },
+        )));
 
         Self::remove_placeholder_from_filter(&mut select.filter, sq_info.id);
         Self::remove_placeholder_from_filter(&mut select.having, sq_info.id);
@@ -1748,7 +1752,7 @@ impl<'a> AnalyzerContext<'a> {
         resolved_sub.limit = Some(1);
 
         let sub_rel = Relation::Subquery {
-            query: Box::new(resolved_sub),
+            query: novarocks_parser::ast::AstBox::new(resolved_sub),
             alias: sq_alias.clone(),
             output_columns: vec![OutputColumn {
                 field_name: Some(match_col.clone()),
@@ -1767,25 +1771,27 @@ impl<'a> AnalyzerContext<'a> {
             novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         );
         let current_from = take_from_or_synthesize_single_row(&mut select.from, scope);
-        select.from = Some(Relation::Join(Box::new(JoinRelation {
-            naa_author: None,
-            left: current_from,
-            right: sub_rel,
-            join_type: JoinKind::LeftOuter,
-            condition: Some(TypedExpr {
-                kind: ExprKind::Literal(LiteralValue::Bool(true)),
-                value_type: novarocks_type_contract::FunctionValueType::new(
-                    DataType::Boolean,
-                    false,
-                ),
-            }),
-        })));
+        select.from = Some(Relation::Join(novarocks_parser::ast::AstBox::new(
+            JoinRelation {
+                naa_author: None,
+                left: current_from,
+                right: sub_rel,
+                join_type: JoinKind::LeftOuter,
+                condition: Some(TypedExpr {
+                    kind: ExprKind::Literal(LiteralValue::Bool(true)),
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Boolean,
+                        false,
+                    ),
+                }),
+            },
+        )));
 
         let replacement = TypedExpr {
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
 
             kind: ExprKind::IsNull {
-                expr: Box::new(TypedExpr {
+                expr: novarocks_parser::ast::AstBox::new(TypedExpr {
                     kind: ExprKind::ColumnRef {
                         column_id: exists_col_id,
                         qualifier: Some(sq_alias),
@@ -1823,18 +1829,13 @@ impl<'a> AnalyzerContext<'a> {
         })?;
 
         // Multi-column LHS: `(a, b) IN (SELECT c, d FROM ...)`. The typed AST
-        // retains the LHS as `Expr::Tuple` (possibly wrapped in
+        // retains the LHS as an anonymous `Expr::Row` (possibly wrapped in
         // `Expr::Nested`). Analyze each component separately and pair
         // them with the subquery's output columns one-to-one.
-        let lhs_items_ast: Vec<&ast::Expr> = match in_expr_ast.as_ref() {
-            ast::Expr::Tuple(ast::TupleExpr { expressions, .. }) => expressions.iter().collect(),
-            ast::Expr::Nested(ast::NestedExpr { expression, .. }) => match expression.as_ref() {
-                ast::Expr::Tuple(ast::TupleExpr { expressions, .. }) => {
-                    expressions.iter().collect()
-                }
-                other => vec![other],
-            },
-            other => vec![other],
+        let positional_lhs = in_expr_ast.as_ref();
+        let lhs_items_ast: Vec<&ast::Expr> = match self.anonymous_row(positional_lhs)? {
+            Some(row) => row.fields.iter().map(|field| &field.expression).collect(),
+            None => vec![positional_lhs],
         };
         let lhs_typed_list: Vec<TypedExpr> = lhs_items_ast
             .iter()
@@ -1949,7 +1950,7 @@ impl<'a> AnalyzerContext<'a> {
                 replacement = TypedExpr {
                     kind: ExprKind::UnaryOp {
                         op: UnOp::Not,
-                        expr: Box::new(replacement),
+                        expr: novarocks_parser::ast::AstBox::new(replacement),
                     },
                     value_type: ty,
                 };
@@ -2001,7 +2002,7 @@ impl<'a> AnalyzerContext<'a> {
                 inner: resolved_sub,
                 correlation_column_ids: Vec::new(),
                 need_check_max_rows: false,
-                subquery_text: printer::print_query(&sq_info.subquery),
+                subquery_text: crate::parser::query_for_diagnostic(&sq_info.subquery),
             });
             return Ok(());
         }
@@ -2144,9 +2145,9 @@ impl<'a> AnalyzerContext<'a> {
                 ),
 
                 kind: ExprKind::BinaryOp {
-                    left: Box::new(lhs_i.clone()),
+                    left: novarocks_parser::ast::AstBox::new(lhs_i.clone()),
                     op: BinOp::Eq,
-                    right: Box::new(rhs_ref),
+                    right: novarocks_parser::ast::AstBox::new(rhs_ref),
                     decimal_overflow_policy:
                         novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 },
@@ -2166,9 +2167,9 @@ impl<'a> AnalyzerContext<'a> {
                     ),
 
                     kind: ExprKind::BinaryOp {
-                        left: Box::new(acc),
+                        left: novarocks_parser::ast::AstBox::new(acc),
                         op: BinOp::And,
-                        right: Box::new(next),
+                        right: novarocks_parser::ast::AstBox::new(next),
                         decimal_overflow_policy:
                             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     },
@@ -2271,12 +2272,12 @@ impl<'a> AnalyzerContext<'a> {
 
             let output_columns = modified_sub.output_columns.clone();
             let sub_rel = Relation::Subquery {
-                query: Box::new(modified_sub),
+                query: novarocks_parser::ast::AstBox::new(modified_sub),
                 alias: sq_alias.clone(),
                 output_columns,
             };
 
-            let match_join = Relation::Join(Box::new(JoinRelation {
+            let match_join = Relation::Join(novarocks_parser::ast::AstBox::new(JoinRelation {
                 naa_author: None,
                 left: current_from,
                 right: sub_rel,
@@ -2285,7 +2286,7 @@ impl<'a> AnalyzerContext<'a> {
             }));
             let (joined_from, null_exists) = match null_marker {
                 Some((null_rel, null_exists)) => (
-                    Relation::Join(Box::new(JoinRelation {
+                    Relation::Join(novarocks_parser::ast::AstBox::new(JoinRelation {
                         naa_author: None,
                         left: match_join,
                         right: null_rel,
@@ -2298,7 +2299,7 @@ impl<'a> AnalyzerContext<'a> {
             };
             let (joined_from, nonempty_exists) = match nonempty_marker {
                 Some((any_rel, any_exists)) => (
-                    Relation::Join(Box::new(JoinRelation {
+                    Relation::Join(novarocks_parser::ast::AstBox::new(JoinRelation {
                         naa_author: None,
                         left: joined_from,
                         right: any_rel,
@@ -2336,9 +2337,12 @@ impl<'a> AnalyzerContext<'a> {
                         ),
 
                         kind: ExprKind::BinaryOp {
-                            left: Box::new(is_null_expr(lhs_typed.clone(), false)),
+                            left: novarocks_parser::ast::AstBox::new(is_null_expr(
+                                lhs_typed.clone(),
+                                false,
+                            )),
                             op: BinOp::And,
-                            right: Box::new(any_exists),
+                            right: novarocks_parser::ast::AstBox::new(any_exists),
                             decimal_overflow_policy:
                                 novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                         },
@@ -2358,8 +2362,8 @@ impl<'a> AnalyzerContext<'a> {
 
                 kind: ExprKind::Case {
                     operand: None,
-                    when_then,
-                    else_expr: Some(Box::new(bool_literal(negated))),
+                    when_then: (when_then).into(),
+                    else_expr: Some(novarocks_parser::ast::AstBox::new(bool_literal(negated))),
                 },
             };
             Self::replace_placeholder_in_filter(&mut select.filter, sq_info.id, &replacement);
@@ -2391,22 +2395,24 @@ impl<'a> AnalyzerContext<'a> {
 
             let output_columns = resolved_sub.output_columns.clone();
             let sub_rel = Relation::Subquery {
-                query: Box::new(resolved_sub),
+                query: novarocks_parser::ast::AstBox::new(resolved_sub),
                 alias: sq_alias.clone(),
                 output_columns,
             };
-            select.from = Some(Relation::Join(Box::new(JoinRelation {
-                naa_author: (join_type == JoinKind::NullAwareLeftAnti).then(|| {
-                    crate::common::naa::NaaAuthorFacts {
-                        comparison: eq_cond.clone(),
-                        eligibility: None,
-                    }
-                }),
-                left: current_from,
-                right: sub_rel,
-                join_type,
-                condition: Some(eq_cond),
-            })));
+            select.from = Some(Relation::Join(novarocks_parser::ast::AstBox::new(
+                JoinRelation {
+                    naa_author: (join_type == JoinKind::NullAwareLeftAnti).then(|| {
+                        crate::common::naa::NaaAuthorFacts {
+                            comparison: eq_cond.clone(),
+                            eligibility: None,
+                        }
+                    }),
+                    left: current_from,
+                    right: sub_rel,
+                    join_type,
+                    condition: Some(eq_cond),
+                },
+            )));
             Self::remove_placeholder_from_filter(&mut select.filter, sq_info.id);
             Self::remove_placeholder_from_filter(&mut select.having, sq_info.id);
         }
@@ -2519,9 +2525,9 @@ impl<'a> AnalyzerContext<'a> {
         };
         let comparison = TypedExpr {
             kind: ExprKind::BinaryOp {
-                left: Box::new(probe),
+                left: novarocks_parser::ast::AstBox::new(probe),
                 op: BinOp::Eq,
-                right: Box::new(item),
+                right: novarocks_parser::ast::AstBox::new(item),
                 decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
@@ -2529,7 +2535,7 @@ impl<'a> AnalyzerContext<'a> {
         let lambda = TypedExpr {
             kind: ExprKind::LambdaFunction {
                 params: vec![probe_param, param],
-                body: Box::new(comparison),
+                body: novarocks_parser::ast::AstBox::new(comparison),
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         };
@@ -2585,7 +2591,7 @@ impl<'a> AnalyzerContext<'a> {
             replacement = TypedExpr {
                 kind: ExprKind::UnaryOp {
                     op: UnOp::Not,
-                    expr: Box::new(replacement),
+                    expr: novarocks_parser::ast::AstBox::new(replacement),
                 },
                 value_type: novarocks_type_contract::FunctionValueType::new(
                     DataType::Boolean,
@@ -2603,7 +2609,7 @@ impl<'a> AnalyzerContext<'a> {
         let query = ResolvedQuery {
             body: QueryBody::Select(ResolvedSelect {
                 from: Some(Relation::Subquery {
-                    query: Box::new(source),
+                    query: novarocks_parser::ast::AstBox::new(source),
                     alias: format!("__sq_values_src_{sq_id}"),
                     output_columns: source_outputs,
                 }),
@@ -2615,9 +2621,9 @@ impl<'a> AnalyzerContext<'a> {
                     expr: TypedExpr {
                         kind: ExprKind::AggregateCall {
                             name: "array_agg".to_string(),
-                            args: vec![argument],
+                            args: (vec![argument]).into(),
                             distinct: false,
-                            order_by: vec![],
+                            order_by: (vec![]).into(),
                             resolved,
                         },
                         value_type: result,
@@ -2628,8 +2634,8 @@ impl<'a> AnalyzerContext<'a> {
                 has_aggregation: true,
                 distinct: false,
                 repeat: None,
-                apply_specs: vec![],
-                predicate_apply_specs: vec![],
+                apply_specs: (vec![]).into(),
+                predicate_apply_specs: (vec![]).into(),
             }),
             order_by: vec![],
             limit: None,
@@ -2714,9 +2720,9 @@ impl<'a> AnalyzerContext<'a> {
                 ),
 
                 kind: ExprKind::BinaryOp {
-                    left: Box::new(left),
+                    left: novarocks_parser::ast::AstBox::new(left),
                     op: BinOp::Eq,
-                    right: Box::new(right.expr),
+                    right: novarocks_parser::ast::AstBox::new(right.expr),
                     decimal_overflow_policy:
                         novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 },
@@ -2735,9 +2741,9 @@ impl<'a> AnalyzerContext<'a> {
                     nullable,
                 ),
                 kind: ExprKind::BinaryOp {
-                    left: Box::new(key_cond),
+                    left: novarocks_parser::ast::AstBox::new(key_cond),
                     op: BinOp::And,
-                    right: Box::new(right),
+                    right: novarocks_parser::ast::AstBox::new(right),
                     decimal_overflow_policy:
                         novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 },
@@ -2776,7 +2782,7 @@ impl<'a> AnalyzerContext<'a> {
                             volatility: crate::functions::builtin_function_volatility("coalesce"),
                             name: "coalesce".to_string(),
                             binding,
-                            args,
+                            args: (args).into(),
                             distinct: false,
                         },
                     })
@@ -2800,9 +2806,9 @@ impl<'a> AnalyzerContext<'a> {
                     ),
 
                     kind: ExprKind::BinaryOp {
-                        left: Box::new(key_cond),
+                        left: novarocks_parser::ast::AstBox::new(key_cond),
                         op: BinOp::And,
-                        right: Box::new(f),
+                        right: novarocks_parser::ast::AstBox::new(f),
                         decimal_overflow_policy:
                             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     },
@@ -2822,13 +2828,15 @@ impl<'a> AnalyzerContext<'a> {
         };
 
         let current_from = take_from_or_synthesize_single_row(&mut select.from, scope);
-        select.from = Some(Relation::Join(Box::new(JoinRelation {
-            naa_author,
-            left: current_from,
-            right: sub_rel,
-            join_type,
-            condition: join_cond,
-        })));
+        select.from = Some(Relation::Join(novarocks_parser::ast::AstBox::new(
+            JoinRelation {
+                naa_author,
+                left: current_from,
+                right: sub_rel,
+                join_type,
+                condition: join_cond,
+            },
+        )));
 
         Self::remove_placeholder_from_filter(&mut select.filter, sq_id);
         Self::remove_placeholder_from_filter(&mut select.having, sq_id);
@@ -2910,7 +2918,7 @@ impl<'a> AnalyzerContext<'a> {
 
             let output_columns = modified_sub.output_columns.clone();
             let sub_rel = Relation::Subquery {
-                query: Box::new(modified_sub),
+                query: novarocks_parser::ast::AstBox::new(modified_sub),
                 alias: sq_alias.clone(),
                 output_columns,
             };
@@ -2927,13 +2935,15 @@ impl<'a> AnalyzerContext<'a> {
 
             let current_from = take_from_or_synthesize_single_row(&mut select.from, scope);
 
-            select.from = Some(Relation::Join(Box::new(JoinRelation {
-                naa_author: None,
-                left: current_from,
-                right: sub_rel,
-                join_type: JoinKind::LeftOuter,
-                condition: corr_join_conds,
-            })));
+            select.from = Some(Relation::Join(novarocks_parser::ast::AstBox::new(
+                JoinRelation {
+                    naa_author: None,
+                    left: current_from,
+                    right: sub_rel,
+                    join_type: JoinKind::LeftOuter,
+                    condition: corr_join_conds,
+                },
+            )));
 
             // Use qualified column ref so that multiple scalar subqueries
             // producing columns with the same name resolve to distinct bindings.
@@ -2959,7 +2969,7 @@ impl<'a> AnalyzerContext<'a> {
             let scalar_col = resolved_sub.output_columns[0].clone();
             let output_columns = resolved_sub.output_columns.clone();
             let sub_rel = Relation::Subquery {
-                query: Box::new(resolved_sub),
+                query: novarocks_parser::ast::AstBox::new(resolved_sub),
                 alias: sq_alias.clone(),
                 output_columns,
             };
@@ -2973,13 +2983,15 @@ impl<'a> AnalyzerContext<'a> {
 
             let current_from = take_from_or_synthesize_single_row(&mut select.from, scope);
 
-            select.from = Some(Relation::Join(Box::new(JoinRelation {
-                naa_author: None,
-                left: current_from,
-                right: sub_rel,
-                join_type: JoinKind::Cross,
-                condition: None,
-            })));
+            select.from = Some(Relation::Join(novarocks_parser::ast::AstBox::new(
+                JoinRelation {
+                    naa_author: None,
+                    left: current_from,
+                    right: sub_rel,
+                    join_type: JoinKind::Cross,
+                    condition: None,
+                },
+            )));
 
             // Use qualified column ref so that multiple scalar subqueries
             // producing columns with the same name resolve to distinct bindings.
@@ -3014,6 +3026,7 @@ impl<'a> AnalyzerContext<'a> {
         outer_scope: &AnalyzerScope,
     ) -> Result<(ResolvedQuery, AnalyzerScope), AnalyzeError> {
         let child_ctx = AnalyzerContext {
+            purpose: self.purpose,
             grouping_scope: std::cell::RefCell::new(None),
             materialized_values: self.materialized_values,
             control: self.control,
@@ -3062,10 +3075,7 @@ impl<'a> AnalyzerContext<'a> {
         query: &ast::Query,
         outer_scope: &AnalyzerScope,
     ) -> Result<(ResolvedQuery, AnalyzerScope), AnalyzeError> {
-        let settings = crate::sql_mode::query_sql_semantics(&self.sql_semantics, query)?;
-        self.with_sql_semantics_scope(settings, |ctx| {
-            ctx.analyze_query_with_outer_scope_in_semantic_scope(query, outer_scope)
-        })
+        self.analyze_query_with_outer_scope_in_semantic_scope(query, outer_scope)
     }
 
     fn analyze_query_with_outer_scope_in_semantic_scope(
@@ -3073,6 +3083,7 @@ impl<'a> AnalyzerContext<'a> {
         query: &ast::Query,
         outer_scope: &AnalyzerScope,
     ) -> Result<(ResolvedQuery, AnalyzerScope), AnalyzeError> {
+        let modifiers = super::helpers::query_modifiers(query)?;
         let (maybe_child_ctx, local_cte_ids) = if let Some(ref with_clause) = query.with {
             let (child_ctx, local_cte_ids) = self.build_with_clause_context(with_clause)?;
             (Some(child_ctx), local_cte_ids)
@@ -3092,12 +3103,18 @@ impl<'a> AnalyzerContext<'a> {
                     ctx.analyze_select_with_outer_scope(s, outer_scope)?;
                 let body = QueryBody::Select(sel);
 
-                let order_by = ctx.analyze_order_by(query, &cols, &body)?;
+                let order_by = ctx.analyze_order_by(
+                    modifiers.order_by.as_ref(),
+                    select,
+                    query.span,
+                    &cols,
+                    &body,
+                )?;
                 if let QueryBody::Select(select) = &body {
                     ctx.validate_grouping_calls(&select.group_by)?;
                 }
-                let limit = super::helpers::extract_limit(query)?;
-                let offset = super::helpers::extract_offset(query)?;
+                let limit = super::helpers::extract_limit(modifiers)?;
+                let offset = super::helpers::extract_offset(modifiers)?;
 
                 Ok((
                     ResolvedQuery {
@@ -3113,9 +3130,15 @@ impl<'a> AnalyzerContext<'a> {
             }
             _ => {
                 let (body, cols) = ctx.analyze_set_expr(body)?;
-                let order_by = ctx.analyze_order_by(query, &cols, &body)?;
-                let limit = super::helpers::extract_limit(query)?;
-                let offset = super::helpers::extract_offset(query)?;
+                let order_by = ctx.analyze_order_by(
+                    modifiers.order_by.as_ref(),
+                    select,
+                    query.span,
+                    &cols,
+                    &body,
+                )?;
+                let limit = super::helpers::extract_limit(modifiers)?;
+                let offset = super::helpers::extract_offset(modifiers)?;
 
                 Ok((
                     ResolvedQuery {
@@ -3145,10 +3168,7 @@ impl<'a> AnalyzerContext<'a> {
         select: &ast::Select,
         outer_scope: &AnalyzerScope,
     ) -> Result<(ResolvedSelect, Vec<OutputColumn>, AnalyzerScope), AnalyzeError> {
-        let settings = crate::sql_mode::select_sql_semantics(&self.sql_semantics, select)?;
-        self.with_sql_semantics_scope(settings, |ctx| {
-            ctx.analyze_select_with_outer_scope_in_semantic_scope(select, outer_scope)
-        })
+        self.analyze_select_with_outer_scope_in_semantic_scope(select, outer_scope)
     }
 
     fn analyze_select_with_outer_scope_in_semantic_scope(
@@ -3157,33 +3177,11 @@ impl<'a> AnalyzerContext<'a> {
         outer_scope: &AnalyzerScope,
     ) -> Result<(ResolvedSelect, Vec<OutputColumn>, AnalyzerScope), AnalyzeError> {
         // --- FROM clause ---
-        let (from, inner_scope) = if select.from.is_empty() {
-            (None, self.new_scope())
-        } else if select.from.len() == 1 {
-            let (rel, scope) = self.analyze_from(&select.from[0])?;
-            (Some(rel), scope)
+        let (from, inner_scope) = if let Some(relation) = &select.from {
+            let (relation, scope) = self.analyze_from(relation)?;
+            (Some(relation), scope)
         } else {
-            let mut iter = select.from.iter();
-            let first = iter.next().unwrap();
-            let (mut current_rel, mut current_scope) = self.analyze_from(first)?;
-            for twj in iter {
-                self.check_control()?;
-                // Comma-separated FROM entries are implicit CROSS JOINs.
-                // Expose the accumulated left-hand scope so that table-valued
-                // functions like `unnest(...)` can reference earlier sibling
-                // columns (StarRocks implicit-lateral semantics).
-                let (right_rel, right_scope) =
-                    self.analyze_from_with_outer(twj, Some(&current_scope))?;
-                current_scope.merge(&right_scope);
-                current_rel = Relation::Join(Box::new(JoinRelation {
-                    naa_author: None,
-                    left: current_rel,
-                    right: right_rel,
-                    join_type: JoinKind::Cross,
-                    condition: None,
-                }));
-            }
-            (Some(current_rel), current_scope)
+            (None, self.new_scope())
         };
 
         // Merged scope: inner tables first (higher priority), then outer scope lookup.
@@ -3224,20 +3222,18 @@ impl<'a> AnalyzerContext<'a> {
             state.enabled.set(false);
         }
         // --- GROUP BY ---
-        let group_by_exprs = match &select.group_by {
-            ast::GroupBy::None => Vec::new(),
-            ast::GroupBy::Expressions { expressions, .. } => expressions.clone(),
-            ast::GroupBy::Rollup { span, .. }
-            | ast::GroupBy::Cube { span, .. }
-            | ast::GroupBy::GroupingSets { span, .. } => {
-                return Err(AnalyzeError::unsupported_query_shape(
+        let group_by_exprs =
+            super::simple_group_by_expressions(&select.group_by).ok_or_else(|| {
+                AnalyzeError::unsupported_query_shape(
                     "GROUP BY ALL is not supported",
-                    *span,
-                ));
-            }
-        };
+                    select
+                        .group_by
+                        .as_ref()
+                        .map_or(select.span, |group| group.span),
+                )
+            })?;
         let mut group_by = Vec::with_capacity(group_by_exprs.len());
-        for gb_expr in &group_by_exprs {
+        for gb_expr in group_by_exprs {
             self.check_control()?;
             match self.analyze_expr(gb_expr, &merged_scope) {
                 Ok(typed) => group_by.push(qualify_inner_shadowing_column_refs(
@@ -3310,7 +3306,7 @@ impl<'a> AnalyzerContext<'a> {
 
         self.validate_grouping_calls(&group_by)?;
 
-        let distinct = matches!(select.quantifier, ast::SelectQuantifier::Distinct { .. });
+        let distinct = select.distinct;
 
         let mut resolved_select = ResolvedSelect {
             from,
@@ -3321,8 +3317,8 @@ impl<'a> AnalyzerContext<'a> {
             has_aggregation,
             distinct,
             repeat: None,
-            apply_specs: Vec::new(),
-            predicate_apply_specs: Vec::new(),
+            apply_specs: (Vec::new()).into(),
+            predicate_apply_specs: (Vec::new()).into(),
         };
 
         // Rewrite nested subqueries within this SELECT if any were collected
@@ -3394,9 +3390,9 @@ impl<'a> AnalyzerContext<'a> {
                 ),
 
                 kind: ExprKind::BinaryOp {
-                    left: Box::new(outer_col.clone()),
+                    left: novarocks_parser::ast::AstBox::new(outer_col.clone()),
                     op: pred.op,
-                    right: Box::new(TypedExpr {
+                    right: novarocks_parser::ast::AstBox::new(TypedExpr {
                         kind: ExprKind::ColumnRef {
                             column_id: corr_col_id,
                             qualifier: None,
@@ -3551,7 +3547,8 @@ pub(crate) fn coerce_where_to_bool(expr: TypedExpr) -> TypedExpr {
             ),
 
             kind: ExprKind::Cast {
-                expr: Box::new(expr),
+                array_failure_mode: None,
+                expr: novarocks_parser::ast::AstBox::new(expr),
                 target: DataType::Boolean,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
@@ -3565,9 +3562,9 @@ pub(crate) fn coerce_where_to_bool(expr: TypedExpr) -> TypedExpr {
         value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, nullable),
 
         kind: ExprKind::BinaryOp {
-            left: Box::new(expr),
+            left: novarocks_parser::ast::AstBox::new(expr),
             op: BinOp::Ne,
-            right: Box::new(zero),
+            right: novarocks_parser::ast::AstBox::new(zero),
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         },
     }
@@ -3609,14 +3606,14 @@ fn qualify_inner_shadowing_column_refs(
             value_type: expr.value_type,
 
             kind: ExprKind::BinaryOp {
-                left: Box::new(qualify_inner_shadowing_column_refs(
-                    *left,
+                left: novarocks_parser::ast::AstBox::new(qualify_inner_shadowing_column_refs(
+                    left.into_inner(),
                     inner_scope,
                     outer_scope,
                 )),
                 op,
-                right: Box::new(qualify_inner_shadowing_column_refs(
-                    *right,
+                right: novarocks_parser::ast::AstBox::new(qualify_inner_shadowing_column_refs(
+                    right.into_inner(),
                     inner_scope,
                     outer_scope,
                 )),
@@ -3628,8 +3625,8 @@ fn qualify_inner_shadowing_column_refs(
 
             kind: ExprKind::UnaryOp {
                 op,
-                expr: Box::new(qualify_inner_shadowing_column_refs(
-                    *inner,
+                expr: novarocks_parser::ast::AstBox::new(qualify_inner_shadowing_column_refs(
+                    inner.into_inner(),
                     inner_scope,
                     outer_scope,
                 )),
@@ -3660,8 +3657,8 @@ fn qualify_inner_shadowing_column_refs(
 
             kind: ExprKind::LambdaFunction {
                 params,
-                body: Box::new(qualify_inner_shadowing_column_refs(
-                    *body,
+                body: novarocks_parser::ast::AstBox::new(qualify_inner_shadowing_column_refs(
+                    body.into_inner(),
                     inner_scope,
                     outer_scope,
                 )),
@@ -3683,11 +3680,17 @@ fn qualify_inner_shadowing_column_refs(
                     .map(|arg| qualify_inner_shadowing_column_refs(arg, inner_scope, outer_scope))
                     .collect(),
                 distinct,
-                order_by: qualify_inner_shadowing_sort_items(order_by, inner_scope, outer_scope),
+                order_by: (qualify_inner_shadowing_sort_items(
+                    order_by.into_inner(),
+                    inner_scope,
+                    outer_scope,
+                ))
+                .into(),
                 resolved,
             },
         },
         ExprKind::Cast {
+            array_failure_mode,
             expr: inner,
             target,
             decimal_overflow_policy,
@@ -3695,8 +3698,9 @@ fn qualify_inner_shadowing_column_refs(
             value_type: expr.value_type,
 
             kind: ExprKind::Cast {
-                expr: Box::new(qualify_inner_shadowing_column_refs(
-                    *inner,
+                array_failure_mode,
+                expr: novarocks_parser::ast::AstBox::new(qualify_inner_shadowing_column_refs(
+                    inner.into_inner(),
                     inner_scope,
                     outer_scope,
                 )),
@@ -3711,8 +3715,8 @@ fn qualify_inner_shadowing_column_refs(
             value_type: expr.value_type,
 
             kind: ExprKind::IsNull {
-                expr: Box::new(qualify_inner_shadowing_column_refs(
-                    *inner,
+                expr: novarocks_parser::ast::AstBox::new(qualify_inner_shadowing_column_refs(
+                    inner.into_inner(),
                     inner_scope,
                     outer_scope,
                 )),
@@ -3727,8 +3731,8 @@ fn qualify_inner_shadowing_column_refs(
             value_type: expr.value_type,
 
             kind: ExprKind::InList {
-                expr: Box::new(qualify_inner_shadowing_column_refs(
-                    *inner,
+                expr: novarocks_parser::ast::AstBox::new(qualify_inner_shadowing_column_refs(
+                    inner.into_inner(),
                     inner_scope,
                     outer_scope,
                 )),
@@ -3748,18 +3752,18 @@ fn qualify_inner_shadowing_column_refs(
             value_type: expr.value_type,
 
             kind: ExprKind::Between {
-                expr: Box::new(qualify_inner_shadowing_column_refs(
-                    *inner,
+                expr: novarocks_parser::ast::AstBox::new(qualify_inner_shadowing_column_refs(
+                    inner.into_inner(),
                     inner_scope,
                     outer_scope,
                 )),
-                low: Box::new(qualify_inner_shadowing_column_refs(
-                    *low,
+                low: novarocks_parser::ast::AstBox::new(qualify_inner_shadowing_column_refs(
+                    low.into_inner(),
                     inner_scope,
                     outer_scope,
                 )),
-                high: Box::new(qualify_inner_shadowing_column_refs(
-                    *high,
+                high: novarocks_parser::ast::AstBox::new(qualify_inner_shadowing_column_refs(
+                    high.into_inner(),
                     inner_scope,
                     outer_scope,
                 )),
@@ -3774,13 +3778,13 @@ fn qualify_inner_shadowing_column_refs(
             value_type: expr.value_type,
 
             kind: ExprKind::Like {
-                expr: Box::new(qualify_inner_shadowing_column_refs(
-                    *inner,
+                expr: novarocks_parser::ast::AstBox::new(qualify_inner_shadowing_column_refs(
+                    inner.into_inner(),
                     inner_scope,
                     outer_scope,
                 )),
-                pattern: Box::new(qualify_inner_shadowing_column_refs(
-                    *pattern,
+                pattern: novarocks_parser::ast::AstBox::new(qualify_inner_shadowing_column_refs(
+                    pattern.into_inner(),
                     inner_scope,
                     outer_scope,
                 )),
@@ -3796,8 +3800,8 @@ fn qualify_inner_shadowing_column_refs(
 
             kind: ExprKind::Case {
                 operand: operand.map(|operand| {
-                    Box::new(qualify_inner_shadowing_column_refs(
-                        *operand,
+                    novarocks_parser::ast::AstBox::new(qualify_inner_shadowing_column_refs(
+                        operand.into_inner(),
                         inner_scope,
                         outer_scope,
                     ))
@@ -3812,8 +3816,8 @@ fn qualify_inner_shadowing_column_refs(
                     })
                     .collect(),
                 else_expr: else_expr.map(|else_expr| {
-                    Box::new(qualify_inner_shadowing_column_refs(
-                        *else_expr,
+                    novarocks_parser::ast::AstBox::new(qualify_inner_shadowing_column_refs(
+                        else_expr.into_inner(),
                         inner_scope,
                         outer_scope,
                     ))
@@ -3828,8 +3832,8 @@ fn qualify_inner_shadowing_column_refs(
             value_type: expr.value_type,
 
             kind: ExprKind::IsTruthValue {
-                expr: Box::new(qualify_inner_shadowing_column_refs(
-                    *inner,
+                expr: novarocks_parser::ast::AstBox::new(qualify_inner_shadowing_column_refs(
+                    inner.into_inner(),
                     inner_scope,
                     outer_scope,
                 )),
@@ -3840,11 +3844,9 @@ fn qualify_inner_shadowing_column_refs(
         ExprKind::Nested(inner) => TypedExpr {
             value_type: expr.value_type,
 
-            kind: ExprKind::Nested(Box::new(qualify_inner_shadowing_column_refs(
-                *inner,
-                inner_scope,
-                outer_scope,
-            ))),
+            kind: ExprKind::Nested(novarocks_parser::ast::AstBox::new(
+                qualify_inner_shadowing_column_refs(inner.into_inner(), inner_scope, outer_scope),
+            )),
         },
         ExprKind::WindowCall {
             name,
@@ -3868,17 +3870,23 @@ fn qualify_inner_shadowing_column_refs(
                     .collect(),
                 distinct,
                 binding,
-                function_order_by: qualify_inner_shadowing_sort_items(
-                    function_order_by,
+                function_order_by: (qualify_inner_shadowing_sort_items(
+                    function_order_by.into_inner(),
                     inner_scope,
                     outer_scope,
-                ),
+                ))
+                .into(),
                 aggregate_binding,
                 partition_by: partition_by
                     .into_iter()
                     .map(|item| qualify_inner_shadowing_column_refs(item, inner_scope, outer_scope))
                     .collect(),
-                order_by: qualify_inner_shadowing_sort_items(order_by, inner_scope, outer_scope),
+                order_by: (qualify_inner_shadowing_sort_items(
+                    order_by.into_inner(),
+                    inner_scope,
+                    outer_scope,
+                ))
+                .into(),
                 window_frame,
                 ignore_nulls,
             },
@@ -3888,8 +3896,8 @@ fn qualify_inner_shadowing_column_refs(
 
             kind: ExprKind::Lambda {
                 params,
-                body: Box::new(qualify_inner_shadowing_column_refs(
-                    *body,
+                body: novarocks_parser::ast::AstBox::new(qualify_inner_shadowing_column_refs(
+                    body.into_inner(),
                     inner_scope,
                     outer_scope,
                 )),
@@ -4377,8 +4385,8 @@ fn extract_corr_preds_inner(
 
                 if left_outer_only && !right_outer_only {
                     out.push(CorrelationPred {
-                        outer_col: *left.clone(),
-                        inner_col: *right.clone(),
+                        outer_col: left.clone().into_inner(),
+                        inner_col: right.clone().into_inner(),
                         op: *op,
                         full_expr: expr.clone(),
                     });
@@ -4394,8 +4402,8 @@ fn extract_corr_preds_inner(
                         _ => *op,
                     };
                     out.push(CorrelationPred {
-                        outer_col: *right.clone(),
-                        inner_col: *left.clone(),
+                        outer_col: right.clone().into_inner(),
+                        inner_col: left.clone().into_inner(),
                         op: rev_op,
                         full_expr: expr.clone(),
                     });
@@ -4709,7 +4717,7 @@ fn attach_aux_join(
         AuxJoinSide::Right => &mut join.right,
     };
     let placeholder = std::mem::replace(host_side, dummy_relation());
-    *host_side = Relation::Join(Box::new(JoinRelation {
+    *host_side = Relation::Join(novarocks_parser::ast::AstBox::new(JoinRelation {
         naa_author: None,
         left: placeholder,
         right: sub_rel,
@@ -5284,9 +5292,9 @@ fn remove_placeholder_from_expr(expr: &TypedExpr, placeholder_id: usize) -> Type
                     ),
 
                     kind: ExprKind::BinaryOp {
-                        left: Box::new(new_left),
+                        left: novarocks_parser::ast::AstBox::new(new_left),
                         op: *op,
-                        right: Box::new(new_right),
+                        right: novarocks_parser::ast::AstBox::new(new_right),
                         decimal_overflow_policy: *decimal_overflow_policy,
                     },
                 }
@@ -5306,7 +5314,7 @@ fn remove_placeholder_from_expr(expr: &TypedExpr, placeholder_id: usize) -> Type
                 TypedExpr {
                     value_type: expr.value_type.clone(),
 
-                    kind: ExprKind::Nested(Box::new(new_inner)),
+                    kind: ExprKind::Nested(novarocks_parser::ast::AstBox::new(new_inner)),
                 }
             }
         }
@@ -5345,7 +5353,8 @@ fn cast_case_branch_if_needed(expr: TypedExpr, target: &DataType) -> TypedExpr {
     if expr.value_type.data_type() != target && *expr.value_type.data_type() != DataType::Null {
         TypedExpr {
             kind: ExprKind::Cast {
-                expr: Box::new(expr),
+                array_failure_mode: None,
+                expr: novarocks_parser::ast::AstBox::new(expr),
                 target: target.clone(),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
@@ -5375,13 +5384,13 @@ fn replace_placeholder_in_expr(
             value_type: expr.value_type.clone(),
 
             kind: ExprKind::BinaryOp {
-                left: Box::new(replace_placeholder_in_expr(
+                left: novarocks_parser::ast::AstBox::new(replace_placeholder_in_expr(
                     left,
                     placeholder_id,
                     replacement,
                 )),
                 op: *op,
-                right: Box::new(replace_placeholder_in_expr(
+                right: novarocks_parser::ast::AstBox::new(replace_placeholder_in_expr(
                     right,
                     placeholder_id,
                     replacement,
@@ -5394,7 +5403,7 @@ fn replace_placeholder_in_expr(
 
             kind: ExprKind::UnaryOp {
                 op: *op,
-                expr: Box::new(replace_placeholder_in_expr(
+                expr: novarocks_parser::ast::AstBox::new(replace_placeholder_in_expr(
                     inner,
                     placeholder_id,
                     replacement,
@@ -5404,11 +5413,9 @@ fn replace_placeholder_in_expr(
         ExprKind::Nested(inner) => TypedExpr {
             value_type: expr.value_type.clone(),
 
-            kind: ExprKind::Nested(Box::new(replace_placeholder_in_expr(
-                inner,
-                placeholder_id,
-                replacement,
-            ))),
+            kind: ExprKind::Nested(novarocks_parser::ast::AstBox::new(
+                replace_placeholder_in_expr(inner, placeholder_id, replacement),
+            )),
         },
         ExprKind::FunctionCall {
             name,
@@ -5451,6 +5458,7 @@ fn replace_placeholder_in_expr(
             },
         },
         ExprKind::Cast {
+            array_failure_mode,
             expr: inner,
             target,
             decimal_overflow_policy,
@@ -5458,7 +5466,8 @@ fn replace_placeholder_in_expr(
             value_type: expr.value_type.clone(),
 
             kind: ExprKind::Cast {
-                expr: Box::new(replace_placeholder_in_expr(
+                array_failure_mode: *array_failure_mode,
+                expr: novarocks_parser::ast::AstBox::new(replace_placeholder_in_expr(
                     inner,
                     placeholder_id,
                     replacement,
@@ -5474,7 +5483,7 @@ fn replace_placeholder_in_expr(
             value_type: expr.value_type.clone(),
 
             kind: ExprKind::IsNull {
-                expr: Box::new(replace_placeholder_in_expr(
+                expr: novarocks_parser::ast::AstBox::new(replace_placeholder_in_expr(
                     inner,
                     placeholder_id,
                     replacement,
@@ -5516,9 +5525,9 @@ fn replace_placeholder_in_expr(
                 value_type: novarocks_type_contract::FunctionValueType::new(result_type, true),
 
                 kind: ExprKind::Case {
-                    operand,
-                    when_then: rewritten_when_then,
-                    else_expr,
+                    operand: operand.map(novarocks_parser::ast::AstBox::from_box),
+                    when_then: (rewritten_when_then).into(),
+                    else_expr: else_expr.map(novarocks_parser::ast::AstBox::from_box),
                 },
             }
         }
@@ -5531,17 +5540,17 @@ fn replace_placeholder_in_expr(
             value_type: expr.value_type.clone(),
 
             kind: ExprKind::Between {
-                expr: Box::new(replace_placeholder_in_expr(
+                expr: novarocks_parser::ast::AstBox::new(replace_placeholder_in_expr(
                     inner,
                     placeholder_id,
                     replacement,
                 )),
-                low: Box::new(replace_placeholder_in_expr(
+                low: novarocks_parser::ast::AstBox::new(replace_placeholder_in_expr(
                     low,
                     placeholder_id,
                     replacement,
                 )),
-                high: Box::new(replace_placeholder_in_expr(
+                high: novarocks_parser::ast::AstBox::new(replace_placeholder_in_expr(
                     high,
                     placeholder_id,
                     replacement,
@@ -5557,12 +5566,12 @@ fn replace_placeholder_in_expr(
             value_type: expr.value_type.clone(),
 
             kind: ExprKind::Like {
-                expr: Box::new(replace_placeholder_in_expr(
+                expr: novarocks_parser::ast::AstBox::new(replace_placeholder_in_expr(
                     inner,
                     placeholder_id,
                     replacement,
                 )),
-                pattern: Box::new(replace_placeholder_in_expr(
+                pattern: novarocks_parser::ast::AstBox::new(replace_placeholder_in_expr(
                     pattern,
                     placeholder_id,
                     replacement,
@@ -5578,7 +5587,7 @@ fn replace_placeholder_in_expr(
             value_type: expr.value_type.clone(),
 
             kind: ExprKind::InList {
-                expr: Box::new(replace_placeholder_in_expr(
+                expr: novarocks_parser::ast::AstBox::new(replace_placeholder_in_expr(
                     inner,
                     placeholder_id,
                     replacement,
@@ -5598,7 +5607,7 @@ fn replace_placeholder_in_expr(
             value_type: expr.value_type.clone(),
 
             kind: ExprKind::IsTruthValue {
-                expr: Box::new(replace_placeholder_in_expr(
+                expr: novarocks_parser::ast::AstBox::new(replace_placeholder_in_expr(
                     inner,
                     placeholder_id,
                     replacement,
@@ -5679,9 +5688,9 @@ fn remove_correlation_preds_from_expr(
                     ),
 
                     kind: ExprKind::BinaryOp {
-                        left: Box::new(l),
+                        left: novarocks_parser::ast::AstBox::new(l),
                         op: BinOp::And,
-                        right: Box::new(r),
+                        right: novarocks_parser::ast::AstBox::new(r),
                         decimal_overflow_policy: *decimal_overflow_policy,
                     },
                 }),
@@ -5906,9 +5915,9 @@ fn disjoin(mut exprs: Vec<TypedExpr>) -> TypedExpr {
         value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
 
         kind: ExprKind::BinaryOp {
-            left: Box::new(acc),
+            left: novarocks_parser::ast::AstBox::new(acc),
             op: BinOp::Or,
-            right: Box::new(e),
+            right: novarocks_parser::ast::AstBox::new(e),
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         },
     })
@@ -5924,9 +5933,9 @@ fn conjoin(mut exprs: Vec<TypedExpr>) -> TypedExpr {
         value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
 
         kind: ExprKind::BinaryOp {
-            left: Box::new(acc),
+            left: novarocks_parser::ast::AstBox::new(acc),
             op: BinOp::And,
-            right: Box::new(e),
+            right: novarocks_parser::ast::AstBox::new(e),
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         },
     })
@@ -5937,11 +5946,97 @@ mod tests {
     use super::*;
 
     #[test]
-    fn composite_in_evaluates_volatile_probe_outside_candidate_lambda() {
-        let statements = novarocks_parser::parse("SELECT [random()] IN (SELECT [0.0])").unwrap();
-        let [ast::Statement::Query(query)] = statements.as_slice() else {
-            panic!("query");
+    fn shadowing_qualification_preserves_explicit_array_cast_modes_and_complete_sources() {
+        use crate::column_id::ColumnId;
+        use novarocks_type_contract::{
+            ArrayCastFailureMode, DecimalOverflowPolicy, FunctionValueType,
         };
+        use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::Arc};
+        let factory = Rc::new(RefCell::new(crate::column_id::ColumnRefFactory::new()));
+        let mut inner = AnalyzerScope::new(Rc::clone(&factory));
+        let mut outer = AnalyzerScope::new(factory);
+        let source = FunctionValueType::new(
+            DataType::List(Arc::new(
+                arrow::datatypes::Field::new("source_child", DataType::Int32, true)
+                    .with_metadata(HashMap::from([("owner".into(), "original-source".into())])),
+            )),
+            true,
+        );
+        let target = FunctionValueType::new(
+            DataType::List(Arc::new(
+                arrow::datatypes::Field::new("target_child", DataType::Int64, true)
+                    .with_metadata(HashMap::from([("owner".into(), "declared-target".into())])),
+            )),
+            true,
+        );
+        let inner_id = ColumnId(801);
+        let outer_id = ColumnId(802);
+        inner.add_column_with_id(Some("inner_source"), "values", inner_id, source.clone());
+        outer.add_column_with_id(Some("outer_source"), "values", outer_id, source.clone());
+        assert_eq!(inner.resolve(None, "values").unwrap().0, inner_id);
+        assert_eq!(outer.resolve(None, "values").unwrap().0, outer_id);
+        for mode in [
+            ArrayCastFailureMode::ReportError,
+            ArrayCastFailureMode::OutputNull,
+        ] {
+            let original = TypedExpr {
+                kind: ExprKind::Cast {
+                    expr: novarocks_parser::ast::AstBox::new(TypedExpr {
+                        kind: ExprKind::ColumnRef {
+                            column_id: inner_id,
+                            qualifier: None,
+                            column: "values".into(),
+                        },
+                        value_type: source.clone(),
+                    }),
+                    target: target.data_type().clone(),
+                    decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
+                    array_failure_mode: Some(mode),
+                },
+                value_type: target.clone(),
+            };
+            let actual = qualify_inner_shadowing_column_refs(original, &inner, &outer);
+            assert_eq!(actual.value_type, target);
+            assert_eq!(
+                actual.value_type.try_to_field("result").unwrap(),
+                target.try_to_field("result").unwrap()
+            );
+            let ExprKind::Cast {
+                expr,
+                target: actual_target,
+                decimal_overflow_policy,
+                array_failure_mode,
+            } = actual.kind
+            else {
+                panic!("original CAST boundary")
+            };
+            assert_eq!(array_failure_mode, Some(mode));
+            assert_eq!(decimal_overflow_policy, DecimalOverflowPolicy::ReportError);
+            assert_eq!(&actual_target, target.data_type());
+            assert_eq!(expr.value_type, source);
+            assert_eq!(
+                expr.value_type.try_to_field("source").unwrap(),
+                source.try_to_field("source").unwrap()
+            );
+            let ExprKind::ColumnRef {
+                column_id,
+                qualifier,
+                column,
+            } = expr.into_inner().kind
+            else {
+                panic!("original bound child")
+            };
+            assert_eq!(column_id, inner_id);
+            assert_ne!(column_id, outer_id);
+            assert_eq!(qualifier.as_deref(), Some("inner_source"));
+            assert_eq!(column, "values");
+        }
+    }
+
+    #[test]
+    fn composite_in_evaluates_volatile_probe_outside_candidate_lambda() {
+        let query =
+            &novarocks_parser::parser::parse_query("SELECT [random()] IN (SELECT [0.0])").unwrap();
         let catalog = crate::catalog::memory::PlannerMemoryCatalog::default();
         let (resolved, _, _) = super::super::analyze_with_function_catalog(
             query,
@@ -5999,10 +6094,7 @@ mod tests {
                 ApplyClause::AggregateInput,
             ),
         ] {
-            let statements = novarocks_parser::parse(sql).unwrap();
-            let [ast::Statement::Query(query)] = statements.as_slice() else {
-                panic!("query");
-            };
+            let query = &novarocks_parser::parser::parse_query(sql).unwrap();
             let catalog = crate::catalog::memory::PlannerMemoryCatalog::default();
             let (resolved, _, _) = super::super::analyze_with_function_catalog(
                 query,
@@ -6098,8 +6190,8 @@ mod tests {
                 has_aggregation: false,
                 distinct: false,
                 repeat: None,
-                apply_specs: Vec::new(),
-                predicate_apply_specs: Vec::new(),
+                apply_specs: (Vec::new()).into(),
+                predicate_apply_specs: (Vec::new()).into(),
             }),
             order_by: Vec::new(),
             limit: None,

@@ -30,33 +30,30 @@ DROP TABLE IF EXISTS ${case_db}.t_rf_three_table_chain_c;
 CREATE TABLE ${case_db}.t_rf_three_table_chain_a (
     id INT,
     k1 INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 CREATE TABLE ${case_db}.t_rf_three_table_chain_b (
     k1 INT,
     k2 INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 CREATE TABLE ${case_db}.t_rf_three_table_chain_c (
     k2 INT,
     payload VARCHAR(20)
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t_rf_three_table_chain_a VALUES
-    (1, 10),
-    (2, 20),
-    (3, 30);
+    ROW(1, 10),
+    ROW(2, 20),
+    ROW(3, 30);
 
 INSERT INTO ${case_db}.t_rf_three_table_chain_b VALUES
-    (10, 100),
-    (20, 200),
-    (40, 400);
+    ROW(10, 100),
+    ROW(20, 200),
+    ROW(40, 400);
 
 INSERT INTO ${case_db}.t_rf_three_table_chain_c VALUES
-    (100, 'c100'),
-    (200, 'c200'),
-    (300, 'c300');
+    ROW(100, 'c100'),
+    ROW(200, 'c200'),
+    ROW(300, 'c300');
 
 SELECT a.id, a.k1, b.k2, c.payload
 FROM ${case_db}.t_rf_three_table_chain_a a

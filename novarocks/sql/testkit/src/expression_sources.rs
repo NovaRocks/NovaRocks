@@ -103,6 +103,19 @@ pub fn inspect_like_source(source: &SqlAuthoredPhysicalPlan) -> usize {
                     node.ty.nullable(),
                     input.ty.nullable() || pattern.ty.nullable()
                 );
+            } else if let ExprKind::FunctionCall { function, args } = &node.kind
+                && function.function_id.as_str() == "builtin.scalar/__like_with_escape/v1"
+            {
+                n += 1;
+                assert_eq!(args.len(), 3);
+                let mut nullable = false;
+                for argument in args.iter() {
+                    let ty = &unit.definition(*argument).unwrap().ty;
+                    assert_eq!(ty.data_type(), &DataType::Utf8);
+                    nullable |= ty.nullable();
+                }
+                assert_eq!(node.ty.data_type(), &DataType::Boolean);
+                assert_eq!(node.ty.nullable(), nullable);
             }
         }
     }

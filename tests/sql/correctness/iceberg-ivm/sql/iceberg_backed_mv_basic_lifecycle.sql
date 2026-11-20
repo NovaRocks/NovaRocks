@@ -26,47 +26,27 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE EXTERNAL CATALOG mv_ice_${uuid0}
-PROPERTIES (
-  "type" = "iceberg",
-  "iceberg.catalog.type" = "rest",
-  "uri" = "${iceberg_rest_uri}",
-  "warehouse" = "${iceberg_rest_warehouse}",
-  "credential.object-store-metadata.consumer-role" = "frontend",
-  "credential.object-store-metadata.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-metadata.name" = "${iceberg_object_store_metadata_credential_name}",
-  "credential.object-store-metadata.generation" = "${iceberg_object_store_credential_generation}",
-  "credential.object-store-data.consumer-role" = "backend",
-  "credential.object-store-data.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-data.name" = "${iceberg_object_store_data_credential_name}",
-  "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
-  "aws.s3.endpoint" = "${oss_endpoint}",
-  "aws.s3.region" = "${oss_region}",
-  "aws.s3.enable_path_style_access" = "${oss_path_style}"
-);
-CREATE DATABASE mv_ice_${uuid0}.ns_${uuid0};
+CREATE CATALOG mv_ice_${uuid0} USING iceberg WITH ("iceberg.catalog.type" = 'rest', "uri" = '${iceberg_rest_uri}', "warehouse" = '${iceberg_rest_warehouse}', "credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-metadata.name" = '${iceberg_object_store_metadata_credential_name}', "credential.object-store-metadata.generation" = '${iceberg_object_store_credential_generation}', "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-data.name" = '${iceberg_object_store_data_credential_name}', "credential.object-store-data.generation" = '${iceberg_object_store_credential_generation}', "aws.s3.endpoint" = '${oss_endpoint}', "aws.s3.region" = '${oss_region}', "aws.s3.enable_path_style_access" = '${oss_path_style}');
+CREATE SCHEMA mv_ice_${uuid0}.ns_${uuid0};
 CREATE TABLE mv_ice_${uuid0}.ns_${uuid0}.orders (
   k1 INT,
   v2 BIGINT
-)
-TBLPROPERTIES ("format-version" = "3",
-  "write.row-lineage" = "true");
+) WITH (format_version = 3);
 INSERT INTO mv_ice_${uuid0}.ns_${uuid0}.orders VALUES
-  (1, 10),
-  (2, 20),
-  (3, 50);
+  ROW(1, 10),
+  ROW(2, 20),
+  ROW(3, 50);
 USE mv_ice_${uuid0}.ns_${uuid0};
-CREATE MATERIALIZED VIEW orders_mv
-DISTRIBUTED BY HASH(k1) BUCKETS 2
-PROPERTIES ('storage_engine' = 'iceberg')
-AS SELECT k1, v2 FROM orders;
+CREATE MATERIALIZED VIEW orders_mv AS SELECT k1, v2 FROM orders;
 
 -- query 2
 SELECT k1, v2 FROM orders_mv ORDER BY k1;
 
 -- query 3
 -- @skip_result_check=true
-REFRESH MATERIALIZED VIEW orders_mv FULL;
+SET SESSION "mv_ice_${uuid0}".incremental_refresh_enabled = false;
+REFRESH MATERIALIZED VIEW orders_mv;
+RESET SESSION "mv_ice_${uuid0}".incremental_refresh_enabled;
 
 -- query 4
 SELECT k1, v2 FROM orders_mv ORDER BY k1;
@@ -81,7 +61,7 @@ SELECT * FROM system.runtime.materialized_view_states WHERE catalog_name = 'mv_i
 
 -- query 6
 -- @skip_result_check=true
-INSERT INTO mv_ice_${uuid0}.ns_${uuid0}.orders VALUES (4, 70);
+INSERT INTO mv_ice_${uuid0}.ns_${uuid0}.orders VALUES ROW(4, 70);
 
 -- query 7
 SELECT k1, v2 FROM orders_mv ORDER BY k1;
@@ -98,7 +78,9 @@ SELECT k1, v2 FROM orders_mv ORDER BY k1;
 -- Incremental publication rows need not equal the complete table's row count.
 -- A second full publication supplies the independently known four-row oracle.
 -- @skip_result_check=true
-REFRESH MATERIALIZED VIEW orders_mv FULL;
+SET SESSION "mv_ice_${uuid0}".incremental_refresh_enabled = false;
+REFRESH MATERIALIZED VIEW orders_mv;
+RESET SESSION "mv_ice_${uuid0}".incremental_refresh_enabled;
 
 -- query 11
 SELECT k1, v2 FROM orders_mv ORDER BY k1;
@@ -113,6 +95,6 @@ SELECT * FROM system.runtime.materialized_view_states WHERE catalog_name = 'mv_i
 -- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW orders_mv;
-DROP TABLE mv_ice_${uuid0}.ns_${uuid0}.orders FORCE;
-DROP DATABASE mv_ice_${uuid0}.ns_${uuid0};
+DROP TABLE mv_ice_${uuid0}.ns_${uuid0}.orders ;
+DROP SCHEMA mv_ice_${uuid0}.ns_${uuid0};
 DROP CATALOG mv_ice_${uuid0};

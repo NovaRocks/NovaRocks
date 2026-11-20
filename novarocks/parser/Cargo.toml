@@ -8,11 +8,12 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+recursive.workspace = true
 novarocks-user-error.workspace = true
 
 [lib]
 doctest = false
 
 [package.metadata.novarocks.test]
-runtime-inputs = ["tests/sql/correctness/**/*.sql"]
+runtime-inputs = ["tests/sql/correctness/**/*.sql", "novarocks/parser/tests/it/coverage-sql/*.sql"]
 env-inputs = []

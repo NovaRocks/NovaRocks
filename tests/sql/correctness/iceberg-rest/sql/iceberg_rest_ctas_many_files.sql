@@ -21,13 +21,11 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE DATABASE iceberg_rest_${suite_uuid0}.ctas_files_${uuid0};
+CREATE SCHEMA iceberg_rest_${suite_uuid0}.ctas_files_${uuid0};
 
 -- query 2
 -- @skip_result_check=true
-CREATE TABLE iceberg_rest_${suite_uuid0}.ctas_files_${uuid0}.dst_${uuid0}
-PARTITION BY (part)
-AS SELECT CAST(generate_series AS INT) AS part,
+CREATE TABLE iceberg_rest_${suite_uuid0}.ctas_files_${uuid0}.dst_${uuid0} WITH (partitioning = ARRAY['part']) AS SELECT CAST(generate_series AS INT) AS part,
           CAST(generate_series * 2 AS INT) AS value
    FROM TABLE(generate_series(1, 240));
 
@@ -37,11 +35,11 @@ FROM iceberg_rest_${suite_uuid0}.ctas_files_${uuid0}.dst_${uuid0};
 
 -- query 4
 SELECT COUNT(*) AS partition_count
-FROM iceberg_rest_${suite_uuid0}.ctas_files_${uuid0}.dst_${uuid0}$partitions;
+FROM iceberg_rest_${suite_uuid0}.ctas_files_${uuid0}."dst_${uuid0}$partitions";
 
 -- query 5
 SELECT COUNT(*) >= 240 AS enough_files
-FROM iceberg_rest_${suite_uuid0}.ctas_files_${uuid0}.dst_${uuid0}$files;
+FROM iceberg_rest_${suite_uuid0}.ctas_files_${uuid0}."dst_${uuid0}$files";
 
 -- query 6
 -- @skip_result_check=true
@@ -49,4 +47,4 @@ DROP TABLE iceberg_rest_${suite_uuid0}.ctas_files_${uuid0}.dst_${uuid0};
 
 -- query 7
 -- @skip_result_check=true
-DROP DATABASE iceberg_rest_${suite_uuid0}.ctas_files_${uuid0};
+DROP SCHEMA iceberg_rest_${suite_uuid0}.ctas_files_${uuid0};

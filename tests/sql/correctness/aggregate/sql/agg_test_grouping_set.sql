@@ -26,19 +26,18 @@ USE ${case_db};
 -- query 2
 -- @skip_result_check=true
 USE ${case_db};
-CREATE TABLE `t0` (
-  `v1` bigint(20) NULL COMMENT "",
-  `v2` bigint(20) NULL COMMENT "",
-  `v3` bigint(20) NULL COMMENT "",
-  `v4` varchar NULL COMMENT ""
-)
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE "t0" (
+  "v1" bigint(20),
+  "v2" bigint(20),
+  "v3" bigint(20),
+  "v4" varchar
+) WITH (format_version = 3);
 
 -- query 3
 -- @skip_result_check=true
 USE ${case_db};
-insert into t0 values(1, 2, 3, 'a'), (1, 3, 4, 'b'), (2, 3, 4, 'a'), (null, 1, null, 'c'), (4, null, 1 , null),
-(5, 1 , 3, 'c'), (2, 2, null, 'a'), (4, null, 4, 'c'), (null, null, 2, null);
+insert into t0 values ROW(1, 2, 3, 'a'), ROW(1, 3, 4, 'b'), ROW(2, 3, 4, 'a'), ROW(null, 1, null, 'c'), ROW(4, null, 1 , null),
+ROW(5, 1 , 3, 'c'), ROW(2, 2, null, 'a'), ROW(4, null, 4, 'c'), ROW(null, null, 2, null);
 
 -- query 4
 USE ${case_db};

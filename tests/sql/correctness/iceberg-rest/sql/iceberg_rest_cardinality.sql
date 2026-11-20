@@ -39,7 +39,7 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE DATABASE iceberg_rest_${suite_uuid0}.iceberg_rest_card_db_${uuid0};
+CREATE SCHEMA iceberg_rest_${suite_uuid0}.iceberg_rest_card_db_${uuid0};
 
 -- query 2
 -- @skip_result_check=true
@@ -81,4 +81,4 @@ DROP TABLE iceberg_rest_${suite_uuid0}.iceberg_rest_card_db_${uuid0}.t_card_${uu
 
 -- query 8
 -- @skip_result_check=true
-DROP DATABASE iceberg_rest_${suite_uuid0}.iceberg_rest_card_db_${uuid0};
+DROP SCHEMA iceberg_rest_${suite_uuid0}.iceberg_rest_card_db_${uuid0};

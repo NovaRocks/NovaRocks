@@ -24,22 +24,61 @@ fn invalid(detail: &'static str) -> SqlCompileError {
 }
 /// Structural edges of the producer's existing eligible query body. These
 /// names describe owned AST positions, never SQL text or wire identities.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SqlConstantQueryStep {
     NestedQuery,
-    UnionLeft,
-    UnionRight,
-    SelectFromDerived { from: usize },
+    SetOperand { index: usize },
+    SelectFromDerived { relation_path: Vec<SqlRelationStep> },
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SqlRelationStep {
+    Aliased,
+    JoinLeft,
+    JoinRight,
 }
 /// Exact expression edges below a producer-authored projection or VALUES cell.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SqlConstantExpressionStep {
-    Nested,
+    LogicalTerm(usize),
+    PredicatedValue,
+    ComparisonRight,
+    BetweenMin,
+    BetweenMax,
+    LikePattern,
+    InValueList,
+    InListValue(usize),
+    CastExpression,
+    ExtractInput,
+    RowFieldExpression(usize),
+    DereferenceBase,
+    SubscriptBase,
+    SubscriptIndex,
+    FunctionArgumentValue(usize),
+    IfCondition,
+    IfTrue,
+    IfFalse,
+    NullIfFirst,
+    NullIfSecond,
+    CoalesceOperand(usize),
+    TryInner,
+    FormatArgument(usize),
+    GroupingColumn(usize),
+    TrimSource,
+    FunctionOrderByKey(usize),
+    WindowOrderByKey(usize),
+    CaseOperand,
+    CaseWhenOperand(usize),
+    CaseResult(usize),
+    CaseDefault,
+    LambdaBody,
+    ExistsSubquery,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SqlConstantExpressionSite {
     ValuesCell { row: usize, column: usize },
     SelectProjection { column: usize },
+    QueryOrderByKey { index: usize },
+    SelectOrderByKey { index: usize },
 }
 #[derive(Clone, Debug)]
 pub struct SqlExpressionConstant {
@@ -94,34 +133,57 @@ pub(crate) fn resolve_expression_site<'a>(
     allow_set_operations: bool,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<&'a ast::Expr, SqlCompileError> {
+    let mut query_owner = Some(query);
     let mut body = query.body.as_ref();
     for step in body_path {
         work.step()?;
         body = match (step, body) {
-            (SqlConstantQueryStep::NestedQuery, ast::SetExpr::Query(query)) => query.body.as_ref(),
-            (SqlConstantQueryStep::UnionLeft, ast::SetExpr::SetOperation(op))
-                if allow_set_operations
-                    || (matches!(op.operator, ast::SetOperator::Union)
-                        && matches!(op.quantifier, ast::SetQuantifier::All)) =>
-            {
-                op.left.as_ref()
+            (SqlConstantQueryStep::NestedQuery, ast::SetExpr::Query(query)) => {
+                query_owner = Some(&query.query);
+                query.query.body.as_ref()
             }
-            (SqlConstantQueryStep::UnionRight, ast::SetExpr::SetOperation(op))
-                if allow_set_operations
-                    || (matches!(op.operator, ast::SetOperator::Union)
-                        && matches!(op.quantifier, ast::SetQuantifier::All)) =>
+            (SqlConstantQueryStep::SetOperand { index }, ast::SetExpr::SetOperation(op))
+                if op.corresponding.is_none()
+                    && (allow_set_operations
+                        || (op.operator == ast::SetOperator::Union && !op.distinct)) =>
             {
-                op.right.as_ref()
+                query_owner = None;
+                op.inputs.get(*index).ok_or_else(|| {
+                    invalid("constant source set operand index differs from its owned query")
+                })?
             }
-            (SqlConstantQueryStep::SelectFromDerived { from }, ast::SetExpr::Select(select)) => {
-                let Some(ast::TableFactor::Derived { subquery, .. }) =
-                    select.from.get(*from).map(|from| &from.relation)
-                else {
-                    return Err(invalid(
-                        "constant source path differs from its owned derived relation",
-                    ));
+            (
+                SqlConstantQueryStep::SelectFromDerived { relation_path },
+                ast::SetExpr::Select(select),
+            ) => {
+                let mut relation = select
+                    .from
+                    .as_ref()
+                    .ok_or_else(|| invalid("constant source path has no owned FROM relation"))?;
+                for edge in relation_path {
+                    work.step()?;
+                    relation = match (edge, relation) {
+                        (SqlRelationStep::Aliased, ast::Relation::Aliased(node)) => &node.relation,
+                        (SqlRelationStep::JoinLeft, ast::Relation::Join(node)) => &node.left,
+                        (SqlRelationStep::JoinRight, ast::Relation::Join(node)) => &node.right,
+                        _ => {
+                            return Err(invalid(
+                                "constant source relation edge differs from its owned relation",
+                            ));
+                        }
+                    };
+                }
+                let query = match relation {
+                    ast::Relation::TableSubquery(node) => &node.query,
+                    ast::Relation::Lateral(node) => &node.query,
+                    _ => {
+                        return Err(invalid(
+                            "constant source path differs from its owned derived relation",
+                        ));
+                    }
                 };
-                subquery.body.as_ref()
+                query_owner = Some(query);
+                query.body.as_ref()
             }
             _ => {
                 return Err(invalid(
@@ -132,13 +194,27 @@ pub(crate) fn resolve_expression_site<'a>(
     }
     work.step()?;
     let mut expression = match (site, body) {
+        (SqlConstantExpressionSite::QueryOrderByKey { index }, _) => query_owner
+            .and_then(|owner| owner.modifiers.order_by.as_ref())
+            .and_then(|order| order.items.get(index))
+            .map(|item| &item.sort_key),
+        (SqlConstantExpressionSite::SelectOrderByKey { index }, ast::SetExpr::Select(select)) => {
+            select
+                .modifiers
+                .order_by
+                .as_ref()
+                .and_then(|order| order.items.get(index))
+                .map(|item| &item.sort_key)
+        }
         (SqlConstantExpressionSite::ValuesCell { row, column }, ast::SetExpr::Values(values)) => {
-            values.rows.get(row).and_then(|row| row.get(column))
+            values
+                .rows
+                .get(row)
+                .and_then(|row| ast::ValuesRowCells::new(row).get(column))
         }
         (SqlConstantExpressionSite::SelectProjection { column }, ast::SetExpr::Select(select)) => {
             select.projection.get(column).and_then(|item| match item {
-                ast::SelectItem::UnnamedExpr(expr)
-                | ast::SelectItem::ExprWithAlias { expr, .. } => Some(expr),
+                ast::SelectItem::SingleColumn(column) => Some(&column.expression),
                 _ => None,
             })
         }
@@ -148,7 +224,188 @@ pub(crate) fn resolve_expression_site<'a>(
     for step in expression_path {
         work.step()?;
         expression = match (step, expression) {
-            (SqlConstantExpressionStep::Nested, ast::Expr::Nested(nested)) => &nested.expression,
+            (
+                SqlConstantExpressionStep::GroupingColumn(index),
+                ast::Expr::GroupingOperation(node),
+            ) => node.grouping_columns.get(*index).ok_or_else(|| {
+                invalid("constant source grouping column differs from its owned syntax")
+            })?,
+            (SqlConstantExpressionStep::TrimSource, ast::Expr::Trim(node)) => &node.trim_source,
+            (SqlConstantExpressionStep::LogicalTerm(index), ast::Expr::Logical(logical)) => {
+                logical.terms.get(*index).ok_or_else(|| {
+                    invalid("constant source logical term index differs from its owned syntax")
+                })?
+            }
+            (SqlConstantExpressionStep::PredicatedValue, ast::Expr::Predicated(node)) => {
+                &node.value
+            }
+            (SqlConstantExpressionStep::ComparisonRight, ast::Expr::Predicated(node)) => {
+                match &node.predicate {
+                    ast::Predicate::Comparison(p) => &p.right,
+                    ast::Predicate::DistinctFrom(p) => &p.right,
+                    _ => {
+                        return Err(invalid(
+                            "constant source comparison edge differs from its owned syntax",
+                        ));
+                    }
+                }
+            }
+            (SqlConstantExpressionStep::BetweenMin, ast::Expr::Predicated(node)) => {
+                let ast::Predicate::Between(p) = &node.predicate else {
+                    return Err(invalid(
+                        "constant source BETWEEN edge differs from its owned syntax",
+                    ));
+                };
+                &p.min
+            }
+            (SqlConstantExpressionStep::BetweenMax, ast::Expr::Predicated(node)) => {
+                let ast::Predicate::Between(p) = &node.predicate else {
+                    return Err(invalid(
+                        "constant source BETWEEN edge differs from its owned syntax",
+                    ));
+                };
+                &p.max
+            }
+            (SqlConstantExpressionStep::LikePattern, ast::Expr::Predicated(node)) => {
+                let ast::Predicate::Like(p) = &node.predicate else {
+                    return Err(invalid(
+                        "constant source LIKE edge differs from its owned syntax",
+                    ));
+                };
+                &p.pattern
+            }
+            (SqlConstantExpressionStep::InValueList, ast::Expr::Predicated(node)) => {
+                let ast::Predicate::In(p) = &node.predicate else {
+                    return Err(invalid(
+                        "constant source IN edge differs from its owned syntax",
+                    ));
+                };
+                &p.value_list
+            }
+            (SqlConstantExpressionStep::InListValue(index), ast::Expr::InList(list)) => {
+                list.values.get(*index).ok_or_else(|| {
+                    invalid("constant source IN value index differs from its owned syntax")
+                })?
+            }
+            (SqlConstantExpressionStep::CastExpression, ast::Expr::Cast(cast)) => &cast.expression,
+            (SqlConstantExpressionStep::DereferenceBase, ast::Expr::Dereference(node)) => {
+                &node.base
+            }
+            (SqlConstantExpressionStep::SubscriptBase, ast::Expr::Subscript(node)) => &node.base,
+            (SqlConstantExpressionStep::SubscriptIndex, ast::Expr::Subscript(node)) => &node.index,
+            (
+                SqlConstantExpressionStep::FunctionArgumentValue(index),
+                ast::Expr::FunctionCall(call),
+            ) => {
+                &call
+                    .arguments
+                    .get(*index)
+                    .ok_or_else(|| {
+                        invalid(
+                            "constant source function argument index differs from its owned syntax",
+                        )
+                    })?
+                    .value
+            }
+            (
+                SqlConstantExpressionStep::FunctionOrderByKey(index),
+                ast::Expr::FunctionCall(call),
+            ) => {
+                &call
+                    .order_by
+                    .as_ref()
+                    .and_then(|order| order.items.get(*index))
+                    .ok_or_else(|| {
+                        invalid(
+                            "constant source function ORDER BY key differs from its owned syntax",
+                        )
+                    })?
+                    .sort_key
+            }
+            (SqlConstantExpressionStep::WindowOrderByKey(index), ast::Expr::FunctionCall(call)) => {
+                &call
+                    .window
+                    .as_ref()
+                    .and_then(|window| match window {
+                        ast::Window::Specification(specification) => {
+                            specification.order_by.as_ref()
+                        }
+                        ast::Window::Reference(_) => None,
+                    })
+                    .and_then(|order| order.items.get(*index))
+                    .ok_or_else(|| {
+                        invalid("constant source window ORDER BY key differs from its owned syntax")
+                    })?
+                    .sort_key
+            }
+            (SqlConstantExpressionStep::ExtractInput, ast::Expr::Extract(node)) => &node.expression,
+            (SqlConstantExpressionStep::RowFieldExpression(index), ast::Expr::Row(row)) => {
+                &row.fields
+                    .get(*index)
+                    .ok_or_else(|| {
+                        invalid("constant source ROW field differs from its owned syntax")
+                    })?
+                    .expression
+            }
+            (SqlConstantExpressionStep::IfCondition, ast::Expr::If(node)) => &node.condition,
+            (SqlConstantExpressionStep::IfTrue, ast::Expr::If(node)) => &node.true_value,
+            (SqlConstantExpressionStep::IfFalse, ast::Expr::If(node)) => {
+                node.false_value.as_ref().ok_or_else(|| {
+                    invalid("constant source IF false value is absent from its owned syntax")
+                })?
+            }
+            (SqlConstantExpressionStep::NullIfFirst, ast::Expr::NullIf(node)) => &node.first,
+            (SqlConstantExpressionStep::NullIfSecond, ast::Expr::NullIf(node)) => &node.second,
+            (SqlConstantExpressionStep::CoalesceOperand(index), ast::Expr::Coalesce(node)) => {
+                node.operands.get(*index).ok_or_else(|| {
+                    invalid("constant source COALESCE operand differs from its owned syntax")
+                })?
+            }
+            (SqlConstantExpressionStep::TryInner, ast::Expr::Try(node)) => &node.inner,
+            (SqlConstantExpressionStep::FormatArgument(index), ast::Expr::Format(node)) => {
+                node.arguments.get(*index).ok_or_else(|| {
+                    invalid("constant source FORMAT argument differs from its owned syntax")
+                })?
+            }
+            (SqlConstantExpressionStep::CaseOperand, ast::Expr::SimpleCase(case)) => &case.operand,
+            (SqlConstantExpressionStep::CaseWhenOperand(index), ast::Expr::SearchedCase(case)) => {
+                case_when_operand(&case.when_clauses, *index)?
+            }
+            (SqlConstantExpressionStep::CaseWhenOperand(index), ast::Expr::SimpleCase(case)) => {
+                case_when_operand(&case.when_clauses, *index)?
+            }
+            (SqlConstantExpressionStep::CaseResult(index), ast::Expr::SearchedCase(case)) => {
+                &case
+                    .when_clauses
+                    .get(*index)
+                    .ok_or_else(|| {
+                        invalid("constant source CASE branch index differs from its owned syntax")
+                    })?
+                    .result
+            }
+            (SqlConstantExpressionStep::CaseResult(index), ast::Expr::SimpleCase(case)) => {
+                &case
+                    .when_clauses
+                    .get(*index)
+                    .ok_or_else(|| {
+                        invalid("constant source CASE branch index differs from its owned syntax")
+                    })?
+                    .result
+            }
+            (SqlConstantExpressionStep::CaseDefault, ast::Expr::SearchedCase(case)) => {
+                case.default_value.as_ref().ok_or_else(|| {
+                    invalid("constant source CASE default is absent from its owned syntax")
+                })?
+            }
+            (SqlConstantExpressionStep::CaseDefault, ast::Expr::SimpleCase(case)) => {
+                case.default_value.as_ref().ok_or_else(|| {
+                    invalid("constant source CASE default is absent from its owned syntax")
+                })?
+            }
+            (SqlConstantExpressionStep::LambdaBody, ast::Expr::Lambda(lambda)) => &lambda.body,
+            (SqlConstantExpressionStep::ExistsSubquery, ast::Expr::Exists(exists)) => {
+                &exists.subquery
+            }
             _ => {
                 return Err(invalid(
                     "constant source expression path differs from its owned syntax",
@@ -157,6 +414,19 @@ pub(crate) fn resolve_expression_site<'a>(
         };
     }
     Ok(expression)
+}
+
+fn case_when_operand(
+    clauses: &[ast::WhenClause],
+    index: usize,
+) -> Result<&ast::Expr, SqlCompileError> {
+    let clause = clauses.get(index).ok_or_else(|| {
+        invalid("constant source CASE branch index differs from its owned syntax")
+    })?;
+    let ast::WhenMatch::Operand(value) = &clause.match_value else {
+        return Err(invalid("constant source CASE match is a partial predicate"));
+    };
+    Ok(value)
 }
 
 pub type SqlExpressionConstants = std::sync::Arc<[SqlExpressionConstant]>;

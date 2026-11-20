@@ -558,7 +558,7 @@ mod compile_control_tests {
 
         let target = novarocks_types::naming::TableIdentity::new("ice", "db", "broken_mv");
         let source = "SELECT\n (";
-        let parser_error = novarocks_parser::parse(source).unwrap_err();
+        let parser_error = novarocks_parser::parser::parse_query(source).unwrap_err();
         let analyze = crate::mv::domain::refresh::definition::read_stored_mv_query(source, &target)
             .unwrap_err();
         assert_eq!(

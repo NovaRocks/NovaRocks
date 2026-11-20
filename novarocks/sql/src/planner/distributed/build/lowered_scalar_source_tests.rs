@@ -94,7 +94,7 @@ pub(in crate::planner::distributed::build) fn lower_call(
     TypedExpr {
         kind: ExprKind::FunctionCall {
             name: "lower".into(),
-            args: vec![argument],
+            args: (vec![argument]).into(),
             distinct: false,
             binding: SqlFunctionBinding::new(resolved, decimal),
             volatility,
@@ -155,11 +155,10 @@ pub(in crate::planner::distributed::build) fn analyzed_lambda_expression_for_tes
     // The real analyzer supplies the selected Lambda and LOWER declarations.
     // This emitter fixture does not assert an installed ARRAY_MAP pure kernel
     // or bypass the public compiler's implementation-presence admission.
-    let statements =
-        novarocks_parser::parse("SELECT ARRAY_MAP(x -> LOWER(x), ['AA','BB']) AS mapped").unwrap();
-    let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
-        panic!("one Lambda query")
-    };
+    let query = &novarocks_parser::parser::parse_query(
+        "SELECT ARRAY_MAP(x -> LOWER(x), ['AA','BB']) AS mapped",
+    )
+    .unwrap();
     let (query, _, _) = crate::analyzer::analyze(
         query,
         &crate::catalog::memory::PlannerMemoryCatalog::default(),
@@ -387,14 +386,15 @@ fn scalar_journal_original_cast_and_nested_none_survive_constant_emission() {
     for argument in [
         TypedExpr {
             kind: ExprKind::Cast {
-                expr: Box::new(text("ABC")),
+                array_failure_mode: None,
+                expr: novarocks_parser::ast::AstBox::new(text("ABC")),
                 target: DataType::Utf8,
                 decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
             },
             value_type: ValueType::new(DataType::Utf8, false),
         },
         TypedExpr {
-            kind: ExprKind::Nested(Box::new(text("ABC"))),
+            kind: ExprKind::Nested(novarocks_parser::ast::AstBox::new(text("ABC"))),
             value_type: ValueType::new(DataType::Utf8, false),
         },
     ] {
@@ -432,7 +432,10 @@ fn scalar_journal_lambda_body_call_keeps_its_actual_emission_scope() {
                 slot_id: 9,
                 value_type: parameter_type,
             }],
-            body: Box::new(lower_call(parameter, DecimalOverflowPolicy::ReportError)),
+            body: novarocks_parser::ast::AstBox::new(lower_call(
+                parameter,
+                DecimalOverflowPolicy::ReportError,
+            )),
         },
         value_type: ValueType::new(DataType::Null, true),
     };
@@ -594,7 +597,8 @@ fn scalar_journal_bare_null_and_cast_null_keep_distinct_original_request_sources
     ));
     let cast = TypedExpr {
         kind: ExprKind::Cast {
-            expr: Box::new(null),
+            array_failure_mode: None,
+            expr: novarocks_parser::ast::AstBox::new(null),
             target: DataType::Utf8,
             decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
         },

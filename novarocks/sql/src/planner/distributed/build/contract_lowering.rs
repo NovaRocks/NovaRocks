@@ -93,12 +93,12 @@ use {
         RuntimeFilterReduction, RuntimeFilterWitnessId, SetOperationKind, SortDirection, SortExpr,
         SortMode, TableFunctionOutput, TopNPhase as ContractTopNPhase, TopNSequenceId,
         UnpivotConstant as ContractUnpivotConstant, UnpivotSpec, UnpivotValueMapping,
-        ValidationErrors, ValueId, ValueOrigin, ValueType, WRITER_MULTIPLEX_SCHEMA_REVISION,
-        WindowBound as ContractWindowBound, WindowCallSpec, WindowFrame as ContractWindowFrame,
-        WindowFrameExclusion, WindowFrameUnits, WindowSpec, WriterAggregateCall, WriterDerivedKind,
-        WriterFinishSpec, WriterGroupedUnpivotMapping, WriterGroupedUnpivotSpec,
-        WriterRelationField, WriterRelationFieldRole, WriterRelationSchema, WriterTarget,
-        WriterTargetField,
+        ValidationErrorCategory, ValidationErrors, ValueId, ValueOrigin, ValueType,
+        WRITER_MULTIPLEX_SCHEMA_REVISION, WindowBound as ContractWindowBound, WindowCallSpec,
+        WindowFrame as ContractWindowFrame, WindowFrameExclusion, WindowFrameUnits, WindowSpec,
+        WriterAggregateCall, WriterDerivedKind, WriterFinishSpec, WriterGroupedUnpivotMapping,
+        WriterGroupedUnpivotSpec, WriterRelationField, WriterRelationFieldRole,
+        WriterRelationSchema, WriterTarget, WriterTargetField,
     },
 };
 
@@ -4148,6 +4148,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                         read,
                         &converted_ty,
                         novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                        None,
                     )?;
                     let expression_root = self.root_definition(
                         node,
@@ -7782,6 +7783,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                     expression,
                     &published_type,
                     novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                    None,
                 )?
             };
             let root = self.root_definition(
@@ -10094,6 +10096,7 @@ impl<'a> ContractLoweringVisitor<'a> {
             &BTreeMap::new(),
             target,
             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            None,
         )?;
         let lowered_type = self.expression_value_type(owner, lowered)?;
         if lowered_type == *target {
@@ -10656,9 +10659,15 @@ impl<'a> ContractLoweringVisitor<'a> {
         visible: &BTreeMap<ColumnId, ValueId>,
         target: &ValueType,
         policy: novarocks_type_contract::DecimalOverflowPolicy,
+        array_failure_mode: Option<novarocks_type_contract::ArrayCastFailureMode>,
     ) -> Result<ExprId, ContractLoweringError> {
-        self.scalar_emission(owner)
-            .lower_expression_as(expression, visible, target, policy)
+        self.scalar_emission(owner).lower_expression_as(
+            expression,
+            visible,
+            target,
+            policy,
+            array_failure_mode,
+        )
     }
 
     /// The type a NULL constant is lowered in, or `None` for any other
@@ -10687,9 +10696,14 @@ impl<'a> ContractLoweringVisitor<'a> {
         expression: ExprId,
         target: &ValueType,
         policy: novarocks_type_contract::DecimalOverflowPolicy,
+        array_failure_mode: Option<novarocks_type_contract::ArrayCastFailureMode>,
     ) -> Result<ExprId, ContractLoweringError> {
-        self.scalar_emission(owner)
-            .convert_expression_to(expression, target, policy)
+        self.scalar_emission(owner).convert_expression_to(
+            expression,
+            target,
+            policy,
+            array_failure_mode,
+        )
     }
 
     fn convert_expression_to_inner(
@@ -10698,9 +10712,14 @@ impl<'a> ContractLoweringVisitor<'a> {
         expression: ExprId,
         target: &ValueType,
         policy: novarocks_type_contract::DecimalOverflowPolicy,
+        array_failure_mode: Option<novarocks_type_contract::ArrayCastFailureMode>,
     ) -> Result<ExprId, ContractLoweringError> {
-        self.scalar_emission(owner)
-            .convert_expression_to_inner(expression, target, policy)
+        self.scalar_emission(owner).convert_expression_to_inner(
+            expression,
+            target,
+            policy,
+            array_failure_mode,
+        )
     }
 
     fn common_comparison_value_type(
@@ -13455,6 +13474,13 @@ impl From<ContractLoweringError> for crate::compiler::SqlCompileError {
             ContractLoweringError::UnsupportedWaitCycle(cause) => {
                 Self::CompilationSource(novarocks_failure_contract::SharedFailureCause::new(cause))
             }
+            ContractLoweringError::Validation(errors)
+                if errors.has(ValidationErrorCategory::ResourceLimit)
+                    && !errors.has(ValidationErrorCategory::StructuralInvariant)
+                    && !errors.has(ValidationErrorCategory::UnsupportedCapability) =>
+            {
+                Self::CompilationSource(novarocks_failure_contract::SharedFailureCause::new(errors))
+            }
             error => Self::Compilation(error.to_string()),
         }
     }
@@ -14554,7 +14580,7 @@ mod tests {
         TypedExpr {
             kind: ExprKind::FunctionCall {
                 name: name.to_string(),
-                args,
+                args: (args).into(),
                 distinct: false,
                 binding,
                 volatility,
@@ -15922,9 +15948,9 @@ mod tests {
         let input = column(1, "number", DataType::Int64, false);
         let predicate = TypedExpr {
             kind: ExprKind::BinaryOp {
-                left: Box::new(column_ref(&input)),
+                left: novarocks_parser::ast::AstBox::new(column_ref(&input)),
                 op: BinOp::Gt,
-                right: Box::new(literal_int(0)),
+                right: novarocks_parser::ast::AstBox::new(literal_int(0)),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
@@ -15948,9 +15974,9 @@ mod tests {
                     ProjectItem {
                         expr: TypedExpr {
                             kind: ExprKind::BinaryOp {
-                                left: Box::new(column_ref(&input)),
+                                left: novarocks_parser::ast::AstBox::new(column_ref(&input)),
                                 op: BinOp::Add,
-                                right: Box::new(literal_int(1)),
+                                right: novarocks_parser::ast::AstBox::new(literal_int(1)),
                                 decimal_overflow_policy:
                                     novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                             },
@@ -16813,9 +16839,9 @@ mod tests {
             kind: PhysicalPlanKind::Filter(PlanFilterNode {
                 predicate: TypedExpr {
                     kind: ExprKind::BinaryOp {
-                        left: Box::new(column_ref(&input)),
+                        left: novarocks_parser::ast::AstBox::new(column_ref(&input)),
                         op: BinOp::Gt,
-                        right: Box::new(literal_int(0)),
+                        right: novarocks_parser::ast::AstBox::new(literal_int(0)),
                         decimal_overflow_policy:
                             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     },
@@ -17930,7 +17956,8 @@ mod tests {
             };
             join.condition.keys_mut()[0].right = TypedExpr {
                 kind: ExprKind::Cast {
-                    expr: Box::new(column_ref(&right)),
+                    array_failure_mode: None,
+                    expr: novarocks_parser::ast::AstBox::new(column_ref(&right)),
                     target: DataType::Int64,
                     decimal_overflow_policy:
                         novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
@@ -18363,11 +18390,12 @@ mod tests {
         for kind in [
             ExprKind::Case {
                 operand: None,
-                when_then: vec![(literal_bool(true), column_ref(&right))],
-                else_expr: Some(Box::new(literal_int(0))),
+                when_then: (vec![(literal_bool(true), column_ref(&right))]).into(),
+                else_expr: Some(novarocks_parser::ast::AstBox::new(literal_int(0))),
             },
             ExprKind::Cast {
-                expr: Box::new(column_ref(&right)),
+                array_failure_mode: None,
+                expr: novarocks_parser::ast::AstBox::new(column_ref(&right)),
                 target: DataType::Int64,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
@@ -18717,9 +18745,9 @@ mod tests {
             let predicate = if volatile {
                 TypedExpr {
                     kind: ExprKind::BinaryOp {
-                        left: Box::new(scalar_call("rand", vec![])),
+                        left: novarocks_parser::ast::AstBox::new(scalar_call("rand", vec![])),
                         op: BinOp::Gt,
-                        right: Box::new(literal_float(0.0)),
+                        right: novarocks_parser::ast::AstBox::new(literal_float(0.0)),
                         decimal_overflow_policy:
                             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     },
@@ -19943,32 +19971,33 @@ mod tests {
         let signed = literal_int(7);
         let kinds = [
             ExprKind::BinaryOp {
-                left: Box::new(large.clone()),
+                left: novarocks_parser::ast::AstBox::new(large.clone()),
                 op: BinOp::Eq,
-                right: Box::new(signed.clone()),
+                right: novarocks_parser::ast::AstBox::new(signed.clone()),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             ExprKind::InList {
-                expr: Box::new(large.clone()),
-                list: vec![signed.clone()],
+                expr: novarocks_parser::ast::AstBox::new(large.clone()),
+                list: (vec![signed.clone()]).into(),
                 negated: false,
             },
             ExprKind::Between {
-                expr: Box::new(large.clone()),
-                low: Box::new(signed.clone()),
-                high: Box::new(large.clone()),
+                expr: novarocks_parser::ast::AstBox::new(large.clone()),
+                low: novarocks_parser::ast::AstBox::new(signed.clone()),
+                high: novarocks_parser::ast::AstBox::new(large.clone()),
                 negated: false,
             },
             ExprKind::Case {
-                operand: Some(Box::new(large)),
-                when_then: vec![(
+                operand: Some(novarocks_parser::ast::AstBox::new(large)),
+                when_then: (vec![(
                     signed,
                     TypedExpr {
                         kind: ExprKind::Literal(LiteralValue::Bool(true)),
                         value_type: ValueType::new(DataType::Boolean, false),
                     },
-                )],
-                else_expr: Some(Box::new(TypedExpr {
+                )])
+                .into(),
+                else_expr: Some(novarocks_parser::ast::AstBox::new(TypedExpr {
                     kind: ExprKind::Literal(LiteralValue::Bool(false)),
                     value_type: ValueType::new(DataType::Boolean, false),
                 })),
@@ -20314,7 +20343,7 @@ mod tests {
                     value_type: declared.clone(),
                 },
                 2 => TypedExpr {
-                    kind: ExprKind::Nested(Box::new(literal_int32(2))),
+                    kind: ExprKind::Nested(novarocks_parser::ast::AstBox::new(literal_int32(2))),
                     value_type: declared.clone(),
                 },
                 _ => literal_int32(row),
@@ -20396,10 +20425,7 @@ mod tests {
             ("-9223372036854775808", DataType::Int64, i64::MIN),
         ] {
             let sql = format!("SELECT {literal}");
-            let statements = novarocks_parser::parse(&sql).unwrap();
-            let novarocks_parser::ast::Statement::Query(query) = &statements[0] else {
-                panic!("query");
-            };
+            let query = &novarocks_parser::parser::parse_query(&sql).unwrap();
             let (resolved, _, _) = crate::analyzer::analyze(query, &catalog, "default").unwrap();
             let crate::analysis::QueryBody::Select(select) = resolved.body else {
                 panic!("select");

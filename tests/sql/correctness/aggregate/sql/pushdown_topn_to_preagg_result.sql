@@ -25,38 +25,25 @@
 CREATE TABLE ${case_db}.t_pushdown_topn_preagg_result (
     city VARCHAR(16),
     sales INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t_pushdown_topn_preagg_result VALUES
-    ('a', 1),
-    ('a', 2),
-    ('a', 10),
-    ('b', 5),
-    ('b', 1),
-    ('c', 3),
-    ('c', 4),
-    ('d', 9),
-    ('d', 2),
-    ('e', 7),
-    ('e', 1),
-    ('f', 8);
+    ROW('a', 1),
+    ROW('a', 2),
+    ROW('a', 10),
+    ROW('b', 5),
+    ROW('b', 1),
+    ROW('c', 3),
+    ROW('c', 4),
+    ROW('d', 9),
+    ROW('d', 2),
+    ROW('e', 7),
+    ROW('e', 1),
+    ROW('f', 8);
 
-ANALYZE TABLE ${case_db}.t_pushdown_topn_preagg_result;
+ANALYZE ${case_db}.t_pushdown_topn_preagg_result;
 
-SET disable_optimizer_rules = '';
-
-SELECT city, SUM(sales) AS total_sales
-FROM (
-    SELECT city, sales FROM ${case_db}.t_pushdown_topn_preagg_result
-    UNION ALL
-    SELECT city, sales FROM ${case_db}.t_pushdown_topn_preagg_result
-) o
-GROUP BY city
-ORDER BY city
-LIMIT 3;
-
-SET disable_optimizer_rules = 'SplitTopN';
+SET SESSION disable_optimizer_rules = '';
 
 SELECT city, SUM(sales) AS total_sales
 FROM (
@@ -68,4 +55,16 @@ GROUP BY city
 ORDER BY city
 LIMIT 3;
 
-SET disable_optimizer_rules = '';
+SET SESSION disable_optimizer_rules = 'SplitTopN';
+
+SELECT city, SUM(sales) AS total_sales
+FROM (
+    SELECT city, sales FROM ${case_db}.t_pushdown_topn_preagg_result
+    UNION ALL
+    SELECT city, sales FROM ${case_db}.t_pushdown_topn_preagg_result
+) o
+GROUP BY city
+ORDER BY city
+LIMIT 3;
+
+SET SESSION disable_optimizer_rules = '';

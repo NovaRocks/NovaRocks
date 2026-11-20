@@ -128,6 +128,7 @@ fn exact_hidden_owner_and_full_effects_are_declared() {
             .map(|overload| overload.identity.as_str())
             .collect::<Vec<_>>(),
         [
+            ARRAY_COMMON_COERCION,
             JSON_TEXT,
             LARGEINT_DECIMAL,
             LARGEINT_FLOAT,

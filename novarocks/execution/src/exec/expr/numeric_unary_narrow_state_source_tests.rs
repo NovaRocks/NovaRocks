@@ -96,6 +96,7 @@ fn numeric_unary_narrow_source_raw_cast_negate_required_error_and_recipe_metadat
         &cast_narrow_type,
         DecimalOverflowPolicy::OutputNull,
         false,
+        None,
         &Control,
     )
     .unwrap();
@@ -141,6 +142,7 @@ fn numeric_unary_narrow_source_raw_cast_negate_required_error_and_recipe_metadat
         &widened_type,
         DecimalOverflowPolicy::OutputNull,
         false,
+        None,
         &Control,
     )
     .unwrap();

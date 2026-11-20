@@ -878,3 +878,64 @@ fn public_java_float_text_preserves_show_statistics_spellings() {
     }
     assert_eq!(crate::java_float_text(3.4e10).unwrap(), "3.4E10");
 }
+
+#[test]
+fn date32_full_range_uses_trino_sqldate_wire_year_format_and_original_bounded_encoder() {
+    // Independent expectations: pinned SqlDate.toString delegates to actual
+    // JDK LocalDate.ofEpochDay, rather than CAST(DATE AS VARCHAR)'s Joda writer.
+    let days = vec![
+        i32::MIN,
+        i32::MIN + 1,
+        i32::MAX - 1,
+        i32::MAX,
+        0,
+        -719893,
+        -719528,
+        -719162,
+    ];
+    let expected = vec![
+        r#"["-5877641-06-23"]"#,
+        r#"["-5877641-06-24"]"#,
+        r#"["+5881580-07-10"]"#,
+        r#"["+5881580-07-11"]"#,
+        r#"["1970-01-01"]"#,
+        r#"["-0001-01-01"]"#,
+        r#"["0000-01-01"]"#,
+        r#"["0001-01-01"]"#,
+    ];
+    for segment in [5, 13, 1000] {
+        assert_eq!(
+            payloads(
+                encoder(
+                    vec![Arc::new(Date32Array::from(days.clone()))],
+                    vec![field(N::Date, false)],
+                    TrinoJsonFacts::default()
+                ),
+                segment
+            ),
+            expected
+        );
+    }
+    let values: ArrayRef = Arc::new(Date32Array::from(vec![
+        Some(i32::MIN),
+        None,
+        Some(i32::MAX),
+    ]));
+    let list: ArrayRef = Arc::new(ListArray::new(
+        Arc::new(Field::new("item", arrow::datatypes::DataType::Date32, true)),
+        OffsetBuffer::new(ScalarBuffer::from(vec![0, 3])),
+        values,
+        None,
+    ));
+    assert_eq!(
+        payloads(
+            encoder(
+                vec![list],
+                vec![field(N::List(Box::new(field(N::Date, true))), false)],
+                TrinoJsonFacts::default()
+            ),
+            5
+        ),
+        [r#"[["-5877641-06-23",null,"+5881580-07-11"]]"#]
+    );
+}

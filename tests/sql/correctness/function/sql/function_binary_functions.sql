@@ -106,13 +106,12 @@ select from_binary(to_binary('1', 'encode64'), 'hex');
 -- query 21
 -- Create table with varbinary column
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.t0(c0 INT, c1 varbinary(16), c2 varchar(16))
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.t0(c0 INT, c1 varbinary(16), c2 varchar(16)) WITH (format_version = 3);
 
 -- query 22
 -- Insert one row (x'ab01' is binary literal)
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t0 VALUES (1, x'ab01', 'ab01');
+INSERT INTO ${case_db}.t0 VALUES ROW(1, X'ab01', 'ab01');
 
 -- query 23
 -- from_binary on varbinary column vs reconstructed binary
@@ -127,7 +126,7 @@ SELECT from_binary(c1, 'encode64'), from_binary(to_binary(c2, 'utf8'), 'hex') FR
 -- query 26
 -- Insert second row
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t0 VALUES (2, x'abab', 'abab');
+INSERT INTO ${case_db}.t0 VALUES ROW(2, X'abab', 'abab');
 
 -- query 27
 SELECT from_binary(c1, 'hex'), from_binary(to_binary(c2, 'hex'), 'hex') FROM ${case_db}.t0 ORDER BY c0;

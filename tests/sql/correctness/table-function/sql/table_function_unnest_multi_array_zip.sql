@@ -28,5 +28,5 @@ SELECT i, s
 FROM (
     SELECT [1, 2, 3] AS ai, ['x', 'y', 'z'] AS as1
 ) t
-CROSS JOIN LATERAL UNNEST(t.ai, t.as1) AS u(i, s)
+CROSS JOIN  UNNEST(t.ai, t.as1) AS u(i, s)
 ORDER BY i;

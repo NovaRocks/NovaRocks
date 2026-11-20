@@ -152,7 +152,7 @@ fn pairs(nullable: bool) -> [(FunctionValueType, FunctionValueType, &'static str
 }
 
 #[test]
-fn whole_builtin_catalogue_attaches_one_hidden_owner_and_exact_nine_implementation_records() {
+fn whole_builtin_catalogue_attaches_one_hidden_owner_and_exact_ten_implementation_records() {
     let owner = owner();
     let catalog = super::super::catalogue::build_builtin_engine_function_catalog().unwrap();
     let actual = catalog
@@ -200,6 +200,10 @@ fn whole_builtin_catalogue_attaches_one_hidden_owner_and_exact_nine_implementati
         (
             value_conversion::NULL_LIFT,
             "builtin.scalar/value_domain_conversion/null_to_typed_nullable/selected-v1",
+        ),
+        (
+            value_conversion::ARRAY_COMMON_COERCION,
+            "builtin.scalar/value_domain_conversion/array_common_coercion/selected-v1",
         ),
     ];
     assert_eq!(owner.implementations.len(), expected.len());

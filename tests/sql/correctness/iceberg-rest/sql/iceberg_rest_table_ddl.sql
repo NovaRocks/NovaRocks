@@ -25,7 +25,7 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE DATABASE iceberg_rest_${suite_uuid0}.iceberg_rest_tbl_db_${uuid0};
+CREATE SCHEMA iceberg_rest_${suite_uuid0}.iceberg_rest_tbl_db_${uuid0};
 
 -- query 2
 -- @skip_result_check=true
@@ -43,8 +43,7 @@ CREATE TABLE iceberg_rest_${suite_uuid0}.iceberg_rest_tbl_db_${uuid0}.t_part_${u
   id BIGINT,
   region STRING,
   amount DOUBLE
-)
-PARTITION BY (region);
+) WITH (partitioning = ARRAY['region']);
 
 -- query 4
 -- @skip_result_check=true
@@ -86,4 +85,4 @@ DROP TABLE IF EXISTS iceberg_rest_${suite_uuid0}.iceberg_rest_tbl_db_${uuid0}.t_
 
 -- query 10
 -- @skip_result_check=true
-DROP DATABASE iceberg_rest_${suite_uuid0}.iceberg_rest_tbl_db_${uuid0};
+DROP SCHEMA iceberg_rest_${suite_uuid0}.iceberg_rest_tbl_db_${uuid0};

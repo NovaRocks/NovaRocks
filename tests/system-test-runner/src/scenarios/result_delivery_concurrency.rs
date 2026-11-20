@@ -131,7 +131,7 @@ impl Scenario for ConcurrentResults {
                         .join(format!("concurrent-client-{client}-http")),
                 )?;
                 let query = format!(
-                    "SELECT CONCAT('client-{client}:', CAST(generate_series AS VARCHAR), ':', REPEAT('x', {SUFFIX_BYTES})) AS payload FROM generate_series(1, {ROWS}) ORDER BY generate_series"
+                    "SELECT CONCAT('client-{client}:', CAST(generate_series AS VARCHAR), ':', REPEAT('x', {SUFFIX_BYTES})) AS payload FROM TABLE(generate_series(1, {ROWS})) ORDER BY generate_series"
                 );
                 let post = actor.submit(&query)?;
                 ensure!(

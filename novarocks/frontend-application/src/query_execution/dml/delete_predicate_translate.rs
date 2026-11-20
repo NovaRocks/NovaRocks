@@ -22,7 +22,9 @@
 //! AND-only, no OR/functions/subqueries/joins; non-DUP tables require
 //! key columns; floating-point columns reject `=`.
 
-use novarocks_parser::ast::{BinaryOperator, Expr, IsPredicate, LiteralKind, UnaryOperator};
+use novarocks_parser::ast::{
+    ComparisonOperator, Expr, LiteralKind, LogicalOperator, Predicate, UnaryOperator,
+};
 use novarocks_types::schema::ColumnDef;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -118,17 +120,17 @@ fn flatten_and(expr: &Expr) -> Result<Vec<&Expr>, String> {
     let mut out = Vec::new();
     fn walk<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) -> Result<(), String> {
         match e {
-            Expr::Binary(expression) if expression.operator == BinaryOperator::And => {
-                walk(&expression.left, out)?;
-                walk(&expression.right, out)?;
+            Expr::Logical(expression) if expression.operator == LogicalOperator::And => {
+                for term in &expression.terms {
+                    walk(term, out)?;
+                }
                 Ok(())
             }
-            Expr::Binary(expression) if expression.operator == BinaryOperator::Or => {
+            Expr::Logical(expression) if expression.operator == LogicalOperator::Or => {
                 Err("DELETE on this table model does not support OR; \
                  use only AND of comparisons / IN / IS NULL"
                     .to_string())
             }
-            Expr::Nested(expression) => walk(&expression.expression, out),
             _ => {
                 out.push(e);
                 Ok(())
@@ -147,78 +149,71 @@ fn translate_atom(
     out: &mut DeletePredicateTerms,
 ) -> Result<(), String> {
     match atom {
-        Expr::Binary(expression) => {
-            let cmp = match expression.operator {
-                BinaryOperator::Equal => CmpOp::Eq,
-                BinaryOperator::NotEqual => CmpOp::Ne,
-                BinaryOperator::LessThan => CmpOp::Lt,
-                BinaryOperator::LessThanOrEqual => CmpOp::Le,
-                BinaryOperator::GreaterThan => CmpOp::Gt,
-                BinaryOperator::GreaterThanOrEqual => CmpOp::Ge,
-                other => {
+        Expr::Predicated(expression) => match &expression.predicate {
+            Predicate::Comparison(comparison) => {
+                let cmp = match comparison.operator {
+                    ComparisonOperator::Equal => CmpOp::Eq,
+                    ComparisonOperator::NotEqual => CmpOp::Ne,
+                    ComparisonOperator::LessThan => CmpOp::Lt,
+                    ComparisonOperator::LessThanOrEqual => CmpOp::Le,
+                    ComparisonOperator::GreaterThan => CmpOp::Gt,
+                    ComparisonOperator::GreaterThanOrEqual => CmpOp::Ge,
+                };
+                let (col_name, lit_expr, swapped) =
+                    extract_col_lit(&expression.value, &comparison.right)?;
+                let cmp = if swapped { cmp.flipped() } else { cmp };
+                let column = column_or_err(schema, &col_name)?;
+                check_keys(&col_name, &column, keys, keys_type)?;
+                if is_float_type(&column.data_type) && matches!(cmp, CmpOp::Eq | CmpOp::Ne) {
                     return Err(format!(
-                        "DELETE WHERE supports comparison / IN / IS NULL only; got {other:?}"
+                        "Don't support float column '{}' in delete condition",
+                        col_name
                     ));
                 }
-            };
-            let (col_name, lit_expr, swapped) =
-                extract_col_lit(&expression.left, &expression.right)?;
-            let cmp = if swapped { cmp.flipped() } else { cmp };
-            let column = column_or_err(schema, &col_name)?;
-            check_keys(&col_name, &column, keys, keys_type)?;
-            if is_float_type(&column.data_type) && matches!(cmp, CmpOp::Eq | CmpOp::Ne) {
-                return Err(format!(
-                    "Don't support float column '{}' in delete condition",
-                    col_name
-                ));
+                let value = serialize_literal(lit_expr, &column.data_type, &col_name)?;
+                out.binary.push(BinaryTerm {
+                    column: col_name,
+                    op: cmp,
+                    value,
+                });
+                Ok(())
             }
-            let value = serialize_literal(lit_expr, &column.data_type, &col_name)?;
-            out.binary.push(BinaryTerm {
-                column: col_name,
-                op: cmp,
-                value,
-            });
-            Ok(())
-        }
-        Expr::InList(expression) => {
-            let col_name = expr_to_col_name(&expression.expr)?;
-            let column = column_or_err(schema, &col_name)?;
-            check_keys(&col_name, &column, keys, keys_type)?;
-            let values = expression
-                .list
-                .iter()
-                .map(|e| serialize_literal(e, &column.data_type, &col_name))
-                .collect::<Result<Vec<_>, _>>()?;
-            out.in_list.push(InTerm {
-                column: col_name,
-                is_not_in: expression.negated,
-                values,
-            });
-            Ok(())
-        }
-        Expr::IsPredicate(expression) if expression.predicate == IsPredicate::Null => {
-            let col_name = expr_to_col_name(&expression.expr)?;
-            let column = column_or_err(schema, &col_name)?;
-            check_keys(&col_name, &column, keys, keys_type)?;
-            out.is_null.push(IsNullTerm {
-                column: col_name,
-                is_not_null: false,
-            });
-            Ok(())
-        }
-        Expr::IsPredicate(expression) if expression.predicate == IsPredicate::NotNull => {
-            let col_name = expr_to_col_name(&expression.expr)?;
-            let column = column_or_err(schema, &col_name)?;
-            check_keys(&col_name, &column, keys, keys_type)?;
-            out.is_null.push(IsNullTerm {
-                column: col_name,
-                is_not_null: true,
-            });
-            Ok(())
-        }
-        Expr::Nested(expression) => {
-            translate_atom(&expression.expression, schema, keys, keys_type, out)
-        }
+            Predicate::In(predicate) => {
+                let Expr::InList(list) = &predicate.value_list else {
+                    return Err("DELETE WHERE IN requires a literal value list".into());
+                };
+                if list.values.is_empty() {
+                    return Err("DELETE WHERE IN requires a nonempty value list".into());
+                }
+                let col_name = expr_to_col_name(&expression.value)?;
+                let column = column_or_err(schema, &col_name)?;
+                check_keys(&col_name, &column, keys, keys_type)?;
+                let values = list
+                    .values
+                    .iter()
+                    .map(|value| serialize_literal(value, &column.data_type, &col_name))
+                    .collect::<Result<Vec<_>, _>>()?;
+                out.in_list.push(InTerm {
+                    column: col_name,
+                    is_not_in: predicate.negated,
+                    values,
+                });
+                Ok(())
+            }
+            Predicate::IsNull(predicate) => {
+                let col_name = expr_to_col_name(&expression.value)?;
+                let column = column_or_err(schema, &col_name)?;
+                check_keys(&col_name, &column, keys, keys_type)?;
+                out.is_null.push(IsNullTerm {
+                    column: col_name,
+                    is_not_null: predicate.negated,
+                });
+                Ok(())
+            }
+            other => Err(format!(
+                "DELETE WHERE supports comparison / IN / IS NULL only; got {other:?}"
+            )),
+        },
         other => Err(format!(
             "DELETE WHERE atom must be col-op-lit / IN / IS NULL; got {other:?}"
         )),
@@ -239,14 +234,9 @@ fn extract_col_lit<'a>(
 }
 
 fn expr_to_col_name(e: &Expr) -> Result<String, String> {
-    match e {
-        Expr::Identifier(id) => Ok(id.value.to_lowercase()),
-        Expr::CompoundIdentifier(parts) => parts
-            .parts
-            .last()
-            .map(|p| p.value.to_lowercase())
-            .ok_or_else(|| "empty compound identifier".to_string()),
-        other => Err(format!("expected column reference, got {other:?}")),
+    match novarocks_parser::ast::identifier_chain_observed(e, |_| Ok::<(), String>(()))? {
+        Some(chain) => Ok(chain.last().value.to_lowercase()),
+        None => Err(format!("expected column reference, got {e:?}")),
     }
 }
 
@@ -296,7 +286,9 @@ fn serialize_literal(
     use arrow::datatypes::{DataType, TimeUnit};
     let (raw, was_negated): (String, bool) = match lit_expr {
         Expr::Literal(literal) => match &literal.kind {
-            LiteralKind::Number(s) => (s.clone(), false),
+            LiteralKind::Long { parsed_value, .. } => (parsed_value.to_string(), false),
+            LiteralKind::Double(value) => (format!("{:?}", value.get()), false),
+            LiteralKind::Decimal(s) => (s.clone(), false),
             LiteralKind::String(s) => (s.clone(), false),
             LiteralKind::Boolean(b) => return Ok(if *b { "1".into() } else { "0".into() }),
             LiteralKind::Null => {
@@ -313,12 +305,16 @@ fn serialize_literal(
         },
         Expr::Unary(expression) if expression.operator == UnaryOperator::Minus => {
             match expression.expression.as_ref() {
-                Expr::Literal(literal) if matches!(&literal.kind, LiteralKind::Number(_)) => {
-                    let LiteralKind::Number(s) = &literal.kind else {
-                        unreachable!()
-                    };
-                    (s.clone(), true)
-                }
+                Expr::Literal(literal) => match &literal.kind {
+                    LiteralKind::Long { parsed_value, .. } => (parsed_value.to_string(), true),
+                    LiteralKind::Double(value) => (format!("{:?}", value.get()), true),
+                    LiteralKind::Decimal(s) => (s.clone(), true),
+                    _ => {
+                        return Err(format!(
+                            "unsupported negated literal for column '{column_name}'"
+                        ));
+                    }
+                },
                 _ => {
                     return Err(format!(
                         "unsupported negated literal for column '{column_name}'"
@@ -460,7 +456,6 @@ fn split_datetime_fraction(raw: &str, column_name: &str) -> Result<(String, Stri
 mod tests {
     use super::*;
     use arrow::datatypes::DataType;
-    use novarocks_parser::ast::{DmlStatement, Statement};
 
     fn dup_schema_int_str() -> Vec<ColumnDef> {
         vec![
@@ -482,12 +477,13 @@ mod tests {
     }
 
     fn parse_where(sql: &str) -> Expr {
-        let statements =
-            novarocks_parser::parse(&format!("DELETE FROM t WHERE {sql}")).expect("parse");
-        let Statement::Dml(DmlStatement::Delete(delete)) = &statements[0] else {
+        let source = format!("DELETE FROM t WHERE {sql}");
+        let novarocks_parser::ast::TrinoStatement::Delete(delete) =
+            novarocks_parser::parser::parse_statement(&source).unwrap()
+        else {
             panic!("expected DELETE");
         };
-        delete.selection.clone().expect("WHERE clause")
+        delete.predicate.expect("WHERE clause")
     }
 
     #[test]
@@ -534,6 +530,50 @@ mod tests {
     }
 
     #[test]
+    fn nested_conjunction_keeps_borrowed_atoms_in_source_order() {
+        let predicate = parse_where("id = 1 AND (name = 'a' AND id = 2) AND id = 3");
+        let Expr::Logical(root) = &predicate else {
+            panic!("root AND");
+        };
+        assert_eq!(root.operator, LogicalOperator::And);
+        assert_eq!(root.terms.len(), 3);
+        let Expr::Logical(group) = &root.terms[1] else {
+            panic!("group AND");
+        };
+        assert_eq!(group.operator, LogicalOperator::And);
+        assert_eq!(group.terms.len(), 2);
+        let expected = [
+            &root.terms[0],
+            &group.terms[0],
+            &group.terms[1],
+            &root.terms[2],
+        ];
+        let atoms = flatten_and(&predicate).unwrap();
+        assert_eq!(atoms.len(), expected.len());
+        for (actual, expected) in atoms.iter().zip(expected) {
+            assert!(std::ptr::eq(*actual, expected));
+            assert_eq!(actual.span(), expected.span());
+        }
+        let terms = translate_to_delete_predicate(
+            &predicate,
+            &dup_schema_int_str(),
+            &["id".into()],
+            KeysType::Dup,
+        )
+        .unwrap();
+        assert_eq!(
+            terms
+                .binary
+                .iter()
+                .map(|term| term.value.as_str())
+                .collect::<Vec<_>>(),
+            ["1", "a", "2", "3"]
+        );
+        let rejected = parse_where("id = 1 AND (id = 2 OR id = 3)");
+        assert!(flatten_and(&rejected).unwrap_err().contains("OR"));
+    }
+
+    #[test]
     fn or_rejected() {
         let w = parse_where("id = 1 OR id = 2");
         let err = translate_to_delete_predicate(
@@ -569,6 +609,45 @@ mod tests {
             KeysType::Dup,
         )
         .expect("dup allows non-key");
+    }
+
+    #[test]
+    fn comparison_extraction_borrows_original_predicated_value_and_right() {
+        let predicate = parse_where("5 < id");
+        let Expr::Predicated(expression) = &predicate else {
+            panic!("comparison predicate");
+        };
+        let Predicate::Comparison(comparison) = &expression.predicate else {
+            panic!("comparison payload");
+        };
+        let (name, literal, flipped) =
+            extract_col_lit(&expression.value, &comparison.right).unwrap();
+        assert_eq!(name, "id");
+        assert!(flipped);
+        assert!(std::ptr::eq(literal, &expression.value));
+        assert_eq!(literal.span(), expression.value.span());
+    }
+
+    #[test]
+    fn advanced_predicates_do_not_expand_delete_translation() {
+        for source in [
+            "id IS NOT DISTINCT FROM 1",
+            "id BETWEEN 1 AND 2",
+            "id IS TRUE",
+            "name LIKE 'a%'",
+        ] {
+            let predicate = parse_where(source);
+            assert!(
+                translate_to_delete_predicate(
+                    &predicate,
+                    &dup_schema_int_str(),
+                    &["id".into()],
+                    KeysType::Dup
+                )
+                .is_err(),
+                "{source}"
+            );
+        }
     }
 
     #[test]

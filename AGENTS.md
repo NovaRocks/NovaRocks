@@ -194,11 +194,14 @@ SQL client
   `system` 与各 catalog 的 `information_schema` 保持只读，见 ADR-0226。
 
 - `novarocks/parser/src/**`
-  Hand-written lexer, parser and AST, including the StarRocks-compatible
-  surface for catalogs, tables, materialized views, Iceberg refs and drops.
+  拥有 NovaRocks 唯一的 Trino SQL 词法、文法、带位置 AST 和 printer。
+  两条语法扩展是 `INSERT OVERWRITE` 和 `INSERT OVERWRITE PARTITIONS`。
+  文法、AST 及扩展见 [ADR-0241](docs/adr/ADR-0241-sole-trino-sql-dialect-and-closed-syntax-extensions.md)。
 
 - `novarocks/sql/src/{analysis,analyzer,semantic}/**`
   Name and expression resolution, type rules and semantic validation.
+  关系取得别名后，该别名是该关系在当前查询层的唯一限定名。
+  SQL 分析器以类型化错误报告未支持的查询构造。
 
 - `novarocks/sql/src/optimizer/**`
   Logical/physical optimization: `rewrite/rules/**` and `cascades_rules/**` for
@@ -211,8 +214,8 @@ SQL client
   `distributed/`, `pipeline/`, `runtime_filter/`).
 
 - `novarocks/query-application/src/sql.rs`, `novarocks/query-application/src/sql/**`
-  Query-application ownership of parser-admitted statement shape: statement
-  admission and DDL/DML routing.
+  `sql/trino_admission.rs::admit_trino_statement` 准入 Trino 语句 AST 并把类型化 DDL/DML 交给对应作者。
+  文法错误返回 `SYNTAX_ERROR`，已解析但未支持的能力由对应消费层返回 `NOT_SUPPORTED`。
 
 - `novarocks/frontend-application/src/query_execution/dml/**`
   DML flows — `insert.rs`, `delete/**`, `mutation.rs` / `mutation_flow.rs`,
@@ -807,7 +810,8 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
   `user`、MV scheduler 与 Iceberg maintenance 设置。Trino 固定监听 `127.0.0.1`，
   使用配置用户；Host 仅接受 `localhost`、`127.0.0.1`、`[::1]`（可带数字端口）。
   `mysql_port` 与旧 MySQL 载体配置明确拒绝，不转换为 Trino 配置。
-  Trino 是客户端协议入口，SQL 仍使用当前方言；客户端 TLS、非本机访问与非空认证不在此入口范围。
+  此入口使用 Trino HTTP 协议、Trino SQL 文法和 [ADR-0241](docs/adr/ADR-0241-sole-trino-sql-dialect-and-closed-syntax-extensions.md) 的封闭语法扩展。
+  客户端 TLS、非本机访问与非空认证不在此入口范围。
 
 - `[connector.object_store]`
   Iceberg Connector 执行使用的进程本地对象存储凭据，不定义 native 内部表存储。
@@ -925,12 +929,15 @@ FE 绑定 Trino 客户端监听后，在 stdout 输出：
 `NOVA_ENV_TRINO_PORT` 是本地 fixture 导出的 Trino 端口。
 
 SQL runner 经 Trino HTTP 协议运行；生成配置的 `[cluster]` 使用 `host`、`trino_port`、`user`，拒绝旧 `port`、`password`。命令行使用 `--trino-port`，不再接受 MySQL、参照或 diff 参数。golden 与语料会话声明见 [SQL README](tests/sql/README.md#golden-格式)。
+正向用例使用 [Trino SQL](tests/sql/README.md#sql-方言与用例作者)。退役语法用于具名拒绝用例，
+runner 负责分句，`@expect_trino_error` 比较实际协议错误。
 
 Run SQL tests with the generated runner config:
 
 ```bash
 docker/iceberg-rest/up.sh
-source docker/iceberg-rest/runtime/current/env.sh
+fixture_publication="$(python3 -c 'from pathlib import Path; print(Path("docker/iceberg-rest/runtime/current/published").resolve(strict=True))')"
+source "$fixture_publication/env.sh"
 cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
   --config "$NOVAROCKS_SQL_TEST_CONFIG" \
   --suite iceberg --mode verify
@@ -1103,7 +1110,9 @@ Suites are discovered from `tests/sql/correctness/`; ask the runner for the
 current list with `--list-suites`.
 `trino-reference` is explicit-only and uses native 1FE+3BE with REST/MinIO.
 Its Trino reference is declared in `docker/fixture-inputs/versions.json` and
-created on demand by the common input builder; see ADR-0231. `tests/sql/correctness/README.md` carries the
+created on demand by the common input builder. Each reference run is bound under ADR-0231.
+The SQL grammar source for this cutover is recorded in [ADR-0241](docs/adr/ADR-0241-sole-trino-sql-dialect-and-closed-syntax-extensions.md).
+`tests/sql/correctness/README.md` carries the
 suite map — which engine area each suite covers, its typical change entry, and
 whether it needs the REST Catalog fixture or a cross-process topology — and is
 the reference for choosing suites. `ssb`, `tpc-h` and `tpc-ds` are explicit-only
@@ -1280,7 +1289,8 @@ the guide differ.
   裸启动禁令查根 `clippy.toml`，近邻配置不合并；先确认实际 owner 与生命周期，
   不把协议 terminal、取消请求、guard 计数或源码形状当退出证明。
 
-- **SQL / parser / planner changes**: start with `novarocks/parser/src/**`,
+- **SQL / parser / planner changes**: use `novarocks/parser/src/{parser,printer}/`
+  and `novarocks/parser/tests/it/` for syntax. Analysis and planning start in
   `novarocks/sql/src/{analysis,analyzer,semantic}/**`,
   `novarocks/sql/src/optimizer/**` and `novarocks/sql/src/planner/**`.
   完成物理计划的 C/B 等待图、输入消费分类与 SCC 的单一作者是

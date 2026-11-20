@@ -26,17 +26,16 @@ USE ${case_db};
 -- query 2
 -- @skip_result_check=true
 USE ${case_db};
-CREATE TABLE `array_map_test` (
-  `id` tinyint(4) NOT NULL COMMENT "",
-  `arr_str` array<string> NULL COMMENT "",
-  `arr_largeint` array<largeint> NULL COMMENT ""
-)
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE "array_map_test" (
+  "id" tinyint(4) NOT NULL,
+  "arr_str" array<string>,
+  "arr_largeint" array<largeint>
+) WITH (format_version = 3);
 
 -- query 3
 -- @skip_result_check=true
 USE ${case_db};
-insert into array_map_test values (1, array_repeat("abcdefghasdasdasirnqwrq", 20000), array_repeat(CAST(100 AS LARGEINT), 20000));
+insert into array_map_test values ROW(1, array_repeat('abcdefghasdasdasirnqwrq', 20000), array_repeat(CAST(100 AS LARGEINT), 20000));
 
 -- query 4
 USE ${case_db};
@@ -64,7 +63,7 @@ USE ${case_db};
 
 -- query 10
 USE ${case_db};
-select array_length(array_map((x,y)->x > y, (array_repeat("12345",1000000)),(array_repeat("12345",1000000)))) from table(generate_series(1,10,1));
+select array_length(array_map((x,y)->x > y, (array_repeat('12345',1000000)),(array_repeat('12345',1000000)))) from table(generate_series(1,10,1));
 
 -- query 11
 USE ${case_db};
@@ -74,18 +73,17 @@ select count(*) from array_map_test where array_map((a1) -> concat(split(id, 'd'
 -- query 12
 -- @skip_result_check=true
 USE ${case_db};
-CREATE TABLE `t` (
-  `k` bigint NOT NULL COMMENT "",
-  `arr_0` array<bigint> NOT NULL COMMENT "",
-  `arr_1` array<bigint> NULL COMMENT "",
-  `arr_2` array<bigint> NULL COMMENT ""
-)
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE "t" (
+  "k" bigint NOT NULL,
+  "arr_0" array<bigint> NOT NULL,
+  "arr_1" array<bigint>,
+  "arr_2" array<bigint>
+) WITH (format_version = 3);
 
 -- query 13
 -- @skip_result_check=true
 USE ${case_db};
-insert into t values (1, [1,2], [1,2],[2,3]), (2, [1,2], null, [2,3]), (3, [1,2],[1,2],null),(4, [1,2],[null,null],[2,3]), (5, [1], [1,2], [3]);
+insert into t values ROW(1, [1,2], [1,2],[2,3]), ROW(2, [1,2], null, [2,3]), ROW(3, [1,2],[1,2],null),ROW(4, [1,2],[null,null],[2,3]), ROW(5, [1], [1,2], [3]);
 
 -- query 14
 -- @expect_error=Input array element's size is not equal in array_map()
@@ -196,26 +194,25 @@ USE ${case_db};
 
 -- query 40
 USE ${case_db};
-select /*+ SET_VAR(query_mem_limit=104857600)*/array_sum(array_map(x->array_contains((array_generate(1,10000)),x), array_generate(1,100000)));
+WITH SESSION query_mem_limit = 104857600 select /*+ SET_VAR(query_mem_limit=104857600)*/array_sum(array_map(x->array_contains((array_generate(1,10000)),x), array_generate(1,100000)));
 
 -- query 41
 -- @skip_result_check=true
 USE ${case_db};
-CREATE TABLE `array_map_x` (
-  `id` tinyint(4) NOT NULL COMMENT "",
-  `arr_str` array<varchar(65533)> NULL COMMENT "",
-  `arr_largeint` array<largeint(40)> NULL COMMENT ""
-)
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE "array_map_x" (
+  "id" tinyint(4) NOT NULL,
+  "arr_str" array<varchar(65533)>,
+  "arr_largeint" array<largeint(40)>
+) WITH (format_version = 3);
 
 -- query 42
 -- @skip_result_check=true
 USE ${case_db};
-insert into array_map_x values (1, array_repeat("abcdefghasdasdasirnqwrq", 2), array_repeat(CAST(100 AS LARGEINT), 2));
+insert into array_map_x values ROW(1, array_repeat('abcdefghasdasdasirnqwrq', 2), array_repeat(CAST(100 AS LARGEINT), 2));
 
 -- query 43
 USE ${case_db};
-select cast(if (1 > rand(), "[]", "") as array<string>) l , array_map((x)-> (concat(x,l)), arr_str) from array_map_x;
+select cast(if (1 > rand(), '[]', '') as array<string>) l , array_map((x)-> (concat(x,l)), arr_str) from array_map_x;
 
 -- query 44
 -- @skip_result_check=true

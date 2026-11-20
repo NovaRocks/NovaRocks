@@ -49,6 +49,7 @@ fn recipe(
         &FunctionValueType::new(target, true),
         policy,
         allow,
+        None,
         &Control,
     )
     .unwrap()
@@ -1432,6 +1433,7 @@ fn p05_timestamp_decimal_preparation_contract() {
                         &result,
                         policy,
                         allow,
+                        None,
                         &Control,
                     );
                     if !target_nullable {
@@ -1470,6 +1472,7 @@ fn p05_timestamp_decimal_preparation_contract() {
                     &FunctionValueType::new(target.clone(), true),
                     policy,
                     allow,
+                    None,
                     &Control
                 ),
                 Err(CastPrepareError::Unsupported)
@@ -1741,6 +1744,7 @@ fn utf8_offset_widening_preserves_exact_successful_null_obligation() {
                     &FunctionValueType::new(DataType::LargeUtf8, result_nullable),
                     policy,
                     allow,
+                    None,
                     &Control,
                 );
                 if source_nullable && !result_nullable {
@@ -1791,6 +1795,7 @@ fn utf8_offset_widening_preserves_exact_successful_null_obligation() {
             &FunctionValueType::new(DataType::LargeUtf8, false),
             policy,
             allow,
+            None,
             &Control,
         )
         .unwrap();
@@ -2336,6 +2341,7 @@ fn checked_time_demand_keeps_hidden_nulls_inherited_errors_and_scalar_addresses(
                 &FunctionValueType::new(to.clone(), true),
                 policy,
                 allow,
+                None,
                 &Control,
             )
             .unwrap();
@@ -2360,6 +2366,7 @@ fn checked_time_demand_keeps_hidden_nulls_inherited_errors_and_scalar_addresses(
                 &FunctionValueType::new(to.clone(), false),
                 policy,
                 allow,
+                None,
                 &Control,
             )
             .unwrap_err();

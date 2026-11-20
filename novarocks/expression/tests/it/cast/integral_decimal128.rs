@@ -203,6 +203,7 @@ fn decimal_to_tinyint_overflow_keeps_its_selected_row_error() {
                 id: parameter,
                 expected_key: SemanticParameterKey::AllowThrowException,
             },
+            array_failure_mode: None,
         },
         &parameters,
     )

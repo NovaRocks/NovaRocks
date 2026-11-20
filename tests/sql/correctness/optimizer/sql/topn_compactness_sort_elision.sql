@@ -21,7 +21,7 @@
 
 -- query 1
 -- @explain_contains=TOP-N
-EXPLAIN VERBOSE SELECT id, score
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'  SELECT id, score
 FROM (
     SELECT id, score
     FROM (
@@ -35,11 +35,11 @@ ORDER BY score DESC, id ASC
 LIMIT 2;
 
 -- query 2
-SET disable_optimizer_rules = 'RemoveRedundantSortUnderTopN';
+SET SESSION disable_optimizer_rules = 'RemoveRedundantSortUnderTopN';
 
 -- query 3
 -- @explain_contains=SORT
-EXPLAIN VERBOSE SELECT id, score
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'  SELECT id, score
 FROM (
     SELECT id, score
     FROM (
@@ -53,4 +53,4 @@ ORDER BY score DESC, id ASC
 LIMIT 2;
 
 -- query 4
-SET disable_optimizer_rules = '';
+SET SESSION disable_optimizer_rules = '';

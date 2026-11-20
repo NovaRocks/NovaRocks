@@ -717,6 +717,7 @@ impl novarocks_query_application::sql::session::registry::SessionCatalogProperty
                     instance_id: runtime.instance_id,
                     provider_id: runtime.provider_id,
                     generation: runtime.generation,
+                    binding_key: facts.binding_key,
                 };
                 let metadata = self
                     .session_properties

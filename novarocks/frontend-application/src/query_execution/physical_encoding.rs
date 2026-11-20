@@ -1209,11 +1209,7 @@ mod tests {
     use super::*;
 
     fn query_ast(sql: &str) -> Box<novarocks_parser::ast::Query> {
-        let mut statements = novarocks_parser::parse(sql).unwrap();
-        assert_eq!(statements.len(), 1);
-        let novarocks_parser::ast::Statement::Query(query) = statements.pop().unwrap() else {
-            panic!("expected one query");
-        };
+        let query = novarocks_parser::parser::parse_query(sql).unwrap();
         Box::new(query)
     }
 
@@ -1834,10 +1830,57 @@ mod tests {
         );
     }
 
+    // A narrow test catalogue retains the actual ARRAY owner and installed
+    // overloads. It makes no claim about the Server's production manifest.
+    fn sealed_array_literal_subset() -> novarocks_functions::PureEngineFunctionCatalog {
+        use novarocks_functions::{
+            EngineFunctionCatalogBuilder, FunctionKind, InstalledPureKernel,
+        };
+        let actual = novarocks_functions::builtin::catalogue::builtin_engine_function_catalog();
+        let definition = actual
+            .definition("__array_literal", FunctionKind::Scalar)
+            .unwrap();
+        let declaration = definition.binding_declaration().unwrap();
+        let control = SqlCompileControl::unbounded();
+        let installed = declaration
+            .overloads()
+            .iter()
+            .map(|overload| {
+                let owner = actual
+                    .pure_overload_declaration_observed(
+                        declaration.function_id(),
+                        declaration.kind(),
+                        &overload.identity,
+                        &control,
+                    )
+                    .unwrap();
+                InstalledPureKernel {
+                    function: declaration.function_id().clone(),
+                    kind: declaration.kind(),
+                    implementation: owner.implementation().clone(),
+                    aggregate_state_format: None,
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut builder = EngineFunctionCatalogBuilder::new();
+        builder.register(definition.clone()).unwrap();
+        builder.seal_pure(installed).unwrap()
+    }
+
     /// Decode the FE's own v2 bytes and compile every fragment with the
     /// independent local compiler, as a BE host would.
     fn compiled_programs(
         sql: &str,
+    ) -> std::collections::BTreeMap<
+        novarocks_physical_plan::FragmentId,
+        novarocks_local_program::LocalProgram,
+    > {
+        compiled_programs_with_functions(sql, &sealed_rand_subset())
+    }
+
+    fn compiled_programs_with_functions(
+        sql: &str,
+        functions: &novarocks_functions::PureEngineFunctionCatalog,
     ) -> std::collections::BTreeMap<
         novarocks_physical_plan::FragmentId,
         novarocks_local_program::LocalProgram,
@@ -1854,7 +1897,6 @@ mod tests {
         let (_, packages) = frozen_packages(sql);
         let control = SqlCompileControl::unbounded();
         let model = FragmentDecodeResourceModel::try_new(&control).expect("decode model");
-        let functions = sealed_rand_subset();
         let providers =
             PureProviderProgramCatalog::<std::io::Error>::try_new(&[], vec![], &control)
                 .expect("empty provider catalog");
@@ -1876,11 +1918,28 @@ mod tests {
                     kernel_abi: novarocks_local_program::KernelAbiVersion::CURRENT,
                     constants: crate::application::test_constant_policy(),
                 };
-                let program = compile_fragment(validated, &functions, options, &control)
+                let program = compile_fragment(validated, functions, options, &control)
                     .unwrap_or_else(|error| panic!("{sql}: fragment {id:?} compiles: {error}"));
                 (*id, program)
             })
             .collect()
+    }
+
+    // The native NULL-list refusal occurred after freezing, in the independent
+    // LocalProgram type author. Exercise that same complete receiver chain.
+    #[test]
+    fn null_list_json_and_varchar_casts_compile_through_the_actual_package_receiver() {
+        let functions = sealed_array_literal_subset();
+        for sql in [
+            "SELECT CAST([] AS ARRAY<JSON>) AS json_values",
+            "SELECT CAST([NULL,NULL] AS ARRAY<JSON>) AS json_values",
+            "SELECT CAST([] AS ARRAY<VARCHAR>) AS string_values",
+            "SELECT CAST([NULL,NULL] AS ARRAY<VARCHAR>) AS string_values",
+            "SELECT CAST([] AS ARRAY<JSON>) AS json_values, CAST([] AS ARRAY<VARCHAR>) AS string_values",
+        ] {
+            let programs = compiled_programs_with_functions(sql, &functions);
+            assert_eq!(programs.len(), 2, "producer and gather both compile: {sql}");
+        }
     }
 
     // The packages a real FE plan freezes compile into local programs whose

@@ -17,7 +17,7 @@
 
 -- query 1
 with frequent_ss_items as
- (select substr(i_item_desc,1,30) itemdesc,i_item_sk item_sk,d_date solddate,count(*) cnt
+ (select substr(i_item_desc,1,30) itemdesc,i_item_sk item_sk,d_date solddate,count() cnt
   from store_sales
       ,date_dim
       ,item
@@ -25,7 +25,7 @@ with frequent_ss_items as
     and ss_item_sk = i_item_sk
     and d_year in (2000,2000+1,2000+2,2000+3)
   group by substr(i_item_desc,1,30),i_item_sk,d_date
-  having count(*) >4),
+  having count() >4),
  max_store_sales as
  (select max(csales) tpcds_cmax
   from (select c_customer_sk,sum(ss_quantity*ss_sales_price) csales
@@ -67,7 +67,7 @@ from
  limit 100;
 -- query 2
 with frequent_ss_items as
- (select substr(i_item_desc,1,30) itemdesc,i_item_sk item_sk,d_date solddate,count(*) cnt
+ (select substr(i_item_desc,1,30) itemdesc,i_item_sk item_sk,d_date solddate,count() cnt
   from store_sales
       ,date_dim
       ,item
@@ -75,7 +75,7 @@ with frequent_ss_items as
     and ss_item_sk = i_item_sk
     and d_year in (2000,2000 + 1,2000 + 2,2000 + 3)
   group by substr(i_item_desc,1,30),i_item_sk,d_date
-  having count(*) >4),
+  having count() >4),
  max_store_sales as
  (select max(csales) tpcds_cmax
   from (select c_customer_sk,sum(ss_quantity*ss_sales_price) csales

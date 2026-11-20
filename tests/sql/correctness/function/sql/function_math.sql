@@ -26,65 +26,63 @@
 -- Setup: create t1 with array<float> column
 -- @skip_result_check=true
 USE ${case_db};
-CREATE TABLE t1 (id int, data array<float>)
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE t1 (id int, data array<float>) WITH (format_version = 3);
 
 -- query 2
 -- @skip_result_check=true
 USE ${case_db};
-INSERT INTO t1 VALUES(1, array<float>[0.1, 0.2, 0.3]), (2, array<float>[0.2, 0.1, 0.3]), (3, array<float>[0.3, 0.2, 0.1]);
+INSERT INTO t1 VALUES ROW(1, CAST(ARRAY[DECIMAL '0.1', DECIMAL '0.2', DECIMAL '0.3'] AS array(float))), ROW(2, CAST(ARRAY[DECIMAL '0.2', DECIMAL '0.1', DECIMAL '0.3'] AS array(float))), ROW(3, CAST(ARRAY[DECIMAL '0.3', DECIMAL '0.2', DECIMAL '0.1'] AS array(float)));
 
 -- query 3
 -- cosine_similarity with literal array vs table column
 USE ${case_db};
-SELECT round(cosine_similarity(array<float>[0.1, 0.2, 0.3], data), 3) AS dist, id FROM t1 ORDER BY dist desc, id;
+SELECT round(cosine_similarity(CAST([0.1, 0.2, 0.3] AS array<float>), data), 3) AS dist, id FROM t1 ORDER BY dist desc, id;
 
 -- query 4
 -- cosine_similarity on two literal arrays
 USE ${case_db};
-SELECT round(cosine_similarity(array<float>[0.1, 0.2, 0.3], array<float>[0.1, 0.2, 0.3]), 3) AS dist;
+SELECT round(cosine_similarity(CAST([0.1, 0.2, 0.3] AS array<float>), CAST([0.1, 0.2, 0.3] AS array<float>)), 3) AS dist;
 
 -- query 5
 -- cosine_similarity_norm on two literal arrays
 USE ${case_db};
-SELECT round(cosine_similarity_norm(array<float>[0.1, 0.2, 0.3], array<float>[0.1, 0.2, 0.3]), 3) AS dist;
+SELECT round(cosine_similarity_norm(CAST([0.1, 0.2, 0.3] AS array<float>), CAST([0.1, 0.2, 0.3] AS array<float>)), 3) AS dist;
 
 -- query 6
 -- l2_distance with literal array vs table column
 USE ${case_db};
-SELECT round(l2_distance(array<float>[0.1, 0.2, 0.3], data), 3) AS dist, id FROM t1 ORDER BY dist desc, id;
+SELECT round(l2_distance(CAST([0.1, 0.2, 0.3] AS array<float>), data), 3) AS dist, id FROM t1 ORDER BY dist desc, id;
 
 -- query 7
 -- l2_distance on two literal arrays
 USE ${case_db};
-SELECT round(l2_distance(array<float>[0.1, 0.2, 0.3], array<float>[0.1, 0.2, 0.3]), 3) AS dist;
+SELECT round(l2_distance(CAST([0.1, 0.2, 0.3] AS array<float>), CAST([0.1, 0.2, 0.3] AS array<float>)), 3) AS dist;
 
 -- query 8
 -- Setup: create test_vector table for cross join tests
 -- @skip_result_check=true
 USE ${case_db};
-CREATE TABLE test_vector (id int, data array<float>)
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE test_vector (id int, data array<float>) WITH (format_version = 3);
 
 -- query 9
 -- @skip_result_check=true
 USE ${case_db};
-INSERT INTO test_vector VALUES (1, array<float>[0.1, 0.2, 0.3]), (2, array<float>[0.2, 0.1, 0.3]);
+INSERT INTO test_vector VALUES ROW(1, CAST(ARRAY[DECIMAL '0.1', DECIMAL '0.2', DECIMAL '0.3'] AS array(float))), ROW(2, CAST(ARRAY[DECIMAL '0.2', DECIMAL '0.1', DECIMAL '0.3'] AS array(float)));
 
 -- query 10
 -- @skip_result_check=true
 USE ${case_db};
-INSERT INTO test_vector VALUES (3, array<float>[0.15, 0.25, 0.32]), (4, array<float>[0.12, 0.11, 0.32]);
+INSERT INTO test_vector VALUES ROW(3, CAST(ARRAY[DECIMAL '0.15', DECIMAL '0.25', DECIMAL '0.32'] AS array(float))), ROW(4, CAST(ARRAY[DECIMAL '0.12', DECIMAL '0.11', DECIMAL '0.32'] AS array(float)));
 
 -- query 11
 -- @skip_result_check=true
 USE ${case_db};
-INSERT INTO test_vector VALUES (5, array<float>[0.25, 0.12, 0.13]), (6, array<float>[0.22, 0.01, 0.39]);
+INSERT INTO test_vector VALUES ROW(5, CAST(ARRAY[DECIMAL '0.25', DECIMAL '0.12', DECIMAL '0.13'] AS array(float))), ROW(6, CAST(ARRAY[DECIMAL '0.22', DECIMAL '0.01', DECIMAL '0.39'] AS array(float)));
 
 -- query 12
 -- cosine_similarity with literal vs table column, ordered by similarity
 USE ${case_db};
-SELECT id, data, round(cosine_similarity(array<float>[0.1, 0.2, 0.3], data), 3) AS sim FROM test_vector ORDER BY sim desc, id;
+SELECT id, data, round(cosine_similarity(CAST([0.1, 0.2, 0.3] AS array<float>), data), 3) AS sim FROM test_vector ORDER BY sim desc, id;
 
 -- query 13
 -- cosine_similarity cross join (first execution)
@@ -99,4 +97,4 @@ SELECT a.id, b.id, a.data, b.data, round(cosine_similarity(a.data, b.data), 3) A
 -- query 15
 -- l2_distance with literal vs table column, ordered by distance
 USE ${case_db};
-SELECT id, data, round(l2_distance(array<float>[0.1, 0.2, 0.3], data), 3) AS sim FROM test_vector ORDER BY sim desc, id;
+SELECT id, data, round(l2_distance(CAST([0.1, 0.2, 0.3] AS array<float>), data), 3) AS sim FROM test_vector ORDER BY sim desc, id;

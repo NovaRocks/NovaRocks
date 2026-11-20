@@ -29,41 +29,38 @@
 -- query 1
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t0 (
-  `v1` bigint NULL COMMENT "",
-  `v2` bigint NULL COMMENT "",
-  `v3` bigint NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+  "v1" bigint,
+  "v2" bigint,
+  "v3" bigint
+) WITH (format_version = 3);
 
 -- query 2
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t1 (
-  `v4` bigint NULL COMMENT "",
-  `v5` bigint NULL COMMENT "",
-  `v6` bigint NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+  "v4" bigint,
+  "v5" bigint,
+  "v6" bigint
+) WITH (format_version = 3);
 
 -- query 3
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t2 (
-  `v7` bigint NULL COMMENT "",
-  `v8` bigint NULL COMMENT "",
-  `v9` bigint NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+  "v7" bigint,
+  "v8" bigint,
+  "v9" bigint
+) WITH (format_version = 3);
 
 -- query 4
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t0 VALUES (null, 1, 1), (2, null, null), (3, 3, null), (4, 4, 4), (5, 5, 5), (6, 6, 6), (null, null, null), (7, 7, 7), (8, 8, 8);
+INSERT INTO ${case_db}.t0 VALUES ROW(null, 1, 1), ROW(2, null, null), ROW(3, 3, null), ROW(4, 4, 4), ROW(5, 5, 5), ROW(6, 6, 6), ROW(null, null, null), ROW(7, 7, 7), ROW(8, 8, 8);
 
 -- query 5
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t1 VALUES (null, 1, 1), (2, null, null), (3, 3, null), (4, 4, 4), (5, 5, 5), (6, 6, 6), (null, null, null), (7, 7, 7), (8, 8, 8);
+INSERT INTO ${case_db}.t1 VALUES ROW(null, 1, 1), ROW(2, null, null), ROW(3, 3, null), ROW(4, 4, 4), ROW(5, 5, 5), ROW(6, 6, 6), ROW(null, null, null), ROW(7, 7, 7), ROW(8, 8, 8);
 
 -- query 6
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t2 VALUES (null, 1, 1), (2, null, null), (3, 3, null), (4, 4, 4), (5, 5, 5), (6, 6, 6), (null, null, null), (7, 7, 7), (8, 8, 8);
+INSERT INTO ${case_db}.t2 VALUES ROW(null, 1, 1), ROW(2, null, null), ROW(3, 3, null), ROW(4, 4, 4), ROW(5, 5, 5), ROW(6, 6, 6), ROW(null, null, null), ROW(7, 7, 7), ROW(8, 8, 8);
 
 -- query 7
 SELECT count(*) FROM ${case_db}.t0 LEFT JOIN ${case_db}.t1 ON v1 IN (SELECT v7 FROM ${case_db}.t2) OR v1 < v5;

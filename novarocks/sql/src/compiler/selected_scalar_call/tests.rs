@@ -44,6 +44,7 @@ fn comparison_conversions_keep_each_side_nullability_and_late_output_null_policy
                 &source,
                 &target,
                 DecimalOverflowPolicy::OutputNull,
+                None,
                 &control,
             )
             .unwrap();
@@ -63,5 +64,58 @@ fn comparison_conversions_keep_each_side_nullability_and_late_output_null_policy
                 }
             }
         }
+    }
+}
+
+#[test]
+fn explicit_array_modes_survive_identity_and_reject_foreign_type_boundaries() {
+    use arrow::datatypes::Field;
+    use novarocks_type_contract::ArrayCastFailureMode;
+    let control = crate::compiler::SqlCompileControl::unbounded();
+    let catalog = crate::functions::builtin_sql_function_catalog();
+    let ty = FunctionValueType::new(
+        DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+        true,
+    );
+    assert!(matches!(
+        plan_conversion(
+            catalog,
+            &ty,
+            &ty,
+            DecimalOverflowPolicy::OutputNull,
+            None,
+            &control
+        )
+        .unwrap(),
+        PlannedConversion::Identity
+    ));
+    for mode in [
+        ArrayCastFailureMode::ReportError,
+        ArrayCastFailureMode::OutputNull,
+    ] {
+        let PlannedConversion::Carrier(step) = plan_conversion(
+            catalog,
+            &ty,
+            &ty,
+            DecimalOverflowPolicy::OutputNull,
+            Some(mode),
+            &control,
+        )
+        .unwrap() else {
+            panic!("explicit boundary must not become identity")
+        };
+        assert_eq!(step.target(), &ty);
+        assert_eq!(step.array_failure_mode(), Some(mode));
+        assert!(matches!(
+            plan_conversion(
+                catalog,
+                &ty,
+                &FunctionValueType::new(DataType::Int32, true),
+                DecimalOverflowPolicy::OutputNull,
+                Some(mode),
+                &control
+            ),
+            Err(FunctionBindingError::InvalidBinding(_))
+        ));
     }
 }

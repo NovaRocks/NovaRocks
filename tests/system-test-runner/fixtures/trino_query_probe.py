@@ -33,10 +33,10 @@ import agg_plan_diff as agg
 import rf_plan_diff as rf
 import trino_query
 
-AGG_SQL = "SELECT SUM(generate_series) AS total FROM generate_series(1, 100)"
+AGG_SQL = 'SELECT SUM(generate_series) AS total FROM TABLE(generate_series(1, 100))'
 RF_SQL = ("SELECT COUNT(*) FROM TABLE(generate_series(1, 100)) a "
           "JOIN TABLE(generate_series(1, 100)) b ON a.generate_series = b.generate_series")
-TEXT_SQL = "SELECT REPEAT('q', 65536) AS payload FROM generate_series(1, 64)"
+TEXT_SQL = "SELECT REPEAT('q', 65536) AS payload FROM TABLE(generate_series(1, 64))"
 
 
 class Probe:

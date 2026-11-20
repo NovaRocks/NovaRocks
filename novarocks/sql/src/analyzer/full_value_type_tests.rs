@@ -106,10 +106,7 @@ impl PlannerTableProvider for SourceCatalog {
 }
 
 fn analyze(sql: &str) -> crate::analysis::ResolvedQuery {
-    let statements = novarocks_parser::parse(sql).unwrap();
-    let [ast::Statement::Query(query)] = statements.as_slice() else {
-        panic!("expected query");
-    };
+    let query = &novarocks_parser::parser::parse_query(sql).unwrap();
     super::analyze(query, &SourceCatalog, "default").unwrap().0
 }
 
@@ -219,30 +216,62 @@ fn explicit_largeint_and_typed_null_are_authored_by_syntax_not_carrier() {
 }
 
 #[test]
-fn empty_array_declares_expected_result_only_to_its_exact_owner() {
-    let resolved = analyze("SELECT ARRAY<JSON>[]");
-    let QueryBody::Select(select) = resolved.body else {
-        panic!("expected select");
-    };
-    let expression = &select.projection[0].expr;
-    assert!(!expression.value_type.nullable());
-    let ExprKind::FunctionCall { args, binding, .. } = &expression.kind else {
-        panic!("expected direct bound literal owner");
-    };
-    assert!(args.is_empty());
-    let novarocks_functions::FunctionResultType::Scalar(result) = &binding.selected.result_type
-    else {
-        panic!("expected scalar");
-    };
-    assert_eq!(&expression.value_type, result);
-    let DataType::List(item) = &result.data_type() else {
-        panic!("expected list");
-    };
-    let expected =
-        crate::test_value_types::string_list(item.is_nullable(), true, result.nullable());
-    assert_eq!(result, &expected);
-    assert!(item.metadata().as_arc().is_none());
-    assert_eq!(item.data_type(), &DataType::Utf8);
+fn typed_empty_array_uses_the_original_unknown_constructor_and_complete_json_cast() {
+    for sql in [
+        "SELECT CAST([] AS ARRAY<JSON>)",
+        "SELECT CAST([] AS ARRAY<JSON>)",
+    ] {
+        let resolved = analyze(sql);
+        let QueryBody::Select(select) = resolved.body else {
+            panic!("expected select");
+        };
+        let expression = &select.projection[0].expr;
+        let ExprKind::Cast {
+            expr,
+            target,
+            array_failure_mode,
+            ..
+        } = &expression.kind
+        else {
+            panic!("expected ordinary outer CAST");
+        };
+        assert_eq!(
+            *array_failure_mode,
+            Some(novarocks_type_contract::ArrayCastFailureMode::ReportError)
+        );
+        let expected = crate::test_value_types::string_list(true, true, true);
+        assert_eq!(expression.value_type, expected);
+        assert_eq!(target, expected.data_type());
+        assert_eq!(
+            expression.value_type.try_to_field("result").unwrap(),
+            expected.try_to_field("result").unwrap()
+        );
+        let ExprKind::FunctionCall { args, binding, .. } = &expr.kind else {
+            panic!("original independent ARRAY constructor");
+        };
+        assert!(args.is_empty());
+        assert!(binding.result_constraint().is_none());
+        assert!(!expr.value_type.nullable());
+        assert_eq!(
+            expr.value_type.child_at(0).unwrap().data_type(),
+            &DataType::Null
+        );
+        assert_eq!(
+            expr.value_type.child_at(0).unwrap().logical_type(),
+            ValueLogicalType::Physical
+        );
+        let novarocks_functions::FunctionResultType::Scalar(result) = &binding.selected.result_type
+        else {
+            panic!("array scalar result");
+        };
+        assert_eq!(result, &expr.value_type);
+        let DataType::List(item) = expression.value_type.data_type() else {
+            panic!("JSON list");
+        };
+        assert_eq!(item.data_type(), &DataType::Utf8);
+        assert!(item.is_nullable());
+        assert!(item.metadata().as_arc().is_none());
+    }
 }
 
 struct StopAt {
@@ -445,19 +474,20 @@ fn round_and_truncate_decimal_result_is_the_exact_selected_binding() {
                 "SELECT round({arguments}) FROM \
                  (SELECT CAST(1.234 AS DECIMAL(18, 6)) AS decimal_value, 2 AS digits) source"
             );
-            let mut statements = novarocks_parser::parse(&sql).unwrap();
-            let [ast::Statement::Query(query)] = statements.as_mut_slice() else {
-                panic!("expected the decimal call query");
-            };
+            let query = &mut novarocks_parser::parser::parse_query(&sql).unwrap();
             if name == "truncate" {
                 // TRUNCATE is a statement keyword in the current parser. Rename
                 // only this call AST to isolate the analyzer contract regression.
                 let ast::SetExpr::Select(select) = query.body.as_mut() else {
                     panic!("expected the decimal call projection");
                 };
-                let Some(ast::SelectItem::UnnamedExpr(ast::Expr::FunctionCall(call))) =
+                let Some(ast::SelectItem::SingleColumn(projection_column)) =
                     select.projection.first_mut()
                 else {
+                    panic!("expected the ordinary scalar call AST");
+                };
+                assert!(projection_column.alias.is_none(), "anonymous projection");
+                let ast::Expr::FunctionCall(call) = &mut projection_column.expression else {
                     panic!("expected the ordinary scalar call AST");
                 };
                 call.name.parts.last_mut().unwrap().value = "truncate".to_string();
@@ -647,11 +677,9 @@ fn same_spelling_custom_round_result_is_not_reauthored_by_analyzer() {
         )
         .unwrap();
     let catalog = builder.seal_bound().unwrap();
-    let statements =
-        novarocks_parser::parse("SELECT round(CAST(1.234 AS DECIMAL(18, 6)), 2)").unwrap();
-    let [ast::Statement::Query(query)] = statements.as_slice() else {
-        panic!("expected the custom round query");
-    };
+    let query =
+        &novarocks_parser::parser::parse_query("SELECT round(CAST(1.234 AS DECIMAL(18, 6)), 2)")
+            .unwrap();
     let resolved = super::analyze_with_function_catalog(
         query,
         &SourceCatalog,
@@ -754,11 +782,48 @@ fn mixed_case_and_typed_array_convert_actual_json_sources() {
         panic!("expected CASE");
     };
     assert_selected_conversion(&when_then[0].1, "json_text_same_structure/v1");
-    let expression = projection("SELECT ARRAY<VARCHAR>[j] FROM source");
-    let ExprKind::FunctionCall { args, .. } = expression.kind else {
-        panic!("expected array literal owner");
-    };
-    assert_selected_conversion(&args[0], "json_text_same_structure/v1");
+    for sql in [
+        "SELECT CAST([j] AS ARRAY<VARCHAR>) FROM source",
+        "SELECT CAST([j] AS ARRAY<VARCHAR>) FROM source",
+    ] {
+        let expression = projection(sql);
+        assert_eq!(
+            expression.value_type.child_at(0).unwrap().logical_type(),
+            ValueLogicalType::Physical
+        );
+        let ExprKind::Cast {
+            expr,
+            array_failure_mode,
+            ..
+        } = &expression.kind
+        else {
+            panic!("ordinary outer array CAST");
+        };
+        assert_eq!(
+            *array_failure_mode,
+            Some(novarocks_type_contract::ArrayCastFailureMode::ReportError)
+        );
+        let ExprKind::FunctionCall { args, binding, .. } = &expr.kind else {
+            panic!("original independent ARRAY source");
+        };
+        assert_eq!(
+            binding.function_id.as_str(),
+            "builtin.scalar/__array_literal/v1"
+        );
+        assert_eq!(
+            expr.value_type.child_at(0).unwrap().logical_type(),
+            ValueLogicalType::Json
+        );
+        assert_eq!(args.len(), 1);
+        assert!(matches!(args[0].kind, ExprKind::ColumnRef { .. }));
+        assert_eq!(args[0].value_type.logical_type(), ValueLogicalType::Json);
+        assert_eq!(args[0].value_type.data_type(), &DataType::Utf8);
+        let novarocks_functions::FunctionResultType::Scalar(result) = &binding.selected.result_type
+        else {
+            panic!("ARRAY scalar")
+        };
+        assert_eq!(result, &expr.value_type);
+    }
 }
 
 #[test]
@@ -781,11 +846,9 @@ fn only_literal_null_is_declared_without_running_its_source() {
 
 #[test]
 fn hidden_conversion_cannot_be_selected_as_a_user_function() {
-    let statements =
-        novarocks_parser::parse("SELECT __value_domain_conversion(j) FROM source").unwrap();
-    let [ast::Statement::Query(query)] = statements.as_slice() else {
-        panic!("expected query");
-    };
+    let query =
+        &novarocks_parser::parser::parse_query("SELECT __value_domain_conversion(j) FROM source")
+            .unwrap();
     assert!(super::analyze(query, &SourceCatalog, "default").is_err());
 }
 
@@ -841,10 +904,8 @@ impl crate::compiler::SqlFunctionCatalog for MissingConversionPort {
 
 #[test]
 fn actual_request_catalog_missing_conversion_port_has_no_fallback() {
-    let statements = novarocks_parser::parse("SELECT CAST(j AS VARCHAR) FROM source").unwrap();
-    let [ast::Statement::Query(query)] = statements.as_slice() else {
-        panic!("expected query");
-    };
+    let query =
+        &novarocks_parser::parser::parse_query("SELECT CAST(j AS VARCHAR) FROM source").unwrap();
     let error = super::analyze_with_function_catalog(
         query,
         &SourceCatalog,
@@ -881,32 +942,12 @@ fn selected_scalar_text_argument_converts_source_json_before_rebinding() {
 
 #[test]
 fn nested_json_conversion_preserves_source_facts_before_same_domain_cast() {
-    let expression = projection(
-        "SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ CAST(ja_meta AS ARRAY<VARCHAR>) FROM source",
-    );
-    let ExprKind::Cast {
-        expr,
-        decimal_overflow_policy,
-        ..
-    } = &expression.kind
-    else {
-        panic!("expected final carrier cast");
-    };
+    let original = projection("SELECT ja_meta FROM source");
     assert_eq!(
-        *decimal_overflow_policy,
-        novarocks_type_contract::DecimalOverflowPolicy::ReportError
+        original.value_type,
+        crate::test_value_types::string_list(false, true, false)
     );
-    assert_selected_conversion(expr, "json_text_same_structure/v1");
-    let DataType::List(item) = &expr.value_type.data_type() else {
-        panic!("expected exact intermediate list");
-    };
-    assert_eq!(item.name(), "item");
-    assert!(!item.is_nullable());
-    assert!(item.metadata().as_arc().is_none());
-    assert_eq!(
-        expr.value_type,
-        crate::test_value_types::string_list(false, false, false),
-    );
+    // Provider layout facts are independent of the canonical analyzed value.
     let source = SourceCatalog
         .resolve_table_for_analysis(None, "default", "source")
         .unwrap();
@@ -916,24 +957,71 @@ fn nested_json_conversion_preserves_source_facts_before_same_domain_cast() {
         .iter()
         .find(|column| column.name == "ja_meta")
         .unwrap();
-    let DataType::List(source_item) = &declared.data_type else {
-        panic!("expected original source list");
+    let DataType::List(provider_item) = &declared.data_type else {
+        panic!("provider source list");
     };
-    assert_eq!(source_item.name(), "source_item");
+    assert_eq!(provider_item.name(), "source_item");
+    assert!(!provider_item.is_nullable());
     assert_eq!(
-        source_item.metadata().get("provider").map(String::as_str),
+        provider_item.metadata().get("provider").map(String::as_str),
         Some("retained-source")
     );
-    let DataType::List(target) = &expression.value_type.data_type() else {
-        panic!("expected final list");
-    };
-    assert!(target.is_nullable());
-    assert_eq!(target.name(), "item");
-    assert!(target.metadata().as_arc().is_none());
-    assert_eq!(
-        expression.value_type,
-        crate::test_value_types::string_list(true, false, true)
-    );
+    for (cast, mode) in [
+        (
+            "CAST",
+            novarocks_type_contract::ArrayCastFailureMode::ReportError,
+        ),
+        (
+            "TRY_CAST",
+            novarocks_type_contract::ArrayCastFailureMode::OutputNull,
+        ),
+    ] {
+        let expression = projection(&format!(
+            "WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' SELECT {cast}(ja_meta AS ARRAY<VARCHAR>) FROM source"
+        ));
+        let ExprKind::Cast {
+            expr,
+            decimal_overflow_policy,
+            array_failure_mode,
+            ..
+        } = &expression.kind
+        else {
+            panic!("expected explicit array conversion owner");
+        };
+        assert_eq!(*array_failure_mode, Some(mode));
+        assert_eq!(
+            *decimal_overflow_policy,
+            novarocks_type_contract::DecimalOverflowPolicy::ReportError
+        );
+        // The array owner borrows the original JSON source, without a scalar
+        // byte conversion or a same-carrier domain retag in front of it.
+        assert_eq!(expr.value_type, original.value_type);
+        assert!(matches!(&expr.kind, ExprKind::ColumnRef { column, .. } if column == "ja_meta"));
+        let DataType::List(source_item) = expr.value_type.data_type() else {
+            panic!("original list");
+        };
+        assert_eq!(source_item.name(), "item");
+        assert!(!source_item.is_nullable());
+        assert!(source_item.metadata().as_arc().is_none());
+        assert_eq!(
+            expr.value_type
+                .value_type()
+                .child_type_at(0)
+                .unwrap()
+                .domain(),
+            Some(ValueLogicalType::Json)
+        );
+        assert_eq!(
+            expression.value_type,
+            crate::test_value_types::string_list(true, false, true)
+        );
+        let DataType::List(target) = expression.value_type.data_type() else {
+            panic!("target list");
+        };
+        assert_eq!(target.name(), "item");
+        assert!(target.is_nullable());
+        assert!(target.metadata().as_arc().is_none());
+    }
 }
 
 fn control_binding_arguments(count: usize) -> Vec<crate::analysis::TypedExpr> {
@@ -1106,16 +1194,13 @@ fn aggregate_and_value_conversion_adapters_preserve_binding_control() {
 }
 
 #[test]
-fn exact_value_conversion_call_preserves_nested_sql_mode_policy() {
+fn exact_value_conversion_call_inherits_query_sql_mode_policy() {
     use novarocks_type_contract::DecimalOverflowPolicy::{OutputNull, ReportError};
-    let strict = "/*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */";
-    let relaxed = "/*+ SET_VAR(sql_mode=32) */";
-    for (outer, inner, outer_policy, inner_policy) in [
-        (strict, relaxed, ReportError, OutputNull),
-        (relaxed, strict, OutputNull, ReportError),
-    ] {
+    let strict = "WITH SESSION sql_mode='ERROR_IF_OVERFLOW'";
+    let relaxed = "WITH SESSION sql_mode=32";
+    for (outer, policy) in [(strict, ReportError), (relaxed, OutputNull)] {
         let sql = format!(
-            "SELECT {outer} CAST(q.j AS VARCHAR) AS x FROM (SELECT {inner} j,CAST(j AS VARCHAR) AS y FROM source) q"
+            "{outer} SELECT CAST(q.j AS VARCHAR) AS x FROM (SELECT j,CAST(j AS VARCHAR) AS y FROM source) q"
         );
         let query = analyze(&sql);
         let QueryBody::Select(select) = &query.body else {
@@ -1139,8 +1224,8 @@ fn exact_value_conversion_call_preserves_nested_sql_mode_policy() {
         );
         assert_eq!(outer.function_id, inner.function_id);
         assert_eq!(outer.selected, inner.selected);
-        assert_eq!(outer.decimal_overflow_policy(), outer_policy, "{sql}");
-        assert_eq!(inner.decimal_overflow_policy(), inner_policy, "{sql}");
+        assert_eq!(outer.decimal_overflow_policy(), policy, "{sql}");
+        assert_eq!(inner.decimal_overflow_policy(), policy, "{sql}");
     }
 }
 

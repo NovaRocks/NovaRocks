@@ -580,6 +580,7 @@ pub(crate) fn compile_casts_with_factory<H, F: ValueSchemaCreationFactory<H>>(
                     child,
                     decimal_overflow_policy,
                     allow_throw_exception,
+                    array_failure_mode,
                 } = kind
                 else {
                     continue;
@@ -600,6 +601,7 @@ pub(crate) fn compile_casts_with_factory<H, F: ValueSchemaCreationFactory<H>>(
                     value(invocation.definition)?,
                     *decimal_overflow_policy,
                     *allow_throw_exception,
+                    *array_failure_mode,
                     control,
                 )?;
                 before_recipe_insert(&recipes, &mut retained, &mut work)?;
@@ -1114,6 +1116,7 @@ pub fn prepare_cast_node(
     result: &FunctionValueType,
     policy: novarocks_type_contract::DecimalOverflowPolicy,
     allow_throw_exception: bool,
+    array_failure_mode: Option<novarocks_type_contract::ArrayCastFailureMode>,
     control: &dyn PureCompileControl,
 ) -> Result<novarocks_functions::PreparedCastRecipe, ProgramPrimitiveError> {
     Ok(novarocks_functions::PreparedCastRecipe::try_new(
@@ -1122,6 +1125,7 @@ pub fn prepare_cast_node(
         result,
         policy,
         allow_throw_exception,
+        array_failure_mode,
         control,
     )?)
 }

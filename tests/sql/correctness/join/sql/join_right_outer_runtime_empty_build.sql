@@ -29,19 +29,17 @@ DROP TABLE IF EXISTS ${case_db}.t_join_right_outer_runtime_empty_build_r;
 CREATE TABLE ${case_db}.t_join_right_outer_runtime_empty_build_l (
   id INT,
   lv STRING
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 CREATE TABLE ${case_db}.t_join_right_outer_runtime_empty_build_r (
   id INT,
   rv STRING
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 INSERT INTO ${case_db}.t_join_right_outer_runtime_empty_build_l VALUES
-  (1, 'L1'),
-  (2, 'L2');
+  ROW(1, 'L1'),
+  ROW(2, 'L2');
 INSERT INTO ${case_db}.t_join_right_outer_runtime_empty_build_r VALUES
-  (1, 'R1'),
-  (2, 'R2');
+  ROW(1, 'R1'),
+  ROW(2, 'R2');
 SELECT l.id AS lid, l.lv, r.id AS rid, r.rv
 FROM ${case_db}.t_join_right_outer_runtime_empty_build_l l
 RIGHT OUTER JOIN (

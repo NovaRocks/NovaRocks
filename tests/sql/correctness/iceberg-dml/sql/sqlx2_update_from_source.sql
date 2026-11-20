@@ -21,31 +21,25 @@
 
 -- query 1
 -- @skip_result_check=true
-DROP TABLE IF EXISTS ${case_db}.sqlx2_update_from_target FORCE;
-DROP TABLE IF EXISTS ${case_db}.sqlx2_update_from_source FORCE;
+DROP TABLE IF EXISTS ${case_db}.sqlx2_update_from_target ;
+DROP TABLE IF EXISTS ${case_db}.sqlx2_update_from_source ;
 CREATE TABLE ${case_db}.sqlx2_update_from_target (
   id BIGINT,
   v STRING
-) TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
-);
+) WITH (format_version = 3);
 CREATE TABLE ${case_db}.sqlx2_update_from_source (
   id BIGINT,
   new_v STRING
-) TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
-);
-INSERT INTO ${case_db}.sqlx2_update_from_target VALUES (1, 'a'), (2, 'b');
-INSERT INTO ${case_db}.sqlx2_update_from_source VALUES (2, 'bb');
+) WITH (format_version = 3);
+INSERT INTO ${case_db}.sqlx2_update_from_target VALUES ROW(1, 'a'), ROW(2, 'b');
+INSERT INTO ${case_db}.sqlx2_update_from_source VALUES ROW(2, 'bb');
 
 -- query 2
 -- @skip_result_check=true
-UPDATE ${case_db}.sqlx2_update_from_target AS t
-SET v = s.new_v
-FROM ${case_db}.sqlx2_update_from_source AS s
-WHERE t.id = s.id;
+MERGE INTO ${case_db}.sqlx2_update_from_target AS t
+USING ${case_db}.sqlx2_update_from_source AS s
+ON t.id = s.id
+WHEN MATCHED THEN UPDATE SET v = s.new_v;
 
 -- query 3
 SELECT id, v
@@ -54,15 +48,15 @@ ORDER BY id;
 
 -- query 4
 -- @skip_result_check=true
-INSERT INTO ${case_db}.sqlx2_update_from_source VALUES (2, 'cc');
+INSERT INTO ${case_db}.sqlx2_update_from_source VALUES ROW(2, 'cc');
 
 -- query 5
 -- @expect_error_tier=drift
--- @expect_error=TrinoError { name=MERGE_TARGET_ROW_MULTIPLE_MATCHES type=USER_ERROR code=119 }: One UPDATE target table row matched more than one source row
-UPDATE ${case_db}.sqlx2_update_from_target AS t
-SET v = s.new_v
-FROM ${case_db}.sqlx2_update_from_source AS s
-WHERE t.id = s.id;
+-- @expect_error=TrinoError { name=MERGE_TARGET_ROW_MULTIPLE_MATCHES type=USER_ERROR code=119 }: One MERGE target table row matched more than one source row
+MERGE INTO ${case_db}.sqlx2_update_from_target AS t
+USING ${case_db}.sqlx2_update_from_source AS s
+ON t.id = s.id
+WHEN MATCHED THEN UPDATE SET v = s.new_v;
 
 -- query 6
 SELECT id, v
@@ -71,5 +65,5 @@ ORDER BY id;
 
 -- query 7
 -- @skip_result_check=true
-DROP TABLE ${case_db}.sqlx2_update_from_target FORCE;
-DROP TABLE ${case_db}.sqlx2_update_from_source FORCE;
+DROP TABLE ${case_db}.sqlx2_update_from_target ;
+DROP TABLE ${case_db}.sqlx2_update_from_source ;

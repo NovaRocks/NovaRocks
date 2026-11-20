@@ -82,6 +82,7 @@ impl FloatArithmetic {
                 &target,
                 policy,
                 allow,
+                None,
                 control,
             )
             .map_err(|error| match error {

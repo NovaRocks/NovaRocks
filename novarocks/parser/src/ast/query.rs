@@ -8,78 +8,77 @@
 
 use crate::{
     Span,
-    ast::{Expr, Ident, relation::TableWithJoins, window::NamedWindow},
+    ast::{
+        AstBox, AstVec, Expr, Ident,
+        relation::{Relation, Table, TableSubquery},
+        window::WindowDefinition,
+    },
 };
 
 /// One top-level query expression and its query-level modifiers.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Query {
+    /// Overrides belonging to the root query, before its CTEs and body.
+    pub session_properties: AstVec<SessionProperty>,
+    pub functions: AstVec<super::FunctionSpecification>,
     pub with: Option<With>,
-    pub body: Box<SetExpr>,
-    pub order_by: Vec<OrderByExpr>,
-    pub limit: Option<Expr>,
+    pub body: AstBox<SetExpr>,
+    pub modifiers: QueryModifiers,
+    pub span: Span,
+}
+
+/// Suffix clauses owned by either a query or its direct specification.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct QueryModifiers {
+    pub order_by: Option<OrderBy>,
     pub offset: Option<Offset>,
-    /// Whether this query used MySQL `LIMIT offset, count` spelling.
-    pub limit_comma_offset: bool,
-    pub fetch: Option<Fetch>,
-    pub span: Span,
+    pub limit: Option<QueryLimit>,
 }
 
-/// A query EXPLAIN wrapper. It never grants a production execution route.
+impl QueryModifiers {
+    pub fn is_empty(&self) -> bool {
+        self.order_by.is_none() && self.offset.is_none() && self.limit.is_none()
+    }
+}
+
+/// A query-local session assignment. Evaluation belongs to statement admission.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ExplainQuery {
-    pub format: ExplainFormat,
-    /// Whether the EXPLAIN targets the logical planning view. This remains
-    /// separate from output detail so `EXPLAIN LOGICAL VERBOSE` is typed.
-    pub logical: bool,
-    pub query: Box<Query>,
+pub struct SessionProperty {
+    pub name: super::ObjectName,
+    pub value: Expr,
     pub span: Span,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ExplainFormat {
-    Default,
-    Analyze,
-    Verbose,
-    Costs,
-    Logical,
-    /// The plan contract itself rather than the operators it describes.
-    ///
-    /// EXPLAIN answers what a statement will do, which is the operator tree.
-    /// What the plan states to the backend -- every value and expression it
-    /// defines, the partition spaces, the filter attachments, the cut
-    /// evidence -- is a different question, asked separately.
-    Contract,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct With {
     pub recursive: bool,
-    pub ctes: Vec<Cte>,
+    pub ctes: AstVec<Cte>,
     pub span: Span,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Cte {
     pub name: Ident,
-    pub columns: Vec<Ident>,
-    pub query: Box<Query>,
+    pub columns: Option<Vec<Ident>>,
+    pub query: AstBox<Query>,
     pub span: Span,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SetExpr {
-    Select(Box<Select>),
+    Select(AstBox<Select>),
     Values(Values),
-    Query(Box<Query>),
+    Table(AstBox<Table>),
+    Query(AstBox<TableSubquery>),
     SetOperation(SetOperation),
 }
 
 impl SetExpr {
-    pub const fn span(&self) -> Span {
+    pub fn span(&self) -> Span {
         match self {
             Self::Select(select) => select.span,
             Self::Values(values) => values.span,
+            Self::Table(table) => table.span,
             Self::Query(query) => query.span,
             Self::SetOperation(operation) => operation.span,
         }
@@ -88,10 +87,16 @@ impl SetExpr {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SetOperation {
-    pub left: Box<SetExpr>,
+    pub inputs: AstVec<SetExpr>,
     pub operator: SetOperator,
-    pub quantifier: SetQuantifier,
-    pub right: Box<SetExpr>,
+    pub distinct: bool,
+    pub corresponding: Option<Corresponding>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Corresponding {
+    pub columns: Vec<Ident>,
     pub span: Span,
 }
 
@@ -102,144 +107,207 @@ pub enum SetOperator {
     Except,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SetQuantifier {
-    Distinct,
-    All,
-    None,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Values {
-    pub rows: Vec<Vec<Expr>>,
-    pub explicit_row: bool,
+    pub rows: AstVec<Expr>,
     pub span: Span,
+}
+
+/// A neutral borrowed view of the actual row syntax. It grants no analysis
+/// capability and never expands an inner struct-valued cell or clones a child.
+#[derive(Clone, Copy)]
+pub enum ValuesRowCells<'a> {
+    Row(&'a super::RowExpr),
+    Single(&'a Expr),
+}
+impl<'a> ValuesRowCells<'a> {
+    pub fn new(row: &'a Expr) -> Self {
+        match row {
+            Expr::Row(row) => Self::Row(row),
+            other => Self::Single(other),
+        }
+    }
+    pub fn len(&self) -> usize {
+        match *self {
+            Self::Row(row) => row.fields.len(),
+            Self::Single(_) => 1,
+        }
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    pub fn get(&self, index: usize) -> Option<&'a Expr> {
+        match *self {
+            Self::Row(row) => row.fields.get(index).map(|field| &field.expression),
+            Self::Single(expr) => (index == 0).then_some(expr),
+        }
+    }
+    pub fn iter(self) -> impl ExactSizeIterator<Item = &'a Expr> + 'a {
+        (0..self.len()).map(move |index| self.get(index).expect("bounded VALUES cell index"))
+    }
+    pub fn has_named_fields(&self) -> bool {
+        matches!(*self,Self::Row(row)if row.fields.iter().any(|field|field.name.is_some()))
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Select {
-    /// Optimizer directives attached to this `SELECT` by `/*+ ... */` syntax.
-    ///
-    /// These remain syntax facts only: they do not grant the parser, planner,
-    /// or execution owner any capability.
-    pub hints: Vec<SelectHint>,
-    pub quantifier: SelectQuantifier,
-    pub projection: Vec<SelectItem>,
-    pub from: Vec<TableWithJoins>,
+    pub distinct: bool,
+    pub projection: AstVec<SelectItem>,
+    pub from: Option<Relation>,
     pub selection: Option<Expr>,
-    pub group_by: GroupBy,
+    pub group_by: Option<GroupBy>,
     pub having: Option<Expr>,
-    pub qualify: Option<Expr>,
-    pub windows: Vec<NamedWindow>,
+    pub windows: AstVec<WindowDefinition>,
+    pub modifiers: QueryModifiers,
     pub span: Span,
-}
-
-/// One structured optimizer directive in a `SELECT /*+ ... */` comment.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SelectHint {
-    pub name: Ident,
-    pub value: SelectHintValue,
-    pub span: Span,
-}
-
-/// The typed payload shape of a [`SelectHint`].
-///
-/// Keep assignment-style directives distinct from function-style directives:
-/// `new_planner_agg_stage = 3` is not a function call and must not be
-/// reconstructed from opaque comment text.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum SelectHintValue {
-    Bare,
-    Call { arguments: Vec<Expr> },
-    Assignment { value: Expr },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum SelectQuantifier {
-    None,
-    All(Span),
-    Distinct { on: Vec<Expr>, span: Span },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SelectItem {
-    UnnamedExpr(Expr),
-    ExprWithAlias {
-        expr: Expr,
-        alias: Ident,
-        explicit_as: bool,
-        span: Span,
-    },
-    Wildcard {
-        options: WildcardOptions,
-        span: Span,
-    },
-    QualifiedWildcard {
-        prefix: Vec<Ident>,
-        options: WildcardOptions,
-        span: Span,
-    },
+    SingleColumn(AstBox<SingleColumn>),
+    AllColumns(AstBox<AllColumns>),
 }
-
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SingleColumn {
+    pub expression: Expr,
+    pub alias: Option<Ident>,
+    pub span: Span,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AllColumns {
+    pub target: Option<Expr>,
+    pub aliases: Vec<Ident>,
+    pub span: Span,
+}
 impl SelectItem {
-    pub const fn span(&self) -> Span {
+    pub fn span(&self) -> Span {
         match self {
-            Self::UnnamedExpr(expr) => expr.span(),
-            Self::ExprWithAlias { span, .. }
-            | Self::Wildcard { span, .. }
-            | Self::QualifiedWildcard { span, .. } => *span,
+            Self::SingleColumn(node) => node.span,
+            Self::AllColumns(node) => node.span,
         }
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct WildcardOptions {
-    pub exclude: Vec<Ident>,
-    pub replace: Vec<ReplaceSelectItem>,
-}
-
+/// One GROUP BY clause; empty element lists remain structurally legal.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ReplaceSelectItem {
-    pub expr: Expr,
-    pub alias: Ident,
+pub struct GroupBy {
+    pub distinct: bool,
+    pub elements: AstVec<GroupingElement>,
     pub span: Span,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum GroupBy {
-    None,
-    Expressions { expressions: Vec<Expr>, span: Span },
-    Rollup { expressions: Vec<Expr>, span: Span },
-    Cube { expressions: Vec<Expr>, span: Span },
-    GroupingSets { sets: Vec<Vec<Expr>>, span: Span },
+pub enum GroupingElement {
+    Simple(SimpleGroupBy),
+    Sets(GroupingSets),
+    Auto(AutoGroupBy),
+}
+
+impl GroupingElement {
+    pub fn span(&self) -> Span {
+        match self {
+            Self::Simple(node) => node.span,
+            Self::Sets(node) => node.span,
+            Self::Auto(node) => node.span,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct OrderByExpr {
-    pub expr: Expr,
-    pub asc: Option<bool>,
-    pub nulls_first: Option<bool>,
+pub struct SimpleGroupBy {
+    pub columns: AstVec<Expr>,
     pub span: Span,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Offset {
-    pub value: Expr,
-    pub rows: OffsetRows,
+pub struct GroupingSets {
+    pub kind: GroupingSetsKind,
+    pub sets: AstVec<AstVec<Expr>>,
     pub span: Span,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum OffsetRows {
-    None,
-    Row,
-    Rows,
+pub enum GroupingSetsKind {
+    Explicit,
+    Rollup,
+    Cube,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Fetch {
-    pub quantity: Option<Expr>,
-    pub percent: bool,
+pub struct AutoGroupBy {
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OrderBy {
+    pub items: AstVec<SortItem>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SortItem {
+    pub sort_key: Expr,
+    pub ordering: SortOrdering,
+    pub null_ordering: NullOrdering,
+    pub span: Span,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SortOrdering {
+    Ascending,
+    Descending,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NullOrdering {
+    First,
+    Last,
+    Undefined,
+}
+
+/// The mutually exclusive Trino row-count clauses.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum QueryLimit {
+    Limit(Limit),
+    FetchFirst(FetchFirst),
+}
+impl QueryLimit {
+    pub fn span(&self) -> Span {
+        match self {
+            Self::Limit(node) => node.span,
+            Self::FetchFirst(node) => node.span,
+        }
+    }
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Limit {
+    pub row_count: Expr,
+    pub span: Span,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Offset {
+    pub row_count: Expr,
+    pub span: Span,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FetchFirst {
+    pub row_count: Option<Expr>,
     pub with_ties: bool,
     pub span: Span,
+}
+impl Limit {
+    pub fn span(&self) -> Span {
+        self.span
+    }
+}
+impl Offset {
+    pub fn span(&self) -> Span {
+        self.span
+    }
+}
+impl FetchFirst {
+    pub fn span(&self) -> Span {
+        self.span
+    }
 }

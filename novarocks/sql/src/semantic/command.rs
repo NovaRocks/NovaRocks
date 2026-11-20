@@ -24,7 +24,7 @@
 //! policy, and maintenance options), but never retain a source span or a SQL
 //! fragment that would invite reparsing at the application boundary.
 
-use super::{ColumnAggregation, IcebergPartitionFieldExpr, ObjectName, TableKeyDesc};
+use super::ObjectName;
 use novarocks_types::schema::SqlType;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -41,6 +41,7 @@ pub enum CatalogSqlCommand {
     CreateDatabase {
         name: ObjectName,
         if_not_exists: bool,
+        properties: Vec<(String, novarocks_spi::connector::DdlPropertyValue)>,
     },
     DropDatabase {
         name: ObjectName,
@@ -50,7 +51,6 @@ pub enum CatalogSqlCommand {
     DropTable {
         name: ObjectName,
         if_exists: bool,
-        force: bool,
     },
     ShowCreateTable {
         name: ObjectName,
@@ -61,17 +61,12 @@ pub enum CatalogSqlCommand {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CatalogCreateCommand {
-    pub external: bool,
     pub if_not_exists: bool,
     pub name: String,
-    pub comment: Option<CommandLiteral>,
-    pub properties: Vec<CommandProperty>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct CommandProperty {
-    pub key: CommandLiteral,
-    pub value: CommandLiteral,
+    /// Exact USING connector. None belongs to the legacy property-based entry.
+    pub connector_name: Option<String>,
+    /// Already evaluated VARCHAR configuration facts, retaining original keys.
+    pub properties: Vec<(String, String)>,
 }
 
 /// A literal value retained by administrative command syntax.
@@ -90,19 +85,12 @@ pub enum CommandLiteral {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CreateTableSqlCommand {
-    pub temporary: bool,
-    pub external: bool,
     pub if_not_exists: bool,
     pub name: ObjectName,
-    pub engine: Option<String>,
     pub like: Option<ObjectName>,
     pub columns: Vec<TableColumnSqlCommand>,
-    pub key: Option<TableKeyDesc>,
-    pub distribution: Option<TableDistributionSqlCommand>,
-    pub partition: Option<TablePartitionSqlCommand>,
-    pub order_by: Vec<String>,
-    pub properties: Vec<CommandProperty>,
-    pub comment: Option<CommandLiteral>,
+    pub comment: Option<String>,
+    pub properties: Vec<(String, novarocks_spi::connector::DdlPropertyValue)>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -110,28 +98,8 @@ pub struct TableColumnSqlCommand {
     pub name: String,
     pub data_type: SqlType,
     pub nullable: Option<bool>,
-    pub aggregation: Option<ColumnAggregation>,
     pub default: Option<CommandLiteral>,
     pub comment: Option<CommandLiteral>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TableDistributionSqlCommand {
-    pub columns: Vec<String>,
-    pub random: bool,
-    pub buckets: Option<u64>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum TablePartitionSqlCommand {
-    Transform(Vec<IcebergPartitionFieldExpr>),
-    /// The parser accepts a legacy range declaration, but no current product
-    /// adapter supports it.  Its individual SQL ranges are deliberately not
-    /// carried across this semantic boundary.
-    UnsupportedLegacyRange {
-        columns: Vec<String>,
-        definition_count: usize,
-    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -143,10 +111,8 @@ pub struct AlterIcebergTableSqlCommand {
 #[derive(Clone, Debug, PartialEq)]
 pub enum IcebergTableSqlAction {
     Schema(IcebergSchemaSqlChange),
-    Properties(IcebergPropertiesSqlAction),
-    Partition(IcebergPartitionSqlChange),
+    Comment(String),
     Reference(IcebergReferenceSqlAction),
-    AddFiles { location: CommandLiteral },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -191,36 +157,13 @@ pub enum IcebergColumnSqlAction {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum IcebergPropertiesSqlAction {
-    Set {
-        entries: Vec<(String, CommandLiteral)>,
-    },
-    Unset {
-        keys: Vec<String>,
-        if_exists: bool,
-    },
-    Comment {
-        value: CommandLiteral,
-    },
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum IcebergPartitionSqlChange {
-    Add(IcebergPartitionFieldExpr),
-    Drop(IcebergPartitionFieldExpr),
-}
-
-#[derive(Clone, Debug, PartialEq)]
 pub enum IcebergReferenceSqlAction {
     Create {
         kind: IcebergReferenceKindSql,
         name: String,
         if_not_exists: bool,
         or_replace: bool,
-        anchor: ReferenceAnchorSql,
-        /// Current product code ignores parser-retained provider extension
-        /// tokens. Keep that fact without passing raw SQL into an adapter.
-        has_uninterpreted_provider_options: bool,
+        snapshot_id: Option<i64>,
     },
     Drop {
         kind: IcebergReferenceKindSql,
@@ -236,16 +179,11 @@ pub enum IcebergReferenceKindSql {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ReferenceAnchorSql {
-    CurrentMain,
-    Version(CommandLiteral),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StatisticsSqlCommand {
     AnalyzeTable {
         table: ObjectName,
-        columns: Vec<String>,
+        /// Absence selects all columns. An explicit empty list remains explicit.
+        columns: Option<Vec<String>>,
     },
     ShowStats {
         table: ObjectName,
@@ -258,20 +196,6 @@ pub enum MaintenanceSqlCommand {
         procedure: ObjectName,
         arguments: Vec<ProcedureArgumentSql>,
         argument_mode: ProcedureArgumentModeSql,
-    },
-    Optimize {
-        table: ObjectName,
-    },
-    RewriteManifests {
-        table: ObjectName,
-    },
-    ExpireSnapshots {
-        table: ObjectName,
-        options: Vec<ExpireSnapshotsOptionSql>,
-    },
-    RemoveOrphanFiles {
-        table: ObjectName,
-        older_than: MaintenanceValueSql,
     },
 }
 
@@ -293,10 +217,4 @@ pub enum MaintenanceValueSql {
     Literal(CommandLiteral),
     Timestamp(CommandLiteral),
     Map(Vec<(CommandLiteral, CommandLiteral)>),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ExpireSnapshotsOptionSql {
-    OlderThan(MaintenanceValueSql),
-    RetainLast(MaintenanceValueSql),
 }

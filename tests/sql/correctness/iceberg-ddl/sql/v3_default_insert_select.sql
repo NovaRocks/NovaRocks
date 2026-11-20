@@ -22,14 +22,11 @@
 
 -- query 1
 -- @skip_result_check=true
-DROP TABLE IF EXISTS ${case_db}.t_v3_default_iselect FORCE;
+DROP TABLE IF EXISTS ${case_db}.t_v3_default_iselect ;
 CREATE TABLE ${case_db}.t_v3_default_iselect (
   a INT,
   b INT DEFAULT 5
-)
-TBLPROPERTIES (
-  "format-version" = "3"
-);
+) WITH (format_version = 3);
 INSERT INTO ${case_db}.t_v3_default_iselect (a) SELECT 1;
 
 -- query 2
@@ -37,4 +34,4 @@ SELECT a, b FROM ${case_db}.t_v3_default_iselect;
 
 -- query 3
 -- @skip_result_check=true
-DROP TABLE ${case_db}.t_v3_default_iselect FORCE;
+DROP TABLE ${case_db}.t_v3_default_iselect ;

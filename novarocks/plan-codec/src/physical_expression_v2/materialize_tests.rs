@@ -181,11 +181,14 @@ struct Fixture {
 }
 impl Fixture {
     fn new(control: &Control) -> Self {
+        Self::with_array_types(control, false)
+    }
+    fn with_array_types(control: &Control, include_arrays: bool) -> Self {
         let field = Arc::new(
             Field::new("original-child", DataType::Int32, true)
                 .with_metadata(HashMap::from([("unknown".into(), "preserved".into())])),
         );
-        let roots = [
+        let mut roots = vec![
             (0, FunctionValueType::new(DataType::Int64, false)),
             (1, FunctionValueType::new(DataType::Int64, true)),
             (2, FunctionValueType::new(DataType::Boolean, false)),
@@ -203,6 +206,17 @@ impl Fixture {
             ),
             (6, FunctionValueType::new(DataType::Utf8, true)),
         ];
+        if include_arrays {
+            for (id, item) in [(11, DataType::Int32), (12, DataType::Int64)] {
+                roots.push((
+                    id,
+                    FunctionValueType::new(
+                        DataType::List(Arc::new(Field::new("declared-item", item, true))),
+                        true,
+                    ),
+                ));
+            }
+        }
         let encoded = encode_type_table(&roots, type_limits(), control).unwrap();
         let types = decode_type_table(&encoded, type_limits(), control).unwrap();
         let carrier_i64 = types
@@ -238,7 +252,11 @@ impl Fixture {
                     as i32,
             intermediate_value_type_id: Some(5),
         }];
-        let values = [(0, 0), (1, 6), (2, 4)]
+        let mut value_types = vec![(0, 0), (1, 6), (2, 4)];
+        if include_arrays {
+            value_types.push((3, 11));
+        }
+        let values = value_types
             .into_iter()
             .map(|(id, ty)| wire::ValueDefinition {
                 id,
@@ -436,6 +454,7 @@ impl Fixture {
                     target_carrier_type_id: Some(self.carrier_i64),
                     decimal_overflow_policy: semantics::DecimalOverflowPolicy::ReportError as i32,
                     allow_throw_exception: Some(allow()),
+                    array_failure_mode: None,
                 }),
             ),
             definition(
@@ -640,6 +659,7 @@ fn owned_expressions_materialize_all_sixteen_scalar_kinds_with_independent_paylo
                 target: DataType::Int64,
                 decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
                 allow_throw_exception: allow,
+                array_failure_mode: None,
             },
         ),
         (
@@ -1130,3 +1150,67 @@ fn owned_expression_unit_enters_actual_sparse_fragment_construction() {
 
 #[path = "materialize_owned_tests.rs"]
 mod caller_owned_tests;
+
+#[test]
+fn explicit_array_cast_modes_materialize_without_erasing_absence_or_target_fields() {
+    use novarocks_type_contract::ArrayCastFailureMode as Mode;
+    use wire::expression_definition::Kind as K;
+    let control = Control::default();
+    let fixture = Fixture::with_array_types(&control, true);
+    let carrier = fixture
+        .types
+        .carriers
+        .iter()
+        .find(|(_, ty)| &ty.value == fixture.types.value_type(12).unwrap().data_type())
+        .map(|(id, _)| *id)
+        .unwrap();
+    for (wire_mode, expected) in [
+        (None, None),
+        (Some(1), Some(Mode::ReportError)),
+        (Some(2), Some(Mode::OutputNull)),
+    ] {
+        let defs = vec![
+            definition(0, 11, K::ValueId(3)),
+            definition(
+                1,
+                12,
+                K::Cast(wire::CastExpression {
+                    expr_id: Some(0),
+                    target_carrier_type_id: Some(carrier),
+                    decimal_overflow_policy: semantics::DecimalOverflowPolicy::ReportError as i32,
+                    allow_throw_exception: Some(allow()),
+                    array_failure_mode: wire_mode,
+                }),
+            ),
+        ];
+        fixture.with_tokens(&defs, &control, |expressions, functions, aggregates| {
+            let actual = materialize_expressions(
+                prepare_expression_materialization(
+                    expressions,
+                    functions,
+                    aggregates,
+                    &p::PlanLimits::FROZEN,
+                    SOURCE,
+                    limits(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let node = &actual.definitions()[1];
+            assert_eq!(node.id, p::ExprId::new(1));
+            let novarocks_expression_contract::ExprKind::Cast {
+                array_failure_mode,
+                expr,
+                target,
+                ..
+            } = &node.kind
+            else {
+                panic!("actual CAST")
+            };
+            assert_eq!(*array_failure_mode, expected);
+            assert_eq!(*expr, p::ExprId::new(0));
+            assert_eq!(target, fixture.types.value_type(12).unwrap().data_type());
+            assert_eq!(&node.ty, fixture.types.value_type(12).unwrap());
+        });
+    }
+}

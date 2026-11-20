@@ -34,23 +34,12 @@ CREATE TABLE ${case_db}.t_datetime_tz_sink (
   normalized_dt DATETIME
 );
 INSERT INTO ${case_db}.t_datetime_tz_src VALUES
-  (1, '2024-01-01 08:00:00', '+08:00'),
-  (2, '2023-12-31 19:00:00', '-05:00'),
-  (3, '2024-01-01 00:00:00', '+00:00'),
-  (4, '2024-01-01 08:00:00', '+08:00');
+  ROW(1, '2024-01-01 08:00:00', '+08:00'),
+  ROW(2, '2023-12-31 19:00:00', '-05:00'),
+  ROW(3, '2024-01-01 00:00:00', '+00:00'),
+  ROW(4, '2024-01-01 08:00:00', '+08:00');
 INSERT INTO ${case_db}.t_datetime_tz_sink
-SELECT
-  id,
-  local_dt,
-  tz,
-  CASE
-    WHEN local_dt IS NULL THEN NULL
-    WHEN tz = '+08:00' THEN CAST('2024-01-01 00:00:00' AS DATETIME)
-    WHEN tz = '-05:00' THEN CAST('2024-01-01 00:00:00' AS DATETIME)
-    WHEN tz = '+00:00' THEN CAST(local_dt AS DATETIME)
-    ELSE NULL
-  END AS normalized_dt
-FROM ${case_db}.t_datetime_tz_src;
+SELECT id, local_dt, tz, CASE WHEN (local_dt IS NULL) THEN NULL WHEN (tz = '+08:00') THEN CAST('2024-01-01 00:00:00' AS TIMESTAMP) WHEN (tz = '-05:00') THEN CAST('2024-01-01 00:00:00' AS TIMESTAMP) WHEN (tz = '+00:00') THEN CAST(local_dt AS TIMESTAMP) ELSE NULL END AS normalized_dt FROM ${case_db}.t_datetime_tz_src;
 SELECT
   id,
   tz,

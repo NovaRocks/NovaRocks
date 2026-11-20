@@ -32,7 +32,7 @@ CREATE TABLE ${case_db}.g7_outer_r (rk BIGINT, payload BIGINT);
 -- @result_contains=other: l.lk = 10
 -- @result_not_contains=r.rk = 10
 -- @result_not_contains=predicates: l.lk = 10
-EXPLAIN VERBOSE
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'
 SELECT l.lk, r.rk
 FROM ${case_db}.g7_outer_l l
 LEFT JOIN ${case_db}.g7_outer_r r ON l.lk = r.rk AND l.lk = 10;

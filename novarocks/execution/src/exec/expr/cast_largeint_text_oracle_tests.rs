@@ -79,6 +79,7 @@ fn largeint_text_original_v1_all_policy_nullability_min_max_slice_and_empty() {
                         &FunctionValueType::new(DataType::Utf8, nullable),
                         policy,
                         allow,
+                        None,
                         &Control,
                     )
                     .unwrap();

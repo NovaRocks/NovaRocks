@@ -116,6 +116,9 @@ pub(crate) fn carry_records_and_closure(metadata: &TableMetadata) -> Result<Reco
     })
 }
 
+/// Immutable snapshot summary key authored by an admitted combined catalog mutation.
+pub(crate) const SLOT_STORAGE_EFFECT_SUMMARY_KEY: &str = "novarocks.mv.slot-storage-effect.v1";
+
 pub(crate) struct SlotChangePreparer {
     pub change: KeyedSlotChange,
 }

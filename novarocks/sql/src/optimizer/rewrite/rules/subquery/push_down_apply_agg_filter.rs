@@ -412,9 +412,9 @@ mod tests {
     fn eq_expr(left: TypedExpr, right: TypedExpr) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::BinaryOp {
-                left: Box::new(left),
+                left: novarocks_parser::ast::AstBox::new(left),
                 op: BinOp::Eq,
-                right: Box::new(right),
+                right: novarocks_parser::ast::AstBox::new(right),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
@@ -668,9 +668,9 @@ mod tests {
         );
         let residual_pred = TypedExpr {
             kind: ExprKind::BinaryOp {
-                left: Box::new(col_ref(T2_V2, "v2", DataType::Int64)),
+                left: novarocks_parser::ast::AstBox::new(col_ref(T2_V2, "v2", DataType::Int64)),
                 op: BinOp::Gt,
-                right: Box::new(TypedExpr {
+                right: novarocks_parser::ast::AstBox::new(TypedExpr {
                     kind: ExprKind::Literal(LiteralValue::Int(5)),
                     value_type: novarocks_type_contract::FunctionValueType::new(
                         DataType::Int64,
@@ -683,9 +683,9 @@ mod tests {
         };
         let combined_pred = TypedExpr {
             kind: ExprKind::BinaryOp {
-                left: Box::new(corr_pred),
+                left: novarocks_parser::ast::AstBox::new(corr_pred),
                 op: BinOp::And,
-                right: Box::new(residual_pred),
+                right: novarocks_parser::ast::AstBox::new(residual_pred),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
@@ -938,9 +938,9 @@ mod tests {
         );
         let combined = TypedExpr {
             kind: ExprKind::BinaryOp {
-                left: Box::new(corr_pred_a),
+                left: novarocks_parser::ast::AstBox::new(corr_pred_a),
                 op: BinOp::And,
-                right: Box::new(corr_pred_b),
+                right: novarocks_parser::ast::AstBox::new(corr_pred_b),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),

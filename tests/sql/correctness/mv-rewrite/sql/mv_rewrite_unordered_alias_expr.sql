@@ -40,28 +40,11 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE EXTERNAL CATALOG mvrw_${uuid0}
-PROPERTIES (
-  "type" = "iceberg",
-  "iceberg.catalog.type" = "rest",
-  "uri" = "${iceberg_rest_uri}",
-  "warehouse" = "${iceberg_rest_warehouse}",
-  "aws.s3.endpoint" = "${oss_endpoint}",
-  "credential.object-store-metadata.consumer-role" = "frontend",
-  "credential.object-store-metadata.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-metadata.name" = "${iceberg_object_store_metadata_credential_name}",
-  "credential.object-store-metadata.generation" = "${iceberg_object_store_credential_generation}",
-  "credential.object-store-data.consumer-role" = "backend",
-  "credential.object-store-data.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-data.name" = "${iceberg_object_store_data_credential_name}",
-  "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
-  "aws.s3.region" = "${oss_region}",
-  "aws.s3.enable_path_style_access" = "${oss_path_style}"
-);
+CREATE CATALOG mvrw_${uuid0} USING iceberg WITH ("iceberg.catalog.type" = 'rest', "uri" = '${iceberg_rest_uri}', "warehouse" = '${iceberg_rest_warehouse}', "aws.s3.endpoint" = '${oss_endpoint}', "credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-metadata.name" = '${iceberg_object_store_metadata_credential_name}', "credential.object-store-metadata.generation" = '${iceberg_object_store_credential_generation}', "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-data.name" = '${iceberg_object_store_data_credential_name}', "credential.object-store-data.generation" = '${iceberg_object_store_credential_generation}', "aws.s3.region" = '${oss_region}', "aws.s3.enable_path_style_access" = '${oss_path_style}');
 
 -- query 2
 -- @skip_result_check=true
-CREATE DATABASE mvrw_${uuid0}.ns_${uuid0};
+CREATE SCHEMA mvrw_${uuid0}.ns_${uuid0};
 
 -- query 3
 -- @skip_result_check=true
@@ -70,7 +53,7 @@ CREATE TABLE mvrw_${uuid0}.ns_${uuid0}.t1 (
   k3 BIGINT,
   k4 STRING,
   v1 BIGINT
-) TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+) WITH (format_version = 3);
 
 -- query 4
 -- k2 cycles a/b/NULL; k4 covers two months; k3 has 3 buckets
@@ -94,17 +77,14 @@ USE mvrw_${uuid0}.ns_${uuid0};
 -- alias-qualified definition; select list deliberately unordered: an
 -- aggregate first, then the expression key, then the plain key
 -- @skip_result_check=true
-CREATE MATERIALIZED VIEW month_mv
-DISTRIBUTED BY HASH(k3) BUCKETS 1
-PROPERTIES ('storage_engine' = 'iceberg')
-AS SELECT SUM(a.v1) AS sv, substring(a.k4, 1, 7) AS month, a.k3
+CREATE MATERIALIZED VIEW month_mv AS SELECT SUM(a.v1) AS sv, substring(a.k4, 1, 7) AS month, a.k3
 FROM t1 a
 WHERE a.k2 = 'a'
 GROUP BY a.k3, substring(a.k4, 1, 7);
 
 -- query 8
 -- @skip_result_check=true
-REFRESH MATERIALIZED VIEW month_mv WITH SYNC MODE;
+REFRESH MATERIALIZED VIEW month_mv;
 
 -- query 9
 -- same semantics written WITHOUT the alias -> still a structural match
@@ -153,7 +133,7 @@ SELECT k3, SUM(v1) AS sv FROM t1 WHERE k2 = 'b' GROUP BY k3 ORDER BY k3;
 -- query 18
 -- freshness: base insert advances the snapshot -> miss
 -- @skip_result_check=true
-INSERT INTO mvrw_${uuid0}.ns_${uuid0}.t1 VALUES ('a', 0, '2024-07-15', 5);
+INSERT INTO mvrw_${uuid0}.ns_${uuid0}.t1 VALUES ROW('a', 0, '2024-07-15', 5);
 
 -- query 19
 -- @skip_result_check=true
@@ -173,12 +153,12 @@ DROP MATERIALIZED VIEW IF EXISTS ns_${uuid0}.month_mv;
 -- query 22
 -- @cleanup=true
 -- @skip_result_check=true
-DROP TABLE IF EXISTS mvrw_${uuid0}.ns_${uuid0}.t1 FORCE;
+DROP TABLE IF EXISTS mvrw_${uuid0}.ns_${uuid0}.t1 ;
 
 -- query 23
 -- @cleanup=true
 -- @skip_result_check=true
-DROP DATABASE IF EXISTS mvrw_${uuid0}.ns_${uuid0};
+DROP SCHEMA IF EXISTS mvrw_${uuid0}.ns_${uuid0};
 
 -- query 24
 -- @cleanup=true

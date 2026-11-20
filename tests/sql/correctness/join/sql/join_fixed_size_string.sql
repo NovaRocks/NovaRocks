@@ -29,9 +29,8 @@
 -- query 1
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.__row_util_base (
-  k1 bigint NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+  k1 bigint
+) WITH (format_version = 3);
 
 -- query 2
 -- @skip_result_check=true
@@ -60,9 +59,8 @@ insert into ${case_db}.__row_util_base select * from ${case_db}.__row_util_base;
 -- query 8
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.__row_util (
-  idx bigint NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+  idx bigint
+) WITH (format_version = 3);
 
 -- query 9
 -- @skip_result_check=true
@@ -71,15 +69,14 @@ insert into ${case_db}.__row_util select row_number() over() as idx from ${case_
 -- query 10
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t1 (
-    k1 bigint NULL,
-    c_int int NULL,
-    c_bigint bigint NULL,
-    c_str4 STRING NULL,
-    c_str8 STRING NULL,
-    c_str16 STRING NULL,
-    c_str32 STRING NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+    k1 bigint ,
+    c_int int ,
+    c_bigint bigint ,
+    c_str4 STRING ,
+    c_str8 STRING ,
+    c_str16 STRING ,
+    c_str32 STRING
+) WITH (format_version = 3);
 
 -- query 11
 -- @skip_result_check=true
@@ -101,15 +98,14 @@ insert into ${case_db}.t1 (k1) select 1001;
 -- query 13
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t2 (
-    k1 bigint NULL,
-    c_int int NULL,
-    c_bigint bigint NULL,
-    c_str4 STRING NULL,
-    c_str8 STRING NULL,
-    c_str16 STRING NULL,
-    c_str32 STRING NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+    k1 bigint ,
+    c_int int ,
+    c_bigint bigint ,
+    c_str4 STRING ,
+    c_str8 STRING ,
+    c_str16 STRING ,
+    c_str32 STRING
+) WITH (format_version = 3);
 
 -- query 14
 -- @skip_result_check=true
@@ -131,7 +127,7 @@ from ${case_db}.t1 join ${case_db}.t2 on t1.c_str4 = t2.c_str4;
 -- join on c_str4 with <=>
 -- query 18
 select count(1), sum(murmur_hash3_32(t1.c_str4)), sum(murmur_hash3_32(t2.c_str4))
-from ${case_db}.t1 join ${case_db}.t2 on t1.c_str4 <=> t2.c_str4;
+from ${case_db}.t1 join ${case_db}.t2 on t1.c_str4  IS NOT DISTINCT FROM  t2.c_str4;
 
 -- join on c_str4 with = and c_int =
 -- query 19
@@ -146,7 +142,7 @@ from ${case_db}.t1 join ${case_db}.t2 on t1.c_str8 = t2.c_str8;
 -- join on c_str8 with <=>
 -- query 21
 select count(1), sum(murmur_hash3_32(t1.c_str8)), sum(murmur_hash3_32(t2.c_str8))
-from ${case_db}.t1 join ${case_db}.t2 on t1.c_str8 <=> t2.c_str8;
+from ${case_db}.t1 join ${case_db}.t2 on t1.c_str8  IS NOT DISTINCT FROM  t2.c_str8;
 
 -- join on c_str8 with = and c_int =
 -- query 22
@@ -161,7 +157,7 @@ from ${case_db}.t1 join ${case_db}.t2 on t1.c_str16 = t2.c_str16;
 -- join on c_str16 with <=>
 -- query 24
 select count(1), sum(murmur_hash3_32(t1.c_str16)), sum(murmur_hash3_32(t2.c_str16))
-from ${case_db}.t1 join ${case_db}.t2 on t1.c_str16 <=> t2.c_str16;
+from ${case_db}.t1 join ${case_db}.t2 on t1.c_str16  IS NOT DISTINCT FROM  t2.c_str16;
 
 -- join on c_str16 with = and c_int =
 -- query 25
@@ -181,15 +177,15 @@ select
     320001,
     320001,
     320001,
-    '\0\0\0\0',
-    '\0\0\0\0\0\0\0\0',
-    '\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0',
-    '\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0';
+    U&'\0000\0000\0000\0000',
+    U&'\0000\0000\0000\0000\0000\0000\0000\0000',
+    U&'\0000\0000\0000\0000\0000\0000\0000\0000\0000\0000\0000\0000\0000\0000\0000\0000\0000',
+    U&'\0000\0000\0000\0000\0000\0000\0000\0000\0000\0000\0000\0000\0000\0000\0000\0000\0000\0000\0000\0000\0000\0000\0000\0000\0000\0000\0000\0000\0000\0000\0000\0000\0000\0000';
 
 -- join on c_str8 with <=> after null-byte insert into t2
 -- query 28
 select count(1), sum(murmur_hash3_32(t1.c_str8)), sum(murmur_hash3_32(t2.c_str8))
-from ${case_db}.t1 join ${case_db}.t2 on t1.c_str8 <=> t2.c_str8;
+from ${case_db}.t1 join ${case_db}.t2 on t1.c_str8  IS NOT DISTINCT FROM  t2.c_str8;
 
 -- insert null-byte string rows into t1
 -- query 29
@@ -199,12 +195,12 @@ select
     320001,
     320001,
     320001,
-    '\0\0\0\0',
-    '\0\0\0\0\0\0\0\0',
-    '\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0',
-    '\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0';
+    U&'\0000\0000\0000\0000',
+    U&'\0000\0000\0000\0000\0000\0000\0000\0000',
+    U&'\0000\0000\0000\0000\0000\0000\0000\0000\0000\0000\0000\0000\0000\0000\0000\0000\0000',
+    U&'\0000\0000\0000\0000\0000\0000\0000\0000\0000\0000\0000\0000\0000\0000\0000\0000\0000\0000\0000\0000\0000\0000\0000\0000\0000\0000\0000\0000\0000\0000\0000\0000\0000\0000';
 
 -- join on c_str8 with <=> after null-byte insert into both
 -- query 30
 select count(1), sum(murmur_hash3_32(t1.c_str8)), sum(murmur_hash3_32(t2.c_str8))
-from ${case_db}.t1 join ${case_db}.t2 on t1.c_str8 <=> t2.c_str8;
+from ${case_db}.t1 join ${case_db}.t2 on t1.c_str8  IS NOT DISTINCT FROM  t2.c_str8;

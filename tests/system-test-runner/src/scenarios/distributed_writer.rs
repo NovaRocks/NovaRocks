@@ -720,7 +720,7 @@ fn writer_partition_values(result: &StatementResult) -> Result<Vec<(String, serd
     let fields = &result.columns[1].type_signature.arguments;
     anyhow::ensure!(
         fields.len() == 2,
-        "evolved partition ROW requires its original p and p_bucket_8 fields"
+        "evolved partition ROW requires its original p and p_bucket fields"
     );
     let names = fields
         .iter()
@@ -736,7 +736,7 @@ fn writer_partition_values(result: &StatementResult) -> Result<Vec<(String, serd
                 .as_str();
             let expected = match name {
                 "p" => "bigint",
-                "p_bucket_8" => "integer",
+                "p_bucket" => "integer",
                 _ => bail!("unexpected evolved partition field {name}"),
             };
             anyhow::ensure!(
@@ -748,7 +748,7 @@ fn writer_partition_values(result: &StatementResult) -> Result<Vec<(String, serd
         })
         .collect::<Result<Vec<_>>>()?;
     anyhow::ensure!(
-        names.contains(&"p") && names.contains(&"p_bucket_8"),
+        names.contains(&"p") && names.contains(&"p_bucket"),
         "evolved partition ROW duplicated a field"
     );
     result.rows.iter().map(|row| match row.as_slice() {
@@ -769,8 +769,13 @@ fn writer_partition_values(result: &StatementResult) -> Result<Vec<(String, serd
 }
 
 fn snapshot_count(control: &mut SqlSession, table: &str) -> Result<i64> {
+    let (namespace, name) = table
+        .rsplit_once('.')
+        .context("snapshot count requires a qualified table")?;
     let result = control
-        .execute(format!("SELECT count(*) FROM {table}$snapshots"))
+        .execute(format!(
+            "SELECT count(*) FROM {namespace}.\"{name}$snapshots\""
+        ))
         .with_context(|| format!("read {table} snapshot count"))?;
     writer_bigint(&result)
 }
@@ -802,7 +807,7 @@ fn seed_source_files(
     let warehouse = create_warehouse(context, warehouse_name)?;
     create_catalog(control, catalog, &warehouse)?;
     control
-        .execute(format!("CREATE DATABASE {catalog}.{database}"))
+        .execute(format!("CREATE SCHEMA {catalog}.{database}"))
         .with_context(|| format!("create {catalog}.{database}"))?;
     control
         .execute(format!(
@@ -1542,12 +1547,11 @@ impl Scenario for DistributedStatisticsDataflow {
         context.action("seed six source files for a three-backend statistics scan");
         create_catalog(&mut control, CATALOG, &warehouse)?;
         control
-            .execute(format!("CREATE DATABASE {CATALOG}.{DATABASE}"))
+            .execute(format!("CREATE SCHEMA {CATALOG}.{DATABASE}"))
             .context("create native statistics database")?;
         control
             .execute(format!(
-                "CREATE TABLE {source} (v BIGINT) TBLPROPERTIES \
-                 ('novarocks.statistics.collect-on-write' = 'false')"
+                "CREATE TABLE {source} (v BIGINT) WITH (statistics_collect_on_write = false)"
             ))
             .context("create native statistics source")?;
         for file in 0..SEED_FILES {
@@ -1568,7 +1572,7 @@ impl Scenario for DistributedStatisticsDataflow {
 
         context.action("run binary ANALYZE across all three backend processes");
         control
-            .execute(format!("ANALYZE TABLE {source}"))
+            .execute(format!("ANALYZE {source}"))
             .context("run native distributed ANALYZE")?;
 
         let analyze_tasks_after = task_admission_counts(context)?;
@@ -1608,8 +1612,7 @@ impl Scenario for DistributedStatisticsDataflow {
 
         control
             .execute(format!(
-                "CREATE TABLE {target} (v BIGINT) TBLPROPERTIES \
-                 ('novarocks.statistics.collect-on-write' = 'true')"
+                "CREATE TABLE {target} (v BIGINT) WITH (statistics_collect_on_write = true)"
             ))
             .context("create collect-on-write target")?;
         let target_root = hadoop_table_root(&warehouse, DATABASE, TABLE);
@@ -1718,8 +1721,7 @@ impl Scenario for DistributedStatisticsDataflow {
         context.action("seed a 1024-field source with twelve independently splittable files");
         control
             .execute(format!(
-                "CREATE TABLE {wide_source} ({wide_schema}) TBLPROPERTIES \
-                 ('novarocks.statistics.collect-on-write' = 'false')"
+                "CREATE TABLE {wide_source} ({wide_schema}) WITH (statistics_collect_on_write = false)"
             ))
             .context("create wide native statistics source")?;
         for file in 0..WIDE_SEED_FILES {
@@ -1734,8 +1736,7 @@ impl Scenario for DistributedStatisticsDataflow {
         }
         control
             .execute(format!(
-                "CREATE TABLE {wide_target} ({wide_schema}) TBLPROPERTIES \
-                 ('novarocks.statistics.collect-on-write' = 'true')"
+                "CREATE TABLE {wide_target} ({wide_schema}) WITH (statistics_collect_on_write = true)"
             ))
             .context("create wide collect-on-write target")?;
 
@@ -2340,16 +2341,14 @@ impl Scenario for DistributedWriterRowLevel {
         let warehouse = create_warehouse(context, "distributed-writer-row-level")?;
         create_catalog(&mut control, CATALOG, &warehouse)?;
         control
-            .execute(format!("CREATE DATABASE {CATALOG}.{DATABASE}"))
+            .execute(format!("CREATE SCHEMA {CATALOG}.{DATABASE}"))
             .context("create row-level mutation database")?;
 
         // A merge-on-read v3 table: DELETE writes deletion vectors.
         let dv = format!("{CATALOG}.{DATABASE}.row_level_dv");
         control
             .execute(format!(
-                "CREATE TABLE {dv} (id BIGINT, v BIGINT) TBLPROPERTIES \
-                 (\"format-version\" = \"3\", \"write.row-lineage\" = \"true\", \
-                 \"novarocks.update.mode\" = \"merge-on-read\")"
+                "CREATE TABLE {dv} (id BIGINT, v BIGINT) WITH (format_version = 3, extra_properties = MAP(ARRAY['write.row-lineage', 'novarocks.update.mode'], ARRAY['true', 'merge-on-read']))"
             ))
             .context("create deletion-vector mutation table")?;
         for file in 0..3 {
@@ -2371,7 +2370,7 @@ impl Scenario for DistributedWriterRowLevel {
 
         context.action("observe distributed position aggregation and the singleton materializer");
         control.execute(format!(
-            "SET pipeline_dop={}",
+            "SET SESSION pipeline_dop={}",
             row_level_contract::INITIAL_DELETE_DOP
         ))?;
         let before = all_write_counters(context)?;
@@ -2439,8 +2438,7 @@ impl Scenario for DistributedWriterRowLevel {
         let positional = format!("{CATALOG}.{DATABASE}.row_level_positional");
         control
             .execute(format!(
-                "CREATE TABLE {positional} (id BIGINT, v BIGINT) TBLPROPERTIES \
-                 (\"format-version\" = \"2\", \"novarocks.update.mode\" = \"merge-on-read\")"
+                "CREATE TABLE {positional} (id BIGINT, v BIGINT) WITH (format_version = 2, extra_properties = MAP(ARRAY['novarocks.update.mode'], ARRAY['merge-on-read']))"
             ))
             .context("create position-delete mutation table")?;
         for file in 0..3 {
@@ -2495,9 +2493,7 @@ impl Scenario for DistributedWriterRowLevel {
         let update_table = format!("{CATALOG}.{DATABASE}.row_level_update");
         control
             .execute(format!(
-                "CREATE TABLE {update_table} (id BIGINT, v BIGINT) TBLPROPERTIES \
-                 (\"format-version\" = \"3\", \"write.row-lineage\" = \"true\", \
-                 \"novarocks.update.mode\" = \"copy-on-write\")"
+                "CREATE TABLE {update_table} (id BIGINT, v BIGINT) WITH (format_version = 3, extra_properties = MAP(ARRAY['write.row-lineage', 'novarocks.update.mode'], ARRAY['true', 'copy-on-write']))"
             ))
             .context("create UPDATE table with legacy mode property")?;
         for file in 0..3 {
@@ -2543,8 +2539,11 @@ impl Scenario for DistributedWriterRowLevel {
                  {update_snapshots_after} snapshots; expected exactly one"
             );
         }
+        let (update_namespace, update_name) = update_table
+            .rsplit_once('.')
+            .context("file count requires a qualified update table")?;
         let delete_artifacts = writer_bigint(&control.execute(format!(
-            "SELECT count(*) FROM {update_table}$files WHERE content=1"
+            "SELECT count(*) FROM {update_namespace}.\"{update_name}$files\" WHERE content=1"
         ))?)?;
         anyhow::ensure!(
             delete_artifacts > 0,
@@ -2564,8 +2563,7 @@ impl Scenario for DistributedWriterRowLevel {
         let merge_source = format!("{CATALOG}.{DATABASE}.row_level_merge_source");
         control
             .execute(format!(
-                "CREATE TABLE {merge_source} (id BIGINT, v BIGINT) TBLPROPERTIES \
-                 (\"format-version\" = \"3\", \"write.row-lineage\" = \"true\")"
+                "CREATE TABLE {merge_source} (id BIGINT, v BIGINT) WITH (format_version = 3, extra_properties = MAP(ARRAY['write.row-lineage'], ARRAY['true']))"
             ))
             .context("create merge source table")?;
         control
@@ -3102,8 +3100,7 @@ impl Scenario for DistributedWriterFaults {
         seed_delay_source_files(&mut control, CATALOG, DATABASE, DELAY_SOURCE)?;
         control
             .execute(format!(
-                "CREATE TABLE {CATALOG}.{DATABASE}.{TABLE} (v BIGINT) \
-                 TBLPROPERTIES ('novarocks.statistics.collect-on-write' = 'true')"
+                "CREATE TABLE {CATALOG}.{DATABASE}.{TABLE} (v BIGINT) WITH (statistics_collect_on_write = true)"
             ))
             .context("create distributed writer fault table")?;
 
@@ -3137,8 +3134,7 @@ impl Scenario for DistributedWriterFaults {
                 // original INSERT below. No old case can contribute a file.
                 control
                     .execute(format!(
-                        "CREATE TABLE {case_target} (v BIGINT) \
-                     TBLPROPERTIES ('novarocks.statistics.collect-on-write' = 'true')"
+                        "CREATE TABLE {case_target} (v BIGINT) WITH (statistics_collect_on_write = true)"
                     ))
                     .context("create the original isolated sealed-object target")?;
                 let table_root = hadoop_table_root(
@@ -3600,10 +3596,11 @@ fn verify_materialization_fault(
 ) -> Result<()> {
     context.action("fault the v3 materialization result after the root reads its sealed prefix");
     control.execute(format!(
-        "CREATE TABLE {V3_FAULT_TABLE} (v BIGINT) TBLPROPERTIES \
-         ('format-version'='3','write.row-lineage'='true','novarocks.update.mode'='merge-on-read')"
+        "CREATE TABLE {V3_FAULT_TABLE} (v BIGINT) WITH (format_version = 3, extra_properties = MAP(ARRAY['write.row-lineage', 'novarocks.update.mode'], ARRAY['true', 'merge-on-read']))"
     ))?;
-    let seed = control.execute(format!("INSERT INTO {V3_FAULT_TABLE} VALUES (1),(2),(3)"))?;
+    let seed = control.execute(format!(
+        "INSERT INTO {V3_FAULT_TABLE} VALUES ROW(1), ROW(2), ROW(3)"
+    ))?;
     row_level_contract::assert_affected(&seed, 3, "seed v3 materialization fault")?;
     let snapshots = snapshot_count(control, V3_FAULT_TABLE)?;
     let terminals = publication_terminals(context, MUTATION_FAMILY)?;

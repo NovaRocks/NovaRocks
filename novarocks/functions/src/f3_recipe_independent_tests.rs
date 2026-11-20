@@ -51,6 +51,7 @@ fn recipe(
         &FunctionValueType::new(target, true),
         policy,
         allow,
+        None,
         &Control,
     )
     .unwrap()

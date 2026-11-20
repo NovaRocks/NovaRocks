@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Direct async leaves for the original property and table-drop publications.
+//! Direct async leaves for the original table create, property and drop publications.
 
 use super::*;
 use crate::catalog::publication_dispatch::PreparationFailure;
@@ -28,9 +28,9 @@ use novarocks_spi::connector::{
 use std::{future::Future, pin::Pin, sync::OnceLock};
 
 type Outcome = ExternalMutationOutcome<ConnectorCatalogMutationReceipt>;
-struct Original {
-    provider: IcebergMetadata,
-    request: ConnectorCatalogMutationRequest,
+pub(in crate::catalog_control) struct Original {
+    pub(super) provider: IcebergMetadata,
+    pub(super) request: ConnectorCatalogMutationRequest,
     journal: PublicationJournal<ConnectorCatalogMutationReceipt>,
     table: OnceLock<OriginalTable>,
 }
@@ -68,13 +68,20 @@ pub(super) fn execute_async<'a>(
             return Ok(known_uncommitted(error));
         }
         match &original.request.operation {
+            ConnectorCatalogMutationOperation::CreateNamespace { .. } => {
+                create_namespace(&original, receiving).await
+            }
+            ConnectorCatalogMutationOperation::CreateTable { .. } => {
+                create_table(&original, receiving).await
+            }
             ConnectorCatalogMutationOperation::DropTable { .. } => {
                 drop_table(&original, receiving).await
             }
-            ConnectorCatalogMutationOperation::AlterProperties { .. } => {
+            ConnectorCatalogMutationOperation::AlterProperties { .. }
+            | ConnectorCatalogMutationOperation::SetTableProperties { .. } => {
                 properties(&original, receiving).await
             }
-            _ => unreachable!("only the two closed leaves construct this original"),
+            _ => unreachable!("only admitted async existing leaves construct this original"),
         }
     })
 }
@@ -140,20 +147,131 @@ async fn finish(
     Ok(outcome)
 }
 
+async fn create_table(
+    original: &Arc<Original>,
+    receiving: &ConnectorCatalogMutationReceiving,
+) -> Result<Outcome, ConnectorError> {
+    let provider = &original.provider;
+    let request = &original.request;
+    let ConnectorCatalogMutationOperation::CreateTable { table, policy, .. } = &request.operation
+    else {
+        unreachable!("only a create request enters create preparation")
+    };
+    let reads = AsyncCreateCatalogReads {
+        original: Arc::clone(original),
+    };
+    let prepared = prepare_ordinary_create(provider, request, *policy, &reads).await;
+    let (frozen, external, receipts) = match prepared {
+        Err(CreatePreparationFailure::Provider(PreparationFailure(failure))) => {
+            return Ok(Outcome::KnownUncommitted {
+                failure,
+                cleanup: ExternalMutationFinalization::Complete,
+            });
+        }
+        Err(CreatePreparationFailure::Source(error)) => return Err(error),
+        Ok(PreparedCreate::NoOp(seed)) => {
+            receiving.record_needed_committed(
+                ExternalMutationEffect::NoOp,
+                &seed,
+                &ExternalMutationFinalization::Complete,
+            )?;
+            return Ok(Outcome::KnownCommitted {
+                effect: ExternalMutationEffect::NoOp,
+                receipt: seed,
+                finalization: ExternalMutationFinalization::Complete,
+                cleanup: ExternalMutationFinalization::Complete,
+            });
+        }
+        Ok(PreparedCreate::Mutation(prepared)) => *prepared,
+    };
+    let outcome = publish_catalog_request(original, receiving, frozen, external, receipts).await?;
+    if matches!(outcome, Outcome::KnownCommitted { .. }) {
+        provider
+            .runtime()
+            .control_state()
+            .invalidate_table_cache(&table.namespace, &table.table);
+    }
+    Ok(outcome)
+}
+
+async fn create_namespace(
+    original: &Original,
+    receiving: &ConnectorCatalogMutationReceiving,
+) -> Result<Outcome, ConnectorError> {
+    let (frozen, external, seed) =
+        match prepare_namespace_publication(&original.provider, &original.request) {
+            Ok(prepared) => prepared,
+            Err(error) => return Ok(known_uncommitted(error)),
+        };
+    publish_catalog_request(
+        original,
+        receiving,
+        frozen,
+        external,
+        PublicationReceipts::same(seed),
+    )
+    .await
+}
+
+async fn publish_catalog_request(
+    original: &Original,
+    receiving: &ConnectorCatalogMutationReceiving,
+    frozen: crate::catalog::catalog_request::FrozenCatalogPublication,
+    external: ExternalMutationEvidence,
+    receipts: PublicationReceipts<ConnectorCatalogMutationReceipt>,
+) -> Result<Outcome, ConnectorError> {
+    use crate::catalog::catalog_request::CatalogResponseDocument;
+    let provider = &original.provider;
+    let request = &original.request;
+    if let Err(error) = original.journal.prepare_catalog_with_receipts(
+        external,
+        receipts,
+        frozen.targets(),
+        frozen.request_bytes().to_vec(),
+        frozen.attribution().clone(),
+        request.context.clone(),
+    ) {
+        return Ok(known_uncommitted(invalid(error.to_string())));
+    }
+    let catalog = Arc::clone(provider.runtime().novarocks_catalog());
+    let policy = catalog.evidence_policy();
+    let read_binding = provider.runtime().resources().planning_binding().clone();
+    let pending = original
+        .journal
+        .publish_once_to_finalization(
+            request.context.clone(),
+            policy,
+            move |descriptor, generation, context| async move {
+                catalog
+                    .prepare_catalog_publication(
+                        frozen,
+                        descriptor,
+                        generation,
+                        context,
+                        CatalogResponseDocument::default(),
+                        read_binding,
+                    )
+                    .await
+            },
+        )
+        .await;
+    match pending {
+        Ok(pending) => finish(original, receiving, pending).await,
+        Err(error) => Ok(original.call_error(error)),
+    }
+}
+
 async fn properties(
     original: &Original,
     receiving: &ConnectorCatalogMutationReceiving,
 ) -> Result<Outcome, ConnectorError> {
     let provider = &original.provider;
     let request = &original.request;
-    let ConnectorCatalogMutationOperation::AlterProperties {
-        table,
-        changes,
-        authority,
-        expected_committed_partitioning,
-    } = &request.operation
-    else {
-        unreachable!()
+    use ConnectorCatalogMutationOperation::{AlterProperties, SetTableProperties};
+
+    let table = match &request.operation {
+        AlterProperties { table, .. } | SetTableProperties { table, .. } => table,
+        _ => unreachable!("properties preparation requires a property operation"),
     };
     let prepared = provider
         .runtime()
@@ -176,12 +294,23 @@ async fn properties(
                     unreachable!("property preparation retains its original physical table")
                 };
                 let metadata = loaded.table.metadata();
-                let change = prepare_property_change(
-                    metadata,
-                    changes,
-                    *authority,
-                    expected_committed_partitioning.as_ref(),
-                )?;
+                let change = match &request.operation {
+                    AlterProperties {
+                        changes,
+                        authority,
+                        expected_committed_partitioning,
+                        ..
+                    } => prepare_property_change(
+                        metadata,
+                        changes,
+                        *authority,
+                        expected_committed_partitioning.as_ref(),
+                    )?,
+                    SetTableProperties { properties, .. } => {
+                        prepare_set_table_properties(metadata, properties, &request.context)?
+                    }
+                    _ => unreachable!("properties preparation requires a property operation"),
+                };
                 let frozen = crate::commit::staging::freeze_existing_change(
                     loaded.table.identifier().clone(),
                     "main",

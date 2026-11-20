@@ -18,6 +18,8 @@
 //! Freeze once from admission; every catalog conflict prepares fresh metadata.
 
 mod lineage;
+mod managed_repartition;
+pub(super) use managed_repartition::slot_matches;
 mod materialized;
 #[cfg(test)]
 pub(crate) use materialized::observed_materialized_staging_fixture;
@@ -183,7 +185,7 @@ pub(in crate::commit) fn written_file_with_historical_partition(
     })
 }
 
-struct WriteRecipe {
+struct WriteRecipe<'a> {
     source: Arc<TableMetadata>,
     files: Vec<WrittenFile>,
     compact_stage: Option<usize>,
@@ -199,11 +201,12 @@ struct WriteRecipe {
     prefix: PreparedChange,
     output_facts: crate::write_codec::IcebergWrittenOutputFacts,
     keyed_documents: Option<novarocks_spi::connector::KeyedPublication>,
+    managed_overwrite: Option<managed_repartition::ManagedOverwrite<'a>>,
 }
 
-impl WriteRecipe {
+impl<'a> WriteRecipe<'a> {
     fn freeze(
-        handle: &IcebergWriteCommitSession,
+        handle: &'a IcebergWriteCommitSession,
         validated: &[ValidatedFragment<'_>],
         documents: Option<&novarocks_spi::connector::KeyedPublicationIntent>,
     ) -> Result<Self, ConnectorError> {
@@ -353,6 +356,7 @@ impl WriteRecipe {
                 .map_err(|e| invalid(e.to_string()))?,
             uuid: Some(source.uuid()),
         };
+        let managed_overwrite = managed_repartition::Effect::freeze(handle, &source)?;
         Ok(Self {
             source,
             files,
@@ -372,6 +376,7 @@ impl WriteRecipe {
             prefix,
             output_facts,
             keyed_documents,
+            managed_overwrite,
         })
     }
 
@@ -717,20 +722,20 @@ impl WritePublicationDispatch {
         }
     }
 }
-pub(super) struct ReceivedOperation {
+pub(super) struct ReceivedOperation<'a> {
     operation: IcebergCommitOperation,
     journal: PublicationJournal<ConnectorWriteReceipt>,
-    recipe: Result<WriteRecipe, ConnectorError>,
+    recipe: Result<WriteRecipe<'a>, ConnectorError>,
 }
 
 impl IcebergWriteSessionControl {
-    pub(super) fn prepare_received_operation(
+    pub(super) fn prepare_received_operation<'a>(
         &self,
-        handle: &IcebergWriteCommitSession,
+        handle: &'a IcebergWriteCommitSession,
         validated: &[ValidatedFragment<'_>],
         documents: Option<&novarocks_spi::connector::KeyedPublicationIntent>,
         context: &ConnectorRequestContext,
-    ) -> Result<ReceivedOperation, ConnectorError> {
+    ) -> Result<ReceivedOperation<'a>, ConnectorError> {
         let (operation, journal) = self.adopt_received_operation(handle, validated, context)?;
         let recipe = WriteRecipe::freeze(handle, validated, documents);
         Ok(ReceivedOperation {
@@ -740,13 +745,13 @@ impl IcebergWriteSessionControl {
         })
     }
 
-    pub(super) fn prepare_compact_operation(
+    pub(super) fn prepare_compact_operation<'a>(
         &self,
-        handle: &IcebergWriteCommitSession,
+        handle: &'a IcebergWriteCommitSession,
         received: &mut IcebergReceiving,
         documents: Option<&novarocks_spi::connector::KeyedPublicationIntent>,
         context: &ConnectorRequestContext,
-    ) -> Result<ReceivedOperation, ConnectorError> {
+    ) -> Result<ReceivedOperation<'a>, ConnectorError> {
         let compact = received
             .compact_files()
             .ok_or_else(|| internal("Expected compact write receiving"))?;
@@ -801,7 +806,7 @@ impl IcebergWriteSessionControl {
     pub(super) async fn dispatch_operation_async(
         &self,
         handle: &IcebergWriteCommitSession,
-        prepared: ReceivedOperation,
+        prepared: ReceivedOperation<'_>,
         statistics: Vec<novarocks_spi::connector::StatisticsArtifactDraft>,
         publishes_documents: bool,
         context: &ConnectorRequestContext,
@@ -861,8 +866,15 @@ impl IcebergWriteSessionControl {
         let receipt_partitioning = handle.repartition().map(|r| r.committed().clone());
         let receipt_output_facts = recipe.output_facts;
         let retained_evidence = handle.recovery_evidence_slot();
+        let managed_effect = recipe
+            .managed_overwrite
+            .as_ref()
+            .map(|data| data.effect.clone());
         let preflight = Arc::new(
             move |request: &FrozenRequest, operation: &IcebergCommitOperation| {
+                if let Some(effect) = &managed_effect {
+                    effect.verify_request(request).map_err(format_error)?;
+                }
                 let evidence = template.encode(request, operation).map_err(format_error)?;
                 *retained_evidence.lock().map_err(|_| {
                     format_error(internal("Iceberg retained evidence state poisoned"))
@@ -917,7 +929,11 @@ impl IcebergWriteSessionControl {
             if let Some(keyed) = &keyed {
                 preparers.push(keyed);
             }
-            preparers.extend([data.as_ref(), &stats as &dyn Preparer]);
+            let data: &dyn Preparer = match &recipe.managed_overwrite {
+                Some(managed) => managed,
+                None => data.as_ref(),
+            };
+            preparers.extend([data, &stats as &dyn Preparer]);
             attempt::run_to_committed_frontier(
                 &run_operation,
                 &intent,
@@ -1339,6 +1355,12 @@ impl RecoveryTemplate {
 }
 
 impl RecoveryPayload {
+    pub(super) fn names_publication(&self, snapshot: i64, parent: Option<i64>) -> bool {
+        self.published_snapshot_id == Some(snapshot)
+            && self.parent_snapshot_id == parent
+            && self.base_snapshot_id == parent
+    }
+
     pub(super) fn validate(
         &self,
         descriptor: &ConnectorInstanceDescriptor,

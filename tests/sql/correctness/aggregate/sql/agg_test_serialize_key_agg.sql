@@ -30,8 +30,7 @@ create table t0 (
     c0 STRING,
     c1 STRING,
     c2 STRING
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 3
 USE ${case_db};

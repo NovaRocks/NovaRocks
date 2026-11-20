@@ -543,7 +543,7 @@ fn view_definition_needs_only_the_declaration_and_saved_context_is_exact() {
 fn historical_system_references_are_refused_before_snapshot_or_provider_read() {
     for sql in [
         "SELECT * FROM system.metadata.fixture FOR VERSION AS OF 17",
-        "SELECT * FROM iceberg.information_schema.fixture FOR SYSTEM_TIME AS OF '2026-01-01'",
+        "SELECT * FROM iceberg.information_schema.fixture FOR TIMESTAMP AS OF '2026-01-01'",
     ] {
         let error = request(sql, SqlCompileIntent::Query)
             .try_into_completion()

@@ -22,12 +22,11 @@
 USE ${case_db};
 create table t2 (
     c0 INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 2
 USE ${case_db};
-insert into t2 values (1), (2), (3);
+insert into t2 values ROW(1), ROW(2), ROW(3);
 
 -- query 3
 USE ${case_db};

@@ -52,11 +52,12 @@ use arrow::array::{ArrayRef, StringArray};
 use arrow::datatypes::DataType;
 
 use crate::mv::domain::readiness::MvReadinessPort;
-use novarocks_parser::ast::{CallStatement, LiteralKind, MaintenanceValue};
+use novarocks_parser::ast::LiteralKind;
 use novarocks_query_application::api::{
     QueryResult, ResultField as QueryResultColumn, build_arrow_query_result,
 };
 use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
+use novarocks_query_application::sql::PreparedMaintenanceCall;
 use novarocks_spi::connector::{
     ConnectorControlResolver, ConnectorInstanceId, ConnectorRequestContext, ConnectorTableIdentity,
 };
@@ -110,7 +111,7 @@ impl ImvStatelessRebuildRequest {
     /// Lowers the one test-only procedure directly from parser-owned syntax.
     /// A non-target procedure remains a route miss for the command router.
     pub(crate) fn from_typed_call(
-        statement: &CallStatement,
+        statement: &PreparedMaintenanceCall,
         current_database: &str,
     ) -> Result<Option<Self>, String> {
         let name_parts = statement
@@ -145,13 +146,14 @@ impl ImvStatelessRebuildRequest {
     }
 }
 
-fn typed_string_argument<'a>(statement: &'a CallStatement, name: &str) -> Option<&'a str> {
+fn typed_string_argument<'a>(
+    statement: &'a PreparedMaintenanceCall,
+    name: &str,
+) -> Option<&'a str> {
     statement.arguments.iter().find_map(|argument| {
         let argument_name = argument.name.as_ref()?;
         (normalize_identifier(&argument_name.value).ok()?.as_str() == name).then(|| {
-            let MaintenanceValue::Literal(literal) = &argument.value else {
-                return None;
-            };
+            let literal = argument.value.literal()?;
             let LiteralKind::String(value) = &literal.kind else {
                 return None;
             };
@@ -178,7 +180,7 @@ pub fn execute_typed_novarocks_imv_stateless_rebuild(
     connector_control: &dyn ConnectorControlResolver,
     readiness: &MvReadinessPort,
     product: &novarocks_mv_application::service::MvKeyedProductService,
-    statement: &CallStatement,
+    statement: &PreparedMaintenanceCall,
     current_database: &str,
     connector_context: ConnectorRequestContext,
 ) -> Result<Option<StatementResult>, String> {
@@ -372,10 +374,7 @@ fn column(name: &str, nullable: bool) -> QueryResultColumn {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use novarocks_parser::{
-        ast::{MaintenanceStatement, Statement},
-        parse,
-    };
+    use novarocks_parser::{ast::TrinoStatement, parser::parse_statement};
 
     #[test]
     fn available_level_tracks_exact_publication_presence() {
@@ -407,19 +406,21 @@ mod tests {
         sql: &str,
         current_database: &str,
     ) -> Result<ImvStatelessRebuildRequest, String> {
-        let statements = parse(sql).map_err(|error| error.to_string())?;
-        let [Statement::Maintenance(MaintenanceStatement::Call(statement))] = statements.as_slice()
+        let TrinoStatement::Call(statement) =
+            parse_statement(sql).map_err(|error| error.to_string())?
         else {
             return Err("expected typed CALL statement".to_string());
         };
-        ImvStatelessRebuildRequest::from_typed_call(statement, current_database)?
+        let prepared =
+            PreparedMaintenanceCall::from_trino(&statement).map_err(|error| error.to_string())?;
+        ImvStatelessRebuildRequest::from_typed_call(&prepared, current_database)?
             .ok_or_else(|| "expected stateless rebuild procedure".to_string())
     }
 
     #[test]
     fn from_call_parses_two_part_table_and_level() {
         let req = parse_request(
-            "CALL ice.system.novarocks_imv_stateless_rebuild(table => 'analytics.mv_orders', level => 'baseline')",
+            "CALL ice.system.novarocks_imv_stateless_rebuild(\"table\" => 'analytics.mv_orders', level => 'baseline')",
             "default_db",
         )
         .unwrap();
@@ -432,7 +433,7 @@ mod tests {
     #[test]
     fn from_call_bare_table_defaults_namespace_to_current_database() {
         let req = parse_request(
-            "CALL ice.system.novarocks_imv_stateless_rebuild(table => 'mv_orders')",
+            "CALL ice.system.novarocks_imv_stateless_rebuild(\"table\" => 'mv_orders')",
             "analytics",
         )
         .unwrap();
@@ -443,7 +444,7 @@ mod tests {
     #[test]
     fn from_call_defaults_level_to_package() {
         let req = parse_request(
-            "CALL ice.system.novarocks_imv_stateless_rebuild(table => 'analytics.mv_orders')",
+            "CALL ice.system.novarocks_imv_stateless_rebuild(\"table\" => 'analytics.mv_orders')",
             "default_db",
         )
         .unwrap();
@@ -453,8 +454,7 @@ mod tests {
     #[test]
     fn typed_call_normalizes_quoted_procedure_and_argument_identifiers() {
         let req = parse_request(
-            "CALL `ICE`.`SYSTEM`.`NOVAROCKS_IMV_STATELESS_REBUILD`(\
-                `TABLE` => 'analytics.mv_orders', `LEVEL` => 'WIPE')",
+            "CALL \"ICE\".\"SYSTEM\".\"NOVAROCKS_IMV_STATELESS_REBUILD\"(\"TABLE\" => 'analytics.mv_orders', \"LEVEL\" => 'WIPE')",
             "default_db",
         )
         .unwrap();
@@ -476,7 +476,7 @@ mod tests {
     #[test]
     fn from_call_rejects_three_part_table() {
         let err = parse_request(
-            "CALL ice.system.novarocks_imv_stateless_rebuild(table => 'ice.analytics.mv_orders')",
+            "CALL ice.system.novarocks_imv_stateless_rebuild(\"table\" => 'ice.analytics.mv_orders')",
             "default_db",
         )
         .unwrap_err();
@@ -487,16 +487,51 @@ mod tests {
     }
 
     #[test]
+    fn trino_rebuild_arguments_use_the_original_request_decoder() {
+        use novarocks_parser::{ast::TrinoStatement, parser};
+        use novarocks_query_application::api::CommandErrorKind;
+
+        let legacy = parse_request(
+            "CALL ice.system.novarocks_imv_stateless_rebuild(\"table\" => 'orders', level => 'provenance')",
+            "analytics",
+        ).unwrap();
+        let sql = r#"CALL ice.system.novarocks_imv_stateless_rebuild("table" => 'orders', level => 'provenance')"#;
+        let TrinoStatement::Call(parsed) = parser::parse_statement(sql).unwrap() else {
+            panic!("expected CALL");
+        };
+        let call = PreparedMaintenanceCall::from_trino(&parsed).unwrap();
+        let expected = ImvStatelessRebuildRequest {
+            catalog: "ice".into(),
+            namespace: "analytics".into(),
+            mv: "orders".into(),
+            required_level: StatelessLevel::Provenance,
+        };
+        assert_eq!(legacy, expected);
+        assert_eq!(
+            ImvStatelessRebuildRequest::from_typed_call(&call, "analytics").unwrap(),
+            Some(expected)
+        );
+        let sql = r#"CALL ice.system.novarocks_imv_stateless_rebuild("table" => 'orders', level => lower('WIPE'))"#;
+        let TrinoStatement::Call(parsed) = parser::parse_statement(sql).unwrap() else {
+            panic!("expected CALL");
+        };
+        let error = PreparedMaintenanceCall::from_trino(&parsed).unwrap_err();
+        assert_eq!(error.kind(), CommandErrorKind::Unsupported);
+    }
+
+    #[test]
     fn typed_call_lowerer_defers_non_target_procedures() {
-        let statements = parse("CALL ice.system.rewrite_manifests(table => 'analytics.mv_orders')")
-            .expect("generic typed CALL should parse");
-        let [Statement::Maintenance(MaintenanceStatement::Call(statement))] = statements.as_slice()
-        else {
+        let source = r#"CALL ice.system.rewrite_manifests("table" => 'analytics.mv_orders')"#;
+        let TrinoStatement::Call(statement) = parse_statement(source).unwrap() else {
             panic!("expected typed CALL statement");
         };
 
         assert_eq!(
-            ImvStatelessRebuildRequest::from_typed_call(statement, "default_db").unwrap(),
+            ImvStatelessRebuildRequest::from_typed_call(
+                &PreparedMaintenanceCall::from_trino(&statement).unwrap(),
+                "default_db",
+            )
+            .unwrap(),
             None
         );
     }

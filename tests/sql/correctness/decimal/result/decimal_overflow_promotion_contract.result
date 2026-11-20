@@ -46,24 +46,24 @@ exact_product
 15241578780673678.515622620750190521
 
 -- query 13
--- types	double	decimal(38, 19)	decimal(38, 19)
+-- types	decimal(38, 19)	decimal(38, 19)	decimal(38, 19)
 promoted	checked	outer_checked
-1.5241578766956256E27	NULL	NULL
+NULL	NULL	NULL
 
 -- query 14
--- types	decimal(38, 19)	double
+-- types	double	double
 checked	inherited
-NULL	1.5241578766956256E27
+1.5241578766956256E27	1.5241578766956256E27
 
 -- query 15
--- types	double	decimal(38, 19)	decimal(38, 19)
+-- types	decimal(38, 19)	decimal(38, 19)	decimal(38, 19)
 promoted	checked	outer_checked
-1.5241578766956256E27	NULL	NULL
+NULL	NULL	NULL
 
 -- query 16
--- types	integer	double
+-- types	integer	decimal(38, 19)
 branch	product
-1	1.5241578766956256E27
+1	NULL
 2	NULL
 
 -- query 27

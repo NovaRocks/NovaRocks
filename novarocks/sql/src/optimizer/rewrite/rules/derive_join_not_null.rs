@@ -405,9 +405,9 @@ mod tests {
     fn eq_expr(left: TypedExpr, right: TypedExpr) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::BinaryOp {
-                left: Box::new(left),
+                left: novarocks_parser::ast::AstBox::new(left),
                 op: BinOp::Eq,
-                right: Box::new(right),
+                right: novarocks_parser::ast::AstBox::new(right),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
@@ -417,9 +417,9 @@ mod tests {
     fn and_expr(left: TypedExpr, right: TypedExpr) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::BinaryOp {
-                left: Box::new(left),
+                left: novarocks_parser::ast::AstBox::new(left),
                 op: BinOp::And,
-                right: Box::new(right),
+                right: novarocks_parser::ast::AstBox::new(right),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
@@ -738,14 +738,14 @@ mod tests {
         let mut arena = ScalarArena::new();
         let not_null_pred_l = TypedExpr {
             kind: ExprKind::IsNull {
-                expr: Box::new(col_typed("l", "a", 1, true)),
+                expr: novarocks_parser::ast::AstBox::new(col_typed("l", "a", 1, true)),
                 negated: true,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         };
         let not_null_pred_r = TypedExpr {
             kind: ExprKind::IsNull {
-                expr: Box::new(col_typed("r", "b", 2, true)),
+                expr: novarocks_parser::ast::AstBox::new(col_typed("r", "b", 2, true)),
                 negated: true,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
@@ -868,9 +868,9 @@ mod tests {
             let mut arena = ScalarArena::new();
             let gt = TypedExpr {
                 kind: ExprKind::BinaryOp {
-                    left: Box::new(col_typed("l", "a", 1, true)),
+                    left: novarocks_parser::ast::AstBox::new(col_typed("l", "a", 1, true)),
                     op: BinOp::Gt,
-                    right: Box::new(col_typed("r", "b", 2, true)),
+                    right: novarocks_parser::ast::AstBox::new(col_typed("r", "b", 2, true)),
                     decimal_overflow_policy:
                         novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 },

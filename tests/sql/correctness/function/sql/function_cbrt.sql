@@ -34,7 +34,7 @@ select cbrt(-27);
 select cbrt(3.1415);
 
 -- query 5
-select cbrt(-3.1415);
+SELECT cbrt((- (DECIMAL '3.1415')));
 
 -- query 6
 select cbrt(null);

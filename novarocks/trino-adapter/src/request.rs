@@ -425,7 +425,7 @@ pub(crate) fn session_effect_headers(
         );
     }
     for name in effects.reset_properties() {
-        headers.append("x-trino-clear-session", HeaderValue::from_str(name)?);
+        headers.append("x-trino-clear-session", HeaderValue::from_str(&name)?);
     }
     Ok(headers)
 }

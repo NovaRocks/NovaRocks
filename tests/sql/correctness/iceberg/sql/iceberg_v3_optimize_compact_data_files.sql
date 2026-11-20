@@ -31,33 +31,15 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE EXTERNAL CATALOG opt_ice_${uuid0}
-PROPERTIES (
-  "type" = "iceberg",
-  "iceberg.catalog.type" = "hadoop",
-  "iceberg.catalog.warehouse" = "${iceberg_test_warehouse}/opt_ice_${uuid0}",
-  "aws.s3.endpoint" = "${oss_endpoint}",
-  "credential.object-store-metadata.consumer-role" = "frontend",
-  "credential.object-store-metadata.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-metadata.name" = "${iceberg_object_store_metadata_credential_name}",
-  "credential.object-store-metadata.generation" = "${iceberg_object_store_credential_generation}",
-  "credential.object-store-data.consumer-role" = "backend",
-  "credential.object-store-data.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-data.name" = "${iceberg_object_store_data_credential_name}",
-  "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
-  "aws.s3.enable_path_style_access" = "${oss_path_style}"
-);
-CREATE DATABASE opt_ice_${uuid0}.ns_${uuid0};
+CREATE CATALOG opt_ice_${uuid0} USING iceberg WITH ("iceberg.catalog.type" = 'hadoop', "iceberg.catalog.warehouse" = '${iceberg_test_warehouse}/opt_ice_${uuid0}', "aws.s3.endpoint" = '${oss_endpoint}', "credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-metadata.name" = '${iceberg_object_store_metadata_credential_name}', "credential.object-store-metadata.generation" = '${iceberg_object_store_credential_generation}', "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-data.name" = '${iceberg_object_store_data_credential_name}', "credential.object-store-data.generation" = '${iceberg_object_store_credential_generation}', "aws.s3.enable_path_style_access" = '${oss_path_style}');
+CREATE SCHEMA opt_ice_${uuid0}.ns_${uuid0};
 CREATE TABLE opt_ice_${uuid0}.ns_${uuid0}.orders (
   id INT,
   user_id INT,
   amount INT
-) TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
-);
-INSERT INTO opt_ice_${uuid0}.ns_${uuid0}.orders VALUES (1, 10, 100), (2, 20, 200);
-INSERT INTO opt_ice_${uuid0}.ns_${uuid0}.orders VALUES (3, 30, 300), (4, 40, 400);
+) WITH (format_version = 3);
+INSERT INTO opt_ice_${uuid0}.ns_${uuid0}.orders VALUES ROW(1, 10, 100), ROW(2, 20, 200);
+INSERT INTO opt_ice_${uuid0}.ns_${uuid0}.orders VALUES ROW(3, 30, 300), ROW(4, 40, 400);
 DELETE FROM opt_ice_${uuid0}.ns_${uuid0}.orders WHERE id = 2;
 DELETE FROM opt_ice_${uuid0}.ns_${uuid0}.orders WHERE id = 4;
 
@@ -67,7 +49,7 @@ SELECT id, user_id, amount FROM orders ORDER BY id;
 
 -- query 3
 -- @db=ns_${uuid0}
-ALTER TABLE orders OPTIMIZE;
+ALTER TABLE orders EXECUTE optimize;
 
 -- query 4
 -- @db=ns_${uuid0}
@@ -75,6 +57,6 @@ SELECT id, user_id, amount FROM orders ORDER BY id;
 
 -- query 5
 -- @skip_result_check=true
-DROP TABLE opt_ice_${uuid0}.ns_${uuid0}.orders FORCE;
-DROP DATABASE opt_ice_${uuid0}.ns_${uuid0};
+DROP TABLE opt_ice_${uuid0}.ns_${uuid0}.orders ;
+DROP SCHEMA opt_ice_${uuid0}.ns_${uuid0};
 DROP CATALOG opt_ice_${uuid0};

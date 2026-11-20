@@ -21,36 +21,30 @@
 -- user-visible strict/no-op behavior and confirms that the winner remains usable.
 
 -- query 1
-CREATE DATABASE iceberg_ddl_cat_${suite_uuid0}.hadoop_fence_${uuid0};
+CREATE SCHEMA iceberg_ddl_cat_${suite_uuid0}.hadoop_fence_${uuid0};
 USE iceberg_ddl_cat_${suite_uuid0}.hadoop_fence_${uuid0};
 CREATE TABLE events (
   id BIGINT,
   payload STRING
-) TBLPROPERTIES (
-  "format-version" = "2"
-);
+) WITH (format_version = 2);
 
 -- query 2
 CREATE TABLE IF NOT EXISTS events (
   id BIGINT,
   payload STRING
-) TBLPROPERTIES (
-  "format-version" = "2"
-);
+) WITH (format_version = 2);
 
 -- query 3
--- @expect_error=AlreadyExists
+-- @expect_trino_error=TABLE_ALREADY_EXISTS,USER_ERROR
 CREATE TABLE events (
   id BIGINT,
   payload STRING
-) TBLPROPERTIES (
-  "format-version" = "2"
-);
+) WITH (format_version = 2);
 
 -- query 4
-INSERT INTO events VALUES (1, 'winner');
+INSERT INTO events VALUES ROW(1, 'winner');
 SELECT * FROM events ORDER BY id;
 
 -- query 5
-DROP TABLE iceberg_ddl_cat_${suite_uuid0}.hadoop_fence_${uuid0}.events FORCE;
-DROP DATABASE iceberg_ddl_cat_${suite_uuid0}.hadoop_fence_${uuid0};
+DROP TABLE iceberg_ddl_cat_${suite_uuid0}.hadoop_fence_${uuid0}.events ;
+DROP SCHEMA iceberg_ddl_cat_${suite_uuid0}.hadoop_fence_${uuid0};

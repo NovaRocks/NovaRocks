@@ -87,6 +87,20 @@ fn work(error: WorkError) -> QueryServiceError {
 fn work_at(error: WorkError, detail: &'static str) -> QueryServiceError {
     QueryServiceError::from_failure_cause(SharedFailureCause::from_static_detail(error, detail))
 }
+/// Reuse the original pure name admission before property computation and
+/// again before the StateStore mutation. No placeholder command is required.
+pub(crate) fn admit_create_catalog_name(
+    name: &str,
+) -> Result<novarocks_spi::connector::ConnectorInstanceId, SharedFailureCause> {
+    let instance = novarocks_spi::connector::ConnectorInstanceId::parse(
+        &novarocks_types::naming::normalize_identifier(name).map_err(invalid)?,
+    )
+    .map_err(|error| invalid(error.to_string()))?;
+    novarocks_catalog_application::validate_catalog_create_name(&instance)
+        .map_err(SharedFailureCause::new)?;
+    Ok(instance)
+}
+
 pub(crate) fn prepare(
     executor: &CatalogCommandExecutor,
     binding: Option<StateStoreOriginalBinding>,
@@ -109,12 +123,7 @@ pub(crate) fn prepare_for_application(
 ) -> Result<Box<dyn GovernedStatementAction>, SharedFailureCause> {
     let input = match command {
         CatalogSqlCommand::CreateCatalog(command) => {
-            let instance = novarocks_spi::connector::ConnectorInstanceId::parse(
-                &novarocks_types::naming::normalize_identifier(&command.name).map_err(invalid)?,
-            )
-            .map_err(|error| invalid(error.to_string()))?;
-            novarocks_catalog_application::validate_catalog_create_name(&instance)
-                .map_err(SharedFailureCause::new)?;
+            admit_create_catalog_name(&command.name)?;
             Mutation::Create(lower_semantic_create_catalog(&command).map_err(invalid)?)
         }
         CatalogSqlCommand::DropCatalog { name, if_exists } => Mutation::Drop(CatalogDropCommand {

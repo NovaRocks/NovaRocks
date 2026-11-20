@@ -1246,6 +1246,15 @@ pub trait StatisticsReader: Send + Sync {
 /// Optional collection and publication half of a connector statistics
 /// capability. Providers without this trait remain valid readers.
 pub trait StatisticsCollection: Send + Sync {
+    fn analyze_property_declarations(
+        &self,
+    ) -> Result<Vec<super::DdlPropertyDeclaration>, ConnectorError> {
+        Err(ConnectorError::new(
+            super::ConnectorErrorKind::Unsupported,
+            "connector statistics does not declare ANALYZE properties",
+        ))
+    }
+
     /// The sealed production Provider manifest's concrete original phase
     /// Source. None supports no scoped phase; descriptor equality is not a
     /// factory qualification. This never registers a new executor or runner.
@@ -1324,6 +1333,16 @@ impl ConnectorStatisticsSession {
     pub const fn incarnation(&self) -> ProviderBindingEpoch {
         self.incarnation
     }
+    /// Read property declarations from the same retained statistics generation.
+    pub fn analyze_property_declarations(
+        &self,
+    ) -> Result<Vec<super::DdlPropertyDeclaration>, ConnectorError> {
+        self.statistics
+            .collection()
+            .ok_or_else(async_collection_unsupported)?
+            .analyze_property_declarations()
+    }
+
     pub fn supports_collection(&self) -> bool {
         self.statistics.collection().is_some()
     }

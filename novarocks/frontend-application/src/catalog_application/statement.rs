@@ -23,7 +23,6 @@
 
 use std::sync::Arc;
 
-use crate::catalog_application::model::{CatalogCreateTableKind, CatalogCreateTableRequest};
 use crate::catalog_application::query_catalog::drop_local_table_registration_if_exists;
 use bytes::Bytes;
 use novarocks_query_application::{
@@ -31,23 +30,17 @@ use novarocks_query_application::{
 };
 use novarocks_spi::connector::ConnectorControlRegistry;
 use novarocks_spi::connector::{
-    ConnectorCatalogMutationOperation, ConnectorColumnAggregation, ConnectorColumnDefinition,
-    ConnectorColumnPath, ConnectorColumnPosition, ConnectorDataType, ConnectorDefaultValue,
+    ConnectorCatalogMutationOperation, ConnectorColumnDefinition, ConnectorColumnPath,
+    ConnectorColumnPosition, ConnectorDataType, ConnectorDefaultValue,
     ConnectorDropTableDataDisposition, ConnectorErrorKind, ConnectorInstanceId,
-    ConnectorNamespaceIdentity, ConnectorPartitionTransform, ConnectorTableIdentity,
-    ConnectorTableKey, ConnectorTableKeyKind, ConnectorViewIdentity, ConnectorViewRequest,
-    CreatePolicy, DropPolicy,
+    ConnectorNamespaceIdentity, ConnectorTableIdentity, ConnectorViewIdentity,
+    ConnectorViewRequest, CreatePolicy, DropPolicy,
 };
 use novarocks_sql::literal::{parse_date_string_to_days, parse_datetime_string_to_micros};
 use novarocks_sql::semantic::command::{
-    ColumnPositionSql, CommandLiteral, CreateTableSqlCommand, IcebergColumnSqlAction,
-    IcebergPartitionSqlChange, IcebergPropertiesSqlAction, IcebergSchemaSqlChange,
-    TablePartitionSqlCommand,
+    ColumnPositionSql, CommandLiteral, IcebergColumnSqlAction, IcebergSchemaSqlChange,
 };
-use novarocks_sql::semantic::{
-    ColumnAggregation, DefaultLiteral, IcebergPartitionFieldExpr, ObjectName, TableColumnDef,
-    TableKeyDesc, TableKeyKind,
-};
+use novarocks_sql::semantic::{DefaultLiteral, ObjectName, TableColumnDef};
 use novarocks_types::naming::{normalize_identifier, resolve_local_table_name};
 use novarocks_types::schema::SqlType;
 
@@ -81,6 +74,7 @@ pub(crate) fn execute_create_database_statement(
     context: &impl CatalogMutationContext,
     name: &ObjectName,
     if_not_exists: bool,
+    properties: &[(String, novarocks_spi::connector::DdlPropertyValue)],
     current_catalog: Option<&str>,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, CommandError> {
@@ -94,6 +88,10 @@ pub(crate) fn execute_create_database_statement(
         context.connector_control(),
         &instance_id,
         ConnectorCatalogMutationOperation::CreateNamespace {
+            properties: properties
+                .iter()
+                .map(|(name, value)| (Arc::from(name.as_str()), value.clone()))
+                .collect(),
             namespace: ConnectorNamespaceIdentity {
                 instance_id: instance_id.clone(),
                 namespace: Arc::from(target.namespace),
@@ -109,180 +107,25 @@ pub(crate) fn execute_create_database_statement(
     Ok(StatementResult::Ok)
 }
 
-pub(crate) fn execute_create_table_statement(
-    context: &impl CatalogMutationContext,
-    stmt: CatalogCreateTableRequest,
-    current_catalog: Option<&str>,
-    current_database: &str,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<StatementResult, CommandError> {
-    match stmt.kind {
-        CatalogCreateTableKind::Iceberg {
-            columns,
-            key_desc,
-            bucket_count,
-            distribution_columns,
-            partition_fields,
-            properties,
-        } => {
-            // BITMAP / HLL columns cannot be used as distribution keys —
-            // they are opaque blobs with no hash semantics that match a
-            // scalar column. Reject the CREATE TABLE before any catalog
-            // mutation. Column names are case-insensitive in StarRocks.
-            for dist_col in &distribution_columns {
-                let dist_lower = dist_col.to_ascii_lowercase();
-                if let Some(column) = columns
-                    .iter()
-                    .find(|c| c.name.eq_ignore_ascii_case(&dist_lower))
-                    && matches!(
-                        column.data_type,
-                        novarocks_types::schema::SqlType::Bitmap
-                            | novarocks_types::schema::SqlType::Hll
-                    )
-                {
-                    return Err(format!(
-                        "BITMAP/HLL columns cannot be used as distribution key (column `{}` has type {:?})",
-                        column.name, column.data_type
-                    ).into());
-                }
-            }
-            let target = crate::catalog_application::resolver::resolve_table_target(
-                context,
-                &stmt.name,
-                current_catalog,
-                current_database,
-            )?;
-            let instance_id = mutation_instance_id(&target.catalog)?;
-            let _ = bucket_count;
-            crate::connector::mutation::execute_catalog_mutation_for_command(
-                context.connector_control(),
-                &instance_id,
-                ConnectorCatalogMutationOperation::CreateTable {
-                    table: ConnectorTableIdentity {
-                        instance_id: instance_id.clone(),
-                        namespace: Arc::from(target.namespace),
-                        table: Arc::from(target.table),
-                    },
-                    columns: columns
-                        .iter()
-                        .map(connector_column)
-                        .collect::<Result<_, _>>()?,
-                    key: key_desc.as_ref().map(connector_table_key),
-                    partitioning: partition_fields
-                        .iter()
-                        .map(connector_partition_transform)
-                        .collect(),
-                    properties: properties
-                        .into_iter()
-                        .map(|(key, value)| (Arc::from(key), Arc::from(value)))
-                        .collect(),
-                    policy: if stmt.if_not_exists {
-                        CreatePolicy::NoOpIfExists
-                    } else {
-                        CreatePolicy::FailIfExists
-                    },
-                },
-                connector_context.clone(),
-            )?;
-            Ok(StatementResult::Ok)
-        }
-    }
-}
-
-/// Lowers a Query-Application `CREATE TABLE` command to the catalog product
-/// request. The input is a closed semantic value, so source syntax cannot
-/// cross this application boundary or be reconstructed here.
-pub(crate) fn lower_semantic_create_table_statement(
-    statement: &CreateTableSqlCommand,
-) -> Result<CatalogCreateTableRequest, String> {
-    if statement.temporary || statement.external {
-        return Err("CREATE TABLE does not support TEMPORARY or EXTERNAL tables".to_string());
-    }
-    if let Some(engine) = &statement.engine
-        && !engine.eq_ignore_ascii_case("iceberg")
-    {
-        return Err(format!("CREATE TABLE does not support ENGINE = {engine}"));
-    }
-    if statement.like.is_some() {
-        return Err("CREATE TABLE LIKE must use the semantic LIKE executor".to_string());
-    }
-    if !statement.order_by.is_empty() {
-        return Err("CREATE TABLE does not support ORDER BY".to_string());
-    }
-    let partition_fields = match &statement.partition {
-        None => Vec::new(),
-        Some(TablePartitionSqlCommand::Transform(partition)) => partition.clone(),
-        Some(TablePartitionSqlCommand::UnsupportedLegacyRange { .. }) => {
-            return Err(
-                "CREATE TABLE does not support legacy RANGE partition definitions".to_string(),
-            );
-        }
-    };
-    let mut properties = statement
-        .properties
+/// Lower complete column defaults through the original typed literal author.
+pub(crate) fn lower_semantic_create_table_columns(
+    columns: &[novarocks_sql::semantic::command::TableColumnSqlCommand],
+) -> Result<Vec<TableColumnDef>, String> {
+    columns
         .iter()
-        .map(|property| {
-            Ok((
-                semantic_table_property_text(&property.key)?,
-                semantic_table_property_text(&property.value)?,
-            ))
+        .map(|column| {
+            Ok(TableColumnDef {
+                name: column.name.clone(),
+                nullable: column.nullable.unwrap_or(true),
+                default: column
+                    .default
+                    .as_ref()
+                    .map(|value| lower_semantic_default_literal(value, &column.data_type))
+                    .transpose()?,
+                data_type: column.data_type.clone(),
+            })
         })
-        .collect::<Result<Vec<_>, String>>()?;
-    if let Some(comment) = &statement.comment {
-        properties.push((
-            "comment".to_string(),
-            semantic_table_property_text(comment)?,
-        ));
-    }
-    Ok(CatalogCreateTableRequest {
-        name: statement.name.clone(),
-        kind: CatalogCreateTableKind::Iceberg {
-            columns: statement
-                .columns
-                .iter()
-                .map(|column| {
-                    Ok(TableColumnDef {
-                        name: column.name.clone(),
-                        nullable: column.nullable.unwrap_or(true),
-                        aggregation: column.aggregation,
-                        default: column
-                            .default
-                            .as_ref()
-                            .map(|value| lower_semantic_default_literal(value, &column.data_type))
-                            .transpose()?,
-                        data_type: column.data_type.clone(),
-                    })
-                })
-                .collect::<Result<Vec<_>, String>>()?,
-            key_desc: statement.key.clone(),
-            bucket_count: statement
-                .distribution
-                .as_ref()
-                .and_then(|value| value.buckets)
-                .map(|value| {
-                    u32::try_from(value)
-                        .map_err(|_| "distribution bucket count exceeds u32".to_string())
-                })
-                .transpose()?,
-            distribution_columns: statement
-                .distribution
-                .as_ref()
-                .map(|value| value.columns.clone())
-                .unwrap_or_default(),
-            partition_fields,
-            properties,
-        },
-        if_not_exists: statement.if_not_exists,
-    })
-}
-
-fn semantic_table_property_text(literal: &CommandLiteral) -> Result<String, String> {
-    match literal {
-        CommandLiteral::Null => Err("table properties do not support NULL values".to_string()),
-        CommandLiteral::Bool(value) => Ok(value.to_string()),
-        CommandLiteral::Number(value) | CommandLiteral::String(value) => Ok(value.clone()),
-        CommandLiteral::Binary(value) => Ok(format!("0x{}", hex::encode(value))),
-    }
+        .collect::<Result<Vec<_>, String>>()
 }
 
 fn lower_semantic_default_literal(
@@ -316,7 +159,6 @@ pub fn connector_column(column: &TableColumnDef) -> Result<ConnectorColumnDefini
         name: Arc::from(column.name.as_str()),
         data_type: connector_data_type(&column.data_type)?,
         nullable: column.nullable,
-        aggregation: column.aggregation.map(connector_column_aggregation),
         default: column.default.as_ref().map(connector_default).transpose()?,
     })
 }
@@ -393,77 +235,10 @@ fn connector_default(value: &DefaultLiteral) -> Result<ConnectorDefaultValue, St
     })
 }
 
-fn connector_column_aggregation(aggregation: ColumnAggregation) -> ConnectorColumnAggregation {
-    match aggregation {
-        ColumnAggregation::Sum => ConnectorColumnAggregation::Sum,
-        ColumnAggregation::Min => ConnectorColumnAggregation::Min,
-        ColumnAggregation::Max => ConnectorColumnAggregation::Max,
-        ColumnAggregation::Replace => ConnectorColumnAggregation::Replace,
-        ColumnAggregation::ReplaceIfNotNull => ConnectorColumnAggregation::ReplaceIfNotNull,
-        ColumnAggregation::BitmapUnion => ConnectorColumnAggregation::BitmapUnion,
-        ColumnAggregation::HllUnion => ConnectorColumnAggregation::HllUnion,
-    }
-}
-
-pub(crate) fn connector_table_key(key: &TableKeyDesc) -> ConnectorTableKey {
-    ConnectorTableKey {
-        kind: match key.kind {
-            TableKeyKind::Duplicate => ConnectorTableKeyKind::Duplicate,
-            TableKeyKind::Unique => ConnectorTableKeyKind::Unique,
-            TableKeyKind::Aggregate => ConnectorTableKeyKind::Aggregate,
-            TableKeyKind::Primary => ConnectorTableKeyKind::Primary,
-        },
-        columns: key
-            .columns
-            .iter()
-            .map(|column| Arc::from(column.as_str()))
-            .collect(),
-    }
-}
-
-pub fn connector_partition_transform(
-    field: &IcebergPartitionFieldExpr,
-) -> ConnectorPartitionTransform {
-    match field {
-        IcebergPartitionFieldExpr::Identity { column } => ConnectorPartitionTransform::Identity {
-            column: Arc::from(column.as_str()),
-        },
-        IcebergPartitionFieldExpr::Year { column } => ConnectorPartitionTransform::Year {
-            column: Arc::from(column.as_str()),
-        },
-        IcebergPartitionFieldExpr::Month { column } => ConnectorPartitionTransform::Month {
-            column: Arc::from(column.as_str()),
-        },
-        IcebergPartitionFieldExpr::Day { column } => ConnectorPartitionTransform::Day {
-            column: Arc::from(column.as_str()),
-        },
-        IcebergPartitionFieldExpr::Hour { column } => ConnectorPartitionTransform::Hour {
-            column: Arc::from(column.as_str()),
-        },
-        IcebergPartitionFieldExpr::Bucket {
-            column,
-            num_buckets,
-        } => ConnectorPartitionTransform::Bucket {
-            column: Arc::from(column.as_str()),
-            num_buckets: *num_buckets,
-        },
-        IcebergPartitionFieldExpr::Truncate { column, width } => {
-            ConnectorPartitionTransform::Truncate {
-                column: Arc::from(column.as_str()),
-                width: *width,
-            }
-        }
-        IcebergPartitionFieldExpr::Void { column } => ConnectorPartitionTransform::Void {
-            column: Arc::from(column.as_str()),
-        },
-    }
-}
-
 // Ownership: `ColumnPath` and `AddPosition` are this module's own parsed
 // schema-change AST types, so lowering them onto the connector SPI is catalog
-// statement work, not query assembly. These two join the sibling converters
-// above (`connector_partition_transform`, `connector_table_key`,
-// `connector_column_aggregation`) that already own that lowering.
+// statement work, not query assembly. Partition transform facts use the
+// shared Query Application projection author.
 pub(crate) fn connector_schema_path(path: ColumnPath) -> ConnectorColumnPath {
     ConnectorColumnPath {
         segments: path
@@ -696,7 +471,6 @@ pub(crate) fn execute_drop_table_statement(
     current_catalog: Option<&str>,
     current_database: &str,
     if_exists: bool,
-    _force: bool,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, CommandError> {
     let target = match crate::catalog_application::resolver::resolve_existing_table_target(
@@ -998,85 +772,6 @@ pub(crate) struct AlterIcebergSchemaStmt {
     pub(crate) change: IcebergSchemaChange,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct AlterIcebergPropertiesStmt {
-    pub(crate) table: ObjectName,
-    pub(crate) op: PropertiesOp,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum PropertiesOp {
-    Set { entries: Vec<(String, String)> },
-    Unset { keys: Vec<String>, if_exists: bool },
-}
-
-/// One typed partition-spec mutation after syntax has been lowered to the
-/// connector-owned representation. Table resolution remains with command
-/// execution, which owns the target catalog and mutation admission.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum IcebergPartitionSpecChange {
-    Add(ConnectorPartitionTransform),
-    Drop(ConnectorPartitionTransform),
-}
-
-/// Lowers a semantic Iceberg property command without accepting parser AST.
-pub(crate) fn lower_semantic_iceberg_properties_action(
-    action: &IcebergPropertiesSqlAction,
-) -> Result<PropertiesOp, String> {
-    match action {
-        IcebergPropertiesSqlAction::Set { entries } => {
-            if entries.is_empty() {
-                return Err("SET TBLPROPERTIES requires at least one key=value pair".to_string());
-            }
-            let mut seen = std::collections::HashSet::new();
-            let mut lowered = Vec::with_capacity(entries.len());
-            for (key, value) in entries {
-                if !seen.insert(key.clone()) {
-                    return Err(format!("duplicate key '{key}' in SET TBLPROPERTIES"));
-                }
-                lowered.push((key.clone(), semantic_property_string(value)?));
-            }
-            Ok(PropertiesOp::Set { entries: lowered })
-        }
-        IcebergPropertiesSqlAction::Unset { keys, if_exists } => {
-            if keys.is_empty() {
-                return Err("UNSET TBLPROPERTIES requires at least one key".to_string());
-            }
-            let mut seen = std::collections::HashSet::new();
-            let mut lowered = Vec::with_capacity(keys.len());
-            for key in keys {
-                if !seen.insert(key.clone()) {
-                    return Err(format!("duplicate key '{key}' in UNSET TBLPROPERTIES"));
-                }
-                lowered.push(key.clone());
-            }
-            Ok(PropertiesOp::Unset {
-                keys: lowered,
-                if_exists: *if_exists,
-            })
-        }
-        IcebergPropertiesSqlAction::Comment { value } => Ok(PropertiesOp::Set {
-            entries: vec![("comment".to_string(), semantic_property_string(value)?)],
-        }),
-    }
-}
-
-/// Lowers a semantic partition change to the connector representation.
-pub(crate) fn lower_semantic_iceberg_partition_change(
-    change: &IcebergPartitionSqlChange,
-) -> Result<IcebergPartitionSpecChange, String> {
-    let lower = |field: &IcebergPartitionFieldExpr| -> Result<ConnectorPartitionTransform, String> {
-        let normalized = normalize_semantic_partition_transform(field)?;
-        Ok(connector_partition_transform(&normalized))
-    };
-    match change {
-        IcebergPartitionSqlChange::Add(field) => Ok(IcebergPartitionSpecChange::Add(lower(field)?)),
-        IcebergPartitionSqlChange::Drop(field) => {
-            Ok(IcebergPartitionSpecChange::Drop(lower(field)?))
-        }
-    }
-}
-
 /// Lowers a semantic schema change to the catalog product request.
 pub(crate) fn lower_semantic_iceberg_schema_change(
     change: &IcebergSchemaSqlChange,
@@ -1206,53 +901,6 @@ fn lower_semantic_add_position(
     }
 }
 
-fn normalize_semantic_partition_transform(
-    field: &IcebergPartitionFieldExpr,
-) -> Result<IcebergPartitionFieldExpr, String> {
-    let normalize = |column: &str| normalize_identifier(column);
-    Ok(match field {
-        IcebergPartitionFieldExpr::Identity { column } => IcebergPartitionFieldExpr::Identity {
-            column: normalize(column)?,
-        },
-        IcebergPartitionFieldExpr::Year { column } => IcebergPartitionFieldExpr::Year {
-            column: normalize(column)?,
-        },
-        IcebergPartitionFieldExpr::Month { column } => IcebergPartitionFieldExpr::Month {
-            column: normalize(column)?,
-        },
-        IcebergPartitionFieldExpr::Day { column } => IcebergPartitionFieldExpr::Day {
-            column: normalize(column)?,
-        },
-        IcebergPartitionFieldExpr::Hour { column } => IcebergPartitionFieldExpr::Hour {
-            column: normalize(column)?,
-        },
-        IcebergPartitionFieldExpr::Void { column } => IcebergPartitionFieldExpr::Void {
-            column: normalize(column)?,
-        },
-        IcebergPartitionFieldExpr::Bucket {
-            column,
-            num_buckets,
-        } => {
-            if *num_buckets == 0 {
-                return Err("bucket count must be positive".to_string());
-            }
-            IcebergPartitionFieldExpr::Bucket {
-                column: normalize(column)?,
-                num_buckets: *num_buckets,
-            }
-        }
-        IcebergPartitionFieldExpr::Truncate { column, width } => {
-            if *width == 0 {
-                return Err("truncate width must be positive".to_string());
-            }
-            IcebergPartitionFieldExpr::Truncate {
-                column: normalize(column)?,
-                width: *width,
-            }
-        }
-    })
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ColumnPath {
     segments: Vec<String>,
@@ -1265,7 +913,6 @@ impl ColumnPath {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn parse(input: &str) -> Result<Self, String> {
         if input.is_empty() {
             return Err("column path is empty".to_string());
@@ -1869,7 +1516,6 @@ mod drop_table_if_exists_tests {
                     None,
                     "db",
                     if_exists,
-                    false,
                     &crate::connector::test_request_context(),
                 )
                 .unwrap_err();
@@ -1961,99 +1607,83 @@ mod tests {
         assert!(super::connector_data_type(&T::Binary).is_ok());
     }
     #[test]
-    fn semantic_create_table_lowering_materializes_catalog_request() {
-        let sql = "CREATE TABLE IF NOT EXISTS ice.db.orders (id BIGINT DEFAULT 3, amount DECIMAL(10,2) DEFAULT '12.30', payload BINARY DEFAULT X'CAFE') DUPLICATE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 8 PARTITION BY (month(id)) PROPERTIES ('format-version' = '2') COMMENT 'orders'";
-        let statement = novarocks_query_application::sql::parse_single_statement(sql)
-            .expect("parse semantic CREATE TABLE");
-        let Some(novarocks_query_application::sql::ProductSqlCommand::Catalog(boxed_command)) =
-            novarocks_query_application::sql::lower_product_sql_command(&statement)
-                .expect("lower semantic CREATE TABLE")
-        else {
-            panic!("expected semantic CREATE TABLE");
-        };
-        let novarocks_sql::semantic::CatalogSqlCommand::CreateTable(command) = *boxed_command
-        else {
-            panic!("expected semantic CREATE TABLE");
-        };
-
-        let request = super::lower_semantic_create_table_statement(&command)
-            .expect("lower semantic catalog request");
-        let super::CatalogCreateTableKind::Iceberg {
-            columns,
-            key_desc,
-            bucket_count,
-            distribution_columns,
-            partition_fields,
-            properties,
-        } = request.kind;
-        assert_eq!(request.name.parts, ["ice", "db", "orders"]);
-        assert!(request.if_not_exists);
+    fn semantic_create_table_columns_preserve_typed_defaults() {
+        use novarocks_sql::semantic::command::{CommandLiteral, TableColumnSqlCommand};
+        let columns = super::lower_semantic_create_table_columns(&[
+            TableColumnSqlCommand {
+                name: "id".into(),
+                data_type: super::SqlType::BigInt,
+                nullable: None,
+                default: Some(CommandLiteral::Number("3".into())),
+                comment: None,
+            },
+            TableColumnSqlCommand {
+                name: "amount".into(),
+                data_type: super::SqlType::Decimal {
+                    precision: 10,
+                    scale: 2,
+                },
+                nullable: None,
+                default: Some(CommandLiteral::String("12.30".into())),
+                comment: None,
+            },
+            TableColumnSqlCommand {
+                name: "payload".into(),
+                data_type: super::SqlType::Binary,
+                nullable: None,
+                default: Some(CommandLiteral::Binary(vec![0xCA, 0xFE])),
+                comment: None,
+            },
+        ])
+        .expect("lower original typed column declarations");
         assert_eq!(columns[0].default, Some(super::DefaultLiteral::Int(3)));
         assert_eq!(
             columns[1].default,
             Some(super::DefaultLiteral::Decimal {
                 unscaled: 1230,
-                scale: 2,
+                scale: 2
             })
         );
         assert_eq!(
             columns[2].default,
             Some(super::DefaultLiteral::Binary(vec![0xCA, 0xFE]))
         );
+        let projected = columns
+            .iter()
+            .map(super::connector_column)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
         assert_eq!(
-            key_desc.expect("duplicate key").kind,
-            super::TableKeyKind::Duplicate
-        );
-        assert_eq!(bucket_count, Some(8));
-        assert_eq!(distribution_columns, ["id"]);
-        assert_eq!(
-            partition_fields,
-            [super::IcebergPartitionFieldExpr::Month {
-                column: "id".into()
-            }]
+            projected[0].default,
+            Some(super::ConnectorDefaultValue::Int(3))
         );
         assert_eq!(
-            properties,
-            [
-                ("format-version".into(), "2".into()),
-                ("comment".into(), "orders".into()),
-            ]
+            projected[1].default,
+            Some(super::ConnectorDefaultValue::Decimal {
+                unscaled: 1230,
+                scale: 2
+            })
         );
-    }
-
-    fn semantic_create_table(sql: &str) -> Vec<(String, String)> {
-        let statement = novarocks_query_application::sql::parse_single_statement(sql)
-            .expect("parse semantic CREATE TABLE");
-        let Some(novarocks_query_application::sql::ProductSqlCommand::Catalog(boxed_command)) =
-            novarocks_query_application::sql::lower_product_sql_command(&statement)
-                .expect("lower semantic CREATE TABLE")
-        else {
-            panic!("expected semantic CREATE TABLE");
-        };
-        let novarocks_sql::semantic::CatalogSqlCommand::CreateTable(command) = *boxed_command
-        else {
-            panic!("expected semantic CREATE TABLE");
-        };
-        let super::CatalogCreateTableKind::Iceberg { properties, .. } =
-            super::lower_semantic_create_table_statement(&command)
-                .expect("lower semantic catalog request")
-                .kind;
-        properties
+        assert_eq!(
+            projected[2].default,
+            Some(super::ConnectorDefaultValue::Binary(
+                bytes::Bytes::from_static(&[0xCA, 0xFE])
+            ))
+        );
     }
 
     #[test]
-    fn semantic_create_table_preserves_comment_property_duplicate() {
-        let table = semantic_create_table(
-            "CREATE TABLE ice.db.orders (id INT) PROPERTIES ('comment' = 'property comment') COMMENT 'table comment'",
-        );
-
-        assert_eq!(
-            table,
-            vec![
-                ("comment".to_string(), "property comment".to_string()),
-                ("comment".to_string(), "table comment".to_string()),
-            ]
-        );
+    fn unprepared_compound_create_requires_evaluated_property_preparation() {
+        let sql = "CREATE TABLE IF NOT EXISTS ice.db.orders (id BIGINT DEFAULT 3, amount DECIMAL(10,2) DEFAULT '12.30', payload BINARY DEFAULT X'CAFE') COMMENT 'orders' WITH (partitioning = ARRAY['month(id)'], format_version = 2)";
+        let statement = novarocks_query_application::sql::parse_single_statement(sql)
+            .expect("parse original compound CREATE source");
+        use novarocks_query_application::sql::trino_admission::{
+            TrinoStatementAction, TrinoStatementPreparation, admit_trino_statement,
+        };
+        assert!(matches!(
+            admit_trino_statement(sql, statement).unwrap(),
+            TrinoStatementAction::Prepare(TrinoStatementPreparation::CreateTable(_)),
+        ));
     }
 
     #[test]
@@ -2110,82 +1740,20 @@ mod tests {
         );
     }
 
-    #[test]
-    fn semantic_iceberg_property_and_partition_lowering_preserves_validation() {
-        let novarocks_sql::semantic::command::IcebergTableSqlAction::Properties(properties) =
-            semantic_iceberg_action(
-                "ALTER TABLE ice.db.orders SET TBLPROPERTIES ('format' = 'parquet', 'owner' = 'ops')",
-            )
-        else {
-            panic!("expected semantic properties action");
-        };
-        assert_eq!(
-            super::lower_semantic_iceberg_properties_action(&properties)
-                .expect("lower semantic properties"),
-            super::PropertiesOp::Set {
-                entries: vec![
-                    ("format".to_string(), "parquet".to_string()),
-                    ("owner".to_string(), "ops".to_string()),
-                ],
-            }
-        );
-
-        let novarocks_sql::semantic::command::IcebergTableSqlAction::Partition(partition) =
-            semantic_iceberg_action(
-                "ALTER TABLE ice.db.orders ADD PARTITION COLUMN bucket(User_Id, 32)",
-            )
-        else {
-            panic!("expected semantic partition action");
-        };
-        assert_eq!(
-            super::lower_semantic_iceberg_partition_change(&partition)
-                .expect("lower semantic partition"),
-            super::IcebergPartitionSpecChange::Add(super::ConnectorPartitionTransform::Bucket {
-                column: std::sync::Arc::from("user_id"),
-                num_buckets: 32,
-            })
-        );
-
-        let novarocks_sql::semantic::command::IcebergTableSqlAction::Properties(non_string) =
-            semantic_iceberg_action(
-                "ALTER TABLE ice.db.orders SET TBLPROPERTIES ('retention' = 7)",
-            )
-        else {
-            panic!("expected semantic properties action");
-        };
-        assert!(
-            super::lower_semantic_iceberg_properties_action(&non_string)
-                .expect_err("non-string property")
-                .contains("string literal")
-        );
-
-        let novarocks_sql::semantic::command::IcebergTableSqlAction::Partition(zero) =
-            semantic_iceberg_action(
-                "ALTER TABLE ice.db.orders ADD PARTITION COLUMN bucket(user_id, 0)",
-            )
-        else {
-            panic!("expected semantic partition action");
-        };
-        assert!(
-            super::lower_semantic_iceberg_partition_change(&zero)
-                .expect_err("zero bucket count")
-                .contains("must be positive")
-        );
-    }
-
     fn semantic_iceberg_action(
         sql: &str,
     ) -> novarocks_sql::semantic::command::IcebergTableSqlAction {
         let statement = novarocks_query_application::sql::parse_single_statement(sql)
             .expect("parse semantic Iceberg command");
-        let Some(novarocks_query_application::sql::ProductSqlCommand::Catalog(boxed_command)) =
-            novarocks_query_application::sql::lower_product_sql_command(&statement)
-                .expect("lower semantic Iceberg command")
-        else {
-            panic!("expected semantic Iceberg ALTER TABLE statement");
+        let novarocks_parser::ast::TrinoStatement::AddColumn(statement) = statement else {
+            panic!("expected typed ADD COLUMN");
         };
-        let novarocks_sql::semantic::CatalogSqlCommand::AlterIcebergTable(statement) =
-            *boxed_command
+        let command =
+            novarocks_query_application::sql::trino_table_command::lower_trino_add_column(
+                sql, &statement,
+            )
+            .unwrap();
+        let novarocks_sql::semantic::CatalogSqlCommand::AlterIcebergTable(statement) = command
         else {
             panic!("expected semantic Iceberg ALTER TABLE statement");
         };

@@ -100,6 +100,7 @@ fn prepare(
         &ty(to, true),
         policy,
         allow,
+        None,
         &CompileControl::default(),
     )
     .unwrap()
@@ -376,6 +377,7 @@ fn timestamp_nullability_and_effects_follow_exact_five_null_pairs_and_one_error_
                             &ty(to, false),
                             policy,
                             allow,
+                            None,
                             &CompileControl::default(),
                         );
                         if source_nullable || null_pair {
@@ -429,6 +431,7 @@ fn timestamp_nullability_and_effects_follow_exact_five_null_pairs_and_one_error_
                 &FunctionValueType::from_legacy_declared_projection(target, true),
                 DecimalOverflowPolicy::OutputNull,
                 false,
+                None,
                 &CompileControl::default()
             ),
             Err(CastPrepareError::Unsupported)
@@ -442,6 +445,7 @@ fn timestamp_nullability_and_effects_follow_exact_five_null_pairs_and_one_error_
                 &ty(TimeUnit::Second, true),
                 DecimalOverflowPolicy::OutputNull,
                 false,
+                None,
                 &CompileControl::default()
             ),
             Err(CastPrepareError::Unsupported)
@@ -680,6 +684,7 @@ fn timestamp_compile_all_actual_callbacks_keep_original_three_causes_and_ordinar
             &result,
             DecimalOverflowPolicy::ReportError,
             false,
+            None,
             &good,
         );
         assert_eq!(result_good.is_ok(), success);
@@ -701,6 +706,7 @@ fn timestamp_compile_all_actual_callbacks_keep_original_three_causes_and_ordinar
                     &result,
                     DecimalOverflowPolicy::ReportError,
                     false,
+                    None,
                     &control,
                 )
                 .unwrap_err();

@@ -31,57 +31,32 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE EXTERNAL CATALOG ice_ivm_jmm_${uuid0}
-PROPERTIES (
-  "type" = "iceberg",
-  "iceberg.catalog.type" = "rest",
-  "uri" = "${iceberg_rest_uri}",
-  "warehouse" = "${iceberg_rest_warehouse}",
-  "aws.s3.endpoint" = "${oss_endpoint}",
-  "credential.object-store-metadata.consumer-role" = "frontend",
-  "credential.object-store-metadata.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-metadata.name" = "${iceberg_object_store_metadata_credential_name}",
-  "credential.object-store-metadata.generation" = "${iceberg_object_store_credential_generation}",
-  "credential.object-store-data.consumer-role" = "backend",
-  "credential.object-store-data.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-data.name" = "${iceberg_object_store_data_credential_name}",
-  "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
-  "aws.s3.region" = "${oss_region}",
-  "aws.s3.enable_path_style_access" = "${oss_path_style}"
-);
-CREATE DATABASE ice_ivm_jmm_${uuid0}.ns_${uuid0};
+CREATE CATALOG ice_ivm_jmm_${uuid0} USING iceberg WITH ("iceberg.catalog.type" = 'rest', "uri" = '${iceberg_rest_uri}', "warehouse" = '${iceberg_rest_warehouse}', "aws.s3.endpoint" = '${oss_endpoint}', "credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-metadata.name" = '${iceberg_object_store_metadata_credential_name}', "credential.object-store-metadata.generation" = '${iceberg_object_store_credential_generation}', "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-data.name" = '${iceberg_object_store_data_credential_name}', "credential.object-store-data.generation" = '${iceberg_object_store_credential_generation}', "aws.s3.region" = '${oss_region}', "aws.s3.enable_path_style_access" = '${oss_path_style}');
+CREATE SCHEMA ice_ivm_jmm_${uuid0}.ns_${uuid0};
 CREATE TABLE ice_ivm_jmm_${uuid0}.ns_${uuid0}.orders (
   id BIGINT NOT NULL,
   user_id BIGINT,
   order_amount BIGINT
-)
-TBLPROPERTIES ("format-version" = "3",
-  "write.row-lineage" = "true");
+) WITH (format_version = 3);
 CREATE TABLE ice_ivm_jmm_${uuid0}.ns_${uuid0}.users (
   id BIGINT NOT NULL,
   user_region STRING
-)
-TBLPROPERTIES ("format-version" = "3",
-  "write.row-lineage" = "true");
+) WITH (format_version = 3);
 USE ice_ivm_jmm_${uuid0}.ns_${uuid0};
 
 -- query 2
 -- @skip_result_check=true
 INSERT INTO ice_ivm_jmm_${uuid0}.ns_${uuid0}.users VALUES
-  (1, 'east'),
-  (2, 'west'),
-  (3, 'south');
+  ROW(1, 'east'),
+  ROW(2, 'west'),
+  ROW(3, 'south');
 INSERT INTO ice_ivm_jmm_${uuid0}.ns_${uuid0}.orders VALUES
-  (100, 1, 25),
-  (101, 1, 75),
-  (102, 2, 40),
-  (103, 2, 60),
-  (104, 3, 99);
-CREATE MATERIALIZED VIEW jmm_mv_${uuid0}
-DISTRIBUTED BY HASH(user_region) BUCKETS 1
-PROPERTIES ('storage_engine' = 'iceberg')
-AS
-SELECT u.user_region,
+  ROW(100, 1, 25),
+  ROW(101, 1, 75),
+  ROW(102, 2, 40),
+  ROW(103, 2, 60),
+  ROW(104, 3, 99);
+CREATE MATERIALIZED VIEW jmm_mv_${uuid0} AS SELECT u.user_region,
        MIN(o.order_amount) AS mn,
        MAX(o.order_amount) AS mx,
        COUNT(*) AS c
@@ -134,7 +109,7 @@ ORDER BY u.user_region;
 -- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW jmm_mv_${uuid0};
-DROP TABLE ice_ivm_jmm_${uuid0}.ns_${uuid0}.orders FORCE;
-DROP TABLE ice_ivm_jmm_${uuid0}.ns_${uuid0}.users FORCE;
-DROP DATABASE ice_ivm_jmm_${uuid0}.ns_${uuid0};
+DROP TABLE ice_ivm_jmm_${uuid0}.ns_${uuid0}.orders ;
+DROP TABLE ice_ivm_jmm_${uuid0}.ns_${uuid0}.users ;
+DROP SCHEMA ice_ivm_jmm_${uuid0}.ns_${uuid0};
 DROP CATALOG ice_ivm_jmm_${uuid0};

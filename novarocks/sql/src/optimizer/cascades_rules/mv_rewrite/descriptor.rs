@@ -947,10 +947,12 @@ pub(crate) fn substitute_scalar(
             resolved,
         },
         ScalarNode::Cast {
+            array_failure_mode,
             child,
             target,
             decimal_overflow_policy,
         } => ScalarNode::Cast {
+            array_failure_mode,
             child: substitute_scalar(arena, child, defs, control)?,
             target,
             decimal_overflow_policy,
@@ -1180,9 +1182,9 @@ mod tests {
     fn cmp(left: TypedExpr, op: crate::analysis::BinOp, right: TypedExpr) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::BinaryOp {
-                left: Box::new(left),
+                left: novarocks_parser::ast::AstBox::new(left),
                 op,
-                right: Box::new(right),
+                right: novarocks_parser::ast::AstBox::new(right),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),

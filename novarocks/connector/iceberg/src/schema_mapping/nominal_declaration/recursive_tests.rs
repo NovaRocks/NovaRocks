@@ -43,7 +43,6 @@ pub(crate) fn columns() -> Vec<ConnectorColumnDefinition> {
             child("ordinary", D::Binary),
         ]),
         nullable: true,
-        aggregation: None,
         default: None,
     }]
 }

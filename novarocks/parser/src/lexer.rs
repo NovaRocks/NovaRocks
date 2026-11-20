@@ -15,564 +15,406 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Lossless MySQL/StarRocks lexical scanning.
+//! Lossless scanning according to the SQL grammar's lexical rules.
 
-use crate::{LexError, Span, Symbol, Token, TokenKind, TriviaKind, keyword};
+use crate::keyword;
+use crate::token::{Symbol, Token, TokenKind, TriviaKind};
+use crate::{LexError, ParseError, ParserError, Span};
 
-/// Lexes SQL source into a lossless, source-ordered token stream.
+/// Produces contiguous source spans, including trivia and a final empty `End`.
 ///
-/// Every token's span is a byte range into `source`; concatenating the spans
-/// of all non-`End` tokens reconstructs `source` exactly. Trivia is represented
-/// as ordinary source-ordered tokens. A trivia run, including a `/*+ ... */`
-/// hint, is leading trivia for the next non-trivia token; at end-of-input it is
-/// leading trivia for `End`. This adjacency is the token-level attachment rule
-/// until the AST owns a richer trivia container.
-pub fn lex(source: &str) -> Result<Vec<Token>, LexError> {
-    Lexer::new(source).run()
+/// Literal contents remain in the source. The grammar and AST builder own
+/// Unicode escape clauses, binary contents, literal conversion, and identifier
+/// use. This scanner only rejects identifier forms forbidden by the language.
+pub fn lex(source: &str) -> Result<Vec<Token>, ParserError> {
+    let mut lexer = Lexer::new(source);
+    let mut tokens = Vec::new();
+    while lexer.position < source.len() {
+        tokens.push(lexer.token()?);
+    }
+    tokens.push(lexer.end_token());
+    Ok(tokens)
 }
 
-struct Lexer<'source> {
-    source: &'source str,
+/// A lexer-owned rejection within a provable source range.
+pub(crate) struct FramingRejection {
+    pub(crate) span: Span,
+    pub(crate) error: ParserError,
+}
+
+pub(crate) struct FramingTokens {
+    pub(crate) tokens: Vec<Token>,
+    pub(crate) rejections: Vec<FramingRejection>,
+}
+
+/// Keeps the scanner's real token boundaries around a proved rejection.
+/// This opt-in stream proves framing only. The strict lexer still stops at
+/// the first rejection and is the sole authority for parsing a statement.
+pub(crate) fn lex_for_framing(source: &str) -> Result<FramingTokens, ParserError> {
+    let mut lexer = Lexer::new(source);
+    let mut tokens = Vec::new();
+    let mut rejections = Vec::new();
+    while lexer.position < source.len() {
+        let start = lexer.position;
+        match lexer.token() {
+            Ok(token) => tokens.push(token),
+            Err(
+                error @ (ParserError::Lex(LexError::UnexpectedCharacter { .. })
+                | ParserError::Parse(ParseError::UnexpectedToken { .. })),
+            ) => rejections.push(FramingRejection {
+                span: Span::new(start, lexer.position),
+                error,
+            }),
+            Err(
+                error @ ParserError::Lex(
+                    LexError::UnterminatedString { .. }
+                    | LexError::UnterminatedQuotedIdentifier { .. }
+                    | LexError::UnterminatedComment { .. },
+                ),
+            ) if !source.as_bytes()[start..].contains(&b';') => {
+                // Nothing after this malformed opening token can be a
+                // delimiter. Submit the exact terminal bytes only to a
+                // caller that already owns an enrolled error expectation.
+                lexer.position = source.len();
+                rejections.push(FramingRejection {
+                    span: Span::new(start, source.len()),
+                    error,
+                });
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    tokens.push(lexer.end_token());
+    Ok(FramingTokens { tokens, rejections })
+}
+
+struct Lexer<'a> {
+    source: &'a str,
     position: usize,
-    tokens: Vec<Token>,
 }
 
-impl<'source> Lexer<'source> {
-    fn new(source: &'source str) -> Self {
+impl<'a> Lexer<'a> {
+    fn new(source: &'a str) -> Self {
         Self {
             source,
             position: 0,
-            tokens: Vec::new(),
         }
     }
 
-    fn run(mut self) -> Result<Vec<Token>, LexError> {
-        while let Some(character) = self.current() {
-            let start = self.position;
-            if character.is_whitespace() {
-                self.consume_while(char::is_whitespace);
-                self.push(TokenKind::Trivia(TriviaKind::Whitespace), start);
-            } else if (self.starts_with("--") && self.mysql_dash_comment()) || character == '#' {
-                self.consume_line_comment();
-                self.push(TokenKind::Trivia(TriviaKind::LineComment), start);
-            } else if self.starts_with("/*") {
-                let hint = self.starts_with("/*+");
-                self.consume_block_comment(start)?;
-                self.push(
-                    TokenKind::Trivia(if hint {
-                        TriviaKind::HintComment
-                    } else {
-                        TriviaKind::BlockComment
-                    }),
-                    start,
-                );
-            } else if character == '`' {
-                self.consume_quoted_identifier(start)?;
-                self.push(TokenKind::QuotedIdent, start);
-            } else if character == '\'' || character == '"' {
-                self.consume_string(start, character)?;
-                self.push(TokenKind::String, start);
-            } else if self.has_string_prefix() {
-                self.advance(); // literal prefix
-                let quote = self.current().expect("prefixed string has a quote");
-                self.consume_string(start, quote)?;
-                self.push(TokenKind::String, start);
-            } else if character.is_ascii_digit()
-                || (character == '.' && self.next().is_some_and(|next| next.is_ascii_digit()))
-            {
-                let kind = self.consume_number();
-                self.push(kind, start);
-            } else if is_identifier_start(character) {
-                self.advance();
-                self.consume_while(is_identifier_part);
-                let word = &self.source[start..self.position];
-                self.push(
-                    keyword::lookup(word).map_or(TokenKind::Ident, TokenKind::Keyword),
-                    start,
-                );
-            } else if let Some(symbol) = self.consume_symbol() {
-                self.push(TokenKind::Symbol(symbol), start);
-            } else {
-                self.advance();
-                return Err(LexError::UnexpectedCharacter {
-                    character,
-                    span: Span::new(start, self.position),
-                });
-            }
-        }
-        self.tokens.push(Token::new(
-            TokenKind::End,
-            Span::new(self.position, self.position),
-        ));
-        Ok(self.tokens)
+    fn end_token(&self) -> Token {
+        Token::new(TokenKind::End, Span::new(self.position, self.position))
     }
 
-    fn current(&self) -> Option<char> {
-        self.source[self.position..].chars().next()
-    }
-
-    fn next(&self) -> Option<char> {
-        let current = self.current()?;
-        self.source[self.position + current.len_utf8()..]
-            .chars()
-            .next()
-    }
-
-    fn starts_with(&self, prefix: &str) -> bool {
-        self.source[self.position..].starts_with(prefix)
-    }
-
-    fn advance(&mut self) -> char {
-        let character = self
-            .current()
-            .expect("advance is only called at a character");
-        self.position += character.len_utf8();
-        character
-    }
-
-    fn consume_while(&mut self, predicate: impl Fn(char) -> bool) {
-        while self.current().is_some_and(&predicate) {
-            self.advance();
-        }
-    }
-
-    fn push(&mut self, kind: TokenKind, start: usize) {
-        self.tokens
-            .push(Token::new(kind, Span::new(start, self.position)));
-    }
-
-    fn mysql_dash_comment(&self) -> bool {
-        self.source[self.position + 2..]
-            .chars()
-            .next()
-            .is_none_or(|character| character.is_whitespace())
-    }
-
-    fn consume_line_comment(&mut self) {
-        while let Some(character) = self.current() {
-            self.advance();
-            if character == '\n' {
-                break;
-            }
-        }
-    }
-
-    fn consume_block_comment(&mut self, start: usize) -> Result<(), LexError> {
-        self.position += 2; // `/*`
-        while self.current().is_some() {
-            if self.starts_with("*/") {
-                self.position += 2;
-                return Ok(());
-            }
-            self.advance();
-        }
-        Err(LexError::UnterminatedComment {
-            span: Span::new(start, self.position),
-        })
-    }
-
-    fn consume_quoted_identifier(&mut self, start: usize) -> Result<(), LexError> {
-        self.advance(); // opening backtick
-        while let Some(character) = self.current() {
-            self.advance();
-            if character == '`' {
-                if self.current() == Some('`') {
-                    self.advance();
-                } else {
-                    return Ok(());
-                }
-            }
-        }
-        Err(LexError::UnterminatedQuotedIdentifier {
-            span: Span::new(start, self.position),
-        })
-    }
-
-    fn consume_string(&mut self, start: usize, quote: char) -> Result<(), LexError> {
-        self.advance(); // opening quote
-        while let Some(character) = self.current() {
-            self.advance();
-            if character == '\\' {
-                if self.current().is_some() {
-                    self.advance();
-                }
-            } else if character == quote {
-                if self.current() == Some(quote) {
-                    self.advance();
-                } else {
-                    return Ok(());
-                }
-            }
-        }
-        Err(LexError::UnterminatedString {
-            span: Span::new(start, self.position),
-        })
-    }
-
-    fn has_string_prefix(&self) -> bool {
-        matches!(self.current(), Some('x' | 'X' | 'b' | 'B' | 'n' | 'N'))
-            && matches!(self.next(), Some('\'' | '"'))
-    }
-
-    fn consume_number(&mut self) -> TokenKind {
-        if self.starts_with("0x") || self.starts_with("0X") {
+    fn token(&mut self) -> Result<Token, ParserError> {
+        let start = self.position;
+        let rest = &self.source[start..];
+        let first = rest.as_bytes()[0];
+        let kind = if is_whitespace(first) {
+            self.position += rest.bytes().take_while(|b| is_whitespace(*b)).count();
+            TokenKind::Trivia(TriviaKind::Whitespace)
+        } else if rest.starts_with("--") {
             self.position += 2;
-            self.consume_while(|character| character.is_ascii_hexdigit());
-            return TokenKind::HexNumber;
-        }
-
-        self.consume_while(|character| character.is_ascii_digit());
-        if self.current() == Some('.') && !self.starts_with("..") {
-            self.advance();
-            self.consume_while(|character| character.is_ascii_digit());
-        }
-        if matches!(self.current(), Some('e' | 'E')) {
-            let exponent_start = self.position;
-            self.advance();
-            if matches!(self.current(), Some('+' | '-')) {
-                self.advance();
-            }
-            if self
-                .current()
-                .is_some_and(|character| character.is_ascii_digit())
+            while self.position < self.source.len()
+                && !matches!(self.source.as_bytes()[self.position], b'\r' | b'\n')
             {
-                self.consume_while(|character| character.is_ascii_digit());
-            } else {
-                self.position = exponent_start;
+                self.position += 1;
+            }
+            if self.byte() == Some(b'\r') {
+                self.position += 1;
+            }
+            if self.byte() == Some(b'\n') {
+                self.position += 1;
+            }
+            TokenKind::Trivia(TriviaKind::LineComment)
+        } else if let Some(comment) = rest.strip_prefix("/*") {
+            match comment.find("*/") {
+                Some(end) => self.position += end + 4,
+                None => {
+                    return Err(LexError::UnterminatedComment {
+                        span: Span::new(start, self.source.len()),
+                    }
+                    .into());
+                }
+            }
+            TokenKind::Trivia(TriviaKind::BlockComment)
+        } else if rest.starts_with('"') {
+            self.consume_quote(start, start, b'"', true)?;
+            if self.position == start + 2 {
+                return Err(self.syntax_error(
+                    "a non-empty quoted identifier",
+                    "zero-length delimited identifier",
+                    start,
+                ));
+            }
+            TokenKind::QuotedIdentifier
+        } else if first == b'`' {
+            self.consume_quote(start, start, b'`', true)?;
+            return Err(self.syntax_error(
+                "double quotes around identifiers",
+                "backquoted identifiers are not supported",
+                start,
+            ));
+        } else if first == b'\'' {
+            self.consume_quote(start, start, b'\'', true)?;
+            TokenKind::String
+        } else if rest.get(..3).is_some_and(|s| s.eq_ignore_ascii_case("U&'")) {
+            self.consume_quote(start, start + 2, b'\'', true)?;
+            TokenKind::UnicodeString
+        } else if rest.get(..2).is_some_and(|s| s.eq_ignore_ascii_case("X'")) {
+            self.consume_quote(start, start + 1, b'\'', false)?;
+            TokenKind::BinaryLiteral
+        } else if let Some(end) = rest.strip_prefix("$$").and_then(|rest| rest.find("$$")) {
+            self.position += end + 4;
+            TokenKind::DollarString
+        } else if first.is_ascii_digit()
+            || (first == b'.' && rest.as_bytes().get(1).is_some_and(u8::is_ascii_digit))
+        {
+            let (length, kind) = number(rest.as_bytes());
+            self.position += length;
+            match kind {
+                Some(kind) => kind,
+                None => {
+                    return Err(self.syntax_error(
+                        "an identifier beginning with a letter or underscore",
+                        "identifiers must not start with a digit; surround the identifier with double quotes",
+                        start,
+                    ));
+                }
+            }
+        } else if is_identifier_start(first) {
+            self.position += rest.bytes().take_while(|b| is_identifier_part(*b)).count();
+            let word = &self.source[start..self.position];
+            keyword::lookup(word).map_or(TokenKind::Identifier, TokenKind::Keyword)
+        } else if let Some((length, symbol)) = symbol(rest) {
+            self.position += length;
+            TokenKind::Symbol(symbol)
+        } else {
+            let character = rest.chars().next().expect("nonempty source remainder");
+            self.position += character.len_utf8();
+            return Err(LexError::UnexpectedCharacter {
+                character,
+                span: Span::new(start, self.position),
+            }
+            .into());
+        };
+        Ok(Token::new(kind, Span::new(start, self.position)))
+    }
+
+    fn byte(&self) -> Option<u8> {
+        self.source.as_bytes().get(self.position).copied()
+    }
+
+    fn syntax_error(&self, expected: &'static str, found: &str, start: usize) -> ParserError {
+        ParseError::UnexpectedToken {
+            expected,
+            found: found.to_owned(),
+            span: Span::new(start, self.position),
+        }
+        .into()
+    }
+
+    fn consume_quote(
+        &mut self,
+        start: usize,
+        opening: usize,
+        quote: u8,
+        doubled: bool,
+    ) -> Result<(), ParserError> {
+        self.position = opening + 1;
+        while let Some(byte) = self.byte() {
+            self.position += 1;
+            if byte == quote {
+                if doubled && self.byte() == Some(quote) {
+                    self.position += 1;
+                } else {
+                    return Ok(());
+                }
             }
         }
-        TokenKind::Number
-    }
-
-    fn consume_symbol(&mut self) -> Option<Symbol> {
-        let (prefix, symbol) = if self.starts_with("->>") {
-            (3, Symbol::LongArrow)
-        } else if self.starts_with("<=>") {
-            (3, Symbol::NullSafeEq)
-        } else if self.starts_with(">=") {
-            (2, Symbol::Gte)
-        } else if self.starts_with("<=") {
-            (2, Symbol::Lte)
-        } else if self.starts_with("<>") || self.starts_with("!=") {
-            (2, Symbol::Neq)
-        } else if self.starts_with("<<") {
-            (2, Symbol::ShiftLeft)
-        } else if self.starts_with(">>") {
-            (2, Symbol::ShiftRight)
-        } else if self.starts_with("||") {
-            (2, Symbol::DoublePipe)
-        } else if self.starts_with("&&") {
-            (2, Symbol::DoubleAmpersand)
-        } else if self.starts_with(":=") {
-            (2, Symbol::ColonEq)
-        } else if self.starts_with("::") {
-            (2, Symbol::DoubleColon)
-        } else if self.starts_with("=>") {
-            (2, Symbol::FatArrow)
-        } else if self.starts_with("->") {
-            (2, Symbol::Arrow)
-        } else if self.starts_with("..") {
-            (2, Symbol::DoubleDot)
-        } else if self.starts_with("?&") {
-            (2, Symbol::QuestionAmpersand)
+        let span = Span::new(start, self.position);
+        Err(if quote == b'\'' {
+            LexError::UnterminatedString { span }
         } else {
-            match self.current()? {
-                ',' => (1, Symbol::Comma),
-                '\\' => (1, Symbol::Backslash),
-                ':' => (1, Symbol::Colon),
-                '.' => (1, Symbol::Dot),
-                '=' => (1, Symbol::Eq),
-                '>' => (1, Symbol::Gt),
-                '{' => (1, Symbol::LBrace),
-                '[' => (1, Symbol::LBracket),
-                '(' => (1, Symbol::LParen),
-                '<' => (1, Symbol::Lt),
-                '-' => (1, Symbol::Minus),
-                '%' => (1, Symbol::Percent),
-                '|' => (1, Symbol::Pipe),
-                '+' => (1, Symbol::Plus),
-                '?' => (1, Symbol::Question),
-                '}' => (1, Symbol::RBrace),
-                ']' => (1, Symbol::RBracket),
-                ')' => (1, Symbol::RParen),
-                ';' => (1, Symbol::Semicolon),
-                '/' => (1, Symbol::Slash),
-                '*' => (1, Symbol::Star),
-                '~' => (1, Symbol::Tilde),
-                '!' => (1, Symbol::Bang),
-                '&' => (1, Symbol::Ampersand),
-                '^' => (1, Symbol::Caret),
-                _ => return None,
-            }
-        };
-        self.position += prefix;
-        Some(symbol)
+            LexError::UnterminatedQuotedIdentifier { span }
+        }
+        .into())
     }
 }
 
-fn is_identifier_start(character: char) -> bool {
-    // SQL test corpus files intentionally retain runner placeholders such as
-    // `${case_db}` before substitution. Tokenizing `$` here keeps the lexer
-    // lossless; grammar/admission decides whether a resulting identifier is
-    // legal in a statement position.
-    character.is_alphabetic() || matches!(character, '_' | '$')
+fn is_whitespace(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\r' | b'\n' | b'\t')
 }
 
-fn is_identifier_part(character: char) -> bool {
-    character.is_alphanumeric() || matches!(character, '_' | '$')
+fn is_identifier_start(byte: u8) -> bool {
+    byte.is_ascii_alphabetic() || byte == b'_'
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::Keyword;
+fn is_identifier_part(byte: u8) -> bool {
+    is_identifier_start(byte) || byte.is_ascii_digit()
+}
 
-    fn kinds(source: &str) -> Vec<TokenKind> {
-        lex(source)
-            .expect("source should lex")
-            .into_iter()
-            .map(|token| token.kind)
-            .collect()
-    }
-
-    fn reconstruct(source: &str) -> String {
-        lex(source)
-            .expect("source should lex")
-            .into_iter()
-            .filter(|token| token.kind != TokenKind::End)
-            .map(|token| source[token.span.start()..token.span.end()].to_owned())
-            .collect()
-    }
-
-    #[test]
-    fn preserves_quoted_identifiers_numbers_and_string_escapes() {
-        let source = "SELECT `odd``name`, t$snapshots, 'e\\\\f', \"x\\\"y\", 1.2e-3, .5, 0xDeAd";
-        let tokens = lex(source).expect("source should lex");
-        assert_eq!(reconstruct(source), source);
-        assert_eq!(tokens[0].kind, TokenKind::Keyword(Keyword::Select));
-        assert!(
-            tokens
-                .iter()
-                .any(|token| token.kind == TokenKind::QuotedIdent)
+/// Maximal matching preserves the grammar's token priority for equal lengths.
+fn number(bytes: &[u8]) -> (usize, Option<TokenKind>) {
+    let integer = decimal_integer(bytes, 0);
+    let mut best = (integer, Some(TokenKind::Integer));
+    if bytes.starts_with(b"0x") || bytes.starts_with(b"0X") {
+        choose(
+            &mut best,
+            based_integer(bytes, 2, u8::is_ascii_hexdigit),
+            TokenKind::Integer,
         );
-        assert_eq!(
-            tokens
-                .iter()
-                .filter(|token| token.kind == TokenKind::Number)
-                .count(),
-            2
+    } else if bytes.starts_with(b"0o") || bytes.starts_with(b"0O") {
+        choose(
+            &mut best,
+            based_integer(bytes, 2, |b| matches!(b, b'0'..=b'7')),
+            TokenKind::Integer,
         );
-        assert!(
-            tokens
-                .iter()
-                .any(|token| token.kind == TokenKind::HexNumber)
-        );
-        assert_eq!(tokens.last().expect("End token").kind, TokenKind::End);
-    }
-
-    #[test]
-    fn classifies_keywords_without_changing_identifier_spelling() {
-        let source = "sHoW BACKENDS as from TRUE false t$snapshots";
-        assert_eq!(
-            kinds(source),
-            vec![
-                TokenKind::Keyword(Keyword::Show),
-                TokenKind::Trivia(TriviaKind::Whitespace),
-                TokenKind::Ident,
-                TokenKind::Trivia(TriviaKind::Whitespace),
-                TokenKind::Keyword(Keyword::As),
-                TokenKind::Trivia(TriviaKind::Whitespace),
-                TokenKind::Keyword(Keyword::From),
-                TokenKind::Trivia(TriviaKind::Whitespace),
-                TokenKind::Keyword(Keyword::True),
-                TokenKind::Trivia(TriviaKind::Whitespace),
-                TokenKind::Keyword(Keyword::False),
-                TokenKind::Trivia(TriviaKind::Whitespace),
-                TokenKind::Ident,
-                TokenKind::End,
-            ]
-        );
-        assert_eq!(reconstruct(source), source);
-    }
-
-    #[test]
-    fn classifies_query_vocabulary_and_preserves_quoted_and_non_reserved_words() {
-        let source = "SeLeCt `select`, window, TRY_CAST(x AS INT) FROM t";
-        assert_eq!(
-            kinds(source),
-            vec![
-                TokenKind::Keyword(Keyword::Select),
-                TokenKind::Trivia(TriviaKind::Whitespace),
-                TokenKind::QuotedIdent,
-                TokenKind::Symbol(Symbol::Comma),
-                TokenKind::Trivia(TriviaKind::Whitespace),
-                TokenKind::Keyword(Keyword::Window),
-                TokenKind::Symbol(Symbol::Comma),
-                TokenKind::Trivia(TriviaKind::Whitespace),
-                TokenKind::Keyword(Keyword::TryCast),
-                TokenKind::Symbol(Symbol::LParen),
-                TokenKind::Ident,
-                TokenKind::Trivia(TriviaKind::Whitespace),
-                TokenKind::Keyword(Keyword::As),
-                TokenKind::Trivia(TriviaKind::Whitespace),
-                TokenKind::Ident,
-                TokenKind::Symbol(Symbol::RParen),
-                TokenKind::Trivia(TriviaKind::Whitespace),
-                TokenKind::Keyword(Keyword::From),
-                TokenKind::Trivia(TriviaKind::Whitespace),
-                TokenKind::Ident,
-                TokenKind::End,
-            ]
-        );
-        assert_eq!(reconstruct(source), source);
-    }
-
-    #[test]
-    fn preserves_prefixed_string_literals_as_single_lossless_tokens() {
-        let source = "X'4D79' b\"0101\" N'local text'";
-        assert_eq!(
-            kinds(source),
-            vec![
-                TokenKind::String,
-                TokenKind::Trivia(TriviaKind::Whitespace),
-                TokenKind::String,
-                TokenKind::Trivia(TriviaKind::Whitespace),
-                TokenKind::String,
-                TokenKind::End,
-            ]
-        );
-        assert_eq!(reconstruct(source), source);
-    }
-
-    #[test]
-    fn preserves_comments_and_keeps_hints_as_leading_trivia() {
-        let source = "-- line\n# hash\n/* block */ /*+ SET_VAR(x = 'a\\\\b') */\nSHOW BACKENDS";
-        let tokens = lex(source).expect("source should lex");
-        assert_eq!(reconstruct(source), source);
-        let hint_index = tokens
-            .iter()
-            .position(|token| token.kind == TokenKind::Trivia(TriviaKind::HintComment))
-            .expect("hint trivia");
-        let next_significant = tokens[hint_index + 1..]
-            .iter()
-            .find(|token| !matches!(token.kind, TokenKind::Trivia(_)))
-            .expect("hint is followed by a token");
-        assert_eq!(next_significant.kind, TokenKind::Keyword(Keyword::Show));
-    }
-
-    #[test]
-    fn mysql_dash_requires_whitespace_but_hash_does_not() {
-        assert_eq!(
-            kinds("1--2 # comment"),
-            vec![
-                TokenKind::Number,
-                TokenKind::Symbol(Symbol::Minus),
-                TokenKind::Symbol(Symbol::Minus),
-                TokenKind::Number,
-                TokenKind::Trivia(TriviaKind::Whitespace),
-                TokenKind::Trivia(TriviaKind::LineComment),
-                TokenKind::End,
-            ]
+    } else if bytes.starts_with(b"0b") || bytes.starts_with(b"0B") {
+        choose(
+            &mut best,
+            based_integer(bytes, 2, |b| matches!(b, b'0' | b'1')),
+            TokenKind::Integer,
         );
     }
+    let decimal = if bytes.first() == Some(&b'.') {
+        let end = decimal_integer(bytes, 1);
+        if end > 1 { end } else { 0 }
+    } else if bytes.get(integer) == Some(&b'.') {
+        decimal_integer(bytes, integer + 1)
+    } else {
+        0
+    };
+    choose(&mut best, decimal, TokenKind::Decimal);
+    choose(&mut best, double(bytes), TokenKind::Double);
+    if bytes.first().is_some_and(u8::is_ascii_digit) {
+        let identifier = bytes.iter().take_while(|b| is_identifier_part(**b)).count();
+        if identifier > 1 && identifier > best.0 {
+            best = (identifier, None);
+        }
+    }
+    best
+}
 
-    #[test]
-    fn reports_unterminated_multiline_constructs_with_full_source_span() {
-        assert_eq!(
-            lex("'unterminated").expect_err("must fail"),
-            LexError::UnterminatedString {
-                span: Span::new(0, 13)
+fn choose(best: &mut (usize, Option<TokenKind>), length: usize, kind: TokenKind) {
+    if length > best.0 {
+        *best = (length, Some(kind));
+    }
+}
+
+fn decimal_integer(bytes: &[u8], start: usize) -> usize {
+    if !bytes.get(start).is_some_and(u8::is_ascii_digit) {
+        return start;
+    }
+    let mut position = start + 1;
+    loop {
+        if bytes.get(position).is_some_and(u8::is_ascii_digit) {
+            position += 1;
+        } else if bytes.get(position) == Some(&b'_')
+            && bytes.get(position + 1).is_some_and(u8::is_ascii_digit)
+        {
+            position += 2;
+        } else {
+            return position;
+        }
+    }
+}
+
+fn based_integer(bytes: &[u8], start: usize, digit: impl Fn(&u8) -> bool) -> usize {
+    let mut position = start;
+    loop {
+        if bytes.get(position).is_some_and(&digit) {
+            position += 1;
+        } else if bytes.get(position) == Some(&b'_') && bytes.get(position + 1).is_some_and(&digit)
+        {
+            position += 2;
+        } else {
+            return if position > start { position } else { 0 };
+        }
+    }
+}
+
+fn double(bytes: &[u8]) -> usize {
+    let mut position = 0;
+    if bytes.first() == Some(&b'.') {
+        position = 1;
+        let start = position;
+        while bytes.get(position).is_some_and(u8::is_ascii_digit) {
+            position += 1;
+        }
+        if start == position {
+            return 0;
+        }
+    } else {
+        while bytes.get(position).is_some_and(u8::is_ascii_digit) {
+            position += 1;
+        }
+        if position == 0 {
+            return 0;
+        }
+        if bytes.get(position) == Some(&b'.') {
+            position += 1;
+            while bytes.get(position).is_some_and(u8::is_ascii_digit) {
+                position += 1;
             }
-        );
-        assert_eq!(
-            lex("/* unterminated\ncomment").expect_err("must fail"),
-            LexError::UnterminatedComment {
-                span: Span::new(0, 23)
-            }
-        );
-        assert_eq!(
-            lex("`unterminated").expect_err("must fail"),
-            LexError::UnterminatedQuotedIdentifier {
-                span: Span::new(0, 13)
-            }
-        );
+        }
     }
+    if !matches!(bytes.get(position), Some(b'e' | b'E')) {
+        return 0;
+    }
+    position += 1;
+    if matches!(bytes.get(position), Some(b'+' | b'-')) {
+        position += 1;
+    }
+    let start = position;
+    while bytes.get(position).is_some_and(u8::is_ascii_digit) {
+        position += 1;
+    }
+    if start == position { 0 } else { position }
+}
 
-    #[test]
-    fn recognizes_the_foundation_punctuation_set() {
-        let source = ";:{}[]%|?~!&^";
-        assert_eq!(
-            kinds(source),
-            vec![
-                TokenKind::Symbol(Symbol::Semicolon),
-                TokenKind::Symbol(Symbol::Colon),
-                TokenKind::Symbol(Symbol::LBrace),
-                TokenKind::Symbol(Symbol::RBrace),
-                TokenKind::Symbol(Symbol::LBracket),
-                TokenKind::Symbol(Symbol::RBracket),
-                TokenKind::Symbol(Symbol::Percent),
-                TokenKind::Symbol(Symbol::Pipe),
-                TokenKind::Symbol(Symbol::Question),
-                TokenKind::Symbol(Symbol::Tilde),
-                TokenKind::Symbol(Symbol::Bang),
-                TokenKind::Symbol(Symbol::Ampersand),
-                TokenKind::Symbol(Symbol::Caret),
-                TokenKind::End,
-            ]
-        );
-        assert_eq!(reconstruct(source), source);
+fn symbol(source: &str) -> Option<(usize, Symbol)> {
+    const DOUBLE: &[(&str, Symbol)] = &[
+        ("!=", Symbol::Neq),
+        ("<>", Symbol::Neq),
+        ("<=", Symbol::Lte),
+        (">=", Symbol::Gte),
+        ("||", Symbol::DoublePipe),
+        ("->", Symbol::Arrow),
+        ("::", Symbol::DoubleColon),
+        ("=>", Symbol::FatArrow),
+        ("{-", Symbol::ExcludeStart),
+        ("-}", Symbol::ExcludeEnd),
+    ];
+    for &(spelling, symbol) in DOUBLE {
+        if source.starts_with(spelling) {
+            return Some((spelling.len(), symbol));
+        }
     }
-
-    #[test]
-    fn prefers_longest_query_operator_matches_and_keeps_number_boundaries() {
-        let source = "<=> <= <> != << >> || && := :: => ->> -> ?& .. 1..2";
-        assert_eq!(
-            kinds(source),
-            vec![
-                TokenKind::Symbol(Symbol::NullSafeEq),
-                TokenKind::Trivia(TriviaKind::Whitespace),
-                TokenKind::Symbol(Symbol::Lte),
-                TokenKind::Trivia(TriviaKind::Whitespace),
-                TokenKind::Symbol(Symbol::Neq),
-                TokenKind::Trivia(TriviaKind::Whitespace),
-                TokenKind::Symbol(Symbol::Neq),
-                TokenKind::Trivia(TriviaKind::Whitespace),
-                TokenKind::Symbol(Symbol::ShiftLeft),
-                TokenKind::Trivia(TriviaKind::Whitespace),
-                TokenKind::Symbol(Symbol::ShiftRight),
-                TokenKind::Trivia(TriviaKind::Whitespace),
-                TokenKind::Symbol(Symbol::DoublePipe),
-                TokenKind::Trivia(TriviaKind::Whitespace),
-                TokenKind::Symbol(Symbol::DoubleAmpersand),
-                TokenKind::Trivia(TriviaKind::Whitespace),
-                TokenKind::Symbol(Symbol::ColonEq),
-                TokenKind::Trivia(TriviaKind::Whitespace),
-                TokenKind::Symbol(Symbol::DoubleColon),
-                TokenKind::Trivia(TriviaKind::Whitespace),
-                TokenKind::Symbol(Symbol::FatArrow),
-                TokenKind::Trivia(TriviaKind::Whitespace),
-                TokenKind::Symbol(Symbol::LongArrow),
-                TokenKind::Trivia(TriviaKind::Whitespace),
-                TokenKind::Symbol(Symbol::Arrow),
-                TokenKind::Trivia(TriviaKind::Whitespace),
-                TokenKind::Symbol(Symbol::QuestionAmpersand),
-                TokenKind::Trivia(TriviaKind::Whitespace),
-                TokenKind::Symbol(Symbol::DoubleDot),
-                TokenKind::Trivia(TriviaKind::Whitespace),
-                TokenKind::Number,
-                TokenKind::Symbol(Symbol::DoubleDot),
-                TokenKind::Number,
-                TokenKind::End,
-            ]
-        );
-        assert_eq!(reconstruct(source), source);
-    }
-
-    #[test]
-    fn uses_byte_spans_for_multibyte_identifiers() {
-        let source = "名$s";
-        let tokens = lex(source).expect("source should lex");
-        assert_eq!(tokens[0].span, Span::new(0, source.len()));
-        assert_eq!(reconstruct(source), source);
-    }
+    let symbol = match source.as_bytes()[0] {
+        b'=' => Symbol::Eq,
+        b'<' => Symbol::Lt,
+        b'>' => Symbol::Gt,
+        b'+' => Symbol::Plus,
+        b'-' => Symbol::Minus,
+        b'*' => Symbol::Star,
+        b'/' => Symbol::Slash,
+        b'%' => Symbol::Percent,
+        b'?' => Symbol::Question,
+        b';' => Symbol::Semicolon,
+        b'.' => Symbol::Dot,
+        b'(' => Symbol::LParen,
+        b')' => Symbol::RParen,
+        b',' => Symbol::Comma,
+        b':' => Symbol::Colon,
+        b'@' => Symbol::At,
+        b'[' => Symbol::LBracket,
+        b']' => Symbol::RBracket,
+        b'^' => Symbol::Caret,
+        b'{' => Symbol::LBrace,
+        b'}' => Symbol::RBrace,
+        b'|' => Symbol::Pipe,
+        b'$' => Symbol::Dollar,
+        _ => return None,
+    };
+    Some((1, symbol))
 }

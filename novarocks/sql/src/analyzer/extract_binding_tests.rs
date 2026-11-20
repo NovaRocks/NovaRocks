@@ -85,10 +85,7 @@ fn analyze(
     source: &TemporalCatalog,
     policy: ConstantPolicy,
 ) -> Result<ResolvedQuery, AnalyzeError> {
-    let statements = novarocks_parser::parse(sql).unwrap();
-    let [ast::Statement::Query(query)] = statements.as_slice() else {
-        panic!("query");
-    };
+    let query = &novarocks_parser::parser::parse_query(sql).unwrap();
     super::analyze_with_function_catalog_and_sql_semantics(
         query,
         source,
@@ -217,6 +214,7 @@ fn extract_binding_all_six_units_preserve_canonical_targets_and_original_catalog
                     let argument = &call(expression).2[0];
                     if original.data_type() != target.data_type() {
                         let ExprKind::Cast {
+                            array_failure_mode: None,
                             expr,
                             target: cast_target,
                             decimal_overflow_policy,
@@ -265,41 +263,36 @@ fn extract_binding_rejects_carrier_only_largeint_and_unsupported_field_at_origin
         nullable: false,
     };
     let sql = "SELECT EXTRACT(QUARTER FROM x) FROM temporal_source";
-    let statements = novarocks_parser::parse(sql).unwrap();
-    let [ast::Statement::Query(query)] = statements.as_slice() else {
-        panic!("query");
-    };
+    let query = &novarocks_parser::parser::parse_query(sql).unwrap();
     let ast::SetExpr::Select(select) = query.body.as_ref() else {
         panic!("select");
     };
-    let ast::SelectItem::UnnamedExpr(ast::Expr::FunctionCall(function)) = &select.projection[0]
-    else {
+    let ast::SelectItem::SingleColumn(projection_column) = &select.projection[0] else {
         panic!("extract");
     };
-    let ast::Expr::Identifier(field) = &function.arguments[0] else {
-        panic!("field");
+    assert!(projection_column.alias.is_none(), "anonymous projection");
+    let ast::Expr::Extract(extract) = &projection_column.expression else {
+        panic!("extract");
     };
     let error = analyze(sql, &catalog, crate::constant::test_constant_policy()).unwrap_err();
     assert_eq!(error.kind(), AnalyzeErrorKind::UnsupportedExpression);
-    assert_eq!(error.span(), Some(field.span));
+    assert_eq!(error.span(), Some(extract.span));
     assert_eq!(error.message(), "unsupported EXTRACT field: quarter");
 }
 
 #[test]
-fn extract_binding_keeps_lexical_policy_null_sources_and_explicit_constant_admission() {
+fn extract_binding_inherits_root_policy_null_sources_and_explicit_constant_admission() {
     use DecimalOverflowPolicy::{OutputNull, ReportError};
     let catalog = TemporalCatalog {
         carrier: DataType::Timestamp(TimeUnit::Second, Some("UTC".into())),
         logical: None,
         nullable: false,
     };
-    for (outer, inner, outer_policy, inner_policy) in [
-        ("ERROR_IF_OVERFLOW", "32", ReportError, OutputNull),
-        ("32", "ERROR_IF_OVERFLOW", OutputNull, ReportError),
-    ] {
+    for (outer, outer_policy) in [("ERROR_IF_OVERFLOW", ReportError), ("32", OutputNull)] {
         let sql = format!(
-            "SELECT /*+ SET_VAR(sql_mode='{outer}') */ EXTRACT(YEAR FROM q.x), year(q.x) FROM (SELECT /*+ SET_VAR(sql_mode='{inner}') */ x, EXTRACT(MONTH FROM x) AS m, month(x) AS n FROM temporal_source) q"
+            "WITH SESSION sql_mode = '{outer}' SELECT EXTRACT(YEAR FROM q.x), year(q.x) FROM (SELECT x, EXTRACT(MONTH FROM x) AS m, month(x) AS n FROM temporal_source) q"
         );
+        // The admitted root policy also governs expressions in the derived query.
         let query = analyze(&sql, &catalog, crate::constant::test_constant_policy()).unwrap();
         for ordinal in [0, 1] {
             assert_eq!(
@@ -321,12 +314,12 @@ fn extract_binding_keeps_lexical_policy_null_sources_and_explicit_constant_admis
                 call(project(inner_query, ordinal))
                     .1
                     .decimal_overflow_policy(),
-                inner_policy
+                outer_policy
             );
         }
         for (query, ordinals, policy) in [
             (&query, [0, 1], outer_policy),
-            (inner_query.as_ref(), [1, 2], inner_policy),
+            (inner_query.as_ref(), [1, 2], outer_policy),
         ] {
             for ordinal in ordinals {
                 let ExprKind::Cast {
@@ -599,12 +592,10 @@ fn extract_binding_custom_same_spelling_result_is_owned_by_actual_selected_decla
         logical: None,
         nullable: false,
     };
-    let statements =
-        novarocks_parser::parse("SELECT EXTRACT(YEAR FROM x), year(x) FROM temporal_source")
-            .unwrap();
-    let [ast::Statement::Query(query)] = statements.as_slice() else {
-        panic!("query");
-    };
+    let query = &novarocks_parser::parser::parse_query(
+        "SELECT EXTRACT(YEAR FROM x), year(x) FROM temporal_source",
+    )
+    .unwrap();
     let query = super::analyze_with_function_catalog(
         query,
         &source,
@@ -631,4 +622,22 @@ fn extract_binding_custom_same_spelling_result_is_owned_by_actual_selected_decla
             FunctionResultType::Scalar(expected)
         );
     }
+}
+
+#[test]
+fn extract_unsupported_field_keeps_typeof_cast_hint_without_analyzing_input() {
+    let catalog = TemporalCatalog {
+        carrier: DataType::Date32,
+        logical: None,
+        nullable: false,
+    };
+    let query = analyze(
+        "SELECT typeof(CAST(EXTRACT(QUARTER FROM must_not_resolve) AS INT))",
+        &catalog,
+        crate::constant::test_constant_policy(),
+    )
+    .unwrap();
+    assert!(
+        matches!(&project(&query, 0).kind, ExprKind::Literal(crate::analysis::LiteralValue::String(value)) if value == "int")
+    );
 }

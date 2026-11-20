@@ -29,19 +29,17 @@ DROP TABLE IF EXISTS ${case_db}.t_join_null_key_inner_r;
 CREATE TABLE ${case_db}.t_join_null_key_inner_l (
   k INT,
   vl STRING
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 CREATE TABLE ${case_db}.t_join_null_key_inner_r (
   k INT,
   vr STRING
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 INSERT INTO ${case_db}.t_join_null_key_inner_l VALUES
-  (NULL, 'LN'),
-  (2, 'L2');
+  ROW(NULL, 'LN'),
+  ROW(2, 'L2');
 INSERT INTO ${case_db}.t_join_null_key_inner_r VALUES
-  (NULL, 'RN'),
-  (2, 'R2');
+  ROW(NULL, 'RN'),
+  ROW(2, 'R2');
 SELECT l.k, l.vl, r.vr
 FROM ${case_db}.t_join_null_key_inner_l l
 INNER JOIN ${case_db}.t_join_null_key_inner_r r

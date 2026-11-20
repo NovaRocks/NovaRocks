@@ -21,6 +21,7 @@
 
 use arrow::{
     array::{Array, UInt64Array},
+    datatypes::DataType,
     record_batch::{RecordBatch, RecordBatchOptions},
 };
 use novarocks_expression::CompiledExpressionInstance;
@@ -252,10 +253,15 @@ impl RequiredConstantInterpreter {
                 "required result differs from its complete frozen carrier",
             ));
         }
-        // Materialize a new flat result under the original copy host invoice.
-        // The copy author proves no nonempty input alias before dropping the
-        // old operation/source lease; output Buffer custody carries ONLY its
-        // actual new backing grant. No stock-based second payload charge is made.
+        // ARRAY<VARCHAR> can share nested children. Arrow take can also slice
+        // an UNKNOWN result and retain its bufferless root owner. Both use the
+        // source-retaining path. Concrete scalars prove independent backing.
+        let retains_source = *array.data_type() == DataType::Null
+            || matches!(
+                prepared.value_type().value_type().kind(),
+                novarocks_type_contract::ValueKind::List(child)
+                    if matches!(child.kind(), novarocks_type_contract::ValueKind::String)
+            );
         let mut indices_scope = resources.factory.begin_scope()?;
         indices_scope.request_layout(
             std::alloc::Layout::array::<u64>(1)
@@ -287,18 +293,28 @@ impl RequiredConstantInterpreter {
         let indices = novarocks_functions::selected_copy::CopyIndices::UInt64(Arc::new(
             UInt64Array::new(index_values.into(), None),
         ));
-        let array = novarocks_functions::selected_copy::take_flat_owned_copy_in(
-            array,
-            indices,
-            (
-                resources.operation_storage(),
-                indices_scope.storage_lifetime(),
-            ),
-            resources.allocator.clone(),
-            &kernel_control,
-        )
-        .map_err(copy_operation_error)?
-        .into_values();
+        let source_storage = (
+            resources.operation_storage(),
+            indices_scope.storage_lifetime(),
+        );
+        let copied = if retains_source {
+            novarocks_functions::selected_copy::take_copy_in(
+                array,
+                indices,
+                source_storage,
+                resources.allocator.clone(),
+                &kernel_control,
+            )
+        } else {
+            novarocks_functions::selected_copy::take_flat_owned_copy_in(
+                array,
+                indices,
+                source_storage,
+                resources.allocator.clone(),
+                &kernel_control,
+            )
+        };
+        let array = copied.map_err(copy_operation_error)?.into_values();
         drop(indices_scope);
         let mut storage = resources.factory.begin_scope()?;
         // The required-target contract admits five flat physical carriers.
@@ -338,16 +354,32 @@ impl RequiredConstantInterpreter {
                 },
             )
             .map_err(constant_creation_error)?;
-        storage
-            .with_creation(|creation| {
-                novarocks_functions::selected_copy::preflight_flat_arrow_structure_construction(
-                    array.data_type(),
-                    array.nulls().is_some(),
-                    creation,
-                    &mut |_| control.checkpoint(CompilePhase::FunctionSpecialization, 0),
-                )
-            })
-            .map_err(copy_construction_error)?;
+        if retains_source {
+            // Bound the actual complete Arrow subtree before to_data creates
+            // its metadata. Payload is already held by the original take.
+            let metadata = novarocks_functions::source_metadata_bytes_observed::<
+                SqlConstantEvaluationError,
+            >(array.as_ref(), &mut |boundary| {
+                if boundary {
+                    work.flush()?;
+                } else {
+                    work.step()?;
+                }
+                Ok(())
+            })?;
+            storage.observe_opaque_upper_bound(metadata)?;
+        } else {
+            storage
+                .with_creation(|creation| {
+                    novarocks_functions::selected_copy::preflight_flat_arrow_structure_construction(
+                        array.data_type(),
+                        array.nulls().is_some(),
+                        creation,
+                        &mut |_| control.checkpoint(CompilePhase::FunctionSpecialization, 0),
+                    )
+                })
+                .map_err(copy_construction_error)?;
+        }
         work.flush()?;
         let data = array.to_data();
         work.flush()?;

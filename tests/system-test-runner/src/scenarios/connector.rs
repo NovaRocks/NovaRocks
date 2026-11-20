@@ -230,7 +230,7 @@ impl Scenario for Uea5dMultiSplitDop {
             let mut observations = Vec::new();
             for (index, dop) in [1, 4].into_iter().enumerate() {
                 control
-                    .execute(format!("SET pipeline_dop = {dop}"))
+                    .execute(format!("SET SESSION pipeline_dop = {dop}"))
                     .map(|_| ())
                     .with_context(|| format!("select requested read DOP {dop}"))?;
                 let before = backend_log_snapshots(context)?;
@@ -383,11 +383,11 @@ impl Scenario for TypedReadData {
             // scenario explicitly opts its control session into both cache reads
             // and population before asserting the warm/cached profiles below.
             control
-                .execute("SET enable_scan_datacache = true")
+                .execute("SET SESSION enable_scan_datacache = true")
                 .map(|_| ())
                 .context("enable cache reads for typed connector data")?;
             control
-                .execute("SET enable_populate_datacache = true")
+                .execute("SET SESSION enable_populate_datacache = true")
                 .map(|_| ())
                 .context("enable cache population for typed connector data")?;
 
@@ -1270,7 +1270,7 @@ impl Scenario for CatalogReadWriteRuntime {
             let warehouse = create_warehouse(context, "catalog-read-write-runtime")?;
             create_catalog(&mut control, CATALOG, &warehouse)?;
             control
-                .execute(format!("CREATE DATABASE {CATALOG}.{DATABASE}"))
+                .execute(format!("CREATE SCHEMA {CATALOG}.{DATABASE}"))
                 .map(|_| ())
                 .context("create catalog read-write database")?;
             control
@@ -1327,7 +1327,7 @@ impl Scenario for CatalogReadWriteRuntime {
                 context,
                 &self.controls.take(4)?,
                 &mut control,
-                &format!("INSERT INTO {CATALOG}.{DATABASE}.{TABLE} VALUES (1001)"),
+                &format!("INSERT INTO {CATALOG}.{DATABASE}.{TABLE} VALUES ROW(1001)"),
             )
             .context("distributed insert after BE replacement")?;
             let rows: Vec<(i64, i64)> = connector_control_plan::query(
@@ -1513,8 +1513,10 @@ impl Scenario for VendedRestReadWritePem {
             context.action("create REST catalog with an explicit vended data binding");
             control
             .execute(format!(
-                "CREATE EXTERNAL CATALOG {CATALOG} PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"rest\",\"uri\"=\"{proxy_uri}\",\"iceberg.catalog.warehouse\"=\"{warehouse}\",\"aws.s3.endpoint\"=\"{}\",\"aws.s3.region\"=\"us-east-1\",\"aws.s3.enable_path_style_access\"=\"true\",\"credential.object-store-metadata.consumer-role\"=\"frontend\",\"credential.object-store-metadata.mode\"=\"static\",\"credential.object-store-metadata.name\"=\"{VENDED_METADATA_CREDENTIAL_NAME}\",\"credential.object-store-metadata.generation\"=\"{VENDED_METADATA_CREDENTIAL_GENERATION}\",\"credential.object-store-data.consumer-role\"=\"backend\",\"credential.object-store-data.mode\"=\"vended\",\"credential.data-credential-vending.consumer-role\"=\"backend\",\"credential.data-credential-vending.mode\"=\"static\",\"credential.data-credential-vending.name\"=\"{VENDED_EXECUTION_CREDENTIAL_NAME}\",\"credential.data-credential-vending.generation\"=\"{VENDED_EXECUTION_CREDENTIAL_GENERATION}\")",
-                self.vended_minio_endpoint()?
+                "CREATE CATALOG {CATALOG} USING iceberg WITH (\"iceberg.catalog.type\" = 'rest',\"uri\" = '{proxy_uri}',\"iceberg.catalog.warehouse\" = '{warehouse}',\"aws.s3.endpoint\" = '{}',\"aws.s3.region\" = 'us-east-1',\"aws.s3.enable_path_style_access\" = 'true',\"credential.object-store-metadata.consumer-role\" = 'frontend',\"credential.object-store-metadata.mode\" = 'static',\"credential.object-store-metadata.name\" = '{VENDED_METADATA_CREDENTIAL_NAME}',\"credential.object-store-metadata.generation\" = '{VENDED_METADATA_CREDENTIAL_GENERATION}',\"credential.object-store-data.consumer-role\" = 'backend',\"credential.object-store-data.mode\" = 'vended',\"credential.data-credential-vending.consumer-role\" = 'backend',\"credential.data-credential-vending.mode\" = 'static',\"credential.data-credential-vending.name\" = '{VENDED_EXECUTION_CREDENTIAL_NAME}',\"credential.data-credential-vending.generation\" = '{VENDED_EXECUTION_CREDENTIAL_GENERATION}')",
+                catalog_sql_text(&self.vended_minio_endpoint()?),
+                proxy_uri = catalog_sql_text(&proxy_uri),
+                warehouse = catalog_sql_text(&warehouse)
             )).map(|_| ())
             .context("create vended REST catalog")?;
             context.action("write three vended REST data files through the native 1FE+3BE path");
@@ -1726,7 +1728,10 @@ impl Scenario for VendedRestWriteOutcomePem {
             const TABLE: &str = "vended_write_outcome_data";
             control
             .execute(format!(
-                "CREATE EXTERNAL CATALOG {CATALOG} PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"rest\",\"uri\"=\"{proxy_uri}\",\"iceberg.catalog.warehouse\"=\"{warehouse}\",\"aws.s3.endpoint\"=\"{minio_endpoint}\",\"aws.s3.region\"=\"us-east-1\",\"aws.s3.enable_path_style_access\"=\"true\",\"credential.object-store-metadata.consumer-role\"=\"frontend\",\"credential.object-store-metadata.mode\"=\"static\",\"credential.object-store-metadata.name\"=\"{VENDED_METADATA_CREDENTIAL_NAME}\",\"credential.object-store-metadata.generation\"=\"{VENDED_METADATA_CREDENTIAL_GENERATION}\",\"credential.object-store-data.consumer-role\"=\"backend\",\"credential.object-store-data.mode\"=\"vended\",\"credential.data-credential-vending.consumer-role\"=\"backend\",\"credential.data-credential-vending.mode\"=\"static\",\"credential.data-credential-vending.name\"=\"{VENDED_EXECUTION_CREDENTIAL_NAME}\",\"credential.data-credential-vending.generation\"=\"{VENDED_EXECUTION_CREDENTIAL_GENERATION}\")"
+                "CREATE CATALOG {CATALOG} USING iceberg WITH (\"iceberg.catalog.type\" = 'rest',\"uri\" = '{proxy_uri}',\"iceberg.catalog.warehouse\" = '{warehouse}',\"aws.s3.endpoint\" = '{minio_endpoint}',\"aws.s3.region\" = 'us-east-1',\"aws.s3.enable_path_style_access\" = 'true',\"credential.object-store-metadata.consumer-role\" = 'frontend',\"credential.object-store-metadata.mode\" = 'static',\"credential.object-store-metadata.name\" = '{VENDED_METADATA_CREDENTIAL_NAME}',\"credential.object-store-metadata.generation\" = '{VENDED_METADATA_CREDENTIAL_GENERATION}',\"credential.object-store-data.consumer-role\" = 'backend',\"credential.object-store-data.mode\" = 'vended',\"credential.data-credential-vending.consumer-role\" = 'backend',\"credential.data-credential-vending.mode\" = 'static',\"credential.data-credential-vending.name\" = '{VENDED_EXECUTION_CREDENTIAL_NAME}',\"credential.data-credential-vending.generation\" = '{VENDED_EXECUTION_CREDENTIAL_GENERATION}')",
+                proxy_uri = catalog_sql_text(&proxy_uri),
+                warehouse = catalog_sql_text(&warehouse),
+                minio_endpoint = catalog_sql_text(&minio_endpoint)
             )).map(|_| ())
             .context("create response-loss REST vended catalog")?;
 
@@ -2042,8 +2047,10 @@ impl Scenario for VendedRestPostPublishAnswerPem {
         context.action("create a vended REST catalog behind the post-publish answer proxy");
         control
             .execute(format!(
-                "CREATE EXTERNAL CATALOG {POST_PUBLISH_CATALOG} PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"rest\",\"uri\"=\"{}\",\"iceberg.catalog.warehouse\"=\"{}\",\"aws.s3.endpoint\"=\"{}\",\"aws.s3.region\"=\"us-east-1\",\"aws.s3.enable_path_style_access\"=\"true\",\"credential.object-store-metadata.consumer-role\"=\"frontend\",\"credential.object-store-metadata.mode\"=\"static\",\"credential.object-store-metadata.name\"=\"{VENDED_METADATA_CREDENTIAL_NAME}\",\"credential.object-store-metadata.generation\"=\"{VENDED_METADATA_CREDENTIAL_GENERATION}\",\"credential.object-store-data.consumer-role\"=\"backend\",\"credential.object-store-data.mode\"=\"vended\",\"credential.data-credential-vending.consumer-role\"=\"backend\",\"credential.data-credential-vending.mode\"=\"static\",\"credential.data-credential-vending.name\"=\"{VENDED_EXECUTION_CREDENTIAL_NAME}\",\"credential.data-credential-vending.generation\"=\"{VENDED_EXECUTION_CREDENTIAL_GENERATION}\")",
-                endpoints.proxy_uri, endpoints.warehouse, endpoints.minio_endpoint
+                "CREATE CATALOG {POST_PUBLISH_CATALOG} USING iceberg WITH (\"iceberg.catalog.type\" = 'rest',\"uri\" = '{}',\"iceberg.catalog.warehouse\" = '{}',\"aws.s3.endpoint\" = '{}',\"aws.s3.region\" = 'us-east-1',\"aws.s3.enable_path_style_access\" = 'true',\"credential.object-store-metadata.consumer-role\" = 'frontend',\"credential.object-store-metadata.mode\" = 'static',\"credential.object-store-metadata.name\" = '{VENDED_METADATA_CREDENTIAL_NAME}',\"credential.object-store-metadata.generation\" = '{VENDED_METADATA_CREDENTIAL_GENERATION}',\"credential.object-store-data.consumer-role\" = 'backend',\"credential.object-store-data.mode\" = 'vended',\"credential.data-credential-vending.consumer-role\" = 'backend',\"credential.data-credential-vending.mode\" = 'static',\"credential.data-credential-vending.name\" = '{VENDED_EXECUTION_CREDENTIAL_NAME}',\"credential.data-credential-vending.generation\" = '{VENDED_EXECUTION_CREDENTIAL_GENERATION}')",
+                catalog_sql_text(&endpoints.proxy_uri),
+                catalog_sql_text(&endpoints.warehouse),
+                catalog_sql_text(&endpoints.minio_endpoint)
             )).map(|_| ())
             .context("create post-publish answer REST vended catalog")?;
         match self.case {
@@ -2201,7 +2208,7 @@ impl VendedRestPostPublishAnswerPem {
         .context("connect post-publish answer DDL session")?;
         let outcome = writer
             .execute(format!(
-                "CREATE DATABASE {POST_PUBLISH_CATALOG}.{POST_PUBLISH_CREATED_DATABASE}"
+                "CREATE SCHEMA {POST_PUBLISH_CATALOG}.{POST_PUBLISH_CREATED_DATABASE}"
             ))
             .map(|_| ());
         let audit = self.vended_proxy_audit()?;
@@ -2478,7 +2485,10 @@ impl Scenario for VendedRestRefreshPem {
         context.action("create short-TTL REST catalog with a vended data binding");
         control
             .execute(format!(
-                "CREATE EXTERNAL CATALOG {CATALOG} PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"rest\",\"uri\"=\"{proxy_uri}\",\"iceberg.catalog.warehouse\"=\"{warehouse}\",\"aws.s3.endpoint\"=\"{minio_endpoint}\",\"aws.s3.region\"=\"us-east-1\",\"aws.s3.enable_path_style_access\"=\"true\",\"credential.object-store-metadata.consumer-role\"=\"frontend\",\"credential.object-store-metadata.mode\"=\"static\",\"credential.object-store-metadata.name\"=\"{VENDED_METADATA_CREDENTIAL_NAME}\",\"credential.object-store-metadata.generation\"=\"{VENDED_METADATA_CREDENTIAL_GENERATION}\",\"credential.object-store-data.consumer-role\"=\"backend\",\"credential.object-store-data.mode\"=\"vended\",\"credential.data-credential-vending.consumer-role\"=\"backend\",\"credential.data-credential-vending.mode\"=\"static\",\"credential.data-credential-vending.name\"=\"{VENDED_EXECUTION_CREDENTIAL_NAME}\",\"credential.data-credential-vending.generation\"=\"{VENDED_EXECUTION_CREDENTIAL_GENERATION}\")"
+                "CREATE CATALOG {CATALOG} USING iceberg WITH (\"iceberg.catalog.type\" = 'rest',\"uri\" = '{proxy_uri}',\"iceberg.catalog.warehouse\" = '{warehouse}',\"aws.s3.endpoint\" = '{minio_endpoint}',\"aws.s3.region\" = 'us-east-1',\"aws.s3.enable_path_style_access\" = 'true',\"credential.object-store-metadata.consumer-role\" = 'frontend',\"credential.object-store-metadata.mode\" = 'static',\"credential.object-store-metadata.name\" = '{VENDED_METADATA_CREDENTIAL_NAME}',\"credential.object-store-metadata.generation\" = '{VENDED_METADATA_CREDENTIAL_GENERATION}',\"credential.object-store-data.consumer-role\" = 'backend',\"credential.object-store-data.mode\" = 'vended',\"credential.data-credential-vending.consumer-role\" = 'backend',\"credential.data-credential-vending.mode\" = 'static',\"credential.data-credential-vending.name\" = '{VENDED_EXECUTION_CREDENTIAL_NAME}',\"credential.data-credential-vending.generation\" = '{VENDED_EXECUTION_CREDENTIAL_GENERATION}')",
+                proxy_uri = catalog_sql_text(&proxy_uri),
+                warehouse = catalog_sql_text(&warehouse),
+                minio_endpoint = catalog_sql_text(&minio_endpoint)
             )).map(|_| ())
             .context("create short-TTL vended REST catalog")?;
         context.action("write three independent vended data files for the 1FE+3BE long read");
@@ -2985,7 +2995,10 @@ impl Scenario for VendedCredentialFaultPem {
         const TABLE: &str = "cad2_vended_data";
         let catalog_sql = |catalog: &str| {
             format!(
-                "CREATE EXTERNAL CATALOG {catalog} PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"rest\",\"uri\"=\"{proxy_uri}\",\"iceberg.catalog.warehouse\"=\"{warehouse}\",\"aws.s3.endpoint\"=\"{minio_endpoint}\",\"aws.s3.region\"=\"us-east-1\",\"aws.s3.enable_path_style_access\"=\"true\",\"credential.object-store-metadata.consumer-role\"=\"frontend\",\"credential.object-store-metadata.mode\"=\"static\",\"credential.object-store-metadata.name\"=\"{VENDED_METADATA_CREDENTIAL_NAME}\",\"credential.object-store-metadata.generation\"=\"{VENDED_METADATA_CREDENTIAL_GENERATION}\",\"credential.object-store-data.consumer-role\"=\"backend\",\"credential.object-store-data.mode\"=\"vended\",\"credential.data-credential-vending.consumer-role\"=\"backend\",\"credential.data-credential-vending.mode\"=\"static\",\"credential.data-credential-vending.name\"=\"{VENDED_EXECUTION_CREDENTIAL_NAME}\",\"credential.data-credential-vending.generation\"=\"{VENDED_EXECUTION_CREDENTIAL_GENERATION}\")"
+                "CREATE CATALOG {catalog} USING iceberg WITH (\"iceberg.catalog.type\" = 'rest',\"uri\" = '{proxy_uri}',\"iceberg.catalog.warehouse\" = '{warehouse}',\"aws.s3.endpoint\" = '{minio_endpoint}',\"aws.s3.region\" = 'us-east-1',\"aws.s3.enable_path_style_access\" = 'true',\"credential.object-store-metadata.consumer-role\" = 'frontend',\"credential.object-store-metadata.mode\" = 'static',\"credential.object-store-metadata.name\" = '{VENDED_METADATA_CREDENTIAL_NAME}',\"credential.object-store-metadata.generation\" = '{VENDED_METADATA_CREDENTIAL_GENERATION}',\"credential.object-store-data.consumer-role\" = 'backend',\"credential.object-store-data.mode\" = 'vended',\"credential.data-credential-vending.consumer-role\" = 'backend',\"credential.data-credential-vending.mode\" = 'static',\"credential.data-credential-vending.name\" = '{VENDED_EXECUTION_CREDENTIAL_NAME}',\"credential.data-credential-vending.generation\" = '{VENDED_EXECUTION_CREDENTIAL_GENERATION}')",
+                proxy_uri = catalog_sql_text(&proxy_uri),
+                warehouse = catalog_sql_text(&warehouse),
+                minio_endpoint = catalog_sql_text(&minio_endpoint)
             )
         };
         let setup_catalog = if matches!(self.kind, VendedCredentialFault::Unreachable) {
@@ -3657,11 +3670,11 @@ impl Scenario for AccessDomainCacheIsolation {
             // cache service configured by this scenario is intentionally inert
             // until the client opts this session into both reads and population.
             control
-                .execute("SET enable_scan_datacache = true")
+                .execute("SET SESSION enable_scan_datacache = true")
                 .map(|_| ())
                 .context("enable cache reads for access-domain isolation")?;
             control
-                .execute("SET enable_populate_datacache = true")
+                .execute("SET SESSION enable_populate_datacache = true")
                 .map(|_| ())
                 .context("enable cache population for access-domain isolation")?;
 
@@ -4165,7 +4178,7 @@ impl Scenario for PredicatePageIndexPruning {
                 format!("SELECT count(*) FROM {CATALOG}.{DATABASE}.{TABLE} WHERE {PREDICATE}");
             context.action("run the static predicate with page-index reader disabled");
             control
-                .execute("SET enable_parquet_reader_page_index = false")
+                .execute("SET SESSION enable_parquet_reader_page_index = false")
                 .map(|_| ())
                 .context("disable predicate-driven page-index pruning")?;
             let disabled: Vec<i64> = control
@@ -4175,7 +4188,7 @@ impl Scenario for PredicatePageIndexPruning {
 
             context.action("run the same static predicate with page-index reader enabled");
             control
-                .execute("SET enable_parquet_reader_page_index = true")
+                .execute("SET SESSION enable_parquet_reader_page_index = true")
                 .map(|_| ())
                 .context("enable predicate-driven page-index pruning")?;
             let enabled: Vec<i64> = control
@@ -4269,7 +4282,7 @@ impl Scenario for CatalogVersionDrain {
         let mut control = SqlSession::new(&user, port, context.deadline())?;
         (|| -> Result<()> {
             control
-                .execute("SET pipeline_dop = 1")
+                .execute("SET SESSION pipeline_dop = 1")
                 .map(|_| ())
                 .context("bound catalog version drain control driver parallelism")?;
 
@@ -4812,7 +4825,7 @@ fn create_catalog_table_and_data(
 ) -> Result<()> {
     create_catalog(control, catalog, warehouse)?;
     control
-        .execute(format!("CREATE DATABASE {catalog}.{database}"))
+        .execute(format!("CREATE SCHEMA {catalog}.{database}"))
         .map(|_| ())
         .with_context(|| format!("create {catalog}.{database}"))?;
     control
@@ -4839,7 +4852,7 @@ fn create_static_catalog_table_and_data(
     ranges: [&str; 3],
 ) -> Result<()> {
     control
-        .execute(format!("CREATE DATABASE {catalog}.{database}"))
+        .execute(format!("CREATE SCHEMA {catalog}.{database}"))
         .map(|_| ())
         .with_context(|| format!("create {catalog}.{database} from StaticFile source"))?;
     control
@@ -4933,7 +4946,7 @@ fn create_catalog_table_and_dense_data(
 ) -> Result<()> {
     create_catalog(control, catalog, warehouse)?;
     control
-        .execute(format!("CREATE DATABASE {catalog}.{database}"))
+        .execute(format!("CREATE SCHEMA {catalog}.{database}"))
         .map(|_| ())
         .with_context(|| format!("create {catalog}.{database}"))?;
     control
@@ -4956,15 +4969,19 @@ fn create_catalog_table_and_dense_data(
     Ok(())
 }
 
+fn catalog_sql_text(value: &str) -> String {
+    value.replace('\'', "''")
+}
+
 pub(super) fn create_catalog(
     control: &mut SqlSession,
     catalog: &str,
     warehouse: &std::path::Path,
 ) -> Result<()> {
-    let warehouse = warehouse.to_string_lossy().replace('"', "\\\"");
+    let warehouse = catalog_sql_text(&warehouse.to_string_lossy());
     control
         .execute(format!(
-            "CREATE EXTERNAL CATALOG {catalog} PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"hadoop\",\"iceberg.catalog.warehouse\"=\"{warehouse}\")"
+            "CREATE CATALOG {catalog} USING iceberg WITH (\"iceberg.catalog.type\" = 'hadoop',\"iceberg.catalog.warehouse\" = '{warehouse}')"
         )).map(|_| ())
         .with_context(|| format!("create Hadoop Iceberg catalog {catalog}"))
 }

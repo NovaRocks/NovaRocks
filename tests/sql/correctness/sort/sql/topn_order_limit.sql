@@ -28,14 +28,13 @@ DROP TABLE IF EXISTS ${case_db}.t_topn_order_limit;
 CREATE TABLE ${case_db}.t_topn_order_limit (
   id INT,
   score INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 INSERT INTO ${case_db}.t_topn_order_limit VALUES
-  (1, 70),
-  (2, 95),
-  (3, 88),
-  (4, 95),
-  (5, 60);
+  ROW(1, 70),
+  ROW(2, 95),
+  ROW(3, 88),
+  ROW(4, 95),
+  ROW(5, 60);
 SELECT id, score
 FROM ${case_db}.t_topn_order_limit
 ORDER BY score DESC, id ASC

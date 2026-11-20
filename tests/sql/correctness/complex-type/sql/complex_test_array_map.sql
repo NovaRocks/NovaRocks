@@ -29,8 +29,7 @@ USE ${case_db};
 CREATE TABLE t1 (
     k1 bigint,
     c1 array < varchar(65536) > 
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 3
 -- @skip_result_check=true
@@ -38,34 +37,33 @@ USE ${case_db};
 CREATE TABLE t2 (
     k1 bigint,
     c1 bigint
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 4
 -- @skip_result_check=true
 USE ${case_db};
 insert into t1
 values
-    (1, ["1","2"]        ), 
-    (2, ["0","2","1"]    ), 
-    (3, ["0","2","1"]    ), 
-    (4, ["1","2"]        ), 
-    (5, ["0","2","1"]    ), 
-    (6, ["0","2","1","1"]), 
-    (7, ["0","2","1"]    ), 
-    (8, ["1","2"]        ), 
-    (9, ["L","2","1"]    ), 
-    (10, ["1","2"]       );
+    ROW(1, ['1','2']        ),
+    ROW(2, ['0','2','1']    ),
+    ROW(3, ['0','2','1']    ),
+    ROW(4, ['1','2']        ),
+    ROW(5, ['0','2','1']    ),
+    ROW(6, ['0','2','1','1']),
+    ROW(7, ['0','2','1']    ),
+    ROW(8, ['1','2']        ),
+    ROW(9, ['L','2','1']    ),
+    ROW(10, ['1','2']       );
 
 -- query 5
 -- @skip_result_check=true
 USE ${case_db};
 insert into t2
 values
-    (1, 1),
-    (2, 1),
-    (3, 3),
-    (4, 5);
+    ROW(1, 1),
+    ROW(2, 1),
+    ROW(3, 3),
+    ROW(4, 5);
 
 -- query 6
 USE ${case_db};
@@ -90,23 +88,23 @@ order by
 USE ${case_db};
 INSERT INTO t1 (k1, c1)
 VALUES 
-(1, ARRAY_MAP(
+ROW(1, ARRAY_MAP(
     x -> CAST(x AS STRING), 
     ARRAY_GENERATE(1, 1000)
 )),
-(2, ARRAY_MAP(
+ROW(2, ARRAY_MAP(
     x -> CAST(x AS STRING), 
     ARRAY_GENERATE(1, 1000)
 )),
-(3, ARRAY_MAP(
+ROW(3, ARRAY_MAP(
     x -> CAST(x AS STRING), 
     ARRAY_GENERATE(1, 1000)
 )),
-(4, ARRAY_MAP(
+ROW(4, ARRAY_MAP(
     x -> CAST(x AS STRING), 
     ARRAY_GENERATE(1, 1000)
 )),
-(5, ARRAY_MAP(
+ROW(5, ARRAY_MAP(
     x -> CAST(x AS STRING), 
     ARRAY_GENERATE(1, 1000)
 ));
@@ -117,16 +115,15 @@ USE ${case_db};
 CREATE TABLE table1 (
     id INT,
     arr_largeint ARRAY<INT> NOT NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 9
 -- @skip_result_check=true
 USE ${case_db};
 INSERT INTO table1 (id, arr_largeint) VALUES
-(1, [1, 2]),
-(2, [3, 4, 5]),
-(3, [6]);
+ROW(1, [1, 2]),
+ROW(2, [3, 4, 5]),
+ROW(3, [6]);
 
 -- query 10
 -- @skip_result_check=true
@@ -134,16 +131,15 @@ USE ${case_db};
 CREATE TABLE table2 (
     id INT,
     arr_str ARRAY<INT> NOT NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 11
 -- @skip_result_check=true
 USE ${case_db};
 INSERT INTO table2 (id, arr_str) VALUES
-(1, [1, 2, 3]),
-(2, [4, 5]),
-(3, [6, 7, 8, 9]);
+ROW(1, [1, 2, 3]),
+ROW(2, [4, 5]),
+ROW(3, [6, 7, 8, 9]);
 
 -- query 12
 USE ${case_db};
@@ -155,11 +151,11 @@ AND array_length(array_map(x -> x + array_length(t2.arr_str), t1.arr_largeint)) 
 
 -- query 13
 USE ${case_db};
-WITH `CTE` AS (
-    SELECT TRUE AS bool_1, TRUE AS bool_2, TRUE AS bool_3, ["a"] AS arr
+WITH "CTE" AS (
+    SELECT TRUE AS bool_1, TRUE AS bool_2, TRUE AS bool_3, ['a'] AS arr
     UNION ALL
-    SELECT TRUE AS bool_1, TRUE AS bool_2, TRUE AS bool_3, ["a"] AS arr
-) SELECT ARRAY_MAP((arg)->`bool_1` AND `bool_2` AND `bool_3`, arr), ARRAY_MAP((arg)->`bool_1` AND `bool_3` AND `bool_2`, arr) FROM `CTE`;
+    SELECT TRUE AS bool_1, TRUE AS bool_2, TRUE AS bool_3, ['a'] AS arr
+) SELECT ARRAY_MAP((arg)->"bool_1" AND "bool_2" AND "bool_3", arr), ARRAY_MAP((arg)->"bool_1" AND "bool_3" AND "bool_2", arr) FROM "CTE";
 
 -- query 14
 USE ${case_db};

@@ -28,13 +28,13 @@ CREATE TABLE ${case_db}.wm_line (l_partkey INT, l_quantity INT, l_ext INT);
 -- query 4
 CREATE TABLE ${case_db}.wm_part (p_partkey INT, p_brand VARCHAR(16));
 -- query 5
-INSERT INTO ${case_db}.wm_line VALUES (1,5,100),(1,50,200),(2,7,300),(2,8,150),(3,9,90);
+INSERT INTO ${case_db}.wm_line VALUES ROW(1,5,100),ROW(1,50,200),ROW(2,7,300),ROW(2,8,150),ROW(3,9,90);
 -- query 6
-INSERT INTO ${case_db}.wm_part VALUES (1,'B1'),(2,'B1'),(3,'B2');
+INSERT INTO ${case_db}.wm_part VALUES ROW(1,'B1'),ROW(2,'B1'),ROW(3,'B2');
 -- query 7
-ANALYZE TABLE ${case_db}.wm_line;
+ANALYZE ${case_db}.wm_line;
 -- query 8
-ANALYZE TABLE ${case_db}.wm_part;
+ANALYZE ${case_db}.wm_part;
 -- query 9
 
 -- query 10
@@ -57,7 +57,7 @@ WHERE p_partkey = l_partkey
   AND l_quantity < (SELECT 2 * avg(l_quantity) FROM ${case_db}.wm_line WHERE l_partkey = p_partkey);
 -- query 12
 
-SET disable_optimizer_rules='ApplyToWindow';
+SET SESSION disable_optimizer_rules = 'ApplyToWindow';
 -- query 13
 
 -- With ApplyToWindow disabled, falls back to the outer JOIN form.
@@ -70,4 +70,4 @@ WHERE p_partkey = l_partkey
   AND l_quantity < (SELECT 2 * avg(l_quantity) FROM ${case_db}.wm_line WHERE l_partkey = p_partkey);
 -- query 14
 
-SET disable_optimizer_rules='';
+SET SESSION disable_optimizer_rules = '';

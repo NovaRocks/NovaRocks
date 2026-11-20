@@ -19,7 +19,7 @@
 -- query 1
 -- @result_contains=TABLE: iceberg_pkfk_db_${uuid0}.txn
 -- @result_not_contains=TABLE: iceberg_pkfk_db_${uuid0}.payment
-CREATE DATABASE iceberg_ddl_cat_${suite_uuid0}.iceberg_pkfk_db_${uuid0};
+CREATE SCHEMA iceberg_ddl_cat_${suite_uuid0}.iceberg_pkfk_db_${uuid0};
 USE iceberg_ddl_cat_${suite_uuid0}.iceberg_pkfk_db_${uuid0};
 CREATE TABLE payment (
   id INT,
@@ -32,24 +32,24 @@ CREATE TABLE txn (
   payment_id INT
 );
 INSERT INTO payment VALUES
-  (1, '2025-01-01', 'COMPLETED'),
-  (2, '2025-01-02', 'PENDING'),
-  (3, '2025-01-03', 'FAILED'),
-  (4, '2025-01-04', 'COMPLETED'),
-  (5, '2025-01-05', 'REFUNDED');
+  ROW(1, '2025-01-01', 'COMPLETED'),
+  ROW(2, '2025-01-02', 'PENDING'),
+  ROW(3, '2025-01-03', 'FAILED'),
+  ROW(4, '2025-01-04', 'COMPLETED'),
+  ROW(5, '2025-01-05', 'REFUNDED');
 INSERT INTO txn VALUES
-  (101, '2025-01-01', 1),
-  (102, '2025-01-02', 2),
-  (103, '2025-01-03', 3),
-  (104, '2025-01-04', 4),
-  (105, '2025-01-05', 5),
-  (106, '2025-01-06', 1);
-ALTER TABLE payment SET ("unique_constraints" = "id");
-ALTER TABLE txn SET ("foreign_key_constraints" = "(payment_id) REFERENCES payment(id)");
-SET enable_ukfk_opt = false;
-SET enable_query_rewrite_table_prune = true;
-SET enable_cbo_table_prune = true;
-SET enable_table_prune_on_update = true;
+  ROW(101, '2025-01-01', 1),
+  ROW(102, '2025-01-02', 2),
+  ROW(103, '2025-01-03', 3),
+  ROW(104, '2025-01-04', 4),
+  ROW(105, '2025-01-05', 5),
+  ROW(106, '2025-01-06', 1);
+ALTER TABLE payment SET PROPERTIES extra_properties = MAP(ARRAY['unique_constraints'], ARRAY['id']);
+ALTER TABLE txn SET PROPERTIES extra_properties = MAP(ARRAY['foreign_key_constraints'], ARRAY['(payment_id) REFERENCES payment(id)']);
+SET SESSION enable_ukfk_opt = false;
+SET SESSION enable_query_rewrite_table_prune = true;
+SET SESSION enable_cbo_table_prune = true;
+SET SESSION enable_table_prune_on_update = true;
 EXPLAIN
 SELECT txn.id, txn.created_at, txn.payment_id
 FROM txn
@@ -71,10 +71,10 @@ INNER JOIN payment
 -- @result_contains=payment_id IS NOT NULL
 -- @result_not_contains=TABLE: iceberg_pkfk_db_${uuid0}.payment
 USE iceberg_ddl_cat_${suite_uuid0}.iceberg_pkfk_db_${uuid0};
-SET enable_ukfk_opt = true;
-SET enable_query_rewrite_table_prune = false;
-SET enable_cbo_table_prune = false;
-SET enable_table_prune_on_update = false;
+SET SESSION enable_ukfk_opt = true;
+SET SESSION enable_query_rewrite_table_prune = false;
+SET SESSION enable_cbo_table_prune = false;
+SET SESSION enable_table_prune_on_update = false;
 EXPLAIN
 SELECT txn.id, txn.created_at, txn.payment_id
 FROM txn
@@ -84,7 +84,7 @@ INNER JOIN payment
 -- query 4
 -- @result_contains=AGGREGATE
 USE iceberg_ddl_cat_${suite_uuid0}.iceberg_pkfk_db_${uuid0};
-SET enable_eliminate_agg = false;
+SET SESSION enable_eliminate_agg = false;
 EXPLAIN
 SELECT COUNT(1) AS cnt, payment.id
 FROM payment
@@ -93,11 +93,11 @@ GROUP BY payment.id;
 -- query 5
 -- @result_not_contains=AGGREGATE
 USE iceberg_ddl_cat_${suite_uuid0}.iceberg_pkfk_db_${uuid0};
-SET enable_eliminate_agg = true;
+SET SESSION enable_eliminate_agg = true;
 EXPLAIN
 SELECT COUNT(1) AS cnt, payment.id
 FROM payment
 GROUP BY payment.id;
-DROP TABLE iceberg_ddl_cat_${suite_uuid0}.iceberg_pkfk_db_${uuid0}.txn FORCE;
-DROP TABLE iceberg_ddl_cat_${suite_uuid0}.iceberg_pkfk_db_${uuid0}.payment FORCE;
-DROP DATABASE iceberg_ddl_cat_${suite_uuid0}.iceberg_pkfk_db_${uuid0};
+DROP TABLE iceberg_ddl_cat_${suite_uuid0}.iceberg_pkfk_db_${uuid0}.txn ;
+DROP TABLE iceberg_ddl_cat_${suite_uuid0}.iceberg_pkfk_db_${uuid0}.payment ;
+DROP SCHEMA iceberg_ddl_cat_${suite_uuid0}.iceberg_pkfk_db_${uuid0};

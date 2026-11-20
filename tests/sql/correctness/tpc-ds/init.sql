@@ -17,45 +17,30 @@
 
 -- @catalog=iceberg_cat_${uuid0}
 -- @db=tpcds
-CREATE EXTERNAL CATALOG IF NOT EXISTS `iceberg_cat_${uuid0}`
-PROPERTIES (
-    "type"="iceberg",
-    "iceberg.catalog.type"="${iceberg_catalog_type}",
-    "iceberg.catalog.warehouse"="${dataset_iceberg_catalog_warehouse}",
-    "credential.object-store-metadata.consumer-role" = "frontend",
-    "credential.object-store-metadata.mode" = "${iceberg_object_store_credential_mode}",
-    "credential.object-store-metadata.name" = "${iceberg_object_store_metadata_credential_name}",
-    "credential.object-store-metadata.generation" = "${iceberg_object_store_credential_generation}",
-    "credential.object-store-data.consumer-role" = "backend",
-    "credential.object-store-data.mode" = "${iceberg_object_store_credential_mode}",
-    "credential.object-store-data.name" = "${iceberg_object_store_data_credential_name}",
-    "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
-    "aws.s3.endpoint"="${oss_endpoint}",
-    "aws.s3.enable_path_style_access"="${oss_path_style}"
-);
+CREATE CATALOG IF NOT EXISTS "iceberg_cat_${uuid0}" USING iceberg WITH ("iceberg.catalog.type" = '${iceberg_catalog_type}', "iceberg.catalog.warehouse" = '${dataset_iceberg_catalog_warehouse}', "credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-metadata.name" = '${iceberg_object_store_metadata_credential_name}', "credential.object-store-metadata.generation" = '${iceberg_object_store_credential_generation}', "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-data.name" = '${iceberg_object_store_data_credential_name}', "credential.object-store-data.generation" = '${iceberg_object_store_credential_generation}', "aws.s3.endpoint" = '${oss_endpoint}', "aws.s3.enable_path_style_access" = '${oss_path_style}');
 
-USE `iceberg_cat_${uuid0}`.`tpcds`;
-SELECT 1 FROM `call_center` LIMIT 1;
-SELECT 1 FROM `catalog_page` LIMIT 1;
-SELECT 1 FROM `catalog_returns` LIMIT 1;
-SELECT 1 FROM `catalog_sales` LIMIT 1;
-SELECT 1 FROM `customer` LIMIT 1;
-SELECT 1 FROM `customer_address` LIMIT 1;
-SELECT 1 FROM `customer_demographics` LIMIT 1;
-SELECT 1 FROM `date_dim` LIMIT 1;
-SELECT 1 FROM `household_demographics` LIMIT 1;
-SELECT 1 FROM `income_band` LIMIT 1;
-SELECT 1 FROM `inventory` LIMIT 1;
-SELECT 1 FROM `item` LIMIT 1;
-SELECT 1 FROM `promotion` LIMIT 1;
-SELECT 1 FROM `reason` LIMIT 1;
-SELECT 1 FROM `ship_mode` LIMIT 1;
-SELECT 1 FROM `store` LIMIT 1;
-SELECT 1 FROM `store_returns` LIMIT 1;
-SELECT 1 FROM `store_sales` LIMIT 1;
-SELECT 1 FROM `time_dim` LIMIT 1;
-SELECT 1 FROM `warehouse` LIMIT 1;
-SELECT 1 FROM `web_page` LIMIT 1;
-SELECT 1 FROM `web_returns` LIMIT 1;
-SELECT 1 FROM `web_sales` LIMIT 1;
-SELECT 1 FROM `web_site` LIMIT 1;
+USE "iceberg_cat_${uuid0}"."tpcds";
+SELECT 1 FROM "call_center" LIMIT 1;
+SELECT 1 FROM "catalog_page" LIMIT 1;
+SELECT 1 FROM "catalog_returns" LIMIT 1;
+SELECT 1 FROM "catalog_sales" LIMIT 1;
+SELECT 1 FROM "customer" LIMIT 1;
+SELECT 1 FROM "customer_address" LIMIT 1;
+SELECT 1 FROM "customer_demographics" LIMIT 1;
+SELECT 1 FROM "date_dim" LIMIT 1;
+SELECT 1 FROM "household_demographics" LIMIT 1;
+SELECT 1 FROM "income_band" LIMIT 1;
+SELECT 1 FROM "inventory" LIMIT 1;
+SELECT 1 FROM "item" LIMIT 1;
+SELECT 1 FROM "promotion" LIMIT 1;
+SELECT 1 FROM "reason" LIMIT 1;
+SELECT 1 FROM "ship_mode" LIMIT 1;
+SELECT 1 FROM "store" LIMIT 1;
+SELECT 1 FROM "store_returns" LIMIT 1;
+SELECT 1 FROM "store_sales" LIMIT 1;
+SELECT 1 FROM "time_dim" LIMIT 1;
+SELECT 1 FROM "warehouse" LIMIT 1;
+SELECT 1 FROM "web_page" LIMIT 1;
+SELECT 1 FROM "web_returns" LIMIT 1;
+SELECT 1 FROM "web_sales" LIMIT 1;
+SELECT 1 FROM "web_site" LIMIT 1;

@@ -41,9 +41,8 @@ DROP TABLE IF EXISTS ${case_db}.t1;
 -- query 4
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.__row_util_base (
-  k1 bigint NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+  k1 bigint
+) WITH (format_version = 3);
 
 -- query 5
 -- @skip_result_check=true
@@ -60,9 +59,8 @@ INSERT INTO ${case_db}.__row_util_base SELECT * FROM ${case_db}.__row_util_base;
 -- query 8
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.__row_util (
-  idx bigint NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+  idx bigint
+) WITH (format_version = 3);
 
 -- query 9
 -- @skip_result_check=true
@@ -71,19 +69,18 @@ INSERT INTO ${case_db}.__row_util SELECT row_number() over() as idx FROM ${case_
 -- query 10
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t1 (
-    k1 bigint NULL,
+    k1 bigint ,
     c_int int,
-    c_int_null int NULL,
+    c_int_null int ,
     c_bigint bigint,
-    c_bigint_null bigint NULL,
+    c_bigint_null bigint ,
     c_largeint bigint,
-    c_largeint_null bigint NULL,
+    c_largeint_null bigint ,
     c_double double,
-    c_double_null double NULL,
+    c_double_null double ,
     c_string STRING,
-    c_string_null STRING NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+    c_string_null STRING
+) WITH (format_version = 3);
 
 -- query 11
 -- @skip_result_check=true
@@ -281,22 +278,26 @@ FROM w1 t1 JOIN  w1 t2 on t1.c_bigint = t2.c_bigint where t2.c_int % 10 < 5;
 -- query 36
 -- left semi join on c_int
 SELECT count(t1.c_int), count(t1.c_bigint)
-FROM ${case_db}.t1 LEFT SEMI JOIN  ${case_db}.t1 t2 on t1.c_int = t2.c_int;
+FROM ${case_db}.t1
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 t2 WHERE t1.c_int = t2.c_int);
 
 -- query 37
 -- left semi join on c_bigint
 SELECT count(t1.c_int), count(t1.c_bigint)
-FROM ${case_db}.t1 LEFT SEMI JOIN  ${case_db}.t1 t2 on t1.c_bigint = t2.c_bigint;
+FROM ${case_db}.t1
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 t2 WHERE t1.c_bigint = t2.c_bigint);
 
 -- query 38
 -- left semi join on c_int_null
 SELECT count(t1.c_int), count(t1.c_bigint)
-FROM ${case_db}.t1 LEFT SEMI JOIN  ${case_db}.t1 t2 on t1.c_int_null = t2.c_int_null;
+FROM ${case_db}.t1
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 t2 WHERE t1.c_int_null = t2.c_int_null);
 
 -- query 39
 -- left semi join on c_bigint_null
 SELECT count(t1.c_int), count(t1.c_bigint)
-FROM ${case_db}.t1 LEFT SEMI JOIN  ${case_db}.t1 t2 on t1.c_bigint_null = t2.c_bigint_null;
+FROM ${case_db}.t1
+WHERE EXISTS (SELECT 1 FROM ${case_db}.t1 t2 WHERE t1.c_bigint_null = t2.c_bigint_null);
 
 -- query 40
 -- CTE left semi join on c_int
@@ -304,7 +305,8 @@ with w1 as (
     select * from ${case_db}.t1 union all select * from ${case_db}.t1
 )
 SELECT count(t1.c_int), count(t1.c_bigint)
-FROM w1 t1 LEFT SEMI JOIN  w1 t2 on t1.c_int = t2.c_int;
+FROM w1 t1
+WHERE EXISTS (SELECT 1 FROM w1 t2 WHERE t1.c_int = t2.c_int);
 
 -- query 41
 -- CTE left semi join on c_int (duplicate)
@@ -312,7 +314,8 @@ with w1 as (
     select * from ${case_db}.t1 union all select * from ${case_db}.t1
 )
 SELECT count(t1.c_int), count(t1.c_bigint)
-FROM w1 t1 LEFT SEMI JOIN  w1 t2 on t1.c_int = t2.c_int;
+FROM w1 t1
+WHERE EXISTS (SELECT 1 FROM w1 t2 WHERE t1.c_int = t2.c_int);
 
 -- query 42
 -- CTE left semi join on c_bigint
@@ -320,7 +323,8 @@ with w1 as (
     select * from ${case_db}.t1 union all select * from ${case_db}.t1
 )
 SELECT count(t1.c_int), count(t1.c_bigint)
-FROM w1 t1 LEFT SEMI JOIN  w1 t2 on t1.c_bigint = t2.c_bigint;
+FROM w1 t1
+WHERE EXISTS (SELECT 1 FROM w1 t2 WHERE t1.c_bigint = t2.c_bigint);
 
 -- query 43
 -- CTE left semi join on c_bigint (duplicate)
@@ -328,7 +332,8 @@ with w1 as (
     select * from ${case_db}.t1 union all select * from ${case_db}.t1
 )
 SELECT count(t1.c_int), count(t1.c_bigint)
-FROM w1 t1 LEFT SEMI JOIN  w1 t2 on t1.c_bigint = t2.c_bigint;
+FROM w1 t1
+WHERE EXISTS (SELECT 1 FROM w1 t2 WHERE t1.c_bigint = t2.c_bigint);
 
 -- ============================================================
 -- LEFT ANTI JOIN with broadcast hint
@@ -337,22 +342,26 @@ FROM w1 t1 LEFT SEMI JOIN  w1 t2 on t1.c_bigint = t2.c_bigint;
 -- query 44
 -- left anti join on c_int
 SELECT count(t1.c_int), count(t1.c_bigint)
-FROM ${case_db}.t1 LEFT ANTI JOIN  ${case_db}.t1 t2 on t1.c_int = t2.c_int;
+FROM ${case_db}.t1
+WHERE NOT EXISTS (SELECT 1 FROM ${case_db}.t1 t2 WHERE t1.c_int = t2.c_int);
 
 -- query 45
 -- left anti join on c_bigint
 SELECT count(t1.c_int), count(t1.c_bigint)
-FROM ${case_db}.t1 LEFT ANTI JOIN  ${case_db}.t1 t2 on t1.c_bigint = t2.c_bigint;
+FROM ${case_db}.t1
+WHERE NOT EXISTS (SELECT 1 FROM ${case_db}.t1 t2 WHERE t1.c_bigint = t2.c_bigint);
 
 -- query 46
 -- left anti join on c_int_null
 SELECT count(t1.c_int), count(t1.c_bigint)
-FROM ${case_db}.t1 LEFT ANTI JOIN  ${case_db}.t1 t2 on t1.c_int_null = t2.c_int_null;
+FROM ${case_db}.t1
+WHERE NOT EXISTS (SELECT 1 FROM ${case_db}.t1 t2 WHERE t1.c_int_null = t2.c_int_null);
 
 -- query 47
 -- left anti join on c_bigint_null
 SELECT count(t1.c_int), count(t1.c_bigint)
-FROM ${case_db}.t1 LEFT ANTI JOIN  ${case_db}.t1 t2 on t1.c_bigint_null = t2.c_bigint_null;
+FROM ${case_db}.t1
+WHERE NOT EXISTS (SELECT 1 FROM ${case_db}.t1 t2 WHERE t1.c_bigint_null = t2.c_bigint_null);
 
 -- query 48
 -- CTE left anti join on c_int
@@ -360,7 +369,8 @@ with w1 as (
     select * from ${case_db}.t1 union all select * from ${case_db}.t1
 )
 SELECT count(t1.c_int), count(t1.c_bigint)
-FROM w1 t1 LEFT ANTI JOIN  w1 t2 on t1.c_int = t2.c_int;
+FROM w1 t1
+WHERE NOT EXISTS (SELECT 1 FROM w1 t2 WHERE t1.c_int = t2.c_int);
 
 -- query 49
 -- CTE left anti join on c_int (duplicate)
@@ -368,7 +378,8 @@ with w1 as (
     select * from ${case_db}.t1 union all select * from ${case_db}.t1
 )
 SELECT count(t1.c_int), count(t1.c_bigint)
-FROM w1 t1 LEFT ANTI JOIN  w1 t2 on t1.c_int = t2.c_int;
+FROM w1 t1
+WHERE NOT EXISTS (SELECT 1 FROM w1 t2 WHERE t1.c_int = t2.c_int);
 
 -- query 50
 -- CTE left anti join on c_bigint
@@ -376,7 +387,8 @@ with w1 as (
     select * from ${case_db}.t1 union all select * from ${case_db}.t1
 )
 SELECT count(t1.c_int), count(t1.c_bigint)
-FROM w1 t1 LEFT ANTI JOIN  w1 t2 on t1.c_bigint = t2.c_bigint;
+FROM w1 t1
+WHERE NOT EXISTS (SELECT 1 FROM w1 t2 WHERE t1.c_bigint = t2.c_bigint);
 
 -- query 51
 -- CTE left anti join on c_bigint (duplicate)
@@ -384,7 +396,8 @@ with w1 as (
     select * from ${case_db}.t1 union all select * from ${case_db}.t1
 )
 SELECT count(t1.c_int), count(t1.c_bigint)
-FROM w1 t1 LEFT ANTI JOIN  w1 t2 on t1.c_bigint = t2.c_bigint;
+FROM w1 t1
+WHERE NOT EXISTS (SELECT 1 FROM w1 t2 WHERE t1.c_bigint = t2.c_bigint);
 
 -- ============================================================
 -- With optimization disabled: enable_hash_join_range_direct_mapping_opt = false
@@ -436,39 +449,47 @@ FROM ${case_db}.t1 LEFT JOIN  ${case_db}.t1 t2 on t1.c_bigint_null = t2.c_bigint
 -- query 61
 -- opt disabled: left anti join on c_int
 SELECT count(t1.c_int), count(t1.c_bigint)
-FROM ${case_db}.t1 LEFT ANTI JOIN  ${case_db}.t1 t2 on t1.c_int = t2.c_int;
+FROM ${case_db}.t1
+WHERE NOT EXISTS (SELECT 1 FROM ${case_db}.t1 t2 WHERE t1.c_int = t2.c_int);
 
 -- query 62
 -- opt disabled: left anti join on c_bigint
 SELECT count(t1.c_int), count(t1.c_bigint)
-FROM ${case_db}.t1 LEFT ANTI JOIN  ${case_db}.t1 t2 on t1.c_bigint = t2.c_bigint;
+FROM ${case_db}.t1
+WHERE NOT EXISTS (SELECT 1 FROM ${case_db}.t1 t2 WHERE t1.c_bigint = t2.c_bigint);
 
 -- query 63
 -- opt disabled: left anti join on c_int_null
 SELECT count(t1.c_int), count(t1.c_bigint)
-FROM ${case_db}.t1 LEFT ANTI JOIN  ${case_db}.t1 t2 on t1.c_int_null = t2.c_int_null;
+FROM ${case_db}.t1
+WHERE NOT EXISTS (SELECT 1 FROM ${case_db}.t1 t2 WHERE t1.c_int_null = t2.c_int_null);
 
 -- query 64
 -- opt disabled: left anti join on c_bigint_null
 SELECT count(t1.c_int), count(t1.c_bigint)
-FROM ${case_db}.t1 LEFT ANTI JOIN  ${case_db}.t1 t2 on t1.c_bigint_null = t2.c_bigint_null;
+FROM ${case_db}.t1
+WHERE NOT EXISTS (SELECT 1 FROM ${case_db}.t1 t2 WHERE t1.c_bigint_null = t2.c_bigint_null);
 
 -- query 65
 -- opt disabled: left anti join on c_int (duplicate)
 SELECT count(t1.c_int), count(t1.c_bigint)
-FROM ${case_db}.t1 LEFT ANTI JOIN  ${case_db}.t1 t2 on t1.c_int = t2.c_int;
+FROM ${case_db}.t1
+WHERE NOT EXISTS (SELECT 1 FROM ${case_db}.t1 t2 WHERE t1.c_int = t2.c_int);
 
 -- query 66
 -- opt disabled: left anti join on c_bigint (duplicate)
 SELECT count(t1.c_int), count(t1.c_bigint)
-FROM ${case_db}.t1 LEFT ANTI JOIN  ${case_db}.t1 t2 on t1.c_bigint = t2.c_bigint;
+FROM ${case_db}.t1
+WHERE NOT EXISTS (SELECT 1 FROM ${case_db}.t1 t2 WHERE t1.c_bigint = t2.c_bigint);
 
 -- query 67
 -- opt disabled: left anti join on c_int_null (duplicate)
 SELECT count(t1.c_int), count(t1.c_bigint)
-FROM ${case_db}.t1 LEFT ANTI JOIN  ${case_db}.t1 t2 on t1.c_int_null = t2.c_int_null;
+FROM ${case_db}.t1
+WHERE NOT EXISTS (SELECT 1 FROM ${case_db}.t1 t2 WHERE t1.c_int_null = t2.c_int_null);
 
 -- query 68
 -- opt disabled: left anti join on c_bigint_null (duplicate)
 SELECT count(t1.c_int), count(t1.c_bigint)
-FROM ${case_db}.t1 LEFT ANTI JOIN  ${case_db}.t1 t2 on t1.c_bigint_null = t2.c_bigint_null;
+FROM ${case_db}.t1
+WHERE NOT EXISTS (SELECT 1 FROM ${case_db}.t1 t2 WHERE t1.c_bigint_null = t2.c_bigint_null);

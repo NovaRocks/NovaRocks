@@ -28,16 +28,15 @@ CREATE TABLE ${case_db}.t_analytic_filter_topn_with_window (
     grp VARCHAR(10),
     id INT,
     score INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t_analytic_filter_topn_with_window VALUES
-    ('A', 1, 70),
-    ('A', 2, 90),
-    ('A', 3, 80),
-    ('B', 4, 60),
-    ('B', 5, 50),
-    ('B', 6, 40);
+    ROW('A', 1, 70),
+    ROW('A', 2, 90),
+    ROW('A', 3, 80),
+    ROW('B', 4, 60),
+    ROW('B', 5, 50),
+    ROW('B', 6, 40);
 
 SELECT grp, id, score, rn
 FROM (

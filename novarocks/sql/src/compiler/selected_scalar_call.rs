@@ -78,8 +78,14 @@ pub(crate) fn canonical_null_target(
 pub(crate) struct CarrierStep {
     target: FunctionValueType,
     decimal_overflow_policy: DecimalOverflowPolicy,
+    array_failure_mode: Option<novarocks_type_contract::ArrayCastFailureMode>,
 }
 impl CarrierStep {
+    pub(crate) fn array_failure_mode(
+        &self,
+    ) -> Option<novarocks_type_contract::ArrayCastFailureMode> {
+        self.array_failure_mode
+    }
     pub(crate) fn target(&self) -> &FunctionValueType {
         &self.target
     }
@@ -104,13 +110,34 @@ pub(crate) fn plan_conversion(
     source: &FunctionValueType,
     target: &FunctionValueType,
     policy: DecimalOverflowPolicy,
+    array_failure_mode: Option<novarocks_type_contract::ArrayCastFailureMode>,
     control: &dyn PureCompileControl,
 ) -> Result<PlannedConversion, FunctionBindingError> {
+    if let Some(mode) = array_failure_mode {
+        control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 0)?;
+        if !novarocks_type_contract::array_cast_mode_types_valid_observed(
+            source,
+            target,
+            mode,
+            || control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 1),
+        )? {
+            return Err(FunctionBindingError::InvalidBinding(
+                "invalid explicit array CAST boundary".into(),
+            ));
+        }
+        return Ok(PlannedConversion::Carrier(CarrierStep {
+            target: target.clone(),
+            decimal_overflow_policy: policy,
+            array_failure_mode,
+        }));
+    }
     if source == target {
         return Ok(PlannedConversion::Identity);
     }
     control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 0)?;
-    let intermediate = if novarocks_type_contract::is_default_json_structure_cast(source, target) {
+    let intermediate = if novarocks_type_contract::is_default_json_structure_cast(source, target)
+        || novarocks_type_contract::is_null_list_to_json_cast(source, target)
+    {
         None
     } else {
         novarocks_functions::builtin::value_conversion::conversion_intermediate_type(source, target)
@@ -120,6 +147,7 @@ pub(crate) fn plan_conversion(
     };
     control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 0)?;
     let step = || CarrierStep {
+        array_failure_mode: None,
         target: target.clone(),
         decimal_overflow_policy: policy,
     };

@@ -24,24 +24,23 @@
 -- One INSERT commits exactly one append snapshot. Both queries therefore return
 -- one, and neither exposes generated snapshot IDs or wall-clock timestamps.
 DROP TABLE IF EXISTS ${case_db}.rf_ordered_timestamp_zone;
-CREATE TABLE ${case_db}.rf_ordered_timestamp_zone (k INT)
-TBLPROPERTIES ("format-version" = "3");
-INSERT INTO ${case_db}.rf_ordered_timestamp_zone VALUES (1), (2);
+CREATE TABLE ${case_db}.rf_ordered_timestamp_zone (k INT) WITH (format_version = 3);
+INSERT INTO ${case_db}.rf_ordered_timestamp_zone VALUES ROW(1), ROW(2);
 
-SET disable_optimizer_rules = 'PushDownTopNToPreAgg';
-SET enable_global_runtime_filter = true;
+SET SESSION disable_optimizer_rules = 'PushDownTopNToPreAgg';
+SET SESSION enable_global_runtime_filter = true;
 -- @explain_contains=LOCAL TOP-N (limit=1, offset=0)
--- @explain_contains=HASH AGGREGATE (GLOBAL, group by: [committed_at])
+-- @explain_contains=HASH AGGREGATE (GLOBAL, group by: [rf_ordered_timestamp_zone$snapshots.committed_at])
 -- @explain_not_contains=domain = OrderedBound
 SELECT COUNT(*) AS snapshots_at_first_commit
-FROM ${case_db}.rf_ordered_timestamp_zone$snapshots
+FROM ${case_db}."rf_ordered_timestamp_zone$snapshots"
 GROUP BY committed_at ORDER BY committed_at LIMIT 1;
 
-SET enable_global_runtime_filter = false;
+SET SESSION enable_global_runtime_filter = false;
 SELECT COUNT(*) AS snapshots_at_first_commit
-FROM ${case_db}.rf_ordered_timestamp_zone$snapshots
+FROM ${case_db}."rf_ordered_timestamp_zone$snapshots"
 GROUP BY committed_at ORDER BY committed_at LIMIT 1;
 
-SET enable_global_runtime_filter = true;
-SET disable_optimizer_rules = '';
+SET SESSION enable_global_runtime_filter = true;
+SET SESSION disable_optimizer_rules = '';
 DROP TABLE ${case_db}.rf_ordered_timestamp_zone;

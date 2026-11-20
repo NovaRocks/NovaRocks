@@ -1730,7 +1730,7 @@ mod tests {
             ),
             volatility: crate::functions::builtin_function_volatility("coalesce"),
             name: "coalesce".to_string(),
-            args: coalesce_args,
+            args: (coalesce_args).into(),
             distinct: false,
         });
         let build = leaf(vec![out_col(2, "build_key")]);
@@ -2175,16 +2175,16 @@ mod tests {
             ),
             volatility: crate::functions::builtin_function_volatility("then_fn"),
             name: "then_fn".to_string(),
-            args: then_args,
+            args: (then_args).into(),
             distinct: false,
         });
         let args = vec![
             unset_col_ref("unset"),
             typed_expr(ExprKind::AggregateCall {
                 name: "sum".to_string(),
-                args: vec![col_ref(7, "agg_arg")],
+                args: (vec![col_ref(7, "agg_arg")]).into(),
                 distinct: false,
-                order_by: vec![sort_item(col_ref(3, "agg_order"))],
+                order_by: (vec![sort_item(col_ref(3, "agg_order"))]).into(),
                 resolved: crate::functions::test_resolved_aggregate(
                     "sum",
                     &[DataType::Int64],
@@ -2192,13 +2192,16 @@ mod tests {
                 ),
             }),
             typed_expr(ExprKind::Case {
-                operand: Some(Box::new(col_ref(6, "case_operand"))),
-                when_then: vec![(col_ref(5, "case_when"), then_expr)],
-                else_expr: Some(Box::new(col_ref(2, "case_else"))),
+                operand: Some(novarocks_parser::ast::AstBox::new(col_ref(
+                    6,
+                    "case_operand",
+                ))),
+                when_then: (vec![(col_ref(5, "case_when"), then_expr)]).into(),
+                else_expr: Some(novarocks_parser::ast::AstBox::new(col_ref(2, "case_else"))),
             }),
             typed_expr(ExprKind::WindowCall {
                 name: "row_number".to_string(),
-                args: vec![col_ref(9, "window_arg")],
+                args: (vec![col_ref(9, "window_arg")]).into(),
                 distinct: false,
                 binding: crate::analysis::test_window_binding(
                     "row_number",
@@ -2206,16 +2209,16 @@ mod tests {
                     DataType::Int64,
                     false,
                 ),
-                function_order_by: vec![],
+                function_order_by: (vec![]).into(),
                 aggregate_binding: None,
-                partition_by: vec![col_ref(8, "window_partition")],
-                order_by: vec![sort_item(col_ref(1, "window_order"))],
+                partition_by: (vec![col_ref(8, "window_partition")]).into(),
+                order_by: (vec![sort_item(col_ref(1, "window_order"))]).into(),
                 window_frame: None,
                 ignore_nulls: false,
             }),
             typed_expr(ExprKind::Lambda {
                 params: vec!["x".to_string()],
-                body: Box::new(col_ref(10, "lambda_body")),
+                body: novarocks_parser::ast::AstBox::new(col_ref(10, "lambda_body")),
             }),
         ];
         let expr = typed_expr(ExprKind::FunctionCall {
@@ -2227,7 +2230,7 @@ mod tests {
                 crate::functions::FunctionVolatility::Immutable,
             ),
             name: "outer_fn".to_string(),
-            args,
+            args: (args).into(),
             distinct: false,
             volatility: crate::functions::FunctionVolatility::Immutable,
         });
@@ -2326,9 +2329,9 @@ mod tests {
     fn binary_expr(left: TypedExpr, right: TypedExpr) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::BinaryOp {
-                left: Box::new(left),
+                left: novarocks_parser::ast::AstBox::new(left),
                 op: BinOp::Add,
-                right: Box::new(right),
+                right: novarocks_parser::ast::AstBox::new(right),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),

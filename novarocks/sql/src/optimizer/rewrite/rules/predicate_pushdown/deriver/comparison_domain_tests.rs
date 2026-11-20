@@ -39,6 +39,7 @@ fn cast(arena: &mut ScalarArena, child: ScalarId, target: DataType) -> ScalarId 
     intern(
         arena,
         ScalarNode::Cast {
+            array_failure_mode: None,
             child,
             target,
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
@@ -137,6 +138,7 @@ fn envelope_axes(
             ScalarNode::Literal(HashableLiteral(LiteralValue::Int(40)))
         ));
         let ScalarNode::Cast {
+            array_failure_mode: None,
             child: base,
             target: actual_target,
             decimal_overflow_policy,

@@ -34,55 +34,53 @@ DROP TABLE IF EXISTS ${case_db}.t_rf_rg_prune_build;
 CREATE TABLE ${case_db}.t_rf_rg_prune_probe (
     id INT,
     k INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 CREATE TABLE ${case_db}.t_rf_rg_prune_build (
     k INT,
     tag VARCHAR(20)
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- Probe-side keys confined to [0, 49].
 INSERT INTO ${case_db}.t_rf_rg_prune_probe VALUES
-    (1, 5),
-    (2, 15),
-    (3, 25),
-    (4, 35),
-    (5, 45),
-    (6, 49);
+    ROW(1, 5),
+    ROW(2, 15),
+    ROW(3, 25),
+    ROW(4, 35),
+    ROW(5, 45),
+    ROW(6, 49);
 
 -- Build side written as three separate data files with disjoint key ranges.
 INSERT INTO ${case_db}.t_rf_rg_prune_build VALUES
-    (5, 'file0_keep'),
-    (15, 'file0_keep'),
-    (25, 'file0_keep'),
-    (99, 'file0_drop');
+    ROW(5, 'file0_keep'),
+    ROW(15, 'file0_keep'),
+    ROW(25, 'file0_keep'),
+    ROW(99, 'file0_drop');
 
 INSERT INTO ${case_db}.t_rf_rg_prune_build VALUES
-    (100, 'file1_drop'),
-    (135, 'file1_drop'),
-    (35, 'file1_keep'),
-    (199, 'file1_drop');
+    ROW(100, 'file1_drop'),
+    ROW(135, 'file1_drop'),
+    ROW(35, 'file1_keep'),
+    ROW(199, 'file1_drop');
 
 INSERT INTO ${case_db}.t_rf_rg_prune_build VALUES
-    (200, 'file2_drop'),
-    (245, 'file2_drop'),
-    (45, 'file2_keep'),
-    (299, 'file2_drop');
+    ROW(200, 'file2_drop'),
+    ROW(245, 'file2_drop'),
+    ROW(45, 'file2_keep'),
+    ROW(299, 'file2_drop');
 
-SET global_runtime_filter_probe_min_selectivity = 0.0;
+SET SESSION global_runtime_filter_probe_min_selectivity = 0.0;
 
-SET disable_optimizer_rules = 'RuntimeFilterPushDown';
+SET SESSION disable_optimizer_rules = 'RuntimeFilterPushDown';
 SELECT p.id, p.k, b.tag
 FROM ${case_db}.t_rf_rg_prune_probe p
 JOIN ${case_db}.t_rf_rg_prune_build b ON p.k = b.k
 ORDER BY p.id;
 
-SET disable_optimizer_rules = '';
+SET SESSION disable_optimizer_rules = '';
 SELECT p.id, p.k, b.tag
 FROM ${case_db}.t_rf_rg_prune_probe p
 JOIN ${case_db}.t_rf_rg_prune_build b ON p.k = b.k
 ORDER BY p.id;
 
-SET disable_optimizer_rules = '';
+SET SESSION disable_optimizer_rules = '';

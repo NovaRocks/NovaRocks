@@ -67,16 +67,16 @@ select  s_store_name
         '27385','61860','58048','56910','16807','17871','35258','31387','35458','35576')
      intersect
       select ca_zip
-      from (SELECT substr(ca_zip,1,5) ca_zip,count(*) cnt
+      from (SELECT substr(ca_zip,1,5) ca_zip,count() cnt
             FROM customer_address, customer
             WHERE ca_address_sk = c_current_addr_sk and
                   c_preferred_cust_flag='Y'
             group by ca_zip
-            having count(*) > 10)A1)A2) V1
+            having count() > 10)A1)A2) V1
  where ss_store_sk = s_store_sk
   and ss_sold_date_sk = d_date_sk
   and d_qoy = 2 and d_year = 1998
-  and (substr(s_zip,1,2) = substr(V1.ca_zip,1,2))
+  and substr(s_zip,1,2) = substr(V1.ca_zip,1,2)
  group by s_store_name
  order by s_store_name
  limit 100;

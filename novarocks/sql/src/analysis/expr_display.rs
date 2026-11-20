@@ -113,6 +113,7 @@ fn checked_constant(
     Ok(())
 }
 
+#[recursive::recursive]
 fn expression(
     expr: &TypedExpr,
     array_item: bool,
@@ -231,6 +232,7 @@ fn expression(
         ExprKind::Cast {
             expr: inner,
             target,
+            array_failure_mode: None,
             ..
         } if matches!(target, arrow::datatypes::DataType::List(_))
             && matches!(&inner.kind, ExprKind::FunctionCall { name, .. } if name == "__array_literal") =>
@@ -240,9 +242,18 @@ fn expression(
         ExprKind::Cast {
             expr: inner,
             target,
+            array_failure_mode,
             ..
         } => {
-            out.append("cast(")?;
+            out.append(
+                if *array_failure_mode
+                    == Some(novarocks_type_contract::ArrayCastFailureMode::OutputNull)
+                {
+                    "try_cast("
+                } else {
+                    "cast("
+                },
+            )?;
             expression(inner, false, out)?;
             out.append(" as ")?;
             // Arrow's type formatter remains opaque. It contains no value pool;
@@ -718,7 +729,7 @@ mod tests {
                 ),
                 volatility: crate::functions::builtin_function_volatility("__struct_subfield"),
                 name: "__struct_subfield".to_string(),
-                args,
+                args: (args).into(),
                 distinct: false,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
@@ -740,7 +751,7 @@ mod tests {
                 ),
                 volatility: crate::functions::builtin_function_volatility("__array_element_at"),
                 name: "__array_element_at".to_string(),
-                args,
+                args: (args).into(),
                 distinct: false,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
@@ -752,11 +763,11 @@ mod tests {
     fn typed_expr_display_name_formats_is_not_null_with_inner_parens() {
         let expr = TypedExpr {
             kind: ExprKind::IsNull {
-                expr: Box::new(TypedExpr {
+                expr: novarocks_parser::ast::AstBox::new(TypedExpr {
                     kind: ExprKind::BinaryOp {
-                        left: Box::new(col("v4")),
+                        left: novarocks_parser::ast::AstBox::new(col("v4")),
                         op: BinOp::Add,
-                        right: Box::new(col("v4")),
+                        right: novarocks_parser::ast::AstBox::new(col("v4")),
                         decimal_overflow_policy:
                             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     },
@@ -786,7 +797,7 @@ mod tests {
                 ),
                 volatility: crate::functions::builtin_function_volatility("__struct_subfield"),
                 name: "__struct_subfield".to_string(),
-                args,
+                args: (args).into(),
                 distinct: false,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),

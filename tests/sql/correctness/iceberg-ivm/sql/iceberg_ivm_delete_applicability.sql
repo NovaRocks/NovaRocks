@@ -28,24 +28,7 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE EXTERNAL CATALOG ice_4g_ivm_${uuid0}
-PROPERTIES (
-  "type" = "iceberg",
-  "iceberg.catalog.type" = "rest",
-  "uri" = "${iceberg_rest_uri}",
-  "warehouse" = "${iceberg_rest_warehouse}",
-  "aws.s3.endpoint" = "${oss_endpoint}",
-  "credential.object-store-metadata.consumer-role" = "frontend",
-  "credential.object-store-metadata.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-metadata.name" = "${iceberg_object_store_metadata_credential_name}",
-  "credential.object-store-metadata.generation" = "${iceberg_object_store_credential_generation}",
-  "credential.object-store-data.consumer-role" = "backend",
-  "credential.object-store-data.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-data.name" = "${iceberg_object_store_data_credential_name}",
-  "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
-  "aws.s3.region" = "${oss_region}",
-  "aws.s3.enable_path_style_access" = "${oss_path_style}"
-);
+CREATE CATALOG ice_4g_ivm_${uuid0} USING iceberg WITH ("iceberg.catalog.type" = 'rest', "uri" = '${iceberg_rest_uri}', "warehouse" = '${iceberg_rest_warehouse}', "aws.s3.endpoint" = '${oss_endpoint}', "credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-metadata.name" = '${iceberg_object_store_metadata_credential_name}', "credential.object-store-metadata.generation" = '${iceberg_object_store_credential_generation}', "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-data.name" = '${iceberg_object_store_data_credential_name}', "credential.object-store-data.generation" = '${iceberg_object_store_credential_generation}', "aws.s3.region" = '${oss_region}', "aws.s3.enable_path_style_access" = '${oss_path_style}');
 
 -- query 2
 -- @skip_result_check=true
@@ -80,17 +63,13 @@ printf 'UEA4G_IVM_STAGE_0_OK\n'
 -- query 3
 -- @skip_result_check=true
 USE ice_4g_ivm_${uuid0}.uea4g_ivm_${uuid0};
-SET enable_materialized_view_rewrite = false;
-CREATE MATERIALIZED VIEW incremental_${uuid0}
-DISTRIBUTED BY HASH(id) BUCKETS 3
-PROPERTIES ('storage_engine' = 'iceberg')
-AS SELECT id, p, value FROM base;
-CREATE MATERIALIZED VIEW full_${uuid0}
-DISTRIBUTED BY HASH(id) BUCKETS 3
-PROPERTIES ('storage_engine' = 'iceberg')
-AS SELECT id, p, value FROM base;
+SET SESSION enable_materialized_view_rewrite = false;
+CREATE MATERIALIZED VIEW incremental_${uuid0} AS SELECT id, p, value FROM base;
+CREATE MATERIALIZED VIEW full_${uuid0} AS SELECT id, p, value FROM base;
 REFRESH MATERIALIZED VIEW incremental_${uuid0};
-REFRESH MATERIALIZED VIEW full_${uuid0} FULL;
+SET SESSION "ice_4g_ivm_${uuid0}".incremental_refresh_enabled = false;
+REFRESH MATERIALIZED VIEW full_${uuid0};
+RESET SESSION "ice_4g_ivm_${uuid0}".incremental_refresh_enabled;
 
 -- query 4
 SELECT 'base' AS source, id, p, value FROM base
@@ -151,12 +130,18 @@ printf 'UEA4G_IVM_STAGE_1_OK\n'
 -- query 6
 -- @skip_result_check=true
 -- @result_contains=source: IcebergDeltaTable
-EXPLAIN VERBOSE REFRESH MATERIALIZED VIEW incremental_${uuid0};
+SET SESSION explain_detail = 'VERBOSE'
+;
+EXPLAIN  REFRESH MATERIALIZED VIEW incremental_${uuid0}
+;
+RESET SESSION explain_detail;
 
 -- query 7
 -- @skip_result_check=true
 REFRESH MATERIALIZED VIEW incremental_${uuid0};
-REFRESH MATERIALIZED VIEW full_${uuid0} FULL;
+SET SESSION "ice_4g_ivm_${uuid0}".incremental_refresh_enabled = false;
+REFRESH MATERIALIZED VIEW full_${uuid0};
+RESET SESSION "ice_4g_ivm_${uuid0}".incremental_refresh_enabled;
 
 -- query 8
 SELECT 'base' AS source, id, p, value FROM base
@@ -206,12 +191,18 @@ printf 'UEA4G_IVM_STAGE_2_OK\n'
 -- query 10
 -- @skip_result_check=true
 -- @result_contains=source: IcebergDeltaTable
-EXPLAIN VERBOSE REFRESH MATERIALIZED VIEW incremental_${uuid0};
+SET SESSION explain_detail = 'VERBOSE'
+;
+EXPLAIN  REFRESH MATERIALIZED VIEW incremental_${uuid0}
+;
+RESET SESSION explain_detail;
 
 -- query 11
 -- @skip_result_check=true
 REFRESH MATERIALIZED VIEW incremental_${uuid0};
-REFRESH MATERIALIZED VIEW full_${uuid0} FULL;
+SET SESSION "ice_4g_ivm_${uuid0}".incremental_refresh_enabled = false;
+REFRESH MATERIALIZED VIEW full_${uuid0};
+RESET SESSION "ice_4g_ivm_${uuid0}".incremental_refresh_enabled;
 
 -- query 12
 SELECT 'base' AS source, id, p, value FROM base
@@ -256,12 +247,18 @@ printf 'UEA4G_IVM_STAGE_3_OK\n'
 -- query 14
 -- @skip_result_check=true
 -- @result_contains=source: IcebergDeltaTable
-EXPLAIN VERBOSE REFRESH MATERIALIZED VIEW incremental_${uuid0};
+SET SESSION explain_detail = 'VERBOSE'
+;
+EXPLAIN  REFRESH MATERIALIZED VIEW incremental_${uuid0}
+;
+RESET SESSION explain_detail;
 
 -- query 15
 -- @skip_result_check=true
 REFRESH MATERIALIZED VIEW incremental_${uuid0};
-REFRESH MATERIALIZED VIEW full_${uuid0} FULL;
+SET SESSION "ice_4g_ivm_${uuid0}".incremental_refresh_enabled = false;
+REFRESH MATERIALIZED VIEW full_${uuid0};
+RESET SESSION "ice_4g_ivm_${uuid0}".incremental_refresh_enabled;
 
 -- query 16
 SELECT 'base' AS source, id, p, value FROM base
@@ -306,12 +303,18 @@ printf 'UEA4G_IVM_STAGE_4_OK\n'
 -- query 18
 -- @skip_result_check=true
 -- @result_contains=source: IcebergDeltaTable
-EXPLAIN VERBOSE REFRESH MATERIALIZED VIEW incremental_${uuid0};
+SET SESSION explain_detail = 'VERBOSE'
+;
+EXPLAIN  REFRESH MATERIALIZED VIEW incremental_${uuid0}
+;
+RESET SESSION explain_detail;
 
 -- query 19
 -- @skip_result_check=true
 REFRESH MATERIALIZED VIEW incremental_${uuid0};
-REFRESH MATERIALIZED VIEW full_${uuid0} FULL;
+SET SESSION "ice_4g_ivm_${uuid0}".incremental_refresh_enabled = false;
+REFRESH MATERIALIZED VIEW full_${uuid0};
+RESET SESSION "ice_4g_ivm_${uuid0}".incremental_refresh_enabled;
 
 -- query 20
 SELECT 'base' AS source, id, p, value FROM base
@@ -324,6 +327,6 @@ ORDER BY source, id, p, value;
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW IF EXISTS uea4g_ivm_${uuid0}.incremental_${uuid0};
 DROP MATERIALIZED VIEW IF EXISTS uea4g_ivm_${uuid0}.full_${uuid0};
-DROP TABLE IF EXISTS ice_4g_ivm_${uuid0}.uea4g_ivm_${uuid0}.base FORCE;
-DROP DATABASE IF EXISTS ice_4g_ivm_${uuid0}.uea4g_ivm_${uuid0};
+DROP TABLE IF EXISTS ice_4g_ivm_${uuid0}.uea4g_ivm_${uuid0}.base ;
+DROP SCHEMA IF EXISTS ice_4g_ivm_${uuid0}.uea4g_ivm_${uuid0};
 DROP CATALOG IF EXISTS ice_4g_ivm_${uuid0};

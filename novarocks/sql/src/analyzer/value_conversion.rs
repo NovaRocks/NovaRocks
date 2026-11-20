@@ -29,6 +29,48 @@ use crate::analysis::{ExprKind, LiteralValue, TypedExpr, function_argument};
 use crate::analyze_error::AnalyzeError;
 
 impl super::AnalyzerContext<'_> {
+    /// An explicit array conversion retains the independently analyzed source and
+    /// complete declared target, even for identity and NULL inputs. Preparation
+    /// remains the capability author; this validates only the boundary facts.
+    pub(super) fn cast_explicit_array_to_value_type(
+        &self,
+        source: TypedExpr,
+        target: FunctionValueType,
+        mode: novarocks_type_contract::ArrayCastFailureMode,
+        span: Span,
+    ) -> Result<TypedExpr, AnalyzeError> {
+        super::helpers::validate_value_type(&source.value_type, self.control)?;
+        super::helpers::validate_value_type(&target, self.control)?;
+        self.control
+            .checkpoint(novarocks_type_contract::CompilePhase::Validate, 0)
+            .map_err(AnalyzeError::control)?;
+        if !novarocks_type_contract::array_cast_mode_types_valid_observed(
+            &source.value_type,
+            &target,
+            mode,
+            || {
+                self.control
+                    .checkpoint(novarocks_type_contract::CompilePhase::Validate, 1)
+            },
+        )
+        .map_err(AnalyzeError::control)?
+        {
+            return Err(AnalyzeError::unsupported_expression(
+                "invalid explicit array CAST boundary",
+                span,
+            ));
+        }
+        Ok(TypedExpr {
+            kind: ExprKind::Cast {
+                expr: novarocks_parser::ast::AstBox::new(source),
+                target: target.data_type().clone(),
+                decimal_overflow_policy: self.sql_semantics.sql_mode().decimal_overflow_policy(),
+                array_failure_mode: Some(mode),
+            },
+            value_type: target,
+        })
+    }
+
     /// Preserve ordinary carrier CASTs, but select the exact conversion owner
     /// whenever the root or a nested logical identity changes. Literal NULL
     /// alone can use the existing typed-NULL declaration without evaluation.
@@ -91,13 +133,15 @@ pub(super) fn cast_to_value_type(
         .map_err(AnalyzeError::control)?;
     if carrier_cast
         || novarocks_type_contract::is_default_json_structure_cast(&source.value_type, &target)
+        || novarocks_type_contract::is_null_list_to_json_cast(&source.value_type, &target)
     {
         // This exact existing intrinsic consumes the complete target,
         // including JSON children; it is not a same-shape domain bridge.
         return Ok(TypedExpr {
             kind: ExprKind::Cast {
+                array_failure_mode: None,
                 target: target.data_type().clone(),
-                expr: Box::new(source),
+                expr: novarocks_parser::ast::AstBox::new(source),
                 decimal_overflow_policy: sql_semantics.sql_mode().decimal_overflow_policy(),
             },
             value_type: target,
@@ -121,6 +165,61 @@ pub(super) fn cast_to_value_type(
         .checkpoint(novarocks_type_contract::CompilePhase::Validate, 0)
         .map_err(AnalyzeError::control)?;
     Ok(result)
+}
+
+/// Materialize one ordinary ordered child coercion using its real ARRAY
+/// common target. Preserve the original expression and CV; no literal retyping
+/// or scalar CAST(None) policy participates in this conversion.
+pub(super) fn coerce_array_common_argument(
+    catalog: &dyn crate::compiler::SqlFunctionCatalog,
+    source: TypedExpr,
+    target: &FunctionValueType,
+    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+    constant_policy: novarocks_functions::ConstantPolicy,
+    control: &dyn PureCompileControl,
+) -> Result<TypedExpr, AnalyzeError> {
+    control
+        .checkpoint(novarocks_type_contract::CompilePhase::Validate, 0)
+        .map_err(AnalyzeError::control)?;
+    if source
+        .value_type
+        .exactly_equals_checked_observed(target, || {
+            control
+                .checkpoint(novarocks_type_contract::CompilePhase::Validate, 1)
+                .map_err(AnalyzeError::control)
+        })?
+    {
+        return Ok(source);
+    }
+    let argument = function_argument(&source, constant_policy, control)
+        .map_err(AnalyzeError::function_binding)?;
+    let bound = catalog
+        .resolve_array_common_coercion_binding(&argument, target, control)
+        .map_err(AnalyzeError::function_binding)?;
+    if bound.function_id.as_str()
+        != novarocks_functions::builtin::value_conversion::VALUE_CONVERSION_FUNCTION_ID
+        || bound.selected.overload.as_str()
+            != novarocks_functions::builtin::value_conversion::ARRAY_COMMON_COERCION
+        || !matches!(&bound.selected.result_type, novarocks_functions::FunctionResultType::Scalar(actual) if actual == target)
+    {
+        return Err(AnalyzeError::internal(
+            "ARRAY common conversion lost its exact selected owner or target",
+        ));
+    }
+    Ok(TypedExpr {
+        value_type: target.clone(),
+        kind: ExprKind::FunctionCall {
+            name: novarocks_functions::builtin::value_conversion::VALUE_CONVERSION_NAME.to_string(),
+            volatility: bound.semantics.volatility,
+            binding: crate::binding::SqlFunctionBinding::new_with_array_common_constraint(
+                bound,
+                decimal_overflow_policy,
+                target.clone(),
+            ),
+            args: (vec![source]).into(),
+            distinct: false,
+        },
+    })
 }
 
 /// A narrow existing binder adapter: the caller owns request observation and
@@ -193,7 +292,7 @@ pub(super) fn convert_value_domain_with_catalog(
                 intermediate,
                 target.clone(),
             ),
-            args: vec![source],
+            args: (vec![source]).into(),
             distinct: false,
         },
     };
@@ -209,7 +308,8 @@ pub(super) fn convert_value_domain_with_catalog(
     } else {
         Ok(TypedExpr {
             kind: ExprKind::Cast {
-                expr: Box::new(converted),
+                array_failure_mode: None,
+                expr: novarocks_parser::ast::AstBox::new(converted),
                 target: target.data_type().clone(),
                 decimal_overflow_policy,
             },

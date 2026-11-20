@@ -31,15 +31,14 @@
 -- query 1
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.lineitem (
-  `l_orderkey` int(11) NOT NULL,
-  `l_partkey` int(11) NOT NULL,
-  `l_suppkey` int(11)
-)
-TBLPROPERTIES ("format-version" = "3");
+  "l_orderkey" int(11) NOT NULL,
+  "l_partkey" int(11) NOT NULL,
+  "l_suppkey" int(11)
+) WITH (format_version = 3);
 
 -- query 2
 -- @skip_result_check=true
-insert into ${case_db}.lineitem values (1,1,1),(1,2,1),(1,3,2),(11,1,11),(11,2,1),(2,3,2),(2,3,null);
+insert into ${case_db}.lineitem values ROW(1,1,1),ROW(1,2,1),ROW(1,3,2),ROW(11,1,11),ROW(11,2,1),ROW(2,3,2),ROW(2,3,null);
 
 -- NOT IN with correlated = predicate on non-nullable table
 -- query 3
@@ -54,15 +53,14 @@ select * from ${case_db}.lineitem l1 where l1.l_orderkey not in ( select l3.l_or
 -- query 5
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.lineitem_nullable (
-  `l_orderkey` int(11),
-  `l_partkey` int(11),
-  `l_suppkey` int(11)
-)
-TBLPROPERTIES ("format-version" = "3");
+  "l_orderkey" int(11),
+  "l_partkey" int(11),
+  "l_suppkey" int(11)
+) WITH (format_version = 3);
 
 -- query 6
 -- @skip_result_check=true
-insert into ${case_db}.lineitem_nullable values (1,1,1),(1,2,1),(1,3,2),(11,1,11),(11,2,1),(2,3,2),(2,3,null),(null,null,null);
+insert into ${case_db}.lineitem_nullable values ROW(1,1,1),ROW(1,2,1),ROW(1,3,2),ROW(11,1,11),ROW(11,2,1),ROW(2,3,2),ROW(2,3,null),ROW(null,null,null);
 
 -- NOT IN uncorrelated on nullable table (should return empty)
 -- query 7
@@ -91,7 +89,7 @@ select * from ${case_db}.lineitem_nullable l1 where not exists ( select 1 from $
 
 -- query 12
 -- @skip_result_check=true
-set pipeline_dop = 1;
+SET SESSION pipeline_dop = 1;
 
 -- multi-column NOT IN with large generated dataset (int pair)
 -- query 13
@@ -99,16 +97,15 @@ select count(*) from (SELECT * from (SELECT if (generate_series <= 1000, null, g
 
 -- multi-column NOT IN with large generated dataset (int + string pair)
 -- query 14
-select count(*) from (SELECT * from (SELECT if (generate_series <= 1000, null, generate_series) x0 FROM TABLE(generate_series(1, 8192))) t where (x0, concat("l", x0)) not in ( select l3.l_orderkey, concat("l", l_orderkey) from ${case_db}.lineitem l3 ) order by 1) t;
+select count(*) from (SELECT * from (SELECT if (generate_series <= 1000, null, generate_series) x0 FROM TABLE(generate_series(1, 8192))) t where (x0, concat('l', x0)) not in ( select l3.l_orderkey, concat('l', l_orderkey) from ${case_db}.lineitem l3 ) order by 1) t;
 
 -- query 15
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.aware3 (
-  `k1` int(11),
-  `k2` int(11),
-  `k3` int(11)
-)
-TBLPROPERTIES ("format-version" = "3");
+  "k1" int(11),
+  "k2" int(11),
+  "k3" int(11)
+) WITH (format_version = 3);
 
 -- query 16
 -- @skip_result_check=true
@@ -117,15 +114,14 @@ insert into ${case_db}.aware3 SELECT generate_series, if(generate_series<4095, 1
 -- query 17
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.build1 (
-  `k1` int(11),
-  `k2` int(11),
-  `k3` int(11)
-)
-TBLPROPERTIES ("format-version" = "3");
+  "k1" int(11),
+  "k2" int(11),
+  "k3" int(11)
+) WITH (format_version = 3);
 
 -- query 18
 -- @skip_result_check=true
-insert into ${case_db}.build1 values (1,1,1),(1,1,1),(1,1,1),(1,1,1),(1,1,1),(1,1,1),(1,1,1),(2,2,2),(3,3,3),(4,4,4);
+insert into ${case_db}.build1 values ROW(1,1,1),ROW(1,1,1),ROW(1,1,1),ROW(1,1,1),ROW(1,1,1),ROW(1,1,1),ROW(1,1,1),ROW(2,2,2),ROW(3,3,3),ROW(4,4,4);
 
 -- NOT IN with correlated coalesce predicate
 -- query 19
@@ -154,15 +150,14 @@ select count(*) from ${case_db}.aware3 l where 1000 not in (select k2 from ${cas
 -- query 25
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.build2 (
-  `k1` int(11),
-  `k2` int(11),
-  `k3` int(11)
-)
-TBLPROPERTIES ("format-version" = "3");
+  "k1" int(11),
+  "k2" int(11),
+  "k3" int(11)
+) WITH (format_version = 3);
 
 -- query 26
 -- @skip_result_check=true
-insert into ${case_db}.build2 values (1,1,1),(NULL,NULL,NULL);
+insert into ${case_db}.build2 values ROW(1,1,1),ROW(NULL,NULL,NULL);
 
 -- constant 1 NOT IN build with NULL row
 -- query 27

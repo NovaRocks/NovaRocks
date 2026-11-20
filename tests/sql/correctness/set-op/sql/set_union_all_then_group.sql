@@ -26,7 +26,7 @@
 -- 3. Assert ordered grouped result.
 SELECT
     x,
-    COUNT(*) AS c
+    COUNT() AS c
 FROM (
     SELECT CAST(1 AS BIGINT) AS x
     UNION ALL

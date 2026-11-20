@@ -34,31 +34,22 @@
 
 -- query 1
 -- @skip_result_check=true
-DROP TABLE IF EXISTS ${case_db}.t_v3_merge_matched_delete_insert FORCE;
-DROP TABLE IF EXISTS ${case_db}.s_v3_merge_matched_delete_insert FORCE;
+DROP TABLE IF EXISTS ${case_db}.t_v3_merge_matched_delete_insert ;
+DROP TABLE IF EXISTS ${case_db}.s_v3_merge_matched_delete_insert ;
 CREATE TABLE ${case_db}.t_v3_merge_matched_delete_insert (
   id BIGINT,
   v STRING
-)
-TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true",
-  "novarocks.update.mode" = "merge-on-read"
-);
+) WITH (format_version = 3, extra_properties = MAP(ARRAY['novarocks.update.mode'], ARRAY['merge-on-read']));
 INSERT INTO ${case_db}.t_v3_merge_matched_delete_insert VALUES
-  (1, 'a'),
-  (2, 'b');
+  ROW(1, 'a'),
+  ROW(2, 'b');
 CREATE TABLE ${case_db}.s_v3_merge_matched_delete_insert (
   id BIGINT,
   v STRING
-)
-TBLPROPERTIES (
-  "format-version" = "3",
-  "write.row-lineage" = "true"
-);
+) WITH (format_version = 3);
 INSERT INTO ${case_db}.s_v3_merge_matched_delete_insert VALUES
-  (2, 'b'),
-  (3, 'c');
+  ROW(2, 'b'),
+  ROW(3, 'c');
 
 -- query 2
 SELECT id, v
@@ -68,7 +59,7 @@ ORDER BY id;
 -- query 3
 -- Atomicity proof: capture the snapshot count immediately before the MERGE.
 SELECT count(*) AS snaps_before
-FROM ${case_db}.t_v3_merge_matched_delete_insert$snapshots;
+FROM ${case_db}."t_v3_merge_matched_delete_insert$snapshots";
 
 -- query 4
 -- @skip_result_check=true
@@ -82,7 +73,7 @@ WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v);
 -- Atomicity proof: the matched-DELETE (DV) and NOT-MATCHED INSERT fold into a
 -- single RowDeltaDvFromFiles snapshot, so snaps_after - snaps_before MUST be 1.
 SELECT count(*) AS snaps_after
-FROM ${case_db}.t_v3_merge_matched_delete_insert$snapshots;
+FROM ${case_db}."t_v3_merge_matched_delete_insert$snapshots";
 
 -- query 6
 -- Row content: id=2 removed via its deletion vector, id=3 appended, id=1 kept.
@@ -97,5 +88,5 @@ FROM ${case_db}.t_v3_merge_matched_delete_insert;
 
 -- query 8
 -- @skip_result_check=true
-DROP TABLE ${case_db}.t_v3_merge_matched_delete_insert FORCE;
-DROP TABLE ${case_db}.s_v3_merge_matched_delete_insert FORCE;
+DROP TABLE ${case_db}.t_v3_merge_matched_delete_insert ;
+DROP TABLE ${case_db}.s_v3_merge_matched_delete_insert ;

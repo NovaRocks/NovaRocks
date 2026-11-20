@@ -239,9 +239,7 @@ fn like_actual_compiler_notlike_truthonly_original_required_prefix() {
 }
 
 #[test]
-fn like_actual_compiler_explicit_escape_keeps_original_ignored_escape_author() {
-    // Analyzer currently drops AST.escape; the original core still uses its
-    // backslash author. This is a recorded bug witness, not a correction.
+fn like_actual_compiler_explicit_escape_matches_literal_percent() {
     let input: ArrayRef = Arc::new(StringArray::from(vec![
         Some("a!x"),
         Some("a%"),
@@ -252,7 +250,24 @@ fn like_actual_compiler_explicit_escape_keeps_original_ignored_escape_author() {
         "SELECT name LIKE 'a!%' ESCAPE '!' FROM t_filter_in_between_like",
         Field::new("name", DataType::Utf8, true),
         input,
-        vec![Some(true), Some(false), None, Some(true)],
+        vec![Some(false), Some(true), None, Some(false)],
+        false,
+    );
+}
+
+#[test]
+fn like_actual_compiler_unescaped_backslash_is_literal() {
+    let input: ArrayRef = Arc::new(StringArray::from(vec![
+        Some("a_b"),
+        Some(r"a\xb"),
+        None,
+        Some(r"a\_b"),
+    ]));
+    evaluate(
+        r"SELECT name LIKE 'a\_b' FROM t_filter_in_between_like",
+        Field::new("name", DataType::Utf8, true),
+        input,
+        vec![Some(false), Some(true), None, Some(true)],
         false,
     );
 }

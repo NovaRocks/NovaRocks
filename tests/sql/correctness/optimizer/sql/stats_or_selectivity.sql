@@ -23,11 +23,11 @@ CREATE TABLE ${case_db}.oq12_stats_or (a INT, b INT);
 INSERT INTO ${case_db}.oq12_stats_or
     SELECT generate_series % 100, generate_series
     FROM TABLE(generate_series(1, 1000));
-ANALYZE TABLE ${case_db}.oq12_stats_or;
+ANALYZE ${case_db}.oq12_stats_or;
 
 -- @explain_contains=oq12_stats_or
 -- @explain_contains=OR
 -- @explain_not_contains=stats={rows=1}
-EXPLAIN VERBOSE SELECT b
+EXPLAIN WITH SESSION explain_detail = 'VERBOSE'  SELECT b
 FROM ${case_db}.oq12_stats_or
 WHERE a = 1 OR a = 2;

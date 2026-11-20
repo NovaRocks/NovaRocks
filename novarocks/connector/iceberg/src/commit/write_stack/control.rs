@@ -95,6 +95,8 @@ use crate::write_descriptor::decode_partition_descriptor;
 /// after an unknown outcome. Without a durable marker, reconciliation could
 /// only guess, and a guess would either double-commit or strand data.
 pub const ICEBERG_WRITE_SESSION_MARKER_PROPERTY: &str = "novarocks.write.session.v1";
+pub(crate) const MANAGED_REPARTITION_EFFECT_SUMMARY_KEY: &str =
+    "novarocks.write.managed-repartition-effect.v1";
 
 /// The evidence schema version this control produces and accepts.
 pub const ICEBERG_WRITE_SESSION_EVIDENCE_VERSION: u16 = 5;
@@ -1536,49 +1538,88 @@ impl IcebergWriteSessionControl {
                 Ok(metadata),
             ));
         }
-        let expected = handle.session_id().to_string();
-        let mut matched = None;
-        for snapshot in metadata.snapshots() {
-            let marker = snapshot
-                .summary()
-                .additional_properties
-                .get(ICEBERG_WRITE_SESSION_MARKER_PROPERTY);
-            if marker.is_some_and(|value| *value == expected)
-                && matched
-                    .replace((snapshot.snapshot_id(), marker.unwrap().clone()))
-                    .is_some()
-            {
-                return Err(corrupt(
-                    "Iceberg write session marker matches multiple snapshots",
-                ));
-            }
-        }
-        let Some((snapshot_id, marker_value)) = matched else {
-            return Ok(journal.catalog_entry_outcome(entry));
-        };
-        if decoded.document_record_digest.is_some() {
-            let records = handle
-                .document_records()?
-                .ok_or_else(|| corrupt("keyed publication evidence lost its exact record bytes"))?;
-            validate_document_records(
-                metadata
-                    .snapshot_by_id(snapshot_id)
-                    .ok_or_else(|| corrupt("selected publication snapshot is absent"))?,
-                &records,
-            )?;
-        }
+        use crate::commit::publication_descriptor::AttributionPlan;
         let descriptor = journal
             .entry_descriptor(entry)
             .ok_or_else(|| invalid("Write journal entry is unavailable"))?;
-        if journal
-            .append_positive_proof_with_finalization(
-                descriptor.key,
+        let managed_repartition = handle
+            .repartition()
+            .is_some_and(|value| value.storage_updates().is_some())
+            || handle
+                .document_publication()
+                .is_some_and(|facts| facts.declaration().slot_update().is_some());
+        let (snapshot_id, observation) = if managed_repartition {
+            let AttributionPlan::ManagedRepartition {
+                snapshot_id,
+                parent,
+                session,
+                ..
+            } = &descriptor.attribution
+            else {
+                return Ok(journal.catalog_entry_outcome(entry));
+            };
+            if !decoded.names_publication(*snapshot_id, *parent)
+                || session != &handle.session_id().to_string()
+            {
+                return Ok(journal.catalog_entry_outcome(entry));
+            }
+            let Some(observation) = descriptor.attribution.observe_table_metadata(metadata) else {
+                return Ok(journal.catalog_entry_outcome(entry));
+            };
+            if !descriptor.attribution.matches_observation(&observation) {
+                return Ok(journal.catalog_entry_outcome(entry));
+            }
+            (*snapshot_id, observation)
+        } else {
+            let expected = handle.session_id().to_string();
+            let mut matched = None;
+            for snapshot in metadata.snapshots() {
+                let marker = snapshot
+                    .summary()
+                    .additional_properties
+                    .get(ICEBERG_WRITE_SESSION_MARKER_PROPERTY);
+                if marker.is_some_and(|value| *value == expected)
+                    && matched
+                        .replace((snapshot.snapshot_id(), marker.unwrap().clone()))
+                        .is_some()
+                {
+                    return Err(corrupt(
+                        "Iceberg write session marker matches multiple snapshots",
+                    ));
+                }
+            }
+            let Some((snapshot_id, marker_value)) = matched else {
+                return Ok(journal.catalog_entry_outcome(entry));
+            };
+            (
+                snapshot_id,
                 PositiveAttributionObservation::SnapshotMarker {
                     table_uuid: metadata.uuid(),
                     snapshot_id,
                     marker_key: ICEBERG_WRITE_SESSION_MARKER_PROPERTY.to_owned(),
                     marker_value,
                 },
+            )
+        };
+        if decoded.document_record_digest.is_some() {
+            let records = handle
+                .document_records()?
+                .ok_or_else(|| corrupt("keyed publication evidence lost its exact record bytes"))?;
+            let validated = validate_document_records(
+                metadata
+                    .snapshot_by_id(snapshot_id)
+                    .ok_or_else(|| corrupt("selected publication snapshot is absent"))?,
+                &records,
+            );
+            if managed_repartition && validated.is_err() {
+                return Ok(journal.catalog_entry_outcome(entry));
+            }
+            validated?;
+        }
+        if journal
+            .append_positive_proof_with_finalization(
+                descriptor.key,
+                observation,
                 self.runtime
                     .novarocks_catalog()
                     .positive_attribution_finalization(),
@@ -1918,11 +1959,15 @@ fn position_contribution_group(
     Ok((group, writer_input))
 }
 
+pub(crate) fn collect_on_write_property_enabled(value: &str) -> bool {
+    !value.eq_ignore_ascii_case("false")
+}
+
 fn collect_on_write_enabled(metadata: &TableMetadata) -> bool {
     metadata
         .properties()
         .get(crate::stats_assembler::COLLECT_ON_WRITE_PROPERTY)
-        .is_none_or(|value| !value.eq_ignore_ascii_case("false"))
+        .is_none_or(|value| collect_on_write_property_enabled(value))
 }
 
 fn write_statistics_contract(
@@ -2162,6 +2207,19 @@ impl IcebergWriteSessionControl {
             ConnectorWriteSessionFlavor::ApplicationDocumentPublication { .. }
         ) {
             request.validate_document_publication()?;
+            if let ConnectorWriteSessionFlavor::ApplicationDocumentPublication {
+                declaration,
+                shape,
+            } = &request.flavor
+                && (declaration.slot_update().is_some()
+                    || declaration.storage_projection_digest().is_some())
+                && (request.target_ref.as_str() != "main"
+                    || *shape != ConnectorManagedPublicationShape::Data)
+            {
+                return Err(invalid(
+                    "combined managed repartition requires one full main data publication",
+                ));
+            }
         }
         let (namespace, table_name) = request.table.rsplit_once('.').ok_or_else(|| {
             invalid("Iceberg write target must be a namespace-qualified table name")
@@ -2204,6 +2262,30 @@ impl IcebergWriteSessionControl {
                 request.context.initiation(),
             ))
             .map_err(connector_unsupported)?;
+        if let ConnectorWriteSessionFlavor::ApplicationDocumentPublication { declaration, .. } =
+            &request.flavor
+            && declaration.storage_projection_digest().is_some()
+        {
+            super::repartition::admit_storage_alter(
+                self.runtime.novarocks_catalog().as_ref(),
+                namespace,
+                table_name,
+                &request.context,
+            )?;
+        }
+        if let ConnectorWriteSessionFlavor::ApplicationDocumentPublication { declaration, .. } =
+            &request.flavor
+            && declaration.slot_update().is_some()
+        {
+            self.runtime
+                .novarocks_catalog()
+                .admit(&CatalogAdmissionRequest::new(
+                    CatalogOperation::UpdateDocuments,
+                    crate::catalog::CatalogTableName::new(namespace, table_name),
+                    request.context.initiation(),
+                ))
+                .map_err(connector_unsupported)?;
+        }
         if let ConnectorWriteSessionFlavor::DistributedRewrite { frozen, .. } = &request.flavor {
             frozen.validate_owner(&self.key)?;
         }
@@ -2520,6 +2602,15 @@ impl IcebergWriteSessionControl {
         // under the spec the commit is about to establish: a writer that used
         // the spec the table still has would stage files partitioned against a
         // spec the same commit retires.
+        if let ConnectorWriteSessionFlavor::ApplicationDocumentPublication { declaration, .. } =
+            &request.flavor
+            && let Some(update) = declaration.slot_update()
+            && !publication::slot_matches(&metadata, update)?
+        {
+            return Err(invalid(
+                "Iceberg managed repartition slot value or writer no longer matches its admission",
+            ));
+        }
         let repartition = match &request.flavor {
             ConnectorWriteSessionFlavor::ApplicationDocumentPublication {
                 declaration,
@@ -2527,9 +2618,10 @@ impl IcebergWriteSessionControl {
             } => declaration
                 .partition_spec_replacement()
                 .map(|replacement| {
-                    let prepared = crate::commit::write_stack::repartition::preview_managed_repartition(
+                    let prepared = crate::commit::write_stack::repartition::prepare_managed_repartition(
                         &metadata,
                         replacement,
+                        &request.context,
                     )?;
                     let expected = declaration.expected_committed_partitioning().ok_or_else(|| {
                         invalid(
@@ -2539,6 +2631,13 @@ impl IcebergWriteSessionControl {
                     if prepared.committed() != expected {
                         return Err(invalid(
                             "Iceberg document publication partition replacement no longer matches its exact preview",
+                        ));
+                    }
+                    if prepared.storage_projection_digest()
+                        != declaration.storage_projection_digest()
+                    {
+                        return Err(invalid(
+                            "Iceberg document publication storage changes no longer match the exact writer preview",
                         ));
                     }
                     Ok(prepared)
@@ -2918,7 +3017,7 @@ impl IcebergWriteSessionControl {
     }
 }
 
-fn iceberg_data_location(metadata: &TableMetadata) -> String {
+pub(super) fn iceberg_data_location(metadata: &TableMetadata) -> String {
     metadata
         .properties()
         .get("write.data.path")

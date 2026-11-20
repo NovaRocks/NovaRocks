@@ -28,14 +28,13 @@ CREATE TABLE ${case_db}.t_analytic_avg_rows_sliding (
     grp VARCHAR(10),
     ts INT,
     v INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t_analytic_avg_rows_sliding VALUES
-    ('A', 1, 10),
-    ('A', 2, 20),
-    ('A', 3, 40),
-    ('A', 4, 80);
+    ROW('A', 1, 10),
+    ROW('A', 2, 20),
+    ROW('A', 3, 40),
+    ROW('A', 4, 80);
 
 SELECT
     grp,

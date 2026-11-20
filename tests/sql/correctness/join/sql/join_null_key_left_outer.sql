@@ -29,19 +29,17 @@ DROP TABLE IF EXISTS ${case_db}.t_join_null_key_left_outer_r;
 CREATE TABLE ${case_db}.t_join_null_key_left_outer_l (
   k INT,
   vl STRING
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 CREATE TABLE ${case_db}.t_join_null_key_left_outer_r (
   k INT,
   vr STRING
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 INSERT INTO ${case_db}.t_join_null_key_left_outer_l VALUES
-  (NULL, 'LN'),
-  (2, 'L2');
+  ROW(NULL, 'LN'),
+  ROW(2, 'L2');
 INSERT INTO ${case_db}.t_join_null_key_left_outer_r VALUES
-  (NULL, 'RN'),
-  (2, 'R2');
+  ROW(NULL, 'RN'),
+  ROW(2, 'R2');
 SELECT
   COALESCE(CAST(l.k AS STRING), 'NULL') AS lk,
   l.vl,

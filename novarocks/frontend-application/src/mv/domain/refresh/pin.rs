@@ -236,13 +236,13 @@ fn validate_refresh_pin_table_object_ids_for_operation(
     Ok(())
 }
 
-/// Walk `query` in place. For each `TableFactor::Table` whose 3-part name
+/// Walk `query` in place. For each `Relation::Table` whose 3-part name
 /// resolves to the next persisted D occurrence, inject that occurrence's
 /// exact snapshot unless its occurrence ID is in `delta_bearing`. Returns the
 /// number of mutations performed.
 ///
 /// Rules:
-/// - `TableFactor::Table` with `version = Some(_)` already -> Err. The
+/// - `Relation::Table` with `query_period = Some(_)` already -> Err. The
 ///   refresh SELECT is not allowed to combine user-written FOR VERSION AS OF
 ///   with refresh pinning.
 /// - A visible CTE reference does not consume a D occurrence.
@@ -367,47 +367,50 @@ fn walk_set_expr(
     }
     match expr {
         SetExpr::Select(select) => {
-            for tw in &mut select.from {
-                walk_table_with_joins(tw, visible_ctes, state);
+            if let Some(tw) = &mut select.from {
+                walk_factor(tw, visible_ctes, state);
             }
         }
         novarocks_parser::ast::SetExpr::SetOperation(operation) => {
-            walk_set_expr(operation.left.as_mut(), visible_ctes, state);
-            walk_set_expr(operation.right.as_mut(), visible_ctes, state);
+            for input in &mut operation.inputs {
+                walk_set_expr(input, visible_ctes, state);
+            }
         }
-        SetExpr::Query(query) => walk_query(query.as_mut(), visible_ctes, state),
+        SetExpr::Query(subquery) => {
+            let query = &mut subquery.query;
+            walk_query(query.as_mut(), visible_ctes, state)
+        }
         _ => {}
     }
 }
 
-fn walk_table_with_joins(
-    table_with_joins: &mut novarocks_parser::ast::TableWithJoins,
-    visible_ctes: &HashSet<String>,
-    state: &mut InjectState<'_>,
-) {
-    walk_factor(&mut table_with_joins.relation, visible_ctes, state);
-    for join in &mut table_with_joins.joins {
-        walk_factor(&mut join.relation, visible_ctes, state);
-    }
-}
-
 fn walk_factor(
-    factor: &mut novarocks_parser::ast::TableFactor,
+    factor: &mut novarocks_parser::ast::Relation,
     visible_ctes: &HashSet<String>,
     state: &mut InjectState<'_>,
 ) {
     use novarocks_parser::ast::{
-        Expr, Literal, LiteralKind, TableFactor, TableVersion, TableVersionKind,
+        AstBox, Expr, Literal, LiteralKind, QueryPeriod, QueryPeriodRangeType, Relation,
     };
     if state.first_error.is_some() {
         return;
     }
     match factor {
-        TableFactor::Table { name, version, .. } => {
-            let parts: Vec<String> = name
-                .parts
-                .iter()
-                .map(|ident| ident.value.to_ascii_lowercase())
+        Relation::Table(table) => {
+            let novarocks_parser::ast::Table {
+                name,
+                query_period: version,
+                branch,
+                ..
+            } = table.as_mut();
+            if branch.is_some() {
+                state.first_error =
+                    Some("refresh SELECT does not support branch-qualified relations".into());
+                return;
+            }
+            let parts: Vec<String> = novarocks_sql::TableNameView::new(name)
+                .parts()
+                .map(str::to_ascii_lowercase)
                 .collect();
             if parts.len() == 1 && visible_ctes.contains(&parts[0]) {
                 return;
@@ -447,23 +450,28 @@ fn walk_factor(
             if state.delta_bearing.contains(&pinned.occurrence_id()) {
                 return;
             }
-            *version = Some(TableVersion {
-                kind: TableVersionKind::ForVersionAsOf,
-                value: Expr::Literal(Literal {
-                    kind: LiteralKind::Number(pinned.snapshot_id().to_string()),
+            *version = Some(QueryPeriod {
+                range_type: QueryPeriodRangeType::Version,
+                start: None,
+                end: Some(AstBox::new(Expr::Literal(Literal {
+                    kind: LiteralKind::Long {
+                        spelling: pinned.snapshot_id().to_string(),
+                        parsed_value: pinned.snapshot_id(),
+                    },
                     span: name.span,
-                }),
+                }))),
                 span: name.span,
             });
             state.count += 1;
         }
-        TableFactor::Derived { subquery, .. } => {
-            walk_query(subquery.as_mut(), visible_ctes, state);
+        Relation::TableSubquery(node) => {
+            walk_query(node.query.as_mut(), visible_ctes, state);
         }
-        TableFactor::NestedJoin {
-            table_with_joins, ..
-        } => {
-            walk_table_with_joins(table_with_joins.as_mut(), visible_ctes, state);
+        Relation::Lateral(node) => walk_query(node.query.as_mut(), visible_ctes, state),
+        Relation::Aliased(alias) => walk_factor(&mut alias.relation, visible_ctes, state),
+        Relation::Join(join) => {
+            walk_factor(&mut join.left, visible_ctes, state);
+            walk_factor(&mut join.right, visible_ctes, state);
         }
         _ => {}
     }
@@ -543,11 +551,7 @@ mod tests {
     use novarocks_parser::printer::print_query;
 
     fn parse_select_for_test(sql: &str) -> novarocks_parser::ast::Query {
-        let statements = novarocks_parser::parse(sql).expect("test SQL must parse");
-        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
-            panic!("test SQL must be a query");
-        };
-        query.clone()
+        novarocks_parser::parser::parse_query(sql).expect("test SQL must parse")
     }
 
     fn make_pin(entries: &[(u32, &str, i64, &[u8])]) -> RefreshSnapshotPin {
@@ -646,6 +650,91 @@ mod tests {
     }
 
     #[test]
+    fn base_identity_reads_keep_trino_quoted_dollar_names_raw() {
+        use crate::mv::domain::{analysis, flow};
+        use novarocks_parser::ast::{Relation, SetExpr};
+        for (sql, expected_table, spelling, quoted, raw_dollar_name) in [
+            (
+                "SELECT * FROM ice.db.orders",
+                "orders",
+                "orders",
+                false,
+                false,
+            ),
+            (
+                r#"SELECT * FROM ice.db."orders""#,
+                "orders",
+                r#""orders""#,
+                true,
+                false,
+            ),
+            (
+                r#"SELECT * FROM ice.db."orders$files""#,
+                "orders$files",
+                r#""orders$files""#,
+                true,
+                true,
+            ),
+        ] {
+            let mut query = parse_select_for_test(sql);
+            let original = query.clone();
+            let SetExpr::Select(select) = query.body.as_ref() else {
+                panic!("original SELECT");
+            };
+            let Some(Relation::Table(table)) = &select.from else {
+                panic!("original table");
+            };
+            let last = table.name.parts.last().unwrap();
+            assert_eq!(last.value, expected_table);
+            assert_eq!(last.quoted, quoted);
+            assert_eq!(&sql[last.span.start()..last.span.end()], spelling);
+            let prepared =
+                analysis::prepare_mv_select_for_catalog_provider(&query, Some("ice"), "db")
+                    .unwrap();
+            assert_eq!(
+                prepared.resolved_refs(),
+                &[analysis::ResolvedTableRef::Iceberg {
+                    catalog: "ice".into(),
+                    namespace: "db".into(),
+                    table: expected_table.into(),
+                }]
+            );
+            assert_eq!(prepared.query_for_analysis(), &original);
+            let base = make_ref("ice", "db", expected_table);
+            let actual = flow::validate_incremental_mv_base_ref(&query, &base);
+            if raw_dollar_name {
+                assert_eq!(
+                    actual.unwrap_err(),
+                    "incremental MV refresh stored SQL has invalid table reference: unsupported identifier `orders$files`"
+                );
+            } else {
+                assert_eq!(
+                    actual.unwrap(),
+                    ("ice".into(), "db".into(), "orders".into())
+                );
+            }
+            let fqn = format!("ice.db.{expected_table}");
+            let pin = make_pin(&[(7, &fqn, 42, b"object-orders")]);
+            let delta_bearing = HashSet::from([SqlMvRelationOccurrenceId::new(7)]);
+            assert_eq!(
+                inject_pin_as_for_version_as_of(
+                    &mut query,
+                    &pin,
+                    &delta_bearing,
+                    Some("ice"),
+                    "db"
+                )
+                .unwrap(),
+                0
+            );
+            assert_eq!(
+                query, original,
+                "delta occurrence identity reads do not alter the source AST"
+            );
+        }
+    }
+
+    #[test]
     fn inject_pin_skips_delta_bearing_base() {
         let mut query = parse_select_for_test("SELECT * FROM ice.db.orders");
         let pin = make_pin(&[(7, "ice.db.orders", 42, b"object-orders")]);
@@ -656,7 +745,10 @@ mod tests {
                 .expect("inject must succeed");
 
         assert_eq!(count, 0);
-        assert_eq!(print_query(&query), "SELECT * FROM ice.db.orders");
+        assert_eq!(
+            print_query(&query).unwrap(),
+            print_query(&parse_select_for_test("SELECT * FROM ice.db.orders")).unwrap(),
+        );
     }
 
     #[test]
@@ -675,8 +767,11 @@ mod tests {
 
         assert_eq!(count, 1);
         assert_eq!(
-            print_query(&query),
-            "SELECT * FROM db.orders JOIN ice.db.customers FOR VERSION AS OF 99 ON TRUE"
+            print_query(&query).unwrap(),
+            print_query(&parse_select_for_test(
+                "SELECT * FROM db.orders JOIN ice.db.customers FOR VERSION AS OF 99 ON TRUE",
+            ))
+            .unwrap(),
         );
     }
 
@@ -697,8 +792,11 @@ mod tests {
 
         assert_eq!(count, 2);
         assert_eq!(
-            print_query(&query),
-            "WITH recent AS (SELECT * FROM ice.db.orders FOR VERSION AS OF 11) SELECT * FROM recent UNION ALL SELECT * FROM ice.db.orders FOR VERSION AS OF 22"
+            print_query(&query).unwrap(),
+            print_query(&parse_select_for_test(
+                "WITH recent AS (SELECT * FROM ice.db.orders FOR VERSION AS OF 11) SELECT * FROM recent UNION ALL SELECT * FROM ice.db.orders FOR VERSION AS OF 22",
+            ))
+            .unwrap(),
         );
     }
 
@@ -716,7 +814,7 @@ mod tests {
             inject_pin_as_for_version_as_of(&mut query, &pin, &HashSet::new(), Some("ice"), "db")
                 .expect("inject must preserve both occurrences");
 
-        let sql = print_query(&query);
+        let sql = print_query(&query).unwrap();
         assert_eq!(count, 2);
         assert_eq!(sql.matches("VERSION AS OF 11").count(), 1, "{sql}");
         assert_eq!(sql.matches("VERSION AS OF 22").count(), 1, "{sql}");
@@ -771,8 +869,11 @@ mod tests {
 
         assert_eq!(count, 1);
         assert_eq!(
-            print_query(&query),
-            "SELECT * FROM (SELECT * FROM ice.db.orders JOIN ice.db.customers FOR VERSION AS OF 99 ON TRUE) AS joined"
+            print_query(&query).unwrap(),
+            print_query(&parse_select_for_test(
+                "SELECT * FROM (SELECT * FROM ice.db.orders JOIN ice.db.customers FOR VERSION AS OF 99 ON TRUE) AS joined",
+            ))
+            .unwrap(),
         );
     }
 }

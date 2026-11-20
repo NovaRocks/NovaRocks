@@ -28,22 +28,19 @@ CREATE TABLE ${case_db}.t1 (
   c1 STRING,
   c2 STRING,
   c3 STRING
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 CREATE TABLE ${case_db}.t2 (
   c1 STRING,
   c2 STRING,
   c3 STRING
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 CREATE TABLE ${case_db}.t3 (
   c1 STRING,
   c2 STRING,
   c3 STRING
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t3 SELECT 'c1-1', 'unknown', 'c3';
 INSERT INTO ${case_db}.t2 SELECT 'c1-1', 'c2-1', 'c3';

@@ -56,20 +56,19 @@ CREATE TABLE ${case_db}.fe_terminal_retained (
   id BIGINT,
   payload BIGINT,
   delay_s BIGINT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 2
 -- @skip_result_check=true
-INSERT INTO ${case_db}.fe_terminal_retained VALUES (1, 10, 15);
+INSERT INTO ${case_db}.fe_terminal_retained VALUES ROW(1, 10, 15);
 
 -- query 3
 -- @skip_result_check=true
-INSERT INTO ${case_db}.fe_terminal_retained VALUES (2, 20, 15);
+INSERT INTO ${case_db}.fe_terminal_retained VALUES ROW(2, 20, 15);
 
 -- query 4
 -- @skip_result_check=true
-INSERT INTO ${case_db}.fe_terminal_retained VALUES (3, 30, 15);
+INSERT INTO ${case_db}.fe_terminal_retained VALUES ROW(3, 30, 15);
 
 -- query 5
 -- @kill_fe_after_be_log_contains=NOVAROCKS_PARTICIPATION_LEASE_RENEWED

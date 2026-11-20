@@ -1,0 +1,187 @@
+line	rule	alternative	label	clause	sql	gate
+389	measureDefinition	1		0	VALUES x OVER ( MEASURES ? AS x ROWS CURRENT ROW )	window_operation
+396	skipTo	1		0	VALUES x OVER ( ROWS CURRENT ROW AFTER MATCH SKIP TO NEXT ROW )	window_operation
+397	skipTo	2		0	VALUES x OVER ( ROWS CURRENT ROW AFTER MATCH SKIP PAST LAST ROW )	window_operation
+398	skipTo	3		0	VALUES x OVER ( ROWS CURRENT ROW AFTER MATCH SKIP TO FIRST x )	window_operation
+399	skipTo	4		0	VALUES x OVER ( ROWS CURRENT ROW AFTER MATCH SKIP TO LAST x )	window_operation
+400	skipTo	5		0	VALUES x OVER ( ROWS CURRENT ROW AFTER MATCH SKIP TO x )	window_operation
+401	subsetDefinition	1		1	VALUES x OVER ( ROWS CURRENT ROW SUBSET x = ( x , x ) )	window_operation
+402	subsetDefinition	1		0	VALUES x OVER ( ROWS CURRENT ROW SUBSET x = ( x ) )	window_operation
+403	variableDefinition	1		0	VALUES x OVER ( ROWS CURRENT ROW DEFINE x AS ? )	window_operation
+422	relationPrimary	7	jsonTable	0	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x ) )	json_table
+425	jsonTableColumn	1	ordinalityColumn	0	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x FOR ORDINALITY ) )	json_table
+426	jsonTableColumn	2		1	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x PATH 'x' ) )	json_table
+427	jsonTableColumn	2		2	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x NULL ON EMPTY ) )	json_table
+428	jsonTableColumn	2		3	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x NULL ON ERROR ) )	json_table
+429	jsonTableColumn	2	valueColumn	0	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x ) )	json_table
+430	jsonTableColumn	3		1	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x FORMAT JSON PATH 'x' ) )	json_table
+431	jsonTableColumn	3		2	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x FORMAT JSON WITH WRAPPER ) )	json_table
+432	jsonTableColumn	3		3	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x FORMAT JSON KEEP QUOTES ON SCALAR STRING ) )	json_table
+433	jsonTableColumn	3		4	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x FORMAT JSON KEEP QUOTES ) )	json_table
+434	jsonTableColumn	3		5	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x FORMAT JSON NULL ON EMPTY ) )	json_table
+435	jsonTableColumn	3		6	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x FORMAT JSON NULL ON ERROR ) )	json_table
+436	jsonTableColumn	3	queryColumn	0	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x FORMAT JSON ) )	json_table
+437	jsonTableColumn	4		1	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( NESTED PATH 'x' COLUMNS ( x x ) ) )	json_table
+438	jsonTableColumn	4		2	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( NESTED 'x' AS x COLUMNS ( x x ) ) )	json_table
+439	jsonTableColumn	4		3	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( NESTED 'x' COLUMNS ( x x , x x ) ) )	json_table
+440	jsonTableColumn	4	nestedColumns	0	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( NESTED 'x' COLUMNS ( x x ) ) )	json_table
+441	jsonTableSpecificPlan	1	leafPlan	0	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x ) PLAN ( x ) )	json_table
+442	jsonTableSpecificPlan	2	joinPlan	0	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x ) PLAN ( x INNER x ) )	json_table
+443	jsonTableSpecificPlan	3		1	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x ) PLAN ( x UNION x UNION x ) )	json_table
+444	jsonTableSpecificPlan	3	unionPlan	0	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x ) PLAN ( x UNION x ) )	json_table
+445	jsonTableSpecificPlan	4		1	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x ) PLAN ( x CROSS x CROSS x ) )	json_table
+446	jsonTableSpecificPlan	4	crossPlan	0	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x ) PLAN ( x CROSS x ) )	json_table
+447	jsonTablePathName	1		0	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x ) PLAN ( x ) )	json_table
+448	planPrimary	1		0	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x ) PLAN ( x INNER x ) )	json_table
+449	planPrimary	2		0	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x ) PLAN ( x INNER ( x ) ) )	json_table
+450	jsonTableDefaultPlan	1		1	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x ) PLAN DEFAULT ( INNER , CROSS ) )	json_table
+451	jsonTableDefaultPlan	1		0	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x ) PLAN DEFAULT ( INNER ) )	json_table
+452	jsonTableDefaultPlan	2		1	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x ) PLAN DEFAULT ( CROSS , INNER ) )	json_table
+453	jsonTableDefaultPlan	2		0	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x ) PLAN DEFAULT ( CROSS ) )	json_table
+510	predicate	10	match	0	VALUES ? MATCH ( TABLE x )	match
+511	predicate	11	overlaps	0	VALUES ? OVERLAPS ?	overlaps
+551	primaryExpression	11	methodCall	0	VALUES ? . x ( )	special_root
+552	primaryExpression	12	measure	0	VALUES x OVER x	window_operation
+553	primaryExpression	13	lambda	0	VALUES x -> ?	standalone_lambda
+556	primaryExpression	14	lambda	0	VALUES ( ) -> ?	standalone_lambda
+559	primaryExpression	17	unique	0	VALUES UNIQUE ( TABLE x )	unique
+573	primaryExpression	25	arrayWildcardSubscript	0	VALUES ? [ * ]	array_wildcard
+576	primaryExpression	28	stringLiteralDereference	0	VALUES ? . 'x'	row_field_dereference
+603	primaryExpression	45	intervalValueExpression	0	VALUES ( ? - ? ) DAY	interval_value_expression
+608	primaryExpression	47	jsonExists	0	VALUES JSON_EXISTS ( ? , 'x' )	json_exists
+612	primaryExpression	48	jsonValue	0	VALUES JSON_VALUE ( ? , 'x' )	json_value
+624	primaryExpression	50	jsonSerialize	0	VALUES JSON_SERIALIZE ( ? )	json_serialize
+640	literal	1	intervalLiteral	0	VALUES INTERVAL 'x' DAY	interval_literal
+649	jsonPathInvocation	1		1	VALUES JSON_VALUE ( ? , 'x' AS x )	json_value
+650	jsonPathInvocation	1		2	VALUES JSON_VALUE ( ? , 'x' PASSING ? AS x , ? AS x )	json_value
+651	jsonPathInvocation	1		3	VALUES JSON_VALUE ( ? , 'x' PASSING ? AS x )	json_value
+652	jsonPathInvocation	1		0	VALUES JSON_VALUE ( ? , 'x' )	json_value
+653	jsonValueExpression	1		1	VALUES JSON ( ? FORMAT JSON )	json_constructor
+654	jsonValueExpression	1		0	VALUES JSON ( ? )	json_constructor
+655	jsonRepresentation	1		1	VALUES JSON ( ? FORMAT JSON ENCODING UTF8 )	json_constructor
+656	jsonRepresentation	1		0	VALUES JSON ( ? FORMAT JSON )	json_constructor
+657	jsonArgument	1		0	VALUES JSON_VALUE ( ? , 'x' PASSING ? AS x )	json_value
+658	jsonExistsErrorBehavior	1		0	VALUES JSON_EXISTS ( ? , 'x' TRUE ON ERROR )	json_exists
+659	jsonExistsErrorBehavior	2		0	VALUES JSON_EXISTS ( ? , 'x' FALSE ON ERROR )	json_exists
+660	jsonExistsErrorBehavior	3		0	VALUES JSON_EXISTS ( ? , 'x' UNKNOWN ON ERROR )	json_exists
+661	jsonExistsErrorBehavior	4		0	VALUES JSON_EXISTS ( ? , 'x' ERROR ON ERROR )	json_exists
+662	jsonValueBehavior	1		0	VALUES JSON_VALUE ( ? , 'x' ERROR ON EMPTY )	json_value
+663	jsonValueBehavior	2		0	VALUES JSON_VALUE ( ? , 'x' NULL ON EMPTY )	json_value
+664	jsonValueBehavior	3		0	VALUES JSON_VALUE ( ? , 'x' DEFAULT ? ON EMPTY )	json_value
+667	jsonQueryWrapperBehavior	2		1	VALUES JSON_QUERY ( ? , 'x' WITH CONDITIONAL WRAPPER )	json_query_profile
+668	jsonQueryWrapperBehavior	2		2	VALUES JSON_QUERY ( ? , 'x' WITH ARRAY WRAPPER )	json_query_profile
+669	jsonQueryWrapperBehavior	2		0	VALUES JSON_QUERY ( ? , 'x' WITH WRAPPER )	json_query_profile
+670	jsonQueryBehavior	1		0	VALUES JSON_QUERY ( ? , 'x' ERROR ON EMPTY )	json_query_profile
+672	jsonQueryBehavior	3		0	VALUES JSON_QUERY ( ? , 'x' EMPTY ARRAY ON EMPTY )	json_query_profile
+673	jsonQueryBehavior	4		0	VALUES JSON_QUERY ( ? , 'x' EMPTY OBJECT ON EMPTY )	json_query_profile
+674	jsonSerializeOnErrorBehavior	1		0	VALUES JSON_SERIALIZE ( ? ERROR ON ERROR )	json_serialize
+675	jsonSerializeOnErrorBehavior	2		0	VALUES JSON_SERIALIZE ( ? NULL ON ERROR )	json_serialize
+679	processingMode	1		0	VALUES RUNNING x ( )	function_processing_mode
+680	processingMode	2		0	VALUES FINAL x ( )	function_processing_mode
+699	interval	1		1	VALUES INTERVAL + 'x' DAY	interval_literal
+700	interval	1		0	VALUES INTERVAL 'x' DAY	interval_literal
+707	type	2	intervalType	0	VALUES CAST ( NULL AS INTERVAL DAY )	interval_type
+721	type	10		1	VALUES CAST ( NULL AS x ARRAY [ 1 ] )	explicit_array_type
+726	intervalQualifier	1		1	VALUES ( ? - ? ) YEAR ( 1 ) TO MONTH	interval_value_expression
+727	intervalQualifier	1	compositeYearToMonthInterval	0	VALUES ( ? - ? ) YEAR TO MONTH	interval_value_expression
+728	intervalQualifier	2		1	VALUES ( ? - ? ) YEAR ( 1 )	interval_value_expression
+729	intervalQualifier	2	simpleYearMonthInterval	0	VALUES ( ? - ? ) YEAR	interval_value_expression
+730	intervalQualifier	3		1	VALUES ( ? - ? ) DAY ( 1 ) TO HOUR	interval_value_expression
+731	intervalQualifier	3		2	VALUES ( ? - ? ) DAY TO SECOND ( 1 )	interval_value_expression
+732	intervalQualifier	3	compositeDayTimeInterval	0	VALUES ( ? - ? ) DAY TO HOUR	interval_value_expression
+733	intervalQualifier	4		1	VALUES ( ? - ? ) DAY ( 1 )	interval_value_expression
+734	intervalQualifier	4	simpleDayTimeInterval	0	VALUES ( ? - ? ) DAY	interval_value_expression
+735	intervalQualifier	5		1	VALUES ( ? - ? ) SECOND ( 1 , 1 )	interval_value_expression
+736	intervalQualifier	5		2	VALUES ( ? - ? ) SECOND ( 1 )	interval_value_expression
+737	intervalQualifier	5	secondsDayTimeInterval	0	VALUES ( ? - ? ) SECOND	interval_value_expression
+782	rowPattern	1		1	VALUES x OVER ( ROWS CURRENT ROW PATTERN ( $ * ) )	window_operation
+783	rowPattern	1	quantifiedPrimary	0	VALUES x OVER ( ROWS CURRENT ROW PATTERN ( $ ) )	window_operation
+784	rowPattern	2	patternConcatenation	0	VALUES x OVER ( ROWS CURRENT ROW PATTERN ( $ $ ) )	window_operation
+785	rowPattern	3	patternAlternation	0	VALUES x OVER ( ROWS CURRENT ROW PATTERN ( $ | $ ) )	window_operation
+786	patternPrimary	1	patternVariable	0	VALUES x OVER ( ROWS CURRENT ROW PATTERN ( x ) )	window_operation
+787	patternPrimary	2	emptyPattern	0	VALUES x OVER ( ROWS CURRENT ROW PATTERN ( ( ) ) )	window_operation
+788	patternPrimary	3		1	VALUES x OVER ( ROWS CURRENT ROW PATTERN ( PERMUTE ( $ , $ ) ) )	window_operation
+789	patternPrimary	3	patternPermutation	0	VALUES x OVER ( ROWS CURRENT ROW PATTERN ( PERMUTE ( $ , A ) ) )	window_operation
+790	patternPrimary	4	groupedPattern	0	VALUES x OVER ( ROWS CURRENT ROW PATTERN ( ( $ ) ) )	window_operation
+791	patternPrimary	5	partitionStartAnchor	0	VALUES x OVER ( ROWS CURRENT ROW PATTERN ( ^ ) )	window_operation
+792	patternPrimary	6	partitionEndAnchor	0	VALUES x OVER ( ROWS CURRENT ROW PATTERN ( $ ) )	window_operation
+793	patternPrimary	7	excludedPattern	0	VALUES x OVER ( ROWS CURRENT ROW PATTERN ( {- $ -} ) )	window_operation
+794	patternQuantifier	1		1	VALUES x OVER ( ROWS CURRENT ROW PATTERN ( $ * ? ) )	window_operation
+795	patternQuantifier	1	zeroOrMoreQuantifier	0	VALUES x OVER ( ROWS CURRENT ROW PATTERN ( $ * ) )	window_operation
+796	patternQuantifier	2		1	VALUES x OVER ( ROWS CURRENT ROW PATTERN ( $ + ? ) )	window_operation
+797	patternQuantifier	2	oneOrMoreQuantifier	0	VALUES x OVER ( ROWS CURRENT ROW PATTERN ( $ + ) )	window_operation
+798	patternQuantifier	3		1	VALUES x OVER ( ROWS CURRENT ROW PATTERN ( $ ? ? ) )	window_operation
+799	patternQuantifier	3	zeroOrOneQuantifier	0	VALUES x OVER ( ROWS CURRENT ROW PATTERN ( $ ? ) )	window_operation
+800	patternQuantifier	4		1	VALUES x OVER ( ROWS CURRENT ROW PATTERN ( $ { 1 } ? ) )	window_operation
+801	patternQuantifier	4	rangeQuantifier	0	VALUES x OVER ( ROWS CURRENT ROW PATTERN ( $ { 1 } ) )	window_operation
+802	patternQuantifier	5		1	VALUES x OVER ( ROWS CURRENT ROW PATTERN ( $ { 1 , } ) )	window_operation
+803	patternQuantifier	5		2	VALUES x OVER ( ROWS CURRENT ROW PATTERN ( $ { , 1 } ) )	window_operation
+804	patternQuantifier	5		3	VALUES x OVER ( ROWS CURRENT ROW PATTERN ( $ { , } ? ) )	window_operation
+805	patternQuantifier	5	rangeQuantifier	0	VALUES x OVER ( ROWS CURRENT ROW PATTERN ( $ { , } ) )	window_operation
+2084	subsetDefinition	1		g1.b1	VALUES x OVER ( ROWS CURRENT ROW SUBSET x = ( x , x ) )	window_operation
+2096	jsonTableColumn	2		g1.b1	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x PATH 'x' ) )	json_table
+2097	jsonTableColumn	2		g2.b1	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x NULL ON EMPTY ) )	json_table
+2098	jsonTableColumn	2		g3.b1	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x NULL ON ERROR ) )	json_table
+2099	jsonTableColumn	3		g1.b1	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x FORMAT JSON PATH 'x' ) )	json_table
+2100	jsonTableColumn	3		g2.b1	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x FORMAT JSON WITH WRAPPER ) )	json_table
+2101	jsonTableColumn	3		g3.b1.g1.b1	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x FORMAT JSON KEEP QUOTES ) )	json_table
+2102	jsonTableColumn	3		g3.b1.g1.b2	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x FORMAT JSON OMIT QUOTES ) )	json_table
+2103	jsonTableColumn	3		g3.b1.g2.b1	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x FORMAT JSON KEEP QUOTES ON SCALAR STRING ) )	json_table
+2104	jsonTableColumn	3		g3.b1	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x FORMAT JSON KEEP QUOTES ) )	json_table
+2105	jsonTableColumn	3		g4.b1	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x FORMAT JSON NULL ON EMPTY ) )	json_table
+2106	jsonTableColumn	3		g5.b1	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x FORMAT JSON NULL ON ERROR ) )	json_table
+2107	jsonTableColumn	4		g1.b1	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( NESTED 'x' AS x COLUMNS ( x x ) ) )	json_table
+2108	jsonTableColumn	4		g2.b1	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( NESTED 'x' COLUMNS ( x x , x x ) ) )	json_table
+2109	jsonTableSpecificPlan	2		g1.b1	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x ) PLAN ( x OUTER x ) )	json_table
+2110	jsonTableSpecificPlan	2		g1.b2	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x ) PLAN ( x INNER x ) )	json_table
+2111	jsonTableSpecificPlan	3		g1.b1	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x ) PLAN ( x UNION x UNION x ) )	json_table
+2112	jsonTableSpecificPlan	4		g1.b1	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x ) PLAN ( x CROSS x CROSS x ) )	json_table
+2113	jsonTableDefaultPlan	1		g1.b1	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x ) PLAN DEFAULT ( OUTER ) )	json_table
+2114	jsonTableDefaultPlan	1		g1.b2	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x ) PLAN DEFAULT ( INNER ) )	json_table
+2115	jsonTableDefaultPlan	1		g2.b1.g1.b1	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x ) PLAN DEFAULT ( INNER , UNION ) )	json_table
+2116	jsonTableDefaultPlan	1		g2.b1.g1.b2	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x ) PLAN DEFAULT ( INNER , CROSS ) )	json_table
+2117	jsonTableDefaultPlan	1		g2.b1	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x ) PLAN DEFAULT ( INNER , CROSS ) )	json_table
+2118	jsonTableDefaultPlan	2		g1.b1	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x ) PLAN DEFAULT ( UNION ) )	json_table
+2119	jsonTableDefaultPlan	2		g1.b2	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x ) PLAN DEFAULT ( CROSS ) )	json_table
+2120	jsonTableDefaultPlan	2		g2.b1.g1.b1	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x ) PLAN DEFAULT ( CROSS , OUTER ) )	json_table
+2121	jsonTableDefaultPlan	2		g2.b1.g1.b2	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x ) PLAN DEFAULT ( CROSS , INNER ) )	json_table
+2122	jsonTableDefaultPlan	2		g2.b1	SELECT * FROM JSON_TABLE ( ? , 'x' COLUMNS ( x x ) PLAN DEFAULT ( CROSS , INNER ) )	json_table
+2224	jsonPathInvocation	1		g1.b1	VALUES JSON_VALUE ( ? , 'x' AS x )	json_value
+2225	jsonPathInvocation	1		g2.b1.g1.b1	VALUES JSON_VALUE ( ? , 'x' PASSING ? AS x , ? AS x )	json_value
+2226	jsonPathInvocation	1		g2.b1	VALUES JSON_VALUE ( ? , 'x' PASSING ? AS x )	json_value
+2227	jsonValueExpression	1		g1.b1	VALUES JSON ( ? FORMAT JSON )	json_constructor
+2228	jsonRepresentation	1		g1.b1.g1.b1	VALUES JSON ( ? FORMAT JSON ENCODING UTF8 )	json_constructor
+2229	jsonRepresentation	1		g1.b1.g1.b2	VALUES JSON ( ? FORMAT JSON ENCODING UTF16 )	json_constructor
+2230	jsonRepresentation	1		g1.b1.g1.b3	VALUES JSON ( ? FORMAT JSON ENCODING UTF32 )	json_constructor
+2231	jsonRepresentation	1		g1.b1	VALUES JSON ( ? FORMAT JSON ENCODING UTF8 )	json_constructor
+2232	jsonQueryWrapperBehavior	2		g1.b1	VALUES JSON_QUERY ( ? , 'x' WITH CONDITIONAL WRAPPER )	json_query_profile
+2233	jsonQueryWrapperBehavior	2		g1.b2	VALUES JSON_QUERY ( ? , 'x' WITH UNCONDITIONAL WRAPPER )	json_query_profile
+2235	interval	1		g1.b1	VALUES INTERVAL + 'x' DAY	interval_literal
+2236	interval	1		g1.b2	VALUES INTERVAL - 'x' DAY	interval_literal
+2244	type	10		g1.b1	VALUES CAST ( NULL AS x ARRAY [ 1 ] )	explicit_array_type
+2247	intervalQualifier	1		g1.b1	VALUES ( ? - ? ) YEAR ( 1 ) TO MONTH	interval_value_expression
+2248	intervalQualifier	2		g1.b1	VALUES ( ? - ? ) YEAR	interval_value_expression
+2249	intervalQualifier	2		g1.b2	VALUES ( ? - ? ) MONTH	interval_value_expression
+2250	intervalQualifier	2		g2.b1	VALUES ( ? - ? ) YEAR ( 1 )	interval_value_expression
+2251	intervalQualifier	3		g1.b1	VALUES ( ? - ? ) DAY TO HOUR	interval_value_expression
+2252	intervalQualifier	3		g1.b2	VALUES ( ? - ? ) HOUR TO SECOND	interval_value_expression
+2253	intervalQualifier	3		g1.b3	VALUES ( ? - ? ) MINUTE TO SECOND	interval_value_expression
+2254	intervalQualifier	3		g2.b1	VALUES ( ? - ? ) DAY ( 1 ) TO HOUR	interval_value_expression
+2255	intervalQualifier	3		g3.b1	VALUES ( ? - ? ) DAY TO HOUR	interval_value_expression
+2256	intervalQualifier	3		g3.b2	VALUES ( ? - ? ) DAY TO MINUTE	interval_value_expression
+2257	intervalQualifier	3		g3.b3.g1.b1	VALUES ( ? - ? ) DAY TO SECOND ( 1 )	interval_value_expression
+2258	intervalQualifier	3		g3.b3	VALUES ( ? - ? ) DAY TO SECOND	interval_value_expression
+2259	intervalQualifier	4		g1.b1	VALUES ( ? - ? ) DAY	interval_value_expression
+2260	intervalQualifier	4		g1.b2	VALUES ( ? - ? ) HOUR	interval_value_expression
+2261	intervalQualifier	4		g1.b3	VALUES ( ? - ? ) MINUTE	interval_value_expression
+2262	intervalQualifier	4		g2.b1	VALUES ( ? - ? ) DAY ( 1 )	interval_value_expression
+2263	intervalQualifier	5		g1.b1.g1.b1	VALUES ( ? - ? ) SECOND ( 1 , 1 )	interval_value_expression
+2264	intervalQualifier	5		g1.b1	VALUES ( ? - ? ) SECOND ( 1 )	interval_value_expression
+2286	patternPrimary	3		g1.b1	VALUES x OVER ( ROWS CURRENT ROW PATTERN ( PERMUTE ( $ , $ ) ) )	window_operation
+2287	patternQuantifier	1		g1.b1	VALUES x OVER ( ROWS CURRENT ROW PATTERN ( $ * ? ) )	window_operation
+2288	patternQuantifier	2		g1.b1	VALUES x OVER ( ROWS CURRENT ROW PATTERN ( $ + ? ) )	window_operation
+2289	patternQuantifier	3		g1.b1	VALUES x OVER ( ROWS CURRENT ROW PATTERN ( $ ? ? ) )	window_operation
+2290	patternQuantifier	4		g1.b1	VALUES x OVER ( ROWS CURRENT ROW PATTERN ( $ { 1 } ? ) )	window_operation
+2291	patternQuantifier	5		g1.b1	VALUES x OVER ( ROWS CURRENT ROW PATTERN ( $ { 1 , } ) )	window_operation
+2292	patternQuantifier	5		g2.b1	VALUES x OVER ( ROWS CURRENT ROW PATTERN ( $ { , 1 } ) )	window_operation
+2293	patternQuantifier	5		g3.b1	VALUES x OVER ( ROWS CURRENT ROW PATTERN ( $ { , } ? ) )	window_operation

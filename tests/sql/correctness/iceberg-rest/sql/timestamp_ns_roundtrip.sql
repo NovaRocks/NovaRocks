@@ -26,7 +26,7 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE DATABASE iceberg_rest_${suite_uuid0}.iceberg_rest_tsns_db_${uuid0};
+CREATE SCHEMA iceberg_rest_${suite_uuid0}.iceberg_rest_tsns_db_${uuid0};
 
 -- query 2
 -- @skip_result_check=true
@@ -35,16 +35,15 @@ CREATE DATABASE iceberg_rest_${suite_uuid0}.iceberg_rest_tsns_db_${uuid0};
 CREATE TABLE iceberg_rest_${suite_uuid0}.iceberg_rest_tsns_db_${uuid0}.t_tsns_${uuid0} (
   id BIGINT,
   ts TIMESTAMP_NS
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 
 -- query 3
 -- @skip_result_check=true
 INSERT INTO iceberg_rest_${suite_uuid0}.iceberg_rest_tsns_db_${uuid0}.t_tsns_${uuid0}
 VALUES
-  (1, '2024-01-02 03:04:05.123456789'),
-  (2, '2024-01-02 03:04:05.000000001'),
-  (3, '1970-01-01 00:00:00.000000000');
+  ROW(1, '2024-01-02 03:04:05.123456789'),
+  ROW(2, '2024-01-02 03:04:05.000000001'),
+  ROW(3, '1970-01-01 00:00:00.000000000');
 
 -- query 4
 -- Nanosecond-precision assertion: CAST to STRING renders 9 fractional digits.
@@ -80,8 +79,7 @@ SELECT id, CAST(CAST(ts AS DATETIME) AS STRING) AS micros
 CREATE TABLE iceberg_rest_${suite_uuid0}.iceberg_rest_tsns_db_${uuid0}.t_tsns_part_${uuid0} (
   id BIGINT,
   ts TIMESTAMP_NS
-) PARTITION BY (day(ts))
-TBLPROPERTIES ("format-version" = "3");
+) WITH (partitioning = ARRAY['day(ts)'], format_version = 3);
 
 -- query 8
 -- @skip_result_check=true
@@ -89,4 +87,4 @@ DROP TABLE iceberg_rest_${suite_uuid0}.iceberg_rest_tsns_db_${uuid0}.t_tsns_${uu
 
 -- query 9
 -- @skip_result_check=true
-DROP DATABASE iceberg_rest_${suite_uuid0}.iceberg_rest_tsns_db_${uuid0};
+DROP SCHEMA iceberg_rest_${suite_uuid0}.iceberg_rest_tsns_db_${uuid0};

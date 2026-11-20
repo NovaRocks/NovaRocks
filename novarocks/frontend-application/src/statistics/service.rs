@@ -39,6 +39,35 @@ impl FrontendStatisticsApplicationPort {
     }
 }
 impl application::StatisticsApplicationPort for FrontendStatisticsApplicationPort {
+    fn prepare_analyze(
+        &self,
+        target: application::StatisticsTableTarget,
+        columns: super::attempt_executor::AnalyzeColumns,
+        execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
+        context: &novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<
+        Box<dyn novarocks_query_application::session_control::GovernedStatementAction>,
+        application::StatisticsApplicationError,
+    > {
+        if novarocks_sql::system_table::is_system_table_name(&target.catalog, &target.namespace) {
+            return Err(
+                application::StatisticsApplicationError::from_connector_error(
+                    novarocks_spi::connector::ConnectorError::new(
+                        novarocks_spi::connector::ConnectorErrorKind::Unsupported,
+                        "statistics collection on system tables is unsupported",
+                    ),
+                ),
+            );
+        }
+        self.statement_executor.prepare_statement(
+            self.target_resolver.clone(),
+            target,
+            columns,
+            execution,
+            context,
+        )
+    }
+
     fn prepare_statement_action(
         &self,
         command: application::StatisticsApplicationCommand,
@@ -50,28 +79,13 @@ impl application::StatisticsApplicationPort for FrontendStatisticsApplicationPor
         application::StatisticsApplicationError,
     > {
         match command {
-            application::StatisticsApplicationCommand::AnalyzeTable { target, columns } => {
-                if novarocks_sql::system_table::is_system_table_name(
-                    &target.catalog,
-                    &target.namespace,
-                ) {
-                    return Err(
-                        application::StatisticsApplicationError::from_connector_error(
-                            novarocks_spi::connector::ConnectorError::new(
-                                novarocks_spi::connector::ConnectorErrorKind::Unsupported,
-                                "statistics collection on system tables is unsupported",
-                            ),
-                        ),
-                    );
-                }
-                self.statement_executor.prepare_statement(
-                    self.target_resolver.clone(),
+            application::StatisticsApplicationCommand::AnalyzeTable { target, columns } => self
+                .prepare_analyze(
                     target,
-                    columns,
+                    super::attempt_executor::AnalyzeColumns::Ready(columns),
                     execution,
                     context,
-                )
-            }
+                ),
             application::StatisticsApplicationCommand::ShowStats { target } => {
                 self.read.prepare_action(target, execution, context, family)
             }
@@ -98,7 +112,7 @@ mod tests {
             &self,
             _: Arc<dyn application::StatisticsTargetResolver>,
             _: application::StatisticsTableTarget,
-            _: application::StatisticsColumnIntent,
+            _: super::super::attempt_executor::AnalyzeColumns,
             _: &QueryExecutionContext,
             _: &novarocks_spi::connector::ConnectorRequestContext,
         ) -> Result<Box<dyn GovernedStatementAction>, application::StatisticsApplicationError>
@@ -137,28 +151,18 @@ mod tests {
         let family =
             novarocks_result_contract::ClientPresentationFamily::TrinoJson(Default::default());
         for (sql, catalog, namespace) in [
-            (
-                "ANALYZE TABLE system.metadata.materialized_views",
-                None,
-                "db",
-            ),
-            ("ANALYZE TABLE SYSTEM.INFORMATION_SCHEMA.TABLES", None, "db"),
-            (
-                "ANALYZE TABLE catalog.information_schema.tables",
-                None,
-                "db",
-            ),
-            (
-                "ANALYZE TABLE tables",
-                Some("catalog"),
-                "information_schema",
-            ),
+            ("ANALYZE system.metadata.materialized_views", None, "db"),
+            ("ANALYZE SYSTEM.INFORMATION_SCHEMA.TABLES", None, "db"),
+            ("ANALYZE catalog.information_schema.tables", None, "db"),
+            ("ANALYZE tables", Some("catalog"), "information_schema"),
         ] {
             let statement = novarocks_query_application::sql::parse_single_statement(sql).unwrap();
-            let Some(novarocks_query_application::sql::ProductSqlCommand::Statistics(command)) =
-                novarocks_query_application::sql::lower_product_sql_command(&statement).unwrap()
-            else {
+            let novarocks_parser::ast::TrinoStatement::Analyze(statement) = statement else {
                 panic!("typed statistics command")
+            };
+            let command = novarocks_sql::semantic::StatisticsSqlCommand::AnalyzeTable {
+                table: novarocks_query_application::sql::lower_object_name(&statement.table_name),
+                columns: None,
             };
             let error = executor
                 .prepare_statement_action(

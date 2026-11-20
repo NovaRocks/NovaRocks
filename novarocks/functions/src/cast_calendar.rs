@@ -115,3 +115,39 @@ pub(super) fn evaluate(
         }
     })
 }
+
+/// The original calendar/date author emits the original selected row fact.
+/// Only this explicit profile uses Trino's text grammar; legacy None is intact.
+pub(super) fn evaluate_trino_array_date(
+    text: &str,
+    ordinal: usize,
+    work: &mut EvaluationCheckpoints<'_>,
+) -> Result<CastRowResult, KernelFailure> {
+    let value = datetime_value::parse_trino_date32_observed(text, |event| match event {
+        DateParseObservation::Step => work.step(),
+        DateParseObservation::OpaqueBoundary => work.flush(),
+    })?;
+    Ok(match value {
+        Some(days) => CastRowResult::Signed(i64::from(days)),
+        None => {
+            work.flush()?;
+            CastRowResult::RowError(crate::RowDataError::from_domain(ordinal, InvalidArrayDate)?)
+        }
+    })
+}
+#[derive(Debug)]
+struct InvalidArrayDate;
+impl std::fmt::Display for InvalidArrayDate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Cannot cast array element to DATE")
+    }
+}
+impl std::error::Error for InvalidArrayDate {}
+impl novarocks_failure_contract::FailureProjection for InvalidArrayDate {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        novarocks_failure_contract::FailureFact::new(
+            novarocks_failure_contract::FailureClass::Data,
+            novarocks_function_contract::kernel_failure::INVALID_CAST_ARGUMENT,
+        )
+    }
+}

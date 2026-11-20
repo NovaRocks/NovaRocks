@@ -21,7 +21,7 @@ with ssr as
           sum(coalesce(sr_return_amt, 0)) as returns,
           sum(ss_net_profit - coalesce(sr_net_loss, 0)) as profit
   from store_sales left outer join store_returns on
-         (ss_item_sk = sr_item_sk and ss_ticket_number = sr_ticket_number),
+          ss_item_sk = sr_item_sk and ss_ticket_number = sr_ticket_number ,
      date_dim,
      store,
      item,
@@ -42,7 +42,7 @@ with ssr as
           sum(coalesce(cr_return_amount, 0)) as returns,
           sum(cs_net_profit - coalesce(cr_net_loss, 0)) as profit
   from catalog_sales left outer join catalog_returns on
-         (cs_item_sk = cr_item_sk and cs_order_number = cr_order_number),
+          cs_item_sk = cr_item_sk and cs_order_number = cr_order_number ,
      date_dim,
      catalog_page,
      item,
@@ -63,7 +63,7 @@ group by cp_catalog_page_id)
           sum(coalesce(wr_return_amt, 0)) as returns,
           sum(ws_net_profit - coalesce(wr_net_loss, 0)) as profit
   from web_sales left outer join web_returns on
-         (ws_item_sk = wr_item_sk and ws_order_number = wr_order_number),
+          ws_item_sk = wr_item_sk and ws_order_number = wr_order_number ,
      date_dim,
      web_site,
      item,
@@ -84,21 +84,21 @@ group by web_site_id)
         , sum(profit) as profit
  from 
  (select 'store channel' as channel
-        , 'store' || store_id as id
+        , CAST('store' AS BOOLEAN) OR CAST(store_id AS BOOLEAN) as id
         , sales
         , returns
         , profit
  from   ssr
  union all
  select 'catalog channel' as channel
-        , 'catalog_page' || catalog_page_id as id
+        , CAST('catalog_page' AS BOOLEAN) OR CAST(catalog_page_id AS BOOLEAN) as id
         , sales
         , returns
         , profit
  from  csr
  union all
  select 'web channel' as channel
-        , 'web_site' || web_site_id as id
+        , CAST('web_site' AS BOOLEAN) OR CAST(web_site_id AS BOOLEAN) as id
         , sales
         , returns
         , profit

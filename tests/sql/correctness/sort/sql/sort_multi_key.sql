@@ -29,14 +29,13 @@ CREATE TABLE ${case_db}.t_sort_multi_key (
   grp STRING,
   v INT,
   id INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 INSERT INTO ${case_db}.t_sort_multi_key VALUES
-  ('B', 2, 1),
-  ('A', 3, 2),
-  ('A', 1, 3),
-  ('B', 1, 4),
-  ('A', 1, 5);
+  ROW('B', 2, 1),
+  ROW('A', 3, 2),
+  ROW('A', 1, 3),
+  ROW('B', 1, 4),
+  ROW('A', 1, 5);
 SELECT grp, v, id
 FROM ${case_db}.t_sort_multi_key
 ORDER BY grp ASC, v ASC, id DESC;

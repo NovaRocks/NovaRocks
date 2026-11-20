@@ -28,19 +28,17 @@ DROP TABLE IF EXISTS ${case_db}.t_join_not_in_with_null_l;
 DROP TABLE IF EXISTS ${case_db}.t_join_not_in_with_null_r;
 CREATE TABLE ${case_db}.t_join_not_in_with_null_l (
   id INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 CREATE TABLE ${case_db}.t_join_not_in_with_null_r (
   id INT
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 INSERT INTO ${case_db}.t_join_not_in_with_null_l VALUES
-  (1),
-  (2),
-  (3);
+  ROW(1),
+  ROW(2),
+  ROW(3);
 INSERT INTO ${case_db}.t_join_not_in_with_null_r VALUES
-  (2),
-  (NULL);
+  ROW(2),
+  ROW(NULL);
 SELECT id
 FROM ${case_db}.t_join_not_in_with_null_l
 WHERE id NOT IN (

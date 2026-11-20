@@ -38,17 +38,30 @@ impl SqlCapturedCatalogPreparation {
         current_database: &str,
         control: SqlCompileControl,
     ) -> Result<Self, SqlCompileError> {
-        control.check()?;
-        let catalog = CatalogCompletionState::try_new(
+        Self::try_new_with_qualifications(
             query,
             current_catalog,
             current_database,
-            crate::catalog::TableLookupMode::SchemaOnly,
-            0,
-        )?
-        .with_exchange_budget(super::DEFAULT_COMPLETION_LIMITS)?;
-        control.check()?;
-        Ok(Self { catalog, control })
+            control,
+            super::CatalogQualifications::default(),
+        )
+    }
+
+    pub fn try_new_with_qualifications(
+        query: novarocks_parser::ast::Query,
+        current_catalog: Option<&str>,
+        current_database: &str,
+        control: SqlCompileControl,
+        qualifications: super::CatalogQualifications,
+    ) -> Result<Self, SqlCompileError> {
+        Self::try_new_qualified_catalog(
+            query,
+            current_catalog,
+            current_database,
+            None,
+            control,
+            qualifications,
+        )
     }
 
     pub fn try_new_definition(
@@ -58,16 +71,61 @@ impl SqlCapturedCatalogPreparation {
         target: Option<novarocks_types::naming::TableIdentity>,
         control: SqlCompileControl,
     ) -> Result<Self, SqlCompileError> {
-        control.check()?;
-        let catalog = CatalogCompletionState::try_new(
+        Self::try_new_definition_with_qualifications(
+            query,
+            catalog,
+            database,
+            target,
+            control,
+            super::CatalogQualifications::default(),
+        )
+    }
+
+    pub fn try_new_definition_with_qualifications(
+        query: novarocks_parser::ast::Query,
+        catalog: &str,
+        database: &str,
+        target: Option<novarocks_types::naming::TableIdentity>,
+        control: SqlCompileControl,
+        qualifications: super::CatalogQualifications,
+    ) -> Result<Self, SqlCompileError> {
+        Self::try_new_qualified_catalog(
             query,
             Some(catalog),
             database,
+            Some(target),
+            control,
+            qualifications,
+        )
+    }
+
+    fn try_new_qualified_catalog(
+        query: novarocks_parser::ast::Query,
+        current_catalog: Option<&str>,
+        current_database: &str,
+        definition: Option<Option<novarocks_types::naming::TableIdentity>>,
+        control: SqlCompileControl,
+        qualifications: super::CatalogQualifications,
+    ) -> Result<Self, SqlCompileError> {
+        control.check()?;
+        let catalog = CatalogCompletionState::try_new_with_qualifications(
+            query,
+            &[],
+            &[],
+            current_catalog,
+            current_database,
             crate::catalog::TableLookupMode::SchemaOnly,
             0,
-        )?
-        .with_definition_context(target, &control)?
+            &crate::sql_mode::SqlSemanticSettings::default(),
+            qualifications,
+        )?;
+        let catalog = if let Some(target) = definition {
+            catalog.with_definition_context(target, &control)?
+        } else {
+            catalog
+        }
         .with_exchange_budget(super::DEFAULT_COMPLETION_LIMITS)?;
+        control.check()?;
         Ok(Self { catalog, control })
     }
 
@@ -176,10 +234,7 @@ mod tests {
     };
 
     fn query(sql: &str) -> novarocks_parser::ast::Query {
-        let statements = novarocks_parser::parse(sql).unwrap();
-        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
-            panic!("query fixture")
-        };
+        let query = &novarocks_parser::parser::parse_query(sql).unwrap();
         query.clone()
     }
 
@@ -253,11 +308,11 @@ mod tests {
 mod view_definition_tests {
     use super::*;
     use crate::analyze_error::AnalyzeErrorKind;
-    use novarocks_parser::ast::{Statement, ViewStatement};
+    use novarocks_parser::ast::TrinoStatement;
 
     fn definition(sql: &str) -> Result<Box<[crate::catalog::SqlViewColumn]>, SqlCompileError> {
-        let mut statements = novarocks_parser::parse(sql).unwrap();
-        let Statement::View(ViewStatement::Create(create)) = statements.remove(0) else {
+        let statement = novarocks_parser::parser::parse_statement(sql).unwrap();
+        let TrinoStatement::CreateView(create) = statement else {
             panic!("view definition fixture")
         };
         let source = SqlCapturedCatalogPreparation::try_new_definition(
@@ -311,7 +366,7 @@ mod view_definition_tests {
             public.data_type(),
             &DataType::Struct(vec![Field::new("a", DataType::Int32, true)].into())
         );
-        let columns = definition("CREATE VIEW v AS SELECT array<json>[] AS js").unwrap();
+        let columns = definition("CREATE VIEW v AS SELECT CAST([] AS ARRAY<json>) AS js").unwrap();
         assert!(columns[0].value_type.nullable());
         let ValueKind::List(item) = columns[0].value_type.value_type().kind() else {
             panic!("ARRAY declaration")
@@ -359,10 +414,9 @@ mod view_definition_tests {
     fn definition_terminal_rejects_an_ordinary_shadowing_capture_context() {
         let source = SqlCapturedCatalogPreparation::try_new(
             {
-                let Statement::View(ViewStatement::Create(create)) =
-                    novarocks_parser::parse("CREATE VIEW v AS SELECT 1 AS x")
+                let TrinoStatement::CreateView(create) =
+                    novarocks_parser::parser::parse_statement("CREATE VIEW v AS SELECT 1 AS x")
                         .unwrap()
-                        .remove(0)
                 else {
                     panic!("fixture")
                 };

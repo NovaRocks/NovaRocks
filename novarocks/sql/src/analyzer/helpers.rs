@@ -18,7 +18,7 @@
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Fields};
-use novarocks_parser::{ast, printer};
+use novarocks_parser::ast;
 
 use crate::analyze_error::AnalyzeError;
 
@@ -476,19 +476,27 @@ fn cast_semantics(
 
 fn declared_root(sql_type: &ast::TypeName) -> novarocks_type_contract::ValueLogicalType {
     use novarocks_type_contract::ValueLogicalType as V;
-    match sql_type
-        .name
-        .parts
-        .last()
-        .map(|part| part.value.to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("json" | "jsonb") => V::Json,
-        Some("variant") => V::Variant,
-        Some("largeint") => V::LargeInt,
-        Some("hll") => V::Hll,
-        Some("bitmap") => V::Bitmap,
+    let ast::TypeKind::Generic(generic) = &sql_type.kind else {
+        return V::Physical;
+    };
+    match generic.name.value.to_ascii_lowercase().as_str() {
+        "json" | "jsonb" => V::Json,
+        "variant" => V::Variant,
+        "largeint" => V::LargeInt,
+        "hll" => V::Hll,
+        "bitmap" => V::Bitmap,
         _ => V::Physical,
+    }
+}
+
+fn generic_type_arguments(
+    sql_type: &ast::TypeName,
+) -> Result<&[ast::DataTypeParameter], AnalyzeError> {
+    match &sql_type.kind {
+        ast::TypeKind::Generic(generic) => Ok(&generic.arguments),
+        _ => Err(AnalyzeError::internal(
+            "container layout lost its generic SQL type author",
+        )),
     }
 }
 
@@ -530,15 +538,36 @@ fn validate_ast_type(
             sql_type.span,
         ));
     }
-    for argument in &sql_type.arguments {
-        match argument {
-            ast::TypeNameArgument::Type(child) => validate_ast_type(child, depth + 1, nodes, work)?,
-            ast::TypeNameArgument::Field(field) => {
-                validate_ast_type(&field.data_type, depth + 1, nodes, work)?
+    match &sql_type.kind {
+        ast::TypeKind::Generic(generic) => {
+            for parameter in &generic.arguments {
+                match parameter {
+                    ast::DataTypeParameter::Type(child) => {
+                        validate_ast_type(&child.data_type, depth + 1, nodes, work)?
+                    }
+                    ast::DataTypeParameter::Numeric(_) => {
+                        work.step().map_err(AnalyzeError::control)?
+                    }
+                }
             }
-            ast::TypeNameArgument::Literal(_) => {
-                work.step().map_err(AnalyzeError::control)?;
+        }
+        ast::TypeKind::Row(row) => {
+            for field in &row.fields {
+                validate_ast_type(&field.data_type, depth + 1, nodes, work)?;
             }
+        }
+        ast::TypeKind::DateTime(_) => {}
+        ast::TypeKind::Interval(_) => {
+            return Err(AnalyzeError::unsupported_expression(
+                "INTERVAL data types are not supported",
+                sql_type.span,
+            ));
+        }
+        ast::TypeKind::ExplicitArray(_) => {
+            return Err(AnalyzeError::unsupported_expression(
+                "explicit ARRAY lengths are not supported",
+                sql_type.span,
+            ));
         }
     }
     Ok(())
@@ -560,7 +589,7 @@ fn author_ast_type(
     } else {
         match layout {
             DataType::List(item) => ValueKind::List(author_ast_type(
-                type_type_argument(&sql_type.arguments, 0, "ARRAY", sql_type.span)?,
+                type_type_argument(generic_type_arguments(sql_type)?, 0, "ARRAY", sql_type.span)?,
                 item.data_type(),
                 item.is_nullable(),
                 work,
@@ -573,13 +602,23 @@ fn author_ast_type(
                 };
                 ValueKind::Map {
                     key: author_ast_type(
-                        type_type_argument(&sql_type.arguments, 0, "MAP", sql_type.span)?,
+                        type_type_argument(
+                            generic_type_arguments(sql_type)?,
+                            0,
+                            "MAP",
+                            sql_type.span,
+                        )?,
                         fields[0].data_type(),
                         false,
                         work,
                     )?,
                     value: author_ast_type(
-                        type_type_argument(&sql_type.arguments, 1, "MAP", sql_type.span)?,
+                        type_type_argument(
+                            generic_type_arguments(sql_type)?,
+                            1,
+                            "MAP",
+                            sql_type.span,
+                        )?,
                         fields[1].data_type(),
                         fields[1].is_nullable(),
                         work,
@@ -588,17 +627,13 @@ fn author_ast_type(
             }
             DataType::Struct(fields) => {
                 let mut values = Vec::with_capacity(fields.len());
-                for (field, argument) in fields.iter().zip(&sql_type.arguments) {
-                    let child = match argument {
-                        ast::TypeNameArgument::Field(field) => &field.data_type,
-                        ast::TypeNameArgument::Type(child) => child,
-                        ast::TypeNameArgument::Literal(_) => {
-                            return Err(AnalyzeError::invalid_argument(
-                                "STRUCT field must have an explicit type",
-                                sql_type.span,
-                            ));
-                        }
-                    };
+                let ast::TypeKind::Row(row) = &sql_type.kind else {
+                    return Err(AnalyzeError::internal(
+                        "Struct layout lost its ROW syntax author",
+                    ));
+                };
+                for (field, argument) in fields.iter().zip(&row.fields) {
+                    let child = &argument.data_type;
                     let value =
                         author_ast_type(child, field.data_type(), field.is_nullable(), work)?;
                     for _ in field.name().bytes() {
@@ -634,15 +669,52 @@ fn nested_field_with_logical_type(
 pub(super) fn sql_type_to_arrow(
     sql_type: &novarocks_parser::ast::TypeName,
 ) -> Result<DataType, AnalyzeError> {
-    let type_name = sql_type
-        .name
-        .parts
-        .last()
-        .map(|part| part.value.to_ascii_lowercase())
-        .ok_or_else(|| {
-            AnalyzeError::invalid_query_shape("CAST target type has no name", sql_type.span)
-        })?;
-    let type_args = &sql_type.arguments;
+    let generic = match &sql_type.kind {
+        ast::TypeKind::Generic(generic) => generic,
+        ast::TypeKind::Row(row) => {
+            let fields = row
+                .fields
+                .iter()
+                .enumerate()
+                .map(|(index, field)| {
+                    let name = field
+                        .name
+                        .as_ref()
+                        .map(|name| name.value.clone())
+                        .unwrap_or_else(|| format!("f{}", index + 1));
+                    nested_field_with_logical_type(&name, &field.data_type, true).map(Arc::new)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            return Ok(DataType::Struct(Fields::from(fields)));
+        }
+        ast::TypeKind::DateTime(datetime) => {
+            if datetime.with_time_zone || datetime.precision.as_deref().is_some_and(|parameter| !matches!(parameter, ast::DataTypeParameter::Numeric(value) if value.parsed_value == 6)) {
+                return Err(AnalyzeError::unsupported_expression("TIME/TIMESTAMP only support microsecond precision without time zone", sql_type.span));
+            }
+            return Ok(match datetime.kind {
+                ast::DateTimeType::Time => {
+                    DataType::Time64(arrow::datatypes::TimeUnit::Microsecond)
+                }
+                ast::DateTimeType::Timestamp => {
+                    DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None)
+                }
+            });
+        }
+        ast::TypeKind::Interval(_) => {
+            return Err(AnalyzeError::unsupported_expression(
+                "INTERVAL data types are not supported",
+                sql_type.span,
+            ));
+        }
+        ast::TypeKind::ExplicitArray(_) => {
+            return Err(AnalyzeError::unsupported_expression(
+                "explicit ARRAY lengths are not supported",
+                sql_type.span,
+            ));
+        }
+    };
+    let type_name = generic.name.value.to_ascii_lowercase();
+    let type_args = &generic.arguments;
     match type_name.as_str() {
         "tinyint" => Ok(DataType::Int8),
         "smallint" => Ok(DataType::Int16),
@@ -740,31 +812,6 @@ pub(super) fn sql_type_to_arrow(
                 false,
             ))
         }
-        "struct" => {
-            let fields = type_args
-                .iter()
-                .enumerate()
-                .map(|(index, argument)| match argument {
-                    novarocks_parser::ast::TypeNameArgument::Field(field) => Ok(Arc::new(
-                        nested_field_with_logical_type(&field.name.value, &field.data_type, true)?,
-                    )),
-                    novarocks_parser::ast::TypeNameArgument::Type(data_type) => {
-                        Ok(Arc::new(nested_field_with_logical_type(
-                            &format!("f{}", index + 1),
-                            data_type,
-                            true,
-                        )?))
-                    }
-                    novarocks_parser::ast::TypeNameArgument::Literal(_) => {
-                        Err(AnalyzeError::invalid_argument(
-                            "STRUCT type field must include a type name",
-                            type_name_argument_span(argument),
-                        ))
-                    }
-                })
-                .collect::<Result<Vec<_>, AnalyzeError>>()?;
-            Ok(DataType::Struct(Fields::from(fields)))
-        }
         _ => Err(AnalyzeError::unsupported_query_shape(
             format!("unsupported SQL type: {type_name}"),
             sql_type.span,
@@ -773,40 +820,36 @@ pub(super) fn sql_type_to_arrow(
 }
 
 fn type_numeric_argument(
-    arguments: &[novarocks_parser::ast::TypeNameArgument],
+    arguments: &[ast::DataTypeParameter],
     index: usize,
 ) -> Result<Option<u64>, AnalyzeError> {
     let Some(argument) = arguments.get(index) else {
         return Ok(None);
     };
-    let novarocks_parser::ast::TypeNameArgument::Literal(literal) = argument else {
+    let ast::DataTypeParameter::Numeric(value) = argument else {
         return Err(AnalyzeError::invalid_literal(
-            "numeric type parameter must be a literal",
+            "numeric type parameter must be an integer",
             type_name_argument_span(argument),
         ));
     };
-    let novarocks_parser::ast::LiteralKind::Number(value) = &literal.kind else {
-        return Err(AnalyzeError::invalid_literal(
-            "numeric type parameter must be an integer literal",
-            literal.span,
-        ));
-    };
-    value.parse::<u64>().map(Some).map_err(|error| {
+    u64::try_from(value.parsed_value).map(Some).map_err(|_| {
         AnalyzeError::invalid_literal(
-            format!("invalid numeric type parameter `{value}`: {error}"),
-            literal.span,
+            format!(
+                "numeric type parameter must be nonnegative: {}",
+                value.spelling
+            ),
+            value.span,
         )
     })
 }
 
 fn type_type_argument<'a>(
-    arguments: &'a [novarocks_parser::ast::TypeNameArgument],
+    arguments: &'a [ast::DataTypeParameter],
     index: usize,
     kind: &str,
     type_span: novarocks_parser::Span,
-) -> Result<&'a novarocks_parser::ast::TypeName, AnalyzeError> {
-    let Some(novarocks_parser::ast::TypeNameArgument::Type(data_type)) = arguments.get(index)
-    else {
+) -> Result<&'a ast::TypeName, AnalyzeError> {
+    let Some(ast::DataTypeParameter::Type(value)) = arguments.get(index) else {
         return Err(AnalyzeError::invalid_argument(
             format!("{kind} type requires a type parameter"),
             arguments
@@ -815,16 +858,13 @@ fn type_type_argument<'a>(
                 .unwrap_or(type_span),
         ));
     };
-    Ok(data_type)
+    Ok(&value.data_type)
 }
 
-fn type_name_argument_span(
-    argument: &novarocks_parser::ast::TypeNameArgument,
-) -> novarocks_parser::Span {
+fn type_name_argument_span(argument: &ast::DataTypeParameter) -> novarocks_parser::Span {
     match argument {
-        novarocks_parser::ast::TypeNameArgument::Type(type_name) => type_name.span,
-        novarocks_parser::ast::TypeNameArgument::Literal(literal) => literal.span,
-        novarocks_parser::ast::TypeNameArgument::Field(field) => field.span,
+        ast::DataTypeParameter::Type(value) => value.data_type.span,
+        ast::DataTypeParameter::Numeric(value) => value.span,
     }
 }
 
@@ -835,45 +875,32 @@ fn type_name_argument_span(
 
 pub(super) fn expr_display_name(expr: &ast::Expr) -> String {
     match expr {
-        ast::Expr::Nested(nested) => expr_display_name(&nested.expression),
         ast::Expr::Literal(literal) => format_literal_display_name(literal),
         ast::Expr::Identifier(ident) => ident.value.clone(),
-        ast::Expr::CompoundIdentifier(identifier) if !identifier.parts.is_empty() => identifier
-            .parts
-            .last()
-            .expect("non-empty compound identifier")
-            .value
-            .clone(),
-        ast::Expr::Access(access) => format_access_display_name(access),
+        ast::Expr::Dereference(node) => format_dereference_display_name(node, expr),
+        ast::Expr::Subscript(node) => format!(
+            "{}[{}]",
+            expr_display_name_preserve_path(&node.base),
+            expr_display_name(&node.index),
+        ),
+        ast::Expr::ArrayWildcardSubscript(_) => crate::parser::expression_for_diagnostic(expr),
         ast::Expr::Array(array) => format!(
             "[{}]",
             array
-                .elements
+                .values
                 .iter()
                 .map(expr_display_name)
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
-        ast::Expr::Map(map) => format!(
-            "map{{{}}}",
-            map.entries
-                .iter()
-                .map(|entry| format!(
-                    "{}:{}",
-                    expr_display_name(&entry.key),
-                    expr_display_name(&entry.value)
-                ))
-                .collect::<Vec<_>>()
-                .join(",")
-        ),
         ast::Expr::Lambda(lambda) => {
             let parameters = lambda
-                .parameters
+                .arguments
                 .iter()
-                .map(|parameter| parameter.value.as_str())
+                .map(|argument| argument.name.value.as_str())
                 .collect::<Vec<_>>()
                 .join(", ");
-            let parameters = if lambda.parameters.len() == 1 {
+            let parameters = if lambda.arguments.len() == 1 {
                 parameters
             } else {
                 format!("({parameters})")
@@ -883,18 +910,55 @@ pub(super) fn expr_display_name(expr: &ast::Expr) -> String {
                 expr_display_name_preserve_path(&lambda.body)
             )
         }
+        ast::Expr::GroupingOperation(node) => format_control_call_display(
+            "grouping",
+            &node.grouping_columns.iter().collect::<Vec<_>>(),
+        ),
+        ast::Expr::Trim(node) if node.trim_character.is_none() => {
+            let name = match node.specification {
+                ast::TrimSpecification::Both => "trim",
+                ast::TrimSpecification::Leading => "ltrim",
+                ast::TrimSpecification::Trailing => "rtrim",
+            };
+            format_control_call_display(name, &[&node.trim_source])
+        }
+        ast::Expr::Extract(_) => crate::parser::expression_for_diagnostic(expr),
+        ast::Expr::If(node) => {
+            let mut arguments = vec![&node.condition, &node.true_value];
+            arguments.extend(node.false_value.iter());
+            format_control_call_display("if", &arguments)
+        }
+        ast::Expr::NullIf(node) => {
+            format_control_call_display("nullif", &[&node.first, &node.second])
+        }
+        ast::Expr::Coalesce(node) => {
+            format_control_call_display("coalesce", &node.operands.iter().collect::<Vec<_>>())
+        }
+        ast::Expr::Try(node) => format_control_call_display("try", &[&node.inner]),
+        ast::Expr::Format(node) => {
+            format_control_call_display("format", &node.arguments.iter().collect::<Vec<_>>())
+        }
+        ast::Expr::FunctionCall(function)
+            if function.processing_mode.is_some()
+                || function
+                    .arguments
+                    .iter()
+                    .any(|argument| argument.name.is_some()) =>
+        {
+            crate::parser::expression_for_diagnostic(expr)
+        }
         ast::Expr::FunctionCall(function) => format_function_display_name(function),
-        ast::Expr::IsPredicate(predicate) => format_is_predicate_display_name(predicate),
+        ast::Expr::Predicated(node) => format_predicated_display_name(expr, node),
         ast::Expr::Cast(cast) => {
             if type_name_is(&cast.data_type, "array")
-                && matches!(cast.expr.as_ref(), ast::Expr::Array(_))
+                && matches!(&cast.expression, ast::Expr::Array(_))
             {
-                return expr_display_name(&cast.expr);
+                return expr_display_name(&cast.expression);
             }
             format!(
                 "CAST({} AS {})",
-                expr_display_name_with_parens(&cast.expr),
-                format_cast_type_for_expression(&cast.data_type, &cast.expr)
+                expr_display_name_with_parens(&cast.expression),
+                format_cast_type_for_expression(&cast.data_type, &cast.expression)
             )
         }
         ast::Expr::Binary(binary) => format!(
@@ -903,289 +967,214 @@ pub(super) fn expr_display_name(expr: &ast::Expr) -> String {
             binary_operator_display(binary.operator),
             expr_display_name_with_parens(&binary.right)
         ),
-        ast::Expr::InList(in_list) => {
-            let not = if in_list.negated { " NOT" } else { "" };
-            let items = in_list
-                .list
+        ast::Expr::Logical(logical) => {
+            let separator = match logical.operator {
+                ast::LogicalOperator::And => " AND ",
+                ast::LogicalOperator::Or => " OR ",
+            };
+            // Output names retain the existing adjacent-pair grouping. Only
+            // rendering strings are grouped; syntax and source terms stay flat.
+            let mut level = logical
+                .terms
+                .iter()
+                .map(expr_display_name_with_parens)
+                .collect::<Vec<_>>();
+            while level.len() > 2 {
+                let mut next = Vec::with_capacity(level.len().div_ceil(2));
+                let mut terms = level.into_iter();
+                while let Some(left) = terms.next() {
+                    next.push(match terms.next() {
+                        Some(right) => format!("({left}{separator}{right})"),
+                        None => left,
+                    });
+                }
+                level = next;
+            }
+            level.join(separator)
+        }
+        ast::Expr::InList(list) => format!(
+            "({})",
+            list.values
                 .iter()
                 .map(expr_display_name_with_parens)
                 .collect::<Vec<_>>()
-                .join(", ");
-            format!(
-                "{}{} IN ({items})",
-                expr_display_name_with_parens(&in_list.expr),
-                not
-            )
-        }
-        ast::Expr::InSubquery(in_subquery) => {
-            let not = if in_subquery.negated { " NOT" } else { "" };
-            format!(
-                "{}{} IN ((({})))",
-                expr_display_name_with_parens(&in_subquery.expr),
-                not,
-                format_subquery_display_name(&in_subquery.query)
-            )
-        }
-        other => lowercase_leading_keyword(&printer::print_expr(other)),
+                .join(", ")
+        ),
+        other => lowercase_leading_keyword(&crate::parser::expression_for_diagnostic(other)),
     }
 }
 
 fn format_subquery_display_name(query: &ast::Query) -> String {
-    let mut query = query.clone();
-    mark_query_aliases_explicit(&mut query);
-    printer::print_query(&query)
+    // AliasedRelation prints the canonical AS form directly.
+    crate::parser::query_for_diagnostic(query)
 }
 
-fn mark_query_aliases_explicit(query: &mut ast::Query) {
-    if let Some(with) = &mut query.with {
-        for cte in &mut with.ctes {
-            mark_query_aliases_explicit(&mut cte.query);
-        }
-    }
-    mark_set_expr_aliases_explicit(&mut query.body);
+fn pure_identifier_chain(expr: &ast::Expr) -> Option<ast::IdentifierChain<'_>> {
+    ast::identifier_chain_observed(expr, |_| Ok::<(), std::convert::Infallible>(()))
+        .unwrap_or_else(|never| match never {})
 }
 
-fn mark_set_expr_aliases_explicit(set_expr: &mut ast::SetExpr) {
-    match set_expr {
-        ast::SetExpr::Select(select) => {
-            for table_with_joins in &mut select.from {
-                mark_table_with_joins_aliases_explicit(table_with_joins);
-            }
-        }
-        ast::SetExpr::Query(query) => mark_query_aliases_explicit(query),
-        ast::SetExpr::SetOperation(operation) => {
-            mark_set_expr_aliases_explicit(&mut operation.left);
-            mark_set_expr_aliases_explicit(&mut operation.right);
-        }
-        ast::SetExpr::Values(_) => {}
-    }
-}
-
-fn mark_table_with_joins_aliases_explicit(table_with_joins: &mut ast::TableWithJoins) {
-    mark_table_factor_aliases_explicit(&mut table_with_joins.relation);
-    for join in &mut table_with_joins.joins {
-        mark_table_factor_aliases_explicit(&mut join.relation);
-    }
-}
-
-fn mark_table_factor_aliases_explicit(factor: &mut ast::TableFactor) {
-    match factor {
-        ast::TableFactor::Table { alias, .. }
-        | ast::TableFactor::TableFunction { alias, .. }
-        | ast::TableFactor::Unnest { alias, .. } => {
-            if let Some(alias) = alias {
-                alias.explicit_as = true;
-            }
-        }
-        ast::TableFactor::Derived {
-            subquery, alias, ..
-        } => {
-            if let Some(alias) = alias {
-                alias.explicit_as = true;
-            }
-            mark_query_aliases_explicit(subquery);
-        }
-        ast::TableFactor::NestedJoin {
-            table_with_joins,
-            alias,
-            ..
-        } => {
-            if let Some(alias) = alias {
-                alias.explicit_as = true;
-            }
-            mark_table_with_joins_aliases_explicit(table_with_joins);
-        }
-    }
-}
-
-fn format_access_display_name(access: &ast::AccessExpr) -> String {
-    if let ast::AccessKind::Field(field) = &access.kind
-        && matches!(
-            access.expr.as_ref(),
-            ast::Expr::Identifier(_) | ast::Expr::CompoundIdentifier(_)
-        )
-    {
+fn format_dereference_display_name(node: &ast::DereferenceExpr, whole: &ast::Expr) -> String {
+    let Some(field) = &node.field else {
+        return crate::parser::expression_for_diagnostic(whole);
+    };
+    if pure_identifier_chain(&node.base).is_some() {
         return field.value.clone();
     }
-
-    let base = expr_display_name_preserve_path(&access.expr);
-    match &access.kind {
-        ast::AccessKind::Field(field) => format!("{base}.{}", field.value),
-        ast::AccessKind::Subscript(index) => format!("{base}[{}]", expr_display_name(index)),
-        ast::AccessKind::Json { operator, path } => {
-            let operator = match operator {
-                ast::JsonOperator::Arrow => "->",
-                ast::JsonOperator::ArrowText => "->>",
-            };
-            format!(
-                "{base} {operator} {}",
-                expr_display_name_preserve_path(path)
-            )
-        }
-    }
+    format!(
+        "{}.{}",
+        expr_display_name_preserve_path(&node.base),
+        field.value
+    )
 }
+
 fn expr_display_name_preserve_path(expr: &ast::Expr) -> String {
-    match expr {
-        ast::Expr::Nested(nested) => expr_display_name_preserve_path(&nested.expression),
-        ast::Expr::CompoundIdentifier(identifier) => identifier
-            .parts
-            .iter()
+    if let Some(chain) = pure_identifier_chain(expr) {
+        let mut parts = chain
+            .iter_rev()
             .map(|part| part.value.as_str())
-            .collect::<Vec<_>>()
-            .join("."),
-        ast::Expr::Access(access) => format_access_display_name_preserve_path(access),
+            .collect::<Vec<_>>();
+        parts.reverse();
+        return parts.join(".");
+    }
+    match expr {
+        ast::Expr::Dereference(node) => match &node.field {
+            Some(field) => format!(
+                "{}.{}",
+                expr_display_name_preserve_path(&node.base),
+                field.value
+            ),
+            None => crate::parser::expression_for_diagnostic(expr),
+        },
+        ast::Expr::Subscript(node) => format!(
+            "{}[{}]",
+            expr_display_name_preserve_path(&node.base),
+            expr_display_name(&node.index)
+        ),
+        ast::Expr::ArrayWildcardSubscript(_) => crate::parser::expression_for_diagnostic(expr),
         _ => expr_display_name(expr),
     }
 }
-
-fn format_access_display_name_preserve_path(access: &ast::AccessExpr) -> String {
-    let base = expr_display_name_preserve_path(&access.expr);
-    match &access.kind {
-        ast::AccessKind::Field(field) => format!("{base}.{}", field.value),
-        ast::AccessKind::Subscript(index) => format!("{base}[{}]", expr_display_name(index)),
-        ast::AccessKind::Json { operator, path } => {
-            let operator = match operator {
-                ast::JsonOperator::Arrow => "->",
-                ast::JsonOperator::ArrowText => "->>",
-            };
-            format!(
-                "{base} {operator} {}",
-                expr_display_name_preserve_path(path)
-            )
-        }
-    }
-}
-
 fn format_literal_display_name(literal: &ast::Literal) -> String {
     match &literal.kind {
         ast::LiteralKind::String(value) => format!("'{}'", value.replace('\'', "''")),
         ast::LiteralKind::Boolean(true) => "TRUE".to_string(),
         ast::LiteralKind::Boolean(false) => "FALSE".to_string(),
         ast::LiteralKind::Null => "NULL".to_string(),
-        ast::LiteralKind::Number(value) => value.clone(),
-        ast::LiteralKind::HexString(value) => format!("X'{value}'"),
+        ast::LiteralKind::Long { spelling, .. } | ast::LiteralKind::Decimal(spelling) => {
+            spelling.clone()
+        }
+        ast::LiteralKind::Double(value) => value.get().to_string(),
+        ast::LiteralKind::Binary(bytes) => format!("X'{}'", hex::encode(bytes)),
+        ast::LiteralKind::Generic(_) | ast::LiteralKind::Interval(_) => {
+            crate::parser::expression_for_diagnostic(&ast::Expr::Literal(literal.clone()))
+        }
     }
 }
 
 fn expr_display_name_with_parens(expr: &ast::Expr) -> String {
+    if pure_identifier_chain(expr).is_some() {
+        return expr_display_name(expr);
+    }
     match expr {
-        ast::Expr::Identifier(_) | ast::Expr::CompoundIdentifier(_) | ast::Expr::Literal(_) => {
-            expr_display_name(expr)
-        }
+        ast::Expr::Identifier(_) | ast::Expr::Literal(_) => expr_display_name(expr),
         ast::Expr::Unary(unary)
             if unary.operator == ast::UnaryOperator::Minus
                 && matches!(unary.expression.as_ref(), ast::Expr::Literal(_)) =>
         {
             expr_display_name(expr)
         }
-        ast::Expr::Nested(nested) => expr_display_name_with_parens(&nested.expression),
         _ => format!("({})", expr_display_name(expr)),
     }
 }
 
-fn format_is_predicate_display_name(predicate: &ast::IsPredicateExpr) -> String {
-    let suffix = match predicate.predicate {
-        ast::IsPredicate::Null => "IS NULL",
-        ast::IsPredicate::NotNull => "IS NOT NULL",
-        ast::IsPredicate::True => "IS TRUE",
-        ast::IsPredicate::NotTrue => "IS NOT TRUE",
-        ast::IsPredicate::False => "IS FALSE",
-        ast::IsPredicate::NotFalse => "IS NOT FALSE",
-        ast::IsPredicate::Unknown => "IS UNKNOWN",
-        ast::IsPredicate::NotUnknown => "IS NOT UNKNOWN",
-    };
-    format!(
-        "{} {suffix}",
-        expr_display_name_with_parens(&predicate.expr)
-    )
+fn format_predicated_display_name(expression: &ast::Expr, node: &ast::PredicatedExpr) -> String {
+    let value = || expr_display_name_with_parens(&node.value);
+    match &node.predicate {
+        ast::Predicate::Comparison(p) => {
+            let operator = match p.operator {
+                ast::ComparisonOperator::Equal => "=",
+                ast::ComparisonOperator::NotEqual => "!=",
+                ast::ComparisonOperator::LessThan => "<",
+                ast::ComparisonOperator::LessThanOrEqual => "<=",
+                ast::ComparisonOperator::GreaterThan => ">",
+                ast::ComparisonOperator::GreaterThanOrEqual => ">=",
+            };
+            format!(
+                "{} {operator} {}",
+                value(),
+                expr_display_name_with_parens(&p.right)
+            )
+        }
+        ast::Predicate::DistinctFrom(p) => {
+            let equal = format!(
+                "{} <=> {}",
+                value(),
+                expr_display_name_with_parens(&p.right)
+            );
+            if p.negated {
+                equal
+            } else {
+                format!("NOT ({equal})")
+            }
+        }
+        ast::Predicate::IsNull(p) => {
+            format!("{} IS {}NULL", value(), if p.negated { "NOT " } else { "" })
+        }
+        ast::Predicate::BooleanTest(p) => {
+            let truth = match p.truth_value {
+                ast::TruthValue::True => "TRUE",
+                ast::TruthValue::False => "FALSE",
+                ast::TruthValue::Unknown => "UNKNOWN",
+            };
+            format!(
+                "{} IS {}{truth}",
+                value(),
+                if p.negated { "NOT " } else { "" }
+            )
+        }
+        ast::Predicate::In(p) => {
+            let not = if p.negated { " NOT" } else { "" };
+            match &p.value_list {
+                ast::Expr::InList(list) => format!(
+                    "{}{not} IN ({})",
+                    value(),
+                    list.values
+                        .iter()
+                        .map(expr_display_name_with_parens)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                ast::Expr::Subquery(subquery) => format!(
+                    "{}{not} IN ((({})))",
+                    value(),
+                    format_subquery_display_name(&subquery.query)
+                ),
+                _ => {
+                    lowercase_leading_keyword(&crate::parser::expression_for_diagnostic(expression))
+                }
+            }
+        }
+        _ => lowercase_leading_keyword(&crate::parser::expression_for_diagnostic(expression)),
+    }
 }
 
 fn binary_operator_display(operator: ast::BinaryOperator) -> &'static str {
     match operator {
-        ast::BinaryOperator::NamedArgument => "=>",
-        ast::BinaryOperator::Or => "OR",
-        ast::BinaryOperator::And => "AND",
-        ast::BinaryOperator::Equal => "=",
-        ast::BinaryOperator::NullSafeEqual => "<=>",
-        ast::BinaryOperator::NotEqual => "!=",
-        ast::BinaryOperator::LessThan => "<",
-        ast::BinaryOperator::LessThanOrEqual => "<=",
-        ast::BinaryOperator::GreaterThan => ">",
-        ast::BinaryOperator::GreaterThanOrEqual => ">=",
         ast::BinaryOperator::Add => "+",
         ast::BinaryOperator::Subtract => "-",
         ast::BinaryOperator::Multiply => "*",
         ast::BinaryOperator::Divide => "/",
         ast::BinaryOperator::Modulo => "%",
-        ast::BinaryOperator::BitwiseAnd => "&",
-        ast::BinaryOperator::BitwiseOr => "|",
-        ast::BinaryOperator::BitwiseXor => "^",
-        ast::BinaryOperator::ShiftLeft => "<<",
-        ast::BinaryOperator::ShiftRight => ">>",
-        ast::BinaryOperator::StringConcat => "||",
-        ast::BinaryOperator::IsDistinctFrom => "IS DISTINCT FROM",
-        ast::BinaryOperator::IsNotDistinctFrom => "IS NOT DISTINCT FROM",
     }
 }
 
 fn type_name_is(data_type: &ast::TypeName, expected: &str) -> bool {
-    data_type
-        .name
-        .parts
-        .last()
-        .is_some_and(|part| part.value.eq_ignore_ascii_case(expected))
+    matches!(&data_type.kind, ast::TypeKind::Generic(value) if value.name.value.eq_ignore_ascii_case(expected))
 }
 
 fn format_cast_type(data_type: &ast::TypeName) -> String {
-    let name = data_type
-        .name
-        .parts
-        .last()
-        .map(|part| part.value.to_ascii_lowercase())
-        .unwrap_or_default();
-    match name.as_str() {
-        "decimal" | "dec" | "numeric" | "decimal32" | "decimal64" | "decimal128" => {
-            let precision = numeric_type_argument(data_type, 0).unwrap_or(38);
-            let scale = numeric_type_argument(data_type, 1).unwrap_or(0);
-            format!("{}({precision},{scale})", decimal_kind(precision))
-        }
-        "tinyint" => "TINYINT".to_string(),
-        "smallint" => "SMALLINT".to_string(),
-        "bigint" => "BIGINT".to_string(),
-        "largeint" => "LARGEINT".to_string(),
-        "string" => "VARCHAR(65533)".to_string(),
-        "binary" | "varbinary" => "VARBINARY".to_string(),
-        "int" | "integer" => "INT".to_string(),
-        "array" => format!(
-            "ARRAY<{}>",
-            data_type
-                .arguments
-                .first()
-                .and_then(type_name_argument_as_type)
-                .map(format_cast_type)
-                .unwrap_or_default()
-        ),
-        "map" => format!(
-            "MAP<{}>",
-            data_type
-                .arguments
-                .iter()
-                .filter_map(type_name_argument_as_type)
-                .map(format_cast_type)
-                .collect::<Vec<_>>()
-                .join(",")
-        ),
-        "struct" => format!(
-            "struct<{}>",
-            data_type
-                .arguments
-                .iter()
-                .map(format_struct_type_argument)
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-        _ => printer::print_type_name(data_type),
-    }
+    format_type_display(data_type, 0)
 }
 
 fn format_cast_type_for_expression(data_type: &ast::TypeName, expression: &ast::Expr) -> String {
@@ -1208,131 +1197,90 @@ fn is_parse_json_call(expression: &ast::Expr) -> bool {
 }
 
 fn format_json_cast_type(data_type: &ast::TypeName) -> String {
-    let name = data_type
-        .name
-        .parts
-        .last()
-        .map(|part| part.value.to_ascii_lowercase())
-        .unwrap_or_default();
-    match name.as_str() {
-        "array" => format!(
-            "ARRAY<{}>",
-            data_type
-                .arguments
-                .first()
-                .and_then(type_name_argument_as_type)
-                .map(format_json_cast_type)
-                .unwrap_or_default()
-        ),
-        "map" => format!(
-            "MAP<{}>",
-            data_type
-                .arguments
-                .iter()
-                .filter_map(type_name_argument_as_type)
-                .map(format_json_cast_type)
-                .collect::<Vec<_>>()
-                .join(",")
-        ),
-        "struct" => format!(
-            "struct<{}>",
-            data_type
-                .arguments
-                .iter()
-                .map(format_json_struct_type_argument)
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-        _ => format_cast_type(data_type),
-    }
+    format_type_display(data_type, 1)
 }
 
 fn numeric_type_argument(data_type: &ast::TypeName, index: usize) -> Option<u64> {
-    match data_type.arguments.get(index) {
-        Some(ast::TypeNameArgument::Literal(ast::Literal {
-            kind: ast::LiteralKind::Number(value),
-            ..
-        })) => value.parse().ok(),
+    let ast::TypeKind::Generic(value) = &data_type.kind else {
+        return None;
+    };
+    match value.arguments.get(index) {
+        Some(ast::DataTypeParameter::Numeric(value)) => u64::try_from(value.parsed_value).ok(),
         _ => None,
     }
 }
 
-fn type_name_argument_as_type(argument: &ast::TypeNameArgument) -> Option<&ast::TypeName> {
+fn type_name_argument_as_type(argument: &ast::DataTypeParameter) -> Option<&ast::TypeName> {
     match argument {
-        ast::TypeNameArgument::Type(data_type) => Some(data_type),
-        _ => None,
+        ast::DataTypeParameter::Type(value) => Some(&value.data_type),
+        ast::DataTypeParameter::Numeric(_) => None,
     }
 }
 
-fn format_struct_type_argument(argument: &ast::TypeNameArgument) -> String {
-    match argument {
-        ast::TypeNameArgument::Field(field) => {
-            format!(
-                "{} {}",
-                field.name.value,
-                format_cast_type(&field.data_type)
-            )
+// These are the established output-column display spellings, not SQL syntax.
+// The parser printer remains the owner of reparsable Trino type text.
+fn format_type_display(data_type: &ast::TypeName, style: u8) -> String {
+    match &data_type.kind {
+        ast::TypeKind::Row(row) => {
+            let fields = row
+                .fields
+                .iter()
+                .map(|field| {
+                    let child =
+                        format_type_display(&field.data_type, if style == 0 { 0 } else { 2 });
+                    field
+                        .name
+                        .as_ref()
+                        .map(|name| format!("{} {child}", name.value))
+                        .unwrap_or(child)
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("struct<{fields}>")
         }
-        ast::TypeNameArgument::Type(data_type) => format_cast_type(data_type),
-        ast::TypeNameArgument::Literal(literal) => format_literal_display_name(literal),
-    }
-}
-
-fn format_json_struct_type_argument(argument: &ast::TypeNameArgument) -> String {
-    match argument {
-        ast::TypeNameArgument::Field(field) => format!(
-            "{} {}",
-            field.name.value,
-            format_json_struct_field_cast_type(&field.data_type)
-        ),
-        ast::TypeNameArgument::Type(data_type) => format_json_struct_field_cast_type(data_type),
-        ast::TypeNameArgument::Literal(literal) => format_literal_display_name(literal),
-    }
-}
-
-fn format_json_struct_field_cast_type(data_type: &ast::TypeName) -> String {
-    let name = data_type
-        .name
-        .parts
-        .last()
-        .map(|part| part.value.to_ascii_lowercase())
-        .unwrap_or_default();
-    match name.as_str() {
-        "tinyint" => "tinyint(4)".to_string(),
-        "smallint" => "smallint(6)".to_string(),
-        "int" | "integer" => "int(11)".to_string(),
-        "bigint" => "bigint(20)".to_string(),
-        "string" => "varchar(65533)".to_string(),
-        "binary" | "varbinary" => "varbinary".to_string(),
-        "array" => format!(
-            "array<{}>",
-            data_type
-                .arguments
-                .first()
-                .and_then(type_name_argument_as_type)
-                .map(format_json_struct_field_cast_type)
-                .unwrap_or_default()
-        ),
-        "map" => format!(
-            "map<{}>",
-            data_type
-                .arguments
-                .iter()
-                .filter_map(type_name_argument_as_type)
-                .map(format_json_struct_field_cast_type)
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-        "struct" => format!(
-            "struct<{}>",
-            data_type
-                .arguments
-                .iter()
-                .map(format_json_struct_type_argument)
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-        _ => format_cast_type(data_type),
+        ast::TypeKind::Generic(generic) => {
+            let name = generic.name.value.to_ascii_lowercase();
+            let arguments = &generic.arguments;
+            match name.as_str() {
+                "array" => {
+                    let child = arguments
+                        .first()
+                        .and_then(type_name_argument_as_type)
+                        .map(|child| format_type_display(child, style))
+                        .unwrap_or_default();
+                    format!("{}<{child}>", if style == 2 { "array" } else { "ARRAY" })
+                }
+                "map" => {
+                    let children = arguments
+                        .iter()
+                        .filter_map(type_name_argument_as_type)
+                        .map(|child| format_type_display(child, style))
+                        .collect::<Vec<_>>()
+                        .join(if style == 2 { ", " } else { "," });
+                    format!("{}<{children}>", if style == 2 { "map" } else { "MAP" })
+                }
+                "tinyint" if style == 2 => "tinyint(4)".into(),
+                "smallint" if style == 2 => "smallint(6)".into(),
+                "int" | "integer" if style == 2 => "int(11)".into(),
+                "bigint" if style == 2 => "bigint(20)".into(),
+                "string" if style == 2 => "varchar(65533)".into(),
+                "binary" | "varbinary" if style == 2 => "varbinary".into(),
+                "decimal" | "dec" | "numeric" | "decimal32" | "decimal64" | "decimal128" => {
+                    let precision = numeric_type_argument(data_type, 0).unwrap_or(38);
+                    let scale = numeric_type_argument(data_type, 1).unwrap_or(0);
+                    format!("{}({precision},{scale})", decimal_kind(precision))
+                }
+                "tinyint" => "TINYINT".into(),
+                "smallint" => "SMALLINT".into(),
+                "bigint" => "BIGINT".into(),
+                "largeint" => "LARGEINT".into(),
+                "int" | "integer" => "INT".into(),
+                "string" => "VARCHAR(65533)".into(),
+                "binary" | "varbinary" => "VARBINARY".into(),
+                _ => crate::parser::type_for_diagnostic(data_type),
+            }
+        }
+        _ => crate::parser::type_for_diagnostic(data_type),
     }
 }
 
@@ -1358,6 +1306,17 @@ fn canonical_display_function_name(name: &str) -> String {
     }
 }
 
+fn format_control_call_display(name: &str, arguments: &[&ast::Expr]) -> String {
+    format!(
+        "{name}({})",
+        arguments
+            .iter()
+            .map(|argument| expr_display_name_preserve_path(argument))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
 fn format_function_display_name(function: &ast::FunctionCall) -> String {
     let original_name = function
         .name
@@ -1372,41 +1331,48 @@ fn format_function_display_name(function: &ast::FunctionCall) -> String {
     if canonical_name == "element_at" && function.arguments.len() == 2 {
         return format!(
             "{}[{}]",
-            expr_display_name_preserve_path(&function.arguments[0]),
-            expr_display_name(&function.arguments[1])
+            expr_display_name_preserve_path(&function.arguments[0].value),
+            expr_display_name(&function.arguments[1].value)
         );
     }
 
-    let distinct = matches!(function.quantifier, ast::FunctionQuantifier::Distinct)
-        || original_name == "array_agg_distinct";
-    let (arguments, order_arguments, implicit_separator) = if canonical_name == "group_concat" {
-        // Prepared syntax owns values and separator in distinct fields.
-        let values = function.arguments.as_slice();
-        let separator = function.separator.as_deref();
-        (
-            values
-                .iter()
-                .map(expr_display_name_preserve_path)
-                .collect::<Vec<_>>()
-                .join(","),
-            values,
-            separator,
-        )
-    } else {
-        (
-            format_function_arguments(function, &canonical_name),
-            function.arguments.as_slice(),
-            None,
-        )
-    };
+    let distinct = function.distinct || original_name == "array_agg_distinct";
+    let argument_values = function
+        .arguments
+        .iter()
+        .map(|argument| &argument.value)
+        .collect::<Vec<_>>();
+    // STRING_AGG's declared final argument is its separator. Raw ordinary
+    // GROUP_CONCAT syntax has not yet acquired that canonical contract.
+    let (arguments, order_arguments, concat_separator) =
+        if original_name == "string_agg" && argument_values.len() >= 2 {
+            let (separator, values) = argument_values
+                .split_last()
+                .expect("two canonical arguments");
+            (
+                values
+                    .iter()
+                    .map(|value| expr_display_name_preserve_path(value))
+                    .collect::<Vec<_>>()
+                    .join(","),
+                values,
+                Some(*separator),
+            )
+        } else {
+            (
+                format_function_arguments(function, &canonical_name),
+                argument_values.as_slice(),
+                None,
+            )
+        };
     let mut out = format!("{canonical_name}(");
     if distinct {
         out.push_str("DISTINCT ");
     }
     out.push_str(&arguments);
-    if !function.order_by.is_empty() {
-        let visible = function
-            .order_by
+    if let Some(order_by) = &function.order_by {
+        let visible = order_by
+            .items
             .iter()
             .filter(|item| !is_constant_function_order_by(item, order_arguments))
             .map(|item| format_function_order_by(item, order_arguments))
@@ -1419,20 +1385,12 @@ fn format_function_display_name(function: &ast::FunctionCall) -> String {
             out.push_str(&visible.join(", "));
         }
     }
-    if canonical_name == "group_concat" {
+    if let Some(separator) = concat_separator {
         if !arguments.is_empty() {
             out.push(' ');
         }
         out.push_str("SEPARATOR ");
-        out.push_str(
-            function
-                .separator
-                .as_deref()
-                .map(expr_display_name)
-                .or_else(|| implicit_separator.map(expr_display_name))
-                .as_deref()
-                .unwrap_or("','"),
-        );
+        out.push_str(&expr_display_name(separator));
     }
     out.push(')');
 
@@ -1450,7 +1408,7 @@ fn format_function_display_name(function: &ast::FunctionCall) -> String {
             ast::NullTreatment::RespectNulls => "respect nulls",
         });
     }
-    if let Some(over) = &function.over {
+    if let Some(over) = &function.window {
         out.push_str(" OVER ");
         out.push_str(&format_window_display_name(over));
     }
@@ -1474,13 +1432,10 @@ fn restore_typeof_cast_spelling(display: String, function: &ast::FunctionCall) -
     impl ast::Visit for Collector {
         fn visit_expr(&mut self, expression: &ast::Expr) {
             if let ast::Expr::Cast(cast) = expression {
-                let source = cast
-                    .data_type
-                    .name
-                    .parts
-                    .last()
-                    .map(|part| part.value.as_str())
-                    .unwrap_or_default();
+                let source = match &cast.data_type.kind {
+                    ast::TypeKind::Generic(value) => value.name.value.as_str(),
+                    _ => "",
+                };
                 let canonical = format_cast_type(&cast.data_type);
                 let display = match source {
                     // `typeof` has legacy result-header spellings for these
@@ -1497,7 +1452,7 @@ fn restore_typeof_cast_spelling(display: String, function: &ast::FunctionCall) -
 
     let mut collector = Collector { casts: Vec::new() };
     for argument in &function.arguments {
-        ast::Visit::visit_expr(&mut collector, argument);
+        ast::Visit::visit_expr(&mut collector, &argument.value);
     }
     if collector.casts.is_empty() {
         return display;
@@ -1524,7 +1479,7 @@ fn format_function_arguments(function: &ast::FunctionCall, canonical_name: &str)
     let mut arguments = function
         .arguments
         .iter()
-        .map(expr_display_name_preserve_path)
+        .map(|argument| expr_display_name_preserve_path(&argument.value))
         .collect::<Vec<_>>();
     if function_null_treatment_is_argument(canonical_name, arguments.len())
         && let Some(null_treatment) = function.null_treatment
@@ -1546,7 +1501,7 @@ fn function_null_treatment_is_argument(canonical_name: &str, argument_count: usi
 
 fn format_map_display_name(function: &ast::FunctionCall) -> String {
     let mut pairs = Vec::new();
-    let mut arguments = function.arguments.iter();
+    let mut arguments = function.arguments.iter().map(|argument| &argument.value);
     while let Some(key) = arguments.next() {
         let key = expr_display_name_preserve_path(key);
         if let Some(value) = arguments.next() {
@@ -1558,42 +1513,61 @@ fn format_map_display_name(function: &ast::FunctionCall) -> String {
     format!("map{{{}}}", pairs.join(","))
 }
 
-fn is_constant_function_order_by(order_by: &ast::FunctionOrderBy, arguments: &[ast::Expr]) -> bool {
-    ordinal_function_argument(&order_by.expr, arguments)
+fn is_constant_function_order_by(order_by: &ast::SortItem, arguments: &[&ast::Expr]) -> bool {
+    ordinal_function_argument(&order_by.sort_key, arguments)
         .map(is_constant_expr)
-        .unwrap_or_else(|| is_constant_expr(&order_by.expr))
+        .unwrap_or_else(|| is_constant_expr(&order_by.sort_key))
 }
 
 fn ordinal_function_argument<'a>(
     expr: &ast::Expr,
-    arguments: &'a [ast::Expr],
+    arguments: &'a [&'a ast::Expr],
 ) -> Option<&'a ast::Expr> {
     let ast::Expr::Literal(ast::Literal {
-        kind: ast::LiteralKind::Number(position),
+        kind: ast::LiteralKind::Long {
+            parsed_value: position,
+            ..
+        },
         ..
     }) = expr
     else {
         return None;
     };
-    position
-        .parse::<usize>()
+    usize::try_from(*position)
         .ok()
         .and_then(|position| arguments.get(position.saturating_sub(1)))
+        .copied()
 }
 
 fn is_constant_expr(expr: &ast::Expr) -> bool {
-    match expr {
-        ast::Expr::Literal(_) => true,
-        ast::Expr::Nested(nested) => is_constant_expr(&nested.expression),
-        _ => false,
-    }
+    matches!(expr, ast::Expr::Literal(_))
 }
 
-fn format_function_order_by(order_by: &ast::FunctionOrderBy, arguments: &[ast::Expr]) -> String {
-    let expression = ordinal_function_argument(&order_by.expr, arguments)
+fn format_function_order_by(order_by: &ast::SortItem, arguments: &[&ast::Expr]) -> String {
+    let expression = ordinal_function_argument(&order_by.sort_key, arguments)
         .map(expr_display_name_preserve_path)
-        .unwrap_or_else(|| expr_display_name(&order_by.expr));
-    format_order_by_display_name(expression, order_by.asc, order_by.nulls_first)
+        .unwrap_or_else(|| expr_display_name(&order_by.sort_key));
+    format_order_by_display_name(
+        expression,
+        Some(matches!(order_by.ordering, ast::SortOrdering::Ascending)),
+        sort_item_explicit_nulls(order_by),
+    )
+}
+
+/// Freeze execution flags using the original NULL placement rule. Undefined
+/// remains an AST fact; this conversion does not rewrite it to a default enum.
+pub(super) fn sort_item_flags(item: &ast::SortItem) -> (bool, bool) {
+    let ascending = matches!(item.ordering, ast::SortOrdering::Ascending);
+    let nulls_first = sort_item_explicit_nulls(item).unwrap_or(ascending);
+    (ascending, nulls_first)
+}
+
+fn sort_item_explicit_nulls(item: &ast::SortItem) -> Option<bool> {
+    match item.null_ordering {
+        ast::NullOrdering::First => Some(true),
+        ast::NullOrdering::Last => Some(false),
+        ast::NullOrdering::Undefined => None,
+    }
 }
 
 fn format_order_by_display_name(
@@ -1615,7 +1589,16 @@ fn format_order_by_display_name(
     out
 }
 
-fn format_window_display_name(over: &ast::WindowSpec) -> String {
+fn format_window_display_name(window: &ast::Window) -> String {
+    match window {
+        ast::Window::Reference(reference) => reference.name.value.clone(),
+        ast::Window::Specification(specification) => {
+            format_window_specification_display_name(specification)
+        }
+    }
+}
+
+fn format_window_specification_display_name(over: &ast::WindowSpecification) -> String {
     if let Some(name) = &over.existing_window_name {
         return name.value.clone();
     }
@@ -1631,16 +1614,17 @@ fn format_window_display_name(over: &ast::WindowSpec) -> String {
                 .join(", ")
         ));
     }
-    if !over.order_by.is_empty() {
+    if let Some(order_by) = &over.order_by {
         parts.push(format!(
             "ORDER BY {}",
-            over.order_by
+            order_by
+                .items
                 .iter()
                 .map(|order_by| {
                     format_order_by_display_name(
-                        expr_display_name(&order_by.expr),
-                        order_by.asc,
-                        order_by.nulls_first,
+                        expr_display_name(&order_by.sort_key),
+                        Some(matches!(order_by.ordering, ast::SortOrdering::Ascending)),
+                        sort_item_explicit_nulls(order_by),
                     )
                 })
                 .collect::<Vec<_>>()
@@ -1710,28 +1694,60 @@ fn lowercase_leading_keyword(display: &str) -> String {
 // LIMIT / OFFSET extraction
 // ---------------------------------------------------------------------------
 
-pub(super) fn extract_limit(query: &ast::Query) -> Result<Option<i64>, AnalyzeError> {
-    match &query.limit {
-        Some(limit) => eval_limit_or_offset(limit, "LIMIT").map(Some),
+pub(super) fn query_modifiers(query: &ast::Query) -> Result<&ast::QueryModifiers, AnalyzeError> {
+    match query.body.as_ref() {
+        ast::SetExpr::Select(select) => {
+            if !query.modifiers.is_empty() {
+                return Err(AnalyzeError::invalid_query_shape(
+                    "direct SELECT modifiers must belong to the query specification",
+                    query.span,
+                ));
+            }
+            Ok(&select.modifiers)
+        }
+        _ => Ok(&query.modifiers),
+    }
+}
+
+pub(super) fn extract_limit(modifiers: &ast::QueryModifiers) -> Result<Option<i64>, AnalyzeError> {
+    match &modifiers.limit {
+        Some(ast::QueryLimit::Limit(limit)) => match &limit.row_count {
+            ast::Expr::AllRows(_) => Ok(None),
+            row_count => eval_limit_or_offset(row_count, "LIMIT").map(Some),
+        },
+        Some(ast::QueryLimit::FetchFirst(fetch)) => Err(AnalyzeError::unsupported_expression(
+            "FETCH FIRST is not supported",
+            fetch.span,
+        )),
         None => Ok(None),
     }
 }
 
-pub(super) fn extract_offset(query: &ast::Query) -> Result<Option<i64>, AnalyzeError> {
-    match &query.offset {
-        Some(offset) => eval_limit_or_offset(&offset.value, "OFFSET").map(Some),
+pub(super) fn extract_offset(modifiers: &ast::QueryModifiers) -> Result<Option<i64>, AnalyzeError> {
+    match &modifiers.offset {
+        Some(offset) => eval_limit_or_offset(&offset.row_count, "OFFSET").map(Some),
         None => Ok(None),
     }
 }
 
 fn eval_limit_or_offset(expr: &ast::Expr, keyword: &str) -> Result<i64, AnalyzeError> {
     match expr {
+        ast::Expr::Parameter(_) => Err(AnalyzeError::unsupported_expression(
+            format!("parameterized {keyword} is not supported"),
+            expr.span(),
+        )),
+        ast::Expr::AllRows(_) => Err(AnalyzeError::unsupported_expression(
+            format!("ALL is not supported for {keyword}"),
+            expr.span(),
+        )),
         ast::Expr::Literal(ast::Literal {
-            kind: ast::LiteralKind::Number(value),
+            kind:
+                ast::LiteralKind::Long {
+                    parsed_value: value,
+                    ..
+                },
             ..
-        }) => value.parse::<i64>().map_err(|error| {
-            AnalyzeError::invalid_literal(format!("invalid {keyword} value: {error}"), expr.span())
-        }),
+        }) => Ok(*value),
         _ => Err(AnalyzeError::invalid_argument(
             format!("only constant {keyword} is supported"),
             expr.span(),
@@ -1743,14 +1759,13 @@ fn eval_limit_or_offset(expr: &ast::Expr, keyword: &str) -> Result<i64, AnalyzeE
 pub(super) fn eval_const_i64(expr: &ast::Expr) -> Result<i64, AnalyzeError> {
     match expr {
         ast::Expr::Literal(ast::Literal {
-            kind: ast::LiteralKind::Number(value),
+            kind:
+                ast::LiteralKind::Long {
+                    parsed_value: value,
+                    ..
+                },
             ..
-        }) => value.parse::<i64>().map_err(|error| {
-            AnalyzeError::invalid_literal(
-                format!("cannot parse integer literal '{value}': {error}"),
-                expr.span(),
-            )
-        }),
+        }) => Ok(*value),
         ast::Expr::Unary(unary) if unary.operator == ast::UnaryOperator::Minus => {
             Ok(-eval_const_i64(&unary.expression)?)
         }
@@ -1772,11 +1787,10 @@ pub(super) fn eval_const_i64(expr: &ast::Expr) -> Result<i64, AnalyzeError> {
                 )),
             }
         }
-        ast::Expr::Nested(nested) => eval_const_i64(&nested.expression),
         _ => Err(AnalyzeError::invalid_literal(
             format!(
                 "expected constant integer expression, got: {}",
-                printer::print_expr(expr)
+                crate::parser::expression_for_diagnostic(expr)
             ),
             expr.span(),
         )),
@@ -1790,35 +1804,82 @@ mod tests {
     use super::{expr_display_name, sql_type_to_arrow};
 
     fn parse_select_expr(sql: &str) -> novarocks_parser::ast::Expr {
-        let statements = novarocks_parser::parse(sql).expect("parse SQL");
-        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
-            panic!("expected query");
-        };
+        let query = &novarocks_parser::parser::parse_query(sql).expect("parse SQL");
         let novarocks_parser::ast::SetExpr::Select(select) = query.body.as_ref() else {
             panic!("expected select body");
         };
-        let [novarocks_parser::ast::SelectItem::UnnamedExpr(expr)] = select.projection.as_slice()
+        let [novarocks_parser::ast::SelectItem::SingleColumn(projection_column)] =
+            select.projection.as_slice()
         else {
             panic!("expected unnamed expr");
         };
+        assert!(projection_column.alias.is_none(), "anonymous projection");
+        let expr = &projection_column.expression;
         expr.clone()
     }
 
     fn parse_native_cast_type(sql: &str) -> novarocks_parser::ast::TypeName {
-        let statements = novarocks_parser::parse(sql).expect("parse native SQL");
-        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
-            panic!("expected native query");
-        };
+        let query = &novarocks_parser::parser::parse_query(sql).expect("parse native SQL");
         let novarocks_parser::ast::SetExpr::Select(select) = query.body.as_ref() else {
             panic!("expected native select body");
         };
-        let [
-            novarocks_parser::ast::SelectItem::UnnamedExpr(novarocks_parser::ast::Expr::Cast(cast)),
-        ] = select.projection.as_slice()
+        let [novarocks_parser::ast::SelectItem::SingleColumn(projection_column)] =
+            select.projection.as_slice()
         else {
             panic!("expected native cast expression");
         };
+        assert!(projection_column.alias.is_none(), "anonymous projection");
+        let novarocks_parser::ast::Expr::Cast(cast) = &projection_column.expression else {
+            panic!("expected native cast expression");
+        };
         cast.data_type.clone()
+    }
+
+    #[test]
+    fn logical_display_preserves_original_adjacent_group_names_and_projection_contract() {
+        // Independent strings from the existing adjacent-pair parser/display
+        // contract cover even and odd tails, nested operators and operands.
+        for (sql, expected) in [
+            ("SELECT TRUE AND FALSE", "TRUE AND FALSE"),
+            (
+                "SELECT TRUE AND FALSE AND NULL",
+                "(TRUE AND FALSE) AND NULL",
+            ),
+            (
+                "SELECT TRUE AND FALSE AND NULL AND TRUE",
+                "(TRUE AND FALSE) AND (NULL AND TRUE)",
+            ),
+            (
+                "SELECT TRUE AND FALSE AND NULL AND TRUE AND FALSE",
+                "((TRUE AND FALSE) AND (NULL AND TRUE)) AND FALSE",
+            ),
+            (
+                "SELECT TRUE OR FALSE OR NULL OR TRUE OR FALSE",
+                "((TRUE OR FALSE) OR (NULL OR TRUE)) OR FALSE",
+            ),
+            (
+                "SELECT TRUE AND (FALSE OR NULL) AND TRUE",
+                "(TRUE AND (FALSE OR NULL)) AND TRUE",
+            ),
+            (
+                "SELECT 1 = 10 AND 2 = 20 AND 3 = 30",
+                "((1 = 10) AND (2 = 20)) AND (3 = 30)",
+            ),
+        ] {
+            let expression = parse_select_expr(sql);
+            assert_eq!(expr_display_name(&expression), expected, "{sql}");
+            let query = &novarocks_parser::parser::parse_query(sql).unwrap();
+            let (resolved, _, _) = crate::analyzer::analyze(
+                query,
+                &crate::planning::catalog::PlannerMemoryCatalog::default(),
+                "default",
+            )
+            .unwrap();
+            let crate::analysis::QueryBody::Select(select) = resolved.body else {
+                panic!("resolved select")
+            };
+            assert_eq!(select.projection[0].output_name, expected, "{sql}");
+        }
     }
 
     #[test]
@@ -1890,12 +1951,26 @@ mod tests {
                 .expect_err("invalid decimal type must fail before binding");
             assert_eq!(error.span(), Some(target.span), "{type_name}: {error}");
         }
-        let fractional = parse_native_cast_type("SELECT CAST(NULL AS DECIMAL(1.5,0))");
-        assert!(sql_type_to_arrow(&fractional).is_err());
+        // Numeric type parameters accept integer tokens. Fractions are syntax
+        // errors whose rejected span must identify source within this CAST.
+        const FRACTIONAL_SOURCE: &str = "SELECT CAST(NULL AS DECIMAL(1.5,0))";
+        let error = novarocks_parser::parser::parse_query(FRACTIONAL_SOURCE)
+            .expect_err("fractional type parameters have no final AST representation");
+        let novarocks_parser::ParserError::Parse(novarocks_parser::ParseError::UnexpectedToken {
+            span,
+            ..
+        }) = error
+        else {
+            panic!("fractional parameter must be a syntax rejection, got {error:?}");
+        };
+        let cast_start = FRACTIONAL_SOURCE.find("CAST").unwrap();
+        assert!(!span.is_empty());
+        assert!(span.start() >= cast_start && span.end() <= FRACTIONAL_SOURCE.len());
         // Signed parameters are already rejected by the native parser.
         for type_name in ["DECIMAL(-1,0)", "DECIMAL(10,-1)"] {
             assert!(
-                novarocks_parser::parse(&format!("SELECT CAST(NULL AS {type_name})")).is_err(),
+                novarocks_parser::parser::parse_query(&format!("SELECT CAST(NULL AS {type_name})"))
+                    .is_err(),
                 "{type_name}"
             );
         }
@@ -1904,7 +1979,7 @@ mod tests {
     #[test]
     fn sql_decimal_type_producer_preserves_nested_cast_carriers() {
         let target = parse_native_cast_type(
-            "SELECT CAST(NULL AS STRUCT<a ARRAY<DECIMAL(60,2)>,m MAP<INT,DECIMAL(76,4)>>)",
+            "SELECT CAST(NULL AS ROW(a ARRAY<DECIMAL(60,2)>,m MAP<INT,DECIMAL(76,4)>))",
         );
         let DataType::Struct(fields) = sql_type_to_arrow(&target).unwrap() else {
             panic!("expected STRUCT");
@@ -1936,7 +2011,7 @@ mod tests {
     #[test]
     fn expr_display_name_formats_group_concat_like_starrocks() {
         let expr =
-            parse_select_expr("SELECT group_concat(name, subject ORDER BY 1, 2 SEPARATOR ',')");
+            parse_select_expr("SELECT string_agg(name, subject \n,\n ','\nORDER BY 1, 2 \n)");
         assert_eq!(
             expr_display_name(&expr),
             "group_concat(name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')"
@@ -1945,7 +2020,7 @@ mod tests {
 
     #[test]
     fn expr_display_name_normalizes_double_quoted_strings_to_single_quotes() {
-        let expr = parse_select_expr("SELECT array_agg(\"中国\" ORDER BY 1, id)");
+        let expr = parse_select_expr("SELECT array_agg('中国' ORDER BY 1, id)");
         assert_eq!(
             expr_display_name(&expr),
             "array_agg('中国' ORDER BY id ASC)"
@@ -1954,10 +2029,10 @@ mod tests {
 
     #[test]
     fn expr_display_name_normalizes_array_literal_string_quotes() {
-        let expr = parse_select_expr("SELECT array_agg(DISTINCT [json_object(\"2:3\")])");
+        let expr = parse_select_expr("SELECT array_agg(DISTINCT ARRAY[JSON_OBJECT('k': 1)])");
         assert_eq!(
             expr_display_name(&expr),
-            "array_agg(DISTINCT [json_object('2:3')])"
+            "array_agg(DISTINCT [JSON_OBJECT(KEY 'k' VALUE 1 NULL ON NULL WITHOUT UNIQUE KEYS)])"
         );
     }
 
@@ -2049,12 +2124,10 @@ mod tests {
     #[test]
     fn expr_display_name_keeps_json_struct_field_widths_but_canonicalizes_other_structs() {
         let json_expr = parse_select_expr(
-            "SELECT CAST(parse_json('[1,2,3]') AS \
-             STRUCT<col1 INT, col2 ARRAY<INT>, col3 STRUCT<nested TINYINT>>)",
+            "SELECT CAST(parse_json('[1,2,3]') AS ROW(col1 INT, col2 ARRAY<INT>, col3 ROW(nested TINYINT)))",
         );
         let row_expr = parse_select_expr(
-            "SELECT CAST(row(1, 2, 3) AS \
-             STRUCT<col1 INT, col2 ARRAY<INT>, col3 STRUCT<nested TINYINT>>)",
+            "SELECT CAST(row(1, 2, 3) AS ROW(col1 INT, col2 ARRAY<INT>, col3 ROW(nested TINYINT)))",
         );
 
         assert_eq!(
@@ -2067,5 +2140,150 @@ mod tests {
             "CAST((row(1, 2, 3)) AS struct<col1 INT, col2 ARRAY<INT>, \
              col3 struct<nested TINYINT>>)"
         );
+    }
+    #[test]
+    fn final_row_and_datetime_nodes_preserve_names_domains_and_microsecond_contract() {
+        use novarocks_parser::{Span, ast, build};
+        use novarocks_type_contract::{ValueKind, ValueLogicalType};
+        let control = crate::compiler::SqlCompileControl::unbounded();
+        let row = build::row_type(vec![ast::RowDataTypeField {
+            name: None,
+            data_type: build::simple_type("JSON"),
+            span: Span::new(4, 8),
+        }]);
+        let value = super::sql_type_to_value_type(&row, true, &control).unwrap();
+        let ValueKind::Struct(fields) = value.value_type().kind() else {
+            panic!("row")
+        };
+        assert_eq!(fields[0].name(), "f1");
+        assert!(matches!(
+            fields[0].value_type().kind(),
+            ValueKind::Nominal(ValueLogicalType::Json)
+        ));
+        for kind in [ast::DateTimeType::Time, ast::DateTimeType::Timestamp] {
+            for precision in [None, Some(ast::AstBox::new(build::numeric_parameter(6)))] {
+                let ty = ast::TypeName {
+                    kind: ast::TypeKind::DateTime(ast::DateTimeDataType {
+                        kind,
+                        with_time_zone: false,
+                        precision,
+                    }),
+                    span: Span::new(0, 12),
+                };
+                let expected = match kind {
+                    ast::DateTimeType::Time => DataType::Time64(TimeUnit::Microsecond),
+                    ast::DateTimeType::Timestamp => {
+                        DataType::Timestamp(TimeUnit::Microsecond, None)
+                    }
+                };
+                assert_eq!(sql_type_to_arrow(&ty).unwrap(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn final_unsupported_type_and_literal_facts_reject_before_catalog_discovery() {
+        use crate::analyze_error::AnalyzeErrorKind;
+        use novarocks_parser::{Span, ast, build};
+        struct NoLookup;
+        impl crate::catalog::PlannerTableProvider for NoLookup {
+            fn resolve_table_for_analysis(
+                &self,
+                _: Option<&str>,
+                _: &str,
+                _: &str,
+            ) -> Result<crate::catalog::ResolvedAnalyzerTable, String> {
+                panic!("unsupported typed syntax must precede catalog lookup");
+            }
+        }
+        let span = Span::new(20, 80);
+        let qualifier = ast::IntervalQualifier::Simple(ast::SimpleIntervalQualifier {
+            precision: None,
+            field: ast::IntervalQualifierField::Year,
+            span,
+        });
+        let explicit = ast::TypeName {
+            kind: ast::TypeKind::ExplicitArray(ast::ExplicitArrayDataType {
+                element: ast::AstBox::new(build::simple_type("INTEGER")),
+                length: ast::ArrayLength {
+                    spelling: "9999999999999999999999999999999999999999999999999".into(),
+                    span,
+                },
+            }),
+            span,
+        };
+        let unsupported_types = vec![
+            explicit.clone(),
+            build::type_name(
+                build::ident("ARRAY", false),
+                vec![build::type_parameter(explicit)],
+            ),
+            ast::TypeName {
+                kind: ast::TypeKind::Interval(ast::IntervalDataType {
+                    qualifier: qualifier.clone(),
+                    span,
+                }),
+                span,
+            },
+            ast::TypeName {
+                kind: ast::TypeKind::DateTime(ast::DateTimeDataType {
+                    kind: ast::DateTimeType::Timestamp,
+                    with_time_zone: true,
+                    precision: None,
+                }),
+                span,
+            },
+            ast::TypeName {
+                kind: ast::TypeKind::DateTime(ast::DateTimeDataType {
+                    kind: ast::DateTimeType::Time,
+                    with_time_zone: false,
+                    precision: Some(ast::AstBox::new(build::numeric_parameter(3))),
+                }),
+                span,
+            },
+            ast::TypeName {
+                kind: ast::TypeKind::DateTime(ast::DateTimeDataType {
+                    kind: ast::DateTimeType::Timestamp,
+                    with_time_zone: false,
+                    precision: Some(ast::AstBox::new(build::type_parameter(build::simple_type(
+                        "BIGINT",
+                    )))),
+                }),
+                span,
+            },
+        ];
+        let mut expressions = unsupported_types
+            .into_iter()
+            .map(|ty| build::cast(build::null(), ty))
+            .collect::<Vec<_>>();
+        for type_name in ["INTEGER", "\"DATE\""] {
+            expressions.push(ast::Expr::Literal(ast::Literal {
+                kind: ast::LiteralKind::Generic(ast::GenericLiteral {
+                    type_name: type_name.into(),
+                    value: "1".into(),
+                }),
+                span,
+            }));
+        }
+        expressions.push(ast::Expr::Literal(ast::Literal {
+            kind: ast::LiteralKind::Interval(ast::IntervalLiteral {
+                value: "1".into(),
+                sign: ast::IntervalSign::Positive,
+                qualifier,
+            }),
+            span,
+        }));
+        for expression in expressions {
+            let query =
+                &mut novarocks_parser::parser::parse_query("SELECT NULL FROM missing_type_input")
+                    .unwrap();
+            let ast::SetExpr::Select(select) = query.body.as_mut() else {
+                panic!("select")
+            };
+            select.projection[0] = novarocks_parser::build::item(expression, None);
+            let error = crate::analyzer::analyze(query, &NoLookup, "default").unwrap_err();
+            assert_eq!(error.kind(), AnalyzeErrorKind::UnsupportedExpression);
+            assert_eq!(error.span(), Some(span));
+        }
     }
 }

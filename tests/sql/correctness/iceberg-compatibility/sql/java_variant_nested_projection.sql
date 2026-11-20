@@ -36,7 +36,7 @@ SELECT st FROM iceberg_compat_${suite_uuid0}.${case_db}.java_variant_nested_${uu
 
 -- query 4
 -- @expect_error=Iceberg Variant writes are not supported
-INSERT INTO iceberg_compat_${suite_uuid0}.${case_db}.java_variant_nested_${uuid0} VALUES (2,NULL);
+INSERT INTO iceberg_compat_${suite_uuid0}.${case_db}.java_variant_nested_${uuid0} VALUES ROW(2,NULL);
 
 -- query 5
 -- @result_contains=IRU9_UNCHANGED_OK
@@ -48,4 +48,4 @@ receipt_dir="$(mktemp -d "$receipt_parent/$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")"
 
 -- query 6
 -- @skip_result_check=true
-DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_variant_nested_${uuid0} FORCE;
+DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_variant_nested_${uuid0} ;

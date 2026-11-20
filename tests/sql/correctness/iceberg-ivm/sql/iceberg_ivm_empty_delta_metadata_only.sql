@@ -31,41 +31,19 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE EXTERNAL CATALOG ice_ivm_empty_delta_${uuid0}
-PROPERTIES (
-  "type" = "iceberg",
-  "iceberg.catalog.type" = "rest",
-  "uri" = "${iceberg_rest_uri}",
-  "warehouse" = "${iceberg_rest_warehouse}",
-  "aws.s3.endpoint" = "${oss_endpoint}",
-  "credential.object-store-metadata.consumer-role" = "frontend",
-  "credential.object-store-metadata.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-metadata.name" = "${iceberg_object_store_metadata_credential_name}",
-  "credential.object-store-metadata.generation" = "${iceberg_object_store_credential_generation}",
-  "credential.object-store-data.consumer-role" = "backend",
-  "credential.object-store-data.mode" = "${iceberg_object_store_credential_mode}",
-  "credential.object-store-data.name" = "${iceberg_object_store_data_credential_name}",
-  "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
-  "aws.s3.region" = "${oss_region}",
-  "aws.s3.enable_path_style_access" = "${oss_path_style}"
-);
-CREATE DATABASE ice_ivm_empty_delta_${uuid0}.ns_${uuid0};
+CREATE CATALOG ice_ivm_empty_delta_${uuid0} USING iceberg WITH ("iceberg.catalog.type" = 'rest', "uri" = '${iceberg_rest_uri}', "warehouse" = '${iceberg_rest_warehouse}', "aws.s3.endpoint" = '${oss_endpoint}', "credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-metadata.name" = '${iceberg_object_store_metadata_credential_name}', "credential.object-store-metadata.generation" = '${iceberg_object_store_credential_generation}', "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-data.name" = '${iceberg_object_store_data_credential_name}', "credential.object-store-data.generation" = '${iceberg_object_store_credential_generation}', "aws.s3.region" = '${oss_region}', "aws.s3.enable_path_style_access" = '${oss_path_style}');
+CREATE SCHEMA ice_ivm_empty_delta_${uuid0}.ns_${uuid0};
 CREATE TABLE ice_ivm_empty_delta_${uuid0}.ns_${uuid0}.orders (
   id BIGINT NOT NULL,
   amount BIGINT,
   name STRING
-)
-TBLPROPERTIES ("format-version" = "3",
-  "write.row-lineage" = "true");
+) WITH (format_version = 3);
 INSERT INTO ice_ivm_empty_delta_${uuid0}.ns_${uuid0}.orders VALUES
-  (200, 200, 'keep'),
-  (1, 1, 'delete-miss'),
-  (2, 2, 'update-miss');
+  ROW(200, 200, 'keep'),
+  ROW(1, 1, 'delete-miss'),
+  ROW(2, 2, 'update-miss');
 USE ice_ivm_empty_delta_${uuid0}.ns_${uuid0};
-CREATE MATERIALIZED VIEW orders_mv
-DISTRIBUTED BY HASH(id) BUCKETS 2
-PROPERTIES ('storage_engine' = 'iceberg')
-AS SELECT id, amount, name
+CREATE MATERIALIZED VIEW orders_mv AS SELECT id, amount, name
 FROM orders
 WHERE amount > 100;
 
@@ -81,7 +59,7 @@ SELECT id, amount, name FROM orders_mv ORDER BY id;
 -- base window without changing the visible MV result.
 -- @skip_result_check=true
 INSERT INTO ice_ivm_empty_delta_${uuid0}.ns_${uuid0}.orders VALUES
-  (3, 3, 'insert-miss');
+  ROW(3, 3, 'insert-miss');
 REFRESH MATERIALIZED VIEW orders_mv;
 
 -- query 5
@@ -107,6 +85,6 @@ SELECT id, amount, name FROM orders_mv ORDER BY id;
 -- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW orders_mv;
-DROP TABLE ice_ivm_empty_delta_${uuid0}.ns_${uuid0}.orders FORCE;
-DROP DATABASE ice_ivm_empty_delta_${uuid0}.ns_${uuid0};
+DROP TABLE ice_ivm_empty_delta_${uuid0}.ns_${uuid0}.orders ;
+DROP SCHEMA ice_ivm_empty_delta_${uuid0}.ns_${uuid0};
 DROP CATALOG ice_ivm_empty_delta_${uuid0};

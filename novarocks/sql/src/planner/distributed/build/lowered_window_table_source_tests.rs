@@ -752,12 +752,13 @@ fn window_and_table_journals_keep_none_elision_and_typed_null_source_policy() {
     let literal = integer(7);
     for input in [
         TypedExpr {
-            kind: ExprKind::Nested(Box::new(literal.clone())),
+            kind: ExprKind::Nested(novarocks_parser::ast::AstBox::new(literal.clone())),
             value_type: literal.value_type.clone(),
         },
         TypedExpr {
             kind: ExprKind::Cast {
-                expr: Box::new(literal.clone()),
+                array_failure_mode: None,
+                expr: novarocks_parser::ast::AstBox::new(literal.clone()),
                 target: DataType::Int64,
                 decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
             },
@@ -788,7 +789,7 @@ fn window_and_table_journals_keep_none_elision_and_typed_null_source_policy() {
         syntax_null(),
         TypedExpr {
             value_type: list_value(1).value_type,
-            kind: ExprKind::Nested(Box::new(list_value(1))),
+            kind: ExprKind::Nested(novarocks_parser::ast::AstBox::new(list_value(1))),
         },
     ] {
         let is_nested = matches!(input.kind, ExprKind::Nested(_));

@@ -469,7 +469,12 @@ fn classify_column_ref(
                 _ => None,
             }
         }
-        ScalarNode::Cast { child, .. } | ScalarNode::Nested(child) => {
+        ScalarNode::Cast {
+            child,
+            array_failure_mode: None,
+            ..
+        }
+        | ScalarNode::Nested(child) => {
             classify_column_ref(arena, *child, left_ids, right_ids, left_names, right_names)
         }
         _ => None,
@@ -933,6 +938,7 @@ mod tests {
         );
         let cast_right = arena.intern(
             ScalarNode::Cast {
+                array_failure_mode: None,
                 child: right_key,
                 target: DataType::Int64,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
@@ -958,6 +964,88 @@ mod tests {
             join_equality_pairs(&join, &left, &right, &arena).unwrap(),
             vec![("left_key".to_string(), "right_key".to_string())]
         );
+    }
+
+    #[test]
+    fn join_equality_pairs_keep_explicit_array_cast_boundaries_out_of_ukfk_proofs() {
+        use novarocks_type_contract::{
+            ArrayCastFailureMode, DecimalOverflowPolicy, FunctionValueType,
+        };
+        let list_type = |item| {
+            FunctionValueType::new(
+                DataType::List(Arc::new(Field::new("item", item, true))),
+                true,
+            )
+        };
+        let target = list_type(DataType::Int32);
+        let source = list_type(DataType::Utf8);
+        let array_scan = |table: &str, id, name, ty: &FunctionValueType| {
+            let mut expr = scan_expr(table, &[(id, name)]);
+            let Operator::LogicalScan(scan) = &mut expr.op else {
+                panic!("original scan fixture")
+            };
+            scan.table.columns[0].data_type = ty.data_type().clone();
+            scan.table.columns[0].nullable = ty.nullable();
+            scan.columns[0].value_type = ty.clone();
+            expr
+        };
+        let left = array_scan("left_t", 1, "left_key", &target);
+        let right = array_scan("right_t", 2, "right_key", &source);
+        let mut arena = ScalarArena::new();
+        let left_key = arena.intern(
+            ScalarNode::ColumnRef(ColumnId::new_for_test(1)),
+            target.clone(),
+        );
+        let right_key = arena.intern(
+            ScalarNode::ColumnRef(ColumnId::new_for_test(2)),
+            source.clone(),
+        );
+        for mode in [
+            ArrayCastFailureMode::ReportError,
+            ArrayCastFailureMode::OutputNull,
+        ] {
+            let cast = arena.intern(
+                ScalarNode::Cast {
+                    child: right_key,
+                    target: target.data_type().clone(),
+                    decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
+                    array_failure_mode: Some(mode),
+                },
+                target.clone(),
+            );
+            let condition = arena.intern(
+                ScalarNode::BinaryOp {
+                    left: left_key,
+                    op: BinOp::Eq,
+                    right: cast,
+                    decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
+                },
+                FunctionValueType::new(DataType::Boolean, true),
+            );
+            let join = LogicalJoinOp {
+                naa_author: None,
+                join_type: JoinKind::LeftOuter,
+                condition: Some(condition),
+            };
+            assert!(
+                join_equality_pairs(&join, &left, &right, &arena)
+                    .unwrap()
+                    .is_empty(),
+                "an explicit conversion cannot become a bare-key uniqueness proof"
+            );
+            let ScalarNode::Cast {
+                child,
+                array_failure_mode,
+                ..
+            } = arena.node(cast)
+            else {
+                panic!("original CAST remains in the condition")
+            };
+            assert_eq!(*child, right_key);
+            assert_eq!(*array_failure_mode, Some(mode));
+            assert_eq!(arena.value_type(cast), &target);
+            assert_eq!(arena.value_type(right_key), &source);
+        }
     }
 
     #[test]

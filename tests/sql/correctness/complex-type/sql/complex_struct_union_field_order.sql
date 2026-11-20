@@ -23,7 +23,7 @@
 
 -- query 1
 -- @skip_result_check=true
-set sql_mode='STRUCT_CAST_BY_NAME';
+SET SESSION sql_mode = 'STRUCT_CAST_BY_NAME';
 
 -- query 2
 -- UNION ALL with different field order via parse_json + CAST
@@ -35,14 +35,14 @@ source_2 as (
 ),
 source_3 as (
     select CAST(
-        source_1.dimensions AS STRUCT<`product_id` VARCHAR, `price` INT>
-    ) AS `product`
+        source_1.dimensions AS ROW("product_id" VARCHAR, "price" INT)
+    ) AS "product"
     from source_1
 ),
 source_4 as (
     select CAST(
-        source_2.dimensions AS STRUCT<`price` INT, `product_id` VARCHAR>
-    ) AS `product`
+        source_2.dimensions AS ROW("price" INT, "product_id" VARCHAR)
+    ) AS "product"
     from source_2
 )
 select product.product_id, product.price from (
@@ -92,7 +92,7 @@ with cte1 as (
 cte2 as (
     select named_struct('inner', named_struct('inner_y', 400, 'inner_x', 300), 'outer_a', 2) as s
 )
-select s.outer_a, s.`inner`.inner_x, s.`inner`.inner_y from (
+select s.outer_a, s."inner".inner_x, s."inner".inner_y from (
     select s from cte1
     union all
     select s from cte2

@@ -74,10 +74,10 @@ SELECT to_datetime(null, null);
 -- Dynamic scale via inline VALUES: mix of scales, negative ts, NULL inputs
 SELECT to_datetime(t.ts_val, t.sc_val) AS dyn_scale_timezone_aware
 FROM (VALUES
-        (1598306400123456, 6),
-        (1598306400123,    3),
-        (1598306400,       0),
-        (-1001,            3),
-        (NULL,             0),
-        (1598306400,       NULL)
+        ROW(1598306400123456, 6),
+        ROW(1598306400123,    3),
+        ROW(1598306400,       0),
+        ROW(-1001,            3),
+        ROW(NULL,             0),
+        ROW(1598306400,       NULL)
      ) AS t(ts_val, sc_val);

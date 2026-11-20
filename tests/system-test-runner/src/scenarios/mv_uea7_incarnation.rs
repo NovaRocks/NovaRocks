@@ -100,7 +100,7 @@ impl Scenario for MvIncarnationMismatch {
             context,
             &mut conn,
             "create managed MV namespace",
-            &format!("CREATE DATABASE {CATALOG}.{NAMESPACE}"),
+            &format!("CREATE SCHEMA {CATALOG}.{NAMESPACE}"),
         )?;
         execute(
             context,
@@ -108,29 +108,27 @@ impl Scenario for MvIncarnationMismatch {
             "create row-lineage source table",
             &format!(
                 "CREATE TABLE {CATALOG}.{NAMESPACE}.orders (k1 INT, v2 BIGINT) \
-                 TBLPROPERTIES (\"format-version\"=\"3\", \"write.row-lineage\"=\"true\")"
+                 WITH (format_version = 3)"
             ),
         )?;
         execute(
             context,
             &mut conn,
             "insert source rows",
-            &format!("INSERT INTO {CATALOG}.{NAMESPACE}.orders VALUES (1, 10), (2, 20)"),
+            &format!("INSERT INTO {CATALOG}.{NAMESPACE}.orders VALUES ROW(1, 10), ROW(2, 20)"),
         )?;
         select_catalog_and_namespace(context, &mut conn, CATALOG)?;
         execute(
             context,
             &mut conn,
             "create document-managed Iceberg MV",
-            "CREATE MATERIALIZED VIEW orders_mv DISTRIBUTED BY HASH(k1) BUCKETS 1 \
-             REFRESH DEFERRED MANUAL PROPERTIES ('storage_engine' = 'iceberg') \
-             AS SELECT k1, SUM(v2) AS total FROM orders GROUP BY k1",
+            "CREATE MATERIALIZED VIEW orders_mv WITH (refresh_policy = 'MANUAL') AS SELECT k1, SUM(v2) AS total FROM orders GROUP BY k1",
         )?;
         execute(
             context,
             &mut conn,
             "publish first MV snapshot",
-            "REFRESH MATERIALIZED VIEW orders_mv WITH SYNC MODE",
+            "REFRESH MATERIALIZED VIEW orders_mv",
         )?;
         assert_rows(
             context,
@@ -166,7 +164,7 @@ impl Scenario for MvIncarnationMismatch {
         )?;
 
         context.action("trigger a new managed write after another incarnation was observed");
-        let first_error = match conn.execute("REFRESH MATERIALIZED VIEW orders_mv WITH SYNC MODE") {
+        let first_error = match conn.execute("REFRESH MATERIALIZED VIEW orders_mv") {
             Err(error) => error,
             Ok(_) => bail!(
                 "refresh committed after a different Current incarnation was persisted; {}",
@@ -195,7 +193,7 @@ impl Scenario for MvIncarnationMismatch {
         // A second attempt must not restore access or overwrite the remote
         // marker with the original value.
         context.action("verify the closed target does not readmit itself on retry");
-        match conn.execute("REFRESH MATERIALIZED VIEW orders_mv WITH SYNC MODE") {
+        match conn.execute("REFRESH MATERIALIZED VIEW orders_mv") {
             Ok(_) => bail!(
                 "second refresh reopened management after incarnation mismatch; {}",
                 context.diagnostics()

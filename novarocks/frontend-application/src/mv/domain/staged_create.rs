@@ -29,6 +29,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use novarocks_mv_application::engine_properties::MvRefreshPropertyChanges;
 use novarocks_mv_application::management::{
     EffectDisposition, EffectIdentity, EffectResponsibility, EffectScope, ManagedMvTarget,
     ManagementEntrance, ManagementEntranceObligation, ManagementRequest, ManagementTimestamp,
@@ -39,7 +40,8 @@ use novarocks_mv_application::persistence::definition::MvAcceleratorSourceRevisi
 use novarocks_mv_application::persistence::publication_facts::MvPublicationInputs;
 use novarocks_spi::connector::document_storage::{
     ConnectorDocumentManagementAdmission, ConnectorDocumentManagementAdmissionRequest,
-    ConnectorDocumentManagementOperation, ConnectorDocumentStorage,
+    ConnectorDocumentManagementOperation, ConnectorDocumentPublicationSlotUpdate,
+    ConnectorDocumentStorage,
 };
 use novarocks_spi::connector::{
     CatalogHandle, ConnectorControlPlanningPin, ConnectorExactSemanticRevision,
@@ -54,6 +56,7 @@ pub(crate) mod create_original;
 mod current_metadata_cpu;
 pub(crate) use current_metadata_cpu::{
     CaptureFailure, CurrentMetadataCapture, CurrentProjectionMetadataCpu,
+    new_current_metadata_capture,
 };
 
 pub(crate) fn now_management_timestamp() -> Result<ManagementTimestamp, String> {
@@ -733,7 +736,7 @@ impl CurrentProjectionRegistration {
     }
     pub(crate) fn new() -> Self {
         Self {
-            capture: current_metadata_cpu::CurrentMetadataCapture::new(),
+            capture: current_metadata_cpu::new_current_metadata_capture(),
             receiving: Arc::new(novarocks_spi::connector::ConnectorCatalogMutationReceiving::new()),
             preparation: std::sync::OnceLock::new(),
             admission: std::sync::OnceLock::new(),
@@ -1552,6 +1555,7 @@ pub(crate) struct AdmittedMvPublication {
     versions: novarocks_mv_application::persistence::keyed_documents::MvKeyedVersions,
     entrance: ManagementEntrance,
     repartitioned: bool,
+    configuration_slot_update: Option<ConnectorDocumentPublicationSlotUpdate>,
 }
 
 impl AdmittedMvPublication {
@@ -1559,7 +1563,14 @@ impl AdmittedMvPublication {
         &self.admission
     }
 
-    /// Reobserve the same admitted target and D/L/P through the original
+    pub(crate) const fn configuration_slot_update(
+        &self,
+    ) -> Option<&ConnectorDocumentPublicationSlotUpdate> {
+        self.configuration_slot_update.as_ref()
+    }
+
+    /// Reobserve the same admitted target and D/L/P, plus the slot for a
+    /// publication which changes configuration, through the original
     /// asynchronous provider authors. The caller retains this publication and
     /// its original future; no Current/StateStore authority is manufactured.
     pub(crate) async fn recheck_current_dependencies_async(
@@ -1651,6 +1662,14 @@ impl AdmittedMvPublication {
             return Err(
                 "MV definition, interpretation or publication changed after computation".into(),
             );
+        }
+        if let Some(update) = &self.configuration_slot_update {
+            let Some(current) = documents.view.slots.get(update.name()) else {
+                return Err("MV configuration slot disappeared after computation".into());
+            };
+            if current.value.digest(update.name(), current.writer) != update.expected_old() {
+                return Err("MV configuration slot changed after computation".into());
+            }
         }
         Ok(())
     }
@@ -1857,6 +1876,7 @@ struct MvPublicationAdmissionInput {
     planning: ConnectorControlPlanningPin,
     projection: novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection,
     publication_id: LakePublicationId,
+    configuration: Option<MvRefreshPropertyChanges>,
     context: ConnectorRequestContext,
 }
 
@@ -1885,6 +1905,7 @@ struct MvPublicationAdmissionParts {
     interpretation: InterpretationDocument,
     versions: novarocks_mv_application::persistence::keyed_documents::MvKeyedVersions,
     entrance: ManagementEntrance,
+    configuration_slot_update: Option<ConnectorDocumentPublicationSlotUpdate>,
 }
 
 impl MvPublicationAdmissionParts {
@@ -1905,6 +1926,7 @@ impl MvPublicationAdmissionParts {
             versions: self.versions,
             entrance: self.entrance,
             repartitioned: false,
+            configuration_slot_update: self.configuration_slot_update,
         }
     }
 }
@@ -1982,15 +2004,71 @@ impl MvPublicationAdmissionReceiving {
     }
 }
 
+async fn prepare_repartition_configuration_slot(
+    documents: &ConnectorDocumentStorage,
+    entrance: &ManagementEntrance,
+    expected: &novarocks_mv_application::persistence::keyed_documents::MvKeyedDocumentProjection,
+    changes: &MvRefreshPropertyChanges,
+    context: &ConnectorRequestContext,
+) -> Result<ConnectorDocumentPublicationSlotUpdate, super::application::MvApplicationError> {
+    use super::application::{MvApplicationError, MvApplicationErrorKind};
+    use novarocks_mv_application::persistence::keyed_documents::{
+        configuration_slot, configuration_slot_name,
+        observe_current_keyed_documents_with_management_async,
+    };
+
+    let binding_error = |message: &str| {
+        MvApplicationError::new(MvApplicationErrorKind::BindingInvalidated, message)
+    };
+    let source = expected.source_revision();
+    let request = keyed_request(
+        documents,
+        source.target.clone(),
+        source.target_object_id.clone(),
+        context.clone(),
+    );
+    let (observed, _) =
+        observe_current_keyed_documents_with_management_async(documents, request, entrance)
+            .await
+            .map_err(|error| {
+                let projected = novarocks_mv_application::readiness::MvProjectionError::from(error);
+                let failure =
+                    MvApplicationError::new(MvApplicationErrorKind::Engine, projected.to_string());
+                match projected.original_failure() {
+                    Some(original) => failure.with_original_failure(original.clone()),
+                    None => failure,
+                }
+            })?;
+    if !metadata_only_current_matches(expected, &observed) {
+        return Err(binding_error(
+            "MV configuration or publication changed during repartition admission",
+        ));
+    }
+    let name = configuration_slot_name().map_err(|error| binding_error(&error.to_string()))?;
+    let current = observed.view.slots.get(&name).ok_or_else(|| {
+        binding_error("MV configuration slot disappeared during repartition admission")
+    })?;
+    let expected_old = current.value.digest(&name, current.writer);
+    let desired = super::flow::configuration_after_alter(&observed.configuration, changes)
+        .map_err(|error| MvApplicationError::new(MvApplicationErrorKind::InvalidRequest, error))?;
+    let configuration = super::iceberg_refresh::configuration_document(desired)
+        .map_err(|error| MvApplicationError::new(MvApplicationErrorKind::InvalidRequest, error))?;
+    let value =
+        configuration_slot(&configuration).map_err(|error| binding_error(&error.to_string()))?;
+    ConnectorDocumentPublicationSlotUpdate::try_new(name, expected_old, value)
+        .map_err(|error| MvApplicationError::from_connector(MvApplicationErrorKind::Engine, error))
+}
+
 /// Borrow the Action's original receiving slot and cancellation/deadline
-/// future. The only await is the original management FIFO. Provider document
-/// admission is a pure capability call, with its original request and lease
-/// already retained before entering the foreign author.
+/// future. An alteration changing configuration reads its actual slot after
+/// the management grant. Provider document admission remains a pure capability
+/// call, with its request and lease retained before entering the foreign author.
 pub(crate) async fn admit_mv_publication_async_in(
     entrance: &ManagementEntrance,
     planning: &ConnectorControlPlanningPin,
     projection: &novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection,
     publication_id: LakePublicationId,
+    configuration: Option<&MvRefreshPropertyChanges>,
     context: &ConnectorRequestContext,
     cancelled: impl std::future::Future<Output = ()> + Send,
     receiving: &MvPublicationAdmissionReceiving,
@@ -2002,6 +2080,7 @@ pub(crate) async fn admit_mv_publication_async_in(
         planning: planning.clone(),
         projection: projection.clone(),
         publication_id,
+        configuration: configuration.cloned(),
         context: context.clone(),
     };
     if receiving.input.set(input).is_err() {
@@ -2083,6 +2162,19 @@ pub(crate) async fn admit_mv_publication_async_in(
                 format!("name the MV publication target: {error:?}"),
             )
         })?;
+        let configuration_slot_update = match &input.configuration {
+            Some(changes) => Some(
+                prepare_repartition_configuration_slot(
+                    &document_lease,
+                    &input.entrance,
+                    &input.projection.facts,
+                    changes,
+                    &input.context,
+                )
+                .await?,
+            ),
+            None => None,
+        };
         let parts = MvPublicationAdmissionParts {
             managed_target,
             incarnation: input.entrance.incarnation().clone(),
@@ -2096,6 +2188,7 @@ pub(crate) async fn admit_mv_publication_async_in(
             interpretation: input.projection.facts.interpretation().clone(),
             versions: input.projection.facts.versions().clone(),
             entrance: input.entrance.clone(),
+            configuration_slot_update,
         };
         receiving
             .body
@@ -2225,6 +2318,7 @@ mod tests {
             &planning,
             &projection,
             publication_id,
+            None,
             &context,
             async move { stopped.await.unwrap() },
             &receiving,
@@ -2245,6 +2339,7 @@ mod tests {
                 &planning,
                 &projection,
                 publication_id,
+                None,
                 &context,
                 pending(),
                 &receiving,

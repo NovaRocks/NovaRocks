@@ -24,8 +24,8 @@ fn check_actual_approx() {
     };
     use novarocks_type_contract::FunctionValueType;
     let statements = [
-        "SELECT CAST(percentile_approx(v, 0.5) AS INT) AS approx50, CAST(percentile_approx(v, 0.9, 2048) AS INT) AS approx90, percentile_approx(v, array<double>[0.25, 0.5, 0.75], 2048) AS approx_quartiles FROM fixture.t_agg_percentile_semantics",
-        "SELECT CAST(percentile_approx_weighted(v, w, 0.5, 2048) AS INT) AS weighted50, CAST(percentile_approx_weighted(v, w, 0.9, 2048) AS INT) AS weighted90, percentile_approx_weighted(v, w, array<double>[0.25, 0.5, 0.75], 2048) AS weighted_quartiles FROM fixture.t_agg_percentile_semantics",
+        "SELECT CAST(percentile_approx(v, 0.5) AS INT) AS approx50, CAST(percentile_approx(v, 0.9, 2048) AS INT) AS approx90, percentile_approx(v, CAST([0.25, 0.5, 0.75] AS ARRAY<double>), 2048) AS approx_quartiles FROM fixture.t_agg_percentile_semantics",
+        "SELECT CAST(percentile_approx_weighted(v, w, 0.5, 2048) AS INT) AS weighted50, CAST(percentile_approx_weighted(v, w, 0.9, 2048) AS INT) AS weighted90, percentile_approx_weighted(v, w, CAST([0.25, 0.5, 0.75] AS ARRAY<double>), 2048) AS weighted_quartiles FROM fixture.t_agg_percentile_semantics",
     ];
     for sql in statements {
         let source = approx_sql_source(sql);

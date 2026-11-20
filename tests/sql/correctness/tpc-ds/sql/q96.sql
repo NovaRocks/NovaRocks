@@ -15,7 +15,7 @@
 -- specific language governing permissions and limitations
 -- under the License.
 
-select  count(*) 
+select  count(*)
 from store_sales
     ,household_demographics 
     ,time_dim, store

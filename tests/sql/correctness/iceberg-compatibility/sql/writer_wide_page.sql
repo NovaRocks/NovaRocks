@@ -20,7 +20,7 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE DATABASE IF NOT EXISTS iceberg_compat_${suite_uuid0}.${case_db};
+CREATE SCHEMA IF NOT EXISTS iceberg_compat_${suite_uuid0}.${case_db};
 CREATE TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm13_wide_${uuid0}
   (id BIGINT, payload VARCHAR);
 -- Each repeat fits the scalar function's 1 MiB limit. The aggregate produces
@@ -28,7 +28,7 @@ CREATE TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm13_wide_${uuid0}
 SET SESSION group_concat_max_len = 17825792;
 INSERT INTO iceberg_compat_${suite_uuid0}.${case_db}.rwm13_wide_${uuid0}
 SELECT CAST(1 AS BIGINT),
-       group_concat(repeat('x', 1048576 - generate_series) SEPARATOR '')
+       string_agg(repeat('x', 1048576 - generate_series), '')
 FROM TABLE(generate_series(1, 17));
 
 -- query 2
@@ -50,4 +50,4 @@ printf '%s\n' "$spark_out" | grep '^RWM13_WIDE='
 -- query 3
 -- @cleanup=true
 -- @skip_result_check=true
-DROP TABLE IF EXISTS iceberg_compat_${suite_uuid0}.${case_db}.rwm13_wide_${uuid0} FORCE;
+DROP TABLE IF EXISTS iceberg_compat_${suite_uuid0}.${case_db}.rwm13_wide_${uuid0} ;

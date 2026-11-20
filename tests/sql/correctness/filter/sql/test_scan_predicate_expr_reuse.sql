@@ -27,11 +27,10 @@
 USE ${case_db};
 CREATE TABLE t (
     v1 BIGINT NOT NULL,
-    v2 BIGINT NULL,
-    v3 BIGINT NULL,
-    v4 ARRAY<STRING> NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+    v2 BIGINT ,
+    v3 BIGINT ,
+    v4 ARRAY<STRING>
+) WITH (format_version = 3);
 INSERT INTO t SELECT generate_series, generate_series, generate_series,
     array_repeat(CAST(generate_series AS STRING), 5)
 FROM TABLE(generate_series(1, 100));
@@ -72,23 +71,22 @@ SELECT * FROM t WHERE v1 < 10 AND array_max(array_map(x->length(x) + v2, v4)) > 
 USE ${case_db};
 CREATE TABLE t0 (
     k BIGINT NOT NULL,
-    v1 ARRAY<BIGINT> NULL,
-    v2 ARRAY<BIGINT> NULL,
-    v3 ARRAY<BIGINT> NULL,
-    v4 STRUCT<a INT, b STRUCT<a INT>> NULL,
-    v5 STRUCT<a INT, b STRUCT<a ARRAY<BIGINT>>> NULL,
-    v6 MAP<INT, INT> NULL,
-    v7 MAP<INT, INT> NULL,
-    v8 JSON NULL,
-    v9 JSON NULL
-)
-TBLPROPERTIES ("format-version" = "3");
+    v1 ARRAY<BIGINT> ,
+    v2 ARRAY<BIGINT> ,
+    v3 ARRAY<BIGINT> ,
+    v4 ROW(a INT, b ROW(a INT)) ,
+    v5 ROW(a INT, b ROW(a ARRAY<BIGINT>)) ,
+    v6 MAP<INT, INT> ,
+    v7 MAP<INT, INT> ,
+    v8 JSON ,
+    v9 JSON
+) WITH (format_version = 3);
 INSERT INTO t0 VALUES
-(1,[1],[1],[1],row(1,row(1)),row(1,row([1])),map{1:1},map{1:1,2:2},parse_json('{"a":{"b":1}}'),parse_json('{"a":1,"b":[1]}')),
-(2,[2],[2],[2],row(2,row(2)),row(2,row([2])),map{1:1},map{1:2,2:2},parse_json('{"a":{"b":2}}'),parse_json('{"a":1,"b":[1]}')),
-(3,[3],[3],[3],row(3,row(3)),row(3,row([3])),map{1:1},map{1:3,2:2},parse_json('{"a":{"b":3}}'),parse_json('{"a":1,"b":[1]}')),
-(4,[4],[4],[4],row(4,row(4)),row(4,row([4])),map{1:1},map{1:4,2:2},parse_json('{"a":{"b":4}}'),parse_json('{"a":1,"b":[1]}')),
-(5,[5],[5],[5],row(5,row(5)),row(5,row([5])),map{1:1},map{1:5,2:2},parse_json('{"a":{"b":5}}'),parse_json('{"a":1,"b":[1]}'));
+ROW(1,[1],[1],[1],row(1,row(1)),row(1,row([1])),map(1,1),map(1,1,2,2),parse_json('{"a":{"b":1}}'),parse_json('{"a":1,"b":[1]}')),
+ROW(2,[2],[2],[2],row(2,row(2)),row(2,row([2])),map(1,1),map(1,2,2,2),parse_json('{"a":{"b":2}}'),parse_json('{"a":1,"b":[1]}')),
+ROW(3,[3],[3],[3],row(3,row(3)),row(3,row([3])),map(1,1),map(1,3,2,2),parse_json('{"a":{"b":3}}'),parse_json('{"a":1,"b":[1]}')),
+ROW(4,[4],[4],[4],row(4,row(4)),row(4,row([4])),map(1,1),map(1,4,2,2),parse_json('{"a":{"b":4}}'),parse_json('{"a":1,"b":[1]}')),
+ROW(5,[5],[5],[5],row(5,row(5)),row(5,row([5])),map(1,1),map(1,5,2,2),parse_json('{"a":{"b":5}}'),parse_json('{"a":1,"b":[1]}'));
 SELECT k FROM t0 WHERE v1[1] = v2[1] ORDER BY k;
 
 -- query 10
@@ -137,11 +135,11 @@ SELECT k, v5.a FROM t0 WHERE array_max(array_map((x,y,z)->x+y+z, v5.b.a, map_key
 -- query 20
 -- JSON path access in predicate
 USE ${case_db};
-SELECT k FROM t0 WHERE v8->'$.a.b' = v9->'$.a' ORDER BY k;
+SELECT k FROM t0 WHERE JSON_QUERY(v8, '$.a.b') = JSON_QUERY(v9, '$.a') ORDER BY k;
 
 -- query 21
 USE ${case_db};
-SELECT k, v9->'$.b' FROM t0 WHERE v8->'$.a.b' = v9->'$.a' ORDER BY k;
+SELECT k, JSON_QUERY(v9, '$.b') FROM t0 WHERE JSON_QUERY(v8, '$.a.b') = JSON_QUERY(v9, '$.a') ORDER BY k;
 
 -- query 22
 -- Cardinality with expression reuse across AND arms

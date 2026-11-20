@@ -14,22 +14,27 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//! SQL admission rejects exact NULL before BitwiseNot folding.
+//! Exact physical NULL is refused at BitwiseNot recipe preparation.
 
-use super::sql_test_source::sql_source;
 use arrow::datatypes::DataType;
+use novarocks_functions::{ArithmeticPrepareError, PreparedNativeBitNotRecipe};
+use novarocks_type_contract::FunctionValueType;
 
 #[test]
 fn native_bitnot_intrinsic_exact_physical_null_is_refused_before_folding() {
-    let refused =
-        std::panic::catch_unwind(|| sql_source("SELECT ~NULL", DataType::Int64)).unwrap_err();
-    let message = refused
-        .downcast_ref::<String>()
-        .map(String::as_str)
-        .or_else(|| refused.downcast_ref::<&str>().copied())
-        .unwrap();
+    let source = FunctionValueType::new(DataType::Null, true);
+    let target = FunctionValueType::new(DataType::Int8, true);
+    let refused = PreparedNativeBitNotRecipe::try_new(
+        &source,
+        &target,
+        &novarocks_sql::compiler::SqlCompileControl::unbounded(),
+    )
+    .unwrap_err();
+    assert!(matches!(refused, ArithmeticPrepareError::Kernel(_)));
     assert!(
-        message.contains("native BitwiseNot unsupported source shape"),
-        "actual pre-fold source refusal: {message}"
+        refused
+            .to_string()
+            .contains("native BitwiseNot unsupported source shape"),
+        "typed recipe refusal: {refused}"
     );
 }

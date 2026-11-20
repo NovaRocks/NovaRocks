@@ -18,14 +18,13 @@
 //! Materialized-view query-analysis vocabulary and pure staged contract.
 
 pub mod refresh_property;
-use std::collections::HashSet;
 
-use novarocks_parser::ast::{Ident, Query, SetExpr, TableFactor, TableWithJoins};
+use novarocks_parser::ast::{Ident, Query, Relation, SetExpr};
 use novarocks_sql::planning::mv::{
     SqlMvOutputColumnFacts, SqlResolvedMvRefreshInput, SqlResolvedMvRefreshInputSource,
     strip_catalog_from_three_part_names,
 };
-use novarocks_sql::semantic::{IcebergPartitionFieldExpr, ObjectName, TableColumnDef};
+use novarocks_sql::semantic::{ObjectName, TableColumnDef};
 use novarocks_types::naming::normalize_identifier;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -150,83 +149,92 @@ where
 }
 
 fn validate_mv_select_raw_query_clauses(query: &Query) -> Result<(), String> {
+    if !query.functions.is_empty() {
+        return Err(unsupported_mv_query_clause("inline functions"));
+    }
     if query.with.is_some() {
         return Err(unsupported_mv_query_clause("WITH"));
     }
-    if !query.order_by.is_empty() {
+    validate_mv_query_modifiers(&query.modifiers)?;
+    validate_mv_select_raw_clauses_in_set_expr(query.body.as_ref())
+}
+
+fn validate_mv_query_modifiers(
+    modifiers: &novarocks_parser::ast::QueryModifiers,
+) -> Result<(), String> {
+    if modifiers.order_by.is_some() {
         return Err(unsupported_mv_query_clause("ORDER BY"));
     }
-    if query.limit.is_some() || query.offset.is_some() {
+    if matches!(
+        &modifiers.limit,
+        Some(novarocks_parser::ast::QueryLimit::Limit(_))
+    ) || modifiers.offset.is_some()
+    {
         return Err(unsupported_mv_query_clause("LIMIT or OFFSET"));
     }
-    if query.fetch.is_some() {
+    if matches!(
+        &modifiers.limit,
+        Some(novarocks_parser::ast::QueryLimit::FetchFirst(_))
+    ) {
         return Err(unsupported_mv_query_clause("FETCH"));
     }
-    validate_mv_select_raw_clauses_in_set_expr(query.body.as_ref())
+    Ok(())
 }
 
 fn validate_mv_select_raw_clauses_in_set_expr(expr: &SetExpr) -> Result<(), String> {
     match expr {
         SetExpr::Select(select) => {
             validate_mv_select_raw_select_clauses(select)?;
-            for from in &select.from {
-                validate_mv_select_raw_clauses_in_table_with_joins(from)?;
+            if let Some(from) = &select.from {
+                validate_mv_select_raw_clauses_in_factor(from)?;
             }
             Ok(())
         }
         SetExpr::SetOperation(operation) => {
-            validate_mv_select_raw_clauses_in_set_expr(operation.left.as_ref())?;
-            validate_mv_select_raw_clauses_in_set_expr(operation.right.as_ref())
+            for input in &operation.inputs {
+                validate_mv_select_raw_clauses_in_set_expr(input)?;
+            }
+            Ok(())
         }
-        SetExpr::Query(query) => validate_mv_select_raw_query_clauses(query),
+        SetExpr::Query(subquery) => {
+            let query = &subquery.query;
+            validate_mv_select_raw_query_clauses(query)
+        }
         SetExpr::Values(_) => Ok(()),
+        SetExpr::Table(_) => Err(unsupported_mv_from_clause("TABLE query bodies")),
     }
 }
 
 fn validate_mv_select_raw_select_clauses(
     select: &novarocks_parser::ast::Select,
 ) -> Result<(), String> {
+    validate_mv_query_modifiers(&select.modifiers)?;
     if !select.windows.is_empty() {
         return Err(unsupported_mv_select_clause("named WINDOW clauses"));
     }
-    if select.qualify.is_some() {
-        return Err(unsupported_mv_select_clause("QUALIFY"));
-    }
     Ok(())
 }
 
-fn validate_mv_select_raw_clauses_in_table_with_joins(
-    table: &TableWithJoins,
-) -> Result<(), String> {
-    validate_mv_select_raw_clauses_in_factor(&table.relation)?;
-    for join in &table.joins {
-        validate_mv_select_raw_clauses_in_factor(&join.relation)?;
-    }
-    Ok(())
-}
-
-fn validate_mv_select_raw_clauses_in_factor(factor: &TableFactor) -> Result<(), String> {
+fn validate_mv_select_raw_clauses_in_factor(factor: &Relation) -> Result<(), String> {
     match factor {
-        TableFactor::Table { version, .. } => {
-            if version.is_some() {
+        Relation::Table(table) => {
+            if table.query_period.is_some() || table.branch.is_some() {
                 return Err(unsupported_mv_from_clause("table version qualifiers"));
             }
             Ok(())
         }
-        TableFactor::Derived {
-            lateral, subquery, ..
-        } => {
-            if *lateral {
-                return Err(unsupported_mv_from_clause("LATERAL derived tables"));
-            }
-            validate_mv_select_raw_query_clauses(subquery)
+        Relation::Aliased(alias) => validate_mv_select_raw_clauses_in_factor(&alias.relation),
+        Relation::Join(join) => {
+            validate_mv_select_raw_clauses_in_factor(&join.left)?;
+            validate_mv_select_raw_clauses_in_factor(&join.right)
         }
-        TableFactor::NestedJoin {
-            table_with_joins, ..
-        } => validate_mv_select_raw_clauses_in_table_with_joins(table_with_joins),
-        TableFactor::TableFunction { .. } | TableFactor::Unnest { .. } => {
+        Relation::TableSubquery(node) => validate_mv_select_raw_query_clauses(&node.query),
+        Relation::Lateral(_) => Err(unsupported_mv_from_clause("LATERAL derived tables")),
+        Relation::JsonTable(_) => Err(unsupported_mv_from_clause("JSON_TABLE")),
+        Relation::TableFunction(_) | Relation::Unnest(_) => {
             Err(unsupported_mv_from_clause("table functions"))
         }
+        _ => Err(unsupported_mv_from_clause("relation modifiers")),
     }
 }
 
@@ -246,7 +254,6 @@ fn synthetic_ident(value: impl Into<String>, span: novarocks_parser::Span) -> Id
     Ident {
         value: value.into(),
         quoted: false,
-        quote_style: None,
         span,
     }
 }
@@ -288,34 +295,17 @@ fn qualify_current_catalog_refs_in_set_expr(
 ) {
     match expr {
         SetExpr::Select(select) => {
-            for from in &mut select.from {
-                qualify_current_catalog_refs_in_factor(
-                    &mut from.relation,
-                    catalog,
-                    current_database,
-                );
-                for join in &mut from.joins {
-                    qualify_current_catalog_refs_in_factor(
-                        &mut join.relation,
-                        catalog,
-                        current_database,
-                    );
-                }
+            if let Some(from) = &mut select.from {
+                qualify_current_catalog_refs_in_factor(from, catalog, current_database);
             }
         }
         SetExpr::SetOperation(operation) => {
-            qualify_current_catalog_refs_in_set_expr(
-                operation.left.as_mut(),
-                catalog,
-                current_database,
-            );
-            qualify_current_catalog_refs_in_set_expr(
-                operation.right.as_mut(),
-                catalog,
-                current_database,
-            );
+            for input in &mut operation.inputs {
+                qualify_current_catalog_refs_in_set_expr(input, catalog, current_database);
+            }
         }
-        SetExpr::Query(query) => {
+        SetExpr::Query(subquery) => {
+            let query = &mut subquery.query;
             qualify_current_catalog_refs_in_set_expr(
                 query.body.as_mut(),
                 catalog,
@@ -327,12 +317,13 @@ fn qualify_current_catalog_refs_in_set_expr(
 }
 
 fn qualify_current_catalog_refs_in_factor(
-    factor: &mut TableFactor,
+    factor: &mut Relation,
     catalog: &str,
     current_database: &str,
 ) {
     match factor {
-        TableFactor::Table { name, .. } => {
+        Relation::Table(table) => {
+            let name = &mut table.name;
             let parts = name
                 .parts
                 .iter()
@@ -355,12 +346,25 @@ fn qualify_current_catalog_refs_in_factor(
                 ];
             }
         }
-        TableFactor::Derived { subquery, .. } => {
+        Relation::TableSubquery(node) => {
+            let subquery = &mut node.query;
             qualify_current_catalog_refs_in_set_expr(
                 subquery.body.as_mut(),
                 catalog,
                 current_database,
             );
+        }
+        Relation::Lateral(node) => qualify_current_catalog_refs_in_set_expr(
+            node.query.body.as_mut(),
+            catalog,
+            current_database,
+        ),
+        Relation::Aliased(alias) => {
+            qualify_current_catalog_refs_in_factor(&mut alias.relation, catalog, current_database)
+        }
+        Relation::Join(join) => {
+            qualify_current_catalog_refs_in_factor(&mut join.left, catalog, current_database);
+            qualify_current_catalog_refs_in_factor(&mut join.right, catalog, current_database);
         }
         _ => {}
     }
@@ -398,63 +402,6 @@ pub(crate) fn resolve_mv_name(
     }
 }
 
-pub fn validate_mv_partition_columns(
-    partition_by: Option<&[IcebergPartitionFieldExpr]>,
-    output_columns: &[SqlMvOutputColumnFacts],
-) -> Result<(), String> {
-    let Some(partition_by) = partition_by else {
-        return Ok(());
-    };
-    let output_names = output_columns
-        .iter()
-        .map(|column| normalize_identifier(&column.name))
-        .collect::<Result<HashSet<_>, _>>()?;
-    for field in partition_by {
-        let column = mv_partition_source_column(field);
-        let normalized = normalize_identifier(column)?;
-        if !output_names.contains(&normalized) {
-            return Err(format!(
-                "materialized view PARTITION BY column `{column}` must be an output column"
-            ));
-        }
-    }
-    Ok(())
-}
-
-#[allow(
-    dead_code,
-    reason = "Retained for staged materialized-view integration and recovery wiring."
-)]
-pub(crate) fn validate_starrocks_mv_partition_columns(
-    partition_by: Option<&[IcebergPartitionFieldExpr]>,
-    output_columns: &[SqlMvOutputColumnFacts],
-) -> Result<(), String> {
-    if let Some(fields) = partition_by {
-        for field in fields {
-            if !matches!(field, IcebergPartitionFieldExpr::Identity { .. }) {
-                return Err(
-                    "StarRocks table materialized view PARTITION BY only supports identity columns"
-                        .to_string(),
-                );
-            }
-        }
-    }
-    validate_mv_partition_columns(partition_by, output_columns)
-}
-
-fn mv_partition_source_column(field: &IcebergPartitionFieldExpr) -> &str {
-    match field {
-        IcebergPartitionFieldExpr::Identity { column }
-        | IcebergPartitionFieldExpr::Year { column }
-        | IcebergPartitionFieldExpr::Month { column }
-        | IcebergPartitionFieldExpr::Day { column }
-        | IcebergPartitionFieldExpr::Hour { column }
-        | IcebergPartitionFieldExpr::Bucket { column, .. }
-        | IcebergPartitionFieldExpr::Truncate { column, .. }
-        | IcebergPartitionFieldExpr::Void { column } => column,
-    }
-}
-
 fn collect_table_refs_from_query(
     query: &Query,
     current_catalog: Option<&str>,
@@ -488,38 +435,17 @@ fn collect_table_refs_from_set_expr(
 ) {
     match expr {
         SetExpr::Select(select) => {
-            for from in &select.from {
-                collect_table_refs_from_factor(
-                    &from.relation,
-                    current_catalog,
-                    current_database,
-                    refs,
-                );
-                for join in &from.joins {
-                    collect_table_refs_from_factor(
-                        &join.relation,
-                        current_catalog,
-                        current_database,
-                        refs,
-                    );
-                }
+            if let Some(from) = &select.from {
+                collect_table_refs_from_factor(from, current_catalog, current_database, refs);
             }
         }
         SetExpr::SetOperation(operation) => {
-            collect_table_refs_from_set_expr(
-                &operation.left,
-                current_catalog,
-                current_database,
-                refs,
-            );
-            collect_table_refs_from_set_expr(
-                &operation.right,
-                current_catalog,
-                current_database,
-                refs,
-            );
+            for input in &operation.inputs {
+                collect_table_refs_from_set_expr(input, current_catalog, current_database, refs);
+            }
         }
-        SetExpr::Query(query) => {
+        SetExpr::Query(subquery) => {
+            let query = &subquery.query;
             collect_table_refs_from_set_expr(
                 query.body.as_ref(),
                 current_catalog,
@@ -532,17 +458,17 @@ fn collect_table_refs_from_set_expr(
 }
 
 fn collect_table_refs_from_factor(
-    factor: &TableFactor,
+    factor: &Relation,
     current_catalog: Option<&str>,
     current_database: &str,
     refs: &mut Vec<ResolvedTableRef>,
 ) {
     match factor {
-        TableFactor::Table { name, .. } => {
-            let parts: Vec<String> = name
-                .parts
-                .iter()
-                .map(|ident| ident.value.to_ascii_lowercase())
+        Relation::Table(table) => {
+            let name = &table.name;
+            let parts: Vec<String> = novarocks_sql::TableNameView::new(name)
+                .parts()
+                .map(str::to_ascii_lowercase)
                 .collect();
             let resolved = match parts.as_slice() {
                 [catalog, namespace, table] => ResolvedTableRef::Iceberg {
@@ -582,7 +508,8 @@ fn collect_table_refs_from_factor(
                 refs.push(resolved);
             }
         }
-        TableFactor::Derived { subquery, .. } => {
+        Relation::TableSubquery(node) => {
+            let subquery = &node.query;
             if let Some(with) = &subquery.with {
                 for cte in &with.ctes {
                     collect_table_refs_from_set_expr(
@@ -599,6 +526,22 @@ fn collect_table_refs_from_factor(
                 current_database,
                 refs,
             );
+        }
+        Relation::Lateral(node) => {
+            for item in
+                collect_table_refs_from_query(&node.query, current_catalog, current_database)
+            {
+                if !refs.contains(&item) {
+                    refs.push(item);
+                }
+            }
+        }
+        Relation::Aliased(alias) => {
+            collect_table_refs_from_factor(&alias.relation, current_catalog, current_database, refs)
+        }
+        Relation::Join(join) => {
+            collect_table_refs_from_factor(&join.left, current_catalog, current_database, refs);
+            collect_table_refs_from_factor(&join.right, current_catalog, current_database, refs);
         }
         _ => {}
     }
@@ -618,7 +561,6 @@ pub(crate) fn output_column_to_table_column(
         data_type: novarocks_types::sql_type_from_value_type(&column.value_type)
             .map_err(|error| error.to_string())?,
         nullable: column.value_type.nullable(),
-        aggregation: None,
         default: None,
     })
 }
@@ -626,18 +568,14 @@ pub(crate) fn output_column_to_table_column(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use novarocks_parser::printer::Printer;
+    use novarocks_parser::printer::print_query;
 
     fn parse_query(sql: &str) -> Query {
-        let statements = novarocks_parser::parse(sql).expect("parse query");
-        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
-            panic!("expected query");
-        };
-        query.clone()
+        novarocks_parser::parser::parse_query(sql).expect("parse query")
     }
 
     fn render_query(query: &Query) -> String {
-        Printer::new().statement(&novarocks_parser::ast::Statement::Query(query.clone()))
+        print_query(query).expect("print fixture query")
     }
 
     #[test]

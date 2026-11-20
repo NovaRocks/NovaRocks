@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::*;
 use crate::analysis::{ExprKind, QueryBody};
 struct EmptyCatalog;
 impl crate::catalog::PlannerTableProvider for EmptyCatalog {
@@ -29,10 +28,7 @@ impl crate::catalog::PlannerTableProvider for EmptyCatalog {
     }
 }
 fn analyze(sql: &str, mode: &str, limit: Option<i64>) -> crate::analysis::ResolvedQuery {
-    let statements = novarocks_parser::parse(sql).unwrap();
-    let [ast::Statement::Query(query)] = statements.as_slice() else {
-        panic!("query")
-    };
+    let query = &novarocks_parser::parser::parse_query(sql).unwrap();
     let mut settings = crate::sql_mode::SqlSemanticSettings::default()
         .with_sql_mode(crate::sql_mode::SqlMode::from_assignment(mode));
     if let Some(raw) = limit {
@@ -74,7 +70,7 @@ fn state(
 #[test]
 fn actual_gc_call_captures_lexical_hint_raw_limit_distinct_and_order() {
     let query = analyze(
-        "select /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ group_concat(distinct 'a' order by 1 desc nulls first separator '|')",
+        "WITH SESSION sql_mode = 'GROUP_CONCAT_LEGACY' select string_agg(distinct 'a' \n,\n '|'\norder by 1 desc nulls first \n)",
         "32",
         Some(-1),
     );
@@ -93,7 +89,7 @@ fn actual_gc_call_captures_lexical_hint_raw_limit_distinct_and_order() {
 #[test]
 fn explicit_separator_does_not_guess_mode_and_missing_limit_stays_absent() {
     for mode in ["32", "GROUP_CONCAT_LEGACY"] {
-        let query = analyze("select group_concat('a' separator '|')", mode, None);
+        let query = analyze("select string_agg('a' \n,\n '|'\n\n)", mode, None);
         assert_eq!(facts(&query).legacy, mode == "GROUP_CONCAT_LEGACY");
         assert_eq!(facts(&query).max_len, None);
         assert!(!state(&query).distinct);

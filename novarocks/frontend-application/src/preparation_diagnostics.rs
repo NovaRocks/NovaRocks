@@ -1849,7 +1849,7 @@ mod session_owner_tests {
     #[test]
     fn nominated_observer_requires_the_same_complete_active_journal_entry() {
         let fixture = ObserverFixture::new();
-        let session = fixture.arm_session("stats", "ANALYZE TABLE t");
+        let session = fixture.arm_session("stats", "ANALYZE t");
         let mut statement = fixture.service.begin_statement(session.token()).unwrap();
         assert!(
             fixture
@@ -1869,7 +1869,7 @@ mod session_owner_tests {
         );
         let original = fixture
             .owner
-            .bind_statement(statement.token(), "ANALYZE TABLE t")
+            .bind_statement(statement.token(), "ANALYZE t")
             .unwrap()
             .unwrap();
         let nomination = original.nomination().unwrap();
@@ -1911,14 +1911,14 @@ mod session_owner_tests {
                 .is_none()
         );
         assert!(resolved.nomination().is_none());
-        let replacement_session = fixture.arm_session("stats", "ANALYZE TABLE t");
+        let replacement_session = fixture.arm_session("stats", "ANALYZE t");
         let mut replacement = fixture
             .service
             .begin_statement(replacement_session.token())
             .unwrap();
         let next = fixture
             .owner
-            .bind_statement(replacement.token(), "ANALYZE TABLE t")
+            .bind_statement(replacement.token(), "ANALYZE t")
             .unwrap()
             .unwrap();
         assert!(

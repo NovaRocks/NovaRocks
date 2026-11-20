@@ -251,6 +251,7 @@ impl DependencyPreparation {
                         let (MvCommandRequest::Refresh {
                             statement,
                             requested,
+                            ..
                         }
                         | MvCommandRequest::ScheduledRefresh {
                             statement,

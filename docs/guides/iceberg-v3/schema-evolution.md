@@ -28,7 +28,7 @@ under the License.
 | RENAME COLUMN（含嵌套） | ✅ | PR #86 |
 | 类型 widening（int→long / float→double / decimal precision↑ / date→timestamp） | ✅ | PR #86 |
 | ARRAY / MAP 元素类型 widening（`<list>.element` / `<map>.key` / `<map>.value`） | ✅ | PR #86 |
-| Column reorder（`ALTER COLUMN ... FIRST / AFTER / BEFORE`，顶层 + 嵌套） | ✅ | PR #86 |
+| Column reorder（`EXECUTE move_column`，顶层 + 嵌套） | ✅ | PR #86 |
 | `SET / DROP NOT NULL`（含 identifier-field 保护 + `novarocks.nullability.attested.*` 留痕） | ✅ | PR #86 |
 | DDL 失败原子回滚（commit 冲突 3 次指数退避 10/100/500ms 重试，每次重试前 invalidate cache + 重 load） | ✅ | PR #88 |
 | `ALTER TABLE ... SET / UNSET TBLPROPERTIES`（denylist：`novarocks.*` 全前缀 + `format-version` + Iceberg 内部 schema/spec/last-* 键） | ✅ | PR #89 |
@@ -52,6 +52,7 @@ ALTER TABLE t ADD COLUMN address.zip INT;
 -- 配合位置子句
 ALTER TABLE t ADD COLUMN c INT FIRST;
 ALTER TABLE t ADD COLUMN c INT AFTER existing_col;
+-- 退役位置子句，解析阶段拒绝
 ALTER TABLE t ADD COLUMN c INT BEFORE existing_col;
 ```
 
@@ -70,12 +71,12 @@ DROP 是逻辑删除：新 schema 中移除字段，老 data file 中的对应�
 
 ```sql
 ALTER TABLE t RENAME COLUMN old_name TO new_name;
-ALTER TABLE t RENAME COLUMN address.zip TO address.postal_code;
+ALTER TABLE t RENAME COLUMN address.zip TO postal_code;
 ```
 
 按 field-id 维系，老 data file 不需要重写。如果新名字与同父级下任何兄弟字段冲突会 reject。
 
-## ✅ MODIFY COLUMN（类型 widening）
+## ✅ ALTER COLUMN … SET DATA TYPE（类型 widening）
 
 按 spec 允许的方向：
 
@@ -87,21 +88,21 @@ ALTER TABLE t RENAME COLUMN address.zip TO address.postal_code;
 | `date` | `timestamp` |
 
 ```sql
-ALTER TABLE t MODIFY COLUMN c BIGINT;             -- int → long
-ALTER TABLE t MODIFY COLUMN price DECIMAL(20, 4); -- precision 增加
-ALTER TABLE t MODIFY COLUMN created_on TIMESTAMP; -- date → timestamp
+ALTER TABLE t ALTER COLUMN c SET DATA TYPE BIGINT;             -- int → long
+ALTER TABLE t ALTER COLUMN price SET DATA TYPE DECIMAL(20, 4); -- precision 增加
+ALTER TABLE t ALTER COLUMN created_on SET DATA TYPE TIMESTAMP; -- date → timestamp
 
 -- 嵌套 STRUCT 内 widen
-ALTER TABLE t MODIFY COLUMN address.zip BIGINT;
+ALTER TABLE t ALTER COLUMN address.zip SET DATA TYPE BIGINT;
 
 -- ARRAY 元素 widen
-ALTER TABLE t MODIFY COLUMN tags.element BIGINT;
+ALTER TABLE t ALTER COLUMN tags.element SET DATA TYPE BIGINT;
 
 -- MAP 值 widen
-ALTER TABLE t MODIFY COLUMN attrs.value BIGINT;
+ALTER TABLE t ALTER COLUMN attrs.value SET DATA TYPE BIGINT;
 
 -- MAP 键 widen
-ALTER TABLE t MODIFY COLUMN attrs.key VARCHAR;
+ALTER TABLE t ALTER COLUMN attrs.key SET DATA TYPE VARCHAR;
 ```
 
 下列变更会 reject（与 spec 不安全方向一致）：
@@ -111,29 +112,29 @@ ALTER TABLE t MODIFY COLUMN attrs.key VARCHAR;
 - 跨族（`string → binary` / `int → string` / 等等）
 - `timestamp` ↔ `timestamptz` 互转（暂未实现，归 V3 timestamp_ns 工作）
 
-> **注意**：MODIFY 不能与位置改变同语句（`MODIFY COLUMN c BIGINT FIRST` 一律 reject），避免提交语义混淆；改类型与改位置请拆成两条 ALTER。
+> 改类型使用 `ALTER COLUMN … SET DATA TYPE`。需要调整位置时另行调用 `move_column`。
 
 ## ✅ Column reorder
 
-NovaRocks 用 `ALTER COLUMN ... FIRST / AFTER / BEFORE` 语法（不是 MODIFY 语法），与 Spark 行为一致：
+NovaRocks 用 `move_column` 过程调整已有列的位置。
 
 ```sql
-ALTER TABLE t ALTER COLUMN c FIRST;
-ALTER TABLE t ALTER COLUMN c AFTER other_col;
-ALTER TABLE t ALTER COLUMN address.street BEFORE address.city;  -- 嵌套同样支持
+ALTER TABLE t EXECUTE move_column(column => 'c', position => 'FIRST');
+ALTER TABLE t EXECUTE move_column(column => 'c', position => 'AFTER', reference => 'other_col');
+ALTER TABLE t EXECUTE move_column(column => 'address.street', position => 'BEFORE', reference => 'address.city');  -- 嵌套同样支持
 ```
 
 `AFTER` / `BEFORE` 的目标必须与被移动列在同一父级 STRUCT；跨父级引用直接 reject。
 
-## ✅ SET / DROP NOT NULL（required ↔ optional）
+## ✅ 设置和解除 NOT NULL（required ↔ optional）
 
 ```sql
-ALTER TABLE t ALTER COLUMN c SET NOT NULL;
+ALTER TABLE t EXECUTE set_column_not_null(column => 'c');
 ALTER TABLE t ALTER COLUMN c DROP NOT NULL;
-ALTER TABLE t ALTER COLUMN address.street SET NOT NULL;
+ALTER TABLE t EXECUTE set_column_not_null(column => 'address.street');
 ```
 
-- `SET NOT NULL`（optional → required）：不扫老数据；commit 时附带 property `novarocks.nullability.attested.<dot.path> = <iso8601_ts>` 留痕（行为对齐 Spark "user attested"）
+- `EXECUTE set_column_not_null`（optional → required）：不扫老数据；commit 时附带 property `novarocks.nullability.attested.<dot.path> = <iso8601_ts>` 留痕（行为对齐 Spark "user attested"）
 - `DROP NOT NULL`（required → optional）：spec 安全方向，直接 commit
 - identifier field（主键）禁止 `DROP NOT NULL`（spec 要求 identifier 必须 required）
 - `novarocks.nullability.attested.*` 这一族 property 由 schema 演进路径维护，PR #89 SET TBLPROPERTIES 路径会 reject 用户直接修改
@@ -148,12 +149,12 @@ schema、分区、属性与 ref 等直接 DDL 路径冻结原表 UUID 和必要 
 
 PR #89 引入：
 
-```sql
-ALTER TABLE t SET TBLPROPERTIES ('write.parquet.compression-codec' = 'zstd');
-ALTER TABLE t SET TBLPROPERTIES ('comment' = 'hello', 'gc.enabled' = 'true');
+``` sql
+ALTER TABLE t SET PROPERTIES extra_properties = MAP(ARRAY['write.parquet.compression-codec'], ARRAY['zstd']);
+ALTER TABLE t SET PROPERTIES gc_enabled = true, extra_properties = MAP(ARRAY['comment'], ARRAY['hello']);
 
-ALTER TABLE t UNSET TBLPROPERTIES ('comment');
-ALTER TABLE t UNSET TBLPROPERTIES IF EXISTS ('a', 'b');   -- 缺失键静默跳过
+ALTER TABLE t EXECUTE unset_extra_properties(keys => ARRAY['comment'], if_exists => false);
+ALTER TABLE t EXECUTE unset_extra_properties(keys => ARRAY['a', 'b'], if_exists => true);   -- 缺失键静默跳过
 ```
 
 **Denylist**（写 / 删都拒绝）：

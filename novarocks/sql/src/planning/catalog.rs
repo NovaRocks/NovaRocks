@@ -24,9 +24,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::analyze_error::AnalyzeError;
 use crate::planner::table::TableDef;
-use novarocks_parser::ast::{Query, TableVersion};
 #[cfg(test)]
-use novarocks_parser::ast::{SetExpr, Statement, TableFactor};
+use novarocks_parser::ast::SetExpr;
+use novarocks_parser::ast::{Query, QueryPeriod};
 use novarocks_types::naming::TableIdentity;
 use novarocks_types::schema::{CatalogTable, ColumnDef};
 
@@ -221,7 +221,9 @@ impl SqlTimeTravelReferenceMetadataFacts {
     }
 }
 
-pub use crate::analyzer::iceberg_ref::{SqlTimeTravelSelection, parse_time_travel_selection};
+pub use crate::analyzer::iceberg_ref::{
+    SqlTimeTravelSelection, parse_time_travel_selection, query_period_end,
+};
 
 /// Sealed result of resolving one parsed time-travel clause against validated
 /// immutable snapshot facts.  SQL exposes only the frozen snapshot identity
@@ -250,7 +252,7 @@ impl SqlTimeTravelSnapshotBindingFacts {
 /// validated snapshot-reference facts.  Unknown requested snapshots and refs
 /// fail closed in SQL before Core creates a synthetic table identity.
 pub fn resolve_time_travel_snapshot_binding(
-    version: &TableVersion,
+    version: &QueryPeriod,
     metadata: &SqlTimeTravelReferenceMetadataFacts,
     fully_qualified_name: &str,
 ) -> Result<SqlTimeTravelSnapshotBindingFacts, AnalyzeError> {
@@ -879,10 +881,7 @@ mod tests {
             "SELECT percentile_empty() AS state",
             "SELECT percentile_hash(CAST(1 AS DOUBLE)) AS state",
         ] {
-            let statements = novarocks_parser::parse(sql).unwrap();
-            let [Statement::Query(query)] = statements.as_slice() else {
-                panic!("expected query")
-            };
+            let query = &novarocks_parser::parser::parse_query(sql).unwrap();
             let error = analyze_view_query(
                 query,
                 &catalog,
@@ -898,11 +897,10 @@ mod tests {
                 "Object and Percentile result domains are unsupported for persisted schemas"
             );
         }
-        let statements =
-            novarocks_parser::parse("SELECT bitmap_to_binary(to_bitmap(1)) AS ordinary").unwrap();
-        let [Statement::Query(query)] = statements.as_slice() else {
-            panic!("expected query")
-        };
+        let query = &novarocks_parser::parser::parse_query(
+            "SELECT bitmap_to_binary(to_bitmap(1)) AS ordinary",
+        )
+        .unwrap();
         let columns = analyze_view_query(
             query,
             &catalog,
@@ -941,10 +939,7 @@ mod tests {
             }],
         )
         .unwrap();
-        let statements = novarocks_parser::parse("SELECT state FROM nested").unwrap();
-        let [Statement::Query(query)] = statements.as_slice() else {
-            panic!("expected query")
-        };
+        let query = &novarocks_parser::parser::parse_query("SELECT state FROM nested").unwrap();
         let functions = crate::functions::builtin_sql_function_catalog();
         assert_eq!(
             analyze_view_query(
@@ -995,27 +990,15 @@ mod tests {
         .into_resolved_table()
     }
 
-    fn parsed_time_travel_clause(sql: &str) -> TableVersion {
-        let mut statements = novarocks_parser::parse(sql).expect("parse time travel");
-        let [statement] = statements.as_mut_slice() else {
-            panic!("expected exactly one statement");
-        };
-        let Statement::Query(query) = statement else {
-            panic!("expected query statement");
-        };
+    fn parsed_time_travel_clause(sql: &str) -> QueryPeriod {
+        let query = novarocks_parser::parser::parse_query(sql).expect("parse time travel");
         let SetExpr::Select(select) = query.body.as_ref() else {
             panic!("expected select query");
         };
-        let Some(table_with_joins) = select.from.first() else {
-            panic!("expected FROM relation");
+        let Some(novarocks_parser::ast::Relation::Table(table)) = &select.from else {
+            panic!("table relation");
         };
-        let TableFactor::Table {
-            version: Some(version),
-            ..
-        } = &table_with_joins.relation
-        else {
-            panic!("expected table version clause");
-        };
+        let version = table.query_period.as_ref().expect("query period");
         version.clone()
     }
 
@@ -1248,7 +1231,7 @@ mod tests {
         );
 
         let timestamp = resolve_time_travel_snapshot_binding(
-            &parsed_time_travel_clause("SELECT id FROM t FOR SYSTEM_TIME AS OF 1700000000500"),
+            &parsed_time_travel_clause("SELECT id FROM t FOR TIMESTAMP AS OF 1700000000500"),
             &metadata,
             "ice.analytics.t",
         )
@@ -1263,9 +1246,9 @@ mod tests {
     #[test]
     fn time_travel_request_identity_reuses_the_original_literal_parser_without_syntax_spans() {
         let number =
-            parsed_time_travel_clause("SELECT id FROM t FOR SYSTEM_TIME AS OF 1700000000000");
+            parsed_time_travel_clause("SELECT id FROM t FOR TIMESTAMP AS OF 1700000000000");
         let text = parsed_time_travel_clause(
-            "SELECT id FROM ice.analytics.t FOR SYSTEM_TIME AS OF '2023-11-14 22:13:20'",
+            "SELECT id FROM ice.analytics.t FOR TIMESTAMP AS OF '2023-11-14 22:13:20'",
         );
         assert_ne!(number.span, text.span);
         assert_eq!(

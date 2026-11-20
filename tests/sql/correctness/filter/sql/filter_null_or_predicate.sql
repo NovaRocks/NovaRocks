@@ -29,14 +29,13 @@ CREATE TABLE ${case_db}.t_filter_null_or_predicate (
   id INT,
   a INT,
   b STRING
-)
-TBLPROPERTIES ("format-version" = "3");
+) WITH (format_version = 3);
 INSERT INTO ${case_db}.t_filter_null_or_predicate VALUES
-  (1, 1, 'x'),
-  (2, NULL, 'x'),
-  (3, 2, 'y'),
-  (4, NULL, NULL),
-  (5, 5, 'z');
+  ROW(1, 1, 'x'),
+  ROW(2, NULL, 'x'),
+  ROW(3, 2, 'y'),
+  ROW(4, NULL, NULL),
+  ROW(5, 5, 'z');
 SELECT id, a, b
 FROM ${case_db}.t_filter_null_or_predicate
 WHERE a IS NULL OR b = 'y'

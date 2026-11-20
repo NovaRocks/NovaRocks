@@ -27,7 +27,7 @@ SET SESSION trc_unknown_property = 1;
 
 -- query 2
 -- @expect_trino_error=INVALID_SESSION_PROPERTY,USER_ERROR
-SET trc_unknown_property = 1;
+SET SESSION trc_unknown_property = 1;
 
 -- query 3
 -- @expect_trino_error=INVALID_SESSION_PROPERTY,USER_ERROR
@@ -87,14 +87,14 @@ SET SESSION time_zone = 'UTC';
 
 -- query 17
 -- @expect_trino_error=INVALID_SESSION_PROPERTY,USER_ERROR
-SET autocommit = 1;
+SET SESSION autocommit = 1;
 
 -- query 18
--- @expect_trino_error=INVALID_SESSION_PROPERTY,USER_ERROR
+-- @expect_trino_error=SYNTAX_ERROR,USER_ERROR
 SET PASSWORD = 'x';
 
 -- query 19
--- @expect_trino_error=INVALID_SESSION_PROPERTY,USER_ERROR
+-- @expect_trino_error=SYNTAX_ERROR,USER_ERROR
 SET ROLE = admin;
 
 -- query 20
@@ -114,11 +114,11 @@ SET SESSION query_mem_limit = -1;
 SET SESSION enable_global_runtime_filter = on;
 
 -- query 24
--- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+-- @expect_trino_error=SYNTAX_ERROR,USER_ERROR
 SET GLOBAL pipeline_dop = 1;
 
 -- query 25
--- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+-- @expect_trino_error=SYNTAX_ERROR,USER_ERROR
 SET GLOBAL trc_unknown_property = 1;
 
 -- query 26
@@ -203,7 +203,7 @@ SELECT n FROM numbers ORDER BY n;
 
 -- query 49
 -- The existing root hint overrides the admitted session depth without changing it.
-WITH RECURSIVE numbers(n) AS (
+WITH SESSION recursive_cte_max_depth = 4 WITH RECURSIVE numbers(n) AS (
     SELECT 1
     UNION ALL
     SELECT n + 1 FROM numbers WHERE n < 10
@@ -222,4 +222,4 @@ WITH RECURSIVE numbers(n) AS (
 SELECT n FROM numbers ORDER BY n;
 
 -- query 52
-SELECT /*+ SET_VAR(query_mem_limit = 1073741824) */ 1;
+WITH SESSION query_mem_limit = 1073741824 SELECT /*+ SET_VAR(query_mem_limit = 1073741824) */ 1;

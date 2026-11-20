@@ -237,10 +237,7 @@ fn parse_analyze_and_plan(sql: &str) -> Result<LogicalPlanNode, String> {
 fn parse_analyze_query(
     sql: &str,
 ) -> Result<(ResolvedQuery, CTERegistry, ColumnRefFactory), String> {
-    let statements = novarocks_parser::parse(sql).map_err(|error| error.to_string())?;
-    let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
-        return Err("expected query".into());
-    };
+    let query = &novarocks_parser::parser::parse_query(sql).map_err(|error| error.to_string())?;
     crate::analyzer::analyze(query, &TestCatalog, "default").map_err(|error| error.to_string())
 }
 
@@ -1213,12 +1210,9 @@ fn p2_having_computed_group_key_does_not_append_leaf_group_by() {
 
 #[test]
 fn p2_repeat_grouping_aggregate_outputs_follow_group_by_order() {
-    // Computed GROUPING arguments remain the existing Nova grammar extension.
-    // Trino requires qualifiedName here; that grammar flip belongs to 5e.
-    // The public width still follows the approved INTEGER/BIGINT rule.
-    let plan = plan_test_query(
-        "SELECT grouping(a + 1) AS g, a + 1 AS k, count(*) AS cnt \
-             FROM t GROUP BY ROLLUP(a + 1)",
+    let plan = plan_with_computed_repeat_key(
+        "SELECT grouping(a) AS g, a + 1 AS k, count(*) AS cnt FROM t GROUP BY ROLLUP(a)",
+        1,
     );
     let (project, aggregate) = root_project_over_aggregate(&plan);
     assert_eq!(
@@ -1777,14 +1771,43 @@ fn test_parenthesized_set_op_branch_keeps_local_cte_anchor_in_branch() {
     let plan = parse_analyze_and_plan(
         "SELECT o_orderkey AS ok FROM orders \
              UNION ALL \
-             (WITH t AS (SELECT o_custkey AS ok FROM orders) SELECT ok FROM t)",
+             (SELECT ok FROM (WITH t AS (SELECT o_custkey AS ok FROM orders) SELECT ok FROM t) AS cte_branch)",
     )
     .expect("planner should succeed");
 
     match &plan.kind {
         LogicalPlanKind::Union(_) => {
             assert_eq!(plan.children.len(), 2);
-            match &plan.child(1).kind {
+            let branch = plan.child(1);
+            let LogicalPlanKind::Project(project) = &branch.kind else {
+                panic!("expected the standard derived-table projection on the UNION branch");
+            };
+            let [item] = project.items.as_slice() else {
+                panic!("expected the single UNION branch column");
+            };
+            assert_eq!(item.output_name, "ok");
+            assert_eq!(item.output_column_id, column_ref_id(&item.expr));
+            assert_eq!(project.output_qualifier, None);
+            assert_eq!(branch.children.len(), 1);
+            let derived = branch.child(0);
+            let LogicalPlanKind::Project(derived_project) = &derived.kind else {
+                panic!("expected the standard derived-table alias projection");
+            };
+            assert_eq!(
+                derived_project.output_qualifier.as_deref(),
+                Some("cte_branch")
+            );
+            let [derived_item] = derived_project.items.as_slice() else {
+                panic!("expected the single derived-table column");
+            };
+            assert_eq!(derived_item.output_name, "ok");
+            assert_eq!(derived_item.output_column_id, item.output_column_id);
+            assert_eq!(
+                derived_item.output_column_id,
+                column_ref_id(&derived_item.expr)
+            );
+            assert_eq!(derived.children.len(), 1);
+            match &derived.child(0).kind {
                 LogicalPlanKind::CTEAnchor(anchor) => assert_eq!(anchor.cte_id, 0),
                 other => {
                     panic!("expected branch-local CTEAnchor in union input, got {other:?}")
@@ -1800,7 +1823,7 @@ fn test_explain_keeps_parenthesized_set_op_branch_anchor_in_branch() {
     let plan = parse_analyze_and_plan(
         "SELECT o_orderkey AS ok FROM orders \
              UNION ALL \
-             (WITH t AS (SELECT o_custkey AS ok FROM orders) SELECT ok FROM t)",
+             (SELECT ok FROM (WITH t AS (SELECT o_custkey AS ok FROM orders) SELECT ok FROM t) AS cte_branch)",
     )
     .expect("planner should succeed");
 
@@ -2368,7 +2391,7 @@ fn p2_base_scan_row_lineage_metadata_preserves_column_id_through_planner() {
 #[test]
 fn sqlx2_delta_relation_projects_token_bound_sql_scan_source() {
     let plan = parse_analyze_and_plan(
-        "SELECT _row_id FROM __nr_ivm_delta('cat.ns.iv_orders', 100, 200) AS t",
+        "SELECT _row_id FROM TABLE(__nr_ivm_delta('cat.ns.iv_orders', 100, 200)) AS t",
     )
     .expect("planner should accept the token-bound delta source");
     let LogicalPlanKind::Project(_) = &plan.kind else {
@@ -2390,10 +2413,40 @@ fn sqlx2_delta_relation_projects_token_bound_sql_scan_source() {
     ));
 }
 
+fn plan_with_computed_repeat_key(sql: &str, key_index: usize) -> LogicalPlanNode {
+    let statement =
+        novarocks_parser::parser::parse_statement(sql).expect("parse a Trino ROLLUP fixture");
+    let novarocks_parser::ast::TrinoStatement::Query(query) = statement else {
+        panic!("expected a query");
+    };
+    let (mut resolved, cte_registry, mut factory) =
+        crate::analyzer::analyze(&query, &TestCatalog, "default").expect("bind the ROLLUP fixture");
+    let QueryBody::Select(select) = &mut resolved.body else {
+        panic!("expected a SELECT");
+    };
+    let [key, _mask] = select.group_by.as_mut_slice() else {
+        panic!("expected a ROLLUP key and its GROUPING mask");
+    };
+    // Keep the analyzed levels and mask. Supply the bound projection expression
+    // as the key to exercise the planner's computed Repeat input directly.
+    let computed_key = select.projection[key_index].expr.clone();
+    assert!(matches!(
+        computed_key.kind,
+        ExprKind::BinaryOp { op: BinOp::Add, .. }
+    ));
+    *key = computed_key;
+    plan_query(
+        resolved,
+        cte_registry,
+        &mut factory,
+        &crate::compiler::SqlCompileControl::unbounded(),
+    )
+    .expect("plan the computed Repeat key")
+}
+
 #[test]
 fn p2_rollup_materialized_key_has_real_id() {
-    let plan = parse_analyze_and_plan("SELECT a + 1 AS k FROM t GROUP BY ROLLUP(a + 1)")
-        .expect("planner should succeed");
+    let plan = plan_with_computed_repeat_key("SELECT a + 1 AS k FROM t GROUP BY ROLLUP(a)", 0);
     let (_project, aggregate) = root_project_over_aggregate(&plan);
     let (repeat_plan, _repeat) = first_repeat_node(&plan);
     let LogicalPlanKind::Project(repeat_input_project) = &repeat_plan.unary_input().kind else {
@@ -2492,7 +2545,10 @@ fn grouping_input_sum_distinct_count_and_ordered_array_keep_original_rows() {
 
 #[test]
 fn grouping_input_computed_key_does_not_replace_aggregate_arithmetic() {
-    let plan = plan_test_query("SELECT a + 1 AS k, sum(a + 1) AS s FROM t GROUP BY ROLLUP(a + 1)");
+    let plan = plan_with_computed_repeat_key(
+        "SELECT a + 1 AS k, sum(a + 1) AS s FROM t GROUP BY ROLLUP(a)",
+        0,
+    );
     let (source_id, repeat_key_id) = grouping_input_source_and_repeat_key(&plan);
     let (project, aggregate) = root_project_over_aggregate(&plan);
     assert_eq!(column_ref_id(&project.items[0].expr), repeat_key_id);
@@ -2586,9 +2642,7 @@ fn grouping_input_scalar_predicate_preserves_non_group_argument_columns() {
 #[test]
 fn grouping_input_quoted_column_name_cannot_replace_an_entire_aggregate() {
     let (resolved, registry, mut factory) = parse_analyze_query(
-        "SELECT `sum(a)` AS k, sum(a) AS total \
-         FROM (SELECT a, b AS `sum(a)` FROM t) AS s \
-         GROUP BY ROLLUP(`sum(a)`)",
+        "SELECT \"sum(a)\" AS k, sum(a) AS total FROM (SELECT a, b AS \"sum(a)\" FROM t) AS s GROUP BY ROLLUP(\"sum(a)\")",
     )
     .expect("quoted column and real aggregate should analyze");
     let QueryBody::Select(select) = &resolved.body else {
@@ -3213,8 +3267,8 @@ fn plan_exists_subquery_expr_is_boolean_colref() {
 fn array_agg_json_project_retains_semantics_above_exact_aggregate_slots() {
     use novarocks_type_contract::ValueLogicalType;
     for sql in [
-        "select array_agg(json_object('k',1)) as j, array_agg(cast(json_object('k',1) as varchar)) as s",
-        "select array_agg(json_object('k',1) order by a) as j, array_agg(cast(json_object('k',1) as varchar)) as s from t",
+        "select array_agg(json_object('k':1)) as j, array_agg(cast(json_object('k':1) as varchar)) as s",
+        "select array_agg(json_object('k':1) order by a) as j, array_agg(cast(json_object('k':1) as varchar)) as s from t",
     ] {
         let plan = plan_test_query(sql);
         let (project, aggregate) = root_project_over_aggregate(&plan);
@@ -3436,7 +3490,7 @@ fn m07_duplicate_and_window_projections_keep_complete_source_witnesses() {
         vec![Some(S::Array(Box::new(S::Json))); 2],
     );
     assert_m07_planned_domains(
-        "select array_sortby(array<json>[],[1]) as x,array_sortby(array<json>[],[1]) as y",
+        "select array_sortby(CAST([] AS ARRAY<json>),[1]) as x,array_sortby(CAST([] AS ARRAY<json>),[1]) as y",
         vec![Some(S::Array(Box::new(S::Json))); 2],
     );
     // Exercise the duplicate-ID builder path with an actual analyzer-owned
@@ -3569,7 +3623,7 @@ fn m07_same_value_transfer_checks_carrier_nullability_and_existing_facts() {
 #[test]
 fn flattened_union_spine_keeps_each_original_complete_declaration() {
     let (resolved, registry, mut factory) = parse_analyze_query(
-        "SELECT 1 AS n, json_object('k',1) AS j UNION ALL SELECT 2, json_object('k',2) UNION ALL SELECT 3, NULL",
+        "SELECT 1 AS n, json_object('k':1) AS j UNION ALL SELECT 2, json_object('k':2) UNION ALL SELECT 3, NULL",
     ).unwrap();
     let mut original_layers = Vec::new();
     let mut query = &resolved;

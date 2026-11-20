@@ -25,17 +25,16 @@ CREATE TABLE ${case_db}.t_scan_pruning (
   id INT,
   part_id INT,
   payload STRING
-)
-PARTITION BY (part_id);
+) WITH (partitioning = ARRAY['part_id']);
 INSERT INTO ${case_db}.t_scan_pruning VALUES
-  (1, 1, 'cold-a'),
-  (2, 1, 'cold-b'),
-  (12, 12, 'target'),
-  (13, 12, 'neighbor');
+  ROW(1, 1, 'cold-a'),
+  ROW(2, 1, 'cold-b'),
+  ROW(12, 12, 'target'),
+  ROW(13, 12, 'neighbor');
 
 -- query 2
 -- @skip_result_check=true
-SET enable_connector_static_predicate_pushdown = false;
+SET SESSION enable_connector_static_predicate_pushdown = false;
 
 -- query 3
 SELECT id, part_id, payload
@@ -45,7 +44,7 @@ ORDER BY id;
 
 -- query 4
 -- @skip_result_check=true
-SET enable_connector_static_predicate_pushdown = true;
+SET SESSION enable_connector_static_predicate_pushdown = true;
 
 -- query 5
 SELECT id, part_id, payload
@@ -60,4 +59,4 @@ WHERE part_id = 99 AND id = 99;
 
 -- query 7
 -- @skip_result_check=true
-DROP TABLE ${case_db}.t_scan_pruning FORCE;
+DROP TABLE ${case_db}.t_scan_pruning ;

@@ -362,13 +362,13 @@ fn rewrite_window_calls(
 
             window_exprs.push(WindowExpr {
                 name: name.clone(),
-                args: args.clone(),
+                args: args.clone().into_inner(),
                 distinct: *distinct,
                 binding: binding.clone(),
-                function_order_by: function_order_by.clone(),
+                function_order_by: function_order_by.clone().into_inner(),
                 aggregate_binding: aggregate_binding.clone(),
-                partition_by: partition_by.clone(),
-                order_by: order_by.clone(),
+                partition_by: partition_by.clone().into_inner(),
+                order_by: order_by.clone().into_inner(),
                 window_frame: window_frame.clone(),
                 result_type: expr.value_type.data_type().clone(),
                 output_name: win_output_name.clone(),
@@ -391,7 +391,7 @@ fn rewrite_window_calls(
             decimal_overflow_policy,
         } => TypedExpr {
             kind: ExprKind::BinaryOp {
-                left: Box::new(rewrite_window_calls(
+                left: novarocks_parser::ast::AstBox::new(rewrite_window_calls(
                     left,
                     base_name,
                     output_ids,
@@ -399,7 +399,7 @@ fn rewrite_window_calls(
                     counter,
                 )),
                 op: *op,
-                right: Box::new(rewrite_window_calls(
+                right: novarocks_parser::ast::AstBox::new(rewrite_window_calls(
                     right,
                     base_name,
                     output_ids,
@@ -413,7 +413,7 @@ fn rewrite_window_calls(
         ExprKind::UnaryOp { op, expr: inner } => TypedExpr {
             kind: ExprKind::UnaryOp {
                 op: *op,
-                expr: Box::new(rewrite_window_calls(
+                expr: novarocks_parser::ast::AstBox::new(rewrite_window_calls(
                     inner,
                     base_name,
                     output_ids,
@@ -479,12 +479,14 @@ fn rewrite_window_calls(
             value_type: expr.value_type.clone(),
         },
         ExprKind::Cast {
+            array_failure_mode,
             expr: inner,
             target,
             decimal_overflow_policy,
         } => TypedExpr {
             kind: ExprKind::Cast {
-                expr: Box::new(rewrite_window_calls(
+                array_failure_mode: *array_failure_mode,
+                expr: novarocks_parser::ast::AstBox::new(rewrite_window_calls(
                     inner,
                     base_name,
                     output_ids,
@@ -501,7 +503,7 @@ fn rewrite_window_calls(
             negated,
         } => TypedExpr {
             kind: ExprKind::IsNull {
-                expr: Box::new(rewrite_window_calls(
+                expr: novarocks_parser::ast::AstBox::new(rewrite_window_calls(
                     inner,
                     base_name,
                     output_ids,
@@ -518,7 +520,7 @@ fn rewrite_window_calls(
             negated,
         } => TypedExpr {
             kind: ExprKind::InList {
-                expr: Box::new(rewrite_window_calls(
+                expr: novarocks_parser::ast::AstBox::new(rewrite_window_calls(
                     inner,
                     base_name,
                     output_ids,
@@ -542,21 +544,21 @@ fn rewrite_window_calls(
             negated,
         } => TypedExpr {
             kind: ExprKind::Between {
-                expr: Box::new(rewrite_window_calls(
+                expr: novarocks_parser::ast::AstBox::new(rewrite_window_calls(
                     inner,
                     base_name,
                     output_ids,
                     window_exprs,
                     counter,
                 )),
-                low: Box::new(rewrite_window_calls(
+                low: novarocks_parser::ast::AstBox::new(rewrite_window_calls(
                     low,
                     base_name,
                     output_ids,
                     window_exprs,
                     counter,
                 )),
-                high: Box::new(rewrite_window_calls(
+                high: novarocks_parser::ast::AstBox::new(rewrite_window_calls(
                     high,
                     base_name,
                     output_ids,
@@ -573,14 +575,14 @@ fn rewrite_window_calls(
             negated,
         } => TypedExpr {
             kind: ExprKind::Like {
-                expr: Box::new(rewrite_window_calls(
+                expr: novarocks_parser::ast::AstBox::new(rewrite_window_calls(
                     inner,
                     base_name,
                     output_ids,
                     window_exprs,
                     counter,
                 )),
-                pattern: Box::new(rewrite_window_calls(
+                pattern: novarocks_parser::ast::AstBox::new(rewrite_window_calls(
                     pattern,
                     base_name,
                     output_ids,
@@ -598,7 +600,7 @@ fn rewrite_window_calls(
         } => TypedExpr {
             kind: ExprKind::Case {
                 operand: operand.as_ref().map(|inner| {
-                    Box::new(rewrite_window_calls(
+                    novarocks_parser::ast::AstBox::new(rewrite_window_calls(
                         inner,
                         base_name,
                         output_ids,
@@ -628,7 +630,7 @@ fn rewrite_window_calls(
                     })
                     .collect(),
                 else_expr: else_expr.as_ref().map(|inner| {
-                    Box::new(rewrite_window_calls(
+                    novarocks_parser::ast::AstBox::new(rewrite_window_calls(
                         inner,
                         base_name,
                         output_ids,
@@ -645,7 +647,7 @@ fn rewrite_window_calls(
             negated,
         } => TypedExpr {
             kind: ExprKind::IsTruthValue {
-                expr: Box::new(rewrite_window_calls(
+                expr: novarocks_parser::ast::AstBox::new(rewrite_window_calls(
                     inner,
                     base_name,
                     output_ids,
@@ -658,7 +660,7 @@ fn rewrite_window_calls(
             value_type: expr.value_type.clone(),
         },
         ExprKind::Nested(inner) => TypedExpr {
-            kind: ExprKind::Nested(Box::new(rewrite_window_calls(
+            kind: ExprKind::Nested(novarocks_parser::ast::AstBox::new(rewrite_window_calls(
                 inner,
                 base_name,
                 output_ids,
