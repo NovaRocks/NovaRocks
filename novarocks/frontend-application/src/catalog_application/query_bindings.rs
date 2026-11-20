@@ -975,6 +975,24 @@ impl QueryTableBindingStore {
         Ok(())
     }
 
+    /// The one original rewritten target, already installed during catalog
+    /// completion. The returned token carries no relation or predicate facts.
+    pub(crate) fn row_mutation_match_binding(&self) -> Result<Option<SqlTableBindingId>, String> {
+        let bindings = self.by_id.lock().expect("query table binding by-id lock");
+        let mut matches = bindings.iter().filter_map(|(id, binding)| {
+            matches!(
+                binding.admission,
+                QueryTableBindingAdmission::RowMutationMatch(..)
+            )
+            .then_some(*id)
+        });
+        let target = matches.next();
+        if matches.next().is_some() {
+            return Err("statement admitted more than one row mutation match target".into());
+        }
+        Ok(target)
+    }
+
     pub fn binding(&self, id: SqlTableBindingId) -> Result<Arc<QueryTableBinding>, String> {
         if !id.belongs_to(self.scope()) {
             return Err("SQL table binding token belongs to a different request".to_string());

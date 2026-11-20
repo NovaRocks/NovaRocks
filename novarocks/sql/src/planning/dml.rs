@@ -801,6 +801,7 @@ pub fn begin_final_connector_write_plan(
 > {
     let constant_policy = request.constant_policy();
     let control = request.control().clone();
+    let row_mutation_match = request.row_mutation_match();
     let compiled = crate::compiler::SqlCompiler::optimize(request)?
         .into_optimized_output()
         .map_err(|_| "connector write intent did not produce optimized SQL facts".to_string())?;
@@ -834,6 +835,7 @@ pub fn begin_final_connector_write_plan(
         physical,
         0,
         settings.connector_static_predicate_pushdown_enabled(),
+        row_mutation_match,
         true,
         &control,
     )?;
@@ -1149,6 +1151,7 @@ pub fn begin_final_ctas_connector_write_plan(
         physical,
         0,
         settings.connector_static_predicate_pushdown_enabled(),
+        None,
         true,
         control,
     )?;
@@ -1356,6 +1359,7 @@ impl DmlChangeStreamCompletion {
 )]
 pub(crate) fn begin_final_change_stream_producer_with_effect_ordinal(
     producer: crate::optimizer::OptimizedOperatorNode,
+    row_mutation_match: Option<crate::binding::SqlTableBindingId>,
     query_statistics: crate::optimizer::stats_input::QueryStatsSnapshot,
     routes: Vec<DmlChangeStreamRoute>,
     statistics_targets: Vec<DmlChangeStreamStatisticsTarget>,
@@ -1422,6 +1426,7 @@ pub(crate) fn begin_final_change_stream_producer_with_effect_ordinal(
         physical,
         0,
         settings.connector_static_predicate_pushdown_enabled(),
+        row_mutation_match,
         control,
     )?;
     Ok((
@@ -1475,6 +1480,7 @@ pub fn begin_final_dml_change_stream(
 > {
     let constant_policy = request.optimize_request.constant_policy();
     let control = request.optimize_request.control().clone();
+    let row_mutation_match = request.optimize_request.row_mutation_match();
     let compiled = crate::compiler::SqlCompiler::optimize(request.optimize_request)?
         .into_optimized_output()
         .map_err(|_| "change-stream intent did not produce an optimized SQL plan".to_string())?;
@@ -1525,6 +1531,7 @@ pub fn begin_final_dml_change_stream(
         .ok_or_else(|| "change-stream producer has no effect output occurrence".to_string())?;
     begin_final_change_stream_producer_with_effect_ordinal(
         producer,
+        row_mutation_match,
         compiled.statistics.snapshot,
         request.routes,
         request.statistics_targets,

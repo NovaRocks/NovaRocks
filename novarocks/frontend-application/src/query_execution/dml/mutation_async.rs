@@ -410,8 +410,12 @@ pub(crate) async fn compile_routed_mutation_write(
     let statistics = crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings_async(
         state, Arc::clone(bindings), context,
     ).await?;
+    let match_binding = bindings
+        .row_mutation_match_binding()?
+        .ok_or("row mutation lost its original target binding")?;
     let optimize_request =
-        novarocks_sql::compiler::SqlOptimizeRequest::new(analyzed, &statistics, control.clone());
+        novarocks_sql::compiler::SqlOptimizeRequest::new(analyzed, &statistics, control.clone())
+            .with_row_mutation_match(Some(match_binding));
     let decimal_overflow_policy = optimize_request.decimal_overflow_policy();
     let (completion, needs) = novarocks_sql::planning::dml::begin_final_dml_change_stream(
         DmlChangeStreamCompileRequest {

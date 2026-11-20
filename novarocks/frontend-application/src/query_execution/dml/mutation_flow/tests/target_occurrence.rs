@@ -20,6 +20,20 @@ use super::*;
 // The production change-stream compiler keeps the target's provider occurrence for registration.
 #[test]
 fn empty_row_mutation_producers_still_request_the_target_occurrence() {
+    check_mutation_provider_reads(false, true);
+}
+
+#[test]
+fn row_mutation_target_offers_folded_bigint_predicate() {
+    check_mutation_provider_reads(true, true);
+}
+
+#[test]
+fn ordinary_read_offer_leaves_folded_bigint_predicate_with_engine() {
+    check_mutation_provider_reads(true, false);
+}
+
+fn check_mutation_provider_reads(folded_delete: bool, row_mutation_match: bool) {
     use novarocks_spi::connector::{
         ConnectorMutationRouteInput, ConnectorRowMutationEffect, ConnectorWriteFieldToken,
         ConnectorWriteRouteId,
@@ -184,14 +198,25 @@ fn empty_row_mutation_producers_still_request_the_target_occurrence() {
         None,
         true,
     );
-    let delete = test_query("SELECT _file, _pos, _spec_id, _partition FROM t WHERE FALSE");
+    let (delete_label, delete_query) = if folded_delete {
+        (
+            "DELETE WHERE id = 1",
+            "SELECT _file, _pos, _spec_id, _partition FROM t WHERE id = 1",
+        )
+    } else {
+        (
+            "DELETE WHERE FALSE",
+            "SELECT _file, _pos, _spec_id, _partition FROM t WHERE FALSE",
+        )
+    };
+    let delete = test_query(delete_query);
     let mut after = columns.clone();
     after.extend(lineage);
     use ConnectorRowMutationEffect::{Delete, Insert, Replace};
     use DmlWriteSinkMode::{Data, DeletionVectors, RowLineageData};
     let cases = [
         (
-            "DELETE WHERE FALSE",
+            delete_label,
             delete,
             DmlChangeStreamKind::Delete {
                 position_input: [0, 1, 2, 3],
@@ -224,6 +249,9 @@ fn empty_row_mutation_producers_still_request_the_target_occurrence() {
         ),
     ];
     for (label, query, kind, assertion, routes) in cases {
+        if folded_delete && !matches!(kind, DmlChangeStreamKind::Delete { .. }) {
+            continue;
+        }
         let control = SqlCompileControl::unbounded();
         let analyzed = SqlCompiler::analyze(SqlAnalyzeRequest::new(
             SqlStatementInput::parsed_query(Box::new(query)),
@@ -259,7 +287,8 @@ fn empty_row_mutation_producers_still_request_the_target_occurrence() {
         }]);
         let (_, needs) = begin_final_dml_change_stream(
             DmlChangeStreamCompileRequest {
-                optimize_request: SqlOptimizeRequest::new(analyzed, &statistics, control),
+                optimize_request: SqlOptimizeRequest::new(analyzed, &statistics, control)
+                    .with_row_mutation_match(row_mutation_match.then_some(id)),
                 kind,
                 routes,
                 statistics_targets,
@@ -279,5 +308,24 @@ fn empty_row_mutation_producers_still_request_the_target_occurrence() {
             id,
             "{label} must freeze the original target"
         );
+        if folded_delete && !row_mutation_match {
+            assert!(needs[0].predicates().is_empty());
+        }
+        if folded_delete && row_mutation_match {
+            use novarocks_spi::connector::read_stack::{ConnectorValue, Domain};
+
+            let need = &needs[0];
+            let id_column = need
+                .columns()
+                .iter()
+                .find(|column| column.name() == "id")
+                .unwrap();
+            let summary = need.filter().summary().domains().unwrap();
+            assert_eq!(summary.len(), 1, "id = 1 must reach the original target");
+            assert_eq!(
+                summary.get(&id_column.ordinal()),
+                Some(&Domain::single_value(ConnectorValue::BigInt(1)).unwrap())
+            );
+        }
     }
 }

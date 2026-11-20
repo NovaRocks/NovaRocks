@@ -1270,6 +1270,7 @@ pub struct SqlOptimizeRequest<'a> {
     analyzed: SqlAnalyzedQuery,
     statistics: &'a crate::planning::dml::DmlStatisticsSnapshot,
     control: SqlCompileControl,
+    row_mutation_match: Option<crate::binding::SqlTableBindingId>,
 }
 
 impl<'a> SqlOptimizeRequest<'a> {
@@ -1302,7 +1303,22 @@ impl<'a> SqlOptimizeRequest<'a> {
             analyzed,
             statistics,
             control,
+            row_mutation_match: None,
         }
+    }
+
+    /// Scope folded predicate offers to the original target already admitted
+    /// by the application. The binding itself is unchanged.
+    pub fn with_row_mutation_match(
+        mut self,
+        binding: Option<crate::binding::SqlTableBindingId>,
+    ) -> Self {
+        self.row_mutation_match = binding;
+        self
+    }
+
+    pub(crate) fn row_mutation_match(&self) -> Option<crate::binding::SqlTableBindingId> {
+        self.row_mutation_match
     }
 }
 
