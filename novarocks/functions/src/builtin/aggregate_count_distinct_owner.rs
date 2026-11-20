@@ -50,7 +50,7 @@ pub(super) fn definition(
     resolver: Arc<BuiltinAggregateResolver>,
 ) -> Result<FunctionDefinition, FunctionCatalogError> {
     let owner = Arc::new(CountDistinctOwner::new(name, declaration, resolver)?);
-    FunctionDefinition::try_new_pure_aggregate(name, FunctionVisibility::Public, owner).map_err(
+    FunctionDefinition::try_new_pure_aggregate(name, FunctionVisibility::Hidden, owner).map_err(
         |error| FunctionCatalogError::InvalidStableIdentity {
             subject: "builtin multi_distinct_count aggregate pure owner",
             value: error.to_string().into(),

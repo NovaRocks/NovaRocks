@@ -37,8 +37,6 @@ use crate::planner::physical::{
     AggMode, AggregateOutputLayout, HashSource, JoinDistribution, JoinExecutionMode,
     PhysicalPlanStats, TopNPhase,
 };
-#[cfg(test)]
-use novarocks_functions::aggregate_types::mangle_distinct_aggregate_name;
 
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
@@ -332,20 +330,12 @@ pub enum RedistributeMode {
 // a pure, planner-free leaf). Consumed by the distributed planner's aggregate
 // output finalization (`sql::planner::distributed::output::finalize_hash_aggregate_wire`).
 
-/// The canonical aggregate function name for a `call`, delegating the DISTINCT
-/// name-mangling table to the single source of truth
-/// [`mangle_distinct_aggregate_name`].
-#[cfg(test)]
-pub(crate) fn aggregate_function_name(call: &AggregateCall) -> String {
-    mangle_distinct_aggregate_name(&call.name, call.distinct)
-}
-
 #[cfg(test)]
 mod aggregate_wire_tests {
     use arrow::datatypes::DataType;
 
+    use super::aggregate_intermediate_type;
     use super::{AggMode, hash_aggregate_outputs_intermediate};
-    use super::{aggregate_function_name, aggregate_intermediate_type};
     use crate::analysis::{ExprKind, LiteralValue, TypedExpr};
     use crate::column_id::ColumnId;
     use crate::planner::payload::AggregateCall;
@@ -382,14 +372,22 @@ mod aggregate_wire_tests {
     }
 
     #[test]
-    fn function_name_applies_distinct_mangling() {
+    fn lowered_aggregate_preserves_the_selected_identity() {
         assert_eq!(
-            aggregate_function_name(&agg_call("count", false, vec![])),
-            "count"
+            agg_call("count", false, vec![])
+                .source
+                .binding()
+                .function_id
+                .as_str(),
+            "builtin.aggregate/count/v1",
         );
         assert_eq!(
-            aggregate_function_name(&agg_call("COUNT", true, vec![DataType::Int64])),
-            "multi_distinct_count"
+            agg_call("COUNT", true, vec![DataType::Int64])
+                .source
+                .binding()
+                .function_id
+                .as_str(),
+            "builtin.aggregate/multi_distinct_count/v1",
         );
     }
 
@@ -400,7 +398,7 @@ mod aggregate_wire_tests {
             aggregate_intermediate_type(&agg_call("avg", false, vec![DataType::Int64])).unwrap(),
             DataType::Utf8
         );
-        // DISTINCT count mangles to multi_distinct_count -> Binary intermediate.
+        // DISTINCT count retains the internal Binary intermediate.
         assert_eq!(
             aggregate_intermediate_type(&agg_call("count", true, vec![DataType::Int64])).unwrap(),
             DataType::Binary

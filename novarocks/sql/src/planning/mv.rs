@@ -3083,7 +3083,7 @@ fn classify_aggregate_call(expr: &Expr, output_name: String) -> Result<Aggregate
 
     let (function, input) = match function_name.as_str() {
         "count" => classify_count_input(args)?,
-        "count_distinct" | "multi_distinct_count" => (
+        "count_distinct" => (
             AggregateFunctionKind::CountDistinct,
             classify_count_distinct_input(args)?,
         ),
@@ -3688,7 +3688,6 @@ fn is_aggregate_function(name: &str) -> bool {
             | "bitmap_union"
             | "bitmap_union_count"
             | "bitmap_union_int"
-            | "multi_distinct_count"
             | "array_agg_distinct"
             | "array_unique_agg"
             | "sum_map"
@@ -3730,7 +3729,6 @@ fn is_aggregate_function(name: &str) -> bool {
             | "min_by"
             | "max_by_v2"
             | "min_by_v2"
-            | "multi_distinct_sum"
             | "retention"
             | "window_funnel"
             | "histogram"
@@ -4284,21 +4282,6 @@ mod tests {
     }
 
     #[test]
-    fn classify_multi_distinct_count() {
-        let shape = classify_sql(
-            "select region, multi_distinct_count(user_id) from ice.ns.events group by region",
-        )
-        .unwrap();
-        let IncrementalMvShape::Aggregate(shape) = shape else {
-            panic!("expected aggregate shape");
-        };
-        assert_eq!(
-            shape.aggregates[0].function,
-            AggregateFunctionKind::CountDistinct
-        );
-    }
-
-    #[test]
     fn classify_approx_count_distinct_aliases() {
         for function_name in ["approx_count_distinct", "ndv", "hll_ndv"] {
             let sql = format!(
@@ -4679,7 +4662,7 @@ mod tests {
             "select hll_union(k1) from ice.ns.orders",
             "select percentile_approx(v2, 0.5) from ice.ns.orders",
             "select max_by_v2(k1, v2) from ice.ns.orders",
-            "select multi_distinct_sum(v2) from ice.ns.orders",
+            "select sum(distinct v2) from ice.ns.orders",
         ] {
             assert_rejects_with(sql, "incremental aggregate MV");
         }
@@ -6174,7 +6157,6 @@ fn validate_supported_aggregate_call(
         normalized.as_str(),
         "count"
             | "count_distinct"
-            | "multi_distinct_count"
             | "approx_count_distinct"
             | "ndv"
             | "hll_ndv"

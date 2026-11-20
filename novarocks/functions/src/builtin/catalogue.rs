@@ -4875,33 +4875,58 @@ mod tests {
     }
 
     #[test]
-    fn variadic_distinct_count_and_dict_merge_keep_their_logical_arities() {
-        let catalog = build_builtin_engine_function_catalog().expect("builtin catalog");
+    fn distinct_count_binds_only_through_its_internal_identity() {
+        use crate::aggregate_types::DistinctAggregate;
 
-        let distinct = resolve_bound_aggregate(
-            &catalog,
-            "multi_distinct_count",
-            &[DataType::Int64, DataType::Utf8, DataType::Boolean],
-            &[DataType::Int64, DataType::Utf8, DataType::Boolean],
-            false,
-            crate::binding_test_control(),
-        )
-        .expect("multi-column distinct count resolves");
+        let catalog = build_builtin_engine_function_catalog().expect("builtin catalog");
+        let types = [DataType::Int64, DataType::Utf8, DataType::Boolean];
+        let arguments = types.map(|data_type| FunctionArgument::Value {
+            value_type: FunctionValueType::new(data_type, true),
+            constant: None,
+        });
+        let request = FunctionBindingRequest {
+            expected_result_type: None,
+            logical_argument_count: arguments.len(),
+            arguments: &arguments,
+        };
+        let control = crate::binding_test_control();
+        let distinct = catalog
+            .resolve_distinct_aggregate(DistinctAggregate::Count, request, control)
+            .expect("multi-column DISTINCT count resolves");
+        assert_eq!(distinct.logical_argument_count, 3);
         assert_eq!(
-            distinct.argument_types,
-            [DataType::Int64, DataType::Utf8, DataType::Boolean]
+            distinct.function_id.as_str(),
+            "builtin.aggregate/multi_distinct_count/v1"
+        );
+        let state = distinct.selected.aggregate.unwrap();
+        assert_eq!(state.intermediate_type.data_type(), &DataType::Binary);
+        assert_eq!(
+            state.state_format.as_str(),
+            "novarocks/multi_distinct_count/state-v1"
         );
         assert!(matches!(
-            resolve_bound_aggregate(
-                &catalog,
+            catalog.resolve_bound_user(
                 "multi_distinct_count",
-                &[],
-                &[],
-                false,
-                crate::binding_test_control()
+                FunctionKind::Aggregate,
+                request,
+                control
             ),
-            Err(FunctionResolutionError::NoMatchingSignature { .. })
+            Err(FunctionBindingError::HiddenFunction)
         ));
+        let empty = FunctionBindingRequest {
+            expected_result_type: None,
+            logical_argument_count: 0,
+            arguments: &[],
+        };
+        assert!(matches!(
+            catalog.resolve_distinct_aggregate(DistinctAggregate::Count, empty, control),
+            Err(FunctionBindingError::NoMatchingOverload)
+        ));
+    }
+
+    #[test]
+    fn dict_merge_keeps_its_logical_arity() {
+        let catalog = build_builtin_engine_function_catalog().expect("builtin catalog");
 
         let dict = resolve_bound_aggregate(
             &catalog,

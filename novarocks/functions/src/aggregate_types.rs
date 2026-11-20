@@ -788,28 +788,43 @@ fn is_state_combinator_aggregate_function(name: &str) -> bool {
     )
 }
 
-/// Apply the canonical DISTINCT aggregate name mangling to `name`: a distinct
-/// `count` / `sum` / `array_agg` maps to its multi-distinct/`_distinct` variant
-/// (`count` -> `multi_distinct_count`, `sum` -> `multi_distinct_sum`,
-/// `avg` -> `multi_distinct_avg`, `array_agg`
-/// -> `array_agg_distinct`); every other name is returned lowercased unchanged.
-///
-/// This is the single source of truth for the DISTINCT-mangling table, feeding
-/// both the planner-typed aggregate adapters (`sql::planner::physical`) and the
-/// Backend-owned native decoder. It is pure
-/// (`&str` in, `String` out) so this module stays a protobuf-free, planner-free
-/// leaf next to [`infer_agg_function_types`].
-pub fn mangle_distinct_aggregate_name(name: &str, distinct: bool) -> String {
-    let name = name.to_ascii_lowercase();
-    if !distinct {
-        return name;
-    }
-    match name.as_str() {
-        "count" => "multi_distinct_count".to_string(),
-        "sum" => "multi_distinct_sum".to_string(),
-        "avg" => "multi_distinct_avg".to_string(),
-        "array_agg" => "array_agg_distinct".to_string(),
-        _ => name,
+/// Internal aggregate selected by SQL for an admitted DISTINCT modifier.
+#[derive(Clone, Copy, Debug)]
+pub enum DistinctAggregate {
+    Count,
+    Sum,
+    Avg,
+}
+
+impl crate::EngineFunctionCatalog {
+    pub fn resolve_distinct_aggregate(
+        &self,
+        aggregate: DistinctAggregate,
+        request: crate::FunctionBindingRequest<'_>,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<crate::ResolvedFunctionBinding, crate::FunctionBindingError> {
+        let (function, overload) = match aggregate {
+            DistinctAggregate::Count => (
+                "builtin.aggregate/multi_distinct_count/v1",
+                "builtin.aggregate/multi_distinct_count/derived-v1",
+            ),
+            DistinctAggregate::Sum => (
+                "builtin.aggregate/multi_distinct_sum/v1",
+                "builtin.aggregate/multi_distinct_sum/derived-v1",
+            ),
+            DistinctAggregate::Avg => (
+                "builtin.aggregate/multi_distinct_avg/v1",
+                "builtin.aggregate/multi_distinct_avg/derived-v1",
+            ),
+        };
+        self.resolve_bound_trusted_at_overload(
+            &crate::FunctionId::try_new(function).expect("valid DISTINCT aggregate identity"),
+            crate::FunctionKind::Aggregate,
+            &crate::FunctionOverloadId::try_new(overload)
+                .expect("valid DISTINCT overload identity"),
+            request,
+            control,
+        )
     }
 }
 
@@ -876,15 +891,10 @@ mod tests {
     use arrow_schema::{DataType, Field, Fields};
     use novarocks_type_contract::canonical_agg_decimal_type;
 
-    use super::{infer_agg_function_types, mangle_distinct_aggregate_name};
+    use super::infer_agg_function_types;
 
     #[test]
     fn distinct_avg_has_its_own_binary_state_and_canonical_decimal_result() {
-        assert_eq!(
-            mangle_distinct_aggregate_name("AVG", true),
-            "multi_distinct_avg"
-        );
-        assert_eq!(mangle_distinct_aggregate_name("avg", false), "avg");
         assert_eq!(
             infer_agg_function_types("multi_distinct_avg", &[DataType::Decimal256(50, 2)], true)
                 .unwrap(),
@@ -903,28 +913,6 @@ mod tests {
             infer_agg_function_types("avg", &[DataType::Int64], false).unwrap(),
             (DataType::Float64, Some(DataType::Utf8))
         );
-    }
-
-    #[test]
-    fn distinct_name_mangling_is_the_single_source_of_truth() {
-        // Non-distinct names are lowercased unchanged.
-        assert_eq!(mangle_distinct_aggregate_name("count", false), "count");
-        assert_eq!(mangle_distinct_aggregate_name("COUNT", false), "count");
-        // The distinct-mangling table.
-        assert_eq!(
-            mangle_distinct_aggregate_name("COUNT", true),
-            "multi_distinct_count"
-        );
-        assert_eq!(
-            mangle_distinct_aggregate_name("sum", true),
-            "multi_distinct_sum"
-        );
-        assert_eq!(
-            mangle_distinct_aggregate_name("array_agg", true),
-            "array_agg_distinct"
-        );
-        // A distinct function with no mangling rule keeps its lowercased name.
-        assert_eq!(mangle_distinct_aggregate_name("MAX", true), "max");
     }
 
     #[test]

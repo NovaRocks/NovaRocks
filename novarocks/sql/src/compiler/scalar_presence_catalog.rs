@@ -399,6 +399,20 @@ impl SqlFunctionCatalog for ScalarPresenceCatalog {
     fn contains_aggregate(&self, name: &str) -> bool {
         self.original.contains_aggregate(name)
     }
+    fn resolve_distinct_aggregate(
+        &self,
+        aggregate: novarocks_functions::aggregate_types::DistinctAggregate,
+        request: novarocks_functions::FunctionBindingRequest<'_>,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<
+        novarocks_functions::ResolvedFunctionBinding,
+        novarocks_functions::FunctionBindingError,
+    > {
+        let binding = self
+            .original
+            .resolve_distinct_aggregate(aggregate, request, control)?;
+        self.admit(binding, control)
+    }
     fn resolve_aggregate_binding(
         &self,
         _name: &str,

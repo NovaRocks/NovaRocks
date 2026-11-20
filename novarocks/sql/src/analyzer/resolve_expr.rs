@@ -2517,12 +2517,7 @@ impl<'a> super::AnalyzerContext<'a> {
             let aggregate_binding = if window_only {
                 None
             } else {
-                let executable_name =
-                    novarocks_functions::aggregate_types::mangle_distinct_aggregate_name(
-                        &name,
-                        is_distinct,
-                    );
-                if !self.function_catalog.contains_aggregate(&executable_name) {
+                if !self.function_catalog.contains_aggregate(&name) {
                     // Legacy declarations are type-inspection facts, not installed selected bindings.
                     // A custom contribution of the same name is resolved by its own catalog identity.
                     if scalar_signature_is_unknown(
@@ -2562,7 +2557,8 @@ impl<'a> super::AnalyzerContext<'a> {
                 }
                 Some(resolve_aggregate_function_call_with_order(
                     self.function_catalog,
-                    &executable_name,
+                    &name,
+                    is_distinct,
                     &args_typed,
                     &func_order_by,
                     func.span,
@@ -2804,14 +2800,10 @@ impl<'a> super::AnalyzerContext<'a> {
         if is_aggregate_function(self.function_catalog, &name) {
             validate_aggregate_function_call(&name, &arg_types)
                 .map_err(|message| AnalyzeError::invalid_argument(message, func.span))?;
-            let executable_name =
-                novarocks_functions::aggregate_types::mangle_distinct_aggregate_name(
-                    &name,
-                    is_distinct,
-                );
             bound_aggregate = Some(resolve_aggregate_function_call_with_order(
                 self.function_catalog,
-                &executable_name,
+                &name,
+                is_distinct,
                 &args_typed,
                 &func_order_by,
                 func.span,
@@ -5939,6 +5931,7 @@ pub(super) fn resolve_aggregate_function_call(
     resolve_aggregate_function_call_with_order(
         function_catalog,
         name,
+        false,
         args,
         &[],
         span,
@@ -5952,6 +5945,7 @@ pub(super) fn resolve_aggregate_function_call(
 fn resolve_aggregate_function_call_with_order(
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     name: &str,
+    distinct: bool,
     args: &[TypedExpr],
     function_order_by: &[SortItem],
     span: Span,
@@ -5964,12 +5958,12 @@ fn resolve_aggregate_function_call_with_order(
         .iter()
         .map(|argument| argument.value_type.data_type().clone())
         .collect::<Vec<_>>();
-    crate::functions::resolve_sql_aggregate_binding(
+    crate::functions::resolve_sql_aggregate_call(
         function_catalog,
         name,
+        distinct,
         args,
         function_order_by,
-        false,
         constant_policy,
         control,
     )

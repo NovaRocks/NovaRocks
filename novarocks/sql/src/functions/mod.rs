@@ -47,12 +47,13 @@ use novarocks_functions::{
     AggregateBindingDeclaration, AggregateOverloadMetadata, EngineFunctionCatalogBuilder,
     FunctionArgumentEvaluation, FunctionBindingDeclaration, FunctionBindingResolver,
     FunctionBindingSelection, FunctionFailureBehavior, FunctionId, FunctionOverloadDeclaration,
-    FunctionOverloadId, FunctionSemantics, FunctionVisibility,
+    FunctionOverloadId, FunctionSemantics,
 };
 use novarocks_functions::{
     EngineFunctionCatalog, FunctionArgument, FunctionArgumentType, FunctionBindingError,
     FunctionBindingRequest, FunctionDefinition, FunctionKind, FunctionResolutionError,
-    FunctionResultType, FunctionValueType, ResolvedAggregateSignature, ResolvedFunctionBinding,
+    FunctionResultType, FunctionValueType, FunctionVisibility, ResolvedAggregateSignature,
+    ResolvedFunctionBinding, aggregate_types::DistinctAggregate,
 };
 
 #[cfg(test)]
@@ -441,7 +442,17 @@ impl crate::compiler::SqlFunctionCatalog for EngineFunctionCatalog {
     }
 
     fn contains_aggregate(&self, name: &str) -> bool {
-        self.definition(name, FunctionKind::Aggregate).is_some()
+        self.definition(name, FunctionKind::Aggregate)
+            .is_some_and(|definition| definition.visibility() == FunctionVisibility::Public)
+    }
+
+    fn resolve_distinct_aggregate(
+        &self,
+        aggregate: DistinctAggregate,
+        request: FunctionBindingRequest<'_>,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
+        EngineFunctionCatalog::resolve_distinct_aggregate(self, aggregate, request, control)
     }
 
     fn resolve_aggregate_binding(
@@ -534,6 +545,73 @@ pub(crate) fn resolve_sql_aggregate_binding(
     constant_policy: novarocks_functions::ConstantPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
+    bind_aggregate_arguments(args, order_by, constant_policy, control, |request| {
+        if trusted {
+            catalog.resolve_aggregate_binding_trusted(
+                name,
+                request.logical_argument_count,
+                request.arguments,
+                control,
+            )
+        } else {
+            catalog.resolve_aggregate_binding(
+                name,
+                request.logical_argument_count,
+                request.arguments,
+                control,
+            )
+        }
+    })
+}
+
+pub(crate) fn resolve_sql_aggregate_call(
+    catalog: &dyn crate::compiler::SqlFunctionCatalog,
+    name: &str,
+    distinct: bool,
+    args: &[crate::analysis::TypedExpr],
+    order_by: &[crate::analysis::SortItem],
+    constant_policy: novarocks_functions::ConstantPolicy,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
+    bind_aggregate_arguments(args, order_by, constant_policy, control, |request| {
+        match public_aggregate_target(name, distinct) {
+            PublicAggregateTarget::Named(executable) => catalog.resolve_aggregate_binding(
+                executable,
+                request.logical_argument_count,
+                request.arguments,
+                control,
+            ),
+            PublicAggregateTarget::Distinct(aggregate) => {
+                catalog.resolve_distinct_aggregate(aggregate, request, control)
+            }
+        }
+    })
+}
+
+enum PublicAggregateTarget<'a> {
+    Named(&'a str),
+    Distinct(DistinctAggregate),
+}
+
+fn public_aggregate_target(name: &str, distinct: bool) -> PublicAggregateTarget<'_> {
+    match (distinct, name) {
+        (true, "count") => PublicAggregateTarget::Distinct(DistinctAggregate::Count),
+        (true, "sum") => PublicAggregateTarget::Distinct(DistinctAggregate::Sum),
+        (true, "avg") => PublicAggregateTarget::Distinct(DistinctAggregate::Avg),
+        (true, "array_agg") => PublicAggregateTarget::Named("array_agg_distinct"),
+        _ => PublicAggregateTarget::Named(name),
+    }
+}
+
+fn bind_aggregate_arguments(
+    args: &[crate::analysis::TypedExpr],
+    order_by: &[crate::analysis::SortItem],
+    constant_policy: novarocks_functions::ConstantPolicy,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+    bind: impl FnOnce(
+        FunctionBindingRequest<'_>,
+    ) -> Result<ResolvedFunctionBinding, FunctionBindingError>,
+) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
     let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
         control,
         novarocks_type_contract::CompilePhase::FunctionSpecialization,
@@ -556,11 +634,11 @@ pub(crate) fn resolve_sql_aggregate_binding(
             work.flush()?;
         }
         work.flush()?;
-        if trusted {
-            catalog.resolve_aggregate_binding_trusted(name, args.len(), &arguments, control)
-        } else {
-            catalog.resolve_aggregate_binding(name, args.len(), &arguments, control)
-        }
+        bind(FunctionBindingRequest {
+            expected_result_type: None,
+            logical_argument_count: args.len(),
+            arguments: &arguments,
+        })
     })();
     if matches!(result, Err(FunctionBindingError::Control(_))) {
         return result;
@@ -584,8 +662,8 @@ pub(crate) fn test_resolved_aggregate(
     argument_types: &[DataType],
     distinct: bool,
 ) -> crate::binding::SqlFunctionBinding {
-    let executable_name =
-        novarocks_functions::aggregate_types::mangle_distinct_aggregate_name(name, distinct);
+    let name = name.to_ascii_lowercase();
+    let control = crate::compiler::SqlCompileControl::unbounded();
     let arguments = argument_types
         .iter()
         .cloned()
@@ -594,20 +672,21 @@ pub(crate) fn test_resolved_aggregate(
             constant: None,
         })
         .collect::<Vec<_>>();
-    let exact = builtin_engine_function_catalog()
-        .resolve_bound_trusted(
-            &executable_name,
-            FunctionKind::Aggregate,
-            FunctionBindingRequest {
-                expected_result_type: None,
-                arguments: &arguments,
-                logical_argument_count: arguments.len(),
-            },
-            &crate::compiler::SqlCompileControl::unbounded(),
-        )
-        .unwrap_or_else(|error| {
-            panic!("test aggregate `{executable_name}` must resolve exactly: {error}")
-        });
+    let request = FunctionBindingRequest {
+        expected_result_type: None,
+        arguments: &arguments,
+        logical_argument_count: arguments.len(),
+    };
+    let catalog = builtin_engine_function_catalog();
+    let exact = match public_aggregate_target(&name, distinct) {
+        PublicAggregateTarget::Named(executable) => {
+            catalog.resolve_bound_trusted(executable, FunctionKind::Aggregate, request, &control)
+        }
+        PublicAggregateTarget::Distinct(aggregate) => {
+            catalog.resolve_distinct_aggregate(aggregate, request, &control)
+        }
+    }
+    .unwrap_or_else(|error| panic!("test aggregate `{name}` must resolve exactly: {error}"));
     crate::binding::SqlFunctionBinding::new(
         exact,
         novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
@@ -1738,33 +1817,8 @@ mod tests {
     }
 
     #[test]
-    fn variadic_distinct_count_and_dict_merge_keep_their_logical_arities() {
+    fn dict_merge_keeps_its_logical_arity() {
         let catalog = build_builtin_engine_function_catalog().expect("builtin catalog");
-
-        let distinct = resolve_bound_aggregate(
-            &catalog,
-            "multi_distinct_count",
-            &[DataType::Int64, DataType::Utf8, DataType::Boolean],
-            &[DataType::Int64, DataType::Utf8, DataType::Boolean],
-            false,
-            &crate::compiler::SqlCompileControl::unbounded(),
-        )
-        .expect("multi-column distinct count resolves");
-        assert_eq!(
-            distinct.argument_types,
-            [DataType::Int64, DataType::Utf8, DataType::Boolean]
-        );
-        assert!(matches!(
-            resolve_bound_aggregate(
-                &catalog,
-                "multi_distinct_count",
-                &[],
-                &[],
-                false,
-                &crate::compiler::SqlCompileControl::unbounded()
-            ),
-            Err(FunctionResolutionError::NoMatchingSignature { .. })
-        ));
 
         let dict = resolve_bound_aggregate(
             &catalog,

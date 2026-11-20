@@ -552,6 +552,22 @@ pub trait SqlFunctionCatalog: Send + Sync + std::fmt::Debug {
 
     fn contains_aggregate(&self, name: &str) -> bool;
 
+    fn resolve_distinct_aggregate(
+        &self,
+        _aggregate: novarocks_functions::aggregate_types::DistinctAggregate,
+        _request: novarocks_functions::FunctionBindingRequest<'_>,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<
+        novarocks_functions::ResolvedFunctionBinding,
+        novarocks_functions::FunctionBindingError,
+    > {
+        control.checkpoint(
+            novarocks_type_contract::CompilePhase::FunctionSpecialization,
+            0,
+        )?;
+        Err(novarocks_functions::FunctionBindingError::MissingBindingDeclaration)
+    }
+
     fn resolve_aggregate_binding(
         &self,
         _name: &str,

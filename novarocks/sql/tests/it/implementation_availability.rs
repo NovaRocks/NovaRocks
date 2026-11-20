@@ -84,6 +84,41 @@ mod fold_frontiers {
     }
 
     #[test]
+    fn distinct_aggregates_are_selected_only_from_supported_sql_calls() {
+        let probe = Arc::new(FoldProbe::default());
+        analyze(
+            "SELECT count(DISTINCT 1, 2), sum(DISTINCT 1), avg(DISTINCT 1)",
+            &probe,
+        )
+        .unwrap();
+
+        for (sql, expected) in [
+            (
+                "SELECT multi_distinct_count(1)",
+                AnalyzeErrorKind::UnknownFunction,
+            ),
+            (
+                "SELECT multi_distinct_sum(1) OVER ()",
+                AnalyzeErrorKind::UnknownFunction,
+            ),
+            (
+                "SELECT multi_distinct_avg(1)",
+                AnalyzeErrorKind::UnknownFunction,
+            ),
+            (
+                "SELECT count(DISTINCT 1) OVER ()",
+                AnalyzeErrorKind::UnsupportedExpression,
+            ),
+        ] {
+            let error = analyze(sql, &probe).unwrap_err();
+            let SqlCompileError::Analyze(error) = error else {
+                panic!("expected analysis error for {sql}: {error:?}");
+            };
+            assert_eq!(error.kind(), expected, "{sql}: {error}");
+        }
+    }
+
+    #[test]
     fn e08s1_missing_aggregate_window_and_over_keep_unavailable_span_before_any_fold() {
         for (sql, name) in [
             ("SELECT dict_merge('x', 1)", "builtin.aggregate/dict_merge/"),
