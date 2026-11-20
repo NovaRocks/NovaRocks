@@ -75,6 +75,8 @@ pub enum TypeSpec {
     /// `negative` -- can name it on both sides. `AnyDecimal128` cannot do
     /// that: it carries no name, so nothing can refer back to it.
     Decimal128Of(&'static str),
+    /// Analogous named decimal template for the Decimal256 carrier.
+    Decimal256Of(&'static str),
     /// LARGEINT, whose physical carrier is `FixedSizeBinary(16)`. It is one
     /// of this engine's integer types; the registry could not name it at all
     /// before, so every numeric family silently refused it.
@@ -241,6 +243,11 @@ impl TypeSpec {
                 output.push_str(name);
                 output.push('>');
             }
+            Self::Decimal256Of(name) => {
+                output.push_str("decimal256<");
+                output.push_str(name);
+                output.push('>');
+            }
             Self::Any(name) => {
                 output.push_str("any<");
                 output.push_str(name);
@@ -280,9 +287,8 @@ pub(crate) fn anchor_matches(spec: &TypeSpec, dt: &DataType) -> bool {
         (TypeSpec::Date, DataType::Date32) => true,
         (TypeSpec::Datetime, DataType::Timestamp(_, _)) => true,
         (TypeSpec::AnyDecimal128, DataType::Decimal128(_, _)) => true,
-        // `Decimal128Of` is deliberately absent: like `Any`, it must fall
-        // through to the polymorphic pass so the concrete decimal is bound
-        // before a return type tries to name it.
+        // Named decimals, like Any, fall through to the polymorphic pass
+        // so the concrete decimal is bound before its use in the return type.
         (TypeSpec::LargeInt, DataType::FixedSizeBinary(width))
             if *width == novarocks_type_contract::LARGEINT_BYTE_WIDTH =>
         {
@@ -318,7 +324,7 @@ fn bind_nothing_with_construction<E>(
     creation: &mut ScalarConstruction<'_, E>,
 ) -> Result<(), ConstructionFailure<E>> {
     match spec {
-        TypeSpec::Any(name) | TypeSpec::Decimal128Of(name) => {
+        TypeSpec::Any(name) | TypeSpec::Decimal128Of(name) | TypeSpec::Decimal256Of(name) => {
             bindings.bind_null_with_construction(name, creation)?
         }
         TypeSpec::List(inner) => bind_nothing_with_construction(inner, bindings, creation)?,
@@ -368,7 +374,7 @@ pub(crate) fn realize(spec: &TypeSpec, bindings: &Bindings) -> Result<DataType, 
         TypeSpec::LargeInt => {
             DataType::FixedSizeBinary(novarocks_type_contract::LARGEINT_BYTE_WIDTH)
         }
-        TypeSpec::Decimal128Of(name) => bindings
+        TypeSpec::Decimal128Of(name) | TypeSpec::Decimal256Of(name) => bindings
             .lookup(name)
             .ok_or_else(|| format!("decimal type variable {name} is unbound in the return type"))?,
         TypeSpec::MapWithUninhabitedKey { map, .. } => bindings
@@ -725,13 +731,21 @@ pub(super) fn unify_with_construction<E>(
         },
         // A named decimal binds like a type variable but only over decimals,
         // so the exact precision and scale travel to the return type.
-        TypeSpec::Decimal128Of(name) => match dt {
-            DataType::Decimal128(_, _) => match mode {
-                BindMode::Strict => bindings.bind_with_construction(name, dt, creation)?,
-                BindMode::Widening => {
-                    bindings.bind_widening_with_construction(name, dt, creation)?
+        TypeSpec::Decimal128Of(name) | TypeSpec::Decimal256Of(name) => match dt {
+            DataType::Decimal128(..) | DataType::Decimal256(..)
+                if matches!(
+                    (spec, dt),
+                    (TypeSpec::Decimal128Of(_), DataType::Decimal128(..))
+                        | (TypeSpec::Decimal256Of(_), DataType::Decimal256(..))
+                ) =>
+            {
+                match mode {
+                    BindMode::Strict => bindings.bind_with_construction(name, dt, creation)?,
+                    BindMode::Widening => {
+                        bindings.bind_widening_with_construction(name, dt, creation)?
+                    }
                 }
-            },
+            }
             DataType::Null => {
                 bindings.bind_null_with_construction(name, creation)?;
                 true
@@ -1064,9 +1078,13 @@ pub(super) fn unify_value_with_construction<E>(
                 }
             }
         }
-        TypeSpec::Decimal128Of(name) => {
+        TypeSpec::Decimal128Of(name) | TypeSpec::Decimal256Of(name) => {
             ty.logical_type() == ValueLogicalType::Physical
-                && matches!(ty.data_type(), DataType::Decimal128(..))
+                && matches!(
+                    (spec, ty.data_type()),
+                    (TypeSpec::Decimal128Of(_), DataType::Decimal128(..))
+                        | (TypeSpec::Decimal256Of(_), DataType::Decimal256(..))
+                )
                 && bindings.bind_value_with_construction(name, ty, mode, creation)?
         }
         TypeSpec::List(inner) if ty.data_type() == &DataType::Null => {

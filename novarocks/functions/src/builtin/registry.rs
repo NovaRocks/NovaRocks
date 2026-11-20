@@ -511,6 +511,10 @@ fn register_numeric_fns(m: &mut HashMap<String, Vec<Signature>>) {
         add(m, "abs", Signature::new(vec![input], output));
     }
 
+    for (signature, _) in super::negation_owner::signatures() {
+        add(m, super::negation_owner::NAME, signature);
+    }
+
     // NEGATIVE preserves the input type. POSITIVE remains in the
     // Float64-returning math family below.
     add_for_every(m, "negative", NUMERIC_PRESERVING_TYPES, |t| {

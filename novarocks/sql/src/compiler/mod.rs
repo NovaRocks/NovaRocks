@@ -376,10 +376,61 @@ pub trait SqlFunctionCatalog: Send + Sync + std::fmt::Debug {
         novarocks_functions::FunctionResolutionError,
     >;
 
+    /// Name recognition does not select a typed overload when the catalogue
+    /// has declaration metadata. Signature-only callers keep their own probe.
+    fn recognizes_scalar_name(
+        &self,
+        name: &str,
+        arg_types: &[arrow::datatypes::DataType],
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<bool, novarocks_functions::FunctionResolutionError> {
+        use novarocks_functions::FunctionResolutionError;
+        match self.resolve_scalar_signature(name, arg_types, control) {
+            Err(FunctionResolutionError::UnknownFunction) => Ok(false),
+            Err(error @ FunctionResolutionError::Control(_)) => Err(error),
+            _ => Ok(true),
+        }
+    }
+
     fn resolve_scalar_binding(
         &self,
         _name: &str,
         _arguments: &[novarocks_functions::FunctionArgument],
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<
+        novarocks_functions::ResolvedFunctionBinding,
+        novarocks_functions::FunctionBindingError,
+    > {
+        control.checkpoint(
+            novarocks_type_contract::CompilePhase::FunctionSpecialization,
+            0,
+        )?;
+        Err(novarocks_functions::FunctionBindingError::MissingBindingDeclaration)
+    }
+
+    /// The grammar has already identified this closed built-in operator.
+    fn resolve_scalar_operator_binding(
+        &self,
+        _operator: novarocks_type_contract::OperatorFunction,
+        _request: novarocks_functions::FunctionBindingRequest<'_>,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<
+        novarocks_functions::ResolvedFunctionBinding,
+        novarocks_functions::FunctionBindingError,
+    > {
+        control.checkpoint(
+            novarocks_type_contract::CompilePhase::FunctionSpecialization,
+            0,
+        )?;
+        Err(novarocks_functions::FunctionBindingError::MissingBindingDeclaration)
+    }
+
+    /// Resolve the already selected overload against the converted inputs.
+    fn finish_scalar_binding(
+        &self,
+        _function: &novarocks_functions::FunctionId,
+        _overload: &novarocks_functions::FunctionOverloadId,
+        _request: novarocks_functions::FunctionBindingRequest<'_>,
         control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<
         novarocks_functions::ResolvedFunctionBinding,

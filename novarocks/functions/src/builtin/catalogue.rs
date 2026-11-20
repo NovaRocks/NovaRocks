@@ -1171,8 +1171,10 @@ fn scalar_result_nullable_from_types(
             }
             _ => true,
         },
-        // Invalid JSON is a required Data failure, not a NULL result.
-        "__json_canonical_key" => first_value.is_some_and(FunctionValueType::nullable),
+        // Invalid JSON and integer negation overflow are required Data failures.
+        "__json_canonical_key" | super::negation_owner::NAME => {
+            first_value.is_some_and(FunctionValueType::nullable)
+        }
         crate::native_like::ESCAPE_FUNCTION_NAME => {
             nullable_arguments(0..logical_argument_count, false, &value_nullable, work)?
         }
@@ -1475,6 +1477,17 @@ impl BuiltinScalarResolver {
         }
         let carriers = ScalarCarriers::from_values(ScalarTypes::from_values(argument_types));
         validate_builtin_selected_domain(&self.canonical_name, carriers, work)?;
+        // Negation accepts only the original numeric domain and carrier.
+        if self.canonical_name.as_ref() == super::negation_owner::NAME {
+            let ([FunctionArgument::Value { value_type, .. }], [target]) =
+                (request.arguments, argument_types.as_slice())
+            else {
+                return Err(FunctionBindingError::NoMatchingOverload);
+            };
+            if !binding_control::exact_type(value_type, target, work)? {
+                return Err(FunctionBindingError::NoMatchingOverload);
+            }
+        }
         if matches!(
             self.function_id.as_str(),
             "builtin.scalar/get_json_bool/v1"
@@ -1565,7 +1578,9 @@ impl BuiltinScalarResolver {
         request: FunctionBindingRequest<'a>,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<FixedScalarResultDecision<'a>, FunctionBindingError> {
-        let source = if self.function_id.as_str() == "builtin.scalar/array_sortby/v1" {
+        let source = if self.function_id.as_str() == "builtin.scalar/array_sortby/v1"
+            || self.canonical_name.as_ref() == super::negation_owner::NAME
+        {
             let Some(FunctionArgument::Value { value_type, .. }) = request.arguments.first() else {
                 return Err(FunctionBindingError::NoMatchingOverload);
             };
@@ -3309,6 +3324,7 @@ pub(super) fn scalar_definition_parts(
                         Some(super::window_offset_owner::effects())
                     }
                     "abs" => Some(super::abs_owner::effects()),
+                    super::negation_owner::NAME => super::negation_owner::effects(signature),
                     "nullif" => Some(super::nullif_owner::effects()),
                     name if super::calendar_time_text_owner::operation(name).is_some() => {
                         Some(super::calendar_time_text_owner::effects(
@@ -3679,6 +3695,9 @@ pub fn contribute_builtin_functions(
                 super::window_offset_owner::definition(name, declaration, resolver)?
             }
             "abs" => super::abs_owner::definition(declaration, resolver)?,
+            super::negation_owner::NAME => {
+                super::negation_owner::definition(declaration, resolver)?
+            }
             "nullif" => super::nullif_owner::definition(&name, declaration, resolver)?,
             name if super::calendar_time_text_owner::operation(name).is_some() => {
                 super::calendar_time_text_owner::definition(name, declaration, resolver)?

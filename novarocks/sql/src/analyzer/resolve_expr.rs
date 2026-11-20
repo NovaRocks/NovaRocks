@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 use crate::parser::{expression_for_diagnostic, type_for_diagnostic};
 use arrow::datatypes::{DataType, TimeUnit};
+use novarocks_expression::typing::{NodeShape, ScalarTypingRoute, scalar_typing_route};
 use novarocks_parser::Span;
 use novarocks_parser::ast;
 use novarocks_parser::printer::print_object_name;
@@ -286,29 +287,6 @@ struct FunctionMetadata<'a> {
     window: Option<&'a ast::Window>,
     null_treatment: Option<ast::NullTreatment>,
 }
-#[derive(Clone, Copy)]
-enum SyntaxBuiltin {
-    Row,
-    If,
-    NullIf,
-    Coalesce,
-    Trim,
-    Ltrim,
-    Rtrim,
-}
-impl SyntaxBuiltin {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Row => "row",
-            Self::If => "if",
-            Self::NullIf => "nullif",
-            Self::Coalesce => "coalesce",
-            Self::Trim => "trim",
-            Self::Ltrim => "ltrim",
-            Self::Rtrim => "rtrim",
-        }
-    }
-}
 fn unsupported_remaining_root(expr: &ast::Expr) -> bool {
     matches!(
         expr,
@@ -401,7 +379,24 @@ impl<'a> super::AnalyzerContext<'a> {
         expr: &ast::Expr,
         scope: &AnalyzerScope,
     ) -> Result<TypedExpr, AnalyzeError> {
+        if let ast::Expr::Row(row) = expr {
+            for _ in &row.fields {
+                self.check_control()?;
+            }
+        }
+        if let Some(call) = novarocks_parser::canonical_call(expr)
+            .map_err(|error| AnalyzeError::unsupported_expression(error.message, error.span))?
+        {
+            return self.analyze_syntax_function(call.name, &call.arguments, call.span, scope);
+        }
+
         match expr {
+            ast::Expr::Trim(_)
+            | ast::Expr::Row(_)
+            | ast::Expr::If(_)
+            | ast::Expr::NullIf(_)
+            | ast::Expr::Coalesce(_)
+            | ast::Expr::Extract(_) => unreachable!("canonical syntax call was already mapped"),
             ast::Expr::JsonQuery(node) => self.analyze_json_query_syntax(node, scope),
             ast::Expr::JsonObject(node) => self.analyze_json_object_syntax(node, scope),
             ast::Expr::JsonArray(node) => self.analyze_json_array_syntax(node, scope),
@@ -444,20 +439,6 @@ impl<'a> super::AnalyzerContext<'a> {
             ast::Expr::GroupingOperation(node) => {
                 self.analyze_grouping_input(super::GroupingSyntaxRef::Operation(node), scope)
             }
-            ast::Expr::Trim(node) => {
-                if node.trim_character.is_some() {
-                    return Err(AnalyzeError::unsupported_expression(
-                        "explicit TRIM characters are not supported",
-                        node.span,
-                    ));
-                }
-                let builtin = match node.specification {
-                    ast::TrimSpecification::Both => SyntaxBuiltin::Trim,
-                    ast::TrimSpecification::Leading => SyntaxBuiltin::Ltrim,
-                    ast::TrimSpecification::Trailing => SyntaxBuiltin::Rtrim,
-                };
-                self.analyze_syntax_function(builtin, &[&node.trim_source], node.span, scope)
-            }
             ast::Expr::AtLocal(_)
             | ast::Expr::AtTimeZone(_)
             | ast::Expr::Overlay(_)
@@ -476,27 +457,9 @@ impl<'a> super::AnalyzerContext<'a> {
                 "expression profile is not supported",
                 expr.span(),
             )),
-            ast::Expr::Literal(value) => self.analyze_literal(value),
+            ast::Expr::Literal(value) => self.type_literal(value),
 
             ast::Expr::Array(array) => self.analyze_array_literal(array, scope),
-            ast::Expr::Row(row) => {
-                for field in &row.fields {
-                    self.check_control()?;
-                    if field.name.is_some() {
-                        return Err(AnalyzeError::unsupported_expression(
-                            "named ROW fields are not supported",
-                            row.span,
-                        ));
-                    }
-                }
-                let arguments = row
-                    .fields
-                    .iter()
-                    .map(|field| &field.expression)
-                    .collect::<Vec<_>>();
-                self.analyze_syntax_function(SyntaxBuiltin::Row, &arguments, row.span, scope)
-            }
-
             ast::Expr::Binary(binary) => self.analyze_binary_op(binary, scope),
 
             ast::Expr::Logical(logical) => self.analyze_boolean_chain(logical, scope),
@@ -593,8 +556,7 @@ impl<'a> super::AnalyzerContext<'a> {
             }
 
             // CASE WHEN
-            ast::Expr::SearchedCase(case) => self.analyze_case(
-                None,
+            ast::Expr::SearchedCase(case) => self.analyze_searched_case(
                 &case.when_clauses,
                 case.default_value.as_ref(),
                 scope,
@@ -608,30 +570,6 @@ impl<'a> super::AnalyzerContext<'a> {
                 case.span,
             ),
 
-            ast::Expr::If(node) => {
-                let Some(false_value) = node.false_value.as_ref() else {
-                    return Err(AnalyzeError::unsupported_expression(
-                        "two-argument IF is not supported",
-                        node.span,
-                    ));
-                };
-                self.analyze_syntax_function(
-                    SyntaxBuiltin::If,
-                    &[&node.condition, &node.true_value, false_value],
-                    node.span,
-                    scope,
-                )
-            }
-            ast::Expr::NullIf(node) => self.analyze_syntax_function(
-                SyntaxBuiltin::NullIf,
-                &[&node.first, &node.second],
-                node.span,
-                scope,
-            ),
-            ast::Expr::Coalesce(node) => {
-                let arguments = node.operands.iter().collect::<Vec<_>>();
-                self.analyze_syntax_function(SyntaxBuiltin::Coalesce, &arguments, node.span, scope)
-            }
             ast::Expr::Try(node) => Err(AnalyzeError::unsupported_expression(
                 "TRY expressions are not supported",
                 node.span,
@@ -640,8 +578,6 @@ impl<'a> super::AnalyzerContext<'a> {
                 "FORMAT expressions are not supported",
                 node.span,
             )),
-
-            ast::Expr::Extract(node) => self.analyze_extract(node, scope),
 
             // Function call
             ast::Expr::FunctionCall(func) => self.analyze_function(func, scope),
@@ -1015,172 +951,6 @@ impl<'a> super::AnalyzerContext<'a> {
         Ok(result)
     }
 
-    fn analyze_typed_string_content(
-        &self,
-        data_type: &ast::TypeName,
-        value: &str,
-        span: Span,
-    ) -> Result<TypedExpr, AnalyzeError> {
-        let target = sql_type_to_arrow(data_type)?;
-        let value = value.to_owned();
-        let declared = super::helpers::sql_type_to_value_type(data_type, false, self.control)?;
-        if declared.logical_type() == novarocks_type_contract::ValueLogicalType::Json {
-            // The explicit literal owns this nominal domain. Preserve
-            // its bytes; canonical JSON semantics belong to the one
-            // Functions normalization owner at the consuming call.
-            return Ok(TypedExpr {
-                kind: ExprKind::Literal(LiteralValue::String(value)),
-                value_type: declared,
-            });
-        }
-        // For DATE literals, constant-fold to Date32 integer value
-        if target == DataType::Date32 {
-            let date_str = value.trim_matches(|c| c == '\'' || c == '"');
-            let days = chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d")
-                .map_err(|e| {
-                    AnalyzeError::invalid_literal(
-                        format!("invalid date literal '{date_str}': {e}"),
-                        span,
-                    )
-                })?
-                .signed_duration_since(chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap())
-                .num_days();
-            return Ok(TypedExpr {
-                kind: ExprKind::Literal(LiteralValue::Int(days)),
-                value_type: novarocks_type_contract::FunctionValueType::new(
-                    DataType::Date32,
-                    false,
-                ),
-            });
-        }
-        Ok(TypedExpr {
-            kind: ExprKind::Cast {
-                array_failure_mode: None,
-                expr: novarocks_parser::ast::AstBox::new(TypedExpr {
-                    kind: ExprKind::Literal(LiteralValue::String(value)),
-                    value_type: novarocks_type_contract::FunctionValueType::new(
-                        DataType::Utf8,
-                        false,
-                    ),
-                }),
-                target: target.clone(),
-                decimal_overflow_policy: self.sql_semantics.sql_mode().decimal_overflow_policy(),
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(target, false),
-        })
-    }
-
-    /// Analyze a literal value.
-    fn analyze_literal(&self, value: &ast::Literal) -> Result<TypedExpr, AnalyzeError> {
-        match value {
-            ast::Literal {
-                kind: ast::LiteralKind::Long { parsed_value, .. },
-                ..
-            } => Ok(TypedExpr {
-                kind: ExprKind::Literal(LiteralValue::Int(*parsed_value)),
-                value_type: novarocks_type_contract::FunctionValueType::new(
-                    if i32::try_from(*parsed_value).is_ok() {
-                        DataType::Int32
-                    } else {
-                        DataType::Int64
-                    },
-                    false,
-                ),
-            }),
-            ast::Literal {
-                kind: ast::LiteralKind::Decimal(text),
-                ..
-            } => {
-                let data_type = infer_decimal_literal_type(text)
-                    .map_err(|message| AnalyzeError::invalid_literal(message, value.span))?;
-                Ok(TypedExpr {
-                    kind: ExprKind::Literal(LiteralValue::Decimal(text.clone())),
-                    value_type: novarocks_type_contract::FunctionValueType::new(data_type, false),
-                })
-            }
-            ast::Literal {
-                kind: ast::LiteralKind::Double(number),
-                ..
-            } => Ok(TypedExpr {
-                kind: ExprKind::Literal(LiteralValue::Float(number.get())),
-                value_type: novarocks_type_contract::FunctionValueType::new(
-                    DataType::Float64,
-                    false,
-                ),
-            }),
-            ast::Literal {
-                kind: ast::LiteralKind::Generic(generic),
-                ..
-            } => {
-                if !crate::literal::is_supported_generic_literal(generic) {
-                    return Err(AnalyzeError::unsupported_expression(
-                        format!(
-                            "generic literal type {} is not supported",
-                            generic.type_name
-                        ),
-                        value.span,
-                    ));
-                }
-                let mut data_type = novarocks_parser::build::simple_type(&generic.type_name);
-                data_type.span = value.span;
-                self.analyze_typed_string_content(&data_type, &generic.value, value.span)
-            }
-            ast::Literal {
-                kind: ast::LiteralKind::Interval(_),
-                ..
-            } => Err(AnalyzeError::unsupported_expression(
-                "INTERVAL literals are not supported",
-                value.span,
-            )),
-            ast::Literal {
-                kind: ast::LiteralKind::String(s),
-                ..
-            } => {
-                // The native typed parser already applied MySQL-style backslash
-                // escapes when it admitted the literal. Don't unescape
-                // again — that double-processed `'e\\f'` from 3 bytes (`e\f`)
-                // down to 2 (`ef`) and is the cause of `join_large_in_predicate`
-                // step 59 silently dropping the backslash row from the IN
-                // result. INSERT VALUES already trusts the parser-admitted value
-                // (`sql::literal` clones the string as-is); SELECT now matches.
-                Ok(TypedExpr {
-                    kind: ExprKind::Literal(LiteralValue::String(s.clone())),
-                    value_type: novarocks_type_contract::FunctionValueType::new(
-                        DataType::Utf8,
-                        false,
-                    ),
-                })
-            }
-            ast::Literal {
-                kind: ast::LiteralKind::Binary(bytes),
-                ..
-            } => Ok(TypedExpr {
-                kind: ExprKind::Literal(LiteralValue::Binary(bytes.clone())),
-                value_type: novarocks_type_contract::FunctionValueType::new(
-                    DataType::Binary,
-                    false,
-                ),
-            }),
-            ast::Literal {
-                kind: ast::LiteralKind::Boolean(b),
-                ..
-            } => Ok(TypedExpr {
-                kind: ExprKind::Literal(LiteralValue::Bool(*b)),
-                value_type: novarocks_type_contract::FunctionValueType::new(
-                    DataType::Boolean,
-                    false,
-                ),
-            }),
-            ast::Literal {
-                kind: ast::LiteralKind::Null,
-                ..
-            } => Ok(TypedExpr {
-                kind: ExprKind::Literal(LiteralValue::Null),
-                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Null, true),
-            }),
-        }
-    }
-
     fn analyze_array_literal(
         &self,
         array: &ast::ArrayExpr,
@@ -1245,15 +1015,16 @@ impl<'a> super::AnalyzerContext<'a> {
             }
             ast::Predicate::IsNull(predicate) => {
                 let inner = self.analyze_expr(value, scope)?;
+                let (value_type, mut children) =
+                    self.type_value_node(NodeShape::IsNull, vec![inner], span)?;
                 Ok(TypedExpr {
                     kind: ExprKind::IsNull {
-                        expr: novarocks_parser::ast::AstBox::new(inner),
+                        expr: novarocks_parser::ast::AstBox::new(
+                            children.pop().expect("IS NULL has one child"),
+                        ),
                         negated: predicate.negated,
                     },
-                    value_type: novarocks_type_contract::FunctionValueType::new(
-                        DataType::Boolean,
-                        false,
-                    ),
+                    value_type,
                 })
             }
             ast::Predicate::BooleanTest(predicate) => {
@@ -1798,10 +1569,11 @@ impl<'a> super::AnalyzerContext<'a> {
         for term in &logical.terms {
             analyzed.push(self.analyze_expr(term, scope)?);
         }
-        let bin_op = match logical.operator {
-            ast::LogicalOperator::And => BinOp::And,
-            ast::LogicalOperator::Or => BinOp::Or,
+        let (bin_op, shape) = match logical.operator {
+            ast::LogicalOperator::And => (BinOp::And, NodeShape::And),
+            ast::LogicalOperator::Or => (BinOp::Or, NodeShape::Or),
         };
+        let (result_type, mut analyzed) = self.type_value_node(shape, analyzed, logical.span)?;
         while analyzed.len() > 1 {
             let mut next_level = Vec::with_capacity(analyzed.len().div_ceil(2));
             let mut operands = analyzed.into_iter();
@@ -1827,9 +1599,11 @@ impl<'a> super::AnalyzerContext<'a> {
             }
             analyzed = next_level;
         }
-        Ok(analyzed
+        let mut result = analyzed
             .pop()
-            .expect("a validated logical expression has terms"))
+            .expect("a validated logical expression has terms");
+        result.value_type = result_type;
+        Ok(result)
     }
 
     /// Common-type coercion is an implicit CAST, not an exact output
@@ -2040,6 +1814,57 @@ impl<'a> super::AnalyzerContext<'a> {
     }
 
     /// Analyze a CASE expression.
+    fn analyze_searched_case(
+        &self,
+        clauses: &[ast::WhenClause],
+        else_result: Option<&ast::Expr>,
+        scope: &AnalyzerScope,
+        span: Span,
+    ) -> Result<TypedExpr, AnalyzeError> {
+        let mut children = Vec::new();
+        for clause in clauses {
+            let ast::WhenMatch::Operand(condition) = &clause.match_value else {
+                return Err(AnalyzeError::unsupported_expression(
+                    "partial CASE predicates are not supported",
+                    clause.span,
+                ));
+            };
+            children.push(self.analyze_expr(condition, scope)?);
+            children.push(self.analyze_expr(&clause.result, scope)?);
+        }
+        if let Some(otherwise) = else_result {
+            children.push(self.analyze_expr(otherwise, scope)?);
+        }
+        let (value_type, mut children) = self.type_value_node(
+            NodeShape::SearchedCase {
+                when_count: clauses.len(),
+                has_else: else_result.is_some(),
+            },
+            children,
+            span,
+        )?;
+        let else_expr = else_result.map(|_| {
+            novarocks_parser::ast::AstBox::new(children.pop().expect("searched CASE has an ELSE"))
+        });
+        let mut operands = children.into_iter();
+        let when_then = std::iter::from_fn(|| {
+            let condition = operands.next()?;
+            let value = operands
+                .next()
+                .expect("searched CASE has a value for every WHEN");
+            Some((condition, value))
+        })
+        .collect::<Vec<_>>();
+        Ok(TypedExpr {
+            kind: ExprKind::Case {
+                operand: None,
+                when_then: when_then.into(),
+                else_expr,
+            },
+            value_type,
+        })
+    }
+
     fn analyze_case(
         &self,
         operand: Option<&ast::Expr>,
@@ -2157,66 +1982,10 @@ impl<'a> super::AnalyzerContext<'a> {
         self.analyze_function_with_original_arguments(func, &original_arguments, scope)
     }
 
-    fn analyze_extract(
-        &self,
-        node: &ast::ExtractExpr,
-        scope: &AnalyzerScope,
-    ) -> Result<TypedExpr, AnalyzeError> {
-        let function_name = match node.field {
-            ast::ExtractField::Year => "year",
-            ast::ExtractField::Month => "month",
-            ast::ExtractField::Day => "day",
-            ast::ExtractField::Hour => "hour",
-            ast::ExtractField::Minute => "minute",
-            ast::ExtractField::Second => "second",
-            field => {
-                let name = match field {
-                    ast::ExtractField::Quarter => "quarter",
-                    ast::ExtractField::Week => "week",
-                    ast::ExtractField::DayOfMonth => "day_of_month",
-                    ast::ExtractField::DayOfWeek => "day_of_week",
-                    ast::ExtractField::Dow => "dow",
-                    ast::ExtractField::DayOfYear => "day_of_year",
-                    ast::ExtractField::Doy => "doy",
-                    ast::ExtractField::YearOfWeek => "year_of_week",
-                    ast::ExtractField::Yow => "yow",
-                    ast::ExtractField::TimezoneMinute => "timezone_minute",
-                    ast::ExtractField::TimezoneHour => "timezone_hour",
-                    _ => unreachable!("the six supported EXTRACT fields returned above"),
-                };
-                return Err(AnalyzeError::unsupported_expression(
-                    format!("unsupported EXTRACT field: {name}"),
-                    node.span,
-                ));
-            }
-        };
-        let argument = self.analyze_expr(&node.expression, scope)?;
-        let bound = bind_scalar_function_call_with_catalog(
-            self.function_catalog,
-            function_name,
-            vec![argument],
-            self.sql_semantics.sql_mode().decimal_overflow_policy(),
-            self.constant_policy,
-            self.control,
-        )
-        .map_err(|error| error.at_type_mismatch(node.span))?;
-        let value_type = bound.value_type().clone();
-        Ok(TypedExpr {
-            kind: ExprKind::FunctionCall {
-                volatility: self.function_catalog.volatility(function_name),
-                name: function_name.to_string(),
-                binding: bound.binding,
-                args: (bound.args).into(),
-                distinct: false,
-            },
-            value_type,
-        })
-    }
-
     /// Borrow dedicated syntax children into the original function author.
     fn analyze_syntax_function(
         &self,
-        builtin: SyntaxBuiltin,
+        name: &str,
         arguments: &[&ast::Expr],
         span: Span,
         scope: &AnalyzerScope,
@@ -2230,7 +1999,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 window: None,
                 null_treatment: None,
             },
-            builtin.name().to_owned(),
+            name.to_owned(),
             arguments,
             scope,
         )
@@ -3054,39 +2823,69 @@ impl<'a> super::AnalyzerContext<'a> {
             }
             validate_scalar_function_call_typed(&name, &args_typed)
                 .map_err(|message| AnalyzeError::type_mismatch(message, func.span))?;
+            let route = scalar_typing_route(&name);
+            let unknown = match route {
+                ScalarTypingRoute::Shared => !self
+                    .function_catalog
+                    .recognizes_scalar_name(&name, &arg_types, self.control)
+                    .map_err(AnalyzeError::function_resolution)?,
+                ScalarTypingRoute::Legacy => scalar_signature_is_unknown(
+                    self.function_catalog,
+                    &name,
+                    &arg_types,
+                    self.control,
+                )?,
+            };
             // Legacy declarations are type-inspection facts, not installed selected bindings.
             // A custom contribution of the same name is resolved by its own catalog identity.
-            if scalar_signature_is_unknown(self.function_catalog, &name, &arg_types, self.control)?
-                && matches!(
+            if unknown {
+                if matches!(
                     crate::functions::builtin_disposition(&name),
                     Some(
                         crate::functions::BuiltinDisposition::Unavailable
                             | crate::functions::BuiltinDisposition::LoweredOnly
                     )
+                ) {
+                    return Err(AnalyzeError::unsupported_expression(
+                        format!(
+                            "builtin function `{name}` has no admitted selected scalar implementation"
+                        ),
+                        func.span,
+                    ));
+                }
+                if legacy_scalar_return_type_with_catalog(
+                    self.function_catalog,
+                    &name,
+                    &arg_types,
+                    self.control,
+                )?
+                .is_none()
+                {
+                    return Err(AnalyzeError::unknown_function(
+                        format!("Unknown function: {name}"),
+                        func.span,
+                    ));
+                }
+            }
+            let bound = match route {
+                ScalarTypingRoute::Shared => self.type_scalar_call(
+                    NodeShape::CatalogCall {
+                        name: &name,
+                        expected_result: None,
+                    },
+                    args_typed,
+                    func.span,
+                )?,
+                ScalarTypingRoute::Legacy => bind_scalar_function_call_with_catalog(
+                    self.function_catalog,
+                    &name,
+                    args_typed,
+                    self.sql_semantics.sql_mode().decimal_overflow_policy(),
+                    self.constant_policy,
+                    self.control,
                 )
-            {
-                return Err(AnalyzeError::unsupported_expression(
-                    format!(
-                        "builtin function `{name}` has no admitted selected scalar implementation"
-                    ),
-                    func.span,
-                ));
-            }
-            if scalar_function_is_unknown(self.function_catalog, &name, &arg_types, self.control)? {
-                return Err(AnalyzeError::unknown_function(
-                    format!("Unknown function: {name}"),
-                    func.span,
-                ));
-            }
-            let bound = bind_scalar_function_call_with_catalog(
-                self.function_catalog,
-                &name,
-                args_typed,
-                self.sql_semantics.sql_mode().decimal_overflow_policy(),
-                self.constant_policy,
-                self.control,
-            )
-            .map_err(|error| error.at_type_mismatch(func.span))?;
+                .map_err(|error| error.at_type_mismatch(func.span))?,
+            };
             // This overload is also exposed by Trino's named array concat call.
             if bound.binding.function_id.as_str() == "builtin.scalar/array_concat/v1"
                 && bound.binding.logical_argument_count > 127
@@ -4782,41 +4581,6 @@ fn is_non_groupable_map_constructor(expr: &TypedExpr) -> bool {
     }
 }
 
-fn infer_decimal_literal_type(s: &str) -> Result<DataType, String> {
-    let raw = s.trim().trim_start_matches('+').trim_start_matches('-');
-    let (int_part, frac_part) = match raw.split_once('.') {
-        Some((i, f)) => (i, f),
-        None => (raw, ""),
-    };
-    let int_part = int_part.trim_start_matches('0');
-    let int_digits = if int_part.is_empty() {
-        1usize
-    } else {
-        int_part.len()
-    };
-    let scale = frac_part.len();
-    let precision = int_digits + scale;
-
-    if scale > 76 {
-        return Err(format!(
-            "decimal literal scale {scale} exceeds maximum scale 76: {s}"
-        ));
-    }
-    if precision == 0 || precision > 76 {
-        return Err(format!(
-            "decimal literal precision {precision} exceeds maximum precision 76: {s}"
-        ));
-    }
-
-    let precision = precision as u8;
-    let scale = scale as i8;
-    if precision > 38 {
-        Ok(DataType::Decimal256(precision, scale))
-    } else {
-        Ok(DataType::Decimal128(precision, scale))
-    }
-}
-
 /// Implicit cast: if `expr` is Utf8 and `target` is a date/timestamp type,
 /// wrap `expr` in a Cast to the target type. This matches StarRocks FE
 /// behavior where string literals are implicitly cast to date/timestamp
@@ -5520,7 +5284,7 @@ fn signed_unary_plus_identity(
     }
 }
 
-fn signed_int_literal_value(expr: &TypedExpr) -> Option<i64> {
+pub(super) fn signed_int_literal_value(expr: &TypedExpr) -> Option<i64> {
     match &expr.kind {
         ExprKind::Literal(LiteralValue::Int(value)) => Some(*value),
         ExprKind::UnaryOp {

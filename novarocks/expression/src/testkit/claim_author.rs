@@ -86,24 +86,11 @@ impl ClaimAuthor {
         expected_result_type: Option<FunctionValueType>,
         constant_policy: ConstantPolicy,
     ) -> Self {
-        let selected = Arc::new(bound.selected);
-        let FunctionResultType::Scalar(result) = &selected.result_type else {
+        let FunctionResultType::Scalar(result) = &bound.selected.result_type else {
             panic!("scalar owner")
         };
-        let function = BoundFunction {
-            function_id: bound.function_id,
-            overload: selected.overload.clone(),
-            kind: bound.kind,
-            argument_types: selected.argument_types.clone(),
-            result_type: result.clone(),
-            legacy_metadata: Some(LegacyBindingMetadata {
-                volatility: bound.semantics.volatility,
-                argument_evaluation: bound.semantics.argument_evaluation,
-                failure_behavior: bound.semantics.failure_behavior,
-                intrinsic_row_error: bound.semantics.intrinsic_row_error,
-                semantic_parameters: Box::default(),
-            }),
-        };
+        let function = legacy_scalar_function(&bound, result);
+        let selected = Arc::new(bound.selected);
         Self {
             function,
             selected,
@@ -182,6 +169,26 @@ impl ClaimAuthor {
     }
 }
 
+pub(super) fn legacy_scalar_function(
+    bound: &ResolvedFunctionBinding,
+    result: &FunctionValueType,
+) -> BoundFunction {
+    BoundFunction {
+        function_id: bound.function_id.clone(),
+        overload: bound.selected.overload.clone(),
+        kind: bound.kind,
+        argument_types: bound.selected.argument_types.clone(),
+        result_type: result.clone(),
+        legacy_metadata: Some(LegacyBindingMetadata {
+            volatility: bound.semantics.volatility,
+            argument_evaluation: bound.semantics.argument_evaluation,
+            failure_behavior: bound.semantics.failure_behavior,
+            intrinsic_row_error: bound.semantics.intrinsic_row_error,
+            semantic_parameters: Box::default(),
+        }),
+    }
+}
+
 fn resolve(
     functions: &PureEngineFunctionCatalog,
     name: &str,
@@ -231,40 +238,53 @@ pub fn register_call_requests(
 ) {
     for (&definition, owner) in authors {
         let original = owner.request();
-        let arguments = original
-            .arguments
-            .iter()
-            .map(|argument| match argument {
-                FunctionArgument::Value {
-                    value_type,
-                    constant,
-                } => StaticFunctionArgument::Value {
-                    value_type: value_type.clone(),
-                    constant: constant
-                        .as_ref()
-                        .map(|value| register_constant(constants, value)),
-                },
-                FunctionArgument::Lambda {
-                    parameter_types,
-                    result_type,
-                } => StaticFunctionArgument::Lambda {
-                    parameter_types: parameter_types.clone(),
-                    result_type: result_type.clone(),
-                },
-            })
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
         draft
             .request(
                 definition,
-                PhysicalCallRequest {
-                    arguments,
-                    logical_argument_count: original.logical_argument_count,
-                    expected_result_type: original.expected_result_type.cloned(),
-                    constant_policy: owner.constant_policy,
-                },
+                physical_call_request(
+                    original.arguments,
+                    original.expected_result_type,
+                    owner.constant_policy,
+                    constants,
+                ),
             )
             .unwrap();
+    }
+}
+
+pub(super) fn physical_call_request(
+    arguments: &[FunctionArgument],
+    expected_result_type: Option<&FunctionValueType>,
+    constant_policy: ConstantPolicy,
+    constants: &mut ConstantPools,
+) -> PhysicalCallRequest {
+    let logical_argument_count = arguments.len();
+    let arguments = arguments
+        .iter()
+        .map(|argument| match argument {
+            FunctionArgument::Value {
+                value_type,
+                constant,
+            } => StaticFunctionArgument::Value {
+                value_type: value_type.clone(),
+                constant: constant
+                    .as_ref()
+                    .map(|value| register_constant(constants, value)),
+            },
+            FunctionArgument::Lambda {
+                parameter_types,
+                result_type,
+            } => StaticFunctionArgument::Lambda {
+                parameter_types: parameter_types.clone(),
+                result_type: result_type.clone(),
+            },
+        })
+        .collect();
+    PhysicalCallRequest {
+        arguments,
+        logical_argument_count,
+        expected_result_type: expected_result_type.cloned(),
+        constant_policy,
     }
 }
 

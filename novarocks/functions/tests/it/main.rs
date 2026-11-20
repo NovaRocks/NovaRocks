@@ -26,3 +26,8 @@ mod time_text_cast;
 
 #[cfg(novarocks_dev_controls)]
 mod scalar_invocation;
+
+#[cfg(novarocks_dev_controls)]
+mod negation;
+#[cfg(novarocks_dev_controls)]
+mod operator_functions;

@@ -258,6 +258,22 @@ impl crate::compiler::SqlFunctionCatalog for EngineFunctionCatalog {
         result
     }
 
+    fn recognizes_scalar_name(
+        &self,
+        name: &str,
+        _arg_types: &[DataType],
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<bool, ResolveError> {
+        let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
+            control,
+            novarocks_type_contract::CompilePhase::FunctionSpecialization,
+        )?;
+        let known = self.definition(name, FunctionKind::Scalar).is_some();
+        work.step()?;
+        work.finish()?;
+        Ok(known)
+    }
+
     fn resolve_scalar_binding(
         &self,
         name: &str,
@@ -272,6 +288,36 @@ impl crate::compiler::SqlFunctionCatalog for EngineFunctionCatalog {
                 arguments,
                 logical_argument_count: arguments.len(),
             },
+            control,
+        )
+    }
+
+    fn resolve_scalar_operator_binding(
+        &self,
+        operator: novarocks_type_contract::OperatorFunction,
+        request: FunctionBindingRequest<'_>,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
+        self.resolve_bound_trusted_by_id(
+            &operator.function_id(),
+            FunctionKind::Scalar,
+            request,
+            control,
+        )
+    }
+
+    fn finish_scalar_binding(
+        &self,
+        function: &novarocks_functions::FunctionId,
+        overload: &novarocks_functions::FunctionOverloadId,
+        request: FunctionBindingRequest<'_>,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
+        self.resolve_bound_trusted_at_overload(
+            function,
+            FunctionKind::Scalar,
+            overload,
+            request,
             control,
         )
     }

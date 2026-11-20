@@ -109,11 +109,13 @@ pub mod largeint_text;
 mod logical_null;
 pub mod math_numeric;
 pub mod opaque_memory;
+mod operator_functions;
 pub mod parse_json_core;
 mod parse_json_resources;
 pub mod pattern_memo;
 pub mod percentile_hash_core;
 pub mod percentile_input;
+pub use operator_functions::{OperatorFunctionCatalogError, validate_installed_operator_functions};
 mod pure_catalogue;
 mod scalar_copy_geometry;
 #[cfg(test)]

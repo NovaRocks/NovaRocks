@@ -39,10 +39,7 @@ pub use failure::LiteralFailure;
 /// Tags accepted by the original typed-string parser and its value consumers.
 /// GenericLiteral retains raw tag text, so quoted tags are not guessed aliases.
 pub(crate) fn is_supported_generic_literal(value: &ast::GenericLiteral) -> bool {
-    matches!(
-        value.type_name.to_ascii_lowercase().as_str(),
-        "date" | "datetime" | "timestamp" | "time" | "json"
-    )
+    novarocks_expression::typing::supports_typed_string(&value.type_name)
 }
 
 fn native_literal_to_literal(literal: &ast::Literal) -> Result<Literal, LiteralFailure> {
