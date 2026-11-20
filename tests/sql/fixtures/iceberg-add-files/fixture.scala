@@ -189,4 +189,107 @@ object IcebergAddFilesFixture {
     check(file.lowerBounds(), lower, lower = true)
     check(file.upperBounds(), upper, lower = false)
   }
+  def oneParquet(spark: SparkSession, directory: String): String = {
+    val path = hadoopPath(directory)
+    val fs = path.getFileSystem(spark.sparkContext.hadoopConfiguration)
+    val files = fs.listStatus(path).filter(file => file.isFile && file.getPath.getName.endsWith(".parquet"))
+    require(files.length == 1, s"Expected one Parquet file in $directory, found " + files.length)
+    files.head.getPath.toString.replaceFirst("^s3a://", "s3://")
+  }
+
+  def addFixtureFile(spark: SparkSession, table: org.apache.iceberg.Table, source: String, rows: Long): Unit = {
+    val path = hadoopPath(source)
+    val size = path.getFileSystem(spark.sparkContext.hadoopConfiguration).getFileStatus(path).getLen
+    val file = org.apache.iceberg.DataFiles.builder(table.spec()).withPath(source)
+      .withRecordCount(rows).withFileSizeInBytes(size).build()
+    table.newAppend().appendFile(file).commit()
+  }
+
+  def prepareNested(spark: SparkSession, schema: String, token: String, root: String): Unit = {
+    import org.apache.iceberg.expressions.Literal
+    import org.apache.iceberg.types.Types
+    import org.apache.spark.sql.functions.col
+    import org.apache.spark.sql.types.MetadataBuilder
+    import org.apache.parquet.hadoop.ParquetFileReader
+    import org.apache.parquet.hadoop.util.HadoopInputFile
+
+    spark.sql(s"CREATE NAMESPACE IF NOT EXISTS ice_rest.$schema")
+    def name(label: String): String = s"ice_rest.$schema.rwm17c_${label}_$token"
+    def table(label: String): org.apache.iceberg.Table = Spark3Util.loadIcebergTable(spark, name(label))
+    val nested = "id BIGINT, details STRUCT<flag:INT,note:STRING,obsolete:STRING>"
+    def create(label: String, fields: String, version: Int): Unit = {
+      spark.sql(s"CREATE TABLE ${name(label)} ($fields) USING iceberg " +
+        s"TBLPROPERTIES ('format-version'='$version','write.distribution-mode'='none')")
+    }
+
+    create("old", nested, 2)
+    create("registered", nested, 2)
+    create("required_add", nested, 2)
+    create("required_read", nested, 2)
+    spark.sql(s"INSERT INTO ${name("old")} SELECT /*+ COALESCE(1) */ id,details FROM VALUES " +
+      "(CAST(1 AS BIGINT),named_struct('flag',17,'note','alpha','obsolete','a'))," +
+      "(CAST(2 AS BIGINT),named_struct('flag',22,'note','beta','obsolete','b')) source(id,details)")
+    val original = oneFile(spark, name("old"))
+    copy(spark, original, s"$root/registered.parquet")
+    copy(spark, original, s"$root/required-add.parquet")
+    val requiredRead = s"$root/required-read.parquet"
+    copy(spark, original, requiredRead)
+    addFixtureFile(spark, table("required_read"), requiredRead, 2)
+    Seq("old", "registered").foreach { label =>
+      table(label).updateSchema().moveFirst("details.note").deleteColumn("details.obsolete")
+        .addColumn("details", "fresh", Types.StringType.get()).commit()
+    }
+    Seq("required_add", "required_read").foreach { label =>
+      table(label).updateSchema().allowIncompatibleChanges()
+        .addRequiredColumn("details", "required_child", Types.StringType.get()).commit()
+    }
+
+    create("mixed_add", "id BIGINT,note STRING", 2)
+    create("mixed_read", "id BIGINT,note STRING", 2)
+    spark.conf.set("spark.sql.parquet.fieldId.write.enabled", "true")
+    val mixed = spark.sql("SELECT CAST(1 AS BIGINT) AS id, 'mixed' AS note")
+    val metadata = new MetadataBuilder().putLong("parquet.field.id", 1L).build()
+    mixed.select(col("id").as("id", metadata), col("note")).coalesce(1)
+      .write.parquet(hadoopPath(s"$root/mixed").toString)
+    val mixedFile = oneParquet(spark, s"$root/mixed")
+    val reader = ParquetFileReader.open(HadoopInputFile.fromPath(
+      hadoopPath(mixedFile), spark.sparkContext.hadoopConfiguration))
+    try {
+      val fields = reader.getFooter.getFileMetaData.getSchema
+      require(fields.getType("id").getId.intValue() == 1 && fields.getType("note").getId == null)
+    } finally reader.close()
+    copy(spark, mixedFile, s"$root/mixed-add.parquet")
+    addFixtureFile(spark, table("mixed_read"), mixedFile, 1)
+
+    create("v3_default", "id BIGINT, details STRUCT<flag:INT,absent:STRING>," +
+      " items ARRAY<STRUCT<value:INT>>, codes MAP<STRING,INT>", 3)
+    val v3 = table("v3_default")
+    val sourceSchema = v3.schema()
+    def id(path: String): Int = sourceSchema.findField(path).fieldId()
+    val mapping = s"""[{"field-id":${id("id")},"names":["id"]},
+      {"field-id":${id("details")},"names":["details","old_details"],"fields":[
+        {"field-id":${id("details.flag")},"names":["flag","legacy_flag"]},
+        {"field-id":${id("details.absent")},"names":[]},
+        {"names":["unmapped"]}]},
+      {"field-id":${id("items")},"names":["items"],"fields":[
+        {"field-id":${id("items.element")},"names":["element","array"],"fields":[
+          {"field-id":${id("items.element.value")},"names":["value","legacy_value"]}]}]},
+      {"field-id":${id("codes")},"names":["codes"],"fields":[
+        {"field-id":${id("codes.key")},"names":["key"]},
+        {"field-id":${id("codes.value")},"names":["value"]}]}]"""
+    v3.updateProperties().set("schema.name-mapping.default", mapping).commit()
+    spark.conf.set("spark.sql.parquet.fieldId.write.enabled", "false")
+    spark.conf.set("spark.sql.parquet.writeLegacyFormat", "true")
+    val beforeDefault = s"$root/before-default"
+    spark.sql("SELECT CAST(1 AS BIGINT) id, named_struct('legacy_flag',7,'unmapped','ignored') old_details," +
+      " array(named_struct('legacy_value',17),CAST(NULL AS STRUCT<legacy_value:INT>)) items, map('x',91) codes" +
+      " UNION ALL SELECT CAST(2 AS BIGINT), CAST(NULL AS STRUCT<legacy_flag:INT,unmapped:STRING>)," +
+      " CAST(NULL AS ARRAY<STRUCT<legacy_value:INT>>), CAST(NULL AS MAP<STRING,INT>)")
+      .coalesce(1).write.parquet(hadoopPath(beforeDefault).toString)
+    addFixtureFile(spark, v3, oneParquet(spark, beforeDefault), 2)
+    v3.updateSchema()
+      .addColumn("details", "initialized", Types.StringType.get(), Literal.of("seed"))
+      .commit()
+    println("RWM17C_NESTED_SOURCE_READY")
+  }
 }
