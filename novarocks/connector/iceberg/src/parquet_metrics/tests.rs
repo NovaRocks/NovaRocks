@@ -15,10 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::fs::File;
-use std::path::PathBuf;
 use std::sync::Arc;
 
+use base64::Engine;
+use bytes::Bytes;
 use parquet::data_type::{ByteArray, FixedLenByteArray};
 use parquet::file::metadata::{ColumnChunkMetaData, FileMetaData, RowGroupMetaData};
 use parquet::file::reader::{FileReader, SerializedFileReader};
@@ -544,15 +544,12 @@ fn preflight_accounts_retained_map_tables_and_variable_bounds() {
     assert_eq!(result.lower_bounds[&1], Datum::string("abc"));
 }
 
-fn reference_path() -> PathBuf {
-    PathBuf::from(
-        std::env::var_os("NOVA_RWM17C_P01_DIR")
-            .expect("Set NOVA_RWM17C_P01_DIR to prepared P01 evidence"),
-    )
-}
-
-fn read_footer(path: PathBuf) -> SerializedFileReader<File> {
-    SerializedFileReader::new(File::open(path).unwrap()).unwrap()
+fn read_footer(encoded: &str) -> SerializedFileReader<Bytes> {
+    let encoded: String = encoded.lines().collect();
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .unwrap();
+    SerializedFileReader::new(Bytes::from(bytes)).unwrap()
 }
 
 fn hex_bytes(string: &str) -> Vec<u8> {
@@ -563,12 +560,14 @@ fn hex_bytes(string: &str) -> Vec<u8> {
 }
 
 #[test]
-#[ignore = "requires the retained P01 Java 1.12.0 and Trino 484 references"]
 fn matches_p01_footer_references() {
-    let path = reference_path();
-    let reader = read_footer(path.join("java/mapped.parquet"));
-    let java: Json =
-        serde_json::from_reader(File::open(path.join("java/metrics.json")).unwrap()).unwrap();
+    let reader = read_footer(include_str!(
+        "../../../../../tests/sql/fixtures/iceberg-add-files/metrics.parquet.b64"
+    ));
+    let java: Json = serde_json::from_str(include_str!(
+        "tests/fixtures/iceberg-java-1.12.0-metrics.json"
+    ))
+    .unwrap();
     let table = schema(&[
         (1, PrimitiveType::Long),
         (
@@ -617,32 +616,25 @@ fn matches_p01_footer_references() {
 
     let table = schema(&[(1, PrimitiveType::Int)]);
     let leaves = vec![leaf(1), leaf(99)];
-    for (file, case) in [
-        ("embedded-extra-int96.parquet", "embedded_extra"),
+    for (encoded, extra_null_count) in [
         (
-            "embedded-extra-int96-known-nulls.parquet",
-            "embedded_extra_known_nulls",
+            include_str!("tests/fixtures/embedded-extra-int96.parquet.b64"),
+            None,
+        ),
+        (
+            include_str!("tests/fixtures/embedded-extra-int96-known-nulls.parquet.b64"),
+            Some(1),
         ),
     ] {
-        let reader = read_footer(path.join("trino-int96/objects").join(file));
-        let trino: Json = serde_json::from_reader(
-            File::open(path.join(format!("trino-int96/protocol/{case}_files/summary.json")))
-                .unwrap(),
-        )
-        .unwrap();
+        let reader = read_footer(encoded);
         let result = metrics(reader.metadata(), &leaves, &table);
-        assert_eq!(
-            serde_json::to_value(result.column_sizes).unwrap(),
-            trino["data"][0][2]
-        );
-        assert_eq!(
-            serde_json::to_value(result.value_counts).unwrap(),
-            trino["data"][0][3]
-        );
-        assert_eq!(
-            serde_json::to_value(result.null_value_counts).unwrap(),
-            trino["data"][0][4]
-        );
+        assert_eq!(result.column_sizes, HashMap::from([(1, 160), (99, 113)]));
+        assert_eq!(result.value_counts, HashMap::from([(1, 3), (99, 3)]));
+        let mut expected_nulls = HashMap::from([(1, 0)]);
+        if let Some(null_count) = extra_null_count {
+            expected_nulls.insert(99, null_count);
+        }
+        assert_eq!(result.null_value_counts, expected_nulls);
         assert_eq!(result.lower_bounds, HashMap::from([(1, Datum::int(11))]));
         assert_eq!(result.upper_bounds, HashMap::from([(1, Datum::int(33))]));
     }
