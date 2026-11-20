@@ -337,7 +337,7 @@ impl ExchangeFrameTransmitter for GrpcExchangeFrameTransmitter {
         let timeout = self.send_timeout;
         spawn_exchange_call(&self.runtime, activity, async move {
             #[cfg(novarocks_dev_controls)]
-            let _observation = observer;
+            observe_grant_only(observer.as_deref(), stream, "deliver_started");
             let client = NativeRpcClient::new_backend_endpoint(
                 runtime,
                 frame.destination.native_endpoint().clone(),

@@ -3417,9 +3417,11 @@ fn verify_grant_only_writer_stop(
             if let Some((sender, trigger, register_count)) =
                 events.iter().find_map(|(sender, seen)| {
                     let registered = seen.get("event=demand_started").copied().unwrap_or(0);
-                    // The sender cannot publish another Data once its own End
-                    // is offered. All earlier Demand RPCs must also have exited.
-                    if !seen.contains_key("event=deliver_end_parked")
+                    // The first pending Data is held before the scheduler can offer
+                    // it. Its Demand has exited and no other unary may be active.
+                    if !seen.contains_key("event=dispatch_parked")
+                        || seen.contains_key("event=dispatch_unparked")
+                        || seen.contains_key("event=deliver_started")
                         || !seen.contains_key("event=grant_observed")
                         || registered == 0
                         || seen.get("event=demand_exited") != Some(&registered)
@@ -3501,6 +3503,8 @@ fn verify_grant_only_writer_stop(
         anyhow::ensure!(
             seen.contains_key("event=parked_dispatch_stopped")
                 && !seen.contains_key("event=dispatch_unparked")
+                && !seen.contains_key("event=deliver_started")
+                && !seen.contains_key("event=stop_started")
                 && seen.get("event=demand_started") == Some(&register_count)
                 && seen.get("event=demand_exited") == Some(&register_count),
             "a new unary or missing actual stop overlapped the original subscriber: {seen:?}"
