@@ -28,7 +28,7 @@ use crate::analysis::*;
 use crate::analyze_error::AnalyzeError;
 use novarocks_type_contract::{
     ArithmeticOperator, arithmetic_result_value_type_with_op, comparison_common_value_type,
-    is_numeric_value_type, wider_comparison_value_type,
+    wider_comparison_value_type,
 };
 use novarocks_types::comparison_common_type;
 
@@ -500,26 +500,16 @@ impl<'a> super::AnalyzerContext<'a> {
 
             // Unary minus
             ast::Expr::Unary(unary) if matches!(unary.operator, ast::UnaryOperator::Minus) => {
-                let inner_typed = self.analyze_expr(&unary.expression, scope)?;
-                if !is_numeric_value_type(&inner_typed.value_type)
-                    && !is_strict_null_value_type(&inner_typed.value_type)
-                {
-                    return Err(AnalyzeError::type_mismatch(
-                        format!(
-                            "unary minus requires a numeric value, got {:?}",
-                            inner_typed.value_type
-                        ),
-                        unary.span,
-                    ));
-                }
-                let value_type = inner_typed.value_type.clone();
-                Ok(TypedExpr {
-                    kind: ExprKind::UnaryOp {
-                        op: UnOp::Negate,
-                        expr: novarocks_parser::ast::AstBox::new(inner_typed),
-                    },
-                    value_type,
-                })
+                let operand = self.analyze_expr(&unary.expression, scope)?;
+                let mut bound = self.type_scalar_call(
+                    NodeShape::Operator(novarocks_type_contract::OperatorFunction::Negation),
+                    vec![operand],
+                    unary.span,
+                )?;
+                Ok(crate::common::negation::typed_call(
+                    bound.binding,
+                    bound.args.pop().expect("one negation operand"),
+                ))
             }
 
             ast::Expr::Predicated(node) => self.analyze_predicated(node, scope),
@@ -4322,11 +4312,10 @@ fn normalize_slice_arguments(
     fn interval_value(expr: &TypedExpr) -> Option<i64> {
         match &expr.kind {
             ExprKind::Nested(nested) => interval_value(nested),
-            ExprKind::UnaryOp {
-                op: UnOp::Negate,
-                expr: nested,
-            } => interval_value(nested).and_then(i64::checked_neg),
-            _ => signed_int_literal_value(expr),
+            _ => match crate::common::negation::typed_operand(expr) {
+                Some(nested) => interval_value(nested).and_then(i64::checked_neg),
+                None => signed_int_literal_value(expr),
+            },
         }
     }
     let count = interval_value(&args[1]).ok_or_else(|| {
@@ -5285,29 +5274,23 @@ fn signed_unary_plus_identity(
 }
 
 pub(super) fn signed_int_literal_value(expr: &TypedExpr) -> Option<i64> {
-    match &expr.kind {
-        ExprKind::Literal(LiteralValue::Int(value)) => Some(*value),
-        ExprKind::UnaryOp {
-            op: UnOp::Negate,
-            expr: inner,
-        } => {
-            // Keep the existing safe unary-literal normalization, but first
-            // preserve each original signed operation's declared-width error.
-            // A later BIGINT parameter cannot legalize an INTEGER overflow.
-            let value = signed_int_literal_value(inner)?.checked_neg()?;
-            if expr.value_type.logical_type() != novarocks_type_contract::ValueLogicalType::Physical
-                || !matches!(
-                    expr.value_type.data_type(),
-                    DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
-                )
-            {
-                return None;
-            }
-            checked_int_literal_for_target(value, expr.value_type.data_type()).ok()?;
-            Some(value)
-        }
-        _ => None,
+    if let ExprKind::Literal(LiteralValue::Int(value)) = &expr.kind {
+        return Some(*value);
     }
+    let operand = crate::common::negation::typed_operand(expr)?;
+    // Each original operation must fit its declared signed width before a
+    // consuming parameter can widen the value.
+    let value = signed_int_literal_value(operand)?.checked_neg()?;
+    if expr.value_type.logical_type() != novarocks_type_contract::ValueLogicalType::Physical
+        || !matches!(
+            expr.value_type.data_type(),
+            DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+        )
+    {
+        return None;
+    }
+    checked_int_literal_for_target(value, expr.value_type.data_type()).ok()?;
+    Some(value)
 }
 
 fn checked_int_literal_for_target(value: i64, target: &DataType) -> Result<(), String> {
@@ -6421,11 +6404,9 @@ fn const_numeric_value(expr: &TypedExpr) -> Option<f64> {
         ExprKind::Literal(LiteralValue::LargeInt(v)) => Some(*v as f64),
         ExprKind::Literal(LiteralValue::Float(v)) => Some(*v),
         ExprKind::Literal(LiteralValue::Decimal(v)) => v.parse::<f64>().ok(),
-        ExprKind::UnaryOp {
-            op: UnOp::Negate,
-            expr,
-        } => const_numeric_value(expr).map(|value| -value),
-        _ => None,
+        _ => crate::common::negation::typed_operand(strip_casts(expr))
+            .and_then(const_numeric_value)
+            .map(|value| -value),
     }
 }
 
@@ -7038,7 +7019,7 @@ fn incompatible_complex_compare(left: &DataType, right: &DataType) -> Option<Str
 mod tests {
     use super::super::analyze;
     use super::{AnalyzeError, BinOp, TypedExpr, string_literal_expr};
-    use crate::analysis::{ExprKind, LiteralValue, QueryBody, UnOp};
+    use crate::analysis::{ExprKind, LiteralValue, QueryBody};
     use crate::binding::{SqlTableBindingId, SqlTableBindingScopeId};
     use crate::catalog::PlannerTableProvider;
     use crate::planner::table::{
@@ -9262,13 +9243,8 @@ mod tests {
                 .unwrap();
                 assert_eq!(expression.value_type.data_type().clone(), key_type);
                 assert_eq!(expression.value_type.nullable(), nullable);
-                let ExprKind::UnaryOp {
-                    op: UnOp::Negate,
-                    expr: operand,
-                } = &expression.kind
-                else {
-                    panic!("expected numeric negation");
-                };
+                let operand = crate::common::negation::typed_operand(&expression)
+                    .expect("expected a bound numeric negation");
                 assert!(matches!(operand.kind, ExprKind::ColumnRef { .. }));
                 assert_eq!(operand.value_type.data_type().clone(), key_type);
                 assert_eq!(operand.value_type.nullable(), nullable);
@@ -9837,7 +9813,10 @@ mod tests {
         let expression = analyze_projection_expr("SELECT + - -2147483648").unwrap();
         assert_eq!(expression.value_type.data_type(), &DataType::Int32);
         assert!(
-            matches!(&expression.kind, ExprKind::UnaryOp { op: UnOp::Negate, expr } if matches!(expr.kind, ExprKind::Literal(LiteralValue::Int(-2147483648)))),
+            matches!(
+                crate::common::negation::typed_operand(&expression).map(|operand| &operand.kind),
+                Some(ExprKind::Literal(LiteralValue::Int(-2147483648)))
+            ),
             "positive identity cannot erase the original INTEGER negate overflow"
         );
         assert_eq!(super::signed_int_literal_value(&expression), None);
@@ -10853,17 +10832,12 @@ mod tests {
             };
             assert_eq!(target, &DataType::Int64);
             assert_eq!(source.value_type.data_type(), &DataType::Int32);
-            let ExprKind::UnaryOp {
-                op: crate::analysis::UnOp::Negate,
-                expr: inner,
-            } = &source.kind
-            else {
-                panic!("original unary");
-            };
+            let inner =
+                crate::common::negation::typed_operand(source).expect("original numeric negation");
             let literal = if let ExprKind::Nested(inner) = &inner.kind {
                 inner.as_ref()
             } else {
-                inner.as_ref()
+                inner
             };
             assert!(matches!(
                 literal.kind,
@@ -10885,13 +10859,11 @@ mod tests {
                 kind: ExprKind::Literal(LiteralValue::Int(minimum)),
                 value_type: novarocks_type_contract::FunctionValueType::new(carrier.clone(), false),
             };
-            let unary = TypedExpr {
-                kind: ExprKind::UnaryOp {
-                    op: crate::analysis::UnOp::Negate,
-                    expr: novarocks_parser::ast::AstBox::new(literal),
-                },
-                value_type: novarocks_type_contract::FunctionValueType::new(carrier, false),
-            };
+            let unary = crate::analyzer::negation_for_test(
+                literal,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
             assert_eq!(super::signed_int_literal_value(&unary), None);
         }
     }

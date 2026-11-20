@@ -374,3 +374,23 @@ fn cast_expression(source: TypedExpr, conversion: CarrierConversion) -> TypedExp
         value_type: conversion.target,
     }
 }
+
+#[cfg(any(test, novarocks_dev_controls))]
+pub(crate) fn negation_for_test(
+    operand: TypedExpr,
+    control: &dyn PureCompileControl,
+) -> Result<TypedExpr, AnalyzeError> {
+    let mut call = type_scalar_call_with_catalog(
+        crate::functions::builtin_sql_function_catalog(),
+        NodeShape::Operator(OperatorFunction::Negation),
+        vec![operand],
+        DecimalOverflowPolicy::OutputNull,
+        crate::constant::test_constant_policy(),
+        control,
+        Span::new(0, 0),
+    )?;
+    Ok(crate::common::negation::typed_call(
+        call.binding,
+        call.args.pop().expect("one negation operand"),
+    ))
+}

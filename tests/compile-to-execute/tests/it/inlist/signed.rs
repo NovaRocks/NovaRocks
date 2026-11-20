@@ -169,8 +169,7 @@ fn inlist_signed_actual_all_widths_value_truthonly_null_sparse_sliced_empty() {
 }
 // The additive inverse of i64::MIN is outside the signed 64-bit carrier.
 // This exact native subtraction diagnostic is the public row-error contract.
-const NEGATE_MIN_ERROR: &str =
-    "Arithmetic overflow: Overflow happened on: 0 - -9223372036854775808";
+const NEGATE_MIN_ERROR: &str = "bigint negation overflow: -9223372036854775808";
 #[test]
 fn inlist_signed_actual_match_never_masks_later_data_error_and_sparse_isolates_it() {
     for sql in [

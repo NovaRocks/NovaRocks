@@ -21,6 +21,9 @@
 //! `expr_identity` and ColumnId; diagnostic text is never a selected-value key.
 
 use crate::analysis::{self as query_ir, BinOp, ExprKind, TypedExpr, UnOp};
+use crate::common::negation::{
+    negation_delimiters, typed_operand, typed_operand_has_lower_precedence,
+};
 use crate::compiler::SqlCompileError;
 use novarocks_type_contract::{CompileCheckpoints, CompilePhase, PureCompileControl};
 
@@ -113,6 +116,18 @@ fn checked_constant(
     Ok(())
 }
 
+fn constant_label(
+    expr: &TypedExpr,
+    value: &novarocks_functions::ConstantValue,
+    out: &mut DisplayOutput<'_, '_>,
+) -> Result<String, SqlCompileError> {
+    checked_constant(expr, value, out)?;
+    out.work.flush()?;
+    let label = crate::constant::format_constant_observed(value, out.work.control())?;
+    out.work.flush()?;
+    Ok(label)
+}
+
 #[recursive::recursive]
 fn expression(
     expr: &TypedExpr,
@@ -120,6 +135,38 @@ fn expression(
     out: &mut DisplayOutput<'_, '_>,
 ) -> Result<(), SqlCompileError> {
     out.work.step()?;
+    if let Some(operand) = typed_operand(expr) {
+        if let ExprKind::Constant(value) = &operand.kind {
+            out.work.step()?;
+            let label = constant_label(operand, value, out)?;
+            let (prefix, suffix) = negation_delimiters(false, &label);
+            out.append(prefix)?;
+            out.append(&label)?;
+            return out.append(suffix);
+        }
+        let needs_parentheses = typed_operand_has_lower_precedence(operand)
+            || typed_operand(operand).is_some()
+            || matches!(
+                operand.kind,
+                ExprKind::Literal(
+                    query_ir::LiteralValue::Int(_)
+                        | query_ir::LiteralValue::LargeInt(_)
+                        | query_ir::LiteralValue::Float(_)
+                        | query_ir::LiteralValue::Decimal(_)
+                )
+            );
+        let first_piece = match &operand.kind {
+            ExprKind::ColumnRef {
+                qualifier, column, ..
+            } => qualifier.as_deref().unwrap_or(column),
+            ExprKind::LambdaParamRef { name, .. } => name,
+            _ => "",
+        };
+        let (prefix, suffix) = negation_delimiters(needs_parentheses, first_piece);
+        out.append(prefix)?;
+        expression(operand, false, out)?;
+        return out.append(suffix);
+    }
     match &expr.kind {
         ExprKind::ColumnRef {
             qualifier, column, ..
@@ -161,10 +208,7 @@ fn expression(
             }
         },
         ExprKind::Constant(value) => {
-            checked_constant(expr, value, out)?;
-            out.work.flush()?;
-            let label = crate::constant::format_constant_observed(value, out.work.control())?;
-            out.work.flush()?;
+            let label = constant_label(expr, value, out)?;
             // Boolean case is display spelling only, never value identity.
             if !array_item
                 && value.value_type().logical_type()
@@ -283,7 +327,6 @@ fn expression(
         ExprKind::UnaryOp { op, expr: inner } => {
             out.append(match op {
                 UnOp::Not => "NOT ",
-                UnOp::Negate => "-",
                 UnOp::BitwiseNot => "~",
             })?;
             with_parens(inner, out)
@@ -712,6 +755,63 @@ mod tests {
         TypedExpr {
             kind: ExprKind::Literal(LiteralValue::Float(value)),
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Float64, false),
+        }
+    }
+
+    #[test]
+    fn typed_expr_display_name_uses_negation_identity_and_keeps_operand_boundaries() {
+        let negate = |operand: TypedExpr| {
+            let operator = novarocks_type_contract::OperatorFunction::Negation;
+            let ty = operand.value_type.clone();
+            let arguments = [novarocks_functions::FunctionArgument::Value {
+                value_type: ty.clone(),
+                constant: None,
+            }];
+            let resolved =
+                novarocks_functions::builtin::catalogue::builtin_engine_function_catalog()
+                    .resolve_bound_trusted_by_id(
+                        &operator.function_id(),
+                        novarocks_functions::FunctionKind::Scalar,
+                        novarocks_functions::FunctionBindingRequest {
+                            arguments: &arguments,
+                            logical_argument_count: arguments.len(),
+                            expected_result_type: None,
+                        },
+                        &crate::compiler::SqlCompileControl::unbounded(),
+                    )
+                    .unwrap();
+            TypedExpr {
+                kind: ExprKind::FunctionCall {
+                    name: "fixture_display_name".into(),
+                    args: vec![operand].into(),
+                    distinct: false,
+                    volatility: resolved.semantics.volatility,
+                    binding: crate::binding::SqlFunctionBinding::new(
+                        resolved,
+                        novarocks_type_contract::DecimalOverflowPolicy::ReportError,
+                    ),
+                },
+                value_type: ty,
+            }
+        };
+        let addition = TypedExpr {
+            kind: ExprKind::BinaryOp {
+                left: novarocks_parser::ast::AstBox::new(col("a")),
+                right: novarocks_parser::ast::AstBox::new(col("b")),
+                op: BinOp::Add,
+                decimal_overflow_policy:
+                    novarocks_type_contract::DecimalOverflowPolicy::ReportError,
+            },
+            value_type: col("a").value_type,
+        };
+        for (operand, expected) in [
+            (col("x"), "-x"),
+            (addition, "-(a + b)"),
+            (negate(col("x")), "-(-x)"),
+            (int_lit(1), "-(1)"),
+            (int_lit(-1), "-(-1)"),
+        ] {
+            assert_eq!(typed_expr_display_name(&negate(operand)), expected);
         }
     }
 

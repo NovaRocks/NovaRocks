@@ -154,25 +154,36 @@ fn folds_decimal_multiplication_and_checked_rounding_cast_with_exact_coefficient
 }
 
 #[test]
-fn declines_unary_minus_without_a_fake_kernel() {
+fn folds_successful_negation_and_keeps_the_overflowing_call() {
     let probe = Arc::new(FoldProbe::default());
-    let owner = compile("SELECT -CAST(7 AS INT), NOT true", &probe);
+    let owner = compile("SELECT -(7), -(-9223372036854775807 - 1), NOT true", &probe);
     let receipts = probe.receipts.lock().unwrap();
+    let operator = novarocks_type_contract::OperatorFunction::Negation;
     let is_minus = |kind: &ExprKind| {
-        matches!(
-            kind,
-            ExprKind::Unary {
-                op: UnaryOperator::Minus,
-                ..
-            }
-        )
+        matches!(kind, ExprKind::FunctionCall { function, .. }
+            if novarocks_type_contract::OperatorFunction::from_function_id(&function.function_id) == Some(operator))
     };
-    assert!(expression_sources(&owner).any(|(_, _, node)| is_minus(&node.kind)));
-    assert!(
-        receipts
-            .iter()
-            .all(|receipt| !is_minus(&receipt.root().kind))
-    );
+    let success = receipts
+        .iter()
+        .find(|receipt| {
+            is_minus(&receipt.root().kind) && receipt.root().ty.data_type() == &DataType::Int32
+        })
+        .expect("production fold candidate for INTEGER negation");
+    let folded = success.result.as_ref().expect("accepted negative constant");
+    assert_eq!(folded.value_type().data_type(), &DataType::Int32);
+    assert_eq!(folded.try_i64().unwrap(), Some(-7));
+    let rejected = receipts
+        .iter()
+        .find(|receipt| {
+            is_minus(&receipt.root().kind) && receipt.root().ty.data_type() == &DataType::Int64
+        })
+        .expect("production fold attempted negation of BIGINT MIN");
+    assert!(rejected.result.is_none());
+    let final_negations = expression_sources(&owner)
+        .filter(|(_, _, node)| is_minus(&node.kind))
+        .map(|(_, _, node)| node.ty.data_type().clone())
+        .collect::<Vec<_>>();
+    assert_eq!(final_negations, [DataType::Int64]);
     let negation = receipts
         .iter()
         .find(|receipt| {

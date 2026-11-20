@@ -31,6 +31,7 @@ use novarocks_physical_plan::{
 };
 use sha2::{Digest, Sha256};
 
+use crate::common::negation::{is_negation, write_negation};
 use crate::compiler::{SqlCompileError, SqlCompletedPlan, SqlDisplayAnnotation, SqlDisplayIntent};
 use crate::explain::ExplainLevel;
 
@@ -1819,6 +1820,14 @@ impl fmt::Display for ExprDefinitionDisplay<'_> {
                 binary_operator(*op),
                 expr(*right)
             ),
+            ExprKind::FunctionCall { function, args } if is_negation(&function.function_id) => {
+                let [operand] = args.as_ref() else {
+                    return Err(fmt::Error);
+                };
+                formatter.write_str("(")?;
+                write_negation(formatter, false, |out| write!(out, "{}", expr(*operand)))?;
+                formatter.write_str(")")
+            }
             ExprKind::FunctionCall { function, args } => write!(
                 formatter,
                 "{}@{}({})",

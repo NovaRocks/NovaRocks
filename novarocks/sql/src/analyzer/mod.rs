@@ -55,6 +55,8 @@ mod collection_expression_tests;
 mod control_expression_tests;
 pub(crate) mod declaration_widening;
 mod expression_typing;
+#[cfg(any(test, novarocks_dev_controls))]
+pub(crate) use expression_typing::negation_for_test;
 mod literal_coercion;
 #[cfg(test)]
 mod load_op_column;

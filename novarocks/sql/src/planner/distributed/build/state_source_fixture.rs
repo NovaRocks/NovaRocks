@@ -279,16 +279,16 @@ pub fn ordinary_union_source(
         e => SqlCompileError::Compilation(e.to_string()),
     })
 }
-/// Original independent MIN state channel: producer UnaryMinus can gain NULL,
+/// Original independent MIN state channel: producer negation can gain NULL,
 /// while merge's OWN literal source remains a complete non-null constant.
 pub fn ordinary_extrema_constant_state_source_for_test(
     maximum: bool,
     control: &dyn PureCompileControl,
 ) -> Result<SqlAuthoredPhysicalPlan, SqlCompileError> {
     let name = if maximum { "max" } else { "min" };
-    // The actual Int64 syntax value is cast to Int8 before native NEGATE.
-    // Its successful NULL then passes through the original widening cast,
-    // retaining the complete Int64 domain of the independent CV2/CV3 sources.
+    // The Int64 syntax value is narrowed before negation. The cast's
+    // possible successful NULL flows through the negation and widening cast.
+    // Independent CV2/CV3 sources retain their complete Int64 declaration.
     let narrow_input = TypedExpr {
         kind: ExprKind::Cast {
             array_failure_mode: None,
@@ -298,13 +298,7 @@ pub fn ordinary_extrema_constant_state_source_for_test(
         },
         value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int8, false),
     };
-    let narrow_minus = TypedExpr {
-        kind: ExprKind::UnaryOp {
-            op: crate::analysis::UnOp::Negate,
-            expr: novarocks_parser::ast::AstBox::new(narrow_input),
-        },
-        value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int8, false),
-    };
+    let narrow_minus = crate::analyzer::negation_for_test(narrow_input, control)?;
     let minus = TypedExpr {
         kind: ExprKind::Cast {
             array_failure_mode: None,
@@ -359,13 +353,7 @@ pub fn ordered_array_state_source_for_test(
         value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int8, false),
     };
     let order = SortItem {
-        expr: TypedExpr {
-            kind: ExprKind::UnaryOp {
-                op: crate::analysis::UnOp::Negate,
-                expr: novarocks_parser::ast::AstBox::new(narrow_input),
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int8, false),
-        },
+        expr: crate::analyzer::negation_for_test(narrow_input, control)?,
         asc: true,
         nulls_first: true,
     };

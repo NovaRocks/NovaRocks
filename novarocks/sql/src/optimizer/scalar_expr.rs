@@ -21,6 +21,7 @@ use std::collections::HashSet;
 use arrow::datatypes::DataType;
 
 use crate::column_id::ColumnId;
+use crate::common::negation::{render_negation, scalar_operand};
 use crate::common::{BinOp, LiteralValue, UnOp};
 use crate::optimizer::scalar::{HashableLiteral, ScalarArena, ScalarId, ScalarNode, SortKey};
 
@@ -430,6 +431,19 @@ pub(crate) fn sort_key_column_id(arena: &ScalarArena, key: &SortKey) -> Option<C
 }
 
 pub(crate) fn scalar_display_name(arena: &ScalarArena, expr: ScalarId) -> String {
+    if let Some(operand) = scalar_operand(arena, expr) {
+        let needs_parentheses = !matches!(
+            arena.node(operand),
+            ScalarNode::ColumnRef(_)
+                | ScalarNode::LambdaParamRef { .. }
+                | ScalarNode::Literal(_)
+                | ScalarNode::Constant(_)
+                | ScalarNode::FunctionCall { .. }
+                | ScalarNode::AggregateCall { .. }
+                | ScalarNode::Cast { .. }
+        );
+        return render_negation(&scalar_display_name(arena, operand), needs_parentheses);
+    }
     match arena.node(expr) {
         ScalarNode::ColumnRef(column_id) => {
             if let Some(display) = arena.column_display(*column_id) {
@@ -532,7 +546,6 @@ pub(crate) fn scalar_display_name(arena: &ScalarArena, expr: ScalarId) -> String
         }
         ScalarNode::UnaryOp { op, child } => match op {
             UnOp::Not => format!("NOT {}", scalar_display_name_with_parens(arena, *child)),
-            UnOp::Negate => format!("-{}", scalar_display_name_with_parens(arena, *child)),
             UnOp::BitwiseNot => format!("~{}", scalar_display_name_with_parens(arena, *child)),
         },
         ScalarNode::Nested(child) => scalar_display_name(arena, *child),
