@@ -27,10 +27,10 @@ use std::{
 use novarocks_spi::connector::{
     ConnectorCleanupAsyncExecution, ConnectorCleanupAsyncOutput as Output,
     ConnectorCleanupAsyncSource, ConnectorCleanupAsyncStart as Start, ConnectorMetadata,
-    LakePublicationDisposition, ProviderMetadataCpuPort,
+    ConnectorTableObjectBindingFailure, LakePublicationDisposition, ProviderMetadataCpuPort,
 };
 
-use super::super::maintenance_admission::{RetentionProcedure, validate_retention_procedure};
+use super::super::orphan_files::{Deletions, OrphanScan};
 use super::*;
 use crate::catalog::admission::{CatalogAdmissionRequest, CatalogOperation, connector_unsupported};
 use crate::catalog::{CatalogTableName, SnapshotLoading};
@@ -43,6 +43,7 @@ struct Body {
     unproven: bool,
 }
 struct Original {
+    deletions: Arc<Deletions>,
     cpu: Arc<dyn ProviderMetadataCpuPort>,
     body: Mutex<Option<Body>>,
 }
@@ -116,7 +117,7 @@ impl ConnectorCleanupAsyncSource for Original {
     }
 
     fn publication_fact(&self) -> (Option<LakePublicationDisposition>, bool) {
-        (None, false)
+        self.deletions.publication_fact()
     }
 }
 
@@ -167,6 +168,9 @@ pub(super) fn install_in(
     input.original.check_active().map_err(scope_error)?;
     let input = start.take().unwrap();
     let adapter = adapter.clone();
+    let deletions = Arc::new(Deletions::default());
+    let scan_deletions = deletions.clone();
+    let scan_cpu = cpu.clone();
     let future = Box::pin(async move {
         input.original.check_active().map_err(scope_error)?;
         let namespace = &input.table.namespace;
@@ -188,26 +192,48 @@ pub(super) fn install_in(
                 &input.context,
                 SnapshotLoading::All,
             )
-            .await?;
-        let metadata = physical.table.metadata();
-        validate_retention_procedure(
-            RetentionProcedure::RemoveOrphanFiles,
-            metadata.format_version() as u8,
-            metadata
-                .properties()
-                .get("write.location-provider.impl")
-                .map(String::as_str),
-            &format!("{namespace}.{table}"),
-            input.retention,
-            adapter.runtime.control_state().configuration().maintenance,
-        )?;
-        Err(ConnectorError::new(
-            ConnectorErrorKind::Unsupported,
-            "scanned orphan cleanup is unsupported",
-        ))
+            .await
+            .map_err(|error| {
+                if error.kind() == ConnectorErrorKind::NotFound {
+                    ConnectorError::table_object_binding(
+                        ConnectorTableObjectBindingFailure::Missing,
+                        "Iceberg table no longer resolves for its original cleanup binding",
+                    )
+                } else {
+                    error
+                }
+            })?;
+        let table_name = format!("{namespace}.{table}");
+        let admission = adapter.runtime.novarocks_catalog().listing_admission();
+        let binding = adapter
+            .runtime
+            .resources()
+            .planning_binding()
+            .for_request(input.context.clone());
+        let metrics = OrphanScan {
+            context: &input.context,
+            scope: &input.original,
+            binding: &binding,
+            admission: &admission,
+            cpu: &scan_cpu,
+            descriptor: &adapter.descriptor,
+            incarnation: adapter.key.incarnation,
+            table_name: &table_name,
+            retention: input.retention,
+            configuration: adapter.runtime.control_state().configuration().maintenance,
+            deletions: &scan_deletions,
+        }
+        .execute(&physical.table, &input.expected_object, input.older_than_ms)
+        .await?;
+        Ok(Output {
+            owner: adapter.key,
+            operation_id: input.operation_id,
+            metrics,
+        })
     });
     *target = Some(ConnectorCleanupAsyncExecution::from_original(Arc::new(
         Original {
+            deletions,
             cpu,
             body: Mutex::new(Some(Body {
                 future: Some(future),
@@ -219,7 +245,9 @@ pub(super) fn install_in(
     Ok(())
 }
 
-fn scope_error(error: novarocks_spi::connector::OriginalResultCheckError) -> ConnectorError {
+pub(in crate::catalog_control) fn scope_error(
+    error: novarocks_spi::connector::OriginalResultCheckError,
+) -> ConnectorError {
     ConnectorError::compile_interruption(novarocks_type_contract::CompileControlError::from_domain(
         error,
     ))

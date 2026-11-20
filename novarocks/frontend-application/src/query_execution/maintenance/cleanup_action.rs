@@ -32,7 +32,8 @@ use novarocks_spi::connector::{
     ConnectorCleanupAsyncExecution, ConnectorCleanupAsyncObservation, ConnectorCleanupAsyncStart,
     ConnectorCleanupMaintenanceSession, ConnectorCleanupOperationId, ConnectorControlPlanningPin,
     ConnectorError, ConnectorMaintenanceRetention, ConnectorOriginalResultScope,
-    ConnectorRequestContext, LakePublicationDisposition, ProviderMetadataCpuPort, SharedDependency,
+    ConnectorRequestContext, ConnectorTableObjectId, LakePublicationDisposition,
+    ProviderMetadataCpuPort, SharedDependency,
 };
 use novarocks_table_maintenance::{
     MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceTarget, ProcedureMetrics,
@@ -78,6 +79,7 @@ struct Body {
     cpu: Option<Arc<dyn ProviderMetadataCpuPort>>,
     original: Option<ConnectorOriginalResultScope>,
     wake: Arc<Wake>,
+    guarded_object: Option<ConnectorTableObjectId>,
     start: Option<ConnectorCleanupAsyncStart>,
     session: Option<ConnectorCleanupAsyncExecution>,
 }
@@ -175,6 +177,7 @@ pub(crate) fn prepare(
         cpu: None,
         original: None,
         wake: wake.clone(),
+        guarded_object: None,
         start: None,
         session: None,
     }));
@@ -537,13 +540,37 @@ async fn reject_mv(
     original: Arc<tokio::sync::Mutex<Body>>,
     target: &MaintenanceTarget,
 ) -> Result<(), TerminalError> {
-    let body = original.lock().await;
-    crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_governed_planning_pin_and_context_async(body.engine.kernel.mv_storage_observation().as_ref(),&body.planning,body.engine.kernel.mv_readiness().as_ref(),&crate::catalog_application::resolver::TargetBackend{provider_id:body.cleanup_session.descriptor().provider_id.clone(),catalog:target.catalog.clone(),namespace:target.namespace.clone(),table:target.table.clone()},crate::mv::domain::iceberg_guard::IcebergMvUserMutation::Maintenance,body.context.clone(),body.cpu.as_ref().ok_or_else(|| TerminalError::pre_dispatch_failed("cleanup original metadata CPU is absent"))?.clone()).await.map_err(|error| {
-
+    let mut body = original.lock().await;
+    let route = crate::catalog_application::resolver::TargetBackend {
+        provider_id: body.cleanup_session.descriptor().provider_id.clone(),
+        catalog: target.catalog.clone(),
+        namespace: target.namespace.clone(),
+        table: target.table.clone(),
+    };
+    let cpu = body.cpu.as_ref().ok_or_else(|| {
+        TerminalError::pre_dispatch_failed("cleanup original metadata CPU is absent")
+    })?;
+    let guarded = crate::mv::domain::iceberg_guard::guarded_iceberg_table_object_with_cpu(
+        &body.planning,
+        body.engine.kernel.mv_readiness().as_ref(),
+        &route,
+        crate::mv::domain::iceberg_guard::IcebergMvUserMutation::Maintenance,
+        body.context.clone(),
+        cpu.clone(),
+    )
+    .await
+    .map_err(|error| {
         super::iceberg::retention_format_error(
-            super::rewrite_job::guard_terminal_error(error), "remove_orphan_files", target,
+            super::rewrite_job::guard_terminal_error(error),
+            "remove_orphan_files",
+            target,
         )
-    })
+    })?
+    .ok_or_else(|| {
+        TerminalError::pre_dispatch_failed("cleanup target has no guarded Iceberg object")
+    })?;
+    body.guarded_object = Some(guarded);
+    Ok(())
 }
 
 async fn execute_cleanup(
@@ -555,6 +582,7 @@ async fn execute_cleanup(
         target,
         older_than,
         retention,
+        guarded_object,
         start,
         session,
         cpu,
@@ -565,6 +593,9 @@ async fn execute_cleanup(
     } = &mut *body;
     *start = Some(ConnectorCleanupAsyncStart {
         table: RequestScopedMaintenanceEngine::target_identity(target)?,
+        expected_object: guarded_object.take().ok_or_else(|| {
+            TerminalError::pre_dispatch_failed("cleanup requires the original guarded table object")
+        })?,
         operation_id: ConnectorCleanupOperationId::new(),
         older_than_ms: *older_than,
         retention: *retention,
@@ -664,6 +695,21 @@ mod tests {
         ResultCapacityConfig, WorkClass, WorkRequest, WorkloadConfig, WorkloadControl,
         WorkloadShutdownError,
     };
+
+    #[test]
+    fn partial_cleanup_keeps_external_effect_with_the_original_failure() {
+        use novarocks_coordination_contract::ExecutionEffect;
+        use novarocks_spi::connector::ConnectorErrorKind;
+
+        let error = ConnectorError::new(ConnectorErrorKind::Cancelled, "original cleanup stopped");
+        let terminal =
+            source_terminal(error, Some(LakePublicationDisposition::CommitUnknown), true);
+        assert_eq!(terminal.effect, Some(ExecutionEffect::External));
+        assert_eq!(
+            terminal.selected_failure_fact().unwrap().class(),
+            novarocks_failure_contract::FailureClass::Control,
+        );
+    }
 
     #[test]
     fn cleanup_local_delivery_retires_without_retiring_the_same_root_data() {

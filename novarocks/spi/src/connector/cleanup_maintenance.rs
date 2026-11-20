@@ -261,6 +261,7 @@ impl Drop for CleanupRelease {
 pub struct ConnectorCleanupAsyncStart {
     pub original: super::ConnectorOriginalResultScope,
     pub table: super::ConnectorTableIdentity,
+    pub expected_object: super::ConnectorTableObjectId,
     pub operation_id: ConnectorCleanupOperationId,
     pub older_than_ms: i64,
     pub retention: ConnectorMaintenanceRetention,

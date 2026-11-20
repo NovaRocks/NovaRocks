@@ -824,7 +824,7 @@ fn descriptor_bytes<'a>(mut files: impl Iterator<Item = &'a ManifestFile>) -> Re
     })
 }
 
-fn raw_manifest_bytes(raw: &Manifest, descriptor: &ManifestFile) -> u64 {
+pub(crate) fn raw_manifest_bytes(raw: &Manifest, descriptor: &ManifestFile) -> u64 {
     use crate::iceberg::spec::ManifestEntry;
     let backing =
         raw.entries()
