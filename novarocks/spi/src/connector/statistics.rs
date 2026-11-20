@@ -1007,6 +1007,8 @@ impl StatisticsEvidence {
 #[derive(Clone)]
 pub struct StatisticsReadRequest {
     pub table: ConnectorTableHandle,
+    /// An ordinary Current occurrence pinned by a row mutation's original admission.
+    pub row_mutation_current: Option<super::ConnectorRowMutationCurrent>,
     /// The read as it stands after negotiation, when one has happened.
     ///
     /// Statistics for a table and statistics for a read of that table are
@@ -1220,6 +1222,17 @@ pub trait StatisticsReader: Send + Sync {
         Err(ConnectorError::new(
             ConnectorErrorKind::Unsupported,
             "connector has no scoped statistics summary source",
+        ))
+    }
+
+    /// Resolve the data version from the original table and signed mutation ref.
+    fn row_mutation_statistics_version(
+        &self,
+        _source: &super::ConnectorRowMutationCurrent,
+    ) -> Result<StatisticsDataVersion, ConnectorError> {
+        Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "connector cannot resolve statistics on the original row mutation observation",
         ))
     }
 

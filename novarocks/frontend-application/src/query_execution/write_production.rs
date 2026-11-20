@@ -19,6 +19,7 @@
 use super::*;
 use crate::query_execution::artifact::TaskManifestBinding;
 use novarocks_query_application::api::PlanSeal;
+use novarocks_spi::connector::read_stack::runtime::ConnectorRewrittenTargetFact;
 use novarocks_spi::connector::write_stack::{
     ConnectorWriteProductionProof, ConnectorWriterPhysicalContext,
 };
@@ -97,6 +98,7 @@ impl ConnectorWriteSession {
         &self,
         manifest: &TaskManifestBinding,
         scope: &WorkScope,
+        rewritten_target: Option<&ConnectorRewrittenTargetFact>,
     ) -> Result<(), ConnectorError> {
         let Some(quote) = WriteProductionQuote::from_manifest(manifest)? else {
             return Ok(());
@@ -150,6 +152,7 @@ impl ConnectorWriteSession {
             targets,
             &mut ready,
             &mut facts,
+            rewritten_target,
         )?;
         drop((ready, facts));
         // The exact original record or its pre-dispatch withdrawal is stable
@@ -165,6 +168,7 @@ impl ConnectorWriteSession {
         targets: &[WriteTargetOrdinal],
         ready: &mut UnreceivedProductionReady,
         facts: &mut Option<Arc<[u8]>>,
+        rewritten_target: Option<&ConnectorRewrittenTargetFact>,
     ) -> Result<(WorkloadProgressNotification, Result<(), ConnectorError>), ConnectorError> {
         let query = super::write_query_identity(execution, plan)?;
         let proof = Arc::new(WriterCreationProof(Arc::clone(facts.as_ref().ok_or_else(
@@ -212,7 +216,7 @@ impl ConnectorWriteSession {
                 &query,
                 targets,
                 Some(proof),
-                None,
+                rewritten_target,
             )
         })) {
             Ok(result) => result,

@@ -455,6 +455,34 @@ impl ConnectorMutationRouteInput {
     }
 }
 
+/// An ordinary Current occurrence of the physical table admitted by a row mutation.
+/// The provider projects the original current schema at the signed base snapshot.
+#[derive(Clone, Debug)]
+pub struct ConnectorRowMutationCurrent {
+    identity: super::ConnectorTableIdentity,
+    original_source: super::ConnectorProcessLocalPayload,
+    target_ref: ConnectorWriteTargetRef,
+    snapshot_id: Option<i64>,
+}
+
+impl ConnectorRowMutationCurrent {
+    pub fn identity(&self) -> &super::ConnectorTableIdentity {
+        &self.identity
+    }
+
+    pub fn original_source(&self) -> &super::ConnectorProcessLocalPayload {
+        &self.original_source
+    }
+
+    pub fn target_ref(&self) -> &ConnectorWriteTargetRef {
+        &self.target_ref
+    }
+
+    pub const fn snapshot_id(&self) -> Option<i64> {
+        self.snapshot_id
+    }
+}
+
 /// Provider-signed, pure planning result. The payload is opaque to Core and
 /// must be consumed with this exact operation and provider generation.
 #[derive(Clone)]
@@ -618,6 +646,31 @@ impl ConnectorRowMutationPreparation {
         }
         Ok(())
     }
+    pub fn current_source(
+        &self,
+        table: &super::ConnectorTableMetadata,
+    ) -> Result<ConnectorRowMutationCurrent, ConnectorError> {
+        if table.table != self.table || table.identity.instance_id != self.owner.instance_id {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Current row mutation read requires the signed original table",
+            ));
+        }
+        let original_source = table.source_read_facts().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Current row mutation read requires the original table observation",
+            )
+        })?;
+        original_source.validate_owner(&self.owner)?;
+        Ok(ConnectorRowMutationCurrent {
+            identity: table.identity.clone(),
+            original_source: original_source.clone(),
+            target_ref: self.target_ref.clone(),
+            snapshot_id: self.base_version_ordinal,
+        })
+    }
+
     /// Hand the provider its original signed preparation at write-session admission.
     pub fn admission(&self) -> super::write_stack::session::ConnectorRowMutationAdmission {
         super::ConnectorProcessLocalPayload::new(

@@ -321,10 +321,62 @@ async fn reject_bound_iceberg_mv_table_async(
         binding.object_id,
         context,
     );
-    let view = match documents
-        .observe_keyed_documents_async(request.clone())
-        .await
+    let observed = documents.observe_keyed_documents_async(request).await;
+    check_iceberg_mv_observation(
+        readiness,
+        target,
+        mutation,
+        documents.catalog_handle(),
+        observed,
+    )
+}
+
+/// Apply the same user mutation guard using the already-admitted table.
+pub(crate) fn reject_from_admitted_iceberg_table(
+    exact_lease: &ConnectorControlPlanningPin,
+    readiness: &crate::mv::domain::readiness::MvReadinessPort,
+    target: &TargetBackend,
+    mutation: IcebergMvUserMutation,
+    metadata: &novarocks_spi::connector::ConnectorTableMetadata,
+    context: ConnectorRequestContext,
+) -> Result<(), novarocks_query_application::session_error::QueryServiceError> {
+    if target.provider_id.as_str() != "iceberg" {
+        return Ok(());
+    }
+    let context = crate::connector::context_for_planning_pin_typed(exact_lease, context)
+        .map_err(super::readiness::connector_application_error)?;
+    let documents = exact_lease
+        .derive_document_storage_lease()
+        .map_err(super::readiness::connector_application_error)?;
+    if metadata.identity.instance_id.as_str() != target.catalog
+        || metadata.identity.namespace.as_ref() != target.namespace
+        || metadata.identity.table.as_ref() != target.table
     {
+        return Err(super::readiness::application_error(
+            "MV mutation guard target differs from its admitted table",
+        ));
+    }
+    let observed = documents.project_keyed_documents_from_observed(metadata, context);
+    check_iceberg_mv_observation(
+        readiness,
+        target,
+        mutation,
+        documents.catalog_handle(),
+        observed,
+    )
+}
+
+fn check_iceberg_mv_observation(
+    readiness: &crate::mv::domain::readiness::MvReadinessPort,
+    target: &TargetBackend,
+    mutation: IcebergMvUserMutation,
+    catalog: &novarocks_spi::connector::CatalogHandle,
+    observed: Result<
+        novarocks_spi::connector::KeyedDocumentView,
+        novarocks_spi::connector::document_storage::KeyedDocumentReadError,
+    >,
+) -> Result<(), novarocks_query_application::session_error::QueryServiceError> {
+    let view = match observed {
         Ok(view) => view,
         Err(novarocks_spi::connector::document_storage::KeyedDocumentReadError::LegacyFormat {
             key,
@@ -344,7 +396,7 @@ async fn reject_bound_iceberg_mv_table_async(
     if is_materialized_view_documents(&view) {
         // Denial needs no projection install, evidence resolution or reload.
         // Existing unsettled effects remain with their original management owner.
-        readiness.revoke_foreign_current_management(&view, &request.catalog_handle)?;
+        readiness.revoke_foreign_current_management(&view, catalog)?;
         return Err(materialized_view_denial(target, mutation));
     }
 

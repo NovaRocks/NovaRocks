@@ -517,6 +517,7 @@ pub enum ConnectorReadRelationPreparationKind {
         version: ConnectorReadRelationVersion,
         reference: Option<String>,
     },
+    RowMutationCurrent(crate::connector::ConnectorRowMutationCurrent),
     RowMutationMatch {
         table: crate::connector::ConnectorTableHandle,
         original_source: crate::connector::ConnectorProcessLocalPayload,

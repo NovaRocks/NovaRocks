@@ -472,6 +472,19 @@ pub trait ConnectorDocumentStorageObservation: Send + Sync {
             .into())
         })
     }
+    /// Project management facts from the original table observation.
+    fn project_keyed_documents_from_observed(
+        &self,
+        _request: &super::KeyedDocumentDefinitionRequest,
+        _table: &crate::connector::ConnectorTableMetadata,
+    ) -> Result<super::KeyedDocumentView, super::KeyedDocumentReadError> {
+        Err(ConnectorError::new(
+            crate::connector::ConnectorErrorKind::Unsupported,
+            "document projection from the original table observation is unsupported",
+        )
+        .into())
+    }
+
     fn observe_keyed_document_definition<'a>(
         &'a self,
         _request: &'a super::KeyedDocumentDefinitionRequest,

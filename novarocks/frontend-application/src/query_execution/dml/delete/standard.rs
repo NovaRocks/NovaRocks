@@ -98,16 +98,20 @@ pub(super) async fn prepare_delete_statement_async(
     operation_id: ConnectorWriteOperationId,
     begin_receiving: Arc<crate::query_execution::write_session::WriteBeginReceiving>,
 ) -> Result<super::PreparedDeleteWrite, crate::dml::error::DmlExecutionError> {
-    let target_binding =
-        super::load_delete_target_async(target, planning_pin, connector_context).await?;
-    crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_planning_pin_and_context_async(
-        state.mv_storage_observation().as_ref(),
+    let target_binding = super::super::mutation_match_read::load_row_mutation_target(
+        target,
+        planning_pin,
+        connector_context,
+    )
+    .await?;
+    crate::mv::domain::iceberg_guard::reject_from_admitted_iceberg_table(
         target_binding.planning_pin(),
         state.mv_readiness().as_ref(),
         target,
         crate::mv::domain::iceberg_guard::IcebergMvUserMutation::Delete,
+        target_binding.metadata(),
         connector_context.clone(),
-    ).await?;
+    )?;
     let where_expr = delete_where_expr(stmt, &target_binding)?;
     // This provider author is pure over the frozen table metadata. It keeps
     // the original operation identity and signs strategy, base and routing.

@@ -55,6 +55,7 @@ pub enum StatisticsResolutionFailure {
 #[derive(Clone)]
 pub struct ResolvedStatisticsTable {
     pub table: ConnectorTableHandle,
+    pub row_mutation_current: Option<novarocks_spi::connector::ConnectorRowMutationCurrent>,
     pub data_version: StatisticsDataVersion,
     pub incarnation: ProviderBindingEpoch,
 }
@@ -115,6 +116,7 @@ impl UnifiedStatisticsResolver {
                 // about the table rather than about a narrowed read.
                 narrowed_read: None,
                 table: table.table.clone(),
+                row_mutation_current: table.row_mutation_current.clone(),
                 data_version: table.data_version.clone(),
                 metrics,
                 context,
@@ -227,6 +229,7 @@ mod tests {
         incarnation: ProviderBindingEpoch,
     ) -> ResolvedStatisticsTable {
         ResolvedStatisticsTable {
+            row_mutation_current: None,
             table: ConnectorTableHandle::try_new(
                 ConnectorInstanceId::parse(instance).expect("instance id"),
                 Bytes::from_static(b"table"),

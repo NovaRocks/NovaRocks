@@ -309,9 +309,10 @@ pub use resources::{
 pub use row_mutation::{
     CONNECTOR_ROW_MUTATION_CONTRACT_VERSION, ConnectorMutationEffectField,
     ConnectorMutationMatchContract, ConnectorMutationRouteInput, ConnectorMutationSourceField,
-    ConnectorMutationTargetField, ConnectorRowMutationEffect, ConnectorRowMutationIntent,
-    ConnectorRowMutationPreparation, ConnectorRowMutationPreparationOutcome,
-    ConnectorRowMutationPreparationRequest, ConnectorRowMutationStrategy, ConnectorWriteRouteId,
+    ConnectorMutationTargetField, ConnectorRowMutationCurrent, ConnectorRowMutationEffect,
+    ConnectorRowMutationIntent, ConnectorRowMutationPreparation,
+    ConnectorRowMutationPreparationOutcome, ConnectorRowMutationPreparationRequest,
+    ConnectorRowMutationStrategy, ConnectorWriteRouteId,
 };
 pub use scalar::{ConnectorScalarType, ConnectorScalarValue};
 pub use scoped_begin::ConnectorScopedBeginCause;

@@ -183,6 +183,8 @@ pub(crate) struct Recorded {
         Option<novarocks_spi::connector::write_stack::ConnectorWriteAbortProduction>,
     pub(crate) abort_received_fragments: Option<usize>,
     pub(crate) received_query_registrations: Vec<RecordedQueryRegistration>,
+    pub(crate) received_rewritten_targets:
+        Vec<Option<novarocks_spi::connector::read_stack::runtime::ConnectorRewrittenTargetFact>>,
     pub(crate) query_registration_failure: Option<ConnectorError>,
     pub(crate) panic_query_registration: bool,
     pub(crate) fragment_arrivals: usize,
@@ -573,7 +575,7 @@ impl novarocks_spi::connector::write_stack::ConnectorWriteControl for FakeSessio
         query: &ConnectorWriteQueryIdentity,
         targets: &[WriteTargetOrdinal],
         production: Option<Arc<dyn ConnectorWriteProductionProof>>,
-        _rewritten_target: Option<
+        rewritten_target: Option<
             &novarocks_spi::connector::read_stack::runtime::ConnectorRewrittenTargetFact,
         >,
     ) -> Result<(), ConnectorError> {
@@ -594,6 +596,9 @@ impl novarocks_spi::connector::write_stack::ConnectorWriteControl for FakeSessio
         recorded
             .received_query_registrations
             .push((*query, targets.to_vec(), production));
+        recorded
+            .received_rewritten_targets
+            .push(rewritten_target.cloned());
         Ok(())
     }
 

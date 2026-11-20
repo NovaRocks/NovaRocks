@@ -39,6 +39,8 @@
 //! untouched and keeps its own resolution rules.
 // Design: ADR-0123 (docs/adr/ADR-0123-task-update-watermark-retry-delivery.md)
 
+mod row_mutation_current;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -1550,6 +1552,9 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
                 }));
             }
             let physical = match request.kind() {
+                K::RowMutationCurrent(source) => {
+                    Some(self.prepare_row_mutation_current(name, source)?)
+                }
                 K::FrozenMvTarget {
                     table,
                     original_source,
@@ -1692,6 +1697,15 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
         } = prepared;
         let name = request.name();
         let table = match request.kind() {
+            K::RowMutationCurrent(source) => Some(
+                crate::typed_read::IcebergRuntimeRelation::Table(pinned_table_handle_with_schema(
+                    name,
+                    physical.table.metadata(),
+                    source.snapshot_id(),
+                    physical.table.metadata().current_schema().clone(),
+                    None,
+                )?),
+            ),
             K::Table { version, reference } => Some(
                 crate::typed_read::IcebergRuntimeRelation::Table(table_handle_for_version(
                     name,
@@ -6150,7 +6164,7 @@ mod prepared_source_relation_tests {
     }
 
     /// Immutable owner-local matcher fixture, without CPU/IO grants.
-    fn inventory_fixture() -> (
+    pub(super) fn inventory_fixture() -> (
         tokio::runtime::Runtime,
         tempfile::TempDir,
         Arc<IcebergTypedBoundary>,

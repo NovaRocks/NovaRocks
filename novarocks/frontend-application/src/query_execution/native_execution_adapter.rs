@@ -2283,7 +2283,13 @@ impl ProductionManifestAttemptProjection {
             // Original complete control D must already be bound. Registration
             // precedes initializer effects, round stage and every Create RPC.
             session
-                .register_manifest_productions(manifest, &self.work_scope)
+                .register_manifest_productions(
+                    manifest,
+                    &self.work_scope,
+                    prepared
+                        .rewritten_target_fact()
+                        .map_err(projection_message)?,
+                )
                 .await
                 .map_err(write_production_failure)?;
             Some(session)
