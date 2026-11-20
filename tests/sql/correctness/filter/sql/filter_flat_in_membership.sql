@@ -21,7 +21,7 @@
 -- query 1
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.membership_values (
-    id INTEGER, truth BOOLEAN, f REAL, d DOUBLE, n DECIMAL(12, 2),
+    id INTEGER, truth BOOLEAN, f FLOAT, d DOUBLE, n DECIMAL(12, 2),
     day DATE, stamp TIMESTAMP, bytes VARBINARY, big LARGEINT
 ) WITH (format_version = 3);
 
