@@ -33,8 +33,6 @@ pub(super) trait NodeRecipes {
     fn null_safe_comparison_recipe(&self) -> Option<&PreparedNullSafeComparisonRecipe>;
     fn native_like_recipe(&self) -> Option<&PreparedNativeLikeRecipe>;
     fn native_inlist_recipe(&self) -> Option<&PreparedNativeInListRecipe>;
-    fn native_negate_recipe(&self) -> Option<&PreparedNativeNegateRecipe>;
-    fn native_bitnot_recipe(&self) -> Option<&PreparedNativeBitNotRecipe>;
     fn arithmetic_recipe(&self) -> Option<&PreparedArithmeticRecipe>;
     fn cast_recipe(&self) -> Option<&PreparedCastRecipe>;
     fn prepared_call(&self) -> Option<&PreparedPureKernel>;
@@ -65,12 +63,6 @@ impl NodeRecipes for UnitNodeRecipes<'_> {
     }
     fn native_inlist_recipe(&self) -> Option<&PreparedNativeInListRecipe> {
         self.unit.recipes().native_inlist(self.occurrence)
-    }
-    fn native_negate_recipe(&self) -> Option<&PreparedNativeNegateRecipe> {
-        self.unit.recipes().native_negate(self.occurrence)
-    }
-    fn native_bitnot_recipe(&self) -> Option<&PreparedNativeBitNotRecipe> {
-        self.unit.recipes().native_bitnot(self.occurrence)
     }
     fn arithmetic_recipe(&self) -> Option<&PreparedArithmeticRecipe> {
         self.unit.recipes().arithmetic(self.occurrence)

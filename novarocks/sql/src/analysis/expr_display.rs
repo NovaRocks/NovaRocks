@@ -327,7 +327,6 @@ fn expression(
         ExprKind::UnaryOp { op, expr: inner } => {
             out.append(match op {
                 UnOp::Not => "NOT ",
-                UnOp::BitwiseNot => "~",
             })?;
             with_parens(inner, out)
         }

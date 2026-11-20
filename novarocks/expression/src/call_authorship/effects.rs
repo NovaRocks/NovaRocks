@@ -694,30 +694,6 @@ fn own_effects(
             recipe.own_effects(context)
         }
         ExprKind::Unary {
-            op: UnaryOperator::Minus,
-            expr,
-        } => {
-            let recipe = novarocks_functions::PreparedNativeNegateRecipe::try_new(
-                &definition(unit, *expr)?.ty,
-                &source.ty,
-                work.control(),
-            )
-            .map_err(arithmetic_author_error)?;
-            recipe.own_effects(context)
-        }
-        ExprKind::Unary {
-            op: UnaryOperator::BitwiseNot,
-            expr,
-        } => {
-            let recipe = novarocks_functions::PreparedNativeBitNotRecipe::try_new(
-                &definition(unit, *expr)?.ty,
-                &source.ty,
-                work.control(),
-            )
-            .map_err(arithmetic_author_error)?;
-            recipe.own_effects(context)
-        }
-        ExprKind::Unary {
             op: UnaryOperator::Not,
             ..
         }

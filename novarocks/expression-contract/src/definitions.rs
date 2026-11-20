@@ -107,10 +107,7 @@ impl BoundFunction {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UnaryOperator {
-    Plus,
-    Minus,
     Not,
-    BitwiseNot,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -127,9 +124,6 @@ pub enum BinaryOperator {
     LtEq,
     Gt,
     GtEq,
-    BitAnd,
-    BitOr,
-    BitXor,
 }
 
 impl BinaryOperator {

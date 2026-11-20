@@ -111,14 +111,6 @@ impl SqlFunctionCatalog for CountingCatalog {
         self.inner
             .admit_authored_environment_observed(binding, control)
     }
-    fn admit_native_bitnot_source_observed(
-        &self,
-        source: &novarocks_functions::FunctionValueType,
-        control: &dyn novarocks_type_contract::PureCompileControl,
-    ) -> Result<(), novarocks_functions::FunctionBindingError> {
-        self.inner
-            .admit_native_bitnot_source_observed(source, control)
-    }
     fn select_exact_overload_observed(
         &self,
         function_id: &novarocks_functions::FunctionId,

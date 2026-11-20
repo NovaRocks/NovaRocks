@@ -548,22 +548,3 @@ fn short_circuit_does_not_fold_over_an_unfolded_child() {
         ));
     }
 }
-
-#[test]
-fn legacy_bitnot_does_not_build_a_fold_unit() {
-    use novarocks_type_contract::FunctionValueType;
-    let mut fixture = Fixture::new();
-    let one = fixture.int_literal(1);
-    let root = fixture.intern(
-        ScalarNode::UnaryOp {
-            op: UnOp::BitwiseNot,
-            child: one,
-        },
-        FunctionValueType::new(DataType::Int64, false),
-    );
-    assert!(matches!(
-        fixture.apply(project(root)),
-        RewriteResult::Unchanged
-    ));
-    assert_eq!(fixture.calls(), 0);
-}

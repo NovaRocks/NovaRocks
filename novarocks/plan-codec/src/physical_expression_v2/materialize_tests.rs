@@ -406,9 +406,9 @@ impl Fixture {
             ),
             definition(
                 1,
-                1,
+                3,
                 K::Unary(wire::UnaryExpression {
-                    op: wire::UnaryOperator::Plus as i32,
+                    op: wire::UnaryOperator::Not as i32,
                     expr_id: Some(0),
                 }),
             ),
@@ -524,9 +524,9 @@ fn small() -> Vec<wire::ExpressionDefinition> {
     vec![
         definition(
             0,
-            0,
+            2,
             wire::expression_definition::Kind::Unary(wire::UnaryExpression {
-                op: wire::UnaryOperator::Plus as i32,
+                op: wire::UnaryOperator::Not as i32,
                 expr_id: Some(1),
             }),
         ),
@@ -612,7 +612,7 @@ fn owned_expressions_materialize_all_sixteen_scalar_kinds_with_independent_paylo
         (
             1,
             novarocks_expression_contract::ExprKind::Unary {
-                op: novarocks_expression_contract::UnaryOperator::Plus,
+                op: novarocks_expression_contract::UnaryOperator::Not,
                 expr: id(0),
             },
         ),

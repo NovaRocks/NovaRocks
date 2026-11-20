@@ -17,9 +17,9 @@
 //! Fixed value expectations retained before deleting the recipe differential.
 use crate::{
     CastOperation, CastRowResult, EvaluatedArgument, FunctionValueType, KernelEvaluationControl,
-    KernelFailure, NativeNegateRowResult, PreparedCastRecipe, PreparedNativeNegateRecipe,
+    KernelFailure, PreparedCastRecipe,
 };
-use arrow_array::{Array, ArrayRef, Date32Array, Int32Array, TimestampMicrosecondArray};
+use arrow_array::{ArrayRef, Date32Array, TimestampMicrosecondArray};
 use arrow_schema::{DataType, TimeUnit};
 use novarocks_type_contract::{
     CompileControlError, CompilePhase, DecimalOverflowPolicy, PureCompileControl,
@@ -124,30 +124,6 @@ fn f3_date_float_recipe_has_independent_calendar_decimal_and_ieee_expectations()
             r.evaluate_row(EvaluatedArgument::Column(&source), 1, 1, &Control)
                 .unwrap(),
             CastRowResult::Null
-        );
-    }
-}
-#[test]
-fn f3_native_negate_integer_value_is_the_handwritten_additive_inverse() {
-    // Additive inverse of -2 is 2, and SQL NULL propagates unchanged.
-    let source: ArrayRef = Arc::new(Int32Array::from(vec![Some(-2), None]));
-    let ty = FunctionValueType::new(DataType::Int32, true);
-    let r = PreparedNativeNegateRecipe::try_new(&ty, &ty, &Control).unwrap();
-    for (row, expected) in [Some(2), None].into_iter().enumerate() {
-        let NativeNegateRowResult::Value(value) = r
-            .evaluate_row(EvaluatedArgument::Column(&source), row, row, &Control)
-            .unwrap()
-        else {
-            panic!("ordinary integer negate must succeed")
-        };
-        assert_eq!(
-            value
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .unwrap()
-                .iter()
-                .collect::<Vec<_>>(),
-            vec![expected]
         );
     }
 }

@@ -274,17 +274,6 @@ pub trait SqlFunctionCatalog: Send + Sync + std::fmt::Debug {
         Ok(())
     }
 
-    /// Original catalogues retain the original intrinsic input domain. Only
-    /// the explicit Exact request scope installs this source-shape admission.
-    /// No query mode is inferred from a runtime value or constant payload.
-    fn admit_native_bitnot_source_observed(
-        &self,
-        _source: &novarocks_functions::FunctionValueType,
-        _control: &dyn novarocks_type_contract::PureCompileControl,
-    ) -> Result<(), novarocks_functions::FunctionBindingError> {
-        Ok(())
-    }
-
     /// Retain this same immutable catalogue with candidate-only scalar presence
     /// admission. No preparation, data evaluation or supported-profile seal is
     /// granted. An already scoped snapshot preserves its one projection.

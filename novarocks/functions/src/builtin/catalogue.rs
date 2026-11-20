@@ -1238,7 +1238,6 @@ const TOTAL_SCALAR_FUNCTIONS: &[&str] = &[
     // Sign manipulation answers for every number it accepts; overflow is an
     // error here, not a null.
     "abs",
-    "negative",
     "sign",
     // Measuring a string cannot fail.
     "bit_length",
@@ -5046,19 +5045,20 @@ mod tests {
                         crate::binding_test_control(),
                     )
                     .expect("the frozen ABS profile must validate without changing the input type");
-
-                let negative = resolver::resolve_scalar_function_signature(
-                    "negative",
-                    std::slice::from_ref(&input),
-                )
-                .unwrap();
-                assert_eq!(negative.return_type, input);
-                assert!(matches!(
-                    builtin_disposition("negative"),
-                    Some(BuiltinDisposition::LoweredOnly)
-                ));
             }
         }
+    }
+
+    #[test]
+    fn negative_is_lowered_only_with_no_legacy_signature() {
+        assert_eq!(
+            resolver::resolve_scalar_function_signature("negative", &[DataType::Int32]),
+            Err(ResolveError::UnknownFunction)
+        );
+        assert!(matches!(
+            builtin_disposition("negative"),
+            Some(BuiltinDisposition::LoweredOnly)
+        ));
     }
 
     #[test]

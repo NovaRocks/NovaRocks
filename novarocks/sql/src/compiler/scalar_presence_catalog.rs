@@ -187,18 +187,6 @@ impl SqlFunctionCatalog for ScalarPresenceCatalog {
         work.finish()?;
         result
     }
-    fn admit_native_bitnot_source_observed(
-        &self,
-        source: &novarocks_functions::FunctionValueType,
-        control: &dyn PureCompileControl,
-    ) -> Result<(), FunctionBindingError> {
-        novarocks_functions::PreparedNativeBitNotRecipe::try_new(source, source, control)
-            .map(|_| ())
-            .map_err(|error| match error.control_error() {
-                Some(cause) => FunctionBindingError::Control(cause),
-                None => FunctionBindingError::InvalidBinding(error.to_string().into()),
-            })
-    }
     fn snapshot(&self) -> Arc<dyn SqlFunctionCatalog> {
         Arc::new(self.clone())
     }

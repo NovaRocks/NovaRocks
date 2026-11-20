@@ -724,7 +724,6 @@ fn expression(
         ExprKind::UnaryOp { op, expr } => {
             out.write_str(match op {
                 UnOp::Not => "NOT ",
-                UnOp::BitwiseNot => "~ ",
             })?;
             expression(out, expr, next, diagnostic)
         }

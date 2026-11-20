@@ -12873,7 +12873,6 @@ fn lower_binary_operator(operator: BinOp) -> BinaryOperator {
 fn lower_unary_operator(operator: UnOp) -> UnaryOperator {
     match operator {
         UnOp::Not => UnaryOperator::Not,
-        UnOp::BitwiseNot => UnaryOperator::BitwiseNot,
     }
 }
 

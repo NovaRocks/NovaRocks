@@ -1786,10 +1786,7 @@ impl fmt::Display for ExprDefinitionDisplay<'_> {
                 formatter,
                 "({}{})",
                 match op {
-                    novarocks_expression_contract::UnaryOperator::Plus => "+",
-                    novarocks_expression_contract::UnaryOperator::Minus => "-",
                     novarocks_expression_contract::UnaryOperator::Not => "NOT ",
-                    novarocks_expression_contract::UnaryOperator::BitwiseNot => "~",
                 },
                 expr(*inner)
             ),
@@ -1977,9 +1974,6 @@ fn binary_operator(operator: novarocks_expression_contract::BinaryOperator) -> &
         novarocks_expression_contract::BinaryOperator::LtEq => "<=",
         novarocks_expression_contract::BinaryOperator::Gt => ">",
         novarocks_expression_contract::BinaryOperator::GtEq => ">=",
-        novarocks_expression_contract::BinaryOperator::BitAnd => "&",
-        novarocks_expression_contract::BinaryOperator::BitOr => "|",
-        novarocks_expression_contract::BinaryOperator::BitXor => "^",
     }
 }
 

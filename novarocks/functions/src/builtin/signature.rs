@@ -71,9 +71,9 @@ pub enum TypeSpec {
     AnyDecimal128,
     /// Decimal128 with unspecified precision/scale, bound to a name. Strict
     /// match accepts any `DataType::Decimal128(_, _)` and records the exact
-    /// one, so a function that returns the decimal it was given -- `abs`,
-    /// `negative` -- can name it on both sides. `AnyDecimal128` cannot do
-    /// that: it carries no name, so nothing can refer back to it.
+    /// one. Functions such as ABS and unary negation can then name the
+    /// same decimal on both sides of the signature. `AnyDecimal128`
+    /// carries no name to refer back to.
     Decimal128Of(&'static str),
     /// Analogous named decimal template for the Decimal256 carrier.
     Decimal256Of(&'static str),

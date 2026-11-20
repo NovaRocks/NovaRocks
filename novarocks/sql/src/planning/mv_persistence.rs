@@ -1132,7 +1132,6 @@ fn binary_operator_identity(operator: BinOp) -> &'static str {
 fn unary_operator_identity(operator: UnOp) -> &'static str {
     match operator {
         UnOp::Not => "operator/not",
-        UnOp::BitwiseNot => "operator/bitwise-not",
     }
 }
 

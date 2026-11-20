@@ -938,10 +938,7 @@ impl ExprText<'_> {
             ExprKind::Unary { op, expr } => {
                 use novarocks_expression_contract::UnaryOperator;
                 match op {
-                    UnaryOperator::Plus => write!(formatter, "+{}", inner(*expr)),
-                    UnaryOperator::Minus => write!(formatter, "-{}", inner(*expr)),
                     UnaryOperator::Not => write!(formatter, "NOT {}", inner(*expr)),
-                    UnaryOperator::BitwiseNot => write!(formatter, "~{}", inner(*expr)),
                 }
             }
             ExprKind::Binary {
@@ -1127,9 +1124,6 @@ fn binary_operator_text(op: novarocks_expression_contract::BinaryOperator) -> &'
         BinaryOperator::Multiply => "*",
         BinaryOperator::Divide => "/",
         BinaryOperator::Modulo => "%",
-        BinaryOperator::BitAnd => "&",
-        BinaryOperator::BitOr => "|",
-        BinaryOperator::BitXor => "^",
     }
 }
 

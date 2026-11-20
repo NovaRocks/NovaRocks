@@ -1098,8 +1098,6 @@ pub(super) enum CompletionKind {
     },
     Boolean,
     Cast,
-    Negate,
-    BitNot,
     Arithmetic,
     Comparison {
         null_safe: bool,
@@ -1118,8 +1116,6 @@ impl CompletionKind {
             StaticExprKind::PreparedBetween { plan, .. } => Self::Between { plan: *plan },
             StaticExprKind::NaryAnd { .. } | StaticExprKind::NaryOr { .. } => Self::Boolean,
             StaticExprKind::PreparedCast { .. } => Self::Cast,
-            StaticExprKind::PreparedNativeNegate(_) => Self::Negate,
-            StaticExprKind::PreparedNativeBitNot(_) => Self::BitNot,
             StaticExprKind::PreparedArithmetic { .. } => Self::Arithmetic,
             StaticExprKind::PreparedNullSafeComparison { .. } => {
                 Self::Comparison { null_safe: true }
@@ -1289,44 +1285,6 @@ fn complete_node<'a, R, K: Ord + Clone>(
             } else {
                 OwnedValue::from_selected(evaluate_cast(recipe, &child, local_selection, work)?)
             }
-        }
-        CompletionKind::Negate => {
-            if frame.children.len() != 1 {
-                return Err(invalid("native negate requires its exact ordered operand").into());
-            }
-            let child = frame
-                .children
-                .pop()
-                .ok_or_else(|| internal("missing native negate operand"))?
-                .value
-                .into_value(local_selection, work)?;
-            let recipe = recipes
-                .native_negate_recipe()
-                .ok_or_else(|| invalid("missing exact native negate recipe"))?;
-            work.flush()?;
-            let output =
-                recipe.evaluate_selected(child.argument(), local_selection, work.control)?;
-            work.flush()?;
-            OwnedValue::from_selected(output)
-        }
-        CompletionKind::BitNot => {
-            if frame.children.len() != 1 {
-                return Err(invalid("native BitwiseNot requires its exact ordered operand").into());
-            }
-            let child = frame
-                .children
-                .pop()
-                .ok_or_else(|| internal("missing native BitwiseNot operand"))?
-                .value
-                .into_value(local_selection, work)?;
-            let recipe = recipes
-                .native_bitnot_recipe()
-                .ok_or_else(|| invalid("missing exact native BitwiseNot recipe"))?;
-            work.flush()?;
-            let output =
-                recipe.evaluate_selected(child.argument(), local_selection, work.control)?;
-            work.flush()?;
-            OwnedValue::from_selected(output)
         }
         CompletionKind::Arithmetic => {
             if frame.children.len() != 2 {

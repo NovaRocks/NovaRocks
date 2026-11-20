@@ -243,7 +243,6 @@ fn normalize_inner(
         ScalarNode::UnaryOp { op, child } => {
             let name = match op {
                 UnOp::Not => "not",
-                UnOp::BitwiseNot => "bitnot",
             };
             call(
                 name,

@@ -85,7 +85,6 @@ pub enum BinOp {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum UnOp {
     Not,
-    BitwiseNot,
 }
 
 impl JoinKind {

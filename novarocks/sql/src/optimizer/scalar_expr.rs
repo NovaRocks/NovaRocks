@@ -546,7 +546,6 @@ pub(crate) fn scalar_display_name(arena: &ScalarArena, expr: ScalarId) -> String
         }
         ScalarNode::UnaryOp { op, child } => match op {
             UnOp::Not => format!("NOT {}", scalar_display_name_with_parens(arena, *child)),
-            UnOp::BitwiseNot => format!("~{}", scalar_display_name_with_parens(arena, *child)),
         },
         ScalarNode::Nested(child) => scalar_display_name(arena, *child),
         other => format!("{:?}", other),

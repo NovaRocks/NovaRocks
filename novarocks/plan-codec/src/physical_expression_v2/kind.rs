@@ -221,10 +221,7 @@ fn project<T, U>(
 
 fn unary(op: UnaryOperator) -> i32 {
     (match op {
-        UnaryOperator::Plus => wire::UnaryOperator::Plus,
-        UnaryOperator::Minus => wire::UnaryOperator::Minus,
         UnaryOperator::Not => wire::UnaryOperator::Not,
-        UnaryOperator::BitwiseNot => wire::UnaryOperator::BitwiseNot,
     }) as i32
 }
 
@@ -242,9 +239,6 @@ fn binary(op: BinaryOperator) -> i32 {
         BinaryOperator::LtEq => wire::BinaryOperator::LtEq,
         BinaryOperator::Gt => wire::BinaryOperator::Gt,
         BinaryOperator::GtEq => wire::BinaryOperator::GtEq,
-        BinaryOperator::BitAnd => wire::BinaryOperator::BitAnd,
-        BinaryOperator::BitOr => wire::BinaryOperator::BitOr,
-        BinaryOperator::BitXor => wire::BinaryOperator::BitXor,
     }) as i32
 }
 
