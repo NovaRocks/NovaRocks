@@ -9622,23 +9622,48 @@ mod tests {
     }
 
     #[test]
-    fn strict_unary_null_preserves_domain_and_nonliteral_child() {
-        let expected = novarocks_type_contract::FunctionValueType::new(DataType::Null, true);
-        for (sql, nonliteral) in [("select -NULL", false), ("select -element_at([],1)", true)] {
-            let expression = analyze_projection_expr(sql).unwrap();
-            assert_eq!(expression.value_type, expected, "{sql}");
-            let ExprKind::UnaryOp { expr, .. } = expression.kind else {
-                panic!("strict NULL still evaluates its operand");
-            };
-            assert_eq!(expr.value_type, expected);
-            if nonliteral {
-                assert!(matches!(expr.kind, ExprKind::FunctionCall { .. }), "{sql}");
-            } else {
-                assert!(
-                    matches!(expr.kind, ExprKind::Literal(LiteralValue::Null)),
-                    "{sql}"
-                );
-            }
+    fn strict_negation_requires_numeric_type_and_preserves_typed_null_operands() {
+        let control = crate::compiler::SqlCompileControl::unbounded();
+        for sql in ["select -NULL", "select -element_at([],1)"] {
+            let query = novarocks_parser::parser::parse_query(sql).unwrap();
+            let error = super::super::analyze_with_function_catalog(
+                &query,
+                &EmptyCatalog,
+                "default",
+                crate::functions::builtin_sql_function_catalog(),
+                crate::constant::test_constant_policy(),
+                &control,
+            )
+            .err()
+            .expect("untyped negation operand");
+            assert_eq!(
+                error.kind(),
+                crate::analyze_error::AnalyzeErrorKind::TypeMismatch
+            );
+            assert!(
+                error.message().contains("specified numeric type"),
+                "{sql}: {error}"
+            );
+        }
+
+        let expected = novarocks_type_contract::FunctionValueType::new(DataType::Int16, true);
+        for sql_operand in [
+            "cast(NULL as smallint)",
+            "cast(element_at([],1) as smallint)",
+        ] {
+            let original = analyze_projection_expr(&format!("select {sql_operand}")).unwrap();
+            let expression = analyze_projection_expr(&format!("select -{sql_operand}")).unwrap();
+            let operand = crate::common::negation::typed_operand(&expression)
+                .expect("strict negation retains its exact binding and operand");
+            assert_eq!(expression.value_type, expected);
+            assert_eq!(operand.value_type, expected);
+            assert!(
+                crate::analysis::expr_identity::typed_expr_semantically_eq(
+                    operand, &original, &control
+                )
+                .unwrap(),
+                "{sql_operand}"
+            );
         }
     }
 
@@ -12045,11 +12070,16 @@ mod tests {
                 .kind,
             ExprKind::Literal(LiteralValue::String(_))
         ));
+        let negation = analyze_projection_expr("select -cast(1 as smallint)").unwrap();
+        let operand = crate::common::negation::typed_operand(&negation)
+            .expect("unary minus selects the dedicated scalar operator");
+        assert_eq!(negation.value_type, operand.value_type);
         assert!(matches!(
-            analyze_projection_expr("select -cast(1 as smallint)")
-                .unwrap()
-                .kind,
-            ExprKind::UnaryOp { .. }
+            operand.kind,
+            ExprKind::Cast {
+                target: DataType::Int16,
+                ..
+            }
         ));
         assert!(matches!(
             analyze_projection_expr("select case when true then 1 else 2 end")
