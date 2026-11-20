@@ -300,13 +300,11 @@ fn register_string_fns(m: &mut HashMap<String, Vec<Signature>>) {
             TypeSpec::Utf8,
         ),
     );
-    for name in ["format"] {
-        add(
-            m,
-            name,
-            Signature::variadic(vec![TypeSpec::Utf8], TypeSpec::Utf8),
-        );
-    }
+    add(
+        m,
+        "format",
+        Signature::variadic(vec![TypeSpec::Utf8], TypeSpec::Utf8),
+    );
 
     // (Utf8, Utf8, Utf8) -> Utf8 — three-arg string rewrites. The executor
     // takes exactly three arguments for each of these and the analyzer coerces
@@ -586,18 +584,16 @@ fn register_datetime_fns(m: &mut HashMap<String, Vec<Signature>>) {
 
     // to_datetime(epoch[, scale]) reads a unix timestamp; it is not one of
     // the no-argument clock functions it used to be grouped with.
-    for name in ["to_datetime"] {
-        add(
-            m,
-            name,
-            Signature::new(vec![TypeSpec::Int64], TypeSpec::Datetime),
-        );
-        add(
-            m,
-            name,
-            Signature::new(vec![TypeSpec::Int64, TypeSpec::Int64], TypeSpec::Datetime),
-        );
-    }
+    add(
+        m,
+        "to_datetime",
+        Signature::new(vec![TypeSpec::Int64], TypeSpec::Datetime),
+    );
+    add(
+        m,
+        "to_datetime",
+        Signature::new(vec![TypeSpec::Int64, TypeSpec::Int64], TypeSpec::Datetime),
+    );
 
     // convert_tz(datetime, str, str) -> datetime
     add(
@@ -1256,19 +1252,17 @@ fn register_map_fns(m: &mut HashMap<String, Vec<Signature>>) {
     // Map-preserving value functions. Lambda-bearing transforms are bound by
     // the dynamic exact resolver because their lambda contract is part of the
     // selected argument shape.
-    for name in ["map_filter"] {
-        add(
-            m,
-            name,
-            Signature::variadic(
-                vec![TypeSpec::Map(
-                    Box::new(TypeSpec::Any("K")),
-                    Box::new(TypeSpec::Any("V")),
-                )],
-                TypeSpec::Map(Box::new(TypeSpec::Any("K")), Box::new(TypeSpec::Any("V"))),
-            ),
-        );
-    }
+    add(
+        m,
+        "map_filter",
+        Signature::variadic(
+            vec![TypeSpec::Map(
+                Box::new(TypeSpec::Any("K")),
+                Box::new(TypeSpec::Any("V")),
+            )],
+            TypeSpec::Map(Box::new(TypeSpec::Any("K")), Box::new(TypeSpec::Any("V"))),
+        ),
+    );
 
     // The frozen non-null Null key domain is uninhabited. Preserve this
     // original Map and the independent evaluated probe, without key coercion.
@@ -1360,22 +1354,17 @@ fn register_window_fns(m: &mut HashMap<String, Vec<Signature>>) {
         "ntile",
         Signature::new(vec![TypeSpec::Int64], TypeSpec::Int64),
     );
-    // session_number(value, timeout): the gap is measured on the value's own
-    // type, which is whatever the column is rather than always 64-bit.
     // cume_dist / percent_rank answer a position as a fraction of the
     // partition, so they are the two ranking functions that are not counts.
     for name in ["cume_dist", "percent_rank"] {
         add(m, name, Signature::new(vec![], TypeSpec::Float64));
     }
-    // grouping / grouping_id -> Int64 (also used by aggregate analyzer
-    // but appears in expression context as a virtual column).
-    for name in ["grouping"] {
-        add(
-            m,
-            name,
-            Signature::variadic(vec![TypeSpec::Any("T")], TypeSpec::Int64),
-        );
-    }
+    // GROUPING appears in expression context as a virtual column.
+    add(
+        m,
+        "grouping",
+        Signature::variadic(vec![TypeSpec::Any("T")], TypeSpec::Int64),
+    );
     // lag/lead: the value's type is what comes back. The offset is a count,
     // not another value of that type, and the default is checked against the
     // value by the analyzer's own LEAD/LAG rule - which is stricter than
@@ -1683,21 +1672,11 @@ fn register_misc_fns(m: &mut HashMap<String, Vec<Signature>>) {
         "murmur_hash3_32",
         Signature::variadic(vec![TypeSpec::AnyType], TypeSpec::Int32),
     );
-    // xx_hash3_64 -> Int64
-    // to_binary / encode_row_id / encode_sort_key -> Binary.
-    // `encode_sort_key` builds its sort key with a `BinaryBuilder`: declaring
-    // it as text made the executor cast those bytes to a string, and left
-    // `from_binary(encode_sort_key(...), 'hex')` -- the only way to read a
-    // sort key -- with no overload to bind.
-    for name in ["to_binary"] {
-        add(
-            m,
-            name,
-            Signature::variadic(vec![TypeSpec::AnyType], TypeSpec::Binary),
-        );
-    }
-    // AES accepts text or binary carriers. Binding validates those carriers.
-    // encode_fingerprint_sha256 -> Binary
+    add(
+        m,
+        "to_binary",
+        Signature::variadic(vec![TypeSpec::AnyType], TypeSpec::Binary),
+    );
 
     // cast: preserves first-arg type. (Special — analyzer's type_hint is
     // usually authoritative for cast, so the registry answer is rarely

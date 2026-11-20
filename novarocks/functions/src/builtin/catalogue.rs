@@ -318,7 +318,7 @@ impl BuiltinAggregateDecision<'_> {
         if !self.output.matches_value_observed(
             output.typed_binding().borrowed(),
             builtin_aggregate_output_nullable(name),
-            builtin_aggregate_output_domain(name),
+            ValueLogicalType::Physical,
             work,
         )? {
             return Ok(false);
@@ -346,7 +346,7 @@ impl BuiltinAggregateDecision<'_> {
         self.intermediate.matches_value_observed(
             state.intermediate_type.typed_binding().borrowed(),
             builtin_aggregate_intermediate_nullable(name),
-            builtin_aggregate_intermediate_domain(name),
+            ValueLogicalType::Physical,
             work,
         )
     }
@@ -359,12 +359,12 @@ impl BuiltinAggregateDecision<'_> {
         work.flush()?;
         let output = self.output.materialize_value_pure(
             builtin_aggregate_output_nullable(name),
-            builtin_aggregate_output_domain(name),
+            ValueLogicalType::Physical,
         )?;
         work.step()?;
         let intermediate = self.intermediate.materialize_value_pure(
             builtin_aggregate_intermediate_nullable(name),
-            builtin_aggregate_intermediate_domain(name),
+            ValueLogicalType::Physical,
         )?;
         binding_control::value_type(&output, work)?;
         binding_control::value_type(&intermediate, work)?;
@@ -548,14 +548,9 @@ impl FunctionBindingResolver for BuiltinAggregateResolver {
     }
 }
 
-/// Aggregates that answer with a number even for a group that saw no value.
+/// Nullability for aggregate results, including groups with no contributing values.
 ///
-/// Only the ones that really do. `approx_count_distinct`, `ndv` and
-/// `bitmap_union_count` count the members of a union, and each of their
-/// executors deliberately answers NULL for an empty union rather than 0 --
-/// `bitmap_union_int_finalize_returns_null_for_empty_group` pins that. They
-/// were listed here anyway, so a query that filtered every row away published
-/// a non-nullable column and then delivered a NULL in it.
+/// NDV and approx_count_distinct can return NULL for an empty group.
 fn builtin_aggregate_output_nullable(name: &str) -> bool {
     !matches!(
         name,
@@ -570,17 +565,6 @@ fn builtin_aggregate_output_nullable(name: &str) -> bool {
             | "bool_or_state_signed"
             | "bool_and_state_signed"
     )
-}
-
-fn builtin_aggregate_output_domain(name: &str) -> ValueLogicalType {
-    match name {
-        _ => ValueLogicalType::Physical,
-    }
-}
-fn builtin_aggregate_intermediate_domain(name: &str) -> ValueLogicalType {
-    match name {
-        _ => ValueLogicalType::Physical,
-    }
 }
 
 fn builtin_aggregate_intermediate_nullable(name: &str) -> bool {
@@ -4940,17 +4924,11 @@ pub(super) fn map_agg_private_catalog_for_test() -> EngineFunctionCatalog {
     builder.seal_bound().unwrap()
 }
 
-/// Actual complete original declaration and original binding/metadata authors.
-/// This test-only factory enables no public registration or binding fallback.
-
 /// Existing test entry delegates to the same installed public BY owners.
 #[cfg(any(test, novarocks_dev_controls))]
 pub fn by_window_private_test_catalog() -> EngineFunctionCatalog {
     build_builtin_engine_function_catalog().unwrap()
 }
-
-/// Private Union capability for original full-domain binding/runtime probes.
-/// This attachment enables no public production registration.
 
 /// Cross-crate transport probes borrow the REAL ARRAY dynamic declaration and
 /// resolver. This private catalogue is not a public supported capability.
