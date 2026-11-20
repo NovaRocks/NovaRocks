@@ -21,7 +21,8 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use novarocks_expression::testkit::{
-    CountingAllocator, HarnessControl, PassThroughCallHost, finish_unit, fixture_scope,
+    CountingAllocator, HarnessControl, PassThroughCallHost, constant_policy, finish_unit,
+    fixture_scope,
 };
 use novarocks_expression::{
     CompiledExprSet, CompiledExpressionInstance, EvaluationEnvironment, EvaluationInput,
@@ -34,11 +35,13 @@ use novarocks_functions::{
     KernelEvaluationControl, KernelFailure, ScalarInvocationActivation, ScalarInvocationScope,
     Selection,
 };
+use novarocks_physical_plan::ConstantPools;
 use novarocks_sql_testkit::{installed_builtin_owner_catalogue, sql_source_with_declared_fields};
 use novarocks_test_compile_to_execute::compiler_results::compiler_results_with_declared_read_fields;
 use novarocks_test_compile_to_execute::programs::compiled_roots;
 use novarocks_type_contract::{
-    CompileCheckpoints, CompilePhase, EvaluationDemand, FunctionValueType, ValueLogicalType,
+    CompileCheckpoints, CompilePhase, EvaluationDemand, FunctionValueType, SemanticParameters,
+    ValueLogicalType,
 };
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
@@ -168,141 +171,95 @@ fn compiled_flat_not_in_distinguishes_absent_from_null_source() {
 }
 
 #[test]
-fn compiled_in_preserves_unsigned_sql_fields_and_exact_nominal_uuid() {
+fn compiled_in_preserves_unsigned_and_nominal_uuid_port_types() {
+    // Exercise explicitly authored expression ports independently of SQL
+    // connector admission, which has no UInt64 scan output.
     let functions = installed_builtin_owner_catalogue();
-    let sql = "SELECT k IN (c1,c2) FROM t0";
-    let column_names = ["k", "c1", "c2"];
-    let unsigned_fields = column_names.map(|name| Field::new(name, DataType::UInt64, true));
-    let source = sql_source_with_declared_fields(sql, &unsigned_fields);
-    let plan = source.plan();
-    let environment = EvaluationEnvironment {
-        constants: plan.constants(),
-        parameters: plan.parameters(),
-    };
-    let policy = plan.statement_constant_policy();
-
-    // UInt64 can be authored from a declared SQL column, but has no current
-    // connector comparison carrier. Lower its original SQL unit directly.
-    let mut unsigned_root = None;
-    for fragment in plan.fragments().values() {
-        for node in fragment.nodes().values() {
-            let Some(unit) = fragment.unit(node.id) else {
-                continue;
-            };
-            for (index, root) in unit.roots().iter().enumerate() {
-                if matches!(
-                    unit.definition(root.definition).unwrap().kind,
-                    ExprKind::InList { .. }
-                ) {
-                    let ordinal = RootOrdinal::new(u32::try_from(index).unwrap());
-                    assert!(unsigned_root.replace((unit, ordinal)).is_none());
-                }
-            }
-        }
-    }
-    let (unsigned_unit, unsigned_root) = unsigned_root.expect("original typed SQL IN root");
-
-    // The SQL fixture admits only physical column declarations. Author the
-    // nominal UUID port explicitly before running the same expression compiler.
-    let uuid = FunctionValueType::try_with_logical_type(
-        DataType::FixedSizeBinary(16),
-        true,
-        ValueLogicalType::Uuid,
-    )
-    .unwrap();
-    let values = [0, 1, 2].map(ValueId::new);
-    let port = ExprPort {
-        values: values.map(|value| (value, uuid.clone())).into(),
-    };
-    let mut builder = BoundExprSetBuilder::new(UnitLimits {
-        expression_semantic_depth: 8,
-    });
-    let [source, first, second] = values.map(|value| {
-        builder
-            .add(None, uuid.clone(), ExprKind::Value(value))
-            .unwrap()
-    });
-    let membership = builder
-        .add(
-            None,
-            FunctionValueType::new(DataType::Boolean, true),
-            ExprKind::InList {
-                expr: source,
-                list: [first, second].into(),
-                negated: false,
-            },
-        )
-        .unwrap();
-    let uuid_root = builder
-        .root(membership, EvaluationDemand::Value, RootScope::Port(0))
-        .unwrap();
-    let mut work = CompileCheckpoints::try_new(&HarnessControl, CompilePhase::Validate).unwrap();
-    let sealed = builder.seal(vec![port], &mut work).unwrap();
-    let uuid_unit = finish_unit(
-        &functions,
-        sealed,
-        &BTreeMap::new(),
-        environment.constants,
-        environment.parameters,
-        policy,
-        &mut work,
-    );
-    work.finish().unwrap();
-
+    let constants = ConstantPools::empty();
+    let parameters = SemanticParameters::default();
+    let policy = constant_policy();
     let columns = [
         [Some(u64::MAX), Some(u64::MAX), None, Some(u64::MAX)],
         [Some(u64::MAX), Some(8), Some(u64::MAX), None],
         [None, Some(9), Some(8), Some(9)],
     ];
-    let test_cases = [
+    let cases = [
         (
-            unsigned_unit,
-            unsigned_root,
-            columns.map(|values| Arc::new(UInt64Array::from(values.to_vec())) as ArrayRef),
             FunctionValueType::new(DataType::UInt64, true),
+            columns.map(|values| Arc::new(UInt64Array::from(values.to_vec())) as ArrayRef),
         ),
         (
-            &uuid_unit,
-            uuid_root,
+            FunctionValueType::try_with_logical_type(
+                DataType::FixedSizeBinary(16),
+                true,
+                ValueLogicalType::Uuid,
+            )
+            .unwrap(),
             columns.map(|values| {
+                let bytes = values.map(|value| value.map(|value| u128::from(value).to_be_bytes()));
                 Arc::new(
-                    FixedSizeBinaryArray::try_from_sparse_iter_with_size(
-                        values
-                            .into_iter()
-                            .map(|value| value.map(|value| u128::from(value).to_be_bytes())),
-                        16,
-                    )
-                    .unwrap(),
+                    FixedSizeBinaryArray::try_from_sparse_iter_with_size(bytes.into_iter(), 16)
+                        .unwrap(),
                 ) as ArrayRef
             }),
-            uuid,
         ),
     ];
-    for (unit, root, arrays, expected_type) in test_cases {
-        let [port] = unit.ports() else {
-            panic!("membership has one original input port");
+    for (ty, arrays) in cases {
+        let values = [0, 1, 2].map(ValueId::new);
+        let port = ExprPort {
+            values: values.map(|value| (value, ty.clone())).into(),
         };
         let schema = Arc::new(Schema::new(
-            port.values
-                .iter()
-                .enumerate()
-                .map(|(ordinal, (_, ty))| ty.try_to_field(format!("input_{ordinal}")).unwrap())
-                .collect::<Vec<_>>(),
+            ["source", "first", "second"].map(|name| Arc::new(ty.try_to_field(name).unwrap())),
         ));
-        let scope = fixture_scope(port, schema);
-        let all_ports = unit
-            .roots()
-            .iter()
-            .any(|root| root.scope == RootScope::AllPorts)
-            .then_some(&scope);
+        let scope = fixture_scope(&port, schema);
+        let mut builder = BoundExprSetBuilder::new(UnitLimits {
+            expression_semantic_depth: 8,
+        });
+        let [source, first, second] = values.map(|value| {
+            builder
+                .add(None, ty.clone(), ExprKind::Value(value))
+                .unwrap()
+        });
+        let membership = builder
+            .add(
+                None,
+                FunctionValueType::new(DataType::Boolean, true),
+                ExprKind::InList {
+                    expr: source,
+                    list: [first, second].into(),
+                    negated: false,
+                },
+            )
+            .unwrap();
+        let root = builder
+            .root(membership, EvaluationDemand::Value, RootScope::Port(0))
+            .unwrap();
+        let mut work =
+            CompileCheckpoints::try_new(&HarnessControl, CompilePhase::Validate).unwrap();
+        let sealed = builder.seal(vec![port], &mut work).unwrap();
+        let unit = finish_unit(
+            &functions,
+            sealed,
+            &BTreeMap::new(),
+            &constants,
+            &parameters,
+            policy,
+            &mut work,
+        );
+        work.finish().unwrap();
+
         let mut work =
             CompileCheckpoints::try_new(&HarnessControl, CompilePhase::LowerProgram).unwrap();
-        let evaluated = compile_expr_set_pure(
-            unit,
-            environment,
+        let compiled = compile_expr_set_pure(
+            &unit,
+            EvaluationEnvironment {
+                constants: &constants,
+                parameters: &parameters,
+            },
             ScopeLayouts {
-                ports: std::slice::from_ref(&scope),
-                all_ports,
+                ports: &[scope],
+                all_ports: None,
             },
             policy,
             &functions,
@@ -310,26 +267,22 @@ fn compiled_in_preserves_unsigned_sql_fields_and_exact_nominal_uuid() {
         )
         .unwrap();
         work.finish().unwrap();
-        let use_id = evaluated.root(root).unwrap().use_id;
-        let recipe = evaluated.recipes().native_inlist(use_id).unwrap();
-        assert_eq!(recipe.source_type(), &expected_type);
-        assert_eq!(
-            recipe.candidate_types(),
-            &[expected_type.clone(), expected_type]
-        );
 
-        // Follow the exact input binding of each authored expression use.
-        let invocation = &evaluated.control_flow().uses()[&use_id];
-        assert_eq!(invocation.arguments.len(), arrays.len());
-        let mut input = [None, None, None];
-        for (&argument, array) in invocation.arguments.iter().zip(arrays) {
-            let binding = evaluated.input(argument).unwrap();
-            assert!(input[binding.ordinal as usize].replace(array).is_none());
-        }
+        let use_id = compiled.root(root).unwrap().use_id;
+        let recipe = compiled.recipes().native_inlist(use_id).unwrap();
+        assert_eq!(recipe.source_type(), &ty);
+        assert_eq!(recipe.candidate_types(), &[ty.clone(), ty]);
+        let invocation = &compiled.control_flow().uses()[&use_id];
+        let ordinals: Vec<_> = invocation
+            .arguments
+            .iter()
+            .map(|&argument| compiled.input(argument).unwrap().ordinal)
+            .collect();
+        assert_eq!(ordinals, [0, 1, 2]);
         evaluate_unit(
-            &evaluated,
+            &compiled,
             root,
-            input.into_iter().map(Option::unwrap).collect(),
+            arrays.into(),
             &[Some(true), Some(false), None, None],
         );
     }
