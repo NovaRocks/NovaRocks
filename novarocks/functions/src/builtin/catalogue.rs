@@ -1172,8 +1172,10 @@ fn scalar_result_nullable_from_types(
             }
             _ => true,
         },
-        // Invalid JSON is a required Data failure, not a NULL result.
-        "__json_canonical_key" => first_value.is_some_and(FunctionValueType::nullable),
+        // Invalid JSON and integer negation overflow are required Data failures.
+        "__json_canonical_key" | super::negation_owner::NAME => {
+            first_value.is_some_and(FunctionValueType::nullable)
+        }
         crate::native_like::ESCAPE_FUNCTION_NAME => {
             nullable_arguments(0..logical_argument_count, false, &value_nullable, work)?
         }
@@ -1240,7 +1242,6 @@ const TOTAL_SCALAR_FUNCTIONS: &[&str] = &[
     // Sign manipulation answers for every number it accepts; overflow is an
     // error here, not a null.
     "abs",
-    "negative",
     "sign",
     // Measuring a string cannot fail.
     "bit_length",
@@ -1486,6 +1487,17 @@ impl BuiltinScalarResolver {
             "equiwidth_bucket" => {
                 super::synopse_owner::Recipe::bind(false, request, work)?;
             }
+            super::negation_owner::NAME => {
+                // Negation accepts only the original numeric domain and carrier.
+                let ([FunctionArgument::Value { value_type, .. }], [target]) =
+                    (request.arguments, argument_types.as_slice())
+                else {
+                    return Err(FunctionBindingError::NoMatchingOverload);
+                };
+                if !binding_control::exact_type(value_type, target, work)? {
+                    return Err(FunctionBindingError::NoMatchingOverload);
+                }
+            }
             _ => {}
         }
         if matches!(
@@ -1578,7 +1590,9 @@ impl BuiltinScalarResolver {
         request: FunctionBindingRequest<'a>,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<FixedScalarResultDecision<'a>, FunctionBindingError> {
-        let source = if self.function_id.as_str() == "builtin.scalar/array_sortby/v1" {
+        let source = if self.function_id.as_str() == "builtin.scalar/array_sortby/v1"
+            || self.canonical_name.as_ref() == super::negation_owner::NAME
+        {
             let Some(FunctionArgument::Value { value_type, .. }) = request.arguments.first() else {
                 return Err(FunctionBindingError::NoMatchingOverload);
             };
@@ -3322,6 +3336,7 @@ pub(super) fn scalar_definition_parts(
                         Some(super::window_offset_owner::effects())
                     }
                     "abs" => Some(super::abs_owner::effects()),
+                    super::negation_owner::NAME => super::negation_owner::effects(signature),
                     name if super::scalar_rows_owner::operation(name).is_some() => {
                         super::scalar_rows_owner::operation(name)
                             .map(super::scalar_rows_owner::effects)
@@ -3696,6 +3711,9 @@ pub fn contribute_builtin_functions(
                 super::window_offset_owner::definition(name, declaration, resolver)?
             }
             "abs" => super::abs_owner::definition(declaration, resolver)?,
+            super::negation_owner::NAME => {
+                super::negation_owner::definition(declaration, resolver)?
+            }
             name if super::scalar_rows_owner::operation(name).is_some() => {
                 super::scalar_rows_owner::definition(name, declaration, resolver)?
             }
@@ -5047,19 +5065,20 @@ mod tests {
                         crate::binding_test_control(),
                     )
                     .expect("the frozen ABS profile must validate without changing the input type");
-
-                let negative = resolver::resolve_scalar_function_signature(
-                    "negative",
-                    std::slice::from_ref(&input),
-                )
-                .unwrap();
-                assert_eq!(negative.return_type, input);
-                assert!(matches!(
-                    builtin_disposition("negative"),
-                    Some(BuiltinDisposition::LoweredOnly)
-                ));
             }
         }
+    }
+
+    #[test]
+    fn negative_is_lowered_only_with_no_legacy_signature() {
+        assert_eq!(
+            resolver::resolve_scalar_function_signature("negative", &[DataType::Int32]),
+            Err(ResolveError::UnknownFunction)
+        );
+        assert!(matches!(
+            builtin_disposition("negative"),
+            Some(BuiltinDisposition::LoweredOnly)
+        ));
     }
 
     #[test]

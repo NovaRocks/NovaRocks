@@ -157,6 +157,8 @@ pub mod md5_shared;
 mod md5sum_numeric_owner;
 mod md5sum_owner;
 mod murmur;
+mod negation;
+mod negation_owner;
 pub mod nullif;
 mod nullif_owner;
 mod numeric_binary;

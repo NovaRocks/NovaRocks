@@ -39,6 +39,10 @@ pub use required_constant::{
     PreparedRequiredConstant, RequiredConstantInput, RequiredConstantRequest,
     RequiredConstantTarget, SqlAuthoredScalarUnit, prepare_required_constant,
 };
+#[cfg(novarocks_dev_controls)]
+pub use required_constant::{
+    SqlStandaloneScalarColumn, SqlStandaloneScalarRequest, author_standalone_scalar_for_test,
+};
 
 mod captured_catalog;
 mod dml_catalog;
@@ -274,17 +278,6 @@ pub trait SqlFunctionCatalog: Send + Sync + std::fmt::Debug {
         Ok(())
     }
 
-    /// Original catalogues retain the original intrinsic input domain. Only
-    /// the explicit Exact request scope installs this source-shape admission.
-    /// No query mode is inferred from a runtime value or constant payload.
-    fn admit_native_bitnot_source_observed(
-        &self,
-        _source: &novarocks_functions::FunctionValueType,
-        _control: &dyn novarocks_type_contract::PureCompileControl,
-    ) -> Result<(), novarocks_functions::FunctionBindingError> {
-        Ok(())
-    }
-
     /// Retain this same immutable catalogue with candidate-only scalar presence
     /// admission. No preparation, data evaluation or supported-profile seal is
     /// granted. An already scoped snapshot preserves its one projection.
@@ -376,10 +369,61 @@ pub trait SqlFunctionCatalog: Send + Sync + std::fmt::Debug {
         novarocks_functions::FunctionResolutionError,
     >;
 
+    /// Name recognition does not select a typed overload when the catalogue
+    /// has declaration metadata. Signature-only callers keep their own probe.
+    fn recognizes_scalar_name(
+        &self,
+        name: &str,
+        arg_types: &[arrow::datatypes::DataType],
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<bool, novarocks_functions::FunctionResolutionError> {
+        use novarocks_functions::FunctionResolutionError;
+        match self.resolve_scalar_signature(name, arg_types, control) {
+            Err(FunctionResolutionError::UnknownFunction) => Ok(false),
+            Err(error @ FunctionResolutionError::Control(_)) => Err(error),
+            _ => Ok(true),
+        }
+    }
+
     fn resolve_scalar_binding(
         &self,
         _name: &str,
         _arguments: &[novarocks_functions::FunctionArgument],
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<
+        novarocks_functions::ResolvedFunctionBinding,
+        novarocks_functions::FunctionBindingError,
+    > {
+        control.checkpoint(
+            novarocks_type_contract::CompilePhase::FunctionSpecialization,
+            0,
+        )?;
+        Err(novarocks_functions::FunctionBindingError::MissingBindingDeclaration)
+    }
+
+    /// The grammar has already identified this closed built-in operator.
+    fn resolve_scalar_operator_binding(
+        &self,
+        _operator: novarocks_type_contract::OperatorFunction,
+        _request: novarocks_functions::FunctionBindingRequest<'_>,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<
+        novarocks_functions::ResolvedFunctionBinding,
+        novarocks_functions::FunctionBindingError,
+    > {
+        control.checkpoint(
+            novarocks_type_contract::CompilePhase::FunctionSpecialization,
+            0,
+        )?;
+        Err(novarocks_functions::FunctionBindingError::MissingBindingDeclaration)
+    }
+
+    /// Resolve the already selected overload against the converted inputs.
+    fn finish_scalar_binding(
+        &self,
+        _function: &novarocks_functions::FunctionId,
+        _overload: &novarocks_functions::FunctionOverloadId,
+        _request: novarocks_functions::FunctionBindingRequest<'_>,
         control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<
         novarocks_functions::ResolvedFunctionBinding,

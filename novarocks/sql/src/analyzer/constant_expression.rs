@@ -39,6 +39,103 @@ use crate::{
     analyze_error::AnalyzeError,
 };
 
+fn scalar_context<'a>(
+    catalog: &'a dyn crate::compiler::SqlCatalogSnapshot,
+    current_database: &'a str,
+    functions: &'a dyn crate::compiler::SqlFunctionCatalog,
+    sql_semantics: &crate::sql_mode::SqlSemanticSettings,
+    constant_policy: novarocks_functions::ConstantPolicy,
+    control: &'a crate::compiler::SqlCompileControl,
+) -> super::AnalyzerContext<'a> {
+    super::AnalyzerContext {
+        purpose: crate::analyzer::QueryAnalysisPurpose::Ordinary,
+        grouping_scope: RefCell::new(None),
+        view_stack: Default::default(),
+        control,
+        constant_policy,
+        materialized_values: None,
+        catalog: catalog.planner_table_provider(),
+        current_database,
+        function_catalog: functions,
+        sql_semantics: sql_semantics.clone(),
+        factory: Rc::new(RefCell::new(crate::column_id::ColumnRefFactory::new())),
+        ctes: HashMap::new(),
+        pending_ctes: HashSet::new(),
+        next_subquery_id: Cell::new(0),
+        next_lambda_slot_id: Cell::new(0),
+        collected_subqueries: RefCell::new(Vec::new()),
+        cte_registry: RefCell::new(crate::analysis::cte::CTERegistry::new()),
+    }
+}
+
+#[cfg(novarocks_dev_controls)]
+pub(crate) fn author_standalone(
+    request: crate::compiler::SqlStandaloneScalarRequest<'_>,
+) -> Result<SqlAuthoredScalarUnit, SqlCompileError> {
+    use crate::compiler::SqlStandaloneScalarRequest;
+    use crate::planner::distributed::build::lower_standalone_scalar_unit;
+
+    let SqlStandaloneScalarRequest {
+        text,
+        columns,
+        catalog,
+        current_database,
+        functions,
+        sealed_functions,
+        sql_semantics,
+        constant_policy,
+        control,
+    } = request;
+    control.check()?;
+    let parsed = novarocks_parser::parser::parse_expression(text)
+        .map_err(|cause| SqlCompileError::InvalidRequest(cause.to_string()))?;
+    reject_subqueries(
+        &parsed,
+        control,
+        "standalone scalar expressions cannot contain subqueries",
+    )?;
+    let functions = functions.snapshot_for_scalar_presence();
+    let context = scalar_context(
+        catalog,
+        current_database,
+        functions.as_ref(),
+        sql_semantics,
+        constant_policy,
+        control,
+    );
+    let mut scope = context.new_scope();
+    let mut inputs = Vec::new();
+    let mut names = HashSet::new();
+    let mut values = HashSet::new();
+    for column in columns {
+        control.checkpoint(CompilePhase::Validate, 1)?;
+        if !names.insert(column.name.to_ascii_lowercase()) || !values.insert(column.value) {
+            return Err(SqlCompileError::InvalidRequest(
+                "standalone scalar layout contains a duplicate column name or value".into(),
+            ));
+        }
+        super::helpers::validate_value_type(&column.value_type, control)?;
+        let column_id = scope.add_column(None, column.name, column.value_type.clone());
+        inputs.push((column_id, column.value, column.value_type.clone()));
+    }
+    let expression = context.analyze_expr(&parsed, &scope)?;
+    drop(context);
+    let source = SqlAuthoredScalarUnit::from_emission(
+        lower_standalone_scalar_unit(
+            &expression,
+            &inputs,
+            functions,
+            sealed_functions,
+            sql_semantics.sql_mode().allow_throw_exception(),
+            constant_policy,
+            control,
+        )
+        .map_err(required_lowering_error)?,
+    );
+    control.check()?;
+    Ok(source)
+}
+
 pub(crate) fn prepare(
     request: RequiredConstantRequest<'_>,
 ) -> Result<PreparedRequiredConstant, SqlCompileError> {
@@ -54,29 +151,21 @@ pub(crate) fn prepare(
         control,
     } = request;
     control.check()?;
-    let factory = Rc::new(RefCell::new(crate::column_id::ColumnRefFactory::new()));
-    let context = super::AnalyzerContext {
-        purpose: crate::analyzer::QueryAnalysisPurpose::Ordinary,
-        grouping_scope: RefCell::new(None),
-        view_stack: Default::default(),
-        control,
-        constant_policy,
-        materialized_values: None,
-        catalog: catalog.planner_table_provider(),
+    let context = scalar_context(
+        catalog,
         current_database,
-        function_catalog: functions.as_ref(),
-        sql_semantics: sql_semantics.clone(),
-        factory: factory.clone(),
-        ctes: HashMap::new(),
-        pending_ctes: HashSet::new(),
-        next_subquery_id: Cell::new(0),
-        next_lambda_slot_id: Cell::new(0),
-        collected_subqueries: RefCell::new(Vec::new()),
-        cte_registry: RefCell::new(crate::analysis::cte::CTERegistry::new()),
-    };
+        functions.as_ref(),
+        sql_semantics,
+        constant_policy,
+        control,
+    );
     let (expression, span) = match input {
         RequiredConstantInput::Expression(expression) => {
-            reject_subqueries(expression, control)?;
+            reject_subqueries(
+                expression,
+                control,
+                "required constants cannot contain subqueries",
+            )?;
             (
                 context.analyze_expr(expression, &context.new_scope())?,
                 expression.span(),
@@ -209,10 +298,12 @@ impl novarocks_failure_contract::FailureProjection for RequiredLoweringFailure {
 fn reject_subqueries(
     expression: &ast::Expr,
     control: &crate::compiler::SqlCompileControl,
+    message: &'static str,
 ) -> Result<(), AnalyzeError> {
     struct Gate<'a> {
         error: Option<AnalyzeError>,
         control: &'a crate::compiler::SqlCompileControl,
+        message: &'static str,
     }
     impl Visit for Gate<'_> {
         fn visit_expr(&mut self, expression: &ast::Expr) {
@@ -225,7 +316,7 @@ fn reject_subqueries(
             }
             if matches!(expression, ast::Expr::Subquery(_) | ast::Expr::Exists(_)) {
                 self.error = Some(AnalyzeError::unsupported_expression(
-                    "required constants cannot contain subqueries",
+                    self.message,
                     expression.span(),
                 ));
                 return;
@@ -236,6 +327,7 @@ fn reject_subqueries(
     let mut gate = Gate {
         error: None,
         control,
+        message,
     };
     gate.visit_expr(expression);
     gate.error.map_or(Ok(()), Err)

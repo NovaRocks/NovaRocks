@@ -1424,7 +1424,7 @@ mod bridge_tests {
                 params: vec!["y".to_string()],
                 body: novarocks_parser::ast::AstBox::new(typed(
                     ExprKind::UnaryOp {
-                        op: UnOp::Negate,
+                        op: UnOp::Not,
                         expr: novarocks_parser::ast::AstBox::new(typed(
                             ExprKind::LambdaParamRef {
                                 name: "y".to_string(),

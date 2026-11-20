@@ -3483,11 +3483,13 @@ name = "novarocks-expression"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "chrono",
  "novarocks-constant-contract",
  "novarocks-expression-contract",
  "novarocks-failure-contract",
  "novarocks-function-contract",
  "novarocks-functions",
+ "novarocks-parser",
  "novarocks-type-contract",
 ]
 

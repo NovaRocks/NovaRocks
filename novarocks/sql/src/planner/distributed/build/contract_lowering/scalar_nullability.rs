@@ -131,22 +131,6 @@ impl ScalarEmission<'_, '_> {
             return self.rebind_scalar_call_entry(id);
         }
         let revised = match &old.kind {
-            ContractExprKind::Unary {
-                op: UnaryOperator::Minus,
-                expr,
-            } => novarocks_functions::native_negate_computed_result_type(
-                &self.nullability_definition(*expr)?.ty,
-                self.control,
-            )
-            .map_err(|error| {
-                if let Some(cause) = error.control_error() {
-                    ContractLoweringError::Control(cause)
-                } else {
-                    ContractLoweringError::InvalidFunctionBinding {
-                        detail: format!("native negate preparation: {error:?}"),
-                    }
-                }
-            })?,
             ContractExprKind::Cast {
                 array_failure_mode,
                 expr,

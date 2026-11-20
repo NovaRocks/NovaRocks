@@ -89,9 +89,6 @@ mod numeric_unary_ordered_sql_source_tests;
 mod numeric_unary_typed_ordered_merge_tests;
 
 #[cfg(test)]
-mod numeric_unary_narrow_state_source_tests;
-
-#[cfg(test)]
 mod sql_published_source_observation_tests;
 
 #[cfg(test)]
@@ -126,9 +123,6 @@ mod filter_conjunction_actual_sql_compiler_tests;
 
 #[cfg(test)]
 mod filter_conjunction_frame_tests;
-
-#[cfg(test)]
-mod native_bitnot_intrinsic_after_tests;
 
 #[cfg(test)]
 mod approx_percentile_actual_sql_source_tests;

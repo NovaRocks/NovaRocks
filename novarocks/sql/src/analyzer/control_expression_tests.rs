@@ -125,6 +125,28 @@ fn case_clauses_keep_original_order_bindings_and_full_branch_declarations() {
                 &control,
             );
         }
+        let check_result = |actual: &TypedExpr, original: &ast::Expr| {
+            let expected = ctx.analyze_expr(original, &scope).unwrap();
+            if operand.is_some() {
+                same_typed(actual, &expected, &control);
+                return;
+            }
+            assert_eq!(
+                actual.value_type,
+                expected.value_type.with_nullable(true).unwrap()
+            );
+            let ExprKind::Cast {
+                expr,
+                target,
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                array_failure_mode: None,
+            } = &actual.kind
+            else {
+                panic!("searched CASE must explicitly convert to the nullable result type");
+            };
+            assert_eq!(target, expected.value_type.data_type());
+            same_typed(expr, &expected, &control);
+        };
         assert_eq!(when_then.len(), 2);
         for ((condition, result), original) in when_then.iter().zip(clauses) {
             let ast::WhenMatch::Operand(original_condition) = &original.match_value else {
@@ -135,17 +157,9 @@ fn case_clauses_keep_original_order_bindings_and_full_branch_declarations() {
                 &ctx.analyze_expr(original_condition, &scope).unwrap(),
                 &control,
             );
-            same_typed(
-                result,
-                &ctx.analyze_expr(&original.result, &scope).unwrap(),
-                &control,
-            );
+            check_result(result, &original.result);
         }
-        same_typed(
-            else_expr.as_ref().unwrap(),
-            &ctx.analyze_expr(default.unwrap(), &scope).unwrap(),
-            &control,
-        );
+        check_result(else_expr.as_ref().unwrap(), default.unwrap());
     }
     for sql in [
         "SELECT CASE WHEN TRUE THEN NULL END",

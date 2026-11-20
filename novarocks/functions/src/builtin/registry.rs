@@ -106,9 +106,8 @@ fn add_for_every<T>(
     }
 }
 
-/// Numeric types where many functions preserve the input width
-/// (e.g. `negative(Int32) -> Int32`). Excludes `Decimal128`, which needs
-/// precision/scale propagation that the registry does not yet handle.
+/// Numeric carriers used for generic registration. Parameterized decimals
+/// are registered separately.
 const NUMERIC_PRESERVING_TYPES: &[TypeSpec] = &[
     TypeSpec::Int8,
     TypeSpec::Int16,
@@ -505,24 +504,9 @@ fn register_numeric_fns(m: &mut HashMap<String, Vec<Signature>>) {
         add(m, "abs", Signature::new(vec![input], output));
     }
 
-    // NEGATIVE preserves the input type. POSITIVE remains in the
-    // Float64-returning math family below.
-    add_for_every(m, "negative", NUMERIC_PRESERVING_TYPES, |t| {
-        Signature::new(vec![t.clone()], t.clone())
-    });
-    add(
-        m,
-        "negative",
-        Signature::new(
-            vec![TypeSpec::Decimal128Of("D")],
-            TypeSpec::Decimal128Of("D"),
-        ),
-    );
-    add(
-        m,
-        "negative",
-        Signature::new(vec![TypeSpec::LargeInt], TypeSpec::LargeInt),
-    );
+    for (signature, _) in super::negation_owner::signatures() {
+        add(m, super::negation_owner::NAME, signature);
+    }
 
     // ceil / ceiling / floor: any numeric input, returns Int64.
     for name in ["ceil", "ceiling", "dceil", "floor", "dfloor"] {

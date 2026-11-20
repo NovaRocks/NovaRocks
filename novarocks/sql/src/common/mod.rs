@@ -19,6 +19,7 @@ pub(crate) mod change_stream;
 pub(crate) mod expr;
 pub(crate) mod imv;
 pub(crate) mod naa;
+pub(crate) mod negation;
 pub(crate) mod plan_hints;
 pub(crate) mod row_lineage;
 pub(crate) mod schema;

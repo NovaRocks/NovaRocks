@@ -201,6 +201,7 @@ pub use crate::evaluator::scalar_invocation::{
     call_invocation, call_scalar, call_scoped_invocation,
 };
 
+pub mod expression_text;
 pub mod filter_conjunction_fixture;
 pub mod frame_fixtures;
 pub mod guarded_fixtures;

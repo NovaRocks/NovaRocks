@@ -1014,6 +1014,27 @@ impl EngineFunctionCatalog {
         finish_binding_work(result, work)
     }
 
+    /// Resolve a trusted call at its known function identity, selecting its
+    /// overload through the same resolver as name-based binding.
+    pub fn resolve_bound_trusted_by_id(
+        &self,
+        function: &FunctionId,
+        kind: FunctionKind,
+        request: FunctionBindingRequest<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
+        let result = (|| {
+            work.step()?;
+            let definition = self
+                .definition_by_id(function)
+                .filter(|definition| definition.kind() == kind)
+                .ok_or(FunctionBindingError::UnknownFunction)?;
+            resolve_definition(definition, request, &mut work)
+        })();
+        finish_binding_work(result, work)
+    }
+
     /// Resolve one trusted call at its exact installed overload and retain the
     /// same declaration-authored metadata as ordinary resolution. Selection
     /// never falls back to automatic overload resolution or an execution ABI.

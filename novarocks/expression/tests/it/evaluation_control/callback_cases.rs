@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 use arrow::{
-    array::{ArrayRef, Int32Array, Int64Array},
+    array::{ArrayRef, Int32Array},
     datatypes::{DataType, Field, Schema, SchemaRef},
     record_batch::RecordBatch,
 };
@@ -31,7 +31,7 @@ use novarocks_expression::{
 };
 use novarocks_expression_contract::{
     BinaryOperator, BoundExprSetBuilder, ExprId, ExprKind, ExprPort, RootOrdinal, RootScope,
-    UnaryOperator, UnitLimits, ValueId,
+    UnitLimits, ValueId,
 };
 use novarocks_functions::{
     AggregateStateAllocator, FunctionArgument, KernelEvaluationControl, KernelFailure,
@@ -156,115 +156,6 @@ fn compile_unit<const N: usize>(
         &functions,
     );
     (compiled, roots, schema)
-}
-
-#[test]
-fn native_bitnot_intrinsic_actual_frame_every_constructor_and_runtime_callback_keeps_cause_and_never_replays()
- {
-    let ty = FunctionValueType::new(DataType::Int64, false);
-    let (unit, [root], schema) = compile_unit(
-        "k",
-        ty.clone(),
-        EvaluationDemand::Value,
-        |_, draft, _, _, column| {
-            let input = draft
-                .add(None, ty.clone(), ExprKind::Value(column))
-                .unwrap();
-            [draft
-                .add(
-                    None,
-                    ty,
-                    ExprKind::Unary {
-                        op: UnaryOperator::BitwiseNot,
-                        expr: input,
-                    },
-                )
-                .unwrap()]
-        },
-    );
-    let use_id = unit.root(root).unwrap().use_id;
-    assert!(unit.recipes().native_bitnot(use_id).is_some());
-    let data = RecordBatch::try_new(
-        schema,
-        vec![Arc::new(Int64Array::from(vec![
-            i64::MIN,
-            -1,
-            0,
-            1,
-            i64::MAX,
-        ]))],
-    )
-    .unwrap();
-    let recorder = Callback::new(usize::MAX, KernelFailure::Cancelled);
-    let _ = CompiledExpressionInstance::try_new(unit.clone(), root, &recorder).unwrap();
-    let trace = recorder.trace();
-    assert!(!trace.is_empty());
-    for at in 1..=trace.len() {
-        for cause in callback_causes([
-            "bitnot-test-invalid",
-            "bitnot-test-internal",
-            "bitnot-test-operational",
-        ]) {
-            let control = Callback::new(at, cause.clone());
-            let result = CompiledExpressionInstance::try_new(unit.clone(), root, &control);
-            assert!(matches!(result,Err(actual) if actual==cause));
-            assert_eq!(control.trace(), trace[..at]);
-        }
-    }
-    let mut frame = CompiledExpressionInstance::try_new(unit.clone(), root, &Control).unwrap();
-    let recorder = Callback::new(usize::MAX, KernelFailure::Cancelled);
-    frame
-        .evaluate(
-            EvaluationInput::Batch {
-                batch: &data,
-                source: None,
-            },
-            ScalarInvocationScope::new(Selection::all(5), Selection::all(5)),
-            ScalarInvocationActivation::Activated,
-            &recorder,
-            &mut PassThroughCallHost,
-        )
-        .unwrap();
-    let trace = recorder.trace();
-    assert!(!trace.is_empty());
-    for at in 1..=trace.len() {
-        for cause in callback_causes([
-            "bitnot-test-invalid",
-            "bitnot-test-internal",
-            "bitnot-test-operational",
-        ]) {
-            let mut frame =
-                CompiledExpressionInstance::try_new(unit.clone(), root, &Control).unwrap();
-            let control = Callback::new(at, cause.clone());
-            let result = frame.evaluate(
-                EvaluationInput::Batch {
-                    batch: &data,
-                    source: None,
-                },
-                ScalarInvocationScope::new(Selection::all(5), Selection::all(5)),
-                ScalarInvocationActivation::Activated,
-                &control,
-                &mut PassThroughCallHost,
-            );
-            assert!(
-                matches!(result, Err(ExprEvaluationFailure::Kernel(actual)) if actual == cause)
-            );
-            assert_eq!(control.trace(), trace[..at]);
-            assert!(matches!(
-                frame.evaluate(
-                    EvaluationInput::Batch {
-                        batch: &data,
-                        source: None
-                    },
-                    ScalarInvocationScope::new(Selection::all(5), Selection::all(5)),
-                    ScalarInvocationActivation::Activated,
-                    &Control,
-                    &mut PassThroughCallHost,
-                ),
-                Err(ExprEvaluationFailure::Kernel(KernelFailure::InstanceFailed))
-            ));
-        }
-    }
 }
 
 fn allocation_host() -> (Arc<CountingAllocator>, Arc<dyn AggregateStateAllocator>) {

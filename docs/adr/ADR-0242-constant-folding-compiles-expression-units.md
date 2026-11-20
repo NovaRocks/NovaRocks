@@ -15,6 +15,10 @@ partially-supersedes:
   - id: ADR-0238
     scope: "Decision 4 assigns control shape, scalar call claims, and scoped effect summaries to the expression layer; SQL retains original binding and request provenance and authors relationship sites"
     link: "ADR-0238-self-contained-expression-units-and-explicit-environments.md"
+partially-superseded-by:
+  - id: ADR-0244
+    scope: "Numeric negation joins ordinary immutable call folding; the same production ownership, admission and failure rules remain"
+    link: "ADR-0244-operators-are-identified-catalogue-functions.md"
 date: 2026-11-19
 provenance:
   - "discussion: 2026-11-19 accepted per-node folding through expression units and shared scalar call authorship"

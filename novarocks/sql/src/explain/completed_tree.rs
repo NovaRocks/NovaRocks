@@ -39,6 +39,7 @@ use novarocks_physical_plan::{
     PhysicalPlan, PlanAnnotation, Relation, SortExpr, ValueId,
 };
 
+use crate::common::negation::{is_negation, write_negation};
 use crate::compiler::SqlCompileError;
 use crate::explain::ExplainLevel;
 use novarocks_expression_contract::{BoundExprSet, ExprId, ExprKind, RootOrdinal};
@@ -937,10 +938,7 @@ impl ExprText<'_> {
             ExprKind::Unary { op, expr } => {
                 use novarocks_expression_contract::UnaryOperator;
                 match op {
-                    UnaryOperator::Plus => write!(formatter, "+{}", inner(*expr)),
-                    UnaryOperator::Minus => write!(formatter, "-{}", inner(*expr)),
                     UnaryOperator::Not => write!(formatter, "NOT {}", inner(*expr)),
-                    UnaryOperator::BitwiseNot => write!(formatter, "~{}", inner(*expr)),
                 }
             }
             ExprKind::Binary {
@@ -1042,6 +1040,31 @@ impl ExprText<'_> {
                 }
                 formatter.write_str(" END")
             }
+            ExprKind::FunctionCall { function, args } if is_negation(&function.function_id) => {
+                let [operand] = args.as_ref() else {
+                    return Err(fmt::Error);
+                };
+                let operand_kind = &self
+                    .unit
+                    .and_then(|unit| unit.definition(*operand))
+                    .ok_or(fmt::Error)?
+                    .kind;
+                let needs_parentheses = matches!(
+                    operand_kind,
+                    ExprKind::Binary { .. }
+                        | ExprKind::Unary { .. }
+                        | ExprKind::Conjunction { .. }
+                        | ExprKind::IsNull { .. }
+                        | ExprKind::IsTruthValue { .. }
+                        | ExprKind::InList { .. }
+                        | ExprKind::Between { .. }
+                        | ExprKind::Like { .. }
+                        | ExprKind::Lambda { .. }
+                );
+                write_negation(formatter, needs_parentheses, |out| {
+                    write!(out, "{}", inner(*operand))
+                })
+            }
             ExprKind::FunctionCall { function, args } => {
                 write!(formatter, "{}(", function_text(&function.function_id))?;
                 write_joined(formatter, args, ", ", |arg| inner(*arg))?;
@@ -1101,9 +1124,6 @@ fn binary_operator_text(op: novarocks_expression_contract::BinaryOperator) -> &'
         BinaryOperator::Multiply => "*",
         BinaryOperator::Divide => "/",
         BinaryOperator::Modulo => "%",
-        BinaryOperator::BitAnd => "&",
-        BinaryOperator::BitOr => "|",
-        BinaryOperator::BitXor => "^",
     }
 }
 
