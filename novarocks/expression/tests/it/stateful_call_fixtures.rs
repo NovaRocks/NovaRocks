@@ -22,14 +22,12 @@ use arrow::{
     datatypes::{DataType, Field, Schema, SchemaRef},
     record_batch::RecordBatch,
 };
-use novarocks_constant_contract::{
-    ConstantPolicy, ConstantPoolId, ConstantPools, ConstantReference,
-};
+use novarocks_constant_contract::{ConstantPolicy, ConstantPools};
 use novarocks_expression::{
     CompiledExprSet, EvaluationEnvironment, ScopeLayouts,
     testkit::{
-        ClaimAuthor, HarnessControl, add_call, checked_constants, compile_fixture_unit,
-        declare_call_controls, finish_unit, fixture_scope, register_call_requests,
+        ClaimAuthor, HarnessControl, add_call, compile_fixture_unit, declare_call_controls,
+        finish_unit, fixture_scope, register_call_requests,
     },
 };
 use novarocks_expression_contract::{
