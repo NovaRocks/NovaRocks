@@ -1253,7 +1253,7 @@ fn type_only_hidden_float_in_compiles_without_evaluating_arguments() {
     else {
         panic!("expected the original floating-point membership definition");
     };
-    assert_eq!(values.as_ref(), &[*child]);
+    assert_eq!(values.as_slice(), &[*child]);
     assert_eq!(
         definitions.node(*child).unwrap().value_type(),
         Some(&FunctionValueType::new(DataType::Float64, false))
