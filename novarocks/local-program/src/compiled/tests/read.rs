@@ -19,7 +19,7 @@
 //! The identity private compiler is a pure contract fixture, not an installed
 //! provider implementation, native plan lowering or provider capability proof.
 
-use super::*;
+use super::super::*;
 use crate::*;
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;

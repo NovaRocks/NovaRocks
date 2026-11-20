@@ -19,11 +19,7 @@
 //! + encode/decode/assert_eq, locking each wire contract. Permanent (unlike the
 //!   NIDL-0 spike). Shared values, task carriers and service contracts remain.
 
-#[path = "proto_contract/common.rs"]
 mod common;
-#[path = "proto_contract/release_fixtures.rs"]
 mod release_fixtures;
-#[path = "proto_contract/service.rs"]
 mod service;
-#[path = "proto_contract/task_carriers.rs"]
 mod task_carriers;
