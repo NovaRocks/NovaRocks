@@ -1501,3 +1501,5 @@ fn ctas_existing_target_uses_the_original_statement_location_and_trino_code() {
     );
     assert!(wire.message.contains("test.s.destination"));
 }
+
+mod iceberg_commit;

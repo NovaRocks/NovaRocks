@@ -132,6 +132,8 @@ enum Code {
     DuplicateWindowName,
     MergeTargetRowMultipleMatches,
     IcebergTooManyOpenPartitions,
+    IcebergCommitError,
+    TransactionConflict,
     GenericInternal,
     PageTransportError,
     PageTransportTimeout,
@@ -201,6 +203,8 @@ impl Code {
                 "ICEBERG_TOO_MANY_OPEN_PARTITIONS",
                 "USER_ERROR",
             ),
+            IcebergCommitError => (0x0504_000C, "ICEBERG_COMMIT_ERROR", "EXTERNAL"),
+            TransactionConflict => (17, "TRANSACTION_CONFLICT", "USER_ERROR"),
             GenericInternal => (65536, "GENERIC_INTERNAL_ERROR", "INTERNAL_ERROR"),
             PageTransportError => (65539, "PAGE_TRANSPORT_ERROR", "INTERNAL_ERROR"),
             PageTransportTimeout => (65540, "PAGE_TRANSPORT_TIMEOUT", "INTERNAL_ERROR"),
@@ -245,13 +249,27 @@ enum PublicMessage<'a> {
     Borrowed(&'a str),
     Session(&'a StatementSessionError),
     Execution(&'a ExecutionFailureInput),
-    OpenPartitionLimit { limit: u64, opening: u64 },
+    CommitFailure {
+        input: &'a ExecutionFailureInput,
+        unknown: bool,
+    },
+    OpenPartitionLimit {
+        limit: u64,
+        opening: u64,
+    },
 }
 impl fmt::Display for PublicMessage<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Borrowed(message) => formatter.write_str(message),
             Self::Session(error) => fmt::Display::fmt(error, formatter),
+            Self::CommitFailure { input, unknown } => {
+                formatter.write_str("Failed to commit the transaction during write: ")?;
+                if *unknown && !input.detail().as_str().starts_with("[CommitUnknown]") {
+                    formatter.write_str("[CommitUnknown] ")?;
+                }
+                fmt::Display::fmt(input.detail(), formatter)
+            }
             Self::OpenPartitionLimit { limit, opening } => write!(
                 formatter,
                 "Exceeded limit of {limit} open writers for partitions: {opening}"
@@ -351,7 +369,16 @@ fn project_message(
         return project(code, diagnostics::bound_display(&message), location);
     }
     let public = StatementExternalEffectDisposition::diagnostic(&message, effect);
-    let bounded = diagnostics::bound_display(&public);
+    project_public_diagnostic(query_id, code, &public, location)
+}
+
+fn project_public_diagnostic(
+    query_id: Option<&str>,
+    code: Code,
+    public: &impl fmt::Display,
+    location: Option<TrinoErrorLocation>,
+) -> TrinoQueryError {
+    let bounded = diagnostics::bound_display(public);
     if bounded.truncated
         && let Some(query_id) = query_id
     {
@@ -417,24 +444,21 @@ fn service_error(
             .expect("declared row match SQL identity has a standard message");
         return project(code, diagnostics::bound_display(message), None);
     }
-    if code == Code::IcebergTooManyOpenPartitions
-        && let Some(input) = error.execution_failure()
-    {
-        return project_message(query_id, code, execution_message(input), None, effect);
+    if let Some(input) = error.execution_failure() {
+        if matches!(code, Code::IcebergCommitError | Code::TransactionConflict) {
+            let message = execution_message(input);
+            let public = error.diagnostic_with_execution_detail(&message, effect);
+            return project_public_diagnostic(query_id, code, &public, None);
+        }
+        if code == Code::IcebergTooManyOpenPartitions {
+            return project_message(query_id, code, execution_message(input), None, effect);
+        }
     }
     let public = error.diagnostic_with_external_effect(effect);
-    let bounded = diagnostics::bound_display(&public);
-    if bounded.truncated
-        && let Some(query_id) = query_id
-    {
-        tracing::warn!(client_query_id = query_id, full_error = %public,
-            client_message_json_bytes = bounded.json_bytes,
-            max_message_json_bytes = diagnostics::MAX_MESSAGE_JSON_BYTES,
-            "Trino client error message truncated; full public diagnostic retained here");
-    }
-    project(
+    project_public_diagnostic(
+        query_id,
         code,
-        bounded,
+        &public,
         error.user_error().and_then(|user| user_location(user, sql)),
     )
 }
@@ -481,7 +505,35 @@ fn open_partition_limit(input: &ExecutionFailureInput) -> Option<(u64, u64)> {
     (resource.dimension == ResourceDimension::Items && opening > limit).then_some((limit, opening))
 }
 
+fn commit_failure(input: &ExecutionFailureInput) -> Option<(Code, bool)> {
+    use novarocks_execution_contract::failure::{
+        FailureEvidence,
+        connector_reason::{
+            COMMIT_TRANSACTION_CONFLICT, ICEBERG_COMMIT_STATE_UNKNOWN,
+            ICEBERG_COMMIT_VALIDATION_CONFLICT,
+        },
+    };
+    use novarocks_query_application::execution_error::ExecutionFailureSite;
+
+    let fact = input.fact();
+    if fact.class() != FailureClass::Dependency
+        || fact.evidence() != FailureEvidence::Originating
+        || !matches!(input.site(), ExecutionFailureSite::Coordinator)
+    {
+        return None;
+    }
+    match fact.reason() {
+        COMMIT_TRANSACTION_CONFLICT => Some((Code::TransactionConflict, false)),
+        ICEBERG_COMMIT_VALIDATION_CONFLICT => Some((Code::IcebergCommitError, false)),
+        ICEBERG_COMMIT_STATE_UNKNOWN => Some((Code::IcebergCommitError, true)),
+        _ => None,
+    }
+}
+
 fn execution_message(input: &ExecutionFailureInput) -> PublicMessage<'_> {
+    if let Some((_, unknown)) = commit_failure(input) {
+        return PublicMessage::CommitFailure { input, unknown };
+    }
     match open_partition_limit(input) {
         Some((limit, opening)) => PublicMessage::OpenPartitionLimit { limit, opening },
         None => PublicMessage::Execution(input),
@@ -489,6 +541,9 @@ fn execution_message(input: &ExecutionFailureInput) -> PublicMessage<'_> {
 }
 
 fn execution_code(input: &ExecutionFailureInput) -> Code {
+    if let Some((code, _)) = commit_failure(input) {
+        return code;
+    }
     if open_partition_limit(input).is_some() {
         return Code::IcebergTooManyOpenPartitions;
     }
@@ -649,7 +704,6 @@ fn user_location(error: &UserError, sql: &str) -> Option<TrinoErrorLocation> {
 }
 
 #[cfg(test)]
-#[path = "error_tests.rs"]
 mod tests;
 
 #[cfg(test)]

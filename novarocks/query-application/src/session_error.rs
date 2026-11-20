@@ -344,6 +344,21 @@ impl QueryServiceError {
         ServiceExternalEffectDiagnostic {
             error: self,
             companion,
+            execution_detail: None,
+        }
+    }
+
+    /// Present an execution failure with the protocol's own detail formatter
+    /// while keeping the original publication and cumulative-effect facts.
+    pub fn diagnostic_with_execution_detail<'a>(
+        &'a self,
+        detail: &'a dyn fmt::Display,
+        companion: Option<StatementExternalEffectDisposition>,
+    ) -> impl fmt::Display + 'a {
+        ServiceExternalEffectDiagnostic {
+            error: self,
+            companion,
+            execution_detail: Some(detail),
         }
     }
 
@@ -487,8 +502,24 @@ impl fmt::Display for ExecutionPublicBase<'_> {
         let QueryServiceErrorBody::Execution { user_error, .. } = &self.0.body else {
             unreachable!("typed execution base")
         };
-        fmt::Display::fmt(user_error, f)?;
-        if let Some(terminal) = self.0.publication_terminal() {
+        fmt::Display::fmt(
+            &ExecutionPublicDetail {
+                detail: user_error,
+                terminal: self.0.publication_terminal(),
+            },
+            f,
+        )
+    }
+}
+
+struct ExecutionPublicDetail<'a> {
+    detail: &'a dyn fmt::Display,
+    terminal: Option<&'a LakePublicationTerminal>,
+}
+impl fmt::Display for ExecutionPublicDetail<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self.detail, f)?;
+        if let Some(terminal) = self.terminal {
             let disposition = match terminal.disposition() {
                 LakePublicationDisposition::KnownUncommitted => "KnownUncommitted",
                 LakePublicationDisposition::CommitUnknown => "CommitUnknown",
@@ -512,6 +543,7 @@ impl fmt::Display for ExecutionPublicBase<'_> {
 struct ServiceExternalEffectDiagnostic<'a> {
     error: &'a QueryServiceError,
     companion: Option<StatementExternalEffectDisposition>,
+    execution_detail: Option<&'a dyn fmt::Display>,
 }
 impl fmt::Display for ServiceExternalEffectDiagnostic<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -519,6 +551,16 @@ impl fmt::Display for ServiceExternalEffectDiagnostic<'_> {
             self.error.external_effect_disposition,
             self.companion,
         );
+        if let Some(detail) = self.execution_detail {
+            let base = ExecutionPublicDetail {
+                detail,
+                terminal: self.error.publication_terminal(),
+            };
+            return fmt::Display::fmt(
+                &StatementExternalEffectDisposition::diagnostic(&base, combined),
+                f,
+            );
+        }
         if self
             .error
             .execution_failure()
