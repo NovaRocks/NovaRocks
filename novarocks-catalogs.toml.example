@@ -10,3 +10,11 @@ catalogs = []
 # These are the defaults. A table's write.target-file-size-bytes overrides
 # the file target. A catalog session can lower its open-partition cap with
 # SET SESSION lake.max_partitions_per_writer = 32, where lake is the catalog.
+
+# Optional Iceberg maintenance minimums, also under [catalogs.properties].
+# "iceberg.expire-snapshots.min-retention" = "7d"
+# "iceberg.remove-orphan-files.min-retention" = "7d"
+# Each EXECUTE defaults retention_threshold to '7d'. A catalog session can
+# override the corresponding minimum, for example when lake is the catalog:
+# SET SESSION lake.expire_snapshots_min_retention = '14d';
+# SET SESSION lake.remove_orphan_files_min_retention = '14d';

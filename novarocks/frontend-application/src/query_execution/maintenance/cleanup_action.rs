@@ -120,6 +120,7 @@ fn health(error: impl std::error::Error + Send + Sync + 'static) -> StatementNat
         Arc::new(error),
     )
 }
+// Design: ADR-0243 (docs/adr/ADR-0243-statement-authorized-iceberg-metadata-maintenance.md)
 pub(crate) fn prepare(
     kernel: &MaintenanceExecutionKernel,
     target: MaintenanceTarget,

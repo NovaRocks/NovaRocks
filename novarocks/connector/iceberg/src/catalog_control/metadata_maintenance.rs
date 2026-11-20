@@ -472,6 +472,7 @@ impl MaintenanceEngine {
         Ok(public_outcome(journal.catalog_entry_outcome(entry)))
     }
 
+    // Design: ADR-0243 (docs/adr/ADR-0243-statement-authorized-iceberg-metadata-maintenance.md)
     async fn execute_once(
         &self,
         plan: &ConnectorMetadataMaintenancePlan,
@@ -612,6 +613,7 @@ impl MaintenanceEngine {
         Ok(outcome)
     }
 
+    // Design: ADR-0243 (docs/adr/ADR-0243-statement-authorized-iceberg-metadata-maintenance.md)
     async fn execute_expire(
         &self,
         plan: &ConnectorMetadataMaintenancePlan,

@@ -148,6 +148,7 @@ pub(super) struct OrphanScan<'a> {
 }
 
 impl OrphanScan<'_> {
+    // Design: ADR-0243 (docs/adr/ADR-0243-statement-authorized-iceberg-metadata-maintenance.md)
     pub(super) async fn execute(
         &self,
         table: &Table,
