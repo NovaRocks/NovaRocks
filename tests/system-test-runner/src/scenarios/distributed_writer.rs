@@ -3417,7 +3417,9 @@ fn verify_grant_only_writer_stop(
             if let Some((sender, trigger, register_count)) =
                 events.iter().find_map(|(sender, seen)| {
                     let registered = seen.get("event=demand_started").copied().unwrap_or(0);
-                    if !seen.contains_key("event=deliver_parked")
+                    // The sender cannot publish another Data once its own End
+                    // is offered. All earlier Demand RPCs must also have exited.
+                    if !seen.contains_key("event=deliver_end_parked")
                         || !seen.contains_key("event=grant_observed")
                         || registered == 0
                         || seen.get("event=demand_exited") != Some(&registered)

@@ -266,6 +266,15 @@ impl ExchangeFrameTransmitter for GrpcExchangeFrameTransmitter {
         let timeout = self.send_timeout;
         #[cfg(novarocks_dev_controls)]
         let hold = self.grant_probe(stream);
+        #[cfg(novarocks_dev_controls)]
+        let carries_end = matches!(
+            frame.receiver.item,
+            novarocks_execution::runtime::task::io::exchange_unit::ExchangeUnitItem::End(_)
+                | novarocks_execution::runtime::task::io::exchange_unit::ExchangeUnitItem::Unit {
+                    end_after_unit: true,
+                    ..
+                }
+        );
         spawn_exchange_call(&self.runtime, activity, async move {
             #[cfg(novarocks_dev_controls)]
             match hold {
@@ -275,6 +284,9 @@ impl ExchangeFrameTransmitter for GrpcExchangeFrameTransmitter {
                         return;
                     }
                     observe_grant_only(observer.as_deref(), stream, "deliver_parked");
+                    if carries_end {
+                        observe_grant_only(observer.as_deref(), stream, "deliver_end_parked");
+                    }
                     tokio::select! {
                         biased;
                         _ = stop.cancelled() => {
