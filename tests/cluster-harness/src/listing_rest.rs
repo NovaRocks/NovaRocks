@@ -64,6 +64,7 @@ pub struct ListingSnapshot {
     pub table_commits: u64,
     pub object_store_list_requests: u64,
     pub object_store_list_body_bytes: u64,
+    pub object_store_head_requests: u64,
 }
 
 #[derive(Default)]
@@ -217,6 +218,14 @@ async fn serve(State(state): State<Arc<FixtureState>>, method: Method, uri: Uri)
 
 async fn reply(state: Arc<FixtureState>, method: Method, uri: Uri) -> Result<Response> {
     let segments = uri.path().trim_matches('/').split('/').collect::<Vec<_>>();
+    if method == Method::HEAD && segments.first() == Some(&"cl-fixture") && segments.len() > 1 {
+        let mut facts = state
+            .facts
+            .lock()
+            .map_err(|_| anyhow::anyhow!("listing fixture lock poisoned"))?;
+        facts.audit.object_store_head_requests += 1;
+        return Ok(StatusCode::NOT_FOUND.into_response());
+    }
     if segments.as_slice() == ["cl-fixture"] {
         ensure!(
             method == Method::GET
@@ -541,8 +550,14 @@ mod tests {
             assert_eq!(response.headers()["content-type"], "application/xml");
             let body = response.bytes().unwrap();
             assert_eq!(body.len(), bytes);
+            let miss = client
+                .head(format!("{}/cl-fixture/missing/source", fixture.endpoint()))
+                .send()
+                .unwrap();
+            assert_eq!(miss.status(), StatusCode::NOT_FOUND);
             let audit = fixture.snapshot().unwrap();
             assert_eq!(audit.object_store_list_requests, 1);
+            assert_eq!(audit.object_store_head_requests, 1);
             assert_eq!(audit.object_store_list_body_bytes, bytes as u64);
             assert_eq!(audit.table_commits, 0);
         }

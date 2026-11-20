@@ -17,6 +17,7 @@
 
 #[allow(dead_code, reason = "P08 reconnects the source I/O verification")]
 pub(crate) mod fixtures;
+mod listing;
 
 #[test]
 fn location_accepts_at_signs_in_paths_and_rejects_embedded_credentials() {

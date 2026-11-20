@@ -58,14 +58,16 @@ pub(super) fn procedure_error(
     .with_public_failure_detail()
 }
 
-#[expect(
-    dead_code,
-    reason = "source listing in P07 consumes the location check"
-)]
 pub(super) fn validate_registration_location(location: &str) -> Result<(), ConnectorError> {
     crate::write_codec::validate_secret_free_text("ADD FILES source location", location)
         .map_err(|error| ConnectorError::new(ConnectorErrorKind::InvalidRequest, error))
 }
+
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "P08 consumes the registration listing seam")
+)]
+pub(super) mod listing;
 
 #[cfg(test)]
 pub(crate) mod tests;
