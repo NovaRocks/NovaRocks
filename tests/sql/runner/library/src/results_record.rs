@@ -1532,7 +1532,7 @@ mod lifecycle_tests {
     impl TrinoSetupPeer {
         fn start() -> Self {
             use std::net::{TcpListener, TcpStream};
-            use std::time::{Duration, Instant};
+            use std::time::Duration;
             fn read_request(peer: &mut TcpStream) -> Option<(String, String)> {
                 let mut head = Vec::new();
                 let mut byte = [0];
@@ -1560,10 +1560,9 @@ mod lifecycle_tests {
             let stop = Arc::new(AtomicBool::new(false));
             let stopping = Arc::clone(&stop);
             let worker = std::thread::spawn(move || {
-                let deadline = Instant::now() + Duration::from_secs(10);
                 let mut queries = Vec::new();
                 loop {
-                    if stopping.load(Ordering::Relaxed) || Instant::now() >= deadline {
+                    if stopping.load(Ordering::Relaxed) {
                         return queries;
                     }
                     let mut peer = match listener.accept() {
