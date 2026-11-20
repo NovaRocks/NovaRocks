@@ -668,7 +668,7 @@ fn to_base64_physical_author_exact_declared_carriers_and_immediate_definitions()
                 call.get(),
                 ExprKind::FunctionCall {
                     function,
-                    args: vec![input],
+                    args: Box::new([input]),
                 },
                 result.clone(),
             ),
