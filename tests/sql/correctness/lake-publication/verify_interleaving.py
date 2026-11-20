@@ -215,6 +215,16 @@ require(actual == expected, s"unexpected rows: $actual, expected: $expected")
     print(marker)
 
 
+def matches_known_uncommitted_message(message, core):
+    return re.fullmatch(
+        re.escape(core)
+        + r" \(lake publication id=[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}"
+        r" family=data_mutation disposition=KnownUncommitted\)"
+        r" \(external effect disposition=KnownUncommitted\)",
+        message,
+    ) is not None
+
+
 def verify_rollback_error(results_jsonl, endpoints_json):
     """Bind A11's exact dynamic E/B error to the preserved runner wire evidence."""
     endpoints = json.loads(Path(endpoints_json).read_text())
@@ -241,8 +251,10 @@ def verify_rollback_error(results_jsonl, endpoints_json):
     statement, = attempt["statements"]
     failure, = statement["failures"]
     error = failure["Client"]["Trino"]
-    if (error["errorCode"], error["errorName"], error["errorType"], error["message"]) != (
-        84148236, "ICEBERG_COMMIT_ERROR", "EXTERNAL", expected_message
+    if (
+        (error["errorCode"], error["errorName"], error["errorType"])
+        != (84148236, "ICEBERG_COMMIT_ERROR", "EXTERNAL")
+        or not matches_known_uncommitted_message(error["message"], expected_message)
     ):
         raise RuntimeError(f"A11 wire error differs from the proved rollback: {error['message']}")
     print("RWM12_ROLLBACK_ERROR_OK")
