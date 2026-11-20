@@ -550,6 +550,7 @@ enum AdmittedRead {
         original_identity: novarocks_spi::connector::ConnectorTableIdentity,
         original_source: Option<novarocks_spi::connector::ConnectorProcessLocalPayload>,
         snapshot_id: Option<i64>,
+        preparation_digest: [u8; 32],
     },
     PreparedSource(Arc<crate::catalog_application::query_bindings::QueryPreparedSourceRead>),
     MvTarget {
@@ -677,7 +678,7 @@ fn prepare_read_opening(
         let input = frozen_input(relation)?;
         let binding = bindings.binding(need.binding())?;
         if let crate::catalog_application::query_bindings::QueryTableBindingAdmission::RowMutationMatch(
-            _, snapshot_id,
+            _, snapshot_id, preparation_digest,
         ) = &binding.admission
         {
             if !matches!(relation, ProviderReadRelationNeed::Data { .. })
@@ -693,6 +694,7 @@ fn prepare_read_opening(
                 original_identity: original.identity.clone(),
                 original_source: original.source_read_facts().cloned(),
                 snapshot_id: *snapshot_id,
+                preparation_digest: *preparation_digest,
             }
         } else {
         let prepared = match relation {
@@ -820,6 +822,7 @@ async fn prepare_observation(
         materialization,
         original_source,
         snapshot_id,
+        preparation_digest,
         ..
     } = &opening.admitted
     {
@@ -829,6 +832,7 @@ async fn prepare_observation(
                 "mutation target scan has no original provider access provenance".to_string()
             })?,
             snapshot_id: *snapshot_id,
+            preparation_digest: *preparation_digest,
         }
     } else if let AdmittedRead::Cohort(cohort) = &opening.admitted {
         match (need.relation(),cohort) {

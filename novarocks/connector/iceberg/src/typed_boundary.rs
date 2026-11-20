@@ -1499,6 +1499,7 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
                 table,
                 original_source,
                 snapshot_id,
+                ..
             } = request.kind()
             {
                 let (physical, schema) =
@@ -6323,6 +6324,7 @@ mod prepared_source_relation_tests {
                     table: signed.clone(),
                     original_source: original.clone(),
                     snapshot_id,
+                    preparation_digest: [1; 32],
                 },
             );
             let prepared = executor
@@ -6348,6 +6350,7 @@ mod prepared_source_relation_tests {
                     table: signed,
                     original_source: original.clone(),
                     snapshot_id: Some(42),
+                    preparation_digest: [1; 32],
                 },
             );
             assert!(

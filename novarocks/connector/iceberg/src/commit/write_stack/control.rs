@@ -2244,7 +2244,7 @@ impl IcebergWriteSessionControl {
             ConnectorWriteSessionFlavor::ApplicationDocumentPublication { .. } => {
                 CatalogOperation::PublishDocuments
             }
-            ConnectorWriteSessionFlavor::RowMutation => CatalogOperation::RowMutation,
+            ConnectorWriteSessionFlavor::RowMutation { .. } => CatalogOperation::RowMutation,
             ConnectorWriteSessionFlavor::DistributedRewrite { shape, .. } => match shape {
                 ConnectorDistributedRewriteShape::DataFiles { .. } => {
                     CatalogOperation::RewriteDataFiles
@@ -2302,7 +2302,7 @@ impl IcebergWriteSessionControl {
             _ => None,
         };
         let fixed_position_read = match &request.flavor {
-            ConnectorWriteSessionFlavor::RowMutation => true,
+            ConnectorWriteSessionFlavor::RowMutation { .. } => true,
             ConnectorWriteSessionFlavor::ApplicationDocumentPublication { shape, .. } => {
                 *shape == ConnectorManagedPublicationShape::RowMutation
             }
@@ -2543,7 +2543,10 @@ impl IcebergWriteSessionControl {
                 ));
             }
         }
-        if matches!(request.flavor, ConnectorWriteSessionFlavor::RowMutation) {
+        if matches!(
+            request.flavor,
+            ConnectorWriteSessionFlavor::RowMutation { .. }
+        ) {
             let expected = crate::commit::write_shared::position_mutation_base(
                 &metadata,
                 table.as_ref().and_then(|table| table.metadata_location()),
@@ -2819,7 +2822,9 @@ impl IcebergWriteSessionControl {
                     IcebergDocumentPublicationFacts::new(declaration.as_ref().clone(), *shape),
                 )?
             }
-            ConnectorWriteSessionFlavor::RowMutation => plan_row_mutation_branches(&material)?,
+            ConnectorWriteSessionFlavor::RowMutation { .. } => {
+                plan_row_mutation_branches(&material)?
+            }
             ConnectorWriteSessionFlavor::DistributedRewrite { shape, .. } => {
                 let content = frozen_rewrite
                     .ok_or_else(|| internal("Iceberg rewrite lost its frozen plan"))?;
@@ -3499,10 +3504,19 @@ impl novarocks_spi::connector::write_stack::session::ConnectorWriteControl
         query: &ConnectorWriteQueryIdentity,
         targets: &[WriteTargetOrdinal],
         mut production: Option<Arc<dyn ConnectorWriteProductionProof>>,
+        rewritten_target: Option<
+            &novarocks_spi::connector::read_stack::runtime::ConnectorRewrittenTargetFact,
+        >,
     ) -> Result<(), ConnectorError> {
         let handle = self.adapter.commit_session(commit)?;
         handle.with_active_receiving(|receiving| {
-            receiving.begin_query(*query, targets, &mut production, handle.targets())
+            receiving.begin_query(
+                *query,
+                targets,
+                &mut production,
+                handle.targets(),
+                rewritten_target,
+            )
         })
     }
 

@@ -129,7 +129,9 @@ pub(super) async fn prepare_delete_statement_async(
             delete_input_request(deletion_vectors)?,
             novarocks_spi::connector::ConnectorWriteAdmissionPurpose::OrdinaryDml,
             Some(mutation.base_version().clone()),
-            novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::RowMutation,
+            novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::RowMutation {
+                admission: mutation.admission(),
+            },
             connector_context.clone(),
         )?,
         begin_receiving.as_ref(),

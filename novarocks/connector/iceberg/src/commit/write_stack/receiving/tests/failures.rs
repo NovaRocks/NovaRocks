@@ -96,7 +96,7 @@ fn a_duplicate_record_leaves_first_receipt_and_no_publication() {
     let commit = lake.adapter.wrap_commit_session(handle);
     let query = write_query_identity();
     lake.control
-        .begin_write_query(&commit, &query, &[target], None)
+        .begin_write_query(&commit, &query, &[target], None, None)
         .unwrap();
     let wrap = || {
         lake.adapter
@@ -161,7 +161,7 @@ fn compact_top_up_refusal_releases_only_the_unaccepted_record() {
     let commit = lake.adapter.wrap_commit_session(handle);
     let query = write_query_identity();
     lake.control
-        .begin_write_query(&commit, &query, &[target], None)
+        .begin_write_query(&commit, &query, &[target], None, None)
         .unwrap();
 
     let budget = Arc::new(RefusingWindow::default());

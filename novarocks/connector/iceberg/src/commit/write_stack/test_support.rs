@@ -140,7 +140,7 @@ pub(crate) fn receive_write_query(
     fragments: Vec<(WriteTargetOrdinal, ConnectorCommitFragment)>,
 ) -> Result<(), ConnectorError> {
     let query = write_query_identity();
-    control.begin_write_query(commit, &query, targets, None)?;
+    control.begin_write_query(commit, &query, targets, None, None)?;
     control.arrive_write_fragments(
         commit,
         &query,

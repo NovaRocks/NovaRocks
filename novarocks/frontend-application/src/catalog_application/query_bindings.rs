@@ -241,7 +241,7 @@ pub enum QueryTableBindingAdmission {
     /// admitted its read materialization or terminal write target.
     Exact(ConnectorControlPlanningPin),
     /// One statement's signed mutation target scan and admitted base.
-    RowMutationMatch(ConnectorControlPlanningPin, Option<i64>),
+    RowMutationMatch(ConnectorControlPlanningPin, Option<i64>, [u8; 32]),
     /// A provider-frozen read has no independent table-selector materialization.
     /// Its source facts remain opaque in the provider request, while this
     /// retained lease fences the synthetic SQL relation to one exact control
@@ -252,7 +252,7 @@ pub enum QueryTableBindingAdmission {
 impl QueryTableBindingAdmission {
     pub fn exact_planning_pin(&self) -> Result<ConnectorControlPlanningPin, String> {
         match self {
-            Self::Exact(lease) | Self::FrozenRead(lease) | Self::RowMutationMatch(lease, _) => {
+            Self::Exact(lease) | Self::FrozenRead(lease) | Self::RowMutationMatch(lease, _, _) => {
                 Ok(lease.clone())
             }
             Self::Local => Err("query binding has no connector planning pin".to_string()),
@@ -715,7 +715,7 @@ impl QueryTableBindingStore {
             }
             if let QueryTableBindingAdmission::Exact(lease)
             | QueryTableBindingAdmission::FrozenRead(lease)
-            | QueryTableBindingAdmission::RowMutationMatch(lease, _) = &binding.admission
+            | QueryTableBindingAdmission::RowMutationMatch(lease, _, _) = &binding.admission
             {
                 let descriptor = lease.binding().descriptor();
                 material.extend_from_slice(descriptor.provider_id.as_str().as_bytes());

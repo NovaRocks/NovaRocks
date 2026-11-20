@@ -312,6 +312,9 @@ impl IcebergReceiving {
         targets: &[WriteTargetOrdinal],
         production: &mut Option<Arc<dyn ConnectorWriteProductionProof>>,
         sealed: &[IcebergSealedWriteTarget],
+        _rewritten_target: Option<
+            &novarocks_spi::connector::read_stack::runtime::ConnectorRewrittenTargetFact,
+        >,
     ) -> Result<(), ConnectorError> {
         validate_query_target_ordinals(targets)?;
         if targets

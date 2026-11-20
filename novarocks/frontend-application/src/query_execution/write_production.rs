@@ -212,6 +212,7 @@ impl ConnectorWriteSession {
                 &query,
                 targets,
                 Some(proof),
+                None,
             )
         })) {
             Ok(result) => result,

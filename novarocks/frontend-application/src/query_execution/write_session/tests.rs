@@ -573,6 +573,9 @@ impl novarocks_spi::connector::write_stack::ConnectorWriteControl for FakeSessio
         query: &ConnectorWriteQueryIdentity,
         targets: &[WriteTargetOrdinal],
         production: Option<Arc<dyn ConnectorWriteProductionProof>>,
+        _rewritten_target: Option<
+            &novarocks_spi::connector::read_stack::runtime::ConnectorRewrittenTargetFact,
+        >,
     ) -> Result<(), ConnectorError> {
         let panic = self.recorded.lock().unwrap().panic_query_registration;
         assert!(!panic, "scripted Provider query registration panic");
@@ -1802,7 +1805,7 @@ fn received_input_validation_refusal_moves_no_original_inventory() {
     let control = fixture.session.write_stack_pin.session();
     let commit = fixture.session.plan.commit_session();
     control
-        .begin_write_query(commit, &query, &[target], None)
+        .begin_write_query(commit, &query, &[target], None, None)
         .unwrap();
     let fragment = fixture
         .fake_adapter()

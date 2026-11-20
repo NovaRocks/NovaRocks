@@ -39,10 +39,11 @@ use novarocks_spi::connector::{
     CatalogHandle, CatalogVersion, ConnectorCommittedVersion, ConnectorDistributedRewriteShape,
     ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorInstanceId,
     ConnectorManagedPublicationEmptyInputDisposition, ConnectorManagedPublicationTechnique,
-    ConnectorMutationRouteInput, ConnectorProviderId, ConnectorRequestContext,
-    ConnectorRowMutationEffect, ConnectorWriteAbortOutcome, ConnectorWriteAdmissionPurpose,
-    ConnectorWriteInputShape, ConnectorWriteRouteId, ExternalMutationEffect,
-    ExternalMutationFinalization, ExternalMutationOutcome, ProviderBindingEpoch,
+    ConnectorMutationRouteInput, ConnectorProviderBindingKey, ConnectorProviderId,
+    ConnectorRequestContext, ConnectorRowMutationEffect, ConnectorWriteAbortOutcome,
+    ConnectorWriteAdmissionPurpose, ConnectorWriteInputShape, ConnectorWriteRouteId,
+    ExternalMutationEffect, ExternalMutationFinalization, ExternalMutationOutcome,
+    ProviderBindingEpoch,
 };
 
 use crate::access_binding::IcebergReadBinding;
@@ -239,6 +240,7 @@ fn received(
             &handle.expected_targets(),
             &mut None,
             handle.targets(),
+            None,
         )
         .expect("register query");
     let mut fragments = entries
@@ -2993,7 +2995,18 @@ fn all_write_admission_requests(
             "staged create",
             ConnectorWriteSessionFlavor::StagedCreate(staged.clone()),
         ),
-        ("row mutation", ConnectorWriteSessionFlavor::RowMutation),
+        (
+            "row mutation",
+            ConnectorWriteSessionFlavor::RowMutation {
+                admission: novarocks_spi::connector::ConnectorProcessLocalPayload::new(
+                    ConnectorProviderBindingKey {
+                        instance_id: staged.owner().clone(),
+                        incarnation,
+                    },
+                    Arc::new(()),
+                ),
+            },
+        ),
         (
             "data rewrite",
             ConnectorWriteSessionFlavor::DistributedRewrite {
@@ -3459,6 +3472,7 @@ impl FrozenRewriteLake {
                     target.ordinal(),
                     physical,
                 )),
+                None,
             )
             .unwrap();
         let fragments = self.executor.block_on(async {
@@ -3538,7 +3552,12 @@ impl FrozenRewriteLake {
                 purpose: ConnectorWriteAdmissionPurpose::OrdinaryDml,
                 input,
                 base: Some(base),
-                flavor: ConnectorWriteSessionFlavor::RowMutation,
+                flavor: ConnectorWriteSessionFlavor::RowMutation {
+                    admission: novarocks_spi::connector::ConnectorProcessLocalPayload::new(
+                        self.control.binding_key().clone(),
+                        Arc::new(()),
+                    ),
+                },
                 context,
             })
             .unwrap();
@@ -4271,7 +4290,7 @@ pub(super) fn project_managed_rows_fixture(
         runtime,
     );
     let query = super::test_support::write_query_identity();
-    control.begin_write_query(&commit, &query, &expected, None)?;
+    control.begin_write_query(&commit, &query, &expected, None, None)?;
     control.arrive_write_fragments(
         &commit,
         &query,
@@ -4886,6 +4905,7 @@ fn seal_test_data_output(
                 target.ordinal(),
                 physical,
             )),
+            None,
         )
         .unwrap();
     let mut writer = executor

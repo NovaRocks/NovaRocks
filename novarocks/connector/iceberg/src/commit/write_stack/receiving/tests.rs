@@ -45,7 +45,7 @@ fn registration_and_arrival_are_atomic_for_sealed_target_subsets() {
     let mut proof = Some(received_write_proof(one, physical));
     assert_eq!(
         received
-            .begin_query(query, &[outside], &mut proof, &targets)
+            .begin_query(query, &[outside], &mut proof, &targets, None)
             .unwrap_err()
             .kind(),
         ConnectorErrorKind::InvalidRequest
@@ -53,7 +53,7 @@ fn registration_and_arrival_are_atomic_for_sealed_target_subsets() {
     assert!(received.is_unstarted());
     assert!(proof.is_some());
     received
-        .begin_query(query, &[one], &mut proof, &targets)
+        .begin_query(query, &[one], &mut proof, &targets, None)
         .unwrap();
     assert!(proof.is_none());
     let adapter = adapter("unit", 1);
@@ -100,10 +100,11 @@ fn same_target_queries_keep_separate_proofs_and_completion() {
             &[target],
             &mut Some(received_write_proof(target, writer1)),
             &sealed,
+            None,
         )
         .unwrap();
     received
-        .begin_query(query2, &[target], &mut None, &sealed)
+        .begin_query(query2, &[target], &mut None, &sealed, None)
         .unwrap();
     for (query, path) in [
         (query1, "s3://b/one.parquet"),
@@ -142,7 +143,7 @@ fn finish_and_exact_abort_refuse_unconfirmed_queries_without_consuming_receiving
     let commit = session.commit_session();
     let query = write_query_identity();
     lake.control
-        .begin_write_query(commit, &query, &session.expected_targets(), None)
+        .begin_write_query(commit, &query, &session.expected_targets(), None, None)
         .unwrap();
     let error = lake
         .control
@@ -183,7 +184,8 @@ fn finish_and_exact_abort_refuse_unconfirmed_queries_without_consuming_receiving
                 commit,
                 &write_query_identity(),
                 &session.expected_targets(),
-                None
+                None,
+                None,
             )
             .is_err()
     );
@@ -272,7 +274,7 @@ fn recipe_refusal_cleans_original_adopted_data_and_repeat_release_observes_it() 
     );
     let query = write_query_identity();
     lake.control
-        .begin_write_query(&commit, &query, &expected, None)
+        .begin_write_query(&commit, &query, &expected, None, None)
         .unwrap();
     lake.control
         .arrive_write_fragments(

@@ -2229,6 +2229,7 @@ mod tests {
                     dyn novarocks_spi::connector::write_stack::ConnectorWriteProductionProof,
                 >,
             >,
+            _: Option<&novarocks_spi::connector::read_stack::runtime::ConnectorRewrittenTargetFact>,
         ) -> Result<(), novarocks_spi::connector::ConnectorError> {
             Ok(())
         }
@@ -2553,6 +2554,10 @@ mod tests {
             calls: Arc::clone(&calls),
             finish_outcome: Mutex::new(Some(outcome)),
         });
+        let admission = novarocks_spi::connector::ConnectorProcessLocalPayload::new(
+            control.binding_key.clone(),
+            Arc::new(()),
+        );
         let lease = novarocks_catalog_application::test_support::write_stack_lease(
             novarocks_spi::connector::ConnectorControlRuntimeId::new(),
             novarocks_spi::connector::ConnectorControlWriteBinding::new(
@@ -2579,7 +2584,7 @@ mod tests {
                 },
                 base: None,
                 flavor:
-                    novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::RowMutation,
+                    novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::RowMutation { admission },
                 context: connector_context_for_test(),
             },
         )

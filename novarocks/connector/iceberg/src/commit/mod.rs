@@ -22,6 +22,11 @@
 
 mod action;
 pub(crate) mod attempt;
+#[allow(
+    dead_code,
+    reason = "The row-delta validator and dispatch integrate this contract in subsequent stages"
+)]
+pub(crate) mod conflict;
 mod data_file;
 pub mod data_writer;
 pub(crate) mod dependency;

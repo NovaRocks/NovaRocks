@@ -98,6 +98,7 @@ pub(super) fn bind_mutation_match_read(
 
     let schema = preparation.match_source_schema().clone();
     let snapshot = preparation.base_version_ordinal();
+    let preparation_digest = preparation.digest();
     let (columns, hidden) = match_source_columns(preparation, original)?;
     let key = QueryTableBindingKey::strict_base(&target.catalog, &target.namespace, &table);
     let (catalog, namespace) = (target.catalog.clone(), target.namespace.clone());
@@ -128,6 +129,7 @@ pub(super) fn bind_mutation_match_read(
                 admission: QueryTableBindingAdmission::RowMutationMatch(
                     planning_pin.clone(),
                     snapshot,
+                    preparation_digest,
                 ),
                 source_metadata: Some(original.clone()),
                 scan_materialization: Some(QueryScanMaterialization {

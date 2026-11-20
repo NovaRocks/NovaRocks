@@ -391,6 +391,7 @@ impl ConnectorWriteSession {
             &query,
             targets,
             None,
+            None,
         )?;
         Ok(query)
     }

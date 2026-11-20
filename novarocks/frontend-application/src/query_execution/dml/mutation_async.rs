@@ -197,7 +197,9 @@ impl PreparedMutationFacts {
                 mor_change_stream_input_request(self.columns(), self.signed()?.match_contract())?,
                 novarocks_spi::connector::ConnectorWriteAdmissionPurpose::OrdinaryDml,
                 Some(self.signed()?.base_version().clone()),
-                novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::RowMutation,
+                novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::RowMutation {
+                    admission: self.signed()?.admission(),
+                },
                 self.context().clone(),
             )?,
             receiving.as_ref(),

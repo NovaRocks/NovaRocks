@@ -618,6 +618,14 @@ impl ConnectorRowMutationPreparation {
         }
         Ok(())
     }
+    /// Hand the provider its original signed preparation at write-session admission.
+    pub fn admission(&self) -> super::write_stack::session::ConnectorRowMutationAdmission {
+        super::ConnectorProcessLocalPayload::new(
+            self.owner.clone(),
+            std::sync::Arc::new(self.clone()),
+        )
+    }
+
     pub fn owner(&self) -> &ConnectorProviderBindingKey {
         &self.owner
     }
