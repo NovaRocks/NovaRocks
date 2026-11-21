@@ -176,6 +176,40 @@ impl<'a> SnapshotSources<'a> {
         Ok(entries)
     }
 
+    /// Return the first candidate index that is live in this snapshot.
+    /// The caller retains a sorted, unique index and its original bytes.
+    /// Duplicate live copies are still evidence of a matching path.
+    pub(crate) async fn registered_path_match(
+        &self,
+        candidate_index: impl Fn(&str) -> Option<usize>,
+        io: &FileIO,
+        active: impl Fn() -> Result<()>,
+    ) -> Result<Option<usize>> {
+        let mut first_match = None;
+        self.fold(
+            io,
+            active,
+            |descriptor| descriptor.content == ManifestContentType::Data,
+            |entry| {
+                if entry.raw.is_alive()
+                    && let Some(index) = candidate_index(entry.raw.file_path())
+                {
+                    if entry.raw.content_type() != DataContentType::Data {
+                        return Err(Error::new(
+                            ErrorKind::DataInvalid,
+                            "Data manifest contains a non-data entry",
+                        ));
+                    }
+                    first_match =
+                        Some(first_match.map_or(index, |previous: usize| previous.min(index)));
+                }
+                Ok(())
+            },
+        )
+        .await?;
+        Ok(first_match)
+    }
+
     /// P lookup scans all data sources because paths have no partition
     /// constraint. Only facts for matching paths escape the source fold.
     pub(crate) async fn live_data_matches(
@@ -254,3 +288,6 @@ pub(crate) fn duplicate_identity(identity: &EntryIdentity) -> Error {
         format!("Duplicate live Iceberg entry identity: {identity:?}"),
     )
 }
+
+#[cfg(test)]
+mod tests;

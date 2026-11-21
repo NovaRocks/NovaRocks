@@ -85,6 +85,12 @@ impl AsyncFileBatchReader {
     pub fn reader_batch_rows(&self) -> Option<usize> {
         self.inner.reader_batch_rows()
     }
+
+    /// Decoder field layout before applying the request's root projection.
+    /// Absent when no rows were selected and no decoder was built.
+    pub fn decoder_file_schema(&self) -> Option<&arrow::datatypes::SchemaRef> {
+        self.inner.decoder_file_schema.as_ref()
+    }
 }
 
 pub use parquet::{

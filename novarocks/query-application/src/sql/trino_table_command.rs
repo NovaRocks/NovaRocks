@@ -37,7 +37,8 @@ use super::property_evaluation::{
     evaluate_ddl_properties, statement_property_assignments,
 };
 use super::table_procedure::{
-    BoundTableProcedure, TableProcedureInputArgument, bind_arguments, resolve_table_procedure,
+    BoundTableProcedure, TableProcedureBindingSource, TableProcedureInputArgument, bind_arguments,
+    resolve_table_procedure,
 };
 use super::trino_admission::unsupported_statement;
 use super::{lower_command_literal, lower_object_name, lower_sql_type};
@@ -428,10 +429,12 @@ pub fn bind_trino_table_execute<'a>(
     bind_arguments(
         procedure,
         &arguments,
-        source,
-        statement.span,
+        TableProcedureBindingSource {
+            sql: source,
+            catalog,
+            statement_span: statement.span,
+        },
         constants,
-        catalog,
         control,
     )
 }

@@ -672,6 +672,7 @@ pub fn step_has_implicit_skip_result(step: &SqlStep) -> bool {
     use novarocks_parser::ast::TrinoStatement::*;
     match novarocks_parser::parser::parse_statement(statement) {
         Ok(TableExecute(value)) => ![
+            "add_files",
             "optimize",
             "optimize_manifests",
             "expire_snapshots",
@@ -907,6 +908,7 @@ mod implicit_skip_result_tests {
             "ALTER TABLE t EXECUTE OPTIMIZE_MANIFESTS;",
             "SET SESSION iceberg.expire_snapshots_min_retention = '0s'; ALTER TABLE t EXECUTE expire_snapshots(retention_threshold => '0s');",
             "ALTER TABLE iceberg.db.t EXECUTE remove_orphan_files;",
+            "ALTER TABLE t EXECUTE ADD_FILES(location => 's3://bucket/source', format => 'PARQUET');",
             "USE x; ALTER TABLE \"qualified\".\"table\" EXECUTE optimize;",
         ] {
             let step = step(sql);

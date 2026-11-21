@@ -22,10 +22,14 @@ use crate::commit::manifest_encoding::{
 use crate::commit::model::{
     AddedContent, ArtifactKind, ArtifactWriter, FrozenEntry, ObjectIdentity,
 };
-use crate::iceberg::Result;
+use crate::commit::new_manifests::decoded_file_clone_bytes;
 use crate::iceberg::spec::{
     DataFile, FormatVersion, Literal, ManifestContentType, ManifestFile, ManifestListWriter,
     ManifestWriterBuilder, PartitionSpec, PrimitiveLiteral, SchemaRef, TableMetadata,
+};
+use crate::iceberg::{Error, ErrorKind, Result};
+use novarocks_spi::connector::{
+    ConnectorError, ConnectorErrorKind, ConnectorPayloadRetentionGuard,
 };
 
 pub enum ManifestEntryWrite {
@@ -101,6 +105,8 @@ pub(crate) async fn write_sourced_manifest(
 ) -> Result<ManifestFile> {
     let encoding =
         ManifestWriteEncoding::choose(metadata, spec, &entries, || artifacts.check_active())?;
+    let _normalization_backing =
+        retain_registered_normalization(artifacts, snapshot_id, &encoding, &entries)?;
     let entries = entries
         .into_iter()
         .map(|entry| encoding.encode(entry.entry, Some(&entry.source)));
@@ -114,6 +120,43 @@ pub(crate) async fn write_sourced_manifest(
         replaces,
     )
     .await
+}
+
+fn retain_registered_normalization(
+    artifacts: &dyn ArtifactWriter,
+    snapshot: i64,
+    encoding: &ManifestWriteEncoding,
+    entries: &[SourcedManifestEntry],
+) -> Result<Option<ConnectorPayloadRetentionGuard>> {
+    let Some(source) = artifacts.registered_manifest_paths(snapshot)? else {
+        return Ok(None);
+    };
+    // The encoded output may overlap the original DataFile when the selected
+    // header normalizes DATE bounds on an evolved V3 table. The original merge
+    // receipt covers its own copy; pay the second owned backing before encode.
+    let bytes = entries.iter().try_fold(0usize, |bytes, entry| {
+        let ManifestEntryWrite::Added(added) = &entry.entry else {
+            return Ok(bytes);
+        };
+        let file = added.file();
+        if source.index(file.file_path()).is_none() || !encoding.normalizes_bounds(file) {
+            return Ok(bytes);
+        }
+        let copy_bytes = decoded_file_clone_bytes(file)?;
+        bytes.checked_add(copy_bytes).ok_or_else(|| {
+            let error = ConnectorError::new(
+                ConnectorErrorKind::ResourceExhausted,
+                "Iceberg registered bounds normalization extent overflow",
+            );
+            Error::new(ErrorKind::Unexpected, error.message()).with_source(error)
+        })
+    })?;
+    if bytes == 0 {
+        return Ok(None);
+    }
+    source
+        .reserve(bytes, "Iceberg registered bounds normalization")
+        .map(Some)
 }
 
 /// Buffer one data-manifest lane until its estimated Avro length reaches the
@@ -233,6 +276,7 @@ pub(super) async fn write_encoded_manifest(
         (FormatVersion::V3, ManifestContentType::Data) => builder.build_v3_data(),
         (FormatVersion::V3, ManifestContentType::Deletes) => builder.build_v3_deletes(),
     };
+    let mut registered = artifacts.observe_registered_manifest(snapshot_id, replaces)?;
     let mut added_paths = Vec::new();
     let mut existing_paths = Vec::new();
     for entry in entries {
@@ -242,11 +286,17 @@ pub(super) async fn write_encoded_manifest(
                 file,
                 data_sequence,
             } => {
-                added_paths.push(file.file_path().to_owned());
+                if let Some(observation) = &mut registered {
+                    observation.push_added(file.file_path())?;
+                } else {
+                    added_paths.push(file.file_path().to_owned());
+                }
                 writer.add_file(file, data_sequence.manifest_writer_value())?;
             }
             EncodedManifestEntry::Existing { file, facts } => {
-                existing_paths.push(file.file_path().to_owned());
+                if registered.is_none() {
+                    existing_paths.push(file.file_path().to_owned());
+                }
                 writer.add_existing_file(
                     file,
                     facts
@@ -270,7 +320,12 @@ pub(super) async fn write_encoded_manifest(
         }
     }
     let descriptor = writer.write_manifest_file().await?;
-    artifacts.record_manifest(&object, &added_paths, &existing_paths, replaces)?;
+    match registered {
+        Some(observation) => {
+            artifacts.record_registered_manifest(&object, observation, replaces)?
+        }
+        None => artifacts.record_manifest(&object, &added_paths, &existing_paths, replaces)?,
+    }
     Ok(descriptor)
 }
 

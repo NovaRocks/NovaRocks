@@ -17,107 +17,207 @@
 
 -- @order_sensitive=true
 -- @sequential=true
--- ADD FILES is an FE-only data mutation. Spark writes a plain Parquet file
--- with no embedded Iceberg field IDs, reordered columns and legacy names.
+-- Spark copies field-ID-bearing data to fixed source keys. ADD FILES owns
+-- its registered paths after commit and the independent targets never share paths.
 
 -- query 1
--- @result_contains=SPARK_SQL_OK
+-- @result_contains=RWM17C_REST_SOURCE_READY
 shell: set -eu
-tmp_sql="$(mktemp "${TMPDIR:-/tmp}/novarocks-c2-add-files-XXXXXX.sql")"
-trap 'rm -f "$tmp_sql"' EXIT
-raw_parquet_warehouse='${iceberg_test_warehouse}'
-case "$raw_parquet_warehouse" in
-  s3://*) raw_parquet_warehouse="s3a://${raw_parquet_warehouse#s3://}" ;;
-esac
-cat > "$tmp_sql" <<SPARK_SQL
-CREATE NAMESPACE IF NOT EXISTS ice_rest.${case_db};
-
-DROP TABLE IF EXISTS ice_rest.${case_db}.c2_add_files_${uuid0};
-CREATE TABLE ice_rest.${case_db}.c2_add_files_${uuid0} (
-  new_id BIGINT,
-  new_note STRING
-) USING iceberg
-TBLPROPERTIES (
-  'format-version' = '3',
-  'write.row-lineage' = 'true',
-  'schema.name-mapping.default' = '[{"field-id":1,"names":["new_id","old_id"]},{"field-id":2,"names":["new_note","old_note"]}]'
-);
-
-INSERT OVERWRITE DIRECTORY '$raw_parquet_warehouse/c2-add-files-${uuid0}'
-USING parquet
-SELECT old_note, old_id
-FROM VALUES
-  ('alpha', CAST(11 AS BIGINT)),
-  ('beta', CAST(22 AS BIGINT))
-AS source(old_note, old_id);
-
-INSERT OVERWRITE DIRECTORY '$raw_parquet_warehouse/c2-add-files-no-mapping-${uuid0}'
-USING parquet
-SELECT old_note, old_id
-FROM VALUES
-  ('gamma', CAST(33 AS BIGINT))
-AS source(old_note, old_id);
-SPARK_SQL
-"${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-sql.sh" "$tmp_sql"
-printf 'SPARK_SQL_OK\n'
+workspace="${NOVAROCKS_WORKSPACE_ROOT:-.}"
+receipt_dir="$workspace/tests/sql/.runtime/iceberg-add-files/${uuid0}"
+mkdir -p "$receipt_dir"
+scala="$receipt_dir/prepareRest.scala"
+cat "$workspace/tests/sql/fixtures/iceberg-add-files/fixture.scala" > "$scala"
+cat >> "$scala" <<'SCALA'
+try {
+  IcebergAddFilesFixture.prepareRest(org.apache.spark.sql.SparkSession.active, "${case_db}", "${uuid0}", "${iceberg_test_warehouse}/rwm17c-rest-${uuid0}")
+} catch { case failure: Throwable => failure.printStackTrace(); System.exit(1) }
+SCALA
+if ! "$workspace/docker/iceberg-rest/spark-shell.sh" "$scala" > "$receipt_dir/prepareRest.log" 2>&1; then
+  tail -80 "$receipt_dir/prepareRest.log" >&2
+  exit 1
+fi
+if ! tr '\r' '\n' < "$receipt_dir/prepareRest.log" | grep -x 'RWM17C_REST_SOURCE_READY'; then
+  tail -80 "$receipt_dir/prepareRest.log" >&2
+  exit 1
+fi
 
 -- query 2
--- @skip_result_check=true
 -- @be_log_contains=NOVAROCKS_PARTICIPATION_ESTABLISH_APPLIED
 -- @be_log_contains=NOVAROCKS_TASK_CREATE_APPLIED
 -- @be_log_contains=NOVAROCKS_CONNECTOR_WRITER_OPENED
--- Prove the write markers before asserting ADD FILES stays frontend-only.
-CREATE TABLE iceberg_compat_${suite_uuid0}.${case_db}.add_files_write_control_${uuid0}
-  (id BIGINT) WITH (format_version = 2);
-INSERT INTO iceberg_compat_${suite_uuid0}.${case_db}.add_files_write_control_${uuid0}
-  VALUES ROW(1);
-DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.add_files_write_control_${uuid0} ;
+CREATE TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_write_control_${uuid0} (id BIGINT) WITH (format_version = 2);
+INSERT INTO iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_write_control_${uuid0} VALUES ROW(1);
+DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_write_control_${uuid0};
 
 -- query 3
--- @skip_result_check=true
+CREATE CATALOG IF NOT EXISTS "rwm17c_disabled_${uuid0}" USING iceberg WITH ("iceberg.catalog.type" = 'rest', "uri" = '${iceberg_rest_uri}', "warehouse" = '${iceberg_rest_warehouse}', "credential.object-store-metadata.consumer-role" = 'frontend', "credential.object-store-metadata.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-metadata.name" = '${iceberg_object_store_metadata_credential_name}', "credential.object-store-metadata.generation" = '${iceberg_object_store_credential_generation}', "credential.object-store-data.consumer-role" = 'backend', "credential.object-store-data.mode" = '${iceberg_object_store_credential_mode}', "credential.object-store-data.name" = '${iceberg_object_store_data_credential_name}', "credential.object-store-data.generation" = '${iceberg_object_store_credential_generation}', "aws.s3.endpoint" = '${oss_endpoint}', "aws.s3.region" = '${oss_region}', "aws.s3.enable_path_style_access" = '${oss_path_style}');
+
+-- query 4
+-- @expect_trino_error=PERMISSION_DENIED,USER_ERROR
+ALTER TABLE rwm17c_disabled_${uuid0}.${case_db}.rwm17c_main_${uuid0} EXECUTE add_files();
+
+-- query 5
+-- @expect_trino_error=INVALID_PROCEDURE_ARGUMENT,USER_ERROR
+ALTER TABLE rwm17c_disabled_${uuid0}.${case_db}.rwm17c_main_${uuid0} EXECUTE add_files(location => '${iceberg_test_warehouse}/rwm17c-rest-${uuid0}/flat/', format => 'TEXTFILE');
+
+-- query 6
+DROP CATALOG rwm17c_disabled_${uuid0};
+
+-- query 7
+-- @expect_trino_error=INVALID_PROCEDURE_ARGUMENT,USER_ERROR
+ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_main_${uuid0} EXECUTE add_files();
+
+-- query 8
+-- @expect_trino_error=INVALID_PROCEDURE_ARGUMENT,USER_ERROR
+ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_main_${uuid0} EXECUTE add_files(location => '${iceberg_test_warehouse}/rwm17c-rest-${uuid0}/does-not-exist');
+
+-- query 9
+-- @expect_trino_error=INVALID_PROCEDURE_ARGUMENT,USER_ERROR
+ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_main_${uuid0} EXECUTE add_files(location => '${iceberg_test_warehouse}/rwm17c-rest-${uuid0}/flat', format => 'argl');
+
+-- query 10
+-- @expect_trino_error=INVALID_PROCEDURE_ARGUMENT,USER_ERROR
+ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_main_${uuid0} EXECUTE add_files(location => '${iceberg_test_warehouse}/rwm17c-rest-${uuid0}/flat', format => 'TEXTFILE');
+
+-- query 11
+-- @expect_trino_error=INVALID_PROCEDURE_ARGUMENT,USER_ERROR
+ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_main_${uuid0} EXECUTE add_files(location => '${iceberg_test_warehouse}/rwm17c-rest-${uuid0}/flat', format => 'PARQUET', recursive_directory => 'invalid');
+
+-- query 12
+-- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_main_${uuid0} EXECUTE add_files(location => '${iceberg_test_warehouse}/rwm17c-rest-${uuid0}/does-not-exist', format => 'ORC');
+
+-- query 13
+-- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_main_${uuid0} EXECUTE add_files(location => '${iceberg_test_warehouse}/rwm17c-rest-${uuid0}/does-not-exist', format => 'AVRO');
+
+-- query 14
+CREATE TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_partitioned_${uuid0} (id BIGINT, note VARCHAR) WITH (format_version = 2, partitioning = ARRAY['id']);
+CREATE TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_single_${uuid0} (id BIGINT, note VARCHAR) WITH (format_version = 2);
+CREATE TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_include_${uuid0} (id BIGINT, note VARCHAR) WITH (format_version = 2);
+CREATE TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_skip_${uuid0} (id BIGINT, note VARCHAR) WITH (format_version = 2);
+CREATE TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_fail_${uuid0} (id BIGINT, note VARCHAR) WITH (format_version = 2);
+CREATE TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_bad_${uuid0} (id BIGINT, note VARCHAR) WITH (format_version = 2);
+CREATE TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_mixed_${uuid0} (id BIGINT, note VARCHAR) WITH (format_version = 2);
+CREATE TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_empty_${uuid0} (id BIGINT, note VARCHAR) WITH (format_version = 2);
+CREATE TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_not_null_${uuid0} (id BIGINT NOT NULL, note VARCHAR) WITH (format_version = 2);
+CREATE TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_missing_column_${uuid0} (id BIGINT, note VARCHAR, required_col BIGINT NOT NULL) WITH (format_version = 2);
+CREATE TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_incompatible_${uuid0} (id VARCHAR, note VARCHAR) WITH (format_version = 2);
+CREATE TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_v1_${uuid0} (id BIGINT, note VARCHAR) WITH (format_version = 1);
+
+-- query 15
+-- @expect_trino_error=INVALID_PROCEDURE_ARGUMENT,USER_ERROR
+ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_partitioned_${uuid0} EXECUTE add_files(location => '${iceberg_test_warehouse}/rwm17c-rest-${uuid0}/flat', format => 'PARQUET');
+
+-- query 16
+-- @expect_trino_error=NOT_FOUND,USER_ERROR
+ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_main_${uuid0} EXECUTE add_files(location => '${iceberg_test_warehouse}/rwm17c-rest-${uuid0}/does-not-exist', format => 'PARQUET');
+
+-- query 17
+-- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_main_${uuid0} EXECUTE add_files(location => '${iceberg_test_warehouse}/rwm17c-rest-${uuid0}/no-id', format => 'PARQUET');
+
+-- query 18
 -- @be_log_not_contains=NOVAROCKS_PARTICIPATION_ESTABLISH_APPLIED
 -- @be_log_not_contains=NOVAROCKS_TASK_CREATE_APPLIED
 -- @be_log_not_contains=NOVAROCKS_CONNECTOR_WRITER_OPENED
-ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.c2_add_files_${uuid0} EXECUTE add_files(location => '${iceberg_test_warehouse}/c2-add-files-${uuid0}');
+ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_main_${uuid0} EXECUTE add_files(location => '${iceberg_test_warehouse}/rwm17c-rest-${uuid0}/flat/', format => 'PARQUET');
 
--- query 4
-SELECT new_id, new_note
-FROM iceberg_compat_${suite_uuid0}.${case_db}.c2_add_files_${uuid0}
-ORDER BY new_id;
+-- query 19
+SELECT id, note FROM iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_main_${uuid0} ORDER BY id, note;
 
--- query 5
--- A second statement reaches the refreshed target base and is rejected by the
--- RegisteredFilesNotLive dependency against the exact target-ref live set;
--- no frontend source-scope ledger is a correctness authority.
--- @expect_error=Broken { dependency: RegisteredFilesNotLive
-ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.c2_add_files_${uuid0} EXECUTE add_files(location => '${iceberg_test_warehouse}/c2-add-files-${uuid0}');
+-- query 20
+-- @expect_trino_error=ICEBERG_COMMIT_ERROR,EXTERNAL
+ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_main_${uuid0} EXECUTE add_files(location => '${iceberg_test_warehouse}/rwm17c-rest-${uuid0}/flat', format => 'PARQUET');
 
--- query 6
--- @skip_result_check=true
-CREATE TABLE iceberg_compat_${suite_uuid0}.${case_db}.c2_add_files_partitioned_${uuid0}
-  (id BIGINT) WITH (partitioning = ARRAY['id'], format_version = 2);
+-- query 21
+ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_single_${uuid0} EXECUTE add_files(location => '${iceberg_test_warehouse}/rwm17c-rest-${uuid0}/single/_one.parquet', format => 'PARQUET');
 
--- query 7
--- @expect_error=unpartitioned
-ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.c2_add_files_partitioned_${uuid0} EXECUTE add_files(location => '${iceberg_test_warehouse}/c2-add-files-${uuid0}');
+-- query 22
+SELECT id, note FROM iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_single_${uuid0} ORDER BY id, note;
 
--- query 8
--- @skip_result_check=true
-CREATE TABLE iceberg_compat_${suite_uuid0}.${case_db}.c2_add_files_no_mapping_${uuid0}
-  (new_id BIGINT, new_note VARCHAR) WITH (format_version = 2);
+-- query 23
+ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_include_${uuid0} EXECUTE add_files(location => '${iceberg_test_warehouse}/rwm17c-rest-${uuid0}/include/', format => 'PARQUET', recursive_directory => 'TRUE');
 
--- query 9
--- @expect_error=schema.name-mapping.default
-ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.c2_add_files_no_mapping_${uuid0} EXECUTE add_files(location => '${iceberg_test_warehouse}/c2-add-files-no-mapping-${uuid0}');
+-- query 24
+SELECT id, note FROM iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_include_${uuid0} ORDER BY id, note;
 
--- query 10
--- @skip_result_check=true
-DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.c2_add_files_${uuid0} ;
+-- query 25
+ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_skip_${uuid0} EXECUTE add_files(location => '${iceberg_test_warehouse}/rwm17c-rest-${uuid0}/skip/', format => 'PARQUET', recursive_directory => 'FALSE');
 
--- query 11
--- @skip_result_check=true
-DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.c2_add_files_partitioned_${uuid0} ;
+-- query 26
+SELECT id, note FROM iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_skip_${uuid0} ORDER BY id, note;
 
--- query 12
--- @skip_result_check=true
-DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.c2_add_files_no_mapping_${uuid0} ;
+-- query 27
+-- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_fail_${uuid0} EXECUTE add_files(location => '${iceberg_test_warehouse}/rwm17c-rest-${uuid0}/fail/', format => 'PARQUET', recursive_directory => 'FAIL');
+
+-- query 28
+-- @expect_trino_error=ICEBERG_COMMIT_ERROR,EXTERNAL
+ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_mixed_${uuid0} EXECUTE add_files(location => '${iceberg_test_warehouse}/rwm17c-rest-${uuid0}/mixed/', format => 'PARQUET', recursive_directory => 'FAIL');
+
+-- query 29
+-- @expect_trino_error=ICEBERG_COMMIT_ERROR,EXTERNAL
+ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_bad_${uuid0} EXECUTE add_files(location => '${iceberg_test_warehouse}/rwm17c-rest-${uuid0}/bad', format => 'PARQUET');
+
+-- query 30
+-- @expect_trino_error=CONSTRAINT_VIOLATION,USER_ERROR
+ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_not_null_${uuid0} EXECUTE add_files(location => '${iceberg_test_warehouse}/rwm17c-rest-${uuid0}/nullable', format => 'PARQUET');
+
+-- query 31
+-- @expect_trino_error=CONSTRAINT_VIOLATION,USER_ERROR
+ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_missing_column_${uuid0} EXECUTE add_files(location => '${iceberg_test_warehouse}/rwm17c-rest-${uuid0}/missing-column', format => 'PARQUET');
+
+-- query 32
+-- @expect_trino_error=TYPE_MISMATCH,USER_ERROR
+ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_incompatible_${uuid0} EXECUTE add_files(location => '${iceberg_test_warehouse}/rwm17c-rest-${uuid0}/incompatible', format => 'PARQUET');
+
+-- query 33
+ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_empty_${uuid0} EXECUTE add_files(location => '${iceberg_test_warehouse}/rwm17c-rest-${uuid0}/empty/', format => 'PARQUET');
+
+-- query 34
+ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_v1_${uuid0} EXECUTE add_files(location => '${iceberg_test_warehouse}/rwm17c-rest-${uuid0}/v1', format => 'PARQUET');
+
+-- query 35
+SELECT id, note FROM iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_v1_${uuid0} ORDER BY id, note;
+
+-- query 36
+SELECT (SELECT count(*) FROM iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_fail_${uuid0}) AS fail_rows, (SELECT count(*) FROM iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_mixed_${uuid0}) AS mixed_rows, (SELECT count(*) FROM iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_bad_${uuid0}) AS bad_rows, (SELECT count(*) FROM iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_not_null_${uuid0}) AS null_rows, (SELECT count(*) FROM iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_missing_column_${uuid0}) AS missing_rows, (SELECT count(*) FROM iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_incompatible_${uuid0}) AS incompatible_rows;
+
+-- query 37
+-- @result_contains=RWM17C_REST_MAPPING_AND_EMPTY_APPEND_VERIFIED
+shell: set -eu
+workspace="${NOVAROCKS_WORKSPACE_ROOT:-.}"
+receipt_dir="$workspace/tests/sql/.runtime/iceberg-add-files/${uuid0}"
+mkdir -p "$receipt_dir"
+scala="$receipt_dir/observeRest.scala"
+cat "$workspace/tests/sql/fixtures/iceberg-add-files/fixture.scala" > "$scala"
+cat >> "$scala" <<'SCALA'
+try {
+  IcebergAddFilesFixture.observeRest(org.apache.spark.sql.SparkSession.active, "${case_db}", "${uuid0}")
+} catch { case failure: Throwable => failure.printStackTrace(); System.exit(1) }
+SCALA
+if ! "$workspace/docker/iceberg-rest/spark-shell.sh" "$scala" > "$receipt_dir/observeRest.log" 2>&1; then
+  tail -80 "$receipt_dir/observeRest.log" >&2
+  exit 1
+fi
+if ! tr '\r' '\n' < "$receipt_dir/observeRest.log" | grep -x 'RWM17C_REST_MAPPING_AND_EMPTY_APPEND_VERIFIED'; then
+  tail -80 "$receipt_dir/observeRest.log" >&2
+  exit 1
+fi
+
+-- query 38
+DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_main_${uuid0};
+DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_partitioned_${uuid0};
+DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_single_${uuid0};
+DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_include_${uuid0};
+DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_skip_${uuid0};
+DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_fail_${uuid0};
+DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_bad_${uuid0};
+DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_mixed_${uuid0};
+DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_empty_${uuid0};
+DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_not_null_${uuid0};
+DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_missing_column_${uuid0};
+DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_incompatible_${uuid0};
+DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.rwm17c_v1_${uuid0};

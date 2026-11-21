@@ -194,6 +194,7 @@ impl ParquetColumnStatistics {
 pub struct ParquetMetadataInspection {
     footer: Arc<ArrowReaderMetadata>,
     policy: ParquetInterpretationPolicy,
+    storage_bytes_read: u64,
     access_domain: StorageAccessDomainId,
     identity: FileIdentity,
     /// The footer with its page indexes, loaded once for every reader of this
@@ -216,6 +217,12 @@ impl ParquetMetadataInspection {
     /// key/value pairs. Arrow hints never rewrite these file facts.
     pub fn raw_metadata(&self) -> &Arc<ParquetMetaData> {
         self.footer.metadata()
+    }
+
+    /// Storage bytes fetched by this footer inspection, including a small-file
+    /// file buffer when the shared range reader used one.
+    pub fn storage_bytes_read(&self) -> u64 {
+        self.storage_bytes_read
     }
 
     pub fn access_domain(&self) -> StorageAccessDomainId {
@@ -1036,6 +1043,7 @@ fn finish_inspection(
     Ok(ParquetMetadataInspection {
         footer: Arc::new(metadata),
         policy,
+        storage_bytes_read: chunk_reader.storage_bytes_read(),
         access_domain,
         identity,
         indexed_footer: Arc::default(),
@@ -1049,6 +1057,7 @@ fn finish_inspection(
 
 pub(crate) struct ParquetPhysicalReader {
     decoder: Option<ParquetPushDecoder>,
+    pub(super) decoder_file_schema: Option<SchemaRef>,
     batch_rows: Option<usize>,
     chunk_reader: BoundChunkReader,
     options: FileReaderOptions,
@@ -1199,8 +1208,8 @@ impl ReaderOpen {
             .map(|span| span.row_group)
             .collect::<Vec<_>>();
         active_groups.dedup();
-        let (decoder, batch_rows) = if active_groups.is_empty() {
-            (None, None)
+        let (decoder, decoder_file_schema, batch_rows) = if active_groups.is_empty() {
+            (None, None, None)
         } else {
             // The physical range owns column representation. Individual
             // decoder runs may prune different groups from that same range.
@@ -1229,6 +1238,7 @@ impl ReaderOpen {
                     "Parquet file declares no rows for a nonempty selection",
                 ));
             }
+            let decoder_file_schema = Arc::clone(arrow_metadata.schema());
             let decoder = build_projected_reader(
                 arrow_metadata,
                 &projected_roots,
@@ -1236,12 +1246,13 @@ impl ReaderOpen {
                 &row_groups,
                 selection,
             )?;
-            (Some(decoder), Some(batch_rows))
+            (Some(decoder), Some(decoder_file_schema), Some(batch_rows))
         };
 
         Ok(ParquetPhysicalReader {
             closed: decoder.is_none(),
             decoder,
+            decoder_file_schema,
             batch_rows,
             chunk_reader: self.chunk_reader,
             options: request.options,

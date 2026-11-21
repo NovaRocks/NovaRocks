@@ -27,13 +27,11 @@ use crate::catalog_config::IcebergCatalogConfiguration;
 use crate::loaded_table::IcebergPhysicalTableCache;
 use crate::manifest::DataFileWithStats;
 
-#[path = "catalog_control/add_files.rs"]
 pub(crate) mod add_files;
 #[path = "catalog_control/catalog_mutation.rs"]
 pub mod catalog_mutation;
 #[path = "catalog_control/cleanup_maintenance.rs"]
 pub mod cleanup_maintenance;
-#[path = "catalog_control/data_mutation.rs"]
 pub mod data_mutation;
 pub mod drop_cleanup;
 #[path = "catalog_control/maintenance_admission.rs"]
@@ -230,6 +228,7 @@ mod tests {
             warehouse_path: PathBuf::from("/tmp/warehouse"),
             write: Default::default(),
             read: Default::default(),
+            add_files_enabled: false,
             maintenance: Default::default(),
         });
 
@@ -256,6 +255,7 @@ mod tests {
                 warehouse_path: PathBuf::from("/tmp/warehouse"),
                 write: Default::default(),
                 read: Default::default(),
+                add_files_enabled: false,
                 maintenance: Default::default(),
             })
         };

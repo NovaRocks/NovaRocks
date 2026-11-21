@@ -1,5 +1,5 @@
 ---
-id: ADR-0247
+id: ADR-0248
 title: "Parquet reader sizing and scan output shaping have distinct owners"
 domain: [provider-spi, pipeline-execution]
 status: active
@@ -13,7 +13,7 @@ related:
   - "ADR-0159-driver-polled-connector-scan-streams.md"
   - "ADR-0195-public-value-access-and-construction.md"
   - "ADR-0222-session-property-declarations-and-required-constant-evaluation.md"
-  - "ADR-0246-footer-derived-parquet-reader-representation.md"
+  - "ADR-0247-footer-derived-parquet-reader-representation.md"
 code-anchors:
   - "novarocks-server/library/src/provider_manifest.rs (IcebergSessionProperties)"
   - "novarocks/connector/iceberg/src/typed_boundary.rs (freeze_read_execution)"
@@ -51,7 +51,7 @@ Iceberg 的 catalog 键为 `parquet.max-read-block-row-count` 和 `parquet.max-r
 ## 裁决
 
 1. **按准确语句冻结读设置。** 普通与已准备读源汇合后经同一 Provider 入口撰写执行设置。保留原表、快照和选集身份。BE 消费已校验私有载荷。全局扫描预算、通用 `QueryOptions.batch_size` 及重复的计划批限制退役。
-2. **在打开时估算解码粒度。** 有正的行宽估计时，取 `min(max_read_rows, max(1, floor(max_read_bytes / estimated_row_bytes)))`，实际计算保留整数单位。零宽或未知取行数上限。按实际解码表示计量固定宽度、字典键、view 描述符和可用的 backing 估计。数据文件采用 [ADR-0246](ADR-0246-footer-derived-parquet-reader-representation.md) 的解释。FS 返回实际 decoder 批。此规则和下一条替代 [ADR-0014](ADR-0014-connector-neutral-file-foundation.md) 中 FS 拥有最终批预算的安排。
+2. **在打开时估算解码粒度。** 有正的行宽估计时，取 `min(max_read_rows, max(1, floor(max_read_bytes / estimated_row_bytes)))`，实际计算保留整数单位。零宽或未知取行数上限。按实际解码表示计量固定宽度、字典键、view 描述符和可用的 backing 估计。数据文件采用 [ADR-0247](ADR-0247-footer-derived-parquet-reader-representation.md) 的解释。FS 返回实际 decoder 批，并公开由当前 reader 确定的文件 schema。Iceberg 先按标准 footer 确定读取列，打开后按实际 decoder schema 核对投影，再按字段 ID 绑定子字段和字节载体。ADD FILES 沿同一字段绑定的标准物理解释核对登记输入。此规则和下一条替代 [ADR-0014](ADR-0014-connector-neutral-file-foundation.md) 中 FS 拥有最终批预算的安排。
 3. **先确定最终列与行域，再提交共同前缀。** 选择、NULL、绝对位置、补列和 change-window 符号参与同一次计划。对准确源范围借用合法存储，或按所得前缀构造一次。第一行可表示且超过软目标时单独交付。真实表示边界限制可交付前缀。分区常量、rewrite-position、metadata 与零列输出也推进各自的实际行域。sequence、表函数及 FE 系统关系按引擎行数政策组批。
 4. **共享来源责任按真实别名续接。** 一次转入共享 hold 的原 reservation 随未消费源与实际引用它的输出续接。独立的新输出有自己的责任。完整复制且已切断源引用时即可释放该输出的源持有。SourcePage、Chunk 及其派生存储保留原 holder。仅独占且确已释放的存储适用原缩减协议。分批字节量也不进入真实容量结算。
 5. **在外层安全点合作。** Driver 将实际轮次预算绑定到活动读源，预备状态独立保管。拉取、空批、过滤为空、切换 split 与下一次完整前缀之间在可控制外层合作让出。一次同步前缀计划及实际构造可在同一个获准单位内完成，内部观察真实取消与期限。真实退出由原 I/O、source 和 Driver 工作的看管者观察。

@@ -49,9 +49,9 @@ MERGE INTO iceberg_compat_${suite_uuid0}.${case_db}.java_variant_rejected_${uuid
 ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_variant_rejected_${uuid0} EXECUTE optimize;
 
 -- query 6
--- @expect_error_tier=drift
--- @expect_error=Iceberg Variant writes are not supported
-ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_variant_rejected_${uuid0} EXECUTE add_files(location => 's3://warehouse/iru9-does-not-exist-${uuid0}');
+-- ADD FILES checks the target format version before inspecting the source or the schema.
+-- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
+ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_variant_rejected_${uuid0} EXECUTE add_files(location => 's3://warehouse/iru9-does-not-exist-${uuid0}', format => 'PARQUET');
 
 -- query 7
 -- The ordinary id column has no Variant semantics. REST staging admission

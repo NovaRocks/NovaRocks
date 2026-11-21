@@ -138,18 +138,13 @@ pub use credential_lease::{
 };
 pub use data_mutation::{
     CONNECTOR_DATA_MUTATION_CONTRACT_VERSION, CONNECTOR_DATA_MUTATION_DURABLE_WIRE_VERSION,
-    ConnectorDataMutation, ConnectorDataMutationAddFilesDomain,
+    ConnectorAddFilesFormat, ConnectorAddFilesRecursion, ConnectorDataMutation,
     ConnectorDataMutationExecuteRequest, ConnectorDataMutationOperation, ConnectorDataMutationPlan,
     ConnectorDataMutationPlanSummary, ConnectorDataMutationPlanningRequest,
     ConnectorDataMutationReceipt, ConnectorDataMutationReconcileRequest,
-    ConnectorDataMutationResolver, ConnectorDataMutationSession, ConnectorDataMutationSourceDomain,
-    ConnectorDataMutationSourceScope, ConnectorDataMutationSourceScopeKind,
-    MAX_CONNECTOR_DATA_MUTATION_FILE_LOCATION_BYTES, MAX_CONNECTOR_DATA_MUTATION_FILES,
-    MAX_CONNECTOR_DATA_MUTATION_PARQUET_FOOTER_BYTES,
+    ConnectorDataMutationResolver, ConnectorDataMutationSession,
     MAX_CONNECTOR_DATA_MUTATION_PROVIDER_PAYLOAD_BYTES,
-    MAX_CONNECTOR_DATA_MUTATION_SOURCE_LOCATION_BYTES,
-    MAX_CONNECTOR_DATA_MUTATION_TARGET_REF_BYTES, MAX_CONNECTOR_DATA_MUTATION_TOTAL_FOOTER_BYTES,
-    REGISTER_EXISTING_FILES_KIND, TRUNCATE_KIND,
+    MAX_CONNECTOR_DATA_MUTATION_TARGET_REF_BYTES, REGISTER_EXISTING_FILES_KIND, TRUNCATE_KIND,
 };
 pub use distributed_rewrite::{
     CONNECTOR_DISTRIBUTED_REWRITE_CONTRACT_VERSION, ConnectorDistributedRewrite,

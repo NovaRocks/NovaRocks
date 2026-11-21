@@ -15,7 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::alloc::Layout;
 use std::sync::Arc;
+
+use novarocks_spi::connector::{
+    ConnectorError, ConnectorErrorKind, ConnectorPayloadRetentionGuard,
+};
 
 use crate::iceberg::spec::{FormatVersion, ManifestFile, ManifestStatus, TableMetadata};
 use crate::iceberg::{Error, ErrorKind, Result};
@@ -24,6 +29,7 @@ use crate::manifest::source::{BindingOrigin, ManifestSource};
 
 use super::manifest_encoding::{ManifestWriteSource, SourcedManifestEntry};
 use super::model::{AddedContent, ArtifactWriter, FrozenEntry};
+use super::new_manifests::{RegisteredPaths, decoded_file_clone_bytes};
 use super::preparation::PreparationContext;
 use super::staging::{ManifestEntryWrite, write_sourced_manifest};
 
@@ -156,10 +162,14 @@ async fn merge_bin(
         .iter()
         .map(|candidate| candidate.descriptor.manifest_path.clone())
         .collect::<Vec<_>>();
+    let mut backing = artifacts
+        .registered_manifest_paths(snapshot_id)?
+        .map(RegisteredMergeBacking::new);
     let mut entries = Vec::new();
     for candidate in bin {
         artifacts.check_active()?;
         let source = candidate.source(snapshot_id);
+        let registered_input = source.origin.is_pending();
         let cached = scope.and_then(|scope| scope.cached_source(source));
         let loaded;
         let retained;
@@ -179,6 +189,9 @@ async fn merge_bin(
                 }
             }
         };
+        if let Some(backing) = &mut backing {
+            backing.reserve_slots(&mut entries, raw.entries().len())?;
+        }
         let encoding_source = Arc::new(ManifestWriteSource::from_header(raw.metadata())?);
         let fresh = if cached.is_none() {
             Some(source.bind(raw)?)
@@ -191,7 +204,13 @@ async fn merge_bin(
             .chain(fresh.into_iter().flatten());
         for bound in entries_for_source {
             artifacts.check_active()?;
-            if let Some(entry) = merged_entry(bound?, raw.metadata().format_version, snapshot_id)? {
+            let bound = bound?;
+            if let Some(backing) = &mut backing
+                && registered_input
+            {
+                backing.retain_clone(&bound)?;
+            }
+            if let Some(entry) = merged_entry(bound, raw.metadata().format_version, snapshot_id)? {
                 entries.push(SourcedManifestEntry {
                     source: encoding_source.clone(),
                     entry,
@@ -209,6 +228,87 @@ async fn merge_bin(
         &replaces,
     )
     .await
+}
+
+/// Keep the original statement's payments through the actual encoded write.
+struct RegisteredMergeBacking {
+    paths: Arc<RegisteredPaths>,
+    file_copies: Vec<ConnectorPayloadRetentionGuard>,
+    slots: Option<ConnectorPayloadRetentionGuard>,
+}
+
+impl RegisteredMergeBacking {
+    fn new(paths: Arc<RegisteredPaths>) -> Self {
+        Self {
+            paths,
+            file_copies: Vec::new(),
+            slots: None,
+        }
+    }
+
+    fn reserve_slots(
+        &mut self,
+        entries: &mut Vec<SourcedManifestEntry>,
+        raw_entries: usize,
+    ) -> Result<()> {
+        let required = entries
+            .len()
+            .checked_add(raw_entries)
+            .ok_or_else(|| merge_backing_error("Registered manifest merge slot count overflow"))?;
+        if required <= entries.capacity() {
+            return Ok(());
+        }
+        let entries_bytes = Layout::array::<SourcedManifestEntry>(required)
+            .map_err(merge_backing_error)?
+            .size();
+        let receipts_bytes = Layout::array::<ConnectorPayloadRetentionGuard>(required)
+            .map_err(merge_backing_error)?
+            .size();
+        let total = entries_bytes
+            .checked_add(receipts_bytes)
+            .ok_or_else(|| merge_backing_error("Registered manifest merge slot extent overflow"))?;
+        let next = self
+            .paths
+            .reserve(total, "Iceberg registered manifest merge slots")?;
+        let prior = self.slots.replace(next);
+        entries
+            .try_reserve_exact(raw_entries)
+            .map_err(merge_backing_error)?;
+        self.file_copies
+            .try_reserve_exact(required - self.file_copies.len())
+            .map_err(merge_backing_error)?;
+        // Cover overlap until both of the old vector allocations have exited.
+        drop(prior);
+        Ok(())
+    }
+
+    fn retain_clone(&mut self, bound: &BoundEntry<'_>) -> Result<()> {
+        let file = bound.raw.data_file();
+        if bound.raw.status != ManifestStatus::Added || self.paths.index(file.file_path()).is_none()
+        {
+            return Err(invalid(
+                "Pending Iceberg manifest does not match its registered input",
+            ));
+        }
+        let bytes = decoded_file_clone_bytes(file)?;
+        self.file_copies.push(
+            self.paths
+                .reserve(bytes, "Iceberg registered manifest file copy")?,
+        );
+        Ok(())
+    }
+}
+
+fn merge_backing_error(error: impl std::fmt::Display) -> Error {
+    let message = error.to_string();
+    Error::new(
+        ErrorKind::Unexpected,
+        "Iceberg registered manifest merge allocation",
+    )
+    .with_source(ConnectorError::new(
+        ConnectorErrorKind::ResourceExhausted,
+        message,
+    ))
 }
 
 fn merged_entry(

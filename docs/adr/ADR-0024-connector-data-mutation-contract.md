@@ -5,12 +5,18 @@ domain: [provider-spi, frontend-dml]
 status: active
 supersedes: []
 superseded-by: null
+partially-superseded-by:
+  - id: ADR-0246
+    scope: "ADD FILES source manifest, field identity, fixed limits and re-planning per attempt"
+    link: "ADR-0246-iceberg-add-files-uses-read-binding-and-atomic-registration.md"
 date: 2026-08-01
 provenance:
   - "discussion: 2026-08-01 FE-only connector data mutation contract"
 code-anchors:
   - "novarocks/spi/src/connector/data_mutation.rs (ConnectorDataMutation)"
 ---
+
+> 本 ADR 的 ADD FILES 冻结清单、字段身份、私有固定额度及每轮重新规划由 [ADR-0246](ADR-0246-iceberg-add-files-uses-read-binding-and-atomic-registration.md) 接替。无 BE staging 的连接器边界、原提交结论和 TRUNCATE 契约继续有效。
 
 ## 问题
 

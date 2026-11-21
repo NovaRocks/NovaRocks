@@ -45,7 +45,7 @@ use std::sync::Arc;
 
 use crate::wire::dto;
 use novarocks_proto_codec::connector_read::{
-    MAX_DELETES_PER_SPLIT, MAX_JSON_BYTES, MAX_PATH_BYTES, MAX_SCAN_ASSIGNMENTS,
+    MAX_DELETES_PER_SPLIT, MAX_JSON_BYTES, MAX_SCAN_ASSIGNMENTS,
 };
 use novarocks_spi::connector::read_stack::{
     ConnectorSplit, ConnectorTableFunctionHandle, HostAddress, SchemaTableName, SplitWeight,
@@ -57,7 +57,11 @@ use novarocks_spi::connector::{
 use crate::iceberg::spec::{NestedField, PartitionSpec, PrimitiveType, Schema, Type};
 
 use super::column_handle::{IcebergColumnHandle, corrupt, invalid, unsupported};
-use super::split::{IcebergDeleteFile, IcebergFileFormat, IcebergSplit, ParquetFileDecryptionData};
+use super::split::{
+    IcebergDeleteFile, IcebergFileFormat, IcebergSplit, ParquetFileDecryptionData,
+    validate_data_file_path,
+};
+use super::table_handle::validate_name_mapping_carrier;
 
 /// The exact metadata columns Trino's `table_changes` appends.
 pub const TABLE_CHANGES_METADATA_COLUMNS: [&str; 4] = [
@@ -1243,12 +1247,8 @@ fn validate_change_columns(
             ));
         }
     }
-    if let Some(name_mapping_json) = name_mapping_json
-        && (name_mapping_json.is_empty() || name_mapping_json.len() > MAX_JSON_BYTES)
-    {
-        return Err(invalid(
-            "iceberg name mapping json must be non-empty and bounded when present",
-        ));
+    if let Some(name_mapping_json) = name_mapping_json {
+        validate_name_mapping_carrier(name_mapping_json)?;
     }
     Ok(())
 }
@@ -1262,11 +1262,7 @@ fn validate_data_file_range(
     file_format: IcebergFileFormat,
     partition_data_json: &str,
 ) -> Result<(), ConnectorError> {
-    if path.is_empty() || path.len() > MAX_PATH_BYTES {
-        return Err(invalid(
-            "iceberg change split path must be non-empty and bounded",
-        ));
-    }
+    validate_data_file_path(path)?;
     if file_format == IcebergFileFormat::Puffin {
         return Err(invalid(
             "an iceberg data file is never in the puffin delete-artifact format",

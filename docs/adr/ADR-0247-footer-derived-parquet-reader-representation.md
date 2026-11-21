@@ -1,5 +1,5 @@
 ---
-id: ADR-0246
+id: ADR-0247
 title: "Derive the Parquet decoder representation from the verified footer"
 domain: [provider-spi, low-cardinality]
 status: active
@@ -12,7 +12,7 @@ provenance:
 related:
   - "ADR-0005-low-cardinality-runtime-carrier-first.md"
   - "ADR-0195-public-value-access-and-construction.md"
-  - "ADR-0247-parquet-reader-sizing-and-scan-output-policy.md"
+  - "ADR-0248-parquet-reader-sizing-and-scan-output-policy.md"
 code-anchors:
   - "novarocks/fs/src/read.rs (ParquetInterpretationPolicy::cache_identity)"
   - "novarocks/fs/src/physical_reader/parquet/representation.rs (decoder_layout_and_rows, whole_chunk_dictionary)"

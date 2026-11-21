@@ -39,6 +39,7 @@ pub(crate) mod model;
 pub mod mv_publication_fence;
 pub mod mv_refresh_ref;
 mod new_manifests;
+pub(crate) use new_manifests::{RegisteredFile, RegisteredNewFiles, RegisteredPaths};
 pub(crate) mod operation;
 pub(crate) mod overwrite;
 mod overwrite_partitions;

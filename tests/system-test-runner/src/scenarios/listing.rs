@@ -480,7 +480,7 @@ impl std::error::Error for ListingClientPanic {}
 fn listing_catalog_sql(fixture: &ListingRestFixture, name: &str) -> String {
     let endpoint = fixture.endpoint().replace('\'', "''");
     format!(
-        "CREATE CATALOG {name} USING iceberg WITH (\"iceberg.catalog.type\" = 'rest',\"uri\" = '{}',\"warehouse\" = 's3://cl-fixture/warehouse',\"aws.s3.endpoint\" = '{}',\"aws.s3.region\" = 'us-east-1',\"aws.s3.enable_path_style_access\" = 'true',\"credential.object-store-metadata.consumer-role\" = 'frontend',\"credential.object-store-metadata.mode\" = 'static',\"credential.object-store-metadata.name\" = 'cl-fixture',\"credential.object-store-metadata.generation\" = 'v1',\"credential.object-store-data.consumer-role\" = 'backend',\"credential.object-store-data.mode\" = 'static',\"credential.object-store-data.name\" = 'cl-fixture',\"credential.object-store-data.generation\" = 'v1')",
+        "CREATE CATALOG {name} USING iceberg WITH (\"iceberg.catalog.type\" = 'rest',\"iceberg.add-files-procedure.enabled\" = 'true',\"uri\" = '{}',\"warehouse\" = 's3://cl-fixture/warehouse',\"aws.s3.endpoint\" = '{}',\"aws.s3.region\" = 'us-east-1',\"aws.s3.enable_path_style_access\" = 'true',\"credential.object-store-metadata.consumer-role\" = 'frontend',\"credential.object-store-metadata.mode\" = 'static',\"credential.object-store-metadata.name\" = 'cl-fixture',\"credential.object-store-metadata.generation\" = 'v1',\"credential.object-store-data.consumer-role\" = 'backend',\"credential.object-store-data.mode\" = 'static',\"credential.object-store-data.name\" = 'cl-fixture',\"credential.object-store-data.generation\" = 'v1')",
         endpoint, endpoint
     )
 }
@@ -534,12 +534,15 @@ impl Scenario for ObjectStoreListingBoundary {
         ] {
             fixture.set_object_store_list_body_bytes(bytes)?;
             record_listing_phase(context, "opendal-list-body-boundary", || {
-                let error = listing_sql(&mut control, "ALTER TABLE cl_opendal.cl_ns_0000.cl_table_000000 EXECUTE add_files(location => 's3://cl-fixture/import-source/')", deadline)
+                let error = listing_sql(&mut control, "ALTER TABLE cl_opendal.cl_ns_0000.cl_table_000000 EXECUTE add_files(location => 's3://cl-fixture/import-source/', format => 'PARQUET')", deadline)
                     .err()
                     .context("empty source listing must not commit ADD FILES")?;
-                let diagnostic = listing_public_error(&error)?.message.clone();
-                if !(diagnostic.contains("no visible Parquet files")
-                    && !diagnostic.contains("ResourceExhausted"))
+                let server = listing_public_error(&error)?;
+                let diagnostic = server.message.clone();
+                if !(server.error_code == 5
+                    && server.error_name == "NOT_FOUND"
+                    && server.error_type == "USER_ERROR"
+                    && diagnostic == "Location not found: s3://cl-fixture/import-source/")
                 {
                     return Err(error.context(
                         "legal list response did not reach the empty-source semantic check",
@@ -548,8 +551,9 @@ impl Scenario for ObjectStoreListingBoundary {
                 let audit = fixture.snapshot()?;
                 ensure!(
                     audit.object_store_list_requests == 1
-                        && audit.object_store_list_body_bytes == bytes as u64,
-                    "OpenDAL boundary was retried or did not consume the frozen response"
+                        && audit.object_store_list_body_bytes == bytes as u64
+                        && audit.object_store_head_requests == 1,
+                    "Expected one frozen LIST response followed by one exact-object HEAD"
                 );
                 ensure!(
                     audit.table_commits == 0 && audit.destructive_mutations == 0,

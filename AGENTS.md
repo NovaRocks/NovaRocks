@@ -819,7 +819,9 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
   catalog session 属性 `max_partitions_per_writer` 可在 1 到该值间覆盖。
   `iceberg.target-max-file-size` 接受正字节数或带单位的大小，默认 1 GiB，
   表属性 `write.target-file-size-bytes` 优先。表属性 `write.parquet.row-group-size-bytes` 默认 128 MiB。
-  这些属性经 catalog properties 与 FE 写会话冻结。
+  这些属性经 catalog properties 与 FE 写会话冻结。示例见 `novarocks-catalogs.toml.example`。
+  `iceberg.add-files-procedure.enabled` 接受字符串 `true` 或 `false`，默认 `false`。
+  [ADD FILES](docs/guides/iceberg-v3/dml.md#登记已有-parquet-文件) 按 catalog 启用，并使用原语句容量。
 
 - Iceberg catalog 维护属性
   `iceberg.expire-snapshots.min-retention` 与 `iceberg.remove-orphan-files.min-retention` 各默认 7 天。

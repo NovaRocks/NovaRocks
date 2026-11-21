@@ -37,7 +37,9 @@
 //! There is no name fallback, no ordinal fallback, and no implicit widening
 //! outside the promotions Iceberg actually defines.
 
+mod adaptation;
 pub(crate) mod mutation_partition;
+pub(crate) mod registration;
 pub(crate) use mutation_partition::MutationMetadataSchema;
 
 use std::collections::HashMap;
@@ -53,6 +55,9 @@ use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use crate::default_value::{
     ICEBERG_INITIAL_DEFAULT_META_KEY, build_iceberg_default_array, literal_to_constant_array,
 };
+use crate::file_reader::field_identity::{
+    FieldIdentityError, original_field_id_coverage, resolve_arrow_fields,
+};
 use crate::file_reader::variant::collapse_variant_struct_to_largebinary;
 use crate::iceberg::spec::{
     Literal, NameMapping, NestedField, PartitionSpec, PrimitiveType, Schema, Struct, Transform,
@@ -64,10 +69,9 @@ use crate::row_lineage_synth::{
     ICEBERG_ROW_ID_COL, ICEBERG_ROW_POS_COL, IcebergRowLineageColumn, StoredRowLineageIndices,
     stored_row_lineage_indices, synthesize_last_updated_sequence_number, synthesize_row_id,
 };
-use crate::schema_mapping::{
-    apply_name_mapping_to_schema, field_id_for_arrow_field, schema_field_id_coverage,
-    sql_read_schema_from_iceberg, unidentified_fields_are_only_opaque_variants,
-};
+use crate::schema_mapping::{field_id_for_arrow_field, sql_read_schema_from_iceberg};
+
+use adaptation::{AdaptationError, FieldAdaptation};
 
 use super::column_handle::{IcebergColumnHandle, corrupt, invalid, parse_type, unsupported};
 
@@ -328,7 +332,16 @@ pub struct IcebergSchemaBinding {
     columns: Vec<IcebergBoundColumn>,
     physical_base_field_ids: Vec<i32>,
     coverage: FileFieldIdCoverage,
-    name_mapping: Option<Arc<NameMapping>>,
+    root_projection: Vec<usize>,
+    reader_schema: SchemaRef,
+    physical: HashMap<i32, BoundPhysicalRoot>,
+    projected_dereferences: Vec<Vec<usize>>,
+}
+
+#[derive(Clone, Debug)]
+struct BoundPhysicalRoot {
+    slot: usize,
+    adaptation: FieldAdaptation,
 }
 
 impl IcebergSchemaBinding {
@@ -337,13 +350,17 @@ impl IcebergSchemaBinding {
     }
 
     /// The base-column field IDs this binding reads, ascending and deduped.
-    /// This is exactly the projection the physical reader must open.
     pub fn physical_base_field_ids(&self) -> &[i32] {
         &self.physical_base_field_ids
     }
 
     pub const fn coverage(&self) -> FileFieldIdCoverage {
         self.coverage
+    }
+
+    /// File root indices, in the order emitted by the Parquet reader.
+    pub(crate) fn root_projection(&self) -> &[usize] {
+        &self.root_projection
     }
 
     /// Whether any bound column reads a physical field at all.
@@ -369,8 +386,21 @@ impl IcebergSchemaBinding {
 
     /// Best-effort retained size of the binding itself.
     pub fn retained_size_in_bytes(&self) -> u64 {
-        let mut retained =
-            size_of::<Self>() + self.physical_base_field_ids.len() * size_of::<i32>();
+        let mut retained = size_of::<Self>()
+            + self.physical_base_field_ids.capacity() * size_of::<i32>()
+            + self.root_projection.capacity() * size_of::<usize>()
+            + self.projected_dereferences.capacity() * size_of::<Vec<usize>>()
+            + self
+                .projected_dereferences
+                .iter()
+                .map(|slots| slots.capacity() * size_of::<usize>())
+                .sum::<usize>()
+            + self.physical.capacity() * size_of::<(i32, BoundPhysicalRoot)>()
+            + self
+                .physical
+                .values()
+                .map(|root| root.adaptation.retained_heap_bytes())
+                .sum::<usize>();
         for column in &self.columns {
             retained += size_of::<IcebergBoundColumn>()
                 + column.handle.base_type_json().len()
@@ -422,13 +452,21 @@ impl IcebergSchemaBinding {
                 positions.len()
             )));
         }
-        // The physical schema is re-indexed per batch because a reader may
-        // legally reorder or narrow its output; the binding decisions
-        // themselves never change.
-        let physical = PhysicalIndex::build(&batch.schema(), self.name_mapping.as_deref())?;
+        if batch.schema_ref().fields() != self.reader_schema.fields() {
+            return Err(corrupt(format!(
+                "iceberg data file {} returned a different reader projection than was bound",
+                facts.path
+            )));
+        }
+        let mut materialized_roots = vec![None; self.root_projection.len()];
 
         let mut columns = Vec::with_capacity(self.columns.len());
-        for (ordinal, bound) in self.columns.iter().enumerate() {
+        for (ordinal, (bound, dereference)) in self
+            .columns
+            .iter()
+            .zip(&self.projected_dereferences)
+            .enumerate()
+        {
             let constant = output_columns.is_some_and(|count| ordinal < count)
                 && matches!(
                     &bound.source,
@@ -441,35 +479,19 @@ impl IcebergSchemaBinding {
                 );
             let row_count = if constant { 1 } else { source_rows };
             let array = match &bound.source {
-                IcebergColumnSource::Physical {
-                    base_field_id,
-                    dereference,
-                } => {
-                    let index = physical.index_of(*base_field_id).ok_or_else(|| {
-                        corrupt(format!(
-                            "iceberg data file {} no longer exposes field id {base_field_id}",
-                            facts.path
-                        ))
-                    })?;
-                    let source = batch.column(index);
-                    let variant = matches!(
-                        super::column_handle::parse_type(
-                            bound.handle.base_type_json(),
-                            "base_type_json"
-                        )?,
-                        Type::Variant(_)
-                    );
-                    let base_target = bound.base_target.as_ref();
-                    let source_target = if output_columns.is_some() && !variant {
-                        base_target.clone().with_data_type(retained_byte_layout(
-                            source.data_type(),
-                            base_target.data_type(),
-                        ))
-                    } else {
-                        base_target.clone()
-                    };
-                    let base = adapt_array(source, &source_target, facts.path, variant)?;
-                    let value = dereference_struct_path(&base, &source_target, dereference)?;
+                IcebergColumnSource::Physical { base_field_id, .. } => {
+                    let root = &self.physical[base_field_id];
+                    let value = &mut materialized_roots[root.slot];
+                    if value.is_none() {
+                        *value = Some(
+                            root.adaptation
+                                .materialize(batch.column(root.slot), facts.path)?,
+                        );
+                    }
+                    let value = dereference_struct_path(
+                        value.as_ref().expect("the bound root was materialized"),
+                        dereference,
+                    )?;
                     match bound.handle.scalar_integer_domain() {
                         Some(domain) => domain.array(&value)?,
                         None => value,
@@ -529,55 +551,6 @@ pub(super) struct MaterializedScanColumn {
     pub(super) constant: bool,
 }
 
-/// Keep the decoder's byte storage through Iceberg predicates and deletes.
-/// The destination field tree still supplies names, IDs and logical types.
-fn retained_byte_layout(source: &DataType, target: &DataType) -> DataType {
-    fn retain_field(source: &Field, target: &FieldRef) -> FieldRef {
-        Arc::new(
-            target
-                .as_ref()
-                .clone()
-                .with_data_type(retained_byte_layout(source.data_type(), target.data_type())),
-        )
-    }
-    match (source, target) {
-        (DataType::Utf8View, DataType::Utf8 | DataType::LargeUtf8)
-        | (DataType::BinaryView, DataType::Binary | DataType::LargeBinary) => source.clone(),
-        (DataType::Dictionary(keys, values), DataType::Utf8 | DataType::LargeUtf8)
-            if **keys == DataType::Int32
-                && matches!(values.as_ref(), DataType::Utf8 | DataType::Utf8View) =>
-        {
-            source.clone()
-        }
-        (DataType::Struct(fields), DataType::Struct(declared))
-            if fields.len() == declared.len() =>
-        {
-            DataType::Struct(
-                fields
-                    .iter()
-                    .zip(declared)
-                    .map(|(from, to)| retain_field(from, to))
-                    .collect(),
-            )
-        }
-        (DataType::List(from), DataType::List(to)) => DataType::List(retain_field(from, to)),
-        (DataType::LargeList(from), DataType::LargeList(to)) => {
-            DataType::LargeList(retain_field(from, to))
-        }
-        (DataType::FixedSizeList(from, width), DataType::FixedSizeList(to, target_width))
-            if width == target_width =>
-        {
-            DataType::FixedSizeList(retain_field(from, to), *width)
-        }
-        (DataType::Map(from, ordered), DataType::Map(to, target_order))
-            if ordered == target_order =>
-        {
-            DataType::Map(retain_field(from, to), *ordered)
-        }
-        _ => target.clone(),
-    }
-}
-
 /// Everything binding needs, and nothing a worker would have to resolve.
 pub struct IcebergSchemaBindingRequest<'a> {
     /// The frozen table schema the scan was planned against.
@@ -598,19 +571,35 @@ pub struct IcebergSchemaBindingRequest<'a> {
 pub fn bind_scan_columns(
     request: IcebergSchemaBindingRequest<'_>,
 ) -> Result<IcebergSchemaBinding, ConnectorError> {
+    bind_columns(request, FieldAdaptation::bind)
+}
+
+/// Bind the layout negotiated by an opened data reader.
+pub(super) fn bind_decoder_columns(
+    request: IcebergSchemaBindingRequest<'_>,
+) -> Result<IcebergSchemaBinding, ConnectorError> {
+    bind_columns(request, FieldAdaptation::bind_for_scan)
+}
+
+fn bind_columns(
+    request: IcebergSchemaBindingRequest<'_>,
+    bind_field: fn(Option<&Field>, &FieldRef) -> Result<FieldAdaptation, AdaptationError>,
+) -> Result<IcebergSchemaBinding, ConnectorError> {
     let coverage = file_field_id_coverage(request.file_schema)?;
     // Name mapping repairs a legacy file, so it is consulted only when the
     // file identifies nothing. Applying it to a partly identified file would
     // be a rename, which Iceberg's name mapping is explicitly not.
-    let name_mapping = match (coverage, request.name_mapping) {
-        (FileFieldIdCoverage::None, Some(mapping)) => Some(mapping),
-        (FileFieldIdCoverage::None, None) | (FileFieldIdCoverage::Complete, _) => None,
-    };
-    let physical = PhysicalIndex::build(request.file_schema, None)?;
-    let mapped_physical = match name_mapping.as_deref() {
-        Some(mapping) => Some(PhysicalIndex::build(request.file_schema, Some(mapping))?),
-        None => None,
-    };
+    let physical = PhysicalIndex::build(request.file_schema)?;
+    let resolved_schema = resolve_arrow_fields(
+        request.file_schema,
+        coverage,
+        request.name_mapping.as_deref(),
+        |_, _| {},
+    )?;
+    let mapped_physical = (!Arc::ptr_eq(&resolved_schema, request.file_schema))
+        .then(|| PhysicalIndex::build(&resolved_schema))
+        .transpose()?;
+    let resolved_index = mapped_physical.as_ref().unwrap_or(&physical);
 
     let read_schema = annotated_read_schema(request.table_schema)?;
     let identity_partitions = identity_partition_values(
@@ -669,11 +658,63 @@ pub fn bind_scan_columns(
     }
     physical_base_field_ids.sort_unstable();
 
+    // FS reads whole Parquet roots in physical order. These slots index the
+    // projected Arrow batch; they need not be the original file indices.
+    let mut root_projection = physical_base_field_ids
+        .iter()
+        .map(|id| {
+            resolved_index.index_of(*id).ok_or_else(|| {
+                corrupt(format!(
+                    "iceberg data file does not expose bound field id {id}"
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    root_projection.sort_unstable();
+    let reader_schema = Arc::new(
+        request
+            .file_schema
+            .project(&root_projection)
+            .map_err(|error| corrupt(format!("iceberg reader projection: {error}")))?,
+    );
+    let mut physical = HashMap::new();
+    for bound in &columns {
+        if let IcebergColumnSource::Physical { base_field_id, .. } = bound.source
+            && let std::collections::hash_map::Entry::Vacant(entry) = physical.entry(base_field_id)
+        {
+            let original_slot = resolved_index
+                .index_of(base_field_id)
+                .expect("a bound physical root was projected");
+            let slot = root_projection
+                .binary_search(&original_slot)
+                .expect("the projected physical root is present");
+            let adaptation = bind_field(
+                Some(resolved_schema.field(original_slot)),
+                &bound.base_target,
+            )
+            .map_err(AdaptationError::into_read_error)?;
+            entry.insert(BoundPhysicalRoot { slot, adaptation });
+        }
+    }
+
+    let projected_dereferences = columns
+        .iter()
+        .map(|bound| match &bound.source {
+            IcebergColumnSource::Physical { dereference, .. } => {
+                bind_struct_dereference(&bound.base_target, dereference)
+            }
+            _ => Ok(Vec::new()),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
     Ok(IcebergSchemaBinding {
         columns,
         physical_base_field_ids,
         coverage,
-        name_mapping,
+        root_projection,
+        reader_schema,
+        physical,
+        projected_dereferences,
     })
 }
 
@@ -686,22 +727,7 @@ pub fn bind_scan_columns(
 pub fn file_field_id_coverage(
     file_schema: &SchemaRef,
 ) -> Result<FileFieldIdCoverage, ConnectorError> {
-    let (identified, total) = schema_field_id_coverage(file_schema)
-        .map_err(|error| corrupt(format!("iceberg data file schema: {error}")))?;
-    if identified == total {
-        return Ok(FileFieldIdCoverage::Complete);
-    }
-    if identified == 0 {
-        return Ok(FileFieldIdCoverage::None);
-    }
-    if unidentified_fields_are_only_opaque_variants(file_schema)
-        .map_err(|error| corrupt(format!("iceberg data file schema: {error}")))?
-    {
-        return Ok(FileFieldIdCoverage::Complete);
-    }
-    Err(corrupt(
-        "iceberg data file mixes fields with and without field ids",
-    ))
+    original_field_id_coverage(file_schema).map_err(FieldIdentityError::into_read_error)
 }
 
 /// Decide whether a physical carrier may become a target carrier at all.
@@ -869,15 +895,7 @@ struct PhysicalIndex {
 }
 
 impl PhysicalIndex {
-    fn build(
-        schema: &SchemaRef,
-        name_mapping: Option<&NameMapping>,
-    ) -> Result<Self, ConnectorError> {
-        let schema = match name_mapping {
-            None => Arc::clone(schema),
-            Some(mapping) => apply_name_mapping_to_schema(schema, mapping)
-                .map_err(|error| corrupt(format!("iceberg name mapping: {error}")))?,
-        };
+    fn build(schema: &SchemaRef) -> Result<Self, ConnectorError> {
         let mut by_field_id = HashMap::with_capacity(schema.fields().len());
         for (index, field) in schema.fields().iter().enumerate() {
             let Some(field_id) = field_id_for_arrow_field(field.as_ref())
@@ -1275,7 +1293,17 @@ fn adapt_array(
     path: &str,
     logical_variant: bool,
 ) -> Result<ArrayRef, ConnectorError> {
-    match physical_adaptation(source.data_type(), target.data_type(), logical_variant)? {
+    let adaptation = physical_adaptation(source.data_type(), target.data_type(), logical_variant)?;
+    apply_adaptation(source, target, path, adaptation)
+}
+
+fn apply_adaptation(
+    source: &ArrayRef,
+    target: &Field,
+    path: &str,
+    adaptation: IcebergPhysicalAdaptation,
+) -> Result<ArrayRef, ConnectorError> {
+    match adaptation {
         IcebergPhysicalAdaptation::Identity => Ok(Arc::clone(source)),
         IcebergPhysicalAdaptation::RetagNestedMetadata => {
             crate::file_reader::retag_iceberg_array(source, target.data_type()).map_err(|error| {
@@ -1377,30 +1405,34 @@ fn adapt_representation(
     Ok(make_array(converted))
 }
 
-/// Extract a nested struct field, propagating every ancestor's null mask.
-fn dereference_struct_path(
-    base: &ArrayRef,
-    base_target: &Field,
+fn bind_struct_dereference(
+    base: &Field,
     field_id_path: &[i32],
-) -> Result<ArrayRef, ConnectorError> {
+) -> Result<Vec<usize>, ConnectorError> {
+    let mut field = base;
+    field_id_path
+        .iter()
+        .map(|id| {
+            let DataType::Struct(children) = field.data_type() else {
+                return Err(corrupt(
+                    "iceberg dereference expected a bound struct carrier",
+                ));
+            };
+            let (index, child) = children
+                .iter()
+                .enumerate()
+                .find(|(_, child)| field_id_for_arrow_field(child).ok().flatten() == Some(*id))
+                .ok_or_else(|| corrupt(format!("iceberg dereference field {id} is missing")))?;
+            field = child;
+            Ok(index)
+        })
+        .collect()
+}
+
+/// Extract through the frozen slots, propagating every ancestor's mask.
+fn dereference_struct_path(base: &ArrayRef, slots: &[usize]) -> Result<ArrayRef, ConnectorError> {
     let mut current = Arc::clone(base);
-    let mut current_field = Arc::new(base_target.clone());
-    for field_id in field_id_path {
-        let DataType::Struct(children) = current_field.data_type().clone() else {
-            return Err(unsupported(format!(
-                "iceberg projection of field id {field_id} descends into a non-struct carrier"
-            )));
-        };
-        let index = children
-            .iter()
-            .position(|child| {
-                field_id_for_arrow_field(child.as_ref()).ok().flatten() == Some(*field_id)
-            })
-            .ok_or_else(|| {
-                corrupt(format!(
-                    "iceberg dereference path field id {field_id} is not a struct field"
-                ))
-            })?;
+    for &index in slots {
         let parent = current
             .as_any()
             .downcast_ref::<StructArray>()
@@ -1416,11 +1448,10 @@ fn dereference_struct_path(
             .build()
             .map_err(|error| {
                 corrupt(format!(
-                    "iceberg dereference of field id {field_id} failed: {error}"
+                    "iceberg dereference at slot {index} failed: {error}"
                 ))
             })?;
         current = make_array(data);
-        current_field = Arc::clone(&children[index]);
     }
     Ok(current)
 }
@@ -1601,465 +1632,4 @@ fn metadata_column(
 mod tests;
 
 #[cfg(test)]
-mod sdk_nested_representation_tests {
-    use super::*;
-    use crate::access_binding::IcebergReadBinding;
-    use crate::commit::frozen_write::{
-        FrozenDataWriteFacts, staged_write_context_from_frozen_facts,
-    };
-    use arrow::array::{BinaryArray, ListArray, MapArray, StringArray, TimestampMicrosecondArray};
-    use arrow::buffer::OffsetBuffer;
-    use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileIoSpawner};
-    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-
-    fn schema() -> Schema {
-        serde_json::from_value(serde_json::json!({"type":"struct","schema-id":42,"fields":[
-            {"id":1,"name":"record","required":false,"type":{"type":"struct","fields":[
-                {"id":2,"name":"blob","required":false,"type":"binary"},
-                {"id":3,"name":"zone","required":false,"type":"timestamptz"},
-                {"id":4,"name":"items","required":false,"type":{"type":"list","element-id":5,"element-required":false,"element":"binary"}}
-            ]}},
-            {"id":6,"name":"mapping","required":false,"type":{"type":"map","key-id":7,"key":"string","value-id":8,"value-required":false,"value":{"type":"struct","fields":[
-                {"id":9,"name":"blob","required":false,"type":"binary"},
-                {"id":10,"name":"zone","required":false,"type":"timestamptz"}
-            ]}}}
-        ]})).unwrap()
-    }
-    fn input(schema: &Schema) -> RecordBatch {
-        let arrow = annotated_read_schema(schema).unwrap();
-        let DataType::Struct(record_fields) = arrow.field(0).data_type() else {
-            panic!("record");
-        };
-        let DataType::List(element) = record_fields[2].data_type() else {
-            panic!("list");
-        };
-        let items = ListArray::try_new(
-            element.clone(),
-            OffsetBuffer::new(vec![0, 2, 2, 3].into()),
-            Arc::new(BinaryArray::from(vec![
-                Some(&[1_u8][..]),
-                None,
-                Some(&[2_u8][..]),
-            ])),
-            Some(NullBuffer::from(vec![true, false, true])),
-        )
-        .unwrap();
-        let record = StructArray::try_new(
-            record_fields.clone(),
-            vec![
-                Arc::new(BinaryArray::from(vec![
-                    Some(&[0xff_u8, 0][..]),
-                    None,
-                    Some(&[][..]),
-                ])),
-                Arc::new(TimestampMicrosecondArray::from(vec![
-                    Some(123_i64),
-                    Some(456),
-                    None,
-                ])),
-                Arc::new(items),
-            ],
-            Some(NullBuffer::from(vec![true, false, true])),
-        )
-        .unwrap();
-        let DataType::Map(entry_field, sorted) = arrow.field(1).data_type() else {
-            panic!("map");
-        };
-        let DataType::Struct(entry_fields) = entry_field.data_type() else {
-            panic!("entries");
-        };
-        let DataType::Struct(value_fields) = entry_fields[1].data_type() else {
-            panic!("value");
-        };
-        let values = StructArray::try_new(
-            value_fields.clone(),
-            vec![
-                Arc::new(BinaryArray::from(vec![Some(&[4_u8, 5][..]), None])),
-                Arc::new(TimestampMicrosecondArray::from(vec![Some(-123_i64), None])),
-            ],
-            Some(NullBuffer::from(vec![true, false])),
-        )
-        .unwrap();
-        let entries = StructArray::try_new(
-            entry_fields.clone(),
-            vec![
-                Arc::new(StringArray::from(vec!["a", "b"])),
-                Arc::new(values),
-            ],
-            None,
-        )
-        .unwrap();
-        let mapping = MapArray::try_new(
-            entry_field.clone(),
-            OffsetBuffer::new(vec![0, 1, 1, 2].into()),
-            entries,
-            Some(NullBuffer::from(vec![true, false, true])),
-            *sorted,
-        )
-        .unwrap();
-        RecordBatch::try_new(arrow, vec![Arc::new(record), Arc::new(mapping)]).unwrap()
-    }
-    fn assert_values(arrays: &[ArrayRef]) {
-        let record = arrays[0].as_any().downcast_ref::<StructArray>().unwrap();
-        assert!(record.is_null(1));
-        let blob = record
-            .column(0)
-            .as_any()
-            .downcast_ref::<BinaryArray>()
-            .unwrap();
-        assert_eq!(blob.value(0), &[0xff, 0]);
-        assert_eq!(blob.value(2), &[] as &[u8]);
-        let zone = record
-            .column(1)
-            .as_any()
-            .downcast_ref::<TimestampMicrosecondArray>()
-            .unwrap();
-        assert_eq!(zone.value(0), 123);
-        assert!(zone.is_null(2));
-        assert_eq!(zone.timezone(), None);
-        let list = record
-            .column(2)
-            .as_any()
-            .downcast_ref::<ListArray>()
-            .unwrap();
-        assert_eq!(list.value_offsets(), &[0, 2, 2, 3]);
-        assert!(list.is_null(1));
-        let values = list
-            .values()
-            .as_any()
-            .downcast_ref::<BinaryArray>()
-            .unwrap();
-        assert_eq!(values.value(0), &[1]);
-        assert!(values.is_null(1));
-        assert_eq!(values.value(2), &[2]);
-        let map = arrays[1].as_any().downcast_ref::<MapArray>().unwrap();
-        assert_eq!(map.value_offsets(), &[0, 1, 1, 2]);
-        assert!(map.is_null(1));
-        let values = map.values().as_any().downcast_ref::<StructArray>().unwrap();
-        assert!(values.is_null(1));
-        let blob = values
-            .column(0)
-            .as_any()
-            .downcast_ref::<BinaryArray>()
-            .unwrap();
-        assert_eq!(blob.value(0), &[4, 5]);
-        let zone = values
-            .column(1)
-            .as_any()
-            .downcast_ref::<TimestampMicrosecondArray>()
-            .unwrap();
-        assert_eq!(zone.value(0), -123);
-        assert_eq!(zone.timezone(), None);
-    }
-    #[tokio::test]
-    async fn sdk_file_nested_binary_and_timestamptz_bind_to_sql_carriers() {
-        let dir = tempfile::tempdir().unwrap();
-        let location = format!("file://{}", dir.path().display());
-        let table_schema = schema();
-        let input = input(&table_schema);
-        let runtime = tokio::runtime::Handle::current();
-        let binding = IcebergReadBinding::new(
-            None,
-            FsAccessResolver::new(),
-            Arc::new(TokioFileIoRuntime::new(runtime.clone())),
-            novarocks_fs::TokioRefreshExecutor::shared(runtime.clone()),
-            Arc::new(TokioFileIoSpawner::new(runtime)),
-        );
-        let facts = FrozenDataWriteFacts {
-            format_version: 3,
-            table_location: location.clone(),
-            data_location: format!("{location}/data"),
-            target_partition_spec_id: 0,
-            partition_source_column_names: vec![],
-            partition_column_names: vec![],
-            transform_exprs: vec![],
-            target_schema_json: serde_json::to_string(&table_schema).unwrap(),
-            parquet_row_group_size_bytes:
-                crate::commit::data_writer::DEFAULT_PARQUET_ROW_GROUP_SIZE_BYTES,
-            target_file_size_bytes: crate::catalog_config::DEFAULT_TARGET_FILE_SIZE_BYTES,
-            max_partitions_per_writer: crate::catalog_config::DEFAULT_MAX_PARTITIONS_PER_WRITER,
-        };
-        let context =
-            staged_write_context_from_frozen_facts(&binding, &input.schema(), facts).unwrap();
-        let files = crate::commit::data_writer::write_record_batches(&context, vec![input])
-            .await
-            .unwrap();
-        assert_eq!(files.len(), 1);
-        let path = files[0].data_file.file_path();
-        let builder = ParquetRecordBatchReaderBuilder::try_new(
-            std::fs::File::open(path.strip_prefix("file://").unwrap_or(path)).unwrap(),
-        )
-        .unwrap();
-        let file_schema = builder.schema().clone();
-        let DataType::Struct(fields) = file_schema.field(0).data_type() else {
-            panic!("record file carrier");
-        };
-        assert_eq!(fields[0].data_type(), &DataType::LargeBinary);
-        assert_eq!(
-            fields[1].data_type(),
-            &DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into()))
-        );
-        let columns = [
-            IcebergColumnHandle::base_column_of(&table_schema, 1).unwrap(),
-            IcebergColumnHandle::base_column_of(&table_schema, 6).unwrap(),
-        ];
-        let scan = bind_scan_columns(IcebergSchemaBindingRequest {
-            table_schema: &table_schema,
-            file_schema: &file_schema,
-            name_mapping: None,
-            partition_spec: None,
-            partition_values: None,
-            columns: &columns,
-        })
-        .unwrap();
-        let batch = builder.build().unwrap().next().unwrap().unwrap();
-        let facts = IcebergSplitFacts {
-            path,
-            file_first_row_id: None,
-            data_sequence_number: None,
-        };
-        let arrays = scan.materialize(&batch, None, &facts).unwrap();
-        assert_values(&arrays);
-        let sliced = scan.materialize(&batch.slice(1, 2), None, &facts).unwrap();
-        let record = sliced[0].as_any().downcast_ref::<StructArray>().unwrap();
-        assert_eq!(record.len(), 2);
-        assert!(record.is_null(0));
-        let list = record
-            .column(2)
-            .as_any()
-            .downcast_ref::<ListArray>()
-            .unwrap();
-        assert_eq!(list.value_offsets(), &[2, 2, 3]);
-        let map = sliced[1].as_any().downcast_ref::<MapArray>().unwrap();
-        assert!(map.is_null(0));
-        assert_eq!(map.value_offsets(), &[1, 1, 2]);
-    }
-
-    #[tokio::test]
-    async fn recursive_nominal_largeint_sdk_file_preserves_nested_values_and_storage() {
-        use crate::schema_mapping::nominal_declaration;
-        use arrow::array::{FixedSizeBinaryArray, Int32Array};
-        use novarocks_spi::connector::{ConnectorColumnDefinition, ConnectorDataType as D};
-        let column = |name: &str, data_type| ConnectorColumnDefinition {
-            name: name.into(),
-            data_type,
-            nullable: true,
-            default: None,
-        };
-        let columns = vec![
-            column("numbers", D::Array(Box::new(D::LargeInt))),
-            column("mapping", D::Map(Box::new(D::Int), Box::new(D::LargeInt))),
-        ];
-        let schema = Schema::builder()
-            .with_fields(crate::catalog_control::type_mapping::schema_fields(&columns).unwrap())
-            .build()
-            .unwrap();
-        let declarations = nominal_declaration::from_columns(&schema, &columns).unwrap();
-        let metadata = crate::iceberg::spec::TableMetadataBuilder::new(
-            schema,
-            crate::iceberg::spec::PartitionSpec::unpartition_spec(),
-            crate::iceberg::spec::SortOrder::unsorted_order(),
-            "memory://nested-largeint".into(),
-            crate::iceberg::spec::FormatVersion::V3,
-            std::collections::HashMap::from([(
-                nominal_declaration::PROPERTY.into(),
-                nominal_declaration::encode(&declarations).unwrap(),
-            )]),
-        )
-        .unwrap()
-        .build()
-        .unwrap()
-        .metadata;
-        let table_schema = metadata.current_schema();
-        let arrow =
-            crate::scalar_integer_domain::metadata_sql_schema(&metadata, table_schema).unwrap();
-        let bytes = [
-            i128::MAX.to_be_bytes(),
-            i128::MIN.to_be_bytes(),
-            (-1_i128).to_be_bytes(),
-        ];
-        let values = |input: Vec<Option<&[u8]>>| -> ArrayRef {
-            Arc::new(
-                FixedSizeBinaryArray::try_from_sparse_iter_with_size(input.into_iter(), 16)
-                    .unwrap(),
-            )
-        };
-        let DataType::List(item) = arrow.field(0).data_type() else {
-            panic!("list");
-        };
-        let numbers = ListArray::try_new(
-            item.clone(),
-            OffsetBuffer::new(vec![0, 2, 2, 4].into()),
-            values(vec![
-                Some(&bytes[0]),
-                None,
-                Some(&bytes[1]),
-                Some(&bytes[2]),
-            ]),
-            Some(NullBuffer::from(vec![true, false, true])),
-        )
-        .unwrap();
-        let DataType::Map(entries, sorted) = arrow.field(1).data_type() else {
-            panic!("map");
-        };
-        let DataType::Struct(fields) = entries.data_type() else {
-            panic!("entries");
-        };
-        let entries_array = StructArray::try_new(
-            fields.clone(),
-            vec![
-                Arc::new(Int32Array::from(vec![1, 2, 3])),
-                values(vec![Some(&bytes[0]), Some(&bytes[1]), None]),
-            ],
-            None,
-        )
-        .unwrap();
-        let mapping = MapArray::try_new(
-            entries.clone(),
-            OffsetBuffer::new(vec![0, 1, 1, 3].into()),
-            entries_array,
-            Some(NullBuffer::from(vec![true, false, true])),
-            *sorted,
-        )
-        .unwrap();
-        let input =
-            RecordBatch::try_new(arrow, vec![Arc::new(numbers), Arc::new(mapping)]).unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let location = format!("file://{}", dir.path().display());
-        let runtime = tokio::runtime::Handle::current();
-        let binding = IcebergReadBinding::new(
-            None,
-            FsAccessResolver::new(),
-            Arc::new(TokioFileIoRuntime::new(runtime.clone())),
-            novarocks_fs::TokioRefreshExecutor::shared(runtime.clone()),
-            Arc::new(TokioFileIoSpawner::new(runtime)),
-        );
-        let context = staged_write_context_from_frozen_facts(
-            &binding,
-            &input.schema(),
-            FrozenDataWriteFacts {
-                format_version: 3,
-                table_location: location.clone(),
-                data_location: format!("{location}/data"),
-                target_partition_spec_id: 0,
-                partition_source_column_names: vec![],
-                partition_column_names: vec![],
-                transform_exprs: vec![],
-                target_schema_json: serde_json::to_string(table_schema).unwrap(),
-                parquet_row_group_size_bytes:
-                    crate::commit::data_writer::DEFAULT_PARQUET_ROW_GROUP_SIZE_BYTES,
-                target_file_size_bytes: crate::catalog_config::DEFAULT_TARGET_FILE_SIZE_BYTES,
-                max_partitions_per_writer: crate::catalog_config::DEFAULT_MAX_PARTITIONS_PER_WRITER,
-            },
-        )
-        .unwrap();
-        let files = crate::commit::data_writer::write_record_batches(&context, vec![input])
-            .await
-            .unwrap();
-        assert_eq!(files.len(), 1);
-        let path = files[0].data_file.file_path();
-        let reader = ParquetRecordBatchReaderBuilder::try_new(
-            std::fs::File::open(path.strip_prefix("file://").unwrap()).unwrap(),
-        )
-        .unwrap();
-        let columns = [
-            IcebergColumnHandle::base_column_of(table_schema, 1).unwrap(),
-            IcebergColumnHandle::base_column_of(table_schema, 2).unwrap(),
-        ];
-        let scan = bind_scan_columns(IcebergSchemaBindingRequest {
-            table_schema,
-            file_schema: reader.schema(),
-            name_mapping: None,
-            partition_spec: None,
-            partition_values: None,
-            columns: &columns,
-        })
-        .unwrap();
-        let batch = reader.build().unwrap().next().unwrap().unwrap();
-        let facts = IcebergSplitFacts {
-            path,
-            file_first_row_id: None,
-            data_sequence_number: None,
-        };
-        let output = scan.materialize(&batch, None, &facts).unwrap();
-        let list = output[0].as_any().downcast_ref::<ListArray>().unwrap();
-        assert_eq!(list.value_offsets(), &[0, 2, 2, 4]);
-        assert!(list.is_null(1));
-        let actual = list
-            .values()
-            .as_any()
-            .downcast_ref::<FixedSizeBinaryArray>()
-            .unwrap();
-        assert_eq!(actual.value(0), bytes[0]);
-        assert!(actual.is_null(1));
-        assert_eq!(actual.value(2), bytes[1]);
-        assert_eq!(actual.value(3), bytes[2]);
-        let map = output[1].as_any().downcast_ref::<MapArray>().unwrap();
-        assert_eq!(map.value_offsets(), &[0, 1, 1, 3]);
-        assert!(map.is_null(1));
-        let actual = map
-            .values()
-            .as_any()
-            .downcast_ref::<FixedSizeBinaryArray>()
-            .unwrap();
-        assert_eq!(actual.value(0), bytes[0]);
-        assert_eq!(actual.value(1), bytes[1]);
-        assert!(actual.is_null(2));
-        let mut request = |_: std::alloc::Layout| Ok(());
-        let mut work = |_: usize| Ok(());
-        let mut creation = novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation::new(
-            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
-            &mut request,
-            &mut work,
-        );
-        let exact = crate::schema_mapping::catalog_value::table(
-            &metadata,
-            table_schema,
-            &[],
-            &mut creation,
-        )
-        .unwrap();
-        assert_eq!(
-            exact
-                .binding(0)
-                .unwrap()
-                .child_at(0)
-                .unwrap()
-                .logical_type(),
-            novarocks_type_contract::ValueLogicalType::LargeInt
-        );
-        assert_eq!(
-            exact
-                .binding(1)
-                .unwrap()
-                .child_at(1)
-                .unwrap()
-                .logical_type(),
-            novarocks_type_contract::ValueLogicalType::LargeInt
-        );
-        let sliced = scan.materialize(&batch.slice(1, 2), None, &facts).unwrap();
-        let list = sliced[0].as_any().downcast_ref::<ListArray>().unwrap();
-        assert_eq!(list.value_offsets(), &[2, 2, 4]);
-        assert!(list.is_null(0));
-    }
-    #[test]
-    fn recursive_representation_keeps_closed_leaf_and_container_rules() {
-        let list = |ty| DataType::List(Arc::new(Field::new("element", ty, true)));
-        assert_eq!(
-            physical_adaptation(&list(DataType::LargeBinary), &list(DataType::Binary), false)
-                .unwrap(),
-            IcebergPhysicalAdaptation::RepresentationCast
-        );
-        assert!(
-            physical_adaptation(&list(DataType::Int32), &list(DataType::Int64), false).is_err()
-        );
-        assert!(
-            physical_adaptation(
-                &list(DataType::LargeBinary),
-                &DataType::LargeList(Arc::new(Field::new("element", DataType::Binary, true))),
-                false
-            )
-            .is_err()
-        );
-    }
-}
+mod sdk_nested_representation_tests;

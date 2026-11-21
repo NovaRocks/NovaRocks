@@ -204,6 +204,19 @@ impl ManifestWriteEncoding {
         })
     }
 
+    pub(super) fn normalizes_bounds(&self, file: &DataFile) -> bool {
+        file.lower_bounds()
+            .iter()
+            .chain(file.upper_bounds())
+            .any(|(id, value)| {
+                bounds_field(&self.schema, *id)
+                    .and_then(|field| field.field_type.as_primitive_type())
+                    .is_some_and(|target| {
+                        date_bound_promotion(self.version, value, target).is_some()
+                    })
+            })
+    }
+
     pub(super) fn encode(
         &self,
         entry: ManifestEntryWrite,
@@ -404,21 +417,32 @@ fn bounds_fit_type(version: FormatVersion, value: &Datum, target: &PrimitiveType
         .is_ok_and(|bytes| Datum::try_from_bytes(&bytes, target.clone()).is_ok()))
 }
 
+type DateBoundPromotion = (i64, fn(i64) -> Datum);
+
+fn date_bound_promotion(
+    version: FormatVersion,
+    value: &Datum,
+    target: &PrimitiveType,
+) -> Option<DateBoundPromotion> {
+    match (version, value.data_type(), target) {
+        (FormatVersion::V3, PrimitiveType::Date, PrimitiveType::Timestamp) => {
+            Some((86_400_000_000, Datum::timestamp_micros))
+        }
+        (FormatVersion::V3, PrimitiveType::Date, PrimitiveType::TimestampNs) => {
+            Some((86_400_000_000_000, Datum::timestamp_nanos))
+        }
+        _ => None,
+    }
+}
+
 fn normalize_date_bound(
     version: FormatVersion,
     value: &Datum,
     target: &PrimitiveType,
 ) -> Result<Option<Datum>> {
-    let (ticks_per_day, timestamp): (i64, fn(i64) -> Datum) =
-        match (version, value.data_type(), target) {
-            (FormatVersion::V3, PrimitiveType::Date, PrimitiveType::Timestamp) => {
-                (86_400_000_000, Datum::timestamp_micros)
-            }
-            (FormatVersion::V3, PrimitiveType::Date, PrimitiveType::TimestampNs) => {
-                (86_400_000_000_000, Datum::timestamp_nanos)
-            }
-            _ => return Ok(None),
-        };
+    let Some((ticks_per_day, timestamp)) = date_bound_promotion(version, value, target) else {
+        return Ok(None);
+    };
     let PrimitiveLiteral::Int(days) = value.literal() else {
         return Err(invalid("DATE manifest bound must contain a day offset"));
     };

@@ -180,11 +180,7 @@ fn an_identity_partition_column_becomes_a_frozen_constant() {
     };
     assert_eq!(value.as_ref(), Some(&IcebergLiteral::string("emea")));
 
-    let batch = RecordBatch::try_new(
-        Arc::clone(&file_schema),
-        vec![Arc::new(Int64Array::from(vec![1_i64, 2]))],
-    )
-    .expect("physical batch");
+    let batch = rows_without_stored_lineage(2);
     let facts = IcebergSplitFacts {
         path: "s3://bucket/data/file.parquet",
         file_first_row_id: None,
@@ -296,11 +292,8 @@ fn a_missing_column_with_an_initial_default_materializes_it() {
         IcebergColumnSource::InitialDefault
     ));
 
-    let batch = RecordBatch::try_new(
-        Arc::clone(&file_schema),
-        vec![Arc::new(Int64Array::from(vec![1_i64]))],
-    )
-    .expect("physical batch");
+    assert!(binding.root_projection().is_empty());
+    let batch = rows_without_stored_lineage(1);
     let facts = IcebergSplitFacts {
         path: "file.parquet",
         file_first_row_id: None,
@@ -403,28 +396,15 @@ fn every_legal_promotion_is_accepted_and_nothing_else_is() {
 }
 
 #[test]
-fn an_illegal_same_field_id_mismatch_fails_when_the_column_is_read() {
+fn an_illegal_same_field_id_mismatch_fails_before_the_reader_opens() {
     let schema = table_schema();
-    // Field id 1 is a LONG in the table schema; the file stores a string.
     let file_schema: SchemaRef = Arc::new(ArrowSchema::new(vec![
         Field::new("id", DataType::Utf8, false).with_metadata(field_id_metadata(1)),
     ]));
     let columns = vec![handle(&schema, 1)];
-    let binding = bind_scan_columns(empty_binding_request(&schema, &file_schema, &columns))
-        .expect("binds by field id");
-    let batch = RecordBatch::try_new(
-        Arc::clone(&file_schema),
-        vec![Arc::new(StringArray::from(vec!["1"]))],
-    )
-    .expect("physical batch");
-    let facts = IcebergSplitFacts {
-        path: "file.parquet",
-        file_first_row_id: None,
-        data_sequence_number: None,
-    };
-    let error = binding
-        .materialize(&batch, None, &facts)
+    let error = bind_scan_columns(empty_binding_request(&schema, &file_schema, &columns))
         .expect_err("string is not a legal source for a long");
+
     assert_eq!(
         error.kind(),
         novarocks_spi::connector::ConnectorErrorKind::CorruptData
@@ -1087,4 +1067,221 @@ fn nominal_largeint_defaults_keep_original_refusal_and_missing_nulls() {
             assert_eq!(values.null_count(), 2);
         }
     }
+}
+
+#[test]
+fn legacy_projection_uses_the_slots_returned_by_the_reader() {
+    let schema = table_schema();
+    let file_schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("old_region", DataType::Utf8, true),
+        Field::new("unused", DataType::Int32, true),
+        Field::new("old.id", DataType::Int64, false),
+    ]));
+    let mapping = crate::schema_mapping::parse_name_mapping(
+        r#"[{"field-id":1,"names":["old.id"]},{"field-id":2,"names":["old_region"]},{"field-id":3,"names":[]},{"names":["unused"]}]"#,
+    )
+    .expect("name mapping");
+    let columns = vec![handle(&schema, 1), handle(&schema, 2)];
+    let binding = bind_scan_columns(IcebergSchemaBindingRequest {
+        name_mapping: Some(Arc::new(mapping)),
+        ..empty_binding_request(&schema, &file_schema, &columns)
+    })
+    .expect("binds");
+    assert_eq!(binding.root_projection(), &[0, 2]);
+    let batch = RecordBatch::try_new(
+        Arc::new(file_schema.project(&[0, 2]).expect("reader schema")),
+        vec![
+            Arc::new(StringArray::from(vec!["old"])),
+            Arc::new(Int64Array::from(vec![91])),
+        ],
+    )
+    .expect("physical batch");
+    let facts = IcebergSplitFacts {
+        path: "legacy.parquet",
+        file_first_row_id: None,
+        data_sequence_number: None,
+    };
+    let values = binding.materialize(&batch, None, &facts).expect("columns");
+    assert_eq!(
+        values[0]
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0),
+        91
+    );
+    assert_eq!(
+        values[1]
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0),
+        "old"
+    );
+
+    let wrong = batch.project(&[1, 0]).expect("reordered physical fields");
+    assert!(binding.materialize(&wrong, None, &facts).is_err());
+}
+
+#[test]
+fn nested_reordering_and_defaults_preserve_the_original_parent_mask() {
+    let schema = IcebergSchema::builder()
+        .with_fields(vec![Arc::new(NestedField::optional(
+            10,
+            "details",
+            Type::Struct(StructType::new(vec![
+                Arc::new(NestedField::required(
+                    11,
+                    "left",
+                    Type::Primitive(PrimitiveType::Long),
+                )),
+                Arc::new(NestedField::optional(
+                    12,
+                    "right",
+                    Type::Primitive(PrimitiveType::Long),
+                )),
+                Arc::new(
+                    NestedField::required(13, "added", Type::Primitive(PrimitiveType::Long))
+                        .with_initial_default(IcebergLiteral::long(17)),
+                ),
+                Arc::new(NestedField::optional(
+                    14,
+                    "optional",
+                    Type::Primitive(PrimitiveType::Long),
+                )),
+            ])),
+        ))])
+        .build()
+        .expect("table schema");
+    let fields = Fields::from(vec![
+        Arc::new(
+            Field::new("earlier_right", DataType::Int64, false)
+                .with_metadata(field_id_metadata(12)),
+        ),
+        Arc::new(
+            Field::new("earlier_left", DataType::Int64, false).with_metadata(field_id_metadata(11)),
+        ),
+    ]);
+    let file_schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("earlier_details", DataType::Struct(fields.clone()), true)
+            .with_metadata(field_id_metadata(10)),
+    ]));
+    let stored = StructArray::new(
+        fields,
+        vec![
+            Arc::new(Int64Array::from(vec![91, 92])),
+            Arc::new(Int64Array::from(vec![15, 16])),
+        ],
+        Some(NullBuffer::from(vec![true, false])),
+    );
+    let batch = RecordBatch::try_new(file_schema.clone(), vec![Arc::new(stored)]).unwrap();
+    let root = handle(&schema, 10);
+    let columns = vec![
+        root.clone(),
+        root.dereference(&[13]).expect("default field"),
+    ];
+    let binding =
+        bind_scan_columns(empty_binding_request(&schema, &file_schema, &columns)).expect("binds");
+    let facts = IcebergSplitFacts {
+        path: "evolved.parquet",
+        file_first_row_id: None,
+        data_sequence_number: None,
+    };
+    let values = binding.materialize(&batch, None, &facts).expect("columns");
+    let details = values[0].as_any().downcast_ref::<StructArray>().unwrap();
+    assert!(details.is_null(1));
+    assert_eq!(
+        details
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0),
+        15
+    );
+    assert_eq!(
+        details
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0),
+        91
+    );
+    assert!(details.column(3).is_null(0));
+    let added = values[1].as_any().downcast_ref::<Int64Array>().unwrap();
+    assert_eq!(added.value(0), 17);
+    assert!(added.is_null(1));
+}
+
+#[test]
+fn missing_required_list_member_only_fails_for_reachable_elements() {
+    use crate::iceberg::spec::ListType;
+    use arrow::array::ListArray;
+    use arrow::buffer::OffsetBuffer;
+
+    let schema = IcebergSchema::builder()
+        .with_fields(vec![Arc::new(NestedField::optional(
+            1,
+            "items",
+            Type::List(ListType {
+                element_field: Arc::new(NestedField::list_element(
+                    2,
+                    Type::Struct(StructType::new(vec![Arc::new(NestedField::required(
+                        3,
+                        "new_child",
+                        Type::Primitive(PrimitiveType::Long),
+                    ))])),
+                    false,
+                )),
+            }),
+        ))])
+        .build()
+        .expect("table schema");
+    let fields = Fields::from(vec![Arc::new(
+        Field::new("old_child", DataType::Int64, true).with_metadata(field_id_metadata(4)),
+    )]);
+    let items = StructArray::new(
+        fields.clone(),
+        vec![Arc::new(Int64Array::from(vec![19, 25]))],
+        None,
+    );
+    let element = Arc::new(
+        Field::new("legacy_array", DataType::Struct(fields), true)
+            .with_metadata(field_id_metadata(2)),
+    );
+    let physical = ListArray::try_new(
+        element,
+        OffsetBuffer::new(vec![0, 1, 2].into()),
+        Arc::new(items),
+        Some(NullBuffer::from(vec![false, true])),
+    )
+    .expect("physical array");
+    let file_schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("legacy_items", physical.data_type().clone(), true)
+            .with_metadata(field_id_metadata(1)),
+    ]));
+    let batch = RecordBatch::try_new(file_schema.clone(), vec![Arc::new(physical)]).unwrap();
+    let columns = [handle(&schema, 1)];
+    let binding =
+        bind_scan_columns(empty_binding_request(&schema, &file_schema, &columns)).unwrap();
+    let facts = IcebergSplitFacts {
+        path: "older-list.parquet",
+        file_first_row_id: None,
+        data_sequence_number: None,
+    };
+    let concealed = binding
+        .materialize(&batch.slice(0, 1), None, &facts)
+        .unwrap();
+    let concealed = concealed[0].as_any().downcast_ref::<ListArray>().unwrap();
+    assert_eq!(concealed.value_offsets(), &[0, 1]);
+    assert!(concealed.is_null(0));
+    let error = binding
+        .materialize(&batch.slice(1, 1), None, &facts)
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("missing required field new_child")
+    );
 }

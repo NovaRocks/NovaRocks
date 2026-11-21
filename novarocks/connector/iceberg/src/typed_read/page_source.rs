@@ -219,8 +219,8 @@ fn file_predicate_value(value: &ConnectorValue) -> Option<MinMaxPredicateValue> 
 
 use super::runtime::IcebergReadLayout;
 use super::schema_binding::{
-    FileFieldIdCoverage, IcebergColumnSource, IcebergSchemaBinding, IcebergSchemaBindingRequest,
-    IcebergSplitFacts, bind_scan_columns,
+    IcebergColumnSource, IcebergSchemaBinding, IcebergSchemaBindingRequest, IcebergSplitFacts,
+    bind_decoder_columns, bind_scan_columns,
 };
 use super::split::{IcebergFileFormat, IcebergSplit, ParquetFileDecryptionData};
 use super::table_handle::IcebergTableHandle;
@@ -1178,12 +1178,7 @@ pub(super) fn plan_iceberg_prepared_input(
         partition_values: Some(&partition_values),
         columns: &bound_handles,
     })?;
-    let projection = match binding.coverage() {
-        FileFieldIdCoverage::None => FileProjection::All,
-        FileFieldIdCoverage::Complete => {
-            FileProjection::FieldIds(binding.physical_base_field_ids().to_vec())
-        }
-    };
+    let projection = FileProjection::RootIndices(binding.root_projection().to_vec());
     let range = if split.is_whole_file() {
         FileReadRange::WholeFile
     } else {
@@ -1266,7 +1261,7 @@ fn parse_name_mapping(json: Option<&str>) -> Result<Option<Arc<NameMapping>>, Co
     let Some(json) = json else {
         return Ok(None);
     };
-    let mapping: NameMapping = crate::metadata_json::from_str(json)
+    let mapping = crate::schema_mapping::parse_name_mapping(json)
         .map_err(|error| invalid(format!("iceberg name mapping json is invalid: {error}")))?;
     Ok(Some(Arc::new(mapping)))
 }
@@ -1476,7 +1471,7 @@ enum ReaderState {
         /// groups are still being chosen.
         reader: Option<SplitReader>,
         plan: RowGroupPlan,
-        binding: IcebergSchemaBinding,
+        binding: Box<IcebergSchemaBinding>,
         page_schema: Arc<ArrowSchema>,
         output_targets: Vec<arrow::datatypes::DataType>,
         checks: Vec<PredicateCheck>,
@@ -1695,7 +1690,7 @@ impl IcebergParquetPageSource {
         self.state = ReaderState::Open {
             reader: None,
             plan,
-            binding,
+            binding: Box::new(binding),
             page_schema,
             output_targets,
             checks,
@@ -1746,15 +1741,37 @@ impl IcebergParquetPageSource {
             return Ok(false);
         };
         let reader = self.open_reader(row_groups).await?;
-        Ok(self.install_reader(reader))
+        self.install_reader(reader)
     }
 
-    fn install_reader(&mut self, reader: SplitReader) -> bool {
-        let ReaderState::Open { reader: slot, .. } = &mut self.state else {
-            return false;
+    fn install_reader(&mut self, reader: SplitReader) -> Result<bool, ConnectorError> {
+        let ReaderState::Open {
+            reader: slot,
+            binding,
+            ..
+        } = &mut self.state
+        else {
+            return Ok(false);
         };
+        if let Some(file_schema) = reader.decoder_file_schema() {
+            let decoder_binding = bind_decoder_columns(IcebergSchemaBindingRequest {
+                table_schema: &self.table_schema,
+                file_schema,
+                name_mapping: self.name_mapping.clone(),
+                partition_spec: Some(&self.partition_spec),
+                partition_values: Some(&self.partition_values),
+                columns: &self.bound_handles,
+            })?;
+            if decoder_binding.root_projection() != binding.root_projection() {
+                return Err(corrupt(format!(
+                    "iceberg data file {} changed its bound Parquet root projection",
+                    self.split.path()
+                )));
+            }
+            **binding = decoder_binding;
+        }
         *slot = Some(reader);
-        true
+        Ok(true)
     }
 
     /// Chooses the next run's row groups against the filter as it stands now,
@@ -1897,14 +1914,7 @@ impl IcebergParquetPageSource {
                 "iceberg page source opened a reader before binding its columns",
             ));
         };
-        let projection = match binding.coverage() {
-            // A legacy file has no field ids to project by, so the whole file
-            // is opened and the name mapping resolves the columns afterwards.
-            FileFieldIdCoverage::None => FileProjection::All,
-            FileFieldIdCoverage::Complete => {
-                FileProjection::FieldIds(binding.physical_base_field_ids().to_vec())
-            }
-        };
+        let projection = FileProjection::RootIndices(binding.root_projection().to_vec());
         let range = if self.split.is_whole_file() {
             FileReadRange::WholeFile
         } else {
@@ -2097,7 +2107,9 @@ impl IcebergParquetPageSource {
     /// preparation, which report their own live retention.
     fn retained_base_bytes(&self) -> u64 {
         let binding = match &self.state {
-            ReaderState::Open { binding, .. } => binding.retained_size_in_bytes(),
+            ReaderState::Open { binding, .. } => binding
+                .retained_size_in_bytes()
+                .saturating_add(size_of::<IcebergSchemaBinding>() as u64),
             ReaderState::NotOpened | ReaderState::Drained => 0,
         };
         self.retained_bytes
