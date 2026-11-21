@@ -29,6 +29,7 @@ pub mod token;
 mod error;
 mod messages;
 mod span;
+mod syntax_call;
 
 pub use ast::validate_statement;
 pub use error::{
@@ -36,3 +37,4 @@ pub use error::{
 };
 pub use keyword::KeywordClass;
 pub use span::{LineCol, SYNTHETIC, Span};
+pub use syntax_call::{CanonicalCall, UnsupportedCallSyntax, canonical_call};

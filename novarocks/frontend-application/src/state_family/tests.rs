@@ -48,6 +48,10 @@ use crate::{
 };
 use bytes::Bytes;
 use novarocks_mv_application::state_family::MV_ACCELERATOR_STATE_FAMILY;
+use novarocks_mv_application::{
+    persistence::test_support::KeyedProjectionFixture, product::MvTarget,
+    state_store_repository::StateStoreMvRepository,
+};
 use novarocks_native_adapter::FrontendNativeTransport;
 use novarocks_native_trust::{
     DeploymentId, NativeCallerSubject, NativeTransportMode, NativeTrust, ValidatedSharedSecret,
@@ -55,9 +59,6 @@ use novarocks_native_trust::{
 use novarocks_secret::SecretValue;
 use novarocks_state_store_api::{Direction, Key, KeyRange, RangeRequest, StateStore};
 use novarocks_state_store_runtime::{StateStoreHost, StateStoreHostInput};
-use novarocks_table_maintenance::gc_observation::{
-    GC_OWNED_REF_OBSERVATION_STATE_FAMILY, GcOwnedRefObservation, GcOwnedRefObservationAccelerator,
-};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -70,6 +71,7 @@ const RETIRED_PREFIXES: &[&[u8]] = &[
     b"\0novarocks/cp/v1/lease/",
     b"novarocks/frontend/views/v1/",
     b"novarocks/frontend/views/v2/",
+    b"novarocks/frontend/table-maintenance/v7/",
 ];
 
 /// Every key in the store, paged over the whole keyspace.
@@ -115,9 +117,7 @@ fn assert_keys_conform(keys: &[Vec<u8>], workload: &str) {
     let mut unattributed = Vec::new();
     let mut forbidden = Vec::new();
     for key in keys {
-        if key.starts_with(GC_OWNED_REF_OBSERVATION_STATE_FAMILY.prefix().as_bytes())
-            || key.starts_with(MV_ACCELERATOR_STATE_FAMILY.prefix().as_bytes())
-        {
+        if key.starts_with(MV_ACCELERATOR_STATE_FAMILY.prefix().as_bytes()) {
             continue;
         }
         match StateFamily::for_key(key) {
@@ -227,7 +227,7 @@ fn backend_config() -> ClusterBackendOpenConfig {
 ///
 /// This is the part of the gate that exercises product code: opening the
 /// application opens every owner in the series - catalog desired state,
-/// backend membership, the MV accelerator, GC observations and the view
+/// backend membership, the MV accelerator and the view
 /// registry - and each one gets its chance to write. The retired coordination
 /// family wrote its control record on exactly this path.
 async fn open_application(input: StateStoreHostInput) -> FrontendApplicationHost {
@@ -309,47 +309,44 @@ async fn durable_records_written_by_real_owners_match_their_product_descriptor()
     .expect("open frontend StateStore host");
     let store = host.state_store().expect("configured StateStore");
 
-    let accelerator = GcOwnedRefObservationAccelerator::open(Arc::clone(&store), host.run_policy())
+    let accelerator = StateStoreMvRepository::open(Arc::clone(&store), host.run_policy())
         .await
-        .expect("open GC owned-ref observation accelerator");
-    let observation = GcOwnedRefObservation::try_new(
-        Uuid::from_u128(0x3c3),
-        "refs/tags/conformance".to_string(),
-        7,
-        1,
-        [0x5a; 32],
-        1,
-    )
-    .expect("valid owned-ref observation");
+        .expect("open MV Accelerator");
+    let target = MvTarget::from_parts(Some("ice"), "sales", "conformance_mv");
+    let projection = KeyedProjectionFixture::new(target, Some(9))
+        .build()
+        .unwrap();
     accelerator
-        .observe(observation, 1_700_000_000_000, 60_000)
+        .install_keyed_projection(Uuid::now_v7(), projection, None)
         .await
-        .expect("record an owned-ref observation");
-
+        .expect("write MV projection");
     let keys = scan_all_keys(&store).await;
     assert!(
         !keys.is_empty(),
-        "the GC accelerator wrote nothing, so this scan would prove nothing"
+        "the MV Accelerator wrote nothing, so this scan would prove nothing"
     );
-    assert_keys_conform(&keys, "recording a GC owned-ref observation");
+    assert_keys_conform(&keys, "writing an MV projection");
     assert_eq!(
         keys.iter()
-            .filter(|key| key.starts_with(GC_OWNED_REF_OBSERVATION_STATE_FAMILY.prefix().as_bytes()))
+            .filter(|key| key.starts_with(MV_ACCELERATOR_STATE_FAMILY.prefix().as_bytes()))
             .count(),
         keys.len(),
-        "a GC observation write touched a family other than its product descriptor"
+        "an MV projection write touched a family other than its product descriptor"
     );
 
     // Per-family wipe isolation: wiping this family clears exactly its own
     // prefix, and the store returns to empty because nothing else wrote.
-    accelerator
-        .wipe_family()
-        .await
-        .expect("wipe the GC observation family");
-    assert!(
-        scan_all_keys(&store).await.is_empty(),
-        "wiping one accelerator family left records behind"
-    );
+    #[cfg(novarocks_dev_controls)]
+    {
+        accelerator
+            .wipe_accelerator(Uuid::now_v7())
+            .await
+            .expect("wipe the MV Accelerator family");
+        assert!(
+            scan_all_keys(&store).await.is_empty(),
+            "wiping one accelerator family left records behind"
+        );
+    }
 
     drop(store);
     drop(accelerator);

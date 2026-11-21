@@ -14,14 +14,20 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//! Original IN state assembly and signed comparison. Scheduling stays outside
-//! this module; every input has already been evaluated by its original shell.
-//! Observation grants no memory. Raw entrypoints preserve complete data errors.
-use crate::KernelFailure;
+//! IN prepares its equality domain and assembles the ordered membership result.
+//! Scheduling stays with the caller, which supplies materialized, error-free inputs.
+use crate::opaque_memory::{OpaqueReservation, OpaqueRetainedCharge};
+use crate::selected_copy::{CopyError, fixed_interleave_extent};
+use crate::{
+    AggregateStateAllocator, ComparisonOperator, EvaluatedArgument, KernelControlObservation,
+    KernelEvaluationControl, KernelFailure, PreparedComparisonRecipe,
+    UnaccountedAggregateStateAllocator,
+};
 use arrow_array::builder::BooleanBuilder;
-use arrow_array::{Array, ArrayRef, BooleanArray, Int8Array, Int16Array, Int32Array, Int64Array};
+use arrow_array::{Array, ArrayRef, BooleanArray, StringArray};
 use arrow_schema::DataType;
-use std::convert::Infallible;
+use novarocks_type_contract::arrow_data_types_exact_observed;
+use std::{convert::Infallible, sync::Arc};
 #[derive(Clone, Copy, Debug)]
 pub enum InObservation {
     Step,
@@ -281,99 +287,63 @@ fn row_index(row: usize, len: usize) -> usize {
     if len == 1 { 0 } else { row }
 }
 
-fn is_signed_integer_type(data_type: &DataType) -> bool {
-    matches!(
-        data_type,
-        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
-    )
+/// Comparison buffers are destroyed before their original reservation is returned.
+/// Access borrows the values without publishing an independently owned Arrow array.
+pub struct MembershipEqualities {
+    array: BooleanArray,
+    _reservation: Option<OpaqueReservation>,
 }
-
-fn signed_integer_value(array: &ArrayRef, row: usize) -> Result<i64, KernelFailure> {
-    match array.data_type() {
-        DataType::Int8 => Ok(array
-            .as_any()
-            .downcast_ref::<Int8Array>()
-            .ok_or_else(|| contract("failed to downcast signed IN value to Int8Array"))?
-            .value(row) as i64),
-        DataType::Int16 => Ok(array
-            .as_any()
-            .downcast_ref::<Int16Array>()
-            .ok_or_else(|| contract("failed to downcast signed IN value to Int16Array"))?
-            .value(row) as i64),
-        DataType::Int32 => Ok(array
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .ok_or_else(|| contract("failed to downcast signed IN value to Int32Array"))?
-            .value(row) as i64),
-        DataType::Int64 => Ok(array
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .ok_or_else(|| contract("failed to downcast signed IN value to Int64Array"))?
-            .value(row)),
-        other => Err(contract(format_args!(
-            "unsupported signed IN value type: {other:?}"
-        ))),
+impl MembershipEqualities {
+    pub fn iter(&self) -> impl Iterator<Item = Option<bool>> + '_ {
+        self.array.iter()
+    }
+    pub fn apply_to_selected_observed<E>(
+        &self,
+        state: &mut InRows,
+        parents: &[usize],
+        observer: &mut dyn FnMut(InObservation) -> Result<(), E>,
+    ) -> Result<(), InError<E>> {
+        state.equalities_selected_observed(&self.array, parents, observer)
     }
 }
 
-/// A supported signed pair only; None preserves the original next dispatch.
-pub fn signed_equality_required(
-    input: &ArrayRef,
-    candidate: &ArrayRef,
-) -> Result<Option<BooleanArray>, KernelFailure> {
-    raw(|observe| signed_equality_observed(input, candidate, observe))
+fn boolean_buffer_bytes(rows: usize, has_nulls: bool) -> Result<usize, KernelFailure> {
+    fixed_interleave_extent(&DataType::Boolean, rows).map_err(CopyError::into_kernel)?;
+    let one = rows
+        .div_ceil(8)
+        .checked_next_multiple_of(64)
+        .ok_or(KernelFailure::ResourceExhausted)?;
+    one.checked_mul(1 + usize::from(has_nulls))
+        .ok_or(KernelFailure::ResourceExhausted)
 }
-pub fn signed_equality_observed<E>(
-    array: &ArrayRef,
-    candidate: &ArrayRef,
+
+fn append_equalities_observed<E>(
+    builder: &mut BooleanBuilder,
+    rows: usize,
     observer: &mut dyn FnMut(InObservation) -> Result<(), E>,
-) -> Result<Option<BooleanArray>, InError<E>> {
-    if !is_signed_integer_type(array.data_type())
-        || !is_signed_integer_type(candidate.data_type())
-        || (candidate.len() != 1 && candidate.len() != array.len())
-    {
-        return Ok(None);
-    }
-    // Original same-type full-column dispatch precedes its scalar/cross-width loop.
-    if candidate.len() == array.len() && array.data_type() == candidate.data_type() {
-        observe(observer, InObservation::OpaqueBoundary)?;
-        let result = arrow_ord::cmp::eq(
-            &array.as_ref() as &dyn arrow_array::Datum,
-            &candidate.as_ref() as &dyn arrow_array::Datum,
-        )
-        .map_err(|error| InError::Operation(arrow_failure(error)))?;
-        observe(observer, InObservation::OpaqueBoundary)?;
-        return Ok(Some(result));
-    }
-    observe(observer, InObservation::OpaqueBoundary)?;
-    let mut builder = BooleanBuilder::with_capacity(array.len());
-    observe(observer, InObservation::OpaqueBoundary)?;
-    for row in 0..array.len() {
+    mut equal: impl FnMut(usize) -> Result<Option<bool>, KernelFailure>,
+) -> Result<(), InError<E>> {
+    for row in 0..rows {
         observe(observer, InObservation::Step)?;
-        let candidate_row = row_index(row, candidate.len());
-        if array.is_null(row) || candidate.is_null(candidate_row) {
-            builder.append_null();
-            continue;
-        }
-        builder.append_value(
-            signed_integer_value(array, row).map_err(InError::Operation)?
-                == signed_integer_value(candidate, candidate_row).map_err(InError::Operation)?,
-        );
+        builder.append_option(equal(row).map_err(InError::Operation)?);
     }
-    observe(observer, InObservation::OpaqueBoundary)?;
-    let result = builder.finish();
-    observe(observer, InObservation::OpaqueBoundary)?;
-    Ok(Some(result))
+    Ok(())
 }
 
-/// Exactly checked signed and Utf8 native IN domains. Other comparison branches
-/// remain explicit unsupported preparation shapes pending their original author.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum MembershipEquality {
+    Comparison(PreparedComparisonRecipe),
+    Json,
+}
+
+/// Common exact typed domain and membership equality for an IN expression.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PreparedNativeInListRecipe {
     negated: bool,
     source: novarocks_type_contract::FunctionValueType,
     candidates: novarocks_type_contract::FunctionParameterTypes,
     result: novarocks_type_contract::FunctionValueType,
+    equality: MembershipEquality,
 }
 /// Original comparison refusal and actual construction cause stay distinct.
 #[derive(Debug)]
@@ -540,18 +510,8 @@ impl PreparedNativeInListRecipe {
                 .map_err(crate::ComparisonPrepareError::Kernel)?;
             crate::kernel_input::validate_type_observed(result, &mut work)
                 .map_err(crate::ComparisonPrepareError::Kernel)?;
-            let supported = match source.logical_type() {
-                ValueLogicalType::Physical => {
-                    is_signed_integer_type(source.data_type())
-                        || source.data_type() == &DataType::Utf8
-                }
-                ValueLogicalType::Json => source.data_type() == &DataType::Utf8,
-                _ => false,
-            };
-            if !supported {
-                return Err(crate::ComparisonPrepareError::Unsupported.into());
-            }
-            let mut nullable = source.nullable();
+            let mut comparison_right = source;
+            let mut nullable = source.nullable() || source.data_type() == &DataType::Null;
             if candidates.len() != 0 {
                 let layout = std::alloc::Layout::array::<novarocks_type_contract::FunctionValueType>(
                     candidates.len(),
@@ -570,9 +530,18 @@ impl PreparedNativeInListRecipe {
                 crate::kernel_input::validate_type_observed(candidate, &mut work)
                     .map_err(crate::ComparisonPrepareError::Kernel)?;
                 if candidate.logical_type() != source.logical_type()
-                    || candidate.data_type() != source.data_type()
+                    || !arrow_data_types_exact_observed::<crate::ComparisonPrepareError>(
+                        source.data_type(),
+                        candidate.data_type(),
+                        || work.step().map_err(Into::into),
+                    )?
                 {
                     return Err(crate::ComparisonPrepareError::TypeMismatch.into());
+                }
+                // All candidates have the same domain. Use an existing nullable
+                // declaration on the right if any candidate can produce SQL NULL.
+                if candidate.nullable() && !comparison_right.nullable() {
+                    comparison_right = candidate;
                 }
                 nullable |= candidate.nullable();
                 work.flush()?;
@@ -588,6 +557,18 @@ impl PreparedNativeInListRecipe {
                 return Err(crate::ComparisonPrepareError::TypeMismatch.into());
             }
             work.flush()?;
+            let equality = if source.logical_type() == ValueLogicalType::Json
+                && source.data_type() == &DataType::Utf8
+            {
+                MembershipEquality::Json
+            } else {
+                MembershipEquality::Comparison(PreparedComparisonRecipe::try_new(
+                    ComparisonOperator::Eq,
+                    source,
+                    comparison_right,
+                    control,
+                )?)
+            };
             let Some(types) = types else {
                 return Ok(None);
             };
@@ -623,6 +604,7 @@ impl PreparedNativeInListRecipe {
                 source: source.clone(),
                 candidates,
                 result: result.clone(),
+                equality,
             }))
         })();
         if matches!(
@@ -636,6 +618,102 @@ impl PreparedNativeInListRecipe {
         work.finish()?;
         outcome
     }
+    /// Compare one materialized operand pair over the same compact row domain.
+    /// A candidate with one physical row may be broadcast across the input.
+    pub fn membership_equalities_observed<E>(
+        &self,
+        input: &ArrayRef,
+        candidate: &ArrayRef,
+        host: Option<Arc<dyn AggregateStateAllocator>>,
+        control: &dyn KernelEvaluationControl,
+        observer: &mut dyn FnMut(InObservation) -> Result<(), E>,
+    ) -> Result<MembershipEqualities, InError<E>> {
+        if candidate.len() != 1 && candidate.len() != input.len() {
+            return Err(InError::Operation(contract(
+                "IN candidate length differs from input",
+            )));
+        }
+        let control = KernelControlObservation::new(control);
+        control.checkpoint(0).map_err(InError::Operation)?;
+        for values in [input, candidate] {
+            if !arrow_data_types_exact_observed(self.source.data_type(), values.data_type(), || {
+                control.checkpoint(1)
+            })
+            .map_err(InError::Operation)?
+            {
+                return Err(InError::Operation(contract(
+                    "IN comparison operand differs from the recipe carrier",
+                )));
+            }
+        }
+        observe(observer, InObservation::OpaqueBoundary)?;
+        let has_nulls = !input.is_empty()
+            && (input.null_count() != 0
+                || candidate.null_count() != 0
+                || input.data_type() == &DataType::Null);
+        let bytes = boolean_buffer_bytes(input.len(), has_nulls).map_err(InError::Operation)?;
+        let reservation = host
+            .as_ref()
+            .filter(|_| bytes != 0)
+            .map(|host| OpaqueRetainedCharge::try_new(Arc::clone(host))?.reserve_operation(bytes))
+            .transpose()
+            .map_err(InError::Operation)?;
+        let mut builder = BooleanBuilder::with_capacity(input.len());
+        match &self.equality {
+            MembershipEquality::Comparison(recipe) => {
+                let left = EvaluatedArgument::Column(input);
+                let right = if candidate.len() == 1 {
+                    EvaluatedArgument::Scalar(candidate)
+                } else {
+                    EvaluatedArgument::Column(candidate)
+                };
+                append_equalities_observed(&mut builder, input.len(), observer, |row| {
+                    recipe.compare_rows(left, row, row, right, row, row, &control)
+                })?;
+            }
+            MembershipEquality::Json => {
+                let left = input
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| InError::Operation(contract("IN JSON source is not Utf8")))?;
+                let right = candidate
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| InError::Operation(contract("IN JSON candidate is not Utf8")))?;
+                // Direct evaluation outside a Task uses the process heap as
+                // before. The Task caller supplies its actual Frame allocator.
+                let host = host.unwrap_or_else(|| Arc::new(UnaccountedAggregateStateAllocator));
+                let normalize = |values: &StringArray, row| {
+                    if values.is_null(row) {
+                        Ok(None)
+                    } else {
+                        crate::json_canonical::normalize_json_key(
+                            values.value(row),
+                            Arc::clone(&host),
+                            &control,
+                        )
+                        .map(Some)
+                    }
+                };
+                append_equalities_observed(&mut builder, input.len(), observer, |row| {
+                    // SQL NULL cannot hide a demanded invalid logical JSON value.
+                    let left = normalize(left, row)?;
+                    let right = normalize(right, row_index(row, candidate.len()))?;
+                    Ok(match (left, right) {
+                        (Some(left), Some(right)) => Some(left.as_bytes() == right.as_bytes()),
+                        _ => None,
+                    })
+                })?;
+            }
+        }
+        control.checkpoint(0).map_err(InError::Operation)?;
+        observe(observer, InObservation::OpaqueBoundary)?;
+        Ok(MembershipEqualities {
+            array: builder.finish(),
+            _reservation: reservation,
+        })
+    }
+
     pub fn negated(&self) -> bool {
         self.negated
     }
@@ -674,49 +752,30 @@ fn inlist_own_effects(
 }
 
 #[derive(Debug)]
-enum InOperationFailure {
-    Contract(novarocks_failure_contract::BoundedDetail),
-    Arrow(arrow_schema::ArrowError),
-}
+struct InOperationFailure(novarocks_failure_contract::BoundedDetail);
+
 impl std::fmt::Display for InOperationFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Contract(detail) => detail.fmt(f),
-            Self::Arrow(source) => source.fmt(f),
-        }
+        self.0.fmt(f)
     }
 }
-impl std::error::Error for InOperationFailure {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Arrow(source) => Some(source),
-            _ => None,
-        }
-    }
-}
+impl std::error::Error for InOperationFailure {}
 impl novarocks_failure_contract::FailureProjection for InOperationFailure {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
         use novarocks_failure_contract::*;
-        let (class, code) = match self {
-            Self::Contract(_) => (FailureClass::Invariant, 381),
-            Self::Arrow(arrow_schema::ArrowError::MemoryError(_)) => (FailureClass::Resource, 382),
-            Self::Arrow(_) => (FailureClass::Invariant, 383),
-        };
         FailureFact::new(
-            class,
-            FailureReason::new(domain::KERNEL, std::num::NonZeroU16::new(code).unwrap()),
+            FailureClass::Invariant,
+            FailureReason::new(domain::KERNEL, std::num::NonZeroU16::new(381).unwrap()),
         )
     }
 }
-pub fn contract(detail: impl std::fmt::Display) -> KernelFailure {
-    KernelFailure::from_domain(InOperationFailure::Contract(
+impl novarocks_failure_contract::OuterFailureProjection for InOperationFailure {}
+
+fn contract(detail: impl std::fmt::Display) -> KernelFailure {
+    KernelFailure::from_domain(InOperationFailure(
         novarocks_failure_contract::BoundedDetail::truncating_display(detail),
     ))
 }
-pub fn arrow_failure(source: arrow_schema::ArrowError) -> KernelFailure {
-    KernelFailure::from_domain(InOperationFailure::Arrow(source))
-}
-impl novarocks_failure_contract::OuterFailureProjection for InOperationFailure {}
 
 #[cfg(test)]
 mod tests;

@@ -14,12 +14,10 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//! Shared original signed IN/state/control witnesses. Not formal MEM admission.
-use super::{InError, InObservation, InRows, signed_equality_observed, signed_equality_required};
+//! Private IN state, construction, and control witnesses.
+use super::{InError, InObservation, InRows, PreparedNativeInListRecipe};
 use crate::{KernelDiagnostic, KernelEvaluationControl, KernelFailure};
-use arrow_array::{
-    Array, ArrayRef, BooleanArray, Int8Array, Int16Array, Int32Array, Int64Array, NullArray,
-};
+use arrow_array::{Array, ArrayRef, BooleanArray, Int32Array, Int64Array, NullArray};
 use arrow_schema::DataType;
 use std::{
     sync::{Arc, Mutex},
@@ -28,33 +26,6 @@ use std::{
 fn values(array: &BooleanArray) -> Vec<Option<bool>> {
     array.iter().collect()
 }
-fn source(width: usize) -> ArrayRef {
-    match width {
-        8 => Arc::new(Int8Array::from(vec![Some(-1), None, Some(7)])),
-        16 => Arc::new(Int16Array::from(vec![Some(-1), None, Some(7)])),
-        32 => Arc::new(Int32Array::from(vec![Some(-1), None, Some(7)])),
-        64 => Arc::new(Int64Array::from(vec![Some(-1), None, Some(7)])),
-        _ => unreachable!(),
-    }
-}
-#[test]
-fn inlist_core_signed_full_pair_matrix_original_nulls_and_scalar() {
-    for left in [8, 16, 32, 64] {
-        for right in [8, 16, 32, 64] {
-            let left = source(left);
-            let column = source(right);
-            assert_eq!(
-                values(&signed_equality_required(&left, &column).unwrap().unwrap()),
-                vec![Some(true), None, Some(true)]
-            );
-            let scalar = column.slice(0, 1);
-            assert_eq!(
-                values(&signed_equality_required(&left, &scalar).unwrap().unwrap()),
-                vec![Some(true), None, Some(false)]
-            );
-        }
-    }
-}
 #[test]
 fn inlist_core_original_match_dominates_null_and_root_null() {
     let input: ArrayRef = Arc::new(Int32Array::from(vec![Some(1), Some(2), None]));
@@ -62,17 +33,12 @@ fn inlist_core_original_match_dominates_null_and_root_null() {
     for negated in [false, true] {
         let mut state = InRows::begin_required(&input).unwrap();
         state.candidate_nulls_required(&candidate).unwrap();
-        state
-            .equalities_required(
-                &signed_equality_required(&input, &candidate)
-                    .unwrap()
-                    .unwrap(),
-            )
-            .unwrap();
+        let eq = BooleanArray::from(vec![Some(true), Some(false), None]);
+        state.equalities_required(&eq).unwrap();
         let null: ArrayRef = Arc::new(Int32Array::from(vec![None; 3]));
         state.candidate_nulls_required(&null).unwrap();
         state
-            .equalities_required(&signed_equality_required(&input, &null).unwrap().unwrap())
+            .equalities_required(&BooleanArray::from(vec![None; 3]))
             .unwrap();
         assert_eq!(
             values(&state.finish_required(&input, negated).unwrap()),
@@ -92,7 +58,7 @@ fn inlist_core_original_match_dominates_null_and_root_null() {
 }
 #[test]
 fn inlist_core_original_length_message_is_full_and_empty_assembly_exact() {
-    let input = source(32);
+    let input: ArrayRef = Arc::new(Int32Array::from(vec![Some(-1), None, Some(7)]));
     let mut state = InRows::begin_required(&input).unwrap();
     let empty = input.slice(0, 0);
     assert_eq!(
@@ -148,11 +114,22 @@ fn invoke(control: &dyn KernelEvaluationControl) -> Result<BooleanArray, InError
         control.checkpoint(due)
     };
     let input: ArrayRef = Arc::new(Int64Array::from(vec![Some(7); 513]));
-    let candidate: ArrayRef = Arc::new(Int8Array::from(vec![Some(7)]));
+    let candidate: ArrayRef = Arc::new(Int64Array::from(vec![Some(7)]));
+    let ty = novarocks_type_contract::FunctionValueType::new(DataType::Int64, true);
+    let result = novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true);
+    let recipe = PreparedNativeInListRecipe::try_new(
+        false,
+        &ty,
+        &[&ty],
+        &result,
+        crate::binding_test_control(),
+    )
+    .unwrap();
     let mut state = InRows::begin_observed(&input, &mut observe)?;
     state.candidate_nulls_observed(&candidate, &mut observe)?;
-    let eq = signed_equality_observed(&input, &candidate, &mut observe)?.unwrap();
-    state.equalities_observed(&eq, &mut observe)?;
+    let eq =
+        recipe.membership_equalities_observed(&input, &candidate, None, control, &mut observe)?;
+    state.equalities_observed(&eq.array, &mut observe)?;
     state.finish_observed(&input, false, &mut observe)
 }
 #[test]
@@ -183,7 +160,10 @@ fn inlist_core_every_real_callback_preserves_all_seven_causes_without_footer() {
                 trace: Mutex::new(Vec::new()),
                 fail: Some((at, cause.clone())),
             };
-            assert!(matches!(invoke(&control),Err(InError::Host(found)) if found==*cause));
+            assert!(matches!(
+                invoke(&control),
+                Err(InError::Host(found) | InError::Operation(found)) if found == *cause
+            ));
             assert_eq!(
                 *control.trace.lock().unwrap(),
                 trace[..at],
@@ -194,7 +174,7 @@ fn inlist_core_every_real_callback_preserves_all_seven_causes_without_footer() {
 }
 
 #[test]
-fn inlist_recipe_exact_signed_widths_nullable_result_and_foreign_carriers() {
+fn inlist_recipe_exact_flat_widths_nullable_result_and_foreign_carriers() {
     use crate::{ComparisonPrepareError, PreparedNativeInListRecipe};
     use arrow_schema::DataType;
     use novarocks_type_contract::{
@@ -213,6 +193,9 @@ fn inlist_recipe_exact_signed_widths_nullable_result_and_foreign_carriers() {
         DataType::Int32,
         DataType::Int64,
         DataType::Utf8,
+        DataType::UInt64,
+        DataType::Null,
+        DataType::Decimal128(4, 0),
     ] {
         let input = FunctionValueType::from_legacy_declared_projection(data_type.clone(), false);
         let nullable = FunctionValueType::from_legacy_declared_projection(data_type, true);
@@ -243,20 +226,18 @@ fn inlist_recipe_exact_signed_widths_nullable_result_and_foreign_carriers() {
             );
         }
     }
-    for ty in [DataType::UInt64, DataType::Null, DataType::Decimal128(4, 0)] {
-        let input = FunctionValueType::from_legacy_declared_projection(ty, true);
-        assert_eq!(
-            PreparedNativeInListRecipe::try_new(
-                false,
-                &input,
-                &[],
-                &FunctionValueType::new(DataType::Boolean, true),
-                &Compile
-            )
-            .unwrap_err(),
-            ComparisonPrepareError::Unsupported
-        );
-    }
+    let input = FunctionValueType::new(unsupported_list_type(), true);
+    assert_eq!(
+        PreparedNativeInListRecipe::try_new(
+            false,
+            &input,
+            &[&input],
+            &FunctionValueType::new(DataType::Boolean, true),
+            &Compile
+        )
+        .unwrap_err(),
+        ComparisonPrepareError::Unsupported
+    );
 }
 #[test]
 fn inlist_shared_selected_parent_mapping_truthonly_and_error_placeholder_are_distinct() {
@@ -521,6 +502,14 @@ fn inlist_recipe_created_callbacks_keep_original_control_and_no_request_tail() {
     }
 }
 
+fn unsupported_list_type() -> DataType {
+    DataType::List(Arc::new(arrow_schema::Field::new(
+        "item",
+        DataType::Int64,
+        true,
+    )))
+}
+
 #[test]
 fn inlist_borrowed_refinement_matches_original_profile_effects_and_control_prefix() {
     use crate::PreparedNativeInListRecipe;
@@ -634,7 +623,7 @@ fn inlist_borrowed_refinement_matches_original_profile_effects_and_control_prefi
     }
     let required_target = FunctionValueType::new(DataType::Boolean, false);
     let foreign_candidate = FunctionValueType::new(DataType::Int32, true);
-    let unsupported_source = FunctionValueType::new(DataType::Float64, true);
+    let unsupported_source = FunctionValueType::new(unsupported_list_type(), true);
     for (input, candidate, output) in [
         (&source, &source, &required_target),
         (&source, &foreign_candidate, &target),
@@ -687,7 +676,7 @@ fn inlist_borrowed_refinement_matches_original_profile_effects_and_control_prefi
 #[test]
 fn inlist_operation_guards_are_unmaskable_and_do_not_mutate_the_match_state() {
     use novarocks_failure_contract::{FailureClass, FailureProjection};
-    let input = source(32);
+    let input: ArrayRef = Arc::new(Int32Array::from(vec![Some(-1), None, Some(7)]));
     let mut state = InRows::begin_required(&input).unwrap();
     let failure = state
         .equalities_required(&BooleanArray::from(vec![true]))
@@ -707,35 +696,6 @@ fn inlist_operation_guards_are_unmaskable_and_do_not_mutate_the_match_state() {
         matches!(failure, InError::Operation(ref cause) if cause.failure_fact().class() == FailureClass::Invariant)
     );
 }
-#[test]
-fn inlist_actual_arrow_equality_error_retains_sdk_source_without_its_inputs() {
-    use novarocks_failure_contract::{FailureClass, FailureProjection};
-    use std::error::Error;
-    let left: ArrayRef = Arc::new(Int32Array::from(vec![1]));
-    let right: ArrayRef = Arc::new(arrow_array::StringArray::from(vec!["one"]));
-    let weak = Arc::downgrade(&right);
-    let source = arrow_ord::cmp::eq(
-        &left.as_ref() as &dyn arrow_array::Datum,
-        &right.as_ref() as &dyn arrow_array::Datum,
-    )
-    .unwrap_err();
-    let original = source.to_string();
-    let failure = super::arrow_failure(source);
-    drop(left);
-    drop(right);
-    assert!(weak.upgrade().is_none());
-    assert_eq!(failure.failure_fact().class(), FailureClass::Invariant);
-    let source = failure
-        .source()
-        .unwrap()
-        .source()
-        .unwrap()
-        .source()
-        .unwrap();
-    assert!(source.downcast_ref::<arrow_schema::ArrowError>().is_some());
-    assert_eq!(source.to_string(), original);
-}
-
 #[test]
 fn inlist_json_profile_preserves_nominal_evidence_and_rejects_plain_text_mixing() {
     use novarocks_type_contract::{

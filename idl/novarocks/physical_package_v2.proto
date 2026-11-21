@@ -391,23 +391,24 @@ message UnaryExpression {
   optional uint32 expr_id = 2;
 }
 enum UnaryOperator {
+  reserved 1, 2, 4;
+  reserved "UNARY_OPERATOR_PLUS", "UNARY_OPERATOR_MINUS", "UNARY_OPERATOR_BITWISE_NOT";
   UNARY_OPERATOR_UNSPECIFIED = 0;
-  UNARY_OPERATOR_PLUS = 1;
-  UNARY_OPERATOR_MINUS = 2;
   UNARY_OPERATOR_NOT = 3;
-  UNARY_OPERATOR_BITWISE_NOT = 4;
 }
 message BinaryExpression {
   optional uint32 left_expr_id = 1;
   BinaryOperator op = 2;
   optional uint32 right_expr_id = 3;
   novarocks.physical_semantics_v2.DecimalOverflowPolicy decimal_overflow_policy = 4;
-  // Required for all five arithmetic operations; absent for comparison/bitwise.
+  // Required for all five arithmetic operations; absent for comparisons.
   // The typed decoder checks the closed AllowThrowException key and resolves
   // this exact lexical reference from the package's sole parameter table.
   novarocks.physical_semantics_v2.SemanticParameterRef allow_throw_exception = 5;
 }
 enum BinaryOperator {
+  reserved 13 to 15;
+  reserved "BINARY_OPERATOR_BIT_AND", "BINARY_OPERATOR_BIT_OR", "BINARY_OPERATOR_BIT_XOR";
   BINARY_OPERATOR_UNSPECIFIED = 0;
   BINARY_OPERATOR_ADD = 1;
   BINARY_OPERATOR_SUBTRACT = 2;
@@ -421,9 +422,6 @@ enum BinaryOperator {
   BINARY_OPERATOR_LT_EQ = 10;
   BINARY_OPERATOR_GT = 11;
   BINARY_OPERATOR_GT_EQ = 12;
-  BINARY_OPERATOR_BIT_AND = 13;
-  BINARY_OPERATOR_BIT_OR = 14;
-  BINARY_OPERATOR_BIT_XOR = 15;
 }
 message FunctionCall {
   optional uint32 function_binding_id = 1;

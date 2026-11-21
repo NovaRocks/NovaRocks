@@ -25,10 +25,13 @@ use crate::query_execution::{
 };
 use crate::task_execution::blocking_io::ConnectorBlockingIoResponsibility;
 use novarocks_spi::connector::{self as spi, read_stack as read};
+use std::sync::Weak;
 
 #[derive(Default)]
 pub(crate) struct OriginalSplitObservation {
     pub(crate) call: Arc<ReadCloseGate>,
+    pub(crate) admission_handoff:
+        Mutex<Weak<crate::task_execution::host::transport::OriginalSendHandoff>>,
     pub(crate) closes: AtomicUsize,
     pub(crate) drops: AtomicUsize,
 }

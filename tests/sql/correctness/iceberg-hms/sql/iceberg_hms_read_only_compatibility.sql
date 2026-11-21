@@ -204,10 +204,10 @@ ALTER TABLE ice_hms_${uuid0}.iru7_${uuid0}.v2 EXECUTE add_files(location => '${i
 -- query 41
 -- Expire snapshots
 -- @expect_error=Hive Metastore catalog is a read-only compatibility entry
-ALTER TABLE ice_hms_${uuid0}.iru7_${uuid0}.v3 EXECUTE expire_snapshots(retain_last => 1);
+ALTER TABLE ice_hms_${uuid0}.iru7_${uuid0}.v3 EXECUTE expire_snapshots(retention_threshold => '7d', retain_last => 1, clean_expired_metadata => true);
 
 -- query 42
--- Rewrite manifests
+-- Optimize manifests
 -- @expect_error=Hive Metastore catalog is a read-only compatibility entry
 ALTER TABLE ice_hms_${uuid0}.iru7_${uuid0}.v3 EXECUTE optimize_manifests;
 
@@ -217,7 +217,7 @@ ALTER TABLE ice_hms_${uuid0}.iru7_${uuid0}.v3 EXECUTE optimize_manifests;
 -- @expect_sql_code=query.execution.unsupported
 -- @expect_sql_phase=Execution
 -- @expect_error=[query.execution.unsupported] table-maintenance original operation failed
-ALTER TABLE ice_hms_${uuid0}.iru7_${uuid0}.v3 EXECUTE remove_orphan_files(older_than => '2020-01-01 00:00:00');
+ALTER TABLE ice_hms_${uuid0}.iru7_${uuid0}.v3 EXECUTE remove_orphan_files(retention_threshold => '7d');
 
 -- query 44
 -- Rewrite data files

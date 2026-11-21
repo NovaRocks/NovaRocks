@@ -104,8 +104,28 @@ pub(crate) async fn load_frontend_table_async(
     request: ConnectorTableRequest,
 ) -> Result<ConnectorTableMetadata, ConnectorError> {
     let control = request.context.original_operation_control();
+    prepare_frontend_table(metadata, control, || metadata.prepare_table(request)).await
+}
+
+/// Load the complete original source observation for row-level mutation admission.
+pub(crate) async fn load_frontend_source_table_async(
+    metadata: &dyn ConnectorMetadata,
+    request: ConnectorTableRequest,
+) -> Result<ConnectorTableMetadata, ConnectorError> {
+    let control = request.context.original_operation_control();
+    prepare_frontend_table(metadata, control, || metadata.prepare_source_table(request)).await
+}
+
+async fn prepare_frontend_table<F>(
+    metadata: &dyn ConnectorMetadata,
+    control: ConnectorOperationControlView,
+    prepare: impl FnOnce() -> F,
+) -> Result<ConnectorTableMetadata, ConnectorError>
+where
+    F: Future<Output = Result<novarocks_spi::connector::ConnectorTablePreparation, ConnectorError>>,
+{
     observe_schema_control(&control).map_err(ConnectorError::compile_interruption)?;
-    let preparation = metadata.prepare_table(request).await?;
+    let preparation = prepare().await?;
     with_original_control(control, |creation| {
         metadata.create_prepared_table(preparation, creation)
     })

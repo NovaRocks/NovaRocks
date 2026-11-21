@@ -23,7 +23,7 @@ code-anchors:
   - "novarocks/frontend-application/src/query/set_action.rs (SetStatementAction::poll_set)"
 ---
 
-[ADR-0245](ADR-0245-parquet-reader-sizing-and-scan-output-policy.md) 更新本记录关于生产 catalog 声明为空、BE 读设置尚未传递的阶段性安排。Iceberg 已有真实 catalog 声明，读侧按准确控制代和绑定提取原语句覆盖，BE 消费冻结的私有读载荷。声明、必求值、一次提交和原身份规则继续适用。
+[ADR-0247](ADR-0247-parquet-reader-sizing-and-scan-output-policy.md) 更新本记录关于生产 catalog 声明为空、BE 读设置尚未传递的阶段性安排。Iceberg 已有真实 catalog 声明，读侧按准确控制代和绑定提取原语句覆盖，BE 消费冻结的私有读载荷。声明、必求值、一次提交和原身份规则继续适用。
 
 ## 问题
 

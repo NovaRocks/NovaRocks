@@ -902,6 +902,10 @@ impl IcebergAttemptTableAccess {
         &self.identifier
     }
 
+    pub(crate) fn metadata_location(&self) -> Option<&str> {
+        self.metadata_location.as_deref()
+    }
+
     pub(crate) fn renewal(&self) -> Option<IcebergVendedS3RenewalCapability> {
         self.renewal.clone()
     }

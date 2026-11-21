@@ -46,7 +46,7 @@ fn register_delete(
     let mut proof = physical.map(|physical| received_write_proof(target, physical));
     handle
         .with_active_receiving(|received| {
-            received.begin_query(query, &[target], &mut proof, handle.targets())
+            received.begin_query(query, &[target], &mut proof, handle.targets(), None)
         })
         .unwrap();
     (query, target)

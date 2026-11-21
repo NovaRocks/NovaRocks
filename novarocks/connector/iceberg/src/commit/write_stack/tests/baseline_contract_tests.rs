@@ -391,7 +391,9 @@ fn empty_delete_session(version: crate::iceberg::spec::FormatVersion, variant: b
             purpose: ConnectorWriteAdmissionPurpose::OrdinaryDml,
             input,
             base: Some(preparation.base_version().clone()),
-            flavor: ConnectorWriteSessionFlavor::RowMutation,
+            flavor: ConnectorWriteSessionFlavor::RowMutation {
+                admission: preparation.admission(),
+            },
             context: context.clone(),
         })
         .expect("prepared empty-base DELETE must acquire its real session");

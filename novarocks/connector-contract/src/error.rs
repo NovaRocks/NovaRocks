@@ -36,6 +36,24 @@ pub enum ConnectorErrorKind {
     Internal,
 }
 
+/// An actual table metadata version which the provider decoder cannot load.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConnectorTableFormatVersionUnsupported(pub u64);
+
+impl fmt::Display for ConnectorTableFormatVersionUnsupported {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "Unsupported table format version {}", self.0)
+    }
+}
+
+impl std::error::Error for ConnectorTableFormatVersionUnsupported {}
+
+impl novarocks_failure_contract::FailureProjection for ConnectorTableFormatVersionUnsupported {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        ConnectorErrorKind::Unsupported.failure_fact()
+    }
+}
+
 /// Typed classification for a current-table binding rejection.
 ///
 /// A durable caller must distinguish a missing logical target from a target

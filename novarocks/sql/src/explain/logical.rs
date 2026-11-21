@@ -27,6 +27,7 @@ use crate::analysis::{
     BinOp, ExprKind, JoinKind, LiteralValue, ProjectItem, SortItem, TypedExpr, UnOp,
 };
 use crate::common::ApplyKind;
+use crate::common::negation::{typed_operand, typed_operand_has_lower_precedence, write_negation};
 use crate::planner::logical::{LogicalPlanKind, LogicalPlanNode};
 use crate::planner::payload::{PlanAssertOneRowNode, PlanRowCountAssertion, WindowExpr};
 use crate::planner::table::{
@@ -652,6 +653,13 @@ fn expression(
         return Err(fmt::Error);
     }
     let next = depth + 1;
+    if let Some(operand) = typed_operand(expr) {
+        let needs_parentheses = typed_operand_has_lower_precedence(operand)
+            || matches!(operand.kind, ExprKind::Nested(_));
+        return write_negation(out, needs_parentheses, |out| {
+            expression(out, operand, next, diagnostic)
+        });
+    }
     match &expr.kind {
         ExprKind::ColumnRef {
             qualifier, column, ..
@@ -716,8 +724,6 @@ fn expression(
         ExprKind::UnaryOp { op, expr } => {
             out.write_str(match op {
                 UnOp::Not => "NOT ",
-                UnOp::Negate => "- ",
-                UnOp::BitwiseNot => "~ ",
             })?;
             expression(out, expr, next, diagnostic)
         }

@@ -72,7 +72,7 @@ ANALYZE lnp_3c_${suite_uuid0}.ns_${uuid0}.orders;
 -- A completed maintenance command must leave provider-owned lake truth that
 -- survives a process restart.  It must not recover an old FE job record.
 -- @restart_fe_after_step=true
--- @skip_result_check=true
+-- @order_sensitive=true
 ALTER TABLE lnp_3c_${suite_uuid0}.ns_${uuid0}.orders EXECUTE optimize_manifests;
 
 -- query 10

@@ -2558,13 +2558,13 @@ fn intrinsic_reference_closure_rejects_missing_wrong_key_and_unconsumed_values()
 fn intrinsic_operator_profiles_refuse_missing_extra_or_foreign_key_refs() {
     let mut constants = crate::tests::constant_fixture::ConstantFixture::new();
     let input = intrinsic_package_fixture(&mut constants);
-    for mutation in 0..4 {
+    for mutation in 0..3 {
         let error = candidate_fixture_unit(&input.fragment, input.fragment.root(), |parts| {
             let expression = parts
                 .definitions
                 .iter_mut()
                 .find(|expression| {
-                    if mutation == 3 {
+                    if mutation == 2 {
                         matches!(expression.kind, ExprKind::Cast { .. })
                     } else {
                         matches!(expression.kind, ExprKind::Binary { .. })
@@ -2573,12 +2573,10 @@ fn intrinsic_operator_profiles_refuse_missing_extra_or_foreign_key_refs() {
                 .unwrap();
             match &mut expression.kind {
                 ExprKind::Binary {
-                    op,
                     allow_throw_exception,
                     ..
                 } => match mutation {
                     0 => *allow_throw_exception = None,
-                    1 => *op = BinaryOperator::BitAnd,
                     _ => {
                         *allow_throw_exception = Some(SemanticParameterRef {
                             id: SemanticParameterId::new(0),

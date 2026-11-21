@@ -6,6 +6,9 @@ status: active
 supersedes: []
 superseded-by: null
 partially-superseded-by:
+  - id: ADR-0244
+    scope: "RefUnchanged and the conservative conflict-domain policy for ordinary Iceberg DELETE, UPDATE, and MERGE"
+    link: "ADR-0244-iceberg-row-dml-conflict-validation.md"
   - id: ADR-0239
     scope: "Section 1 addition representation for compact receiving; WholeSet intents, dependencies, inheritance and publication authority remain active"
     link: "ADR-0239-iceberg-compact-receiving-and-rolling-manifests.md"
@@ -43,6 +46,8 @@ code-anchors:
   - "novarocks/connector/iceberg/src/commit/recovery.rs (FrozenPublicationFacts)"
   - "novarocks/connector/iceberg/src/catalog_control/staged_create/publication.rs (publish)"
 ---
+
+> [ADR-0244](ADR-0244-iceberg-row-dml-conflict-validation.md) 更新本裁决中普通 Iceberg DELETE、UPDATE、MERGE 的保守冲突策略、依赖选择与阶段性重评条件。不可变意图、依赖框架和发布权继续适用。
 
 ## 问题
 

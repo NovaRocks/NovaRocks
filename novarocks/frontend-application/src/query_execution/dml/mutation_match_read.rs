@@ -17,9 +17,9 @@
 
 use novarocks_parser::{ast, build};
 use novarocks_spi::connector::{
-    CONNECTOR_FIELD_HIDDEN_FROM_SQL, ConnectorControlPlanningPin, ConnectorReadSelector,
-    ConnectorRowMutationPreparation, ConnectorTableColumnRole, ConnectorTableMetadata,
-    ConnectorTablePlanningFacts,
+    CONNECTOR_FIELD_HIDDEN_FROM_SQL, ConnectorControlPlanningPin, ConnectorError,
+    ConnectorReadSelector, ConnectorRowMutationPreparation, ConnectorTableColumnRole,
+    ConnectorTableMetadata, ConnectorTablePlanningFacts,
 };
 use novarocks_sql::planning::catalog::{ConnectorReadTableFacts, materialize_connector_read_table};
 use novarocks_types::schema::ColumnDef;
@@ -29,6 +29,48 @@ use crate::catalog_application::query_bindings::{
 };
 use crate::catalog_application::query_materializer::QueryLocalTableOverlay;
 use crate::catalog_application::resolver::TargetBackend;
+
+/// Admit the ordinary row-level target through the statement's existing planning pin.
+pub(super) async fn load_row_mutation_target(
+    target: &TargetBackend,
+    planning_pin: ConnectorControlPlanningPin,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<
+    crate::connector::write_target::ConnectorWriteTargetBinding,
+    crate::dml::error::DmlExecutionError,
+> {
+    let project = |error| {
+        novarocks_query_application::session_error::QueryServiceError::from_failure_cause(
+            novarocks_failure_contract::SharedFailureCause::new(error),
+        )
+    };
+    let context =
+        crate::connector::context_for_planning_pin_typed(&planning_pin, connector_context.clone())
+            .map_err(project)?;
+    let identity = novarocks_spi::connector::ConnectorTableIdentity {
+        instance_id: planning_pin.binding().descriptor().instance_id.clone(),
+        namespace: target.namespace.as_str().into(),
+        table: target.table.as_str().into(),
+    };
+    let metadata = crate::connector::schema_creation::load_frontend_source_table_async(
+        planning_pin.binding().metadata().as_ref(),
+        novarocks_spi::connector::ConnectorTableRequest {
+            table: identity.clone(),
+            resolution: novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+            context,
+        },
+    )
+    .await
+    .map_err(project)?;
+    if metadata.identity != identity || metadata.table.owner() != &identity.instance_id {
+        return Err(project(ConnectorError::new(
+            novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
+            "row mutation target differs from its original table observation",
+        ))
+        .into());
+    }
+    Ok(crate::connector::write_target::ConnectorWriteTargetBinding::new(metadata, planning_pin))
+}
 
 /// Keep the signed target read under the same generation and original table
 /// observation. Only the generated target occurrence is assigned this overlay.
@@ -98,6 +140,7 @@ pub(super) fn bind_mutation_match_read(
 
     let schema = preparation.match_source_schema().clone();
     let snapshot = preparation.base_version_ordinal();
+    let preparation_digest = preparation.digest();
     let (columns, hidden) = match_source_columns(preparation, original)?;
     let key = QueryTableBindingKey::strict_base(&target.catalog, &target.namespace, &table);
     let (catalog, namespace) = (target.catalog.clone(), target.namespace.clone());
@@ -128,6 +171,7 @@ pub(super) fn bind_mutation_match_read(
                 admission: QueryTableBindingAdmission::RowMutationMatch(
                     planning_pin.clone(),
                     snapshot,
+                    preparation_digest,
                 ),
                 source_metadata: Some(original.clone()),
                 scan_materialization: Some(QueryScanMaterialization {

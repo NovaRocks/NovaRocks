@@ -14,11 +14,11 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use super::fixtures::assert_original_same_owner;
+use super::fixtures::{assert_original_same_owner, compile_table_free, session};
 use arrow::datatypes::DataType;
-use novarocks_expression_contract::{ExprKind, UnaryOperator};
+use novarocks_expression_contract::ExprKind;
 use novarocks_functions::{KernelEvaluationControl, KernelFailure};
-use novarocks_sql::compiler::check_pure_call_definitions_observed;
+use novarocks_sql::compiler::{SqlCompileControl, check_pure_call_definitions_observed};
 use novarocks_sql_testkit::sql_source;
 use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
 use std::time::Duration;
@@ -38,6 +38,18 @@ impl KernelEvaluationControl for Control {
         panic!("numeric transaction never waits")
     }
 }
+fn negation_input(kind: &ExprKind) -> Option<novarocks_expression_contract::ExprId> {
+    let ExprKind::FunctionCall { function, args } = kind else {
+        return None;
+    };
+    let [input] = args.as_ref() else {
+        return None;
+    };
+    (novarocks_type_contract::OperatorFunction::from_function_id(&function.function_id)
+        == Some(novarocks_type_contract::OperatorFunction::Negation))
+    .then_some(*input)
+}
+
 #[test]
 fn numeric_unary_original_nonnull_sql_baseline_three_narrow_widths_remain_nonnullable() {
     for (ty, min, dtype) in [
@@ -63,20 +75,11 @@ fn numeric_unary_original_nonnull_sql_baseline_three_narrow_widths_remain_nonnul
                 .filter_map(|node| node.expressions.as_deref())
                 .flat_map(|unit| unit.definitions().iter().map(move |expr| (unit, expr)))
             {
-                if matches!(
-                    expr.kind,
-                    ExprKind::Unary {
-                        op: UnaryOperator::Minus,
-                        ..
-                    }
-                ) {
+                if let Some(input) = negation_input(&expr.kind) {
                     actual_minus += 1;
                     assert_eq!(expr.ty.data_type().clone(), dtype);
                     assert!(!expr.ty.nullable());
-                    let ExprKind::Unary { expr: input, .. } = &expr.kind else {
-                        unreachable!();
-                    };
-                    let input = unit.definition(*input).unwrap();
+                    let input = unit.definition(input).unwrap();
                     assert_eq!(input.ty.data_type(), &dtype);
                     assert!(!input.ty.nullable());
                 }
@@ -84,7 +87,7 @@ fn numeric_unary_original_nonnull_sql_baseline_three_narrow_widths_remain_nonnul
         }
         assert!(
             actual_minus > 0,
-            "fixture must retain the actual original Minus definition"
+            "fixture must retain the actual negation call"
         );
     }
 }
@@ -144,14 +147,79 @@ fn numeric_unary_owned_transaction_actual_aggregate_window_and_table_sources_pub
                 .filter_map(|node| node.expressions.as_deref())
                 .flat_map(|unit| unit.definitions())
             {
-                if let ExprKind::Unary {
-                    op: UnaryOperator::Minus,
-                    ..
-                } = &expr.kind
-                {
+                if negation_input(&expr.kind).is_some() {
                     assert!(!expr.ty.nullable());
                 }
             }
         }
     }
+}
+
+#[test]
+fn decimal_negation_follows_the_actual_physical_nullability_and_width() {
+    for (ty, value) in [
+        (DataType::Decimal128(23, 4), "1000000000000000000.0001"),
+        (
+            DataType::Decimal256(43, 9),
+            "1000000000000000000000000000000000.000000001",
+        ),
+    ] {
+        for (sql, nullable) in [
+            (format!("SELECT -({value}) AS negated"), false),
+            (
+                format!("SELECT -k AS negated FROM (VALUES ({value}), (NULL)) AS v(k)"),
+                true,
+            ),
+        ] {
+            let owner = compile_table_free(
+                &sql,
+                session(Default::default(), false),
+                &SqlCompileControl::unbounded(),
+            )
+            .unwrap();
+            assert_negation_type(&owner, &ty, nullable);
+        }
+    }
+}
+
+#[test]
+fn negation_follows_grouping_set_null_extension() {
+    let ty = DataType::Int64;
+    for (sql, nullable) in [
+        ("SELECT -k AS negated FROM fixture", false),
+        (
+            "SELECT -k AS negated FROM fixture GROUP BY GROUPING SETS ((k), ())",
+            true,
+        ),
+    ] {
+        assert_negation_type(&sql_source(sql, ty.clone()), &ty, nullable);
+    }
+}
+
+fn assert_negation_type(
+    owner: &novarocks_sql::compiler::SqlAuthoredPhysicalPlan,
+    ty: &DataType,
+    nullable: bool,
+) {
+    let port = owner.plan().result_port().unwrap();
+    assert_eq!(port.fields[0].ty.data_type(), ty);
+    assert_eq!(port.fields[0].ty.nullable(), nullable);
+    let mut found = false;
+    for fragment in owner.plan().fragments().values() {
+        for unit in fragment
+            .nodes()
+            .values()
+            .filter_map(|node| node.expressions.as_deref())
+        {
+            for definition in unit.definitions().iter() {
+                if let Some(input) = negation_input(&definition.kind) {
+                    assert_eq!(definition.ty.data_type(), ty);
+                    assert_eq!(definition.ty.nullable(), nullable);
+                    assert_eq!(unit.definition(input).unwrap().ty.nullable(), nullable);
+                    found = true;
+                }
+            }
+        }
+    }
+    assert!(found, "the plan must contain the negation it reports");
 }

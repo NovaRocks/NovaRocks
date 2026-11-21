@@ -293,7 +293,7 @@ SQL client
 
 - `novarocks/expression-contract/src/{unit,builder}.rs`
   `BoundExprSet` 已冻结有序端口、局部定义、根、控制流、调用声明与静态请求；
-  codec 用受检的中立 parts 构造单元。修订号 27 的 package 在 PhysicalNode 信封承载单元，
+  codec 用受检的中立 parts 构造单元。修订号 33 的 package 在 PhysicalNode 信封承载单元，
   类型、常量和函数绑定由 package 共享。节点字段的根与端口由 `physical-plan/src/node_roots.rs` 核对。
   见 [ADR-0238](docs/adr/ADR-0238-self-contained-expression-units-and-explicit-environments.md)。
 
@@ -340,6 +340,17 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
   依赖闭包止于 Functions、中立契约和 Arrow。`evaluator_view.rs` 为关系算子与本地程序提供编译单元的只读视图。
   求值器撰写叶子调用协议，宿主提供原控制、分配、准入和来源存储，见
   [ADR-0239](docs/adr/ADR-0239-expression-evaluation-and-host-admission.md)。
+
+- `novarocks/expression/src/typing.rs` 拥有节点级定型、转换和原重载定稿。
+  `novarocks/parser/src/syntax_call.rs` 投影特殊语法的原实参，SQL 使用原语句准入并发射已定型转换。
+  `rebind_unpublished_nullability` 沿实际端口保留来源、控制与同一重载。开发文本入口在
+  `novarocks/expression/src/testkit/expression_text.rs`，与 SQL 共用迁移判定并核对实际环境。
+  见 [ADR-0245](docs/adr/ADR-0245-scalar-typing-finalizes-the-original-overload.md)。
+
+- `novarocks/type-contract/src/operator_function.rs` 冻结已迁入运算符的函数身份，Functions 保管隐藏定义、
+  准确重载效应与整批 kernel。SQL 的 `common/negation.rs` 按身份读实参并保持渲染边界。
+  取负沿普通调用参与折叠，错误行保留原式。迁移规则见 [ADR-0244](docs/adr/ADR-0244-operators-are-identified-catalogue-functions.md)，
+  遗留面见 [表达式层遗留面](docs/guides/development/expression-layer-legacy.md)。
 
 - `novarocks/local-compiler/src/**`
   只消费已冻结的 package、pure function/provider facts，产生纯 `LocalProgram`；
@@ -593,6 +604,10 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
   - `novarocks/connector/iceberg/src/commit/new_manifests.rs` 消费 operation 的紧凑 stage，
     按 spec 和内容类型顺序滚动写出并释放已写条目。首次完整核对条目覆盖，各轮保留 manifest 级核对。
   - `novarocks/connector/iceberg/src/commit/model/**`：不可变意图、逻辑/物理身份与继承字段；对象来源、写入与退休状态、覆盖记录及准确发布引用分别保留。
+  - 普通行级 DML 在 `novarocks/connector/iceberg/src/commit/row_mutation_preparation.rs`
+    冻结准入观察与隔离级别。FE 的 `catalog_application/query_bindings.rs` 为同句 Current 复用原观察。
+    `commit/conflict_scope.rs` 消费读侧签发的被改写目标谓词事实与写出分区，
+    `commit/dependency/row_delta.rs` 核对连续快照窗口。见 [ADR-0244](docs/adr/ADR-0244-iceberg-row-dml-conflict-validation.md)。
   - `novarocks/connector/iceberg/src/commit/dependency/**`：按类别惰性读取 metadata、目标 ref 存活集和连续历史窗口，验证操作依赖。
   - `novarocks/connector/iceberg/src/commit/staging/**`：updates 前缀事实、ID 规范化、requirements 折算及 manifest-list 的实际 row-ID 分配。
   - `novarocks/connector/iceberg/src/commit/attempt.rs`：同一 operation 的单次提交循环；加载、依赖验证、稳定 stage ID 核对、准备与覆盖断言、单次派发及确定冲突重试，循环内不删除产物。
@@ -804,7 +819,13 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
   catalog session 属性 `max_partitions_per_writer` 可在 1 到该值间覆盖。
   `iceberg.target-max-file-size` 接受正字节数或带单位的大小，默认 1 GiB，
   表属性 `write.target-file-size-bytes` 优先。表属性 `write.parquet.row-group-size-bytes` 默认 128 MiB。
-  这些属性经 catalog properties 与 FE 写会话冻结。示例见 `novarocks-catalogs.toml.example`。
+  这些属性经 catalog properties 与 FE 写会话冻结。
+
+- Iceberg catalog 维护属性
+  `iceberg.expire-snapshots.min-retention` 与 `iceberg.remove-orphan-files.min-retention` 各默认 7 天。
+  同 catalog 的会话属性 `expire_snapshots_min_retention` 与 `remove_orphan_files_min_retention`
+  分别覆盖下限，两个 EXECUTE 的缺省 `retention_threshold` 均为 `'7d'`。
+  示例见 `novarocks-catalogs.toml.example`。
 
 - `[standalone_server]`
   `trino_port`（默认 `8080`，`0` 由 OS 分配）、`trino_client_timeout_ms`（默认 `300000`）、
@@ -1347,11 +1368,17 @@ the guide differ.
   紧凑接收先读 [ADR-0239](docs/adr/ADR-0239-iceberg-compact-receiving-and-rolling-manifests.md)，
   对照 `novarocks/connector/iceberg/src/commit/write_stack/receiving.rs` 的交接与
   `novarocks/connector/iceberg/src/commit/new_manifests.rs` 的 stage 持有、滚动写出和沿用。
+  普通行级提交按 [ADR-0244](docs/adr/ADR-0244-iceberg-row-dml-conflict-validation.md) 核对准入观察、
+  `commit/conflict_scope.rs` 的冲突范围及 `commit/dependency/row_delta.rs` 的历史窗口。
+  核对通过后在实际提交基准上定位移除条目。确定的 Catalog 竞争按原 operation 预算重试并沿用新增产物。
   单次派发结论由 `commit/attempt/observation.rs` 的 journal 拥有，prepared owner 在 `catalog/publication_dispatch.rs`；冻结恢复载荷与桥接证据在 `commit/recovery.rs`、
   `commit/attempt/observation.rs`；CTAS 完整 CREATE 请求在 `catalog_control/staged_create/publication.rs`。
   读 [ADR-0171](docs/adr/ADR-0171-commit-operation-model.md)、[ADR-0179](docs/adr/ADR-0179-iceberg-publication-lifecycle-and-evidence.md) 与 [ADR-0198](docs/adr/ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md) 后再改身份、字段继承、派发或清理授权。
   BE seal 先不可回退撤销 writer 删除权；FE 收齐后做本地交接。缺产物清单不能报 cleanup Complete。
-  精确 operation-owned cleanup 与扫描 GC 分开；REST/Hadoop 扫描安全仍为 UNPROVEN，手动/自动入口共用缺证限制，不能以本地 deadline 或年龄授予删除权。
+  精确 operation-owned cleanup 与扫描 GC 各自使用原授权。显式 `EXECUTE remove_orphan_files`
+  由原 Iceberg Provider 核对准确表对象、固定截止时间、完整有效文件名与 Hadoop 发现根后逐批删除，
+  保留已确认的部分回执直至实际退出。自有 ref 成熟回收与首次观察状态族已经退役；无表锚 CTAS
+  与自动入口沿原准入。三项元数据维护的提交、删除与 SQL 结果契约见 [ADR-0243](docs/adr/ADR-0243-statement-authorized-iceberg-metadata-maintenance.md)。
   必要业务事实与原 receipt/cause 由同 canonical `ConnectorWriteNeededReady` Arc 保管；
   `query_execution/write_session/publication_call.rs` 保留同一 Provider F 到真实退出，安全 GC 由同 Call 的残留继续驱动。
   NeededReady、cleanup Pending/Observed、实际 F 退出及库存 Disposed 不可互换；封存必要 finalize 失败不能授权最终 CTAS publication。

@@ -80,23 +80,16 @@ fn kind_projection_preserves_sparse_constant_ids_and_every_operator() {
             row_ordinal: 0,
         })
     );
-    for (source, expected) in [
-        (UnaryOperator::Plus, wire::UnaryOperator::Plus),
-        (UnaryOperator::Minus, wire::UnaryOperator::Minus),
-        (UnaryOperator::Not, wire::UnaryOperator::Not),
-        (UnaryOperator::BitwiseNot, wire::UnaryOperator::BitwiseNot),
-    ] {
-        assert_eq!(
-            encoded(ExprKind::Unary {
-                op: source,
-                expr: ExprId::new(0)
-            }),
-            Kind::Unary(wire::UnaryExpression {
-                op: expected as i32,
-                expr_id: Some(0)
-            })
-        );
-    }
+    assert_eq!(
+        encoded(ExprKind::Unary {
+            op: UnaryOperator::Not,
+            expr: ExprId::new(0)
+        }),
+        Kind::Unary(wire::UnaryExpression {
+            op: wire::UnaryOperator::Not as i32,
+            expr_id: Some(0)
+        })
+    );
     for (source, expected) in [
         (BinaryOperator::Add, wire::BinaryOperator::Add),
         (BinaryOperator::Subtract, wire::BinaryOperator::Subtract),
@@ -110,9 +103,6 @@ fn kind_projection_preserves_sparse_constant_ids_and_every_operator() {
         (BinaryOperator::LtEq, wire::BinaryOperator::LtEq),
         (BinaryOperator::Gt, wire::BinaryOperator::Gt),
         (BinaryOperator::GtEq, wire::BinaryOperator::GtEq),
-        (BinaryOperator::BitAnd, wire::BinaryOperator::BitAnd),
-        (BinaryOperator::BitOr, wire::BinaryOperator::BitOr),
-        (BinaryOperator::BitXor, wire::BinaryOperator::BitXor),
     ] {
         let result = encoded(ExprKind::Binary {
             left: ExprId::new(u32::MAX),

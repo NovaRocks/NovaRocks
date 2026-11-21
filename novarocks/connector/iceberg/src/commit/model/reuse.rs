@@ -21,7 +21,7 @@ use super::{ArtifactLedger, ObjectIdentity, invalid};
 use crate::iceberg::Result;
 use crate::iceberg::spec::ManifestFile;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum AddedManifestAuthor {
@@ -79,6 +79,7 @@ pub struct ManifestRewriteReuse {
     pub sources: Vec<ManifestFile>,
     pub outputs: Vec<ManifestFile>,
     pub encoding_basis: Vec<u8>,
+    pub processed_entries: u64,
 }
 impl ManifestRewriteReuse {
     pub fn owned_backing_bytes(&self) -> Result<u64> {
@@ -148,9 +149,11 @@ impl ManifestReuseIndex {
             }
             ledger.check_reusable_manifest(&object)?;
         }
-        if cache.encoding_basis != encoding
-            || !cache.sources.iter().all(|source| latest.contains(source))
-        {
+        if cache.encoding_basis != encoding {
+            return Ok(None);
+        }
+        let latest: HashSet<_> = latest.iter().collect();
+        if !cache.sources.iter().all(|source| latest.contains(source)) {
             return Ok(None);
         }
         Ok(Some(cache.clone()))
@@ -372,18 +375,24 @@ mod tests {
                     sources: vec![source.clone()],
                     outputs: vec![output.clone()],
                     encoding_basis: vec![1],
+                    processed_entries: 5,
                 },
             )
             .unwrap();
         let latest = [descriptor("s3://bucket/concurrent.avro"), source.clone()];
-        assert_eq!(
+        let reused = index
+            .find_rewrite(&ledger, 0, &[1], &latest)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reused.outputs.as_slice(), std::slice::from_ref(&output));
+        assert_eq!(reused.processed_entries, 5);
+        let mut replaced = source.clone();
+        replaced.sequence_number += 1;
+        assert!(
             index
-                .find_rewrite(&ledger, 0, &[1], &latest)
+                .find_rewrite(&ledger, 0, &[1], &[replaced])
                 .unwrap()
-                .unwrap()
-                .outputs
-                .as_slice(),
-            std::slice::from_ref(&output)
+                .is_none()
         );
         assert!(
             index

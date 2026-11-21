@@ -64,6 +64,7 @@ owner 启动真实进程。
 | 要验证的性质 | 去处 |
 |---|---|
 | 单个函数、转换或运算的值、类型与失败 | Functions 的 Rust 测试；Functions 的 testkit 建成后使用它 |
+| 构造经表达式层定型与求值的类型、值与错误 | `novarocks-expression/tests/it` 使用门控的表达式文本入口，输入为表达式文本、列布局及实际环境 |
 | 算子与 pipeline 的局部行为 | Execution 的 Rust 测试 |
 | 只有在编译产物与求值器之间才看得见的性质；需要特殊输入形状、注入控制或非法 package 才能触发的行为 | 接缝测试 package `tests/compile-to-execute` |
 | 一条语句端到端的结果，以及依赖拓扑的行为 | SQL 套件，在 1FE+3BE 上运行 |

@@ -27,7 +27,7 @@ code-anchors:
   - "novarocks/execution/src/exec/chunk/schema.rs (ChunkSlotSchema::reconcile_to_carrier)"
 ---
 
-Iceberg 默认交付普通 offsets。开发语句可按原授权独立启用 view 或保持顶层整列块字符串字典。实际载体沿冻结布局校验，消费方按自身能力选择展开。[ADR-0244](ADR-0244-footer-derived-parquet-reader-representation.md)
+Iceberg 默认交付普通 offsets。开发语句可按原授权独立启用 view 或保持顶层整列块字符串字典。实际载体沿冻结布局校验，消费方按自身能力选择展开。[ADR-0246](ADR-0246-footer-derived-parquet-reader-representation.md)
 
 ## 问题
 

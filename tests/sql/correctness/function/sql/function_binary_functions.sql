@@ -118,6 +118,7 @@ INSERT INTO ${case_db}.t0 VALUES ROW(1, X'ab01', 'ab01');
 SELECT from_binary(c1, 'hex'), from_binary(to_binary(c2, 'hex'), 'hex') FROM ${case_db}.t0;
 
 -- query 24
+-- Decode malformed UTF-8 with the Trino replacement character.
 SELECT hex(from_binary(c1, 'utf8')), from_binary(to_binary(c2, 'encode64'), 'hex') FROM ${case_db}.t0;
 
 -- query 25

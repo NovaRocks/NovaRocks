@@ -25,6 +25,9 @@
 
 // Design: ADR-0214 (docs/adr/ADR-0214-iceberg-schema-depth-by-decoder-owner.md)
 use crate::rest_protocol::json::{ScanError, validate_document_with_depth};
+use novarocks_spi::connector::{
+    ConnectorError, ConnectorErrorKind, ConnectorTableFormatVersionUnsupported,
+};
 use serde::Deserialize;
 
 /// The physical envelope of the document actually handed to Serde. A further
@@ -126,6 +129,48 @@ pub(crate) fn from_slice_document<'de, T: Deserialize<'de>>(
     Ok(value)
 }
 
+/// Classify an already structurally validated table document which could not
+/// be decoded by the SDK. Only the original version field is retained.
+pub(crate) fn future_table_format_error(
+    error: &Error,
+    bytes: &[u8],
+    document: Document,
+) -> Option<ConnectorError> {
+    if !matches!(error, Error::Json(_)) {
+        return None;
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    struct TableVersion {
+        format_version: u64,
+    }
+
+    #[derive(Deserialize)]
+    struct TableEnvelope {
+        metadata: TableVersion,
+    }
+
+    let mut decoder = serde_json::Deserializer::from_slice(bytes);
+    decoder.disable_recursion_limit(); // The original scanner already bounded this document.
+    let version = match document {
+        Document::Schema => return None,
+        Document::TableMetadata => TableVersion::deserialize(&mut decoder).ok()?.format_version,
+        Document::TableResponse => {
+            TableEnvelope::deserialize(&mut decoder)
+                .ok()?
+                .metadata
+                .format_version
+        }
+    };
+    (version > 3).then(|| {
+        ConnectorError::from_domain(
+            ConnectorErrorKind::Unsupported,
+            ConnectorTableFormatVersionUnsupported(version),
+        )
+    })
+}
+
 /// Provider-private schema re-parsing, including field/default projections.
 /// Outer table documents must select their own envelope explicitly.
 pub(crate) fn from_slice<'de, T: Deserialize<'de>>(bytes: &'de [u8]) -> Result<T, Error> {
@@ -148,6 +193,25 @@ mod tests {
         TableMetadata, TableMetadataBuilder, Type,
     };
     use std::{collections::HashMap, sync::Arc};
+
+    #[test]
+    fn future_table_versions_are_classified_from_the_original_field() {
+        for (document, body) in [
+            (
+                Document::TableMetadata,
+                br#"{"format-version":4,"unparsed":true}"#.as_slice(),
+            ),
+            (
+                Document::TableResponse,
+                br#"{"metadata":{"format-version":4,"unparsed":true}}"#.as_slice(),
+            ),
+        ] {
+            let error = from_slice_document::<u64>(body, document).unwrap_err();
+            let classified = future_table_format_error(&error, body, document).unwrap();
+            assert_eq!(classified.kind(), ConnectorErrorKind::Unsupported);
+            assert!(classified.message().contains("version 4"));
+        }
+    }
 
     #[test]
     fn complete_metadata_preserves_depth64_in_current_and_retained_history() {

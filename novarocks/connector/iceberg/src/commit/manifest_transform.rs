@@ -68,6 +68,7 @@ pub(crate) async fn ordinary_manifests_scoped(
     removed: &[&LocatedEntry],
     added: Vec<ManifestFile>,
     scope: &ManifestReadScope,
+    later_snapshot: bool,
 ) -> Result<OrdinaryManifests> {
     ordinary_manifests_core(
         view,
@@ -75,7 +76,7 @@ pub(crate) async fn ordinary_manifests_scoped(
         Some(sources),
         removed,
         added,
-        Some(scope),
+        Some((scope, later_snapshot)),
     )
     .await
 }
@@ -86,7 +87,7 @@ async fn ordinary_manifests_core(
     sources: Option<&SnapshotSources<'_>>,
     removed: &[&LocatedEntry],
     added: Vec<ManifestFile>,
-    scope: Option<&ManifestReadScope>,
+    observation: Option<(&ManifestReadScope, bool)>,
 ) -> Result<OrdinaryManifests> {
     let mut candidates = added
         .into_iter()
@@ -101,7 +102,7 @@ async fn ordinary_manifests_core(
             snapshot_id,
             sources,
             removed.iter().copied(),
-            scope,
+            observation,
         )
         .await?;
         candidates.extend(filtered);
@@ -112,7 +113,7 @@ async fn ordinary_manifests_core(
         }
         0
     };
-    let manifests = match scope {
+    let manifests = match observation {
         None => {
             super::manifest_merge::merge_manifests(
                 view.artifacts(),
@@ -124,7 +125,7 @@ async fn ordinary_manifests_core(
             )
             .await?
         }
-        Some(scope) => {
+        Some((scope, _)) => {
             super::manifest_merge::merge_manifests_scoped(
                 view.artifacts(),
                 view.metadata(),
@@ -166,7 +167,7 @@ async fn apply_removals<'a, 'entry>(
     snapshot_id: i64,
     sources: &'a SnapshotSources<'_>,
     removed: impl IntoIterator<Item = &'entry LocatedEntry>,
-    scope: Option<&ManifestReadScope>,
+    observation: Option<(&ManifestReadScope, bool)>,
 ) -> Result<(Vec<MergeCandidate<'a>>, usize)> {
     let mut selections = BTreeMap::<usize, OrdinalSelection<'_>>::new();
     for entry in removed {
@@ -189,8 +190,16 @@ async fn apply_removals<'a, 'entry>(
             inputs.push((source, selected));
         }
     }
-    if !selections.is_empty() {
-        return Err(invalid("Manifest removal refers to an absent source"));
+    if let Some(entry) = selections
+        .values()
+        .flat_map(|entries| entries.values())
+        .next()
+    {
+        return Err(changed_entry(
+            observation,
+            entry,
+            "Manifest removal refers to an absent source",
+        ));
     }
     let eligible_previous = inputs.len();
     let candidates = ordered_window(
@@ -227,7 +236,7 @@ async fn apply_removals<'a, 'entry>(
                             snapshot_id,
                             source,
                             selected,
-                            scope,
+                            observation,
                         )
                         .await?;
                         artifacts.remember_reusable_manifest(basis, output.clone())?;
@@ -248,9 +257,10 @@ async fn filter_source(
     snapshot_id: i64,
     source: ManifestSource<'_>,
     mut selected: OrdinalSelection<'_>,
-    scope: Option<&ManifestReadScope>,
+    observation: Option<(&ManifestReadScope, bool)>,
 ) -> Result<ManifestFile> {
     artifacts.check_active()?;
+    let scope = observation.map(|(scope, _)| scope);
     let cached = scope.and_then(|scope| scope.cached_source(source));
     let loaded;
     let retained;
@@ -301,7 +311,11 @@ async fn filter_source(
                 || expected.file_format != located.file_format
                 || expected.logical_size != located.logical_size
             {
-                return Err(invalid("Selected manifest entry changed since observation"));
+                return Err(changed_entry(
+                    observation,
+                    expected,
+                    "Selected manifest entry changed since observation",
+                ));
             }
             ManifestEntryWrite::Deleted {
                 file,
@@ -328,8 +342,12 @@ async fn filter_source(
             entry: write,
         });
     }
-    if !selected.is_empty() {
-        return Err(invalid("Selected live manifest entry is absent"));
+    if let Some(expected) = selected.values().next() {
+        return Err(changed_entry(
+            observation,
+            expected,
+            "Selected live manifest entry is absent",
+        ));
     }
     let mut descriptor = write_sourced_manifest(
         artifacts,
@@ -345,6 +363,20 @@ async fn filter_source(
         descriptor.first_row_id = first_explicit;
     }
     Ok(descriptor)
+}
+
+fn changed_entry(
+    observation: Option<(&ManifestReadScope, bool)>,
+    expected: &LocatedEntry,
+    message: &'static str,
+) -> Error {
+    if observation.is_some_and(|(_, later_snapshot)| later_snapshot) {
+        return super::new_manifests::row_delta_validation_error(format!(
+            "Missing required files to delete: {}",
+            expected.frozen.identity().path(),
+        ));
+    }
+    invalid(message)
 }
 
 fn invalid(message: &str) -> Error {

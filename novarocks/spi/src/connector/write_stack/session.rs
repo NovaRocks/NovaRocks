@@ -435,6 +435,9 @@ impl ConnectorWriteBeginRequest {
     }
 }
 
+/// Process-local, provider-owned observation sealed by row-mutation preparation.
+pub type ConnectorRowMutationAdmission = crate::connector::ConnectorProcessLocalPayload;
+
 /// The write flavors a session admits.
 ///
 /// This selects how the provider plans its logical branches. It is deliberately
@@ -466,7 +469,9 @@ pub enum ConnectorWriteSessionFlavor {
     },
     /// A merge-on-read row mutation. The provider decides how many branches
     /// the mutation needs and what each accepts; SQL routes rows to them.
-    RowMutation,
+    RowMutation {
+        admission: ConnectorRowMutationAdmission,
+    },
     /// A rewrite whose reads, writers and replacement set consume one provider-owned frozen plan.
     DistributedRewrite {
         shape: ConnectorDistributedRewriteShape,
@@ -1263,13 +1268,17 @@ pub trait ConnectorWriteControl: Send + Sync {
     ) -> Result<ConnectorWriteSessionPlan, ConnectorError>;
 
     /// Register the frozen targets and optional writer cohort proof before
-    /// the query produces any commit fragments.
+    /// the query produces any commit fragments. An ordinary row mutation also
+    /// supplies the provider's fact from its final rewritten-target scan.
     fn begin_write_query(
         &self,
         commit: &ConnectorWriteCommitSession,
         query: &ConnectorWriteQueryIdentity,
         targets: &[WriteTargetOrdinal],
         production: Option<Arc<dyn ConnectorWriteProductionProof>>,
+        rewritten_target: Option<
+            &crate::connector::read_stack::runtime::ConnectorRewrittenTargetFact,
+        >,
     ) -> Result<(), ConnectorError>;
 
     /// Admit one complete root record on the caller's bounded CPU owner.

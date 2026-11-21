@@ -142,22 +142,6 @@ fn unsupported_predicate_profiles_precede_original_children_and_catalog_discover
     let unknown = || build::identifier(build::ident_at("must_not_resolve", false, span));
     let mut cases = vec![
         (
-            ast::Predicate::BooleanTest(ast::BooleanTestPredicate {
-                negated: false,
-                truth_value: ast::TruthValue::Unknown,
-                span,
-            }),
-            "IS UNKNOWN predicates are not supported",
-        ),
-        (
-            ast::Predicate::BooleanTest(ast::BooleanTestPredicate {
-                negated: true,
-                truth_value: ast::TruthValue::Unknown,
-                span,
-            }),
-            "IS UNKNOWN predicates are not supported",
-        ),
-        (
             ast::Predicate::Overlaps(ast::OverlapsPredicate {
                 right: unknown(),
                 span,

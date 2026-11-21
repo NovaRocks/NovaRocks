@@ -1,0 +1,8 @@
+-- query 4
+-- types	bigint	bigint	varchar
+id	value	part
+1	11	east
+2	20	east
+3	31	west
+4	40	west
+5	50	north

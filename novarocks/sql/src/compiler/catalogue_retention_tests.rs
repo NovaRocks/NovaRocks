@@ -111,14 +111,6 @@ impl SqlFunctionCatalog for CountingCatalog {
         self.inner
             .admit_authored_environment_observed(binding, control)
     }
-    fn admit_native_bitnot_source_observed(
-        &self,
-        source: &novarocks_functions::FunctionValueType,
-        control: &dyn novarocks_type_contract::PureCompileControl,
-    ) -> Result<(), novarocks_functions::FunctionBindingError> {
-        self.inner
-            .admit_native_bitnot_source_observed(source, control)
-    }
     fn select_exact_overload_observed(
         &self,
         function_id: &novarocks_functions::FunctionId,
@@ -184,6 +176,39 @@ impl SqlFunctionCatalog for CountingCatalog {
         novarocks_functions::FunctionBindingError,
     > {
         self.inner.resolve_scalar_binding(name, arguments, control)
+    }
+    fn recognizes_scalar_name(
+        &self,
+        name: &str,
+        arg_types: &[arrow::datatypes::DataType],
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<bool, novarocks_functions::FunctionResolutionError> {
+        self.inner.recognizes_scalar_name(name, arg_types, control)
+    }
+    fn resolve_scalar_operator_binding(
+        &self,
+        operator: novarocks_type_contract::OperatorFunction,
+        request: novarocks_functions::FunctionBindingRequest<'_>,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<
+        novarocks_functions::ResolvedFunctionBinding,
+        novarocks_functions::FunctionBindingError,
+    > {
+        self.inner
+            .resolve_scalar_operator_binding(operator, request, control)
+    }
+    fn finish_scalar_binding(
+        &self,
+        function: &novarocks_functions::FunctionId,
+        overload: &novarocks_functions::FunctionOverloadId,
+        request: novarocks_functions::FunctionBindingRequest<'_>,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<
+        novarocks_functions::ResolvedFunctionBinding,
+        novarocks_functions::FunctionBindingError,
+    > {
+        self.inner
+            .finish_scalar_binding(function, overload, request, control)
     }
     fn resolve_scalar_binding_with_expected_result(
         &self,

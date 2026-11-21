@@ -1039,10 +1039,12 @@ impl novarocks_query_application::sql::session::registry::CatalogPropertyDeclara
         novarocks_query_application::sql::session::registry::SessionPropertyError,
     > {
         use novarocks_connector_iceberg::catalog_config::{
+            EXPIRE_SNAPSHOTS_MIN_RETENTION_SESSION_PROPERTY, IcebergCatalogMaintenanceConfig,
             IcebergCatalogReadConfig, IcebergCatalogWriteConfig,
             MAX_PARTITIONS_PER_WRITER_SESSION_PROPERTY,
             PARQUET_READ_BLOCK_ROW_COUNT_SESSION_PROPERTY,
-            PARQUET_READ_BLOCK_SIZE_SESSION_PROPERTY, parse_parquet_read_block_size,
+            PARQUET_READ_BLOCK_SIZE_SESSION_PROPERTY,
+            REMOVE_ORPHAN_FILES_MIN_RETENTION_SESSION_PROPERTY, parse_parquet_read_block_size,
             validate_parquet_read_block_rows,
         };
         use novarocks_query_application::sql::session::registry::{
@@ -1052,6 +1054,30 @@ impl novarocks_query_application::sql::session::registry::CatalogPropertyDeclara
             .map_err(|_| SessionPropertyError::InvalidDeclaration {
                 detail: "Admitted Iceberg catalog has an invalid open partition limit",
             })?;
+        use novarocks_spi::connector::ConnectorMaintenanceDuration;
+        let maintenance =
+            IcebergCatalogMaintenanceConfig::from_properties(configuration).map_err(|_| {
+                SessionPropertyError::InvalidDeclaration {
+                    detail: "Admitted Iceberg catalog has an invalid maintenance duration",
+                }
+            })?;
+        let duration_property = |name, value: ConnectorMaintenanceDuration, description| {
+            PropertyDeclaration::catalog(
+                name,
+                SessionPropertyType::Varchar,
+                Some(SessionPropertyValue::Varchar(value.to_string())),
+                description,
+                false,
+                |value| match value {
+                    SessionPropertyValue::Varchar(text)
+                        if ConnectorMaintenanceDuration::parse(text).is_some() =>
+                    {
+                        Ok(())
+                    }
+                    _ => Err("Value must be a valid duration".to_owned()),
+                },
+            )
+        };
         let (read_rows, read_size) = IcebergCatalogReadConfig::session_defaults(configuration)
             .map_err(|_| SessionPropertyError::InvalidDeclaration {
                 detail: "Admitted Iceberg catalog has invalid Parquet read sizing",
@@ -1093,7 +1119,21 @@ impl novarocks_query_application::sql::session::registry::CatalogPropertyDeclara
                 _ => Err("Expected VARCHAR".to_owned()),
             },
         )?;
-        Ok(vec![write_partitions, parquet_rows, parquet_bytes])
+        Ok(vec![
+            write_partitions,
+            parquet_rows,
+            parquet_bytes,
+            duration_property(
+                EXPIRE_SNAPSHOTS_MIN_RETENTION_SESSION_PROPERTY,
+                maintenance.expire_snapshots_min_retention,
+                "Minimum retention for expiring Iceberg snapshots",
+            )?,
+            duration_property(
+                REMOVE_ORPHAN_FILES_MIN_RETENTION_SESSION_PROPERTY,
+                maintenance.remove_orphan_files_min_retention,
+                "Minimum retention for removing Iceberg orphan files",
+            )?,
+        ])
     }
 }
 
@@ -1129,7 +1169,15 @@ mod iceberg_session_properties_tests {
                     provider_id: provider,
                     generation: 1,
                 },
-                &[("iceberg.max-partitions-per-writer".into(), "30".into())],
+                &[
+                    ("iceberg.max-partitions-per-writer".into(), "30".into()),
+                    (
+                        "iceberg.expire-snapshots.min-retention".into(),
+                        "168h".into(),
+                    ),
+                    ("parquet.max-read-block-row-count".into(), "512".into()),
+                    ("parquet.max-read-block-size".into(), "0B".into()),
+                ],
             )
             .unwrap();
         let property = "max_partitions_per_writer";
@@ -1146,5 +1194,35 @@ mod iceberg_session_properties_tests {
         );
         assert!(metadata.prepare_header("lake", property, "31").is_err());
         assert!(metadata.prepare_header("lake", property, "0").is_err());
+        let expire = "expire_snapshots_min_retention";
+        let orphan = "remove_orphan_files_min_retention";
+        assert_eq!(
+            metadata.lookup(expire).unwrap().default_value(),
+            Some(&SessionPropertyValue::Varchar("168.00h".into())),
+        );
+        assert_eq!(
+            metadata.lookup(orphan).unwrap().default_value(),
+            Some(&SessionPropertyValue::Varchar("7.00d".into())),
+        );
+        assert_eq!(
+            metadata
+                .prepare_header("lake", orphan, "0s")
+                .unwrap()
+                .value(),
+            &SessionPropertyValue::Varchar("0s".into()),
+        );
+        assert!(metadata.prepare_header("lake", expire, "-7d").is_err());
+        let rows = "parquet_max_read_block_row_count";
+        let bytes = "parquet_max_read_block_size";
+        assert_eq!(
+            metadata.lookup(rows).unwrap().default_value(),
+            Some(&SessionPropertyValue::Integer(512)),
+        );
+        assert_eq!(
+            metadata.lookup(bytes).unwrap().default_value(),
+            Some(&SessionPropertyValue::Varchar("0B".into())),
+        );
+        assert!(metadata.prepare_header("lake", rows, "127").is_err());
+        assert!(metadata.prepare_header("lake", bytes, "16MB").is_ok());
     }
 }

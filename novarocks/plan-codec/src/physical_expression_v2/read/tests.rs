@@ -450,9 +450,9 @@ impl Fixture {
             ),
             expression(
                 1,
-                1,
+                3,
                 K::Unary(wire::UnaryExpression {
-                    op: wire::UnaryOperator::Plus as i32,
+                    op: wire::UnaryOperator::Not as i32,
                     expr_id: Some(0),
                 }),
             ),
@@ -577,9 +577,9 @@ fn small() -> Vec<wire::ExpressionDefinition> {
     vec![
         expression(
             0,
-            0,
+            2,
             wire::expression_definition::Kind::Unary(wire::UnaryExpression {
-                op: wire::UnaryOperator::Plus as i32,
+                op: wire::UnaryOperator::Not as i32,
                 expr_id: Some(1),
             }),
         ),
@@ -763,8 +763,8 @@ fn receiving_expressions_reject_missing_closed_payloads_and_forward_reference_fa
     for (op, expr_id) in [
         (0, Some(u32::MAX)),
         (99, Some(u32::MAX)),
-        (wire::UnaryOperator::Plus as i32, None),
-        (wire::UnaryOperator::Plus as i32, Some(404)),
+        (wire::UnaryOperator::Not as i32, None),
+        (wire::UnaryOperator::Not as i32, Some(404)),
     ] {
         let mut bad = valid.clone();
         bad[0].kind = Some(K::Unary(wire::UnaryExpression { op, expr_id }));
@@ -782,12 +782,8 @@ fn receiving_expressions_reject_missing_closed_payloads_and_forward_reference_fa
     for case in cases {
         assert!(run(&fixture, &case, SOURCE, limits(), &Control::default()).is_err());
     }
-    let mut forward = valid;
-    forward[0].kind = Some(K::Unary(wire::UnaryExpression {
-        op: wire::UnaryOperator::Minus as i32,
-        expr_id: Some(1),
-    }));
-    assert!(run(&fixture, &forward, SOURCE, limits(), &Control::default()).is_ok());
+    // The valid unary references a later definition in the dense table.
+    assert!(run(&fixture, &valid, SOURCE, limits(), &Control::default()).is_ok());
 }
 
 #[test]
@@ -1180,7 +1176,7 @@ fn receiving_expression_success_ordinary_tails_and_real_quantum_preserve_all_con
     let mut bad = defs.clone();
     bad[0].kind = Some(wire::expression_definition::Kind::Unary(
         wire::UnaryExpression {
-            op: wire::UnaryOperator::Plus as i32,
+            op: wire::UnaryOperator::Not as i32,
             expr_id: Some(404),
         },
     ));
@@ -1252,9 +1248,9 @@ fn receiving_expression_success_ordinary_tails_and_real_quantum_preserve_all_con
         .map(|id| {
             expression(
                 id,
-                0,
+                2,
                 wire::expression_definition::Kind::Unary(wire::UnaryExpression {
-                    op: wire::UnaryOperator::Plus as i32,
+                    op: wire::UnaryOperator::Not as i32,
                     expr_id: Some(320),
                 }),
             )

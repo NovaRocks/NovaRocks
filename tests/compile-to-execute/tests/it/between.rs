@@ -167,8 +167,7 @@ fn between_actual_after_nullable_case_sparse_sliced_and_empty_three_valued_outpu
 // Negating -2^63 requires +2^63, beyond signed INT64's maximum 2^63-1.
 // The frozen arithmetic diagnostic spells the typed zero/subtraction and the
 // original offending decimal value; no evaluator manufactures this expectation.
-const NEGATE_MIN_ERROR: &str =
-    "Arithmetic overflow: Overflow happened on: 0 - -9223372036854775808";
+const NEGATE_MIN_ERROR: &str = "bigint negation overflow: -9223372036854775808";
 #[test]
 fn between_actual_after_upper_error_is_required_even_after_false_lower_and_lower_error_is_first() {
     for (sql, expected) in [

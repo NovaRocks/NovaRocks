@@ -1141,7 +1141,8 @@ pub(crate) async fn prepare_query_as_iceberg_write_with_write_session_and_consta
         analyzed,
         &statistics,
         compile_control.clone(),
-    );
+    )
+    .with_row_mutation_match(table_bindings.row_mutation_match_binding()?);
     let sealed = write_session
         .seal_write_targets()
         .map_err(|error| error.to_string())?;

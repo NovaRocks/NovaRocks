@@ -131,37 +131,6 @@ pub fn eval(value: &LegacyLiteralValue, len: usize) -> Result<ArrayRef, crate::K
     }
 }
 
-pub fn native_negate_zero(
-    data_type: &arrow_schema::DataType,
-) -> Result<LegacyLiteralValue, String> {
-    use arrow_schema::DataType;
-    let literal = match data_type {
-        DataType::Int8 => LegacyLiteralValue::Int8(0),
-        DataType::Int16 => LegacyLiteralValue::Int16(0),
-        DataType::Int32 => LegacyLiteralValue::Int32(0),
-        DataType::Int64 => LegacyLiteralValue::Int64(0),
-        DataType::Float32 => LegacyLiteralValue::Float32(0.0),
-        DataType::Float64 => LegacyLiteralValue::Float64(0.0),
-        DataType::Decimal128(precision, scale) => LegacyLiteralValue::Decimal128 {
-            value: 0,
-            precision: *precision,
-            scale: *scale,
-        },
-        DataType::Decimal256(precision, scale) => LegacyLiteralValue::Decimal256 {
-            value: i256::ZERO,
-            precision: *precision,
-            scale: *scale,
-        },
-        dt if crate::largeint::is_largeint_data_type(dt) => LegacyLiteralValue::LargeInt(0),
-        _ => {
-            return Err(format!(
-                "NEGATE is not supported for data type {data_type:?}"
-            ));
-        }
-    };
-    Ok(literal)
-}
-
 #[derive(Debug)]
 enum LiteralFailure {
     Decimal(arrow_schema::ArrowError),

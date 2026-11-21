@@ -19,6 +19,9 @@
 use novarocks_query_application::api::ExecutionFailurePresentation;
 
 use crate::diagnostics::{self, BoundedMessage};
+use novarocks_execution_contract::failure::connector_reason::{
+    ICEBERG_COMMIT_ERROR, ICEBERG_FILESYSTEM_ERROR, ICEBERG_INVALID_METADATA,
+};
 use novarocks_execution_contract::failure::{FailureClass, FailureProjection, domain};
 use novarocks_query_application::{
     api::{QueryExecutionError, QueryExecutionErrorKind, StatementExternalEffectDisposition},
@@ -81,7 +84,7 @@ pub(crate) struct TrinoErrorLocation {
     pub(crate) column_number: u32,
 }
 
-// Numeric identities and error types are frozen by Trino StandardErrorCode.
+// Numeric identities and error types are frozen by Trino StandardErrorCode and IcebergErrorCode.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Code {
     GenericUser,
@@ -131,7 +134,11 @@ enum Code {
     ViewIsRecursive,
     DuplicateWindowName,
     MergeTargetRowMultipleMatches,
+    IcebergInvalidMetadata,
     IcebergTooManyOpenPartitions,
+    IcebergFilesystemError,
+    IcebergCommitError,
+    TransactionConflict,
     GenericInternal,
     PageTransportError,
     PageTransportTimeout,
@@ -143,7 +150,15 @@ enum Code {
     ExceededTimeLimit,
 }
 impl Code {
+    fn uses_iceberg_maintenance_detail(self) -> bool {
+        matches!(
+            self,
+            Self::IcebergInvalidMetadata | Self::IcebergFilesystemError | Self::IcebergCommitError
+        )
+    }
+
     fn fields(self) -> (i32, &'static str, &'static str) {
+        const EXTERNAL: &str = "EXTERNAL";
         use Code::*;
         match self {
             GenericUser => (0, "GENERIC_USER_ERROR", "USER_ERROR"),
@@ -196,11 +211,15 @@ impl Code {
             MergeTargetRowMultipleMatches => {
                 (119, "MERGE_TARGET_ROW_MULTIPLE_MATCHES", "USER_ERROR")
             }
+            IcebergInvalidMetadata => (0x0504_0001, "ICEBERG_INVALID_METADATA", EXTERNAL),
+            IcebergFilesystemError => (0x0504_0008, "ICEBERG_FILESYSTEM_ERROR", EXTERNAL),
+            IcebergCommitError => (0x0504_000C, "ICEBERG_COMMIT_ERROR", EXTERNAL),
             IcebergTooManyOpenPartitions => (
                 0x0504_0002,
                 "ICEBERG_TOO_MANY_OPEN_PARTITIONS",
                 "USER_ERROR",
             ),
+            TransactionConflict => (17, "TRANSACTION_CONFLICT", "USER_ERROR"),
             GenericInternal => (65536, "GENERIC_INTERNAL_ERROR", "INTERNAL_ERROR"),
             PageTransportError => (65539, "PAGE_TRANSPORT_ERROR", "INTERNAL_ERROR"),
             PageTransportTimeout => (65540, "PAGE_TRANSPORT_TIMEOUT", "INTERNAL_ERROR"),
@@ -245,13 +264,27 @@ enum PublicMessage<'a> {
     Borrowed(&'a str),
     Session(&'a StatementSessionError),
     Execution(&'a ExecutionFailureInput),
-    OpenPartitionLimit { limit: u64, opening: u64 },
+    CommitFailure {
+        input: &'a ExecutionFailureInput,
+        unknown: bool,
+    },
+    OpenPartitionLimit {
+        limit: u64,
+        opening: u64,
+    },
 }
 impl fmt::Display for PublicMessage<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Borrowed(message) => formatter.write_str(message),
             Self::Session(error) => fmt::Display::fmt(error, formatter),
+            Self::CommitFailure { input, unknown } => {
+                formatter.write_str("Failed to commit the transaction during write: ")?;
+                if *unknown && !input.detail().as_str().starts_with("[CommitUnknown]") {
+                    formatter.write_str("[CommitUnknown] ")?;
+                }
+                fmt::Display::fmt(input.detail(), formatter)
+            }
             Self::OpenPartitionLimit { limit, opening } => write!(
                 formatter,
                 "Exceeded limit of {limit} open writers for partitions: {opening}"
@@ -285,7 +318,10 @@ fn project_source(
         }
         TrinoErrorSource::Execution { error, sql: _sql } => {
             let (code, message) = match error.execution_failure() {
-                Some(input) => (execution_code(input), execution_message(input)),
+                Some(input) => {
+                    let code = execution_code(input);
+                    (code, execution_message(input, code))
+                }
                 None => (
                     match error.kind() {
                         QueryExecutionErrorKind::InvalidRequest => Code::GenericUser,
@@ -351,7 +387,16 @@ fn project_message(
         return project(code, diagnostics::bound_display(&message), location);
     }
     let public = StatementExternalEffectDisposition::diagnostic(&message, effect);
-    let bounded = diagnostics::bound_display(&public);
+    project_public_diagnostic(query_id, code, &public, location)
+}
+
+fn project_public_diagnostic(
+    query_id: Option<&str>,
+    code: Code,
+    public: &impl fmt::Display,
+    location: Option<TrinoErrorLocation>,
+) -> TrinoQueryError {
+    let bounded = diagnostics::bound_display(public);
     if bounded.truncated
         && let Some(query_id) = query_id
     {
@@ -417,24 +462,25 @@ fn service_error(
             .expect("declared row match SQL identity has a standard message");
         return project(code, diagnostics::bound_display(message), None);
     }
-    if code == Code::IcebergTooManyOpenPartitions
-        && let Some(input) = error.execution_failure()
-    {
-        return project_message(query_id, code, execution_message(input), None, effect);
+    if let Some(input) = error.execution_failure() {
+        let message = execution_message(input, code);
+        if matches!(message, PublicMessage::CommitFailure { .. }) {
+            let public = error.diagnostic_with_execution_detail(&message, effect);
+            return project_public_diagnostic(query_id, code, &public, None);
+        }
+        if code == Code::IcebergTooManyOpenPartitions || code.uses_iceberg_maintenance_detail() {
+            let effect = StatementExternalEffectDisposition::combine(
+                error.external_effect_disposition(),
+                effect,
+            );
+            return project_message(query_id, code, message, None, effect);
+        }
     }
     let public = error.diagnostic_with_external_effect(effect);
-    let bounded = diagnostics::bound_display(&public);
-    if bounded.truncated
-        && let Some(query_id) = query_id
-    {
-        tracing::warn!(client_query_id = query_id, full_error = %public,
-            client_message_json_bytes = bounded.json_bytes,
-            max_message_json_bytes = diagnostics::MAX_MESSAGE_JSON_BYTES,
-            "Trino client error message truncated; full public diagnostic retained here");
-    }
-    project(
+    project_public_diagnostic(
+        query_id,
         code,
-        bounded,
+        &public,
         error.user_error().and_then(|user| user_location(user, sql)),
     )
 }
@@ -481,7 +527,38 @@ fn open_partition_limit(input: &ExecutionFailureInput) -> Option<(u64, u64)> {
     (resource.dimension == ResourceDimension::Items && opening > limit).then_some((limit, opening))
 }
 
-fn execution_message(input: &ExecutionFailureInput) -> PublicMessage<'_> {
+fn commit_failure(input: &ExecutionFailureInput) -> Option<(Code, bool)> {
+    use novarocks_execution_contract::failure::{
+        FailureEvidence,
+        connector_reason::{
+            COMMIT_TRANSACTION_CONFLICT, ICEBERG_COMMIT_STATE_UNKNOWN,
+            ICEBERG_COMMIT_VALIDATION_CONFLICT,
+        },
+    };
+    use novarocks_query_application::execution_error::ExecutionFailureSite;
+
+    let fact = input.fact();
+    if fact.class() != FailureClass::Dependency
+        || fact.evidence() != FailureEvidence::Originating
+        || !matches!(input.site(), ExecutionFailureSite::Coordinator)
+    {
+        return None;
+    }
+    match fact.reason() {
+        COMMIT_TRANSACTION_CONFLICT => Some((Code::TransactionConflict, false)),
+        ICEBERG_COMMIT_VALIDATION_CONFLICT => Some((Code::IcebergCommitError, false)),
+        ICEBERG_COMMIT_STATE_UNKNOWN => Some((Code::IcebergCommitError, true)),
+        _ => None,
+    }
+}
+
+fn execution_message(input: &ExecutionFailureInput, code: Code) -> PublicMessage<'_> {
+    if let Some((_, unknown)) = commit_failure(input) {
+        return PublicMessage::CommitFailure { input, unknown };
+    }
+    if code.uses_iceberg_maintenance_detail() {
+        return PublicMessage::Borrowed(input.detail().as_str());
+    }
     match open_partition_limit(input) {
         Some((limit, opening)) => PublicMessage::OpenPartitionLimit { limit, opening },
         None => PublicMessage::Execution(input),
@@ -489,11 +566,23 @@ fn execution_message(input: &ExecutionFailureInput) -> PublicMessage<'_> {
 }
 
 fn execution_code(input: &ExecutionFailureInput) -> Code {
+    if let Some((code, _)) = commit_failure(input) {
+        return code;
+    }
     if open_partition_limit(input).is_some() {
         return Code::IcebergTooManyOpenPartitions;
     }
     if input.row_match_violation_message().is_some() {
         return Code::MergeTargetRowMultipleMatches;
+    }
+    let fact = input.fact();
+    match (fact.class(), fact.reason()) {
+        (FailureClass::Data, ICEBERG_INVALID_METADATA) => return Code::IcebergInvalidMetadata,
+        (FailureClass::Dependency, ICEBERG_FILESYSTEM_ERROR) => {
+            return Code::IcebergFilesystemError;
+        }
+        (FailureClass::Dependency, ICEBERG_COMMIT_ERROR) => return Code::IcebergCommitError,
+        _ => {}
     }
     let descriptor = input.descriptor().descriptor;
     let code = user_code(descriptor.code.as_str()).unwrap_or(Code::GenericInternal);
@@ -501,7 +590,6 @@ fn execution_code(input: &ExecutionFailureInput) -> Code {
     // fact (spi/connector/mutation.rs). Its entity is unspecified, so the wire
     // uses Trino's general ALREADY_EXISTS rather than guessing a table kind.
     // CatalogApplicationErrorKind::AlreadyExists owns Data/METADATA/902.
-    let fact = input.fact();
     if code == Code::GenericUser
         && fact.class() == FailureClass::Data
         && ((fact.reason().domain() == domain::CONNECTOR.get() && fact.reason().code() == 6002)
@@ -649,7 +737,6 @@ fn user_location(error: &UserError, sql: &str) -> Option<TrinoErrorLocation> {
 }
 
 #[cfg(test)]
-#[path = "error_tests.rs"]
 mod tests;
 
 #[cfg(test)]

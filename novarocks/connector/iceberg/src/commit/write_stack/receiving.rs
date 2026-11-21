@@ -24,14 +24,21 @@ pub(crate) mod validation;
 use std::collections::{BTreeMap, LinkedList};
 use std::sync::Arc;
 
+use novarocks_spi::connector::read_stack::runtime::ConnectorRewrittenTargetFact;
 use novarocks_spi::connector::write_stack::{
     ConnectorCommitFragment, ConnectorWriteProductionProof, ConnectorWriteQueryIdentity,
     ConnectorWriterPhysicalContext, WriteTargetOrdinal, validate_query_target_ordinals,
     validate_write_fragment_targets,
 };
 use novarocks_spi::connector::{
-    ConnectorError, ConnectorErrorKind, ConnectorPayloadRetentionGuard,
+    ConnectorError, ConnectorErrorKind, ConnectorPayloadRetentionGuard, ConnectorProviderBindingKey,
 };
+
+use crate::commit::conflict_scope::{
+    ConflictScope, IcebergRewrittenTargetFact, RewrittenTargetBinding, WrittenPartitionCollector,
+    WrittenPartitionDomain,
+};
+use crate::iceberg::spec::TableMetadata;
 
 use super::domain::{
     IcebergArtifactPartition, IcebergCommitArtifact, IcebergSealedWriteTarget,
@@ -51,6 +58,20 @@ pub(crate) struct IcebergReceiving {
     queries: BTreeMap<ConnectorWriteQueryIdentity, QueryReceiving>,
     records: Vec<ReceivedRecord>,
     compact: Option<CompactReceiving>,
+    rewritten_target: Option<Box<RewrittenTargetReceiving>>,
+}
+
+#[derive(Debug)]
+struct RewrittenTargetReceiving {
+    owner: ConnectorProviderBindingKey,
+    binding: RewrittenTargetBinding,
+    metadata_digest: [u8; 32],
+    collector: WrittenPartitionCollector,
+    written: Option<WrittenPartitionDomain>,
+}
+
+fn rewritten_target_error(message: impl Into<String>) -> ConnectorError {
+    ConnectorError::new(ConnectorErrorKind::Internal, message)
 }
 
 #[derive(Default)]
@@ -124,6 +145,7 @@ impl std::fmt::Debug for CompactReceiving {
 struct QueryReceiving {
     targets: Vec<WriteTargetOrdinal>,
     production: Option<Arc<dyn ConnectorWriteProductionProof>>,
+    rewritten_target: Option<Arc<IcebergRewrittenTargetFact>>,
     confirmed: bool,
 }
 
@@ -171,6 +193,14 @@ impl ReceivedFragment<'_> {
     }
 }
 
+fn matches_rewritten_target(metadata: &TableMetadata, binding: RewrittenTargetBinding) -> bool {
+    metadata.uuid() == binding.table_uuid
+        && match binding.snapshot_id {
+            Some(snapshot_id) => metadata.snapshot_by_id(snapshot_id).is_some(),
+            None => metadata.current_snapshot_id().is_none(),
+        }
+}
+
 impl IcebergReceiving {
     pub(super) fn with_compact_mode(compact: bool) -> Self {
         Self {
@@ -191,6 +221,66 @@ impl IcebergReceiving {
             );
             self.compact = Some(CompactReceiving::default());
         }
+    }
+
+    pub(crate) fn bind_rewritten_target(
+        &mut self,
+        owner: ConnectorProviderBindingKey,
+        binding: RewrittenTargetBinding,
+        metadata: &TableMetadata,
+    ) -> Result<(), ConnectorError> {
+        if !self.is_unstarted() || self.rewritten_target.is_some() {
+            return Err(rewritten_target_error(
+                "Iceberg rewritten target binding was installed after receiving started",
+            ));
+        }
+        if !matches_rewritten_target(metadata, binding) {
+            return Err(rewritten_target_error(
+                "Iceberg rewritten target binding differs from the original write observation",
+            ));
+        }
+        self.rewritten_target = Some(Box::new(RewrittenTargetReceiving {
+            owner,
+            binding,
+            metadata_digest: crate::read_snapshot::metadata_identity_digest(metadata)
+                .map_err(rewritten_target_error)?,
+            collector: WrittenPartitionCollector::new(metadata),
+            written: Some(WrittenPartitionDomain::default()),
+        }));
+        Ok(())
+    }
+
+    pub(crate) fn row_conflict_scope(
+        &mut self,
+        source: &TableMetadata,
+    ) -> Result<Option<ConflictScope>, ConnectorError> {
+        if self.rewritten_target.is_some() {
+            self.require_complete()?;
+        }
+        let Some(receiving) = self.rewritten_target.as_mut() else {
+            return Ok(None);
+        };
+        if !matches_rewritten_target(source, receiving.binding)
+            || crate::read_snapshot::metadata_identity_digest(source)
+                .map_err(rewritten_target_error)?
+                != receiving.metadata_digest
+        {
+            return Err(rewritten_target_error(
+                "Iceberg conflict scope requires the original write observation",
+            ));
+        }
+        let fact = self
+            .queries
+            .values()
+            .next()
+            .and_then(|query| query.rewritten_target.as_deref())
+            .ok_or_else(|| {
+                rewritten_target_error("Iceberg row-level write lost its rewritten target fact")
+            })?;
+        let written = receiving.written.take().ok_or_else(|| {
+            rewritten_target_error("Iceberg row-level conflict scope was already taken")
+        })?;
+        ConflictScope::compose(fact, written, source).map(Some)
     }
 
     pub(crate) fn compact_files(&self) -> Option<&ReceivedCompactFiles> {
@@ -220,6 +310,7 @@ impl IcebergReceiving {
         if fragments.is_empty() {
             return Ok(());
         }
+        let mut record_partitions = WrittenPartitionDomain::default();
         let mut admission = FragmentAdmission::for_record(handle, &compact.indexes);
         let mut counts = compact.files.counts;
         let mut prepared = Vec::with_capacity(fragments.len());
@@ -264,6 +355,18 @@ impl IcebergReceiving {
                     "Iceberg compact receiving index size overflow",
                 )
             })?;
+            if let Some(receiving) = self.rewritten_target.as_ref() {
+                let existing = receiving.written.as_ref().ok_or_else(|| {
+                    rewritten_target_error("Iceberg row-level conflict scope was already taken")
+                })?;
+                let partition = match typed.artifact() {
+                    IcebergCommitArtifact::FinalDelete(effect) => Some(effect.partition()),
+                    _ => typed.partition(),
+                };
+                receiving
+                    .collector
+                    .observe(existing, &mut record_partitions, partition, author)?;
+            }
             let entry = CompactEntry::prepare(adapter, fragment, index_bytes, author)?;
             counts = counts.checked_add(entry.counts())?;
             prepared.push(entry);
@@ -293,6 +396,13 @@ impl IcebergReceiving {
             }
         }
         compact.indexes.apply(delta);
+        if let Some(written) = self
+            .rewritten_target
+            .as_mut()
+            .and_then(|state| state.written.as_mut())
+        {
+            written.apply(record_partitions);
+        }
         compact.files.v2_targets.extend(new_targets);
         for entry in entries {
             compact.files.push(entry);
@@ -312,6 +422,7 @@ impl IcebergReceiving {
         targets: &[WriteTargetOrdinal],
         production: &mut Option<Arc<dyn ConnectorWriteProductionProof>>,
         sealed: &[IcebergSealedWriteTarget],
+        rewritten_target: Option<&ConnectorRewrittenTargetFact>,
     ) -> Result<(), ConnectorError> {
         validate_query_target_ordinals(targets)?;
         if targets
@@ -322,12 +433,47 @@ impl IcebergReceiving {
                 "Iceberg write query targets are outside its original sealed session",
             ));
         }
+        let fact = match (&self.rewritten_target, rewritten_target) {
+            (None, None) => None,
+            (None, Some(_)) => {
+                return Err(rewritten_target_error(
+                    "Iceberg rewritten target fact requires an admitted row-level write",
+                ));
+            }
+            (Some(expected), Some(fact)) => {
+                if !self.queries.is_empty() || self.compact.is_none() {
+                    return Err(rewritten_target_error(
+                        "Iceberg row-level write expected one compact receiving query",
+                    ));
+                }
+                fact.validate_owner(&expected.owner).map_err(|_| {
+                    rewritten_target_error(
+                        "Iceberg rewritten target fact belongs to another provider generation",
+                    )
+                })?;
+                let fact = fact
+                    .value::<IcebergRewrittenTargetFact>(expected.owner.instance_id())
+                    .cloned()?;
+                if fact.binding != expected.binding {
+                    return Err(rewritten_target_error(
+                        "Iceberg rewritten target fact differs from the admitted table, snapshot or preparation",
+                    ));
+                }
+                Some(fact)
+            }
+            (Some(_), None) => {
+                return Err(rewritten_target_error(
+                    "Iceberg row-level write is missing its rewritten target fact",
+                ));
+            }
+        };
         let std::collections::btree_map::Entry::Vacant(entry) = self.queries.entry(query) else {
             return Err(invalid("Iceberg write query is already registered"));
         };
         entry.insert(QueryReceiving {
             targets: targets.to_vec(),
             production: production.take(),
+            rewritten_target: fact,
             confirmed: false,
         });
         Ok(())

@@ -32,6 +32,9 @@ use novarocks_spi::connector::{
     ConnectorWriteFieldToken,
 };
 use sha2::{Digest, Sha256};
+use std::sync::Arc;
+
+use super::model::IsolationLevel;
 
 use crate::commit::validation::row_mutation_strategy_from_metadata;
 use crate::commit::write_shared::{
@@ -41,6 +44,143 @@ use crate::commit::write_shared::{
 use crate::file_reader::execution_payload::{decode_payload, encode_payload};
 use crate::iceberg::spec::{FormatVersion, TableMetadata};
 use crate::metadata::{IcebergTablePayload, metadata_arrow_fields, projected_schema};
+
+const ISOLATION_LEVEL: &str = "write.delete.isolation-level";
+
+fn isolation_level(metadata: &TableMetadata) -> Result<IsolationLevel, ConnectorError> {
+    match metadata
+        .properties()
+        .get(ISOLATION_LEVEL)
+        .map(String::as_str)
+    {
+        None => Ok(IsolationLevel::Serializable),
+        Some(level) if level.eq_ignore_ascii_case("serializable") => {
+            Ok(IsolationLevel::Serializable)
+        }
+        Some(level) if level.eq_ignore_ascii_case("snapshot") => Ok(IsolationLevel::Snapshot),
+        Some(level) => Err(ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            format!("Invalid isolation level: {level}"),
+        )),
+    }
+}
+
+fn preparation_payload(
+    owner: &ConnectorProviderBindingKey,
+    table_uuid: &str,
+    target_ref: &str,
+    target_snapshot_id: Option<i64>,
+    strategy: ConnectorRowMutationStrategy,
+    isolation: IsolationLevel,
+) -> Bytes {
+    let snapshot = snapshot_token(target_snapshot_id);
+    let isolation_token = match isolation {
+        IsolationLevel::Snapshot => "snapshot",
+        IsolationLevel::Serializable => "serializable",
+    };
+    Bytes::from(format!(
+        "iceberg/row-mutation-preparation/v2/{}/{table_uuid}/{target_ref}/{snapshot}/{strategy:?}/{isolation_token}",
+        owner.instance_id.as_str(),
+    ))
+}
+
+pub(crate) struct AdmittedRowMutation {
+    pub(crate) metadata: Arc<TableMetadata>,
+    pub(crate) metadata_location: String,
+    pub(crate) isolation: IsolationLevel,
+    pub(crate) preparation_digest: [u8; 32],
+}
+
+pub(crate) fn open_admission(
+    owner: &ConnectorProviderBindingKey,
+    request: &novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest,
+    admission: &novarocks_spi::connector::ConnectorProcessLocalPayload,
+    namespace: &str,
+    table_name: &str,
+) -> Result<AdmittedRowMutation, ConnectorError> {
+    let invalid = |message| ConnectorError::new(ConnectorErrorKind::InvalidRequest, message);
+    admission.validate_owner(owner)?;
+    let preparation =
+        admission.value::<ConnectorRowMutationPreparation>(owner.instance_id.as_str())?;
+    preparation.validate()?;
+    if preparation.owner() != owner
+        || preparation.target_ref() != &request.target_ref
+        || Some(preparation.base_version()) != request.base.as_ref()
+        || request.intent != novarocks_spi::connector::ConnectorWriteIntent::RowDelta
+    {
+        return Err(invalid(
+            "Iceberg row mutation request differs from its admitted target",
+        ));
+    }
+    let payload: IcebergTablePayload = decode_payload(
+        preparation.table().payload(),
+        "admitted Iceberg row-mutation table",
+    )?;
+    if payload.namespace != namespace
+        || payload.table != table_name
+        || payload.metadata_table_type.is_some()
+        || payload.explicit_files.is_some()
+    {
+        return Err(invalid(
+            "Iceberg row mutation admission names a different table",
+        ));
+    }
+    let location = payload
+        .metadata_location
+        .ok_or_else(|| invalid("Iceberg row mutation target has no immutable metadata location"))?;
+    let info = payload
+        .table_info
+        .ok_or_else(|| invalid("Iceberg row mutation admission has no table metadata"))?;
+    let serialized = info
+        .serialized_metadata
+        .as_deref()
+        .ok_or_else(|| invalid("Iceberg row mutation admission has no frozen metadata"))?;
+    let metadata = crate::metadata_json::from_metadata_str(serialized).map_err(|error| {
+        ConnectorError::new(
+            error.connector_kind(ConnectorErrorKind::CorruptData),
+            format!("decode admitted Iceberg row-mutation metadata: {error}"),
+        )
+    })?;
+    let target_ref = request.target_ref.as_str();
+    let snapshot = write_target_snapshot_id(&metadata, target_ref)?;
+    let exact_base = super::write_shared::position_mutation_base(
+        &metadata,
+        Some(&location),
+        target_ref,
+        snapshot,
+    )?;
+    let table_uuid = metadata.uuid().to_string();
+    if &exact_base != preparation.base_version()
+        || preparation.base_version_ordinal() != snapshot
+        || info.table_uuid.as_deref() != Some(table_uuid.as_str())
+    {
+        return Err(invalid(
+            "Iceberg row mutation base differs from its admitted target",
+        ));
+    }
+    // Isolation is part of the signed preparation emitted by the original
+    // provider. It is never recovered from a later catalog generation.
+    let isolation = isolation_level(&metadata)?;
+    let expected_payload = preparation_payload(
+        owner,
+        &table_uuid,
+        target_ref,
+        snapshot,
+        preparation.strategy(),
+        isolation,
+    );
+    if preparation.payload() != &expected_payload {
+        return Err(invalid(
+            "Iceberg row mutation preparation differs from its frozen facts",
+        ));
+    }
+    Ok(AdmittedRowMutation {
+        metadata: Arc::new(metadata),
+        metadata_location: location,
+        isolation,
+        preparation_digest: preparation.digest(),
+    })
+}
 
 /// Provider-side row-mutation admission. This is intentionally independent of
 /// `prepare_write`: it chooses the table-format strategy and signs identity
@@ -115,6 +255,10 @@ pub(crate) fn prepare_row_mutation(
             return Ok(ConnectorRowMutationPreparationOutcome::Denied(error));
         }
     };
+    let isolation = match isolation_level(&metadata) {
+        Ok(isolation) => isolation,
+        Err(error) => return Ok(ConnectorRowMutationPreparationOutcome::Denied(error)),
+    };
     // A MERGE that can append has no target identity or before-image for its
     // Insert rows.  The signed match layout therefore declares precisely those
     // fields nullable; Delete/Replace validation still rejects null keys.
@@ -149,7 +293,6 @@ pub(crate) fn prepare_row_mutation(
         identity_source_fields.extend(mutation.arrow_fields()?);
     }
 
-    let snapshot = snapshot_token(target_snapshot_id);
     let base_version = super::write_shared::position_mutation_base(
         &metadata,
         payload.metadata_location.as_deref(),
@@ -335,11 +478,14 @@ pub(crate) fn prepare_row_mutation(
         after_fields,
         effect_field,
     )?;
-    let preparation_payload = Bytes::from(format!(
-        "iceberg/row-mutation-preparation/v1/{}/{table_uuid}/{}/{snapshot}/{strategy:?}",
-        owner.instance_id.as_str(),
-        request.target_ref.as_str()
-    ));
+    let preparation_payload = preparation_payload(
+        owner,
+        table_uuid,
+        request.target_ref.as_str(),
+        target_snapshot_id,
+        strategy,
+        isolation,
+    );
     Ok(ConnectorRowMutationPreparationOutcome::Prepared(
         ConnectorRowMutationPreparation::try_new(
             owner.clone(),
@@ -733,7 +879,7 @@ mod tests {
         assert_eq!(preparation.base_version_ordinal(), None);
         assert_eq!(
             preparation.payload().as_ref(),
-            b"iceberg/row-mutation-preparation/v1/ice/11111111-2222-3333-4444-555555555555/main/none/DeletionVector"
+            b"iceberg/row-mutation-preparation/v2/ice/11111111-2222-3333-4444-555555555555/main/none/DeletionVector/serializable"
         );
 
         let contract = preparation.match_contract();
@@ -833,7 +979,11 @@ mod tests {
             preparation.strategy(),
             ConnectorRowMutationStrategy::PositionDelete
         );
-        assert!(preparation.payload().ends_with(b"/none/PositionDelete"));
+        assert!(
+            preparation
+                .payload()
+                .ends_with(b"/none/PositionDelete/serializable")
+        );
     }
 
     #[test]
@@ -1630,7 +1780,7 @@ mod tests {
         );
         assert_eq!(
             preparation.payload().as_ref(),
-            b"iceberg/row-mutation-preparation/v1/ice/11111111-2222-3333-4444-555555555555/main/none/MergeOnRead"
+            b"iceberg/row-mutation-preparation/v2/ice/11111111-2222-3333-4444-555555555555/main/none/MergeOnRead/serializable"
         );
     }
     fn scalar_integer_metadata_with_older_base_schema(

@@ -139,18 +139,6 @@ impl UnitRecipes {
     ) -> Option<&novarocks_functions::PreparedArithmeticRecipe> {
         self.arithmetic.get(&id)
     }
-    pub fn native_negate(
-        &self,
-        id: ExpressionUseId,
-    ) -> Option<&novarocks_functions::PreparedNativeNegateRecipe> {
-        self.native_negate.get(&id)
-    }
-    pub fn native_bitnot(
-        &self,
-        id: ExpressionUseId,
-    ) -> Option<&novarocks_functions::PreparedNativeBitNotRecipe> {
-        self.native_bitnot.get(&id)
-    }
     pub fn native_inlist(
         &self,
         id: ExpressionUseId,

@@ -196,9 +196,9 @@ under the License.
 | 能力 | 状态 | 备注 |
 | --- | --- | --- |
 | `parent-snapshot-id` / `summary` 正确记录 | ✅ | |
-| `EXPIRE SNAPSHOTS [OLDER THAN] [RETAIN LAST]` | ✅ | OLDER THAN / RETAIN LAST 子句，per-branch retention 属性未读取 |
-| `REMOVE ORPHAN FILES` | ✅ | OLDER THAN 强制；hdfs:// 暂不支持 |
-| `REWRITE MANIFESTS` | ✅ | 按 (spec_id, content_type) 分组合并；V3 row-lineage round-trip |
+| `EXECUTE expire_snapshots` | ✅ | 保留期、分支与标签保留规则，可清理未使用的 schema/spec |
+| `EXECUTE remove_orphan_files` | ✅ | 表根、保留期、完整有效文件名与发现根保护，支持 S3 兼容存储、本地文件系统及 HDFS |
+| `EXECUTE optimize_manifests` | ✅ | 按首分区字段聚簇并按历史 spec 滚动写出，保留删除 manifest 与 v3 行谱系 |
 
 ## 9. Metadata Tables
 
@@ -243,12 +243,14 @@ under the License.
 | --- | --- | --- |
 | OPTIMIZE TABLE（whole-table） | ✅ | |
 | OPTIMIZE 增量（仅小文件 / 仅 partition） | ❌ | |
-| EXPIRE SNAPSHOTS | ✅ | OLDER THAN / RETAIN LAST 子句，per-branch retention 属性未读取 |
-| REMOVE ORPHAN FILES | ✅ | OLDER THAN 强制；hdfs:// 暂不支持 |
-| REWRITE MANIFESTS | ✅ | 按 (spec_id, content_type) 分组合并；V3 row-lineage round-trip |
+| `EXECUTE expire_snapshots` | ✅ | 保留期、分支与标签保留规则，可清理未使用的 schema/spec |
+| `EXECUTE remove_orphan_files` | ✅ | 显式语句扫描表根，非空表成功时返回五行指标 |
+| `EXECUTE optimize_manifests` | ✅ | 聚簇重写数据 manifest，实际重写成功时返回四行指标 |
 | REWRITE POSITION DELETES（v2→DV） | ❌ | |
 | REWRITE DATA FILES BY SORT ORDER | ❌ | |
 | 自动 maintenance 调度器 | ❌ | |
+
+参数、保留期与文件回收边界见 [维护](../maintenance.md)。
 
 ## 12. Row Lineage（V3）
 

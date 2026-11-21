@@ -46,6 +46,7 @@ use std::{error::Error, fmt};
 mod calendar;
 
 mod f3_scalar;
+pub(crate) use f3_scalar::{decimal_integral_coefficient, decimal_overflow_error};
 
 mod f3_array;
 

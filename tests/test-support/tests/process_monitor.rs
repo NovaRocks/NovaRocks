@@ -134,7 +134,23 @@ fn one_shot_accepts_fast_stdout_marker_but_preserves_nonzero_status() {
         directory.0.join("failure"),
     )
     .unwrap_err();
-    assert!(format!("{error:#}").contains("did not exit successfully"));
+    assert!(
+        format!("{error:#}").contains("did not exit successfully"),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn one_shot_accepts_stdout_marker_across_log_chunks_at_exit() {
+    let directory = Directory::new();
+    ManagedProcess::run_to_completion(
+        "one-shot chunked stdout".into(),
+        command("printf '%0131070dRE' 0; printf 'ADY\\n'"),
+        ReadyMarker::StdoutContains("READY".into()),
+        Duration::from_secs(2),
+        directory.0.join("success"),
+    )
+    .unwrap();
 }
 
 #[test]

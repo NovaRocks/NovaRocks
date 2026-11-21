@@ -28,8 +28,9 @@ use novarocks_spi::connector::read_stack::{
 };
 use novarocks_spi::connector::{
     CatalogHandle, ConnectorChangeWindowAdmission, ConnectorExactSemanticRevision,
-    ConnectorOriginalResultScope, ConnectorProviderBindingKey, ConnectorRequestContext,
-    ConnectorTableMetadata, ConnectorTableObjectId, ProviderMetadataCpuPort,
+    ConnectorOriginalResultScope, ConnectorProcessLocalPayload, ConnectorProviderBindingKey,
+    ConnectorRequestContext, ConnectorRowMutationCurrent, ConnectorTableMetadata,
+    ConnectorTableObjectId, ProviderMetadataCpuPort,
 };
 use std::{
     future::Future,
@@ -43,6 +44,62 @@ pub(crate) struct IcebergObservedSourceReadFacts {
     pub(crate) access: Arc<IcebergAttemptTableAccess>,
     pub(crate) snapshots: crate::catalog::SnapshotLoading,
     pub(crate) projection: crate::metadata::TableMetadataProjection,
+}
+
+impl IcebergObservedSourceReadFacts {
+    pub(crate) fn for_row_mutation_current<'a>(
+        source: &'a ConnectorRowMutationCurrent,
+        owner: &ConnectorProviderBindingKey,
+    ) -> Result<&'a Self, ConnectorError> {
+        let identity = source.identity();
+        if identity.instance_id != owner.instance_id {
+            return Err(invalid(
+                "Iceberg mutation Current read belongs to another table owner",
+            ));
+        }
+        let observed = Self::current_all(
+            source.original_source(),
+            owner,
+            &identity.namespace,
+            &identity.table,
+        )?;
+        let metadata = observed.access.metadata();
+        if crate::commit::write_shared::write_target_snapshot_id(
+            metadata,
+            source.target_ref().as_str(),
+        )? != source.snapshot_id()
+        {
+            return Err(invalid(
+                "Iceberg mutation Current read differs from its signed ref base",
+            ));
+        }
+        Ok(observed)
+    }
+
+    pub(crate) fn current_all<'a>(
+        original: &'a ConnectorProcessLocalPayload,
+        owner: &ConnectorProviderBindingKey,
+        namespace: &str,
+        table: &str,
+    ) -> Result<&'a Self, ConnectorError> {
+        original.validate_owner(owner)?;
+        let observed = original.value::<Self>(owner.instance_id.as_str())?;
+        let ident = observed.access.identifier();
+        if observed.snapshots != crate::catalog::SnapshotLoading::All
+            || !matches!(
+                observed.projection,
+                crate::metadata::TableMetadataProjection::Current
+            )
+            || ident.namespace().to_url_string() != namespace
+            || ident.name() != table
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg row mutation requires the complete original current table observation",
+            ));
+        }
+        Ok(observed)
+    }
 }
 
 pub(crate) struct PreparedRelations {

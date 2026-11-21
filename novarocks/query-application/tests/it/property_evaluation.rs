@@ -1715,23 +1715,10 @@ fn trino_branch_uses_the_authentic_bigint_expression_and_original_ref_command() 
 fn trino_table_execute_resolves_provider_and_where_before_evaluating_arguments() {
     use novarocks_parser::{ast::TrinoStatement, parser::parse_statement};
     use novarocks_query_application::sql::{
-        table_procedure::{
-            BoundProcedureArgument, TableProcedureAbsoluteTimePort, TableProcedureKind,
-        },
+        table_procedure::{BoundProcedureArgument, TableProcedureKind},
         trino_table_command::bind_trino_table_execute,
     };
     use novarocks_spi::connector::ConnectorProviderId;
-
-    struct NoAbsoluteTime;
-    impl TableProcedureAbsoluteTimePort for NoAbsoluteTime {
-        fn legacy_timestamp_literal_millis(
-            &mut self,
-            _: &str,
-            _: novarocks_parser::Span,
-        ) -> Result<i64, QueryServiceError> {
-            panic!("this procedure does not request an absolute time")
-        }
-    }
 
     let provider = ConnectorProviderId::parse("iceberg").unwrap();
     let control = Control::default();
@@ -1757,7 +1744,7 @@ fn trino_table_execute_resolves_provider_and_where_before_evaluating_arguments()
             &statement,
             &provider,
             &mut Port::new(vec![]),
-            &mut NoAbsoluteTime,
+            "lake",
             &control,
         )
         .unwrap_err();
@@ -1773,7 +1760,7 @@ fn trino_table_execute_resolves_provider_and_where_before_evaluating_arguments()
         &statement,
         &provider,
         &mut Port::new(vec![]),
-        &mut NoAbsoluteTime,
+        "lake",
         &control,
     )
     .unwrap();
@@ -1786,94 +1773,37 @@ fn trino_table_execute_resolves_provider_and_where_before_evaluating_arguments()
 }
 
 #[test]
-fn table_procedure_timestamp_projection_uses_original_selected_ticks_and_declared_unit() {
-    use arrow::array::{
-        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-        TimestampSecondArray,
-    };
+fn iceberg_maintenance_rejects_the_retired_absolute_time_before_evaluation() {
     use novarocks_parser::{ast::TrinoStatement, parser::parse_statement};
-    use novarocks_query_application::sql::{
-        table_procedure::{
-            BoundProcedureArgument, BoundProcedureValue, TableProcedureAbsoluteTimePort,
-        },
-        trino_table_command::bind_trino_table_execute,
-    };
+    use novarocks_query_application::sql::trino_table_command::bind_trino_table_execute;
     use novarocks_spi::connector::ConnectorProviderId;
-
-    struct NoLegacyTimestamp;
-    impl TableProcedureAbsoluteTimePort for NoLegacyTimestamp {
-        fn legacy_timestamp_literal_millis(
-            &mut self,
-            _: &str,
-            _: novarocks_parser::Span,
-        ) -> Result<i64, QueryServiceError> {
-            panic!("a typed expression does not use the legacy literal parser")
-        }
-    }
 
     let provider = ConnectorProviderId::parse("iceberg").unwrap();
     let control = Control::default();
-    let source = "ALTER TABLE lake.ns.t EXECUTE expire_snapshots(older_than => CAST('1970-01-01' AS TIMESTAMP))";
-    let TrinoStatement::TableExecute(statement) = parse_statement(source).unwrap() else {
-        panic!("expected ALTER TABLE EXECUTE");
-    };
-    let cases: [(ArrayRef, Option<i64>); 7] = [
-        (
-            Arc::new(TimestampSecondArray::from(vec![10, 7])),
-            Some(7000),
-        ),
-        (
-            Arc::new(TimestampMillisecondArray::from(vec![10, 7123])),
-            Some(7123),
-        ),
-        (
-            Arc::new(TimestampMicrosecondArray::from(vec![10, 7_123_456]).with_timezone("+02:00")),
-            Some(7123),
-        ),
-        (
-            Arc::new(TimestampNanosecondArray::from(vec![10, -1])),
-            Some(-1),
-        ),
-        (
-            Arc::new(TimestampSecondArray::from(vec![10, i64::MAX])),
-            None,
-        ),
-        (
-            Arc::new(TimestampNanosecondArray::from(vec![Some(10), None])),
-            None,
-        ),
-        (Arc::new(arrow::array::NullArray::new(2)), None),
-    ];
-    for (array, expected) in cases {
-        let mut port = Port::new(vec![Call {
-            expression: &statement.arguments[0].value,
-            target: Target::Timestamp,
-            result: Ok(constant(array, ValueLogicalType::Physical)),
-        }]);
-        let result = bind_trino_table_execute(
-            source,
-            &statement,
-            &provider,
-            &mut port,
-            &mut NoLegacyTimestamp,
-            &control,
+    for name in [
+        "optimize_manifests",
+        "expire_snapshots",
+        "remove_orphan_files",
+    ] {
+        let source = format!(
+            "ALTER TABLE lake.ns.t EXECUTE {name}(older_than => CAST('1970-01-01' AS TIMESTAMP))"
         );
-        match expected {
-            Some(millis) => {
-                let bound = result.unwrap();
-                let (_, value) = bound
-                    .arguments()
-                    .find(|(slot, _)| slot.name == "older_than")
-                    .unwrap();
-                assert!(matches!(value, BoundProcedureArgument::Present {
-                    value: BoundProcedureValue::Value(Value::Bigint(actual)), ..
-                } if *actual == millis));
-            }
-            None => assert_eq!(
-                result.unwrap_err().user_error().unwrap().code().as_str(),
-                "sql.admit.invalid_table_procedure_argument",
-            ),
-        }
+        let TrinoStatement::TableExecute(statement) = parse_statement(&source).unwrap() else {
+            panic!("expected ALTER TABLE EXECUTE");
+        };
+        let mut port = Port::new(vec![]);
+        let error =
+            bind_trino_table_execute(&source, &statement, &provider, &mut port, "lake", &control)
+                .unwrap_err();
+        let user = error.user_error().unwrap();
+        assert_eq!(
+            user.code().as_str(),
+            "sql.admit.invalid_table_procedure_argument"
+        );
+        assert!(error.to_string().contains(&format!(
+            "Catalog 'lake' table procedure '{}' property 'older_than' does not exist",
+            name.to_uppercase(),
+        )));
         port.exhausted();
     }
 }

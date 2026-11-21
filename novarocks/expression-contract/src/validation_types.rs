@@ -21,7 +21,6 @@ use arrow_schema::DataType;
 use novarocks_type_contract::CompileCheckpoints;
 use novarocks_type_contract::{
     FunctionArgumentType, FunctionKind, arithmetic_result_value_shape_with_op,
-    is_integer_value_type, is_numeric_value_type,
 };
 use std::collections::BTreeSet;
 
@@ -343,36 +342,15 @@ pub(crate) fn validate_expression_types<'a, H>(
                 ));
             }
         }
-        ExprKind::Unary { op, expr } => {
+        ExprKind::Unary {
+            op: crate::UnaryOperator::Not,
+            expr,
+        } => {
             if let Some(input) = definitions.get((*expr).get() as usize) {
-                // An operator answers in its operand's type and may admit null
-                // its operand does not -- negating the smallest integer has no
-                // answer, and a plan's nullability widens on the way out. It
-                // may not admit less.
-                let widens = expression.ty.nullable() || !input.ty.nullable();
-                // Strict unary NULL preserves the actual nullable NULL domain
-                // and its child evaluation; it is not a numeric coercion.
-                let strict_null = input.ty.logical_type()
-                    == novarocks_type_contract::ValueLogicalType::Physical
-                    && *input.ty.data_type() == DataType::Null
-                    && input.ty.nullable();
-                let valid = match op {
-                    crate::UnaryOperator::Plus | crate::UnaryOperator::Minus => {
-                        (is_numeric_value_type(&input.ty) || strict_null)
-                            && same_domain(&input.ty, &expression.ty, work)?
-                            && widens
-                    }
-                    crate::UnaryOperator::Not => {
-                        novarocks_type_contract::supports_boolean_negation_value_type(&input.ty)
-                            && *expression.ty.data_type() == DataType::Boolean
-                            && widens
-                    }
-                    crate::UnaryOperator::BitwiseNot => {
-                        (is_integer_value_type(&input.ty) || strict_null)
-                            && same_domain(&input.ty, &expression.ty, work)?
-                            && widens
-                    }
-                };
+                let valid =
+                    novarocks_type_contract::supports_boolean_negation_value_type(&input.ty)
+                        && *expression.ty.data_type() == DataType::Boolean
+                        && (expression.ty.nullable() || !input.ty.nullable());
                 if !valid {
                     errors.push(TypeIssue::new(
                         path,
@@ -790,14 +768,6 @@ pub(crate) fn validate_binary_types<'a, H>(
         }
         crate::BinaryOperator::EqForNull => {
             same_inputs && *output.ty.data_type() == DataType::Boolean && !output.ty.nullable()
-        }
-        crate::BinaryOperator::BitAnd
-        | crate::BinaryOperator::BitOr
-        | crate::BinaryOperator::BitXor => {
-            same_inputs
-                && is_integer_value_type(&left.ty)
-                && same_domain(&output.ty, &left.ty, work)?
-                && nullability_widens(output.ty.nullable())
         }
     };
     if !valid {

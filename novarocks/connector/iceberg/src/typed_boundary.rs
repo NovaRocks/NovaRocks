@@ -39,6 +39,8 @@
 //! untouched and keeps its own resolution rules.
 // Design: ADR-0123 (docs/adr/ADR-0123-task-update-watermark-retry-delivery.md)
 
+mod row_mutation_current;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -1146,6 +1148,44 @@ impl ConnectorReadAttemptAccessSealer for IcebergAttemptAccessSealer {
             access,
         })))
     }
+
+    fn rewritten_target_fact(
+        &self,
+        frozen: &ConnectorReadTableHandle,
+    ) -> Result<
+        novarocks_spi::connector::read_stack::runtime::ConnectorRewrittenTargetFact,
+        ConnectorError,
+    > {
+        use crate::commit::conflict_scope::IcebergRewrittenTargetFact;
+
+        let relation = self.adapter.table(frozen)?;
+        let crate::typed_read::IcebergRuntimeRelation::Table(table) = relation else {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::Internal,
+                "Iceberg rewritten target fact requires a data relation",
+            ));
+        };
+        let binding = table.rewritten_target().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::Internal,
+                "Iceberg read handle does not represent the rewritten target",
+            )
+        })?;
+        let fact = IcebergRewrittenTargetFact::new(
+            binding,
+            Arc::new(table.parse_table_schema()?),
+            table.enforced_predicate(),
+            table.unenforced_predicate(),
+        )?;
+        let owner = novarocks_spi::connector::ConnectorProviderBindingKey {
+            instance_id: self.boundary.descriptor.instance_id.clone(),
+            incarnation: self.boundary.incarnation,
+        };
+        Ok(novarocks_spi::connector::ConnectorProcessLocalPayload::new(
+            owner,
+            Arc::new(fact),
+        ))
+    }
 }
 
 // Attempt retries retain the original source access recipe.
@@ -1537,6 +1577,7 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
                 table,
                 original_source,
                 snapshot_id,
+                ..
             } = request.kind()
             {
                 let (physical, schema) =
@@ -1549,6 +1590,9 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
                 }));
             }
             let physical = match request.kind() {
+                K::RowMutationCurrent(source) => {
+                    Some(self.prepare_row_mutation_current(name, source)?)
+                }
                 K::FrozenMvTarget {
                     table,
                     original_source,
@@ -1691,6 +1735,15 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
         } = prepared;
         let name = request.name();
         let table = match request.kind() {
+            K::RowMutationCurrent(source) => Some(
+                crate::typed_read::IcebergRuntimeRelation::Table(pinned_table_handle_with_schema(
+                    name,
+                    physical.table.metadata(),
+                    source.snapshot_id(),
+                    physical.table.metadata().current_schema().clone(),
+                    None,
+                )?),
+            ),
             K::Table { version, reference } => Some(
                 crate::typed_read::IcebergRuntimeRelation::Table(table_handle_for_version(
                     name,
@@ -1699,16 +1752,31 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
                     reference.as_deref(),
                 )?),
             ),
-            K::RowMutationMatch { snapshot_id, .. } => Some(
-                crate::typed_read::IcebergRuntimeRelation::Table(pinned_table_handle_with_schema(
+            K::RowMutationMatch {
+                snapshot_id,
+                preparation_digest,
+                ..
+            } => {
+                let metadata = physical.table.metadata();
+                let match_handle = pinned_table_handle_with_schema(
                     name,
-                    physical.table.metadata(),
+                    metadata,
                     *snapshot_id,
                     mutation_match_schema
                         .ok_or_else(|| corrupt("mutation match lost its signed schema"))?,
                     None,
-                )?),
-            ),
+                )?
+                .with_rewritten_target(
+                    crate::commit::conflict_scope::RewrittenTargetBinding {
+                        table_uuid: metadata.uuid(),
+                        snapshot_id: *snapshot_id,
+                        preparation_digest: *preparation_digest,
+                    },
+                );
+                Some(crate::typed_read::IcebergRuntimeRelation::Table(
+                    match_handle,
+                ))
+            }
             K::PinnedFileSet { pinned } => {
                 let metadata = physical.table.metadata();
                 let snapshot_id = pinned.version_ordinal();
@@ -6144,7 +6212,7 @@ mod prepared_source_relation_tests {
     }
 
     /// Immutable owner-local matcher fixture, without CPU/IO grants.
-    fn inventory_fixture() -> (
+    pub(super) fn inventory_fixture() -> (
         tokio::runtime::Runtime,
         tempfile::TempDir,
         Arc<IcebergTypedBoundary>,
@@ -6371,6 +6439,7 @@ mod prepared_source_relation_tests {
                     table: signed.clone(),
                     original_source: original.clone(),
                     snapshot_id,
+                    preparation_digest: [1; 32],
                 },
             );
             let prepared = executor
@@ -6386,6 +6455,40 @@ mod prepared_source_relation_tests {
                 panic!("original match target must be a table");
             };
             assert_eq!(table.snapshot_id(), snapshot_id);
+            let read = Arc::new(read);
+            let adapter = Arc::clone(&read).read_runtime_adapter();
+            let request_control = iceberg_request_control(Arc::clone(&boundary), Arc::clone(&read));
+            let optimized = table.apply_limit(3).unwrap().into_handle();
+            let rewritten =
+                adapter.wrap_table(crate::typed_read::IcebergRuntimeRelation::Table(optimized));
+            let fact = request_control.rewritten_target_fact(&rewritten).unwrap();
+            let owner = novarocks_spi::connector::ConnectorProviderBindingKey {
+                instance_id: boundary.descriptor.instance_id.clone(),
+                incarnation: boundary.incarnation,
+            };
+            fact.validate_owner(&owner).unwrap();
+            assert_eq!(
+                fact.value::<crate::commit::conflict_scope::IcebergRewrittenTargetFact>(
+                    owner.instance_id(),
+                )
+                .unwrap()
+                .binding,
+                crate::commit::conflict_scope::RewrittenTargetBinding {
+                    table_uuid: source.access.metadata().uuid(),
+                    snapshot_id,
+                    preparation_digest: [1; 32],
+                },
+            );
+            let ordinary = adapter.wrap_table(crate::typed_read::IcebergRuntimeRelation::Table(
+                source.relations.from.as_ref().unwrap().clone(),
+            ));
+            assert_eq!(
+                request_control
+                    .rewritten_target_fact(&ordinary)
+                    .unwrap_err()
+                    .kind(),
+                ConnectorErrorKind::Internal,
+            );
             assert_eq!(
                 read.load_pinned_relation(name).unwrap().table.metadata(),
                 source.access.metadata(),
@@ -6396,6 +6499,7 @@ mod prepared_source_relation_tests {
                     table: signed,
                     original_source: original.clone(),
                     snapshot_id: Some(42),
+                    preparation_digest: [1; 32],
                 },
             );
             assert!(

@@ -138,7 +138,6 @@ pub enum FrontendApplicationErrorKind {
     StateFamilyRegistration,
     StateStoreHost,
     ViewServiceOpen,
-    TableMaintenanceServiceOpen,
     MvServiceOpen,
     StatisticsApplicationServiceOpen,
     CatalogApplicationServiceOpen,
@@ -1419,12 +1418,10 @@ impl FrontendApplicationHost {
         native_trust: Arc<NativeTrust>,
         native_transport: FrontendNativeTransport,
     ) -> Result<Self, FrontendApplicationError> {
-        let mut durable_families =
-            vec![novarocks_mv_application::state_family::MV_ACCELERATOR_STATE_FAMILY];
-        durable_families.push(novarocks_catalog_application::CATALOG_DESIRED_STATE_FAMILY);
-        durable_families.push(
-            novarocks_table_maintenance::gc_observation::GC_OWNED_REF_OBSERVATION_STATE_FAMILY,
-        );
+        let durable_families = [
+            novarocks_mv_application::state_family::MV_ACCELERATOR_STATE_FAMILY,
+            novarocks_catalog_application::CATALOG_DESIRED_STATE_FAMILY,
+        ];
         validate_persistent_state_families(&durable_families).map_err(|error| {
             FrontendApplicationError::new(
                 FrontendApplicationErrorKind::StateFamilyRegistration,

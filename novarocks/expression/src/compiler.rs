@@ -598,32 +598,12 @@ pub(crate) fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFacto
                 | ExprKind::Conjunction { args }
                 | ExprKind::Disjunction { args } => args.get(next).copied(),
                 ExprKind::Unary {
-                    op:
-                        novarocks_expression_contract::UnaryOperator::Not
-                        | novarocks_expression_contract::UnaryOperator::Minus
-                        | novarocks_expression_contract::UnaryOperator::BitwiseNot,
+                    op: novarocks_expression_contract::UnaryOperator::Not,
                     expr,
                 }
                 | ExprKind::IsNull { expr, .. }
                 | ExprKind::Cast { expr, .. } => (next == 0).then_some(*expr),
-                ExprKind::Binary {
-                    op:
-                        novarocks_expression_contract::BinaryOperator::Eq
-                        | novarocks_expression_contract::BinaryOperator::EqForNull
-                        | novarocks_expression_contract::BinaryOperator::NotEq
-                        | novarocks_expression_contract::BinaryOperator::Lt
-                        | novarocks_expression_contract::BinaryOperator::LtEq
-                        | novarocks_expression_contract::BinaryOperator::Gt
-                        | novarocks_expression_contract::BinaryOperator::GtEq
-                        | novarocks_expression_contract::BinaryOperator::Add
-                        | novarocks_expression_contract::BinaryOperator::Subtract
-                        | novarocks_expression_contract::BinaryOperator::Multiply
-                        | novarocks_expression_contract::BinaryOperator::Divide
-                        | novarocks_expression_contract::BinaryOperator::Modulo,
-                    left,
-                    right,
-                    ..
-                } => [*left, *right].get(next).copied(),
+                ExprKind::Binary { left, right, .. } => [*left, *right].get(next).copied(),
                 ExprKind::Like { expr, pattern, .. } => [*expr, *pattern].get(next).copied(),
                 ExprKind::Between {
                     expr, low, high, ..
@@ -706,44 +686,6 @@ pub(crate) fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFacto
                     } else {
                         StaticExprKind::NaryOr { args: local_args }
                     }
-                }
-                ExprKind::Unary {
-                    op: novarocks_expression_contract::UnaryOperator::Minus,
-                    expr,
-                } => {
-                    let child = *ids.get(expr).ok_or(ExprCompileError::Invalid(
-                        "native negate operand was not lowered",
-                    ))?;
-                    let source_child = source.definition(*expr).ok_or(
-                        ExprCompileError::Invalid("native negate source operand is missing"),
-                    )?;
-                    work.flush()?;
-                    novarocks_functions::PreparedNativeNegateRecipe::try_new(
-                        &source_child.ty,
-                        &node.ty,
-                        control,
-                    )?;
-                    work.flush()?;
-                    StaticExprKind::PreparedNativeNegate(child)
-                }
-                ExprKind::Unary {
-                    op: novarocks_expression_contract::UnaryOperator::BitwiseNot,
-                    expr,
-                } => {
-                    let child = *ids.get(expr).ok_or(ExprCompileError::Invalid(
-                        "native BitwiseNot operand was not lowered",
-                    ))?;
-                    let source_child = source.definition(*expr).ok_or(
-                        ExprCompileError::Invalid("native BitwiseNot source operand is missing"),
-                    )?;
-                    work.flush()?;
-                    novarocks_functions::PreparedNativeBitNotRecipe::try_new(
-                        &source_child.ty,
-                        &node.ty,
-                        control,
-                    )?;
-                    work.flush()?;
-                    StaticExprKind::PreparedNativeBitNot(child)
                 }
                 ExprKind::Unary {
                     op: novarocks_expression_contract::UnaryOperator::Not,
@@ -1580,80 +1522,6 @@ pub(crate) fn prepare_core<H, F: novarocks_type_contract::ValueSchemaCreationFac
                 }
                 (
                     ExprKind::Unary {
-                        op: novarocks_expression_contract::UnaryOperator::Minus,
-                        expr,
-                    },
-                    StaticExprKind::PreparedNativeNegate(local_child),
-                ) => {
-                    if invocation.control != ControlShape::Eager
-                        || invocation.arguments.len() != 1
-                        || lowered.ids.get(expr) != Some(local_child)
-                        || flow.uses()[&invocation.arguments[0]].definition != *expr
-                    {
-                        return Err(ExprCompileError::Invalid(
-                            "native negate differs from its actual ordered source",
-                        )
-                        .into());
-                    }
-                    let child = unit
-                        .definition(*expr)
-                        .ok_or(ExprCompileError::Invalid("missing native negate source"))?;
-                    work.flush()?;
-                    let recipe = novarocks_functions::PreparedNativeNegateRecipe::try_new(
-                        &child.ty, &source.ty, control,
-                    )?;
-                    work.flush()?;
-                    recipe
-                        .own_effects(invocation.context)
-                        .join_control_argument(
-                            *effects.get(&invocation.arguments[0]).ok_or(
-                                ExprCompileError::Invalid(
-                                    "native negate child effects were not prepared",
-                                ),
-                            )?,
-                            flow,
-                            0,
-                        )?
-                }
-                (
-                    ExprKind::Unary {
-                        op: novarocks_expression_contract::UnaryOperator::BitwiseNot,
-                        expr,
-                    },
-                    StaticExprKind::PreparedNativeBitNot(local_child),
-                ) => {
-                    if invocation.control != ControlShape::Eager
-                        || invocation.arguments.len() != 1
-                        || lowered.ids.get(expr) != Some(local_child)
-                        || flow.uses()[&invocation.arguments[0]].definition != *expr
-                    {
-                        return Err(ExprCompileError::Invalid(
-                            "native BitwiseNot differs from its actual ordered source",
-                        )
-                        .into());
-                    }
-                    let child = unit.definition(*expr).ok_or(ExprCompileError::Invalid(
-                        "missing native BitwiseNot source",
-                    ))?;
-                    work.flush()?;
-                    let recipe = novarocks_functions::PreparedNativeBitNotRecipe::try_new(
-                        &child.ty, &source.ty, control,
-                    )?;
-                    work.flush()?;
-                    recipe
-                        .own_effects(invocation.context)
-                        .join_control_argument(
-                            *effects.get(&invocation.arguments[0]).ok_or(
-                                ExprCompileError::Invalid(
-                                    "native BitwiseNot child effects were not prepared",
-                                ),
-                            )?,
-                            flow,
-                            0,
-                        )?
-                }
-                (
-                    ExprKind::Unary {
                         op: novarocks_expression_contract::UnaryOperator::Not,
                         expr,
                     },
@@ -2334,20 +2202,6 @@ fn literal_argument(
             )
             | (ExprKind::IsNull { negated: false, .. }, StaticExprKind::IsNull(_))
             | (ExprKind::IsNull { negated: true, .. }, StaticExprKind::IsNotNull(_)) => Ok(None),
-            (
-                ExprKind::Unary {
-                    op: novarocks_expression_contract::UnaryOperator::Minus,
-                    ..
-                },
-                StaticExprKind::PreparedNativeNegate(_),
-            ) => Ok(None),
-            (
-                ExprKind::Unary {
-                    op: novarocks_expression_contract::UnaryOperator::BitwiseNot,
-                    ..
-                },
-                StaticExprKind::PreparedNativeBitNot(_),
-            ) => Ok(None),
             (ExprKind::Between { .. }, StaticExprKind::PreparedBetween { .. }) => Ok(None),
             (ExprKind::InList { .. }, StaticExprKind::PreparedInList { .. }) => Ok(None),
             (ExprKind::Like { .. }, StaticExprKind::PreparedLike { .. }) => Ok(None),

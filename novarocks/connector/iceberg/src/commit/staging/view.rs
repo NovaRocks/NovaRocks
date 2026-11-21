@@ -17,6 +17,8 @@
 
 use std::collections::BTreeMap;
 
+use std::sync::Arc;
+
 use crate::commit::manifest_sources::{LocatedEntry, SnapshotSources};
 use crate::commit::model::{ArtifactWriter, EntryIdentity, OperationIntent};
 use crate::commit::preparation::PreparationContext;
@@ -25,7 +27,7 @@ use crate::iceberg::spec::{ManifestList, Snapshot, TableMetadata};
 
 /// Each preparer borrows exactly the canonical prefix and the attempt IO owner.
 pub struct StagedView<'a> {
-    metadata: &'a TableMetadata,
+    metadata: &'a Arc<TableMetadata>,
     stage: usize,
     intent: &'a OperationIntent,
     artifacts: &'a dyn ArtifactWriter,
@@ -35,7 +37,7 @@ pub struct StagedView<'a> {
 
 impl<'a> StagedView<'a> {
     pub(super) fn new(
-        metadata: &'a TableMetadata,
+        metadata: &'a Arc<TableMetadata>,
         stage: usize,
         intent: &'a OperationIntent,
         artifacts: &'a dyn ArtifactWriter,
@@ -53,6 +55,9 @@ impl<'a> StagedView<'a> {
     }
     pub fn metadata(&self) -> &TableMetadata {
         self.metadata
+    }
+    pub(crate) fn metadata_ref(&self) -> Arc<TableMetadata> {
+        Arc::clone(self.metadata)
     }
     pub(crate) fn stage_key(&self) -> usize {
         self.stage

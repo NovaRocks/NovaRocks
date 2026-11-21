@@ -942,11 +942,11 @@ impl AttemptSubscriptions {
                     }
                 }
             }
-            row.call_retired = call
+            progressed |= call
                 .source
                 .retire_result()
                 .expect("original subscription exit result");
-            progressed |= row.call_retired;
+            row.call_retired = call.source.is_quiescent();
         }
         if !row.call_retired {
             return (progressed, false);

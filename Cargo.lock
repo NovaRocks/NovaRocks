@@ -3484,11 +3484,13 @@ name = "novarocks-expression"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "chrono",
  "novarocks-constant-contract",
  "novarocks-expression-contract",
  "novarocks-failure-contract",
  "novarocks-function-contract",
  "novarocks-functions",
+ "novarocks-parser",
  "novarocks-type-contract",
 ]
 
@@ -4371,19 +4373,11 @@ dependencies = [
 name = "novarocks-table-maintenance"
 version = "0.1.0"
 dependencies = [
- "bytes",
- "hex",
  "novarocks-coordination-contract",
  "novarocks-failure-contract",
  "novarocks-query-application",
- "novarocks-state-store-api",
- "novarocks-state-store-runtime",
- "novarocks-state-store-testkit",
  "novarocks-type-contract",
- "serde",
- "serde_json",
  "tokio",
- "uuid",
 ]
 
 [[package]]
