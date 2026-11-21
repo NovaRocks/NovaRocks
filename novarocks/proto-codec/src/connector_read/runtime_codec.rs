@@ -208,11 +208,6 @@ where
                     dto::ConnectorSystemTableReference { provider_payload },
                 )
             }
-            novarocks_spi::connector::read_stack::ConnectorReadRelationKind::TableExecute => {
-                dto::catalog_table_handle::Relation::TableExecute(
-                    dto::ConnectorTableExecuteHandle { provider_payload },
-                )
-            }
             novarocks_spi::connector::read_stack::ConnectorReadRelationKind::MergeTable => {
                 dto::catalog_table_handle::Relation::MergeTable(dto::ConnectorMergeTableHandle {
                     provider_payload,
@@ -293,11 +288,6 @@ where
                 dto::connector_split::Category::SystemRelation(dto::SystemRelationSplitCategory {
                     provider_payload,
                 })
-            }
-            ConnectorReadSplitCategory::RewritePositionDeleteFiles => {
-                dto::connector_split::Category::RewritePositionDeleteFiles(
-                    dto::RewritePositionDeleteFilesSplitCategory { provider_payload },
-                )
             }
         };
         let facts = split.facts();
@@ -440,9 +430,6 @@ where
             super::ConnectorRelationKind::SystemTable => {
                 novarocks_spi::connector::read_stack::ConnectorReadRelationKind::SystemTable
             }
-            super::ConnectorRelationKind::TableExecute => {
-                novarocks_spi::connector::read_stack::ConnectorReadRelationKind::TableExecute
-            }
             super::ConnectorRelationKind::MergeTable => {
                 novarocks_spi::connector::read_stack::ConnectorReadRelationKind::MergeTable
             }
@@ -483,9 +470,6 @@ where
             super::SplitCategory::ChangeWindow => ConnectorReadSplitCategory::ChangeWindow,
             super::SplitCategory::SystemManifest => ConnectorReadSplitCategory::SystemManifest,
             super::SplitCategory::SystemRelation => ConnectorReadSplitCategory::SystemRelation,
-            super::SplitCategory::RewritePositionDeleteFiles => {
-                ConnectorReadSplitCategory::RewritePositionDeleteFiles
-            }
         };
         self.decode_split_payload(
             &ConnectorReadSplitPayload::new(category, split.provider_payload().clone()),

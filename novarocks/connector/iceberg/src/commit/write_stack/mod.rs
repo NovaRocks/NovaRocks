@@ -61,9 +61,9 @@ pub use domain::{
     IcebergArtifactMetrics, IcebergArtifactPartition, IcebergCommitArtifact, IcebergCommitFragment,
     IcebergContentRange, IcebergDataBranchRecipe, IcebergDataFileArtifact,
     IcebergDeletionVectorArtifact, IcebergEmptyWriteDecision, IcebergPositionDeleteFileArtifact,
-    IcebergPositionRewriteTarget, IcebergSealedWriteTarget, IcebergWriteBranch,
-    IcebergWriteCommitSession, IcebergWriteFlavor, IcebergWriteSessionId, IcebergWriteSessionState,
-    IcebergWriteTableFacts, IcebergWriterHandle, IcebergWriterOutput,
+    IcebergSealedWriteTarget, IcebergWriteBranch, IcebergWriteCommitSession, IcebergWriteFlavor,
+    IcebergWriteSessionId, IcebergWriteSessionState, IcebergWriteTableFacts, IcebergWriterHandle,
+    IcebergWriterOutput,
 };
 pub use execution::{IcebergWriteStackExecution, IcebergWriteStackExecutionFactory};
 pub use planning::{

@@ -69,8 +69,8 @@ use crate::commit::write_stack::domain::{
     IcebergEqualityDeleteColumnFacts, IcebergEqualityDeleteFileArtifact,
     IcebergEqualityDeleteRecipe, IcebergFinalDeleteEffect, IcebergFinalDeleteKind,
     IcebergMutationReadRecipe, IcebergMutationSnapshot, IcebergPositionDeleteFileArtifact,
-    IcebergPositionRewriteTarget, IcebergWriteBranch, IcebergWriteSessionId,
-    IcebergWriteTableFacts, IcebergWriterHandle, IcebergWriterOutput,
+    IcebergWriteBranch, IcebergWriteSessionId, IcebergWriteTableFacts, IcebergWriterHandle,
+    IcebergWriterOutput,
 };
 use crate::commit::write_stack::runtime::IcebergWriteAdapter;
 use crate::delete_file::IcebergFileFormat;
@@ -825,13 +825,6 @@ impl IcebergWriteValueCodec {
             table: Some(self.encode_table(handle.table())),
             output: Some(self.encode_output(handle.output(), path.field("output"))?),
             data,
-            position_rewrite: handle.position_rewrite().map(|target| {
-                dto::IcebergPositionRewriteTarget {
-                    data_file_path: target.path().to_owned(),
-                    record_count: target.record_count(),
-                    partition: Some(self.encode_partition(target.partition())),
-                }
-            }),
             position_group_id: handle.position_group().map(|id| id.to_bytes().to_vec()),
             creation_scope: handle
                 .creation_scope()
@@ -926,35 +919,14 @@ impl IcebergWriteValueCodec {
                         crate::wire::write::require_exact_bytes(bytes, field)
                             .map(novarocks_connector_contract::ConnectorMutationContributionGroupId::from_bytes)
                     }).transpose()?;
-                    let rewrite = iceberg
-                        .position_rewrite
-                        .as_ref()
-                        .map(|target| {
-                            let field = path.field("position_rewrite");
-                            let data_file_path =
-                                copy_value_string(&target.data_file_path, context)?;
-                            let partition = self.decode_partition(
-                                target.partition.as_ref(),
-                                field.field("partition"),
-                                context,
-                            )?;
-                            IcebergPositionRewriteTarget::try_new(
-                                data_file_path,
-                                target.record_count,
-                                partition,
-                            )
-                            .map_err(|error| spi_codec_error(self.rejected(field, &error)))
-                        })
-                        .transpose()?;
                     observe_value_opaque(context, || {
                         let handle = IcebergWriterHandle::try_new_delete(branch, table, output)?;
-                        match (mutation, rewrite) {
-                            (Some(recipe), None) => handle.try_with_mutation_read(recipe, group),
-                            (None, Some(target)) => handle.try_with_position_rewrite(target),
-                            _ => Err(super::domain::invalid(
-                                "Iceberg position writer requires exactly one input recipe",
-                            )),
-                        }
+                        let recipe = mutation.ok_or_else(|| {
+                            super::domain::invalid(
+                                "Iceberg position writer requires a fixed mutation input recipe",
+                            )
+                        })?;
+                        handle.try_with_mutation_read(recipe, group)
                     })?
                     .map_err(|error| spi_codec_error(self.rejected(path.clone(), &error)))
                 }
@@ -2132,8 +2104,7 @@ mod tests {
 
     use crate::commit::write_stack::runtime::build_write_adapter;
     use crate::commit::write_stack::test_support::{
-        equality_delete_recipe, position_rewrite_target, sample_metrics, sample_partition,
-        table_facts,
+        equality_delete_recipe, sample_metrics, sample_partition, table_facts,
     };
 
     fn adapter(catalog: &str, version: u8) -> IcebergWriteAdapter {
@@ -2306,14 +2277,6 @@ mod tests {
         };
         let handle =
             IcebergWriterHandle::try_new_delete(branch, table.clone(), output(format)).unwrap();
-        if branch == IcebergWriteBranch::DeletionVector {
-            return handle
-                .try_with_position_rewrite(position_rewrite_target(
-                    "s3://b/wh/db/t/data/a.parquet",
-                    100,
-                ))
-                .unwrap();
-        }
         let recipe = IcebergMutationReadRecipe::try_new(
             &table,
             "s3://b/wh/db/t/metadata/v3.json".into(),
@@ -2324,7 +2287,10 @@ mod tests {
             ),
         )
         .unwrap();
-        handle.try_with_mutation_read(recipe, None).unwrap()
+        let group = (branch == IcebergWriteBranch::DeletionVector).then(|| {
+            novarocks_connector_contract::ConnectorMutationContributionGroupId::from_bytes([1; 32])
+        });
+        handle.try_with_mutation_read(recipe, group).unwrap()
     }
 
     fn data_file_fragment() -> IcebergCommitFragment {
@@ -2462,7 +2428,6 @@ mod tests {
             }
             _ => panic!("one handle has a data recipe and the other does not"),
         }
-        assert_eq!(left.position_rewrite(), right.position_rewrite());
     }
 
     fn assert_same_fragment(left: &IcebergCommitFragment, right: &IcebergCommitFragment) {
@@ -3228,18 +3193,6 @@ mod tests {
     }
 
     #[test]
-    fn position_rewrite_round_trips_exact_selected_file() {
-        let facets = generation();
-        let handle = delete_handle(IcebergWriteBranch::DeletionVector);
-        let recovered = round_trip_handle(&facets, &handle);
-        let target = recovered.position_rewrite().unwrap();
-        assert_eq!(target.path(), "s3://b/wh/db/t/data/a.parquet");
-        assert_eq!(target.record_count(), 100);
-        assert_eq!(target.partition(), &sample_partition());
-        assert!(recovered.mutation_read().is_none());
-    }
-
-    #[test]
     fn merged_vectors_in_one_puffin_round_trip_with_distinct_ranges() {
         let facets = generation();
         let references = [4, 80]
@@ -3690,14 +3643,25 @@ mod tests {
         // One path past the 16 MiB writer-handle bound. A bare path keeps the
         // fixture cheap: it is a location the domain accepts and nothing else.
         let huge = format!("/wh/db/t/data/{}.parquet", "x".repeat(17 * 1024 * 1024));
-        let handle = IcebergWriterHandle::try_new_delete(
-            IcebergWriteBranch::DeletionVector,
-            table_facts(),
-            output(IcebergFileFormat::Puffin),
+        let table = table_facts();
+        let recipe = IcebergMutationReadRecipe::try_new(
+            &table,
+            huge,
+            format!("sha256:{}", "a".repeat(64)),
+            Some(
+                IcebergMutationSnapshot::try_new("s3://b/wh/db/t/metadata/snap-77.avro".into(), 3)
+                    .unwrap(),
+            ),
         )
-        .expect("handle")
-        .try_with_position_rewrite(position_rewrite_target(&huge, 10))
-        .expect("maintenance selection");
+        .unwrap();
+        let handle = IcebergWriterHandle::try_new_delete(
+            IcebergWriteBranch::PositionDelete,
+            table,
+            output(IcebergFileFormat::Parquet),
+        )
+        .unwrap()
+        .try_with_mutation_read(recipe, None)
+        .unwrap();
         let neutral = facets.adapter.wrap_writer_handle(handle);
         let error = facets
             .handle_encoder
@@ -3813,7 +3777,7 @@ mod tests {
         assert_eq!(recovered.equality(), handle.equality());
         // It carries no old-delete merge and no data recipe: an equality delete
         // supersedes nothing and writes no data file.
-        assert!(recovered.position_rewrite().is_none());
+        assert!(recovered.mutation_read().is_none());
         assert!(recovered.data().is_none());
     }
 

@@ -617,21 +617,21 @@ fn a_compiled_read_binds_the_installed_execution_of_its_binding() {
 }
 
 #[test]
-fn system_table_and_table_execute_reads_register_the_split_execution() {
-    for kind in [
+fn system_table_read_registers_the_split_execution() {
+    let runtime = test_support::typed_scan_runtime();
+    let read = frozen_read_kind(
+        "fixture",
+        TupleDomain::all(),
+        vec![],
         ConnectorReadRelationKind::SystemTable,
-        ConnectorReadRelationKind::TableExecute,
-    ] {
-        let runtime = test_support::typed_scan_runtime();
-        let read = frozen_read_kind("fixture", TupleDomain::all(), vec![], kind);
-        let source = bind(&runtime, &recipe(&read), &layout()).expect("supported relation binds");
-        assert_eq!(source.profile_name().as_deref(), Some("TypedConnectorScan"));
-        assert!(
-            runtime
-                .register_read_execution(SCAN_NODE, test_support::installed_read_execution())
-                .is_err()
-        );
-    }
+    );
+    let source = bind(&runtime, &recipe(&read), &layout()).expect("system table binds");
+    assert_eq!(source.profile_name().as_deref(), Some("TypedConnectorScan"));
+    assert!(
+        runtime
+            .register_read_execution(SCAN_NODE, test_support::installed_read_execution())
+            .is_err()
+    );
 }
 
 #[test]

@@ -97,8 +97,8 @@ fn run_read(
 }
 
 #[test]
-fn caller_owned_joint_and_all_six_read_kinds_keep_original_sparse_sources() {
-    for (i, kind) in KINDS.into_iter().enumerate() {
+fn caller_owned_joint_and_all_read_kinds_keep_original_sparse_sources() {
+    for (kind, wire_kind) in KINDS {
         let source = read(kind);
         let write = ConnectorWriteBinding::new(
             source.binding.descriptor().clone(),
@@ -134,7 +134,7 @@ fn caller_owned_joint_and_all_six_read_kinds_keep_original_sparse_sources() {
         let r =
             encode_provider_reads_in(&reads, &b, &p, SOURCE, limits(), &mut |_| Ok(()), &mut work)
                 .unwrap();
-        assert_eq!(r.as_wire(), [expected(u32::MAX, i as i32 + 1)]);
+        assert_eq!(r.as_wire(), [expected(u32::MAX, wire_kind)]);
         assert!(std::ptr::eq(
             b.write_binding_in(0, &mut work).unwrap().unwrap(),
             &write
@@ -162,7 +162,7 @@ fn caller_owned_joint_and_all_six_read_kinds_keep_original_sparse_sources() {
             &mut work,
         )
         .unwrap();
-        let raw = [expected(0, i as i32 + 1)];
+        let raw = [expected(0, wire_kind)];
         let dr =
             decode_provider_reads_in(&raw, &db, &dp, SOURCE, limits(), &mut |_| Ok(()), &mut work)
                 .unwrap();

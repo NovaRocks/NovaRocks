@@ -17,10 +17,6 @@
 
 //! Closed Rewrite admission continuation in the original WriteControl.
 use super::*;
-use crate::catalog_control::statistics::scoped_cpu::IcebergMetadataCpuOriginal;
-use crate::catalog_control::statistics::scoped_cpu::scoped_snapshot::{
-    ScopedReadSnapshot, SnapshotReadKind, drive_read_snapshot,
-};
 use novarocks_spi::connector::{
     ConnectorOriginalResultScope, ConnectorRewriteWriteBeginSource, ProviderMetadataCpuPort,
     RewriteCpuInput, RewriteCpuPort, RewritePlanCpuSource,
@@ -31,29 +27,6 @@ use std::{
     sync::Mutex,
     task::{Context, Poll, Waker},
 };
-
-#[derive(Debug)]
-struct RewriteRetentionFailure(novarocks_resource_contract::RetentionPinError);
-impl std::fmt::Display for RewriteRetentionFailure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("rewrite snapshot original retention failed")
-    }
-}
-impl std::error::Error for RewriteRetentionFailure {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.0)
-    }
-}
-impl novarocks_failure_contract::FailureProjection for RewriteRetentionFailure {
-    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
-        match self.0 {
-            novarocks_resource_contract::RetentionPinError::Overflow => {
-                ConnectorErrorKind::ResourceExhausted.failure_fact()
-            }
-            _ => ConnectorErrorKind::Internal.failure_fact(),
-        }
-    }
-}
 
 type OriginalFuture =
     Pin<Box<dyn Future<Output = Result<ConnectorWriteSessionPlan, ConnectorError>> + Send>>;
@@ -67,21 +40,12 @@ enum IoState {
     Idle,
     Observe(Box<ObserveRequest>),
     Observed(Result<crate::loaded_table::IcebergPhysicalTable, String>),
-    Snapshot {
-        table: crate::iceberg::table::Table,
-        snapshot: i64,
-        original: Option<Arc<IcebergMetadataCpuOriginal>>,
-    },
-    SnapshotReturned(Result<ScopedReadSnapshot, ConnectorError>),
 }
 struct IoBody {
     state: IoState,
-    // Actual snapshot receiving and retention survive every borrowed driver.
-    retention: Option<novarocks_spi::connector::ConnectorPayloadRetentionGuard>,
 }
 pub(super) struct RewriteBeginIo {
     control: Arc<IcebergWriteSessionControl>,
-    context: ConnectorRequestContext,
     capture: ConnectorOriginalResultScope,
     body: Mutex<Option<IoBody>>,
 }
@@ -147,49 +111,7 @@ impl RewriteBeginIo {
         })
         .await
     }
-    pub(super) async fn snapshot(
-        &self,
-        table: crate::iceberg::table::Table,
-        snapshot: i64,
-    ) -> Result<ScopedReadSnapshot, ConnectorError> {
-        let mut table = Some(table);
-        std::future::poll_fn(|_| {
-            let mut loan = IoLoan::take(self);
-            let body = loan.body.as_mut().unwrap();
-            match &body.state {
-                IoState::Idle => {
-                    body.state = IoState::Snapshot {
-                        table: table.take().expect("same snapshot table"),
-                        snapshot,
-                        original: None,
-                    };
-                    Poll::Pending
-                }
-                IoState::Snapshot { .. } => Poll::Pending,
-                IoState::SnapshotReturned(_) => {
-                    let IoState::SnapshotReturned(value) =
-                        std::mem::replace(&mut body.state, IoState::Idle)
-                    else {
-                        unreachable!()
-                    };
-                    Poll::Ready(value)
-                }
-                _ => panic!("WriteBegin snapshot crossed its original continuation"),
-            }
-        })
-        .await
-    }
-    fn close_original_child(&self) {
-        let mut loan = IoLoan::take(self);
-        let body = loan.body.as_mut().unwrap();
-        if let IoState::Snapshot { original, .. } = &mut body.state {
-            // Same serial physical job has joined before this method. Drop
-            // this concrete parser F under the parent's original close poll,
-            // so a destructor panic cannot be reported as an observed exit.
-            drop(original.take());
-        }
-    }
-    async fn fulfill(&self, cpu: &Arc<dyn ProviderMetadataCpuPort>) -> Result<(), ConnectorError> {
+    async fn fulfill(&self) -> Result<(), ConnectorError> {
         let mut loan = IoLoan::take(self);
         let body = loan.body.as_mut().unwrap();
         match &mut body.state {
@@ -211,45 +133,6 @@ impl RewriteBeginIo {
                     .await
                     .map_err(|(_, message)| message);
                 body.state = IoState::Observed(value);
-            }
-            IoState::Snapshot {
-                table,
-                snapshot,
-                original,
-            } => {
-                if original.is_none() {
-                    *original = Some(
-                        IcebergMetadataCpuOriginal::read_snapshot_source_for_generation(
-                            self.control.descriptor.clone(),
-                            self.control.key.incarnation,
-                            table.clone(),
-                            *snapshot,
-                            self.context.clone(),
-                            self.capture.clone(),
-                            SnapshotReadKind::Rewrite,
-                        ),
-                    );
-                }
-                let source = original
-                    .as_ref()
-                    .expect("installed original snapshot source");
-                drive_read_snapshot(source, cpu).await?;
-                let mut value = None;
-                source.take_read_snapshot_in(&mut value)?;
-                let value = value.expect("same WriteBegin snapshot receiver");
-                if let Ok(value) = &value {
-                    body.retention = Some(value.retention_guard.try_clone().map_err(|e| {
-                        let kind = match e {
-                            novarocks_resource_contract::RetentionPinError::Overflow => {
-                                ConnectorErrorKind::ResourceExhausted
-                            }
-                            _ => ConnectorErrorKind::Internal,
-                        };
-                        ConnectorError::from_domain(kind, RewriteRetentionFailure(e))
-                    })?);
-                }
-                // Preserve original retention before the pure continuation consumes the files.
-                body.state = IoState::SnapshotReturned(value);
             }
             _ => return Err(internal("WriteBegin pure continuation has no I/O request")),
         }
@@ -324,11 +207,7 @@ struct RewriteBeginSource {
     original: Arc<RewriteBeginOriginal>,
 }
 impl RewriteBeginSource {
-    async fn prepare_original(
-        &self,
-        cpu: &dyn RewriteCpuPort,
-        metadata: &Arc<dyn ProviderMetadataCpuPort>,
-    ) -> Result<(), ConnectorError> {
+    async fn prepare_original(&self, cpu: &dyn RewriteCpuPort) -> Result<(), ConnectorError> {
         loop {
             let mut input = Some(RewriteCpuInput(self.original.clone()));
             cpu.submit_in(&mut input)?;
@@ -344,7 +223,7 @@ impl RewriteBeginSource {
                 // another turn of this exact original continuation.
                 body.started = false;
             }
-            self.original.io.fulfill(metadata).await?;
+            self.original.io.fulfill().await?;
         }
     }
     async fn close_original(&self, cpu: &dyn RewriteCpuPort) -> Result<(), ConnectorError> {
@@ -354,7 +233,6 @@ impl RewriteBeginSource {
         // A pending pure reader has no external mutation. Its only physical
         // I/O is in the retained parent driver, which must exit before close.
         drop(body.future.take());
-        self.original.io.close_original_child();
         Ok(())
     }
 }
@@ -362,9 +240,9 @@ impl ConnectorRewriteWriteBeginSource for RewriteBeginSource {
     fn prepare<'a>(
         &'a self,
         cpu: &'a dyn RewriteCpuPort,
-        metadata_cpu: &'a Arc<dyn ProviderMetadataCpuPort>,
+        _metadata_cpu: &'a Arc<dyn ProviderMetadataCpuPort>,
     ) -> Pin<Box<dyn Future<Output = Result<(), ConnectorError>> + Send + 'a>> {
-        Box::pin(self.prepare_original(cpu, metadata_cpu))
+        Box::pin(self.prepare_original(cpu))
     }
     fn take_plan_in(
         &self,
@@ -434,11 +312,9 @@ pub(super) fn prepare_in(
         .map_err(|e| crate::distributed_rewrite::async_plan::formation_failure(e.into()))?;
     let io = Arc::new(RewriteBeginIo {
         control: control.clone(),
-        context: value.context.clone(),
         capture,
         body: Mutex::new(Some(IoBody {
             state: IoState::Idle,
-            retention: None,
         })),
     });
     let original = Arc::new(RewriteBeginOriginal {

@@ -231,6 +231,7 @@ impl StatementObservers {
         })
     }
 
+    #[cfg(test)]
     fn bound_statement(&self, statement: StatementToken) -> Option<StatementObservationHandle> {
         self.runs
             .iter()
@@ -658,6 +659,7 @@ impl StatementObservationOwner {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn bound_statement(
         self: &Arc<Self>,
         statement: StatementToken,

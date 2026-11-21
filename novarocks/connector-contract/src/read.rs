@@ -49,6 +49,5 @@ pub enum ConnectorReadRelationKind {
     TableFunction,
     ChangeWindow,
     SystemTable,
-    TableExecute,
     MergeTable,
 }

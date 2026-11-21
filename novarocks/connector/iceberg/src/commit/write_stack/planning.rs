@@ -32,10 +32,9 @@ use novarocks_spi::connector::{
 
 use crate::commit::write_stack::domain::{
     IcebergDataBranchRecipe, IcebergDocumentPublicationFacts, IcebergEqualityDeleteRecipe,
-    IcebergFrozenRewriteBranchInput, IcebergPositionRewriteTarget, IcebergSealedWriteTarget,
-    IcebergSessionFacts, IcebergWriteBranch, IcebergWriteCommitSession, IcebergWriteFlavor,
-    IcebergWriteSessionId, IcebergWriteTableFacts, IcebergWriterHandle, IcebergWriterOutput,
-    invalid,
+    IcebergFrozenRewriteBranchInput, IcebergSealedWriteTarget, IcebergSessionFacts,
+    IcebergWriteBranch, IcebergWriteCommitSession, IcebergWriteFlavor, IcebergWriteSessionId,
+    IcebergWriteTableFacts, IcebergWriterHandle, IcebergWriterOutput, invalid,
 };
 type IcebergWriteTargetPlanParts = (
     WriteTargetOrdinal,
@@ -131,7 +130,6 @@ pub struct IcebergDataBranchPlan {
 pub struct IcebergDeleteBranchPlan {
     pub branch: IcebergWriteBranch,
     pub output: IcebergWriterOutput,
-    pub position_rewrite: Option<IcebergPositionRewriteTarget>,
     pub input: ConnectorWriteInputShape,
 }
 
@@ -209,13 +207,6 @@ impl IcebergWriteBranchPlan {
         }
     }
 
-    fn position_rewrite(&self) -> Option<&IcebergPositionRewriteTarget> {
-        match self {
-            Self::Delete { plan, .. } => plan.position_rewrite.as_ref(),
-            _ => None,
-        }
-    }
-
     fn writer_handle(
         &self,
         table: &IcebergWriteTableFacts,
@@ -229,15 +220,7 @@ impl IcebergWriteBranchPlan {
                 ),
             ),
             Self::Delete { plan, .. } => {
-                let handle = IcebergWriterHandle::try_new_delete(
-                    plan.branch,
-                    table.clone(),
-                    plan.output.clone(),
-                )?;
-                match &plan.position_rewrite {
-                    Some(target) => handle.try_with_position_rewrite(target.clone()),
-                    None => Ok(handle),
-                }
+                IcebergWriterHandle::try_new_delete(plan.branch, table.clone(), plan.output.clone())
             }
             Self::EqualityDelete { plan, .. } => IcebergWriterHandle::try_new_equality_delete(
                 table.clone(),
@@ -340,7 +323,6 @@ pub fn plan_branch_session(
         sealed.push(IcebergSealedWriteTarget::new(
             WriteTargetOrdinal::try_new(ordinal)?,
             plan.branch(),
-            plan.position_rewrite().cloned(),
         ));
     }
 
@@ -443,7 +425,7 @@ mod tests {
                 base_version_digest: None,
                 staged_metadata: None,
                 data: data_branch_plan(),
-                deletes: vec![delete_branch_plan(IcebergWriteBranch::DeletionVector, None)],
+                deletes: vec![delete_branch_plan(IcebergWriteBranch::DeletionVector)],
             },
         )
         .expect("plan");
@@ -466,7 +448,7 @@ mod tests {
                 base_version_digest: None,
                 staged_metadata: None,
                 data: data_branch_plan(),
-                deletes: vec![delete_branch_plan(IcebergWriteBranch::DeletionVector, None)],
+                deletes: vec![delete_branch_plan(IcebergWriteBranch::DeletionVector)],
             },
         )
         .expect_err("flavor does not own the branch");

@@ -474,7 +474,6 @@ mod tests {
             RewriteManifests,
             RemoveOrphanFiles,
             RewriteDataFiles,
-            RewritePositionDeletes,
             Statistics,
             CreateDocuments,
             UpdateDocuments,

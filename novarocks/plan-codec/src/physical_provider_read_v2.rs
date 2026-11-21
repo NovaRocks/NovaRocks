@@ -234,7 +234,6 @@ pub(crate) const fn encode_relation_kind(
         ConnectorReadRelationKind::TableFunction => wire::ConnectorRelationKind::TableFunction,
         ConnectorReadRelationKind::ChangeWindow => wire::ConnectorRelationKind::ChangeWindow,
         ConnectorReadRelationKind::SystemTable => wire::ConnectorRelationKind::SystemTable,
-        ConnectorReadRelationKind::TableExecute => wire::ConnectorRelationKind::TableExecute,
         ConnectorReadRelationKind::MergeTable => wire::ConnectorRelationKind::MergeTable,
     }
 }
@@ -247,7 +246,6 @@ pub(crate) fn decode_relation_kind(kind: i32) -> Result<ConnectorReadRelationKin
             wire::ConnectorRelationKind::TableFunction => ConnectorReadRelationKind::TableFunction,
             wire::ConnectorRelationKind::ChangeWindow => ConnectorReadRelationKind::ChangeWindow,
             wire::ConnectorRelationKind::SystemTable => ConnectorReadRelationKind::SystemTable,
-            wire::ConnectorRelationKind::TableExecute => ConnectorReadRelationKind::TableExecute,
             wire::ConnectorRelationKind::MergeTable => ConnectorReadRelationKind::MergeTable,
             wire::ConnectorRelationKind::Unspecified => {
                 return Err(invalid("unspecified connector relation kind"));

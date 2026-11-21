@@ -494,7 +494,6 @@ pub enum ConnectorReadSplitCategory {
     ChangeWindow,
     SystemManifest,
     SystemRelation,
-    RewritePositionDeleteFiles,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

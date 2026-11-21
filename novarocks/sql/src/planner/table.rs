@@ -105,16 +105,6 @@ pub enum SqlScanKind {
     /// optimizer pushes nor by anything the connector would re-derive -- while
     /// an ordinary `Data` scan may be.
     PinnedFileSet,
-    /// A scan of the relation one distributed `ALTER TABLE ... EXECUTE`
-    /// procedure instance reads.
-    ///
-    /// SQL carries no procedure facts here: the frozen group is minted by the
-    /// connector's own rewrite preparation, and the application recovers it by
-    /// `binding` at the preparation boundary. It is a kind of its own because
-    /// what such a scan outputs is not the relation's rows -- rewriting delete
-    /// artifacts produces the rows those artifacts remove -- so neither a
-    /// `Data` predicate nor a pinned file set describes it.
-    TableExecute,
     Data {
         version: SqlTableVersionSelector,
     },
@@ -643,7 +633,6 @@ impl TableCompletionRetainedBytes {
             }
             SqlScanKind::ConnectorRead
             | SqlScanKind::PinnedFileSet
-            | SqlScanKind::TableExecute
             | SqlScanKind::Data { .. }
             | SqlScanKind::FrozenInputSet { .. }
             | SqlScanKind::Metadata { .. }

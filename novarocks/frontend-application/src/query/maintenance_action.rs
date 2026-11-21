@@ -27,57 +27,6 @@ use novarocks_query_application::{
 };
 use std::task::{Context, Poll};
 
-pub(super) fn prepare(
-    executor: &MaintenanceCommandExecutor,
-    command: &novarocks_sql::semantic::MaintenanceSqlCommand,
-    context: &RequestContext,
-    command_context: &CommandContext,
-    #[cfg(novarocks_dev_controls)] observation: Option<
-        crate::preparation_diagnostics::StatementObservationHandle,
-    >,
-) -> Result<Box<dyn GovernedStatementAction>, CommandError> {
-    let family = context.session().presentation().copied().ok_or_else(|| {
-        CommandError::new(
-            CommandErrorKind::Rejected,
-            "maintenance client result requires an explicit presentation",
-        )
-    })?;
-    if let Some(action) = executor
-        .prepare_direct_rewrite_action(
-            command,
-            context.session().current_catalog(),
-            context.session().current_database(),
-            context.execution(),
-            command_context.connector_context(),
-            family,
-            #[cfg(novarocks_dev_controls)]
-            observation,
-        )
-        .map_err(maintenance_command_error)?
-    {
-        return Ok(action);
-    }
-    if let Some(action) = executor.prepare_legacy_cleanup_call(
-        command,
-        context.session().current_catalog(),
-        context.session().current_database(),
-        context.execution(),
-        command_context.connector_context(),
-        family,
-    )? {
-        return Ok(action);
-    }
-    prepare_metadata_action(context, command_context, family, || {
-        executor.prepare_command(
-            command,
-            context.session().current_catalog(),
-            context.session().current_database(),
-            context.execution(),
-            command_context.connector_context(),
-        )
-    })
-}
-
 pub(super) enum PreparedTrinoTableExecute {
     Action(Box<dyn GovernedStatementAction>),
     AddFiles(crate::query_execution::dml::add_files::ResolvedAddFiles),

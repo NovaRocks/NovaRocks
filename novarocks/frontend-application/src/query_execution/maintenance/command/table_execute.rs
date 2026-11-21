@@ -29,6 +29,7 @@ use novarocks_parser::{Span, ast::TrinoTableExecute};
 use novarocks_query_application::{
     admitted_query_context::QueryExecutionContext,
     api::CommandErrorKind,
+    protocol_delivery::QuerySessionOutput as StatementResult,
     session_control::GovernedStatementAction,
     session_error::{QueryServiceError, QueryServiceErrorKind},
     sql::{
@@ -224,7 +225,7 @@ impl MaintenanceCommandExecutor {
                     connector.clone(),
                 ),
                 target,
-                Some(&planning),
+                &planning,
                 execution,
                 family,
                 #[cfg(novarocks_dev_controls)]
@@ -247,7 +248,7 @@ impl MaintenanceCommandExecutor {
                     &self.kernel,
                     target,
                     older_than_ms,
-                    super::super::cleanup_action::CleanupEntry::TableExecute(retention),
+                    retention,
                     planning,
                     execution,
                     connector,
@@ -332,16 +333,15 @@ impl MaintenanceCommandExecutor {
         ];
         self.prepare_metadata_source(
             ParsedMaintenanceStatement { name_parts, action },
-            false,
             context,
             execution,
             connector,
             lease,
-            Some(MetadataPreparation {
+            MetadataPreparation {
                 target,
                 planning,
                 intent,
-            }),
+            },
         )
         .map(PreparedTableExecute::Metadata)
     }

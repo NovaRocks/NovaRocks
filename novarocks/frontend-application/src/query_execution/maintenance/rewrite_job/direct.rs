@@ -61,66 +61,16 @@ struct DirectRewriteAction {
     activity: Option<MaintenanceActivityPermit>,
     local: Option<LocalResultProducer>,
     delivered: bool,
-    optimize: bool,
 }
 struct DirectResidual {
     original: DirectRewriteAction,
-}
-
-fn closed_intent(
-    action: crate::table_maintenance::ParsedMaintenanceAction,
-) -> Result<RewriteIntent, TerminalError> {
-    match action {
-        crate::table_maintenance::ParsedMaintenanceAction::RewriteDataFiles { .. } => {
-            // The semantic lowerer already validated rewrite-all, branch and
-            // predicate support. Keep the original Product intent unchanged.
-            Ok(RewriteIntent::DataFiles { rewrite_all: true })
-        }
-        crate::table_maintenance::ParsedMaintenanceAction::RewritePositionDeleteFiles {
-            options,
-            where_clause,
-        } => novarocks_table_maintenance::product::rewrite_position_delete_intent(
-            &options,
-            where_clause.as_deref(),
-        )
-        .map_err(TerminalError::pre_dispatch_failed),
-        _ => Err(TerminalError::pre_dispatch_failed(
-            "not a direct Rewrite command",
-        )),
-    }
-}
-
-pub(crate) fn prepare(
-    kernel: &crate::query_execution::kernels::MaintenanceExecutionKernel,
-    names: &[String],
-    action: crate::table_maintenance::ParsedMaintenanceAction,
-    context: MaintenanceRequestContext<'_>,
-    execution: &QueryExecutionContext,
-    connector: &ConnectorRequestContext,
-    family: novarocks_result_contract::ClientPresentationFamily,
-    #[cfg(novarocks_dev_controls)] observation: Option<
-        crate::preparation_diagnostics::StatementObservationHandle,
-    >,
-) -> Result<Box<dyn GovernedStatementAction>, TerminalError> {
-    let intent = closed_intent(action)?;
-    prepare_intent(
-        kernel,
-        names,
-        intent,
-        context,
-        execution,
-        connector,
-        family,
-        #[cfg(novarocks_dev_controls)]
-        observation,
-    )
 }
 
 pub(crate) fn prepare_resolved_optimize(
     kernel: &crate::query_execution::kernels::MaintenanceExecutionKernel,
     engine: RequestScopedMaintenanceEngine,
     target: MaintenanceTarget,
-    planning: Option<&novarocks_spi::connector::ConnectorControlPlanningPin>,
+    planning: &novarocks_spi::connector::ConnectorControlPlanningPin,
     execution: &QueryExecutionContext,
     family: novarocks_result_contract::ClientPresentationFamily,
     #[cfg(novarocks_dev_controls)] observation: Option<
@@ -142,42 +92,12 @@ pub(crate) fn prepare_resolved_optimize(
     )
 }
 
-fn prepare_intent(
-    kernel: &crate::query_execution::kernels::MaintenanceExecutionKernel,
-    names: &[String],
-    intent: RewriteIntent,
-    context: MaintenanceRequestContext<'_>,
-    execution: &QueryExecutionContext,
-    connector: &ConnectorRequestContext,
-    family: novarocks_result_contract::ClientPresentationFamily,
-    #[cfg(novarocks_dev_controls)] observation: Option<
-        crate::preparation_diagnostics::StatementObservationHandle,
-    >,
-) -> Result<Box<dyn GovernedStatementAction>, TerminalError> {
-    let engine =
-        RequestScopedMaintenanceEngine::new(kernel.clone(), execution.clone(), connector.clone());
-    let target = engine
-        .resolve_target(names, context)
-        .map_err(TerminalError::from)?;
-    prepare_resolved_intent(
-        kernel,
-        engine,
-        target,
-        intent,
-        None,
-        execution,
-        family,
-        #[cfg(novarocks_dev_controls)]
-        observation,
-    )
-}
-
 fn prepare_resolved_intent(
     kernel: &crate::query_execution::kernels::MaintenanceExecutionKernel,
     engine: RequestScopedMaintenanceEngine,
     target: MaintenanceTarget,
     intent: RewriteIntent,
-    planning: Option<&novarocks_spi::connector::ConnectorControlPlanningPin>,
+    planning: &novarocks_spi::connector::ConnectorControlPlanningPin,
     execution: &QueryExecutionContext,
     family: novarocks_result_contract::ClientPresentationFamily,
     #[cfg(novarocks_dev_controls)] observation: Option<
@@ -198,19 +118,15 @@ fn prepare_resolved_intent(
     }
     let identity = RequestScopedMaintenanceEngine::target_identity(&target)
         .map_err(TerminalError::pre_dispatch_failed)?;
-    let resolver = kernel.connector_control();
-    let rewrite = match planning {
-        Some(planning) => {
-            if planning.binding().descriptor().instance_id != identity.instance_id {
-                return Err(TerminalError::pre_dispatch_failed(
-                    "direct Rewrite target differs from its retained generation",
-                ));
-            }
-            resolver.acquire_exact_distributed_rewrite(planning.control_runtime_id())
-        }
-        None => resolver.acquire_current_distributed_rewrite(&identity.instance_id),
+    if planning.binding().descriptor().instance_id != identity.instance_id {
+        return Err(TerminalError::pre_dispatch_failed(
+            "direct Rewrite target differs from its retained generation",
+        ));
     }
-    .map_err(TerminalError::from_original_cause)?;
+    let rewrite = kernel
+        .connector_control()
+        .acquire_exact_distributed_rewrite(planning.control_runtime_id())
+        .map_err(TerminalError::from_original_cause)?;
     let mut dependencies = rewrite
         .planning_initial_dependencies()
         .map_err(TerminalError::from_original_cause)?;
@@ -231,10 +147,8 @@ fn prepare_resolved_intent(
         .original_optimize_host()
         .map_err(TerminalError::pre_dispatch_failed)?;
     let product = host.product;
-    let optimize = matches!(intent, RewriteIntent::Optimize { .. });
     Ok(Box::new(DirectRewriteAction {
         family,
-        optimize,
         starting: Some(Starting {
             engine,
             target,
@@ -282,7 +196,7 @@ async fn run_direct_product(
         )
         .await
         .map_err(crate::query_execution::maintenance::rewrite_job::guard_terminal_error)?;
-    if matches!(input.intent, RewriteIntent::Optimize { .. }) {
+    {
         let identity = RequestScopedMaintenanceEngine::target_identity(&input.target)
             .map_err(TerminalError::pre_dispatch_failed)?;
         let metadata = input.rewrite.metadata().clone();
@@ -393,14 +307,7 @@ impl DirectRewriteAction {
             self.activity = Some(
                 original
                     .product
-                    .acquire_activity(
-                        &original.target,
-                        if self.optimize {
-                            MaintenanceActivityFamily::Optimize
-                        } else {
-                            MaintenanceActivityFamily::Metadata
-                        },
-                    )
+                    .acquire_activity(&original.target, MaintenanceActivityFamily::Optimize)
                     .map_err(service)?,
             );
         }
@@ -450,13 +357,7 @@ impl DirectRewriteAction {
         }
         std::task::ready!(self.poll_start(owner, cx))?;
         let state = self.state.as_mut().unwrap();
-        let result = std::task::ready!(state.poll_product(owner, cx));
-        // OPTIMIZE retains its exact target gate through actual Source exit.
-        // Direct procedure custody otherwise keeps its existing release frontier.
-        if !self.optimize {
-            drop(self.activity.take());
-        }
-        result?;
+        std::task::ready!(state.poll_product(owner, cx))?;
         let mut domain = state
             .domain
             .try_lock()
@@ -484,7 +385,7 @@ impl DirectRewriteAction {
         // Every Arrow/schema/result graph is formed only inside the original
         // positively admitted Local factory, using the original result author.
         Poll::Ready(
-            produce_local(producer, outcome, self.optimize)
+            produce_local(producer, outcome)
                 .map(StatementActionValue::Local)
                 .map_err(service),
         )
@@ -549,7 +450,6 @@ impl GovernedStatementAction for DirectRewriteAction {
         }
         let original = Self {
             family: self.family,
-            optimize: self.optimize,
             starting: self.starting.take(),
             input: self.input.take(),
             state: self.state.take(),
@@ -577,18 +477,13 @@ impl GovernedStatementResidual for DirectResidual {
 fn produce_local(
     producer: LocalResultProducer,
     outcome: MaintenanceActionOutcome,
-    optimize: bool,
 ) -> Result<novarocks_query_application::api::OwnedLocalResult, String> {
-    producer.produce(|| {
-        match if optimize {
-            crate::table_maintenance::result::optimize_result(outcome)?
-        } else {
-            crate::table_maintenance::result::action_result(outcome)?
-        } {
+    producer.produce(
+        || match crate::table_maintenance::result::optimize_result(outcome)? {
             MaintenanceStatementResult::Query(result) => Ok(result),
             MaintenanceStatementResult::Ok => Err("direct Rewrite has no local row result".into()),
-        }
-    })
+        },
+    )
 }
 
 #[cfg(test)]
@@ -732,7 +627,6 @@ mod tests {
             ),
             local: None,
             delivered: false,
-            optimize: true,
         };
         let mut retirement = None;
         action.handoff_residual_in(&mut retirement).unwrap();
@@ -897,11 +791,10 @@ mod tests {
                 removed_delete_files_count: 0,
                 output_record_count: None,
             },
-            false,
         )
         .unwrap();
-        assert_eq!(result.row_count(), 1);
-        assert_eq!(result.columns().len(), 5);
+        assert_eq!(result.row_count(), 3);
+        assert_eq!(result.columns().len(), 2);
         drop((local, internal));
         root.owner.complete();
         query_permit.release();
@@ -919,24 +812,5 @@ mod tests {
         );
         drop(result);
         assert!(control.shutdown().is_ok());
-    }
-
-    #[test]
-    fn direct_position_delete_intent_uses_the_original_product_validator() {
-        let options = std::collections::BTreeMap::new();
-        let action =
-            crate::table_maintenance::ParsedMaintenanceAction::RewritePositionDeleteFiles {
-                options,
-                where_clause: None,
-            };
-        let actual = closed_intent(action).unwrap();
-        assert_eq!(
-            actual,
-            novarocks_table_maintenance::product::rewrite_position_delete_intent(
-                &std::collections::BTreeMap::new(),
-                None
-            )
-            .unwrap()
-        );
     }
 }

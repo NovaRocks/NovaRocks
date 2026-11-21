@@ -1705,9 +1705,6 @@ fn connector_relation_kind(
         novarocks_spi::connector::read_stack::ConnectorReadRelationKind::SystemTable => {
             "system-table"
         }
-        novarocks_spi::connector::read_stack::ConnectorReadRelationKind::TableExecute => {
-            "table-execute"
-        }
         novarocks_spi::connector::read_stack::ConnectorReadRelationKind::MergeTable => {
             "merge-table"
         }

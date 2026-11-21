@@ -110,23 +110,16 @@ impl ManagementCall {
     /// route miss: silently falling through would let a mistyped management
     /// statement be reported as an unknown procedure.
     pub(crate) fn try_decode(statement: &PreparedMaintenanceCall) -> Result<Option<Self>, String> {
-        let [part] = statement.procedure.parts.as_slice() else {
+        let Some((procedure, arity)) = owned_procedure(&statement.procedure) else {
             return Ok(None);
         };
-        let procedure = part.value.to_ascii_lowercase();
-        let arity = match procedure.as_str() {
-            STATUS_PROCEDURE => 3,
-            RESUME_PROCEDURE => 7,
-            SET_OWNER_PROCEDURE => 5,
-            _ => return Ok(None),
-        };
-        let arguments = positional_text_arguments(statement, &procedure, arity)?;
+        let arguments = positional_text_arguments(statement, procedure, arity)?;
         let target = ManagementCallTarget {
             catalog: arguments[0].clone(),
             database: arguments[1].clone(),
             name: arguments[2].clone(),
         };
-        Ok(Some(match procedure.as_str() {
+        Ok(Some(match procedure {
             STATUS_PROCEDURE => Self::Status { target },
             RESUME_PROCEDURE => Self::Resume {
                 target,
@@ -141,6 +134,21 @@ impl ManagementCall {
                 new_deployment: arguments[4].clone(),
             },
         }))
+    }
+}
+
+/// Identify a management procedure before argument decoding.
+pub(crate) fn owned_procedure(
+    name: &novarocks_parser::ast::ObjectName,
+) -> Option<(&'static str, usize)> {
+    let [part] = name.parts.as_slice() else {
+        return None;
+    };
+    match part.value.to_ascii_lowercase().as_str() {
+        STATUS_PROCEDURE => Some((STATUS_PROCEDURE, 3)),
+        RESUME_PROCEDURE => Some((RESUME_PROCEDURE, 7)),
+        SET_OWNER_PROCEDURE => Some((SET_OWNER_PROCEDURE, 5)),
+        _ => None,
     }
 }
 

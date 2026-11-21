@@ -494,26 +494,6 @@ fn read_le_u64_from(cursor: &mut Cursor<&[u8]>) -> Result<u64> {
     Ok(u64::from_le_bytes(bytes))
 }
 
-/// Write a DV through the explicit operation or attempt artifact owner.
-#[cfg(test)]
-pub(crate) async fn write_single_deletion_vector_puffin_allocated(
-    writer: &dyn super::model::ArtifactWriter,
-    referenced_data_file: &str,
-    dv: &DeletionVector,
-) -> Result<WrittenPuffinDv> {
-    writer.check_active()?;
-    let object = writer.allocate(super::model::ArtifactKind::DeletionVector)?;
-    let written = write_single_deletion_vector_puffin(
-        writer.file_io(),
-        object.path(),
-        referenced_data_file,
-        dv,
-    )
-    .await?;
-    writer.check_active()?;
-    Ok(written)
-}
-
 #[cfg(test)]
 pub(crate) async fn write_multi_deletion_vector_puffin_allocated(
     writer: &dyn super::model::ArtifactWriter,

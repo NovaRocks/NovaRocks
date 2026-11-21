@@ -273,7 +273,6 @@ pub(crate) async fn make_scoped_read_snapshot(
         ),
         _ => None,
     };
-    let mut all_deletes = Vec::new();
     let files = match kind {
         SnapshotReadKind::ChangeWindow { .. } | SnapshotReadKind::PreparedSource { .. } => {
             // Preserve the original full endpoint projection and delete
@@ -283,31 +282,17 @@ pub(crate) async fn make_scoped_read_snapshot(
                 domain,
                 Some(&context),
                 Some(&capture),
-                None,
                 Some(io.as_ref()),
                 referenced_specs.as_mut(),
             )
             .await?
         }
-        SnapshotReadKind::Statistics => {
+        SnapshotReadKind::Statistics | SnapshotReadKind::Rewrite => {
             observe_read_files_original::<FrozenScopedDataFileProjection>(
                 &table,
                 domain,
                 Some(&context),
                 Some(&capture),
-                None,
-                Some(io.as_ref()),
-                None,
-            )
-            .await?
-        }
-        SnapshotReadKind::Rewrite => {
-            observe_read_files_original::<FrozenScopedDataFileProjection>(
-                &table,
-                domain,
-                Some(&context),
-                Some(&capture),
-                Some(&mut all_deletes),
                 Some(io.as_ref()),
                 None,
             )
@@ -317,9 +302,8 @@ pub(crate) async fn make_scoped_read_snapshot(
     Ok(
         crate::catalog_control::statistics::scoped_cpu::scoped_snapshot::ScopedReadSnapshot {
             files,
-            all_deletes,
             referenced_specs,
-            retention_guard: original.retention_guard(),
+            _retention_guard: original.retention_guard(),
         },
     )
 }
@@ -332,17 +316,7 @@ async fn observe_read_files<P: ObservedDataFileProjection>(
     control: Option<&dyn novarocks_spi::connector::ConnectorOperationControl>,
     capture: Option<&CaptureScope<'_>>,
 ) -> Result<Vec<P::File>, ReadFailure> {
-    observe_read_files_with_delete_receiving::<P>(table, domain, control, capture, None).await
-}
-
-async fn observe_read_files_with_delete_receiving<P: ObservedDataFileProjection>(
-    table: &Table,
-    domain: Arc<ReadDomain>,
-    control: Option<&dyn novarocks_spi::connector::ConnectorOperationControl>,
-    capture: Option<&CaptureScope<'_>>,
-    all_deletes: Option<&mut Vec<Arc<crate::delete_semantics::DeleteFact>>>,
-) -> Result<Vec<P::File>, ReadFailure> {
-    observe_read_files_original::<P>(table, domain, control, capture, all_deletes, None, None).await
+    observe_read_files_original::<P>(table, domain, control, capture, None, None).await
 }
 
 /// Index by physical path, but retain the original descriptor as a borrowed
@@ -368,7 +342,6 @@ async fn observe_read_files_original<P: ObservedDataFileProjection>(
     domain: Arc<ReadDomain>,
     control: Option<&dyn novarocks_spi::connector::ConnectorOperationControl>,
     capture: Option<&CaptureScope<'_>>,
-    all_deletes: Option<&mut Vec<Arc<crate::delete_semantics::DeleteFact>>>,
     io: Option<&crate::catalog_control::statistics::scoped_cpu::scoped_snapshot::SnapshotIoGate>,
     mut referenced_specs: Option<&mut crate::catalog_control::statistics::scoped_cpu::scoped_snapshot::ReferencedSpecInventory>,
 ) -> Result<Vec<P::File>, ReadFailure> {
@@ -582,15 +555,6 @@ async fn observe_read_files_original<P: ObservedDataFileProjection>(
         }
         crate::delete_semantics::ConstructionFailure::Original(e) => e,
     })?;
-    if let Some(receiving) = all_deletes {
-        if !receiving.is_empty() {
-            return Err(ReadFailure::Semantic(
-                "Rewrite delete receiver is occupied".into(),
-            ));
-        }
-
-        receiving.extend(observation.facts().iter().cloned());
-    }
     let index =
         DeleteCandidateIndex::try_new_checked(domain, observation, || check_scoped_active(capture))
             .map_err(|e| match e {

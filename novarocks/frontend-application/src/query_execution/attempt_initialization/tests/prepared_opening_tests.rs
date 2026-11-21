@@ -331,14 +331,6 @@ impl ProviderReadMetadata for Provider {
     ) -> Result<Option<Table>, spi::ConnectorError> {
         Err(unused())
     }
-    fn get_table_execute_plan(
-        &self,
-        _: &read::ConnectorSession,
-        _: &read::SchemaTableName,
-        _: read::ConnectorReadTableExecuteProcedure,
-    ) -> Result<Option<Table>, spi::ConnectorError> {
-        Err(unused())
-    }
 }
 impl spi::ConnectorMetadata for Provider {
     fn provider_metadata_cpu_author(

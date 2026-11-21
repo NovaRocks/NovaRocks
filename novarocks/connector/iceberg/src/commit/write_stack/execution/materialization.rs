@@ -89,7 +89,7 @@ struct V2File {
 struct PuffinArtifact {
     data_file: String,
     partition: IcebergArtifactPartition,
-    mutation: Option<(IcebergDeleteTargetLocator, u64)>,
+    mutation: (IcebergDeleteTargetLocator, u64),
     exclusive: Vec<EntryIdentity>,
 }
 
@@ -133,7 +133,6 @@ pub(super) struct MaterializedDeleteWriter {
     files: BTreeSet<String>,
     file_id_charge: Option<ConnectorResourceReservation>,
     v2: BTreeMap<String, V2File>,
-    rewrite: Option<(DeletionVector, ConnectorResourceReservation)>,
     puffin: Option<PuffinOutput>,
     next_puffin: u64,
     effects: Vec<RetainedEffect>,
@@ -146,9 +145,9 @@ impl MaterializedDeleteWriter {
         handle: IcebergWriterHandle,
         request: ConnectorOpenWriterRequest,
     ) -> Result<Self, ConnectorError> {
-        if handle.mutation_read().is_some() == handle.position_rewrite().is_some() {
+        if handle.mutation_read().is_none() {
             return Err(invalid(
-                "Iceberg position writer requires exactly one position input recipe",
+                "Iceberg position writer requires a fixed mutation input recipe",
             ));
         }
         let resources = request.resources.ok_or_else(|| {
@@ -192,7 +191,6 @@ impl MaterializedDeleteWriter {
             files: BTreeSet::new(),
             file_id_charge: None,
             v2: BTreeMap::new(),
-            rewrite: None,
             puffin: None,
             next_puffin: 0,
             effects: Vec::new(),
@@ -509,7 +507,7 @@ impl MaterializedDeleteWriter {
             PuffinArtifact {
                 data_file: file.file,
                 partition,
-                mutation: Some((locator, new_rows)),
+                mutation: (locator, new_rows),
                 exclusive,
             },
             effect_bytes
@@ -622,16 +620,12 @@ impl MaterializedDeleteWriter {
                 pending.blob.cardinality,
                 pending.artifact.exclusive,
             )?;
-            let fragment = match pending.artifact.mutation {
-                Some((target, new_rows)) => {
-                    IcebergCommitFragment::final_delete(IcebergFinalDeleteEffect::try_new(
-                        target,
-                        new_rows,
-                        IcebergFinalDeleteKind::ReplacePositions(Box::new(artifact)),
-                    )?)
-                }
-                None => IcebergCommitFragment::deletion_vector(artifact),
-            };
+            let (target, new_rows) = pending.artifact.mutation;
+            let fragment = IcebergCommitFragment::final_delete(IcebergFinalDeleteEffect::try_new(
+                target,
+                new_rows,
+                IcebergFinalDeleteKind::ReplacePositions(Box::new(artifact)),
+            )?);
             let fragment = with_creation_receipt(fragment, &self.journal)?;
             self.effects.push(RetainedEffect {
                 fragment,
@@ -639,68 +633,6 @@ impl MaterializedDeleteWriter {
             });
         }
         Ok(())
-    }
-
-    fn append_rewrite(&mut self, batch: &RecordBatch) -> Result<(), ConnectorError> {
-        self.check_schema(batch, 2)?;
-        if batch.num_rows() == 0 {
-            return Ok(());
-        }
-        if self.rewrite.is_none() {
-            self.rewrite = Some((
-                DeletionVector::new(),
-                self.reserve(std::mem::size_of::<DeletionVector>() as u64)?,
-            ));
-        }
-        let target = self
-            .handle
-            .position_rewrite()
-            .ok_or_else(|| corrupt("Iceberg position rewrite selection is unavailable"))?;
-        let (positions, charge) = self
-            .rewrite
-            .as_mut()
-            .ok_or_else(|| corrupt("Iceberg position rewrite state is unavailable"))?;
-        let files: &StringArray = required(batch, 0)?;
-        let rows: &Int64Array = required(batch, 1)?;
-        for row in 0..batch.num_rows() {
-            self.context.check_active()?;
-            if files.value(row) != target.path() {
-                return Err(invalid(
-                    "Iceberg position rewrite row names an unselected data file",
-                ));
-            }
-            let position = u64::try_from(rows.value(row))
-                .ok()
-                .filter(|position| *position < target.record_count())
-                .ok_or_else(|| {
-                    invalid("Iceberg position rewrite row is outside the selected data file")
-                })?;
-            if !positions.contains(position) {
-                charge.try_grow(std::mem::size_of::<u64>() as u64)?;
-                positions.insert(position).map_err(stage_position_error)?;
-            }
-        }
-        Ok(())
-    }
-
-    async fn finish_rewrite(&mut self) -> Result<(), ConnectorError> {
-        let Some((positions, _charge)) = self.rewrite.take() else {
-            return Ok(());
-        };
-        let target = self
-            .handle
-            .position_rewrite()
-            .ok_or_else(|| corrupt("Iceberg position rewrite selection is unavailable"))?;
-        let artifact = PuffinArtifact {
-            data_file: target.path().to_owned(),
-            partition: target.partition().clone(),
-            mutation: None,
-            exclusive: Vec::new(),
-        };
-        let bytes = artifact_partition_bytes(&artifact.partition)
-            .saturating_add(artifact.data_file.len() as u64)
-            .saturating_add(std::mem::size_of::<PendingPuffinEffect>() as u64);
-        self.append_puffin(&positions, artifact, bytes).await
     }
 
     async fn finish_v2(&mut self) -> Result<(), ConnectorError> {
@@ -777,9 +709,6 @@ impl MaterializedDeleteWriter {
 impl ConnectorBatchWriter for MaterializedDeleteWriter {
     async fn append(&mut self, batch: RecordBatch) -> Result<(), ConnectorError> {
         self.live()?;
-        if self.handle.position_rewrite().is_some() {
-            return self.append_rewrite(&batch);
-        }
         if self.handle.branch() != IcebergWriteBranch::PositionDelete {
             return Err(invalid(
                 "Iceberg DV writer requires authenticated position shards",
@@ -869,7 +798,6 @@ impl ConnectorBatchWriter for MaterializedDeleteWriter {
             ));
         }
         self.finish_v2().await?;
-        self.finish_rewrite().await?;
         self.close_puffin().await?;
         self.context.check_active()?;
         self.lifecycle = WriterLifecycle::Sealed;
@@ -890,7 +818,6 @@ impl ConnectorBatchWriter for MaterializedDeleteWriter {
         }
         self.lifecycle = WriterLifecycle::Aborting;
         self.puffin.take();
-        self.rewrite.take();
         self.authors.clear();
         self.v2.clear();
         self.files.clear();

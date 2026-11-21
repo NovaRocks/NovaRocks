@@ -304,11 +304,7 @@ impl<'a> WriteRecipe<'a> {
         let materialized = (!targets.is_empty())
             .then(|| Arc::new(materialized::MaterializedDeleteStep::new(targets)));
         let selected = selected_rewrite_files(handle);
-        if crate::schema_facts::row_lineage_enabled(&source)
-            && selected.as_ref().is_some_and(|rewrite| {
-                rewrite.kind == crate::commit::selected_rewrite::SelectedRewriteKind::Data
-            })
-        {
+        if crate::schema_facts::row_lineage_enabled(&source) && selected.is_some() {
             lineage::freeze_preserved_row_ids(validated, &mut files)?;
         }
         let output_facts = crate::write_codec::written_output_facts(&files).map_err(invalid)?;
@@ -436,15 +432,11 @@ impl<'a> WriteRecipe<'a> {
                         .selected
                         .as_ref()
                         .ok_or_else(|| format_error(invalid("Selected rewrite input is absent")))?;
-                    if selected.kind == crate::commit::selected_rewrite::SelectedRewriteKind::Data {
-                        selected
-                            .data_paths
-                            .union(&selected.delete_paths)
-                            .cloned()
-                            .collect()
-                    } else {
-                        selected.delete_paths.clone()
-                    }
+                    selected
+                        .data_paths
+                        .union(&selected.delete_paths)
+                        .cloned()
+                        .collect()
                 }
                 CommitOpKind::Truncate => live.keys().cloned().collect(),
                 CommitOpKind::OverwritePartitions => live

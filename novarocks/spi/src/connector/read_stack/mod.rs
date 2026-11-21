@@ -51,9 +51,8 @@ pub use dynamic_filter::{
     BoundsMatch, ColumnValueBounds, CompleteAllDynamicFilter, DynamicFilter, DynamicFilterSnapshot,
 };
 pub use handle::{
-    ColumnHandle, ConnectorMergeTableHandle, ConnectorTableExecuteHandle,
-    ConnectorTableFunctionHandle, ConnectorTableHandle, ConnectorTransactionHandle,
-    MAX_SCHEMA_TABLE_NAME_BYTES, SchemaTableName,
+    ColumnHandle, ConnectorMergeTableHandle, ConnectorTableFunctionHandle, ConnectorTableHandle,
+    ConnectorTransactionHandle, MAX_SCHEMA_TABLE_NAME_BYTES, SchemaTableName,
 };
 pub use mv_target_selection::{
     ConnectorMvPartitionValue, ConnectorMvTargetPartitionSelection, MAX_MV_TARGET_PARTITION_KEYS,
@@ -89,17 +88,17 @@ pub use runtime::{
     ConnectorReadAttemptAccessSource, ConnectorReadAttemptRuntime, ConnectorReadBinding,
     ConnectorReadChangeWindow, ConnectorReadColumnBinding, ConnectorReadColumnHandle,
     ConnectorReadConstraint, ConnectorReadDynamicFilter, ConnectorReadDynamicFilterSnapshot,
-    ConnectorReadFilterApplication, ConnectorReadFrozenRewriteGroup, ConnectorReadLimitApplication,
-    ConnectorReadMetadata, ConnectorReadOpenedRelation, ConnectorReadPageSourceProvider,
-    ConnectorReadRegistrationPin, ConnectorReadRelation, ConnectorReadRelationKind,
-    ConnectorReadRelationPreparation, ConnectorReadRelationPreparationFuture,
-    ConnectorReadRelationPreparationKind, ConnectorReadRelationPreparationRequest,
-    ConnectorReadRelationVersion, ConnectorReadRequestControl, ConnectorReadRequestControlFactory,
+    ConnectorReadFilterApplication, ConnectorReadLimitApplication, ConnectorReadMetadata,
+    ConnectorReadOpenedRelation, ConnectorReadPageSourceProvider, ConnectorReadRegistrationPin,
+    ConnectorReadRelation, ConnectorReadRelationKind, ConnectorReadRelationPreparation,
+    ConnectorReadRelationPreparationFuture, ConnectorReadRelationPreparationKind,
+    ConnectorReadRelationPreparationRequest, ConnectorReadRelationVersion,
+    ConnectorReadRequestControl, ConnectorReadRequestControlFactory,
     ConnectorReadSourcePreparationRequest, ConnectorReadSourceProjection,
     ConnectorReadSourceSelection, ConnectorReadSplit, ConnectorReadSplitFacts,
     ConnectorReadSplitManager, ConnectorReadSplitOpenFuture, ConnectorReadSplitOpenRequest,
     ConnectorReadSplitPreparation, ConnectorReadSplitSource, ConnectorReadSystemTablePlan,
-    ConnectorReadTableExecuteProcedure, ConnectorReadTableHandle, ConnectorReadTransactionHandle,
+    ConnectorReadTableHandle, ConnectorReadTransactionHandle,
 };
 pub use scan_policy::{ENGINE_OUTPUT_POLICY, ScanOutputPolicy};
 pub use session::{

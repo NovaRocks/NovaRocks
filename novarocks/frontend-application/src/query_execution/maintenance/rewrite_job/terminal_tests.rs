@@ -264,7 +264,9 @@ async fn exercise_original_terminal(effect: ExecutionEffect, outcome: ProviderOu
     let original = execution.product.execute_rewrite_terminal(
         &execution,
         &target,
-        RewriteIntent::DataFiles { rewrite_all: true },
+        RewriteIntent::Optimize {
+            file_size_threshold_bytes: 1,
+        },
     );
     tokio::pin!(original);
     assert!(futures::poll!(original.as_mut()).is_pending());
@@ -497,7 +499,9 @@ async fn originating_mutation_failure_keeps_one_cause_through_product_and_statem
             .execute_rewrite_terminal(
                 &execution,
                 &target,
-                RewriteIntent::DataFiles { rewrite_all: true },
+                RewriteIntent::Optimize {
+                    file_size_threshold_bytes: 1,
+                },
             )
             .await
             .unwrap_err();

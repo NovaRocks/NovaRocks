@@ -74,30 +74,6 @@ pub(super) fn publish(
                 window.table_schema_json().len(),
             )
         }
-        IcebergRuntimeRelation::TableExecute(execute) => match execute.procedure_handle() {
-            Some(IcebergTableExecuteProcedureHandle::Optimize(optimize)) => {
-                let table = optimize.table_handle();
-                creation.work(table.table_schema_json().len())?;
-                let schema = table.parse_table_schema()?;
-                creation.work(1)?;
-                (
-                    Some(schema),
-                    Some(table.nominal_declarations()),
-                    Some(table),
-                    table.table_schema_json().len(),
-                )
-            }
-            Some(IcebergTableExecuteProcedureHandle::RewritePositionDeleteFiles(_)) => {
-                (None, None, None, 0)
-            }
-            None => {
-                return Err(ConnectorError::new(
-                    ConnectorErrorKind::Unsupported,
-                    "Iceberg table execute has no source declaration",
-                )
-                .into());
-            }
-        },
         _ => {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::Unsupported,
@@ -309,17 +285,8 @@ fn validate_column_declaration(
     creation: &mut ConnectorReadSchemaCreation<'_>,
 ) -> Result<(), CreationFailure> {
     if let Some(metadata) = IcebergMetadataColumn::from_field_id(column.base_field_id()) {
-        let rewrite_name = if matches!(relation, IcebergRuntimeRelation::TableExecute(execute)
-            if matches!(execute.procedure_handle(), Some(IcebergTableExecuteProcedureHandle::RewritePositionDeleteFiles(_))))
-        {
-            REWRITE_POSITION_DELETE_OUTPUT_COLUMNS
-                .iter()
-                .find_map(|(name, expected)| (*expected == metadata).then_some(*name))
-        } else {
-            Some(metadata.column_name())
-        };
         if !column.is_base_column()
-            || rewrite_name != Some(column.base_column_identity().name())
+            || metadata.column_name() != column.base_column_identity().name()
             || source.field_type.as_ref() != &Type::Primitive(metadata.declared_type())
             || metadata == IcebergMetadataColumn::IsDeleted
         {

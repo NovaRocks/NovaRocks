@@ -101,19 +101,10 @@ provider_payload_wrapper!(
     ConnectorCodecCategory::ReadTable
 );
 provider_payload_wrapper!(
-    ValidatedConnectorTableExecuteHandle,
-    dto::ConnectorTableExecuteHandle,
-    ConnectorCodecCategory::ReadTable
-);
-provider_payload_wrapper!(
     ValidatedConnectorMergeTableHandle,
     dto::ConnectorMergeTableHandle,
     ConnectorCodecCategory::ReadTable
 );
-
-/// Compatibility export while procedure details move behind ReadTable.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TableExecuteProcedure {}
 
 /// Public routing category. Relation contents are provider-private.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -122,7 +113,6 @@ pub enum ConnectorRelationKind {
     TableFunction,
     ChangeWindow,
     SystemTable,
-    TableExecute,
     MergeTable,
 }
 
@@ -132,7 +122,6 @@ pub enum ConnectorRelation<'a> {
     TableFunction(&'a ValidatedConnectorTableFunctionHandle),
     ChangeWindow(&'a ValidatedConnectorChangeWindowHandle),
     SystemTable(&'a ValidatedConnectorSystemTableReference),
-    TableExecute(&'a ValidatedConnectorTableExecuteHandle),
     MergeTable(&'a ValidatedConnectorMergeTableHandle),
 }
 
@@ -143,7 +132,6 @@ impl ConnectorRelation<'_> {
             Self::TableFunction(_) => ConnectorRelationKind::TableFunction,
             Self::ChangeWindow(_) => ConnectorRelationKind::ChangeWindow,
             Self::SystemTable(_) => ConnectorRelationKind::SystemTable,
-            Self::TableExecute(_) => ConnectorRelationKind::TableExecute,
             Self::MergeTable(_) => ConnectorRelationKind::MergeTable,
         }
     }
@@ -156,7 +144,6 @@ impl<'a> ConnectorRelation<'a> {
             Self::TableFunction(value) => value.provider_payload(),
             Self::ChangeWindow(value) => value.provider_payload(),
             Self::SystemTable(value) => value.provider_payload(),
-            Self::TableExecute(value) => value.provider_payload(),
             Self::MergeTable(value) => value.provider_payload(),
         }
     }
@@ -168,7 +155,6 @@ enum OwnedConnectorRelation {
     TableFunction(ValidatedConnectorTableFunctionHandle),
     ChangeWindow(ValidatedConnectorChangeWindowHandle),
     SystemTable(ValidatedConnectorSystemTableReference),
-    TableExecute(ValidatedConnectorTableExecuteHandle),
     MergeTable(ValidatedConnectorMergeTableHandle),
 }
 
@@ -179,7 +165,6 @@ impl OwnedConnectorRelation {
             Self::TableFunction(value) => ConnectorRelation::TableFunction(value),
             Self::ChangeWindow(value) => ConnectorRelation::ChangeWindow(value),
             Self::SystemTable(value) => ConnectorRelation::SystemTable(value),
-            Self::TableExecute(value) => ConnectorRelation::TableExecute(value),
             Self::MergeTable(value) => ConnectorRelation::MergeTable(value),
         }
     }
@@ -245,12 +230,6 @@ impl CatalogTableHandle {
                 OwnedConnectorRelation::SystemTable(ValidatedConnectorSystemTableReference::parse(
                     value,
                     path.clone().field("system_table"),
-                )?)
-            }
-            dto::catalog_table_handle::Relation::TableExecute(value) => {
-                OwnedConnectorRelation::TableExecute(ValidatedConnectorTableExecuteHandle::parse(
-                    value,
-                    path.clone().field("table_execute"),
                 )?)
             }
             dto::catalog_table_handle::Relation::MergeTable(value) => {

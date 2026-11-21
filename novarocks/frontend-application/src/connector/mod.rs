@@ -34,7 +34,7 @@ pub use application::{
     acquire_metadata_planning_pin, connector_request_context,
     connector_request_context_for_execution, connector_write_default_at,
     metadata_list_namespaces_with_planning_pin, metadata_load_connector_table_with_planning_pin,
-    metadata_read_reference_facts_with_planning_pin, validate_request_context,
+    validate_request_context,
 };
 pub(crate) use application::{
     connector_request_context_for_execution_on_runtime,

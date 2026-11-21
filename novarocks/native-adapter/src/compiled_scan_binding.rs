@@ -342,8 +342,7 @@ pub(crate) fn bind_compiled_scan(
     match draft.relation().kind() {
         ConnectorReadRelationKind::Table
         | ConnectorReadRelationKind::ChangeWindow
-        | ConnectorReadRelationKind::SystemTable
-        | ConnectorReadRelationKind::TableExecute => {}
+        | ConnectorReadRelationKind::SystemTable => {}
         kind @ (ConnectorReadRelationKind::TableFunction
         | ConnectorReadRelationKind::MergeTable) => {
             return Err(CompiledScanBindingError::at_domain(
