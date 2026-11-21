@@ -15,7 +15,7 @@ use super::{
     session_admit::SessionAdmitError,
 };
 
-const UNSUPPORTED_STATEMENT: ErrorCodeDescriptor = ErrorCodeDescriptor {
+pub(super) const UNSUPPORTED_STATEMENT: ErrorCodeDescriptor = ErrorCodeDescriptor {
     code: ErrorCodeId::new("sql.admit.unsupported_statement"),
     phase: ErrorPhase::Admit,
     status: ErrorCodeStatus::Active,

@@ -37,6 +37,7 @@ use novarocks_user_error::{
 };
 
 use super::property_evaluation::{DdlPropertyConstantPort, evaluate_required_property_value};
+use super::trino_admission::UNSUPPORTED_STATEMENT;
 use crate::session_error::{QueryServiceError, QueryServiceErrorKind};
 
 const NOT_FOUND: ErrorCodeDescriptor = admit("sql.admit.table_procedure_not_found");
@@ -567,10 +568,15 @@ fn bind_slots<'a, A: Copy>(
         };
         let slot = &procedure.arguments[index];
         if let Some(reason) = slot.explicit_value_unavailable {
-            return Err(not_supported(format!(
-                "Table procedure {} argument '{}' is not supported: {reason}",
-                procedure.name, slot.name
-            )));
+            return Err(error(
+                UNSUPPORTED_STATEMENT,
+                source.zip(argument.span),
+                format!(
+                    "Table procedure {} argument '{}' is not supported: {reason}",
+                    procedure.name, slot.name
+                ),
+                None,
+            ));
         }
         let value = evaluate(slot, *argument)?;
         // The reference checks duplicates on canonical Ident values above,
@@ -829,10 +835,6 @@ fn error(
 
 fn invariant(message: &str) -> QueryServiceError {
     QueryServiceError::new(QueryServiceErrorKind::Internal, message)
-}
-
-fn not_supported(message: impl Into<String>) -> QueryServiceError {
-    QueryServiceError::new(QueryServiceErrorKind::Unsupported, message)
 }
 
 #[cfg(test)]

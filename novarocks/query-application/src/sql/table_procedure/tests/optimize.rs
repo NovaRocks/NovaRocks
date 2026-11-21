@@ -123,9 +123,11 @@ fn sorted_by_explains_which_write_capability_is_required() {
     let source = "ALTER TABLE t EXECUTE optimize(sorted_by => ARRAY['a'])";
     let statement = optimize(source);
     let error = bind(source, &statement, &mut UnreachedEvaluation).unwrap_err();
-    assert_eq!(error.kind(), QueryServiceErrorKind::Unsupported);
+    let user = error.user_error().unwrap();
+    assert_eq!(user.code().as_str(), "sql.admit.unsupported_statement");
     assert_eq!(
-        error.message(),
+        user.message(),
         "Table procedure OPTIMIZE argument 'sorted_by' is not supported: it requires support for writing files in the specified sort order",
     );
+    assert!(user.location().is_some());
 }
