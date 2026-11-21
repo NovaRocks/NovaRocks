@@ -153,10 +153,10 @@ pub use distributed_rewrite::{
     ConnectorDistributedRewritePlanningRequest, ConnectorDistributedRewriteReceipt,
     ConnectorDistributedRewriteReceiptSummary, ConnectorDistributedRewriteResolver,
     ConnectorDistributedRewriteShape, ConnectorFrozenRewriteGroup, ConnectorRewriteCohortRead,
-    ConnectorRewritePlanSource, ConnectorRewritePrepared, ConnectorRewriteSelection,
-    ConnectorRewriteSourceRequest, ConnectorRewriteWriteBeginSource,
-    MAX_CONNECTOR_DISTRIBUTED_REWRITE_PROVIDER_PAYLOAD_BYTES, REWRITE_DATA_FILES_KIND,
-    REWRITE_POSITION_DELETES_KIND, RewriteCpuInput, RewriteCpuPort, RewritePlanCpuSource,
+    ConnectorRewritePlanSource,
+    ConnectorRewritePrepared, ConnectorRewriteSelection, ConnectorRewriteSourceRequest,
+    ConnectorRewriteWriteBeginSource, MAX_CONNECTOR_DISTRIBUTED_REWRITE_PROVIDER_PAYLOAD_BYTES,
+    REWRITE_DATA_FILES_KIND, RewriteCpuInput, RewriteCpuPort, RewritePlanCpuSource,
     SharedConnectorDistributedRewrite,
 };
 pub use distribution::ProviderBindingEpoch;

@@ -176,11 +176,11 @@ impl super::staging::Preparer for RewriteDataFilesPreparer {
                 "Whole-data rewrite frozen set does not equal the target-ref live set",
             ));
         }
-        prepare_physical_rewrite(view, intent, (sources.as_ref(), &live), &removed, true).await
+        prepare_physical_rewrite(view, intent, (sources.as_ref(), &live), &removed).await
     }
 }
 
-/// Shared by whole-data and exact selected-delete replacement. All inputs are
+/// Shared by whole-table and selected-data replacement. All inputs are
 /// frozen before this attempt; live entries retain their actual source facts.
 pub(crate) async fn prepare_physical_rewrite(
     view: &super::staging::StagedView<'_>,
@@ -190,9 +190,8 @@ pub(crate) async fn prepare_physical_rewrite(
         &BTreeMap<super::model::EntryIdentity, super::manifest_sources::LocatedEntry>,
     ),
     removed: &std::collections::BTreeSet<super::model::EntryIdentity>,
-    data_rewrite: bool,
 ) -> crate::iceberg::Result<super::staging::PreparedChange> {
-    use super::model::{EntryIdentity, SeqField};
+    use super::model::SeqField;
     use super::staging::{ManifestEntryWrite, write_manifest};
     let metadata = view.metadata();
     let (sources, live) = observation;
@@ -224,48 +223,15 @@ pub(crate) async fn prepare_physical_rewrite(
                 "Physical rewrite output must carry the frozen starting data sequence",
             ));
         }
-        let spec_id = if data_rewrite {
-            if added.file().content_type() != DataContentType::Data {
-                return Err(rewrite_invalid(
-                    "Whole-data rewrite output must contain only data files",
-                ));
-            }
-            added.partition_spec_id()
-        } else {
-            let EntryIdentity::DeletionVector {
-                referenced_data_file,
-                ..
-            } = EntryIdentity::try_from(added.file())?
-            else {
-                return Err(rewrite_invalid(
-                    "Position-delete rewrite output must contain deletion vectors",
-                ));
-            };
-            let data = live
-                .get(&EntryIdentity::DataFile {
-                    path: referenced_data_file,
-                })
-                .ok_or_else(|| {
-                    rewrite_invalid(
-                        "Replacement DV references a data file absent from the target ref",
-                    )
-                })?;
-            if &data.frozen.facts().partition != added.file().partition() {
-                return Err(rewrite_invalid(
-                    "Replacement DV partition differs from its exact referenced data file",
-                ));
-            }
-            if added.partition_spec_id() != data.frozen.facts().partition_spec_id {
-                return Err(rewrite_invalid(
-                    "Replacement DV spec differs from its exact referenced data file",
-                ));
-            }
-            added.partition_spec_id()
-        };
+        if added.file().content_type() != DataContentType::Data {
+            return Err(rewrite_invalid(
+                "Whole-data rewrite output must contain only data files",
+            ));
+        }
         added_groups
             .entry((
-                spec_id,
-                data_rewrite && added.file().first_row_id().is_some(),
+                added.partition_spec_id(),
+                added.file().first_row_id().is_some(),
             ))
             .or_default()
             .push(added.clone());
@@ -287,26 +253,21 @@ pub(crate) async fn prepare_physical_rewrite(
         let spec = metadata.partition_spec_by_id(spec_id).ok_or_else(|| {
             rewrite_invalid(format!("Rewrite partition spec {spec_id} is absent"))
         })?;
-        let assigned_min =
-            (metadata.format_version() == FormatVersion::V3 && data_rewrite && assigned)
-                .then(|| {
-                    added
-                        .iter()
-                        .filter_map(|entry| entry.file().first_row_id())
-                        .min()
-                })
-                .flatten();
+        let assigned_min = (metadata.format_version() == FormatVersion::V3 && assigned)
+            .then(|| {
+                added
+                    .iter()
+                    .filter_map(|entry| entry.file().first_row_id())
+                    .min()
+            })
+            .flatten();
         let mut manifest = write_manifest(
             view.artifacts(),
             metadata.format_version(),
             snapshot_id,
             metadata.current_schema().clone(),
             spec.as_ref().clone(),
-            if data_rewrite {
-                ManifestContentType::Data
-            } else {
-                ManifestContentType::Deletes
-            },
+            ManifestContentType::Data,
             added.into_iter().map(ManifestEntryWrite::Added),
         )
         .await?;
@@ -334,12 +295,7 @@ pub(crate) async fn prepare_physical_rewrite(
     )
     .await?;
     let mut summary = super::overwrite::snapshot_file_summary(&intent.changes().added, &deleted)?;
-    if data_rewrite {
-        super::overwrite::set_physical_rows_after_removal(view, &mut summary)?;
-    }
-    if !data_rewrite {
-        summary.insert("rewritten-delete-files".into(), removed.len().to_string());
-    }
+    super::overwrite::set_physical_rows_after_removal(view, &mut summary)?;
     super::overwrite::prepare_ordinary_snapshot_change(
         view,
         intent,

@@ -395,7 +395,6 @@ pub struct MaintenanceCommandPorts {
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
     mv_readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
     service: Arc<dyn TableMaintenanceService>,
-    runtime: Handle,
 }
 
 impl MaintenanceCommandPorts {
@@ -412,7 +411,6 @@ impl MaintenanceCommandPorts {
         mv_storage_observation: Arc<dyn MvStorageObservationPort>,
         mv_readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
         service: Arc<dyn TableMaintenanceService>,
-        runtime: Handle,
         constant_policy: novarocks_functions::ConstantPolicy,
         static_plan_carrier: CompiledPackageCarrier,
         sealed_functions: Arc<novarocks_functions::PureEngineFunctionCatalog>,
@@ -430,7 +428,6 @@ impl MaintenanceCommandPorts {
             mv_storage_observation,
             mv_readiness,
             service,
-            runtime,
         }
     }
 

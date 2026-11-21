@@ -59,12 +59,12 @@ use novarocks_spi::connector::read_stack::{
     ConnectorReadStaticFacts, ConnectorReadTableHandle, ConnectorSession, ConnectorSplitBatch,
     ConnectorSplitSource, ConnectorTableHandle as _, ConnectorValue, ConnectorValueType,
     Constraint, Domain, DynamicFilterSnapshot, OrderedAssignments, Range, SchemaTableName,
-    SplitWeight, SystemTableUnitHint, TupleDomain, ValueSet,
+    SystemTableUnitHint, TupleDomain, ValueSet,
 };
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorOperationControl,
     ConnectorPinnedFileSet, ConnectorRequestContext, ConnectorTableObjectId,
-    MvExactPartitionTransform, ProviderBindingEpoch, REWRITE_POSITION_DELETES_KIND,
+    MvExactPartitionTransform, ProviderBindingEpoch,
 };
 
 use crate::file_pruning::file_may_satisfy_physical_predicates;
@@ -95,17 +95,13 @@ use crate::typed_read::{
     ALWAYS_BOUND_METADATA_COLUMNS, HiveTransactionHandle, ICEBERG_CHANGE_OP_COLUMN,
     IcebergChangeSplit, IcebergChangeWindowEndpoints, IcebergChangeWindowHandle,
     IcebergChangeWindowHandleParams, IcebergChangeWindowSplitSource, IcebergColumnHandle,
-    IcebergDeleteFile, IcebergDeleteFileContent, IcebergDeleteFileParams, IcebergFileFormat,
-    IcebergMetadataColumn, IcebergPinnedDataFileSet, IcebergPlannedDataFile,
-    IcebergRewriteArtifactContentId, IcebergRewritePositionDeleteFilesHandle,
-    IcebergRewritePositionDeleteFilesSplit, IcebergRewritePositionDeleteFilesSplitParams,
+    IcebergFileFormat, IcebergMetadataColumn, IcebergPinnedDataFileSet, IcebergPlannedDataFile,
     IcebergSplit, IcebergSplitSource, IcebergSplitSourceOptions, IcebergSystemTableReference,
-    IcebergTableExecuteHandle, IcebergTableExecuteHandleParams, IcebergTableExecuteProcedureHandle,
-    IcebergTableHandle, IcebergTableHandleParams, REWRITE_POSITION_DELETE_OUTPUT_COLUMNS,
-    ROW_LINEAGE_METADATA_COLUMNS, SystemManifestSplit, SystemManifestSplitSource,
-    SystemManifestSplitSourceParams, SystemRelationSplit, TrinoManifestFile, bounds_row_type,
-    change_op_column_handle, derived_row_type_json, partition_row_type_with_metadata,
-    plan_change_window_splits, system_relation_columns_with_metadata,
+    IcebergTableHandle, IcebergTableHandleParams, ROW_LINEAGE_METADATA_COLUMNS,
+    SystemManifestSplit, SystemManifestSplitSource, SystemManifestSplitSourceParams,
+    SystemRelationSplit, TrinoManifestFile, bounds_row_type, change_op_column_handle,
+    derived_row_type_json, partition_row_type_with_metadata, plan_change_window_splits,
+    system_relation_columns_with_metadata,
 };
 #[cfg(test)]
 use novarocks_spi::connector::read_stack::{
@@ -944,61 +940,6 @@ impl ChangeWindowEndpointProjection {
     }
 }
 
-/// The partition spelling a rewrite split carries for an unpartitioned file.
-///
-/// The split contract requires a non-empty partition JSON, and an
-/// unpartitioned data file has no partition struct to spell. The empty object
-/// is the spec's own encoding of "no partition fields", so it states that
-/// rather than inventing a placeholder value.
-const UNPARTITIONED_REWRITE_PARTITION_JSON: &str = "{}";
-
-/// Restate one frozen delete artifact as the typed split's delete file.
-///
-/// Every fact is carried from the artifact the group named. A V2 Parquet
-/// position-delete file has no addressed content range, so re-encoding it would
-/// mean reading a whole file to find one data file's rows; the split contract
-/// refuses that, and this refuses it earlier with the artifact's own path.
-fn rewrite_position_delete_file(
-    delete: &crate::scan_model::IcebergDeleteFileInfo,
-) -> Result<IcebergDeleteFile, ConnectorError> {
-    if delete.file_content != crate::scan_model::IcebergDeleteFileContent::Position
-        || delete.file_format != crate::scan_model::IcebergDeleteFileFormat::Puffin
-    {
-        return Err(invalid(format!(
-            "iceberg rewrite position delete artifact {} is not a puffin deletion vector",
-            delete.path
-        )));
-    }
-    IcebergDeleteFile::try_new(IcebergDeleteFileParams {
-        content: IcebergDeleteFileContent::PositionDeletes,
-        path: delete.path.clone(),
-        format: IcebergFileFormat::Puffin,
-        record_count: delete
-            .record_count
-            .ok_or_else(|| corrupt("rewrite delete has no manifest record count"))?,
-        file_size_in_bytes: delete
-            .length
-            .ok_or_else(|| corrupt("rewrite delete has no file size"))?,
-        partition_spec_id: delete
-            .partition_spec_id
-            .ok_or_else(|| corrupt("rewrite delete has no partition spec"))?,
-        partition_data_json: delete
-            .partition_data_json
-            .clone()
-            .ok_or_else(|| corrupt("rewrite delete has no typed partition tuple"))?,
-        equality_field_ids: Vec::new(),
-        row_position_lower_bound: None,
-        row_position_upper_bound: None,
-        data_sequence_number: delete
-            .sequence_number
-            .ok_or_else(|| corrupt("rewrite delete has no data sequence"))?,
-        content_offset: delete.content_offset,
-        content_size_in_bytes: delete.content_size_in_bytes,
-        referenced_data_file: delete.referenced_data_file.clone(),
-        decryption_data: None,
-    })
-}
-
 /// Project complete facts without a second manifest walk or path-based join.
 fn planned_data_file(
     read_file: IcebergReadFile,
@@ -1655,18 +1596,8 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
                     }
                     self.load_mv_target_relation_async(name).await?
                 }
-                K::TableExecute { procedure } => {
-                    let novarocks_spi::connector::read_stack::ConnectorReadTableExecuteProcedure::RewritePositionDeleteFiles(group)=procedure;
-                    group.content().validate_owner(
-                        &novarocks_spi::connector::ConnectorProviderBindingKey {
-                            instance_id: self.descriptor.instance_id.clone(),
-                            incarnation: self.incarnation,
-                        },
-                    )?;
-                    if system_relation_of(name.table_name()).is_some() {
-                        return Ok(None);
-                    }
-                    self.load_relation_async(name).await?
+                K::TableExecute { .. } => {
+                    return Err(unsupported("Iceberg table-execute reads are retired"));
                 }
                 _ => {
                     if system_relation_of(name.table_name()).is_some() {
@@ -1862,41 +1793,8 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
                 pinned_change_window_handle(name, physical.table.metadata(), *window)?
                     .map(crate::typed_read::IcebergRuntimeRelation::ChangeWindow)
             }
-            K::TableExecute { procedure } => {
-                let novarocks_spi::connector::read_stack::ConnectorReadTableExecuteProcedure::RewritePositionDeleteFiles(group)=procedure;
-
-                let metadata = physical.table.metadata();
-                let content = group
-                    .content()
-                    .value::<crate::distributed_rewrite::FrozenRewritePlanContent>(
-                        self.descriptor.instance_id.as_str(),
-                    )?
-                    .clone();
-                content.validate_identity(group.operation_id(), group.artifact_digest_hex())?;
-                content.group(group.group_digest_hex())?;
-                let snapshot_id =
-                    validate_rewrite_position_delete_artifact(name, metadata, &content)?;
-                let table_handle = pinned_table_handle(name, metadata, Some(snapshot_id))?;
-                let procedure_handle =
-                    IcebergTableExecuteProcedureHandle::RewritePositionDeleteFiles(
-                        IcebergRewritePositionDeleteFilesHandle::try_new(
-                            table_handle.clone(),
-                            IcebergRewriteArtifactContentId::try_new(
-                                group.operation_id(),
-                                group.artifact_digest_hex(),
-                            )?,
-                            group.group_digest_hex(),
-                        )?
-                        .with_content(content),
-                    );
-                Some(crate::typed_read::IcebergRuntimeRelation::TableExecute(
-                    IcebergTableExecuteHandle::try_new(IcebergTableExecuteHandleParams {
-                        schema_table_name: name.clone(),
-                        procedure_id: procedure_handle.procedure_id(),
-                        table_location: table_handle.table_location().to_string(),
-                        procedure_handle: Some(procedure_handle),
-                    })?,
-                ))
+            K::TableExecute { .. } => {
+                return Err(unsupported("Iceberg table-execute reads are retired"));
             }
             K::Metadata { .. } => {
                 let (base_table, relation) =
@@ -2118,26 +2016,6 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
                         )
                     })
                     .collect()
-            }
-            crate::typed_read::IcebergRuntimeRelation::TableExecute(handle) => {
-                let mut columns = Vec::new();
-                match handle.procedure_handle() {
-                    Some(IcebergTableExecuteProcedureHandle::RewritePositionDeleteFiles(_)) => {
-                        for (name, metadata) in REWRITE_POSITION_DELETE_OUTPUT_COLUMNS {
-                            columns.push((
-                                name.to_string(),
-                                rewrite_position_delete_pseudo_column(name, metadata)?,
-                                true,
-                            ));
-                        }
-                    }
-                    Some(IcebergTableExecuteProcedureHandle::Optimize(_)) | None => {
-                        return Err(unsupported(
-                            "an iceberg optimize procedure reads the data relation's own columns",
-                        ));
-                    }
-                }
-                columns
             }
             crate::typed_read::IcebergRuntimeRelation::Table(handle) => {
                 let schema = handle.parse_table_schema()?;
@@ -2389,96 +2267,11 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
     fn get_table_execute_plan(
         &self,
         _session: &ConnectorSession,
-        name: &SchemaTableName,
-        procedure: novarocks_spi::connector::read_stack::ConnectorReadTableExecuteProcedure,
+        _name: &SchemaTableName,
+        _procedure: novarocks_spi::connector::read_stack::ConnectorReadTableExecuteProcedure,
     ) -> Result<Option<Self::Table>, ConnectorError> {
-        let novarocks_spi::connector::read_stack::ConnectorReadTableExecuteProcedure::RewritePositionDeleteFiles(group) = procedure;
-        group
-            .content()
-            .validate_owner(&novarocks_spi::connector::ConnectorProviderBindingKey {
-                instance_id: self.descriptor.instance_id.clone(),
-                incarnation: self.incarnation,
-            })?;
-        // Reuse the existing frozen-artifact construction, but retain the
-        // resulting concrete handle instead of encoding it into a carrier.
-        if system_relation_of(name.table_name()).is_some() {
-            return Ok(None);
-        }
-        let Some(physical) = self.load_relation(name)? else {
-            return Ok(None);
-        };
-        let metadata = physical.table.metadata();
-        let content = group
-            .content()
-            .value::<crate::distributed_rewrite::FrozenRewritePlanContent>(
-                self.descriptor.instance_id.as_str(),
-            )?
-            .clone();
-        content.validate_identity(group.operation_id(), group.artifact_digest_hex())?;
-        content.group(group.group_digest_hex())?;
-        let snapshot_id = validate_rewrite_position_delete_artifact(name, metadata, &content)?;
-        let table_handle = pinned_table_handle(name, metadata, Some(snapshot_id))?;
-        let procedure_handle = IcebergTableExecuteProcedureHandle::RewritePositionDeleteFiles(
-            IcebergRewritePositionDeleteFilesHandle::try_new(
-                table_handle.clone(),
-                IcebergRewriteArtifactContentId::try_new(
-                    group.operation_id(),
-                    group.artifact_digest_hex(),
-                )?,
-                group.group_digest_hex(),
-            )?
-            .with_content(content),
-        );
-        Ok(Some(
-            crate::typed_read::IcebergRuntimeRelation::TableExecute(
-                IcebergTableExecuteHandle::try_new(IcebergTableExecuteHandleParams {
-                    schema_table_name: name.clone(),
-                    procedure_id: procedure_handle.procedure_id(),
-                    table_location: table_handle.table_location().to_string(),
-                    procedure_handle: Some(procedure_handle),
-                })?,
-            ),
-        ))
+        Err(unsupported("Iceberg table-execute reads are retired"))
     }
-}
-
-/// Check every identity fence the frozen rewrite artifact carries before the
-/// TableExecute relation can admit split dispatch or any writer side effect.
-fn validate_rewrite_position_delete_artifact(
-    name: &SchemaTableName,
-    metadata: &TableMetadata,
-    artifact: &crate::distributed_rewrite::IcebergFrozenRewriteArtifactV1,
-) -> Result<i64, ConnectorError> {
-    let snapshot_id = artifact.base_snapshot_id.ok_or_else(|| {
-        invalid(format!(
-            "iceberg rewrite-position artifact for {}.{} has no base snapshot",
-            name.schema_name(),
-            name.table_name()
-        ))
-    })?;
-    if artifact.operation_kind != REWRITE_POSITION_DELETES_KIND
-        || artifact.namespace != name.schema_name()
-        || artifact.table != name.table_name()
-        || artifact.target_ref != "main"
-        || metadata.uuid().to_string() != artifact.table_uuid
-        || metadata.current_snapshot_id() != Some(snapshot_id)
-        || metadata.current_schema_id() != artifact.schema_id
-        || metadata.default_partition_spec_id() != artifact.default_spec_id
-    {
-        return Err(invalid(format!(
-            "iceberg rewrite-position artifact does not match the frozen relation {}.{}",
-            name.schema_name(),
-            name.table_name()
-        )));
-    }
-    if metadata.snapshot_by_id(snapshot_id).is_none() {
-        return Err(invalid(format!(
-            "iceberg rewrite-position artifact base snapshot {snapshot_id} is unavailable for {}.{}",
-            name.schema_name(),
-            name.table_name()
-        )));
-    }
-    Ok(snapshot_id)
 }
 
 /// Preserve the original no-read case before starting a fresh observation.
@@ -2648,9 +2441,6 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadSplitManager
                 crate::typed_read::IcebergRuntimeRelation::SystemTable(reference) => {
                     self.system_relation_runtime_split_source(reference).await
                 }
-                crate::typed_read::IcebergRuntimeRelation::TableExecute(handle) => {
-                    self.table_execute_runtime_split_source(handle).await
-                }
                 crate::typed_read::IcebergRuntimeRelation::Table(handle) => {
                     let enumeration_handle = if columns.is_empty() {
                         handle.clone()
@@ -2706,7 +2496,7 @@ impl IcebergTypedBoundary {
     ) -> Result<crate::catalog_control::statistics::scoped_cpu::scoped_prepared_split::PreparedSplitEndpoint, ConnectorError>{
         let crate::catalog_control::statistics::scoped_cpu::scoped_snapshot::ScopedReadSnapshot {
             files,
-            retention_guard,
+            _retention_guard: retention_guard,
             ..
         } = snapshot;
         let files = match request.table.as_ref() {
@@ -3115,106 +2905,7 @@ impl IcebergTypedBoundary {
         })?;
         Ok(Box::new(IcebergRuntimeSplitSource::new(source)))
     }
-
-    async fn table_execute_runtime_split_source(
-        &self,
-        handle: &IcebergTableExecuteHandle,
-    ) -> Result<Box<dyn ProviderReadSplitSource<Self>>, ConnectorError> {
-        let rewrite = match handle.procedure_handle() {
-            Some(IcebergTableExecuteProcedureHandle::RewritePositionDeleteFiles(rewrite)) => {
-                rewrite
-            }
-            Some(IcebergTableExecuteProcedureHandle::Optimize(_)) | None => {
-                return Err(unsupported(
-                    "an iceberg optimize procedure reads data splits, not a table-execute relation",
-                ));
-            }
-        };
-        let table_handle = rewrite.table_handle();
-        let snapshot_id = table_handle.snapshot_id().ok_or_else(|| {
-            corrupt("an iceberg rewrite position delete relation carries no pinned snapshot")
-        })?;
-        let request_context = self.request_context.as_ref().ok_or_else(|| {
-            invalid("Iceberg rewrite planning requires the admitted request control")
-        })?;
-        let physical = self
-            .load_pinned_relation_async(table_handle.schema_table_name())
-            .await?;
-        let (data_file, selected) =
-            crate::distributed_rewrite::plan_rewrite_position_delete_splits_async(
-                &physical.table,
-                snapshot_id,
-                rewrite.content()?.as_ref(),
-                rewrite.group_digest_hex(),
-                request_context,
-            )
-            .await?;
-        let deletes = selected
-            .iter()
-            .map(rewrite_position_delete_file)
-            .collect::<Result<Vec<_>, _>>()?;
-        let split = IcebergRewritePositionDeleteFilesSplit::try_new(
-            IcebergRewritePositionDeleteFilesSplitParams {
-                data_file_path: data_file.path.clone(),
-                data_file_size: data_file.size,
-                partition_spec_id: data_file.partition_spec_id.ok_or_else(|| {
-                    corrupt(format!(
-                        "iceberg rewrite position delete data file {} records no partition spec",
-                        data_file.path
-                    ))
-                })?,
-                partition_data_json: data_file
-                    .partition_key
-                    .clone()
-                    .unwrap_or_else(|| UNPARTITIONED_REWRITE_PARTITION_JSON.to_string()),
-                selected_position_deletes: deletes,
-                split_weight: SplitWeight::STANDARD,
-            },
-        )?;
-        Ok(Box::new(OneRuntimeSplitSource::new(
-            crate::typed_read::IcebergReadSplit::RewritePositionDeleteFiles(split),
-        )))
-    }
 }
-
-struct OneRuntimeSplitSource {
-    split: Option<crate::typed_read::IcebergReadSplit>,
-    closed: bool,
-}
-
-impl OneRuntimeSplitSource {
-    const fn new(split: crate::typed_read::IcebergReadSplit) -> Self {
-        Self {
-            split: Some(split),
-            closed: false,
-        }
-    }
-}
-
-impl ProviderReadSplitSource<IcebergTypedBoundary> for OneRuntimeSplitSource {
-    fn next_batch(
-        &mut self,
-        _max_size: usize,
-        _dynamic_filter: &DynamicFilterSnapshot<IcebergColumnHandle>,
-    ) -> Result<ConnectorSplitBatch<crate::typed_read::IcebergReadSplit>, ConnectorError> {
-        if self.closed {
-            return Ok(ConnectorSplitBatch::finished());
-        }
-        let split = self.split.take().into_iter().collect();
-        Ok(ConnectorSplitBatch::new(split, true))
-    }
-
-    fn is_finished(&self) -> bool {
-        self.closed || self.split.is_none()
-    }
-
-    fn close(&mut self) -> Result<(), ConnectorError> {
-        self.closed = true;
-        self.split = None;
-        Ok(())
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Snapshot pinning and handle construction
 // ---------------------------------------------------------------------------
@@ -3430,15 +3121,6 @@ fn pinned_schema(
     }
 }
 
-/// Freeze one worker-visible DATA relation handle.
-fn pinned_table_handle(
-    name: &SchemaTableName,
-    metadata: &TableMetadata,
-    snapshot_id: Option<i64>,
-) -> Result<IcebergTableHandle, ConnectorError> {
-    pinned_table_handle_with_files(name, metadata, snapshot_id, None)
-}
-
 fn table_handle_for_version(
     name: &SchemaTableName,
     metadata: &TableMetadata,
@@ -3481,16 +3163,6 @@ pub(crate) fn projection_schema_for_pinned_snapshot(
             snapshot_schema
         },
     )
-}
-
-fn pinned_table_handle_with_files(
-    name: &SchemaTableName,
-    metadata: &TableMetadata,
-    snapshot_id: Option<i64>,
-    pinned_data_files: Option<IcebergPinnedDataFileSet>,
-) -> Result<IcebergTableHandle, ConnectorError> {
-    let schema = pinned_schema(metadata, snapshot_id)?;
-    pinned_table_handle_with_schema(name, metadata, snapshot_id, schema, pinned_data_files)
 }
 
 fn pinned_table_handle_with_schema(
@@ -3998,15 +3670,6 @@ fn pseudo_column_with_nullable(
         Type::Primitive(metadata.declared_type()),
         !nullable,
     ))
-}
-
-/// A `REWRITE_POSITION_DELETE_FILES` result retains the reserved metadata
-/// field IDs while exposing its procedure-specific output names on the wire.
-fn rewrite_position_delete_pseudo_column(
-    name: &str,
-    metadata: IcebergMetadataColumn,
-) -> Result<IcebergColumnHandle, ConnectorError> {
-    crate::typed_read::table_execute::rewrite_position_delete_pseudo_column(name, metadata)
 }
 
 // ---------------------------------------------------------------------------

@@ -48,7 +48,6 @@ const REQUEST_DOMAIN: &[u8] = b"novarocks.connector-distributed-rewrite.request.
 const PLAN_DOMAIN: &[u8] = b"novarocks.connector-distributed-rewrite.plan.v1\0";
 
 pub const REWRITE_DATA_FILES_KIND: &str = "rewrite-data-files";
-pub const REWRITE_POSITION_DELETES_KIND: &str = "rewrite-position-deletes";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConnectorDistributedRewriteOperation {
@@ -56,123 +55,38 @@ pub enum ConnectorDistributedRewriteOperation {
         table: ConnectorTableHandle,
         file_size_threshold_bytes: u64,
     },
-    RewriteDataFiles {
-        table: ConnectorTableHandle,
-        rewrite_all: bool,
-    },
-    RewritePositionDeletes {
-        table: ConnectorTableHandle,
-        rewrite_all: bool,
-        min_input_files: Option<u32>,
-    },
 }
 
-/// Which artifacts a distributed rewrite republishes, and the selection facts
-/// that decide which of them it selected.
-///
-/// This is the frozen operation stripped of its target, so it can travel with a
-/// write session that already names one. It exists because the two rewrites are
-/// not distinguishable downstream by anything else: both reach `begin_write`
-/// through the same neutral request, and a provider that read the writer input
-/// shape instead would let a caller turn a data rewrite into a delete rewrite by
-/// signing a different input.
-///
-/// The selection facts travel with the kind rather than being re-derived. The provider freezes groups once and the session consumes that selection.
+/// The cohort's provider-owned write family without its target identity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConnectorDistributedRewriteShape {
-    /// Republish the target's data files.
-    ///
-    /// `rewrite_all` is carried so the shape stays a faithful projection of the
-    /// frozen operation. Whether a provider narrows its selection by it is that
-    /// provider's decision; both sides read the same value, so they cannot
-    /// disagree about the group set either way.
-    DataFiles { rewrite_all: bool },
-    /// Repack the position-delete artifacts attached to the target's data
-    /// files. Both facts narrow the selection: `rewrite_all` waives the
-    /// threshold, and `min_input_files` sets how many attached artifacts make a
-    /// data file worth repacking.
-    PositionDeletes {
-        rewrite_all: bool,
-        min_input_files: Option<u32>,
-    },
+    DataFiles,
 }
 
 impl ConnectorDistributedRewriteOperation {
     pub const fn kind(&self) -> &'static str {
-        match self {
-            Self::RewriteDataFiles { .. } | Self::OptimizeDataFiles { .. } => {
-                REWRITE_DATA_FILES_KIND
-            }
-            Self::RewritePositionDeletes { .. } => REWRITE_POSITION_DELETES_KIND,
-        }
+        REWRITE_DATA_FILES_KIND
     }
 
-    /// What this operation rewrites, without its target.
     pub const fn shape(&self) -> ConnectorDistributedRewriteShape {
-        match self {
-            Self::OptimizeDataFiles { .. } => {
-                ConnectorDistributedRewriteShape::DataFiles { rewrite_all: false }
-            }
-            Self::RewriteDataFiles { rewrite_all, .. } => {
-                ConnectorDistributedRewriteShape::DataFiles {
-                    rewrite_all: *rewrite_all,
-                }
-            }
-            Self::RewritePositionDeletes {
-                rewrite_all,
-                min_input_files,
-                ..
-            } => ConnectorDistributedRewriteShape::PositionDeletes {
-                rewrite_all: *rewrite_all,
-                min_input_files: *min_input_files,
-            },
-        }
+        ConnectorDistributedRewriteShape::DataFiles
     }
 
     pub const fn table(&self) -> &ConnectorTableHandle {
-        match self {
-            Self::RewriteDataFiles { table, .. }
-            | Self::OptimizeDataFiles { table, .. }
-            | Self::RewritePositionDeletes { table, .. } => table,
-        }
-    }
-
-    pub fn validate(&self) -> Result<(), ConnectorError> {
-        if let Self::RewritePositionDeletes {
-            min_input_files: Some(value),
-            ..
-        } = self
-            && *value == 0
-        {
-            return Err(invalid(
-                "rewrite position deletes min_input_files must be positive",
-            ));
-        }
-        Ok(())
+        let Self::OptimizeDataFiles { table, .. } = self;
+        table
     }
 
     fn digest_into(&self, hash: &mut Sha256) {
         digest_bytes(hash, self.kind().as_bytes());
         digest_bytes(hash, self.table().owner().as_str().as_bytes());
         digest_bytes(hash, self.table().payload());
-        match self {
-            Self::RewriteDataFiles { rewrite_all, .. } => hash.update([u8::from(*rewrite_all)]),
-            Self::OptimizeDataFiles {
-                file_size_threshold_bytes,
-                ..
-            } => {
-                digest_bytes(hash, b"optimize");
-                hash.update(file_size_threshold_bytes.to_be_bytes());
-            }
-            Self::RewritePositionDeletes {
-                rewrite_all,
-                min_input_files,
-                ..
-            } => {
-                hash.update([u8::from(*rewrite_all), u8::from(min_input_files.is_some())]);
-                hash.update(min_input_files.unwrap_or_default().to_be_bytes());
-            }
-        }
+        let Self::OptimizeDataFiles {
+            file_size_threshold_bytes,
+            ..
+        } = self;
+        digest_bytes(hash, b"optimize");
+        hash.update(file_size_threshold_bytes.to_be_bytes());
     }
 }
 
@@ -192,7 +106,6 @@ impl ConnectorDistributedRewritePlanningRequest {
         operation: ConnectorDistributedRewriteOperation,
         context: ConnectorRequestContext,
     ) -> Result<Self, ConnectorError> {
-        operation.validate()?;
         if operation.table().owner() != &owner.instance_id {
             return Err(invalid(
                 "distributed rewrite table handle does not match exact owner",
@@ -220,7 +133,6 @@ impl ConnectorDistributedRewritePlanningRequest {
         self.request_digest
     }
     pub fn validate(&self) -> Result<(), ConnectorError> {
-        self.operation.validate()?;
         if self.operation.table().owner() != &self.owner.instance_id
             || request_digest(self.operation_id, &self.owner, &self.operation)
                 != self.request_digest
@@ -636,7 +548,6 @@ impl ConnectorDistributedRewritePlan {
     }
     pub fn validate(&self) -> Result<(), ConnectorError> {
         validate_payload(&self.provider_payload, "plan")?;
-        self.operation.validate()?;
         if self
             .cohorts
             .windows(2)
@@ -1087,7 +998,6 @@ fn request_digest(
 fn rewrite_operation_intent(kind: &str) -> ConnectorWriteIntent {
     match kind {
         REWRITE_DATA_FILES_KIND => ConnectorWriteIntent::Overwrite,
-        REWRITE_POSITION_DELETES_KIND => ConnectorWriteIntent::RowDelta,
         _ => unreachable!("validated distributed rewrite operation kind"),
     }
 }
@@ -1198,9 +1108,9 @@ mod tests {
         ConnectorDistributedRewritePlanningRequest::try_new(
             ConnectorWriteOperationId::new(),
             owner,
-            ConnectorDistributedRewriteOperation::RewriteDataFiles {
+            ConnectorDistributedRewriteOperation::OptimizeDataFiles {
                 table,
-                rewrite_all: true,
+                file_size_threshold_bytes: 1024,
             },
             ConnectorRequestContext::try_new(
                 Instant::now() + Duration::from_secs(1),
@@ -1214,16 +1124,12 @@ mod tests {
     }
 
     fn cohort_read() -> ConnectorRewriteCohortRead {
-        ConnectorRewriteCohortRead::DeleteArtifactGroup(
-            ConnectorFrozenRewriteGroup::try_new(
+        ConnectorRewriteCohortRead::PinnedFileSet(
+            ConnectorPinnedFileSet::try_new(
                 "db",
                 "orders",
-                ConnectorWriteOperationId::from_bytes([1; 16]),
-                [5; 32],
-                super::super::ConnectorProcessLocalPayload::new(
-                    request().owner().clone(),
-                    Arc::new(()),
-                ),
+                1,
+                ["s3://warehouse/orders/data.parquet"],
             )
             .unwrap(),
         )

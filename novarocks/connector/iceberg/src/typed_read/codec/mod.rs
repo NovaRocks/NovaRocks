@@ -374,8 +374,5 @@ const fn split_category(split: &IcebergReadSplit) -> ConnectorReadSplitCategory 
         IcebergReadSplit::ChangeWindow(_) => ConnectorReadSplitCategory::ChangeWindow,
         IcebergReadSplit::SystemManifest(_) => ConnectorReadSplitCategory::SystemManifest,
         IcebergReadSplit::SystemRelation(_) => ConnectorReadSplitCategory::SystemRelation,
-        IcebergReadSplit::RewritePositionDeleteFiles(_) => {
-            ConnectorReadSplitCategory::RewritePositionDeleteFiles
-        }
     }
 }

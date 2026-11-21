@@ -269,7 +269,9 @@ impl<'session, 'fragment> FragmentAdmission<'session, 'fragment> {
                     }
                 }
             } else {
-                check_position_rewrite(target, fragment, referenced)?;
+                return Err(invalid(
+                    "Iceberg received a position artifact without a fixed mutation",
+                ));
             }
         }
         if matches!(fragment.artifact(), IcebergCommitArtifact::DataFile(file)
@@ -459,31 +461,6 @@ fn checked_add(total: usize, additional: usize) -> Result<usize, ConnectorError>
 
 fn cohort_mismatch() -> ConnectorError {
     corrupt("Iceberg received object creation differs from its completed writer cohort")
-}
-
-fn check_position_rewrite(
-    target: &IcebergSealedWriteTarget,
-    fragment: &IcebergCommitFragment,
-    referenced: &str,
-) -> Result<(), ConnectorError> {
-    let rewrite = target.position_rewrite().ok_or_else(|| {
-        invalid("Iceberg received a position artifact without a fixed mutation or rewrite")
-    })?;
-    let IcebergCommitArtifact::DeletionVector(vector) = fragment.artifact() else {
-        return Err(invalid(
-            "Iceberg position rewrite must produce deletion vectors",
-        ));
-    };
-    if rewrite.path() != referenced
-        || rewrite.partition() != vector.partition()
-        || vector.cardinality() > rewrite.record_count()
-        || !vector.merged_old_references().is_empty()
-    {
-        return Err(corrupt(
-            "Iceberg position rewrite output differs from its selected data file",
-        ));
-    }
-    Ok(())
 }
 
 /// Validate the actual projected addition of an already admitted materialized

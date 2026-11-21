@@ -420,18 +420,6 @@ pub(crate) fn dv_artifact(
     )
 }
 
-pub(crate) fn position_rewrite_target(
-    data_file: &str,
-    record_count: u64,
-) -> super::domain::IcebergPositionRewriteTarget {
-    super::domain::IcebergPositionRewriteTarget::try_new(
-        data_file.to_owned(),
-        record_count,
-        sample_partition(),
-    )
-    .expect("selected rewrite data file")
-}
-
 pub(crate) fn binding(name: &str, seed: u8, data_type: DataType) -> ConnectorWriteFieldBinding {
     ConnectorWriteFieldBinding::new(
         ConnectorWriteFieldToken::from_bytes([seed; 32]),
@@ -542,10 +530,7 @@ pub(crate) fn data_branch_plan() -> IcebergDataBranchPlan {
     }
 }
 
-pub(crate) fn delete_branch_plan(
-    branch: IcebergWriteBranch,
-    position_rewrite: Option<super::domain::IcebergPositionRewriteTarget>,
-) -> IcebergDeleteBranchPlan {
+pub(crate) fn delete_branch_plan(branch: IcebergWriteBranch) -> IcebergDeleteBranchPlan {
     let file_format = match branch {
         IcebergWriteBranch::DeletionVector => IcebergFileFormat::Puffin,
         _ => IcebergFileFormat::Parquet,
@@ -553,7 +538,6 @@ pub(crate) fn delete_branch_plan(
     IcebergDeleteBranchPlan {
         branch,
         output: IcebergWriterOutput::for_test(file_format, parquet::basic::Compression::SNAPPY),
-        position_rewrite,
         input: delete_input_shape(branch),
     }
 }

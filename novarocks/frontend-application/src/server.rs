@@ -441,7 +441,6 @@ async fn build_frontend_role_products(
         Arc::clone(&mv_storage_observation),
         Arc::clone(&mv_readiness),
         Arc::clone(&maintenance_service),
-        Handle::current(),
         host.constant_policy(),
         host.static_plan_carrier(),
         host.required_constant_interpreter().sealed_functions(),

@@ -27,8 +27,8 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use novarocks_spi::connector::read_stack::{
-    Bound, ConnectorSplit, ConnectorTableExecuteHandle, ConnectorTableHandle, ConnectorValue,
-    ConnectorValueType, Domain, Range, SchemaTableName, SplitWeight, TupleDomain, ValueSet,
+    Bound, ConnectorSplit, ConnectorTableHandle, ConnectorValue, ConnectorValueType, Domain, Range,
+    SchemaTableName, SplitWeight, TupleDomain, ValueSet,
 };
 use novarocks_spi::connector::{
     ConnectorCodecError, ConnectorCodecErrorKind, ConnectorDecodeContext, ConnectorFieldPath,
@@ -43,16 +43,13 @@ use crate::typed_read::{
     IcebergColumnHandle, IcebergColumnHandleParams, IcebergDeleteFile, IcebergDeleteFileContent,
     IcebergDeleteFileParams, IcebergDeletedDataFileRows, IcebergFileFormat,
     IcebergInsertTableHandle, IcebergInsertTableHandleParams, IcebergMergeTableHandle,
-    IcebergOptimizeHandle, IcebergProcedureId, IcebergReadSplit, IcebergRewriteArtifactContentId,
-    IcebergRewritePositionDeleteFilesHandle, IcebergRewritePositionDeleteFilesSplit,
-    IcebergRewritePositionDeleteFilesSplitParams, IcebergRuntimeRelation, IcebergSplit,
-    IcebergSplitParams, IcebergSystemTableReference, IcebergSystemTableReferenceParams,
-    IcebergSystemTableType, IcebergTableExecuteHandle, IcebergTableExecuteHandleParams,
-    IcebergTableExecuteProcedureHandle, IcebergTableHandle, IcebergTableHandleParams,
-    IcebergVisibilityDifferenceRows, ParquetFileDecryptionData, SystemManifestSplit,
-    SystemManifestSplitParams, SystemRelationSplit, TableChangesChangeType,
-    TableChangesFunctionHandle, TableChangesFunctionHandleParams, TableChangesSplit,
-    TableChangesSplitParams, TrinoManifestContent, TrinoManifestFile, TrinoManifestFileParams,
+    IcebergReadSplit, IcebergRuntimeRelation, IcebergSplit, IcebergSplitParams,
+    IcebergSystemTableReference, IcebergSystemTableReferenceParams, IcebergSystemTableType,
+    IcebergTableHandle, IcebergTableHandleParams, IcebergVisibilityDifferenceRows,
+    ParquetFileDecryptionData, SystemManifestSplit, SystemManifestSplitParams, SystemRelationSplit,
+    TableChangesChangeType, TableChangesFunctionHandle, TableChangesFunctionHandleParams,
+    TableChangesSplit, TableChangesSplitParams, TrinoManifestContent, TrinoManifestFile,
+    TrinoManifestFileParams,
 };
 
 use super::dto;
@@ -305,10 +302,6 @@ enum Schema {
     TableFunction,
     ChangeWindowHandle,
     SystemTable,
-    Optimize,
-    Artifact,
-    RewriteHandle,
-    TableExecute,
     Insert,
     Merge,
     ReadTable,
@@ -324,7 +317,6 @@ enum Schema {
     Manifest,
     ManifestSplit,
     RelationSplit,
-    RewriteSplit,
     ReadSplit,
 }
 
@@ -491,29 +483,6 @@ fn field_rule(schema: Schema, field: u32) -> Option<FieldRule> {
             3 | 4 => singular(Scalar),
             _ => return None,
         },
-        Optimize => match field {
-            1 => singular(Message(Table)),
-            2 => singular(Varint),
-            _ => return None,
-        },
-        Artifact => match field {
-            1 | 2 => singular(Scalar),
-            _ => return None,
-        },
-        RewriteHandle => match field {
-            1 => singular(Message(Table)),
-            2 => singular(Message(Artifact)),
-            3 => singular(Scalar),
-            _ => return None,
-        },
-        TableExecute => match field {
-            1 => singular(Message(Name)),
-            2 => singular(Varint),
-            3 => singular(Scalar),
-            10 => oneof(Message(Optimize)),
-            11 => oneof(Message(RewriteHandle)),
-            _ => return None,
-        },
         Insert => match field {
             1 => singular(Message(Name)),
             2 | 3 => singular(Scalar),
@@ -531,7 +500,6 @@ fn field_rule(schema: Schema, field: u32) -> Option<FieldRule> {
             11 => oneof(Message(TableFunction)),
             12 => oneof(Message(ChangeWindowHandle)),
             13 => oneof(Message(SystemTable)),
-            14 => oneof(Message(TableExecute)),
             15 => oneof(Message(Merge)),
             _ => return None,
         },
@@ -603,19 +571,12 @@ fn field_rule(schema: Schema, field: u32) -> Option<FieldRule> {
             1 => singular(Message(SystemTable)),
             _ => return None,
         },
-        RewriteSplit => match field {
-            1 | 4 => singular(Scalar),
-            2 | 3 => singular(Varint),
-            5 => repeated(Message(Delete)),
-            _ => return None,
-        },
         ReadSplit => match field {
             10 => oneof(Message(DataSplit)),
             11 => oneof(Message(TableChangesSplit)),
             12 => oneof(Message(ChangeSplit)),
             13 => oneof(Message(ManifestSplit)),
             15 => oneof(Message(RelationSplit)),
-            14 => oneof(Message(RewriteSplit)),
             _ => return None,
         },
     };
@@ -1991,197 +1952,6 @@ fn decode_system_table(
     finish_decode(result, context)
 }
 
-fn encode_procedure(value: IcebergProcedureId) -> dto::IcebergProcedureId {
-    match value {
-        IcebergProcedureId::Optimize => dto::IcebergProcedureId::Optimize,
-        IcebergProcedureId::OptimizeManifests => dto::IcebergProcedureId::OptimizeManifests,
-        IcebergProcedureId::DropExtendedStats => dto::IcebergProcedureId::DropExtendedStats,
-        IcebergProcedureId::RollbackToSnapshot => dto::IcebergProcedureId::RollbackToSnapshot,
-        IcebergProcedureId::ExpireSnapshots => dto::IcebergProcedureId::ExpireSnapshots,
-        IcebergProcedureId::RemoveOrphanFiles => dto::IcebergProcedureId::RemoveOrphanFiles,
-        IcebergProcedureId::AddFiles => dto::IcebergProcedureId::AddFiles,
-        IcebergProcedureId::AddFilesFromTable => dto::IcebergProcedureId::AddFilesFromTable,
-        IcebergProcedureId::RewritePositionDeleteFiles => {
-            dto::IcebergProcedureId::RewritePositionDeleteFiles
-        }
-    }
-}
-
-fn decode_procedure(
-    raw: i32,
-    context: &mut ConnectorDecodeContext<'_>,
-) -> Result<IcebergProcedureId, ConnectorCodecError> {
-    // Existing serde/domain/library operations remain opaque inside this boundary.
-    context.flush_compile_control()?;
-    let result = match dto::IcebergProcedureId::try_from(raw) {
-        Ok(dto::IcebergProcedureId::Optimize) => Ok(IcebergProcedureId::Optimize),
-        Ok(dto::IcebergProcedureId::OptimizeManifests) => Ok(IcebergProcedureId::OptimizeManifests),
-        Ok(dto::IcebergProcedureId::DropExtendedStats) => Ok(IcebergProcedureId::DropExtendedStats),
-        Ok(dto::IcebergProcedureId::RollbackToSnapshot) => {
-            Ok(IcebergProcedureId::RollbackToSnapshot)
-        }
-        Ok(dto::IcebergProcedureId::ExpireSnapshots) => Ok(IcebergProcedureId::ExpireSnapshots),
-        Ok(dto::IcebergProcedureId::RemoveOrphanFiles) => Ok(IcebergProcedureId::RemoveOrphanFiles),
-        Ok(dto::IcebergProcedureId::AddFiles) => Ok(IcebergProcedureId::AddFiles),
-        Ok(dto::IcebergProcedureId::AddFilesFromTable) => Ok(IcebergProcedureId::AddFilesFromTable),
-        Ok(dto::IcebergProcedureId::RewritePositionDeleteFiles) => {
-            Ok(IcebergProcedureId::RewritePositionDeleteFiles)
-        }
-        Ok(dto::IcebergProcedureId::Unspecified) | Err(_) => Err(codec_error(
-            "table_execute.procedure_id",
-            ConnectorCodecErrorKind::InvalidEnum,
-            "Iceberg procedure must be known",
-        )),
-    };
-    context.observe_compile_step()?;
-    finish_decode(result, context)
-}
-
-fn encode_table_execute(value: &IcebergTableExecuteHandle) -> dto::IcebergTableExecuteHandle {
-    let procedure_handle = value.procedure_handle().map(|handle| match handle {
-        IcebergTableExecuteProcedureHandle::Optimize(handle) => {
-            dto::iceberg_table_execute_handle::ProcedureHandle::Optimize(
-                dto::IcebergOptimizeHandle {
-                    table_handle: Some(encode_table(handle.table_handle())),
-                    min_file_size_bytes: handle.min_file_size_bytes(),
-                },
-            )
-        }
-        IcebergTableExecuteProcedureHandle::RewritePositionDeleteFiles(handle) => {
-            dto::iceberg_table_execute_handle::ProcedureHandle::RewritePositionDeleteFiles(
-                dto::IcebergRewritePositionDeleteFilesHandle {
-                    table_handle: Some(encode_table(handle.table_handle())),
-                    artifact: Some(dto::IcebergRewriteArtifactContentId {
-                        operation_id: handle.artifact().operation_id().to_bytes().to_vec(),
-                        artifact_digest_hex: handle.artifact().artifact_digest_hex().to_string(),
-                    }),
-                    group_digest_hex: handle.group_digest_hex().to_string(),
-                },
-            )
-        }
-    });
-    dto::IcebergTableExecuteHandle {
-        schema_table_name: Some(encode_schema_name(value.schema_table_name())),
-        procedure_id: encode_procedure(value.procedure_id()) as i32,
-        table_location: value.table_location().to_string(),
-        procedure_handle,
-    }
-}
-
-fn decode_table_execute(
-    raw: &dto::IcebergTableExecuteHandle,
-    context: &mut ConnectorDecodeContext<'_>,
-) -> Result<IcebergTableExecuteHandle, ConnectorCodecError> {
-    // Existing serde/domain/library operations remain opaque inside this boundary.
-    context.flush_compile_control()?;
-    let result = (|| {
-        let procedure_handle = match raw.procedure_handle.as_ref() {
-            None => None,
-            Some(dto::iceberg_table_execute_handle::ProcedureHandle::Optimize(handle)) => {
-                Some(IcebergTableExecuteProcedureHandle::Optimize(
-                    {
-                        let opaque_arguments = (
-                            decode_table(
-                                handle.table_handle.as_ref().ok_or_else(|| {
-                                    codec_error(
-                                        "table_execute.optimize.table_handle",
-                                        ConnectorCodecErrorKind::MissingField,
-                                        "Iceberg optimize requires a table handle",
-                                    )
-                                })?,
-                                context,
-                            )?,
-                            handle.min_file_size_bytes,
-                        );
-                        observe_opaque(context, || {
-                            IcebergOptimizeHandle::try_new(opaque_arguments.0, opaque_arguments.1)
-                        })?
-                    }
-                    .map_err(|error| domain_error("table_execute.optimize", error))?,
-                ))
-            }
-            Some(
-                dto::iceberg_table_execute_handle::ProcedureHandle::RewritePositionDeleteFiles(
-                    handle,
-                ),
-            ) => {
-                let artifact = handle.artifact.as_ref().ok_or_else(|| {
-                    codec_error(
-                        "table_execute.rewrite.artifact",
-                        ConnectorCodecErrorKind::MissingField,
-                        "Iceberg rewrite requires its content identity",
-                    )
-                })?;
-                Some(
-                    IcebergTableExecuteProcedureHandle::RewritePositionDeleteFiles(
-                        {
-                            let opaque_arguments = (
-                                decode_table(
-                                    handle.table_handle.as_ref().ok_or_else(|| {
-                                        codec_error(
-                                            "table_execute.rewrite.table_handle",
-                                            ConnectorCodecErrorKind::MissingField,
-                                            "Iceberg rewrite requires a table handle",
-                                        )
-                                    })?,
-                                    context,
-                                )?,
-                                {
-                                    let opaque_arguments = (
-                                        novarocks_spi::connector::ConnectorWriteOperationId::from_bytes(artifact.operation_id.as_slice().try_into().map_err(|_| codec_error("table_execute.rewrite.operation_id", ConnectorCodecErrorKind::InvalidValue, "Iceberg rewrite operation identity must be 16 bytes"))?),
-                                        &artifact.artifact_digest_hex,
-                                    );
-                                    observe_opaque(context, || {
-                                        IcebergRewriteArtifactContentId::try_new(
-                                            opaque_arguments.0,
-                                            opaque_arguments.1,
-                                        )
-                                    })?
-                                }
-                                .map_err(|error| {
-                                    domain_error("table_execute.rewrite.artifact", error)
-                                })?,
-                                &handle.group_digest_hex,
-                            );
-                            observe_opaque(context, || {
-                                IcebergRewritePositionDeleteFilesHandle::try_new(
-                                    opaque_arguments.0,
-                                    opaque_arguments.1,
-                                    opaque_arguments.2,
-                                )
-                            })?
-                        }
-                        .map_err(|error| domain_error("table_execute.rewrite", error))?,
-                    ),
-                )
-            }
-        };
-        {
-            let opaque_arguments = (IcebergTableExecuteHandleParams {
-                schema_table_name: decode_schema_name(
-                    raw.schema_table_name.as_ref().ok_or_else(|| {
-                        codec_error(
-                            "table_execute.schema_table_name",
-                            ConnectorCodecErrorKind::MissingField,
-                            "Iceberg table execute requires a schema table name",
-                        )
-                    })?,
-                    context,
-                )?,
-                procedure_id: decode_procedure(raw.procedure_id, context)?,
-                table_location: copy_string(&raw.table_location, context)?,
-                procedure_handle,
-            },);
-            observe_opaque(context, || {
-                IcebergTableExecuteHandle::try_new(opaque_arguments.0)
-            })?
-        }
-        .map_err(|error| domain_error("table_execute", error))
-    })();
-    context.observe_compile_step()?;
-    finish_decode(result, context)
-}
-
 fn encode_insert_handle(value: &IcebergInsertTableHandle) -> dto::IcebergInsertTableHandle {
     dto::IcebergInsertTableHandle {
         schema_table_name: Some(encode_schema_name(value.schema_table_name())),
@@ -2287,9 +2057,6 @@ fn encode_relation(value: &IcebergRuntimeRelation) -> dto::IcebergReadTablePaylo
         IcebergRuntimeRelation::SystemTable(value) => {
             dto::iceberg_read_table_payload::Relation::SystemTable(encode_system_table(value))
         }
-        IcebergRuntimeRelation::TableExecute(value) => {
-            dto::iceberg_read_table_payload::Relation::TableExecute(encode_table_execute(value))
-        }
         IcebergRuntimeRelation::MergeTable(value) => {
             dto::iceberg_read_table_payload::Relation::MergeTable(encode_merge(value))
         }
@@ -2384,9 +2151,6 @@ fn decode_relation(
         ),
         dto::iceberg_read_table_payload::Relation::SystemTable(value) => Ok(
             IcebergRuntimeRelation::SystemTable(decode_system_table(value, context)?),
-        ),
-        dto::iceberg_read_table_payload::Relation::TableExecute(value) => Ok(
-            IcebergRuntimeRelation::TableExecute(decode_table_execute(value, context)?),
         ),
         dto::iceberg_read_table_payload::Relation::MergeTable(value) => Ok(
             IcebergRuntimeRelation::MergeTable(decode_merge(value, context)?),
@@ -2957,53 +2721,6 @@ fn decode_files_split(
     finish_decode(result, context)
 }
 
-fn encode_rewrite_split(
-    value: &IcebergRewritePositionDeleteFilesSplit,
-) -> dto::IcebergRewritePositionDeleteFilesSplit {
-    dto::IcebergRewritePositionDeleteFilesSplit {
-        data_file_path: value.data_file_path().to_string(),
-        data_file_size: value.data_file_size(),
-        partition_spec_id: value.partition_spec_id(),
-        partition_data_json: value.partition_data_json().to_string(),
-        selected_position_deletes: value
-            .selected_position_deletes()
-            .iter()
-            .map(encode_delete)
-            .collect(),
-    }
-}
-
-fn decode_rewrite_split(
-    raw: &dto::IcebergRewritePositionDeleteFilesSplit,
-    split_weight: SplitWeight,
-    context: &mut ConnectorDecodeContext<'_>,
-) -> Result<IcebergRewritePositionDeleteFilesSplit, ConnectorCodecError> {
-    // Existing serde/domain/library operations remain opaque inside this boundary.
-    context.flush_compile_control()?;
-    let result = (|| {
-        {
-            let opaque_arguments = (IcebergRewritePositionDeleteFilesSplitParams {
-                data_file_path: copy_string(&raw.data_file_path, context)?,
-                data_file_size: raw.data_file_size,
-                partition_spec_id: raw.partition_spec_id,
-                partition_data_json: copy_string(&raw.partition_data_json, context)?,
-                selected_position_deletes: convert_slice(
-                    &raw.selected_position_deletes,
-                    context,
-                    decode_delete,
-                )?,
-                split_weight,
-            },);
-            observe_opaque(context, || {
-                IcebergRewritePositionDeleteFilesSplit::try_new(opaque_arguments.0)
-            })?
-        }
-        .map_err(|error| domain_error("rewrite_position_delete_files_split", error))
-    })();
-    context.observe_compile_step()?;
-    finish_decode(result, context)
-}
-
 fn encode_split(
     value: &IcebergReadSplit,
 ) -> Result<dto::IcebergReadSplitPayload, ConnectorCodecError> {
@@ -3019,9 +2736,6 @@ fn encode_split(
             Split::SystemRelation(dto::SystemRelationSplit {
                 reference: Some(encode_system_table(value.reference())),
             })
-        }
-        IcebergReadSplit::RewritePositionDeleteFiles(value) => {
-            Split::RewritePositionDeleteFiles(encode_rewrite_split(value))
         }
     };
     Ok(dto::IcebergReadSplitPayload { split: Some(split) })
@@ -3104,11 +2818,6 @@ fn decode_split(
                 Ok(IcebergReadSplit::SystemRelation(
                     SystemRelationSplit::try_new(reference)
                         .map_err(|error| domain_error("system_relation_split", error))?,
-                ))
-            }
-            Split::RewritePositionDeleteFiles(value) => {
-                Ok(IcebergReadSplit::RewritePositionDeleteFiles(
-                    decode_rewrite_split(value, facts.split_weight(), context)?,
                 ))
             }
         }
@@ -4232,13 +3941,6 @@ mod compile_control_tests {
             snapshot_id: Some(11),
         })
         .unwrap();
-        let execute = IcebergTableExecuteHandle::try_new(IcebergTableExecuteHandleParams {
-            schema_table_name: name.clone(),
-            procedure_id: IcebergProcedureId::ExpireSnapshots,
-            table_location: location.into(),
-            procedure_handle: None,
-        })
-        .unwrap();
         let insert = IcebergInsertTableHandle::try_new(IcebergInsertTableHandleParams {
             schema_table_name: name,
             table_schema_json: schema_json,
@@ -4253,7 +3955,6 @@ mod compile_control_tests {
             IcebergRuntimeRelation::TableFunction(table_function),
             IcebergRuntimeRelation::ChangeWindow(window),
             IcebergRuntimeRelation::SystemTable(system),
-            IcebergRuntimeRelation::TableExecute(execute),
             IcebergRuntimeRelation::MergeTable(merge),
         ]
     }

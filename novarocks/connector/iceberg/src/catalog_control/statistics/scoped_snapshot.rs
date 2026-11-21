@@ -48,9 +48,8 @@ pub(crate) enum SnapshotReadKind {
 }
 pub(crate) struct ScopedReadSnapshot {
     pub(crate) files: Vec<crate::read_model::IcebergReadFile>,
-    pub(crate) all_deletes: Vec<Arc<crate::delete_semantics::DeleteFact>>,
     pub(crate) referenced_specs: Option<ReferencedSpecInventory>,
-    pub(crate) retention_guard: ConnectorPayloadRetentionGuard,
+    pub(crate) _retention_guard: ConnectorPayloadRetentionGuard,
 }
 /// The original complete discovery records one i32 slot per distinct manifest,
 /// then compacts unique spec IDs in place. Capacity is retained until actual

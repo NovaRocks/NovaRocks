@@ -23,28 +23,17 @@
 use std::collections::BTreeSet;
 
 use crate::commit::model::EntryIdentity;
-use crate::iceberg::spec::FormatVersion;
 use async_trait::async_trait;
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SelectedRewriteFiles {
-    pub(crate) kind: SelectedRewriteKind,
     pub(crate) data_paths: BTreeSet<EntryIdentity>,
     pub(crate) delete_paths: BTreeSet<EntryIdentity>,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) enum SelectedRewriteKind {
-    #[default]
-    Data,
-    PositionDeletes,
-}
-
 impl SelectedRewriteFiles {
     pub(crate) fn validate(&self) -> Result<(), String> {
-        if (self.kind == SelectedRewriteKind::Data && self.data_paths.is_empty())
-            || (self.kind == SelectedRewriteKind::PositionDeletes && self.delete_paths.is_empty())
-        {
+        if self.data_paths.is_empty() {
             return Err("selected rewrite file set is empty".to_string());
         }
         if self.data_paths.iter().any(|path| path.validate().is_err())
@@ -90,69 +79,12 @@ impl super::staging::Preparer for SelectedRewritePreparer {
                 "Selected rewrite frozen logical set is no longer live at the target ref",
             ));
         }
-        let data_rewrite = self.files.kind == SelectedRewriteKind::Data;
-        let removed = if data_rewrite {
-            self.files
-                .data_paths
-                .union(&self.files.delete_paths)
-                .cloned()
-                .collect()
-        } else {
-            if view.metadata().format_version() != FormatVersion::V3 {
-                return Err(selected_invalid(
-                    "Selected position-delete rewrite requires a V3 table",
-                ));
-            }
-            let expected_data = self
-                .files
-                .data_paths
-                .iter()
-                .map(|entry| entry.path().to_owned())
-                .collect::<BTreeSet<_>>();
-            let mut output_identities = BTreeSet::new();
-            let mut output_data = BTreeSet::new();
-            for added in &intent.changes().added {
-                let identity = EntryIdentity::try_from(added.file())?;
-                let EntryIdentity::DeletionVector {
-                    referenced_data_file,
-                    ..
-                } = &identity
-                else {
-                    return Err(selected_invalid(
-                        "Selected delete rewrite output is not a deletion vector",
-                    ));
-                };
-                if !output_identities.insert(identity.clone())
-                    || !output_data.insert(referenced_data_file.clone())
-                {
-                    return Err(selected_invalid(
-                        "Selected delete rewrite has duplicate logical output or referenced data ownership",
-                    ));
-                }
-            }
-            if output_data != expected_data || output_data.is_empty() {
-                return Err(selected_invalid(
-                    "Selected delete rewrite outputs do not exactly cover frozen data groups",
-                ));
-            }
-            let owned_live = live_deletes
-                .iter()
-                .filter(|identity| match identity {
-                    EntryIdentity::DeletionVector {
-                        referenced_data_file,
-                        ..
-                    } => expected_data.contains(referenced_data_file),
-                    _ => false,
-                })
-                .cloned()
-                .collect::<BTreeSet<_>>();
-            if owned_live != self.files.delete_paths {
-                return Err(selected_invalid(
-                    "Selected delete rewrite does not own the exact live DV entries of its data groups",
-                ));
-            }
-            self.files.delete_paths.clone()
-        };
+        let removed = self
+            .files
+            .data_paths
+            .union(&self.files.delete_paths)
+            .cloned()
+            .collect();
         let intent_removed = intent
             .changes()
             .removed
@@ -169,7 +101,6 @@ impl super::staging::Preparer for SelectedRewritePreparer {
             intent,
             (sources.as_ref(), &live),
             &removed,
-            data_rewrite,
         )
         .await
     }
@@ -638,186 +569,6 @@ mod preparer_tests {
     }
 
     #[tokio::test]
-    async fn selected_delete_rewrite_replaces_one_blob_and_retains_other_shared_puffin_blob() {
-        let writer = Writer::new();
-        let metadata = fixture(&writer, true).await;
-        let original = live(&writer, &metadata, 10).await;
-        let old=original.keys().find(|id|matches!(id,EntryIdentity::DeletionVector{referenced_data_file,..} if referenced_data_file=="file:///source-a.parquet")).unwrap().clone();
-        let mut dv = super::super::puffin_dv::DeletionVector::new();
-        dv.insert(1).unwrap();
-        let blob = super::super::puffin_dv::write_single_deletion_vector_puffin_allocated(
-            &writer,
-            "file:///source-a.parquet",
-            &dv,
-        )
-        .await
-        .unwrap();
-        let replacement = DataFileBuilder::default()
-            .content(DataContentType::PositionDeletes)
-            .file_path(blob.path)
-            .file_format(DataFileFormat::Puffin)
-            .record_count(blob.cardinality)
-            .file_size_in_bytes(blob.file_size_in_bytes)
-            .partition_spec_id(0)
-            .content_offset(Some(blob.content_offset))
-            .content_size_in_bytes(Some(blob.content_size_in_bytes))
-            .referenced_data_file(Some(blob.referenced_data_file))
-            .build()
-            .unwrap();
-        let intent = intent(
-            &writer,
-            &metadata,
-            vec![AddedContent::rewritten_data(replacement, 0, 1).unwrap()],
-            vec![original[&old].frozen.clone()],
-            RequestShape::SnapshotProducing,
-        );
-        let files = SelectedRewriteFiles {
-            kind: SelectedRewriteKind::PositionDeletes,
-            data_paths: BTreeSet::from([EntryIdentity::DataFile {
-                path: "file:///source-a.parquet".into(),
-            }]),
-            delete_paths: BTreeSet::from([old.clone()]),
-        };
-        let mut staging = StagingEngine::begin(base(metadata.clone()), &intent, &writer).unwrap();
-        staging
-            .stage(&SelectedRewritePreparer { files })
-            .await
-            .unwrap();
-        let snapshot = staging.metadata().snapshot_for_ref("dev").unwrap();
-        assert_eq!(snapshot.added_rows_count(), Some(0));
-        let before_list = crate::manifest::load_manifest_list(
-            metadata.snapshot_by_id(10).unwrap(),
-            writer.file_io(),
-            &metadata,
-        )
-        .await
-        .unwrap();
-        let after_list =
-            crate::manifest::load_manifest_list(snapshot, writer.file_io(), staging.metadata())
-                .await
-                .unwrap();
-        let retained_data = before_list
-            .entries()
-            .iter()
-            .find(|file| file.content == ManifestContentType::Data)
-            .unwrap();
-        assert!(after_list.entries().contains(retained_data));
-        let output = live(&writer, staging.metadata(), snapshot.snapshot_id()).await;
-        assert_eq!(output.len(), 4);
-        assert!(!output.contains_key(&old));
-        let retained=original.keys().find(|id|matches!(id,EntryIdentity::DeletionVector{referenced_data_file,..} if referenced_data_file=="file:///source-b.parquet")).unwrap();
-        assert_eq!(output[retained].frozen, original[retained].frozen);
-        assert!(
-            writer
-                .io
-                .new_input(old.path())
-                .unwrap()
-                .exists()
-                .await
-                .unwrap()
-        );
-        assert_eq!(
-            snapshot.summary().additional_properties["removed-files-size"],
-            match old {
-                EntryIdentity::DeletionVector { length, .. } => length.to_string(),
-                _ => unreachable!(),
-            }
-        );
-    }
-
-    #[tokio::test]
-    async fn selected_delete_rewrite_accepts_two_replacement_entries_in_one_puffin() {
-        let writer = Writer::new();
-        let metadata = fixture(&writer, true).await;
-        let original = live(&writer, &metadata, 10).await;
-        let mut dv = super::super::puffin_dv::DeletionVector::new();
-        dv.insert(1).unwrap();
-        let inputs = ["file:///source-a.parquet", "file:///source-b.parquet"].map(|path| {
-            super::super::puffin_dv::DeletionVectorBlobInput {
-                referenced_data_file: path.into(),
-                deletion_vector: dv.clone(),
-            }
-        });
-        let blobs =
-            super::super::puffin_dv::write_multi_deletion_vector_puffin_allocated(&writer, &inputs)
-                .await
-                .unwrap();
-        assert_eq!(blobs[0].path, blobs[1].path);
-        let added = blobs
-            .into_iter()
-            .map(|blob| {
-                AddedContent::rewritten_data(
-                    DataFileBuilder::default()
-                        .content(DataContentType::PositionDeletes)
-                        .file_path(blob.path)
-                        .file_format(DataFileFormat::Puffin)
-                        .record_count(blob.cardinality)
-                        .file_size_in_bytes(blob.file_size_in_bytes)
-                        .partition_spec_id(0)
-                        .content_offset(Some(blob.content_offset))
-                        .content_size_in_bytes(Some(blob.content_size_in_bytes))
-                        .referenced_data_file(Some(blob.referenced_data_file))
-                        .build()
-                        .unwrap(),
-                    0,
-                    1,
-                )
-                .unwrap()
-            })
-            .collect();
-        let delete_paths = original
-            .keys()
-            .filter(|id| matches!(id, EntryIdentity::DeletionVector { .. }))
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        let intent = intent(
-            &writer,
-            &metadata,
-            added,
-            delete_paths
-                .iter()
-                .map(|id| original[id].frozen.clone())
-                .collect(),
-            RequestShape::SnapshotProducing,
-        );
-        let mut staging = StagingEngine::begin(base(metadata), &intent, &writer).unwrap();
-        let files = SelectedRewriteFiles {
-            kind: SelectedRewriteKind::PositionDeletes,
-            data_paths: original
-                .keys()
-                .filter(|id| matches!(id, EntryIdentity::DataFile { .. }))
-                .cloned()
-                .collect(),
-            delete_paths: delete_paths.clone(),
-        };
-        staging
-            .stage(&SelectedRewritePreparer { files })
-            .await
-            .unwrap();
-        let output = live(
-            &writer,
-            staging.metadata(),
-            staging
-                .metadata()
-                .snapshot_for_ref("dev")
-                .unwrap()
-                .snapshot_id(),
-        )
-        .await;
-        let dvs = output
-            .iter()
-            .filter(|(id, _)| matches!(id, EntryIdentity::DeletionVector { .. }))
-            .collect::<Vec<_>>();
-        assert_eq!(dvs.len(), 2);
-        assert_eq!(dvs[0].0.path(), dvs[1].0.path());
-        for (id, entry) in dvs {
-            assert!(!delete_paths.contains(id));
-            assert_eq!(entry.frozen.facts().data_sequence, Some(1));
-            assert_eq!(entry.frozen.facts().file_sequence, Some(3));
-        }
-    }
-
-    #[tokio::test]
     async fn selected_data_rewrite_replaces_only_owned_files_and_carries_parent_totals() {
         let writer = Writer::new();
         let metadata = fixture(&writer, true).await;
@@ -866,7 +617,6 @@ mod preparer_tests {
         staging
             .stage(&SelectedRewritePreparer {
                 files: SelectedRewriteFiles {
-                    kind: SelectedRewriteKind::Data,
                     data_paths: BTreeSet::from([selected_data.clone()]),
                     delete_paths: selected_deletes.clone(),
                 },

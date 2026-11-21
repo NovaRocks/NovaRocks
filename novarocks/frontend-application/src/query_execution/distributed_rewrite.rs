@@ -744,9 +744,9 @@ mod tests {
         let request = ConnectorDistributedRewritePlanningRequest::try_new(
             operation_id,
             key.clone(),
-            novarocks_spi::connector::ConnectorDistributedRewriteOperation::RewriteDataFiles {
+            novarocks_spi::connector::ConnectorDistributedRewriteOperation::OptimizeDataFiles {
                 table: table.clone(),
-                rewrite_all: true,
+                file_size_threshold_bytes: 1024,
             },
             context(),
         )
@@ -787,16 +787,12 @@ mod tests {
                 crate::connector::schema_creation::with_schema_creation(&context(), |creation| {
                     ConnectorDistributedRewriteCohortPlan::try_new_typed(
                         ConnectorWriteCohortId::derive(operation_id, b"test", digest).unwrap(),
-                        novarocks_spi::connector::ConnectorRewriteCohortRead::DeleteArtifactGroup(
-                            novarocks_spi::connector::ConnectorFrozenRewriteGroup::try_new(
+                        novarocks_spi::connector::ConnectorRewriteCohortRead::PinnedFileSet(
+                            novarocks_spi::connector::ConnectorPinnedFileSet::try_new(
                                 "db",
                                 "orders",
-                                operation_id,
-                                digest,
-                                novarocks_spi::connector::ConnectorProcessLocalPayload::new(
-                                    key.clone(),
-                                    Arc::new(()),
-                                ),
+                                1,
+                                [format!("s3://warehouse/orders/group-{index}.parquet").as_str()],
                             )
                             .unwrap(),
                         ),

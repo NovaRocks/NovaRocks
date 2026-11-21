@@ -396,63 +396,6 @@ fn bind_write_input(
     })
 }
 
-/// Re-author the canonical artifact relation only after begin_write validated
-/// the retained position-delete rewrite's target, UUID, base and operation.
-/// Ordinary row identities keep the strict scan-metadata declaration path.
-pub(crate) fn freeze_position_delete_rewrite_input(
-    metadata: &TableMetadata,
-    input: &ConnectorWriteInputRequest,
-    context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<ConnectorWriteInputRequest, ConnectorError> {
-    let ConnectorWriteInputRequest::DeletionVector {
-        identity_fields,
-        partition_source_fields,
-    } = input
-    else {
-        return Err(invalid_write_activation(
-            "position-delete rewrite requires a deletion-vector artifact input",
-        ));
-    };
-    crate::metadata::with_pure_schema_creation(context, |creation| {
-        let declaration = crate::distributed_rewrite::delete_artifact_execution_schema(creation)
-            .map_err(crate::metadata::metadata_creation_error)?;
-        let fields = declaration.schema().fields();
-        if identity_fields.len() != fields.len()
-            || identity_fields
-                .iter()
-                .zip(fields)
-                .any(|(source, expected)| source.field().name() != expected.name())
-        {
-            return Err(invalid_write_activation(
-                "position-delete rewrite identity differs from its canonical artifact schema",
-            ));
-        }
-        let mut authored = creation
-            .reserve(fields.len())
-            .map_err(crate::metadata::metadata_creation_error)?;
-        for (ordinal, field) in fields.iter().enumerate() {
-            creation
-                .work(1)
-                .map_err(crate::metadata::metadata_creation_error)?;
-            authored.push(ConnectorWriteFieldRequest::try_new_typed(
-                field.as_ref().clone(),
-                declaration
-                    .binding(ordinal)
-                    .expect("provider artifact schema covers every identity field")
-                    .clone(),
-            )?);
-        }
-        Ok(ConnectorWriteInputRequest::DeletionVector {
-            identity_fields: authored,
-            partition_source_fields: exact_partition_source_write_fields(
-                metadata,
-                partition_source_fields,
-                creation,
-            )?,
-        })
-    })
-}
-
 /// Freeze complete provider declarations before either session-signing entry.
 /// The loaded schema and exact metadata roles author execution semantics;
 /// caller Field attributes remain source facts and supply no type authority.

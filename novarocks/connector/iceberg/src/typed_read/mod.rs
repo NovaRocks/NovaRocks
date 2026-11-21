@@ -46,14 +46,12 @@ pub(crate) mod read_static_facts;
 #[cfg(any(test, feature = "reader-test-fixture"))]
 #[doc(hidden)]
 pub mod reader_test_fixture;
-pub mod rewrite_position_page_source;
 pub mod runtime;
 pub mod schema_binding;
 pub mod split;
 pub mod split_source;
 pub mod system_page_source;
 pub mod system_table;
-pub mod table_execute;
 pub mod table_handle;
 #[cfg(test)]
 mod test_spawners;
@@ -87,10 +85,6 @@ pub use page_source::{
     IcebergReadRelation, ParquetFooterCache,
 };
 pub use page_source_provider::{IcebergPageSourceProvider, IcebergPageSourceProviderOptions};
-pub use rewrite_position_page_source::{
-    IcebergRewritePositionDeleteFilesPageSourceRequest,
-    create_iceberg_rewrite_position_delete_files_page_stream,
-};
 pub use runtime::{IcebergExecutionReadRuntime, IcebergReadSplit, IcebergRuntimeRelation};
 pub use schema_binding::{
     ALWAYS_BOUND_METADATA_COLUMNS, FileFieldIdCoverage, ICEBERG_METADATA_FIELD_ID_IS_DELETED,
@@ -122,13 +116,6 @@ pub use system_table::{
     MAX_FILES_TABLE_MANIFESTS, SystemManifestSplit, SystemManifestSplitParams,
     SystemManifestSplitSource, SystemManifestSplitSourceParams, SystemRelationSplit,
     TrinoManifestContent, TrinoManifestFile, TrinoManifestFileParams,
-};
-pub use table_execute::{
-    IcebergOptimizeHandle, IcebergProcedureExecution, IcebergProcedureId,
-    IcebergRewriteArtifactContentId, IcebergRewritePositionDeleteFilesHandle,
-    IcebergRewritePositionDeleteFilesSplit, IcebergRewritePositionDeleteFilesSplitParams,
-    IcebergTableExecuteHandle, IcebergTableExecuteHandleParams, IcebergTableExecuteProcedureHandle,
-    REWRITE_POSITION_DELETE_OUTPUT_COLUMNS,
 };
 pub use table_handle::{
     HiveTransactionHandle, IcebergPinnedDataFileSet, IcebergTableHandle, IcebergTableHandleParams,

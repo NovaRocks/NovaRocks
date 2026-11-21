@@ -52,7 +52,6 @@ fn rewritten_target_must_come_from_the_exact_admitted_table_snapshot_and_prepara
     let targets = [IcebergSealedWriteTarget::new(
         target,
         IcebergWriteBranch::Data,
-        None,
     )];
     let mut receiving = IcebergReceiving::with_compact_mode(true);
     receiving
