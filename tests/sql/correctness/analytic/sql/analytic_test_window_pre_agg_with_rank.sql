@@ -22,7 +22,7 @@
 -- 2. Cover JOIN between t1 and t2 with row_number <= predicate filter.
 -- 3. Validate sum() / avg() OVER (PARTITION BY ...) combined with row_number pre-agg pattern.
 -- 4. Validate COUNT(*) + ROW_NUMBER with non-deterministic ORDER BY RAND() — result not snapshotted.
--- 5. Validate bitmap_union_count(to_bitmap(uid)) OVER (PARTITION BY k) combined with rank() (crash guard).
+-- 5. Validate a partition count window combined with rank() (crash guard).
 
 -- query 1
 -- @skip_result_check=true
@@ -101,16 +101,3 @@ CREATE TABLE ${case_db}.t_rank_bitmap_crash (
 INSERT INTO ${case_db}.t_rank_bitmap_crash VALUES
 ROW(1, 100, 1), ROW(1, 90, 2), ROW(1, 80, NULL), ROW(1, 70, 3),
 ROW(2, 100, 4), ROW(2, 90, NULL), ROW(2, 80, 5);
-
--- query 7
--- bitmap_union_count combined with rank() — crash guard test
--- @order_sensitive=true
-SELECT * FROM (
-    SELECT
-        k, ts,
-        rank() OVER (PARTITION BY k ORDER BY ts DESC) AS rk,
-        bitmap_union_count(to_bitmap(uid)) OVER (PARTITION BY k) AS uv
-    FROM ${case_db}.t_rank_bitmap_crash
-) s
-ORDER BY rk, k, ts DESC
-LIMIT 3;

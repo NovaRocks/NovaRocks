@@ -96,17 +96,6 @@ impl Rule for SplitDistinctAgg {
             .iter()
             .map(|idx| agg.aggregates[*idx].clone())
             .collect();
-        // Stateful sketch/bitmap aggregates preserve null/empty-state semantics
-        // across the current split-distinct phase boundaries poorly. Fall back
-        // to the single-stage plan for correctness until their merge path is
-        // aligned with StarRocks FE.
-        if non_distinct
-            .iter()
-            .any(|call| split_distinct_sensitive_agg(call.name.as_str()))
-        {
-            return Ok(vec![]);
-        }
-
         Ok(if agg.group_by.is_empty() {
             apply_four_phase(
                 expr,
@@ -163,23 +152,6 @@ fn extract_single_distinct_col(
         }
     }
     Some(first.source.arguments()[0])
-}
-
-fn split_distinct_sensitive_agg(name: &str) -> bool {
-    matches!(
-        name,
-        "approx_count_distinct_hll_sketch"
-            | "bitmap_agg"
-            | "bitmap_union"
-            | "bitmap_union_count"
-            | "bitmap_union_int"
-            | "ds_hll_count_distinct"
-            | "ds_hll_count_distinct_merge"
-            | "ds_hll_count_distinct_union"
-            | "hll_raw_agg"
-            | "hll_union"
-            | "hll_union_agg"
-    )
 }
 
 fn distinct_aggregate_indices(aggregates: &[ScalarAggregateSpec]) -> Vec<usize> {
@@ -1116,53 +1088,6 @@ mod tests {
                         ),
                     },
                     count_distinct("name"),
-                ],
-                vec![],
-            )),
-            children: vec![sg],
-        };
-        assert!(
-            SplitDistinctAgg
-                .apply(
-                    &mexpr,
-                    &mut memo,
-                    &crate::compiler::SqlCompileControl::unbounded()
-                )
-                .unwrap()
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn apply_skips_stateful_sketch_non_distinct_aggregate() {
-        let mut memo = Memo::new();
-        let sg = scan_group(&mut memo);
-        let id = memo.next_expr_id();
-        let mexpr = MExpr {
-            id,
-            op: Operator::LogicalAggregate(single_agg(
-                &mut memo,
-                vec![],
-                vec![
-                    count_distinct("x"),
-                    AggregateCall {
-                        name: "ds_hll_count_distinct".into(),
-                        distinct: false,
-                        result_type: novarocks_type_contract::FunctionValueType::new(
-                            DataType::Int64,
-                            false,
-                        ),
-                        output_column_id: fallback_output_id(1),
-                        source: crate::binding::AggregateArgumentSource::uncertified(
-                            vec![col("x")],
-                            vec![],
-                            crate::functions::test_resolved_aggregate(
-                                "ds_hll_count_distinct",
-                                &[DataType::Int64],
-                                false,
-                            ),
-                        ),
-                    },
                 ],
                 vec![],
             )),

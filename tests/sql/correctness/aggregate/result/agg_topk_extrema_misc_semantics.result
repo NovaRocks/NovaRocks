@@ -21,8 +21,3 @@ grp	expr_avg
 1	32499997.316162
 2	29999997.627262
 3	24999998.249461
-
--- query 5
--- types	varchar	varchar	varchar
-two_sided	less_side	greater_side
-[12.5, 0.610491756745271]	[12.5, 0.7775834956817393]	[12.5, 0.3052458783726355]

@@ -60,9 +60,6 @@ pub(crate) use contract_lowering::{
     lower_final_physical_plan_with_root_semantics, lower_final_physical_write_plan,
 };
 
-#[cfg(test)]
-mod physical_temporal_journal_tests;
-
 #[cfg(novarocks_dev_controls)]
 pub mod state_source_fixture;
 

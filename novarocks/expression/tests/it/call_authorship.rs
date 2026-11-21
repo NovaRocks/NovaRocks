@@ -712,11 +712,9 @@ fn primitive_cast_summaries_preserve_null_and_error_semantics_and_typed_refusals
 }
 
 #[test]
-fn call_author_keeps_the_installed_regexp_base64_and_temporal_sources() {
+fn call_author_keeps_the_installed_regexp_and_base64_sources() {
     use arrow::array::StringArray;
-    use novarocks_type_contract::{
-        RegexpCountPatternSource, TemporalSourceShape, ToBase64ByteSource,
-    };
+    use novarocks_type_contract::{RegexpCountPatternSource, ToBase64ByteSource};
     use std::sync::Arc;
 
     let mut fixture = AuthorFixture::new();
@@ -738,8 +736,7 @@ fn call_author_keeps_the_installed_regexp_base64_and_temporal_sources() {
     // receipt used by native encryption byte producers.
     let bytes = fixture.call("from_base64", &[text], DecimalOverflowPolicy::OutputNull);
     let latin1 = fixture.call("to_base64", &[bytes], DecimalOverflowPolicy::OutputNull);
-    let temporal = fixture.call("time_to_sec", &[text], DecimalOverflowPolicy::OutputNull);
-    for root in [literal_regex, dynamic_regex, ordinary, latin1, temporal] {
+    for root in [literal_regex, dynamic_regex, ordinary, latin1] {
         fixture.root(root, EvaluationDemand::Value);
     }
     let sealed = fixture.seal();
@@ -762,14 +759,6 @@ fn call_author_keeps_the_installed_regexp_base64_and_temporal_sources() {
     assert_eq!(
         authored.claims[&roots[3]].to_base64_byte_source,
         Some(ToBase64ByteSource::NativeV1EncryptionLatin1)
-    );
-    let temporal = authored.claims[&roots[4]].temporal_source.as_ref().unwrap();
-    assert_eq!(temporal.facts.shape(), TemporalSourceShape::SecondsDirect);
-    assert_eq!(temporal.sources.len(), 1);
-    assert_eq!(temporal.sources[0].definition, text);
-    assert_eq!(
-        sealed.control_flow().uses()[&roots[4]].control,
-        ControlShape::TemporalSource(TemporalSourceShape::SecondsDirect)
     );
 }
 

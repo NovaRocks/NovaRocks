@@ -233,15 +233,12 @@ INSERT INTO ${case_db}.decimal_implicit_left VALUES ROW(1,1,1),ROW(2,NULL,2);
 INSERT INTO ${case_db}.decimal_implicit_right VALUES ROW(10,1),ROW(20,1000),ROW(30,NULL);
 
 -- query 41
-WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ id,FIELD(k,c) AS f FROM ${case_db}.decimal_implicit_left ORDER BY id;
-
--- query 42
 SELECT l.id AS left_id,r.id AS right_id,CAST(k AS VARCHAR) AS merged_key
 FROM (SELECT id,k FROM ${case_db}.decimal_implicit_left WHERE id=1) l
 FULL OUTER JOIN ${case_db}.decimal_implicit_right r USING(k)
 ORDER BY r.id;
 
--- query 43
+-- query 42
 -- @skip_result_check=true
 -- @expect_error_tier=target
 -- @expect_sql_code=query.execution.numeric_out_of_range
@@ -252,13 +249,13 @@ WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' SELECT /*+ SET_VAR(sql_mode='ERROR_I
 FROM (SELECT id,k FROM ${case_db}.decimal_implicit_left WHERE id=1) l
 FULL OUTER JOIN ${case_db}.decimal_implicit_right r USING(k);
 
--- query 44
+-- query 43
 WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ l.id AS left_id,r.id AS right_id,CAST(k AS VARCHAR) AS merged_key
 FROM (SELECT id,k FROM ${case_db}.decimal_implicit_left WHERE id=2) l
 FULL OUTER JOIN (SELECT id,k FROM ${case_db}.decimal_implicit_right WHERE id=30) r USING(k)
 ORDER BY COALESCE(l.id,r.id);
 
--- query 45
+-- query 44
 -- @skip_result_check=true
 SET SESSION sql_mode = '32';
 DROP TABLE ${case_db}.decimal_implicit_left;

@@ -166,10 +166,10 @@ WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' select /*+ SET_VAR(sql_mode='ERROR_I
 select c_id - 1.12345678901234567890 from ${case_db}.t_decimal_overflow where c_id = 1;
 
 -- query 29
-select max(c0- 2.8665963056616452*(lt - 3.062472673706541)) as adjust_lt from (select c0, array_sum(c1) lt, c2 from ${case_db}.avg_test) t group by c2;
+select max(c0- 2.8665963056616452*(lt - 3.062472673706541)) as adjust_lt from (select c0, c2, c3, sum(n) lt from ${case_db}.avg_test CROSS JOIN UNNEST(c1) AS item(n) GROUP BY c0,c2,c3,c1) t group by c2;
 
 -- query 30
-select avg(c0- 2.8665963056616452*(lt - 3.062472673706541)) as adjust_lt from (select c0, array_sum(c1) lt, c2 from ${case_db}.avg_test) t group by c2;
+select avg(c0- 2.8665963056616452*(lt - 3.062472673706541)) as adjust_lt from (select c0, c2, c3, sum(n) lt from ${case_db}.avg_test CROSS JOIN UNNEST(c1) AS item(n) GROUP BY c0,c2,c3,c1) t group by c2;
 
 -- query 31
 -- @skip_result_check=true
@@ -177,7 +177,7 @@ select avg(c0- 2.8665963056616452*(lt - 3.062472673706541)) as adjust_lt from (s
 -- @expect_sql_code=query.execution.numeric_out_of_range
 -- @expect_sql_phase=Execution
 -- @expect_error=[query.execution.numeric_out_of_range]
-WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' select /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW')*/ max(lt- 2.8665963056616452*(c2 - 3.062472673706541)) as adjust_lt from (select c0, array_sum(c1) lt, c2 from ${case_db}.avg_test) t group by c0;
+WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' select /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW')*/ max(lt- 2.8665963056616452*(c2 - 3.062472673706541)) as adjust_lt from (select c0, c2, c3, sum(n) lt from ${case_db}.avg_test CROSS JOIN UNNEST(c1) AS item(n) GROUP BY c0,c2,c3,c1) t group by c0;
 
 -- query 32
 -- @skip_result_check=true
@@ -185,4 +185,4 @@ WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' select /*+ SET_VAR(sql_mode='ERROR_I
 -- @expect_sql_code=query.execution.numeric_out_of_range
 -- @expect_sql_phase=Execution
 -- @expect_error=[query.execution.numeric_out_of_range]
-WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' select /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW')*/ avg(lt- 2.8665963056616452*(c2 - 3.062472673706541)) as adjust_lt from (select c0, array_sum(c1) lt, c2 from ${case_db}.avg_test) t group by c0;
+WITH SESSION sql_mode = 'ERROR_IF_OVERFLOW' select /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW')*/ avg(lt- 2.8665963056616452*(c2 - 3.062472673706541)) as adjust_lt from (select c0, c2, c3, sum(n) lt from ${case_db}.avg_test CROSS JOIN UNNEST(c1) AS item(n) GROUP BY c0,c2,c3,c1) t group by c0;

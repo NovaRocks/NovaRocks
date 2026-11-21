@@ -16,14 +16,8 @@
 -- under the License.
 
 -- @order_sensitive=true
--- @tags=aggregate,array_agg,array_unique_agg,string_agg,dict_merge
--- Test Objective:
--- 1. Validate array/string collection aggregates on grouped nullable inputs.
--- 2. Cover dict_merge payload generation for string and array<string> columns.
--- Test Flow:
--- 1. Create/reset a mixed-type source table.
--- 2. Insert deterministic grouped rows with duplicates and NULLs.
--- 3. Snapshot grouped collection outputs and dict_merge payloads.
+-- @tags=aggregate,array_agg,string_agg
+-- Check grouped array and string aggregation with nullable inputs.
 -- query 1
 CREATE TABLE ${case_db}.t_agg_collection_string_dict (
     g INT,
@@ -58,27 +52,9 @@ ORDER BY g;
 -- query 2
 SELECT
     g,
-    ARRAY_MIN(ARRAY_UNIQUE_AGG(score_items)) AS min_unique_score,
-    ARRAY_MAX(ARRAY_UNIQUE_AGG(score_items)) AS max_unique_score,
-    CARDINALITY(ARRAY_UNIQUE_AGG(score_items)) AS unique_score_count
-FROM ${case_db}.t_agg_collection_string_dict
-GROUP BY g
-ORDER BY g;
-
--- query 3
-SELECT
-    g,
     STRING_AGG(name, '|' ORDER BY id) AS names_concat,
     STRING_AGG(DISTINCT CAST(score AS STRING), ',' ORDER BY 1) AS distinct_scores
 FROM ${case_db}.t_agg_collection_string_dict
 WHERE name IS NOT NULL
 GROUP BY g
 ORDER BY g;
-
--- query 4
-SELECT
-    DICT_MERGE(city, 255) AS city_dict,
-    DICT_MERGE(city_null, 255) AS city_null_dict,
-    DICT_MERGE(city_array, 255) AS city_array_dict,
-    DICT_MERGE(city_array_null, 255) AS city_array_null_dict
-FROM ${case_db}.t_agg_collection_string_dict;

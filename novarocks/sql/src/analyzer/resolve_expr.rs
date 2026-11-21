@@ -30,7 +30,6 @@ use novarocks_type_contract::{
     ArithmeticOperator, arithmetic_result_value_type_with_op, comparison_common_value_type,
     wider_comparison_value_type,
 };
-use novarocks_types::comparison_common_type;
 
 use super::functions::*;
 use super::helpers::{eval_const_i64, expr_display_name, sql_type_to_arrow};
@@ -175,6 +174,7 @@ pub(crate) fn unsupported_control_expression_reason(
     }
 }
 
+#[cfg(test)]
 fn string_literal_expr(value: String, span: Span) -> ast::Expr {
     ast::Expr::Literal(ast::Literal {
         kind: ast::LiteralKind::String(value),
@@ -2062,7 +2062,7 @@ impl<'a> super::AnalyzerContext<'a> {
             ));
         }
         let original_name = print_object_name(&func.name).to_ascii_lowercase();
-        if matches!(original_name.as_str(), "grouping" | "grouping_id") {
+        if original_name == "grouping" {
             return self.analyze_grouping_function(func, scope);
         }
         self.analyze_function_from_metadata(
@@ -2088,16 +2088,9 @@ impl<'a> super::AnalyzerContext<'a> {
         original_arguments: &[&ast::Expr],
         scope: &AnalyzerScope,
     ) -> Result<TypedExpr, AnalyzeError> {
-        if original_name == "ds_theta_count_distinct" {
-            return Err(AnalyzeError::unsupported_expression(
-                "unsupported agg function: ds_theta_count_distinct",
-                func.span,
-            ));
-        }
         let name = match original_name.as_str() {
-            "approx_count_distinct_hll_sketch" => "ds_hll_count_distinct".to_string(),
             "every" => "bool_and".to_string(),
-            other => other.to_string(),
+            _ => original_name,
         };
         // Route explicit `element_at(container, key)` calls to the right typed
         // subscript function. The subscript-syntax path already does this, but
@@ -2203,10 +2196,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 func.span,
             ));
         }
-        if matches!(
-            name.as_str(),
-            "array_agg" | "array_agg_distinct" | "array_unique_agg"
-        ) {
+        if matches!(name.as_str(), "array_agg" | "array_agg_distinct") {
             if arg_exprs.is_empty() {
                 return Err(AnalyzeError::invalid_argument(
                     "array_agg should have at least one input.",
@@ -2226,52 +2216,35 @@ impl<'a> super::AnalyzerContext<'a> {
                 func.span,
             ));
         }
-        // A shorthand without an explicit unit still defaults to days.
-        // Bare boundary names retain their established function meaning.
-        let time_slice_rewrites: Vec<ast::Expr> =
-            if matches!(name.as_str(), "time_slice" | "date_slice") {
-                let mut rewritten = Vec::with_capacity(arg_exprs.len() + 1);
-                for (idx, expression) in arg_exprs.iter().enumerate() {
-                    if idx == 1 {
-                        rewritten.push((*expression).clone());
-                        let default_day = arg_exprs.len() == 2
-                            || (arg_exprs.len() == 3
-                                && slice_boundary_keyword(arg_exprs[2]).is_some());
-                        if default_day {
-                            rewritten.push(string_literal_expr("day".into(), expression.span()));
-                        }
-                        continue;
-                    }
-                    if idx == arg_exprs.len() - 1
-                        && idx >= 2
-                        && let Some(token) = slice_boundary_keyword(expression)
-                        && matches!(token.as_str(), "ceil" | "floor")
-                    {
-                        rewritten.push(string_literal_expr(token, expression.span()));
-                    } else {
-                        rewritten.push((*expression).clone());
-                    }
-                }
-                rewritten
-            } else {
-                Vec::new()
-            };
-
-        let effective_arg_exprs: Vec<&ast::Expr> = if is_count_star {
-            Vec::new()
-        } else if time_slice_rewrites.is_empty() {
-            arg_exprs.clone()
+        let effective_arg_exprs = if is_count_star {
+            &[]
         } else {
-            time_slice_rewrites.iter().collect()
+            arg_exprs.as_slice()
         };
+        if effective_arg_exprs
+            .iter()
+            .any(|arg| matches!(arg, ast::Expr::Lambda(_)))
+            && !is_window_only_function(&name)
+            && !is_aggregate_function(self.function_catalog, &name)
+            && crate::functions::builtin_disposition(&name).is_none()
+            && !self
+                .function_catalog
+                .recognizes_scalar_name(&name, &[], self.control)
+                .map_err(AnalyzeError::function_resolution)?
+        {
+            return Err(AnalyzeError::unknown_function(
+                format!("Unknown function: {name}"),
+                func.span,
+            ));
+        }
 
         if let Some(rewritten) =
-            self.try_analyze_higher_order_function(&name, &effective_arg_exprs, scope, func.span)?
+            self.try_analyze_higher_order_function(&name, effective_arg_exprs, scope, func.span)?
         {
             return Ok(rewritten);
         }
         if let Some(rewritten) =
-            self.try_analyze_array_map_cast_lambda(&name, &effective_arg_exprs, scope, func.span)?
+            self.try_analyze_array_map_cast_lambda(&name, effective_arg_exprs, scope, func.span)?
         {
             return Ok(rewritten);
         }
@@ -2285,18 +2258,18 @@ impl<'a> super::AnalyzerContext<'a> {
                 .and_then(|expr| parse_array_sortby_lambda(expr))
                 .is_some()
         {
-            self.analyze_array_sortby_lambda_arguments(&effective_arg_exprs, scope, func.span)?
-        } else if is_map_higher_order_function_with_lambda(&name, &effective_arg_exprs) {
+            self.analyze_array_sortby_lambda_arguments(effective_arg_exprs, scope, func.span)?
+        } else if is_map_higher_order_function_with_lambda(&name, effective_arg_exprs) {
             self.analyze_map_higher_order_lambda_arguments(
                 &name,
-                &effective_arg_exprs,
+                effective_arg_exprs,
                 scope,
                 func.span,
             )?
         } else {
             let mut args_typed = Vec::with_capacity(effective_arg_exprs.len());
             let mut arg_types = Vec::with_capacity(effective_arg_exprs.len());
-            for arg in &effective_arg_exprs {
+            for arg in effective_arg_exprs {
                 let typed = self.analyze_expr(arg, scope)?;
                 arg_types.push(typed.value_type.data_type().clone());
                 args_typed.push(typed);
@@ -2338,7 +2311,7 @@ impl<'a> super::AnalyzerContext<'a> {
         }
 
         if name == "array_generate" {
-            normalize_array_generate_arguments(&mut args_typed, &effective_arg_exprs, func.span)?;
+            normalize_array_generate_arguments(&mut args_typed, effective_arg_exprs, func.span)?;
             arg_types = args_typed
                 .iter()
                 .map(|arg| arg.value_type.data_type().clone())
@@ -2397,16 +2370,6 @@ impl<'a> super::AnalyzerContext<'a> {
                 .map(|a| a.value_type.data_type().clone())
                 .collect();
         }
-
-        if matches!(name.as_str(), "time_slice" | "date_slice") {
-            normalize_slice_arguments(&name, &effective_arg_exprs, &mut args_typed, func.span)?;
-            arg_types = args_typed
-                .iter()
-                .map(|arg| arg.value_type.data_type().clone())
-                .collect();
-        }
-
-        self.validate_ds_hll_arguments(&name, &args_typed, func.span)?;
 
         if name == "array_flatten"
             && let Some(DataType::List(item)) = arg_types.first()
@@ -2507,22 +2470,11 @@ impl<'a> super::AnalyzerContext<'a> {
 
         // Check for window function: func(...) OVER (...)
         if let Some(window_type) = func.window {
-            if is_analyzer_aggregate_macro(&original_name) {
-                return Err(AnalyzeError::unsupported_expression(
-                    format!("{original_name} is not supported with OVER clause"),
-                    func.span,
-                ));
-            }
             let window_only = is_window_only_function(&name);
             let aggregate_binding = if window_only {
                 None
             } else {
-                let executable_name =
-                    novarocks_functions::aggregate_types::mangle_distinct_aggregate_name(
-                        &name,
-                        is_distinct,
-                    );
-                if !self.function_catalog.contains_aggregate(&executable_name) {
+                if !self.function_catalog.contains_aggregate(&name) {
                     // Legacy declarations are type-inspection facts, not installed selected bindings.
                     // A custom contribution of the same name is resolved by its own catalog identity.
                     if scalar_signature_is_unknown(
@@ -2562,7 +2514,8 @@ impl<'a> super::AnalyzerContext<'a> {
                 }
                 Some(resolve_aggregate_function_call_with_order(
                     self.function_catalog,
-                    &executable_name,
+                    &name,
+                    is_distinct,
                     &args_typed,
                     &func_order_by,
                     func.span,
@@ -2669,46 +2622,6 @@ impl<'a> super::AnalyzerContext<'a> {
                 .collect();
         }
 
-        let needs_hll_hash_string_arg = matches!(name.as_str(), "hll_hash" | "hll_hash1");
-        if needs_hll_hash_string_arg {
-            for arg in &mut args_typed {
-                if arg.value_type.data_type() != &DataType::Utf8
-                    && arg.value_type.data_type() != &DataType::LargeUtf8
-                    && arg.value_type.data_type() != &DataType::Null
-                {
-                    let inner = std::mem::replace(
-                        arg,
-                        TypedExpr {
-                            kind: ExprKind::Literal(LiteralValue::Null),
-                            value_type: novarocks_type_contract::FunctionValueType::new(
-                                DataType::Null,
-                                true,
-                            ),
-                        },
-                    );
-                    *arg = TypedExpr {
-                        kind: ExprKind::Cast {
-                            array_failure_mode: None,
-                            expr: novarocks_parser::ast::AstBox::new(inner),
-                            target: DataType::Utf8,
-                            decimal_overflow_policy: self
-                                .sql_semantics
-                                .sql_mode()
-                                .decimal_overflow_policy(),
-                        },
-                        value_type: novarocks_type_contract::FunctionValueType::new(
-                            DataType::Utf8,
-                            true,
-                        ),
-                    };
-                }
-            }
-            arg_types = args_typed
-                .iter()
-                .map(|a| a.value_type.data_type().clone())
-                .collect();
-        }
-
         if name == "date_trunc"
             && let Some(value_arg) = args_typed.get_mut(1)
             && !matches!(
@@ -2790,28 +2703,14 @@ impl<'a> super::AnalyzerContext<'a> {
                 .collect();
         }
 
-        let aggregate_macro = is_analyzer_aggregate_macro(&original_name);
-        if aggregate_macro && is_distinct {
-            return Err(AnalyzeError::unsupported_expression(
-                format!("{original_name} does not support DISTINCT"),
-                func.span,
-            ));
-        }
-
         let mut bound_scalar = None;
         self.validate_percentile_arguments(&name, &args_typed, func.span)?;
         let mut bound_aggregate = None;
         if is_aggregate_function(self.function_catalog, &name) {
-            validate_aggregate_function_call(&name, &arg_types)
-                .map_err(|message| AnalyzeError::invalid_argument(message, func.span))?;
-            let executable_name =
-                novarocks_functions::aggregate_types::mangle_distinct_aggregate_name(
-                    &name,
-                    is_distinct,
-                );
             bound_aggregate = Some(resolve_aggregate_function_call_with_order(
                 self.function_catalog,
-                &executable_name,
+                &name,
+                is_distinct,
                 &args_typed,
                 &func_order_by,
                 func.span,
@@ -2820,7 +2719,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 self.control,
                 self.purpose,
             )?);
-        } else if !aggregate_macro {
+        } else {
             if matches!(name.as_str(), "variant_get" | "try_variant_get") {
                 if !(2..=3).contains(&args_typed.len()) {
                     return Err(AnalyzeError::invalid_argument(
@@ -2930,111 +2829,6 @@ impl<'a> super::AnalyzerContext<'a> {
                 .collect();
             args_typed = bound.args;
             bound_scalar = Some(bound.binding);
-        }
-
-        match original_name.as_str() {
-            "ds_hll_accumulate" => {
-                let bound_state = bind_scalar_function_call_with_catalog(
-                    self.function_catalog,
-                    "ds_hll_count_distinct_state",
-                    args_typed,
-                    self.sql_semantics.sql_mode().decimal_overflow_policy(),
-                    self.constant_policy,
-                    self.control,
-                )
-                .map_err(|error| error.at_type_mismatch(func.span))?;
-                let state_value_type = match &bound_state.binding.selected.result_type {
-                    novarocks_functions::FunctionResultType::Scalar(result) => result.clone(),
-                    novarocks_functions::FunctionResultType::Relation(_) => unreachable!(),
-                };
-                let state_expr = TypedExpr {
-                    kind: ExprKind::FunctionCall {
-                        volatility: self
-                            .function_catalog
-                            .volatility("ds_hll_count_distinct_state"),
-                        name: "ds_hll_count_distinct_state".to_string(),
-                        args: (bound_state.args).into(),
-                        distinct: false,
-                        binding: bound_state.binding,
-                    },
-                    value_type: state_value_type,
-                };
-                let aggregate_signature = resolve_aggregate_function_call(
-                    self.function_catalog,
-                    "ds_hll_count_distinct_union",
-                    std::slice::from_ref(&state_expr),
-                    func.span,
-                    self.sql_semantics.sql_mode().decimal_overflow_policy(),
-                    self.constant_policy,
-                    self.control,
-                )?;
-                return Ok(TypedExpr {
-                    kind: ExprKind::AggregateCall {
-                        name: "ds_hll_count_distinct_union".to_string(),
-                        args: (vec![state_expr]).into(),
-                        distinct: false,
-                        order_by: (func_order_by).into(),
-                        resolved: aggregate_signature.clone(),
-                    },
-                    value_type: crate::functions::aggregate_result_type(&aggregate_signature)
-                        .clone(),
-                });
-            }
-            "ds_hll_combine" => {
-                self.ensure_ds_hll_binary_arg(
-                    "ds_hll_count_distinct_union",
-                    args_typed.first(),
-                    func.span,
-                )?;
-                let aggregate_signature = resolve_aggregate_function_call(
-                    self.function_catalog,
-                    "ds_hll_count_distinct_union",
-                    &args_typed,
-                    func.span,
-                    self.sql_semantics.sql_mode().decimal_overflow_policy(),
-                    self.constant_policy,
-                    self.control,
-                )?;
-                return Ok(TypedExpr {
-                    kind: ExprKind::AggregateCall {
-                        name: "ds_hll_count_distinct_union".to_string(),
-                        args: (args_typed).into(),
-                        distinct: false,
-                        order_by: (func_order_by).into(),
-                        resolved: aggregate_signature.clone(),
-                    },
-                    value_type: crate::functions::aggregate_result_type(&aggregate_signature)
-                        .clone(),
-                });
-            }
-            "ds_hll_estimate" => {
-                self.ensure_ds_hll_binary_arg(
-                    "ds_hll_count_distinct_merge",
-                    args_typed.first(),
-                    func.span,
-                )?;
-                let aggregate_signature = resolve_aggregate_function_call(
-                    self.function_catalog,
-                    "ds_hll_count_distinct_merge",
-                    &args_typed,
-                    func.span,
-                    self.sql_semantics.sql_mode().decimal_overflow_policy(),
-                    self.constant_policy,
-                    self.control,
-                )?;
-                return Ok(TypedExpr {
-                    kind: ExprKind::AggregateCall {
-                        name: "ds_hll_count_distinct_merge".to_string(),
-                        args: (args_typed).into(),
-                        distinct: false,
-                        order_by: (func_order_by).into(),
-                        resolved: aggregate_signature.clone(),
-                    },
-                    value_type: crate::functions::aggregate_result_type(&aggregate_signature)
-                        .clone(),
-                });
-            }
-            _ => {}
         }
 
         if is_aggregate_function(self.function_catalog, &name) {
@@ -3547,12 +3341,7 @@ impl<'a> super::AnalyzerContext<'a> {
         }
     }
 
-    /// Analyse `map_apply((k, v) -> body, m)` / `transform_keys((k, v) -> nk, m)` /
-    /// `transform_values((k, v) -> nv, m)`. The 2-parameter lambda binds
-    /// `k` to the map's key Arrow type and `v` to the value type. For
-    /// `map_apply` the body must be a `(new_key, new_value)` tuple (the native
-    /// parser represents it as an anonymous `Expr::Row`); we rewrite it as a `row(...)` call so
-    /// downstream codegen sees a 2-field Struct.
+    /// Bind two-parameter map lambdas to the actual input key and value types.
     fn analyze_map_higher_order_lambda_arguments(
         &self,
         name: &str,
@@ -3631,14 +3420,7 @@ impl<'a> super::AnalyzerContext<'a> {
             inner_scope.add_lambda_param(param.clone());
         }
 
-        // The shared `map_apply` executor expects the lambda body to evaluate
-        // to a single-entry MAP per `(k, v)` input pair, which it concatenates
-        // into the output map. Each map family supplies the `(new_key,
-        // new_value)` pair differently, so normalize all three to a
-        // `map(new_key, new_value)` body here:
-        //   map_apply       : body is a `(new_key, new_value)` tuple.
-        //   transform_keys  : body is the new key scalar; value passes through.
-        //   transform_values: body is the new value scalar; key passes through.
+        // Both map transforms use the same executor over single-entry maps.
         let lambda_param_ref =
             |param: &LambdaParam, _value_type: novarocks_type_contract::FunctionValueType| {
                 TypedExpr {
@@ -3650,25 +3432,6 @@ impl<'a> super::AnalyzerContext<'a> {
                 }
             };
         let (new_key, new_value) = match name {
-            "map_apply" => {
-                let tuple_items: Vec<&ast::Expr> = match self.anonymous_row(body_expr)? {
-                    Some(row) => row.fields.iter().map(|field| &field.expression).collect(),
-                    None => Vec::new(),
-                };
-                if tuple_items.len() != 2 {
-                    return Err(AnalyzeError::invalid_argument(
-                        format!(
-                            "map_apply lambda body must produce (new_key, new_value), got {} items",
-                            tuple_items.len()
-                        ),
-                        span,
-                    ));
-                }
-                (
-                    self.analyze_expr(tuple_items[0], &inner_scope)?,
-                    self.analyze_expr(tuple_items[1], &inner_scope)?,
-                )
-            }
             "transform_keys" => (
                 self.analyze_expr(body_expr, &inner_scope)?,
                 lambda_param_ref(&lambda_params[1], value_type.clone()),
@@ -3769,22 +3532,6 @@ impl<'a> super::AnalyzerContext<'a> {
         args: &[TypedExpr],
         span: Span,
     ) -> Result<(), AnalyzeError> {
-        match name {
-            "percentile_cont" | "percentile_disc_lc" => {
-                if let Some(expr) = args.get(1)
-                    && let Some(value) = const_numeric_value(expr)
-                    && !(0.0..=1.0).contains(&value)
-                {
-                    return Err(AnalyzeError::invalid_argument(
-                        format!("{name} second parameter'value should be between 0 and 1"),
-                        span,
-                    ));
-                }
-                return Ok(());
-            }
-            _ => {}
-        }
-
         match name {
             "percentile_approx" => {
                 if let Some(expr) = args.first() {
@@ -3918,11 +3665,7 @@ impl<'a> super::AnalyzerContext<'a> {
                         visible_args[pos_index - 1].clone()
                     } else if matches!(
                         func_name.as_str(),
-                        "array_agg"
-                            | "array_agg_distinct"
-                            | "array_unique_agg"
-                            | "group_concat"
-                            | "string_agg"
+                        "array_agg" | "array_agg_distinct" | "group_concat" | "string_agg"
                     ) {
                         let display_name = if func_name == "string_agg" {
                             "group_concat"
@@ -4066,90 +3809,6 @@ impl<'a> super::AnalyzerContext<'a> {
                 })?;
                 Ok(WindowBound::Following(n))
             }
-        }
-    }
-
-    fn validate_ds_hll_arguments(
-        &self,
-        name: &str,
-        args: &[TypedExpr],
-        span: Span,
-    ) -> Result<(), AnalyzeError> {
-        if name != "ds_hll_count_distinct" {
-            return Ok(());
-        }
-
-        if args.len() > 3 {
-            return Err(AnalyzeError::invalid_argument(
-                "ds_hll_count_distinct requires one/two/three parameters: ds_hll_count_distinct(col, <log_k>, <tgt_type>)",
-                span,
-            ));
-        }
-
-        if let Some(log_k) = args.get(1) {
-            let ExprKind::Literal(LiteralValue::Int(value)) = &log_k.kind else {
-                return Err(AnalyzeError::invalid_argument(
-                    "ds_hll_count_distinct 's second parameter's data type is wrong ",
-                    span,
-                ));
-            };
-            if !(4..=21).contains(value) {
-                return Err(AnalyzeError::invalid_argument(
-                    "ds_hll_count_distinct second parameter'value should be between 4 and 21.",
-                    span,
-                ));
-            }
-        }
-
-        if let Some(target) = args.get(2) {
-            let ExprKind::Literal(LiteralValue::String(value)) = &target.kind else {
-                return Err(AnalyzeError::invalid_argument(
-                    "ds_hll_count_distinct 's third parameter's data type is wrong ",
-                    span,
-                ));
-            };
-            if !matches!(value.as_str(), "HLL_4" | "HLL_6" | "HLL_8") {
-                return Err(AnalyzeError::invalid_argument(
-                    "ds_hll_count_distinct third  parameter'value should be in HLL_4/HLL_6/HLL_8.",
-                    span,
-                ));
-            }
-        }
-
-        Ok(())
-    }
-
-    fn ensure_ds_hll_binary_arg(
-        &self,
-        fn_name: &str,
-        arg: Option<&TypedExpr>,
-        span: Span,
-    ) -> Result<(), AnalyzeError> {
-        let Some(arg) = arg else {
-            return Ok(());
-        };
-        let looks_like_standalone_binary_state = matches!(
-            &arg.kind,
-            ExprKind::ColumnRef {
-                qualifier: _,
-                column,
-                ..
-            } if column.starts_with("ds_")
-        ) && matches!(
-            arg.value_type.data_type(),
-            DataType::Utf8 | DataType::LargeUtf8
-        );
-        if matches!(
-            arg.value_type.data_type(),
-            DataType::Binary | DataType::LargeBinary
-        ) || looks_like_standalone_binary_state
-        {
-            Ok(())
-        } else {
-            Err(AnalyzeError::type_mismatch(
-                format!("Resolved function {fn_name} has no binary as argument type."),
-                span,
-            ))
         }
     }
 
@@ -4300,196 +3959,6 @@ impl<'a> super::AnalyzerContext<'a> {
             _ => false,
         }
     }
-}
-
-fn slice_boundary_keyword(expr: &ast::Expr) -> Option<String> {
-    let token = match expr {
-        ast::Expr::Identifier(ident) => ident.value.to_ascii_lowercase(),
-        _ => return None,
-    };
-    matches!(token.as_str(), "floor" | "ceil").then_some(token)
-}
-
-/// Freeze the slice domain before overload binding. Runtime kernels receive
-/// a canonical temporal value, checked INT count, and literal control strings.
-fn normalize_slice_arguments(
-    name: &str,
-    source: &[&ast::Expr],
-    args: &mut [TypedExpr],
-    span: Span,
-) -> Result<(), AnalyzeError> {
-    if !matches!(args.len(), 3 | 4) {
-        return Err(AnalyzeError::invalid_argument(
-            format!("{name} expects value, interval, unit and optional boundary"),
-            span,
-        ));
-    }
-    fn integer_source(expr: &ast::Expr) -> bool {
-        match expr {
-            ast::Expr::Literal(ast::Literal {
-                kind: ast::LiteralKind::Long { .. },
-                ..
-            }) => true,
-            ast::Expr::Unary(unary)
-                if matches!(
-                    unary.operator,
-                    ast::UnaryOperator::Plus | ast::UnaryOperator::Minus
-                ) =>
-            {
-                integer_source(&unary.expression)
-            }
-            _ => false,
-        }
-    }
-    if !source.get(1).is_some_and(|source| integer_source(source)) {
-        return Err(AnalyzeError::invalid_argument(
-            format!("{name} requires second parameter must be a constant interval"),
-            span,
-        ));
-    }
-    fn interval_value(expr: &TypedExpr) -> Option<i64> {
-        match &expr.kind {
-            ExprKind::Nested(nested) => interval_value(nested),
-            _ => match crate::common::negation::typed_operand(expr) {
-                Some(nested) => interval_value(nested).and_then(i64::checked_neg),
-                None => signed_int_literal_value(expr),
-            },
-        }
-    }
-    let count = interval_value(&args[1]).ok_or_else(|| {
-        AnalyzeError::invalid_argument(format!("{name} interval must fit INT32"), span)
-    })?;
-    if count <= 0 {
-        return Err(AnalyzeError::invalid_argument(
-            format!("{name} requires second parameter must be greater than 0"),
-            span,
-        ));
-    }
-    i32::try_from(count).map_err(|_| {
-        AnalyzeError::invalid_argument(format!("{name} interval must fit INT32"), span)
-    })?;
-    args[1] = TypedExpr {
-        kind: ExprKind::Literal(LiteralValue::Int(count)),
-        value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
-    };
-    fn control_string(expr: &TypedExpr) -> Option<&str> {
-        match &expr.kind {
-            ExprKind::Literal(LiteralValue::String(value)) => Some(value),
-            ExprKind::Nested(nested) => control_string(nested),
-            _ => None,
-        }
-    }
-    let unit = match control_string(&args[2]) {
-        Some(value) => value.to_ascii_lowercase(),
-        _ => {
-            return Err(AnalyzeError::invalid_argument(
-                format!("{name} requires constant unit string"),
-                span,
-            ));
-        }
-    };
-    let unit = match unit.as_str() {
-        "year" | "years" => "year",
-        "quarter" | "quarters" => "quarter",
-        "month" | "months" => "month",
-        "week" | "weeks" => "week",
-        "day" | "days" => "day",
-        "hour" | "hours" => "hour",
-        "minute" | "minutes" => "minute",
-        "second" | "seconds" => "second",
-        "millisecond" | "milliseconds" => "millisecond",
-        "microsecond" | "microseconds" => "microsecond",
-        _ => {
-            return Err(AnalyzeError::invalid_argument(
-                format!("{name} unsupported unit: {unit}"),
-                span,
-            ));
-        }
-    };
-    if name == "date_slice" && !matches!(unit, "year" | "quarter" | "month" | "week" | "day") {
-        return Err(AnalyzeError::invalid_argument(
-            "can't use time_slice for date with time(hour/minute/second)",
-            span,
-        ));
-    }
-    args[2] = TypedExpr {
-        kind: ExprKind::Literal(LiteralValue::String(unit.into())),
-        value_type: novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
-    };
-    if let Some(boundary) = args.get_mut(3) {
-        let value = match control_string(boundary) {
-            Some(value) => value.to_ascii_lowercase(),
-            _ => {
-                return Err(AnalyzeError::invalid_argument(
-                    format!("{name} requires constant boundary string"),
-                    span,
-                ));
-            }
-        };
-        if !matches!(value.as_str(), "floor" | "ceil") {
-            return Err(AnalyzeError::invalid_argument(
-                format!("{name} expects boundary floor/ceil, got {value}"),
-                span,
-            ));
-        }
-        *boundary = TypedExpr {
-            kind: ExprKind::Literal(LiteralValue::String(value)),
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
-        };
-    }
-    let domain = if name == "date_slice" {
-        DataType::Date32
-    } else {
-        DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None)
-    };
-    if *args[0].value_type.data_type() != domain {
-        // Coercion belongs to the existing explicit SQL CAST owner; no kernel
-        // infers its output type or parses a string under a temporal binding.
-        if !matches!(
-            args[0].value_type.data_type(),
-            DataType::Null
-                | DataType::Utf8
-                | DataType::LargeUtf8
-                | DataType::Date32
-                | DataType::Date64
-                | DataType::Timestamp(_, _)
-                | DataType::Boolean
-                | DataType::Int8
-                | DataType::Int16
-                | DataType::Int32
-                | DataType::Int64
-                | DataType::UInt8
-                | DataType::UInt16
-                | DataType::UInt32
-                | DataType::UInt64
-                | DataType::Float32
-                | DataType::Float64
-                | DataType::Decimal128(_, _)
-                | DataType::FixedSizeBinary(16)
-        ) {
-            return Err(AnalyzeError::type_mismatch(
-                format!("{name} first argument cannot be cast to its temporal domain"),
-                span,
-            ));
-        }
-        let inner = std::mem::replace(
-            &mut args[0],
-            TypedExpr {
-                kind: ExprKind::Literal(LiteralValue::Null),
-                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Null, true),
-            },
-        );
-        args[0] = TypedExpr {
-            kind: ExprKind::Cast {
-                array_failure_mode: None,
-                expr: novarocks_parser::ast::AstBox::new(inner),
-                target: domain.clone(),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(domain, true),
-        };
-    }
-    Ok(())
 }
 
 fn function_order_by_position(expr: &ast::Expr) -> Option<i64> {
@@ -5102,13 +4571,7 @@ fn apply_implicit_string_function_casts(name: &str, args: &mut [TypedExpr]) -> b
             }
             changed
         }
-        "append_trailing_char_if_absent"
-        | "find_in_set"
-        | "instr"
-        | "locate"
-        | "split"
-        | "starts_with"
-        | "ends_with" => cast_utf8_args(args, &[0, 1]),
+        "instr" | "locate" | "split" | "starts_with" | "ends_with" => cast_utf8_args(args, &[0, 1]),
         "regexp_extract" | "regexp_extract_all" => cast_utf8_args(args, &[0, 1]),
         "regexp_replace" => cast_utf8_args(args, &[0, 1, 2]),
         "lpad" | "rpad" => cast_utf8_args(args, &[0, 2]),
@@ -5512,120 +4975,6 @@ fn bind_scalar_function_call(
 
 // FIELD chooses one comparison family before ordinary argument binding. The
 // frozen signature must contain this common type for every value and candidate.
-fn normalize_field_arguments(
-    args: Vec<TypedExpr>,
-    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
-) -> Result<Vec<TypedExpr>, AnalyzeError> {
-    if args.len() < 2 {
-        return Err(AnalyzeError::internal(
-            "field requires a value and at least one candidate",
-        ));
-    }
-    if args.len() - 1 > i32::MAX as usize {
-        return Err(AnalyzeError::internal(
-            "field candidate count exceeds INT range",
-        ));
-    }
-    let numeric = |ty: &DataType| {
-        matches!(
-            ty,
-            DataType::Int8
-                | DataType::Int16
-                | DataType::Int32
-                | DataType::Int64
-                | DataType::Float32
-                | DataType::Float64
-                | DataType::Decimal128(_, _)
-                | DataType::Decimal256(_, _)
-        ) || novarocks_types::largeint::is_largeint_data_type(ty)
-    };
-    let string = |ty: &DataType| matches!(ty, DataType::Utf8 | DataType::LargeUtf8);
-    for arg in &args {
-        if !numeric(arg.value_type.data_type())
-            && !string(arg.value_type.data_type())
-            && !matches!(
-                arg.value_type.data_type(),
-                DataType::Null | DataType::Boolean | DataType::Date32 | DataType::Timestamp(_, _)
-            )
-        {
-            return Err(AnalyzeError::internal(format!(
-                "field does not support argument type {:?}",
-                arg.value_type.data_type()
-            )));
-        }
-    }
-    let mut non_null = args
-        .iter()
-        .filter(|arg| *arg.value_type.data_type() != DataType::Null);
-    // NULL supplies no comparison type. Preserve the non-NULL candidates'
-    // capacity; an all-NULL call has an explicit INT comparison type.
-    let mut common = non_null
-        .next()
-        .map(|arg| arg.value_type.data_type().clone())
-        .unwrap_or(DataType::Int32);
-    for arg in non_null {
-        let other = &arg.value_type.data_type();
-        common = if string(&common) && string(other) {
-            DataType::Utf8
-        } else if numeric(&common) && numeric(other) {
-            if matches!(common, DataType::Float32 | DataType::Float64)
-                || matches!(other, DataType::Float32 | DataType::Float64)
-            {
-                // An existing approximate operand determines the numeric family.
-                DataType::Float64
-            } else if (novarocks_types::largeint::is_largeint_data_type(&common)
-                && matches!(
-                    other,
-                    DataType::Decimal128(_, _) | DataType::Decimal256(_, _)
-                ))
-                || (matches!(
-                    common,
-                    DataType::Decimal128(_, _) | DataType::Decimal256(_, _)
-                ) && novarocks_types::largeint::is_largeint_data_type(other))
-            {
-                // All signed i128 values require 39 decimal integer digits.
-                let decimal = |ty: &DataType| {
-                    if novarocks_types::largeint::is_largeint_data_type(ty) {
-                        DataType::Decimal256(39, 0)
-                    } else {
-                        ty.clone()
-                    }
-                };
-                novarocks_types::coercion::decimal_compare_type(&decimal(&common), &decimal(other))
-                    .map_err(AnalyzeError::domain_source)?
-            } else {
-                match comparison_common_type(&common, other).map_err(AnalyzeError::domain_source)? {
-                    Some(target) => target,
-                    None if common == **other => common,
-                    None => {
-                        return Err(AnalyzeError::internal(format!(
-                            "field has no exact numeric common type for {common:?} and {other:?}"
-                        )));
-                    }
-                }
-            }
-        } else {
-            // FIELD's mixed-family contract is DOUBLE, unlike ordinary `=`.
-            // Ordinary SQL CAST owns invalid string handling; never parse here.
-            DataType::Float64
-        };
-    }
-    args.into_iter()
-        .map(|arg| {
-            let can_introduce_null = *arg.value_type.data_type() != common
-                && string(arg.value_type.data_type())
-                && !string(&common);
-            let mut cast = coerce_function_argument(arg, &common, decimal_overflow_policy)
-                .map_err(AnalyzeError::internal)?;
-            // Ordinary string-to-numeric CAST may produce NULL for invalid input.
-            cast.value_type = cast
-                .value_type
-                .with_nullable(cast.value_type.nullable() || (can_introduce_null))
-                .expect("validated root NULL contract");
-            Ok(cast)
-        })
-        .collect()
-}
 
 fn selected_call_shape_matches_observed(
     binding: &novarocks_functions::ResolvedFunctionBinding,
@@ -5832,9 +5181,6 @@ pub(super) fn bind_scalar_function_call_with_catalog(
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<BoundScalarCall, AnalyzeError> {
     apply_implicit_string_function_casts(name, &mut args);
-    if name.eq_ignore_ascii_case("field") {
-        args = normalize_field_arguments(args, decimal_overflow_policy)?;
-    }
     let arg_types = args
         .iter()
         .map(|arg| arg.value_type.data_type().clone())
@@ -5939,6 +5285,7 @@ pub(super) fn resolve_aggregate_function_call(
     resolve_aggregate_function_call_with_order(
         function_catalog,
         name,
+        false,
         args,
         &[],
         span,
@@ -5952,6 +5299,7 @@ pub(super) fn resolve_aggregate_function_call(
 fn resolve_aggregate_function_call_with_order(
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     name: &str,
+    distinct: bool,
     args: &[TypedExpr],
     function_order_by: &[SortItem],
     span: Span,
@@ -5964,12 +5312,12 @@ fn resolve_aggregate_function_call_with_order(
         .iter()
         .map(|argument| argument.value_type.data_type().clone())
         .collect::<Vec<_>>();
-    crate::functions::resolve_sql_aggregate_binding(
+    crate::functions::resolve_sql_aggregate_call(
         function_catalog,
         name,
+        distinct,
         args,
         function_order_by,
-        false,
         constant_policy,
         control,
     )
@@ -6004,15 +5352,8 @@ fn resolve_aggregate_function_call_with_order(
     })
 }
 
-fn is_analyzer_aggregate_macro(name: &str) -> bool {
-    matches!(
-        name,
-        "ds_hll_accumulate" | "ds_hll_combine" | "ds_hll_estimate"
-    )
-}
-
 fn is_analyzer_aggregate_syntax(name: &str) -> bool {
-    name == "every" || is_analyzer_aggregate_macro(name)
+    name == "every"
 }
 
 fn aggregate_arg_cast_type(name: &str, input_type: &DataType) -> Option<DataType> {
@@ -6576,7 +5917,7 @@ fn parse_multi_param_lambda(expr: &ast::Expr) -> Option<(Vec<String>, &ast::Expr
 /// `map_apply` (body returns 2-tuple), `transform_keys` (body returns scalar
 /// new key), `transform_values` (body returns scalar new value).
 fn is_map_higher_order_function_with_lambda(name: &str, arg_exprs: &[&ast::Expr]) -> bool {
-    matches!(name, "map_apply" | "transform_keys" | "transform_values")
+    matches!(name, "transform_keys" | "transform_values")
         && arg_exprs.len() == 2
         && arg_exprs
             .first()
@@ -6708,16 +6049,6 @@ fn sql_expr_logical_type_name(expr: &ast::Expr) -> Option<String> {
             let name = print_object_name(&function.name).to_ascii_lowercase();
             let name = name.split('.').next_back().unwrap_or(name.as_str());
             match name {
-                n if n.starts_with("bitmap_")
-                    || n == "to_bitmap"
-                    || n == "bitmap_agg"
-                    || n == "bitmap_union" =>
-                {
-                    Some("bitmap".to_string())
-                }
-                n if n.starts_with("hll_") || n == "hll_empty" || n == "hll_hash" => {
-                    Some("hll".to_string())
-                }
                 "parse_json" | "json_object" | "json_array" | "to_json" => Some("json".to_string()),
                 _ => None,
             }
@@ -8425,10 +7756,8 @@ mod tests {
     #[test]
     fn map_higher_order_preserves_complete_json_and_same_carrier_string_children() {
         use novarocks_type_contract::ValueLogicalType;
-        for function in ["transform_values", "transform_keys", "map_apply"] {
-            let body = if function == "map_apply" {
-                "(k,v)"
-            } else if function == "transform_keys" {
+        for function in ["transform_values", "transform_keys"] {
+            let body = if function == "transform_keys" {
                 "k"
             } else {
                 "v"
@@ -8960,123 +8289,6 @@ mod tests {
             )
             .unwrap();
             assert_json_list_scalar_owner(&expression, "builtin.scalar/array_sortby/v1");
-        }
-    }
-
-    #[test]
-    fn slice_calls_freeze_temporal_result_and_materialize_input_cast_before_binding() {
-        for (sql, date) in [
-            (
-                "select time_slice('2023-12-31 03:12:04',2147483647, 'year')",
-                false,
-            ),
-            (
-                "select time_slice(cast('2020-01-01' as date),1, 'day','ceil')",
-                false,
-            ),
-            ("select time_slice('2020-01-01',1)", false),
-            ("select time_slice('2020-01-01',(1))", false),
-            ("select time_slice('2020-01-01',1,ceil)", false),
-            ("select time_slice('2020-01-01',1, 'day',(CEIL))", false),
-            ("select time_slice(null,1,'day','floor')", false),
-            ("select date_slice('2020-01-01 12:00:00',1, 'day')", true),
-            (
-                "select date_slice(cast('2020-01-01' as datetime),1,'day','ceil')",
-                true,
-            ),
-            (
-                "select date_slice(cast('2020-01-01' as date),1, 'month')",
-                true,
-            ),
-        ] {
-            let expr =
-                analyze_projection_expr(sql).unwrap_or_else(|error| panic!("{sql}: {error}"));
-            let domain = if date {
-                DataType::Date32
-            } else {
-                DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None)
-            };
-            assert_eq!(expr.value_type.data_type().clone(), domain);
-            assert!(expr.value_type.nullable());
-            let ExprKind::FunctionCall { binding, args, .. } = &expr.kind else {
-                panic!("expected bound slice call")
-            };
-            assert_eq!(
-                binding.function_id.as_str(),
-                if date {
-                    "builtin.scalar/date_slice/v1"
-                } else {
-                    "builtin.scalar/time_slice/v1"
-                }
-            );
-            assert_eq!(args[0].value_type.data_type().clone(), domain);
-            assert_eq!(args[1].value_type.data_type().clone(), DataType::Int32);
-            assert!(!args[1].value_type.nullable());
-            let novarocks_functions::FunctionResultType::Scalar(result) =
-                &binding.selected.result_type
-            else {
-                panic!("expected scalar")
-            };
-            assert_eq!(result.data_type().clone(), domain);
-            assert!(result.nullable());
-            for (argument, selected) in args.iter().zip(&binding.selected.argument_types) {
-                let novarocks_functions::FunctionArgumentType::Value(selected) = selected else {
-                    panic!("expected value")
-                };
-                assert_eq!(argument.value_type.data_type(), selected.data_type());
-                assert_eq!(argument.value_type.nullable(), selected.nullable());
-            }
-        }
-    }
-
-    #[test]
-    fn slice_calls_fail_fast_for_invalid_interval_unit_boundary_and_input() {
-        for (sql, fragment) in [
-            ("select time_slice('2020-01-01',0, 'day')", "greater than 0"),
-            (
-                "select time_slice('2020-01-01',-1, 'day')",
-                "greater than 0",
-            ),
-            (
-                "select date_slice('2020-01-01',3.2, 'day')",
-                "constant interval",
-            ),
-            (
-                "select time_slice('2020-01-01',2147483648, 'day')",
-                "fit INT32",
-            ),
-            (
-                "select time_slice('2020-01-01',null,'day','floor')",
-                "constant interval",
-            ),
-            (
-                "select time_slice('2020-01-01','1','day','floor')",
-                "constant interval",
-            ),
-            (
-                "select time_slice('2020-01-01',1+1,'day','floor')",
-                "constant interval",
-            ),
-            ("select date_slice(null,1, 'hour')", "can't use time_slice"),
-            (
-                "select date_slice('2020-01-01',1,'microsecond','floor')",
-                "can't use time_slice",
-            ),
-            (
-                "select time_slice(null,1,'century','floor')",
-                "unsupported unit",
-            ),
-            (
-                "select time_slice(null,1,'day','round')",
-                "boundary floor/ceil",
-            ),
-            (
-                "select time_slice([1],1,'day','floor')",
-                "first argument cannot be cast",
-            ),
-        ] {
-            let error = analyze_projection_expr(sql).unwrap_err();
-            assert!(error.contains(fragment), "{sql}: {error}");
         }
     }
 
@@ -10295,7 +9507,7 @@ mod tests {
         )
         .expect_err("hidden aggregate must not be admitted as a window function");
 
-        assert!(error.contains("hidden from user SQL"), "{error}");
+        assert!(error.contains("Unknown function"), "{error}");
         assert!(!error.contains("aggregate function"));
     }
 
@@ -10321,42 +9533,6 @@ mod tests {
     }
 
     #[test]
-    fn ds_hll_macros_resolve_only_their_executable_expansion() {
-        let accumulate =
-            analyze_projection_expr("select ds_hll_accumulate(1)").expect("macro should analyze");
-        let crate::analysis::ExprKind::AggregateCall {
-            name,
-            args,
-            distinct,
-            ..
-        } = accumulate.kind
-        else {
-            panic!("expected aggregate call, got {:?}", accumulate.kind);
-        };
-        assert_eq!(name, "ds_hll_count_distinct_union");
-        assert!(!distinct);
-        let [state] = args.as_slice() else {
-            panic!("expected one scalar state argument");
-        };
-        assert!(matches!(
-            &state.kind,
-            crate::analysis::ExprKind::FunctionCall { name, .. }
-                if name == "ds_hll_count_distinct_state"
-        ));
-        assert_eq!(state.value_type.data_type().clone(), DataType::Binary);
-        assert_eq!(accumulate.value_type.data_type().clone(), DataType::Binary);
-
-        let estimate =
-            analyze_projection_expr("select ds_hll_estimate(ds_hll_count_distinct_state(1))")
-                .expect("estimate macro should analyze");
-        let crate::analysis::ExprKind::AggregateCall { name, .. } = estimate.kind else {
-            panic!("expected aggregate call, got {:?}", estimate.kind);
-        };
-        assert_eq!(name, "ds_hll_count_distinct_merge");
-        assert_eq!(estimate.value_type.data_type().clone(), DataType::Int64);
-    }
-
-    #[test]
     fn sqlx1_function_array_sort_lambda_rejects_extended_clock_functions() {
         // array_sort validates its lambda body through this same helper.  The
         // seven entries below were missing from the old analyzer-local list
@@ -10367,8 +9543,6 @@ mod tests {
             "curtime",
             "localtime",
             "localtimestamp",
-            "utc_timestamp",
-            "utc_time",
         ] {
             let body = crate::analysis::TypedExpr {
                 kind: crate::analysis::ExprKind::FunctionCall {
@@ -11262,149 +10436,6 @@ mod tests {
             assert!(resolved("SELECT string_agg('a','-' ORDER BY 2)", mode).is_err());
         }
     }
-    #[test]
-    fn field_binding_freezes_the_comparison_family() {
-        use crate::analysis::ExprKind;
-        for (sql, expected) in [
-            ("select field('01', '1')", DataType::Utf8),
-            ("select field('01', '1', 1)", DataType::Float64),
-            (
-                "select field(cast(1 as int), cast(1 as bigint))",
-                DataType::Int64,
-            ),
-            (
-                "select field(cast(1 as float), cast(1 as double))",
-                DataType::Float64,
-            ),
-            ("select field(true, true)", DataType::Float64),
-            (
-                "select field(cast('2022-02-02' as date), cast('2022-02-02' as datetime))",
-                DataType::Float64,
-            ),
-            ("select field(NULL, NULL)", DataType::Int32),
-            ("select field(NULL, 2147483648)", DataType::Int64),
-            ("select field(NULL, NULL, 1)", DataType::Int32),
-            ("select field(NULL, 2147483648, 'bad')", DataType::Float64),
-        ] {
-            let expr = analyze_projection_expr(sql).unwrap();
-            assert_eq!(
-                expr.value_type.data_type().clone(),
-                DataType::Int32,
-                "{sql}"
-            );
-            assert!(
-                !expr.value_type.nullable(),
-                "FIELD result is always a non-NULL INT: {sql}"
-            );
-            let ExprKind::FunctionCall { args, binding, .. } = expr.kind else {
-                panic!("expected FIELD");
-            };
-            assert!(
-                args.iter()
-                    .all(|arg| *arg.value_type.data_type() == expected),
-                "{sql}: {args:?}"
-            );
-            assert!(binding.selected.argument_types.iter().all(|arg| matches!(arg,
-                novarocks_functions::FunctionArgumentType::Value(value) if *value.data_type() == expected)), "{sql}");
-        }
-        let expr = analyze_projection_expr("select field('bad', '1', 1)").unwrap();
-        let ExprKind::FunctionCall { args, .. } = expr.kind else {
-            panic!("expected FIELD");
-        };
-        assert!(matches!(args[0].kind, ExprKind::Cast { .. }));
-        assert!(
-            args[0].value_type.nullable() && args[1].value_type.nullable(),
-            "invalid numeric strings may cast to NULL"
-        );
-    }
-
-    #[test]
-    fn field_common_type_retains_explicit_cast_boundaries() {
-        use crate::analysis::ExprKind;
-        let expr = analyze_projection_expr("select field(cast('01' as varchar), 1)").unwrap();
-        let ExprKind::FunctionCall { args, .. } = expr.kind else {
-            panic!("expected FIELD");
-        };
-        let ExprKind::Cast {
-            array_failure_mode: None,
-            expr: inner,
-            target,
-            decimal_overflow_policy,
-        } = &args[0].kind
-        else {
-            panic!("expected common DOUBLE cast");
-        };
-        assert_eq!(*target, DataType::Float64);
-        assert_eq!(
-            *decimal_overflow_policy,
-            novarocks_type_contract::DecimalOverflowPolicy::OutputNull
-        );
-        assert!(matches!(
-            &inner.kind,
-            ExprKind::Cast {
-                target: DataType::Utf8,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn field_exact_numeric_binding_preserves_largeint_and_decimal_capacity() {
-        use crate::analysis::{ExprKind, LiteralValue, TypedExpr};
-        let arg = |data_type: DataType| TypedExpr {
-            kind: ExprKind::Literal(LiteralValue::Null),
-            value_type: novarocks_type_contract::FunctionValueType::new(data_type, true),
-        };
-        for (types, expected) in [
-            (
-                vec![DataType::Int64, DataType::FixedSizeBinary(16)],
-                DataType::FixedSizeBinary(16),
-            ),
-            (
-                vec![DataType::Decimal128(20, 1), DataType::Int64],
-                DataType::Decimal128(20, 1),
-            ),
-            (
-                vec![DataType::Decimal128(38, 20), DataType::Int64],
-                DataType::Decimal256(39, 20),
-            ),
-            (
-                vec![DataType::FixedSizeBinary(16), DataType::Decimal128(38, 2)],
-                DataType::Decimal256(41, 2),
-            ),
-        ] {
-            let bound =
-                super::bind_scalar_function_call("field", types.into_iter().map(arg).collect())
-                    .unwrap();
-            assert!(
-                bound
-                    .args
-                    .iter()
-                    .all(|arg| *arg.value_type.data_type() == expected)
-            );
-        }
-        let error = match super::bind_scalar_function_call(
-            "field",
-            vec![
-                arg(DataType::Decimal256(76, 0)),
-                arg(DataType::Decimal256(76, 38)),
-            ],
-        ) {
-            Ok(_) => panic!("precision overflow must fail"),
-            Err(error) => error,
-        };
-        assert!(error.message().contains("precision overflow"), "{error}");
-    }
-
-    #[test]
-    fn field_rejects_arity_and_container_types_during_binding() {
-        assert!(analyze_projection_expr("select field(1)").is_err());
-        assert!(
-            analyze_projection_expr("select field([1], [1])")
-                .unwrap_err()
-                .contains("does not support argument type")
-        );
-    }
 
     fn assert_array_concat_binding(expression: &crate::analysis::TypedExpr) {
         let ExprKind::FunctionCall {
@@ -12019,67 +11050,22 @@ mod tests {
                 "{sql}: {error}"
             );
         }
-        assert!(
-            analyze_projection_expr("select next_day('2020-01-01') where false")
-                .unwrap_err()
-                .contains("no matching declared overload")
-        );
-        let installed = analyze_projection_expr(
+        for sql in [
+            "select next_day('2020-01-01') where false",
             "select next_day(cast('2020-01-01' as date), 'Monday') where false",
-        )
-        .unwrap();
-        assert_eq!(installed.value_type.data_type(), &DataType::Date32);
+        ] {
+            let error = analyze_projection_expr(sql).unwrap_err();
+            assert!(error.contains("Unknown function"), "{sql}: {error}");
+        }
         let unknown =
             analyze_projection_expr("select not_an_advertised_builtin(1) where false").unwrap_err();
         assert!(unknown.contains("Unknown function"), "{unknown}");
     }
 
     #[test]
-    fn installed_next_day_binds_two_arguments_before_false_filter_pruning() {
-        use novarocks_functions::builtin::intrinsic::{BuiltinDisposition, builtin_disposition};
-
-        assert!(matches!(
-            builtin_disposition("next_day"),
-            Some(BuiltinDisposition::InstalledScalar(_))
-        ));
-        let expression =
-            analyze_projection_expr("select next_day('2020-01-01', 'MONDAY') where false")
-                .expect("installed next_day must bind its declared two-argument profile");
-        assert_eq!(*expression.value_type.data_type(), DataType::Date32);
-        let ExprKind::FunctionCall {
-            name,
-            args,
-            binding,
-            ..
-        } = &expression.kind
-        else {
-            panic!("next_day must retain its exact scalar binding");
-        };
-        assert_eq!(name, "next_day");
-        assert_eq!(args.len(), 2);
-        assert_eq!(binding.logical_argument_count, 2);
-        assert_eq!(binding.function_id.as_str(), "builtin.scalar/next_day/v1");
-    }
-
-    #[test]
-    fn next_day_invalid_arity_is_rejected_before_false_filter_pruning() {
-        let error =
-            analyze_projection_expr("select next_day('2020-01-01') where false").unwrap_err();
-        assert!(
-            error.contains("cannot bind scalar function `next_day`"),
-            "{error}"
-        );
-        assert!(error.contains("no matching declared overload"), "{error}");
-    }
-
-    #[test]
     fn authoritative_lowering_retains_alias_and_non_row_boundaries() {
         for (sql, expected) in [
             ("select every(true)", "bool_and"),
-            (
-                "select approx_count_distinct_hll_sketch(1)",
-                "ds_hll_count_distinct",
-            ),
             ("select max_by(1,2)", "max_by"),
         ] {
             let typed = analyze_projection_expr(sql).unwrap();
@@ -12126,52 +11112,6 @@ mod tests {
             ExprKind::Case { .. }
         ));
         // Existing grouping-marker tests prove GROUPING is replaced by exact ColumnId.
-    }
-    #[test]
-    fn field_implicit_decimal_casts_inherit_the_query_policy() {
-        use crate::analysis::ExprKind;
-        use novarocks_type_contract::DecimalOverflowPolicy::{OutputNull, ReportError};
-        let strict = "WITH SESSION sql_mode='ERROR_IF_OVERFLOW'";
-        let relaxed = "WITH SESSION sql_mode=32";
-        for (root, expected) in [
-            ("", OutputNull),
-            (strict, ReportError),
-            (relaxed, OutputNull),
-        ] {
-            let sql = format!(
-                "{root} SELECT FIELD(d.k,d.c) AS f FROM (SELECT CAST(1 AS DECIMAL(3,0)) k,CAST(1 AS BIGINT) c) d"
-            );
-            let typed = analyze_projection_expr(&sql).unwrap();
-            let ExprKind::FunctionCall { args, binding, .. } = typed.kind else {
-                panic!("expected FIELD: {sql}")
-            };
-            assert_eq!(args.len(), 2);
-            assert_eq!(binding.decimal_overflow_policy(), expected, "{sql}");
-            assert_eq!(typed.value_type.data_type().clone(), DataType::Int32);
-            assert!(
-                binding
-                    .selected
-                    .argument_types
-                    .iter()
-                    .all(|arg| matches!(arg,
-                novarocks_functions::FunctionArgumentType::Value(value)
-                    if *value.data_type() == DataType::Decimal128(19, 0)))
-            );
-            for arg in args {
-                let ExprKind::Cast {
-                    array_failure_mode: None,
-                    expr,
-                    target,
-                    decimal_overflow_policy,
-                } = arg.kind
-                else {
-                    panic!("expected an automatic common-type cast: {sql}")
-                };
-                assert!(matches!(expr.kind, ExprKind::ColumnRef { .. }));
-                assert_eq!(target, DataType::Decimal128(19, 0));
-                assert_eq!(decimal_overflow_policy, expected, "{sql}");
-            }
-        }
     }
 
     #[test]

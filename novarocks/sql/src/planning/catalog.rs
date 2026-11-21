@@ -874,47 +874,6 @@ mod tests {
     use crate::planner::table::{ScanSource, SqlScanKind};
 
     #[test]
-    fn m07_external_view_rejects_private_producer_before_schema_projection() {
-        let catalog = PlannerMemoryCatalog::default();
-        let functions = crate::functions::builtin_sql_function_catalog();
-        for sql in [
-            "SELECT percentile_empty() AS state",
-            "SELECT percentile_hash(CAST(1 AS DOUBLE)) AS state",
-        ] {
-            let query = &novarocks_parser::parser::parse_query(sql).unwrap();
-            let error = analyze_view_query(
-                query,
-                &catalog,
-                "default",
-                functions,
-                crate::constant::test_constant_policy(),
-                &crate::compiler::SqlCompileControl::unbounded(),
-            )
-            .map_err(|error| error.to_string())
-            .expect_err("private producer must not become VARBINARY");
-            assert_eq!(
-                error,
-                "Object and Percentile result domains are unsupported for persisted schemas"
-            );
-        }
-        let query = &novarocks_parser::parser::parse_query(
-            "SELECT bitmap_to_binary(to_bitmap(1)) AS ordinary",
-        )
-        .unwrap();
-        let columns = analyze_view_query(
-            query,
-            &catalog,
-            "default",
-            functions,
-            crate::constant::test_constant_policy(),
-            &crate::compiler::SqlCompileControl::unbounded(),
-        )
-        .map_err(|error| error.to_string())
-        .expect("ordinary Binary view remains admitted");
-        assert_eq!(columns[0].data_type, arrow::datatypes::DataType::Binary);
-    }
-
-    #[test]
     fn m07_external_view_rejects_complete_nested_private_type_without_top_domain() {
         use arrow::datatypes::{DataType, Field};
         use novarocks_types::logical::{LogicalType, field_with_logical_type};

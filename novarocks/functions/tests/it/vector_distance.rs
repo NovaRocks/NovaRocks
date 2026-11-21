@@ -90,36 +90,21 @@ fn assert_values(output: (Vec<Option<f64>>, Vec<RowDataError>), expected: &[Opti
 }
 
 #[test]
-fn vector_names_preserve_cosine_normalized_dot_and_squared_l2() {
+fn vector_names_preserve_cosine_and_squared_l2() {
     let base = vector(&[Some(3.0), Some(4.0)]);
     let target = vector(&[Some(6.0), Some(8.0)]);
-    for (name, expected) in [
-        ("cosine_similarity", 1.0),
-        ("approx_cosine_similarity", 1.0),
-        ("cosine_similarity_norm", 50.0),
-        ("l2_distance", 25.0),
-        ("approx_l2_distance", 25.0),
-    ] {
+    for (name, expected) in [("cosine_similarity", 1.0), ("l2_distance", 25.0)] {
         assert_values(pair(name, &base, &target), &[Some(expected)]);
     }
 
     let zero = vector(&[Some(0.0), Some(0.0)]);
     assert_values(pair("cosine_similarity", &zero, &base), &[Some(0.0)]);
-    assert_values(
-        pair(
-            "cosine_similarity_norm",
-            &vector(&[Some(1e16), Some(1.0), Some(-1e16)]),
-            &vector(&[Some(1.0); 3]),
-        ),
-        &[Some(0.0)],
-    );
 }
 
 #[test]
 fn vector_final_nonfinite_values_are_successful_nulls() {
     for (name, base, target) in [
         ("cosine_similarity", f64::INFINITY, 1.0),
-        ("cosine_similarity_norm", f64::MAX, 2.0),
         ("l2_distance", f64::MAX, -f64::MAX),
         ("l2_distance", f64::NAN, 0.0),
     ] {

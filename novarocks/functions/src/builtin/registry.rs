@@ -77,10 +77,8 @@ static SCALAR_FN_SIGNATURES: LazyLock<HashMap<String, Vec<Signature>>> = LazyLoc
     register_map_fns(&mut m);
     register_bitwise_fns(&mut m);
     register_window_fns(&mut m);
-    register_bitmap_fns(&mut m);
     register_hll_fns(&mut m);
     register_json_fns(&mut m);
-    register_iceberg_transform_fns(&mut m);
     register_mv_state_fns(&mut m);
     register_misc_fns(&mut m);
     register_aggregate_in_expr_fns(&mut m);
@@ -153,7 +151,6 @@ fn register_string_fns(m: &mut HashMap<String, Vec<Signature>>) {
         "url_encode",
         "url_decode",
         "char",
-        "sm3",
     ] {
         add(
             m,
@@ -170,11 +167,6 @@ fn register_string_fns(m: &mut HashMap<String, Vec<Signature>>) {
 
     // md5sum hashes the bytes of whatever it is given, over any number of
     // arguments -- it is not one of the string transforms it was grouped with.
-    add(
-        m,
-        "md5sum",
-        Signature::variadic(vec![TypeSpec::AnyType], TypeSpec::Utf8),
-    );
 
     // These were grouped with the one-argument string transforms above, but
     // none of them is one: they differ in arity, in what they take, or in
@@ -197,24 +189,6 @@ fn register_string_fns(m: &mut HashMap<String, Vec<Signature>>) {
             ],
             TypeSpec::Utf8,
         ),
-    );
-    // money_format renders a number, not a string.
-    for argument in [
-        TypeSpec::Int64,
-        TypeSpec::Float64,
-        TypeSpec::AnyDecimal128,
-        TypeSpec::Utf8,
-    ] {
-        add(
-            m,
-            "money_format",
-            Signature::new(vec![argument], TypeSpec::Utf8),
-        );
-    }
-    add(
-        m,
-        "append_trailing_char_if_absent",
-        Signature::new(vec![TypeSpec::Utf8, TypeSpec::Utf8], TypeSpec::Utf8),
     );
     add(
         m,
@@ -253,15 +227,7 @@ fn register_string_fns(m: &mut HashMap<String, Vec<Signature>>) {
     );
 
     // (Utf8) -> Int32 — length / position / ascii family.
-    for name in [
-        "length",
-        "char_length",
-        "character_length",
-        "bit_length",
-        "octet_length",
-        "ascii",
-        "ord",
-    ] {
+    for name in ["length", "char_length", "character_length", "ascii"] {
         add(
             m,
             name,
@@ -270,14 +236,7 @@ fn register_string_fns(m: &mut HashMap<String, Vec<Signature>>) {
     }
 
     // (Utf8, Utf8) -> Int32 — multi-string position / compare.
-    for name in [
-        "instr",
-        "locate",
-        "position",
-        "find_in_set",
-        "strcmp",
-        "regexp_position",
-    ] {
+    for name in ["instr", "locate", "position", "regexp_position"] {
         add(
             m,
             name,
@@ -311,14 +270,6 @@ fn register_string_fns(m: &mut HashMap<String, Vec<Signature>>) {
     );
     // FIELD's SQL owner normalizes all arguments to one comparison type.
     // Two fixed arguments plus the repeated variadic tail enforce min arity 2.
-    add(
-        m,
-        "field",
-        Signature::variadic(
-            vec![TypeSpec::Any("T"), TypeSpec::Any("T"), TypeSpec::Any("T")],
-            TypeSpec::Int32,
-        ),
-    );
     // `equiwidth_bucket` and `regexp_count` return Int64 instead of Int32.
     add(
         m,
@@ -349,13 +300,11 @@ fn register_string_fns(m: &mut HashMap<String, Vec<Signature>>) {
             TypeSpec::Utf8,
         ),
     );
-    for name in ["elt", "format"] {
-        add(
-            m,
-            name,
-            Signature::variadic(vec![TypeSpec::Utf8], TypeSpec::Utf8),
-        );
-    }
+    add(
+        m,
+        "format",
+        Signature::variadic(vec![TypeSpec::Utf8], TypeSpec::Utf8),
+    );
 
     // (Utf8, Utf8, Utf8) -> Utf8 — three-arg string rewrites. The executor
     // takes exactly three arguments for each of these and the analyzer coerces
@@ -378,12 +327,7 @@ fn register_string_fns(m: &mut HashMap<String, Vec<Signature>>) {
     // It is 32-bit and coercing for the same reason `substring`'s position is:
     // a literal ordinal analyzes as `Int32`, and a wider declaration would
     // match none of the calls anyone writes.
-    for name in [
-        "regexp_extract",
-        "regexp_extract_all",
-        "split_part",
-        "substring_index",
-    ] {
+    for name in ["regexp_extract", "regexp_extract_all", "split_part"] {
         add(
             m,
             name,
@@ -458,11 +402,6 @@ fn register_string_fns(m: &mut HashMap<String, Vec<Signature>>) {
     );
 
     // space(n) -> str
-    add(
-        m,
-        "space",
-        Signature::new(vec![TypeSpec::Int64], TypeSpec::Utf8),
-    );
 
     // sha2(str, bits) -> str
     add(
@@ -525,8 +464,8 @@ fn register_numeric_fns(m: &mut HashMap<String, Vec<Signature>>) {
     // it alongside the math family.
     for name in [
         "sqrt", "dsqrt", "cbrt", "exp", "dexp", "ln", "log2", "log10", "dlog10", "dlog1", "dround",
-        "sin", "cos", "tan", "asin", "acos", "atan", "sinh", "cosh", "tanh", "cot", "square",
-        "radians", "degrees", "degress", "sign", "positive",
+        "sin", "cos", "tan", "asin", "acos", "atan", "sinh", "cosh", "tanh", "radians", "degrees",
+        "degress", "sign", "positive",
     ] {
         for t in NUMERIC_PRESERVING_TYPES {
             add(m, name, Signature::new(vec![t.clone()], TypeSpec::Float64));
@@ -560,7 +499,7 @@ fn register_numeric_fns(m: &mut HashMap<String, Vec<Signature>>) {
 
     // Two-arg math returning Float64.
     for name in [
-        "pow", "fpow", "dpow", "power", "log", "mod", "fmod", "pmod", "atan2",
+        "pow", "fpow", "dpow", "power", "log", "mod", "fmod", "atan2",
     ] {
         for tl in NUMERIC_PRESERVING_TYPES {
             for tr in NUMERIC_PRESERVING_TYPES {
@@ -590,13 +529,7 @@ fn register_numeric_fns(m: &mut HashMap<String, Vec<Signature>>) {
     );
 
     // Vector distance — varies in arity but always returns Float64.
-    for name in [
-        "cosine_similarity",
-        "cosine_similarity_norm",
-        "approx_cosine_similarity",
-        "l2_distance",
-        "approx_l2_distance",
-    ] {
+    for name in ["cosine_similarity", "l2_distance"] {
         // Take two list-of-numeric arguments. For simplicity we accept
         // any List + List and let cast/runtime checks reject bad inputs.
         add(
@@ -643,8 +576,6 @@ fn register_datetime_fns(m: &mut HashMap<String, Vec<Signature>>) {
         "curtime",
         "localtimestamp",
         "localtime",
-        "utc_timestamp",
-        "utc_time",
         "curdate",
         "current_date",
     ] {
@@ -653,18 +584,16 @@ fn register_datetime_fns(m: &mut HashMap<String, Vec<Signature>>) {
 
     // to_datetime(epoch[, scale]) reads a unix timestamp; it is not one of
     // the no-argument clock functions it used to be grouped with.
-    for name in ["to_datetime", "to_datetime_ntz"] {
-        add(
-            m,
-            name,
-            Signature::new(vec![TypeSpec::Int64], TypeSpec::Datetime),
-        );
-        add(
-            m,
-            name,
-            Signature::new(vec![TypeSpec::Int64, TypeSpec::Int64], TypeSpec::Datetime),
-        );
-    }
+    add(
+        m,
+        "to_datetime",
+        Signature::new(vec![TypeSpec::Int64], TypeSpec::Datetime),
+    );
+    add(
+        m,
+        "to_datetime",
+        Signature::new(vec![TypeSpec::Int64, TypeSpec::Int64], TypeSpec::Datetime),
+    );
 
     // convert_tz(datetime, str, str) -> datetime
     add(
@@ -707,7 +636,7 @@ fn register_datetime_fns(m: &mut HashMap<String, Vec<Signature>>) {
     // arity — NovaRocks's legacy path returns Utf8 for `from_unixtime`
     // unconditionally, including the bare `from_unixtime(unix_ts)` form
     // which arguably should return Datetime; matching legacy for now).
-    for name in ["date_format", "time_format", "from_unixtime"] {
+    for name in ["date_format", "from_unixtime"] {
         add(
             m,
             name,
@@ -751,8 +680,6 @@ fn register_datetime_fns(m: &mut HashMap<String, Vec<Signature>>) {
         "minutes_sub",
         "seconds_add",
         "seconds_sub",
-        "microseconds_add",
-        "microseconds_sub",
     ];
     // The interval position accepts anything that spells a whole number --
     // a string, a float, a decimal -- and an interval that does not spell one
@@ -781,11 +708,6 @@ fn register_datetime_fns(m: &mut HashMap<String, Vec<Signature>>) {
         );
     }
     // sec_to_time formats an integer second count as a TIME string.
-    add(
-        m,
-        "sec_to_time",
-        Signature::new(vec![TypeSpec::Int64], TypeSpec::Utf8),
-    );
 
     // date_trunc(unit, datetime) -> datetime; date_trunc(unit, date) -> date
     add(
@@ -814,7 +736,6 @@ fn register_datetime_fns(m: &mut HashMap<String, Vec<Signature>>) {
         "minute",
         "second",
         "dayofweek",
-        "yearweek",
         "dayofyear",
         "weekofyear",
         "quarter",
@@ -845,11 +766,6 @@ fn register_datetime_fns(m: &mut HashMap<String, Vec<Signature>>) {
     }
 
     // hour_from_unixtime reads a unix second count, not a datetime.
-    add(
-        m,
-        "hour_from_unixtime",
-        Signature::new(vec![TypeSpec::Int64], TypeSpec::Int32),
-    );
 
     // Diff family -> Int64.
     for name in [
@@ -895,11 +811,6 @@ fn register_datetime_fns(m: &mut HashMap<String, Vec<Signature>>) {
     }
 
     // to_days / time_to_sec measure one instant, not the distance between two.
-    for name in ["to_days", "time_to_sec"] {
-        for argument in [TypeSpec::Datetime, TypeSpec::Date, TypeSpec::Utf8] {
-            add(m, name, Signature::new(vec![argument], TypeSpec::Int64));
-        }
-    }
     // unix_timestamp / to_unix_timestamp - 0 or 1 arg
     for name in ["unix_timestamp", "to_unix_timestamp"] {
         add(m, name, Signature::new(vec![], TypeSpec::Int64));
@@ -920,32 +831,12 @@ fn register_datetime_fns(m: &mut HashMap<String, Vec<Signature>>) {
         );
     }
 
-    // Date constructors -> Date32.
-    // makedate(year, day-of-year) builds a date from two numbers; the group
-    // below converts one value into a date, which is a different shape.
-    add(
-        m,
-        "makedate",
-        Signature::new(vec![TypeSpec::Int64, TypeSpec::Int64], TypeSpec::Date)
-            .with_argument_coercion(),
-    );
-    // Keep the existing to_date profiles independent of the finite constructor family.
-    for argument in [TypeSpec::Utf8, TypeSpec::Int64, TypeSpec::Datetime] {
-        add(m, "to_date", Signature::new(vec![argument], TypeSpec::Date));
-    }
     // Match the actual native date helper argument shapes and supported carriers.
     add(
         m,
         "str_to_date",
         Signature::new(vec![TypeSpec::Utf8, TypeSpec::Utf8], TypeSpec::Date),
     );
-    for argument in [TypeSpec::Int32, TypeSpec::Int64] {
-        add(
-            m,
-            "from_days",
-            Signature::new(vec![argument], TypeSpec::Date),
-        );
-    }
     for argument in [TypeSpec::Date, TypeSpec::Datetime, TypeSpec::Utf8] {
         add(
             m,
@@ -957,13 +848,6 @@ fn register_datetime_fns(m: &mut HashMap<String, Vec<Signature>>) {
             "last_day",
             Signature::new(vec![argument.clone(), TypeSpec::Utf8], TypeSpec::Date),
         );
-        for name in ["next_day", "previous_day"] {
-            add(
-                m,
-                name,
-                Signature::new(vec![argument.clone(), TypeSpec::Utf8], TypeSpec::Date),
-            );
-        }
     }
     // `date(x)` extracts a Date from a Datetime or Date.
     add(
@@ -984,34 +868,6 @@ fn register_datetime_fns(m: &mut HashMap<String, Vec<Signature>>) {
 
     // SQL normalizes each call to its frozen temporal domain before binding.
     // StarRocks TIME_SLICE is DATETIME -> DATETIME; DATE_SLICE is DATE -> DATE.
-    for (name, temporal) in [
-        ("time_slice", TypeSpec::Datetime),
-        ("date_slice", TypeSpec::Date),
-    ] {
-        add(
-            m,
-            name,
-            Signature::new(
-                vec![temporal.clone(), TypeSpec::Int32, TypeSpec::Utf8],
-                temporal.clone(),
-            )
-            .with_argument_coercion(),
-        );
-        add(
-            m,
-            name,
-            Signature::new(
-                vec![
-                    temporal.clone(),
-                    TypeSpec::Int32,
-                    TypeSpec::Utf8,
-                    TypeSpec::Utf8,
-                ],
-                temporal,
-            )
-            .with_argument_coercion(),
-        );
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1197,7 +1053,7 @@ fn register_array_fns(m: &mut HashMap<String, Vec<Signature>>) {
 
     // Two-list boolean predicates. Each side carries its own element
     // variable: these compare membership, not a shared element type.
-    for name in ["array_contains_all", "array_contains_seq", "arrays_overlap"] {
+    for name in ["array_contains_seq", "arrays_overlap"] {
         add(
             m,
             name,
@@ -1252,17 +1108,6 @@ fn register_array_fns(m: &mut HashMap<String, Vec<Signature>>) {
     );
 
     // array_top_n(List<T>, n) -> List<T>
-    add(
-        m,
-        "array_top_n",
-        Signature::new(
-            vec![
-                TypeSpec::List(Box::new(TypeSpec::Any("T"))),
-                TypeSpec::Int64,
-            ],
-            TypeSpec::List(Box::new(TypeSpec::Any("T"))),
-        ),
-    );
 
     // array_slice(List<T>, offset[, length]) -> List<T>. The executor reads
     // both positions as BIGINT.
@@ -1407,19 +1252,17 @@ fn register_map_fns(m: &mut HashMap<String, Vec<Signature>>) {
     // Map-preserving value functions. Lambda-bearing transforms are bound by
     // the dynamic exact resolver because their lambda contract is part of the
     // selected argument shape.
-    for name in ["map_filter", "distinct_map_keys"] {
-        add(
-            m,
-            name,
-            Signature::variadic(
-                vec![TypeSpec::Map(
-                    Box::new(TypeSpec::Any("K")),
-                    Box::new(TypeSpec::Any("V")),
-                )],
-                TypeSpec::Map(Box::new(TypeSpec::Any("K")), Box::new(TypeSpec::Any("V"))),
-            ),
-        );
-    }
+    add(
+        m,
+        "map_filter",
+        Signature::variadic(
+            vec![TypeSpec::Map(
+                Box::new(TypeSpec::Any("K")),
+                Box::new(TypeSpec::Any("V")),
+            )],
+            TypeSpec::Map(Box::new(TypeSpec::Any("K")), Box::new(TypeSpec::Any("V"))),
+        ),
+    );
 
     // The frozen non-null Null key domain is uninhabited. Preserve this
     // original Map and the independent evaluated probe, without key coercion.
@@ -1511,27 +1354,17 @@ fn register_window_fns(m: &mut HashMap<String, Vec<Signature>>) {
         "ntile",
         Signature::new(vec![TypeSpec::Int64], TypeSpec::Int64),
     );
-    // session_number(value, timeout): the gap is measured on the value's own
-    // type, which is whatever the column is rather than always 64-bit.
-    add(
-        m,
-        "session_number",
-        Signature::new(vec![TypeSpec::Any("T"), TypeSpec::Int64], TypeSpec::Int64),
-    );
     // cume_dist / percent_rank answer a position as a fraction of the
     // partition, so they are the two ranking functions that are not counts.
     for name in ["cume_dist", "percent_rank"] {
         add(m, name, Signature::new(vec![], TypeSpec::Float64));
     }
-    // grouping / grouping_id -> Int64 (also used by aggregate analyzer
-    // but appears in expression context as a virtual column).
-    for name in ["grouping", "grouping_id"] {
-        add(
-            m,
-            name,
-            Signature::variadic(vec![TypeSpec::Any("T")], TypeSpec::Int64),
-        );
-    }
+    // GROUPING appears in expression context as a virtual column.
+    add(
+        m,
+        "grouping",
+        Signature::variadic(vec![TypeSpec::Any("T")], TypeSpec::Int64),
+    );
     // lag/lead: the value's type is what comes back. The offset is a count,
     // not another value of that type, and the default is checked against the
     // value by the analyzer's own LEAD/LAG rule - which is stricter than
@@ -1573,178 +1406,16 @@ fn register_window_fns(m: &mut HashMap<String, Vec<Signature>>) {
 }
 
 // ---------------------------------------------------------------------------
-// Bitmap functions.
-// ---------------------------------------------------------------------------
-
-fn register_bitmap_fns(m: &mut HashMap<String, Vec<Signature>>) {
-    // Bitmap subsetters take one bitmap and two positions. Grouping them
-    // with the combinators below made every argument share one type, which
-    // a bitmap and an offset never do.
-    for name in [
-        "sub_bitmap",
-        "bitmap_subset_limit",
-        "bitmap_subset_in_range",
-    ] {
-        add(
-            m,
-            name,
-            Signature::new(
-                vec![TypeSpec::Binary, TypeSpec::Int64, TypeSpec::Int64],
-                TypeSpec::Binary,
-            ),
-        );
-        add(
-            m,
-            name,
-            Signature::new(
-                vec![TypeSpec::Bitmap, TypeSpec::Int64, TypeSpec::Int64],
-                TypeSpec::Binary,
-            ),
-        );
-    }
-
-    // bitmap-producing functions: -> Binary.
-    for name in [
-        "to_bitmap",
-        "bitmap_or",
-        "bitmap_xor",
-        "bitmap_andnot",
-        "bitmap_intersect",
-        "bitmap_from_string",
-        "bitmap_empty",
-        "bitmap_and",
-        "bitmap_to_binary",
-        "bitmap_from_binary",
-        "bitmap_agg",
-        "bitmap_union",
-    ] {
-        add(
-            m,
-            name,
-            Signature::variadic(vec![TypeSpec::Any("T")], TypeSpec::Binary),
-        );
-    }
-    // The installed encoder consumes bitmap bytes and emits base64 text.
-    add(
-        m,
-        "bitmap_to_base64",
-        Signature::new(vec![TypeSpec::Binary], TypeSpec::Utf8),
-    );
-    add(
-        m,
-        "bitmap_to_base64",
-        Signature::new(vec![TypeSpec::Bitmap], TypeSpec::Utf8),
-    );
-    // Boolean queries.
-    for name in ["bitmap_contains", "bitmap_has_any"] {
-        add(
-            m,
-            name,
-            Signature::new(
-                vec![TypeSpec::Binary, TypeSpec::Any("T")],
-                TypeSpec::Boolean,
-            ),
-        );
-    }
-    add(
-        m,
-        "bitmap_contains",
-        Signature::new(vec![TypeSpec::Bitmap, TypeSpec::Int64], TypeSpec::Boolean),
-    );
-    add(
-        m,
-        "bitmap_has_any",
-        Signature::new(vec![TypeSpec::Bitmap, TypeSpec::Bitmap], TypeSpec::Boolean),
-    );
-    // Int64-returning.
-    for name in [
-        "bitmap_min",
-        "bitmap_max",
-        "bitmap_count",
-        "bitmap_union_int",
-        "bitmap_union_count",
-    ] {
-        add(
-            m,
-            name,
-            Signature::variadic(vec![TypeSpec::Any("T")], TypeSpec::Int64),
-        );
-    }
-    // Utf8-returning.
-    add(
-        m,
-        "bitmap_to_string",
-        Signature::new(vec![TypeSpec::Binary], TypeSpec::Utf8),
-    );
-    // Preserve the original plain Binary overload and freeze bitmap semantics
-    // independently for the actual bitmap aggregate output.
-    add(
-        m,
-        "bitmap_to_string",
-        Signature::new(vec![TypeSpec::Bitmap], TypeSpec::Utf8),
-    );
-    // bitmap_to_array -> List<Int64>
-    add(
-        m,
-        "bitmap_to_array",
-        Signature::new(
-            vec![TypeSpec::Binary],
-            TypeSpec::List(Box::new(TypeSpec::Int64)),
-        ),
-    );
-    add(
-        m,
-        "bitmap_to_array",
-        Signature::new(
-            vec![TypeSpec::Bitmap],
-            TypeSpec::List(Box::new(TypeSpec::Int64)),
-        ),
-    );
-}
-
-// ---------------------------------------------------------------------------
 // HLL / approximate distinct functions.
 // ---------------------------------------------------------------------------
 
 fn register_hll_fns(m: &mut HashMap<String, Vec<Signature>>) {
     // -> Int64
-    for name in [
-        "hll_union_agg",
-        "hll_cardinality",
-        "ndv",
-        "approx_count_distinct",
-        "approx_count_distinct_hll_sketch",
-        "ds_hll_count_distinct",
-        "ds_hll_count_distinct_merge",
-    ] {
+    for name in ["ndv", "approx_count_distinct"] {
         add(
             m,
             name,
             Signature::variadic(vec![TypeSpec::Any("T")], TypeSpec::Int64),
-        );
-    }
-    // -> Binary
-    for name in [
-        "hll_hash",
-        "hll_union",
-        "hll_raw_agg",
-        "ds_hll_count_distinct_union",
-    ] {
-        add(
-            m,
-            name,
-            Signature::variadic(vec![TypeSpec::Any("T")], TypeSpec::Binary),
-        );
-    }
-    // ds_hll_count_distinct_state(value[, log_k[, hash_type]]): the value is
-    // whatever is being counted and the tuning parameters are its own types.
-    for extra in 0..=2usize {
-        let mut args = vec![TypeSpec::AnyType];
-        args.extend(std::iter::repeat_n(TypeSpec::AnyType, extra));
-        add(
-            m,
-            "ds_hll_count_distinct_state",
-            Signature::new(args, TypeSpec::Binary),
         );
     }
 }
@@ -1973,51 +1644,6 @@ fn register_json_fns(m: &mut HashMap<String, Vec<Signature>>) {
 // Iceberg transform functions.
 // ---------------------------------------------------------------------------
 
-fn register_iceberg_transform_fns(m: &mut HashMap<String, Vec<Signature>>) {
-    // __iceberg_transform_identity: preserves first-arg type.
-    add(
-        m,
-        "__iceberg_transform_identity",
-        Signature::variadic(vec![TypeSpec::Any("T")], TypeSpec::Any("T")),
-    );
-    // __iceberg_transform_truncate: preserves first-arg type.
-    add(
-        m,
-        "__iceberg_transform_truncate",
-        Signature::new(
-            vec![TypeSpec::Any("T"), TypeSpec::Int64],
-            TypeSpec::Any("T"),
-        ),
-    );
-    // __iceberg_transform_void: -> Null. But Null as a return type is
-    // unusual; legacy returns DataType::Null. We register that.
-    // TypeSpec doesn't have a `Null` variant; we use Utf8 as a stand-in
-    // because the analyzer's TypedExpr always overrides via type_hint.
-    // This is an explicit deviation: leave to legacy.
-    // (no registration)
-    let _ = m;
-
-    // year/month/day/hour/bucket -> Int32
-    for name in [
-        "__iceberg_transform_year",
-        "__iceberg_transform_month",
-        "__iceberg_transform_day",
-        "__iceberg_transform_hour",
-        "__iceberg_transform_bucket",
-    ] {
-        add(
-            m,
-            name,
-            Signature::new(vec![TypeSpec::Any("T")], TypeSpec::Int32),
-        );
-        add(
-            m,
-            name,
-            Signature::new(vec![TypeSpec::Any("T"), TypeSpec::Int64], TypeSpec::Int32),
-        );
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Misc functions.
 // ---------------------------------------------------------------------------
@@ -2046,38 +1672,9 @@ fn register_misc_fns(m: &mut HashMap<String, Vec<Signature>>) {
         "murmur_hash3_32",
         Signature::variadic(vec![TypeSpec::AnyType], TypeSpec::Int32),
     );
-    // xx_hash3_64 -> Int64
     add(
         m,
-        "xx_hash3_64",
-        Signature::variadic(vec![TypeSpec::AnyType], TypeSpec::Int64),
-    );
-    // to_binary / encode_row_id / encode_sort_key -> Binary.
-    // `encode_sort_key` builds its sort key with a `BinaryBuilder`: declaring
-    // it as text made the executor cast those bytes to a string, and left
-    // `from_binary(encode_sort_key(...), 'hex')` -- the only way to read a
-    // sort key -- with no overload to bind.
-    for name in ["to_binary", "encode_row_id", "encode_sort_key"] {
-        add(
-            m,
-            name,
-            Signature::variadic(vec![TypeSpec::AnyType], TypeSpec::Binary),
-        );
-    }
-    // AES accepts text or binary carriers. Binding validates those carriers.
-    for name in ["aes_encrypt", "aes_decrypt"] {
-        for arity in [2, 4, 5] {
-            add(
-                m,
-                name,
-                Signature::new(vec![TypeSpec::AnyType; arity], TypeSpec::Utf8),
-            );
-        }
-    }
-    // encode_fingerprint_sha256 -> Binary
-    add(
-        m,
-        "encode_fingerprint_sha256",
+        "to_binary",
         Signature::variadic(vec![TypeSpec::AnyType], TypeSpec::Binary),
     );
 
@@ -2142,13 +1739,7 @@ fn register_aggregate_in_expr_fns(m: &mut HashMap<String, Vec<Signature>>) {
         );
     }
     // Percentile family always Float64.
-    for name in [
-        "percentile_cont",
-        "percentile_disc",
-        "percentile_disc_lc",
-        "percentile_approx",
-        "percentile_approx_weighted",
-    ] {
+    for name in ["percentile_approx", "percentile_approx_weighted"] {
         add(
             m,
             name,
@@ -2157,253 +1748,6 @@ fn register_aggregate_in_expr_fns(m: &mut HashMap<String, Vec<Signature>>) {
     }
     // percentile_approx_raw(percentile, quantile) reads a serialized
     // percentile at one quantile: two unrelated types, not a repeated one.
-    add(
-        m,
-        "percentile_approx_raw",
-        Signature::new(
-            vec![TypeSpec::AnyType, TypeSpec::AnyType],
-            TypeSpec::Float64,
-        ),
-    );
 
     // percentile_hash / percentile_empty -> Binary
-    for name in ["percentile_hash", "percentile_empty"] {
-        add(
-            m,
-            name,
-            Signature::variadic(vec![TypeSpec::Any("T")], TypeSpec::Binary),
-        );
-    }
-}
-
-#[cfg(test)]
-mod bitmap_consumer_domain_tests {
-    use crate::{
-        EngineFunctionCatalog, FunctionArgument, FunctionArgumentType, FunctionBindingRequest,
-        FunctionKind, FunctionResultType, FunctionValueType,
-    };
-    use arrow_schema::{DataType, Field};
-    use novarocks_type_contract::ValueLogicalType;
-    use std::sync::Arc;
-
-    fn argument(value_type: FunctionValueType) -> FunctionArgument {
-        FunctionArgument::Value {
-            value_type,
-            constant: None,
-        }
-    }
-    fn integer() -> FunctionArgument {
-        argument(FunctionValueType::new(DataType::Int64, true))
-    }
-    fn producer(catalog: &EngineFunctionCatalog) -> FunctionValueType {
-        let arguments = [integer()];
-        let bound = catalog
-            .resolve_bound_user(
-                "to_bitmap",
-                FunctionKind::Scalar,
-                FunctionBindingRequest {
-                    arguments: &arguments,
-                    logical_argument_count: 1,
-                    expected_result_type: None,
-                },
-                crate::binding_test_control(),
-            )
-            .unwrap();
-        let FunctionResultType::Scalar(value) = bound.selected.result_type else {
-            panic!("to_bitmap must author a scalar value")
-        };
-        assert_eq!(value, bitmap());
-        value
-    }
-    fn bitmap() -> FunctionValueType {
-        FunctionValueType::try_with_logical_type(DataType::Binary, true, ValueLogicalType::Bitmap)
-            .unwrap()
-    }
-    fn check(
-        catalog: &EngineFunctionCatalog,
-        name: &str,
-        arguments: &[FunctionArgument],
-        expected: FunctionValueType,
-    ) {
-        let request = || FunctionBindingRequest {
-            arguments,
-            logical_argument_count: arguments.len(),
-            expected_result_type: None,
-        };
-        let bound = catalog
-            .resolve_bound_user(
-                name,
-                FunctionKind::Scalar,
-                request(),
-                crate::binding_test_control(),
-            )
-            .unwrap();
-        assert_eq!(
-            bound.function_id.as_str(),
-            format!("builtin.scalar/{name}/v1")
-        );
-        let expected_arguments = arguments
-            .iter()
-            .map(|argument| {
-                let FunctionArgument::Value { value_type, .. } = argument else {
-                    panic!("bitmap consumers have value arguments")
-                };
-                FunctionArgumentType::Value(value_type.clone())
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            bound.selected.argument_types.as_ref(),
-            expected_arguments.as_slice()
-        );
-        assert_eq!(
-            bound.selected.result_type,
-            FunctionResultType::Scalar(expected)
-        );
-        catalog
-            .validate_bound(&bound, request(), crate::binding_test_control())
-            .unwrap();
-    }
-
-    #[test]
-    fn public_bitmap_producer_reaches_subset_consumers_with_integer_positions() {
-        let catalog = super::super::catalogue::build_builtin_engine_function_catalog().unwrap();
-        let value = producer(&catalog);
-        for name in [
-            "sub_bitmap",
-            "bitmap_subset_limit",
-            "bitmap_subset_in_range",
-        ] {
-            check(
-                &catalog,
-                name,
-                &[argument(value.clone()), integer(), integer()],
-                bitmap(),
-            );
-        }
-    }
-    #[test]
-    fn public_bitmap_producer_reaches_base64_text_consumer() {
-        let catalog = super::super::catalogue::build_builtin_engine_function_catalog().unwrap();
-        check(
-            &catalog,
-            "bitmap_to_base64",
-            &[argument(producer(&catalog))],
-            FunctionValueType::new(DataType::Utf8, true),
-        );
-    }
-    #[test]
-    fn public_bitmap_producer_reaches_array_consumer() {
-        let catalog = super::super::catalogue::build_builtin_engine_function_catalog().unwrap();
-        check(
-            &catalog,
-            "bitmap_to_array",
-            &[argument(producer(&catalog))],
-            FunctionValueType::new(
-                DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
-                true,
-            ),
-        );
-    }
-    #[test]
-    fn public_bitmap_producer_reaches_contains_with_integer_member() {
-        let catalog = super::super::catalogue::build_builtin_engine_function_catalog().unwrap();
-        check(
-            &catalog,
-            "bitmap_contains",
-            &[argument(producer(&catalog)), integer()],
-            FunctionValueType::new(DataType::Boolean, true),
-        );
-    }
-    #[test]
-    fn public_bitmap_producers_reach_has_any_as_two_bitmap_values() {
-        let catalog = super::super::catalogue::build_builtin_engine_function_catalog().unwrap();
-        check(
-            &catalog,
-            "bitmap_has_any",
-            &[argument(producer(&catalog)), argument(producer(&catalog))],
-            FunctionValueType::new(DataType::Boolean, true),
-        );
-    }
-    #[test]
-    fn bitmap_consumers_preserve_the_existing_raw_binary_overloads() {
-        let catalog = super::super::catalogue::build_builtin_engine_function_catalog().unwrap();
-        let raw = || argument(FunctionValueType::new(DataType::Binary, true));
-        for name in [
-            "sub_bitmap",
-            "bitmap_subset_limit",
-            "bitmap_subset_in_range",
-        ] {
-            check(&catalog, name, &[raw(), integer(), integer()], bitmap());
-        }
-        check(
-            &catalog,
-            "bitmap_to_base64",
-            &[raw()],
-            FunctionValueType::new(DataType::Utf8, true),
-        );
-        check(
-            &catalog,
-            "bitmap_to_array",
-            &[raw()],
-            FunctionValueType::new(
-                DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
-                true,
-            ),
-        );
-        check(
-            &catalog,
-            "bitmap_contains",
-            &[raw(), integer()],
-            FunctionValueType::new(DataType::Boolean, true),
-        );
-        check(
-            &catalog,
-            "bitmap_has_any",
-            &[raw(), raw()],
-            FunctionValueType::new(DataType::Boolean, true),
-        );
-    }
-    #[test]
-    fn bitmap_consumers_refuse_unrelated_nominal_binary_domains() {
-        let catalog = super::super::catalogue::build_builtin_engine_function_catalog().unwrap();
-        for domain in [ValueLogicalType::Hll, ValueLogicalType::Percentile] {
-            for name in [
-                "sub_bitmap",
-                "bitmap_subset_limit",
-                "bitmap_subset_in_range",
-                "bitmap_to_base64",
-                "bitmap_to_array",
-                "bitmap_contains",
-                "bitmap_has_any",
-            ] {
-                let foreign = argument(
-                    FunctionValueType::try_with_logical_type(DataType::Binary, true, domain)
-                        .unwrap(),
-                );
-                let arguments = match name {
-                    "sub_bitmap" | "bitmap_subset_limit" | "bitmap_subset_in_range" => {
-                        vec![foreign, integer(), integer()]
-                    }
-                    "bitmap_contains" => vec![foreign, integer()],
-                    "bitmap_has_any" => vec![foreign.clone(), foreign],
-                    _ => vec![foreign],
-                };
-                assert!(
-                    catalog
-                        .resolve_bound_user(
-                            name,
-                            FunctionKind::Scalar,
-                            FunctionBindingRequest {
-                                arguments: &arguments,
-                                logical_argument_count: arguments.len(),
-                                expected_result_type: None
-                            },
-                            crate::binding_test_control()
-                        )
-                        .is_err(),
-                    "{name} must reject {domain:?}"
-                );
-            }
-        }
-    }
 }

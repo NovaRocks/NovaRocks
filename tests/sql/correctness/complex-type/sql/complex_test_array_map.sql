@@ -66,24 +66,6 @@ values
     ROW(4, 5);
 
 -- query 6
-USE ${case_db};
-with w1 as (
-    select
-        k1, c1, array_map (x -> true, c1) as c2
-    from
-        t1
-)
-select
-    w1.*
-from
-    w1
-    join  t2 using(k1)
-where
-    array_sum(w1.c1) <= t2.c1
-order by
-    w1.k1;
-
--- query 7
 -- @skip_result_check=true
 USE ${case_db};
 INSERT INTO t1 (k1, c1)
@@ -109,7 +91,7 @@ ROW(5, ARRAY_MAP(
     ARRAY_GENERATE(1, 1000)
 ));
 
--- query 8
+-- query 7
 -- @skip_result_check=true
 USE ${case_db};
 CREATE TABLE table1 (
@@ -117,7 +99,7 @@ CREATE TABLE table1 (
     arr_largeint ARRAY<INT> NOT NULL
 ) WITH (format_version = 3);
 
--- query 9
+-- query 8
 -- @skip_result_check=true
 USE ${case_db};
 INSERT INTO table1 (id, arr_largeint) VALUES
@@ -125,7 +107,7 @@ ROW(1, [1, 2]),
 ROW(2, [3, 4, 5]),
 ROW(3, [6]);
 
--- query 10
+-- query 9
 -- @skip_result_check=true
 USE ${case_db};
 CREATE TABLE table2 (
@@ -133,7 +115,7 @@ CREATE TABLE table2 (
     arr_str ARRAY<INT> NOT NULL
 ) WITH (format_version = 3);
 
--- query 11
+-- query 10
 -- @skip_result_check=true
 USE ${case_db};
 INSERT INTO table2 (id, arr_str) VALUES
@@ -141,7 +123,7 @@ ROW(1, [1, 2, 3]),
 ROW(2, [4, 5]),
 ROW(3, [6, 7, 8, 9]);
 
--- query 12
+-- query 11
 USE ${case_db};
 SELECT t1.id AS t1_id, t2.id AS t2_id, t1.arr_largeint
 FROM table1 t1
@@ -149,7 +131,7 @@ LEFT JOIN table2 t2
 ON t1.id = t2.id
 AND array_length(array_map(x -> x + array_length(t2.arr_str), t1.arr_largeint)) >= 2;
 
--- query 13
+-- query 12
 USE ${case_db};
 WITH "CTE" AS (
     SELECT TRUE AS bool_1, TRUE AS bool_2, TRUE AS bool_3, ['a'] AS arr
@@ -157,7 +139,7 @@ WITH "CTE" AS (
     SELECT TRUE AS bool_1, TRUE AS bool_2, TRUE AS bool_3, ['a'] AS arr
 ) SELECT ARRAY_MAP((arg)->"bool_1" AND "bool_2" AND "bool_3", arr), ARRAY_MAP((arg)->"bool_1" AND "bool_3" AND "bool_2", arr) FROM "CTE";
 
--- query 14
+-- query 13
 USE ${case_db};
 with t1 as (
  select parse_json('[{"open_id": "aaa", "num": 1},{"open_id": "bbb", "num": 2},{"open_id": "ccc", "num": 3}]') as price_list
@@ -168,7 +150,7 @@ with t1 as (
 select * from t2 
 where  array_contains(fields,'bbb');
 
--- query 15
+-- query 14
 -- @skip_result_check=true
 -- A catalog that cannot hold views cannot answer view enumeration, so
 -- DROP DATABASE ... FORCE is refused here rather than silently assuming

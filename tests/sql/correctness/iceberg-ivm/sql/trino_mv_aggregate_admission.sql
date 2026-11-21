@@ -43,9 +43,15 @@ CREATE MATERIALIZED VIEW ${case_db}.trc_l7_bad_avg_string AS SELECT k, AVG(s) FR
 CREATE MATERIALIZED VIEW ${case_db}.trc_l7_bad_min_star AS SELECT k, MIN(*) AS invalid_min FROM ${case_db}.trc_l7_measurements GROUP BY k;
 
 -- query 5
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR
+CREATE MATERIALIZED VIEW ${case_db}.trc_l7_retired_call AS
+SELECT md5sum(s) AS v FROM ${case_db}.trc_l7_measurements;
+
+-- query 6
 -- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW IF EXISTS ${case_db}.trc_l7_bad_avg_star;
 DROP MATERIALIZED VIEW IF EXISTS ${case_db}.trc_l7_bad_avg_string;
 DROP MATERIALIZED VIEW IF EXISTS ${case_db}.trc_l7_bad_min_star;
-DROP TABLE ${case_db}.trc_l7_measurements ;
+DROP MATERIALIZED VIEW IF EXISTS ${case_db}.trc_l7_retired_call;
+DROP TABLE ${case_db}.trc_l7_measurements;

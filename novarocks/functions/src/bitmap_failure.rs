@@ -374,28 +374,6 @@ mod tests {
             assert_eq!(representation.required, Some(i32::MAX as u64 + 1));
         }
     }
-
-    #[test]
-    fn bitmap_frozen_input_source_does_not_retain_original_arrow_fields() {
-        use crate::bitmap_aggregate_core::InputFailure;
-        use std::sync::Arc;
-        let field = Arc::new(arrow_schema::Field::new(
-            "bounded resource cancelled".repeat(100),
-            arrow_schema::DataType::Utf8,
-            true,
-        ));
-        let weak = Arc::downgrade(&field);
-        let ty = arrow_schema::DataType::Struct(vec![field.clone()].into());
-        let error = InputFailure::Unsupported(&ty).into_failure();
-        let fact = error.failure_fact();
-        assert_eq!(fact.class(), FailureClass::Invariant);
-        assert_eq!(fact.reason().code(), 194);
-        assert!(error.to_string().len() <= 512);
-        drop(ty);
-        drop(field);
-        assert!(weak.upgrade().is_none());
-        assert_eq!(error.failure_fact(), fact);
-    }
 }
 
 #[cfg(test)]

@@ -532,12 +532,12 @@ fn to_base64_actual_native_identity_projection_matches_independent_source_table(
     use novarocks_type_contract::ToBase64ByteSource as Source;
 
     // The frozen native-v1 source contract canonicalizes wire names and
-    // aliases case-insensitively before testing three exact encryption tags.
+    // aliases case-insensitively before testing the remaining encryption tags.
     // Expected facts are pinned independently; do not call a registry lookup
     // (or the classifier being tested) to calculate their own expected value.
     for (name, expected) in [
-        ("aes_encrypt", Source::NativeV1EncryptionLatin1),
-        ("AES_ENCRYPT", Source::NativeV1EncryptionLatin1),
+        ("aes_encrypt", Source::Ordinary),
+        ("AES_ENCRYPT", Source::Ordinary),
         ("from_base64", Source::NativeV1EncryptionLatin1),
         ("FROM_BASE64", Source::NativeV1EncryptionLatin1),
         ("base64_decode_binary", Source::NativeV1EncryptionLatin1),
@@ -641,51 +641,38 @@ fn to_base64_physical_author_exact_declared_carriers_and_immediate_definitions()
     ));
     // Pin the emitted carrier and exact native owner ID for each source.
     // The immediate-source projection consumes these facts from the emitted nodes.
-    for (name, count, dtype, expected) in [
-        (
-            "aes_encrypt",
-            2,
-            DataType::Utf8,
-            Source::NativeV1EncryptionLatin1,
-        ),
+    for (name, dtype, expected) in [
         (
             "from_base64",
-            1,
             DataType::Utf8,
             Source::NativeV1EncryptionLatin1,
         ),
         (
             "to_binary",
-            1,
             DataType::Binary,
             Source::NativeV1EncryptionLatin1,
         ),
-        ("concat", 1, DataType::Utf8, Source::Ordinary),
+        ("concat", DataType::Utf8, Source::Ordinary),
     ] {
         let result = ValueType::new(dtype, true);
         let function = super::support::function(
             &format!("builtin.scalar/{name}/v1"),
-            vec![FunctionArgumentType::Value(utf8.clone()); count],
+            vec![FunctionArgumentType::Value(utf8.clone())],
             result.clone(),
         );
-        let mut nodes: Vec<_> = (0..count)
-            .map(|id| {
-                leaf(
-                    id as u32,
-                    ExprKind::Value(ValueId::new(91 + id as u32)),
-                    utf8.clone(),
-                )
-            })
-            .collect();
-        let call = ExprId::new(count as u32);
-        nodes.push(leaf(
-            call.get(),
-            ExprKind::FunctionCall {
-                function,
-                args: (0..count).map(|i| ExprId::new(i as u32)).collect(),
-            },
-            result.clone(),
-        ));
+        let input = ExprId::new(0);
+        let call = ExprId::new(1);
+        let mut nodes = vec![
+            leaf(input.get(), ExprKind::Value(ValueId::new(91)), utf8.clone()),
+            leaf(
+                call.get(),
+                ExprKind::FunctionCall {
+                    function,
+                    args: Box::new([input]),
+                },
+                result.clone(),
+            ),
+        ];
         let direct = classify(nodes.clone(), &[call]);
         if name == "to_binary" {
             assert!(
@@ -702,7 +689,7 @@ fn to_base64_physical_author_exact_declared_carriers_and_immediate_definitions()
         } else {
             assert_eq!(direct.unwrap(), expected);
         }
-        let cast = ExprId::new(count as u32 + 1);
+        let cast = ExprId::new(2);
         nodes.push(leaf(
             cast.get(),
             ExprKind::Cast {

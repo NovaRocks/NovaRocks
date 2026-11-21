@@ -157,9 +157,8 @@ fn kernel(types: &[FunctionValueType], phase: AggregateKernelPhase) -> CountDist
         expected_result_type: None,
     };
     let bound = catalog
-        .resolve_bound_user(
-            "multi_distinct_count",
-            FunctionKind::Aggregate,
+        .resolve_distinct_aggregate(
+            crate::aggregate_types::DistinctAggregate::Count,
             request,
             &Compile,
         )

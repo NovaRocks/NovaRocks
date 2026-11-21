@@ -49,7 +49,6 @@ pub mod case;
 pub mod equality;
 pub mod nary;
 pub mod ordered;
-pub mod temporal;
 pub mod unary;
 pub mod value_conversion;
 

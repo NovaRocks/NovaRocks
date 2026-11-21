@@ -34,7 +34,6 @@ SELECT
        grp,
        CAST(avg(v) AS DECIMAL(18, 4)) AS avg_v,
        ndv(k) AS ndv_k,
-       hll_union_agg(hll_hash(k)) AS hll_k,
        CAST(percentile_approx(d, 0.5) AS DECIMAL(18, 4)) AS p50_d
 FROM ${case_db}.agg_state_typedesc_contract
 GROUP BY grp

@@ -3152,9 +3152,6 @@ mod tests {
 
     #[test]
     fn m07_completed_result_occurrences_supply_exact_attempt_domains() {
-        // Producer-domain propagation is independent of the unavailable to_bitmap
-        // scalar. A source-free bitmap_agg supplies the same opaque Bitmap domain;
-        // bitmap_to_string supplies a Physical domain without assuming its carrier.
         use novarocks_type_contract::ValueLogicalType as D;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -3162,7 +3159,7 @@ mod tests {
             .unwrap();
         let (_root, scope) = query_scope();
         let completed = runtime.block_on(FinalPlanCompletionDriver::new(Arc::new(NoFacts)).complete_for_test(
-            request_for("SELECT hll_hash('x') AS h,bitmap_agg(1) AS b,percentile_hash(1.0) AS p,parse_json('{}') AS j,bitmap_to_string(bitmap_agg(1)) AS raw"), &scope,
+            request_for("SELECT CAST(NULL AS HLL) AS h, CAST(NULL AS BITMAP) AS b, parse_json('{}') AS j, CAST(NULL AS VARBINARY) AS raw"), &scope,
         )).unwrap();
         let plan = completed.candidate().plan();
         let result = plan.result_port().unwrap();
@@ -3175,19 +3172,19 @@ mod tests {
                 .iter()
                 .map(|column| column.logical_type())
                 .collect::<Vec<_>>(),
-            vec![D::Hll, D::Bitmap, D::Percentile, D::Json, D::Physical]
+            vec![D::Hll, D::Bitmap, D::Json, D::Physical]
         );
         assert_eq!(
             outputs
                 .iter()
                 .map(|column| column.name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["h", "b", "p", "j", "raw"]
+            vec!["h", "b", "j", "raw"]
         );
         for (output, original) in outputs.iter().zip(result.fields.iter()) {
             assert_eq!(output.ty, original.ty);
         }
-        assert_eq!(outputs[4].logical_type(), D::Physical);
+        assert_eq!(outputs[3].logical_type(), D::Physical);
     }
 
     fn request() -> SqlFinalPlanCompileRequest {

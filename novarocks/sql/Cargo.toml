@@ -49,7 +49,6 @@ novarocks-type-contract.workspace = true
 novarocks-constant-contract.workspace = true
 novarocks-types.workspace = true
 novarocks-user-error.workspace = true
-md-5.workspace = true
 recursive.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true

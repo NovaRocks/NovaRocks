@@ -42,9 +42,9 @@ use super::numeric_unary::NumericUnaryOp;
 #[cfg(test)]
 pub(super) fn names() -> &'static [&'static str] {
     &[
-        "acos", "asin", "atan", "cbrt", "ceil", "ceiling", "dceil", "cos", "cot", "degress",
-        "dlog1", "exp", "dexp", "floor", "dfloor", "ln", "log10", "dlog10", "log2", "radians",
-        "sin", "sqrt", "dsqrt", "square", "tan", "positive",
+        "acos", "asin", "atan", "cbrt", "ceil", "ceiling", "dceil", "cos", "degress", "dlog1",
+        "exp", "dexp", "floor", "dfloor", "ln", "log10", "dlog10", "log2", "radians", "sin",
+        "sqrt", "dsqrt", "tan", "positive",
     ]
 }
 
@@ -59,7 +59,6 @@ pub(super) fn operation(name: &str) -> Option<NumericUnaryOp> {
         "cbrt" => Cbrt,
         "ceil" | "ceiling" | "dceil" => Ceil,
         "cos" => Cos,
-        "cot" => Cot,
         "degress" => Degrees,
         "dlog1" => Dlog1,
         "exp" | "dexp" => Exp,
@@ -70,7 +69,6 @@ pub(super) fn operation(name: &str) -> Option<NumericUnaryOp> {
         "radians" => Radians,
         "sin" => Sin,
         "sqrt" | "dsqrt" => Sqrt,
-        "square" => Square,
         "tan" => Tan,
         "positive" => Positive,
         _ => return None,
@@ -491,7 +489,7 @@ mod tests {
 
     #[test]
     fn startup_operation_mapping_covers_exact_installed_names_and_aliases() {
-        assert_eq!(names().len(), 26);
+        assert_eq!(names().len(), 24);
         let mut operations = Vec::new();
         for name in names() {
             let op = operation(name).unwrap();
@@ -499,7 +497,7 @@ mod tests {
                 operations.push(op);
             }
         }
-        assert_eq!(operations.len(), 20);
+        assert_eq!(operations.len(), 18);
         for (alias, original) in [
             ("ceiling", "ceil"),
             ("dceil", "ceil"),
@@ -522,7 +520,7 @@ mod tests {
     }
 
     #[test]
-    fn whole_production_catalogue_attaches_all_unary_owners_and_182_exact_records() {
+    fn whole_production_catalogue_attaches_all_unary_owners_and_168_exact_records() {
         let catalog = super::super::catalogue::build_builtin_engine_function_catalog().unwrap();
         let mut total = 0;
         for name in names() {
@@ -550,11 +548,11 @@ mod tests {
             }
             total += owner.implementation_declarations().len();
         }
-        assert_eq!(total, 182);
+        assert_eq!(total, 168);
     }
 
     #[test]
-    fn all_26_names_and_seven_profiles_preserve_full_types_fresh_and_frozen() {
+    fn all_24_names_and_seven_profiles_preserve_full_types_fresh_and_frozen() {
         let parameters = SemanticParameters::try_new([]).unwrap();
         let uses = [Some(ExpressionUseId::new(42))];
         for name in names() {

@@ -24,7 +24,6 @@ use crate::exec::pipeline::operator::InputConstructionOwner;
 use crate::runtime::task::{ExecutionFailure, ExecutionResult};
 use novarocks_functions::{
     AggregateStateAllocator, EvaluationCheckpoints, KernelEvaluationControl,
-    builtin::aggregate_ds_hll_state::hll_heap_bytes,
     datasketches_hll::{HllAccumulator, HllTargetType},
     datasketches_hll_failure::{
         ClassifiedHllFailure, HllFailureDetail, HllFailureRecipe, HllFailureSink,
@@ -38,6 +37,10 @@ use std::sync::Arc;
 
 const LOG_K: u8 = 12;
 const TARGET: HllTargetType = HllTargetType::Hll8;
+
+fn hll_heap_bytes(current: usize) -> usize {
+    current.saturating_sub(std::mem::size_of::<HllAccumulator>())
+}
 
 /// A private build/projection/partition name. Equal values do not authorize
 /// merging: independently created domains remain distinct actual instances.

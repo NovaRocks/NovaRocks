@@ -44,7 +44,6 @@ pub enum NumericUnaryOp {
     Cbrt,
     Ceil,
     Cos,
-    Cot,
     Degrees,
     Dlog1,
     Exp,
@@ -56,7 +55,6 @@ pub enum NumericUnaryOp {
     Positive,
     Sin,
     Sqrt,
-    Square,
     Tan,
 }
 impl NumericUnaryOp {
@@ -71,7 +69,6 @@ impl NumericUnaryOp {
             Self::Cbrt => value.cbrt(),
             Self::Ceil => value.ceil(),
             Self::Cos => value.cos(),
-            Self::Cot => 1.0 / value.tan(),
             Self::Degrees => value.to_degrees(),
             // Preserve the original addition/rounding; ln_1p differs at zero
             // and for small inputs and is not the accepted implementation.
@@ -85,7 +82,6 @@ impl NumericUnaryOp {
             Self::Positive => value,
             Self::Sin => value.sin(),
             Self::Sqrt => value.sqrt(),
-            Self::Square => value * value,
             Self::Tan => value.tan(),
         }
     }
@@ -465,7 +461,7 @@ mod tests {
     }
 
     #[test]
-    fn twenty_real_operations_have_independent_finite_oracles() {
+    fn eighteen_real_operations_have_independent_finite_oracles() {
         use std::f64::consts::{FRAC_PI_2, FRAC_PI_3, FRAC_PI_4, FRAC_PI_6, PI};
         // Expected answers are identities/constants, not calls to the same
         // operation used by the production enum. libm last-bit identity is
@@ -477,7 +473,6 @@ mod tests {
             ("cbrt", -8.0, -2.0),
             ("ceil", -1.2, -1.0),
             ("cos", PI, -1.0),
-            ("cot", FRAC_PI_4, 1.0),
             ("degress", PI, 180.0),
             ("dlog1", 0.0, 0.0),
             ("exp", 0.0, 1.0),
@@ -489,10 +484,9 @@ mod tests {
             ("positive", -2.0, -2.0),
             ("sin", FRAC_PI_2, 1.0),
             ("sqrt", 4.0, 2.0),
-            ("square", -3.0, 9.0),
             ("tan", FRAC_PI_4, 1.0),
         ];
-        assert_eq!(cases.len(), 20);
+        assert_eq!(cases.len(), 18);
         for (name, value, expected) in cases {
             let array = floats(name, vec![Some(value), None]);
             if ["ceil", "floor"].contains(&name) {
@@ -506,7 +500,7 @@ mod tests {
     }
 
     #[test]
-    fn twenty_real_operations_keep_nonfinite_domain_and_signed_zero_rules() {
+    fn eighteen_real_operations_keep_nonfinite_domain_and_signed_zero_rules() {
         use std::f64::consts::FRAC_PI_2;
         let nan = f64::from_bits(0xfff8123456789abc);
         let inf = f64::INFINITY;
@@ -537,7 +531,6 @@ mod tests {
                 [None, None, None, Some(0.0)],
             ),
             ("cos", [nan, inf, -inf, -0.0], [None, None, None, Some(1.0)]),
-            ("cot", [0.0, -0.0, nan, inf], [None, None, None, None]),
             (
                 "degress",
                 [nan, inf, -inf, -0.0],
@@ -582,17 +575,12 @@ mod tests {
                 [None, None, None, Some(-0.0)],
             ),
             (
-                "square",
-                [nan, inf, -inf, -0.0],
-                [None, None, None, Some(0.0)],
-            ),
-            (
                 "tan",
                 [nan, inf, -inf, -0.0],
                 [None, None, None, Some(-0.0)],
             ),
         ];
-        assert_eq!(cases.len(), 20);
+        assert_eq!(cases.len(), 18);
         for (name, values, expected) in cases {
             let array = floats(name, values.into_iter().map(Some).collect());
             if ["ceil", "floor"].contains(&name) {

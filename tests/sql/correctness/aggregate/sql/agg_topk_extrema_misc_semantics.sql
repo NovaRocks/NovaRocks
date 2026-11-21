@@ -83,12 +83,3 @@ FROM ${case_db}.t_agg_topk_extrema_misc
 WHERE big_v IS NOT NULL
 GROUP BY grp
 ORDER BY grp;
-
--- query 5
-SELECT
-    mann_whitney_u_test(v, flag, 'two-sided') AS two_sided,
-    mann_whitney_u_test(v, flag, 'less') AS less_side,
-    mann_whitney_u_test(v, flag, 'greater') AS greater_side
-FROM ${case_db}.t_agg_topk_extrema_misc
-WHERE v IS NOT NULL
-  AND flag IS NOT NULL;

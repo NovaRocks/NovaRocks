@@ -1063,7 +1063,6 @@ fn canonical_display_function_name(name: &str) -> String {
         "booland_agg" | "every" => "bool_and".to_string(),
         "string_agg" => "group_concat".to_string(),
         "array_agg_distinct" => "array_agg".to_string(),
-        "approx_count_distinct_hll_sketch" => "ds_hll_count_distinct".to_string(),
         "struct" => "row".to_string(),
         other => other.to_string(),
     }

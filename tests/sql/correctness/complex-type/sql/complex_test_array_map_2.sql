@@ -58,19 +58,15 @@ USE ${case_db};
 select count(array_map(x->array_length(array_concat(arr_str,[])), arr_largeint)) from array_map_test;
 
 -- query 9
--- @skip_result_check=true
-USE ${case_db};
-
--- query 10
 USE ${case_db};
 select array_length(array_map((x,y)->x > y, (array_repeat('12345',1000000)),(array_repeat('12345',1000000)))) from table(generate_series(1,10,1));
 
--- query 11
+-- query 10
 USE ${case_db};
 select count(*) from array_map_test where array_map((a1) -> concat(split(id, 'd'), split(id, 'd')), arr_str) is not null;
 
 -- name: test_array_map_3
--- query 12
+-- query 11
 -- @skip_result_check=true
 USE ${case_db};
 CREATE TABLE "t" (
@@ -80,123 +76,115 @@ CREATE TABLE "t" (
   "arr_2" array<bigint>
 ) WITH (format_version = 3);
 
--- query 13
+-- query 12
 -- @skip_result_check=true
 USE ${case_db};
 insert into t values ROW(1, [1,2], [1,2],[2,3]), ROW(2, [1,2], null, [2,3]), ROW(3, [1,2],[1,2],null),ROW(4, [1,2],[null,null],[2,3]), ROW(5, [1], [1,2], [3]);
 
--- query 14
+-- query 13
 -- @expect_error=Input array element's size is not equal in array_map()
 USE ${case_db};
 select array_map((x,y,z)->x+y+z, arr_0, arr_1, arr_2) from t;
 
--- query 15
+-- query 14
 USE ${case_db};
 select array_map((x,y,z)->x+y+z, arr_0, arr_1, arr_2) from t where k != 5 order by k;
 
--- query 16
+-- query 15
 -- @skip_result_check=true
 USE ${case_db};
 delete from t where k = 5;
 
--- query 17
+-- query 16
 USE ${case_db};
 select array_map((x,y,z)->x+y+z, arr_0, arr_1, arr_2) from t order by k;
 
--- query 18
+-- query 17
 USE ${case_db};
 select array_map((x,y,z,d)->x+y+z+d, arr_0, arr_1, arr_2, [1,2]) from t order by k;
 
--- query 19
+-- query 18
 -- @expect_error=Input array element's size is not equal in array_map()
 USE ${case_db};
 select array_map((x,y,z,d)->x+y+z+d, arr_0, arr_1, arr_2, [1]) from t order by k;
 
--- query 20
+-- query 19
 USE ${case_db};
 select array_map((x)->x*x, arr_0) from t order by k;
 
--- query 21
+-- query 20
 USE ${case_db};
 select k from t where coalesce(element_at(array_map(x->x+any_match(array_map(x->x<10,arr_1)), arr_1), 1),element_at(array_map(x->x+any_match(array_map(x->x<10,arr_2)), arr_2), 1),element_at(array_map(x->x+any_match(array_map(x->x<10,arr_0)), arr_0), 1))=2 order by k;
 
--- query 22
+-- query 21
 USE ${case_db};
 select k from t where coalesce(element_at(array_map(x->x+any_match(array_map(x->x<10,arr_1)), arr_1), 1),element_at(array_map(x->x+any_match(array_map(x->x<10,arr_2)), arr_2), 1),element_at(array_map(x->x+any_match(array_map(x->x<10,arr_0)), arr_0), 1))>0 and coalesce(element_at(array_map(x->x+any_match(array_map(x->x<10,arr_1)), arr_1), 1),element_at(array_map(x->x+any_match(array_map(x->x<10,arr_2)), arr_2), 1)) < 10  order by k;
 
--- query 23
+-- query 22
 USE ${case_db};
 select k, coalesce(element_at(array_map(x->x+any_match(array_map(x->x<10,arr_1)), arr_1), 1),element_at(array_map(x->x+any_match(array_map(x->x<10,arr_2)), arr_2), 1),element_at(array_map(x->x+any_match(array_map(x->x<10,arr_0)), arr_0), 1)) as col1 from t order by k;
 
--- query 24
+-- query 23
 USE ${case_db};
 select k, coalesce(element_at(array_map(x->x+any_match(array_map(x->x<10,arr_1)), arr_1), 1),element_at(array_map(x->x+any_match(array_map(x->x<10,arr_2)), arr_2), 1),element_at(array_map(x->x+any_match(array_map(x->x<10,arr_0)), arr_0), 1)) as col1, coalesce(element_at(array_map(x->x+any_match(array_map(x->x<10,arr_1)), arr_1), 1),element_at(array_map(x->x+any_match(array_map(x->x<10,arr_2)), arr_2), 1)) as col2 from t order by k;
 
--- query 25
+-- query 24
 USE ${case_db};
 select array_map(x->x, arr_0) from t order by k;
 
--- query 26
+-- query 25
 USE ${case_db};
 select array_map((x,y,z)->10, arr_0, arr_1, arr_2) from t;
 
--- query 27
+-- query 26
 USE ${case_db};
 select array_map((x,y)-> k, arr_0, arr_1) from t order by k;
 
--- query 28
+-- query 27
 USE ${case_db};
 select array_map((x,y)->k, [1,2],[2,3]) from t order by k;
 
--- query 29
+-- query 28
 USE ${case_db};
 select array_map((x,y,z)->x+y+z, [1,2],[2,3],[3,4]) from t;
 
--- query 30
+-- query 29
 USE ${case_db};
 select array_map((x,y,z)->x+y+z, [1,2],[2,null],[3,4]) from t;
 
--- query 31
+-- query 30
 USE ${case_db};
 select array_map((x,y,z)->x+y+z, [1,2],[2,null],null) from t;
 
--- query 32
+-- query 31
 USE ${case_db};
 select array_map(x->array_map(x->x+100,x), [[1,2,3]]);
 
--- query 33
+-- query 32
 USE ${case_db};
 select array_map(x->array_map(x->x+100,x), [[1,2,3], [null]]);
 
--- query 34
+-- query 33
 USE ${case_db};
 select array_map(x->array_map(x->array_map(x->x+100,x),x), [[[1,2,3]]]);
 
--- query 35
+-- query 34
 USE ${case_db};
 select array_map(arg0 -> array_map(arg1 -> array_map(arg2 -> array_map(arg3 -> array_length(arg1) + arg3, arg2), arg1), arg0), [[[[1,2]]]]);
 
--- query 36
+-- query 35
 USE ${case_db};
 select array_map(arg0 -> array_map(arg1 -> array_map(arg2 -> array_map(arg3 -> array_length(arg0) + arg3, arg2), arg1), arg0), [[[[1,2]]]]);
 
--- query 37
+-- query 36
 USE ${case_db};
 select array_map(arg0 -> array_map(arg1 -> array_map(arg2 -> array_map(arg3 -> array_length(arg2) + arg3, arg2), arg1), arg0), [[[[1,2]]]]);
 
--- query 38
+-- query 37
 USE ${case_db};
 select array_map(arg0 -> array_map(arg1 -> array_map(arg2 -> array_map(arg3 -> array_map(arg4->array_length(arg2) + arg4, arg3), arg2), arg1), arg0), [[[[[1,2]]]]] );
 
--- query 39
--- @skip_result_check=true
-USE ${case_db};
-
--- query 40
-USE ${case_db};
-WITH SESSION query_mem_limit = 104857600 select /*+ SET_VAR(query_mem_limit=104857600)*/array_sum(array_map(x->array_contains((array_generate(1,10000)),x), array_generate(1,100000)));
-
--- query 41
+-- query 38
 -- @skip_result_check=true
 USE ${case_db};
 CREATE TABLE "array_map_x" (
@@ -205,16 +193,16 @@ CREATE TABLE "array_map_x" (
   "arr_largeint" array<largeint(40)>
 ) WITH (format_version = 3);
 
--- query 42
+-- query 39
 -- @skip_result_check=true
 USE ${case_db};
 insert into array_map_x values ROW(1, array_repeat('abcdefghasdasdasirnqwrq', 2), array_repeat(CAST(100 AS LARGEINT), 2));
 
--- query 43
+-- query 40
 USE ${case_db};
 select cast(if (1 > rand(), '[]', '') as array<string>) l , array_map((x)-> (concat(x,l)), arr_str) from array_map_x;
 
--- query 44
+-- query 41
 -- @skip_result_check=true
 -- A catalog that cannot hold views cannot answer view enumeration, so
 -- DROP DATABASE ... FORCE is refused here rather than silently assuming

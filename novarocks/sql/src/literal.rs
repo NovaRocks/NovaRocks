@@ -534,67 +534,6 @@ pub(crate) fn function_to_literal(func: &ast::FunctionCall) -> Result<Literal, L
                 ))),
             }
         }
-        "bitmap_empty" => {
-            if !args.is_empty() {
-                return Err(LiteralFailure::rejected("bitmap_empty expects 0 arguments"));
-            }
-            // SeriV2 empty bitmap encoding: a single BITMAP_TYPE_EMPTY (=0) byte,
-            // matching `eval_bitmap_empty` runtime output.
-            Ok(Literal::String(bytes_to_latin1_string(&[
-                novarocks_types::value::bitmap::BITMAP_TYPE_EMPTY,
-            ])))
-        }
-        "hll_hash" => {
-            if args.len() != 1 {
-                return Err(LiteralFailure::rejected("hll_hash expects 1 argument"));
-            }
-            // Reject explicit narrowing CAST since this const-fold path always
-            // hashes Int64 little-endian bytes, while the runtime path hashes
-            // the cast's native (narrower) width. Allowing the unwrap would
-            // produce values that disagree with `eval_hll_hash` at runtime.
-            if let ast::Expr::Cast(cast) = args[0] {
-                let narrowing = match &cast.data_type.kind {
-                    ast::TypeKind::Generic(generic) => Some(&generic.name),
-                    _ => None,
-                }
-                .is_some_and(|part| {
-                    matches!(
-                        part.value.to_ascii_lowercase().as_str(),
-                        "tinyint"
-                            | "smallint"
-                            | "int"
-                            | "integer"
-                            | "int2"
-                            | "int4"
-                            | "mediumint"
-                            | "float"
-                    )
-                });
-                if narrowing {
-                    return Err(LiteralFailure::rejected(
-                        "hll_hash with narrowing CAST argument is not supported in INSERT VALUES; \
-                         wrap the value directly without CAST",
-                    ));
-                }
-            }
-            use novarocks_functions::hll_hash_core::encode_scalar_bytes;
-            let arg = expr_to_literal(args[0])?;
-            // Preserve this INSERT author's original byte projection. SELECT
-            // analyzer coercion is a distinct source contract, not a default here.
-            let bytes = match arg {
-                Literal::Null => encode_scalar_bytes(None),
-                Literal::Int(v) => encode_scalar_bytes(Some(&v.to_le_bytes())),
-                Literal::Float(v) => encode_scalar_bytes(Some(&v.to_le_bytes())),
-                Literal::String(s) => encode_scalar_bytes(Some(s.as_bytes())),
-                Literal::Bool(b) => encode_scalar_bytes(Some(&[if b { 1u8 } else { 0u8 }])),
-                other => {
-                    return Err(LiteralFailure::rejected(format_args!(
-                        "hll_hash unsupported literal: {other:?}"
-                    )));
-                }
-            };
-            Ok(Literal::String(bytes_to_latin1_string(&bytes)))
-        }
         "to_binary" => {
             if args.len() != 1 && args.len() != 2 {
                 return Err(LiteralFailure::rejected(
@@ -637,83 +576,6 @@ pub(crate) fn function_to_literal(func: &ast::FunctionCall) -> Result<Literal, L
             Ok(Literal::String(
                 bytes.iter().map(|b| char::from(*b)).collect(),
             ))
-        }
-        "bitmap_from_string" => {
-            if args.len() != 1 {
-                return Err(LiteralFailure::rejected(
-                    "bitmap_from_string expects 1 argument",
-                ));
-            }
-            let arg = expr_to_literal(args[0])?;
-            let text = match arg {
-                Literal::Null => return Ok(Literal::Null),
-                Literal::String(s) => s,
-                other => {
-                    return Err(LiteralFailure::rejected(format_args!(
-                        "bitmap_from_string expects VARCHAR argument, got {other:?}"
-                    )));
-                }
-            };
-            // Mirror runtime semantics: malformed string -> NULL (not error).
-            let values = match novarocks_types::value::bitmap::parse_bitmap_string(&text) {
-                Ok(v) => v,
-                Err(source) if source.is_data() => return Ok(Literal::Null),
-                Err(source) => return Err(source.into()),
-            };
-            // Use the EXTERNAL (storage / SeriV1-style) encoding here —
-            // that's the format the StarRocks table bitmap column
-            // reader expects, matching `bitmap_empty` / `to_bitmap`'s
-            // const-fold output. The internal varint format only round-
-            // trips through the runtime expression layer.
-            let bytes = novarocks_types::value::bitmap::encode_external_bitmap(&values)?;
-            Ok(Literal::String(bytes_to_latin1_string(&bytes)))
-        }
-        "to_bitmap" => {
-            if args.len() != 1 {
-                return Err(LiteralFailure::rejected("to_bitmap expects 1 argument"));
-            }
-            use novarocks_types::value::bitmap::encode_bitmap_single;
-            let arg = expr_to_literal(args[0])?;
-            // Mirror `eval_to_bitmap` runtime semantics for scalar literals:
-            //   - NULL or negative integer → NULL
-            //   - Int  → encode as u64 (Int64 runtime arm uses i128::from then casts)
-            //   - Bool → 1 or 0
-            //   - String → parse as unsigned decimal; non-numeric → NULL
-            let value: u64 = match arg {
-                Literal::Null => return Ok(Literal::Null),
-                Literal::Int(v) if v >= 0 => v as u64,
-                Literal::Int(_) => return Ok(Literal::Null),
-                Literal::Bool(b) => {
-                    if b {
-                        1
-                    } else {
-                        0
-                    }
-                }
-                Literal::String(s) => match s.trim().parse::<u64>() {
-                    Ok(v) => v,
-                    Err(_) => return Ok(Literal::Null),
-                },
-                other => {
-                    return Err(LiteralFailure::rejected(format_args!(
-                        "to_bitmap unsupported literal: {other:?}"
-                    )));
-                }
-            };
-            let bytes = encode_bitmap_single(value);
-            Ok(Literal::String(bytes_to_latin1_string(&bytes)))
-        }
-        "md5sum" => {
-            use md5::Digest;
-            let mut hasher = md5::Md5::new();
-            for arg in args {
-                let literal = expr_to_literal(arg)?;
-                let Some(bytes) = literal_to_varchar_bytes(&literal)? else {
-                    continue;
-                };
-                hasher.update(bytes);
-            }
-            Ok(Literal::String(hex::encode(hasher.finalize())))
         }
         "parse_json" => {
             if args.len() != 1 {
@@ -772,19 +634,6 @@ pub(crate) fn function_to_literal(func: &ast::FunctionCall) -> Result<Literal, L
                 func.clone()
             )))
         ))),
-    }
-}
-
-fn literal_to_varchar_bytes(value: &Literal) -> Result<Option<Vec<u8>>, LiteralFailure> {
-    match value {
-        Literal::Null => Ok(None),
-        Literal::Bool(v) => Ok(Some(if *v { b"1".to_vec() } else { b"0".to_vec() })),
-        Literal::Int(v) => Ok(Some(v.to_string().into_bytes())),
-        Literal::Float(v) => Ok(Some(v.to_string().into_bytes())),
-        Literal::String(v) | Literal::Date(v) => Ok(Some(v.as_bytes().to_vec())),
-        Literal::Array(_) | Literal::Map(_) | Literal::Struct(_) => Err(LiteralFailure::rejected(
-            "md5sum literal folding does not support complex arguments",
-        )),
     }
 }
 
@@ -1841,66 +1690,6 @@ mod tests {
     }
 
     #[test]
-    fn bitmap_constant_folds_round_trip_through_runtime_codec() {
-        use std::collections::BTreeSet;
-
-        for (sql, expected) in [
-            ("bitmap_empty()", BTreeSet::new()),
-            ("to_bitmap(7)", BTreeSet::from([7])),
-            ("bitmap_from_string('7, 9, 7')", BTreeSet::from([7, 9])),
-        ] {
-            let raw = parse_expr(sql);
-            let novarocks_parser::ast::Expr::FunctionCall(ref func) = raw else {
-                panic!("expected Function node for `{sql}`");
-            };
-            let Literal::String(packed) = function_to_literal(func).expect("bitmap constant fold")
-            else {
-                panic!("expected packed bitmap literal for `{sql}`");
-            };
-            let bytes = latin1_string_to_bytes(&packed).expect("latin1 decode");
-
-            assert_eq!(
-                novarocks_types::value::bitmap::decode_bitmap(&bytes)
-                    .expect("runtime bitmap decode"),
-                expected,
-                "runtime codec disagrees with constant fold for `{sql}`"
-            );
-        }
-    }
-
-    #[test]
-    fn hll_hash_const_fold_rejects_narrowing_cast() {
-        // The const-fold path always hashes the literal as Int64 little-endian
-        // bytes; CAST(5 AS TINYINT) would silently produce the wrong bytes
-        // (8-byte vs 1-byte) compared to the runtime path. We must reject
-        // the explicit narrowing CAST rather than silently diverge.
-        for cast_type in ["TINYINT", "SMALLINT", "INT", "INTEGER", "FLOAT"] {
-            let sql = format!("hll_hash(CAST(5 AS {cast_type}))");
-            let raw = parse_expr(&sql);
-            let novarocks_parser::ast::Expr::FunctionCall(ref func) = raw else {
-                panic!("expected Function node for `{sql}`");
-            };
-            let err = function_to_literal(func).expect_err(&format!("must reject `{sql}`"));
-            assert!(
-                err.to_string().contains("hll_hash with narrowing CAST"),
-                "unexpected error for `{sql}`: {err}"
-            );
-        }
-    }
-
-    #[test]
-    fn hll_hash_const_fold_accepts_bigint_cast() {
-        // CAST to BIGINT is the runtime path's native width for integer
-        // literals, so it must continue to fold cleanly.
-        let raw = parse_expr("hll_hash(CAST(5 AS BIGINT))");
-        let novarocks_parser::ast::Expr::FunctionCall(ref func) = raw else {
-            panic!("expected Function node");
-        };
-        let lit = function_to_literal(func).expect("BIGINT cast must fold");
-        assert!(matches!(lit, Literal::String(_)));
-    }
-
-    #[test]
     fn arrow_type_equals_ignoring_metadata_handles_scalar_and_nested_shapes() {
         use std::collections::HashMap;
         let mut meta = HashMap::new();
@@ -2058,7 +1847,6 @@ mod source_failure_tests {
                     .is::<novarocks_types::value::bitmap::BitmapValueFailure>()
             );
         }
-        assert_eq!(fold("bitmap_from_string('bad')").unwrap(), Literal::Null);
         let error = fold("parse_json('not-json')").unwrap_err();
         assert!(
             error

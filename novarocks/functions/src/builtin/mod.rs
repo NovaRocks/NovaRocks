@@ -74,13 +74,6 @@ mod aggregate_extrema_utf8;
 pub mod aggregate_hll_core;
 mod aggregate_hll_kernel;
 mod aggregate_hll_owner;
-pub mod aggregate_mann_whitney_core;
-mod aggregate_mann_whitney_emission;
-mod aggregate_mann_whitney_failure;
-mod aggregate_mann_whitney_operation;
-mod aggregate_mann_whitney_owner;
-mod aggregate_mann_whitney_resources;
-mod aggregate_mann_whitney_selected;
 mod aggregate_n;
 pub mod aggregate_n_core;
 mod aggregate_n_dispatch;
@@ -89,22 +82,16 @@ mod aggregate_n_largeint_emission;
 mod aggregate_n_largeint_operation;
 mod aggregate_n_largeint_resources;
 mod aggregate_n_owner;
-mod aggregate_percentile;
-mod aggregate_percentile_owner;
 mod aggregate_sum;
 mod aggregate_sum_owner;
 mod aggregate_window_adapter;
 mod bit_shift;
 mod bit_shift_owner;
-mod bitmap_to_string_owner;
-mod bitmap_to_string_selected;
 mod bitwise;
 mod bitwise_owner;
 mod calendar_add;
 pub mod calendar_add_interval;
 mod calendar_convert_tz;
-mod calendar_day_number;
-mod calendar_day_number_owner;
 mod calendar_diff;
 mod calendar_diff_owner;
 mod calendar_duration;
@@ -124,7 +111,6 @@ mod calendar_period_diff;
 mod calendar_period_diff_owner;
 pub mod calendar_timestamp;
 pub mod calendar_to_date;
-mod calendar_to_date_owner;
 pub mod collection_arrow;
 mod collection_cardinality;
 mod collection_cardinality_owner;
@@ -141,8 +127,6 @@ mod json_canonical_selected;
 mod json_object_owner;
 mod json_object_selected;
 mod like_escape_owner;
-mod makedate;
-mod makedate_owner;
 pub mod map_entries_core;
 mod map_entries_owner;
 mod map_entries_selected;
@@ -154,8 +138,6 @@ mod map_size_owner;
 mod map_size_selected;
 mod md5_selected;
 pub mod md5_shared;
-mod md5sum_numeric_owner;
-mod md5sum_owner;
 mod murmur;
 mod negation;
 mod negation_owner;
@@ -173,8 +155,6 @@ pub mod numeric_unary;
 mod numeric_unary_owner;
 mod parse_json_owner;
 mod parse_json_selected;
-mod percentile_hash_owner;
-mod percentile_hash_selected;
 mod rand;
 mod rand_owner;
 mod round;
@@ -185,8 +165,6 @@ pub mod round_core;
 mod round_owner;
 mod rounding_binding;
 mod sleep_owner;
-mod string_append_trailing;
-mod string_append_trailing_owner;
 mod string_binary;
 pub mod string_case;
 mod string_case_owner;
@@ -196,8 +174,6 @@ mod string_concat_ws;
 mod string_concat_ws_owner;
 pub mod string_extended;
 mod string_extended_owner;
-mod string_find_in_set;
-mod string_find_in_set_owner;
 mod string_from_base64;
 mod string_from_base64_owner;
 mod string_hex;
@@ -212,9 +188,6 @@ mod string_md5;
 mod string_md5_owner;
 pub mod string_measure;
 mod string_measure_owner;
-mod string_money;
-pub mod string_null_or_empty;
-mod string_null_or_empty_owner;
 mod string_pad;
 mod string_pad_owner;
 mod string_repeat;
@@ -225,16 +198,11 @@ mod string_reverse;
 mod string_reverse_owner;
 mod string_sha2;
 mod string_sha2_owner;
-mod string_sm3;
-mod string_sm3_owner;
 pub mod string_split;
 mod string_split_owner;
 mod string_split_part;
 mod string_split_part_owner;
 mod string_substring;
-mod string_substring_index;
-pub mod string_substring_index_core;
-mod string_substring_index_owner;
 mod string_substring_owner;
 mod string_translate;
 mod string_translate_owner;
@@ -276,20 +244,12 @@ mod string_regexp_replace;
 pub mod scalar_extrema;
 mod scalar_extrema_owner;
 
-pub mod xx_hash3_128;
-mod xx_hash3_128_owner;
-
-pub mod calendar_sec_to_time;
-mod calendar_sec_to_time_owner;
+pub mod calendar_time_text_shared;
+#[cfg(test)]
+mod calendar_time_text_shared_tests;
 
 pub mod regexp_position;
 mod regexp_position_owner;
-
-mod calendar_time_text_owner;
-pub mod calendar_time_text_shared;
-
-#[cfg(test)]
-mod calendar_time_text_shared_tests;
 
 pub mod array_literal_core;
 mod array_literal_owner;
@@ -304,9 +264,6 @@ mod array_element_at_owner;
 pub mod calendar_unixtime;
 mod calendar_unixtime_owner;
 
-pub mod calendar_slice;
-mod calendar_slice_owner;
-
 pub mod array_append_core;
 mod array_append_owner;
 mod array_append_selected;
@@ -316,8 +273,6 @@ pub mod regexp_count;
 pub(crate) mod regexp_count_owner;
 
 pub mod sha2_shared;
-
-pub mod sm3_shared;
 
 mod string_parse_url;
 mod string_parse_url_owner;
@@ -330,21 +285,9 @@ mod string_to_base64;
 mod string_to_base64_owner;
 pub mod to_base64_shared;
 
-mod aes_owner;
-pub mod aes_primitive;
-pub mod aes_rows;
-pub mod aggregate_ds_hll_core;
-pub mod aggregate_ds_hll_failure;
-mod aggregate_ds_hll_kernel;
-mod aggregate_ds_hll_owner;
-pub mod aggregate_ds_hll_state;
 mod assert_true_owner;
 pub mod bytes_output;
-pub mod ds_hll_state_core;
-mod ds_hll_state_owner;
-mod ds_hll_state_selected;
 mod from_binary_owner;
-mod row_encoding_owner;
 mod scalar_rows_owner;
 mod synopse_owner;
 mod uuid_owner;
@@ -353,24 +296,6 @@ mod vector_distance_owner;
 pub mod array_match_core;
 mod array_match_owner;
 mod array_match_selected;
-
-pub mod array_difference_core;
-mod array_difference_owner;
-mod array_difference_selected;
-
-mod string_field;
-mod string_field_owner;
-#[cfg(test)]
-mod string_field_tests;
-
-mod hll_hash_owner;
-mod hll_hash_selected;
-
-mod aggregate_bitmap_union_int;
-mod aggregate_bitmap_union_int_owner;
-
-mod aggregate_hll_payload_kernel;
-mod aggregate_hll_payload_owner;
 
 pub mod aggregate_map_core;
 mod aggregate_map_source_failure;
@@ -391,9 +316,6 @@ mod array_struct_subfield_port;
 mod array_struct_subfield_selected;
 pub mod struct_field_resolution;
 
-mod percentile_approx_raw_owner;
-mod percentile_approx_raw_selected;
-
 mod aggregate_by_window;
 
 // Private transport/lifecycle probes; no scalar owner or ABI is registered.
@@ -412,10 +334,5 @@ mod parametric_aggregate_construction;
 mod scalar_construction;
 mod scalar_type_recipe;
 
-// The single binding carrier preserves FIELD's actual validation prefix.
-pub(crate) use string_field_owner::StringFieldOwner;
-
 #[cfg(test)]
 mod array_struct_subfield_owner_tests;
-
-pub mod array_cum_sum_core;

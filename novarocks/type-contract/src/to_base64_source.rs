@@ -35,20 +35,12 @@ pub fn native_v1_function_name(
 }
 
 pub const NATIVE_V1_ENCRYPTION_FUNCTIONS: &[(&str, &str)] = &[
-    ("aes_decrypt", "aes_decrypt"),
-    ("aes_encrypt", "aes_encrypt"),
-    ("encode_fingerprint_sha256", "encode_fingerprint_sha256"),
-    ("encode_row_id", "encode_fingerprint_sha256"),
-    ("encode_sort_key", "encode_sort_key"),
     ("base64_decode_binary", "from_base64"),
     ("base64_decode_string", "from_base64"),
     ("from_base64", "from_base64"),
     ("from_binary", "from_binary"),
     ("md5", "md5"),
-    ("md5sum", "md5sum"),
-    ("md5sum_numeric", "md5sum_numeric"),
     ("sha2", "sha2"),
-    ("sm3", "sm3"),
     ("to_base64", "to_base64"),
     ("to_binary", "to_binary"),
 ];
@@ -74,7 +66,7 @@ impl ToBase64ByteSource {
     }
     /// Raw/Local construction tags are already dispatch identities; retain exact old tag semantics.
     pub fn from_immediate_encryption_identity(name: Option<&str>) -> Self {
-        if matches!(name, Some("aes_encrypt" | "from_base64" | "to_binary")) {
+        if matches!(name, Some("from_base64" | "to_binary")) {
             Self::NativeV1EncryptionLatin1
         } else {
             Self::Ordinary

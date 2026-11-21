@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 //! Original corpus source author and permanent complete-compiler expectation.
-use arrow::datatypes::DataType;
+use arrow::datatypes::{DataType, Field};
 use novarocks_expression_contract::ExprKind;
 use novarocks_physical_plan::FunctionArgumentType;
 use novarocks_physical_plan::StaticFunctionArgument;
@@ -42,17 +42,19 @@ fn sources() -> Vec<novarocks_sql::compiler::SqlAuthoredPhysicalPlan> {
     [format!("WITH w1 AS ({first}"), second.to_owned()]
         .into_iter()
         .map(|sql| {
-            super::hll_hash_actual_sql_source_tests::hll_sql_source(
+            let fields = [
+                ("id", DataType::Int32),
+                ("grp", DataType::Int32),
+                ("v", DataType::Int32),
+                ("txt", DataType::Utf8),
+                ("flag", DataType::Boolean),
+                ("big_v", DataType::Int64),
+                ("w", DataType::Int64),
+            ]
+            .map(|(name, ty)| Field::new(name, ty, true));
+            super::sql_test_source::sql_source_with_declared_fields(
                 sql.replace("${case_db}", "fixture").trim(),
-                &[
-                    ("id", DataType::Int32),
-                    ("grp", DataType::Int32),
-                    ("v", DataType::Int32),
-                    ("txt", DataType::Utf8),
-                    ("flag", DataType::Boolean),
-                    ("big_v", DataType::Int64),
-                    ("w", DataType::Int64),
-                ],
+                &fields,
             )
         })
         .collect()

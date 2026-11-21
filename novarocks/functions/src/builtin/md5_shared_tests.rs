@@ -19,7 +19,7 @@ use crate::{
     EvaluatedArgument, FunctionValueType, KernelEvaluationControl, ScalarEvaluationInstance,
     kernel_control::{internal, invalid},
 };
-use arrow_array::{LargeBinaryArray, LargeStringArray, StructArray};
+use arrow_array::{LargeBinaryArray, StructArray};
 use std::sync::{Arc, Mutex};
 #[derive(Default)]
 struct Control {
@@ -47,19 +47,12 @@ impl KernelEvaluationControl for Control {
     }
 }
 fn prepared(name: &str, sources: &[FunctionValueType]) -> Arc<dyn crate::PreparedScalarKernel> {
-    match name {
-        "md5" => super::super::string_md5_owner::prepared_for_test_with_policy(
-            name,
-            sources,
-            novarocks_type_contract::DecimalOverflowPolicy::ReportError,
-        )
-        .unwrap(),
-        "md5sum" => super::super::md5sum_owner::tests::prepared_for_test(name, sources).unwrap(),
-        "md5sum_numeric" => {
-            super::super::md5sum_numeric_owner::tests::prepared_for_test(name, sources).unwrap()
-        }
-        _ => panic!("uninstalled test owner"),
-    }
+    super::super::string_md5_owner::prepared_for_test_with_policy(
+        name,
+        sources,
+        novarocks_type_contract::DecimalOverflowPolicy::ReportError,
+    )
+    .unwrap()
 }
 fn causes() -> [KernelFailure; 7] {
     [
@@ -74,7 +67,7 @@ fn causes() -> [KernelFailure; 7] {
 }
 #[test]
 fn md5_family_actual_instances_keep_seven_causes_at_every_checkpoint_without_replay() {
-    for name in ["md5", "md5sum", "md5sum_numeric"] {
+    for name in ["md5"] {
         let text = "aé\0".repeat(129);
         let first = Arc::new(StringArray::from(vec![
             Some(text.as_str()),
@@ -137,54 +130,6 @@ fn md5_family_actual_instances_keep_seven_causes_at_every_checkpoint_without_rep
                 assert_eq!(*control.trace.lock().unwrap(), trace[..=at]);
             }
         }
-    }
-}
-#[test]
-fn md5_family_selected_compact_and_scalar_addresses_skip_null_without_delimiters() {
-    for name in ["md5sum", "md5sum_numeric"] {
-        let first = Arc::new(LargeStringArray::from(vec![
-            "inactive", "a", "inactive", "hello",
-        ])) as ArrayRef;
-        let compact = Arc::new(Int64Array::from(vec![Some(42), None])) as ArrayRef;
-        let scalar = Arc::new(BinaryArray::from(vec![b"b".as_slice()])) as ArrayRef;
-        let sources = [
-            FunctionValueType::new(DataType::LargeUtf8, false),
-            FunctionValueType::new(DataType::Int64, true),
-            FunctionValueType::new(DataType::Binary, false),
-        ];
-        let rows = [1, 3];
-        let selection = Selection::try_sparse(4, &rows).unwrap();
-        let compact_values =
-            crate::SelectedValues::try_new(selection, &DataType::Int64, compact, Box::default())
-                .unwrap();
-        let arguments = [
-            EvaluatedArgument::Column(&first),
-            EvaluatedArgument::SelectedColumn(&compact_values),
-            EvaluatedArgument::Scalar(&scalar),
-        ];
-        let output = ScalarEvaluationInstance::instantiate(prepared(name, &sources))
-            .unwrap()
-            .evaluate(selection, &arguments, &Control::default())
-            .unwrap();
-        let input = to_owned_bytes_array_with_varchar_cast(
-            Arc::new(StringArray::from(vec!["a42b", "hellob"])),
-            name,
-            0,
-        )
-        .unwrap();
-        let op = if name == "md5sum" {
-            Operation::Md5sum
-        } else {
-            Operation::Md5sumNumeric
-        };
-        let target = if name == "md5sum" {
-            DataType::Utf8
-        } else {
-            DataType::FixedSizeBinary(16)
-        };
-        let expected = evaluate_required(op, &[input], 2, Some(&target)).unwrap();
-        assert_eq!(output.values().to_data(), expected.to_data());
-        assert!(output.errors().is_empty());
     }
 }
 #[test]

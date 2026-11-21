@@ -35,7 +35,6 @@ SELECT array_remove([NULL, NULL], NULL) AS removed,
        array_intersect([NULL], []) AS empty_intersection,
        arrays_overlap([NULL], [NULL]) AS shared_null,
        arrays_overlap([], [NULL]) AS empty_overlap,
-       array_contains_all([NULL, NULL], [NULL]) AS contains_all_null,
        array_contains_seq([NULL, NULL], [NULL]) AS contains_null_seq;
 
 -- query 3

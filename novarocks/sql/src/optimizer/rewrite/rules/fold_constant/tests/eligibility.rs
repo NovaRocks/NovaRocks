@@ -134,12 +134,7 @@ fn does_not_fold_distinct_function_call() {
 
 #[test]
 fn does_not_fold_denylisted_function_even_when_marked_immutable() {
-    for name in [
-        "from_unixtime",
-        "FROM_UNIXTIME",
-        "hour_from_unixtime",
-        "now",
-    ] {
+    for name in ["from_unixtime", "FROM_UNIXTIME", "now"] {
         let mut fixture = Fixture::new();
         let one = fixture.int_literal(1);
         let call = fixture.function_call(
@@ -167,7 +162,7 @@ fn does_not_fold_byte_carrying_string_function() {
     // These carry raw bytes inside a Utf8 value. Folding one turns it into
     // an ordinary string literal, after which a consumer such as
     // `to_base64` reads different bytes than the runtime produced.
-    for name in ["aes_encrypt", "AES_ENCRYPT", "from_base64", "unhex"] {
+    for name in ["from_base64", "FROM_BASE64", "unhex"] {
         let mut fixture = Fixture::new();
         let one = fixture.int_literal(1);
         let call = fixture.function_call(
@@ -399,100 +394,6 @@ fn second_pass_over_a_folded_plan_reports_unchanged() {
         matches!(fixture.apply(rewritten), RewriteResult::Unchanged),
         "folding must reach a fixed point in one pass"
     );
-}
-
-#[test]
-fn preserves_sec_to_time_provenance_but_folds_its_numeric_argument() {
-    let mut fixture = Fixture::new();
-    let negative = fixture.int_literal(-2);
-    let one = fixture.int_literal(1);
-    let seconds = fixture.binary(BinOp::Add, negative, one);
-    let source = fixture.function_call(
-        "sec_to_time",
-        vec![seconds],
-        false,
-        FunctionVolatility::Immutable,
-        DataType::Utf8,
-        true,
-    );
-    let cast_source = fixture.intern(
-        ScalarNode::Cast {
-            array_failure_mode: None,
-            child: source,
-            target: DataType::Utf8,
-            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-        },
-        novarocks_type_contract::FunctionValueType::new(DataType::Utf8, true),
-    );
-    let wrapped = fixture.intern(
-        ScalarNode::Nested(cast_source),
-        novarocks_type_contract::FunctionValueType::new(DataType::Utf8, true),
-    );
-    let consumer = fixture.function_call(
-        "time_to_sec",
-        vec![wrapped],
-        false,
-        FunctionVolatility::Immutable,
-        DataType::Int64,
-        true,
-    );
-
-    let rewritten = changed(fixture.apply(project(consumer)));
-    let ScalarNode::FunctionCall { args, .. } = fixture.node(project_expr(&rewritten)) else {
-        panic!("source-sensitive consumer must remain a call");
-    };
-    let ScalarNode::Nested(cast_source) = fixture.node(args[0]) else {
-        panic!("source wrapper must remain intact");
-    };
-    let ScalarNode::Cast { child: source, .. } = fixture.node(cast_source) else {
-        panic!("source cast must remain intact");
-    };
-    let ScalarNode::FunctionCall { name, args, .. } = fixture.node(source) else {
-        panic!("SEC_TO_TIME source must not become a string literal");
-    };
-    assert_eq!(name, "sec_to_time");
-    assert_int_literal(&fixture, args[0], -1);
-    assert_eq!(fixture.calls(), 1, "only the numeric argument is folded");
-}
-
-#[test]
-fn shared_sec_to_time_can_fold_without_erasing_roundtrip_source() {
-    let fixture = Fixture::new();
-    let seconds = fixture.int_literal(-1);
-    let source = fixture.function_call(
-        "sec_to_time",
-        vec![seconds],
-        false,
-        FunctionVolatility::Immutable,
-        DataType::Utf8,
-        true,
-    );
-    let consumer = fixture.function_call(
-        "time_to_sec",
-        vec![source],
-        false,
-        FunctionVolatility::Immutable,
-        DataType::Int64,
-        true,
-    );
-    let mut arena = fixture.arena.borrow_mut();
-    let mut memo = HashMap::new();
-    let mut work = CompileCheckpoints::try_new(
-        crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
-        CompilePhase::Validate,
-    )
-    .unwrap();
-    let standalone =
-        fold_scalar_id(&mut arena, source, &fixture.ctx, &mut memo, &mut work).unwrap();
-    let roundtrip =
-        fold_scalar_id(&mut arena, consumer, &fixture.ctx, &mut memo, &mut work).unwrap();
-    work.finish().unwrap();
-    assert!(matches!(arena.node(standalone), ScalarNode::Constant(_)));
-    let ScalarNode::FunctionCall { args, .. } = arena.node(roundtrip) else {
-        panic!("roundtrip must not reuse the standalone folded literal");
-    };
-    assert_eq!(args, &[source]);
-    assert_eq!(fixture.calls(), 1);
 }
 
 #[test]

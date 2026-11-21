@@ -218,13 +218,13 @@ SELECT pk, map5 NOT IN (SELECT map5 FROM ${case_db}.map_test s) AS membership FR
 -- query 30
 SELECT t.map2, s.map2
 FROM ${case_db}.map_test t JOIN ${case_db}.map_test s
-  ON map_apply((k,v)->(k+1,array_length(v)),s.map2) = map_apply((k,v)->(k+1,array_length(v)),t.map2)
+  ON transform_values((k,v) -> array_length(v), transform_keys((k,v) -> k+1, s.map2)) = transform_values((k,v) -> array_length(v), transform_keys((k,v) -> k+1, t.map2))
 ORDER BY t.pk;
 
 -- query 31
 SELECT t.map2, s.map2
 FROM ${case_db}.map_test t JOIN ${case_db}.map_test s
-  ON map_apply((k,v)->(k+1,v),s.map2) = map_apply((k,v)->(k+1,v),t.map2)
+  ON transform_keys((k,v) -> k+1, s.map2) = transform_keys((k,v) -> k+1, t.map2)
 ORDER BY t.pk;
 
 -- query 32

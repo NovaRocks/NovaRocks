@@ -41,9 +41,7 @@ fn actual_map_key_keeps_original_exact_binding_and_candidate_named_refusal() {
 }
 
 mod fold_frontiers {
-    use crate::fixtures::{
-        analyze_table_free, optimize_table_free, session, table_free_request, table_parent,
-    };
+    use crate::fixtures::{analyze_table_free, optimize_table_free, session, table_parent};
     use crate::fold_observation::FoldProbe;
     use novarocks_sql::{
         analyze_error::AnalyzeErrorKind,
@@ -84,17 +82,208 @@ mod fold_frontiers {
     }
 
     #[test]
-    fn e08s1_missing_aggregate_window_and_over_keep_unavailable_span_before_any_fold() {
-        for (sql, name) in [
-            ("SELECT dict_merge('x', 1)", "builtin.aggregate/dict_merge/"),
+    fn distinct_aggregates_are_selected_only_from_supported_sql_calls() {
+        let probe = Arc::new(FoldProbe::default());
+        analyze(
+            "SELECT count(DISTINCT 1, 2), sum(DISTINCT 1), avg(DISTINCT 1)",
+            &probe,
+        )
+        .unwrap();
+
+        for (sql, expected) in [
             (
-                "SELECT session_number(1, 2) OVER (ORDER BY 1)",
-                "builtin.window/session_number/",
+                "SELECT multi_distinct_count(1)",
+                AnalyzeErrorKind::UnknownFunction,
+            ),
+            (
+                "SELECT multi_distinct_sum(1) OVER ()",
+                AnalyzeErrorKind::UnknownFunction,
+            ),
+            (
+                "SELECT multi_distinct_avg(1)",
+                AnalyzeErrorKind::UnknownFunction,
+            ),
+            (
+                "SELECT count(DISTINCT 1) OVER ()",
+                AnalyzeErrorKind::UnsupportedExpression,
             ),
         ] {
-            let probe = Arc::new(FoldProbe::default());
-            unavailable(analyze(sql, &probe).unwrap_err(), name);
-            assert!(probe.receipts.lock().unwrap().is_empty());
+            let error = analyze(sql, &probe).unwrap_err();
+            let SqlCompileError::Analyze(error) = error else {
+                panic!("expected analysis error for {sql}: {error:?}");
+            };
+            assert_eq!(error.kind(), expected, "{sql}: {error}");
+        }
+    }
+
+    #[test]
+    fn retired_trc_6d1_names_are_unknown_to_sql_analysis() {
+        use novarocks_functions::{
+            FunctionKind, FunctionVisibility, builtin::catalogue::builtin_engine_function_catalog,
+        };
+
+        let catalog = builtin_engine_function_catalog();
+        let probe = Arc::new(FoldProbe::default());
+        for name in [
+            "__iceberg_transform_bucket",
+            "__iceberg_transform_day",
+            "__iceberg_transform_hour",
+            "__iceberg_transform_identity",
+            "__iceberg_transform_month",
+            "__iceberg_transform_truncate",
+            "__iceberg_transform_void",
+            "__iceberg_transform_year",
+            "aes_decrypt",
+            "aes_encrypt",
+            "append_trailing_char_if_absent",
+            "approx_cosine_similarity",
+            "approx_count_distinct_hll_sketch",
+            "approx_l2_distance",
+            "array_avg",
+            "array_contains_all",
+            "array_cum_sum",
+            "array_difference",
+            "array_sum",
+            "array_top_n",
+            "array_unique_agg",
+            "bit_length",
+            "bitmap_agg",
+            "bitmap_and",
+            "bitmap_andnot",
+            "bitmap_contains",
+            "bitmap_count",
+            "bitmap_empty",
+            "bitmap_from_binary",
+            "bitmap_from_string",
+            "bitmap_has_any",
+            "bitmap_intersect",
+            "bitmap_max",
+            "bitmap_min",
+            "bitmap_or",
+            "bitmap_subset_in_range",
+            "bitmap_subset_limit",
+            "bitmap_to_array",
+            "bitmap_to_base64",
+            "bitmap_to_binary",
+            "bitmap_to_string",
+            "bitmap_union",
+            "bitmap_union_count",
+            "bitmap_union_int",
+            "bitmap_xor",
+            "cosine_similarity_norm",
+            "cot",
+            "date_slice",
+            "dict_merge",
+            "distinct_map_keys",
+            "ds_hll_accumulate",
+            "ds_hll_combine",
+            "ds_hll_count_distinct",
+            "ds_hll_count_distinct_merge",
+            "ds_hll_count_distinct_state",
+            "ds_hll_count_distinct_union",
+            "ds_hll_estimate",
+            "ds_theta_count_distinct",
+            "elt",
+            "encode_fingerprint_sha256",
+            "encode_row_id",
+            "encode_sort_key",
+            "field",
+            "find_in_set",
+            "from_days",
+            "grouping_id",
+            "hll_cardinality",
+            "hll_hash",
+            "hll_raw_agg",
+            "hll_union",
+            "hll_union_agg",
+            "hour_from_unixtime",
+            "makedate",
+            "mann_whitney_u_test",
+            "map_apply",
+            "md5sum",
+            "md5sum_numeric",
+            "microseconds_add",
+            "microseconds_sub",
+            "money_format",
+            "multi_distinct_avg",
+            "multi_distinct_count",
+            "multi_distinct_sum",
+            "next_day",
+            "null_or_empty",
+            "octet_length",
+            "ord",
+            "percentile_approx_raw",
+            "percentile_cont",
+            "percentile_disc",
+            "percentile_disc_lc",
+            "percentile_empty",
+            "percentile_hash",
+            "percentile_union",
+            "pmod",
+            "previous_day",
+            "sec_to_time",
+            "session_number",
+            "sm3",
+            "space",
+            "square",
+            "strcmp",
+            "sub_bitmap",
+            "substring_index",
+            "sum_map",
+            "time_format",
+            "time_slice",
+            "time_to_sec",
+            "to_bitmap",
+            "to_date",
+            "to_datetime_ntz",
+            "to_days",
+            "utc_time",
+            "utc_timestamp",
+            "xx_hash3_128",
+            "xx_hash3_64",
+            "yearweek",
+        ] {
+            for kind in [
+                FunctionKind::Scalar,
+                FunctionKind::Aggregate,
+                FunctionKind::Window,
+                FunctionKind::Table,
+            ] {
+                let expected = if kind == FunctionKind::Aggregate
+                    && matches!(
+                        name,
+                        "multi_distinct_count" | "multi_distinct_sum" | "multi_distinct_avg"
+                    ) {
+                    Some(FunctionVisibility::Hidden)
+                } else {
+                    None
+                };
+                assert_eq!(
+                    catalog
+                        .definition(name, kind)
+                        .map(|entry| entry.visibility()),
+                    expected,
+                    "catalogue entry for {kind:?} {name}"
+                );
+            }
+            let sql = format!("SELECT {name}(1)");
+            let error = analyze(&sql, &probe).unwrap_err();
+            let SqlCompileError::Analyze(error) = error else {
+                panic!("expected analysis error for {sql}: {error:?}");
+            };
+            assert_eq!(
+                error.kind(),
+                AnalyzeErrorKind::UnknownFunction,
+                "{sql}: {error}"
+            );
+        }
+
+        for sql in [
+            "SELECT sleep(0)",
+            "SELECT murmur_hash3_32('x')",
+            "SELECT array_sortby(ARRAY[2, 1], ARRAY[2, 1])",
+        ] {
+            analyze(sql, &probe).unwrap_or_else(|error| panic!("{sql}: {error}"));
         }
     }
 
@@ -206,21 +395,6 @@ mod fold_frontiers {
         );
     }
 
-    const HOUR_LITERAL: &str = "SELECT hour_from_unixtime(CAST(1700000000 AS BIGINT)) AS h";
-    const HOUR_OWNER: &str = "builtin.scalar/hour_from_unixtime/(i64)->i32;strict;legacy";
-
-    #[test]
-    fn sql_presence_candidate_hour_literal_and_projected_column_refuse_before_fold() {
-        for sql in [
-            HOUR_LITERAL,
-            "SELECT hour_from_unixtime(t.k) AS h FROM (SELECT CAST(1700000000 AS BIGINT) AS k) t",
-        ] {
-            let probe = Arc::new(FoldProbe::default());
-            unavailable(analyze(sql, &probe).unwrap_err(), HOUR_OWNER);
-            assert!(probe.receipts.lock().unwrap().is_empty());
-        }
-    }
-
     #[test]
     fn sql_presence_candidate_invalid_pattern_is_not_prepared_or_evaluated_by_admission() {
         let probe = Arc::new(FoldProbe::default());
@@ -231,133 +405,5 @@ mod fold_frontiers {
         )
         .unwrap();
         assert!(probe.receipts.lock().unwrap().is_empty());
-    }
-
-    #[test]
-    fn sql_presence_candidate_completion_uses_actual_request_mode_before_fold_or_publication() {
-        let probe = Arc::new(FoldProbe::default());
-        let request = table_free_request(
-            HOUR_LITERAL,
-            session(Default::default(), true),
-            &probe.control(),
-        );
-        unavailable(
-            request
-                .try_into_completion()
-                .err()
-                .expect("unavailable before completed source"),
-            HOUR_OWNER,
-        );
-        assert!(probe.receipts.lock().unwrap().is_empty());
-    }
-}
-
-mod percentile_hash {
-    use crate::fixtures::{session, table_free_request};
-    use crate::fold_observation::FoldProbe;
-    use arrow::datatypes::DataType;
-    use novarocks_functions::{
-        FunctionArgument, FunctionBindingError, FunctionBindingRequest, FunctionValueType,
-    };
-    use novarocks_sql::{
-        analyze_error::AnalyzeErrorKind,
-        compiler::{SqlCompileControl, SqlCompileError, builtin_sql_function_catalog},
-    };
-    use std::sync::Arc;
-
-    #[test]
-    fn hash_native_n1_exact_admission_preserves_original_variadic_binding_and_refuses_before_fold()
-    {
-        let original = builtin_sql_function_catalog().snapshot();
-        let exact = original.snapshot_for_scalar_presence();
-        let control = SqlCompileControl::unbounded();
-        for n in [1, 2, 5] {
-            let args = (0..n)
-                .map(|_| FunctionArgument::Value {
-                    value_type: FunctionValueType::new(DataType::Int32, true),
-                    constant: None,
-                })
-                .collect::<Vec<_>>();
-            let bound = original
-                .resolve_scalar_binding("percentile_hash", &args, &control)
-                .unwrap();
-            assert_eq!(bound.admitted_execution_abi, None);
-            assert_eq!(bound.logical_argument_count, n);
-            assert_eq!(bound.selected.argument_types.len(), n);
-            let request = FunctionBindingRequest {
-                arguments: &args,
-                logical_argument_count: n,
-                expected_result_type: None,
-            };
-            original
-                .select_exact_overload_observed(
-                    &bound.function_id,
-                    bound.kind,
-                    &bound.selected.overload,
-                    request,
-                    &control,
-                )
-                .unwrap();
-            if n == 1 {
-                assert_eq!(bound.admitted_execution_abi, None);
-                let actual_abi = original
-                    .pure_overload_declaration_observed(
-                        &bound.function_id,
-                        bound.kind,
-                        &bound.selected.overload,
-                        &control,
-                    )
-                    .unwrap()
-                    .implementation()
-                    .abi;
-                let mut admitted = exact
-                    .resolve_scalar_binding("percentile_hash", &args, &control)
-                    .unwrap();
-                assert_eq!(admitted.admitted_execution_abi, Some(actual_abi));
-                admitted.admitted_execution_abi = None;
-                assert_eq!(
-                    admitted, bound,
-                    "complete original selected source is unchanged"
-                );
-                exact
-                    .select_exact_overload_observed(
-                        &bound.function_id,
-                        bound.kind,
-                        &bound.selected.overload,
-                        request,
-                        &control,
-                    )
-                    .unwrap();
-            } else {
-                assert!(
-                    matches!(exact.resolve_scalar_binding("percentile_hash", &args, &control),
-                Err(FunctionBindingError::UnavailableImplementation(ref o)) if o == &bound.selected.overload)
-                );
-                assert!(
-                    matches!(exact.select_exact_overload_observed(&bound.function_id, bound.kind,
-                &bound.selected.overload, request, &control),
-                Err(FunctionBindingError::UnavailableImplementation(ref o)) if o == &bound.selected.overload)
-                );
-            }
-        }
-        for sql in [
-            "SELECT percentile_hash(CAST(17 AS INT),CAST('bad' AS INT)) AS encoded",
-            "SELECT percentile_hash(CAST(17 AS INT),CAST(1 AS INT),CAST(2 AS INT),CAST(3 AS INT),CAST(4 AS INT))",
-        ] {
-            let probe = Arc::new(FoldProbe::default());
-            let request =
-                table_free_request(sql, session(Default::default(), true), &probe.control());
-            let SqlCompileError::Analyze(error) = request
-                .try_into_completion()
-                .err()
-                .expect("deferred production arity must fail before completing the source")
-            else {
-                panic!("expected original typed analysis category");
-            };
-            assert_eq!(error.kind(), AnalyzeErrorKind::UnavailableImplementation);
-            assert!(error.span().is_some());
-            assert!(error.message().contains("builtin.scalar/percentile_hash/"));
-            assert!(probe.receipts.lock().unwrap().is_empty());
-        }
     }
 }

@@ -16,7 +16,6 @@
 // under the License.
 //! Original TIME computation. Source occurrence scheduling belongs to the host.
 use super::calendar_extended::DateInput;
-use super::calendar_sec_to_time::clamp_sec_to_time_seconds;
 use crate::{KernelEvaluationControl, KernelFailure, kernel_input::EvaluationCheckpoints};
 use arrow_array::{Array, ArrayRef, Int64Array, StringArray};
 use arrow_schema::DataType;
@@ -140,6 +139,11 @@ pub fn datetime_seconds(
     }
     Ok(out)
 }
+const SEC_TO_TIME_CAP_SECONDS: i64 = 839 * 3600 + 59 * 60 + 59;
+fn clamp_sec_to_time_seconds(seconds: i64) -> i64 {
+    seconds.clamp(-SEC_TO_TIME_CAP_SECONDS, SEC_TO_TIME_CAP_SECONDS)
+}
+
 pub fn sec_to_time_source(
     array: &ArrayRef,
     work: &mut EvaluationCheckpoints<'_>,

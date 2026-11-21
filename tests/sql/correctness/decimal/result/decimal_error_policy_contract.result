@@ -92,19 +92,13 @@ n
 1
 
 -- query 41
--- types	integer	integer
-id	f
-1	1
-2	0
-
--- query 42
 -- types	integer	integer	varchar
 left_id	right_id	merged_key
 1	10	1
 NULL	20	1000
 NULL	30	NULL
 
--- query 44
+-- query 43
 -- types	integer	integer	varchar
 left_id	right_id	merged_key
 2	NULL	NULL

@@ -1,23 +1,17 @@
--- query 6
--- legacy
-k1	c1	c2
-3	["0","2","1"]	[1,1,1]
-4	["1","2"]	[1,1]
-
--- query 12
+-- query 11
 -- legacy
 t1_id	t2_id	arr_largeint
 1	1	[1,2]
 2	2	[3,4,5]
 3	NULL	[6]
 
--- query 13
+-- query 12
 -- legacy
 _col0	_col1
 [1]	[1]
 [1]	[1]
 
--- query 14
+-- query 13
 -- legacy
 price_list	fields
 [{"num": 1, "open_id": "aaa"}, {"num": 2, "open_id": "bbb"}, {"num": 3, "open_id": "ccc"}]	["aaa","bbb","ccc"]

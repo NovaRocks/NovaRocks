@@ -14,13 +14,12 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//! ONE original MOD/PMOD row computation, independent of arena and output carrier.
+//! ONE original MOD row computation, independent of arena and output carrier.
 //! Callers supply checked addresses, explicit work, and their result projection.
 use crate::{KernelFailure, math_numeric::NumericArrayView};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NumericModOp {
     Mod,
-    Pmod,
 }
 #[derive(Debug)]
 pub enum NumericModError {
@@ -77,7 +76,7 @@ impl novarocks_failure_contract::OuterFailureProjection for NumericModError {}
 /// Raw legacy callers retain unchecked indexing/broadcast; pure callers provide
 /// exact selected addresses and validate their non-null promises in `address`.
 pub fn evaluate_mod_rows(
-    op: NumericModOp,
+    _op: NumericModOp,
     left_view: &NumericArrayView<'_>,
     right_view: &NumericArrayView<'_>,
     rows: impl IntoIterator<Item = usize>,
@@ -92,14 +91,8 @@ pub fn evaluate_mod_rows(
         let r = right_view.value_i64(right_row);
         let out = match (l, r) {
             (Some(a), Some(b)) if b != 0 => {
-                // Widen before division and absolute value: i64::MIN % -1
-                // and abs(i64::MIN) overflow despite their remainder fitting.
-                let mut v = (a as i128) % (b as i128);
-                if op == NumericModOp::Pmod && v < 0 {
-                    v += (b as i128).abs();
-                }
-                // |remainder| < |b| <= 2^63. Positive correction lies in
-                // [0, |b| - 1], so both formulas always fit signed BIGINT.
+                // Widen before division because i64::MIN % -1 overflows.
+                let v = (a as i128) % (b as i128);
                 Some(i64::try_from(v).map_err(|_| NumericModError::RangeInvariant)?)
             }
             _ => None,

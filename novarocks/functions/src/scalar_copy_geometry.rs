@@ -191,12 +191,14 @@ pub(crate) trait GeometryFold: Sized {
     fn child(children: &mut Self::Children, child: Self) -> Result<(), KernelFailure>;
     fn end(kind: ContainerExtent, children: Self::Children) -> Result<Self, KernelFailure>;
 }
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ScalarCopyFacts {
     pub(crate) requested_bytes_upper: usize,
     pub(crate) requests_upper: usize,
     pub(crate) peak_bytes_upper: usize,
 }
+#[cfg(test)]
 impl From<CopyGeometry> for ScalarCopyFacts {
     fn from(copy: CopyGeometry) -> Self {
         Self {
@@ -206,6 +208,7 @@ impl From<CopyGeometry> for ScalarCopyFacts {
         }
     }
 }
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ScalarCopyDiagnosticGeometry {
     Known {
@@ -216,11 +219,13 @@ pub(crate) enum ScalarCopyDiagnosticGeometry {
         diagnostic_bytes_upper: usize,
     },
 }
+#[cfg(test)]
 struct CopyDiagnosticFold {
     copy: CopyGeometry,
     diagnostic: usize,
     failed: bool,
 }
+#[cfg(test)]
 impl GeometryFold for CopyDiagnosticFold {
     type Children = Self;
     fn leaf(copy: CopyGeometry, _: LeafExtent) -> Result<Self, KernelFailure> {
@@ -253,6 +258,7 @@ impl GeometryFold for CopyDiagnosticFold {
         Ok(children)
     }
 }
+#[cfg(test)]
 pub(crate) fn scalar_copy_diagnostic_geometry(
     array: &ArrayRef,
     row: usize,

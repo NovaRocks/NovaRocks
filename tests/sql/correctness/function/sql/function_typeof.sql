@@ -80,18 +80,12 @@ select typeof(map(1,'apple', 2,'orange', 3,'pear'));
 select typeof(struct(1, 2, 3, 4));
 
 -- query 20
-select typeof(bitmap_empty());
-
--- query 21
-select typeof(hll_empty());
-
--- query 22
 select typeof(parse_json('{"a": 1, "b": true}'));
 
--- query 23
+-- query 21
 select typeof(null);
 
--- query 24
+-- query 22
 -- @skip_result_check=true
 USE ${case_db};
 create table t1 (
@@ -123,7 +117,7 @@ insert into t1 values ROW(
   NULL, NULL, NULL, NULL, NULL
 );
 
--- query 25
+-- query 23
 USE ${case_db};
 select typeof(c1)
   ,typeof(c2)
@@ -146,37 +140,3 @@ select typeof(c1)
   ,typeof(c19)
   ,typeof(c20)
   from t1;
-
--- query 26
--- @skip_result_check=true
-CREATE TABLE ${case_db}.pv_bitmap (
-    dt INT(11),
-    page VARCHAR(10),
-    user_id bitmap
-) WITH (format_version = 3);
-
--- query 27
--- @skip_result_check=true
-USE ${case_db};
-insert into pv_bitmap values ROW(1, 'test', to_bitmap(10));
-
--- query 28
-USE ${case_db};
-select typeof(user_id) from pv_bitmap;
-
--- query 29
--- @skip_result_check=true
-CREATE TABLE ${case_db}.test_uv(
-    dt date,
-    id int,
-    uv_set hll
-) WITH (format_version = 3);
-
--- query 30
--- @skip_result_check=true
-USE ${case_db};
-insert into test_uv values ROW('2024-01-01', 1, hll_hash(10));
-
--- query 31
-USE ${case_db};
-select typeof(uv_set) from test_uv;

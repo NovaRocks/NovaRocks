@@ -266,7 +266,7 @@ fn classify_aggregate_call(
             single_expression_input(args, "COUNT(DISTINCT)")?,
         ),
         "count" if !function.distinct => count_input(args)?,
-        "count_distinct" | "multi_distinct_count" if !function.distinct => (
+        "count_distinct" if !function.distinct => (
             AggregateFunctionKind::CountDistinct,
             single_expression_input(args, "COUNT(DISTINCT)")?,
         ),

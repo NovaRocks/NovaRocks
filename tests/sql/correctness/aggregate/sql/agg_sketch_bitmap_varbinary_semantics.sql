@@ -17,25 +17,13 @@
 
 -- @order_sensitive=true
 -- @tags=aggregate,bitmap,hll,theta,varbinary
--- Test Objective:
--- 1. Validate bitmap/HLL aggregate families on integer and VARBINARY inputs.
--- 2. Cover ds_hll state materialization and estimate over persisted binary state.
--- 3. Assert theta sketches fail fast with an explicit unsupported error.
--- Test Flow:
--- 1. Create/reset source and state tables.
--- 2. Insert deterministic grouped rows with duplicates and NULLs.
--- 3. Assert exact vs approximate distinct counts, bitmap aggregation, and ds_hll state estimation.
+-- Compare exact and approximate distinct counts for duplicates and NULLs.
 -- query 1
 CREATE TABLE ${case_db}.t_agg_sketch_bitmap_source (
     grp INT,
     id_int INT,
     name STRING,
     vb VARBINARY
-) WITH (format_version = 3);
-
-CREATE TABLE ${case_db}.t_agg_ds_hll_state (
-    grp INT,
-    ds_vb BINARY
 ) WITH (format_version = 3);
 
 INSERT INTO ${case_db}.t_agg_sketch_bitmap_source VALUES
@@ -50,17 +38,10 @@ INSERT INTO ${case_db}.t_agg_sketch_bitmap_source VALUES
     ROW(3, 6, 'zeta', to_binary('zeta', 'utf8')),
     ROW(3, 6, 'zeta-dup', to_binary('zeta', 'utf8'));
 
-INSERT INTO ${case_db}.t_agg_ds_hll_state
-SELECT
-    grp,
-    ds_hll_count_distinct_state(vb)
-FROM ${case_db}.t_agg_sketch_bitmap_source;
 SELECT
     COUNT(DISTINCT id_int) AS exact_id,
     ndv(id_int) AS ndv_id,
-    approx_count_distinct(id_int) AS approx_id,
-    approx_count_distinct_hll_sketch(id_int) AS hll_sketch_id,
-    ds_hll_count_distinct(id_int, 10, 'HLL_6') AS ds_hll_id
+    approx_count_distinct(id_int) AS approx_id
 FROM ${case_db}.t_agg_sketch_bitmap_source;
 
 -- query 2
@@ -68,44 +49,7 @@ SELECT
     grp,
     COUNT(DISTINCT vb) AS exact_vb,
     ndv(vb) AS ndv_vb,
-    approx_count_distinct(vb) AS approx_vb,
-    ds_hll_count_distinct(vb) AS ds_hll_vb
+    approx_count_distinct(vb) AS approx_vb
 FROM ${case_db}.t_agg_sketch_bitmap_source
 GROUP BY grp
 ORDER BY grp;
-
--- query 3
-SELECT
-    bitmap_union_int(id_int) AS bitmap_union_cnt,
-    bitmap_to_string(bitmap_agg(id_int)) AS bitmap_members
-FROM ${case_db}.t_agg_sketch_bitmap_source
-WHERE id_int IS NOT NULL;
-
--- query 4
-SELECT
-    grp,
-    bitmap_to_string(bitmap_agg(id_int)) AS bitmap_members,
-    hll_union_agg(hll_hash(id_int)) AS hll_union_cnt
-FROM ${case_db}.t_agg_sketch_bitmap_source
-WHERE id_int IS NOT NULL
-GROUP BY grp
-ORDER BY grp;
-
--- query 5
--- Persisted singleton states must merge to the same non-null NDV as query 2.
-SELECT
-    grp,
-    ds_hll_estimate(ds_vb) AS est_vb
-FROM ${case_db}.t_agg_ds_hll_state
-GROUP BY grp
-ORDER BY grp;
-
--- query 6
--- @expect_error=HLL_4/HLL_6/HLL_8
-SELECT ds_hll_count_distinct(id_int, 10, 'INVALID')
-FROM ${case_db}.t_agg_sketch_bitmap_source;
-
--- query 7
--- @expect_error=unsupported agg function: ds_theta_count_distinct
-SELECT ds_theta_count_distinct(id_int)
-FROM ${case_db}.t_agg_sketch_bitmap_source;

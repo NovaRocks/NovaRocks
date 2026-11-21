@@ -28,7 +28,7 @@ SELECT substring('x', 1, 2, 3);
 SELECT 1 GROUP BY 9999999999999999999999999999999999999999;
 
 -- query 6
--- @expect_trino_error=INVALID_ARGUMENTS,USER_ERROR
+-- @expect_trino_error=FUNCTION_NOT_FOUND,USER_ERROR
 SELECT ds_hll_count_distinct(1, 1);
 
 -- query 7

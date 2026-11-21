@@ -402,6 +402,13 @@ pub(crate) enum ExecutionReason {
         reason = "Stable Execution failure reason slot retained after its producer retired; never renumber or reuse."
     )]
     GroupKeyDictionaryAddress = 367,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Stable Execution failure reason slot retained for its allocator contract test."
+        )
+    )]
     AggregateRequestExtent = 368,
     GroupKeyDecodeContract = 369,
     GroupKeyDecodeAllocation = 370,

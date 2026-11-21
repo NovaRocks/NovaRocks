@@ -43,12 +43,9 @@ use crate::{
 pub(super) enum Operation {
     AssertTrue,
     Uuid,
-    Fingerprint,
-    SortKey,
     FromBinary,
     Bar,
     Bucket,
-    Aes(super::aes_rows::Operation),
     Vector(super::vector_distance_owner::Operation),
 }
 
@@ -56,13 +53,9 @@ pub(super) fn operation(name: &str) -> Option<Operation> {
     Some(match name {
         "assert_true" => Operation::AssertTrue,
         "uuid" => Operation::Uuid,
-        "encode_row_id" | "encode_fingerprint_sha256" => Operation::Fingerprint,
-        "encode_sort_key" => Operation::SortKey,
         "from_binary" => Operation::FromBinary,
         "bar" => Operation::Bar,
         "equiwidth_bucket" => Operation::Bucket,
-        "aes_encrypt" => Operation::Aes(super::aes_rows::Operation::Encrypt),
-        "aes_decrypt" => Operation::Aes(super::aes_rows::Operation::Decrypt),
         name => Operation::Vector(super::vector_distance_owner::operation(name)?),
     })
 }
@@ -76,11 +69,9 @@ pub(super) fn effects(operation: Operation) -> FunctionEffectDeclaration {
             FunctionVolatility::Immutable
         },
         own_row_error: match operation {
-            Operation::AssertTrue
-            | Operation::Bar
-            | Operation::Bucket
-            | Operation::Aes(_)
-            | Operation::Vector(_) => FunctionIntrinsicRowError::MayRaise,
+            Operation::AssertTrue | Operation::Bar | Operation::Bucket | Operation::Vector(_) => {
+                FunctionIntrinsicRowError::MayRaise
+            }
             _ => FunctionIntrinsicRowError::NoRowError,
         },
         failure_behavior: FunctionFailureBehavior::Propagate,
@@ -326,22 +317,10 @@ impl ScalarKernelInstance for ScalarRowsInstance {
         input: ScalarCallInput<'_, 'a>,
         control: &dyn KernelEvaluationControl,
     ) -> Result<SelectedValues<'a>, KernelFailure> {
-        use super::{
-            aes_owner, assert_true_owner, from_binary_owner, row_encoding_owner,
-            vector_distance_owner,
-        };
+        use super::{assert_true_owner, from_binary_owner, vector_distance_owner};
         match self.0 {
             Recipe::Operation(Operation::AssertTrue) => assert_true_owner::evaluate(input, control),
-            Recipe::Operation(Operation::Fingerprint) => {
-                row_encoding_owner::evaluate(false, input, control)
-            }
-            Recipe::Operation(Operation::SortKey) => {
-                row_encoding_owner::evaluate(true, input, control)
-            }
             Recipe::Operation(Operation::FromBinary) => from_binary_owner::evaluate(input, control),
-            Recipe::Operation(Operation::Aes(operation)) => {
-                aes_owner::evaluate(operation, input, control)
-            }
             Recipe::Operation(Operation::Vector(operation)) => {
                 vector_distance_owner::evaluate(operation, input, control)
             }
@@ -428,10 +407,7 @@ impl ScalarRowsOwner {
             })?;
             let result_type = match self.operation {
                 Operation::AssertTrue => DataType::Boolean,
-                Operation::Uuid | Operation::FromBinary | Operation::Bar | Operation::Aes(_) => {
-                    DataType::Utf8
-                }
-                Operation::Fingerprint | Operation::SortKey => DataType::Binary,
+                Operation::Uuid | Operation::FromBinary | Operation::Bar => DataType::Utf8,
                 Operation::Bucket => DataType::Int64,
                 Operation::Vector(_) => DataType::Float64,
             };

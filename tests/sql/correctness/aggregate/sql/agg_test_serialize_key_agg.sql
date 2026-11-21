@@ -38,11 +38,11 @@ select distinct c0, c1 from t0 order by c0, c1 desc limit 10;
 
 -- query 4
 USE ${case_db};
-select length(c0), length(c1) from (select distinct c0, c1 from (select * from t0 union all select space(1000000) as c0, space(1000000) as c1, space(1000000) as c2) tb) tb order by 1, 2 desc limit 10;
+select length(c0), length(c1) from (select distinct c0, c1 from (select * from t0 union all select repeat(' ', 1000000) as c0, repeat(' ', 1000000) as c1, repeat(' ', 1000000) as c2) tb) tb order by 1, 2 desc limit 10;
 
 -- query 5
 USE ${case_db};
-select length(c0), max(length(c1)), max(length(c2)) from (select * from t0 union all select space(1000000) as c0, space(1000000) as c1, space(1000000) as c2) tb group by c0 order by 1, 2 desc limit 10;
+select length(c0), max(length(c1)), max(length(c2)) from (select * from t0 union all select repeat(' ', 1000000) as c0, repeat(' ', 1000000) as c1, repeat(' ', 1000000) as c2) tb group by c0 order by 1, 2 desc limit 10;
 
 -- query 6
 -- @skip_result_check=true
@@ -55,8 +55,8 @@ select max(length(c0)), max(length(c1)) from (select distinct c0, c1 from t0) tb
 
 -- query 8
 USE ${case_db};
-select max(length(c0)), max(length(c1)) from (select distinct c0, c1 from (select * from t0 union all select space(1000000) as c0, space(1000000) as c1, space(1000000) as c2) tb) tb order by 1, 2 desc limit 10;
+select max(length(c0)), max(length(c1)) from (select distinct c0, c1 from (select * from t0 union all select repeat(' ', 1000000) as c0, repeat(' ', 1000000) as c1, repeat(' ', 1000000) as c2) tb) tb order by 1, 2 desc limit 10;
 
 -- query 9
 USE ${case_db};
-select length(c0), max(length(c1)), max(length(c2)) from (select * from t0 union all select space(1000000) as c0, space(1000000) as c1, space(1000000) as c2) tb group by c0, c1, c2 order by 1, 2 desc limit 10;
+select length(c0), max(length(c1)), max(length(c2)) from (select * from t0 union all select repeat(' ', 1000000) as c0, repeat(' ', 1000000) as c1, repeat(' ', 1000000) as c2) tb group by c0, c1, c2 order by 1, 2 desc limit 10;

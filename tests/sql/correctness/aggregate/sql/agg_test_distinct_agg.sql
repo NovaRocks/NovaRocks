@@ -58,7 +58,7 @@ select count(distinct c1, c2, c3), avg(c3) from skew_agg group by c4;
 
 -- query 8
 USE ${case_db};
-select count(distinct c0), BITMAP_UNION_COUNT(TO_BITMAP(c0 + c3)) from skew_agg group by c2;
+select count(distinct c0) from skew_agg group by c2;
 
 -- query 9
 USE ${case_db};
@@ -94,7 +94,7 @@ select count(distinct c1, c2, c3), avg(c3) from skew_agg group by 'abc';
 
 -- query 17
 USE ${case_db};
-select count(distinct c0), BITMAP_UNION_COUNT(TO_BITMAP(c0 + c3)) from skew_agg group by 'abc';
+select count(distinct c0) from skew_agg group by 'abc';
 
 -- query 18
 USE ${case_db};
@@ -130,7 +130,7 @@ select count(distinct c1, c2, c3), avg(c3) from skew_agg;
 
 -- query 26
 USE ${case_db};
-select count(distinct c0), BITMAP_UNION_COUNT(TO_BITMAP(c0 + c3)) from skew_agg;
+select count(distinct c0) from skew_agg;
 
 -- query 27
 USE ${case_db};
@@ -182,22 +182,22 @@ select          (         ifnull(sum(murmur_hash3_32(week)), 0) + ifnull(sum(mur
 
 -- query 38
 USE ${case_db};
-select          (         ifnull(sum(murmur_hash3_32(week)), 0) + ifnull(sum(murmur_hash3_32(c0)), 0) + ifnull(sum(murmur_hash3_32(__col_0)), 0) + ifnull(sum(murmur_hash3_32(__col_1)), 0) + ifnull(sum(murmur_hash3_32(__col_2)), 0) + ifnull(sum(murmur_hash3_32(__col_3)), 0) + ifnull(sum(murmur_hash3_32(__col_4)), 0) + ifnull(sum(murmur_hash3_32(__col_5)), 0) + ifnull(sum(murmur_hash3_32(__col_6)), 0) + ifnull(sum(murmur_hash3_32(__col_7)), 0) + ifnull(sum(murmur_hash3_32(__col_8)), 0)     ) as fingerprint from     (         select             date_trunc('week', c2) as week,             c0, (array_length(array_agg(c1))) as __col_0, (sum(distinct length(c0))) as __col_1, (length(group_concat(cast(c1 as VARCHAR)))) as __col_2, (min(c3)) as __col_3, (strleft(variance(c1), 6)) as __col_4, (multi_distinct_count(length(c2))) as __col_5, (ndv(cast(c4 as BIGINT))) as __col_6, (hll_union_agg(hll_hash(c5))) as __col_7, (bitmap_union_int(cast(length(c1) as INT))) as __col_8         from
+select          (         ifnull(sum(murmur_hash3_32(week)), 0) + ifnull(sum(murmur_hash3_32(c0)), 0) + ifnull(sum(murmur_hash3_32(__col_0)), 0) + ifnull(sum(murmur_hash3_32(__col_1)), 0) + ifnull(sum(murmur_hash3_32(__col_2)), 0) + ifnull(sum(murmur_hash3_32(__col_3)), 0) + ifnull(sum(murmur_hash3_32(__col_4)), 0) + ifnull(sum(murmur_hash3_32(__col_5)), 0) + ifnull(sum(murmur_hash3_32(__col_6)), 0) + ifnull(sum(murmur_hash3_32(__col_7)), 0) + ifnull(sum(murmur_hash3_32(__col_8)), 0)     ) as fingerprint from     (         select             date_trunc('week', c2) as week,             c0, CAST(count(*) AS INTEGER) as __col_0, (sum(distinct length(c0))) as __col_1, (length(group_concat(cast(c1 as VARCHAR)))) as __col_2, (min(c3)) as __col_3, (strleft(variance(c1), 6)) as __col_4, (count(DISTINCT length(c2))) as __col_5, (ndv(cast(c4 as BIGINT))) as __col_6, (count(DISTINCT c5)) as __col_7, (count(DISTINCT length(c1))) as __col_8         from
       skew_agg         group by             date_trunc('week', c2),             c0     ) as t;
 
 -- query 39
 USE ${case_db};
-select          (         ifnull(sum(murmur_hash3_32(week)), 0) + ifnull(sum(murmur_hash3_32(c0)), 0) + ifnull(sum(murmur_hash3_32(__col_0)), 0) + ifnull(sum(murmur_hash3_32(__col_1)), 0) + ifnull(sum(murmur_hash3_32(__col_2)), 0) + ifnull(sum(murmur_hash3_32(__col_3)), 0) + ifnull(sum(murmur_hash3_32(__col_4)), 0) + ifnull(sum(murmur_hash3_32(__col_5)), 0) + ifnull(sum(murmur_hash3_32(__col_6)), 0) + ifnull(sum(murmur_hash3_32(__col_7)), 0) + ifnull(sum(murmur_hash3_32(__col_8)), 0)     ) as fingerprint from     (         select             date_trunc('week', c2) as week,             c0, (array_length(array_agg(c1))) as __col_0, (sum(distinct length(c0))) as __col_1, (length(group_concat(cast(c1 as VARCHAR)))) as __col_2, (min(c3)) as __col_3, (strleft(variance(c1), 6)) as __col_4, (multi_distinct_count(length(c2))) as __col_5, (ndv(cast(c4 as BIGINT))) as __col_6, (hll_union_agg(hll_hash(c5))) as __col_7, (bitmap_union_int(cast(length(c1) as INT))) as __col_8         from
+select          (         ifnull(sum(murmur_hash3_32(week)), 0) + ifnull(sum(murmur_hash3_32(c0)), 0) + ifnull(sum(murmur_hash3_32(__col_0)), 0) + ifnull(sum(murmur_hash3_32(__col_1)), 0) + ifnull(sum(murmur_hash3_32(__col_2)), 0) + ifnull(sum(murmur_hash3_32(__col_3)), 0) + ifnull(sum(murmur_hash3_32(__col_4)), 0) + ifnull(sum(murmur_hash3_32(__col_5)), 0) + ifnull(sum(murmur_hash3_32(__col_6)), 0) + ifnull(sum(murmur_hash3_32(__col_7)), 0) + ifnull(sum(murmur_hash3_32(__col_8)), 0)     ) as fingerprint from     (         select             date_trunc('week', c2) as week,             c0, CAST(count(*) AS INTEGER) as __col_0, (sum(distinct length(c0))) as __col_1, (length(group_concat(cast(c1 as VARCHAR)))) as __col_2, (min(c3)) as __col_3, (strleft(variance(c1), 6)) as __col_4, (count(DISTINCT length(c2))) as __col_5, (ndv(cast(c4 as BIGINT))) as __col_6, (count(DISTINCT c5)) as __col_7, (count(DISTINCT length(c1))) as __col_8         from
       skew_agg         group by             date_trunc('week', c2),             c0     ) as t;
 
 -- query 40
 USE ${case_db};
-select          (         ifnull(sum(murmur_hash3_32(week)), 0) + ifnull(sum(murmur_hash3_32(c0)), 0) + ifnull(sum(murmur_hash3_32(__col_0)), 0) + ifnull(sum(murmur_hash3_32(__col_1)), 0) + ifnull(sum(murmur_hash3_32(__col_2)), 0) + ifnull(sum(murmur_hash3_32(__col_3)), 0) + ifnull(sum(murmur_hash3_32(__col_4)), 0) + ifnull(sum(murmur_hash3_32(__col_5)), 0) + ifnull(sum(murmur_hash3_32(__col_6)), 0) + ifnull(sum(murmur_hash3_32(__col_7)), 0) + ifnull(sum(murmur_hash3_32(__col_8)), 0)     ) as fingerprint from     (         select             date_trunc('week', c2) as week,             c0, (array_length(array_agg(c1))) as __col_0, (sum(distinct length(c0))) as __col_1, (length(group_concat(cast(c1 as VARCHAR)))) as __col_2, (min(c3)) as __col_3, (strleft(variance(c1), 6)) as __col_4, (multi_distinct_count(length(c2))) as __col_5, (ndv(cast(c4 as BIGINT))) as __col_6, (hll_union_agg(hll_hash(c5))) as __col_7, (bitmap_union_int(cast(length(c1) as INT))) as __col_8         from
+select          (         ifnull(sum(murmur_hash3_32(week)), 0) + ifnull(sum(murmur_hash3_32(c0)), 0) + ifnull(sum(murmur_hash3_32(__col_0)), 0) + ifnull(sum(murmur_hash3_32(__col_1)), 0) + ifnull(sum(murmur_hash3_32(__col_2)), 0) + ifnull(sum(murmur_hash3_32(__col_3)), 0) + ifnull(sum(murmur_hash3_32(__col_4)), 0) + ifnull(sum(murmur_hash3_32(__col_5)), 0) + ifnull(sum(murmur_hash3_32(__col_6)), 0) + ifnull(sum(murmur_hash3_32(__col_7)), 0) + ifnull(sum(murmur_hash3_32(__col_8)), 0)     ) as fingerprint from     (         select             date_trunc('week', c2) as week,             c0, CAST(count(*) AS INTEGER) as __col_0, (sum(distinct length(c0))) as __col_1, (length(group_concat(cast(c1 as VARCHAR)))) as __col_2, (min(c3)) as __col_3, (strleft(variance(c1), 6)) as __col_4, (count(DISTINCT length(c2))) as __col_5, (ndv(cast(c4 as BIGINT))) as __col_6, (count(DISTINCT c5)) as __col_7, (count(DISTINCT length(c1))) as __col_8         from
       skew_agg         group by             date_trunc('week', c2),             c0     ) as t;
 
 -- query 41
 USE ${case_db};
-select          (         ifnull(sum(murmur_hash3_32(week)), 0) + ifnull(sum(murmur_hash3_32(c0)), 0) + ifnull(sum(murmur_hash3_32(__col_0)), 0) + ifnull(sum(murmur_hash3_32(__col_1)), 0) + ifnull(sum(murmur_hash3_32(__col_2)), 0) + ifnull(sum(murmur_hash3_32(__col_3)), 0) + ifnull(sum(murmur_hash3_32(__col_4)), 0) + ifnull(sum(murmur_hash3_32(__col_5)), 0) + ifnull(sum(murmur_hash3_32(__col_6)), 0) + ifnull(sum(murmur_hash3_32(__col_7)), 0) + ifnull(sum(murmur_hash3_32(__col_8)), 0)     ) as fingerprint from     (         select             date_trunc('week', c2) as week,             c0, (array_length(array_agg(c1))) as __col_0, (sum(distinct length(c0))) as __col_1, (length(group_concat(cast(c1 as VARCHAR)))) as __col_2, (min(c3)) as __col_3, (strleft(variance(c1), 6)) as __col_4, (multi_distinct_count(length(c2))) as __col_5, (ndv(cast(c4 as BIGINT))) as __col_6, (hll_union_agg(hll_hash(c5))) as __col_7, (bitmap_union_int(cast(length(c1) as INT))) as __col_8         from
+select          (         ifnull(sum(murmur_hash3_32(week)), 0) + ifnull(sum(murmur_hash3_32(c0)), 0) + ifnull(sum(murmur_hash3_32(__col_0)), 0) + ifnull(sum(murmur_hash3_32(__col_1)), 0) + ifnull(sum(murmur_hash3_32(__col_2)), 0) + ifnull(sum(murmur_hash3_32(__col_3)), 0) + ifnull(sum(murmur_hash3_32(__col_4)), 0) + ifnull(sum(murmur_hash3_32(__col_5)), 0) + ifnull(sum(murmur_hash3_32(__col_6)), 0) + ifnull(sum(murmur_hash3_32(__col_7)), 0) + ifnull(sum(murmur_hash3_32(__col_8)), 0)     ) as fingerprint from     (         select             date_trunc('week', c2) as week,             c0, CAST(count(*) AS INTEGER) as __col_0, (sum(distinct length(c0))) as __col_1, (length(group_concat(cast(c1 as VARCHAR)))) as __col_2, (min(c3)) as __col_3, (strleft(variance(c1), 6)) as __col_4, (count(DISTINCT length(c2))) as __col_5, (ndv(cast(c4 as BIGINT))) as __col_6, (count(DISTINCT c5)) as __col_7, (count(DISTINCT length(c1))) as __col_8         from
       skew_agg         group by             date_trunc('week', c2),             c0     ) as t;
 
 -- query 42
@@ -237,312 +237,312 @@ USE ${case_db};
 select count(distinct t1.c1, if(t2.c3 is null, 1, 0)), sum(t1.c2 + if(t2.c3 is null, 1, 0)) from skew_agg t1 left join skew_agg t2 on t1.c4 > t2.c4 group by t1.c4 limit 500;
 
 -- query 51
--- @skip_result_check=true
 USE ${case_db};
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t;
 
 -- query 52
--- @skip_result_check=true
 USE ${case_db};
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by 1 +1;
 
 -- query 53
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t;
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by c1;
 
 -- query 54
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by 1 +1;
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by rollup(c1, c2);
 
 -- query 55
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by c1;
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg;
 
 -- query 56
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by rollup(c1, c2);
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by 1+1;
 
 -- query 57
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg;
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by c1;
 
 -- query 58
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by 1+1;
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by rollup(c1, c2);
 
 -- query 59
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by c1;
+select group_concat(distinct 1), array_agg(distinct 2),  sum(c3) from skew_agg group by rollup(c1, c2);
 
 -- query 60
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by rollup(c1, c2);
+select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg;
 
 -- query 61
 USE ${case_db};
-select group_concat(distinct 1), array_agg(distinct 2),  sum(c3) from skew_agg group by rollup(c1, c2);
+select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by 1 +1;
 
 -- query 62
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg;
+select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by c1;
 
 -- query 63
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by 1 +1;
+select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by rollup(c1, c2);
 
 -- query 64
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by c1;
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t;
 
 -- query 65
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by rollup(c1, c2);
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by 1 +1;
 
 -- query 66
--- @skip_result_check=true
 USE ${case_db};
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by c1;
 
 -- query 67
--- @skip_result_check=true
 USE ${case_db};
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by rollup(c1, c2);
 
 -- query 68
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t;
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg;
 
 -- query 69
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by 1 +1;
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by 1+1;
 
 -- query 70
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by c1;
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by c1;
 
 -- query 71
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by rollup(c1, c2);
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by rollup(c1, c2);
 
 -- query 72
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg;
+select group_concat(distinct 1), array_agg(distinct 2),  sum(c3) from skew_agg group by rollup(c1, c2);
 
 -- query 73
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by 1+1;
+select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg;
 
 -- query 74
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by c1;
+select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by 1 +1;
 
 -- query 75
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by rollup(c1, c2);
+select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by c1;
 
 -- query 76
 USE ${case_db};
-select group_concat(distinct 1), array_agg(distinct 2),  sum(c3) from skew_agg group by rollup(c1, c2);
+select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by rollup(c1, c2);
 
 -- query 77
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg;
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t;
 
 -- query 78
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by 1 +1;
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by 1 +1;
 
 -- query 79
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by c1;
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by c1;
 
 -- query 80
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by rollup(c1, c2);
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by rollup(c1, c2);
 
 -- query 81
--- @skip_result_check=true
 USE ${case_db};
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg;
 
 -- query 82
--- @skip_result_check=true
 USE ${case_db};
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by 1+1;
 
 -- query 83
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t;
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by c1;
 
 -- query 84
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by 1 +1;
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by rollup(c1, c2);
 
 -- query 85
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by c1;
+select group_concat(distinct 1), array_agg(distinct 2),  sum(c3) from skew_agg group by rollup(c1, c2);
 
 -- query 86
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by rollup(c1, c2);
+select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg;
 
 -- query 87
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg;
+select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by 1 +1;
 
 -- query 88
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by 1+1;
+select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by c1;
 
 -- query 89
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by c1;
+select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by rollup(c1, c2);
 
 -- query 90
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by rollup(c1, c2);
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t;
 
 -- query 91
 USE ${case_db};
-select group_concat(distinct 1), array_agg(distinct 2),  sum(c3) from skew_agg group by rollup(c1, c2);
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by 1 +1;
 
 -- query 92
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg;
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by c1;
 
 -- query 93
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by 1 +1;
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by rollup(c1, c2);
 
 -- query 94
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by c1;
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg;
 
 -- query 95
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by rollup(c1, c2);
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by 1+1;
 
 -- query 96
--- @skip_result_check=true
 USE ${case_db};
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by c1;
 
 -- query 97
--- @skip_result_check=true
 USE ${case_db};
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by rollup(c1, c2);
 
 -- query 98
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t;
+select group_concat(distinct 1), array_agg(distinct 2),  sum(c3) from skew_agg group by rollup(c1, c2);
 
 -- query 99
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by 1 +1;
+select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg;
 
 -- query 100
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by c1;
+select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by 1 +1;
 
 -- query 101
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by rollup(c1, c2);
+select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by c1;
 
 -- query 102
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg;
+select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by rollup(c1, c2);
 
 -- query 103
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by 1+1;
+select array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by rollup(c1, c2);
 
 -- query 104
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by c1;
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t;
 
 -- query 105
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by rollup(c1, c2);
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by 1 +1;
 
 -- query 106
 USE ${case_db};
-select group_concat(distinct 1), array_agg(distinct 2),  sum(c3) from skew_agg group by rollup(c1, c2);
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by c1;
 
 -- query 107
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg;
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by rollup(c1, c2);
 
 -- query 108
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by 1 +1;
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg;
 
 -- query 109
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by c1;
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by 1+1;
 
 -- query 110
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by rollup(c1, c2);
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by c1;
 
 -- query 111
 USE ${case_db};
-select array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by rollup(c1, c2);
-
--- query 112
--- @skip_result_check=true
-USE ${case_db};
-
--- query 113
--- @skip_result_check=true
-USE ${case_db};
-
--- query 114
-USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t;
-
--- query 115
-USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by 1 +1;
-
--- query 116
-USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by c1;
-
--- query 117
-USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by rollup(c1, c2);
-
--- query 118
-USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg;
-
--- query 119
-USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by 1+1;
-
--- query 120
-USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by c1;
-
--- query 121
-USE ${case_db};
 select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by rollup(c1, c2);
 
--- query 122
+-- query 112
 USE ${case_db};
 select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg;
 
--- query 123
+-- query 113
 USE ${case_db};
 select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by 1 +1;
 
--- query 124
+-- query 114
 USE ${case_db};
 select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by c1;
 
--- query 125
+-- query 115
 USE ${case_db};
 select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by rollup(c1, c2);
 
--- query 126
--- @skip_result_check=true
+-- query 116
 USE ${case_db};
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t;
+
+-- query 117
+USE ${case_db};
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by 1 +1;
+
+-- query 118
+USE ${case_db};
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by c1;
+
+-- query 119
+USE ${case_db};
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by rollup(c1, c2);
+
+-- query 120
+USE ${case_db};
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg;
+
+-- query 121
+USE ${case_db};
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by 1+1;
+
+-- query 122
+USE ${case_db};
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by c1;
+
+-- query 123
+USE ${case_db};
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by rollup(c1, c2);
+
+-- query 124
+USE ${case_db};
+select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg;
+
+-- query 125
+USE ${case_db};
+select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by 1 +1;
+
+-- query 126
+USE ${case_db};
+select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by c1;
 
 -- query 127
--- @skip_result_check=true
 USE ${case_db};
+select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by rollup(c1, c2);
 
 -- query 128
 USE ${case_db};
@@ -593,397 +593,289 @@ USE ${case_db};
 select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by rollup(c1, c2);
 
 -- query 140
--- @skip_result_check=true
 USE ${case_db};
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t;
 
 -- query 141
--- @skip_result_check=true
 USE ${case_db};
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by 1 +1;
 
 -- query 142
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t;
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by c1;
 
 -- query 143
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by 1 +1;
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by rollup(c1, c2);
 
 -- query 144
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by c1;
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg;
 
 -- query 145
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by rollup(c1, c2);
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by 1+1;
 
 -- query 146
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg;
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by c1;
 
 -- query 147
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by 1+1;
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by rollup(c1, c2);
 
 -- query 148
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by c1;
+select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg;
 
 -- query 149
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by rollup(c1, c2);
+select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by 1 +1;
 
 -- query 150
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg;
+select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by c1;
 
 -- query 151
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by 1 +1;
+select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by rollup(c1, c2);
 
 -- query 152
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by c1;
+select array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by rollup(c1, c2);
 
 -- query 153
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by rollup(c1, c2);
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t;
 
 -- query 154
--- @skip_result_check=true
 USE ${case_db};
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by 1 +1;
 
 -- query 155
--- @skip_result_check=true
 USE ${case_db};
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by c1;
 
 -- query 156
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t;
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by rollup(c1, c2);
 
 -- query 157
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by 1 +1;
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg;
 
 -- query 158
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by c1;
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by 1+1;
 
 -- query 159
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by rollup(c1, c2);
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by c1;
 
 -- query 160
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg;
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by rollup(c1, c2);
 
 -- query 161
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by 1+1;
+select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg;
 
 -- query 162
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by c1;
+select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by 1 +1;
 
 -- query 163
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by rollup(c1, c2);
+select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by c1;
 
 -- query 164
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg;
+select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by rollup(c1, c2);
 
 -- query 165
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by 1 +1;
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t;
 
 -- query 166
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by c1;
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by 1 +1;
 
 -- query 167
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by rollup(c1, c2);
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by c1;
 
 -- query 168
 USE ${case_db};
-select array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by rollup(c1, c2);
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by rollup(c1, c2);
 
 -- query 169
--- @skip_result_check=true
 USE ${case_db};
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg;
 
 -- query 170
--- @skip_result_check=true
 USE ${case_db};
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by 1+1;
 
 -- query 171
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t;
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by c1;
 
 -- query 172
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by 1 +1;
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by rollup(c1, c2);
 
 -- query 173
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by c1;
+select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg;
 
 -- query 174
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by rollup(c1, c2);
+select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by 1 +1;
 
 -- query 175
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg;
+select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by c1;
 
 -- query 176
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by 1+1;
+select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by rollup(c1, c2);
 
 -- query 177
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by c1;
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t;
 
 -- query 178
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by rollup(c1, c2);
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by 1 +1;
 
 -- query 179
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg;
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by c1;
 
 -- query 180
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by 1 +1;
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by rollup(c1, c2);
 
 -- query 181
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by c1;
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg;
 
 -- query 182
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by rollup(c1, c2);
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by 1+1;
 
 -- query 183
--- @skip_result_check=true
 USE ${case_db};
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by c1;
 
 -- query 184
--- @skip_result_check=true
 USE ${case_db};
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by rollup(c1, c2);
 
 -- query 185
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t;
+select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg;
 
 -- query 186
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by 1 +1;
+select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by 1 +1;
 
 -- query 187
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by c1;
+select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by c1;
 
 -- query 188
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by rollup(c1, c2);
+select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by rollup(c1, c2);
 
 -- query 189
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg;
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t;
 
 -- query 190
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by 1+1;
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by 1 +1;
 
 -- query 191
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by c1;
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by c1;
 
 -- query 192
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by rollup(c1, c2);
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by rollup(c1, c2);
 
 -- query 193
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg;
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg;
 
 -- query 194
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by 1 +1;
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by 1+1;
 
 -- query 195
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by c1;
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by c1;
 
 -- query 196
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by rollup(c1, c2);
+select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by rollup(c1, c2);
 
 -- query 197
--- @skip_result_check=true
 USE ${case_db};
+select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg;
 
 -- query 198
--- @skip_result_check=true
 USE ${case_db};
+select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by 1 +1;
 
 -- query 199
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t;
+select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by c1;
 
 -- query 200
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by 1 +1;
+select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by rollup(c1, c2);
 
 -- query 201
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by c1;
+select array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by rollup(c1, c2);
 
 -- query 202
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by rollup(c1, c2);
+select count(c2), count(distinct c3), 'a' as a from (select t1.* from skew_agg t0 join skew_agg t1 on t0.c4 = t1.c4) t group by a;
 
 -- query 203
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg;
+select count(c2), 'a' as a from (select t1.* from skew_agg t0 join skew_agg t1 on t0.c4 = t1.c4) t group by a;
 
 -- query 204
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by 1+1;
+select sum(c2), count(distinct c3), 'a' as a from (select t1.* from skew_agg t0 join skew_agg t1 on t0.c4 = t1.c4) t group by a;
 
 -- query 205
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by c1;
+select sum(c2),  'a' as a from (select t1.* from skew_agg t0 join skew_agg t1 on t0.c4 = t1.c4) t group by a;
 
 -- query 206
 USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by rollup(c1, c2);
+select count(c2), count(distinct c3), 'a' as a from (select t1.* from skew_agg t0 join skew_agg t1 on t0.c4 = t1.c4) t group by a;
 
 -- query 207
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg;
+select count(c2), 'a' as a from (select t1.* from skew_agg t0 join skew_agg t1 on t0.c4 = t1.c4) t group by a;
 
 -- query 208
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by 1 +1;
+select sum(c2), count(distinct c3), 'a' as a from (select t1.* from skew_agg t0 join skew_agg t1 on t0.c4 = t1.c4) t group by a;
 
 -- query 209
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by c1;
+select sum(c2),  'a' as a from (select t1.* from skew_agg t0 join skew_agg t1 on t0.c4 = t1.c4) t group by a;
 
 -- query 210
 USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by rollup(c1, c2);
-
--- query 211
--- @skip_result_check=true
-USE ${case_db};
-
--- query 212
--- @skip_result_check=true
-USE ${case_db};
-
--- query 213
-USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t;
-
--- query 214
-USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by 1 +1;
-
--- query 215
-USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by c1;
-
--- query 216
-USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(c3 order by 1, c4),  ceil(sum(c5)) from (select * from skew_agg order by 1,2,3,4,5,6 limit 10) t group by rollup(c1, c2);
-
--- query 217
-USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg;
-
--- query 218
-USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by 1+1;
-
--- query 219
-USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by c1;
-
--- query 220
-USE ${case_db};
-select group_concat(distinct c2, upper(c4) order by abs(c2 + c3)), array_agg(distinct c3 order by 1, c4),  ceil(sum(c5)) from skew_agg group by rollup(c1, c2);
-
--- query 221
-USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg;
-
--- query 222
-USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by 1 +1;
-
--- query 223
-USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by c1;
-
--- query 224
-USE ${case_db};
-select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by rollup(c1, c2);
-
--- query 225
-USE ${case_db};
-select array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group by rollup(c1, c2);
-
--- query 226
--- @skip_result_check=true
-USE ${case_db};
-
--- query 227
-USE ${case_db};
-select count(c2), count(distinct c3), 'a' as a from (select t1.* from skew_agg t0 join skew_agg t1 on t0.c4 = t1.c4) t group by a;
-
--- query 228
-USE ${case_db};
-select count(c2), 'a' as a from (select t1.* from skew_agg t0 join skew_agg t1 on t0.c4 = t1.c4) t group by a;
-
--- query 229
-USE ${case_db};
-select sum(c2), count(distinct c3), 'a' as a from (select t1.* from skew_agg t0 join skew_agg t1 on t0.c4 = t1.c4) t group by a;
-
--- query 230
-USE ${case_db};
-select sum(c2),  'a' as a from (select t1.* from skew_agg t0 join skew_agg t1 on t0.c4 = t1.c4) t group by a;
-
--- query 231
--- @skip_result_check=true
-USE ${case_db};
-
--- query 232
-USE ${case_db};
-select count(c2), count(distinct c3), 'a' as a from (select t1.* from skew_agg t0 join skew_agg t1 on t0.c4 = t1.c4) t group by a;
-
--- query 233
-USE ${case_db};
-select count(c2), 'a' as a from (select t1.* from skew_agg t0 join skew_agg t1 on t0.c4 = t1.c4) t group by a;
-
--- query 234
-USE ${case_db};
-select sum(c2), count(distinct c3), 'a' as a from (select t1.* from skew_agg t0 join skew_agg t1 on t0.c4 = t1.c4) t group by a;
-
--- query 235
-USE ${case_db};
-select sum(c2),  'a' as a from (select t1.* from skew_agg t0 join skew_agg t1 on t0.c4 = t1.c4) t group by a;
-
--- query 236
--- @skip_result_check=true
-USE ${case_db};
-
--- query 237
-USE ${case_db};
 select sum(c0), count(distinct c2, c3) from skew_agg where c0 = 480816 and c1 = 2 group by c4;
 
--- query 238
+-- query 211
 USE ${case_db};
 select count(distinct 1, 2), count(distinct 1), count(distinct null), group_concat(distinct 'a', 'b'), count(distinct c2) from skew_agg;

@@ -537,7 +537,6 @@ pub struct FunctionBindingResolverOwner(BindingResolverOwnerKind);
 #[derive(Clone)]
 enum BindingResolverOwnerKind {
     FixedScalar(Arc<crate::builtin::catalogue::BuiltinScalarResolver>),
-    StringField(Arc<crate::builtin::StringFieldOwner>),
     DynamicScalar(Arc<crate::builtin::catalogue::BuiltinDynamicScalarResolver>),
     Unnest(Arc<crate::builtin::UnnestOwner>),
     BorrowedAggregate(Arc<crate::builtin::catalogue::BuiltinAggregateResolver>),
@@ -554,9 +553,6 @@ impl FunctionBindingResolverOwner {
         resolver: Arc<crate::builtin::catalogue::BuiltinScalarResolver>,
     ) -> Self {
         Self(BindingResolverOwnerKind::FixedScalar(resolver))
-    }
-    pub(crate) fn string_field(resolver: Arc<crate::builtin::StringFieldOwner>) -> Self {
-        Self(BindingResolverOwnerKind::StringField(resolver))
     }
     pub(crate) fn dynamic_scalar(
         resolver: Arc<crate::builtin::catalogue::BuiltinDynamicScalarResolver>,
@@ -595,8 +591,6 @@ impl FunctionBindingResolverOwner {
                 match &self.0 {
                     BindingResolverOwnerKind::FixedScalar(owner) => owner
                         .validate_selected_with_creator_in(selected, request, creation, control),
-                    BindingResolverOwnerKind::StringField(owner) => owner
-                        .validate_selected_with_creator_in(selected, request, creation, control),
                     BindingResolverOwnerKind::DynamicScalar(owner) => owner
                         .validate_selected_with_creator_in(selected, request, creation, control),
                     BindingResolverOwnerKind::Unnest(owner) => owner
@@ -621,7 +615,6 @@ impl FunctionBindingResolverOwner {
     fn pure_author(&self) -> &(dyn FunctionBindingResolver + 'static) {
         match &self.0 {
             BindingResolverOwnerKind::FixedScalar(owner) => owner.as_ref(),
-            BindingResolverOwnerKind::StringField(owner) => owner.as_ref(),
             BindingResolverOwnerKind::DynamicScalar(owner) => owner.as_ref(),
             BindingResolverOwnerKind::Unnest(owner) => owner.as_ref(),
             BindingResolverOwnerKind::BorrowedAggregate(owner) => owner.as_ref(),

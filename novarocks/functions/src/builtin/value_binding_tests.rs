@@ -417,7 +417,17 @@ fn largeint_anchor_has_exact_domain_and_numeric_results_are_owner_declared() {
         ("sum", FunctionKind::Aggregate),
         ("multi_distinct_sum", FunctionKind::Aggregate),
     ] {
-        let binding = resolve(name, kind, &arguments);
+        let binding = if name == "multi_distinct_sum" {
+            catalog
+                .resolve_distinct_aggregate(
+                    crate::aggregate_types::DistinctAggregate::Sum,
+                    request(&arguments),
+                    crate::binding_test_control(),
+                )
+                .unwrap()
+        } else {
+            resolve(name, kind, &arguments)
+        };
         assert_eq!(output(&binding).logical_type(), ValueLogicalType::LargeInt);
         if name == "sum" {
             // The exact LARGEINT SUM state is a physical 76-digit decimal.

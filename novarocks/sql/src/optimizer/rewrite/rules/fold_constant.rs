@@ -80,14 +80,11 @@ const ENVIRONMENT_SENSITIVE_FUNCTIONS: &[&str] = &[
     "current_date",
     "curtime",
     "current_time",
-    "utc_time",
-    "utc_timestamp",
     "unix_timestamp",
     // Process/session timezone conversions.
     "convert_tz",
     "from_unixtime",
     "from_unixtime_ms",
-    "hour_from_unixtime",
     "to_datetime",
     "timestamp",
     "get_variant_date",
@@ -104,16 +101,10 @@ const ENVIRONMENT_SENSITIVE_FUNCTIONS: &[&str] = &[
 /// runtime produced. Excluding the family keeps folded output bit-identical to
 /// runtime output; the cost is only a missed optimization.
 const BYTE_CARRYING_STRING_FUNCTIONS: &[&str] = &[
-    "aes_encrypt",
-    "aes_decrypt",
     "from_base64",
     "from_binary",
     "base64_decode_binary",
     "base64_decode_string",
-    "encode_fingerprint_sha256",
-    "encode_row_id",
-    "encode_sort_key",
-    "sm3",
     "unhex",
 ];
 
@@ -597,15 +588,9 @@ fn fold_scalar_uncached(
         ScalarNode::Nested(child) => {
             *child = fold_scalar_id(arena, *child, ctx, memo, work)?;
         }
-        ScalarNode::FunctionCall { name, args, .. } => {
+        ScalarNode::FunctionCall { args, .. } => {
             for arg in args.iter_mut() {
-                // TIME_TO_SEC distinguishes a SEC_TO_TIME result from a raw
-                // string. Folding that producer would erase its provenance.
-                *arg = if name == "time_to_sec" && has_sec_to_time_source(arena, *arg, work)? {
-                    fold_sec_to_time_source(arena, *arg, ctx, memo, work)?
-                } else {
-                    fold_scalar_id(arena, *arg, ctx, memo, work)?
-                };
+                *arg = fold_scalar_id(arena, *arg, ctx, memo, work)?;
             }
         }
         ScalarNode::LambdaFunction { body, .. } | ScalarNode::Lambda { body, .. } => {
@@ -675,48 +660,6 @@ fn fold_scalar_uncached(
     // fold step below reads the children back out of the arena.
     let rebuilt = arena.intern_observed(node, value_type, work.control())?;
     Ok(try_fold_node_current(arena, rebuilt, ctx, work)?.unwrap_or(rebuilt))
-}
-
-fn has_sec_to_time_source(
-    arena: &ScalarArena,
-    mut id: ScalarId,
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<bool, SqlCompileError> {
-    loop {
-        work.step()?;
-        match arena.node(id) {
-            ScalarNode::FunctionCall { name, .. } => return Ok(name == "sec_to_time"),
-            ScalarNode::Cast { child, .. } | ScalarNode::Nested(child) => id = *child,
-            _ => return Ok(false),
-        }
-    }
-}
-
-/// Keep the source-sensitive path intact, while still folding the producer's
-/// numeric arguments. Do not memoize this contextual result: the same producer
-/// may independently be folded when it is another projection's root.
-#[recursive::recursive]
-fn fold_sec_to_time_source(
-    arena: &mut ScalarArena,
-    id: ScalarId,
-    ctx: &RewriteContext<'_>,
-    memo: &mut HashMap<ScalarId, ScalarId>,
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<ScalarId, SqlCompileError> {
-    work.step()?;
-    let mut node = arena.node(id).clone();
-    match &mut node {
-        ScalarNode::FunctionCall { args, .. } => {
-            for arg in args {
-                *arg = fold_scalar_id(arena, *arg, ctx, memo, work)?;
-            }
-        }
-        ScalarNode::Cast { child, .. } | ScalarNode::Nested(child) => {
-            *child = fold_sec_to_time_source(arena, *child, ctx, memo, work)?;
-        }
-        _ => unreachable!("source path was checked before folding"),
-    }
-    arena.intern_observed(node, arena.value_type(id).clone(), work.control())
 }
 
 /// Fold a rebuilt node only after every direct child has become a constant.

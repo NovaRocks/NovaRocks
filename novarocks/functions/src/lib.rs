@@ -61,7 +61,6 @@ pub mod array_projection;
 mod binding;
 pub mod bit_array;
 pub mod bit_numeric;
-pub mod bitmap_to_string_core;
 pub mod bitmap_value;
 pub mod builtin;
 pub mod calendar_julian;
@@ -89,8 +88,6 @@ mod evaluation_failure;
 mod exact_installed_owner_selection_tests;
 #[cfg(test)]
 mod exact_overload_selection_tests;
-pub mod exact_percentile_core;
-pub mod exact_percentile_failure;
 mod frozen_writer_preparation;
 pub mod generate_series_core;
 mod higher_order_call;
@@ -113,7 +110,6 @@ mod operator_functions;
 pub mod parse_json_core;
 mod parse_json_resources;
 pub mod pattern_memo;
-pub mod percentile_hash_core;
 pub mod percentile_input;
 pub use operator_functions::{OperatorFunctionCatalogError, validate_installed_operator_functions};
 mod pure_catalogue;
@@ -2767,8 +2763,6 @@ pub mod time_text_cast;
 
 pub mod time_calendar_cast;
 
-pub mod field_shared;
-
 /// Original Decimal128 CAST computation shared by legacy and selected shells.
 pub mod decimal128_rescale;
 
@@ -2784,16 +2778,8 @@ pub mod integral_decimal128;
 pub mod native_inlist;
 pub use native_inlist::{NativeInListCreationFailure, PreparedNativeInListRecipe};
 
-pub mod hll_hash_core;
-
 pub mod native_like;
 pub use native_like::PreparedNativeLikeRecipe;
-
-pub mod bitmap_aggregate_core;
-
-mod bitmap_decode_resources;
-
-pub mod percentile_approx_raw_core;
 
 pub mod approx_percentile_failure;
 

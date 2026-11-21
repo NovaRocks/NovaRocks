@@ -84,7 +84,7 @@ impl DateOwner {
         declaration: FunctionBindingDeclaration,
         resolver: BuiltinScalarResolver,
     ) -> Result<Self, FunctionCatalogError> {
-        if !matches!(name, "date" | "to_date") {
+        if name != "date" {
             return Err(FunctionCatalogError::InvalidStableIdentity {
                 subject: "uninstalled date extraction",
                 value: name.into(),

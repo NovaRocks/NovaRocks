@@ -110,45 +110,50 @@ NULL
 NULL
 NULL
 
--- query 14
+-- query 13
 -- legacy
 _col0
 1000
+
+-- query 14
+-- legacy
+_col0
+1001
 
 -- query 15
 -- legacy
 _col0
-1001
+500500
 
 -- query 16
 -- legacy
 _col0
-500500
+100100
 
 -- query 17
 -- legacy
 _col0
-100100
+1000
 
 -- query 18
 -- legacy
 _col0
-1000
+1001
 
 -- query 19
 -- legacy
 _col0
-1001
+2
 
 -- query 20
 -- legacy
 _col0
-2
+101
 
 -- query 21
 -- legacy
 _col0
-101
+1
 
 -- query 22
 -- legacy
@@ -158,7 +163,7 @@ _col0
 -- query 23
 -- legacy
 _col0
-1
+1000
 
 -- query 24
 -- legacy
@@ -168,27 +173,32 @@ _col0
 -- query 25
 -- legacy
 _col0
-1000
+2
 
 -- query 26
 -- legacy
 _col0
-2
+101
 
 -- query 27
 -- legacy
 _col0
-101
-
--- query 29
--- legacy
-_col0
 1001
 
--- query 30
+-- query 28
 -- legacy
 _col0
 0
+
+-- query 31
+-- legacy
+_col0
+1
+
+-- query 32
+-- legacy
+_col0
+1
 
 -- query 33
 -- legacy
@@ -230,15 +240,31 @@ _col0
 _col0
 1
 
--- query 41
+-- query 43
 -- legacy
 _col0
+1
+0
+0
+NULL
+1
+1
+0
+1
 1
 
--- query 42
+-- query 44
 -- legacy
 _col0
+0
+0
+0
+NULL
 1
+0
+1
+0
+0
 
 -- query 45
 -- legacy
@@ -246,8 +272,8 @@ _col0
 1
 1
 0
-NULL
 1
+NULL
 1
 1
 1
@@ -259,20 +285,20 @@ _col0
 0
 0
 0
-NULL
 1
+NULL
 0
 1
-1
-1
+0
+0
 
 -- query 47
 -- legacy
 _col0
 1
 1
-0
 1
+NULL
 NULL
 1
 1
@@ -284,11 +310,11 @@ NULL
 _col0
 0
 0
-0
 1
 NULL
-0
+NULL
 1
+0
 0
 0
 
@@ -296,26 +322,26 @@ NULL
 -- legacy
 _col0
 1
+0
+0
+0
+0
 1
-1
-NULL
-NULL
-1
-1
-1
-1
+0
+0
+0
 
 -- query 50
 -- legacy
 _col0
-0
+1
 0
 1
 NULL
-NULL
-1
+0
 1
 0
+1
 0
 
 -- query 51
@@ -323,8 +349,8 @@ NULL
 _col0
 1
 0
-0
-0
+1
+NULL
 0
 1
 0
@@ -334,15 +360,15 @@ _col0
 -- query 52
 -- legacy
 _col0
-1
+0
+0
+0
+0
+0
+0
+0
 0
 1
-NULL
-0
-1
-0
-1
-0
 
 -- query 53
 -- legacy
@@ -350,7 +376,7 @@ _col0
 1
 1
 1
-NULL
+1
 1
 1
 1
@@ -360,64 +386,68 @@ NULL
 -- query 54
 -- legacy
 _col0
-0
-1
-1
-1
-1
-0
-0
-0
-1
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
 
 -- query 55
 -- legacy
 _col0
-1
-1
-1
-1
-1
-1
-1
-1
-1
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
 
 -- query 56
 -- legacy
 _col0
-NULL
-NULL
-NULL
-NULL
-NULL
-NULL
-NULL
-NULL
-NULL
+1
 
 -- query 57
 -- legacy
 _col0
-NULL
-NULL
-NULL
-NULL
-NULL
-NULL
-NULL
-NULL
-NULL
+1
+
+-- query 58
+-- legacy
+_col0
+0
+
+-- query 59
+-- legacy
+_col0
+1
 
 -- query 60
 -- legacy
 _col0
-0
+1
+
+-- query 61
+-- legacy
+_col0
+1
+
+-- query 62
+-- legacy
+_col0
+1
 
 -- query 63
 -- legacy
 _col0
-0
+1
 
 -- query 64
 -- legacy
@@ -428,227 +458,13 @@ _col0
 -- legacy
 _col0
 1
-0
-0
-NULL
-1
-1
-0
-1
-1
 
 -- query 66
 -- legacy
 _col0
-0
-0
-0
-NULL
 1
-0
-1
-0
-0
-
--- query 67
--- legacy
-_col0
-1
-1
-0
-1
-NULL
-1
-1
-1
-1
-
--- query 68
--- legacy
-_col0
-0
-0
-0
-1
-NULL
-0
-1
-0
-0
-
--- query 69
--- legacy
-_col0
-1
-1
-1
-NULL
-NULL
-1
-1
-1
-1
-
--- query 70
--- legacy
-_col0
-0
-0
-1
-NULL
-NULL
-1
-0
-0
-0
-
--- query 71
--- legacy
-_col0
-1
-0
-0
-0
-0
-1
-0
-0
-0
-
--- query 72
--- legacy
-_col0
-1
-0
-1
-NULL
-0
-1
-0
-1
-0
 
 -- query 73
--- legacy
-_col0
-1
-0
-1
-NULL
-0
-1
-0
-1
-0
-
--- query 74
--- legacy
-_col0
-0
-0
-0
-0
-0
-0
-0
-0
-1
-
--- query 75
--- legacy
-_col0
-1
-1
-1
-1
-1
-1
-1
-1
-1
-
--- query 76
--- legacy
-_col0
-NULL
-NULL
-NULL
-NULL
-NULL
-NULL
-NULL
-NULL
-NULL
-
--- query 77
--- legacy
-_col0
-NULL
-NULL
-NULL
-NULL
-NULL
-NULL
-NULL
-NULL
-NULL
-
--- query 78
--- legacy
-_col0
-1
-
--- query 79
--- legacy
-_col0
-1
-
--- query 80
--- legacy
-_col0
-0
-
--- query 81
--- legacy
-_col0
-1
-
--- query 82
--- legacy
-_col0
-1
-
--- query 83
--- legacy
-_col0
-1
-
--- query 84
--- legacy
-_col0
-1
-
--- query 85
--- legacy
-_col0
-1
-
--- query 86
--- legacy
-_col0
-1
-
--- query 87
--- legacy
-_col0
-1
-
--- query 90
--- legacy
-_col0
-1
-
--- query 97
 -- legacy
 id
 1
@@ -659,11 +475,210 @@ id
 8
 9
 
--- query 98
+-- query 74
 -- legacy
 id
 2
 8
+
+-- query 75
+-- legacy
+id
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+
+-- query 76
+-- legacy
+id
+4
+
+-- query 77
+-- legacy
+id
+1
+
+-- query 78
+-- legacy
+id
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+
+-- query 79
+-- legacy
+id
+5
+
+-- query 80
+-- legacy
+id
+2
+
+-- query 81
+-- legacy
+id
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+
+-- query 82
+-- legacy
+id
+5
+
+-- query 83
+-- legacy
+id
+5
+
+-- query 84
+-- legacy
+id
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+
+-- query 85
+-- legacy
+id
+7
+
+-- query 86
+-- legacy
+id
+1
+
+-- query 87
+-- legacy
+id
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+
+-- query 88
+-- legacy
+id
+6
+
+-- query 89
+-- legacy
+id
+1
+6
+8
+
+-- query 90
+-- legacy
+id
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+
+-- query 91
+-- legacy
+id
+2
+3
+
+-- query 92
+-- legacy
+id
+1
+6
+
+-- query 93
+-- legacy
+id
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+
+-- query 94
+-- legacy
+id
+4
+10
+
+-- query 95
+-- legacy
+id
+1
+10
+
+-- query 96
+-- legacy
+id
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+
+-- query 97
+-- legacy
+id
+8
+
+-- query 98
+-- legacy
+id
+1
+10
 
 -- query 99
 -- legacy
@@ -682,12 +697,7 @@ id
 -- query 100
 -- legacy
 id
-4
-
--- query 101
--- legacy
-id
-1
+9
 
 -- query 102
 -- legacy
@@ -703,14 +713,10 @@ id
 9
 10
 
--- query 103
--- legacy
-id
-5
-
 -- query 104
 -- legacy
 id
+1
 2
 
 -- query 105
@@ -730,12 +736,13 @@ id
 -- query 106
 -- legacy
 id
-5
+6
+9
 
 -- query 107
 -- legacy
 id
-5
+1
 
 -- query 108
 -- legacy
@@ -743,7 +750,6 @@ id
 1
 2
 3
-4
 5
 6
 7
@@ -754,7 +760,7 @@ id
 -- query 109
 -- legacy
 id
-7
+1
 
 -- query 110
 -- legacy
@@ -778,14 +784,12 @@ id
 -- query 112
 -- legacy
 id
-6
+8
 
 -- query 113
 -- legacy
 id
 1
-6
-8
 
 -- query 114
 -- legacy
@@ -804,197 +808,9 @@ id
 -- query 115
 -- legacy
 id
-2
-3
+10
 
 -- query 116
--- legacy
-id
-1
-6
-
--- query 117
--- legacy
-id
-1
-2
-3
-4
-5
-6
-7
-8
-9
-10
-
--- query 118
--- legacy
-id
-4
-10
-
--- query 119
--- legacy
-id
-1
-10
-
--- query 120
--- legacy
-id
-1
-2
-3
-4
-5
-6
-7
-8
-9
-10
-
--- query 121
--- legacy
-id
-8
-
--- query 122
--- legacy
-id
-1
-10
-
--- query 123
--- legacy
-id
-1
-2
-3
-4
-5
-6
-7
-8
-9
-10
-
--- query 124
--- legacy
-id
-9
-
--- query 126
--- legacy
-id
-1
-2
-3
-4
-5
-6
-7
-8
-9
-10
-
--- query 128
--- legacy
-id
-1
-2
-
--- query 129
--- legacy
-id
-1
-2
-3
-4
-5
-6
-7
-8
-9
-10
-
--- query 130
--- legacy
-id
-6
-9
-
--- query 131
--- legacy
-id
-1
-
--- query 132
--- legacy
-id
-1
-2
-3
-5
-6
-7
-8
-9
-10
-
--- query 133
--- legacy
-id
-1
-
--- query 134
--- legacy
-id
-1
-
--- query 135
--- legacy
-id
-1
-2
-3
-4
-5
-6
-7
-8
-9
-10
-
--- query 136
--- legacy
-id
-8
-
--- query 137
--- legacy
-id
-1
-
--- query 138
--- legacy
-id
-1
-2
-3
-4
-5
-6
-7
-8
-9
-10
-
--- query 139
--- legacy
-id
-10
-
--- query 140
 -- legacy
 id	position
 1	1
@@ -1008,7 +824,7 @@ id	position
 9	2
 10	1
 
--- query 141
+-- query 117
 -- legacy
 id	position
 1	3
@@ -1022,7 +838,7 @@ id	position
 9	3
 10	3
 
--- query 142
+-- query 118
 -- legacy
 id	position
 1	2
@@ -1036,7 +852,7 @@ id	position
 9	1
 10	0
 
--- query 143
+-- query 119
 -- legacy
 id	position
 1	0
@@ -1050,7 +866,7 @@ id	position
 9	0
 10	0
 
--- query 144
+-- query 120
 -- legacy
 id	position
 1	3
@@ -1064,7 +880,7 @@ id	position
 9	3
 10	3
 
--- query 145
+-- query 121
 -- legacy
 id	position
 1	0
@@ -1078,10 +894,346 @@ id	position
 9	0
 10	0
 
--- query 146
+-- query 122
 -- legacy
 id	position
 1	1
+2	0
+3	0
+4	0
+5	0
+6	0
+7	0
+8	0
+9	0
+10	0
+
+-- query 123
+-- legacy
+id	position
+1	3
+2	3
+3	2
+4	3
+5	3
+6	3
+7	2
+8	2
+9	2
+10	3
+
+-- query 124
+-- legacy
+id	position
+1	0
+2	0
+3	0
+4	0
+5	1
+6	0
+7	0
+8	0
+9	0
+10	0
+
+-- query 125
+-- legacy
+id	position
+1	0
+2	1
+3	0
+4	0
+5	0
+6	0
+7	0
+8	0
+9	0
+10	0
+
+-- query 126
+-- legacy
+id	position
+1	3
+2	3
+3	2
+4	1
+5	2
+6	3
+7	3
+8	2
+9	3
+10	3
+
+-- query 127
+-- legacy
+id	position
+1	0
+2	0
+3	0
+4	0
+5	3
+6	0
+7	0
+8	0
+9	0
+10	0
+
+-- query 128
+-- legacy
+id	position
+1	0
+2	0
+3	0
+4	0
+5	1
+6	0
+7	0
+8	0
+9	0
+10	0
+
+-- query 129
+-- legacy
+id	position
+1	3
+2	2
+3	2
+4	2
+5	2
+6	2
+7	2
+8	2
+9	2
+10	2
+
+-- query 130
+-- legacy
+id	position
+1	0
+2	0
+3	0
+4	0
+5	0
+6	0
+7	1
+8	0
+9	0
+10	0
+
+-- query 131
+-- legacy
+id	position
+1	1
+2	0
+3	0
+4	0
+5	0
+6	0
+7	0
+8	0
+9	0
+10	0
+
+-- query 132
+-- legacy
+id	position
+1	2
+2	2
+3	2
+4	2
+5	2
+6	2
+7	2
+8	2
+9	2
+10	2
+
+-- query 133
+-- legacy
+id	position
+1	0
+2	0
+3	0
+4	0
+5	0
+6	1
+7	0
+8	0
+9	0
+10	0
+
+-- query 134
+-- legacy
+id	position
+1	1
+2	0
+3	0
+4	0
+5	0
+6	3
+7	0
+8	3
+9	0
+10	0
+
+-- query 135
+-- legacy
+id	position
+1	3
+2	2
+3	2
+4	3
+5	2
+6	2
+7	2
+8	2
+9	2
+10	2
+
+-- query 136
+-- legacy
+id	position
+1	0
+2	1
+3	3
+4	0
+5	0
+6	0
+7	0
+8	0
+9	0
+10	0
+
+-- query 137
+-- legacy
+id	position
+1	1
+2	0
+3	0
+4	0
+5	0
+6	1
+7	0
+8	0
+9	0
+10	0
+
+-- query 138
+-- legacy
+id	position
+1	3
+2	2
+3	2
+4	3
+5	2
+6	2
+7	2
+8	2
+9	2
+10	2
+
+-- query 139
+-- legacy
+id	position
+1	0
+2	0
+3	0
+4	1
+5	0
+6	0
+7	0
+8	0
+9	0
+10	1
+
+-- query 140
+-- legacy
+id	position
+1	1
+2	0
+3	0
+4	0
+5	0
+6	0
+7	0
+8	0
+9	0
+10	1
+
+-- query 141
+-- legacy
+id	position
+1	3
+2	2
+3	2
+4	3
+5	2
+6	2
+7	2
+8	2
+9	2
+10	2
+
+-- query 142
+-- legacy
+id	position
+1	0
+2	0
+3	0
+4	0
+5	0
+6	0
+7	0
+8	3
+9	0
+10	0
+
+-- query 143
+-- legacy
+id	position
+1	1
+2	0
+3	0
+4	0
+5	0
+6	0
+7	0
+8	0
+9	0
+10	1
+
+-- query 144
+-- legacy
+id	position
+1	2
+2	2
+3	2
+4	2
+5	2
+6	2
+7	2
+8	2
+9	2
+10	2
+
+-- query 145
+-- legacy
+id	position
+1	0
+2	0
+3	0
+4	0
+5	0
+6	0
+7	0
+8	0
+9	1
+10	0
+
+-- query 146
+-- legacy
+id	position
+1	0
 2	0
 3	0
 4	0
@@ -1096,15 +1248,15 @@ id	position
 -- legacy
 id	position
 1	3
-2	3
+2	2
 3	2
-4	3
+4	1
 5	3
-6	3
-7	2
+6	1
+7	3
 8	2
 9	2
-10	3
+10	1
 
 -- query 148
 -- legacy
@@ -1113,7 +1265,7 @@ id	position
 2	0
 3	0
 4	0
-5	1
+5	0
 6	0
 7	0
 8	0
@@ -1123,8 +1275,8 @@ id	position
 -- query 149
 -- legacy
 id	position
-1	0
-2	1
+1	1
+2	3
 3	0
 4	0
 5	0
@@ -1138,14 +1290,14 @@ id	position
 -- legacy
 id	position
 1	3
-2	3
+2	2
 3	2
 4	1
 5	2
-6	3
-7	3
+6	2
+7	2
 8	2
-9	3
+9	2
 10	3
 
 -- query 151
@@ -1155,21 +1307,21 @@ id	position
 2	0
 3	0
 4	0
-5	3
-6	0
+5	0
+6	3
 7	0
 8	0
-9	0
+9	1
 10	0
 
 -- query 152
 -- legacy
 id	position
-1	0
+1	1
 2	0
 3	0
 4	0
-5	1
+5	0
 6	0
 7	0
 8	0
@@ -1179,27 +1331,27 @@ id	position
 -- query 153
 -- legacy
 id	position
-1	3
-2	2
-3	2
-4	2
-5	2
-6	2
+1	2
+2	1
+3	3
+4	0
+5	3
+6	1
 7	2
-8	2
+8	1
 9	2
-10	2
+10	3
 
 -- query 154
 -- legacy
 id	position
-1	0
+1	3
 2	0
 3	0
 4	0
 5	0
 6	0
-7	1
+7	0
 8	0
 9	0
 10	0
@@ -1221,16 +1373,16 @@ id	position
 -- query 156
 -- legacy
 id	position
-1	2
-2	2
+1	3
+2	1
 3	2
-4	2
-5	2
-6	2
-7	2
+4	1
+5	3
+6	3
+7	3
 8	2
-9	2
-10	2
+9	1
+10	3
 
 -- query 157
 -- legacy
@@ -1240,9 +1392,9 @@ id	position
 3	0
 4	0
 5	0
-6	1
+6	0
 7	0
-8	0
+8	1
 9	0
 10	0
 
@@ -1254,433 +1406,60 @@ id	position
 3	0
 4	0
 5	0
-6	3
+6	0
 7	0
-8	3
+8	0
 9	0
 10	0
 
 -- query 159
 -- legacy
 id	position
-1	3
-2	2
-3	2
-4	3
+1	2
+2	3
+3	3
+4	1
 5	2
 6	2
 7	2
-8	2
+8	3
 9	2
-10	2
+10	1
 
 -- query 160
 -- legacy
 id	position
 1	0
-2	1
-3	3
+2	0
+3	0
 4	0
 5	0
 6	0
 7	0
 8	0
 9	0
-10	0
+10	2
 
 -- query 161
 -- legacy
-id	position
-1	1
-2	0
-3	0
-4	0
-5	0
-6	1
-7	0
-8	0
-9	0
-10	0
-
--- query 162
--- legacy
-id	position
-1	3
-2	2
-3	2
-4	3
-5	2
-6	2
-7	2
-8	2
-9	2
-10	2
+id
+1
+4
 
 -- query 163
 -- legacy
-id	position
-1	0
-2	0
-3	0
-4	1
-5	0
-6	0
-7	0
-8	0
-9	0
-10	1
-
--- query 164
--- legacy
-id	position
-1	1
-2	0
-3	0
-4	0
-5	0
-6	0
-7	0
-8	0
-9	0
-10	1
-
--- query 165
--- legacy
-id	position
-1	3
-2	2
-3	2
-4	3
-5	2
-6	2
-7	2
-8	2
-9	2
-10	2
-
--- query 166
--- legacy
-id	position
-1	0
-2	0
-3	0
-4	0
-5	0
-6	0
-7	0
-8	3
-9	0
-10	0
-
--- query 167
--- legacy
-id	position
-1	1
-2	0
-3	0
-4	0
-5	0
-6	0
-7	0
-8	0
-9	0
-10	1
-
--- query 168
--- legacy
-id	position
-1	2
-2	2
-3	2
-4	2
-5	2
-6	2
-7	2
-8	2
-9	2
-10	2
-
--- query 169
--- legacy
-id	position
-1	0
-2	0
-3	0
-4	0
-5	0
-6	0
-7	0
-8	0
-9	1
-10	0
-
--- query 170
--- legacy
-id	position
-1	0
-2	0
-3	0
-4	0
-5	0
-6	0
-7	0
-8	0
-9	0
-10	0
-
--- query 171
--- legacy
-id	position
-1	3
-2	2
-3	2
-4	1
-5	3
-6	1
-7	3
-8	2
-9	2
-10	1
+id
+1
 
 -- query 172
 -- legacy
-id	position
-1	0
-2	0
-3	0
-4	0
-5	0
-6	0
-7	0
-8	0
-9	0
-10	0
-
--- query 173
--- legacy
-id	position
-1	1
-2	3
-3	0
-4	0
-5	0
-6	0
-7	0
-8	0
-9	0
-10	0
-
--- query 174
--- legacy
-id	position
-1	3
-2	2
-3	2
-4	1
-5	2
-6	2
-7	2
-8	2
-9	2
-10	3
-
--- query 175
--- legacy
-id	position
-1	0
-2	0
-3	0
-4	0
-5	0
-6	3
-7	0
-8	0
-9	1
-10	0
-
--- query 176
--- legacy
-id	position
-1	1
-2	0
-3	0
-4	0
-5	0
-6	0
-7	0
-8	0
-9	0
-10	0
-
--- query 177
--- legacy
-id	position
-1	2
-2	1
-3	3
-4	0
-5	3
-6	1
-7	2
-8	1
-9	2
-10	3
-
--- query 178
--- legacy
-id	position
-1	3
-2	0
-3	0
-4	0
-5	0
-6	0
-7	0
-8	0
-9	0
-10	0
-
--- query 179
--- legacy
-id	position
-1	1
-2	0
-3	0
-4	0
-5	0
-6	0
-7	0
-8	0
-9	0
-10	0
-
--- query 180
--- legacy
-id	position
-1	3
-2	1
-3	2
-4	1
-5	3
-6	3
-7	3
-8	2
-9	1
-10	3
-
--- query 181
--- legacy
-id	position
-1	0
-2	0
-3	0
-4	0
-5	0
-6	0
-7	0
-8	1
-9	0
-10	0
-
--- query 182
--- legacy
-id	position
-1	1
-2	0
-3	0
-4	0
-5	0
-6	0
-7	0
-8	0
-9	0
-10	0
-
--- query 183
--- legacy
-id	position
-1	2
-2	3
-3	3
-4	1
-5	2
-6	2
-7	2
-8	3
-9	2
-10	1
-
--- query 184
--- legacy
-id	position
-1	0
-2	0
-3	0
-4	0
-5	0
-6	0
-7	0
-8	0
-9	0
-10	2
-
--- query 186
--- legacy
-id
-1
-3
-4
-5
-6
-7
-8
-9
-10
-
--- query 187
--- legacy
-id
-1
-4
-
--- query 189
--- legacy
-id
-1
-2
-3
-4
-5
-6
-7
-8
-9
-10
-
--- query 192
--- legacy
-id
-1
-2
-3
-4
-5
-6
-7
-8
-9
-10
-
--- query 193
--- legacy
 id
 1
 
--- query 195
+-- query 191
 -- legacy
 id
 1
-2
 3
 4
 5
@@ -1693,320 +1472,91 @@ id
 -- query 198
 -- legacy
 id
-1
-2
-3
 4
-5
-6
-7
-8
-9
-10
+
+-- query 199
+-- legacy
+id
+4
+
+-- query 200
+-- legacy
+id
+4
 
 -- query 201
 -- legacy
 id
-1
-2
-3
 4
-5
-6
-7
-8
-9
-10
+
+-- query 202
+-- legacy
+id
+4
+
+-- query 203
+-- legacy
+id
+4
 
 -- query 204
 -- legacy
 id
 1
+
+-- query 205
+-- legacy
+id
+1
 2
-3
 4
-5
-6
-7
-8
-9
-10
+
+-- query 206
+-- legacy
+id
+1
 
 -- query 207
 -- legacy
 id
 1
-2
-3
-4
-5
-6
-7
-8
-9
-10
 
--- query 210
+-- query 208
+-- legacy
+id
+2
+
+-- query 211
 -- legacy
 id
 1
-2
-3
-4
-5
-6
-7
-8
-9
-10
+
+-- query 212
+-- legacy
+id
+1
 
 -- query 213
 -- legacy
 id
-1
 2
-3
-4
-5
-6
-7
-8
-9
-10
 
 -- query 216
 -- legacy
 id
 1
-2
-3
-4
-5
-6
-7
-8
-9
-10
 
--- query 219
+-- query 217
 -- legacy
 id
 1
+
+-- query 218
+-- legacy
+id
 2
-3
-4
-5
-6
-7
-8
-9
-10
 
 -- query 220
--- legacy
-id
-1
-
--- query 222
--- legacy
-id
-1
-2
-3
-5
-6
-7
-8
-9
-10
-
--- query 225
--- legacy
-id
-1
-2
-3
-4
-5
-6
-7
-8
-9
-10
-
--- query 228
--- legacy
-id
-1
-2
-3
-4
-5
-6
-7
-8
-9
-10
-
--- query 275
--- legacy
-id
-1
-3
-4
-5
-6
-7
-8
-9
-10
-
--- query 276
--- legacy
-id
-1
-3
-4
-5
-6
-7
-8
-9
-10
-
--- query 287
--- legacy
-id
-4
-
--- query 288
--- legacy
-id
-4
-
--- query 289
--- legacy
-id
-4
-
--- query 290
--- legacy
-id
-4
-
--- query 291
--- legacy
-id
-4
-
--- query 292
--- legacy
-id
-4
-
--- query 293
--- legacy
-id
-4
-
--- query 294
--- legacy
-id
-4
-
--- query 295
--- legacy
-id
-4
-
--- query 296
--- legacy
-id
-4
-
--- query 297
--- legacy
-id
-4
-
--- query 298
--- legacy
-id
-4
-
--- query 299
--- legacy
-id
-4
-
--- query 300
--- legacy
-id
-4
-
--- query 302
--- legacy
-id
-1
-
--- query 303
--- legacy
-id
-1
-
--- query 304
--- legacy
-id
-1
-2
-4
-
--- query 305
--- legacy
-id
-1
-
--- query 306
--- legacy
-id
-1
-
--- query 307
--- legacy
-id
-2
-
--- query 310
--- legacy
-id
-1
-
--- query 311
--- legacy
-id
-1
-
--- query 312
--- legacy
-id
-2
-
--- query 315
--- legacy
-id
-1
-
--- query 316
--- legacy
-id
-1
-
--- query 317
--- legacy
-id
-2
-
--- query 319
 -- legacy
 id	_col1
 1	1
@@ -2014,7 +1564,7 @@ id	_col1
 3	NULL
 4	0
 
--- query 320
+-- query 221
 -- legacy
 id	_col1
 1	2
@@ -2022,7 +1572,7 @@ id	_col1
 3	NULL
 4	0
 
--- query 321
+-- query 222
 -- legacy
 id	_col1
 1	0
@@ -2030,7 +1580,7 @@ id	_col1
 3	NULL
 4	0
 
--- query 322
+-- query 223
 -- legacy
 id	_col1
 1	0
@@ -2038,7 +1588,7 @@ id	_col1
 3	NULL
 4	0
 
--- query 323
+-- query 224
 -- legacy
 id	_col1
 1	0
@@ -2046,7 +1596,7 @@ id	_col1
 3	NULL
 4	0
 
--- query 324
+-- query 225
 -- legacy
 id	_col1
 1	1
@@ -2054,7 +1604,7 @@ id	_col1
 3	NULL
 4	0
 
--- query 325
+-- query 226
 -- legacy
 id	_col1
 1	2
@@ -2062,7 +1612,7 @@ id	_col1
 3	NULL
 4	0
 
--- query 326
+-- query 227
 -- legacy
 id	_col1
 1	0
@@ -2070,7 +1620,7 @@ id	_col1
 3	NULL
 4	0
 
--- query 327
+-- query 228
 -- legacy
 id	_col1
 1	0
@@ -2078,7 +1628,7 @@ id	_col1
 3	NULL
 4	0
 
--- query 328
+-- query 229
 -- legacy
 id	_col1
 1	0
@@ -2086,7 +1636,7 @@ id	_col1
 3	NULL
 4	0
 
--- query 329
+-- query 230
 -- legacy
 id	_col1
 1	1
@@ -2094,7 +1644,7 @@ id	_col1
 3	NULL
 4	0
 
--- query 330
+-- query 231
 -- legacy
 id	_col1
 1	2
@@ -2102,7 +1652,7 @@ id	_col1
 3	NULL
 4	0
 
--- query 331
+-- query 232
 -- legacy
 id	_col1
 1	0
@@ -2110,7 +1660,7 @@ id	_col1
 3	NULL
 4	0
 
--- query 332
+-- query 233
 -- legacy
 id	_col1
 1	0
@@ -2118,17 +1668,17 @@ id	_col1
 3	NULL
 4	0
 
--- query 333
+-- query 234
 -- legacy
 _col0	_col1
 1	1
 
--- query 337
+-- query 238
 -- legacy
 pk	_col1	arr_bigint
 0	0	[0,0,0,0,0,0,0,0,0,0]
 
--- query 338
+-- query 239
 -- legacy
 pk	_col1	arr_bigint
 0	10	[0,0,0,0,0,0,0,0,0,0]

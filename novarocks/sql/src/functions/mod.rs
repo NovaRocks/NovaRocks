@@ -27,9 +27,6 @@ pub(crate) use novarocks_functions::builtin::resolver;
 #[path = "intrinsic.rs"]
 mod intrinsic_integration_tests;
 #[cfg(test)]
-#[path = "registry.rs"]
-mod registry_integration_tests;
-#[cfg(test)]
 mod selected_preparation_tests;
 pub use novarocks_functions::builtin::catalogue::{
     build_builtin_engine_function_catalog, builtin_engine_function_catalog,
@@ -47,12 +44,13 @@ use novarocks_functions::{
     AggregateBindingDeclaration, AggregateOverloadMetadata, EngineFunctionCatalogBuilder,
     FunctionArgumentEvaluation, FunctionBindingDeclaration, FunctionBindingResolver,
     FunctionBindingSelection, FunctionFailureBehavior, FunctionId, FunctionOverloadDeclaration,
-    FunctionOverloadId, FunctionSemantics, FunctionVisibility,
+    FunctionOverloadId, FunctionSemantics,
 };
 use novarocks_functions::{
     EngineFunctionCatalog, FunctionArgument, FunctionArgumentType, FunctionBindingError,
     FunctionBindingRequest, FunctionDefinition, FunctionKind, FunctionResolutionError,
-    FunctionResultType, FunctionValueType, ResolvedAggregateSignature, ResolvedFunctionBinding,
+    FunctionResultType, FunctionValueType, FunctionVisibility, ResolvedAggregateSignature,
+    ResolvedFunctionBinding, aggregate_types::DistinctAggregate,
 };
 
 #[cfg(test)]
@@ -86,19 +84,6 @@ pub(crate) fn scalar_output_logical_type(
     binding: &ResolvedFunctionBinding,
 ) -> Option<novarocks_types::schema::SqlType> {
     if binding.kind != FunctionKind::Scalar {
-        return None;
-    }
-    let FunctionResultType::Scalar(result) = &binding.selected.result_type else {
-        return None;
-    };
-    declared_output_logical_type(result)
-}
-
-#[cfg(test)]
-pub(crate) fn aggregate_output_logical_type(
-    binding: &ResolvedFunctionBinding,
-) -> Option<novarocks_types::schema::SqlType> {
-    if binding.kind != FunctionKind::Aggregate {
         return None;
     }
     let FunctionResultType::Scalar(result) = &binding.selected.result_type else {
@@ -441,7 +426,17 @@ impl crate::compiler::SqlFunctionCatalog for EngineFunctionCatalog {
     }
 
     fn contains_aggregate(&self, name: &str) -> bool {
-        self.definition(name, FunctionKind::Aggregate).is_some()
+        self.definition(name, FunctionKind::Aggregate)
+            .is_some_and(|definition| definition.visibility() == FunctionVisibility::Public)
+    }
+
+    fn resolve_distinct_aggregate(
+        &self,
+        aggregate: DistinctAggregate,
+        request: FunctionBindingRequest<'_>,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
+        EngineFunctionCatalog::resolve_distinct_aggregate(self, aggregate, request, control)
     }
 
     fn resolve_aggregate_binding(
@@ -534,6 +529,74 @@ pub(crate) fn resolve_sql_aggregate_binding(
     constant_policy: novarocks_functions::ConstantPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
+    bind_aggregate_arguments(args, order_by, constant_policy, control, |request| {
+        if trusted {
+            catalog.resolve_aggregate_binding_trusted(
+                name,
+                request.logical_argument_count,
+                request.arguments,
+                control,
+            )
+        } else {
+            catalog.resolve_aggregate_binding(
+                name,
+                request.logical_argument_count,
+                request.arguments,
+                control,
+            )
+        }
+    })
+}
+
+pub(crate) fn resolve_sql_aggregate_call(
+    catalog: &dyn crate::compiler::SqlFunctionCatalog,
+    name: &str,
+    distinct: bool,
+    args: &[crate::analysis::TypedExpr],
+    order_by: &[crate::analysis::SortItem],
+    constant_policy: novarocks_functions::ConstantPolicy,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
+    bind_aggregate_arguments(args, order_by, constant_policy, control, |request| {
+        match public_aggregate_target(name, distinct) {
+            PublicAggregateTarget::Named(executable) => catalog.resolve_aggregate_binding(
+                executable,
+                request.logical_argument_count,
+                request.arguments,
+                control,
+            ),
+            PublicAggregateTarget::Distinct(aggregate) => {
+                catalog.resolve_distinct_aggregate(aggregate, request, control)
+            }
+        }
+    })
+}
+
+enum PublicAggregateTarget<'a> {
+    Named(&'a str),
+    Distinct(DistinctAggregate),
+}
+
+// Design: ADR-0246 (docs/adr/ADR-0246-trino-public-functions-and-internal-aggregate-identities.md)
+fn public_aggregate_target(name: &str, distinct: bool) -> PublicAggregateTarget<'_> {
+    match (distinct, name) {
+        (true, "count") => PublicAggregateTarget::Distinct(DistinctAggregate::Count),
+        (true, "sum") => PublicAggregateTarget::Distinct(DistinctAggregate::Sum),
+        (true, "avg") => PublicAggregateTarget::Distinct(DistinctAggregate::Avg),
+        (true, "array_agg") => PublicAggregateTarget::Named("array_agg_distinct"),
+        _ => PublicAggregateTarget::Named(name),
+    }
+}
+
+fn bind_aggregate_arguments(
+    args: &[crate::analysis::TypedExpr],
+    order_by: &[crate::analysis::SortItem],
+    constant_policy: novarocks_functions::ConstantPolicy,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+    bind: impl FnOnce(
+        FunctionBindingRequest<'_>,
+    ) -> Result<ResolvedFunctionBinding, FunctionBindingError>,
+) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
     let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
         control,
         novarocks_type_contract::CompilePhase::FunctionSpecialization,
@@ -556,11 +619,11 @@ pub(crate) fn resolve_sql_aggregate_binding(
             work.flush()?;
         }
         work.flush()?;
-        if trusted {
-            catalog.resolve_aggregate_binding_trusted(name, args.len(), &arguments, control)
-        } else {
-            catalog.resolve_aggregate_binding(name, args.len(), &arguments, control)
-        }
+        bind(FunctionBindingRequest {
+            expected_result_type: None,
+            logical_argument_count: args.len(),
+            arguments: &arguments,
+        })
     })();
     if matches!(result, Err(FunctionBindingError::Control(_))) {
         return result;
@@ -584,8 +647,8 @@ pub(crate) fn test_resolved_aggregate(
     argument_types: &[DataType],
     distinct: bool,
 ) -> crate::binding::SqlFunctionBinding {
-    let executable_name =
-        novarocks_functions::aggregate_types::mangle_distinct_aggregate_name(name, distinct);
+    let name = name.to_ascii_lowercase();
+    let control = crate::compiler::SqlCompileControl::unbounded();
     let arguments = argument_types
         .iter()
         .cloned()
@@ -594,20 +657,21 @@ pub(crate) fn test_resolved_aggregate(
             constant: None,
         })
         .collect::<Vec<_>>();
-    let exact = builtin_engine_function_catalog()
-        .resolve_bound_trusted(
-            &executable_name,
-            FunctionKind::Aggregate,
-            FunctionBindingRequest {
-                expected_result_type: None,
-                arguments: &arguments,
-                logical_argument_count: arguments.len(),
-            },
-            &crate::compiler::SqlCompileControl::unbounded(),
-        )
-        .unwrap_or_else(|error| {
-            panic!("test aggregate `{executable_name}` must resolve exactly: {error}")
-        });
+    let request = FunctionBindingRequest {
+        expected_result_type: None,
+        arguments: &arguments,
+        logical_argument_count: arguments.len(),
+    };
+    let catalog = builtin_engine_function_catalog();
+    let exact = match public_aggregate_target(&name, distinct) {
+        PublicAggregateTarget::Named(executable) => {
+            catalog.resolve_bound_trusted(executable, FunctionKind::Aggregate, request, &control)
+        }
+        PublicAggregateTarget::Distinct(aggregate) => {
+            catalog.resolve_distinct_aggregate(aggregate, request, &control)
+        }
+    }
+    .unwrap_or_else(|error| panic!("test aggregate `{name}` must resolve exactly: {error}"));
     crate::binding::SqlFunctionBinding::new(
         exact,
         novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
@@ -977,8 +1041,6 @@ mod tests {
             "curtime",
             "localtime",
             "localtimestamp",
-            "utc_timestamp",
-            "utc_time",
         ] {
             assert_eq!(
                 catalog.volatility(name),
@@ -1015,7 +1077,7 @@ mod tests {
             )
             .unwrap()],
         );
-        assert!(crate::compiler::SqlFunctionCatalog::contains_aggregate(
+        assert!(!crate::compiler::SqlFunctionCatalog::contains_aggregate(
             &catalog,
             "$hidden_stat"
         ));
@@ -1028,109 +1090,6 @@ mod tests {
             ),
             Err(FunctionResolutionError::HiddenFunction)
         );
-    }
-
-    #[test]
-    fn m07_closed_scalar_output_domains_follow_actual_selected_bindings() {
-        use novarocks_types::schema::SqlType;
-
-        let catalog = build_builtin_engine_function_catalog().unwrap();
-        let cases = [
-            ("to_bitmap", vec![DataType::Int64], SqlType::Bitmap),
-            ("bitmap_empty", vec![], SqlType::Bitmap),
-            ("bitmap_from_string", vec![DataType::Utf8], SqlType::Bitmap),
-            (
-                "bitmap_from_binary",
-                vec![DataType::Binary],
-                SqlType::Bitmap,
-            ),
-            (
-                "bitmap_and",
-                vec![DataType::Binary, DataType::Binary],
-                SqlType::Bitmap,
-            ),
-            (
-                "bitmap_or",
-                vec![DataType::Binary, DataType::Binary],
-                SqlType::Bitmap,
-            ),
-            (
-                "bitmap_xor",
-                vec![DataType::Binary, DataType::Binary],
-                SqlType::Bitmap,
-            ),
-            (
-                "bitmap_andnot",
-                vec![DataType::Binary, DataType::Binary],
-                SqlType::Bitmap,
-            ),
-            (
-                "bitmap_intersect",
-                vec![DataType::Binary, DataType::Binary],
-                SqlType::Bitmap,
-            ),
-            (
-                "sub_bitmap",
-                vec![DataType::Binary, DataType::Int64, DataType::Int64],
-                SqlType::Bitmap,
-            ),
-            (
-                "bitmap_subset_limit",
-                vec![DataType::Binary, DataType::Int64, DataType::Int64],
-                SqlType::Bitmap,
-            ),
-            (
-                "bitmap_subset_in_range",
-                vec![DataType::Binary, DataType::Int64, DataType::Int64],
-                SqlType::Bitmap,
-            ),
-            ("hll_hash", vec![DataType::Utf8], SqlType::Hll),
-            (
-                "percentile_hash",
-                vec![DataType::Float64],
-                SqlType::Percentile,
-            ),
-            ("percentile_empty", vec![], SqlType::Percentile),
-        ];
-        for (name, types, expected) in cases {
-            let arguments = types
-                .into_iter()
-                .map(|ty| value_argument(ty, true, None))
-                .collect::<Vec<_>>();
-            let binding = resolve_exact_scalar(&catalog, name, &arguments);
-            assert_eq!(
-                scalar_result(&binding).data_type().clone(),
-                DataType::Binary,
-                "{name}"
-            );
-            assert_eq!(
-                scalar_output_logical_type(&binding),
-                Some(expected),
-                "{name}"
-            );
-            assert_eq!(aggregate_output_logical_type(&binding), None, "{name}");
-        }
-        for (name, types) in [
-            ("parse_json", vec![DataType::Utf8]),
-            ("json_object", vec![DataType::Utf8]),
-            ("json_query", vec![DataType::Utf8, DataType::Utf8]),
-        ] {
-            let arguments = types
-                .into_iter()
-                .map(|ty| value_argument(ty, false, None))
-                .collect::<Vec<_>>();
-            let binding = resolve_exact_scalar(&catalog, name, &arguments);
-            assert_eq!(
-                scalar_result(&binding).data_type().clone(),
-                DataType::Utf8,
-                "{name}"
-            );
-            assert_eq!(
-                scalar_output_logical_type(&binding),
-                Some(SqlType::Json),
-                "{name}"
-            );
-        }
     }
 
     #[test]
@@ -1169,230 +1128,6 @@ mod tests {
             let binding = resolve_exact_scalar(&catalog, name, &arguments);
             assert_eq!(scalar_result(&binding).data_type().clone(), DataType::Int64);
             assert_eq!(scalar_output_logical_type(&binding), None);
-        }
-    }
-
-    #[test]
-    fn m07_closed_aggregate_output_domains_exclude_state_and_count_lookalikes() {
-        use novarocks_types::schema::SqlType;
-
-        let catalog = build_builtin_engine_function_catalog().unwrap();
-        for (name, argument, domain) in [
-            ("bitmap_agg", DataType::Int64, Some(SqlType::Bitmap)),
-            ("bitmap_union", DataType::Binary, Some(SqlType::Bitmap)),
-            ("hll_union", DataType::Binary, Some(SqlType::Hll)),
-            ("hll_raw_agg", DataType::Binary, Some(SqlType::Hll)),
-            (
-                "percentile_union",
-                DataType::Binary,
-                Some(SqlType::Percentile),
-            ),
-            ("bitmap_union_count", DataType::Binary, None),
-            ("hll_union_agg", DataType::Binary, None),
-            ("ds_hll_count_distinct_union", DataType::Binary, None),
-            ("any_value", DataType::Binary, None),
-        ] {
-            let arguments = [value_argument(argument, true, None)];
-            let binding = catalog
-                .resolve_bound_user(
-                    name,
-                    FunctionKind::Aggregate,
-                    FunctionBindingRequest {
-                        expected_result_type: None,
-                        arguments: &arguments,
-                        logical_argument_count: 1,
-                    },
-                    &crate::compiler::SqlCompileControl::unbounded(),
-                )
-                .unwrap_or_else(|error| panic!("{name} must bind exactly: {error}"));
-            if domain.is_some() {
-                assert_eq!(
-                    aggregate_result_type(&binding).data_type().clone(),
-                    DataType::Binary,
-                    "{name}"
-                );
-            }
-            assert_eq!(aggregate_output_logical_type(&binding), domain, "{name}");
-            assert_eq!(scalar_output_logical_type(&binding), None, "{name}");
-        }
-        for (name, argument) in [
-            ("bitmap_to_binary", DataType::Binary),
-            ("ds_hll_count_distinct_state", DataType::Int64),
-        ] {
-            let arguments = [value_argument(argument, true, None)];
-            let binding = resolve_exact_scalar(&catalog, name, &arguments);
-            assert_eq!(
-                scalar_result(&binding).data_type().clone(),
-                DataType::Binary
-            );
-            assert_eq!(scalar_output_logical_type(&binding), None, "{name}");
-        }
-    }
-
-    #[test]
-    fn m07_output_domains_reject_changed_identity_kind_or_selected_carrier() {
-        let catalog = build_builtin_engine_function_catalog().unwrap();
-        for (name, arguments) in [
-            (
-                "parse_json",
-                vec![value_argument(DataType::Utf8, true, None)],
-            ),
-            ("bitmap_empty", vec![]),
-            ("hll_hash", vec![value_argument(DataType::Utf8, true, None)]),
-            ("percentile_empty", vec![]),
-        ] {
-            let binding = resolve_exact_scalar(&catalog, name, &arguments);
-            for carrier in [
-                DataType::Boolean,
-                DataType::Utf8,
-                DataType::Binary,
-                DataType::LargeUtf8,
-                DataType::LargeBinary,
-            ]
-            .into_iter()
-            .filter(|carrier| *carrier != *scalar_result(&binding).data_type())
-            {
-                let mut changed = binding.clone();
-                changed.selected.result_type =
-                    FunctionResultType::Scalar(FunctionValueType::new(carrier, true));
-                assert_eq!(scalar_output_logical_type(&changed), None, "{name}");
-            }
-            let mut changed = binding.clone();
-            changed.kind = FunctionKind::Aggregate;
-            assert_eq!(scalar_output_logical_type(&changed), None);
-            changed = binding.clone();
-            changed.function_id =
-                FunctionId::try_new(format!("external.scalar/{name}/v1")).unwrap();
-            assert_eq!(
-                scalar_output_logical_type(&changed),
-                scalar_output_logical_type(&binding)
-            );
-            assert!(
-                catalog
-                    .validate_bound(
-                        &changed,
-                        FunctionBindingRequest {
-                            expected_result_type: None,
-                            arguments: &arguments,
-                            logical_argument_count: arguments.len()
-                        },
-                        &crate::compiler::SqlCompileControl::unbounded()
-                    )
-                    .is_err()
-            );
-            changed = binding;
-            changed.selected.result_type = FunctionResultType::Relation(
-                novarocks_type_contract::TypedFactSlice::from_pure_boxed(
-                    vec![FunctionValueType::new(DataType::Binary, true)].into_boxed_slice(),
-                ),
-            );
-            assert_eq!(scalar_output_logical_type(&changed), None);
-        }
-        let arguments = [value_argument(DataType::Binary, true, None)];
-        let binding = catalog
-            .resolve_bound_user(
-                "percentile_union",
-                FunctionKind::Aggregate,
-                FunctionBindingRequest {
-                    expected_result_type: None,
-                    arguments: &arguments,
-                    logical_argument_count: 1,
-                },
-                &crate::compiler::SqlCompileControl::unbounded(),
-            )
-            .unwrap();
-        for carrier in [DataType::Utf8, DataType::LargeBinary, DataType::Int64] {
-            let mut changed = binding.clone();
-            changed.selected.result_type =
-                FunctionResultType::Scalar(FunctionValueType::new(carrier, true));
-            assert_eq!(aggregate_output_logical_type(&changed), None);
-        }
-        let mut changed = binding.clone();
-        changed.kind = FunctionKind::Scalar;
-        assert_eq!(aggregate_output_logical_type(&changed), None);
-        changed = binding.clone();
-        changed.function_id =
-            FunctionId::try_new("external.aggregate/percentile_union/v1").unwrap();
-        assert_eq!(
-            aggregate_output_logical_type(&changed),
-            aggregate_output_logical_type(&binding)
-        );
-        assert!(
-            catalog
-                .validate_bound(
-                    &changed,
-                    FunctionBindingRequest {
-                        expected_result_type: None,
-                        arguments: &arguments,
-                        logical_argument_count: arguments.len()
-                    },
-                    &crate::compiler::SqlCompileControl::unbounded()
-                )
-                .is_err()
-        );
-        changed = binding;
-        changed.selected.result_type = FunctionResultType::Relation(
-            novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::new([])),
-        );
-        assert_eq!(aggregate_output_logical_type(&changed), None);
-    }
-
-    #[test]
-    fn m07_unadmitted_kernel_identities_cannot_establish_output_domains() {
-        let catalog = build_builtin_engine_function_catalog().unwrap();
-        let mut binding = resolve_exact_scalar(&catalog, "bitmap_empty", &[]);
-        for id in [
-            "builtin.scalar/hll_empty/v1",
-            "builtin.scalar/hll_serialize/v1",
-            "builtin.scalar/hll_deserialize/v1",
-            "builtin.scalar/hll_hash1/v1",
-            "builtin.scalar/array_to_bitmap/v1",
-        ] {
-            binding.function_id = FunctionId::try_new(id).unwrap();
-            assert_eq!(
-                scalar_output_logical_type(&binding),
-                Some(novarocks_types::schema::SqlType::Bitmap),
-                "{id}"
-            );
-            assert!(
-                catalog
-                    .validate_bound(
-                        &binding,
-                        FunctionBindingRequest {
-                            expected_result_type: None,
-                            arguments: &[],
-                            logical_argument_count: 0
-                        },
-                        &crate::compiler::SqlCompileControl::unbounded()
-                    )
-                    .is_err()
-            );
-        }
-        let arguments = [value_argument(DataType::Utf8, false, None)];
-        let mut binding = resolve_exact_scalar(&catalog, "parse_json", &arguments);
-        for name in ["json_array", "to_json"] {
-            binding.function_id = FunctionId::try_new(format!("builtin.scalar/{name}/v1")).unwrap();
-            assert_eq!(
-                scalar_output_logical_type(&binding),
-                Some(novarocks_types::schema::SqlType::Json)
-            );
-            assert!(
-                catalog
-                    .validate_bound(
-                        &binding,
-                        FunctionBindingRequest {
-                            expected_result_type: None,
-                            arguments: &arguments,
-                            logical_argument_count: arguments.len()
-                        },
-                        &crate::compiler::SqlCompileControl::unbounded()
-                    )
-                    .is_err()
-            );
-            assert_eq!(
-                builtin_disposition(name),
-                Some(BuiltinDisposition::Unavailable)
-            );
         }
     }
 
@@ -1738,151 +1473,6 @@ mod tests {
     }
 
     #[test]
-    fn variadic_distinct_count_and_dict_merge_keep_their_logical_arities() {
-        let catalog = build_builtin_engine_function_catalog().expect("builtin catalog");
-
-        let distinct = resolve_bound_aggregate(
-            &catalog,
-            "multi_distinct_count",
-            &[DataType::Int64, DataType::Utf8, DataType::Boolean],
-            &[DataType::Int64, DataType::Utf8, DataType::Boolean],
-            false,
-            &crate::compiler::SqlCompileControl::unbounded(),
-        )
-        .expect("multi-column distinct count resolves");
-        assert_eq!(
-            distinct.argument_types,
-            [DataType::Int64, DataType::Utf8, DataType::Boolean]
-        );
-        assert!(matches!(
-            resolve_bound_aggregate(
-                &catalog,
-                "multi_distinct_count",
-                &[],
-                &[],
-                false,
-                &crate::compiler::SqlCompileControl::unbounded()
-            ),
-            Err(FunctionResolutionError::NoMatchingSignature { .. })
-        ));
-
-        let dict = resolve_bound_aggregate(
-            &catalog,
-            "dict_merge",
-            &[DataType::Utf8, DataType::Int64],
-            &[DataType::Utf8, DataType::Int64],
-            false,
-            &crate::compiler::SqlCompileControl::unbounded(),
-        )
-        .expect("dict_merge logical value and threshold arguments resolve");
-        assert_eq!(dict.argument_types, [DataType::Utf8, DataType::Int64]);
-        assert!(
-            catalog
-                .resolve_selected_aggregate_update_trusted(
-                    "dict_merge",
-                    &dict.overload,
-                    &[DataType::Boolean, DataType::Float64],
-                )
-                .is_err(),
-            "selected update resolution must preserve dict_merge's logical type contract"
-        );
-        let list_utf8 = DataType::List(Arc::new(arrow::datatypes::Field::new(
-            "item",
-            DataType::Utf8,
-            true,
-        )));
-        for threshold_type in [
-            DataType::Int8,
-            DataType::Int16,
-            DataType::Int32,
-            DataType::Int64,
-        ] {
-            resolve_bound_aggregate(
-                &catalog,
-                "dict_merge",
-                &[list_utf8.clone(), threshold_type.clone()],
-                &[list_utf8.clone(), threshold_type.clone()],
-                false,
-                &crate::compiler::SqlCompileControl::unbounded(),
-            )
-            .unwrap_or_else(|error| {
-                panic!("dict_merge must accept {list_utf8:?}, {threshold_type:?}: {error}")
-            });
-        }
-        assert!(matches!(
-            resolve_bound_aggregate(
-                &catalog,
-                "dict_merge",
-                &[DataType::Utf8],
-                &[DataType::Utf8],
-                false,
-                &crate::compiler::SqlCompileControl::unbounded(),
-            ),
-            Err(FunctionResolutionError::NoMatchingSignature { .. })
-        ));
-        assert!(matches!(
-            resolve_bound_aggregate(
-                &catalog,
-                "dict_merge",
-                &[DataType::Boolean, DataType::Float64],
-                &[DataType::Boolean, DataType::Float64],
-                false,
-                &crate::compiler::SqlCompileControl::unbounded(),
-            ),
-            Err(FunctionResolutionError::NoMatchingSignature { .. })
-        ));
-        let unsupported_list = DataType::List(Arc::new(arrow::datatypes::Field::new(
-            "item",
-            DataType::Int64,
-            true,
-        )));
-        assert!(matches!(
-            resolve_bound_aggregate(
-                &catalog,
-                "dict_merge",
-                &[unsupported_list.clone(), DataType::Int64],
-                &[unsupported_list, DataType::Int64],
-                false,
-                &crate::compiler::SqlCompileControl::unbounded(),
-            ),
-            Err(FunctionResolutionError::NoMatchingSignature { .. })
-        ));
-    }
-
-    #[test]
-    fn analyzer_macros_are_not_published_as_executable_aggregate_overloads() {
-        let catalog = build_builtin_engine_function_catalog().expect("builtin catalog");
-        for name in ["ds_hll_accumulate", "ds_hll_combine", "ds_hll_estimate"] {
-            assert!(
-                catalog.definition(name, FunctionKind::Aggregate).is_none(),
-                "{name} is analyzer syntax, not an executable aggregate"
-            );
-        }
-        assert!(
-            catalog
-                .definition("ds_hll_count_distinct_state", FunctionKind::Aggregate)
-                .is_none(),
-            "ds_hll_count_distinct_state is an executable scalar"
-        );
-        assert!(
-            catalog
-                .definition("ds_hll_count_distinct_state", FunctionKind::Scalar)
-                .is_some()
-        );
-        assert!(
-            catalog
-                .definition("every", FunctionKind::Aggregate)
-                .is_none(),
-            "EVERY is normalized to the executable BOOL_AND aggregate"
-        );
-        assert!(
-            catalog
-                .definition("bool_and", FunctionKind::Aggregate)
-                .is_some()
-        );
-    }
-
-    #[test]
     fn abs_exact_bindings_freeze_input_and_promoted_output_widths() {
         let catalog = build_builtin_engine_function_catalog().expect("builtin catalog");
         let control = crate::compiler::SqlCompileControl::unbounded();
@@ -2009,214 +1599,6 @@ mod tests {
     }
 
     #[test]
-    fn variadic_typed_encoders_close_unsupported_shape_before_optimization() {
-        let catalog = build_builtin_engine_function_catalog().unwrap();
-        for name in ["mv_group_row_id", "encode_sort_key"] {
-            let arguments = [value_argument(
-                DataType::List(Arc::new(arrow::datatypes::Field::new(
-                    "item",
-                    DataType::Int32,
-                    true,
-                ))),
-                true,
-                None,
-            )];
-            assert!(
-                catalog
-                    .resolve_bound_user(
-                        name,
-                        FunctionKind::Scalar,
-                        FunctionBindingRequest {
-                            expected_result_type: None,
-                            arguments: &arguments,
-                            logical_argument_count: 1
-                        },
-                        &crate::compiler::SqlCompileControl::unbounded(),
-                    )
-                    .is_err(),
-                "{name}"
-            );
-        }
-        let arguments = [
-            value_argument(DataType::Int16, true, None),
-            value_argument(DataType::Utf8, true, None),
-        ];
-        for name in ["mv_group_row_id", "encode_sort_key", "encode_row_id"] {
-            let bound = resolve_exact_scalar(&catalog, name, &arguments);
-            assert_eq!(
-                bound.selected.argument_types.as_ref(),
-                arguments
-                    .iter()
-                    .map(FunctionArgument::argument_type)
-                    .collect::<Vec<_>>()
-            );
-            assert_eq!(
-                bound.semantics.intrinsic_row_error,
-                novarocks_type_contract::FunctionIntrinsicRowError::NoRowError
-            );
-        }
-        // Fingerprint intentionally ignores complex inputs in its installed owner.
-        let complex = [value_argument(
-            DataType::List(Arc::new(arrow::datatypes::Field::new(
-                "item",
-                DataType::Int32,
-                true,
-            ))),
-            true,
-            None,
-        )];
-        let bound = resolve_exact_scalar(&catalog, "encode_fingerprint_sha256", &complex);
-        assert_eq!(
-            bound.semantics.intrinsic_row_error,
-            novarocks_type_contract::FunctionIntrinsicRowError::NoRowError
-        );
-    }
-
-    #[test]
-    fn fingerprint_alias_preserves_ignored_container_selected_profiles() {
-        use arrow::datatypes::{Field, Fields};
-        use novarocks_type_contract::FunctionIntrinsicRowError;
-        let catalog = build_builtin_engine_function_catalog().unwrap();
-        let element = Arc::new(
-            Field::new("element", DataType::Int32, true).with_metadata(
-                [("PARQUET:field_id".to_string(), "5".to_string())]
-                    .into_iter()
-                    .collect::<std::collections::HashMap<String, String>>(),
-            ),
-        );
-        let fields: Fields = vec![
-            Arc::new(Field::new("key", DataType::Int32, false)),
-            Arc::new(Field::new("value", DataType::Utf8, true)),
-        ]
-        .into();
-        for ignored in [
-            DataType::List(element),
-            DataType::Struct(fields.clone()),
-            DataType::Map(
-                Arc::new(Field::new("entries", DataType::Struct(fields), false)),
-                false,
-            ),
-        ] {
-            let arguments = [
-                value_argument(DataType::Int64, false, None),
-                value_argument(DataType::Utf8, true, None),
-                value_argument(ignored, true, None),
-            ];
-            for name in ["encode_row_id", "encode_fingerprint_sha256"] {
-                let bound = resolve_exact_scalar(&catalog, name, &arguments);
-                assert_eq!(
-                    bound.selected.argument_types.as_ref(),
-                    arguments
-                        .iter()
-                        .map(FunctionArgument::argument_type)
-                        .collect::<Vec<_>>()
-                );
-                assert_eq!(scalar_result(&bound).data_type().clone(), DataType::Binary);
-                assert_eq!(
-                    bound.semantics.intrinsic_row_error,
-                    FunctionIntrinsicRowError::NoRowError
-                );
-                catalog
-                    .validate_bound(
-                        &bound,
-                        FunctionBindingRequest {
-                            expected_result_type: None,
-                            arguments: &arguments,
-                            logical_argument_count: arguments.len(),
-                        },
-                        &crate::compiler::SqlCompileControl::unbounded(),
-                    )
-                    .unwrap();
-            }
-            assert!(
-                catalog
-                    .resolve_bound_user(
-                        "encode_sort_key",
-                        FunctionKind::Scalar,
-                        FunctionBindingRequest {
-                            expected_result_type: None,
-                            arguments: &arguments,
-                            logical_argument_count: arguments.len()
-                        },
-                        &crate::compiler::SqlCompileControl::unbounded(),
-                    )
-                    .is_err()
-            );
-        }
-    }
-
-    #[test]
-    fn field_exact_binding_rejects_containers_and_preserves_comparable_profiles() {
-        use arrow::datatypes::{Field, Fields, TimeUnit};
-        let catalog = build_builtin_engine_function_catalog().unwrap();
-        let item = Arc::new(Field::new("item", DataType::Int64, true));
-        let fields: Fields = vec![
-            Arc::new(Field::new("key", DataType::Int64, false)),
-            Arc::new(Field::new("value", DataType::Utf8, true)),
-        ]
-        .into();
-        for ty in [
-            DataType::List(item),
-            DataType::Struct(fields.clone()),
-            DataType::Map(
-                Arc::new(Field::new("entries", DataType::Struct(fields), false)),
-                false,
-            ),
-        ] {
-            let arguments = [
-                value_argument(ty.clone(), true, None),
-                value_argument(ty, true, None),
-            ];
-            assert!(
-                catalog
-                    .resolve_bound_user(
-                        "field",
-                        FunctionKind::Scalar,
-                        FunctionBindingRequest {
-                            expected_result_type: None,
-                            arguments: &arguments,
-                            logical_argument_count: 2
-                        },
-                        &crate::compiler::SqlCompileControl::unbounded(),
-                    )
-                    .is_err()
-            );
-        }
-        for ty in [
-            DataType::Int8,
-            DataType::Int16,
-            DataType::Int64,
-            DataType::Decimal128(38, 9),
-            DataType::Decimal256(60, 9),
-            DataType::FixedSizeBinary(16),
-            DataType::Utf8,
-            DataType::Date32,
-            DataType::Timestamp(TimeUnit::Microsecond, None),
-        ] {
-            let arguments = [
-                value_argument(ty.clone(), true, None),
-                value_argument(ty, true, None),
-            ];
-            let bound = resolve_exact_scalar(&catalog, "field", &arguments);
-            assert_eq!(
-                bound.semantics.intrinsic_row_error,
-                novarocks_type_contract::FunctionIntrinsicRowError::NoRowError
-            );
-            catalog
-                .validate_bound(
-                    &bound,
-                    FunctionBindingRequest {
-                        expected_result_type: None,
-                        arguments: &arguments,
-                        logical_argument_count: 2,
-                    },
-                    &crate::compiler::SqlCompileControl::unbounded(),
-                )
-                .unwrap();
-        }
-    }
-
-    #[test]
     fn array_ordering_binding_closes_comparator_domain_and_preserves_sortby_values() {
         let catalog = build_builtin_engine_function_catalog().unwrap();
         let list = |ty| DataType::List(Arc::new(arrow::datatypes::Field::new("item", ty, true)));
@@ -2247,11 +1629,8 @@ mod tests {
             DataType::Decimal256(60, 2),
             DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into())),
         ] {
-            for name in ["array_sort", "array_min", "array_max", "array_top_n"] {
-                let mut arguments = vec![value_argument(list(ty.clone()), true, None)];
-                if name == "array_top_n" {
-                    arguments.push(value_argument(DataType::Int64, false, None));
-                }
+            for name in ["array_sort", "array_min", "array_max"] {
+                let arguments = vec![value_argument(list(ty.clone()), true, None)];
                 assert!(
                     catalog
                         .resolve_bound_user(
@@ -2325,164 +1704,6 @@ mod tests {
                 &crate::compiler::SqlCompileControl::unbounded(),
             )
             .unwrap();
-    }
-
-    #[test]
-    fn object_value_binding_rejects_unimplemented_carriers_and_missing_inputs() {
-        let catalog = build_builtin_engine_function_catalog().unwrap();
-        let list = DataType::List(Arc::new(arrow::datatypes::Field::new(
-            "item",
-            DataType::Int64,
-            true,
-        )));
-        for name in [
-            "hll_hash",
-            "percentile_hash",
-            "to_bitmap",
-            "bitmap_count",
-            "bitmap_to_binary",
-            "bitmap_from_binary",
-            "bitmap_from_string",
-            "bitmap_and",
-        ] {
-            for types in [vec![], vec![list.clone()], vec![list.clone(), list.clone()]] {
-                let arguments = types
-                    .into_iter()
-                    .map(|ty| value_argument(ty, true, None))
-                    .collect::<Vec<_>>();
-                assert!(
-                    catalog
-                        .resolve_bound_user(
-                            name,
-                            FunctionKind::Scalar,
-                            FunctionBindingRequest {
-                                expected_result_type: None,
-                                arguments: &arguments,
-                                logical_argument_count: arguments.len()
-                            },
-                            &crate::compiler::SqlCompileControl::unbounded(),
-                        )
-                        .is_err(),
-                    "{name}"
-                );
-            }
-        }
-        for (name, ty) in [
-            ("hll_hash", DataType::Date32),
-            ("hll_hash", DataType::FixedSizeBinary(16)),
-            ("percentile_hash", DataType::Decimal128(38, 2)),
-            ("percentile_hash", DataType::FixedSizeBinary(16)),
-            ("to_bitmap", DataType::UInt64),
-            ("to_bitmap", DataType::LargeBinary),
-            ("bitmap_count", DataType::Null),
-            ("bitmap_from_binary", DataType::LargeUtf8),
-        ] {
-            let arguments = [value_argument(ty, true, None)];
-            let bound = resolve_exact_scalar(&catalog, name, &arguments);
-            assert_eq!(
-                bound.semantics.intrinsic_row_error,
-                novarocks_type_contract::FunctionIntrinsicRowError::NoRowError
-            );
-            catalog
-                .validate_bound(
-                    &bound,
-                    FunctionBindingRequest {
-                        expected_result_type: None,
-                        arguments: &arguments,
-                        logical_argument_count: 1,
-                    },
-                    &crate::compiler::SqlCompileControl::unbounded(),
-                )
-                .unwrap();
-        }
-        let arguments = [
-            value_argument(DataType::Binary, true, None),
-            value_argument(DataType::Binary, true, None),
-        ];
-        for name in ["bitmap_and", "bitmap_has_any"] {
-            let bound = resolve_exact_scalar(&catalog, name, &arguments);
-            catalog
-                .validate_bound(
-                    &bound,
-                    FunctionBindingRequest {
-                        expected_result_type: None,
-                        arguments: &arguments,
-                        logical_argument_count: 2,
-                    },
-                    &crate::compiler::SqlCompileControl::unbounded(),
-                )
-                .unwrap();
-        }
-        // These installed constructors consume no row values, including no input.
-        for name in ["bitmap_empty", "percentile_empty"] {
-            let bound = resolve_exact_scalar(&catalog, name, &[]);
-            catalog
-                .validate_bound(
-                    &bound,
-                    FunctionBindingRequest {
-                        expected_result_type: None,
-                        arguments: &[],
-                        logical_argument_count: 0,
-                    },
-                    &crate::compiler::SqlCompileControl::unbounded(),
-                )
-                .unwrap();
-        }
-    }
-
-    #[test]
-    fn dynamic_array_numeric_binding_closes_the_installed_output_domain() {
-        let catalog = build_builtin_engine_function_catalog().unwrap();
-        let list = |ty| DataType::List(Arc::new(arrow::datatypes::Field::new("item", ty, true)));
-        for name in ["array_cum_sum", "array_difference"] {
-            for ty in [
-                DataType::Null,
-                DataType::Utf8,
-                DataType::Decimal256(60, 2),
-                list(DataType::Int64),
-            ] {
-                let arguments = [value_argument(list(ty), true, None)];
-                assert!(
-                    catalog
-                        .resolve_bound_user(
-                            name,
-                            FunctionKind::Scalar,
-                            FunctionBindingRequest {
-                                expected_result_type: None,
-                                arguments: &arguments,
-                                logical_argument_count: 1
-                            },
-                            &crate::compiler::SqlCompileControl::unbounded(),
-                        )
-                        .is_err(),
-                    "{name}"
-                );
-            }
-            for (input, output) in [
-                (DataType::Boolean, DataType::Int64),
-                (DataType::Int16, DataType::Int64),
-                (DataType::Float32, DataType::Float64),
-                (DataType::Decimal128(38, 2), DataType::Float64),
-            ] {
-                let arguments = [value_argument(list(input), true, None)];
-                let bound = resolve_exact_scalar(&catalog, name, &arguments);
-                assert_eq!(
-                    bound.selected.result_type,
-                    FunctionResultType::Scalar(FunctionValueType::new(list(output), true))
-                );
-                catalog
-                    .validate_bound(
-                        &bound,
-                        FunctionBindingRequest {
-                            expected_result_type: None,
-                            arguments: &arguments,
-                            logical_argument_count: 1,
-                        },
-                        &crate::compiler::SqlCompileControl::unbounded(),
-                    )
-                    .unwrap();
-            }
-        }
     }
 
     #[test]
@@ -2646,11 +1867,8 @@ mod tests {
     fn selected_array_ordering_retains_null_only_and_empty_profiles() {
         let catalog = build_builtin_engine_function_catalog().unwrap();
         let list = |ty| DataType::List(Arc::new(arrow::datatypes::Field::new("item", ty, true)));
-        for name in ["array_sort", "array_min", "array_max", "array_top_n"] {
-            let mut arguments = vec![value_argument(list(DataType::Null), true, None)];
-            if name == "array_top_n" {
-                arguments.push(value_argument(DataType::Int64, false, None));
-            }
+        for name in ["array_sort", "array_min", "array_max"] {
+            let arguments = vec![value_argument(list(DataType::Null), true, None)];
             let bound = resolve_exact_scalar(&catalog, name, &arguments);
             catalog
                 .validate_bound(
@@ -2665,11 +1883,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 bound.semantics.intrinsic_row_error,
-                if name == "array_top_n" {
-                    novarocks_type_contract::FunctionIntrinsicRowError::MayRaise
-                } else {
-                    novarocks_type_contract::FunctionIntrinsicRowError::NoRowError
-                }
+                novarocks_type_contract::FunctionIntrinsicRowError::NoRowError
             );
         }
         let arguments = [
